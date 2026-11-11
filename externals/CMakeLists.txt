@@ -46,6 +46,11 @@ else()
         ${CMAKE_SOURCE_DIR}/externals/boost/libs/iostreams/src/mapped_file.cpp
     )
     target_link_libraries(boost_iostreams PUBLIC boost)
+    # The Vita's newlib has no sys/mman.h, and nothing in the emulator uses mapped_file.
+    if(VITA)
+        set_source_files_properties(${CMAKE_SOURCE_DIR}/externals/boost/libs/iostreams/src/mapped_file.cpp
+            TARGET_DIRECTORY boost_iostreams PROPERTIES HEADER_FILE_ONLY ON)
+    endif()
     # Add additional boost libs here; remember to ALIAS them in the root CMakeLists!
 endif()
 
