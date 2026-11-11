@@ -1452,36 +1452,57 @@ Framebuffer::Framebuffer(TextureRuntime&, const VideoCore::FramebufferParams& pa
     rt.width = static_cast<u16>(width);
     rt.height = static_cast<u16>(height);
     // Titles switch targets mid-frame; the SDK bounds queued scenes per target per frame.
+    // 8 is SCE_GXM_MAX_SCENES_PER_RENDERTARGET: anything higher fails with INVALID_VALUE.
     rt.scenesPerFrame = 8;
     rt.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
     rt.driverMemBlock = static_cast<SceUID>(-1);
-    if (sceGxmCreateRenderTarget(&rt, &render_target) < 0) {
-        LOG_ERROR(Render, "GXM: render target creation failed ({}x{})", width, height);
-        render_target = nullptr;
+    // Several render targets for the one surface pair, used in turn by successive scenes: the
+    // limit of 8 queued scenes is per render target, and a title can need more than that on
+    // one surface in a frame (Monster Hunter 4 Ultimate: eight of a gameplay frame's twelve
+    // scenes are on its main target). A target that cannot be made shortens the rotation.
+    for (auto& target : render_targets) {
+        if (sceGxmCreateRenderTarget(&rt, &target) < 0) {
+            target = nullptr;
+            break;
+        }
+        render_target_count++;
     }
+    if (render_target_count == 0) {
+        LOG_ERROR(Render, "GXM: render target creation failed ({}x{})", width, height);
+    }
+}
+
+void Framebuffer::DestroyRenderTargets() noexcept {
+    // The cache removes framebuffers only after a frame's wait, so the GPU is done here.
+    for (auto& target : render_targets) {
+        if (target != nullptr) {
+            sceGxmDestroyRenderTarget(target);
+            target = nullptr;
+        }
+    }
+    render_target_count = 0;
 }
 
 Framebuffer::~Framebuffer() {
-    if (render_target != nullptr) {
-        // The cache removes framebuffers only after a frame's wait, so the GPU is done here.
-        sceGxmDestroyRenderTarget(render_target);
-    }
+    DestroyRenderTargets();
 }
 
 Framebuffer::Framebuffer(Framebuffer&& o) noexcept
-    : VideoCore::FramebufferParams{o}, render_target{o.render_target},
+    : VideoCore::FramebufferParams{o}, render_targets{o.render_targets},
+      render_target_count{o.render_target_count}, next_render_target{o.next_render_target},
       color_surface{o.color_surface}, ds_surface{o.ds_surface}, color_data{o.color_data},
       width{o.width}, height{o.height}, has_color{o.has_color}, has_depth{o.has_depth} {
-    o.render_target = nullptr;
+    o.render_targets = {};
+    o.render_target_count = 0;
 }
 
 Framebuffer& Framebuffer::operator=(Framebuffer&& o) noexcept {
     if (this != &o) {
-        if (render_target != nullptr) {
-            sceGxmDestroyRenderTarget(render_target);
-        }
+        DestroyRenderTargets();
         VideoCore::FramebufferParams::operator=(o);
-        render_target = o.render_target;
+        render_targets = o.render_targets;
+        render_target_count = o.render_target_count;
+        next_render_target = o.next_render_target;
         color_surface = o.color_surface;
         ds_surface = o.ds_surface;
         color_data = o.color_data;
@@ -1489,7 +1510,8 @@ Framebuffer& Framebuffer::operator=(Framebuffer&& o) noexcept {
         height = o.height;
         has_color = o.has_color;
         has_depth = o.has_depth;
-        o.render_target = nullptr;
+        o.render_targets = {};
+        o.render_target_count = 0;
     }
     return *this;
 }

@@ -7,6 +7,9 @@
 #include <bit>
 #include <cstring>
 #include <cstdio>
+#include <set>
+#include <tuple>
+
 #include <string>
 #include <vector>
 #include <fmt/format.h>
@@ -38,6 +41,19 @@ static inline int sceIoMkdir(const char*, int) {
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
+
+namespace GxmRenderer {
+namespace {
+// logtex: frames left in the window opened by dump_now, during which texture bindings, fills,
+// transfers and the targets of draws are logged (at most 400 lines a window).
+unsigned logtex_frames_left = 0;
+unsigned logtex_lines = 0;
+bool LogtexActive() {
+    static const bool enabled = GxmFlag("logtex");
+    return enabled && logtex_frames_left > 0 && logtex_lines < 400;
+}
+} // namespace
+} // namespace GxmRenderer
 
 namespace GxmRenderer {
 
@@ -367,7 +383,9 @@ SceGxmRenderTarget* RasterizerGxm::BlitTargetFor(u32 width, u32 height) {
     SceGxmRenderTargetParams rt{};
     rt.width = static_cast<u16>(width);
     rt.height = static_cast<u16>(height);
-    rt.scenesPerFrame = 4;
+    // The most a render target allows: a frame can blit into one size several times,
+    // and past the limit the scenes corrupt one another.
+    rt.scenesPerFrame = 8;
     rt.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
     rt.driverMemBlock = static_cast<SceUID>(-1);
     SceGxmRenderTarget* target = nullptr;
@@ -763,7 +781,7 @@ void RasterizerGxm::BeginScene(Framebuffer* fb) {
     // it as they are bound; the notification goes to sceGxmEndScene.
     const u64 serial = runtime.BeginSceneEpoch(&scene_notification);
     GXM_PHASE("gpu:begin-scene");
-    if (sceGxmBeginScene(context, flags, fb->RenderTarget(), nullptr, nullptr, nullptr,
+    if (sceGxmBeginScene(context, flags, fb->NextRenderTarget(), nullptr, nullptr, nullptr,
                          fb->ColorSurface(), fb->DepthStencilSurface()) < 0) {
         LOG_ERROR(Render, "sceGxmBeginScene failed ({}x{} colour {} depth {})", fb->Width(),
                   fb->Height(), fb->HasColor(), fb->HasDepth());
@@ -1809,17 +1827,46 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             continue;
         }
         Surface& surface = res_cache.GetSurface(surface_id);
+        // logtex: each distinct (colour target, unit, texture, resolved surface) once, so a
+        // pass that samples the wrong thing can be told from the log - the surface the cache
+        // answered with, its format next to the one asked for, and whether the texture lies in
+        // the target being drawn.
+        static const bool log_textures = GxmFlag("logtex");
+        if (log_textures && logtex_frames_left > 0) {
+            static std::set<std::tuple<u32, u32, u32, u32, u32>> seen;
+            const u32 target = regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
+            const u32 tex_addr = info.physical_address;
+            const auto key = std::make_tuple(target, unit, tex_addr,
+                                             static_cast<u32>(info.format),
+                                             static_cast<u32>(surface.addr));
+            if (seen.size() < 300 && seen.insert(key).second) {
+                const u32 target_end = target + regs.framebuffer.framebuffer.width *
+                                                    regs.framebuffer.framebuffer.height * 4;
+                const bool in_target = tex_addr >= target && tex_addr < target_end;
+                LOG_INFO(Render,
+                         "logtex: target {:08X} unit {} tex {:08X} {}x{} {} -> surface {:08X}-{:08X} "
+                         "{}x{} {} type {}{}{}",
+                         target, unit, tex_addr, info.width, info.height,
+                         VideoCore::PixelFormatAsString(VideoCore::PixelFormatFromTextureFormat(info.format)),
+                         surface.addr, surface.end, surface.width, surface.height,
+                         VideoCore::PixelFormatAsString(surface.pixel_format),
+                         static_cast<u32>(surface.type), in_target ? " IN-TARGET" : "",
+                         surface.HasMemory() ? "" : " NO-MEMORY");
+            }
+        }
         if (!surface.HasMemory()) {
             stat_white_nomem++;
             continue;
         }
-        // Sampling the target being drawn is a feedback loop GXM cannot express on a
-        // linear surface within the scene; the GL backend copies the texture. Bind it
-        // as-is (the tiler reads what was stored before this scene) rather than white.
-        (void)framebuffer;
         if (surface.HasPendingClear()) {
             runtime.FlushPendingClear(surface);
         }
+        // Sampling the target being drawn is a feedback loop GXM cannot express on a
+        // linear surface within the scene; the GL backend copies the texture. Bind it
+        // as-is (the tiler reads what was stored before this scene) rather than white.
+        // A copy through a GPU blit was tried (2026-11-12) and gave garbage on Monster
+        // Hunter 4 Ultimate's character select, which this way draws cleanly.
+        (void)framebuffer;
         SceGxmTexture bound = *surface.Texture();
         res_cache.GetSampler(texture.config).Apply(bound);
         textures[unit] = bound;
@@ -1878,6 +1925,26 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                                fb_regs.framebuffer.allow_depth_stencil_write != 0;
     const bool using_color_fb =
         fb_regs.framebuffer.GetColorBufferPhysicalAddress() != 0 && write_color_fb;
+    if (LogtexActive()) {
+        static std::set<std::tuple<u32, u32, u32, u32, u32>> seen_targets;
+        const u32 color_addr = fb_regs.framebuffer.GetColorBufferPhysicalAddress();
+        const u32 depth_addr = fb_regs.framebuffer.GetDepthBufferPhysicalAddress();
+        const u32 depth_func =
+            om.depth_test_enable ? static_cast<u32>(om.depth_test_func.Value()) : 99u;
+        const auto key = std::make_tuple(color_addr, depth_addr, depth_func,
+                                         static_cast<u32>(write_color_fb),
+                                         static_cast<u32>(depth_write));
+        if (seen_targets.insert(key).second) {
+            logtex_lines++;
+            LOG_INFO(Render,
+                     "logtex: draw into colour {:08X} ({}x{}) depth {:08X}: depth test {} write {}, "
+                     "colour write {}, blend {}",
+                     color_addr, fb_regs.framebuffer.width.Value(),
+                     fb_regs.framebuffer.height.Value(), depth_addr, depth_func,
+                     depth_write ? 1 : 0, write_color_fb ? 1 : 0,
+                     om.alphablend_enable.Value() ? 1 : 0);
+        }
+    }
     const bool using_depth_fb = fb_regs.framebuffer.GetDepthBufferPhysicalAddress() != 0 &&
                                 (depth_write || stencil_write || om.depth_test_enable != 0 ||
                                  (has_stencil && om.stencil_test.enable));
@@ -2604,6 +2671,18 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     DrawTrace("display transfer");
     const PhaseTimer timer{time_draws, times.transfers};
     const bool done = EnsureResources() && res_cache.AccelerateDisplayTransfer(config);
+    if (LogtexActive()) {
+        logtex_lines++;
+        LOG_INFO(Render,
+                 "logtex: display transfer {}: {:08X} {}x{} fmt {} -> {:08X} {}x{} fmt {}, flip {} "
+                 "scale {} tiled-in {}",
+                 done ? "accelerated" : "REFUSED", config.GetPhysicalInputAddress(),
+                 config.input_width.Value(), config.input_height.Value(),
+                 static_cast<u32>(config.input_format.Value()), config.GetPhysicalOutputAddress(),
+                 config.output_width.Value(), config.output_height.Value(),
+                 static_cast<u32>(config.output_format.Value()), config.flip_vertically.Value(),
+                 config.scaling.Value(), config.input_linear.Value() ? 0 : 1);
+    }
     // Bring-up switch: a transfer the cache refuses is done by the CPU against memory the
     // surfaces do not know about, so the screen and the surface stop agreeing.
     static const bool log_transfers = GxmFlag("logdraw");
@@ -2626,13 +2705,30 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
 bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     DrawTrace("texture copy");
     const PhaseTimer timer{time_draws, times.transfers};
-    return EnsureResources() && res_cache.AccelerateTextureCopy(config);
+    const bool done = EnsureResources() && res_cache.AccelerateTextureCopy(config);
+    if (LogtexActive()) {
+        logtex_lines++;
+        LOG_INFO(Render, "logtex: texture copy {}: {:08X} -> {:08X} size {} in {}/{} out {}/{}",
+                 done ? "accelerated" : "REFUSED", config.GetPhysicalInputAddress(),
+                 config.GetPhysicalOutputAddress(), static_cast<u32>(config.texture_copy.size),
+                 static_cast<u32>(config.texture_copy.input_width), static_cast<u32>(config.texture_copy.input_gap),
+                 static_cast<u32>(config.texture_copy.output_width), static_cast<u32>(config.texture_copy.output_gap));
+    }
+    return done;
 }
 
 bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     DrawTrace("fill");
     const PhaseTimer timer{time_draws, times.transfers};
     const bool done = EnsureResources() && res_cache.AccelerateFill(config);
+    if (LogtexActive()) {
+        logtex_lines++;
+        LOG_INFO(Render, "logtex: fill {}: {:08X}..{:08X} value {:08X} 24bit {} 32bit {}",
+                 done ? "accelerated" : "REFUSED", config.GetStartAddress(),
+                 config.GetEndAddress(), config.value_32bit,
+                 static_cast<u32>(config.fill_24bit.Value()),
+                 static_cast<u32>(config.fill_32bit.Value()));
+    }
     static const bool log_fills = GxmFlag("logdraw");
     if (log_fills) {
         static u32 shown = 0;
@@ -2771,6 +2867,23 @@ void RasterizerGxm::EndFrame() {
     static const bool dump_surfaces_once = GxmFlag("dumpsurfaces");
     if (dump_surfaces_once && frame_index == 300) {
         RequestSurfaceDump();
+    }
+    // dumpfile: the same dump whenever ux0:data/azahar/dump_now appears, looked for once every
+    // 60 frames, so a running title can be dumped from the PC without the pause menu (and
+    // without the resume after it, which can hang the console).
+    static const bool dump_on_file = GxmFlag("dumpfile");
+    if (dump_on_file && frame_index % 60 == 0) {
+        if (std::FILE* f = std::fopen("ux0:data/azahar/dump_now", "rb")) {
+            std::fclose(f);
+            std::remove("ux0:data/azahar/dump_now");
+            LOG_INFO(Render, "dump_now found: dumping every surface after frame {}",
+                     frame_index);
+            RequestSurfaceDump();
+            logtex_frames_left = 120;
+        }
+    }
+    if (logtex_frames_left > 0) {
+        logtex_frames_left--;
     }
     res_cache.TickFrame();
     // Report on wall time, not on a frame count: at the frame rates this phase produces, a

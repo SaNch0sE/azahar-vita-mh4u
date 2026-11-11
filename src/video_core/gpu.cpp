@@ -780,7 +780,15 @@ PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
         return addr - Memory::PLUGIN_3GX_FB_VADDR + plg_fb_addr;
     }
 
-    LOG_ERROR(HW_Memory, "Unknown virtual address @ 0x{:08X}", addr);
+    // A corrupt command list asks for thousands of these at once, enough to overrun the console
+    // log and lose whatever comes next; the first few say what is happening.
+    static u32 unknown_reported = 0;
+    if (unknown_reported < 16) {
+        LOG_ERROR(HW_Memory, "Unknown virtual address @ 0x{:08X}", addr);
+    } else if (unknown_reported == 16) {
+        LOG_ERROR(HW_Memory, "Unknown virtual address @ 0x{:08X}; further ones not logged", addr);
+    }
+    unknown_reported++;
     return addr;
 }
 

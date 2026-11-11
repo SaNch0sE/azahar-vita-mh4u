@@ -336,9 +336,22 @@ const char* FragmentEmitter::Unsupported() const {
     // Cube and shadow textures: the rasterizer binds a white texture for them (P5), so a
     // program sampling them would not be the fix.
     const auto t0 = tex.texture0_type.Value();
+    // A 2D shadow texture is let through: the rasterizer binds white on unit 0 for it, and an
+    // ordinary sample of white is the PICA's answer for a fragment fully lit, so the draw comes
+    // out unshadowed instead of not at all (Monster Hunter 4 Ultimate draws most of its world
+    // with one). Real shadow comparison is still P5.
     if (t0 != TextureType::Disabled && t0 != TextureType::Texture2D &&
-        t0 != TextureType::Projection2D) {
-        return "texture unit 0 type";
+        t0 != TextureType::Projection2D && t0 != TextureType::Shadow2D) {
+        switch (t0) {
+        case TextureType::TextureCube:
+            return "texture unit 0 type: cube";
+        case TextureType::Shadow2D:
+            return "texture unit 0 type: shadow 2D";
+        case TextureType::ShadowCube:
+            return "texture unit 0 type: shadow cube";
+        default:
+            return "texture unit 0 type: other";
+        }
     }
     for (u32 i = 0; i < tex.tev_stages.size(); i++) {
         const TevStageConfig stage = tex.tev_stages[i];

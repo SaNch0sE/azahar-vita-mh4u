@@ -445,8 +445,18 @@ public:
     [[nodiscard]] u32 Scale() const noexcept {
         return 1;
     }
+    /// The first of the rotation, or nullptr when none could be made.
     [[nodiscard]] SceGxmRenderTarget* RenderTarget() const noexcept {
-        return render_target;
+        return render_target_count > 0 ? render_targets[0] : nullptr;
+    }
+    /// The render target for the next scene on this framebuffer, taking each in turn.
+    [[nodiscard]] SceGxmRenderTarget* NextRenderTarget() noexcept {
+        if (render_target_count == 0) {
+            return nullptr;
+        }
+        SceGxmRenderTarget* target = render_targets[next_render_target];
+        next_render_target = (next_render_target + 1) % render_target_count;
+        return target;
     }
     /// The colour surface to begin the scene with: the attachment's, or a disabled one.
     [[nodiscard]] const SceGxmColorSurface* ColorSurface() const noexcept {
@@ -477,7 +487,11 @@ public:
     }
 
 private:
-    SceGxmRenderTarget* render_target{};
+    void DestroyRenderTargets() noexcept;
+    static constexpr u32 RenderTargetsPerFramebuffer = 4;
+    std::array<SceGxmRenderTarget*, RenderTargetsPerFramebuffer> render_targets{};
+    u32 render_target_count{};
+    u32 next_render_target{};
     SceGxmColorSurface color_surface{};
     SceGxmDepthStencilSurface ds_surface{};
     const u8* color_data{};
