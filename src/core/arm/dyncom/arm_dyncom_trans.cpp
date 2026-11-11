@@ -8,15 +8,16 @@
 
 char* trans_cache_buf = nullptr;
 size_t trans_cache_buf_top = 0;
+std::size_t trans_cache_size = TRANS_CACHE_SIZE;
 
 static void* AllocBuffer(std::size_t size) {
     if (trans_cache_buf == nullptr) {
-        trans_cache_buf = static_cast<char*>(std::calloc(1, TRANS_CACHE_SIZE));
+        trans_cache_buf = static_cast<char*>(std::calloc(1, trans_cache_size));
         ASSERT_MSG(trans_cache_buf != nullptr, "Could not allocate the translation cache");
     }
     std::size_t start = trans_cache_buf_top;
     trans_cache_buf_top += TransInstStride(size);
-    ASSERT_MSG(trans_cache_buf_top <= TRANS_CACHE_SIZE, "Translation cache is full!");
+    ASSERT_MSG(trans_cache_buf_top <= trans_cache_size, "Translation cache is full!");
     return static_cast<void*>(&trans_cache_buf[start]);
 }
 

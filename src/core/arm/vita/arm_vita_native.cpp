@@ -3,10 +3,14 @@
 // Refer to the license.txt file included.
 
 #include "core/arm/vita/arm_vita_native.h"
+#include "core/arm/dyncom/arm_dyncom.h"
+#include "core/arm/dyncom/arm_dyncom_trans.h"
+#include "core/arm/skyeye_common/armstate.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "core/arm/vita/native_stats.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <psp2/io/fcntl.h>
@@ -440,6 +444,11 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         return false;
     }
     case AZAHAR_EXIT_UND:
+        if (InterpretShortVectors()) {
+            return !break_flag && !stop_requested;
+        }
+        ReportFault(run);
+        return false;
     case AZAHAR_EXIT_PABT:
     default:
         ReportFault(run);
@@ -476,19 +485,108 @@ void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
     for (u32 a = context.r[15] - 16; a <= context.r[15] + 12; a += 4) {
         code += fmt::format("{}{:08X}", a == context.r[15] ? " *" : " ", memory.Read32(a));
     }
-    LOG_CRITICAL(Core_ARM11, "code around PC:{}\nrender-thread writes:\n{}", code,
-                 system.GPU().DescribeRecentWrites(std::span<const u32>(context.r),
-                                                   run.far));
+    const std::string writes = system.GPU().DescribeRecentWrites(std::span<const u32>(context.r),
+                                                                 run.far);
+    LOG_CRITICAL(Core_ARM11, "code around PC:{}\nrender-thread writes:\n{}", code, writes);
+    // The console log is a ring that a burst of errors just before a fault can overrun, taking
+    // the registers with it; the same report goes to a file that nothing else writes.
+    if (FILE* f = std::fopen("ux0:data/azahar/fault.txt", "a")) {
+        std::fprintf(f, "%s\nfpscr %08X tpidruro %08X tpidrurw %08X reason %u\ncode around PC:%s\n",
+                     message.c_str(), context.fpscr, context.tpidruro, context.tpidrurw,
+                     static_cast<unsigned>(run.reason), code.c_str());
+        for (int i = 0; i < 32; i++) {
+            std::fprintf(f, "d%02d = %08X%08X%s", i, context.fpregs[2 * i + 1],
+                         context.fpregs[2 * i], (i % 4 == 3) ? "\n" : "  ");
+        }
+        std::fprintf(f, "render-thread writes:\n%s\n----\n", writes.c_str());
+        std::fclose(f);
+    }
     system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised, message.c_str());
 }
 
+bool ARM_VitaNative::InterpretShortVectors() {
+    // FPSCR.LEN (bits 18:16) and STRIDE (bits 21:20). The ARM11's VFPv2 runs data-processing
+    // instructions over register banks while either is set; the Cortex-A9 has no short vectors and
+    // takes VFP instructions as undefined instead (Monster Hunter 4 Ultimate sets LEN=3 for its
+    // matrix code when gameplay starts). The guest normally clears them again at the end of the
+    // block, so the interpreter runs exactly that block and native execution resumes after it.
+    constexpr u32 ShortVectorMask = 0x00370000;
+    if ((context.fpscr & ShortVectorMask) == 0) {
+        return false;
+    }
+    if (!vector_interpreter) {
+        // The interpreter's translation cache is 32 MB by default, enough to push a title that
+        // already holds most of the heap (Monster Hunter 4 Ultimate, ~210 MB of 240) into
+        // std::bad_alloc. A short-vector routine needs a few KB of it.
+        if (trans_cache_buf == nullptr) {
+            trans_cache_size = 4 * 1024 * 1024;
+        }
+        // No timer: the native slice this block belongs to has already credited the time.
+        vector_interpreter = std::make_unique<ARM_DynCom>(system, memory, USER32MODE, GetID(), nullptr);
+        LOG_INFO(Core_ARM11, "VFP short vectors at PC {:08X} (fpscr {:08X}): interpreting such blocks",
+                 context.r[15], context.fpscr);
+    }
+    auto& interp = *vector_interpreter;
+    // A full cache asserts, and it may only be cleared between blocks; half is the margin for
+    // the one about to run.
+    if (trans_cache_buf_top > trans_cache_size / 2) {
+        interp.ClearInstructionCache();
+    }
+    interp.SetPageTable(current_page_table);
+    ThreadContext ctx{};
+    SaveContext(ctx);
+    interp.LoadContext(ctx);
+    interp.SetCP15Register(CP15_THREAD_URO, cp15[CP15_THREAD_URO]);
+    interp.SetCP15Register(CP15_THREAD_UPRW, cp15[CP15_THREAD_UPRW]);
+
+    // Stop before an svc, which must be serviced by this core as usual: the interpreter would take
+    // it against whichever core the kernel thinks is running. A block left with LEN still set
+    // simply traps again at its next VFP instruction.
+    constexpr u32 MaxSteps = 1'000'000;
+    u32 steps = 0;
+    while (steps < MaxSteps && (interp.GetVFPSystemReg(VFP_FPSCR) & ShortVectorMask) != 0) {
+        const u32 pc = interp.GetPC();
+        const bool thumb = (interp.GetCPSR() & (1u << 5)) != 0;
+        const bool svc = thumb ? (memory.Read16(pc) & 0xFF00u) == 0xDF00u
+                               : (memory.Read32(pc) & 0x0F000000u) == 0x0F000000u;
+        if (svc) {
+            break;
+        }
+        interp.Step();
+        steps++;
+    }
+    if (steps == 0) {
+        return false;
+    }
+    interp.SaveContext(ctx);
+    LoadContext(ctx);
+    cp15[CP15_THREAD_UPRW] = interp.GetCP15Register(CP15_THREAD_UPRW);
+
+    static u32 blocks = 0;
+    static u64 total_steps = 0;
+    blocks++;
+    total_steps += steps;
+    if (blocks <= 4 || (blocks & (blocks - 1)) == 0) {
+        LOG_INFO(Core_ARM11, "short-vector block {}: {} instructions, now at {:08X} (fpscr {:08X}); "
+                             "{} instructions interpreted in all",
+                 blocks, steps, context.r[15], context.fpscr, total_steps);
+    }
+    return true;
+}
+
 void ARM_VitaNative::ClearInstructionCache() {
+    if (vector_interpreter) {
+        vector_interpreter->ClearInstructionCache();
+    }
     if (map) {
         map->SyncAllCode();
     }
 }
 
 void ARM_VitaNative::InvalidateCacheRange(u32 start_address, std::size_t length) {
+    if (vector_interpreter) {
+        vector_interpreter->InvalidateCacheRange(start_address, length);
+    }
     if (!map) {
         return;
     }

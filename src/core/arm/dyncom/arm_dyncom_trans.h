@@ -518,3 +518,6 @@ extern const std::size_t arm_instruction_trans_len;
 // native backend is preferred so the interpreter — and this buffer — is usually never touched.
 extern char* trans_cache_buf;
 extern std::size_t trans_cache_buf_top;
+// TRANS_CACHE_SIZE unless set before the buffer is first allocated. The Vita's native backend
+// interprets only VFP short-vector blocks and asks for far less than a whole interpreter needs.
+extern std::size_t trans_cache_size;

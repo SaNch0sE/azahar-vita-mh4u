@@ -153,6 +153,10 @@ private:
     bool RunSlice(u64 quantum_ns);
     void CreditTime(const AzaharRunRequest& run, u64 quantum_ns);
     void ReportFault(const AzaharRunRequest& run);
+    /// The guest left an undefined instruction with FPSCR.LEN or STRIDE set: VFPv2 short
+    /// vectors, which the ARM11 has and the Cortex-A9 does not. Interprets from the trapping
+    /// instruction until the guest clears them again. False if this was not that case.
+    bool InterpretShortVectors();
 
     Core::System& system;
     Memory::MemorySystem& memory;
@@ -167,6 +171,8 @@ private:
     u32 fpexc{};
     std::atomic<bool> stop_requested{};
     bool usable{};
+    /// Made on the first short-vector trap; shares the guest's memory through the page table.
+    std::unique_ptr<ARM_Interface> vector_interpreter;
 };
 
 } // namespace Core
