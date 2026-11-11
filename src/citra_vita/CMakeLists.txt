@@ -44,6 +44,36 @@ create_target_directory_groups(citra_vita)
 
 target_link_libraries(citra_vita PRIVATE citra_common citra_core input_common video_core)
 
+# GPU profiling on a retail console through psp2-cex-gpues4-prof (src/citra_vita/gpuprof.h).
+# GPUPROF_DIR is that repository with its build/ made; nothing is installed into the SDK. Off by
+# default: the wrapped GXM calls cost a callback each, and the vpk then needs
+# psp2_gpuprof.skprx loaded to resolve its imports.
+option(ENABLE_VITA_GPUPROF "GPU profiling through psp2-cex-gpues4-prof" OFF)
+set(GPUPROF_DIR "" CACHE PATH "psp2-cex-gpues4-prof source tree with build/ made")
+if (ENABLE_VITA_GPUPROF)
+    if (NOT EXISTS "${GPUPROF_DIR}/build/libpsp2_gpuprof_client.a")
+        message(FATAL_ERROR "ENABLE_VITA_GPUPROF needs GPUPROF_DIR with build/ made")
+    endif()
+    target_sources(citra_vita PRIVATE gpuprof.cpp gpuprof.h)
+    target_compile_definitions(citra_vita PRIVATE CITRA_VITA_GPUPROF)
+    target_include_directories(citra_vita PRIVATE "${GPUPROF_DIR}/include")
+    target_link_libraries(citra_vita PRIVATE
+        "${GPUPROF_DIR}/build/libpsp2_gpuprof_client.a"
+        "${GPUPROF_DIR}/build/libpsp2_gpuprof_gxm_observer.a"
+        "${GPUPROF_DIR}/build/libpsp2_gpuprof_stub.a"
+        ScePower_stub)
+    foreach(call BeginScene EndScene MidSceneFlush Draw DrawInstanced DrawPrecomputed
+            SetVertexProgram SetFragmentProgram CreateContext DestroyContext
+            ShaderPatcherCreateVertexProgram ShaderPatcherCreateFragmentProgram
+            ShaderPatcherAddRefVertexProgram ShaderPatcherAddRefFragmentProgram
+            ShaderPatcherReleaseVertexProgram ShaderPatcherReleaseFragmentProgram
+            ShaderPatcherDestroy DisplayQueueAddEntry TransferCopy TransferFill
+            TransferDownscale TransferFinish SetFrontFragmentProgramEnable
+            SetBackFragmentProgramEnable ShaderPatcherCreateMaskUpdateFragmentProgram)
+        target_link_options(citra_vita PRIVATE "-Wl,--wrap=sceGxm${call}")
+    endforeach()
+endif()
+
 # Per-core PMU stats line, printed once a second, and the SGI window counters. Pulls those
 # calls into the import table, so the vpk then only loads against a kernel module new enough to
 # export them; OFF builds a vpk that runs against any module. It is a measurement, so it

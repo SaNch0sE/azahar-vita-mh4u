@@ -20,6 +20,9 @@
 #include <psp2/shellutil.h>
 #include <psp2/vshbridge.h>
 #include "citra_vita/gxm_present.h"
+#ifdef CITRA_VITA_GPUPROF
+#include "citra_vita/gpuprof.h"
+#endif
 
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/input_factory_vita.h"
@@ -665,6 +668,10 @@ int EmulatorMain() {
     VTRACE("EmulatorMain: network");
     SetupNetwork();
 
+#ifdef CITRA_VITA_GPUPROF
+    // Before sceGxmInitialize: the identity model counts every scene and present from the start.
+    VitaFrontend::GpuProf::Install();
+#endif
     VTRACE("EmulatorMain: GxmPresent::Initialize");
     if (!VitaFrontend::GxmPresent::Initialize()) {
         VTRACE("EmulatorMain: GxmPresent::Initialize FAILED");

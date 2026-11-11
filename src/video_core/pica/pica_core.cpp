@@ -9,6 +9,7 @@
 #endif
 #include <atomic>
 #include <span>
+#include "common/pipeline_stats.h"
 #include "common/arch.h"
 #include "common/archives.h"
 #include "common/math_util.h"
@@ -1016,9 +1017,16 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }
 
     const bool accelerate_draw = [this] {
+        namespace PS = Common::PipelineStats;
         // Geometry shaders cannot be accelerated due to register preservation.
         if (regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes) {
+            PS::hw_not_offered[0].fetch_add(1, std::memory_order_relaxed);
             return false;
+        }
+        if (!Settings::values.use_hw_shader) {
+            PS::hw_not_offered[1].fetch_add(1, std::memory_order_relaxed);
+        } else if (!primitive_assembler.IsEmpty()) {
+            PS::hw_not_offered[2].fetch_add(1, std::memory_order_relaxed);
         }
 
         // TODO (wwylele): for Strip/Fan topology, if the primitive assember is not restarted
@@ -1032,6 +1040,9 @@ void PicaCore::DrawArrays(bool is_indexed) {
         const auto topology = primitive_assembler.GetTopology();
         if (topology == PipelineRegs::TriangleTopology::Shader ||
             topology == PipelineRegs::TriangleTopology::List) {
+            if (accelerate_draw && (regs.internal.pipeline.num_vertices % 3) != 0) {
+                PS::hw_not_offered[3].fetch_add(1, std::memory_order_relaxed);
+            }
             accelerate_draw = accelerate_draw && (regs.internal.pipeline.num_vertices % 3) == 0;
         }
         return accelerate_draw;
@@ -1051,6 +1062,7 @@ void PicaCore::DrawArrays(bool is_indexed) {
             }
             return;
         }
+        Common::PipelineStats::hw_not_offered[4].fetch_add(1, std::memory_order_relaxed);
     } else if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
         return;
     }

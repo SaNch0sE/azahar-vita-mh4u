@@ -1570,9 +1570,14 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
     {
         const PresentTimer timer{ptimes.begin_scene_us};
         GXM_PHASE("present:begin-scene");
+        // nodeps (GPU profiling only): no flags, as psp2-cex-gpues4-prof requires; the
+        // renderer's scenes then set no dependency for this one to wait on either.
+        static const bool no_dependency = GxmRenderer::GxmFlag("nodeps");
         sceGxmBeginScene(
             g.context,
-            SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY | SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY,
+            no_dependency ? 0u
+                          : u32{SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY |
+                                SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY},
             g.render_target, nullptr, nullptr, g.sync[g.back], &g.display_surface[g.back], nullptr);
     }
     g.in_scene = true;

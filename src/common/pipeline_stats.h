@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include "common/common_types.h"
@@ -43,6 +44,17 @@ namespace Common::PipelineStats {
 }
 
 /// Ops the render thread retired, and the wall time spent inside their bodies.
+/// Draws whose vertices the render thread shaded in software on the mirror PICA, the time it
+/// took, and how many of them were never offered to the hardware path (hw = false at ship).
+inline std::atomic<u32> sw_shaded_draws{0};
+inline std::atomic<u64> sw_shaded_us{0};
+inline std::atomic<u32> sw_shaded_not_offered{0};
+/// Why a backend declined a draw offered for hardware vertex shading, by reason index.
+inline std::array<std::atomic<u32>, 12> hw_declines{};
+/// Why the emulation thread did not offer a draw for hardware shading: 0 geometry shader,
+/// 1 hardware shaders off, 2 primitive assembler not empty, 3 list not a multiple of three,
+/// 4 the hardware shipment itself failed.
+inline std::array<std::atomic<u32>, 5> hw_not_offered{};
 inline std::atomic<u32> gpu_ops{0};
 inline std::atomic<u64> gpu_busy_us{0};
 /// The subset of that time spent in swap-marker ops (a whole frame's present).

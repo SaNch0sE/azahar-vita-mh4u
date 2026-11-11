@@ -423,7 +423,15 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
         ApplyShipment(mirror_pica, *shipment);
         const u32 watch = GuestWatch::Read();
         if (!shipment->draw.hw || !real->AccelerateShippedDraw(shipment->draw)) {
+            const u64 sw_start = Common::PipelineStats::NowUs();
             mirror_pica.RunShippedDraw(shipment->draw);
+            Common::PipelineStats::sw_shaded_us.fetch_add(
+                Common::PipelineStats::NowUs() - sw_start, std::memory_order_relaxed);
+            Common::PipelineStats::sw_shaded_draws.fetch_add(1, std::memory_order_relaxed);
+            if (!shipment->draw.hw) {
+                Common::PipelineStats::sw_shaded_not_offered.fetch_add(1,
+                                                                       std::memory_order_relaxed);
+            }
         }
         if (shipment->draw.in_ring) {
             RingDrawConsumed(shipment->draw.ring_end);

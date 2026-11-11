@@ -507,7 +507,8 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
     // does the sampling, and fragment processing runs scene by scene in order, so no
     // vertex-stage wait is needed: SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY is for a vertex
     // program reading the earlier scene's output, and here it only stalled the tiler.
-    const u32 flags = SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY;
+    static const bool no_dependency = GxmFlag("nodeps");
+    const u32 flags = no_dependency ? 0u : u32{SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY};
     serial = runtime.BeginSceneEpoch(&notification);
     GXM_PHASE("gpu:begin-scene-blit", serial);
     if (sceGxmBeginScene(context, flags, target, nullptr, nullptr, nullptr, dest.ColorSurface(),
@@ -743,7 +744,11 @@ u32 RasterizerGxm::SceneFlagsFor(std::initializer_list<VideoCore::SurfaceId> tou
     // touched a surface still in flight, it only kept the tiler from overlapping the
     // previous scene's fragment work, once a frame on SM3DL.
     (void)touched;
-    const u32 flags = SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY;
+    // nodeps: no flag at all. Nothing waits on the dependency, and psp2-cex-gpues4-prof's
+    // identity model, which GPU profiling on a retail console needs, only supports scenes
+    // begun without flags.
+    static const bool no_dependency = GxmFlag("nodeps");
+    const u32 flags = no_dependency ? 0u : u32{SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY};
     return flags;
 }
 
@@ -2258,15 +2263,26 @@ Shader* RasterizerGxm::VertexShaderFor(u16 default_regs,
     return vs;
 }
 
+namespace {
+/// Counts why AccelerateShippedDraw sent a draw to the software path (reported with timedraw):
+/// 0 geometry shader / immediate / software only, 1 no resources, 2 vertex range, 3 too many
+/// non-indexed vertices, 4 too many attributes, 5 no vertex streams, 6 no program possible,
+/// 7 program failed, 8 program still compiling, 9 draw larger than the ring, 10 no ring space.
+bool DeclineHw(u32 reason) {
+    Common::PipelineStats::hw_declines[reason].fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+} // namespace
+
 bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
     static const bool software_only = GxmFlag("nohwvs");
     if (software_only || regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::No ||
         payload.immediate) {
-        return false;
+        return DeclineHw(0);
     }
     if (!EnsureResources()) {
-        return false;
+        return DeclineHw(1);
     }
     const PhaseTimer total_timer{time_draws, times.total};
 
@@ -2286,11 +2302,11 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
     // pieces, which a strip or fan cannot be.
     const u32 vertex_range = payload.vertex_max - payload.vertex_min + 1;
     if (vertex_range > 64000 || payload.vertex_max < payload.vertex_min) {
-        return false;
+        return DeclineHw(2);
     }
     if (!payload.is_indexed && payload.num_vertices > MaxVerticesPerDraw &&
         primitive != SCE_GXM_PRIMITIVE_TRIANGLES) {
-        return false;
+        return DeclineHw(3);
     }
 
     // The streams: one per vertex loader that owns arena bytes, walked exactly as the GL
@@ -2344,7 +2360,7 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
                     break;
                 }
                 if (candidate_count == candidates.size()) {
-                    return false;
+                    return DeclineHw(4);
                 }
                 candidates[candidate_count++] = {
                     reg, VertexAttribute{AttributeNames[reg], static_cast<u16>(offset), format,
@@ -2364,7 +2380,7 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
         layout.stream_count++;
     }
     if (layout.stream_count == 0) {
-        return false;
+        return DeclineHw(5);
     }
     // Every register no loader feeds is a uniform to the program (the emitter only
     // declares the ones it reads): the fixed default attribute's value where the guest
@@ -2382,7 +2398,7 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
         // draw. Slow, but the picture is there while the compile runs - a generated vertex
         // program is twenty seconds on this CPU - and the disk cache makes it a first-run
         // cost.
-        return false;
+        return DeclineHw(vs == nullptr ? 6 : vs->failed ? 7 : 8);
     }
     layout.shader = vs;
     // Only the attributes the program reads: the patcher refuses one it does not name. Two
@@ -2444,7 +2460,7 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
         total += Common::AlignUp(index_bytes, 16);
         total = Common::AlignUp<u32>(std::max<u32>(total, 1), sizeof(Pica::OutputVertex));
         if (total > ring_size / 2) {
-            return false;
+            return DeclineHw(9);
         }
         // Under the ring's mutex: the emulation thread allocates from it too.
         u32 off;
@@ -2456,7 +2472,7 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
             if (attempt == 64) {
                 // Nothing in flight is holding the space and nothing is being freed.
                 LOG_WARNING(Render, "GXM: no ring space for a {} byte hardware draw", total);
-                return false;
+                return DeclineHw(10);
             }
             RingRetireBlocking();
             std::scoped_lock lock{vertex_ring.mutex};
@@ -2992,6 +3008,37 @@ void RasterizerGxm::EndFrame() {
                                   times.invalidate_region + times.flush + times.transfers +
                                   times.retire + times.sync + times.present;
             const u64 unaccounted = busy_us > accounted ? busy_us - accounted : 0;
+            {
+                namespace PS = Common::PipelineStats;
+                std::string declines;
+                static constexpr const char* names[] = {
+                    "gs/immediate", "resources", "range", "non-indexed", "attributes", "streams",
+                    "no program", "program failed", "compiling", "too big", "ring full"};
+                for (u32 r = 0; r < 11; r++) {
+                    const u32 n = PS::hw_declines[r].exchange(0, std::memory_order_relaxed);
+                    if (n != 0) {
+                        declines += fmt::format(" {} {},", names[r], n);
+                    }
+                }
+                const u32 sw = PS::sw_shaded_draws.exchange(0, std::memory_order_relaxed);
+                const u64 sw_us = PS::sw_shaded_us.exchange(0, std::memory_order_relaxed);
+                const u32 not_offered = PS::sw_shaded_not_offered.exchange(0, std::memory_order_relaxed);
+                std::string why_not;
+                static constexpr const char* not_names[] = {"geometry shader", "hw shaders off",
+                                                            "assembler not empty", "list not /3",
+                                                            "shipment failed"};
+                for (u32 r = 0; r < 5; r++) {
+                    const u32 n = PS::hw_not_offered[r].exchange(0, std::memory_order_relaxed);
+                    if (n != 0) {
+                        why_not += fmt::format(" {} {},", not_names[r], n);
+                    }
+                }
+                LOG_INFO(Render,
+                         "software vertex shading: {} draws, {} us ({}%% of the window), {} never "
+                         "offered to the hardware path (why:{}); declined:{}",
+                         sw, sw_us, pct(sw_us), not_offered, why_not.empty() ? " -" : why_not,
+                         declines.empty() ? " none" : declines);
+            }
             LOG_INFO(Render,
                      "gxm time (us over {} ms, {}%% of it): framebuffer {} ({}%%), textures {} "
                      "({}%%), scene {} ({}%%) + end scene {} ({}%%), state {} ({}%%), programs {} ({}%%), uniforms {} "
