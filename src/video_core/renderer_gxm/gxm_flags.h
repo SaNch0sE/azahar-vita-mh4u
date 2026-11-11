@@ -87,6 +87,11 @@ namespace GxmRenderer {
  */
 [[nodiscard]] bool GxmFlag(const char* name);
 
+/// logtex: true during the 120 frames after ux0:data/azahar/dump_now was found, while fewer
+/// than 400 lines have been logged; each caller that logs adds one to logtex_lines.
+[[nodiscard]] bool LogtexActive();
+extern unsigned logtex_lines;
+
 /**
  * The pause menu's "Dump frame", the cache's half: on its next frame end the render thread
  * writes every surface the cache holds to ux0:data/azahar/dump/fNN_*.ppm (level 0, as the

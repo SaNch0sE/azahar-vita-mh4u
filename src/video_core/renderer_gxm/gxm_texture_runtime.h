@@ -184,6 +184,7 @@ public:
         return NeedsWait(&surface);
     }
     u32 stat_renames{}; ///< uploads that took a fresh block instead of waiting for the GPU
+    u32 stat_copied_renames{}; ///< of those, partial uploads that copied the old contents
     /// The serial of the scene being recorded, for marking the surfaces it uses.
     [[nodiscard]] u64 CurrentEpoch() const noexcept {
         return scene_serial;
@@ -407,6 +408,10 @@ public:
     /// GPU is done with it: an upload of the whole surface then need not wait. Textures
     /// only (a target's descriptors live in framebuffers too). False when the pool is out.
     bool Rename();
+    /// Rename() for an upload into a texture the GPU may still be reading: the whole surface
+    /// takes a fresh block, part of it a fresh block with the old contents copied in. False
+    /// when the upload has to wait instead (a render target, or too large to copy).
+    bool RenameForUpload(bool whole);
     void UploadCustom(const VideoCore::Material* material, u32 level);
     void Download(const VideoCore::BufferTextureCopy& download,
                   const VideoCore::StagingData& staging);

@@ -43,16 +43,15 @@ static inline int sceIoMkdir(const char*, int) {
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
 
 namespace GxmRenderer {
-namespace {
 // logtex: frames left in the window opened by dump_now, during which texture bindings, fills,
-// transfers and the targets of draws are logged (at most 400 lines a window).
+// transfers, the targets of draws and the uploads that wait for the GPU are logged (at most
+// 400 lines a window). Declared in gxm_flags.h for the texture runtime.
 unsigned logtex_frames_left = 0;
 unsigned logtex_lines = 0;
 bool LogtexActive() {
     static const bool enabled = GxmFlag("logtex");
     return enabled && logtex_frames_left > 0 && logtex_lines < 400;
 }
-} // namespace
 } // namespace GxmRenderer
 
 namespace GxmRenderer {
@@ -2903,7 +2902,7 @@ void RasterizerGxm::EndFrame() {
                  "deps, "
                  "{} uniform writes "
                  "({} skipped), "
-                 "{} uploads ({} KiB, {} renamed), {} downloads ({} KiB), {} transfers, {} gpu blits "
+                 "{} uploads ({} KiB, {} renamed, {} with a copy), {} downloads ({} KiB), {} transfers, {} gpu blits "
                  "({} merged), "
                  "{} cpu blits, {} fills ({} handed to a scene), {} shaders; "
                  "pools LPDDR {}/{} KiB "
@@ -2917,7 +2916,8 @@ void RasterizerGxm::EndFrame() {
                  runtime.stat_syncs_avoided, stat_lut_waits, stat_scene_waits,
                  stat_uniform_uploads, stat_uniform_skips,
                  runtime.stat_uploads,
-                 runtime.stat_upload_bytes / 1024, runtime.stat_renames, runtime.stat_downloads,
+                 runtime.stat_upload_bytes / 1024, runtime.stat_renames, runtime.stat_copied_renames,
+                 runtime.stat_downloads,
                  runtime.stat_download_bytes / 1024, runtime.stat_transfers,
                  runtime.stat_gpu_blits, runtime.stat_gpu_blit_merges, runtime.stat_cpu_blits,
                  runtime.stat_fills,
@@ -3023,7 +3023,7 @@ void RasterizerGxm::EndFrame() {
                 stat_uniform_skips = stat_dropped_draws = stat_scene_waits = 0;
         runtime.stat_uploads = runtime.stat_upload_bytes = runtime.stat_downloads =
             runtime.stat_download_bytes = runtime.stat_transfers = runtime.stat_cpu_blits =
-                runtime.stat_renames = runtime.stat_deferred_clears = runtime.stat_fills = runtime.stat_syncs =
+                runtime.stat_renames = runtime.stat_copied_renames = runtime.stat_deferred_clears = runtime.stat_fills = runtime.stat_syncs =
                     runtime.stat_syncs_avoided =
                     runtime.stat_gpu_blits = runtime.stat_gpu_blit_merges = 0;
     }

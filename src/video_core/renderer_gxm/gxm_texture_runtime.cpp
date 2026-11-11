@@ -657,6 +657,16 @@ void TextureRuntime::Sync(Surface* a, Surface* b, const char* why) {
                          unconditional ? " (unconditional)" : "");
             }
         }
+        if (LogtexActive()) {
+            logtex_lines++;
+            const auto name = [](const Surface* s) {
+                return s == nullptr ? std::string{"-"}
+                                    : fmt::format("{:08X} {}x{} {}", s->addr, s->width, s->height,
+                                                  VideoCore::PixelFormatAsString(s->pixel_format));
+            };
+            LOG_INFO(Render, "logtex: GPU wait for {}: {} | {}{}", why, name(a), name(b),
+                     serial == 0 ? " (everything)" : "");
+        }
         sync_hook(serial);
     }
 }
@@ -1256,6 +1266,37 @@ bool Surface::Rename() {
     return true;
 }
 
+bool Surface::RenameForUpload(bool whole) {
+    // Only textures: the GPU never writes them, so the old block's contents are what they were
+    // when the scenes still reading it were queued, and copying them is safe.
+    if (is_color_target || is_depth_target || !runtime->InFlight(*this)) {
+        return false;
+    }
+    if (whole) {
+        return Rename();
+    }
+    // A partial or single-level upload into a texture still in flight. Waiting for those
+    // scenes cost ~40 ms a time (Monster Hunter 4 Ultimate: a dialogue text atlas updated a
+    // strip at a time, and a four-level ETC1 texture re-uploaded level by level, together
+    // 22-36% of the render thread); a fresh block carrying the old contents costs a copy.
+    constexpr u32 MaxCopiedRename = 1024 * 1024;
+    if (alloc_size > MaxCopiedRename) {
+        return false;
+    }
+    GpuPool& pool = in_cdram ? runtime->cdram_pool : runtime->mapped_pool;
+    void* fresh = pool.Alloc(alloc_size, 256);
+    if (fresh == nullptr) {
+        return false;
+    }
+    std::memcpy(fresh, data, alloc_size);
+    runtime->DeferFree(data, in_cdram, gpu_serial);
+    data = static_cast<u8*>(fresh);
+    sceGxmTextureSetData(&texture, data);
+    gpu_serial = 0;
+    runtime->stat_copied_renames++;
+    return true;
+}
+
 void Surface::Release() {
     if (data == nullptr || runtime == nullptr) {
         return;
@@ -1286,9 +1327,20 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
     // of waiting for those scenes, which was half the render thread's time at times.
     const bool whole = upload.texture_level == 0 && levels == 1 && rect.left == 0 &&
                        rect.bottom == 0 && w == width && h == height;
-    if (whole && !is_color_target && !is_depth_target && runtime->InFlight(*this) && Rename()) {
+    if (RenameForUpload(whole)) {
         runtime->stat_renames++;
     } else {
+        // logtex: an upload that is about to wait for the GPU, and why it could not rename.
+        if (runtime->InFlight(*this) && LogtexActive()) {
+            logtex_lines++;
+            LOG_INFO(Render,
+                     "logtex: upload waits: {:08X} {}x{} {} levels {} -> level {} rect {}x{} at "
+                     "{},{}{}{}{}",
+                     addr, width, height, VideoCore::PixelFormatAsString(pixel_format), levels,
+                     upload.texture_level, w, h, rect.left, rect.bottom,
+                     whole ? " whole" : " partial", is_color_target ? " colour-target" : "",
+                     is_depth_target ? " depth-target" : "");
+        }
         runtime->Sync(this, nullptr, "upload");
     }
     const u32 bpp = format.bytes_per_pixel;
@@ -1336,10 +1388,10 @@ std::span<u8> Surface::DirectUploadSpan(const VideoCore::BufferTextureCopy& uplo
     }
     const bool whole = upload.texture_level == 0 && levels == 1 && rect.bottom == 0 &&
                        w == width && h == height;
-    if (whole && !is_color_target && !is_depth_target && runtime->InFlight(*this) && Rename()) {
+    if (RenameForUpload(whole)) {
         runtime->stat_renames++;
     } else {
-        runtime->Sync(this);
+        runtime->Sync(this, nullptr, "direct upload");
     }
     runtime->stat_uploads++;
     runtime->stat_upload_bytes += bytes;
