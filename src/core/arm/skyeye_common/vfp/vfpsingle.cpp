@@ -52,6 +52,8 @@
  */
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "common/logging/log.h"
@@ -1197,7 +1199,150 @@ static struct op fops[] = {
 #define FREG_BANK(x) ((x) & 0x18)
 #define FREG_IDX(x) ((x) & 7)
 
+u32 vfp_single_cpdo_slow(ARMul_State* state, u32 inst, u32 fpscr);
+
+#ifdef __vita__
+namespace {
+
+// Host-float arithmetic for the common single-precision data-processing instructions. The
+// soft-float functions above cost the PS Vita ~2 us an instruction, and Monster Hunter 4
+// Ultimate runs a 1525-instruction vector-mode (FPSCR.LEN=3) matrix routine through this
+// interpreter ~60 times a second, the Cortex-A9 having no short vectors. In round-to-nearest
+// the host's VFP gives the same results; FZ and DN are applied by hand, and the A9 has no fused
+// multiply-add, so a multiply-accumulate rounds twice exactly as the ARM11's does. Cumulative
+// exception flags are not raised. Anything else falls back to the soft-float path.
+float HostF(u32 bits) {
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+u32 HostBits(float f) {
+    u32 bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return bits;
+}
+u32 FlushDenormal(u32 bits) {
+    // An exponent of zero with a fraction: a denormal, flushed to a zero of the same sign.
+    return (bits & 0x7f800000u) == 0 ? (bits & 0x80000000u) : bits;
+}
+
+bool CpdoFast(ARMul_State* state, u32 inst, u32 fpscr) {
+    if ((fpscr & FPSCR_RMODE_MASK) != 0) {
+        return false;
+    }
+    const u32 op = inst & FOP_MASK;
+    u32 ext = 0;
+    if (op == FOP_EXT) {
+        ext = inst & FEXT_MASK;
+        if (ext != FEXT_FCPY && ext != FEXT_FABS && ext != FEXT_FNEG && ext != FEXT_FSQRT) {
+            return false;
+        }
+    }
+    const bool fz = (fpscr & FPSCR_FLUSH_TO_ZERO) != 0;
+    const bool dn = (fpscr & FPSCR_DEFAULT_NAN) != 0;
+    const unsigned vecstride = 1 + ((fpscr & FPSCR_STRIDE_MASK) == FPSCR_STRIDE_MASK);
+    unsigned dest = vfp_get_sd(inst);
+    unsigned sn = vfp_get_sn(inst);
+    unsigned sm = vfp_get_sm(inst);
+    const unsigned veclen = (dest & 0x18) == 0 ? 0 : (fpscr & FPSCR_LENGTH_MASK);
+    const auto in = [&](unsigned reg) {
+        const u32 bits = static_cast<u32>(vfp_get_float(state, reg));
+        return HostF(fz ? FlushDenormal(bits) : bits);
+    };
+    for (unsigned itr = 0; itr <= veclen; itr += 1u << FPSCR_LENGTH_BIT) {
+        const u32 m_bits = static_cast<u32>(vfp_get_float(state, sm));
+        u32 out;
+        if (op == FOP_EXT) {
+            switch (ext) {
+            case FEXT_FCPY:
+                out = m_bits;
+                break;
+            case FEXT_FABS:
+                out = m_bits & 0x7fffffffu;
+                break;
+            case FEXT_FNEG:
+                out = m_bits ^ 0x80000000u;
+                break;
+            default: { // FSQRT
+                const float m = HostF(fz ? FlushDenormal(m_bits) : m_bits);
+                out = HostBits(std::sqrt(m));
+                break;
+            }
+            }
+        } else {
+            const float n = in(sn);
+            const float m = in(sm);
+            float r;
+            switch (op) {
+            case FOP_FMAC: {
+                const float p = n * m;
+                r = in(dest) + p;
+                break;
+            }
+            case FOP_FNMAC: {
+                const float p = n * m;
+                r = in(dest) - p;
+                break;
+            }
+            case FOP_FMSC: {
+                const float p = n * m;
+                r = p - in(dest);
+                break;
+            }
+            case FOP_FNMSC: {
+                const float p = n * m;
+                r = -in(dest) - p;
+                break;
+            }
+            case FOP_FMUL:
+                r = n * m;
+                break;
+            case FOP_FNMUL:
+                r = -(n * m);
+                break;
+            case FOP_FADD:
+                r = n + m;
+                break;
+            case FOP_FSUB:
+                r = n - m;
+                break;
+            default: // FDIV
+                r = n / m;
+                break;
+            }
+            out = HostBits(r);
+        }
+        if (op != FOP_EXT || ext == FEXT_FSQRT) {
+            if (fz) {
+                out = FlushDenormal(out);
+            }
+            if (dn && (out & 0x7f800000u) == 0x7f800000u && (out & 0x007fffffu) != 0) {
+                out = 0x7fc00000u;
+            }
+        }
+        vfp_put_float(state, static_cast<s32>(out), dest);
+        dest = (dest & 0x18) + (((dest & 7) + vecstride) & 7);
+        sn = (sn & 0x18) + (((sn & 7) + vecstride) & 7);
+        if ((sm & 0x18) != 0) {
+            sm = (sm & 0x18) + (((sm & 7) + vecstride) & 7);
+        }
+    }
+    return true;
+}
+
+} // namespace
+#endif
+
 u32 vfp_single_cpdo(ARMul_State* state, u32 inst, u32 fpscr) {
+#ifdef __vita__
+    if (CpdoFast(state, inst, fpscr)) {
+        return 0;
+    }
+#endif
+    return vfp_single_cpdo_slow(state, inst, fpscr);
+}
+
+u32 vfp_single_cpdo_slow(ARMul_State* state, u32 inst, u32 fpscr) {
     u32 op = inst & FOP_MASK;
     u32 exceptions = 0;
     unsigned int dest;

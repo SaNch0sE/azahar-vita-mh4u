@@ -16,6 +16,7 @@
 namespace Core {
 
 class System;
+class ARM_DynCom;
 
 /**
  * Keeps the taken core's translation table matching the emulated process's page table.
@@ -172,7 +173,10 @@ private:
     std::atomic<bool> stop_requested{};
     bool usable{};
     /// Made on the first short-vector trap; shares the guest's memory through the page table.
-    std::unique_ptr<ARM_Interface> vector_interpreter;
+    std::unique_ptr<ARM_DynCom> vector_interpreter;
+    /// The page table last handed to vector_interpreter: SetPageTable clears its translation
+    /// cache, so it is only called again when the table changes.
+    const Memory::PageTable* vector_interpreter_table = nullptr;
 };
 
 } // namespace Core

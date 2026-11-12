@@ -3870,6 +3870,10 @@ SUB_INST: {
 }
 SWI_INST: {
     if (inst_base->cond == ConditionCode::AL || CondPassed(cpu, inst_base->cond)) {
+        if (cpu->stop_before_svc) {
+            cpu->stopped_at_svc = true;
+            goto END;
+        }
         swi_inst* const inst_cream = (swi_inst*)inst_base->component;
         cpu->system.GetRunningCore().GetTimer().AddTicks(num_instrs);
         cpu->NumInstrsToExecute =

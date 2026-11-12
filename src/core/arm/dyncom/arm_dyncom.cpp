@@ -37,6 +37,18 @@ void ARM_DynCom::Step() {
     ExecuteInstructions(1);
 }
 
+u32 ARM_DynCom::RunUntilSvc(u32 count, bool& stopped_at_svc) {
+    state->stop_before_svc = true;
+    state->stopped_at_svc = false;
+    state->NumInstrsToExecute = count;
+    const u32 ran = InterpreterMainLoop(state.get());
+    state->ServeBreak();
+    state->stop_before_svc = false;
+    stopped_at_svc = state->stopped_at_svc;
+    // The svc itself was counted when dispatched but did not run.
+    return stopped_at_svc && ran > 0 ? ran - 1 : ran;
+}
+
 void ARM_DynCom::ClearInstructionCache() {
     state->instruction_cache.clear();
     trans_cache_buf_top = 0;

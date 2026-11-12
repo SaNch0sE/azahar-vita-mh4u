@@ -27,6 +27,9 @@ public:
 
     void Run() override;
     void Step() override;
+    /// Runs up to `count` instructions without a timer, stopping before any svc (left
+    /// unexecuted, PC on it). Returns how many ran; `stopped_at_svc` says whether an svc ended it.
+    u32 RunUntilSvc(u32 count, bool& stopped_at_svc);
 
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u32 start_address, std::size_t length) override;

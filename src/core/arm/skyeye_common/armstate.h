@@ -250,6 +250,10 @@ public:
 
     unsigned long long NumInstrs; // The number of instructions executed
     u64 NumInstrsToExecute;
+    /// Leave an svc unexecuted - PC on it - and end the run there (the Vita native core's
+    /// short-vector fallback: the svc must be taken by the native core, not here).
+    bool stop_before_svc = false;
+    bool stopped_at_svc = false;
 
     unsigned NresetSig; // Reset the processor
     unsigned NfiqSig;

@@ -532,7 +532,13 @@ bool ARM_VitaNative::InterpretShortVectors() {
     if (trans_cache_buf_top > trans_cache_size / 2) {
         interp.ClearInstructionCache();
     }
-    interp.SetPageTable(current_page_table);
+    // SetPageTable empties the interpreter's translation cache: once per table, not per block.
+    // Per block, Monster Hunter 4 Ultimate's 1525-instruction routine was decoded afresh every
+    // time it ran (~60 times a second), ~1.8 us an instruction.
+    if (vector_interpreter_table != current_page_table.get()) {
+        interp.SetPageTable(current_page_table);
+        vector_interpreter_table = current_page_table.get();
+    }
     ThreadContext ctx{};
     SaveContext(ctx);
     interp.LoadContext(ctx);
@@ -542,18 +548,18 @@ bool ARM_VitaNative::InterpretShortVectors() {
     // Stop before an svc, which must be serviced by this core as usual: the interpreter would take
     // it against whichever core the kernel thinks is running. A block left with LEN still set
     // simply traps again at its next VFP instruction.
+    // In chunks: the interpreter stops by itself before an svc (RunUntilSvc), and running a
+    // few instructions past the end of the vector block is still correct, only not native -
+    // cheaper than one Step() per instruction with an svc check reading memory before each.
     constexpr u32 MaxSteps = 1'000'000;
+    constexpr u32 Chunk = 128;
     u32 steps = 0;
     while (steps < MaxSteps && (interp.GetVFPSystemReg(VFP_FPSCR) & ShortVectorMask) != 0) {
-        const u32 pc = interp.GetPC();
-        const bool thumb = (interp.GetCPSR() & (1u << 5)) != 0;
-        const bool svc = thumb ? (memory.Read16(pc) & 0xFF00u) == 0xDF00u
-                               : (memory.Read32(pc) & 0x0F000000u) == 0x0F000000u;
-        if (svc) {
+        bool at_svc = false;
+        steps += interp.RunUntilSvc(Chunk, at_svc);
+        if (at_svc) {
             break;
         }
-        interp.Step();
-        steps++;
     }
     if (steps == 0) {
         return false;
