@@ -2027,6 +2027,39 @@ void FragmentEmitter::TevStage(u32 index) {
                 break;
             }
         };
+        // A Replace takes its argument as it is: load it straight into i2, the result, instead
+        // of into i0 and then copying it over - and without loading the argument it ignores.
+        // A move or two per stage of the lit programs that dominate the PS Vita's GPU time.
+        const bool color_replace = stage.color_op == Operation::Replace;
+        const bool alpha_replace = stage.alpha_op == Operation::Replace && !dot3_alpha;
+        const auto load_replace = [&](uint8_t lanes) {
+            LoadArg(2, stage, index, stage.color_source1, stage.color_modifier1,
+                    stage.alpha_source1, stage.alpha_modifier1, lanes);
+        };
+        static const bool no_direct_replace = GxmFlag("noreplacedirect");
+        bool handled = false;
+        if (!no_direct_replace) {
+            if (color_replace && alpha_replace) {
+                load_replace(0xf);
+                handled = true;
+            } else if (color_replace && separate_alpha && !alpha_three) {
+                load_replace(0x7);
+                load(0, 0x8);
+                load(1, 0x8);
+                ColorOp(stage.alpha_op, 0x8);
+                handled = true;
+            } else if (alpha_replace && separate_alpha) {
+                load(0, 0x7);
+                load(1, 0x7);
+                if (needs_three(stage.color_op)) {
+                    load(2, 0x7);
+                }
+                ColorOp(stage.color_op, 0x7);
+                load_replace(0x8);
+                handled = true;
+            }
+        }
+        if (!handled) {
         load(0, lanes01);
         load(1, lanes01);
         if (needs_three(stage.color_op)) {
@@ -2051,6 +2084,7 @@ void FragmentEmitter::TevStage(u32 index) {
                 }
                 ColorOp(stage.alpha_op, 0x8);
             }
+        }
         }
         Clamp01(I2);
         // The PICA keeps every stage's result in 8 bits. Only the last stage's rounding is kept
