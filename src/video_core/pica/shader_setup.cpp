@@ -38,6 +38,7 @@ ShaderSetup::~ShaderSetup() = default;
 
 void ShaderSetup::WriteUniformBoolReg(u32 value) {
     uniforms_sync_dirty = true;
+    InvalidateFloatFingerprint();
     const auto bits = BitSet32(value);
     for (u32 i = 0; i < uniforms.b.size(); ++i) {
         const bool prev = std::exchange(uniforms.b[i], bits[i]);
@@ -47,6 +48,7 @@ void ShaderSetup::WriteUniformBoolReg(u32 value) {
 
 void ShaderSetup::WriteUniformIntReg(u32 index, const Common::Vec4<u8> values) {
     uniforms_sync_dirty = true;
+    InvalidateFloatFingerprint();
     ASSERT(index < uniforms.i.size());
     const auto prev = std::exchange(uniforms.i[index], values);
     uniforms_dirty |= prev != values;
@@ -54,6 +56,7 @@ void ShaderSetup::WriteUniformIntReg(u32 index, const Common::Vec4<u8> values) {
 
 std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 value) {
     uniforms_sync_dirty = true;
+    InvalidateFloatFingerprint();
     auto& uniform_setup = config.uniform_setup;
     const bool is_float32 = uniform_setup.IsFloat32();
     if (!uniform_queue.Push(value, is_float32)) {
@@ -78,6 +81,7 @@ std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 val
 std::optional<ShaderSetup::UniformWriteRange> ShaderSetup::WriteUniformFloatRegRange(
     ShaderRegs& config, const u32* values, u32 count) {
     uniforms_sync_dirty = true;
+    InvalidateFloatFingerprint();
 
     if (count == 0) [[unlikely]] {
         return std::nullopt;

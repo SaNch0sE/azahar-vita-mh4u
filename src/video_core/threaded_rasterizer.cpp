@@ -17,9 +17,13 @@ namespace VideoCore {
 
 void ThreadedRasterizer::ApplySetup(Pica::ShaderSetup& setup, const SetupSync& sync) {
     if (sync.has_uniforms) {
-        if (sync.f_lo < sync.f_hi) {
-            std::memcpy(&setup.uniforms.f[sync.f_lo], &sync.uniforms.f[sync.f_lo],
-                        (sync.f_hi - sync.f_lo) * sizeof(setup.uniforms.f[0]));
+        // Register by register, so the fingerprint the geometry-shader draw memo keys on
+        // follows what changed rather than being recomputed over all 96.
+        for (u32 i = sync.f_lo; i < sync.f_hi; i++) {
+            if (std::memcmp(&setup.uniforms.f[i], &sync.uniforms.f[i], sizeof(setup.uniforms.f[i])) !=
+                0) {
+                setup.SetFloatUniformTracked(i, sync.uniforms.f[i]);
+            }
         }
         setup.uniforms.b = sync.uniforms.b;
         setup.uniforms.i = sync.uniforms.i;

@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #include <optional>
+#include "common/hash.h"
 #include "common/vector_math.h"
 #include "video_core/pica/packed_attribute.h"
 #include "video_core/pica_types.h"
@@ -167,6 +168,34 @@ public:
     const void* cached_shader{};
     bool uniforms_dirty = true;
 
+    /// A fingerprint of the float uniforms: the XOR of a hash of each register with its index,
+    /// so a write updates it in proportion to what changed. Computed in full on first use and
+    /// after any write that does not maintain it (InvalidateFloatFingerprint).
+    u64 FloatUniformFingerprint() {
+        if (!float_fp_valid) {
+            float_fp = 0;
+            for (u32 i = 0; i < uniforms.f.size(); i++) {
+                float_fp ^= FloatRegisterHash(i, uniforms.f[i]);
+            }
+            float_fp_valid = true;
+        }
+        return float_fp;
+    }
+    /// Sets float register `i`, keeping the fingerprint (when it is valid).
+    void SetFloatUniformTracked(u32 i, const Common::Vec4<f24>& value) {
+        if (float_fp_valid) {
+            float_fp ^= FloatRegisterHash(i, uniforms.f[i]) ^ FloatRegisterHash(i, value);
+        }
+        uniforms.f[i] = value;
+    }
+    void InvalidateFloatFingerprint() {
+        float_fp_valid = false;
+    }
+    static u64 FloatRegisterHash(u32 i, const Common::Vec4<f24>& value) {
+        u64 h = Common::ComputeHash64(&value, sizeof(value));
+        return h ^ ((u64{i} + 1) * 0x9E3779B97F4A7C15ull);
+    }
+
     /// Cross-thread sync flags for the render-thread mirror: set on every mutation, cleared when
     /// the corresponding block ships. Start dirty so the first shipment seeds the mirror.
     bool uniforms_sync_dirty = true;
@@ -192,6 +221,8 @@ private:
     ProgramCode program_code{};
     SwizzleData swizzle_data{};
     bool program_code_hash_dirty{true};
+    u64 float_fp = 0;
+    bool float_fp_valid = false;
     bool swizzle_data_hash_dirty{true};
     u32 biggest_program_size = 0;
     u32 biggest_swizzle_size = 0;

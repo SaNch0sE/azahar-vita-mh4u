@@ -330,7 +330,7 @@ struct PicaCore::Dispatch {
         if (GsMirrorsVs(p) && index) {
             p.gs_setup.uniforms_sync_dirty = true;
             p.gs_setup.WidenFloatSyncWindow(index.value(), index.value() + 1);
-            p.gs_setup.uniforms.f[index.value()] = p.vs_setup.uniforms.f[index.value()];
+            p.gs_setup.SetFloatUniformTracked(index.value(), p.vs_setup.uniforms.f[index.value()]);
         }
     }
 
@@ -341,7 +341,7 @@ struct PicaCore::Dispatch {
             p.gs_setup.WidenFloatSyncWindow(range->first_index, range->first_index + range->count);
             for (u32 i = 0; i < range->count; ++i) {
                 const u32 idx = range->first_index + i;
-                p.gs_setup.uniforms.f[idx] = p.vs_setup.uniforms.f[idx];
+                p.gs_setup.SetFloatUniformTracked(idx, p.vs_setup.uniforms.f[idx]);
             }
         }
     }
@@ -1386,10 +1386,14 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         key = Common::HashCombine(key, Common::ComputeHash64(&r.rasterizer, sizeof(r.rasterizer)));
         key = Common::HashCombine(
             key, Common::ComputeHash64(&input_default_attributes, sizeof(input_default_attributes)));
-        key = Common::HashCombine(key,
-                                  Common::ComputeHash64(&vs_setup.uniforms, sizeof(vs_setup.uniforms)));
-        key = Common::HashCombine(key,
-                                  Common::ComputeHash64(&gs_setup.uniforms, sizeof(gs_setup.uniforms)));
+        // The float uniforms by their maintained fingerprints (a full hash was ~3 KB a draw);
+        // the bools and ints are small enough to hash.
+        key = Common::HashCombine(key, vs_setup.FloatUniformFingerprint());
+        key = Common::HashCombine(key, gs_setup.FloatUniformFingerprint() * 3);
+        key = Common::HashCombine(key, Common::ComputeHash64(&vs_setup.uniforms.b, sizeof(vs_setup.uniforms.b)));
+        key = Common::HashCombine(key, Common::ComputeHash64(&vs_setup.uniforms.i, sizeof(vs_setup.uniforms.i)));
+        key = Common::HashCombine(key, Common::ComputeHash64(&gs_setup.uniforms.b, sizeof(gs_setup.uniforms.b)));
+        key = Common::HashCombine(key, Common::ComputeHash64(&gs_setup.uniforms.i, sizeof(gs_setup.uniforms.i)));
         key = Common::HashCombine(key, vs_setup.GetProgramCodeHash() ^ (vs_setup.GetSwizzleDataHash() << 1));
         key = Common::HashCombine(key, gs_setup.GetProgramCodeHash() ^ (gs_setup.GetSwizzleDataHash() << 1));
         key = Common::HashCombine(key, u64{p.num_vertices} | (u64{p.vertex_offset} << 32) |

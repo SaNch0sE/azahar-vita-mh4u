@@ -153,7 +153,7 @@ public:
 
         // The number of vertex input is put to the uniform register
         f24 vertex_num = f24::FromFloat32(static_cast<float>(val));
-        setup.uniforms.f[0] = Common::MakeVec(vertex_num, vertex_num, vertex_num, vertex_num);
+        setup.SetFloatUniformTracked(0, Common::MakeVec(vertex_num, vertex_num, vertex_num, vertex_num));
 
         // The second uniform register and so on are used for receiving input vertices
         buffer_cur = setup.uniforms.f.data() + 1;
