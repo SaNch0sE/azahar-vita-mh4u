@@ -9,6 +9,8 @@
 #endif
 #include <atomic>
 #include <span>
+#include <unordered_set>
+#include "common/hash.h"
 #include "common/pipeline_stats.h"
 #include "common/arch.h"
 #include "common/archives.h"
@@ -91,6 +93,11 @@ PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> 
     const auto submit_vertex = [this](const AttributeBuffer& buffer) {
         const auto add_triangle = [this](const OutputVertex& v0, const OutputVertex& v1,
                                          const OutputVertex& v2) {
+            if (triangle_record) {
+                triangle_record->push_back(v0);
+                triangle_record->push_back(v1);
+                triangle_record->push_back(v2);
+            }
             rasterizer->AddTriangle(v0, v1, v2);
         };
         const auto vertex = OutputVertex(output_vertex_map, buffer);
@@ -1351,6 +1358,66 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
 
     ShaderUnit shader_unit;
     AttributeBuffer vs_output;
+    // Geometry-shader draws, memoized. The vertex and geometry shaders run here in software
+    // (the GPU has no geometry stage), ~30 us a draw on the PS Vita for Monster Hunter 4
+    // Ultimate's one-point text glyphs - and ~98% of those draws repeat one from the frames
+    // before, inputs and all. Keyed on everything their output depends on: the draw's vertex
+    // data, the pipeline/VS/GS/rasterizer registers, the default attributes, both shaders'
+    // uniforms, programs and swizzles; a hit replays the recorded triangles. Only draws that
+    // start and end with the primitive assembler empty, so no partial strip crosses a draw.
+    // Two generations, capped: the heap has little room. ux0:data/azahar/nogsmemo turns it off.
+    static const bool gs_memo = [] {
+        std::FILE* f = std::fopen("ux0:data/azahar/nogsmemo", "rb");
+        if (f != nullptr) {
+            std::fclose(f);
+        }
+        return f == nullptr;
+    }();
+    u64 memo_key = 0;
+    bool memo_record = false;
+    std::vector<OutputVertex> memo_triangles;
+    if (gs_memo && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
+        primitive_assembler.IsEmpty()) {
+        const auto& r = regs.internal;
+        u64 key = Common::ComputeHash64(p.arena, p.layout.total);
+        key = Common::HashCombine(key, Common::ComputeHash64(&r.pipeline, sizeof(r.pipeline)));
+        key = Common::HashCombine(key, Common::ComputeHash64(&r.vs, sizeof(r.vs)));
+        key = Common::HashCombine(key, Common::ComputeHash64(&r.gs, sizeof(r.gs)));
+        key = Common::HashCombine(key, Common::ComputeHash64(&r.rasterizer, sizeof(r.rasterizer)));
+        key = Common::HashCombine(
+            key, Common::ComputeHash64(&input_default_attributes, sizeof(input_default_attributes)));
+        key = Common::HashCombine(key,
+                                  Common::ComputeHash64(&vs_setup.uniforms, sizeof(vs_setup.uniforms)));
+        key = Common::HashCombine(key,
+                                  Common::ComputeHash64(&gs_setup.uniforms, sizeof(gs_setup.uniforms)));
+        key = Common::HashCombine(key, vs_setup.GetProgramCodeHash() ^ (vs_setup.GetSwizzleDataHash() << 1));
+        key = Common::HashCombine(key, gs_setup.GetProgramCodeHash() ^ (gs_setup.GetSwizzleDataHash() << 1));
+        key = Common::HashCombine(key, u64{p.num_vertices} | (u64{p.vertex_offset} << 32) |
+                                           (u64{p.is_indexed} << 63) | (u64{p.index_u16} << 62));
+        memo_key = key;
+        auto hit = gs_memo_cur.find(key);
+        if (hit == gs_memo_cur.end()) {
+            if (auto old = gs_memo_prev.find(key); old != gs_memo_prev.end()) {
+                hit = gs_memo_cur.emplace(key, std::move(old->second)).first;
+                gs_memo_prev.erase(old);
+            }
+        }
+        if (hit != gs_memo_cur.end()) {
+            const auto& tris = hit->second;
+            for (std::size_t i = 0; i + 2 < tris.size(); i += 3) {
+                rasterizer->AddTriangle(tris[i], tris[i + 1], tris[i + 2]);
+            }
+            gs_memo_hits++;
+            if ((gs_memo_hits + gs_memo_misses) % 10000 == 0) {
+                LOG_INFO(HW_GPU, "geometry-shader draw memo: {} hits, {} misses, {} + {} entries",
+                         gs_memo_hits, gs_memo_misses, gs_memo_cur.size(), gs_memo_prev.size());
+            }
+            rasterizer->DrawTriangles();
+            return;
+        }
+        memo_record = true;
+        triangle_record = &memo_triangles;
+    }
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
     geometry_pipeline.Reconfigure();
@@ -1398,6 +1465,18 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         geometry_pipeline.SubmitVertex(vs_output);
     }
 
+    if (memo_record) {
+        triangle_record = nullptr;
+        if (primitive_assembler.IsEmpty()) {
+            if (gs_memo_cur.size() >= GsMemoGenerationCap) {
+                // A generation is full: the older one goes.
+                gs_memo_prev = std::move(gs_memo_cur);
+                gs_memo_cur.clear();
+            }
+            gs_memo_cur.emplace(memo_key, std::move(memo_triangles));
+        }
+        gs_memo_misses++;
+    }
     rasterizer->DrawTriangles();
 }
 

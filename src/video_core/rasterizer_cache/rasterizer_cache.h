@@ -1166,6 +1166,27 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         return;
     }
 
+    // A texture whose bytes still hash to what it last matched needs nothing, however much of it
+    // was invalidated. Guest writes are tracked by the page, and a texture that does not start
+    // or end on one shares its pages with other data: Monster Hunter 4 Ultimate writes next to
+    // its textures every frame, and each such partial invalidation re-decoded part of a texture
+    // whose bytes had not changed (~70 a second on the ship's deck, ~3 ms each on the PS Vita's
+    // render thread).
+    const bool whole_texture = surface.type == SurfaceType::Texture &&
+                               boost::icl::contains(validate_interval, surface.GetInterval());
+    if (whole_texture && surface.upload_hash != 0) {
+        const MemoryRef source = memory.GetPhysicalRef(surface.addr);
+        if (source && source.GetSize() >= surface.size &&
+            Common::ComputeHash64(source.GetPtr(), surface.size) == surface.upload_hash) {
+            guest_flush_hash_skips++;
+            memory.WriteTracker().Arm(source.GetPtr(), surface.size);
+            surface.MarkValid(surface.GetInterval());
+            return;
+        }
+    }
+    bool uploaded = false;
+    bool from_other = false; // a region came from another surface rather than memory
+
     auto notify_validated = [&](SurfaceInterval interval) {
         surface.MarkValid(interval);
         validate_regions.erase(interval);
@@ -1205,6 +1226,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
                 }
             }
             CopySurface(copy_surface, surface, copy_interval);
+            from_other = true;
             surface.upload_hash = 0;
             notify_validated(copy_interval);
             continue;
@@ -1213,6 +1235,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         // Try to find surface in cache with different format
         // that can can be reinterpreted to the requested format.
         if (ValidateByReinterpretation(surface, params, interval)) {
+            from_other = true;
             surface.upload_hash = 0;
             notify_validated(interval);
             continue;
@@ -1241,8 +1264,19 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         validating_for = nullptr;
         if (!use_custom_textures || !UploadCustomSurface(surface_id, interval)) {
             UploadSurface(surface, interval);
+            uploaded = true;
         }
         notify_validated(params.GetInterval());
+    }
+
+    // Now that the whole texture matches memory again, remember what it matches, so the next
+    // partial invalidation can be checked against it (a partial upload alone leaves no hash).
+    if (whole_texture && uploaded && !from_other && surface.upload_hash == 0 &&
+        surface.IsRegionValid(surface.GetInterval())) {
+        const MemoryRef source = memory.GetPhysicalRef(surface.addr);
+        if (source && source.GetSize() >= surface.size) {
+            surface.upload_hash = Common::ComputeHash64(source.GetPtr(), surface.size);
+        }
     }
 
     // Filtered mipmaps often look really bad. We can achieve better quality by

@@ -7,6 +7,8 @@
 #include <array>
 #include <atomic>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 #include "common/common_types.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
@@ -454,6 +456,13 @@ private:
     Service::GSP::InterruptHandler signal_interrupt;
     GeometryPipeline geometry_pipeline;
     PrimitiveAssembler primitive_assembler;
+    /// While set, every triangle the software path hands the rasterizer is appended here too
+    /// (RunShippedDraw's geometry-shader draw memo records a draw's output with it).
+    std::vector<OutputVertex>* triangle_record = nullptr;
+    /// RunShippedDraw's geometry-shader draw memo: recorded triangles by input key.
+    static constexpr std::size_t GsMemoGenerationCap = 400;
+    std::unordered_map<u64, std::vector<OutputVertex>> gs_memo_cur, gs_memo_prev;
+    u32 gs_memo_hits = 0, gs_memo_misses = 0;
     /// Semantic map for OutputVertex construction, rebuilt at each batch start.
     OutputVertexMap output_vertex_map;
     CommandList cmd_list;
