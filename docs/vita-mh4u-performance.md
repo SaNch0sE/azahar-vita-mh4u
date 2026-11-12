@@ -76,6 +76,26 @@ The A9 + SGX543 compute some instruction forms differently from what the IR mean
 Tools: `usse_stopN`, `usse_vsnoloadsrc`/`usse_fsnoloadsrc` bisect tier-2 passes on the console;
 `tools/usse_host` replays dumped programs on the PC (`usse_dump` writes them).
 
+## Render thread breakdown (after all of the above)
+
+Per 3 s on the deck: the render thread is ~91% busy.
+
+| Part | Time | Per op |
+| --- | --- | --- |
+| Hardware draws (~6,000) | ~815 ms | ~135 us |
+| Software draws (~12,900, mostly memoized glyphs) | ~940 ms | ~73 us |
+| Applying shipped state (~590,000 register writes) | ~205 ms | ~11 us |
+| Waiting for the GPU at frame end | ~620 ms | - |
+
+A hardware draw is ~7 us of vertex layout, ~9 us of vertex program lookup and ~118 us of the GXM
+phases every fully set-up draw pays (programs ~30, textures ~28, framebuffer ~23, draw ~23,
+uniforms ~17, scene ~12, invalidate ~11 us). ~43% of hardware draws keep the previous draw's
+fragment-side registers with nothing in between: a hardware form of the software repeat path
+(bind the draw's own vertex program and uniforms, skip framebuffer, textures, scene and fragment
+program selection) would save ~5% of the render thread. The glyph memo's key hashes both shaders'
+whole uniform sets (~1.5 KB each) per draw; an incrementally maintained fingerprint would save most
+of its ~13 us.
+
 ## Open
 
 - Ship cutscene: depth of field blurs everything and some shots show blocky garbage, with GPU-load
