@@ -43,6 +43,11 @@ public:
 
     void Run(const ShaderSetup& setup, ShaderUnit& state, u32 offset) const;
 
+    /// False when no code memory could be had for it: the engine interprets this shader.
+    [[nodiscard]] bool Compiled() const {
+        return program != nullptr;
+    }
+
     void Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_code,
                  const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data);
 

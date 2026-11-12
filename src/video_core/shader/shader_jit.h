@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include "common/common_types.h"
 #include "video_core/shader/shader.h"
+#include "video_core/shader/shader_interpreter.h"
 
 namespace Pica::Shader {
 
@@ -26,6 +27,8 @@ public:
 
 private:
     std::unordered_map<u64, std::unique_ptr<JitShader>> cache;
+    /// For a shader the JIT could not place (A32 on the PS Vita: its code arena is full).
+    InterpreterEngine fallback;
 };
 
 } // namespace Pica::Shader

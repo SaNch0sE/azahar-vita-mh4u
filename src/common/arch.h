@@ -15,11 +15,10 @@
     (BOOST_ARCH_ARM >= BOOST_VERSION_NUMBER(7, 0, 0) && BOOST_ARCH_WORD_BITS == 32)
 
 /**
- * Whether a shader JIT exists for this target. The three architectures with a compiler have one,
- * except on the PS Vita: mapping executable memory there needs a kernel plugin this build does
- * not require, so the shader interpreter is used instead.
+ * Whether a shader JIT exists for this target: the three architectures with a compiler. On the
+ * PS Vita the A32 one places its code in a VM memory block, which the app's unsafe flag allows.
  */
-#if (CITRA_ARCH(x86_64) || CITRA_ARCH(arm64) || CITRA_ARCH(arm32)) && !defined(__vita__)
+#if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64) || CITRA_ARCH(arm32)
 #define CITRA_HAS_SHADER_JIT 1
 #else
 #define CITRA_HAS_SHADER_JIT 0

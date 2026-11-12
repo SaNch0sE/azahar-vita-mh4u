@@ -306,9 +306,19 @@ public:
         Emit(0xF3B907C0 | VdBits(qd) | VmBits(qm));
     }
 
-    /// Round toward minus infinity (ARMv8 AArch32).
+    /// Round toward minus infinity. ARMv8 AArch32 only: the PS Vita's Cortex-A9 (ARMv7) faults
+    /// on it, so the compiler floors with the conversions below there.
     void VRINTM_F32(QReg qd, QReg qm) {
         Emit(0xF3BA06C0 | VdBits(qd) | VmBits(qm));
+    }
+
+    void VABS_F32(QReg qd, QReg qm) {
+        Emit(0xF3B90740 | VdBits(qd) | VmBits(qm));
+    }
+
+    /// Signed int to float.
+    void VCVT_F32_S32(QReg qd, QReg qm) {
+        Emit(0xF3BB0640 | 0x40 | VdBits(qd) | VmBits(qm));
     }
 
     /// Float to signed int, truncating.

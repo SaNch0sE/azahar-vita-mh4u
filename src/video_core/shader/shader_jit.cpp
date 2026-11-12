@@ -40,6 +40,11 @@ void JitEngine::SetupBatch(ShaderSetup& setup, u32 entry_point) {
     auto iter = cache.find(cache_key);
     if (iter != cache.end()) {
         setup.cached_shader = iter->second.get();
+#if CITRA_ARCH(arm32)
+        if (!iter->second->Compiled()) {
+            setup.cached_shader = nullptr;
+        }
+#endif
     } else {
         // Every miss here is a guest shader being translated on whichever thread is running
         // the command list, which is a stall on that thread. Logged so a hitch can be matched
@@ -53,6 +58,11 @@ void JitEngine::SetupBatch(ShaderSetup& setup, u32 entry_point) {
         LOG_INFO(HW_GPU, "shader JIT compiled {:016x} entry {} in {}.{:03} ms (cached {})",
                  cache_key, entry_point, us / 1000, us % 1000, cache.size() + 1);
         setup.cached_shader = shader.get();
+#if CITRA_ARCH(arm32)
+        if (!shader->Compiled()) {
+            setup.cached_shader = nullptr;
+        }
+#endif
         cache.emplace_hint(iter, cache_key, std::move(shader));
     }
 }
@@ -60,6 +70,12 @@ void JitEngine::SetupBatch(ShaderSetup& setup, u32 entry_point) {
 MICROPROFILE_DECLARE(GPU_Shader);
 
 void JitEngine::Run(const ShaderSetup& setup, ShaderUnit& state) const {
+#if CITRA_ARCH(arm32)
+    if (setup.cached_shader == nullptr) {
+        fallback.Run(setup, state);
+        return;
+    }
+#endif
     ASSERT(setup.cached_shader != nullptr);
 
     MICROPROFILE_SCOPE(GPU_Shader);

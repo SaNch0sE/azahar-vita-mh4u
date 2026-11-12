@@ -15,7 +15,10 @@
 #include "video_core/pica/shader_unit.h"
 #include "video_core/shader/shader_jit_a32_compiler.h"
 
-#ifdef __linux__
+#if defined(__vita__)
+#include <mutex>
+#include <psp2/kernel/sysmem.h>
+#elif defined(__linux__)
 #include <sys/mman.h>
 #endif
 
@@ -532,9 +535,30 @@ void JitShader::Compile_SLT(Instruction instr) {
     Compile_DestEnable(instr, SRC1);
 }
 
+alignas(16) static const std::array<float, 4> two_pow_23 = {8388608.0f, 8388608.0f, 8388608.0f,
+                                                            8388608.0f};
+
 void JitShader::Compile_FLR(Instruction instr) {
     Compile_SwizzleSrc(instr, 1, instr.common.src1, SRC1);
+#ifdef __vita__
+    // ARMv7 has no VRINTM (the console faulted on it): truncate and convert back, one less
+    // where that rounded up (a negative fraction). From 2^23 a float is an integer already
+    // and the conversion would saturate, so those - and infinities, and NaN - pass as they are.
+    auto& e = *emitter;
+    e.VCVT_S32_F32(VSCRATCH0, SRC1);
+    e.VCVT_F32_S32(VSCRATCH0, VSCRATCH0);
+    e.VCGT_F32(VSCRATCH1, VSCRATCH0, SRC1);
+    e.VAND(VSCRATCH1, VSCRATCH1, ONE);
+    e.VSUB_F32(VSCRATCH0, VSCRATCH0, VSCRATCH1);
+    e.MovImm32(SCRATCH0, reinterpret_cast<u32>(two_pow_23.data()));
+    e.VLD1(VSCRATCH2, SCRATCH0);
+    e.VABS_F32(VSCRATCH1, SRC1);
+    e.VCGT_F32(VSCRATCH1, VSCRATCH2, VSCRATCH1); // |x| < 2^23 (false for NaN)
+    e.VBSL(VSCRATCH1, VSCRATCH0, SRC1);
+    e.VMOV(SRC1, VSCRATCH1);
+#else
     emitter->VRINTM_F32(SRC1, SRC1);
+#endif
     Compile_DestEnable(instr, SRC1);
 }
 
@@ -946,7 +970,51 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
 
     // Copy to executable memory
     const std::size_t code_size = code_vec.size() * sizeof(u32);
-#ifdef __linux__
+#if defined(__vita__)
+    // One VM block for every shader (the system hands out few of them): code is bumped into
+    // it and never freed, as the engine's cache never drops a shader either. Writable only
+    // between Open and Close - for every VM block of the process, so briefly - then synced
+    // so the instruction cache sees it. Full: this shader is left uncompiled and the engine
+    // interprets it.
+    static std::mutex arena_mutex;
+    static SceUID arena_uid = -1;
+    static u8* arena_base = nullptr;
+    static std::size_t arena_used = 0;
+    constexpr std::size_t ArenaSize = 4 * 1024 * 1024;
+    {
+        std::scoped_lock lock{arena_mutex};
+        if (arena_uid < 0 && arena_base == nullptr) {
+            arena_uid = sceKernelAllocMemBlockForVM("pica shader jit", ArenaSize);
+            void* base = nullptr;
+            if (arena_uid < 0 || sceKernelGetMemBlockBase(arena_uid, &base) < 0) {
+                LOG_ERROR(HW_GPU, "shader JIT: no VM block ({:#x}); interpreting",
+                          static_cast<u32>(arena_uid));
+                arena_base = reinterpret_cast<u8*>(1); // tried once
+            } else {
+                arena_base = static_cast<u8*>(base);
+            }
+        }
+        const std::size_t aligned = (code_size + 31) & ~std::size_t{31};
+        if (arena_uid >= 0 && arena_used + aligned <= ArenaSize) {
+            code_mem = arena_base + arena_used;
+            code_mem_size = code_size;
+            arena_used += aligned;
+            sceKernelOpenVMDomain();
+            std::memcpy(code_mem, code_vec.data(), code_size);
+            sceKernelCloseVMDomain();
+            sceKernelSyncVMDomain(arena_uid, code_mem, code_size);
+        } else if (arena_uid >= 0) {
+            LOG_WARNING(HW_GPU, "shader JIT: code arena full ({} of {} bytes); interpreting",
+                        arena_used, ArenaSize);
+        }
+    }
+    if (code_mem == nullptr) {
+        emitter.reset();
+        code_vec.clear();
+        code_vec.shrink_to_fit();
+        return;
+    }
+#elif defined(__linux__)
     void* mem = mmap(nullptr, code_size, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     ASSERT_MSG(mem != MAP_FAILED, "could not allocate shader JIT code memory");
@@ -956,7 +1024,7 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
     __builtin___clear_cache(reinterpret_cast<char*>(code_mem),
                             reinterpret_cast<char*>(code_mem) + code_size);
 #else
-#error "The A32 shader JIT only knows how to map code on Linux"
+#error "The A32 shader JIT only knows how to map code on Linux and the PS Vita"
 #endif
 
     program = reinterpret_cast<CompiledShader*>(code_mem);
@@ -976,7 +1044,7 @@ void JitShader::Run(const ShaderSetup& setup, ShaderUnit& state, u32 offset) con
 JitShader::JitShader() = default;
 
 JitShader::~JitShader() {
-#ifdef __linux__
+#if defined(__linux__) && !defined(__vita__)
     if (code_mem != nullptr) {
         munmap(code_mem, code_mem_size);
     }
