@@ -358,7 +358,8 @@ static uint32_t active_cpu_mask(void) {
 }
 
 int azaharVersion() {
-    return 1;
+    // 2: AzaharRunRequest's fast system calls (svcGetThreadId, svcGetSystemTick).
+    return 2;
 }
 
 // One read into `out`. Returns the call's own status; the caller decides what a failure means.

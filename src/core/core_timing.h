@@ -209,6 +209,9 @@ public:
         void Idle();
 
         u64 GetTicks() const;
+        double GetClockScale() const {
+            return cpu_clock_scale;
+        }
         u64 GetIdleTicks() const;
 
         void AddTicks(u64 ticks);

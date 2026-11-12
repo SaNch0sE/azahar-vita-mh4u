@@ -662,6 +662,69 @@ static void pmu_slice_end(void) {
     azahar_pmu_runs++;
 }
 
+
+static AzaharRunRequest azahar_run_req; // defined further down; declared here for the handler
+
+// Guest ticks charged by the fast system calls of the current run, so a svcGetSystemTick sees
+// the time the calls before it took, as it does through the HLE (which charges each call).
+static uint64_t azahar_fast_charge;
+
+// Called from the svc vector stub (entry.S) with the guest's user registers already saved in
+// azahar_ctx, in Supervisor mode, IRQ masked, on a small private stack. Answers the call by
+// writing the result registers into azahar_ctx and returns nonzero - the stub then reloads them
+// and returns to the instruction after the svc - or returns 0 to exit to the app as usual.
+// Integer-only: the guest's VFP registers are live here.
+uint32_t azahar_fast_svc(uint32_t lr, uint32_t spsr) {
+    AzaharRunRequest *const q = &azahar_run_req;
+    if (q->fast_flags == 0 || (spsr & (1u << 5)) != 0) {
+        return 0; // off, or a Thumb svc
+    }
+    const uint32_t insn = *(const volatile uint32_t *)(uintptr_t)(lr - 4u);
+    if ((insn & 0xFF000000u) != 0xEF000000u) {
+        return 0; // only an unconditional svc
+    }
+    const uint32_t num = insn & 0x00FFFFFFu;
+    if (num == 0x37u && (q->fast_flags & AZAHAR_FAST_THREAD_ID)) {
+        const uint32_t handle = azahar_ctx.r[1];
+        uint32_t id = 0;
+        if (handle == 0xFFFF8000u) {
+            id = q->cur_thread_id;
+        } else {
+            uint32_t i = 0;
+            for (; i < 4u; i++) {
+                if (q->handle_ids[i][0] != 0u && q->handle_ids[i][0] == handle) {
+                    id = q->handle_ids[i][1];
+                    break;
+                }
+            }
+            if (i == 4u) {
+                return 0;
+            }
+        }
+        azahar_ctx.r[0] = 0u; // RESULT_SUCCESS
+        azahar_ctx.r[1] = id;
+        azahar_fast_charge += q->charge_37;
+        q->fast37_count++;
+        return 1;
+    }
+    if (num == 0x28u && (q->fast_flags & AZAHAR_FAST_SYSTEM_TICK) && azahar_run_quantum_ticks != 0u &&
+        gic_va != 0) {
+        const uint32_t left = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
+        const uint32_t spent = azahar_run_quantum_ticks > left ? azahar_run_quantum_ticks - left : 0u;
+        azahar_fast_charge += q->charge_28;
+        uint64_t tick = q->tick_base + (((uint64_t)spent * q->tick_ratio_q16) >> 16) + azahar_fast_charge;
+        if (tick < q->last_tick) {
+            tick = q->last_tick;
+        }
+        q->last_tick = tick;
+        azahar_ctx.r[0] = (uint32_t)tick;
+        azahar_ctx.r[1] = (uint32_t)(tick >> 32);
+        q->fast28_count++;
+        return 1;
+    }
+    return 0;
+}
+
 // owned, not shared, while guest code runs — and put back afterwards.
 static void core2_run(void) {
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
@@ -1770,6 +1833,9 @@ int azaharRun(AzaharRunRequest *user_req) {
         }
     }
     azahar_run_timer_left = 0;
+    azahar_fast_charge = 0;
+    azahar_run_req.fast37_count = 0;
+    azahar_run_req.fast28_count = 0;
     if (azahar_verbose) {
         emit("== azaharRun  pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u ticks\n",
              azahar_ctx.r[15], azahar_ctx.cpsr, azahar_ctx.r[13], azahar_ctx.r[0], azahar_ctx.r[1],

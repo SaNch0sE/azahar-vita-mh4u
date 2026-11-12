@@ -563,9 +563,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 const auto wt_stats = system.Memory().WriteTracker().TakeStats();
                 sceClibPrintf(
                     "[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  "
-                    "slices %u (svc %u)  guest %u us  in %u us  wf %u wa %u wh %u  "
+                    "slices %u (svc %u fast %u)  guest %u us  in %u us  wf %u wa %u wh %u  "
                     "queue %u brake %u us  heap %u/%u KiB%s%s%s\n",
-                    speed, fps10 / 10, fps10 % 10, presented, skipped, rec.slices, rec.svcs,
+                    speed, fps10 / 10, fps10 % 10, presented, skipped, rec.slices, rec.svcs, static_cast<unsigned>(Core::NativeStats::fast_svcs.exchange(0)),
                     static_cast<unsigned>(rec.guest_ns / 1000),
                     static_cast<unsigned>(rec.vanrun_us),
                     Core::NativeStats::write_faults.exchange(0, std::memory_order_relaxed),

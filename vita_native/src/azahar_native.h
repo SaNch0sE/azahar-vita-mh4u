@@ -69,7 +69,26 @@ typedef struct AzaharRunRequest {
     uint32_t quantum_us;  // in: preemption quantum; 0 runs without a timer (the guest must trap)
     uint32_t timer_hz;    // out: the private timer's measured clock
     uint32_t timer_left;  // out: timer counter at exit (ticks not yet spent)
+    // Version 2: system calls answered on the core, without leaving the guest - the guest's
+    // svcGetThreadId and svcGetSystemTick, tens of thousands a second in some titles, each of
+    // which otherwise costs a full exit, an HLE dispatch and a re-entry. Only an unconditional
+    // ARM-state svc is taken; anything the plugin cannot answer exits as before. An older plugin
+    // ignores these fields (the counts come back zero), so the app checks azaharVersion first.
+    uint32_t fast_flags;       // in: AZAHAR_FAST_* - which calls may be answered here
+    uint32_t cur_thread_id;    // in: the running guest thread's id, for handle 0xFFFF8000
+    uint32_t handle_ids[4][2]; // in: other (handle, thread id) pairs; handle 0 = unused
+    uint32_t tick_ratio_q16;   // in: guest ticks per private-timer tick, 16.16
+    uint32_t charge_37;        // in: guest ticks each svcGetThreadId costs (as the HLE charges)
+    uint32_t charge_28;        // in: guest ticks each svcGetSystemTick costs
+    uint32_t fast37_count;     // out: svcGetThreadId calls answered here
+    uint32_t fast28_count;     // out: svcGetSystemTick calls answered here
+    uint32_t pad2;
+    uint64_t tick_base;        // in: the guest's tick count at entry
+    uint64_t last_tick;        // in/out: the last tick handed out; returned ticks never go below
 } AzaharRunRequest;
+
+#define AZAHAR_FAST_THREAD_ID 1u   // svc 0x37 GetThreadId
+#define AZAHAR_FAST_SYSTEM_TICK 2u // svc 0x28 GetSystemTick
 
 // Runtime edits to the guest's mapping, for svcControlMemory / svcMapMemoryBlock and friends.
 // Only between runs: the guest is stopped at an exit while the app handles its svc. MAP adds

@@ -177,6 +177,13 @@ private:
     /// The page table last handed to vector_interpreter: SetPageTable clears its translation
     /// cache, so it is only called again when the table changes.
     const Memory::PageTable* vector_interpreter_table = nullptr;
+    /// Fast system calls answered in the plugin (azaharVersion 2): -1 not decided yet.
+    int fast_svc = -1;
+    u32 fast_timer_hz = 0;
+    u64 fast_last_tick = 0;
+    /// Thread handles other than the current-thread pseudo-handle the guest asked
+    /// svcGetThreadId about, most recent first; resolved again before every slice.
+    std::array<u32, 4> fast_handles{};
 };
 
 } // namespace Core

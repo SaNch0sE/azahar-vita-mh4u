@@ -384,6 +384,49 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     run.ctx.tpidruro = cp15[CP15_THREAD_URO];
     run.ctx.tpidrurw = cp15[CP15_THREAD_UPRW];
     run.quantum_us = static_cast<u32>(quantum_ns / 1000);
+    if (fast_svc < 0) {
+        std::FILE* off = std::fopen("ux0:data/azahar/nofastsvc", "rb");
+        if (off != nullptr) {
+            std::fclose(off);
+        }
+        fast_svc = (azaharVersion() >= 2 && off == nullptr) ? 1 : 0;
+        LOG_INFO(Core_ARM11, "fast system calls in the plugin: {} (plugin version {})",
+                 fast_svc ? "on" : "off", azaharVersion());
+    }
+    const double clock_scale = timer->GetClockScale();
+    if (fast_svc > 0) {
+        // svcGetThreadId: the running thread, and the other handles the guest has asked about,
+        // resolved now - a handle closed and reused since is simply looked up again.
+        Kernel::KernelSystem& kernel = system.Kernel();
+        if (const auto thread = kernel.GetCurrentThreadManager().GetCurrentThread()) {
+            run.fast_flags |= AZAHAR_FAST_THREAD_ID;
+            run.cur_thread_id = thread->GetThreadId();
+            if (const auto process = kernel.GetCurrentProcess()) {
+                for (std::size_t i = 0; i < fast_handles.size(); i++) {
+                    if (fast_handles[i] == 0) {
+                        continue;
+                    }
+                    if (const auto t = process->handle_table.Get<Kernel::Thread>(fast_handles[i])) {
+                        run.handle_ids[i][0] = fast_handles[i];
+                        run.handle_ids[i][1] = t->GetThreadId();
+                    }
+                }
+            }
+        }
+        // svcGetSystemTick: the plugin adds the time spent in this slice, at the rate CreditTime
+        // will credit it, to the ticks at entry. Needs the timer's clock, known after one run.
+        if (fast_timer_hz != 0 && run.quantum_us != 0) {
+            run.fast_flags |= AZAHAR_FAST_SYSTEM_TICK;
+            run.tick_ratio_q16 = static_cast<u32>(
+                static_cast<double>(BASE_CLOCK_RATE_ARM11) * clock_scale * 65536.0 /
+                fast_timer_hz);
+            run.tick_base = timer->GetTicks();
+            run.last_tick = fast_last_tick;
+        }
+        // The cycles the HLE charges these calls (svc.cpp's table), in guest ticks.
+        run.charge_37 = static_cast<u32>(677 * clock_scale);
+        run.charge_28 = static_cast<u32>(340 * clock_scale);
+    }
 
     const SceUInt64 vanrun_start = sceKernelGetProcessTimeWide();
     const int ret = azaharRun(&run);
@@ -403,6 +446,34 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         NativeStats::svcs.fetch_add(1, std::memory_order_relaxed);
     }
     CreditTime(run, quantum_ns);
+    if (fast_svc > 0) {
+        fast_timer_hz = run.timer_hz;
+        if (run.fast37_count + run.fast28_count != 0) {
+            NativeStats::fast_svcs.fetch_add(run.fast37_count + run.fast28_count,
+                                             std::memory_order_relaxed);
+            timer->AddTicks(u64{run.fast37_count} * 677 + u64{run.fast28_count} * 340);
+        }
+        if (run.fast28_count != 0) {
+            fast_last_tick = run.last_tick;
+            // Guest time never goes back: the slice's credit is rounded differently from the
+            // plugin's estimate, so catch up to the last tick it handed out.
+            const u64 now = timer->GetTicks();
+            if (now < fast_last_tick) {
+                timer->AddTicks(static_cast<u64>((fast_last_tick - now) / clock_scale) + 1);
+            }
+        }
+        if (run.reason == AZAHAR_EXIT_SVC && run.svc_number == 0x37 &&
+            run.ctx.r[1] != 0xFFFF8000u) {
+            // A handle the plugin could not answer: remember it for the next slices.
+            const u32 handle = run.ctx.r[1];
+            if (std::find(fast_handles.begin(), fast_handles.end(), handle) ==
+                fast_handles.end()) {
+                std::move_backward(fast_handles.begin(), fast_handles.end() - 1,
+                                   fast_handles.end());
+                fast_handles[0] = handle;
+            }
+        }
+    }
 
     switch (run.reason) {
     case AZAHAR_EXIT_SVC: {

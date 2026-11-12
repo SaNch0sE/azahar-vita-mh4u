@@ -16,6 +16,8 @@ inline std::atomic<u32> slices{0};
 /// Guest stores into pages the surface cache armed (core/guest_write_tracker.h).
 inline std::atomic<u32> write_faults{0};
 inline std::atomic<u32> svcs{0};
+/// System calls the plugin answered without leaving the guest (azaharVersion 2).
+inline std::atomic<u32> fast_svcs{0};
 inline std::atomic<u64> credited_ns{0};
 
 // Where the emulation thread's wall time goes, microseconds per stats window: inside the

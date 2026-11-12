@@ -98,6 +98,27 @@ azahar_vec_\name:
     ldr     sp, [sp]
     stmia   sp, {r0-r14}^
     nop
+    .if \reason == 1
+    @ Fast system calls (azahar_fast_svc in native.c): answered here without leaving the guest.
+    @ The user registers are in ctx; the C call may clobber r0-r3/r12, which the ldm ^ below
+    @ restores from ctx along with the result registers the handler wrote there. SPSR_svc and
+    @ LR_svc (kept on the private stack) are the guest's return state.
+    ldr     sp, =azahar_fast_stack_top
+    push    {r4, lr}                @ lr: the instruction after the svc; r4 pads to 8 bytes
+    mov     r0, lr
+    mrs     r1, spsr
+    ldr     r2, =azahar_fast_svc
+    blx     r2
+    pop     {r4, lr}
+    cmp     r0, #0
+    ldr     sp, =azahar_ctx_ptr
+    ldr     sp, [sp]
+    beq     5f
+    ldmia   sp, {r0-r14}^           @ the guest's registers, with the handler's results
+    nop                             @ no banked access in the instruction after ldm ^
+    movs    pc, lr                  @ back to the guest after the svc, cpsr = SPSR_svc
+5:
+    .endif
     mov     r0, #\reason
     b       azahar_exit_common
 9:  ldr     sp, =azahar_stray_stack_top
@@ -346,6 +367,10 @@ azahar_stray_retry: .word 0
 azahar_stray_stack: .space 64
     .global azahar_stray_stack_top
 azahar_stray_stack_top:
+    .balign 8
+azahar_fast_stack: .space 256
+    .global azahar_fast_stack_top
+azahar_fast_stack_top:
 azahar_irq_stack:  .space 64
     .global azahar_irq_stack_top
 azahar_irq_stack_top:
