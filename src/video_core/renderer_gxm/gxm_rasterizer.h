@@ -85,6 +85,10 @@ public:
     void EndFrame();
     /// Every cached surface to ux0:data/azahar/dump (RequestSurfaceDump); GPU idle.
     void DumpSurfaces();
+    /// Whether the current TEV configuration (or fragment lighting) reads texture `unit`.
+    [[nodiscard]] bool TextureUnitRead(u32 unit) const;
+    /// Level 0 of `surface` to <stem>.ppm, with <stem>_a.pgm (alpha) or _s.pgm (stencil).
+    void WriteSurfaceImage(Surface& surface, const std::string& stem);
     /// The presentation layer's cost, charged from the renderer so the report can set it
     /// against the draws.
     void NotePresentTime(u64 us) {
@@ -447,7 +451,7 @@ private:
     bool vs_bank_valid = false;
     /// Texture units bound to the white texture because the cache found no surface, or a
     /// surface with no memory behind it: what a blank picture after a trim is made of.
-    u32 stat_white_nosurface{}, stat_white_nomem{};
+    u32 stat_white_nosurface{}, stat_white_nomem{}, stat_white_unread_feedback{};
     bool resources_ready{};
     bool resources_failed{};
     // Counters, reported on a wall-clock interval (a frame count is useless at 1 fps).

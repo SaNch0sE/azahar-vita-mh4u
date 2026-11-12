@@ -1509,15 +1509,24 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     // ux0:data/azahar/blend_log.txt - which draws use the constant-colour factors GXM lacks.
     static const bool log_blend = GxmFlag("logblend");
     if (log_blend) {
-        static std::set<std::tuple<u64, u64, u32, u32>> seen;
+        static std::set<std::tuple<u64, u64, u32, u32, u32>> seen;
         u32 blending_raw = 0;
         std::memcpy(&blending_raw, &om.alpha_blending, sizeof(blending_raw));
         const u64 state = (static_cast<u64>(blending_raw) << 32) | om.blend_const.raw;
         const u32 tex0_addr = regs.texturing.texture0.GetPhysicalAddress();
         const u32 color_addr = fb_regs.GetColorBufferPhysicalAddress();
-        if (seen.size() < 4096 && seen.insert({fs_hash, state, tex0_addr, color_addr}).second) {
+        // The surface the cache answered texture unit 0 with: a texture inside a bigger
+        // surface comes back as that surface, read at an offset.
+        u32 s0_addr = 0, s0_w = 0, s0_h = 0;
+        if (bound_surfaces[0]) {
+            const Surface& s0 = res_cache.GetSurface(bound_surfaces[0]);
+            s0_addr = s0.addr;
+            s0_w = s0.width;
+            s0_h = s0.height;
+        }
+        if (seen.size() < 4096 && seen.insert({fs_hash, state, tex0_addr, color_addr, s0_addr ^ (s0_w << 20)}).second) {
             if (std::FILE* f = std::fopen("ux0:data/azahar/blend_log.txt", "a")) {
-                std::fprintf(f, "us_%016llx ab %u lit %u eq %u/%u src %u/%u dst %u/%u const %08x mask %x fmt %u tex %u/%u/%u t0 %08x cb %08x\n",
+                std::fprintf(f, "us_%016llx ab %u lit %u eq %u/%u src %u/%u dst %u/%u const %08x mask %x fmt %u tex %u/%u/%u t0 %08x cb %08x s0 %08x %ux%u\n",
                              static_cast<unsigned long long>(fs_hash),
                              static_cast<u32>(om.alphablend_enable.Value()),
                              static_cast<u32>(fs_config.lighting.enable.Value()),
@@ -1533,7 +1542,7 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
                              static_cast<u32>(regs.texturing.texture0_format.Value()),
                              static_cast<u32>(regs.texturing.texture1_format.Value()),
                              static_cast<u32>(regs.texturing.texture2_format.Value()),
-                             tex0_addr, color_addr);
+                             tex0_addr, color_addr, s0_addr, s0_w, s0_h);
                 std::fclose(f);
             }
         }
@@ -1909,6 +1918,25 @@ void RasterizerGxm::BindFragmentTexture(u32 unit, const SceGxmTexture& texture) 
     }
 }
 
+bool RasterizerGxm::TextureUnitRead(u32 unit) const {
+    // Fragment lighting may read any unit (bump, shadow), so a lit draw counts as reading it.
+    if (regs.lighting.disable == 0) {
+        return true;
+    }
+    using Source = Pica::TexturingRegs::TevStageConfig::Source;
+    const Source wanted = static_cast<Source>(static_cast<u32>(Source::Texture0) + unit);
+    for (const auto& stage : regs.texturing.GetTevStages()) {
+        for (const Source src : {stage.color_source1.Value(), stage.color_source2.Value(),
+                                 stage.color_source3.Value(), stage.alpha_source1.Value(),
+                                 stage.alpha_source2.Value(), stage.alpha_source3.Value()}) {
+            if (src == wanted) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
     std::array<SceGxmTexture, 3> textures{white_texture, white_texture, white_texture};
@@ -1997,6 +2025,30 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         if (surface.HasPendingClear()) {
             runtime.FlushPendingClear(surface);
         }
+        // dumpdraws: in the logtex window (dump_now with dumpfile), each sampled surface that
+        // is a render target, as this draw reads it, to ux0:data/azahar/dump/dNNN_*, listed in
+        // d_index.txt with the draw's target - render-to-texture chains step by step.
+        static const bool dump_draws = GxmFlag("dumpdraws");
+        if (dump_draws && logtex_frames_left > 0 &&
+            surface.type == VideoCore::SurfaceType::Color) {
+            static u32 dumped = 0;
+            if (dumped < 160) {
+                const u32 n = dumped++;
+                const u32 target = regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
+                const std::string stem =
+                    fmt::format("ux0:data/azahar/dump/d{:03}_u{}_t{:08x}_s{:08x}_{}x{}_cb{:08x}", n,
+                                unit, info.physical_address, surface.addr, surface.width,
+                                surface.height, target);
+                sceIoMkdir("ux0:data/azahar/dump", 0777);
+                if (std::FILE* f = std::fopen("ux0:data/azahar/dump/d_index.txt", "a")) {
+                    std::fprintf(f, "%03u draw %u unit %u tex %08x %ux%u surface %08x %ux%u cb %08x\n",
+                                 n, stat_draws, unit, info.physical_address, info.width,
+                                 info.height, surface.addr, surface.width, surface.height, target);
+                    std::fclose(f);
+                }
+                WriteSurfaceImage(surface, stem);
+            }
+        }
         // Sampling the target being drawn is a feedback loop GXM cannot express on a
         // linear surface within the scene; the GL backend copies the texture. Bind it
         // as-is (the tiler reads what was stored before this scene) rather than white.
@@ -2009,7 +2061,16 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         static const bool skip_feedback = !GxmFlag("keepfeedback");
         if (skip_feedback && framebuffer != nullptr && framebuffer->HasColor() &&
             surface_id == framebuffer->color_id) {
-            skip_feedback_draw = true;
+            // Only a unit the program reads makes a feedback loop. An enabled unit left
+            // pointing at the target by a draw that shades from vertex colour alone is not
+            // one: Monster Hunter 4 Ultimate draws its sky haze that way, and dropping it left
+            // the whole scene olive. Such a unit stays unbound (white) and the draw is made.
+            if (TextureUnitRead(unit)) {
+                skip_feedback_draw = true;
+            } else {
+                stat_white_unread_feedback++;
+                continue;
+            }
         }
         // feedbackbreak: end the scene first, so its tiles are stored and the texture read in
         // the next scene sees this frame rather than what memory held before. Tried before the
@@ -3264,6 +3325,121 @@ void RasterizerGxm::EndFrame() {
 #endif
 }
 
+void RasterizerGxm::WriteSurfaceImage(Surface& surface, const std::string& stem) {
+    using VideoCore::PixelFormat;
+    if (!surface.HasMemory() || surface.width == 0 || surface.height == 0) {
+        return;
+    }
+    const u32 w = surface.width;
+    const u32 h = surface.height;
+    const PixelFormat pf = surface.pixel_format;
+    const u32 bpp = pf == PixelFormat::D16 ? 2u : surface.Format().bytes_per_pixel;
+    const u32 bytes = w * h * bpp;
+    const auto staging = runtime.FindStaging(bytes, false);
+    surface.Download(VideoCore::BufferTextureCopy{.buffer_offset = 0,
+                                                  .buffer_size = bytes,
+                                                  .texture_rect = {0, h, w, 0},
+                                                  .texture_level = 0},
+                     staging);
+    const bool depth_word = pf == PixelFormat::D24S8;
+    const bool depth_f32 = pf == PixelFormat::D24;
+    const bool depth_16 = pf == PixelFormat::D16;
+    const bool has_alpha = !depth_word && !depth_f32 && !depth_16 &&
+                           pf != PixelFormat::RGB565 && pf != PixelFormat::RGB8;
+    const std::string ppm_path = stem + ".ppm";
+    const std::string pgm_path = stem + (depth_word ? "_s.pgm" : "_a.pgm");
+    FILE* ppm = std::fopen(ppm_path.c_str(), "wb");
+    FILE* pgm = (has_alpha || depth_word) ? std::fopen(pgm_path.c_str(), "wb") : nullptr;
+    if (ppm == nullptr) {
+        if (pgm != nullptr) {
+            std::fclose(pgm);
+        }
+        return;
+    }
+    std::string header = fmt::format("P6\n{} {}\n255\n", w, h);
+    std::fwrite(header.data(), 1, header.size(), ppm);
+    if (pgm != nullptr) {
+        header = fmt::format("P5\n{} {}\n255\n", w, h);
+        std::fwrite(header.data(), 1, header.size(), pgm);
+    }
+    std::vector<u8> rgb(w * 3);
+    std::vector<u8> extra(w);
+    for (u32 row = 0; row < h; row++) {
+        const u8* src = staging.mapped.data() + static_cast<std::size_t>(h - 1 - row) * w * bpp;
+        for (u32 x = 0; x < w; x++) {
+            const u8* px = src + x * bpp;
+            u8 r = 0, g = 0, b = 0, a = 255;
+            switch (pf) {
+            case PixelFormat::RGB5A1: {
+                u16 v;
+                std::memcpy(&v, px, 2);
+                r = static_cast<u8>(((v >> 11) & 31) * 255 / 31);
+                g = static_cast<u8>(((v >> 6) & 31) * 255 / 31);
+                b = static_cast<u8>(((v >> 1) & 31) * 255 / 31);
+                a = (v & 1) ? 255 : 0;
+                break;
+            }
+            case PixelFormat::RGB565: {
+                u16 v;
+                std::memcpy(&v, px, 2);
+                r = static_cast<u8>(((v >> 11) & 31) * 255 / 31);
+                g = static_cast<u8>(((v >> 5) & 63) * 255 / 63);
+                b = static_cast<u8>((v & 31) * 255 / 31);
+                break;
+            }
+            case PixelFormat::RGBA4: {
+                u16 v;
+                std::memcpy(&v, px, 2);
+                r = static_cast<u8>(((v >> 12) & 15) * 17);
+                g = static_cast<u8>(((v >> 8) & 15) * 17);
+                b = static_cast<u8>(((v >> 4) & 15) * 17);
+                a = static_cast<u8>((v & 15) * 17);
+                break;
+            }
+            case PixelFormat::D16: {
+                u16 v;
+                std::memcpy(&v, px, 2);
+                r = g = b = static_cast<u8>(v >> 8);
+                break;
+            }
+            case PixelFormat::D24: {
+                float f;
+                std::memcpy(&f, px, 4);
+                r = g = b = static_cast<u8>(std::clamp(f, 0.0f, 1.0f) * 255.0f);
+                break;
+            }
+            case PixelFormat::D24S8: {
+                // GL order after Download: depth in the top 24 bits, stencil below.
+                u32 v;
+                std::memcpy(&v, px, 4);
+                r = g = b = static_cast<u8>(v >> 24);
+                a = static_cast<u8>(v & 0xff);
+                break;
+            }
+            default:
+                // Everything else is stored as bytes R,G,B,A.
+                r = px[0];
+                g = px[1];
+                b = px[2];
+                a = px[3];
+                break;
+            }
+            rgb[x * 3 + 0] = r;
+            rgb[x * 3 + 1] = g;
+            rgb[x * 3 + 2] = b;
+            extra[x] = a;
+        }
+        std::fwrite(rgb.data(), 1, rgb.size(), ppm);
+        if (pgm != nullptr) {
+            std::fwrite(extra.data(), 1, extra.size(), pgm);
+        }
+    }
+    std::fclose(ppm);
+    if (pgm != nullptr) {
+        std::fclose(pgm);
+    }
+}
+
 void RasterizerGxm::DumpSurfaces() {
     // Level 0 of every surface with memory, read back the way a download is (through the
     // transfer unit, which is the only way a rendered surface's pixels reach the CPU under
@@ -3283,14 +3459,6 @@ void RasterizerGxm::DumpSurfaces() {
         const u32 w = surface.width;
         const u32 h = surface.height;
         const PixelFormat pf = surface.pixel_format;
-        const u32 bpp = pf == PixelFormat::D16 ? 2u : surface.Format().bytes_per_pixel;
-        const u32 bytes = w * h * bpp;
-        const auto staging = runtime.FindStaging(bytes, false);
-        surface.Download(VideoCore::BufferTextureCopy{.buffer_offset = 0,
-                                                      .buffer_size = bytes,
-                                                      .texture_rect = {0, h, w, 0},
-                                                      .texture_level = 0},
-                         staging);
         static constexpr const char* TypeNames[] = {"color", "texture", "depth", "depthstencil",
                                                     "fill", "invalid"};
         const char* type = TypeNames[std::min<u32>(static_cast<u32>(surface.type), 5)];
@@ -3306,103 +3474,7 @@ void RasterizerGxm::DumpSurfaces() {
                 surface.presented ? " presented" : "", surface.gpu_serial);
             std::fwrite(line.data(), 1, line.size(), index);
         }
-        const bool depth_word = pf == PixelFormat::D24S8;
-        const bool depth_f32 = pf == PixelFormat::D24;
-        const bool depth_16 = pf == PixelFormat::D16;
-        const bool has_alpha = !depth_word && !depth_f32 && !depth_16 &&
-                               pf != PixelFormat::RGB565 && pf != PixelFormat::RGB8;
-        const std::string ppm_path = stem + ".ppm";
-        const std::string pgm_path = stem + (depth_word ? "_s.pgm" : "_a.pgm");
-        FILE* ppm = std::fopen(ppm_path.c_str(), "wb");
-        FILE* pgm = (has_alpha || depth_word) ? std::fopen(pgm_path.c_str(), "wb") : nullptr;
-        if (ppm == nullptr) {
-            if (pgm != nullptr) {
-                std::fclose(pgm);
-            }
-            return;
-        }
-        std::string header = fmt::format("P6\n{} {}\n255\n", w, h);
-        std::fwrite(header.data(), 1, header.size(), ppm);
-        if (pgm != nullptr) {
-            header = fmt::format("P5\n{} {}\n255\n", w, h);
-            std::fwrite(header.data(), 1, header.size(), pgm);
-        }
-        std::vector<u8> rgb(w * 3);
-        std::vector<u8> extra(w);
-        for (u32 row = 0; row < h; row++) {
-            const u8* src = staging.mapped.data() + static_cast<std::size_t>(h - 1 - row) * w * bpp;
-            for (u32 x = 0; x < w; x++) {
-                const u8* px = src + x * bpp;
-                u8 r = 0, g = 0, b = 0, a = 255;
-                switch (pf) {
-                case PixelFormat::RGB5A1: {
-                    u16 v;
-                    std::memcpy(&v, px, 2);
-                    r = static_cast<u8>(((v >> 11) & 31) * 255 / 31);
-                    g = static_cast<u8>(((v >> 6) & 31) * 255 / 31);
-                    b = static_cast<u8>(((v >> 1) & 31) * 255 / 31);
-                    a = (v & 1) ? 255 : 0;
-                    break;
-                }
-                case PixelFormat::RGB565: {
-                    u16 v;
-                    std::memcpy(&v, px, 2);
-                    r = static_cast<u8>(((v >> 11) & 31) * 255 / 31);
-                    g = static_cast<u8>(((v >> 5) & 63) * 255 / 63);
-                    b = static_cast<u8>((v & 31) * 255 / 31);
-                    break;
-                }
-                case PixelFormat::RGBA4: {
-                    u16 v;
-                    std::memcpy(&v, px, 2);
-                    r = static_cast<u8>(((v >> 12) & 15) * 17);
-                    g = static_cast<u8>(((v >> 8) & 15) * 17);
-                    b = static_cast<u8>(((v >> 4) & 15) * 17);
-                    a = static_cast<u8>((v & 15) * 17);
-                    break;
-                }
-                case PixelFormat::D16: {
-                    u16 v;
-                    std::memcpy(&v, px, 2);
-                    r = g = b = static_cast<u8>(v >> 8);
-                    break;
-                }
-                case PixelFormat::D24: {
-                    float f;
-                    std::memcpy(&f, px, 4);
-                    r = g = b = static_cast<u8>(std::clamp(f, 0.0f, 1.0f) * 255.0f);
-                    break;
-                }
-                case PixelFormat::D24S8: {
-                    // GL order after Download: depth in the top 24 bits, stencil below.
-                    u32 v;
-                    std::memcpy(&v, px, 4);
-                    r = g = b = static_cast<u8>(v >> 24);
-                    a = static_cast<u8>(v & 0xff);
-                    break;
-                }
-                default:
-                    // Everything else is stored as bytes R,G,B,A.
-                    r = px[0];
-                    g = px[1];
-                    b = px[2];
-                    a = px[3];
-                    break;
-                }
-                rgb[x * 3 + 0] = r;
-                rgb[x * 3 + 1] = g;
-                rgb[x * 3 + 2] = b;
-                extra[x] = a;
-            }
-            std::fwrite(rgb.data(), 1, rgb.size(), ppm);
-            if (pgm != nullptr) {
-                std::fwrite(extra.data(), 1, extra.size(), pgm);
-            }
-        }
-        std::fclose(ppm);
-        if (pgm != nullptr) {
-            std::fclose(pgm);
-        }
+        WriteSurfaceImage(surface, stem);
     });
     if (index != nullptr) {
         std::fclose(index);
