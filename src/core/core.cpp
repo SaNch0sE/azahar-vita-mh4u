@@ -208,11 +208,10 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         break;
     }
     case Signal::Save: {
-        if (gpu != nullptr && gpu->RenderThreadRunning()) {
-            LOG_ERROR(Core, "Save states are not supported while the GPU render thread is active");
-            status_details = "Save states are unavailable with the GPU thread";
-            return ResultStatus::ErrorSavestate;
-        }
+        // No refusal while the render thread runs: the save below is taken inside a
+        // ScopedRenderContext, which stops that thread for its duration and starts it again.
+        // A rendered surface lives in GPU memory, so a state may restore one stale frame
+        // before the title draws over it.
         if (save_state_request_status != SaveStateStatus::NONE) {
             LOG_ERROR(Core, "A pending save state operation has not finished yet");
             status_details = "A pending save state operation has not finished yet";

@@ -683,18 +683,26 @@ int EmulatorMain() {
         SceCommonDialogConfigParam dialog_config_param{};
         sceCommonDialogSetConfigParam(&dialog_config_param);
 
-        if (!module_installed("azaharnative")) {
+        // ux0:data/azahar/cpu_interpreter: run without the kernel modules (the interpreter
+        // takes the guest, as ARM_VitaNative::CreateMap does for the same file) - the only way
+        // to run under the Vita3K emulator, which cannot load a kernel plugin.
+        SceIoStat interpreter_stat{};
+        const bool interpreter_only =
+            sceIoGetstat("ux0:data/azahar/cpu_interpreter", &interpreter_stat) >= 0;
+        if (interpreter_only) {
+            LOG_WARNING(Frontend, "cpu_interpreter present: skipping the kernel module checks");
+        } else if (!module_installed("azaharnative")) {
             show_error_dialog("azaharnative.skprx not installed. Check the release page.");
             return -1;
         }
 
-        if (!module_installed("CapUnlocker")) {
+        if (!interpreter_only && !module_installed("CapUnlocker")) {
             show_error_dialog("CapUnlocker.skprx not installed. Install it from "
                               "https://github.com/GrapheneCt/CapUnlocker");
             return -1;
         }
 
-        if (azaharVersion() < MinAzaharNativeVersion) {
+        if (!interpreter_only && azaharVersion() < MinAzaharNativeVersion) {
             show_error_dialog(
                 "The installed azaharnative.skprx module is not compatible. Please update it.");
             return -1;

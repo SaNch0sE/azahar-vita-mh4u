@@ -2228,6 +2228,16 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
             CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpDiffuse});
         }
         break;
+    case DebugOutput::Texcoord2:
+        // dbgout_uv1: texture coordinate 1 as (u, v, 0, 1). Coordinates a surface's texture is
+        // sampled with come out as smooth gradients; broken ones as noise or flat blocks.
+        if (unit_used[1]) {
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput), 0x3}, {Reg::Pa(texcoord_pa[1]), XYZW},
+                  ConstZero);
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x3}, ConstZero, ConstZero);
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x2}, ConstOne, ConstZero);
+        }
+        break;
     default:
         break;
     }

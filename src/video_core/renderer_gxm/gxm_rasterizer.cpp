@@ -205,6 +205,9 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texcoord1);
         } else if (GxmFlag("dbgout_light")) {
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Lighting);
+        } else if (GxmFlag("dbgout_uv1")) {
+            // Texcoord2 stands for "texture coordinate 1 as colour" in the USSE emitter.
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texcoord2);
         }
     }
     runtime.SetSyncHook([this](u64 serial) { SyncToGpu(serial); });

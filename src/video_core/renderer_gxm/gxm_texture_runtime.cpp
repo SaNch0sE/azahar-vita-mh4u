@@ -1589,8 +1589,13 @@ Sampler::Sampler(TextureRuntime&, VideoCore::SamplerParams params) {
         case WrapMode::Repeat2:
         case WrapMode::Repeat3:
             return SCE_GXM_TEXTURE_ADDR_REPEAT;
-        case WrapMode::MirroredRepeat:
-            return SCE_GXM_TEXTURE_ADDR_MIRROR;
+        case WrapMode::MirroredRepeat: {
+            // mirrorasrepeat: plain repeat instead of the mirror bits forced into a linear
+            // texture's control word, to tell whether those bits are what corrupts the
+            // out-of-range coordinates of Monster Hunter 4 Ultimate's world textures.
+            static const bool mirror_as_repeat = GxmFlag("mirrorasrepeat");
+            return mirror_as_repeat ? SCE_GXM_TEXTURE_ADDR_REPEAT : SCE_GXM_TEXTURE_ADDR_MIRROR;
+        }
         default:
             return SCE_GXM_TEXTURE_ADDR_CLAMP;
         }
