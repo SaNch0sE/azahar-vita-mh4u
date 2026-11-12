@@ -52,6 +52,11 @@ bool LogtexActive() {
     static const bool enabled = GxmFlag("logtex");
     return enabled && logtex_frames_left > 0 && logtex_lines < 400;
 }
+namespace {
+// Targets of the shadow-map passes this backend drops (P5): [start, end) of each, so a later
+// texture read of that memory - which nothing has drawn - can be reported.
+std::vector<std::pair<u32, u32>> dropped_shadow_targets;
+} // namespace
 } // namespace GxmRenderer
 
 namespace GxmRenderer {
@@ -1856,6 +1861,25 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         // pass that samples the wrong thing can be told from the log - the surface the cache
         // answered with, its format next to the one asked for, and whether the texture lies in
         // the target being drawn.
+        {
+            // A texture over a dropped shadow-map pass's target reads memory nothing drew.
+            static u32 overlap_reports = 0;
+            const u32 tex_start = info.physical_address;
+            const u32 tex_end = tex_start + static_cast<u32>(surface.end - surface.addr);
+            for (const auto& [start, end] : dropped_shadow_targets) {
+                if (overlap_reports < 48 && tex_start < end && start < tex_end) {
+                    overlap_reports++;
+                    LOG_WARNING(Render,
+                                "texture over a dropped shadow-map target: unit {} tex {:08X} {}x{} "
+                                "{} (type {}), shadow target {:08X}-{:08X}, drawing into {:08X}",
+                                unit, tex_start, info.width, info.height,
+                                VideoCore::PixelFormatAsString(
+                                    VideoCore::PixelFormatFromTextureFormat(info.format)),
+                                static_cast<u32>(texture.config.type.Value()), start, end,
+                                regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress());
+                }
+            }
+        }
         static const bool log_textures = GxmFlag("logtex");
         if (log_textures && logtex_frames_left > 0) {
             static std::set<std::tuple<u32, u32, u32, u32, u32>> seen;
@@ -1891,7 +1915,25 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         // as-is (the tiler reads what was stored before this scene) rather than white.
         // A copy through a GPU blit was tried (2026-11-12) and gave garbage on Monster
         // Hunter 4 Ultimate's character select, which this way draws cleanly.
-        (void)framebuffer;
+        // Such draws are dropped by default: read in-scene they bring back whatever memory held
+        // (Monster Hunter 4 Ultimate's red-block overlay), and both ways tried of giving them
+        // this frame - a scene break, a blit copy - broke the character select. MH4U loses a
+        // cutscene depth-of-field pass; gameplay is unaffected. keepfeedback restores them.
+        static const bool skip_feedback = !GxmFlag("keepfeedback");
+        if (skip_feedback && framebuffer != nullptr && framebuffer->HasColor() &&
+            surface_id == framebuffer->color_id) {
+            skip_feedback_draw = true;
+        }
+        // feedbackbreak: end the scene first, so its tiles are stored and the texture read in
+        // the next scene sees this frame rather than what memory held before. Tried before the
+        // render targets rotated (2026-11-12) and it broke the menus, but that was the extra
+        // scene pushing the target past its 8 scenes a frame, which the rotation now absorbs.
+        static const bool feedback_break = GxmFlag("feedbackbreak");
+        if (feedback_break && in_scene && framebuffer != nullptr && framebuffer->HasColor() &&
+            surface_id == framebuffer->color_id) {
+            stat_scene_breaks++;
+            EndScene();
+        }
         SceGxmTexture bound = *surface.Texture();
         res_cache.GetSampler(texture.config).Apply(bound);
         textures[unit] = bound;
@@ -1933,6 +1975,16 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     }
     if (fb_regs.IsShadowRendering()) {
         // No image load/store on this backend: shadow maps are dropped (P5).
+        const u32 start = fb_regs.framebuffer.GetColorBufferPhysicalAddress();
+        const u32 end = start + fb_regs.framebuffer.GetWidth() * fb_regs.framebuffer.GetHeight() * 4;
+        const bool known = std::any_of(dropped_shadow_targets.begin(), dropped_shadow_targets.end(),
+                                       [&](const auto& t) { return t.first == start; });
+        if (!known && dropped_shadow_targets.size() < 32) {
+            dropped_shadow_targets.emplace_back(start, end);
+            LOG_WARNING(Render, "shadow-map pass dropped: target {:08X}-{:08X} ({}x{}), depth {:08X}",
+                        start, end, fb_regs.framebuffer.GetWidth(), fb_regs.framebuffer.GetHeight(),
+                        fb_regs.framebuffer.GetDepthBufferPhysicalAddress());
+        }
         return false;
     }
     const bool has_stencil = fb_regs.HasStencil();
@@ -1987,7 +2039,12 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     {
         const PhaseTimer timer{time_draws, times.textures};
         SyncAndUploadLUTs();
+        skip_feedback_draw = false;
         SyncTextureUnits(fb);
+    }
+    if (skip_feedback_draw) {
+        stat_skipped++;
+        return false;
     }
     {
         const PhaseTimer timer{time_draws, times.scene};

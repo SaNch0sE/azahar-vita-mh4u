@@ -455,6 +455,8 @@ private:
     u64 report_at_ms{};
     u32 stat_frames{}, stat_draws{}, stat_vertices{}, stat_scenes{}, stat_skipped{};
     u32 stat_finishes{}, stat_syncs{}, stat_scene_breaks{}, stat_ring_peak{};
+    /// skipfeedback: the draw being set up samples its own colour target and is dropped.
+    bool skip_feedback_draw{};
 
     u32 stat_uniform_uploads{}, stat_uniform_skips{}, stat_dropped_draws{}, stat_scene_waits{};
     u32 stat_gpu_blit_logs{}, stat_guest_writes{}, stat_invalidates{}, stat_flushes{};
