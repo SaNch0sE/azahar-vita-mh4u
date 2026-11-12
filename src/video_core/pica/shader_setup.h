@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstring>
 
 #include <optional>
 #include "common/hash.h"
@@ -147,6 +148,27 @@ public:
 
     const SwizzleData& GetSwizzleData() const {
         return swizzle_data;
+    }
+
+    /// Render-thread mirror: takes the emulation side's program and swizzle prefixes with the
+    /// hashes it already computed, so the mirror neither compares the words nor hashes them
+    /// again. A prefix the mirror already holds (same hash and size) is not copied.
+    void LoadShippedCode(const u32* program, u32 program_size, u64 program_hash,
+                         const u32* swizzle, u32 swizzle_size, u64 swizzle_hash) {
+        if (program_code_hash_dirty || program_code_hash != program_hash ||
+            biggest_program_size != program_size) {
+            std::memcpy(program_code.data(), program, program_size * sizeof(u32));
+            biggest_program_size = program_size;
+            program_code_hash = program_hash;
+            program_code_hash_dirty = false;
+        }
+        if (swizzle_data_hash_dirty || swizzle_data_hash != swizzle_hash ||
+            biggest_swizzle_size != swizzle_size) {
+            std::memcpy(swizzle_data.data(), swizzle, swizzle_size * sizeof(u32));
+            biggest_swizzle_size = swizzle_size;
+            swizzle_data_hash = swizzle_hash;
+            swizzle_data_hash_dirty = false;
+        }
     }
 
     u32 GetBiggestProgramSize() const {

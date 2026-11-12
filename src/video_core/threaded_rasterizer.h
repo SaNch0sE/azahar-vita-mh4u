@@ -315,6 +315,9 @@ private:
     struct CodeSync {
         std::vector<u32> program;
         std::vector<u32> swizzle;
+        /// Hashes of the two prefixes, computed on the emulation thread.
+        u64 program_hash = 0;
+        u64 swizzle_hash = 0;
     };
 
     struct SetupSync {
@@ -324,6 +327,9 @@ private:
         u32 f_lo = 0;
         u32 f_hi = 0;
         Pica::Uniforms uniforms;
+        /// Kept across shipment reuse so the vectors keep their capacity; `has_code` says
+        /// whether this shipment carries code.
+        bool has_code = false;
         std::unique_ptr<CodeSync> code;
     };
 
@@ -366,9 +372,9 @@ private:
             owned_arena.reset();
             owned_arena_bytes = 0;
             vs.has_uniforms = false;
-            vs.code.reset();
+            vs.has_code = false;
             gs.has_uniforms = false;
-            gs.code.reset();
+            gs.has_code = false;
             has_default_attrs = false;
             pa_reconfigure_events = 0;
             pa_reset_events = 0;

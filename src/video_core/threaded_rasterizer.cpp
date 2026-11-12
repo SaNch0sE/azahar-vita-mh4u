@@ -33,14 +33,11 @@ void ThreadedRasterizer::ApplySetup(Pica::ShaderSetup& setup, const SetupSync& s
         setup.sync_f_lo = std::min(setup.sync_f_lo, sync.f_lo);
         setup.sync_f_hi = std::max(setup.sync_f_hi, sync.f_hi);
     }
-    if (sync.code) {
-        // The word-compare in the range updaters doubles as a filter: an upload identical to
-        // what the mirror already holds leaves the hashes valid, where the old whole-array
-        // assignment forced a 16 KB rehash per shipment.
-        setup.UpdateProgramCodeRange(0, sync.code->program.data(),
-                                     static_cast<u32>(sync.code->program.size()));
-        setup.UpdateSwizzleDataRange(0, sync.code->swizzle.data(),
-                                     static_cast<u32>(sync.code->swizzle.size()));
+    if (sync.has_code) {
+        const auto& code = *sync.code;
+        setup.LoadShippedCode(code.program.data(), static_cast<u32>(code.program.size()),
+                              code.program_hash, code.swizzle.data(),
+                              static_cast<u32>(code.swizzle.size()), code.swizzle_hash);
     }
 }
 
@@ -264,13 +261,19 @@ void ThreadedRasterizer::CollectState(Shipment& shipment) {
             setup.sync_f_hi = 0;
         }
         if (setup.code_sync_dirty) {
-            sync.code = std::make_unique<CodeSync>();
+            if (!sync.code) {
+                sync.code = std::make_unique<CodeSync>();
+            }
+            sync.has_code = true;
             const auto& program = setup.GetProgramCode();
             const auto& swizzle = setup.GetSwizzleData();
             sync.code->program.assign(program.begin(),
                                       program.begin() + setup.GetBiggestProgramSize());
             sync.code->swizzle.assign(swizzle.begin(),
                                       swizzle.begin() + setup.GetBiggestSwizzleSize());
+            // Hashed here, once per change, rather than by the busier render thread.
+            sync.code->program_hash = setup.GetProgramCodeHash();
+            sync.code->swizzle_hash = setup.GetSwizzleDataHash();
             setup.code_sync_dirty = false;
         }
     };

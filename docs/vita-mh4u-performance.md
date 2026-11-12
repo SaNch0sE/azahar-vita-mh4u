@@ -101,9 +101,25 @@ Since then:
 - The glyph memo is keyed on uniform fingerprints that are kept up to date as uniforms are written,
   instead of hashing ~1.5 KB per shader per draw.
 
-## Open
+## Open (in the order being worked on)
 
-- Ship cutscene: depth of field blurs everything and some shots show blocky garbage, with GPU-load
-  frame drops. The composite of the aliased 256x512 view at `0x18070800` is not the cause (flushing
-  it changed nothing); the focus mask (frame alpha) is the next suspect.
-- The render thread's unaccounted ~24%; applying shipped state (~31 register writes per draw).
+1. **Applying shipped state on the render thread** (measured; mostly done). Per 3 s on the deck:
+   ~19,000 shipments, ~340 ms with timers in place (one `sceKernelGetProcessTimeWide` read is
+   ~0.7 us). ~2,800 of them carry shader code: the game switches between different programs,
+   not identical re-uploads. The mirror compared ~400 words per switch and later rehashed them;
+   now the emulation thread ships the hashes with the code, the mirror copies without comparing
+   (or not at all if it already holds that program), and the code buffers are reused: 73 ms ->
+   24 ms. What is left (~7% of the render thread: ~31 scattered register writes, ~17 float
+   registers compared per shipment) is mostly cache misses on data written by the other core.
+2. **Lighting cost on the GPU.** The top lit program is ~40% of fragment time and fewer
+   instructions barely moved it: the cost is lighting-LUT and texture latency or pixel count.
+   Options: hoist uniform-only lighting math (light direction normalize) to the CPU; reduce
+   register moves in the IR (operate in place) where that does not hit the console miscompiles.
+3. **Ship cutscene depth of field.** Blurs everything and some shots show blocky garbage, with
+   frame drops to ~8 fps while the garbage is on screen. The composite of the aliased 256x512 view
+   at `0x18070800` is not the cause (flushing it changed nothing); the focus mask (frame alpha) is
+   the next suspect.
+4. **Shown fps is vblank-quantised.** The guest runs ~39 fps, but a frame takes ~47 ms on the
+   render thread, so ~21 are shown. Under 33 ms is needed for 30.
+5. Low priority: persist tier-2 USSE programs to disk (creating them is already microseconds);
+   the render thread's unaccounted ~24%.
