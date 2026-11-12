@@ -2061,6 +2061,7 @@ std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
     e.AddClass({Bank::PrimAttr, pa_inputs, PaLimit});
     e.AddClass({Bank::Output, 0, OutScratchEnd, epilogue_at});
     Encoder primary;
+    e.vertex = true;
     const Ir::LowerResult lowered = e.Lower(primary, level);
     primary.FinishNosched();
     Encoder secondary;

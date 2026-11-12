@@ -121,6 +121,7 @@ public:
     bool skip_invalid = true;
     int nosched_override = 0;
     bool secondary = false;
+    bool vertex = false; ///< a vertex program (usse_vsnoloadsrc)
 
     std::size_t Count() const {
         return insts.size();

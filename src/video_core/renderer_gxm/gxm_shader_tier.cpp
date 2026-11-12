@@ -10,6 +10,9 @@
 #include "common/pipeline_stats.h"
 #include "common/thread.h"
 #include "video_core/renderer_gxm/gxm_shader_tier.h"
+#include "video_core/renderer_gxm/gxm_flags.h"
+#include <fmt/format.h>
+#include <cstdio>
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
 
 namespace GxmRenderer {
@@ -92,6 +95,33 @@ void ShaderTier2::Loop(std::stop_token stop) {
         if (job.vertex) {
             job.vs.code = job.code;
             job.vs.swizzle = job.swizzle;
+            // usse_dump: the request itself, for the host harness to emit again
+            // (ux0:data/azahar/usse/vr_<key>.bin: the fixed fields, then the code and the
+            // operand descriptors, each with its word count).
+            static const bool dump = GxmFlag("usse_dump");
+            if (dump) {
+                const std::string path =
+                    fmt::format("ux0:data/azahar/usse/vr_{:016x}.bin", job.key);
+                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                    const Usse::VsRequest& r = job.vs;
+                    std::fwrite(&r.code_size, 4, 1, f);
+                    std::fwrite(&r.main_offset, 4, 1, f);
+                    std::fwrite(&r.num_outputs, 4, 1, f);
+                    std::fwrite(r.output_map.data(), 4, r.output_map.size(), f);
+                    std::fwrite(r.semantics.data(), sizeof(Usse::VsSemantic), r.semantics.size(), f);
+                    std::fwrite(&r.default_regs, 2, 1, f);
+                    std::fwrite(&r.bools, 2, 1, f);
+                    std::fwrite(&r.bool_mask, 2, 1, f);
+                    std::fwrite(r.reg_components.data(), 1, r.reg_components.size(), f);
+                    const u32 code_words = static_cast<u32>(job.code.size());
+                    const u32 swizzle_words = static_cast<u32>(job.swizzle.size());
+                    std::fwrite(&code_words, 4, 1, f);
+                    std::fwrite(job.code.data(), 4, code_words, f);
+                    std::fwrite(&swizzle_words, 4, 1, f);
+                    std::fwrite(job.swizzle.data(), 4, swizzle_words, f);
+                    std::fclose(f);
+                }
+            }
             result.program =
                 Usse::EmitVertexProgram(job.vs, result.input_regs, &result.refusal, 2);
         } else {

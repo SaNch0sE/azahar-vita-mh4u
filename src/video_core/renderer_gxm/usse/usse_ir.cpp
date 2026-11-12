@@ -10,6 +10,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <fmt/format.h>
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/usse/usse_ir.h"
 
@@ -475,6 +476,7 @@ namespace {
 
 class Lowering {
 public:
+    bool vertex = false;
     Lowering(std::vector<Inst>& insts_, const std::vector<RegClass>& classes_)
         : insts{insts_}, classes{classes_} {}
 
@@ -2332,7 +2334,12 @@ void Lowering::LoadSources() {
                         }
                         const Mod mod = Compose(d.src[sidx].mod, loaded.mod);
                         const bool table = sidx == 0 || InVec4StdTable(swz);
-                        ok = loaded.reg.bank != Bank::Const && table &&
+                        // Secondary attributes only: the console miscomputed a four-wide op
+                        // reading a temporary this way (`vmul i2.xyzw, sa90.wzyx, r40.xyzz`
+                        // in a Monster Hunter 4 Ultimate vertex program dropped blue from
+                        // the whole scene, 2026-11-12), while the compiler's own form reads
+                        // the secondary attributes.
+                        ok = loaded.reg.bank == Bank::SecAttr && table &&
                              (sidx == 0 || (mod != Mod::Neg && mod != Mod::NegAbs));
                         if (ok) {
                             d.src[sidx] = Src{loaded.reg, swz, mod};
@@ -3126,6 +3133,22 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
     const auto D = [&](const Dst& d) { return Dst{Map(d.reg), d.mask}; };
     const auto I = [&](const IOp& o) { return o.imm ? o : IOp::R(Map(o.reg)); };
     std::vector<Ref> refs;
+    if (std::getenv("USSE_IR_DUMP") != nullptr) {
+        // The program as encoded: every register after placement.
+        std::fprintf(stderr, "== allocated (%zu)\n", insts.size());
+        for (std::size_t n = 0; n < insts.size(); n++) {
+            Inst m = insts[n];
+            Refs(m, refs);
+            for (const Ref& r : refs) {
+                *r.reg = Map(*r.reg);
+            }
+            m.dst.reg = Map(m.dst.reg);
+            for (Src& src : m.src) {
+                src.reg = Map(src.reg);
+            }
+            std::fprintf(stderr, "%4zu: %s\n", n, Describe(m).c_str());
+        }
+    }
     for (std::size_t n = 0; n < insts.size(); n++) {
         const Inst& i = insts[n];
         switch (i.op) {
@@ -3275,11 +3298,25 @@ LowerResult Lowering::Run(Encoder& e, int level) {
     for (int attempt = 0; attempt < 3; attempt++) {
         const int hoist = 3 - attempt; // groups of three, then two, then none
         if (level >= 2) {
+            // usse_stopN (N 0-11): only the first N of the steps below, to bisect a
+            // program the second tier gets wrong.
+            static const int stop_after = [] {
+                for (int n = 0; n < 12; n++) {
+                    if (GxmFlag(fmt::format("usse_stop{}", n).c_str())) {
+                        return n;
+                    }
+                }
+                return 99;
+            }();
+            int step = 0;
+            const auto run = [&] { return step++ < stop_after; };
+            if (run()) {
             Liveness();
             DeadStores();
+            }
             static const bool no_hoist = GxmFlag("usse_nohoist");
             Dump("input");
-            if (hoist >= 2 && !no_hoist) {
+            if (run() && hoist >= 2 && !no_hoist) {
                 static const bool no_global = GxmFlag("usse_noglobalhoist");
                 if (hoist == 3 && !no_global) {
                     HoistLoadsGlobal();
@@ -3288,25 +3325,45 @@ LowerResult Lowering::Run(Encoder& e, int level) {
                 HoistLoads(hoist);
                 Dump("hoist");
             }
-            CoalesceOutputs();
+            if (run()) {
+                CoalesceOutputs();
+            }
             Dump("coalesce");
-            Reloads();
+            if (run()) {
+                Reloads();
+            }
             Dump("reloads");
-            TwoWideChains();
+            if (run()) {
+                TwoWideChains();
+            }
             Dump("chains");
-            DirectTwoWide();
+            if (run()) {
+                DirectTwoWide();
+            }
             Dump("two-wide");
-            LoadSources();
+            static const bool vs_no_load_sources = GxmFlag("usse_vsnoloadsrc");
+            static const bool fs_no_load_sources = GxmFlag("usse_fsnoloadsrc");
+            if (run() && !(vertex ? vs_no_load_sources : fs_no_load_sources)) {
+                LoadSources();
+            }
             Dump("load sources");
-            ResultsIntoInternal();
+            if (run()) {
+                ResultsIntoInternal();
+            }
             Dump("results into internal");
-            InternalRegisters();
+            if (run()) {
+                InternalRegisters();
+            }
             Dump("internal registers");
             // The chains that pass forms (a mad reading the previous mad's register) end
             // in a mad plus its moves out: the two-wide pass again for those tails.
-            DirectTwoWide();
+            if (run()) {
+                DirectTwoWide();
+            }
             Dump("two-wide again");
-            InternalDeadWrites();
+            if (run()) {
+                InternalDeadWrites();
+            }
             Liveness();
             DeadStores();
             Dump("final");
@@ -3348,6 +3405,7 @@ LowerResult Builder::Lower(Encoder& e, int level) {
         cls.push_back({Bank::Temp, 0, 64});
     }
     Lowering lowering{insts, cls};
+    lowering.vertex = vertex;
     return lowering.Run(e, level);
 }
 
