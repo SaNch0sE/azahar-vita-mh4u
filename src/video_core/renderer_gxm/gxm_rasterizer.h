@@ -394,6 +394,15 @@ private:
     bool repeat_ok = false;
     u64 repeat_key = 0, repeat_epoch = 0, repeat_scene = 0;
     u32 stat_repeat_draws = 0;
+    /// BeginDraw's own repeat: like the software-draw repeat above, but for any draw - the
+    /// fragment-side setup (framebuffer, textures, scene, depth/stencil state) is kept when the
+    /// fragment-side registers, the scene and everything but draws since are unchanged; the
+    /// draw's programs and uniforms are still bound. nondraw_epoch is bumped by every entry
+    /// point except the two draw paths (a hardware draw changes only programs and uniforms).
+    u64 nondraw_epoch = 0;
+    bool begin_repeat_ok = false;
+    u64 begin_key = 0, begin_epoch = 0, begin_scene = 0;
+    u32 stat_begin_repeats = 0;
     [[nodiscard]] u64 RepeatKey() const;
     SceGxmNotification scene_notification{};
     u32 frame_index{};

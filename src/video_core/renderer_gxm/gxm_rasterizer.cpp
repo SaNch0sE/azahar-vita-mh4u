@@ -1157,6 +1157,7 @@ void RasterizerGxm::TrimSurfaceCache() {
 
 void RasterizerGxm::EndScene() {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("end scene");
     if (!in_scene) {
         return;
@@ -2176,6 +2177,30 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                                 (depth_write || stencil_write || om.depth_test_enable != 0 ||
                                  (has_stencil && om.stencil_test.enable));
 
+    // The fragment-side setup of the previous draw is still bound and still right: only this
+    // draw's programs (its vertex program and layout may differ) and uniforms. ~43% of
+    // Monster Hunter 4 Ultimate's hardware draws on the ship's deck; nobeginrepeat turns it off.
+    static const bool no_begin_repeat = GxmFlag("nobeginrepeat");
+    const u64 begin_key_now = no_begin_repeat ? 0 : RepeatKey();
+    if (!no_begin_repeat && begin_repeat_ok && in_scene && begin_key_now == begin_key &&
+        nondraw_epoch == begin_epoch && scene_seq == begin_scene && !pica.lighting.lut_dirty &&
+        !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
+        stat_begin_repeats++;
+        for (const VideoCore::SurfaceId id : bound_surfaces) {
+            if (id) {
+                res_cache.GetSurface(id).gpu_serial = runtime.CurrentEpoch();
+            }
+        }
+        {
+            const PhaseTimer timer{time_draws, times.programs};
+            if (!BindPrograms(layout, vertex_count)) {
+                stat_skipped++;
+                return false;
+            }
+        }
+        return in_scene;
+    }
+    begin_repeat_ok = false;
     {
         const PhaseTimer timer{time_draws, times.framebuffer};
         setup.helper.emplace(res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb));
@@ -2234,6 +2259,10 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         LOG_ERROR(Render, "GXM: the scene was ended under a draw");
         return false;
     }
+    begin_repeat_ok = !no_begin_repeat;
+    begin_key = begin_key_now;
+    begin_epoch = nondraw_epoch;
+    begin_scene = scene_seq;
     return true;
 }
 
@@ -2905,6 +2934,7 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
 
 void RasterizerGxm::FlushAll() {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("flush all");
     const PhaseTimer timer{time_draws, times.flush};
     res_cache.FlushAll();
@@ -2912,6 +2942,7 @@ void RasterizerGxm::FlushAll() {
 
 void RasterizerGxm::FlushRegion(PAddr addr, u32 size) {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("flush region");
     const PhaseTimer timer{time_draws, times.flush};
     stat_flushes++;
@@ -2920,6 +2951,7 @@ void RasterizerGxm::FlushRegion(PAddr addr, u32 size) {
 
 void RasterizerGxm::InvalidateRegion(PAddr addr, u32 size) {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("invalidate region");
     const PhaseTimer timer{time_draws, times.invalidate_region};
     stat_invalidates++;
@@ -2928,6 +2960,7 @@ void RasterizerGxm::InvalidateRegion(PAddr addr, u32 size) {
 
 void RasterizerGxm::InvalidateGuestFlushedRegion(PAddr addr, u32 size) {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("invalidate guest-flushed region");
     const PhaseTimer timer{time_draws, times.invalidate_region};
     stat_invalidates++;
@@ -2944,6 +2977,7 @@ void RasterizerGxm::InvalidateGuestFlushedRegion(PAddr addr, u32 size) {
 
 void RasterizerGxm::FlushAndInvalidateRegion(PAddr addr, u32 size) {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("flush+invalidate");
     const PhaseTimer timer{time_draws, times.flush};
     stat_flushes++;
@@ -2953,6 +2987,7 @@ void RasterizerGxm::FlushAndInvalidateRegion(PAddr addr, u32 size) {
 
 void RasterizerGxm::NoteGuestWrite(PAddr addr, u32 size) {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("guest write");
     const PhaseTimer timer{time_draws, times.guest_writes};
     stat_guest_writes++;
@@ -2961,11 +2996,13 @@ void RasterizerGxm::NoteGuestWrite(PAddr addr, u32 size) {
 
 void RasterizerGxm::ClearAll(bool flush) {
     draw_epoch++;
+    nondraw_epoch++;
     res_cache.ClearAll(flush);
 }
 
 bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("display transfer");
     const PhaseTimer timer{time_draws, times.transfers};
     const bool done = EnsureResources() && res_cache.AccelerateDisplayTransfer(config);
@@ -3002,6 +3039,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
 
 bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("texture copy");
     const PhaseTimer timer{time_draws, times.transfers};
     const bool done = EnsureResources() && res_cache.AccelerateTextureCopy(config);
@@ -3018,6 +3056,7 @@ bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
 
 bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("fill");
     const PhaseTimer timer{time_draws, times.transfers};
     const bool done = EnsureResources() && res_cache.AccelerateFill(config);
@@ -3122,6 +3161,7 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
 
 void RasterizerGxm::EndFrame() {
     draw_epoch++;
+    nondraw_epoch++;
     DrawTrace("end frame");
     if (!resources_ready) {
         return;
@@ -3341,8 +3381,10 @@ void RasterizerGxm::EndFrame() {
                         why_not += fmt::format(" {} {},", not_names[r], n);
                     }
                 }
-                LOG_INFO(Render, "repeated software draws (no state sync): {}", stat_repeat_draws);
+                LOG_INFO(Render, "repeated software draws (no state sync): {}, draws keeping the fragment setup: {}",
+                         stat_repeat_draws, stat_begin_repeats);
                 stat_repeat_draws = 0;
+                stat_begin_repeats = 0;
                 LOG_INFO(Render,
                          "software vertex shading: {} draws, {} us ({}%% of the window), {} never "
                          "offered to the hardware path (why:{}); declined:{}",
@@ -3504,6 +3546,7 @@ void RasterizerGxm::WriteSurfaceImage(Surface& surface, const std::string& stem)
 
 void RasterizerGxm::DumpSurfaces() {
     draw_epoch++;
+    nondraw_epoch++;
     // Level 0 of every surface with memory, read back the way a download is (through the
     // transfer unit, which is the only way a rendered surface's pixels reach the CPU under
     // Vita3K), as a PPM of its colour or depth plus a PGM of its alpha or stencil where the

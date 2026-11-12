@@ -14,8 +14,9 @@ the v1.3 update, at the ship's deck right after the save loads, no frame-cap che
 | Kernel plugin v2: GetThreadId/GetSystemTick on core | 51-57% | ~20 |
 | Glyph memo, texture re-upload hash | 55-57% | ~20 |
 | TEV rounding at the last stage only | 45-65% | 21-22 |
+| Glyph memo on kept fingerprints, hardware draws keep fragment setup | 64-68% | 21-22 |
 
-The guest now runs at ~33 fps; what is shown is held at ~21 by the render thread (~90% busy, of
+The guest now runs at ~39 fps; what is shown is held at ~21 by the render thread (~90% busy, of
 which ~20% waiting for the GPU).
 
 ## Emulation thread (core 0 + the guest on core 2)
@@ -89,16 +90,20 @@ Per 3 s on the deck: the render thread is ~91% busy.
 
 A hardware draw is ~7 us of vertex layout, ~9 us of vertex program lookup and ~118 us of the GXM
 phases every fully set-up draw pays (programs ~30, textures ~28, framebuffer ~23, draw ~23,
-uniforms ~17, scene ~12, invalidate ~11 us). ~43% of hardware draws keep the previous draw's
-fragment-side registers with nothing in between: a hardware form of the software repeat path
-(bind the draw's own vertex program and uniforms, skip framebuffer, textures, scene and fragment
-program selection) would save ~5% of the render thread. The glyph memo's key hashes both shaders'
-whole uniform sets (~1.5 KB each) per draw; an incrementally maintained fingerprint would save most
-of its ~13 us.
+uniforms ~17, scene ~12, invalidate ~11 us).
+
+Since then:
+
+- ~43% of hardware draws keep the previous draw's fragment-side registers with nothing in between.
+  These now skip the framebuffer, texture and scene phases and rebind only the programs and
+  uniforms (switch: `nobeginrepeat`). Per 3 s, the framebuffer phase fell from ~194 ms to ~134 ms
+  and textures from ~230 ms to ~198 ms.
+- The glyph memo is keyed on uniform fingerprints that are kept up to date as uniforms are written,
+  instead of hashing ~1.5 KB per shader per draw.
 
 ## Open
 
 - Ship cutscene: depth of field blurs everything and some shots show blocky garbage, with GPU-load
   frame drops. The composite of the aliased 256x512 view at `0x18070800` is not the cause (flushing
   it changed nothing); the focus mask (frame alpha) is the next suspect.
-- The render thread's unaccounted ~24% and the glyph memo's ~13 us of hashing per draw.
+- The render thread's unaccounted ~24%; applying shipped state (~31 register writes per draw).
