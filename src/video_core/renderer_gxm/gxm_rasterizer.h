@@ -385,6 +385,16 @@ private:
 
     Framebuffer* scene_fb{};
     bool in_scene{};
+    /// Fast repeat of a software-shaded draw (DrawTriangles): its vertices carry everything
+    /// the vertex side computed, so a draw with the same fragment-side registers, in the same
+    /// open scene, with nothing else reaching this rasterizer in between, needs no state sync
+    /// - only its own sceGxmDraw. Monster Hunter 4 Ultimate draws text one glyph per draw.
+    u64 draw_epoch = 0;   ///< bumped by every entry point other than DrawTriangles
+    u64 scene_seq = 0;    ///< bumped when a scene begins
+    bool repeat_ok = false;
+    u64 repeat_key = 0, repeat_epoch = 0, repeat_scene = 0;
+    u32 stat_repeat_draws = 0;
+    [[nodiscard]] u64 RepeatKey() const;
     SceGxmNotification scene_notification{};
     u32 frame_index{};
     u32 surface_dump_index{};

@@ -54,6 +54,7 @@ void GpuThread::Enqueue(Op op) {
         }
         return;
     }
+    bool wake = false;
     {
         std::unique_lock lock{mutex};
         if (depth.load(std::memory_order_relaxed) >= MaxDepth) {
@@ -71,6 +72,11 @@ void GpuThread::Enqueue(Op op) {
                 lock.lock();
             }
         }
+        // Only an idle worker can be asleep: it sets idle, under this lock, only when it has
+        // found the queue empty and is about to wait. A busy one re-checks the queue under the
+        // lock before it ever waits, so it needs no wake - and on the Vita each one was a
+        // kernel call (an event flag) for every draw shipped, thousands a second.
+        wake = idle;
         idle = false;
         if (op.swap_marker) {
             pending_swaps.fetch_add(1, std::memory_order_relaxed);
@@ -78,7 +84,9 @@ void GpuThread::Enqueue(Op op) {
         depth.fetch_add(1, std::memory_order_relaxed);
         queue.push_back(std::move(op));
     }
-    enqueue_wake.Raise();
+    if (wake) {
+        enqueue_wake.Raise();
+    }
 
     if (lockstep.load(std::memory_order_relaxed)) {
         Drain();

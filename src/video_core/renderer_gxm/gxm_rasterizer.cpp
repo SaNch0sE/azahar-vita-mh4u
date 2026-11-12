@@ -833,6 +833,7 @@ void RasterizerGxm::BeginScene(Framebuffer* fb) {
         return;
     }
     in_scene = true;
+    scene_seq++;
     scene_fb = fb;
     if (scenes_this_frame < MaxSceneRecords) {
         scene_records[scenes_this_frame] = {
@@ -1155,6 +1156,7 @@ void RasterizerGxm::TrimSurfaceCache() {
 }
 
 void RasterizerGxm::EndScene() {
+    draw_epoch++;
     DrawTrace("end scene");
     if (!in_scene) {
         return;
@@ -2243,6 +2245,16 @@ void RasterizerGxm::ReleaseDraw(DrawSetup& setup) {
     DrawTrace("release draw done");
 }
 
+u64 RasterizerGxm::RepeatKey() const {
+    // Everything a software-shaded draw's fragment side reads from the registers: textures,
+    // combiner, fog and procedural texture (texturing), the output merger and targets
+    // (framebuffer), fragment lighting (lighting), viewport, depth map and scissor (rasterizer).
+    u64 h = Common::ComputeHash64(&regs.texturing, sizeof(regs.texturing));
+    h = Common::HashCombine(h, Common::ComputeHash64(&regs.framebuffer, sizeof(regs.framebuffer)));
+    h = Common::HashCombine(h, Common::ComputeHash64(&regs.lighting, sizeof(regs.lighting)));
+    return Common::HashCombine(h, Common::ComputeHash64(&regs.rasterizer, sizeof(regs.rasterizer)));
+}
+
 void RasterizerGxm::DrawTriangles() {
     // The triangles are in the ring, written there by the shipping facade or by the mirror's
     // software shader; vertex_batch is only ever used when there is no ring at all.
@@ -2258,6 +2270,36 @@ void RasterizerGxm::DrawTriangles() {
     for (const auto& range : pending_ring_ranges) {
         vertex_count += range.count;
     }
+    static const bool no_repeat = GxmFlag("norepeat");
+    const u64 key = no_repeat ? 0 : RepeatKey();
+    if (!no_repeat && repeat_ok && in_scene && vertex_batch.empty() && key == repeat_key &&
+        draw_epoch == repeat_epoch && scene_seq == repeat_scene && !pica.lighting.lut_dirty &&
+        !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
+        // The previous draw's state is still bound and still right: just this draw.
+        stat_draws++;
+        stat_repeat_draws++;
+        SceGxmContext* context = Device().context;
+        const PhaseTimer draw_timer{time_draws, times.draw};
+        for (const auto& range : pending_ring_ranges) {
+            u32 first = range.first;
+            u32 left = range.count;
+            while (left > 0) {
+                const u32 count = std::min(left, MaxVerticesPerDraw);
+                sceGxmSetVertexStream(context, 0,
+                                      vertex_ring.base + static_cast<std::size_t>(first) *
+                                                             sizeof(Pica::OutputVertex));
+                sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
+                           identity_indices, count);
+                first += count;
+                left -= count;
+            }
+            stat_vertices += range.count;
+            ring_scene_pos = std::max(ring_scene_pos, range.end_pos);
+        }
+        pending_ring_ranges.clear();
+        return;
+    }
+    repeat_ok = false;
     DrawSetup setup;
     if (!BeginDraw(setup, fixed_layout, vertex_count)) {
         ReleaseDraw(setup);
@@ -2307,6 +2349,12 @@ void RasterizerGxm::DrawTriangles() {
     vertex_batch.clear();
     pending_ring_ranges.clear();
     ReleaseDraw(setup);
+    // Now that everything this draw did is done (the release invalidates the drawn region,
+    // and may itself have bumped the epoch), the next one may repeat it.
+    repeat_ok = in_scene;
+    repeat_key = key;
+    repeat_epoch = draw_epoch;
+    repeat_scene = scene_seq;
 }
 
 Usse::VsRequest RasterizerGxm::MakeVsRequest(
@@ -2501,6 +2549,7 @@ bool DeclineHw(u32 reason) {
 } // namespace
 
 bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
+    draw_epoch++;
     using Topology = Pica::PipelineRegs::TriangleTopology;
     static const bool software_only = GxmFlag("nohwvs");
     if (software_only || regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::No ||
@@ -2855,12 +2904,14 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
 }
 
 void RasterizerGxm::FlushAll() {
+    draw_epoch++;
     DrawTrace("flush all");
     const PhaseTimer timer{time_draws, times.flush};
     res_cache.FlushAll();
 }
 
 void RasterizerGxm::FlushRegion(PAddr addr, u32 size) {
+    draw_epoch++;
     DrawTrace("flush region");
     const PhaseTimer timer{time_draws, times.flush};
     stat_flushes++;
@@ -2868,6 +2919,7 @@ void RasterizerGxm::FlushRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGxm::InvalidateRegion(PAddr addr, u32 size) {
+    draw_epoch++;
     DrawTrace("invalidate region");
     const PhaseTimer timer{time_draws, times.invalidate_region};
     stat_invalidates++;
@@ -2875,6 +2927,7 @@ void RasterizerGxm::InvalidateRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGxm::InvalidateGuestFlushedRegion(PAddr addr, u32 size) {
+    draw_epoch++;
     DrawTrace("invalidate guest-flushed region");
     const PhaseTimer timer{time_draws, times.invalidate_region};
     stat_invalidates++;
@@ -2890,6 +2943,7 @@ void RasterizerGxm::InvalidateGuestFlushedRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGxm::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    draw_epoch++;
     DrawTrace("flush+invalidate");
     const PhaseTimer timer{time_draws, times.flush};
     stat_flushes++;
@@ -2898,6 +2952,7 @@ void RasterizerGxm::FlushAndInvalidateRegion(PAddr addr, u32 size) {
 }
 
 void RasterizerGxm::NoteGuestWrite(PAddr addr, u32 size) {
+    draw_epoch++;
     DrawTrace("guest write");
     const PhaseTimer timer{time_draws, times.guest_writes};
     stat_guest_writes++;
@@ -2905,10 +2960,12 @@ void RasterizerGxm::NoteGuestWrite(PAddr addr, u32 size) {
 }
 
 void RasterizerGxm::ClearAll(bool flush) {
+    draw_epoch++;
     res_cache.ClearAll(flush);
 }
 
 bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+    draw_epoch++;
     DrawTrace("display transfer");
     const PhaseTimer timer{time_draws, times.transfers};
     const bool done = EnsureResources() && res_cache.AccelerateDisplayTransfer(config);
@@ -2944,6 +3001,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
 }
 
 bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
+    draw_epoch++;
     DrawTrace("texture copy");
     const PhaseTimer timer{time_draws, times.transfers};
     const bool done = EnsureResources() && res_cache.AccelerateTextureCopy(config);
@@ -2959,6 +3017,7 @@ bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
 }
 
 bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
+    draw_epoch++;
     DrawTrace("fill");
     const PhaseTimer timer{time_draws, times.transfers};
     const bool done = EnsureResources() && res_cache.AccelerateFill(config);
@@ -3062,6 +3121,7 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
 }
 
 void RasterizerGxm::EndFrame() {
+    draw_epoch++;
     DrawTrace("end frame");
     if (!resources_ready) {
         return;
@@ -3281,6 +3341,8 @@ void RasterizerGxm::EndFrame() {
                         why_not += fmt::format(" {} {},", not_names[r], n);
                     }
                 }
+                LOG_INFO(Render, "repeated software draws (no state sync): {}", stat_repeat_draws);
+                stat_repeat_draws = 0;
                 LOG_INFO(Render,
                          "software vertex shading: {} draws, {} us ({}%% of the window), {} never "
                          "offered to the hardware path (why:{}); declined:{}",
@@ -3441,6 +3503,7 @@ void RasterizerGxm::WriteSurfaceImage(Surface& surface, const std::string& stem)
 }
 
 void RasterizerGxm::DumpSurfaces() {
+    draw_epoch++;
     // Level 0 of every surface with memory, read back the way a download is (through the
     // transfer unit, which is the only way a rendered surface's pixels reach the CPU under
     // Vita3K), as a PPM of its colour or depth plus a PGM of its alpha or stencil where the

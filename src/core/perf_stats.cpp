@@ -50,20 +50,31 @@ PerfStats::~PerfStats() {
     file.WriteString(stream.str());
 }
 
+// Not on the PS Vita: a high_resolution_clock read costs ~10 us there (measured 2026-11-12),
+// and two a system call were most of what Monster Hunter 4 Ultimate's ~11,000 calls a second
+// cost - a trivial svcGetThreadId took 21 us. The SVC share of the frame time reads as zero.
 void PerfStats::BeginSVCProcessing() {
+#ifndef __vita__
     start_svc_time = Clock::now();
+#endif
 }
 
 void PerfStats::EndSVCProcessing() {
+#ifndef __vita__
     accumulated_svc_time += (Clock::now() - start_svc_time);
+#endif
 }
 
 void PerfStats::BeginIPCProcessing() {
+#ifndef __vita__
     start_ipc_time = Clock::now();
+#endif
 }
 
 void PerfStats::EndIPCProcessing() {
+#ifndef __vita__
     accumulated_ipc_time += (Clock::now() - start_ipc_time);
+#endif
 }
 
 void PerfStats::BeginGPUProcessing() {
