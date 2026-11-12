@@ -189,6 +189,24 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
     // pi5 in a Smash fight and an SM3DL level, and on the
     // console each read is the sceKernelGetProcessTimeWide syscall, 150k a second in SM3DL.
     time_draws = GxmFlag("timedraw");
+    // nofog: every generated fragment program without fog (Cg::SetFogDisabled).
+    if (GxmFlag("nofog")) {
+        Pica::Shader::Generator::Cg::SetFogDisabled(true);
+    }
+    // dbgout_*: every generated fragment program outputs one intermediate value instead of
+    // its result - the vertex colour, texture unit 0 or 1, or the lighting's diffuse sum.
+    {
+        using DebugOutput = Pica::Shader::Generator::Cg::DebugOutput;
+        if (GxmFlag("dbgout_vertex")) {
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::VertexColor);
+        } else if (GxmFlag("dbgout_tex0")) {
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texture0);
+        } else if (GxmFlag("dbgout_tex1")) {
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texcoord1);
+        } else if (GxmFlag("dbgout_light")) {
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Lighting);
+        }
+    }
     runtime.SetSyncHook([this](u64 serial) { SyncToGpu(serial); });
     runtime.SetColourClearHook([this](Surface& surface) {
         if (!in_scene || scene_fb == nullptr || !scene_fb->color_id ||
@@ -2899,6 +2917,28 @@ void RasterizerGxm::EndFrame() {
     }
     if (logtex_frames_left > 0) {
         logtex_frames_left--;
+    }
+    // flushlist: copy these regions back to guest memory at every frame end. Native execution
+    // never tells the cache when the guest CPU reads memory a surface was rendered into, so a
+    // title that reads back GPU output (an 8x8 brightness target for exposure, say) reads
+    // whatever memory last held. Pairs of hex address and size in ux0:data/azahar/flush.txt.
+    static const std::vector<std::pair<u32, u32>> flush_list = [] {
+        std::vector<std::pair<u32, u32>> list;
+        if (!GxmFlag("flushlist")) {
+            return list;
+        }
+        if (std::FILE* f = std::fopen("ux0:data/azahar/flush.txt", "rb")) {
+            unsigned addr = 0, size = 0;
+            while (std::fscanf(f, "%x %x", &addr, &size) == 2) {
+                list.emplace_back(addr, size);
+                LOG_INFO(Render, "flushlist: {:08X}+{:X} flushed every frame", addr, size);
+            }
+            std::fclose(f);
+        }
+        return list;
+    }();
+    for (const auto& [addr, size] : flush_list) {
+        res_cache.FlushRegion(addr, size);
     }
     res_cache.TickFrame();
     // Report on wall time, not on a frame count: at the frame rates this phase produces, a

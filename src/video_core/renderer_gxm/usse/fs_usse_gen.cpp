@@ -9,6 +9,7 @@
 #include <string>
 #include <fmt/format.h>
 #include "video_core/renderer_gxm/gxm_flags.h"
+#include "video_core/shader/generator/cg_fs_shader_gen.h"
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 #include "video_core/renderer_gxm/usse/usse_encoder.h"
@@ -432,7 +433,10 @@ void FragmentEmitter::PlanInputs() {
     }
     uses_scissor = config.framebuffer.scissor_test_mode.Value() !=
                    Pica::RasterizerRegs::ScissorMode::Disabled;
-    uses_fog = tex.fog_mode == TexturingRegs::FogMode::Fog;
+    // nofog (Cg::FogDisabled): leave fog out, so a picture wrong only with fog can be told
+    // from one wrong without it. The hash the rasterizer keys programs by includes the switch.
+    uses_fog = tex.fog_mode == TexturingRegs::FogMode::Fog &&
+               !Pica::Shader::Generator::Cg::FogDisabled();
     uses_depth = config.framebuffer.depthmap_enable ==
                  Pica::RasterizerRegs::DepthBuffering::WBuffering;
     if (uses_lighting && lighting.enable_shadow) {
@@ -2199,6 +2203,34 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
         NewPhaseAfterKill();
     }
     Fog();
+    // Debug outputs (dbgout_* switches, Cg::SetDebugOutput): one intermediate value in place
+    // of the result, to find the stage a wrong colour enters at. Texcoord1 stands for texture
+    // unit 1 here, since a lit surface in Monster Hunter 4 Ultimate keeps its shadow on unit 0.
+    // Only lit programs - the world and the characters - so the post-processing passes that
+    // read the frame back still draw it, and what reaches the screen is the debug value.
+    using DebugOutput = Pica::Shader::Generator::Cg::DebugOutput;
+    switch (uses_lighting ? Pica::Shader::Generator::Cg::GetDebugOutput() : DebugOutput::None) {
+    case DebugOutput::VertexColor:
+        CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpPrimary});
+        break;
+    case DebugOutput::Texture0:
+        if (unit_used[0]) {
+            CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpTex0});
+        }
+        break;
+    case DebugOutput::Texcoord1:
+        if (unit_used[1]) {
+            CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpTex0 + 4});
+        }
+        break;
+    case DebugOutput::Lighting:
+        if (uses_lighting) {
+            CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpDiffuse});
+        }
+        break;
+    default:
+        break;
+    }
     e.PackF16({Reg::Pa(0), 0xf}, Reg::V(TmpOutput), Reg::V(TmpOutput + 2));
 
     // The quads go to the temporaries, then to primary attributes past the interpolants.
