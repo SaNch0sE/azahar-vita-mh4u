@@ -157,6 +157,19 @@ bool Pipeline::Build() {
                   static_cast<int>(blend.alphaSrc), static_cast<int>(blend.alphaDst));
         return false;
     }
+    // logfp: which generated program each patched fragment program is, so a GPU profile's
+    // program addresses (psp2-cex-gpues4-prof) can be traced to their usse_dump files.
+    static const bool log_programs = GxmFlag("logfp");
+    if (log_programs) {
+        // A file, not the console log: with usse_dump on, the console log overruns and
+        // drops lines by the hundred thousand.
+        if (std::FILE* f = std::fopen("ux0:data/azahar/fp_map.txt", "a")) {
+            std::fprintf(f, "%p %s blend %d format %#x\n",
+                         static_cast<const void*>(fragment_program), info.fragment->name.c_str(),
+                         info.blend_enabled ? 1 : 0, static_cast<unsigned>(info.output_format));
+            std::fclose(f);
+        }
+    }
     return true;
 }
 

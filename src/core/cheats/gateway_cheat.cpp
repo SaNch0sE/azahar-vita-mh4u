@@ -492,8 +492,9 @@ std::vector<std::shared_ptr<CheatBase>> GatewayCheat::LoadFile(const std::string
         return cheats;
     }
 
-    boost::iostreams::stream<boost::iostreams::file_descriptor_source> file;
-    FileUtil::OpenFStream<std::ios_base::in>(file, filepath);
+    // A plain ifstream: boost's file_descriptor_source fails to open on the Vita's newlib even
+    // for a file that exists, and getline is all this reads with.
+    std::ifstream file(filepath, std::ios_base::in);
     if (!file.is_open()) {
         LOG_INFO(Core_Cheats, "GatewayCheat::LoadFile failed, file failed to open: {}", filepath);
         return cheats;

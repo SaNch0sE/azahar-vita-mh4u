@@ -535,15 +535,13 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
                   static_cast<u32>(load_result));
     }
 
-#if defined(__vita__)
-    // Cheats are off on the Vita build: every cheat write goes through
-    // InvalidateCacheRange, which on the native core is a kernel round trip that cleans the
-    // page and drops core 2's icache, once a frame per cheat line (2026-09-05).
-    LOG_INFO(Core, "cheats are disabled on this build");
-#else
+    // Cheats were off on the Vita build because every cheat write goes through
+    // InvalidateCacheRange, a kernel round trip on the native core (2026-09-05). That now
+    // returns at once for a range nothing executes, so data-only cheats - Monster Hunter 4
+    // Ultimate's render-setting codes - cost a memory write; a code that patches executable
+    // pages still pays for the sync. With no cheat file, nothing runs.
     cheat_engine.LoadCheatFile(title_id);
     cheat_engine.Connect(process->process_id);
-#endif
 
     perf_stats = std::make_unique<PerfStats>(title_id);
 
