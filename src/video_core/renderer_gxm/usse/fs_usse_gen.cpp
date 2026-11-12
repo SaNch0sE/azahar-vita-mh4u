@@ -288,6 +288,7 @@ private:
     uint8_t normquat_pa = 0;              ///< PA base of TEXCOORD4/5 (two float4s)
     uint8_t view_pa = 0;                  ///< PA base of TEXCOORD6 (float3)
     bool buffer_used = false;
+    u32 last_active_stage = 0; ///< the last TEV stage that is not a pass-through
     /// Where a stage's PreviousBuffer colour / alpha comes from: -2 zero (stage 0), -1 the
     /// tev_combiner_buffer_color uniform, else the stage whose output it is.
     std::array<int, 6> buffer_color_from{};
@@ -2052,7 +2053,15 @@ void FragmentEmitter::TevStage(u32 index) {
             }
         }
         Clamp01(I2);
-        Byteround(I2, I0);
+        // The PICA keeps every stage's result in 8 bits. Only the last stage's rounding is kept
+        // here: the output is converted to 8 bits on the way out anyway, and the alpha test reads
+        // that stage. Rounding between stages cost 4 instructions a stage - ~10% of the lit
+        // programs that dominate Monster Hunter 4 Ultimate's GPU time on the PS Vita - for
+        // differences of at most a step of 1/255 per stage. tevround keeps every stage's.
+        static const bool round_every_stage = GxmFlag("tevround");
+        if (round_every_stage || index == last_active_stage) {
+            Byteround(I2, I0);
+        }
         const unsigned cscale = stage.GetColorMultiplier();
         const unsigned ascale = stage.GetAlphaMultiplier();
         if (cscale != 1) {
@@ -2218,6 +2227,12 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     e.Vec(VecOp::Add, {Reg::V(TmpOutput), 0x3}, ConstZero, ConstZero);
     e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x3}, ConstZero, ConstZero);
     PlanCombinerBuffer();
+    last_active_stage = 0;
+    for (u32 i = 0; i < config.texture.tev_stages.size(); i++) {
+        if (!IsPassThroughTevStage(config.texture.tev_stages[i])) {
+            last_active_stage = i;
+        }
+    }
     const bool debug_target = debug_selected && (debug_unlit ? !uses_lighting : uses_lighting);
     const bool stop_early = debug_target && debug_stop_stage >= 0;
     const u32 stage_count = stop_early ? static_cast<u32>(debug_stop_stage) + 1
