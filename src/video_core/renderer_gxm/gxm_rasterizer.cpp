@@ -210,9 +210,24 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texcoord1);
         } else if (GxmFlag("dbgout_light")) {
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Lighting);
+        } else if (GxmFlag("dbgout_spec")) {
+            // Normal stands for the specular sum in the USSE emitter.
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Normal);
+        } else if (GxmFlag("dbgout_const0")) {
+            // TevStage0 / Alpha stand for const_color[0] / [1] in the USSE emitter.
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::TevStage0);
+        } else if (GxmFlag("dbgout_const1")) {
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Alpha);
         } else if (GxmFlag("dbgout_uv1")) {
             // Texcoord2 stands for "texture coordinate 1 as colour" in the USSE emitter.
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texcoord2);
+        }
+    }
+    Usse::SetDebugUnlit(GxmFlag("dbgunlit"));
+    Usse::SetDebugOpaque(GxmFlag("dbgopaque"));
+    for (int stage = 0; stage < 6; stage++) {
+        if (GxmFlag(fmt::format("dbgstage{}", stage).c_str())) {
+            Usse::SetDebugStopStage(stage);
         }
     }
     runtime.SetSyncHook([this](u64 serial) { SyncToGpu(serial); });
@@ -1365,6 +1380,21 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     Shader* fs = pipeline_cache->FindShader(fs_hash);
     if (fs == nullptr) {
         std::string refusal;
+        {
+            // dbg_hashes.txt: the debug switches act only on the listed fs_<hash> programs.
+            static const std::set<u64> debug_hashes = [] {
+                std::set<u64> hashes;
+                if (std::FILE* f = std::fopen("ux0:data/azahar/dbg_hashes.txt", "r")) {
+                    unsigned long long h;
+                    while (std::fscanf(f, " us_%llx", &h) == 1 || std::fscanf(f, " %llx", &h) == 1) {
+                        hashes.insert(static_cast<u64>(h));
+                    }
+                    std::fclose(f);
+                }
+                return hashes;
+            }();
+            Usse::SetDebugSelected(debug_hashes.empty() || debug_hashes.contains(fs_hash));
+        }
         std::vector<u8> program = Usse::EmitFragmentProgram(fs_config, &refusal);
         if (program.empty()) {
             if (usse_refused.insert(fs_hash).second) {
@@ -1443,6 +1473,30 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         blend.colorDst = PicaToGxm::BlendFactor(om.alpha_blending.factor_dest_rgb);
         blend.alphaSrc = PicaToGxm::BlendFactor(om.alpha_blending.factor_source_a);
         blend.alphaDst = PicaToGxm::BlendFactor(om.alpha_blending.factor_dest_a);
+        // A colour buffer without alpha (RGB8, RGB565) reads back alpha 1 on the PICA, but the
+        // GXM surface behind RGB8 is RGBA8, and the tile buffer keeps the alpha the fragment
+        // programs wrote either way - so the destination-alpha factors are resolved here.
+        // Monster Hunter 4 Ultimate draws its sky through DstAlpha over an RGB8 target: with
+        // the stored alpha the sky faded out and the world took an olive cast.
+        using CF = Pica::FramebufferRegs::ColorFormat;
+        const CF target_format = fb_regs.color_format.Value();
+        if (target_format == CF::RGB8 || target_format == CF::RGB565) {
+            const auto resolve = [](unsigned f) -> unsigned {
+                switch (static_cast<SceGxmBlendFactor>(f)) {
+                case SCE_GXM_BLEND_FACTOR_DST_ALPHA:
+                    return SCE_GXM_BLEND_FACTOR_ONE;
+                case SCE_GXM_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:
+                case SCE_GXM_BLEND_FACTOR_SRC_ALPHA_SATURATE: // min(As, 1 - Ad) = 0
+                    return SCE_GXM_BLEND_FACTOR_ZERO;
+                default:
+                    return f;
+                }
+            };
+            blend.colorSrc = resolve(blend.colorSrc);
+            blend.colorDst = resolve(blend.colorDst);
+            blend.alphaSrc = resolve(blend.alphaSrc);
+            blend.alphaDst = resolve(blend.alphaDst);
+        }
     } else {
         blend.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
         blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
@@ -1450,6 +1504,39 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
         blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
         blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    }
+    // logblend: every distinct pairing of fragment program and PICA blend state, once, to
+    // ux0:data/azahar/blend_log.txt - which draws use the constant-colour factors GXM lacks.
+    static const bool log_blend = GxmFlag("logblend");
+    if (log_blend) {
+        static std::set<std::tuple<u64, u64, u32, u32>> seen;
+        u32 blending_raw = 0;
+        std::memcpy(&blending_raw, &om.alpha_blending, sizeof(blending_raw));
+        const u64 state = (static_cast<u64>(blending_raw) << 32) | om.blend_const.raw;
+        const u32 tex0_addr = regs.texturing.texture0.GetPhysicalAddress();
+        const u32 color_addr = fb_regs.GetColorBufferPhysicalAddress();
+        if (seen.size() < 4096 && seen.insert({fs_hash, state, tex0_addr, color_addr}).second) {
+            if (std::FILE* f = std::fopen("ux0:data/azahar/blend_log.txt", "a")) {
+                std::fprintf(f, "us_%016llx ab %u lit %u eq %u/%u src %u/%u dst %u/%u const %08x mask %x fmt %u tex %u/%u/%u t0 %08x cb %08x\n",
+                             static_cast<unsigned long long>(fs_hash),
+                             static_cast<u32>(om.alphablend_enable.Value()),
+                             static_cast<u32>(fs_config.lighting.enable.Value()),
+                             static_cast<u32>(om.alpha_blending.blend_equation_rgb.Value()),
+                             static_cast<u32>(om.alpha_blending.blend_equation_a.Value()),
+                             static_cast<u32>(om.alpha_blending.factor_source_rgb.Value()),
+                             static_cast<u32>(om.alpha_blending.factor_source_a.Value()),
+                             static_cast<u32>(om.alpha_blending.factor_dest_rgb.Value()),
+                             static_cast<u32>(om.alpha_blending.factor_dest_a.Value()),
+                             static_cast<u32>(om.blend_const.raw),
+                             static_cast<u32>(blend.colorMask),
+                             static_cast<u32>(fb_regs.color_format.Value()),
+                             static_cast<u32>(regs.texturing.texture0_format.Value()),
+                             static_cast<u32>(regs.texturing.texture1_format.Value()),
+                             static_cast<u32>(regs.texturing.texture2_format.Value()),
+                             tex0_addr, color_addr);
+                std::fclose(f);
+            }
+        }
     }
 
     // Waiting here is a whole SceShaccCg compile on the render thread - tens of milliseconds

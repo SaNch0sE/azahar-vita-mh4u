@@ -18,6 +18,29 @@
 namespace GxmRenderer::Usse {
 
 namespace {
+int debug_stop_stage = -1;
+bool debug_unlit = false;
+bool debug_opaque = false;
+bool debug_selected = true;
+}
+
+void SetDebugSelected(bool selected) {
+    debug_selected = selected;
+}
+
+void SetDebugOpaque(bool opaque) {
+    debug_opaque = opaque;
+}
+
+void SetDebugUnlit(bool unlit) {
+    debug_unlit = unlit;
+}
+
+void SetDebugStopStage(int stage) {
+    debug_stop_stage = stage;
+}
+
+namespace {
 
 using Pica::FramebufferRegs;
 using Pica::LightingRegs;
@@ -282,6 +305,7 @@ private:
     uint32_t uniform_floats = 0;
     uint32_t sa_alpha_ref = 0;
     uint32_t sa_const_color = 0;
+    uint32_t const_stage_count = 0; ///< const_color entries declared (stages up to the last reader)
     uint32_t sa_buffer_color = 0;
     uint32_t sa_scissor = 0;
     uint32_t sa_fog_offset = 0;
@@ -584,6 +608,7 @@ void FragmentEmitter::PlanUniforms() {
     if (const_stages != 0) {
         sa_const_color = AllocateUniform("const_color", 4, const_stages);
     }
+    const_stage_count = const_stages;
     if (buffer_used) {
         sa_buffer_color = AllocateUniform("tev_combiner_buffer_color", 4, 1);
     }
@@ -2193,7 +2218,11 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     e.Vec(VecOp::Add, {Reg::V(TmpOutput), 0x3}, ConstZero, ConstZero);
     e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x3}, ConstZero, ConstZero);
     PlanCombinerBuffer();
-    for (u32 i = 0; i < config.texture.tev_stages.size(); i++) {
+    const bool debug_target = debug_selected && (debug_unlit ? !uses_lighting : uses_lighting);
+    const bool stop_early = debug_target && debug_stop_stage >= 0;
+    const u32 stage_count = stop_early ? static_cast<u32>(debug_stop_stage) + 1
+                                       : static_cast<u32>(config.texture.tev_stages.size());
+    for (u32 i = 0; i < stage_count; i++) {
         TevStage(i);
     }
     AlphaTest();
@@ -2202,14 +2231,23 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
         WriteDepth();
         NewPhaseAfterKill();
     }
-    Fog();
+    if (stop_early) {
+        // dbgstageN: the stage's colour as it is, opaque.
+        e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x2}, ConstOne, ConstZero);
+    } else {
+        Fog();
+        if (debug_target && debug_opaque) {
+            // dbgopaque: the program's result with alpha 1.
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x2}, ConstOne, ConstZero);
+        }
+    }
     // Debug outputs (dbgout_* switches, Cg::SetDebugOutput): one intermediate value in place
     // of the result, to find the stage a wrong colour enters at. Texcoord1 stands for texture
     // unit 1 here, since a lit surface in Monster Hunter 4 Ultimate keeps its shadow on unit 0.
     // Only lit programs - the world and the characters - so the post-processing passes that
     // read the frame back still draw it, and what reaches the screen is the debug value.
     using DebugOutput = Pica::Shader::Generator::Cg::DebugOutput;
-    switch (uses_lighting ? Pica::Shader::Generator::Cg::GetDebugOutput() : DebugOutput::None) {
+    switch (debug_target ? Pica::Shader::Generator::Cg::GetDebugOutput() : DebugOutput::None) {
     case DebugOutput::VertexColor:
         CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpPrimary});
         break;
@@ -2228,6 +2266,23 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
             CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpDiffuse});
         }
         break;
+    case DebugOutput::Normal:
+        // dbgout_spec: the lighting's specular sum (secondary_fragment_color), rgb only.
+        if (uses_lighting) {
+            CopyVec4({Bank::Virtual, TmpOutput}, {Bank::Virtual, TmpSpecular});
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x2}, ConstOne, ConstZero);
+        }
+        break;
+    case DebugOutput::TevStage0:
+    case DebugOutput::Alpha: {
+        // dbgout_const0 / dbgout_const1: the TEV constant colour of stage 0 or 1, as uploaded.
+        const uint32_t k = Pica::Shader::Generator::Cg::GetDebugOutput() == DebugOutput::Alpha;
+        if (const_stage_count > k) {
+            CopyVec4({Bank::Virtual, TmpOutput},
+                     {Bank::SecAttr, static_cast<uint8_t>(sa_const_color + k * 4)});
+        }
+        break;
+    }
     case DebugOutput::Texcoord2:
         // dbgout_uv1: texture coordinate 1 as (u, v, 0, 1). Coordinates a surface's texture is
         // sampled with come out as smooth gradients; broken ones as noise or flat blocks.

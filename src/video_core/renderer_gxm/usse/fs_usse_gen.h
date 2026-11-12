@@ -28,4 +28,15 @@ namespace GxmRenderer::Usse {
                                                        std::string* refusal = nullptr,
                                                        int level = 1);
 
+/// dbgstageN: lit programs stop after combiner stage `stage` (0-5) and output its colour with
+/// alpha 1 and no fog, to find the stage a wrong colour enters at. -1: off.
+void SetDebugStopStage(int stage);
+/// dbgunlit: the dbgstage and dbgout switches act on the programs without lighting instead.
+void SetDebugUnlit(bool unlit);
+/// dbgopaque: the targeted programs output alpha 1, everything else unchanged.
+void SetDebugOpaque(bool opaque);
+/// Whether the next emitted program is one the debug switches act on (the rasterizer's
+/// ux0:data/azahar/dbg_hashes.txt filter; run with notier2 so no other thread emits).
+void SetDebugSelected(bool selected);
+
 } // namespace GxmRenderer::Usse

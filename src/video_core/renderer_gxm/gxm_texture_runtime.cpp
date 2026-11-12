@@ -48,8 +48,11 @@ constexpr SceGxmTransferFormat TrRaw32 = SCE_GXM_TRANSFER_FORMAT_RAW32;
 constexpr std::array<GxmFormat, 18> FormatTable = {{
     // RGBA8: guest bytes A,B,G,R; converted to R,G,B,A.
     {TexAbgr8, ColAbgr8, {}, TrAbgr8, 4, true, true},
-    // RGB8: converted to RGBA8.
-    {TexAbgr8, ColAbgr8, {}, TrAbgr8, 4, true, true},
+    // RGB8: converted to RGBA8, but sampled with alpha 1 as the PICA reads it. A render target
+    // in this format still holds the alpha its fragment programs wrote, and Monster Hunter 4
+    // Ultimate copies its RGB8 frame through a texture into the destination alpha its sky
+    // pass blends by - with the stored alpha the sky faded out to an olive cast.
+    {SCE_GXM_TEXTURE_FORMAT_X8U8U8U8_1BGR, ColAbgr8, {}, TrAbgr8, 4, true, true},
     // RGB5A1: r<<11 | g<<6 | b<<1 | a
     {SCE_GXM_TEXTURE_FORMAT_U5U5U5U1_RGBA,
      SCE_GXM_COLOR_FORMAT_U5U5U5U1_RGBA,
@@ -970,8 +973,15 @@ bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
     const bool same_size = src_w == dst_w && src_h == dst_h;
     const bool half_size = src_w == 2 * dst_w && src_h == 2 * dst_h;
     // A PTLA format for each end: real formats convert between each other, RAW copies bits.
+    // RGB8 into a format with alpha: the PICA's transfer fills alpha with 0xFF, but the RGB8
+    // surface is RGBA8 here and holds whatever alpha its fragment programs wrote, which a
+    // byte copy would carry over. The fragment-pipeline blit samples the source with alpha 1
+    // instead. Monster Hunter 4 Ultimate copies its RGB8 frame into an RGBA8 texture whose
+    // alpha its sky pass blends by; with the stale alpha the whole scene went olive.
+    const bool fills_alpha = source.pixel_format == VideoCore::PixelFormat::RGB8 &&
+                             dest.pixel_format != VideoCore::PixelFormat::RGB8;
     const bool same_bits =
-        sf.bytes_per_pixel == df.bytes_per_pixel &&
+        !fills_alpha && sf.bytes_per_pixel == df.bytes_per_pixel &&
         (source.pixel_format == dest.pixel_format || (sf.native_transfer && df.native_transfer));
     if (same_size && same_bits) {
         Sync(&source, &dest, "BlitTextures");
@@ -990,7 +1000,7 @@ bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
         // A format change: no PTLA path exists, so the fragment pipeline converts it.
         stat_gpu_blits++;
         return true;
-    } else if (half_size && sf.native_transfer && df.native_transfer && !flip) {
+    } else if (half_size && !fills_alpha && sf.native_transfer && df.native_transfer && !flip) {
         Sync(&source, &dest, "BlitTextures");
         stat_transfers++;
         const int err =
