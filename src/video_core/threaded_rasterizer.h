@@ -327,7 +327,21 @@ private:
         /// Hashes of the two prefixes, computed on the emulation thread.
         u64 program_hash = 0;
         u64 swizzle_hash = 0;
+        /// Which halves travel: only one that differs from what the mirror already holds.
+        bool has_program = false;
+        bool has_swizzle = false;
     };
+    /// What the mirror's setup holds (it only ever changes through LoadShippedProgram /
+    /// LoadShippedSwizzle), as the emulation thread last shipped it.
+    struct ShippedCode {
+        bool valid = false;
+        u64 program_hash = 0;
+        u32 program_size = 0;
+        u64 swizzle_hash = 0;
+        u32 swizzle_size = 0;
+    };
+    ShippedCode shipped_vs_code;
+    ShippedCode shipped_gs_code;
 
     struct SetupSync {
         bool has_uniforms = false;

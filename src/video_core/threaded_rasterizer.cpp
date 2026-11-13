@@ -38,9 +38,14 @@ void ThreadedRasterizer::ApplySetup(Pica::ShaderSetup& setup, const SetupSync& s
     }
     if (sync.has_code) {
         const auto& code = *sync.code;
-        setup.LoadShippedCode(code.program.data(), static_cast<u32>(code.program.size()),
-                              code.program_hash, code.swizzle.data(),
-                              static_cast<u32>(code.swizzle.size()), code.swizzle_hash);
+        if (code.has_program) {
+            setup.LoadShippedProgram(code.program.data(), static_cast<u32>(code.program.size()),
+                                     code.program_hash);
+        }
+        if (code.has_swizzle) {
+            setup.LoadShippedSwizzle(code.swizzle.data(), static_cast<u32>(code.swizzle.size()),
+                                     code.swizzle_hash);
+        }
     }
 }
 
@@ -109,6 +114,9 @@ ThreadedRasterizer::ThreadedRasterizer(GpuThread& gpu_thread_, Pica::PicaCore& e
 
 void ThreadedRasterizer::SetRealRasterizer(RasterizerInterface* real_) {
     real = real_;
+    // What the mirror holds is no longer known: ship the next code whole.
+    shipped_vs_code = {};
+    shipped_gs_code = {};
     // A recreated rasterizer brings a fresh ring (new mapping, cursor at zero); rebind and reset
     // the batch bookkeeping. This runs with the render thread quiescent.
     ring = real ? real->GetVertexRing() : nullptr;
@@ -276,7 +284,8 @@ void ThreadedRasterizer::CollectState(Shipment& shipment) {
     }
 
     prof(" .collect: luts");
-    const auto collect_setup = [&](Pica::ShaderSetup& setup, SetupSync& sync) {
+    const auto collect_setup = [&](Pica::ShaderSetup& setup, SetupSync& sync,
+                                   ShippedCode& shipped) {
         if (setup.uniforms_sync_dirty) {
             sync.has_uniforms = true;
             // Only the float window written since the last collect travels; bools and ints are
@@ -295,28 +304,45 @@ void ThreadedRasterizer::CollectState(Shipment& shipment) {
         }
         prof(" .collect: uniforms");
         if (setup.code_sync_dirty) {
-            if (!sync.code) {
-                sync.code = std::make_unique<CodeSync>();
+            // Hashed here, once per change, rather than by the busier render thread. Only a
+            // half that differs from what the mirror holds is copied and shipped: the game
+            // switches between a few programs, and the swizzle data rarely changes with them.
+            const u64 program_hash = setup.GetProgramCodeHash();
+            const u64 swizzle_hash = setup.GetSwizzleDataHash();
+            const u32 program_size = setup.GetBiggestProgramSize();
+            const u32 swizzle_size = setup.GetBiggestSwizzleSize();
+            const bool ship_program = !shipped.valid || shipped.program_hash != program_hash ||
+                                      shipped.program_size != program_size;
+            const bool ship_swizzle = !shipped.valid || shipped.swizzle_hash != swizzle_hash ||
+                                      shipped.swizzle_size != swizzle_size;
+            if (ship_program || ship_swizzle) {
+                if (!sync.code) {
+                    sync.code = std::make_unique<CodeSync>();
+                }
+                sync.has_code = true;
+                sync.code->has_program = ship_program;
+                sync.code->has_swizzle = ship_swizzle;
+                if (ship_program) {
+                    const auto& program = setup.GetProgramCode();
+                    sync.code->program.assign(program.begin(), program.begin() + program_size);
+                    sync.code->program_hash = program_hash;
+                }
+                if (ship_swizzle) {
+                    const auto& swizzle = setup.GetSwizzleData();
+                    sync.code->swizzle.assign(swizzle.begin(), swizzle.begin() + swizzle_size);
+                    sync.code->swizzle_hash = swizzle_hash;
+                }
+                shipped = {true, program_hash, program_size, swizzle_hash, swizzle_size};
             }
-            sync.has_code = true;
-            const auto& program = setup.GetProgramCode();
-            const auto& swizzle = setup.GetSwizzleData();
-            sync.code->program.assign(program.begin(),
-                                      program.begin() + setup.GetBiggestProgramSize());
-            sync.code->swizzle.assign(swizzle.begin(),
-                                      swizzle.begin() + setup.GetBiggestSwizzleSize());
-            // Hashed here, once per change, rather than by the busier render thread.
-            sync.code->program_hash = setup.GetProgramCodeHash();
-            sync.code->swizzle_hash = setup.GetSwizzleDataHash();
             setup.code_sync_dirty = false;
             prof(" .collect: code");
-            if (EP::enabled) {
+            if (EP::enabled && sync.has_code && sync.code->has_program) {
                 EP::Add(" .collect: code KiB", (sync.code->program.size() * 4 + 1023) / 1024 * 1000);
             }
         }
     };
-    collect_setup(emu_pica.vs_setup, shipment.vs);
-    collect_setup(emu_pica.gs_setup, shipment.gs);
+    collect_setup(emu_pica.vs_setup, shipment.vs, shipped_vs_code);
+    collect_setup(emu_pica.gs_setup, shipment.gs, shipped_gs_code);
     shipment.pa_reconfigure_events = emu_pica.pa_reconfigure_events;
     shipment.pa_reset_events = emu_pica.pa_reset_events;
     shipment.pa_topology =
