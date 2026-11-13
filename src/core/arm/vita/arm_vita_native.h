@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include <atomic>
 #include <map>
 #include <memory>
@@ -150,6 +152,13 @@ protected:
     std::shared_ptr<Memory::PageTable> GetPageTable() const override;
 
 private:
+    /// gxoverlap: per guest thread, the last TriggerCmdReqQueue's end time and duration.
+    struct GxPending {
+        u64 end_us = 0;
+        u64 dur_us = 0;
+    };
+    std::unordered_map<u32, GxPending> gx_pending;
+
     /// One trip into the guest. Returns false if the core should stop running for now.
     bool RunSlice(u64 quantum_ns);
     void CreditTime(const AzaharRunRequest& run, u64 quantum_ns);

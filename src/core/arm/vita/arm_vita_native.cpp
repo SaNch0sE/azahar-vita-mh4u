@@ -497,6 +497,28 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     case AZAHAR_EXIT_SVC: {
         const SceUInt64 svc_start = sceKernelGetProcessTimeWide();
         std::string prof_key;
+        // gxoverlap (with emuprof): how much of the GX command processing could overlap other
+        // work if it ran on its own thread. For each TriggerCmdReqQueue: its duration, and the
+        // wall time until the same guest thread next waits (WaitSynchronization1/N) - what the
+        // emulation thread does in between could run while the GX work proceeds elsewhere.
+        static const bool gx_overlap = GxmRenderer::GxmFlag("gxoverlap");
+        u32 svc_thread_id = 0;
+        bool is_gx_trigger = false;
+        if (gx_overlap && Common::EmuProf::enabled) {
+            if (const auto thread = system.Kernel().GetCurrentThreadManager().GetCurrentThread()) {
+                svc_thread_id = thread->GetThreadId();
+            }
+            if (run.svc_number == 0x24 || run.svc_number == 0x25) {
+                const auto it = gx_pending.find(svc_thread_id);
+                if (it != gx_pending.end()) {
+                    const u64 gap = svc_start - it->second.end_us;
+                    Common::EmuProf::Add("gxoverlap: trigger time", it->second.dur_us);
+                    Common::EmuProf::Add("gxoverlap: gap to wait", gap);
+                    Common::EmuProf::Add("gxoverlap: hideable", std::min<u64>(gap, it->second.dur_us));
+                    gx_pending.erase(it);
+                }
+            }
+        }
         if (Common::EmuProf::enabled) {
             // IPC requests by service and command; everything else by number.
             prof_key = fmt::format("svc {:02X}", run.svc_number);
@@ -505,6 +527,8 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                     if (const auto obj = process->handle_table.GetGeneric(run.ctx.r[0])) {
                         const u32 header = memory.Read32(cp15[CP15_THREAD_URO] + 0x80);
                         prof_key = fmt::format("ipc {} {:04X}", obj->GetName(), header >> 16);
+                        is_gx_trigger = (header >> 16) == 0x000C &&
+                                        obj->GetName().starts_with("gsp::Gpu");
                     }
                 }
             }
@@ -514,6 +538,18 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         NativeStats::svc_us.fetch_add(svc_end - svc_start, std::memory_order_relaxed);
         if (!prof_key.empty()) {
             Common::EmuProf::Add(prof_key, svc_end - svc_start);
+        }
+        if (gx_overlap && is_gx_trigger) {
+            auto& pending = gx_pending[svc_thread_id];
+            if (pending.end_us != 0) {
+                // Triggered again before waiting: what the thread did between the two (building
+                // the next list) could have overlapped the earlier one's processing.
+                const u64 gap = svc_start - pending.end_us;
+                Common::EmuProf::Add("gxoverlap: trigger time", pending.dur_us);
+                Common::EmuProf::Add("gxoverlap: gap to next trigger", gap);
+                Common::EmuProf::Add("gxoverlap: hideable", std::min<u64>(gap, pending.dur_us));
+            }
+            pending = {svc_end, svc_end - svc_start};
         }
     }
         // An svc can reschedule, which replaces the register file wholesale.
