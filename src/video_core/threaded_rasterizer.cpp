@@ -484,17 +484,24 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
     prof(" .ship: take");
     shipment->has_draw = true;
     shipment->draw = payload;
+    if (shipment->draw.arena_inline) {
+        shipment->draw.arena = reinterpret_cast<const u8*>(shipment->draw.immediate_input.data());
+    }
     shipment->owned_arena = std::move(emergency_arena);
     shipment->owned_arena_bytes = emergency_arena_bytes;
     emergency_arena_bytes = 0;
     CollectState(*shipment);
     prof(" .ship: collect");
 
-    auto* const arena_slot = static_cast<ArenaSlot*>(slot);
-    if (arena_slot) {
-        arena_slot->pending.fetch_add(1, std::memory_order_acq_rel);
+    shipment->arena_slot = static_cast<ArenaSlot*>(slot);
+    if (shipment->arena_slot) {
+        shipment->arena_slot->pending.fetch_add(1, std::memory_order_acq_rel);
     }
-    gpu_thread.Enqueue({.run = [this, shipment, arena_slot] {
+    // Two pointers: libstdc++'s std::function keeps a closure that small inline (8 bytes on the
+    // Vita), where the three-pointer one was a malloc here and a free on the render thread for
+    // every draw.
+    const auto op = [this, shipment] {
+        ArenaSlot* const arena_slot = shipment->arena_slot;
         ApplyShipment(mirror_pica, *shipment);
         const u32 watch = GuestWatch::Read();
         if (!shipment->draw.hw || !real->AccelerateShippedDraw(shipment->draw)) {
@@ -523,8 +530,11 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
         if (shipment->owned_arena_bytes) {
             emergency_bytes.fetch_sub(shipment->owned_arena_bytes, std::memory_order_relaxed);
         }
+        // Last: the emulation thread may take and reset the shipment right after.
         ReturnShipment(shipment);
-    }});
+    };
+    static_assert(sizeof(op) <= 2 * sizeof(void*) && std::is_trivially_copyable_v<decltype(op)>);
+    gpu_thread.EnqueueFromProducer({.run = op});
     prof(" .ship: enqueue");
 }
 
@@ -663,22 +673,25 @@ bool ThreadedRasterizer::TestGLWritten(PAddr addr, u32 size) const {
 }
 
 ThreadedRasterizer::Shipment* ThreadedRasterizer::TakeShipment() {
-    {
-        std::scoped_lock lock{shipment_pool_mutex};
-        if (!shipment_free.empty()) {
-            Shipment* shipment = shipment_free.back();
-            shipment_free.pop_back();
-            shipment->Reset();
-            return shipment;
-        }
+    Shipment* head = free_head.load(std::memory_order_acquire);
+    while (head != nullptr &&
+           !free_head.compare_exchange_weak(head, head->next_free, std::memory_order_acquire,
+                                            std::memory_order_acquire)) {
+    }
+    if (head != nullptr) {
+        head->Reset();
+        return head;
     }
     shipment_pool.push_back(std::make_unique<Shipment>());
     return shipment_pool.back().get();
 }
 
 void ThreadedRasterizer::ReturnShipment(Shipment* shipment) {
-    std::scoped_lock lock{shipment_pool_mutex};
-    shipment_free.push_back(shipment);
+    Shipment* head = free_head.load(std::memory_order_relaxed);
+    do {
+        shipment->next_free = head;
+    } while (!free_head.compare_exchange_weak(head, shipment, std::memory_order_release,
+                                              std::memory_order_relaxed));
 }
 
 void ThreadedRasterizer::FlushAll() {

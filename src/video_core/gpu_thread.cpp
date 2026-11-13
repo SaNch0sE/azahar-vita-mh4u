@@ -46,6 +46,16 @@ void GpuThread::Stop(std::function<void()> on_thread_exit) {
     thread.join();
 }
 
+void GpuThread::EnqueueFromProducer(Op op) {
+    if (!thread.joinable()) {
+        if (op.run) {
+            op.run();
+        }
+        return;
+    }
+    EnqueueQueued(std::move(op));
+}
+
 void GpuThread::Enqueue(Op op) {
     if (!thread.joinable() || OnThread()) {
         // No worker, or already on it (an op enqueueing another op): run inline.
@@ -54,6 +64,10 @@ void GpuThread::Enqueue(Op op) {
         }
         return;
     }
+    EnqueueQueued(std::move(op));
+}
+
+void GpuThread::EnqueueQueued(Op op) {
     bool wake = false;
     {
         std::unique_lock lock{mutex};

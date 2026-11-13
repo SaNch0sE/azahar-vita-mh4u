@@ -1255,6 +1255,31 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     if (layout.total > MAX_ARENA_BYTES) {
         return false;
     }
+    // A small software-shaded draw (MH4U's glyphs: one point for a geometry shader) carries its
+    // bytes in the payload itself: no frame arena slot, no ring branch, no per-draw emergency
+    // allocation when the slots are busy. The mirror reads them from the shipment, so what it
+    // hashes and draws is the same.
+    if (!hw && layout.total <= sizeof(AttributeBuffer)) {
+        if (!rasterizer->NoteShippedDraw(skippable_target)) {
+            return true;
+        }
+        DrawPayload payload;
+        u8* const dst = reinterpret_cast<u8*>(payload.immediate_input.data());
+        loader.CopyIntoArena(base_address, vertex_min, vertex_max, layout, dst);
+        if (index_bytes != 0) {
+            std::memcpy(dst + layout.index_offset, index_address_8, index_bytes);
+        }
+        payload.arena_inline = true;
+        payload.layout = layout;
+        payload.vertex_min = vertex_min;
+        payload.vertex_max = vertex_max;
+        payload.num_vertices = pipeline.num_vertices;
+        payload.vertex_offset = pipeline.vertex_offset;
+        payload.is_indexed = is_indexed;
+        payload.index_u16 = index_u16;
+        rasterizer->ShipDraw(std::move(payload), nullptr);
+        return true;
+    }
     // A hardware draw would rather be written once, straight into the renderer's GPU-visible
     // ring in the layout its vertex streams read, than into an arena the render thread copies
     // into that ring; the facade grants it when the ring has room.
@@ -1374,8 +1399,6 @@ void PicaCore::LoadVertices(bool is_indexed) {
     const auto& pipeline = regs.internal.pipeline;
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
     auto& loader = GetVertexLoader();
-    regs.internal.rasterizer.ValidateSemantics();
-    output_vertex_map.Build(regs.internal.rasterizer);
 
     // Locate index buffer.
     const auto& index_info = pipeline.index_array;
@@ -1400,6 +1423,9 @@ void PicaCore::LoadVertices(bool is_indexed) {
     if (TryShipDraw(is_indexed, false)) {
         return;
     }
+    // Only the local path below needs these; a shipped draw has them rebuilt on the mirror.
+    regs.internal.rasterizer.ValidateSemantics();
+    output_vertex_map.Build(regs.internal.rasterizer);
 
     // Local path: resolve the attribute arrays to host pointers once for the whole draw;
     // fetches below are then a pointer add each.

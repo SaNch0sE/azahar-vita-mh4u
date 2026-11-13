@@ -54,6 +54,9 @@ struct DrawPayload {
     /// `arena` is a block of the vertex cache's GPU-visible pool (pica/vertex_cache.h), in the
     /// ring's layout: drawn from in place like a ring draw, with no ring position to retire.
     bool gpu_resident = false;
+    /// The draw's bytes are in `immediate_input` (a small software-shaded draw); the shipment
+    /// points `arena` at its own copy of them.
+    bool arena_inline = false;
     bool immediate = false;
     bool immediate_reset_geometry = false;
     AttributeBuffer immediate_input{};

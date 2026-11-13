@@ -4,7 +4,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -34,6 +37,24 @@ namespace Pica {
  * before that, so queued draws can still read them.
  */
 class VertexCache {
+    /// Every user but the once-a-second stats reader is the emulation thread: a spinlock
+    /// costs an atomic, where std::mutex on the Vita was ~5 us a draw. It sleeps after a while
+    /// so a preempted holder on the same core gets to run.
+    struct SpinLock {
+        std::atomic_flag flag = ATOMIC_FLAG_INIT;
+        void lock() {
+            for (u32 n = 0; flag.test_and_set(std::memory_order_acquire); n++) {
+                if (n > 2000) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    n = 0;
+                }
+            }
+        }
+        void unlock() {
+            flag.clear(std::memory_order_release);
+        }
+    };
+
 public:
     struct Entry {
         u8* block = nullptr;
@@ -94,13 +115,15 @@ public:
                 watched_pages[page]++;
             }
         }
+        watched_count.store(static_cast<u32>(watched_pages.size()), std::memory_order_relaxed);
         entries[key] = std::move(entry);
         stat_inserts++;
     }
 
     /// Drops every entry that read from [host, host + size). Any thread.
     void InvalidateHost(const u8* host, std::size_t size) {
-        if (size == 0) {
+        // The write hook fires on every IPC buffer write: nothing watched, nothing to do.
+        if (size == 0 || watched_count.load(std::memory_order_relaxed) == 0) {
             return;
         }
         std::scoped_lock lock{mutex};
@@ -141,6 +164,7 @@ public:
                     }
                 }
             }
+            watched_count.store(static_cast<u32>(watched_pages.size()), std::memory_order_relaxed);
             u8& v = volatility[it->first];
             v = v < 255 ? v + 1 : v;
             stat_invalidations++;
@@ -153,6 +177,7 @@ public:
         std::scoped_lock lock{mutex};
         entries.clear();
         watched_pages.clear();
+        watched_count.store(0, std::memory_order_relaxed);
         pool_used = 0;
         stat_resets++;
     }
@@ -179,7 +204,8 @@ public:
     }
 
 private:
-    std::mutex mutex;
+    SpinLock mutex;
+    std::atomic<u32> watched_count{0}; ///< watched_pages.size(), readable without the lock
     std::unordered_map<u64, Entry> entries;
     std::unordered_map<u64, u8> volatility;
     std::unordered_map<uintptr_t, u32> watched_pages;

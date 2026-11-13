@@ -58,6 +58,9 @@ public:
     /// Queues an operation. Never blocks (in lockstep mode, waits for it to retire).
     /// With no worker running, executes inline — the pre-thread and non-threaded configurations.
     void Enqueue(Op op);
+    /// Enqueue for callers that are never the worker (the emulation thread's draw shipments):
+    /// skips the OnThread test, a thread-id query per call.
+    void EnqueueFromProducer(Op op);
 
     /// Runs `fn` on the GPU thread after everything queued before it, and waits for it.
     void RunSync(std::function<void()> fn);
@@ -125,6 +128,7 @@ public:
 
 private:
     void ThreadLoop(std::function<void()> on_thread_start);
+    void EnqueueQueued(Op op);
 
     Common::NamedThread thread;
     std::mutex mutex;

@@ -373,6 +373,10 @@ private:
         std::unique_ptr<std::array<std::array<u32, 256>, 24>> lighting_luts;
         std::unique_ptr<Pica::PicaCore::Fog> fog;
         std::unique_ptr<Pica::PicaCore::ProcTex> proctex;
+        /// The frame arena slot the draw's data lives in (ShipDraw), released when it ran.
+        ArenaSlot* arena_slot = nullptr;
+        /// Next in the free stack (TakeShipment / ReturnShipment).
+        Shipment* next_free = nullptr;
 
         void Reset() {
             vertices.clear();
@@ -392,14 +396,17 @@ private:
             lighting_dirty = 0;
             fog.reset();
             proctex.reset();
+            arena_slot = nullptr;
         }
     };
 
     Shipment* TakeShipment();
     void ReturnShipment(Shipment* shipment);
+    /// Every shipment ever made (the emulation thread's), and the free ones as a lock-free
+    /// stack: the render thread pushes as it retires them, only the emulation thread pops (so
+    /// no ABA). LIFO keeps the most recently used, still cached, shipment in use.
     std::vector<std::unique_ptr<Shipment>> shipment_pool;
-    std::vector<Shipment*> shipment_free;
-    std::mutex shipment_pool_mutex;
+    std::atomic<Shipment*> free_head{nullptr};
 
     static void ApplySetup(Pica::ShaderSetup& setup, const SetupSync& sync);
     static void ApplyShipment(Pica::PicaCore& mirror, const Shipment& shipment);
