@@ -185,6 +185,12 @@ struct GPU::Impl {
     ~Impl();
 
     u64 floor_last_presented = 0;
+    /// Top-screen frame boundaries (display transfers / top copies) seen on the emulation
+    /// thread, and the count when the last present was queued: a vblank with no new boundary
+    /// has no new picture, and its present is not queued (see VBlankCallback).
+    u64 frame_boundaries = 0;
+    u64 boundaries_at_present = 0;
+    u32 dup_present_streak = 0;
     u32 floor_starved_vblanks = 0;
     u32 skip_flip_pending_vblanks = 0;
     /// The same wait, for arming rather than releasing the skip.

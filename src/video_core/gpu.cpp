@@ -26,6 +26,9 @@
 #include "video_core/renderer_software/sw_blitter.h"
 #include "video_core/right_eye_disabler.h"
 #include "video_core/video_core.h"
+#ifdef ENABLE_GXM
+#include "video_core/renderer_gxm/gxm_flags.h"
+#endif
 
 #include <cstdint>
 #include <cstdlib>
@@ -402,6 +405,7 @@ void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in) {
             impl->skip_current = impl->skip_pending;
             impl->shipping_rasterizer->SetSkipFrame(impl->skip_current);
         }
+        impl->frame_boundaries++;
         // Boundaries are arriving, so flips happen at frame edges; the vblank timeouts below
         // must only rescue phases with no boundaries at all.
         impl->skip_flip_pending_vblanks = 0;
@@ -1264,7 +1268,32 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     // the top pane's picture, so a recording's hitches can be matched to the trace.
     static const bool log_presents = std::getenv("AZAHAR_PRESENT_LOG") != nullptr;
     const u64 vblank_serial = ++impl->vblank_serial;
-    if (skip_next) {
+    // A vblank with no new top-screen frame since the last queued present shows the same
+    // picture again. On the Vita each present also ends a renderer frame, and its end waits for
+    // the GPU to finish the frame two presents back: a repeated present between two real
+    // frames cut the CPU/GPU overlap from two frames to one. MH4U under its 30 fps cap repeats
+    // every other vblank. Up to three in a row are dropped; the fourth goes through, so phases
+    // that compose without top-sized transfers (CPU-drawn or copy-composed screens) still
+    // refresh at 15 fps at worst. `nodupskip` turns it off.
+#ifdef ENABLE_GXM
+    static const bool dup_skip = !GxmRenderer::GxmFlag("nodupskip");
+#else
+    constexpr bool dup_skip = false;
+#endif
+    bool dup_present = false;
+    if (dup_skip && threaded && !skip_next) {
+        if (impl->frame_boundaries == impl->boundaries_at_present &&
+            impl->dup_present_streak < 3) {
+            impl->dup_present_streak++;
+            dup_present = true;
+        } else {
+            impl->dup_present_streak = 0;
+            impl->boundaries_at_present = impl->frame_boundaries;
+        }
+    }
+    if (dup_present) {
+        Common::PipelineStats::dup_presents.fetch_add(1, std::memory_order_relaxed);
+    } else if (skip_next) {
         if (log_presents) {
             LOG_INFO(HW_GPU, "present vb {} skipped by frameskip at {} us, queue {}", vblank_serial,
                      Common::PipelineStats::NowUs(), impl->gpu_thread.Depth());

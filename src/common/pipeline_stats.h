@@ -148,6 +148,8 @@ inline std::atomic<void (*)()> scene_report{nullptr};
 /// finished, which is what the emulated console produced, not what the display showed - the
 /// two diverge whenever presents are being dropped, and only this one tracks the latter.
 inline std::atomic<u32> presents{0};
+/// Vblanks whose present was not queued because no new top-screen frame had arrived.
+inline std::atomic<u32> dup_presents{0};
 /// VBlank snapshots taken of CPU-written framebuffers (GPU::DisplaySnapshot).
 inline std::atomic<u32> display_snapshots{0};
 
