@@ -87,6 +87,9 @@ public:
     void DumpSurfaces();
     /// Whether the current TEV configuration (or fragment lighting) reads texture `unit`.
     [[nodiscard]] bool TextureUnitRead(u32 unit) const;
+    /// Whether the combiner's alpha output (what reaches the target's alpha) depends on the
+    /// unit: its colour output may still read it.
+    [[nodiscard]] bool AlphaReadsUnit(u32 unit) const;
     /// Level 0 of `surface` to <stem>.ppm, with <stem>_a.pgm (alpha) or _s.pgm (stencil).
     void WriteSurfaceImage(Surface& surface, const std::string& stem);
     /// The presentation layer's cost, charged from the renderer so the report can set it
@@ -480,6 +483,10 @@ private:
     u32 stat_finishes{}, stat_syncs{}, stat_scene_breaks{}, stat_ring_peak{};
     /// skipfeedback: the draw being set up samples its own colour target and is dropped.
     bool skip_feedback_draw{};
+    /// A draw reading its own target only for colour: drawn writing alpha alone (see
+    /// SyncTextureUnits).
+    bool feedback_alpha_only{};
+    u32 stat_alpha_only_feedback{};
 
     u32 stat_uniform_uploads{}, stat_uniform_skips{}, stat_dropped_draws{}, stat_scene_waits{};
     u32 stat_gpu_blit_logs{}, stat_guest_writes{}, stat_invalidates{}, stat_flushes{};

@@ -111,14 +111,20 @@ Since then:
    (or not at all if it already holds that program), and the code buffers are reused: 73 ms ->
    24 ms. What is left (~7% of the render thread: ~31 scattered register writes, ~17 float
    registers compared per shipment) is mostly cache misses on data written by the other core.
-2. **Lighting cost on the GPU.** The top lit program is ~40% of fragment time and fewer
-   instructions barely moved it: the cost is lighting-LUT and texture latency or pixel count.
-   Options: hoist uniform-only lighting math (light direction normalize) to the CPU; reduce
-   register moves in the IR (operate in place) where that does not hit the console miscompiles.
-3. **Ship cutscene depth of field.** Blurs everything and some shots show blocky garbage, with
-   frame drops to ~8 fps while the garbage is on screen. The composite of the aliased 256x512 view
-   at `0x18070800` is not the cause (flushing it changed nothing); the focus mask (frame alpha) is
-   the next suspect.
+2. **Lighting cost on the GPU** (looked at; parked). Fewer instructions do cut fragment time,
+   but what is left is structural: of the top program's 214 instructions, 70 are moves between
+   the three internal registers and temporaries (stores and reloads around every 4-wide value).
+   Only 2 can be removed without touching the forms that miscompile on the console; more needs
+   a new register allocator. Each LUT read waits for its sample at once, but the profile showed
+   almost no texture stall, so overlapping the two reads is not expected to pay.
+3. **Ship cutscene depth of field** (mostly fixed). MH4U builds the focus mask with depth-tested
+   full-screen quads that colour-grade the frame from the target itself (a feedback read) and
+   write a constant alpha. Feedback draws were dropped, which left alpha 1 everywhere and blurred
+   every pixel. A feedback draw whose TEV alpha does not depend on the self-read unit is now drawn
+   writing alpha only (`nofeedbackalpha` turns it off); the colour grade on those pixels is still
+   lost. Still open: close-up shots show blocky garbage where the blur shows through.
+   `18070800` is used both as a 256x512 target (two scenes a frame) and as the 64x128 blur
+   ping-pong buffer, so the two layouts of that memory get mixed up.
 4. **Shown fps is vblank-quantised.** The guest runs ~39 fps, but a frame takes ~47 ms on the
    render thread, so ~21 are shown. Under 33 ms is needed for 30.
 5. Low priority: persist tier-2 USSE programs to disk (creating them is already microseconds);

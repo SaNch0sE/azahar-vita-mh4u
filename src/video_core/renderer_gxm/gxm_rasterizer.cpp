@@ -1466,6 +1466,9 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     blend.colorMask =
         mask(om.red_enable, SCE_GXM_COLOR_MASK_R) | mask(om.green_enable, SCE_GXM_COLOR_MASK_G) |
         mask(om.blue_enable, SCE_GXM_COLOR_MASK_B) | mask(om.alpha_enable, SCE_GXM_COLOR_MASK_A);
+    if (feedback_alpha_only) {
+        blend.colorMask &= SCE_GXM_COLOR_MASK_A;
+    }
     // Bring-up switch: every draw written straight to the target. A picture that comes right
     // without blending puts the fault in the blend or in what it reads back, not in what the
     // shader computed.
@@ -1940,6 +1943,35 @@ bool RasterizerGxm::TextureUnitRead(u32 unit) const {
     return false;
 }
 
+bool RasterizerGxm::AlphaReadsUnit(u32 unit) const {
+    if (regs.lighting.disable == 0) {
+        return true; // lit alpha (Fresnel) may come from a bump or shadow read
+    }
+    using Source = Pica::TexturingRegs::TevStageConfig::Source;
+    const Source wanted = static_cast<Source>(static_cast<u32>(Source::Texture0) + unit);
+    const auto& buffer_input = regs.texturing.tev_combiner_buffer_input;
+    // Taint through the chain: the previous stage's alpha and the combiner buffer's.
+    bool previous = false;
+    bool buffer = false;
+    const auto stages = regs.texturing.GetTevStages();
+    for (u32 i = 0; i < stages.size(); i++) {
+        const auto& stage = stages[i];
+        bool reads = false;
+        for (const Source src : {stage.alpha_source1.Value(), stage.alpha_source2.Value(),
+                                 stage.alpha_source3.Value()}) {
+            reads |= src == wanted || (src == Source::Previous && previous) ||
+                     (src == Source::PreviousBuffer && buffer);
+        }
+        // With its update bit set, the stage's output becomes the buffer the following stages
+        // read; sticky, to stay conservative.
+        if (buffer_input.TevStageUpdatesCombinerBufferAlpha(i)) {
+            buffer |= reads;
+        }
+        previous = reads;
+    }
+    return previous;
+}
+
 void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
     std::array<SceGxmTexture, 3> textures{white_texture, white_texture, white_texture};
@@ -2068,8 +2100,17 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             // pointing at the target by a draw that shades from vertex colour alone is not
             // one: Monster Hunter 4 Ultimate draws its sky haze that way, and dropping it left
             // the whole scene olive. Such a unit stays unbound (white) and the draw is made.
-            if (TextureUnitRead(unit)) {
+            // A draw whose alpha does not come from the unit is drawn with only alpha written
+            // and the unit white: Monster Hunter 4 Ultimate builds its depth-of-field focus
+            // mask that way, depth-tested full-screen quads that colour-grade from the target
+            // and write a constant alpha. Dropping them left alpha 1, blurring every pixel.
+            static const bool no_alpha_only = GxmFlag("nofeedbackalpha");
+            if (TextureUnitRead(unit) && (no_alpha_only || AlphaReadsUnit(unit))) {
                 skip_feedback_draw = true;
+            } else if (TextureUnitRead(unit)) {
+                feedback_alpha_only = true;
+                stat_alpha_only_feedback++;
+                continue;
             } else {
                 stat_white_unread_feedback++;
                 continue;
@@ -2215,6 +2256,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         const PhaseTimer timer{time_draws, times.textures};
         SyncAndUploadLUTs();
         skip_feedback_draw = false;
+        feedback_alpha_only = false;
         SyncTextureUnits(fb);
     }
     if (skip_feedback_draw) {
@@ -3381,8 +3423,9 @@ void RasterizerGxm::EndFrame() {
                         why_not += fmt::format(" {} {},", not_names[r], n);
                     }
                 }
-                LOG_INFO(Render, "repeated software draws (no state sync): {}, draws keeping the fragment setup: {}",
-                         stat_repeat_draws, stat_begin_repeats);
+                LOG_INFO(Render, "repeated software draws (no state sync): {}, draws keeping the fragment setup: {}, feedback draws written as alpha only: {}",
+                         stat_repeat_draws, stat_begin_repeats, stat_alpha_only_feedback);
+                stat_alpha_only_feedback = 0;
                 stat_repeat_draws = 0;
                 stat_begin_repeats = 0;
                 LOG_INFO(Render,
