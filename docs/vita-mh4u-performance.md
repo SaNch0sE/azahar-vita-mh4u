@@ -130,7 +130,17 @@ Since then:
      wrote, and the light colours and distance attenuation came from leftover register contents.
      Each quad now has its own load. Found by stopping the fragment programs after each TEV
      stage (`dbgstage<N>`), then the debug outputs, then the host emitter's allocated listing.
-4. **Shown fps is vblank-quantised.** The guest runs ~39 fps, but a frame takes ~47 ms on the
-   render thread, so ~21 are shown. Under 33 ms is needed for 30.
+4. **Shown fps (~20-22) - where a frame goes now** (2026-11-13). On the deck, per shown frame
+   (~49 ms): ~28 ms of render-thread work, ~15 ms waiting at the frame's end for the GPU to
+   finish the frame before, the rest idle. With every fragment program replaced by vertex
+   colour (`dbgout_vertex`) the wait and the fps do not change, so the GPU's frame time is not
+   fragment shading; per-scene tile load/store of the 256x512 target (~9 scenes a frame) or
+   vertex work are the candidates, and need a GPU timeline capture (the profiler's sampling
+   covers matched draw windows only). Character select: ~250 geometry-shader glyph draws a
+   frame are 56-59% of the render thread; entering it creates 4 framebuffers (~110 ms each,
+   one-off) and ~0.5 s of programs.
+   Glyph draws now: memo key ~19 us, triangle copy ~9 us, repeat path ~2 us (merged into
+   runs, `nodrawmerge`); the ~18% that change state between glyphs pay a full draw setup
+   (~150 us) and are most of what is left.
 5. Low priority: persist tier-2 USSE programs to disk (creating them is already microseconds);
    the render thread's unaccounted ~24%.
