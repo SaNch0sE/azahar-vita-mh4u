@@ -19,9 +19,14 @@ the v1.3 update, at the ship's deck right after the save loads, no frame-cap che
 | No post fx / shadow-target clear, colour-only scene merge (-> 35.5 ms) | 60% | 28-29 |
 | Reflection LUTs as 1 (-> 32.9 ms of GPU a frame) | 60-63% | **30-31** |
 | Glyph memo on kept fingerprints, hardware draws keep fragment setup | 64-68% | 21-22 |
+| 30 fps cap cheat on; repeated presents not queued (deck now measured in real frames) | 90-93% | 27-28 |
+| Per-vertex normal and N.V (deck GPU ~32.4 -> ~30.4 ms) | 90-93% | 27-28 |
+| Single-screen layout (Heavenfall mod), bottom screen not drawn | 90-93% | 27-28 |
+| DSP mixing skips silent sends; vertex cache (copy 24 -> 3.8 MB/s) | **100%** | **30** |
 
-The guest now runs at ~39 fps; what is shown is held at ~21 by the render thread (~90% busy, of
-which ~20% waiting for the GPU).
+From the 30 fps cap row on, speed is against the capped 30 game fps (100% = full speed at 30 fps)
+and the shown fps counts distinct pictures. The ship's deck now runs at full speed; the next limits
+are the emulation thread's command-list processing and, close behind, the GPU (~28-30 ms a frame).
 
 ## Emulation thread (core 0 + the guest on core 2)
 
@@ -180,6 +185,7 @@ The vertex copy runs at the CPU's ceiling for uncached memory: `copybench` measu
 with memcpy into the ring, 118 MB/s with 64-byte NEON blocks, 264 MB/s into CDRAM. Moving the copies
 to a worker on core 0 did not help (the same bandwidth, and the other draws got slower), a
 cached ring (`alloc_mapped_cached`, with or without `sceKernelSyncVMDomain` on each range) ends the
-title ~48 s in ("No more processes"). What is left is not copying: reusing the GPU copy of vertex
-data that has not changed since the last frame (most of it is static meshes), which needs guest
-write tracking plus invalidation on the emulator's own writes (file reads, GX DMA).
+title ~48 s in ("No more processes"). What did work is not copying: `pica/vertex_cache.h` keeps
+the GPU copy of vertex data that has not changed (guest write tracking, plus Memory::host_write_hook
+and the rasterizer's invalidations for the emulator's own writes): 77% of hardware draws hit on the
+deck, the copy fell to 3.8 MB/s and the deck reached 100% speed.

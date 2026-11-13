@@ -23,6 +23,11 @@ Measurements and history are in `vita-mh4u-performance.md`.
    (`postfx`, `shadowtarget` restore them), and colour-only framebuffers draw in the open
    scene (`noscenemerge`). Deck GPU ~37.8 -> ~35.5 ms a frame, shown fps 28-29.
 
+9. Done: the vertex cache (hardware draws reuse the GPU copy of unchanged vertex data). Watch
+   for stale geometry on area loads; `novtxcache` turns it off.
+10. Next on the emulation thread (`emuprof`): command-list parsing outside draws (~90 ms/s),
+    glyph draws (~60 ms/s), the DSP tick (~65 ms/s; mixing could split across cores by sample).
+
 ## After the optimisations
 
 7. Done: **single-screen play** with the Heavenfall mod (`vita-mh4u-single-screen.md`); the
