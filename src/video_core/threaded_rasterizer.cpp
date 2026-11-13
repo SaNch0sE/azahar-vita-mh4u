@@ -12,6 +12,8 @@
 #include "video_core/pica/pica_core.h"
 #include <cstring>
 #include "video_core/guest_watch.h"
+#include "common/emu_prof.h"
+#include "common/pipeline_stats.h"
 #include "video_core/threaded_rasterizer.h"
 
 namespace VideoCore {
@@ -223,6 +225,15 @@ void ThreadedRasterizer::AddTriangle(const Pica::OutputVertex& v0, const Pica::O
 }
 
 void ThreadedRasterizer::CollectState(Shipment& shipment) {
+    namespace EP = Common::EmuProf;
+    u64 prof_t = EP::enabled ? Common::PipelineStats::NowUs() : 0;
+    const auto prof = [&](const char* key) {
+        if (EP::enabled) {
+            const u64 now = Common::PipelineStats::NowUs();
+            EP::Add(key, now - prof_t);
+            prof_t = now;
+        }
+    };
     // Ship only the registers that changed, discovered through the dirty bits; the LUTs travel
     // only when PicaCore flagged them since the last batch.
     shipment.dirty = emu_pica.dirty_regs;
@@ -239,6 +250,7 @@ void ThreadedRasterizer::CollectState(Shipment& shipment) {
         }
     }
     emu_pica.dirty_regs.Clear();
+    prof(" .collect: regs");
 
     if (emu_pica.lighting.lut_dirty != 0) {
         if (!shipment.lighting_luts) {
@@ -263,7 +275,8 @@ void ThreadedRasterizer::CollectState(Shipment& shipment) {
         emu_pica.proctex.table_dirty = 0;
     }
 
-    const auto collect_setup = [](Pica::ShaderSetup& setup, SetupSync& sync) {
+    prof(" .collect: luts");
+    const auto collect_setup = [&](Pica::ShaderSetup& setup, SetupSync& sync) {
         if (setup.uniforms_sync_dirty) {
             sync.has_uniforms = true;
             // Only the float window written since the last collect travels; bools and ints are
@@ -280,6 +293,7 @@ void ThreadedRasterizer::CollectState(Shipment& shipment) {
             setup.sync_f_lo = 96;
             setup.sync_f_hi = 0;
         }
+        prof(" .collect: uniforms");
         if (setup.code_sync_dirty) {
             if (!sync.code) {
                 sync.code = std::make_unique<CodeSync>();
@@ -295,6 +309,10 @@ void ThreadedRasterizer::CollectState(Shipment& shipment) {
             sync.code->program_hash = setup.GetProgramCodeHash();
             sync.code->swizzle_hash = setup.GetSwizzleDataHash();
             setup.code_sync_dirty = false;
+            prof(" .collect: code");
+            if (EP::enabled) {
+                EP::Add(" .collect: code KiB", (sync.code->program.size() * 4 + 1023) / 1024 * 1000);
+            }
         }
     };
     collect_setup(emu_pica.vs_setup, shipment.vs);
@@ -453,13 +471,24 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
         }
     }
 #endif // CITRA_TRACE_PROBES
+    namespace EP = Common::EmuProf;
+    u64 prof_t = EP::enabled ? Common::PipelineStats::NowUs() : 0;
+    const auto prof = [&](const char* key) {
+        if (EP::enabled) {
+            const u64 now = Common::PipelineStats::NowUs();
+            EP::Add(key, now - prof_t);
+            prof_t = now;
+        }
+    };
     Shipment* const shipment = TakeShipment();
+    prof(" .ship: take");
     shipment->has_draw = true;
     shipment->draw = payload;
     shipment->owned_arena = std::move(emergency_arena);
     shipment->owned_arena_bytes = emergency_arena_bytes;
     emergency_arena_bytes = 0;
     CollectState(*shipment);
+    prof(" .ship: collect");
 
     auto* const arena_slot = static_cast<ArenaSlot*>(slot);
     if (arena_slot) {
@@ -496,6 +525,7 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
         }
         ReturnShipment(shipment);
     }});
+    prof(" .ship: enqueue");
 }
 
 void ThreadedRasterizer::DrawTriangles() {

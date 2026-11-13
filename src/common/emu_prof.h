@@ -24,9 +24,17 @@ struct Entry {
 
 inline bool enabled = false;
 inline std::unordered_map<std::string, Entry> entries;
+/// Literal keys, by address: no string is built or hashed per call (the string-keyed Add costs
+/// a few microseconds on the Vita, which distorted fine-grained timings).
+inline std::unordered_map<const char*, Entry> literal_entries;
 
 inline void Add(const std::string& key, u64 us) {
     auto& e = entries[key];
+    e.us += us;
+    e.count++;
+}
+inline void Add(const char* key, u64 us) {
+    auto& e = literal_entries[key];
     e.us += us;
     e.count++;
 }
@@ -35,6 +43,10 @@ inline void Add(const std::string& key, u64 us) {
 inline std::string TakeReport(std::size_t top = 12) {
     std::vector<std::pair<std::string, Entry>> v(entries.begin(), entries.end());
     entries.clear();
+    for (const auto& [key, e] : literal_entries) {
+        v.emplace_back(key, e);
+    }
+    literal_entries.clear();
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
     std::string out;
     for (std::size_t i = 0; i < std::min(top, v.size()); i++) {

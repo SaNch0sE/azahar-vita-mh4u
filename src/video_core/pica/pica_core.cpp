@@ -814,6 +814,23 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
 }
 
 // Handle batch register writes
+
+} // namespace Pica
+namespace {
+// emuprof: time spent in each register's special or batch handler, keyed "reg XXX".
+const char* RegProfKey(u32 id) {
+    static const std::vector<std::string> keys = [] {
+        std::vector<std::string> k(Pica::RegsInternal::NUM_REGS);
+        for (u32 i = 0; i < k.size(); i++) {
+            k[i] = fmt::format(" .reg {:03X}", i);
+        }
+        return k;
+    }();
+    return keys[id].c_str();
+}
+} // namespace
+namespace Pica {
+
 void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                      bool& stop_requested) {
     if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
@@ -831,7 +848,11 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
 
     if (const BatchFn batch = batch_lut[id]) {
         // If the register supports batch then call the handler.
+        const u64 prof_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
         batch(*this, id, values, count);
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add(RegProfKey(id), Common::PipelineStats::NowUs() - prof_t0);
+        }
     } else if (const SpecialFn special = special_lut[id]) [[unlikely]] {
         // Unlikely as all special regs that make sense to use batch mode already
         // support batch handling.
@@ -925,7 +946,11 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     }
 
     if (const SpecialFn special = special_lut[id]) {
+        const u64 prof_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
         special(*this, id, value, stop_requested);
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add(RegProfKey(id), Common::PipelineStats::NowUs() - prof_t0);
+        }
     }
 
     dirty_regs.Set(id);
@@ -1126,6 +1151,15 @@ void PicaCore::DrawArrays(bool is_indexed) {
 }
 
 bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
+    namespace EP = Common::EmuProf;
+    u64 prof_t = EP::enabled ? Common::PipelineStats::NowUs() : 0;
+    const auto prof = [&](const char* key) {
+        if (EP::enabled) {
+            const u64 now = Common::PipelineStats::NowUs();
+            EP::Add(key, now - prof_t);
+            prof_t = now;
+        }
+    };
     const auto& pipeline = regs.internal.pipeline;
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
     const auto& index_info = pipeline.index_array;
@@ -1137,6 +1171,7 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     const bool index_u16 = index_info.format != 0;
 
     auto& loader = GetVertexLoader();
+    prof(" .draw: loader");
 
     // The vertex cache (vertex_cache.h): a hardware draw whose sources have not changed since
     // it was last drawn reuses that copy - no index scan, no copy, no ring space.
@@ -1167,10 +1202,13 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
         key_data.flags = (is_indexed ? 1u : 0u) | (index_u16 ? 2u : 0u);
         vkey = Common::ComputeHash64(&key_data, sizeof(key_data));
         VertexCache::Entry hit;
-        if (vcache.Find(vkey, hit)) {
+        const bool found = vcache.Find(vkey, hit);
+        prof(" .draw: key + find");
+        if (found) {
             if (!rasterizer->NoteShippedDraw(skippable_target)) {
                 return true;
             }
+            prof(" .draw hit: note");
             DrawPayload payload;
             payload.arena = hit.block;
             payload.layout = hit.layout;
@@ -1183,6 +1221,7 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
             payload.index_u16 = index_u16;
             payload.hw = true;
             rasterizer->ShipDraw(std::move(payload), nullptr);
+            prof(" .draw hit: ship");
             return true;
         }
     }

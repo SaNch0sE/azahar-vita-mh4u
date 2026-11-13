@@ -581,7 +581,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     static_cast<unsigned>(heap.uordblks / 1024),
                     static_cast<unsigned>(heap.arena / 1024), sema, phase, sgi);
                 if (Common::EmuProf::enabled) {
-                    sceClibPrintf("[emuprof]%s\n", Common::EmuProf::TakeReport().c_str());
+                    sceClibPrintf("[emuprof]%s\n", Common::EmuProf::TakeReport(30).c_str());
                 }
                 if (Pica::GetVertexCache().enabled) {
                     const auto vc = Pica::GetVertexCache().TakeStats();
