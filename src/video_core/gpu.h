@@ -109,6 +109,14 @@ public:
      */
     void StartRenderThread();
 
+    /// Async command lists (Common::gx_async): on the emulation thread, waits for the list in
+    /// flight and applies what it left (interrupts, deferred flushes); on any other thread, only
+    /// waits. A no-op when nothing is in flight.
+    void GxAcquire(const char* site = "gxwait: other");
+    /// Emulation thread, between guest slices: takes back a list that has finished.
+    void GxPoll();
+    [[nodiscard]] bool GxBusy() const;
+
     /// Drains and stops the render thread, handing the GL context back released.
     void StopRenderThread();
 
@@ -200,6 +208,9 @@ public:
     void ReleaseRenderer();
 
 private:
+    void GxLoop();
+    void GxStart();
+    void GxStop();
     // Runs on the emulation thread: registers, vertex processing and P3D keep exact timing.
     void ExecSubmitCmdList(u32 index);
 

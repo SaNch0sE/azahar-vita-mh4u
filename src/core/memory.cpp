@@ -413,6 +413,8 @@ public:
             // Through the threaded facade: the raw GL rasterizer's caches may only be touched
             // on the render thread, and these flushes arrive from the emulation thread (DMA,
             // y2r, applet captures) and even filesystem worker threads.
+            // A command list parsing on the GX thread owns the facade until it is taken back.
+            system.GPU().GxAcquire("gxwait: memory flush");
             auto* rasterizer = system.GPU().CacheRasterizer();
             switch (mode) {
             case FlushMode::Flush:

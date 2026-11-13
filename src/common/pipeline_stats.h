@@ -154,6 +154,9 @@ inline std::atomic<u32> dup_presents{0};
 inline std::atomic<u32> bottom_draws_dropped{0};
 /// Time the frame limiter slept on the emulation thread (the guest ahead of real time).
 inline std::atomic<u32> limiter_sleep_us{0};
+/// Time the GX thread spent parsing command lists, and how many.
+inline std::atomic<u32> gx_list_us{0};
+inline std::atomic<u32> gx_lists{0};
 /// VBlank snapshots taken of CPU-written framebuffers (GPU::DisplaySnapshot).
 inline std::atomic<u32> display_snapshots{0};
 

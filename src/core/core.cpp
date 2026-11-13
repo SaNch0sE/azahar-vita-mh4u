@@ -323,7 +323,13 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         }
         if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
             LOG_TRACE(Core_ARM11, "Core {} idling", current_core_to_execute->GetID());
-            current_core_to_execute->GetTimer().Idle();
+            // A command list still parsing on the GX thread: its P3D is what the guest is
+            // waiting for, so take it back rather than idle time forward past it.
+            if (gpu && gpu->GxBusy()) {
+                gpu->GxAcquire("gxwait: guest idle");
+            } else {
+                current_core_to_execute->GetTimer().Idle();
+            }
             PrepareReschedule();
         } else {
             if (tight_loop) {
@@ -357,7 +363,11 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             // instead advance to the next event and try to yield to the next thread
             if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
                 LOG_TRACE(Core_ARM11, "Core {} idling", cpu_core->GetID());
-                cpu_core->GetTimer().Idle();
+                if (gpu && gpu->GxBusy()) {
+                    gpu->GxAcquire("gxwait: guest idle");
+                } else {
+                    cpu_core->GetTimer().Idle();
+                }
                 PrepareReschedule();
             } else {
                 // In the rare case the break flag is set (due to exception thrown)

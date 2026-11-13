@@ -23,17 +23,25 @@ struct Entry {
 };
 
 inline bool enabled = false;
+/// Set on threads that must not record (the GX thread: the maps are the emulation thread's).
+inline thread_local bool thread_disabled = false;
 inline std::unordered_map<std::string, Entry> entries;
 /// Literal keys, by address: no string is built or hashed per call (the string-keyed Add costs
 /// a few microseconds on the Vita, which distorted fine-grained timings).
 inline std::unordered_map<const char*, Entry> literal_entries;
 
 inline void Add(const std::string& key, u64 us) {
+    if (thread_disabled) {
+        return;
+    }
     auto& e = entries[key];
     e.us += us;
     e.count++;
 }
 inline void Add(const char* key, u64 us) {
+    if (thread_disabled) {
+        return;
+    }
     auto& e = literal_entries[key];
     e.us += us;
     e.count++;

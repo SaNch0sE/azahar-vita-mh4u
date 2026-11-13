@@ -566,13 +566,15 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 #endif
                 const auto wt_stats = system.Memory().WriteTracker().TakeStats();
                 sceClibPrintf(
-                    "[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  dup %u  bottom %u  limiter %u us  "
+                    "[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  dup %u  bottom %u  limiter %u us  gx %u us/%u  "
                     "slices %u (svc %u fast %u)  guest %u us  in %u us  wf %u wa %u wh %u  "
                     "queue %u brake %u us  heap %u/%u KiB%s%s%s\n",
                     speed, fps10 / 10, fps10 % 10, presented, skipped,
                     Common::PipelineStats::dup_presents.exchange(0, std::memory_order_relaxed),
                     Common::PipelineStats::bottom_draws_dropped.exchange(0, std::memory_order_relaxed),
-                    Common::PipelineStats::limiter_sleep_us.exchange(0, std::memory_order_relaxed), rec.slices, rec.svcs, static_cast<unsigned>(Core::NativeStats::fast_svcs.exchange(0)),
+                    Common::PipelineStats::limiter_sleep_us.exchange(0, std::memory_order_relaxed),
+                    Common::PipelineStats::gx_list_us.exchange(0, std::memory_order_relaxed),
+                    Common::PipelineStats::gx_lists.exchange(0, std::memory_order_relaxed), rec.slices, rec.svcs, static_cast<unsigned>(Core::NativeStats::fast_svcs.exchange(0)),
                     static_cast<unsigned>(rec.guest_ns / 1000),
                     static_cast<unsigned>(rec.vanrun_us),
                     Core::NativeStats::write_faults.exchange(0, std::memory_order_relaxed),
@@ -754,7 +756,10 @@ int EmulatorMain() {
     Settings::values.disable_right_eye_render = true;
     Common::EmuProf::enabled = GxmRenderer::GxmFlag("emuprof");
     Common::dsp_parallel = !GxmRenderer::GxmFlag("nodspthread");
-    Common::vcache_arm_first = GxmRenderer::GxmFlag("vcarmfirst");
+    Common::gx_async = GxmRenderer::GxmFlag("gxasync");
+    Common::gx_early_p3d = GxmRenderer::GxmFlag("gxearlyp3d");
+    // The vertex cache needs arm-first inserts once lists are parsed beside the guest.
+    Common::vcache_arm_first = GxmRenderer::GxmFlag("vcarmfirst") || Common::gx_async;
     // Hardware draws reuse the GPU copy of vertex data that has not changed (pica/vertex_cache.h);
     // the emulator's own writes into guest memory drop what they overwrite. `novtxcache`.
     Pica::GetVertexCache().enabled = !GxmRenderer::GxmFlag("novtxcache");

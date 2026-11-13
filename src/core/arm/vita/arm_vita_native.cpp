@@ -380,6 +380,8 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         return false;
     }
 
+    // A command list finished on the GX thread since the last slice: post its interrupts now.
+    system.GPU().GxPoll();
     const SceUInt64 prologue_start = Common::EmuProf::enabled ? sceKernelGetProcessTimeWide() : 0;
     // Pages the surface cache wants armed since the last slice: protected now, while the
     // guest is stopped, so the claim and the protection take effect together at this entry.

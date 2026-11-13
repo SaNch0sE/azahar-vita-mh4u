@@ -4,6 +4,8 @@
 
 #include "common/archives.h"
 #include "common/emu_prof.h"
+#include <thread>
+#include "common/vita_tuning.h"
 #include "common/scope_exit.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
@@ -243,6 +245,13 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 }
 
 void GPU::PostInterrupt(Service::GSP::InterruptId id, u64 delay_ns) {
+    if (impl->gx.worker_id != std::thread::id{} &&
+        std::this_thread::get_id() == impl->gx.worker_id) {
+        // Raised by a list running on the GX thread: posted when the emulation thread takes the
+        // list back, never earlier than synchronous processing would have.
+        impl->gx.irqs.emplace_back(id, delay_ns);
+        return;
+    }
     if (impl->gpu_thread.OnThread()) {
         const uintptr_t packed = (static_cast<uintptr_t>(id) << 28) |
                                  static_cast<uintptr_t>(std::min<u64>(delay_ns, 0x0FFFFFFF));
@@ -504,9 +513,126 @@ void GPU::StartRenderThread() {
         }
     });
     LOG_INFO(HW_GPU, "GPU execution moved to the render thread");
+    GxStart();
+}
+
+void GPU::GxStart() {
+    if (!Common::gx_async || impl->gx.thread.joinable()) {
+        return;
+    }
+    impl->gx.quit = false;
+    impl->gx.thread = std::thread([this] { GxLoop(); });
+    LOG_INFO(HW_GPU, "GX command lists run on their own thread");
+}
+
+void GPU::GxStop() {
+    if (!impl->gx.thread.joinable()) {
+        return;
+    }
+    GxAcquire();
+    impl->gx.quit = true;
+    impl->gx.work_wake.Raise();
+    impl->gx.thread.join();
+    impl->gx.worker_id = {};
+}
+
+void GPU::GxLoop() {
+    // The shader compiler's core, idle while a title runs.
+    Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
+    Common::SetCurrentThreadName("GxLists");
+    Common::EmuProf::thread_disabled = true;
+    impl->gx.worker_id = std::this_thread::get_id();
+    auto& gx = impl->gx;
+    for (;;) {
+        if (gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted) {
+            MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
+            const u64 list_t0 = Common::PipelineStats::NowUs();
+            impl->pica.ProcessCmdList(gx.addr, gx.size, false);
+            Common::PipelineStats::gx_list_us.fetch_add(Common::PipelineStats::NowUs() - list_t0,
+                                                        std::memory_order_relaxed);
+            Common::PipelineStats::gx_lists.fetch_add(1, std::memory_order_relaxed);
+            impl->pica.regs.internal.pipeline.command_buffer.trigger[0] = 0;
+            gx.state.store(Impl::GxWorker::Done, std::memory_order_release);
+            gx.done_wake.Raise();
+            continue;
+        }
+        gx.work_wake.Lower();
+        if (gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted) {
+            continue;
+        }
+        if (gx.quit.load(std::memory_order_acquire)) {
+            return;
+        }
+        gx.work_wake.Wait();
+    }
+}
+
+bool GPU::GxBusy() const {
+    return impl->gx.state.load(std::memory_order_acquire) != Impl::GxWorker::Idle;
+}
+
+void GPU::GxPoll() {
+    if (impl->gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Done) {
+        GxAcquire();
+    }
+}
+
+void GPU::GxAcquire(const char* site) {
+    auto& gx = impl->gx;
+    if (gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Idle) {
+        return;
+    }
+    const bool was_posted = gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted;
+    const u64 wait_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+    // Wait for the list (a short spin first: most hand-backs are near).
+    for (u32 spin = 0; spin < 200 &&
+                       gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted;
+         spin++) {
+        std::this_thread::yield();
+    }
+    while (gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted) {
+        gx.done_wake.Lower();
+        if (gx.state.load(std::memory_order_acquire) != Impl::GxWorker::Posted) {
+            break;
+        }
+        gx.done_wake.Wait();
+    }
+    if (Common::EmuProf::enabled && was_posted) {
+        Common::EmuProf::Add(site, Common::PipelineStats::NowUs() - wait_t0);
+    }
+    if (gx.emu_id == std::thread::id{} || std::this_thread::get_id() != gx.emu_id) {
+        // Not the emulation thread: the list is finished, which is all this caller needs;
+        // its interrupts and deferred flushes are the emulation thread's to apply.
+        return;
+    }
+    if (Common::EmuProf::enabled) {
+        u32 p3d = 0;
+        for (const auto& [id, delay] : gx.irqs) {
+            p3d += id == Service::GSP::InterruptId::P3D ? 1 : 0;
+        }
+        Common::EmuProf::Add(p3d == 1 ? "gx list: one P3D" : (p3d == 0 ? "gx list: no P3D" : "gx list: several P3D"),
+                             gx.irqs.size() * 1000);
+    }
+    bool skip_p3d = gx.early_p3d;
+    gx.early_p3d = false;
+    for (const auto& [id, delay] : gx.irqs) {
+        if (skip_p3d && id == Service::GSP::InterruptId::P3D) {
+            skip_p3d = false; // already posted at hand-over
+            continue;
+        }
+        PostInterruptDeferred(id, delay);
+    }
+    gx.irqs.clear();
+    for (const auto& [addr, size] : gx.deferred_flush) {
+        impl->shipping_rasterizer->InvalidateGuestFlushedRegion(addr, size);
+        impl->shipping_rasterizer->InvalidateVertexCache(addr, size);
+    }
+    gx.deferred_flush.clear();
+    gx.state.store(Impl::GxWorker::Idle, std::memory_order_release);
 }
 
 void GPU::StopRenderThread() {
+    GxStop();
     if (!impl->gpu_thread.IsRunning()) {
         return;
     }
@@ -637,6 +763,7 @@ const u8* GPU::DisplaySnapshot(u32 screen, PAddr addr) const {
 }
 
 void GPU::RunOnRenderThread(std::function<void()> fn) {
+    GxAcquire();
     impl->gpu_thread.RunSync(std::move(fn));
 }
 
@@ -682,12 +809,19 @@ void GPU::InvalidateOnGuestFlush(PAddr addr, u32 size) {
     // and faulted without ever invalidating anything until it came back.)
     auto& tracker = impl->memory.WriteTracker();
     if (tracker.Enabled()) {
-        tracker.Consume([this](u32 paddr, u32 size) {
+        // A list in flight: its invalidations stay ordered after it, as when it ran here.
+        const bool defer = GxBusy();
+        tracker.Consume([this, defer](u32 paddr, u32 size) {
+            if (defer) {
+                impl->gx.deferred_flush.emplace_back(paddr, size);
+                return;
+            }
             impl->shipping_rasterizer->InvalidateGuestFlushedRegion(paddr, size);
             impl->shipping_rasterizer->InvalidateVertexCache(paddr, size);
         });
         return;
     }
+    GxAcquire();
     impl->shipping_rasterizer->InvalidateGuestFlushedRegion(addr, size);
 }
 
@@ -808,21 +942,29 @@ void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
 }
 
 void GPU::FlushRegion(PAddr addr, u32 size) {
+    GxAcquire("gxwait: flush region");
     impl->gpu_thread.RunSync([this, addr, size] { impl->rasterizer->FlushRegion(addr, size); });
 }
 
 void GPU::InvalidateRegion(PAddr addr, u32 size) {
+    GxAcquire("gxwait: invalidate region");
     impl->gpu_thread.RunSync(
         [this, addr, size] { impl->rasterizer->InvalidateRegion(addr, size); });
 }
 
 void GPU::ClearAll(bool flush) {
+    GxAcquire();
     impl->gpu_thread.RunSync([this, flush] { impl->rasterizer->ClearAll(flush); });
 }
 
 void GPU::Execute(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
+    // Every command waits for the list in flight: one at a time, in order.
+    if (impl->gx.emu_id == std::thread::id{}) {
+        impl->gx.emu_id = std::this_thread::get_id();
+    }
+    GxAcquire("gxwait: next command");
 
 #ifdef CITRA_TRACE_PROBES
     // Temporary divergence tracing for the software-renderer boot hang.
@@ -877,7 +1019,35 @@ void GPU::Execute(const Service::GSP::Command& command) {
 
         // Processing runs right here on the emulation thread: register state, vertex shading and
         // the P3D interrupt all keep their exact timing, and only the resulting triangles travel
-        // to the render thread.
+        // to the render thread. With Common::gx_async the list goes to the GX thread instead,
+        // and the guest runs on while it is parsed (its P3D is posted when it is taken back).
+        if (impl->gx.thread.joinable()) {
+            const PAddr addr = cmdbuffer.GetPhysicalAddress(0);
+            const u32 size = cmdbuffer.GetSize(0);
+            if (right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size)) {
+                impl->gx.addr = addr;
+                impl->gx.size = size;
+                // gx_early_p3d: a list that ends by requesting its P3D (a write to the IRQ
+                // request register, 0x010, as its last command) gets the interrupt now, as when
+                // lists were parsed here; the game then runs on instead of waiting for the parse.
+                impl->gx.early_p3d = false;
+                if (Common::gx_early_p3d && size >= 8) {
+                    if (const u8* head = impl->memory.GetPhysicalPointer(addr)) {
+                        u32 header;
+                        std::memcpy(&header, head + size - 4, sizeof(header));
+                        if ((header & 0x3ff) == 0x010) {
+                            impl->gx.early_p3d = true;
+                        }
+                    }
+                }
+                impl->gx.state.store(Impl::GxWorker::Posted, std::memory_order_release);
+                impl->gx.work_wake.Raise();
+                if (impl->gx.early_p3d) {
+                    PostInterruptDeferred(Service::GSP::InterruptId::P3D, 0);
+                }
+                break;
+            }
+        }
         ExecSubmitCmdList(0);
 #ifdef CITRA_TRACE_PROBES
         {
@@ -948,6 +1118,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
+    GxAcquire("gxwait: buffer swap");
     const PAddr phys_address_left = VirtualToPhysicalAddress(info.address_left);
     const PAddr phys_address_right = VirtualToPhysicalAddress(info.address_right);
     const auto info_copy = info;
@@ -977,11 +1148,13 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
 }
 
 void GPU::SetColorFill(const Pica::ColorFill& fill) {
+    GxAcquire();
     impl->pica.regs_lcd.color_fill_top = fill;
     impl->pica.regs_lcd.color_fill_bottom = fill;
 }
 
 u32 GPU::ReadReg(VAddr addr) {
+    GxAcquire("gxwait: read reg");
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -1004,6 +1177,7 @@ u32 GPU::ReadReg(VAddr addr) {
 }
 
 void GPU::WriteReg(VAddr addr, u32 data) {
+    GxAcquire("gxwait: write reg");
     switch (addr & 0xFFFFF000) {
     case VADDR_LCD: {
         const u32 offset = addr - VADDR_LCD;
@@ -1121,6 +1295,8 @@ void GPU::ExecSubmitCmdList(u32 index) {
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+    // Stage 1: the frame's list is taken back before the vblank's frameskip and present work.
+    GxAcquire("gxwait: vblank");
     // Signal to GSP that GPU interrupt has occurred
     impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
@@ -1383,6 +1559,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 }
 
 void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {
+    GxAcquire();
     impl->gpu_thread.RunSync([this, &emu_window, secondary_window] {
         RecreateRendererLocked(emu_window, secondary_window);
     });
@@ -1452,6 +1629,7 @@ void GPU::RecreateRendererLocked(Frontend::EmuWindow& emu_window,
 }
 
 void GPU::ReleaseRenderer() {
+    GxStop();
     impl->gpu_thread.RunSync([this] {
         // Just reset the renderer to release OpenGL resources
         // Don't null out rasterizer pointer as it will become dangling

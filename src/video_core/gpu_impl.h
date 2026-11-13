@@ -6,6 +6,9 @@
 #pragma once
 
 #include <atomic>
+#include "common/wake_flag.h"
+#include <vector>
+#include <thread>
 
 #include "common/archives.h"
 #include "common/pipeline_stats.h"
@@ -38,6 +41,27 @@ struct DisplaySnapshotSlot {
 };
 
 struct GPU::Impl {
+    /// Command lists on their own thread (Common::gx_async): one list in flight at a time; the
+    /// emulation thread hands one over in Execute and takes the result back (GxAcquire) before
+    /// it touches GPU state again.
+    struct GxWorker {
+        enum : u32 { Idle = 0, Posted = 1, Done = 2 };
+        std::atomic<u32> state{Idle};
+        PAddr addr = 0;
+        u32 size = 0;
+        /// Interrupts the list raised; posted on the emulation thread when it is taken back.
+        std::vector<std::pair<Service::GSP::InterruptId, u64>> irqs;
+        /// Guest data-cache flushes that arrived while it ran, applied after it.
+        std::vector<std::pair<PAddr, u32>> deferred_flush;
+        Common::WakeFlag work_wake;
+        Common::WakeFlag done_wake;
+        std::thread thread;
+        std::thread::id worker_id{};
+        std::thread::id emu_id{};
+        std::atomic<bool> quit{false};
+        /// The list in flight had its P3D posted when it was handed over (gx_early_p3d).
+        bool early_p3d = false;
+    } gx;
     Core::Timing& timing;
     Core::System& system;
     Memory::MemorySystem& memory;
