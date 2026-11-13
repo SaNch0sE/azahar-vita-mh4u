@@ -83,6 +83,24 @@ void GuestWriteTracker::ApplyPending() {
     }
 }
 
+bool GuestWriteTracker::ArmedSignature(const u8* host, std::size_t size, u64& sig) const {
+    const Block* block = FindBlock(host);
+    if (block == nullptr || size == 0 || host + size > block->host_base + block->size) {
+        return false;
+    }
+    const u8* first = reinterpret_cast<const u8*>(reinterpret_cast<std::uintptr_t>(host) &
+                                                   ~std::uintptr_t{PageSize - 1});
+    for (const u8* page = first; page < host + size; page += PageSize) {
+        const std::size_t index = block->first_page + (page - block->host_base) / PageSize;
+        const u32 word = state[index].load(std::memory_order_acquire);
+        if ((word & ArmedBit) == 0 || (word & DirtyBit) != 0) {
+            return false;
+        }
+        sig = sig * 0x100000001b3ull ^ (word + index);
+    }
+    return true;
+}
+
 void GuestWriteTracker::ArmNow(const u8* host, std::size_t size) {
     const Block* block = FindBlock(host);
     if (block == nullptr) {

@@ -23,6 +23,7 @@
 #include "core/memory.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/pica/pica_core.h"
+#include "common/vita_tuning.h"
 #include "video_core/pica/vertex_cache.h"
 #ifdef ENABLE_GXM
 #include "video_core/renderer_gxm/gxm_flags.h"
@@ -1290,8 +1291,33 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     // A miss the cache wants: copied once into a pool block, in the ring's layout, and drawn
     // from there.
     if (use_vcache && vcache.Wanted(vkey, ring_layout.total)) {
-        u8* block = vcache.Allocate(ring_layout.total);
-        if (block == nullptr) {
+        auto& tracker = memory.WriteTracker();
+        // Arm-first (Common::vcache_arm_first): a draw is cached only once its sources are
+        // already protected, and kept only if no store faulted on them and no emulator write
+        // touched them during the copy - correct with the guest running at the same time.
+        // Otherwise copy then arm, which needs the guest stopped while this runs.
+        const bool arm_first = Common::vcache_arm_first && tracker.Enabled();
+        std::vector<std::pair<const u8*, u32>> sources;
+        loader.SourceRanges(base_address, vertex_min, vertex_max, sources);
+        if (index_bytes != 0) {
+            sources.emplace_back(index_address_8, index_bytes);
+        }
+        bool cacheable = true;
+        u64 sig_before = 0;
+        if (arm_first) {
+            for (const auto& [host, size] : sources) {
+                cacheable = tracker.ArmedSignature(host, size, sig_before) && cacheable;
+            }
+            if (!cacheable) {
+                for (const auto& [host, size] : sources) {
+                    tracker.Arm(host, size);
+                }
+                vcache.NoteUnarmedMiss(vkey);
+            }
+        }
+        const u32 seq_before = vcache.InvalidationSeq();
+        u8* block = cacheable ? vcache.Allocate(ring_layout.total) : nullptr;
+        if (cacheable && block == nullptr) {
             // The pool is full: once the GPU has finished every draw that may still read it,
             // start over.
             rasterizer->WaitGpuIdle();
@@ -1303,24 +1329,35 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
                 return true;
             }
             loader.CopyIntoArena(base_address, vertex_min, vertex_max, ring_layout, block);
+            if (index_bytes != 0) {
+                VertexLoader::WriteRingIndices(block + ring_layout.index_offset, index_address_8,
+                                               index_u16, pipeline.num_vertices, vertex_min);
+            }
             VertexCache::Entry entry;
             entry.block = block;
             entry.layout = ring_layout;
             entry.vertex_min = vertex_min;
             entry.vertex_max = vertex_max;
-            loader.SourceRanges(base_address, vertex_min, vertex_max, entry.sources);
-            if (index_bytes != 0) {
-                VertexLoader::WriteRingIndices(block + ring_layout.index_offset, index_address_8,
-                                               index_u16, pipeline.num_vertices, vertex_min);
-                entry.sources.emplace_back(index_address_8, index_bytes);
-            }
-            auto& tracker = memory.WriteTracker();
-            if (tracker.Enabled()) {
-                for (const auto& [host, size] : entry.sources) {
+            entry.sources = sources;
+            if (!arm_first && tracker.Enabled()) {
+                for (const auto& [host, size] : sources) {
                     tracker.Arm(host, size);
                 }
             }
             vcache.Insert(vkey, std::move(entry));
+            if (arm_first) {
+                u64 sig_after = 0;
+                bool still_armed = true;
+                for (const auto& [host, size] : sources) {
+                    still_armed = tracker.ArmedSignature(host, size, sig_after) && still_armed;
+                }
+                if (!still_armed || sig_after != sig_before ||
+                    vcache.ChangedSince(seq_before, sources)) {
+                    // Changed under the copy: this draw still uses what was copied (as a ring
+                    // copy would), but the entry goes.
+                    vcache.Erase(vkey);
+                }
+            }
             DrawPayload payload;
             payload.arena = block;
             payload.layout = ring_layout;

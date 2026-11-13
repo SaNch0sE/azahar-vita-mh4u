@@ -754,6 +754,7 @@ int EmulatorMain() {
     Settings::values.disable_right_eye_render = true;
     Common::EmuProf::enabled = GxmRenderer::GxmFlag("emuprof");
     Common::dsp_parallel = !GxmRenderer::GxmFlag("nodspthread");
+    Common::vcache_arm_first = GxmRenderer::GxmFlag("vcarmfirst");
     // Hardware draws reuse the GPU copy of vertex data that has not changed (pica/vertex_cache.h);
     // the emulator's own writes into guest memory drop what they overwrite. `novtxcache`.
     Pica::GetVertexCache().enabled = !GxmRenderer::GxmFlag("novtxcache");

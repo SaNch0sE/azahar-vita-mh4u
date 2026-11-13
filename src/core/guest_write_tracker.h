@@ -85,6 +85,11 @@ public:
      */
     bool OnFault(const u8* host_page, void (*unprotect)(void*), void* unprotect_ctx);
 
+    /// Whether every page of [host, host + size) is armed and clean right now; `sig` then folds
+    /// their state words (each fault bumps a page's epoch, so a changed `sig` means a store
+    /// landed in between). False for memory the tracker does not cover. Any thread.
+    bool ArmedSignature(const u8* host, std::size_t size, u64& sig) const;
+
     /// Hands every dirty run to `fn(physical_address, size)` and clears the dirty bits. Runs
     /// of consecutive pages are merged. Emulation thread.
     void Consume(const std::function<void(u32 paddr, u32 size)>& fn);

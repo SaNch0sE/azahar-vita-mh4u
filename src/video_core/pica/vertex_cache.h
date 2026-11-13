@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -122,6 +123,15 @@ public:
 
     /// Drops every entry that read from [host, host + size). Any thread.
     void InvalidateHost(const u8* host, std::size_t size) {
+        // Recorded before anything else: an insert checks the ranges invalidated around its
+        // copy against its own sources (arm-first, ChangedSince).
+        if (size != 0) {
+            const u32 seq = inval_seq.load(std::memory_order_relaxed) + 1;
+            auto& slot = recent[seq % RecentRanges];
+            slot.lo.store(reinterpret_cast<uintptr_t>(host), std::memory_order_relaxed);
+            slot.hi.store(reinterpret_cast<uintptr_t>(host) + size, std::memory_order_relaxed);
+            inval_seq.store(seq, std::memory_order_release);
+        }
         // The write hook fires on every IPC buffer write: nothing watched, nothing to do.
         if (size == 0 || watched_count.load(std::memory_order_relaxed) == 0) {
             return;
@@ -182,6 +192,58 @@ public:
         stat_resets++;
     }
 
+    /// Drops an entry without counting it towards volatility (an insert that lost a race).
+    void Erase(u64 key) {
+        std::scoped_lock lock{mutex};
+        const auto it = entries.find(key);
+        if (it == entries.end()) {
+            return;
+        }
+        for (const auto& [src, n] : it->second.sources) {
+            const uintptr_t s = reinterpret_cast<uintptr_t>(src);
+            for (uintptr_t page = s >> 12; page <= (s + n - 1) >> 12; page++) {
+                const auto w = watched_pages.find(page);
+                if (w != watched_pages.end() && --w->second == 0) {
+                    watched_pages.erase(w);
+                }
+            }
+        }
+        watched_count.store(static_cast<u32>(watched_pages.size()), std::memory_order_relaxed);
+        entries.erase(it);
+    }
+    /// Arm-first: a miss whose sources were not all armed yet. After three such misses the
+    /// key is treated as volatile (its pages never stay armed: hot, or rewritten every frame).
+    void NoteUnarmedMiss(u64 key) {
+        std::scoped_lock lock{mutex};
+        u8& v = volatility[key];
+        if (++unarmed[key] >= 3 && v < 2) {
+            v = 2;
+        }
+    }
+    [[nodiscard]] u32 InvalidationSeq() const {
+        return inval_seq.load(std::memory_order_acquire);
+    }
+    /// Whether an invalidation recorded after `seq` may have touched one of `sources` (true
+    /// when too many have happened to tell).
+    bool ChangedSince(u32 seq, const std::vector<std::pair<const u8*, u32>>& sources) const {
+        const u32 now = inval_seq.load(std::memory_order_acquire);
+        if (now - seq > RecentRanges / 2) {
+            return now != seq;
+        }
+        for (u32 s = seq + 1; s != now + 1; s++) {
+            const auto& slot = recent[s % RecentRanges];
+            const uintptr_t lo = slot.lo.load(std::memory_order_relaxed);
+            const uintptr_t hi = slot.hi.load(std::memory_order_relaxed);
+            for (const auto& [src, n] : sources) {
+                const uintptr_t a = reinterpret_cast<uintptr_t>(src);
+                if (a < hi && lo < a + n) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     void SetPool(u8* base, u32 size) {
         std::scoped_lock lock{mutex};
         pool = base;
@@ -206,6 +268,14 @@ public:
 private:
     SpinLock mutex;
     std::atomic<u32> watched_count{0}; ///< watched_pages.size(), readable without the lock
+    std::atomic<u32> inval_seq{0};
+    static constexpr u32 RecentRanges = 64;
+    struct Recent {
+        std::atomic<uintptr_t> lo{0};
+        std::atomic<uintptr_t> hi{0};
+    };
+    std::array<Recent, RecentRanges> recent{};
+    std::unordered_map<u64, u8> unarmed;
     std::unordered_map<u64, Entry> entries;
     std::unordered_map<u64, u8> volatility;
     std::unordered_map<uintptr_t, u32> watched_pages;
