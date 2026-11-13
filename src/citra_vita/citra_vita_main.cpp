@@ -112,6 +112,8 @@ FILE* OpenPerfFile() {
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/hle/service/am/am.h"
+#include "core/hle/service/fs/archive.h"
 #include "core/memory.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/image_interface.h"
@@ -367,6 +369,69 @@ std::string FindRom() {
     }
 #endif
     return rom;
+}
+
+/// Installs the CIAs in ux0:data/mh4u/roms that are not installed yet (the game's update, DLC),
+/// with progress on screen: the Heavenfall mod's executable is built for the update, so it has to
+/// be there before the game boots. An installed title is recognised by its TMD and skipped.
+void InstallPendingCias(VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui) {
+    const std::string folder = VITA_DATA_DIR "/roms";
+    std::vector<std::string> cias;
+    const SceUID dir = sceIoDopen(folder.c_str());
+    if (dir < 0) {
+        return;
+    }
+    SceIoDirent entry{};
+    while (sceIoDread(dir, &entry) > 0) {
+        std::string lower = entry.d_name;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!SCE_S_ISDIR(entry.d_stat.st_mode) && lower.size() > 4 &&
+            lower.compare(lower.size() - 4, 4, ".cia") == 0) {
+            cias.push_back(folder + "/" + entry.d_name);
+        }
+    }
+    sceIoDclose(dir);
+    for (const std::string& path : cias) {
+        const auto infos = Service::AM::GetCIAInfos(path);
+        if (infos.Failed()) {
+            LOG_WARNING(Frontend, "{} is not an installable CIA", path);
+            continue;
+        }
+        const u64 tid = infos.Unwrap().first.tid;
+        if (FileUtil::Exists(
+                Service::AM::GetTitleMetadataPath(Service::FS::MediaType::SDMC, tid))) {
+            continue;
+        }
+        const std::string name = path.substr(path.find_last_of('/') + 1);
+        u64 last_shown = 0;
+        const auto show = [&](std::size_t done, std::size_t total) {
+            const u64 now = sceKernelGetProcessTimeWide();
+            if (now - last_shown < 250000 && done != total) {
+                return;
+            }
+            last_shown = now;
+            ui.SetStatusMessage(fmt::format("Installing {} ({}%)...", name,
+                                            total != 0 ? done * 100 / total : 0));
+            window.PollEvents();
+            ui.Update();
+            window.Present(&ui);
+        };
+        show(0, 1);
+        const auto status = Service::AM::InstallCIA(path, show);
+        LOG_INFO(Frontend, "installed {} ({:016X}): {}", name, tid, static_cast<u32>(status));
+        if (status != Service::AM::InstallStatus::Success) {
+            ui.SetStatusMessage(fmt::format("Could not install {} (error {}). It has to be a "
+                                            "decrypted CIA.",
+                                            name, static_cast<u32>(status)));
+            for (int i = 0; i < 180; i++) { // ~3 s on screen
+                window.PollEvents();
+                ui.Update();
+                window.Present(&ui);
+            }
+        }
+        ui.ClearStatusMessage();
+    }
 }
 
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
@@ -869,6 +934,7 @@ int EmulatorMain() {
         RunTitle(system, window, ui, launch);
     } else {
         sceIoMkdir(VITA_DATA_DIR "/roms", 0777);
+        InstallPendingCias(window, ui);
         const std::string rom = FindRom();
         if (rom.empty()) {
             ui.SetStatusMessage("Monster Hunter 4 Ultimate was not found.\n\nPut your own decrypted "
