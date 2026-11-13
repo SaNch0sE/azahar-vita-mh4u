@@ -27,11 +27,9 @@ Measurements and history are in `vita-mh4u-performance.md`.
 
 7. Done: **single-screen play** with the Heavenfall mod (`vita-mh4u-single-screen.md`); the
    port starts in the Single screen layout.
-8. **Then skip the bottom screen entirely** and measure what that saves. MH4U draws the
-   bottom screen through the main colour buffer at the start of each frame (viewport
-   ~240x320), copies it out with a display transfer, then draws the top screen; the copy
-   ends the scene, so the bottom screen costs its own draws, the transfer and one extra
-   load/store of the 256x512 target - roughly 1.5-2 ms of GPU a frame on the deck.
+8. Done: in the single-screen layout the bottom screen's draws (240x320 viewport) are not shipped
+   (`nobottomskip` keeps them): ~135 draws a frame on the deck; deck speed with the mod 82-86% ->
+   90-93% (27-28 fps).
 
 ## Open bugs
 

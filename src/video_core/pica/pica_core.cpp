@@ -22,6 +22,9 @@
 #include "core/memory.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/pica/pica_core.h"
+#ifdef ENABLE_GXM
+#include "video_core/renderer_gxm/gxm_flags.h"
+#endif
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/shader/shader.h"
@@ -1017,6 +1020,32 @@ void PicaCore::DrawImmediate() {
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
+
+    // Single screen: the bottom screen is never shown, so its draws (MH4U draws it through the
+    // main colour buffer with a 240x320 viewport at the start of each frame, then copies it out
+    // with a display transfer) are not shipped at all - no vertex copy or shipment on this
+    // thread, no setup on the render thread, no GPU time. Decided per draw from the live
+    // setting, so switching the layout back in the pause menu brings the screen back.
+    // `nobottomskip` (gxm_flags.txt) draws it anyway.
+    {
+#ifdef ENABLE_GXM
+        static const bool keep_bottom = GxmRenderer::GxmFlag("nobottomskip");
+#else
+        constexpr bool keep_bottom = true;
+#endif
+        if (!keep_bottom &&
+            Settings::values.layout_option.GetValue() == Settings::LayoutOption::SingleScreen &&
+            !Settings::values.swap_screen.GetValue()) {
+            const auto& rs = regs.internal.rasterizer;
+            const float w = f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2.0f;
+            const float h = f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2.0f;
+            if (w == 240.0f && h == 320.0f) {
+                Common::PipelineStats::bottom_draws_dropped.fetch_add(1,
+                                                                      std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
 
     // Track vertex in the debug recorder.
     if (debug_context) {

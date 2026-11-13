@@ -3,6 +3,8 @@
 The port starts in the **Single screen** layout (the top screen fills the display). It is meant to be
 played with the Heavenfall mod's single-screen mode (https://github.com/popzol/4u-heavenfall-mod-beta),
 which moves the touch screen's menus to the top screen. The pause menu's *Screen layout* switches back.
+In the Single screen layout the bottom screen's draws are not shipped at all (`nobottomskip` in
+`gxm_flags.txt` keeps them).
 
 ## Building the mod
 
@@ -24,7 +26,7 @@ python3 -m core --rom "<game>.3ds" --code "<update>.cia" --out <folder> \
   off in the game's START menu, Mod Settings page; its 3D and bloom cheats match the port's cheat file.
 - On Python 3.15 the `zstandard` wheel does not build; it is only needed for `.zcci`/`.zcia` input, so
   an empty `zstandard.py` on `PYTHONPATH` is enough for a `.3ds`/`.cia`.
-- The output folder has a game file decrypted by nobody but you; do not share it.
+- The output folder holds files made from your game; do not share it.
 
 ## Installing it
 

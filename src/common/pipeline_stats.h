@@ -150,6 +150,8 @@ inline std::atomic<void (*)()> scene_report{nullptr};
 inline std::atomic<u32> presents{0};
 /// Vblanks whose present was not queued because no new top-screen frame had arrived.
 inline std::atomic<u32> dup_presents{0};
+/// Draws dropped because they were for the hidden bottom screen (single-screen layout).
+inline std::atomic<u32> bottom_draws_dropped{0};
 /// VBlank snapshots taken of CPU-written framebuffers (GPU::DisplaySnapshot).
 inline std::atomic<u32> display_snapshots{0};
 
