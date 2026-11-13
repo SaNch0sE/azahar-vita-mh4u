@@ -254,6 +254,12 @@ private:
     /// anything else touches the context (BeginDraw, BeginScene, EndScene, GpuBlit, EndFrame).
     void FlushDeferredDraws();
     std::vector<VideoCore::VertexRingRange> deferred_ranges;
+    struct SceneTimeAgg {
+        u32 addr = 0, width = 0, height = 0, scenes = 0, draws = 0;
+        u64 us = 0;
+        u64 vertex_us = 0;
+    };
+    std::unordered_map<u64, SceneTimeAgg> scene_time_agg; ///< scenetime, per target
     u32 stat_deferred_merged{};
 
     VideoCore::RendererBase& renderer;

@@ -130,17 +130,22 @@ Since then:
      wrote, and the light colours and distance attenuation came from leftover register contents.
      Each quad now has its own load. Found by stopping the fragment programs after each TEV
      stage (`dbgstage<N>`), then the debug outputs, then the host emitter's allocated listing.
-4. **Shown fps (~20-22) - where a frame goes now** (2026-11-13). On the deck, per shown frame
-   (~49 ms): ~28 ms of render-thread work, ~15 ms waiting at the frame's end for the GPU to
-   finish the frame before, the rest idle. With every fragment program replaced by vertex
-   colour (`dbgout_vertex`) the wait and the fps do not change, so the GPU's frame time is not
-   fragment shading; per-scene tile load/store of the 256x512 target (~9 scenes a frame) or
-   vertex work are the candidates, and need a GPU timeline capture (the profiler's sampling
-   covers matched draw windows only). Character select: ~250 geometry-shader glyph draws a
-   frame are 56-59% of the render thread; entering it creates 4 framebuffers (~110 ms each,
-   one-off) and ~0.5 s of programs.
-   Glyph draws now: memo key ~19 us, triangle copy ~9 us, repeat path ~2 us (merged into
-   runs, `nodrawmerge`); the ~18% that change state between glyphs pay a full draw setup
-   (~150 us) and are most of what is left.
+4. **Shown fps (~20-22): the GPU's fragment programs** (2026-11-13). `scenetime` (with
+   `timedraw`) waits for each scene and logs GPU time per target, split into the vertex phase
+   (vertex notification) and the rest. On the ship's deck the main 256x512 target takes ~48 ms
+   of GPU per frame (4 scenes, ~125 draws): vertex ~4 ms, fragment ~44 ms. With every program
+   cut to vertex colour (`dbgminfs`) it is ~11 ms. Putting features back one at a time
+   (`minkeep_tex`, `_tev`, `_light`, `_proctex`, `_alpha`), per frame: textures +5, the real
+   combiner +4, lighting +11, the procedural texture +12, fog +2, alpha test +0.3.
+   (`dbgout_*` only replace the output; the whole program still runs, so they do not price
+   anything.) A shown 30 fps needs the frame under ~33 ms: ~15 ms of GPU to find.
+   - The procedural texture (18 configurations, no noise, stage 1 `AddSigned`): ~100
+     instructions and four texture fetches in a dependent chain, each waited for at once.
+     Baking it into a texture when its configuration or tables change would replace that
+     with one fetch.
+   - Lighting: see item 2.
+   Render thread: ~28 ms of work a frame on the deck; ~250 geometry-shader glyph draws a
+   frame on character select are 56-59% of it (memo key ~19 us, triangle copy ~9 us, repeat
+   path ~2 us merged into runs; the ~18% that change state pay a full setup, ~150 us).
 5. Low priority: persist tier-2 USSE programs to disk (creating them is already microseconds);
    the render thread's unaccounted ~24%.

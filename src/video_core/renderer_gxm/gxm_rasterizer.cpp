@@ -1167,11 +1167,49 @@ void RasterizerGxm::EndScene() {
     }
     // The fragment notification is what turns "is the GPU done with this surface" into a
     // load: it lands in the notification region once this scene's fragment processing ends.
+    // scenetime (diagnostic, with timedraw): every scene is waited for on its own, its GPU
+    // time and its vertex phase (the vertex notification) summed per target and logged with
+    // the draw report. Serialises the GPU, so the frame rate drops while it is on; what it
+    // gives is each target's true GPU cost per frame.
+    static const bool scene_time = GxmFlag("scenetime");
+    static SceGxmNotification vertex_done{};
+    if (scene_time && vertex_done.address == nullptr) {
+        vertex_done.address = Device().alloc_notification();
+    }
+    if (scene_time) {
+        sceGxmFinish(Device().context);
+        if (vertex_done.address != nullptr) {
+            vertex_done.value++;
+            *vertex_done.address = 0;
+        }
+    }
+    const u64 st_t0 = scene_time ? Common::PipelineStats::NowUs() : 0;
     {
         const PhaseTimer timer{time_draws, times.scene_end};
         GXM_PHASE("gpu:end-scene");
-        sceGxmEndScene(Device().context, nullptr,
+        sceGxmEndScene(Device().context,
+                       scene_time && vertex_done.address != nullptr ? &vertex_done : nullptr,
                        scene_notification.address != nullptr ? &scene_notification : nullptr);
+    }
+    if (scene_time) {
+        u64 vertex_us = 0;
+        if (vertex_done.address != nullptr) {
+            while (*vertex_done.address != vertex_done.value &&
+                   Common::PipelineStats::NowUs() - st_t0 < 200000) {
+            }
+            vertex_us = Common::PipelineStats::NowUs() - st_t0;
+        }
+        sceGxmFinish(Device().context);
+        const u64 us = Common::PipelineStats::NowUs() - st_t0;
+        const auto& rec = scene_open;
+        auto& agg = scene_time_agg[(u64{rec.addr} << 24) ^ (u64{rec.width} << 12) ^ rec.height];
+        agg.addr = rec.addr;
+        agg.width = rec.width;
+        agg.height = rec.height;
+        agg.scenes++;
+        agg.draws += rec.draws;
+        agg.us += us;
+        agg.vertex_us += vertex_us;
     }
     // The scene is now the GPU's, so its notification will arrive and a wait for it can end.
     runtime.SceneSubmitted();
@@ -3472,6 +3510,23 @@ void RasterizerGxm::EndFrame() {
                 stat_alpha_only_feedback = 0;
                 stat_repeat_draws = 0;
                 stat_begin_repeats = 0;
+                if (!scene_time_agg.empty()) {
+                    std::vector<SceneTimeAgg> v;
+                    u64 total = 0;
+                    for (const auto& [k, a] : scene_time_agg) {
+                        v.push_back(a);
+                        total += a.us;
+                    }
+                    std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.us > y.us; });
+                    std::string line;
+                    for (std::size_t i = 0; i < std::min<std::size_t>(v.size(), 10); i++) {
+                        line += fmt::format(" | {:08X} {}x{}: {} scenes {} draws {} us (vertex {} us)",
+                                            v[i].addr, v[i].width, v[i].height, v[i].scenes,
+                                            v[i].draws, v[i].us, v[i].vertex_us);
+                    }
+                    LOG_INFO(Render, "scene GPU time {} us:{}", total, line);
+                    scene_time_agg.clear();
+                }
                 LOG_INFO(Render,
                          "software vertex shading: {} draws, {} us ({}%% of the window), {} never "
                          "offered to the hardware path (why:{}); declined:{}",

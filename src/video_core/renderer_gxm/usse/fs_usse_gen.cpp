@@ -73,6 +73,39 @@ Source AlphaSource(const TevStageConfig& stage, Source source, u32 index) {
     return (index == 0 && source == Source::Previous) ? stage.alpha_source3.Value() : source;
 }
 
+/// How many of its three arguments an operation reads.
+u32 ArgumentCount(Operation op) {
+    switch (op) {
+    case Operation::Replace:
+        return 1;
+    case Operation::Lerp:
+    case Operation::MultiplyThenAdd:
+    case Operation::AddThenMultiply:
+        return 3;
+    default:
+        return 2;
+    }
+}
+
+/// The six sources of a stage as the analysis sees them, with an argument the operation does
+/// not read replaced by the vertex colour (which every program has anyway). A third source
+/// set but unused by a two-argument operation used to count as read: Monster Hunter 4
+/// Ultimate's lit world programs name the procedural texture there, and every pixel computed
+/// it for nothing - ~12 ms of GPU time a frame on the ship's deck.
+std::array<Source, 6> ReadSources(const TevStageConfig& stage, u32 index) {
+    const u32 nc = ArgumentCount(stage.color_op);
+    const u32 na = ArgumentCount(stage.alpha_op);
+    const auto pick = [](u32 n, u32 arg, Source s) { return arg < n ? s : Source::PrimaryColor; };
+    return {
+        pick(nc, 0, ColorSource(stage, stage.color_source1, index)),
+        pick(nc, 1, ColorSource(stage, stage.color_source2, index)),
+        pick(nc, 2, ColorSource(stage, stage.color_source3, index)),
+        pick(na, 0, AlphaSource(stage, stage.alpha_source1, index)),
+        pick(na, 1, AlphaSource(stage, stage.alpha_source2, index)),
+        pick(na, 2, AlphaSource(stage, stage.alpha_source3, index)),
+    };
+}
+
 /**
  * The register plan: everything long-lived in the unified store,
  * the three internal registers only inside one pass, with nosched set for as long as one
@@ -427,11 +460,7 @@ void FragmentEmitter::PlanInputs() {
         if (IsPassThroughTevStage(stage)) {
             continue;
         }
-        const Source sources[] = {
-            ColorSource(stage, stage.color_source1, i), ColorSource(stage, stage.color_source2, i),
-            ColorSource(stage, stage.color_source3, i), AlphaSource(stage, stage.alpha_source1, i),
-            AlphaSource(stage, stage.alpha_source2, i), AlphaSource(stage, stage.alpha_source3, i),
-        };
+        const std::array<Source, 6> sources = ReadSources(stage, i);
         for (const Source s : sources) {
             if (s == Source::Texture0 && tex.texture0_type != TextureType::Disabled) {
                 unit_used[0] = true;
@@ -595,11 +624,7 @@ void FragmentEmitter::PlanUniforms() {
         if (IsPassThroughTevStage(stage)) {
             continue;
         }
-        const Source sources[] = {
-            ColorSource(stage, stage.color_source1, i), ColorSource(stage, stage.color_source2, i),
-            ColorSource(stage, stage.color_source3, i), AlphaSource(stage, stage.alpha_source1, i),
-            AlphaSource(stage, stage.alpha_source2, i), AlphaSource(stage, stage.alpha_source3, i),
-        };
+        const std::array<Source, 6> sources = ReadSources(stage, i);
         for (const Source s : sources) {
             if (s == Source::Constant) {
                 const_stages = i + 1;
@@ -2369,6 +2394,63 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
 } // Anonymous namespace
 
 std::vector<uint8_t> EmitFragmentProgram(const FSConfig& config, std::string* refusal, int level) {
+    // dbgminfs (diagnostic, with scenetime): every configuration cut to vertex colour - no
+    // lighting, textures, fog, alpha test, procedural texture or combiner - and minkeep_light,
+    // _tex, _tev, _alpha, _proctex put one feature back, to price each in GPU time. On the
+    // ship's deck (2026-11-13), per frame: 11 ms bare, textures +5, the real combiner +4,
+    // lighting +11, the procedural texture +12, fog +2: ~48 ms in all.
+    static const bool min_fs = GxmFlag("dbgminfs");
+    if (min_fs) {
+        alignas(16) static unsigned char raw[sizeof(FSConfig)];
+        std::memcpy(raw, &config, sizeof(FSConfig));
+        auto& c = *reinterpret_cast<FSConfig*>(raw);
+        static const bool keep_alpha = GxmFlag("minkeep_alpha");
+        static const bool keep_tex = GxmFlag("minkeep_tex");
+        static const bool keep_tev = GxmFlag("minkeep_tev");
+        static const bool keep_light = GxmFlag("minkeep_light");
+        static const bool keep_proctex = GxmFlag("minkeep_proctex");
+        if (!keep_light) {
+            c.lighting.enable.Assign(0);
+        }
+        if (!keep_tex && !keep_tev) {
+            c.texture.texture0_type.Assign(Pica::TexturingRegs::TextureConfig::Disabled);
+        }
+        c.texture.fog_mode.Assign(Pica::TexturingRegs::FogMode::None);
+        if (!keep_proctex) {
+            c.proctex.enable.Assign(0);
+        }
+        if (!keep_alpha) {
+            c.framebuffer.alpha_test_func.Assign(Pica::FramebufferRegs::CompareFunc::Always);
+        }
+        if (!keep_tev) {
+            c.texture.combiner_buffer_input.Assign(0);
+        }
+        for (u32 i = 0; keep_tex && !keep_tev && i < c.texture.tev_stages.size(); i++) {
+            // Textures sampled and combined trivially: stage i multiplies in texture i.
+            const u32 t = i < 3 ? 3u + i : 0xfu;
+            c.texture.tev_stages[i].sources_raw = i == 0 ? (0x3u | (0x3u << 16))
+                                                         : (0xfu | (t << 4) | (0xfu << 16) | (t << 20));
+            c.texture.tev_stages[i].modifiers_raw = 0;
+            c.texture.tev_stages[i].ops_raw = i == 0 || i >= 3 ? 0u : 0x00010001u;
+            c.texture.tev_stages[i].scales_raw = 0;
+        }
+        for (u32 i = 0; !keep_tex && !keep_tev && i < c.texture.tev_stages.size(); i++) {
+            // Replace with PrimaryColor (0x0), passthrough (Previous 0xf) after stage 0.
+            const u32 src = i == 0 ? 0x00000000u : 0x000f000fu;
+            c.texture.tev_stages[i].sources_raw = src;
+            c.texture.tev_stages[i].modifiers_raw = 0;
+            c.texture.tev_stages[i].ops_raw = 0;
+            c.texture.tev_stages[i].scales_raw = 0;
+        }
+        static thread_local bool inside = false;
+        if (!inside) {
+            inside = true;
+            auto r = EmitFragmentProgram(c, refusal, level);
+            inside = false;
+            return r;
+        }
+    }
+
     try {
         FragmentEmitter emitter{config, level};
         return emitter.Emit(refusal);
