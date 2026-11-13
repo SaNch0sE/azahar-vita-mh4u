@@ -14,6 +14,10 @@ the v1.3 update, at the ship's deck right after the save loads, no frame-cap che
 | Kernel plugin v2: GetThreadId/GetSystemTick on core | 51-57% | ~20 |
 | Glyph memo, texture re-upload hash | 55-57% | ~20 |
 | TEV rounding at the last stage only | 45-65% | 21-22 |
+| Procedural texture baked into a strip (GPU 48.8 -> 38.6 ms) | 55-60% | 25-26 |
+| Fog strip, light pre-normalise, shadow fold, Fresnel skip (-> 36.9 ms) | 55-60% | 26-27 |
+| No post fx / shadow-target clear, colour-only scene merge (-> 35.5 ms) | 60% | 28-29 |
+| Reflection LUTs as 1 (-> 32.9 ms of GPU a frame) | 60-63% | **30-31** |
 | Glyph memo on kept fingerprints, hardware draws keep fragment setup | 64-68% | 21-22 |
 
 The guest now runs at ~39 fps; what is shown is held at ~21 by the render thread (~90% busy, of
