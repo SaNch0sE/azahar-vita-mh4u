@@ -213,9 +213,11 @@ void SetupPaths() {
     // Must happen before anything asks for a path: the first request bootstraps the whole table
     // from whatever the platform default is, and on this console there is no such thing.
     FileUtil::SetUserPath(UserDirectory);
-    // The game's own data - the update, saves and extdata (sdmc), the system files (nand,
-    // sysdata) - is used from Azahar's folder in place unless the port has its own copy. The
-    // port's files (flags, logs, cheats, mods) always live in ux0:data/mh4u.
+#ifdef VITA_DIAGNOSTICS
+    // Diagnostic builds only: the game's own data - the update, saves and extdata (sdmc), the
+    // system files (nand, sysdata) - is used from Azahar's folder in place unless the port has
+    // its own copy, so testing needs no copy. A release uses ux0:data/mh4u alone; the port's
+    // files (flags, logs, cheats, mods) always live there.
     const std::pair<FileUtil::UserPath, const char*> shared[] = {
         {FileUtil::UserPath::SDMCDir, "sdmc"},
         {FileUtil::UserPath::NANDDir, "nand"},
@@ -228,6 +230,7 @@ void SetupPaths() {
             FileUtil::UpdateUserPath(path, azahar);
         }
     }
+#endif
 }
 
 /// Names the exception behind an abort. std::terminate goes to newlib's abort(), which raises
@@ -328,8 +331,8 @@ void ShutdownSystem(Core::System& system) {
 
 // ---- The port's own data folder (ux0:data/mh4u) and how it is first filled -------------------
 
-/// The game image: the first .3ds/.cci/.cxi/.app in ux0:data/mh4u/roms, else one in Azahar's
-/// roms folder whose name says Monster Hunter 4.
+/// The game image: the first .3ds/.cci/.cxi/.app in ux0:data/mh4u/roms; diagnostic builds also
+/// take one in Azahar's roms folder whose name says Monster Hunter 4.
 std::string FindRom() {
     const auto search = [](const char* folder, bool only_mh4u) {
         std::string found;
@@ -358,9 +361,11 @@ std::string FindRom() {
         return found;
     };
     std::string rom = search(VITA_DATA_DIR "/roms", false);
+#ifdef VITA_DIAGNOSTICS
     if (rom.empty()) {
         rom = search(VITA_AZAHAR_DIR "/roms", true);
     }
+#endif
     return rom;
 }
 
@@ -863,8 +868,8 @@ int EmulatorMain() {
         const std::string rom = FindRom();
         if (rom.empty()) {
             ui.SetStatusMessage("Monster Hunter 4 Ultimate was not found.\n\nPut your own decrypted "
-                                "game (.3ds, .cci or .cxi) in " VITA_DATA_DIR "/roms/ or "
-                                VITA_AZAHAR_DIR "/roms/ and start again.\n\nPress START to exit.");
+                                "game (.3ds, .cci or .cxi) in " VITA_DATA_DIR "/roms/ and start "
+                                "again.\n\nPress START to exit.");
             while (!window.IsQuitRequested()) {
                 window.PollEvents();
                 ui.Update();
