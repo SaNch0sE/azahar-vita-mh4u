@@ -1997,12 +1997,47 @@ void VertexEmitter::Epilogue() {
     e.Vec(VecOp::Min, {Reg::O(OutColor), 0x3}, {I1, XYZW, Mod::Abs}, ConstOne);
     e.Vec(VecOp::Min, {Reg::O(OutColor + 2), 0x3}, {I1, ZWZW, Mod::Abs}, ConstOne);
 
-    // The quaternion, twice (TEXCOORD5 is its flat copy).
+    // The quaternion in TEXCOORD4. TEXCOORD5 was its copy (interpolated the same way, so the
+    // fragment programs' sign test against it never fired); it now carries the unit normal
+    // the quaternion rotates (0, 0, 1) to, and N.V with the view normalised, per vertex. The
+    // lit fragment programs without a bump map read those instead of rotating and
+    // normalising per pixel (MH4U's world has ~2 pixels per vertex). Only for programs that
+    // write a quaternion; `nopvnormal` keeps the copy (and the fragment side off).
     GatherFour(I2, SemQuaternionX);
     e.MoveInternal({Reg::O(OutNormquat), 0x3}, {I2, XYZW});
     e.MoveInternal({Reg::O(OutNormquat + 2), 0x3}, {I2, ZWZW});
-    e.MoveInternal({Reg::O(OutNormquatFlat), 0x3}, {I2, XYZW});
-    e.MoveInternal({Reg::O(OutNormquatFlat + 2), 0x3}, {I2, ZWZW});
+    static const bool no_pv_normal = GxmFlag("nopvnormal");
+    if (no_pv_normal || !SemanticSrc(SemQuaternionX)) {
+        e.MoveInternal({Reg::O(OutNormquatFlat), 0x3}, {I2, XYZW});
+        e.MoveInternal({Reg::O(OutNormquatFlat + 2), 0x3}, {I2, ZWZW});
+    } else {
+        constexpr Swizzle XYZZ{Ch::X, Ch::Y, Ch::Z, Ch::Z};
+        constexpr Swizzle XYXY{Ch::X, Ch::Y, Ch::X, Ch::Y};
+        constexpr Swizzle YXYX{Ch::Y, Ch::X, Ch::Y, Ch::X};
+        // q = normalize(q)
+        e.Dot({I0, 0x1}, {I2, XYZW}, {I2, XYZW}, true);
+        e.Comp(CompOp::Rsq, {I0, 0x1}, {I0}, 0);
+        e.Vec(VecOp::Mul, {I2, 0xf}, {I2, XYZW}, {I0, XXXX});
+        // rotate(q, (0, 0, 1)) = (2(xz + yw), 2(yz - xw), 1 - 2(x^2 + y^2)):
+        // i1 = 2 * (x^2, y^2, xz, yz), i0 = 2 * (yw, xw)
+        e.Vec(VecOp::Mul, {I1, 0xf}, {I2, XYZZ}, {I2, XYXY});
+        e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW}, {I1, XYZW});
+        e.Vec(VecOp::Mul, {I0, 0xf}, {I2, YXYX}, {I2, WWWW});
+        e.Vec(VecOp::Add, {I0, 0x3}, {I0, XYZW}, {I0, XYZW});
+        e.Vec(VecOp::Add, {I0, 0x1}, {I1, ZZZZ}, {I0, XXXX});            // n.x
+        e.Vec(VecOp::Add, {I0, 0x2}, {I0, YYYY, Mod::Neg}, {I1, WWWW}); // n.y
+        e.Vec(VecOp::Add, {I0, 0x4}, {I1, XXXX}, {I1, YYYY});
+        e.Vec(VecOp::Add, {I0, 0x4}, {I0, ZZZZ, Mod::Neg}, ConstOne);   // n.z
+        // n.w = dot(n, normalize(view))
+        GatherFour(I1, SemViewX);
+        e.Dot({I2, 0x1}, {I1, XYZW}, {I1, XYZW}, false);
+        e.Comp(CompOp::Rsq, {I2, 0x1}, {I2}, 0);
+        e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {I2, XXXX});
+        e.Dot({I2, 0x1}, {I0, XYZW}, {I1, XYZW}, false);
+        e.MoveInternal({I0, 0x8}, {I2, XXXX});
+        e.MoveInternal({Reg::O(OutNormquatFlat), 0x3}, {I0, XYZW});
+        e.MoveInternal({Reg::O(OutNormquatFlat + 2), 0x3}, {I0, ZWZW});
+    }
 
     OutputPair(OutTexcoord0, SemTexcoord0U, SemTexcoord0V);
     OutputPair(OutTexcoord1, SemTexcoord1U, SemTexcoord1V);

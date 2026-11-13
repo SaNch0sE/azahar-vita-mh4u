@@ -1225,10 +1225,14 @@ void FragmentEmitter::Fog() {
         e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, ConstHalf, Pred::None, true);
         e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, Lit(LitInv256), Pred::None, true);
         e.Vec(VecOp::Add, {I0, 0x2}, ConstHalf, ConstZero, Pred::None, true);
+        // dbgconstfog: the coordinate as the factor, no fetch (diagnostic: prices the fetch).
+        static const bool const_fog = GxmFlag("dbgconstfog");
+        if (!const_fog) {
         e.MoveInternal({Reg::V(TmpLutCoord), 0x3}, {I0, XYZW}, Pred::None, true);
         e.Sample2D(Reg::V(TmpLutEntry), Reg::V(TmpLutCoord), SamplerSa(sampler_fog), nullptr, 0);
         e.Wdf(0);
         e.MoveInternal({I0, 0x1}, {Reg::V(TmpLutEntry), XXXX}, Pred::None, true);
+        }
     } else if (config.texture.fog_flip) {
         e.Vec(VecOp::Add, {I0, 0x1}, {pos, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
         e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, Lit(Lit128), Pred::None, true);
@@ -1413,11 +1417,12 @@ void FragmentEmitter::LightingLutLookup(Sampler sampler, bool abs_input, bool tw
 void FragmentEmitter::Lighting() {
     const auto& lighting = config.lighting;
     const Vec4Loc normquat{Bank::PrimAttr, normquat_pa};
-    const Vec4Loc normquat_flat{Bank::PrimAttr, static_cast<uint8_t>(normquat_pa + 4)};
+    // TEXCOORD5: the per-vertex unit normal (xyz) and N.V (w), from the vertex program.
+    const Vec4Loc pv_normal{Bank::PrimAttr, static_cast<uint8_t>(normquat_pa + 4)};
     const Vec4Loc view{Bank::PrimAttr, view_pa};
     const Vec4Loc diffuse_sum{Bank::Virtual, TmpDiffuse};
     const Vec4Loc specular_sum{Bank::Virtual, TmpSpecular};
-    const Vec4Loc normal{Bank::Virtual, TmpNormal};
+    Vec4Loc normal{Bank::Virtual, TmpNormal};
     const Vec4Loc tangent{Bank::Virtual, TmpTangent};
     const Vec4Loc nview{Bank::Virtual, TmpView};
     const Vec4Loc light_vector{Bank::Virtual, TmpLight};
@@ -1498,6 +1503,11 @@ void FragmentEmitter::Lighting() {
     const bool default_normal_only = lighting.bump_mode != LightingRegs::LightingBumpMode::NormalMap &&
                                      lighting.bump_mode != LightingRegs::LightingBumpMode::TangentMap &&
                                      !config7;
+    // Without a bump map or tangent the vertex program's normal is used as it is
+    // interpolated (not renormalised: ~2 pixels per vertex), and N.V comes with it.
+    // `nopvnormal` rotates the quaternion per pixel again.
+    static const bool pv_off = GxmFlag("nopvnormal");
+    const bool per_vertex = default_normal_only && !pv_off;
     if (!default_normal_only) {
         StoreVec4(normal, I0);
     }
@@ -1505,15 +1515,14 @@ void FragmentEmitter::Lighting() {
         StoreVec4(tangent, I1);
     }
 
-    // quat = normalize(dot(normquat, normquat_flat) < 0 ? -normquat : normquat)
-    LoadVec4(I0, normquat);
-    LoadVec4(I1, normquat_flat);
-    e.Dot({I2, 0x1}, {I0, XYZW}, {I1, XYZW}, true, Pred::None, true);
-    e.Test(Cond::Lt, 0, {I2}, 0, ConstZero, false);
-    e.Vec(VecOp::Mul, {I0, 0xf}, {I0, XYZW, Mod::Neg}, ConstOne, Pred::P0, true);
-    e.Dot({I2, 0x1}, {I0, XYZW}, {I0, XYZW}, true, Pred::None, true);
-    e.Comp(CompOp::Rsq, {I2, 0x1}, {I2}, 0, Pred::None, true);
-    e.Vec(VecOp::Mul, {I0, 0xf}, {I0, XYZW}, {I2, XXXX}, Pred::None, true);
+    // quat = normalize(normquat). (A sign test against TEXCOORD5 was here: q and -q
+    // rotate alike, so it never changed anything.)
+    if (!per_vertex) {
+        LoadVec4(I0, normquat);
+        e.Dot({I2, 0x1}, {I0, XYZW}, {I0, XYZW}, true, Pred::None, true);
+        e.Comp(CompOp::Rsq, {I2, 0x1}, {I2}, 0, Pred::None, true);
+        e.Vec(VecOp::Mul, {I0, 0xf}, {I0, XYZW}, {I2, XXXX}, Pred::None, true);
+    }
     // rotate(q, v) = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v), for the normal and
     // the tangent; i0 = q throughout.
     const auto rotate = [&](Vec4Loc v) {
@@ -1537,7 +1546,9 @@ void FragmentEmitter::Lighting() {
         e.Vec(VecOp::Add, {I1, 0x7}, {I1, XYZW}, {I2, XYZW}, Pred::None, true);
         StoreVec4(v, I1);
     };
-    if (default_normal_only) {
+    if (per_vertex) {
+        normal = pv_normal;
+    } else if (default_normal_only) {
         // rotate(q, (0, 0, 1)) = (2(xz + yw), 2(yz - xw), 1 - 2(x^2 + y^2)), with i0 = q:
         // P = (x^2, y^2, xz, yz) doubled, Q = (yw, xw, yw, xw), then n.xy = (2, -2) * Q.zw
         // + 2P.zw and n.z = 1 - (2P.x + 2P.y). Six instructions for the general rotation's
@@ -1562,6 +1573,9 @@ void FragmentEmitter::Lighting() {
     // What the enabled LUTs read decides whether the view and half vectors are needed at
     // all: a light with the distribution LUT on the (light, normal) angle alone needs
     // neither.
+    // Monster Hunter 4 Ultimate, by default: the reflection LUTs (its lit world uses the
+    // red one on |N.H|) are taken as 1 (see the specular below); `refllut` restores them.
+    static const bool const_refl = !GxmFlag("refllut");
     bool needs_half = false;
     bool needs_view = false;
     for (u32 li = 0; li < lighting.src_num; li++) {
@@ -1583,7 +1597,7 @@ void FragmentEmitter::Lighting() {
                 }
                 break;
             case LutInput::NV:
-                needs_view = true;
+                needs_view = needs_view || !per_vertex;
                 break;
             default:
                 break;
@@ -1592,9 +1606,11 @@ void FragmentEmitter::Lighting() {
         if (uses_secondary_color) {
             input_of(lighting.lut_d0, Sampler::Distribution0);
             input_of(lighting.lut_d1, Sampler::Distribution1);
-            input_of(lighting.lut_rr, Sampler::ReflectRed);
-            input_of(lighting.lut_rg, Sampler::ReflectGreen);
-            input_of(lighting.lut_rb, Sampler::ReflectBlue);
+            if (!const_refl) {
+                input_of(lighting.lut_rr, Sampler::ReflectRed);
+                input_of(lighting.lut_rg, Sampler::ReflectGreen);
+                input_of(lighting.lut_rb, Sampler::ReflectBlue);
+            }
         }
         if (li + 1 == lighting.src_num &&
             ((uses_primary_color && lighting.enable_primary_alpha && primary_alpha_read) ||
@@ -1622,6 +1638,10 @@ void FragmentEmitter::Lighting() {
             e.Dot({I0, 0x1}, {nview.Pair(0), XYZW}, {I1, XYZW}, false, Pred::None, true);
             break;
         case LutInput::NV:
+            if (per_vertex) {
+                e.MoveInternal({I0, 0x1}, {pv_normal.Pair(1), YYYY}, Pred::None, true);
+                break;
+            }
             LoadVec4(I1, nview);
             e.Dot({I0, 0x1}, {normal.Pair(0), XYZW}, {I1, XYZW}, false, Pred::None, true);
             break;
@@ -1787,7 +1807,6 @@ void FragmentEmitter::Lighting() {
         // without the LUT's shaping. ~2.6 ms of GPU a frame on the ship's deck, what takes
         // the deck under the 33 ms a shown 30 fps needs; highlights on close-ups come out a
         // little brighter. `refllut` restores the lookup.
-        static const bool const_refl = !GxmFlag("refllut");
         const bool rr = !const_refl && LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
         const bool rg = !const_refl && LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
         const bool rb = !const_refl && LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
@@ -1901,7 +1920,13 @@ void FragmentEmitter::Lighting() {
             uses_secondary_color && lighting.enable_secondary_alpha && secondary_alpha_read;
         if (light_index + 1 == lighting.src_num && (fresnel_primary || fresnel_secondary) &&
             LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel)) {
-            lut_value(lighting.lut_fr, Sampler::Fresnel, two_sided);
+            // dbgconstfr: the Fresnel value as 1, no lookup (diagnostic: prices the fetch).
+            static const bool const_fr = GxmFlag("dbgconstfr");
+            if (const_fr) {
+                e.MoveInternal({I0, 0x1}, {Reg::C(2), XXXX}, Pred::None, true);
+            } else {
+                lut_value(lighting.lut_fr, Sampler::Fresnel, two_sided);
+            }
             if (fresnel_primary) {
                 e.MoveInternal({diffuse_sum.Pair(1), 0x2}, {I0, XXXX}, Pred::None, true);
             }
@@ -2505,6 +2530,12 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     encoder.PatchKills(LiteralSaOffset(uniform_floats + data_head, LitKillControl));
     encoder.FinishNosched();
     gxp.temp_count = lowered.temp_count;
+    // tempinflate: declare 24 more temporaries than the program uses, to see whether the
+    // register file's occupancy limits fragment throughput (diagnostic only).
+    static const bool temp_inflate = GxmFlag("tempinflate");
+    if (temp_inflate) {
+        gxp.temp_count += 24;
+    }
     gxp.pa_count = std::max<uint32_t>(gxp.pa_count, lowered.pa_count);
     gxp.phase_starts = lowered.phase_starts;
     gxp.primary = encoder.Words();
@@ -2533,7 +2564,17 @@ std::vector<uint8_t> EmitFragmentProgram(const FSConfig& config, std::string* re
     // ship's deck (2026-11-13), per frame: 11 ms bare, textures +5, the real combiner +4,
     // lighting +11, the procedural texture +12, fog +2: ~48 ms in all.
     static const bool min_fs = GxmFlag("dbgminfs");
-    if (min_fs) {
+    // dbgminsel_<class>: dbgminfs only for one class of program (lit, unlit, pt = with a
+    // procedural texture, nopt = without), to find where the fragment time is.
+    static const bool sel_lit = GxmFlag("dbgminsel_lit");
+    static const bool sel_unlit = GxmFlag("dbgminsel_unlit");
+    static const bool sel_pt = GxmFlag("dbgminsel_pt");
+    static const bool sel_nopt = GxmFlag("dbgminsel_nopt");
+    const bool lit = config.lighting.enable;
+    const bool pt = config.proctex.enable;
+    const bool selected = (!sel_lit || lit) && (!sel_unlit || !lit) && (!sel_pt || pt) &&
+                          (!sel_nopt || !pt);
+    if (min_fs && selected) {
         alignas(16) static unsigned char raw[sizeof(FSConfig)];
         std::memcpy(raw, &config, sizeof(FSConfig));
         auto& c = *reinterpret_cast<FSConfig*>(raw);
