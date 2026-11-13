@@ -50,5 +50,7 @@ void SetDebugSelected(bool selected);
                                         Pica::TexturingRegs::ProcTexFilter filter);
 constexpr uint32_t ProcTexStripUnit = 6;
 constexpr uint32_t ProcTexStripTexels = 256;
+/// Fog's baked strip: the fog LUT interpolated as the PICA does, 256 texels over depth.
+constexpr uint32_t FogStripUnit = 7;
 
 } // namespace GxmRenderer::Usse

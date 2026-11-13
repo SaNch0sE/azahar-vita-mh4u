@@ -162,6 +162,9 @@ public:
             UniformSlot diffuse{};
             UniformSlot ambient{};
             UniformSlot position{};
+            /// A directional light's direction, normalised on the CPU (the emitter declares
+            /// it for directional lights without distance attenuation).
+            UniformSlot position_n{};
             UniformSlot spot_direction{};
             UniformSlot dist_atten_bias{};
             UniformSlot dist_atten_scale{};
@@ -269,6 +272,10 @@ private:
     u64 proctex_tables_version = 0;
     u32 stat_strip_bakes = 0;
     void SyncProcTexStrip();
+    void SyncFogStrip();
+    int AcquireStrip(u64 key, bool& fresh);
+    int fog_strip_bound = -1;
+    u64 fog_tables_version = 0;
     struct SceneTimeAgg {
         u32 addr = 0, width = 0, height = 0, scenes = 0, draws = 0;
         u64 us = 0;

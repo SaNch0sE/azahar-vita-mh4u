@@ -1055,6 +1055,7 @@ void RasterizerGxm::SyncAndUploadLUTs() {
         fs_data_dirty = true;
     }
     if (pica.fog.lut_dirty) {
+        fog_tables_version++;
         for (u32 i = 0; i < pica.fog.lut.size(); i++) {
             scratch2[i] = {pica.fog.lut[i].ToFloat(), pica.fog.lut[i].DiffToFloat()};
         }
@@ -1687,6 +1688,7 @@ const RasterizerGxm::FsUniforms& RasterizerGxm::UniformsOf(Shader* fs) {
             light.diffuse = lp("diffuse");
             light.ambient = lp("ambient");
             light.position = lp("position");
+            light.position_n = lp("position_n");
             light.spot_direction = lp("spot_direction");
             light.dist_atten_bias = lp("dist_atten_bias");
             light.dist_atten_scale = lp("dist_atten_scale");
@@ -1927,6 +1929,13 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
         set(p.diffuse, l.diffuse.AsArray(), 3);
         set(p.ambient, l.ambient.AsArray(), 3);
         set(p.position, l.position.AsArray(), 3);
+        if (p.position_n) {
+            const auto& v = l.position;
+            const float len2 = v.x * v.x + v.y * v.y + v.z * v.z;
+            const float inv = len2 > 0.0f ? 1.0f / std::sqrt(len2) : 0.0f;
+            const float n[3] = {v.x * inv, v.y * inv, v.z * inv};
+            set(p.position_n, n, 3);
+        }
         set(p.spot_direction, l.spot_direction.AsArray(), 3);
         set(p.dist_atten_bias, &l.dist_atten_bias, 1);
         set(p.dist_atten_scale, &l.dist_atten_scale, 1);
@@ -2034,31 +2043,13 @@ void RasterizerGxm::SyncProcTexStrip() {
         proctex_tables_version,
         u64{width} | (u64{offset} << 8) | (u64{nearest} << 16) |
             (u64{static_cast<u32>(t.proctex.color_combiner.Value())} << 20));
-    for (u32 i = 0; i < ProcStripCount; i++) {
-        if (proc_strips[i].key == key && proc_strips[i].mem != nullptr) {
-            proc_strip_bound = static_cast<int>(i);
-            return;
-        }
+    bool fresh = false;
+    const int slot = AcquireStrip(key, fresh);
+    if (slot < 0 || !fresh) {
+        proc_strip_bound = slot;
+        return;
     }
-    const u32 slot = proc_strip_next;
-    proc_strip_next = (proc_strip_next + 1) % ProcStripCount;
     ProcStrip& strip = proc_strips[slot];
-    if (strip.mem == nullptr) {
-        strip.mem = Device().alloc_mapped(Usse::ProcTexStripTexels * 4);
-        if (strip.mem == nullptr) {
-            return;
-        }
-        sceGxmTextureInitLinear(&strip.texture, strip.mem, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR,
-                                Usse::ProcTexStripTexels, 1, 0);
-        sceGxmTextureSetUAddrMode(&strip.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
-        sceGxmTextureSetVAddrMode(&strip.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
-    } else if (strip.serial != 0 && runtime.CompletedEpoch() < strip.serial) {
-        // A scene still to finish samples it.
-        if (in_scene) {
-            EndScene();
-        }
-        runtime.WaitForEpoch(strip.serial);
-    }
     const auto& pt = pica.proctex;
     const auto map = [&](float c) {
         c *= 128.0f;
@@ -2090,10 +2081,71 @@ void RasterizerGxm::SyncProcTexStrip() {
         nearest ? SCE_GXM_TEXTURE_FILTER_POINT : SCE_GXM_TEXTURE_FILTER_LINEAR;
     sceGxmTextureSetMinFilter(&strip.texture, f);
     sceGxmTextureSetMagFilter(&strip.texture, f);
+    stat_strip_bakes++;
+    proc_strip_bound = slot;
+}
+
+int RasterizerGxm::AcquireStrip(u64 key, bool& fresh) {
+    // The slot already holding this key, or the next in turn (once the GPU has passed the
+    // last scene that sampled it), allocated on first use; `fresh` says it must be filled.
+    fresh = false;
+    for (u32 i = 0; i < ProcStripCount; i++) {
+        if (proc_strips[i].key == key && proc_strips[i].mem != nullptr) {
+            return static_cast<int>(i);
+        }
+    }
+    const u32 slot = proc_strip_next;
+    proc_strip_next = (proc_strip_next + 1) % ProcStripCount;
+    ProcStrip& strip = proc_strips[slot];
+    if (strip.mem == nullptr) {
+        strip.mem = Device().alloc_mapped(Usse::ProcTexStripTexels * 4);
+        if (strip.mem == nullptr) {
+            return -1;
+        }
+        sceGxmTextureInitLinear(&strip.texture, strip.mem, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR,
+                                Usse::ProcTexStripTexels, 1, 0);
+        sceGxmTextureSetUAddrMode(&strip.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+        sceGxmTextureSetVAddrMode(&strip.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    } else if (strip.serial != 0 && runtime.CompletedEpoch() < strip.serial) {
+        // A scene still to finish samples it.
+        if (in_scene) {
+            EndScene();
+        }
+        runtime.WaitForEpoch(strip.serial);
+    }
     strip.key = key;
     strip.serial = 0;
-    stat_strip_bakes++;
-    proc_strip_bound = static_cast<int>(slot);
+    fresh = true;
+    return static_cast<int>(slot);
+}
+
+void RasterizerGxm::SyncFogStrip() {
+    // Fog's factor over depth, the fog LUT interpolated as the PICA does (index = d * 128,
+    // entry + fraction * difference), baked per LUT upload; the program samples it once.
+    fog_strip_bound = -1;
+    if (regs.texturing.fog_mode != Pica::TexturingRegs::FogMode::Fog) {
+        return;
+    }
+    bool fresh = false;
+    const int slot = AcquireStrip(Common::HashCombine(0xF06F06F06ull, fog_tables_version), fresh);
+    if (slot < 0) {
+        return;
+    }
+    if (fresh) {
+        auto* texels = static_cast<u32*>(proc_strips[slot].mem);
+        for (u32 n = 0; n < Usse::ProcTexStripTexels; n++) {
+            const float index = static_cast<float>(n) / (Usse::ProcTexStripTexels - 1) * 128.0f;
+            const int i = std::min(static_cast<int>(index), 127);
+            const float value =
+                pica.fog.lut[i].ToFloat() + (index - static_cast<float>(i)) * pica.fog.lut[i].DiffToFloat();
+            const u32 byte = static_cast<u32>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+            texels[n] = byte * 0x01010101u;
+        }
+        sceGxmTextureSetMinFilter(&proc_strips[slot].texture, SCE_GXM_TEXTURE_FILTER_LINEAR);
+        sceGxmTextureSetMagFilter(&proc_strips[slot].texture, SCE_GXM_TEXTURE_FILTER_LINEAR);
+        stat_strip_bakes++;
+    }
+    fog_strip_bound = slot;
 }
 
 void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
@@ -2384,6 +2436,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         feedback_alpha_only = false;
         SyncTextureUnits(fb);
         SyncProcTexStrip();
+        SyncFogStrip();
     }
     if (skip_feedback_draw) {
         stat_skipped++;
@@ -2400,6 +2453,10 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     if (proc_strip_bound >= 0) {
         BindFragmentTexture(Usse::ProcTexStripUnit, proc_strips[proc_strip_bound].texture);
         proc_strips[proc_strip_bound].serial = runtime.CurrentEpoch();
+    }
+    if (fog_strip_bound >= 0) {
+        BindFragmentTexture(Usse::FogStripUnit, proc_strips[fog_strip_bound].texture);
+        proc_strips[fog_strip_bound].serial = runtime.CurrentEpoch();
     }
     // The scene now has a serial: the surfaces it will sample are read for as long as its
     // fragment processing runs, so nothing may write them until the GPU passes it.

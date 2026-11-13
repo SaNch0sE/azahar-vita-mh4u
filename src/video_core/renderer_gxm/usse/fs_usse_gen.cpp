@@ -73,6 +73,13 @@ Source AlphaSource(const TevStageConfig& stage, Source source, u32 index) {
     return (index == 0 && source == Source::Previous) ? stage.alpha_source3.Value() : source;
 }
 
+/// A directional light whose direction the CPU normalises (no distance attenuation needs the
+/// unnormalised length). `nolightprenorm` turns it off.
+bool DirectionPreNormalised(const Pica::Shader::Light& light) {
+    static const bool off = GxmFlag("nolightprenorm");
+    return !off && light.directional && !light.dist_atten_enable;
+}
+
 /// How many of its three arguments an operation reads.
 u32 ArgumentCount(Operation op) {
     switch (op) {
@@ -360,6 +367,8 @@ private:
     bool uses_shadow = false;             ///< lighting reads the shadow texture
     bool uses_border = false;             ///< a unit clamps to its border colour
     bool uses_proctex = false;
+    bool fog_strip = false;               ///< fog reads the baked strip
+    uint32_t sampler_fog = 0;             ///< its sampler's index
     bool proctex_strip = false;           ///< the procedural texture is the baked strip
     uint32_t sampler_strip = 0;           ///< its sampler's index
     uint32_t sampler_rg = 0;              ///< the rg and rgba LUT samplers' indices
@@ -530,7 +539,10 @@ void FragmentEmitter::PlanInputs() {
             }
         }
     }
-    lut_used = lut_used || uses_fog;
+    // Fog reads a baked strip (unit FogStripUnit) rather than the LUT texture.
+    static const bool no_fog_strip = GxmFlag("nofogstrip");
+    fog_strip = uses_fog && !no_fog_strip;
+    lut_used = lut_used || (uses_fog && !fog_strip);
 
     // pa0-3 is the vertex colour; the four-wide inputs follow, then the pairs, then the
     // one float3 (which need not be followed by anything pair-aligned).
@@ -592,6 +604,10 @@ void FragmentEmitter::PlanInputs() {
     }
     if (lut_used) {
         gxp.samplers.push_back({"texture_buffer_lut_lf", 3});
+    }
+    if (fog_strip) {
+        sampler_fog = static_cast<uint32_t>(gxp.samplers.size());
+        gxp.samplers.push_back({"texture_fog_strip", FogStripUnit});
     }
     if (proctex_strip) {
         sampler_strip = static_cast<uint32_t>(gxp.samplers.size());
@@ -656,7 +672,9 @@ void FragmentEmitter::PlanUniforms() {
         AllocateUniform("scissor_y2", 1, 1);
     }
     if (uses_fog) {
-        sa_fog_offset = AllocateUniform("fog_lut_offset", 1, 1);
+        if (!fog_strip) {
+            sa_fog_offset = AllocateUniform("fog_lut_offset", 1, 1);
+        }
         sa_fog_color = AllocateUniform("fog_color", 3, 1);
     }
     if (uses_border) {
@@ -701,8 +719,12 @@ void FragmentEmitter::PlanUniforms() {
         const uint32_t tail = LiteralCount + static_cast<uint32_t>(gxp.samplers.size()) * 4 + 1;
         for (u32 i = 0; i < lighting.src_num; i++) {
             const u32 num = lighting.lights[i].num;
+            // A directional light without distance attenuation reads its direction normalised
+            // by the CPU (position_n), so no pixel normalises a constant.
+            const bool pre_normalised = DirectionPreNormalised(lighting.lights[i]);
             const char* members[8] = {"specular_0", "dist_atten_bias", "specular_1",
-                                      "dist_atten_scale", "diffuse", "ambient", "position",
+                                      "dist_atten_scale", "diffuse", "ambient",
+                                      pre_normalised ? "position_n" : "position",
                                       "spot_direction"};
             const uint8_t sizes[8] = {3, 1, 3, 1, 3, 3, 3, 3};
             const bool resident_light = ((uniform_floats + 1) & ~1u) + 24 + tail <= 128;
@@ -1148,22 +1170,42 @@ void FragmentEmitter::Fog() {
     // fog_index = depth * 128 (or (1 - depth) * 128 flipped); i = clamp(floor(index), 0,
     // 127); f = index - i; entry = lut_lf(i + fog_lut_offset); factor = clamp(r + g * f).
     const Reg pos = Reg::Pa(position_pa + 2); // z, w
-    if (config.texture.fog_flip) {
+    if (fog_strip) {
+        // The baked strip (the LUT interpolated as the PICA does, on the CPU): factor =
+        // strip((d * 255 + 0.5) / 256), d the depth or 1 - depth.
+        if (config.texture.fog_flip) {
+            e.Vec(VecOp::Add, {I0, 0x1}, {pos, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
+            e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX, Mod::Neg}, Lit(LitNeg255), Pred::None,
+                  true);
+        } else {
+            e.Vec(VecOp::Mul, {I0, 0x1}, {pos, XYZW, Mod::Neg}, Lit(LitNeg255), Pred::None,
+                  true);
+        }
+        e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, ConstHalf, Pred::None, true);
+        e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, Lit(LitInv256), Pred::None, true);
+        e.Vec(VecOp::Add, {I0, 0x2}, ConstHalf, ConstZero, Pred::None, true);
+        e.MoveInternal({Reg::V(TmpLutCoord), 0x3}, {I0, XYZW}, Pred::None, true);
+        e.Sample2D(Reg::V(TmpLutEntry), Reg::V(TmpLutCoord), SamplerSa(sampler_fog), nullptr, 0);
+        e.Wdf(0);
+        e.MoveInternal({I0, 0x1}, {Reg::V(TmpLutEntry), XXXX}, Pred::None, true);
+    } else if (config.texture.fog_flip) {
         e.Vec(VecOp::Add, {I0, 0x1}, {pos, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
         e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, Lit(Lit128), Pred::None, true);
     } else {
         e.Vec(VecOp::Mul, {I0, 0x1}, {pos, XYZW}, Lit(Lit128), Pred::None, true);
     }
-    // i1.y = -i (frc's floor form, see LightingLutLookup), clamped to [-127, 0].
-    e.Vec(VecOp::Frc, {I1, 0x2}, ConstZero, {I0, XXXX}, Pred::None, true);
-    e.Vec(VecOp::Max, {I1, 0x2}, {I1, XYZW}, Lit(LitNeg127), Pred::None, true);
-    e.Vec(VecOp::Min, {I1, 0x2}, {I1, XYZW}, ConstZero, Pred::None, true);
-    e.Vec(VecOp::Add, {I1, 0x1}, {I1, YYYY}, {I0, XXXX}, Pred::None, true); // f = index - i
-    e.MoveInternal({Reg::V(TmpLutDelta), 0x3}, {I1, XYZW}, Pred::None, true);
-    const Src fog_offset = SaScalar(sa_fog_offset);
-    e.Vec(VecOp::Add, {I1, 0x2}, {fog_offset.reg, fog_offset.swz, Mod::Neg}, {I1, YYYY},
-          Pred::None, true);
-    LutLfFetch();
+    if (!fog_strip) {
+        // i1.y = -i (frc's floor form, see LightingLutLookup), clamped to [-127, 0].
+        e.Vec(VecOp::Frc, {I1, 0x2}, ConstZero, {I0, XXXX}, Pred::None, true);
+        e.Vec(VecOp::Max, {I1, 0x2}, {I1, XYZW}, Lit(LitNeg127), Pred::None, true);
+        e.Vec(VecOp::Min, {I1, 0x2}, {I1, XYZW}, ConstZero, Pred::None, true);
+        e.Vec(VecOp::Add, {I1, 0x1}, {I1, YYYY}, {I0, XXXX}, Pred::None, true); // f = index - i
+        e.MoveInternal({Reg::V(TmpLutDelta), 0x3}, {I1, XYZW}, Pred::None, true);
+        const Src fog_offset = SaScalar(sa_fog_offset);
+        e.Vec(VecOp::Add, {I1, 0x2}, {fog_offset.reg, fog_offset.swz, Mod::Neg}, {I1, YYYY},
+              Pred::None, true);
+        LutLfFetch();
+    }
     Clamp01(I0, 0x1);
     e.MoveInternal({I0, 0xf}, {I0, XXXX}, Pred::None, true);
     LoadVec4(I1, {Bank::Virtual, TmpOutput});
@@ -1616,17 +1658,19 @@ void FragmentEmitter::Lighting() {
         // console, 2026-09-06: the tiles of one fragment job do not all see the same
         // secondary attributes once the secondary program has written them.
         LoadVec4(I0, position);
-        if (!light.directional) {
-            LoadVec4(I1, view);
-            e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
+        if (!DirectionPreNormalised(light)) {
+            if (!light.directional) {
+                LoadVec4(I1, view);
+                e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
+            }
+            e.Dot({I1, 0x1}, {I0, XYZW}, {I0, XYZW}, false, Pred::None, true);
+            e.Comp(CompOp::Rsq, {I1, 0x2}, {I1}, 0, Pred::None, true);
+            if (light.dist_atten_enable) {
+                e.Vec(VecOp::Mul, {I1, 0x1}, {I1, XYZW}, {I1, YYYY}, Pred::None, true); // length
+                e.MoveInternal({misc_hi, 0x2}, {I1, XXXX}, Pred::None, true); // .y = distance
+            }
+            e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {I1, YYYY}, Pred::None, true);
         }
-        e.Dot({I1, 0x1}, {I0, XYZW}, {I0, XYZW}, false, Pred::None, true);
-        e.Comp(CompOp::Rsq, {I1, 0x2}, {I1}, 0, Pred::None, true);
-        if (light.dist_atten_enable) {
-            e.Vec(VecOp::Mul, {I1, 0x1}, {I1, XYZW}, {I1, YYYY}, Pred::None, true); // length
-            e.MoveInternal({misc_hi, 0x2}, {I1, XXXX}, Pred::None, true);           // .y = distance
-        }
-        e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {I1, YYYY}, Pred::None, true);
         StoreVec4(light_vector, I0);
         CopyVec4({Bank::Virtual, TmpLightAcc}, spot, 0x7);
         // half_vector = normalize(nview + light_vector); its squared length kept for the
