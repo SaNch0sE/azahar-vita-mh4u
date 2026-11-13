@@ -8,9 +8,11 @@ Measurements and history are in `vita-mh4u-performance.md`.
 1. **Per-vertex lighting for the lit world.** One fragment program (`25bbe5f060`: lighting
    config 1, one directional light) is ~46% of the GPU's fragment time on the ship's deck;
    106 of its 199 instructions are lighting. The deck has ~2 pixels per vertex, so lighting
-   inputs computed per vertex and interpolated should look the same. Target: the deck under
-   ~33 ms of GPU a frame (now ~37).
-2. **Simpler specular** if 1 is not enough: the reflection LUT as a constant or per vertex.
+   inputs computed per vertex and interpolated should look the same. Now headroom rather
+   than a necessity: the deck is ~32.9 ms of GPU a frame with item 2.
+2. Done: the reflection LUTs are taken as 1 by default (`refllut` restores them): deck GPU
+   ~35.5 -> ~32.9 ms a frame, shown fps 30-31. Close-up highlights are a little brighter;
+   a per-vertex reflection term would bring the shaping back if it matters.
 3. **Hardware-filtered lighting LUTs** with one wait for all lookups (check the console can
    filter the chosen format; signed tables need care).
 4. **F16 colour pipeline** in the fragment emitter (TEV, texels, lighting sums): the largest

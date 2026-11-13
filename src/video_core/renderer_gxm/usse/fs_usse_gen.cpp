@@ -1782,9 +1782,15 @@ void FragmentEmitter::Lighting() {
         // (the spot direction is no longer needed by then); no register when all three
         // LUTs are off (refl = 1).
         const Vec4Loc acc{Bank::Virtual, TmpLightAcc};
-        const bool rr = LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
-        const bool rg = LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
-        const bool rb = LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
+        // Monster Hunter 4 Ultimate, by default: the reflection LUTs (its lit world uses the
+        // red one on |N.H|) are taken as 1, so specular is the light's specular_1 colour
+        // without the LUT's shaping. ~2.6 ms of GPU a frame on the ship's deck, what takes
+        // the deck under the 33 ms a shown 30 fps needs; highlights on close-ups come out a
+        // little brighter. `refllut` restores the lookup.
+        static const bool const_refl = !GxmFlag("refllut");
+        const bool rr = !const_refl && LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
+        const bool rg = !const_refl && LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
+        const bool rb = !const_refl && LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
         const bool d1_on = LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1);
         const bool d0_on = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
         const bool refl_on = rr || rg || rb;
