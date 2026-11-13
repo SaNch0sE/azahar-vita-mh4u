@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "common/pipeline_stats.h"
+#include <array>
 #include <cstdlib>
 #include <chrono>
 #include <memory>
@@ -43,8 +44,27 @@ void ThreadedRasterizer::ApplySetup(Pica::ShaderSetup& setup, const SetupSync& s
 
 /// Applies a shipment's state to the render thread's mirror.
 void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& shipment) {
+    // The blocks a software draw's fragment side reads (RasterizerGxm::RepeatKey), as one
+    // register index range each.
+    static constexpr std::array<std::pair<u32, u32>, 4> fragment_blocks{{
+        {PICA_REG_INDEX(rasterizer), sizeof(Pica::RasterizerRegs) / 4},
+        {PICA_REG_INDEX(texturing), sizeof(Pica::TexturingRegs) / 4},
+        {PICA_REG_INDEX(framebuffer), sizeof(Pica::FramebufferRegs) / 4},
+        {PICA_REG_INDEX(lighting), sizeof(Pica::LightingRegs) / 4},
+    }};
+    bool fragment_changed = false;
     for (const auto& [index, value] : shipment.reg_delta) {
-        mirror.regs.internal.reg_array[index] = value;
+        u32& reg = mirror.regs.internal.reg_array[index];
+        if (reg != value && !fragment_changed) {
+            for (const auto& [first, count] : fragment_blocks) {
+                fragment_changed |= index - first < count;
+            }
+        }
+        reg = value;
+    }
+    mirror.fragment_regs_versioned = true;
+    if (fragment_changed) {
+        mirror.fragment_regs_version++;
     }
     ApplySetup(mirror.vs_setup, shipment.vs);
     ApplySetup(mirror.gs_setup, shipment.gs);

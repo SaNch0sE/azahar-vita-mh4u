@@ -440,6 +440,7 @@ SceGxmRenderTarget* RasterizerGxm::BlitTargetFor(u32 width, u32 height) {
 }
 
 bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit) {
+    FlushDeferredDraws();
     static const bool no_gpu_blit = GxmFlag("nogpublit");
     if (no_gpu_blit || !resources_ready || !HasDevice() || blit_ring == nullptr) {
         return false;
@@ -794,6 +795,7 @@ u32 RasterizerGxm::SceneFlagsFor(std::initializer_list<VideoCore::SurfaceId> tou
 }
 
 void RasterizerGxm::BeginScene(Framebuffer* fb) {
+    FlushDeferredDraws();
     if (in_scene && scene_fb == fb) {
         return;
     }
@@ -1156,6 +1158,7 @@ void RasterizerGxm::TrimSurfaceCache() {
 }
 
 void RasterizerGxm::EndScene() {
+    FlushDeferredDraws();
     draw_epoch++;
     nondraw_epoch++;
     DrawTrace("end scene");
@@ -2151,6 +2154,7 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
 
 bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                               u32 vertex_count) {
+    FlushDeferredDraws();
     SyncDrawUniforms();
 
     const auto& fb_regs = regs.framebuffer;
@@ -2320,10 +2324,49 @@ u64 RasterizerGxm::RepeatKey() const {
     // Everything a software-shaded draw's fragment side reads from the registers: textures,
     // combiner, fog and procedural texture (texturing), the output merger and targets
     // (framebuffer), fragment lighting (lighting), viewport, depth map and scissor (rasterizer).
+    // With the threaded rasterizer the mirror counts changes to those blocks as shipments
+    // apply them: the count stands for the ~2 KB this hashed on every software draw. The top
+    // bit keeps it apart from a hash.
+    if (pica.fragment_regs_versioned) {
+        return pica.fragment_regs_version | (1ull << 63);
+    }
     u64 h = Common::ComputeHash64(&regs.texturing, sizeof(regs.texturing));
     h = Common::HashCombine(h, Common::ComputeHash64(&regs.framebuffer, sizeof(regs.framebuffer)));
     h = Common::HashCombine(h, Common::ComputeHash64(&regs.lighting, sizeof(regs.lighting)));
     return Common::HashCombine(h, Common::ComputeHash64(&regs.rasterizer, sizeof(regs.rasterizer)));
+}
+
+void RasterizerGxm::FlushDeferredDraws() {
+    if (deferred_ranges.empty()) {
+        return;
+    }
+    if (!in_scene) {
+        // Nothing to draw them into: a path that ended the scene without EndScene.
+        static u32 reported = 0;
+        if (reported++ < 8) {
+            LOG_WARNING(Render, "deferred draws with no scene open: {} ranges dropped",
+                        deferred_ranges.size());
+        }
+        deferred_ranges.clear();
+        return;
+    }
+    SceGxmContext* context = Device().context;
+    const PhaseTimer draw_timer{time_draws, times.draw};
+    for (const auto& range : deferred_ranges) {
+        u32 first = range.first;
+        u32 left = range.count;
+        while (left > 0) {
+            const u32 count = std::min(left, MaxVerticesPerDraw);
+            sceGxmSetVertexStream(context, 0,
+                                  vertex_ring.base +
+                                      static_cast<std::size_t>(first) * sizeof(Pica::OutputVertex));
+            sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
+                       identity_indices, count);
+            first += count;
+            left -= count;
+        }
+    }
+    deferred_ranges.clear();
 }
 
 void RasterizerGxm::DrawTriangles() {
@@ -2346,28 +2389,27 @@ void RasterizerGxm::DrawTriangles() {
     if (!no_repeat && repeat_ok && in_scene && vertex_batch.empty() && key == repeat_key &&
         draw_epoch == repeat_epoch && scene_seq == repeat_scene && !pica.lighting.lut_dirty &&
         !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
-        // The previous draw's state is still bound and still right: just this draw.
+        // The previous draw's state is still bound and still right: this draw's triangles
+        // join the deferred run (FlushDeferredDraws), one draw for a whole line of glyphs.
         stat_draws++;
         stat_repeat_draws++;
-        SceGxmContext* context = Device().context;
-        const PhaseTimer draw_timer{time_draws, times.draw};
+        static const bool no_merge = GxmFlag("nodrawmerge");
         for (const auto& range : pending_ring_ranges) {
-            u32 first = range.first;
-            u32 left = range.count;
-            while (left > 0) {
-                const u32 count = std::min(left, MaxVerticesPerDraw);
-                sceGxmSetVertexStream(context, 0,
-                                      vertex_ring.base + static_cast<std::size_t>(first) *
-                                                             sizeof(Pica::OutputVertex));
-                sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
-                           identity_indices, count);
-                first += count;
-                left -= count;
+            if (!no_merge && !deferred_ranges.empty() &&
+                deferred_ranges.back().first + deferred_ranges.back().count == range.first) {
+                deferred_ranges.back().count += range.count;
+                deferred_ranges.back().end_pos = range.end_pos;
+                stat_deferred_merged++;
+            } else {
+                deferred_ranges.push_back(range);
             }
             stat_vertices += range.count;
             ring_scene_pos = std::max(ring_scene_pos, range.end_pos);
         }
         pending_ring_ranges.clear();
+        if (no_merge) {
+            FlushDeferredDraws();
+        }
         return;
     }
     repeat_ok = false;
@@ -3202,6 +3244,7 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
 }
 
 void RasterizerGxm::EndFrame() {
+    FlushDeferredDraws();
     draw_epoch++;
     nondraw_epoch++;
     DrawTrace("end frame");
@@ -3423,8 +3466,9 @@ void RasterizerGxm::EndFrame() {
                         why_not += fmt::format(" {} {},", not_names[r], n);
                     }
                 }
-                LOG_INFO(Render, "repeated software draws (no state sync): {}, draws keeping the fragment setup: {}, feedback draws written as alpha only: {}",
-                         stat_repeat_draws, stat_begin_repeats, stat_alpha_only_feedback);
+                LOG_INFO(Render, "repeated software draws (no state sync): {} ({} merged into the run before), draws keeping the fragment setup: {}, feedback draws written as alpha only: {}",
+                         stat_repeat_draws, stat_deferred_merged, stat_begin_repeats, stat_alpha_only_feedback);
+                stat_deferred_merged = 0;
                 stat_alpha_only_feedback = 0;
                 stat_repeat_draws = 0;
                 stat_begin_repeats = 0;

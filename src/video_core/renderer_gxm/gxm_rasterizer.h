@@ -249,6 +249,12 @@ private:
     void SyncAndUploadLUTs();
     bool RetireRing();
     void DropDraw();
+    /// Repeated software draws (glyphs) with the state still bound are not drawn one by one:
+    /// their ring ranges collect here, merged when contiguous, and go out together before
+    /// anything else touches the context (BeginDraw, BeginScene, EndScene, GpuBlit, EndFrame).
+    void FlushDeferredDraws();
+    std::vector<VideoCore::VertexRingRange> deferred_ranges;
+    u32 stat_deferred_merged{};
 
     VideoCore::RendererBase& renderer;
     std::unique_ptr<PipelineCache> pipeline_cache;

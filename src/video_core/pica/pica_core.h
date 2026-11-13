@@ -380,6 +380,12 @@ public:
     RegsLcd regs_lcd{};
     Regs regs{};
     DirtyRegs dirty_regs{};
+    /// Render-thread mirror only: bumped by every shipment that writes a register of the
+    /// rasterizer, texturing, framebuffer or lighting blocks, so a backend can tell "nothing
+    /// a draw's fragment side reads changed" without hashing those blocks. `versioned` says
+    /// the registers only change through shipments (false: inline mode, hash instead).
+    u64 fragment_regs_version = 0;
+    bool fragment_regs_versioned = false;
     GeometryShaderUnit gs_unit;
     ShaderSetup vs_setup;
     ShaderSetup gs_setup;
