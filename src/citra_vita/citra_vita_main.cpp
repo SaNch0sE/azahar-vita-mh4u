@@ -97,6 +97,8 @@ FILE* OpenPerfFile() {
 } // namespace
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/vita_ui.h"
+#include "common/emu_prof.h"
+#include "common/vita_tuning.h"
 #include "common/file_util.h"
 #include "common/logging/backend.h"
 #include "common/logging/filter.h"
@@ -562,12 +564,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 #endif
                 const auto wt_stats = system.Memory().WriteTracker().TakeStats();
                 sceClibPrintf(
-                    "[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  dup %u  bottom %u  "
+                    "[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  dup %u  bottom %u  limiter %u us  "
                     "slices %u (svc %u fast %u)  guest %u us  in %u us  wf %u wa %u wh %u  "
                     "queue %u brake %u us  heap %u/%u KiB%s%s%s\n",
                     speed, fps10 / 10, fps10 % 10, presented, skipped,
                     Common::PipelineStats::dup_presents.exchange(0, std::memory_order_relaxed),
-                    Common::PipelineStats::bottom_draws_dropped.exchange(0, std::memory_order_relaxed), rec.slices, rec.svcs, static_cast<unsigned>(Core::NativeStats::fast_svcs.exchange(0)),
+                    Common::PipelineStats::bottom_draws_dropped.exchange(0, std::memory_order_relaxed),
+                    Common::PipelineStats::limiter_sleep_us.exchange(0, std::memory_order_relaxed), rec.slices, rec.svcs, static_cast<unsigned>(Core::NativeStats::fast_svcs.exchange(0)),
                     static_cast<unsigned>(rec.guest_ns / 1000),
                     static_cast<unsigned>(rec.vanrun_us),
                     Core::NativeStats::write_faults.exchange(0, std::memory_order_relaxed),
@@ -575,6 +578,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     system.GPU().RenderQueueDepth(), rec.gpu_brakes,
                     static_cast<unsigned>(heap.uordblks / 1024),
                     static_cast<unsigned>(heap.arena / 1024), sema, phase, sgi);
+                if (Common::EmuProf::enabled) {
+                    sceClibPrintf("[emuprof]%s\n", Common::EmuProf::TakeReport().c_str());
+                }
                 if (perf_file != nullptr) {
                     std::fwrite(&rec, sizeof(rec), 1, perf_file);
                     std::fflush(perf_file);
@@ -737,6 +743,8 @@ int EmulatorMain() {
     Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
     Settings::values.use_cpu_jit = false;
     Settings::values.disable_right_eye_render = true;
+    Common::EmuProf::enabled = GxmRenderer::GxmFlag("emuprof");
+    Common::dsp_parallel = !GxmRenderer::GxmFlag("nodspthread");
     // One screen by default: the port is played with the Heavenfall mod's single-screen mode
     // (the touch screen's menus moved to the top screen), and the top screen then fills the
     // display. The pause menu's Screen layout still switches back.

@@ -3,6 +3,8 @@
 // Refer to the license.txt file included.
 
 #include "common/archives.h"
+#include "common/emu_prof.h"
+#include "common/scope_exit.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
 #include "core/core.h"
@@ -830,6 +832,13 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
 #endif // CITRA_TRACE_PROBES
 
+    const u64 prof_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+    SCOPE_EXIT({
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add(fmt::format("gx cmd {}", static_cast<u32>(command.id.Value())),
+                                 Common::PipelineStats::NowUs() - prof_t0);
+        }
+    });
     switch (command.id) {
     case CommandId::RequestDma: {
         impl->system.Memory().RasterizerFlushVirtualRegion(

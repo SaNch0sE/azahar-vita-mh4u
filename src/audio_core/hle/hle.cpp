@@ -3,6 +3,8 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/base_object.hpp>
@@ -24,7 +26,11 @@
 #include "common/common_types.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
+#include "common/emu_prof.h"
+#include "common/pipeline_stats.h"
 #include "common/settings.h"
+#include "common/thread.h"
+#include "common/vita_tuning.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 
@@ -107,6 +113,19 @@ private:
 
     std::function<void(Service::DSP::InterruptType type, DspPipe pipe)> interrupt_handler{};
 
+    // The odd sources' Tick on a second thread (Common::dsp_parallel): sources are
+    // independent - each reads its own configuration and buffers and writes its own status -
+    // so half of them run on an idle core while the emulation thread runs the other half; the
+    // mixing stays on this thread, in source order, so the output is the same.
+    void SourceWorkerLoop();
+    void TickSources(HLE::SharedMemory& read, HLE::SharedMemory& write, std::size_t first);
+    std::thread source_worker;
+    Common::Event source_start;
+    std::atomic<bool> source_done{false};
+    std::atomic<bool> source_quit{false};
+    HLE::SharedMemory* job_read{};
+    HLE::SharedMemory* job_write{};
+
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
         ar& boost::serialization::make_binary_object(backup_dsp_memory.raw_memory.data(),
@@ -139,6 +158,34 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
 
 DspHle::Impl::~Impl() {
     core_timing.UnscheduleEvent(tick_event, 0);
+    if (source_worker.joinable()) {
+        source_quit.store(true, std::memory_order_release);
+        source_start.Set();
+        source_worker.join();
+    }
+}
+
+void DspHle::Impl::TickSources(HLE::SharedMemory& read, HLE::SharedMemory& write,
+                               std::size_t first) {
+    for (std::size_t i = first; i < HLE::num_sources; i += 2) {
+        write.source_statuses.status[i] =
+            sources[i].Tick(read.source_configurations.config[i], read.adpcm_coefficients.coeff[i]);
+    }
+}
+
+void DspHle::Impl::SourceWorkerLoop() {
+    // The shader compiler's core: idle while a title runs (libgxm's display queue thread is the
+    // only other tenant), where the emulation thread's core carries the guest too.
+    Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
+    Common::SetCurrentThreadName("DspSources");
+    for (;;) {
+        source_start.Wait();
+        if (source_quit.load(std::memory_order_acquire)) {
+            return;
+        }
+        TickSources(*job_read, *job_write, 1);
+        source_done.store(true, std::memory_order_release);
+    }
 }
 
 DspState DspHle::Impl::GetDspState() const {
@@ -417,19 +464,45 @@ StereoFrame16 DspHle::Impl::GenerateCurrentFrame() {
 
     std::array<QuadFrame32, 3> intermediate_mixes = {};
 
+    namespace EP = Common::EmuProf;
+    u64 prof_t = EP::enabled ? Common::PipelineStats::NowUs() : 0;
+    const auto prof = [&](const char* key) {
+        if (EP::enabled) {
+            const u64 now = Common::PipelineStats::NowUs();
+            EP::Add(key, now - prof_t);
+            prof_t = now;
+        }
+    };
     // Generate intermediate mixes
+    if (Common::dsp_parallel) {
+        if (!source_worker.joinable()) {
+            source_worker = std::thread([this] { SourceWorkerLoop(); });
+        }
+        job_read = &read;
+        job_write = &write;
+        source_done.store(false, std::memory_order_relaxed);
+        source_start.Set();
+        TickSources(read, write, 0);
+        while (!source_done.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    } else {
+        TickSources(read, write, 0);
+        TickSources(read, write, 1);
+    }
+    prof(" .dsp sources");
     for (std::size_t i = 0; i < HLE::num_sources; i++) {
-        write.source_statuses.status[i] =
-            sources[i].Tick(read.source_configurations.config[i], read.adpcm_coefficients.coeff[i]);
         for (std::size_t mix = 0; mix < 3; mix++) {
             sources[i].MixInto(intermediate_mixes[mix], mix);
         }
     }
+    prof(" .dsp mixinto");
 
     // Generate final mix
     write.dsp_status = mixers.Tick(read.dsp_configuration, read.intermediate_mix_samples,
                                    write.intermediate_mix_samples, intermediate_mixes);
 
+    prof(" .dsp mixers");
     StereoFrame16 output_frame = mixers.GetOutput();
 
     // Write current output frame to the shared memory region
@@ -452,7 +525,11 @@ bool DspHle::Impl::Tick() {
         // to shared memory region)
         current_frame = GenerateCurrentFrame();
 
+        const u64 out_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
         parent.OutputFrame(std::move(current_frame));
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add(" .dsp output", Common::PipelineStats::NowUs() - out_t0);
+        }
     }
 
     return is_on;

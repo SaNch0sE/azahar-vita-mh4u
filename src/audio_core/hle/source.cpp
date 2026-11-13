@@ -41,6 +41,20 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
     const std::array<float, 4>& ramp_start = state.gain_ramp_start.at(intermediate_mix_id);
     constexpr float ramp_scale = 1.0f / static_cast<float>(samples_per_frame - 1);
 
+    // A source that does not feed this mix (every gain zero, and no ramp down from a non-zero
+    // one) adds exactly nothing: skip its 160 samples. Most sources feed one of the three mixes,
+    // and the loop was ~2/3 of the DSP tick on the emulation thread.
+    const auto zero = [](const std::array<float, 4>& g) {
+        return g[0] == 0.0f && g[1] == 0.0f && g[2] == 0.0f && g[3] == 0.0f;
+    };
+    if (zero(gains) && (!ramp_active || zero(ramp_start))) {
+        if (ramp_active) {
+            state.gain_ramp_start.at(intermediate_mix_id) = gains;
+            state.gain_ramp_active.at(intermediate_mix_id) = false;
+        }
+        return;
+    }
+
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     // Stereo-to-quad expansion: each output sample is {gain0*L, gain1*R, gain2*L, gain3*R},
     // one 4-lane multiply-accumulate. vcvtq_s32_f32 truncates toward zero like the scalar

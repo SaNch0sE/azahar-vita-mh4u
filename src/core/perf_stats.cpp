@@ -14,6 +14,7 @@
 #include "common/file_util.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
+#include "common/pipeline_stats.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
 
@@ -256,6 +257,9 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
     if (frame_limiting_delta_err > microseconds::zero()) {
         std::this_thread::sleep_for(frame_limiting_delta_err);
         auto now_after_sleep = Clock::now();
+        Common::PipelineStats::limiter_sleep_us.fetch_add(
+            static_cast<u32>(duration_cast<microseconds>(now_after_sleep - now).count()),
+            std::memory_order_relaxed);
         frame_limiting_delta_err -= duration_cast<microseconds>(now_after_sleep - now);
         now = now_after_sleep;
     }

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <span>
 #include <unordered_set>
+#include "common/emu_prof.h"
 #include "common/hash.h"
 #include "common/pipeline_stats.h"
 #include "common/arch.h"
@@ -1020,6 +1021,15 @@ void PicaCore::DrawImmediate() {
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
+    const u64 prof_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+    SCOPE_EXIT({
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add(regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes
+                                     ? "pica draw (gs)"
+                                     : "pica draw",
+                                 Common::PipelineStats::NowUs() - prof_t0);
+        }
+    });
 
     // Single screen: the bottom screen is never shown, so its draws (MH4U draws it through the
     // main colour buffer with a 240x320 viewport at the start of each frame, then copies it out
@@ -1174,7 +1184,12 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     if (ticket->in_ring) {
         layout = ring_layout;
     }
+    const u64 copy_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     loader.CopyIntoArena(base_address, vertex_min, vertex_max, layout, ticket->data);
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add(ticket->in_ring ? " .vertex copy (ring)" : " .vertex copy (arena)",
+                             Common::PipelineStats::NowUs() - copy_t0);
+    }
     if (index_bytes != 0) {
         if (layout.ring) {
             VertexLoader::WriteRingIndices(ticket->data + layout.index_offset, index_address_8,
@@ -1196,7 +1211,11 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     payload.is_indexed = is_indexed;
     payload.index_u16 = index_u16;
     payload.hw = hw;
+    const u64 ship_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     rasterizer->ShipDraw(std::move(payload), ticket->slot);
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add(" .ship", Common::PipelineStats::NowUs() - ship_t0);
+    }
     return true;
 }
 

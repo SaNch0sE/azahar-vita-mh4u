@@ -152,6 +152,8 @@ inline std::atomic<u32> presents{0};
 inline std::atomic<u32> dup_presents{0};
 /// Draws dropped because they were for the hidden bottom screen (single-screen layout).
 inline std::atomic<u32> bottom_draws_dropped{0};
+/// Time the frame limiter slept on the emulation thread (the guest ahead of real time).
+inline std::atomic<u32> limiter_sleep_us{0};
 /// VBlank snapshots taken of CPU-written framebuffers (GPU::DisplaySnapshot).
 inline std::atomic<u32> display_snapshots{0};
 

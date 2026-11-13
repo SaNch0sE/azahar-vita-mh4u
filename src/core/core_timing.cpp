@@ -6,6 +6,8 @@
 #include <random>
 #include <tuple>
 #include "common/assert.h"
+#include "common/emu_prof.h"
+#include "common/pipeline_stats.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
@@ -228,7 +230,13 @@ void Timing::Timer::Advance() {
         std::pop_heap(event_queue.begin(), event_queue.end(), std::greater<>());
         event_queue.pop_back();
         if (evt.type->callback != nullptr) {
-            evt.type->callback(evt.user_data, static_cast<int>(executed_ticks - evt.time));
+            if (Common::EmuProf::enabled) {
+                const u64 t0 = Common::PipelineStats::NowUs();
+                evt.type->callback(evt.user_data, static_cast<int>(executed_ticks - evt.time));
+                Common::EmuProf::Add("ev " + *evt.type->name, Common::PipelineStats::NowUs() - t0);
+            } else {
+                evt.type->callback(evt.user_data, static_cast<int>(executed_ticks - evt.time));
+            }
         } else {
             LOG_ERROR(Core, "Event '{}' has no callback", *evt.type->name);
         }

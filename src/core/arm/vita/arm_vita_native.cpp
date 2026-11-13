@@ -8,6 +8,7 @@
 #include "core/arm/skyeye_common/armstate.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "core/arm/vita/native_stats.h"
+#include "common/emu_prof.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -478,9 +479,25 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     switch (run.reason) {
     case AZAHAR_EXIT_SVC: {
         const SceUInt64 svc_start = sceKernelGetProcessTimeWide();
+        std::string prof_key;
+        if (Common::EmuProf::enabled) {
+            // IPC requests by service and command; everything else by number.
+            prof_key = fmt::format("svc {:02X}", run.svc_number);
+            if (run.svc_number == 0x32) {
+                if (const auto process = system.Kernel().GetCurrentProcess()) {
+                    if (const auto obj = process->handle_table.GetGeneric(run.ctx.r[0])) {
+                        const u32 header = memory.Read32(cp15[CP15_THREAD_URO] + 0x80);
+                        prof_key = fmt::format("ipc {} {:04X}", obj->GetName(), header >> 16);
+                    }
+                }
+            }
+        }
         svc_context.CallSVC(run.svc_number);
-        NativeStats::svc_us.fetch_add(sceKernelGetProcessTimeWide() - svc_start,
-                                      std::memory_order_relaxed);
+        const SceUInt64 svc_end = sceKernelGetProcessTimeWide();
+        NativeStats::svc_us.fetch_add(svc_end - svc_start, std::memory_order_relaxed);
+        if (!prof_key.empty()) {
+            Common::EmuProf::Add(prof_key, svc_end - svc_start);
+        }
     }
         // An svc can reschedule, which replaces the register file wholesale.
         return !break_flag && !stop_requested;
