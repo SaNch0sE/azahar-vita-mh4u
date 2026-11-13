@@ -118,6 +118,20 @@ private:
     // so half of them run on an idle core while the emulation thread runs the other half; the
     // mixing stays on this thread, in source order, so the output is the same.
     void SourceWorkerLoop();
+    // Pipelined ticks (Common::dsp_pipelined): the tick hands the frame to a worker and an event
+    // half an audio frame later takes the result, outputs it and raises the interrupt. The game
+    // runs on in between and writes only the other shared-memory region (it flips regions after
+    // the interrupt, which has not come yet). Every other entry point joins the worker first.
+    void PipeWorkerLoop();
+    void JoinPipe() const;
+    void CollectCallback();
+    std::thread pipe_worker;
+    Common::Event pipe_start;
+    std::atomic<bool> pipe_busy{false};
+    std::atomic<bool> pipe_quit{false};
+    StereoFrame16 pipe_frame{};
+    bool pipe_pending = false;
+    Core::TimingEventType* collect_event{};
     void TickSources(HLE::SharedMemory& read, HLE::SharedMemory& write, std::size_t first);
     std::thread source_worker;
     Common::Event source_start;
@@ -154,10 +168,49 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
             this->AudioTickCallback(cycles_late);
         });
     core_timing.ScheduleEvent(audio_frame_ticks, tick_event);
+    collect_event = core_timing.RegisterEvent(
+        "AudioCore::DspHle::collect_event", [this](u64, s64) { this->CollectCallback(); });
+}
+
+void DspHle::Impl::JoinPipe() const {
+    while (pipe_busy.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+void DspHle::Impl::PipeWorkerLoop() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
+    Common::SetCurrentThreadName("DspTick");
+    Common::EmuProf::thread_disabled = true;
+    for (;;) {
+        pipe_start.Wait();
+        if (pipe_quit.load(std::memory_order_acquire)) {
+            return;
+        }
+        pipe_frame = GenerateCurrentFrame();
+        pipe_busy.store(false, std::memory_order_release);
+    }
+}
+
+void DspHle::Impl::CollectCallback() {
+    JoinPipe();
+    if (!pipe_pending) {
+        return;
+    }
+    pipe_pending = false;
+    parent.OutputFrame(std::move(pipe_frame));
+    interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
 }
 
 DspHle::Impl::~Impl() {
     core_timing.UnscheduleEvent(tick_event, 0);
+    core_timing.UnscheduleEvent(collect_event, 0);
+    if (pipe_worker.joinable()) {
+        JoinPipe();
+        pipe_quit.store(true, std::memory_order_release);
+        pipe_start.Set();
+        pipe_worker.join();
+    }
     if (source_worker.joinable()) {
         source_quit.store(true, std::memory_order_release);
         source_start.Set();
@@ -189,10 +242,12 @@ void DspHle::Impl::SourceWorkerLoop() {
 }
 
 DspState DspHle::Impl::GetDspState() const {
+    JoinPipe();
     return dsp_state;
 }
 
 u16 DspHle::Impl::RecvData(u32 register_number) {
+    JoinPipe();
     ASSERT_MSG(register_number == 0, "Unknown register_number {}", register_number);
 
     // Application reads this after requesting DSP shutdown, to verify the DSP has indeed shutdown
@@ -211,11 +266,13 @@ u16 DspHle::Impl::RecvData(u32 register_number) {
 }
 
 bool DspHle::Impl::RecvDataIsReady(u32 register_number) const {
+    JoinPipe();
     ASSERT_MSG(register_number == 0, "Unknown register_number {}", register_number);
     return true;
 }
 
 std::vector<u8> DspHle::Impl::PipeRead(DspPipe pipe_number, std::size_t length) {
+    JoinPipe();
     const std::size_t pipe_index = static_cast<std::size_t>(pipe_number);
 
     if (pipe_index >= num_dsp_pipe) {
@@ -247,6 +304,7 @@ std::vector<u8> DspHle::Impl::PipeRead(DspPipe pipe_number, std::size_t length) 
 }
 
 size_t DspHle::Impl::GetPipeReadableSize(DspPipe pipe_number) const {
+    JoinPipe();
     const std::size_t pipe_index = static_cast<std::size_t>(pipe_number);
 
     if (pipe_index >= num_dsp_pipe) {
@@ -258,6 +316,7 @@ size_t DspHle::Impl::GetPipeReadableSize(DspPipe pipe_number) const {
 }
 
 void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
+    JoinPipe();
     switch (pipe_number) {
     case DspPipe::Audio: {
         if (buffer.size() != 4) {
@@ -359,6 +418,7 @@ void DspHle::Impl::Initialize() {
 }
 
 void DspHle::Impl::Sleep() {
+    JoinPipe();
     // TODO(PabloMK7): This is NOT the right way to do this,
     // but it is close enough. What state is saved on
     // real hardware still not figured out.
@@ -372,6 +432,7 @@ void DspHle::Impl::Sleep() {
 }
 
 void DspHle::Impl::Wakeup() {
+    JoinPipe();
     // TODO(PabloMK7): This is NOT the right way to do this,
     // but it is close enough. What state is restored on
     // real hardware still not figured out.
@@ -386,6 +447,7 @@ void DspHle::Impl::Wakeup() {
 }
 
 void DspHle::Impl::ResetPipes() {
+    JoinPipe();
     for (auto& data : pipe_data) {
         data.clear();
     }
@@ -474,7 +536,7 @@ StereoFrame16 DspHle::Impl::GenerateCurrentFrame() {
         }
     };
     // Generate intermediate mixes
-    if (Common::dsp_parallel) {
+    if (Common::dsp_parallel && !Common::dsp_pipelined) {
         if (!source_worker.joinable()) {
             source_worker = std::thread([this] { SourceWorkerLoop(); });
         }
@@ -536,7 +598,23 @@ bool DspHle::Impl::Tick() {
 }
 
 void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
-    if (Tick()) {
+    if (Common::dsp_pipelined) {
+        JoinPipe();
+        if (pipe_pending) {
+            // The previous frame's collect has not run (it is always scheduled before this
+            // tick); deliver it now so no frame is lost.
+            CollectCallback();
+        }
+        if (GetDspState() == DspState::On) {
+            if (!pipe_worker.joinable()) {
+                pipe_worker = std::thread([this] { PipeWorkerLoop(); });
+            }
+            pipe_pending = true;
+            pipe_busy.store(true, std::memory_order_release);
+            pipe_start.Set();
+            core_timing.ScheduleEvent(static_cast<s64>(audio_frame_ticks / 2), collect_event);
+        }
+    } else if (Tick()) {
         // TODO(merry): Signal all the other interrupts as appropriate.
         interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
     }

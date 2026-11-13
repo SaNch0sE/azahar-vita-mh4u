@@ -10,6 +10,9 @@ namespace Common {
 
 /// HLE DSP: the odd sources' Tick on a second thread (audio_core/hle/hle.cpp). `nodspthread`.
 inline bool dsp_parallel = false;
+/// HLE DSP ticks pipelined on a worker: the frame is computed beside the guest and output,
+/// with its interrupt, half an audio frame later (audio_core/hle/hle.cpp). `nodsppipe` turns it off.
+inline bool dsp_pipelined = false;
 
 /// GX command lists on their own thread beside the guest (video_core/gpu.cpp GxLoop). `gxasync`.
 inline bool gx_async = false;
