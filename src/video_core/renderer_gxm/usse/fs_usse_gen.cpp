@@ -367,6 +367,8 @@ private:
     bool uses_shadow = false;             ///< lighting reads the shadow texture
     bool uses_border = false;             ///< a unit clamps to its border colour
     bool uses_proctex = false;
+    bool primary_alpha_read = false;      ///< a used operand reads primary_fragment_color.a
+    bool secondary_alpha_read = false;    ///< ... secondary_fragment_color.a
     bool fog_strip = false;               ///< fog reads the baked strip
     uint32_t sampler_fog = 0;             ///< its sampler's index
     bool proctex_strip = false;           ///< the procedural texture is the baked strip
@@ -490,6 +492,37 @@ void FragmentEmitter::PlanInputs() {
             }
         }
     }
+    // Whether a used TEV operand reads the alpha of a lighting colour: the Fresnel LUT feeds
+    // only those alphas, so without a reader it is not computed. (MH4U's lit world reads the
+    // lighting colours' RGB only.) `nofresnelskip` computes it regardless.
+    {
+        static const bool no_skip = GxmFlag("nofresnelskip");
+        for (u32 i = 0; i < tex.tev_stages.size(); i++) {
+            const TevStageConfig stage = tex.tev_stages[i];
+            if (IsPassThroughTevStage(stage)) {
+                continue;
+            }
+            const auto src = ReadSources(stage, i);
+            const ColorModifier cm[3] = {stage.color_modifier1, stage.color_modifier2,
+                                         stage.color_modifier3};
+            const AlphaModifier am[3] = {stage.alpha_modifier1, stage.alpha_modifier2,
+                                         stage.alpha_modifier3};
+            for (int k = 0; k < 3; k++) {
+                const bool c_alpha = cm[k] == ColorModifier::SourceAlpha ||
+                                     cm[k] == ColorModifier::OneMinusSourceAlpha;
+                const bool a_alpha = am[k] == AlphaModifier::SourceAlpha ||
+                                     am[k] == AlphaModifier::OneMinusSourceAlpha;
+                for (const auto& [s, reads] : {std::pair{src[k], c_alpha},
+                                               std::pair{src[3 + k], a_alpha}}) {
+                    if (!reads && !no_skip) {
+                        continue;
+                    }
+                    primary_alpha_read |= s == Source::PrimaryFragmentColor;
+                    secondary_alpha_read |= s == Source::SecondaryFragmentColor;
+                }
+            }
+        }
+    }
     proctex_strip = uses_proctex &&
                     ProcTexStripEligible(config.proctex.noise_enable, config.proctex.u_shift,
                                          config.proctex.v_shift, config.proctex.separate_alpha,
@@ -510,7 +543,15 @@ void FragmentEmitter::PlanInputs() {
                  Pica::RasterizerRegs::DepthBuffering::WBuffering;
     if (uses_lighting && lighting.enable_shadow) {
         const u32 unit = lighting.shadow_selector;
-        if (unit < 3 && (unit != 0 || tex.texture0_type != TextureType::Disabled)) {
+        // A 2D shadow texture on unit 0 is bound white (shadow-map passes are dropped, P5), so
+        // an uninverted shadow is exactly 1: nothing to sample, copy or multiply. Monster
+        // Hunter 4 Ultimate's lit world has shadow on for every light. `noshadowfold` keeps
+        // the sample.
+        static const bool no_fold = GxmFlag("noshadowfold");
+        const bool white_shadow = !no_fold && unit == 0 &&
+                                  tex.texture0_type == TextureType::Shadow2D &&
+                                  !lighting.shadow_invert;
+        if (!white_shadow && unit < 3 && (unit != 0 || tex.texture0_type != TextureType::Disabled)) {
             unit_used[unit] = true;
             uses_shadow = true;
         }
@@ -1556,8 +1597,8 @@ void FragmentEmitter::Lighting() {
             input_of(lighting.lut_rb, Sampler::ReflectBlue);
         }
         if (li + 1 == lighting.src_num &&
-            ((uses_primary_color && lighting.enable_primary_alpha) ||
-             (uses_secondary_color && lighting.enable_secondary_alpha))) {
+            ((uses_primary_color && lighting.enable_primary_alpha && primary_alpha_read) ||
+             (uses_secondary_color && lighting.enable_secondary_alpha && secondary_alpha_read))) {
             input_of(lighting.lut_fr, Sampler::Fresnel);
         }
         if (light.spot_atten_enable) {
@@ -1848,8 +1889,10 @@ void FragmentEmitter::Lighting() {
         } // uses_primary_color
 
         // The fresnel term, on the last light, into the alphas asked for.
-        const bool fresnel_primary = uses_primary_color && lighting.enable_primary_alpha;
-        const bool fresnel_secondary = uses_secondary_color && lighting.enable_secondary_alpha;
+        const bool fresnel_primary =
+            uses_primary_color && lighting.enable_primary_alpha && primary_alpha_read;
+        const bool fresnel_secondary =
+            uses_secondary_color && lighting.enable_secondary_alpha && secondary_alpha_read;
         if (light_index + 1 == lighting.src_num && (fresnel_primary || fresnel_secondary) &&
             LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel)) {
             lut_value(lighting.lut_fr, Sampler::Fresnel, two_sided);

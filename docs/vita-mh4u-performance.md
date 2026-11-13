@@ -144,6 +144,13 @@ Since then:
      256-texel strip (`SyncProcTexStrip`, cached by table version and settings, unit 6) that
      the program samples once: 97 -> 42 instructions, four dependent fetches -> one. Deck GPU
      time 48.8 -> 38.6 ms a frame; shown fps 20-21 -> 25-26. `noptstrip` turns it off.
+   - Fog: baked into a strip like the procedural texture (`nofogstrip`). Directional lights
+     without distance attenuation are normalised on the CPU (`nolightprenorm`). A white
+     dummy shadow (Shadow2D on unit 0, shadow maps dropped) is folded to 1 (`noshadowfold`).
+     The Fresnel LUT is skipped when no used TEV operand reads a lighting colour's alpha
+     (`nofresnelskip`): MH4U's main lit program 223 -> 189 instructions, five fetches -> three.
+     Deck GPU 38.6 -> ~36.9 ms a frame: fewer instructions in the main lit programs barely
+     move it, so what remains is not their instruction count.
    - Lighting: see item 2.
    Render thread: ~28 ms of work a frame on the deck; ~250 geometry-shader glyph draws a
    frame on character select are 56-59% of it (memo key ~19 us, triangle copy ~9 us, repeat
