@@ -161,3 +161,25 @@ Since then:
    path ~2 us merged into runs; the ~18% that change state pay a full setup, ~150 us).
 5. Low priority: persist tier-2 USSE programs to disk (creating them is already microseconds);
    the render thread's unaccounted ~24%.
+
+## Emulation thread (2026-11-13, single screen, 30 fps cap)
+
+With the bottom screen skipped, the deck runs at 90-93% speed, 27-28 fps, and the emulation thread
+is the limit: ~100% busy (the frame limiter never sleeps, `limiter 0 us` on the speed line), the
+render thread ~35-45%, the GPU ~28-30 ms a frame. `emuprof` per second on the deck:
+
+| What | Time | Count |
+| --- | --- | --- |
+| GSP TriggerCmdReqQueue (command lists) | ~310 ms | ~150 |
+| - hardware draws | ~175 ms | ~2,350 (~73 us each) |
+| - of which the vertex copy out of guest memory | ~79 ms | ~25 MB |
+| - glyph (geometry-shader) draws | ~45 ms | ~5,200 |
+| HLE DSP tick | ~66 ms (was ~88) | ~170 |
+
+The vertex copy runs at the CPU's ceiling for uncached memory: `copybench` measured 300-317 MB/s
+with memcpy into the ring, 118 MB/s with 64-byte NEON blocks, 264 MB/s into CDRAM. Moving the copies
+to a worker on core 0 did not help (the same bandwidth, and the other draws got slower), a
+cached ring (`alloc_mapped_cached`, with or without `sceKernelSyncVMDomain` on each range) ends the
+title ~48 s in ("No more processes"). What is left is not copying: reusing the GPU copy of vertex
+data that has not changed since the last frame (most of it is static meshes), which needs guest
+write tracking plus invalidation on the emulator's own writes (file reads, GX DMA).

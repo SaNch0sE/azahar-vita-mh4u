@@ -1189,6 +1189,8 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     if (Common::EmuProf::enabled) {
         Common::EmuProf::Add(ticket->in_ring ? " .vertex copy (ring)" : " .vertex copy (arena)",
                              Common::PipelineStats::NowUs() - copy_t0);
+        // Bytes as "ms" (KiB here): what the copies move per second.
+        Common::EmuProf::Add(" .vertex copy KiB", (layout.total + 1023) / 1024 * 1000);
     }
     if (index_bytes != 0) {
         if (layout.ring) {
