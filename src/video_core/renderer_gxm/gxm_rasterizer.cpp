@@ -1064,6 +1064,7 @@ void RasterizerGxm::SyncAndUploadLUTs() {
         pica.fog.lut_dirty = false;
     }
     if (pica.proctex.table_dirty) {
+        proctex_tables_version++;
         const auto value_lut = [&](const auto& lut, int& lut_offset) {
             for (u32 i = 0; i < lut.size(); i++) {
                 scratch2[i] = {lut[i].ToFloat(), lut[i].DiffToFloat()};
@@ -2013,6 +2014,88 @@ bool RasterizerGxm::AlphaReadsUnit(u32 unit) const {
     return previous;
 }
 
+void RasterizerGxm::SyncProcTexStrip() {
+    // A procedural texture that is a function of one clamped coordinate is baked into a
+    // 256-texel strip the program samples (Usse::ProcTexStripEligible): the colour map, then
+    // the colour LUT, as the software renderer computes them (SwRenderer::ProcTex).
+    proc_strip_bound = -1;
+    const auto& t = regs.texturing;
+    if (!t.main_config.texture3_enable ||
+        !Usse::ProcTexStripEligible(t.proctex.noise_enable, t.proctex.u_shift.Value(),
+                                    t.proctex.v_shift.Value(), t.proctex.separate_alpha,
+                                    t.proctex.color_combiner.Value(), t.proctex_lut.filter.Value())) {
+        return;
+    }
+    using Filter = Pica::TexturingRegs::ProcTexFilter;
+    const bool nearest = t.proctex_lut.filter.Value() == Filter::Nearest;
+    const u32 width = t.proctex_lut.width;
+    const u32 offset = t.proctex_lut_offset.level0;
+    const u64 key = Common::HashCombine(
+        proctex_tables_version,
+        u64{width} | (u64{offset} << 8) | (u64{nearest} << 16) |
+            (u64{static_cast<u32>(t.proctex.color_combiner.Value())} << 20));
+    for (u32 i = 0; i < ProcStripCount; i++) {
+        if (proc_strips[i].key == key && proc_strips[i].mem != nullptr) {
+            proc_strip_bound = static_cast<int>(i);
+            return;
+        }
+    }
+    const u32 slot = proc_strip_next;
+    proc_strip_next = (proc_strip_next + 1) % ProcStripCount;
+    ProcStrip& strip = proc_strips[slot];
+    if (strip.mem == nullptr) {
+        strip.mem = Device().alloc_mapped(Usse::ProcTexStripTexels * 4);
+        if (strip.mem == nullptr) {
+            return;
+        }
+        sceGxmTextureInitLinear(&strip.texture, strip.mem, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR,
+                                Usse::ProcTexStripTexels, 1, 0);
+        sceGxmTextureSetUAddrMode(&strip.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+        sceGxmTextureSetVAddrMode(&strip.texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    } else if (strip.serial != 0 && runtime.CompletedEpoch() < strip.serial) {
+        // A scene still to finish samples it.
+        if (in_scene) {
+            EndScene();
+        }
+        runtime.WaitForEpoch(strip.serial);
+    }
+    const auto& pt = pica.proctex;
+    const auto map = [&](float c) {
+        c *= 128.0f;
+        const int i = std::min(static_cast<int>(c), 127);
+        return pt.color_map_table[i].ToFloat() + (c - i) * pt.color_map_table[i].DiffToFloat();
+    };
+    auto* texels = static_cast<u32*>(strip.mem);
+    for (u32 n = 0; n < Usse::ProcTexStripTexels; n++) {
+        const float lut_coord = map(static_cast<float>(n) / (Usse::ProcTexStripTexels - 1));
+        const float index = static_cast<float>(offset) + lut_coord * static_cast<float>(width - 1);
+        u32 rgba;
+        if (nearest) {
+            const int i = std::clamp(static_cast<int>(std::round(index)), 0, 255);
+            rgba = pt.color_table[i].raw;
+        } else {
+            const int i = std::clamp(static_cast<int>(index), 0, 255);
+            const float frac = index - static_cast<float>(i);
+            const auto value = pt.color_table[i].ToVector().Cast<float>();
+            const auto diff = pt.color_diff_table[i].ToVector().Cast<float>();
+            const auto c = value + diff * frac;
+            const auto byte = [](float v) {
+                return static_cast<u32>(std::clamp(v, 0.0f, 255.0f));
+            };
+            rgba = byte(c.r()) | (byte(c.g()) << 8) | (byte(c.b()) << 16) | (byte(c.a()) << 24);
+        }
+        texels[n] = rgba;
+    }
+    const SceGxmTextureFilter f =
+        nearest ? SCE_GXM_TEXTURE_FILTER_POINT : SCE_GXM_TEXTURE_FILTER_LINEAR;
+    sceGxmTextureSetMinFilter(&strip.texture, f);
+    sceGxmTextureSetMagFilter(&strip.texture, f);
+    strip.key = key;
+    strip.serial = 0;
+    stat_strip_bakes++;
+    proc_strip_bound = static_cast<int>(slot);
+}
+
 void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
     std::array<SceGxmTexture, 3> textures{white_texture, white_texture, white_texture};
@@ -2300,6 +2383,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         skip_feedback_draw = false;
         feedback_alpha_only = false;
         SyncTextureUnits(fb);
+        SyncProcTexStrip();
     }
     if (skip_feedback_draw) {
         stat_skipped++;
@@ -2311,6 +2395,11 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     }
     if (!in_scene) {
         return false;
+    }
+    // After BeginScene, which binds units 6 and 7 white for the scene.
+    if (proc_strip_bound >= 0) {
+        BindFragmentTexture(Usse::ProcTexStripUnit, proc_strips[proc_strip_bound].texture);
+        proc_strips[proc_strip_bound].serial = runtime.CurrentEpoch();
     }
     // The scene now has a serial: the surfaces it will sample are read for as long as its
     // fragment processing runs, so nothing may write them until the GPU passes it.
@@ -3504,8 +3593,9 @@ void RasterizerGxm::EndFrame() {
                         why_not += fmt::format(" {} {},", not_names[r], n);
                     }
                 }
-                LOG_INFO(Render, "repeated software draws (no state sync): {} ({} merged into the run before), draws keeping the fragment setup: {}, feedback draws written as alpha only: {}",
-                         stat_repeat_draws, stat_deferred_merged, stat_begin_repeats, stat_alpha_only_feedback);
+                LOG_INFO(Render, "repeated software draws (no state sync): {} ({} merged into the run before), draws keeping the fragment setup: {}, feedback draws written as alpha only: {}, procedural texture strips baked: {}",
+                         stat_repeat_draws, stat_deferred_merged, stat_begin_repeats, stat_alpha_only_feedback, stat_strip_bakes);
+                stat_strip_bakes = 0;
                 stat_deferred_merged = 0;
                 stat_alpha_only_feedback = 0;
                 stat_repeat_draws = 0;

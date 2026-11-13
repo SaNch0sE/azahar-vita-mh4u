@@ -254,6 +254,21 @@ private:
     /// anything else touches the context (BeginDraw, BeginScene, EndScene, GpuBlit, EndFrame).
     void FlushDeferredDraws();
     std::vector<VideoCore::VertexRingRange> deferred_ranges;
+    /// Baked procedural-texture strips (Usse::ProcTexStripEligible): 256x1 RGBA8, reused in
+    /// turn once the GPU has passed their last scene.
+    struct ProcStrip {
+        void* mem = nullptr;
+        SceGxmTexture texture{};
+        u64 key = ~0ull;
+        u64 serial = 0;
+    };
+    static constexpr u32 ProcStripCount = 32;
+    std::array<ProcStrip, ProcStripCount> proc_strips{};
+    u32 proc_strip_next = 0;
+    int proc_strip_bound = -1; ///< the strip this draw samples, bound after BeginScene
+    u64 proctex_tables_version = 0;
+    u32 stat_strip_bakes = 0;
+    void SyncProcTexStrip();
     struct SceneTimeAgg {
         u32 addr = 0, width = 0, height = 0, scenes = 0, draws = 0;
         u64 us = 0;

@@ -139,10 +139,11 @@ Since then:
    combiner +4, lighting +11, the procedural texture +12, fog +2, alpha test +0.3.
    (`dbgout_*` only replace the output; the whole program still runs, so they do not price
    anything.) A shown 30 fps needs the frame under ~33 ms: ~15 ms of GPU to find.
-   - The procedural texture (18 configurations, no noise, stage 1 `AddSigned`): ~100
-     instructions and four texture fetches in a dependent chain, each waited for at once.
-     Baking it into a texture when its configuration or tables change would replace that
-     with one fetch.
+   - The procedural texture (18 configurations: no noise, no shift, combiner U, linear,
+     clamp to edge) is a function of one clamped coordinate. It is now baked on the CPU into a
+     256-texel strip (`SyncProcTexStrip`, cached by table version and settings, unit 6) that
+     the program samples once: 97 -> 42 instructions, four dependent fetches -> one. Deck GPU
+     time 48.8 -> 38.6 ms a frame; shown fps 20-21 -> 25-26. `noptstrip` turns it off.
    - Lighting: see item 2.
    Render thread: ~28 ms of work a frame on the deck; ~250 geometry-shader glyph draws a
    frame on character select are 56-59% of it (memo key ~19 us, triangle copy ~9 us, repeat

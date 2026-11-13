@@ -39,4 +39,16 @@ void SetDebugOpaque(bool opaque);
 /// ux0:data/azahar/dbg_hashes.txt filter; run with notier2 so no other thread emits).
 void SetDebugSelected(bool selected);
 
+/// Whether a procedural texture reduces to a function of one clamped coordinate (no noise,
+/// no shift, no separate alpha, the U or V combiner, an unmipmapped filter): the program then
+/// samples a 256-texel strip the rasterizer bakes on unit 6 (ProcTexStripUnit) instead of
+/// computing it. The rasterizer asks the same question of the registers. `noptstrip` is off.
+[[nodiscard]] bool ProcTexStripEligible(bool noise, Pica::TexturingRegs::ProcTexShift u_shift,
+                                        Pica::TexturingRegs::ProcTexShift v_shift,
+                                        bool separate_alpha,
+                                        Pica::TexturingRegs::ProcTexCombiner combiner,
+                                        Pica::TexturingRegs::ProcTexFilter filter);
+constexpr uint32_t ProcTexStripUnit = 6;
+constexpr uint32_t ProcTexStripTexels = 256;
+
 } // namespace GxmRenderer::Usse

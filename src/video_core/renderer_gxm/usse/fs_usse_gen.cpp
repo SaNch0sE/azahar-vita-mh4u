@@ -360,6 +360,8 @@ private:
     bool uses_shadow = false;             ///< lighting reads the shadow texture
     bool uses_border = false;             ///< a unit clamps to its border colour
     bool uses_proctex = false;
+    bool proctex_strip = false;           ///< the procedural texture is the baked strip
+    uint32_t sampler_strip = 0;           ///< its sampler's index
     uint32_t sampler_rg = 0;              ///< the rg and rgba LUT samplers' indices
     uint32_t sampler_rgba = 0;
     uint32_t sa_proctex = 0;              ///< lut_offset, diff_lut_offset, color_map_offset,
@@ -479,6 +481,10 @@ void FragmentEmitter::PlanInputs() {
             }
         }
     }
+    proctex_strip = uses_proctex &&
+                    ProcTexStripEligible(config.proctex.noise_enable, config.proctex.u_shift,
+                                         config.proctex.v_shift, config.proctex.separate_alpha,
+                                         config.proctex.color_combiner, config.proctex.lut_filter);
     if (uses_lighting && lighting.bump_mode != LightingRegs::LightingBumpMode::None) {
         const u32 unit = lighting.bump_selector;
         if (unit < 3 && (unit != 0 || tex.texture0_type != TextureType::Disabled)) {
@@ -587,7 +593,10 @@ void FragmentEmitter::PlanInputs() {
     if (lut_used) {
         gxp.samplers.push_back({"texture_buffer_lut_lf", 3});
     }
-    if (uses_proctex) {
+    if (proctex_strip) {
+        sampler_strip = static_cast<uint32_t>(gxp.samplers.size());
+        gxp.samplers.push_back({"texture_proctex_strip", ProcTexStripUnit});
+    } else if (uses_proctex) {
         sampler_rg = static_cast<uint32_t>(gxp.samplers.size());
         gxp.samplers.push_back({"texture_buffer_lut_rg", 4});
         sampler_rgba = static_cast<uint32_t>(gxp.samplers.size());
@@ -653,7 +662,7 @@ void FragmentEmitter::PlanUniforms() {
     if (uses_border) {
         sa_border = AllocateUniform("tex_border_color", 4, 3);
     }
-    if (uses_proctex) {
+    if (uses_proctex && !proctex_strip) {
         sa_proctex = AllocateUniform("proctex_lut_offset", 1, 1);
         AllocateUniform("proctex_diff_lut_offset", 1, 1);
         AllocateUniform("proctex_color_map_offset", 1, 1);
@@ -1000,6 +1009,24 @@ void FragmentEmitter::ProcTexClamp(TexturingRegs::ProcTexClamp mode) {
 void FragmentEmitter::ProcTex() {
     using Filter = TexturingRegs::ProcTexFilter;
     const auto& pt = config.proctex;
+    if (proctex_strip) {
+        // The baked strip: c = clamp(|coordinate|) on the combiner's axis, then the strip at
+        // its texel centres, (c * 255 + 0.5) / 256 - one fetch where the general path below
+        // takes four dependent ones and ~90 instructions.
+        const Reg tc = Reg::Pa(texcoord_pa[std::min<u32>(pt.coord, 2)]);
+        const bool use_v = pt.color_combiner == TexturingRegs::ProcTexCombiner::V;
+        e.Vec(VecOp::Add, {I0, 0x1}, {tc, use_v ? YYYY : XXXX, Mod::Abs}, ConstZero, Pred::None,
+              true);
+        ProcTexClamp(use_v ? pt.v_clamp.Value() : pt.u_clamp.Value());
+        e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX, Mod::Neg}, Lit(LitNeg255), Pred::None, true);
+        e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, ConstHalf, Pred::None, true);
+        e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, Lit(LitInv256), Pred::None, true);
+        e.Vec(VecOp::Add, {I0, 0x2}, ConstHalf, ConstZero, Pred::None, true);
+        e.MoveInternal({Reg::V(TmpLutCoord), 0x3}, {I0, XYZW}, Pred::None, true);
+        e.Sample2D(Reg::V(TmpTex3), Reg::V(TmpLutCoord), SamplerSa(sampler_strip), nullptr, 0);
+        e.Wdf(0);
+        return;
+    }
     const Vec4Loc uv_home{Bank::Virtual, TmpProcUv};
     const Reg uv = uv_home.Pair(0);
     const Reg tc = Reg::Pa(texcoord_pa[std::min<u32>(pt.coord, 2)]);
@@ -2392,6 +2419,19 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
 }
 
 } // Anonymous namespace
+
+bool ProcTexStripEligible(bool noise, TexturingRegs::ProcTexShift u_shift,
+                          TexturingRegs::ProcTexShift v_shift, bool separate_alpha,
+                          TexturingRegs::ProcTexCombiner combiner,
+                          TexturingRegs::ProcTexFilter filter) {
+    static const bool off = GxmFlag("noptstrip");
+    using Shift = TexturingRegs::ProcTexShift;
+    using Combiner = TexturingRegs::ProcTexCombiner;
+    using Filter = TexturingRegs::ProcTexFilter;
+    return !off && !noise && u_shift == Shift::None && v_shift == Shift::None && !separate_alpha &&
+           (combiner == Combiner::U || combiner == Combiner::V) &&
+           (filter == Filter::Linear || filter == Filter::Nearest);
+}
 
 std::vector<uint8_t> EmitFragmentProgram(const FSConfig& config, std::string* refusal, int level) {
     // dbgminfs (diagnostic, with scenetime): every configuration cut to vertex colour - no
