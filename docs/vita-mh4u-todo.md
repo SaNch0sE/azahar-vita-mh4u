@@ -25,10 +25,8 @@ Measurements and history are in `vita-mh4u-performance.md`.
 
 ## After the optimisations
 
-7. **Single-screen play** with the Heavenfall mod
-   (https://github.com/popzol/4u-heavenfall-mod-beta), which moves the bottom-screen menus to
-   the top screen: install it into the port's file layout and make one-screen play the native
-   Vita layout.
+7. Done: **single-screen play** with the Heavenfall mod (`vita-mh4u-single-screen.md`); the
+   port starts in the Single screen layout.
 8. **Then skip the bottom screen entirely** and measure what that saves. MH4U draws the
    bottom screen through the main colour buffer at the start of each frame (viewport
    ~240x320), copies it out with a display transfer, then draws the top screen; the copy

@@ -163,9 +163,28 @@ void Ui::BuildSettings() {
            [](bool value) { Settings::values.enable_audio_stretching = value; });
     choice("Screen layout", "How the two screens are arranged on the display.", true,
            {"Default", "Single screen", "Large screen", "Side by side", "Hybrid"},
-           [] { return static_cast<int>(Settings::values.layout_option.GetValue()); },
+           // The list's order, not the enum's: SeparateWindows sits between SideScreen and
+           // HybridScreen in the enum and is no layout here.
+           [] {
+               using L = Settings::LayoutOption;
+               switch (Settings::values.layout_option.GetValue()) {
+               case L::SingleScreen:
+                   return 1;
+               case L::LargeScreen:
+                   return 2;
+               case L::SideScreen:
+                   return 3;
+               case L::HybridScreen:
+                   return 4;
+               default:
+                   return 0;
+               }
+           },
            [](int value) {
-               Settings::values.layout_option = static_cast<Settings::LayoutOption>(value);
+               using L = Settings::LayoutOption;
+               static constexpr L order[] = {L::Default, L::SingleScreen, L::LargeScreen,
+                                             L::SideScreen, L::HybridScreen};
+               Settings::values.layout_option = order[value < 0 || value > 4 ? 0 : value];
            });
     toggle("Swap screens", "Puts the touch screen where the top screen would be.", true,
            [] { return Settings::values.swap_screen.GetValue(); },

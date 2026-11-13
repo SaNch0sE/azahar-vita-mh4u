@@ -736,6 +736,10 @@ int EmulatorMain() {
     Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
     Settings::values.use_cpu_jit = false;
     Settings::values.disable_right_eye_render = true;
+    // One screen by default: the port is played with the Heavenfall mod's single-screen mode
+    // (the touch screen's menus moved to the top screen), and the top screen then fills the
+    // display. The pause menu's Screen layout still switches back.
+    Settings::values.layout_option = Settings::LayoutOption::SingleScreen;
     VTRACE("EmulatorMain: applets");
     Frontend::RegisterDefaultApplets(system);
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());
