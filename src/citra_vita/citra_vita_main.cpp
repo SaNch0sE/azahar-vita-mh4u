@@ -661,6 +661,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     std::fwrite(&rec, sizeof(rec), 1, perf_file);
                     std::fflush(perf_file);
                 }
+#else
+                // Release: one short line a second, so a console log still tells the speed.
+                sceClibPrintf("[mh4u] speed %d%%  game %d.%d fps  shown %u fps\n", speed,
+                              fps10 / 10, fps10 % 10, presented);
 #endif // VITA_DIAGNOSTICS
        // The stats window reads these on the render thread.
                 {
