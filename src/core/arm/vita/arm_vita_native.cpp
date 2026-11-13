@@ -8,9 +8,13 @@
 #include "core/arm/skyeye_common/armstate.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "core/arm/vita/native_stats.h"
+#include "core/arm/vita/mh4u_vector_hle.h"
 #include "common/emu_prof.h"
 
 #include <algorithm>
+#include <array>
+#include <string>
+#include <vector>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
@@ -376,9 +380,13 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         return false;
     }
 
+    const SceUInt64 prologue_start = Common::EmuProf::enabled ? sceKernelGetProcessTimeWide() : 0;
     // Pages the surface cache wants armed since the last slice: protected now, while the
     // guest is stopped, so the claim and the protection take effect together at this entry.
     memory.WriteTracker().ApplyPending();
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add(" .slice apply pending", sceKernelGetProcessTimeWide() - prologue_start);
+    }
 
     AzaharRunRequest run{};
     run.ctx = context;
@@ -430,9 +438,15 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     }
 
     const SceUInt64 vanrun_start = sceKernelGetProcessTimeWide();
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add(" .slice prologue", vanrun_start - prologue_start);
+    }
     const int ret = azaharRun(&run);
-    NativeStats::vanrun_us.fetch_add(sceKernelGetProcessTimeWide() - vanrun_start,
-                                     std::memory_order_relaxed);
+    const SceUInt64 vanrun_end = sceKernelGetProcessTimeWide();
+    NativeStats::vanrun_us.fetch_add(vanrun_end - vanrun_start, std::memory_order_relaxed);
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add(" .slice guest (azaharRun)", vanrun_end - vanrun_start);
+    }
     if (ret < 0) {
         system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
                          fmt::format("azaharRun failed: {}", ret).c_str());
@@ -476,6 +490,9 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         }
     }
 
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add(" .slice epilogue", sceKernelGetProcessTimeWide() - vanrun_end);
+    }
     switch (run.reason) {
     case AZAHAR_EXIT_SVC: {
         const SceUInt64 svc_start = sceKernelGetProcessTimeWide();
@@ -531,10 +548,17 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         ReportFault(run);
         return false;
     }
-    case AZAHAR_EXIT_UND:
-        if (InterpretShortVectors()) {
+    case AZAHAR_EXIT_UND: {
+        const SceUInt64 und_start = Common::EmuProf::enabled ? sceKernelGetProcessTimeWide() : 0;
+        const bool handled = InterpretShortVectors();
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add(" .slice VFP short vectors (interpreted)",
+                                 sceKernelGetProcessTimeWide() - und_start);
+        }
+        if (handled) {
             return !break_flag && !stop_requested;
         }
+    }
         ReportFault(run);
         return false;
     case AZAHAR_EXIT_PABT:
@@ -602,6 +626,64 @@ bool ARM_VitaNative::InterpretShortVectors() {
     if ((context.fpscr & ShortVectorMask) == 0) {
         return false;
     }
+    // MH4U's audio filter, the one routine that runs in vector mode (mh4u_vector_hle.h): native.
+    // `nosvhle` interprets it as before; `svcheck` runs both and logs any difference.
+    static const bool sv_hle = !GxmRenderer::GxmFlag("nosvhle");
+    static const bool sv_check = GxmRenderer::GxmFlag("svcheck");
+    const bool hle_here = sv_hle && context.r[15] == VitaHle::Mh4uFilterEntry &&
+                          (context.fpscr & ShortVectorMask) == 0x00030000;
+    if (hle_here && !sv_check) {
+        struct Direct {
+            Memory::MemorySystem& m;
+            u32 Read(u32 a) {
+                return m.Read32(a);
+            }
+            void Write(u32 a, u32 v) {
+                m.Write32(a, v);
+            }
+            u8* Span(u32 a, u32 size) {
+                if ((a & 3) != 0 || (a & 0xfff) + size > 0x1000) {
+                    return nullptr;
+                }
+                return m.GetPointer(a);
+            }
+        } direct{memory};
+        VitaHle::RunMh4uFilter({context.r, context.fpregs, &context.cpsr, &context.fpscr}, direct);
+        static u32 hle_calls = 0;
+        if (++hle_calls == 1) {
+            LOG_INFO(Core_ARM11, "MH4U vector routine at {:08X}: native (HLE)", VitaHle::Mh4uFilterEntry);
+        }
+        return true;
+    }
+    // svcheck: the HLE on copies, writes into a shadow; compared after the interpreter below.
+    struct Shadow {
+        Memory::MemorySystem& m;
+        std::vector<std::pair<u32, u32>> writes;
+        u32 Read(u32 a) {
+            for (auto it = writes.rbegin(); it != writes.rend(); ++it) {
+                if (it->first == a) {
+                    return it->second;
+                }
+            }
+            return m.Read32(a);
+        }
+        void Write(u32 a, u32 v) {
+            writes.emplace_back(a, v);
+        }
+        u8* Span(u32, u32) {
+            return nullptr;
+        }
+    } shadow{memory, {}};
+    std::array<u32, 16> chk_r{};
+    std::array<u32, 64> chk_s{};
+    u32 chk_cpsr = 0, chk_fpscr = 0;
+    if (hle_here) {
+        std::copy(std::begin(context.r), std::end(context.r), chk_r.begin());
+        std::copy(std::begin(context.fpregs), std::end(context.fpregs), chk_s.begin());
+        chk_cpsr = context.cpsr;
+        chk_fpscr = context.fpscr;
+        VitaHle::RunMh4uFilter({chk_r.data(), chk_s.data(), &chk_cpsr, &chk_fpscr}, shadow);
+    }
     if (!vector_interpreter) {
         // The interpreter's translation cache is 32 MB by default, enough to push a title that
         // already holds most of the heap (Monster Hunter 4 Ultimate, ~210 MB of 240) into
@@ -642,6 +724,58 @@ bool ARM_VitaNative::InterpretShortVectors() {
     constexpr u32 MaxSteps = 1'000'000;
     constexpr u32 Chunk = 128;
     u32 steps = 0;
+    if (hle_here) {
+        // Check mode: one instruction at a time up to the routine's exit, then compare.
+        while (steps < MaxSteps && interp.GetPC() != VitaHle::Mh4uFilterExit) {
+            bool at_svc = false;
+            steps += interp.RunUntilSvc(1, at_svc);
+            if (at_svc) {
+                break;
+            }
+        }
+        u32 bad = 0;
+        std::string what;
+        for (u32 i = 0; i < 16; i++) {
+            if (interp.GetReg(i) != chk_r[i]) {
+                bad++;
+                what += fmt::format(" r{} {:08X}/{:08X}", i, interp.GetReg(i), chk_r[i]);
+            }
+        }
+        for (u32 i = 0; i < 32; i++) {
+            const u32 iv = interp.GetVFPReg(i);
+            if (iv != chk_s[i]) {
+                bad++;
+                what += fmt::format(" s{} {:08X}/{:08X}", i, iv, chk_s[i]);
+            }
+        }
+        if ((interp.GetCPSR() & 0xf0000000u) != (chk_cpsr & 0xf0000000u)) {
+            bad++;
+            what += fmt::format(" nzcv {:08X}/{:08X}", interp.GetCPSR(), chk_cpsr);
+        }
+        if (interp.GetVFPSystemReg(VFP_FPSCR) != chk_fpscr) {
+            bad++;
+            what += fmt::format(" fpscr {:08X}/{:08X}", interp.GetVFPSystemReg(VFP_FPSCR), chk_fpscr);
+        }
+        u32 bad_mem = 0;
+        for (const auto& [a, v] : shadow.writes) {
+            if (memory.Read32(a) != v && shadow.Read(a) == v) {
+                bad_mem++;
+            }
+        }
+        static u32 checks = 0, failures = 0;
+        checks++;
+        if (bad != 0 || bad_mem != 0) {
+            failures++;
+            if (failures <= 8) {
+                LOG_ERROR(Core_ARM11, "svcheck: HLE differs ({} regs, {} of {} words):{}", bad,
+                          bad_mem, shadow.writes.size(), what.substr(0, 400));
+            }
+        }
+        if ((checks & (checks - 1)) == 0) {
+            LOG_INFO(Core_ARM11, "svcheck: {} calls compared, {} differed ({} steps, {} writes)",
+                     checks, failures, steps, shadow.writes.size());
+        }
+    }
     while (steps < MaxSteps && (interp.GetVFPSystemReg(VFP_FPSCR) & ShortVectorMask) != 0) {
         bool at_svc = false;
         steps += interp.RunUntilSvc(Chunk, at_svc);

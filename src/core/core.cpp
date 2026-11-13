@@ -3,6 +3,8 @@
 // Refer to the license.txt file included.
 
 #include <stdexcept>
+#include "common/emu_prof.h"
+#include "common/pipeline_stats.h"
 #include <utility>
 #include <boost/serialization/array.hpp>
 #include "audio_core/dsp_interface.h"
@@ -135,6 +137,22 @@ private:
     bool was_running;
 };
 
+} // namespace
+
+
+namespace {
+// emuprof: the run loop's own parts (Common::EmuProf).
+struct ProfScope {
+    const char* key;
+    u64 t0;
+    explicit ProfScope(const char* k)
+        : key{k}, t0{Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0} {}
+    ~ProfScope() {
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add(key, Common::PipelineStats::NowUs() - t0);
+        }
+    }
+};
 } // namespace
 
 System::ResultStatus System::RunLoop(bool tight_loop) {
@@ -280,9 +298,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             s64 delay = global_ticks - cpu_core->GetTimer().GetTicks();
             running_core = cpu_core.get();
             kernel->SetRunningCPU(running_core);
-            cpu_core->GetTimer().Advance();
+            { ProfScope p{"loop: timer advance"}; cpu_core->GetTimer().Advance(); }
             cpu_core->PrepareReschedule();
-            kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
+            { ProfScope p{"loop: thread reschedule"}; kernel->GetThreadManager(cpu_core->GetID()).Reschedule(); }
             cpu_core->GetTimer().SetNextSlice(delay);
             if (max_delay < delay) {
                 max_delay = delay;
@@ -309,12 +327,12 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             PrepareReschedule();
         } else {
             if (tight_loop) {
-                current_core_to_execute->Run();
+                { ProfScope p{"loop: core run"}; current_core_to_execute->Run(); }
             } else {
-                current_core_to_execute->Step();
+                { ProfScope p{"loop: core run"}; current_core_to_execute->Step(); }
             }
         }
-        Reschedule();
+        { ProfScope p{"loop: reschedule"}; Reschedule(); }
     } else {
         // Now all cores are at the same global time. So we will run them one after the other
         // with a max slice that is the minimum of all max slices of all cores
@@ -323,9 +341,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         for (const auto& cpu_core : cpu_cores) {
             running_core = cpu_core.get();
             kernel->SetRunningCPU(running_core);
-            cpu_core->GetTimer().Advance();
+            { ProfScope p{"loop: timer advance"}; cpu_core->GetTimer().Advance(); }
             cpu_core->PrepareReschedule();
-            kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
+            { ProfScope p{"loop: thread reschedule"}; kernel->GetThreadManager(cpu_core->GetID()).Reschedule(); }
             max_slice = std::min(max_slice, cpu_core->GetTimer().GetMaxSliceLength());
         }
         for (auto& cpu_core : cpu_cores) {
@@ -345,13 +363,13 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 // In the rare case the break flag is set (due to exception thrown)
                 // there is probably no need to adjust the timer accordingly.
                 if (tight_loop) {
-                    cpu_core->Run();
+                    { ProfScope p{"loop: core run"}; cpu_core->Run(); }
                 } else {
-                    cpu_core->Step();
+                    { ProfScope p{"loop: core run"}; cpu_core->Step(); }
                 }
             }
             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
-            Reschedule();
+            { ProfScope p{"loop: reschedule"}; Reschedule(); }
         }
     }
 
