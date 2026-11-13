@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include "common/vita_data_dir.h"
 #include <cstring>
 
 #include <imgui_vita2d/imgui.h>
@@ -27,7 +28,7 @@ constexpr float ScreenHeight = 544.0f;
 
 /// Where titles are looked for. One directory, no recursion: a console file manager is enough
 /// work to use that a deep tree is worse than a flat one.
-constexpr char GameDirectory[] = "ux0:/data/azahar/roms";
+constexpr char GameDirectory[] = VITA_DATA_DIR "/roms";
 
 bool HasRomExtension(const std::string& name) {
     static constexpr const char* extensions[] = {".3ds", ".3dsx", ".cci", ".cxi",
@@ -367,16 +368,14 @@ Ui::Action Ui::DrawPauseMenu() {
     }
 #ifdef VITA_DIAGNOSTICS
     if (ImGui::Button("Dump frame", button_size)) {
-        // The next presented frame, screens only, to ux0:data/azahar/frame_NN.ppm, and every
-        // surface the cache holds at that frame's end to ux0:data/azahar/dump/.
+        // The next presented frame, screens only, to ux0:data/mh4u/frame_NN.ppm, and every
+        // surface the cache holds at that frame's end to ux0:data/mh4u/dump/.
         GxmPresent::DumpNextFrame();
         GxmRenderer::RequestSurfaceDump();
     }
 #endif
-    if (ImGui::Button("Quit game", button_size)) {
-        action = Action::QuitGame;
-    }
-    if (ImGui::Button("Exit emulator", button_size)) {
+    // One game: leaving it ends the app, back to the LiveArea.
+    if (ImGui::Button("Exit game", button_size)) {
         action = Action::ExitApplication;
     }
 

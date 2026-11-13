@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include "common/vita_data_dir.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -590,7 +591,7 @@ void StartGpuLive() {
         static const char* const candidates[] = {
             "ux0:data/hud_settings.ini",
             "ux0:hud_settings.ini",
-            "ux0:data/azahar/hud_settings.ini",
+            VITA_DATA_DIR "/hud_settings.ini",
             "ur0:data/hud_settings.ini",
             "ux0:temp/hud_settings.ini",
             "host0:hud_settings.ini",
@@ -690,7 +691,7 @@ void LoadRazor() {
                 static_cast<u32>(cap), static_cast<u32>(mod),
                 razor_loaded ? "loaded" : "unavailable");
     if (razor_loaded) {
-        sceRazorGpuCaptureEnableSalvage("ux0:data/azahar/gpucrash.sgx");
+        sceRazorGpuCaptureEnableSalvage(VITA_DATA_DIR "/gpucrash.sgx");
     }
 }
 
@@ -1505,7 +1506,7 @@ void CaptureNextFrame() {
         return;
     }
     static char path[64];
-    std::snprintf(path, sizeof(path), "ux0:data/azahar/capture_%u.sgx", razor_captures++);
+    std::snprintf(path, sizeof(path), VITA_DATA_DIR "/capture_%u.sgx", razor_captures++);
     sceRazorGpuCaptureSetTriggerNextFrame(path);
     LOG_WARNING(Frontend, "Razor: capturing the next frame to {}", path);
 }
@@ -1671,7 +1672,7 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
             const u32 tex_stride =
                 screen.texture != nullptr ? ((tex_width + 7u) & ~7u) * bpp : screen.stride_bytes;
             char path[64];
-            std::snprintf(path, sizeof(path), "ux0:data/azahar/fb_%s.raw", top ? "top" : "bot");
+            std::snprintf(path, sizeof(path), VITA_DATA_DIR "/fb_%s.raw", top ? "top" : "bot");
             if (FILE* f = std::fopen(path, "wb")) {
                 const u32 header[4] = {tex_width, tex_height, tex_stride, bpp};
                 std::fwrite(header, sizeof(header), 1, f);
@@ -1680,7 +1681,7 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
             }
             // And the guest's own memory for the same screen, whatever the quad samples.
             if (screen.pixels != nullptr) {
-                std::snprintf(path, sizeof(path), "ux0:data/azahar/fb_%s_mem.raw",
+                std::snprintf(path, sizeof(path), VITA_DATA_DIR "/fb_%s_mem.raw",
                               top ? "top" : "bot");
                 if (FILE* f = std::fopen(path, "wb")) {
                     const u32 header[4] = {240, screen.height, screen.stride_bytes, bpp};
@@ -1766,7 +1767,7 @@ void EndFrame() {
     g.in_scene = false;
 
     // Bring-up switch: every five seconds, the frame just drawn as a PPM under
-    // ux0:data/azahar, so what the GPU produced can be looked at off the console. Costs a
+    // ux0:data/mh4u, so what the GPU produced can be looked at off the console. Costs a
     // full GPU wait and a 1.5 MB write each time, which is why it is a switch.
     static const bool dump_frames = GxmRenderer::GxmFlag("dumpframe");
     static u64 last_dump_us = 0;
@@ -1776,7 +1777,7 @@ void EndFrame() {
         dump_requested = false;
         last_dump_us = now_us;
         char path[64];
-        std::snprintf(path, sizeof(path), "ux0:data/azahar/frame_%02u.ppm", dump_index++ % 20);
+        std::snprintf(path, sizeof(path), VITA_DATA_DIR "/frame_%02u.ppm", dump_index++ % 20);
         WriteDisplayPpm(path);
         LOG_INFO(Frontend, "wrote {}", path);
     }

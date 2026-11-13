@@ -84,7 +84,7 @@ public:
     /// Once per present, from the renderer (render thread): ends the frame's scene, waits
     /// for the GPU, recycles per-frame memory, ticks the cache.
     void EndFrame();
-    /// Every cached surface to ux0:data/azahar/dump (RequestSurfaceDump); GPU idle.
+    /// Every cached surface to ux0:data/mh4u/dump (RequestSurfaceDump); GPU idle.
     void DumpSurfaces();
     /// Whether the current TEV configuration (or fragment lighting) reads texture `unit`.
     [[nodiscard]] bool TextureUnitRead(u32 unit) const;

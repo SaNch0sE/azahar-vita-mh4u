@@ -80,6 +80,8 @@ public:
 
     /// Left stick, each axis in [-1, 1] with y positive upwards.
     [[nodiscard]] std::pair<float, float> LeftStick() const;
+    /// The right stick, for the guest's C-stick (Circle Pad Pro / New 3DS).
+    [[nodiscard]] std::pair<float, float> RightStick() const;
 
     /// Stops feeding the guest its pad state, for while a menu owns the input.
     void SetInputToGuest(bool enabled) {
@@ -100,6 +102,7 @@ private:
 
     std::atomic<u32> buttons_held{};
     std::atomic<s32> stick_x{}, stick_y{};
+    std::atomic<s32> rstick_x{128}, rstick_y{128};
     std::atomic<bool> input_to_guest{true};
     std::atomic<bool> quit_requested{};
     bool touch_down{};

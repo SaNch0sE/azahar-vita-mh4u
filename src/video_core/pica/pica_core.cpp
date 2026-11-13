@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <cstdlib>
+#include "common/vita_data_dir.h"
 #include <cstring>
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
@@ -1616,9 +1617,9 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
     // data, the pipeline/VS/GS/rasterizer registers, the default attributes, both shaders'
     // uniforms, programs and swizzles; a hit replays the recorded triangles. Only draws that
     // start and end with the primitive assembler empty, so no partial strip crosses a draw.
-    // Two generations, capped: the heap has little room. ux0:data/azahar/nogsmemo turns it off.
+    // Two generations, capped: the heap has little room. ux0:data/mh4u/nogsmemo turns it off.
     static const bool gs_memo = [] {
-        std::FILE* f = std::fopen("ux0:data/azahar/nogsmemo", "rb");
+        std::FILE* f = std::fopen(VITA_DATA_DIR "/nogsmemo", "rb");
         if (f != nullptr) {
             std::fclose(f);
         }

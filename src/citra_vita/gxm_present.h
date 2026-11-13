@@ -75,7 +75,7 @@ void DrawTexture(const SceGxmTexture* texture, float x, float y, float w, float 
 /// until the first second is in.
 [[nodiscard]] const std::string& GpuLiveText();
 
-/// The next EndFrame writes its picture to ux0:data/azahar/frame_NN.ppm (the pause menu's
+/// The next EndFrame writes its picture to ux0:data/mh4u/frame_NN.ppm (the pause menu's
 /// "Dump frame"; the dumpframe flag does the same every five seconds). DumpPending is true
 /// until that frame is written, so the caller can leave the overlay out of it.
 void DumpNextFrame();

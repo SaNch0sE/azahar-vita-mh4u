@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include "common/vita_data_dir.h"
 #include <map>
 #include <bit>
 #include <cstring>
@@ -1471,7 +1472,7 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             // dbg_hashes.txt: the debug switches act only on the listed fs_<hash> programs.
             static const std::set<u64> debug_hashes = [] {
                 std::set<u64> hashes;
-                if (std::FILE* f = std::fopen("ux0:data/azahar/dbg_hashes.txt", "r")) {
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/dbg_hashes.txt", "r")) {
                     unsigned long long h;
                     while (std::fscanf(f, " us_%llx", &h) == 1 || std::fscanf(f, " %llx", &h) == 1) {
                         hashes.insert(static_cast<u64>(h));
@@ -1495,8 +1496,8 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         stat_usse_emitted++;
         static const bool dump = GxmFlag("usse_dump");
         if (dump) {
-            sceIoMkdir("ux0:data/azahar/usse", 0777);
-            const std::string stem = fmt::format("ux0:data/azahar/usse/us_{:016x}", fs_hash);
+            sceIoMkdir(VITA_DATA_DIR "/usse", 0777);
+            const std::string stem = fmt::format(VITA_DATA_DIR "/usse/us_{:016x}", fs_hash);
             if (FILE* f = std::fopen((stem + ".gxp").c_str(), "wb")) {
                 std::fwrite(program.data(), 1, program.size(), f);
                 std::fclose(f);
@@ -1596,7 +1597,7 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
     }
     // logblend: every distinct pairing of fragment program and PICA blend state, once, to
-    // ux0:data/azahar/blend_log.txt - which draws use the constant-colour factors GXM lacks.
+    // ux0:data/mh4u/blend_log.txt - which draws use the constant-colour factors GXM lacks.
     static const bool log_blend = GxmFlag("logblend");
     if (log_blend) {
         static std::set<std::tuple<u64, u64, u32, u32, u32>> seen;
@@ -1615,7 +1616,7 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             s0_h = s0.height;
         }
         if (seen.size() < 4096 && seen.insert({fs_hash, state, tex0_addr, color_addr, s0_addr ^ (s0_w << 20)}).second) {
-            if (std::FILE* f = std::fopen("ux0:data/azahar/blend_log.txt", "a")) {
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/blend_log.txt", "a")) {
                 std::fprintf(f, "us_%016llx ab %u lit %u eq %u/%u src %u/%u dst %u/%u const %08x mask %x fmt %u tex %u/%u/%u t0 %08x cb %08x s0 %08x %ux%u\n",
                              static_cast<unsigned long long>(fs_hash),
                              static_cast<u32>(om.alphablend_enable.Value()),
@@ -2278,7 +2279,7 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             runtime.FlushPendingClear(surface);
         }
         // dumpdraws: in the logtex window (dump_now with dumpfile), each sampled surface that
-        // is a render target, as this draw reads it, to ux0:data/azahar/dump/dNNN_*, listed in
+        // is a render target, as this draw reads it, to ux0:data/mh4u/dump/dNNN_*, listed in
         // d_index.txt with the draw's target - render-to-texture chains step by step.
         static const bool dump_draws = GxmFlag("dumpdraws");
         if (dump_draws && logtex_frames_left > 0 &&
@@ -2288,11 +2289,11 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
                 const u32 n = dumped++;
                 const u32 target = regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
                 const std::string stem =
-                    fmt::format("ux0:data/azahar/dump/d{:03}_u{}_t{:08x}_s{:08x}_{}x{}_cb{:08x}", n,
+                    fmt::format(VITA_DATA_DIR "/dump/d{:03}_u{}_t{:08x}_s{:08x}_{}x{}_cb{:08x}", n,
                                 unit, info.physical_address, surface.addr, surface.width,
                                 surface.height, target);
-                sceIoMkdir("ux0:data/azahar/dump", 0777);
-                if (std::FILE* f = std::fopen("ux0:data/azahar/dump/d_index.txt", "a")) {
+                sceIoMkdir(VITA_DATA_DIR "/dump", 0777);
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/dump/d_index.txt", "a")) {
                     std::fprintf(f, "%03u draw %u unit %u tex %08x %ux%u surface %08x %ux%u cb %08x\n",
                                  n, stat_draws, unit, info.physical_address, info.width,
                                  info.height, surface.addr, surface.width, surface.height, target);
@@ -2790,8 +2791,8 @@ void RasterizerGxm::InstallTier2() {
         }
         stat_tier2++;
         if (dump) {
-            sceIoMkdir("ux0:data/azahar/usse", 0777);
-            const std::string path = fmt::format("ux0:data/azahar/usse/{}.gxp", name);
+            sceIoMkdir(VITA_DATA_DIR "/usse", 0777);
+            const std::string path = fmt::format(VITA_DATA_DIR "/usse/{}.gxp", name);
             if (FILE* f = std::fopen(path.c_str(), "wb")) {
                 std::fwrite(result.program.data(), 1, result.program.size(), f);
                 std::fclose(f);
@@ -2832,11 +2833,11 @@ Shader* RasterizerGxm::VertexShaderFor(u16 default_regs,
         }
         return it->second;
     }
-    // Bisect list: ux0:data/azahar/hwvs_refuse.txt names vertex keys (hex, one per line)
+    // Bisect list: ux0:data/mh4u/hwvs_refuse.txt names vertex keys (hex, one per line)
     // whose programs go to the software shader, so a wrong picture can be pinned on one.
     static const std::vector<u64> refuse_keys = [] {
         std::vector<u64> keys;
-        if (FILE* f = std::fopen("ux0:data/azahar/hwvs_refuse.txt", "rb")) {
+        if (FILE* f = std::fopen(VITA_DATA_DIR "/hwvs_refuse.txt", "rb")) {
             char line[64];
             while (std::fgets(line, sizeof(line), f) != nullptr) {
                 keys.push_back(std::strtoull(line, nullptr, 16));
@@ -2864,8 +2865,8 @@ Shader* RasterizerGxm::VertexShaderFor(u16 default_regs,
             stat_vs_emitted++;
             static const bool dump = GxmFlag("usse_dump");
             if (dump) {
-                sceIoMkdir("ux0:data/azahar/usse", 0777);
-                const std::string stem = fmt::format("ux0:data/azahar/usse/uv_{:016x}", key);
+                sceIoMkdir(VITA_DATA_DIR "/usse", 0777);
+                const std::string stem = fmt::format(VITA_DATA_DIR "/usse/uv_{:016x}", key);
                 if (FILE* f = std::fopen((stem + ".gxp").c_str(), "wb")) {
                     std::fwrite(program.data(), 1, program.size(), f);
                     std::fclose(f);
@@ -3196,8 +3197,8 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
         }
         {
             // vsdump: the first draws of the vertex program whose name contains the word in
-            // ux0:data/azahar/vsdump.txt, with the default uniform buffer and stream 0 as
-            // the GPU sees them, to ux0:data/azahar/vsdump_NN.bin (header: vertex count,
+            // ux0:data/mh4u/vsdump.txt, with the default uniform buffer and stream 0 as
+            // the GPU sees them, to ux0:data/mh4u/vsdump_NN.bin (header: vertex count,
             // stride, stream bytes, uniform bytes; then the two blocks), so the program's
             // translation can be run off the console on the same data.
             static const bool vsdump = GxmFlag("vsdump");
@@ -3208,7 +3209,7 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
                 static const std::pair<std::string, u32> key_and_frame = [] {
                     std::string k;
                     u32 from = 0;
-                    if (FILE* f = std::fopen("ux0:data/azahar/vsdump.txt", "rb")) {
+                    if (FILE* f = std::fopen(VITA_DATA_DIR "/vsdump.txt", "rb")) {
                         char buf[64]{};
                         std::fread(buf, 1, sizeof(buf) - 1, f);
                         std::fclose(f);
@@ -3225,7 +3226,7 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
                     const u32 ubytes =
                         sceGxmProgramGetDefaultUniformBufferSize(layout.shader->Program());
                     char path[64];
-                    std::snprintf(path, sizeof(path), "ux0:data/azahar/vsdump_%02u.bin",
+                    std::snprintf(path, sizeof(path), VITA_DATA_DIR "/vsdump_%02u.bin",
                                   dumped++);
                     if (FILE* f = std::fopen(path, "wb")) {
                         const u32 header[4] = {payload.num_vertices, layout.strides[0],
@@ -3556,14 +3557,14 @@ void RasterizerGxm::EndFrame() {
     if (dump_surfaces_once && frame_index == 300) {
         RequestSurfaceDump();
     }
-    // dumpfile: the same dump whenever ux0:data/azahar/dump_now appears, looked for once every
+    // dumpfile: the same dump whenever ux0:data/mh4u/dump_now appears, looked for once every
     // 60 frames, so a running title can be dumped from the PC without the pause menu (and
     // without the resume after it, which can hang the console).
     static const bool dump_on_file = GxmFlag("dumpfile");
     if (dump_on_file && frame_index % 60 == 0) {
-        if (std::FILE* f = std::fopen("ux0:data/azahar/dump_now", "rb")) {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/dump_now", "rb")) {
             std::fclose(f);
-            std::remove("ux0:data/azahar/dump_now");
+            std::remove(VITA_DATA_DIR "/dump_now");
             LOG_INFO(Render, "dump_now found: dumping every surface after frame {}",
                      frame_index);
             RequestSurfaceDump();
@@ -3576,13 +3577,13 @@ void RasterizerGxm::EndFrame() {
     // flushlist: copy these regions back to guest memory at every frame end. Native execution
     // never tells the cache when the guest CPU reads memory a surface was rendered into, so a
     // title that reads back GPU output (an 8x8 brightness target for exposure, say) reads
-    // whatever memory last held. Pairs of hex address and size in ux0:data/azahar/flush.txt.
+    // whatever memory last held. Pairs of hex address and size in ux0:data/mh4u/flush.txt.
     static const std::vector<std::pair<u32, u32>> flush_list = [] {
         std::vector<std::pair<u32, u32>> list;
         if (!GxmFlag("flushlist")) {
             return list;
         }
-        if (std::FILE* f = std::fopen("ux0:data/azahar/flush.txt", "rb")) {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/flush.txt", "rb")) {
             unsigned addr = 0, size = 0;
             while (std::fscanf(f, "%x %x", &addr, &size) == 2) {
                 list.emplace_back(addr, size);
@@ -3921,9 +3922,9 @@ void RasterizerGxm::DumpSurfaces() {
     // transfer unit, which is the only way a rendered surface's pixels reach the CPU under
     // Vita3K), as a PPM of its colour or depth plus a PGM of its alpha or stencil where the
     // format has one. Rows are stored bottom-up; the files are written top-down.
-    sceIoMkdir("ux0:data/azahar/dump", 0777);
+    sceIoMkdir(VITA_DATA_DIR "/dump", 0777);
     const u32 frame = surface_dump_index++ % 20;
-    const std::string index_path = fmt::format("ux0:data/azahar/dump/f{:02}_index.txt", frame);
+    const std::string index_path = fmt::format(VITA_DATA_DIR "/dump/f{:02}_index.txt", frame);
     FILE* index = std::fopen(index_path.c_str(), "wb");
     u32 count = 0;
     res_cache.ForEachSurface([&](VideoCore::SurfaceId, Surface& surface) {
@@ -3939,7 +3940,7 @@ void RasterizerGxm::DumpSurfaces() {
                                                     "fill", "invalid"};
         const char* type = TypeNames[std::min<u32>(static_cast<u32>(surface.type), 5)];
         const std::string stem =
-            fmt::format("ux0:data/azahar/dump/f{:02}_{:03}_{}_{:08x}_{}x{}_{}", frame, n, type,
+            fmt::format(VITA_DATA_DIR "/dump/f{:02}_{:03}_{}_{:08x}_{}x{}_{}", frame, n, type,
                         surface.addr, w, h, VideoCore::PixelFormatAsString(pf));
         if (index != nullptr) {
             const std::string line = fmt::format(
@@ -3955,7 +3956,7 @@ void RasterizerGxm::DumpSurfaces() {
     if (index != nullptr) {
         std::fclose(index);
     }
-    LOG_INFO(Render, "surface dump f{:02}: {} surfaces under ux0:data/azahar/dump", frame, count);
+    LOG_INFO(Render, "surface dump f{:02}: {} surfaces under ux0:data/mh4u/dump", frame, count);
 }
 
 

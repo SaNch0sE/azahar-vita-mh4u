@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <cstdio>
+#include "common/vita_data_dir.h"
 #include "common/arch.h"
 #include "video_core/shader/shader_interpreter.h"
 #if CITRA_HAS_SHADER_JIT
@@ -15,8 +16,8 @@ namespace Pica {
 std::unique_ptr<ShaderEngine> CreateEngine(bool use_jit) {
 #if CITRA_HAS_SHADER_JIT
 #ifdef __vita__
-    // ux0:data/azahar/shader_interpreter: the interpreter, to tell a JIT fault from others.
-    if (std::FILE* f = std::fopen("ux0:data/azahar/shader_interpreter", "rb")) {
+    // ux0:data/mh4u/shader_interpreter: the interpreter, to tell a JIT fault from others.
+    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/shader_interpreter", "rb")) {
         std::fclose(f);
         use_jit = false;
     }

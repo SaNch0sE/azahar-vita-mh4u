@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interpret ux0:data/azahar/perf.bin (the Vita build's per-second performance blob).
+"""Interpret ux0:data/mh4u/perf.bin (the Vita build's per-second performance blob).
 
 Usage: read_perf.py perf.bin [--summary]
 

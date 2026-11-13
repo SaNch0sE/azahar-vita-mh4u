@@ -11,11 +11,11 @@ namespace VitaFrontend::GpuProf {
  * psp2_gpuprof.skprx under *KERNEL). Call once before sceGxmInitialize.
  *
  * From then on every wrapped GXM call is counted - presents, and scenes ended since the last
- * present - which costs nothing on the GPU. When ux0:data/azahar/gpuprof_now appears, the next
+ * present - which costs nothing on the GPU. When ux0:data/mh4u/gpuprof_now appears, the next
  * point with no scene open becomes the capture's start: the identity model is seeded with
  * those exact counts (it may not be guessed for a running renderer), calls are recorded and a
  * sampler thread reads the GPU's diagnostic counters. After CaptureSeconds, recording stops
- * and ux0:data/azahar/gpuprof.csv is written, for the repository's tools/analyze.py.
+ * and ux0:data/mh4u/gpuprof.csv is written, for the repository's tools/analyze.py.
  */
 void Install();
 

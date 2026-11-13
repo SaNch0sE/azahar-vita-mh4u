@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include "common/vita_data_dir.h"
 #include <chrono>
 #include <optional>
 #include <cstdlib>
@@ -68,11 +69,28 @@ std::pair<float, float> EmuWindowVita::LeftStick() const {
             -axis(stick_y.load(std::memory_order_relaxed))};
 }
 
+std::pair<float, float> EmuWindowVita::RightStick() const {
+    // The pad reports each axis as a byte around 128. The dead zone is wide because the sticks on
+    // this console rest off-centre often enough that a narrow one walks the character.
+    constexpr float dead_zone = 0.2f;
+    const auto axis = [](s32 raw) {
+        const float value = (static_cast<float>(raw) - 128.0f) / 128.0f;
+        if (std::abs(value) < dead_zone) {
+            return 0.0f;
+        }
+        const float scaled = (std::abs(value) - dead_zone) / (1.0f - dead_zone);
+        return value < 0.0f ? -scaled : scaled;
+    };
+    // y is reported downwards; the guest's circle pad is upwards.
+    return {axis(rstick_x.load(std::memory_order_relaxed)),
+            -axis(rstick_y.load(std::memory_order_relaxed))};
+}
+
 namespace {
 
 /**
  * Scripted pad input, for driving a title where nobody holds the console (Vita3K under
- * Xvfb, an unattended console): ux0:data/azahar/autoinput.txt, one press per line,
+ * Xvfb, an unattended console): ux0:data/mh4u/autoinput.txt, one press per line,
  * `<seconds since the title started> <button> [hold seconds]` with the Vita's button
  * names (cross circle square triangle start select up down left right l r), or
  * `<seconds> stick <x> <y> [hold]` with x and y in -1..1, or `<seconds> touch <x> <y>
@@ -94,7 +112,7 @@ public:
     void Load() {
 #ifdef VITA_DIAGNOSTICS
         loaded = true;
-        FILE* f = std::fopen("ux0:data/azahar/autoinput.txt", "rb");
+        FILE* f = std::fopen(VITA_DATA_DIR "/autoinput.txt", "rb");
         if (f == nullptr) {
             return;
         }
@@ -233,6 +251,8 @@ void EmuWindowVita::PollEvents() {
         buttons_held.store(pad.buttons, std::memory_order_relaxed);
         stick_x.store(pad.lx, std::memory_order_relaxed);
         stick_y.store(pad.ly, std::memory_order_relaxed);
+        rstick_x.store(pad.rx, std::memory_order_relaxed);
+        rstick_y.store(pad.ry, std::memory_order_relaxed);
     }
     UpdateTouch();
 }

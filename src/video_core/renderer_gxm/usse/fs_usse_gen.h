@@ -36,7 +36,7 @@ void SetDebugUnlit(bool unlit);
 /// dbgopaque: the targeted programs output alpha 1, everything else unchanged.
 void SetDebugOpaque(bool opaque);
 /// Whether the next emitted program is one the debug switches act on (the rasterizer's
-/// ux0:data/azahar/dbg_hashes.txt filter; run with notier2 so no other thread emits).
+/// ux0:data/mh4u/dbg_hashes.txt filter; run with notier2 so no other thread emits).
 void SetDebugSelected(bool selected);
 
 /// Whether a procedural texture reduces to a function of one clamped coordinate (no noise,

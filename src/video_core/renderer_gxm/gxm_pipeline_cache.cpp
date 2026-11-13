@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <cstdio>
+#include "common/vita_data_dir.h"
 #include <cstring>
 #include <fmt/format.h>
 #if defined(__vita__)
@@ -163,7 +164,7 @@ bool Pipeline::Build() {
     if (log_programs) {
         // A file, not the console log: with usse_dump on, the console log overruns and
         // drops lines by the hundred thousand.
-        if (std::FILE* f = std::fopen("ux0:data/azahar/fp_map.txt", "a")) {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/fp_map.txt", "a")) {
             std::fprintf(f, "%p %s blend %d format %#x\n",
                          static_cast<const void*>(fragment_program), info.fragment->name.c_str(),
                          info.blend_enabled ? 1 : 0, static_cast<unsigned>(info.output_format));

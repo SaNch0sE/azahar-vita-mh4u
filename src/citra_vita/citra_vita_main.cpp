@@ -3,13 +3,19 @@
 // Refer to the license.txt file included.
 
 #include <cstddef>
+#include "common/vita_data_dir.h"
 #include <exception>
 #include <memory>
 #include <string>
 #include <vector>
 #include <pthread.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <psp2/appmgr.h>
+#include <psp2/io/dirent.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/ctrl.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
@@ -38,7 +44,7 @@
 #include <psp2/io/stat.h>
 
 namespace {
-// One record per second, appended to ux0:data/azahar/perf.bin; read the file back with
+// One record per second, appended to ux0:data/mh4u/perf.bin; read the file back with
 // src/citra_vita/tools/read_perf.py. The console keeps only the speed line - everything
 // else lives here, where a run's whole history survives instead of scrolling away.
 #pragma pack(push, 1)
@@ -85,8 +91,8 @@ static_assert(sizeof(PerfFileHeader) == 12);
 static_assert(sizeof(PerfRecord) == 384);
 
 FILE* OpenPerfFile() {
-    sceIoMkdir("ux0:data/azahar", 0777);
-    FILE* f = std::fopen("ux0:data/azahar/perf.bin", "wb");
+    sceIoMkdir(VITA_DATA_DIR "", 0777);
+    FILE* f = std::fopen(VITA_DATA_DIR "/perf.bin", "wb");
     if (f != nullptr) {
         const PerfFileHeader hdr{{'A', 'Z', 'P', 'F'}, 5u, sizeof(PerfRecord)};
         std::fwrite(&hdr, sizeof(hdr), 1, f);
@@ -201,12 +207,27 @@ inline void VitaAllocTraceDump() {}
 inline void VitaAllocTraceWatchThread() {}
 #endif
 
-constexpr char UserDirectory[] = "ux0:/data/azahar/";
+constexpr char UserDirectory[] = VITA_DATA_DIR "/";
 
 void SetupPaths() {
     // Must happen before anything asks for a path: the first request bootstraps the whole table
     // from whatever the platform default is, and on this console there is no such thing.
     FileUtil::SetUserPath(UserDirectory);
+    // The game's own data - the update, saves and extdata (sdmc), the system files (nand,
+    // sysdata) - is used from Azahar's folder in place unless the port has its own copy. The
+    // port's files (flags, logs, cheats, mods) always live in ux0:data/mh4u.
+    const std::pair<FileUtil::UserPath, const char*> shared[] = {
+        {FileUtil::UserPath::SDMCDir, "sdmc"},
+        {FileUtil::UserPath::NANDDir, "nand"},
+        {FileUtil::UserPath::SysDataDir, "sysdata"},
+    };
+    for (const auto& [path, name] : shared) {
+        const std::string own = std::string(VITA_DATA_DIR "/") + name;
+        const std::string azahar = std::string(VITA_AZAHAR_DIR "/") + name;
+        if (!FileUtil::IsDirectory(own) && FileUtil::IsDirectory(azahar)) {
+            FileUtil::UpdateUserPath(path, azahar);
+        }
+    }
 }
 
 /// Names the exception behind an abort. std::terminate goes to newlib's abort(), which raises
@@ -304,6 +325,45 @@ void ShutdownSystem(Core::System& system) {
 
 /// Runs one title to completion. Returns false when the user wants the application to close
 /// rather than to return to the game list.
+
+// ---- The port's own data folder (ux0:data/mh4u) and how it is first filled -------------------
+
+/// The game image: the first .3ds/.cci/.cxi/.app in ux0:data/mh4u/roms, else one in Azahar's
+/// roms folder whose name says Monster Hunter 4.
+std::string FindRom() {
+    const auto search = [](const char* folder, bool only_mh4u) {
+        std::string found;
+        const SceUID dir = sceIoDopen(folder);
+        if (dir < 0) {
+            return found;
+        }
+        SceIoDirent entry{};
+        while (found.empty() && sceIoDread(dir, &entry) > 0) {
+            std::string lower = entry.d_name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (SCE_S_ISDIR(entry.d_stat.st_mode) ||
+                (only_mh4u && lower.find("monster hunter 4") == std::string::npos)) {
+                continue;
+            }
+            for (const char* ext : {".3ds", ".cci", ".cxi", ".app"}) {
+                const std::size_t n = std::strlen(ext);
+                if (lower.size() > n && lower.compare(lower.size() - n, n, ext) == 0) {
+                    found = std::string(folder) + "/" + entry.d_name;
+                    break;
+                }
+            }
+        }
+        sceIoDclose(dir);
+        return found;
+    };
+    std::string rom = search(VITA_DATA_DIR "/roms", false);
+    if (rom.empty()) {
+        rom = search(VITA_AZAHAR_DIR "/roms", true);
+    }
+    return rom;
+}
+
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
               const std::string& path) {
     VTRACE("RunTitle: %s", path.c_str());
@@ -343,12 +403,12 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     system.GPU().SetRenderThreadLockstep(GxmRenderer::GxmFlag("lockstep"));
 
 #ifdef VITA_DIAGNOSTICS
-    // ux0:data/azahar/autoload.txt names a savestate slot to restore before the render thread
+    // ux0:data/mh4u/autoload.txt names a savestate slot to restore before the render thread
     // starts, the one moment a load is accepted (saves and loads are refused once the thread
     // runs). The signal executes at a quiescent point inside RunLoop, so it gets a few slices.
     // States are the same boost archive on every 32-bit build, so a state the pi5 harness
     // saved in a fight, a results screen or a level lands here without the menus.
-    if (FILE* f = std::fopen("ux0:data/azahar/autoload.txt", "rb")) {
+    if (FILE* f = std::fopen(VITA_DATA_DIR "/autoload.txt", "rb")) {
         char buf[16]{};
         std::fread(buf, 1, sizeof(buf) - 1, f);
         std::fclose(f);
@@ -702,12 +762,12 @@ int EmulatorMain() {
         SceCommonDialogConfigParam dialog_config_param{};
         sceCommonDialogSetConfigParam(&dialog_config_param);
 
-        // ux0:data/azahar/cpu_interpreter: run without the kernel modules (the interpreter
+        // ux0:data/mh4u/cpu_interpreter: run without the kernel modules (the interpreter
         // takes the guest, as ARM_VitaNative::CreateMap does for the same file) - the only way
         // to run under the Vita3K emulator, which cannot load a kernel plugin.
         SceIoStat interpreter_stat{};
         const bool interpreter_only =
-            sceIoGetstat("ux0:data/azahar/cpu_interpreter", &interpreter_stat) >= 0;
+            sceIoGetstat(VITA_DATA_DIR "/cpu_interpreter", &interpreter_stat) >= 0;
         if (interpreter_only) {
             LOG_WARNING(Frontend, "cpu_interpreter present: skipping the kernel module checks");
         } else if (!module_installed("azaharnative")) {
@@ -794,26 +854,27 @@ int EmulatorMain() {
 
     VitaAllocTraceDump();
 
-    bool running = true;
+    // A one-game port: no title list. The game is launched at once and quitting it ends the app.
     if (const std::string launch = LaunchParameter(); !launch.empty()) {
         LOG_INFO(Frontend, "launch parameter names {}", launch);
-        running = RunTitle(system, window, ui, launch);
-    }
-    while (running && !window.IsQuitRequested()) {
-        window.PollEvents();
-        const auto action = ui.Update();
-        window.Present(&ui);
-
-        switch (action) {
-        case VitaFrontend::Ui::Action::LaunchGame: {
-            running = RunTitle(system, window, ui, ui.SelectedGamePath());
-            break;
-        }
-        case VitaFrontend::Ui::Action::ExitApplication:
-            running = false;
-            break;
-        default:
-            break;
+        RunTitle(system, window, ui, launch);
+    } else {
+        sceIoMkdir(VITA_DATA_DIR "/roms", 0777);
+        const std::string rom = FindRom();
+        if (rom.empty()) {
+            ui.SetStatusMessage("Monster Hunter 4 Ultimate was not found.\n\nPut your own decrypted "
+                                "game (.3ds, .cci or .cxi) in " VITA_DATA_DIR "/roms/ or "
+                                VITA_AZAHAR_DIR "/roms/ and start again.\n\nPress START to exit.");
+            while (!window.IsQuitRequested()) {
+                window.PollEvents();
+                ui.Update();
+                window.Present(&ui);
+                if ((window.ButtonsHeld() & SCE_CTRL_START) != 0) {
+                    break;
+                }
+            }
+        } else {
+            RunTitle(system, window, ui, rom);
         }
     }
 

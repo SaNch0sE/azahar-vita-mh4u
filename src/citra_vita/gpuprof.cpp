@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "citra_vita/gpuprof.h"
+#include "common/vita_data_dir.h"
 
 #include <atomic>
 #include <cstdio>
@@ -25,8 +26,8 @@ extern "C" {
 namespace VitaFrontend::GpuProf {
 namespace {
 
-constexpr const char* TriggerPath = "ux0:data/azahar/gpuprof_now";
-constexpr const char* OutputPath = "ux0:data/azahar/gpuprof.csv";
+constexpr const char* TriggerPath = VITA_DATA_DIR "/gpuprof_now";
+constexpr const char* OutputPath = VITA_DATA_DIR "/gpuprof.csv";
 constexpr unsigned CaptureSeconds = 2;
 // Static rather than heap: the newlib heap is what the emulator runs out of first, and this
 // is ~11 MB the executable's own data segment takes from the free user memory instead.

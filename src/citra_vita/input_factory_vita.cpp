@@ -47,18 +47,23 @@ public:
 /// The circle pad, from the left stick.
 class VitaAnalog final : public Input::AnalogDevice {
 public:
+    explicit VitaAnalog(bool right_) : right{right_} {}
+
     std::tuple<float, float> GetStatus() const override {
         if (g_window == nullptr) {
             return {0.0f, 0.0f};
         }
-        return g_window->LeftStick();
+        return right ? g_window->RightStick() : g_window->LeftStick();
     }
+
+private:
+    bool right;
 };
 
 class VitaAnalogFactory final : public Input::Factory<Input::AnalogDevice> {
 public:
-    std::unique_ptr<Input::AnalogDevice> Create(const Common::ParamPackage&) override {
-        return std::make_unique<VitaAnalog>();
+    std::unique_ptr<Input::AnalogDevice> Create(const Common::ParamPackage& params) override {
+        return std::make_unique<VitaAnalog>(params.Get("stick", "left") == "right");
     }
 };
 
@@ -111,9 +116,14 @@ void InitInput(EmuWindowVita& window) {
         param.Set("engine", EngineName);
         profile.analogs[Settings::NativeAnalog::CirclePad] = param.Serialize();
     }
-    // Nothing on this console can drive the C-stick, and a device that always reads centred is
-    // what the guest expects from a 3DS without one.
-    profile.analogs[Settings::NativeAnalog::CStick].clear();
+    // The right stick is the C-stick: MH4U reads it through the Circle Pad Pro (ir:USER's extra
+    // HID), where it turns the camera.
+    {
+        Common::ParamPackage param;
+        param.Set("engine", EngineName);
+        param.Set("stick", "right");
+        profile.analogs[Settings::NativeAnalog::CStick] = param.Serialize();
+    }
     // The touchscreen is the window's own device, fed from the front panel.
     profile.touch_device = "engine:emu_window";
 }

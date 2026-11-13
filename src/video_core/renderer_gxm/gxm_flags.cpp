@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <atomic>
+#include "common/vita_data_dir.h"
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -24,7 +25,7 @@ const std::vector<std::string>& Flags() {
             // Off the console (the stub libgxm build) the flags come from the environment.
             text = env;
         }
-        if (FILE* f = std::fopen("ux0:data/azahar/gxm_flags.txt", "rb")) {
+        if (FILE* f = std::fopen(VITA_DATA_DIR "/gxm_flags.txt", "rb")) {
             char buf[256];
             while (std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
                 text.append(buf, n);

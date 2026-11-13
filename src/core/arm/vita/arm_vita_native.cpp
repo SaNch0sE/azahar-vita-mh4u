@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "core/arm/vita/arm_vita_native.h"
+#include "common/vita_data_dir.h"
 #include "core/arm/dyncom/arm_dyncom.h"
 #include "core/arm/dyncom/arm_dyncom_trans.h"
 #include "core/arm/skyeye_common/armstate.h"
@@ -293,9 +294,9 @@ std::shared_ptr<VitaGuestMap> ARM_VitaNative::CreateMap(Memory::MemorySystem& me
     // Under the Vita3K emulator there is no kernel to take a core from, and an unresolved import
     // there returns zero rather than an error - which azaharTakeCore cannot tell from success. So
     // that target says so with a file instead, and the caller falls back to the interpreter.
-    if (SceUID fd = sceIoOpen("ux0:data/azahar/cpu_interpreter", SCE_O_RDONLY, 0); fd >= 0) {
+    if (SceUID fd = sceIoOpen(VITA_DATA_DIR "/cpu_interpreter", SCE_O_RDONLY, 0); fd >= 0) {
         sceIoClose(fd);
-        LOG_WARNING(Core_ARM11, "ux0:data/azahar/cpu_interpreter present: not taking a core");
+        LOG_WARNING(Core_ARM11, VITA_DATA_DIR "/cpu_interpreter present: not taking a core");
         return nullptr;
     }
 
@@ -396,7 +397,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     run.ctx.tpidrurw = cp15[CP15_THREAD_UPRW];
     run.quantum_us = static_cast<u32>(quantum_ns / 1000);
     if (fast_svc < 0) {
-        std::FILE* off = std::fopen("ux0:data/azahar/nofastsvc", "rb");
+        std::FILE* off = std::fopen(VITA_DATA_DIR "/nofastsvc", "rb");
         if (off != nullptr) {
             std::fclose(off);
         }
@@ -640,7 +641,7 @@ void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
     LOG_CRITICAL(Core_ARM11, "code around PC:{}\nrender-thread writes:\n{}", code, writes);
     // The console log is a ring that a burst of errors just before a fault can overrun, taking
     // the registers with it; the same report goes to a file that nothing else writes.
-    if (FILE* f = std::fopen("ux0:data/azahar/fault.txt", "a")) {
+    if (FILE* f = std::fopen(VITA_DATA_DIR "/fault.txt", "a")) {
         std::fprintf(f, "%s\nfpscr %08X tpidruro %08X tpidrurw %08X reason %u\ncode around PC:%s\n",
                      message.c_str(), context.fpscr, context.tpidruro, context.tpidrurw,
                      static_cast<unsigned>(run.reason), code.c_str());

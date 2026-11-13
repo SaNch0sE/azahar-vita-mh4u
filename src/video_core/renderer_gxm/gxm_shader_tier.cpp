@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <utility>
+#include "common/vita_data_dir.h"
 #ifdef __vita__
 #include <psp2/kernel/threadmgr.h>
 #endif
@@ -96,12 +97,12 @@ void ShaderTier2::Loop(std::stop_token stop) {
             job.vs.code = job.code;
             job.vs.swizzle = job.swizzle;
             // usse_dump: the request itself, for the host harness to emit again
-            // (ux0:data/azahar/usse/vr_<key>.bin: the fixed fields, then the code and the
+            // (ux0:data/mh4u/usse/vr_<key>.bin: the fixed fields, then the code and the
             // operand descriptors, each with its word count).
             static const bool dump = GxmFlag("usse_dump");
             if (dump) {
                 const std::string path =
-                    fmt::format("ux0:data/azahar/usse/vr_{:016x}.bin", job.key);
+                    fmt::format(VITA_DATA_DIR "/usse/vr_{:016x}.bin", job.key);
                 if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
                     const Usse::VsRequest& r = job.vs;
                     std::fwrite(&r.code_size, 4, 1, f);

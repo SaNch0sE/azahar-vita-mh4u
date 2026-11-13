@@ -7,7 +7,7 @@
 namespace GxmRenderer {
 
 /**
- * Bring-up switches read once from ux0:data/azahar/gxm_flags.txt: whitespace-separated
+ * Bring-up switches read once from ux0:data/mh4u/gxm_flags.txt: whitespace-separated
  * words, one per switch, so a console round trip needs no rebuild. Absent file: nothing
  * set. Compiled in only when VITA_DIAGNOSTICS is defined; the release build answers
  * false to every one of them and reads no file.
@@ -45,11 +45,11 @@ namespace GxmRenderer {
  *             old notimedraw switched the same thing the other way (was on by
  *             default, reported as the "gxm time" line every report window: where the
  *             render thread's time goes, and how much of it is the GPU wait)
- *   dumpframe every five seconds, write the presented frame to ux0:data/azahar/frame_NN.ppm
+ *   dumpframe every five seconds, write the presented frame to ux0:data/mh4u/frame_NN.ppm
  *             (twenty of them, then round again), so the picture can be looked at off the
  *             console without a camera. The pause menu's "Dump frame" button writes one
  *             such frame and, with it, every surface the cache holds (textures, render
- *             targets, depth) under ux0:data/azahar/dump/ - see RequestSurfaceDump
+ *             targets, depth) under ux0:data/mh4u/dump/ - see RequestSurfaceDump
  *   lockstep  the emulation thread waits for each queued operation to finish
  *   alwayssync every cache operation waits for the GPU, whatever the serials say
  *   nohwvs    every draw shaded in software on the render thread, none through a generated
@@ -60,7 +60,7 @@ namespace GxmRenderer {
  *   dumpsurfaces
  *             the surface dump the pause menu's "Dump frame" makes, once, 300 frames in
  *   vsdump    the first 16 hardware draws of the vertex program whose name contains the
- *             word in ux0:data/azahar/vsdump.txt, each to ux0:data/azahar/vsdump_NN.bin
+ *             word in ux0:data/mh4u/vsdump.txt, each to ux0:data/mh4u/vsdump_NN.bin
  *             (vertex count, stride, stream bytes, uniform bytes; the default uniform
  *             buffer; stream 0), so the program's translation can be run off the console on
  *             the same data, against a host harness that runs the same program another
@@ -68,7 +68,7 @@ namespace GxmRenderer {
  *   notier2   no second tier: every program stays the first emission (usse_ir level 1)
  *   tier2now  the second tier for every program at its first draw instead of after 100
  *             (parity checks of the optimising passes)
- *   usse_dump every emitted program to ux0:data/azahar/usse/us_<hash>.gxp with a .txt of
+ *   usse_dump every emitted program to ux0:data/mh4u/usse/us_<hash>.gxp with a .txt of
  *             its configuration (fragment) and uv_<key>.gxp (vertex), for the SDK tools
  *             off the console
  *   usse_nohoist, usse_nocse, usse_nomadfold
@@ -82,19 +82,19 @@ namespace GxmRenderer {
  *   razor     load the Razor GPU capture module at init, so the Razor host tool on a PC can
  *             capture a frame over the target connection, and name each draw with the
  *             fragment program that made it. Also arms crash salvage to
- *             ux0:data/azahar/gpucrash.sgx. On a retail console the module must be installed
+ *             ux0:data/mh4u/gpucrash.sgx. On a retail console the module must be installed
  *             at ur0:data/librazorcapture_es4.suprx; the load is logged either way
  */
 [[nodiscard]] bool GxmFlag(const char* name);
 
-/// logtex: true during the 120 frames after ux0:data/azahar/dump_now was found, while fewer
+/// logtex: true during the 120 frames after ux0:data/mh4u/dump_now was found, while fewer
 /// than 400 lines have been logged; each caller that logs adds one to logtex_lines.
 [[nodiscard]] bool LogtexActive();
 extern unsigned logtex_lines;
 
 /**
  * The pause menu's "Dump frame", the cache's half: on its next frame end the render thread
- * writes every surface the cache holds to ux0:data/azahar/dump/fNN_*.ppm (level 0, as the
+ * writes every surface the cache holds to ux0:data/mh4u/dump/fNN_*.ppm (level 0, as the
  * GPU sees it: what a draw sampled and what it drew into, before the presentation quad),
  * with fNN_index.txt saying what each file is. The request is consumed by the rasterizer.
  */
