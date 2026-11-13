@@ -271,13 +271,14 @@ private:
     int proc_strip_bound = -1; ///< the strip this draw samples, bound after BeginScene
     u64 proctex_tables_version = 0;
     u32 stat_strip_bakes = 0;
+    u32 stat_scene_merges = 0;
     void SyncProcTexStrip();
     void SyncFogStrip();
     int AcquireStrip(u64 key, bool& fresh);
     int fog_strip_bound = -1;
     u64 fog_tables_version = 0;
     struct SceneTimeAgg {
-        u32 addr = 0, width = 0, height = 0, scenes = 0, draws = 0;
+        u32 addr = 0, width = 0, height = 0, scenes = 0, draws = 0, ordinal = 0;
         u64 us = 0;
         u64 vertex_us = 0;
     };

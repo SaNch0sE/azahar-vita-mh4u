@@ -17,8 +17,9 @@ Measurements and history are in `vita-mh4u-performance.md`.
    remaining lever, and the riskiest (known four-wide miscompiles on the console).
 5. **Render thread:** the ~18% of geometry-shader glyph draws that change state pay a full
    draw setup (~150 us); a partial update would help character select most.
-6. Decide whether `nopostfx` (drop the bloom / depth-of-field chain, ~1.4 ms of GPU) becomes
-   the default.
+6. Done: the bloom / depth-of-field chain and the shadow-target clear are dropped by default
+   (`postfx`, `shadowtarget` restore them), and colour-only framebuffers draw in the open
+   scene (`noscenemerge`). Deck GPU ~37.8 -> ~35.5 ms a frame, shown fps 28-29.
 
 ## After the optimisations
 
@@ -26,9 +27,11 @@ Measurements and history are in `vita-mh4u-performance.md`.
    (https://github.com/popzol/4u-heavenfall-mod-beta), which moves the bottom-screen menus to
    the top screen: install it into the port's file layout and make one-screen play the native
    Vita layout.
-8. **Then skip the bottom screen entirely** - no display transfer, no presentation - and
-   measure what that saves. On the deck today the bottom screen costs one display copy a
-   frame and no render pass of its own, so the win is expected to be small.
+8. **Then skip the bottom screen entirely** and measure what that saves. MH4U draws the
+   bottom screen through the main colour buffer at the start of each frame (viewport
+   ~240x320), copies it out with a display transfer, then draws the top screen; the copy
+   ends the scene, so the bottom screen costs its own draws, the transfer and one extra
+   load/store of the 256x512 target - roughly 1.5-2 ms of GPU a frame on the deck.
 
 ## Open bugs
 

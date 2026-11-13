@@ -441,8 +441,8 @@ SceGxmRenderTarget* RasterizerGxm::BlitTargetFor(u32 width, u32 height) {
 
 bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit) {
     FlushDeferredDraws();
-    // nopostfx: the bloom / depth-of-field downsamples are scaled transfers (see BeginDraw).
-    static const bool no_postfx = GxmFlag("nopostfx");
+    // The bloom / depth-of-field downsamples are scaled transfers (see BeginDraw; `postfx`).
+    static const bool no_postfx = !GxmFlag("postfx");
     if (no_postfx && (dest.addr == 0x1847D400 || dest.addr == 0x1849D400 ||
                       (dest.addr >= 0x18070800 && dest.addr < 0x18090000))) {
         return true; // done, as far as anyone will look
@@ -803,6 +803,17 @@ u32 RasterizerGxm::SceneFlagsFor(std::initializer_list<VideoCore::SurfaceId> tou
 void RasterizerGxm::BeginScene(Framebuffer* fb) {
     FlushDeferredDraws();
     if (in_scene && scene_fb == fb) {
+        return;
+    }
+    // A colour-only framebuffer on the open scene's colour surface draws into that scene:
+    // its draws test and write no depth (SyncState: ALWAYS, writes off), so the scene's depth
+    // attachment is inert for them. MH4U ends its frame's world pass with two such draws,
+    // and starting a scene for them reloaded and stored the whole target (~1 ms of GPU).
+    static const bool no_merge = GxmFlag("noscenemerge");
+    if (!no_merge && in_scene && scene_fb != nullptr && fb->HasColor() && !fb->HasDepth() &&
+        scene_fb->HasColor() && fb->color_id == scene_fb->color_id &&
+        fb->color_level == scene_fb->color_level) {
+        stat_scene_merges++;
         return;
     }
     if (in_scene) {
@@ -1210,7 +1221,11 @@ void RasterizerGxm::EndScene() {
         sceGxmFinish(Device().context);
         const u64 us = Common::PipelineStats::NowUs() - st_t0;
         const auto& rec = scene_open;
-        auto& agg = scene_time_agg[(u64{rec.addr} << 24) ^ (u64{rec.width} << 12) ^ rec.height];
+        static const bool by_ordinal = GxmFlag("scenetimeord");
+        const u64 ordinal = by_ordinal ? u64{scenes_this_frame} << 48 : 0;
+        auto& agg =
+            scene_time_agg[ordinal ^ (u64{rec.addr} << 24) ^ (u64{rec.width} << 12) ^ rec.height];
+        agg.ordinal = static_cast<u32>(ordinal >> 48);
         agg.addr = rec.addr;
         agg.width = rec.width;
         agg.height = rec.height;
@@ -2362,6 +2377,18 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         }
         return false;
     }
+    // Other draws into a dropped shadow map's target (MH4U clears it with one each frame)
+    // feed nothing - a 2D shadow texture is bound white - and their scene splits the main
+    // target's. `shadowtarget` keeps them.
+    static const bool no_shadow_target = !GxmFlag("shadowtarget");
+    if (no_shadow_target) {
+        const u32 cb = fb_regs.framebuffer.GetColorBufferPhysicalAddress();
+        if (std::any_of(dropped_shadow_targets.begin(), dropped_shadow_targets.end(),
+                        [&](const auto& t) { return t.first == cb; })) {
+            stat_skipped++;
+            return false;
+        }
+    }
     const bool has_stencil = fb_regs.HasStencil();
     const bool write_color_fb =
         fb_regs.framebuffer.allow_color_write != 0 &&
@@ -2448,10 +2475,11 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         stat_skipped++;
         return false;
     }
-    // nopostfx (Monster Hunter 4 Ultimate only): its bloom / depth-of-field chain - the
+    // Monster Hunter 4 Ultimate only, on by default (`postfx` keeps it): its bloom /
+    // depth-of-field chain - the
     // downsamples into 0x1847D400 (128x256) and 0x1849D400 (64x128), the blur buffers in
     // [0x18070800, 0x18090000) and the composites that read them back - is dropped.
-    static const bool no_postfx = GxmFlag("nopostfx");
+    static const bool no_postfx = !GxmFlag("postfx");
     if (no_postfx) {
         const auto chain = [](u32 a) {
             return a == 0x1847D400 || a == 0x1849D400 || (a >= 0x18070800 && a < 0x18090000);
@@ -3678,6 +3706,9 @@ void RasterizerGxm::EndFrame() {
                 LOG_INFO(Render, "repeated software draws (no state sync): {} ({} merged into the run before), draws keeping the fragment setup: {}, feedback draws written as alpha only: {}, procedural texture strips baked: {}",
                          stat_repeat_draws, stat_deferred_merged, stat_begin_repeats, stat_alpha_only_feedback, stat_strip_bakes);
                 stat_strip_bakes = 0;
+                LOG_INFO(Render, "colour-only framebuffers drawn in the open scene: {}",
+                         stat_scene_merges);
+                stat_scene_merges = 0;
                 stat_deferred_merged = 0;
                 stat_alpha_only_feedback = 0;
                 stat_repeat_draws = 0;
@@ -3692,9 +3723,9 @@ void RasterizerGxm::EndFrame() {
                     std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.us > y.us; });
                     std::string line;
                     for (std::size_t i = 0; i < std::min<std::size_t>(v.size(), 10); i++) {
-                        line += fmt::format(" | {:08X} {}x{}: {} scenes {} draws {} us (vertex {} us)",
-                                            v[i].addr, v[i].width, v[i].height, v[i].scenes,
-                                            v[i].draws, v[i].us, v[i].vertex_us);
+                        line += fmt::format(" | #{} {:08X} {}x{}: {} scenes {} draws {} us (vertex {} us)",
+                                            v[i].ordinal, v[i].addr, v[i].width, v[i].height,
+                                            v[i].scenes, v[i].draws, v[i].us, v[i].vertex_us);
                     }
                     LOG_INFO(Render, "scene GPU time {} us:{}", total, line);
                     scene_time_agg.clear();
