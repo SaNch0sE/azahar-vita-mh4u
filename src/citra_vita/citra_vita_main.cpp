@@ -106,12 +106,14 @@ FILE* OpenPerfFile() {
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/memory.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/image_interface.h"
 #include "core/hle/service/service.h"
 #include "core/movie.h"
 #include "pte_sema.h"
 #include "video_core/gpu.h"
+#include "video_core/pica/vertex_cache.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 
 // The default heap is nowhere near enough for a 3DS: FCRAM alone is 128 MB, and the caches and
@@ -581,6 +583,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 if (Common::EmuProf::enabled) {
                     sceClibPrintf("[emuprof]%s\n", Common::EmuProf::TakeReport().c_str());
                 }
+                if (Pica::GetVertexCache().enabled) {
+                    const auto vc = Pica::GetVertexCache().TakeStats();
+                    sceClibPrintf("[vtxcache] %u/%u hits, %u inserts, %u invalidated, %u resets, "
+                                  "%u entries, %u KiB used\n",
+                                  vc.hits, vc.lookups, vc.inserts, vc.invalidations, vc.resets,
+                                  vc.entries, vc.pool_kib);
+                }
                 if (perf_file != nullptr) {
                     std::fwrite(&rec, sizeof(rec), 1, perf_file);
                     std::fflush(perf_file);
@@ -745,6 +754,14 @@ int EmulatorMain() {
     Settings::values.disable_right_eye_render = true;
     Common::EmuProf::enabled = GxmRenderer::GxmFlag("emuprof");
     Common::dsp_parallel = !GxmRenderer::GxmFlag("nodspthread");
+    // Hardware draws reuse the GPU copy of vertex data that has not changed (pica/vertex_cache.h);
+    // the emulator's own writes into guest memory drop what they overwrite. `novtxcache`.
+    Pica::GetVertexCache().enabled = !GxmRenderer::GxmFlag("novtxcache");
+    if (Pica::GetVertexCache().enabled) {
+        Memory::host_write_hook = [](const u8* host, std::size_t size) {
+            Pica::GetVertexCache().InvalidateHost(host, size);
+        };
+    }
     // One screen by default: the port is played with the Heavenfall mod's single-screen mode
     // (the touch screen's menus moved to the top screen), and the top screen then fills the
     // display. The pause menu's Screen layout still switches back.

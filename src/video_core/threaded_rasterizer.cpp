@@ -346,6 +346,25 @@ void ThreadedRasterizer::RotateArenaSlots() {
     }
 }
 
+bool ThreadedRasterizer::NoteShippedDraw(bool skippable) {
+    const auto& fb = emu_pica.regs.internal.framebuffer.framebuffer;
+    const u32 fb_pixels = (fb.width + 1) * (fb.height + 1);
+    MarkGLWritten(fb.GetColorBufferPhysicalAddress(), fb_pixels * 4);
+    MarkGLWritten(fb.GetDepthBufferPhysicalAddress(), fb_pixels * 4);
+    const u32 color_target = fb.GetColorBufferPhysicalAddress();
+    const bool repeat_target = IsRepeatTarget(color_target);
+    RecordDrawTarget(color_target);
+    if (skippable) {
+        RecordTopTarget(fb.GetColorBufferPhysicalAddress());
+        RecordTopTarget(fb.GetDepthBufferPhysicalAddress());
+    }
+    return !(skip_frame && (skippable || repeat_target));
+}
+
+void ThreadedRasterizer::WaitGpuIdle() {
+    gpu_thread.RunSync([this] { real->WaitGpuIdle(); });
+}
+
 std::optional<RasterizerInterface::DrawArenaTicket> ThreadedRasterizer::BeginShippedDraw(
     u32 bytes, bool skippable, u32 ring_bytes) {
     {
@@ -653,6 +672,7 @@ void ThreadedRasterizer::FlushRegion(PAddr addr, u32 size) {
 }
 
 void ThreadedRasterizer::InvalidateRegion(PAddr addr, u32 size) {
+    InvalidateVertexCache(addr, size);
     // Invalidation is an ordering requirement, not a synchronous one: the caches must drop
     // stale surfaces before the *next* GL op that could read them, and that op sits behind this
     // one in the same queue. Fire and forget.
@@ -667,6 +687,7 @@ void ThreadedRasterizer::InvalidateGuestFlushedRegion(PAddr addr, u32 size) {
 }
 
 void ThreadedRasterizer::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    InvalidateVertexCache(addr, size);
     if (!TestGLWritten(addr, size)) {
         InvalidateRegion(addr, size);
         return;
@@ -677,6 +698,16 @@ void ThreadedRasterizer::FlushAndInvalidateRegion(PAddr addr, u32 size) {
         return;
     }
     gpu_thread.RunSync([this, addr, size] { real->FlushAndInvalidateRegion(addr, size); });
+}
+
+void ThreadedRasterizer::InvalidateVertexCache(PAddr addr, u32 size) {
+    auto& cache = Pica::GetVertexCache();
+    if (!cache.enabled || size == 0) {
+        return;
+    }
+    if (const u8* host = emu_pica.GuestMemory().GetPhysicalPointer(addr)) {
+        cache.InvalidateHost(host, size);
+    }
 }
 
 void ThreadedRasterizer::ClearAll(bool flush) {

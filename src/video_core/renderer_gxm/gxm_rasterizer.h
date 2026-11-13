@@ -67,6 +67,7 @@ public:
     }
     void DrawRingRange(u32 first, u32 count, u64 ring_end_pos) override;
     void RingRetireBlocking() override;
+    void WaitGpuIdle() override;
     void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;

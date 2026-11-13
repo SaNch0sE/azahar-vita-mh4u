@@ -341,6 +341,9 @@ public:
 
                 u8* dest_ptr = page_table.pointers[page_index] + page_offset;
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
+                if (host_write_hook != nullptr) {
+                    host_write_hook(dest_ptr, copy_amount);
+                }
                 break;
             }
             case PageType::MemoryWatchpoint: {
@@ -350,6 +353,9 @@ public:
 
                 u8* dest_ptr = it->second.memory.GetPtr() + page_offset;
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
+                if (host_write_hook != nullptr) {
+                    host_write_hook(dest_ptr, copy_amount);
+                }
                 break;
             }
             case PageType::RasterizerCachedMemory:
@@ -1369,6 +1375,9 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
 
             u8* dest_ptr = page_table.pointers[page_index] + page_offset;
             std::memset(dest_ptr, 0, copy_amount);
+            if (host_write_hook != nullptr) {
+                host_write_hook(dest_ptr, copy_amount);
+            }
             break;
         }
         case PageType::MemoryWatchpoint: {
@@ -1378,6 +1387,9 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
 
             u8* dest_ptr = it->second.memory.GetPtr() + page_offset;
             std::memset(dest_ptr, 0, copy_amount);
+            if (host_write_hook != nullptr) {
+                host_write_hook(dest_ptr, copy_amount);
+            }
             break;
         }
         case PageType::RasterizerCachedMemory:

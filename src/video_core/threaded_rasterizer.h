@@ -17,6 +17,7 @@
 #include "video_core/pica/output_vertex.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/pica/vertex_cache.h"
 #include "video_core/vertex_ring.h"
 
 namespace VideoCore {
@@ -216,6 +217,14 @@ public:
                      const Pica::OutputVertex& v2) override;
     void DrawTriangles() override;
 
+    /// Emulation thread: drops vertex-cache entries that read from guest memory being invalidated.
+    void InvalidateVertexCache(PAddr addr, u32 size);
+    bool NoteShippedDraw(bool skippable) override;
+    std::pair<u8*, u32> VertexCachePool() override {
+        return ring != nullptr ? std::pair<u8*, u32>{ring->cache_pool, ring->cache_pool_size}
+                               : std::pair<u8*, u32>{nullptr, 0};
+    }
+    void WaitGpuIdle() override;
     std::optional<DrawArenaTicket> BeginShippedDraw(u32 bytes, bool skippable,
                                                     u32 ring_bytes) override;
     void ShipDraw(Pica::DrawPayload&& payload, void* slot) override;

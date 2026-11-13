@@ -144,6 +144,30 @@ void VertexLoader::CopyIntoArena(PAddr base_address, u32 min_vertex, u32 max_ver
     }
 }
 
+void VertexLoader::SourceRanges(PAddr base_address, u32 min_vertex, u32 max_vertex,
+                                std::vector<std::pair<const u8*, u32>>& out) const {
+    constexpr u32 ZERO_STRIDE_BYTES = 64;
+    for (u32 loader = 0; loader < 12; ++loader) {
+        if (!loader_used[loader]) {
+            continue;
+        }
+        const PAddr start =
+            base_address + loader_data_offset[loader] + min_vertex * loader_byte_count[loader];
+        u32 bytes = loader_byte_count[loader] == 0
+                        ? ZERO_STRIDE_BYTES
+                        : (max_vertex - min_vertex + 1) * loader_byte_count[loader];
+        const u8* const src = memory.GetPhysicalPointer(start);
+        if (src == nullptr) {
+            continue;
+        }
+        const auto region = memory.GetPhysMemRegionInfo(start);
+        if (region.valid()) {
+            bytes = std::min<u64>(bytes, region.region_end - start);
+        }
+        out.emplace_back(src, bytes);
+    }
+}
+
 void VertexLoader::AttachArena(const u8* arena, const DrawArenaLayout& layout, u32 min_vertex) {
     for (s32 i = 0; i < num_total_attributes; ++i) {
         if (vertex_attribute_is_default[i]) {

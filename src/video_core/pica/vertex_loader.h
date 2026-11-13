@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <utility>
 #include <vector>
 #include "core/memory.h"
 #include "video_core/pica/draw_payload.h"
@@ -41,6 +42,11 @@ public:
     /// region) into dst following the layout. The index slice is copied by the caller.
     void CopyIntoArena(PAddr base_address, u32 min_vertex, u32 max_vertex,
                        const DrawArenaLayout& layout, u8* dst) const;
+
+    /// The host ranges CopyIntoArena reads for the same arguments (sources it would zero-fill
+    /// are left out).
+    void SourceRanges(PAddr base_address, u32 min_vertex, u32 max_vertex,
+                      std::vector<std::pair<const u8*, u32>>& out) const;
 
     /// Render thread: points the per-attribute bases into a shipped arena, pre-biased by
     /// -min_vertex*stride so LoadVertex indexes with absolute vertex ids.

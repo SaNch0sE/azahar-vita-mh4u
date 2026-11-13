@@ -684,6 +684,7 @@ void GPU::InvalidateOnGuestFlush(PAddr addr, u32 size) {
     if (tracker.Enabled()) {
         tracker.Consume([this](u32 paddr, u32 size) {
             impl->shipping_rasterizer->InvalidateGuestFlushedRegion(paddr, size);
+            impl->shipping_rasterizer->InvalidateVertexCache(paddr, size);
         });
         return;
     }

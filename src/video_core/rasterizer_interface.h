@@ -9,6 +9,7 @@
 #include <atomic>
 #include <functional>
 #include <optional>
+#include <utility>
 #include "common/common_types.h"
 #include "video_core/pica/draw_payload.h"
 #include "video_core/vertex_ring.h"
@@ -120,6 +121,17 @@ public:
     /// Blocks on the oldest outstanding ring fence and retires it. The producer requests this
     /// through the work queue when the ring is full and polling has not caught up.
     virtual void RingRetireBlocking() {}
+    /// The vertex cache's GPU-visible pool (base, size), or {nullptr, 0} when there is none.
+    virtual std::pair<u8*, u32> VertexCachePool() {
+        return {nullptr, 0};
+    }
+    /// Returns once the GPU has finished every draw submitted so far.
+    virtual void WaitGpuIdle() {}
+    /// The bookkeeping BeginShippedDraw does for a draw that needs no arena (its data is already
+    /// GPU-resident). False when the draw is skipped.
+    virtual bool NoteShippedDraw([[maybe_unused]] bool skippable) {
+        return true;
+    }
 
     /// Opens a shipped draw. nullopt: this rasterizer does not consume shipped draws — shade
     /// locally. A ticket with null data: the draw is skipped entirely (frameskip decided before

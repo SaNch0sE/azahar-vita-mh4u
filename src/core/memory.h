@@ -30,6 +30,11 @@ class DspInterface;
 
 namespace Memory {
 
+/// Called with each host range of guest memory the emulator itself writes through WriteBlock or
+/// ZeroBlock (file reads, IPC buffers): what a cache of guest data uses to see writes that are
+/// not the guest's own stores. Null when nothing watches.
+inline void (*host_write_hook)(const u8* host, std::size_t size) = nullptr;
+
 /**
  * Page size used by the ARM architecture. This is the smallest granularity with which memory can
  * be mapped.

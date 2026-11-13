@@ -68,6 +68,7 @@ namespace {
 // every frame - and a stall here is a full sceGxmFinish, the thing everything else in this
 // backend now works to avoid.
 constexpr u32 RingSize = 16 * 1024 * 1024;
+constexpr u32 VertexCachePoolSize = 8 * 1024 * 1024;
 constexpr u32 MaxVerticesPerDraw = 65535 - 65535 % 3;
 
 // The fixed programs (the pass-through vertex program for software-shaded draws, the blit
@@ -268,6 +269,12 @@ void RasterizerGxm::EnsureRing() {
     ring_size = RingSize;
     vertex_ring.base = ring;
     vertex_ring.size = RingSize;
+    // The vertex cache's pool (pica/vertex_cache.h): unchanged vertex data stays here across
+    // frames instead of being copied into the ring every time it is drawn.
+    vertex_ring.cache_pool = static_cast<u8*>(Device().alloc_mapped(VertexCachePoolSize));
+    vertex_ring.cache_pool_size = vertex_ring.cache_pool != nullptr ? VertexCachePoolSize : 0;
+    LOG_INFO(Render, "GXM rasterizer: vertex cache pool {} KiB at {}",
+             vertex_ring.cache_pool_size / 1024, static_cast<void*>(vertex_ring.cache_pool));
 }
 
 RasterizerGxm::~RasterizerGxm() {
@@ -712,6 +719,19 @@ void RasterizerGxm::DrawRingRange(u32 first, u32 count, u64 ring_end_pos) {
 VideoCore::VertexRing* RasterizerGxm::GetVertexRing() {
     EnsureRing();
     return vertex_ring.Active() ? &vertex_ring : nullptr;
+}
+
+void RasterizerGxm::WaitGpuIdle() {
+    // The vertex cache's pool is about to be reused: every draw that may read it has been
+    // consumed (the facade runs this synchronously, after the queue), so submit the open scene
+    // and wait for the GPU.
+    FlushDeferredDraws();
+    if (in_scene) {
+        EndScene();
+    }
+    if (HasDevice()) {
+        sceGxmFinish(Device().context);
+    }
 }
 
 void RasterizerGxm::RingRetireBlocking() {
@@ -3059,12 +3079,17 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
     std::array<u32, PipelineInfo::MaxStreams> stream_ring_offset{};
     const u8* base = nullptr;
     const u16* indices = identity_indices;
-    if (payload.in_ring) {
+    if (payload.in_ring || payload.gpu_resident) {
         // The emulation thread wrote the draw into this ring already, in this layout: the
         // streams are the loader blocks where the arena layout put them, the indices 16-bit
-        // and rebased. Nothing to copy; the ring position is retired with the scene.
-        hw_ring_end = std::max(hw_ring_end, payload.ring_end);
-        base = vertex_ring.base + payload.ring_offset;
+        // and rebased. Nothing to copy; the ring position is retired with the scene. A vertex
+        // cache block has the same layout and nothing to retire.
+        if (payload.in_ring) {
+            hw_ring_end = std::max(hw_ring_end, payload.ring_end);
+            base = vertex_ring.base + payload.ring_offset;
+        } else {
+            base = payload.arena;
+        }
         for (u32 stream = 0; stream < layout.stream_count; stream++) {
             stream_ring_offset[stream] = stream_arena_offset[stream];
         }

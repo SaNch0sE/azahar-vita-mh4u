@@ -27,6 +27,9 @@ namespace VideoCore {
 struct VertexRing {
     u8* base = nullptr;
     u64 size = 0;
+    /// The vertex cache's GPU-visible pool (pica/vertex_cache.h), allocated with the ring.
+    u8* cache_pool = nullptr;
+    u32 cache_pool_size = 0;
 
     /// Producer position, emulation thread only. `offset` mirrors `cursor % size` so the hot
     /// path never divides — u64 divmod is a libcall on 32-bit ARM and measured whole percents.

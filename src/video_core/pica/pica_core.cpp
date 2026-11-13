@@ -23,6 +23,7 @@
 #include "core/memory.h"
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/pica/pica_core.h"
+#include "video_core/pica/vertex_cache.h"
 #ifdef ENABLE_GXM
 #include "video_core/renderer_gxm/gxm_flags.h"
 #endif
@@ -1136,6 +1137,56 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     const bool index_u16 = index_info.format != 0;
 
     auto& loader = GetVertexLoader();
+
+    // The vertex cache (vertex_cache.h): a hardware draw whose sources have not changed since
+    // it was last drawn reuses that copy - no index scan, no copy, no ring space.
+    auto& vcache = GetVertexCache();
+    if (hw && vcache.enabled && !vcache.HasPool()) {
+        const auto [pool, pool_size] = rasterizer->VertexCachePool();
+        if (pool != nullptr) {
+            vcache.SetPool(pool, pool_size);
+        }
+    }
+    const bool use_vcache = hw && vcache.enabled && vcache.HasPool();
+    u64 vkey = 0;
+    const bool skippable_target = regs.internal.framebuffer.framebuffer.height + 1 > 350;
+    if (use_vcache) {
+        struct KeyData {
+            std::array<u8, sizeof(cached_loader_key)> loader;
+            PAddr base;
+            u32 index_offset;
+            u32 num_vertices;
+            u32 vertex_offset;
+            u32 flags;
+        } key_data{};
+        key_data.loader = cached_loader_key;
+        key_data.base = base_address;
+        key_data.index_offset = is_indexed ? index_info.offset.Value() : 0;
+        key_data.num_vertices = pipeline.num_vertices;
+        key_data.vertex_offset = pipeline.vertex_offset;
+        key_data.flags = (is_indexed ? 1u : 0u) | (index_u16 ? 2u : 0u);
+        vkey = Common::ComputeHash64(&key_data, sizeof(key_data));
+        VertexCache::Entry hit;
+        if (vcache.Find(vkey, hit)) {
+            if (!rasterizer->NoteShippedDraw(skippable_target)) {
+                return true;
+            }
+            DrawPayload payload;
+            payload.arena = hit.block;
+            payload.layout = hit.layout;
+            payload.gpu_resident = true;
+            payload.vertex_min = hit.vertex_min;
+            payload.vertex_max = hit.vertex_max;
+            payload.num_vertices = pipeline.num_vertices;
+            payload.vertex_offset = pipeline.vertex_offset;
+            payload.is_indexed = is_indexed;
+            payload.index_u16 = index_u16;
+            payload.hw = true;
+            rasterizer->ShipDraw(std::move(payload), nullptr);
+            return true;
+        }
+    }
+
     u32 vertex_min = pipeline.vertex_offset;
     u32 vertex_max = pipeline.vertex_offset + pipeline.num_vertices - 1;
     const u32 index_bytes = is_indexed ? pipeline.num_vertices * (index_u16 ? 2 : 1) : 0;
@@ -1172,9 +1223,57 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
         hw ? loader.ComputeArenaLayout(vertex_min, vertex_max,
                                        is_indexed ? pipeline.num_vertices * 2 : 0, true)
            : layout;
-    auto ticket = rasterizer->BeginShippedDraw(
-        layout.total, regs.internal.framebuffer.framebuffer.height + 1 > 350,
-        hw ? ring_layout.total : 0);
+    // A miss the cache wants: copied once into a pool block, in the ring's layout, and drawn
+    // from there.
+    if (use_vcache && vcache.Wanted(vkey, ring_layout.total)) {
+        u8* block = vcache.Allocate(ring_layout.total);
+        if (block == nullptr) {
+            // The pool is full: once the GPU has finished every draw that may still read it,
+            // start over.
+            rasterizer->WaitGpuIdle();
+            vcache.Reset();
+            block = vcache.Allocate(ring_layout.total);
+        }
+        if (block != nullptr) {
+            if (!rasterizer->NoteShippedDraw(skippable_target)) {
+                return true;
+            }
+            loader.CopyIntoArena(base_address, vertex_min, vertex_max, ring_layout, block);
+            VertexCache::Entry entry;
+            entry.block = block;
+            entry.layout = ring_layout;
+            entry.vertex_min = vertex_min;
+            entry.vertex_max = vertex_max;
+            loader.SourceRanges(base_address, vertex_min, vertex_max, entry.sources);
+            if (index_bytes != 0) {
+                VertexLoader::WriteRingIndices(block + ring_layout.index_offset, index_address_8,
+                                               index_u16, pipeline.num_vertices, vertex_min);
+                entry.sources.emplace_back(index_address_8, index_bytes);
+            }
+            auto& tracker = memory.WriteTracker();
+            if (tracker.Enabled()) {
+                for (const auto& [host, size] : entry.sources) {
+                    tracker.Arm(host, size);
+                }
+            }
+            vcache.Insert(vkey, std::move(entry));
+            DrawPayload payload;
+            payload.arena = block;
+            payload.layout = ring_layout;
+            payload.gpu_resident = true;
+            payload.vertex_min = vertex_min;
+            payload.vertex_max = vertex_max;
+            payload.num_vertices = pipeline.num_vertices;
+            payload.vertex_offset = pipeline.vertex_offset;
+            payload.is_indexed = is_indexed;
+            payload.index_u16 = index_u16;
+            payload.hw = true;
+            rasterizer->ShipDraw(std::move(payload), nullptr);
+            return true;
+        }
+    }
+    auto ticket = rasterizer->BeginShippedDraw(layout.total, skippable_target,
+                                               hw ? ring_layout.total : 0);
     if (!ticket) {
         return false;
     }
@@ -1614,4 +1713,11 @@ void PicaCore::CommandList::serialize(Archive& ar, const u32 file_version) {
 
 SERIALIZE_IMPL(PicaCore::CommandList)
 
+} // namespace Pica
+
+namespace Pica {
+VertexCache& GetVertexCache() {
+    static VertexCache cache;
+    return cache;
+}
 } // namespace Pica

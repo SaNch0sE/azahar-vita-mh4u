@@ -429,6 +429,9 @@ private:
     }
 
 public:
+    Memory::MemorySystem& GuestMemory() {
+        return memory;
+    }
     struct RenderPropertiesGuess {
         u32 vp_height;
         PAddr paddr;
