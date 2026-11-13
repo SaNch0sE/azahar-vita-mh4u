@@ -721,16 +721,21 @@ Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
     if (light_memory[num] < 0) {
         return {Bank::SecAttr, static_cast<uint8_t>(sa_light[num])};
     }
-    // 24 floats from the buffer: sixteen, then two fours. The immediate offset is in
-    // floats and seven bits wide; the fourth light past the budget still fits.
+    // 24 floats from the buffer, one load per quad. The immediate offset is in floats and
+    // seven bits wide; the fourth light past the budget still fits.
+    // One 16-float load used to fill the first four quads: the IR takes a load to define a
+    // single quad (WriteLanes), so the allocator gave the other three homes nothing wrote,
+    // and lighting read its colours and distance attenuation from whatever those registers
+    // held - blocks of noise over Monster Hunter 4 Ultimate's multi-light cutscene shots.
     const uint32_t off = static_cast<uint32_t>(light_memory[num]);
     if (off + 20 > 127) {
         throw std::runtime_error("light parameters past the load offset's reach");
     }
     const Reg ptr = Reg::Sa(static_cast<uint8_t>(uniform_floats)); // data container offset 0
-    e.Lda32(Reg::V(TmpLightMem), ptr, nullptr, static_cast<uint8_t>(off), 16, 0);
-    e.Lda32(Reg::V(TmpLightMem + 16), ptr, nullptr, static_cast<uint8_t>(off + 16), 4, 0);
-    e.Lda32(Reg::V(TmpLightMem + 20), ptr, nullptr, static_cast<uint8_t>(off + 20), 4, 0);
+    for (uint32_t q = 0; q < 6; q++) {
+        e.Lda32(Reg::V(static_cast<uint8_t>(TmpLightMem + q * 4)), ptr, nullptr,
+                static_cast<uint8_t>(off + q * 4), 4, 0);
+    }
     e.WdfVertex(0);
     return {Bank::Virtual, TmpLightMem};
 }

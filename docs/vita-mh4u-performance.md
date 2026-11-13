@@ -117,14 +117,19 @@ Since then:
    Only 2 can be removed without touching the forms that miscompile on the console; more needs
    a new register allocator. Each LUT read waits for its sample at once, but the profile showed
    almost no texture stall, so overlapping the two reads is not expected to pay.
-3. **Ship cutscene depth of field** (mostly fixed). MH4U builds the focus mask with depth-tested
-   full-screen quads that colour-grade the frame from the target itself (a feedback read) and
-   write a constant alpha. Feedback draws were dropped, which left alpha 1 everywhere and blurred
-   every pixel. A feedback draw whose TEV alpha does not depend on the self-read unit is now drawn
-   writing alpha only (`nofeedbackalpha` turns it off); the colour grade on those pixels is still
-   lost. Still open: close-up shots show blocky garbage where the blur shows through.
-   `18070800` is used both as a 256x512 target (two scenes a frame) and as the 64x128 blur
-   ping-pong buffer, so the two layouts of that memory get mixed up.
+3. **Ship cutscene** (fixed). Two separate bugs:
+   - Depth of field blurred every pixel: MH4U builds the focus mask with depth-tested
+     full-screen quads that colour-grade the frame from the target itself (a feedback read) and
+     write a constant alpha. Feedback draws were dropped, which left alpha 1 everywhere. A
+     feedback draw whose TEV alpha does not depend on the self-read unit is now drawn writing
+     alpha only (`nofeedbackalpha` turns it off); the colour grade on those pixels is lost.
+   - Blocks of noise over lit surfaces (the shot looking up at the captain, the close-ups):
+     lights whose parameters do not fit the uniform registers are loaded from memory in the
+     fragment program, and one 16-float load filled four register quads. The USSE IR models a
+     load as defining one quad, so the register allocator placed the other three where nothing
+     wrote, and the light colours and distance attenuation came from leftover register contents.
+     Each quad now has its own load. Found by stopping the fragment programs after each TEV
+     stage (`dbgstage<N>`), then the debug outputs, then the host emitter's allocated listing.
 4. **Shown fps is vblank-quantised.** The guest runs ~39 fps, but a frame takes ~47 ms on the
    render thread, so ~21 are shown. Under 33 ms is needed for 30.
 5. Low priority: persist tier-2 USSE programs to disk (creating them is already microseconds);
