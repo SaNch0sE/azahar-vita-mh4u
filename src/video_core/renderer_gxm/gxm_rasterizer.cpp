@@ -441,6 +441,12 @@ SceGxmRenderTarget* RasterizerGxm::BlitTargetFor(u32 width, u32 height) {
 
 bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::TextureBlit& blit) {
     FlushDeferredDraws();
+    // nopostfx: the bloom / depth-of-field downsamples are scaled transfers (see BeginDraw).
+    static const bool no_postfx = GxmFlag("nopostfx");
+    if (no_postfx && (dest.addr == 0x1847D400 || dest.addr == 0x1849D400 ||
+                      (dest.addr >= 0x18070800 && dest.addr < 0x18090000))) {
+        return true; // done, as far as anyone will look
+    }
     static const bool no_gpu_blit = GxmFlag("nogpublit");
     if (no_gpu_blit || !resources_ready || !HasDevice() || blit_ring == nullptr) {
         return false;
@@ -2441,6 +2447,25 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     if (skip_feedback_draw) {
         stat_skipped++;
         return false;
+    }
+    // nopostfx (Monster Hunter 4 Ultimate only): its bloom / depth-of-field chain - the
+    // downsamples into 0x1847D400 (128x256) and 0x1849D400 (64x128), the blur buffers in
+    // [0x18070800, 0x18090000) and the composites that read them back - is dropped.
+    static const bool no_postfx = GxmFlag("nopostfx");
+    if (no_postfx) {
+        const auto chain = [](u32 a) {
+            return a == 0x1847D400 || a == 0x1849D400 || (a >= 0x18070800 && a < 0x18090000);
+        };
+        bool drop = chain(regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress());
+        const auto pica_textures = regs.texturing.GetTextures();
+        for (u32 unit = 0; unit < pica_textures.size() && !drop; unit++) {
+            drop = pica_textures[unit].enabled &&
+                   chain(pica_textures[unit].config.GetPhysicalAddress());
+        }
+        if (drop) {
+            stat_skipped++;
+            return false;
+        }
     }
     {
         const PhaseTimer timer{time_draws, times.scene};

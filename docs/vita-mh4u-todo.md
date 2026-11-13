@@ -1,0 +1,38 @@
+# Monster Hunter 4 Ultimate on the PS Vita: TODO
+
+The port is game-specific: an optimisation may break behaviour other titles rely on.
+Measurements and history are in `vita-mh4u-performance.md`.
+
+## Performance (in order)
+
+1. **Per-vertex lighting for the lit world.** One fragment program (`25bbe5f060`: lighting
+   config 1, one directional light) is ~46% of the GPU's fragment time on the ship's deck;
+   106 of its 199 instructions are lighting. The deck has ~2 pixels per vertex, so lighting
+   inputs computed per vertex and interpolated should look the same. Target: the deck under
+   ~33 ms of GPU a frame (now ~37).
+2. **Simpler specular** if 1 is not enough: the reflection LUT as a constant or per vertex.
+3. **Hardware-filtered lighting LUTs** with one wait for all lookups (check the console can
+   filter the chosen format; signed tables need care).
+4. **F16 colour pipeline** in the fragment emitter (TEV, texels, lighting sums): the largest
+   remaining lever, and the riskiest (known four-wide miscompiles on the console).
+5. **Render thread:** the ~18% of geometry-shader glyph draws that change state pay a full
+   draw setup (~150 us); a partial update would help character select most.
+6. Decide whether `nopostfx` (drop the bloom / depth-of-field chain, ~1.4 ms of GPU) becomes
+   the default.
+
+## After the optimisations
+
+7. **Single-screen play** with the Heavenfall mod
+   (https://github.com/popzol/4u-heavenfall-mod-beta), which moves the bottom-screen menus to
+   the top screen: install it into the port's file layout and make one-screen play the native
+   Vita layout.
+8. **Then skip the bottom screen entirely** - no display transfer, no presentation - and
+   measure what that saves. On the deck today the bottom screen costs one display copy a
+   frame and no render pass of its own, so the win is expected to be small.
+
+## Open bugs
+
+- Lit draws sent through the software vertex path (`nohwvs`, or the `litsw` experiment) hang
+  the GPU at the first lit frame.
+- The cutscene's colour grade on the depth-of-field focus pixels is lost (feedback draws are
+  drawn alpha-only).
