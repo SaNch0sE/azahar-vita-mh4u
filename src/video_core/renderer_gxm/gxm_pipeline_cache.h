@@ -194,6 +194,9 @@ private:
     std::vector<std::unique_ptr<Shader>> retired; ///< replaced programs, still bound by pipelines
     std::unordered_map<u64, std::unique_ptr<Pipeline>> pipelines;
     Pipeline* current_pipeline{};
+    /// What current_pipeline was bound for, to answer a repeated request without hashing.
+    PipelineInfo last_bound{};
+    bool last_bound_valid = false;
 };
 
 } // namespace GxmRenderer

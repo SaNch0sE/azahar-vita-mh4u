@@ -259,6 +259,23 @@ PipelineCache::MemoryUsage PipelineCache::MemoryStats() const {
 }
 
 bool PipelineCache::BindPipeline(const PipelineInfo& info) {
+    // Consecutive draws mostly ask for the pipeline already bound: compared field by field,
+    // that answer costs less than hashing the key again.
+    if (current_pipeline != nullptr && last_bound_valid &&
+        info.vertex == last_bound.vertex && info.fragment == last_bound.fragment &&
+        info.stream_count == last_bound.stream_count &&
+        info.attribute_count == last_bound.attribute_count &&
+        info.blend_enabled == last_bound.blend_enabled &&
+        info.output_format == last_bound.output_format &&
+        std::memcmp(&info.blend, &last_bound.blend, sizeof(info.blend)) == 0 &&
+        info.strides == last_bound.strides &&
+        std::equal(info.attributes.begin(), info.attributes.begin() + info.attribute_count,
+                   last_bound.attributes.begin(), [](const auto& a, const auto& b) {
+                       return a.offset == b.offset && a.stream == b.stream &&
+                              a.format == b.format && a.components == b.components;
+                   })) {
+        return true;
+    }
     const u64 hash = info.Hash();
     const auto [it, is_new] = pipelines.try_emplace(hash);
     if (is_new) {
@@ -274,6 +291,8 @@ bool PipelineCache::BindPipeline(const PipelineInfo& info) {
         sceGxmSetFragmentProgram(context, pipeline->FragmentProgram());
         current_pipeline = pipeline;
     }
+    last_bound = info;
+    last_bound_valid = true;
     return true;
 }
 
