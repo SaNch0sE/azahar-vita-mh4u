@@ -1165,6 +1165,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
     if (validate_regions.empty()) {
         return;
     }
+    mutation_gen++;
 
     // A texture whose bytes still hash to what it last matched needs nothing, however much of it
     // was invalidated. Guest writes are tracked by the page, and a texture that does not start
@@ -1900,6 +1901,9 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
             return;
         }
         const auto interval = surface.GetInterval() & invalid_interval;
+        if (!boost::icl::contains(surface.invalid_regions, interval)) {
+            mutation_gen++;
+        }
         surface.MarkInvalid(interval);
         if (!surface.IsFullyInvalid()) {
             return;
@@ -1947,6 +1951,7 @@ void RasterizerCache<T>::RegisterSurface(SurfaceId surface_id) {
                "Trying to register an already registered surface");
 
     surface.flags |= SurfaceFlagBits::Registered;
+    mutation_gen++;
     UpdatePagesCachedCount(surface.addr, surface.size, 1);
     ForEachPage(surface.addr, surface.size,
                 [this, surface_id](u64 page) { page_table[page].push_back(surface_id); });
@@ -1959,6 +1964,7 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
                "Trying to unregister an already unregistered surface");
 
     surface.flags &= ~SurfaceFlagBits::Registered;
+    mutation_gen++;
     UpdatePagesCachedCount(surface.addr, surface.size, -1);
     ForEachPage(surface.addr, surface.size, [this, surface_id](u64 page) {
         const auto page_it = page_table.find(page);

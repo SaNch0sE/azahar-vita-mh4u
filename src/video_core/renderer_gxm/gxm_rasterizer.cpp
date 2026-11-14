@@ -2483,7 +2483,25 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     begin_repeat_ok = false;
     {
         const PhaseTimer timer{time_draws, times.framebuffer};
-        setup.helper.emplace(res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb));
+        // The target lookup of the draw before still stands when nothing it depends on moved:
+        // the framebuffer and rasterizer registers (viewport, scissor), which buffers this draw
+        // uses, the scene, and the cache (MutationGen). Its invalidation of the drawn region
+        // was done then and would repeat exactly; `nofbreuse` looks it up every time.
+        static const bool no_fb_reuse = GxmFlag("nofbreuse");
+        setup.target_key =
+            Common::HashCombine(Common::ComputeHash64(&regs.framebuffer, sizeof(regs.framebuffer)),
+                                Common::ComputeHash64(&regs.rasterizer, sizeof(regs.rasterizer))) ^
+            (using_color_fb ? 1ull : 0ull) ^ (using_depth_fb ? 2ull : 0ull);
+        if (!no_fb_reuse && reuse_target && in_scene && setup.target_key == reuse_target_key &&
+            res_cache.MutationGen() == reuse_target_gen && scene_seq == reuse_target_scene &&
+            nondraw_epoch == reuse_target_epoch) {
+            setup.helper.emplace(reuse_target->Disarmed());
+            setup.fresh_target = false;
+            stat_target_reuses++;
+        } else {
+            setup.helper.emplace(res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb));
+            setup.fresh_target = true;
+        }
     }
     Framebuffer* fb = setup.helper->Framebuffer();
     if (fb->RenderTarget() == nullptr) {
@@ -2582,7 +2600,18 @@ void RasterizerGxm::ReleaseDraw(DrawSetup& setup) {
     DrawTrace("release draw");
     // The helper's destructor invalidates the drawn region: cache work worth its own line.
     const PhaseTimer timer{time_draws, times.invalidate};
+    if (setup.helper && setup.fresh_target) {
+        reuse_target.emplace(setup.helper->Disarmed());
+        reuse_target_key = setup.target_key;
+    }
     setup.helper.reset();
+    if (setup.fresh_target) {
+        // After the invalidation: its own changes are part of what the next draw may reuse.
+        reuse_target_gen = res_cache.MutationGen();
+        reuse_target_scene = scene_seq;
+        reuse_target_epoch = nondraw_epoch;
+        setup.fresh_target = false;
+    }
     DrawTrace("release draw done");
 }
 
@@ -3783,6 +3812,8 @@ void RasterizerGxm::EndFrame() {
                              "scene {} other {}; fragment reg changes:{}",
                              m[0], m[1], m[2], m[3], m[4], m[5], regs_line);
                     namespace PS = Common::PipelineStats;
+                    LOG_INFO(Render, "target lookups reused: {}", stat_target_reuses);
+                    stat_target_reuses = 0;
                     LOG_INFO(Render, "bind programs: {} calls, config+lookup {} us, tier2 {} us, pipeline {} us",
                              PS::bp_calls, PS::bp_config_us, PS::bp_tier2_us, PS::bp_pipeline_us);
                     PS::bp_calls = PS::bp_config_us = PS::bp_tier2_us = PS::bp_pipeline_us = 0;

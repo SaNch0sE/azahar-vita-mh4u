@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "common/pipeline_stats.h"
+#include "video_core/renderer_gxm/gxm_flags.h"
 #include <array>
 #include <cstdlib>
 #include <chrono>
@@ -59,6 +60,31 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
         {PICA_REG_INDEX(framebuffer), sizeof(Pica::FramebufferRegs) / 4},
         {PICA_REG_INDEX(lighting), sizeof(Pica::LightingRegs) / 4},
     }};
+    // Registers inside those blocks that a software draw's fragment side never reads, or whose
+    // effect has its own dirty flag the repeat paths check: the vertex shader's output map and
+    // clock (0x4F-0x56, 0x6E-0x7F) and the fog, procedural-texture and lighting LUT data ports
+    // (lut_dirty / table_dirty). MH4U rewrites 0x6F around its particle draws. `allfragregs`
+    // counts them again.
+    static const std::array<bool, 0x300> fragment_ignored = [] {
+        std::array<bool, 0x300> t{};
+        if (GxmRenderer::GxmFlag("allfragregs")) {
+            return t;
+        }
+        const auto mark = [&t](u32 first, u32 count) {
+            for (u32 i = first; i < first + count && i < t.size(); i++) {
+                t[i] = true;
+            }
+        };
+        mark(PICA_REG_INDEX(rasterizer.vs_output_total), 8);
+        mark(PICA_REG_INDEX(rasterizer.depthmap_enable) + 1, 0x12);
+        mark(PICA_REG_INDEX(texturing.fog_lut_offset), 1);
+        mark(PICA_REG_INDEX(texturing.fog_lut_data), 8);
+        mark(PICA_REG_INDEX(texturing.proctex_lut_config), 1);
+        mark(PICA_REG_INDEX(texturing.proctex_lut_data), 8);
+        mark(PICA_REG_INDEX(lighting.lut_config), 1);
+        mark(PICA_REG_INDEX(lighting.lut_data), 8);
+        return t;
+    }();
     bool fragment_changed = false;
     for (const auto& [index, value] : shipment.reg_delta) {
         u32& reg = mirror.regs.internal.reg_array[index];
@@ -67,6 +93,7 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
             for (const auto& [first, count] : fragment_blocks) {
                 in_block |= index - first < count;
             }
+            in_block &= !fragment_ignored[index];
             fragment_changed |= in_block;
             if (in_block && index < Common::PipelineStats::frag_reg_changes.size()) {
                 Common::PipelineStats::frag_reg_changes[index]++;

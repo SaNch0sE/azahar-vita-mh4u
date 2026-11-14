@@ -115,6 +115,9 @@ public:
     }
 
     ~FramebufferHelper() {
+        if (!armed) {
+            return;
+        }
         const Common::Rectangle draw_rect_unscaled{draw_rect / fb->Scale()};
         const auto invalidate = [&](SurfaceId surface_id, u32 level) {
             const auto& surface = res_cache->GetSurface(surface_id);
@@ -129,6 +132,17 @@ public:
         if (fb->depth_id) {
             invalidate(fb->depth_id, fb->depth_level);
         }
+    }
+
+    FramebufferHelper(const FramebufferHelper&) = default;
+    FramebufferHelper& operator=(const FramebufferHelper&) = default;
+
+    /// A copy that does not invalidate the drawn region when it goes: for a draw reusing the
+    /// previous one's lookup, whose invalidation would repeat exactly what that one did.
+    FramebufferHelper Disarmed() const {
+        FramebufferHelper copy{*this};
+        copy.armed = false;
+        return copy;
     }
 
     typename T::Framebuffer* Framebuffer() const noexcept {
@@ -152,6 +166,7 @@ private:
     typename T::Framebuffer* fb;
     Common::Rectangle<s32> scissor_rect;
     Common::Rectangle<u32> draw_rect;
+    bool armed = true;
     ViewportInfo viewport;
 };
 

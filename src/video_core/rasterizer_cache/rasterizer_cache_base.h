@@ -85,6 +85,13 @@ public:
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
+    /// Counts changes that can alter what a framebuffer lookup returns or what a draw's
+    /// invalidation does: surfaces registered or unregistered, validated with real work, or
+    /// newly invalidated. Unchanged, the previous draw's target lookup still stands.
+    u64 MutationGen() const noexcept {
+        return mutation_gen;
+    }
+
     /// Perform hardware accelerated texture copy according to the provided configuration
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config);
 
@@ -278,6 +285,7 @@ private:
     void UpdatePagesCachedCount(PAddr addr, u32 size, int delta);
 
 private:
+    u64 mutation_gen = 0;
     Memory::MemorySystem& memory;
     CustomTexManager& custom_tex_manager;
     Runtime& runtime;

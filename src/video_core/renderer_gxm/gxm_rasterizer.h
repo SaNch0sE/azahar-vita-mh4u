@@ -202,7 +202,17 @@ private:
     /// destructor invalidates the drawn region, so it lives until the draw is done.
     struct DrawSetup {
         std::optional<VideoCore::FramebufferHelper<Traits>> helper;
+        u64 target_key = 0;
+        bool fresh_target = false;
     };
+    /// The previous draw's framebuffer lookup (disarmed), and what it is valid for: the same
+    /// target registers, scene, non-draw epoch and cache contents (fbreuse).
+    std::optional<VideoCore::FramebufferHelper<Traits>> reuse_target;
+    u64 reuse_target_key = 0;
+    u64 reuse_target_gen = 0;
+    u64 reuse_target_scene = 0;
+    u64 reuse_target_epoch = 0;
+    u32 stat_target_reuses = 0;
     /// Everything a draw does before its vertices: framebuffer, textures, scene, state,
     /// programs, uniforms. False means the draw is not happening (the caller folds its ring
     /// space back and returns); the helper is left for the caller to release either way.
