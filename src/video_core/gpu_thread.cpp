@@ -7,6 +7,8 @@
 #include "common/microprofile.h"
 #include "common/thread.h"
 #include <cstdlib>
+#include "common/emu_prof.h"
+#include "common/scope_exit.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/guest_watch.h"
 #include "common/pipeline_stats.h"
@@ -76,6 +78,13 @@ void GpuThread::EnqueueQueued(Op op) {
             // once a second while it lasts: a render thread that never drains is what the
             // log then has to explain (the phase breadcrumb, VITA_RENDER_TRACE builds).
             Common::PipelineStats::gpu_brakes.fetch_add(1, std::memory_order_relaxed);
+            const u64 brake_t0 = Common::PipelineStats::NowUs();
+            SCOPE_EXIT({
+                if (Common::EmuProf::enabled) {
+                    Common::EmuProf::Add("gpu thread: queue brake",
+                                         Common::PipelineStats::NowUs() - brake_t0);
+                }
+            });
             while (depth.load(std::memory_order_relaxed) >= MaxDepth / 2) {
                 retire_wake.Lower();
                 if (depth.load(std::memory_order_relaxed) < MaxDepth / 2) {
@@ -113,8 +122,12 @@ void GpuThread::RunSync(std::function<void()> fn) {
         fn();
         return;
     }
+    const u64 t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     Enqueue({.run = std::move(fn)});
     Drain();
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add("gpu thread: RunSync wait", Common::PipelineStats::NowUs() - t0);
+    }
 }
 
 void GpuThread::WaitForRetire() {
@@ -128,7 +141,11 @@ void GpuThread::WaitForRetire() {
     retire_waiters.fetch_add(1, std::memory_order_relaxed);
     retire_wake.Lower();
     lock.unlock();
+    const u64 t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     retire_wake.Wait();
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add("gpu thread: retire wait", Common::PipelineStats::NowUs() - t0);
+    }
     lock.lock();
     retire_waiters.fetch_sub(1, std::memory_order_relaxed);
 }

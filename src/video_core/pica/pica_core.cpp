@@ -675,6 +675,15 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     const u8* head = memory.GetPhysicalPointer(list);
     bool stop_requested = false;
     cmd_list.Reset(list, head, size);
+    const u64 list_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+    SCOPE_EXIT({
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add("cmdlist: ProcessCmdList", Common::PipelineStats::NowUs() - list_t0);
+            Common::EmuProf::Add("cmdlist: KiB", (size + 1023) / 1024 * 1000);
+            Common::EmuProf::Add("cmdlist: fast words (k)", fast_words);
+            fast_words = 0;
+        }
+    });
 
     bool skip_fast_path = false;
     while (cmd_list.current_index < cmd_list.length) {
@@ -707,6 +716,9 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
                     reinterpret_cast<u8*>(dirty_regs.qwords.data()), &run);
                 if (run > 0) {
                     delay_generator.AddCommands(run);
+                    if (Common::EmuProf::enabled) {
+                        fast_words += run;
+                    }
                     cmd_list.current_index = index;
                     if (index + 1 >= cmd_list.length) {
                         continue;
@@ -822,6 +834,41 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
 
 } // namespace Pica
 namespace {
+// emuprof: writes by register through the slow paths (calls, words), logged every 3 s.
+std::array<u32, 0x300> reg_calls{}, reg_words{};
+u64 reg_count_logged = 0;
+void RegCountImpl(u32 id, u32 words) {
+    reg_calls[id]++;
+    reg_words[id] += words;
+    static u32 calls_since = 0;
+    if (++calls_since < 4096) {
+        return;
+    }
+    calls_since = 0;
+    const u64 now = Common::PipelineStats::NowUs();
+    if (now - reg_count_logged < 3'000'000) {
+        return;
+    }
+    reg_count_logged = now;
+    std::vector<std::pair<u32, u32>> top;
+    u64 calls = 0, words_all = 0;
+    for (u32 i = 0; i < reg_calls.size(); i++) {
+        calls += reg_calls[i];
+        words_all += reg_words[i];
+        if (reg_calls[i] != 0) {
+            top.emplace_back(reg_words[i], i);
+        }
+    }
+    std::sort(top.rbegin(), top.rend());
+    std::string line;
+    for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 16); i++) {
+        line += fmt::format(" {:03X}:{}/{}", top[i].second, reg_calls[top[i].second], top[i].first);
+    }
+    LOG_INFO(HW_GPU, "register writes (3 s, slow path): {} calls, {} words; by words (calls/words):{}",
+             calls, words_all, line);
+    reg_calls = {};
+    reg_words = {};
+}
 // emuprof: time spent in each register's special or batch handler, keyed "reg XXX".
 const char* RegProfKey(u32 id) {
     static const std::vector<std::string> keys = [] {
@@ -835,6 +882,9 @@ const char* RegProfKey(u32 id) {
 }
 } // namespace
 namespace Pica {
+static void RegCount(u32 id, u32 words) {
+    RegCountImpl(id, words);
+}
 
 void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                      bool& stop_requested) {
@@ -851,6 +901,9 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
         (regs.internal.reg_array[id] & ~write_mask) | (values[count - 1] & write_mask);
     dirty_regs.Set(id);
 
+    if (Common::EmuProf::enabled) {
+        RegCount(id, count);
+    }
     if (const BatchFn batch = batch_lut[id]) {
         // If the register supports batch then call the handler.
         // noregprof: no per-register timers (their own cost blurs the command-list total).
@@ -952,6 +1005,9 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
         debug_context->OnEvent(DebugContext::Event::PicaCommandLoaded, &id);
     }
 
+    if (Common::EmuProf::enabled) {
+        RegCount(id, 1);
+    }
     if (const SpecialFn special = special_lut[id]) {
         static const bool reg_prof = Common::EmuProf::enabled && !GxmRenderer::GxmFlag("noregprof");
         const u64 prof_t0 = reg_prof ? Common::PipelineStats::NowUs() : 0;
@@ -1056,12 +1112,15 @@ void PicaCore::DrawImmediate() {
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
     const u64 prof_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+    draw_path = nullptr;
     SCOPE_EXIT({
         if (Common::EmuProf::enabled) {
+            const u64 us = Common::PipelineStats::NowUs() - prof_t0;
             Common::EmuProf::Add(regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes
                                      ? "pica draw (gs)"
                                      : "pica draw",
-                                 Common::PipelineStats::NowUs() - prof_t0);
+                                 us);
+            Common::EmuProf::Add(draw_path != nullptr ? draw_path : "pica draw: other", us);
         }
     });
 
@@ -1160,9 +1219,11 @@ void PicaCore::DrawArrays(bool is_indexed) {
 
 bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     namespace EP = Common::EmuProf;
-    u64 prof_t = EP::enabled ? Common::PipelineStats::NowUs() : 0;
+    // noregprof: no step timers here either; the draw is timed whole, by path (draw_path).
+    static const bool step_prof = EP::enabled && !GxmRenderer::GxmFlag("noregprof");
+    u64 prof_t = step_prof ? Common::PipelineStats::NowUs() : 0;
     const auto prof = [&](const char* key) {
-        if (EP::enabled) {
+        if (step_prof) {
             const u64 now = Common::PipelineStats::NowUs();
             EP::Add(key, now - prof_t);
             prof_t = now;
@@ -1212,7 +1273,9 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
         VertexCache::Entry hit;
         const bool found = vcache.Find(vkey, hit);
         prof(" .draw: key + find");
+        draw_path = "pica draw: miss (not wanted)";
         if (found) {
+            draw_path = "pica draw: hit";
             if (!rasterizer->NoteShippedDraw(skippable_target)) {
                 return true;
             }
@@ -1268,6 +1331,7 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     // allocation when the slots are busy. The mirror reads them from the shipment, so what it
     // hashes and draws is the same.
     if (!hw && layout.total <= sizeof(AttributeBuffer)) {
+        draw_path = "pica draw: sw inline";
         if (!rasterizer->NoteShippedDraw(skippable_target)) {
             return true;
         }
@@ -1298,6 +1362,7 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     // A miss the cache wants: copied once into a pool block, in the ring's layout, and drawn
     // from there.
     if (use_vcache && vcache.Wanted(vkey, ring_layout.total)) {
+        draw_path = "pica draw: miss (wanted, unarmed)";
         auto& tracker = memory.WriteTracker();
         // Arm-first (Common::vcache_arm_first): a draw is cached only once its sources are
         // already protected, and kept only if no store faulted on them and no emulator write
@@ -1332,6 +1397,7 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
             block = vcache.Allocate(ring_layout.total);
         }
         if (block != nullptr) {
+            draw_path = "pica draw: miss (cached now)";
             if (!rasterizer->NoteShippedDraw(skippable_target)) {
                 return true;
             }
@@ -1390,6 +1456,9 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     }
     if (ticket->in_ring) {
         layout = ring_layout;
+    }
+    if (draw_path == nullptr) {
+        draw_path = hw ? "pica draw: no cache" : "pica draw: sw arena";
     }
     const u64 copy_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     loader.CopyIntoArena(base_address, vertex_min, vertex_max, layout, ticket->data);

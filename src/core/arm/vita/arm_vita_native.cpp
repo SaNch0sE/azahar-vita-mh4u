@@ -621,10 +621,12 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     }
     case AZAHAR_EXIT_UND: {
         const SceUInt64 und_start = Common::EmuProf::enabled ? sceKernelGetProcessTimeWide() : 0;
+        const u32 und_pc = context.r[15];
         const bool handled = InterpretShortVectors();
         if (Common::EmuProf::enabled) {
-            Common::EmuProf::Add(" .slice VFP short vectors (interpreted)",
-                                 sceKernelGetProcessTimeWide() - und_start);
+            const u64 us = sceKernelGetProcessTimeWide() - und_start;
+            Common::EmuProf::Add(" .slice VFP short vectors (interpreted)", us);
+            Common::EmuProf::Add(fmt::format("sv {:08X} lr {:08X}", und_pc, context.r[14]), us);
         }
         if (handled) {
             return !break_flag && !stop_requested;

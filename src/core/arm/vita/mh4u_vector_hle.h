@@ -8,6 +8,9 @@
 #include <cstring>
 #include <limits>
 #include "common/common_types.h"
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 namespace Core::VitaHle {
 
@@ -69,20 +72,53 @@ void RunMh4uFilter(HleState st, Mem& mem) {
         }
         return b;
     };
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // NEON flushes denormal inputs and results and returns the default NaN, and VMLA/VMLS
+    // round the product before the add: with FPSCR.FZ and DN both set (how the game runs it)
+    // that is exactly the scalar path below, four lanes at once.
+    const bool neon = fz && dn;
+    const auto vec = [&](u32 reg) { return vld1q_f32(reinterpret_cast<const float*>(&s[reg])); };
+    const auto put = [&](u32 reg, float32x4_t v) { vst1q_f32(reinterpret_cast<float*>(&s[reg]), v); };
+    const auto scalar = [&](u32 reg) {
+        float v;
+        std::memcpy(&v, &s[reg], sizeof(v));
+        return v;
+    };
+#else
+    const bool neon = false;
+#endif
     // Vector ops of length 4 (no register wraps past its bank in this routine); m a scalar.
     const auto fmac = [&](u32 d, u32 n, u32 m) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        if (neon) {
+            put(d, vmlaq_f32(vec(d), vec(n), vdupq_n_f32(scalar(m))));
+            return;
+        }
+#endif
         for (u32 i = 0; i < 4; i++) {
             const float p = f(s[n + i]) * f(s[m]);
             s[d + i] = out(f(s[d + i]) + p);
         }
     };
     const auto fnmac = [&](u32 d, u32 n, u32 m) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        if (neon) {
+            put(d, vmlsq_f32(vec(d), vec(n), vdupq_n_f32(scalar(m))));
+            return;
+        }
+#endif
         for (u32 i = 0; i < 4; i++) {
             const float p = f(s[n + i]) * f(s[m]);
             s[d + i] = out(f(s[d + i]) - p);
         }
     };
     const auto fmul = [&](u32 d, u32 n, u32 m) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        if (neon) {
+            put(d, vmulq_f32(vec(n), vdupq_n_f32(scalar(m))));
+            return;
+        }
+#endif
         for (u32 i = 0; i < 4; i++) {
             s[d + i] = out(f(s[n + i]) * f(s[m]));
         }
@@ -182,8 +218,16 @@ void RunMh4uFilter(HleState st, Mem& mem) {
                 load(tap, 4, r[11]);
                 fmac(acc, tap, k);
             }
-            for (u32 i = 0; i < 4; i++) {
-                ftosiz(acc + i);
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            if (neon) {
+                // VCVT.S32.F32: toward zero, saturating, NaN to zero - as ftosiz.
+                vst1q_s32(reinterpret_cast<s32*>(&s[acc]), vcvtq_s32_f32(vec(acc)));
+            } else
+#endif
+            {
+                for (u32 i = 0; i < 4; i++) {
+                    ftosiz(acc + i);
+                }
             }
             store(acc, 4, r[9]);
             r[9] += 16;

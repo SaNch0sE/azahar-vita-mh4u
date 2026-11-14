@@ -475,6 +475,10 @@ private:
     std::vector<OutputVertex>* triangle_record = nullptr;
     /// ShadeShippedDraw: triangles go only to triangle_record, nothing is drawn.
     bool capture_only = false;
+    /// emuprof: which way the current draw went (TryShipDraw), a literal key.
+    const char* draw_path = nullptr;
+    /// emuprof: plain register writes the fast loop applied.
+    u64 fast_words = 0;
     /// RunShippedDraw's geometry-shader draw memo: recorded triangles by input key.
     static constexpr std::size_t GsMemoGenerationCap = 400;
     std::unordered_map<u64, std::vector<OutputVertex>> gs_memo_cur, gs_memo_prev;

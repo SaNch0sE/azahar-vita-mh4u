@@ -15,6 +15,7 @@
 #include "video_core/guest_watch.h"
 #include "common/emu_prof.h"
 #include "common/pipeline_stats.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "common/vita_data_dir.h"
 #include "common/logging/log.h"
@@ -271,9 +272,10 @@ void ThreadedRasterizer::AddTriangle(const Pica::OutputVertex& v0, const Pica::O
 
 void ThreadedRasterizer::CollectState(Shipment& shipment) {
     namespace EP = Common::EmuProf;
-    u64 prof_t = EP::enabled ? Common::PipelineStats::NowUs() : 0;
+    static const bool step_prof = EP::enabled && !GxmRenderer::GxmFlag("noregprof");
+    u64 prof_t = step_prof ? Common::PipelineStats::NowUs() : 0;
     const auto prof = [&](const char* key) {
-        if (EP::enabled) {
+        if (step_prof) {
             const u64 now = Common::PipelineStats::NowUs();
             EP::Add(key, now - prof_t);
             prof_t = now;
@@ -525,6 +527,12 @@ void ThreadedRasterizer::PostInterruptAfterQueue(Service::GSP::InterruptId id, u
 }
 
 void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
+    const u64 ship_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+    SCOPE_EXIT({
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add("ship draw (total)", Common::PipelineStats::NowUs() - ship_t0);
+        }
+    });
 #ifdef CITRA_TRACE_PROBES
     {
         static const bool trace = std::getenv("AZAHAR_DRAW_TRACE") != nullptr;
@@ -535,9 +543,10 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
     }
 #endif // CITRA_TRACE_PROBES
     namespace EP = Common::EmuProf;
-    u64 prof_t = EP::enabled ? Common::PipelineStats::NowUs() : 0;
+    static const bool step_prof = EP::enabled && !GxmRenderer::GxmFlag("noregprof");
+    u64 prof_t = step_prof ? Common::PipelineStats::NowUs() : 0;
     const auto prof = [&](const char* key) {
-        if (EP::enabled) {
+        if (step_prof) {
             const u64 now = Common::PipelineStats::NowUs();
             EP::Add(key, now - prof_t);
             prof_t = now;
