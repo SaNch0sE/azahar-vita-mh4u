@@ -22,6 +22,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
@@ -496,12 +497,14 @@ void VitaAllocTraceDump(void) {
     {
         // The ten call sites holding the most live heap (allocations of 2 KiB or more).
         static unsigned int live_dumps;
-        if ((++live_dumps % 2) == 0) {
+        if ((++live_dumps % 1) == 0) {
             long total = 0;
             for (unsigned int k = 0; k < LIVE_KEYS; k++) {
                 total += g_keys[k].bytes;
             }
-            sceClibPrintf("[live] --- tracked %ld KiB\n", total / 1024);
+            static char buf[8192];
+            int len = sceClibSnprintf(buf, sizeof(buf), "#%u tracked %ld KiB heap %ld KiB\n",
+                                      live_dumps, total / 1024, g_heap_live / 1024);
             int used[40];
             for (int t = 0; t < 40; t++) {
                 long best = 0;
@@ -520,10 +523,19 @@ void VitaAllocTraceDump(void) {
                 if (bi < 0) {
                     break;
                 }
-                sceClibPrintf("[live] %8ld KiB %6u x  %08x %08x %08x %08x\n",
-                              g_keys[bi].bytes / 1024, g_keys[bi].count, (unsigned)g_keys[bi].a,
-                              (unsigned)g_keys[bi].b, (unsigned)g_keys[bi].c,
-                              (unsigned)g_keys[bi].d);
+                if (len < (int)sizeof(buf) - 96) {
+                    len += sceClibSnprintf(buf + len, sizeof(buf) - len,
+                                           "#%u %ld KiB %u x %08x %08x %08x %08x\n", live_dumps,
+                                           g_keys[bi].bytes / 1024, g_keys[bi].count,
+                                           (unsigned)g_keys[bi].a, (unsigned)g_keys[bi].b,
+                                           (unsigned)g_keys[bi].c, (unsigned)g_keys[bi].d);
+                }
+            }
+            const SceUID fd = sceIoOpen("ux0:data/mh4u/live.txt",
+                                        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
+            if (fd >= 0) {
+                sceIoWrite(fd, buf, (SceSize)len);
+                sceIoClose(fd);
             }
         }
     }
