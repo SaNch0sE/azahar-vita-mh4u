@@ -62,9 +62,14 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
     bool fragment_changed = false;
     for (const auto& [index, value] : shipment.reg_delta) {
         u32& reg = mirror.regs.internal.reg_array[index];
-        if (reg != value && !fragment_changed) {
+        if (reg != value) {
+            bool in_block = false;
             for (const auto& [first, count] : fragment_blocks) {
-                fragment_changed |= index - first < count;
+                in_block |= index - first < count;
+            }
+            fragment_changed |= in_block;
+            if (in_block && index < Common::PipelineStats::frag_reg_changes.size()) {
+                Common::PipelineStats::frag_reg_changes[index]++;
             }
         }
         reg = value;

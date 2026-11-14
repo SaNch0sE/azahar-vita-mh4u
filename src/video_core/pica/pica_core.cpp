@@ -1566,6 +1566,66 @@ std::array<ListRec, 1024> g_list_ring{};
 std::atomic<u32> g_list_ring_head{};
 
 
+namespace GsProf {
+// Render thread only (EmuProf is the emulation thread's): summed here, logged every 3 s.
+struct Sum {
+    u64 draws = 0, us = 0, vs = 0, gs = 0, out = 0, verts = 0, tris = 0;
+};
+static Sum hit, miss;
+// key hash, VS SetupBatch, Reconfigure, GS Setup, everything before SetupBatch.
+static u64 extra[5]{};
+static u64 last_log = 0;
+static void Record(bool is_hit, u64 us, u64 vs, u64 gs, u64 out, u64 verts, u64 tris) {
+    Sum& s = is_hit ? hit : miss;
+    s.draws++;
+    s.us += us;
+    s.vs += vs;
+    s.gs += gs;
+    s.out += out;
+    s.verts += verts;
+    s.tris += tris;
+    const u64 now = Common::PipelineStats::NowUs();
+    if (now - last_log >= 3'000'000) {
+        LOG_INFO(HW_GPU,
+                 "gsprof {} ms: hits {} draws {} us (out {} us, {} tris) | misses {} draws {} us "
+                 "(vs {} us, gs {} us, out {} us; {} verts in, {} tris)",
+                 (now - last_log) / 1000, hit.draws, hit.us, hit.out, hit.tris, miss.draws,
+                 miss.us, miss.vs, miss.gs, miss.out, miss.verts, miss.tris);
+        LOG_INFO(HW_GPU, "gsprof fixed: key {} us, vs setup {} us, reconfigure {} us, gs setup {} us, "
+                 "before setup {} us", extra[0], extra[1], extra[2], extra[3], extra[4]);
+        for (auto& e : extra) {
+            e = 0;
+        }
+        hit = {};
+        miss = {};
+        last_log = now;
+    }
+}
+struct ProgramStat {
+    u64 draws = 0, verts = 0, vs_interp = 0, gs_interp = 0;
+    u32 topology = 0;
+};
+static std::unordered_map<u64, ProgramStat> programs;
+static u64 programs_logged = 0;
+static void Program(u64 hash, bool vs_jit, bool gs_jit, u32 verts, u32 topology) {
+    auto& p = programs[hash];
+    p.draws++;
+    p.verts += verts;
+    p.vs_interp += vs_jit ? 0 : 1;
+    p.gs_interp += gs_jit ? 0 : 1;
+    p.topology = topology;
+    if (++programs_logged % 5000 == 0) {
+        std::string line;
+        for (const auto& [h, st] : programs) {
+            line += fmt::format(" | gs {:016x}: {} draws, {} verts, topo {}, vs interp {}, gs interp {}",
+                                h, st.draws, st.verts, st.topology, st.vs_interp, st.gs_interp);
+        }
+        LOG_INFO(HW_GPU, "gsprof programs:{}", line);
+        programs.clear();
+    }
+}
+} // namespace GsProf
+
 void PicaCore::RunShippedDraw(const DrawPayload& p) {
 #ifdef CITRA_TRACE_PROBES
     DrawTraceRunProbe();
@@ -1625,11 +1685,29 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         }
         return f == nullptr;
     }();
+    // gsprof (with emuprof): where geometry-shader draws spend the render thread's time.
+    static const bool gs_prof = Common::EmuProf::enabled;
+    const bool prof_gs = gs_prof && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
+    u64 prof_t0 = prof_gs ? Common::PipelineStats::NowUs() : 0;
+    u64 prof_vs = 0, prof_gsu = 0;
     u64 memo_key = 0;
     bool memo_record = false;
     std::vector<OutputVertex> memo_triangles;
-    if (gs_memo && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
-        primitive_assembler.IsEmpty()) {
+    // After 32 misses in a row a program runs 256 draws without the memo, then probes again
+    // (one more miss puts it back to skipping). `nogsmemoskip` keeps it always on.
+    static const bool memo_skip = !GxmRenderer::GxmFlag("nogsmemoskip");
+    bool memo_eligible = gs_memo && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
+                         primitive_assembler.IsEmpty();
+    gs_memo_program = nullptr;
+    if (memo_eligible && memo_skip) {
+        gs_memo_program = &gs_memo_programs[gs_setup.GetProgramCodeHash() ^
+                                            (u64{regs.internal.gs.main_offset} << 48)];
+        if (gs_memo_program->skip_left > 0) {
+            gs_memo_program->skip_left--;
+            memo_eligible = false;
+        }
+    }
+    if (memo_eligible) {
         const auto& r = regs.internal;
         u64 key = Common::ComputeHash64(p.arena, p.layout.total);
         key = Common::HashCombine(key, Common::ComputeHash64(&r.pipeline, sizeof(r.pipeline)));
@@ -1651,6 +1729,9 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         key = Common::HashCombine(key, u64{p.num_vertices} | (u64{p.vertex_offset} << 32) |
                                            (u64{p.is_indexed} << 63) | (u64{p.index_u16} << 62));
         memo_key = key;
+        if (prof_gs) {
+            GsProf::extra[0] += Common::PipelineStats::NowUs() - prof_t0;
+        }
         auto hit = gs_memo_cur.find(key);
         if (hit == gs_memo_cur.end()) {
             if (auto old = gs_memo_prev.find(key); old != gs_memo_prev.end()) {
@@ -1664,6 +1745,16 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
                 rasterizer->AddTriangle(tris[i], tris[i + 1], tris[i + 2]);
             }
             gs_memo_hits++;
+            if (gs_memo_program != nullptr) {
+                gs_memo_program->misses_in_row = 0;
+            }
+            if (prof_gs) {
+                const u64 t1 = Common::PipelineStats::NowUs();
+                rasterizer->DrawTriangles();
+                const u64 t2 = Common::PipelineStats::NowUs();
+                GsProf::Record(true, t2 - prof_t0, 0, 0, t2 - t1, p.num_vertices, tris.size() / 3);
+                return;
+            }
             if ((gs_memo_hits + gs_memo_misses) % 10000 == 0) {
                 LOG_INFO(HW_GPU, "geometry-shader draw memo: {} hits, {} misses, {} + {} entries",
                          gs_memo_hits, gs_memo_misses, gs_memo_cur.size(), gs_memo_prev.size());
@@ -1674,11 +1765,23 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         memo_record = true;
         triangle_record = &memo_triangles;
     }
+    const u64 sb_t = prof_gs ? Common::PipelineStats::NowUs() : 0;
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
-
+    const u64 rc_t = prof_gs ? Common::PipelineStats::NowUs() : 0;
     geometry_pipeline.Reconfigure();
+    const u64 su_t = prof_gs ? Common::PipelineStats::NowUs() : 0;
     geometry_pipeline.Setup(shader_engine.get());
     ASSERT(!geometry_pipeline.NeedIndexInput() || p.is_indexed);
+    if (prof_gs) {
+        const u64 now = Common::PipelineStats::NowUs();
+        GsProf::extra[1] += rc_t - sb_t;
+        GsProf::extra[2] += su_t - rc_t;
+        GsProf::extra[3] += now - su_t;
+        GsProf::extra[4] += sb_t - prof_t0;
+        GsProf::Program(gs_setup.GetProgramCodeHash() ^ (u64{regs.internal.gs.main_offset} << 48),
+                        vs_setup.cached_shader != nullptr, gs_setup.cached_shader != nullptr,
+                        p.num_vertices, static_cast<u32>(regs.internal.pipeline.triangle_topology.Value()));
+    }
 
     for (u32 index = 0; index < p.num_vertices; ++index) {
         // A ring-layout arena holds 16-bit indices rebased to the draw's first vertex.
@@ -1706,9 +1809,13 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             AttributeBuffer input;
             loader.LoadVertex(vertex, input, input_default_attributes);
 
+            const u64 vs_t = prof_gs ? Common::PipelineStats::NowUs() : 0;
             shader_unit.LoadInput(regs.internal.vs, input);
             shader_engine->Run(vs_setup, shader_unit);
             shader_unit.WriteOutput(regs.internal.vs, vs_output);
+            if (prof_gs) {
+                prof_vs += Common::PipelineStats::NowUs() - vs_t;
+            }
 
 
             if (p.is_indexed) {
@@ -1718,7 +1825,13 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             }
         }
 
-        geometry_pipeline.SubmitVertex(vs_output);
+        if (prof_gs) {
+            const u64 gs_t = Common::PipelineStats::NowUs();
+            geometry_pipeline.SubmitVertex(vs_output);
+            prof_gsu += Common::PipelineStats::NowUs() - gs_t;
+        } else {
+            geometry_pipeline.SubmitVertex(vs_output);
+        }
     }
 
     if (memo_record) {
@@ -1732,6 +1845,18 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             gs_memo_cur.emplace(memo_key, std::move(memo_triangles));
         }
         gs_memo_misses++;
+        if (gs_memo_program != nullptr && ++gs_memo_program->misses_in_row >= 32) {
+            gs_memo_program->misses_in_row = 31;
+            gs_memo_program->skip_left = 256;
+        }
+    }
+    if (prof_gs) {
+        const u64 t1 = Common::PipelineStats::NowUs();
+        rasterizer->DrawTriangles();
+        const u64 t2 = Common::PipelineStats::NowUs();
+        GsProf::Record(false, t2 - prof_t0, prof_vs, prof_gsu, t2 - t1, p.num_vertices,
+                       memo_triangles.size() / 3);
+        return;
     }
     rasterizer->DrawTriangles();
 }

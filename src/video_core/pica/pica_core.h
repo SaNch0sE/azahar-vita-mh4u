@@ -472,6 +472,14 @@ private:
     static constexpr std::size_t GsMemoGenerationCap = 400;
     std::unordered_map<u64, std::vector<OutputVertex>> gs_memo_cur, gs_memo_prev;
     u32 gs_memo_hits = 0, gs_memo_misses = 0;
+    /// Per geometry program: misses in a row, and draws left to run without the memo. A program
+    /// whose draws never repeat (MH4U's particles) stops paying for the key and the recording.
+    struct GsMemoProgram {
+        u32 misses_in_row = 0;
+        u32 skip_left = 0;
+    };
+    std::unordered_map<u64, GsMemoProgram> gs_memo_programs;
+    GsMemoProgram* gs_memo_program = nullptr;
     /// Semantic map for OutputVertex construction, rebuilt at each batch start.
     OutputVertexMap output_vertex_map;
     CommandList cmd_list;

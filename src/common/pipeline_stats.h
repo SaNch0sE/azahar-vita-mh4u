@@ -15,6 +15,14 @@
 
 namespace Common::PipelineStats {
 
+/// repeatdiag (render thread only): fragment-block registers whose change bumped the mirror's
+/// fragment version, by register index, and why software draws missed the repeat path.
+inline std::array<u32, 0x300> frag_reg_changes{};
+inline std::array<u32, 8> repeat_miss{};
+/// BindPrograms split (render thread): FSConfig + hash + lookup, pipeline bind, calls.
+inline u64 bp_config_us = 0, bp_pipeline_us = 0, bp_calls = 0, bp_tier2_us = 0;
+
+
 /**
  * Where the emulation thread's wall time goes when it is not running the guest.
  *

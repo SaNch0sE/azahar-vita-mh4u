@@ -1432,6 +1432,8 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     const auto& om = regs.framebuffer.output_merger;
     const auto& fb_regs = regs.framebuffer.framebuffer;
 
+    const u64 bp_t0 = Common::PipelineStats::NowUs();
+    Common::PipelineStats::bp_calls++;
     // The fragment program for this PICA configuration, compiled on the worker if new.
     Pica::Shader::FSConfig fs_config{regs};
     // These comparisons cannot reject an 8-bit alpha. Reuse the Always shader before
@@ -1532,8 +1534,11 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         }
     }
 
+    const u64 bp_t1 = Common::PipelineStats::NowUs();
+    Common::PipelineStats::bp_config_us += bp_t1 - bp_t0;
     PipelineInfo info{};
     ConsiderTier2(fs, fs_hash, &fs_config, nullptr);
+    Common::PipelineStats::bp_tier2_us += Common::PipelineStats::NowUs() - bp_t1;
     info.vertex = layout.shader;
     info.fragment = fs;
     info.stream_count = layout.stream_count;
@@ -1652,7 +1657,10 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     // The disk cache makes it a first-run cost.
     (void)vertex_count;
     DrawTrace("bind pipeline");
-    if (!pipeline_cache->BindPipeline(info)) {
+    const u64 bp_t2 = Common::PipelineStats::NowUs();
+    const bool bound = pipeline_cache->BindPipeline(info);
+    Common::PipelineStats::bp_pipeline_us += Common::PipelineStats::NowUs() - bp_t2;
+    if (!bound) {
         return false;
     }
     NoteScenePipeline(info.vertex != nullptr ? info.vertex->name.c_str() : "?",
@@ -2669,6 +2677,23 @@ void RasterizerGxm::DrawTriangles() {
             FlushDeferredDraws();
         }
         return;
+    }
+    if (!pending_ring_ranges.empty()) {
+        // repeatdiag: the first reason this draw could not join the previous one.
+        auto& m = Common::PipelineStats::repeat_miss;
+        if (!repeat_ok) {
+            m[0]++;
+        } else if (!in_scene) {
+            m[1]++;
+        } else if (key != repeat_key) {
+            m[2]++;
+        } else if (draw_epoch != repeat_epoch) {
+            m[3]++;
+        } else if (scene_seq != repeat_scene) {
+            m[4]++;
+        } else {
+            m[5]++;
+        }
     }
     repeat_ok = false;
     DrawSetup setup;
@@ -3739,6 +3764,31 @@ void RasterizerGxm::EndFrame() {
                 stat_alpha_only_feedback = 0;
                 stat_repeat_draws = 0;
                 stat_begin_repeats = 0;
+                {
+                    auto& m = Common::PipelineStats::repeat_miss;
+                    auto& c = Common::PipelineStats::frag_reg_changes;
+                    std::vector<std::pair<u32, u32>> top;
+                    for (u32 i = 0; i < c.size(); i++) {
+                        if (c[i] != 0) {
+                            top.emplace_back(c[i], i);
+                        }
+                    }
+                    std::sort(top.rbegin(), top.rend());
+                    std::string regs_line;
+                    for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 16); i++) {
+                        regs_line += fmt::format(" {:03X}:{}", top[i].second, top[i].first);
+                    }
+                    LOG_INFO(Render,
+                             "repeat misses (software draws): not ok {} no scene {} key {} epoch {} "
+                             "scene {} other {}; fragment reg changes:{}",
+                             m[0], m[1], m[2], m[3], m[4], m[5], regs_line);
+                    namespace PS = Common::PipelineStats;
+                    LOG_INFO(Render, "bind programs: {} calls, config+lookup {} us, tier2 {} us, pipeline {} us",
+                             PS::bp_calls, PS::bp_config_us, PS::bp_tier2_us, PS::bp_pipeline_us);
+                    PS::bp_calls = PS::bp_config_us = PS::bp_tier2_us = PS::bp_pipeline_us = 0;
+                    m = {};
+                    c = {};
+                }
                 if (!scene_time_agg.empty()) {
                     std::vector<SceneTimeAgg> v;
                     u64 total = 0;
