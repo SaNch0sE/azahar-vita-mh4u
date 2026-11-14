@@ -529,6 +529,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     bool keep_running = true;
     bool combo_held = false;
     SceUInt64 last_poll_us = 0;
+    SceUInt64 last_event_us = 0;
     while (!window.IsQuitRequested()) {
         // The pad and touch panel, every 2 ms at most: RunLoop returns several thousand times a
         // second, and the two peeks cost ~30 us together - a sixth of the emulation thread's
@@ -538,13 +539,26 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             window.PollEvents();
         }
 
-        // Edge triggered, and the guest must not see the frame in which the combination is
-        // pressed - it holds two buttons a title may well be reading. The PS button, locked
-        // away from the shell below, arrives as an ordinary pad bit that nothing binds for
-        // the guest; it is the same button DSVita pauses on.
+        // Edge triggered: Select + Start together opens the pause menu (the PS button belongs
+        // to the shell). Coming back from the shell opens it too, so the title waits for the
+        // player instead of running on from wherever it was suspended.
         const u32 buttons = window.ButtonsHeld();
-        const bool combo_now = (buttons & SCE_CTRL_PSBUTTON) != 0;
-        if (combo_now && !combo_held && !ui.MenuOpen()) {
+        constexpr u32 PauseCombo = SCE_CTRL_SELECT | SCE_CTRL_START;
+        const bool combo_now = (buttons & PauseCombo) == PauseCombo;
+        bool resumed = false;
+        if (const SceUInt64 now = sceKernelGetProcessTimeWide(); now - last_event_us >= 100000) {
+            last_event_us = now;
+            SceAppMgrSystemEvent event{};
+            while (sceAppMgrReceiveSystemEvent(&event) == 0) {
+                if (event.systemEvent == SCE_APPMGR_SYSTEMEVENT_ON_RESUME) {
+                    resumed = true;
+                }
+            }
+        }
+        if (((combo_now && !combo_held) || resumed) && !ui.MenuOpen()) {
+            if (resumed) {
+                LOG_INFO(Frontend, "resumed from the shell: pausing");
+            }
             ui.OpenPauseMenu();
         }
         combo_held = combo_now;
@@ -880,15 +894,12 @@ int EmulatorMain() {
     // Presents never block this thread in a vblank wait: the display queue's own thread
     // does the flip and the wait, and submission only blocks past two pending flips - which
     // the run loop's own pacing keeps from happening.
-    // The PS button would otherwise hand the display to the home menu, which this process does
-    // not survive once a core is taken; locked, its presses appear in the pad data instead, and
-    // the run loop opens the pause menu on them. The quick menu lock keeps the power slider out
-    // from under a running title. Both are held for the whole session, because the core, once
-    // taken, is taken for the whole session.
+    // The PS button and the quick menu are left to the shell. The guest runs folded into the
+    // emulation thread (azaharTakeCore's folded mode): core 2 is the kernel's again between
+    // slices, so a suspend just stops the thread between two of them like any other. The old
+    // resident design held the core for the whole session and could not survive one, which
+    // is what these used to be locked for. The pause menu is on Select + Start instead.
     sceShellUtilInitEvents(0);
-    sceShellUtilLock(static_cast<SceShellUtilLockType>(SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN |
-                                                       SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN_2 |
-                                                       SCE_SHELL_UTIL_LOCK_TYPE_QUICK_MENU));
 
     VTRACE("EmulatorMain: shell lock");
     auto& system = Core::System::GetInstance();
@@ -988,9 +999,6 @@ int EmulatorMain() {
     VitaFrontend::ShutdownInput();
     Common::Log::Stop();
 
-    sceShellUtilUnlock(static_cast<SceShellUtilLockType>(SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN |
-                                                         SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN_2 |
-                                                         SCE_SHELL_UTIL_LOCK_TYPE_QUICK_MENU));
     VitaFrontend::GxmPresent::Shutdown();
     return 0;
 }
