@@ -1769,13 +1769,15 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
                          regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
     u64 prof_t0 = prof_gs ? Common::PipelineStats::NowUs() : 0;
     u64 prof_vs = 0, prof_gsu = 0;
+    // ShadeShippedDraw: where the triangles go (the memo records into its own vector).
+    std::vector<OutputVertex>* const capture_out = capture_only ? triangle_record : nullptr;
     u64 memo_key = 0;
     bool memo_record = false;
     std::vector<OutputVertex> memo_triangles;
     // After 32 misses in a row a program runs 256 draws without the memo, then probes again
     // (one more miss puts it back to skipping). `nogsmemoskip` keeps it always on.
     static const bool memo_skip = !GxmRenderer::GxmFlag("nogsmemoskip");
-    bool memo_eligible = gs_memo && !capture_only && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
+    bool memo_eligible = gs_memo && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
                          primitive_assembler.IsEmpty();
     gs_memo_program = nullptr;
     if (memo_eligible && memo_skip) {
@@ -1820,8 +1822,12 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         }
         if (hit != gs_memo_cur.end()) {
             const auto& tris = hit->second;
-            for (std::size_t i = 0; i + 2 < tris.size(); i += 3) {
-                rasterizer->AddTriangle(tris[i], tris[i + 1], tris[i + 2]);
+            if (capture_out != nullptr) {
+                capture_out->insert(capture_out->end(), tris.begin(), tris.end());
+            } else {
+                for (std::size_t i = 0; i + 2 < tris.size(); i += 3) {
+                    rasterizer->AddTriangle(tris[i], tris[i + 1], tris[i + 2]);
+                }
             }
             gs_memo_hits++;
             if (gs_memo_program != nullptr) {
@@ -1918,7 +1924,10 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
     }
 
     if (memo_record) {
-        triangle_record = nullptr;
+        triangle_record = capture_out;
+        if (capture_out != nullptr) {
+            capture_out->insert(capture_out->end(), memo_triangles.begin(), memo_triangles.end());
+        }
         if (primitive_assembler.IsEmpty()) {
             if (gs_memo_cur.size() >= GsMemoGenerationCap) {
                 // A generation is full: the older one goes.

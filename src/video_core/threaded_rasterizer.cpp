@@ -17,6 +17,11 @@
 #include "common/pipeline_stats.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
+#include "common/vita_tuning.h"
+#ifdef __vita__
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
+#endif
 #include "common/vita_data_dir.h"
 #include "common/logging/log.h"
 #include "video_core/threaded_rasterizer.h"
@@ -812,8 +817,16 @@ void ThreadedRasterizer::QueuePreshade(Shipment* shipment) {
 }
 
 void ThreadedRasterizer::PreshadeLoop() {
-    Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
+    // Core 0, or core 3 when the GX queue (on core 0) is in use.
+    Common::SetCurrentThreadRole(Common::gx_fifo ? Common::ThreadRole::RasterWorker
+                                                 : Common::ThreadRole::ShaderCompiler);
     Common::SetCurrentThreadName("PreShade");
+#ifdef __vita__
+    // Below the DSP worker on the same core: the emulation thread waits for each DSP tick, and
+    // a screen of text glyphs once kept this worker busy enough to hold those up by ~20 ms.
+    // (The render thread shades a draw itself when this one falls behind.)
+    sceKernelChangeThreadPriority(0, SCE_KERNEL_PROCESS_PRIORITY_USER_DEFAULT + 8);
+#endif
     for (;;) {
         const u32 head = shade_head.load(std::memory_order_relaxed);
         if (shade_tail.load(std::memory_order_acquire) == head) {

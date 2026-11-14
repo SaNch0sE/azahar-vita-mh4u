@@ -21,6 +21,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include "video_core/gpu.h"
+#ifdef __vita__
+#include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
+#endif
 #include "video_core/gpu_debugger.h"
 #include "video_core/gpu_impl.h"
 #include "video_core/guest_watch.h"
@@ -270,6 +274,11 @@ bool GPU::GxFifo() const {
 
 void GPU::GxPush(std::function<void()> task) {
     auto& gx = impl->gx;
+    // Only the emulation thread pushes; known from the first push (a vblank half can come
+    // before any GSP command, and GxAcquire treats an unknown caller as a foreign thread).
+    if (gx.emu_id == std::thread::id{}) {
+        gx.emu_id = std::this_thread::get_id();
+    }
     {
         std::scoped_lock lock{gx.task_mutex};
         gx.tasks.push_back(std::move(task));
@@ -564,10 +573,19 @@ void GPU::GxStop() {
 }
 
 void GPU::GxLoop() {
-    // The shader compiler's core, idle while a title runs - or, queued (gxfifo), core 3: core 0
-    // carries the pre-shade, DSP and y2r workers.
-    Common::SetCurrentThreadRole(Common::gx_fifo ? Common::ThreadRole::RasterWorker
-                                                 : Common::ThreadRole::ShaderCompiler);
+    // The shader compiler's core (0), shared with the DSP and y2r workers; the pre-shade worker
+    // goes to core 3 when the queue is in use (ThreadedRasterizer::PreshadeLoop).
+    // `gxcore3`: core 3 instead (the kernel's core; lists parsed ~70% slower there).
+    static const bool core3 = GxmRenderer::GxmFlag("gxcore3");
+    Common::SetCurrentThreadRole(core3 ? Common::ThreadRole::RasterWorker
+                                       : Common::ThreadRole::ShaderCompiler);
+#ifdef __vita__
+    // Just below the DSP worker sharing the core: a list takes 10-20 ms, and the emulation
+    // thread waits for every DSP tick (equal priorities do not preempt each other here).
+    if (Common::gx_fifo) {
+        sceKernelChangeThreadPriority(0, SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 4);
+    }
+#endif
     Common::SetCurrentThreadName("GxLists");
     Common::EmuProf::thread_disabled = true;
     impl->gx.worker_id = std::this_thread::get_id();
@@ -653,6 +671,11 @@ void GPU::GxPoll() {
 void GPU::GxAcquire(const char* site) {
     auto& gx = impl->gx;
     if (gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Idle) {
+        return;
+    }
+    // On the GX thread itself (a queued vblank half reaching a draining call): its work is
+    // already in order, and waiting for its own queue would never end.
+    if (gx.worker_id != std::thread::id{} && std::this_thread::get_id() == gx.worker_id) {
         return;
     }
     const bool was_posted = gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted;
@@ -1761,12 +1784,17 @@ void GPU::VBlankGpuWork(const std::array<Pica::FramebufferConfig, 2>& fb_config,
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     // gxfifo: the guest-visible half stays here, on time; the GPU half (frameskip, arena
     // rotation, the present) queues behind the GX work in flight, so a list's parse may run on
-    // past the vblank. At most one such half waits: a second vblank drains the queue first.
+    // past the vblank.
     auto& gx = impl->gx;
-    if (GxFifo() && GxBusy() && gx.vblank_pending.load(std::memory_order_acquire) > 0) {
+    // Vblanks come at 60 Hz and a frame's GX work can take longer than one: up to three halves
+    // (~50 ms) may wait. The list bound (QueueCmdList) keeps the guest within a frame anyway.
+    if (GxFifo() && GxBusy() && gx.vblank_pending.load(std::memory_order_acquire) >= 3) {
         GxAcquire("gxwait: vblank bound");
     }
-    const bool defer = GxFifo() && GxBusy();
+    // Queued even when the GX thread is idle - the half costs ~4 ms (presents, snapshots) the
+    // emulation thread need not pay - but only once the render thread runs: before that the
+    // present is made by the caller itself, which has to be this thread.
+    const bool defer = GxFifo() && (GxBusy() || impl->gpu_thread.IsRunning());
     if (!defer) {
         // Stage 1: the frame's list is taken back before the vblank's frameskip and present work.
         GxAcquire("gxwait: vblank");
