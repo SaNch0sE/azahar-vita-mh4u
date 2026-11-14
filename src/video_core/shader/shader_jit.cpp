@@ -6,6 +6,7 @@
 #if CITRA_HAS_SHADER_JIT
 
 #include <chrono>
+#include <mutex>
 
 #include "common/assert.h"
 #include "common/hash.h"
@@ -46,25 +47,43 @@ void JitEngine::SetupBatch(ShaderSetup& setup, u32 entry_point) {
         }
 #endif
     } else {
-        // Every miss here is a guest shader being translated on whichever thread is running
-        // the command list, which is a stall on that thread. Logged so a hitch can be matched
-        // against a compile rather than guessed at.
-        auto shader = std::make_unique<JitShader>();
-        const auto start = std::chrono::steady_clock::now();
-        shader->Compile(&setup.GetProgramCode(), &setup.GetSwizzleData());
-        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - start)
-                            .count();
-        LOG_INFO(HW_GPU, "shader JIT compiled {:016x} entry {} in {}.{:03} ms (cached {})",
-                 cache_key, entry_point, us / 1000, us % 1000, cache.size() + 1);
-        setup.cached_shader = shader.get();
+        setup.cached_shader = nullptr;
+        std::shared_ptr<JitShader> shader = Shared(cache_key, setup, entry_point);
+        if (shader) {
+            setup.cached_shader = shader.get();
 #if CITRA_ARCH(arm32)
-        if (!shader->Compiled()) {
-            setup.cached_shader = nullptr;
-        }
+            if (!shader->Compiled()) {
+                setup.cached_shader = nullptr;
+            }
 #endif
-        cache.emplace_hint(iter, cache_key, std::move(shader));
+            cache.emplace_hint(iter, cache_key, std::move(shader));
+        }
     }
+}
+
+std::shared_ptr<JitShader> JitEngine::Shared(u64 cache_key, ShaderSetup& setup, u32 entry_point) {
+    // One compiled copy per guest shader for the whole process. The lock is held across the
+    // compile so two threads meeting the same new shader translate it once; only engine-cache
+    // misses come here, a few dozen per area.
+    static std::mutex mutex;
+    static std::unordered_map<u64, std::shared_ptr<JitShader>> shared;
+    std::scoped_lock lock{mutex};
+    if (const auto it = shared.find(cache_key); it != shared.end()) {
+        return it->second;
+    }
+    // Every compile here is a guest shader being translated on whichever thread is running
+    // the command list, which is a stall on that thread. Logged so a hitch can be matched
+    // against a compile rather than guessed at.
+    auto shader = std::make_shared<JitShader>();
+    const auto start = std::chrono::steady_clock::now();
+    shader->Compile(&setup.GetProgramCode(), &setup.GetSwizzleData());
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    LOG_INFO(HW_GPU, "shader JIT compiled {:016x} entry {} in {}.{:03} ms (shared {})", cache_key,
+             entry_point, us / 1000, us % 1000, shared.size() + 1);
+    shared.emplace(cache_key, shader);
+    return shader;
 }
 
 MICROPROFILE_DECLARE(GPU_Shader);

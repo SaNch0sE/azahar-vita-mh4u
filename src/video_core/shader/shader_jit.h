@@ -26,7 +26,13 @@ public:
     void Run(const ShaderSetup& setup, ShaderUnit& state) const override;
 
 private:
-    std::unordered_map<u64, std::unique_ptr<JitShader>> cache;
+    static std::shared_ptr<JitShader> Shared(u64 cache_key, ShaderSetup& setup, u32 entry_point);
+
+    /// This engine's view of the process-wide cache (shader_jit.cpp): looked up without a lock.
+    /// Every engine - the emulation thread's, the pre-shade worker's, the render thread's - used
+    /// to compile its own copy of each shader into the one fixed A32 code arena on the Vita,
+    /// which filled it within a few areas and left later shaders interpreted.
+    std::unordered_map<u64, std::shared_ptr<JitShader>> cache;
     /// For a shader the JIT could not place (A32 on the PS Vita: its code arena is full).
     InterpreterEngine fallback;
 };
