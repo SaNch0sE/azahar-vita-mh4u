@@ -189,3 +189,28 @@ title ~48 s in ("No more processes"). What did work is not copying: `pica/vertex
 the GPU copy of vertex data that has not changed (guest write tracking, plus Memory::host_write_hook
 and the rasterizer's invalidations for the emulator's own writes): 77% of hardware draws hit on the
 deck, the copy fell to 3.8 MB/s and the deck reached 100% speed.
+
+## Movie, village hub (2026-11-14)
+
+The intro movie ran at 33% (10 fps). Its decoder thread polled an empty queue in a tight loop
+(0x968764), so guest time never idled and every millisecond of host work (y2r, HLE) cut the
+speed; the branch now sleeps 1 ms when taken (`nofmvsleep`). y2r converts on a core-0 worker,
+asynchronously, finishing ~4 ms of guest time later with the emulation thread taking the rest
+if the guest gets there first (`noy2rasync`). The pad and touch peeks ran on every RunLoop
+return (~5000/s, ~30 us each) and now run every 2 ms. Release: intro 30 fps.
+
+The village hub (the user's second save) was render-thread bound: game ~27 fps, 16-18 shown.
+~1800 point-mode geometry-shader particle draws a second (one program, all distinct) and
+~4000 full draw setups a second (textures and TEV constants change on most draws):
+
+- GS memo skipped for programs that never hit (`nogsmemoskip`).
+- Target lookup reused when nothing it depends on changed (`nofbreuse`; RasterizerCache
+  MutationGen counts the cache changes that matter).
+- Texture lookups memoized per configuration while the surface's modification_tick and the
+  set of registered surfaces are unchanged (`notexmemo`).
+- BindPipeline answers a repeated request without hashing.
+- Pre-shading: a core-0 worker with its own mirror runs VS+GS for point-mode GS draws ahead of
+  the render thread (`nopreshade` or ux0:data/mh4u/nopreshade).
+
+Release hub: shown 24-25 fps, equal to the game's rate; the emulation thread (PICA command
+processing, ~60% of it in the hub) is the limit again. Deck: 30 fps in both views.
