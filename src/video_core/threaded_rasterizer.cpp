@@ -808,6 +808,17 @@ void ThreadedRasterizer::ReleaseShipment(Shipment* shipment) {
     shipment->vs.code.reset();
     shipment->gs.code.reset();
     shipment->lighting_luts.reset();
+    // The same for the shaded triangles: a geometry-shader draw's vertices (~20 KiB) used to
+    // stay as capacity in whichever shipment carried it, and over a long walk nearly all of the
+    // ~1600 pooled shipments had - 32 MB, the rest of the heap growth that ran the village out
+    // of memory. Kept only when small.
+    constexpr std::size_t KeepVertices = 64;
+    if (shipment->vertices.capacity() > KeepVertices) {
+        std::vector<Pica::OutputVertex>().swap(shipment->vertices);
+    }
+    if (shipment->ranges.capacity() > KeepVertices) {
+        std::vector<VertexRingRange>().swap(shipment->ranges);
+    }
     // Last: the emulation thread may take and reset the shipment right after.
     ReturnShipment(shipment);
 }
