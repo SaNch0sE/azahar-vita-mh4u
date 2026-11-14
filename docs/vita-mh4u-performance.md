@@ -280,3 +280,10 @@ direction starts, which are vblank frame skips from arena backpressure.
 - **Third arena slot**: seconds under 28 fps 5/7 -> 3/2 per walk. (Tried before the memory fix
   it ran the process out of heap.)
 - A spurious resume event mid-load opened the pause menu; it now needs a real wall-clock stop.
+- **Long walks (3x the route, ~3.5 min)** still ran out of heap after the LUT fix: the pre-shade
+  worker's recorded triangles (~20 KiB per geometry-shader draw) stayed as capacity in the ~1600
+  pooled shipments (32 MB), and with fragmentation the heap failed at ~217 MB live of 240. Vertex
+  and ring-range buffers over 64 entries are now freed on release: live heap peaks ~195 MB and
+  falls back; release long walk 204 s, no crash, 29.65 fps shown; short-walk fps unchanged.
+  Found with the tracer's live table, now appended to `ux0:data/mh4u/live.txt` (the TTY drops
+  lines under load).
