@@ -9,6 +9,7 @@
 // the frontend prints the largest once a second. Emulation thread only: no locking.
 
 #include <algorithm>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,10 +30,18 @@ inline std::unordered_map<std::string, Entry> entries;
 /// Literal keys, by address: no string is built or hashed per call (the string-keyed Add costs
 /// a few microseconds on the Vita, which distorted fine-grained timings).
 inline std::unordered_map<const char*, Entry> literal_entries;
+/// emuprofgx: the GX thread records instead of the emulation thread (which is then disabled),
+/// and the report is taken on another thread, so the maps need the lock.
+inline bool gx_thread = false;
+inline std::mutex mutex;
 
 inline void Add(const std::string& key, u64 us) {
     if (thread_disabled) {
         return;
+    }
+    std::unique_lock lock{mutex, std::defer_lock};
+    if (gx_thread) {
+        lock.lock();
     }
     auto& e = entries[key];
     e.us += us;
@@ -42,6 +51,10 @@ inline void Add(const char* key, u64 us) {
     if (thread_disabled) {
         return;
     }
+    std::unique_lock lock{mutex, std::defer_lock};
+    if (gx_thread) {
+        lock.lock();
+    }
     auto& e = literal_entries[key];
     e.us += us;
     e.count++;
@@ -49,12 +62,19 @@ inline void Add(const char* key, u64 us) {
 
 /// The `top` largest entries since the last call, as one line; clears them.
 inline std::string TakeReport(std::size_t top = 12) {
+    std::unique_lock lock{mutex, std::defer_lock};
+    if (gx_thread) {
+        lock.lock();
+    }
     std::vector<std::pair<std::string, Entry>> v(entries.begin(), entries.end());
     entries.clear();
     for (const auto& [key, e] : literal_entries) {
         v.emplace_back(key, e);
     }
     literal_entries.clear();
+    if (lock.owns_lock()) {
+        lock.unlock();
+    }
     std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
     std::string out;
     for (std::size_t i = 0; i < std::min(top, v.size()); i++) {

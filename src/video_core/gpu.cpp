@@ -587,7 +587,7 @@ void GPU::GxLoop() {
     }
 #endif
     Common::SetCurrentThreadName("GxLists");
-    Common::EmuProf::thread_disabled = true;
+    Common::EmuProf::thread_disabled = !Common::EmuProf::gx_thread;
     impl->gx.worker_id = std::this_thread::get_id();
     auto& gx = impl->gx;
     const bool fifo = Common::gx_fifo;

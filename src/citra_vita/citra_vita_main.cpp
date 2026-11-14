@@ -931,7 +931,9 @@ int EmulatorMain() {
     Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
     Settings::values.use_cpu_jit = false;
     Settings::values.disable_right_eye_render = true;
-    Common::EmuProf::enabled = GxmRenderer::GxmFlag("emuprof");
+    Common::EmuProf::enabled = GxmRenderer::GxmFlag("emuprof") || GxmRenderer::GxmFlag("emuprofgx");
+    Common::EmuProf::gx_thread = GxmRenderer::GxmFlag("emuprofgx");
+    Common::EmuProf::thread_disabled = Common::EmuProf::gx_thread;
     Common::dsp_parallel = !GxmRenderer::GxmFlag("nodspthread");
     Common::dsp_pipelined = !GxmRenderer::GxmFlag("nodsppipe");
     Common::y2r_fast = !GxmRenderer::GxmFlag("noy2rfast");

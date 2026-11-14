@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include "common/emu_prof.h"
 #include "common/arch.h"
 #if CITRA_HAS_SHADER_JIT
 
@@ -80,6 +81,7 @@ std::shared_ptr<JitShader> JitEngine::Shared(u64 cache_key, ShaderSetup& setup, 
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - start)
                         .count();
+    Common::EmuProf::Add("vs jit compile", static_cast<u64>(us));
     LOG_INFO(HW_GPU, "shader JIT compiled {:016x} entry {} in {}.{:03} ms (shared {})", cache_key,
              entry_point, us / 1000, us % 1000, shared.size() + 1);
     shared.emplace(cache_key, shader);
