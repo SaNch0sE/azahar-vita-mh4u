@@ -105,6 +105,9 @@ PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> 
                 triangle_record->push_back(v1);
                 triangle_record->push_back(v2);
             }
+            if (capture_only) {
+                return;
+            }
             rasterizer->AddTriangle(v0, v1, v2);
         };
         const auto vertex = OutputVertex(output_vertex_map, buffer);
@@ -1647,7 +1650,9 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         geometry_pipeline.Setup(shader_engine.get());
         geometry_pipeline.SubmitVertex(output);
 
-        rasterizer->DrawTriangles();
+        if (!capture_only) {
+            rasterizer->DrawTriangles();
+        }
         return;
     }
 
@@ -1687,7 +1692,8 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
     }();
     // gsprof (with emuprof): where geometry-shader draws spend the render thread's time.
     static const bool gs_prof = Common::EmuProf::enabled;
-    const bool prof_gs = gs_prof && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
+    const bool prof_gs = gs_prof && !capture_only &&
+                         regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
     u64 prof_t0 = prof_gs ? Common::PipelineStats::NowUs() : 0;
     u64 prof_vs = 0, prof_gsu = 0;
     u64 memo_key = 0;
@@ -1696,7 +1702,7 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
     // After 32 misses in a row a program runs 256 draws without the memo, then probes again
     // (one more miss puts it back to skipping). `nogsmemoskip` keeps it always on.
     static const bool memo_skip = !GxmRenderer::GxmFlag("nogsmemoskip");
-    bool memo_eligible = gs_memo && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
+    bool memo_eligible = gs_memo && !capture_only && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
                          primitive_assembler.IsEmpty();
     gs_memo_program = nullptr;
     if (memo_eligible && memo_skip) {
@@ -1750,7 +1756,9 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             }
             if (prof_gs) {
                 const u64 t1 = Common::PipelineStats::NowUs();
-                rasterizer->DrawTriangles();
+                if (!capture_only) {
+            rasterizer->DrawTriangles();
+        }
                 const u64 t2 = Common::PipelineStats::NowUs();
                 GsProf::Record(true, t2 - prof_t0, 0, 0, t2 - t1, p.num_vertices, tris.size() / 3);
                 return;
@@ -1759,7 +1767,9 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
                 LOG_INFO(HW_GPU, "geometry-shader draw memo: {} hits, {} misses, {} + {} entries",
                          gs_memo_hits, gs_memo_misses, gs_memo_cur.size(), gs_memo_prev.size());
             }
+            if (!capture_only) {
             rasterizer->DrawTriangles();
+        }
             return;
         }
         memo_record = true;
@@ -1852,13 +1862,30 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
     }
     if (prof_gs) {
         const u64 t1 = Common::PipelineStats::NowUs();
-        rasterizer->DrawTriangles();
+        if (!capture_only) {
+            rasterizer->DrawTriangles();
+        }
         const u64 t2 = Common::PipelineStats::NowUs();
         GsProf::Record(false, t2 - prof_t0, prof_vs, prof_gsu, t2 - t1, p.num_vertices,
                        memo_triangles.size() / 3);
         return;
     }
-    rasterizer->DrawTriangles();
+    if (!capture_only) {
+            rasterizer->DrawTriangles();
+        }
+}
+
+bool PicaCore::ShadeShippedDraw(const DrawPayload& payload, std::vector<OutputVertex>& out) {
+    out.clear();
+    if (payload.immediate || !primitive_assembler.IsEmpty()) {
+        return false;
+    }
+    capture_only = true;
+    triangle_record = &out;
+    RunShippedDraw(payload);
+    triangle_record = nullptr;
+    capture_only = false;
+    return primitive_assembler.IsEmpty();
 }
 
 PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u32 size) {

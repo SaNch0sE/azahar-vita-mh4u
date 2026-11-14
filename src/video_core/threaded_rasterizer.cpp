@@ -15,6 +15,9 @@
 #include "video_core/guest_watch.h"
 #include "common/emu_prof.h"
 #include "common/pipeline_stats.h"
+#include "common/thread.h"
+#include "common/vita_data_dir.h"
+#include "common/logging/log.h"
 #include "video_core/threaded_rasterizer.h"
 
 namespace VideoCore {
@@ -51,7 +54,8 @@ void ThreadedRasterizer::ApplySetup(Pica::ShaderSetup& setup, const SetupSync& s
 }
 
 /// Applies a shipment's state to the render thread's mirror.
-void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& shipment) {
+void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& shipment,
+                                       bool count_stats) {
     // The blocks a software draw's fragment side reads (RasterizerGxm::RepeatKey), as one
     // register index range each.
     static constexpr std::array<std::pair<u32, u32>, 4> fragment_blocks{{
@@ -95,7 +99,8 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
             }
             in_block &= !fragment_ignored[index];
             fragment_changed |= in_block;
-            if (in_block && index < Common::PipelineStats::frag_reg_changes.size()) {
+            if (count_stats && in_block &&
+                index < Common::PipelineStats::frag_reg_changes.size()) {
                 Common::PipelineStats::frag_reg_changes[index]++;
             }
         }
@@ -558,13 +563,13 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
     // Two pointers: libstdc++'s std::function keeps a closure that small inline (8 bytes on the
     // Vita), where the three-pointer one was a malloc here and a free on the render thread for
     // every draw.
+    QueuePreshade(shipment);
     const auto op = [this, shipment] {
-        ArenaSlot* const arena_slot = shipment->arena_slot;
         ApplyShipment(mirror_pica, *shipment);
         const u32 watch = GuestWatch::Read();
         if (!shipment->draw.hw || !real->AccelerateShippedDraw(shipment->draw)) {
             const u64 sw_start = Common::PipelineStats::NowUs();
-            mirror_pica.RunShippedDraw(shipment->draw);
+            RunSoftwareDraw(*shipment);
             Common::PipelineStats::sw_shaded_us.fetch_add(
                 Common::PipelineStats::NowUs() - sw_start, std::memory_order_relaxed);
             Common::PipelineStats::sw_shaded_draws.fetch_add(1, std::memory_order_relaxed);
@@ -582,14 +587,7 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
                               fb.GetDepthBufferPhysicalAddress(),
                               (fb.GetWidth() << 16) | fb.GetHeight());
         }
-        if (arena_slot) {
-            arena_slot->pending.fetch_sub(1, std::memory_order_acq_rel);
-        }
-        if (shipment->owned_arena_bytes) {
-            emergency_bytes.fetch_sub(shipment->owned_arena_bytes, std::memory_order_relaxed);
-        }
-        // Last: the emulation thread may take and reset the shipment right after.
-        ReturnShipment(shipment);
+        ReleaseShipment(shipment);
     };
     static_assert(sizeof(op) <= 2 * sizeof(void*) && std::is_trivially_copyable_v<decltype(op)>);
     gpu_thread.EnqueueFromProducer({.run = op});
@@ -651,6 +649,7 @@ void ThreadedRasterizer::DrawTriangles() {
     }
 
     CollectState(*shipment);
+    QueuePreshade(shipment);
 
     gpu_thread.Enqueue({.run = [this, shipment] {
         ApplyShipment(mirror_pica, *shipment);
@@ -666,7 +665,7 @@ void ThreadedRasterizer::DrawTriangles() {
             real->DrawTriangles();
             ReturnBuffer(std::move(shipment->vertices));
         }
-        ReturnShipment(shipment);
+        ReleaseShipment(shipment);
     }});
 }
 
@@ -742,6 +741,136 @@ ThreadedRasterizer::Shipment* ThreadedRasterizer::TakeShipment() {
     }
     shipment_pool.push_back(std::make_unique<Shipment>());
     return shipment_pool.back().get();
+}
+
+void ThreadedRasterizer::ReleaseShipment(Shipment* shipment) {
+    if (shipment->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return;
+    }
+    if (shipment->arena_slot) {
+        shipment->arena_slot->pending.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    if (shipment->owned_arena_bytes) {
+        emergency_bytes.fetch_sub(shipment->owned_arena_bytes, std::memory_order_relaxed);
+    }
+    // Last: the emulation thread may take and reset the shipment right after.
+    ReturnShipment(shipment);
+}
+
+ThreadedRasterizer::~ThreadedRasterizer() {
+    if (shade_thread.joinable()) {
+        shade_quit.store(true, std::memory_order_release);
+        shade_thread.join();
+    }
+}
+
+void ThreadedRasterizer::EnablePreshade(Memory::MemorySystem& memory) {
+    // `nopreshade` (diagnostic flag), or ux0:data/mh4u/nopreshade in any build.
+    std::FILE* off = std::fopen(VITA_DATA_DIR "/nopreshade", "rb");
+    if (off != nullptr) {
+        std::fclose(off);
+    }
+    if (preshade || off != nullptr || GxmRenderer::GxmFlag("nopreshade")) {
+        LOG_INFO(Render, "pre-shading off");
+        return;
+    }
+    shade_pica = std::make_unique<Pica::PicaCore>(memory, nullptr);
+    shade_ring = std::make_unique<Shipment*[]>(ShadeRingSize);
+    preshade = true;
+    shade_thread = std::thread([this] { PreshadeLoop(); });
+}
+
+void ThreadedRasterizer::QueuePreshade(Shipment* shipment) {
+    if (!preshade) {
+        return;
+    }
+    // Point-mode geometry-shader draws in software: the GS does not write its own uniforms
+    // (FixedPrimitive does), so the two mirrors stay identical whichever thread shades.
+    const auto& pipeline = emu_pica.regs.internal.pipeline;
+    const bool eligible = shipment->has_draw && !shipment->draw.hw && !shipment->draw.immediate &&
+                          pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes &&
+                          pipeline.gs_config.mode == Pica::PipelineRegs::GSMode::Point;
+    shipment->shade_state.store(eligible ? ShadePending : ShadeNone, std::memory_order_relaxed);
+    shipment->refs.store(2, std::memory_order_relaxed);
+    const u32 tail = shade_tail.load(std::memory_order_relaxed);
+    while (tail - shade_head.load(std::memory_order_acquire) >= ShadeRingSize) {
+        std::this_thread::yield(); // full: the worker is thousands of shipments behind
+    }
+    shade_ring[tail % ShadeRingSize] = shipment;
+    // No wake-up: the worker polls (PreshadeLoop). Waking it per shipment was a kernel call
+    // each, ~12 us on the emulation thread thousands of times a second.
+    shade_tail.store(tail + 1, std::memory_order_release);
+}
+
+void ThreadedRasterizer::PreshadeLoop() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
+    Common::SetCurrentThreadName("PreShade");
+    for (;;) {
+        const u32 head = shade_head.load(std::memory_order_relaxed);
+        if (shade_tail.load(std::memory_order_acquire) == head) {
+            // Empty: spin a little (the next shipment is usually microseconds away), then sleep.
+            bool got = false;
+            for (int i = 0; i < 200 && !got; i++) {
+                got = shade_tail.load(std::memory_order_acquire) != head;
+            }
+            if (!got) {
+                if (shade_quit.load(std::memory_order_acquire)) {
+                    return;
+                }
+                // Polled rather than woken: shipments wait here at most this long, while the
+                // render thread runs most of a frame behind the emulation thread anyway.
+                std::this_thread::sleep_for(std::chrono::microseconds(150));
+            }
+            continue;
+        }
+        Shipment* const shipment = shade_ring[head % ShadeRingSize];
+        shade_head.store(head + 1, std::memory_order_release);
+        // Every shipment, in order, so this mirror's vertex-side state is the render mirror's
+        // at the same draw.
+        ApplyShipment(*shade_pica, *shipment, false);
+        u32 expected = ShadePending;
+        if (!shade_quit.load(std::memory_order_relaxed) &&
+            shipment->shade_state.compare_exchange_strong(
+                               expected, ShadeRunning, std::memory_order_acq_rel)) {
+            shipment->shade_ok = shade_pica->ShadeShippedDraw(shipment->draw, shipment->vertices);
+            shipment->shade_state.store(ShadeDone, std::memory_order_release);
+        }
+        ReleaseShipment(shipment);
+    }
+}
+
+void ThreadedRasterizer::RunSoftwareDraw(Shipment& shipment) {
+    namespace PS = Common::PipelineStats;
+    u32 state = shipment.shade_state.load(std::memory_order_acquire);
+    if (state == ShadePending &&
+        shipment.shade_state.compare_exchange_strong(state, ShadeStolen,
+                                                     std::memory_order_acq_rel)) {
+        PS::preshade_stolen.fetch_add(1, std::memory_order_relaxed);
+        mirror_pica.RunShippedDraw(shipment.draw);
+        return;
+    }
+    if (state == ShadeRunning) {
+        PS::preshade_waited.fetch_add(1, std::memory_order_relaxed);
+        while ((state = shipment.shade_state.load(std::memory_order_acquire)) == ShadeRunning) {
+            std::this_thread::yield();
+        }
+    }
+    // The worker's triangles stand in for this mirror's shading only when its primitive
+    // assembler is as empty as the worker's was: a GS draw then starts and ends with it empty.
+    if (state == ShadeDone && shipment.shade_ok &&
+        mirror_pica.GetPrimitiveAssembler().IsEmpty()) {
+        PS::preshade_used.fetch_add(1, std::memory_order_relaxed);
+        const auto& v = shipment.vertices;
+        for (std::size_t i = 0; i + 2 < v.size(); i += 3) {
+            real->AddTriangle(v[i], v[i + 1], v[i + 2]);
+        }
+        real->DrawTriangles();
+        return;
+    }
+    if (state == ShadeDone) {
+        PS::preshade_refused.fetch_add(1, std::memory_order_relaxed);
+    }
+    mirror_pica.RunShippedDraw(shipment.draw);
 }
 
 void ThreadedRasterizer::ReturnShipment(Shipment* shipment) {

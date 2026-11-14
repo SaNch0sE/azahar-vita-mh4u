@@ -444,6 +444,11 @@ public:
     /// Executes a shipped draw against this core's registers, shader setup and rasterizer.
     /// Runs on the render thread against the mirror; everything it reads was shipped.
     void RunShippedDraw(const DrawPayload& payload);
+    /// The vertex and geometry shading of a shipped draw only, its triangles appended to `out`
+    /// instead of reaching the rasterizer (the pre-shade worker's mirror; no memo). False when
+    /// the primitive assembler was not empty before or after, so the result cannot stand in
+    /// for the draw on another mirror.
+    bool ShadeShippedDraw(const DrawPayload& payload, std::vector<OutputVertex>& out);
 
     /// Freezes the current draw into an arena and ships it (hw = GLSL path with software
     /// fallback). Returns false when the draw must be handled locally instead.
@@ -468,6 +473,8 @@ private:
     /// While set, every triangle the software path hands the rasterizer is appended here too
     /// (RunShippedDraw's geometry-shader draw memo records a draw's output with it).
     std::vector<OutputVertex>* triangle_record = nullptr;
+    /// ShadeShippedDraw: triangles go only to triangle_record, nothing is drawn.
+    bool capture_only = false;
     /// RunShippedDraw's geometry-shader draw memo: recorded triangles by input key.
     static constexpr std::size_t GsMemoGenerationCap = 400;
     std::unordered_map<u64, std::vector<OutputVertex>> gs_memo_cur, gs_memo_prev;

@@ -10,6 +10,8 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <optional>
 #include <vector>
 #include <functional>
@@ -126,6 +128,13 @@ class ThreadedRasterizer final : public RasterizerInterface {
 public:
     explicit ThreadedRasterizer(GpuThread& gpu_thread, Pica::PicaCore& emu_pica,
                                 Pica::PicaCore& mirror_pica);
+    ~ThreadedRasterizer() override;
+
+    /// Pre-shading (`nopreshade` keeps it off): a worker on core 0 with its own mirror applies
+    /// every shipment in order and shades point-mode geometry-shader draws ahead of the render
+    /// thread, which then only hands their triangles to the GPU. The render thread shades a
+    /// draw itself when the worker has not started it, or when the result cannot stand in.
+    void EnablePreshade(Memory::MemorySystem& memory);
 
     /// The real rasterizer is recreated with the renderer; rebind after each recreation.
     void SetRealRasterizer(RasterizerInterface* real);
@@ -391,6 +400,10 @@ private:
         ArenaSlot* arena_slot = nullptr;
         /// Next in the free stack (TakeShipment / ReturnShipment).
         Shipment* next_free = nullptr;
+        /// Pre-shading: holders (render op, worker) and the draw's state (PreshadeState).
+        std::atomic<u32> refs{1};
+        std::atomic<u32> shade_state{0};
+        bool shade_ok = false;
 
         void Reset() {
             vertices.clear();
@@ -411,8 +424,32 @@ private:
             fog.reset();
             proctex.reset();
             arena_slot = nullptr;
+            refs.store(1, std::memory_order_relaxed);
+            shade_state.store(0, std::memory_order_relaxed);
+            shade_ok = false;
         }
     };
+    enum PreshadeState : u32 { ShadeNone, ShadePending, ShadeRunning, ShadeDone, ShadeStolen };
+    /// One holder done with the shipment; the last one releases the draw's arena and returns it.
+    void ReleaseShipment(Shipment* shipment);
+    /// The render thread's part of a software draw: the worker's triangles, or its own shading.
+    void RunSoftwareDraw(Shipment& shipment);
+    /// Hands a shipment to the worker (after CollectState, before the render op is queued).
+    void QueuePreshade(Shipment* shipment);
+    void PreshadeLoop();
+    std::unique_ptr<Pica::PicaCore> shade_pica;
+    std::thread shade_thread;
+    std::mutex shade_mutex;
+    std::condition_variable shade_cv;
+    /// Single producer (emulation thread), single consumer (worker): no lock on the way in,
+    /// and the worker is only woken when it went to sleep.
+    static constexpr u32 ShadeRingSize = 8192;
+    std::unique_ptr<Shipment*[]> shade_ring;
+    std::atomic<u32> shade_head{0}; ///< next to pop (worker)
+    std::atomic<u32> shade_tail{0}; ///< next to push (emulation thread)
+    std::atomic<bool> shade_sleeping{false};
+    std::atomic<bool> shade_quit{false};
+    bool preshade = false;
 
     Shipment* TakeShipment();
     void ReturnShipment(Shipment* shipment);
@@ -423,7 +460,8 @@ private:
     std::atomic<Shipment*> free_head{nullptr};
 
     static void ApplySetup(Pica::ShaderSetup& setup, const SetupSync& sync);
-    static void ApplyShipment(Pica::PicaCore& mirror, const Shipment& shipment);
+    static void ApplyShipment(Pica::PicaCore& mirror, const Shipment& shipment,
+                              bool count_stats = true);
     void CollectState(Shipment& shipment);
 
     /// One bit per 4 KiB page over the window the PICA can actually target

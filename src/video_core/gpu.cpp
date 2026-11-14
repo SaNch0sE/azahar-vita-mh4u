@@ -225,6 +225,7 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
     impl->shipping_rasterizer = std::make_unique<ThreadedRasterizer>(
         impl->gpu_thread, impl->pica, impl->pica_mirror);
     impl->shipping_rasterizer->SetRealRasterizer(impl->rasterizer);
+    impl->shipping_rasterizer->EnablePreshade(impl->memory);
     // The software renderer's rendered output lands in guest RAM on the render thread, and its
     // fills and transfers run on the CPU against guest RAM too - GL absorbs both into the host
     // GPU and never writes there. So its completion interrupts ride the render-thread queue:
@@ -1578,6 +1579,7 @@ void GPU::RecreateRendererLocked(Frontend::EmuWindow& emu_window,
 
     // PICA keeps driving the shipping facade; only the facade's target changes
     impl->shipping_rasterizer->SetRealRasterizer(impl->rasterizer);
+    impl->shipping_rasterizer->EnablePreshade(impl->memory);
     // The software renderer's rendered output lands in guest RAM on the render thread, and its
     // fills and transfers run on the CPU against guest RAM too - GL absorbs both into the host
     // GPU and never writes there. So its completion interrupts ride the render-thread queue:

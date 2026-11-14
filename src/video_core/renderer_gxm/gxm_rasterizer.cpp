@@ -3851,6 +3851,9 @@ void RasterizerGxm::EndFrame() {
                              "scene {} other {}; fragment reg changes:{}",
                              m[0], m[1], m[2], m[3], m[4], m[5], regs_line);
                     namespace PS = Common::PipelineStats;
+                    LOG_INFO(Render, "pre-shade: used {} stolen {} waited {} refused {}",
+                             PS::preshade_used.exchange(0), PS::preshade_stolen.exchange(0),
+                             PS::preshade_waited.exchange(0), PS::preshade_refused.exchange(0));
                     LOG_INFO(Render, "target lookups reused: {}; texture memo {} hits, {} misses",
                              stat_target_reuses, stat_tex_memo_hits, stat_tex_memo_misses);
                     stat_target_reuses = 0;

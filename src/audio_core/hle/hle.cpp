@@ -173,8 +173,15 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
 }
 
 void DspHle::Impl::JoinPipe() const {
+    if (!pipe_busy.load(std::memory_order_acquire)) {
+        return;
+    }
+    const u64 t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     while (pipe_busy.load(std::memory_order_acquire)) {
         std::this_thread::yield();
+    }
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add("dsp: join wait", Common::PipelineStats::NowUs() - t0);
     }
 }
 
