@@ -390,8 +390,8 @@ private:
         Pica::DirtyRegs dirty;
         // LUT blocks travel only when their dirty flags fired since the last shipment.
         /// Lighting LUTs: only the ones flagged dirty travel, a kilobyte each, into a buffer
-        /// the shipment keeps across reuse (the whole block was 24.5 KB, copied twice per
-        /// shipment, 1300 times a second on SM3DL).
+        /// allocated for the shipment and freed when it is released (the whole block was
+        /// 24.5 KB, copied twice per shipment, 1300 times a second on SM3DL).
         u32 lighting_dirty = 0;
         std::unique_ptr<std::array<std::array<u32, 256>, 24>> lighting_luts;
         std::unique_ptr<Pica::PicaCore::Fog> fog;
@@ -415,6 +415,10 @@ private:
             vs.has_code = false;
             gs.has_uniforms = false;
             gs.has_code = false;
+            // Freed on release already (ReleaseShipment); see there.
+            vs.code.reset();
+            gs.code.reset();
+            lighting_luts.reset();
             has_default_attrs = false;
             pa_reconfigure_events = 0;
             pa_reset_events = 0;

@@ -800,6 +800,14 @@ void ThreadedRasterizer::ReleaseShipment(Shipment* shipment) {
     if (shipment->owned_arena_bytes) {
         emergency_bytes.fetch_sub(shipment->owned_arena_bytes, std::memory_order_relaxed);
     }
+    // The two large per-shipment buffers - a program copy (~20 KiB) and the lighting LUT block
+    // (24 KiB) - are freed here rather than kept for reuse: the free list holds every shipment
+    // that was ever in flight (~950 with the GX queue's frame of overlap), and nearly all of
+    // them end up having carried a LUT change, which was ~23 MB of heap that never came back
+    // (out-of-memory while walking the village, 2026-11-14).
+    shipment->vs.code.reset();
+    shipment->gs.code.reset();
+    shipment->lighting_luts.reset();
     // Last: the emulation thread may take and reset the shipment right after.
     ReturnShipment(shipment);
 }
