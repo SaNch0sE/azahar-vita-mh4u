@@ -223,7 +223,8 @@ static void WriteTileToOutput(u32* output, const ImageTile& tile, int height, in
  * place (strip, tile, Morton index, B G R as EncodeRGB8 lays it out). The general path made four
  * scalar passes per pixel (~19 ms a 512x240 frame on the Vita). Returns false for anything else.
  */
-static bool PerformConversionFast(Memory::MemorySystem& memory, const ConversionConfiguration& cvt) {
+bool PrepareFastJob(Memory::MemorySystem& memory, const ConversionConfiguration& cvt,
+                    FastJob& job) {
     const u32 width = cvt.input_line_width;
     const u32 lines = cvt.input_lines;
     if (cvt.input_format != InputFormat::YUV420_Indiv8 ||
@@ -238,121 +239,150 @@ static bool PerformConversionFast(Memory::MemorySystem& memory, const Conversion
     const u32 u_stride = cvt.src_U.transfer_unit + cvt.src_U.gap;
     const u32 v_stride = cvt.src_V.transfer_unit + cvt.src_V.gap;
     const u32 dst_stride = cvt.dst.transfer_unit + cvt.dst.gap;
-    // Every row must resolve to host memory before anything is written.
+    // Every row resolved to host memory now, on the emulation thread: nothing is written unless
+    // all of them do, and the strips can then be converted anywhere, in any order.
+    job.width = width;
+    job.strips = lines / 8;
+    job.y.resize(lines);
+    job.u.resize(lines / 2);
+    job.v.resize(lines / 2);
+    job.dst.resize(lines / 8);
     for (u32 y = 0; y < lines; y++) {
-        if (memory.GetPointer(cvt.src_Y.address + y * y_stride) == nullptr ||
-            memory.GetPointer(cvt.src_U.address + (y / 2) * u_stride) == nullptr ||
-            memory.GetPointer(cvt.src_V.address + (y / 2) * v_stride) == nullptr) {
+        job.y[y] = memory.GetPointer(cvt.src_Y.address + y * y_stride);
+        if (job.y[y] == nullptr) {
+            return false;
+        }
+    }
+    for (u32 y = 0; y < lines / 2; y++) {
+        job.u[y] = memory.GetPointer(cvt.src_U.address + y * u_stride);
+        job.v[y] = memory.GetPointer(cvt.src_V.address + y * v_stride);
+        if (job.u[y] == nullptr || job.v[y] == nullptr) {
             return false;
         }
     }
     for (u32 strip = 0; strip < lines / 8; strip++) {
-        if (memory.GetPointer(cvt.dst.address + strip * dst_stride) == nullptr ||
+        job.dst[strip] = memory.GetPointer(cvt.dst.address + strip * dst_stride);
+        if (job.dst[strip] == nullptr ||
             memory.GetPointer(cvt.dst.address + strip * dst_stride + cvt.dst.transfer_unit - 1) ==
                 nullptr) {
             return false;
         }
     }
     const auto& c = cvt.coefficients;
-    const s32 c0 = c[0], c1 = c[1], c2 = c[2], c3 = c[3], c4 = c[4];
     constexpr s32 rounding_offset = 0x18;
-    const s32 k5 = c[5] + rounding_offset, k6 = c[6] + rounding_offset,
-              k7 = c[7] + rounding_offset;
-    const auto clamp8 = [](s32 v) -> u8 { return static_cast<u8>(std::clamp(v >> 5, 0, 0xFF)); };
+    job.c0 = c[0];
+    job.c1 = c[1];
+    job.c2 = c[2];
+    job.c3 = c[3];
+    job.c4 = c[4];
+    job.k5 = c[5] + rounding_offset;
+    job.k6 = c[6] + rounding_offset;
+    job.k7 = c[7] + rounding_offset;
+    return true;
+}
+
+void ConvertFastStrip(const FastJob& job, u32 strip) {
+    const u32 width = job.width;
+    const s32 c0 = job.c0, c1 = job.c1, c2 = job.c2, c3 = job.c3, c4 = job.c4;
+    const s32 k5 = job.k5, k6 = job.k6, k7 = job.k7;
+    u8* const strip_out = job.dst[strip];
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     // Eight pixels of two neighbouring rows at a time (they share a chroma row). Exact:
     // ((a >> 3) + k) >> 5 == (a + 8k) >> 8 in floor arithmetic, and vqshrun (no rounding,
     // negatives to 0) followed by vqmovn (to 255) is the clamp. In Morton order the rows'
     // pixels alternate in pairs: zipping the two rows by pairs gives the tile's next eight
     // pixels for x 0-3 and, 16 further on, for x 4-7; vst3 writes them as B G R.
-    {
-        const int32x4_t k5v = vdupq_n_s32(8 * k5), k6v = vdupq_n_s32(8 * k6),
-                        k7v = vdupq_n_s32(8 * k7);
-        const auto rgb = [&](uint8x8_t yv, uint8x8_t uv, uint8x8_t vv, uint8x8_t& r8,
-                             uint8x8_t& g8, uint8x8_t& b8) {
-            const int16x8_t Y = vreinterpretq_s16_u16(vmovl_u8(yv));
-            const int16x8_t U = vreinterpretq_s16_u16(vmovl_u8(uv));
-            const int16x8_t V = vreinterpretq_s16_u16(vmovl_u8(vv));
-            uint16x4_t rh[2], gh[2], bh[2];
-            for (int h = 0; h < 2; h++) {
-                const int16x4_t y4 = h == 0 ? vget_low_s16(Y) : vget_high_s16(Y);
-                const int16x4_t u4 = h == 0 ? vget_low_s16(U) : vget_high_s16(U);
-                const int16x4_t v4 = h == 0 ? vget_low_s16(V) : vget_high_s16(V);
-                const int32x4_t cY = vmull_n_s16(y4, static_cast<s16>(c0));
-                int32x4_t r = vmlal_n_s16(cY, v4, static_cast<s16>(c1));
-                int32x4_t g = vmlsl_n_s16(cY, v4, static_cast<s16>(c2));
-                g = vmlsl_n_s16(g, u4, static_cast<s16>(c3));
-                int32x4_t b = vmlal_n_s16(cY, u4, static_cast<s16>(c4));
-                rh[h] = vqshrun_n_s32(vaddq_s32(r, k5v), 8);
-                gh[h] = vqshrun_n_s32(vaddq_s32(g, k6v), 8);
-                bh[h] = vqshrun_n_s32(vaddq_s32(b, k7v), 8);
-            }
-            r8 = vqmovn_u16(vcombine_u16(rh[0], rh[1]));
-            g8 = vqmovn_u16(vcombine_u16(gh[0], gh[1]));
-            b8 = vqmovn_u16(vcombine_u16(bh[0], bh[1]));
-        };
-        static constexpr u32 pair_base[4] = {0, 8, 32, 40};
-        for (u32 strip = 0; strip < lines / 8; strip++) {
-            u8* const strip_out = memory.GetPointer(cvt.dst.address + strip * dst_stride);
-            for (u32 k = 0; k < 4; k++) {
-                const u32 y = strip * 8 + k * 2;
-                const u8* const row_a = memory.GetPointer(cvt.src_Y.address + y * y_stride);
-                const u8* const row_b = memory.GetPointer(cvt.src_Y.address + (y + 1) * y_stride);
-                const u8* const row_u = memory.GetPointer(cvt.src_U.address + (y / 2) * u_stride);
-                const u8* const row_v = memory.GetPointer(cvt.src_V.address + (y / 2) * v_stride);
-                for (u32 x0 = 0; x0 < width; x0 += 8) {
-                    u32 u_raw, v_raw;
-                    std::memcpy(&u_raw, row_u + x0 / 2, 4);
-                    std::memcpy(&v_raw, row_v + x0 / 2, 4);
-                    const uint8x8_t u4 = vreinterpret_u8_u32(vdup_n_u32(u_raw));
-                    const uint8x8_t v4 = vreinterpret_u8_u32(vdup_n_u32(v_raw));
-                    const uint8x8_t uu = vzip_u8(u4, u4).val[0]; // u0 u0 u1 u1 u2 u2 u3 u3
-                    const uint8x8_t vv = vzip_u8(v4, v4).val[0];
-                    uint8x8_t ra, ga, ba, rb, gb, bb;
-                    rgb(vld1_u8(row_a + x0), uu, vv, ra, ga, ba);
-                    rgb(vld1_u8(row_b + x0), uu, vv, rb, gb, bb);
-                    const auto pairs = [](uint8x8_t a, uint8x8_t b) {
-                        return vzip_u16(vreinterpret_u16_u8(a), vreinterpret_u16_u8(b));
-                    };
-                    const uint16x4x2_t R = pairs(ra, rb), G = pairs(ga, gb), B = pairs(ba, bb);
-                    u8* const tile = strip_out + (x0 / 8) * 64 * 3;
-                    uint8x8x3_t lo, hi;
-                    lo.val[0] = vreinterpret_u8_u16(B.val[0]);
-                    lo.val[1] = vreinterpret_u8_u16(G.val[0]);
-                    lo.val[2] = vreinterpret_u8_u16(R.val[0]);
-                    hi.val[0] = vreinterpret_u8_u16(B.val[1]);
-                    hi.val[1] = vreinterpret_u8_u16(G.val[1]);
-                    hi.val[2] = vreinterpret_u8_u16(R.val[1]);
-                    vst3_u8(tile + pair_base[k] * 3, lo);
-                    vst3_u8(tile + (pair_base[k] + 16) * 3, hi);
-                }
-            }
+    const int32x4_t k5v = vdupq_n_s32(8 * k5), k6v = vdupq_n_s32(8 * k6),
+                    k7v = vdupq_n_s32(8 * k7);
+    const auto rgb = [&](uint8x8_t yv, uint8x8_t uv, uint8x8_t vv, uint8x8_t& r8, uint8x8_t& g8,
+                         uint8x8_t& b8) {
+        const int16x8_t Y = vreinterpretq_s16_u16(vmovl_u8(yv));
+        const int16x8_t U = vreinterpretq_s16_u16(vmovl_u8(uv));
+        const int16x8_t V = vreinterpretq_s16_u16(vmovl_u8(vv));
+        uint16x4_t rh[2], gh[2], bh[2];
+        for (int h = 0; h < 2; h++) {
+            const int16x4_t y4 = h == 0 ? vget_low_s16(Y) : vget_high_s16(Y);
+            const int16x4_t u4 = h == 0 ? vget_low_s16(U) : vget_high_s16(U);
+            const int16x4_t v4 = h == 0 ? vget_low_s16(V) : vget_high_s16(V);
+            const int32x4_t cY = vmull_n_s16(y4, static_cast<s16>(c0));
+            int32x4_t r = vmlal_n_s16(cY, v4, static_cast<s16>(c1));
+            int32x4_t g = vmlsl_n_s16(cY, v4, static_cast<s16>(c2));
+            g = vmlsl_n_s16(g, u4, static_cast<s16>(c3));
+            int32x4_t b = vmlal_n_s16(cY, u4, static_cast<s16>(c4));
+            rh[h] = vqshrun_n_s32(vaddq_s32(r, k5v), 8);
+            gh[h] = vqshrun_n_s32(vaddq_s32(g, k6v), 8);
+            bh[h] = vqshrun_n_s32(vaddq_s32(b, k7v), 8);
         }
-        return true;
+        r8 = vqmovn_u16(vcombine_u16(rh[0], rh[1]));
+        g8 = vqmovn_u16(vcombine_u16(gh[0], gh[1]));
+        b8 = vqmovn_u16(vcombine_u16(bh[0], bh[1]));
+    };
+    static constexpr u32 pair_base[4] = {0, 8, 32, 40};
+    for (u32 k = 0; k < 4; k++) {
+        const u32 y = strip * 8 + k * 2;
+        const u8* const row_a = job.y[y];
+        const u8* const row_b = job.y[y + 1];
+        const u8* const row_u = job.u[y / 2];
+        const u8* const row_v = job.v[y / 2];
+        for (u32 x0 = 0; x0 < width; x0 += 8) {
+            u32 u_raw, v_raw;
+            std::memcpy(&u_raw, row_u + x0 / 2, 4);
+            std::memcpy(&v_raw, row_v + x0 / 2, 4);
+            const uint8x8_t u4 = vreinterpret_u8_u32(vdup_n_u32(u_raw));
+            const uint8x8_t v4 = vreinterpret_u8_u32(vdup_n_u32(v_raw));
+            const uint8x8_t uu = vzip_u8(u4, u4).val[0]; // u0 u0 u1 u1 u2 u2 u3 u3
+            const uint8x8_t vv = vzip_u8(v4, v4).val[0];
+            uint8x8_t ra, ga, ba, rb, gb, bb;
+            rgb(vld1_u8(row_a + x0), uu, vv, ra, ga, ba);
+            rgb(vld1_u8(row_b + x0), uu, vv, rb, gb, bb);
+            const auto pairs = [](uint8x8_t a, uint8x8_t b) {
+                return vzip_u16(vreinterpret_u16_u8(a), vreinterpret_u16_u8(b));
+            };
+            const uint16x4x2_t R = pairs(ra, rb), G = pairs(ga, gb), B = pairs(ba, bb);
+            u8* const tile = strip_out + (x0 / 8) * 64 * 3;
+            uint8x8x3_t lo, hi;
+            lo.val[0] = vreinterpret_u8_u16(B.val[0]);
+            lo.val[1] = vreinterpret_u8_u16(G.val[0]);
+            lo.val[2] = vreinterpret_u8_u16(R.val[0]);
+            hi.val[0] = vreinterpret_u8_u16(B.val[1]);
+            hi.val[1] = vreinterpret_u8_u16(G.val[1]);
+            hi.val[2] = vreinterpret_u8_u16(R.val[1]);
+            vst3_u8(tile + pair_base[k] * 3, lo);
+            vst3_u8(tile + (pair_base[k] + 16) * 3, hi);
+        }
+    }
+#else
+    const auto clamp8 = [](s32 v) -> u8 { return static_cast<u8>(std::clamp(v >> 5, 0, 0xFF)); };
+    for (u32 ty = 0; ty < 8; ty++) {
+        const u32 y = strip * 8 + ty;
+        const u8* const row_y = job.y[y];
+        const u8* const row_u = job.u[y / 2];
+        const u8* const row_v = job.v[y / 2];
+        const u8* const morton_row = &morton_lut[ty * 8];
+        for (u32 x = 0; x < width; x++) {
+            const s32 Y = row_y[x];
+            const s32 U = row_u[x / 2];
+            const s32 V = row_v[x / 2];
+            const s32 cY = c0 * Y;
+            const s32 r = ((cY + c1 * V) >> 3) + k5;
+            const s32 g = ((cY - c2 * V - c3 * U) >> 3) + k6;
+            const s32 b = ((cY + c4 * U) >> 3) + k7;
+            u8* const out = strip_out + ((x / 8) * 64 + morton_row[x % 8]) * 3;
+            out[0] = clamp8(b);
+            out[1] = clamp8(g);
+            out[2] = clamp8(r);
+        }
     }
 #endif
-    for (u32 strip = 0; strip < lines / 8; strip++) {
-        u8* const strip_out = memory.GetPointer(cvt.dst.address + strip * dst_stride);
-        for (u32 ty = 0; ty < 8; ty++) {
-            const u32 y = strip * 8 + ty;
-            const u8* const row_y = memory.GetPointer(cvt.src_Y.address + y * y_stride);
-            const u8* const row_u = memory.GetPointer(cvt.src_U.address + (y / 2) * u_stride);
-            const u8* const row_v = memory.GetPointer(cvt.src_V.address + (y / 2) * v_stride);
-            const u8* const morton_row = &morton_lut[ty * 8];
-            for (u32 x = 0; x < width; x++) {
-                const s32 Y = row_y[x];
-                const s32 U = row_u[x / 2];
-                const s32 V = row_v[x / 2];
-                const s32 cY = c0 * Y;
-                const s32 r = ((cY + c1 * V) >> 3) + k5;
-                const s32 g = ((cY - c2 * V - c3 * U) >> 3) + k6;
-                const s32 b = ((cY + c4 * U) >> 3) + k7;
-                u8* const out = strip_out + ((x / 8) * 64 + morton_row[x % 8]) * 3;
-                out[0] = clamp8(b);
-                out[1] = clamp8(g);
-                out[2] = clamp8(r);
-            }
-        }
+}
+
+static bool PerformConversionFast(Memory::MemorySystem& memory, const ConversionConfiguration& cvt) {
+    static thread_local FastJob job;
+    if (!PrepareFastJob(memory, cvt, job)) {
+        return false;
+    }
+    for (u32 strip = 0; strip < job.strips; strip++) {
+        ConvertFastStrip(job, strip);
     }
     return true;
 }

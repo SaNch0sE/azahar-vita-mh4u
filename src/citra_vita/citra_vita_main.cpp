@@ -528,8 +528,15 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 
     bool keep_running = true;
     bool combo_held = false;
+    SceUInt64 last_poll_us = 0;
     while (!window.IsQuitRequested()) {
-        window.PollEvents();
+        // The pad and touch panel, every 2 ms at most: RunLoop returns several thousand times a
+        // second, and the two peeks cost ~30 us together - a sixth of the emulation thread's
+        // time in a movie. The 3DS's own HID samples every 4 ms or so.
+        if (const SceUInt64 now = sceKernelGetProcessTimeWide(); now - last_poll_us >= 2000) {
+            last_poll_us = now;
+            window.PollEvents();
+        }
 
         // Edge triggered, and the guest must not see the frame in which the combination is
         // pressed - it holds two buttons a title may well be reading. The PS button, locked
@@ -581,9 +588,17 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             VitaAllocTraceDump();
         }
         const SceUInt64 runloop_start = sceKernelGetProcessTimeWide();
+        static SceUInt64 last_iter_end = 0;
+        if (Common::EmuProf::enabled && last_iter_end != 0) {
+            Common::EmuProf::Add("main: between runloops", runloop_start - last_iter_end);
+        }
         const auto status = system.RunLoop();
-        Core::NativeStats::runloop_us.fetch_add(sceKernelGetProcessTimeWide() - runloop_start,
+        last_iter_end = sceKernelGetProcessTimeWide();
+        Core::NativeStats::runloop_us.fetch_add(last_iter_end - runloop_start,
                                                 std::memory_order_relaxed);
+        if (Common::EmuProf::enabled) {
+            Common::EmuProf::Add("main: runloop", last_iter_end - runloop_start);
+        }
         if (status == Core::System::ResultStatus::ErrorSavestate) {
             // A refused save or load is not fatal; the title keeps running.
             LOG_ERROR(Frontend, "Savestate operation failed");
@@ -713,7 +728,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     static_cast<unsigned>(heap.uordblks / 1024),
                     static_cast<unsigned>(heap.arena / 1024), sema, phase, sgi);
                 if (Common::EmuProf::enabled) {
-                    sceClibPrintf("[emuprof]%s\n", Common::EmuProf::TakeReport(30).c_str());
+                    sceClibPrintf("[emuprof]%s\n", Common::EmuProf::TakeReport(GxmRenderer::GxmFlag("pcsample") ? 60 : 30).c_str());
                 }
                 if (Pica::GetVertexCache().enabled) {
                     const auto vc = Pica::GetVertexCache().TakeStats();
@@ -893,6 +908,7 @@ int EmulatorMain() {
     Common::dsp_pipelined = !GxmRenderer::GxmFlag("nodsppipe");
     Common::y2r_fast = !GxmRenderer::GxmFlag("noy2rfast");
     Common::y2r_check = GxmRenderer::GxmFlag("y2rcheck");
+    Common::y2r_async = !GxmRenderer::GxmFlag("noy2rasync");
     Common::gx_async = GxmRenderer::GxmFlag("gxasync");
     Common::gx_early_p3d = GxmRenderer::GxmFlag("gxearlyp3d");
     // The vertex cache needs arm-first inserts once lists are parsed beside the guest.

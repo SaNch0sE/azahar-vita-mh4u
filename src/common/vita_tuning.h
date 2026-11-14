@@ -15,6 +15,8 @@ inline bool dsp_parallel = false;
 /// runs it and the general one and compares.
 inline bool y2r_fast = true;
 inline bool y2r_check = false;
+/// Y2R: the fast path's conversion on a worker (core 0), asynchronous to the guest. `noy2rasync`.
+inline bool y2r_async = true;
 /// HLE DSP ticks pipelined on a worker: the frame is computed beside the guest and output,
 /// with its interrupt, half an audio frame later (audio_core/hle/hle.cpp). `nodsppipe` turns it off.
 inline bool dsp_pipelined = false;

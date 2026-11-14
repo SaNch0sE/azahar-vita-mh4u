@@ -80,6 +80,12 @@ const char* ReasonName(u32 reason) {
     }
 }
 
+constexpr u64 Mh4uTitleId = 0x0004000000126300;
+constexpr u32 Mh4uFmvPollBranch = 0x00968764;
+constexpr u32 Mh4uFmvPollReturn = 0x009687AC;
+constexpr u32 Mh4uFmvSvc = 0xF0;
+constexpr u32 Mh4uFmvLoopReturn = 0x0096417C;
+
 } // Anonymous namespace
 
 // ---------------------------------------------------------------------------- VitaGuestMap
@@ -351,8 +357,11 @@ void ARM_VitaNative::Run() {
     // about the slice that just ended.
     stop_requested = false;
 
+    // pcsample (with emuprof): slices of at most 1 ms, so the guest PC at each timer exit is a
+    // usable sample of where guest time goes.
+    static const bool pc_sample = GxmRenderer::GxmFlag("pcsample");
     const u64 quantum = std::clamp(TicksToNanoseconds(timer->GetDowncount()), MinQuantumNs,
-                                   MaxQuantumNs);
+                                   pc_sample ? u64{1'000'000} : MaxQuantumNs);
     while (RunSlice(quantum)) {
         if (timer->GetDowncount() <= 0 || break_flag || stop_requested) {
             break;
@@ -381,6 +390,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         return false;
     }
 
+    Mh4uPatchFmvPoll();
     // A command list finished on the GX thread since the last slice: post its interrupts now.
     system.GPU().GxPoll();
     const SceUInt64 prologue_start = Common::EmuProf::enabled ? sceKernelGetProcessTimeWide() : 0;
@@ -444,8 +454,28 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     if (Common::EmuProf::enabled) {
         Common::EmuProf::Add(" .slice prologue", vanrun_start - prologue_start);
     }
+    u32 guest_thread_id = 0;
+    if (Common::EmuProf::enabled) {
+        if (const auto thread = system.Kernel().GetCurrentThreadManager().GetCurrentThread()) {
+            guest_thread_id = thread->GetThreadId();
+        }
+    }
     const int ret = azaharRun(&run);
     const SceUInt64 vanrun_end = sceKernelGetProcessTimeWide();
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add(fmt::format("guest thread {}", guest_thread_id),
+                             vanrun_end - vanrun_start);
+        static const bool pc_sample = GxmRenderer::GxmFlag("pcsample");
+        if (pc_sample && run.reason == AZAHAR_EXIT_TIMER) {
+            // Counted as "ms" in thousands so the report sorts them by sample count.
+            const u32 pc = run.ctx.r[15];
+            Common::EmuProf::Add(fmt::format("pc {:08X}", pc & ~0xFu), 1000);
+            if (pc >= 0x10C000 && pc < 0x111000) {
+                // Lock helpers: who calls them.
+                Common::EmuProf::Add(fmt::format("lr {:08X}", run.ctx.r[14] & ~0x3u), 1000);
+            }
+        }
+    }
     NativeStats::vanrun_us.fetch_add(vanrun_end - vanrun_start, std::memory_order_relaxed);
     if (Common::EmuProf::enabled) {
         Common::EmuProf::Add(" .slice guest (azaharRun)", vanrun_end - vanrun_start);
@@ -536,7 +566,9 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                 }
             }
         }
-        svc_context.CallSVC(run.svc_number);
+        if (run.svc_number != Mh4uFmvSvc || !Mh4uFmvPollSvc()) {
+            svc_context.CallSVC(run.svc_number);
+        }
         const SceUInt64 svc_end = sceKernelGetProcessTimeWide();
         NativeStats::svc_us.fetch_add(svc_end - svc_start, std::memory_order_relaxed);
         if (!prof_key.empty()) {
@@ -605,6 +637,62 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         ReportFault(run);
         return false;
     }
+}
+
+// MH4U's movie decoder thread polls for its input without ever waiting: a loop that locks,
+// unlocks and calls a method which returns at once while fewer than one or two items are
+// queued (0x9686B8, the `bcc` at 0x968764). On the 3DS that only burns idle time. Here guest
+// time is wall time, so the spin is what keeps the core from skipping ahead while the host does
+// the frame's other work (y2r, HLE), and every millisecond of that work slows the movie down.
+// The branch becomes `svc Mh4uFmvSvc`: taken, the thread sleeps 1 ms first. `nofmvsleep`: off.
+void ARM_VitaNative::Mh4uPatchFmvPoll() {
+    const auto process = system.Kernel().GetCurrentProcess();
+    if (!process || process.get() == fmv_patch_process) {
+        return;
+    }
+    fmv_patch_process = process.get();
+    static const bool off = GxmRenderer::GxmFlag("nofmvsleep");
+    if (off || process->codeset == nullptr || process->codeset->program_id != Mh4uTitleId) {
+        return;
+    }
+    // The test and branch, and the epilogue the handler resumes at (frame: 28 bytes, r4-r11, pc).
+    static constexpr std::array<std::pair<u32, u32>, 7> expected{{
+        {Mh4uFmvPollBranch - 12, 0xE5940014}, {Mh4uFmvPollBranch - 8, 0xE0400008},
+        {Mh4uFmvPollBranch - 4, 0xE1500006},  {Mh4uFmvPollBranch, 0x3A000010},
+        {Mh4uFmvPollBranch + 4, 0xE5940080},  {Mh4uFmvPollReturn, 0xE28DD01C},
+        {Mh4uFmvPollReturn + 4, 0xE8BD8FF0},
+    }};
+    for (const auto& [addr, word] : expected) {
+        if (!memory.IsValidVirtualAddress(*process, addr) || memory.Read32(addr) != word) {
+            LOG_INFO(Core_ARM11, "MH4U movie poll: code differs, not patched");
+            return;
+        }
+    }
+    memory.Write32(Mh4uFmvPollBranch, 0xEF000000u | Mh4uFmvSvc);
+    map->SyncCode(Mh4uFmvPollBranch & ~0xFFFu, 0x1000);
+    LOG_INFO(Core_ARM11, "MH4U movie poll at {:08X}: sleeps while idle", Mh4uFmvPollBranch);
+}
+
+bool ARM_VitaNative::Mh4uFmvPollSvc() {
+    if (context.r[15] != Mh4uFmvPollBranch + 4 || fmv_patch_process == nullptr) {
+        return false;
+    }
+    constexpr u32 CarryFlag = 1u << 29;
+    if ((context.cpsr & CarryFlag) != 0) {
+        return true; // `bcc` not taken: there is work, go on to it (the next instruction)
+    }
+    // Taken: return from the method (0x9687AC), asleep first - but only when called from the
+    // thread's own loop (return address 0x96417C at sp+60), not from a caller that expects it
+    // back at once. r0/r1 are dead there.
+    context.r[15] = Mh4uFmvPollReturn;
+    if (memory.Read32(context.r[13] + 60) != Mh4uFmvLoopReturn) {
+        return true;
+    }
+    static const u32 sleep_ns = GxmRenderer::GxmFlag("fmvsleep2") ? 2'000'000 : 1'000'000;
+    context.r[0] = sleep_ns;
+    context.r[1] = 0;
+    svc_context.CallSVC(0x0A); // svcSleepThread
+    return true;
 }
 
 void ARM_VitaNative::CreditTime(const AzaharRunRequest& run, u64 quantum_ns) {

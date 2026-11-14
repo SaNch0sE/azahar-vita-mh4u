@@ -328,7 +328,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             if (gpu && gpu->GxBusy()) {
                 gpu->GxAcquire("gxwait: guest idle");
             } else {
-                current_core_to_execute->GetTimer().Idle();
+                { ProfScope p{"loop: idle skip"}; current_core_to_execute->GetTimer().Idle(); }
             }
             PrepareReschedule();
         } else {
@@ -366,7 +366,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 if (gpu && gpu->GxBusy()) {
                     gpu->GxAcquire("gxwait: guest idle");
                 } else {
-                    cpu_core->GetTimer().Idle();
+                    { ProfScope p{"loop: idle skip"}; cpu_core->GetTimer().Idle(); }
                 }
                 PrepareReschedule();
             } else {

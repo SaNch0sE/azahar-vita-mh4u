@@ -357,6 +357,13 @@ private:
     bool spacial_dithering_enabled = false;
     bool is_busy_conversion = false;
 
+    /// A fast-path conversion running on a worker (core 0) while the guest goes on; see
+    /// StartConversion. Finished (the rest done here, the worker waited for) before anything
+    /// that observes its result or replaces it.
+    struct AsyncConversion;
+    std::unique_ptr<AsyncConversion> async;
+    void FinishConversion();
+
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);
     friend class boost::serialization::access;

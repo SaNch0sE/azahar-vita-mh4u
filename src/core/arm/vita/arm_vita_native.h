@@ -193,6 +193,10 @@ private:
     /// Thread handles other than the current-thread pseudo-handle the guest asked
     /// svcGetThreadId about, most recent first; resolved again before every slice.
     std::array<u32, 4> fast_handles{};
+    /// MH4U's movie decoder poll (Mh4uPatchFmvPoll): the process it was checked for.
+    const void* fmv_patch_process = nullptr;
+    void Mh4uPatchFmvPoll();
+    bool Mh4uFmvPollSvc();
 };
 
 } // namespace Core

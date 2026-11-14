@@ -5,6 +5,8 @@
 #include <array>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <string>
 #include <vector>
 #include "common/archives.h"
@@ -12,6 +14,8 @@
 #include "common/pipeline_stats.h"
 #include "common/common_funcs.h"
 #include "common/logging/log.h"
+#include "common/thread.h"
+#include "common/vita_tuning.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/ipc_helpers.h"
@@ -25,8 +29,74 @@ SERIALIZE_EXPORT_IMPL(Service::Y2R::Y2R_U)
 
 namespace Service::Y2R {
 
+struct Y2R_U::AsyncConversion {
+    HW::Y2R::FastJob job;
+    std::atomic<u32> next_strip{0};
+    std::atomic<u32> done_strips{0};
+    /// The worker is inside Work(): job must not change until it leaves.
+    std::atomic<bool> worker_busy{false};
+    std::atomic<bool> quit{false};
+    Common::Event start;
+    std::thread worker;
+    // Emulation thread only.
+    bool pending = false;
+    VAddr dst_address = 0;
+    u32 dst_size = 0;
+    u32 stolen = 0;
+
+    /// Strips until none is left, on whichever thread calls it.
+    u32 Work() {
+        u32 count = 0;
+        for (;;) {
+            const u32 strip = next_strip.fetch_add(1, std::memory_order_relaxed);
+            if (strip >= job.strips) {
+                return count;
+            }
+            HW::Y2R::ConvertFastStrip(job, strip);
+            done_strips.fetch_add(1, std::memory_order_release);
+            count++;
+        }
+    }
+
+    void Loop() {
+        Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
+        Common::SetCurrentThreadName("Y2R");
+        Common::EmuProf::thread_disabled = true;
+        for (;;) {
+            start.Wait();
+            if (quit.load(std::memory_order_acquire)) {
+                return;
+            }
+            Work();
+            worker_busy.store(false, std::memory_order_release);
+        }
+    }
+};
+
+void Y2R_U::FinishConversion() {
+    if (!async || !async->pending) {
+        return;
+    }
+    auto& a = *async;
+    const u64 t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+    // What the worker has not started yet is done here, then its last strip is waited for.
+    a.stolen += a.Work();
+    while (a.worker_busy.load(std::memory_order_acquire) ||
+           a.done_strips.load(std::memory_order_acquire) < a.job.strips) {
+        std::this_thread::yield();
+    }
+    a.pending = false;
+    // The strips went straight to memory: anything cached from the destination is stale.
+    system.Memory().RasterizerFlushVirtualRegion(a.dst_address, a.dst_size,
+                                                 Memory::FlushMode::Invalidate);
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add("y2r: async finish", Common::PipelineStats::NowUs() - t0);
+    }
+}
+
 template <class Archive>
 void Y2R_U::serialize(Archive& ar, const unsigned int) {
+    FinishConversion();
     ar& boost::serialization::base_object<Kernel::SessionRequestHandler>(*this);
     ar & completion_event;
     ar & conversion;
@@ -544,6 +614,7 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
             LOG_INFO(Service_Y2R, "conversion: {}", config);
         }
     }
+    FinishConversion();
     u64 prof_t = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
                                                  Memory::FlushMode::FlushAndInvalidate);
@@ -553,7 +624,40 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
         prof_t = now;
     }
 
-    HW::Y2R::PerformConversion(system.Memory(), conversion);
+    // This value has been estimated as the minimum amount of cycles to resolve a race condition
+    // in the intro cutscene of the FIFA series of games.
+    // TODO: Measure the cycle count more accurately based on hardware.
+    static constexpr s64 MinY2RDelay = 50000;
+    s64 delay = MinY2RDelay;
+
+    // y2rasync: the fast path's conversion runs on a worker on core 0 while the guest goes on,
+    // as the hardware's does, and completes ~4 ms of guest time later (the worker's own time;
+    // longer than the minimum above, the safe direction). If the guest gets there first, this
+    // thread converts what is left alongside the worker. The guest sees the same results at the
+    // same point - the completion event - either way. `noy2rasync`: converted here, at once.
+    if (Common::y2r_async && Common::y2r_fast && !Common::y2r_check) {
+        if (!async) {
+            async = std::make_unique<AsyncConversion>();
+            async->worker = std::thread([a = async.get()] { a->Loop(); });
+        }
+        if (HW::Y2R::PrepareFastJob(system.Memory(), conversion, async->job)) {
+            auto& a = *async;
+            a.dst_address = conversion.dst.address;
+            a.dst_size = total_output_size;
+            a.next_strip.store(0, std::memory_order_relaxed);
+            a.done_strips.store(0, std::memory_order_relaxed);
+            a.stolen = 0;
+            a.pending = true;
+            a.worker_busy.store(true, std::memory_order_release);
+            a.start.Set();
+            static constexpr s64 AsyncY2RDelay = BASE_CLOCK_RATE_ARM11 / 250; // 4 ms
+            delay = AsyncY2RDelay;
+        } else {
+            HW::Y2R::PerformConversion(system.Memory(), conversion);
+        }
+    } else {
+        HW::Y2R::PerformConversion(system.Memory(), conversion);
+    }
     if (Common::EmuProf::enabled) {
         Common::EmuProf::Add("y2r: convert", Common::PipelineStats::NowUs() - prof_t);
     }
@@ -561,12 +665,7 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
     if (is_busy_conversion) {
         system.CoreTiming().RemoveEvent(completion_signal_event);
     }
-
-    // This value has been estimated as the minimum amount of cycles to resolve a race condition
-    // in the intro cutscene of the FIFA series of games.
-    // TODO: Measure the cycle count more accurately based on hardware.
-    static constexpr s64 MinY2RDelay = 50000;
-    system.CoreTiming().ScheduleEvent(MinY2RDelay, completion_signal_event);
+    system.CoreTiming().ScheduleEvent(delay, completion_signal_event);
     is_busy_conversion = true;
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
@@ -578,6 +677,7 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
 void Y2R_U::StopConversion(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
+    FinishConversion();
     if (is_busy_conversion) {
         is_busy_conversion = false;
         system.CoreTiming().RemoveEvent(completion_signal_event);
@@ -684,6 +784,7 @@ void Y2R_U::DriverInitialize(Kernel::HLERequestContext& ctx) {
 
 void Y2R_U::DriverFinalize(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
+    FinishConversion();
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
@@ -756,12 +857,23 @@ Y2R_U::Y2R_U(Core::System& system) : ServiceFramework("y2r:u", 1), system(system
     completion_event = system.Kernel().CreateEvent(Kernel::ResetType::OneShot, "Y2R:Completed");
     completion_signal_event =
         system.CoreTiming().RegisterEvent("Y2R Completion Signal Event", [this](uintptr_t, s64) {
+            FinishConversion();
+            if (Common::EmuProf::enabled && async) {
+                Common::EmuProf::Add("y2r: strips done here", async->stolen);
+            }
             completion_event->Signal();
             is_busy_conversion = false;
         });
 }
 
-Y2R_U::~Y2R_U() = default;
+Y2R_U::~Y2R_U() {
+    if (async) {
+        FinishConversion();
+        async->quit.store(true, std::memory_order_release);
+        async->start.Set();
+        async->worker.join();
+    }
+}
 
 void InstallInterfaces(Core::System& system) {
     auto& service_manager = system.ServiceManager();
