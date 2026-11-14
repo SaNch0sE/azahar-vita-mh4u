@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <string>
+
 namespace GxmRenderer {
 
 /**
@@ -86,6 +88,10 @@ namespace GxmRenderer {
  *             at ur0:data/librazorcapture_es4.suprx; the load is logged either way
  */
 [[nodiscard]] bool GxmFlag(const char* name);
+
+/// Every switch that is set, space-separated (empty in the release build). Programs that
+/// switches change must not outlive them: the program disk cache versions itself with this.
+[[nodiscard]] std::string GxmFlagsText();
 
 /// logtex: true during the 120 frames after ux0:data/mh4u/dump_now was found, while fewer
 /// than 400 lines have been logged; each caller that logs adds one to logtex_lines.

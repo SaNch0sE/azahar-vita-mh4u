@@ -99,4 +99,14 @@ bool GxmFlag(const char* name) {
     return false;
 }
 
+std::string GxmFlagsText() {
+    std::string joined;
+#ifdef VITA_DIAGNOSTICS
+    for (const auto& flag : Flags()) {
+        joined += flag + ' ';
+    }
+#endif
+    return joined;
+}
+
 } // namespace GxmRenderer

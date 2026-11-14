@@ -16,6 +16,7 @@
 #include "video_core/rasterizer_accelerated.h"
 #include "video_core/vertex_ring.h"
 #include "video_core/renderer_gxm/gxm_pipeline_cache.h"
+#include "video_core/renderer_gxm/gxm_program_disk_cache.h"
 #include "video_core/renderer_gxm/gxm_shader_tier.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
 #include "video_core/renderer_gxm/gxm_texture_runtime.h"
@@ -340,6 +341,7 @@ private:
     std::unordered_map<u64, Shader*> generated_vs;
     /// The second tier (gxm_shader_tier.h); null with the notier2 flag.
     std::unique_ptr<ShaderTier2> tier2;
+    std::unique_ptr<ProgramDiskCache> program_cache;
     u32 tier2_threshold = 100; ///< draws before a program is emitted again at level 2
     /// The vertex emitter's view of the current PICA program and this draw's shape.
     Usse::VsRequest MakeVsRequest(const Pica::Shader::Generator::Cg::VSExtra& extra) const;

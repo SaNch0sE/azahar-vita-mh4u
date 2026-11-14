@@ -1,0 +1,16 @@
+# Writes OUT: a header with GXM_PROGRAM_VERSION, the MD5 of every source the USSE programs
+# depend on (FILES, '|'-separated). The program disk cache discards a file of another version.
+string(REPLACE "|" ";" _files "${FILES}")
+set(_all "")
+foreach(_f IN LISTS _files)
+    file(READ "${_f}" _text)
+    string(APPEND _all "${_text}")
+endforeach()
+string(MD5 _md5 "${_all}")
+set(_header "#pragma once\n#define GXM_PROGRAM_VERSION \"${_md5}\"\n")
+if(EXISTS "${OUT}")
+    file(READ "${OUT}" _old)
+endif()
+if(NOT "${_old}" STREQUAL "${_header}")
+    file(WRITE "${OUT}" "${_header}")
+endif()

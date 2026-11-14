@@ -37,6 +37,8 @@ static inline int sceIoMkdir(const char*, int) {
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/gxm_rasterizer.h"
 #include "video_core/renderer_gxm/pica_to_gxm.h"
+#include "gxm_program_version.h"
+#include "video_core/renderer_gxm/gxm_program_disk_cache.h"
 #include "video_core/renderer_gxm/usse/fixed_usse_gen.h"
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
@@ -327,6 +329,14 @@ bool RasterizerGxm::EnsureResources() {
     }
     const auto& device = Device();
     pipeline_cache = std::make_unique<PipelineCache>();
+    if (!GxmFlag("nodiskprograms")) {
+        // The flags can change what a program is (the usse_ and dbg switches), so a file
+        // written under other flags is another version.
+        const std::string flags = GxmFlagsText();
+        const u64 flags_hash = flags.empty() ? 0 : Common::ComputeHash64(flags.data(), flags.size());
+        program_cache = std::make_unique<ProgramDiskCache>(
+            VITA_DATA_DIR "/programs.bin", fmt::format("{}-{:016x}", GXM_PROGRAM_VERSION, flags_hash));
+    }
     if (!GxmFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
         if (GxmFlag("tier2now")) {
@@ -1468,6 +1478,15 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     // that was not worth a third fewer cycles; a better program has to come from a better
     // emitter. The generated Cg still exists for psp2cgc off the console (usse_dump).
     Shader* fs = pipeline_cache->FindShader(fs_hash);
+    if (fs == nullptr && program_cache != nullptr) {
+        if (auto cached = program_cache->Find(false, fs_hash)) {
+            fs = cached->tier == 2
+                     ? pipeline_cache->Replace(fs_hash, fmt::format("tf_{:016x}", fs_hash),
+                                               cached->bytes, 0)
+                     : pipeline_cache->UseBuiltinShader(
+                           fs_hash, fmt::format("us_{:016x}", fs_hash), cached->bytes);
+        }
+    }
     if (fs == nullptr) {
         std::string refusal;
         {
@@ -1485,7 +1504,12 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             }();
             Usse::SetDebugSelected(debug_hashes.empty() || debug_hashes.contains(fs_hash));
         }
+        const u64 emit_t0 = Common::PipelineStats::StatUs();
         std::vector<u8> program = Usse::EmitFragmentProgram(fs_config, &refusal);
+        if (const u64 us = Common::PipelineStats::StatUs() - emit_t0; us >= 1000) {
+            LOG_INFO(Render, "slow fs emit fs_{:016x}: {} us, {} bytes", fs_hash, us,
+                     program.size());
+        }
         if (program.empty()) {
             if (usse_refused.insert(fs_hash).second) {
                 LOG_WARNING(Render, "no fragment program for fs_{:016x}: {}", fs_hash, refusal);
@@ -1496,6 +1520,9 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         fs = pipeline_cache->UseBuiltinShader(fs_hash, fmt::format("us_{:016x}", fs_hash),
                                               program);
         stat_usse_emitted++;
+        if (program_cache != nullptr) {
+            program_cache->Store(ProgramDiskCache::Kind::Fragment, fs_hash, program, 0);
+        }
         static const bool dump = GxmFlag("usse_dump");
         if (dump) {
             sceIoMkdir(VITA_DATA_DIR "/usse", 0777);
@@ -2887,6 +2914,11 @@ void RasterizerGxm::InstallTier2() {
         if (result.vertex) {
             generated_vs[result.key] = shader;
         }
+        if (program_cache != nullptr) {
+            program_cache->Store(result.vertex ? ProgramDiskCache::Kind::Vertex2
+                                               : ProgramDiskCache::Kind::Fragment2,
+                                 result.key, result.program, result.input_regs);
+        }
         stat_tier2++;
         if (dump) {
             sceIoMkdir(VITA_DATA_DIR "/usse", 0777);
@@ -2960,14 +2992,31 @@ Shader* RasterizerGxm::VertexShaderFor(u16 default_regs,
     u32 input_regs = 0;
     // The emitter is the only path: what it refuses shades in software (nothing compiles on
     // the console any more).
-    if (!listed) {
+    if (!listed && program_cache != nullptr) {
+        if (auto cached = program_cache->Find(true, key)) {
+            vs = cached->tier == 2
+                     ? pipeline_cache->Replace(key, fmt::format("tv_{:016x}", key), cached->bytes,
+                                               cached->input_regs)
+                     : pipeline_cache->UseBuiltinShader(key, fmt::format("uv_{:016x}", key),
+                                                        cached->bytes, cached->input_regs);
+        }
+    }
+    if (!listed && vs == nullptr) {
         const Usse::VsRequest request = MakeVsRequest(extra);
         std::string refusal;
+        const u64 emit_t0 = Common::PipelineStats::StatUs();
         const std::vector<u8> program = Usse::EmitVertexProgram(request, input_regs, &refusal);
+        if (const u64 us = Common::PipelineStats::StatUs() - emit_t0; us >= 1000) {
+            LOG_INFO(Render, "slow vs emit vs_{:016x}: {} us, {} bytes", key, us,
+                     program.size());
+        }
         if (!program.empty()) {
             vs = pipeline_cache->UseBuiltinShader(key, fmt::format("uv_{:016x}", key), program,
                                                   input_regs);
             stat_vs_emitted++;
+            if (program_cache != nullptr) {
+                program_cache->Store(ProgramDiskCache::Kind::Vertex, key, program, input_regs);
+            }
             static const bool dump = GxmFlag("usse_dump");
             if (dump) {
                 sceIoMkdir(VITA_DATA_DIR "/usse", 0777);
@@ -3831,9 +3880,11 @@ void RasterizerGxm::EndFrame() {
         {
             const auto memory = pipeline_cache->MemoryStats();
             LOG_INFO(Render, "gxm shader cache: {} shaders + {} retired, {} pipelines, "
-                             "{} KiB GXP storage, {} pending surface frees",
+                             "{} KiB GXP storage, {} pending surface frees; disk {} programs, {} used",
                      pipeline_cache->ShaderCount(), memory.retired_shaders, memory.pipelines,
-                     memory.program_bytes / 1024, runtime.PendingFreeCount());
+                     memory.program_bytes / 1024, runtime.PendingFreeCount(),
+                     program_cache ? program_cache->Loaded() : 0,
+                     program_cache ? program_cache->Hits() : 0);
 #ifdef __vita__
             const auto* patcher = Device().patcher;
             const auto heap = mallinfo();

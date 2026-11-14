@@ -82,7 +82,14 @@ bool Pipeline::TryBuild() {
             return false;
         }
     }
+    // timedraw: first-time costs are what hitch a new area, so slow builds are named.
+    const u64 build_t0 = Common::PipelineStats::StatUs();
     failed = !Build();
+    const u64 build_us = Common::PipelineStats::StatUs() - build_t0;
+    if (build_us >= 1000) {
+        LOG_INFO(Render, "slow pipeline build {} + {}: {} us", info.vertex->name,
+                 info.fragment->name, build_us);
+    }
     MarkDone();
     return !failed;
 }

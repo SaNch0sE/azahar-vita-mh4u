@@ -126,6 +126,8 @@ if (ENABLE_GXM)
         renderer_gxm/gxm_texture_runtime.h
         renderer_gxm/gxm_pipeline_cache.cpp
         renderer_gxm/gxm_pipeline_cache.h
+        renderer_gxm/gxm_program_disk_cache.cpp
+        renderer_gxm/gxm_program_disk_cache.h
         renderer_gxm/gxm_rasterizer.cpp
         renderer_gxm/gxm_rasterizer.h
         renderer_gxm/gxm_shader_tier.cpp
@@ -148,6 +150,31 @@ if (ENABLE_GXM)
         renderer_gxm/renderer_gxm.cpp
         renderer_gxm/renderer_gxm.h
     )
+    # The program disk cache's version: a hash of everything the emitted programs depend on,
+    # regenerated whenever one of those sources changes.
+    file(GLOB _gxm_program_sources CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/usse/*.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/usse/*.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/shader/generator/*.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/shader/generator/*.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/pica/*.h
+    )
+    list(SORT _gxm_program_sources)
+    list(APPEND _gxm_program_sources
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/gxm_rasterizer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/gxm_shader_tier.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/gxm_program_disk_cache.cpp
+    )
+    string(REPLACE ";" "|" _gxm_program_list "${_gxm_program_sources}")
+    set(_gxm_program_header ${CMAKE_CURRENT_BINARY_DIR}/gxm_program_version.h)
+    add_custom_command(
+        OUTPUT ${_gxm_program_header}
+        COMMAND ${CMAKE_COMMAND} "-DOUT=${_gxm_program_header}" "-DFILES=${_gxm_program_list}"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/program_version.cmake
+        DEPENDS ${_gxm_program_sources} ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/program_version.cmake
+        VERBATIM)
+    target_sources(video_core PRIVATE ${_gxm_program_header})
+    target_include_directories(video_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     # libgxm only: every program comes from the USSE emitters, nothing compiles on the console.
     if (ENABLE_GXM_STUB)
         if (NOT DEFINED ENV{VITASDK})
