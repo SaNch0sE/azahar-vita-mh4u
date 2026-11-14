@@ -265,3 +265,18 @@ Not done yet, by expected value: a TEV-constant-colour-only begin-repeat (0xC3/0
 ~4k draws per 3 s; measure first, cf. the failed light repeat), uniform upload trimming
 (316 ms / 14k uploads: write plans per program, vertex bank extent), and the per-shipment
 ApplyShipment cost.
+
+### Walking the village (2026-11-14, night)
+
+`walk.sh` walks a fixed route of six stick segments through the village (the camera there only
+follows the character). Release: shown ~29.5 fps on average; one-second dips to 26-28 when a new
+direction starts, which are vblank frame skips from arena backpressure.
+
+- **Out of heap while walking** (std::bad_alloc in release). The shipment pool grows to every
+  shipment ever in flight (~950 with the GX queue) and each kept its 24 KiB lighting LUT block
+  and vertex program copy for reuse: ~23 MB that never came back. Freed on release now; diag
+  heap at the end of the walk 237 -> 209 MB of 240. Found with the alloc tracer's new live-by-
+  call-site table (`-DVITA_ALLOC_TRACE=ON`). Heap still creeps up slowly with each new shader.
+- **Third arena slot**: seconds under 28 fps 5/7 -> 3/2 per walk. (Tried before the memory fix
+  it ran the process out of heap.)
+- A spurious resume event mid-load opened the pause menu; it now needs a real wall-clock stop.
