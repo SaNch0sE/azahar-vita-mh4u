@@ -220,8 +220,10 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
         // on the pi5 with the software renderer and the guest uncapped: shown fps sat at 0 for
         // most of a run against a steady 10-18 without the drop, and the queue ran *deeper*
         // (3442 against 696), because the presents being skipped were also what paced it.
-        const u64 now_us = Common::PipelineStats::NowUs();
-        const bool display_is_current = now_us - last_present_us < PresentStaleUs;
+        // Only a present asks whether the display is current: one clock read per frame rather
+        // than per op.
+        const u64 now_us = op.swap_marker ? Common::PipelineStats::NowUs() : 0;
+        const bool display_is_current = op.swap_marker && now_us - last_present_us < PresentStaleUs;
         const bool superseded = op.swap_marker && display_is_current &&
                                 pending_swaps.load(std::memory_order_relaxed) > 1;
         if (superseded) {
@@ -240,7 +242,16 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
 
         {
             MICROPROFILE_SCOPE(GPU_Thread_Op);
-            const u64 op_start = Common::PipelineStats::NowUs();
+            // Release times one op in eight: the average below only has to track the mix, and
+            // a clock read per op was ~27k system calls per 3 s in the hub. The diagnostic
+            // build times every op, since its busy and swap totals are read as exact.
+#ifdef VITA_DIAGNOSTICS
+            constexpr u32 OpSampleMask = 0;
+#else
+            constexpr u32 OpSampleMask = 7;
+#endif
+            const bool timed = (op_sequence++ & OpSampleMask) == 0;
+            const u64 op_start = timed ? Common::PipelineStats::NowUs() : 0;
             const u32 watch = GuestWatch::Read();
             GXM_PHASE("op");
             if (op.run) {
@@ -248,6 +259,7 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
             }
             GXM_PHASE("op:returned");
             GuestWatch::Check(watch, "op", op.swap_marker, new_depth, 0);
+            if (timed) {
             const u64 op_us = Common::PipelineStats::NowUs() - op_start;
             // A slow-moving average of what an op costs, so a queue depth can be read as a
             // time rather than a count. Fifteen-sixteenths keeps it steady across the mix of
@@ -258,6 +270,7 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
             Common::PipelineStats::gpu_busy_total_us.fetch_add(op_us, std::memory_order_relaxed);
             if (op.swap_marker) {
                 Common::PipelineStats::gpu_swap_us.fetch_add(op_us, std::memory_order_relaxed);
+            }
             }
             Common::PipelineStats::gpu_ops.fetch_add(1, std::memory_order_relaxed);
         }

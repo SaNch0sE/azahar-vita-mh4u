@@ -154,6 +154,7 @@ private:
     static constexpr u64 PresentStaleUs = 33'000;
     /// When the last present executed (GPU thread only).
     u64 last_present_us = 0;
+    u32 op_sequence = 0;
 
     /// Exponential moving average of an op's cost, maintained by the worker.
     std::atomic<u64> avg_op_us{0};

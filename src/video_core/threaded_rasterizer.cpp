@@ -583,10 +583,10 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
         ApplyShipment(mirror_pica, *shipment);
         const u32 watch = GuestWatch::Read();
         if (!shipment->draw.hw || !real->AccelerateShippedDraw(shipment->draw)) {
-            const u64 sw_start = Common::PipelineStats::NowUs();
+            const u64 sw_start = Common::PipelineStats::StatUs();
             RunSoftwareDraw(*shipment);
             Common::PipelineStats::sw_shaded_us.fetch_add(
-                Common::PipelineStats::NowUs() - sw_start, std::memory_order_relaxed);
+                Common::PipelineStats::StatUs() - sw_start, std::memory_order_relaxed);
             Common::PipelineStats::sw_shaded_draws.fetch_add(1, std::memory_order_relaxed);
             if (!shipment->draw.hw) {
                 Common::PipelineStats::sw_shaded_not_offered.fetch_add(1,
@@ -869,9 +869,9 @@ void ThreadedRasterizer::RunSoftwareDraw(Shipment& shipment) {
         shipment.shade_state.compare_exchange_strong(state, ShadeStolen,
                                                      std::memory_order_acq_rel)) {
         PS::preshade_stolen.fetch_add(1, std::memory_order_relaxed);
-        const u64 t0 = PS::NowUs();
+        const u64 t0 = PS::StatUs();
         mirror_pica.RunShippedDraw(shipment.draw);
-        PS::preshade_local_us.fetch_add(PS::NowUs() - t0, std::memory_order_relaxed);
+        PS::preshade_local_us.fetch_add(PS::StatUs() - t0, std::memory_order_relaxed);
         return;
     }
     if (state == ShadeRunning) {
@@ -894,15 +894,15 @@ void ThreadedRasterizer::RunSoftwareDraw(Shipment& shipment) {
     if (state == ShadeDone && shipment.shade_ok &&
         mirror_pica.GetPrimitiveAssembler().IsEmpty()) {
         PS::preshade_used.fetch_add(1, std::memory_order_relaxed);
-        const u64 t0 = PS::NowUs();
+        const u64 t0 = PS::StatUs();
         const auto& v = shipment.vertices;
         for (std::size_t i = 0; i + 2 < v.size(); i += 3) {
             real->AddTriangle(v[i], v[i + 1], v[i + 2]);
         }
-        const u64 t1 = PS::NowUs();
+        const u64 t1 = PS::StatUs();
         real->DrawTriangles();
         PS::preshade_feed_us.fetch_add(t1 - t0, std::memory_order_relaxed);
-        PS::preshade_draw_us.fetch_add(PS::NowUs() - t1, std::memory_order_relaxed);
+        PS::preshade_draw_us.fetch_add(PS::StatUs() - t1, std::memory_order_relaxed);
         PS::preshade_tris.fetch_add(static_cast<u32>(v.size() / 3), std::memory_order_relaxed);
         return;
     }

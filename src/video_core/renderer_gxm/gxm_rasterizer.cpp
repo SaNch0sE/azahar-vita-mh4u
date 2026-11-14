@@ -1432,7 +1432,7 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     const auto& om = regs.framebuffer.output_merger;
     const auto& fb_regs = regs.framebuffer.framebuffer;
 
-    const u64 bp_t0 = Common::PipelineStats::NowUs();
+    const u64 bp_t0 = Common::PipelineStats::StatUs();
     Common::PipelineStats::bp_calls++;
     // The fragment program for this PICA configuration, compiled on the worker if new.
     Pica::Shader::FSConfig fs_config{regs};
@@ -1534,11 +1534,11 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         }
     }
 
-    const u64 bp_t1 = Common::PipelineStats::NowUs();
+    const u64 bp_t1 = Common::PipelineStats::StatUs();
     Common::PipelineStats::bp_config_us += bp_t1 - bp_t0;
     PipelineInfo info{};
     ConsiderTier2(fs, fs_hash, &fs_config, nullptr);
-    Common::PipelineStats::bp_tier2_us += Common::PipelineStats::NowUs() - bp_t1;
+    Common::PipelineStats::bp_tier2_us += Common::PipelineStats::StatUs() - bp_t1;
     info.vertex = layout.shader;
     info.fragment = fs;
     info.stream_count = layout.stream_count;
@@ -1657,9 +1657,9 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     // The disk cache makes it a first-run cost.
     (void)vertex_count;
     DrawTrace("bind pipeline");
-    const u64 bp_t2 = Common::PipelineStats::NowUs();
+    const u64 bp_t2 = Common::PipelineStats::StatUs();
     const bool bound = pipeline_cache->BindPipeline(info);
-    Common::PipelineStats::bp_pipeline_us += Common::PipelineStats::NowUs() - bp_t2;
+    Common::PipelineStats::bp_pipeline_us += Common::PipelineStats::StatUs() - bp_t2;
     if (!bound) {
         return false;
     }
@@ -2243,9 +2243,9 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             memo_hit = true;
             stat_tex_memo_hits++;
         } else {
-            const u64 lt = Common::PipelineStats::NowUs();
+            const u64 lt = Common::PipelineStats::StatUs();
             surface_id = res_cache.GetTextureSurface(info, max_level);
-            tex_split[3] += Common::PipelineStats::NowUs() - lt;
+            tex_split[3] += Common::PipelineStats::StatUs() - lt;
             stat_tex_memo_misses++;
         }
         if (!surface_id) {
@@ -2543,16 +2543,16 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     {
         const PhaseTimer timer{time_draws, times.textures};
         namespace PS = Common::PipelineStats;
-        const u64 t0 = PS::NowUs();
+        const u64 t0 = PS::StatUs();
         SyncAndUploadLUTs();
-        const u64 t1 = PS::NowUs();
+        const u64 t1 = PS::StatUs();
         skip_feedback_draw = false;
         feedback_alpha_only = false;
         SyncTextureUnits(fb);
-        const u64 t2 = PS::NowUs();
+        const u64 t2 = PS::StatUs();
         SyncProcTexStrip();
         SyncFogStrip();
-        const u64 t3 = PS::NowUs();
+        const u64 t3 = PS::StatUs();
         tex_split[0] += t1 - t0;
         tex_split[1] += t2 - t1;
         tex_split[2] += t3 - t2;
