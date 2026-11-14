@@ -14,4 +14,6 @@ struct ConversionConfiguration;
 
 namespace HW::Y2R {
 void PerformConversion(Memory::MemorySystem& memory, Service::Y2R::ConversionConfiguration cvt);
+/// The general (any format) conversion, without the fast path.
+void PerformConversionGeneral(Memory::MemorySystem& memory, Service::Y2R::ConversionConfiguration cvt);
 } // namespace HW::Y2R

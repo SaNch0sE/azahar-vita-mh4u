@@ -891,6 +891,8 @@ int EmulatorMain() {
     Common::EmuProf::enabled = GxmRenderer::GxmFlag("emuprof");
     Common::dsp_parallel = !GxmRenderer::GxmFlag("nodspthread");
     Common::dsp_pipelined = !GxmRenderer::GxmFlag("nodsppipe");
+    Common::y2r_fast = !GxmRenderer::GxmFlag("noy2rfast");
+    Common::y2r_check = GxmRenderer::GxmFlag("y2rcheck");
     Common::gx_async = GxmRenderer::GxmFlag("gxasync");
     Common::gx_early_p3d = GxmRenderer::GxmFlag("gxearlyp3d");
     // The vertex cache needs arm-first inserts once lists are parsed beside the guest.

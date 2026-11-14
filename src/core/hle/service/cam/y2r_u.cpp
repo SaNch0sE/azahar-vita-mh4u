@@ -4,7 +4,12 @@
 
 #include <array>
 #include <cstring>
+#include <algorithm>
+#include <string>
+#include <vector>
 #include "common/archives.h"
+#include "common/emu_prof.h"
+#include "common/pipeline_stats.h"
 #include "common/common_funcs.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
@@ -518,10 +523,40 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
     // dst_image_size would seem to be perfect for this, but it doesn't include the gap :(
     u32 total_output_size =
         conversion.input_lines * (conversion.dst.transfer_unit + conversion.dst.gap);
+    {
+        // Each distinct configuration once, for tuning the conversion to what the game uses.
+        const auto& c = conversion;
+        const std::string config = fmt::format(
+            "in {} out {} rot {} align {} {}x{} coef {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} "
+            "{:04X} {:04X} alpha {} | Y {:08X} u{} g{} U {:08X} u{} g{} V {:08X} u{} g{} | dst "
+            "{:08X} size {} u{} g{}",
+            static_cast<u32>(c.input_format), static_cast<u32>(c.output_format),
+            static_cast<u32>(c.rotation), static_cast<u32>(c.block_alignment), c.input_line_width,
+            c.input_lines, c.coefficients[0], c.coefficients[1], c.coefficients[2],
+            c.coefficients[3], c.coefficients[4], c.coefficients[5], c.coefficients[6],
+            c.coefficients[7], c.alpha, c.src_Y.address, c.src_Y.transfer_unit, c.src_Y.gap,
+            c.src_U.address, c.src_U.transfer_unit, c.src_U.gap, c.src_V.address,
+            c.src_V.transfer_unit, c.src_V.gap, c.dst.address, c.dst.image_size,
+            c.dst.transfer_unit, c.dst.gap);
+        static std::vector<std::string> seen;
+        if (seen.size() < 32 && std::find(seen.begin(), seen.end(), config) == seen.end()) {
+            seen.push_back(config);
+            LOG_INFO(Service_Y2R, "conversion: {}", config);
+        }
+    }
+    u64 prof_t = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
                                                  Memory::FlushMode::FlushAndInvalidate);
+    if (Common::EmuProf::enabled) {
+        const u64 now = Common::PipelineStats::NowUs();
+        Common::EmuProf::Add("y2r: flush", now - prof_t);
+        prof_t = now;
+    }
 
     HW::Y2R::PerformConversion(system.Memory(), conversion);
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add("y2r: convert", Common::PipelineStats::NowUs() - prof_t);
+    }
 
     if (is_busy_conversion) {
         system.CoreTiming().RemoveEvent(completion_signal_event);
@@ -555,6 +590,9 @@ void Y2R_U::StopConversion(Kernel::HLERequestContext& ctx) {
 }
 
 void Y2R_U::IsBusyConversion(Kernel::HLERequestContext& ctx) {
+    if (Common::EmuProf::enabled) {
+        Common::EmuProf::Add("y2r: busy polls", 0);
+    }
     IPC::RequestParser rp(ctx);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
