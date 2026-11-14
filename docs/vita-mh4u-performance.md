@@ -214,3 +214,22 @@ The village hub (the user's second save) was render-thread bound: game ~27 fps, 
 
 Release hub: shown 24-25 fps, equal to the game's rate; the emulation thread (PICA command
 processing, ~60% of it in the hub) is the limit again. Deck: 30 fps in both views.
+
+## GX queue (2026-11-14, later)
+
+With the render thread relieved, the hub was emulation-thread bound: command lists (~140 KB,
+two a frame; ~20 ms a frame in diag) ran on the emulation thread after the guest's frame,
+serially. Stage 1 async GX (`gxasync gxearlyp3d`) gained nothing: the idle guest waited for
+the list ("gxwait: guest idle"), then the next command, the buffer swap and the vblank all
+drained it again. Stage 2 (`gx_fifo`, on by default; ux0:data/mh4u/nogxfifo turns it off)
+makes the GX thread an ordered queue the emulation thread alone fills - lists (copied at
+submission), fills, transfers, guest-flush invalidations, and the vblank's GPU half - while
+everything the guest sees stays on time (early P3D, fill/transfer completions on modelled
+delays, PDC). Overlap is bounded to a frame. Placement matters: the GX thread runs on core 0
+just below the DSP worker (equal priorities do not preempt; DSP ticks waited out whole lists),
+the pre-shade worker on core 3; the depth frameskip signal is off under the queue (the vblank
+half sees the frame's whole op stream queued).
+
+Release hub: game 24 -> 29-31 fps (speed ~80% -> ~99%), shown 24 -> 25-28. The render thread
+is the limit now (and the keyboard screen, ~500 glyph draws a frame, render-bound at ~20).
+Checked: intro movie, ship cutscene, deck both views, hub, keyboard screen.

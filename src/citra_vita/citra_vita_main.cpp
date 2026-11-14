@@ -912,12 +912,13 @@ int EmulatorMain() {
     Common::gx_async = GxmRenderer::GxmFlag("gxasync");
     Common::gx_early_p3d = GxmRenderer::GxmFlag("gxearlyp3d");
     {
-        // gxfifo (or ux0:data/mh4u/gxfifo in any build): stage 2 GX queue; implies the above.
-        std::FILE* f = std::fopen(VITA_DATA_DIR "/gxfifo", "rb");
+        // The stage 2 GX queue, on by default (implies the above); ux0:data/mh4u/nogxfifo (any
+        // build) or the nogxfifo flag turns it off.
+        std::FILE* f = std::fopen(VITA_DATA_DIR "/nogxfifo", "rb");
         if (f != nullptr) {
             std::fclose(f);
         }
-        Common::gx_fifo = GxmRenderer::GxmFlag("gxfifo") || f != nullptr;
+        Common::gx_fifo = f == nullptr && !GxmRenderer::GxmFlag("nogxfifo");
         Common::gx_snapshot = !GxmRenderer::GxmFlag("nogxsnap");
         if (Common::gx_fifo) {
             Common::gx_async = true;

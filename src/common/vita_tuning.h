@@ -28,7 +28,7 @@ inline bool gx_async = false;
 inline bool gx_early_p3d = false;
 /// Stage 2: GX work as an ordered queue (lists, fills, transfers, flushes, the GPU half of the
 /// vblank) beside the guest, so a list's parse overlaps the next frame. Implies gx_async and
-/// gx_early_p3d. `gxfifo`; ux0:data/mh4u/gxfifo in any build.
+/// gx_early_p3d. On by default; `nogxfifo` or ux0:data/mh4u/nogxfifo turns it off.
 inline bool gx_fifo = false;
 /// With gx_fifo: command lists copied at submission, so the guest may rewrite its buffer while
 /// the copy is parsed. `nogxsnap` reads guest memory instead.
