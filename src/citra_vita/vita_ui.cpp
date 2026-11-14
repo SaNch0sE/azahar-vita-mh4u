@@ -354,6 +354,11 @@ Ui::Action Ui::DrawPauseMenu() {
     ImGui::Separator();
 
     const ImVec2 button_size{320.0f, 48.0f};
+    // Every opening starts on Resume: the menu otherwise remembers the last button, and the
+    // same presses land somewhere else each time.
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetKeyboardFocusHere();
+    }
     if (ImGui::Button("Resume", button_size)) {
         action = Action::ResumeGame;
         window.UpdateCurrentFramebufferLayout();

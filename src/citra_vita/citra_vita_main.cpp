@@ -464,14 +464,27 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 
     // The window presents straight out of guest memory, so the renderer can skip its
     // screen_infos conversion entirely.
-    system.GPU().Renderer().SetFrontendPresentsGuestMemory(true);
-    // Bring-up switch: frameskip drops top-screen draws when the render thread is behind,
-    // which is indistinguishable from a renderer that draws nothing until it is turned off.
-    system.GPU().SetFrameskipAllowed(!GxmRenderer::GxmFlag("noskip"));
-    // Bring-up switch: every operation the emulation thread queues is finished before it goes
-    // on, so nothing the guest writes can change under a draw the render thread has not run
-    // yet. A picture that comes right this way was being raced.
-    system.GPU().SetRenderThreadLockstep(GxmRenderer::GxmFlag("lockstep"));
+    // Applied to this GPU and, through the configurator, to the one a state load rebuilds.
+    const auto configure_gpu = [](VideoCore::GPU& gpu) {
+        gpu.Renderer().SetFrontendPresentsGuestMemory(true);
+        // Bring-up switch: frameskip drops top-screen draws when the render thread is behind,
+        // which is indistinguishable from a renderer that draws nothing until it is turned off.
+        gpu.SetFrameskipAllowed(!GxmRenderer::GxmFlag("noskip"));
+        // Bring-up switch: every operation the emulation thread queues is finished before it
+        // goes on, so nothing the guest writes can change under a draw the render thread has
+        // not run yet. A picture that comes right this way was being raced.
+        gpu.SetRenderThreadLockstep(GxmRenderer::GxmFlag("lockstep"));
+    };
+    configure_gpu(system.GPU());
+    system.SetGpuConfigurator(configure_gpu);
+    // A state load frees and reallocates guest RAM (and the GPU's display snapshots) inside
+    // the core: the GPU's mappings of them go first, as in ShutdownSystem. They are mapped
+    // again on the next present.
+    system.SetBeforeShutdown([] { VitaFrontend::GxmPresent::UnmapAllGuestMemory(); });
+    // States are refused across builds by default, and every commit is another build: each
+    // update would orphan the player's states. What has to match is the archive layout, not
+    // the revision (the diag autoload has always relied on that).
+    system.SetLoadStateAnyBuild(true);
 
 #ifdef VITA_DIAGNOSTICS
     // ux0:data/mh4u/autoload.txt names a savestate slot to restore before the render thread
@@ -484,9 +497,6 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         std::fread(buf, 1, sizeof(buf) - 1, f);
         std::fclose(f);
         const int slot = std::atoi(buf);
-        // The states come from the pi5 harness, saved at whatever commit it was built from;
-        // the archive layout is what has to match, not the revision.
-        system.SetLoadStateAnyBuild(true);
         if (slot >= 0 && system.SendSignal(Core::System::Signal::Load, static_cast<u32>(slot))) {
             LOG_INFO(Frontend, "autoload.txt: restoring savestate slot {}", slot);
             // The load runs inside RunLoop once the kernel has no asynchronous HLE request in

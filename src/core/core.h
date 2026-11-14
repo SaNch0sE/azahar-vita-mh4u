@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -379,6 +380,19 @@ public:
         return save_state_request_status != SaveStateStatus::NONE;
     }
 
+    /// Called on every GPU the system creates - at boot and again when a state load rebuilds
+    /// it - so frontend settings applied to the GPU survive the rebuild.
+    void SetGpuConfigurator(std::function<void(VideoCore::GPU&)> configure) {
+        gpu_configurator = std::move(configure);
+    }
+
+    /// Called first thing in every Shutdown, including the one a state load runs before it
+    /// rebuilds the system: whatever the frontend holds on guest memory or the GPU (the Vita's
+    /// GXM mappings of guest RAM) must be let go before they are freed.
+    void SetBeforeShutdown(std::function<void()> hook) {
+        before_shutdown = std::move(hook);
+    }
+
     /// Accept a state saved by another build of the same serialization layout (the Vita
     /// autoload restores states the pi5 harness saved; every commit changes the revision).
     void SetLoadStateAnyBuild(bool accept) {
@@ -485,6 +499,8 @@ private:
     bool curr_core_reschedule_pending{};
 
     std::unique_ptr<VideoCore::GPU> gpu;
+    std::function<void(VideoCore::GPU&)> gpu_configurator;
+    std::function<void()> before_shutdown;
 
     /// Service manager
     std::unique_ptr<Service::SM::ServiceManager> service_manager;

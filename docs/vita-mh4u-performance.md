@@ -307,3 +307,23 @@ direction starts, which are vblank frame skips from arena backpressure.
   - timedraw names slow emits/pipeline builds (`slow vs emit ...`).
 - Still open: a rare single-second stall to ~13 fps (twice in all the walks so far), cause unknown.
 
+### Save states mid-game (2026-11-14)
+
+Pause menu (Select+Start) -> Save states. Saving and loading now work while the game runs:
+- **Save crashed** after "archives": the save's `ClearAll` emptied the surface page table but
+  left every surface flagged Registered; the first surface trim after the save picked one and
+  hit UnregisterSurface's page assert on the render thread. ClearAll now unregisters them.
+- **Load was refused** with the render thread running. Enabled: the ScopedRenderContext guard
+  held a reference to the GPU the load destroys (now re-fetched), the frontend's GPU settings
+  are re-applied through `System::SetGpuConfigurator`, the GXM mappings of guest RAM are dropped
+  before the load frees it (`System::SetBeforeShutdown`; otherwise "could not map 134217728
+  bytes" every frame and a stale mapping), and the state is decompressed straight from the
+  file instead of a 28 MB heap buffer (that load died in std::bad_alloc).
+- **A state saved after a load sent the guest to PC 0** when loaded: the load puts the running
+  threads back from their saved contexts, which are only written on a context switch. The save
+  now copies each core's live registers into its running thread's context first.
+- States load across builds (`SetLoadStateAnyBuild` for every build, not just the diag
+  autoload): every commit is another build, and an update would otherwise orphan them.
+- The pause menu opens on Resume every time.
+- A state can be loaded from the title screen; there is no need to enter the game first.
+- Timings on the console (diag): save ~30 s (28 MB file), load ~10 s; the screen freezes meanwhile.

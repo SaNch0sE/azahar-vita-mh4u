@@ -107,8 +107,9 @@ namespace {
  */
 class ScopedRenderContext {
 public:
-    explicit ScopedRenderContext(VideoCore::GPU& gpu_, Frontend::EmuWindow* window_)
-        : gpu{gpu_}, window{window_}, was_running{gpu_.RenderThreadRunning()} {
+    explicit ScopedRenderContext(System& system_, Frontend::EmuWindow* window_)
+        : system{system_}, window{window_}, was_running{system_.GPU().RenderThreadRunning()} {
+        VideoCore::GPU& gpu = system.GPU();
         // Take the context unconditionally. The render thread owning it is only one of the
         // ways it can be absent here: with the render thread stopped nobody holds it at all,
         // which is just as fatal, and is the case --loadstate hits before the thread starts.
@@ -127,12 +128,13 @@ public:
             if (window != nullptr) {
                 window->DoneCurrent();
             }
-            gpu.StartRenderThread();
+            // A load rebuilt the GPU: the one to restart is whichever is current now.
+            system.GPU().StartRenderThread();
         }
     }
 
 private:
-    VideoCore::GPU& gpu;
+    System& system;
     Frontend::EmuWindow* window;
     bool was_running;
 };
@@ -195,11 +197,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     case Signal::Shutdown:
         return ResultStatus::ShutdownRequested;
     case Signal::Load: {
-        if (gpu != nullptr && gpu->RenderThreadRunning()) {
-            LOG_ERROR(Core, "Save states are not supported while the GPU render thread is active");
-            status_details = "Save states are unavailable with the GPU thread";
-            return ResultStatus::ErrorSavestate;
-        }
+        // No refusal while the render thread runs (2026-11-14): the load is taken inside a
+        // ScopedRenderContext like a save, and the guard restarts the thread on the rebuilt
+        // GPU; the frontend's GPU settings come back through the GPU configurator.
         if (save_state_request_status != SaveStateStatus::NONE) {
             LOG_ERROR(Core, "A pending save state operation has not finished yet");
             status_details = "A pending save state operation has not finished yet";
@@ -252,7 +252,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         try {
             // Loading destroys and rebuilds the renderer, so GPU() names a different object
             // afterwards; the guard restarts the render thread on whichever one is current.
-            ScopedRenderContext context{GPU(), m_emu_window};
+            ScopedRenderContext context{*this, m_emu_window};
             System::LoadState(slot);
             LOG_INFO(Core, "Load completed");
         } catch (const std::exception& e) {
@@ -268,7 +268,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         const u32 slot = save_state_slot;
         LOG_INFO(Core, "Begin save to slot {}", slot);
         try {
-            ScopedRenderContext context{GPU(), m_emu_window};
+            ScopedRenderContext context{*this, m_emu_window};
             System::SaveState(slot);
             LOG_INFO(Core, "Save completed");
         } catch (const std::exception& e) {
@@ -758,6 +758,9 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     gpu->SetInterruptHandler([gsp](Service::GSP::InterruptId interrupt_id, u64 wait_delay_ns) {
         gsp->SignalInterrupt(interrupt_id, wait_delay_ns);
     });
+    if (gpu_configurator) {
+        gpu_configurator(*gpu);
+    }
 
     auto plg_ldr = Service::PLGLDR::GetService(*this);
     if (plg_ldr) {
@@ -869,6 +872,9 @@ static void SavestateTrace(const char* what) {
 }
 
 void System::Shutdown(bool is_deserializing) {
+    if (before_shutdown) {
+        before_shutdown();
+    }
 
     // Shutdown emulation session
     is_powered_on = false;
@@ -1130,6 +1136,17 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
 
     ar&* memory.get();
     SavestateTrace("memory");
+    if (!Archive::is_loading::value) {
+        // A load puts each core's running thread back from its saved context
+        // (AfterStateLoaded), but a running thread's context is only written when it is
+        // switched out - stale at best. Right after a load it held nothing usable, and a state
+        // saved then sent the guest to PC 0 when loaded (2026-11-14). The live registers go in.
+        for (u32 core_id = 0; core_id < static_cast<u32>(cpu_cores.size()); core_id++) {
+            if (Kernel::Thread* thread = kernel->GetThreadManager(core_id).GetCurrentThread()) {
+                cpu_cores[core_id]->SaveContext(thread->context);
+            }
+        }
+    }
     ar&* kernel.get();
     SavestateTrace("kernel");
     ar&* gpu.get();

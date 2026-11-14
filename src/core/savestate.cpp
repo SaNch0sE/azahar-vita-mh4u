@@ -91,17 +91,18 @@ private:
     bool ok = true;
 };
 
-/// Decompresses a zstd frame on demand as the archive reads, avoiding the full decompressed
-/// image (the compressed input stays in memory; it is a fifth of the size).
-class ZstdIStreamBuf final : public std::streambuf {
+/// Decompresses straight out of the file as the archive reads. The Vita's heap had no room for
+/// a whole compressed state (28 MB for MH4U) next to a running title: a load mid-game died in
+/// std::bad_alloc while deserializing the services (2026-11-14).
+class ZstdFileIStreamBuf final : public std::streambuf {
 public:
-    explicit ZstdIStreamBuf(std::span<const u8> compressed_) : compressed{compressed_} {
+    explicit ZstdFileIStreamBuf(FileUtil::IOFile& file_) : file{file_} {
         dctx = ZSTD_createDCtx();
+        in_buffer.resize(ZSTD_DStreamInSize());
         out_buffer.resize(ZSTD_DStreamOutSize());
-        input = {compressed.data(), compressed.size(), 0};
     }
 
-    ~ZstdIStreamBuf() override {
+    ~ZstdFileIStreamBuf() override {
         ZSTD_freeDCtx(dctx);
     }
 
@@ -113,13 +114,17 @@ private:
         ZSTD_outBuffer output{out_buffer.data(), out_buffer.size(), 0};
         while (output.pos == 0) {
             if (input.pos >= input.size) {
-                return traits_type::eof();
+                const std::size_t read = file.ReadBytes(in_buffer.data(), in_buffer.size());
+                if (read == 0) {
+                    return traits_type::eof();
+                }
+                input = {in_buffer.data(), read, 0};
             }
             const std::size_t ret = ZSTD_decompressStream(dctx, &output, &input);
             if (ZSTD_isError(ret)) {
                 return traits_type::eof();
             }
-            if (ret == 0 && output.pos == 0) {
+            if (ret == 0 && output.pos == 0 && input.pos >= input.size) {
                 return traits_type::eof();
             }
         }
@@ -128,9 +133,10 @@ private:
         return traits_type::to_int_type(*gptr());
     }
 
-    std::span<const u8> compressed;
+    FileUtil::IOFile& file;
     ZSTD_DCtx* dctx{};
     ZSTD_inBuffer input{};
+    std::vector<u8> in_buffer;
     std::vector<u8> out_buffer;
 };
 
@@ -355,7 +361,6 @@ void System::LoadState(u32 slot) {
     const u64 movie_id = movie.GetCurrentMovieID();
     const auto path = GetSaveStatePath(title_id, movie_id, slot);
 
-    std::vector<u8> buffer(FileUtil::GetSize(path) - sizeof(CSTHeader));
     {
         FileUtil::IOFile file(path, "rb");
 
@@ -374,15 +379,8 @@ void System::LoadState(u32 slot) {
             throw std::runtime_error("Invalid savestate");
         }
 
-        if (file.ReadBytes(buffer.data(), buffer.size()) != buffer.size()) {
-            throw std::runtime_error("Could not read from file at " + path);
-        }
-    }
-
-    LOG_INFO(Core, "savestate: {} compressed bytes read", buffer.size());
-    // Deserialize, decompressing as the archive reads; only the compressed image is resident.
-    {
-        ZstdIStreamBuf zstd_buf{buffer};
+        // Deserialize, decompressing out of the file as the archive reads.
+        ZstdFileIStreamBuf zstd_buf{file};
         std::istream stream{&zstd_buf};
         iarchive ia{stream};
         LOG_INFO(Core, "savestate: archive open");
