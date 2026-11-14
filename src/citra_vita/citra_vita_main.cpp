@@ -783,9 +783,17 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     std::fflush(perf_file);
                 }
 #else
-                // Release: one short line a second, so a console log still tells the speed.
-                sceClibPrintf("[mh4u] speed %d%%  game %d.%d fps  shown %u fps\n", speed,
-                              fps10 / 10, fps10 % 10, presented);
+                // Release: one short line a second, so a console log still tells the speed -
+                // and which thread holds it back: the GX thread's command-list time and the
+                // render thread's busy time (it times one op in eight here), in ms a second.
+                const unsigned gx_ms = Common::PipelineStats::gx_list_us.exchange(
+                                           0, std::memory_order_relaxed) / 1000;
+                const unsigned render_ms = static_cast<unsigned>(
+                    Common::PipelineStats::gpu_busy_us.exchange(0, std::memory_order_relaxed) *
+                    8 / 1000);
+                sceClibPrintf("[mh4u] speed %d%%  game %d.%d fps  shown %u fps  gx %u ms  "
+                              "render ~%u ms\n",
+                              speed, fps10 / 10, fps10 % 10, presented, gx_ms, render_ms);
 #endif // VITA_DIAGNOSTICS
        // The stats window reads these on the render thread.
                 {

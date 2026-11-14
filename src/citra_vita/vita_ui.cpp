@@ -59,9 +59,15 @@ bool BeginFullscreen(const char* id) {
 bool BeginCentered(const char* id, float width, float height) {
     ImGui::SetNextWindowPos(ImVec2((ScreenWidth - width) * 0.5f, (ScreenHeight - height) * 0.5f));
     ImGui::SetNextWindowSize(ImVec2(width, height));
-    return ImGui::Begin(id, nullptr,
-                        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+    const bool open = ImGui::Begin(id, nullptr,
+                                   ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+    // A tap outside the panel clears ImGui's window focus, and the buttons then ignore the pad
+    // until the panel is touched again. The panel is the only thing on screen to talk to.
+    if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+        ImGui::SetWindowFocus();
+    }
+    return open;
 }
 } // Anonymous namespace
 
@@ -403,7 +409,7 @@ Ui::Action Ui::DrawPauseSettings() {
     ImGui::EndChild();
 
     ImGui::Separator();
-    const bool back = ImGui::Button("Back", ImVec2(200.0f, 48.0f)) || BackPressed();
+    const bool back = ImGui::Button("Back", ImVec2(200.0f, 40.0f)) || BackPressed();
     overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
 
@@ -416,30 +422,35 @@ Ui::Action Ui::DrawPauseSettings() {
 
 Ui::Action Ui::DrawSavestates() {
     Action action = Action::None;
-    BeginCentered("##savestates", 560.0f, 460.0f);
+    BeginCentered("##savestates", 560.0f, 528.0f);
+    // Opening lands on slot 1's Load (Load comes first, so the default can't overwrite a slot).
+    // No scrolling child: ImGui 1.79's pad navigation into one starts on its frame or on Back.
+    const bool appearing = ImGui::IsWindowAppearing();
     ImGui::TextUnformatted("Save states");
     ImGui::Separator();
 
-    ImGui::BeginChild("##slots", ImVec2(0.0f, 300.0f));
     for (u32 slot = 1; slot <= 9; slot++) {
         ImGui::PushID(static_cast<int>(slot));
+        ImGui::AlignTextToFramePadding();
         ImGui::Text("Slot %u", slot);
         ImGui::SameLine(140.0f);
-        if (ImGui::Button("Save", ImVec2(140.0f, 40.0f))) {
-            selected_slot = slot;
-            action = Action::SaveState;
+        if (appearing && slot == 1) {
+            ImGui::SetKeyboardFocusHere();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Load", ImVec2(140.0f, 40.0f))) {
+        if (ImGui::Button("Load", ImVec2(140.0f, 34.0f))) {
             selected_slot = slot;
             action = Action::LoadState;
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Save", ImVec2(140.0f, 34.0f))) {
+            selected_slot = slot;
+            action = Action::SaveState;
+        }
         ImGui::PopID();
     }
-    ImGui::EndChild();
 
     ImGui::Separator();
-    const bool back = ImGui::Button("Back", ImVec2(200.0f, 48.0f)) || BackPressed();
+    const bool back = ImGui::Button("Back", ImVec2(200.0f, 40.0f)) || BackPressed();
     overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
 

@@ -60,6 +60,9 @@
 #include "core/loader/loader.h"
 #include "core/movie.h"
 #include "core/savestate.h"
+#ifdef __vita__
+#include <psp2/kernel/clib.h>
+#endif
 #ifdef ENABLE_SCRIPTING
 #include "core/rpc/server.h"
 #endif
@@ -69,6 +72,17 @@
 #include "video_core/renderer_base.h"
 
 namespace Core {
+
+// Save/load milestones on the console log in every build (release has no logging backend), so
+// a script driving the pause menu sees a press take effect and the operation finish.
+static void StateNote(const char* what, u32 slot) {
+#ifdef __vita__
+    sceClibPrintf("[mh4u] state: %s %u\n", what, slot);
+#else
+    (void)what;
+    (void)slot;
+#endif
+}
 
 /*static*/ System System::s_instance;
 
@@ -249,14 +263,17 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         const u32 slot = save_state_slot;
         save_state_request_status = SaveStateStatus::NONE;
         LOG_INFO(Core, "Begin load of slot {}", slot);
+        StateNote("loading slot", slot);
         try {
             // Loading destroys and rebuilds the renderer, so GPU() names a different object
             // afterwards; the guard restarts the render thread on whichever one is current.
             ScopedRenderContext context{*this, m_emu_window};
             System::LoadState(slot);
             LOG_INFO(Core, "Load completed");
+            StateNote("loaded slot", slot);
         } catch (const std::exception& e) {
             LOG_ERROR(Core, "Error loading: {}", e.what());
+            StateNote("load failed, slot", slot);
             status_details = e.what();
             return ResultStatus::ErrorSavestate;
         }
@@ -267,12 +284,15 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         save_state_request_status = SaveStateStatus::NONE;
         const u32 slot = save_state_slot;
         LOG_INFO(Core, "Begin save to slot {}", slot);
+        StateNote("saving slot", slot);
         try {
             ScopedRenderContext context{*this, m_emu_window};
             System::SaveState(slot);
             LOG_INFO(Core, "Save completed");
+            StateNote("saved slot", slot);
         } catch (const std::exception& e) {
             LOG_ERROR(Core, "Error saving: {}", e.what());
+            StateNote("save failed, slot", slot);
             status_details = e.what();
             return ResultStatus::ErrorSavestate;
         }
