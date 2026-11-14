@@ -877,7 +877,13 @@ void ThreadedRasterizer::PreshadeLoop() {
     // Below the DSP worker on the same core: the emulation thread waits for each DSP tick, and
     // a screen of text glyphs once kept this worker busy enough to hold those up by ~20 ms.
     // (The render thread shades a draw itself when this one falls behind.)
-    sceKernelChangeThreadPriority(0, SCE_KERNEL_PROCESS_PRIORITY_USER_DEFAULT + 8);
+    // On core 3 (the GX queue's case) it sits just below the audio sink and above the other
+    // threads there: at USER_DEFAULT + 8 it fell behind on the quest counter (~450 glyph and
+    // sprite draws a frame) and the render thread shaded a third of the draws itself
+    // (2026-11-14). It sleeps when its ring is empty. `preshadelow` restores the old priority.
+    static const bool low = !Common::gx_fifo || GxmRenderer::GxmFlag("preshadelow");
+    sceKernelChangeThreadPriority(0, low ? SCE_KERNEL_PROCESS_PRIORITY_USER_DEFAULT + 8
+                                         : SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1);
 #endif
     for (;;) {
         const u32 head = shade_head.load(std::memory_order_relaxed);

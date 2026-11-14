@@ -327,3 +327,26 @@ Pause menu (Select+Start) -> Save states. Saving and loading now work while the 
 - The pause menu opens on Resume every time.
 - A state can be loaded from the title screen; there is no need to enter the game first.
 - Timings on the console (diag): save ~30 s (28 MB file), load ~10 s; the screen freezes meanwhile.
+
+## Quest counter (2026-11-14, from the user's save state)
+
+Release: game 22-24 fps, then 24-26 with the change below. Both worker threads are near full:
+the GX thread ~870-900 ms a second (about a quarter of it waiting on the render queue) and the
+render thread ~95%. A frame is ~690 draws: ~110 hardware draws of the village behind the board
+(drawn every frame under a fully opaque menu, ~46k vertices) and ~450-550 geometry-shader
+sprites and glyphs (one point each, ~2 output triangles) that rotate through 4-5 textures, so
+most of them pay a full GXM setup (~45 us in diag) instead of joining the run before.
+
+Render thread per 3 s (diag, timedraw): software (GS) draws ~1.4 s (~40 us each), hardware
+draws ~0.77 s (~98 us each), applying shipments ~0.39 s (43.6k, ~9 us each). Dropping the
+hardware draws alone only took diag from ~21 to ~23.5 fps (the GX thread is then the limit).
+
+- The pre-shade worker (core 3) ran at USER_DEFAULT + 8, below every other thread there, and
+  fell behind: the render thread shaded about a third of the GS draws itself (~230 ms per 3 s).
+  It now runs at USER_HIGH + 1 under the GX queue (`preshadelow` restores the old priority):
+  ~35 ms. Village walk unchanged (30).
+
+Next candidates: a texture-only-change path for software draws (skip the target, scene, state
+and program-config work when only texture bindings moved), the GX thread's ~30 us shipment
+per GS draw, and the hidden world behind full-screen menus (needs a way to know the cover
+before the world's draws are processed).
