@@ -2227,12 +2227,35 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
                                                                       texture.format);
         const u32 max_level =
             VideoCore::MipLevels(info.width, info.height, texture.config.lod.max_level) - 1;
-        const VideoCore::SurfaceId surface_id = res_cache.GetTextureSurface(info, max_level);
+        // The lookup and the sampler, from the memo while the cache has not changed since:
+        // a lookup that changed nothing would return the same surface. `notexmemo`: always.
+        static const bool no_tex_memo = GxmFlag("notexmemo");
+        const u64 memo_key =
+            Common::HashCombine(Common::ComputeHash64(&texture.config, sizeof(texture.config)),
+                                static_cast<u64>(texture.format) | (u64{max_level} << 8) |
+                                    (u64{unit} << 16));
+        TexMemo& memo = tex_memo[(memo_key ^ (memo_key >> 17)) & (tex_memo.size() - 1)];
+        VideoCore::SurfaceId surface_id{};
+        bool memo_hit = false;
+        if (!no_tex_memo && memo.key == memo_key && memo.gen == res_cache.StructureGen() &&
+            memo.id && res_cache.GetSurface(memo.id).modification_tick == memo.tick) {
+            surface_id = memo.id;
+            memo_hit = true;
+            stat_tex_memo_hits++;
+        } else {
+            const u64 lt = Common::PipelineStats::NowUs();
+            surface_id = res_cache.GetTextureSurface(info, max_level);
+            tex_split[3] += Common::PipelineStats::NowUs() - lt;
+            stat_tex_memo_misses++;
+        }
         if (!surface_id) {
             stat_white_nosurface++;
             continue;
         }
         Surface& surface = res_cache.GetSurface(surface_id);
+        if (memo_hit) {
+            surface.last_use_tick = runtime.GetResourceTick();
+        }
         // logtex: each distinct (colour target, unit, texture, resolved surface) once, so a
         // pass that samples the wrong thing can be told from the log - the surface the cache
         // answered with, its format next to the one asked for, and whether the texture lies in
@@ -2352,8 +2375,16 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             stat_scene_breaks++;
             EndScene();
         }
-        SceGxmTexture bound = *surface.Texture();
-        res_cache.GetSampler(texture.config).Apply(bound);
+        SceGxmTexture bound;
+        if (memo_hit) {
+            bound = memo.bound;
+        } else {
+            bound = *surface.Texture();
+            res_cache.GetSampler(texture.config).Apply(bound);
+            // Recorded after the lookup and the sampler: what they changed is part of the state
+            // a later hit relies on.
+            memo = {memo_key, res_cache.StructureGen(), surface_id, surface.modification_tick, bound};
+        }
         textures[unit] = bound;
         // The scene that will sample this has not begun yet (a cache miss here uploads, and
         // an upload may end the open scene), so the surface is noted and given the serial in
@@ -2511,12 +2542,20 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     // the scene), and so may a LUT ring wrap; both before the scene begins.
     {
         const PhaseTimer timer{time_draws, times.textures};
+        namespace PS = Common::PipelineStats;
+        const u64 t0 = PS::NowUs();
         SyncAndUploadLUTs();
+        const u64 t1 = PS::NowUs();
         skip_feedback_draw = false;
         feedback_alpha_only = false;
         SyncTextureUnits(fb);
+        const u64 t2 = PS::NowUs();
         SyncProcTexStrip();
         SyncFogStrip();
+        const u64 t3 = PS::NowUs();
+        tex_split[0] += t1 - t0;
+        tex_split[1] += t2 - t1;
+        tex_split[2] += t3 - t2;
     }
     if (skip_feedback_draw) {
         stat_skipped++;
@@ -3812,8 +3851,19 @@ void RasterizerGxm::EndFrame() {
                              "scene {} other {}; fragment reg changes:{}",
                              m[0], m[1], m[2], m[3], m[4], m[5], regs_line);
                     namespace PS = Common::PipelineStats;
-                    LOG_INFO(Render, "target lookups reused: {}", stat_target_reuses);
+                    LOG_INFO(Render, "target lookups reused: {}; texture memo {} hits, {} misses",
+                             stat_target_reuses, stat_tex_memo_hits, stat_tex_memo_misses);
                     stat_target_reuses = 0;
+                    stat_tex_memo_hits = stat_tex_memo_misses = 0;
+                    LOG_INFO(Render, "textures phase: luts {} us, units {} us (lookup misses {} us), strips {} us",
+                             tex_split[0], tex_split[1], tex_split[3], tex_split[2]);
+                    tex_split = {};
+                    {
+                        auto& w = res_cache.mutation_why;
+                        LOG_INFO(Render, "cache changes: validated texture {} other {}, invalidated by draw {} "
+                                 "by guest {}, registered {}, unregistered {}", w[0], w[1], w[2], w[3], w[4], w[5]);
+                        w = {};
+                    }
                     LOG_INFO(Render, "bind programs: {} calls, config+lookup {} us, tier2 {} us, pipeline {} us",
                              PS::bp_calls, PS::bp_config_us, PS::bp_tier2_us, PS::bp_pipeline_us);
                     PS::bp_calls = PS::bp_config_us = PS::bp_tier2_us = PS::bp_pipeline_us = 0;

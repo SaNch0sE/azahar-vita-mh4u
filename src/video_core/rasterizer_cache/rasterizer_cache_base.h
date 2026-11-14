@@ -91,6 +91,14 @@ public:
     u64 MutationGen() const noexcept {
         return mutation_gen;
     }
+    /// Counts surfaces registered and unregistered only: with it and a surface's own
+    /// modification_tick unchanged, a texture lookup that returned that surface still would.
+    u64 StructureGen() const noexcept {
+        return structure_gen;
+    }
+    /// Diagnostic: validated texture / other, invalidated by a draw / by the guest, registered,
+    /// unregistered.
+    std::array<u32, 6> mutation_why{};
 
     /// Perform hardware accelerated texture copy according to the provided configuration
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config);
@@ -286,6 +294,7 @@ private:
 
 private:
     u64 mutation_gen = 0;
+    u64 structure_gen = 0;
     Memory::MemorySystem& memory;
     CustomTexManager& custom_tex_manager;
     Runtime& runtime;

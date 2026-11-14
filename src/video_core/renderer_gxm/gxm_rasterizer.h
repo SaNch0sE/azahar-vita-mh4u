@@ -213,6 +213,19 @@ private:
     u64 reuse_target_scene = 0;
     u64 reuse_target_epoch = 0;
     u32 stat_target_reuses = 0;
+    /// Texture lookups (texmemo): the surface and the sampler-applied texture a unit's
+    /// configuration resolved to, valid while no surface was registered or unregistered and that
+    /// surface's modification_tick is unchanged.
+    struct TexMemo {
+        u64 key = 0;
+        u64 gen = ~0ull;
+        VideoCore::SurfaceId id{};
+        u64 tick = 0;
+        SceGxmTexture bound{};
+    };
+    std::array<TexMemo, 512> tex_memo{};
+    u32 stat_tex_memo_hits = 0, stat_tex_memo_misses = 0;
+    std::array<u64, 4> tex_split{};
     /// Everything a draw does before its vertices: framebuffer, textures, scene, state,
     /// programs, uniforms. False means the draw is not happening (the caller folds its ring
     /// space back and returns); the helper is left for the caller to release either way.

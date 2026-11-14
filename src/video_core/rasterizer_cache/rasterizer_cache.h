@@ -1166,6 +1166,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         return;
     }
     mutation_gen++;
+    mutation_why[surface.type == SurfaceType::Texture ? 0 : 1]++;
 
     // A texture whose bytes still hash to what it last matched needs nothing, however much of it
     // was invalidated. Guest writes are tracked by the page, and a texture that does not start
@@ -1834,6 +1835,10 @@ void RasterizerCache<T>::InvalidateRegionUnlessDirty(PAddr addr, u32 size) {
                 (surface.GetInterval() & cpu_interval) == surface.GetInterval()) {
                 return;
             }
+            if (!boost::icl::contains(surface.invalid_regions, surface.GetInterval() & cpu_interval)) {
+                mutation_gen++;
+                mutation_why[3]++;
+            }
             surface.MarkInvalid(surface.GetInterval() & cpu_interval);
             if (!surface.IsFullyInvalid()) {
                 return;
@@ -1903,6 +1908,7 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
         const auto interval = surface.GetInterval() & invalid_interval;
         if (!boost::icl::contains(surface.invalid_regions, interval)) {
             mutation_gen++;
+            mutation_why[region_owner_id ? 2 : 3]++;
         }
         surface.MarkInvalid(interval);
         if (!surface.IsFullyInvalid()) {
@@ -1952,6 +1958,8 @@ void RasterizerCache<T>::RegisterSurface(SurfaceId surface_id) {
 
     surface.flags |= SurfaceFlagBits::Registered;
     mutation_gen++;
+    structure_gen++;
+    mutation_why[4]++;
     UpdatePagesCachedCount(surface.addr, surface.size, 1);
     ForEachPage(surface.addr, surface.size,
                 [this, surface_id](u64 page) { page_table[page].push_back(surface_id); });
@@ -1965,6 +1973,8 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
 
     surface.flags &= ~SurfaceFlagBits::Registered;
     mutation_gen++;
+    structure_gen++;
+    mutation_why[5]++;
     UpdatePagesCachedCount(surface.addr, surface.size, -1);
     ForEachPage(surface.addr, surface.size, [this, surface_id](u64 page) {
         const auto page_it = page_table.find(page);
