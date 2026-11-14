@@ -233,3 +233,35 @@ half sees the frame's whole op stream queued).
 Release hub: game 24 -> 29-31 fps (speed ~80% -> ~99%), shown 24 -> 25-28. The render thread
 is the limit now (and the keyboard screen, ~500 glyph draws a frame, render-bound at ~20).
 Checked: intro movie, ship cutscene, deck both views, hub, keyboard screen.
+
+## Village hub render thread (2026-11-14, evening)
+
+Release, standing in the hub: shown 28.2 -> 29.8 fps (the 30 fps cap), game 30. Deck and the ship
+cutscene stay at 30 and look right. Per change, hub, 3 s windows:
+
+- **Shared shader JIT cache** (`shader_jit.cpp`). Every engine compiled its own copy of each guest
+  shader into the one 4 MB A32 arena, which filled in the hub ("code arena full; interpreting").
+  One process-wide cache: no arena-full warning.
+- **No statistics clock reads in release** (`PipelineStats::StatUs`). ~280k process-clock reads per
+  3 s fed counters release never prints; the GPU thread now reads the clock per present and times
+  one op in eight for the backlog average. Shown 28.2 -> 29.2.
+- **Vertex layout memo** (`AccelerateShippedDraw`, `vertex_regs_version`). The mirror's version is
+  bumped only by registers the layout and program key read (formats, loader configs, VS config
+  words, VS output map, lighting disable, VS code/bools/ints - not buffer addresses or float
+  uniform ports, which change every draw). ~12k of ~15k hardware draws hit; layout block
+  199 -> 91 ms. `vsmemocheck` compares against a rebuild (0 mismatches), `novsmemo` disables.
+- **Per-page guest-flush hashes** (`SurfaceBase::SetUploadHash`, `ValidateSurface`). MH4U's writes
+  next to its textures made every frame re-hash whole textures: 33 MB / 215 ms per 3 s for 1.8 MB
+  actually invalidated, never a change. Whole uploads keep a hash per 4 KiB page (valid only while
+  the whole hash is current); the check hashes only the pages the invalid regions touch. Re-hash
+  215 -> 17 ms, texture lookup misses 242 -> 46 ms, frames rendered 75 -> 86 per 3 s (diag).
+  `pagehashcheck` compares against the whole hash (0 disagreements), `nopagehash` disables.
+
+Profile reading notes (Fable's review): "programs" includes "uniforms" (the uniforms timer is inside
+BindPrograms); "software vertex shading" mostly re-counts the pre-shaded draws' DrawTriangles; the
+~26% "none of the above" is op time outside `times.total` (ApplyShipment etc.).
+
+Not done yet, by expected value: a TEV-constant-colour-only begin-repeat (0xC3/0xD3 change in
+~4k draws per 3 s; measure first, cf. the failed light repeat), uniform upload trimming
+(316 ms / 14k uploads: write plans per program, vertex bank extent), and the per-shipment
+ApplyShipment cost.
