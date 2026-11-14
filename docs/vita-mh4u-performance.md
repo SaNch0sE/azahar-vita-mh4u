@@ -350,3 +350,26 @@ Next candidates: a texture-only-change path for software draws (skip the target,
 and program-config work when only texture bindings moved), the GX thread's ~30 us shipment
 per GS draw, and the hidden world behind full-screen menus (needs a way to know the cover
 before the world's draws are processed).
+
+## Quest area 3 (2026-11-15, the user's save state, slot 2)
+
+Release, standing and turning the camera: game 30, shown mostly 28-29 (frames dropped by the
+frameskip, the uneven feel), 30 looking at sky or ground, one one-second stall to ~15. The GX
+thread is light (~300-480 ms/s); the render thread is near full (diag 94%, ~5 ms a frame of it
+waiting for the GPU) and the GPU is at the budget by itself.
+
+GPU per frame on the main target (diag scenetime): 32.8 ms. Building the programs back up from
+vertex colour: 7.0, + textures 10.6, + combiner 14.6, + lighting 21.6, + alpha test 29.7, all 33.5.
+- Alpha test off for every draw (`ptalways` experiment): 24.9 ms. Alpha-tested draws dropped
+  (`ptskip`): 20.6 ms. Alpha-tested draws with a trivial alpha-only discard program (`ptmin`):
+  25.4 ms. So ~33 alpha-tested lit draws a frame cost 4.3 ms without discard and 12.2 ms with it,
+  and even a trivial discard program costs them ~4.8 ms: on the SGX the cost is the discard
+  itself, not the program before or after it.
+- An early kill (alpha chain first, then lighting; all 2,848 alpha-tested draws per 3 s were
+  eligible once combiner-buffer alpha was supported) gained nothing: 32.8 -> 32.2 ms. Reverted.
+- A depth pre-pass + EQUAL colour pass would pay the ~4.8 ms discard cost again in the pre-pass:
+  projected ~30.7 ms, about 2 ms. Not built.
+- libgxm classes the world's ADD/ONE/ZERO programs as opaque (`logfp` pass type), so passing
+  that blend as FUNC_NONE changes nothing (measured: 33.2 ms).
+- A save-state load left the GXM context bound to the old renderer's freed programs (crash with
+  `scenetime`); fixed (commit 2cb311511).
