@@ -1801,6 +1801,16 @@ void RasterizerCache<T>::ClearAll(bool flush) {
         memory.RasterizerMarkRegionCached(interval_start_addr, interval_size, false);
     }
 
+    // Every surface leaves properly: clearing the page table alone left them all flagged
+    // Registered with no pages behind them, and the first surface trim after a save state
+    // picked one and died in UnregisterSurface's page assert (2026-11-14). Sentenced ones are
+    // freed by the collector as usual.
+    for (auto& [page, surfaces] : page_table) {
+        while (!surfaces.empty()) {
+            UnregisterSurface(surfaces.back());
+        }
+    }
+
     // Remove the whole cache without really looking at it.
     cached_pages -= flush_interval;
     dirty_regions.clear();
