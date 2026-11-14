@@ -311,16 +311,126 @@ static void heap_refused(size_t size, void* ra) {
     g_in_trace = 0;
 }
 
+// Live heap by call site: every allocation of LIVE_MIN bytes or more is remembered with a key
+// made of the first two stack callers (see stack_callers), and freeing it takes it back off, so
+// the dump can name what is holding the heap rather than what churns through it.
+#define LIVE_MIN 256u
+#define LIVE_SLOTS 65536u
+#define LIVE_KEYS 2048u
+struct LiveSlot { uintptr_t ptr; uint32_t size; uint16_t key; };
+struct LiveKey { uint32_t a, b, c, d; long bytes; uint32_t count; };
+static struct LiveSlot g_live[LIVE_SLOTS];
+static struct LiveKey g_keys[LIVE_KEYS];
+static volatile int g_live_lock;
+/// Never waits: a thread spinning on this at a higher priority than the holder, on the
+/// holder's core, never lets it finish - that froze the whole console. Busy means the
+/// allocation goes untracked (a missed free leaves a stale entry; the totals stay close).
+static int live_lock(void) {
+    for (int t = 0; t < 64; t++) {
+        if (!__atomic_exchange_n(&g_live_lock, 1, __ATOMIC_ACQUIRE)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+static void live_unlock(void) { __atomic_store_n(&g_live_lock, 0, __ATOMIC_RELEASE); }
+
+static void __attribute__((noinline)) live_callers(uint32_t* out) {
+    const volatile uint32_t* sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    unsigned int n = 0;
+    out[0] = out[1] = out[2] = out[3] = 0;
+    for (unsigned int i = 0; i < 64 && n < 4; i++) {
+        const uint32_t w = sp[i];
+        if (w > 0x81000000u && w < 0x81a40000u && w != 0x8101a4c5u) {
+            out[n++] = w;
+        }
+    }
+}
+
+static void live_add(void* p, size_t size) {
+    if (!p || size < LIVE_MIN) {
+        return;
+    }
+    uint32_t c[4];
+    live_callers(c);
+    if (!live_lock()) {
+        return;
+    }
+    unsigned int k = ((c[0] * 2654435761u) ^ (c[1] * 40503u) ^ c[2] ^ (c[3] << 7)) % LIVE_KEYS;
+    for (unsigned int t = 0; t < LIVE_KEYS; t++, k = (k + 1) % LIVE_KEYS) {
+        if (g_keys[k].count == 0 && g_keys[k].bytes == 0 && g_keys[k].a == 0) {
+            g_keys[k].a = c[0];
+            g_keys[k].b = c[1];
+            g_keys[k].c = c[2];
+            g_keys[k].d = c[3];
+            break;
+        }
+        if (g_keys[k].a == c[0] && g_keys[k].b == c[1] && g_keys[k].c == c[2] && g_keys[k].d == c[3]) {
+            break;
+        }
+    }
+    unsigned int i = ((uintptr_t)p >> 3) % LIVE_SLOTS;
+    for (unsigned int t = 0; t < LIVE_SLOTS; t++, i = (i + 1) % LIVE_SLOTS) {
+        if (g_live[i].ptr == 0 || g_live[i].ptr == 1) {
+            g_live[i].ptr = (uintptr_t)p;
+            g_live[i].size = (uint32_t)size;
+            g_live[i].key = (uint16_t)k;
+            g_keys[k].bytes += (long)size;
+            g_keys[k].count++;
+            break;
+        }
+    }
+    live_unlock();
+}
+
+static void live_remove(void* p) {
+    if (!p || !live_lock()) {
+        return;
+    }
+    unsigned int i = ((uintptr_t)p >> 3) % LIVE_SLOTS;
+    for (unsigned int t = 0; t < LIVE_SLOTS && g_live[i].ptr != 0; t++, i = (i + 1) % LIVE_SLOTS) {
+        if (g_live[i].ptr == (uintptr_t)p) {
+            g_keys[g_live[i].key].bytes -= (long)g_live[i].size;
+            g_keys[g_live[i].key].count--;
+            g_live[i].ptr = 1; // tombstone
+            break;
+        }
+    }
+    live_unlock();
+}
+
+/// Heap records keep no name, so their name field holds up to five more callers: words on the
+/// stack that look like Thumb return addresses into the executable (odd, inside its text). A
+/// heuristic - stale words show up too - but enough to see past operator new.
+static void __attribute__((noinline)) stack_callers(struct AllocRecord* r) {
+    const volatile uint32_t* sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    uint32_t found[ALLOC_TRACE_NAME / 4] = {0};
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < 160 && n < ALLOC_TRACE_NAME / 4; i++) {
+        const uint32_t w = sp[i];
+        if (w > 0x81000000u && w < 0x81a40000u && w != (uint32_t)r->ra) {
+            found[n++] = w;
+        }
+    }
+    __builtin_memcpy(r->name, found, sizeof(found));
+}
+
 #define WRAP_BODY(call, req_size)                                                                  \
     stack_watch();                                                                                 \
     void* const ra = __builtin_return_address(0);                                                  \
     const size_t sz = (req_size);                                                                  \
     struct AllocRecord* r = sz >= ALLOC_TRACE_THRESHOLD ? record(ALLOC_HEAP, NULL, sz, ra) : NULL; \
+    if (r) {                                                                                       \
+        stack_callers(r);                                                                          \
+    }                                                                                              \
     void* p = (call);                                                                              \
     if (!p && sz != 0) {                                                                           \
         heap_refused(sz, ra);                                                                      \
     }                                                                                              \
     if (p) {                                                                                       \
+        live_add(p, sz);                                                                           \
         if (r) {                                                                                   \
             r->failed = 0;                                                                         \
             r->result = 1;                                                                         \
@@ -352,8 +462,12 @@ void* __wrap_realloc(void* old, size_t size) {
     void* const ra = __builtin_return_address(0);
     const size_t old_size = old ? malloc_usable_size(old) : 0;
     struct AllocRecord* r = size >= ALLOC_TRACE_THRESHOLD ? record(ALLOC_HEAP, NULL, size, ra) : NULL;
+    if (old) {
+        live_remove(old);
+    }
     void* p = __real_realloc(old, size);
     if (p) {
+        live_add(p, size);
         if (r) {
             r->failed = 0;
             r->result = 1;
@@ -368,6 +482,7 @@ void* __wrap_realloc(void* old, size_t size) {
 }
 
 void __wrap_free(void* p) {
+    live_remove(p);
     if (p) {
         __atomic_sub_fetch(&g_heap_live, (long)malloc_usable_size(p), __ATOMIC_RELAXED);
     }
@@ -378,6 +493,40 @@ void __wrap_free(void* p) {
 /// never from the allocation path, which is the whole reason the wrappers only record.
 void VitaAllocTraceDump(void) {
     static const char* const kind_name[] = {"memblock", "thread  ", "heap    "};
+    {
+        // The ten call sites holding the most live heap (allocations of 2 KiB or more).
+        static unsigned int live_dumps;
+        if ((++live_dumps % 2) == 0) {
+            long total = 0;
+            for (unsigned int k = 0; k < LIVE_KEYS; k++) {
+                total += g_keys[k].bytes;
+            }
+            sceClibPrintf("[live] --- tracked %ld KiB\n", total / 1024);
+            int used[40];
+            for (int t = 0; t < 40; t++) {
+                long best = 0;
+                int bi = -1;
+                for (unsigned int k = 0; k < LIVE_KEYS; k++) {
+                    int taken = 0;
+                    for (int u = 0; u < t; u++) {
+                        taken |= used[u] == (int)k;
+                    }
+                    if (!taken && g_keys[k].bytes > best) {
+                        best = g_keys[k].bytes;
+                        bi = (int)k;
+                    }
+                }
+                used[t] = bi;
+                if (bi < 0) {
+                    break;
+                }
+                sceClibPrintf("[live] %8ld KiB %6u x  %08x %08x %08x %08x\n",
+                              g_keys[bi].bytes / 1024, g_keys[bi].count, (unsigned)g_keys[bi].a,
+                              (unsigned)g_keys[bi].b, (unsigned)g_keys[bi].c,
+                              (unsigned)g_keys[bi].d);
+            }
+        }
+    }
     const unsigned int seen = g_record_count;
     unsigned int first = g_dumped;
     if (seen - first > ALLOC_TRACE_RECORDS) {
@@ -389,11 +538,22 @@ void VitaAllocTraceDump(void) {
             sceClibPrintf("[alloc] %s %9u B  kernel %4u MiB  heap %4u MiB  ra %p  %s  "
                           "REFUSED 0x%08X\n",
                           kind_name[r->kind < 3 ? r->kind : 2], r->bytes, r->kernel_mib,
-                          r->heap_mib, r->ra, r->name, (unsigned int)r->result);
+                          r->heap_mib, r->ra, r->kind == ALLOC_HEAP ? "" : r->name,
+                          (unsigned int)r->result);
         } else {
-            sceClibPrintf("[alloc] %s %9u B  kernel %4u MiB  heap %4u MiB  ra %p  %s\n",
-                          kind_name[r->kind < 3 ? r->kind : 2], r->bytes, r->kernel_mib,
-                          r->heap_mib, r->ra, r->name);
+            if (r->kind == ALLOC_HEAP) {
+                uint32_t c[ALLOC_TRACE_NAME / 4];
+                __builtin_memcpy(c, r->name, sizeof(c));
+                sceClibPrintf("[alloc] %s %9u B  kernel %4u MiB  heap %4u MiB  ra %p  callers "
+                              "%08x %08x %08x %08x %08x\n",
+                              kind_name[2], r->bytes, r->kernel_mib, r->heap_mib, r->ra,
+                              (unsigned)c[0], (unsigned)c[1], (unsigned)c[2], (unsigned)c[3],
+                              (unsigned)c[4]);
+            } else {
+                sceClibPrintf("[alloc] %s %9u B  kernel %4u MiB  heap %4u MiB  ra %p  %s\n",
+                              kind_name[r->kind < 3 ? r->kind : 2], r->bytes, r->kernel_mib,
+                              r->heap_mib, r->ra, r->name);
+            }
         }
     }
     g_dumped = seen;
