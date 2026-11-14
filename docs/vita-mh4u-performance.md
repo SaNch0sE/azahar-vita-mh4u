@@ -287,3 +287,23 @@ direction starts, which are vblank frame skips from arena backpressure.
   falls back; release long walk 204 s, no crash, 29.65 fps shown; short-walk fps unchanged.
   Found with the tracer's live table, now appended to `ux0:data/mh4u/live.txt` (the TTY drops
   lines under load).
+
+- **"Direction-change dips" were mostly the test's own screenshots.** walk.sh took a capture at
+  each segment end and the capture runs on the console: the dip landed in the second second of
+  nearly every segment. `NOSHOT=1 walk.sh` measures without captures; then laps over ground
+  already seen hold 29-30, and the one real dip is the first steps out of the spawn (2 s at
+  21-25 game fps, every session). That is first-time work: ~30 vertex/fragment programs emitted
+  on the render thread in 0.7 s (1-10 ms each, plus two ~20 ms PICA JIT compiles on the GX
+  thread); the render thread fell behind and the GX queue's brake (85-317 ms a second, seen with
+  the new `emuprofgx` switch, which points EmuProf at the GX thread) held the emulation side.
+  - **Program disk cache** (`ux0:data/mh4u/programs.bin`): every emitted program, both tiers,
+    is written by a background thread and read back by key in later runs; the file is
+    versioned by a build-time MD5 of the emitter sources (plus the diag flags), so a code
+    change starts it over. Release, warm cache: the first steps hold 30/30 (cold: 21-23 as
+    before; only the first visit ever pays). `nodiskprograms` (diag) turns it off.
+  - The **second shader tier ran on core 0 at high priority**, above the GX thread, despite its
+    comment (it used the ShaderCompiler role); it now has a Background role, core 3 at
+    USER_LOW.
+  - timedraw names slow emits/pipeline builds (`slow vs emit ...`).
+- Still open: a rare single-second stall to ~13 fps (twice in all the walks so far), cause unknown.
+
