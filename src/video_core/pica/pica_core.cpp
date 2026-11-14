@@ -672,7 +672,8 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         return;
     }
 
-    const u8* head = memory.GetPhysicalPointer(list);
+    const u8* head = list_override != nullptr ? list_override : memory.GetPhysicalPointer(list);
+    list_override = nullptr; // the top-level list only; chained lists read guest memory
     bool stop_requested = false;
     cmd_list.Reset(list, head, size);
     const u64 list_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;

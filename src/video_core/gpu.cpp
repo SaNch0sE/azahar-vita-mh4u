@@ -137,9 +137,9 @@ GPU::Impl::~Impl() {
 
 /// Emulation thread, at the VBlank: copies the framebuffer the guest shows on `screen` into a
 /// free slot when the CPU is what writes it, and returns the slot; null otherwise.
-DisplaySnapshotSlot* GPU::TakeDisplaySnapshot(u32 screen) {
+DisplaySnapshotSlot* GPU::TakeDisplaySnapshot(u32 screen, const Pica::FramebufferConfig* config) {
     Impl& impl = *this->impl;
-    const auto& fb = impl.pica.regs.framebuffer_config[screen];
+    const auto& fb = config != nullptr ? *config : impl.pica.regs.framebuffer_config[screen];
     const PAddr addr = fb.active_fb == 0 ? fb.address_left1 : fb.address_left2;
     const u32 bytes = fb.stride * fb.height;
     if (addr == 0 || bytes == 0 || bytes > GPU::DisplaySnapshotBytes) {
@@ -263,6 +263,22 @@ void GPU::PostInterrupt(Service::GSP::InterruptId id, u64 delay_ns) {
     }
 }
 
+bool GPU::GxFifo() const {
+    // Stage 2 (Common::gx_fifo): the GX thread works through a queue; see GxWorker.
+    return Common::gx_fifo && impl->gx.thread.joinable();
+}
+
+void GPU::GxPush(std::function<void()> task) {
+    auto& gx = impl->gx;
+    {
+        std::scoped_lock lock{gx.task_mutex};
+        gx.tasks.push_back(std::move(task));
+        gx.unfinished++;
+        gx.state.store(Impl::GxWorker::Posted, std::memory_order_release);
+    }
+    gx.work_wake.Raise();
+}
+
 void GPU::PostInterruptDeferred(Service::GSP::InterruptId id, u64 delay_ns) {
     // Zero-cycle event so delivery happens on a clean stack: these are raised from inside GSP's
     // own command handling, which must not re-enter.
@@ -271,7 +287,8 @@ void GPU::PostInterruptDeferred(Service::GSP::InterruptId id, u64 delay_ns) {
     impl->timing.ScheduleEvent(0, impl->gpu_interrupt_event, packed);
 }
 
-void GPU::QueueMemoryFill(u32 index, u32 start, u32 end, u32 value, u32 control, u32 intr_index) {
+void GPU::QueueMemoryFill(u32 index, u32 start, u32 end, u32 value, u32 control, u32 intr_index,
+                          bool post_completion) {
     // Mirror the register-visible effects on the emulation side immediately: games poll the
     // `finished` bit through ReadHWRegs, and the completion interrupt runs on the fill engine's
     // modelled timing, never on the render thread's backlog. The memory effect lands when the op
@@ -305,7 +322,9 @@ void GPU::QueueMemoryFill(u32 index, u32 start, u32 end, u32 value, u32 control,
             PostInterruptDeferred(id, delay);
         }
     };
-    post_psc(false);
+    if (post_completion) {
+        post_psc(false);
+    }
     config.trigger.Assign(0);
     config.finished.Assign(1);
 
@@ -352,22 +371,26 @@ void GPU::QueueMemoryFill(u32 index, u32 start, u32 end, u32 value, u32 control,
     }});
 }
 
-void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in) {
+u64 GPU::TransferDelay(Pica::DisplayTransferConfig config) {
+    if (config.is_texture_copy) {
+        return DelayGenerator::CalculateDelayNanoseconds(
+            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
+            config.texture_copy.size);
+    }
+    return DelayGenerator::CalculateDelayNanoseconds(
+        DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
+        config.input_width * config.input_height * BytesPerPixel(config.input_format));
+}
+
+void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in, bool post_completion) {
     Pica::DisplayTransferConfig config = config_in;
     impl->pica.regs.display_transfer_config = config;
 
-    u64 delay{};
-    if (config.is_texture_copy) {
-        delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
-            config.texture_copy.size);
-    } else {
-        delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
-            config.input_width * config.input_height * BytesPerPixel(config.input_format));
-    }
+    const u64 delay = TransferDelay(config);
     const bool defer_completion = impl->shipping_rasterizer->DefersInterrupts();
-    PostInterruptDeferred(Service::GSP::InterruptId::PPF, delay);
+    if (post_completion) {
+        PostInterruptDeferred(Service::GSP::InterruptId::PPF, delay);
+    }
     impl->pica.regs.display_transfer_config.trigger.Assign(0);
 
     // Transfers normally run even for skipped frames: unlike draws they are how content persists —
@@ -523,6 +546,9 @@ void GPU::GxStart() {
     }
     impl->gx.quit = false;
     impl->gx.thread = std::thread([this] { GxLoop(); });
+    if (Common::gx_fifo) {
+        LOG_INFO(HW_GPU, "GX work runs as an ordered queue beside the guest (gxfifo)");
+    }
     LOG_INFO(HW_GPU, "GX command lists run on their own thread");
 }
 
@@ -538,13 +564,47 @@ void GPU::GxStop() {
 }
 
 void GPU::GxLoop() {
-    // The shader compiler's core, idle while a title runs.
-    Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
+    // The shader compiler's core, idle while a title runs - or, queued (gxfifo), core 3: core 0
+    // carries the pre-shade, DSP and y2r workers.
+    Common::SetCurrentThreadRole(Common::gx_fifo ? Common::ThreadRole::RasterWorker
+                                                 : Common::ThreadRole::ShaderCompiler);
     Common::SetCurrentThreadName("GxLists");
     Common::EmuProf::thread_disabled = true;
     impl->gx.worker_id = std::this_thread::get_id();
     auto& gx = impl->gx;
+    const bool fifo = Common::gx_fifo;
     for (;;) {
+        if (fifo) {
+            std::function<void()> task;
+            {
+                std::scoped_lock lock{gx.task_mutex};
+                if (!gx.tasks.empty()) {
+                    task = std::move(gx.tasks.front());
+                    gx.tasks.pop_front();
+                }
+            }
+            if (task) {
+                task();
+                std::scoped_lock lock{gx.task_mutex};
+                if (--gx.unfinished == 0) {
+                    gx.state.store(Impl::GxWorker::Done, std::memory_order_release);
+                    gx.done_wake.Raise();
+                }
+                continue;
+            }
+            gx.work_wake.Lower();
+            {
+                std::scoped_lock lock{gx.task_mutex};
+                if (!gx.tasks.empty()) {
+                    continue;
+                }
+            }
+            if (gx.quit.load(std::memory_order_acquire)) {
+                return;
+            }
+            gx.work_wake.Wait();
+            continue;
+        }
         if (gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted) {
             MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
             const u64 list_t0 = Common::PipelineStats::NowUs();
@@ -570,6 +630,18 @@ void GPU::GxLoop() {
 
 bool GPU::GxBusy() const {
     return impl->gx.state.load(std::memory_order_acquire) != Impl::GxWorker::Idle;
+}
+
+bool GPU::GxIdleSkippable() const {
+    if (GxFifo()) {
+        // Every queued list has had its P3D posted: the idle guest waits for something else
+        // (a vblank), so time runs on while the queue works.
+        return impl->gx.lists_waiting_p3d == 0 &&
+               impl->gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted;
+    }
+    static const bool idle_skip = GxmRenderer::GxmFlag("gxidleskip");
+    return idle_skip && impl->gx.early_p3d &&
+           impl->gx.state.load(std::memory_order_acquire) == Impl::GxWorker::Posted;
 }
 
 void GPU::GxPoll() {
@@ -614,11 +686,15 @@ void GPU::GxAcquire(const char* site) {
         Common::EmuProf::Add(p3d == 1 ? "gx list: one P3D" : (p3d == 0 ? "gx list: no P3D" : "gx list: several P3D"),
                              gx.irqs.size() * 1000);
     }
-    bool skip_p3d = gx.early_p3d;
+    // P3Ds already posted at hand-over (one per early list) are not posted again.
+    u32 skip_p3d = GxFifo() ? gx.early_p3d_lists : (gx.early_p3d ? 1u : 0u);
     gx.early_p3d = false;
+    gx.early_p3d_lists = 0;
+    gx.lists_waiting_p3d = 0;
+    gx.lists_queued = false;
     for (const auto& [id, delay] : gx.irqs) {
-        if (skip_p3d && id == Service::GSP::InterruptId::P3D) {
-            skip_p3d = false; // already posted at hand-over
+        if (skip_p3d > 0 && id == Service::GSP::InterruptId::P3D) {
+            skip_p3d--;
             continue;
         }
         PostInterruptDeferred(id, delay);
@@ -812,7 +888,16 @@ void GPU::InvalidateOnGuestFlush(PAddr addr, u32 size) {
     if (tracker.Enabled()) {
         // A list in flight: its invalidations stay ordered after it, as when it ran here.
         const bool defer = GxBusy();
-        tracker.Consume([this, defer](u32 paddr, u32 size) {
+        const bool as_task = defer && GxFifo();
+        tracker.Consume([this, defer, as_task](u32 paddr, u32 size) {
+            if (as_task) {
+                // Ordered after the queued work, like everything the queue ships.
+                GxPush([this, paddr, size] {
+                    impl->shipping_rasterizer->InvalidateGuestFlushedRegion(paddr, size);
+                    impl->shipping_rasterizer->InvalidateVertexCache(paddr, size);
+                });
+                return;
+            }
             if (defer) {
                 impl->gx.deferred_flush.emplace_back(paddr, size);
                 return;
@@ -958,6 +1043,56 @@ void GPU::ClearAll(bool flush) {
     impl->gpu_thread.RunSync([this, flush] { impl->rasterizer->ClearAll(flush); });
 }
 
+void GPU::QueueCmdList(PAddr addr, u32 size) {
+    auto& gx = impl->gx;
+    // At most one frame of overlap: a list from before the last vblank still queued is
+    // finished first, so the guest is never more than a frame ahead of the parse.
+    if (gx.lists_queued && gx.list_frame != gx.vblanks) {
+        GxAcquire("gxwait: list bound");
+    }
+    const bool allow = right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size);
+    const u8* head = impl->memory.GetPhysicalPointer(addr);
+    // gx_early_p3d: a list that ends by requesting its P3D (a write to the IRQ request
+    // register, 0x010, as its last command) gets the interrupt now.
+    bool early = false;
+    if (allow && head != nullptr && size >= 8) {
+        u32 header;
+        std::memcpy(&header, head + size - 4, sizeof(header));
+        early = (header & 0x3ff) == 0x010;
+    }
+    std::shared_ptr<std::vector<u32>> snapshot;
+    if (allow && Common::gx_snapshot && head != nullptr) {
+        snapshot = std::make_shared<std::vector<u32>>(size / 4);
+        std::memcpy(snapshot->data(), head, size);
+    }
+    if (!gx.lists_queued) {
+        gx.lists_queued = true;
+        gx.list_frame = gx.vblanks;
+    }
+    if (early) {
+        gx.early_p3d_lists++;
+        PostInterruptDeferred(Service::GSP::InterruptId::P3D, 0);
+    } else {
+        gx.lists_waiting_p3d++;
+    }
+    GxPush([this, addr, size, allow, snapshot] {
+        auto& cmdbuffer = impl->pica.regs.internal.pipeline.command_buffer;
+        cmdbuffer.addr[0].Assign(addr >> 3);
+        cmdbuffer.size[0].Assign(size >> 3);
+        cmdbuffer.trigger[0] = 1;
+        MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
+        const u64 list_t0 = Common::PipelineStats::NowUs();
+        impl->pica.SetListOverride(snapshot ? reinterpret_cast<const u8*>(snapshot->data())
+                                            : nullptr);
+        impl->pica.ProcessCmdList(addr, size, !allow);
+        impl->pica.SetListOverride(nullptr);
+        Common::PipelineStats::gx_list_us.fetch_add(Common::PipelineStats::NowUs() - list_t0,
+                                                    std::memory_order_relaxed);
+        Common::PipelineStats::gx_lists.fetch_add(1, std::memory_order_relaxed);
+        cmdbuffer.trigger[0] = 0;
+    });
+}
+
 void GPU::Execute(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
@@ -965,7 +1100,15 @@ void GPU::Execute(const Service::GSP::Command& command) {
     if (impl->gx.emu_id == std::thread::id{}) {
         impl->gx.emu_id = std::this_thread::get_id();
     }
-    GxAcquire("gxwait: next command");
+    // gxfifo: lists, fills and transfers queue behind the work in flight; anything else waits.
+    const bool fifo = GxFifo();
+    const bool queued = fifo && (command.id == CommandId::SubmitCmdList ||
+                                 command.id == CommandId::MemoryFill ||
+                                 command.id == CommandId::DisplayTransfer ||
+                                 command.id == CommandId::TextureCopy);
+    if (!queued) {
+        GxAcquire("gxwait: next command");
+    }
 
 #ifdef CITRA_TRACE_PROBES
     // Temporary divergence tracing for the software-renderer boot hang.
@@ -1011,6 +1154,10 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     case CommandId::SubmitCmdList: {
         auto& params = command.submit_gpu_cmdlist;
+        if (fifo) {
+            QueueCmdList(VirtualToPhysicalAddress(params.address), (params.size >> 3) << 3);
+            break;
+        }
         auto& cmdbuffer = regs.internal.pipeline.command_buffer;
 
         // Write to the command buffer GPU registers
@@ -1066,6 +1213,40 @@ void GPU::Execute(const Service::GSP::Command& command) {
 
         // If both buffers are set GSP dispatches PSC0 only.
         const bool has_both_bufs = params.start1 != 0 && params.start2 != 0;
+        if (fifo) {
+            // The completion goes out now, on the engine's modelled timing; the fill itself
+            // queues behind the work in flight.
+            const auto queue_fill = [&](u32 index, VAddr start_v, VAddr end_v, u32 value,
+                                        u32 control, u32 intr_index) {
+                const u32 start = VirtualToPhysicalAddress(start_v) >> 3;
+                const u32 end = VirtualToPhysicalAddress(end_v) >> 3;
+                Pica::MemoryFillConfig cfg{};
+                cfg.address_start = start;
+                cfg.address_end = end;
+                cfg.value_32bit = value;
+                cfg.control = control;
+                const u64 delay = DelayGenerator::CalculateDelayNanoseconds(
+                    DelayGenerator::GetCopyMode(true, cfg.IsVRAM()), true,
+                    cfg.GetEndAddress() - cfg.GetStartAddress());
+                if (cfg.GetStartAddress() != 0 && intr_index <= 1) {
+                    PostInterruptDeferred(intr_index == 0 ? Service::GSP::InterruptId::PSC0
+                                                          : Service::GSP::InterruptId::PSC1,
+                                          delay);
+                }
+                GxPush([this, index, start, end, value, control, intr_index] {
+                    QueueMemoryFill(index, start, end, value, control, intr_index, false);
+                });
+            };
+            if (params.start1 != 0) {
+                queue_fill(0, params.start1, params.end1, params.value1, params.control1,
+                           has_both_bufs ? std::numeric_limits<u32>::max() : 0);
+            }
+            if (params.start2 != 0) {
+                queue_fill(1, params.start2, params.end2, params.value2, params.control2,
+                           has_both_bufs ? 0 : 1);
+            }
+            break;
+        }
         if (params.start1 != 0) {
             QueueMemoryFill(0, VirtualToPhysicalAddress(params.start1) >> 3,
                             VirtualToPhysicalAddress(params.end1) >> 3, params.value1,
@@ -1087,6 +1268,11 @@ void GPU::Execute(const Service::GSP::Command& command) {
         config.input_size = params.in_buffer_size;
         config.output_size = params.out_buffer_size;
         config.flags = params.flags;
+        if (fifo) {
+            PostInterruptDeferred(Service::GSP::InterruptId::PPF, TransferDelay(config));
+            GxPush([this, config] { QueueMemoryTransfer(config, false); });
+            break;
+        }
         QueueMemoryTransfer(config);
         break;
     }
@@ -1100,6 +1286,11 @@ void GPU::Execute(const Service::GSP::Command& command) {
         config.texture_copy.output_size = params.out_width_gap;
         config.flags = params.flags;
         config.is_texture_copy.Assign(1);
+        if (fifo) {
+            PostInterruptDeferred(Service::GSP::InterruptId::PPF, TransferDelay(config));
+            GxPush([this, config] { QueueMemoryTransfer(config, false); });
+            break;
+        }
         QueueMemoryTransfer(config);
         break;
     }
@@ -1119,7 +1310,11 @@ void GPU::Execute(const Service::GSP::Command& command) {
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
-    GxAcquire("gxwait: buffer swap");
+    // The framebuffer registers are the emulation thread's (a queued vblank half takes its own
+    // copy): with gxfifo a swap does not wait for the queue.
+    if (!GxFifo()) {
+        GxAcquire("gxwait: buffer swap");
+    }
     const PAddr phys_address_left = VirtualToPhysicalAddress(info.address_left);
     const PAddr phys_address_right = VirtualToPhysicalAddress(info.address_right);
     const auto info_copy = info;
@@ -1295,13 +1490,8 @@ void GPU::ExecSubmitCmdList(u32 index) {
     config.trigger[index] = 0;
 }
 
-void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
-    // Stage 1: the frame's list is taken back before the vblank's frameskip and present work.
-    GxAcquire("gxwait: vblank");
-    // Signal to GSP that GPU interrupt has occurred
-    impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
-    impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
-
+void GPU::VBlankGpuWork(const std::array<Pica::FramebufferConfig, 2>& fb_config,
+                        const Pica::RegsLcd& lcd_regs) {
     // Whole-frame frameskip, decided here before any of the next frame's work is queued: with a
     // present backlog, the coming frame ships state but no triangles and no present. Frames that
     // do render are always complete.
@@ -1491,15 +1681,12 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         const u32 queue_depth = impl->gpu_thread.Depth();
         // The presentation registers (framebuffer pointers, LCD fill) travel with the op, since
         // the renderer reads them from the mirror.
-        std::array<Pica::FramebufferConfig, 2> fb_config{impl->pica.regs.framebuffer_config[0],
-                                                         impl->pica.regs.framebuffer_config[1]};
-        const auto lcd_regs = impl->pica.regs_lcd;
         // CPU-written framebuffers are copied now, at the VBlank the real display would scan
         // them out, and the present samples the copy (see Impl::DisplaySnapshotSlot).
         std::array<DisplaySnapshotSlot*, 2> snapshots{};
         if (threaded) {
-            snapshots[0] = TakeDisplaySnapshot(0);
-            snapshots[1] = TakeDisplaySnapshot(1);
+            snapshots[0] = TakeDisplaySnapshot(0, &fb_config[0]);
+            snapshots[1] = TakeDisplaySnapshot(1, &fb_config[1]);
         }
         impl->gpu_thread.Enqueue(
             {.run =
@@ -1548,6 +1735,42 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                  },
              .swap_marker = true});
     }
+
+}
+
+void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+    // gxfifo: the guest-visible half stays here, on time; the GPU half (frameskip, arena
+    // rotation, the present) queues behind the GX work in flight, so a list's parse may run on
+    // past the vblank. At most one such half waits: a second vblank drains the queue first.
+    auto& gx = impl->gx;
+    if (GxFifo() && GxBusy() && gx.vblank_pending.load(std::memory_order_acquire) > 0) {
+        GxAcquire("gxwait: vblank bound");
+    }
+    const bool defer = GxFifo() && GxBusy();
+    if (!defer) {
+        // Stage 1: the frame's list is taken back before the vblank's frameskip and present work.
+        GxAcquire("gxwait: vblank");
+    }
+    gx.vblanks++;
+    // Signal to GSP that GPU interrupt has occurred
+    impl->signal_interrupt(Service::GSP::InterruptId::PDC0, 0);
+    impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
+
+    // The presentation registers as of this vblank; the guest may swap again before a queued
+    // half runs.
+    const std::array<Pica::FramebufferConfig, 2> fb_config{impl->pica.regs.framebuffer_config[0],
+                                                           impl->pica.regs.framebuffer_config[1]};
+    const auto lcd_regs = impl->pica.regs_lcd;
+    if (defer) {
+        gx.vblank_pending.fetch_add(1, std::memory_order_acq_rel);
+        GxPush([this, fb_config, lcd_regs] {
+            VBlankGpuWork(fb_config, lcd_regs);
+            impl->gx.vblank_pending.fetch_sub(1, std::memory_order_acq_rel);
+        });
+    } else {
+        VBlankGpuWork(fb_config, lcd_regs);
+    }
+    const bool threaded = impl->gpu_thread.IsRunning();
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);

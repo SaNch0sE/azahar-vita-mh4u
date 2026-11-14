@@ -444,6 +444,10 @@ public:
     /// Executes a shipped draw against this core's registers, shader setup and rasterizer.
     /// Runs on the render thread against the mirror; everything it reads was shipped.
     void RunShippedDraw(const DrawPayload& payload);
+    /// The next ProcessCmdList reads its list from here instead of guest memory (gxfifo's copy).
+    void SetListOverride(const u8* data) {
+        list_override = data;
+    }
     /// The vertex and geometry shading of a shipped draw only, its triangles appended to `out`
     /// instead of reaching the rasterizer (the pre-shade worker's mirror; no memo). False when
     /// the primitive assembler was not empty before or after, so the result cannot stand in
@@ -477,6 +481,7 @@ private:
     bool capture_only = false;
     /// emuprof: which way the current draw went (TryShipDraw), a literal key.
     const char* draw_path = nullptr;
+    const u8* list_override = nullptr;
     /// emuprof: plain register writes the fast loop applied.
     u64 fast_words = 0;
     /// RunShippedDraw's geometry-shader draw memo: recorded triangles by input key.

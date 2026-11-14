@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <functional>
 #include <span>
 #include <string>
@@ -25,6 +26,7 @@ namespace Pica {
 class DebugContext;
 class PicaCore;
 struct RegsLcd;
+struct FramebufferConfig;
 union ColorFill;
 struct DisplayTransferConfig;
 } // namespace Pica
@@ -116,6 +118,11 @@ public:
     /// Emulation thread, between guest slices: takes back a list that has finished.
     void GxPoll();
     [[nodiscard]] bool GxBusy() const;
+    /// The list on the GX thread has already had its P3D posted (gx_early_p3d) and the idle
+    /// guest may run time forward instead of waiting for it (`gxidleskip`, diagnostic).
+    [[nodiscard]] bool GxIdleSkippable() const;
+    /// Stage 2 GX queue in use (Common::gx_fifo with the GX thread running).
+    [[nodiscard]] bool GxFifo() const;
 
     /// Drains and stops the render thread, handing the GL context back released.
     void StopRenderThread();
@@ -210,6 +217,12 @@ public:
 private:
     void GxLoop();
     void GxStart();
+    void GxPush(std::function<void()> task);
+    void QueueCmdList(PAddr addr, u32 size);
+    static u64 TransferDelay(Pica::DisplayTransferConfig config);
+    /// VBlankCallback's GPU half: frameskip, arena rotation, the present (gxfifo: queued).
+    void VBlankGpuWork(const std::array<Pica::FramebufferConfig, 2>& fb_config,
+                       const Pica::RegsLcd& lcd_regs);
     void GxStop();
     // Runs on the emulation thread: registers, vertex processing and P3D keep exact timing.
     void ExecSubmitCmdList(u32 index);
@@ -218,8 +231,9 @@ private:
 
     // Completion (interrupt + status registers) happens here on modelled timing; the memory
     // effect is queued to the render thread.
-    void QueueMemoryFill(u32 index, u32 start, u32 end, u32 value, u32 control, u32 intr_index);
-    void QueueMemoryTransfer(const Pica::DisplayTransferConfig& config);
+    void QueueMemoryFill(u32 index, u32 start, u32 end, u32 value, u32 control, u32 intr_index,
+                         bool post_completion = true);
+    void QueueMemoryTransfer(const Pica::DisplayTransferConfig& config, bool post_completion = true);
 
     void RecreateRendererLocked(Frontend::EmuWindow& emu_window,
                                 Frontend::EmuWindow* secondary_window);
@@ -239,7 +253,8 @@ private:
 
     /// Emulation thread, at the VBlank: copies a CPU-written framebuffer into a free snapshot
     /// slot and returns it, or null when the framebuffer is GPU-written or no slot is free.
-    DisplaySnapshotSlot* TakeDisplaySnapshot(u32 screen);
+    DisplaySnapshotSlot* TakeDisplaySnapshot(u32 screen,
+                                             const Pica::FramebufferConfig* config = nullptr);
 
     PAddr VirtualToPhysicalAddress(VAddr addr);
 };

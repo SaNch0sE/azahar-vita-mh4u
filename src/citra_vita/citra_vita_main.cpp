@@ -911,6 +911,19 @@ int EmulatorMain() {
     Common::y2r_async = !GxmRenderer::GxmFlag("noy2rasync");
     Common::gx_async = GxmRenderer::GxmFlag("gxasync");
     Common::gx_early_p3d = GxmRenderer::GxmFlag("gxearlyp3d");
+    {
+        // gxfifo (or ux0:data/mh4u/gxfifo in any build): stage 2 GX queue; implies the above.
+        std::FILE* f = std::fopen(VITA_DATA_DIR "/gxfifo", "rb");
+        if (f != nullptr) {
+            std::fclose(f);
+        }
+        Common::gx_fifo = GxmRenderer::GxmFlag("gxfifo") || f != nullptr;
+        Common::gx_snapshot = !GxmRenderer::GxmFlag("nogxsnap");
+        if (Common::gx_fifo) {
+            Common::gx_async = true;
+            Common::gx_early_p3d = true;
+        }
+    }
     // The vertex cache needs arm-first inserts once lists are parsed beside the guest.
     Common::vcache_arm_first = GxmRenderer::GxmFlag("vcarmfirst") || Common::gx_async;
     // Hardware draws reuse the GPU copy of vertex data that has not changed (pica/vertex_cache.h);

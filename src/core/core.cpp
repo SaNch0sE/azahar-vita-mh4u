@@ -325,7 +325,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             LOG_TRACE(Core_ARM11, "Core {} idling", current_core_to_execute->GetID());
             // A command list still parsing on the GX thread: its P3D is what the guest is
             // waiting for, so take it back rather than idle time forward past it.
-            if (gpu && gpu->GxBusy()) {
+            if (gpu && gpu->GxBusy() && !gpu->GxIdleSkippable()) {
                 gpu->GxAcquire("gxwait: guest idle");
             } else {
                 { ProfScope p{"loop: idle skip"}; current_core_to_execute->GetTimer().Idle(); }
@@ -363,7 +363,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             // instead advance to the next event and try to yield to the next thread
             if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
                 LOG_TRACE(Core_ARM11, "Core {} idling", cpu_core->GetID());
-                if (gpu && gpu->GxBusy()) {
+                if (gpu && gpu->GxBusy() && !gpu->GxIdleSkippable()) {
                     gpu->GxAcquire("gxwait: guest idle");
                 } else {
                     { ProfScope p{"loop: idle skip"}; cpu_core->GetTimer().Idle(); }

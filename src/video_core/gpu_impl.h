@@ -5,6 +5,12 @@
 
 #pragma once
 
+#include <mutex>
+
+#include <functional>
+
+#include <deque>
+
 #include <atomic>
 #include "common/wake_flag.h"
 #include <vector>
@@ -61,6 +67,21 @@ struct GPU::Impl {
         std::atomic<bool> quit{false};
         /// The list in flight had its P3D posted when it was handed over (gx_early_p3d).
         bool early_p3d = false;
+
+        /// gxfifo (stage 2): GX work as an ordered queue the emulation thread alone fills -
+        /// command lists, fills, transfers, guest flushes and the GPU half of the vblank -
+        /// so a list's parse runs on into the next frame's guest work. `state` is Posted
+        /// while anything is queued or running.
+        std::mutex task_mutex;
+        std::deque<std::function<void()>> tasks;
+        u32 unfinished = 0;          ///< queued + running, under task_mutex
+        u32 lists_waiting_p3d = 0;   ///< queued lists whose P3D was not posted early (emu thread)
+        u32 vblank_tasks = 0;        ///< queued vblank tasks not yet run (atomic below)
+        std::atomic<u32> vblank_pending{0};
+        u64 list_frame = 0;          ///< vblank serial of the oldest queued list's frame
+        bool lists_queued = false;
+        u32 early_p3d_lists = 0;     ///< queued lists whose P3D was posted at hand-over
+        u64 vblanks = 0;             ///< vblanks so far (emulation thread)
     } gx;
     Core::Timing& timing;
     Core::System& system;
