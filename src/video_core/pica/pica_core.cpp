@@ -853,9 +853,11 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
 
     if (const BatchFn batch = batch_lut[id]) {
         // If the register supports batch then call the handler.
-        const u64 prof_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+        // noregprof: no per-register timers (their own cost blurs the command-list total).
+        static const bool reg_prof = Common::EmuProf::enabled && !GxmRenderer::GxmFlag("noregprof");
+        const u64 prof_t0 = reg_prof ? Common::PipelineStats::NowUs() : 0;
         batch(*this, id, values, count);
-        if (Common::EmuProf::enabled) {
+        if (reg_prof) {
             Common::EmuProf::Add(RegProfKey(id), Common::PipelineStats::NowUs() - prof_t0);
         }
     } else if (const SpecialFn special = special_lut[id]) [[unlikely]] {
@@ -951,9 +953,10 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     }
 
     if (const SpecialFn special = special_lut[id]) {
-        const u64 prof_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
+        static const bool reg_prof = Common::EmuProf::enabled && !GxmRenderer::GxmFlag("noregprof");
+        const u64 prof_t0 = reg_prof ? Common::PipelineStats::NowUs() : 0;
         special(*this, id, value, stop_requested);
-        if (Common::EmuProf::enabled) {
+        if (reg_prof) {
             Common::EmuProf::Add(RegProfKey(id), Common::PipelineStats::NowUs() - prof_t0);
         }
     }
