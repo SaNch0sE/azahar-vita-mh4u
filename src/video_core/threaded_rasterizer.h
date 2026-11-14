@@ -307,7 +307,11 @@ private:
         u32 chunk_used = 0;
         std::atomic<u32> pending{0};
     };
-    std::array<ArenaSlot, 2> arena_slots;
+    /// Three: with the GX queue the emulation thread runs up to a frame ahead, so two slots
+    /// were both owned by the render thread after a single slow frame and the vblank skip
+    /// dropped frames at every turn while walking the village (2026-11-14). The third costs
+    /// one or two 512 KiB chunks, affordable since the shipment buffers are freed on release.
+    std::array<ArenaSlot, 3> arena_slots;
     ArenaSlot* current_slot = nullptr;
     /// Buffer for a draw that must ship while no slot is free (bottom screen, forced frames);
     /// handed to its shipment, which owns it from then on.
