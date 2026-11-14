@@ -187,6 +187,13 @@ PipelineCache::~PipelineCache() {
     if (HasDevice() && Device().context != nullptr) {
         // Releasing a program needs the GPU done with it and the context no longer binding it.
         sceGxmFinish(Device().context);
+        // The context still names the last pipeline's programs, and libgxm reads the bound
+        // fragment program again on the next sceGxmSetFragmentTexture - which the next
+        // renderer issues before binding a pipeline of its own.
+        if (Device().rest_vertex_program != nullptr && Device().rest_fragment_program != nullptr) {
+            sceGxmSetVertexProgram(Device().context, Device().rest_vertex_program);
+            sceGxmSetFragmentProgram(Device().context, Device().rest_fragment_program);
+        }
     }
     pipelines.clear();
     if (HasDevice()) {

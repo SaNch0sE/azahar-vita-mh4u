@@ -486,52 +486,22 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     // the revision (the diag autoload has always relied on that).
     system.SetLoadStateAnyBuild(true);
 
-#ifdef VITA_DIAGNOSTICS
-    // ux0:data/mh4u/autoload.txt names a savestate slot to restore before the render thread
-    // starts, the one moment a load is accepted (saves and loads are refused once the thread
-    // runs). The signal executes at a quiescent point inside RunLoop, so it gets a few slices.
-    // States are the same boost archive on every 32-bit build, so a state the pi5 harness
-    // saved in a fight, a results screen or a level lands here without the menus.
+    VTRACE("RunTitle: StartRenderThread");
+    system.GPU().StartRenderThread();
+    ui.EnterGame();
+    // ux0:data/mh4u/autoload.txt names a save-state slot to load once the game has run for
+    // ten seconds - the same request the pause menu makes - so speed can be measured from a
+    // state without driving the menu (test scripts write the file before launching and delete
+    // it once started). In every build. Requested earlier (before the render thread, or on the
+    // first frames) the reload could not take the native core back.
+    int autoload_slot = 0;
     if (FILE* f = std::fopen(VITA_DATA_DIR "/autoload.txt", "rb")) {
         char buf[16]{};
         std::fread(buf, 1, sizeof(buf) - 1, f);
         std::fclose(f);
-        const int slot = std::atoi(buf);
-        if (slot >= 0 && system.SendSignal(Core::System::Signal::Load, static_cast<u32>(slot))) {
-            LOG_INFO(Frontend, "autoload.txt: restoring savestate slot {}", slot);
-            // The load runs inside RunLoop once the kernel has no asynchronous HLE request in
-            // flight; at this point in the boot that is immediate. Requests are run inline
-            // while the load is pending so a title that streams from its ROM (Smash) cannot
-            // keep one in flight, and a failed load is reported rather than played over.
-            const bool async_before = Settings::values.deterministic_async_operations.GetValue();
-            Settings::values.deterministic_async_operations = true;
-            // The signal becomes a pending request inside the first RunLoop, so the loop
-            // always runs at least once (a pending-only condition ran zero times, and the
-            // load was then refused under the render thread).
-            for (int i = 0; i < 200000; i++) {
-                const auto status = system.RunLoop();
-                if (status != Core::System::ResultStatus::Success) {
-                    LOG_ERROR(Frontend, "autoload.txt: load of slot {} failed: {} ({})", slot,
-                              static_cast<int>(status), system.GetStatusDetails());
-                    break;
-                }
-                if (!system.IsSaveStateRequestPending()) {
-                    break;
-                }
-            }
-            Settings::values.deterministic_async_operations = async_before;
-            if (system.IsSaveStateRequestPending()) {
-                LOG_WARNING(Frontend, "autoload.txt: slot {} never became loadable", slot);
-            }
-        } else {
-            LOG_WARNING(Frontend, "autoload.txt: could not queue a load of slot {}", slot);
-        }
+        autoload_slot = std::atoi(buf);
     }
-#endif
-
-    VTRACE("RunTitle: StartRenderThread");
-    system.GPU().StartRenderThread();
-    ui.EnterGame();
+    const SceUInt64 autoload_at = sceKernelGetProcessTimeWide() + 10'000'000ull;
     // From here the GXM presentation layer belongs to the render thread, which draws the
     // interface along with the frame it has just finished.
     window.SetUi(&ui);
@@ -621,6 +591,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 break;
             }
             continue;
+        }
+
+        if (autoload_slot >= 1 && sceKernelGetProcessTimeWide() >= autoload_at) {
+            if (!system.SendSignal(Core::System::Signal::Load, static_cast<u32>(autoload_slot))) {
+                LOG_WARNING(Frontend, "autoload.txt: could not request slot {}", autoload_slot);
+            }
+            autoload_slot = 0;
         }
 
         // Periodic snapshot on the emulation thread, never from the allocation path.

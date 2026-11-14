@@ -1329,6 +1329,8 @@ bool Initialize() {
         .free_block = FreeBlock,
         .alloc_notification = AllocNotification,
         .razor = razor_loaded,
+        .rest_vertex_program = g.quad_vp,
+        .rest_fragment_program = g.quad_fp,
     });
     LOG_INFO(Frontend, "GXM presentation layer up: {} display buffers, {} KiB frame arenas",
              display_buffers, FrameArenaSize / 1024);

@@ -48,6 +48,11 @@ struct GxmDevice {
     /// The Razor GPU capture module is loaded, so user markers reach a capture and are worth
     /// the string that names them. False on a normal run, where they would be pure cost.
     bool razor{};
+    /// Programs that live as long as the context: bound before a renderer releases its own,
+    /// so the context never points at a freed program (a state load recreates the renderer,
+    /// and libgxm read the stale fragment program on the next texture bind).
+    SceGxmVertexProgram* rest_vertex_program{};
+    SceGxmFragmentProgram* rest_fragment_program{};
 };
 
 void SetDevice(const GxmDevice& device);
