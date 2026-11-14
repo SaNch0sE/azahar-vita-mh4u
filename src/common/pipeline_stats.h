@@ -23,6 +23,8 @@ inline std::array<u32, 8> repeat_miss{};
 /// (the worker had not started), waited for, refused (assembler not empty).
 inline std::atomic<u32> preshade_used{0}, preshade_stolen{0}, preshade_waited{0},
     preshade_refused{0};
+inline std::atomic<u64> preshade_feed_us{0}, preshade_draw_us{0}, preshade_local_us{0};
+inline std::atomic<u32> preshade_tris{0};
 /// BindPrograms split (render thread): FSConfig + hash + lookup, pipeline bind, calls.
 inline u64 bp_config_us = 0, bp_pipeline_us = 0, bp_calls = 0, bp_tier2_us = 0;
 

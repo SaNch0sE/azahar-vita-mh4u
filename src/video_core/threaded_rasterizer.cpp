@@ -116,6 +116,7 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
     if (fragment_changed) {
         mirror.fragment_regs_version++;
     }
+
     ApplySetup(mirror.vs_setup, shipment.vs);
     ApplySetup(mirror.gs_setup, shipment.gs);
     if (shipment.pa_reconfigure_events != 0) {
@@ -868,10 +869,21 @@ void ThreadedRasterizer::RunSoftwareDraw(Shipment& shipment) {
         shipment.shade_state.compare_exchange_strong(state, ShadeStolen,
                                                      std::memory_order_acq_rel)) {
         PS::preshade_stolen.fetch_add(1, std::memory_order_relaxed);
+        const u64 t0 = PS::NowUs();
         mirror_pica.RunShippedDraw(shipment.draw);
+        PS::preshade_local_us.fetch_add(PS::NowUs() - t0, std::memory_order_relaxed);
         return;
     }
     if (state == ShadeRunning) {
+        // The worker is on it: shading it here costs about what waiting would, and keeps this
+        // mirror's own memo warm (text glyphs replay from it in microseconds). Its result is
+        // left unused. `preshadewait` waits for it instead.
+        static const bool wait_for_worker = GxmRenderer::GxmFlag("preshadewait");
+        if (!wait_for_worker) {
+            PS::preshade_stolen.fetch_add(1, std::memory_order_relaxed);
+            mirror_pica.RunShippedDraw(shipment.draw);
+            return;
+        }
         PS::preshade_waited.fetch_add(1, std::memory_order_relaxed);
         while ((state = shipment.shade_state.load(std::memory_order_acquire)) == ShadeRunning) {
             std::this_thread::yield();
@@ -882,11 +894,16 @@ void ThreadedRasterizer::RunSoftwareDraw(Shipment& shipment) {
     if (state == ShadeDone && shipment.shade_ok &&
         mirror_pica.GetPrimitiveAssembler().IsEmpty()) {
         PS::preshade_used.fetch_add(1, std::memory_order_relaxed);
+        const u64 t0 = PS::NowUs();
         const auto& v = shipment.vertices;
         for (std::size_t i = 0; i + 2 < v.size(); i += 3) {
             real->AddTriangle(v[i], v[i + 1], v[i + 2]);
         }
+        const u64 t1 = PS::NowUs();
         real->DrawTriangles();
+        PS::preshade_feed_us.fetch_add(t1 - t0, std::memory_order_relaxed);
+        PS::preshade_draw_us.fetch_add(PS::NowUs() - t1, std::memory_order_relaxed);
+        PS::preshade_tris.fetch_add(static_cast<u32>(v.size() / 3), std::memory_order_relaxed);
         return;
     }
     if (state == ShadeDone) {
