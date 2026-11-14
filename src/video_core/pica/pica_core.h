@@ -386,6 +386,10 @@ public:
     /// the registers only change through shipments (false: inline mode, hash instead).
     u64 fragment_regs_version = 0;
     bool fragment_regs_versioned = false;
+    /// The same for what a hardware draw's vertex layout and program key read: the pipeline
+    /// and vertex shader blocks (0x200-0x2FF), the VS output map (0x4F-0x56), the lighting
+    /// disable bit, and the VS program, swizzle, bool and integer uniforms (not its floats).
+    u64 vertex_regs_version = 0;
     GeometryShaderUnit gs_unit;
     ShaderSetup vs_setup;
     ShaderSetup gs_setup;

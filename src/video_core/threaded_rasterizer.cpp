@@ -95,10 +95,35 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
         mark(PICA_REG_INDEX(lighting.lut_data), 8);
         return t;
     }();
+    // The registers a hardware draw's vertex layout and program key read
+    // (RasterizerGxm::AccelerateShippedDraw, VertexShaderFor): the attribute formats and each
+    // loader's two configuration words - not the buffer addresses, which move every draw -
+    // the vertex shader's configuration words (bools, integers, input count, entry point,
+    // input map, output mask; not its upload ports), the GS switch, the VS output map, and
+    // the lighting disable bit.
+    static const std::array<bool, 0x300> vertex_reads = [] {
+        std::array<bool, 0x300> t{};
+        const u32 va = PICA_REG_INDEX(pipeline.vertex_attributes);
+        t[va + 1] = t[va + 2] = true;
+        for (u32 loader = 0; loader < 12; loader++) {
+            t[va + 3 + loader * 3 + 1] = t[va + 3 + loader * 3 + 2] = true;
+        }
+        t[PICA_REG_INDEX(pipeline.num_vertices) + 1] = true; // use_gs
+        for (u32 i = PICA_REG_INDEX(vs); i < PICA_REG_INDEX(vs) + 0x10; i++) {
+            t[i] = true;
+        }
+        for (u32 i = 0; i < 8; i++) {
+            t[PICA_REG_INDEX(rasterizer.vs_output_total) + i] = true;
+        }
+        t[PICA_REG_INDEX(lighting.disable)] = true;
+        return t;
+    }();
     bool fragment_changed = false;
+    bool vertex_changed = false;
     for (const auto& [index, value] : shipment.reg_delta) {
         u32& reg = mirror.regs.internal.reg_array[index];
         if (reg != value) {
+            vertex_changed |= index < vertex_reads.size() && vertex_reads[index];
             bool in_block = false;
             for (const auto& [first, count] : fragment_blocks) {
                 in_block |= index - first < count;
@@ -117,6 +142,13 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
         mirror.fragment_regs_version++;
     }
 
+    vertex_changed |= shipment.vs.has_code ||
+                      (shipment.vs.has_uniforms &&
+                       (mirror.vs_setup.uniforms.b != shipment.vs.uniforms.b ||
+                        mirror.vs_setup.uniforms.i != shipment.vs.uniforms.i));
+    if (vertex_changed) {
+        mirror.vertex_regs_version++;
+    }
     ApplySetup(mirror.vs_setup, shipment.vs);
     ApplySetup(mirror.gs_setup, shipment.gs);
     if (shipment.pa_reconfigure_events != 0) {

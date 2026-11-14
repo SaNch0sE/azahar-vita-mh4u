@@ -2895,7 +2895,8 @@ void RasterizerGxm::InstallTier2() {
 }
 
 Shader* RasterizerGxm::VertexShaderFor(u16 default_regs,
-                                       const std::array<u8, 16>& reg_components) {
+                                       const std::array<u8, 16>& reg_components, u64* key_out,
+                                       Pica::Shader::Generator::Cg::VSExtra* extra_out) {
     using namespace Pica::Shader::Generator;
     const PicaVSConfig config{regs, pica.vs_setup};
     Cg::VSExtra extra{};
@@ -2915,6 +2916,12 @@ Shader* RasterizerGxm::VertexShaderFor(u16 default_regs,
     }
     extra.bools &= extra.bool_mask;
     const u64 key = Cg::VertexShaderKey(config, extra);
+    if (key_out != nullptr) {
+        *key_out = key;
+    }
+    if (extra_out != nullptr) {
+        *extra_out = extra;
+    }
     const auto it = generated_vs.find(key);
     if (it != generated_vs.end()) {
         if (it->second != nullptr && tier2 != nullptr && !it->second->tier2_queued &&
@@ -3048,127 +3055,182 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
         return DeclineHw(3);
     }
 
-    // The streams: one per vertex loader that owns arena bytes, walked exactly as the GL
-    // backend and the software loader walk them, so the offsets agree with the arena.
-    static constexpr const char* AttributeNames[16] = {
-        "vs_in_attr0",  "vs_in_attr1",  "vs_in_attr2",  "vs_in_attr3",
-        "vs_in_attr4",  "vs_in_attr5",  "vs_in_attr6",  "vs_in_attr7",
-        "vs_in_attr8",  "vs_in_attr9",  "vs_in_attr10", "vs_in_attr11",
-        "vs_in_attr12", "vs_in_attr13", "vs_in_attr14", "vs_in_attr15",
-    };
-    struct Candidate {
-        u32 reg;
-        VertexAttribute attribute;
-    };
-    std::array<Candidate, 16> candidates{};
-    u32 candidate_count = 0;
     std::array<u32, PipelineInfo::MaxStreams> stream_arena_offset{};
     std::array<u32, PipelineInfo::MaxStreams> stream_bytes{};
     VertexLayout layout{};
-    u32 enabled_regs = 0;
-    const auto& va = regs.pipeline.vertex_attributes;
-    for (u32 loader_index = 0; loader_index < 12; loader_index++) {
-        const auto& loader = va.attribute_loaders[loader_index];
-        if (loader.component_count == 0 || loader.byte_count == 0 ||
-            (payload.layout.used_mask & (1u << loader_index)) == 0) {
-            continue;
+    std::array<u8, PipelineInfo::MaxStreams> stream_loader{};
+    const u64 layout_t0 = Common::PipelineStats::StatUs();
+    static const bool no_vs_memo = GxmFlag("novsmemo");
+    static const bool vs_memo_check = GxmFlag("vsmemocheck");
+    const bool memo_hit = !no_vs_memo && pica.fragment_regs_versioned && vs_memo.valid &&
+                          vs_memo.version == pica.vertex_regs_version &&
+                          vs_memo.used_mask == payload.layout.used_mask &&
+                          vs_memo.layout.shader->IsDone() && !vs_memo.layout.shader->failed;
+    if (memo_hit && !vs_memo_check) {
+        // Same vertex registers, program and loaders as the draw that built the memo: only
+        // where this draw's streams sit in the arena, and how far they reach, are its own.
+        stat_vs_memo_hits++;
+        layout = vs_memo.layout;
+        stream_loader = vs_memo.stream_loader;
+        Shader* const vs = layout.shader;
+        if (tier2 != nullptr && !vs->tier2_queued && ++vs->draws >= tier2_threshold) {
+            Usse::VsRequest request = MakeVsRequest(vs_memo.extra);
+            ConsiderTier2(vs, vs_memo.key, nullptr, &request);
         }
-        const u32 stream = layout.stream_count;
-        u32 offset = 0;
-        for (u32 comp = 0; comp < loader.component_count && comp < 12; ++comp) {
-            const u32 attribute_index = loader.GetComponent(comp);
-            if (attribute_index < 12) {
-                if (va.GetNumElements(attribute_index) == 0) {
-                    continue;
+    } else {
+        // The streams: one per vertex loader that owns arena bytes, walked exactly as the GL
+        // backend and the software loader walk them, so the offsets agree with the arena.
+        static constexpr const char* AttributeNames[16] = {
+            "vs_in_attr0",  "vs_in_attr1",  "vs_in_attr2",  "vs_in_attr3",
+            "vs_in_attr4",  "vs_in_attr5",  "vs_in_attr6",  "vs_in_attr7",
+            "vs_in_attr8",  "vs_in_attr9",  "vs_in_attr10", "vs_in_attr11",
+            "vs_in_attr12", "vs_in_attr13", "vs_in_attr14", "vs_in_attr15",
+        };
+        struct Candidate {
+            u32 reg;
+            VertexAttribute attribute;
+        };
+        std::array<Candidate, 16> candidates{};
+        u32 candidate_count = 0;
+        u32 enabled_regs = 0;
+        const auto& va = regs.pipeline.vertex_attributes;
+        for (u32 loader_index = 0; loader_index < 12; loader_index++) {
+            const auto& loader = va.attribute_loaders[loader_index];
+            if (loader.component_count == 0 || loader.byte_count == 0 ||
+                (payload.layout.used_mask & (1u << loader_index)) == 0) {
+                continue;
+            }
+            const u32 stream = layout.stream_count;
+            u32 offset = 0;
+            for (u32 comp = 0; comp < loader.component_count && comp < 12; ++comp) {
+                const u32 attribute_index = loader.GetComponent(comp);
+                if (attribute_index < 12) {
+                    if (va.GetNumElements(attribute_index) == 0) {
+                        continue;
+                    }
+                    const u32 element_size = va.GetElementSizeInBytes(attribute_index);
+                    offset = Common::AlignUp(offset, element_size);
+                    const u32 reg = regs.vs.GetRegisterForAttribute(attribute_index);
+                    SceGxmAttributeFormat format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+                    switch (va.GetFormat(attribute_index)) {
+                    case Pica::PipelineRegs::VertexAttributeFormat::BYTE:
+                        format = SCE_GXM_ATTRIBUTE_FORMAT_S8;
+                        break;
+                    case Pica::PipelineRegs::VertexAttributeFormat::UBYTE:
+                        format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
+                        break;
+                    case Pica::PipelineRegs::VertexAttributeFormat::SHORT:
+                        format = SCE_GXM_ATTRIBUTE_FORMAT_S16;
+                        break;
+                    default:
+                        break;
+                    }
+                    if (candidate_count == candidates.size()) {
+                        return DeclineHw(4);
+                    }
+                    candidates[candidate_count++] = {
+                        reg, VertexAttribute{AttributeNames[reg], static_cast<u16>(offset), format,
+                                             static_cast<u8>(va.GetNumElements(attribute_index)),
+                                             static_cast<u8>(stream)}};
+                    enabled_regs |= 1u << reg;
+                    offset += va.GetStride(attribute_index);
+                } else {
+                    // Attribute ids 12, 13, 14 and 15 signify 4, 8, 12 and 16-byte paddings.
+                    offset = Common::AlignUp(offset, 4);
+                    offset += (attribute_index - 11) * 4;
                 }
-                const u32 element_size = va.GetElementSizeInBytes(attribute_index);
-                offset = Common::AlignUp(offset, element_size);
-                const u32 reg = regs.vs.GetRegisterForAttribute(attribute_index);
-                SceGxmAttributeFormat format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
-                switch (va.GetFormat(attribute_index)) {
-                case Pica::PipelineRegs::VertexAttributeFormat::BYTE:
-                    format = SCE_GXM_ATTRIBUTE_FORMAT_S8;
-                    break;
-                case Pica::PipelineRegs::VertexAttributeFormat::UBYTE:
-                    format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
-                    break;
-                case Pica::PipelineRegs::VertexAttributeFormat::SHORT:
-                    format = SCE_GXM_ATTRIBUTE_FORMAT_S16;
-                    break;
-                default:
-                    break;
-                }
-                if (candidate_count == candidates.size()) {
-                    return DeclineHw(4);
-                }
-                candidates[candidate_count++] = {
-                    reg, VertexAttribute{AttributeNames[reg], static_cast<u16>(offset), format,
-                                         static_cast<u8>(va.GetNumElements(attribute_index)),
-                                         static_cast<u8>(stream)}};
-                enabled_regs |= 1u << reg;
-                offset += va.GetStride(attribute_index);
-            } else {
-                // Attribute ids 12, 13, 14 and 15 signify 4, 8, 12 and 16-byte paddings.
-                offset = Common::AlignUp(offset, 4);
-                offset += (attribute_index - 11) * 4;
+            }
+            layout.strides[stream] = static_cast<u16>(loader.byte_count);
+            stream_loader[stream] = static_cast<u8>(loader_index);
+            layout.stream_count++;
+        }
+        if (layout.stream_count == 0) {
+            return DeclineHw(5);
+        }
+        // Every register no loader feeds is a uniform to the program (the emitter only
+        // declares the ones it reads): the fixed default attribute's value where the guest
+        // set one, (0, 0, 0, 1) otherwise, as GL's disabled generic attribute. Declaring such
+        // a register as an attribute made the patcher refuse the program with INVALID_VALUE
+        // (Pokémon Alpha Sapphire reads five input registers nothing feeds, 2026-09-06).
+        const u16 default_regs = static_cast<u16>(~enabled_regs & 0xffffu);
+        std::array<u8, 16> reg_components{};
+        for (u32 n = 0; n < candidate_count; n++) {
+            reg_components[candidates[n].reg] = candidates[n].attribute.components;
+        }
+        u64 vs_key = 0;
+        Pica::Shader::Generator::Cg::VSExtra vs_extra{};
+        Shader* vs = VertexShaderFor(default_regs, reg_components, &vs_key, &vs_extra);
+        if (vs == nullptr || !vs->IsDone() || vs->failed) {
+            // No program yet, or none possible: the software shader on the mirror takes the
+            // draw. Slow, but the picture is there while the compile runs - a generated vertex
+            // program is twenty seconds on this CPU - and the disk cache makes it a first-run
+            // cost.
+            return DeclineHw(vs == nullptr ? 6 : vs->failed ? 7 : 8);
+        }
+        layout.shader = vs;
+        // Only the attributes the program reads: the patcher refuses one it does not name. Two
+        // loaders feeding the same register is a guest bug; the last wins, as in GL, and the
+        // earlier one must not stay in the list (the patcher refuses two attributes on one
+        // register with INVALID_VALUE: Pokémon Alpha Sapphire, 2026-09-06).
+        for (u32 n = 0; n < candidate_count; n++) {
+            if ((vs->input_regs & (1u << candidates[n].reg)) == 0) {
+                continue;
+            }
+            bool later = false;
+            for (u32 m = n + 1; m < candidate_count; m++) {
+                later |= candidates[m].reg == candidates[n].reg;
+            }
+            if (!later) {
+                layout.attributes[layout.attribute_count++] = candidates[n].attribute;
             }
         }
-        layout.strides[stream] = static_cast<u16>(loader.byte_count);
-        stream_arena_offset[stream] = payload.layout.loader_offset[loader_index];
-        stream_bytes[stream] = loader.byte_count * vertex_range;
-        layout.stream_count++;
-    }
-    if (layout.stream_count == 0) {
-        return DeclineHw(5);
-    }
-    // Every register no loader feeds is a uniform to the program (the emitter only
-    // declares the ones it reads): the fixed default attribute's value where the guest
-    // set one, (0, 0, 0, 1) otherwise, as GL's disabled generic attribute. Declaring such
-    // a register as an attribute made the patcher refuse the program with INVALID_VALUE
-    // (Pokémon Alpha Sapphire reads five input registers nothing feeds, 2026-09-06).
-    const u16 default_regs = static_cast<u16>(~enabled_regs & 0xffffu);
-    std::array<u8, 16> reg_components{};
-    for (u32 n = 0; n < candidate_count; n++) {
-        reg_components[candidates[n].reg] = candidates[n].attribute.components;
-    }
-    Shader* vs = VertexShaderFor(default_regs, reg_components);
-    if (vs == nullptr || !vs->IsDone() || vs->failed) {
-        // No program yet, or none possible: the software shader on the mirror takes the
-        // draw. Slow, but the picture is there while the compile runs - a generated vertex
-        // program is twenty seconds on this CPU - and the disk cache makes it a first-run
-        // cost.
-        return DeclineHw(vs == nullptr ? 6 : vs->failed ? 7 : 8);
-    }
-    layout.shader = vs;
-    // Only the attributes the program reads: the patcher refuses one it does not name. Two
-    // loaders feeding the same register is a guest bug; the last wins, as in GL, and the
-    // earlier one must not stay in the list (the patcher refuses two attributes on one
-    // register with INVALID_VALUE: Pokémon Alpha Sapphire, 2026-09-06).
-    for (u32 n = 0; n < candidate_count; n++) {
-        if ((vs->input_regs & (1u << candidates[n].reg)) == 0) {
-            continue;
+        static const bool dump_layout = GxmFlag("usse_dump");
+        if (dump_layout) {
+            std::string what;
+            for (u32 n = 0; n < layout.attribute_count; n++) {
+                const auto& a = layout.attributes[n];
+                what += fmt::format(" {}:s{}+{} f{:#x} x{}", a.name, a.stream, a.offset,
+                                    static_cast<u32>(a.format), a.components);
+            }
+            for (u32 stream = 0; stream < layout.stream_count; stream++) {
+                what += fmt::format(" stride{}={}", stream, layout.strides[stream]);
+            }
+            LOG_INFO(Render, "layout for {}:{}", vs->name, what);
         }
-        bool later = false;
-        for (u32 m = n + 1; m < candidate_count; m++) {
-            later |= candidates[m].reg == candidates[n].reg;
+        if (memo_hit) {
+            // vsmemocheck: the memo would have been used; say if it differs from the rebuild.
+            bool same = vs_memo.layout.shader == layout.shader &&
+                        vs_memo.layout.stream_count == layout.stream_count &&
+                        vs_memo.layout.attribute_count == layout.attribute_count &&
+                        vs_memo.layout.strides == layout.strides &&
+                        vs_memo.stream_loader == stream_loader;
+            for (u32 n = 0; same && n < layout.attribute_count; n++) {
+                const auto& a = vs_memo.layout.attributes[n];
+                const auto& b = layout.attributes[n];
+                same = a.name == b.name && a.offset == b.offset && a.format == b.format &&
+                       a.components == b.components && a.stream == b.stream;
+            }
+            if (!same && stat_vs_memo_mismatch++ < 20) {
+                LOG_ERROR(Render, "vsmemocheck: memo differs from the rebuild ({} vs {})",
+                          vs_memo.layout.shader->name, layout.shader->name);
+            }
         }
-        if (!later) {
-            layout.attributes[layout.attribute_count++] = candidates[n].attribute;
+        if (pica.fragment_regs_versioned) {
+            vs_memo.valid = true;
+            vs_memo.version = pica.vertex_regs_version;
+            vs_memo.used_mask = payload.layout.used_mask;
+            vs_memo.layout = layout;
+            vs_memo.stream_loader = stream_loader;
+            vs_memo.key = vs_key;
+            vs_memo.extra = vs_extra;
         }
     }
-    static const bool dump_layout = GxmFlag("usse_dump");
-    if (dump_layout) {
-        std::string what;
-        for (u32 n = 0; n < layout.attribute_count; n++) {
-            const auto& a = layout.attributes[n];
-            what += fmt::format(" {}:s{}+{} f{:#x} x{}", a.name, a.stream, a.offset,
-                                static_cast<u32>(a.format), a.components);
-        }
-        for (u32 stream = 0; stream < layout.stream_count; stream++) {
-            what += fmt::format(" stride{}={}", stream, layout.strides[stream]);
-        }
-        LOG_INFO(Render, "layout for {}:{}", vs->name, what);
+    for (u32 stream = 0; stream < layout.stream_count; stream++) {
+        stream_arena_offset[stream] = payload.layout.loader_offset[stream_loader[stream]];
+        stream_bytes[stream] = layout.strides[stream] * vertex_range;
     }
+    Shader* const vs = layout.shader;
+    stat_layout_us += Common::PipelineStats::StatUs() - layout_t0;
 
     std::array<u32, PipelineInfo::MaxStreams> stream_ring_offset{};
     const u8* base = nullptr;
@@ -3857,9 +3919,13 @@ void RasterizerGxm::EndFrame() {
                              PS::preshade_waited.exchange(0), PS::preshade_refused.exchange(0),
                              PS::preshade_feed_us.exchange(0), PS::preshade_tris.exchange(0),
                              PS::preshade_draw_us.exchange(0), PS::preshade_local_us.exchange(0));
-                    LOG_INFO(Render, "target lookups reused: {}; texture memo {} hits, {} misses",
-                             stat_target_reuses, stat_tex_memo_hits, stat_tex_memo_misses);
+                    LOG_INFO(Render, "target lookups reused: {}; texture memo {} hits, {} misses; "
+                             "vertex layout memo {} hits ({} mismatches), layout {} us",
+                             stat_target_reuses, stat_tex_memo_hits, stat_tex_memo_misses,
+                             stat_vs_memo_hits, stat_vs_memo_mismatch, stat_layout_us);
                     stat_target_reuses = 0;
+                    stat_vs_memo_hits = 0;
+                    stat_layout_us = 0;
                     stat_tex_memo_hits = stat_tex_memo_misses = 0;
                     LOG_INFO(Render, "textures phase: luts {} us, units {} us (lookup misses {} us), strips {} us",
                              tex_split[0], tex_split[1], tex_split[3], tex_split[2]);

@@ -233,7 +233,25 @@ private:
     void ReleaseDraw(DrawSetup& setup);
     /// The generated vertex program for the mirror's current PICA vertex configuration, or
     /// null when the decompiler refused it (remembered, so the refusal costs once).
-    Shader* VertexShaderFor(u16 default_regs, const std::array<u8, 16>& reg_components);
+    Shader* VertexShaderFor(u16 default_regs, const std::array<u8, 16>& reg_components,
+                            u64* key_out = nullptr,
+                            Pica::Shader::Generator::Cg::VSExtra* extra_out = nullptr);
+    /// The last hardware draw's vertex layout and program (AccelerateShippedDraw), valid while
+    /// the mirror's vertex_regs_version and the draw's loader mask are unchanged. `novsmemo`
+    /// rebuilds every draw; `vsmemocheck` rebuilds and compares, logging any difference.
+    struct VsMemo {
+        bool valid = false;
+        u64 version = 0;
+        u32 used_mask = 0;
+        VertexLayout layout{};
+        std::array<u8, PipelineInfo::MaxStreams> stream_loader{};
+        u64 key = 0;
+        Pica::Shader::Generator::Cg::VSExtra extra{};
+    };
+    VsMemo vs_memo;
+    u32 stat_vs_memo_hits = 0;
+    u32 stat_vs_memo_mismatch = 0;
+    u64 stat_layout_us = 0;
     void ResolveVertexUniforms();
     void EnsureRing();
     bool EnsureResources();
