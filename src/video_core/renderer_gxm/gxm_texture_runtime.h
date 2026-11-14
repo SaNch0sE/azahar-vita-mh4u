@@ -224,6 +224,19 @@ public:
         return on && NeedsWait(&surface);
     }
 
+    /// `nopagehash`: a guest flush over a texture re-hashes the whole texture, not just the
+    /// pages it touched (RasterizerCache::ValidateSurface).
+    [[nodiscard]] static bool NoPageHash() {
+        static const bool on = GxmFlag("nopagehash");
+        return on;
+    }
+
+    /// `pagehashcheck`: also hash the whole texture and log where the page check disagrees.
+    [[nodiscard]] static bool PageHashCheck() {
+        static const bool on = GxmFlag("pagehashcheck");
+        return on;
+    }
+
     /// A CPU staging buffer for pixel uploads/downloads.
     VideoCore::StagingData FindStaging(u32 size, bool upload);
 

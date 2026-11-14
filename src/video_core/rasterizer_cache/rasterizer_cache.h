@@ -1178,8 +1178,66 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
                                boost::icl::contains(validate_interval, surface.GetInterval());
     if (whole_texture && surface.upload_hash != 0) {
         const MemoryRef source = memory.GetPhysicalRef(surface.addr);
-        if (source && source.GetSize() >= surface.size &&
-            Common::ComputeHash64(source.GetPtr(), surface.size) == surface.upload_hash) {
+        const u64 hash_t0 = Common::PipelineStats::StatUs();
+        bool same = source && source.GetSize() >= surface.size;
+        // Only the bytes the guest could have written since the whole surface last matched
+        // can differ: those are inside its invalid regions (the write tracker reports every
+        // write to an armed range). With page hashes for this upload hash, compare just the
+        // pages those regions touch; `nopagehash` hashes the whole texture as before.
+        static const bool no_page_hash = [this] {
+            if constexpr (requires { runtime.NoPageHash(); }) {
+                return runtime.NoPageHash();
+            }
+            return false;
+        }();
+        const bool by_page = same && !no_page_hash && surface.page_hashes_of != 0 &&
+                             surface.page_hashes_of == surface.upload_hash;
+        if (by_page) {
+            const PAddr first_page = surface.addr >> 12;
+            PAddr checked_up_to = 0; // pages below this were compared already
+            for (const auto& region : surface.invalid_regions) {
+                const PAddr lo = std::max<PAddr>(boost::icl::first(region), surface.addr);
+                const PAddr hi = std::min<PAddr>(boost::icl::last_next(region), surface.end);
+                if (lo >= hi) {
+                    continue;
+                }
+                for (PAddr page = std::max(lo >> 12, checked_up_to); page <= (hi - 1) >> 12 && same;
+                     page++) {
+                    const PAddr plo = std::max<PAddr>(surface.addr, page << 12);
+                    const PAddr phi = std::min<PAddr>(surface.end, (page + 1) << 12);
+                    same = Common::ComputeHash64(source.GetPtr() + (plo - surface.addr), phi - plo) ==
+                           surface.page_hashes[page - first_page];
+                    guest_flush_hash_bytes += phi - plo;
+                }
+                checked_up_to = std::max(checked_up_to, ((hi - 1) >> 12) + 1);
+                if (!same) {
+                    break;
+                }
+            }
+            static const bool check = [this] {
+                if constexpr (requires { runtime.PageHashCheck(); }) {
+                    return runtime.PageHashCheck();
+                }
+                return false;
+            }();
+            if (check) {
+                const bool whole_same =
+                    Common::ComputeHash64(source.GetPtr(), surface.size) == surface.upload_hash;
+                if (whole_same != same) {
+                    LOG_ERROR(HW_GPU, "pagehashcheck: {:#x} ({} bytes) pages say {}, whole says {}",
+                              surface.addr, surface.size, same, whole_same);
+                }
+            }
+        } else if (same) {
+            same = Common::ComputeHash64(source.GetPtr(), surface.size) == surface.upload_hash;
+            guest_flush_hash_bytes += surface.size;
+        }
+        guest_flush_hash_us += Common::PipelineStats::StatUs() - hash_t0;
+        for (const auto& region : surface.invalid_regions) {
+            guest_flush_invalid_bytes += boost::icl::length(region);
+        }
+        guest_flush_hash_changed += same ? 0 : 1;
+        if (same) {
             guest_flush_hash_skips++;
             memory.WriteTracker().Arm(source.GetPtr(), surface.size);
             surface.MarkValid(surface.GetInterval());
@@ -1277,7 +1335,8 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         surface.IsRegionValid(surface.GetInterval())) {
         const MemoryRef source = memory.GetPhysicalRef(surface.addr);
         if (source && source.GetSize() >= surface.size) {
-            surface.upload_hash = Common::ComputeHash64(source.GetPtr(), surface.size);
+            surface.SetUploadHash(Common::ComputeHash64(source.GetPtr(), surface.size),
+                                  source.GetPtr());
         }
     }
 
@@ -1312,7 +1371,8 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
     if (surface.type != SurfaceType::Texture && surface.type != SurfaceType::Color) {
         // Depth data is not compared.
     } else if (load_info.addr == surface.addr && load_info.end == surface.end) {
-        surface.upload_hash = Common::ComputeHash64(upload_data.data(), upload_data.size());
+        surface.SetUploadHash(Common::ComputeHash64(upload_data.data(), upload_data.size()),
+                              upload_data.data());
     } else {
         surface.upload_hash = 0;
     }

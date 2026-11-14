@@ -162,6 +162,12 @@ public:
     /// Uploads a guest cache flush would have caused that the hash of guest memory proved
     /// unnecessary. For the backend's stats line, which resets it.
     u32 guest_flush_hash_skips = 0;
+    /// Diagnostic: what the whole-texture re-hash after a guest flush cost (us, bytes hashed)
+    /// against the bytes actually invalidated, and how many re-hashes found a change.
+    u64 guest_flush_hash_us = 0;
+    u64 guest_flush_hash_bytes = 0;
+    u64 guest_flush_invalid_bytes = 0;
+    u32 guest_flush_hash_changed = 0;
     /// What the current validation serves (texture, framebuffer): CopySurface logging.
     const char* validate_reason = "?";
 

@@ -2,7 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include "common/alignment.h"
+#include "common/hash.h"
 #include "video_core/custom_textures/material.h"
 #include "video_core/rasterizer_cache/surface_base.h"
 #include "video_core/texture/texture_decode.h"
@@ -177,6 +179,24 @@ std::array<u8, 4> SurfaceBase::MakeFillBuffer(PAddr copy_addr) {
     }
 
     return fill_buffer;
+}
+
+void SurfaceBase::SetUploadHash(u64 whole, const u8* bytes) {
+    upload_hash = whole;
+    page_hashes.clear();
+    page_hashes_of = 0;
+    if (whole == 0 || bytes == nullptr || size == 0) {
+        return;
+    }
+    const PAddr first_page = addr >> 12;
+    const PAddr last_page = (end - 1) >> 12;
+    page_hashes.resize(last_page - first_page + 1);
+    for (PAddr page = first_page; page <= last_page; page++) {
+        const PAddr lo = std::max<PAddr>(addr, page << 12);
+        const PAddr hi = std::min<PAddr>(end, (page + 1) << 12);
+        page_hashes[page - first_page] = Common::ComputeHash64(bytes + (lo - addr), hi - lo);
+    }
+    page_hashes_of = whole;
 }
 
 } // namespace VideoCore

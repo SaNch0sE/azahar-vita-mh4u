@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <vector>
 #include <boost/icl/interval_set.hpp>
 #include "video_core/rasterizer_cache/surface_params.h"
 #include "video_core/rasterizer_cache/utils.h"
@@ -109,6 +110,16 @@ public:
     /// decoding and uploading again: titles flush texture memory every frame whether or not
     /// they wrote it.
     u64 upload_hash = 0;
+    /// The same bytes hashed per 4 KiB guest page (page i covers the surface's part of page
+    /// (addr >> 12) + i), valid only while `page_hashes_of == upload_hash`: whatever replaces
+    /// or clears the whole hash leaves these stale by construction. A guest flush that touched
+    /// two pages of a 64 KiB texture then hashes those two pages, not the texture.
+    std::vector<u64> page_hashes;
+    u64 page_hashes_of = 0;
+
+    /// Records the whole hash of `bytes` (the surface's own guest bytes, `size` long) and its
+    /// per-page hashes.
+    void SetUploadHash(u64 whole, const u8* bytes);
 };
 
 } // namespace VideoCore

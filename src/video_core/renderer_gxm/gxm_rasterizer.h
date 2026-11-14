@@ -252,6 +252,7 @@ private:
     u32 stat_vs_memo_hits = 0;
     u32 stat_vs_memo_mismatch = 0;
     u64 stat_layout_us = 0;
+    std::array<u32, 3> stat_tex_miss_why{};
     void ResolveVertexUniforms();
     void EnsureRing();
     bool EnsureResources();

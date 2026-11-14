@@ -2243,6 +2243,11 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             memo_hit = true;
             stat_tex_memo_hits++;
         } else {
+            // Why the memo missed: another key in the slot, the cache's structure moved, or
+            // only this surface's tick (a guest flush or an upload).
+            stat_tex_miss_why[memo.key != memo_key ? 0
+                              : memo.gen != res_cache.StructureGen() ? 1
+                                                                      : 2]++;
             const u64 lt = Common::PipelineStats::StatUs();
             surface_id = res_cache.GetTextureSurface(info, max_level);
             tex_split[3] += Common::PipelineStats::StatUs() - lt;
@@ -3812,7 +3817,16 @@ void RasterizerGxm::EndFrame() {
                      surfaces, surface_bytes / 1024, targets, target_bytes / 1024,
                      res_cache.SentencedCount(), stat_trimmed, stat_white_nosurface,
                      stat_white_nomem, res_cache.guest_flush_hash_skips);
+            LOG_INFO(Render, "guest-flush re-hash: {} us, {} KiB hashed, {} KiB invalid, {} changed; "
+                     "texture memo misses: key {} structure {} tick {}",
+                     res_cache.guest_flush_hash_us, res_cache.guest_flush_hash_bytes / 1024,
+                     res_cache.guest_flush_invalid_bytes / 1024, res_cache.guest_flush_hash_changed,
+                     stat_tex_miss_why[0], stat_tex_miss_why[1], stat_tex_miss_why[2]);
             res_cache.guest_flush_hash_skips = 0;
+            res_cache.guest_flush_hash_us = res_cache.guest_flush_hash_bytes = 0;
+            res_cache.guest_flush_invalid_bytes = 0;
+            res_cache.guest_flush_hash_changed = 0;
+            stat_tex_miss_why = {};
         }
         {
             const auto memory = pipeline_cache->MemoryStats();
