@@ -129,6 +129,7 @@ target_link_libraries(citra_vita PRIVATE
     ScePower_stub
     SceShellSvc_stub
     SceAppMgr_stub
+    SceRtc_stub
     SceAppUtil_stub
     SceSysmodule_stub
     SceKernelDmacMgr_stub

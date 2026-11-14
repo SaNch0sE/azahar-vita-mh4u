@@ -23,6 +23,7 @@
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/message_dialog.h>
 #include <psp2/power.h>
+#include <psp2/rtc.h>
 #include <psp2/shellutil.h>
 #include <psp2/vshbridge.h>
 #include "citra_vita/gxm_present.h"
@@ -530,6 +531,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     bool combo_held = false;
     SceUInt64 last_poll_us = 0;
     SceUInt64 last_event_us = 0;
+    u64 last_wall_us = 0;
+    u64 stopped_at_us = 0;
     while (!window.IsQuitRequested()) {
         // The pad and touch panel, every 2 ms at most: RunLoop returns several thousand times a
         // second, and the two peeks cost ~30 us together - a sixth of the emulation thread's
@@ -546,12 +549,26 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         constexpr u32 PauseCombo = SCE_CTRL_SELECT | SCE_CTRL_START;
         const bool combo_now = (buttons & PauseCombo) == PauseCombo;
         bool resumed = false;
+        // A resume event alone is not proof of a suspend: one arrived mid-load with the app
+        // never having left the screen (2026-11-14), and paused the game. It counts only when
+        // the wall clock also jumped by two seconds or more between two of these checks (they
+        // run every 100 ms) - the process was stopped - within the last few seconds.
         if (const SceUInt64 now = sceKernelGetProcessTimeWide(); now - last_event_us >= 100000) {
             last_event_us = now;
+            SceRtcTick tick{};
+            sceRtcGetCurrentTick(&tick);
+            const u64 wall_us = tick.tick;
+            if (last_wall_us != 0 && wall_us - last_wall_us >= 2000000) {
+                stopped_at_us = wall_us;
+            }
+            last_wall_us = wall_us;
             SceAppMgrSystemEvent event{};
             while (sceAppMgrReceiveSystemEvent(&event) == 0) {
                 if (event.systemEvent == SCE_APPMGR_SYSTEMEVENT_ON_RESUME) {
-                    resumed = true;
+                    const bool was_stopped = stopped_at_us != 0 && wall_us - stopped_at_us < 5000000;
+                    LOG_INFO(Frontend, "resume event ({})",
+                             was_stopped ? "after a stop" : "ignored: no stop seen");
+                    resumed |= was_stopped;
                 }
             }
         }
