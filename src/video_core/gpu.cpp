@@ -1533,11 +1533,31 @@ void GPU::VBlankGpuWork(const std::array<Pica::FramebufferConfig, 2>& fb_config,
     // thread that has stopped altogether.
     const u32 queue_depth = impl->gpu_thread.Depth();
     constexpr u32 QueueDepthSkip = GpuThread::MaxDepth / 2;
+    // gxfifo: this half runs right after the frame's list has been parsed, with the whole
+    // frame's ops still queued, so the depth reads as a backlog it is not; the time estimate,
+    // the presents and the arenas still tell (and the queue's brake bounds it regardless).
+    const bool depth_signal = !GxFifo() && queue_depth >= QueueDepthSkip;
     bool skip_next = threaded && impl->frameskip_allowed &&
                      (impl->shipping_rasterizer->ArenaBackpressure() ||
                       frames_behind >= PresentBacklogSkip ||
-                      queue_backlog_us >= QueueBacklogSkipUs ||
-                      queue_depth >= QueueDepthSkip);
+                      queue_backlog_us >= QueueBacklogSkipUs || depth_signal);
+    {
+        // timedraw: which signal asked for the skips (counted per vblank, logged every 300).
+        static u32 why[5]{}, n = 0;
+        why[0] += impl->shipping_rasterizer->ArenaBackpressure();
+        why[1] += frames_behind >= PresentBacklogSkip;
+        why[2] += queue_backlog_us >= QueueBacklogSkipUs;
+        why[3] += queue_depth >= QueueDepthSkip;
+        why[4] += skip_next;
+        if (++n == 300) {
+            LOG_INFO(HW_GPU, "frameskip signals over 300 vblanks: arena {} presents {} backlog {} depth {} -> skip {}",
+                     why[0], why[1], why[2], why[3], why[4]);
+            n = 0;
+            for (auto& w : why) {
+                w = 0;
+            }
+        }
+    }
     // Duty-cycle the skip: under permanent backpressure (the software renderer's normal state
     // on 3D scenes) an unbounded skip freezes the top screen on its last rendered frame while
     // the game runs on invisibly. Forcing one rendered frame every 15 vblanks keeps ~4 fps of
