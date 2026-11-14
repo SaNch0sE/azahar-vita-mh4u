@@ -127,6 +127,9 @@ enum class ThreadRole {
     RasterWorker,
     ShaderCompiler,
     AudioSink,
+    /// Work nobody waits for (the second shader tier, the program disk cache's writes): the
+    /// system core at the lowest user priority, so it never takes time from the GX queue.
+    Background,
 };
 
 /**

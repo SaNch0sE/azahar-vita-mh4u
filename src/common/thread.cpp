@@ -168,6 +168,7 @@ constexpr int RoleCore(ThreadRole role, std::size_t index) {
         return 0;
     case ThreadRole::RasterWorker:
     case ThreadRole::AudioSink:
+    case ThreadRole::Background:
     case ThreadRole::Other:
         return 3;
     }
@@ -186,6 +187,8 @@ constexpr int PriorityCore(ThreadRole role) {
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH;
     case ThreadRole::Other:
         return SCE_KERNEL_PROCESS_PRIORITY_USER_DEFAULT;
+    case ThreadRole::Background:
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_LOW;
     }
     return 0;
 }

@@ -67,8 +67,10 @@ std::size_t ShaderTier2::Pending() const {
 
 void ShaderTier2::Loop(std::stop_token stop) {
     // Core 3, the system core where libgxm's threads live too, at the lowest user
-    // priority: the worker has the core only while nothing else wants it.
-    Common::SetCurrentThreadRole(Common::ThreadRole::ShaderCompiler);
+    // priority: the worker has the core only while nothing else wants it. (Until 2026-11-14
+    // it took the ShaderCompiler role, which is core 0 at high priority, above the GX queue
+    // thread: every new area's burst of level-2 emissions held the command lists up.)
+    Common::SetCurrentThreadRole(Common::ThreadRole::Background);
     std::stop_callback wake_on_stop(stop, [this] { wake.RaiseAll(); });
     while (true) {
         Job job;
