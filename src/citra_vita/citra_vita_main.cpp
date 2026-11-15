@@ -293,11 +293,30 @@ void SetupLogging() {
 }
 
 /// The Vita boots at a conservative clock; a software-rendered 3DS needs every megahertz.
+/// Only ever raises a clock: a clock plugin may already run the CPU at 500 MHz (above what
+/// the user API can ask for), and asking for 444 here took it back down (measured with the
+/// clocks line, 2026-11-15).
 void SetupClocks() {
-    scePowerSetArmClockFrequency(444);
-    scePowerSetBusClockFrequency(222);
-    scePowerSetGpuClockFrequency(222);
-    scePowerSetGpuXbarClockFrequency(166);
+    sceClibPrintf("[mh4u] clocks at start: arm %d bus %d gpu %d xbar %d MHz\n",
+                  scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
+                  scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
+    // ux0:data/mh4u/noclocks: leave the clocks entirely to a plugin.
+    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/noclocks", "rb")) {
+        std::fclose(f);
+        return;
+    }
+    if (scePowerGetArmClockFrequency() < 444) {
+        scePowerSetArmClockFrequency(444);
+    }
+    if (scePowerGetBusClockFrequency() < 222) {
+        scePowerSetBusClockFrequency(222);
+    }
+    if (scePowerGetGpuClockFrequency() < 222) {
+        scePowerSetGpuClockFrequency(222);
+    }
+    if (scePowerGetGpuXbarClockFrequency() < 166) {
+        scePowerSetGpuXbarClockFrequency(166);
+    }
 }
 
 std::string DescribeLoadError(Core::System::ResultStatus status) {
@@ -772,6 +791,15 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                               "render ~%u ms\n",
                               speed, fps10 / 10, fps10 % 10, presented, gx_ms, render_ms);
 #endif // VITA_DIAGNOSTICS
+                // The clocks actually in effect (a clock plugin may override SetupClocks),
+                // every 30 s.
+                static unsigned clock_lines = 0;
+                if (clock_lines++ % 30 == 0) {
+                    sceClibPrintf("[mh4u] clocks arm %d bus %d gpu %d xbar %d MHz\n",
+                                  scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
+                                  scePowerGetGpuClockFrequency(),
+                                  scePowerGetGpuXbarClockFrequency());
+                }
        // The stats window reads these on the render thread.
                 {
                     using namespace VitaFrontend::HudStats;

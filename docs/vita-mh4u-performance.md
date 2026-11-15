@@ -373,3 +373,8 @@ vertex colour: 7.0, + textures 10.6, + combiner 14.6, + lighting 21.6, + alpha t
   that blend as FUNC_NONE changes nothing (measured: 33.2 ms).
 - A save-state load left the GXM context bound to the old renderer's freed programs (crash with
   `scenetime`); fixed (commit 2cb311511).
+
+## Clocks (2026-11-15)
+
+The release log now prints `[mh4u] clocks at start …` and every 30 s `[mh4u] clocks arm … MHz` (scePowerGet*). SetupClocks only raises a clock, never lowers it, and `ux0:data/mh4u/noclocks` skips it.
+Measured: readback says 333 at start and 444 after SetupClocks, and stays 333 with `noclocks`, although the user's PSVshellPlus profile for MH4UVITA0 sets 500/222/222/166. GX-thread time in area 3 was the same (~400 ms/s) in all three runs, so the readback does not see the plugin's clock and the CPU speed did not change. Don't treat the readback as the real clock.
