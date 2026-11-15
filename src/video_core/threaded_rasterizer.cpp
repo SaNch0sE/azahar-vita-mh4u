@@ -649,7 +649,19 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
     // every draw.
     QueuePreshade(shipment);
     const auto op = [this, shipment] {
+        const u64 op_t0 = Common::PipelineStats::StatUs();
         ApplyShipment(mirror_pica, *shipment);
+        if (op_t0 != 0) {
+            Common::PipelineStats::rt_apply_us.fetch_add(
+                Common::PipelineStats::StatUs() - op_t0, std::memory_order_relaxed);
+        }
+        SCOPE_EXIT({
+            if (op_t0 != 0) {
+                Common::PipelineStats::rt_op_us.fetch_add(
+                    Common::PipelineStats::StatUs() - op_t0, std::memory_order_relaxed);
+                Common::PipelineStats::rt_ops.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
         const u32 watch = GuestWatch::Read();
         // Geometry-shader draws are never offered to the hardware vertex path; the GPU takes
         // the ones a fused VS + GS program covers (AccelerateGsDraw), the rest shade here.

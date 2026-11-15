@@ -862,6 +862,21 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                   static_cast<unsigned>(take(PS::preshade_local_us) / 1000),
                                   static_cast<unsigned>(take(PS::gs_memo_hit_n)),
                                   static_cast<unsigned>(take(PS::gs_memo_miss_n)));
+                    if (PS::stat_timing) {
+                        // Render thread, ms this second: draw ops (all), their register
+                        // replay, software-shaded draws (incl. the pre-shade feed), the feed
+                        // alone and its triangles.
+                        sceClibPrintf("[mh4u] rt ops %u %u ms apply %u sw %u (%u draws) feed %u "
+                                      "(%u tris) local %u\n",
+                                      static_cast<unsigned>(take(PS::rt_ops)),
+                                      static_cast<unsigned>(take(PS::rt_op_us) / 1000),
+                                      static_cast<unsigned>(take(PS::rt_apply_us) / 1000),
+                                      static_cast<unsigned>(take(PS::sw_shaded_us) / 1000),
+                                      static_cast<unsigned>(take(PS::sw_shaded_draws)),
+                                      static_cast<unsigned>(take(PS::preshade_feed_us) / 1000),
+                                      static_cast<unsigned>(take(PS::preshade_tris)),
+                                      static_cast<unsigned>(take(PS::preshade_local_us) / 1000));
+                    }
                 }
                 static unsigned heap_prof_seconds = 0;
                 if (HeapProfEnabled() && ++heap_prof_seconds % 10 == 0) {

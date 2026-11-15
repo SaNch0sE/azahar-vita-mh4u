@@ -60,13 +60,18 @@ inline u64 bp_config_us = 0, bp_pipeline_us = 0, bp_calls = 0, bp_tier2_us = 0;
 /// A clock read that only feeds statistics: NowUs in the diagnostic build, 0 in release, so
 /// the per-draw counters cost no system call there. The render thread made ~280k of these
 /// per 3 s in the hub at ~0.7 us each.
+/// Release: StatUs reads the clock only while this is set (ux0:data/mh4u/timedraw).
+inline bool stat_timing = false;
 [[nodiscard]] inline u64 StatUs() {
 #ifdef VITA_DIAGNOSTICS
     return NowUs();
 #else
-    return 0;
+    return stat_timing ? NowUs() : 0;
 #endif
 }
+/// Render thread (with stat_timing): ApplyShipment on the mirror, and whole shipment ops.
+inline std::atomic<u64> rt_apply_us{0}, rt_op_us{0};
+inline std::atomic<u32> rt_ops{0};
 
 /// Ops the render thread retired, and the wall time spent inside their bodies.
 /// Draws whose vertices the render thread shaded in software on the mirror PICA, the time it

@@ -210,6 +210,7 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
     if (std::FILE* f = std::fopen(VITA_DATA_DIR "/timedraw", "rb")) {
         std::fclose(f);
         time_draws = true;
+        Common::PipelineStats::stat_timing = true;
     }
     // nofog: every generated fragment program without fog (Cg::SetFogDisabled).
     if (GxmFlag("nofog")) {
