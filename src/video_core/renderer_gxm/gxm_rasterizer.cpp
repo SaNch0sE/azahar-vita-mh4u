@@ -2570,6 +2570,27 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             // mask that way, depth-tested full-screen quads that colour-grade from the target
             // and write a constant alpha. Dropping them left alpha 1, blurring every pixel.
             static const bool no_alpha_only = GxmFlag("nofeedbackalpha");
+            // logfeedback (diag): each feedback decision, first 40, with what it samples.
+            static const bool log_feedback = GxmFlag("logfeedback");
+            if (log_feedback && TextureUnitRead(unit) && AlphaReadsUnit(unit)) {
+                static u32 shown = 0;
+                if (shown++ < 40) {
+                    const auto& om = regs.framebuffer.output_merger;
+                    LOG_INFO(Render,
+                             "feedback: draw {} unit {} tex {:08X} {}x{} fmt {} -> target {:08X} "
+                             "{}x{}; reads {} alpha {}; blend {} src {}/{} dst {}/{} depth w{} f{}",
+                             stat_draws, unit, info.physical_address, info.width, info.height,
+                             static_cast<u32>(texture.format), surface.addr, surface.width,
+                             surface.height, TextureUnitRead(unit), AlphaReadsUnit(unit),
+                             om.alphablend_enable.Value(),
+                             static_cast<u32>(om.alpha_blending.factor_source_rgb.Value()),
+                             static_cast<u32>(om.alpha_blending.factor_source_a.Value()),
+                             static_cast<u32>(om.alpha_blending.factor_dest_rgb.Value()),
+                             static_cast<u32>(om.alpha_blending.factor_dest_a.Value()),
+                             om.depth_write_enable.Value(),
+                             static_cast<u32>(om.depth_test_func.Value()));
+                }
+            }
             if (TextureUnitRead(unit) && (no_alpha_only || AlphaReadsUnit(unit))) {
                 skip_feedback_draw = true;
             } else if (TextureUnitRead(unit)) {

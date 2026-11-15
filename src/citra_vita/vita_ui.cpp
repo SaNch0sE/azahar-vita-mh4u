@@ -64,8 +64,11 @@ bool BeginCentered(const char* id, float width, float height) {
                                    ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
     // A tap outside the panel clears ImGui's window focus, and the buttons then ignore the pad
-    // until the panel is touched again. The panel is the only thing on screen to talk to.
-    if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+    // until the panel is touched again. The panel is the only thing on screen to talk to -
+    // except an open dropdown, which is a popup window of its own: taking the focus back from
+    // it closed every combo the moment it opened (the settings' choices could not be changed).
+    if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)) {
         ImGui::SetWindowFocus();
     }
     return open;
@@ -262,7 +265,10 @@ void Ui::ClearStatusMessage() {
 void Ui::DrawSetting(Setting& setting, std::size_t index) {
     ImGui::PushID(static_cast<int>(index));
     ImGui::TextUnformatted(setting.title);
-    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", setting.description);
+    // Wrapped: the longer descriptions ran off the panel's edge.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+    ImGui::TextWrapped("%s", setting.description);
+    ImGui::PopStyleColor();
 
     switch (setting.kind) {
     case Setting::Kind::Toggle: {
@@ -364,7 +370,7 @@ Ui::Action Ui::DrawGameSettings() {
     ImGui::TextUnformatted("Settings");
     ImGui::Separator();
 
-    ImGui::BeginChild("##settings_scroll", ImVec2(0.0f, 420.0f));
+    ImGui::BeginChild("##settings_scroll", ImVec2(0.0f, 420.0f), false, ImGuiWindowFlags_NavFlattened);
     DrawSettingsBody(false);
     ImGui::EndChild();
 
@@ -430,7 +436,7 @@ Ui::Action Ui::DrawPauseSettings() {
     ImGui::TextUnformatted("Settings");
     ImGui::Separator();
 
-    ImGui::BeginChild("##pause_settings_scroll", ImVec2(0.0f, 320.0f));
+    ImGui::BeginChild("##pause_settings_scroll", ImVec2(0.0f, 320.0f), false, ImGuiWindowFlags_NavFlattened);
     // Only what can be changed under a running title; the rest would need a reboot.
     DrawSettingsBody(true);
     ImGui::EndChild();
