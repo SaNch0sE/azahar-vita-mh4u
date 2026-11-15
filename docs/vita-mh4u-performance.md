@@ -457,3 +457,5 @@ Measured (release unless noted):
 - The return run (stick Up 6 s) did not leave area 3; the later segments are all area 3 at 30. So the 3 -> 2 return and "area 2 after a round trip" are **not measured yet**.
 
 Next when resumed: fix the return direction in `trans.sh` (check the minimap/screenshot after each run), then measure area 2 at the spot after one and two round trips against the fresh-load numbers; if worse, diag `timedraw scenetime` after the round trip (GPU vs render thread, shader cache/surface counts, heap) and hand the logs to Fable.
+
+**Round trips (2026-11-15, after the reboot):** `vita-tests/trans.sh` (now kept in `~/Documents/Personal/grarakAzahar/vita-tests`, outside the repo; running Down 6 s crosses both ways). Route 2 -> 3 -> 2 -> 3 -> 2, release: every stay held 30 shown for 20 s, area 2 after two round trips included. Each crossing dips for 1-2 s to 24-26 shown with the game's own fps falling too (loading on the guest side). No slowdown builds up across transitions in this build.
