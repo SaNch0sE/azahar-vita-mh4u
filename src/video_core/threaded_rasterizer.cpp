@@ -1078,19 +1078,33 @@ void ThreadedRasterizer::RunSoftwareDraw(Shipment& shipment) {
         return;
     }
     if (state == ShadeRunning) {
-        // The worker is on it: shading it here costs about what waiting would, and keeps this
-        // mirror's own memo warm (text glyphs replay from it in microseconds). Its result is
-        // left unused. `preshadewait` waits for it instead.
-        static const bool wait_for_worker = GxmRenderer::GxmFlag("preshadewait");
-        if (!wait_for_worker) {
+        // The worker is on it: wait for its triangles. Shading it again here was thought to
+        // cost about what waiting would (true for 1-4 point HUD sprites), but MH4U's monster
+        // and particle GS draws are thousands of triangles: near an active herd in play the
+        // render thread spent ~600 of ~950 ms a second in software draws and became the limit
+        // (20 fps, 2026-11-15). ux0:data/mh4u/preshadesteal (or flag) shades it here again
+        // as before.
+        static const bool steal_running = [] {
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/preshadesteal", "rb")) {
+                std::fclose(f);
+                return true;
+            }
+            return GxmRenderer::GxmFlag("preshadesteal");
+        }();
+        if (steal_running) {
             PS::preshade_stolen.fetch_add(1, std::memory_order_relaxed);
+            const u64 t0 = PS::StatUs();
             mirror_pica.RunShippedDraw(shipment.draw);
+            PS::preshade_steal_running_us.fetch_add(PS::StatUs() - t0,
+                                                    std::memory_order_relaxed);
             return;
         }
         PS::preshade_waited.fetch_add(1, std::memory_order_relaxed);
+        const u64 t0 = PS::StatUs();
         while ((state = shipment.shade_state.load(std::memory_order_acquire)) == ShadeRunning) {
             std::this_thread::yield();
         }
+        PS::preshade_wait_us.fetch_add(PS::StatUs() - t0, std::memory_order_relaxed);
     }
     // The worker's triangles stand in for this mirror's shading only when its primitive
     // assembler is as empty as the worker's was: a GS draw then starts and ends with it empty.
@@ -1112,7 +1126,9 @@ void ThreadedRasterizer::RunSoftwareDraw(Shipment& shipment) {
     if (state == ShadeDone) {
         PS::preshade_refused.fetch_add(1, std::memory_order_relaxed);
     }
+    const u64 other_t0 = PS::StatUs();
     mirror_pica.RunShippedDraw(shipment.draw);
+    PS::preshade_other_us.fetch_add(PS::StatUs() - other_t0, std::memory_order_relaxed);
 }
 
 void ThreadedRasterizer::ReturnShipment(Shipment* shipment) {

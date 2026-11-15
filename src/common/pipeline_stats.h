@@ -25,6 +25,9 @@ inline std::atomic<u32> preshade_used{0}, preshade_stolen{0}, preshade_waited{0}
     preshade_refused{0};
 inline std::atomic<u64> preshade_feed_us{0}, preshade_draw_us{0}, preshade_local_us{0};
 inline std::atomic<u32> preshade_tris{0};
+/// Render thread: shading a draw the worker was already running (preshadesteal), waiting for
+/// the worker instead, and shading draws the worker never took or whose result was refused.
+inline std::atomic<u64> preshade_steal_running_us{0}, preshade_wait_us{0}, preshade_other_us{0};
 /// BindPrograms split (render thread): FSConfig + hash + lookup, pipeline bind, calls.
 inline u64 bp_config_us = 0, bp_pipeline_us = 0, bp_calls = 0, bp_tier2_us = 0;
 
