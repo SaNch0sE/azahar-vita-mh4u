@@ -185,6 +185,8 @@ inline std::atomic<u32> skipsig_armed{0};
 inline std::atomic<u32> presents_superseded{0};
 /// Draws dropped because they were for the hidden bottom screen (single-screen layout).
 inline std::atomic<u32> bottom_draws_dropped{0};
+/// Bottom-screen display transfers dropped in the single-screen layout (GPU::QueueMemoryTransfer).
+inline std::atomic<u32> bottom_xfers_dropped{0};
 /// Time the frame limiter slept on the emulation thread (the guest ahead of real time).
 inline std::atomic<u32> limiter_sleep_us{0};
 /// Time the GX thread spent parsing command lists, and how many.

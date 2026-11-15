@@ -460,6 +460,31 @@ void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in, bool
         return;
     }
 
+    // Single screen: the bottom screen's draws are dropped (PicaCore::DrawArrays), so its
+    // display transfer only copies the main target's untouched corner into a buffer nobody
+    // shows. On the GPU it also split the world into two scenes: MH4U clears the target, copies
+    // the bottom screen out, then draws the world, which had to reload colour and depth
+    // (~1 ms a frame in quest areas). Decided per transfer from the live setting, as the
+    // draw skip is. `nobottomskip` (flag or ux0:data/mh4u/nobottomskip) keeps it.
+    {
+        static const bool keep_bottom = [] {
+            std::FILE* f = std::fopen(VITA_DATA_DIR "/nobottomskip", "rb");
+            if (f != nullptr) {
+                std::fclose(f);
+                return true;
+            }
+            return GxmRenderer::GxmFlag("nobottomskip");
+        }();
+        const auto& bottom = impl->pica.regs.framebuffer_config[1];
+        const PAddr out = config.GetPhysicalOutputAddress();
+        if (!keep_bottom && !config.is_texture_copy &&
+            Settings::values.layout_option.GetValue() == Settings::LayoutOption::SingleScreen &&
+            !Settings::values.swap_screen.GetValue() &&
+            (out == bottom.address_left1 || out == bottom.address_left2)) {
+            Common::PipelineStats::bottom_xfers_dropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
     const bool allow = config.is_texture_copy ||
                        right_eye_disabler->ShouldAllowDisplayTransfer(
                            config.GetPhysicalInputAddress(), config.input_height);

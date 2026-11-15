@@ -45,8 +45,9 @@ Frame pacing, release, `cam.sh` (camera segments), gameplay seconds only:
 | # | Item | Relieves | Estimate | Status |
 |---|---|---|---|---|
 | FS | Frameskip: presents signal only when two are pending for 3 vblanks or three are pending; presents out of `avg_op_us`; superseded only with three pending | Pacing | measured +0.6-0.8 shown fps | **Done** (kill switch `oldskip`) |
+| BPT | Blended draws: drop alpha tests that reject only alpha 0 | GPU | measured 6.5 ms (area 2) | **Done** (switch `noblendptdrop`) |
 | G2 | Present scene without the vertex dependency wait | GPU overlap | measured: area 3 holds 30 shown | **Done** (switch `presentvwait`) |
-| G1 | Drop the bottom-screen display transfer in Single screen so the clear quad joins the world scene | GPU, render | up to ~1 ms (scene 0 measured at 1.07 ms) | Next (half a day) |
+| G1 | Drop the bottom-screen display transfer in Single screen so the clear quad joins the world scene | GPU, render | measured 0.5 ms GPU (area 2) | **Done** (switch `nobottomskip`) |
 | G3 | Fog strip as a non-dependent (projective iterated) read | GPU | up to ~1 ms (fetch measured) | After a spike |
 | G4 | Textures 0-2 on raw coordinates as non-dependent reads | GPU | 0.5-1.5 ms | Same spike as G3 |
 | U | Uniform uploads: per-program write list, reachable vertex rows only | Render | 1-1.5 ms a frame (diag) | After G3/G4 |
