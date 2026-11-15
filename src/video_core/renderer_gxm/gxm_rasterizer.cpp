@@ -206,6 +206,11 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
     // pi5 in a Smash fight and an SM3DL level, and on the
     // console each read is the sceKernelGetProcessTimeWide syscall, 150k a second in SM3DL.
     time_draws = GxmFlag("timedraw");
+    // Release too, from ux0:data/mh4u/timedraw.
+    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/timedraw", "rb")) {
+        std::fclose(f);
+        time_draws = true;
+    }
     // nofog: every generated fragment program without fog (Cg::SetFogDisabled).
     if (GxmFlag("nofog")) {
         Pica::Shader::Generator::Cg::SetFogDisabled(true);
@@ -5007,6 +5012,37 @@ void RasterizerGxm::EndFrame() {
                 runtime.stat_renames = runtime.stat_copied_renames = runtime.stat_deferred_clears = runtime.stat_fills = runtime.stat_syncs =
                     runtime.stat_syncs_avoided =
                     runtime.stat_gpu_blits = runtime.stat_gpu_blit_merges = 0;
+    }
+#else
+    // Release, ux0:data/mh4u/timedraw: the render thread's phases every 3 s (ms over the
+    // window), against its busy time - where a saturated render thread goes.
+    if (time_draws) {
+        const u64 now = static_cast<u64>(Common::Timer::GetTimeMs().count());
+        if (report_at_ms == 0) {
+            report_at_ms = now + ReportIntervalMs;
+        } else if (now >= report_at_ms) {
+            report_at_ms = now + ReportIntervalMs;
+            const u64 busy_total =
+                Common::PipelineStats::gpu_busy_total_us.load(std::memory_order_relaxed);
+            const u64 busy_us = busy_total - busy_total_at_report;
+            busy_total_at_report = busy_total;
+            const auto ms = [](u64 us) { return static_cast<unsigned>(us / 1000); };
+            const u64 accounted = times.total + times.end_frame + times.guest_writes +
+                                  times.invalidate_region + times.flush + times.transfers +
+                                  times.retire + times.sync + times.present;
+            sceClibPrintf("[mh4u] rtime 3s: busy %u | draws %u: fb %u tex %u scene %u+%u state %u "
+                          "prog %u unif %u draw %u inval %u | endframe %u (gpu wait %u) | "
+                          "gwrites %u inval %u flush %u xfer %u retire %u sync %u present %u | "
+                          "other %u\n",
+                          ms(busy_us), ms(times.total), ms(times.framebuffer), ms(times.textures),
+                          ms(times.scene), ms(times.scene_end), ms(times.state),
+                          ms(times.programs), ms(times.uniforms), ms(times.draw),
+                          ms(times.invalidate), ms(times.end_frame), ms(times.finish),
+                          ms(times.guest_writes), ms(times.invalidate_region), ms(times.flush),
+                          ms(times.transfers), ms(times.retire), ms(times.sync),
+                          ms(times.present), ms(busy_us > accounted ? busy_us - accounted : 0));
+            times = DrawTimes{};
+        }
     }
 #endif
 }
