@@ -17,6 +17,8 @@
 
 #if defined(__vita__)
 #include <mutex>
+#include <psp2/kernel/clib.h>
+#include "common/pipeline_stats.h"
 #include <psp2/kernel/sysmem.h>
 #elif defined(__linux__)
 #include <sys/mman.h>
@@ -872,6 +874,14 @@ void JitShader::Compile_Return() {
 }
 
 void JitShader::Compile_NextInstr() {
+    if (!reachable[program_counter]) {
+        // Not reachable from this entry point: nothing jumps here, nothing falls through to
+        // it. Bound (unused) and skipped, also as an IF or LOOP: its blocks are compiled, or
+        // skipped, instruction by instruction like the rest of the span.
+        emitter->Bind(instruction_labels[program_counter]);
+        ++program_counter;
+        return;
+    }
     if (std::binary_search(return_offsets.begin(), return_offsets.end(), program_counter)) {
         Compile_Return();
     }
@@ -919,10 +929,81 @@ void JitShader::FindReturnOffsets() {
     std::sort(return_offsets.begin(), return_offsets.end());
 }
 
+std::pair<u32, u32> JitShader::FindReachable(u32 entry) {
+    // Every PICA control transfer has a static target, so this is exact: fall-through, both
+    // ways of a conditional jump, a call's body and its return (the instruction after the
+    // CALL), both blocks of an IF and what follows them, a LOOP's body and what follows it.
+    // The last word is an implicit END.
+    reachable.reset();
+    std::vector<u32> work{entry};
+    u32 lo = entry, hi = entry;
+    const auto push = [&](u32 pc) {
+        if (pc < MAX_PROGRAM_CODE_LENGTH && !reachable[pc]) {
+            work.push_back(pc);
+        }
+    };
+    while (!work.empty()) {
+        const u32 pc = work.back();
+        work.pop_back();
+        if (reachable[pc]) {
+            continue;
+        }
+        reachable[pc] = true;
+        lo = std::min(lo, pc);
+        hi = std::max(hi, pc);
+        if (pc >= MAX_PROGRAM_CODE_LENGTH - 1) {
+            continue; // implicit END
+        }
+        const Instruction instr{(*program_code)[pc]};
+        const u32 dest = instr.flow_control.dest_offset;
+        const u32 num = instr.flow_control.num_instructions;
+        switch (instr.opcode.Value()) {
+        case OpCode::Id::END:
+            break;
+        case OpCode::Id::JMPC:
+        case OpCode::Id::JMPU:
+            push(dest);
+            push(pc + 1);
+            break;
+        case OpCode::Id::CALL:
+        case OpCode::Id::CALLC:
+        case OpCode::Id::CALLU:
+            push(dest);
+            push(dest + num);
+            push(pc + 1);
+            break;
+        case OpCode::Id::IFU:
+        case OpCode::Id::IFC:
+            push(pc + 1);
+            push(dest);
+            push(dest + num);
+            break;
+        case OpCode::Id::LOOP:
+            push(pc + 1);
+            push(dest + 1);
+            break;
+        default:
+            push(pc + 1);
+            break;
+        }
+    }
+    return {lo, hi};
+}
+
 void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_code_,
-                        const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data_) {
+                        const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data_,
+                        u32 entry_point) {
     program_code = program_code_;
     swizzle_data = swizzle_data_;
+    // Only the span the entry point reaches: compiling all 4096 words made every program
+    // ~hundreds of KiB, the 4 MiB code arena filled within a long MH4U session, and every
+    // shader compiled after that ran on the interpreter (monster GS draws ~3x slower per
+    // vertex after an hour of play than after a save state load, 2026-11-15).
+    const auto [span_lo, span_hi] = FindReachable(entry_point);
+#if defined(__vita__)
+    sceClibPrintf("[mh4u] shader JIT: compiling entry %u, span %u-%u (%u reachable)\n",
+                  entry_point, span_lo, span_hi, static_cast<unsigned>(reachable.count()));
+#endif
 
     code_vec.clear();
     emitter = std::make_unique<Emitter>(code_vec);
@@ -960,8 +1041,9 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
     // Jump to the requested entry point
     e.BX(SCRATCH0);
 
-    // Compile entire program
-    Compile_Block(static_cast<u32>(program_code->size()));
+    // Compile the reachable span
+    program_counter = span_lo;
+    Compile_Block(span_hi + 1);
 
     program_code = nullptr;
     swizzle_data = nullptr;
@@ -1006,7 +1088,16 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
         } else if (arena_uid >= 0) {
             LOG_WARNING(HW_GPU, "shader JIT: code arena full ({} of {} bytes); interpreting",
                         arena_used, ArenaSize);
+            sceClibPrintf("[mh4u] shader JIT: arena full (%u of %u KiB), %u KiB program "
+                          "left to the interpreter\n",
+                          static_cast<unsigned>(arena_used / 1024),
+                          static_cast<unsigned>(ArenaSize / 1024),
+                          static_cast<unsigned>(code_size / 1024));
         }
+        Common::PipelineStats::jit_last_bytes.store(static_cast<u32>(code_size),
+                                                    std::memory_order_relaxed);
+        Common::PipelineStats::jit_arena_bytes.store(static_cast<u32>(arena_used),
+                                                     std::memory_order_relaxed);
     }
     if (code_mem == nullptr) {
         emitter.reset();

@@ -867,7 +867,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         // replay, software-shaded draws (incl. the pre-shade feed), the feed
                         // alone and its triangles.
                         sceClibPrintf("[mh4u] rt ops %u %u ms apply %u sw %u (%u draws) feed %u "
-                                      "(%u tris) local %u running %u wait %u other %u\n",
+                                      "(%u tris) local %u running %u wait %u other %u  interp %u\n",
                                       static_cast<unsigned>(take(PS::rt_ops)),
                                       static_cast<unsigned>(take(PS::rt_op_us) / 1000),
                                       static_cast<unsigned>(take(PS::rt_apply_us) / 1000),
@@ -878,7 +878,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                       static_cast<unsigned>(take(PS::preshade_local_us) / 1000),
                                       static_cast<unsigned>(take(PS::preshade_steal_running_us) / 1000),
                                       static_cast<unsigned>(take(PS::preshade_wait_us) / 1000),
-                                      static_cast<unsigned>(take(PS::preshade_other_us) / 1000));
+                                      static_cast<unsigned>(take(PS::preshade_other_us) / 1000),
+                                      static_cast<unsigned>(take(PS::jit_interp_runs)));
                         sceClibPrintf("[mh4u] psw apply %u | gs %u draws (%u hits) %u verts: "
                                       "total %u key %u setup %u vs %u gs %u\n",
                                       static_cast<unsigned>(take(PS::psw_apply_us) / 1000),

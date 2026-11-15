@@ -3,6 +3,10 @@
 // Refer to the license.txt file included.
 
 #include "common/emu_prof.h"
+#include "common/pipeline_stats.h"
+#ifdef __vita__
+#include <psp2/kernel/clib.h>
+#endif
 #include "common/arch.h"
 #if CITRA_HAS_SHADER_JIT
 
@@ -38,7 +42,13 @@ void JitEngine::SetupBatch(ShaderSetup& setup, u32 entry_point) {
     const u64 code_hash = setup.GetProgramCodeHash();
     const u64 swizzle_hash = setup.GetSwizzleDataHash();
 
+#if CITRA_ARCH(arm32)
+    // The A32 compiler builds only what the entry point reaches.
+    const u64 cache_key =
+        Common::HashCombine(Common::HashCombine(code_hash, swizzle_hash), u64{entry_point});
+#else
     const u64 cache_key = Common::HashCombine(code_hash, swizzle_hash);
+#endif
     auto iter = cache.find(cache_key);
     if (iter != cache.end()) {
         setup.cached_shader = iter->second.get();
@@ -77,7 +87,11 @@ std::shared_ptr<JitShader> JitEngine::Shared(u64 cache_key, ShaderSetup& setup, 
     // against a compile rather than guessed at.
     auto shader = std::make_shared<JitShader>();
     const auto start = std::chrono::steady_clock::now();
+#if CITRA_ARCH(arm32)
+    shader->Compile(&setup.GetProgramCode(), &setup.GetSwizzleData(), entry_point);
+#else
     shader->Compile(&setup.GetProgramCode(), &setup.GetSwizzleData());
+#endif
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - start)
                         .count();
@@ -85,6 +99,15 @@ std::shared_ptr<JitShader> JitEngine::Shared(u64 cache_key, ShaderSetup& setup, 
     LOG_INFO(HW_GPU, "shader JIT compiled {:016x} entry {} in {}.{:03} ms (shared {})", cache_key,
              entry_point, us / 1000, us % 1000, shared.size() + 1);
     shared.emplace(cache_key, shader);
+#ifdef __vita__
+    sceClibPrintf("[mh4u] shader JIT #%u: %016llx entry %u, %u KiB in %u ms, arena %u KiB%s\n",
+                  static_cast<unsigned>(shared.size()), static_cast<unsigned long long>(cache_key),
+                  entry_point,
+                  static_cast<unsigned>(Common::PipelineStats::jit_last_bytes.load() / 1024),
+                  static_cast<unsigned>(us / 1000),
+                  static_cast<unsigned>(Common::PipelineStats::jit_arena_bytes.load() / 1024),
+                  shader->Compiled() ? "" : " (NOT COMPILED: interpreted)");
+#endif
     return shader;
 }
 
@@ -93,6 +116,7 @@ MICROPROFILE_DECLARE(GPU_Shader);
 void JitEngine::Run(const ShaderSetup& setup, ShaderUnit& state) const {
 #if CITRA_ARCH(arm32)
     if (setup.cached_shader == nullptr) {
+        Common::PipelineStats::jit_interp_runs.fetch_add(1, std::memory_order_relaxed);
         fallback.Run(setup, state);
         return;
     }

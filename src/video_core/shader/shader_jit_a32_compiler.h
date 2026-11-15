@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <bitset>
+#include <utility>
+
 #include "common/arch.h"
 #if CITRA_ARCH(arm32) && CITRA_HAS_SHADER_JIT
 
@@ -48,8 +51,10 @@ public:
         return program != nullptr;
     }
 
+    /// Compiles what `entry_point` can reach (one span of the program, the rest of the 4096
+    /// words skipped), so a compiled shader serves that entry point only.
     void Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_code,
-                 const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data);
+                 const std::array<u32, MAX_SWIZZLE_DATA_LENGTH>* swizzle_data, u32 entry_point);
 
     void Compile_ADD(Instruction instr);
     void Compile_DP3(Instruction instr);
@@ -119,6 +124,10 @@ private:
     std::vector<u32> return_offsets;
 
     u32 program_counter = 0; ///< Offset of the next instruction to decode
+    /// Instructions the entry point can reach; the others in the compiled span emit nothing.
+    std::bitset<MAX_PROGRAM_CODE_LENGTH> reachable;
+    /// Marks `reachable` from `entry`; returns the span [lo, hi] that holds all of it.
+    std::pair<u32, u32> FindReachable(u32 entry);
     u8 loop_depth = 0;       ///< Depth of the (nested) loops currently compiled
 
     /// Executable copy of the finished code
