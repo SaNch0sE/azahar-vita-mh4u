@@ -49,3 +49,13 @@ Source: tag v0.3B (branch vita-0.1.7) of github.com/TutuiFC/TuizaVita-3ds-emu; t
 - RomFS/LayeredFS reads on a worker thread: next; first time the reads during an area crossing (the 1-2 s dip).
 - Condition-variable wait wrap for the remaining polling waits: small, later.
 - Z-order (swizzled) textures: TuizaVita pairs it with mipmaps; not taken yet (every copy/blit/download path would need an unswizzle).
+
+## Render scale measured (2026-11-15, release, slot 1, area 2 spot)
+| Scale | Shown fps | Notes |
+|---|---|---|
+| 0.75x | 30 | softer; GPU headroom |
+| 1x | 30 | identical to before the scale code |
+| 1.25x | 22 | |
+| 1.5x | 17-18 | |
+| 2x | 11-12 | the game itself slows too (speed 50-77%, GX 600-860 ms/s waiting on the renderer); sharp |
+Pictures correct at every scale (HUD, world, sky). Mipmaps A/B, diag scenetime: 29.4-31.5 ms without, 27.2-31.2 with (within noise).
