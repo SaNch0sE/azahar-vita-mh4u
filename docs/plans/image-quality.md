@@ -41,3 +41,11 @@ Release, slots 1 and 2: screenshots at fixed views with each option off (identic
 
 ## TuizaVita comparison (Fable, 2026-11-15)
 The other Vita port (github.com/TutuiFC/TuizaVita-3ds-emu, cloned to ~/Documents/Personal) is a general-compatibility port with a block JIT and runtime Cg shaders; it is behind ours in CPU, shaders, frame pacing and I/O. Taken: clamp the time-stretch output before the s16 cast. Candidates left: constant blend factors carried in source alpha (`MapCarrierFactor`; ours approximates them; check `logblend` whether MH4U uses them), preloading the program disk cache into RAM to soften area-entry hitches (measure `Find` during a transition first).
+
+## TuizaVita 0.3B follow-up (2026-11-15)
+Source: tag v0.3B (branch vita-0.1.7) of github.com/TutuiFC/TuizaVita-3ds-emu; the earlier review only saw `main` (0.1B).
+- Mipmaps: done (commit ac796f726, kill switch `nomipmaps`). Slot 1: distant textures smoother, GPU about the same.
+- 0.75x render scale: added to the menu; untested on the console, like 1.25x-2x.
+- RomFS/LayeredFS reads on a worker thread: next; first time the reads during an area crossing (the 1-2 s dip).
+- Condition-variable wait wrap for the remaining polling waits: small, later.
+- Z-order (swizzled) textures: TuizaVita pairs it with mipmaps; not taken yet (every copy/blit/download path would need an unswizzle).
