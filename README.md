@@ -32,7 +32,7 @@ What each one gave this port, and in what form:
 - [Azahar](https://github.com/azahar-emu/azahar): the emulator itself (code base).
 - [Grarak/azahar](https://github.com/Grarak/azahar): the PS Vita port this fork is built on: native execution through the `azaharnative` kernel plugin, the USSE shader emitters, the GXM renderer and the frontend (code base).
 - [Grarak/mh3-wii](https://github.com/Grarak/mh3-wii): the choice of render resolutions offered in its start menu (idea for the render scale option).
-- [TuizaVita](https://github.com/TutuiFC/TuizaVita-3ds-emu): clamping the time-stretched audio before conversion (small code idea); mipmapped textures, file reads on a worker thread and a render scale below 1x are being evaluated from its 0.3B source (ideas).
+- [TuizaVita](https://github.com/TutuiFC/TuizaVita-3ds-emu): clamping the time-stretched audio before conversion and the sleeping-wait wrap for pthreads-embedded (small pieces of code); mipmapped textures and a render scale below 1x (ideas); its worker-thread file reads led us to the real cause of our area-crossing stutter (a mod file opened per read).
 - [DSVita](https://github.com/Grarak/DSVita): the shape of the audio output (48 kHz port, buffer size), the pause menu's structure, and mirrored addressing on linear textures (reference design).
 - [vitaGL](https://github.com/Rinnegatamante/vitaGL): suballocating one GPU memory block, and loading the Razor GPU capture and live metrics (approach).
 - [Vita3K](https://github.com/Vita3K/Vita3K): running and debugging the port off the console (tool).
