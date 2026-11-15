@@ -74,6 +74,11 @@ inline bool stat_timing = false;
 }
 /// Render thread (with stat_timing): ApplyShipment on the mirror, and whole shipment ops.
 inline std::atomic<u64> rt_apply_us{0}, rt_op_us{0};
+/// Pre-shade worker (with stat_timing): GS draws shaded, memo hits, VS invocations; time in
+/// the memo key, the shader setup, the VS, the GS, all of RunShippedDraw, and ApplyShipment.
+inline std::atomic<u32> psw_draws{0}, psw_hits{0}, psw_vertices{0};
+inline std::atomic<u64> psw_key_us{0}, psw_setup_us{0}, psw_vs_us{0}, psw_gs_us{0},
+    psw_total_us{0}, psw_apply_us{0};
 inline std::atomic<u32> rt_ops{0};
 
 /// Ops the render thread retired, and the wall time spent inside their bodies.

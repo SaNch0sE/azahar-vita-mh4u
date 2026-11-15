@@ -879,6 +879,17 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                       static_cast<unsigned>(take(PS::preshade_steal_running_us) / 1000),
                                       static_cast<unsigned>(take(PS::preshade_wait_us) / 1000),
                                       static_cast<unsigned>(take(PS::preshade_other_us) / 1000));
+                        sceClibPrintf("[mh4u] psw apply %u | gs %u draws (%u hits) %u verts: "
+                                      "total %u key %u setup %u vs %u gs %u\n",
+                                      static_cast<unsigned>(take(PS::psw_apply_us) / 1000),
+                                      static_cast<unsigned>(take(PS::psw_draws)),
+                                      static_cast<unsigned>(take(PS::psw_hits)),
+                                      static_cast<unsigned>(take(PS::psw_vertices)),
+                                      static_cast<unsigned>(take(PS::psw_total_us) / 1000),
+                                      static_cast<unsigned>(take(PS::psw_key_us) / 1000),
+                                      static_cast<unsigned>(take(PS::psw_setup_us) / 1000),
+                                      static_cast<unsigned>(take(PS::psw_vs_us) / 1000),
+                                      static_cast<unsigned>(take(PS::psw_gs_us) / 1000));
                     }
                 }
                 static unsigned heap_prof_seconds = 0;

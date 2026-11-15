@@ -1052,7 +1052,12 @@ void ThreadedRasterizer::PreshadeLoop() {
         shade_head.store(head + 1, std::memory_order_release);
         // Every shipment, in order, so this mirror's vertex-side state is the render mirror's
         // at the same draw.
+        const u64 apply_t0 = Common::PipelineStats::StatUs();
         ApplyShipment(*shade_pica, *shipment, false);
+        if (apply_t0 != 0) {
+            Common::PipelineStats::psw_apply_us.fetch_add(
+                Common::PipelineStats::StatUs() - apply_t0, std::memory_order_relaxed);
+        }
         u32 expected = ShadePending;
         if (!shade_quit.load(std::memory_order_relaxed) &&
             shipment->shade_state.compare_exchange_strong(

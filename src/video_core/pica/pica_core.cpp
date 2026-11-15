@@ -1770,8 +1770,13 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
     static const bool gs_prof = Common::EmuProf::enabled;
     const bool prof_gs = gs_prof && !capture_only &&
                          regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
-    u64 prof_t0 = prof_gs ? Common::PipelineStats::NowUs() : 0;
-    u64 prof_vs = 0, prof_gsu = 0;
+    // psprof (release, with timedraw): the same split for the pre-shade worker's draws, summed
+    // into PipelineStats (the GsProf tables belong to the render thread).
+    const bool prof_ps = Common::PipelineStats::stat_timing && capture_only &&
+                         regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
+    const bool prof_any = prof_gs || prof_ps;
+    u64 prof_t0 = prof_any ? Common::PipelineStats::NowUs() : 0;
+    u64 prof_vs = 0, prof_gsu = 0, prof_key = 0, prof_setup = 0;
     // ShadeShippedDraw: where the triangles go (the memo records into its own vector).
     std::vector<OutputVertex>* const capture_out = capture_only ? triangle_record : nullptr;
     u64 memo_key = 0;
@@ -1813,8 +1818,11 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         key = Common::HashCombine(key, u64{p.num_vertices} | (u64{p.vertex_offset} << 32) |
                                            (u64{p.is_indexed} << 63) | (u64{p.index_u16} << 62));
         memo_key = key;
+        if (prof_any) {
+            prof_key = Common::PipelineStats::NowUs() - prof_t0;
+        }
         if (prof_gs) {
-            GsProf::extra[0] += Common::PipelineStats::NowUs() - prof_t0;
+            GsProf::extra[0] += prof_key;
         }
         auto hit = gs_memo_cur.find(key);
         if (hit == gs_memo_cur.end()) {
@@ -1840,6 +1848,13 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             if (gs_memo_program != nullptr) {
                 gs_memo_program->misses_in_row = 0;
             }
+            if (prof_ps) {
+                namespace PS = Common::PipelineStats;
+                PS::psw_draws.fetch_add(1, std::memory_order_relaxed);
+                PS::psw_hits.fetch_add(1, std::memory_order_relaxed);
+                PS::psw_key_us.fetch_add(prof_key, std::memory_order_relaxed);
+                PS::psw_total_us.fetch_add(PS::NowUs() - prof_t0, std::memory_order_relaxed);
+            }
             if (prof_gs) {
                 const u64 t1 = Common::PipelineStats::NowUs();
                 if (!capture_only) {
@@ -1861,13 +1876,16 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         memo_record = true;
         triangle_record = &memo_triangles;
     }
-    const u64 sb_t = prof_gs ? Common::PipelineStats::NowUs() : 0;
+    const u64 sb_t = prof_any ? Common::PipelineStats::NowUs() : 0;
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
-    const u64 rc_t = prof_gs ? Common::PipelineStats::NowUs() : 0;
+    const u64 rc_t = prof_any ? Common::PipelineStats::NowUs() : 0;
     geometry_pipeline.Reconfigure();
-    const u64 su_t = prof_gs ? Common::PipelineStats::NowUs() : 0;
+    const u64 su_t = prof_any ? Common::PipelineStats::NowUs() : 0;
     geometry_pipeline.Setup(shader_engine.get());
     ASSERT(!geometry_pipeline.NeedIndexInput() || p.is_indexed);
+    if (prof_ps) {
+        prof_setup = Common::PipelineStats::NowUs() - sb_t;
+    }
     if (prof_gs) {
         const u64 now = Common::PipelineStats::NowUs();
         GsProf::extra[1] += rc_t - sb_t;
@@ -1905,11 +1923,11 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             AttributeBuffer input;
             loader.LoadVertex(vertex, input, input_default_attributes);
 
-            const u64 vs_t = prof_gs ? Common::PipelineStats::NowUs() : 0;
+            const u64 vs_t = prof_any ? Common::PipelineStats::NowUs() : 0;
             shader_unit.LoadInput(regs.internal.vs, input);
             shader_engine->Run(vs_setup, shader_unit);
             shader_unit.WriteOutput(regs.internal.vs, vs_output);
-            if (prof_gs) {
+            if (prof_any) {
                 prof_vs += Common::PipelineStats::NowUs() - vs_t;
             }
 
@@ -1921,7 +1939,7 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             }
         }
 
-        if (prof_gs) {
+        if (prof_any) {
             const u64 gs_t = Common::PipelineStats::NowUs();
             geometry_pipeline.SubmitVertex(vs_output);
             prof_gsu += Common::PipelineStats::NowUs() - gs_t;
@@ -1958,6 +1976,16 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             gs_memo_program->misses_in_row = 31;
             gs_memo_program->skip_left = 256;
         }
+    }
+    if (prof_ps) {
+        namespace PS = Common::PipelineStats;
+        PS::psw_draws.fetch_add(1, std::memory_order_relaxed);
+        PS::psw_vertices.fetch_add(p.num_vertices, std::memory_order_relaxed);
+        PS::psw_key_us.fetch_add(prof_key, std::memory_order_relaxed);
+        PS::psw_setup_us.fetch_add(prof_setup, std::memory_order_relaxed);
+        PS::psw_vs_us.fetch_add(prof_vs, std::memory_order_relaxed);
+        PS::psw_gs_us.fetch_add(prof_gsu, std::memory_order_relaxed);
+        PS::psw_total_us.fetch_add(PS::NowUs() - prof_t0, std::memory_order_relaxed);
     }
     if (prof_gs) {
         const u64 t1 = Common::PipelineStats::NowUs();
