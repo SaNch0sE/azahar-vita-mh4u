@@ -468,6 +468,28 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     const auto load_result = system.Load(window, path);
     VTRACE("RunTitle: system.Load -> %d", static_cast<int>(load_result));
     VitaAllocTraceDump(); // what the load itself allocated
+    {
+        // ballast (test): ux0:data/mh4u/ballast holding a number of MiB to allocate and keep,
+        // in 64 KiB blocks, so a fresh state load runs with the heap as full as a long play
+        // session leaves it (does a nearly full heap slow the game?). Never in normal use.
+        static std::vector<void*> ballast;
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/ballast", "rb")) {
+            char text[16] = {};
+            std::fread(text, 1, sizeof(text) - 1, f);
+            std::fclose(f);
+            const int mib = std::atoi(text);
+            for (int i = 0; i < mib * 16; i++) {
+                void* block = std::malloc(64 * 1024);
+                if (block == nullptr) {
+                    break;
+                }
+                std::memset(block, 0, 64 * 1024);
+                ballast.push_back(block);
+            }
+            sceClibPrintf("[mh4u] ballast: %u KiB held\n",
+                          static_cast<unsigned>(ballast.size() * 64));
+        }
+    }
     if (load_result != Core::System::ResultStatus::Success) {
         LOG_CRITICAL(Frontend, "Could not load {}: {}", path, DescribeLoadError(load_result));
         ui.SetStatusMessage("Could not load this title: " + DescribeLoadError(load_result));
