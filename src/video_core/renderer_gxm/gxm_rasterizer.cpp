@@ -1607,6 +1607,29 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             }
         }
     }
+    {   // logcube (diag): the combiner of each cube-map program, once per program.
+        static const bool log_cube = GxmFlag("logcube");
+        if (log_cube && fs_config.texture.texture0_type ==
+                            Pica::TexturingRegs::TextureConfig::TextureType::TextureCube) {
+            static std::set<u64> seen;
+            const u64 h = fs_config.Hash();
+            if (seen.size() < 16 && seen.insert(h).second) {
+                std::string st;
+                for (const auto& t : fs_config.texture.tev_stages) {
+                    st += fmt::format(" [{:08x} {:08x} {:08x} {:08x}]", t.sources_raw,
+                                      t.modifiers_raw, t.ops_raw, t.scales_raw);
+                }
+                LOG_INFO(Render,
+                         "logcube fs {:016x}: lighting {} buffer_input {:02x} t2coord1 {} alpha {} "
+                         "fog {}{}",
+                         h, fs_config.lighting.enable.Value(),
+                         fs_config.texture.combiner_buffer_input.Value(),
+                         fs_config.texture.texture2_use_coord1.Value(),
+                         static_cast<u32>(fs_config.framebuffer.alpha_test_func.Value()),
+                         static_cast<u32>(fs_config.texture.fog_mode.Value()), st);
+            }
+        }
+    }
     if (prepass_mode == 1) {
         fs_config = AlphaOnlyConfig(fs_config);
     } else if (prepass_mode == 2) {
@@ -2421,13 +2444,55 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         if (!texture.enabled) {
             continue;
         }
+        // dbgwhite_u1 / dbgwhite_u2 (diag): leave that unit white, to tell which texture a
+        // wrong picture comes from.
+        static const bool white_u1 = GxmFlag("dbgwhite_u1");
+        static const bool white_u2 = GxmFlag("dbgwhite_u2");
+        if ((unit == 1 && white_u1) || (unit == 2 && white_u2)) {
+            continue;
+        }
         if (unit == 0) {
             switch (texture.config.type.Value()) {
             case TextureType::Shadow2D:
             case TextureType::ShadowCube:
-            case TextureType::TextureCube:
-                // P5: cube maps and shadow textures.
+                // P5: shadow textures.
                 continue;
+            case TextureType::TextureCube: {
+                // The six faces as one 2D atlas (Surface, CopyTextures); the program picks the
+                // face (FragmentEmitter's cube coordinates). `nocube` leaves it white.
+                static const bool no_cube = GxmFlag("nocube");
+                if (no_cube) {
+                    continue;
+                }
+                using CubeFace = Pica::TexturingRegs::CubeFace;
+                const VideoCore::TextureCubeConfig cube_config = {
+                    .px = regs.texturing.GetCubePhysicalAddress(CubeFace::PositiveX),
+                    .nx = regs.texturing.GetCubePhysicalAddress(CubeFace::NegativeX),
+                    .py = regs.texturing.GetCubePhysicalAddress(CubeFace::PositiveY),
+                    .ny = regs.texturing.GetCubePhysicalAddress(CubeFace::NegativeY),
+                    .pz = regs.texturing.GetCubePhysicalAddress(CubeFace::PositiveZ),
+                    .nz = regs.texturing.GetCubePhysicalAddress(CubeFace::NegativeZ),
+                    .width = texture.config.width,
+                    .levels = texture.config.lod.max_level + 1,
+                    .format = texture.format,
+                };
+                const VideoCore::SurfaceId cube_id = res_cache.GetTextureCubeId(cube_config);
+                Surface& cube = res_cache.GetSurface(cube_id);
+                if (!cube.HasMemory()) {
+                    continue;
+                }
+                SceGxmTexture bound = *cube.Texture();
+                res_cache.GetSampler(texture.config).Apply(bound);
+                // The atlas's faces sit one above another: no wrapping across them.
+                sceGxmTextureSetUAddrMode(&bound, SCE_GXM_TEXTURE_ADDR_CLAMP);
+                sceGxmTextureSetVAddrMode(&bound, SCE_GXM_TEXTURE_ADDR_CLAMP);
+                sceGxmTextureSetMipmapCount(&bound, 1);
+                textures[unit] = bound;
+                bound_surfaces[unit] = cube_id;
+                dimensions[unit * 2] = static_cast<float>(cube.width);
+                dimensions[unit * 2 + 1] = static_cast<float>(cube.height);
+                continue;
+            }
             default:
                 break;
             }
@@ -2516,6 +2581,25 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
                          VideoCore::PixelFormatAsString(surface.pixel_format),
                          static_cast<u32>(surface.type), in_target ? " IN-TARGET" : "",
                          surface.HasMemory() ? "" : " NO-MEMORY");
+            }
+        }
+        // logcube (diag): what the other units of a cube-map draw sample, first 24.
+        static const bool log_cube = GxmFlag("logcube");
+        if (log_cube && pica_textures[0].enabled &&
+            pica_textures[0].config.type.Value() == TextureType::TextureCube) {
+            static u32 shown = 0;
+            if (shown++ < 24) {
+                LOG_INFO(Render,
+                         "logcube: unit {} tex {:08X} {}x{} {} type {} -> surface {:08X} {}x{} {} "
+                         "colour-target {} mem {} target {:08X}",
+                         unit, info.physical_address, info.width, info.height,
+                         VideoCore::PixelFormatAsString(
+                             VideoCore::PixelFormatFromTextureFormat(info.format)),
+                         static_cast<u32>(texture.config.type.Value()), surface.addr,
+                         surface.width, surface.height,
+                         VideoCore::PixelFormatAsString(surface.pixel_format),
+                         surface.IsColorTarget(), surface.HasMemory(),
+                         regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress());
             }
         }
         if (!surface.HasMemory()) {

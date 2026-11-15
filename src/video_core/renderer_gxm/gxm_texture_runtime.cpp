@@ -847,10 +847,23 @@ bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
     if (!source.HasMemory() || !dest.HasMemory()) {
         return false;
     }
-    if (source.texture_type == TextureType::CubeMap || dest.texture_type == TextureType::CubeMap) {
+    // Faces into a cube atlas: level 0 only, face i at rows i * height (see the constructor).
+    std::vector<VideoCore::TextureCopy> cube_copies;
+    if (dest.texture_type == TextureType::CubeMap && source.texture_type != TextureType::CubeMap) {
+        for (const auto& copy : copies) {
+            if (copy.src_level == 0 && copy.dst_level == 0) {
+                auto face = copy;
+                face.dst_offset.y += copy.dst_layer * dest.height;
+                face.dst_layer = 0;
+                cube_copies.push_back(face);
+            }
+        }
+        copies = cube_copies;
+    } else if (source.texture_type == TextureType::CubeMap ||
+               dest.texture_type == TextureType::CubeMap) {
         static bool warned = false;
         if (!warned) {
-            LOG_WARNING(Render, "GXM: cube map copies not implemented (P5)");
+            LOG_WARNING(Render, "GXM: copies out of a cube map not implemented");
             warned = true;
         }
         return false;
@@ -1148,10 +1161,10 @@ Surface::Surface(TextureRuntime& runtime_, const VideoCore::SurfaceParams& param
         type == SurfaceType::Invalid || width == 0 || height == 0) {
         return;
     }
-    if (texture_type == TextureType::CubeMap) {
-        // P5: cube maps need a swizzled six-face allocation and PTLA face copies.
-        return;
-    }
+    // A cube map is stored as a linear 2D atlas of its six faces stacked (+X, -X, +Y, -Y, +Z,
+    // -Z, face i at rows i * height), level 0 only; the fragment emitter picks the face and
+    // the coordinate from the direction (FragmentEmitter::CubeCoordinates). GXM's own cube
+    // textures are swizzled only. Monster Hunter 4 Ultimate's water reflects one.
     Allocate();
 }
 
@@ -1226,14 +1239,15 @@ u32 RenderScaleQ() {
 void Surface::Allocate() {
     const bool depth = IsDepthType(type);
     scale_q = (type == SurfaceType::Color || depth) ? RenderScaleQ() : 4u;
-    const u32 width = SX(this->width), height = SX(this->height); // storage texels
+    const bool cube = texture_type == TextureType::CubeMap;
+    const u32 width = SX(this->width), height = SX(this->height) * (cube ? 6u : 1u);
     stride_texels = PitchFor(width, depth);
     // Levels are stored one after the other, each with its own implied pitch; only level 0
     // is exposed to the sampler until GXM's linear mip layout is verified on console.
     u32 offset = 0;
     for (u32 level = 0; level < VideoCore::MAX_PICA_LEVELS; level++) {
         level_offsets[level] = offset;
-        if (level < levels) {
+        if (level < (cube ? 1u : levels)) {
             const u32 w = std::max(width >> level, 1u);
             u32 h = std::max(height >> level, 1u);
             if (depth) {
@@ -1297,7 +1311,8 @@ void Surface::Allocate() {
         return GxmFlag("nomipmaps");
     }();
     mip_count = 1;
-    if (!no_mipmaps && type == SurfaceType::Texture && levels > 1 && width >= 8 && height >= 8 &&
+    if (!no_mipmaps && !cube && type == SurfaceType::Texture && levels > 1 && width >= 8 &&
+        height >= 8 &&
         (width & (width - 1)) == 0 && (height & (height - 1)) == 0 &&
         stride_texels == PitchFor(width, false)) {
         while (mip_count < levels && (width >> mip_count) >= 8 && (height >> mip_count) >= 8) {

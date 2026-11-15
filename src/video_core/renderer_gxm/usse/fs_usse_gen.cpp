@@ -215,6 +215,8 @@ enum Lit : uint8_t {
     LitRgBiasY,
     LitNeg127,    ///< the clamp bounds of a negated LUT index
     LitNeg255,
+    LitInvSix, ///< the cube atlas's face band
+    LitCubePad,
     LiteralCount, // even, so the sampler words stay pair-aligned
 };
 static_assert(LiteralCount % 2 == 0);
@@ -278,6 +280,8 @@ private:
     void Fog();
     void Byteround(Reg value, Reg scratch);
     void Clamp01(Reg value, uint8_t mask = 0xf);
+    /// Unit 0's cube-map lookup into the rasterizer's six-face atlas, into TmpProj.
+    void CubeCoordinates(Reg uv);
     /// dbgconstfog (diagnostic): the fog coordinate as the factor, no fetch (prices the fetch).
     static bool const_fog_strip() {
         static const bool on = GxmFlag("dbgconstfog");
@@ -418,10 +422,9 @@ const char* FragmentEmitter::Unsupported() const {
     // out unshadowed instead of not at all (Monster Hunter 4 Ultimate draws most of its world
     // with one). Real shadow comparison is still P5.
     if (t0 != TextureType::Disabled && t0 != TextureType::Texture2D &&
-        t0 != TextureType::Projection2D && t0 != TextureType::Shadow2D) {
+        t0 != TextureType::Projection2D && t0 != TextureType::Shadow2D &&
+        t0 != TextureType::TextureCube) {
         switch (t0) {
-        case TextureType::TextureCube:
-            return "texture unit 0 type: cube";
         case TextureType::Shadow2D:
             return "texture unit 0 type: shadow 2D";
         case TextureType::ShadowCube:
@@ -626,8 +629,11 @@ void FragmentEmitter::PlanInputs() {
         view_pa = pa;
         pa += 4;
     }
-    if (unit_used[0] && tex.texture0_type == TextureType::Projection2D) {
-        // texcoord0's w, one register, last so nothing pair-aligned has to follow it.
+    static const bool cube_flat = GxmFlag("cubeflat"); // diag: cube sampled by (u, v) alone
+    if (unit_used[0] && (tex.texture0_type == TextureType::Projection2D ||
+                         (tex.texture0_type == TextureType::TextureCube && !cube_flat))) {
+        // texcoord0's w (the cube map's third coordinate too), one register, last so nothing
+        // pair-aligned has to follow it.
         gxp.inputs.push_back({FragmentInput::TexCoord3, 1});
         texcoord0_w_pa = pa;
         pa += 1;
@@ -1268,6 +1274,55 @@ void FragmentEmitter::Fog() {
     StoreVec4({Bank::Virtual, TmpOutput}, I1);
 }
 
+void FragmentEmitter::CubeCoordinates(Reg uv) {
+    // The cube map as the PICA (and GL) samples it, into the rasterizer's atlas of six faces
+    // stacked +X, -X, +Y, -Y, +Z, -Z: the largest of |x|, |y|, |z| picks the face; with r = 1 /
+    // that coordinate, (s, t) = (-z r, -y |r|) for x, (x |r|, z r) for y, (x r, -y |r|) for z;
+    // face = 2 * axis + (coordinate < 0); atlas (u, v) = ((s + 1) / 2, (face + (t + 1) / 2) / 6).
+    // i0 = (x, y, z), i1 = the chosen (s, t, face, signed major), i2 scratch.
+    const Src w{Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u)),
+                (texcoord0_w_pa & 1) ? YYYY : XXXX};
+    e.Vec(VecOp::Add, {I0, 0x3}, {uv, XYZW}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x4}, w, ConstZero, Pred::None, true);
+    // Which axis: p0 = x is largest, p2 = y is (and x is not).
+    e.Vec(VecOp::Max, {I1, 0x7}, {I0, XYZW, Mod::Neg}, {I0, XYZW}, Pred::None, true); // |xyz|
+    e.Vec(VecOp::Add, {I2, 0x1}, {I1, YYYY, Mod::Neg}, {I1, XXXX}, Pred::None, true); // |x|-|y|
+    e.Vec(VecOp::Add, {I2, 0x2}, {I1, ZZZZ, Mod::Neg}, {I1, XXXX}, Pred::None, true); // |x|-|z|
+    e.Vec(VecOp::Add, {I2, 0x4}, {I1, ZZZZ, Mod::Neg}, {I1, YYYY}, Pred::None, true); // |y|-|z|
+    e.Test(Cond::Ge, 0, {I2}, 0, ConstZero, true);
+    e.Test(Cond::Ge, 0, {I2}, 1, ConstZero, true, Pred::P0);
+    e.Test(Cond::Lt, 2, {I1}, 0, ConstZero, true);            // p2 = false (|x| < 0)
+    e.Test(Cond::Ge, 2, {I2}, 2, ConstZero, true, Pred::NotP0);
+    // r = 1 / (x, y, z).
+    e.Comp(CompOp::Rcp, {I2, 0x1}, {I0}, 0, Pred::None, true);
+    e.Comp(CompOp::Rcp, {I2, 0x2}, {I0}, 1, Pred::None, true);
+    e.Comp(CompOp::Rcp, {I2, 0x4}, {I0}, 2, Pred::None, true);
+    // z, the default.
+    e.Vec(VecOp::Mul, {I1, 0x1}, {I2, ZZZZ}, {I0, XXXX}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I1, 0x2}, {I2, ZZZZ, Mod::NegAbs}, {I0, YYYY}, Pred::None, true);
+    e.MoveInternal({I1, 0x4}, Lit(LitFour), Pred::None, true);
+    e.MoveInternal({I1, 0x8}, {I0, ZZZZ}, Pred::None, true);
+    // y.
+    e.Vec(VecOp::Mul, {I1, 0x1}, {I2, YYYY, Mod::Abs}, {I0, XXXX}, Pred::P2, true);
+    e.Vec(VecOp::Mul, {I1, 0x2}, {I2, YYYY}, {I0, ZZZZ}, Pred::P2, true);
+    e.MoveInternal({I1, 0x4}, Lit(LitTwo), Pred::P2, true);
+    e.MoveInternal({I1, 0x8}, {I0, YYYY}, Pred::P2, true);
+    // x.
+    e.Vec(VecOp::Mul, {I1, 0x1}, {I2, XXXX, Mod::Neg}, {I0, ZZZZ}, Pred::P0, true);
+    e.Vec(VecOp::Mul, {I1, 0x2}, {I2, XXXX, Mod::NegAbs}, {I0, YYYY}, Pred::P0, true);
+    e.MoveInternal({I1, 0x4}, ConstZero, Pred::P0, true);
+    e.MoveInternal({I1, 0x8}, {I0, XXXX}, Pred::P0, true);
+    // The negative face of the axis is the next one.
+    e.Test(Cond::Lt, 0, {I1}, 3, ConstZero, true);
+    e.Vec(VecOp::Add, {I1, 0x4}, {I1, ZZZZ}, ConstOne, Pred::P0, true);
+    // To [0, 1], then the face's band of the atlas.
+    e.Vec(VecOp::Mul, {I1, 0x3}, {I1, XYZW}, ConstHalf, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x3}, {I1, XYZW}, ConstHalf, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY}, {I1, ZZZZ}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I1, 0x2}, {I1, YYYY}, Lit(LitInvSix), Pred::None, true);
+    e.MoveInternal({Reg::V(TmpProj), 0x3}, {I1, XYZW}, Pred::None, true);
+}
+
 void FragmentEmitter::SampleTextures() {
     // Every read on counter 0, one wait for all of them before the first use.
     const auto& tex = config.texture;
@@ -1286,6 +1341,10 @@ void FragmentEmitter::SampleTextures() {
                    static_cast<uint8_t>(texcoord0_w_pa & 1), Pred::None, true);
             e.Vec(VecOp::Mul, {Reg::V(TmpProj), 0x3}, {coords[0], XYZW}, {I0, XXXX}, Pred::None,
                   true);
+            coords[0] = Reg::V(TmpProj);
+        } else if (unit == 0 && tex.texture0_type == TextureType::TextureCube &&
+                   !GxmFlag("cubeflat")) {
+            CubeCoordinates(coords[0]);
             coords[0] = Reg::V(TmpProj);
         }
         e.Sample2D(Reg::V(static_cast<uint8_t>(TmpTex0 + unit * 4)), coords[unit],
@@ -2000,6 +2059,11 @@ void FragmentEmitter::PlanCombinerBuffer() {
         if (IsPassThroughTevStage(stage)) {
             continue;
         }
+        // Which half of the buffer an operand reads is set by its modifier, not by whether it
+        // is a colour or an alpha operand: a colour operand with SourceAlpha reads the alpha
+        // (from the stage that last updated the alpha), an alpha operand with SourceRed/
+        // Green/Blue reads the colour. Planning by operand kind left the snapshot's w unwritten
+        // and the read took whatever the register held (MH4U's camp pond, 2026-11-15).
         const auto reads = [&](Source src, bool alpha) {
             if (src != Source::PreviousBuffer) {
                 return;
@@ -2009,12 +2073,18 @@ void FragmentEmitter::PlanCombinerBuffer() {
                 snapshot_lanes[from] |= alpha ? 0x8 : 0x7;
             }
         };
-        reads(ColorSource(stage, stage.color_source1, k), false);
-        reads(ColorSource(stage, stage.color_source2, k), false);
-        reads(ColorSource(stage, stage.color_source3, k), false);
-        reads(AlphaSource(stage, stage.alpha_source1, k), true);
-        reads(AlphaSource(stage, stage.alpha_source2, k), true);
-        reads(AlphaSource(stage, stage.alpha_source3, k), true);
+        const auto color_reads_alpha = [](ColorModifier m) {
+            return (static_cast<u32>(m) & ~1u) == 0x2;
+        };
+        const auto alpha_reads_alpha = [](AlphaModifier m) {
+            return ((static_cast<u32>(m) >> 1) & 3) == 0;
+        };
+        reads(ColorSource(stage, stage.color_source1, k), color_reads_alpha(stage.color_modifier1));
+        reads(ColorSource(stage, stage.color_source2, k), color_reads_alpha(stage.color_modifier2));
+        reads(ColorSource(stage, stage.color_source3, k), color_reads_alpha(stage.color_modifier3));
+        reads(AlphaSource(stage, stage.alpha_source1, k), alpha_reads_alpha(stage.alpha_modifier1));
+        reads(AlphaSource(stage, stage.alpha_source2, k), alpha_reads_alpha(stage.alpha_modifier2));
+        reads(AlphaSource(stage, stage.alpha_source3, k), alpha_reads_alpha(stage.alpha_modifier3));
     }
 }
 
@@ -2061,8 +2131,13 @@ void FragmentEmitter::LoadArg(uint8_t arg_index, const TevStageConfig& stage, u3
     // differs, then one add for the inverted lanes. Assembling it in temporaries first cost
     // three copies and a load per argument.
     const Reg dst = Reg::I(arg_index);
-    const Vec4Loc c = SourceLocation(ColorSource(stage, csrc, stage_index), stage_index, false);
-    const Vec4Loc a = SourceLocation(AlphaSource(stage, asrc, stage_index), stage_index, true);
+    // The buffer half each operand reads follows its modifier (see PlanCombinerBuffer).
+    const bool c_reads_alpha = (static_cast<u32>(cmod) & ~1u) == 0x2;
+    const bool a_reads_alpha = ((static_cast<u32>(amod) >> 1) & 3) == 0;
+    const Vec4Loc c =
+        SourceLocation(ColorSource(stage, csrc, stage_index), stage_index, c_reads_alpha);
+    const Vec4Loc a =
+        SourceLocation(AlphaSource(stage, asrc, stage_index), stage_index, a_reads_alpha);
     const bool want_c = lanes & 0x7;
     const bool want_a = lanes & 0x8;
 
@@ -2413,8 +2488,10 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
                     std::bit_cast<uint32_t>(0.5f / 256.0f),
                     std::bit_cast<uint32_t>(0.5f / static_cast<float>(Pica::Shader::LUT_RG_ROWS)),
                     std::bit_cast<uint32_t>(-127.0f),
-                    std::bit_cast<uint32_t>(-255.0f)};
-    static_assert(LiteralCount == 40);
+                    std::bit_cast<uint32_t>(-255.0f),
+                    std::bit_cast<uint32_t>(1.0f / 6.0f),
+                    0u};
+    static_assert(LiteralCount == 42);
     static_assert(Pica::Shader::LUT_RG_ROWS == Pica::Shader::LUT_RGBA_ROWS);
     gxp.uses_discard = uses_kill;
     gxp.writes_depth = uses_depth;

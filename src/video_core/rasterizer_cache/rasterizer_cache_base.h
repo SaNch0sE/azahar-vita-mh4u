@@ -202,6 +202,11 @@ public:
 
     /// Get a texture cube based on the texture configuration
     Surface& GetTextureCube(const TextureCubeConfig& config);
+    /// GetTextureCube, returning the cube surface's id (for in-flight tracking).
+    SurfaceId GetTextureCubeId(const TextureCubeConfig& config) {
+        GetTextureCube(config);
+        return texture_cube_cache.at(config).surface_id;
+    }
 
     /// Get the color and depth surfaces based on the framebuffer configuration
     FramebufferHelper<T> GetFramebufferSurfaces(bool using_color_fb, bool using_depth_fb);
