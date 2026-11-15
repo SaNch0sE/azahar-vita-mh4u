@@ -21,6 +21,25 @@ This is an early, almost entirely vibecoded port of Azahar for the PSVita, so do
 ## Build
 See [DEVELOPMENT.md](./DEVELOPMENT.md)
 
+## This fork
+
+This branch tunes the port for Monster Hunter 4 Ultimate: it installs as its own app (MH4UVITA0) and keeps its files in `ux0:data/mh4u`. Performance notes and plans are in [docs/vita-mh4u-performance.md](./docs/vita-mh4u-performance.md) and [docs/plans](./docs/plans). The pause menu has image options: an upscale filter (linear or sharp bilinear), FXAA, and an internal render scale (1x to 2x, applied on the next launch).
+
+## Projects we learned from
+
+What each one gave this port, and in what form:
+
+- [Azahar](https://github.com/azahar-emu/azahar): the emulator itself (code base).
+- [Grarak/azahar](https://github.com/Grarak/azahar): the PS Vita port this fork is built on: native execution through the `azaharnative` kernel plugin, the USSE shader emitters, the GXM renderer and the frontend (code base).
+- [Grarak/mh3-wii](https://github.com/Grarak/mh3-wii): the choice of render resolutions offered in its start menu (idea for the render scale option).
+- [TuizaVita](https://github.com/TutuiFC/TuizaVita-3ds-emu): clamping the time-stretched audio before conversion (small code idea); mipmapped textures, file reads on a worker thread and a render scale below 1x are being evaluated from its 0.3B source (ideas).
+- [DSVita](https://github.com/Grarak/DSVita): the shape of the audio output (48 kHz port, buffer size), the pause menu's structure, and mirrored addressing on linear textures (reference design).
+- [vitaGL](https://github.com/Rinnegatamante/vitaGL): suballocating one GPU memory block, and loading the Razor GPU capture and live metrics (approach).
+- [Vita3K](https://github.com/Vita3K/Vita3K): running and debugging the port off the console (tool).
+- Programs from Sony's `psp2cgc` and the `psp2shaderperf` report: reference output for instruction encodings and scheduling bits that the USSE emitters reproduce (reference).
+- [kubridge](https://github.com/bythos14/kubridge): the logging approach in the kernel plugin (idea).
+- FXAA (Timothy Lottes) and the sharp-bilinear upscale (libretro shaders): the algorithms behind the image options, rewritten as USSE programs (algorithms).
+
 ## Credits
 - The Azahar Team
 - vitaGL
