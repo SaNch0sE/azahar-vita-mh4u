@@ -80,6 +80,8 @@ void GpuThread::EnqueueQueued(Op op) {
             Common::PipelineStats::gpu_brakes.fetch_add(1, std::memory_order_relaxed);
             const u64 brake_t0 = Common::PipelineStats::NowUs();
             SCOPE_EXIT({
+                Common::PipelineStats::gxw_brake_us.fetch_add(
+                    Common::PipelineStats::NowUs() - brake_t0, std::memory_order_relaxed);
                 if (Common::EmuProf::enabled) {
                     Common::EmuProf::Add("gpu thread: queue brake",
                                          Common::PipelineStats::NowUs() - brake_t0);

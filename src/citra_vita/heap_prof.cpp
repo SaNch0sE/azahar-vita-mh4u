@@ -56,8 +56,10 @@ std::uintptr_t g_self_lo = 0, g_self_hi = 0;
 // higher-priority thread spinning on a core starves the lower-priority holder there (the first
 // spinlock version froze the game, and the console's network with it).
 std::mutex g_lock;
-PtrSlot g_ptrs[PtrSlots];
-Site g_sites[SiteSlots];
+// On the heap, and only when switched on: as .bss they took ~470 KiB from the game partition's
+// small remainder outside the heap (thread stacks, GPU blocks) even with the profile off.
+PtrSlot* g_ptrs = nullptr;
+Site* g_sites = nullptr;
 std::size_t g_ptr_used = 0;
 std::atomic<std::int64_t> g_total{0};
 thread_local std::int64_t t_until_sample = SamplePeriod;
@@ -186,6 +188,11 @@ void HeapProfInit(bool on) {
     for (const std::uintptr_t f : fns) {
         g_self_lo = std::min(g_self_lo, f & ~std::uintptr_t{1});
         g_self_hi = std::max(g_self_hi, f + 0x200);
+    }
+    if (on) {
+        g_ptrs = static_cast<PtrSlot*>(std::calloc(PtrSlots, sizeof(PtrSlot)));
+        g_sites = static_cast<Site*>(std::calloc(SiteSlots, sizeof(Site)));
+        on = g_ptrs != nullptr && g_sites != nullptr;
     }
     g_on = on;
 }

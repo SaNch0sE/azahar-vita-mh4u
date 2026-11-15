@@ -73,6 +73,11 @@ inline u64 bp_config_us = 0, bp_pipeline_us = 0, bp_calls = 0, bp_tier2_us = 0;
 /// took, and how many of them were never offered to the hardware path (hw = false at ship).
 /// RunShippedDraw's geometry-shader memo, both generations (KiB, last value).
 inline std::atomic<u32> gs_memo_kib{0};
+/// GS memo hits and misses (all PicaCores: the pre-shade worker and the render mirror).
+inline std::atomic<u32> gs_memo_hit_n{0}, gs_memo_miss_n{0};
+/// Time the shipping (GX) thread spent blocked, by cause: the pre-shade ring full, the render
+/// queue's brake, the vertex ring out of space, the frame arenas over budget (us).
+inline std::atomic<u64> gxw_shade_us{0}, gxw_brake_us{0}, gxw_ring_us{0}, gxw_arena_us{0};
 inline std::atomic<u32> sw_shaded_draws{0};
 inline std::atomic<u64> sw_shaded_us{0};
 inline std::atomic<u32> sw_shaded_not_offered{0};

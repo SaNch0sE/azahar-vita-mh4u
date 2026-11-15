@@ -237,6 +237,11 @@ void ThreadedRasterizer::RingDrawConsumed(u64 ring_end) {
 }
 
 void ThreadedRasterizer::RingWaitForSpace(u64 bytes) {
+    const u64 wait_t0 = Common::PipelineStats::NowUs();
+    SCOPE_EXIT({
+        Common::PipelineStats::gxw_ring_us.fetch_add(Common::PipelineStats::NowUs() - wait_t0,
+                                                     std::memory_order_relaxed);
+    });
     std::unique_lock lock{ring->mutex};
     while (ring->TryAllocWouldFail(static_cast<u32>(bytes))) {
         // The render thread only learns that space ran out from us: hand it a blocking retire,
@@ -559,7 +564,10 @@ std::optional<RasterizerInterface::DrawArenaTicket> ThreadedRasterizer::BeginShi
         // budget, wait for the render thread to retire something and look for a freed slot.
         while (emergency_bytes.load(std::memory_order_relaxed) + bytes > EmergencyBudget &&
                gpu_thread.HasWorker()) {
+            const u64 wait_t0 = Common::PipelineStats::NowUs();
             gpu_thread.WaitForRetire();
+            Common::PipelineStats::gxw_arena_us.fetch_add(
+                Common::PipelineStats::NowUs() - wait_t0, std::memory_order_relaxed);
             RotateArenaSlots();
             if (current_slot != nullptr) {
                 return DrawArenaTicket{SlotAlloc(*current_slot, bytes), current_slot};
@@ -897,8 +905,13 @@ void ThreadedRasterizer::QueuePreshade(Shipment* shipment) {
     shipment->shade_state.store(eligible ? ShadePending : ShadeNone, std::memory_order_relaxed);
     shipment->refs.store(2, std::memory_order_relaxed);
     const u32 tail = shade_tail.load(std::memory_order_relaxed);
-    while (tail - shade_head.load(std::memory_order_acquire) >= ShadeRingSize) {
-        std::this_thread::yield(); // full: the worker is thousands of shipments behind
+    if (tail - shade_head.load(std::memory_order_acquire) >= ShadeRingSize) [[unlikely]] {
+        const u64 t0 = Common::PipelineStats::NowUs();
+        while (tail - shade_head.load(std::memory_order_acquire) >= ShadeRingSize) {
+            std::this_thread::yield(); // full: the worker is thousands of shipments behind
+        }
+        Common::PipelineStats::gxw_shade_us.fetch_add(Common::PipelineStats::NowUs() - t0,
+                                                      std::memory_order_relaxed);
     }
     shade_ring[tail % ShadeRingSize] = shipment;
     // No wake-up: the worker polls (PreshadeLoop). Waking it per shipment was a kernel call

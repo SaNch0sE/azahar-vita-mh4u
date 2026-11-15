@@ -844,7 +844,25 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                               Common::PipelineStats::gs_memo_kib.load(std::memory_order_relaxed));
                 // cpu: the CPU time each named thread actually ran this second (gx above is
                 // wall time, preemption and waits included).
-                sceClibPrintf("[mh4u] cpu%s\n", Common::ThreadCpuReport().c_str());
+                {
+                    // wait: GX-thread blocked ms by cause (shade ring, queue brake, vertex
+                    // ring, arenas); ps: pre-shade used/stolen/waited and the render thread's
+                    // own shading ms; memo: GS memo hits/misses (all mirrors).
+                    namespace PS = Common::PipelineStats;
+                    const auto take = [](auto& a) { return a.exchange(0, std::memory_order_relaxed); };
+                    sceClibPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u\n",
+                                  Common::ThreadCpuReport().c_str(),
+                                  static_cast<unsigned>(take(PS::gxw_shade_us) / 1000),
+                                  static_cast<unsigned>(take(PS::gxw_brake_us) / 1000),
+                                  static_cast<unsigned>(take(PS::gxw_ring_us) / 1000),
+                                  static_cast<unsigned>(take(PS::gxw_arena_us) / 1000),
+                                  static_cast<unsigned>(take(PS::preshade_used)),
+                                  static_cast<unsigned>(take(PS::preshade_stolen)),
+                                  static_cast<unsigned>(take(PS::preshade_waited)),
+                                  static_cast<unsigned>(take(PS::preshade_local_us) / 1000),
+                                  static_cast<unsigned>(take(PS::gs_memo_hit_n)),
+                                  static_cast<unsigned>(take(PS::gs_memo_miss_n)));
+                }
                 static unsigned heap_prof_seconds = 0;
                 if (HeapProfEnabled() && ++heap_prof_seconds % 10 == 0) {
                     HeapProfReport();

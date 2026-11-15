@@ -1836,6 +1836,7 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
                 }
             }
             gs_memo_hits++;
+            Common::PipelineStats::gs_memo_hit_n.fetch_add(1, std::memory_order_relaxed);
             if (gs_memo_program != nullptr) {
                 gs_memo_program->misses_in_row = 0;
             }
@@ -1952,6 +1953,7 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             static_cast<u32>((gs_memo_cur_bytes + gs_memo_prev_bytes) / 1024),
             std::memory_order_relaxed);
         gs_memo_misses++;
+        Common::PipelineStats::gs_memo_miss_n.fetch_add(1, std::memory_order_relaxed);
         if (gs_memo_program != nullptr && ++gs_memo_program->misses_in_row >= 32) {
             gs_memo_program->misses_in_row = 31;
             gs_memo_program->skip_left = 256;
