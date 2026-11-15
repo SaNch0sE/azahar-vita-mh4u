@@ -477,6 +477,16 @@ private:
         u8 stencil_compare{}, stencil_write{}, stencil_ref{};
     };
     CachedState state_cache;
+    /// The alpha-test depth pre-pass of an eligible hardware draw (PrepassEligible): 1 the
+    /// depth pass (alpha-only kill program, no colour), 2 the colour pass (no kill, depth
+    /// EQUAL, no depth write), 0 otherwise. BindPrograms reads it.
+    int prepass_mode = 0;
+    SceGxmDepthFunc prepass_saved_func{};
+    SceGxmDepthWriteMode prepass_saved_write{};
+    u32 stat_prepass{}, stat_prepass_nodepth{};
+    bool PrepassEligible();
+    bool PrepassSecond(const VertexLayout& layout, u32 vertex_count);
+    void PrepassRestore();
 
     Framebuffer* scene_fb{};
     bool in_scene{};

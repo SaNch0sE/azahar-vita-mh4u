@@ -378,3 +378,19 @@ vertex colour: 7.0, + textures 10.6, + combiner 14.6, + lighting 21.6, + alpha t
 
 The release log now prints `[mh4u] clocks at start …` and every 30 s `[mh4u] clocks arm … MHz` (scePowerGet*). SetupClocks only raises a clock, never lowers it, and `ux0:data/mh4u/noclocks` skips it.
 Measured: readback says 333 at start and 444 after SetupClocks, and stays 333 with `noclocks`, although the user's PSVshellPlus profile for MH4UVITA0 sets 500/222/222/166. GX-thread time in area 3 was the same (~400 ms/s) in all three runs, so the readback does not see the plugin's clock and the CPU speed did not change. Don't treat the readback as the real clock.
+
+## Area 3 alpha pre-pass, in place (2026-11-15)
+
+Opt-in `prepass` (diag flag or `ux0:data/mh4u/prepass`). An alpha-tested draw with replace blending (alphablend off, or Add/One/Zero, which is MH4U's world), an ordering depth test with depth write on, no stencil, and AlphaChainClass 1 is drawn twice. First an alpha-only kill program with colour mask NONE that writes depth; then the full program without the kill, depth EQUAL, no depth write. About 1,530 draws per 3 s qualify; the other ~1,275 alpha-tested draws really blend.
+
+GPU per frame (diag `scenetime`, area 3):
+
+| | ms |
+|---|---|
+| Baseline | 33.5 |
+| `prepass` | 33.5 |
+| `prepass ppskipb` (depth pass only, grass invisible) | 31.8 |
+| `ptoffop` (alpha test off for the 1,530 unblended draws) | 25.6 |
+| `ptoffbl` (alpha test off for the 1,275 blended draws) | 33.9 |
+
+So the ~8 ms is in the unblended alpha-tested draws, and ~6 ms of it is the discard itself happening mid-scene, whatever the program does; the in-place colour pass costs only ~1.7 ms. The in-place pre-pass cannot recover it. Only moving the punch-through draws out of the middle of the scene could, if the cost is the GPU flushing already-tagged opaque work (Fable's model). If instead the cost is the grass cards' own overdraw being shaded, moving them would not help either. Next step: an experiment that tells the two apart, before a deferred-context build.

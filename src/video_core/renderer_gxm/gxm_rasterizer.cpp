@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #ifdef __vita__
 #include <malloc.h>
 #include <psp2/io/stat.h>
@@ -36,6 +37,7 @@ static inline int sceIoMkdir(const char*, int) {
 #include "video_core/renderer_gxm/gxm_device.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/gxm_gs_request.h"
+#include "video_core/renderer_gxm/gxm_alpha_prepass.h"
 #include "video_core/renderer_gxm/gxm_rasterizer.h"
 #include "video_core/renderer_gxm/pica_to_gxm.h"
 #include "gxm_program_version.h"
@@ -1457,6 +1459,27 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
          om.alpha_test.ref == 255)) {
         fs_config.framebuffer.alpha_test_func.Assign(CompareFunc::Always);
     }
+    {   // Diag split experiment (2026-11-15): alpha test off for blended (ptoffbl) or unblended
+        // (ptoffop) alpha-tested draws. In area 3 the ~8 ms is all in the unblended ones.
+        static const bool off_bl = GxmFlag("ptoffbl");
+        static const bool off_op = GxmFlag("ptoffop");
+        const auto f = fs_config.framebuffer.alpha_test_func.Value();
+        if ((off_bl || off_op) && f != CompareFunc::Always && f != CompareFunc::Never) {
+            const auto& b = om.alpha_blending;
+            using Factor = Pica::FramebufferRegs::BlendFactor;
+            const bool replace = !om.alphablend_enable ||
+                                 (b.factor_source_rgb == Factor::One &&
+                                  b.factor_dest_rgb == Factor::Zero);
+            if ((replace && off_op) || (!replace && off_bl)) {
+                fs_config.framebuffer.alpha_test_func.Assign(CompareFunc::Always);
+            }
+        }
+    }
+    if (prepass_mode == 1) {
+        fs_config = AlphaOnlyConfig(fs_config);
+    } else if (prepass_mode == 2) {
+        fs_config.framebuffer.alpha_test_func.Assign(CompareFunc::Always);
+    }
     if (scissor_covers_draw && fs_config.framebuffer.scissor_test_mode ==
                                    Pica::RasterizerRegs::ScissorMode::Include) {
         fs_config.framebuffer.scissor_test_mode.Assign(
@@ -1586,6 +1609,9 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         mask(om.blue_enable, SCE_GXM_COLOR_MASK_B) | mask(om.alpha_enable, SCE_GXM_COLOR_MASK_A);
     if (feedback_alpha_only) {
         blend.colorMask &= SCE_GXM_COLOR_MASK_A;
+    }
+    if (prepass_mode == 1) {
+        blend.colorMask = SCE_GXM_COLOR_MASK_NONE;
     }
     // Bring-up switch: every draw written straight to the target. A picture that comes right
     // without blending puts the fault in the blend or in what it reads back, not in what the
@@ -3371,9 +3397,11 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
     }
 
     DrawSetup setup;
+    prepass_mode = PrepassEligible() ? 1 : 0;
     if (!BeginDraw(setup, layout, payload.num_vertices)) {
         // Consumed, not drawn: a program still compiling, a target the cache has no surface
         // for. The software shader would only reach the same refusal after shading.
+        prepass_mode = 0;
         ReleaseDraw(setup);
         DropDraw();
         return true;
@@ -3386,110 +3414,120 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
 
     SceGxmContext* context = Device().context;
     const PhaseTimer draw_timer{time_draws, times.draw};
-    if (payload.is_indexed || payload.num_vertices <= MaxVerticesPerDraw) {
-        for (u32 stream = 0; stream < layout.stream_count; stream++) {
-            sceGxmSetVertexStream(context, stream, base + stream_ring_offset[stream]);
+    // Twice for the alpha-test pre-pass: depth first, then colour where the depth matched.
+    const int passes = prepass_mode == 1 ? 2 : 1;
+    for (int pass = 0; pass < passes; pass++) {
+        if (pass == 1 && !PrepassSecond(layout, payload.num_vertices)) {
+            break;
         }
-        DrawTrace("hw draw");
-        {
-            static const bool on = GxmFlag("logdraw");
-            // The first draws of each vertex program, so one program's draws can be read
-            // against another's rather than only the frame's first few.
-            static std::map<const Shader*, u32> per_program;
-            const bool show = on && layout.shader != nullptr && per_program[layout.shader]++ < 6;
-            if (show) {
-                std::string attrs;
-                for (u32 n = 0; n < layout.attribute_count; n++) {
-                    const auto& a = layout.attributes[n];
-                    attrs += fmt::format(" {}@{}:fmt{}x{}", a.name, a.offset,
-                                         static_cast<int>(a.format), a.components);
-                }
-                std::string v0;
-                for (u32 n = 0; n < std::min<u32>(layout.strides[0], 32); n++) {
-                    v0 += fmt::format("{:02x}", base[stream_ring_offset[0] + n]);
-                }
-                LOG_INFO(Render,
-                         "hw draw: {} verts, indexed {} (min {} max {}), {} streams, stride0 {} "
-                         "bytes0 {}, stride1 {} bytes1 {}, {} attributes, primitive {}, vs {},"
-                         "{} v0 {}",
-                         payload.num_vertices, payload.is_indexed, payload.vertex_min,
-                         payload.vertex_max, layout.stream_count, layout.strides[0],
-                         stream_bytes[0], layout.strides[1], stream_bytes[1],
-                         layout.attribute_count, static_cast<int>(primitive),
-                         layout.shader != nullptr ? layout.shader->name : "none", attrs, v0);
+        if (payload.is_indexed || payload.num_vertices <= MaxVerticesPerDraw) {
+            for (u32 stream = 0; stream < layout.stream_count; stream++) {
+                sceGxmSetVertexStream(context, stream, base + stream_ring_offset[stream]);
             }
-        }
-        {
-            // vsdump: the first draws of the vertex program whose name contains the word in
-            // ux0:data/mh4u/vsdump.txt, with the default uniform buffer and stream 0 as
-            // the GPU sees them, to ux0:data/mh4u/vsdump_NN.bin (header: vertex count,
-            // stride, stream bytes, uniform bytes; then the two blocks), so the program's
-            // translation can be run off the console on the same data.
-            static const bool vsdump = GxmFlag("vsdump");
-            static u32 dumped = 0;
-            if (vsdump && layout.shader != nullptr && last_vertex_uniforms != nullptr &&
-                dumped < 32) {
-                // The file holds the key and, optionally, the first frame to dump from.
-                static const std::pair<std::string, u32> key_and_frame = [] {
-                    std::string k;
-                    u32 from = 0;
-                    if (FILE* f = std::fopen(VITA_DATA_DIR "/vsdump.txt", "rb")) {
-                        char buf[64]{};
-                        std::fread(buf, 1, sizeof(buf) - 1, f);
-                        std::fclose(f);
-                        char word[64]{};
-                        if (std::sscanf(buf, "%63s %u", word, &from) >= 1) {
-                            k = word;
+            DrawTrace("hw draw");
+            {
+                static const bool on = GxmFlag("logdraw");
+                // The first draws of each vertex program, so one program's draws can be read
+                // against another's rather than only the frame's first few.
+                static std::map<const Shader*, u32> per_program;
+                const bool show = on && layout.shader != nullptr && per_program[layout.shader]++ < 6;
+                if (show) {
+                    std::string attrs;
+                    for (u32 n = 0; n < layout.attribute_count; n++) {
+                        const auto& a = layout.attributes[n];
+                        attrs += fmt::format(" {}@{}:fmt{}x{}", a.name, a.offset,
+                                             static_cast<int>(a.format), a.components);
+                    }
+                    std::string v0;
+                    for (u32 n = 0; n < std::min<u32>(layout.strides[0], 32); n++) {
+                        v0 += fmt::format("{:02x}", base[stream_ring_offset[0] + n]);
+                    }
+                    LOG_INFO(Render,
+                             "hw draw: {} verts, indexed {} (min {} max {}), {} streams, stride0 {} "
+                             "bytes0 {}, stride1 {} bytes1 {}, {} attributes, primitive {}, vs {},"
+                             "{} v0 {}",
+                             payload.num_vertices, payload.is_indexed, payload.vertex_min,
+                             payload.vertex_max, layout.stream_count, layout.strides[0],
+                             stream_bytes[0], layout.strides[1], stream_bytes[1],
+                             layout.attribute_count, static_cast<int>(primitive),
+                             layout.shader != nullptr ? layout.shader->name : "none", attrs, v0);
+                }
+            }
+            {
+                // vsdump: the first draws of the vertex program whose name contains the word in
+                // ux0:data/mh4u/vsdump.txt, with the default uniform buffer and stream 0 as
+                // the GPU sees them, to ux0:data/mh4u/vsdump_NN.bin (header: vertex count,
+                // stride, stream bytes, uniform bytes; then the two blocks), so the program's
+                // translation can be run off the console on the same data.
+                static const bool vsdump = GxmFlag("vsdump");
+                static u32 dumped = 0;
+                if (vsdump && layout.shader != nullptr && last_vertex_uniforms != nullptr &&
+                    dumped < 32) {
+                    // The file holds the key and, optionally, the first frame to dump from.
+                    static const std::pair<std::string, u32> key_and_frame = [] {
+                        std::string k;
+                        u32 from = 0;
+                        if (FILE* f = std::fopen(VITA_DATA_DIR "/vsdump.txt", "rb")) {
+                            char buf[64]{};
+                            std::fread(buf, 1, sizeof(buf) - 1, f);
+                            std::fclose(f);
+                            char word[64]{};
+                            if (std::sscanf(buf, "%63s %u", word, &from) >= 1) {
+                                k = word;
+                            }
+                        }
+                        return std::make_pair(k, from);
+                    }();
+                    const std::string& key = key_and_frame.first;
+                    if (!key.empty() && frame_index >= key_and_frame.second &&
+                        layout.shader->name.find(key) != std::string::npos) {
+                        const u32 ubytes =
+                            sceGxmProgramGetDefaultUniformBufferSize(layout.shader->Program());
+                        char path[64];
+                        std::snprintf(path, sizeof(path), VITA_DATA_DIR "/vsdump_%02u.bin",
+                                      dumped++);
+                        if (FILE* f = std::fopen(path, "wb")) {
+                            const u32 header[4] = {payload.num_vertices, layout.strides[0],
+                                                   stream_bytes[0], ubytes};
+                            std::fwrite(header, sizeof(header), 1, f);
+                            std::fwrite(last_vertex_uniforms, 1, ubytes, f);
+                            std::fwrite(base + stream_ring_offset[0], 1, stream_bytes[0], f);
+                            std::fclose(f);
                         }
                     }
-                    return std::make_pair(k, from);
-                }();
-                const std::string& key = key_and_frame.first;
-                if (!key.empty() && frame_index >= key_and_frame.second &&
-                    layout.shader->name.find(key) != std::string::npos) {
-                    const u32 ubytes =
-                        sceGxmProgramGetDefaultUniformBufferSize(layout.shader->Program());
-                    char path[64];
-                    std::snprintf(path, sizeof(path), VITA_DATA_DIR "/vsdump_%02u.bin",
-                                  dumped++);
-                    if (FILE* f = std::fopen(path, "wb")) {
-                        const u32 header[4] = {payload.num_vertices, layout.strides[0],
-                                               stream_bytes[0], ubytes};
-                        std::fwrite(header, sizeof(header), 1, f);
-                        std::fwrite(last_vertex_uniforms, 1, ubytes, f);
-                        std::fwrite(base + stream_ring_offset[0], 1, stream_bytes[0], f);
-                        std::fclose(f);
-                    }
                 }
             }
-        }
-        GXM_PHASE_NAME("gpu:draw");
-        const int err =
-            sceGxmDraw(context, primitive, SCE_GXM_INDEX_FORMAT_U16, indices, payload.num_vertices);
-        GXM_PHASE_NAME("gpu:drawn");
-        DrawTrace("hw draw done");
-        if (err < 0) {
-            LOG_ERROR(Render, "GXM: hardware draw refused: {} ({:#x})", GxmErrorName(err),
-                      static_cast<u32>(err));
-        }
-    } else {
-        // A non-indexed list longer than the identity table: move every stream's base along
-        // with the vertices.
-        u32 first = 0;
-        u32 left = payload.num_vertices;
-        while (left > 0) {
-            const u32 count = std::min(left, MaxVerticesPerDraw);
-            for (u32 stream = 0; stream < layout.stream_count; stream++) {
-                sceGxmSetVertexStream(context, stream,
-                                      base + stream_ring_offset[stream] +
-                                          static_cast<std::size_t>(first) * layout.strides[stream]);
-            }
             GXM_PHASE_NAME("gpu:draw");
-            sceGxmDraw(context, primitive, SCE_GXM_INDEX_FORMAT_U16, identity_indices, count);
+            const int err =
+                sceGxmDraw(context, primitive, SCE_GXM_INDEX_FORMAT_U16, indices, payload.num_vertices);
             GXM_PHASE_NAME("gpu:drawn");
-            first += count;
-            left -= count;
+            DrawTrace("hw draw done");
+            if (err < 0) {
+                LOG_ERROR(Render, "GXM: hardware draw refused: {} ({:#x})", GxmErrorName(err),
+                          static_cast<u32>(err));
+            }
+        } else {
+            // A non-indexed list longer than the identity table: move every stream's base along
+            // with the vertices.
+            u32 first = 0;
+            u32 left = payload.num_vertices;
+            while (left > 0) {
+                const u32 count = std::min(left, MaxVerticesPerDraw);
+                for (u32 stream = 0; stream < layout.stream_count; stream++) {
+                    sceGxmSetVertexStream(context, stream,
+                                          base + stream_ring_offset[stream] +
+                                              static_cast<std::size_t>(first) * layout.strides[stream]);
+                }
+                GXM_PHASE_NAME("gpu:draw");
+                sceGxmDraw(context, primitive, SCE_GXM_INDEX_FORMAT_U16, identity_indices, count);
+                GXM_PHASE_NAME("gpu:drawn");
+                first += count;
+                left -= count;
+            }
         }
+    }
+    if (prepass_mode != 0) {
+        PrepassRestore();
     }
     stat_vertices += payload.num_vertices;
     ring_scene_pos = std::max(ring_scene_pos, hw_ring_end);
@@ -3820,6 +3858,124 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
     hw_ring_end = 0;
     ReleaseDraw(setup);
     return true;
+}
+
+/**
+ * The alpha-test depth pre-pass, in place (`prepass`, diag flag or ux0:data/mh4u/prepass):
+ * an alpha-tested draw that writes depth with an ordering test, without blending or stencil,
+ * is drawn twice - first with a program that computes only the combiner's alpha chain and
+ * kills (AlphaOnlyConfig), writing depth and no colour; then with the full program minus the
+ * kill, testing depth EQUAL without writing it. The second draw is opaque to the GPU, so the
+ * expensive lit program runs without discard. Same vertex program both times, so the depth
+ * values match bit for bit.
+ */
+namespace {
+std::array<u32, 16> prepass_why{};
+}
+
+bool RasterizerGxm::PrepassEligible() {
+    static const bool on = [] {
+        if (GxmFlag("prepass")) {
+            return true;
+        }
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/prepass", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return false;
+    }();
+    if (!on) {
+        return false;
+    }
+    using CompareFunc = Pica::FramebufferRegs::CompareFunc;
+    const auto& fbr = regs.framebuffer;
+    const auto& om = fbr.output_merger;
+    if (!om.alpha_test.enable) {
+        return false;
+    }
+    prepass_why[0]++;
+    if (om.alphablend_enable) {
+        // Blending that replaces (MH4U's world: Add, One, Zero) is no blending.
+        using Factor = Pica::FramebufferRegs::BlendFactor;
+        using Equation = Pica::FramebufferRegs::BlendEquation;
+        const auto& b = om.alpha_blending;
+        if (b.blend_equation_rgb != Equation::Add || b.blend_equation_a != Equation::Add ||
+            b.factor_source_rgb != Factor::One || b.factor_source_a != Factor::One ||
+            b.factor_dest_rgb != Factor::Zero || b.factor_dest_a != Factor::Zero) {
+            prepass_why[1]++;
+            return false;
+        }
+    } else if (om.logic_op != Pica::FramebufferRegs::LogicOp::Copy) {
+        prepass_why[1]++;
+        return false;
+    }
+    if (!om.depth_test_enable || !om.depth_write_enable ||
+        fbr.framebuffer.allow_depth_stencil_write == 0 || fbr.framebuffer.allow_color_write == 0) {
+        prepass_why[2]++;
+        return false;
+    }
+    const auto func = om.depth_test_func.Value();
+    if (func != CompareFunc::LessThan && func != CompareFunc::LessThanOrEqual &&
+        func != CompareFunc::GreaterThan && func != CompareFunc::GreaterThanOrEqual) {
+        prepass_why[3]++;
+        return false;
+    }
+    if (fbr.HasStencil() && om.stencil_test.enable) {
+        prepass_why[4]++;
+        return false;
+    }
+    const Pica::Shader::FSConfig fs_config{regs};
+    const int cls = AlphaChainClass(fs_config);
+    prepass_why[std::min(4 + cls, 15)]++;
+    return cls == 1;
+}
+
+bool RasterizerGxm::PrepassSecond(const VertexLayout& layout, u32 vertex_count) {
+    // Diag (2026-11-15): the depth pass alone, colour pass skipped: 31.8 ms against 33.5.
+    static const bool skip_colour = GxmFlag("ppskipb");
+    if (skip_colour) {
+        prepass_mode = 0;
+        return false;
+    }
+    // Without a depth buffer the first draw wrote nothing: draw the original instead.
+    const bool depth = state_cache.depth_write == SCE_GXM_DEPTH_WRITE_ENABLED &&
+                       state_cache.depth_func != SCE_GXM_DEPTH_FUNC_ALWAYS;
+    prepass_mode = depth ? 2 : 0;
+    {
+        const PhaseTimer timer{time_draws, times.programs};
+        if (!BindPrograms(layout, vertex_count)) {
+            return false;
+        }
+    }
+    SceGxmContext* context = Device().context;
+    if (depth) {
+        stat_prepass++;
+        prepass_saved_func = state_cache.depth_func;
+        prepass_saved_write = state_cache.depth_write;
+        state_cache.depth_func = SCE_GXM_DEPTH_FUNC_EQUAL;
+        state_cache.depth_write = SCE_GXM_DEPTH_WRITE_DISABLED;
+        sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_EQUAL);
+        sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_EQUAL);
+        sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+        sceGxmSetBackDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    } else {
+        stat_prepass_nodepth++;
+    }
+    return true;
+}
+
+void RasterizerGxm::PrepassRestore() {
+    // The next draw may skip SyncState (BeginDraw's repeat path): put the depth state back.
+    if (prepass_mode == 2) {
+        SceGxmContext* context = Device().context;
+        state_cache.depth_func = prepass_saved_func;
+        state_cache.depth_write = prepass_saved_write;
+        sceGxmSetFrontDepthFunc(context, prepass_saved_func);
+        sceGxmSetBackDepthFunc(context, prepass_saved_func);
+        sceGxmSetFrontDepthWriteEnable(context, prepass_saved_write);
+        sceGxmSetBackDepthWriteEnable(context, prepass_saved_write);
+    }
+    prepass_mode = 0;
 }
 
 void RasterizerGxm::FlushAll() {
@@ -4388,6 +4544,13 @@ void RasterizerGxm::EndFrame() {
             times = DrawTimes{};
             stat_guest_writes = stat_invalidates = stat_flushes = 0;
         }
+        if (stat_prepass != 0 || stat_prepass_nodepth != 0) {
+            LOG_INFO(Render, "prepass: {} alpha-tested draws drawn depth-first, {} without depth; "
+                     "why [{}]",
+                     stat_prepass, stat_prepass_nodepth, fmt::join(prepass_why, " "));
+            prepass_why.fill(0);
+        }
+        stat_prepass = stat_prepass_nodepth = 0;
         if (stat_gs_hw != 0 || stat_gs_declined != 0) {
             LOG_INFO(Render, "hwgs: {} draws on the GPU ({} points), {} declined", stat_gs_hw,
                      stat_gs_points, stat_gs_declined);
