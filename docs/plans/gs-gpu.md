@@ -105,3 +105,28 @@ Kill switch: `ux0:data/mh4u/nopreshadering` plus flag `nopreshadering`, read onc
 | a4cb51124f38a2aa | dumped, not in the logged window | | |
 
 GS float uniforms changed in 25 of 600 draws; VS float uniforms in 390 of 600. Dumps: scratchpad `gsd/a3_*`.
+
+## Implementation and result (2026-11-15, measured)
+
+Built as Fable's option (a), a general fused emitter rather than hand-written corner code:
+- `Usse::GsStage` / `GsResult` (`usse/vs_usse_gen.h`) and the GS stage in `VertexEmitter` (`ScanGs`, `EmitGsStage`, `EmitGsEmit`). The VS outputs become GS-input quads, the GS reads its own resident `gs_uniforms_f` rows, the k-th EMIT branches to the epilogue for the vertex whose one-hot `gs_corner` has lane k, and END without that emit writes position (0,0,0,1) (culled point). The triangle pattern comes from simulating SETEMIT/EMIT as PrimitiveAssembler does. The analyser refuses loops, bools, address registers, conditional emits, and jumps to anything but END.
+- `BuildGsStage` (`gxm_gs_request.h`), shared with the host tool `tools/usse_host/gs_emit.cpp`. On the three area 3 dumps it produces patterns `1 0 2 3 1 2` (particles) and `0 1 2 1 3 2` (HUD), as Fable derived.
+- `RasterizerGxm::AccelerateGsDraw`: expands each point's loader bytes once per pattern entry, plus a one-hot corner stream, into the ring, and draws a triangle list. `ThreadedRasterizer` tries it for GS draws before the software path.
+
+On the console it draws correctly: particles and HUD look the same as the software path in timed screenshots. But it does not pay in area 3 (diag `scenetime timedraw`, 3 s windows):
+
+| | GS on GPU | Software (before) |
+|---|---|---|
+| GPU per frame | 35.2 ms (vertex 5.2) | 33.5 ms (vertex 3.4) |
+| Draws per 3 s | 9,898 | 8,700 |
+| Software GS shading on the render thread | 205 ms (4,018 small draws) | 340 ms (5,550 draws) |
+| Render-thread gxm time (draw setup, uniforms, …) | 28% | 24% |
+
+- **GPU:** +1.7 ms a frame. The VS and GS run per corner (6 vertices a point), on a GPU that area 3 already saturates.
+- **Render thread:** saves ~135 ms per 3 s of feeding, then spends about the same on per-draw setup. The software path merges consecutive same-state GS draws into one GPU draw, and the GPU path reserves a uniform buffer per draw.
+- **Release camera test:** standing still, shown 24–28 fps against 27–30 without.
+
+So it is **off by default**, opt-in with `ux0:data/mh4u/hwgs` (or diag flag `hwgs`). `hwgs_min.txt` sets the fewest points per draw (default 4).
+It could pay only where the render thread is the limit and the GPU has headroom, and only after: 4 vertices a point (indexed), merging consecutive draws with unchanged uniforms, and uniform rows written without re-reserving the whole VS bank. The quest counter's GS draws are mostly 1–4-point sprites the repeat path already merges, so it is not a candidate as is.
+
+Side note: during these runs MH4U menus ("Player Select", "Hunter Search", the Gathering Hall notice) opened on their own, with and without this change. They look like stray touch input on the console, not an emulator bug. They spoil fps runs (GX jumps to ~800 ms/s), so check the end screenshot.

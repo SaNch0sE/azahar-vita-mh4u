@@ -174,6 +174,12 @@ public:
         return false;
     }
 
+    /// A geometry-shader draw (never offered to AccelerateShippedDraw) run on the GPU: the
+    /// registers are the draw's. False: the software path takes it.
+    virtual bool AccelerateGsDraw([[maybe_unused]] const Pica::DrawPayload& payload) {
+        return false;
+    }
+
     /// Fences everything drawn from the ring so far and retires whatever already completed.
     /// Called at presents — the natural flush points — so fence traffic stays per-frame, not
     /// per-batch.

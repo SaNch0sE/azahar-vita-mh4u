@@ -35,6 +35,7 @@ static inline int sceIoMkdir(const char*, int) {
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_gxm/gxm_device.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
+#include "video_core/renderer_gxm/gxm_gs_request.h"
 #include "video_core/renderer_gxm/gxm_rasterizer.h"
 #include "video_core/renderer_gxm/pica_to_gxm.h"
 #include "gxm_program_version.h"
@@ -1802,6 +1803,7 @@ const RasterizerGxm::VsUniforms& RasterizerGxm::VsUniformsOf(Shader* vs) {
         }
         u.i = MakeSlot(vs->Param("uniforms_i"));
         u.b = MakeSlot(vs->Param("uniforms_b"));
+        u.gs_f = MakeSlot(vs->Param("gs_uniforms_f"));
         u.flip_viewport = MakeSlot(vs->Param("flip_viewport"));
         u.depth_scale = MakeSlot(vs->Param("depth_scale"));
         u.depth_offset = MakeSlot(vs->Param("depth_offset"));
@@ -1838,7 +1840,8 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
                     sizeof(uploaded_default_attrs)) != 0) {
         defaults_changed = true;
     }
-    const bool vertex_dirty = rebind || vs_data_dirty ||
+    // A fused GS program's rows are not tracked: written with every one of its draws.
+    const bool vertex_dirty = rebind || vs_data_dirty || current_gs != nullptr ||
                               (generated && (pica.vs_setup.uniforms_dirty || defaults_changed));
     (void)fs_hash;
     const bool fragment_dirty = rebind || fs_data_dirty || tex_dims_dirty || fb_dims_changed;
@@ -1944,6 +1947,18 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
                         set(vsu->default_regs[reg], value, 4);
                     }
                     uploaded_default_attrs = pica.input_default_attributes;
+                }
+                if (current_gs != nullptr && vsu->gs_f) {
+                    std::array<float, 96 * 4> rows;
+                    const auto& g = pica.gs_setup.uniforms.f;
+                    u32 n = 0;
+                    for (const u8 row : current_gs->uniform_rows) {
+                        rows[n++] = g[row].x.ToFloat32();
+                        rows[n++] = g[row].y.ToFloat32();
+                        rows[n++] = g[row].z.ToFloat32();
+                        rows[n++] = g[row].w.ToFloat32();
+                    }
+                    set(vsu->gs_f, rows.data(), n);
                 }
                 pica.vs_setup.uniforms_dirty = false;
             }
@@ -3488,6 +3503,325 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
     return true;
 }
 
+/**
+ * A Point-mode geometry-shader draw on the GPU: one fused vertex program runs the VS and then
+ * the GS for each corner of each point (Usse::GsStage), so the CPU neither shades it nor feeds
+ * its triangles one by one. The point's vertex data is repeated once per corner of its
+ * triangles (the pattern the emitter derived from the GS's emits), next to a one-hot corner
+ * stream; the draw is a plain triangle list over those copies. Anything the fused program
+ * does not cover goes back to the software path. Off unless `hwgs` (flag or
+ * ux0:data/mh4u/hwgs) turns it on; ux0:data/mh4u/hwgs_min.txt sets the fewest points a draw needs (default 4:
+ * smaller draws are HUD sprites that the software path merges into one draw).
+ */
+bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
+    // Opt-in: in MH4U's area 3 (GPU-bound) it cost the GPU ~1.7 ms a frame (the VS runs per
+    // corner) and saved the render thread about nothing (no repeat merge, a uniform buffer
+    // per draw), measured 2026-11-15; see docs/plans/gs-gpu.md.
+    static const bool enabled = [] {
+        if (GxmFlag("hwgs")) {
+            return true;
+        }
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/hwgs", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return false;
+    }();
+    static const u32 min_points = [] {
+        u32 n = 4;
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/hwgs_min.txt", "rb")) {
+            char line[16]{};
+            if (std::fgets(line, sizeof(line), f) != nullptr) {
+                n = static_cast<u32>(std::strtoul(line, nullptr, 10));
+            }
+            std::fclose(f);
+        }
+        return n;
+    }();
+    if (!enabled || payload.immediate || payload.num_vertices == 0 ||
+        payload.num_vertices < min_points || payload.vertex_max < payload.vertex_min) {
+        return false;
+    }
+    if (!EnsureResources()) {
+        return false;
+    }
+    draw_epoch++;
+    const PhaseTimer total_timer{time_draws, times.total};
+
+    // The streams: one per loader that owns arena bytes, as AccelerateShippedDraw walks them.
+    static constexpr const char* AttributeNames[16] = {
+        "vs_in_attr0",  "vs_in_attr1",  "vs_in_attr2",  "vs_in_attr3",
+        "vs_in_attr4",  "vs_in_attr5",  "vs_in_attr6",  "vs_in_attr7",
+        "vs_in_attr8",  "vs_in_attr9",  "vs_in_attr10", "vs_in_attr11",
+        "vs_in_attr12", "vs_in_attr13", "vs_in_attr14", "vs_in_attr15",
+    };
+    VertexLayout layout{};
+    std::array<u8, PipelineInfo::MaxStreams> stream_loader{};
+    std::array<std::pair<u32, VertexAttribute>, 16> candidates{};
+    u32 candidate_count = 0;
+    u32 enabled_regs = 0;
+    std::array<u8, 16> reg_components{};
+    const auto& va = regs.pipeline.vertex_attributes;
+    for (u32 loader_index = 0; loader_index < 12; loader_index++) {
+        const auto& loader = va.attribute_loaders[loader_index];
+        if (loader.component_count == 0 ||
+            (payload.layout.used_mask & (1u << loader_index)) == 0) {
+            continue;
+        }
+        if (loader.byte_count == 0) {
+            stat_gs_declined++;
+            return false; // zero stride
+        }
+        const u32 stream = layout.stream_count;
+        if (stream + 1 >= PipelineInfo::MaxStreams) {
+            stat_gs_declined++;
+            return false;
+        }
+        u32 offset = 0;
+        for (u32 comp = 0; comp < loader.component_count && comp < 12; ++comp) {
+            const u32 attribute_index = loader.GetComponent(comp);
+            if (attribute_index < 12) {
+                if (va.GetNumElements(attribute_index) == 0) {
+                    continue;
+                }
+                const u32 element_size = va.GetElementSizeInBytes(attribute_index);
+                offset = Common::AlignUp(offset, element_size);
+                const u32 reg = regs.vs.GetRegisterForAttribute(attribute_index);
+                SceGxmAttributeFormat format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+                switch (va.GetFormat(attribute_index)) {
+                case Pica::PipelineRegs::VertexAttributeFormat::BYTE:
+                    format = SCE_GXM_ATTRIBUTE_FORMAT_S8;
+                    break;
+                case Pica::PipelineRegs::VertexAttributeFormat::UBYTE:
+                    format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
+                    break;
+                case Pica::PipelineRegs::VertexAttributeFormat::SHORT:
+                    format = SCE_GXM_ATTRIBUTE_FORMAT_S16;
+                    break;
+                default:
+                    break;
+                }
+                if (candidate_count == candidates.size()) {
+                    stat_gs_declined++;
+                    return false;
+                }
+                candidates[candidate_count++] = {
+                    reg, VertexAttribute{AttributeNames[reg], static_cast<u16>(offset), format,
+                                         static_cast<u8>(va.GetNumElements(attribute_index)),
+                                         static_cast<u8>(stream)}};
+                enabled_regs |= 1u << reg;
+                reg_components[reg] = static_cast<u8>(va.GetNumElements(attribute_index));
+                offset += va.GetStride(attribute_index);
+            } else {
+                offset = Common::AlignUp(offset, 4);
+                offset += (attribute_index - 11) * 4;
+            }
+        }
+        layout.strides[stream] = static_cast<u16>(loader.byte_count);
+        stream_loader[stream] = static_cast<u8>(loader_index);
+        layout.stream_count++;
+    }
+    if (layout.stream_count == 0) {
+        stat_gs_declined++;
+        return false;
+    }
+
+    // The program: the VS's key (program, bools, inputs, semantic map) with the GS's.
+    using namespace Pica::Shader::Generator;
+    const PicaVSConfig config{regs, pica.vs_setup};
+    Cg::VSExtra extra{};
+    extra.default_regs = static_cast<u16>(~enabled_regs & 0xffffu);
+    extra.reg_components = reg_components;
+    const auto used_it = used_bools.find(config.state.program_hash);
+    if (used_it != used_bools.end()) {
+        extra.bool_mask = used_it->second;
+    } else {
+        extra.bool_mask = Cg::UsedBoolUniforms(pica.vs_setup);
+        used_bools.emplace(config.state.program_hash, extra.bool_mask);
+    }
+    for (u32 n = 0; n < 16; n++) {
+        extra.bools |= static_cast<u16>((pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n);
+    }
+    extra.bools &= extra.bool_mask;
+    const auto& gsr = regs.gs;
+    u64 key = Cg::VertexShaderKey(config, extra);
+    key = Common::HashCombine(key, pica.gs_setup.GetProgramCodeHash() ^
+                                       (pica.gs_setup.GetSwizzleDataHash() << 1));
+    key = Common::HashCombine(key, u64{gsr.main_offset.Value()} |
+                                       (u64{gsr.output_mask.Value()} << 16) |
+                                       (u64{regs.vs.output_mask.Value()} << 32) |
+                                       (u64{gsr.max_input_attribute_index.Value()} << 48) |
+                                       (u64{static_cast<u32>(regs.pipeline.triangle_topology.Value())} << 56));
+    key = Common::HashCombine(key, (u64{gsr.input_attribute_to_register_map_high} << 32) |
+                                       gsr.input_attribute_to_register_map_low);
+    key = Common::HashCombine(
+        key, u64{regs.pipeline.vs_outmap_total_minus_1_a.Value()} |
+                 (u64{static_cast<u32>(regs.pipeline.gs_config.mode.Value())} << 8) |
+                 (u64{regs.pipeline.variable_primitive.Value()} << 40) |
+                 (u64{gsr.input_to_uniform.Value()} << 48));
+    auto it = gs_programs.find(key);
+    if (it == gs_programs.end()) {
+        GsProgram program;
+        Usse::VsRequest request = MakeVsRequest(extra);
+        Usse::GsStage gs{};
+        gs.code = pica.gs_setup.GetProgramCode();
+        gs.swizzle = pica.gs_setup.GetSwizzleData();
+        gs.code_size =
+            std::min<u32>(pica.gs_setup.GetBiggestProgramSize(), Pica::MAX_PROGRAM_CODE_LENGTH);
+        const char* why = "";
+        std::string refusal;
+        if (BuildGsStage(regs, gs, request, &why)) {
+            Usse::GsResult result;
+            request.gs_result = &result;
+            u32 input_regs = 0;
+            const std::vector<u8> bytes = Usse::EmitVertexProgram(request, input_regs, &refusal, 1);
+            if (!bytes.empty()) {
+                program.shader = pipeline_cache->UseBuiltinShader(
+                    key, fmt::format("gv_{:016x}", key), bytes, input_regs);
+                program.uniform_rows = result.uniform_rows;
+                program.pattern = result.pattern;
+            }
+        } else {
+            refusal = why;
+        }
+        if (program.shader != nullptr && program.shader->failed) {
+            program.shader = nullptr;
+            refusal = "program failed";
+        }
+        LOG_INFO(Render, "hwgs: gv_{:016x} {} ({} corners/point, {} GS rows)", key,
+                 program.shader != nullptr ? "built" : fmt::format("refused: {}", refusal),
+                 program.pattern.size(), program.uniform_rows.size());
+        it = gs_programs.emplace(key, std::move(program)).first;
+    }
+    const GsProgram& program = it->second;
+    if (program.shader == nullptr || !program.shader->IsDone()) {
+        stat_gs_declined++;
+        return false;
+    }
+    layout.shader = program.shader;
+    for (u32 n = 0; n < candidate_count; n++) {
+        if ((program.shader->input_regs & (1u << candidates[n].first)) == 0) {
+            continue;
+        }
+        bool later = false;
+        for (u32 m = n + 1; m < candidate_count; m++) {
+            later |= candidates[m].first == candidates[n].first;
+        }
+        if (!later) {
+            layout.attributes[layout.attribute_count++] = candidates[n].second;
+        }
+    }
+    const u32 corner_stream = layout.stream_count++;
+    layout.strides[corner_stream] = 4;
+    layout.attributes[layout.attribute_count++] =
+        VertexAttribute{"gs_corner", 0, SCE_GXM_ATTRIBUTE_FORMAT_U8, 4,
+                        static_cast<u8>(corner_stream)};
+
+    // The expanded streams in the ring: each point's loader bytes once per pattern entry.
+    const u32 per_point = static_cast<u32>(program.pattern.size());
+    const u32 points = payload.num_vertices;
+    const u32 vertex_count = points * per_point;
+    if (per_point == 0 || vertex_count > MaxVerticesPerDraw) {
+        stat_gs_declined++;
+        return false;
+    }
+    std::array<u32, PipelineInfo::MaxStreams> stream_ring_offset{};
+    u32 total = 0;
+    for (u32 stream = 0; stream < layout.stream_count; stream++) {
+        stream_ring_offset[stream] = total;
+        total += Common::AlignUp(vertex_count * layout.strides[stream], 16);
+    }
+    total = Common::AlignUp<u32>(std::max<u32>(total, 1), sizeof(Pica::OutputVertex));
+    if (total > ring_size / 2) {
+        stat_gs_declined++;
+        return false;
+    }
+    u32 off;
+    {
+        std::scoped_lock lock{vertex_ring.mutex};
+        off = vertex_ring.TryAlloc(total);
+    }
+    for (u32 attempt = 0; off == VideoCore::VertexRing::FULL; attempt++) {
+        if (attempt == 64) {
+            stat_gs_declined++;
+            return false;
+        }
+        RingRetireBlocking();
+        std::scoped_lock lock{vertex_ring.mutex};
+        off = vertex_ring.TryAlloc(total);
+    }
+    hw_ring_end = std::max(hw_ring_end, vertex_ring.cursor);
+    u8* const base = vertex_ring.base + off;
+    const u8* const index_data = payload.arena + payload.layout.index_offset;
+    const u32 rows = payload.vertex_max - payload.vertex_min + 1;
+    for (u32 p = 0; p < points; p++) {
+        u32 vertex;
+        if (payload.is_indexed) {
+            vertex = payload.layout.ring
+                         ? reinterpret_cast<const u16*>(index_data)[p] + payload.vertex_min
+                     : payload.index_u16 ? reinterpret_cast<const u16*>(index_data)[p]
+                                         : index_data[p];
+        } else {
+            vertex = p + payload.vertex_offset;
+        }
+        const u32 row = std::min(vertex - payload.vertex_min, rows - 1);
+        for (u32 stream = 0; stream < corner_stream; stream++) {
+            const u32 stride = layout.strides[stream];
+            const u8* const src = payload.arena +
+                                  payload.layout.loader_offset[stream_loader[stream]] +
+                                  static_cast<std::size_t>(row) * stride;
+            u8* dst = base + stream_ring_offset[stream] +
+                      static_cast<std::size_t>(p) * per_point * stride;
+            for (u32 j = 0; j < per_point; j++, dst += stride) {
+                std::memcpy(dst, src, stride);
+            }
+        }
+        u8* corner = base + stream_ring_offset[corner_stream] + p * per_point * 4;
+        for (u32 j = 0; j < per_point; j++, corner += 4) {
+            const u32 c = program.pattern[j];
+            corner[0] = c == 0;
+            corner[1] = c == 1;
+            corner[2] = c == 2;
+            corner[3] = c == 3;
+        }
+    }
+
+    DrawSetup setup;
+    current_gs = &program;
+    const bool ready = BeginDraw(setup, layout, vertex_count);
+    current_gs = nullptr;
+    if (!ready) {
+        ReleaseDraw(setup);
+        DropDraw();
+        return true;
+    }
+    stat_draws++;
+    stat_gs_hw++;
+    stat_gs_points += points;
+    if (scenes_this_frame > 0 && scenes_this_frame <= MaxSceneRecords) {
+        scene_records[scenes_this_frame - 1].draws++;
+    }
+    SceGxmContext* context = Device().context;
+    {
+        const PhaseTimer draw_timer{time_draws, times.draw};
+        for (u32 stream = 0; stream < layout.stream_count; stream++) {
+            sceGxmSetVertexStream(context, stream, base + stream_ring_offset[stream]);
+        }
+        DrawTrace("hw gs draw");
+        sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
+                   identity_indices, vertex_count);
+    }
+    stat_vertices += vertex_count;
+    ring_scene_pos = std::max(ring_scene_pos, hw_ring_end);
+    stat_ring_peak = std::max(
+        stat_ring_peak,
+        static_cast<u32>(std::min<u64>(
+            hw_ring_end - vertex_ring.retired.load(std::memory_order_relaxed), ring_size)));
+    hw_ring_end = 0;
+    ReleaseDraw(setup);
+    return true;
+}
+
 void RasterizerGxm::FlushAll() {
     draw_epoch++;
     nondraw_epoch++;
@@ -4054,6 +4388,11 @@ void RasterizerGxm::EndFrame() {
             times = DrawTimes{};
             stat_guest_writes = stat_invalidates = stat_flushes = 0;
         }
+        if (stat_gs_hw != 0 || stat_gs_declined != 0) {
+            LOG_INFO(Render, "hwgs: {} draws on the GPU ({} points), {} declined", stat_gs_hw,
+                     stat_gs_points, stat_gs_declined);
+        }
+        stat_gs_hw = stat_gs_points = stat_gs_declined = 0;
         stat_hw_draws = stat_hw_refused = stat_scissor_free = 0;
         stat_lut_waits = 0;
         stat_frames = stat_draws = stat_vertices = stat_scenes = stat_skipped = stat_finishes =

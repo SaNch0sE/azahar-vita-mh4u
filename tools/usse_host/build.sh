@@ -13,3 +13,4 @@ FLAGS="-std=gnu++20 -O0 -g -w -I$A/src -I$A/externals/fmt/include -I$A/externals
 D=$(dirname "$0")
 g++ $FLAGS $D/fs_emit.cpp $U/fs_usse_gen.cpp $U/usse_ir.cpp $U/usse_encoder.cpp $U/gxp_writer.cpp -o fs_emit
 g++ $FLAGS $D/vs_emit.cpp $D/stub_flags.cpp $D/stub_log.cpp $U/vs_usse_gen.cpp $U/usse_ir.cpp $U/usse_encoder.cpp $U/gxp_writer.cpp -o vs_emit
+g++ $FLAGS $D/gs_emit.cpp $D/stub_flags.cpp $D/stub_log.cpp $U/vs_usse_gen.cpp $U/usse_ir.cpp $U/usse_encoder.cpp $U/gxp_writer.cpp -o gs_emit

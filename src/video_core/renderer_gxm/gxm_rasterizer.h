@@ -53,6 +53,7 @@ public:
     /// software shader on the mirror: a geometry shader, a loader layout this backend cannot
     /// stream, or a program the decompiler refused.
     bool AccelerateShippedDraw(const Pica::DrawPayload& payload) override;
+    bool AccelerateGsDraw(const Pica::DrawPayload& payload) override;
     void FlushAll() override;
     void FlushRegion(PAddr addr, u32 size) override;
     void InvalidateRegion(PAddr addr, u32 size) override;
@@ -187,6 +188,7 @@ public:
         /// The input registers no loader feeds, as uniforms; null where the program has none.
         std::array<UniformSlot, 16> default_regs{};
         bool any_default{};
+        UniformSlot gs_f{}; ///< a fused VS + GS program's resident GS rows
     };
     const VsUniforms& VsUniformsOf(Shader* vs);
 
@@ -339,6 +341,16 @@ private:
     /// Generated vertex programs by VertexShaderKey; null marks a configuration the
     /// decompiler refused.
     std::unordered_map<u64, Shader*> generated_vs;
+    /// Fused VS + GS programs (AccelerateGsDraw), by key; a null shader is a refusal.
+    struct GsProgram {
+        Shader* shader{};
+        std::vector<u8> uniform_rows;
+        std::vector<u8> pattern;
+    };
+    std::unordered_map<u64, GsProgram> gs_programs;
+    /// The fused program of the draw being set up, for UploadUniforms.
+    const GsProgram* current_gs{};
+    u32 stat_gs_hw{}, stat_gs_declined{}, stat_gs_points{};
     /// The second tier (gxm_shader_tier.h); null with the notier2 flag.
     std::unique_ptr<ShaderTier2> tier2;
     std::unique_ptr<ProgramDiskCache> program_cache;

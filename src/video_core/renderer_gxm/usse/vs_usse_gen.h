@@ -35,6 +35,34 @@ struct VsSemantic {
     uint8_t component;
 };
 
+/**
+ * A geometry shader in Point mode with one vertex per primitive, run in the same program
+ * after the vertex shader: each GPU vertex is one corner of the point's primitives. The VS
+ * outputs become the GS inputs; the GS runs straight-line, and its k-th EMIT ends the
+ * program for the vertex whose `gs_corner` attribute has lane k set (one-hot, U8), so the
+ * outputs are that emitted vertex's. A vertex reaching END without its emit (the GS culled
+ * the point) gets the position (0, 0, 0, 1): every corner the same point, nothing drawn.
+ * In this mode the request's num_outputs, output_map and semantics are the GS's.
+ */
+struct GsStage {
+    std::span<const uint32_t> code;
+    std::span<const uint32_t> swizzle;
+    uint32_t code_size;
+    uint32_t main_offset;
+    uint32_t vs_num_outputs;               ///< VS output attributes (vs_outmap_total)
+    std::array<uint32_t, 16> vs_output_map; ///< VS output register -> VS output attribute
+    std::array<uint8_t, 16> input_from;     ///< GS input register -> VS output attribute, 0xff none
+};
+
+/// What the emitter found out about the GS: the uniform rows it reads, in the order of the
+/// resident array `gs_uniforms_f`, and the corner order of its triangles (three corner
+/// numbers per triangle, as the primitive assembler would have produced them).
+struct GsResult {
+    std::vector<uint8_t> uniform_rows;
+    std::vector<uint8_t> pattern;
+    uint32_t corners = 0;
+};
+
 struct VsRequest {
     std::span<const uint32_t> code;    ///< the PICA program code
     std::span<const uint32_t> swizzle; ///< the operand descriptors
@@ -49,6 +77,8 @@ struct VsRequest {
     uint16_t bools;
     uint16_t bool_mask;
     std::array<uint8_t, 16> reg_components;
+    const GsStage* gs = nullptr; ///< set: a fused VS + GS program (see GsStage)
+    GsResult* gs_result = nullptr;
 };
 
 /// `level` 2 runs the IR's optimising passes (the second tier).

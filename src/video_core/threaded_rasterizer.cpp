@@ -616,7 +616,16 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
     const auto op = [this, shipment] {
         ApplyShipment(mirror_pica, *shipment);
         const u32 watch = GuestWatch::Read();
-        if (!shipment->draw.hw || !real->AccelerateShippedDraw(shipment->draw)) {
+        // Geometry-shader draws are never offered to the hardware vertex path; the GPU takes
+        // the ones a fused VS + GS program covers (AccelerateGsDraw), the rest shade here.
+        bool drawn = false;
+        if (shipment->draw.hw) {
+            drawn = real->AccelerateShippedDraw(shipment->draw);
+        } else if (mirror_pica.regs.internal.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes &&
+                   mirror_pica.GetPrimitiveAssembler().IsEmpty()) {
+            drawn = real->AccelerateGsDraw(shipment->draw);
+        }
+        if (!drawn) {
             const u64 sw_start = Common::PipelineStats::StatUs();
             RunSoftwareDraw(*shipment);
             Common::PipelineStats::sw_shaded_us.fetch_add(

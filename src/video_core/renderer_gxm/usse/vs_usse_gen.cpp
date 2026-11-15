@@ -257,6 +257,9 @@ private:
         bool cc = false;  ///< a conditional form reads the condition codes
     };
     void ScanProgram();
+    void ScanGs();
+    void EmitGsStage();
+    void EmitGsEmit();
     void MarkReachable(uint32_t begin, uint32_t end);
     void NoteSource(const SourceRegister& reg, uint32_t addr, const Swizzle& swz);
     void NoteDest(const DestRegister& reg, uint8_t mask);
@@ -331,6 +334,30 @@ private:
 
     const VsRequest& req;
     Scan scan;
+    /// The code the instruction emitters read: the VS's, or the GS's in its stage.
+    std::span<const uint32_t> code{req.code};
+    std::span<const uint32_t> swz_data{req.swizzle};
+    /// Fused VS + GS (req.gs): which stage is being emitted, and where its outputs go.
+    bool gs_stage = false;
+    const std::array<uint32_t, 16>* stage_map = &req.output_map;
+    uint32_t stage_outputs = req.num_outputs;
+    std::array<std::optional<Quad>, 16>* stage_quads = &attr_quad;
+    std::array<std::optional<Quad>, 16> vs_attr_quad{}; ///< the VS outputs (GS inputs)
+    std::array<std::optional<Quad>, 16> gs_temp_quad{};
+    Scan gs_scan;
+    std::vector<bool> gs_reachable;
+    std::array<int, 96> gs_uniform_sa{}; ///< GS uniform -> resident SA, or -1
+    std::vector<uint8_t> gs_rows;
+    int corner_pa = -1;
+    int final_end = -1;
+    uint32_t emit_count = 0;
+    struct EmitState {
+        uint32_t vertex_id = 0;
+        bool prim = false;
+        bool winding = false;
+    } emit_state;
+    std::array<int, 3> emit_slots{-1, -1, -1};
+    std::vector<uint8_t> pattern;
     std::vector<bool> reachable;
     Ir::Builder e;   ///< the primary program
     Ir::Builder sec; ///< the secondary program
@@ -424,8 +451,8 @@ void VertexEmitter::NoteDest(const DestRegister& reg, uint8_t mask) {
         scan.temps |= static_cast<uint16_t>(1u << (index & 15));
         scan.temp_written[index & 15] |= mask;
     } else if (reg.GetRegisterType() == RegisterType::Output) {
-        const uint32_t attr = req.output_map[index & 15];
-        if (attr < req.num_outputs) {
+        const uint32_t attr = (*stage_map)[index & 15];
+        if (attr < stage_outputs) {
             scan.attrs_written |= static_cast<uint16_t>(1u << attr);
         }
     }
@@ -558,6 +585,14 @@ void VertexEmitter::Layout() {
         pa_inputs = static_cast<uint8_t>(pa_inputs + 4);
     }
 
+    if (req.gs != nullptr) {
+        // The corner selector, one-hot in four components.
+        corner_pa = pa_inputs;
+        gxp.attributes.push_back({"gs_corner", pa_inputs});
+        gxp.attrib_pa_regs |= 0xfull << pa_inputs;
+        pa_inputs = static_cast<uint8_t>(pa_inputs + 4);
+    }
+
     // Resident uniforms: the depth mapping, the input defaults, the integer uniforms.
     gxp.uniforms.push_back({"flip_viewport", SaFlipViewport, 1, 1});
     gxp.uniforms.push_back({"depth_scale", SaDepthScale, 1, 1});
@@ -574,6 +609,15 @@ void VertexEmitter::Layout() {
         int_sa = static_cast<int>(resident);
         gxp.uniforms.push_back({"uniforms_i", resident, 4, 4});
         resident += 16;
+    }
+    if (req.gs != nullptr && !gs_rows.empty()) {
+        // The GS's float uniforms, only the rows it reads, resident.
+        for (std::size_t i = 0; i < gs_rows.size(); i++) {
+            gs_uniform_sa[gs_rows[i]] = static_cast<int>(resident + 4 * i);
+        }
+        gxp.uniforms.push_back(
+            {"gs_uniforms_f", resident, 4, static_cast<uint32_t>(gs_rows.size())});
+        resident += static_cast<uint32_t>(4 * gs_rows.size());
     }
     gxp.uniform_floats = resident;
 
@@ -617,6 +661,16 @@ void VertexEmitter::Layout() {
     for (uint32_t t = 0; t < 16; t++) {
         if ((scan.temps & (1u << t)) != 0) {
             temp_quad[t] = AllocateQuad();
+        }
+    }
+    if (req.gs != nullptr) {
+        for (uint32_t k = 0; k < req.gs->vs_num_outputs && k < 16; k++) {
+            vs_attr_quad[k] = AllocateQuad();
+        }
+        for (uint32_t t = 0; t < 16; t++) {
+            if ((gs_scan.temps & (1u << t)) != 0) {
+                gs_temp_quad[t] = AllocateQuad();
+            }
         }
     }
 }
@@ -678,6 +732,13 @@ Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Sw
     const Mod mod = negate ? Mod::Neg : Mod::None;
     switch (reg.GetRegisterType()) {
     case RegisterType::Input:
+        if (gs_stage) {
+            const uint8_t attr = req.gs->input_from[index & 15];
+            if (attr >= 16 || !vs_attr_quad[attr]) {
+                Refuse("GS input without a VS output");
+            }
+            return {*vs_attr_quad[attr], swz, mod};
+        }
         if (input_pa[index & 15] >= 0) {
             return {{Bank::PrimAttr, static_cast<uint8_t>(input_pa[index & 15])}, swz, mod};
         }
@@ -723,6 +784,12 @@ Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Sw
         return {*temp_quad[t], swz, mod};
     }
     case RegisterType::FloatUniform: {
+        if (gs_stage) {
+            if (addr != 0 || (index & 127) >= 96 || gs_uniform_sa[index & 127] < 0) {
+                Refuse("GS uniform without a resident place");
+            }
+            return {{Bank::SecAttr, static_cast<uint8_t>(gs_uniform_sa[index & 127])}, swz, mod};
+        }
         const Reg ptr = DataReg(DataPtr);
         const Reg dst = Reg::V(load_quad);
         if (addr == 0) {
@@ -769,9 +836,9 @@ std::optional<Quad> VertexEmitter::Dest(const DestRegister& reg) {
     const uint32_t index = static_cast<uint32_t>(reg.GetIndex());
     switch (reg.GetRegisterType()) {
     case RegisterType::Output: {
-        const uint32_t attr = req.output_map[index & 15];
-        if (attr < req.num_outputs && attr_quad[attr]) {
-            return attr_quad[attr];
+        const uint32_t attr = (*stage_map)[index & 15];
+        if (attr < stage_outputs && (*stage_quads)[attr]) {
+            return (*stage_quads)[attr];
         }
         return std::nullopt; // an output nothing reads
     }
@@ -1202,7 +1269,7 @@ void VertexEmitter::EmitMad(const Instruction& instr, const SwizzlePattern& swz)
 }
 
 uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
-    const Instruction instr = {req.code[offset]};
+    const Instruction instr = {code[offset]};
     const OpCode::Info info = instr.opcode.Value().GetInfo();
     // A hoisted instruction is emitted into the secondary program, its temporary
     // destination an SA home; the first primary read of that temporary copies the home
@@ -1246,8 +1313,8 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         hoisted_count++;
     };
     if (info.type == OpCode::Type::Arithmetic) {
-        const SwizzlePattern swz{req.swizzle[instr.common.operand_desc_id]};
-        if (hoist_at[offset] == 3) {
+        const SwizzlePattern swz{swz_data[instr.common.operand_desc_id]};
+        if (offset < hoist_at.size() && hoist_at[offset] == 3) {
             // The whole register from a prefetched uniform: the uniform's quad is its home.
             const uint32_t t = static_cast<uint32_t>(instr.common.dest.Value().GetIndex()) & 15;
             const int n = AliasUniform(instr, swz);
@@ -1278,7 +1345,7 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         if (op != OpCode::Id::MAD && op != OpCode::Id::MADI) {
             Refuse("unhandled multiply-add instruction");
         }
-        const SwizzlePattern swz{req.swizzle[instr.mad.operand_desc_id]};
+        const SwizzlePattern swz{swz_data[instr.mad.operand_desc_id]};
         if (hoist) {
             begin_hoist(instr.mad.dest.Value());
             EmitMad(instr, swz);
@@ -1293,6 +1360,21 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
     const auto& flow = instr.flow_control;
     switch (instr.opcode.Value()) {
     case OpCode::Id::NOP:
+        return offset + 1;
+
+    case OpCode::Id::SETEMIT:
+        if (!gs_stage) {
+            Refuse("setemit outside a geometry shader");
+        }
+        emit_state = {instr.setemit.vertex_id.Value(), instr.setemit.prim_emit.Value() != 0,
+                      instr.setemit.winding.Value() != 0};
+        return offset + 1;
+
+    case OpCode::Id::EMIT:
+        if (!gs_stage) {
+            Refuse("emit outside a geometry shader");
+        }
+        EmitGsEmit();
         return offset + 1;
 
     case OpCode::Id::END: {
@@ -1312,6 +1394,9 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
     }
 
     case OpCode::Id::JMPC: {
+        if (gs_stage && Instruction{code[flow.dest_offset]}.opcode.Value() != OpCode::Id::END) {
+            Refuse("GS jump to anything but END");
+        }
         const int target = LabelAt(flow.dest_offset);
         CondBranch(flow, target, true);
         return offset + 1;
@@ -1857,6 +1942,249 @@ void VertexEmitter::PlanHoist() {
     walk(req.main_offset, req.code_size);
 }
 
+// The geometry stage (req.gs)
+
+void VertexEmitter::ScanGs() {
+    const GsStage& gs = *req.gs;
+    const uint32_t extent = std::min<uint32_t>(gs.code_size, static_cast<uint32_t>(gs.code.size()));
+    if (gs.main_offset >= extent || gs.vs_num_outputs == 0 || gs.vs_num_outputs > 16) {
+        Refuse("GS program extent");
+    }
+    const auto saved_reach = std::move(reachable);
+    reachable.assign(extent, false);
+    {
+        // MarkReachable reads req.code; walk the GS by hand instead.
+        std::vector<std::pair<uint32_t, uint32_t>> work{{gs.main_offset, extent}};
+        while (!work.empty()) {
+            auto [begin, end] = work.back();
+            work.pop_back();
+            for (uint32_t offset = begin; offset < end && offset < extent; offset++) {
+                if (reachable[offset]) {
+                    break;
+                }
+                reachable[offset] = true;
+                const Instruction instr = {gs.code[offset]};
+                const auto& flow = instr.flow_control;
+                const auto op = instr.opcode.Value();
+                if (op == OpCode::Id::END) {
+                    break;
+                }
+                if (op == OpCode::Id::JMPC) {
+                    work.push_back({flow.dest_offset, extent});
+                } else if (op == OpCode::Id::CALL) {
+                    work.push_back({flow.dest_offset, flow.dest_offset + flow.num_instructions});
+                } else if (op == OpCode::Id::IFC) {
+                    work.push_back({flow.dest_offset, flow.dest_offset + flow.num_instructions});
+                } else if (op == OpCode::Id::LOOP || op == OpCode::Id::JMPU ||
+                           op == OpCode::Id::IFU || op == OpCode::Id::CALLU ||
+                           op == OpCode::Id::CALLC || op == OpCode::Id::BREAKC) {
+                    Refuse("GS control flow other than forward jumps to END and IFC");
+                }
+            }
+        }
+    }
+    gs_reachable = std::move(reachable);
+    reachable = saved_reach;
+    std::array<bool, 96> used{};
+    const auto note = [&](const SourceRegister& reg, uint32_t addr, const Swizzle& swz) {
+        const uint32_t index = static_cast<uint32_t>(reg.GetIndex());
+        uint8_t lanes = 0;
+        for (const Ch ch : swz) {
+            if (ch <= Ch::W) {
+                lanes |= static_cast<uint8_t>(1u << static_cast<int>(ch));
+            }
+        }
+        switch (reg.GetRegisterType()) {
+        case RegisterType::Input:
+            if (gs.input_from[index & 15] >= gs.vs_num_outputs) {
+                Refuse("GS reads an input no VS output feeds");
+            }
+            break;
+        case RegisterType::Temporary:
+            gs_scan.temps |= static_cast<uint16_t>(1u << (index & 15));
+            gs_scan.temp_init[index & 15] |=
+                static_cast<uint8_t>(lanes & ~gs_scan.temp_written[index & 15]);
+            break;
+        case RegisterType::FloatUniform:
+            if (addr != 0 || (index & 127) >= 96) {
+                Refuse("GS uniform read through an address register");
+            }
+            used[index & 127] = true;
+            break;
+        default:
+            break;
+        }
+    };
+    const auto dest = [&](const DestRegister& reg, uint8_t mask) {
+        const uint32_t index = static_cast<uint32_t>(reg.GetIndex());
+        if (reg.GetRegisterType() == RegisterType::Temporary) {
+            gs_scan.temps |= static_cast<uint16_t>(1u << (index & 15));
+            gs_scan.temp_written[index & 15] |= mask;
+        } else if (reg.GetRegisterType() == RegisterType::Output) {
+            const uint32_t attr = req.output_map[index & 15];
+            if (attr < req.num_outputs) {
+                gs_scan.attrs_written |= static_cast<uint16_t>(1u << attr);
+            }
+        }
+    };
+    uint32_t emits = 0;
+    for (uint32_t offset = 0; offset < extent; offset++) {
+        if (!gs_reachable[offset]) {
+            continue;
+        }
+        const Instruction instr = {gs.code[offset]};
+        const OpCode::Info info = instr.opcode.Value().GetInfo();
+        if (info.type == OpCode::Type::Arithmetic) {
+            const SwizzlePattern swz = {gs.swizzle[instr.common.operand_desc_id]};
+            const bool inverted = (info.subtype & OpCode::Info::SrcInversed) != 0;
+            note(instr.common.GetSrc1(inverted), !inverted * instr.common.address_register_index,
+                 SelectorSwizzle(swz, 1));
+            note(instr.common.GetSrc2(inverted), inverted * instr.common.address_register_index,
+                 SelectorSwizzle(swz, 2));
+            const auto op = instr.opcode.Value().EffectiveOpCode();
+            if (op == OpCode::Id::MOVA) {
+                Refuse("GS address register");
+            }
+            if (op == OpCode::Id::CMP) {
+                gs_scan.cc = true;
+            } else {
+                dest(instr.common.dest.Value(), DestMask(swz));
+            }
+        } else if (info.type == OpCode::Type::MultiplyAdd) {
+            const SwizzlePattern swz = {gs.swizzle[instr.mad.operand_desc_id]};
+            const bool inverted = instr.opcode.Value().EffectiveOpCode() == OpCode::Id::MADI;
+            note(instr.mad.GetSrc1(inverted), 0, SelectorSwizzle(swz, 1));
+            note(instr.mad.GetSrc2(inverted), !inverted * instr.mad.address_register_index,
+                 SelectorSwizzle(swz, 2));
+            note(instr.mad.GetSrc3(inverted), inverted * instr.mad.address_register_index,
+                 SelectorSwizzle(swz, 3));
+            dest(instr.mad.dest.Value(), DestMask(swz));
+        } else if (instr.opcode.Value() == OpCode::Id::EMIT) {
+            emits++;
+        } else if (instr.opcode.Value() == OpCode::Id::IFC ||
+                   instr.opcode.Value() == OpCode::Id::JMPC) {
+            gs_scan.cc = true;
+        }
+    }
+    if (emits == 0 || emits > 4) {
+        Refuse("GS emit count");
+    }
+    for (uint32_t n = 0; n < 96; n++) {
+        if (used[n]) {
+            gs_rows.push_back(static_cast<uint8_t>(n));
+        }
+    }
+}
+
+void VertexEmitter::EmitGsEmit() {
+    // The corner numbering is static: every emit must run once, in order, on every path.
+    if (region_depth != 0 || loop_depth != 0) {
+        Refuse("GS emit inside a conditional region");
+    }
+    if (emit_state.vertex_id > 2) {
+        Refuse("GS emit vertex id");
+    }
+    const uint32_t k = emit_count++;
+    if (k >= 4) {
+        Refuse("GS emits more than four vertices");
+    }
+    emit_slots[emit_state.vertex_id] = static_cast<int>(k);
+    if (emit_state.prim) {
+        if (emit_slots[0] < 0 || emit_slots[1] < 0 || emit_slots[2] < 0) {
+            Refuse("GS primitive with an unset vertex");
+        }
+        // As PrimitiveAssembler with the Shader topology: (1, 0, 2) when winding is set.
+        if (emit_state.winding) {
+            pattern.insert(pattern.end(), {static_cast<uint8_t>(emit_slots[1]),
+                                           static_cast<uint8_t>(emit_slots[0]),
+                                           static_cast<uint8_t>(emit_slots[2])});
+        } else {
+            pattern.insert(pattern.end(), {static_cast<uint8_t>(emit_slots[0]),
+                                           static_cast<uint8_t>(emit_slots[1]),
+                                           static_cast<uint8_t>(emit_slots[2])});
+        }
+    }
+    // This vertex is emit k: its outputs are the ones written so far.
+    const Quad corner{Bank::PrimAttr, static_cast<uint8_t>(corner_pa)};
+    out->Vec(VecOp::Mul, {I0, 0xf}, {corner.Base(), XYZW}, ConstOne);
+    out->Test(Cond::Gt, 2, {I0}, static_cast<uint8_t>(k), ConstHalf, true);
+    Branch(Pred::P2, final_end);
+}
+
+void VertexEmitter::EmitGsStage() {
+    const GsStage& gs = *req.gs;
+    gs_stage = true;
+    code = gs.code;
+    swz_data = gs.swizzle;
+    // The GS's own temporaries; nothing of the VS's hoist applies to them.
+    temp_quad = gs_temp_quad;
+    hoist_at.assign(std::max<std::size_t>(hoist_at.size(), gs.code_size), 0);
+    hoist_flush.clear();
+    hoist_sa.fill(-1);
+    hoist_swz.fill(XYZW);
+    hoist_alias.fill(false);
+    hoist_lanes.fill(0);
+    hoist_uncopied.fill(0);
+    stage_map = &req.output_map;
+    stage_outputs = req.num_outputs;
+    stage_quads = &attr_quad;
+    // Outputs the GS never writes, and temporaries read before written: (0, 0, 0, 1).
+    for (uint32_t k = 0; k < req.num_outputs && k < 16; k++) {
+        if ((gs_scan.attrs_written & (1u << k)) == 0 && attr_quad[k]) {
+            e.MoveInternal({attr_quad[k]->Pair(0), 0x3}, {Reg::C(0), XYZW});
+            e.MoveInternal({attr_quad[k]->Pair(1), 0x3}, ConstZeroOne);
+        }
+    }
+    for (uint32_t t = 0; t < 16; t++) {
+        if (!temp_quad[t] || gs_scan.temp_init[t] == 0) {
+            continue;
+        }
+        const uint8_t m = gs_scan.temp_init[t];
+        if (m & 0x3) {
+            e.MoveInternal({temp_quad[t]->Pair(0), static_cast<uint8_t>(m & 0x3)},
+                           {Reg::C(0), XYZW});
+        }
+        if (m & 0xc) {
+            e.MoveInternal({temp_quad[t]->Pair(1), static_cast<uint8_t>(m >> 2)}, ConstZeroOne);
+        }
+    }
+    if (gs_scan.cc) {
+        e.Test(Cond::Ne, 0, ConstZero, 0, ConstZero, true);
+        e.Test(Cond::Ne, 1, ConstZero, 0, ConstZero, true);
+    }
+    const int cull = NewLabel();
+    end_label = cull; // END without this vertex's emit
+    contexts.push_back({gs.main_offset, gs.code_size, {}});
+    EmitRange(gs.main_offset, gs.code_size);
+    for (const auto& [at, label] : contexts.back().labels) {
+        if (!Bound(label)) {
+            Refuse("jump into GS code main never reaches");
+        }
+    }
+    contexts.pop_back();
+    if (pattern.empty()) {
+        Refuse("GS emits no primitive");
+    }
+    Bind(cull);
+    // Culled (or never emitted): the same point for every corner, so no area.
+    for (int i = 0; i < 4; i++) {
+        const VsSemantic& m = req.semantics[SemPositionX + i];
+        if (m.attribute < req.num_outputs && m.attribute < 16 && attr_quad[m.attribute]) {
+            e.MoveInternal({attr_quad[m.attribute]->Pair(m.component / 2),
+                            static_cast<uint8_t>(1u << (m.component & 1))},
+                           i == 3 ? ConstOne : ConstZero);
+        }
+    }
+    if (req.gs_result != nullptr) {
+        req.gs_result->uniform_rows = gs_rows;
+        req.gs_result->pattern = pattern;
+        req.gs_result->corners = emit_count;
+    }
+    gs_stage = false;
+    code = req.code;
+    swz_data = req.swizzle;
+}
+
 // Prologue and epilogue
 
 void VertexEmitter::Prologue() {
@@ -1885,10 +2213,10 @@ void VertexEmitter::Prologue() {
         }
     }
     // Output attributes the program never assigns: (0, 0, 0, 1), as the wrappers write it.
-    for (uint32_t k = 0; k < req.num_outputs && k < 16; k++) {
-        if ((scan.attrs_written & (1u << k)) == 0 && attr_quad[k]) {
-            e.MoveInternal({attr_quad[k]->Pair(0), 0x3}, {Reg::C(0), XYZW});
-            e.MoveInternal({attr_quad[k]->Pair(1), 0x3}, ConstZeroOne);
+    for (uint32_t k = 0; k < stage_outputs && k < 16; k++) {
+        if ((scan.attrs_written & (1u << k)) == 0 && (*stage_quads)[k]) {
+            e.MoveInternal({(*stage_quads)[k]->Pair(0), 0x3}, {Reg::C(0), XYZW});
+            e.MoveInternal({(*stage_quads)[k]->Pair(1), 0x3}, ConstZeroOne);
         }
     }
     // Temporaries read before they are written start at (0, 0, 0, 1) too.
@@ -2053,6 +2381,12 @@ std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
     if (req.code.size() < req.code_size || req.main_offset >= req.code_size) {
         Refuse("program extent");
     }
+    if (req.gs != nullptr) {
+        stage_map = &req.gs->vs_output_map;
+        stage_outputs = req.gs->vs_num_outputs;
+        stage_quads = &vs_attr_quad;
+        ScanGs();
+    }
     ScanProgram();
     input_regs = scan.inputs;
     Layout();
@@ -2065,6 +2399,10 @@ std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
     e.Phas(true);
     e.Nop();
     Prologue();
+    final_end = end_label;
+    if (req.gs != nullptr) {
+        end_label = NewLabel(); // the VS's END continues into the GS
+    }
     contexts.push_back({req.main_offset, req.code_size, {}});
     EmitRange(req.main_offset, req.code_size);
     for (const auto& [at, label] : contexts.back().labels) {
@@ -2073,6 +2411,11 @@ std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
         }
     }
     contexts.pop_back();
+    if (req.gs != nullptr) {
+        Bind(end_label);
+        EmitGsStage();
+        end_label = final_end;
+    }
     // The hoist takes SA quads past the prefetch as it emits (fresh homes, section
     // "hoist"), and the header's secondary register count decides what the hardware
     // allocates: Layout's count left them undeclared, which Vita3K did not mind and the
