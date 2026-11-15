@@ -521,7 +521,7 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
                         &res_cache.GetSurface(scene_fb->color_id) == &dest;
     SceGxmRenderTarget* target = nullptr;
     if (!merged) {
-        target = BlitTargetFor(dest.width, dest.height);
+        target = BlitTargetFor(dest.SX(dest.width), dest.SX(dest.height));
         if (target == nullptr) {
             return false;
         }
@@ -625,11 +625,15 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
     NoteScenePipeline(info.vertex != nullptr ? info.vertex->name.c_str() : "?",
                       info.fragment != nullptr ? info.fragment->name.c_str() : "?");
 
+    // The destination in its storage texels (render scale); the source is sampled by
+    // normalised coordinates, which the scale does not change.
+    const auto drect = dest.SRect(blit.dst_rect);
+    const u32 sdst_w = std::max(drect.GetWidth(), 1u), sdst_h = std::max(drect.GetHeight(), 1u);
     sceGxmSetViewportEnable(context, SCE_GXM_VIEWPORT_ENABLED);
-    sceGxmSetViewport(context, blit.dst_rect.left + dst_w * 0.5f, dst_w * 0.5f,
-                      blit.dst_rect.bottom + dst_h * 0.5f, dst_h * 0.5f, 0.0f, 1.0f);
-    sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_OUTSIDE, blit.dst_rect.left,
-                        blit.dst_rect.bottom, blit.dst_rect.right - 1, blit.dst_rect.top - 1);
+    sceGxmSetViewport(context, drect.left + sdst_w * 0.5f, sdst_w * 0.5f,
+                      drect.bottom + sdst_h * 0.5f, sdst_h * 0.5f, 0.0f, 1.0f);
+    sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_OUTSIDE, drect.left, drect.bottom,
+                        drect.left + sdst_w - 1, drect.bottom + sdst_h - 1);
     sceGxmSetCullMode(context, SCE_GXM_CULL_NONE);
     sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
     sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
@@ -943,7 +947,9 @@ void RasterizerGxm::DrawPendingColourClears() {
     SceGxmContext* context = Device().context;
     const SceGxmProgramParameter* colour_param = fill_fragment_shader->Param("fill_colour");
     constexpr u32 QuadVertices = 6;
-    for (const auto& clear : pending) {
+    for (const auto& guest_clear : pending) {
+        Surface::PendingColourClear clear = guest_clear;
+        clear.rect = surface.SRect(guest_clear.rect); // storage texels
         const u32 w = clear.rect.GetWidth();
         const u32 h = clear.rect.GetHeight();
         const u32 offset = (blit_ring_used + 15u) & ~15u;
@@ -1290,17 +1296,20 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
     // Viewport and draw rectangle from the helper, in the surface's own space (a framebuffer
     // may be a sub-rectangle of a bigger cached surface). Rows are stored bottom-up, so the
     // y scale is positive: NDC +1 lands on the highest row index, the top of the picture.
+    // A scaled framebuffer (render scale) takes all of these in storage texels.
     const auto vp = helper.Viewport();
-    const float viewport[6] = {static_cast<float>(vp.x) + vp.width * 0.5f, vp.width * 0.5f,
-                               static_cast<float>(vp.y) + vp.height * 0.5f, vp.height * 0.5f,
-                               0.0f, 1.0f};
+    const float vx = fb->SXf(static_cast<float>(vp.x)), vy = fb->SXf(static_cast<float>(vp.y));
+    const float vw = fb->SXf(static_cast<float>(vp.width)),
+                vh = fb->SXf(static_cast<float>(vp.height));
+    const float viewport[6] = {vx + vw * 0.5f, vw * 0.5f, vy + vh * 0.5f, vh * 0.5f, 0.0f, 1.0f};
     if (!state_cache.valid || std::memcmp(state_cache.vp, viewport, sizeof(viewport)) != 0) {
         std::memcpy(state_cache.vp, viewport, sizeof(viewport));
         sceGxmSetViewportEnable(context, SCE_GXM_VIEWPORT_ENABLED);
         sceGxmSetViewport(context, viewport[0], viewport[1], viewport[2], viewport[3],
                           viewport[4], viewport[5]);
     }
-    const auto draw = helper.DrawRect();
+    auto draw = helper.DrawRect();
+    draw = {fb->SX(draw.left), fb->SX(draw.top), fb->SX(draw.right), fb->SX(draw.bottom)};
     const u32 fbw = fb->Width();
     const u32 fbh = fb->Height();
     const u32 cx0 = std::min(draw.left, fbw), cx1 = std::min(draw.right, fbw);
@@ -1314,7 +1323,10 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
                             clip[3]);
     }
     // Scissor uniforms (the fragment program's discard test), window-relative like GL's.
-    const auto [scissor_x1, scissor_y2, scissor_x2, scissor_y1] = helper.Scissor();
+    auto [guest_sx1, guest_sy2, guest_sx2, guest_sy1] = helper.Scissor();
+    const auto ss = [fb](s32 v) { return v <= 0 ? v : static_cast<s32>(fb->SX(static_cast<u32>(v))); };
+    const s32 scissor_x1 = ss(guest_sx1), scissor_y2 = ss(guest_sy2), scissor_x2 = ss(guest_sx2),
+              scissor_y1 = ss(guest_sy1);
     // Most titles leave the scissor test on with the whole screen as its rectangle. The
     // region clip above already confines the draw to that, and a kill in the program
     // costs the tiler its hidden-surface removal (the phase before the kill runs for every
@@ -4470,7 +4482,9 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
     }
     res_cache.GetSurface(surface_id).presented = true;
     if (out_rect != nullptr) {
-        *out_rect = {x0, y0, x0 + src_params.width, y0 + src_params.height};
+        // In the texture's storage texels (render scale): the frontend normalises by them.
+        *out_rect = {surface.SX(x0), surface.SX(y0), surface.SX(x0 + src_params.width),
+                     surface.SX(y0 + src_params.height)};
     }
     display_surfaces[screen & 1] = surface_id;
     display_textures[screen & 1] = *surface.Texture();

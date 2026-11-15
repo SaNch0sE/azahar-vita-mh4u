@@ -214,6 +214,15 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().fxaa = value;
                GxmRenderer::SaveVideoOptions();
            });
+    choice("Render scale",
+           "Renders the game above the 3DS's 400x240 (applies on the next launch). Each step "
+           "costs a lot of GPU time: expect well under 30 fps above 1x.",
+           true, {"1x", "1.25x", "1.5x", "1.75x", "2x"},
+           [] { return static_cast<int>(GxmRenderer::Video().scale_q) - 4; },
+           [](int value) {
+               GxmRenderer::Video().scale_q = static_cast<u32>(4 + (value < 0 || value > 4 ? 0 : value));
+               GxmRenderer::SaveVideoOptions();
+           });
     choice("Region", "The console region reported to the title.", false,
            {"Auto", "Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"},
            [] { return Settings::values.region_value.GetValue() + 1; },

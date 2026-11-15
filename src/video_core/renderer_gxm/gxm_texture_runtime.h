@@ -447,7 +447,26 @@ private:
     SceGxmDepthStencilSurface ds_surface{};
     bool is_color_target{};
     bool is_depth_target{};
+
+public:
+    /// Internal render scale of the storage, in quarters (4 = 1x): render-target-capable
+    /// surfaces (colour and depth types) are stored at RenderScaleQ(), textures at 1x. The
+    /// cache and every rectangle it hands over stay in guest texels; SX converts one to
+    /// storage texels where memory is addressed or rendered into.
+    u32 scale_q = 4;
+    [[nodiscard]] u32 SX(u32 v) const noexcept {
+        return v * scale_q / 4;
+    }
+    [[nodiscard]] bool Scaled() const noexcept {
+        return scale_q != 4;
+    }
+    [[nodiscard]] Common::Rectangle<u32> SRect(const Common::Rectangle<u32>& r) const noexcept {
+        return {SX(r.left), SX(r.top), SX(r.right), SX(r.bottom)};
+    }
 };
+
+/// The render scale (VideoOptions::scale_q, quarters), read once: it applies from launch.
+u32 RenderScaleQ();
 
 class Framebuffer : public VideoCore::FramebufferParams {
 public:
@@ -515,6 +534,16 @@ private:
     const u8* color_data{};
     u32 width{}, height{};
     bool has_color{}, has_depth{};
+
+public:
+    /// The attached surfaces' render scale (quarters); Width/Height are storage texels.
+    u32 scale_q = 4;
+    [[nodiscard]] float SXf(float v) const noexcept {
+        return v * static_cast<float>(scale_q) * 0.25f;
+    }
+    [[nodiscard]] u32 SX(u32 v) const noexcept {
+        return v * scale_q / 4;
+    }
 };
 
 /// GXM has no sampler objects: the filters and address modes live in the texture control

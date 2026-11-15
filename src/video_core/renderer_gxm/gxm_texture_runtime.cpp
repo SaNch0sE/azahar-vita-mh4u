@@ -15,6 +15,7 @@
 #include "video_core/renderer_gxm/gxm_shader_util.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/gxm_texture_runtime.h"
+#include "video_core/renderer_gxm/gxm_video_options.h"
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
@@ -780,7 +781,7 @@ void TextureRuntime::ClearNow(Surface& surface, const VideoCore::TextureClear& c
     Sync(&surface, nullptr, "clear");
     const GxmFormat& format = surface.Format();
     const u32 value = PackClear(format, surface.pixel_format, clear.value);
-    const auto& rect = clear.texture_rect;
+    const auto rect = surface.SRect(clear.texture_rect); // storage texels
     const u32 width = rect.GetWidth();
     const u32 height = rect.GetHeight();
     if (width == 0 || height == 0) {
@@ -910,9 +911,48 @@ bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
             return true;
         }
     }
+    if (source.scale_q != dest.scale_q) {
+        // Storage of different scales: a resampling blit (GPU, else the CPU's nearest).
+        for (const auto& copy : copies) {
+            if (copy.extent.width == 0 || copy.extent.height == 0) {
+                continue;
+            }
+            const VideoCore::TextureBlit blit{
+                .src_level = copy.src_level,
+                .dst_level = copy.dst_level,
+                .src_layer = copy.src_layer,
+                .dst_layer = copy.dst_layer,
+                .src_rect = Common::Rectangle<u32>{copy.src_offset.x,
+                                                   copy.src_offset.y + copy.extent.height,
+                                                   copy.src_offset.x + copy.extent.width,
+                                                   copy.src_offset.y},
+                .dst_rect = Common::Rectangle<u32>{copy.dst_offset.x,
+                                                   copy.dst_offset.y + copy.extent.height,
+                                                   copy.dst_offset.x + copy.extent.width,
+                                                   copy.dst_offset.y},
+            };
+            if (!BlitTextures(source, dest, blit)) {
+                return false;
+            }
+        }
+        return true;
+    }
     Sync(&source, &dest, "CopyTextures");
     const SceGxmTransferFormat raw = sf.bytes_per_pixel == 2 ? TrRaw16 : TrRaw32;
-    for (const auto& copy : copies) {
+    for (const auto& guest_copy : copies) {
+        if (guest_copy.extent.width == 0 || guest_copy.extent.height == 0) {
+            continue;
+        }
+        // Same scale at both ends: the copy in storage texels.
+        VideoCore::TextureCopy copy = guest_copy;
+        copy.src_offset.x = source.SX(guest_copy.src_offset.x);
+        copy.src_offset.y = source.SX(guest_copy.src_offset.y);
+        copy.dst_offset.x = dest.SX(guest_copy.dst_offset.x);
+        copy.dst_offset.y = dest.SX(guest_copy.dst_offset.y);
+        copy.extent.width =
+            source.SX(guest_copy.src_offset.x + guest_copy.extent.width) - copy.src_offset.x;
+        copy.extent.height =
+            source.SX(guest_copy.src_offset.y + guest_copy.extent.height) - copy.src_offset.y;
         if (copy.extent.width == 0 || copy.extent.height == 0) {
             continue;
         }
@@ -941,9 +981,19 @@ bool TextureRuntime::CopyTextures(Surface& source, Surface& dest,
 }
 
 bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
-                                  const VideoCore::TextureBlit& blit) {
+                                  const VideoCore::TextureBlit& guest_blit) {
     if (!source.HasMemory() || !dest.HasMemory()) {
         return false;
+    }
+    // The transfer and CPU paths below work in storage texels; the GPU blit (blit_hook)
+    // takes the guest rectangles and scales its own destination.
+    VideoCore::TextureBlit blit = guest_blit;
+    blit.src_rect = source.SRect(guest_blit.src_rect);
+    blit.dst_rect = dest.SRect(guest_blit.dst_rect);
+    const bool scaled = source.Scaled() || dest.Scaled();
+    if (scaled && blit_hook && blit_hook(source, dest, guest_blit)) {
+        stat_gpu_blits++;
+        return true;
     }
     const GxmFormat& sf = source.Format();
     const GxmFormat& df = dest.Format();
@@ -996,7 +1046,7 @@ bool TextureRuntime::BlitTextures(Surface& source, Surface& dest,
             TransferWait();
             return true;
         }
-    } else if (!same_bits && blit_hook && blit_hook(source, dest, blit)) {
+    } else if (!same_bits && !scaled && blit_hook && blit_hook(source, dest, guest_blit)) {
         // A format change: no PTLA path exists, so the fragment pipeline converts it.
         stat_gpu_blits++;
         return true;
@@ -1119,7 +1169,7 @@ Surface::Surface(Surface&& o) noexcept
       in_cdram{o.in_cdram}, stride_texels{o.stride_texels}, alloc_size{o.alloc_size},
       level_offsets{o.level_offsets}, texture{o.texture}, color_surface{o.color_surface},
       ds_surface{o.ds_surface}, is_color_target{o.is_color_target},
-      is_depth_target{o.is_depth_target} {
+      is_depth_target{o.is_depth_target}, scale_q{o.scale_q} {
     o.data = nullptr;
 }
 
@@ -1139,6 +1189,7 @@ Surface& Surface::operator=(Surface&& o) noexcept {
         ds_surface = o.ds_surface;
         is_color_target = o.is_color_target;
         is_depth_target = o.is_depth_target;
+        scale_q = o.scale_q;
         o.data = nullptr;
     }
     return *this;
@@ -1161,8 +1212,18 @@ void SetFilters(SceGxmTexture& texture, SceGxmTextureFilter min_filter,
     sceGxmTextureSetMipFilter(&texture, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
 }
 
+u32 RenderScaleQ() {
+    static const u32 q = [] {
+        const u32 v = Video().scale_q;
+        return v >= 4 && v <= 8 ? v : 4u;
+    }();
+    return q;
+}
+
 void Surface::Allocate() {
     const bool depth = IsDepthType(type);
+    scale_q = (type == SurfaceType::Color || depth) ? RenderScaleQ() : 4u;
+    const u32 width = SX(this->width), height = SX(this->height); // storage texels
     stride_texels = PitchFor(width, depth);
     // Levels are stored one after the other, each with its own implied pitch; only level 0
     // is exposed to the sampler until GXM's linear mip layout is verified on console.
@@ -1316,7 +1377,7 @@ void Surface::Release() {
 }
 
 u32 Surface::LevelStrideTexels(u32 level) const noexcept {
-    return PitchFor(std::max(width >> level, 1u), IsDepthType(type));
+    return PitchFor(std::max(SX(width) >> level, 1u), IsDepthType(type));
 }
 
 u8* Surface::RowPointer(u32 level, u32 y, u32 x) const noexcept {
@@ -1372,6 +1433,34 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
     }
     runtime->stat_upload_bytes += row_bytes * h;
     const u8* src = staging.mapped.data();
+    if (Scaled()) {
+        // Guest texels into scaled storage, nearest: each storage row and texel takes the
+        // guest texel it lies in.
+        const auto srect = SRect(rect);
+        std::vector<u8> row(row_bytes);
+        u32 converted = ~0u;
+        for (u32 sy = srect.bottom; sy < srect.top; sy++) {
+            const u32 gy = std::min(sy * 4 / scale_q, rect.top - 1) - rect.bottom;
+            if (gy != converted) {
+                const u8* srow = src + static_cast<std::size_t>(gy) * staging_row;
+                if (pixel_format == PixelFormat::D24S8) {
+                    RotateWordsRight8(reinterpret_cast<u32*>(row.data()),
+                                      reinterpret_cast<const u32*>(srow), w);
+                } else if (pixel_format == PixelFormat::D16) {
+                    D16ToS8D24(srow, row.data(), w);
+                } else {
+                    std::memcpy(row.data(), srow, row_bytes);
+                }
+                converted = gy;
+            }
+            u8* dst = RowPointer(upload.texture_level, sy, srect.left);
+            for (u32 sx = srect.left; sx < srect.right; sx++) {
+                const u32 gx = std::min(sx * 4 / scale_q, rect.right - 1) - rect.left;
+                std::memcpy(dst + (sx - srect.left) * bpp, row.data() + gx * bpp, bpp);
+            }
+        }
+        return;
+    }
     for (u32 y = 0; y < h; y++) {
         u8* dst = RowPointer(upload.texture_level, rect.bottom + y, rect.left);
         if (pixel_format == PixelFormat::D24S8) {
@@ -1386,7 +1475,8 @@ void Surface::Upload(const VideoCore::BufferTextureCopy& upload,
 }
 
 std::span<u8> Surface::DirectUploadSpan(const VideoCore::BufferTextureCopy& upload, u32 bytes) {
-    if (data == nullptr || pixel_format == PixelFormat::D24S8 || pixel_format == PixelFormat::D16) {
+    if (data == nullptr || pixel_format == PixelFormat::D24S8 || pixel_format == PixelFormat::D16 ||
+        Scaled()) {
         return {};
     }
     const auto& rect = upload.texture_rect;
@@ -1432,6 +1522,30 @@ void Surface::Download(const VideoCore::BufferTextureCopy& download,
     const u32 row_bytes = w * bpp;
     runtime->stat_downloads++;
     runtime->stat_download_bytes += row_bytes * h;
+    if (Scaled()) {
+        // Scaled storage into guest texels, nearest: each guest texel reads the storage texel
+        // at its start.
+        std::vector<u8> row(row_bytes);
+        u8* out = staging.mapped.data();
+        for (u32 y = 0; y < h; y++) {
+            const u8* srow = RowPointer(download.texture_level, SX(rect.bottom + y), 0);
+            for (u32 x = 0; x < w; x++) {
+                std::memcpy(row.data() + x * bpp, srow + SX(rect.left + x) * bpp, bpp);
+            }
+            if (pixel_format == PixelFormat::D24S8) {
+                RotateWordsLeft8(reinterpret_cast<u32*>(out),
+                                 reinterpret_cast<const u32*>(row.data()), w);
+            } else if (pixel_format == PixelFormat::D16) {
+                S8D24ToD16(row.data(), out, w);
+                out += w * 2;
+                continue;
+            } else {
+                std::memcpy(out, row.data(), row_bytes);
+            }
+            out += row_bytes;
+        }
+        return;
+    }
     // Through the transfer unit when the format has a raw transfer size and the level fits
     // the download buffer (see its declaration); the CPU reads the copy, not the surface.
     const u8* first_row = RowPointer(download.texture_level, rect.bottom, rect.left);
@@ -1494,8 +1608,10 @@ Framebuffer::Framebuffer(TextureRuntime&, const VideoCore::FramebufferParams& pa
     if (any == nullptr) {
         return;
     }
-    width = std::max(any->width >> (color != nullptr ? color_level : depth_level), 1u);
-    height = std::max(any->height >> (color != nullptr ? color_level : depth_level), 1u);
+    // Storage texels: the render target covers the scaled surface.
+    scale_q = any->scale_q;
+    width = std::max(any->SX(any->width) >> (color != nullptr ? color_level : depth_level), 1u);
+    height = std::max(any->SX(any->height) >> (color != nullptr ? color_level : depth_level), 1u);
     if (color != nullptr && color->IsColorTarget() && color_level == 0) {
         color_surface = *color->ColorSurface();
         color_data = color->Data();
@@ -1553,7 +1669,8 @@ Framebuffer::Framebuffer(Framebuffer&& o) noexcept
     : VideoCore::FramebufferParams{o}, render_targets{o.render_targets},
       render_target_count{o.render_target_count}, next_render_target{o.next_render_target},
       color_surface{o.color_surface}, ds_surface{o.ds_surface}, color_data{o.color_data},
-      width{o.width}, height{o.height}, has_color{o.has_color}, has_depth{o.has_depth} {
+      width{o.width}, height{o.height}, has_color{o.has_color}, has_depth{o.has_depth},
+      scale_q{o.scale_q} {
     o.render_targets = {};
     o.render_target_count = 0;
 }
@@ -1572,6 +1689,7 @@ Framebuffer& Framebuffer::operator=(Framebuffer&& o) noexcept {
         height = o.height;
         has_color = o.has_color;
         has_depth = o.has_depth;
+        scale_q = o.scale_q;
         o.render_targets = {};
         o.render_target_count = 0;
     }
