@@ -459,3 +459,7 @@ Measured (release unless noted):
 Next when resumed: fix the return direction in `trans.sh` (check the minimap/screenshot after each run), then measure area 2 at the spot after one and two round trips against the fresh-load numbers; if worse, diag `timedraw scenetime` after the round trip (GPU vs render thread, shader cache/surface counts, heap) and hand the logs to Fable.
 
 **Round trips (2026-11-15, after the reboot):** `vita-tests/trans.sh` (now kept in `~/Documents/Personal/grarakAzahar/vita-tests`, outside the repo; running Down 6 s crosses both ways). Route 2 -> 3 -> 2 -> 3 -> 2, release: every stay held 30 shown for 20 s, area 2 after two round trips included. Each crossing dips for 1-2 s to 24-26 shown with the game's own fps falling too (loading on the guest side). No slowdown builds up across transitions in this build.
+
+## Area crossings: mod files opened per read (2026-11-15)
+
+Release counters `fs <ms> <reads> <KiB>` (guest File::Read through a backend without cached reads, which is LayeredFS with the Heavenfall mod). Standing: 4-5 reads, 3-6 ms a second. Crossing area 2 -> 3: 59, 164, 144, 30, 296, 134, 63 ms a second, with game fps 28, 24, 24, 30, 22, 29, 29 - one second spent 296 ms on three 8 KiB reads. `LayeredFS::ReadFile` opened the replacement file for every read. With eight replacement files kept open (least recently used goes first): one second of 100-130 ms (1.3-1.6 MB of real data) at 25-27 fps, then 30. TuizaVita 0.3B moves these reads to a worker thread instead; the remaining ~0.1 s could still go that way.

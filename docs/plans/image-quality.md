@@ -46,7 +46,7 @@ The other Vita port (github.com/TutuiFC/TuizaVita-3ds-emu, cloned to ~/Documents
 Source: tag v0.3B (branch vita-0.1.7) of github.com/TutuiFC/TuizaVita-3ds-emu; the earlier review only saw `main` (0.1B).
 - Mipmaps: done (commit ac796f726, kill switch `nomipmaps`). Slot 1: distant textures smoother, GPU about the same.
 - 0.75x render scale: added to the menu; untested on the console, like 1.25x-2x.
-- RomFS/LayeredFS reads on a worker thread: next; first time the reads during an area crossing (the 1-2 s dip).
+- RomFS/LayeredFS reads: timed; the dip was LayeredFS opening the mod's replacement file per read. Fixed by keeping them open (crossing ~7 s of dips -> 1 s). A worker thread for the remaining ~0.1 s is optional.
 - Condition-variable wait wrap for the remaining polling waits: small, later.
 - Z-order (swizzled) textures: TuizaVita pairs it with mipmaps; not taken yet (every copy/blit/download path would need an unswizzle).
 
