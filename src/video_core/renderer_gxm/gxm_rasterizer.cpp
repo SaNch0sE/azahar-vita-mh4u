@@ -3542,6 +3542,14 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
 
     DrawSetup setup;
     prepass_mode = PrepassEligible() ? 1 : 0;
+    // Diag (Fable's step 0): the eligible draws dropped, so the world is drawn with full hidden
+    // surface removal and nothing hidden by grass.
+    static const bool skip_eligible = GxmFlag("ptskipop");
+    if (skip_eligible && prepass_mode == 1) {
+        prepass_mode = 0;
+        DropDraw();
+        return true;
+    }
     if (!BeginDraw(setup, layout, payload.num_vertices)) {
         // Consumed, not drawn: a program still compiling, a target the cache has no surface
         // for. The software shader would only reach the same refusal after shading.
