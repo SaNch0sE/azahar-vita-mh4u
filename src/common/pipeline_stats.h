@@ -181,6 +181,10 @@ inline std::atomic<u32> skipsig_presents{0};
 inline std::atomic<u32> skipsig_backlog{0};
 inline std::atomic<u32> skipsig_arena{0};
 inline std::atomic<u32> skipsig_armed{0};
+/// Guest file reads (FS File::Read): time spent, count and KiB, per second.
+inline std::atomic<u32> fs_read_us{0};
+inline std::atomic<u32> fs_reads{0};
+inline std::atomic<u32> fs_read_kib{0};
 /// Presents the render thread dropped because a newer one was queued behind them.
 inline std::atomic<u32> presents_superseded{0};
 /// Draws dropped because they were for the hidden bottom screen (single-screen layout).

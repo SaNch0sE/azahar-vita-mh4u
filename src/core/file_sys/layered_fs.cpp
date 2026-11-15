@@ -487,6 +487,27 @@ std::size_t LayeredFS::GetSize() const {
     return metadata.size() + current_data_offset;
 }
 
+FileUtil::IOFile* LayeredFS::ReplacementFile(const std::string& path) {
+    OpenReplacement* oldest = &open_replacements[0];
+    for (auto& entry : open_replacements) {
+        if (entry.file.IsOpen() && entry.path == path) {
+            entry.last_use = ++replacement_uses;
+            return &entry.file;
+        }
+        if (!entry.file.IsOpen() || entry.last_use < oldest->last_use) {
+            oldest = &entry;
+        }
+    }
+    oldest->file = FileUtil::IOFile(path, "rb");
+    if (!oldest->file.IsOpen()) {
+        oldest->path.clear();
+        return nullptr;
+    }
+    oldest->path = path;
+    oldest->last_use = ++replacement_uses;
+    return &oldest->file;
+}
+
 std::size_t LayeredFS::ReadFile(std::size_t offset, std::size_t length, u8* buffer) {
     ASSERT_MSG(offset + length <= GetSize(), "Out of bound");
 
@@ -522,10 +543,11 @@ std::size_t LayeredFS::ReadFile(std::size_t offset, std::size_t length, u8* buff
             romfs->ReadFile(relocation.original_offset + relative_offset, to_read,
                             buffer + read_size);
         } else if (relocation.type == 1) { // replace
-            FileUtil::IOFile replace_file(relocation.replace_file_path, "rb");
-            if (replace_file) {
-                replace_file.Seek(relative_offset, SEEK_SET);
-                replace_file.ReadBytes(buffer + read_size, to_read);
+            std::scoped_lock lock{replacement_mutex};
+            FileUtil::IOFile* replace_file = ReplacementFile(relocation.replace_file_path);
+            if (replace_file != nullptr) {
+                replace_file->Seek(relative_offset, SEEK_SET);
+                replace_file->ReadBytes(buffer + read_size, to_read);
             } else {
                 LOG_ERROR(Service_FS, "Could not open replacement file for {}",
                           current->second->path);

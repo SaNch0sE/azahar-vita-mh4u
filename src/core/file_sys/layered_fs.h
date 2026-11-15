@@ -4,7 +4,9 @@
 
 #pragma once
 
+#include <array>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -15,6 +17,7 @@
 #include <boost/serialization/string.hpp>
 #include "common/common_types.h"
 #include "common/swap.h"
+#include "common/file_util.h"
 #include "core/file_sys/romfs_reader.h"
 
 namespace FileSys {
@@ -119,6 +122,20 @@ private:
     std::unordered_map<std::string, Directory*> directory_path_map;
     std::map<u64, File*> data_offset_map; // assigned data offset -> file
     std::vector<u8> metadata;             // Includes header, hash table and metadata
+
+    /// Replacement files kept open between reads: opening one on the PS Vita's card costs
+    /// tens of milliseconds, and a mod's file is read a few KiB at a time, so an open per
+    /// read held the emulation thread for 60-300 ms a second while MH4U crossed areas
+    /// (2026-11-15). Least recently used goes first. Not serialized.
+    struct OpenReplacement {
+        std::string path;
+        FileUtil::IOFile file;
+        u64 last_use = 0;
+    };
+    std::array<OpenReplacement, 8> open_replacements;
+    u64 replacement_uses = 0;
+    std::mutex replacement_mutex;
+    FileUtil::IOFile* ReplacementFile(const std::string& path);
 
     // Used for rebuilding header
     std::vector<u32_le> directory_hash_table;

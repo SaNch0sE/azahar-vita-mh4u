@@ -5,6 +5,7 @@
 #include <boost/serialization/unique_ptr.hpp>
 #include "common/archives.h"
 #include "common/logging/log.h"
+#include "common/pipeline_stats.h"
 #include "core/core.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/file_backend.h"
@@ -85,7 +86,12 @@ void File::Read(Kernel::HLERequestContext& ctx) {
         auto& buffer = rp.PopMappedBuffer();
         IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
         std::unique_ptr<u8[]> data = std::make_unique_for_overwrite<u8[]>(length);
+        const u64 read_t0 = Common::PipelineStats::NowUs();
         const auto read = backend->Read(offset, length, data.get());
+        Common::PipelineStats::fs_read_us.fetch_add(
+            static_cast<u32>(Common::PipelineStats::NowUs() - read_t0), std::memory_order_relaxed);
+        Common::PipelineStats::fs_reads.fetch_add(1, std::memory_order_relaxed);
+        Common::PipelineStats::fs_read_kib.fetch_add(length >> 10, std::memory_order_relaxed);
         if (read.Failed()) {
             rb.Push(read.Code());
             rb.Push<u32>(0);
