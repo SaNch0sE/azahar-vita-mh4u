@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 #include "common/common_types.h"
+#include "common/pipeline_stats.h"
 #include "video_core/pica/draw_payload.h"
 
 namespace Pica {
@@ -92,7 +93,15 @@ public:
             return false;
         }
         const auto it = volatility.find(key);
-        return it == volatility.end() || it->second < 2;
+        if (it == volatility.end() || it->second.count < 2) {
+            return true;
+        }
+        // Volatility expires: a key quiet for VolatileExpiryUs is given another chance.
+        if (Common::PipelineStats::NowUs() - it->second.last_us > VolatileExpiryUs) {
+            volatility.erase(it);
+            return true;
+        }
+        return false;
     }
 
     /// Room for `bytes` in the pool, or nullptr when it is full (the caller waits for the GPU
@@ -175,8 +184,7 @@ public:
                 }
             }
             watched_count.store(static_cast<u32>(watched_pages.size()), std::memory_order_relaxed);
-            u8& v = volatility[it->first];
-            v = v < 255 ? v + 1 : v;
+            NoteInvalidated(it->first);
             stat_invalidations++;
             it = entries.erase(it);
         }
@@ -215,9 +223,10 @@ public:
     /// key is treated as volatile (its pages never stay armed: hot, or rewritten every frame).
     void NoteUnarmedMiss(u64 key) {
         std::scoped_lock lock{mutex};
-        u8& v = volatility[key];
-        if (++unarmed[key] >= 3 && v < 2) {
-            v = 2;
+        Volatility& v = volatility[key];
+        if (++unarmed[key] >= 3 && v.count < 2) {
+            v.count = 2;
+            v.last_us = Common::PipelineStats::NowUs();
         }
     }
     [[nodiscard]] u32 InvalidationSeq() const {
@@ -277,7 +286,27 @@ private:
     std::array<Recent, RecentRanges> recent{};
     std::unordered_map<u64, u8> unarmed;
     std::unordered_map<u64, Entry> entries;
-    std::unordered_map<u64, u8> volatility;
+    /// How often a key's sources were rewritten. Two invalidations within VolatileWindowUs make
+    /// it volatile (dynamic data rewritten every frame); farther apart they restart the count.
+    /// Counting them for good made every key whose memory an area load reuses volatile for the
+    /// rest of the session: MH4U lost the cache's hits after the third area crossing (hit rate
+    /// 85% -> 30%, GX thread 350 -> 850 ms a second, game 30 -> 25 fps; 2026-11-15). Only a
+    /// state load, which resets everything, brought it back.
+    struct Volatility {
+        u8 count = 0;
+        u64 last_us = 0;
+    };
+    static constexpr u64 VolatileWindowUs = 2'000'000;
+    static constexpr u64 VolatileExpiryUs = 10'000'000;
+    void NoteInvalidated(u64 key) {
+        Volatility& v = volatility[key];
+        const u64 now = Common::PipelineStats::NowUs();
+        v.count = (v.last_us != 0 && now - v.last_us < VolatileWindowUs)
+                      ? static_cast<u8>(v.count < 255 ? v.count + 1 : v.count)
+                      : u8{1};
+        v.last_us = now;
+    }
+    std::unordered_map<u64, Volatility> volatility;
     std::unordered_map<uintptr_t, u32> watched_pages;
     u8* pool = nullptr;
     u32 pool_size = 0;

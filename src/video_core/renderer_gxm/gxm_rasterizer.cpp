@@ -3,6 +3,10 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#ifdef __vita__
+#include <malloc.h>
+#include <psp2/kernel/clib.h>
+#endif
 #include <unordered_map>
 #include "common/vita_data_dir.h"
 #include <map>
@@ -4664,6 +4668,39 @@ void RasterizerGxm::EndFrame() {
     if (logtex_frames_left > 0) {
         logtex_frames_left--;
     }
+#ifdef __vita__
+    // Health line (release too), every 300 frames: what a long session accumulates - the
+    // surface cache, the GPU memory pools, shaders and pipelines, the heap - to read a
+    // slowdown that builds up over play (and that a fresh state load does not show)
+    // against what grew. Cheap: one walk over the surface slots every ten seconds.
+    if (frame_index % 300 == 0) {
+        u32 surfaces = 0, targets = 0;
+        u64 surface_bytes = 0;
+        res_cache.ForEachSurface([&](VideoCore::SurfaceId, Surface& surface) {
+            surfaces++;
+            surface_bytes += surface.AllocSize();
+            if (surface.IsColorTarget() || surface.IsDepthTarget()) {
+                targets++;
+            }
+        });
+        const auto memory = pipeline_cache->MemoryStats();
+        const auto heap = mallinfo();
+        sceClibPrintf("[mh4u] health f%u: surfaces %u (%u targets) %u KiB, %u sentenced, "
+                      "cdram %u/%u KiB, mapped %u/%u KiB, shaders %u+%u, pipelines %u, "
+                      "heap %u/%u KiB, pending frees %u\n",
+                      frame_index, surfaces, targets, static_cast<u32>(surface_bytes / 1024),
+                      static_cast<u32>(res_cache.SentencedCount()),
+                      static_cast<u32>(runtime.CdramPool().Used() / 1024),
+                      static_cast<u32>(runtime.CdramPool().Reserved() / 1024),
+                      static_cast<u32>(runtime.MappedPool().Used() / 1024),
+                      static_cast<u32>(runtime.MappedPool().Reserved() / 1024),
+                      static_cast<u32>(pipeline_cache->ShaderCount()),
+                      static_cast<u32>(memory.retired_shaders),
+                      static_cast<u32>(memory.pipelines), static_cast<u32>(heap.uordblks / 1024),
+                      static_cast<u32>(heap.arena / 1024),
+                      static_cast<u32>(runtime.PendingFreeCount()));
+    }
+#endif
     // flushlist: copy these regions back to guest memory at every frame end. Native execution
     // never tells the cache when the guest CPU reads memory a surface was rendered into, so a
     // title that reads back GPU output (an 8x8 brightness target for exposure, say) reads
