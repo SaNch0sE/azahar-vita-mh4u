@@ -489,3 +489,33 @@ User report: slowdown when the gathering icon appears, deeper when "... obtained
 Every vertex program writes TEXCOORD7 = (z * 255/256 + w/512, w/2, 0, w) (o27-30; output descriptor 31 registers, TEXCOORD7 four wide). Fog programs read the strip non-dependently from it, projected by w (exactly the coordinate the shader used to compute from the fragment's depth), on the COLOR0 descriptor as the SDK's compiled imgui_f does; the texel arrives in pa4-7 before the program runs and fog no longer needs the Position input. Flipped fog bakes the strip reversed. GXP details learnt from the SDK programs in src/citra_vita/shaders and Vita3K's reader: descriptor low nibble = TEXCOORD index of the query (0xF none), 0x100/0x200 = xy / xy over w, 0x800 set, size bits 6-7 = result registers - 1, component_info 0x30 = float result; texunit nibble 1 = non-dependent; program flag 0x800; non-dependent samplers take no data-container words.
 
 Slot 1 open field, diag scenetime: ~32.7 ms with it, ~33.7-34.3 without; release 26-27 -> 28 shown. Screenshots match. Kill switch `nofogquery` (flag or `ux0:data/mh4u/nofogquery`).
+
+## Out of memory in long sessions; reading the slowdowns (2026-11-15)
+
+**Crash.** A normal session near a herd ended in `std::bad_alloc`: in-use heap 212 -> 230 MiB in
+~6000 frames while surfaces, shaders and pipelines stayed flat. A sampling heap profile
+(`ux0:data/mh4u/heapprof`, `src/citra_vita/heap_prof.cpp`) named `triangle_record->push_back`
+in the GS draw memo: its generations were capped at 400 entries but not by size, and monster
+GS draws are 100-300 KiB each (~18 MiB in 90 s). Now 3 MiB per generation and no entry over
+1 MiB (`gm` on the speed line). The vertex cache's volatility/unarmed maps were bounded too.
+
+**Partition slack.** The heap is one fixed 240 MiB memblock; thread stacks and GPU blocks come
+from what is left of the game partition, which is very little. Adding ~470 KiB of static tables
+(.bss) froze the game ~40 s into a slot-1 run; keep large tables on the heap.
+
+**New release diagnostics.** `[mh4u] cpu`: CPU ms each named thread ran, `wait s/b/r/a`
+(GX thread blocked: pre-shade ring, render-queue brake, vertex ring, arenas), `ps u/s/w/l`
+(pre-shade used/stolen/waited, local ms), `memo hits/misses`. `gx` on the speed line is wall
+time, so read it with these. `ux0:data/mh4u/gxprof` turns on the GX-thread EmuProf.
+
+**Menus that open by themselves** (Hunter Search, Gathering Hall notice) spoil long scripted
+runs: there the render thread shades ~6000 stolen GS sprite draws a second (CPU ~950 ms/s), the
+worker is saturated on the rest, and the GX thread waits ~500 ms/s on the queue brake: 21-22 fps.
+Ships per frame ~600 vs ~190 in play. Always check the end screenshot.
+
+**Monster slowdown in play** (user session): same draws (~450) and ships (~190) per frame as the
+fast save state, but GX wall 650-900 ms/s. Not reproduced by scripts. Next: a play session with
+the `cpu`/`wait` line to tell waiting from work. Fable's plan (cheaper GS misses, memo keys on the
+uniform rows a program reads, no yield-spin, AddTriangles span, HLE of the three quad programs)
+is gated on that. `hwgs` in the calm part of slot 1: GX 330 vs 350 ms, render 540 vs 595 ms,
+fps unchanged.
