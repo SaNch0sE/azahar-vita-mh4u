@@ -8,8 +8,8 @@ Gameplay (GPU-bound, ~30-31 ms of 33.3):
 2. Non-dependent texture reads (G3/G4, docs/plans/gameplay-headroom.md): 1-2.5 ms; one-day spike on the fog strip first.
 3. Remaining exact fragment trims (constant specular for one light, direct alpha compare, LUT row from the upload): 0.5-1.5 ms.
 4. Per-texture minimum-alpha census for unblended GREATER 0/5/30 tests: 1-3 ms where they apply; census first.
-5. Stall recorder for the rare one-second drops to ~13-15 fps.
-6. Worker-thread file reads for the last ~0.1 s of an area crossing.
+5. Stall recorder for the rare one-second drops to ~13-15 fps. **Done 2026-11-15** (release `[mh4u] stall` lines).
+6. Worker-thread file reads for the last ~0.1 s of an area crossing. **Done 2026-11-15** (reads >= 64 KiB; kill switch `syncreads`).
 7. Vertex output trimming, depth-store skip, uniform write lists: 0.3-1.5 ms each.
 Menus and quest counter (GX-thread-bound, ~880 ms/s):
 8. GX shipping trims (menu plan Phase 2): 40-70 ms/s, ~1-2 fps.
