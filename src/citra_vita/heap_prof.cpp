@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <new>
 #include <psp2/kernel/clib.h>
 
@@ -51,7 +52,10 @@ struct Site {
 bool g_on = false;
 /// This file's own code (operator new, Sample...), skipped by the stack scan.
 std::uintptr_t g_self_lo = 0, g_self_hi = 0;
-std::atomic_flag g_lock = ATOMIC_FLAG_INIT;
+// A blocking mutex, not a spinlock: every thread's delete takes it, and on the Vita a
+// higher-priority thread spinning on a core starves the lower-priority holder there (the first
+// spinlock version froze the game, and the console's network with it).
+std::mutex g_lock;
 PtrSlot g_ptrs[PtrSlots];
 Site g_sites[SiteSlots];
 std::size_t g_ptr_used = 0;
@@ -59,13 +63,7 @@ std::atomic<std::int64_t> g_total{0};
 thread_local std::int64_t t_until_sample = SamplePeriod;
 
 struct Lock {
-    Lock() {
-        while (g_lock.test_and_set(std::memory_order_acquire)) {
-        }
-    }
-    ~Lock() {
-        g_lock.clear(std::memory_order_release);
-    }
+    std::scoped_lock<std::mutex> lock{g_lock};
 };
 
 std::size_t PtrHash(std::uintptr_t p) {
