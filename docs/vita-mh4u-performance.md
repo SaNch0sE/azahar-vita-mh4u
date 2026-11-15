@@ -519,3 +519,21 @@ the `cpu`/`wait` line to tell waiting from work. Fable's plan (cheaper GS misses
 uniform rows a program reads, no yield-spin, AddTriangles span, HLE of the three quad programs)
 is gated on that. `hwgs` in the calm part of slot 1: GX 330 vs 350 ms, render 540 vs 595 ms,
 fps unchanged.
+
+## The real cause of "slower after playing a while" (2026-11-15, fixed)
+
+Release timers (`ux0:data/mh4u/timedraw`: `rtime`, `rt ops`, `psw` lines) narrowed it down:
+near an active herd after normal play the render thread was saturated (~950 ms/s), ~650 ms of
+it in software GS draws; with duplicate shading of draws the worker was already running removed
+(it now waits; `preshadesteal` restores the old behaviour) the pre-shade worker was the limit,
+spending ~30 us a vertex in the VS and ~42 us in the GS, against ~10 and ~18 from a save state
+of the same spot. The shader JIT (A32) compiled all 4096 program words for every program
+(hundreds of KiB), never frees its 4 MiB code arena, and interprets every shader compiled after
+it fills; a long session filled it, a fresh boot and state load did not. Now it compiles only
+the span the entry point reaches (keyed by entry point): 2-15 KiB a program, ~616 KiB of the
+arena after a long session with new areas, `interp 0`, and the herd scene after play at
+30/29-30 fps (GX ~340 ms, no queue waits). One GS program (entry 88, conditional jumps) still
+compiles ~307 KiB: the reachability is deliberately conservative around jumps.
+
+Every compile is logged (`[mh4u] shader JIT ...`, with the arena use), an arena that fills is
+reported, and the `rt` line counts interpreted shader runs (`interp`).

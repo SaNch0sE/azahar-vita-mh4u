@@ -18,6 +18,7 @@
 #if defined(__vita__)
 #include <mutex>
 #include <psp2/kernel/clib.h>
+#include <cstdio>
 #include "common/pipeline_stats.h"
 #include <psp2/kernel/sysmem.h>
 #elif defined(__linux__)
@@ -930,10 +931,77 @@ void JitShader::FindReturnOffsets() {
 }
 
 std::pair<u32, u32> JitShader::FindReachable(u32 entry) {
-    // Every PICA control transfer has a static target, so this is exact: fall-through, both
-    // ways of a conditional jump, a call's body and its return (the instruction after the
-    // CALL), both blocks of an IF and what follows them, a LOOP's body and what follows it.
-    // The last word is an implicit END.
+    // Every PICA control transfer has a static target, so this over-approximates safely:
+    // fall-through, both ways of a conditional jump, a call's body and its return (the
+    // instruction after the CALL), both blocks of an IF, a LOOP's body and what follows it.
+    // The code after an IF is left out only when neither block can fall out of it - the flat
+    // version always took it, and from one MH4U shader whose IF blocks both END it ran
+    // through the rest of the 4096 words (307 KiB). The last word is an implicit END.
+    constexpr u32 Last = MAX_PROGRAM_CODE_LENGTH - 1;
+    const auto at = [&](u32 pc) { return Instruction{(*program_code)[pc]}; };
+    // Any jump's or call's target, anywhere in the program: a block holding one is taken to
+    // fall out.
+    std::bitset<MAX_PROGRAM_CODE_LENGTH> jump_target;
+    for (u32 pc = 0; pc < Last; pc++) {
+        const Instruction instr = at(pc);
+        const auto op = instr.opcode.Value();
+        if (op == OpCode::Id::JMPC || op == OpCode::Id::JMPU || op == OpCode::Id::CALL ||
+            op == OpCode::Id::CALLC || op == OpCode::Id::CALLU) {
+            if (instr.flow_control.dest_offset < MAX_PROGRAM_CODE_LENGTH) {
+                jump_target[instr.flow_control.dest_offset] = true;
+            }
+        }
+    }
+    // Whether control entering [begin, end) at `begin` can reach `end` the way the compiler
+    // lays the block out. Conservative: a jump in it, or into it, says yes.
+    const auto falls_out = [&](auto& self, u32 begin, u32 end, u32 depth) -> bool {
+        if (depth > 32) {
+            return true;
+        }
+        u32 pc = begin;
+        while (pc < end) {
+            if (pc >= Last) {
+                return false; // implicit END
+            }
+            if (jump_target[pc]) {
+                return true;
+            }
+            const Instruction instr = at(pc);
+            const u32 dest = instr.flow_control.dest_offset;
+            const u32 num = instr.flow_control.num_instructions;
+            switch (instr.opcode.Value()) {
+            case OpCode::Id::END:
+                return false;
+            case OpCode::Id::JMPC:
+            case OpCode::Id::JMPU:
+                return true;
+            case OpCode::Id::IFU:
+            case OpCode::Id::IFC: {
+                if (dest <= pc) {
+                    return true;
+                }
+                const bool out = self(self, pc + 1, dest, depth + 1) ||
+                                 (num == 0 || self(self, dest, dest + num, depth + 1));
+                if (!out) {
+                    return false;
+                }
+                pc = dest + num;
+                break;
+            }
+            case OpCode::Id::LOOP:
+                if (dest < pc) {
+                    return true;
+                }
+                pc = dest + 1;
+                break;
+            default:
+                pc++;
+                break;
+            }
+        }
+        return true;
+    };
+
     reachable.reset();
     std::vector<u32> work{entry};
     u32 lo = entry, hi = entry;
@@ -951,10 +1019,10 @@ std::pair<u32, u32> JitShader::FindReachable(u32 entry) {
         reachable[pc] = true;
         lo = std::min(lo, pc);
         hi = std::max(hi, pc);
-        if (pc >= MAX_PROGRAM_CODE_LENGTH - 1) {
+        if (pc >= Last) {
             continue; // implicit END
         }
-        const Instruction instr{(*program_code)[pc]};
+        const Instruction instr = at(pc);
         const u32 dest = instr.flow_control.dest_offset;
         const u32 num = instr.flow_control.num_instructions;
         switch (instr.opcode.Value()) {
@@ -976,7 +1044,10 @@ std::pair<u32, u32> JitShader::FindReachable(u32 entry) {
         case OpCode::Id::IFC:
             push(pc + 1);
             push(dest);
-            push(dest + num);
+            if (num == 0 || dest <= pc || falls_out(falls_out, pc + 1, dest, 0) ||
+                falls_out(falls_out, dest, dest + num, 0)) {
+                push(dest + num);
+            }
             break;
         case OpCode::Id::LOOP:
             push(pc + 1);
@@ -1003,6 +1074,25 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
 #if defined(__vita__)
     sceClibPrintf("[mh4u] shader JIT: compiling entry %u, span %u-%u (%u reachable)\n",
                   entry_point, span_lo, span_hi, static_cast<unsigned>(reachable.count()));
+    if (span_hi - span_lo > 1024) {
+        // Why so much is reachable: the program from the entry point, as opcode/dest/num.
+        char line[512];
+        std::size_t len = 0;
+        for (u32 pc = entry_point; pc < entry_point + 64 && pc < MAX_PROGRAM_CODE_LENGTH; pc++) {
+            const Instruction in{(*program_code)[pc]};
+            len += std::snprintf(line + len, sizeof(line) - len, " %u:%02x/%u/%u", pc,
+                                 static_cast<unsigned>(in.opcode.Value().EffectiveOpCode()),
+                                 static_cast<unsigned>(in.flow_control.dest_offset),
+                                 static_cast<unsigned>(in.flow_control.num_instructions));
+            if (len > sizeof(line) - 32 || (pc + 1) % 8 == 0) {
+                sceClibPrintf("[mh4u] shader JIT: wide span:%s\n", line);
+                len = 0;
+            }
+        }
+        if (len) {
+            sceClibPrintf("[mh4u] shader JIT: wide span:%s\n", line);
+        }
+    }
 #endif
 
     code_vec.clear();
