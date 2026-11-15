@@ -1819,6 +1819,9 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         auto hit = gs_memo_cur.find(key);
         if (hit == gs_memo_cur.end()) {
             if (auto old = gs_memo_prev.find(key); old != gs_memo_prev.end()) {
+                const std::size_t bytes = old->second.capacity() * sizeof(OutputVertex);
+                gs_memo_prev_bytes -= bytes;
+                gs_memo_cur_bytes += bytes;
                 hit = gs_memo_cur.emplace(key, std::move(old->second)).first;
                 gs_memo_prev.erase(old);
             }
@@ -1931,14 +1934,23 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         if (capture_out != nullptr) {
             capture_out->insert(capture_out->end(), memo_triangles.begin(), memo_triangles.end());
         }
-        if (primitive_assembler.IsEmpty()) {
-            if (gs_memo_cur.size() >= GsMemoGenerationCap) {
+        const std::size_t entry_bytes = memo_triangles.capacity() * sizeof(OutputVertex);
+        if (primitive_assembler.IsEmpty() && entry_bytes <= GsMemoMaxEntryBytes) {
+            if (gs_memo_cur.size() >= GsMemoGenerationCap ||
+                gs_memo_cur_bytes + entry_bytes > GsMemoGenerationBytes) {
                 // A generation is full: the older one goes.
                 gs_memo_prev = std::move(gs_memo_cur);
+                gs_memo_prev_bytes = gs_memo_cur_bytes;
                 gs_memo_cur.clear();
+                gs_memo_cur_bytes = 0;
             }
-            gs_memo_cur.emplace(memo_key, std::move(memo_triangles));
+            if (gs_memo_cur.emplace(memo_key, std::move(memo_triangles)).second) {
+                gs_memo_cur_bytes += entry_bytes;
+            }
         }
+        Common::PipelineStats::gs_memo_kib.store(
+            static_cast<u32>((gs_memo_cur_bytes + gs_memo_prev_bytes) / 1024),
+            std::memory_order_relaxed);
         gs_memo_misses++;
         if (gs_memo_program != nullptr && ++gs_memo_program->misses_in_row >= 32) {
             gs_memo_program->misses_in_row = 31;

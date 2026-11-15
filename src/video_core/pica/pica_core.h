@@ -492,8 +492,16 @@ private:
     /// emuprof: plain register writes the fast loop applied.
     u64 fast_words = 0;
     /// RunShippedDraw's geometry-shader draw memo: recorded triangles by input key.
+    /// Two generations, each capped by entries and by bytes. The entry cap alone let the memo
+    /// grow past the heap: MH4U's monsters are geometry-shader draws of up to thousands of
+    /// triangles (96 bytes a vertex) whose uniforms change every animation frame, so in normal
+    /// play near a herd the memo kept recording ~100-300 KiB entries until std::bad_alloc ended
+    /// the game (2026-11-15; ~18 MiB in 90 s).
     static constexpr std::size_t GsMemoGenerationCap = 400;
+    static constexpr std::size_t GsMemoGenerationBytes = 3u << 20;
+    static constexpr std::size_t GsMemoMaxEntryBytes = 1u << 20;
     std::unordered_map<u64, std::vector<OutputVertex>> gs_memo_cur, gs_memo_prev;
+    std::size_t gs_memo_cur_bytes = 0, gs_memo_prev_bytes = 0;
     u32 gs_memo_hits = 0, gs_memo_misses = 0;
     /// Per geometry program: misses in a row, and draws left to run without the memo. A program
     /// whose draws never repeat (MH4U's particles) stops paying for the key and the recording.

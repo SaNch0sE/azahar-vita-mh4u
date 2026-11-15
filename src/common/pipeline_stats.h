@@ -71,6 +71,8 @@ inline u64 bp_config_us = 0, bp_pipeline_us = 0, bp_calls = 0, bp_tier2_us = 0;
 /// Ops the render thread retired, and the wall time spent inside their bodies.
 /// Draws whose vertices the render thread shaded in software on the mirror PICA, the time it
 /// took, and how many of them were never offered to the hardware path (hw = false at ship).
+/// RunShippedDraw's geometry-shader memo, both generations (KiB, last value).
+inline std::atomic<u32> gs_memo_kib{0};
 inline std::atomic<u32> sw_shaded_draws{0};
 inline std::atomic<u64> sw_shaded_us{0};
 inline std::atomic<u32> sw_shaded_not_offered{0};

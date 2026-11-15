@@ -223,11 +223,14 @@ public:
     /// key is treated as volatile (its pages never stay armed: hot, or rewritten every frame).
     void NoteUnarmedMiss(u64 key) {
         std::scoped_lock lock{mutex};
-        Volatility& v = volatility[key];
-        if (++unarmed[key] >= 3 && v.count < 2) {
-            v.count = 2;
-            v.last_us = Common::PipelineStats::NowUs();
+        if (++unarmed[key] >= 3) {
+            Volatility& v = volatility[key];
+            if (v.count < 2) {
+                v.count = 2;
+                v.last_us = Common::PipelineStats::NowUs();
+            }
         }
+        BoundTracking();
     }
     [[nodiscard]] u32 InvalidationSeq() const {
         return inval_seq.load(std::memory_order_acquire);
@@ -266,6 +269,8 @@ public:
     struct Stats {
         u32 lookups, hits, inserts, invalidations, resets, entries, pool_kib;
         u32 volatile_keys; ///< keys currently refused as volatile (not yet expired)
+        u32 tracked;       ///< keys in the volatility and unarmed maps (bounded)
+        u32 prunes;        ///< BoundTracking passes this second
     };
     Stats TakeStats() {
         std::scoped_lock lock{mutex};
@@ -275,8 +280,10 @@ public:
             volatile_keys += v.count >= 2 && now - v.last_us <= VolatileExpiryUs ? 1 : 0;
         }
         const Stats s{stat_lookups, stat_hits, stat_inserts, stat_invalidations, stat_resets,
-                      static_cast<u32>(entries.size()), pool_used / 1024, volatile_keys};
+                      static_cast<u32>(entries.size()), pool_used / 1024, volatile_keys,
+                      static_cast<u32>(volatility.size() + unarmed.size()), tracking_prunes};
         stat_lookups = stat_hits = stat_inserts = stat_invalidations = stat_resets = 0;
+        tracking_prunes = 0;
         return s;
     }
 
@@ -311,7 +318,33 @@ private:
                       ? static_cast<u8>(v.count < 255 ? v.count + 1 : v.count)
                       : u8{1};
         v.last_us = now;
+        BoundTracking();
     }
+    /// Keys come and go (animated meshes in rotating buffers make new ones all the time), and
+    /// both maps used to keep every key ever seen: in normal play near monsters they grew by
+    /// ~2.5 MiB a minute until the heap ran out (std::bad_alloc after ~10 minutes,
+    /// 2026-11-15), each lookup getting slower and every rehash stalling the GX thread. Past
+    /// MaxTrackedKeys, expired volatility is dropped and the unarmed counts start over.
+    static constexpr std::size_t MaxTrackedKeys = 4096;
+    void BoundTracking() {
+        if (unarmed.size() > MaxTrackedKeys) {
+            unarmed.clear();
+        }
+        if (volatility.size() <= MaxTrackedKeys) {
+            return;
+        }
+        const u64 now = Common::PipelineStats::NowUs();
+        for (auto it = volatility.begin(); it != volatility.end();) {
+            const bool live = it->second.count >= 2 ? now - it->second.last_us <= VolatileExpiryUs
+                                                    : now - it->second.last_us < VolatileWindowUs;
+            it = live ? std::next(it) : volatility.erase(it);
+        }
+        if (volatility.size() > MaxTrackedKeys / 2) {
+            volatility.clear();
+        }
+        tracking_prunes++;
+    }
+    u32 tracking_prunes = 0;
     std::unordered_map<u64, Volatility> volatility;
     std::unordered_map<uintptr_t, u32> watched_pages;
     u8* pool = nullptr;
