@@ -31,3 +31,11 @@ Owner request (2026-11-15): toggleable options to try on the console: an upscale
 
 ## Tests
 Release, slots 1 and 2: screenshots at fixed views with each option off (identical to base) and on; the camera script for fps; diag `timedraw scenetime` and the `pools` line. For scale and MSAA also: quest counter, an area transition, a state load, two-screen layout.
+
+## Status (2026-11-15)
+- Step 0 + A (sharp bilinear): done, commit 9e21cdd43. Slot 1: crisper, 30 fps unchanged.
+- B (FXAA): done. Slot 1: edges visibly smoother, slight overall softening (HUD included); shown 29-30 (a few skips).
+- D (render scale) and C (MSAA): next.
+
+## TuizaVita comparison (Fable, 2026-11-15)
+The other Vita port (github.com/TutuiFC/TuizaVita-3ds-emu, cloned to ~/Documents/Personal) is a general-compatibility port with a block JIT and runtime Cg shaders; it is behind ours in CPU, shaders, frame pacing and I/O. Taken: clamp the time-stretch output before the s16 cast. Candidates left: constant blend factors carried in source alpha (`MapCarrierFactor`; ours approximates them; check `logblend` whether MH4U uses them), preloading the program disk cache into RAM to soften area-entry hitches (measure `Find` during a transition first).
