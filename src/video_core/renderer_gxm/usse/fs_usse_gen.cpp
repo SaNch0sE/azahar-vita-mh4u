@@ -278,6 +278,11 @@ private:
     void Fog();
     void Byteround(Reg value, Reg scratch);
     void Clamp01(Reg value, uint8_t mask = 0xf);
+    /// dbgconstfog (diagnostic): the fog coordinate as the factor, no fetch (prices the fetch).
+    static bool const_fog_strip() {
+        static const bool on = GxmFlag("dbgconstfog");
+        return on;
+    }
     void LoadVec4(Reg internal, Vec4Loc from);
     void StoreVec4(Vec4Loc to, Reg internal);
     void CopyVec4(Vec4Loc to, Vec4Loc from, uint8_t mask = 0xf);
@@ -1225,13 +1230,10 @@ void FragmentEmitter::Fog() {
         e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, ConstHalf, Pred::None, true);
         e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, Lit(LitInv256), Pred::None, true);
         e.Vec(VecOp::Add, {I0, 0x2}, ConstHalf, ConstZero, Pred::None, true);
-        // dbgconstfog: the coordinate as the factor, no fetch (diagnostic: prices the fetch).
-        static const bool const_fog = GxmFlag("dbgconstfog");
-        if (!const_fog) {
+        if (!const_fog_strip()) {
         e.MoveInternal({Reg::V(TmpLutCoord), 0x3}, {I0, XYZW}, Pred::None, true);
         e.Sample2D(Reg::V(TmpLutEntry), Reg::V(TmpLutCoord), SamplerSa(sampler_fog), nullptr, 0);
         e.Wdf(0);
-        e.MoveInternal({I0, 0x1}, {Reg::V(TmpLutEntry), XXXX}, Pred::None, true);
         }
     } else if (config.texture.fog_flip) {
         e.Vec(VecOp::Add, {I0, 0x1}, {pos, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
@@ -1251,8 +1253,14 @@ void FragmentEmitter::Fog() {
               Pred::None, true);
         LutLfFetch();
     }
-    Clamp01(I0, 0x1);
-    e.MoveInternal({I0, 0xf}, {I0, XXXX}, Pred::None, true);
+    if (fog_strip && !const_fog_strip()) {
+        // The strip holds clamped bytes replicated in all four channels (SyncFogStrip), so
+        // the fetched entry is already the factor in every lane.
+        LoadVec4(I0, {Bank::Virtual, TmpLutEntry});
+    } else {
+        Clamp01(I0, 0x1);
+        e.MoveInternal({I0, 0xf}, {I0, XXXX}, Pred::None, true);
+    }
     LoadVec4(I1, {Bank::Virtual, TmpOutput});
     LoadVec4(I2, {Bank::SecAttr, static_cast<uint8_t>(sa_fog_color)});
     e.Vec(VecOp::Add, {I1, 0x7}, {I2, XYZW, Mod::Neg}, {I1, XYZW}, Pred::None, true);
@@ -2261,7 +2269,23 @@ void FragmentEmitter::TevStage(u32 index) {
             }
         }
         }
-        Clamp01(I2);
+        {
+            // Every source of a stage is in [0, 1] (texels, bytes, clamped lighting and earlier
+            // stages, and their one-minus modifiers), so these operations cannot go below 0:
+            // only the upper clamp does anything. AddSigned, Subtract and the dot products
+            // can, and keep both. `tevclampboth` keeps both for every operation.
+            static const bool clamp_both = GxmFlag("tevclampboth");
+            const auto nonneg = [](Operation op) {
+                return op == Operation::Replace || op == Operation::Modulate ||
+                       op == Operation::Add || op == Operation::Lerp ||
+                       op == Operation::MultiplyThenAdd || op == Operation::AddThenMultiply;
+            };
+            if (!clamp_both && nonneg(stage.color_op) && nonneg(stage.alpha_op)) {
+                e.Vec(VecOp::Min, {I2, 0xf}, {I2, XYZW}, ConstOne, Pred::None, true);
+            } else {
+                Clamp01(I2);
+            }
+        }
         // The PICA keeps every stage's result in 8 bits. Only the last stage's rounding is kept
         // here: the output is converted to 8 bits on the way out anyway, and the alpha test reads
         // that stage. Rounding between stages cost 4 instructions a stage - ~10% of the lit

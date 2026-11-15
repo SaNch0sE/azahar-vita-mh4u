@@ -48,6 +48,7 @@ Frame pacing, release, `cam.sh` (camera segments), gameplay seconds only:
 | BPT | Blended draws: drop alpha tests that reject only alpha 0 | GPU | measured 6.5 ms (area 2) | **Done** (switch `noblendptdrop`) |
 | G2 | Present scene without the vertex dependency wait | GPU overlap | measured: area 3 holds 30 shown | **Done** (switch `presentvwait`) |
 | G1 | Drop the bottom-screen display transfer in Single screen so the clear quad joins the world scene | GPU, render | measured 0.5 ms GPU (area 2) | **Done** (switch `nobottomskip`) |
+| FT | Exact fragment trims: dead TEV lower clamps, fog texel path | GPU | measured ~2 ms (area 2) | **Done** |
 | G3 | Fog strip as a non-dependent (projective iterated) read | GPU | up to ~1 ms (fetch measured) | After a spike |
 | G4 | Textures 0-2 on raw coordinates as non-dependent reads | GPU | 0.5-1.5 ms | Same spike as G3 |
 | U | Uniform uploads: per-program write list, reachable vertex rows only | Render | 1-1.5 ms a frame (diag) | After G3/G4 |
@@ -57,3 +58,7 @@ Frame pacing, release, `cam.sh` (camera segments), gameplay seconds only:
 | G7 | Lighting register moves | GPU | 0.5-1.5 ms | Last (high risk) |
 
 Other gameplay scenes to measure once save states exist: a large-monster fight with effects (roar, dust, fire, hit sparks), two monsters or a full party, caves or night areas (point and spot lights), water or lava areas (procedural texture), other foliage areas, and zone transitions (program emission and upload hitches).
+
+## Area 2 follow-up (Fable, 2026-11-15)
+
+From the listing of the top lit program (145 instructions): fog is 17 instructions plus the Position input. Exact, existing-form trims done: the fog texel path (-3) and TEV lower clamps (up to -6). Still open, in order: fog coordinate as one MAD (needs four literals; `Mad2` form unproven in fragment programs), the fog fetch moved into `SampleTextures` for non-kill programs, `PackF16` straight from the internal register (new form), specular as a CPU constant for the single directional light shape (-8), diffuse kept in the internal register (-3), the LUT row taken from the upload (-4 per lookup, if `LUT_TEX_WIDTH` is 256), a direct alpha compare (-3; check k = 0..255 on the host first), and a census of unblended GREATER 0/5/30 draws with a per-texture minimum alpha (1-3 ms, exact when the minimum exceeds the reference).
