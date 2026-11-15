@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <string>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -111,6 +113,13 @@ enum class ThreadPriority : u32 {
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 
 void SetCurrentThreadName(const char* name);
+
+/// Vita: remembers the calling thread under `name` (SetCurrentThreadName does it too), so
+/// ThreadCpuReport can tell how much CPU each named thread got. Elsewhere a no-op.
+void RegisterThreadCpu(const char* name);
+/// Vita: " name ms" per registered thread, the CPU time it ran since the last call. Empty
+/// elsewhere.
+std::string ThreadCpuReport();
 
 /**
  * Which part of the emulator a thread belongs to.

@@ -93,6 +93,9 @@ endif()
 # Condition-variable and semaphore waits that sleep instead of polling every 500 us
 # (pte_wait.c; TuizaVita 0.3B's finding).
 target_sources(citra_vita PRIVATE pte_wait.c)
+# heapprof: the replaced global operator new/delete (heap_prof.cpp), outside LTO.
+target_sources(citra_vita PRIVATE heap_prof.cpp heap_prof.h)
+set_source_files_properties(heap_prof.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 set_source_files_properties(pte_wait.c PROPERTIES COMPILE_OPTIONS "-fno-lto")
 target_link_options(citra_vita PRIVATE -Wl,--wrap=pte_osSemaphoreCancellablePend)
 

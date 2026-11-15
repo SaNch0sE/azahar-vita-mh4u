@@ -26,6 +26,7 @@
 #include <psp2/rtc.h>
 #include <psp2/shellutil.h>
 #include <psp2/vshbridge.h>
+#include "citra_vita/heap_prof.h"
 #include "citra_vita/gxm_present.h"
 #ifdef CITRA_VITA_GPUPROF
 #include "citra_vita/gpuprof.h"
@@ -822,7 +823,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 // that armed a skip, and presents dropped as superseded on the render thread.
                 sceClibPrintf("[mh4u] speed %d%%  game %d.%d fps  shown %u fps  gx %u ms  "
                               "render ~%u ms  skip p%u b%u a%u x%u sup %u  fs %u ms %u r %u KiB async %u ms  "
-                              "vc %u/%u i%u x%u r%u e%u %uK v%u  gxc l%uK d%u s%u v%uK c%uK\n",
+                              "vc %u/%u i%u x%u r%u e%u %uK v%u t%u p%u  gxc l%uK d%u s%u v%uK c%uK gm%uK\n",
                               speed, fps10 / 10, fps10 % 10, presented, gx_ms, render_ms,
                               Common::PipelineStats::skipsig_presents.exchange(0, std::memory_order_relaxed),
                               Common::PipelineStats::skipsig_backlog.exchange(0, std::memory_order_relaxed),
@@ -834,12 +835,23 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                               Common::PipelineStats::fs_read_kib.exchange(0, std::memory_order_relaxed),
                               Common::PipelineStats::fs_async_us.exchange(0, std::memory_order_relaxed) / 1000,
                               vc.hits, vc.lookups, vc.inserts, vc.invalidations, vc.resets,
-                              vc.entries, vc.pool_kib, vc.volatile_keys,
+                              vc.entries, vc.pool_kib, vc.volatile_keys, vc.tracked, vc.prunes,
                               Common::PipelineStats::gxc_cmd_bytes.exchange(0, std::memory_order_relaxed) / 1024,
                               Common::PipelineStats::gxc_draws.exchange(0, std::memory_order_relaxed),
                               Common::PipelineStats::gxc_ships.exchange(0, std::memory_order_relaxed),
                               Common::PipelineStats::gxc_vtx_bytes.exchange(0, std::memory_order_relaxed) / 1024,
-                              Common::PipelineStats::gxc_code_bytes.exchange(0, std::memory_order_relaxed) / 1024);
+                              Common::PipelineStats::gxc_code_bytes.exchange(0, std::memory_order_relaxed) / 1024,
+                              Common::PipelineStats::gs_memo_kib.load(std::memory_order_relaxed));
+                // cpu: the CPU time each named thread actually ran this second (gx above is
+                // wall time, preemption and waits included).
+                sceClibPrintf("[mh4u] cpu%s\n", Common::ThreadCpuReport().c_str());
+                static unsigned heap_prof_seconds = 0;
+                if (HeapProfEnabled() && ++heap_prof_seconds % 10 == 0) {
+                    HeapProfReport();
+                }
+                if (Common::EmuProf::enabled) {
+                    sceClibPrintf("[mh4u] gxprof%s\n", Common::EmuProf::TakeReport(24).c_str());
+                }
 #endif // VITA_DIAGNOSTICS
                 // The clocks actually in effect (a clock plugin may override SetupClocks),
                 // every 30 s.
@@ -930,6 +942,7 @@ int EmulatorMain() {
     // system scheduler) and feeds the render thread; RoleCore in common/thread.cpp lays out
     // which of the three schedulable cores each host thread gets.
     Common::SetCurrentThreadRole(Common::ThreadRole::Emulation);
+    Common::RegisterThreadCpu("Emu");
 
     VTRACE("EmulatorMain: clocks");
     SetupClocks();
@@ -1004,8 +1017,21 @@ int EmulatorMain() {
     Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
     Settings::values.use_cpu_jit = false;
     Settings::values.disable_right_eye_render = true;
-    Common::EmuProf::enabled = GxmRenderer::GxmFlag("emuprof") || GxmRenderer::GxmFlag("emuprofgx");
-    Common::EmuProf::gx_thread = GxmRenderer::GxmFlag("emuprofgx");
+    // gxprof (ux0:data/mh4u/gxprof, release too): the GX thread's profile, where its list
+    // time goes by register handler and draw step, printed once a second.
+    bool gx_prof_file = false;
+    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/gxprof", "rb")) {
+        std::fclose(f);
+        gx_prof_file = true;
+    }
+    // heapprof (ux0:data/mh4u/heapprof): the sampled heap profile, top sites every 10 s.
+    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/heapprof", "rb")) {
+        std::fclose(f);
+        HeapProfInit(true);
+    }
+    Common::EmuProf::enabled = gx_prof_file || GxmRenderer::GxmFlag("emuprof") ||
+                               GxmRenderer::GxmFlag("emuprofgx");
+    Common::EmuProf::gx_thread = gx_prof_file || GxmRenderer::GxmFlag("emuprofgx");
     Common::EmuProf::thread_disabled = Common::EmuProf::gx_thread;
     Common::dsp_parallel = !GxmRenderer::GxmFlag("nodspthread");
     Common::dsp_pipelined = !GxmRenderer::GxmFlag("nodsppipe");

@@ -100,7 +100,7 @@ void SetCurrentThreadName(const char* name) {
 #ifdef __vita__
     // The console names threads at creation and has no way to rename one afterwards; the
     // thread's identity here is its role, and roles are pinned rather than named.
-    (void)name;
+    RegisterThreadCpu(name);
 #elif defined(__APPLE__)
     pthread_setname_np(name);
 #elif defined(__Bitrig__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
@@ -234,3 +234,60 @@ void SetCurrentThreadRole(ThreadRole, std::size_t) {}
 #endif
 
 } // namespace Common
+
+#ifdef __vita__
+#include <psp2/kernel/threadmgr.h>
+#include <cstdio>
+#include <mutex>
+namespace Common {
+namespace {
+struct CpuSlot {
+    const char* name;
+    int uid;
+    u64 last_us;
+};
+constexpr std::size_t MaxCpuSlots = 16;
+CpuSlot cpu_slots[MaxCpuSlots];
+std::size_t cpu_slot_count = 0;
+std::mutex cpu_slot_mutex;
+} // namespace
+
+void RegisterThreadCpu(const char* name) {
+    std::scoped_lock lock{cpu_slot_mutex};
+    if (cpu_slot_count < MaxCpuSlots) {
+        cpu_slots[cpu_slot_count++] = {name, sceKernelGetThreadId(), 0};
+    }
+}
+
+std::string ThreadCpuReport() {
+    std::string out;
+    std::scoped_lock lock{cpu_slot_mutex};
+    for (std::size_t i = 0; i < cpu_slot_count; i++) {
+        SceKernelThreadInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetThreadInfo(cpu_slots[i].uid, &info) < 0) {
+            continue;
+        }
+        const u64 now = info.runClocks;
+        const u64 delta = now - cpu_slots[i].last_us;
+        const bool first = cpu_slots[i].last_us == 0;
+        cpu_slots[i].last_us = now;
+        if (first) {
+            continue;
+        }
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), " %s %u", cpu_slots[i].name,
+                      static_cast<unsigned>(delta / 1000));
+        out += buf;
+    }
+    return out;
+}
+} // namespace Common
+#else
+namespace Common {
+void RegisterThreadCpu(const char*) {}
+std::string ThreadCpuReport() {
+    return {};
+}
+} // namespace Common
+#endif
