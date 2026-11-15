@@ -265,11 +265,17 @@ public:
 
     struct Stats {
         u32 lookups, hits, inserts, invalidations, resets, entries, pool_kib;
+        u32 volatile_keys; ///< keys currently refused as volatile (not yet expired)
     };
     Stats TakeStats() {
         std::scoped_lock lock{mutex};
+        const u64 now = Common::PipelineStats::NowUs();
+        u32 volatile_keys = 0;
+        for (const auto& [key, v] : volatility) {
+            volatile_keys += v.count >= 2 && now - v.last_us <= VolatileExpiryUs ? 1 : 0;
+        }
         const Stats s{stat_lookups, stat_hits, stat_inserts, stat_invalidations, stat_resets,
-                      static_cast<u32>(entries.size()), pool_used / 1024};
+                      static_cast<u32>(entries.size()), pool_used / 1024, volatile_keys};
         stat_lookups = stat_hits = stat_inserts = stat_invalidations = stat_resets = 0;
         return s;
     }
