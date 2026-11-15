@@ -16,6 +16,8 @@
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/gxm_texture_runtime.h"
 #include "video_core/renderer_gxm/gxm_video_options.h"
+#include <cstdio>
+#include "common/vita_data_dir.h"
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
@@ -1169,7 +1171,7 @@ Surface::Surface(Surface&& o) noexcept
       in_cdram{o.in_cdram}, stride_texels{o.stride_texels}, alloc_size{o.alloc_size},
       level_offsets{o.level_offsets}, texture{o.texture}, color_surface{o.color_surface},
       ds_surface{o.ds_surface}, is_color_target{o.is_color_target},
-      is_depth_target{o.is_depth_target}, scale_q{o.scale_q} {
+      is_depth_target{o.is_depth_target}, scale_q{o.scale_q}, mip_count{o.mip_count} {
     o.data = nullptr;
 }
 
@@ -1190,6 +1192,7 @@ Surface& Surface::operator=(Surface&& o) noexcept {
         is_color_target = o.is_color_target;
         is_depth_target = o.is_depth_target;
         scale_q = o.scale_q;
+        mip_count = o.mip_count;
         o.data = nullptr;
     }
     return *this;
@@ -1280,9 +1283,30 @@ void Surface::Allocate() {
     // 400 wide is 400 texels to the sampler and 416 to everything else, and the picture skews
     // by a row every row. Those give the sampler the pitch the memory actually has.
     const u32 stride_bytes = stride_texels * format.bytes_per_pixel;
+    // Mipmaps (as TuizaVita 0.3B does): the levels are already stored back to back at their
+    // own 8-texel-aligned pitch, which is GXM's linear mip layout. Exposed for power-of-two
+    // textures from 8x8, down to the last level of at least 8x8; the sampler then picks the
+    // level by distance instead of reading full-size texels for far surfaces. Kill switch
+    // `nomipmaps` (flag or ux0:data/mh4u/nomipmaps).
+    static const bool no_mipmaps = [] {
+        std::FILE* f = std::fopen(VITA_DATA_DIR "/nomipmaps", "rb");
+        if (f != nullptr) {
+            std::fclose(f);
+            return true;
+        }
+        return GxmFlag("nomipmaps");
+    }();
+    mip_count = 1;
+    if (!no_mipmaps && type == SurfaceType::Texture && levels > 1 && width >= 8 && height >= 8 &&
+        (width & (width - 1)) == 0 && (height & (height - 1)) == 0 &&
+        stride_texels == PitchFor(width, false)) {
+        while (mip_count < levels && (width >> mip_count) >= 8 && (height >> mip_count) >= 8) {
+            mip_count++;
+        }
+    }
     const int texture_err =
         stride_texels == PitchFor(width, false)
-            ? sceGxmTextureInitLinear(&texture, data, format.texture, width, height, 1)
+            ? sceGxmTextureInitLinear(&texture, data, format.texture, width, height, mip_count)
             : sceGxmTextureInitLinearStrided(&texture, data, format.texture, width, height,
                                              stride_bytes);
     if (texture_err < 0) {
@@ -1730,12 +1754,24 @@ Sampler::Sampler(TextureRuntime&, VideoCore::SamplerParams params) {
     };
     mag_filter = filter(params.mag_filter);
     min_filter = filter(params.min_filter);
+    // Blending between levels only when the PICA asks for it (linear mip filter); a nearest
+    // mip filter still picks a level. A minimum level above 0 is not expressible: level 0
+    // only then.
+    mip_linear = params.mip_filter == TextureFilter::Linear;
+    mip_allowed = params.lod_min == 0;
     wrap_s = wrap(params.wrap_s);
     wrap_t = wrap(params.wrap_t);
 }
 
 void Sampler::Apply(SceGxmTexture& texture) const {
     SetFilters(texture, min_filter, mag_filter);
+    if (sceGxmTextureGetMipmapCount(&texture) > 1) {
+        if (!mip_allowed) {
+            sceGxmTextureSetMipmapCount(&texture, 1);
+        } else if (mip_linear) {
+            sceGxmTextureSetMipFilter(&texture, SCE_GXM_TEXTURE_MIP_FILTER_ENABLED);
+        }
+    }
     const int err_u = sceGxmTextureSetUAddrMode(&texture, wrap_s);
     const int err_v = sceGxmTextureSetVAddrMode(&texture, wrap_t);
     if (err_u < 0 || err_v < 0) {

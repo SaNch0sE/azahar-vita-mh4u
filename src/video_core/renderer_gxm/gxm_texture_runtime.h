@@ -454,6 +454,8 @@ public:
     /// cache and every rectangle it hands over stay in guest texels; SX converts one to
     /// storage texels where memory is addressed or rendered into.
     u32 scale_q = 4;
+    /// Mip levels exposed to the sampler (Allocate).
+    u32 mip_count = 1;
     [[nodiscard]] u32 SX(u32 v) const noexcept {
         return v * scale_q / 4;
     }
@@ -565,6 +567,8 @@ private:
     SceGxmTextureFilter min_filter{};
     SceGxmTextureAddrMode wrap_s{};
     SceGxmTextureAddrMode wrap_t{};
+    bool mip_linear{};
+    bool mip_allowed{true};
 };
 
 class DebugScope {
