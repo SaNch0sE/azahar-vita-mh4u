@@ -676,6 +676,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     list_override = nullptr; // the top-level list only; chained lists read guest memory
     bool stop_requested = false;
     cmd_list.Reset(list, head, size);
+    Common::PipelineStats::gxc_cmd_bytes.fetch_add(size, std::memory_order_relaxed);
     const u64 list_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     SCOPE_EXIT({
         if (Common::EmuProf::enabled) {
@@ -1112,6 +1113,7 @@ void PicaCore::DrawImmediate() {
 
 void PicaCore::DrawArrays(bool is_indexed) {
     MICROPROFILE_SCOPE(GPU_Drawing);
+    Common::PipelineStats::gxc_draws.fetch_add(1, std::memory_order_relaxed);
     const u64 prof_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     draw_path = nullptr;
     SCOPE_EXIT({
@@ -1463,6 +1465,7 @@ bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
     }
     const u64 copy_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     loader.CopyIntoArena(base_address, vertex_min, vertex_max, layout, ticket->data);
+    Common::PipelineStats::gxc_vtx_bytes.fetch_add(layout.total, std::memory_order_relaxed);
     if (Common::EmuProf::enabled) {
         Common::EmuProf::Add(ticket->in_ring ? " .vertex copy (ring)" : " .vertex copy (arena)",
                              Common::PipelineStats::NowUs() - copy_t0);

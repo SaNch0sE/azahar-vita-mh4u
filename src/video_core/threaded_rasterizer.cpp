@@ -437,6 +437,10 @@ void ThreadedRasterizer::CollectState(Shipment& shipment) {
             }
             setup.code_sync_dirty = false;
             prof(" .collect: code");
+            if (sync.has_code && sync.code->has_program) {
+                Common::PipelineStats::gxc_code_bytes.fetch_add(
+                    static_cast<u32>(sync.code->program.size() * 4), std::memory_order_relaxed);
+            }
             if (EP::enabled && sync.has_code && sync.code->has_program) {
                 EP::Add(" .collect: code KiB", (sync.code->program.size() * 4 + 1023) / 1024 * 1000);
             }
@@ -589,6 +593,7 @@ void ThreadedRasterizer::PostInterruptAfterQueue(Service::GSP::InterruptId id, u
 }
 
 void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
+    Common::PipelineStats::gxc_ships.fetch_add(1, std::memory_order_relaxed);
     const u64 ship_t0 = Common::EmuProf::enabled ? Common::PipelineStats::NowUs() : 0;
     SCOPE_EXIT({
         if (Common::EmuProf::enabled) {

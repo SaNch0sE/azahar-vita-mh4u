@@ -190,6 +190,13 @@ inline std::atomic<u64> fs_reads_total{0};
 inline std::atomic<u32> fs_async_us{0};
 inline std::atomic<u64> fs_async_total_us{0};
 inline std::atomic<u64> guest_frames_total{0};
+/// GX thread work, per second (release line `gxc`): command-list KiB, draws, draws shipped
+/// to the render thread, vertex KiB copied, shader code KiB collected.
+inline std::atomic<u32> gxc_cmd_bytes{0};
+inline std::atomic<u32> gxc_draws{0};
+inline std::atomic<u32> gxc_ships{0};
+inline std::atomic<u32> gxc_vtx_bytes{0};
+inline std::atomic<u32> gxc_code_bytes{0};
 /// Guest file reads (FS File::Read): time spent, count and KiB, per second.
 inline std::atomic<u32> fs_read_us{0};
 inline std::atomic<u32> fs_reads{0};
