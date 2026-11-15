@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <fmt/format.h>
@@ -230,6 +231,25 @@ struct Vec4Loc {
     }
 };
 
+} // Anonymous namespace
+
+bool FogQueryEnabled() {
+    static const bool on = [] {
+        if (GxmFlag("nofogquery")) {
+            return false;
+        }
+        std::FILE* f = std::fopen("ux0:data/mh4u/nofogquery", "rb");
+        if (f != nullptr) {
+            std::fclose(f);
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+
+namespace {
+
 class FragmentEmitter {
 public:
     FragmentEmitter(const FSConfig& config_, int level_) : config{config_}, level{level_} {}
@@ -380,6 +400,8 @@ private:
     bool secondary_alpha_read = false;    ///< ... secondary_fragment_color.a
     bool fog_strip = false;               ///< fog reads the baked strip
     uint32_t sampler_fog = 0;             ///< its sampler's index
+    bool fog_query = false;               ///< fog read non-dependently (see PlanInputs)
+    uint8_t fog_query_pa = 0;             ///< where its texel arrives (4 PAs)
     bool proctex_strip = false;           ///< the procedural texture is the baked strip
     uint32_t sampler_strip = 0;           ///< its sampler's index
     uint32_t sampler_rg = 0;              ///< the rg and rgba LUT samplers' indices
@@ -593,11 +615,30 @@ void FragmentEmitter::PlanInputs() {
     fog_strip = uses_fog && !no_fog_strip;
     lut_used = lut_used || (uses_fog && !fog_strip);
 
+    // Fog as a non-dependent read (FogQueryEnabled): the vertex programs write
+    // TEXCOORD7 = (depth * w * 255/256 + w/512, w/2, 0, w), whose projection is exactly
+    // the strip coordinate the shader computed from the fragment's depth; the texel then
+    // arrives in pa4-7 before the program runs, carried on the COLOR0 descriptor as
+    // psp2cgc does it, and Position is no longer needed for fog.
+    fog_query = fog_strip && FogQueryEnabled() && !const_fog_strip();
+
     // pa0-3 is the vertex colour; the four-wide inputs follow, then the pairs, then the
     // one float3 (which need not be followed by anything pair-aligned).
-    gxp.inputs.push_back({FragmentInput::Color0, 4});
+    {
+        GxpInput colour{FragmentInput::Color0, 4};
+        if (fog_query) {
+            colour.query_coord = 7;
+            colour.query_unit = FogStripUnit;
+            colour.query_project_w = true;
+        }
+        gxp.inputs.push_back(colour);
+    }
     uint8_t pa = 4;
-    if (uses_scissor || uses_fog || uses_depth) {
+    if (fog_query) {
+        fog_query_pa = pa;
+        pa += 4;
+    }
+    if (uses_scissor || (uses_fog && !fog_query) || uses_depth) {
         gxp.inputs.push_back({FragmentInput::Position, 4});
         position_pa = pa;
         pa += 4;
@@ -657,7 +698,7 @@ void FragmentEmitter::PlanInputs() {
     if (lut_used) {
         gxp.samplers.push_back({"texture_buffer_lut_lf", 3});
     }
-    if (fog_strip) {
+    if (fog_strip && !fog_query) {
         sampler_fog = static_cast<uint32_t>(gxp.samplers.size());
         gxp.samplers.push_back({"texture_fog_strip", FogStripUnit});
     }
@@ -669,6 +710,10 @@ void FragmentEmitter::PlanInputs() {
         gxp.samplers.push_back({"texture_buffer_lut_rg", 4});
         sampler_rgba = static_cast<uint32_t>(gxp.samplers.size());
         gxp.samplers.push_back({"texture_buffer_lut_rgba", 5});
+    }
+    if (fog_query) {
+        // Last: a non-dependent sampler takes no words, and the dependent ones keep theirs.
+        gxp.samplers.push_back({"texture_fog_strip", FogStripUnit, true});
     }
 }
 
@@ -1222,7 +1267,10 @@ void FragmentEmitter::Fog() {
     // fog_index = depth * 128 (or (1 - depth) * 128 flipped); i = clamp(floor(index), 0,
     // 127); f = index - i; entry = lut_lf(i + fog_lut_offset); factor = clamp(r + g * f).
     const Reg pos = Reg::Pa(position_pa + 2); // z, w
-    if (fog_strip) {
+    if (fog_query) {
+        // Already fetched: the factor in every lane.
+        LoadVec4(I0, {Bank::PrimAttr, fog_query_pa});
+    } else if (fog_strip) {
         // The baked strip (the LUT interpolated as the PICA does, on the CPU): factor =
         // strip((d * 255 + 0.5) / 256), d the depth or 1 - depth.
         if (config.texture.fog_flip) {
@@ -1259,7 +1307,9 @@ void FragmentEmitter::Fog() {
               Pred::None, true);
         LutLfFetch();
     }
-    if (fog_strip && !const_fog_strip()) {
+    if (fog_query) {
+        // Loaded above.
+    } else if (fog_strip && !const_fog_strip()) {
         // The strip holds clamped bytes replicated in all four channels (SyncFogStrip), so
         // the fetched entry is already the factor in every lane.
         LoadVec4(I0, {Bank::Virtual, TmpLutEntry});

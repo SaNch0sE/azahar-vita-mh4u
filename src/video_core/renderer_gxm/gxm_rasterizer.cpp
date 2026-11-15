@@ -1650,7 +1650,8 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     const u64 fs_hash = Common::HashCombine(
         static_cast<u64>(fs_config.Hash()),
         static_cast<u64>(Pica::Shader::Generator::Cg::GetDebugOutput()) |
-            (Pica::Shader::Generator::Cg::FogDisabled() ? 0x100ull : 0ull));
+            (Pica::Shader::Generator::Cg::FogDisabled() ? 0x100ull : 0ull) |
+            (Usse::FogQueryEnabled() ? 0ull : 0x4000ull));
     // Only generate the Cg when the configuration is new. Both arguments below cost real time
     // - the source is hundreds of string appends and the name is an allocation - and they
     // were being paid on every draw for a shader that had existed since the first one.
@@ -2414,15 +2415,20 @@ void RasterizerGxm::SyncFogStrip() {
     if (regs.texturing.fog_mode != Pica::TexturingRegs::FogMode::Fog) {
         return;
     }
+    // Read by the non-dependent query (Usse::FogQueryEnabled), the coordinate is the depth
+    // itself, so a flipped fog (1 - depth) gets its strip baked reversed instead.
+    const bool reversed = Usse::FogQueryEnabled() && regs.texturing.fog_flip != 0;
     bool fresh = false;
-    const int slot = AcquireStrip(Common::HashCombine(0xF06F06F06ull, fog_tables_version), fresh);
+    const int slot = AcquireStrip(
+        Common::HashCombine(0xF06F06F06ull ^ (reversed ? 1ull : 0ull), fog_tables_version), fresh);
     if (slot < 0) {
         return;
     }
     if (fresh) {
         auto* texels = static_cast<u32*>(proc_strips[slot].mem);
         for (u32 n = 0; n < Usse::ProcTexStripTexels; n++) {
-            const float index = static_cast<float>(n) / (Usse::ProcTexStripTexels - 1) * 128.0f;
+            const float depth = static_cast<float>(n) / (Usse::ProcTexStripTexels - 1);
+            const float index = (reversed ? 1.0f - depth : depth) * 128.0f;
             const int i = std::min(static_cast<int>(index), 127);
             const float value =
                 pica.fog.lut[i].ToFloat() + (index - static_cast<float>(i)) * pica.fog.lut[i].DiffToFloat();

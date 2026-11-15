@@ -67,6 +67,12 @@ enum class FragmentInput : uint32_t {
 struct GxpInput {
     FragmentInput input;
     uint8_t components; ///< 1-4, each one PA register (f32)
+    /// A non-dependent texture read carried by this descriptor, as psp2cgc writes one
+    /// (SDK quad_f/imgui_f): the sampler unit's float4 texel lands in the four PA registers
+    /// right after this input's own, before the next input. -1: none.
+    int8_t query_coord = -1;    ///< the TEXCOORDn read (n)
+    uint8_t query_unit = 0;     ///< its sampler's TEXUNIT
+    bool query_project_w = false; ///< (x, y) / w of the coordinate, else (x, y)
 };
 
 struct GxpUniform {
@@ -79,6 +85,9 @@ struct GxpUniform {
 struct GxpSampler {
     std::string name;
     uint32_t unit; ///< TEXUNITn, 0-15
+    /// Read only by a GxpInput's non-dependent query: no sampler words in the data container.
+    /// Such samplers go after every dependent one, so the dependent indices are unchanged.
+    bool non_dependent = false;
 };
 
 struct GxpAttribute {

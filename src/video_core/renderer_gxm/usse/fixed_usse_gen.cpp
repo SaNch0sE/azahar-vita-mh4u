@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <bit>
 #include "video_core/renderer_gxm/usse/fixed_usse_gen.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 #include "video_core/renderer_gxm/usse/usse_encoder.h"
@@ -12,6 +13,7 @@ namespace {
 
 const Src ConstOne{Reg::C(2), XXXX};
 const Src ConstZeroOne{Reg::C(1), XYZW};
+const Src ConstZero{Reg::C(0), XXXX};
 const Src ConstHalf{Reg::C(12), XXXX};
 const Reg I0 = Reg::I(0);
 const Reg I1 = Reg::I(1);
@@ -46,8 +48,9 @@ std::vector<uint8_t> EmitPassThroughVertexProgram() {
     gxp.uniforms.push_back({"depth_scale", 1, 1, 1});
     gxp.uniforms.push_back({"depth_offset", 2, 1, 1});
     gxp.uniform_floats = 4;
-    gxp.vertex_outputs1 = 0x1b001800;
-    gxp.vertex_outputs2 = 0xff249;
+    gxp.vertex_outputs1 = 0x1f001800; // with TEXCOORD7, the fog coordinate (o27-30)
+    gxp.vertex_outputs2 = 0xeff249;
+    gxp.literals = {std::bit_cast<uint32_t>(255.0f / 256.0f), 0u}; // sa4: the fog scale
 
     Encoder e;
     e.skip_invalid = true;
@@ -77,6 +80,15 @@ std::vector<uint8_t> EmitPassThroughVertexProgram() {
     e.Vec(VecOp::Mul, {I0, 0x4}, {I1, YYYY}, {I0, WWWW});
     e.MoveInternal({Reg::O(OutPosition), 3}, {I0, XYZW});
     e.MoveInternal({Reg::O(OutPosition + 2), 3}, {I0, ZWZW});
+    // TEXCOORD7, the fog coordinate (vs_usse_gen's epilogue explains it).
+    e.Vec(VecOp::Mul, {I1, 0x1}, {I0, WWWW}, ConstHalf);
+    e.Vec(VecOp::Add, {I1, 0x2}, {I1, XXXX, Mod::Neg}, {I0, ZZZZ});
+    e.Vec(VecOp::Mul, {I1, 0x2}, {I1, YYYY}, {Reg::Sa(4), XXXX});
+    e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY}, {I1, XXXX});
+    e.MoveInternal({Reg::O(26), 0x2}, {I1, YYYY});
+    e.MoveInternal({Reg::O(28), 0x1}, {I1, XXXX});
+    e.MoveInternal({Reg::O(28), 0x2}, ConstZero);
+    e.MoveInternal({Reg::O(30), 0x1}, {I0, WWWW});
     e.EndVertex();
     e.FinishNosched();
     gxp.primary = e.Words();

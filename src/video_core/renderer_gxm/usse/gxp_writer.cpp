@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 
@@ -75,6 +76,9 @@ constexpr uint32_t BufferFlagsDefaultInRegisters = 1u << 28;
 constexpr uint32_t BufferFlagsDefaultInMemory = 1u << 29;
 // texunit_flags: four bits per unit, 2 = dependent read.
 constexpr uint32_t TexunitDependent = 2;
+constexpr uint32_t TexunitNonDependent = 1;
+/// Set by psp2cgc on every program with a non-dependent texture read (SDK quad_f, imgui_f).
+constexpr uint32_t FlagNonDependentQueries = 0x800;
 
 constexpr uint16_t ContainerDefaultUniforms = 14;
 constexpr uint16_t ContainerData = 19; ///< literals, then four SAs of control words per sampler
@@ -163,6 +167,11 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
         if (program.writes_depth) {
             flags |= FlagDepthUsed;
         }
+        for (const auto& input : program.inputs) {
+            if (input.query_coord >= 0) {
+                flags |= FlagNonDependentQueries;
+            }
+        }
     }
     w.PatchU32(FieldBinaryGuid, program.binary_guid);
     w.PatchU32(FieldSourceGuid, program.source_guid);
@@ -172,7 +181,8 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
                                      (program.buffer_pointer ? BufferFlagsDefaultInMemory : 0));
     uint32_t texunit_flags = 0;
     for (const auto& sampler : program.samplers) {
-        texunit_flags |= TexunitDependent << (sampler.unit * 4);
+        texunit_flags |= (sampler.non_dependent ? TexunitNonDependent : TexunitDependent)
+                         << (sampler.unit * 4);
     }
     w.PatchU32(FieldTexunitFlags0, texunit_flags);
     w.PatchU16(FieldPrimaryRegCount, static_cast<uint16_t>(program.pa_count));
@@ -180,7 +190,10 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
     const uint32_t data_base = program.uniform_floats;
     const uint32_t data_head = DataHead(program);
     const uint32_t literal_count = static_cast<uint32_t>(program.literals.size());
-    const uint32_t sampler_count = static_cast<uint32_t>(program.samplers.size());
+    // The data container holds the dependent samplers' words only.
+    const uint32_t sampler_count = static_cast<uint32_t>(
+        std::count_if(program.samplers.begin(), program.samplers.end(),
+                      [](const GxpSampler& s) { return !s.non_dependent; }));
     const uint32_t data_size = data_head + literal_count + sampler_count * SamplerWords;
     w.PatchU16(FieldSecondaryRegCount, static_cast<uint16_t>(std::max(
                                            data_base + data_size, program.secondary_reg_count)));
@@ -211,7 +224,11 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
         w.U8(TypeF16); // the colour leaves the program as half4 in pa0
         w.U8(4);
         w.U16(static_cast<uint16_t>(program.inputs.size()));
-        w.U16(0); // non-dependent sampler count
+        uint16_t queries = 0;
+        for (const auto& input : program.inputs) {
+            queries += input.query_coord >= 0 ? 1 : 0;
+        }
+        w.U16(queries); // non-dependent sampler count
         w.U32(4); // the descriptors follow this field directly
         for (size_t i = 0; i < program.inputs.size(); i++) {
             const auto& input = program.inputs[i];
@@ -226,10 +243,22 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
             if (i + 1 == program.inputs.size()) {
                 info |= 0x02000000;
             }
+            uint32_t resource = 0, size = static_cast<uint32_t>(input.components - 1) << 4;
+            uint32_t component_info = 0;
+            if (input.query_coord >= 0) {
+                // The query, as the SDK's imgui_f has it on its COLOR0 descriptor: the TEXCOORD
+                // index in the low bits instead of 0xF, 0x800, the coordinate swizzle (0x100
+                // xy, 0x200 xy/w), the unit, four result registers (bits 6-7), float texels.
+                info = (info & ~0xfu) | static_cast<uint32_t>(input.query_coord) | 0x800 |
+                       (input.query_project_w ? 0x200 : 0x100);
+                resource = input.query_unit;
+                size |= 3u << 6;
+                component_info = 0x30;
+            }
             w.U32(info);
-            w.U32(0);                                              // resource_index
-            w.U32(static_cast<uint32_t>(input.components - 1) << 4); // registers minus one
-            w.U32(0);                                              // component_info
+            w.U32(resource);       // resource_index
+            w.U32(size);           // registers minus one (iterated, then the query's)
+            w.U32(component_info); // component_info
         }
     }
 
@@ -267,6 +296,10 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
             w.U16(static_cast<uint16_t>(program.samplers[j].unit * SamplerWords + k));
             w.U16(static_cast<uint16_t>(SamplerSaOffset(data_head, literal_count, j) + k));
         }
+    }
+    for (uint32_t j = sampler_count; j < program.samplers.size(); j++) {
+        // Non-dependent samplers must come after every dependent one.
+        assert(program.samplers[j].non_dependent);
     }
 
     // --- containers ---
@@ -338,7 +371,7 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
     }
     // --- sampler query info: one u16 per texture unit, 0x0301 for a unit the program
     // reads with a dependent 2D read; 32 bytes, present only when there are samplers ---
-    if (sampler_count != 0) {
+    if (!program.samplers.empty()) {
         w.PatchOffset(FieldSamplerQueryInfoOffset, w.Size());
         uint16_t units[16]{};
         for (const auto& s : program.samplers) {

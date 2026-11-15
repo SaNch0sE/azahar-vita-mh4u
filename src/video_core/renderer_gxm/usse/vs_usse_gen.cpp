@@ -104,7 +104,7 @@ enum DataSlot : uint32_t {
     DataNeg1 = 10, ///< -1.0f
     DataScratch3 = 11,
     DataOnes16 = 12, ///< 0x00010001: the mad.i16 multiplier for an add (even, like psp2cgc's)
-    DataPad13 = 13,
+    DataFogScale = 13, ///< 255/256: the fog coordinate's scale (read as .y of slot 12's pair)
     DataSize = 14,
 };
 constexpr uint32_t DataLiteralCount = DataSize - 1;
@@ -122,8 +122,10 @@ constexpr uint8_t OutTexcoord0W = 14;
 constexpr uint8_t OutNormquat = 16;
 constexpr uint8_t OutNormquatFlat = 20;
 constexpr uint8_t OutView = 24;
-constexpr uint32_t VertexOutputs1 = 0x1b001800; ///< 27 registers, position, colour
-constexpr uint32_t VertexOutputs2 = 0xff249;    ///< the texcoord widths
+// TEXCOORD7 o27-30: the fog coordinate (FragmentEmitter's non-dependent fog read).
+constexpr uint8_t OutFogCoord = 27;
+constexpr uint32_t VertexOutputs1 = 0x1f001800; ///< 31 registers, position, colour
+constexpr uint32_t VertexOutputs2 = 0xeff249;   ///< the texcoord widths (TEXCOORD7 four)
 
 // VSOutputAttributes::Semantic, as regs_rasterizer.h numbers them.
 enum Semantic : uint8_t {
@@ -2319,6 +2321,17 @@ void VertexEmitter::Epilogue() {
     e.Vec(VecOp::Mul, {I0, 0x4}, {I1, YYYY}, {I0, WWWW});                   // z = depth * w
     e.MoveInternal({Reg::O(OutPosition), 0x3}, {I0, XYZW});
     e.MoveInternal({Reg::O(OutPosition + 2), 0x3}, {I0, ZWZW});
+    // The fog coordinate, TEXCOORD7 = (A, w/2, 0, w) with A = 255/256 * (z - w/2) + w/2, i.e.
+    // z * 255/256 + w/512: projected by w it is (depth * 255 + 0.5) / 256, the strip texel
+    // of the depth the fragment interpolates - exactly what the fragment program computed.
+    e.Vec(VecOp::Mul, {I1, 0x1}, {I0, WWWW}, ConstHalf);
+    e.Vec(VecOp::Add, {I1, 0x2}, {I1, XXXX, Mod::Neg}, {I0, ZZZZ});
+    e.Vec(VecOp::Mul, {I1, 0x2}, {I1, YYYY}, {DataReg(DataOnes16), YYYY});
+    e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY}, {I1, XXXX});
+    e.MoveInternal({Reg::O(OutFogCoord - 1), 0x2}, {I1, YYYY}); // o27
+    e.MoveInternal({Reg::O(OutFogCoord + 1), 0x1}, {I1, XXXX}); // o28
+    e.MoveInternal({Reg::O(OutFogCoord + 1), 0x2}, ConstZero);   // o29
+    e.MoveInternal({Reg::O(OutFogCoord + 3), 0x1}, {I0, WWWW}); // o30
 
     // Colour: min(abs(c), 1).
     GatherFour(I1, SemColorR);
@@ -2458,7 +2471,7 @@ std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
         0u, std::bit_cast<uint32_t>(-128.0f), 0x00010000u, std::bit_cast<uint32_t>(127.0f),
         0u, std::bit_cast<uint32_t>(1e-6f),   0u,          std::bit_cast<uint32_t>(-1.00001f),
         0u, std::bit_cast<uint32_t>(-1.0f),   0u,          0x00010001u,
-        0u};
+        std::bit_cast<uint32_t>(255.0f / 256.0f)};
     static_assert(DataLiteralCount == 13);
     if (!gxp.buffer_pointer) {
         // No uniform read: the pointer slot stays, as a literal, so the layout is one.

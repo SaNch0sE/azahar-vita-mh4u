@@ -53,4 +53,9 @@ constexpr uint32_t ProcTexStripTexels = 256;
 /// Fog's baked strip: the fog LUT interpolated as the PICA does, 256 texels over depth.
 constexpr uint32_t FogStripUnit = 7;
 
+/// Fog read as a non-dependent texture query of TEXCOORD7 (the vertex programs' fog
+/// coordinate) instead of in the shader; off with `nofogquery` (flag or ux0:data/mh4u file).
+/// The strip is then baked reversed for a flipped fog (SyncFogStrip).
+bool FogQueryEnabled();
+
 } // namespace GxmRenderer::Usse
