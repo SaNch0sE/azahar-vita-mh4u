@@ -123,6 +123,15 @@ scene. Titles using 2x1 only map onto `SCE_GXM_MULTISAMPLE_2X`, at the cost of
 the horizontal supersampling they asked for. The transfer engine cannot help:
 its downscale is a fixed 50% in both axes.
 
+### 4x MSAA as an image option (MH4U, parked 2026-11-15)
+
+Planned in [docs/plans/image-quality.md](docs/plans/image-quality.md) (option C), not
+started: `SCE_GXM_MULTISAMPLE_4X` render targets with MSAA-downscale colour surfaces,
+depth at 2x2 samples (reusing the render-scale machinery), and a 4X variant of every
+fragment program in the pipeline key. libgxm has no alpha-to-coverage, so cut-out grass
+would stay aliased. Estimate 36-42 ms a frame in area 2 (24-27 fps). Parked in favour of
+other work; FXAA and sharp bilinear are the image options for now.
+
 ### Textures
 
 Swizzled rather than linear, and F16 where the emitter currently uses F32.
