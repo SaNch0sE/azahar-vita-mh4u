@@ -4,7 +4,9 @@
 
 #include "common/pipeline_stats.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
+#include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <memory>
@@ -868,6 +870,88 @@ void ThreadedRasterizer::QueuePreshade(Shipment* shipment) {
     shade_tail.store(tail + 1, std::memory_order_release);
 }
 
+namespace {
+/// gsdump (diag): the geometry-shader draws the pre-shade worker runs, for planning a GPU
+/// path for them. Each distinct program pair once to ux0:data/mh4u/gsdump_<key>.bin (the
+/// whole register file, both programs and swizzles, both uniform sets, default attributes,
+/// the draw's arena bytes and its output triangles), and from 30 s into the run one log
+/// line per draw for the next 600 draws.
+void GsDump(Pica::PicaCore& pica, const Pica::DrawPayload& d,
+            const std::vector<Pica::OutputVertex>& out, bool ok) {
+    static const bool enabled = GxmRenderer::GxmFlag("gsdump");
+    if (!enabled) {
+        return;
+    }
+    auto& gs = pica.gs_setup;
+    auto& vs = pica.vs_setup;
+    const auto& r = pica.regs.internal;
+    const u64 key = gs.GetProgramCodeHash() ^ (gs.GetSwizzleDataHash() << 1) ^
+                    (u64{r.gs.main_offset} << 48) ^ (vs.GetProgramCodeHash() * 3);
+    static std::vector<u64> seen;
+    if (seen.size() < 32 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+        seen.push_back(key);
+        char name[96];
+        std::snprintf(name, sizeof(name), VITA_DATA_DIR "/gsdump_%016llx.bin",
+                      static_cast<unsigned long long>(key));
+        if (std::FILE* f = std::fopen(name, "wb")) {
+            const u32 hdr[12] = {0x50534447u, 1, sizeof(pica.regs.internal),
+                                 static_cast<u32>(sizeof(Pica::ProgramCode)),
+                                 static_cast<u32>(sizeof(Pica::SwizzleData)),
+                                 static_cast<u32>(sizeof(Pica::Uniforms)),
+                                 static_cast<u32>(sizeof(pica.input_default_attributes)),
+                                 d.layout.total, d.num_vertices,
+                                 (u32{d.is_indexed} << 1) | u32{d.index_u16} | (u32{ok} << 2),
+                                 static_cast<u32>(out.size()),
+                                 static_cast<u32>(sizeof(Pica::OutputVertex))};
+            std::fwrite(hdr, sizeof(hdr), 1, f);
+            const u32 extra[4] = {d.vertex_min, d.vertex_max, d.vertex_offset, d.layout.index_offset};
+            std::fwrite(extra, sizeof(extra), 1, f);
+            std::fwrite(d.layout.loader_offset.data(), sizeof(u32), 12, f);
+            std::fwrite(&pica.regs.internal, sizeof(pica.regs.internal), 1, f);
+            std::fwrite(gs.GetProgramCode().data(), sizeof(Pica::ProgramCode), 1, f);
+            std::fwrite(gs.GetSwizzleData().data(), sizeof(Pica::SwizzleData), 1, f);
+            std::fwrite(vs.GetProgramCode().data(), sizeof(Pica::ProgramCode), 1, f);
+            std::fwrite(vs.GetSwizzleData().data(), sizeof(Pica::SwizzleData), 1, f);
+            std::fwrite(&gs.uniforms, sizeof(Pica::Uniforms), 1, f);
+            std::fwrite(&vs.uniforms, sizeof(Pica::Uniforms), 1, f);
+            std::fwrite(&pica.input_default_attributes, sizeof(pica.input_default_attributes), 1, f);
+            if (d.arena != nullptr && d.layout.total != 0) {
+                std::fwrite(d.arena, d.layout.total, 1, f);
+            }
+            if (!out.empty()) {
+                std::fwrite(out.data(), sizeof(Pica::OutputVertex), out.size(), f);
+            }
+            std::fclose(f);
+            LOG_INFO(Render, "gsdump: wrote {}", name);
+        }
+    }
+    static int logged = 0;
+    static u64 last_gsf = 0, last_vsf = 0;
+    static std::FILE* draws = nullptr;
+    if (logged < 600 && sceKernelGetProcessTimeWide() > 30'000'000ull) {
+        if (draws == nullptr) {
+            draws = std::fopen(VITA_DATA_DIR "/gsdraws.txt", "w");
+        }
+        logged++;
+        const u64 gsf = gs.FloatUniformFingerprint(), vsf = vs.FloatUniformFingerprint();
+        if (draws != nullptr) {
+            std::fprintf(draws, "key %016llx nv %u idx %d tris %u ok %d gsf %s vsf %s fixnum %u stride %u\n",
+                         static_cast<unsigned long long>(key), d.num_vertices, d.is_indexed ? 1 : 0,
+                         static_cast<unsigned>(out.size() / 3), ok ? 1 : 0,
+                         gsf != last_gsf ? "chg" : "same", vsf != last_vsf ? "chg" : "same",
+                         static_cast<unsigned>(r.pipeline.gs_config.fixed_vertex_num_minus_1.Value() + 1),
+                         static_cast<unsigned>(r.pipeline.gs_config.stride_minus_1.Value() + 1));
+            if (logged == 600) {
+                std::fclose(draws);
+                draws = nullptr;
+            }
+        }
+        last_gsf = gsf;
+        last_vsf = vsf;
+    }
+}
+} // namespace
+
 void ThreadedRasterizer::PreshadeLoop() {
     // Core 0, or core 3 when the GX queue (on core 0) is in use.
     Common::SetCurrentThreadRole(Common::gx_fifo ? Common::ThreadRole::RasterWorker
@@ -913,6 +997,7 @@ void ThreadedRasterizer::PreshadeLoop() {
             shipment->shade_state.compare_exchange_strong(
                                expected, ShadeRunning, std::memory_order_acq_rel)) {
             shipment->shade_ok = shade_pica->ShadeShippedDraw(shipment->draw, shipment->vertices);
+            GsDump(*shade_pica, shipment->draw, shipment->vertices, shipment->shade_ok);
             shipment->shade_state.store(ShadeDone, std::memory_order_release);
         }
         ReleaseShipment(shipment);
