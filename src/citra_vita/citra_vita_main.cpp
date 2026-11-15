@@ -750,7 +750,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 sceClibPrintf(
                     "[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  dup %u  bottom %u  limiter %u us  gx %u us/%u  "
                     "slices %u (svc %u fast %u)  guest %u us  in %u us  wf %u wa %u wh %u  "
-                    "queue %u brake %u us  heap %u/%u KiB%s%s%s\n",
+                    "queue %u brake %u us  heap %u/%u KiB  skipsig p%u b%u a%u x%u sup %u%s%s%s\n",
                     speed, fps10 / 10, fps10 % 10, presented, skipped,
                     Common::PipelineStats::dup_presents.exchange(0, std::memory_order_relaxed),
                     Common::PipelineStats::bottom_draws_dropped.exchange(0, std::memory_order_relaxed),
@@ -763,7 +763,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     static_cast<unsigned>(wt_stats.arms), static_cast<unsigned>(wt_stats.hot_skips),
                     system.GPU().RenderQueueDepth(), rec.gpu_brakes,
                     static_cast<unsigned>(heap.uordblks / 1024),
-                    static_cast<unsigned>(heap.arena / 1024), sema, phase, sgi);
+                    static_cast<unsigned>(heap.arena / 1024),
+                    Common::PipelineStats::skipsig_presents.exchange(0, std::memory_order_relaxed),
+                    Common::PipelineStats::skipsig_backlog.exchange(0, std::memory_order_relaxed),
+                    Common::PipelineStats::skipsig_arena.exchange(0, std::memory_order_relaxed),
+                    Common::PipelineStats::skipsig_armed.exchange(0, std::memory_order_relaxed),
+                    Common::PipelineStats::presents_superseded.exchange(0, std::memory_order_relaxed),
+                    sema, phase, sgi);
                 if (Common::EmuProf::enabled) {
                     sceClibPrintf("[emuprof]%s\n", Common::EmuProf::TakeReport(GxmRenderer::GxmFlag("pcsample") ? 60 : 30).c_str());
                 }
@@ -787,9 +793,16 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 const unsigned render_ms = static_cast<unsigned>(
                     Common::PipelineStats::gpu_busy_us.exchange(0, std::memory_order_relaxed) *
                     8 / 1000);
+                // skip: vblanks each frameskip signal was on (presents, backlog, arenas), vblanks
+                // that armed a skip, and presents dropped as superseded on the render thread.
                 sceClibPrintf("[mh4u] speed %d%%  game %d.%d fps  shown %u fps  gx %u ms  "
-                              "render ~%u ms\n",
-                              speed, fps10 / 10, fps10 % 10, presented, gx_ms, render_ms);
+                              "render ~%u ms  skip p%u b%u a%u x%u sup %u\n",
+                              speed, fps10 / 10, fps10 % 10, presented, gx_ms, render_ms,
+                              Common::PipelineStats::skipsig_presents.exchange(0, std::memory_order_relaxed),
+                              Common::PipelineStats::skipsig_backlog.exchange(0, std::memory_order_relaxed),
+                              Common::PipelineStats::skipsig_arena.exchange(0, std::memory_order_relaxed),
+                              Common::PipelineStats::skipsig_armed.exchange(0, std::memory_order_relaxed),
+                              Common::PipelineStats::presents_superseded.exchange(0, std::memory_order_relaxed));
 #endif // VITA_DIAGNOSTICS
                 // The clocks actually in effect (a clock plugin may override SetupClocks),
                 // every 30 s.

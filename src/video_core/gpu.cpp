@@ -1560,16 +1560,37 @@ void GPU::VBlankGpuWork(const std::array<Pica::FramebufferConfig, 2>& fb_config,
     // frame's ops still queued, so the depth reads as a backlog it is not; the time estimate,
     // the presents and the arenas still tell (and the queue's brake bounds it regardless).
     const bool depth_signal = !GxFifo() && queue_depth >= QueueDepthSkip;
+    // Two presents pending is one frame rendering and one queued: at a capacity of about the
+    // game's 30 fps that is ordinary jitter (one frame landing a vblank late), and skipping on
+    // the first such vblank dropped frames a renderer that keeps up on average would have
+    // shown (MH4U quest area 3, 2026-11-15: about half the skips). Skip when it persists for
+    // PresentSustainVblanks vblanks or a third present is pending; the queue lag this allows is
+    // bounded by those vblanks. `oldskip` restores the first-vblank rule.
+    const bool old_skip = OldSkip();
+    constexpr u32 PresentSustainVblanks = 3;
+    if (frames_behind >= PresentBacklogSkip) {
+        impl->presents_behind_vblanks++;
+    } else {
+        impl->presents_behind_vblanks = 0;
+    }
+    const bool presents_signal =
+        old_skip ? frames_behind >= PresentBacklogSkip
+                 : frames_behind > PresentBacklogSkip ||
+                       impl->presents_behind_vblanks >= PresentSustainVblanks;
+    const bool arena_signal = impl->shipping_rasterizer->ArenaBackpressure();
+    const bool backlog_signal = queue_backlog_us >= QueueBacklogSkipUs;
     bool skip_next = threaded && impl->frameskip_allowed &&
-                     (impl->shipping_rasterizer->ArenaBackpressure() ||
-                      frames_behind >= PresentBacklogSkip ||
-                      queue_backlog_us >= QueueBacklogSkipUs || depth_signal);
+                     (arena_signal || presents_signal || backlog_signal || depth_signal);
+    Common::PipelineStats::skipsig_presents.fetch_add(presents_signal, std::memory_order_relaxed);
+    Common::PipelineStats::skipsig_backlog.fetch_add(backlog_signal, std::memory_order_relaxed);
+    Common::PipelineStats::skipsig_arena.fetch_add(arena_signal, std::memory_order_relaxed);
+    Common::PipelineStats::skipsig_armed.fetch_add(skip_next, std::memory_order_relaxed);
     {
         // timedraw: which signal asked for the skips (counted per vblank, logged every 300).
         static u32 why[5]{}, n = 0;
-        why[0] += impl->shipping_rasterizer->ArenaBackpressure();
-        why[1] += frames_behind >= PresentBacklogSkip;
-        why[2] += queue_backlog_us >= QueueBacklogSkipUs;
+        why[0] += arena_signal;
+        why[1] += presents_signal;
+        why[2] += backlog_signal;
         why[3] += queue_depth >= QueueDepthSkip;
         why[4] += skip_next;
         if (++n == 300) {

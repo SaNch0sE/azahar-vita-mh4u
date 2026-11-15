@@ -241,6 +241,8 @@ struct GPU::Impl {
     /// The same wait, for arming rather than releasing the skip.
     u32 skip_arm_pending_vblanks = 0;
     u32 skip_streak_vblanks = 0;
+    /// Consecutive vblanks that found PresentBacklogSkip presents pending (see VBlankGpuWork).
+    u32 presents_behind_vblanks = 0;
     // A duty-cycle un-skip that has been decided but not yet consumed by a frame boundary.
     bool skip_forced_render = false;
     bool frameskip_allowed = true;

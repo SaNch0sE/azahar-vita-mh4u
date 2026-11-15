@@ -224,8 +224,13 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
         // than per op.
         const u64 now_us = op.swap_marker ? Common::PipelineStats::NowUs() : 0;
         const bool display_is_current = op.swap_marker && now_us - last_present_us < PresentStaleUs;
+        // Under the GX queue the next frame's present is often queued by the time this one is
+        // reached (a renderer at about the game's rate), so "a newer one is pending" dropped
+        // frames that were fully drawn. Unless `oldskip`, only a third pending present makes
+        // this one superseded, matching the frameskip's rule in VBlankGpuWork.
+        const u32 superseded_pending = OldSkip() ? 1 : 2;
         const bool superseded = op.swap_marker && display_is_current &&
-                                pending_swaps.load(std::memory_order_relaxed) > 1;
+                                pending_swaps.load(std::memory_order_relaxed) > superseded_pending;
         if (superseded) {
             static const bool log_presents = std::getenv("AZAHAR_PRESENT_LOG") != nullptr;
             if (log_presents) {
@@ -235,6 +240,7 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
             }
             pending_swaps.fetch_sub(1, std::memory_order_relaxed);
             skipped_frames.fetch_add(1, std::memory_order_relaxed);
+            Common::PipelineStats::presents_superseded.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
@@ -264,8 +270,13 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
             // A slow-moving average of what an op costs, so a queue depth can be read as a
             // time rather than a count. Fifteen-sixteenths keeps it steady across the mix of
             // cheap draws and expensive presents without lagging a real change for long.
-            const u64 previous = avg_op_us.load(std::memory_order_relaxed);
-            avg_op_us.store((previous * 15 + op_us) / 16, std::memory_order_relaxed);
+            // Presents stay out of it (unless `oldskip`): theirs includes the frame-end GPU
+            // wait, and one sampled present lifted the average by 300 us or more for dozens
+            // of ops, which read a single queued frame as the 120 ms backlog (MH4U area 3).
+            if (!op.swap_marker || OldSkip()) {
+                const u64 previous = avg_op_us.load(std::memory_order_relaxed);
+                avg_op_us.store((previous * 15 + op_us) / 16, std::memory_order_relaxed);
+            }
             Common::PipelineStats::gpu_busy_us.fetch_add(op_us, std::memory_order_relaxed);
             Common::PipelineStats::gpu_busy_total_us.fetch_add(op_us, std::memory_order_relaxed);
             if (op.swap_marker) {

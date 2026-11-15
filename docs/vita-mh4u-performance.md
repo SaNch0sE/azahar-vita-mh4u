@@ -404,3 +404,9 @@ Menu plan Phase 1 (F0 + A), built as planned:
 Measured at the quest counter (slot 1):
 - diag: 16,632 fast-path draws per 3 s, 0 mismatches. Render-thread phases per 3 s: framebuffer 169→142 ms, textures 237→119, programs 599→370, uniforms 291→205, draw 264→178. Diag fps 21–22 → 24.
 - release: 24–25 fps shown either way. The GX thread is at ~880 ms/s with the render thread relieved, so the counter is now GX-bound; the GX trims (menu plan G) come next for it.
+
+## Frameskip for gameplay (2026-11-15)
+
+Plan: `docs/plans/gameplay-headroom.md`. Under the GX queue at ~30 fps capacity, half of area 3's skips were false: a single late vblank (two presents pending), a backlog estimate inflated by the present op's GPU wait, and fully drawn presents dropped as superseded. Now: the presents signal needs two pending for 3 vblanks or three pending, presents stay out of `avg_op_us`, and a present is superseded only with three pending. Kill switch `oldskip` (diag flag or `ux0:data/mh4u/oldskip`). The release line gains `skip pN bN aN xN sup N` (vblanks per second each signal was on, vblanks that armed a skip, superseded presents).
+
+Release, area 3 with the camera script: shown 28.84 -> 29.42 / 29.61; seconds under 29 from 21 of 83 to 2 of 48 and 7 of 111; armed vblanks 137 -> 48 / 75, all from sustained presents.

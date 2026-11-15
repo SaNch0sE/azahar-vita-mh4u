@@ -15,7 +15,25 @@
 #include "common/wake_flag.h"
 #include "common/common_types.h"
 
+#include <cstdio>
+#include "common/vita_data_dir.h"
+#include "video_core/renderer_gxm/gxm_flags.h"
+
 namespace VideoCore {
+
+/// `oldskip` (diag flag or ux0:data/mh4u/oldskip): the frameskip as before 2026-11-15, a skip on
+/// the first vblank with two presents pending and presents counted in the op-cost average.
+inline bool OldSkip() {
+    static const bool old_skip = [] {
+        std::FILE* f = std::fopen(VITA_DATA_DIR "/oldskip", "rb");
+        if (f != nullptr) {
+            std::fclose(f);
+            return true;
+        }
+        return GxmRenderer::GxmFlag("oldskip");
+    }();
+    return old_skip;
+}
 
 /**
  * The GPU worker thread: owns the GL context and executes everything from the GSP command down.

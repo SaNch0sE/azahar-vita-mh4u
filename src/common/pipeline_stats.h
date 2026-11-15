@@ -175,6 +175,14 @@ inline std::atomic<void (*)()> scene_report{nullptr};
 inline std::atomic<u32> presents{0};
 /// Vblanks whose present was not queued because no new top-screen frame had arrived.
 inline std::atomic<u32> dup_presents{0};
+/// Frameskip signals, in vblanks per second (release counters): presents pending, queue
+/// backlog estimate, arena backpressure, and vblanks that armed a skip.
+inline std::atomic<u32> skipsig_presents{0};
+inline std::atomic<u32> skipsig_backlog{0};
+inline std::atomic<u32> skipsig_arena{0};
+inline std::atomic<u32> skipsig_armed{0};
+/// Presents the render thread dropped because a newer one was queued behind them.
+inline std::atomic<u32> presents_superseded{0};
 /// Draws dropped because they were for the hidden bottom screen (single-screen layout).
 inline std::atomic<u32> bottom_draws_dropped{0};
 /// Time the frame limiter slept on the emulation thread (the guest ahead of real time).
