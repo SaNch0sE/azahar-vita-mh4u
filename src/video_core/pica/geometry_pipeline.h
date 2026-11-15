@@ -48,6 +48,9 @@ private:
     VertexHandler vertex_handler;
     ShaderEngine* shader_engine;
     std::unique_ptr<GeometryPipelineBackend> backend;
+    /// Reconfigure keeps a Point backend while these hold (1 = Point, 0 = rebuild).
+    u32 backend_mode = 0;
+    u32 backend_point_key = 0;
     RegsInternal& regs;
     GeometryShaderUnit& gs_unit;
     ShaderSetup& gs;

@@ -78,10 +78,12 @@ inline std::atomic<u64> rt_apply_us{0}, rt_op_us{0};
 /// the memo key, the shader setup, the VS, the GS, all of RunShippedDraw, and ApplyShipment.
 /// Shader JIT (a32): the last program's code size and the code arena's use (bytes), and
 /// shader runs that fell back to the interpreter (uncompiled program).
+/// timedraw: VS float-uniform rows whose value changed, per row, on the render mirror.
+inline std::array<std::atomic<u32>, 96> vs_frow_changes{};
 inline std::atomic<u32> jit_last_bytes{0}, jit_arena_bytes{0}, jit_interp_runs{0};
 inline std::atomic<u32> psw_draws{0}, psw_hits{0}, psw_vertices{0};
 inline std::atomic<u64> psw_key_us{0}, psw_setup_us{0}, psw_vs_us{0}, psw_gs_us{0},
-    psw_total_us{0}, psw_apply_us{0};
+    psw_total_us{0}, psw_apply_us{0}, psw_load_us{0}, psw_loop_us{0};
 inline std::atomic<u32> rt_ops{0};
 
 /// Ops the render thread retired, and the wall time spent inside their bodies.

@@ -30,13 +30,17 @@
 
 namespace VideoCore {
 
-void ThreadedRasterizer::ApplySetup(Pica::ShaderSetup& setup, const SetupSync& sync) {
+void ThreadedRasterizer::ApplySetup(Pica::ShaderSetup& setup, const SetupSync& sync,
+                                    bool count_rows) {
     if (sync.has_uniforms) {
         // Register by register, so the fingerprint the geometry-shader draw memo keys on
         // follows what changed rather than being recomputed over all 96.
         for (u32 i = sync.f_lo; i < sync.f_hi; i++) {
             if (std::memcmp(&setup.uniforms.f[i], &sync.uniforms.f[i], sizeof(setup.uniforms.f[i])) !=
                 0) {
+                if (count_rows) {
+                    Common::PipelineStats::vs_frow_changes[i].fetch_add(1, std::memory_order_relaxed);
+                }
                 setup.SetFloatUniformTracked(i, sync.uniforms.f[i]);
             }
         }
@@ -173,7 +177,7 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
     if (vertex_changed) {
         mirror.vertex_regs_version++;
     }
-    ApplySetup(mirror.vs_setup, shipment.vs);
+    ApplySetup(mirror.vs_setup, shipment.vs, count_stats && Common::PipelineStats::stat_timing);
     ApplySetup(mirror.gs_setup, shipment.gs);
     if (shipment.pa_reconfigure_events != 0) {
         mirror.GetPrimitiveAssembler().Reconfigure(

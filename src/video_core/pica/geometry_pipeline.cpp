@@ -331,6 +331,7 @@ void GeometryPipeline::Reconfigure() {
 
     if (regs.pipeline.use_gs == PipelineRegs::UseGS::No) {
         backend = nullptr;
+        backend_mode = 0;
         return;
     }
 
@@ -345,13 +346,26 @@ void GeometryPipeline::Reconfigure() {
     ASSERT(regs.pipeline.vs_outmap_total_minus_1_a == regs.pipeline.vs_outmap_total_minus_1_b);
 
     switch (regs.pipeline.gs_config.mode) {
-    case PipelineRegs::GSMode::Point:
+    case PipelineRegs::GSMode::Point: {
+        // Kept across draws while its configuration holds: a new backend per draw was a malloc
+        // and a free for every one of the ~11,000 one-glyph draws a second of MH4U's keyboard.
+        const u32 point_key = (u32{regs.pipeline.vs_outmap_total_minus_1_a.Value()} << 8) |
+                              regs.gs.max_input_attribute_index.Value();
+        if (backend != nullptr && backend_mode == 1 && backend_point_key == point_key &&
+            backend->IsEmpty()) {
+            break;
+        }
         backend = std::make_unique<GeometryPipeline_Point>(regs, gs_unit);
-        break;
+        backend_mode = 1;
+        backend_point_key = point_key;
+        return;
+    }
     case PipelineRegs::GSMode::VariablePrimitive:
+        backend_mode = 0;
         backend = std::make_unique<GeometryPipeline_VariablePrimitive>(regs, gs);
         break;
     case PipelineRegs::GSMode::FixedPrimitive:
+        backend_mode = 0;
         backend = std::make_unique<GeometryPipeline_FixedPrimitive>(regs, gs);
         break;
     default:

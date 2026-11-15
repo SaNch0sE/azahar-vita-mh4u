@@ -467,7 +467,7 @@ private:
     std::vector<std::unique_ptr<Shipment>> shipment_pool;
     std::atomic<Shipment*> free_head{nullptr};
 
-    static void ApplySetup(Pica::ShaderSetup& setup, const SetupSync& sync);
+    static void ApplySetup(Pica::ShaderSetup& setup, const SetupSync& sync, bool count_rows = false);
     static void ApplyShipment(Pica::PicaCore& mirror, const Shipment& shipment,
                               bool count_stats = true);
     void CollectState(Shipment& shipment);

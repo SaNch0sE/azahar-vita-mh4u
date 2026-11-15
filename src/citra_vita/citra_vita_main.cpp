@@ -881,7 +881,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                       static_cast<unsigned>(take(PS::preshade_other_us) / 1000),
                                       static_cast<unsigned>(take(PS::jit_interp_runs)));
                         sceClibPrintf("[mh4u] psw apply %u | gs %u draws (%u hits) %u verts: "
-                                      "total %u key %u setup %u vs %u gs %u\n",
+                                      "total %u key %u setup %u loop %u (load %u vs %u gs %u)\n",
                                       static_cast<unsigned>(take(PS::psw_apply_us) / 1000),
                                       static_cast<unsigned>(take(PS::psw_draws)),
                                       static_cast<unsigned>(take(PS::psw_hits)),
@@ -889,8 +889,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                       static_cast<unsigned>(take(PS::psw_total_us) / 1000),
                                       static_cast<unsigned>(take(PS::psw_key_us) / 1000),
                                       static_cast<unsigned>(take(PS::psw_setup_us) / 1000),
+                                      static_cast<unsigned>(take(PS::psw_loop_us) / 1000),
+                                      static_cast<unsigned>(take(PS::psw_load_us) / 1000),
                                       static_cast<unsigned>(take(PS::psw_vs_us) / 1000),
                                       static_cast<unsigned>(take(PS::psw_gs_us) / 1000));
+                        std::string rows;
+                        for (u32 r = 0; r < 96; r++) {
+                            const u32 n = take(PS::vs_frow_changes[r]);
+                            if (n >= 100) {
+                                rows += fmt::format(" {}:{}", r, n);
+                            }
+                        }
+                        sceClibPrintf("[mh4u] vs uniform rows changed/s:%s\n", rows.c_str());
                     }
                 }
                 static unsigned heap_prof_seconds = 0;

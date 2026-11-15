@@ -1776,7 +1776,7 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
                          regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
     const bool prof_any = prof_gs || prof_ps;
     u64 prof_t0 = prof_any ? Common::PipelineStats::NowUs() : 0;
-    u64 prof_vs = 0, prof_gsu = 0, prof_key = 0, prof_setup = 0;
+    u64 prof_vs = 0, prof_gsu = 0, prof_key = 0, prof_setup = 0, prof_load = 0, prof_loop = 0;
     // ShadeShippedDraw: where the triangles go (the memo records into its own vector).
     std::vector<OutputVertex>* const capture_out = capture_only ? triangle_record : nullptr;
     u64 memo_key = 0;
@@ -1784,7 +1784,13 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
     std::vector<OutputVertex> memo_triangles;
     // After 32 misses in a row a program runs 256 draws without the memo, then probes again
     // (one more miss puts it back to skipping). `nogsmemoskip` keeps it always on.
-    static const bool memo_skip = !GxmRenderer::GxmFlag("nogsmemoskip");
+    static const bool memo_skip = [] {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nogsmemoskip", "rb")) {
+            std::fclose(f);
+            return false;
+        }
+        return !GxmRenderer::GxmFlag("nogsmemoskip");
+    }();
     bool memo_eligible = gs_memo && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
                          primitive_assembler.IsEmpty();
     gs_memo_program = nullptr;
@@ -1897,6 +1903,8 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
                         p.num_vertices, static_cast<u32>(regs.internal.pipeline.triangle_topology.Value()));
     }
 
+    // psprof: the whole vertex loop (VS + GS) once per draw; per-vertex reads distorted it.
+    const u64 loop_t0 = prof_ps ? Common::PipelineStats::NowUs() : 0;
     for (u32 index = 0; index < p.num_vertices; ++index) {
         // A ring-layout arena holds 16-bit indices rebased to the draw's first vertex.
         const u32 vertex =
@@ -1920,14 +1928,16 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         }
 
         if (!vertex_cache_hit) {
+            const u64 ld_t = prof_ps ? Common::PipelineStats::NowUs() : 0;
             AttributeBuffer input;
             loader.LoadVertex(vertex, input, input_default_attributes);
 
-            const u64 vs_t = prof_any ? Common::PipelineStats::NowUs() : 0;
+            const u64 vs_t = (prof_gs || prof_ps) ? Common::PipelineStats::NowUs() : 0;
+            prof_load += prof_ps ? vs_t - ld_t : 0;
             shader_unit.LoadInput(regs.internal.vs, input);
             shader_engine->Run(vs_setup, shader_unit);
             shader_unit.WriteOutput(regs.internal.vs, vs_output);
-            if (prof_any) {
+            if (prof_gs || prof_ps) {
                 prof_vs += Common::PipelineStats::NowUs() - vs_t;
             }
 
@@ -1939,7 +1949,7 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
             }
         }
 
-        if (prof_any) {
+        if (prof_gs || prof_ps) {
             const u64 gs_t = Common::PipelineStats::NowUs();
             geometry_pipeline.SubmitVertex(vs_output);
             prof_gsu += Common::PipelineStats::NowUs() - gs_t;
@@ -1978,6 +1988,9 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         }
     }
     if (prof_ps) {
+        prof_loop = Common::PipelineStats::NowUs() - loop_t0;
+    }
+    if (prof_ps) {
         namespace PS = Common::PipelineStats;
         PS::psw_draws.fetch_add(1, std::memory_order_relaxed);
         PS::psw_vertices.fetch_add(p.num_vertices, std::memory_order_relaxed);
@@ -1985,6 +1998,8 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         PS::psw_setup_us.fetch_add(prof_setup, std::memory_order_relaxed);
         PS::psw_vs_us.fetch_add(prof_vs, std::memory_order_relaxed);
         PS::psw_gs_us.fetch_add(prof_gsu, std::memory_order_relaxed);
+        PS::psw_load_us.fetch_add(prof_load, std::memory_order_relaxed);
+        PS::psw_loop_us.fetch_add(prof_loop, std::memory_order_relaxed);
         PS::psw_total_us.fetch_add(PS::NowUs() - prof_t0, std::memory_order_relaxed);
     }
     if (prof_gs) {
