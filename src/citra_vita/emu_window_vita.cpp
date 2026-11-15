@@ -321,10 +321,9 @@ int EmuWindowVita::TakeUiAction() {
 void EmuWindowVita::DrawScreens() {
     // The renderer knows where this frame's guest framebuffers are; the GPU samples them in
     // place. Before a title runs (or under another backend) there is nothing to draw.
-    if (!system.IsPoweredOn()) {
+    if (!CanDrawScreens()) {
         return;
     }
-    auto& renderer = system.GPU().Renderer();
     // The GPU can only sample what it can see; both guest memory pools are page-aligned
     // page-multiples by construction, so they map as they are. Registering twice is a no-op.
     auto& memory = system.Memory();
@@ -334,44 +333,57 @@ void EmuWindowVita::DrawScreens() {
                                Memory::VRAM_SIZE);
 
     const auto& layout = GetFramebufferLayout();
-    const auto draw = [&](int screen, const Common::Rectangle<u32>& rect) {
-        const auto fb = renderer.GetGuestFramebuffer(screen);
-        if (!fb) {
-            return;
-        }
-        if (fb->snapshot) {
-            // A VBlank copy of a CPU-written framebuffer lives outside guest memory; the
-            // GPU samples it in place too, so map the slot the first time it is seen (the
-            // slots are few, page-aligned and never freed while a title runs).
-            GxmPresent::MapGuestMemory(const_cast<u8*>(fb->pixels),
-                                       (VideoCore::GPU::DisplaySnapshotBytes + 4095) & ~4095u);
-        }
-        GxmPresent::DrawGuestScreen(
-            GxmPresent::GuestScreen{
-                .pixels = fb->pixels,
-                .texture = static_cast<const SceGxmTexture*>(fb->texture),
-                .tex_x = fb->tex_x,
-                .tex_y = fb->tex_y,
-                .tex_width = fb->tex_width,
-                .tex_height = fb->tex_height,
-                .stride_bytes = fb->stride,
-                .height = fb->height,
-                .pica_format = static_cast<int>(fb->format),
-                .fill_enabled = fb->fill_enabled,
-                .fill_r = fb->fill_r,
-                .fill_g = fb->fill_g,
-                .fill_b = fb->fill_b,
-            },
-            static_cast<float>(rect.left), static_cast<float>(rect.top),
-            static_cast<float>(rect.GetWidth()), static_cast<float>(rect.GetHeight()));
+    const auto rect_draw = [](const GxmPresent::GuestScreen& screen,
+                              const Common::Rectangle<u32>& rect) {
+        GxmPresent::DrawGuestScreen(screen, static_cast<float>(rect.left),
+                                    static_cast<float>(rect.top),
+                                    static_cast<float>(rect.GetWidth()),
+                                    static_cast<float>(rect.GetHeight()));
     };
-
-    if (layout.top_screen_enabled) {
-        draw(0, layout.top_screen);
+    if (layout.top_screen_enabled && top_ready) {
+        rect_draw(top_screen, layout.top_screen);
     }
     if (layout.bottom_screen_enabled) {
-        draw(1, layout.bottom_screen);
+        GxmPresent::GuestScreen bottom{};
+        if (BuildScreen(1, bottom)) {
+            rect_draw(bottom, layout.bottom_screen);
+        }
     }
+}
+
+bool EmuWindowVita::CanDrawScreens() const {
+    return system.IsPoweredOn();
+}
+
+bool EmuWindowVita::BuildScreen(int screen, GxmPresent::GuestScreen& out) {
+    auto& renderer = system.GPU().Renderer();
+    const auto fb = renderer.GetGuestFramebuffer(screen);
+    if (!fb) {
+        return false;
+    }
+    if (fb->snapshot) {
+        // A VBlank copy of a CPU-written framebuffer lives outside guest memory; the
+        // GPU samples it in place too, so map the slot the first time it is seen (the
+        // slots are few, page-aligned and never freed while a title runs).
+        GxmPresent::MapGuestMemory(const_cast<u8*>(fb->pixels),
+                                   (VideoCore::GPU::DisplaySnapshotBytes + 4095) & ~4095u);
+    }
+    out = GxmPresent::GuestScreen{
+        .pixels = fb->pixels,
+        .texture = static_cast<const SceGxmTexture*>(fb->texture),
+        .tex_x = fb->tex_x,
+        .tex_y = fb->tex_y,
+        .tex_width = fb->tex_width,
+        .tex_height = fb->tex_height,
+        .stride_bytes = fb->stride,
+        .height = fb->height,
+        .pica_format = static_cast<int>(fb->format),
+        .fill_enabled = fb->fill_enabled,
+        .fill_r = fb->fill_r,
+        .fill_g = fb->fill_g,
+        .fill_b = fb->fill_b,
+    };
+    return true;
 }
 
 void EmuWindowVita::Present(Ui* ui) {
@@ -383,7 +395,13 @@ void EmuWindowVita::Present(Ui* ui) {
             pending_ui_action.store(static_cast<int>(action), std::memory_order_release);
         }
     }
-    GxmPresent::BeginFrame(0, 0, 0);
+    // The top screen is looked up before the frame begins: an FXAA pass over it runs ahead
+    // of the present scene and hands back its output to draw instead.
+    top_ready = false;
+    if (CanDrawScreens() && GetFramebufferLayout().top_screen_enabled) {
+        top_ready = BuildScreen(0, top_screen);
+    }
+    GxmPresent::BeginFrame(0, 0, 0, top_ready ? &top_screen : nullptr);
     DrawScreens();
     // A frame being dumped holds the guest screens alone, not the menu over them.
     if (ui != nullptr && !GxmPresent::DumpPending()) {

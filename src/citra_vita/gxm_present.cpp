@@ -211,6 +211,17 @@ struct State {
     SceGxmShaderPatcherId sharp_f_id{};
     SceGxmFragmentProgram* sharp_fp{};
     const SceGxmProgramParameter* sharp_param[5]{};
+    // FXAA (VideoOptions::fxaa): the emitter's program and a target the size of the top
+    // screen's texture, created on first use.
+    std::vector<uint8_t> fxaa_gxp;
+    SceGxmShaderPatcherId fxaa_f_id{};
+    SceGxmFragmentProgram* fxaa_fp{};
+    const SceGxmProgramParameter* fxaa_param[4]{};
+    SceGxmRenderTarget* fxaa_rt{};
+    SceGxmColorSurface fxaa_surface{};
+    SceGxmTexture fxaa_texture{};
+    void* fxaa_mem{};
+    u32 fxaa_w{}, fxaa_h{};
 
     void* quad_indices{}; ///< the one index buffer every quad uses
 
@@ -1133,6 +1144,25 @@ bool BuildFixedPipelines() {
         }
     }
 
+    // FXAA: optional as well.
+    {
+        g.fxaa_gxp = GxmRenderer::Usse::EmitFxaaFragmentProgram();
+        const auto* fxaa = reinterpret_cast<const SceGxmProgram*>(g.fxaa_gxp.data());
+        if (!g.fxaa_gxp.empty() && sceGxmProgramCheck(fxaa) == 0 &&
+            sceGxmShaderPatcherRegisterProgram(g.patcher, fxaa, &g.fxaa_f_id) >= 0 &&
+            sceGxmShaderPatcherCreateFragmentProgram(
+                g.patcher, g.fxaa_f_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+                SCE_GXM_MULTISAMPLE_NONE, nullptr, quad_v, &g.fxaa_fp) >= 0) {
+            const char* names[4] = {"fx_half", "fx_reduce", "fx_span", "fx_texel"};
+            for (int i = 0; i < 4; i++) {
+                g.fxaa_param[i] = sceGxmProgramFindParameterByName(fxaa, names[i]);
+            }
+        } else {
+            LOG_ERROR(Frontend, "FXAA program unavailable");
+            g.fxaa_fp = nullptr;
+        }
+    }
+
     // Solid color: x, y as floats; the color is a fragment uniform.
     {
         SceGxmVertexAttribute attr =
@@ -1575,7 +1605,111 @@ void* FrameAlloc(u32 size, u32 align) {
     return g.arena[g.back] + offset;
 }
 
-void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
+namespace {
+
+/// The FXAA target for a texture of w x h texels (made once, remade if the size changes).
+bool EnsureFxaaTarget(u32 w, u32 h) {
+    if (g.fxaa_rt != nullptr && g.fxaa_w == w && g.fxaa_h == h) {
+        return true;
+    }
+    if (g.fxaa_rt != nullptr) {
+        sceGxmFinish(g.context);
+        sceGxmDestroyRenderTarget(g.fxaa_rt);
+        g.fxaa_rt = nullptr;
+        FreeBlock(g.fxaa_mem);
+        g.fxaa_mem = nullptr;
+    }
+    SceGxmRenderTargetParams rt{};
+    rt.width = w;
+    rt.height = h;
+    rt.scenesPerFrame = 1;
+    rt.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
+    rt.driverMemBlock = static_cast<SceUID>(-1);
+    if (sceGxmCreateRenderTarget(&rt, &g.fxaa_rt) < 0) {
+        g.fxaa_rt = nullptr;
+        return false;
+    }
+    SceUID uid;
+    const u32 stride = (w + 7u) & ~7u;
+    g.fxaa_mem = GpuAlloc(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, stride * h * 4,
+                          static_cast<SceGxmMemoryAttribFlags>(SCE_GXM_MEMORY_ATTRIB_READ |
+                                                               SCE_GXM_MEMORY_ATTRIB_WRITE),
+                          &uid);
+    if (g.fxaa_mem == nullptr ||
+        sceGxmColorSurfaceInit(&g.fxaa_surface, SCE_GXM_COLOR_FORMAT_A8B8G8R8,
+                               SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE,
+                               SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, w, h, stride, g.fxaa_mem) < 0 ||
+        sceGxmTextureInitLinear(&g.fxaa_texture, g.fxaa_mem, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8, w,
+                                h, 1) < 0) {
+        sceGxmDestroyRenderTarget(g.fxaa_rt);
+        g.fxaa_rt = nullptr;
+        return false;
+    }
+    g.fxaa_w = w;
+    g.fxaa_h = h;
+    LOG_INFO(Frontend, "FXAA target {}x{}", w, h);
+    return true;
+}
+
+/// Runs FXAA over the screen's texture into the FXAA target, in its own scene (fragment
+/// processing is in scene order, so it sees the renderer's finished frame and the present
+/// scene after it sees its output), and points the screen at the result.
+void FxaaPass(GuestScreen& screen) {
+    if (g.fxaa_fp == nullptr || screen.texture == nullptr || screen.fill_enabled) {
+        return;
+    }
+    SceGxmTexture source = *screen.texture;
+    const u32 w = sceGxmTextureGetWidth(&source), h = sceGxmTextureGetHeight(&source);
+    if (w == 0 || h == 0 || sceGxmTextureGetType(&source) == SCE_GXM_TEXTURE_LINEAR_STRIDED ||
+        !EnsureFxaaTarget(w, h)) {
+        return;
+    }
+    sceGxmTextureSetMagFilter(&source, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetMinFilter(&source, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetUAddrMode(&source, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetVAddrMode(&source, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmBeginScene(g.context, SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY, g.fxaa_rt, nullptr,
+                     nullptr, nullptr, &g.fxaa_surface, nullptr);
+    sceGxmSetDefaultRegionClipAndViewport(g.context, w - 1, h - 1);
+    sceGxmSetCullMode(g.context, SCE_GXM_CULL_NONE);
+    sceGxmSetFrontDepthFunc(g.context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetFrontDepthWriteEnable(g.context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    sceGxmSetVertexProgram(g.context, g.quad_vp);
+    sceGxmSetFragmentProgram(g.context, g.fxaa_fp);
+    sceGxmSetFragmentTexture(g.context, 0, &source);
+    const float tu = 1.0f / static_cast<float>(w), tv = 1.0f / static_cast<float>(h);
+    const float values[4][2] = {{0.5f * tu, 0.5f * tv},
+                                {0.25f / 8.0f, 1.0f / 128.0f},
+                                {8.0f, 1.0f / 6.0f},
+                                {tu, tv}};
+    void* uniform_buffer = nullptr;
+    sceGxmReserveFragmentDefaultUniformBuffer(g.context, &uniform_buffer);
+    for (int i = 0; i < 4; i++) {
+        if (g.fxaa_param[i] != nullptr) {
+            sceGxmSetUniformDataF(uniform_buffer, g.fxaa_param[i], 0, 2, values[i]);
+        }
+    }
+    // Only the framebuffer's part of the texture: pixel (x, y) of the target is texel (x, y).
+    const float px0 = static_cast<float>(screen.tex_width ? screen.tex_x : 0);
+    const float py0 = static_cast<float>(screen.tex_height ? screen.tex_y : 0);
+    const float px1 = screen.tex_width ? px0 + static_cast<float>(screen.tex_width) : w;
+    const float py1 = screen.tex_height ? py0 + static_cast<float>(screen.tex_height) : h;
+    const auto cx = [w](float x) { return x * 2.0f / static_cast<float>(w) - 1.0f; };
+    const auto cy = [h](float y) { return 1.0f - y * 2.0f / static_cast<float>(h); };
+    const QuadVertex corners[4] = {
+        {cx(px0), cy(py0), px0 * tu, py0 * tv},
+        {cx(px1), cy(py0), px1 * tu, py0 * tv},
+        {cx(px0), cy(py1), px0 * tu, py1 * tv},
+        {cx(px1), cy(py1), px1 * tu, py1 * tv},
+    };
+    DrawQuad(corners);
+    sceGxmEndScene(g.context, nullptr, nullptr);
+    screen.texture = &g.fxaa_texture;
+}
+
+} // Anonymous namespace
+
+void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b, GuestScreen* top) {
     if (!g.initialized) {
         return;
     }
@@ -1593,6 +1727,9 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
         sceGxmNotificationWait(&wait);
     }
     g.arena_used[g.back] = 0;
+    if (top != nullptr && GxmRenderer::Video().fxaa) {
+        FxaaPass(*top);
+    }
 
     // The screens are sampled from surfaces the renderer's own scenes wrote, and scenes on
     // one context are not ordered against each other unless they say so. The renderer sets

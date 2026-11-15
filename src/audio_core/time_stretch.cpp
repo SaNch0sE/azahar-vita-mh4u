@@ -86,8 +86,10 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
 
         // Converting output samples back to shorts so we can use them
         for (std::size_t i = 0; i < (2 * num_out); i++) {
-            const s16 temp = static_cast<s16>(float_out[i] * std::numeric_limits<s16>::max());
-            out[i] = temp;
+            // Overlapped segments can overshoot full scale; an unclamped cast wraps that to
+            // a loud opposite-sign click (as TuizaVita found).
+            const float v = float_out[i] * std::numeric_limits<s16>::max();
+            out[i] = static_cast<s16>(v > 32767.0f ? 32767.0f : (v < -32768.0f ? -32768.0f : v));
         }
 
         return samples_received;

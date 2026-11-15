@@ -38,5 +38,12 @@ namespace GxmRenderer::Usse {
  * texture must be linear-filtered.
  */
 [[nodiscard]] std::vector<uint8_t> EmitSharpBilinearFragmentProgram();
+/**
+ * FXAA (the classic low-tap form, green as luma) over a texture (TEXCOORD0 float2, sampler
+ * `fx_source` at TEXUNIT0, linear-filtered). Uniforms: fx_half (half a texel, u and v),
+ * fx_reduce (0.25 * reduce_mul, reduce_min), fx_span (span in texels, 1/6), fx_texel (one
+ * texel, u and v).
+ */
+[[nodiscard]] std::vector<uint8_t> EmitFxaaFragmentProgram();
 
 } // namespace GxmRenderer::Usse

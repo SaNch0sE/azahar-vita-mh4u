@@ -44,7 +44,10 @@ struct GuestScreen {
 /// Frame lifecycle. All of these run on whichever single thread presents (the render thread
 /// in-game, the main thread in the menus) - never two at once, which is the same discipline
 /// GXM's immediate context demands.
-void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b);
+/// Starts the frame's present scene. With `top` given and FXAA on (VideoOptions), the top
+/// screen's texture first goes through the FXAA pass in its own scene, and `*top` is
+/// rewritten to sample its output.
+void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b, GuestScreen* top = nullptr);
 void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float h);
 void DrawSolidRect(float x, float y, float w, float h, u8 r, u8 g, u8 b, u8 a);
 void EndFrame();

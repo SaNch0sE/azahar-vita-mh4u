@@ -181,4 +181,117 @@ std::vector<uint8_t> EmitSharpBilinearFragmentProgram() {
     return WriteGxp(gxp);
 }
 
+std::vector<uint8_t> EmitFxaaFragmentProgram() {
+    GxpProgram gxp;
+    gxp.inputs.push_back({FragmentInput::TexCoord0, 2});
+    gxp.uniforms.push_back({"fx_half", 0, 2, 1});
+    gxp.uniforms.push_back({"fx_reduce", 2, 2, 1});
+    gxp.uniforms.push_back({"fx_span", 4, 2, 1});
+    gxp.uniforms.push_back({"fx_texel", 6, 2, 1});
+    gxp.uniform_floats = 8;
+    gxp.samplers.push_back({"fx_source", 0});
+    gxp.pa_count = 4;
+    gxp.temp_count = 32;
+    const uint8_t sampler = static_cast<uint8_t>(SamplerSaOffset(8, 0, 0));
+
+    const Reg I2 = Reg::I(2);
+    const Reg uv = Reg::Pa(0);
+    const auto R = [](uint8_t n) { return Reg::R(n); };
+    const auto G = [](uint8_t base) { return Src{Reg::R(base), YYYY}; }; // a sample's green
+    Encoder e;
+    e.skip_invalid = false;
+    e.Phas(true);
+    e.Nop();
+    // Corner coordinates (half a texel diagonally: each bilinear tap averages a 2x2 block):
+    // NW r0, SE r2, NE r4, SW r6. Internal registers never live across a texture read.
+    e.Vec(VecOp::Add, {I0, 0x3}, {Reg::Sa(0), XYZW, Mod::Neg}, {uv, XYZW}); // uv - h
+    e.Vec(VecOp::Add, {I1, 0x3}, {Reg::Sa(0), XYZW}, {uv, XYZW});           // uv + h
+    e.MoveInternal({R(0), 0x3}, {I0, XYZW});
+    e.MoveInternal({R(2), 0x3}, {I1, XYZW});
+    e.MoveInternal({I2, 0x1}, {I1, XYZW});
+    e.MoveInternal({I2, 0x2}, {I0, XYZW});
+    e.MoveInternal({R(4), 0x3}, {I2, XYZW});
+    e.MoveInternal({I2, 0x1}, {I0, XYZW});
+    e.MoveInternal({I2, 0x2}, {I1, XYZW});
+    e.MoveInternal({R(6), 0x3}, {I2, XYZW});
+    // M r8, NW r12, SE r16, NE r20, SW r24.
+    e.Sample2D(R(8), uv, sampler, nullptr, 0);
+    e.Sample2D(R(12), R(0), sampler, nullptr, 0);
+    e.Sample2D(R(16), R(2), sampler, nullptr, 0);
+    e.Sample2D(R(20), R(4), sampler, nullptr, 0);
+    e.Sample2D(R(24), R(6), sampler, nullptr, 0);
+    e.Wdf(0);
+    // Luma range of the five, kept in r28.x (min) and r30.x (max).
+    e.Vec(VecOp::Min, {I0, 0x1}, G(12), G(16));
+    e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, G(20));
+    e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, G(24));
+    e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, G(8));
+    e.Vec(VecOp::Max, {I1, 0x1}, G(12), G(16));
+    e.Vec(VecOp::Max, {I1, 0x1}, {I1, XXXX}, G(20));
+    e.Vec(VecOp::Max, {I1, 0x1}, {I1, XXXX}, G(24));
+    e.Vec(VecOp::Max, {I1, 0x1}, {I1, XXXX}, G(8));
+    e.MoveInternal({R(28), 0x1}, {I0, XYZW});
+    e.MoveInternal({R(30), 0x1}, {I1, XYZW});
+    // Sums: x = NW + NE, y = SW + SE, z = NW + SW, w = NE + SE.
+    e.Vec(VecOp::Add, {I0, 0x1}, G(12), G(20));
+    e.Vec(VecOp::Add, {I0, 0x2}, G(24), G(16));
+    e.Vec(VecOp::Add, {I0, 0x4}, G(12), G(24));
+    e.Vec(VecOp::Add, {I0, 0x8}, G(20), G(16));
+    // dir = ((SW + SE) - (NW + NE), (NW + SW) - (NE + SE)).
+    e.Vec(VecOp::Add, {I1, 0x1}, {I0, XXXX, Mod::Neg}, {I0, YYYY});
+    e.Vec(VecOp::Add, {I1, 0x2}, {I0, WWWW, Mod::Neg}, {I0, ZZZZ});
+    // reduce = max((sum of four) * 0.25 * reduce_mul, reduce_min).
+    e.Vec(VecOp::Add, {I2, 0x1}, {I0, XXXX}, {I0, YYYY});
+    e.Vec(VecOp::Mul, {I2, 0x1}, {I2, XXXX}, {Reg::Sa(2), XXXX});
+    e.Vec(VecOp::Max, {I2, 0x1}, {I2, XXXX}, {Reg::Sa(2), YYYY});
+    // rcp(min(|dir.x|, |dir.y|) + reduce).
+    e.Vec(VecOp::Max, {I2, 0x2}, {I1, YYYY, Mod::Neg}, {I1, YYYY});
+    e.Vec(VecOp::Max, {I2, 0x4}, {I1, XXXX, Mod::Neg}, {I1, XXXX});
+    e.Vec(VecOp::Min, {I2, 0x2}, {I2, ZZZZ}, {I2, YYYY});
+    e.Vec(VecOp::Add, {I2, 0x2}, {I2, YYYY}, {I2, XXXX});
+    e.Comp(CompOp::Rcp, {I2, 0x4}, {I2}, 1);
+    e.Vec(VecOp::Mul, {I1, 0x3}, {I1, XYZW}, {I2, ZZZZ});
+    // Clamped to the span, in texels.
+    e.Vec(VecOp::Min, {I1, 0x3}, {I1, XYZW}, {Reg::Sa(4), XXXX});
+    e.Vec(VecOp::Max, {I1, 0x3}, {Reg::Sa(4), XXXX, Mod::Neg}, {I1, XYZW});
+    e.Vec(VecOp::Mul, {I1, 0x3}, {I1, XYZW}, {Reg::Sa(6), XYZW});
+    // Taps along it: uv -/+ dir / 6 (r0, r2), uv -/+ dir / 2 (r4, r6).
+    e.Vec(VecOp::Mul, {I2, 0x3}, {I1, XYZW}, {Reg::Sa(4), YYYY});
+    e.Vec(VecOp::Add, {I0, 0x3}, {I2, XYZW, Mod::Neg}, {uv, XYZW});
+    e.MoveInternal({R(0), 0x3}, {I0, XYZW});
+    e.Vec(VecOp::Add, {I0, 0x3}, {I2, XYZW}, {uv, XYZW});
+    e.MoveInternal({R(2), 0x3}, {I0, XYZW});
+    e.Vec(VecOp::Mul, {I2, 0x3}, {I1, XYZW}, ConstHalf);
+    e.Vec(VecOp::Add, {I0, 0x3}, {I2, XYZW, Mod::Neg}, {uv, XYZW});
+    e.MoveInternal({R(4), 0x3}, {I0, XYZW});
+    e.Vec(VecOp::Add, {I0, 0x3}, {I2, XYZW}, {uv, XYZW});
+    e.MoveInternal({R(6), 0x3}, {I0, XYZW});
+    e.Sample2D(R(12), R(0), sampler, nullptr, 0);
+    e.Sample2D(R(16), R(2), sampler, nullptr, 0);
+    e.Sample2D(R(20), R(4), sampler, nullptr, 0);
+    e.Sample2D(R(24), R(6), sampler, nullptr, 0);
+    e.Wdf(0);
+    // A = (r12 + r16) / 2; B = (A + (r20 + r24) / 2) / 2.
+    e.MoveF32x4({I0, 0xf}, R(12), R(14));
+    e.MoveF32x4({I1, 0xf}, R(16), R(18));
+    e.Vec(VecOp::Add, {I0, 0xf}, {I0, XYZW}, {I1, XYZW});
+    e.Vec(VecOp::Mul, {I0, 0xf}, {I0, XYZW}, ConstHalf);
+    e.MoveF32x4({I1, 0xf}, R(20), R(22));
+    e.MoveF32x4({I2, 0xf}, R(24), R(26));
+    e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW}, {I2, XYZW});
+    e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, ConstHalf);
+    e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW}, {I0, XYZW});
+    e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, ConstHalf);
+    // B unless its luma leaves the five's range, then A.
+    e.Test(Cond::Lt, 0, {I1}, 1, {R(28), XXXX}, true);
+    e.Test(Cond::Gt, 0, {I1}, 1, {R(30), XXXX}, true, Pred::NotP0);
+    e.MoveInternal({I1, 0xf}, {I0, XYZW}, Pred::P0);
+    e.MoveInternal({R(8), 0x3}, {I1, XYZW});
+    e.MoveInternal({R(10), 0x3}, {I1, ZWZW});
+    e.PackF16({Reg::Pa(0), 0xf}, R(8), R(10));
+    e.FinishNosched();
+    gxp.primary = e.Words();
+    return WriteGxp(gxp);
+}
+
 } // namespace GxmRenderer::Usse

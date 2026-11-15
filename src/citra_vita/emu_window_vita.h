@@ -9,6 +9,7 @@
 
 #include "common/common_types.h"
 #include "core/frontend/emu_window.h"
+#include "citra_vita/gxm_present.h"
 #include "video_core/renderer_base.h"
 
 namespace Core {
@@ -92,6 +93,11 @@ public:
 
 private:
     void DrawScreens();
+    bool CanDrawScreens() const;
+    /// The guest framebuffer of `screen` (0 top, 1 bottom) as the present draws it.
+    bool BuildScreen(int screen, GxmPresent::GuestScreen& out);
+    GxmPresent::GuestScreen top_screen{};
+    bool top_ready = false;
     void UpdateTouch();
 
     Core::System& system;

@@ -207,6 +207,13 @@ void Ui::BuildSettings() {
                    static_cast<GxmRenderer::VideoOptions::Upscale>(value < 0 || value > 1 ? 0 : value);
                GxmRenderer::SaveVideoOptions();
            });
+    toggle("FXAA", "Smooths jagged edges of the game's picture (top screen) before it is "
+           "stretched. Costs about 1-2 ms of GPU a frame.",
+           true, [] { return GxmRenderer::Video().fxaa; },
+           [](bool value) {
+               GxmRenderer::Video().fxaa = value;
+               GxmRenderer::SaveVideoOptions();
+           });
     choice("Region", "The console region reported to the title.", false,
            {"Auto", "Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"},
            [] { return Settings::values.region_value.GetValue() + 1; },
