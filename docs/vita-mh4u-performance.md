@@ -473,3 +473,9 @@ The water then drew with per-pixel noise. Found by stopping the combiner after e
 ## Stall recorder and asynchronous large reads (2026-11-15)
 
 Release prints `[mh4u] stall N ms: guest +F frames, gx G ms, render ~R ms, fs S ms N reads (+A ms async), heap H KiB` when two presents are over 100 ms apart (quiet for the first 20 s). On two area crossings it showed single file reads of 97-203 ms blocking the emulation thread. Reads of 64 KiB or more through LayeredFS now run on a worker (File::Read's async path), serialised by a lock in LayeredFS::ReadFile. Stalls over 100 ms on two crossings: 11 (max 262 ms) -> 4 (max 110 ms); one remaining stall had the guest itself produce no frame for 104 ms (its own loading). Kill switch `ux0:data/mh4u/syncreads`.
+
+## Slowdown that builds up over a session (2026-11-15)
+
+User report: performance drops after moving across areas in a quest (and at the quest counter after returning, down to 15 fps), never from a state saved there. Reproduced with eight area crossings from slot 1 (release): from the third crossing the game itself fell from 30 to 24-26 fps and the GX thread from ~350 to ~850 ms a second. GX profile (`emuprof emuprofgx`) early vs late: vertex-cache hits per window 2,400 -> 1,000, "miss (not wanted)" 750 -> 2,250, vertex data copied 7.5 -> 14.5 MB a second; `[vtxcache]` entries 122 -> 41 with no inserts. Cause: a key invalidated twice was volatile forever, and every area load rewrites the memory of the keys it reuses. Now volatility needs two invalidations within 2 s and expires after 10 s quiet. Eight crossings: game 30, GX 318-379 ms/s throughout.
+
+The release `[mh4u] health` line (every 300 frames) tracks surfaces, GPU pools, shaders/pipelines and the heap; over eight crossings surfaces grew 84 -> 193, pipelines 180 -> 620, heap ~201 -> ~207 MB of a 216 MB arena - none of them the slowdown, but worth watching.
