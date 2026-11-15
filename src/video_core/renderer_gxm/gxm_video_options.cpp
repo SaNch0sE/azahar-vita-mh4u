@@ -32,7 +32,7 @@ VideoOptions Load() {
             o.upscale = static_cast<VideoOptions::Upscale>(v);
         } else if (std::strcmp(line, "fxaa") == 0) {
             o.fxaa = v != 0;
-        } else if (std::strcmp(line, "scale_q") == 0 && v >= 4 && v <= 8) {
+        } else if (std::strcmp(line, "scale_q") == 0 && v >= 3 && v <= 8) {
             o.scale_q = v;
         } else if (std::strcmp(line, "msaa") == 0) {
             o.msaa = v != 0;

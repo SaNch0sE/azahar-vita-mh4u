@@ -215,12 +215,12 @@ void Ui::BuildSettings() {
                GxmRenderer::SaveVideoOptions();
            });
     choice("Render scale",
-           "Renders the game above the 3DS's 400x240 (applies on the next launch). Each step "
-           "costs a lot of GPU time: expect well under 30 fps above 1x.",
-           true, {"1x", "1.25x", "1.5x", "1.75x", "2x"},
-           [] { return static_cast<int>(GxmRenderer::Video().scale_q) - 4; },
+           "The game's internal resolution against the 3DS's 400x240 (applies on the next "
+           "launch). 0.75x is softer and faster; each step above 1x costs a lot of GPU time.",
+           true, {"0.75x", "1x", "1.25x", "1.5x", "1.75x", "2x"},
+           [] { return static_cast<int>(GxmRenderer::Video().scale_q) - 3; },
            [](int value) {
-               GxmRenderer::Video().scale_q = static_cast<u32>(4 + (value < 0 || value > 4 ? 0 : value));
+               GxmRenderer::Video().scale_q = static_cast<u32>(3 + (value < 0 || value > 5 ? 1 : value));
                GxmRenderer::SaveVideoOptions();
            });
     choice("Region", "The console region reported to the title.", false,

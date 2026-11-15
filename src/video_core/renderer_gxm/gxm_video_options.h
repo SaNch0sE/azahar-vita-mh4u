@@ -15,7 +15,7 @@ struct VideoOptions {
     enum class Upscale : u32 { Linear = 0, SharpBilinear = 1, EdgeAware = 2 };
     Upscale upscale = Upscale::Linear;
     bool fxaa = false;
-    /// Internal render scale in quarters: 4 = 1x .. 8 = 2x (next launch).
+    /// Internal render scale in quarters: 3 = 0.75x, 4 = 1x .. 8 = 2x (next launch).
     u32 scale_q = 4;
     /// 4x MSAA on render targets (next launch).
     bool msaa = false;

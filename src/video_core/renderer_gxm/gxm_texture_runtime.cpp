@@ -1215,7 +1215,7 @@ void SetFilters(SceGxmTexture& texture, SceGxmTextureFilter min_filter,
 u32 RenderScaleQ() {
     static const u32 q = [] {
         const u32 v = Video().scale_q;
-        return v >= 4 && v <= 8 ? v : 4u;
+        return v >= 3 && v <= 8 ? v : 4u;
     }();
     return q;
 }
