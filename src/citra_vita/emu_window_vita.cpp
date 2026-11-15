@@ -284,8 +284,14 @@ void EmuWindowVita::UpdateTouch() {
         }
     }
 
+    // The panel reaches the guest only while its bottom screen is on the display. In the Single
+    // screen layout that screen is not drawn, but the core still maps the whole panel onto it,
+    // so every touch on the visible top screen pressed an invisible bottom-screen button (MH4U:
+    // Hunter Search, the Gathering Hall). The Heavenfall mod moves those menus to the top screen
+    // and expects the touch screen only "whenever the bottom screen is visible".
     SceTouchData touch{};
-    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) <= 0 || touch.reportNum == 0) {
+    if (!GetFramebufferLayout().bottom_screen_enabled ||
+        sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) <= 0 || touch.reportNum == 0) {
         if (touch_down) {
             TouchReleased();
             touch_down = false;
