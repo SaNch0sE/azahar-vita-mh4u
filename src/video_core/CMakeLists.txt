@@ -130,6 +130,8 @@ if (ENABLE_GXM)
         renderer_gxm/gxm_program_disk_cache.h
         renderer_gxm/gxm_rasterizer.cpp
         renderer_gxm/gxm_alpha_prepass.cpp
+        renderer_gxm/gxm_video_options.cpp
+        renderer_gxm/gxm_video_options.h
         renderer_gxm/gxm_alpha_prepass.h
         renderer_gxm/gxm_rasterizer.h
         renderer_gxm/gxm_shader_tier.cpp

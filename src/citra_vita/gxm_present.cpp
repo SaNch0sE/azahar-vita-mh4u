@@ -32,6 +32,8 @@ extern "C" int sceRazorHudSetDisplayEnabled(int enabled);
 #include "video_core/pica/regs_external.h"
 #include "video_core/renderer_gxm/gxm_device.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
+#include "video_core/renderer_gxm/gxm_video_options.h"
+#include "video_core/renderer_gxm/usse/fixed_usse_gen.h"
 
 namespace VitaFrontend::GxmPresent {
 
@@ -204,6 +206,11 @@ struct State {
     SceGxmVertexProgram* color_vp{};
     SceGxmFragmentProgram* color_fp{};
     const SceGxmProgramParameter* color_param{};
+    // The sharp-bilinear upscale (VideoOptions::Upscale::SharpBilinear), from the emitter.
+    std::vector<uint8_t> sharp_gxp;
+    SceGxmShaderPatcherId sharp_f_id{};
+    SceGxmFragmentProgram* sharp_fp{};
+    const SceGxmProgramParameter* sharp_param[5]{};
 
     void* quad_indices{}; ///< the one index buffer every quad uses
 
@@ -1106,6 +1113,26 @@ bool BuildFixedPipelines() {
         }
     }
 
+    // Sharp bilinear: the same quad, the emitter's fragment program. Optional: without it the
+    // present keeps the linear quad.
+    {
+        g.sharp_gxp = GxmRenderer::Usse::EmitSharpBilinearFragmentProgram();
+        const auto* sharp = reinterpret_cast<const SceGxmProgram*>(g.sharp_gxp.data());
+        if (!g.sharp_gxp.empty() && sceGxmProgramCheck(sharp) == 0 &&
+            sceGxmShaderPatcherRegisterProgram(g.patcher, sharp, &g.sharp_f_id) >= 0 &&
+            sceGxmShaderPatcherCreateFragmentProgram(
+                g.patcher, g.sharp_f_id, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+                SCE_GXM_MULTISAMPLE_NONE, nullptr, quad_v, &g.sharp_fp) >= 0) {
+            const char* names[5] = {"sb_size", "sb_inv", "sb_scale", "sb_lo", "sb_hi"};
+            for (int i = 0; i < 5; i++) {
+                g.sharp_param[i] = sceGxmProgramFindParameterByName(sharp, names[i]);
+            }
+        } else {
+            LOG_ERROR(Frontend, "sharp-bilinear program unavailable");
+            g.sharp_fp = nullptr;
+        }
+    }
+
     // Solid color: x, y as floats; the color is a fragment uniform.
     {
         SceGxmVertexAttribute attr =
@@ -1736,8 +1763,10 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
     sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
     sceGxmTextureSetVAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
 
+    const bool sharp = g.sharp_fp != nullptr && GxmRenderer::Video().upscale ==
+                                                    GxmRenderer::VideoOptions::Upscale::SharpBilinear;
     sceGxmSetVertexProgram(g.context, g.quad_vp);
-    sceGxmSetFragmentProgram(g.context, g.quad_fp);
+    sceGxmSetFragmentProgram(g.context, sharp ? g.sharp_fp : g.quad_fp);
     sceGxmSetFragmentTexture(g.context, 0, &texture);
 
     // The rotation lives here, in the texture coordinates: the texture is 240 wide (u runs
@@ -1762,6 +1791,26 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
         {x0, y1, u0, v0},
         {x1, y1, u0, v1},
     };
+    if (sharp) {
+        // Texels per axis (u runs down the picture, v across it) and the output pixels each
+        // covers; below 1x the band is the whole texel, which is plain bilinear.
+        const float tw = static_cast<float>(sceGxmTextureGetWidth(&texture));
+        const float th = static_cast<float>(sceGxmTextureGetHeight(&texture));
+        const float su = std::max(1.0f, h / std::max(1.0f, (u1 - u0) * tw));
+        const float sv = std::max(1.0f, w / std::max(1.0f, (v1 - v0) * th));
+        const float values[5][2] = {{tw, th},
+                                    {1.0f / tw, 1.0f / th},
+                                    {su, sv},
+                                    {0.5f / su, 0.5f / sv},
+                                    {1.0f - 0.5f / su, 1.0f - 0.5f / sv}};
+        void* uniform_buffer = nullptr;
+        sceGxmReserveFragmentDefaultUniformBuffer(g.context, &uniform_buffer);
+        for (int i = 0; i < 5; i++) {
+            if (g.sharp_param[i] != nullptr) {
+                sceGxmSetUniformDataF(uniform_buffer, g.sharp_param[i], 0, 2, values[i]);
+            }
+        }
+    }
     DrawQuad(corners);
 }
 

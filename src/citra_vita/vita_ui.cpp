@@ -14,6 +14,7 @@
 #include "citra_vita/gxm_present.h"
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/vita_ui.h"
+#include "video_core/renderer_gxm/gxm_video_options.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
@@ -196,6 +197,16 @@ void Ui::BuildSettings() {
     toggle("Swap screens", "Puts the touch screen where the top screen would be.", true,
            [] { return Settings::values.swap_screen.GetValue(); },
            [](bool value) { Settings::values.swap_screen = value; });
+    choice("Upscale filter",
+           "How the 400x240 picture is stretched to the screen. Sharp keeps pixels crisp, "
+           "blending only at their edges.",
+           true, {"Linear", "Sharp bilinear"},
+           [] { return static_cast<int>(GxmRenderer::Video().upscale); },
+           [](int value) {
+               GxmRenderer::Video().upscale =
+                   static_cast<GxmRenderer::VideoOptions::Upscale>(value < 0 || value > 1 ? 0 : value);
+               GxmRenderer::SaveVideoOptions();
+           });
     choice("Region", "The console region reported to the title.", false,
            {"Auto", "Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"},
            [] { return Settings::values.region_value.GetValue() + 1; },

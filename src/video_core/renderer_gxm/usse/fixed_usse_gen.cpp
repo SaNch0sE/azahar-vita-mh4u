@@ -140,4 +140,45 @@ std::vector<uint8_t> EmitFillFragmentProgram() {
     return WriteGxp(gxp);
 }
 
+std::vector<uint8_t> EmitSharpBilinearFragmentProgram() {
+    // t = uv * size; i = floor(t); f = t - i; g = f - clamp(f, lo, hi); uv' = (i + g * scale +
+    // 0.5) / size: inside a texel the coordinate snaps to its centre, and only the band of
+    // width 1 / scale at its edges blends to the neighbour.
+    GxpProgram gxp;
+    gxp.inputs.push_back({FragmentInput::TexCoord0, 2});
+    gxp.uniforms.push_back({"sb_size", 0, 2, 1});
+    gxp.uniforms.push_back({"sb_inv", 2, 2, 1});
+    gxp.uniforms.push_back({"sb_scale", 4, 2, 1});
+    gxp.uniforms.push_back({"sb_lo", 6, 2, 1});
+    gxp.uniforms.push_back({"sb_hi", 8, 2, 1});
+    gxp.uniform_floats = 10;
+    gxp.samplers.push_back({"sb_source", 0});
+    gxp.pa_count = 4;
+    gxp.temp_count = 8;
+
+    const Reg I2 = Reg::I(2);
+    Encoder e;
+    e.skip_invalid = false;
+    e.Phas(true);
+    e.Nop();
+    e.Vec(VecOp::Mul, {I0, 0x3}, {Reg::Pa(0), XYZW}, {Reg::Sa(0), XYZW});    // t
+    e.Vec(VecOp::Frc, {I1, 0x3}, {I0, XYZW}, {I0, XYZW});                    // f
+    e.Vec(VecOp::Add, {I0, 0x3}, {I1, XYZW, Mod::Neg}, {I0, XYZW});          // i
+    e.Vec(VecOp::Max, {I2, 0x3}, {I1, XYZW}, {Reg::Sa(6), XYZW});            // clamp(f, lo,
+    e.Vec(VecOp::Min, {I2, 0x3}, {I2, XYZW}, {Reg::Sa(8), XYZW});            //   hi)
+    e.Vec(VecOp::Add, {I1, 0x3}, {I2, XYZW, Mod::Neg}, {I1, XYZW});          // g
+    e.Vec(VecOp::Mul, {I1, 0x3}, {I1, XYZW}, {Reg::Sa(4), XYZW});            // g * scale
+    e.Vec(VecOp::Add, {I1, 0x3}, {I1, XYZW}, ConstHalf);                     //   + 0.5
+    e.Vec(VecOp::Add, {I0, 0x3}, {I0, XYZW}, {I1, XYZW});                    // i + ...
+    e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW}, {Reg::Sa(2), XYZW});            // / size
+    e.MoveInternal({Reg::R(0), 0x3}, {I0, XYZW});
+    e.Sample2D(Reg::R(4), Reg::R(0), static_cast<uint8_t>(SamplerSaOffset(10, 0, 0)), nullptr,
+               0);
+    e.Wdf(0);
+    e.PackF16({Reg::Pa(0), 0xf}, Reg::R(4), Reg::R(6));
+    e.FinishNosched();
+    gxp.primary = e.Words();
+    return WriteGxp(gxp);
+}
+
 } // namespace GxmRenderer::Usse

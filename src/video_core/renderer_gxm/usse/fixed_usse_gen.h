@@ -30,5 +30,13 @@ namespace GxmRenderer::Usse {
 [[nodiscard]] std::vector<uint8_t> EmitBlitVertexProgram();
 [[nodiscard]] std::vector<uint8_t> EmitBlitFragmentProgram();
 [[nodiscard]] std::vector<uint8_t> EmitFillFragmentProgram();
+/**
+ * The present's sharp-bilinear upscale (TEXCOORD0 float2, sampler `sb_source` at TEXUNIT0):
+ * nearest-looking texels with a linear blend only across the last output pixel of each
+ * texel. Uniforms, in texels: sb_size (texture width, height), sb_inv (1 / size), sb_scale
+ * (output pixels per texel, per axis), sb_lo and sb_hi (0.5 -/+ (0.5 - 0.5 / scale)). The
+ * texture must be linear-filtered.
+ */
+[[nodiscard]] std::vector<uint8_t> EmitSharpBilinearFragmentProgram();
 
 } // namespace GxmRenderer::Usse
