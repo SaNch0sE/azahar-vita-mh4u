@@ -510,6 +510,9 @@ FileUtil::IOFile* LayeredFS::ReplacementFile(const std::string& path) {
 
 std::size_t LayeredFS::ReadFile(std::size_t offset, std::size_t length, u8* buffer) {
     ASSERT_MSG(offset + length <= GetSize(), "Out of bound");
+    // Large reads run on an FS worker thread (File::Read) while small ones stay on the
+    // emulation thread: one read at a time through the shared romfs reader and open files.
+    std::scoped_lock lock{replacement_mutex};
 
     std::size_t read_size = 0;
     if (offset < metadata.size()) {
@@ -543,7 +546,6 @@ std::size_t LayeredFS::ReadFile(std::size_t offset, std::size_t length, u8* buff
             romfs->ReadFile(relocation.original_offset + relative_offset, to_read,
                             buffer + read_size);
         } else if (relocation.type == 1) { // replace
-            std::scoped_lock lock{replacement_mutex};
             FileUtil::IOFile* replace_file = ReplacementFile(relocation.replace_file_path);
             if (replace_file != nullptr) {
                 replace_file->Seek(relative_offset, SEEK_SET);

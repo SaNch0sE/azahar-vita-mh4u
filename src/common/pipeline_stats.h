@@ -181,6 +181,15 @@ inline std::atomic<u32> skipsig_presents{0};
 inline std::atomic<u32> skipsig_backlog{0};
 inline std::atomic<u32> skipsig_arena{0};
 inline std::atomic<u32> skipsig_armed{0};
+/// Running totals (never reset) for the stall recorder (GxmPresent::EndFrame): GX
+/// command-list time, guest file-read time and count, guest top-screen frames finished.
+inline std::atomic<u64> gx_list_total_us{0};
+inline std::atomic<u64> fs_read_total_us{0};
+inline std::atomic<u64> fs_reads_total{0};
+/// Guest file reads done on a worker thread (File::Read's async path): per second, total.
+inline std::atomic<u32> fs_async_us{0};
+inline std::atomic<u64> fs_async_total_us{0};
+inline std::atomic<u64> guest_frames_total{0};
 /// Guest file reads (FS File::Read): time spent, count and KiB, per second.
 inline std::atomic<u32> fs_read_us{0};
 inline std::atomic<u32> fs_reads{0};

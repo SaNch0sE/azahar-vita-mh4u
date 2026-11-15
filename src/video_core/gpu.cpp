@@ -450,6 +450,7 @@ void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in, bool
             impl->shipping_rasterizer->SetSkipFrame(impl->skip_current);
         }
         impl->frame_boundaries++;
+        Common::PipelineStats::guest_frames_total.fetch_add(1, std::memory_order_relaxed);
         // Boundaries are arriving, so flips happen at frame edges; the vblank timeouts below
         // must only rescue phases with no boundaries at all.
         impl->skip_flip_pending_vblanks = 0;
@@ -652,6 +653,7 @@ void GPU::GxLoop() {
             MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
             const u64 list_t0 = Common::PipelineStats::NowUs();
             impl->pica.ProcessCmdList(gx.addr, gx.size, false);
+            Common::PipelineStats::gx_list_total_us.fetch_add(Common::PipelineStats::NowUs() - list_t0, std::memory_order_relaxed);
             Common::PipelineStats::gx_list_us.fetch_add(Common::PipelineStats::NowUs() - list_t0,
                                                         std::memory_order_relaxed);
             Common::PipelineStats::gx_lists.fetch_add(1, std::memory_order_relaxed);
@@ -1134,7 +1136,8 @@ void GPU::QueueCmdList(PAddr addr, u32 size) {
                                             : nullptr);
         impl->pica.ProcessCmdList(addr, size, !allow);
         impl->pica.SetListOverride(nullptr);
-        Common::PipelineStats::gx_list_us.fetch_add(Common::PipelineStats::NowUs() - list_t0,
+        Common::PipelineStats::gx_list_total_us.fetch_add(Common::PipelineStats::NowUs() - list_t0, std::memory_order_relaxed);
+            Common::PipelineStats::gx_list_us.fetch_add(Common::PipelineStats::NowUs() - list_t0,
                                                     std::memory_order_relaxed);
         Common::PipelineStats::gx_lists.fetch_add(1, std::memory_order_relaxed);
         cmdbuffer.trigger[0] = 0;

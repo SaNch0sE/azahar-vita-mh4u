@@ -5,6 +5,7 @@
 #include <algorithm>
 #include "common/vita_data_dir.h"
 #include <cstdio>
+#include <malloc.h>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1951,6 +1952,52 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
     DrawQuad(corners);
 }
 
+namespace {
+
+/// Stall recorder (release too): when the gap between two presented frames passes 100 ms,
+/// one line saying what each side did in it - the guest's finished frames, the GX thread's
+/// command-list time, the render thread's busy time (sampled one op in eight in release),
+/// guest file reads and the heap - so a rare drop names its owner. Quiet for the first 20 s.
+void RecordStall() {
+    namespace PS = Common::PipelineStats;
+    struct Snap {
+        u64 at, gx, render, fs_us, fs_n, guest, async;
+    };
+    static Snap last{};
+    static u64 start_us = 0;
+    static u32 printed = 0;
+    const Snap now{sceKernelGetProcessTimeWide(),
+                   PS::gx_list_total_us.load(std::memory_order_relaxed),
+                   PS::gpu_busy_total_us.load(std::memory_order_relaxed),
+                   PS::fs_read_total_us.load(std::memory_order_relaxed),
+                   PS::fs_reads_total.load(std::memory_order_relaxed),
+                   PS::guest_frames_total.load(std::memory_order_relaxed),
+                   PS::fs_async_total_us.load(std::memory_order_relaxed)};
+    if (start_us == 0) {
+        start_us = now.at;
+    }
+    const u64 gap = last.at != 0 ? now.at - last.at : 0;
+    if (gap >= 100000 && now.at - start_us > 20000000 && printed < 200) {
+        printed++;
+#ifdef VITA_DIAGNOSTICS
+        constexpr u64 render_scale = 1;
+#else
+        constexpr u64 render_scale = 8;
+#endif
+        const struct mallinfo heap = mallinfo();
+        sceClibPrintf("[mh4u] stall %llu ms: guest +%llu frames, gx %llu ms, render ~%llu ms, "
+                      "fs %llu ms %llu reads (+%llu ms async), heap %u KiB\n",
+                      gap / 1000, now.guest - last.guest, (now.gx - last.gx) / 1000,
+                      (now.render - last.render) * render_scale / 1000,
+                      (now.fs_us - last.fs_us) / 1000, now.fs_n - last.fs_n,
+                      (now.async - last.async) / 1000,
+                      static_cast<unsigned>(heap.uordblks / 1024));
+    }
+    last = now;
+}
+
+} // Anonymous namespace
+
 void EndFrame() {
     if (!g.initialized || !g.in_scene) {
         return;
@@ -2024,6 +2071,7 @@ void EndFrame() {
         GpuLiveFrame();
     }
     Common::PipelineStats::presents.fetch_add(1, std::memory_order_relaxed);
+    RecordStall();
     GXM_PHASE("present:done");
 }
 

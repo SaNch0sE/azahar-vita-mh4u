@@ -4,6 +4,7 @@
 
 #include <boost/serialization/unique_ptr.hpp>
 #include "common/archives.h"
+#include "common/file_util.h"
 #include "common/logging/log.h"
 #include "common/pipeline_stats.h"
 #include "core/core.h"
@@ -82,7 +83,14 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     // Do not use asynchronous operations on file reads, as in most cases
     // there are many of them with small sizes. This causes a lot of delay
     // due to thread communication overhead.
-    if (!allows_cache_reads) {
+    // PS Vita: except large ones. MH4U with a LayeredFS mod reads a block of a megabyte or so
+    // in one call when it crosses into an area, 100-200 ms on the card, and the emulation
+    // thread ran no other guest thread meanwhile (the stall recorder's lines, 2026-11-15).
+    // From 64 KiB the read goes to a worker as the cached path's misses do, and the reading
+    // thread sleeps while the rest of the game runs. ux0:data/mh4u/syncreads keeps them here.
+    constexpr u32 AsyncReadMin = 64 * 1024;
+    static const bool sync_reads = FileUtil::Exists("ux0:data/mh4u/syncreads");
+    if (!allows_cache_reads && (length < AsyncReadMin || sync_reads)) {
         auto& buffer = rp.PopMappedBuffer();
         IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
         std::unique_ptr<u8[]> data = std::make_unique_for_overwrite<u8[]>(length);
@@ -91,6 +99,9 @@ void File::Read(Kernel::HLERequestContext& ctx) {
         Common::PipelineStats::fs_read_us.fetch_add(
             static_cast<u32>(Common::PipelineStats::NowUs() - read_t0), std::memory_order_relaxed);
         Common::PipelineStats::fs_reads.fetch_add(1, std::memory_order_relaxed);
+        Common::PipelineStats::fs_read_total_us.fetch_add(
+            Common::PipelineStats::NowUs() - read_t0, std::memory_order_relaxed);
+        Common::PipelineStats::fs_reads_total.fetch_add(1, std::memory_order_relaxed);
         Common::PipelineStats::fs_read_kib.fetch_add(length >> 10, std::memory_order_relaxed);
         if (read.Failed()) {
             rb.Push(read.Code());
@@ -125,7 +136,7 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     async_data->buffer = &rp.PopMappedBuffer();
     async_data->length = length;
     async_data->offset = offset;
-    async_data->cache_ready = backend->CacheReady(offset, length);
+    async_data->cache_ready = allows_cache_reads && backend->CacheReady(offset, length);
     const bool really_async = !async_data->cache_ready;
     if (really_async) {
         async_data->pre_timer = std::chrono::steady_clock::now();
@@ -135,8 +146,13 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     ctx.RunAsync(
         [this, async_data](Kernel::HLERequestContext& ctx) {
             async_data->data = std::make_unique_for_overwrite<u8[]>(async_data->length);
+            const u64 read_t0 = Common::PipelineStats::NowUs();
             const auto read =
                 backend->Read(async_data->offset, async_data->length, async_data->data.get());
+            const u64 read_us = Common::PipelineStats::NowUs() - read_t0;
+            Common::PipelineStats::fs_async_us.fetch_add(static_cast<u32>(read_us),
+                                                         std::memory_order_relaxed);
+            Common::PipelineStats::fs_async_total_us.fetch_add(read_us, std::memory_order_relaxed);
             if (read.Failed()) {
                 async_data->ret = read.Code();
                 async_data->read_size = 0;

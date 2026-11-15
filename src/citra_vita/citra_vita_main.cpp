@@ -796,7 +796,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 // skip: vblanks each frameskip signal was on (presents, backlog, arenas), vblanks
                 // that armed a skip, and presents dropped as superseded on the render thread.
                 sceClibPrintf("[mh4u] speed %d%%  game %d.%d fps  shown %u fps  gx %u ms  "
-                              "render ~%u ms  skip p%u b%u a%u x%u sup %u  fs %u ms %u r %u KiB\n",
+                              "render ~%u ms  skip p%u b%u a%u x%u sup %u  fs %u ms %u r %u KiB async %u ms\n",
                               speed, fps10 / 10, fps10 % 10, presented, gx_ms, render_ms,
                               Common::PipelineStats::skipsig_presents.exchange(0, std::memory_order_relaxed),
                               Common::PipelineStats::skipsig_backlog.exchange(0, std::memory_order_relaxed),
@@ -805,7 +805,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                               Common::PipelineStats::presents_superseded.exchange(0, std::memory_order_relaxed),
                               Common::PipelineStats::fs_read_us.exchange(0, std::memory_order_relaxed) / 1000,
                               Common::PipelineStats::fs_reads.exchange(0, std::memory_order_relaxed),
-                              Common::PipelineStats::fs_read_kib.exchange(0, std::memory_order_relaxed));
+                              Common::PipelineStats::fs_read_kib.exchange(0, std::memory_order_relaxed),
+                              Common::PipelineStats::fs_async_us.exchange(0, std::memory_order_relaxed) / 1000);
 #endif // VITA_DIAGNOSTICS
                 // The clocks actually in effect (a clock plugin may override SetupClocks),
                 // every 30 s.
