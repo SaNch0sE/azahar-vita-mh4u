@@ -90,6 +90,12 @@ if (ENABLE_VITA_RENDER_TRACE)
     target_compile_definitions(citra_vita PRIVATE VITA_RENDER_TRACE)
 endif()
 
+# Condition-variable and semaphore waits that sleep instead of polling every 500 us
+# (pte_wait.c; TuizaVita 0.3B's finding).
+target_sources(citra_vita PRIVATE pte_wait.c)
+set_source_files_properties(pte_wait.c PROPERTIES COMPILE_OPTIONS "-fno-lto")
+target_link_options(citra_vita PRIVATE -Wl,--wrap=pte_osSemaphoreCancellablePend)
+
 option(VITA_ALLOC_TRACE "Log large heap allocations on the Vita build" OFF)
 # Allocation tracer: -DVITA_ALLOC_TRACE=ON logs every allocation >= 1 MiB (with a running live
 # total and the caller's return address) to the kernel printf channel, to find what eats the
