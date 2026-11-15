@@ -385,6 +385,9 @@ public:
     /// a draw's fragment side reads changed" without hashing those blocks. `versioned` says
     /// the registers only change through shipments (false: inline mode, hash instead).
     u64 fragment_regs_version = 0;
+    /// The same, but not bumped by a change that only rebinds a texture unit (dimensions,
+    /// addresses, format, filter bits): RasterizerGxm's texture-only fast path reads it.
+    u64 fragment_nonbinding_version = 0;
     bool fragment_regs_versioned = false;
     /// The same for what a hardware draw's vertex layout and program key read: the pipeline
     /// and vertex shader blocks (0x200-0x2FF), the VS output map (0x4F-0x56), the lighting

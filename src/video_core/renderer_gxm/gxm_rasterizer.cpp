@@ -1870,7 +1870,14 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
     const bool vertex_dirty = rebind || vs_data_dirty || current_gs != nullptr ||
                               (generated && (pica.vs_setup.uniforms_dirty || defaults_changed));
     (void)fs_hash;
-    const bool fragment_dirty = rebind || fs_data_dirty || tex_dims_dirty || fb_dims_changed;
+    // F0: a texture or target size change only matters to a program that declares the
+    // uniform; otherwise it stays pending for one that does (`texdimsalways`: always).
+    last_fs = fs;
+    static const bool dims_always = GxmFlag("texdimsalways");
+    const FsUniforms& fu = UniformsOf(fs);
+    const bool tex_dims_needed = tex_dims_dirty && (dims_always || fu.tex_dims);
+    const bool fb_dims_needed = fb_dims_changed && (dims_always || fu.fb_dims);
+    const bool fragment_dirty = rebind || fs_data_dirty || tex_dims_needed || fb_dims_needed;
     if (!vertex_dirty && !fragment_dirty) {
         stat_uniform_skips++;
         return;
@@ -1994,8 +2001,12 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
     if (!fragment_dirty) {
         return;
     }
-    tex_dims_dirty = false;
-    uniform_fb_dims = {fb_dims[0], fb_dims[1]};
+    if (dims_always || fu.tex_dims) {
+        tex_dims_dirty = false;
+    }
+    if (dims_always || fu.fb_dims) {
+        uniform_fb_dims = {fb_dims[0], fb_dims[1]};
+    }
 
     void* fbuf = nullptr;
     if (sceGxmReserveFragmentDefaultUniformBuffer(context, &fbuf) < 0 || fbuf == nullptr) {
@@ -2836,6 +2847,9 @@ void RasterizerGxm::DrawTriangles() {
             m[5]++;
         }
     }
+    if (TexOnlyRepeat()) {
+        return;
+    }
     repeat_ok = false;
     DrawSetup setup;
     if (!BeginDraw(setup, fixed_layout, vertex_count)) {
@@ -2892,6 +2906,136 @@ void RasterizerGxm::DrawTriangles() {
     repeat_key = key;
     repeat_epoch = draw_epoch;
     repeat_scene = scene_seq;
+    repeat_nb_version = pica.fragment_nonbinding_version;
+    using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
+    repeat_plain = !feedback_alpha_only && !skip_feedback_draw &&
+                   regs.texturing.texture0.type.Value() == TextureType::Texture2D;
+    repeat_fb_color_id = scene_fb != nullptr && scene_fb->HasColor() ? scene_fb->color_id
+                                                                       : VideoCore::SurfaceId{};
+    static const bool check = GxmFlag("texrepeatcheck");
+    if (check) {
+        repeat_fs_raw_hash = Pica::Shader::FSConfig{regs}.Hash();
+    }
+}
+
+/**
+ * The texture-only fast path for software draws (menu plan, Phase 1): the previous software
+ * draw's setup still stands except for which textures its units bind - only binding
+ * registers changed (the mirror's fragment_nonbinding_version) - and every unit resolves from
+ * the texture memo without reaching the cache. The pending run goes out under the old
+ * textures, the new ones are bound, and this draw's triangles become the next run. Anything
+ * else takes the full path. `notexrepeat` (flag or ux0:data/mh4u/notexrepeat) turns it off;
+ * `texrepeatcheck` (diag) compares the configuration against the last full draw's.
+ */
+bool RasterizerGxm::TexOnlyRepeat() {
+    static const bool off = [] {
+        if (GxmFlag("notexrepeat")) {
+            return true;
+        }
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/notexrepeat", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return false;
+    }();
+    if (off || !pica.fragment_regs_versioned || !repeat_ok || !in_scene || !repeat_plain ||
+        !vertex_batch.empty() || pending_ring_ranges.empty() || draw_epoch != repeat_epoch ||
+        scene_seq != repeat_scene || pica.lighting.lut_dirty || pica.fog.lut_dirty ||
+        pica.proctex.table_dirty || pica.fragment_nonbinding_version != repeat_nb_version) {
+        return false;
+    }
+    using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
+    // Pass 1: resolve every unit from the memo, changing nothing.
+    std::array<SceGxmTexture, 3> textures{white_texture, white_texture, white_texture};
+    std::array<float, 6> dimensions{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    std::array<VideoCore::SurfaceId, 3> ids{};
+    const auto pica_textures = regs.texturing.GetTextures();
+    for (u32 unit = 0; unit < pica_textures.size(); unit++) {
+        const auto& texture = pica_textures[unit];
+        if (!texture.enabled) {
+            continue;
+        }
+        if (unit == 0 && texture.config.type.Value() != TextureType::Texture2D) {
+            return false;
+        }
+        const auto info =
+            Pica::Texture::TextureInfo::FromPicaRegister(texture.config, texture.format);
+        const u32 max_level =
+            VideoCore::MipLevels(info.width, info.height, texture.config.lod.max_level) - 1;
+        const u64 memo_key =
+            Common::HashCombine(Common::ComputeHash64(&texture.config, sizeof(texture.config)),
+                                static_cast<u64>(texture.format) | (u64{max_level} << 8) |
+                                    (u64{unit} << 16));
+        const TexMemo& memo = tex_memo[(memo_key ^ (memo_key >> 17)) & (tex_memo.size() - 1)];
+        if (memo.key != memo_key || memo.gen != res_cache.StructureGen() || !memo.id) {
+            return false;
+        }
+        Surface& surface = res_cache.GetSurface(memo.id);
+        if (surface.modification_tick != memo.tick || !surface.HasMemory() ||
+            surface.HasPendingClear() || memo.id == repeat_fb_color_id) {
+            return false;
+        }
+        // BeginDraw drops MH4U's post-effect chain; its draws take the full path.
+        const u32 a = info.physical_address;
+        if (a == 0x1847D400 || a == 0x1849D400 || (a >= 0x18070800 && a < 0x18090000)) {
+            return false;
+        }
+        textures[unit] = memo.bound;
+        ids[unit] = memo.id;
+        dimensions[unit * 2] = static_cast<float>(surface.width);
+        dimensions[unit * 2 + 1] = static_cast<float>(surface.height);
+    }
+    // A size change the bound program reads needs its uniforms: the full path.
+    if (dimensions != tex_dims && (last_fs == nullptr || UniformsOf(last_fs).tex_dims)) {
+        return false;
+    }
+    static const bool check = GxmFlag("texrepeatcheck");
+    if (check && Pica::Shader::FSConfig{regs}.Hash() != repeat_fs_raw_hash) {
+        if (stat_texonly_mismatch++ < 20) {
+            LOG_ERROR(Render, "texrepeatcheck: the configuration changed under a texture-only "
+                              "repeat");
+        }
+        return false;
+    }
+    // Pass 2: commit.
+    const PhaseTimer total_timer{time_draws, times.total};
+    FlushDeferredDraws();
+    for (u32 unit = 0; unit < textures.size(); unit++) {
+        BindFragmentTexture(unit, textures[unit]);
+        bound_surfaces[unit] = ids[unit];
+        if (ids[unit]) {
+            Surface& surface = res_cache.GetSurface(ids[unit]);
+            surface.gpu_serial = runtime.CurrentEpoch();
+            surface.last_use_tick = runtime.GetResourceTick();
+        }
+    }
+    if (tex_dims != dimensions) {
+        tex_dims = dimensions;
+        tex_dims_dirty = true;
+    }
+    stat_draws++;
+    stat_texonly++;
+    SceGxmContext* context = Device().context;
+    for (const auto& range : pending_ring_ranges) {
+        u32 first = range.first;
+        u32 left = range.count;
+        while (left > 0) {
+            const u32 count = std::min(left, MaxVerticesPerDraw);
+            sceGxmSetVertexStream(context, 0,
+                                  vertex_ring.base +
+                                      static_cast<std::size_t>(first) * sizeof(Pica::OutputVertex));
+            sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
+                       identity_indices, count);
+            first += count;
+            left -= count;
+        }
+        stat_vertices += range.count;
+        ring_scene_pos = std::max(ring_scene_pos, range.end_pos);
+    }
+    pending_ring_ranges.clear();
+    // The next draw with these textures joins this one's setup.
+    repeat_key = RepeatKey();
+    return true;
 }
 
 Usse::VsRequest RasterizerGxm::MakeVsRequest(
@@ -4544,6 +4688,11 @@ void RasterizerGxm::EndFrame() {
             times = DrawTimes{};
             stat_guest_writes = stat_invalidates = stat_flushes = 0;
         }
+        if (stat_texonly != 0 || stat_texonly_mismatch != 0) {
+            LOG_INFO(Render, "texture-only repeats: {} ({} refused by texrepeatcheck)",
+                     stat_texonly, stat_texonly_mismatch);
+        }
+        stat_texonly = stat_texonly_mismatch = 0;
         if (stat_prepass != 0 || stat_prepass_nodepth != 0) {
             LOG_INFO(Render, "prepass: {} alpha-tested draws drawn depth-first, {} without depth; "
                      "why [{}]",

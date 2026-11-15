@@ -498,6 +498,17 @@ private:
     u64 scene_seq = 0;    ///< bumped when a scene begins
     bool repeat_ok = false;
     u64 repeat_key = 0, repeat_epoch = 0, repeat_scene = 0;
+    /// The texture-only fast path (TexOnlyRepeat): what the last full software draw's setup
+    /// was made from - the mirror's non-binding version, whether it was a plain setup (no
+    /// feedback handling, unit 0 a 2D texture), its colour target, and its FSConfig hash
+    /// (texrepeatcheck).
+    u64 repeat_nb_version = ~0ull;
+    bool repeat_plain = false;
+    VideoCore::SurfaceId repeat_fb_color_id{};
+    u64 repeat_fs_raw_hash = 0;
+    Shader* last_fs{}; ///< the fragment program UploadUniforms last ran for
+    u32 stat_texonly{}, stat_texonly_mismatch{};
+    bool TexOnlyRepeat();
     u32 stat_repeat_draws = 0;
     /// BeginDraw's own repeat: like the software-draw repeat above, but for any draw - the
     /// fragment-side setup (framebuffer, textures, scene, depth/stencil state) is kept when the

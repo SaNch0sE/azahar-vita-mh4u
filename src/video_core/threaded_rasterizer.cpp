@@ -120,11 +120,29 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
         t[PICA_REG_INDEX(lighting.disable)] = true;
         return t;
     }();
+    // Texture-binding registers (RasterizerGxm's texture-only fast path): each unit's
+    // dimensions, addresses and format, and its configuration word when only filter bits move
+    // (type and wrap modes unchanged). Everything else in the fragment blocks is non-binding.
+    static const std::array<bool, 0x300> binding = [] {
+        std::array<bool, 0x300> t{};
+        for (const u32 i : {0x82u, 0x92u, 0x9Au, 0x85u, 0x86u, 0x87u, 0x88u, 0x89u, 0x8Au,
+                            0x95u, 0x9Du, 0x8Eu, 0x96u, 0x9Eu}) {
+            t[i] = true;
+        }
+        return t;
+    }();
+    static_assert(PICA_REG_INDEX(texturing.texture0) == 0x81 &&
+                  PICA_REG_INDEX(texturing.texture1) == 0x91 &&
+                  PICA_REG_INDEX(texturing.texture2) == 0x99);
     bool fragment_changed = false;
+    bool nonbinding_changed = false;
     bool vertex_changed = false;
     for (const auto& [index, value] : shipment.reg_delta) {
         u32& reg = mirror.regs.internal.reg_array[index];
         if (reg != value) {
+            const bool filter_only = (index == 0x83 || index == 0x93 || index == 0x9B) &&
+                                     ((reg ^ value) & 0x70007700u) == 0;
+            const bool is_binding = (index < binding.size() && binding[index]) || filter_only;
             vertex_changed |= index < vertex_reads.size() && vertex_reads[index];
             bool in_block = false;
             for (const auto& [first, count] : fragment_blocks) {
@@ -132,6 +150,7 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
             }
             in_block &= !fragment_ignored[index];
             fragment_changed |= in_block;
+            nonbinding_changed |= in_block && !is_binding;
             if (count_stats && in_block &&
                 index < Common::PipelineStats::frag_reg_changes.size()) {
                 Common::PipelineStats::frag_reg_changes[index]++;
@@ -142,6 +161,9 @@ void ThreadedRasterizer::ApplyShipment(Pica::PicaCore& mirror, const Shipment& s
     mirror.fragment_regs_versioned = true;
     if (fragment_changed) {
         mirror.fragment_regs_version++;
+    }
+    if (nonbinding_changed) {
+        mirror.fragment_nonbinding_version++;
     }
 
     vertex_changed |= shipment.vs.has_code ||

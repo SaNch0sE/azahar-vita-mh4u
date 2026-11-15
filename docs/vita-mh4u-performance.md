@@ -394,3 +394,13 @@ GPU per frame (diag `scenetime`, area 3):
 | `ptoffbl` (alpha test off for the 1,275 blended draws) | 33.9 |
 
 So the ~8 ms is in the unblended alpha-tested draws, and ~6 ms of it is the discard itself happening mid-scene, whatever the program does; the in-place colour pass costs only ~1.7 ms. The in-place pre-pass cannot recover it. Only moving the punch-through draws out of the middle of the scene could, if the cost is the GPU flushing already-tagged opaque work (Fable's model). If instead the cost is the grass cards' own overdraw being shaded, moving them would not help either. Next step: an experiment that tells the two apart, before a deferred-context build.
+
+## Texture-only fast path for software draws (2026-11-15)
+
+Menu plan Phase 1 (F0 + A), built as planned:
+- **F0** (`UploadUniforms`): tex_dims/fb_dims dirtiness only counts for a program that declares the uniform; otherwise it stays pending. `texdimsalways` restores the old behaviour.
+- **A** (`RasterizerGxm::TexOnlyRepeat`, called from `DrawTriangles` before the full path): the mirror keeps `fragment_nonbinding_version`, which texture-binding register changes don't bump (dims, addresses, formats, and filter-only config changes). When the previous software draw's setup stands except for the bindings, and every unit resolves from the texture memo, it flushes the pending run, binds the new textures and draws, without BeginDraw. Kill switch `notexrepeat` (flag or file); `texrepeatcheck` (diag) compares FSConfig hashes.
+
+Measured at the quest counter (slot 1):
+- diag: 16,632 fast-path draws per 3 s, 0 mismatches. Render-thread phases per 3 s: framebuffer 169→142 ms, textures 237→119, programs 599→370, uniforms 291→205, draw 264→178. Diag fps 21–22 → 24.
+- release: 24–25 fps shown either way. The GX thread is at ~880 ms/s with the render thread relieved, so the counter is now GX-bound; the GX trims (menu plan G) come next for it.
