@@ -414,3 +414,25 @@ Release, area 3 with the camera script: shown 28.84 -> 29.42 / 29.61; seconds un
 ## Present scene without the vertex wait (2026-11-15)
 
 The present's `BeginScene` set `SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY` as well as the fragment dependency. Only its fragment stage samples the screens, and fragment processing is in scene order, so the vertex wait only held the tiler: the next frame's world could not be tiled while this frame's was still being shaded (the ~3.4 ms of vertex work a frame lost its overlap). Without it, release area 3 with the camera script: shown 30.02 in two runs, 105/110 and 108/112 seconds at 30+, none under 29, a skip armed on 1 and 5 vblanks (from 29.4-29.6 with the frameskip change alone, 28.8 before both). Screens correct in area 3 and at the quest counter. Switch `presentvwait` (diag flag or `ux0:data/mh4u/presentvwait`) puts the wait back.
+
+## Quest area 2 (2026-11-15, the user's new save state, slot 2)
+
+Release: game 30, shown 24-25 in the normal view (26.3 average over the camera script), 30 looking at the ground. GX ~350 ms/s. GPU-bound: main target 40.7 ms a frame (world scene 39.6 + bottom-screen clear scene 1.1).
+
+GPU per frame (diag `timedraw scenetime`):
+
+| Run | ms |
+|---|---|
+| Baseline | 40.7 |
+| `nofog` | 36.7 |
+| `dbgminfs minkeep_tex minkeep_tev minkeep_alpha` (no lighting, fog) | 23.3 |
+| `dbgminfs minkeep_tex minkeep_tev minkeep_light` (no alpha test, fog) | 28.3 |
+| `dbgminfs dbgminsel_lit` (lit programs bare) | 8.6 |
+| `dbgminfs dbgminsel_pt` (procedural texture programs bare) | 40.2 |
+| `ptoffop` (alpha test off, unblended) | 35.4 |
+| `ptoffbl` (alpha test off, blended) | 34.3 |
+| `dbgminfs` | 7.2 |
+
+Alpha-tested draws (diag `ptcensus`, per 15,000 binds): unblended GREATER 128 cut-outs 6,632 draws / 2.6M vertices; unblended GREATER 5/0/30; blended SrcAlpha/OneMinusSrcAlpha, GREATER 0, depth write off, 3,582 draws / 816k vertices. The world target is RGBA8; ~184 dst-alpha blends per 15,000 blended binds, all into the world target after the foliage (Zero/One colour, alpha × DstAlpha: the depth-of-field mask).
+
+**Blended alpha-0 tests dropped** (`BindPrograms`): an alpha test that rejects only alpha 0, on a draw blended Add with SourceAlpha (or Zero) / One (or OneMinusSourceAlpha), no depth write, no stencil, into an 8-bit target, is drawn with the no-kill program. Colour is exact; into RGBA8 a rejected fragment now writes alpha 0 instead of leaving it, which only the depth-of-field mask could see. Screenshots from five camera angles matched the base build. Kill switch `noblendptdrop` (flag or file). Diag: 40.7 -> 34.2 ms. Release, camera script: shown 26.3 -> 29.0, seconds under 29 from 89 of 113 to 24 of 110.

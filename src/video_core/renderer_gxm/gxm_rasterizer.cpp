@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <unordered_map>
 #include "common/vita_data_dir.h"
 #include <map>
 #include <bit>
@@ -1459,6 +1460,45 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
          om.alpha_test.ref == 255)) {
         fs_config.framebuffer.alpha_test_func.Assign(CompareFunc::Always);
     }
+    {   // An alpha test that only rejects alpha 0 changes nothing for a draw whose rejected
+        // fragments contribute nothing: colour blended Add with source factor SourceAlpha (or
+        // Zero) and destination factor One or OneMinusSourceAlpha, no depth write, no stencil,
+        // into an 8-bit colour target. Into RGB8/RGB565 that is exact (no stored alpha on the
+        // PICA; the GXM surface's alpha is sampled as 1 and destination-alpha factors are
+        // resolved). Into RGBA8 the colour is exact but a rejected fragment would have left
+        // the stored alpha alone and now writes 0 (these draws blend alpha One/Zero). MH4U's
+        // world target is RGBA8 and its alpha feeds the depth-of-field mask; the mask quads
+        // rewrite alpha behind them, and screenshots of area 2 from five camera angles
+        // matched with and without the drop (2026-11-15), so it is on for RGBA8 too. The
+        // kill program costs the SGX its hidden-surface removal: these draws were ~5 ms of
+        // area 2's 40.7 ms frame. Kill switch `noblendptdrop` (diag flag or
+        // ux0:data/mh4u/noblendptdrop).
+        static const bool keep_test = [] {
+            std::FILE* f = std::fopen(VITA_DATA_DIR "/noblendptdrop", "rb");
+            if (f != nullptr) {
+                std::fclose(f);
+                return true;
+            }
+            return GxmFlag("noblendptdrop");
+        }();
+        using Factor = Pica::FramebufferRegs::BlendFactor;
+        using CF = Pica::FramebufferRegs::ColorFormat;
+        const auto f = fs_config.framebuffer.alpha_test_func.Value();
+        const auto& b = om.alpha_blending;
+        const auto target_format = fb_regs.color_format.Value();
+        if (!keep_test && om.alphablend_enable &&
+            ((f == CompareFunc::GreaterThan && om.alpha_test.ref == 0) ||
+             (f == CompareFunc::GreaterThanOrEqual && om.alpha_test.ref == 1)) &&
+            b.blend_equation_rgb == Pica::FramebufferRegs::BlendEquation::Add &&
+            (b.factor_source_rgb == Factor::SourceAlpha || b.factor_source_rgb == Factor::Zero) &&
+            (b.factor_dest_rgb == Factor::One || b.factor_dest_rgb == Factor::OneMinusSourceAlpha) &&
+            !om.depth_write_enable && !om.stencil_test.enable &&
+            (target_format == CF::RGB8 || target_format == CF::RGB565 ||
+             target_format == CF::RGBA8)) {
+            fs_config.framebuffer.alpha_test_func.Assign(CompareFunc::Always);
+            stat_blend_pt_dropped++;
+        }
+    }
     {   // Diag split experiment (2026-11-15): alpha test off for blended (ptoffbl) or unblended
         // (ptoffop) alpha-tested draws. In area 3 the ~8 ms is all in the unblended ones.
         static const bool off_bl = GxmFlag("ptoffbl");
@@ -1472,6 +1512,86 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
                                   b.factor_dest_rgb == Factor::Zero);
             if ((replace && off_op) || (!replace && off_bl)) {
                 fs_config.framebuffer.alpha_test_func.Assign(CompareFunc::Always);
+            }
+        }
+    }
+    {   // ptcensus (diag): alpha-tested draws by alpha test, blend and depth/colour mask,
+        // to tell which can drop the test exactly (blended, depth write off, test passing
+        // every alpha that contributes). Top 12 every 15,000 binds.
+        static const bool census = GxmFlag("ptcensus");
+        if (census && om.alphablend_enable) {
+            static u32 dst_alpha_draws = 0, all_binds = 0;
+            using BF = Pica::FramebufferRegs::BlendFactor;
+            const auto reads_dst_alpha = [](BF x) {
+                return x == BF::DestAlpha || x == BF::OneMinusDestAlpha ||
+                       x == BF::SourceAlphaSaturate;
+            };
+            const auto& bb = om.alpha_blending;
+            // Order within the frame: a dst-alpha blend after a blended alpha-0-tested draw
+            // into the same colour target is what would see the dropped test.
+            static u32 seen_frame = 0, after = 0, before = 0;
+            static PAddr pt_target = 0;
+            if (seen_frame != frame_index) {
+                seen_frame = frame_index;
+                pt_target = 0;
+            }
+            const PAddr target = fb_regs.GetColorBufferPhysicalAddress();
+            const auto tf = fs_config.framebuffer.alpha_test_func.Value();
+            if (tf == CompareFunc::GreaterThan && om.alpha_test.ref == 0 && !om.depth_write_enable) {
+                pt_target = target;
+            }
+            if (reads_dst_alpha(bb.factor_source_rgb) || reads_dst_alpha(bb.factor_dest_rgb) ||
+                reads_dst_alpha(bb.factor_source_a) || reads_dst_alpha(bb.factor_dest_a)) {
+                dst_alpha_draws++;
+                (pt_target == target ? after : before)++;
+                if (all_binds % 15000 == 14999 || (after + before) % 200 == 1) {
+                    LOG_INFO(Render, "ptcensus: dst-alpha blend into {:08x} src {}/{} dst {}/{}: after alpha-0 blended draws {} before {}",
+                             target, static_cast<u32>(bb.factor_source_rgb.Value()),
+                             static_cast<u32>(bb.factor_source_a.Value()),
+                             static_cast<u32>(bb.factor_dest_rgb.Value()),
+                             static_cast<u32>(bb.factor_dest_a.Value()), after, before);
+                }
+            }
+            if (++all_binds % 15000 == 0) {
+                LOG_INFO(Render, "ptcensus: dst-alpha blends {} of the last 15000 blended binds (fmt {})",
+                         dst_alpha_draws, static_cast<u32>(fb_regs.color_format.Value()));
+                dst_alpha_draws = 0;
+            }
+        }
+        const auto f = fs_config.framebuffer.alpha_test_func.Value();
+        if (census && f != CompareFunc::Always) {
+            struct Count { u32 draws, verts; };
+            static std::unordered_map<u64, Count> counts;
+            static u32 binds = 0;
+            const u64 key = (u64{static_cast<u32>(f)} << 60) | (u64{om.alpha_test.ref.Value()} << 52) |
+                            (u64{om.alphablend_enable.Value()} << 51) |
+                            (u64{om.stencil_test.enable.Value()} << 50) |
+                            (u64{static_cast<u32>(fb_regs.color_format.Value()) & 7u} << 45) |
+                            (u64{om.depth_color_mask & 0x1fffu} << 32) |
+                            (u64{static_cast<u32>(om.alpha_blending.blend_equation_rgb.Value())} |
+                             (u64{static_cast<u32>(om.alpha_blending.blend_equation_a.Value())} << 8) |
+                             (u64{static_cast<u32>(om.alpha_blending.factor_source_rgb.Value())} << 16) |
+                             (u64{static_cast<u32>(om.alpha_blending.factor_dest_rgb.Value())} << 20) |
+                             (u64{static_cast<u32>(om.alpha_blending.factor_source_a.Value())} << 24) |
+                             (u64{static_cast<u32>(om.alpha_blending.factor_dest_a.Value())} << 28));
+            auto& c = counts[key];
+            c.draws++;
+            c.verts += vertex_count;
+            if (++binds % 15000 == 0) {
+                std::vector<std::pair<u64, Count>> v(counts.begin(), counts.end());
+                std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+                    return a.second.verts > b.second.verts;
+                });
+                std::string out;
+                for (size_t i = 0; i < v.size() && i < 12; i++) {
+                    const u64 k = v[i].first;
+                    out += fmt::format(" [func {} ref {} blend {} st {} fmt {} mask {:04x} eq/fac {:08x}: {} draws {} verts]",
+                                       k >> 60, (k >> 52) & 0xff, (k >> 51) & 1, (k >> 50) & 1, (k >> 45) & 7,
+                                       (k >> 32) & 0x1fff, k & 0xffffffffu, v[i].second.draws,
+                                       v[i].second.verts);
+                }
+                LOG_INFO(Render, "ptcensus:{}", out);
+                counts.clear();
             }
         }
     }
@@ -4713,6 +4833,8 @@ void RasterizerGxm::EndFrame() {
                      stat_gs_points, stat_gs_declined);
         }
         stat_gs_hw = stat_gs_points = stat_gs_declined = 0;
+        LOG_INFO(Render, "blended draws drawn without their alpha-0 test: {}", stat_blend_pt_dropped);
+        stat_blend_pt_dropped = 0;
         stat_hw_draws = stat_hw_refused = stat_scissor_free = 0;
         stat_lut_waits = 0;
         stat_frames = stat_draws = stat_vertices = stat_scenes = stat_skipped = stat_finishes =

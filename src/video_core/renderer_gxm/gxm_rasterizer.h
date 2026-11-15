@@ -605,6 +605,7 @@ private:
     u32 stat_gpu_blit_logs{}, stat_guest_writes{}, stat_invalidates{}, stat_flushes{};
     u32 stat_hw_draws{}, stat_hw_refused{};
     u32 stat_scissor_free{}; ///< draws whose scissor test the region clip made redundant
+    u32 stat_blend_pt_dropped{}; ///< blended draws whose alpha-0 test was dropped (BindPrograms)
 
     /**
      * Where the render thread's time actually goes, under the `timedraw` switch.
