@@ -446,3 +446,14 @@ Alpha-tested draws (diag `ptcensus`, per 15,000 binds): unblended GREATER 128 cu
 Area 2, diag: 33.6 -> ~31.5 ms. Screenshots match the base build at noise level (area 2 still frame, quest counter pixel-identical). Release, camera script, two runs: shown 29.97 and 30.02, 106/112 and 115/117 seconds at 30+, at most 1 second under 29.
 
 Fable's remaining list (docs/plans/gameplay-headroom.md): fog coordinate as one two-wide MAD (new form), fetch moved into SampleTextures, pack from the internal register (new form), specular as a CPU constant for the single-light shape, diffuse kept in the internal, LUT row from the upload, alpha test as a direct compare, and a census of unblended GREATER 0/5/30 draws whose texture alpha never falls below the reference.
+
+## Slot 1: area 2 spot and area transitions (2026-11-15, the user's new save state)
+
+User report: fps drops with the camera at/near the slot 1 spot in area 2, and when moving between areas; a fresh state load can perform better than after moving between areas.
+
+Measured (release unless noted):
+- Fresh load, standing at the spot: 30 shown for 20 s, no skip signals. Diag GPU 29.0-31.6 ms a frame (one main scene a frame, GPU wait ~0), so ~2-4 ms margin at the spot itself.
+- `trans.sh` (scratchpad; left stick Down 6 s, stays of 20 s, screenshots per segment): the first run went from area 2 into area 3. The transition dipped for ~5 s: shown 25, 23, 30, 19, 28 (game fps 23.5/23/18 in two of those seconds, so the guest itself slowed: loading, not rendering). Area 3 afterwards (with Apceros herds) held 30 for 20 s.
+- The return run (stick Up 6 s) did not leave area 3; the later segments are all area 3 at 30. So the 3 -> 2 return and "area 2 after a round trip" are **not measured yet**.
+
+Next when resumed: fix the return direction in `trans.sh` (check the minimap/screenshot after each run), then measure area 2 at the spot after one and two round trips against the fresh-load numbers; if worse, diag `timedraw scenetime` after the round trip (GPU vs render thread, shader cache/surface counts, heap) and hand the logs to Fable.
