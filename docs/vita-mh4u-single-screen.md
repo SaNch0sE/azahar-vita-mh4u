@@ -38,3 +38,20 @@ Copy into `ux0:data/azahar/load/mods/0004000000126300/` (USA; 0004000000126100 f
 
 The console log then shows `LayeredFS replacement file in use for /eng/data/...` and
 `exefs/code.bin overriding built-in ExeFS file`.
+
+## Wide picture (16:9)
+
+The mod's experimental aspect option keeps the game's 400x240 frame but widens its 3D views and
+spreads the interface, for an emulator that stretches the picture to the screen's shape. Build it
+with `--cheat-aspect-ratio 16:9` (ratios: 4:3, 16:10, 16:9, 20:9, 21:9, 32:9), install it as
+above after removing the old mod folder, choose 16:9 in the game's START menu, third page, Mod
+Settings, and set the port's *Picture shape* (Settings) to **Wide (16:9)** - `wide=1` in
+`ux0:data/mh4u/video.txt` - which stretches the top screen over the whole 960x544 display
+(Settings::AspectRatio::Stretch). The sharp upscale filter scales each axis separately.
+
+## Touch
+
+In the Single screen layout touches do not reach the game: the hidden bottom screen would
+otherwise take them (invisible Hunter Search, Gathering Hall). The mod puts every menu on the
+top screen and expects the touch screen only while the bottom screen is visible: layouts that
+show it (or Swap screens) keep touch.

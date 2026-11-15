@@ -27,6 +27,7 @@
 #include <psp2/shellutil.h>
 #include <psp2/vshbridge.h>
 #include "citra_vita/heap_prof.h"
+#include "video_core/renderer_gxm/gxm_video_options.h"
 #include "citra_vita/gxm_present.h"
 #ifdef CITRA_VITA_GPUPROF
 #include "citra_vita/gpuprof.h"
@@ -1126,6 +1127,9 @@ int EmulatorMain() {
     // (the touch screen's menus moved to the top screen), and the top screen then fills the
     // display. The pause menu's Screen layout still switches back.
     Settings::values.layout_option = Settings::LayoutOption::SingleScreen;
+    // Picture shape (video.txt `wide`): the whole display for the mod's 16:9 option.
+    Settings::values.aspect_ratio = GxmRenderer::Video().wide ? Settings::AspectRatio::Stretch
+                                                             : Settings::AspectRatio::Default;
     VTRACE("EmulatorMain: applets");
     Frontend::RegisterDefaultApplets(system);
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());

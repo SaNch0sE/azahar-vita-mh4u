@@ -19,6 +19,10 @@ struct VideoOptions {
     u32 scale_q = 4;
     /// 4x MSAA on render targets (next launch).
     bool msaa = false;
+    /// The top screen across the whole display (16:9) instead of the 3DS's 5:3 with side
+    /// bars: for the Heavenfall mod built with --cheat-aspect-ratio 16:9, which widens the
+    /// game's views and interface for a stretched picture.
+    bool wide = false;
 };
 
 /// The live options (loaded from the file on first use).

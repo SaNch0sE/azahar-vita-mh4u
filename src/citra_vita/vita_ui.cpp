@@ -217,6 +217,18 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().fxaa = value;
                GxmRenderer::SaveVideoOptions();
            });
+    choice("Picture shape",
+           "3DS keeps the game's 5:3 picture with bars at the sides. Wide fills the screen; "
+           "use it with the Heavenfall mod built with --cheat-aspect-ratio 16:9 (and 16:9 "
+           "chosen in its Mod Settings), or the picture looks stretched.",
+           true, {"3DS (5:3)", "Wide (16:9)"},
+           [] { return GxmRenderer::Video().wide ? 1 : 0; },
+           [](int value) {
+               GxmRenderer::Video().wide = value == 1;
+               Settings::values.aspect_ratio = value == 1 ? Settings::AspectRatio::Stretch
+                                                          : Settings::AspectRatio::Default;
+               GxmRenderer::SaveVideoOptions();
+           });
     choice("Render scale",
            "The game's internal resolution against the 3DS's 400x240 (applies on the next "
            "launch). 0.75x is softer and faster; each step above 1x costs a lot of GPU time.",
