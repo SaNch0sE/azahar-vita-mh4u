@@ -463,3 +463,9 @@ Next when resumed: fix the return direction in `trans.sh` (check the minimap/scr
 ## Area crossings: mod files opened per read (2026-11-15)
 
 Release counters `fs <ms> <reads> <KiB>` (guest File::Read through a backend without cached reads, which is LayeredFS with the Heavenfall mod). Standing: 4-5 reads, 3-6 ms a second. Crossing area 2 -> 3: 59, 164, 144, 30, 296, 134, 63 ms a second, with game fps 28, 24, 24, 30, 22, 29, 29 - one second spent 296 ms on three 8 KiB reads. `LayeredFS::ReadFile` opened the replacement file for every read. With eight replacement files kept open (least recently used goes first): one second of 100-130 ms (1.3-1.6 MB of real data) at 25-27 fps, then 30. TuizaVita 0.3B moves these reads to a worker thread instead; the remaining ~0.1 s could still go that way.
+
+## Camp pond water (2026-11-15, the user's slot 3)
+
+The pond was an empty pit: its programs sample a cube map (texture unit 0 type cube), which the emitter refused, so the draws were skipped (`no fragment program ... type: cube`, seven programs). Cube maps are now a linear 2D atlas of the six faces stacked (+X, -X, +Y, -Y, +Z, -Z, level 0 only), filled by `CopyTextures` from the face surfaces; `FragmentEmitter::CubeCoordinates` picks the face and coordinate from (u, v, w) as the PICA/GL do.
+
+The water then drew with per-pixel noise. Found by stopping the combiner after each stage (`dbgstage0..5`: clean to 3, noisy from 4) and Fable reading the emitter: a colour operand with the SourceAlpha modifier on PreviousBuffer read the colour snapshot's w lane, which no instruction wrote (uninitialised register: per-thread garbage), and would have been the wrong stage's alpha anyway. `LoadArg` and `PlanCombinerBuffer` now choose the buffer half by the operand's modifier, both ways. Pond clean at 30 fps; slot 1 unchanged against a mipmap-era screenshot.
