@@ -1576,11 +1576,24 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
         // nodeps (GPU profiling only): no flags, as psp2-cex-gpues4-prof requires; the
         // renderer's scenes then set no dependency for this one to wait on either.
         static const bool no_dependency = GxmRenderer::GxmFlag("nodeps");
+        // Only the fragment stage samples the screens, and fragment processing runs scene by
+        // scene in order, as for the renderer's blits. A vertex-stage wait here held the
+        // tiler, so the next frame's scenes could not be tiled while this frame's world was
+        // still being shaded. `presentvwait` (diag flag or ux0:data/mh4u/presentvwait) puts
+        // the wait back.
+        static const bool vertex_wait = [] {
+            std::FILE* f = std::fopen(VITA_DATA_DIR "/presentvwait", "rb");
+            if (f != nullptr) {
+                std::fclose(f);
+                return true;
+            }
+            return GxmRenderer::GxmFlag("presentvwait");
+        }();
         sceGxmBeginScene(
             g.context,
             no_dependency ? 0u
                           : u32{SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY |
-                                SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY},
+                                (vertex_wait ? SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY : 0u)},
             g.render_target, nullptr, nullptr, g.sync[g.back], &g.display_surface[g.back], nullptr);
     }
     g.in_scene = true;

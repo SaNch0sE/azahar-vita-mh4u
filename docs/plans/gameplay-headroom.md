@@ -28,6 +28,8 @@ Frame pacing, release, `cam.sh` (camera segments), gameplay seconds only:
 | Old (`oldskip`) | 28.84 | 32 / 83 | 21 | 137 (presents 67, backlog 71) | 8 |
 | New, run 1 | 29.42 | 20 / 48 | 2 | 48 (presents only) | 0 |
 | New, run 2 | 29.61 | 68 / 111 | 7 | 75 (presents only) | 0 |
+| New + G2, run 1 | 30.02 | 105 / 110 | 0 | 1 | 0 |
+| New + G2, run 2 | 30.02 | 108 / 112 | 0 | 5 | 0 |
 
 ## Findings (Fable)
 
@@ -43,7 +45,7 @@ Frame pacing, release, `cam.sh` (camera segments), gameplay seconds only:
 | # | Item | Relieves | Estimate | Status |
 |---|---|---|---|---|
 | FS | Frameskip: presents signal only when two are pending for 3 vblanks or three are pending; presents out of `avg_op_us`; superseded only with three pending | Pacing | measured +0.6-0.8 shown fps | **Done** (kill switch `oldskip`) |
-| G2 | Present scene without the vertex dependency wait | GPU overlap | 0-2 ms | Next (an hour) |
+| G2 | Present scene without the vertex dependency wait | GPU overlap | measured: area 3 holds 30 shown | **Done** (switch `presentvwait`) |
 | G1 | Drop the bottom-screen display transfer in Single screen so the clear quad joins the world scene | GPU, render | up to ~1 ms (scene 0 measured at 1.07 ms) | Next (half a day) |
 | G3 | Fog strip as a non-dependent (projective iterated) read | GPU | up to ~1 ms (fetch measured) | After a spike |
 | G4 | Textures 0-2 on raw coordinates as non-dependent reads | GPU | 0.5-1.5 ms | Same spike as G3 |
