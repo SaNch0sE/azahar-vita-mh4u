@@ -81,6 +81,8 @@ namespace GxmRenderer {
  *             constant, Usse::FrMode); logfresnel dumps the tables (fresnellog.txt)
  *   nolightfast  the lighting emitter without its streamlined directional-light paths
  *   loglights per-light colours of lit draws to ux0:data/mh4u/lightlog.txt
+ *   ptsources, ptorder  the unblended alpha-tested draws by alpha source and format
+ *             (ptsources.txt), and one frame's draw order on the main target (ptorder.txt)
  *   pvhalf    N.H per vertex for directional lights (opt-in; Usse::SetPvHalf); logpvhalf
  *             counts who takes it (pvlog.txt)
  *   pvnormalsw software-shaded lit draws read TEXCOORD5 as a normal again (it holds the

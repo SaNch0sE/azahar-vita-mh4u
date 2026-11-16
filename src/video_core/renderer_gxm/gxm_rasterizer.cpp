@@ -1923,6 +1923,108 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             }
         }
     }
+    {   // ptorder (diag): one frame's draw sequence into the main target as letters (O opaque
+        // depth-writing, P unblended alpha-tested, B blended, o other), run-length coded, with
+        // the opaque vertices drawn after the first P, to ux0:data/mh4u/ptorder.txt, every
+        // 150th frame (8 frames).
+        static const bool pt_order = GxmFlag("ptorder");
+        if (pt_order && fb_regs.GetColorBufferPhysicalAddress() == 0x180D4800) {
+            static u32 last_frame = ~0u, frames = 0;
+            static std::string seq;
+            static u64 opaque_after = 0, opaque_total = 0;
+            static bool seen_p = false;
+            const u32 frame = frame_index;
+            if (frame != last_frame) {
+                if (!seq.empty() && frames % 150 == 0 && frames / 150 < 8) {
+                    std::string rle;
+                    for (std::size_t i = 0; i < seq.size();) {
+                        std::size_t j = i;
+                        while (j < seq.size() && seq[j] == seq[i]) {
+                            j++;
+                        }
+                        rle += fmt::format("{}{} ", seq[i], j - i);
+                        i = j;
+                    }
+                    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/ptorder.txt", "a")) {
+                        std::fprintf(f, "frame %u: opaque verts %llu, after first P %llu: %s\n",
+                                     frame, static_cast<unsigned long long>(opaque_total),
+                                     static_cast<unsigned long long>(opaque_after), rle.c_str());
+                        std::fclose(f);
+                    }
+                }
+                frames++;
+                last_frame = frame;
+                seq.clear();
+                opaque_after = opaque_total = 0;
+                seen_p = false;
+            }
+            const bool blended = om.alphablend_enable &&
+                                 !(om.alpha_blending.factor_source_rgb ==
+                                       Pica::FramebufferRegs::BlendFactor::One &&
+                                   om.alpha_blending.factor_dest_rgb ==
+                                       Pica::FramebufferRegs::BlendFactor::Zero);
+            const bool tested = om.alpha_test.enable &&
+                                fs_config.framebuffer.alpha_test_func != CompareFunc::Always;
+            char c = 'o';
+            if (blended) {
+                c = 'B';
+            } else if (tested) {
+                c = 'P';
+                seen_p = true;
+            } else if (om.depth_write_enable && om.depth_test_enable) {
+                c = 'O';
+                opaque_total += vertex_count;
+                if (seen_p) {
+                    opaque_after += vertex_count;
+                }
+            }
+            seq += c;
+        }
+    }
+    {   // ptsources (diag): unblended alpha-tested draws by what their alpha chain reads
+        // (texture units with their formats, vertex colour, constants, lighting), counted
+        // in draws and vertices, to ux0:data/mh4u/ptsources.txt every 4,000 such binds.
+        static const bool pt_sources = GxmFlag("ptsources");
+        const bool replace_blend =
+            !om.alphablend_enable ||
+            (om.alpha_blending.factor_source_rgb == Pica::FramebufferRegs::BlendFactor::One &&
+             om.alpha_blending.factor_dest_rgb == Pica::FramebufferRegs::BlendFactor::Zero);
+        if (pt_sources && om.alpha_test.enable && replace_blend &&
+            fs_config.framebuffer.alpha_test_func != CompareFunc::Always) {
+            static std::map<std::string, std::pair<u32, u64>> counts;
+            static u32 binds = 0;
+            const auto stages = regs.texturing.GetTevStages();
+            u32 src_mask = 0;
+            for (u32 i = 0; i < stages.size(); i++) {
+                const u32 raw = stages[i].sources_raw;
+                const u32 op = static_cast<u32>(stages[i].alpha_op.Value());
+                const u32 nargs = op == 0 ? 1 : (op == 4 || op == 8 || op == 9) ? 3 : 2;
+                for (u32 k = 0; k < nargs; k++) {
+                    src_mask |= 1u << ((raw >> (16 + 4 * k)) & 0xF);
+                }
+            }
+            const auto tex = regs.texturing.GetTextures();
+            std::string key = fmt::format("func {} ref {} srcs {:04x} fmt", static_cast<u32>(
+                                              fs_config.framebuffer.alpha_test_func.Value()),
+                                          om.alpha_test.ref.Value(), src_mask);
+            for (u32 u = 0; u < 3; u++) {
+                key += tex[u].enabled ? fmt::format(" {}", static_cast<u32>(tex[u].format)) : " -";
+            }
+            auto& c = counts[key];
+            c.first++;
+            c.second += vertex_count;
+            if (++binds % 4000 == 0) {
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/ptsources.txt", "a")) {
+                    std::fprintf(f, "after %u binds:\n", binds);
+                    for (const auto& [k, v] : counts) {
+                        std::fprintf(f, "  %6u draws %8llu verts  %s\n", v.first,
+                                     static_cast<unsigned long long>(v.second), k.c_str());
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+    }
     {   // ptcensus (diag): alpha-tested draws by alpha test, blend and depth/colour mask,
         // to tell which can drop the test exactly (blended, depth write off, test passing
         // every alpha that contributes). Top 12 every 15,000 binds.

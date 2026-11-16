@@ -664,3 +664,9 @@ normalise), the alpha-tested discards (~4.6 ms), or a render scale below 1x (use
   31.1 (`prepass` alone gave no reading). Dropping the cut-outs saves 5.1 ms, more than making
   them opaque - not just honest visibility here, so ordering (E2) and always-passing tests (E3)
   are worth measuring next.
+- **E3 (`ptsources`):** the camp's unblended alpha-tested draws read alpha from texture unit 1,
+  ETC1A4 (GREATER 128 / 0 / 5 / 30 / 80): textures with real 4-bit alpha, so no test is provably
+  always passing.
+- **E2 (`ptorder`):** every camp frame on the main target is `O2 o2 B4 O56 P23 B22 o1 B33` -
+  all opaque draws come before the first cut-out (0 opaque vertices after it). Deferring the
+  cut-outs cannot help: their cost is their own shading of overlapping cards. Item 2 is closed.
