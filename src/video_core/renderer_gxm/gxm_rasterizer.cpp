@@ -1144,9 +1144,13 @@ void RasterizerGxm::FitReflectionRed(const void* lut_data) {
                         if (i == 255 && f != 0.0f) {
                             continue; // the last entry's difference runs past the table
                         }
+                        // Between entries the exact curve may differ from the PICA's straight
+                        // line by more than at them (x^100: 2.7/255 next to the peak), and is
+                        // not worse for it: checked against the entries' tolerance there with
+                        // the gap allowed for.
                         const float x = (static_cast<float>(i) + f) / 256.0f;
-                        worst = std::max(worst, std::abs(value(i, f) -
-                                                         std::pow(x, static_cast<float>(n))));
+                        const float err = std::abs(value(i, f) - std::pow(x, static_cast<float>(n)));
+                        worst = std::max(worst, f == 0.0f ? err : err * (1.5f / 3.5f));
                     }
                 }
                 if (worst <= Tolerance) {
@@ -1763,6 +1767,89 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             }
         }
     }
+    // A software-shaded draw's vertex program passes the quaternion through: no per-vertex
+    // normal for its fragment program (`pvnormalsw` keeps the old, wrong, reading).
+    {
+        static const bool keep = GxmFlag("pvnormalsw");
+        if (!keep && fs_config.lighting.enable && layout.shader == vertex_shader) {
+            Usse::SetNoPvNormal(fs_config, true);
+        }
+    }
+    // PvHalf: N.H per vertex (Usse::SetPvHalf) for one or two directional lights without
+    // distance attenuation or geometric factors, the per-vertex normal, a power-curve or
+    // dropped highlight, no VH / CP LUT input, and a generated vertex program to supply it.
+    // `nopvhalf` keeps the per-pixel half vector.
+    pv_half_data[3] = 0.0f;
+    {
+        // Opt-in (`pvhalf`): at the camp it moved nothing (36.4 against 36.3 ms) - most of the
+        // highlight cost is not the half vector.
+        static const bool off = !GxmFlag("pvhalf") || GxmFlag("nopvnormal");
+        const auto& lt = fs_config.lighting;
+        using Usse::ReflMode;
+        const ReflMode rmode = Usse::ReflModeOf(fs_config);
+        bool ok = !off && lt.enable && layout.shader != vertex_shader &&
+                  lt.bump_mode == Pica::LightingRegs::LightingBumpMode::None &&
+                  lt.config != Pica::LightingRegs::LightingConfig::Config7 && lt.src_num >= 1 &&
+                  lt.src_num <= 2 &&
+                  ((rmode == ReflMode::Power && Usse::ReflExponentOf(fs_config) <= 40) ||
+                   rmode == ReflMode::Dead || rmode == ReflMode::One);
+        const auto input_ok = [&](const Pica::Shader::LutConfig& lut) {
+            using In = Pica::LightingRegs::LightingLutInput;
+            return !lut.enable || (lut.type.Value() != In::VH && lut.type.Value() != In::CP);
+        };
+        ok = ok && input_ok(lt.lut_d0) && input_ok(lt.lut_d1) && input_ok(lt.lut_fr) &&
+             input_ok(lt.lut_rr) && input_ok(lt.lut_rg) && input_ok(lt.lut_rb) &&
+             input_ok(lt.lut_sp);
+        for (u32 i = 0; ok && i < lt.src_num; i++) {
+            const auto& l = lt.lights[i];
+            ok = l.directional && !l.dist_atten_enable && !l.geometric_factor_0 &&
+                 !l.geometric_factor_1;
+        }
+        // logpvhalf (diag): why lit draws do or do not take PvHalf, counted, to pvlog.txt.
+        static const bool log_pv = GxmFlag("logpvhalf");
+        if (log_pv && lt.enable) {
+            static u32 counts[8]{};
+            u32 why = 0;
+            if (ok) {
+                why = 0;
+            } else if (layout.shader == vertex_shader) {
+                why = 1;
+            } else if (lt.bump_mode != Pica::LightingRegs::LightingBumpMode::None) {
+                why = 2;
+            } else if (lt.src_num > 2) {
+                why = 3;
+            } else if (!(rmode == ReflMode::Power || rmode == ReflMode::Dead ||
+                         rmode == ReflMode::One)) {
+                why = 4;
+            } else {
+                why = 5;
+            }
+            counts[why]++;
+            static u32 n = 0;
+            if (++n % 3000 == 0) {
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/pvlog.txt", "a")) {
+                    std::fprintf(f, "lit binds %u: pvhalf %u, fixed vs %u, bump %u, lights>2 %u, "
+                                    "lookup %u, other %u\n",
+                                 n, counts[0], counts[1], counts[2], counts[3], counts[4],
+                                 counts[5]);
+                    std::fclose(f);
+                }
+            }
+        }
+        if (ok) {
+            for (u32 k = 0; k < 2; k++) {
+                const auto& v = fs_data.light_src[lt.lights[std::min<u32>(k, lt.src_num - 1)].num]
+                                    .position;
+                const float len2 = v.x * v.x + v.y * v.y + v.z * v.z;
+                const float inv = len2 > 0.0f ? 1.0f / std::sqrt(len2) : 0.0f;
+                pv_half_data[k * 4 + 0] = v.x * inv;
+                pv_half_data[k * 4 + 1] = v.y * inv;
+                pv_half_data[k * 4 + 2] = v.z * inv;
+            }
+            pv_half_data[3] = 1.0f;
+            Usse::SetPvHalf(fs_config, true);
+        }
+    }
     if (fs_config.lighting.enable && fs_config.lighting.lut_fr.enable) {
         // The Fresnel LUT's evaluation (Usse::FrMode); `nofrfit` keeps the lookup.
         static const bool no_fit = GxmFlag("nofrfit");
@@ -2354,6 +2441,7 @@ const RasterizerGxm::VsUniforms& RasterizerGxm::VsUniformsOf(Shader* vs) {
         u.i = MakeSlot(vs->Param("uniforms_i"));
         u.b = MakeSlot(vs->Param("uniforms_b"));
         u.gs_f = MakeSlot(vs->Param("gs_uniforms_f"));
+        u.pv_light_dir = MakeSlot(vs->Param("pv_light_dir"));
         u.flip_viewport = MakeSlot(vs->Param("flip_viewport"));
         u.depth_scale = MakeSlot(vs->Param("depth_scale"));
         u.depth_offset = MakeSlot(vs->Param("depth_offset"));
@@ -2391,7 +2479,10 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
         defaults_changed = true;
     }
     // A fused GS program's rows are not tracked: written with every one of its draws.
+    const bool pv_half_changed = vsu != nullptr && vsu->pv_light_dir &&
+                                 pv_half_data != pv_half_uploaded;
     const bool vertex_dirty = rebind || vs_data_dirty || current_gs != nullptr ||
+                              pv_half_changed ||
                               (generated && (pica.vs_setup.uniforms_dirty || defaults_changed));
     (void)fs_hash;
     // F0: a texture or target size change only matters to a program that declares the
@@ -2426,6 +2517,10 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
                     SetUniformF(vbuf, slot, data, count, "vs");
                 };
                 set(vsu->flip_viewport, &flip, 1);
+                if (vsu->pv_light_dir) {
+                    set(vsu->pv_light_dir, pv_half_data.data(), 8);
+                    pv_half_uploaded = pv_half_data;
+                }
                 set(vsu->depth_scale, &fs_data.depth_scale, 1);
                 set(vsu->depth_offset, &fs_data.depth_offset, 1);
                 const auto& uniforms = pica.vs_setup.uniforms;

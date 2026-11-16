@@ -644,3 +644,23 @@ directional lights, specular_0 always black, no spot/distance/geometric factors.
 Shown fps at the camp (diag build, 17 s): 23.6 -> 25.6. Still short of 30: the remaining gap is
 ~3 ms of GPU. Candidates: the half vector per pixel (two rsq for two lights plus the view
 normalise), the alpha-tested discards (~4.6 ms), or a render scale below 1x (user's call).
+
+### Camp, round two (2026-11-16)
+
+- **Per-vertex N.H (`pvhalf`, opt-in):** the generated vertex program computes N.H for one or two
+  directional lights into TEXCOORD6.xy (switched by the vertex uniform pv_light_dir[0].w), and
+  the fragment program drops the view normalise and the per-light half vector (26 instructions,
+  3 rsq). Camp: 36.4 ms against 36.3 without - nothing. `logpvhalf` counts (in game): ~40% of lit
+  binds eligible, ~21% software-shaded, ~35% without a red LUT. Kept opt-in.
+- **x^100 reflection table** now takes the power form too: between entries the exact curve may
+  differ from the PICA's straight line by 2.7/255 next to the peak, so midpoints are checked
+  against 3.5/255 (entries still 1.5/255). No measurable change at the camp.
+- **Software-shaded lit draws read a quaternion as their normal:** the pass-through vertex
+  program copies the quaternion into TEXCOORD5, which per-vertex-normal fragment programs read
+  as (normal, N.V). Such draws (~21% of lit binds at the camp) now get a fragment program that
+  builds its normal per pixel (`Usse::SetNoPvNormal`, lut_rr bit 12; `pvnormalsw` restores the
+  old reading). No visible change in slots 1-3, +0.2 ms.
+- **Punch-through (E1):** base 36.2, `ptoffop` 32.0, `prepass ppskipb` 32.9, `prepass ptskipop`
+  31.1 (`prepass` alone gave no reading). Dropping the cut-outs saves 5.1 ms, more than making
+  them opaque - not just honest visibility here, so ordering (E2) and always-passing tests (E3)
+  are worth measuring next.

@@ -400,6 +400,8 @@ private:
     uint32_t data_base = 0;            ///< container 19's first SA
     uint32_t sa_top = 0;               ///< SAs in use
     int int_sa = -1;                   ///< uniforms_i's SA base
+    int pv_half_sa = -1;               ///< pv_light_dir's SA base (PvHalf), or -1
+    std::optional<Quad> pv_half_quad;  ///< the parked per-vertex N.H pair
     uint8_t pa_inputs = 0;             ///< PA registers the attributes take
     uint32_t next_virtual = TmpQuads;  ///< the next free virtual quad's first register
     std::vector<uint8_t> prefetch;     ///< uniforms the secondary program loads, by index
@@ -600,6 +602,17 @@ void VertexEmitter::Layout() {
     gxp.uniforms.push_back({"depth_scale", SaDepthScale, 1, 1});
     gxp.uniforms.push_back({"depth_offset", SaDepthOffset, 1, 1});
     resident = SaResidentHead;
+    // PvHalf: two light directions (xyz) for per-vertex N.H, [0].w the switch, on programs
+    // that write the quaternion (the lit ones); see Epilogue.
+    {
+        static const bool off = !GxmFlag("pvhalf") || GxmFlag("nopvnormal");
+        const VsSemantic& q = req.semantics[SemQuaternionX];
+        if (!off && q.attribute < req.num_outputs && q.attribute < 16) {
+            pv_half_sa = static_cast<int>(resident);
+            gxp.uniforms.push_back({"pv_light_dir", resident, 4, 2});
+            resident += 8;
+        }
+    }
     for (uint32_t i = 0; i < 16; i++) {
         if ((scan.inputs & (1u << i)) != 0 && (req.default_regs & (1u << i)) != 0) {
             default_sa[i] = static_cast<int>(resident);
@@ -2378,6 +2391,23 @@ void VertexEmitter::Epilogue() {
         e.MoveInternal({I0, 0x8}, {I2, XXXX});
         e.MoveInternal({Reg::O(OutNormquatFlat), 0x3}, {I0, XYZW});
         e.MoveInternal({Reg::O(OutNormquatFlat + 2), 0x3}, {I0, ZWZW});
+        if (pv_half_sa >= 0) {
+            // PvHalf: N.H for two directional lights, h = normalize(V + L), into a parked
+            // pair; written over the view output at the end when pv_light_dir[0].w is set.
+            pv_half_quad = AllocateQuad();
+            for (uint32_t k = 0; k < 2; k++) {
+                const uint8_t sa = static_cast<uint8_t>(pv_half_sa + 4 * k);
+                e.MoveF32x4({I2, 0xf}, Reg::Sa(sa), Reg::Sa(static_cast<uint8_t>(sa + 2)));
+                e.Vec(VecOp::Add, {I2, 0x7}, {I2, XYZW}, {I1, XYZW});
+                e.Dot({I2, 0x8}, {I2, XYZW}, {I2, XYZW}, false);
+                e.Vec(VecOp::Add, {I2, 0x8}, {I2, WWWW}, Data(DataEpsilon));
+                e.Comp(CompOp::Rsq, {I2, 0x8}, {I2}, 3);
+                e.Dot({I1, 0x8}, {I0, XYZW}, {I2, XYZW}, false);
+                e.Vec(VecOp::Mul, {I1, 0x8}, {I1, WWWW}, {I2, WWWW});
+                e.MoveInternal({pv_half_quad->Pair(0), static_cast<uint8_t>(1u << k)},
+                               {I1, WWWW});
+            }
+        }
     }
 
     OutputPair(OutTexcoord0, SemTexcoord0U, SemTexcoord0V);
@@ -2386,6 +2416,10 @@ void VertexEmitter::Epilogue() {
     OutputLane(OutTexcoord0W, 0, SemTexcoord0W);
     OutputPair(OutView, SemViewX, static_cast<Semantic>(SemViewX + 1));
     OutputLane(OutView + 2, 0, static_cast<Semantic>(SemViewX + 2));
+    if (pv_half_quad) {
+        e.Test(Cond::Gt, 2, {Reg::Sa(static_cast<uint8_t>(pv_half_sa + 2))}, 1, ConstHalf, false);
+        e.MoveInternal({Reg::O(OutView), 0x3}, {pv_half_quad->Pair(0), XYZW}, Pred::P2);
+    }
 }
 
 // ---------------------------------------------------------------------------------------

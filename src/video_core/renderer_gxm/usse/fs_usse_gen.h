@@ -81,6 +81,30 @@ inline void SetReflMode(Pica::Shader::FSConfig& config, ReflMode mode, uint32_t 
 }
 
 /**
+ * PvHalf: N.H per light computed by the vertex program (TEXCOORD6.x / .y in place of the view
+ * vector, under the vertex uniform pv_light_dir[0].w) for directional lights with the per-vertex
+ * normal; the fragment program reads it instead of building the half vector per pixel. Bit 11
+ * of lut_rr (set after SetReflMode, which rewrites the word).
+ */
+inline void SetPvHalf(Pica::Shader::FSConfig& config, bool on) {
+    auto& raw = config.lighting.lut_rr.raw;
+    raw = on ? (raw | (1u << 11)) : (raw & ~(1u << 11));
+}
+[[nodiscard]] inline bool PvHalfOf(const Pica::Shader::FSConfig& config) {
+    return (config.lighting.lut_rr.raw >> 11) & 1u;
+}
+/// The vertex program is the pass-through one (software-shaded draws): TEXCOORD5 holds the
+/// quaternion, not the per-vertex normal, so the fragment program builds its normal per pixel.
+/// Bit 12 of lut_rr, set after SetReflMode.
+inline void SetNoPvNormal(Pica::Shader::FSConfig& config, bool on) {
+    auto& raw = config.lighting.lut_rr.raw;
+    raw = on ? (raw | (1u << 12)) : (raw & ~(1u << 12));
+}
+[[nodiscard]] inline bool NoPvNormalOf(const Pica::Shader::FSConfig& config) {
+    return (config.lighting.lut_rr.raw >> 12) & 1u;
+}
+
+/**
  * The Fresnel LUT's evaluation, the same way (spare bits of lut_fr): the lookup, or
  *   Schlick  c0 + c1 * (1 - |N.V|)^m, m in bits 16-23, (c0, c1) in the uniform
  *            lighting_fr_coef - MH4U's tables are all this form with m = 5

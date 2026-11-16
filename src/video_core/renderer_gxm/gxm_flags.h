@@ -81,6 +81,10 @@ namespace GxmRenderer {
  *             constant, Usse::FrMode); logfresnel dumps the tables (fresnellog.txt)
  *   nolightfast  the lighting emitter without its streamlined directional-light paths
  *   loglights per-light colours of lit draws to ux0:data/mh4u/lightlog.txt
+ *   pvhalf    N.H per vertex for directional lights (opt-in; Usse::SetPvHalf); logpvhalf
+ *             counts who takes it (pvlog.txt)
+ *   pvnormalsw software-shaded lit draws read TEXCOORD5 as a normal again (it holds the
+ *             quaternion there: the old, wrong, behaviour)
  *   nogradeblend MH4U's final grade (frame times two) back to alpha-only; loggrade logs
  *             the alpha-only feedback draws' combiners to ux0:data/mh4u/gradelog.txt
  *   tracedrop count BeginDraw's drops by source line and target (ux0:data/mh4u/droplog.txt)

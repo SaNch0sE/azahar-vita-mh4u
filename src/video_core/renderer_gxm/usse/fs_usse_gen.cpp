@@ -1741,7 +1741,11 @@ void FragmentEmitter::Lighting() {
     // interpolated (not renormalised: ~2 pixels per vertex), and N.V comes with it.
     // `nopvnormal` rotates the quaternion per pixel again.
     static const bool pv_off = GxmFlag("nopvnormal");
-    const bool per_vertex = default_normal_only && !pv_off;
+    const bool per_vertex = default_normal_only && !pv_off && !NoPvNormalOf(config);
+    // PvHalf: N.H arrives per light in the view varying's x / y (the rasterizer only sets it
+    // with the per-vertex normal, directional lights and no VH / CP input).
+    const bool pv_half = per_vertex && PvHalfOf(config);
+    u32 current_light = 0;
     if (!default_normal_only) {
         StoreVec4(normal, I0);
     }
@@ -1829,6 +1833,9 @@ void FragmentEmitter::Lighting() {
             case LutInput::NH:
             case LutInput::VH:
             case LutInput::CP:
+                if (pv_half && lut.type.Value() == LutInput::NH) {
+                    break;
+                }
                 needs_half = true;
                 if (lut.type.Value() == LutInput::VH) {
                     needs_view = true;
@@ -1872,6 +1879,12 @@ void FragmentEmitter::Lighting() {
     const auto lut_input = [&](LutInput input) {
         switch (input) {
         case LutInput::NH:
+            if (pv_half) {
+                e.Vec(VecOp::Add, {I0, 0x1},
+                      {Reg::Pa(view_pa), current_light == 0 ? XXXX : YYYY}, ConstZero,
+                      Pred::None, true);
+                break;
+            }
             LoadVec4(I1, half_vector);
             e.Dot({I0, 0x1}, {normal.Pair(0), XYZW}, {I1, XYZW}, false, Pred::None, true);
             break;
@@ -2015,6 +2028,7 @@ void FragmentEmitter::Lighting() {
     const bool sp_read = lut_reads(LutInput::SP);
     const bool ln_read = lut_reads(LutInput::LN);
     for (u32 light_index = 0; light_index < lighting.src_num; light_index++) {
+        current_light = light_index;
         const auto& light = lighting.lights[light_index];
         const Vec4Loc params = LightParams(light.num);
         const Bank pb = params.bank;

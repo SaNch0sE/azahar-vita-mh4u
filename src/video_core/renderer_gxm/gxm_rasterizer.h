@@ -191,6 +191,7 @@ public:
         std::array<UniformSlot, 16> default_regs{};
         bool any_default{};
         UniformSlot gs_f{}; ///< a fused VS + GS program's resident GS rows
+        UniformSlot pv_light_dir{}; ///< PvHalf: two light directions, [0].w the switch
     };
     const VsUniforms& VsUniformsOf(Shader* vs);
 
@@ -579,6 +580,10 @@ private:
         float c1 = 0.0f;
     };
     FrFit fr_fit{};
+    /// PvHalf (Usse::SetPvHalf): what the vertex program's pv_light_dir should hold for the
+    /// current draw, and what was last uploaded.
+    std::array<float, 8> pv_half_data{};
+    std::array<float, 8> pv_half_uploaded{};
     std::unordered_map<u64, FrFit> fr_fits; ///< dbgshadowblack (diag): bound for shadow textures
     /// The LUT textures: 256 texels wide, LUT_*_ROWS rows, sampled with nearest filtering
     /// and clamping so a row index reads exactly one LUT entry. lf and rg hold (value,
