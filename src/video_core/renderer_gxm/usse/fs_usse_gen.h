@@ -58,4 +58,26 @@ constexpr uint32_t FogStripUnit = 7;
 /// The strip is then baked reversed for a flipped fog (SyncFogStrip).
 bool FogQueryEnabled();
 
+/**
+ * How a program evaluates the reflection-red LUT, chosen per draw by the rasterizer from the
+ * LUT's contents and kept in spare bits of the configuration's lut_rr word (bits 0-4 are the
+ * PICA's), so the program key, tier-2 re-emits and dumps all carry it. Zero is the real lookup.
+ *   Lookup  the 256-entry LUT, fetched and interpolated as the PICA does
+ *   Power   |N.H|^n, n in bits 16-23: Monster Hunter 4 Ultimate's tables are exactly x^16
+ *           and x^40 - a few multiplies instead of a dependent texture read
+ *   One     taken as 1 (the old shortcut; `reflone` forces it, for A/B)
+ *   Dead    the specular_1 term is zero for every enabled light: not computed at all
+ */
+enum class ReflMode : uint32_t { Lookup = 0, Power = 1, One = 2, Dead = 3 };
+inline void SetReflMode(Pica::Shader::FSConfig& config, ReflMode mode, uint32_t n = 0) {
+    auto& raw = config.lighting.lut_rr.raw;
+    raw = (raw & 0x1Fu) | (static_cast<uint32_t>(mode) << 8) | ((n & 0xFFu) << 16);
+}
+[[nodiscard]] inline ReflMode ReflModeOf(const Pica::Shader::FSConfig& config) {
+    return static_cast<ReflMode>((config.lighting.lut_rr.raw >> 8) & 0x7u);
+}
+[[nodiscard]] inline uint32_t ReflExponentOf(const Pica::Shader::FSConfig& config) {
+    return (config.lighting.lut_rr.raw >> 16) & 0xFFu;
+}
+
 } // namespace GxmRenderer::Usse

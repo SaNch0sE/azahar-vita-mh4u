@@ -1127,6 +1127,27 @@ void PicaCore::DrawArrays(bool is_indexed) {
         }
     });
 
+#ifdef ENABLE_GXM
+    // tracecb (diag): each draw the game makes into MH4U's water reflection target
+    // (0x18154F00), as the PICA sees it, before any skip. The first 200.
+    {
+        static const bool trace_cb = GxmRenderer::GxmFlag("tracecb");
+        const auto& fb = regs.internal.framebuffer.framebuffer;
+        if (trace_cb && fb.GetColorBufferPhysicalAddress() == 0x18154F00) {
+            static u32 shown = 0;
+            if (shown++ < 200) {
+                const auto& rs = regs.internal.rasterizer;
+                LOG_INFO(HW_GPU, "tracecb: pica draw {} verts, indexed {}, gs {}, viewport {}x{}, "
+                         "topology {}",
+                         regs.internal.pipeline.num_vertices, is_indexed,
+                         static_cast<u32>(regs.internal.pipeline.use_gs.Value()),
+                         f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2.0f,
+                         f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2.0f,
+                         static_cast<u32>(primitive_assembler.GetTopology()));
+            }
+        }
+    }
+#endif
     // Single screen: the bottom screen is never shown, so its draws (MH4U draws it through the
     // main colour buffer with a 240x320 viewport at the start of each frame, then copies it out
     // with a display transfer) are not shipped at all - no vertex copy or shipment on this

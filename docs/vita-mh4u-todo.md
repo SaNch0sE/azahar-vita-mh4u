@@ -10,9 +10,10 @@ Measurements and history are in `vita-mh4u-performance.md`.
    106 of its 199 instructions are lighting. The deck has ~2 pixels per vertex, so lighting
    inputs computed per vertex and interpolated should look the same. Now headroom rather
    than a necessity: the deck is ~32.9 ms of GPU a frame with item 2.
-2. Done: the reflection LUTs are taken as 1 by default (`refllut` restores them): deck GPU
-   ~35.5 -> ~32.9 ms a frame, shown fps 30-31. Close-up highlights are a little brighter;
-   a per-vertex reflection term would bring the shaping back if it matters.
+2. Done, then replaced (2026-11-16): the reflection LUTs taken as 1 made the water white
+   (slot 2). Now the rasterizer fits the reflection-red LUT on upload and the program
+   computes |N.H|^n (MH4U's tables are exactly n = 16 and n = 40) - exact and fetch-free;
+   see "Water and highlights" in vita-mh4u-performance.md.
 3. **Hardware-filtered lighting LUTs** with one wait for all lookups (check the console can
    filter the chosen format; signed tables need care).
 4. **F16 colour pipeline** in the fragment emitter (TEV, texels, lighting sums): the largest

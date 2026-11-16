@@ -403,6 +403,14 @@ public:
     [[nodiscard]] bool IsColorTarget() const noexcept {
         return is_color_target;
     }
+    /// shadowmap: the depth buffer a PICA shadow pass into this colour surface tests against
+    /// (LESS, so the nearest caster's packed depth is what the colour keeps), allocated at the
+    /// first shadow pass. Null when there is no memory for it.
+    SceGxmDepthStencilSurface* ShadowAux();
+    /// Whether the aux depth holds this map's depths: a scene on this colour that is not a
+    /// shadow pass (the title's clear of the map) makes it stale, and the next shadow scene
+    /// starts it from 1.0 instead of loading it (BeginScene).
+    bool shadow_aux_valid{};
     [[nodiscard]] bool IsDepthTarget() const noexcept {
         return is_depth_target;
     }
@@ -447,6 +455,9 @@ private:
     SceGxmDepthStencilSurface ds_surface{};
     bool is_color_target{};
     bool is_depth_target{};
+    void* shadow_aux_data{};
+    bool shadow_aux_cdram{};
+    SceGxmDepthStencilSurface shadow_ds{};
 
 public:
     /// Internal render scale of the storage, in quarters (4 = 1x): render-target-capable

@@ -537,3 +537,59 @@ compiles ~307 KiB: the reachability is deliberately conservative around jumps.
 
 Every compile is logged (`[mh4u] shader JIT ...`, with the arena use), an arena that fills is
 reported, and the `rt` line counts interpreted shader runs (`interp`).
+
+## Water and highlights: the reflection LUT as |N.H|^n (2026-11-16)
+
+The user's slot 2 (a pond seen from a cliff) drew the water white; Android Azahar draws it dark
+blue with reflections. Ruled out on the way: the hidden 256x256 target at 0x18154F00 is not a
+reflection but MH4U's **shadow map** (see below), and the cube-map water code is not used here.
+The cause was our own shortcut: the reflection-red LUT (on |N.H|) taken as 1, which turns the
+specular_1 highlight into a full-strength glow over the whole surface. With `refllut` (the real
+lookup) the water matched Android exactly, at ~2.8 ms more GPU a frame.
+
+`logrefl` dumped the tables: every lit draw in three slots uses the red LUT only, on |N.H| with
+abs input, and its entries are exactly x^16 (most materials) or x^40 (a character) at
+x = i/256 (worst error 0.0005 / 0.0025 against the PICA's interpolation). So:
+
+- `RasterizerGxm::FitReflectionRed`, on each upload of LUT 6 (cached by content hash): all zero
+  -> Dead, all one -> One, a power curve within 1.5/255 at every entry and midpoint -> Power(n),
+  otherwise Lookup. Note the LUT's `difference` field is not on the value's scale (11 bits); the
+  check interpolates towards the next entry instead.
+- `BindPrograms` puts the mode (and n) into spare bits of `fs_config.lighting.lut_rr`
+  (`Usse::SetReflMode`, bits 8-10 and 16-23), so the program key, tier 2 and dumps carry it.
+  Dead also when every enabled light's specular_1 is black.
+- The emitter: Power computes |N.H| (the existing half vector) and squares it - no texture read,
+  no LUT index maths; Dead drops the specular_1 term.
+
+Main-target GPU per frame (`scenetime timedraw`, serialised, so relative only):
+
+| | taken as 1 (`reflone`) | Power (default) | lookup (`refllut`) |
+|---|---|---|---|
+| slot 2, water | 24.9 ms | 26.5 ms | 32.6 ms |
+| slot 1, quest counter | 37.6 ms | 40.6 ms | 43.6 ms |
+
+Without timing flags slot 1 shows the same 19-20 fps (diag build) either way, and slot 2 stays at
+30 fps in the release build with the water right. Switches: `refllut`, `reflone`, `noreflpow`,
+`noreflskip`, `logrefl` (to ux0:data/mh4u/refllog.txt). Further saving if needed (Fable's plan):
+inline the half vector instead of parking it in temporaries, and the Fresnel LUT (Schlick-like
+ranges) the same way.
+
+### Shadow maps (P5), opt-in: `shadowmap`
+
+MH4U renders a hard-shadow map each frame into 0x18154F00 (256x256): a plain clear quad (white),
+then the shadow-mode casters (constant penumbra 0, no alpha test, Z-buffered). Lit materials read
+it on unit 0 (orthographic, bias 0x02067B, light 0 and/or the alphas via shadow_alpha). The
+backend used to drop the pass and bind white. With `shadowmap`:
+
+- the pass draws into the colour surface itself, with a depth buffer of its own
+  (`Surface::ShadowAux`, F32) tested LESS, so the colour keeps the nearest caster; the program
+  writes its depth as three bytes (G, B, A = low, mid, high; R, the penumbra, masked off);
+  any other scene on that colour (the clear) makes the aux depth start at 1.0 again;
+- receivers sample it point-filtered and compare in the program (`ShadowCompare`: one texel,
+  border colour as the software renderer has it).
+
+Checked on the console: the map holds the hunter's silhouette (~90 texels) and the receivers
+compare against it. It is only character shadows, so it does not affect the water; cost not yet
+measured, so it stays off. Diagnostics: `logshadow` (ux0:data/mh4u/shadowlog.txt), `tracecb`,
+`dbgshadowblack`, `dbgshadowzero`, `dbgshadowref`, `dbgshadowdepth`, `dbgshadowalways`,
+`dbgshadownocull`, `dbgshadowsw`.

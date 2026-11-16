@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <bit>
 #include <cstdio>
 #include <stdexcept>
@@ -218,6 +219,16 @@ enum Lit : uint8_t {
     LitNeg255,
     LitInvSix, ///< the cube atlas's face band
     LitCubePad,
+    // Shadow maps: a texel's packed depth as dot(texel, (0, k, 256 k, 65536 k)), k = 255 /
+    // 0xFFFFFF (two pairs, read four-wide), and the shadow pass's packing constants.
+    LitShadowK0,
+    LitShadowK1,
+    LitShadowK2,
+    LitShadowK3,
+    LitDepth24,     ///< 0xFFFFFF
+    LitInv65536,
+    LitQuarterByte, ///< 0.25 / 255: a byte's value survives the half-float output either way
+    LitShadowPad,
     LiteralCount, // even, so the sampler words stay pair-aligned
 };
 static_assert(LiteralCount % 2 == 0);
@@ -394,6 +405,10 @@ private:
     std::array<int32_t, 8> light_memory{}; ///< per light number: float offset, or -1 (resident)
     bool uses_depth = false;              ///< W-buffering: the fragment writes its depth
     bool uses_shadow = false;             ///< lighting reads the shadow texture
+    bool shadow_compare = false;          ///< unit 0 is a 2D shadow map, compared (shadowmap)
+    uint32_t sa_shadow_bias = 0;          ///< shadow_texture_bias, in depth units
+    void ShadowCompare();
+    void ShadowOutput();
     bool uses_border = false;             ///< a unit clamps to its border colour
     bool uses_proctex = false;
     bool primary_alpha_read = false;      ///< a used operand reads primary_fragment_color.a
@@ -424,7 +439,10 @@ const char* FragmentEmitter::Unsupported() const {
     if (tex.fog_mode == TexturingRegs::FogMode::Gas) {
         return "gas";
     }
-    if (fb.shadow_rendering) {
+    // shadowmap: a Z-buffered shadow pass is emitted (ShadowOutput); W-buffered ones are not.
+    if (fb.shadow_rendering &&
+        (!GxmFlag("shadowmap") ||
+         fb.depthmap_enable == Pica::RasterizerRegs::DepthBuffering::WBuffering)) {
         return "shadow rendering";
     }
     if (fb.logic_op != FramebufferRegs::LogicOp::Copy &&
@@ -571,6 +589,13 @@ void FragmentEmitter::PlanInputs() {
                !Pica::Shader::Generator::Cg::FogDisabled();
     uses_depth = config.framebuffer.depthmap_enable ==
                  Pica::RasterizerRegs::DepthBuffering::WBuffering;
+    if (config.framebuffer.shadow_rendering) {
+        // The pass writes depths, not colours: no fog; its depth is the fragment's (Z only,
+        // see Unsupported).
+        uses_fog = false;
+        uses_depth = false;
+    }
+    static const bool shadow_map = GxmFlag("shadowmap");
     if (uses_lighting && lighting.enable_shadow) {
         const u32 unit = lighting.shadow_selector;
         // A 2D shadow texture on unit 0 is bound white (shadow-map passes are dropped, P5), so
@@ -578,7 +603,7 @@ void FragmentEmitter::PlanInputs() {
         // Hunter 4 Ultimate's lit world has shadow on for every light. `noshadowfold` keeps
         // the sample.
         static const bool no_fold = GxmFlag("noshadowfold");
-        const bool white_shadow = !no_fold && unit == 0 &&
+        const bool white_shadow = !no_fold && !shadow_map && unit == 0 &&
                                   tex.texture0_type == TextureType::Shadow2D &&
                                   !lighting.shadow_invert;
         if (!white_shadow && unit < 3 && (unit != 0 || tex.texture0_type != TextureType::Disabled)) {
@@ -586,8 +611,12 @@ void FragmentEmitter::PlanInputs() {
             uses_shadow = true;
         }
     }
+    shadow_compare = shadow_map && unit_used[0] && tex.texture0_type == TextureType::Shadow2D;
     for (u32 unit = 0; unit < 3; unit++) {
         const auto& border = tex.texture_border_color[unit];
+        // A shadow map's border colour is compared like a texel (the software renderer's
+        // lookup): MH4U's map covers the hunter's surroundings, and receivers past it - the
+        // distant water - read the border's depth and are in shadow.
         if (unit_used[unit] && (border.enable_s || border.enable_t)) {
             uses_border = true;
         }
@@ -596,7 +625,8 @@ void FragmentEmitter::PlanInputs() {
         lut_used = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0) ||
                    LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1) ||
                    LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel) ||
-                   LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed) ||
+                   (ReflModeOf(config) == ReflMode::Lookup &&
+                    LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed)) ||
                    LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen) ||
                    LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
         for (u32 i = 0; i < lighting.src_num; i++) {
@@ -638,7 +668,8 @@ void FragmentEmitter::PlanInputs() {
         fog_query_pa = pa;
         pa += 4;
     }
-    if (uses_scissor || (uses_fog && !fog_query) || uses_depth) {
+    if (uses_scissor || (uses_fog && !fog_query) || uses_depth ||
+        config.framebuffer.shadow_rendering) {
         gxp.inputs.push_back({FragmentInput::Position, 4});
         position_pa = pa;
         pa += 4;
@@ -671,7 +702,7 @@ void FragmentEmitter::PlanInputs() {
         pa += 4;
     }
     static const bool cube_flat = GxmFlag("cubeflat"); // diag: cube sampled by (u, v) alone
-    if (unit_used[0] && (tex.texture0_type == TextureType::Projection2D ||
+    if (unit_used[0] && (tex.texture0_type == TextureType::Projection2D || shadow_compare ||
                          (tex.texture0_type == TextureType::TextureCube && !cube_flat))) {
         // texcoord0's w (the cube map's third coordinate too), one register, last so nothing
         // pair-aligned has to follow it.
@@ -777,6 +808,9 @@ void FragmentEmitter::PlanUniforms() {
     if (uses_border) {
         sa_border = AllocateUniform("tex_border_color", 4, 3);
     }
+    if (shadow_compare) {
+        sa_shadow_bias = AllocateUniform("shadow_texture_bias", 1, 1);
+    }
     if (uses_proctex && !proctex_strip) {
         sa_proctex = AllocateUniform("proctex_lut_offset", 1, 1);
         AllocateUniform("proctex_diff_lut_offset", 1, 1);
@@ -798,7 +832,9 @@ void FragmentEmitter::PlanUniforms() {
         note(LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel), 3);
         note(LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue), 4);
         note(LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen), 5);
-        note(LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed), 6);
+        note(ReflModeOf(config) == ReflMode::Lookup &&
+                 LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed),
+             6);
         for (u32 i = 0; i < lighting.src_num; i++) {
             const auto& light = lighting.lights[i];
             note(light.spot_atten_enable &&
@@ -891,6 +927,75 @@ Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
     }
     e.WdfVertex(0);
     return {Bank::Virtual, TmpLightMem};
+}
+
+void FragmentEmitter::ShadowCompare() {
+    // The PICA's 2D shadow lookup at one texel (GL's shadowTexture without the bilinear
+    // footprint): lit when the map's depth is past the reference, min(|w|, 1) - bias, and
+    // then the map's penumbra byte; 0 in shadow. The texel's lanes are (penumbra, depth low,
+    // mid, high) as the shadow pass stored them (ShadowOutput). All four lanes get the result.
+    const Vec4Loc texel{Bank::Virtual, TmpTex0};
+    e.MoveF32x4({I1, 0xf}, Lit(LitShadowK0).reg, Lit(LitShadowK2).reg, true);
+    e.Dot({I2, 0x1}, {texel.Pair(0), XYZW}, {I1, XYZW}, true, Pred::None, true); // map depth
+    const Reg w_pair = Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u));
+    const Swizzle w_swz = (texcoord0_w_pa & 1) ? YYYY : XXXX;
+    e.Vec(VecOp::Min, {I0, 0x1}, {w_pair, w_swz, Mod::Abs}, ConstOne, Pred::None, true);
+    const Src bias = SaScalar(sa_shadow_bias);
+    e.Vec(VecOp::Add, {I0, 0x1}, {bias.reg, bias.swz, Mod::Neg}, {I0, XXXX}, Pred::None, true);
+    // map depth - reference > 0: lit.
+    e.Vec(VecOp::Add, {I2, 0x1}, {I0, XXXX, Mod::Neg}, {I2, XXXX}, Pred::None, true);
+    e.Test(Cond::Gt, 2, {I2}, 0, ConstZero, true);
+    LoadVec4(I1, texel);
+    e.MoveInternal({I0, 0xf}, ConstZero, Pred::None, true);
+    e.MoveInternal({I0, 0xf}, {I1, XXXX}, Pred::P2, true);
+    // dbgshadowdepth (diag): the map's depth itself, to look at the map through the receivers.
+    static const bool show_depth = GxmFlag("dbgshadowdepth");
+    if (show_depth) {
+        e.MoveF32x4({I1, 0xf}, Lit(LitShadowK0).reg, Lit(LitShadowK2).reg, true);
+        e.Dot({I0, 0x1}, {texel.Pair(0), XYZW}, {I1, XYZW}, true, Pred::None, true);
+        e.MoveInternal({I0, 0xf}, {I0, XXXX}, Pred::None, true);
+    }
+    // dbgshadowzero (diag): every lookup in shadow; dbgshadowref: the reference depth
+    // min(|w|, 1) - bias as the result, to look at what the receivers compare with.
+    static const bool show_zero = GxmFlag("dbgshadowzero");
+    static const bool show_ref = GxmFlag("dbgshadowref");
+    if (show_zero) {
+        e.MoveInternal({I0, 0xf}, ConstZero, Pred::None, true);
+    } else if (show_ref) {
+        e.Vec(VecOp::Min, {I0, 0x1}, {w_pair, w_swz, Mod::Abs}, ConstOne, Pred::None, true);
+        e.Vec(VecOp::Add, {I0, 0x1}, {bias.reg, bias.swz, Mod::Neg}, {I0, XXXX}, Pred::None,
+              true);
+        e.MoveInternal({I0, 0xf}, {I0, XXXX}, Pred::None, true);
+    }
+    StoreVec4(texel, I0);
+}
+
+void FragmentEmitter::ShadowOutput() {
+    // The shadow pass's colour: the fragment's 24-bit depth d * 0xFFFFFF as three bytes,
+    // (_, low, mid, high) in (R, G, B, A) - the colour mask keeps R, the penumbra - each as
+    // (byte + 0.25) / 255 so the half-float output and the 8-bit store give the byte back.
+    // The depth buffer behind it (LESS) keeps the nearest caster's.
+    const Reg pos = Reg::Pa(static_cast<uint8_t>(position_pa + 2)); // z, w
+    e.Vec(VecOp::Max, {I0, 0x1}, {pos, XXXX}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, ConstOne, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, Lit(LitDepth24), Pred::None, true); // v
+    // high = floor(v / 65536)
+    e.Vec(VecOp::Mul, {I0, 0x8}, {I0, XXXX}, Lit(LitInv65536), Pred::None, true);
+    FloorLane(3);
+    // mid = floor(frac(v / 65536) * 256)
+    e.Vec(VecOp::Mul, {I0, 0x4}, {I0, XXXX}, Lit(LitInv65536), Pred::None, true);
+    e.Vec(VecOp::Frc, {I0, 0x4}, {I0, ZZZZ}, {I0, ZZZZ}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x4}, {I0, ZZZZ}, Lit(Lit256), Pred::None, true);
+    FloorLane(2);
+    // low = floor(frac(v / 256) * 256)
+    e.Vec(VecOp::Mul, {I0, 0x2}, {I0, XXXX}, Lit(LitInv256), Pred::None, true);
+    e.Vec(VecOp::Frc, {I0, 0x2}, {I0, YYYY}, {I0, YYYY}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x2}, {I0, YYYY}, Lit(Lit256), Pred::None, true);
+    FloorLane(1);
+    e.Vec(VecOp::Mul, {I0, 0xe}, {I0, XYZW}, Lit(LitInv255), Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0xe}, {I0, XYZW}, Lit(LitQuarterByte), Pred::None, true);
+    e.MoveInternal({I0, 0x1}, ConstOne, Pred::None, true);
+    StoreVec4({Bank::Virtual, TmpOutput}, I0);
 }
 
 void FragmentEmitter::WriteDepth() {
@@ -1385,7 +1490,8 @@ void FragmentEmitter::SampleTextures() {
         }
         const int coord = (unit == 2 && tex.texture2_use_coord1) ? 1 : static_cast<int>(unit);
         coords[unit] = Reg::Pa(texcoord_pa[coord]);
-        if (unit == 0 && tex.texture0_type == TextureType::Projection2D) {
+        if (unit == 0 && (tex.texture0_type == TextureType::Projection2D ||
+                          (shadow_compare && !tex.shadow_texture_orthographic))) {
             // texcoord0 / texcoord0_w
             e.Comp(CompOp::Rcp, {I0, 0x1}, {Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u))},
                    static_cast<uint8_t>(texcoord0_w_pa & 1), Pred::None, true);
@@ -1425,6 +1531,9 @@ void FragmentEmitter::SampleTextures() {
                 replace_when(Cond::Gt, chan, ConstOne);
             }
         }
+    }
+    if (shadow_compare) {
+        ShadowCompare();
     }
     if (uses_shadow) {
         // shadow = tex, or 1 - tex when inverted.
@@ -1690,9 +1799,13 @@ void FragmentEmitter::Lighting() {
     // What the enabled LUTs read decides whether the view and half vectors are needed at
     // all: a light with the distribution LUT on the (light, normal) angle alone needs
     // neither.
-    // Monster Hunter 4 Ultimate, by default: the reflection LUTs (its lit world uses the
-    // red one on |N.H|) are taken as 1 (see the specular below); `refllut` restores them.
-    static const bool const_refl = !GxmFlag("refllut");
+    // How the reflection LUTs are evaluated is the rasterizer's choice per draw (ReflMode,
+    // carried in the configuration): the real lookup, |N.H|^n, 1, or not at all.
+    const ReflMode refl_mode = ReflModeOf(config);
+    const bool refl_lookup = refl_mode == ReflMode::Lookup;
+    const bool refl_power = refl_mode == ReflMode::Power &&
+                            LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
+    const bool refl_dead = refl_mode == ReflMode::Dead;
     bool needs_half = false;
     bool needs_view = false;
     for (u32 li = 0; li < lighting.src_num; li++) {
@@ -1723,10 +1836,12 @@ void FragmentEmitter::Lighting() {
         if (uses_secondary_color) {
             input_of(lighting.lut_d0, Sampler::Distribution0);
             input_of(lighting.lut_d1, Sampler::Distribution1);
-            if (!const_refl) {
+            if (refl_lookup) {
                 input_of(lighting.lut_rr, Sampler::ReflectRed);
                 input_of(lighting.lut_rg, Sampler::ReflectGreen);
                 input_of(lighting.lut_rb, Sampler::ReflectBlue);
+            } else if (refl_power) {
+                input_of(lighting.lut_rr, Sampler::ReflectRed);
             }
         }
         if (li + 1 == lighting.src_num &&
@@ -1790,10 +1905,7 @@ void FragmentEmitter::Lighting() {
         }
     };
     // scale * LUT(input) into i0.x, for an enabled LUT.
-    const auto lut_value = [&](const Pica::Shader::LutConfig& lut, Sampler sampler,
-                               bool two_sided) {
-        lut_input(lut.type.Value());
-        LightingLutLookup(sampler, lut.abs_input, two_sided);
+    const auto lut_scale = [&](const Pica::Shader::LutConfig& lut) {
         const float scale = lut.GetScale();
         if (scale != 1.0f) {
             // Scales are powers of two between 0.25 and 8: made from the constant bank.
@@ -1811,6 +1923,46 @@ void FragmentEmitter::Lighting() {
                 e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, ConstHalf, Pred::None, true);
             }
         }
+    };
+    const auto lut_value = [&](const Pica::Shader::LutConfig& lut, Sampler sampler,
+                               bool two_sided) {
+        lut_input(lut.type.Value());
+        LightingLutLookup(sampler, lut.abs_input, two_sided);
+        lut_scale(lut);
+    };
+    // ReflMode::Power: the reflection-red LUT as |N.H|^n (the rasterizer checked the table is
+    // that curve), by repeated squaring in i0.x - no texture read. The input is |N.H|, the
+    // only form the rasterizer accepts (abs_input), clamped to 1 as the LUT index is.
+    const auto refl_power_value = [&]() {
+        lut_input(LutInput::NH);
+        e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX, Mod::Abs}, ConstZero, Pred::None, true);
+        e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, ConstOne, Pred::None, true);
+        u32 n = ReflExponentOf(config);
+        if (n == 0) {
+            e.MoveInternal({I0, 0x1}, ConstOne, Pred::None, true);
+        } else if ((n & (n - 1)) == 0) {
+            for (; n > 1; n >>= 1) {
+                e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, {I0, XXXX}, Pred::None, true);
+            }
+        } else {
+            bool first = true;
+            while (n != 0) {
+                if (n & 1) {
+                    if (first) {
+                        e.MoveInternal({I0, 0x2}, {I0, XXXX}, Pred::None, true);
+                        first = false;
+                    } else {
+                        e.Vec(VecOp::Mul, {I0, 0x2}, {I0, YYYY}, {I0, XXXX}, Pred::None, true);
+                    }
+                }
+                n >>= 1;
+                if (n != 0) {
+                    e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, {I0, XXXX}, Pred::None, true);
+                }
+            }
+            e.MoveInternal({I0, 0x1}, {I0, YYYY}, Pred::None, true);
+        }
+        lut_scale(lighting.lut_rr);
     };
 
     for (u32 light_index = 0; light_index < lighting.src_num; light_index++) {
@@ -1924,12 +2076,50 @@ void FragmentEmitter::Lighting() {
         // without the LUT's shaping. ~2.6 ms of GPU a frame on the ship's deck, what takes
         // the deck under the 33 ms a shown 30 fps needs; highlights on close-ups come out a
         // little brighter. `refllut` restores the lookup.
-        const bool rr = !const_refl && LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
-        const bool rg = !const_refl && LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
-        const bool rb = !const_refl && LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
+        // logrefl (diag): each distinct reflection-LUT setup, to ux0:data/mh4u/refllog.txt.
+        static const bool log_refl = GxmFlag("logrefl");
+        if (log_refl) {
+            static std::set<u64> seen;
+            const auto lut_word = [&](const Pica::Shader::LutConfig& lut, Sampler smp) -> u32 {
+                return LightingLutEnabled(lut, smp)
+                           ? 0x100u | (static_cast<u32>(lut.type.Value()) << 4) |
+                                 (static_cast<u32>(lut.abs_input.Value()) << 3)
+                           : 0u;
+            };
+            const u32 w_rr = lut_word(lighting.lut_rr, Sampler::ReflectRed);
+            const u32 w_rg = lut_word(lighting.lut_rg, Sampler::ReflectGreen);
+            const u32 w_rb = lut_word(lighting.lut_rb, Sampler::ReflectBlue);
+            const u32 w_fr = lut_word(lighting.lut_fr, Sampler::Fresnel);
+            const u32 w_d0 = lut_word(lighting.lut_d0, Sampler::Distribution0);
+            const u32 w_d1 = lut_word(lighting.lut_d1, Sampler::Distribution1);
+            const u64 key = (u64{w_rr} << 48) ^ (u64{w_rg} << 36) ^ (u64{w_rb} << 24) ^
+                            (u64{w_fr} << 12) ^ w_d0 ^ (u64{w_d1} << 56) ^
+                            (static_cast<u64>(lighting.config.Value()) << 60) ^
+                            (u64{lighting.shadow_alpha.Value()} << 63);
+            if (seen.size() < 64 && seen.insert(key).second) {
+                if (std::FILE* f = std::fopen("ux0:data/mh4u/refllog.txt", "a")) {
+                    std::fprintf(f,
+                                 "config %u lights %u rr %03X rg %03X rb %03X fr %03X d0 %03X "
+                                 "d1 %03X fresnel_sel %u shadow_alpha %u prim_alpha %u "
+                                 "sec_alpha %u sec_read %u sec_alpha_read %u\n",
+                                 static_cast<u32>(lighting.config.Value()), lighting.src_num.Value(),
+                                 w_rr, w_rg, w_rb, w_fr, w_d0, w_d1,
+                                 static_cast<u32>(lighting.enable_primary_alpha.Value()) |
+                                     (static_cast<u32>(lighting.enable_secondary_alpha.Value()) << 1),
+                                 static_cast<u32>(lighting.shadow_alpha.Value()),
+                                 static_cast<u32>(lighting.enable_primary_alpha.Value()),
+                                 static_cast<u32>(lighting.enable_secondary_alpha.Value()),
+                                 uses_secondary_color ? 1u : 0u, secondary_alpha_read ? 1u : 0u);
+                    std::fclose(f);
+                }
+            }
+        }
+        const bool rr = refl_lookup && LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
+        const bool rg = refl_lookup && LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
+        const bool rb = refl_lookup && LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
         const bool d1_on = LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1);
         const bool d0_on = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
-        const bool refl_on = rr || rg || rb;
+        const bool refl_on = rr || rg || rb || refl_power;
         if (refl_on) {
             if (rg) {
                 lut_value(lighting.lut_rg, Sampler::ReflectGreen, two_sided);
@@ -1941,6 +2131,8 @@ void FragmentEmitter::Lighting() {
             }
             if (rr) {
                 lut_value(lighting.lut_rr, Sampler::ReflectRed, two_sided);
+            } else if (refl_power) {
+                refl_power_value();
             } else {
                 e.MoveInternal({I0, 0x1}, {Reg::C(2), XXXX}, Pred::None, true);
             }
@@ -1955,7 +2147,10 @@ void FragmentEmitter::Lighting() {
         // specular_1 = d1 * refl * light.specular_1 (each factor only when it is not 1),
         // into i2; parked in the accumulator's home when the d0 lookup runs next (it
         // needs the internal registers).
-        if (d1_on) {
+        if (refl_dead) {
+            // ReflMode::Dead: specular_1 is black for every light, so its term is zero.
+            e.MoveInternal({I2, 0xf}, ConstZero, Pred::None, true);
+        } else if (d1_on) {
             lut_value(lighting.lut_d1, Sampler::Distribution1, two_sided);
             LoadVec4(I2, specular_1);
             e.Vec(VecOp::Mul, {I2, 0x7}, {I2, XYZW}, {I0, XXXX}, Pred::None, true);
@@ -2540,8 +2735,16 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
                     std::bit_cast<uint32_t>(-127.0f),
                     std::bit_cast<uint32_t>(-255.0f),
                     std::bit_cast<uint32_t>(1.0f / 6.0f),
+                    0u,
+                    0u,
+                    std::bit_cast<uint32_t>(255.0f / 16777215.0f),
+                    std::bit_cast<uint32_t>(255.0f * 256.0f / 16777215.0f),
+                    std::bit_cast<uint32_t>(255.0f * 65536.0f / 16777215.0f),
+                    std::bit_cast<uint32_t>(16777215.0f),
+                    std::bit_cast<uint32_t>(1.0f / 65536.0f),
+                    std::bit_cast<uint32_t>(0.25f / 255.0f),
                     0u};
-    static_assert(LiteralCount == 42);
+    static_assert(LiteralCount == 50);
     static_assert(Pica::Shader::LUT_RG_ROWS == Pica::Shader::LUT_RGBA_ROWS);
     gxp.uses_discard = uses_kill;
     gxp.writes_depth = uses_depth;
@@ -2670,6 +2873,9 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
         break;
     default:
         break;
+    }
+    if (config.framebuffer.shadow_rendering) {
+        ShadowOutput();
     }
     e.PackF16({Reg::Pa(0), 0xf}, Reg::V(TmpOutput), Reg::V(TmpOutput + 2));
 

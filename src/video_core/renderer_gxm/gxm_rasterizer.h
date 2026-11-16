@@ -158,6 +158,7 @@ public:
         UniformSlot tex_border_color{};
         UniformSlot blend_color{};
         UniformSlot tex_dims{};
+        UniformSlot shadow_texture_bias{};
         UniformSlot fb_dims{};
         struct Light {
             UniformSlot specular_0{};
@@ -296,6 +297,8 @@ private:
     /// before the scene begins: a ring wrap waits for the GPU, since the rows it reuses may
     /// still be sampled by a scene in flight.
     void SyncAndUploadLUTs();
+    /// `lut`: the 256 entries of pica.lighting.luts[6].
+    void FitReflectionRed(const void* lut);
     bool RetireRing();
     void DropDraw();
     /// Repeated software draws (glyphs) with the state still bound are not drawn one by one:
@@ -557,6 +560,12 @@ private:
     u16* identity_indices{};
     void* white_mem{};
     SceGxmTexture white_texture{};
+    SceGxmTexture black_texture{};
+    /// The reflection-red LUT's shape, fitted when it is uploaded (SyncAndUploadLUTs) and
+    /// applied per draw in BindPrograms (Usse::ReflMode): mode, and n for |N.H|^n.
+    u32 refl_fit_mode = 0;
+    u32 refl_fit_n = 0;
+    std::unordered_map<u64, u32> refl_fits; ///< LUT content hash -> mode | n << 8 ///< dbgshadowblack (diag): bound for shadow textures
     /// The LUT textures: 256 texels wide, LUT_*_ROWS rows, sampled with nearest filtering
     /// and clamping so a row index reads exactly one LUT entry. lf and rg hold (value,
     /// delta) pairs as two floats; rgba holds proctex colours as bytes, which is what they

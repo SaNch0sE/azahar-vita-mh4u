@@ -13,6 +13,7 @@
 #include <bit>
 #include <cstring>
 #include <cstdio>
+#include <cmath>
 #include <set>
 #include <tuple>
 
@@ -371,6 +372,9 @@ bool RasterizerGxm::EnsureResources() {
     std::memset(white_mem, 0xFF, 64);
     sceGxmTextureInitLinear(&white_texture, white_mem, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 1, 1,
                             1);
+    std::memset(static_cast<u8*>(white_mem) + 16, 0, 16);
+    sceGxmTextureInitLinear(&black_texture, static_cast<u8*>(white_mem) + 16,
+                            SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 1, 1, 1);
     vertex_shader = pipeline_cache->UseBuiltinShader(0x7061737376657274ull, "pica_vs_trivial",
                                                      Usse::EmitPassThroughVertexProgram());
     blit_vertex_shader = pipeline_cache->UseBuiltinShader(0x626c69745f767300ull, "blit_vs",
@@ -872,6 +876,26 @@ void RasterizerGxm::BeginScene(Framebuffer* fb) {
         return;
     }
     SceGxmContext* context = Device().context;
+    // shadowmap: a shadow pass's own depth starts at 1.0 after the map was cleared (any
+    // other scene on its colour), and is loaded otherwise, so a pass split over scenes goes on.
+    static const bool shadow_map = GxmFlag("shadowmap");
+    if (shadow_map && fb->color_id) {
+        Surface& colour = res_cache.GetSurface(fb->color_id);
+        if (fb->shadow_rendering) {
+            if (SceGxmDepthStencilSurface* ds = fb->MutableDepthStencilSurface()) {
+                const bool fresh = !colour.shadow_aux_valid;
+                if (fresh) {
+                    sceGxmDepthStencilSurfaceSetBackgroundDepth(ds, 1.0f);
+                    colour.shadow_aux_valid = true;
+                }
+                sceGxmDepthStencilSurfaceSetForceLoadMode(
+                    ds, fresh ? SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED
+                              : SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED);
+            }
+        } else {
+            colour.shadow_aux_valid = false;
+        }
+    }
     // A deferred depth clear lands here: this scene starts from the background value and
     // loads nothing; the force-store at its end writes the result back, and the scenes
     // after it load again.
@@ -1067,6 +1091,98 @@ bool RasterizerGxm::ReserveLutRows(LutTexture& lut, u32 needed) {
     return wrapped;
 }
 
+void RasterizerGxm::FitReflectionRed(const void* lut_data) {
+    const auto& lut =
+        *static_cast<const std::array<Pica::PicaCore::Lighting::LutEntry, 256>*>(lut_data);
+    // Which cheap form the reflection-red LUT has, if any: all zero (its term vanishes),
+    // all one, or |x|^n - entry i is the value at |x| = i / 256, interpolated with its
+    // difference over the next 1/256. Checked against what the PICA evaluates, at each entry
+    // and halfway to the next, to within 1.5/255; anything else keeps the real lookup.
+    const u64 hash = Common::ComputeHash64(lut.data(), sizeof(lut));
+    if (const auto it = refl_fits.find(hash); it != refl_fits.end()) {
+        refl_fit_mode = it->second & 0xFF;
+        refl_fit_n = it->second >> 8;
+        return;
+    }
+    using Usse::ReflMode;
+    // Between entries the PICA interpolates towards the next one (the difference field is a
+    // differently scaled copy of that step, so the next entry is used directly).
+    const auto value = [&](u32 i, float f) {
+        const float next = i < 255 ? lut[i + 1].ToFloat() : lut[i].ToFloat();
+        return lut[i].ToFloat() + (next - lut[i].ToFloat()) * f;
+    };
+    float lo = 2.0f, hi = -1.0f;
+    for (u32 i = 0; i < 256; i++) {
+        lo = std::min(lo, lut[i].ToFloat());
+        hi = std::max(hi, lut[i].ToFloat());
+    }
+    ReflMode mode = ReflMode::Lookup;
+    u32 n = 0;
+    constexpr float Tolerance = 1.5f / 255.0f;
+    if (hi < 0.5f / 255.0f) {
+        mode = ReflMode::Dead;
+    } else if (lo > 1.0f - 1.0f / 255.0f) {
+        mode = ReflMode::One;
+    } else {
+        // n by least squares of ln v against ln x through the origin (scale 1).
+        double sxy = 0.0, sxx = 0.0;
+        for (u32 i = 1; i < 256; i++) {
+            const float v = lut[i].ToFloat();
+            if (v > 0.02f) {
+                const double lx = std::log(i / 256.0);
+                sxy += lx * std::log(static_cast<double>(v));
+                sxx += lx * lx;
+            }
+        }
+        if (sxx > 0.0) {
+            const double fit = sxy / sxx;
+            if (fit >= 0.5 && fit <= 255.5) {
+                n = static_cast<u32>(std::lround(fit));
+                float worst = 0.0f;
+                for (u32 i = 0; i < 256; i++) {
+                    for (const float f : {0.0f, 0.5f}) {
+                        if (i == 255 && f != 0.0f) {
+                            continue; // the last entry's difference runs past the table
+                        }
+                        const float x = (static_cast<float>(i) + f) / 256.0f;
+                        worst = std::max(worst, std::abs(value(i, f) -
+                                                         std::pow(x, static_cast<float>(n))));
+                    }
+                }
+                if (worst <= Tolerance) {
+                    mode = ReflMode::Power;
+                }
+                static const bool log_fit = GxmFlag("logrefl");
+                if (log_fit) {
+                    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/refllog.txt", "a")) {
+                        std::fprintf(f, "fit n %u worst %.4f; entries", n, worst);
+                        for (u32 i = 0; i < 256; i++) {
+                            std::fprintf(f, " %u%s%u", lut[i].value.Value(),
+                                         lut[i].neg_difference ? "-" : "+",
+                                         lut[i].difference.Value());
+                        }
+                        std::fprintf(f, "\n");
+                        std::fclose(f);
+                    }
+                }
+            }
+        }
+    }
+    refl_fit_mode = static_cast<u32>(mode);
+    refl_fit_n = n;
+    if (refl_fits.size() < 64) {
+        refl_fits.emplace(hash, refl_fit_mode | (n << 8));
+    }
+    static const bool log_refl = GxmFlag("logrefl");
+    if (log_refl) {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/refllog.txt", "a")) {
+            std::fprintf(f, "fit rr %016llx: mode %u n %u (min %.3f max %.3f)\n",
+                         static_cast<unsigned long long>(hash), refl_fit_mode, n, lo, hi);
+            std::fclose(f);
+        }
+    }
+}
+
 void RasterizerGxm::SyncAndUploadLUTs() {
     if (!pica.lighting.lut_dirty && !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
         return;
@@ -1120,6 +1236,9 @@ void RasterizerGxm::SyncAndUploadLUTs() {
         }
         fs_data.lighting_lut_offset[index / 4][index % 4] =
             upload_row(lut_lf, scratch2.data(), static_cast<u32>(source.size()));
+        if (index == 6) {
+            FitReflectionRed(&source);
+        }
         fs_data_dirty = true;
     }
     if (pica.fog.lut_dirty) {
@@ -1393,6 +1512,11 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
     } else if (cull == CullMode::KeepCounterClockWise) {
         mode = is_flipped ? SCE_GXM_CULL_CW : SCE_GXM_CULL_CCW;
     }
+    // dbgshadownocull (diag): no culling in a shadow pass.
+    static const bool shadow_no_cull = GxmFlag("dbgshadownocull");
+    if (shadow_no_cull && fb->shadow_rendering) {
+        mode = SCE_GXM_CULL_NONE;
+    }
     if (!state_cache.valid || state_cache.cull != mode) {
         state_cache.cull = mode;
         sceGxmSetCullMode(context, mode);
@@ -1400,12 +1524,18 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
 
     // Depth: both faces the same, since culling may be off.
     const bool has_ds = fb->HasDepth();
-    const bool depth_write = fb_regs.framebuffer.allow_depth_stencil_write != 0 &&
-                             om.depth_write_enable == 1 && has_ds;
+    // A shadow pass keeps the nearest fragment: LESS on its own depth buffer, written.
+    const bool shadow_fb = fb->shadow_rendering;
+    const bool depth_write = shadow_fb || (fb_regs.framebuffer.allow_depth_stencil_write != 0 &&
+                                           om.depth_write_enable == 1 && has_ds);
     // A write without a test is a test that always passes (see BeginDraw).
     const bool depth_test = om.depth_test_enable == 1 && has_ds;
+    // dbgshadowalways (diag): the shadow pass draws every fragment, last one wins.
+    static const bool shadow_always = GxmFlag("dbgshadowalways");
     const SceGxmDepthFunc depth_func =
-        depth_test ? PicaToGxm::CompareFunc(om.depth_test_func) : SCE_GXM_DEPTH_FUNC_ALWAYS;
+        shadow_fb    ? (shadow_always ? SCE_GXM_DEPTH_FUNC_ALWAYS : SCE_GXM_DEPTH_FUNC_LESS)
+        : depth_test ? PicaToGxm::CompareFunc(om.depth_test_func)
+                     : SCE_GXM_DEPTH_FUNC_ALWAYS;
     const auto write_mode =
         depth_write ? SCE_GXM_DEPTH_WRITE_ENABLED : SCE_GXM_DEPTH_WRITE_DISABLED;
     if (!state_cache.valid || state_cache.depth_func != depth_func) {
@@ -1420,7 +1550,7 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
     }
 
     // Stencil, when the framebuffer has one.
-    const bool has_stencil = fb_regs.HasStencil() && has_ds;
+    const bool has_stencil = fb_regs.HasStencil() && has_ds && !shadow_fb;
     const auto& st = om.stencil_test;
     if (has_stencil && st.enable) {
         const u8 write_mask = fb_regs.framebuffer.allow_depth_stencil_write != 0
@@ -1472,6 +1602,41 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     Common::PipelineStats::bp_calls++;
     // The fragment program for this PICA configuration, compiled on the worker if new.
     Pica::Shader::FSConfig fs_config{regs};
+    if (fs_config.lighting.enable && fs_config.lighting.lut_rr.enable) {
+        // The reflection-red LUT's evaluation (Usse::ReflMode). `refllut` keeps the lookup,
+        // `reflone` the old shortcut (taken as 1), `noreflpow` / `noreflskip` turn off the
+        // power form and the dropped term.
+        using Usse::ReflMode;
+        static const bool force_lookup = GxmFlag("refllut");
+        static const bool force_one = GxmFlag("reflone");
+        static const bool no_pow = GxmFlag("noreflpow");
+        static const bool no_skip = GxmFlag("noreflskip");
+        ReflMode mode = ReflMode::Lookup;
+        u32 n = 0;
+        bool specular_black = true;
+        for (u32 i = 0; i < fs_config.lighting.src_num; i++) {
+            const auto& colour = regs.lighting.light[fs_config.lighting.lights[i].num].specular_1;
+            specular_black = specular_black && colour.r == 0 && colour.g == 0 && colour.b == 0;
+        }
+        const bool only_red =
+            !fs_config.lighting.lut_rg.enable && !fs_config.lighting.lut_rb.enable;
+        const ReflMode fit = static_cast<ReflMode>(refl_fit_mode);
+        if (force_lookup) {
+            mode = ReflMode::Lookup;
+        } else if (force_one) {
+            mode = ReflMode::One;
+        } else if (!no_skip && specular_black) {
+            mode = ReflMode::Dead;
+        } else if (only_red && (pica.lighting.lut_dirty & (1u << 6)) == 0) {
+            if (fit == ReflMode::Power && !no_pow && fs_config.lighting.lut_rr.abs_input) {
+                mode = ReflMode::Power;
+                n = refl_fit_n;
+            } else if (fit == ReflMode::One || (fit == ReflMode::Dead && !no_skip)) {
+                mode = fit;
+            }
+        }
+        Usse::SetReflMode(fs_config, mode, n);
+    }
     // These comparisons cannot reject an 8-bit alpha. Reuse the Always shader before
     // hashing so the USSE emitter omits the alpha kill and its GXP discard flag (unless
     // scissoring still needs it), without putting the reference value in the shader key.
@@ -1821,6 +1986,52 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
         blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
     }
+    if (fs_config.framebuffer.shadow_rendering) {
+        // The packed depth goes to G, B and A unblended; R (the penumbra) is the clear's.
+        blend.colorMask = SCE_GXM_COLOR_MASK_G | SCE_GXM_COLOR_MASK_B | SCE_GXM_COLOR_MASK_A;
+        blend.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
+        blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+        blend.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
+        blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    }
+    // logrefl (diag): each distinct reflection-red / Fresnel LUT content a lit draw uses, with
+    // its range and a few entries, to ux0:data/mh4u/refllog.txt.
+    static const bool log_refl = GxmFlag("logrefl");
+    if (log_refl && fs_config.lighting.enable && fs_config.lighting.lut_rr.enable) {
+        static std::set<u64> seen;
+        const auto& rr = pica.lighting.luts[6];
+        const auto& fr = pica.lighting.luts[3];
+        const u64 key = Common::ComputeHash64(rr.data(), sizeof(rr)) ^
+                        (Common::ComputeHash64(fr.data(), sizeof(fr)) * 3);
+        if (seen.size() < 48 && seen.insert(key).second) {
+            float mn = 2.0f, mx = -1.0f;
+            for (const auto& entry : rr) {
+                mn = std::min(mn, entry.ToFloat());
+                mx = std::max(mx, entry.ToFloat());
+            }
+            float fmn = 2.0f, fmx = -1.0f;
+            for (const auto& entry : fr) {
+                fmn = std::min(fmn, entry.ToFloat());
+                fmx = std::max(fmx, entry.ToFloat());
+            }
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/refllog.txt", "a")) {
+                std::fprintf(f,
+                             "lut rr %016llx min %.3f max %.3f [0]=%.3f [64]=%.3f [128]=%.3f "
+                             "[192]=%.3f [255]=%.3f | fr min %.3f max %.3f | cb %08x t0 %08x t1 "
+                             "%08x blend %u\n",
+                             static_cast<unsigned long long>(key), mn, mx, rr[0].ToFloat(),
+                             rr[64].ToFloat(), rr[128].ToFloat(), rr[192].ToFloat(),
+                             rr[255].ToFloat(), fmn, fmx,
+                             fb_regs.GetColorBufferPhysicalAddress(),
+                             regs.texturing.texture0.GetPhysicalAddress(),
+                             regs.texturing.texture1.GetPhysicalAddress(),
+                             static_cast<u32>(om.alphablend_enable.Value()));
+                std::fclose(f);
+            }
+        }
+    }
     // logblend: every distinct pairing of fragment program and PICA blend state, once, to
     // ux0:data/mh4u/blend_log.txt - which draws use the constant-colour factors GXM lacks.
     static const bool log_blend = GxmFlag("logblend");
@@ -1945,6 +2156,7 @@ const RasterizerGxm::FsUniforms& RasterizerGxm::UniformsOf(Shader* fs) {
         u.tev_combiner_buffer_color = p("tev_combiner_buffer_color");
         u.tex_lod_bias = p("tex_lod_bias");
         u.tex_border_color = p("tex_border_color");
+        u.shadow_texture_bias = p("shadow_texture_bias");
         u.blend_color = p("blend_color");
         u.tex_dims = p("tex_dims");
         u.fb_dims = p("fb_dims");
@@ -2201,6 +2413,11 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
     set_int(u.proctex_lut_offset, d.proctex_lut_offset);
     set_int(u.proctex_diff_lut_offset, d.proctex_diff_lut_offset);
     set(u.proctex_bias, &d.proctex_bias, 1);
+    if (u.shadow_texture_bias) {
+        // The PICA's 24-bit depth units, as a fraction of the depth range.
+        const float bias = static_cast<float>(d.shadow_texture_bias) / 16777215.0f;
+        set(u.shadow_texture_bias, &bias, 1);
+    }
     if (u.lighting_lut_offset) {
         float lut[24];
         for (int i = 0; i < 6; i++) {
@@ -2448,6 +2665,101 @@ void RasterizerGxm::SyncFogStrip() {
     fog_strip_bound = slot;
 }
 
+namespace {
+/// logshadow lines also go to ux0:data/mh4u/shadowlog.txt (the console log can lose them).
+void ShadowLogFile(const std::string& line) {
+    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/shadowlog.txt", "a")) {
+        std::fprintf(f, "%s\n", line.c_str());
+        std::fclose(f);
+    }
+}
+/// logshadow (diag): one line per distinct shadow-pass setup - every TEV stage's raw words and
+/// constant, the alpha test, the shadow bias registers, cull and depth mode - so the shadow
+/// path can be built for what the title actually does (hard or soft casters). The first 24.
+void LogShadowDraw(const Pica::RegsInternal& regs, const char* what) {
+    static const bool on = GxmFlag("logshadow");
+    if (!on) {
+        return;
+    }
+    static std::set<u64> seen;
+    const auto stages = regs.texturing.GetTevStages();
+    u64 key = Common::ComputeHash64(stages.data(), sizeof(stages));
+    key ^= Common::ComputeHash64(&regs.framebuffer.output_merger.alpha_test,
+                                 sizeof(regs.framebuffer.output_merger.alpha_test)) * 31;
+    key ^= what[0];
+    if (seen.size() >= 24 || !seen.insert(key).second) {
+        return;
+    }
+    const auto& fb = regs.framebuffer;
+    std::string tev;
+    for (const auto& st : stages) {
+        tev += fmt::format(" [{:08X} {:08X} {:08X} {:08X} {:08X}]", st.sources_raw,
+                           st.modifiers_raw, st.ops_raw, st.const_color, st.scales_raw);
+    }
+    const std::string line = fmt::format(
+             "logshadow: {} into {:08X} {}x{}: alpha test {} func {} ref {}; shadow const {:04X} "
+             "linear {:04X}; cull {}; depthmap {}; depth {:08X}; buffer in {:08X} col {:08X};{}",
+             what, fb.framebuffer.GetColorBufferPhysicalAddress(), fb.framebuffer.GetWidth(),
+             fb.framebuffer.GetHeight(), fb.output_merger.alpha_test.enable.Value(),
+             static_cast<u32>(fb.output_merger.alpha_test.func.Value()),
+             fb.output_merger.alpha_test.ref.Value(), fb.shadow.constant.Value(),
+             fb.shadow.linear.Value(), static_cast<u32>(regs.rasterizer.cull_mode.Value()),
+             static_cast<u32>(regs.rasterizer.depthmap_enable.Value()),
+             fb.framebuffer.GetDepthBufferPhysicalAddress(),
+             regs.texturing.tev_combiner_buffer_input.update_mask_rgb.Value(),
+             regs.texturing.tev_combiner_buffer_color.raw, tev);
+    LOG_INFO(Render, "{}", line);
+    ShadowLogFile(line);
+}
+
+/// logshadow (diag): one line per distinct way a draw samples a shadow texture on unit 0.
+void LogShadowSample(const Pica::RegsInternal& regs, u32 addr, u32 w, u32 h) {
+    static const bool on = GxmFlag("logshadow");
+    if (!on) {
+        return;
+    }
+    static std::set<std::tuple<u32, u32, u32, u32>> seen;
+    const auto& lt = regs.lighting;
+    const u32 cfg0 = lt.config0.enable_shadow | (lt.config0.shadow_primary << 1) |
+                     (lt.config0.shadow_secondary << 2) | (lt.config0.shadow_invert << 3) |
+                     (lt.config0.shadow_alpha << 4) | (lt.config0.shadow_selector << 5);
+    const u32 shadow_raw = regs.texturing.shadow.orthographic | (regs.texturing.shadow.bias << 1);
+    const auto stages = regs.texturing.GetTevStages();
+    u32 tex0_in_tev = 0;
+    for (u32 i = 0; i < stages.size(); i++) {
+        const u32 src = stages[i].sources_raw;
+        for (u32 k = 0; k < 24; k += 4) {
+            if (((src >> k) & 0xF) == 3) {
+                tex0_in_tev |= 1u << i;
+            }
+        }
+    }
+    const auto key = std::make_tuple(addr, cfg0 | (tex0_in_tev << 8) |
+                                               (static_cast<u32>(regs.texturing.texture0.type.Value()) << 16),
+                                     shadow_raw, lt.config1.raw);
+    if (seen.size() >= 24 || !seen.insert(key).second) {
+        return;
+    }
+    const std::string line = fmt::format(
+             "logshadow: sample {:08X} {}x{} into {:08X}: ortho {} bias {:06X}; lighting {} "
+             "(shadow {} primary {} secondary {} invert {} alpha {} selector {}), lights {}, "
+             "disable_shadow {:02X}; tex0 in TEV stages {:02X}; wrap {} {} border {:08X}",
+             addr, w, h, regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress(),
+             regs.texturing.shadow.orthographic.Value(), regs.texturing.shadow.bias.Value(),
+             regs.lighting.disable == 0 ? 1 : 0, lt.config0.enable_shadow.Value(),
+             lt.config0.shadow_primary.Value(), lt.config0.shadow_secondary.Value(),
+             lt.config0.shadow_invert.Value(), lt.config0.shadow_alpha.Value(),
+             lt.config0.shadow_selector.Value(), lt.max_light_index.Value() + 1,
+             lt.config1.disable_shadow.Value(), tex0_in_tev,
+             static_cast<u32>(regs.texturing.texture0.wrap_s.Value()),
+             static_cast<u32>(regs.texturing.texture0.wrap_t.Value()),
+             regs.texturing.texture0.border_color.raw);
+    LOG_INFO(Render, "{}", line);
+    ShadowLogFile(line);
+}
+} // namespace
+
+
 void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
     std::array<SceGxmTexture, 3> textures{white_texture, white_texture, white_texture};
@@ -2470,9 +2782,23 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         if (unit == 0) {
             switch (texture.config.type.Value()) {
             case TextureType::Shadow2D:
-            case TextureType::ShadowCube:
-                // P5: shadow textures.
+            case TextureType::ShadowCube: {
+                // P5: shadow textures. dbgshadowblack (diag, with noshadowfold): black instead
+                // of white - everything in full shadow - to see what reads them.
+                LogShadowSample(regs, texture.config.GetPhysicalAddress(), texture.config.width,
+                                texture.config.height);
+                // shadowmap: a 2D shadow map is the render target the shadow pass drew, looked
+                // up as any texture; the program compares its packed depths (SampleTextures).
+                static const bool shadow_map_on = GxmFlag("shadowmap");
+                if (shadow_map_on && texture.config.type.Value() == TextureType::Shadow2D) {
+                    break;
+                }
+                static const bool shadow_black = GxmFlag("dbgshadowblack");
+                if (shadow_black) {
+                    textures[unit] = black_texture;
+                }
                 continue;
+            }
             case TextureType::TextureCube: {
                 // The six faces as one 2D atlas (Surface, CopyTextures); the program picks the
                 // face (FragmentEmitter's cube coordinates). `nocube` leaves it white.
@@ -2723,6 +3049,13 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             memo = {memo_key, res_cache.StructureGen(), surface_id, surface.modification_tick, bound};
         }
         textures[unit] = bound;
+        if (unit == 0 && texture.config.type.Value() == TextureType::Shadow2D) {
+            // Packed depths: one texel, never a blend of neighbours (GL forces nearest too).
+            sceGxmTextureSetMinFilter(&textures[unit], SCE_GXM_TEXTURE_FILTER_POINT);
+            sceGxmTextureSetMagFilter(&textures[unit], SCE_GXM_TEXTURE_FILTER_POINT);
+            sceGxmTextureSetUAddrMode(&textures[unit], SCE_GXM_TEXTURE_ADDR_CLAMP);
+            sceGxmTextureSetVAddrMode(&textures[unit], SCE_GXM_TEXTURE_ADDR_CLAMP);
+        }
         // The scene that will sample this has not begun yet (a cache miss here uploads, and
         // an upload may end the open scene), so the surface is noted and given the serial in
         // DrawTriangles once BeginScene has claimed one.
@@ -2743,6 +3076,22 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
     // BeginScene: they are white until P5 and a texture binding persists indefinitely.
 }
 
+namespace {
+/// tracecb (diag): draws into MH4U's water reflection target (0x18154F00): each one that
+/// BeginDraw drops, with the source line of the return that dropped it, and each one drawn
+/// (line 0). The first 200.
+bool TraceDrop(const Pica::RegsInternal& regs, int line) {
+    static const bool on = GxmFlag("tracecb");
+    if (on && regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() == 0x18154F00) {
+        static u32 shown = 0;
+        if (shown++ < 200) {
+            LOG_INFO(Render, "tracecb: {} at line {}", line <= 1 ? "drawn" : "DROPPED", line);
+        }
+    }
+    return false;
+}
+} // namespace
+
 bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                               u32 vertex_count) {
     FlushDeferredDraws();
@@ -2758,9 +3107,14 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         (alpha.func == CompareFunc::Never ||
          (alpha.func == CompareFunc::LessThan && alpha.ref == 0) ||
          (alpha.func == CompareFunc::GreaterThan && alpha.ref == 255))) {
-        return false;
+        return TraceDrop(regs, __LINE__);
     }
-    if (fb_regs.IsShadowRendering()) {
+    static const bool shadow_map = GxmFlag("shadowmap");
+    const bool shadow_pass = shadow_map && fb_regs.IsShadowRendering();
+    if (shadow_pass) {
+        LogShadowDraw(regs, "shadow draw");
+    } else if (fb_regs.IsShadowRendering()) {
+        LogShadowDraw(regs, "shadow draw");
         // No image load/store on this backend: shadow maps are dropped (P5).
         const u32 start = fb_regs.framebuffer.GetColorBufferPhysicalAddress();
         const u32 end = start + fb_regs.framebuffer.GetWidth() * fb_regs.framebuffer.GetHeight() * 4;
@@ -2772,18 +3126,19 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                         start, end, fb_regs.framebuffer.GetWidth(), fb_regs.framebuffer.GetHeight(),
                         fb_regs.framebuffer.GetDepthBufferPhysicalAddress());
         }
-        return false;
+        return TraceDrop(regs, __LINE__);
     }
     // Other draws into a dropped shadow map's target (MH4U clears it with one each frame)
     // feed nothing - a 2D shadow texture is bound white - and their scene splits the main
     // target's. `shadowtarget` keeps them.
     static const bool no_shadow_target = !GxmFlag("shadowtarget");
-    if (no_shadow_target) {
+    if (no_shadow_target && !shadow_map) {
         const u32 cb = fb_regs.framebuffer.GetColorBufferPhysicalAddress();
         if (std::any_of(dropped_shadow_targets.begin(), dropped_shadow_targets.end(),
                         [&](const auto& t) { return t.first == cb; })) {
+            LogShadowDraw(regs, "plain draw");
             stat_skipped++;
-            return false;
+            return TraceDrop(regs, __LINE__);
         }
     }
     const bool has_stencil = fb_regs.HasStencil();
@@ -2799,8 +3154,10 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     const bool stencil_write = has_stencil && om.stencil_test.enable &&
                                om.stencil_test.write_mask != 0 &&
                                fb_regs.framebuffer.allow_depth_stencil_write != 0;
-    const bool using_color_fb =
-        fb_regs.framebuffer.GetColorBufferPhysicalAddress() != 0 && write_color_fb;
+    // A shadow pass writes its colour whatever the colour mask, and ignores the depth buffer
+    // (it has its own, Surface::ShadowAux), as the GL backend has it.
+    const bool using_color_fb = fb_regs.framebuffer.GetColorBufferPhysicalAddress() != 0 &&
+                                (write_color_fb || shadow_pass);
     if (LogtexActive()) {
         static std::set<std::tuple<u32, u32, u32, u32, u32>> seen_targets;
         const u32 color_addr = fb_regs.framebuffer.GetColorBufferPhysicalAddress();
@@ -2821,7 +3178,8 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                      om.alphablend_enable.Value() ? 1 : 0);
         }
     }
-    const bool using_depth_fb = fb_regs.framebuffer.GetDepthBufferPhysicalAddress() != 0 &&
+    const bool using_depth_fb = !shadow_pass &&
+                                fb_regs.framebuffer.GetDepthBufferPhysicalAddress() != 0 &&
                                 (depth_write || stencil_write || om.depth_test_enable != 0 ||
                                  (has_stencil && om.stencil_test.enable));
 
@@ -2834,6 +3192,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         nondraw_epoch == begin_epoch && scene_seq == begin_scene && !pica.lighting.lut_dirty &&
         !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
         stat_begin_repeats++;
+        TraceDrop(regs, 1);
         for (const VideoCore::SurfaceId id : bound_surfaces) {
             if (id) {
                 res_cache.GetSurface(id).gpu_serial = runtime.CurrentEpoch();
@@ -2843,7 +3202,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
             const PhaseTimer timer{time_draws, times.programs};
             if (!BindPrograms(layout, vertex_count)) {
                 stat_skipped++;
-                return false;
+                return TraceDrop(regs, __LINE__);
             }
         }
         return in_scene;
@@ -2873,7 +3232,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     }
     Framebuffer* fb = setup.helper->Framebuffer();
     if (fb->RenderTarget() == nullptr) {
-        return false;
+        return TraceDrop(regs, __LINE__);
     }
     // Texture uploads the cache does for this draw may wait for the GPU (the sync hook ends
     // the scene), and so may a LUT ring wrap; both before the scene begins.
@@ -2896,7 +3255,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     }
     if (skip_feedback_draw) {
         stat_skipped++;
-        return false;
+        return TraceDrop(regs, __LINE__);
     }
     // Monster Hunter 4 Ultimate only, on by default (`postfx` keeps it): its bloom /
     // depth-of-field chain - the
@@ -2915,7 +3274,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         }
         if (drop) {
             stat_skipped++;
-            return false;
+            return TraceDrop(regs, __LINE__);
         }
     }
     {
@@ -2923,7 +3282,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         BeginScene(fb);
     }
     if (!in_scene) {
-        return false;
+        return TraceDrop(regs, __LINE__);
     }
     // After BeginScene, which binds units 6 and 7 white for the scene.
     if (proc_strip_bound >= 0) {
@@ -2950,7 +3309,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         const PhaseTimer timer{time_draws, times.programs};
         if (!BindPrograms(layout, vertex_count)) {
             stat_skipped++;
-            return false;
+            return TraceDrop(regs, __LINE__);
         }
     }
     DrawTrace("programs bound");
@@ -2963,8 +3322,9 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         // Something between BeginScene and here synced. The draw would be silently refused
         // with SCE_GXM_ERROR_NOT_WITHIN_SCENE, so say so instead of losing it quietly.
         LOG_ERROR(Render, "GXM: the scene was ended under a draw");
-        return false;
+        return TraceDrop(regs, __LINE__);
     }
+    TraceDrop(regs, 0);
     begin_repeat_ok = !no_begin_repeat;
     begin_key = begin_key_now;
     begin_epoch = nondraw_epoch;
@@ -3517,6 +3877,12 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
     static const bool software_only = GxmFlag("nohwvs");
     if (software_only || regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::No ||
         payload.immediate) {
+        return DeclineHw(0);
+    }
+    // dbgshadowsw (diag): draws into MH4U's shadow map shaded in software, to tell a vertex
+    // program translation fault from the rest.
+    static const bool shadow_sw = GxmFlag("dbgshadowsw");
+    if (shadow_sw && regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() == 0x18154F00) {
         return DeclineHw(0);
     }
     if (!EnsureResources()) {

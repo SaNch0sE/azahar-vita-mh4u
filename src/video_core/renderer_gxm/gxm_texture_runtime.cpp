@@ -1184,8 +1184,12 @@ Surface::Surface(Surface&& o) noexcept
       in_cdram{o.in_cdram}, stride_texels{o.stride_texels}, alloc_size{o.alloc_size},
       level_offsets{o.level_offsets}, texture{o.texture}, color_surface{o.color_surface},
       ds_surface{o.ds_surface}, is_color_target{o.is_color_target},
-      is_depth_target{o.is_depth_target}, scale_q{o.scale_q}, mip_count{o.mip_count} {
+      is_depth_target{o.is_depth_target}, shadow_aux_data{o.shadow_aux_data},
+      shadow_aux_cdram{o.shadow_aux_cdram}, shadow_ds{o.shadow_ds}, scale_q{o.scale_q},
+      mip_count{o.mip_count} {
+    shadow_aux_valid = o.shadow_aux_valid;
     o.data = nullptr;
+    o.shadow_aux_data = nullptr;
 }
 
 Surface& Surface::operator=(Surface&& o) noexcept {
@@ -1206,7 +1210,12 @@ Surface& Surface::operator=(Surface&& o) noexcept {
         is_depth_target = o.is_depth_target;
         scale_q = o.scale_q;
         mip_count = o.mip_count;
+        shadow_aux_data = o.shadow_aux_data;
+        shadow_aux_cdram = o.shadow_aux_cdram;
+        shadow_ds = o.shadow_ds;
+        shadow_aux_valid = o.shadow_aux_valid;
         o.data = nullptr;
+        o.shadow_aux_data = nullptr;
     }
     return *this;
 }
@@ -1408,11 +1417,48 @@ bool Surface::RenameForUpload(bool whole) {
 }
 
 void Surface::Release() {
+    if (runtime != nullptr && shadow_aux_data != nullptr) {
+        runtime->DeferFree(shadow_aux_data, shadow_aux_cdram, gpu_serial);
+        shadow_aux_data = nullptr;
+        shadow_aux_valid = false;
+    }
     if (data == nullptr || runtime == nullptr) {
         return;
     }
     runtime->DeferFree(data, in_cdram, gpu_serial);
     data = nullptr;
+}
+
+SceGxmDepthStencilSurface* Surface::ShadowAux() {
+    if (shadow_aux_data == nullptr && runtime != nullptr && data != nullptr) {
+        // F32 depth, no stencil, at the depth pitch (a multiple of the tile width) and a
+        // height rounded up to the tile height.
+        const u32 w = SX(width);
+        const u32 h = Common::AlignUp(SX(height), 32u);
+        const u32 pitch = PitchFor(w, true);
+        const u32 bytes = pitch * h * 4;
+        shadow_aux_cdram = true;
+        shadow_aux_data = runtime->cdram_pool.Alloc(bytes, 256);
+        if (shadow_aux_data == nullptr) {
+            shadow_aux_cdram = false;
+            shadow_aux_data = runtime->mapped_pool.Alloc(bytes, 256);
+        }
+        if (shadow_aux_data == nullptr) {
+            return nullptr;
+        }
+        if (sceGxmDepthStencilSurfaceInit(&shadow_ds, SCE_GXM_DEPTH_STENCIL_FORMAT_DF32,
+                                          SCE_GXM_DEPTH_STENCIL_SURFACE_LINEAR, pitch,
+                                          shadow_aux_data, nullptr) < 0) {
+            LOG_ERROR(Render, "GXM: no shadow depth for {}x{}", w, h);
+            runtime->DeferFree(shadow_aux_data, shadow_aux_cdram, gpu_serial);
+            shadow_aux_data = nullptr;
+            return nullptr;
+        }
+        sceGxmDepthStencilSurfaceSetForceStoreMode(&shadow_ds,
+                                                   SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED);
+        shadow_aux_valid = false;
+    }
+    return shadow_aux_data != nullptr ? &shadow_ds : nullptr;
 }
 
 u32 Surface::LevelStrideTexels(u32 level) const noexcept {
@@ -1639,7 +1685,20 @@ Framebuffer::Framebuffer(TextureRuntime&, const VideoCore::FramebufferParams& pa
                          Surface* color, Surface* depth)
     : VideoCore::FramebufferParams{params} {
     if (shadow_rendering) {
-        return; // no image load/store on this backend; the draw is dropped
+        // shadowmap: the colour surface keeps the packed depths, a depth buffer of its own
+        // does the "keep the nearest" (Surface::ShadowAux). Without the switch the draw is
+        // dropped (no image load/store on this backend).
+        if (!GxmFlag("shadowmap") || color == nullptr || !color->HasMemory() ||
+            !color->IsColorTarget() || color_level != 0) {
+            return;
+        }
+        SceGxmDepthStencilSurface* aux = color->ShadowAux();
+        if (aux == nullptr) {
+            return;
+        }
+        ds_surface = *aux;
+        has_depth = true;
+        depth = nullptr;
     }
     Surface* any = color != nullptr && color->HasMemory()
                        ? color

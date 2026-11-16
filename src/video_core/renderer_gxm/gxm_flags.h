@@ -73,6 +73,12 @@ namespace GxmRenderer {
  *   usse_dump every emitted program to ux0:data/mh4u/usse/us_<hash>.gxp with a .txt of
  *             its configuration (fragment) and uv_<key>.gxp (vertex), for the SDK tools
  *             off the console
+ *   refllut   the reflection-red LUT always looked up (the default fits it: |N.H|^n or
+ *             nothing - Usse::ReflMode); reflone takes it as 1 (the old shortcut, white
+ *             water); noreflpow / noreflskip turn off the power form / the dropped term;
+ *             logrefl logs the fits and tables to ux0:data/mh4u/refllog.txt
+ *   shadowmap PICA shadow maps drawn and compared (P5; off: shadow passes dropped, maps
+ *             white); logshadow, tracecb and the dbgshadow* switches diagnose it
  *   usse_nohoist, usse_nocse, usse_nomadfold
  *       Tier 2 bisecting: no load hoisting (and so no shared chains or reuse), no reuse of
  *       an earlier read of the same uniform, no direct two-wide mads.
