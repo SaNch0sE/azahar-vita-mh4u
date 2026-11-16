@@ -1701,6 +1701,21 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     Common::PipelineStats::bp_calls++;
     // The fragment program for this PICA configuration, compiled on the worker if new.
     Pica::Shader::FSConfig fs_config{regs};
+    // The grade drawn as a blend (IsGradeDouble) needs only white from its program: the
+    // combiner becomes stage 0 = constant (white, checked), the rest pass-through, so no
+    // texture read or six stages per pixel. `nogradeprog` keeps the game's combiner.
+    if (grade_double && regs.texturing.GetTevStages()[0].const_color == 0xFFFFFFFFu) {
+        static const bool keep = GxmFlag("nogradeprog");
+        if (!keep) {
+            auto& st = fs_config.texture.tev_stages;
+            for (u32 i = 0; i < st.size(); i++) {
+                st[i].sources_raw = i == 0 ? 0x000E000Eu : 0x000F000Fu;
+                st[i].modifiers_raw = 0;
+                st[i].ops_raw = 0;
+                st[i].scales_raw = 0;
+            }
+        }
+    }
     if (fs_config.lighting.enable && fs_config.lighting.lut_rr.enable) {
         // The reflection-red LUT's evaluation (Usse::ReflMode). `refllut` keeps the lookup,
         // `reflone` the old shortcut (taken as 1), `noreflpow` / `noreflskip` turn off the
@@ -1765,6 +1780,24 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
                     std::fclose(f);
                 }
             }
+        }
+    }
+    // Black lighting terms (Usse::SetBlackTerms) left out of the program; `noblackterms`
+    // keeps them.
+    {
+        static const bool off = GxmFlag("noblackterms");
+        const auto& lt = fs_config.lighting;
+        if (!off && lt.enable) {
+            const auto black = [](const auto& c) {
+                return c.r.Value() == 0 && c.g.Value() == 0 && c.b.Value() == 0;
+            };
+            u32 spec0 = 0, ambient = 0;
+            for (u32 i = 0; i < lt.src_num && i < 8; i++) {
+                const auto& l = regs.lighting.light[lt.lights[i].num];
+                spec0 |= black(l.specular_0) ? 1u << i : 0u;
+                ambient |= black(l.ambient) ? 1u << i : 0u;
+            }
+            Usse::SetBlackTerms(fs_config, spec0, ambient, black(regs.lighting.global_ambient));
         }
     }
     // A software-shaded draw's vertex program passes the quaternion through: no per-vertex
@@ -3385,6 +3418,10 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
                 }
             }
             if (TextureUnitRead(unit) && (no_alpha_only || AlphaReadsUnit(unit))) {
+                skip_feedback_draw = true;
+            } else if (TextureUnitRead(unit) && IsGradeDouble(unit) &&
+                       GxmFlag("dbgnograde")) {
+                // dbgnograde (diag): the grade draw dropped, to price it.
                 skip_feedback_draw = true;
             } else if (TextureUnitRead(unit) && IsGradeDouble(unit)) {
                 // Monster Hunter 4 Ultimate's last pass reads the whole frame and writes back

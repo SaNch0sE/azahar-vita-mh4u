@@ -87,6 +87,9 @@ namespace GxmRenderer {
  *             counts who takes it (pvlog.txt)
  *   pvnormalsw software-shaded lit draws read TEXCOORD5 as a normal again (it holds the
  *             quaternion there: the old, wrong, behaviour)
+ *   noblackterms  black specular_0 / ambient / global ambient computed anyway
+ *   nogradeprog the grade blend runs the game's combiner rather than constant white;
+ *             dbgnograde drops the grade (pricing only)
  *   nogradeblend MH4U's final grade (frame times two) back to alpha-only; loggrade logs
  *             the alpha-only feedback draws' combiners to ux0:data/mh4u/gradelog.txt
  *   tracedrop count BeginDraw's drops by source line and target (ux0:data/mh4u/droplog.txt)

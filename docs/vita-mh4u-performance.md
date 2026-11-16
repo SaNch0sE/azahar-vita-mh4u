@@ -670,3 +670,17 @@ normalise), the alpha-tested discards (~4.6 ms), or a render scale below 1x (use
 - **E2 (`ptorder`):** every camp frame on the main target is `O2 o2 B4 O56 P23 B22 o1 B33` -
   all opaque draws come before the first cut-out (0 opaque vertices after it). Deferring the
   cut-outs cannot help: their cost is their own shading of overlapping cards. Item 2 is closed.
+
+### Camp, round three: exact trims (2026-11-16)
+
+- **Black lighting terms** (`Usse::SetBlackTerms`, spare bits of lut_d0; `noblackterms`): a
+  light's black specular_0 or ambient, or a black global ambient, is neither loaded nor added
+  (MH4U's world: specular_0 and ambient always black). Camp 36.6 -> 35.1 ms - more than the
+  instruction count suggests.
+- **The grade's program** (`nogradeprog`): the frame-doubling grade, drawn as a blend, now uses a
+  combiner of constant white (stage 0 constant checked to be white) instead of the game's six
+  stages with a texture read. The draw itself costs ~1.4 ms (`dbgnograde` drops it, diag only);
+  the program change takes ~1 ms of it. Pictures identical.
+
+Camp main target now ~33.9 ms (run-to-run noise ~1 ms). Release, 25 s: camp 27.8 fps (was 26.1),
+pond and pillar 30.0.

@@ -105,6 +105,27 @@ inline void SetNoPvNormal(Pica::Shader::FSConfig& config, bool on) {
 }
 
 /**
+ * Black lighting terms, from the light colour registers (spare bits of lut_d0, bits 0-4 being
+ * the PICA's): bit 8 + i the i-th enabled light's specular_0, bit 16 + i its ambient, bit 24
+ * the global ambient. A black term is not loaded or added.
+ */
+inline void SetBlackTerms(Pica::Shader::FSConfig& config, uint32_t spec0, uint32_t ambient,
+                          bool global_ambient) {
+    auto& raw = config.lighting.lut_d0.raw;
+    raw = (raw & 0x1Fu) | ((spec0 & 0xFFu) << 8) | ((ambient & 0xFFu) << 16) |
+          (global_ambient ? 1u << 24 : 0u);
+}
+[[nodiscard]] inline bool Specular0Black(const Pica::Shader::FSConfig& config, uint32_t i) {
+    return (config.lighting.lut_d0.raw >> (8 + i)) & 1u;
+}
+[[nodiscard]] inline bool AmbientBlack(const Pica::Shader::FSConfig& config, uint32_t i) {
+    return (config.lighting.lut_d0.raw >> (16 + i)) & 1u;
+}
+[[nodiscard]] inline bool GlobalAmbientBlack(const Pica::Shader::FSConfig& config) {
+    return (config.lighting.lut_d0.raw >> 24) & 1u;
+}
+
+/**
  * The Fresnel LUT's evaluation, the same way (spare bits of lut_fr): the lookup, or
  *   Schlick  c0 + c1 * (1 - |N.V|)^m, m in bits 16-23, (c0, c1) in the uniform
  *            lighting_fr_coef - MH4U's tables are all this form with m = 5

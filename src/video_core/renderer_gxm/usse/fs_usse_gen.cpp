@@ -2247,7 +2247,11 @@ void FragmentEmitter::Lighting() {
         if (d0_on) {
             StoreVec4(acc, I2);
         }
-        // specular_0 = d0 * light.specular_0 (d0 from its LUT or 1), added on.
+        // specular_0 = d0 * light.specular_0 (d0 from its LUT or 1), added on; nothing when
+        // specular_0 is black (MH4U's world: always).
+        if (!d0_on && Specular0Black(config, light_index)) {
+            e.MoveInternal({I1, 0xf}, {I2, XYZW}, Pred::None, true);
+        } else {
         if (d0_on) {
             lut_value(lighting.lut_d0, Sampler::Distribution0, two_sided);
             LoadVec4(I1, specular_0);
@@ -2262,6 +2266,7 @@ void FragmentEmitter::Lighting() {
             LoadVec4(I2, acc);
         }
         e.Vec(VecOp::Add, {I1, 0x7}, {I1, XYZW}, {I2, XYZW}, Pred::None, true);
+        } // specular_0
         // * clamp_highlights * atten, into specular_sum.
         if (lighting.clamp_highlights) {
             e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {misc_hi, XXXX}, Pred::None, true);
@@ -2284,14 +2289,19 @@ void FragmentEmitter::Lighting() {
         } // uses_secondary_color
         if (uses_primary_color) {
         // diffuse_sum += (diffuse * dot_product + ambient) * atten
+        const bool ambient_black = AmbientBlack(config, light_index);
         LoadVec4(I0, diffuse);
-        LoadVec4(I1, ambient);
+        if (!ambient_black) {
+            LoadVec4(I1, ambient);
+        }
         e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {dot_product, XXXX}, Pred::None, true);
         if (shadow_primary) {
             LoadVec4(I2, shadow);
             e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {I2, XYZW}, Pred::None, true);
         }
-        e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
+        if (!ambient_black) {
+            e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
+        }
         if (atten_on) {
             e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {atten, XXXX}, Pred::None, true);
         }
@@ -2344,8 +2354,10 @@ void FragmentEmitter::Lighting() {
     // diffuse_sum.rgb += global ambient; both clamped in place.
     if (uses_primary_color) {
         LoadVec4(I0, diffuse_sum);
-        LoadVec4(I1, {Bank::SecAttr, static_cast<uint8_t>(sa_global_ambient)});
-        e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
+        if (!GlobalAmbientBlack(config)) {
+            LoadVec4(I1, {Bank::SecAttr, static_cast<uint8_t>(sa_global_ambient)});
+            e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
+        }
         Clamp01(I0);
         StoreVec4(diffuse_sum, I0);
     }
