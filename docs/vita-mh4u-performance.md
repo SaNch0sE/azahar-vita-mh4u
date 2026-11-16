@@ -728,3 +728,10 @@ upscale, ~1.2 ms with plain linear (`upscale=0`). So a frame at the camp is ~31 
 (xferlog.txt). Presenting straight from the main target would save the blit, but the present
 marks its source busy until the frame's finish, so the next frame's first draw into the main
 target would wait - not tried. The sharp-bilinear cost is its dependent read at 960x544.
+
+### Upscale filter at the camp (2026-11-16)
+
+Release, camp, 25-30 s each: linear 30.0 fps (0 s under 29), sharp bilinear 29.0-29.5, and a
+pre-scaled sharp variant (2x nearest-neighbour into its own 480x800 target, then a linear
+stretch; tried and removed) 29.0 with 6 s under 29 - its extra scene costs what the
+non-dependent read saves. The user's default is now linear (`upscale=0` in video.txt).
