@@ -679,7 +679,21 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
                                     SCE_GXM_INDEX_FORMAT_U16, identity_indices, BlitVertices);
     if (!merged) {
         GXM_PHASE("gpu:end-scene");
+        // presenttime (diag): the GPU blit scenes timed on their own, like scenetime.
+        static const bool present_time = GxmFlag("presenttime");
+        const u64 pt0 = present_time ? (sceGxmFinish(context), Common::PipelineStats::NowUs()) : 0;
         sceGxmEndScene(context, nullptr, &notification);
+        if (present_time) {
+            sceGxmFinish(context);
+            static u64 total_us = 0;
+            static u32 count = 0;
+            total_us += Common::PipelineStats::NowUs() - pt0;
+            if (++count % 100 == 0) {
+                LOG_INFO(Render, "presenttime: gpu blit scenes {} us each ({} {}x{})",
+                         total_us / 100, dest.addr, dest.width, dest.height);
+                total_us = 0;
+            }
+        }
         runtime.SceneSubmitted();
         CloseSceneTrace();
     }
@@ -5293,6 +5307,29 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     nondraw_epoch++;
     DrawTrace("display transfer");
     const PhaseTimer timer{time_draws, times.transfers};
+    // logxfer (diag): the first 12 display transfers in full, to ux0:data/mh4u/xferlog.txt.
+    static const bool log_xfer = GxmFlag("logxfer");
+    if (log_xfer) {
+        static u32 n = 0;
+        if (n++ < 12) {
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/xferlog.txt", "a")) {
+                std::fprintf(f,
+                             "xfer %08x %ux%u fmt %u linear %u -> %08x %ux%u fmt %u; flip %u "
+                             "scale %u raw_copy %u crop %u dont_swizzle %u\n",
+                             config.GetPhysicalInputAddress(), config.input_width.Value(),
+                             config.input_height.Value(),
+                             static_cast<u32>(config.input_format.Value()),
+                             config.input_linear.Value(), config.GetPhysicalOutputAddress(),
+                             config.output_width.Value(), config.output_height.Value(),
+                             static_cast<u32>(config.output_format.Value()),
+                             config.flip_vertically.Value(),
+                             static_cast<u32>(config.scaling.Value()),
+                             config.is_texture_copy.Value(), config.crop_input_lines.Value(),
+                             config.dont_swizzle.Value());
+                std::fclose(f);
+            }
+        }
+    }
     const bool done = EnsureResources() && res_cache.AccelerateDisplayTransfer(config);
     if (LogtexActive()) {
         logtex_lines++;

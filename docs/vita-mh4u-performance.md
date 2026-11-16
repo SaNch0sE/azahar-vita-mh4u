@@ -717,3 +717,14 @@ measured 33.3 ms against 32.8 without, and some draws read white (the hunter's w
 fence) - not pursued. Texture latency is not what limits the lit programs.
 Proven query carriers in Sony's programs: COLOR0 and four-wide TEXCOORDs, and a standalone
 query descriptor (input 0xF, no 0x0c000000); no two-wide or own-coordinate carrier.
+
+### Camp: the GPU time outside the main target (2026-11-16)
+
+`presenttime` (diag) times the GPU blit scenes and the frontend's present scene on their own:
+the display-transfer blit (main target 0x180F0800 256x512 RGBA8, cropped, into one of three
+240x400 RGB565 framebuffers) ~0.8 ms a frame; the present scene ~3.1 ms with the sharp-bilinear
+upscale, ~1.2 ms with plain linear (`upscale=0`). So a frame at the camp is ~31 ms main target +
+0.8 + 3.1 = ~35 ms, which is the 28.7 fps shown. `logxfer` logs the first display transfers
+(xferlog.txt). Presenting straight from the main target would save the blit, but the present
+marks its source busy until the frame's finish, so the next frame's first draw into the main
+target would wait - not tried. The sharp-bilinear cost is its dependent read at 960x544.

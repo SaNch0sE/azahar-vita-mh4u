@@ -87,6 +87,8 @@ namespace GxmRenderer {
  *             counts who takes it (pvlog.txt)
  *   pvnormalsw software-shaded lit draws read TEXCOORD5 as a normal again (it holds the
  *             quaternion there: the old, wrong, behaviour)
+ *   presenttime  the GPU blit scenes and the present scene timed on their own
+ *   logxfer   the first display transfers in full (xferlog.txt)
  *   nolightcompact  resident lights declare all eight members (24 SAs) again
  *   logtemps  each emitted fragment program's temporaries and shape (templog.txt)
  *   dbgminsel_bump / _flat / _l2 / _kill  dbgminfs for one class of lit program only

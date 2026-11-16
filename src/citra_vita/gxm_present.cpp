@@ -2010,7 +2010,21 @@ void EndFrame() {
     {
         const PresentTimer timer{ptimes.end_scene_us};
         GXM_PHASE("present:end-scene");
+        // presenttime (diag): the present scene's own GPU time.
+        static const bool present_time = GxmRenderer::GxmFlag("presenttime");
+        const u64 pt0 = present_time ? (sceGxmFinish(g.context), sceKernelGetProcessTimeWide()) : 0;
         sceGxmEndScene(g.context, nullptr, &done);
+        if (present_time) {
+            sceGxmFinish(g.context);
+            static u64 total_us = 0;
+            static u32 count = 0;
+            total_us += sceKernelGetProcessTimeWide() - pt0;
+            if (++count % 100 == 0) {
+                sceClibPrintf("[present] presenttime: present scene %u us each\n",
+                            static_cast<unsigned>(total_us / 100));
+                total_us = 0;
+            }
+        }
     }
     g.in_scene = false;
 
