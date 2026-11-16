@@ -486,7 +486,7 @@ User report: slowdown when the gathering icon appears, deeper when "... obtained
 
 ## Fog as a non-dependent read (2026-11-15)
 
-Every vertex program writes TEXCOORD7 = (z * 255/256 + w/512, w/2, 0, w) (o27-30; output descriptor 31 registers, TEXCOORD7 four wide). Fog programs read the strip non-dependently from it, projected by w (exactly the coordinate the shader used to compute from the fragment's depth), on the COLOR0 descriptor as the SDK's compiled imgui_f does; the texel arrives in pa4-7 before the program runs and fog no longer needs the Position input. Flipped fog bakes the strip reversed. GXP details learnt from the SDK programs in src/citra_vita/shaders and Vita3K's reader: descriptor low nibble = TEXCOORD index of the query (0xF none), 0x100/0x200 = xy / xy over w, 0x800 set, size bits 6-7 = result registers - 1, component_info 0x30 = float result; texunit nibble 1 = non-dependent; program flag 0x800; non-dependent samplers take no data-container words.
+Every vertex program writes TEXCOORD7 = (z * 255/256 + w/512, w/2, 0, w) (o27-30; output descriptor 31 registers, TEXCOORD7 four wide). Fog programs read the strip non-dependently from it, projected by w (exactly the coordinate the shader used to compute from the fragment's depth), on the COLOR0 descriptor as the SDK's compiled imgui_f does; the texel arrives in pa4-7 before the program runs and fog no longer needs the Position input. Flipped fog bakes the strip reversed. GXP details learnt from the SDK programs in src/citra_vita/shaders and Vita3K's reader: descriptor low nibble = TEXCOORD index of the query (0xF none), 0x100/0x200 = xy / xy over w, 0x800 set (on the last query only, see "Textures as non-dependent reads"), size bits 6-7 = result registers - 1, component_info 0x30 = float result; texunit nibble 1 = non-dependent; program flag 0x800; non-dependent samplers take no data-container words.
 
 Slot 1 open field, diag scenetime: ~32.7 ms with it, ~33.7-34.3 without; release 26-27 -> 28 shown. Screenshots match. Kill switch `nofogquery` (flag or `ux0:data/mh4u/nofogquery`).
 
@@ -704,3 +704,16 @@ most with one or both lights loaded from memory (24 temporaries of TmpLightMem e
 
 Camp: 34.0 -> 33.4 (literals) -> 32.8 ms (compact lights) - smaller than the temporaries
 suggested. The highlight power chain still costs ~6 ms (`reflone`), unchanged by `pvhalf`.
+
+### Textures as non-dependent reads: no gain (2026-11-16)
+
+Tried for texture unit 1 (`texquery1`, removed again). Two console GPU crashes ("render gpu
+crash", the second powered the Vita off) were the descriptor writer setting 0x800 on every
+query: Fable compared TuizaVita's psp2cgc-compiled two-query programs (reserva_r_f /
+reserva_r_fl), where 0x800 is "last texture query" and sits on the last query only, and
+0x02000000 marks the last iterated input. The writer now sets 0x800 on the last query alone
+(single-query programs, the fog path, are unchanged). With that the query ran, but the camp
+measured 33.3 ms against 32.8 without, and some draws read white (the hunter's weapon, a
+fence) - not pursued. Texture latency is not what limits the lit programs.
+Proven query carriers in Sony's programs: COLOR0 and four-wide TEXCOORDs, and a standalone
+query descriptor (input 0xF, no 0x0c000000); no two-wide or own-coordinate carrier.

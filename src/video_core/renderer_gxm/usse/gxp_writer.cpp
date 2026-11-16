@@ -230,6 +230,15 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
         }
         w.U16(queries); // non-dependent sampler count
         w.U32(4); // the descriptors follow this field directly
+        // The last descriptor carrying a query marks it with 0x800 ("last texture query"):
+        // psp2cgc's two-query programs (TuizaVita's reserva_r_f / reserva_r_fl) set it on the
+        // second query only. Setting it on every query crashed the console's GPU (2026-11-16).
+        int last_query = -1;
+        for (size_t i = 0; i < program.inputs.size(); i++) {
+            if (program.inputs[i].query_coord >= 0) {
+                last_query = static_cast<int>(i);
+            }
+        }
         for (size_t i = 0; i < program.inputs.size(); i++) {
             const auto& input = program.inputs[i];
             // 0x0c00000f: constant bits and "no texture query"; the input id in bits 12-15; the
@@ -249,7 +258,8 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
                 // The query, as the SDK's imgui_f has it on its COLOR0 descriptor: the TEXCOORD
                 // index in the low bits instead of 0xF, 0x800, the coordinate swizzle (0x100
                 // xy, 0x200 xy/w), the unit, four result registers (bits 6-7), float texels.
-                info = (info & ~0xfu) | static_cast<uint32_t>(input.query_coord) | 0x800 |
+                info = (info & ~0xfu) | static_cast<uint32_t>(input.query_coord) |
+                       (static_cast<int>(i) == last_query ? 0x800u : 0u) |
                        (input.query_project_w ? 0x200 : 0x100);
                 resource = input.query_unit;
                 size |= 3u << 6;
