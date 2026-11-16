@@ -630,6 +630,10 @@ private:
     /// MH4U's final grade (a feedback draw that doubles the frame, see SyncTextureUnits):
     /// drawn as white blended DstColor + One, which is the target times two.
     bool grade_double = false;
+    /// The frame's 2D layer: draws into `hud_target` after its grade (dbgnohud, dbgonlyhud,
+    /// hudlog). Cleared at a display transfer and at the frame's end.
+    bool hud_phase = false;
+    u32 hud_target = 0;
     u32 stat_alpha_only_feedback{};
     u32 stat_grade_double{};
 

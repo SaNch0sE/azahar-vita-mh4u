@@ -1540,7 +1540,27 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
     // y scale is positive: NDC +1 lands on the highest row index, the top of the picture.
     // A scaled framebuffer (render scale) takes all of these in storage texels.
     const auto vp = helper.Viewport();
-    const float vx = fb->SXf(static_cast<float>(vp.x)), vy = fb->SXf(static_cast<float>(vp.y));
+    // dbghudhalf (diag): the 2D layer's viewport moved by half a pixel on both axes.
+    // Every draw's viewport moved by half a pixel on both axes: the PICA and GXM differ by
+    // half a pixel in where a primitive's pixels sample, so without it MH4U's HUD letters
+    // (one texel per pixel) were sampled between texels - "(No Item)" read "(No Itarr)" at
+    // native resolution, crisp on a real 3DS (2026-11-16). `nohalfpixel` (flag or
+    // ux0:data/mh4u/nohalfpixel) turns it off; dbghudhalf (diag) applies it to the HUD only.
+    static const bool no_half = GxmFlag("nohalfpixel") || [] {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nohalfpixel", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return false;
+    }();
+    static const bool hud_half = GxmFlag("dbghudhalf");
+    const float hud_shift =
+        !no_half || (hud_half && hud_phase &&
+                     fb_regs.framebuffer.GetColorBufferPhysicalAddress() == hud_target)
+            ? 0.5f
+            : 0.0f;
+    const float vx = fb->SXf(static_cast<float>(vp.x)) + hud_shift,
+                vy = fb->SXf(static_cast<float>(vp.y)) + hud_shift;
     const float vw = fb->SXf(static_cast<float>(vp.width)),
                 vh = fb->SXf(static_cast<float>(vp.height));
     const float viewport[6] = {vx + vw * 0.5f, vw * 0.5f, vy + vh * 0.5f, vh * 0.5f, 0.0f, 1.0f};
@@ -2868,7 +2888,14 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
     fs_data_dirty = false;
 }
 
-void RasterizerGxm::BindFragmentTexture(u32 unit, const SceGxmTexture& texture) {
+void RasterizerGxm::BindFragmentTexture(u32 unit, const SceGxmTexture& texture_in) {
+    // dbghudpoint (diag): the 2D layer's textures sampled nearest-neighbour.
+    static const bool hud_point = GxmFlag("dbghudpoint");
+    SceGxmTexture texture = texture_in;
+    if (hud_point && hud_phase && unit < 3) {
+        sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+        sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
+    }
     if (texture_binding_valid[unit] &&
         std::memcmp(&texture_bindings[unit], &texture, sizeof(texture)) == 0) {
         return;
@@ -3737,6 +3764,57 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         tex_split[0] += t1 - t0;
         tex_split[1] += t2 - t1;
         tex_split[2] += t3 - t2;
+    }
+    // The 2D layer (diag): everything drawn into the graded target after its grade.
+    // dbgnohud drops it, dbgonlyhud drops what comes before (and the grade), hudlog describes
+    // one frame of it in 150 to ux0:data/mh4u/hudlog.txt.
+    {
+        static const bool no_hud = GxmFlag("dbgnohud");
+        static const bool only_hud = GxmFlag("dbgonlyhud");
+        static const bool hud_log = GxmFlag("hudlog");
+        const u32 cb = regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
+        const bool post = hud_phase && cb == hud_target;
+        if (grade_double) {
+            hud_phase = true;
+            hud_target = cb;
+        }
+        if (hud_log && post) {
+            static u32 logged_frame = ~0u;
+            if (frame_index % 150 == 0 || logged_frame == frame_index) {
+                logged_frame = frame_index;
+                const auto& om = regs.framebuffer.output_merger;
+                u32 blend_raw = 0;
+                std::memcpy(&blend_raw, &om.alpha_blending, sizeof(blend_raw));
+                const auto tex = regs.texturing.GetTextures();
+                const auto& vp = regs.rasterizer;
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/hudlog.txt", "a")) {
+                    std::fprintf(
+                        f,
+                        "frame %u draw: blend %u raw %08x depth test %u func %u write %u "
+                        "alpha test %u func %u ref %u mask %u%u%u%u gs %u verts %u vp %.0fx%.0f "
+                        "tex0 %08x %ux%u fmt %u en %u tex1 %08x en %u tev0 %08x\n",
+                        frame_index, om.alphablend_enable.Value(), blend_raw,
+                        om.depth_test_enable.Value(), static_cast<u32>(om.depth_test_func.Value()),
+                        om.depth_write_enable.Value(), om.alpha_test.enable.Value(),
+                        static_cast<u32>(om.alpha_test.func.Value()), om.alpha_test.ref.Value(),
+                        om.red_enable.Value(), om.green_enable.Value(), om.blue_enable.Value(),
+                        om.alpha_enable.Value(),
+                        regs.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes ? 1u : 0u,
+                        static_cast<u32>(regs.pipeline.num_vertices),
+                        Pica::f24::FromRaw(vp.viewport_size_x).ToFloat32() * 2.0f,
+                        Pica::f24::FromRaw(vp.viewport_size_y).ToFloat32() * 2.0f,
+                        tex[0].config.GetPhysicalAddress(), tex[0].config.width.Value(),
+                        tex[0].config.height.Value(), static_cast<u32>(tex[0].format),
+                        tex[0].enabled ? 1u : 0u, tex[1].config.GetPhysicalAddress(),
+                        tex[1].enabled ? 1u : 0u, regs.texturing.GetTevStages()[0].sources_raw);
+                    std::fclose(f);
+                }
+            }
+        }
+        if ((no_hud && post) || (only_hud && !post && cb == 0x180D4800)) {
+            stat_skipped++;
+            return false;
+        }
     }
     if (skip_feedback_draw) {
         stat_skipped++;
@@ -5330,6 +5408,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
             }
         }
     }
+    hud_phase = false;
     const bool done = EnsureResources() && res_cache.AccelerateDisplayTransfer(config);
     if (LogtexActive()) {
         logtex_lines++;
@@ -5487,6 +5566,7 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
 }
 
 void RasterizerGxm::EndFrame() {
+    hud_phase = false;
     FlushDeferredDraws();
     draw_epoch++;
     nondraw_epoch++;

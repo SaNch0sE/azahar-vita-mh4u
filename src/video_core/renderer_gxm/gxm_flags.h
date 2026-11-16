@@ -87,6 +87,9 @@ namespace GxmRenderer {
  *             counts who takes it (pvlog.txt)
  *   pvnormalsw software-shaded lit draws read TEXCOORD5 as a normal again (it holds the
  *             quaternion there: the old, wrong, behaviour)
+ *   nohalfpixel  draws without the half-pixel viewport shift (default on: HUD text crisp)
+ *   dbgnohud / dbgonlyhud / hudlog / dbghudpoint / dbghudhalf  the post-grade 2D layer:
+ *             dropped, alone, logged (hudlog.txt), point-sampled, shifted half a pixel
  *   presenttime  the GPU blit scenes and the present scene timed on their own
  *   logxfer   the first display transfers in full (xferlog.txt)
  *   nolightcompact  resident lights declare all eight members (24 SAs) again

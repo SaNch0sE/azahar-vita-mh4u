@@ -735,3 +735,20 @@ Release, camp, 25-30 s each: linear 30.0 fps (0 s under 29), sharp bilinear 29.0
 pre-scaled sharp variant (2x nearest-neighbour into its own 480x800 target, then a linear
 stretch; tried and removed) 29.0 with 6 s under 29 - its extra scene costs what the
 non-dependent read saves. The user's default is now linear (`upscale=0` in video.txt).
+
+## HUD text: a half-pixel offset (2026-11-16)
+
+The user's photo of a real 3DS shows MH4U's HUD text crisp at 400x240; ours read "(No Itarr)"
+for "(No Item)". The surface dump (`dumpfile`, main target 0x180D4800) showed the letters already
+malformed at native resolution, before the stretch, so not an upscale matter. Mipmaps off: no
+change. `dbghudpoint` (point sampling for the 2D layer): no change. `dbghudhalf` (the 2D layer's
+viewport moved half a pixel): crisp letters. With the shift on every draw (`SyncState`), the
+world is the same picture half a pixel over and the text is right - the PICA and GXM differ by
+half a pixel in where a primitive's pixels sample, and one-texel-per-pixel glyphs were read
+between texels. Now the default; kill switch `nohalfpixel` (flag or file). Release: camp 29.5,
+pond 30.1, pillar 30.0 fps; menu text crisp.
+
+The 2D layer (post-grade draws): `dbgnohud` / `dbgonlyhud` split it cleanly (it costs ~2.8 ms at
+the camp); `hudlog` lists one frame of it: ~32 software-GS sprite draws (SrcAlpha /
+OneMinusSrcAlpha, no depth) and two full-screen quads. Fable's plan for replaying the sprites in
+the present at screen resolution is kept for later if the native text is still not enough.
