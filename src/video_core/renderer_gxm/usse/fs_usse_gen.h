@@ -80,4 +80,22 @@ inline void SetReflMode(Pica::Shader::FSConfig& config, ReflMode mode, uint32_t 
     return (config.lighting.lut_rr.raw >> 16) & 0xFFu;
 }
 
+/**
+ * The Fresnel LUT's evaluation, the same way (spare bits of lut_fr): the lookup, or
+ *   Schlick  c0 + c1 * (1 - |N.V|)^m, m in bits 16-23, (c0, c1) in the uniform
+ *            lighting_fr_coef - MH4U's tables are all this form with m = 5
+ *   Const    c0 (a flat table)
+ */
+enum class FrMode : uint32_t { Lookup = 0, Schlick = 1, Const = 2 };
+inline void SetFrMode(Pica::Shader::FSConfig& config, FrMode mode, uint32_t m = 0) {
+    auto& raw = config.lighting.lut_fr.raw;
+    raw = (raw & 0x1Fu) | (static_cast<uint32_t>(mode) << 8) | ((m & 0xFFu) << 16);
+}
+[[nodiscard]] inline FrMode FrModeOf(const Pica::Shader::FSConfig& config) {
+    return static_cast<FrMode>((config.lighting.lut_fr.raw >> 8) & 0x3u);
+}
+[[nodiscard]] inline uint32_t FrExponentOf(const Pica::Shader::FSConfig& config) {
+    return (config.lighting.lut_fr.raw >> 16) & 0xFFu;
+}
+
 } // namespace GxmRenderer::Usse

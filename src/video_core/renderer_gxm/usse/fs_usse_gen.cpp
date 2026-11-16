@@ -394,6 +394,7 @@ private:
     uint32_t sa_lut_offset = 0;
     uint32_t sa_global_ambient = 0;
     uint32_t sa_border = 0;               ///< tex_border_color float4[3]
+    uint32_t sa_fr_coef = 0;              ///< lighting_fr_coef (c0, c1), FrMode not Lookup
     uint32_t data_head = 0;               ///< 1 when the data container starts with the pointer
     uint32_t memory_floats = 0;           ///< floats in the memory part of the uniform buffer
     struct MemoryUniform {
@@ -624,7 +625,8 @@ void FragmentEmitter::PlanInputs() {
     if (uses_lighting) {
         lut_used = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0) ||
                    LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1) ||
-                   LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel) ||
+                   (FrModeOf(config) == FrMode::Lookup &&
+                    LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel)) ||
                    (ReflModeOf(config) == ReflMode::Lookup &&
                     LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed)) ||
                    LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen) ||
@@ -819,6 +821,10 @@ void FragmentEmitter::PlanUniforms() {
         AllocateUniform("proctex_bias", 1, 1);
     }
     light_memory.fill(-1);
+    if (uses_lighting && FrModeOf(config) != FrMode::Lookup &&
+        LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel)) {
+        sa_fr_coef = AllocateUniform("lighting_fr_coef", 2, 1);
+    }
     if (uses_lighting) {
         // The LUT offsets as a prefix of the float4[6] up to the highest sampler used.
         u32 highest = 0;
@@ -829,7 +835,9 @@ void FragmentEmitter::PlanUniforms() {
         };
         note(LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0), 0);
         note(LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1), 1);
-        note(LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel), 3);
+        note(FrModeOf(config) == FrMode::Lookup &&
+                 LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel),
+             3);
         note(LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue), 4);
         note(LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen), 5);
         note(ReflModeOf(config) == ReflMode::Lookup &&
@@ -1847,7 +1855,9 @@ void FragmentEmitter::Lighting() {
         if (li + 1 == lighting.src_num &&
             ((uses_primary_color && lighting.enable_primary_alpha && primary_alpha_read) ||
              (uses_secondary_color && lighting.enable_secondary_alpha && secondary_alpha_read))) {
-            input_of(lighting.lut_fr, Sampler::Fresnel);
+            if (FrModeOf(config) != FrMode::Const) {
+                input_of(lighting.lut_fr, Sampler::Fresnel);
+            }
         }
         if (light.spot_atten_enable) {
             input_of(lighting.lut_sp, Sampler::SpotlightAttenuation);
@@ -1933,11 +1943,8 @@ void FragmentEmitter::Lighting() {
     // ReflMode::Power: the reflection-red LUT as |N.H|^n (the rasterizer checked the table is
     // that curve), by repeated squaring in i0.x - no texture read. The input is |N.H|, the
     // only form the rasterizer accepts (abs_input), clamped to 1 as the LUT index is.
-    const auto refl_power_value = [&]() {
-        lut_input(LutInput::NH);
-        e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX, Mod::Abs}, ConstZero, Pred::None, true);
-        e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, ConstOne, Pred::None, true);
-        u32 n = ReflExponentOf(config);
+    // i0.x = i0.x^n by repeated squaring (i0.y the accumulator when n is not a power of two).
+    const auto pow_i0x = [&](u32 n) {
         if (n == 0) {
             e.MoveInternal({I0, 0x1}, ConstOne, Pred::None, true);
         } else if ((n & (n - 1)) == 0) {
@@ -1962,9 +1969,51 @@ void FragmentEmitter::Lighting() {
             }
             e.MoveInternal({I0, 0x1}, {I0, YYYY}, Pred::None, true);
         }
+    };
+    // FrMode::Schlick / Const: the Fresnel LUT as c0 + c1 * (1 - |N.V|)^m, or c0, in i0.x.
+    const auto fresnel_fit_value = [&]() {
+        const Src c0 = SaScalar(sa_fr_coef);
+        const Src c1 = SaScalar(sa_fr_coef + 1);
+        if (FrModeOf(config) == FrMode::Const) {
+            e.Vec(VecOp::Add, {I0, 0x1}, c0, ConstZero, Pred::None, true);
+        } else {
+            lut_input(LutInput::NV);
+            e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX, Mod::Abs}, ConstZero, Pred::None, true);
+            e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, ConstOne, Pred::None, true);
+            e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX, Mod::Neg}, ConstOne, Pred::None, true);
+            pow_i0x(FrExponentOf(config));
+            e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, c1, Pred::None, true);
+            e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX}, c0, Pred::None, true);
+        }
+        lut_scale(lighting.lut_fr);
+    };
+    const auto refl_power_value = [&]() {
+        lut_input(LutInput::NH);
+        e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX, Mod::Abs}, ConstZero, Pred::None, true);
+        e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, ConstOne, Pred::None, true);
+        pow_i0x(ReflExponentOf(config));
         lut_scale(lighting.lut_rr);
     };
 
+
+    // Streamlined lighting (`nolightfast` turns it off): no copy of the spot direction or of a
+    // pre-normalised directional light's vector when no LUT reads them, and the power-curve
+    // reflection multiplied into specular_1 directly.
+    static const bool light_fast = !GxmFlag("nolightfast");
+    const auto lut_reads = [&](LutInput input) {
+        const auto reads = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
+            return LightingLutEnabled(lut, sampler) && lut.type.Value() == input;
+        };
+        return reads(lighting.lut_d0, Sampler::Distribution0) ||
+               reads(lighting.lut_d1, Sampler::Distribution1) ||
+               reads(lighting.lut_fr, Sampler::Fresnel) ||
+               reads(lighting.lut_rr, Sampler::ReflectRed) ||
+               reads(lighting.lut_rg, Sampler::ReflectGreen) ||
+               reads(lighting.lut_rb, Sampler::ReflectBlue) ||
+               reads(lighting.lut_sp, Sampler::SpotlightAttenuation);
+    };
+    const bool sp_read = lut_reads(LutInput::SP);
+    const bool ln_read = lut_reads(LutInput::LN);
     for (u32 light_index = 0; light_index < lighting.src_num; light_index++) {
         const auto& light = lighting.lights[light_index];
         const Vec4Loc params = LightParams(light.num);
@@ -2001,8 +2050,16 @@ void FragmentEmitter::Lighting() {
             }
             e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {I1, YYYY}, Pred::None, true);
         }
-        StoreVec4(light_vector, I0);
-        CopyVec4({Bank::Virtual, TmpLightAcc}, spot, 0x7);
+        // A pre-normalised directional light's vector is the uniform itself: read from there
+        // unless a LUT input (LN, SP) reads the parked copy.
+        const bool direct_lv = light_fast && DirectionPreNormalised(light) && !ln_read && !sp_read;
+        const Vec4Loc lv = direct_lv ? position : light_vector;
+        if (!direct_lv) {
+            StoreVec4(light_vector, I0);
+        }
+        if (!light_fast || sp_read || light.spot_atten_enable) {
+            CopyVec4({Bank::Virtual, TmpLightAcc}, spot, 0x7);
+        }
         // half_vector = normalize(nview + light_vector); its squared length kept for the
         // geometric factor.
         const bool geo0 = light.geometric_factor_0;
@@ -2020,7 +2077,7 @@ void FragmentEmitter::Lighting() {
         }
         // dot_product = two_sided ? |dot(l, n)| : max(dot(l, n), 0)
         LoadVec4(I1, normal);
-        e.Dot({I0, 0x1}, {light_vector.Pair(0), XYZW}, {I1, XYZW}, false, Pred::None, true);
+        e.Dot({I0, 0x1}, {lv.Pair(0), XYZW}, {I1, XYZW}, false, Pred::None, true);
         if (two_sided) {
             e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW, Mod::Abs}, ConstZero, Pred::None, true);
         } else {
@@ -2119,7 +2176,13 @@ void FragmentEmitter::Lighting() {
         const bool rb = refl_lookup && LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
         const bool d1_on = LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1);
         const bool d0_on = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
-        const bool refl_on = rr || rg || rb || refl_power;
+        // The power curve alone (no rg/rb lookups, no d1): its value multiplies specular_1
+        // straight from i0.x, no spreading into the accumulator and reloading it.
+        const bool refl_direct = light_fast && refl_power && !rg && !rb && !d1_on;
+        const bool refl_on = rr || rg || rb || (refl_power && !refl_direct);
+        if (refl_direct) {
+            refl_power_value();
+        }
         if (refl_on) {
             if (rg) {
                 lut_value(lighting.lut_rg, Sampler::ReflectGreen, two_sided);
@@ -2156,6 +2219,9 @@ void FragmentEmitter::Lighting() {
             e.Vec(VecOp::Mul, {I2, 0x7}, {I2, XYZW}, {I0, XXXX}, Pred::None, true);
         } else {
             LoadVec4(I2, specular_1);
+        }
+        if (refl_direct) {
+            e.Vec(VecOp::Mul, {I2, 0x7}, {I2, XYZW}, {I0, XXXX}, Pred::None, true);
         }
         if (refl_on) {
             LoadVec4(I1, acc);
@@ -2236,6 +2302,8 @@ void FragmentEmitter::Lighting() {
             static const bool const_fr = GxmFlag("dbgconstfr");
             if (const_fr) {
                 e.MoveInternal({I0, 0x1}, {Reg::C(2), XXXX}, Pred::None, true);
+            } else if (FrModeOf(config) != FrMode::Lookup) {
+                fresnel_fit_value();
             } else {
                 lut_value(lighting.lut_fr, Sampler::Fresnel, two_sided);
             }

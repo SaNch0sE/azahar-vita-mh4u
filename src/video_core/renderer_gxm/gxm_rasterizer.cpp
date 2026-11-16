@@ -1183,6 +1183,82 @@ void RasterizerGxm::FitReflectionRed(const void* lut_data) {
     }
 }
 
+void RasterizerGxm::FitFresnel(const void* lut_data) {
+    // The Fresnel LUT as c0 + c1 * (1 - x)^m (x = i / 256, abs input) or flat, checked like
+    // the reflection fit: every entry and every midpoint within 1.5/255.
+    const auto& lut =
+        *static_cast<const std::array<Pica::PicaCore::Lighting::LutEntry, 256>*>(lut_data);
+    const u64 hash = Common::ComputeHash64(lut.data(), sizeof(lut));
+    if (const auto it = fr_fits.find(hash); it != fr_fits.end()) {
+        fr_fit = it->second;
+        return;
+    }
+    using Usse::FrMode;
+    std::array<float, 256> v;
+    float lo = 2.0f, hi = -1.0f;
+    for (u32 i = 0; i < 256; i++) {
+        v[i] = lut[i].ToFloat();
+        lo = std::min(lo, v[i]);
+        hi = std::max(hi, v[i]);
+    }
+    constexpr float Tolerance = 1.5f / 255.0f;
+    FrFit fit{};
+    if (hi - lo < 0.5f / 255.0f) {
+        fit = {static_cast<u32>(FrMode::Const), 0, (hi + lo) * 0.5f, 0.0f};
+    } else {
+        float best = 1e9f;
+        for (u32 m = 1; m <= 8; m++) {
+            double sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (u32 i = 0; i < 256; i++) {
+                const double t = std::pow(1.0 - i / 256.0, static_cast<double>(m));
+                sx += t;
+                sy += v[i];
+                sxx += t * t;
+                sxy += t * v[i];
+            }
+            const double d = 256.0 * sxx - sx * sx;
+            if (d <= 0.0) {
+                continue;
+            }
+            const float c1 = static_cast<float>((256.0 * sxy - sx * sy) / d);
+            const float c0 = static_cast<float>((sy - c1 * sx) / 256.0);
+            float worst = 0.0f;
+            for (u32 i = 0; i < 256; i++) {
+                for (const float f : {0.0f, 0.5f}) {
+                    if (i == 255 && f != 0.0f) {
+                        continue;
+                    }
+                    const float x = (static_cast<float>(i) + f) / 256.0f;
+                    const float next = i < 255 ? v[i + 1] : v[i];
+                    const float pica = v[i] + (next - v[i]) * f;
+                    worst = std::max(worst,
+                                     std::abs(pica - (c0 + c1 * std::pow(1.0f - x, float(m)))));
+                }
+            }
+            if (worst < best) {
+                best = worst;
+                if (worst <= Tolerance) {
+                    fit = {static_cast<u32>(FrMode::Schlick), m, c0, c1};
+                }
+            }
+        }
+    }
+    fr_fit = fit;
+    if (fr_fits.size() < 64) {
+        fr_fits.emplace(hash, fit);
+    }
+    fs_data_dirty = true;
+    static const bool log_refl = GxmFlag("logrefl");
+    if (log_refl) {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/refllog.txt", "a")) {
+            std::fprintf(f, "fit fr %016llx: mode %u m %u c0 %.4f c1 %.4f (min %.3f max %.3f)\n",
+                         static_cast<unsigned long long>(hash), fit.mode, fit.m, fit.c0, fit.c1,
+                         lo, hi);
+            std::fclose(f);
+        }
+    }
+}
+
 void RasterizerGxm::SyncAndUploadLUTs() {
     if (!pica.lighting.lut_dirty && !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
         return;
@@ -1238,6 +1314,25 @@ void RasterizerGxm::SyncAndUploadLUTs() {
             upload_row(lut_lf, scratch2.data(), static_cast<u32>(source.size()));
         if (index == 6) {
             FitReflectionRed(&source);
+        }
+        if (index == 3) {
+            FitFresnel(&source);
+        }
+        // logfresnel (diag): each distinct Fresnel LUT's 256 values, for fitting.
+        static const bool log_fresnel = GxmFlag("logfresnel");
+        if (log_fresnel && index == 3) {
+            static std::set<u64> seen;
+            const u64 hash = Common::ComputeHash64(source.data(), sizeof(source));
+            if (seen.size() < 32 && seen.insert(hash).second) {
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/fresnellog.txt", "a")) {
+                    std::fprintf(f, "fr %016llx:", static_cast<unsigned long long>(hash));
+                    for (const auto& entry : source) {
+                        std::fprintf(f, " %u", entry.value.Value());
+                    }
+                    std::fprintf(f, "\n");
+                    std::fclose(f);
+                }
+            }
         }
         fs_data_dirty = true;
     }
@@ -1636,6 +1731,45 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             }
         }
         Usse::SetReflMode(fs_config, mode, n);
+        // loglights (diag): each distinct per-light colour set of lit draws.
+        static const bool log_lights = GxmFlag("loglights");
+        if (log_lights) {
+            static std::set<u64> seen;
+            u64 key = fs_config.lighting.src_num;
+            std::string line = fmt::format("lights {}:", fs_config.lighting.src_num.Value());
+            for (u32 i = 0; i < fs_config.lighting.src_num; i++) {
+                const auto& lc = fs_config.lighting.lights[i];
+                const auto& l = regs.lighting.light[lc.num];
+                const auto rgb = [](const auto& c) {
+                    return fmt::format("{:02x}{:02x}{:02x}", c.r.Value(), c.g.Value(), c.b.Value());
+                };
+                u32 c[3];
+                std::memcpy(&c[0], &l.specular_0, 4);
+                std::memcpy(&c[1], &l.specular_1, 4);
+                std::memcpy(&c[2], &l.diffuse, 4);
+                key = key * 1000003 ^ Common::HashCombine(c[0], c[1]) ^ (u64{c[2]} << 7) ^ lc.num;
+                line += fmt::format(" [num {} dir {} spec0 {} spec1 {} diff {} amb {} geo {}{} "
+                                    "spot {} dist {}]",
+                                    lc.num.Value(), lc.directional.Value(), rgb(l.specular_0),
+                                    rgb(l.specular_1), rgb(l.diffuse), rgb(l.ambient),
+                                    lc.geometric_factor_0.Value(), lc.geometric_factor_1.Value(),
+                                    lc.spot_atten_enable.Value(), lc.dist_atten_enable.Value());
+            }
+            if (seen.size() < 64 && seen.insert(key).second) {
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/lightlog.txt", "a")) {
+                    std::fprintf(f, "%s\n", line.c_str());
+                    std::fclose(f);
+                }
+            }
+        }
+    }
+    if (fs_config.lighting.enable && fs_config.lighting.lut_fr.enable) {
+        // The Fresnel LUT's evaluation (Usse::FrMode); `nofrfit` keeps the lookup.
+        static const bool no_fit = GxmFlag("nofrfit");
+        if (!no_fit && fr_fit.mode != 0 && fs_config.lighting.lut_fr.abs_input &&
+            (pica.lighting.lut_dirty & (1u << 3)) == 0) {
+            Usse::SetFrMode(fs_config, static_cast<Usse::FrMode>(fr_fit.mode), fr_fit.m);
+        }
     }
     // These comparisons cannot reject an 8-bit alpha. Reuse the Always shader before
     // hashing so the USSE emitter omits the alpha kill and its GXP discard flag (unless
@@ -2168,6 +2302,7 @@ const RasterizerGxm::FsUniforms& RasterizerGxm::UniformsOf(Shader* fs) {
         u.tex_lod_bias = p("tex_lod_bias");
         u.tex_border_color = p("tex_border_color");
         u.shadow_texture_bias = p("shadow_texture_bias");
+        u.lighting_fr_coef = p("lighting_fr_coef");
         u.blend_color = p("blend_color");
         u.tex_dims = p("tex_dims");
         u.fb_dims = p("fb_dims");
@@ -2424,6 +2559,10 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
     set_int(u.proctex_lut_offset, d.proctex_lut_offset);
     set_int(u.proctex_diff_lut_offset, d.proctex_diff_lut_offset);
     set(u.proctex_bias, &d.proctex_bias, 1);
+    if (u.lighting_fr_coef) {
+        const float coef[2] = {fr_fit.c0, fr_fit.c1};
+        set(u.lighting_fr_coef, coef, 2);
+    }
     if (u.shadow_texture_bias) {
         // The PICA's 24-bit depth units, as a fraction of the depth range.
         const float bias = static_cast<float>(d.shadow_texture_bias) / 16777215.0f;

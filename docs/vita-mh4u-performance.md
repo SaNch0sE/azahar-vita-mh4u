@@ -612,3 +612,35 @@ the 8-bit store - with no read of the target and no scene break. Slots 1-3 match
 `keepfeedback feedbackbreak` pictures (slot 3 luma 39.1) at unchanged fps (30 / 30 / 24).
 Switch: `nogradeblend` (back to alpha-only). A grade with a non-zero const5 would still be
 alpha-only; `loggrade` would show it.
+
+## Camp (user's slot 1, 24 fps): pricing and the first cuts (2026-11-16)
+
+Release: game 30 fps, shown 24-25; the render thread waits on the GPU ~1.28 s in 3 s. Main target
+GPU (`scenetime timedraw`, serialised) and the experiments from Fable's list:
+
+| flags | ms/frame |
+|---|---|
+| base | 39.5 |
+| `dbgminfs` | 7.0 |
+| `dbgminfs dbgminsel_lit` | 8.2 (lit programs ~31 ms of it) |
+| `dbgminfs minkeep_tex minkeep_tev minkeep_alpha` | 18.9 (lighting + fog ~20.6) |
+| `nofog` | 37.7 |
+| `reflone` | 34.6 (the |N.H|^n highlight ~4.9 ms here) |
+| `nopvnormal` | 43.3 |
+| `dbgconstfr` | 36.7 (the Fresnel fetch ~2.8) |
+| `ptoffop` | 34.9 |
+
+Vertex work is ~2.9 ms; render scale is the default (scale_q 4). The camp's lit draws: one or two
+directional lights, specular_0 always black, no spot/distance/geometric factors.
+
+- **Fresnel as Schlick** (`Usse::FrMode`, `RasterizerGxm::FitFresnel`): every Fresnel table seen
+  is c0 + c1 (1 - |N.V|)^5 (c0 0.109 / 0.010 / 0.101) or flat (1, 0.87, 0), within 0.0001. The
+  mode and m ride in lut_fr's spare bits, (c0, c1) in the uniform `lighting_fr_coef`.
+  39.5 -> 36.7 ms (the whole fetch); picture unchanged. Switch `nofrfit`.
+- **Streamlined lighting** (`nolightfast`): no parking of a pre-normalised directional light's
+  vector (N.L reads the uniform), no spot-direction copy without a spot LUT, the power-curve
+  highlight multiplied into specular_1 directly. 36.7 -> 36.2 ms.
+
+Shown fps at the camp (diag build, 17 s): 23.6 -> 25.6. Still short of 30: the remaining gap is
+~3 ms of GPU. Candidates: the half vector per pixel (two rsq for two lights plus the view
+normalise), the alpha-tested discards (~4.6 ms), or a render scale below 1x (user's call).

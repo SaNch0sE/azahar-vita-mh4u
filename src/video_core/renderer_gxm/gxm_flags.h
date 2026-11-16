@@ -77,6 +77,10 @@ namespace GxmRenderer {
  *             nothing - Usse::ReflMode); reflone takes it as 1 (the old shortcut, white
  *             water); noreflpow / noreflskip turn off the power form / the dropped term;
  *             logrefl logs the fits and tables to ux0:data/mh4u/refllog.txt
+ *   nofrfit   the Fresnel LUT always looked up (default: fitted to c0 + c1 (1 - |N.V|)^m or a
+ *             constant, Usse::FrMode); logfresnel dumps the tables (fresnellog.txt)
+ *   nolightfast  the lighting emitter without its streamlined directional-light paths
+ *   loglights per-light colours of lit draws to ux0:data/mh4u/lightlog.txt
  *   nogradeblend MH4U's final grade (frame times two) back to alpha-only; loggrade logs
  *             the alpha-only feedback draws' combiners to ux0:data/mh4u/gradelog.txt
  *   tracedrop count BeginDraw's drops by source line and target (ux0:data/mh4u/droplog.txt)

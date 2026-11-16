@@ -159,6 +159,7 @@ public:
         UniformSlot blend_color{};
         UniformSlot tex_dims{};
         UniformSlot shadow_texture_bias{};
+        UniformSlot lighting_fr_coef{};
         UniformSlot fb_dims{};
         struct Light {
             UniformSlot specular_0{};
@@ -301,6 +302,8 @@ private:
     bool IsGradeDouble(u32 unit) const;
     /// `lut`: the 256 entries of pica.lighting.luts[6].
     void FitReflectionRed(const void* lut);
+    /// `lut`: the 256 entries of pica.lighting.luts[3].
+    void FitFresnel(const void* lut);
     bool RetireRing();
     void DropDraw();
     /// Repeated software draws (glyphs) with the state still bound are not drawn one by one:
@@ -567,7 +570,16 @@ private:
     /// applied per draw in BindPrograms (Usse::ReflMode): mode, and n for |N.H|^n.
     u32 refl_fit_mode = 0;
     u32 refl_fit_n = 0;
-    std::unordered_map<u64, u32> refl_fits; ///< LUT content hash -> mode | n << 8 ///< dbgshadowblack (diag): bound for shadow textures
+    std::unordered_map<u64, u32> refl_fits; ///< LUT content hash -> mode | n << 8
+    /// The Fresnel LUT's fit (Usse::FrMode), the same way: mode, m, and (c0, c1).
+    struct FrFit {
+        u32 mode = 0;
+        u32 m = 0;
+        float c0 = 0.0f;
+        float c1 = 0.0f;
+    };
+    FrFit fr_fit{};
+    std::unordered_map<u64, FrFit> fr_fits; ///< dbgshadowblack (diag): bound for shadow textures
     /// The LUT textures: 256 texels wide, LUT_*_ROWS rows, sampled with nearest filtering
     /// and clamping so a row index reads exactly one LUT entry. lf and rg hold (value,
     /// delta) pairs as two floats; rgba holds proctex colours as bytes, which is what they
