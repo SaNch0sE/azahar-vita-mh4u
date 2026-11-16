@@ -332,13 +332,14 @@ void System::AfterStateLoaded() {
         auto& cpu_core = *cpu_cores[core_id];
         cpu_core.ClearInstructionCache();
 
-        // Deserialization restores each thread's saved context but never puts the running one back
-        // into the CPU, because that normally happens on a context switch and a load is not one.
-        // Left alone the core keeps the register file it had before the load while the memory
-        // under it has been replaced wholesale, which a backend executing guest code directly does
-        // not survive.
+        // The core's own registers, restored with it, are the running thread's live ones at the
+        // save; the thread's context may be older - states saved before 2026-11-16 hold the one
+        // from its last switch-out (see System::serialize), and loading that put the thread back
+        // at an earlier point than the memory it then ran on (MH4U: a stack slot holding a float
+        // where a loop index was expected, a crash a moment after the load). So the core wins,
+        // and the thread's context is brought up to date from it.
         if (Kernel::Thread* thread = kernel->GetThreadManager(core_id).GetCurrentThread()) {
-            cpu_core.LoadContext(thread->context);
+            cpu_core.SaveContext(thread->context);
         }
     }
 }

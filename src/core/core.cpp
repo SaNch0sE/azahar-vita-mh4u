@@ -1095,6 +1095,22 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
         save_state_status = SaveStateStatus::SAVING;
     }
 
+    if (Archive::is_saving::value) {
+        // Each core's live registers into its running thread's context, before anything is
+        // written: a running thread's context is otherwise only written when it is switched out.
+        // It has to be first because the threads are not written with the kernel - the services
+        // serialized earlier hold references to them, so boost writes each thread (context and
+        // all) at its first reference, long before the kernel. A copy made after that never
+        // reached the file, and the running thread's context in the state was the one from its
+        // last switch-out: MH4U states whose main thread had since moved on crashed right after
+        // the load (2026-11-16).
+        for (u32 core_id = 0; core_id < static_cast<u32>(cpu_cores.size()); core_id++) {
+            if (Kernel::Thread* thread = kernel->GetThreadManager(core_id).GetCurrentThread()) {
+                cpu_cores[core_id]->SaveContext(thread->context);
+            }
+        }
+    }
+
     u32 num_cores;
     if (Archive::is_saving::value) {
         num_cores = this->GetNumCores();
@@ -1156,17 +1172,6 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
 
     ar&* memory.get();
     SavestateTrace("memory");
-    if (!Archive::is_loading::value) {
-        // A load puts each core's running thread back from its saved context
-        // (AfterStateLoaded), but a running thread's context is only written when it is
-        // switched out - stale at best. Right after a load it held nothing usable, and a state
-        // saved then sent the guest to PC 0 when loaded (2026-11-14). The live registers go in.
-        for (u32 core_id = 0; core_id < static_cast<u32>(cpu_cores.size()); core_id++) {
-            if (Kernel::Thread* thread = kernel->GetThreadManager(core_id).GetCurrentThread()) {
-                cpu_cores[core_id]->SaveContext(thread->context);
-            }
-        }
-    }
     ar&* kernel.get();
     SavestateTrace("kernel");
     ar&* gpu.get();
