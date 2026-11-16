@@ -77,6 +77,9 @@ namespace GxmRenderer {
  *             nothing - Usse::ReflMode); reflone takes it as 1 (the old shortcut, white
  *             water); noreflpow / noreflskip turn off the power form / the dropped term;
  *             logrefl logs the fits and tables to ux0:data/mh4u/refllog.txt
+ *   nogradeblend MH4U's final grade (frame times two) back to alpha-only; loggrade logs
+ *             the alpha-only feedback draws' combiners to ux0:data/mh4u/gradelog.txt
+ *   tracedrop count BeginDraw's drops by source line and target (ux0:data/mh4u/droplog.txt)
  *   shadowmap PICA shadow maps drawn and compared (P5; off: shadow passes dropped, maps
  *             white); logshadow, tracecb and the dbgshadow* switches diagnose it
  *   usse_nohoist, usse_nocse, usse_nomadfold

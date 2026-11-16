@@ -593,3 +593,22 @@ compare against it. It is only character shadows, so it does not affect the wate
 measured, so it stays off. Diagnostics: `logshadow` (ux0:data/mh4u/shadowlog.txt), `tracecb`,
 `dbgshadowblack`, `dbgshadowzero`, `dbgshadowref`, `dbgshadowdepth`, `dbgshadowalways`,
 `dbgshadownocull`, `dbgshadowsw`.
+
+## The frame's final brightness grade (2026-11-16)
+
+The user's slot 3 (a vine-covered pillar) and slot 2 looked dark and muted next to Android.
+None of the lighting or fog switches moved the brightness; Fable compared the lighting emitter
+with the GL generator line by line and found it equivalent, and pointed at the feedback draws we
+keep alpha-only. `keepfeedback feedbackbreak` gave the Android picture (slot 3 mean luma 25 -> 39)
+at 2-3 fps less. `loggrade` (ux0:data/mh4u/gradelog.txt) showed one such draw a frame, the same
+in every scene: a full-screen quad reading the main target 0x180D4800 and replacing it with
+
+    stage 0: t + t -> buffer;  1-3: a contrast curve;  5: lerp(curve, buffer, const5)
+
+and const5 = 0 everywhere seen, so the result is clamp(2 * t): MH4U draws its world at half
+brightness and doubles it last. `IsGradeDouble` matches that exact combiner (with const5 = 0) and
+the draw is made with unit 0 white and the blend DstColor + One - the target times two, clamped by
+the 8-bit store - with no read of the target and no scene break. Slots 1-3 match the
+`keepfeedback feedbackbreak` pictures (slot 3 luma 39.1) at unchanged fps (30 / 30 / 24).
+Switch: `nogradeblend` (back to alpha-only). A grade with a non-zero const5 would still be
+alpha-only; `loggrade` would show it.

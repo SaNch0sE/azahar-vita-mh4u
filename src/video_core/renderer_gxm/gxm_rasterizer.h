@@ -297,6 +297,8 @@ private:
     /// before the scene begins: a ring wrap waits for the GPU, since the rows it reuses may
     /// still be sampled by a scene in flight.
     void SyncAndUploadLUTs();
+    /// Whether the feedback read on `unit` is MH4U's frame-doubling grade (SyncTextureUnits).
+    bool IsGradeDouble(u32 unit) const;
     /// `lut`: the 256 entries of pica.lighting.luts[6].
     void FitReflectionRed(const void* lut);
     bool RetireRing();
@@ -608,7 +610,11 @@ private:
     /// A draw reading its own target only for colour: drawn writing alpha alone (see
     /// SyncTextureUnits).
     bool feedback_alpha_only{};
+    /// MH4U's final grade (a feedback draw that doubles the frame, see SyncTextureUnits):
+    /// drawn as white blended DstColor + One, which is the target times two.
+    bool grade_double = false;
     u32 stat_alpha_only_feedback{};
+    u32 stat_grade_double{};
 
     u32 stat_uniform_uploads{}, stat_uniform_skips{}, stat_dropped_draws{}, stat_scene_waits{};
     u32 stat_gpu_blit_logs{}, stat_guest_writes{}, stat_invalidates{}, stat_flushes{};

@@ -1986,6 +1986,17 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
         blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
     }
+    if (grade_double) {
+        // dst * (src + 1) with src = 1 (the program, unit 0 white, outputs white): dst * 2,
+        // clamped by the target; alpha replaced as the PICA draw does.
+        blend.colorMask = SCE_GXM_COLOR_MASK_ALL;
+        blend.colorFunc = SCE_GXM_BLEND_FUNC_ADD;
+        blend.colorSrc = SCE_GXM_BLEND_FACTOR_DST_COLOR;
+        blend.colorDst = SCE_GXM_BLEND_FACTOR_ONE;
+        blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+        blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    }
     if (fs_config.framebuffer.shadow_rendering) {
         // The packed depth goes to G, B and A unblended; R (the penumbra) is the clear's.
         blend.colorMask = SCE_GXM_COLOR_MASK_G | SCE_GXM_COLOR_MASK_B | SCE_GXM_COLOR_MASK_A;
@@ -2760,6 +2771,26 @@ void LogShadowSample(const Pica::RegsInternal& regs, u32 addr, u32 w, u32 h) {
 } // namespace
 
 
+bool RasterizerGxm::IsGradeDouble(u32 unit) const {
+    // The combiner MH4U's grade runs (logged with loggrade, 2026-11-16): stage 0 t + t into
+    // the buffer, a contrast curve in 1-3, stage 5 lerp(curve, buffer, constant). With the
+    // constant 0 the result is the buffer, clamp(2t).
+    static const bool off = GxmFlag("nogradeblend");
+    if (off || unit != 0) {
+        return false;
+    }
+    const auto st = regs.texturing.GetTevStages();
+    const auto is = [&](u32 i, u32 sources, u32 ops) {
+        return st[i].sources_raw == sources && st[i].modifiers_raw == 0 && st[i].ops_raw == ops &&
+               st[i].scales_raw == 0;
+    };
+    return is(0, 0x00ee0033, 0x2) && is(1, 0x00ee00ff, 0x1) && is(2, 0x00ee00fd, 0x5) &&
+           is(3, 0x00ee00fd, 0x2) && is(4, 0x00ee00ff, 0x0) && is(5, 0x00ee0edf, 0x4) &&
+           (st[5].const_color & 0x00FFFFFFu) == 0 &&
+           regs.texturing.tev_combiner_buffer_input.update_mask_rgb.Value() == 1 &&
+           regs.framebuffer.output_merger.alphablend_enable == 1;
+}
+
 void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
     std::array<SceGxmTexture, 3> textures{white_texture, white_texture, white_texture};
@@ -3019,7 +3050,55 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             }
             if (TextureUnitRead(unit) && (no_alpha_only || AlphaReadsUnit(unit))) {
                 skip_feedback_draw = true;
+            } else if (TextureUnitRead(unit) && IsGradeDouble(unit)) {
+                // Monster Hunter 4 Ultimate's last pass reads the whole frame and writes back
+                // clamp(2 * colour) (its world is drawn at half brightness): the same with
+                // fixed blending, no read of the target. `nogradeblend` keeps it alpha-only.
+                grade_double = true;
+                stat_grade_double++;
+                continue;
             } else if (TextureUnitRead(unit)) {
+                // loggrade (diag): each distinct alpha-only feedback draw (the colour grade),
+                // its combiner, blend and depth state, to ux0:data/mh4u/gradelog.txt.
+                static const bool log_grade = GxmFlag("loggrade");
+                if (log_grade) {
+                    static std::set<u64> seen;
+                    const auto stages = regs.texturing.GetTevStages();
+                    const auto& om = regs.framebuffer.output_merger;
+                    u32 blend_raw = 0;
+                    std::memcpy(&blend_raw, &om.alpha_blending, sizeof(blend_raw));
+                    const u64 key = Common::ComputeHash64(stages.data(), sizeof(stages)) ^
+                                    (u64{blend_raw} << 7) ^ unit;
+                    if (seen.size() < 32 && seen.insert(key).second) {
+                        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/gradelog.txt", "a")) {
+                            std::fprintf(f,
+                                         "draw %u unit %u tex %08x %ux%u fmt %u -> %08x; blend %u "
+                                         "raw %08x const %08x; depth test %u func %u write %u; "
+                                         "alpha test %u func %u ref %u; mask %u%u%u%u; buf in "
+                                         "%08x col %08x; tev",
+                                         stat_draws, unit, info.physical_address, info.width,
+                                         info.height, static_cast<u32>(texture.format),
+                                         surface.addr, om.alphablend_enable.Value(), blend_raw,
+                                         om.blend_const.raw, om.depth_test_enable.Value(),
+                                         static_cast<u32>(om.depth_test_func.Value()),
+                                         om.depth_write_enable.Value(), om.alpha_test.enable.Value(),
+                                         static_cast<u32>(om.alpha_test.func.Value()),
+                                         om.alpha_test.ref.Value(), om.red_enable.Value(),
+                                         om.green_enable.Value(), om.blue_enable.Value(),
+                                         om.alpha_enable.Value(),
+                                         regs.texturing.tev_combiner_buffer_input.update_mask_rgb.Value() |
+                                             (regs.texturing.tev_combiner_buffer_input.update_mask_a.Value() << 4),
+                                         regs.texturing.tev_combiner_buffer_color.raw);
+                            for (const auto& st : stages) {
+                                std::fprintf(f, " [%08x %08x %08x %08x %08x]", st.sources_raw,
+                                             st.modifiers_raw, st.ops_raw, st.const_color,
+                                             st.scales_raw);
+                            }
+                            std::fprintf(f, "\n");
+                            std::fclose(f);
+                        }
+                    }
+                }
                 feedback_alpha_only = true;
                 stat_alpha_only_feedback++;
                 continue;
@@ -3081,6 +3160,24 @@ namespace {
 /// BeginDraw drops, with the source line of the return that dropped it, and each one drawn
 /// (line 0). The first 200.
 bool TraceDrop(const Pica::RegsInternal& regs, int line) {
+    // tracedrop (diag): every BeginDraw drop counted by (source line, colour target), written
+    // to ux0:data/mh4u/droplog.txt every 600 calls that dropped.
+    static const bool all = GxmFlag("tracedrop");
+    if (all && line > 1) {
+        static std::map<std::pair<int, u32>, u32> counts;
+        static u32 total = 0;
+        counts[{line, regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress()}]++;
+        if (++total % 600 == 0) {
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/droplog.txt", "a")) {
+                std::fprintf(f, "after %u drops:", total);
+                for (const auto& [k, n] : counts) {
+                    std::fprintf(f, " line %d cb %08x x%u;", k.first, k.second, n);
+                }
+                std::fprintf(f, "\n");
+                std::fclose(f);
+            }
+        }
+    }
     static const bool on = GxmFlag("tracecb");
     if (on && regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() == 0x18154F00) {
         static u32 shown = 0;
@@ -3244,6 +3341,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         const u64 t1 = PS::StatUs();
         skip_feedback_draw = false;
         feedback_alpha_only = false;
+        grade_double = false;
         SyncTextureUnits(fb);
         const u64 t2 = PS::StatUs();
         SyncProcTexStrip();
