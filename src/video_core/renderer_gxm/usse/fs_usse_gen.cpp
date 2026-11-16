@@ -338,7 +338,7 @@ private:
     }
     uint8_t SamplerSa(uint32_t sampler_index) const {
         return static_cast<uint8_t>(
-            SamplerSaOffset(uniform_floats + data_head, LiteralCount, sampler_index));
+            SamplerSaOffset(uniform_floats + data_head, literal_count, sampler_index));
     }
     /// A uniform in the memory part of the default uniform buffer: `components` floats at
     /// a float offset past the resident part (the light parameters of lights past the SA
@@ -407,6 +407,10 @@ private:
     bool uses_depth = false;              ///< W-buffering: the fragment writes its depth
     bool uses_shadow = false;             ///< lighting reads the shadow texture
     bool shadow_compare = false;          ///< unit 0 is a 2D shadow map, compared (shadowmap)
+    /// Literals this program carries: the shadow constants (the table's tail) only when it
+    /// compares or renders a shadow map - eight secondary attributes that otherwise push a
+    /// second light out of registers (MH4U's two-light world, 2026-11-16).
+    uint32_t literal_count = LiteralCount;
     uint32_t sa_shadow_bias = 0;          ///< shadow_texture_bias, in depth units
     void ShadowCompare();
     void ShadowOutput();
@@ -424,6 +428,10 @@ private:
     uint32_t sampler_rgba = 0;
     uint32_t sa_proctex = 0;              ///< lut_offset, diff_lut_offset, color_map_offset,
                                           ///< alpha_map_offset, bias (scalars, in that order)
+    /// Register-resident lights: each member's own SA (only the members the program reads are
+    /// declared), per PICA light number and member (specular_0, dist_atten_bias, specular_1,
+    /// dist_atten_scale, diffuse, ambient, position, spot_direction); -1 when not declared.
+    std::array<std::array<int16_t, 8>, 8> sa_member{};
     std::array<uint32_t, 8> sa_light{}; ///< per PICA light number; per light: specular_0
                                         ///< +0, dist_atten_bias +3, specular_1 +4,
                                         ///< dist_atten_scale +7, diffuse +8, ambient +12,
@@ -857,7 +865,7 @@ void FragmentEmitter::PlanUniforms() {
         // Lights are register-resident (24 SAs each) while the budget holds, counting the
         // literals, the sampler words and the pointer behind them; the rest live in the
         // memory part of the uniform buffer and are loaded when their turn comes.
-        const uint32_t tail = LiteralCount + static_cast<uint32_t>(gxp.samplers.size()) * 4 + 1;
+        const uint32_t tail = literal_count + static_cast<uint32_t>(gxp.samplers.size()) * 4 + 1;
         for (u32 i = 0; i < lighting.src_num; i++) {
             const u32 num = lighting.lights[i].num;
             // A directional light without distance attenuation reads its direction normalised
@@ -868,11 +876,49 @@ void FragmentEmitter::PlanUniforms() {
                                       pre_normalised ? "position_n" : "position",
                                       "spot_direction"};
             const uint8_t sizes[8] = {3, 1, 3, 1, 3, 3, 3, 3};
-            const bool resident_light = ((uniform_floats + 1) & ~1u) + 24 + tail <= 128;
+            // Resident, only what Lighting() reads of this light (`nolightcompact`: all
+            // eight members, 24 SAs): MH4U's directional lights need specular_1, diffuse and
+            // the direction - 12 SAs - and two of them then fit where one did before.
+            static const bool no_compact = GxmFlag("nolightcompact");
+            const auto& lc = lighting.lights[i];
+            const bool d0_on = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
+            const bool sp_input =
+                lighting.lut_d0.enable && lighting.lut_d0.type == LutInput::SP ||
+                lighting.lut_d1.enable && lighting.lut_d1.type == LutInput::SP ||
+                lighting.lut_fr.enable && lighting.lut_fr.type == LutInput::SP ||
+                lighting.lut_rr.enable && lighting.lut_rr.type == LutInput::SP ||
+                lighting.lut_rg.enable && lighting.lut_rg.type == LutInput::SP ||
+                lighting.lut_rb.enable && lighting.lut_rb.type == LutInput::SP ||
+                lighting.lut_sp.enable;
+            bool need[8];
+            need[0] = uses_secondary_color && (d0_on || !Specular0Black(config, i));
+            need[1] = lc.dist_atten_enable;
+            need[2] = uses_secondary_color && ReflModeOf(config) != ReflMode::Dead;
+            need[3] = lc.dist_atten_enable;
+            need[4] = uses_primary_color;
+            need[5] = uses_primary_color && !AmbientBlack(config, i);
+            need[6] = true;
+            need[7] = lc.spot_atten_enable || sp_input || GxmFlag("nolightfast");
+            if (no_compact) {
+                std::fill(std::begin(need), std::end(need), true);
+            }
+            uint32_t floats = 0;
+            for (int m = 0; m < 8; m++) {
+                if (need[m]) {
+                    floats += sizes[m] == 1 ? 1 : 4;
+                }
+            }
+            const bool resident_light =
+                ((uniform_floats + 1) & ~1u) + (no_compact ? 24 : floats) + tail <= 128;
+            sa_member[num].fill(-1);
             for (int m = 0; m < 8; m++) {
                 const std::string name = fmt::format("light_src[{}].{}", num, members[m]);
                 if (resident_light) {
+                    if (!need[m]) {
+                        continue;
+                    }
                     const uint32_t at = AllocateUniform(name, sizes[m], 1);
+                    sa_member[num][m] = static_cast<int16_t>(at);
                     if (m == 0) {
                         sa_light[num] = at;
                     }
@@ -2033,12 +2079,29 @@ void FragmentEmitter::Lighting() {
         const Vec4Loc params = LightParams(light.num);
         const Bank pb = params.bank;
         const uint32_t sa = params.base;
-        const Vec4Loc position{pb, static_cast<uint8_t>(sa + 16)};
-        const Vec4Loc spot{pb, static_cast<uint8_t>(sa + 20)};
-        const Vec4Loc diffuse{pb, static_cast<uint8_t>(sa + 8)};
-        const Vec4Loc ambient{pb, static_cast<uint8_t>(sa + 12)};
-        const Vec4Loc specular_0{pb, static_cast<uint8_t>(sa + 0)};
-        const Vec4Loc specular_1{pb, static_cast<uint8_t>(sa + 4)};
+        // A memory light sits in the SA layout in TmpLightMem; a resident one has each member
+        // where PlanUniforms put it (absent members are never read).
+        const bool from_memory = light_memory[light.num] >= 0;
+        const auto member = [&](int m, uint32_t offset) -> Vec4Loc {
+            if (from_memory) {
+                return {pb, static_cast<uint8_t>(sa + offset)};
+            }
+            const int16_t at = sa_member[light.num][m];
+            return {Bank::SecAttr, static_cast<uint8_t>(at < 0 ? 0 : at)};
+        };
+        const auto member_scalar = [&](int m, uint32_t offset) -> Src {
+            if (from_memory) {
+                return Scalar(pb, sa + offset);
+            }
+            const int16_t at = sa_member[light.num][m];
+            return Scalar(Bank::SecAttr, static_cast<uint32_t>(at < 0 ? 0 : at));
+        };
+        const Vec4Loc position = member(6, 16);
+        const Vec4Loc spot = member(7, 20);
+        const Vec4Loc diffuse = member(4, 8);
+        const Vec4Loc ambient = member(5, 12);
+        const Vec4Loc specular_0 = member(0, 0);
+        const Vec4Loc specular_1 = member(2, 4);
         const bool two_sided = light.two_sided_diffuse;
         const bool shadow_primary = uses_shadow && lighting.shadow_primary && light.shadow_enable;
         const bool shadow_secondary =
@@ -2130,8 +2193,8 @@ void FragmentEmitter::Lighting() {
         }
         if (light.dist_atten_enable) {
             // index = clamp(scale * distance + bias, 0, 1), unsigned lookup
-            e.Vec(VecOp::Mul, {I0, 0x1}, {misc_hi, YYYY}, Scalar(pb, sa + 7), Pred::None, true);
-            e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, Scalar(pb, sa + 3), Pred::None, true);
+            e.Vec(VecOp::Mul, {I0, 0x1}, {misc_hi, YYYY}, member_scalar(3, 7), Pred::None, true);
+            e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, member_scalar(1, 3), Pred::None, true);
             Clamp01(I0, 0x1);
             LightingLutLookup(LightingRegs::DistanceAttenuationSampler(light.num), true, false);
             e.Vec(VecOp::Mul, {atten, 0x1}, {atten, XYZW}, {I0, XXXX}, Pred::None, true);
@@ -2784,6 +2847,8 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
         return {};
     }
     PlanInputs();
+    literal_count = (shadow_compare || config.framebuffer.shadow_rendering) ? LiteralCount
+                                                                             : LitShadowK0;
     PlanUniforms();
     uses_kill = config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always ||
                 uses_scissor;
@@ -2839,10 +2904,12 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
                     std::bit_cast<uint32_t>(0.25f / 255.0f),
                     0u};
     static_assert(LiteralCount == 50);
+    static_assert(LitShadowK0 % 2 == 0, "the trimmed table keeps the samplers pair-aligned");
+    gxp.literals.resize(literal_count);
     static_assert(Pica::Shader::LUT_RG_ROWS == Pica::Shader::LUT_RGBA_ROWS);
     gxp.uses_discard = uses_kill;
     gxp.writes_depth = uses_depth;
-    if (uniform_floats + LiteralCount + gxp.samplers.size() * 4 > 128) {
+    if (uniform_floats + literal_count + gxp.samplers.size() * 4 > 128) {
         if (refusal) {
             *refusal = "secondary attribute budget";
         }
@@ -2981,6 +3048,25 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     encoder.PatchKills(LiteralSaOffset(uniform_floats + data_head, LitKillControl));
     encoder.FinishNosched();
     gxp.temp_count = lowered.temp_count;
+    // logtemps (diag): each emitted program's temporaries, PAs, instructions and shape, to
+    // ux0:data/mh4u/templog.txt.
+    static const bool log_temps = GxmFlag("logtemps");
+    if (log_temps) {
+        if (std::FILE* f = std::fopen("ux0:data/mh4u/templog.txt", "a")) {
+            std::fprintf(f,
+                         "level %d temps %u pa %u instrs %u lit %u lights %u bump %u pv %u kill %u "
+                         "fog %u tex %u%u%u refl %u n %u fr %u spec0black %u memlights %u\n",
+                         level, lowered.temp_count, lowered.pa_count, static_cast<u32>(encoder.Words().size()),
+                         config.lighting.enable.Value(), config.lighting.src_num.Value(),
+                         static_cast<u32>(config.lighting.bump_mode.Value()),
+                         PvHalfOf(config) ? 1u : 0u, uses_kill ? 1u : 0u, uses_fog ? 1u : 0u,
+                         unit_used[0] ? 1u : 0u, unit_used[1] ? 1u : 0u, unit_used[2] ? 1u : 0u,
+                         static_cast<u32>(ReflModeOf(config)), ReflExponentOf(config),
+                         static_cast<u32>(FrModeOf(config)), Specular0Black(config, 0) ? 1u : 0u,
+                         static_cast<u32>(memory_uniforms.size() / 8));
+            std::fclose(f);
+        }
+    }
     // tempinflate: declare 24 more temporaries than the program uses, to see whether the
     // register file's occupancy limits fragment throughput (diagnostic only).
     static const bool temp_inflate = GxmFlag("tempinflate");
@@ -3023,8 +3109,19 @@ std::vector<uint8_t> EmitFragmentProgram(const FSConfig& config, std::string* re
     static const bool sel_nopt = GxmFlag("dbgminsel_nopt");
     const bool lit = config.lighting.enable;
     const bool pt = config.proctex.enable;
+    // _bump: lit with a normal map; _flat: lit without; _l2: two or more lights; _kill: an
+    // alpha test.
+    static const bool sel_bump = GxmFlag("dbgminsel_bump");
+    static const bool sel_flat = GxmFlag("dbgminsel_flat");
+    static const bool sel_l2 = GxmFlag("dbgminsel_l2");
+    static const bool sel_kill = GxmFlag("dbgminsel_kill");
+    const bool bump = lit && config.lighting.bump_mode !=
+                                 Pica::LightingRegs::LightingBumpMode::None;
+    const bool kill = config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always;
     const bool selected = (!sel_lit || lit) && (!sel_unlit || !lit) && (!sel_pt || pt) &&
-                          (!sel_nopt || !pt);
+                          (!sel_nopt || !pt) && (!sel_bump || bump) &&
+                          (!sel_flat || (lit && !bump)) && (!sel_l2 || config.lighting.src_num >= 2) &&
+                          (!sel_kill || kill);
     if (min_fs && selected) {
         alignas(16) static unsigned char raw[sizeof(FSConfig)];
         std::memcpy(raw, &config, sizeof(FSConfig));

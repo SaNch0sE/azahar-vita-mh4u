@@ -684,3 +684,23 @@ normalise), the alpha-tested discards (~4.6 ms), or a render scale below 1x (use
 
 Camp main target now ~33.9 ms (run-to-run noise ~1 ms). Release, 25 s: camp 27.8 fps (was 26.1),
 pond and pillar 30.0.
+
+### Camp, round four: where the lit time is, and registers (2026-11-16)
+
+Pricing (main target, serialised): base 34.0; `dbgminfs` 7.1; `+minkeep_tex` 11.7; `+tev` 15.8;
+`+alpha` 17.3; `+light` (no alpha) 28.3; `dbgminsel_unlit` 34.0 (unlit costs nothing);
+`dbgconstfog` 35.0; `reflone` 27.7; `pvhalf reflone` 28.0; `ptoffop` 30.1; `nomipmaps` 34.3.
+New class selectors (`dbgminsel_bump`, `_flat`, `_l2`, `_kill`): stripping the lit programs
+without a normal map leaves 14.3 ms (they hold ~19 ms), with one 26.6, two-light 29.3,
+alpha-tested 28.1. `logtemps` (templog.txt) listed the camp's lit programs: 28-64 temporaries,
+most with one or both lights loaded from memory (24 temporaries of TmpLightMem each).
+
+- **Shadow literals only where used:** today's shadow constants (8 SAs) had joined every
+  program's literal table; now only shadow compare / shadow rendering programs carry them.
+- **Compact resident lights** (`nolightcompact`): a resident light declares only the members
+  the program reads (MH4U's directional lights: specular_1, diffuse, the direction - 12 SAs
+  instead of 24), so two lights stay in registers. Memory lights at the camp: 8 of 103 lit
+  programs (was most); the usual program now 28-40 temporaries.
+
+Camp: 34.0 -> 33.4 (literals) -> 32.8 ms (compact lights) - smaller than the temporaries
+suggested. The highlight power chain still costs ~6 ms (`reflone`), unchanged by `pvhalf`.

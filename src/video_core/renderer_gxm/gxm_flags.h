@@ -87,6 +87,9 @@ namespace GxmRenderer {
  *             counts who takes it (pvlog.txt)
  *   pvnormalsw software-shaded lit draws read TEXCOORD5 as a normal again (it holds the
  *             quaternion there: the old, wrong, behaviour)
+ *   nolightcompact  resident lights declare all eight members (24 SAs) again
+ *   logtemps  each emitted fragment program's temporaries and shape (templog.txt)
+ *   dbgminsel_bump / _flat / _l2 / _kill  dbgminfs for one class of lit program only
  *   noblackterms  black specular_0 / ambient / global ambient computed anyway
  *   nogradeprog the grade blend runs the game's combiner rather than constant white;
  *             dbgnograde drops the grade (pricing only)
