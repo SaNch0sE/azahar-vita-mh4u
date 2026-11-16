@@ -1035,8 +1035,8 @@ int EmulatorMain() {
             sceIoGetstat(VITA_DATA_DIR "/cpu_interpreter", &interpreter_stat) >= 0;
         if (interpreter_only) {
             LOG_WARNING(Frontend, "cpu_interpreter present: skipping the kernel module checks");
-        } else if (!module_installed("azaharnative")) {
-            show_error_dialog("azaharnative.skprx not installed. Check the release page.");
+        } else if (!module_installed("mh4unative")) {
+            show_error_dialog("mh4unative.skprx not installed: add it to the *KERNEL section of ur0:tai/config.txt.");
             return -1;
         }
 
@@ -1048,7 +1048,7 @@ int EmulatorMain() {
 
         if (!interpreter_only && azaharVersion() < MinAzaharNativeVersion) {
             show_error_dialog(
-                "The installed azaharnative.skprx module is not compatible. Please update it.");
+                "The installed mh4unative.skprx module is not compatible. Please update it.");
             return -1;
         }
     }

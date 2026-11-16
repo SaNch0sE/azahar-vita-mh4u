@@ -8,7 +8,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   endif()
 endif()
 
-project(azaharnative C ASM)
+project(mh4unative C ASM)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 # -fno-tree-vectorize is a correctness flag here, not a preference. The toolchain defaults to
@@ -23,9 +23,9 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O2 -nostdlib -fno-optimize-sib
 set(AZAHAR_SEAL "1" CACHE STRING "1 = sealed L1, 0 = merged kernel L1")
 add_definitions(-DAZAHAR_SEAL=${AZAHAR_SEAL})
 
-add_executable(azaharnative src/main.c src/entry.S)
+add_executable(mh4unative src/main.c src/entry.S)
 
-target_link_libraries(azaharnative
+target_link_libraries(mh4unative
   taihenForKernel_stub
   taihenModuleUtils_stub
   SceCpuForDriver_stub
@@ -44,5 +44,5 @@ target_link_libraries(azaharnative
 # whole module fail to load with "Library not found". Anything needed from them is resolved at
 # runtime instead.
 
-vita_create_self(azaharnative.skprx azaharnative CONFIG exports.yml UNSAFE)
-vita_create_stubs(stubs azaharnative ${CMAKE_CURRENT_SOURCE_DIR}/exports.yml KERNEL)
+vita_create_self(mh4unative.skprx mh4unative CONFIG exports.yml UNSAFE)
+vita_create_stubs(stubs mh4unative ${CMAKE_CURRENT_SOURCE_DIR}/exports.yml KERNEL)

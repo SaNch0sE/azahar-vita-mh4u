@@ -1167,7 +1167,7 @@ int azaharTakeCore(void) {
         azahar_installed = 0;
         azahar_client_pid = ksceKernelGetProcessId();
         if (azahar_proc_handler < 0) {
-            azahar_proc_handler = ksceKernelRegisterProcEventHandler("azaharnative", &azahar_proc_events, 0);
+            azahar_proc_handler = ksceKernelRegisterProcEventHandler("mh4unative", &azahar_proc_events, 0);
             emit("  process-event handler: 0x%08x\n", (uint32_t)azahar_proc_handler);
         }
         emit("  folded: no resident thread, the caller's core runs the guest\n");
@@ -1217,7 +1217,7 @@ int azaharTakeCore(void) {
 
     // Occupy first, detach second: a thread pinned to an already-detached core never runs.
     azahar_heartbeat = azahar_stop = azahar_park = azahar_cmd = azahar_cmd_done = 0;
-    azahar_thread = ksceKernelCreateThread("azaharnative_core2", core2_entry, 0x10000100, 0x4000, 0,
+    azahar_thread = ksceKernelCreateThread("mh4unative_core2", core2_entry, 0x10000100, 0x4000, 0,
                                         CPU_AFFINITY(AZAHAR_TARGET_CORE), NULL);
     if (azahar_thread < 0 || ksceKernelStartThread(azahar_thread, 0, NULL) < 0) {
         emit("  core-2 thread create/start failed 0x%08x\n", (uint32_t)azahar_thread);
@@ -1261,7 +1261,7 @@ int azaharTakeCore(void) {
     if (azahar_proc_handler < 0) {
         // So the core comes back when the app dies, however it dies. Registered here rather
         // than at module_start: a fault here costs one launch, a fault there bootloops.
-        azahar_proc_handler = ksceKernelRegisterProcEventHandler("azaharnative", &azahar_proc_events, 0);
+        azahar_proc_handler = ksceKernelRegisterProcEventHandler("mh4unative", &azahar_proc_events, 0);
         emit("  process-event handler: 0x%08x\n", (uint32_t)azahar_proc_handler);
     }
     azahar_state = ST_TAKEN;
@@ -1423,7 +1423,7 @@ static int build_table(const AzaharMapRequest *req) {
         tai_module_info_t tinfo;
         __builtin_memset(&tinfo, 0, sizeof(tinfo));
         tinfo.size = sizeof(tinfo);
-        if (taiGetModuleInfoForKernel(0x10005 /* the kernel */, "azaharnative", &tinfo) >= 0) {
+        if (taiGetModuleInfoForKernel(0x10005 /* the kernel */, "mh4unative", &tinfo) >= 0) {
             const uint32_t text_syms[] = {
                 (uint32_t)(uintptr_t)&azahar_enter,         (uint32_t)(uintptr_t)&azahar_vec_irq,
                 (uint32_t)(uintptr_t)&azahar_get_banked_sp, (uint32_t)(uintptr_t)&core2_entry,

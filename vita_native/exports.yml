@@ -1,4 +1,4 @@
-azaharnative:
+mh4unative:
   attributes: 0
   version:
     major: 1
@@ -7,7 +7,7 @@ azaharnative:
     start: module_start
     stop: module_stop
   libraries:
-    azaharnative:
+    mh4unative:
       syscall: true
       functions:
         - azaharTakeCore: 0x3C1A7E01

@@ -594,7 +594,7 @@ if (VITA)
             message(FATAL_ERROR
                 "VITASDK is not set, so the kernel module in vita_native/ cannot be built. "
                 "Set it, or point VITA_NATIVE_STUB_DIR at a directory that already holds "
-                "libazaharnative_stub.a.")
+                "libmh4unative_stub.a.")
         endif()
         set(VITA_NATIVE_BINARY_DIR "${CMAKE_BINARY_DIR}/vita_native")
         set(VITA_NATIVE_STUB_DIR "${VITA_NATIVE_BINARY_DIR}/stubs")
@@ -606,26 +606,26 @@ if (VITA)
                 "-DCMAKE_BUILD_TYPE=Release"
             BUILD_ALWAYS 1
             INSTALL_COMMAND ""
-            BUILD_BYPRODUCTS "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a"
+            BUILD_BYPRODUCTS "${VITA_NATIVE_STUB_DIR}/libmh4unative_stub.a"
         )
         add_dependencies(citra_core vita_native_module)
     endif()
     # A build directory configured before the module moved into the tree has the old path
     # cached, and the cache wins, so it would quietly go on pointing at a stub that is no
     # longer there - or worse, one that is. Say so rather than failing at link time.
-    if (NOT EXISTS "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a"
+    if (NOT EXISTS "${VITA_NATIVE_STUB_DIR}/libmh4unative_stub.a"
         AND NOT TARGET vita_native_module)
         message(FATAL_ERROR
             "VITA_NATIVE_STUB_DIR is set to ${VITA_NATIVE_STUB_DIR}, which holds no "
-            "libazaharnative_stub.a. If this is a build directory from before the module "
+            "libmh4unative_stub.a. If this is a build directory from before the module "
             "moved into vita_native/, clear the entry to build it from the tree:\n"
             "  cmake -U VITA_NATIVE_STUB_DIR -B <build dir>")
     endif()
     # An imported target rather than a bare path, so the dependency travels with the link.
-    add_library(azaharnative_stub STATIC IMPORTED GLOBAL)
-    set_target_properties(azaharnative_stub PROPERTIES
-        IMPORTED_LOCATION "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a")
-    target_link_libraries(citra_core PUBLIC azaharnative_stub)
+    add_library(mh4unative_stub STATIC IMPORTED GLOBAL)
+    set_target_properties(mh4unative_stub PROPERTIES
+        IMPORTED_LOCATION "${VITA_NATIVE_STUB_DIR}/libmh4unative_stub.a")
+    target_link_libraries(citra_core PUBLIC mh4unative_stub)
 endif()
 
 if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)

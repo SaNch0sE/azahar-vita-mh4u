@@ -37,7 +37,7 @@
 
 int vsnprintf(char *s, size_t n, const char *fmt, va_list ap);
 
-#define OUT_DIR "ux0:data/azahar"
+#define OUT_DIR "ux0:data/mh4u"
 
 // ---------------------------------------------------------------------------- cp15
 
@@ -185,7 +185,7 @@ static void emit(const char *fmt, ...) {
     // The file stays the record — it survives a hang and a hard reset — but on a retail console
     // with no UART and no usable LED, this is the only channel that says "still working" while
     // the app is blocked inside the syscall. kubridge logs the same way.
-    ksceKernelPrintf("[azaharnative] %s", buf + buf_len);
+    ksceKernelPrintf("[mh4unative] %s", buf + buf_len);
 
     buf_len += n;
     if (log_sync) {

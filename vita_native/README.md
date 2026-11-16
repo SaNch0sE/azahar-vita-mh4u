@@ -33,7 +33,7 @@ cmake -S . -B build
 cmake --build build
 ```
 
-That produces `build/azaharnative.skprx`, the plugin, and `build/libazaharnative_stub.a`, the
+That produces `build/mh4unative.skprx`, the plugin, and `build/libmh4unative_stub.a`, the
 stub the emulator links against.
 
 ## Installing
@@ -43,13 +43,13 @@ Copy the plugin somewhere on the memory card and add it to taiHEN's kernel secti
 ```sh
 # on the Vita, ux0:tai/config.txt
 *KERNEL
-ux0:tai/azaharnative.skprx
+ux0:tai/mh4unative.skprx
 ```
 
 Reboot, or reload the config with a taiHEN plugin manager. The plugin does nothing until an
 application calls it, so a console with it installed and no emulator running behaves normally.
 
-To build against it, put `libazaharnative_stub.a` on the linker line and include
+To build against it, put `libmh4unative_stub.a` on the linker line and include
 `src/azahar_native.h`; the nine calls it declares are the whole interface.
 
 ## Where it writes

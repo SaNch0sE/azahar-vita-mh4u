@@ -178,8 +178,8 @@ typedef struct AzaharSgiStats {
 } AzaharSgiStats;
 int azaharSgiStats(AzaharSgiStats *out);
 /// Writes every thread of the client with its kernel-held registers (user and kernel pc,
-/// lr, sp; status, priority, last core, wait) to ux0:data/azahar/native.txt, when logging
-/// is enabled (ux0:data/azahar/log). Returns the number of threads seen, 0 without a client.
+/// lr, sp; status, priority, last core, wait) to ux0:data/mh4u/native.txt, when logging
+/// is enabled (ux0:data/mh4u/log). Returns the number of threads seen, 0 without a client.
 int azaharThreadDump(void);
 
 #ifdef __cplusplus
