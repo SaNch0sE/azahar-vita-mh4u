@@ -217,6 +217,12 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().fxaa = value;
                GxmRenderer::SaveVideoOptions();
            });
+    toggle("FPS counter", "Shows the emulation speed and the frame rate in the top right corner.",
+           true, [] { return GxmRenderer::Video().show_fps; },
+           [](bool value) {
+               GxmRenderer::Video().show_fps = value;
+               GxmRenderer::SaveVideoOptions();
+           });
     choice("Picture shape",
            "3DS keeps the game's 5:3 picture with bars at the sides. Wide fills the screen; "
            "use it with the Heavenfall mod built with --cheat-aspect-ratio 16:9 (and 16:9 "
@@ -533,7 +539,8 @@ void Ui::DrawStatsHud() {
     // Top right, every frame while a title runs: what the console line prints once a second.
     // A dozen text lines of ImGui, so a few hundred vertices; `nostats` hides it.
     static const bool off = GxmRenderer::GxmFlag("nostats");
-    if (off || !HudStats::valid.load(std::memory_order_acquire)) {
+    if (off || !GxmRenderer::Video().show_fps ||
+        !HudStats::valid.load(std::memory_order_acquire)) {
         return;
     }
     using namespace HudStats;

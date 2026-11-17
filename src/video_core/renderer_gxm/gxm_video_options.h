@@ -23,6 +23,8 @@ struct VideoOptions {
     /// bars: for the Heavenfall mod built with --cheat-aspect-ratio 16:9, which widens the
     /// game's views and interface for a stretched picture.
     bool wide = false;
+    /// The speed / frame rate counter in the top right corner (Ui::DrawStatsHud).
+    bool show_fps = true;
 };
 
 /// The live options (loaded from the file on first use).

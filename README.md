@@ -115,7 +115,8 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 
 - **Save states**: nine slots, each with Load and Save.
 - **Settings**: screen layout, upscale filter (Linear is the fastest; Sharp bilinear costs about
-  1 fps), FXAA, picture shape, render scale (above 1x is much slower, and applies on
+  1 fps), FXAA, FPS counter (the speed and frame rate in the top right corner, on by default),
+  picture shape, render scale (above 1x is much slower, and applies on
   the next start).
 - **Exit game**.
 

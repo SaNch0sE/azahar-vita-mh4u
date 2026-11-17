@@ -38,6 +38,8 @@ VideoOptions Load() {
             o.msaa = v != 0;
         } else if (std::strcmp(line, "wide") == 0) {
             o.wide = v != 0;
+        } else if (std::strcmp(line, "fps") == 0) {
+            o.show_fps = v != 0;
         }
     }
     std::fclose(f);
@@ -57,9 +59,9 @@ void SaveVideoOptions() {
     if (f == nullptr) {
         return;
     }
-    std::fprintf(f, "upscale=%u\nfxaa=%u\nscale_q=%u\nmsaa=%u\nwide=%u\n",
+    std::fprintf(f, "upscale=%u\nfxaa=%u\nscale_q=%u\nmsaa=%u\nwide=%u\nfps=%u\n",
                  static_cast<u32>(o.upscale), o.fxaa ? 1u : 0u, o.scale_q, o.msaa ? 1u : 0u,
-                 o.wide ? 1u : 0u);
+                 o.wide ? 1u : 0u, o.show_fps ? 1u : 0u);
     std::fclose(f);
 }
 
