@@ -37,6 +37,13 @@ namespace Core::VitaHle {
  */
 constexpr u32 Mh4uFilterEntry = 0x00110C64;
 constexpr u32 Mh4uFilterExit = 0x00110DA8;
+/// The same routine, byte for byte, in the USA game without its update (v1.0, and the Heavenfall
+/// build of it, which the mod's web installer makes): 0x1A4 bytes lower.
+constexpr u32 Mh4uFilterEntryV10 = 0x00110AC0;
+constexpr u32 Mh4uFilterExitV10 = 0x00110C04;
+/// The instruction at the entry in both (a vector vmla), checked so no other code is ever taken
+/// for the routine.
+constexpr u32 Mh4uFilterEntryWord = 0xEE084A00;
 
 struct HleState {
     u32* r;     ///< r0-r15
@@ -48,7 +55,7 @@ struct HleState {
 /// `Mem` provides u32 Read(u32 vaddr), void Write(u32 vaddr, u32 value) and u8* Span(u32 vaddr,
 /// u32 size): a host pointer to a run inside one page of plain memory, or nullptr.
 template <typename Mem>
-void RunMh4uFilter(HleState st, Mem& mem) {
+void RunMh4uFilter(HleState st, Mem& mem, u32 exit = Mh4uFilterExit) {
     u32* const r = st.r;
     u32* const s = st.s;
     const u32 fpscr = *st.fpscr;
@@ -246,7 +253,7 @@ void RunMh4uFilter(HleState st, Mem& mem) {
     r[12] = mem.Read(r[13]);
     r[13] += 4;
     *st.fpscr = r[12];
-    r[15] = Mh4uFilterExit;
+    r[15] = exit;
 }
 
 } // namespace Core::VitaHle

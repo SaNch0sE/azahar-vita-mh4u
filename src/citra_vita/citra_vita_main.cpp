@@ -393,6 +393,35 @@ std::string FindRom() {
     return rom;
 }
 
+/// The port's cheat file (USA: 3D off without dithering, bloom off, the 30 fps cap) ships in the
+/// vpk and is copied to ux0:data/mh4u/cheats on first start; a file already there (the player's
+/// own choices) is kept. Each code first checks a v1.1 instruction, so on the game without its
+/// update - whose code sits elsewhere - it does nothing.
+void InstallDefaultCheats() {
+    constexpr char Name[] = "0004000000126300.txt";
+    const std::string dest = std::string(VITA_DATA_DIR "/cheats/") + Name;
+    SceIoStat st{};
+    if (sceIoGetstat(dest.c_str(), &st) >= 0) {
+        return;
+    }
+    sceIoMkdir(VITA_DATA_DIR "/cheats", 0777);
+    const SceUID in = sceIoOpen((std::string("app0:cheats/") + Name).c_str(), SCE_O_RDONLY, 0);
+    if (in < 0) {
+        return;
+    }
+    std::vector<char> data(16 * 1024);
+    const int n = sceIoRead(in, data.data(), static_cast<SceSize>(data.size()));
+    sceIoClose(in);
+    if (n <= 0) {
+        return;
+    }
+    const SceUID out = sceIoOpen(dest.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+    if (out >= 0) {
+        sceIoWrite(out, data.data(), static_cast<SceSize>(n));
+        sceIoClose(out);
+    }
+}
+
 /// Installs the CIAs in ux0:data/mh4u/roms that are not installed yet (the game's update, DLC),
 /// with progress on screen: the Heavenfall mod's executable is built for the update, so it has to
 /// be there before the game boots. An installed title is recognised by its TMD and skipped.
@@ -1157,6 +1186,7 @@ int EmulatorMain() {
         RunTitle(system, window, ui, launch);
     } else {
         sceIoMkdir(VITA_DATA_DIR "/roms", 0777);
+        InstallDefaultCheats();
         InstallPendingCias(window, ui);
         const std::string rom = FindRom();
         if (rom.empty()) {

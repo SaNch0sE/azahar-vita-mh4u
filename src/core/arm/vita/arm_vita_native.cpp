@@ -759,8 +759,13 @@ bool ARM_VitaNative::InterpretShortVectors() {
     // `nosvhle` interprets it as before; `svcheck` runs both and logs any difference.
     static const bool sv_hle = !GxmRenderer::GxmFlag("nosvhle");
     static const bool sv_check = GxmRenderer::GxmFlag("svcheck");
-    const bool hle_here = sv_hle && context.r[15] == VitaHle::Mh4uFilterEntry &&
-                          (context.fpscr & ShortVectorMask) == 0x00030000;
+    const u32 pc = context.r[15];
+    const bool hle_here =
+        sv_hle && (pc == VitaHle::Mh4uFilterEntry || pc == VitaHle::Mh4uFilterEntryV10) &&
+        (context.fpscr & ShortVectorMask) == 0x00030000 &&
+        memory.Read32(pc) == VitaHle::Mh4uFilterEntryWord;
+    const u32 hle_exit =
+        pc == VitaHle::Mh4uFilterEntry ? VitaHle::Mh4uFilterExit : VitaHle::Mh4uFilterExitV10;
     if (hle_here && !sv_check) {
         struct Direct {
             Memory::MemorySystem& m;
@@ -777,10 +782,11 @@ bool ARM_VitaNative::InterpretShortVectors() {
                 return m.GetPointer(a);
             }
         } direct{memory};
-        VitaHle::RunMh4uFilter({context.r, context.fpregs, &context.cpsr, &context.fpscr}, direct);
+        VitaHle::RunMh4uFilter({context.r, context.fpregs, &context.cpsr, &context.fpscr}, direct,
+                               hle_exit);
         static u32 hle_calls = 0;
         if (++hle_calls == 1) {
-            LOG_INFO(Core_ARM11, "MH4U vector routine at {:08X}: native (HLE)", VitaHle::Mh4uFilterEntry);
+            LOG_INFO(Core_ARM11, "MH4U vector routine at {:08X}: native (HLE)", pc);
         }
         return true;
     }
@@ -811,7 +817,8 @@ bool ARM_VitaNative::InterpretShortVectors() {
         std::copy(std::begin(context.fpregs), std::end(context.fpregs), chk_s.begin());
         chk_cpsr = context.cpsr;
         chk_fpscr = context.fpscr;
-        VitaHle::RunMh4uFilter({chk_r.data(), chk_s.data(), &chk_cpsr, &chk_fpscr}, shadow);
+        VitaHle::RunMh4uFilter({chk_r.data(), chk_s.data(), &chk_cpsr, &chk_fpscr}, shadow,
+                               hle_exit);
     }
     if (!vector_interpreter) {
         // The interpreter's translation cache is 32 MB by default, enough to push a title that
@@ -855,7 +862,7 @@ bool ARM_VitaNative::InterpretShortVectors() {
     u32 steps = 0;
     if (hle_here) {
         // Check mode: one instruction at a time up to the routine's exit, then compare.
-        while (steps < MaxSteps && interp.GetPC() != VitaHle::Mh4uFilterExit) {
+        while (steps < MaxSteps && interp.GetPC() != hle_exit) {
             bool at_svc = false;
             steps += interp.RunUntilSvc(1, at_svc);
             if (at_svc) {

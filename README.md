@@ -1,29 +1,150 @@
 ![Azahar Emulator](https://azahar-emu.org/resources/images/logo/azahar-name-and-logo.svg)
 
-# Azahar Emulator for the PSVita
+# Monster Hunter 4 Ultimate for the PS Vita
 
-This is an early, almost entirely vibecoded port of Azahar for the PSVita, so do not expect playability or support from my side.
+A port of the [Azahar](https://github.com/azahar-emu/azahar) 3DS emulator, built on
+[Grarak's PS Vita port](https://github.com/Grarak/azahar) and tuned for one game: **Monster Hunter 4
+Ultimate**. It installs as its own app (title ID `MH4UVITA0`), keeps everything in `ux0:data/mh4u`,
+and is played on one screen with the [Heavenfall mod](https://github.com/popzol/4u-heavenfall-mod-beta),
+which moves the touch screen's menus to the top screen.
+
+Status: **alpha**. Hunts, the village and the menus run at or near 30 fps; the quest counter still
+drops below that. Expect bugs, and back up your saves.
+
+This repository contains no game files. You need your own copy of the game.
+
+## What you need
+
+| What | Where it comes from |
+| --- | --- |
+| A PS Vita or PS TV with [HENkaku/Ensō](https://vita.hacks.guide/) (taiHEN) and VitaShell | the Vita hacks guide |
+| `MH4U.vpk` and `mh4unative.skprx` | this repository's [releases](https://github.com/SaNch0sE/azahar-vita-mh4u/releases) |
+| `CapUnlocker.skprx` | [GrapheneCt/CapUnlocker releases](https://github.com/GrapheneCt/CapUnlocker/releases) |
+| Monster Hunter 4 Ultimate, **USA**, decrypted (`.3ds`, `.cci` or `.cxi`) | dumped from your own cartridge or 3DS ([how to dump](https://3ds.hacks.guide/dumping-titles-and-game-cartridges.html)); decrypted, for example with GodMode9 |
+| Optional: the game's v1.1 update, decrypted `.cia` | dumped from your own 3DS |
+| The Heavenfall mod, made from your own game | the [web installer](https://popzol.github.io/4u-heavenfall-mod-beta/) (below) |
+
+Only the American release (title `0004000000126300`) has been tested. The European one may run, but
+the port's speedups and cheat file are made for the American game.
 
 ## Install
 
-- Grab the latest vpk and skprx from [releases](https://github.com/Grarak/azahar/releases)
-- Grab latest release of [CapUnlocker](https://github.com/GrapheneCt/CapUnlocker/releases)
-- Install the vpk
-- Install both skprx files (azaharnative and CapUnlocker) to the KERNEL section in your config.txt
-- Put your **decrypted** ROMs in ux0:/data/azahar/roms
-- Set your CPU to 500MHz before launching a game
+### 1. The app and the kernel plugins
 
-## Known Issues
-- Pausing the game and resuming might freeze your console, you need a hardreset
-- Savestates are untested and probably don't work
-- Expect crashes
+1. Copy `MH4U.vpk` to the Vita and install it with VitaShell.
+2. Copy `mh4unative.skprx` and `CapUnlocker.skprx` to `ur0:tai/`.
+3. Add both under the `*KERNEL` section of `ur0:tai/config.txt` (if your setup uses
+   `ux0:tai/config.txt` instead, edit that one):
+
+   ```
+   *KERNEL
+   ur0:tai/mh4unative.skprx
+   ur0:tai/CapUnlocker.skprx
+   ```
+
+4. Reboot the Vita.
+
+`mh4unative.skprx` lets the Vita run the game's ARM code directly. It does nothing until the app
+calls it. The app refuses to start, with a message, if either plugin is missing or too old.
+
+### 2. The game
+
+1. Create the folder `ux0:data/mh4u/roms/`. The app also creates it on its first start.
+2. Put your decrypted game (`.3ds`, `.cci` or `.cxi`) in it.
+3. Optional: put the decrypted update `.cia` in the same folder. On the next start the app installs
+   it, with a progress bar. You can delete the `.cia` afterwards.
+
+### 3. The Heavenfall mod
+
+The port is meant to be played with the mod's single-screen mode.
+
+1. On a PC or phone, open the web installer: **https://popzol.github.io/4u-heavenfall-mod-beta/**.
+   Your game is never uploaded; everything runs in your browser.
+2. Choose your game file: the `.3ds`. The installer does not take the update.
+3. Options:
+   - **Single Screen mode**: on (the default).
+   - **HUD size**: your choice. 70% is the default.
+   - **Aspect ratio**: tick **Allow other aspect ratios (EXPERIMENTAL)** and choose **16:9** to
+     fill the Vita's screen. Leave it at 5:3 to keep the 3DS shape with bars at the sides.
+   - Keep the **other / quality-of-life module on**. The port needs it: without it the game
+     crashes about 15 seconds after boot.
+   - Layered Gear and the cheats: your choice.
+4. Press **Make the mod**, download the zip, and extract it. Inside is a folder named
+   `0004000000126300`.
+5. Copy that folder to `ux0:data/mh4u/load/mods/`, so that you end up with
+   `ux0:data/mh4u/load/mods/0004000000126300/romfs` and `.../exefs`. To save space, you
+   only need `romfs/system` and the language folder you play in (`romfs/eng` for English).
+
+To update the mod or change its options, delete that folder and copy the new one in. Files
+left behind would still be loaded.
+
+The mod is also a Python program (`python3 -m core --rom <game> --code <update.cia> --out
+<folder> --single-screen --quality-of-life ...`, see
+[docs/vita-mh4u-single-screen.md](./docs/vita-mh4u-single-screen.md)), which can build it from
+the update's executable too. The port runs either build: the web installer's build was tested
+from a fresh `ux0:data/mh4u`, and the update-based build is the one played most.
+
+### 4. First start
+
+Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
+
+- **START menu, third page, Mod Settings, Display**: set **FPS** to **30**, 3D Mode off with no
+  dithering, and Bloom and Depth Blur off. If you made the mod with 16:9, set the aspect ratio
+  to 16:9 there too. A mod from the web installer starts with FPS off, and the game then tries to
+  run at 60, which the Vita can't keep up.
+- **Select + Start** opens the port's pause menu. Under **Settings**:
+  - **Picture shape: Wide (16:9)** if you made the mod with 16:9.
+  - **Sharp HUD text** draws the HUD's names and item names at the Vita's resolution. It is
+    recommended.
+
+## The port's files: `ux0:data/mh4u`
+
+| Path | What |
+| --- | --- |
+| `roms/` | your game (and the update `.cia` until it is installed) |
+| `load/mods/0004000000126300/` | the Heavenfall mod |
+| `cheats/0004000000126300.txt` | the cheat file: 3D and dithering off, bloom off, a 30 fps cap. It is copied from the app on first start. Your own edits are kept. Its codes only act on a mod built from the v1.1 update's executable. Otherwise they do nothing, and the mod's Display settings above do the same job. |
+| `sdmc/`, `nand/`, `sysdata/` | the game's saves, the installed update, system data |
+| `states/` | save states (pause menu, **Save states**, slots 1-9) |
+| `video.txt` | the pause menu's picture settings |
+
+## Pause menu (Select + Start)
+
+- **Save states**: nine slots, each with Load and Save.
+- **Settings**: screen layout, upscale filter (Linear is the fastest; Sharp bilinear costs about
+  1 fps), FXAA, Sharp HUD text, picture shape, render scale (above 1x is much slower, and applies on
+  the next start).
+- **Exit game**.
+
+## Known issues
+
+- The quest counter runs below 30 fps.
+- The first steps into an area you have not seen yet can stutter once while shaders are made. They
+  are saved to `programs.bin` and load quickly after that.
+- Save states made with one mod build may not load with another.
 
 ## Build
-See [DEVELOPMENT.md](./DEVELOPMENT.md)
 
-## This fork
+Needs Linux, [VitaSDK](https://vitasdk.org), clang/lld (21) and CMake with Ninja:
 
-This branch tunes the port for Monster Hunter 4 Ultimate: it installs as its own app (MH4UVITA0) and keeps its files in `ux0:data/mh4u`. Performance notes and plans are in [docs/vita-mh4u-performance.md](./docs/vita-mh4u-performance.md) and [docs/plans](./docs/plans). The pause menu has image options: an upscale filter (linear or sharp bilinear), FXAA, and an internal render scale (1x to 2x, applied on the next launch).
+```sh
+git clone --recursive https://github.com/SaNch0sE/azahar-vita-mh4u
+cd azahar-vita-mh4u
+git -C externals/libressl apply ../../patches/vita/libressl-vita.patch   # once, see patches/vita
+export VITASDK=/usr/local/vitasdk
+cmake -S . -B build-vita-rel -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE=CMakeModules/toolchain-vita-clang.cmake \
+  -DCMAKE_BUILD_TYPE=Release -DENABLE_LTO=ON
+cmake --build build-vita-rel
+```
+
+- The app: `build-vita-rel/src/citra_vita/citra_vita.vpk`.
+- The kernel plugin: `build-vita-rel/vita_native/mh4unative.skprx`.
+
+`-DENABLE_LTO=OFF` gives the diagnostic build: logging, statistics and the switches in
+`src/video_core/renderer_gxm/gxm_flags.h`. [DEVELOPMENT.md](./DEVELOPMENT.md) explains how the port
+works, and [docs/vita-mh4u-performance.md](./docs/vita-mh4u-performance.md) records what was
+measured and changed.
 
 ## Projects we learned from
 
