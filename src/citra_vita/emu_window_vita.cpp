@@ -15,7 +15,6 @@
 
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/gxm_present.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
 #include "citra_vita/vita_ui.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
@@ -349,11 +348,6 @@ void EmuWindowVita::DrawScreens() {
     };
     if (layout.top_screen_enabled && top_ready) {
         rect_draw(top_screen, layout.top_screen);
-        // The 2D layer's text at screen resolution, over the stretched picture (hudtext).
-        GxmRenderer::ReplayHudText(top_screen.addr, static_cast<float>(layout.top_screen.left),
-                                   static_cast<float>(layout.top_screen.top),
-                                   static_cast<float>(layout.top_screen.GetWidth()),
-                                   static_cast<float>(layout.top_screen.GetHeight()));
     }
     if (layout.bottom_screen_enabled) {
         GxmPresent::GuestScreen bottom{};
@@ -394,7 +388,6 @@ bool EmuWindowVita::BuildScreen(int screen, GxmPresent::GuestScreen& out) {
         .fill_r = fb->fill_r,
         .fill_g = fb->fill_g,
         .fill_b = fb->fill_b,
-        .addr = fb->addr,
     };
     return true;
 }

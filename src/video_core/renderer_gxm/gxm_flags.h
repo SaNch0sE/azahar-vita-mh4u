@@ -5,7 +5,6 @@
 #pragma once
 
 #include <string>
-#include "common/common_types.h"
 
 namespace GxmRenderer {
 
@@ -142,13 +141,6 @@ void RequestSurfaceDump();
 /// right after it writes the frame, since with the emulation paused in the menu the
 /// rasterizer's own frame end never comes. GXM is idle at that point: no scene is open.
 void SetSurfaceDumpHook(void (*hook)(void*), void* user);
-
-/// HUD text at screen resolution (`hudtext`): the rasterizer records the 2D layer's text draws
-/// instead of drawing them, keyed by the display framebuffer they were transferred into, and
-/// the frontend replays them over the stretched screen with ReplayHudText (in its present
-/// scene, after the top screen's quad; x, y, w, h the screen's rectangle in display pixels).
-void SetHudReplayHook(void (*hook)(void*, u32, float, float, float, float), void* user);
-void ReplayHudText(u32 framebuffer_addr, float x, float y, float w, float h);
 void RunSurfaceDumpIfRequested();
 
 } // namespace GxmRenderer

@@ -64,7 +64,8 @@ The port is meant to be played with the mod's single-screen mode.
 2. Choose your game file: the `.3ds`. The installer does not take the update.
 3. Options:
    - **Single Screen mode**: on (the default).
-   - **HUD size**: your choice. 70% is the default.
+   - **HUD size**: **100%** (or 90%). The default 70% makes the HUD's text hard to read on the
+     Vita's screen, since the game draws it at the 3DS's resolution.
    - **Aspect ratio**: leave it at **5:3** (the default). The mod can widen the game to 16:9
      (**Allow other aspect ratios (EXPERIMENTAL)**, then **16:9**), but we don't recommend it:
      it is playable, but heavy scenes drop to 28-30 fps where the 5:3 game holds a steady 30.
@@ -98,8 +99,6 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
   - **Picture shape**: **3DS (5:3)** keeps the game's proportions, with bars at the sides.
     **Wide (16:9)** fills the screen: with a 5:3 mod it stretches the picture sideways, and with
     a 16:9 mod the proportions are correct.
-  - **Sharp HUD text** draws the HUD's names and item names at the Vita's resolution. It is
-    recommended.
 
 ## The port's files: `ux0:data/mh4u`
 
@@ -116,7 +115,7 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 
 - **Save states**: nine slots, each with Load and Save.
 - **Settings**: screen layout, upscale filter (Linear is the fastest; Sharp bilinear costs about
-  1 fps), FXAA, Sharp HUD text, picture shape, render scale (above 1x is much slower, and applies on
+  1 fps), FXAA, picture shape, render scale (above 1x is much slower, and applies on
   the next start).
 - **Exit game**.
 

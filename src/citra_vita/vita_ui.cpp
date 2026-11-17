@@ -217,13 +217,6 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().fxaa = value;
                GxmRenderer::SaveVideoOptions();
            });
-    toggle("Sharp HUD text", "Draws the HUD's text (names, item names) at the screen's "
-           "resolution over the stretched picture, instead of at the 3DS's 400x240.",
-           true, [] { return GxmRenderer::Video().hud_text; },
-           [](bool value) {
-               GxmRenderer::Video().hud_text = value;
-               GxmRenderer::SaveVideoOptions();
-           });
     choice("Picture shape",
            "3DS keeps the game's 5:3 picture with bars at the sides. Wide fills the screen; "
            "use it with the Heavenfall mod built with --cheat-aspect-ratio 16:9 (and 16:9 "

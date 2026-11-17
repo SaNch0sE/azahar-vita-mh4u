@@ -809,3 +809,12 @@ timing: clock reads per draw). Val Habar slot 4, Sharp HUD text on: with it 25.7
 thread ~960 ms/s); without it 29.3 / 30.0 (render thread ~815-875 ms/s). Every village figure
 above this note (and the "village was already ~26" bisect) was measured with it on. Renamed to
 timedraw.off on 2026-11-17; check the card for it before any fps measurement.
+
+**Sharp HUD text removed (2026-11-17).** With the Heavenfall mod's HUD at 100% the native text is
+readable, so the option (recorded HUD text replayed at screen resolution) went: the code of
+58c3ea0d7..f834922b7 reverted. Release, Sharp HUD text off, mod HUD 100%, game fps over two passes
+(camp slot 1 / village slot 4): current code 1x 30.0/30.0 and 30.0/29.7, 1.25x 29.2/29.5 and
+29.9/30.0; code removed 1x 29.9/29.9 and 29.9/29.3, 1.25x 29.7/29.6 and 30.0/29.9 - the same
+within noise (render thread ~550 / ~820 ms/s in both). Disabled, it cost nothing measurable.
+The half-pixel viewport fix stays: without it (`nohalfpixel`) fps is the same (1x 30.0/30.0,
+1.25x 29.5/29.4 camp) but "(No Item)" reads "(No Itarr)" at both scales.
