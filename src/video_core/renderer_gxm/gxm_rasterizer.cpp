@@ -270,6 +270,16 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
     EnsureRing();
 }
 
+namespace {
+/// Diagnostic fog switches change the generated program, so they are part of its cache key.
+u64 FogDiagKeyBits() {
+    static const u64 bits = (GxmFlag("dbgconstfog") ? 0x8000ull : 0ull) |
+                            (GxmFlag("dbgfognoinput") ? 0x10000ull : 0ull) |
+                            (GxmFlag("nofogstrip") ? 0x20000ull : 0ull);
+    return bits;
+}
+} // namespace
+
 void RasterizerGxm::EnsureRing() {
     if (ring != nullptr || !HasDevice()) {
         return;
@@ -2212,7 +2222,7 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         static_cast<u64>(fs_config.Hash()),
         static_cast<u64>(Pica::Shader::Generator::Cg::GetDebugOutput()) |
             (Pica::Shader::Generator::Cg::FogDisabled() ? 0x100ull : 0ull) |
-            (Usse::FogQueryEnabled() ? 0ull : 0x4000ull));
+            (Usse::FogQueryEnabled() ? 0ull : 0x4000ull) | FogDiagKeyBits());
     // Only generate the Cg when the configuration is new. Both arguments below cost real time
     // - the source is hundreds of string appends and the name is an allocation - and they
     // were being paid on every draw for a shader that had existed since the first one.

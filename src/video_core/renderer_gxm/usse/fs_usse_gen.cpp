@@ -314,6 +314,10 @@ private:
     /// Unit 0's cube-map lookup into the rasterizer's six-face atlas, into TmpProj.
     void CubeCoordinates(Reg uv);
     /// dbgconstfog (diagnostic): the fog coordinate as the factor, no fetch (prices the fetch).
+    static bool fog_no_input() {
+        static const bool on = GxmFlag("dbgfognoinput");
+        return on;
+    }
     static bool const_fog_strip() {
         static const bool on = GxmFlag("dbgconstfog");
         return on;
@@ -660,7 +664,7 @@ void FragmentEmitter::PlanInputs() {
     // the strip coordinate the shader computed from the fragment's depth; the texel then
     // arrives in pa4-7 before the program runs, carried on the COLOR0 descriptor as
     // psp2cgc does it, and Position is no longer needed for fog.
-    fog_query = fog_strip && FogQueryEnabled() && !const_fog_strip();
+    fog_query = fog_strip && FogQueryEnabled() && !const_fog_strip() && !fog_no_input();
 
     // pa0-3 is the vertex colour; the four-wide inputs follow, then the pairs, then the
     // one float3 (which need not be followed by anything pair-aligned).
@@ -678,7 +682,7 @@ void FragmentEmitter::PlanInputs() {
         fog_query_pa = pa;
         pa += 4;
     }
-    if (uses_scissor || (uses_fog && !fog_query) || uses_depth ||
+    if (uses_scissor || (uses_fog && !fog_query && !fog_no_input()) || uses_depth ||
         config.framebuffer.shadow_rendering) {
         gxp.inputs.push_back({FragmentInput::Position, 4});
         position_pa = pa;
@@ -1426,7 +1430,11 @@ void FragmentEmitter::Fog() {
     // fog_index = depth * 128 (or (1 - depth) * 128 flipped); i = clamp(floor(index), 0,
     // 127); f = index - i; entry = lut_lf(i + fog_lut_offset); factor = clamp(r + g * f).
     const Reg pos = Reg::Pa(position_pa + 2); // z, w
-    if (fog_query) {
+    if (fog_no_input()) {
+        // dbgfognoinput (diag): the fog arithmetic with a fixed factor of one half and no
+        // per-pixel input, to price the input apart from the arithmetic.
+        e.MoveInternal({I0, 0xf}, ConstHalf, Pred::None, true);
+    } else if (fog_query) {
         // Already fetched: the factor in every lane.
         LoadVec4(I0, {Bank::PrimAttr, fog_query_pa});
     } else if (fog_strip) {
@@ -1466,7 +1474,7 @@ void FragmentEmitter::Fog() {
               Pred::None, true);
         LutLfFetch();
     }
-    if (fog_query) {
+    if (fog_query || fog_no_input()) {
         // Loaded above.
     } else if (fog_strip && !const_fog_strip()) {
         // The strip holds clamped bytes replicated in all four channels (SyncFogStrip), so

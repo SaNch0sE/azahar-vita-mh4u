@@ -818,3 +818,12 @@ readable, so the option (recorded HUD text replayed at screen resolution) went: 
 within noise (render thread ~550 / ~820 ms/s in both). Disabled, it cost nothing measurable.
 The half-pixel viewport fix stays: without it (`nohalfpixel`) fps is the same (1x 30.0/30.0,
 1.25x 29.5/29.4 camp) but "(No Item)" reads "(No Itarr)" at both scales.
+
+**Slot 6 (hunting area, 2026-11-17): GPU-bound, ~36 ms on the main target at 1x (diag
+scenetime), ~140 draws a frame.** Fog costs ~2 ms (`nofog` 34.3 against 36.1); `dbgfognoinput`
+(new: fog arithmetic with a fixed factor, no per-pixel input) 36.1, so the fog query is free and
+fog adds no temporaries (logtemps, 22 program pairs identical, +7 instructions). `dbgconstfog`
+and `nofogstrip` were missing from the program cache key, so readings with them before this date
+used the normal cached programs; they are keyed now (FogDiagKeyBits). The spot is live gameplay
+(monsters attack, the camera moves, menus open), so A/B readings there swing by 5 ms; a still
+save state is needed before pricing alpha test and shadows there.
