@@ -27,8 +27,11 @@ Updating from 0.2: install the new `MH4U.vpk` over the old one. Your saves and s
    ur0:tai/CapUnlocker.skprx
    ```
 3. **The game.** Create `ux0:data/mh4u/roms/` and put your decrypted Monster Hunter 4 Ultimate (USA)
-   `.3ds` (or `.cci`/`.cxi`) in it. Optional: also put the decrypted v1.1 update `.cia` there. The
-   app installs the update on its next start; after that you can delete the update's `.cia`.
+   `.3ds` (or `.cci`/`.cxi`) in it. You don't need the game's v1.1 update with a mod from the web
+   installer: that mod brings its own copy of the game's program, built from the base game, which
+   replaces the update's. (If you build the mod yourself from the update with Heavenfall's
+   command-line tool, put the decrypted update `.cia` in the same folder too; the app installs it
+   on its next start.)
 4. **The Heavenfall mod** (menus on one screen; the port is made to be played with it):
    1. Open the web installer, https://popzol.github.io/4u-heavenfall-mod-beta/, on a PC or phone.
       Your game is never uploaded.
@@ -69,17 +72,16 @@ Your saves, save states and settings are in `ux0:data/mh4u`.
   replayed text cost code complexity for no gain. The fix that keeps the HUD's letters crisp
   (a half-pixel offset) stays.
 - **FPS counter setting** in the pause menu (Settings), on by default.
-- **30 fps from the first start.** The bundled cheat file's 30 FPS Cap is on and now works for both
-  the base game's and the update's executable (the web installer builds the mod from the base
-  game), so the prologue runs capped before the mod's own FPS setting can be reached. The 3D and
-  bloom codes are off: the mod does them. An existing cheat file is kept.
-- **Intro movie at full speed with web-installer mods.** The web installer builds the mod's
-  executable from the base game, so with such a mod the game runs the base game's code (v1.0),
-  even with the update installed. The intro movie fix recognised only the update's code, so with
-  a web-installer mod the intro always played slowly; it now handles both. The bundled 30 fps cap
-  also works with both (the audio speedup already did since 0.2).
-- **Update install survives interruptions.** If the app is closed while it installs the update
-  `.cia`, the next start installs it again instead of starting the game on a half-installed update.
+- **30 fps from the first start.** The bundled cheat file's 30 FPS Cap is on, so the prologue runs
+  capped before the mod's own FPS setting can be reached. The 3D and bloom codes are off: the mod
+  does them. An existing cheat file is kept.
+- **Full speed with the web installer's mod.** That mod's copy of the game's program is built
+  from the base game, and the port's game-specific fixes only recognised the update's program.
+  The intro movie fix (the intro played slowly) and the 30 fps cap now work with both; the audio
+  speedup already did since 0.2.
+- **Update install survives interruptions.** For those who install the update `.cia`: if the app
+  is closed during the install, the next start installs it again instead of starting the game on a
+  half-installed update.
 - **Crash fix.** The game could close mid-play while reading a file: every large read started
   a new thread, and when the Vita had no memory left for one, the app ended. Reads now go to a
   small pool of threads made once at start.

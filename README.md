@@ -21,7 +21,7 @@ This repository contains no game files. You need your own copy of the game.
 | `MH4U.vpk` and `mh4unative.skprx` | this repository's [releases](https://github.com/SaNch0sE/azahar-vita-mh4u/releases) |
 | `CapUnlocker.skprx` | [GrapheneCt/CapUnlocker releases](https://github.com/GrapheneCt/CapUnlocker/releases) |
 | Monster Hunter 4 Ultimate, **USA**, decrypted (`.3ds`, `.cci` or `.cxi`) | dumped from your own cartridge or 3DS ([how to dump](https://3ds.hacks.guide/dumping-titles-and-game-cartridges.html)); decrypted, for example with GodMode9 |
-| Optional: the game's v1.1 update, decrypted `.cia` | dumped from your own 3DS |
+| Not needed with the web installer's mod: the game's v1.1 update, decrypted `.cia` | dumped from your own 3DS (see step 2) |
 | The Heavenfall mod, made from your own game | the [web installer](https://popzol.github.io/4u-heavenfall-mod-beta/) (below) |
 
 Only the American release (title `0004000000126300`) has been tested. The European one may run, but
@@ -51,8 +51,12 @@ calls it. The app refuses to start, with a message, if either plugin is missing 
 
 1. Create the folder `ux0:data/mh4u/roms/`. The app also creates it on its first start.
 2. Put your decrypted game (`.3ds`, `.cci` or `.cxi`) in it.
-3. Optional: put the decrypted v1.1 update `.cia` in the same folder. On its next start the app
-   installs the update, with a progress bar. After that you can delete the update's `.cia`.
+3. **The update (v1.1) is not needed** if you make the mod with the web installer (step 3
+   below): that mod brings its own copy of the game's program, built from the base game, and
+   it replaces the update's program whenever the mod is active. The update matters only if you
+   build the mod yourself from the update with Heavenfall's command-line tool (`--code`, below).
+   If you do want it: put the decrypted v1.1 update `.cia` in the same folder. On its next start
+   the app installs it, with a progress bar; after that you can delete the `.cia`.
    (Any other `.cia` in that folder, such as DLC, is installed the same way.)
 
 ### 3. The Heavenfall mod
@@ -112,9 +116,9 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 
 | Path | What |
 | --- | --- |
-| `roms/` | your game (and the update `.cia` until it is installed) |
+| `roms/` | your game (and the update `.cia`, if you use one, until it is installed) |
 | `load/mods/0004000000126300/` | the Heavenfall mod |
-| `cheats/0004000000126300.txt` | the cheat file, copied from the app on first start: **30 FPS Cap** on (for the base game's and the update's executable, each behind a version check), and 3D, dithering and bloom codes off (update executable only; the mod does them). Your own edits are kept. |
+| `cheats/0004000000126300.txt` | the cheat file, copied from the app on first start: **30 FPS Cap** on (it works with a mod built from the base game, like the web installer's, and with one built from the update), and 3D, dithering and bloom codes off (the mod does them). Your own edits are kept. |
 | `sdmc/`, `nand/`, `sysdata/` | the game's saves, the installed update, system data |
 | `states/` | save states (pause menu, **Save states**, slots 1-9) |
 | `video.txt` | the pause menu's picture settings |
