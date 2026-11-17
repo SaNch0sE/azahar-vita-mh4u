@@ -66,12 +66,14 @@ The port is meant to be played with the mod's single-screen mode.
    - **Single Screen mode**: on (the default).
    - **HUD size**: **100%** (or 90%). The default 70% makes the HUD's text hard to read on the
      Vita's screen, since the game draws it at the 3DS's resolution.
-   - **Aspect ratio**: leave it at **5:3** (the default). The mod can widen the game to 16:9
-     (**Allow other aspect ratios (EXPERIMENTAL)**, then **16:9**), but we don't recommend it:
-     it is playable, but heavy scenes drop to 28-30 fps where the 5:3 game holds a steady 30.
+   - **Aspect ratio**: tick **Allow other aspect ratios (EXPERIMENTAL)** and choose **16:9**, so
+     the game fills the Vita's screen with correct proportions. This is the setup we play and
+     measure (16:9, HUD 100%): since 0.3 it holds 30 fps in the areas we test. 5:3, the default,
+     works too and keeps the 3DS shape.
    - Keep the **other / quality-of-life module on**. The port needs it: without it the game
      crashes about 15 seconds after boot.
-   - Layered Gear and the cheats: your choice.
+   - Layered Gear and the mod's cheats ("Enable cheats"): your choice. The port doesn't need
+     them.
 4. Press **Make the mod**, download the zip, and extract it. Inside is a folder named
    `0004000000126300`.
 5. Copy that folder to `ux0:data/mh4u/load/mods/`, so that you end up with
@@ -91,10 +93,13 @@ from a fresh `ux0:data/mh4u`, and the update-based build is the one played most.
 
 Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 
-- **START menu, third page, Mod Settings, Display**: set **FPS** to **30**, 3D Mode off with no
-  dithering, and Bloom and Depth Blur off. If you made the mod with 16:9, set the aspect ratio
-  to 16:9 there too. A mod from the web installer starts with FPS off, and the game then tries to
-  run at 60, which the Vita can't keep up.
+- **START menu, third page, Mod Settings, Display** (do this once; it is kept in your save):
+  - **FPS: 30**. Required: a mod from the web installer starts with FPS off, and the game then
+    tries to run at 60, which the Vita can't keep up, and slows down. The mod's own 30 fps cap
+    keeps the game at full speed even when the GPU is behind.
+  - **3D Mode**: off, with no dithering.
+  - **Bloom and Depth Blur**: off.
+  - **Aspect ratio**: 16:9, if you made the mod with it.
 - **Select + Start** opens the port's pause menu. Under **Settings**:
   - **Picture shape**: **3DS (5:3)** keeps the game's proportions, with bars at the sides.
     **Wide (16:9)** fills the screen: with a 5:3 mod it stretches the picture sideways, and with
@@ -106,7 +111,7 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 | --- | --- |
 | `roms/` | your game (and the update `.cia` until it is installed) |
 | `load/mods/0004000000126300/` | the Heavenfall mod |
-| `cheats/0004000000126300.txt` | the cheat file: 3D and dithering off, bloom off, a 30 fps cap. It is copied from the app on first start. Your own edits are kept. Its codes only act on a mod built from the v1.1 update's executable. Otherwise they do nothing, and the mod's Display settings above do the same job. |
+| `cheats/0004000000126300.txt` | a cheat file (3D and dithering off, bloom off, a 30 fps cap), copied from the app on first start with every code **off**: the mod's Display settings above do the same job better. Your own edits are kept. Its codes only act on a mod built from the v1.1 update's executable. |
 | `sdmc/`, `nand/`, `sysdata/` | the game's saves, the installed update, system data |
 | `states/` | save states (pause menu, **Save states**, slots 1-9) |
 | `video.txt` | the pause menu's picture settings |
@@ -125,7 +130,12 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 - The quest counter runs below 30 fps.
 - The first steps into an area you have not seen yet can stutter once while shaders are made. They
   are saved to `programs.bin` and load quickly after that.
-- Save states made with one mod build may not load with another.
+- After moving to another area, the frame rate can dip for a few seconds before it settles at 30.
+  It is worst the first time you visit an area after installing a new version: the shaders saved
+  in `ux0:data/mh4u/programs.bin` are rebuilt for each new build, so the first visits make them
+  again. Later visits are faster.
+- A save state carries the mod's code as it was when the state was saved: after changing the mod,
+  load your in-game save once instead of an older state.
 
 ## Build
 

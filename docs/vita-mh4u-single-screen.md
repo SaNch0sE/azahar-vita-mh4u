@@ -41,8 +41,10 @@ The console log then shows `LayeredFS replacement file in use for /eng/data/...`
 
 ## Wide picture (16:9)
 
-Not recommended (user playtest, 2026-11-17): with the 16:9 build, heavy scenes ran at 28-30 fps
-where the same play on the 5:3 build held a steady 30. It works and is playable.
+User playtest, 2026-11-17 (0.2): with the 16:9 build, heavy scenes ran at 28-30 fps where the 5:3
+build held a steady 30. Since the reflection fix (0.3: lit programs take the power form) the
+16:9 build with HUD 100% holds 30 in the hunting area that was 27-28, so it is the recommended
+setup again.
 
 The mod's experimental aspect option keeps the game's 400x240 frame but widens its 3D views and
 spreads the interface, for an emulator that stretches the picture to the screen's shape. Build it

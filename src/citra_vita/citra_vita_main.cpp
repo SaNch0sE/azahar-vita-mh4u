@@ -394,8 +394,10 @@ std::string FindRom() {
 }
 
 /// The port's cheat file (USA: 3D off without dithering, bloom off, the 30 fps cap) ships in the
-/// vpk and is copied to ux0:data/mh4u/cheats on first start; a file already there (the player's
-/// own choices) is kept. Each code first checks a v1.1 instruction, so on the game without its
+/// vpk, every code off since 0.3 (the Heavenfall mod's Display settings do the same, and its
+/// frame cap keeps the game at full speed where the cheat's slowed it: 85% against 99% when the
+/// GPU was behind), and is copied to ux0:data/mh4u/cheats on first start; a file already there
+/// (the player's own choices) is kept. Each code first checks a v1.1 instruction, so on the game without its
 /// update - whose code sits elsewhere - it does nothing.
 void InstallDefaultCheats() {
     constexpr char Name[] = "0004000000126300.txt";

@@ -166,7 +166,7 @@ set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(VITA_TITLEID "MH4UVITA0")
 set(VITA_APP_NAME "Monster Hunter 4 Ultimate")
-set(VITA_VERSION "00.20")
+set(VITA_VERSION "00.30")
 
 # The SceShell authid grants the extra permissions the native backend needs (taking a core, the
 # kernel-module bridge), and -na disables ASLR so the guest range lands where the module expects.
