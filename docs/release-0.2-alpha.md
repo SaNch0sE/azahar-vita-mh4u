@@ -26,7 +26,8 @@ No game files are included: you need your own decrypted copy of the game (USA).
    Reboot.
 3. **The game.** Create `ux0:data/mh4u/roms/` and put your decrypted Monster Hunter 4 Ultimate (USA)
    `.3ds` (or `.cci`/`.cxi`) in it. Optional: also put the decrypted v1.1 update `.cia` there. The app
-   installs it on the next start, and you can delete the `.cia` afterwards.
+   installs the update on its next start; after that you can delete the update's `.cia`. (Any
+   other `.cia` in that folder, such as DLC, is installed the same way.)
 4. **The Heavenfall mod** (single-screen menus; the port is made to be played with it):
    1. Open the web installer, https://popzol.github.io/4u-heavenfall-mod-beta/, on a PC or phone.
       Your game is never uploaded.

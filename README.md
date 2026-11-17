@@ -51,8 +51,9 @@ calls it. The app refuses to start, with a message, if either plugin is missing 
 
 1. Create the folder `ux0:data/mh4u/roms/`. The app also creates it on its first start.
 2. Put your decrypted game (`.3ds`, `.cci` or `.cxi`) in it.
-3. Optional: put the decrypted update `.cia` in the same folder. On the next start the app installs
-   it, with a progress bar. You can delete the `.cia` afterwards.
+3. Optional: put the decrypted v1.1 update `.cia` in the same folder. On its next start the app
+   installs the update, with a progress bar. After that you can delete the update's `.cia`.
+   (Any other `.cia` in that folder, such as DLC, is installed the same way.)
 
 ### 3. The Heavenfall mod
 
