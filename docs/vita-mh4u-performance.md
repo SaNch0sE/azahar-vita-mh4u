@@ -860,3 +860,8 @@ the old thread-per-call path runs, and if that throws, the section runs on the e
 Console: boot, intro, the save loaded into Val Habar at 30 fps.
 Tooling: the dump is gzip'd ELF; a stdlib reader (thread notes, registers, stack scan) plus
 arm-vita-eabi-addr2line on build-vita-rel/src/citra_vita/citra_vita gives the stack.
+
+**pvhalf with the power form (2026-11-17, slot 7, diag scenetime with tier2now):** base 31.7-32.9
+ms, `pvhalf` 29.6-30.3 ms (~2.3 ms). Frames against the per-pixel half vector (dumpframe): mean
+difference 13.7/255, 23% of pixels over 24 - the ground's highlights shift across wide areas. Not
+an invisible change, so it stays an opt-in switch.
