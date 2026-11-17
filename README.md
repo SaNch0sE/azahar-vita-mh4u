@@ -65,7 +65,9 @@ The port is meant to be played with the mod's single-screen mode.
 
 1. On a PC or phone, open the web installer: **https://popzol.github.io/4u-heavenfall-mod-beta/**.
    Your game is never uploaded; everything runs in your browser.
-2. Choose your game file: the `.3ds`. The installer does not take the update.
+2. Choose your **base game** file: the same decrypted `.3ds` (cartridge or eShop dump) that is
+   in `roms/`. Not the update `.cia`: the installer refuses it ("this is the game update, not the
+   game itself").
 3. Options:
    - **Single Screen mode**: on (the default).
    - **HUD size**: **100%** (or 90%). The default 70% makes the HUD's text hard to read on the

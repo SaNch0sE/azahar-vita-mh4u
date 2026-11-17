@@ -35,7 +35,8 @@ Updating from 0.2: install the new `MH4U.vpk` over the old one. Your saves and s
 4. **The Heavenfall mod** (menus on one screen; the port is made to be played with it):
    1. Open the web installer, https://popzol.github.io/4u-heavenfall-mod-beta/, on a PC or phone.
       Your game is never uploaded.
-   2. Choose your `.3ds`.
+   2. Choose your **base game** file: the same decrypted `.3ds` (cartridge or eShop dump) you put
+      in `roms/`. Not the update `.cia`: the installer refuses it.
    3. Options:
       - **Single Screen mode**: on.
       - **HUD size**: **100%** (or 90%). The default 70% is hard to read on the Vita.
