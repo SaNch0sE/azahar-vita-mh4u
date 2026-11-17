@@ -73,10 +73,11 @@ Your saves, save states and settings are in `ux0:data/mh4u`.
   the base game's and the update's executable (the web installer builds the mod from the base
   game), so the prologue runs capped before the mod's own FPS setting can be reached. The 3D and
   bloom codes are off: the mod does them. An existing cheat file is kept.
-- **Web-installer mods get every speedup.** The web installer builds the mod from the base game,
-  so the game runs the base game's code even with the update installed. The intro movie fix (it
-  had dropped back to slow playback), the audio speedup and the 30 fps cap now handle both the base
-  game's and the update's code.
+- **Intro movie at full speed with web-installer mods.** The web installer builds the mod's
+  executable from the base game, so with such a mod the game runs the base game's code (v1.0),
+  even with the update installed. The intro movie fix recognised only the update's code, so with
+  a web-installer mod the intro always played slowly; it now handles both. The bundled 30 fps cap
+  also works with both (the audio speedup already did since 0.2).
 - **Update install survives interruptions.** If the app is closed while it installs the update
   `.cia`, the next start installs it again instead of starting the game on a half-installed update.
 - **Crash fix.** The game could close mid-play while reading a file: every large read started
