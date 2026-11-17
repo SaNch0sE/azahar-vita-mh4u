@@ -5571,8 +5571,12 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         }
     }
     hud_phase = false;
-    if (!hud_recording.empty()) {
-        // This frame's text goes with the framebuffer the frame is transferred into.
+    // This frame's text goes with the framebuffer the frame is transferred into, and replaces
+    // whatever that framebuffer had - also with nothing: a frame without the grade (title
+    // screen, menus) records no text, and the last text must not stay on the screen.
+    if (hud_recording.empty()) {
+        hud_ready.erase(config.GetPhysicalOutputAddress());
+    } else {
         if (hud_ready.size() > 6) {
             hud_ready.clear();
         }
