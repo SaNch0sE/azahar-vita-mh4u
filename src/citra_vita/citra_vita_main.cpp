@@ -453,9 +453,25 @@ void InstallPendingCias(VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& u
             continue;
         }
         const u64 tid = infos.Unwrap().first.tid;
-        if (FileUtil::Exists(
-                Service::AM::GetTitleMetadataPath(Service::FS::MediaType::SDMC, tid))) {
+        // An install that was cut short (the app closed, the console slept) leaves its title
+        // metadata behind, which would read as installed. A marker is written before the install
+        // and removed only after it succeeds: while it exists, the title is installed again.
+        const std::string marker = fmt::format(VITA_DATA_DIR "/installing_{:016X}", tid);
+        SceIoStat marker_stat{};
+        const bool interrupted = sceIoGetstat(marker.c_str(), &marker_stat) >= 0;
+        if (!interrupted && FileUtil::Exists(Service::AM::GetTitleMetadataPath(
+                                Service::FS::MediaType::SDMC, tid))) {
             continue;
+        }
+        if (interrupted) {
+            LOG_WARNING(Frontend, "{:016X}: the last install did not finish, installing again", tid);
+        } else {
+            const SceUID mf =
+                sceIoOpen(marker.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+            if (mf >= 0) {
+                sceIoWrite(mf, path.c_str(), static_cast<SceSize>(path.size()));
+                sceIoClose(mf);
+            }
         }
         const std::string name = path.substr(path.find_last_of('/') + 1);
         u64 last_shown = 0;
@@ -465,8 +481,9 @@ void InstallPendingCias(VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& u
                 return;
             }
             last_shown = now;
-            ui.SetStatusMessage(fmt::format("Installing {} ({}%)...", name,
-                                            total != 0 ? done * 100 / total : 0));
+            ui.SetStatusMessage(fmt::format("Installing {} ({}%)...\n\nPlease don't close the "
+                                            "app until it finishes.",
+                                            name, total != 0 ? done * 100 / total : 0));
             window.PollEvents();
             ui.Update();
             window.Present(&ui);
@@ -474,7 +491,9 @@ void InstallPendingCias(VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& u
         show(0, 1);
         const auto status = Service::AM::InstallCIA(path, show);
         LOG_INFO(Frontend, "installed {} ({:016X}): {}", name, tid, static_cast<u32>(status));
-        if (status != Service::AM::InstallStatus::Success) {
+        if (status == Service::AM::InstallStatus::Success) {
+            sceIoRemove(marker.c_str());
+        } else {
             ui.SetStatusMessage(fmt::format("Could not install {} (error {}). It has to be a "
                                             "decrypted CIA.",
                                             name, static_cast<u32>(status)));
