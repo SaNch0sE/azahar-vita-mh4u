@@ -886,6 +886,10 @@ void FragmentEmitter::PlanUniforms() {
             static const bool no_compact = GxmFlag("nolightcompact");
             const auto& lc = lighting.lights[i];
             const bool d0_on = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
+            // The spot table is evaluated only for a light with spot attenuation on, which
+            // spot_atten_enable below covers: counting it here (its enable bit is always set)
+            // made every light carry its spot direction. `nospottrim` restores that.
+            static const bool no_spot_trim = GxmFlag("nospottrim");
             const bool sp_input =
                 lighting.lut_d0.enable && lighting.lut_d0.type == LutInput::SP ||
                 lighting.lut_d1.enable && lighting.lut_d1.type == LutInput::SP ||
@@ -893,7 +897,7 @@ void FragmentEmitter::PlanUniforms() {
                 lighting.lut_rr.enable && lighting.lut_rr.type == LutInput::SP ||
                 lighting.lut_rg.enable && lighting.lut_rg.type == LutInput::SP ||
                 lighting.lut_rb.enable && lighting.lut_rb.type == LutInput::SP ||
-                lighting.lut_sp.enable;
+                (no_spot_trim && lighting.lut_sp.enable);
             bool need[8];
             need[0] = uses_secondary_color && (d0_on || !Specular0Black(config, i));
             need[1] = lc.dist_atten_enable;
@@ -1874,10 +1878,12 @@ void FragmentEmitter::Lighting() {
     const bool refl_dead = refl_mode == ReflMode::Dead;
     bool needs_half = false;
     bool needs_view = false;
+    bool half_for_other = false; // the half vector is read by more than the power form's N.H
     for (u32 li = 0; li < lighting.src_num; li++) {
         const auto& light = lighting.lights[li];
         if (uses_secondary_color && (light.geometric_factor_0 || light.geometric_factor_1)) {
             needs_half = true;
+            half_for_other = true;
         }
         const auto input_of = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
             if (!LightingLutEnabled(lut, sampler)) {
@@ -1891,6 +1897,9 @@ void FragmentEmitter::Lighting() {
                     break;
                 }
                 needs_half = true;
+                if (!(refl_power && &lut == &lighting.lut_rr && lut.type.Value() == LutInput::NH)) {
+                    half_for_other = true;
+                }
                 if (lut.type.Value() == LutInput::VH) {
                     needs_view = true;
                 }
@@ -2079,7 +2088,32 @@ void FragmentEmitter::Lighting() {
                reads(lighting.lut_rb, Sampler::ReflectBlue) ||
                reads(lighting.lut_sp, Sampler::SpotlightAttenuation);
     };
-    const bool sp_read = lut_reads(LutInput::SP);
+    // The spot table is read only for lights with spot attenuation (`nospottrim`: for all).
+    static const bool no_spot_trim = GxmFlag("nospottrim");
+    const auto lut_reads_but_spot = [&](LutInput input) {
+        const auto reads = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
+            return LightingLutEnabled(lut, sampler) && lut.type.Value() == input;
+        };
+        return reads(lighting.lut_d0, Sampler::Distribution0) ||
+               reads(lighting.lut_d1, Sampler::Distribution1) ||
+               reads(lighting.lut_fr, Sampler::Fresnel) ||
+               reads(lighting.lut_rr, Sampler::ReflectRed) ||
+               reads(lighting.lut_rg, Sampler::ReflectGreen) ||
+               reads(lighting.lut_rb, Sampler::ReflectBlue);
+    };
+    const bool sp_read_any = lut_reads(LutInput::SP);
+    const bool sp_read_others = lut_reads_but_spot(LutInput::SP);
+    const bool spot_table_sp = LightingLutEnabled(lighting.lut_sp, Sampler::SpotlightAttenuation) &&
+                               lighting.lut_sp.type.Value() == LutInput::SP;
+    // The power form's |N.H|^n without the normalised half vector, exactly: with Hu = nview + L,
+    // (N.H)^2 = (N.Hu)^2 / (Hu.Hu), so |N.H|^n = ((N.Hu)^2 / (Hu.Hu))^(n/2) for an even n - no
+    // square root, no half vector parked and reloaded. Only when nothing else reads the half
+    // vector (no geometric factor, no other table on NH/VH/CP). `noexactpow` turns it off.
+    static const bool no_exact_pow = GxmFlag("noexactpow");
+    const u32 refl_n = ReflExponentOf(config);
+    const bool exact_power = !no_exact_pow && refl_power && !pv_half && !half_for_other &&
+                             refl_n >= 2 && (refl_n % 2) == 0 &&
+                             lighting.lut_rr.type.Value() == LutInput::NH;
     const bool ln_read = lut_reads(LutInput::LN);
     for (u32 light_index = 0; light_index < lighting.src_num; light_index++) {
         current_light = light_index;
@@ -2137,8 +2171,28 @@ void FragmentEmitter::Lighting() {
         }
         // A pre-normalised directional light's vector is the uniform itself: read from there
         // unless a LUT input (LN, SP) reads the parked copy.
+        // This light reads the SP input if another table does, or if its own spot table does.
+        const bool sp_read = no_spot_trim ? sp_read_any
+                                          : sp_read_others || (light.spot_atten_enable && spot_table_sp);
         const bool direct_lv = light_fast && DirectionPreNormalised(light) && !ln_read && !sp_read;
         const Vec4Loc lv = direct_lv ? position : light_vector;
+        const auto power_value = [&]() {
+            if (!exact_power) {
+                refl_power_value();
+                return;
+            }
+            LoadVec4(I1, nview);
+            LoadVec4(I0, lv);
+            e.Vec(VecOp::Add, {I1, 0x7}, {I1, XYZW}, {I0, XYZW}, Pred::None, true); // Hu
+            e.Dot({I0, 0x1}, {I1, XYZW}, {I1, XYZW}, false, Pred::None, true);       // Hu.Hu
+            e.Dot({I2, 0x1}, {normal.Pair(0), XYZW}, {I1, XYZW}, false, Pred::None, true); // N.Hu
+            e.Vec(VecOp::Mul, {I2, 0x1}, {I2, XXXX}, {I2, XXXX}, Pred::None, true);
+            e.Comp(CompOp::Rcp, {I0, 0x1}, {I0}, 0, Pred::None, true);
+            e.Vec(VecOp::Mul, {I0, 0x1}, {I2, XXXX}, {I0, XXXX}, Pred::None, true);  // (N.H)^2
+            e.Vec(VecOp::Min, {I0, 0x1}, {I0, XXXX}, ConstOne, Pred::None, true);
+            pow_i0x(refl_n / 2);
+            lut_scale(lighting.lut_rr);
+        };
         if (!direct_lv) {
             StoreVec4(light_vector, I0);
         }
@@ -2149,7 +2203,7 @@ void FragmentEmitter::Lighting() {
         // geometric factor.
         const bool geo0 = light.geometric_factor_0;
         const bool geo1 = light.geometric_factor_1;
-        if (needs_half) {
+        if (needs_half && !exact_power) {
             LoadVec4(I1, nview);
             e.Vec(VecOp::Add, {I1, 0x7}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
             e.Dot({I2, 0x1}, {I1, XYZW}, {I1, XYZW}, false, Pred::None, true);
@@ -2266,7 +2320,7 @@ void FragmentEmitter::Lighting() {
         const bool refl_direct = light_fast && refl_power && !rg && !rb && !d1_on;
         const bool refl_on = rr || rg || rb || (refl_power && !refl_direct);
         if (refl_direct) {
-            refl_power_value();
+            power_value();
         }
         if (refl_on) {
             if (rg) {
@@ -2280,7 +2334,7 @@ void FragmentEmitter::Lighting() {
             if (rr) {
                 lut_value(lighting.lut_rr, Sampler::ReflectRed, two_sided);
             } else if (refl_power) {
-                refl_power_value();
+                power_value();
             } else {
                 e.MoveInternal({I0, 0x1}, {Reg::C(2), XXXX}, Pred::None, true);
             }

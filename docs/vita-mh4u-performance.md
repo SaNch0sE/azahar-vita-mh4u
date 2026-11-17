@@ -865,3 +865,18 @@ arm-vita-eabi-addr2line on build-vita-rel/src/citra_vita/citra_vita gives the st
 ms, `pvhalf` 29.6-30.3 ms (~2.3 ms). Frames against the per-pixel half vector (dumpframe): mean
 difference 13.7/255, 23% of pixels over 24 - the ground's highlights shift across wide areas. Not
 an invisible change, so it stays an opt-in switch.
+
+**Two exact lighting trims (2026-11-17, slot 7, diag scenetime with tier2now):**
+- *Spot direction only where used* (`nospottrim` restores the old code): the spot table's enable
+  bit is always set, so every light carried and copied its spot direction; the table is only read
+  for a light with spot attenuation (MH4U's lights have none).
+- *The power form without the normalised half vector* (`noexactpow`): for an even exponent,
+  |N.H|^n = ((N.Hu)^2 / (Hu.Hu))^(n/2) with Hu = nview + L - no square root, no half vector
+  parked and reloaded; used when nothing else reads the half vector.
+Old code 32.9 / 32.8 ms, both trims 31.2 / 30.6 / 31.1 ms (~1.9 ms), each alone ~1 ms. Frames
+against the old code: mean difference 0.29/255, the changed pixels all on the animated characters
+(the two frames are moments apart); terrain identical.
+
+**Program cache versioning (F2):** programs.bin's version hashes the emitters, the shader
+generator, the PICA headers and gxm_program_epoch.h, no longer the whole of gxm_rasterizer.cpp,
+whose edits reset every player's cache for nothing. The epoch file says when to bump it.

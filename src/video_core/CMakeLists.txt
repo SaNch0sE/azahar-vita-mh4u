@@ -138,6 +138,7 @@ if (ENABLE_GXM)
         renderer_gxm/gxm_shader_tier.h
         renderer_gxm/gxm_shader_util.cpp
         renderer_gxm/gxm_shader_util.h
+        renderer_gxm/gxm_program_epoch.h
         renderer_gxm/usse/fixed_usse_gen.cpp
         renderer_gxm/usse/fixed_usse_gen.h
         renderer_gxm/usse/fs_usse_gen.cpp
@@ -165,7 +166,7 @@ if (ENABLE_GXM)
     )
     list(SORT _gxm_program_sources)
     list(APPEND _gxm_program_sources
-        ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/gxm_rasterizer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/gxm_program_epoch.h
         ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/gxm_shader_tier.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/renderer_gxm/gxm_program_disk_cache.cpp
     )
