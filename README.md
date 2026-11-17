@@ -93,13 +93,16 @@ from a fresh `ux0:data/mh4u`, and the update-based build is the one played most.
 
 Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 
-- **START menu, third page, Mod Settings, Display** (do this once; it is kept in your save):
-  - **FPS: 30**. Required: a mod from the web installer starts with FPS off, and the game then
-    tries to run at 60, which the Vita can't keep up, and slows down. The mod's own 30 fps cap
-    keeps the game at full speed even when the GPU is behind.
-  - **3D Mode**: off, with no dithering.
-  - **Bloom and Depth Blur**: off.
+- The game is capped at 30 fps from the first start by the port's cheat file (the **30 FPS Cap**
+  code, on by default). Without a cap the game tries to run at 60, which the Vita can't keep up.
+- Once you reach the START menu (after the prologue): third page, **Mod Settings**, **Display**.
+  This is kept in your save:
   - **Aspect ratio**: 16:9, if you made the mod with it.
+  - **FPS: 30** (recommended, optional). Normally it's the same as the cheat, but if the GPU
+    falls behind, the mod's cap keeps the game at full speed and only skips frames, where the
+    cheat lets the game itself slow down. Both caps on together is fine.
+  - 3D Mode off with no dithering, and Bloom and Depth Blur off. These are the web installer's
+    defaults; check them if you built the mod another way.
 - **Select + Start** opens the port's pause menu. Under **Settings**:
   - **Picture shape**: **3DS (5:3)** keeps the game's proportions, with bars at the sides.
     **Wide (16:9)** fills the screen: with a 5:3 mod it stretches the picture sideways, and with
@@ -111,7 +114,7 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 | --- | --- |
 | `roms/` | your game (and the update `.cia` until it is installed) |
 | `load/mods/0004000000126300/` | the Heavenfall mod |
-| `cheats/0004000000126300.txt` | a cheat file (3D and dithering off, bloom off, a 30 fps cap), copied from the app on first start with every code **off**: the mod's Display settings above do the same job better. Your own edits are kept. Its codes only act on a mod built from the v1.1 update's executable. |
+| `cheats/0004000000126300.txt` | the cheat file, copied from the app on first start: **30 FPS Cap** on (for the base game's and the update's executable, each behind a version check), and 3D, dithering and bloom codes off (update executable only; the mod does them). Your own edits are kept. |
 | `sdmc/`, `nand/`, `sysdata/` | the game's saves, the installed update, system data |
 | `states/` | save states (pause menu, **Save states**, slots 1-9) |
 | `video.txt` | the pause menu's picture settings |
