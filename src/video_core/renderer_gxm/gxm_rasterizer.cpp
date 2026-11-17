@@ -1776,8 +1776,17 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             const auto& colour = regs.lighting.light[fs_config.lighting.lights[i].num].specular_1;
             specular_black = specular_black && colour.r == 0 && colour.g == 0 && colour.b == 0;
         }
+        // Green and blue count only where the lighting configuration has them (as the
+        // emitter's LightingLutEnabled): MH4U's materials are Config1 and leave their enable
+        // bits set, which kept every lit program on the lookup (2026-11-17, slot 7: 36.6 ms).
+        using LRegs = Pica::LightingRegs;
+        const auto lcfg = fs_config.lighting.config.Value();
         const bool only_red =
-            !fs_config.lighting.lut_rg.enable && !fs_config.lighting.lut_rb.enable;
+            !(fs_config.lighting.lut_rg.enable &&
+              LRegs::IsLightingSamplerSupported(lcfg, LRegs::LightingSampler::ReflectGreen)) &&
+            !(fs_config.lighting.lut_rb.enable &&
+              LRegs::IsLightingSamplerSupported(lcfg, LRegs::LightingSampler::ReflectBlue));
+        const bool rr_nh = fs_config.lighting.lut_rr.type == LRegs::LightingLutInput::NH;
         const ReflMode fit = static_cast<ReflMode>(refl_fit_mode);
         if (force_lookup) {
             mode = ReflMode::Lookup;
@@ -1786,7 +1795,8 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         } else if (!no_skip && specular_black) {
             mode = ReflMode::Dead;
         } else if (only_red && (pica.lighting.lut_dirty & (1u << 6)) == 0) {
-            if (fit == ReflMode::Power && !no_pow && fs_config.lighting.lut_rr.abs_input) {
+            if (fit == ReflMode::Power && !no_pow && fs_config.lighting.lut_rr.abs_input &&
+                rr_nh) {
                 mode = ReflMode::Power;
                 n = refl_fit_n;
             } else if (fit == ReflMode::One || (fit == ReflMode::Dead && !no_skip)) {
@@ -1794,6 +1804,44 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             }
         }
         Usse::SetReflMode(fs_config, mode, n);
+        // logreflwhy (diag): per distinct case, why the reflection-red evaluation is what it
+        // is, to ux0:data/mh4u/reflwhy.txt.
+        static const bool log_why = GxmFlag("logreflwhy");
+        if (log_why) {
+            using LR = Pica::LightingRegs;
+            const auto cfg = fs_config.lighting.config.Value();
+            const bool dirty = (pica.lighting.lut_dirty & (1u << 6)) != 0;
+            const u64 key = (static_cast<u64>(cfg) << 0) |
+                            (static_cast<u64>(fs_config.lighting.lut_rr.abs_input.Value()) << 4) |
+                            (static_cast<u64>(fs_config.lighting.lut_rr.type.Value()) << 5) |
+                            (static_cast<u64>(fs_config.lighting.lut_rg.enable.Value()) << 8) |
+                            (static_cast<u64>(fs_config.lighting.lut_rb.enable.Value()) << 9) |
+                            (static_cast<u64>(dirty) << 10) | (static_cast<u64>(fit) << 11) |
+                            (static_cast<u64>(refl_fit_n) << 14) |
+                            (static_cast<u64>(specular_black) << 22) |
+                            (static_cast<u64>(mode) << 23) |
+                            (static_cast<u64>(fs_config.lighting.src_num.Value()) << 26);
+            static std::set<u64> seen;
+            if (seen.insert(key).second) {
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/reflwhy.txt", "a")) {
+                    std::fprintf(
+                        f,
+                        "config %u lights %u rr abs %u type %u | rg %u rb %u supported %u | "
+                        "only_red %u dirty %u | fit %u n %u | spec1black %u -> mode %u n %u\n",
+                        static_cast<u32>(cfg), fs_config.lighting.src_num.Value(),
+                        fs_config.lighting.lut_rr.abs_input.Value(),
+                        static_cast<u32>(fs_config.lighting.lut_rr.type.Value()),
+                        fs_config.lighting.lut_rg.enable.Value(),
+                        fs_config.lighting.lut_rb.enable.Value(),
+                        LR::IsLightingSamplerSupported(cfg, LR::LightingSampler::ReflectGreen)
+                            ? 1u
+                            : 0u,
+                        only_red ? 1u : 0u, dirty ? 1u : 0u, static_cast<u32>(fit), refl_fit_n,
+                        specular_black ? 1u : 0u, static_cast<u32>(mode), n);
+                    std::fclose(f);
+                }
+            }
+        }
         // loglights (diag): each distinct per-light colour set of lit draws.
         static const bool log_lights = GxmFlag("loglights");
         if (log_lights) {

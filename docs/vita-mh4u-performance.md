@@ -827,3 +827,14 @@ and `nofogstrip` were missing from the program cache key, so readings with them 
 used the normal cached programs; they are keyed now (FogDiagKeyBits). The spot is live gameplay
 (monsters attack, the camera moves, menus open), so A/B readings there swing by 5 ms; a still
 save state is needed before pricing alpha test and shadows there.
+
+**Power highlights were never selected (fixed 2026-11-17).** `BindPrograms` judged "red only"
+from the raw enable bits of the green and blue reflection tables; MH4U's materials are lighting
+Config1, where those tables do not exist, and leave the bits set - so every lit program took the
+LUT lookup (`logreflwhy`, new: `config 1 ... rg 1 rb 1 supported 0 | only_red 0 | fit 1 n 16 ->
+mode 0`). Now green/blue count only where the configuration supports them (as the emitter's
+LightingLutEnabled), and Power also requires the table's input to be N.H (Fable's review).
+Slot 7 (hunting area), diag scenetime: 36.7 -> 30.6 ms (`refllut`, the old path: 36.7/35.4;
+`reflone`: 27.8). Frames (dumpframe) against the lookup: mean difference 0.20/255, 0.18% of
+pixels over 24 (the stats overlay). Earlier notes that "the power chain costs ~6 ms, unchanged by
+pvhalf" measured lookup programs; pvhalf now becomes eligible and is worth re-measuring.
