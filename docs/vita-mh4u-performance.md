@@ -846,3 +846,14 @@ it logged "code differs, not patched" and the intro was back to the slow polling
 0x698 bytes lower in v1.0 (branch 0x9680CC, return 0x968114, the loop's return 0x963AE4; byte
 match on 24 bytes around the branch and 32 around the caller); both are tried, each checked word
 by word. Same for the audio filter HLE (0x1A4 lower) and the 30 fps cheat (pointer 8 bytes lower).
+
+**Crash: "No more processes" in an FS read (core dump 2026-11-17 19:38).** The emulation thread
+aborted: std::terminate from Service::FS::File::Read, the exception a std::system_error, code 11
+(EAGAIN, newlib's "No more processes"), found from its typeinfo pointer in the dump. Reads of
+64 KiB and more go through HLERequestContext::RunAsync, which starts a thread per call with
+std::async; when the Vita could not create one (most likely no memory left in the partition for
+its stack) the throw was outside every handler. Now RunAsync catches it and runs the work on the
+emulation thread, as deterministic_async_operations does. Better still (not done): one long-lived
+FS worker instead of a thread per read - no creation cost, no stack per read, and no failure mode.
+Tooling: the dump is gzip'd ELF; a stdlib reader (thread notes, registers, stack scan) plus
+arm-vita-eabi-addr2line on build-vita-rel/src/citra_vita/citra_vita gives the stack.

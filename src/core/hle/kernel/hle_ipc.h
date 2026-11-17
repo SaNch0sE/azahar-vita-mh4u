@@ -304,31 +304,7 @@ public:
     void RunAsync(AsyncFunctor async_section, ResultFunctor result_function,
                   bool really_async = true) {
 
-        if (!Settings::values.deterministic_async_operations && really_async) {
-            kernel.ReportAsyncState(true);
-            this->SleepClientThread(
-                "RunAsync", std::chrono::nanoseconds(-1),
-                std::make_shared<AsyncWakeUpCallback<ResultFunctor>>(
-                    kernel, result_function,
-                    std::move(std::async(std::launch::async, [this, async_section] {
-                        s64 sleep_for = 0;
-                        try {
-                            sleep_for = async_section(*this);
-                        } catch (const std::exception& e) {
-                            // The future captures a throw and nothing ever reads it back: the
-                            // wake below would be skipped and the client would sleep forever
-                            // on nanoseconds(-1), silently. A std::bad_alloc inside an FS read
-                            // stranded the guest exactly that way on the Vita, whose heap runs
-                            // within a few megabytes of its ceiling.
-                            LOG_CRITICAL(Kernel, "async section threw '{}'; waking the client",
-                                         e.what());
-                        }
-                        // WakeAfterDelay treats -1 as "schedule nothing", which here would
-                        // also mean sleeping forever.
-                        this->thread->WakeAfterDelay(std::max<s64>(sleep_for, 0), true);
-                    }))));
-
-        } else {
+        const auto run_here = [&] {
             s64 sleep_for = async_section(*this);
             if (sleep_for > 0) {
                 kernel.ReportAsyncState(true);
@@ -339,6 +315,45 @@ public:
             } else {
                 result_function(*this);
             }
+        };
+        if (!Settings::values.deterministic_async_operations && really_async) {
+            // std::async starts a thread per call. On the Vita that can fail - EAGAIN, "No more
+            // processes", when there is no memory left for another thread's stack - and the
+            // throw, outside any handler, ended the app (core dump 2026-11-17, an FS read). Then
+            // the work is done here, synchronously, as with deterministic_async_operations.
+            std::future<void> future;
+            try {
+                future = std::async(std::launch::async, [this, async_section] {
+                    s64 sleep_for = 0;
+                    try {
+                        sleep_for = async_section(*this);
+                    } catch (const std::exception& e) {
+                        // The future captures a throw and nothing ever reads it back: the
+                        // wake below would be skipped and the client would sleep forever
+                        // on nanoseconds(-1), silently. A std::bad_alloc inside an FS read
+                        // stranded the guest exactly that way on the Vita, whose heap runs
+                        // within a few megabytes of its ceiling.
+                        LOG_CRITICAL(Kernel, "async section threw '{}'; waking the client",
+                                     e.what());
+                    }
+                    // WakeAfterDelay treats -1 as "schedule nothing", which here would
+                    // also mean sleeping forever.
+                    this->thread->WakeAfterDelay(std::max<s64>(sleep_for, 0), true);
+                });
+            } catch (const std::system_error& e) {
+                LOG_WARNING(Kernel, "RunAsync: no thread for the async section ({}), running it "
+                                    "here",
+                            e.what());
+                run_here();
+                return;
+            }
+            kernel.ReportAsyncState(true);
+            this->SleepClientThread(
+                "RunAsync", std::chrono::nanoseconds(-1),
+                std::make_shared<AsyncWakeUpCallback<ResultFunctor>>(kernel, result_function,
+                                                                     std::move(future)));
+        } else {
+            run_here();
         }
     }
 
