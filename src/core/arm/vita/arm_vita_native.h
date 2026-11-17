@@ -195,6 +195,7 @@ private:
     std::array<u32, 4> fast_handles{};
     /// MH4U's movie decoder poll (Mh4uPatchFmvPoll): the process it was checked for.
     const void* fmv_patch_process = nullptr;
+    u32 fmv_shift = 0; ///< patched copy's offset from the v1.1 addresses (v1.0: -0x698)
     void Mh4uPatchFmvPoll();
     bool Mh4uFmvPollSvc();
 };

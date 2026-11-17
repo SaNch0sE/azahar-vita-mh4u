@@ -838,3 +838,11 @@ Slot 7 (hunting area), diag scenetime: 36.7 -> 30.6 ms (`refllut`, the old path:
 `reflone`: 27.8). Frames (dumpframe) against the lookup: mean difference 0.20/255, 0.18% of
 pixels over 24 (the stats overlay). Earlier notes that "the power chain costs ~6 ms, unchanged by
 pvhalf" measured lookup programs; pvhalf now becomes eligible and is worth re-measuring.
+
+**Intro movie on the v1.0 executable (2026-11-17).** The movie-decoder poll patch
+(Mh4uPatchFmvPoll) checked the v1.1 addresses only, so with a Heavenfall mod from the web
+installer (built from the base game, so the game runs v1.0 code even with the update installed)
+it logged "code differs, not patched" and the intro was back to the slow polling. The same code is
+0x698 bytes lower in v1.0 (branch 0x9680CC, return 0x968114, the loop's return 0x963AE4; byte
+match on 24 bytes around the branch and 32 around the caller); both are tried, each checked word
+by word. Same for the audio filter HLE (0x1A4 lower) and the 30 fps cheat (pointer 8 bytes lower).

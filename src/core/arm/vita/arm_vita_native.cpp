@@ -85,6 +85,9 @@ constexpr u32 Mh4uFmvPollBranch = 0x00968764;
 constexpr u32 Mh4uFmvPollReturn = 0x009687AC;
 constexpr u32 Mh4uFmvSvc = 0xF0;
 constexpr u32 Mh4uFmvLoopReturn = 0x0096417C;
+/// The same code in the game without its update (v1.0, which the Heavenfall web installer's mod
+/// is built from): 0x698 bytes lower. Each candidate is checked word by word before patching.
+constexpr std::array<u32, 2> Mh4uFmvShifts{0u, 0u - 0x698u};
 
 } // Anonymous namespace
 
@@ -664,19 +667,30 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
         {Mh4uFmvPollBranch + 4, 0xE5940080},  {Mh4uFmvPollReturn, 0xE28DD01C},
         {Mh4uFmvPollReturn + 4, 0xE8BD8FF0},
     }};
-    for (const auto& [addr, word] : expected) {
-        if (!memory.IsValidVirtualAddress(*process, addr) || memory.Read32(addr) != word) {
-            LOG_INFO(Core_ARM11, "MH4U movie poll: code differs, not patched");
-            return;
+    for (const u32 shift : Mh4uFmvShifts) {
+        bool match = true;
+        for (const auto& [addr, word] : expected) {
+            if (!memory.IsValidVirtualAddress(*process, addr + shift) ||
+                memory.Read32(addr + shift) != word) {
+                match = false;
+                break;
+            }
         }
+        if (!match) {
+            continue;
+        }
+        fmv_shift = shift;
+        const u32 branch = Mh4uFmvPollBranch + shift;
+        memory.Write32(branch, 0xEF000000u | Mh4uFmvSvc);
+        map->SyncCode(branch & ~0xFFFu, 0x1000);
+        LOG_INFO(Core_ARM11, "MH4U movie poll at {:08X}: sleeps while idle", branch);
+        return;
     }
-    memory.Write32(Mh4uFmvPollBranch, 0xEF000000u | Mh4uFmvSvc);
-    map->SyncCode(Mh4uFmvPollBranch & ~0xFFFu, 0x1000);
-    LOG_INFO(Core_ARM11, "MH4U movie poll at {:08X}: sleeps while idle", Mh4uFmvPollBranch);
+    LOG_INFO(Core_ARM11, "MH4U movie poll: code differs, not patched");
 }
 
 bool ARM_VitaNative::Mh4uFmvPollSvc() {
-    if (context.r[15] != Mh4uFmvPollBranch + 4 || fmv_patch_process == nullptr) {
+    if (context.r[15] != Mh4uFmvPollBranch + fmv_shift + 4 || fmv_patch_process == nullptr) {
         return false;
     }
     constexpr u32 CarryFlag = 1u << 29;
@@ -686,8 +700,8 @@ bool ARM_VitaNative::Mh4uFmvPollSvc() {
     // Taken: return from the method (0x9687AC), asleep first - but only when called from the
     // thread's own loop (return address 0x96417C at sp+60), not from a caller that expects it
     // back at once. r0/r1 are dead there.
-    context.r[15] = Mh4uFmvPollReturn;
-    if (memory.Read32(context.r[13] + 60) != Mh4uFmvLoopReturn) {
+    context.r[15] = Mh4uFmvPollReturn + fmv_shift;
+    if (memory.Read32(context.r[13] + 60) != Mh4uFmvLoopReturn + fmv_shift) {
         return true;
     }
     static const u32 sleep_ns = GxmRenderer::GxmFlag("fmvsleep2") ? 2'000'000 : 1'000'000;
