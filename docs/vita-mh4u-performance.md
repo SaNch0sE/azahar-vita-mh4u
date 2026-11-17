@@ -795,3 +795,11 @@ and joins the run in the recording (as native glyph draws join the deferred run)
 full draw setup. Village, slot 4 (render-thread bound): off 25.9 / 26.5, on 26.0 / 26.1 fps -
 within noise. Note the village spot itself is ~26-27 in every build tried (this morning's
 eaae5bd05: 26.5 / 27.3; the user sees 27-30 across Val Habar, lowest where most NPCs are).
+
+Sharp HUD text under later UI (2026-11-17, slot 5: the Item Box opening over the Item Pouch
+left the pouch's text on top): replayed text is drawn last, above anything the game drew over
+it. Each recorded run keeps its extent; a later non-text draw on the 2D layer is checked against
+the runs still pending, and any it overlaps is drawn natively right there, before it (in order,
+so covered as on hardware; that text loses the sharpening). Shipped draws (no extent known) emit
+all pending runs. Village counters (hudtextlog): 4 runs, ~40 checks, 1 native run a frame.
+Village fps with the check: on 25.7 / 25.8, off 26.5 (within the scene's run-to-run spread).

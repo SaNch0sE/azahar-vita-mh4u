@@ -325,6 +325,10 @@ RasterizerGxm::~RasterizerGxm() {
         if (identity_indices != nullptr) {
             Device().free_block(identity_indices);
         }
+        if (hud_emit_mem != nullptr) {
+            Device().free_block(hud_emit_mem);
+            hud_emit_mem = nullptr;
+        }
         if (white_mem != nullptr) {
             Device().free_block(white_mem);
         }
@@ -4033,6 +4037,29 @@ void RasterizerGxm::DrawTriangles() {
     // text draw before it, whose run it then joins in the recording (as native glyph draws
     // join the deferred run). Nothing else may repeat a recorded draw: it was never drawn.
     const bool text_draw = HudTextDraw();
+    if (!text_draw && hud_pending != 0 && hud_phase &&
+        regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() == hud_target) {
+        // This draw's extent, from its triangles in the ring.
+        float extent[4] = {2.0f, -2.0f, 2.0f, -2.0f};
+        for (const auto& range : pending_ring_ranges) {
+            const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+                vertex_ring.base +
+                static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+            for (u32 i = 0; i < range.count; i++) {
+                const float w = v[i].pos.w.ToFloat32();
+                if (w == 0.0f) {
+                    continue;
+                }
+                const float x = v[i].pos.x.ToFloat32() / w, y = v[i].pos.y.ToFloat32() / w;
+                extent[0] = std::min(extent[0], x);
+                extent[1] = std::max(extent[1], x);
+                extent[2] = std::min(extent[2], y);
+                extent[3] = std::max(extent[3], y);
+            }
+        }
+        hud_stat_scans++;
+        HudCover(pending_ring_ranges.empty() ? nullptr : extent);
+    }
     if (text_draw != hud_last_recorded) {
         repeat_ok = false;
     }
@@ -4228,11 +4255,13 @@ void RasterizerGxm::RecordHudDraw() {
     }
     if (!hud_cur.records.empty()) {
         HudRecord& last = hud_cur.records.back();
-        if (last.pipeline == pipeline && last.vertex_offset + last.vertex_count == first_vertex &&
+        if (!last.emitted && last.pipeline == pipeline &&
+            last.vertex_offset + last.vertex_count == first_vertex &&
             last.uniform_bytes == bytes &&
             std::memcmp(last.textures.data(), textures.data(), sizeof(textures)) == 0 &&
             std::memcmp(hud_cur.uniforms.data() + last.uniform_offset, uni, bytes) == 0) {
             last.vertex_count += count;
+            GrowHudExtent(last, first_vertex, count);
             return;
         }
     }
@@ -4244,7 +4273,109 @@ void RasterizerGxm::RecordHudDraw() {
     hud_cur.uniforms.insert(hud_cur.uniforms.end(), uni, uni + bytes);
     rec.vertex_offset = first_vertex;
     rec.vertex_count = count;
+    rec.x0 = rec.y0 = 2.0f;
+    rec.x1 = rec.y1 = -2.0f;
+    GrowHudExtent(rec, first_vertex, count);
     hud_cur.records.push_back(rec);
+    hud_pending++;
+    hud_stat_runs++;
+}
+
+void RasterizerGxm::GrowHudExtent(HudRecord& rec, u32 first, u32 count) {
+    for (u32 i = first; i < first + count; i++) {
+        const auto& p = hud_cur.vertices[i].pos;
+        const float w = p.w.ToFloat32();
+        if (w == 0.0f) {
+            continue;
+        }
+        const float x = p.x.ToFloat32() / w, y = p.y.ToFloat32() / w;
+        rec.x0 = std::min(rec.x0, x);
+        rec.x1 = std::max(rec.x1, x);
+        rec.y0 = std::min(rec.y0, y);
+        rec.y1 = std::max(rec.y1, y);
+    }
+}
+
+void RasterizerGxm::HudCover(const float* extent) {
+    if (hud_pending == 0) {
+        return;
+    }
+    bool any = false;
+    for (HudRecord& rec : hud_cur.records) {
+        if (rec.emitted) {
+            continue;
+        }
+        if (extent != nullptr && (extent[1] < rec.x0 || extent[0] > rec.x1 ||
+                                  extent[3] < rec.y0 || extent[2] > rec.y1)) {
+            continue;
+        }
+        if (!any) {
+            FlushDeferredDraws();
+            any = true;
+        }
+        hud_stat_emitted++;
+        EmitHudNative(rec);
+    }
+    if (any) {
+        // The context no longer holds what the rasterizer bound: everything rebinds.
+        pipeline_cache->InvalidateBinding();
+        texture_binding_valid.reset();
+        uniform_pipeline = nullptr;
+        repeat_ok = false;
+        begin_repeat_ok = false;
+        hud_last_recorded = false;
+    }
+}
+
+void RasterizerGxm::EmitHudNative(HudRecord& rec) {
+    rec.emitted = true;
+    hud_pending--;
+    // Drawn where it was recorded: the open scene on the 2D layer's target, whose viewport
+    // and state are the layer's (the draws before were the layer's too). Without that scene
+    // the run is dropped rather than drawn into something else.
+    if (!in_scene || scene_fb == nullptr || !scene_fb->HasColor() ||
+        res_cache.GetSurface(scene_fb->color_id).addr > hud_target) {
+        return;
+    }
+    SceGxmContext* context = Device().context;
+    const u32 n = std::min<u32>(rec.vertex_count, MaxVerticesPerDraw);
+    if (hud_emit_mem == nullptr) {
+        hud_emit_mem = static_cast<u8*>(Device().alloc_mapped(HudEmitSlotBytes * 3));
+        if (hud_emit_mem == nullptr) {
+            return;
+        }
+    }
+    if (hud_emit_frame != frame_index) {
+        hud_emit_frame = frame_index;
+        hud_emit_used = 0;
+    }
+    const u32 bytes = n * static_cast<u32>(sizeof(Pica::OutputVertex));
+    if (hud_emit_used + bytes > HudEmitSlotBytes) {
+        return;
+    }
+    auto* verts = reinterpret_cast<Pica::OutputVertex*>(
+        hud_emit_mem + (frame_index % 3) * HudEmitSlotBytes + hud_emit_used);
+    hud_emit_used += bytes;
+    std::memcpy(verts, hud_cur.vertices.data() + rec.vertex_offset, n * sizeof(Pica::OutputVertex));
+    sceGxmSetVertexProgram(context, rec.pipeline->VertexProgram());
+    sceGxmSetFragmentProgram(context, rec.pipeline->FragmentProgram());
+    for (u32 u = 0; u < 3; u++) {
+        sceGxmSetFragmentTexture(context, u, &rec.textures[u]);
+    }
+    void* vbuf = nullptr;
+    if (sceGxmReserveVertexDefaultUniformBuffer(context, &vbuf) >= 0 && vbuf != nullptr) {
+        const float flip = vs_data.flip_viewport ? 1.0f : 0.0f;
+        SetUniformF(vbuf, vs_flip_viewport, &flip, 1, "vs");
+        SetUniformF(vbuf, vs_depth_scale, &fs_data.depth_scale, 1, "vs");
+        SetUniformF(vbuf, vs_depth_offset, &fs_data.depth_offset, 1, "vs");
+    }
+    void* fbuf = nullptr;
+    if (rec.uniform_bytes != 0 && sceGxmReserveFragmentDefaultUniformBuffer(context, &fbuf) >= 0 &&
+        fbuf != nullptr) {
+        std::memcpy(fbuf, hud_cur.uniforms.data() + rec.uniform_offset, rec.uniform_bytes);
+    }
+    sceGxmSetVertexStream(context, 0, verts);
+    sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, identity_indices, n);
 }
 
 void RasterizerGxm::ReplayHud(u32 addr, float x, float y, float w, float h) {
@@ -4271,6 +4402,9 @@ void RasterizerGxm::ReplayHud(u32 addr, float x, float y, float w, float h) {
     sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
     sceGxmSetBackDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
     for (const HudRecord& rec : frame->records) {
+        if (rec.emitted) {
+            continue;
+        }
         const u32 n = std::min<u32>(rec.vertex_count, MaxVerticesPerDraw);
         auto* verts = static_cast<Pica::OutputVertex*>(
             Device().frame_alloc(n * sizeof(Pica::OutputVertex), 16));
@@ -4664,6 +4798,10 @@ bool DeclineHw(u32 reason) {
 
 bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
     draw_epoch++;
+    if (hud_pending != 0 && hud_phase &&
+        regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() == hud_target) {
+        HudCover(nullptr); // its extent is not known here: all pending text first
+    }
     using Topology = Pica::PipelineRegs::TriangleTopology;
     static const bool software_only = GxmFlag("nohwvs");
     if (software_only || regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::No ||
@@ -5663,6 +5801,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         }
         hud_cur.Clear();
         hud_last_recorded = false;
+        hud_pending = 0;
     }
     const bool done = EnsureResources() && res_cache.AccelerateDisplayTransfer(config);
     if (LogtexActive()) {
@@ -5823,15 +5962,17 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
 void RasterizerGxm::EndFrame() {
     hud_phase = false;
     hud_last_recorded = false;
+    hud_pending = 0;
     static const bool hud_count_log = GxmFlag("hudtextlog");
     if (hud_count_log && frame_index % 120 == 0) {
         if (std::FILE* f = std::fopen(VITA_DATA_DIR "/hudtextlog.txt", "a")) {
-            std::fprintf(f, "frame %u: text draws decided %u recorded %u, ready %u\n", frame_index,
-                         hud_stat_decided, hud_stat_recorded,
-                         static_cast<u32>(hud_cur.records.size()));
+            std::fprintf(f, "frame %u: text draws decided %u recorded %u, runs %u scans %u emitted %u\n",
+                         frame_index, hud_stat_decided, hud_stat_recorded, hud_stat_runs,
+                         hud_stat_scans, hud_stat_emitted);
             std::fclose(f);
         }
         hud_stat_decided = hud_stat_recorded = 0;
+        hud_stat_runs = hud_stat_scans = hud_stat_emitted = 0;
     }
     hud_cur.Clear();
     FlushDeferredDraws();

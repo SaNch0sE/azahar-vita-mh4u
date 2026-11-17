@@ -643,6 +643,8 @@ private:
         std::array<SceGxmTexture, 3> textures{};
         u32 uniform_offset{}, uniform_bytes{};
         u32 vertex_offset{}, vertex_count{};
+        float x0{}, y0{}, x1{}, y1{}; ///< the run's extent in the layer's NDC
+        bool emitted{};               ///< drawn natively after all (covered), not replayed
     };
     /// A frame's text: the runs and the buffers they index (capacity kept across frames).
     struct HudFrame {
@@ -663,7 +665,20 @@ private:
     std::array<HudFrame, 4> hud_ready{}; ///< by display framebuffer (addr)
     u32 hud_ready_next = 0;
     u32 hud_stat_decided = 0, hud_stat_recorded = 0;
+    u32 hud_stat_runs = 0, hud_stat_scans = 0, hud_stat_emitted = 0;
     bool hud_last_recorded = false; ///< the last full-path draw was recorded, not drawn
+    u32 hud_pending = 0;            ///< recorded runs of this frame not yet emitted natively
+    /// GPU memory for text drawn natively after all: three slots used frame by frame, so a
+    /// slot is rewritten only once the frame that read it two frames ago is done.
+    u8* hud_emit_mem = nullptr;
+    u32 hud_emit_used = 0;
+    u32 hud_emit_frame = ~0u;
+    static constexpr u32 HudEmitSlotBytes = 2048 * sizeof(Pica::OutputVertex);
+    /// A 2D-layer draw that is not text is about to be made: recorded text it would cover
+    /// (its NDC extent; null: unknown, so all) is drawn natively first, keeping the order.
+    void HudCover(const float* extent);
+    void EmitHudNative(HudRecord& rec);
+    void GrowHudExtent(HudRecord& rec, u32 first, u32 count);
     void* last_fragment_uniforms{};             ///< the last reserved fragment buffer
     void ReplayHud(u32 addr, float x, float y, float w, float h);
     static bool HudTextOn();
