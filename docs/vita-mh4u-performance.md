@@ -786,3 +786,12 @@ Village (user's slot 4, Val Habar with the minimap): render-thread bound (GpuThr
 speed 84-90%). The first Sharp HUD text bypassed the draw-merging fast paths for the whole 2D
 layer: 26.5 -> 23.3 fps there. Now only the text draws (the A4 font in the layer,
 `HudTextDraw`) take the full path, and nothing repeats a recorded draw: 25.7 off, 24.9 on.
+
+Sharp HUD text made cheap (2026-11-17): the frame's text goes into pooled buffers (vertices,
+uniforms; four reusable framebuffer slots, swapped at the display transfer so no allocation per
+draw or frame), consecutive text draws with the same pipeline, textures and uniforms are merged
+into one run, and a text draw that repeats the recorded one before it takes the cheap repeat path
+and joins the run in the recording (as native glyph draws join the deferred run) instead of the
+full draw setup. Village, slot 4 (render-thread bound): off 25.9 / 26.5, on 26.0 / 26.1 fps -
+within noise. Note the village spot itself is ~26-27 in every build tried (this morning's
+eaae5bd05: 26.5 / 27.3; the user sees 27-30 across Val Habar, lowest where most NPCs are).

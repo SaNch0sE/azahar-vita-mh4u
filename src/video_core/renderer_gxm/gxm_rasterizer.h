@@ -636,16 +636,34 @@ private:
     u32 hud_target = 0;
     u32 hud_ordinal = 0;
     /// HUD text at screen resolution (`hudtext`, ReplayHudText): one recorded text draw.
+    /// One run of recorded text draws sharing a pipeline, textures and uniforms: its
+    /// uniforms and triangles are ranges of the frame's pooled buffers.
     struct HudRecord {
         const Pipeline* pipeline{};
         std::array<SceGxmTexture, 3> textures{};
-        std::vector<u8> fragment_uniforms;
-        std::vector<Pica::OutputVertex> vertices;
+        u32 uniform_offset{}, uniform_bytes{};
+        u32 vertex_offset{}, vertex_count{};
     };
-    bool hud_record_draw = false;               ///< the current draw is recorded, not drawn
+    /// A frame's text: the runs and the buffers they index (capacity kept across frames).
+    struct HudFrame {
+        u32 addr{};
+        bool valid{};
+        std::vector<HudRecord> records;
+        std::vector<Pica::OutputVertex> vertices;
+        std::vector<u8> uniforms;
+        void Clear() {
+            records.clear();
+            vertices.clear();
+            uniforms.clear();
+            valid = false;
+        }
+    };
+    bool hud_record_draw = false;     ///< the current draw is recorded, not drawn
+    HudFrame hud_cur;                 ///< this frame's, until its display transfer
+    std::array<HudFrame, 4> hud_ready{}; ///< by display framebuffer (addr)
+    u32 hud_ready_next = 0;
     u32 hud_stat_decided = 0, hud_stat_recorded = 0;
-    std::vector<HudRecord> hud_recording;       ///< this frame's, until its display transfer
-    std::unordered_map<u32, std::vector<HudRecord>> hud_ready; ///< by display framebuffer
+    bool hud_last_recorded = false; ///< the last full-path draw was recorded, not drawn
     void* last_fragment_uniforms{};             ///< the last reserved fragment buffer
     void ReplayHud(u32 addr, float x, float y, float w, float h);
     static bool HudTextOn();

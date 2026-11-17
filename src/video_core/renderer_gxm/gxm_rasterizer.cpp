@@ -4029,12 +4029,37 @@ void RasterizerGxm::DrawTriangles() {
     }
     static const bool no_repeat = GxmFlag("norepeat");
     const u64 key = no_repeat ? 0 : RepeatKey();
-    if (HudTextDraw()) {
-        repeat_ok = false; // a text draw takes the full path, where it is recorded
+    // A text draw takes the full path, where it is recorded - unless it repeats the recorded
+    // text draw before it, whose run it then joins in the recording (as native glyph draws
+    // join the deferred run). Nothing else may repeat a recorded draw: it was never drawn.
+    const bool text_draw = HudTextDraw();
+    if (text_draw != hud_last_recorded) {
+        repeat_ok = false;
     }
     if (!no_repeat && repeat_ok && in_scene && vertex_batch.empty() && key == repeat_key &&
         draw_epoch == repeat_epoch && scene_seq == repeat_scene && !pica.lighting.lut_dirty &&
-        !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
+        !pica.fog.lut_dirty && !pica.proctex.table_dirty && text_draw && hud_last_recorded &&
+        !hud_cur.records.empty()) {
+        stat_draws++;
+        stat_repeat_draws++;
+        HudRecord& last = hud_cur.records.back();
+        for (const auto& range : pending_ring_ranges) {
+            const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+                vertex_ring.base +
+                static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+            if (last.vertex_offset + last.vertex_count == hud_cur.vertices.size() &&
+                hud_cur.vertices.size() + range.count <= 16384) {
+                hud_cur.vertices.insert(hud_cur.vertices.end(), v, v + range.count);
+                last.vertex_count += range.count;
+            }
+            ring_scene_pos = std::max(ring_scene_pos, range.end_pos);
+        }
+        pending_ring_ranges.clear();
+        return;
+    }
+    if (!no_repeat && repeat_ok && in_scene && vertex_batch.empty() && key == repeat_key &&
+        draw_epoch == repeat_epoch && scene_seq == repeat_scene && !pica.lighting.lut_dirty &&
+        !pica.fog.lut_dirty && !pica.proctex.table_dirty && !text_draw) {
         // The previous draw's state is still bound and still right: this draw's triangles
         // join the deferred run (FlushDeferredDraws), one draw for a whole line of glyphs.
         stat_draws++;
@@ -4137,8 +4162,9 @@ void RasterizerGxm::DrawTriangles() {
     ReleaseDraw(setup);
     // Now that everything this draw did is done (the release invalidates the drawn region,
     // and may itself have bumped the epoch), the next one may repeat it.
-    // Nothing may repeat a recorded text draw: its state was never drawn here.
-    repeat_ok = in_scene && !recorded;
+    // Only a text draw may repeat a recorded one (it joins the recording, above).
+    repeat_ok = in_scene;
+    hud_last_recorded = recorded && !hud_both;
     repeat_key = key;
     repeat_epoch = draw_epoch;
     repeat_scene = scene_seq;
@@ -4175,34 +4201,60 @@ bool RasterizerGxm::HudTextOn() {
 void RasterizerGxm::RecordHudDraw() {
     hud_stat_recorded++;
     // Everything the draw has bound: the pipeline, units 0-2, the fragment uniforms (the last
-    // reserved buffer, written for this pipeline), and its triangles from the ring.
+    // reserved buffer, written for this pipeline), and its triangles from the ring - into the
+    // frame's pooled buffers, merged into the previous run when the state is the same (the
+    // glyphs of a line share it), so the replay makes a few draws, not one per word.
     const Pipeline* pipeline = pipeline_cache->CurrentPipeline();
     if (pipeline == nullptr || pipeline->FragmentProgram() == nullptr ||
-        last_fragment_uniforms == nullptr || hud_recording.size() > 256) {
+        last_fragment_uniforms == nullptr || hud_cur.vertices.size() > 16384) {
         return;
     }
-    HudRecord rec;
-    rec.pipeline = pipeline;
+    std::array<SceGxmTexture, 3> textures;
     for (u32 u = 0; u < 3; u++) {
-        rec.textures[u] = texture_binding_valid[u] ? texture_bindings[u] : white_texture;
+        textures[u] = texture_binding_valid[u] ? texture_bindings[u] : white_texture;
     }
     const SceGxmProgram* fp = sceGxmFragmentProgramGetProgram(pipeline->FragmentProgram());
     const u32 bytes = fp != nullptr ? sceGxmProgramGetDefaultUniformBufferSize(fp) : 0;
-    rec.fragment_uniforms.assign(static_cast<const u8*>(last_fragment_uniforms),
-                                 static_cast<const u8*>(last_fragment_uniforms) + bytes);
+    const auto* uni = static_cast<const u8*>(last_fragment_uniforms);
+    const u32 first_vertex = static_cast<u32>(hud_cur.vertices.size());
     for (const auto& range : pending_ring_ranges) {
         const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
             vertex_ring.base + static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
-        rec.vertices.insert(rec.vertices.end(), v, v + range.count);
+        hud_cur.vertices.insert(hud_cur.vertices.end(), v, v + range.count);
     }
-    if (!rec.vertices.empty()) {
-        hud_recording.push_back(std::move(rec));
+    const u32 count = static_cast<u32>(hud_cur.vertices.size()) - first_vertex;
+    if (count == 0) {
+        return;
     }
+    if (!hud_cur.records.empty()) {
+        HudRecord& last = hud_cur.records.back();
+        if (last.pipeline == pipeline && last.vertex_offset + last.vertex_count == first_vertex &&
+            last.uniform_bytes == bytes &&
+            std::memcmp(last.textures.data(), textures.data(), sizeof(textures)) == 0 &&
+            std::memcmp(hud_cur.uniforms.data() + last.uniform_offset, uni, bytes) == 0) {
+            last.vertex_count += count;
+            return;
+        }
+    }
+    HudRecord rec;
+    rec.pipeline = pipeline;
+    rec.textures = textures;
+    rec.uniform_offset = static_cast<u32>(hud_cur.uniforms.size());
+    rec.uniform_bytes = bytes;
+    hud_cur.uniforms.insert(hud_cur.uniforms.end(), uni, uni + bytes);
+    rec.vertex_offset = first_vertex;
+    rec.vertex_count = count;
+    hud_cur.records.push_back(rec);
 }
 
 void RasterizerGxm::ReplayHud(u32 addr, float x, float y, float w, float h) {
-    const auto it = hud_ready.find(addr);
-    if (it == hud_ready.end() || it->second.empty() || !resources_ready) {
+    const HudFrame* frame = nullptr;
+    for (const HudFrame& f : hud_ready) {
+        if (f.valid && f.addr == addr) {
+            frame = &f;
+        }
+    }
+    if (frame == nullptr || frame->records.empty() || !resources_ready) {
         return;
     }
     SceGxmContext* context = Device().context;
@@ -4218,15 +4270,15 @@ void RasterizerGxm::ReplayHud(u32 addr, float x, float y, float w, float h) {
     sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
     sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
     sceGxmSetBackDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
-    for (const HudRecord& rec : it->second) {
-        const u32 n = static_cast<u32>(rec.vertices.size());
+    for (const HudRecord& rec : frame->records) {
+        const u32 n = std::min<u32>(rec.vertex_count, MaxVerticesPerDraw);
         auto* verts = static_cast<Pica::OutputVertex*>(
             Device().frame_alloc(n * sizeof(Pica::OutputVertex), 16));
         if (verts == nullptr) {
             break;
         }
         for (u32 i = 0; i < n; i++) {
-            Pica::OutputVertex v = rec.vertices[i];
+            Pica::OutputVertex v = frame->vertices[rec.vertex_offset + i];
             const float pw = v.pos.w.ToFloat32();
             const float nx = v.pos.x.ToFloat32() / pw, ny = v.pos.y.ToFloat32() / pw;
             static const float shift = GxmFlag("dbghudshift") ? 30.0f : 0.0f;
@@ -4254,13 +4306,13 @@ void RasterizerGxm::ReplayHud(u32 addr, float x, float y, float w, float h) {
             std::memcpy(vbuf, vu, sizeof(vu));
         }
         void* fbuf = nullptr;
-        if (!rec.fragment_uniforms.empty() &&
+        if (rec.uniform_bytes != 0 &&
             sceGxmReserveFragmentDefaultUniformBuffer(context, &fbuf) >= 0 && fbuf != nullptr) {
-            std::memcpy(fbuf, rec.fragment_uniforms.data(), rec.fragment_uniforms.size());
+            std::memcpy(fbuf, frame->uniforms.data() + rec.uniform_offset, rec.uniform_bytes);
         }
         sceGxmSetVertexStream(context, 0, verts);
         sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
-                   identity_indices, std::min<u32>(n, MaxVerticesPerDraw));
+                   identity_indices, n);
     }
     // The rasterizer's own bindings are no longer what the context holds.
     pipeline_cache->InvalidateBinding();
@@ -5588,14 +5640,29 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     // This frame's text goes with the framebuffer the frame is transferred into, and replaces
     // whatever that framebuffer had - also with nothing: a frame without the grade (title
     // screen, menus) records no text, and the last text must not stay on the screen.
-    if (hud_recording.empty()) {
-        hud_ready.erase(config.GetPhysicalOutputAddress());
-    } else {
-        if (hud_ready.size() > 6) {
-            hud_ready.clear();
+    {
+        const u32 out = config.GetPhysicalOutputAddress();
+        HudFrame* slot = nullptr;
+        for (HudFrame& f : hud_ready) {
+            if (f.valid && f.addr == out) {
+                slot = &f;
+            }
         }
-        hud_ready[config.GetPhysicalOutputAddress()] = std::move(hud_recording);
-        hud_recording.clear();
+        if (hud_cur.records.empty()) {
+            if (slot != nullptr) {
+                slot->Clear();
+            }
+        } else {
+            if (slot == nullptr) {
+                slot = &hud_ready[hud_ready_next];
+                hud_ready_next = (hud_ready_next + 1) % hud_ready.size();
+            }
+            std::swap(*slot, hud_cur); // the buffers change hands, their capacity stays
+            slot->addr = out;
+            slot->valid = true;
+        }
+        hud_cur.Clear();
+        hud_last_recorded = false;
     }
     const bool done = EnsureResources() && res_cache.AccelerateDisplayTransfer(config);
     if (LogtexActive()) {
@@ -5755,17 +5822,18 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
 
 void RasterizerGxm::EndFrame() {
     hud_phase = false;
+    hud_last_recorded = false;
     static const bool hud_count_log = GxmFlag("hudtextlog");
     if (hud_count_log && frame_index % 120 == 0) {
         if (std::FILE* f = std::fopen(VITA_DATA_DIR "/hudtextlog.txt", "a")) {
             std::fprintf(f, "frame %u: text draws decided %u recorded %u, ready %u\n", frame_index,
                          hud_stat_decided, hud_stat_recorded,
-                         static_cast<u32>(hud_ready.size()));
+                         static_cast<u32>(hud_cur.records.size()));
             std::fclose(f);
         }
         hud_stat_decided = hud_stat_recorded = 0;
     }
-    hud_recording.clear();
+    hud_cur.Clear();
     FlushDeferredDraws();
     draw_epoch++;
     nondraw_epoch++;
