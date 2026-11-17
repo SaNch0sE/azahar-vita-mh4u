@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -40,7 +41,8 @@ class StatefulThreadWorker {
 
 public:
     explicit StatefulThreadWorker(std::size_t num_workers, std::string_view name,
-                                  StateMaker func = {}, ThreadRole role = ThreadRole::Other)
+                                  StateMaker func = {}, ThreadRole role = ThreadRole::Other,
+                                  std::size_t stack_size = 1024 * 1024)
         : workers_queued{num_workers}, thread_name{name} {
         const auto lambda = [this, func, role](std::stop_token stop_token, std::size_t index) {
             Common::SetCurrentThreadName(thread_name.data());
@@ -87,7 +89,7 @@ public:
         };
         threads.reserve(num_workers);
         for (std::size_t i = 0; i < num_workers; ++i) {
-            threads.emplace_back(ThreadCfg{thread_name.data()},
+            threads.emplace_back(ThreadCfg{thread_name.data(), stack_size},
                                  [lambda, i](std::stop_token token) { lambda(token, i); });
         }
     }
@@ -97,6 +99,13 @@ public:
 
     StatefulThreadWorker& operator=(StatefulThreadWorker&&) = delete;
     StatefulThreadWorker(StatefulThreadWorker&&) = delete;
+
+    /// Whether every worker thread was created (on the Vita a thread that could not be made
+    /// leaves no exception, only a NamedThread that is not joinable).
+    [[nodiscard]] bool AllStarted() const {
+        return std::all_of(threads.begin(), threads.end(),
+                           [](const NamedThread& t) { return t.joinable(); });
+    }
 
     void QueueWork(Task work) {
         {

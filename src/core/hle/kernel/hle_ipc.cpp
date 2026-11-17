@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <system_error>
 #include <algorithm>
 #include <vector>
 #include <boost/serialization/assume_abstract.hpp>
@@ -26,6 +27,28 @@ SERIALIZE_EXPORT_IMPL(Kernel::HLERequestContext)
 SERIALIZE_EXPORT_IMPL(Kernel::HLERequestContext::ThreadCallback)
 
 namespace Kernel {
+
+Common::ThreadWorker* AsyncSectionPool() {
+    static const std::unique_ptr<Common::ThreadWorker> pool = []() {
+        try {
+            auto worker = std::unique_ptr<Common::ThreadWorker>(new Common::ThreadWorker(
+                2, "HLE_Async", {}, Common::ThreadRole::Other, 256 * 1024));
+            if (!worker->AllStarted()) {
+                // A pool missing a thread would still take work; with none, work would
+                // never run and the guest would wait forever. Use it only whole.
+                LOG_CRITICAL(Kernel, "async pool threads could not all be made");
+                return std::unique_ptr<Common::ThreadWorker>{};
+            }
+            return worker;
+        } catch (const std::system_error& e) {
+            LOG_CRITICAL(Kernel, "no async pool ({}); async sections start their own threads",
+                         e.what());
+            return std::unique_ptr<Common::ThreadWorker>{};
+        }
+    }();
+    return pool.get();
+}
+
 
 class HLERequestContext::ThreadCallback : public Kernel::WakeupCallback {
 

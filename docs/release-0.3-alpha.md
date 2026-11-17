@@ -79,6 +79,9 @@ Your saves, save states and settings are in `ux0:data/mh4u`.
   game's and the update's code.
 - **Update install survives interruptions.** If the app is closed while it installs the update
   `.cia`, the next start installs it again instead of starting the game on a half-installed update.
+- **Crash fix.** The game could close mid-play while reading a file: every large read started
+  a new thread, and when the Vita had no memory left for one, the app ended. Reads now go to a
+  small pool of threads made once at start.
 - Install guide: HUD 100%, the 16:9 mod, the mod's FPS 30 as a recommended extra.
 
 ## Known issues

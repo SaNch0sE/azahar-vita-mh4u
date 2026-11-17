@@ -33,6 +33,11 @@ class MemorySystem;
 
 namespace Kernel {
 
+/// The shared pool that runs HLERequestContext::RunAsync's sections (two threads, 256 KiB
+/// stacks, made on first use); null if it could not be made.
+Common::ThreadWorker* AsyncSectionPool();
+
+
 class HandleTable;
 class Process;
 class Thread;
@@ -303,6 +308,18 @@ public:
     template <typename AsyncFunctor, typename ResultFunctor>
     void RunAsync(AsyncFunctor async_section, ResultFunctor result_function,
                   bool really_async = true) {
+        // Every async section (FS reads of 64 KiB and more, AM's work) goes to one pool of
+        // long-lived threads, made once: a thread per call (std::async) failed on the Vita with
+        // EAGAIN when no memory was left for another stack, and ended the app mid-play
+        // (2026-11-17). The thread-per-call path below stays only for a pool that could not be
+        // made, and it falls back to running the section here.
+        if (!Settings::values.deterministic_async_operations && really_async) {
+            if (Common::ThreadWorker* pool = AsyncSectionPool()) {
+                RunOnThreadWorker(*pool, std::move(async_section), std::move(result_function),
+                                  true);
+                return;
+            }
+        }
 
         const auto run_here = [&] {
             s64 sleep_for = async_section(*this);

@@ -852,8 +852,11 @@ aborted: std::terminate from Service::FS::File::Read, the exception a std::syste
 (EAGAIN, newlib's "No more processes"), found from its typeinfo pointer in the dump. Reads of
 64 KiB and more go through HLERequestContext::RunAsync, which starts a thread per call with
 std::async; when the Vita could not create one (most likely no memory left in the partition for
-its stack) the throw was outside every handler. Now RunAsync catches it and runs the work on the
-emulation thread, as deterministic_async_operations does. Better still (not done): one long-lived
-FS worker instead of a thread per read - no creation cost, no stack per read, and no failure mode.
+its stack) the throw was outside every handler. Fix: RunAsync now queues every async section
+(FS reads, AM's work) on one shared pool, `HLE_Async`: two long-lived threads with 256 KiB stacks,
+made on first use (Kernel::AsyncSectionPool), and used only if both threads were really created
+(NamedThread fails silently on the Vita, so ThreadWorker::AllStarted checks). Without a whole pool,
+the old thread-per-call path runs, and if that throws, the section runs on the emulation thread.
+Console: boot, intro, the save loaded into Val Habar at 30 fps.
 Tooling: the dump is gzip'd ELF; a stdlib reader (thread notes, registers, stack scan) plus
 arm-vita-eabi-addr2line on build-vita-rel/src/citra_vita/citra_vita gives the stack.
