@@ -359,8 +359,13 @@ bool RasterizerGxm::EnsureResources() {
         // written under other flags is another version.
         const std::string flags = GxmFlagsText();
         const u64 flags_hash = flags.empty() ? 0 : Common::ComputeHash64(flags.data(), flags.size());
+        // A run with flags keeps its own file: sharing programs.bin made every diagnostic run
+        // start the player's cache over, and the next game session paid every program again.
+        const std::string file = flags.empty()
+                                     ? std::string(VITA_DATA_DIR "/programs.bin")
+                                     : std::string(VITA_DATA_DIR "/programs_diag.bin");
         program_cache = std::make_unique<ProgramDiskCache>(
-            VITA_DATA_DIR "/programs.bin", fmt::format("{}-{:016x}", GXM_PROGRAM_VERSION, flags_hash));
+            file, fmt::format("{}-{:016x}", GXM_PROGRAM_VERSION, flags_hash));
     }
     if (!GxmFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();

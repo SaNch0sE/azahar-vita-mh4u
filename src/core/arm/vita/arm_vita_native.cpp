@@ -686,7 +686,16 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
         LOG_INFO(Core_ARM11, "MH4U movie poll at {:08X}: sleeps while idle", branch);
         return;
     }
-    LOG_INFO(Core_ARM11, "MH4U movie poll: code differs, not patched");
+    {
+        std::string seen;
+        for (const auto& [addr, word] : expected) {
+            seen += memory.IsValidVirtualAddress(*process, addr)
+                        ? fmt::format(" {:08X}={:08X}/{:08X}", addr, memory.Read32(addr), word)
+                        : fmt::format(" {:08X}=unmapped", addr);
+        }
+        LOG_INFO(Core_ARM11, "MH4U movie poll: code differs, not patched (read/expected:{})",
+                 seen);
+    }
 }
 
 bool ARM_VitaNative::Mh4uFmvPollSvc() {
