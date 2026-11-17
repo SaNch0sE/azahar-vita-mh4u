@@ -65,8 +65,9 @@ The port is meant to be played with the mod's single-screen mode.
 3. Options:
    - **Single Screen mode**: on (the default).
    - **HUD size**: your choice. 70% is the default.
-   - **Aspect ratio**: tick **Allow other aspect ratios (EXPERIMENTAL)** and choose **16:9** to
-     fill the Vita's screen. Leave it at 5:3 to keep the 3DS shape with bars at the sides.
+   - **Aspect ratio**: leave it at **5:3** (the default). The mod can widen the game to 16:9
+     (**Allow other aspect ratios (EXPERIMENTAL)**, then **16:9**), but we don't recommend it:
+     it is playable, but heavy scenes drop to 28-30 fps where the 5:3 game holds a steady 30.
    - Keep the **other / quality-of-life module on**. The port needs it: without it the game
      crashes about 15 seconds after boot.
    - Layered Gear and the cheats: your choice.
@@ -94,7 +95,9 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
   to 16:9 there too. A mod from the web installer starts with FPS off, and the game then tries to
   run at 60, which the Vita can't keep up.
 - **Select + Start** opens the port's pause menu. Under **Settings**:
-  - **Picture shape: Wide (16:9)** if you made the mod with 16:9.
+  - **Picture shape**: **3DS (5:3)** keeps the game's proportions, with bars at the sides.
+    **Wide (16:9)** fills the screen: with a 5:3 mod it stretches the picture sideways, and with
+    a 16:9 mod the proportions are correct.
   - **Sharp HUD text** draws the HUD's names and item names at the Vita's resolution. It is
     recommended.
 

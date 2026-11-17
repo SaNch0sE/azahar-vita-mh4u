@@ -33,8 +33,9 @@ No game files are included: you need your own decrypted copy of the game (USA).
       Your game is never uploaded.
    2. Choose your `.3ds`.
    3. Options: keep **Single Screen mode** on, and keep the quality-of-life ("other") module on (the
-      port needs it). For a full-screen picture, tick **Allow other aspect ratios (EXPERIMENTAL)** and
-      choose **16:9**. Pick the HUD size you like.
+      port needs it). Pick the HUD size you like. Leave the aspect ratio at **5:3** (the default).
+      The 16:9 option (**Allow other aspect ratios (EXPERIMENTAL)**) is playable, but not
+      recommended: heavy scenes drop to 28-30 fps where 5:3 holds a steady 30.
    4. Press **Make the mod**, download the zip and extract it. You get a folder named
       `0004000000126300`.
    5. Copy that folder to `ux0:data/mh4u/load/mods/`, so that you end up with
@@ -43,9 +44,10 @@ No game files are included: you need your own decrypted copy of the game (USA).
 5. **Start the game.** In the game, open the START menu, third page, **Mod Settings**, **Display**:
    set **FPS** to **30** (a web-installer mod starts with it off, and the game then tries to run at
    60), 3D Mode off with no dithering, and Bloom and Depth Blur off. If you made the mod with 16:9,
-   set the aspect ratio to 16:9 there too. Then in the port's pause menu (**Select + Start**) go to **Settings** and
-   set **Picture shape** to **Wide (16:9)**. **Sharp HUD text** in the same menu makes names and item
-   names much easier to read.
+   set the aspect ratio to 16:9 there too. In the port's pause menu (**Select + Start**),
+   **Settings**: **Picture shape** is **3DS (5:3)** (correct proportions, bars at the sides) or
+   **Wide (16:9)** (fills the screen; stretched with a 5:3 mod, correct with a 16:9 one).
+   **Sharp HUD text** in the same menu makes names and item names much easier to read.
 
 Your saves, save states and settings are in `ux0:data/mh4u`.
 
