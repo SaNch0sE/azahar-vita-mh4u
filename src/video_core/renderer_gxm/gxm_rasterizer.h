@@ -649,6 +649,7 @@ private:
     void* last_fragment_uniforms{};             ///< the last reserved fragment buffer
     void ReplayHud(u32 addr, float x, float y, float w, float h);
     static bool HudTextOn();
+    bool HudTextDraw() const;
     void RecordHudDraw();
     u32 stat_alpha_only_feedback{};
     u32 stat_grade_double{};

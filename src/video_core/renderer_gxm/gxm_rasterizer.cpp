@@ -3709,7 +3709,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     static const bool no_begin_repeat = GxmFlag("nobeginrepeat");
     const u64 begin_key_now = no_begin_repeat ? 0 : RepeatKey();
     if (!no_begin_repeat && begin_repeat_ok && in_scene && begin_key_now == begin_key &&
-        !(HudTextOn() && hud_phase) &&
+        !HudTextDraw() &&
         nondraw_epoch == begin_epoch && scene_seq == begin_scene && !pica.lighting.lut_dirty &&
         !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
         stat_begin_repeats++;
@@ -4029,8 +4029,8 @@ void RasterizerGxm::DrawTriangles() {
     }
     static const bool no_repeat = GxmFlag("norepeat");
     const u64 key = no_repeat ? 0 : RepeatKey();
-    if (HudTextOn() && hud_phase) {
-        repeat_ok = false; // every 2D-layer draw takes the full path, where text is recorded
+    if (HudTextDraw()) {
+        repeat_ok = false; // a text draw takes the full path, where it is recorded
     }
     if (!no_repeat && repeat_ok && in_scene && vertex_batch.empty() && key == repeat_key &&
         draw_epoch == repeat_epoch && scene_seq == repeat_scene && !pica.lighting.lut_dirty &&
@@ -4105,6 +4105,7 @@ void RasterizerGxm::DrawTriangles() {
         RecordHudDraw();
     }
     const bool skip_native = hud_record_draw && !hud_both;
+    const bool recorded = hud_record_draw;
     hud_record_draw = false;
     // Each range is a run of whole triangles already sitting in GPU memory: the stream base
     // moves to the run and the indices always start at zero, so no index offset is needed and
@@ -4136,7 +4137,8 @@ void RasterizerGxm::DrawTriangles() {
     ReleaseDraw(setup);
     // Now that everything this draw did is done (the release invalidates the drawn region,
     // and may itself have bumped the epoch), the next one may repeat it.
-    repeat_ok = in_scene;
+    // Nothing may repeat a recorded text draw: its state was never drawn here.
+    repeat_ok = in_scene && !recorded;
     repeat_key = key;
     repeat_epoch = draw_epoch;
     repeat_scene = scene_seq;
@@ -4150,6 +4152,18 @@ void RasterizerGxm::DrawTriangles() {
     if (check) {
         repeat_fs_raw_hash = Pica::Shader::FSConfig{regs}.Hash();
     }
+}
+
+bool RasterizerGxm::HudTextDraw() const {
+    // The draw about to be made is HUD text (the font atlas, a software-GS sprite in the 2D
+    // layer): only these skip the merging fast paths, so the rest of the HUD keeps them.
+    if (!hud_phase || !HudTextOn() ||
+        regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::Yes ||
+        regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() != hud_target) {
+        return false;
+    }
+    const auto t0 = regs.texturing.GetTextures()[0];
+    return t0.enabled && t0.format == Pica::TexturingRegs::TextureFormat::A4;
 }
 
 bool RasterizerGxm::HudTextOn() {
@@ -4275,7 +4289,7 @@ bool RasterizerGxm::TexOnlyRepeat() {
         }
         return false;
     }();
-    if (off || (HudTextOn() && hud_phase) || !pica.fragment_regs_versioned || !repeat_ok ||
+    if (off || HudTextDraw() || !pica.fragment_regs_versioned || !repeat_ok ||
         !in_scene || !repeat_plain ||
         !vertex_batch.empty() || pending_ring_ranges.empty() || draw_epoch != repeat_epoch ||
         scene_seq != repeat_scene || pica.lighting.lut_dirty || pica.fog.lut_dirty ||
