@@ -2,7 +2,7 @@
 
 # MH4U on Vita: what would really move performance
 
-Nothing here was run on the console. Everything is from the docs, the code and the logs in the scratchpad. Measured facts and my estimates are labelled.
+Nothing here was run on the console. Everything is from the docs, the code and the local test logs. Measured facts and my estimates are labelled.
 
 ## Headline
 
@@ -35,7 +35,7 @@ Per-frame GPU on the main target, recomputed from the `al_st_*` and `al_x_*` log
 
 **1. Alpha pre-pass at the start of the scene (GPU, area 3 and any foliage area).**
 - **Change:** for alpha-tested draws that write depth with a LESS-type test and One/Zero blending, draw them twice.
-  - First, at the start of the scene: colour mask off, depth write on, an alpha-chain-only kill program. The eligibility analysis already exists in the scratchpad `gxm_alpha_prepass.cpp`.
+  - First, at the start of the scene: colour mask off, depth write on, an alpha-chain-only kill program. The eligibility analysis already exists in the local prototype `gxm_alpha_prepass.cpp` (not in the repo).
   - Then, in their original position: the no-kill program, depth EQUAL, no depth write. Every colour draw is then opaque and gets full hidden-surface removal.
 - **How to get the order:** record the main scene on a GXM deferred context and issue pre-pass draws straight to the immediate context, then `sceGxmExecuteCommandList` before `EndScene`. The API is in the vitasdk header (`psp2/gxm.h:1549-1662`). It needs no lookahead. Hooks are `BeginScene`, `EndScene`, `BindPrograms` and `SyncState` in `src/video_core/renderer_gxm/gxm_rasterizer.cpp` (lines 834, 1210, 1441, 1279).
 - **Gain (estimate):** 33.3 ms to about 27 ms. That is `ptalways` at 25.1 ms, plus ~1.1 for trivial punch-through fragments, plus ~0.8 for the second vertex pass. Range 4-7 ms. Shown fps would hold 30, and the render thread gets its ~5 ms of GPU wait back.
@@ -110,9 +110,9 @@ Per-frame GPU on the main target, recomputed from the `al_st_*` and `al_x_*` log
 - **Counter figures compound.** Options 2, 3, 4 and 6 overlap; I would expect 30 fps there only after 3 and 4 plus either 5 or 6.
 
 ### Critical Files for Implementation
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/gxm_rasterizer.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/usse/fs_usse_gen.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/citra_vita/gxm_present.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/threaded_rasterizer.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/citra_vita/citra_vita_main.cpp
-- Prototype pieces outside the repo: /tmp/claude-1000/-home-areki-Documents-Personal/f3394e24-c6d1-4869-8501-c260051877ee/scratchpad/gxm_alpha_prepass.cpp and /tmp/claude-1000/-home-areki-Documents-Personal/f3394e24-c6d1-4869-8501-c260051877ee/scratchpad/alphaexp.patch
+- src/video_core/renderer_gxm/gxm_rasterizer.cpp
+- src/video_core/renderer_gxm/usse/fs_usse_gen.cpp
+- src/citra_vita/gxm_present.cpp
+- src/video_core/threaded_rasterizer.cpp
+- src/citra_vita/citra_vita_main.cpp
+- Prototype pieces outside the repo (local working files, not published): gxm_alpha_prepass.cpp and alphaexp.patch

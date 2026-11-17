@@ -40,7 +40,7 @@ Release, slots 1 and 2: screenshots at fixed views with each option off (identic
 - Slot 2's save state crashes the game right after loading (guest prefetch abort at PC 0, fault.txt); slot 2 was re-saved 2026-11-15 11:19. Slot 1 loads fine with the same build.
 
 ## TuizaVita comparison (Fable, 2026-11-15)
-The other Vita port (github.com/TutuiFC/TuizaVita-3ds-emu, cloned to ~/Documents/Personal) is a general-compatibility port with a block JIT and runtime Cg shaders; it is behind ours in CPU, shaders, frame pacing and I/O. Taken: clamp the time-stretch output before the s16 cast. Candidates left: constant blend factors carried in source alpha (`MapCarrierFactor`; ours approximates them; check `logblend` whether MH4U uses them), preloading the program disk cache into RAM to soften area-entry hitches (measure `Find` during a transition first).
+The other Vita port (github.com/TutuiFC/TuizaVita-3ds-emu) is a general-compatibility port with a block JIT and runtime Cg shaders; it is behind ours in CPU, shaders, frame pacing and I/O. Taken: clamp the time-stretch output before the s16 cast. Candidates left: constant blend factors carried in source alpha (`MapCarrierFactor`; ours approximates them; check `logblend` whether MH4U uses them), preloading the program disk cache into RAM to soften area-entry hitches (measure `Find` during a transition first).
 
 ## TuizaVita 0.3B follow-up (2026-11-15)
 Source: tag v0.3B (branch vita-0.1.7) of github.com/TutuiFC/TuizaVita-3ds-emu; the earlier review only saw `main` (0.1B).

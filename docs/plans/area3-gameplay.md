@@ -78,7 +78,7 @@ The 110 HUD draws cost ~91 us each by the "software vertex shading" figure, abou
 
 ## 5. Phase 0: measurement (no behaviour change)
 
-Use slot 2 through `ux0:data/mh4u/autoload.txt`. The scripts are `/tmp/claude-1000/-home-areki-Documents-Personal/f3394e24-c6d1-4869-8501-c260051877ee/scratchpad/al.sh` (still camera) and `/tmp/claude-1000/-home-areki-Documents-Personal/f3394e24-c6d1-4869-8501-c260051877ee/scratchpad/cam.sh` (camera segments).
+Use slot 2 through `ux0:data/mh4u/autoload.txt`. The scripts are the local test scripts `al.sh` (still camera) and `cam.sh` (camera segments), kept outside the repository.
 
 ### 5.1 Two GPU runs with existing flags
 
@@ -249,8 +249,8 @@ Do this after Phase 1 is measured; with the GPU under budget the frame-end wait 
 | Phase 3 as needed | 1-3 ms less | - | 30 steady |
 
 ### Critical Files for Implementation
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/usse/fs_usse_gen.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/usse/fs_usse_gen.h
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/gxm_rasterizer.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/usse/usse_ir.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/gpu.cpp (with gpu_thread.cpp and src/citra_vita/citra_vita_main.cpp for the Phase 0 counters)
+- src/video_core/renderer_gxm/usse/fs_usse_gen.cpp
+- src/video_core/renderer_gxm/usse/fs_usse_gen.h
+- src/video_core/renderer_gxm/gxm_rasterizer.cpp
+- src/video_core/renderer_gxm/usse/usse_ir.cpp
+- src/video_core/gpu.cpp (with gpu_thread.cpp and src/citra_vita/citra_vita_main.cpp for the Phase 0 counters)

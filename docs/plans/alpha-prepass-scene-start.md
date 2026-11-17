@@ -108,12 +108,12 @@ Stop the pre-pass work and remove `prepass`. What is left for area 3's GPU time 
 Past that, accept about 28-29 shown fps here and spend on frame pacing (FS1, FS2) and the render thread.
 
 ### Critical Files for Implementation
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/gxm_rasterizer.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/gxm_rasterizer.h
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/gxm_alpha_prepass.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/citra_vita/gxm_present.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/gxm_texture_runtime.cpp
-- Header reference: /home/areki/vitasdk/arm-vita-eabi/include/psp2/gxm.h
+- src/video_core/renderer_gxm/gxm_rasterizer.cpp
+- src/video_core/renderer_gxm/gxm_rasterizer.h
+- src/video_core/renderer_gxm/gxm_alpha_prepass.cpp
+- src/citra_vita/gxm_present.cpp
+- src/video_core/renderer_gxm/gxm_texture_runtime.cpp
+- Header reference: $VITASDK/arm-vita-eabi/include/psp2/gxm.h
 
 ## Step 0 result (2026-11-15, measured)
 

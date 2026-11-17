@@ -453,12 +453,12 @@ User report: fps drops with the camera at/near the slot 1 spot in area 2, and wh
 
 Measured (release unless noted):
 - Fresh load, standing at the spot: 30 shown for 20 s, no skip signals. Diag GPU 29.0-31.6 ms a frame (one main scene a frame, GPU wait ~0), so ~2-4 ms margin at the spot itself.
-- `trans.sh` (scratchpad; left stick Down 6 s, stays of 20 s, screenshots per segment): the first run went from area 2 into area 3. The transition dipped for ~5 s: shown 25, 23, 30, 19, 28 (game fps 23.5/23/18 in two of those seconds, so the guest itself slowed: loading, not rendering). Area 3 afterwards (with Apceros herds) held 30 for 20 s.
+- `trans.sh` (local test script; left stick Down 6 s, stays of 20 s, screenshots per segment): the first run went from area 2 into area 3. The transition dipped for ~5 s: shown 25, 23, 30, 19, 28 (game fps 23.5/23/18 in two of those seconds, so the guest itself slowed: loading, not rendering). Area 3 afterwards (with Apceros herds) held 30 for 20 s.
 - The return run (stick Up 6 s) did not leave area 3; the later segments are all area 3 at 30. So the 3 -> 2 return and "area 2 after a round trip" are **not measured yet**.
 
 Next when resumed: fix the return direction in `trans.sh` (check the minimap/screenshot after each run), then measure area 2 at the spot after one and two round trips against the fresh-load numbers; if worse, diag `timedraw scenetime` after the round trip (GPU vs render thread, shader cache/surface counts, heap) and hand the logs to Fable.
 
-**Round trips (2026-11-15, after the reboot):** `vita-tests/trans.sh` (now kept in `~/Documents/Personal/grarakAzahar/vita-tests`, outside the repo; running Down 6 s crosses both ways). Route 2 -> 3 -> 2 -> 3 -> 2, release: every stay held 30 shown for 20 s, area 2 after two round trips included. Each crossing dips for 1-2 s to 24-26 shown with the game's own fps falling too (loading on the guest side). No slowdown builds up across transitions in this build.
+**Round trips (2026-11-15, after the reboot):** `vita-tests/trans.sh` (a local test script kept outside the repo; running Down 6 s crosses both ways). Route 2 -> 3 -> 2 -> 3 -> 2, release: every stay held 30 shown for 20 s, area 2 after two round trips included. Each crossing dips for 1-2 s to 24-26 shown with the game's own fps falling too (loading on the guest side). No slowdown builds up across transitions in this build.
 
 ## Area crossings: mod files opened per read (2026-11-15)
 

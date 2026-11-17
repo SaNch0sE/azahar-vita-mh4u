@@ -2,7 +2,7 @@
 
 # Plan: GS point-mode draws off the render thread's per-triangle path ("fix 2")
 
-All paths are under `/home/areki/Documents/Personal/grarakAzahar/azahar/`. Nothing was built or run; this is from reading the code and docs.
+All paths are relative to the repository root. Nothing was built or run; this is from reading the code and docs.
 
 ## 1. Verdict
 
@@ -88,11 +88,11 @@ Kill switch: `ux0:data/mh4u/nopreshadering` plus flag `nopreshadering`, read onc
 - **Soak:** 10 minutes of hub and village walk, checking heap and ring peak.
 
 ### Critical Files for Implementation
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/threaded_rasterizer.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/pica/pica_core.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/gxm_rasterizer.cpp
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/vertex_ring.h
-- /home/areki/Documents/Personal/grarakAzahar/azahar/src/video_core/renderer_gxm/usse/vs_usse_gen.cpp
+- src/video_core/threaded_rasterizer.cpp
+- src/video_core/pica/pica_core.cpp
+- src/video_core/renderer_gxm/gxm_rasterizer.cpp
+- src/video_core/vertex_ring.h
+- src/video_core/renderer_gxm/usse/vs_usse_gen.cpp
 
 ## Capture results (area 3, diag `gsdump`, 2026-11-15, measured)
 
@@ -104,7 +104,7 @@ Kill switch: `ux0:data/mh4u/nopreshadering` plus flag `nopreshadering`, read onc
 | 9e6bb9b64d38d710 | 375 (63%) | 1,216 (10%) | non-indexed, 1-4 points per draw (HUD sprites) |
 | a4cb51124f38a2aa | dumped, not in the logged window | | |
 
-GS float uniforms changed in 25 of 600 draws; VS float uniforms in 390 of 600. Dumps: scratchpad `gsd/a3_*`.
+GS float uniforms changed in 25 of 600 draws; VS float uniforms in 390 of 600. Dumps: local test files (`gsd/a3_*`), not in the repo.
 
 ## Implementation and result (2026-11-15, measured)
 

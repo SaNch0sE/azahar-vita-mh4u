@@ -140,6 +140,11 @@ if (VITA)
     # to the flags variable instead of appending to it - which is exactly how the software
     # renderer's NEON came to be compiled without NEON on the first clang build.
     add_compile_options(-D__vita__=1 -mcpu=cortex-a9 -mfpu=neon -fno-pic -fno-pie)
+    # Source, build and SDK paths are recorded in the binary (__FILE__ in asserts and logging):
+    # mapped, a release names ./src/... and /vitasdk/..., never the builder's home directory.
+    add_compile_options(-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.
+                        -ffile-prefix-map=${CMAKE_BINARY_DIR}=./build
+                        -ffile-prefix-map=${VITASDK}=/vitasdk)
     # A handful of POSIX headers the console's newlib does not ship, supplied here rather than
     # by patching every library that includes them. See src/vita_compat/ for what each is for.
     include_directories(BEFORE SYSTEM ${CMAKE_CURRENT_SOURCE_DIR}/src/vita_compat)
