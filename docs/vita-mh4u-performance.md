@@ -752,3 +752,32 @@ The 2D layer (post-grade draws): `dbgnohud` / `dbgonlyhud` split it cleanly (it 
 the camp); `hudlog` lists one frame of it: ~32 software-GS sprite draws (SrcAlpha /
 OneMinusSrcAlpha, no depth) and two full-screen quads. Fable's plan for replaying the sprites in
 the present at screen resolution is kept for later if the native text is still not enough.
+
+## Sharp HUD text: the text replayed at screen resolution (2026-11-17)
+
+Even with the half-pixel fix the 400x240 text stretched 2.4x stays soft (the user compared a
+video of a real 3DS; a 1.5x render looked good, 1.25x barely better). Stage 0 at the camp
+(scenetime, merging off): ~99 post-grade draws a frame; dropping the GS sprites -1.6 ms, the two
+full-screen quads -0.2, the alpha-only draws -0.5 (not dead: draw #66 blends with DstAlpha on
+the RGBA8 target, so the planned "dead draw" drop was cancelled). Re-drawing every HUD sprite at
+the display's resolution would cost ~3-5 ms, so only the text is moved:
+
+- **Which draws:** MH4U's font is a 1024x1024 A4 atlas (0x20AA3800), drawn as software-GS sprites
+  with a constant colour. The IA4 atlas beside it holds icons (found by shifting the replay:
+  `dbghudshift` moves the replayed draws 30 px).
+- **Record** (`RecordHudDraw`, from the software draw loop in `DrawTriangles`): the bound
+  pipeline, units 0-2, the last reserved fragment uniform buffer (its size from the program),
+  and the triangles copied out of the ring - instead of drawing. While the 2D layer is open the
+  repeat, begin-repeat and texture-only fast paths are bypassed so every draw reaches it.
+- **Pair:** at the display transfer the frame's records go with its output framebuffer
+  (`hud_ready`, by address); the present's top screen carries its framebuffer address.
+- **Replay** (`ReplayHud`, hook `ReplayHudText` called by EmuWindowVita::DrawScreens after the
+  top screen's quad): the same pipelines in the present scene, positions mapped from the 2D
+  layer's clip space to the screen rectangle (x from -NDC y, y from -NDC x: the present's turn),
+  pass-through vertex uniforms with z = w / 2, the fragment uniforms copied back.
+- **Option:** pause menu "Sharp HUD text" (`hudtext=1` in video.txt; `hudtext` flag in diag).
+  Diag: `dbghudboth` (native and replay together, vertex colour tinted red - icons only),
+  `dbghudshift`, `hudtexticons` (also the IA4 icon draws), `hudtextlog` (counts), `hudsx`/`hudsy`.
+
+Release with it on: pond 30.0, pillar 30.0, camp 28.8 (4 of 20 s under 29; 30.0 without) - the
+camp has no margin, so it stays an option. Text crisp in the HUD and the in-game menu.

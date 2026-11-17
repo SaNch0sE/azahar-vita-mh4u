@@ -73,6 +73,22 @@ void (*surface_dump_hook)(void*) = nullptr;
 void* surface_dump_user = nullptr;
 } // namespace
 
+namespace {
+void (*hud_replay_hook)(void*, u32, float, float, float, float) = nullptr;
+void* hud_replay_user = nullptr;
+} // namespace
+
+void SetHudReplayHook(void (*hook)(void*, u32, float, float, float, float), void* user) {
+    hud_replay_hook = hook;
+    hud_replay_user = user;
+}
+
+void ReplayHudText(u32 framebuffer_addr, float x, float y, float w, float h) {
+    if (hud_replay_hook != nullptr) {
+        hud_replay_hook(hud_replay_user, framebuffer_addr, x, y, w, h);
+    }
+}
+
 void SetSurfaceDumpHook(void (*hook)(void*), void* user) {
     surface_dump_hook = hook;
     surface_dump_user = user;

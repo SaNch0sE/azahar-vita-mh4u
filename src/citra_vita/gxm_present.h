@@ -39,6 +39,7 @@ struct GuestScreen {
     int pica_format;  ///< Pica::PixelFormat as int, to keep video_core out of this header
     bool fill_enabled;
     u8 fill_r, fill_g, fill_b;
+    u32 addr; ///< the guest framebuffer's physical address (HUD text replay)
 };
 
 /// Frame lifecycle. All of these run on whichever single thread presents (the render thread

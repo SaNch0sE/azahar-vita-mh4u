@@ -23,6 +23,9 @@ struct VideoOptions {
     /// bars: for the Heavenfall mod built with --cheat-aspect-ratio 16:9, which widens the
     /// game's views and interface for a stretched picture.
     bool wide = false;
+    /// The HUD's text drawn at the display's resolution over the stretched picture instead of
+    /// in the 400x240 frame (RasterizerGxm::ReplayHud): crisp names and item names.
+    bool hud_text = false;
 };
 
 /// The live options (loaded from the file on first use).

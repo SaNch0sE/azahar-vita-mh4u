@@ -634,6 +634,22 @@ private:
     /// hudlog). Cleared at a display transfer and at the frame's end.
     bool hud_phase = false;
     u32 hud_target = 0;
+    u32 hud_ordinal = 0;
+    /// HUD text at screen resolution (`hudtext`, ReplayHudText): one recorded text draw.
+    struct HudRecord {
+        const Pipeline* pipeline{};
+        std::array<SceGxmTexture, 3> textures{};
+        std::vector<u8> fragment_uniforms;
+        std::vector<Pica::OutputVertex> vertices;
+    };
+    bool hud_record_draw = false;               ///< the current draw is recorded, not drawn
+    u32 hud_stat_decided = 0, hud_stat_recorded = 0;
+    std::vector<HudRecord> hud_recording;       ///< this frame's, until its display transfer
+    std::unordered_map<u32, std::vector<HudRecord>> hud_ready; ///< by display framebuffer
+    void* last_fragment_uniforms{};             ///< the last reserved fragment buffer
+    void ReplayHud(u32 addr, float x, float y, float w, float h);
+    static bool HudTextOn();
+    void RecordHudDraw();
     u32 stat_alpha_only_feedback{};
     u32 stat_grade_double{};
 
