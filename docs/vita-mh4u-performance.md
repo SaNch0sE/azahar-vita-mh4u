@@ -803,3 +803,9 @@ the runs still pending, and any it overlaps is drawn natively right there, befor
 so covered as on hardware; that text loses the sharpening). Shipped draws (no extent known) emit
 all pending runs. Village counters (hudtextlog): 4 runs, ~40 checks, 1 native run a frame.
 Village fps with the check: on 25.7 / 25.8, off 26.5 (within the scene's run-to-run spread).
+
+**The `timedraw` switch file was left on the card** (ux0:data/mh4u/timedraw, release per-phase
+timing: clock reads per draw). Val Habar slot 4, Sharp HUD text on: with it 25.7 fps (render
+thread ~960 ms/s); without it 29.3 / 30.0 (render thread ~815-875 ms/s). Every village figure
+above this note (and the "village was already ~26" bisect) was measured with it on. Renamed to
+timedraw.off on 2026-11-17; check the card for it before any fps measurement.
