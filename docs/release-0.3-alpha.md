@@ -46,14 +46,16 @@ Updating from 0.2: install the new `MH4U.vpk` over the old one. Your saves and s
       `ux0:data/mh4u/load/mods/0004000000126300/romfs`. You only need `romfs/system` and your
       language's folder (`romfs/eng` for English). To change the mod later, delete that folder
       first and copy the new one in.
-5. **Start the game**, then once (it's kept in your save): START menu, third page,
-   **Mod Settings**, **Display**:
-   - **FPS: 30** - required. A web-installer mod starts with FPS off, and the game then tries to
-     run at 60 and slows down.
-   - 3D Mode off with no dithering; Bloom and Depth Blur off.
-   - Aspect ratio 16:9, if you made the mod with it.
+5. **Start the game.** It is capped at 30 fps from the first start by the port's cheat file
+   (**30 FPS Cap**, on by default); without a cap the game would try to run at 60 and slow down.
+   Once you reach the START menu (after the prologue), open its third page, **Mod Settings**,
+   **Display** (kept in your save):
+   - Aspect ratio **16:9**, if you made the mod with it.
+   - **FPS: 30** - recommended. It's the same as the cheat in normal play, but when the GPU falls
+     behind it keeps the game at full speed instead of letting it slow down.
+   - 3D Mode off with no dithering, and Bloom and Depth Blur off (the web installer's defaults).
 
-   Then in the port's pause menu (**Select + Start**), **Settings**: set **Picture shape** to
+   In the port's pause menu (**Select + Start**), **Settings**: set **Picture shape** to
    **Wide (16:9)** for a 16:9 mod.
 
 Your saves, save states and settings are in `ux0:data/mh4u`.
@@ -67,9 +69,11 @@ Your saves, save states and settings are in `ux0:data/mh4u`.
   replayed text cost code complexity for no gain. The fix that keeps the HUD's letters crisp
   (a half-pixel offset) stays.
 - **FPS counter setting** in the pause menu (Settings), on by default.
-- **Cheat file off by default.** The mod's Display settings do the same and keep the game at full
-  speed when the GPU is behind (our cheat let it slow to ~85%). An existing cheat file is kept.
-- Install guide: HUD 100%, the 16:9 mod, and the mod's FPS 30 setting.
+- **30 fps from the first start.** The bundled cheat file's 30 FPS Cap is on and now works for both
+  the base game's and the update's executable (the web installer builds the mod from the base
+  game), so the prologue runs capped before the mod's own FPS setting can be reached. The 3D and
+  bloom codes are off: the mod does them. An existing cheat file is kept.
+- Install guide: HUD 100%, the 16:9 mod, the mod's FPS 30 as a recommended extra.
 
 ## Known issues
 
