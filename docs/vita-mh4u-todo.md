@@ -43,3 +43,26 @@ Measurements and history are in `vita-mh4u-performance.md`.
   the GPU at the first lit frame.
 - The cutscene's colour grade on the depth-of-field focus pixels is lost (feedback draws are
   drawn alpha-only).
+
+## Future ideas (not scheduled)
+
+Picture quality, in order of value for effort. Not a priority while the mod's HUD at 100% keeps
+most text readable (2026-11-18).
+
+1. **HUD mask with its own upscale filter.** Copy the 400x240 frame just before the 2D layer
+   starts (the grade pass, `hud_phase`, already marks that point). At the present, a pixel that
+   differs between that copy and the finished frame is HUD: upscale it with a crisp or
+   text-friendly filter (sharp bilinear, or a pixel-art scaler such as xBRZ), and the rest with
+   linear or bicubic. Covers text, icons, minimap and frames; changes nothing in how the game
+   draws, so no draw-order bugs. Estimated +0.5-1 ms GPU (one copy, one extra read per screen
+   pixel), almost no CPU. It reshapes the 400x240 pixels only - no extra glyph detail.
+2. **Bicubic (Catmull-Rom) upscale**, 5 texture reads: sharper 3D than linear without the
+   blockiness of sharp bilinear, ~+1.5-2 ms. Optionally RCAS/CAS sharpening with a strength
+   setting on top, ~+1.5-3 ms.
+3. **Sharp HUD text again** (redrawn glyphs at screen resolution, removed in 57d1fd733; history
+   58c3ea0d7..f834922b7): the only option that adds real detail to text. Could sit on top of (1)
+   for the letters. Needs a re-test against today's renderer.
+4. **FSR 1.0 (EASU + RCAS)**, trimmed: the best 3D upscale, but probably 5-10 ms at 960x544 on
+   this GPU - an experimental option at most.
+Not worth it: Lanczos (ringing, many reads), pixel-art scalers on the 3D scene (smeared look),
+per-vertex highlights (`pvhalf`: white pond, see the performance notes).
