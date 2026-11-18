@@ -146,8 +146,10 @@ Right after the problem happens, open the pause menu and choose **Bug report**:
 - **Save report with the newest save state** adds your most recent save state (about 30 MB), for
   problems that only show at one moment: save a state there first, then make the report.
 
-Copy the zip to a PC (VitaShell's FTP or USB) and open an issue on this repository's GitHub page:
-say what happened, where, and what you did just before, and attach the zip. GitHub takes files up
+Copy the zip to a PC (VitaShell's FTP or USB) and fill in the
+[bug report form](https://github.com/SaNch0sE/azahar-vita-mh4u/issues/new?template=bug_report.yml):
+what happened, and either which save state to load and what to do after loading it, or the steps
+in the game from your save. Attach the zip there. GitHub takes files up
 to 25 MB; a report with a save state is larger, so share that one through a cloud drive link.
 
 What you share: your hunter's name, guild cards and progress (in the save). A save state also
