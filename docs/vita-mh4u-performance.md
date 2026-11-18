@@ -969,3 +969,25 @@ Start-up freeze, not fixed: three times on 2026-11-18 the app stopped right afte
 entering run loop" (no speed line ever printed) and the console switched itself off ~100 s later,
 no core dump, battery 76%. The same start-then-disconnect shape is in the event log on earlier
 days too. The slot 7 power-offs blamed on a4824a3c5 were this, not the state load.
+
+## Out of heap after 1 h 45 min: fragmentation, not a leak (2026-11-18)
+
+A user session (fishing at the camp) ended in `std::bad_alloc` on a 258 KiB request: the audio
+thread decoding an ADPCM buffer (`Source::DequeueBuffer` -> `Codec::DecodeADPCM`); the dump has
+`typeinfo for std::bad_alloc` on the stack. The console log of that session (188,400 frames)
+shows in-use heap flat, 194 -> 212 MiB (growing with pipelines 65 -> 2886), while the arena
+grew 208 -> 245 MiB, the whole 240 MiB block: ~33 MiB free, in pieces too small for 258 KiB.
+
+`heapprof` now also measures fragmentation, every 10 s:
+- `heapfrag`: arena, used, free bytes and chunks, the largest free chunk, the top chunk, free bytes
+  by chunk size (a walk of newlib's free lists under the malloc lock);
+- `heapbig`: every allocation of 32 KiB or more (exact, not sampled) by call site: bytes, count,
+  frees and largest size since the last report, and how many are still live;
+- a failed allocation prints its size and the free-list numbers even with the profile off;
+- reports are appended to `ux0:data/mh4u/heapprof.txt` (kept open, one write per report: opening
+  it each time cost ~150 ms of game time). A report takes ~6 ms.
+
+First look (slot 1, 1 min): the audio sink callback allocates and frees a 32 KiB buffer ~68
+times a second, and `Service::FS::File::Read` allocates buffers up to 685 KiB per read; both are
+churn that can leave holes for long-lived objects to pin. Next: a long user session with
+`heapprof`, then plan the fix from where the free space ends up.
