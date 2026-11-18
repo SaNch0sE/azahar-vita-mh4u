@@ -5156,10 +5156,33 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
         VertexAttribute{"gs_corner", 0, SCE_GXM_ATTRIBUTE_FORMAT_U8, 4,
                         static_cast<u8>(corner_stream)};
 
-    // The expanded streams in the ring: each point's loader bytes once per pattern entry.
+    // The expanded streams in the ring: each point's loader bytes once per distinct corner
+    // (a quad's two triangles name four corners in six entries), drawn through an index list
+    // so the GPU's post-transform cache runs the fused program once per corner, not once per
+    // entry - a third less vertex work for MH4U's grass (2026-11-18). `nohwgsidx`: one copy
+    // per pattern entry and the identity indices, as before.
+    static const bool no_index = GxmFlag("nohwgsidx");
     const u32 per_point = static_cast<u32>(program.pattern.size());
     const u32 points = payload.num_vertices;
-    const u32 vertex_count = points * per_point;
+    const u32 vertex_count = points * per_point; // indices drawn
+    std::array<u8, 4> slot_of{0xFF, 0xFF, 0xFF, 0xFF};
+    std::array<u8, 4> corner_of{};
+    u32 unique = 0;
+    for (u32 j = 0; j < per_point; j++) {
+        const u32 c = program.pattern[j];
+        if (c < 4 && slot_of[c] == 0xFF) {
+            slot_of[c] = static_cast<u8>(unique);
+            corner_of[unique++] = static_cast<u8>(c);
+        }
+    }
+    bool all_known = true;
+    for (u32 j = 0; j < per_point; j++) {
+        all_known = all_known && program.pattern[j] < 4;
+    }
+    const bool indexed = !no_index && all_known && unique != 0 && unique < per_point &&
+                         static_cast<u64>(points) * unique <= 0xFFFF;
+    const u32 per_point_stored = indexed ? unique : per_point;
+    const u32 stored = points * per_point_stored; // vertices written
     if (per_point == 0 || vertex_count > MaxVerticesPerDraw) {
         stat_gs_declined++;
         return false;
@@ -5168,7 +5191,11 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
     u32 total = 0;
     for (u32 stream = 0; stream < layout.stream_count; stream++) {
         stream_ring_offset[stream] = total;
-        total += Common::AlignUp(vertex_count * layout.strides[stream], 16);
+        total += Common::AlignUp(stored * layout.strides[stream], 16);
+    }
+    const u32 index_ring_offset = total;
+    if (indexed) {
+        total += Common::AlignUp(vertex_count * static_cast<u32>(sizeof(u16)), 16);
     }
     total = Common::AlignUp<u32>(std::max<u32>(total, 1), sizeof(Pica::OutputVertex));
     if (total > ring_size / 2) {
@@ -5210,18 +5237,24 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
                                   payload.layout.loader_offset[stream_loader[stream]] +
                                   static_cast<std::size_t>(row) * stride;
             u8* dst = base + stream_ring_offset[stream] +
-                      static_cast<std::size_t>(p) * per_point * stride;
-            for (u32 j = 0; j < per_point; j++, dst += stride) {
+                      static_cast<std::size_t>(p) * per_point_stored * stride;
+            for (u32 j = 0; j < per_point_stored; j++, dst += stride) {
                 std::memcpy(dst, src, stride);
             }
         }
-        u8* corner = base + stream_ring_offset[corner_stream] + p * per_point * 4;
-        for (u32 j = 0; j < per_point; j++, corner += 4) {
-            const u32 c = program.pattern[j];
+        u8* corner = base + stream_ring_offset[corner_stream] + p * per_point_stored * 4;
+        for (u32 j = 0; j < per_point_stored; j++, corner += 4) {
+            const u32 c = indexed ? corner_of[j] : program.pattern[j];
             corner[0] = c == 0;
             corner[1] = c == 1;
             corner[2] = c == 2;
             corner[3] = c == 3;
+        }
+        if (indexed) {
+            u16* idx = reinterpret_cast<u16*>(base + index_ring_offset) + p * per_point;
+            for (u32 j = 0; j < per_point; j++) {
+                idx[j] = static_cast<u16>(p * unique + slot_of[program.pattern[j]]);
+            }
         }
     }
 
@@ -5248,9 +5281,11 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
         }
         DrawTrace("hw gs draw");
         sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
-                   identity_indices, vertex_count);
+                   indexed ? static_cast<const void*>(base + index_ring_offset)
+                           : static_cast<const void*>(identity_indices),
+                   vertex_count);
     }
-    stat_vertices += vertex_count;
+    stat_vertices += stored;
     ring_scene_pos = std::max(ring_scene_pos, hw_ring_end);
     stat_ring_peak = std::max(
         stat_ring_peak,

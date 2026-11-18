@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include <imgui_vita2d/imgui.h>
+#include <imgui_vita2d/imgui_internal.h>
 
 #include "citra_vita/imgui_impl_gxm.h"
 
@@ -559,7 +560,31 @@ void Ui::DrawStatsHud() {
     ImGui::End();
 }
 
+namespace {
+/// ImGui 1.79 applies a pad/stick navigation move a frame after it was requested, and asserts
+/// (`g.NavWindow && result->Window`, imgui.cpp:8873) that the window it moved in still exists.
+/// The menus swap whole windows between frames (pause -> save states -> the "Saving..."
+/// status), so a direction held while a screen changed ended the app from the render thread
+/// (core dump 2026-11-18). A move whose window is gone is cancelled before the frame starts.
+void CancelStaleNavMove() {
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    if (ctx == nullptr || !ctx->NavMoveRequest) {
+        return;
+    }
+    const auto gone = [](const ImGuiWindow* w) { return w == nullptr || !w->Active; };
+    const bool local = ctx->NavMoveResultLocal.ID != 0;
+    const bool other = ctx->NavMoveResultOther.ID != 0;
+    if (gone(ctx->NavWindow) || (local && gone(ctx->NavMoveResultLocal.Window)) ||
+        (other && gone(ctx->NavMoveResultOther.Window))) {
+        ImGui::NavMoveRequestCancel();
+        ctx->NavMoveResultLocal.Clear();
+        ctx->NavMoveResultOther.Clear();
+    }
+}
+} // Anonymous namespace
+
 Ui::Action Ui::Update() {
+    CancelStaleNavMove();
     ImGui_ImplGxm_NewFrame();
 
     Action action = Action::None;

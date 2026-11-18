@@ -901,3 +901,22 @@ by default now; `nohwgs` (flag or ux0:data/mh4u/nohwgs) restores the software pa
 release at slot 1: game 29.8, shown 28.0, speed 99%. Next candidates from Fable's ranking: four
 indexed corners per point instead of six (a third less fused vertex work), merging consecutive
 GS draws, a CPU/GPU hybrid split, a cheaper CPU GS (emit path, JIT).
+
+**Crash in the pause menu (core dump 2026-11-18 10:53):** the render thread aborted on ImGui
+1.79's `IM_ASSERT(g.NavWindow && result->Window)` (imgui.cpp:8873; strings and line read from the
+dump's registers). The SDK's prebuilt imgui keeps its asserts. A pad move is applied a frame after
+it is requested; the menus swap whole windows between frames (pause -> save states -> the status
+window), so a direction landing on a switch left the move pointing at a window that was gone.
+Ui::Update now cancels a pending move whose window was not drawn last frame (CancelStaleNavMove)
+before NewFrame. Stress test (directions pressed together with Circle/Cross on every switch, three
+rounds): no crash.
+
+**GPU GS corners indexed:** a point's four distinct corners are written once and drawn through a
+16-bit index list (`nohwgsidx`: six copies as before). Slot 1: 42.6 vs 42.7 ms - the vertex stage
+was never the limit there - but a third less ring data and vertex work.
+
+**Slot 1, second view (GPU-bound, 2026-11-18):** game 30, shown ~24. Diag scenetime 42.4 / 41.6 /
+42.6 ms (vertex 4.7); `ptoffop` 17.3, `ptoffbl` 39.9, `nofog` 40.8, `dbgopaque` 41.9,
+`dbgshadowzero` 42.7, `reflone` 42.9, `nohwgs` 42.8, `dbgminfs` 7.4. ~25 ms is the unblended
+alpha-tested draws (the grass cut-out cards). Fable: the existing `prepass` never reached GS draws
+(AccelerateShippedDraw only), and the kill comes after lighting and the combiner.
