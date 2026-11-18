@@ -880,3 +880,9 @@ against the old code: mean difference 0.29/255, the changed pixels all on the an
 **Program cache versioning (F2):** programs.bin's version hashes the emitters, the shader
 generator, the PICA headers and gxm_program_epoch.h, no longer the whole of gxm_rasterizer.cpp,
 whose edits reset every player's cache for nothing. The epoch file says when to bump it.
+
+**Per-vertex highlights as a setting, tried and removed (2026-11-18).** Shipped briefly as a
+pause-menu option (83e4d6ddf). Playtest: no practical gain (sharp bilinear fits without it too;
+1.25x still too slow), and the water by the camp's pond (slot 1 area) turned fully white - the
+water material's highlight does not survive per-vertex N.H. Reverted; `pvhalf` is a diag flag
+again and would need that water fixed before any further use.
