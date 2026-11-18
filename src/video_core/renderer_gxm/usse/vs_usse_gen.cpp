@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include "video_core/renderer_gxm/gxm_video_options.h"
 #include <nihstro/shader_bytecode.h>
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
@@ -605,7 +606,8 @@ void VertexEmitter::Layout() {
     // PvHalf: two light directions (xyz) for per-vertex N.H, [0].w the switch, on programs
     // that write the quaternion (the lit ones); see Epilogue.
     {
-        static const bool off = !GxmFlag("pvhalf") || GxmFlag("nopvnormal");
+        static const bool off =
+            !(GxmFlag("pvhalf") || GxmRenderer::Video().pv_half) || GxmFlag("nopvnormal");
         const VsSemantic& q = req.semantics[SemQuaternionX];
         if (!off && q.attribute < req.num_outputs && q.attribute < 16) {
             pv_half_sa = static_cast<int>(resident);

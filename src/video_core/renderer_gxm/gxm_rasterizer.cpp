@@ -8,6 +8,7 @@
 #include <psp2/kernel/clib.h>
 #endif
 #include <unordered_map>
+#include "video_core/renderer_gxm/gxm_video_options.h"
 #include "common/vita_data_dir.h"
 #include <map>
 #include <bit>
@@ -361,9 +362,13 @@ bool RasterizerGxm::EnsureResources() {
         const u64 flags_hash = flags.empty() ? 0 : Common::ComputeHash64(flags.data(), flags.size());
         // A run with flags keeps its own file: sharing programs.bin made every diagnostic run
         // start the player's cache over, and the next game session paid every program again.
-        const std::string file = flags.empty()
-                                     ? std::string(VITA_DATA_DIR "/programs.bin")
-                                     : std::string(VITA_DATA_DIR "/programs_diag.bin");
+        // Per-vertex highlights (a setting, read once) change the vertex programs without
+        // changing their keys: such a run keeps its own file, the player's usual one intact.
+        const bool pv_half_setting = GxmRenderer::Video().pv_half;
+        const std::string file =
+            !flags.empty()   ? std::string(VITA_DATA_DIR "/programs_diag.bin")
+            : pv_half_setting ? std::string(VITA_DATA_DIR "/programs_pvhalf.bin")
+                              : std::string(VITA_DATA_DIR "/programs.bin");
         program_cache = std::make_unique<ProgramDiskCache>(
             file, fmt::format("{}-{:016x}", GXM_PROGRAM_VERSION, flags_hash));
     }
@@ -1913,7 +1918,8 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     {
         // Opt-in (`pvhalf`): at the camp it moved nothing (36.4 against 36.3 ms) - most of the
         // highlight cost is not the half vector.
-        static const bool off = !GxmFlag("pvhalf") || GxmFlag("nopvnormal");
+        static const bool off =
+            !(GxmFlag("pvhalf") || GxmRenderer::Video().pv_half) || GxmFlag("nopvnormal");
         const auto& lt = fs_config.lighting;
         using Usse::ReflMode;
         const ReflMode rmode = Usse::ReflModeOf(fs_config);
