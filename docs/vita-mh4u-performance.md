@@ -931,3 +931,12 @@ combiner + kill 31.3. The pre-pass is now on by default for GPU GS draws only (`
 turns it off; shipped draws keep the opt-in `prepass`). Release: slot 1 shown 24 -> 29.7, game
 29.7, speed 99%; slot 7 30.0 unchanged. Left on the table: the depth pass's ~9 ms (front-to-back
 card order, an earlier kill in the emitter).
+
+**Slow intro after the game's own Quit, after a save state (2026-11-18, user report).** A save
+state carries the code with the movie-poll patch already applied (`svc 0xF0` at the branch).
+After a state load Mh4uPatchFmvPoll saw that word, logged "code differs, not patched" and gave
+up, so the svc ran without its handler (the v1.0 shift of a web-installer mod lost) and the movie
+decoder spun: after Quit Game the intro alternated 100% and 7-20% speed (diag). The check now
+accepts the already-patched word. Release, same sequence (slot 2, Quit Game from Val Habar):
+100% / 30 fps for the following minute. The glitched line at the bottom of that intro is a
+separate issue, not yet looked at.

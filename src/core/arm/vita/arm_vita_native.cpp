@@ -670,8 +670,17 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
     for (const u32 shift : Mh4uFmvShifts) {
         bool match = true;
         for (const auto& [addr, word] : expected) {
-            if (!memory.IsValidVirtualAddress(*process, addr + shift) ||
-                memory.Read32(addr + shift) != word) {
+            if (!memory.IsValidVirtualAddress(*process, addr + shift)) {
+                match = false;
+                break;
+            }
+            const u32 have = memory.Read32(addr + shift);
+            // A save state carries the code as it was: already patched. Taking the svc for
+            // "code differs" left the patch unrecognised after a state load - the svc ran without
+            // its handler (the v1.0 shift lost) and the movie decoder spun: the intro after the
+            // game's own Quit ran at ~10% speed (2026-11-18).
+            const bool already = addr == Mh4uFmvPollBranch && have == (0xEF000000u | Mh4uFmvSvc);
+            if (have != word && !already) {
                 match = false;
                 break;
             }
