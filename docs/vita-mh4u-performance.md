@@ -940,3 +940,9 @@ decoder spun: after Quit Game the intro alternated 100% and 7-20% speed (diag). 
 accepts the already-patched word. Release, same sequence (slot 2, Quit Game from Val Habar):
 100% / 30 fps for the following minute. The glitched line at the bottom of that intro is a
 separate issue, not yet looked at.
+
+**Power-off loading slot 7 (2026-11-18), caused by a4824a3c5.** That fix re-wrote the movie-poll
+svc and synced its code page right after a state load; loading slot 7 (a state from the previous,
+v1.1-built mod) then switched the console off, twice, no core dump. The same build without the
+fix loaded it at 30 fps. Now an already-patched poll only sets the shift (no write, no SyncCode).
+Slot 2 quit intro 100% / 30 fps; slot 7 loads at 30 fps.

@@ -669,6 +669,7 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
     }};
     for (const u32 shift : Mh4uFmvShifts) {
         bool match = true;
+        bool patched = false;
         for (const auto& [addr, word] : expected) {
             if (!memory.IsValidVirtualAddress(*process, addr + shift)) {
                 match = false;
@@ -684,6 +685,15 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
                 match = false;
                 break;
             }
+            patched = patched || already;
+        }
+        if (match && patched) {
+            // Already in place (a save state's code): only the addresses are needed. Writing it
+            // again and syncing the code page right after a state load powered the console off
+            // with a state made from another build of the mod (slot 7, 2026-11-18, twice).
+            fmv_shift = shift;
+            LOG_INFO(Core_ARM11, "MH4U movie poll at {:08X}: already patched", Mh4uFmvPollBranch + shift);
+            return;
         }
         if (!match) {
             continue;
