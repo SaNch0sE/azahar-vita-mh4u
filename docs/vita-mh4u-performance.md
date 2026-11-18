@@ -946,3 +946,12 @@ svc and synced its code page right after a state load; loading slot 7 (a state f
 v1.1-built mod) then switched the console off, twice, no core dump. The same build without the
 fix loaded it at 30 fps. Now an already-patched poll only sets the shift (no write, no SyncCode).
 Slot 2 quit intro 100% / 30 fps; slot 7 loads at 30 fps.
+
+**Noise line at the bottom of the intro after Quit Game (2026-11-18).** The half-pixel viewport
+shift (2026-11-16, for crisp HUD letters) moved every draw on both framebuffer axes. The top screen
+is stored rotated, so framebuffer x is the screen's vertical: the x half made the movie quad's last
+row sample half a texel past the frame. On a fresh boot that memory is zero (black, invisible);
+after gameplay it holds leftovers, hence a line of noise. Tested on the slot 2 quit sequence:
+x-only shift kept the line, y-only removed it, and the HUD letters are as crisp with y alone
+(slot 7). The shift is now y-only; `halfpixelxy` (diag) restores both axes, `nohalfpixel` still
+turns it off. A HUD-only scope did not work: the movie frames also run the grade pass.

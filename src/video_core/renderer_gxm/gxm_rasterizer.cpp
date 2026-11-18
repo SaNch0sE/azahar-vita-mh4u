@@ -1555,12 +1555,15 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
     // y scale is positive: NDC +1 lands on the highest row index, the top of the picture.
     // A scaled framebuffer (render scale) takes all of these in storage texels.
     const auto vp = helper.Viewport();
-    // dbghudhalf (diag): the 2D layer's viewport moved by half a pixel on both axes.
-    // Every draw's viewport moved by half a pixel on both axes: the PICA and GXM differ by
-    // half a pixel in where a primitive's pixels sample, so without it MH4U's HUD letters
-    // (one texel per pixel) were sampled between texels - "(No Item)" read "(No Itarr)" at
-    // native resolution, crisp on a real 3DS (2026-11-16). `nohalfpixel` (flag or
-    // ux0:data/mh4u/nohalfpixel) turns it off; dbghudhalf (diag) applies it to the HUD only.
+    // The viewport moved by half a pixel along the framebuffer's y axis: the PICA and GXM differ
+    // by half a pixel in where a primitive's pixels sample, so without it MH4U's HUD letters (one
+    // texel per pixel) were sampled between texels - "(No Item)" read "(No Itarr)" at native
+    // resolution, crisp on a real 3DS (2026-11-16). It was on both axes until 2026-11-18; the x
+    // half (the top screen is rotated: framebuffer x is the screen's vertical) moved the intro
+    // movie's last row half a texel past the frame, and after gameplay that memory holds
+    // leftovers - a line of noise at the bottom of the intro after the game's Quit. The letters
+    // are as crisp with y alone. `nohalfpixel` (flag or ux0:data/mh4u/nohalfpixel) turns it off;
+    // `halfpixelxy` (diag) shifts both axes as before.
     static const bool no_half = GxmFlag("nohalfpixel") || [] {
         if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nohalfpixel", "rb")) {
             std::fclose(f);
@@ -1568,13 +1571,9 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
         }
         return false;
     }();
-    static const bool hud_half = GxmFlag("dbghudhalf");
-    const float hud_shift =
-        !no_half || (hud_half && hud_phase &&
-                     fb_regs.framebuffer.GetColorBufferPhysicalAddress() == hud_target)
-            ? 0.5f
-            : 0.0f;
-    const float vx = fb->SXf(static_cast<float>(vp.x)) + hud_shift,
+    static const bool both_axes = GxmFlag("halfpixelxy");
+    const float hud_shift = !no_half ? 0.5f : 0.0f;
+    const float vx = fb->SXf(static_cast<float>(vp.x)) + (both_axes ? hud_shift : 0.0f),
                 vy = fb->SXf(static_cast<float>(vp.y)) + hud_shift;
     const float vw = fb->SXf(static_cast<float>(vp.width)),
                 vh = fb->SXf(static_cast<float>(vp.height));
