@@ -17,8 +17,8 @@
 
 namespace Core {
 
-/// The MH4U program the movie-poll fix recognised: 11 (v1.1), 10 (v1.0), -1 (neither), 0 (not
-/// looked yet). For the bug report.
+/// The MH4U program the movie-poll fix recognised: 11 (USA v1.1), 10 (USA v1.0), 21 (EUR v1.1),
+/// -1 (none of them), 0 (not looked yet). For the bug report.
 extern std::atomic<int> mh4u_code_version;
 
 class System;

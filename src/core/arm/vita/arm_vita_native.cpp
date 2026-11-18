@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <span>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -83,6 +84,8 @@ const char* ReasonName(u32 reason) {
 }
 
 constexpr u64 Mh4uTitleId = 0x0004000000126300;
+/// The European release (update v1.1.0, title version 1040). Untested: we have no EUR dump.
+constexpr u64 Mh4uTitleIdEur = 0x0004000000126100;
 constexpr u32 Mh4uFmvPollBranch = 0x00968764;
 constexpr u32 Mh4uFmvPollReturn = 0x009687AC;
 constexpr u32 Mh4uFmvSvc = 0xF0;
@@ -90,6 +93,10 @@ constexpr u32 Mh4uFmvLoopReturn = 0x0096417C;
 /// The same code in the game without its update (v1.0, which the Heavenfall web installer's mod
 /// is built from): 0x698 bytes lower. Each candidate is checked word by word before patching.
 constexpr std::array<u32, 2> Mh4uFmvShifts{0u, 0u - 0x698u};
+/// EUR v1.1.0: 0x38 bytes higher than USA v1.1. From MH4UltimateDC's address map
+/// (config/shifts/eur_v110.txt, https://github.com/CompaLarios18/MH4UltimateDC), which maps the
+/// branch, the return and the loop return all by +0x38.
+constexpr std::array<u32, 1> Mh4uFmvShiftsEur{0x38u};
 
 } // Anonymous namespace
 
@@ -659,9 +666,18 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
     }
     fmv_patch_process = process.get();
     static const bool off = GxmRenderer::GxmFlag("nofmvsleep");
-    if (off || process->codeset == nullptr || process->codeset->program_id != Mh4uTitleId) {
+    if (off || process->codeset == nullptr) {
         return;
     }
+    const u64 program_id = process->codeset->program_id;
+    const bool eur = program_id == Mh4uTitleIdEur;
+    if (program_id != Mh4uTitleId && !eur) {
+        return;
+    }
+    const std::span<const u32> shifts =
+        eur ? std::span<const u32>{Mh4uFmvShiftsEur} : std::span<const u32>{Mh4uFmvShifts};
+    // mh4u_code_version: 11 USA v1.1, 10 USA v1.0, 21 EUR v1.1.
+    const auto version = [eur](u32 shift) { return eur ? 21 : shift == 0 ? 11 : 10; };
     // The test and branch, and the epilogue the handler resumes at (frame: 28 bytes, r4-r11, pc).
     static constexpr std::array<std::pair<u32, u32>, 7> expected{{
         {Mh4uFmvPollBranch - 12, 0xE5940014}, {Mh4uFmvPollBranch - 8, 0xE0400008},
@@ -669,7 +685,7 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
         {Mh4uFmvPollBranch + 4, 0xE5940080},  {Mh4uFmvPollReturn, 0xE28DD01C},
         {Mh4uFmvPollReturn + 4, 0xE8BD8FF0},
     }};
-    for (const u32 shift : Mh4uFmvShifts) {
+    for (const u32 shift : shifts) {
         bool match = true;
         bool patched = false;
         for (const auto& [addr, word] : expected) {
@@ -694,7 +710,7 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
             // again and syncing the code page right after a state load powered the console off
             // with a state made from another build of the mod (slot 7, 2026-11-18, twice).
             fmv_shift = shift;
-            mh4u_code_version.store(shift == 0 ? 11 : 10, std::memory_order_relaxed);
+            mh4u_code_version.store(version(shift), std::memory_order_relaxed);
             LOG_INFO(Core_ARM11, "MH4U movie poll at {:08X}: already patched", Mh4uFmvPollBranch + shift);
             return;
         }
@@ -702,7 +718,7 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
             continue;
         }
         fmv_shift = shift;
-        mh4u_code_version.store(shift == 0 ? 11 : 10, std::memory_order_relaxed);
+        mh4u_code_version.store(version(shift), std::memory_order_relaxed);
         const u32 branch = Mh4uFmvPollBranch + shift;
         memory.Write32(branch, 0xEF000000u | Mh4uFmvSvc);
         map->SyncCode(branch & ~0xFFFu, 0x1000);

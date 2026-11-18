@@ -271,6 +271,8 @@ const char* GameProgramName() {
         return "v1.1 (the update's program)";
     case 10:
         return "v1.0 (the base game's program, as the web installer's mod brings)";
+    case 21:
+        return "EUR v1.1 (the European update's program)";
     case -1:
         return "not recognised (the port's game fixes are off)";
     default:
@@ -356,8 +358,11 @@ std::string WriteBugReport(bool with_state) {
     report += fmt::format("Save state included: {}\n", with_state && !state.empty() ? state : "no");
     report += fmt::format("Crash dump included: {}\n\n", dump.empty() ? "none on the card" : dump);
 
-    const std::string mod = base + "/load/mods/0004000000126300";
-    report += "== Mod folder (load/mods/0004000000126300)\n";
+    // The European release is 00126100, the American 00126300.
+    const bool eur = Core::mh4u_code_version.load(std::memory_order_relaxed) == 21;
+    const std::string title = eur ? "0004000000126100" : "0004000000126300";
+    const std::string mod = base + "/load/mods/" + title;
+    report += fmt::format("== Mod folder (load/mods/{})\n", title);
     ListInto(report, mod, 0);
     report += "  romfs:\n";
     ListInto(report, mod + "/romfs", 2);
@@ -373,7 +378,8 @@ std::string WriteBugReport(bool with_state) {
             report += fmt::format("{}  {} bytes\n", e.name, e.size);
         }
     }
-    for (const char* name : {"video.txt", "gxm_flags.txt", "cheats/0004000000126300.txt"}) {
+    for (const std::string& name : {std::string("video.txt"), std::string("gxm_flags.txt"),
+                                    "cheats/" + title + ".txt"}) {
         std::string text;
         if (ReadText(base + "/" + name, text)) {
             report += fmt::format("\n== {}\n{}\n", name, text);
@@ -390,8 +396,14 @@ std::string WriteBugReport(bool with_state) {
 
     ZipWriter zip{path};
     zip.AddText("report.txt", report);
-    zip.AddTree("save/", base + "/sdmc/title/00040000/00126300/data");
-    zip.AddTree("extdata/", base + "/sdmc/extdata/00000000/00001263");
+    zip.AddTree("save/", base + "/sdmc/title/00040000/" + title.substr(8) + "/data");
+    // The game's extra data (00001263 for the American release; any 0000126x folder, so the
+    // European one is found too without knowing its id).
+    for (const Entry& e : ListDir(base + "/sdmc/extdata/00000000")) {
+        if (e.dir && e.name.rfind("0000126", 0) == 0) {
+            zip.AddTree("extdata/" + e.name + "/", base + "/sdmc/extdata/00000000/" + e.name);
+        }
+    }
     if (!dump.empty()) {
         zip.AddFile("crash/" + dump, "ux0:data/" + dump, true);
     }

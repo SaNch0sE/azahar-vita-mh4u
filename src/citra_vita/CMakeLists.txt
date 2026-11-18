@@ -199,6 +199,7 @@ vita_create_vpk(citra_vita.vpk ${VITA_TITLEID} citra_vita.self
     # Razor HUD reads its settings from app0:; LIVE=1 is what lets GPU Live Metrics start.
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/hud_settings.ini hud_settings.ini
         ${CMAKE_CURRENT_SOURCE_DIR}/cheats/0004000000126300.txt cheats/0004000000126300.txt
+        ${CMAKE_CURRENT_SOURCE_DIR}/cheats/0004000000126100.txt cheats/0004000000126100.txt
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png sce_sys/icon0.png
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png

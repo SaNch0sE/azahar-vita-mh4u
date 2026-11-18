@@ -402,8 +402,19 @@ std::string FindRom() {
 /// v1.0 (the web installer's build; its pointer 8 bytes lower), each behind its own version check.
 /// 3D and bloom stay off (the mod's installer defaults already do them). Each code first checks a v1.1 instruction, so on the game without its
 /// update - whose code sits elsewhere - it does nothing.
+/// The European release (0004000000126100) has its own file: the same data addresses (they lie
+/// outside the code, which is all that moved), bloom's render function 0x20 bytes higher, and no
+/// v1.0 block (EUR addresses from MH4UltimateDC's map, https://github.com/CompaLarios18/MH4UltimateDC).
+/// Untested: we have no EUR dump.
+void InstallDefaultCheatFile(const char* Name);
+
 void InstallDefaultCheats() {
-    constexpr char Name[] = "0004000000126300.txt";
+    for (const char* name : {"0004000000126300.txt", "0004000000126100.txt"}) {
+        InstallDefaultCheatFile(name);
+    }
+}
+
+void InstallDefaultCheatFile(const char* Name) {
     const std::string dest = std::string(VITA_DATA_DIR "/cheats/") + Name;
     SceIoStat st{};
     if (sceIoGetstat(dest.c_str(), &st) >= 0) {
