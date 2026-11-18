@@ -116,7 +116,9 @@ private:
     std::atomic<bool> enable_time_stretching = false;
     std::atomic<bool> performing_time_stretching = false;
     std::atomic<bool> flushing_time_stretcher = false;
-    Common::RingBuffer<s16, 0x2000, 2> fifo;
+    static constexpr std::size_t FifoSlots = 0x2000;
+    Common::RingBuffer<s16, FifoSlots, 2> fifo;
+    std::vector<s16> stretch_in; ///< the time stretcher's input, popped from fifo (reused)
     std::array<s16, 2> last_frame{};
     TimeStretcher time_stretcher;
     std::unique_ptr<Sink> sink;

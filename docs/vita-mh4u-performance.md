@@ -991,3 +991,17 @@ First look (slot 1, 1 min): the audio sink callback allocates and frees a 32 KiB
 times a second, and `Service::FS::File::Read` allocates buffers up to 685 KiB per read; both are
 churn that can leave holes for long-lived objects to pin. Next: a long user session with
 `heapprof`, then plan the fix from where the free space ends up.
+
+**Fix, first batch (BigArena).** `src/common/big_arena.{h,cpp}`: an 8 MiB block taken from the
+heap at start-up (kill switch `ux0:data/mh4u/nobigarena`), 4 KiB granules, best fit with
+coalescing, one mutex; requests under 32 KiB or that do not fit go to malloc. Routed through it:
+the GPU command list snapshots (`GPU::QueueCmdList`), decoded audio (`StereoBuffer16`'s vector)
+and file read buffers (`File::Read`). The time stretcher pops into one persistent buffer instead
+of a new 32 KiB vector per callback. (Its float conversion vectors are unused here: the Vita's
+SoundTouch is built with integer samples.) Slot 1, 2 min with `heapprof`: the `heapbig` churn is
+gone (0 KiB a window, from 15+ MiB), arena peak 1.5 of 8 MiB, no fallbacks, 30 fps. The health
+line now ends with `bigarena used/capacity peak largest fallbacks`.
+
+heapprof: the pointer table now deletes by backward shift (tombstones had filled it after an hour
+and stopped sampling), has 65536 slots, prints `dropped` samples, and lists `heapgrow`: the sites
+whose live bytes grew most since a baseline taken at two minutes.

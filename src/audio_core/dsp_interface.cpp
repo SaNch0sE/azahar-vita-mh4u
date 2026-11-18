@@ -82,9 +82,13 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
 
     std::size_t frames_written = 0;
     if (performing_time_stretching) {
-        const std::vector<s16> in{fifo.Pop()};
-        const std::size_t num_in{in.size() / 2};
-        frames_written = time_stretcher.Process(in.data(), num_in, buffer, num_frames);
+        // One persistent buffer: a fresh 32 KiB vector per callback (~47 a second) was a large
+        // share of the heap churn that fragmented the Vita's fixed heap.
+        if (stretch_in.empty()) {
+            stretch_in.resize(FifoSlots * 2);
+        }
+        const std::size_t num_in{fifo.Pop(stretch_in.data(), FifoSlots)};
+        frames_written = time_stretcher.Process(stretch_in.data(), num_in, buffer, num_frames);
     } else {
         if (flushing_time_stretcher) {
             time_stretcher.Flush();

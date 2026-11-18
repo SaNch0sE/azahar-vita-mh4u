@@ -45,14 +45,14 @@
 namespace {
 
 constexpr std::size_t SamplePeriod = 64 * 1024;
-constexpr std::size_t PtrSlots = 1 << 15; // sampled live allocations (power of two)
+constexpr std::size_t PtrSlots = 1 << 16; // sampled live allocations (power of two)
 constexpr std::size_t SiteSlots = 1 << 11;
 constexpr std::size_t BigMin = 32 * 1024; // recorded exactly from this size up
 // The executable's text (the data segment starts above it, at 0x81a60000 in this layout).
 constexpr std::uintptr_t TextLo = 0x81000000u, TextHi = 0x81a60000u;
 
 struct PtrSlot {
-    std::uintptr_t ptr; // 0 empty, 1 tombstone
+    std::uintptr_t ptr; // 0 empty
     std::uint32_t weight;
     std::uint16_t site;
     std::uint8_t big;
@@ -66,6 +66,7 @@ struct Site {
     std::uint32_t big_allocs, big_frees, big_max;
     std::int64_t big_bytes;
     std::int32_t big_live;
+    std::int64_t baseline; // live at the baseline report (growers list)
 };
 
 bool g_on = false;
@@ -81,6 +82,7 @@ std::mutex g_lock;
 PtrSlot* g_ptrs = nullptr;
 Site* g_sites = nullptr;
 std::size_t g_ptr_used = 0;
+std::size_t g_dropped = 0; // samples not recorded: the pointer table was too full
 std::atomic<std::int64_t> g_total{0};
 thread_local std::int64_t t_until_sample = SamplePeriod;
 
@@ -141,16 +143,15 @@ __attribute__((noinline)) void Sample(void* p, std::size_t size, std::uintptr_t 
     StackCallers(ra0, ra + 1);
     Lock lock;
     if (g_ptr_used >= PtrSlots * 3 / 4) {
+        g_dropped++;
         return;
     }
     const std::uint16_t site = SiteIndex(ra);
     std::size_t h = PtrHash(reinterpret_cast<std::uintptr_t>(p));
-    while (g_ptrs[h].ptr > 1) {
+    while (g_ptrs[h].ptr != 0) {
         h = (h + 1) & (PtrSlots - 1);
     }
-    if (g_ptrs[h].ptr == 0) {
-        g_ptr_used++;
-    }
+    g_ptr_used++;
     g_ptrs[h] = {reinterpret_cast<std::uintptr_t>(p), static_cast<std::uint32_t>(weight), site,
                  static_cast<std::uint8_t>(big)};
     Site& s = g_sites[site];
@@ -180,7 +181,24 @@ void Forget(void* p) {
                 s.big_live--;
             }
             g_total.fetch_sub(g_ptrs[h].weight, std::memory_order_relaxed);
-            g_ptrs[h].ptr = 1;
+            // Backward-shift deletion (no tombstones: with them the table filled up after an
+            // hour and sampling stopped): pull later entries of the probe run into the gap
+            // unless their home slot lies cyclically in (gap, j].
+            std::size_t i = h, j = h;
+            for (;;) {
+                j = (j + 1) & (PtrSlots - 1);
+                if (g_ptrs[j].ptr == 0) {
+                    break;
+                }
+                const std::size_t k = PtrHash(g_ptrs[j].ptr);
+                if (i <= j ? (i < k && k <= j) : (i < k || k <= j)) {
+                    continue;
+                }
+                g_ptrs[i] = g_ptrs[j];
+                i = j;
+            }
+            g_ptrs[i] = {};
+            g_ptr_used--;
             return;
         }
     }
@@ -338,8 +356,13 @@ void HeapProfReport(bool failure) {
         std::uintptr_t ra[3];
         std::int64_t live, delta;
         std::int32_t count;
-    } rows[Top] = {};
+    } rows[Top] = {}, growers[Top] = {};
     std::size_t sites_used = 0;
+    // Growers: live now minus live at the first report after two minutes (start-up loading
+    // done), to find growth spread over sites that never reach the top list.
+    static bool baseline_set = false;
+    const bool take_baseline =
+        !baseline_set && sceKernelGetProcessTimeWide() >= 120ull * 1000000;
     {
         Lock lock;
         for (std::size_t i = 0; i < SiteSlots; i++) {
@@ -350,6 +373,21 @@ void HeapProfReport(bool failure) {
             sites_used++;
             const Row r{{s.ra[0], s.ra[1], s.ra[2]}, s.live, s.live - s.reported, s.count};
             s.reported = s.live;
+            if (take_baseline) {
+                s.baseline = s.live;
+            }
+            if (baseline_set) {
+                const Row g{{s.ra[0], s.ra[1], s.ra[2]}, s.live, s.live - s.baseline, s.count};
+                for (std::size_t k = 0; k < Top; k++) {
+                    if (g.delta > growers[k].delta) {
+                        for (std::size_t m = Top - 1; m > k; m--) {
+                            growers[m] = growers[m - 1];
+                        }
+                        growers[k] = g;
+                        break;
+                    }
+                }
+            }
             // Big allocations, ranked by bytes allocated since the last report (the churn
             // that leaves holes), then the window restarts.
             const BigRow b{{s.ra[0], s.ra[1], s.ra[2]}, s.big_allocs, s.big_frees, s.big_max,
@@ -378,20 +416,28 @@ void HeapProfReport(bool failure) {
             }
         }
     }
+    baseline_set = baseline_set || take_baseline;
     if (failure) {
         Out("[mh4u] heapprof: ALLOCATION OF %u KiB FAILED\n",
             static_cast<unsigned>(g_failed_size / 1024));
     }
-    Out("[mh4u] heapprof t%u%s: sampled live %d KiB, %u sites, %u ptrs\n",
+    Out("[mh4u] heapprof t%u%s: sampled live %d KiB, %u sites, %u ptrs, %u dropped\n",
                   static_cast<unsigned>(sceKernelGetProcessTimeWide() / 1000000),
                   failure ? " (ALLOCATION FAILED)" : "",
                   static_cast<int>(g_total.load(std::memory_order_relaxed) / 1024),
-                  static_cast<unsigned>(sites_used), static_cast<unsigned>(g_ptr_used));
+                  static_cast<unsigned>(sites_used), static_cast<unsigned>(g_ptr_used),
+                  static_cast<unsigned>(g_dropped));
     for (std::size_t k = 0; k < Top && rows[k].live > 0; k++) {
         Out("[mh4u] heapprof  %6d KiB %+5d n%-5d %08x %08x %08x\n",
                       static_cast<int>(rows[k].live / 1024), static_cast<int>(rows[k].delta / 1024),
                       static_cast<int>(rows[k].count), static_cast<unsigned>(rows[k].ra[0]),
                       static_cast<unsigned>(rows[k].ra[1]), static_cast<unsigned>(rows[k].ra[2]));
+    }
+    for (std::size_t k = 0; k < Top && growers[k].delta > 0; k++) {
+        Out("[mh4u] heapgrow %+6d KiB live %6d n%-5d %08x %08x %08x\n",
+            static_cast<int>(growers[k].delta / 1024), static_cast<int>(growers[k].live / 1024),
+            static_cast<int>(growers[k].count), static_cast<unsigned>(growers[k].ra[0]),
+            static_cast<unsigned>(growers[k].ra[1]), static_cast<unsigned>(growers[k].ra[2]));
     }
     Out("[mh4u] heapfrag arena %u KiB, used %u, free %u in %u chunks, largest %u, top %u; "
         "free by chunk <4K %u <32K %u <128K %u <512K %u <2M %u >=2M %u\n",

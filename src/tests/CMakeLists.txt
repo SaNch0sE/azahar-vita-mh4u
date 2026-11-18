@@ -1,4 +1,5 @@
 add_executable(tests
+    common/big_arena.cpp
     common/bit_field.cpp
     common/file_util.cpp
     common/param_package.cpp

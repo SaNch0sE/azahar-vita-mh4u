@@ -37,6 +37,24 @@ Measurements and history are in `vita-mh4u-performance.md`.
    (`nobottomskip` keeps them): ~135 draws a frame on the deck; deck speed with the mod 82-86% ->
    90-93% (27-28 fps).
 
+## Testing and compatibility
+
+- **Long sessions (heap fragmentation).** In progress: large short-lived buffers moved to the
+  BigArena (performance notes, 2026-11-18). Still to do: the geometry-shader memo's scratch
+  recorder, the JIT label table, an emergency reserve, then a 90+ minute session with
+  `heapprof`; if in-use heap still grows ~6 MB an hour, cap the long-lived caches.
+- **Multiplayer: local and online.** Test local play (two Vitas, or a Vita and a PC running
+  Azahar) through Azahar's network rooms, and online play through a room server: does it
+  connect, does the frame rate hold, do quests stay in sync. MH4UltimateDC's
+  `docs/research/community-enhancements.md` (section 4) and its lobby/room server notes are a
+  starting point.
+- **EUR game (v1.1.0 update, 0004000E00126100).** Test the European release and find what to
+  improve. Our code patches (the movie poll fix, `Mh4uPatchFmvPoll`) know only the USA v1.0 and
+  v1.1 addresses, so EUR gets none (`code differs`). MH4UltimateDC's `config/shifts/eur_v110.txt`
+  maps USA v1.3.0 (title version 1072, the same build as our "v1.1") addresses to EUR: the movie
+  poll's `bcc` (0x968764) is at +0x38 there, so adding that shift to `Mh4uFmvShifts` may be all
+  the patch needs (it checks the code word by word before writing).
+
 ## Open bugs
 
 - Lit draws sent through the software vertex path (`nohwvs`, or the `litsw` experiment) hang

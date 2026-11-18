@@ -13,6 +13,7 @@
 #include <boost/serialization/level.hpp>
 #include <boost/serialization/tracking.hpp>
 #include <boost/serialization/split_member.hpp>
+#include "common/big_arena.h"
 #include "common/common_types.h"
 
 namespace AudioCore {
@@ -104,7 +105,9 @@ public:
     BOOST_SERIALIZATION_SPLIT_MEMBER()
 
 private:
-    std::vector<Sample> samples;
+    // Decoded buffers reach ~450 KiB and come and go with every sound: from the BigArena, so
+    // they stop fragmenting the main heap (one of them was the request that ran it out).
+    std::vector<Sample, Common::BigArena::Allocator<Sample>> samples;
     std::size_t head = 0;
 };
 

@@ -34,6 +34,7 @@
 #endif
 
 #include "citra_vita/bug_report.h"
+#include "common/big_arena.h"
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/input_factory_vita.h"
 
@@ -1142,6 +1143,15 @@ int EmulatorMain() {
     if (std::FILE* f = std::fopen(VITA_DATA_DIR "/heapprof", "rb")) {
         std::fclose(f);
         HeapProfInit(true);
+    }
+    // BigArena: 8 MiB of the heap for large short-lived buffers (GPU command list copies,
+    // decoded audio, file reads), which otherwise fragmented the heap until an allocation
+    // failed after 1-2 hours. Kill switch ux0:data/mh4u/nobigarena.
+    if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nobigarena", "rb")) {
+        std::fclose(f);
+        sceClibPrintf("[mh4u] bigarena off (nobigarena)\n");
+    } else if (!Common::BigArena::Init(8 * 1024 * 1024)) {
+        sceClibPrintf("[mh4u] bigarena: could not allocate\n");
     }
     Common::EmuProf::enabled = gx_prof_file || GxmRenderer::GxmFlag("emuprof") ||
                                GxmRenderer::GxmFlag("emuprofgx");

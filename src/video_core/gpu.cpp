@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "common/archives.h"
+#include "common/big_arena.h"
 #include "common/emu_prof.h"
 #include <thread>
 #include "common/vita_tuning.h"
@@ -1110,10 +1111,15 @@ void GPU::QueueCmdList(PAddr addr, u32 size) {
         std::memcpy(&header, head + size - 4, sizeof(header));
         early = (header & 0x3ff) == 0x010;
     }
-    std::shared_ptr<std::vector<u32>> snapshot;
-    if (allow && Common::gx_snapshot && head != nullptr) {
-        snapshot = std::make_shared<std::vector<u32>>(size / 4);
-        std::memcpy(snapshot->data(), head, size);
+    // The copy lives in the BigArena: ~44 lists a second of up to ~300 KiB, each freed after its
+    // parse, otherwise cut holes in the main heap that long-lived objects then pinned (out of
+    // heap after 1-2 hours). The shared_ptr frees it even if the task never runs.
+    std::shared_ptr<u8> snapshot;
+    if (allow && Common::gx_snapshot && head != nullptr && size != 0) {
+        if (void* copy = Common::BigArena::Alloc(size)) {
+            std::memcpy(copy, head, size);
+            snapshot = std::shared_ptr<u8>(static_cast<u8*>(copy), Common::BigArena::Deleter{});
+        }
     }
     if (!gx.lists_queued) {
         gx.lists_queued = true;
@@ -1132,8 +1138,7 @@ void GPU::QueueCmdList(PAddr addr, u32 size) {
         cmdbuffer.trigger[0] = 1;
         MICROPROFILE_SCOPE(GPU_CmdlistProcessing);
         const u64 list_t0 = Common::PipelineStats::NowUs();
-        impl->pica.SetListOverride(snapshot ? reinterpret_cast<const u8*>(snapshot->data())
-                                            : nullptr);
+        impl->pica.SetListOverride(snapshot.get());
         impl->pica.ProcessCmdList(addr, size, !allow);
         impl->pica.SetListOverride(nullptr);
         Common::PipelineStats::gx_list_total_us.fetch_add(Common::PipelineStats::NowUs() - list_t0, std::memory_order_relaxed);

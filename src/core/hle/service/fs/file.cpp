@@ -4,6 +4,7 @@
 
 #include <boost/serialization/unique_ptr.hpp>
 #include "common/archives.h"
+#include "common/big_arena.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
 #include "common/pipeline_stats.h"
@@ -55,6 +56,18 @@ File::File(Kernel::KernelSystem& kernel)
     RegisterHandlers(functions);
 }
 
+namespace {
+/// A read buffer from the BigArena: reads up to ~700 KiB, freed when the request is answered,
+/// otherwise cut holes in the Vita's fixed heap. Throws std::bad_alloc like make_unique did.
+Common::BigArena::Buffer ReadBuffer(std::size_t length) {
+    Common::BigArena::Buffer buffer = Common::BigArena::MakeBuffer(length);
+    if (!buffer) {
+        throw std::bad_alloc();
+    }
+    return buffer;
+}
+} // namespace
+
 void File::Read(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
     u64 offset = rp.Pop<u64>();
@@ -93,7 +106,7 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     if (!allows_cache_reads && (length < AsyncReadMin || sync_reads)) {
         auto& buffer = rp.PopMappedBuffer();
         IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
-        std::unique_ptr<u8[]> data = std::make_unique_for_overwrite<u8[]>(length);
+        Common::BigArena::Buffer data = ReadBuffer(length);
         const u64 read_t0 = Common::PipelineStats::NowUs();
         const auto read = backend->Read(offset, length, data.get());
         Common::PipelineStats::fs_read_us.fetch_add(
@@ -128,7 +141,7 @@ void File::Read(Kernel::HLERequestContext& ctx) {
         // Output
         Result ret{0};
         Kernel::MappedBuffer* buffer;
-        std::unique_ptr<u8[]> data;
+        Common::BigArena::Buffer data;
         std::size_t read_size;
     };
 
@@ -145,7 +158,7 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     // LOG_DEBUG(Service_FS, "cache={}, offset={}, length={}", cache_ready, offset, length);
     ctx.RunAsync(
         [this, async_data](Kernel::HLERequestContext& ctx) {
-            async_data->data = std::make_unique_for_overwrite<u8[]>(async_data->length);
+            async_data->data = ReadBuffer(async_data->length);
             const u64 read_t0 = Common::PipelineStats::NowUs();
             const auto read =
                 backend->Read(async_data->offset, async_data->length, async_data->data.get());

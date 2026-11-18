@@ -8,6 +8,7 @@
 #include <psp2/kernel/clib.h>
 #endif
 #include <unordered_map>
+#include "common/big_arena.h"
 #include "common/vita_data_dir.h"
 #include <map>
 #include <bit>
@@ -5790,9 +5791,11 @@ void RasterizerGxm::EndFrame() {
         });
         const auto memory = pipeline_cache->MemoryStats();
         const auto heap = mallinfo();
+        const auto arena = Common::BigArena::GetStats();
         sceClibPrintf("[mh4u] health f%u: surfaces %u (%u targets) %u KiB, %u sentenced, "
                       "cdram %u/%u KiB, mapped %u/%u KiB, shaders %u+%u, pipelines %u, "
-                      "heap %u/%u KiB, pending frees %u\n",
+                      "heap %u/%u KiB, pending frees %u, bigarena %u/%u peak %u largest %u KiB "
+                      "fallbacks %u\n",
                       frame_index, surfaces, targets, static_cast<u32>(surface_bytes / 1024),
                       static_cast<u32>(res_cache.SentencedCount()),
                       static_cast<u32>(runtime.CdramPool().Used() / 1024),
@@ -5803,7 +5806,10 @@ void RasterizerGxm::EndFrame() {
                       static_cast<u32>(memory.retired_shaders),
                       static_cast<u32>(memory.pipelines), static_cast<u32>(heap.uordblks / 1024),
                       static_cast<u32>(heap.arena / 1024),
-                      static_cast<u32>(runtime.PendingFreeCount()));
+                      static_cast<u32>(runtime.PendingFreeCount()),
+                      static_cast<u32>(arena.used / 1024), static_cast<u32>(arena.capacity / 1024),
+                      static_cast<u32>(arena.peak / 1024), static_cast<u32>(arena.largest / 1024),
+                      static_cast<u32>(arena.fallbacks));
     }
 #endif
     // flushlist: copy these regions back to guest memory at every frame end. Native execution

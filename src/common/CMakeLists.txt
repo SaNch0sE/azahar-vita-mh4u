@@ -11,6 +11,8 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     announce_multiplayer_room.h
     arch.h
     archives.h
+    big_arena.cpp
+    big_arena.h
     async_handle.h
     assert.h
     atomic_ops.h
