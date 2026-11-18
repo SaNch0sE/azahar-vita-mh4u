@@ -429,6 +429,11 @@ Ui::Action Ui::DrawPauseMenu() {
         state = State::Savestates;
         overlay_focused = false;
     }
+    if (ImGui::Button("Bug report", button_size)) {
+        state = State::BugReport;
+        report_message.clear();
+        overlay_focused = false;
+    }
 #ifdef VITA_DIAGNOSTICS
     if (ImGui::Button("Dump frame", button_size)) {
         // The next presented frame, screens only, to ux0:data/mh4u/frame_NN.ppm, and every
@@ -507,6 +512,56 @@ Ui::Action Ui::DrawSavestates() {
     ImGui::End();
 
     if (back) {
+        state = State::Pause;
+        overlay_focused = false;
+    }
+    return action;
+}
+
+Ui::Action Ui::DrawBugReport() {
+    Action action = Action::None;
+    if (report_pending) {
+        // The frame before this one showed "Saving...": now the frontend writes it (a few
+        // seconds, during which the screen holds that frame).
+        report_pending = false;
+        action = Action::SaveReport;
+    }
+    BeginCentered("##bugreport", 640.0f, 470.0f);
+    const bool appearing = ImGui::IsWindowAppearing();
+    ImGui::TextUnformatted("Bug report");
+    ImGui::Separator();
+    ImGui::TextWrapped("Saves one zip to ux0:data/mh4u/reports (the newest 3 are kept) with what we need to look into a "
+                       "problem: the app and game versions, your mod files list and settings, the "
+                       "speed of the last two minutes, your in-game save (it shows your hunter's "
+                       "name and guild cards) and the newest crash dump. Make it right after the "
+                       "problem happens.");
+    ImGui::Spacing();
+    const ImVec2 button_size{600.0f, 44.0f};
+    if (appearing) {
+        ImGui::SetKeyboardFocusHere();
+    }
+    if (ImGui::Button("Save report", button_size) && !report_pending) {
+        report_with_state = false;
+        report_pending = true;
+    }
+    if (ImGui::Button("Save report with the newest save state (+30 MB)", button_size) &&
+        !report_pending) {
+        report_with_state = true;
+        report_pending = true;
+    }
+    if (report_pending) {
+        report_message = "Saving the report...";
+    }
+    if (!report_message.empty()) {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", report_message.c_str());
+    }
+    ImGui::Separator();
+    const bool back = ImGui::Button("Back", ImVec2(200.0f, 40.0f)) || BackPressed();
+    overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGui::End();
+
+    if (back && !report_pending && action == Action::None) {
         state = State::Pause;
         overlay_focused = false;
     }
@@ -610,6 +665,9 @@ Ui::Action Ui::Update() {
             break;
         case State::Savestates:
             action = DrawSavestates();
+            break;
+        case State::BugReport:
+            action = DrawBugReport();
             break;
         }
     }

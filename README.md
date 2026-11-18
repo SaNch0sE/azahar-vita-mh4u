@@ -124,6 +124,7 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
 | `sdmc/`, `nand/`, `sysdata/` | the game's saves, the installed update, system data |
 | `states/` | save states (pause menu, **Save states**, slots 1-9) |
 | `video.txt` | the pause menu's picture settings |
+| `reports/` | bug reports (pause menu, **Bug report**); the newest 3 are kept |
 
 ## Pause menu (Select + Start)
 
@@ -132,7 +133,28 @@ Start **Monster Hunter 4 Ultimate** from the LiveArea. In the game, then:
   1 fps), FXAA, FPS counter (the speed and frame rate in the top right corner, on by default),
   picture shape, render scale (above 1x is much slower, and applies on
   the next start).
+- **Bug report**: saves one zip for reporting a problem (see below).
 - **Exit game**.
+
+## Reporting a problem
+
+Right after the problem happens, open the pause menu and choose **Bug report**:
+
+- **Save report** (about 1 MB) writes `ux0:data/mh4u/reports/mh4u_report_<date>_<time>.zip` with
+  the app and game versions, your mod folder's file list, your settings and cheat file, the game's
+  speed over the last two minutes, your in-game save and extra data, and the newest crash dump.
+- **Save report with the newest save state** adds your most recent save state (about 30 MB), for
+  problems that only show at one moment: save a state there first, then make the report.
+
+Copy the zip to a PC (VitaShell's FTP or USB) and open an issue on this repository's GitHub page:
+say what happened, where, and what you did just before, and attach the zip. GitHub takes files up
+to 25 MB; a report with a save state is larger, so share that one through a cloud drive link.
+
+What you share: your hunter's name, guild cards and progress (in the save). A save state also
+holds the game's program as it was in memory. No game files are included otherwise.
+
+The app keeps no log file while you play: the two minutes of speed lines live in memory and are
+written only into a report. The newest 3 reports are kept; making a new one deletes older ones.
 
 ## Known issues
 

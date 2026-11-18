@@ -955,3 +955,17 @@ after gameplay it holds leftovers, hence a line of noise. Tested on the slot 2 q
 x-only shift kept the line, y-only removed it, and the HUD letters are as crisp with y alone
 (slot 7). The shift is now y-only; `halfpixelxy` (diag) restores both axes, `nohalfpixel` still
 turns it off. A HUD-only scope did not work: the movie frames also run the grade pass.
+
+**Bug report (pause menu, 2026-11-18).** `src/citra_vita/bug_report.cpp` writes
+`ux0:data/mh4u/reports/mh4u_report_<date>_<time>.zip` (its own small zip writer on zlib; save
+states stored, the rest deflated at level 1): report.txt (app version, the game program the movie
+patch recognised, mod and data folder listings, video.txt, gxm_flags.txt, the cheat file, the last
+240 `[mh4u] speed`/`cpu` lines), the in-game save, extdata, the newest crash dump, optionally the
+newest state. The speed/cpu lines go through `ReportPrintf`: a fixed 240 x 512-byte ring, no
+allocation, nothing on the card until a report. The newest 3 reports are kept. On the Vita: 0.9 MB
+in ~1 s, 28.7 MB with a state in ~25 s; the game resumes at 30 fps.
+
+Start-up freeze, not fixed: three times on 2026-11-18 the app stopped right after "RunTitle:
+entering run loop" (no speed line ever printed) and the console switched itself off ~100 s later,
+no core dump, battery 76%. The same start-then-disconnect shape is in the event log on earlier
+days too. The slot 7 power-offs blamed on a4824a3c5 were this, not the state load.

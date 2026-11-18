@@ -33,6 +33,7 @@
 #include "citra_vita/gpuprof.h"
 #endif
 
+#include "citra_vita/bug_report.h"
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/input_factory_vita.h"
 
@@ -681,6 +682,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 system.SendSignal(Core::System::Signal::Load, ui.SelectedSlot());
                 ui.EnterGame();
                 break;
+            case VitaFrontend::Ui::Action::SaveReport:
+                ui.SetReportResult(VitaFrontend::WriteBugReport(ui.ReportWithState()));
+                break;
             default:
                 break;
             }
@@ -873,7 +877,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 const auto vc = Pica::GetVertexCache().TakeStats();
                 // skip: vblanks each frameskip signal was on (presents, backlog, arenas), vblanks
                 // that armed a skip, and presents dropped as superseded on the render thread.
-                sceClibPrintf("[mh4u] speed %d%%  game %d.%d fps  shown %u fps  gx %u ms  "
+                VitaFrontend::ReportPrintf("[mh4u] speed %d%%  game %d.%d fps  shown %u fps  gx %u ms  "
                               "render ~%u ms  skip p%u b%u a%u x%u sup %u  fs %u ms %u r %u KiB async %u ms  "
                               "vc %u/%u i%u x%u r%u e%u %uK v%u t%u p%u  gxc l%uK d%u s%u v%uK c%uK gm%uK\n",
                               speed, fps10 / 10, fps10 % 10, presented, gx_ms, render_ms,
@@ -902,7 +906,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     // own shading ms; memo: GS memo hits/misses (all mirrors).
                     namespace PS = Common::PipelineStats;
                     const auto take = [](auto& a) { return a.exchange(0, std::memory_order_relaxed); };
-                    sceClibPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u\n",
+                    VitaFrontend::ReportPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u\n",
                                   Common::ThreadCpuReport().c_str(),
                                   static_cast<unsigned>(take(PS::gxw_shade_us) / 1000),
                                   static_cast<unsigned>(take(PS::gxw_brake_us) / 1000),

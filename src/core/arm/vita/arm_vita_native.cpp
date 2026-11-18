@@ -36,6 +36,8 @@
 
 namespace Core {
 
+std::atomic<int> mh4u_code_version{0};
+
 namespace {
 
 /// Never hand the guest a slice longer than this, so a runaway guest cannot stall the frontend.
@@ -692,6 +694,7 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
             // again and syncing the code page right after a state load powered the console off
             // with a state made from another build of the mod (slot 7, 2026-11-18, twice).
             fmv_shift = shift;
+            mh4u_code_version.store(shift == 0 ? 11 : 10, std::memory_order_relaxed);
             LOG_INFO(Core_ARM11, "MH4U movie poll at {:08X}: already patched", Mh4uFmvPollBranch + shift);
             return;
         }
@@ -699,6 +702,7 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
             continue;
         }
         fmv_shift = shift;
+        mh4u_code_version.store(shift == 0 ? 11 : 10, std::memory_order_relaxed);
         const u32 branch = Mh4uFmvPollBranch + shift;
         memory.Write32(branch, 0xEF000000u | Mh4uFmvSvc);
         map->SyncCode(branch & ~0xFFFu, 0x1000);
@@ -712,6 +716,7 @@ void ARM_VitaNative::Mh4uPatchFmvPoll() {
                         ? fmt::format(" {:08X}={:08X}/{:08X}", addr, memory.Read32(addr), word)
                         : fmt::format(" {:08X}=unmapped", addr);
         }
+        mh4u_code_version.store(-1, std::memory_order_relaxed);
         LOG_INFO(Core_ARM11, "MH4U movie poll: code differs, not patched (read/expected:{})",
                  seen);
     }

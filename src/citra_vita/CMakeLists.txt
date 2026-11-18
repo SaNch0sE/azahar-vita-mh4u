@@ -16,6 +16,8 @@ add_custom_command(
     COMMENT "Embedding GXM shader programs")
 
 add_executable(citra_vita
+    bug_report.cpp
+    bug_report.h
     ../vita_compat/src/vita_libc_shims.c
     citra_vita_main.cpp
     emu_window_vita.cpp
@@ -146,6 +148,7 @@ target_link_libraries(citra_vita PRIVATE
     SceRazorHud_stub_weak
     SceKernelModulemgr_stub
     SceVshBridge_stub
+    z
     m
 )
 
@@ -166,7 +169,7 @@ set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(VITA_TITLEID "MH4UVITA0")
 set(VITA_APP_NAME "Monster Hunter 4 Ultimate")
-set(VITA_VERSION "00.30")
+set(VITA_VERSION "00.32")
 
 # The SceShell authid grants the extra permissions the native backend needs (taking a core, the
 # kernel-module bridge), and -na disables ASLR so the guest range lands where the module expects.

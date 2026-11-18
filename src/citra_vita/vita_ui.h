@@ -40,6 +40,7 @@ public:
         ExitApplication,
         SaveState,
         LoadState,
+        SaveReport,
     };
 
     explicit Ui(Core::System& system, EmuWindowVita& window);
@@ -67,6 +68,16 @@ public:
         return selected_slot;
     }
 
+    /// Whether the report asked for (Action::SaveReport) should carry the newest save state.
+    [[nodiscard]] bool ReportWithState() const {
+        return report_with_state;
+    }
+
+    /// The outcome of Action::SaveReport, shown on the bug report screen.
+    void SetReportResult(std::string message) {
+        report_message = std::move(message);
+    }
+
     /// Switches to the in-game state, where nothing is drawn over the title.
     void EnterGame();
 
@@ -86,6 +97,7 @@ private:
         Pause,
         PauseSettings,
         Savestates,
+        BugReport,
     };
 
     /// One row of the settings body. The value is read and written through closures so a row can
@@ -124,6 +136,7 @@ private:
     Action DrawPauseMenu();
     Action DrawPauseSettings();
     Action DrawSavestates();
+    Action DrawBugReport();
     void DrawStatusMessage();
     /// The GPU counters over the game (gxm flag gpuhud), drawn every frame like vitaGL's
     /// debugger window.
@@ -146,6 +159,10 @@ private:
     std::string selected_game_path;
     u32 selected_slot{};
     std::string status_message;
+    bool report_with_state{};
+    /// A report was asked for: this frame shows "Saving..."; the next asks the frontend for it.
+    bool report_pending{};
+    std::string report_message;
 
     std::vector<GameEntry> games;
     int selected_game{};
