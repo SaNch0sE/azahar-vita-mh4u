@@ -2039,8 +2039,10 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     }
     {   // Diag split experiment (2026-11-15): alpha test off for blended (ptoffbl) or unblended
         // (ptoffop) alpha-tested draws. In area 3 the ~8 ms is all in the unblended ones.
+        // ptoffgs: ptoffop for the GPU geometry-shader draws only (the grass cards).
         static const bool off_bl = GxmFlag("ptoffbl");
-        static const bool off_op = GxmFlag("ptoffop");
+        static const bool off_gs = GxmFlag("ptoffgs");
+        const bool off_op = GxmFlag("ptoffop") || (off_gs && current_gs != nullptr);
         const auto f = fs_config.framebuffer.alpha_test_func.Value();
         if ((off_bl || off_op) && f != CompareFunc::Always && f != CompareFunc::Never) {
             const auto& b = om.alpha_blending;
@@ -5220,15 +5222,18 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
     u8* const base = vertex_ring.base + off;
     const u8* const index_data = payload.arena + payload.layout.index_offset;
     const u32 rows = payload.vertex_max - payload.vertex_min + 1;
+    // gsrev (diag): the points in reverse order, to price the order of overlapping cards.
+    static const bool gs_reverse = GxmFlag("gsrev");
     for (u32 p = 0; p < points; p++) {
+        const u32 q = gs_reverse ? points - 1 - p : p;
         u32 vertex;
         if (payload.is_indexed) {
             vertex = payload.layout.ring
-                         ? reinterpret_cast<const u16*>(index_data)[p] + payload.vertex_min
-                     : payload.index_u16 ? reinterpret_cast<const u16*>(index_data)[p]
-                                         : index_data[p];
+                         ? reinterpret_cast<const u16*>(index_data)[q] + payload.vertex_min
+                     : payload.index_u16 ? reinterpret_cast<const u16*>(index_data)[q]
+                                         : index_data[q];
         } else {
-            vertex = p + payload.vertex_offset;
+            vertex = q + payload.vertex_offset;
         }
         const u32 row = std::min(vertex - payload.vertex_min, rows - 1);
         for (u32 stream = 0; stream < corner_stream; stream++) {
@@ -5259,10 +5264,21 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
     }
 
     DrawSetup setup;
+    // The alpha-test depth pre-pass for the GS cards, on by default (PrepassEligible): until
+    // 2026-11-18 it only reached AccelerateShippedDraw, so the grass never had it. current_gs
+    // stays set through both passes: the second pass binds programs again and uploads the GS rows.
+    prepass_mode = PrepassEligible(true) ? 1 : 0;
+    static const bool skip_eligible = GxmFlag("ptskipop");
+    if (skip_eligible && prepass_mode == 1) {
+        prepass_mode = 0;
+        DropDraw();
+        return true;
+    }
     current_gs = &program;
     const bool ready = BeginDraw(setup, layout, vertex_count);
-    current_gs = nullptr;
     if (!ready) {
+        current_gs = nullptr;
+        prepass_mode = 0;
         ReleaseDraw(setup);
         DropDraw();
         return true;
@@ -5276,14 +5292,24 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
     SceGxmContext* context = Device().context;
     {
         const PhaseTimer draw_timer{time_draws, times.draw};
-        for (u32 stream = 0; stream < layout.stream_count; stream++) {
-            sceGxmSetVertexStream(context, stream, base + stream_ring_offset[stream]);
+        const int passes = prepass_mode == 1 ? 2 : 1;
+        for (int pass = 0; pass < passes; pass++) {
+            if (pass == 1 && !PrepassSecond(layout, vertex_count)) {
+                break;
+            }
+            for (u32 stream = 0; stream < layout.stream_count; stream++) {
+                sceGxmSetVertexStream(context, stream, base + stream_ring_offset[stream]);
+            }
+            DrawTrace("hw gs draw");
+            sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
+                       indexed ? static_cast<const void*>(base + index_ring_offset)
+                               : static_cast<const void*>(identity_indices),
+                       vertex_count);
         }
-        DrawTrace("hw gs draw");
-        sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
-                   indexed ? static_cast<const void*>(base + index_ring_offset)
-                           : static_cast<const void*>(identity_indices),
-                   vertex_count);
+    }
+    current_gs = nullptr;
+    if (prepass_mode != 0) {
+        PrepassRestore();
     }
     stat_vertices += stored;
     ring_scene_pos = std::max(ring_scene_pos, hw_ring_end);
@@ -5309,7 +5335,7 @@ namespace {
 std::array<u32, 16> prepass_why{};
 }
 
-bool RasterizerGxm::PrepassEligible() {
+bool RasterizerGxm::PrepassEligible(bool gs_draw) {
     static const bool on = [] {
         if (GxmFlag("prepass")) {
             return true;
@@ -5320,7 +5346,19 @@ bool RasterizerGxm::PrepassEligible() {
         }
         return false;
     }();
-    if (!on) {
+    // GPU GS draws (the grass cards) take it by default: slot 1's dense grass 41.7/42.0 ->
+    // 33.7 ms (2026-11-18). `nogsprepass` (flag or ux0:data/mh4u/nogsprepass) turns that off.
+    static const bool gs_off = [] {
+        if (GxmFlag("nogsprepass")) {
+            return true;
+        }
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nogsprepass", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return false;
+    }();
+    if (!(on || (gs_draw && !gs_off))) {
         return false;
     }
     using CompareFunc = Pica::FramebufferRegs::CompareFunc;

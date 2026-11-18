@@ -920,3 +920,14 @@ was never the limit there - but a third less ring data and vertex work.
 `dbgshadowzero` 42.7, `reflone` 42.9, `nohwgs` 42.8, `dbgminfs` 7.4. ~25 ms is the unblended
 alpha-tested draws (the grass cut-out cards). Fable: the existing `prepass` never reached GS draws
 (AccelerateShippedDraw only), and the kill comes after lighting and the combiner.
+
+**Grass cut-outs: the depth pre-pass reaches the GS draws (2026-11-18).** Fable: `prepass` was only
+wired into AccelerateShippedDraw, so the GPU GS cards (the grass) never had it. Wired into
+AccelerateGsDraw (both passes keep current_gs). Slot 1, diag scenetime: base 41.7 / 42.0;
+`ptoffgs` (new: alpha test off for GS draws only) 21.0 - the grass cards are ~21 ms; `prepass`
+33.7; `prepass ppskipb` 26.9 (the depth pass alone ~9 ms over no grass); `prepass ptskipop` 17.7;
+`gsrev` (new: points in reverse) 39.8 - card order is worth ~2 ms; grass reduced to texture +
+combiner + kill 31.3. The pre-pass is now on by default for GPU GS draws only (`nogsprepass`
+turns it off; shipped draws keep the opt-in `prepass`). Release: slot 1 shown 24 -> 29.7, game
+29.7, speed 99%; slot 7 30.0 unchanged. Left on the table: the depth pass's ~9 ms (front-to-back
+card order, an earlier kill in the emitter).

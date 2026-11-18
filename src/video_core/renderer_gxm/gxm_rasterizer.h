@@ -493,7 +493,7 @@ private:
     SceGxmDepthFunc prepass_saved_func{};
     SceGxmDepthWriteMode prepass_saved_write{};
     u32 stat_prepass{}, stat_prepass_nodepth{};
-    bool PrepassEligible();
+    bool PrepassEligible(bool gs_draw = false);
     bool PrepassSecond(const VertexLayout& layout, u32 vertex_count);
     void PrepassRestore();
 
