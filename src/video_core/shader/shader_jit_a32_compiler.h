@@ -114,8 +114,15 @@ private:
     std::vector<u32> code_vec;
     std::unique_ptr<A32::Emitter> emitter;
 
-    /// Mapping of PICA VS instructions to offsets in the emitted code
-    std::array<A32::Label, MAX_PROGRAM_CODE_LENGTH> instruction_labels;
+    /// Mapping of PICA VS instructions to offsets in the emitted code, while compiling. One
+    /// table for all shaders (Compile runs under JitEngine::Shared's lock): as a member it was
+    /// 80 KiB kept by every compiled shader for good, ~6 MiB of heap after an hour and more
+    /// with each new shader. Run uses entry_offsets instead.
+    static std::array<A32::Label, MAX_PROGRAM_CODE_LENGTH>& LabelScratch();
+    std::array<A32::Label, MAX_PROGRAM_CODE_LENGTH>& instruction_labels = LabelScratch();
+    /// Code offset of each instruction in [entry_lo, entry_lo + size) (~0u: not compiled).
+    std::vector<u32> entry_offsets;
+    u32 entry_lo = 0;
 
     /// Labels pointing to the end of each nested LOOP block, for BREAKC.
     std::vector<A32::Label> loop_break_labels;

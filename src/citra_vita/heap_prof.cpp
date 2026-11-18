@@ -71,6 +71,7 @@ struct Site {
 
 bool g_on = false;
 std::size_t g_failed_size = 0; // the request that failed, for the report
+std::atomic<void*> g_reserve{nullptr}; // HeapReserveInit's block, freed on the first failure
 /// This file's own code (operator new, Sample...), skipped by the stack scan.
 std::uintptr_t g_self_lo = 0, g_self_hi = 0;
 // A blocking mutex, not a spinlock: every thread's delete takes it, and on the Vita a
@@ -209,7 +210,17 @@ void Forget(void* p) {
     if (p == nullptr) [[unlikely]] {
         g_failed_size = size;
         HeapProfReport(true);
-        throw std::bad_alloc();
+        // The reserve goes back to the heap once, and the request is tried again: the first
+        // failure becomes a warning in the log instead of the end of the session.
+        if (void* reserve = g_reserve.exchange(nullptr)) {
+            std::free(reserve);
+            sceClibPrintf("[mh4u] heap: OUT OF MEMORY on %u KiB, emergency reserve released\n",
+                          static_cast<unsigned>(size / 1024));
+            p = std::malloc(size != 0 ? size : 1);
+        }
+        if (p == nullptr) {
+            throw std::bad_alloc();
+        }
     }
     if (g_on) [[unlikely]] {
         if (size >= BigMin) {
@@ -317,6 +328,14 @@ void HeapProfInit(bool on) {
                           SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
     }
     g_on = on;
+}
+
+void HeapReserveInit(std::size_t bytes) {
+    g_reserve.store(std::malloc(bytes));
+}
+
+bool HeapReserveReleased() {
+    return g_reserve.load() == nullptr;
 }
 
 bool HeapProfEnabled() {

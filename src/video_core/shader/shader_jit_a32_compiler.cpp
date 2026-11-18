@@ -1210,6 +1210,15 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
 
     program = reinterpret_cast<CompiledShader*>(code_mem);
 
+    entry_lo = span_lo;
+    entry_offsets.assign(span_hi - span_lo + 1, ~0u);
+    for (u32 i = span_lo; i <= span_hi; i++) {
+        if (instruction_labels[i].IsBound()) {
+            entry_offsets[i - span_lo] = static_cast<u32>(instruction_labels[i].BoundOffset());
+        }
+    }
+    instruction_labels.fill(Label()); // frees the labels' branch lists now
+
     emitter.reset();
     code_vec.clear();
     code_vec.shrink_to_fit();
@@ -1217,9 +1226,15 @@ void JitShader::Compile(const std::array<u32, MAX_PROGRAM_CODE_LENGTH>* program_
 
 void JitShader::Run(const ShaderSetup& setup, ShaderUnit& state, u32 offset) const {
     ASSERT(program != nullptr);
-    ASSERT(instruction_labels[offset].IsBound());
-    const void* entry = code_mem + instruction_labels[offset].BoundOffset();
+    ASSERT(offset >= entry_lo && offset - entry_lo < entry_offsets.size() &&
+           entry_offsets[offset - entry_lo] != ~0u);
+    const void* entry = code_mem + entry_offsets[offset - entry_lo];
     program(&setup.uniforms, &state, entry);
+}
+
+std::array<A32::Label, MAX_PROGRAM_CODE_LENGTH>& JitShader::LabelScratch() {
+    static auto* const labels = new std::array<A32::Label, MAX_PROGRAM_CODE_LENGTH>();
+    return *labels;
 }
 
 JitShader::JitShader() = default;

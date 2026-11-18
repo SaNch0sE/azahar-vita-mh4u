@@ -1005,3 +1005,12 @@ line now ends with `bigarena used/capacity peak largest fallbacks`.
 heapprof: the pointer table now deletes by backward shift (tombstones had filled it after an hour
 and stopped sampling), has 65536 slots, prints `dropped` samples, and lists `heapgrow`: the sites
 whose live bytes grew most since a baseline taken at two minutes.
+
+**Fix, second batch.** The geometry-shader memo records into one scratch vector kept by each
+`PicaCore` (trimmed above 1 MiB) and stores exact-size copies: no more doubling churn on every
+miss, and entries no longer carry up to 2x spare capacity. The A32 shader JIT's label table
+(4096 labels, 80 KiB) is one shared compile-time scratch instead of a member every compiled
+shader kept; `Run` reads a compact offset table for the compiled span. A 2 MiB emergency reserve
+(`HeapReserveInit`) is freed on the first failed `operator new`, which is then retried and logged
+(`heap: OUT OF MEMORY ... emergency reserve released`). Slot 1: memo hit/miss pattern unchanged,
+same shader JIT compiles, 30 fps, picture unchanged.

@@ -1153,6 +1153,7 @@ int EmulatorMain() {
     } else if (!Common::BigArena::Init(8 * 1024 * 1024)) {
         sceClibPrintf("[mh4u] bigarena: could not allocate\n");
     }
+    HeapReserveInit(2 * 1024 * 1024);
     Common::EmuProf::enabled = gx_prof_file || GxmRenderer::GxmFlag("emuprof") ||
                                GxmRenderer::GxmFlag("emuprofgx");
     Common::EmuProf::gx_thread = gx_prof_file || GxmRenderer::GxmFlag("emuprofgx");

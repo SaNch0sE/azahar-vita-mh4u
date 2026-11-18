@@ -1802,7 +1802,14 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
     std::vector<OutputVertex>* const capture_out = capture_only ? triangle_record : nullptr;
     u64 memo_key = 0;
     bool memo_record = false;
-    std::vector<OutputVertex> memo_triangles;
+    // Recorded into one scratch vector kept between draws: a fresh vector grew by doubling
+    // (48 -> 96 -> 192 -> 384 KiB) on every miss, and that churn fragmented the heap. The memo
+    // entry is an exact-size copy.
+    if (gs_memo_scratch.capacity() * sizeof(OutputVertex) > 1024 * 1024) {
+        std::vector<OutputVertex>().swap(gs_memo_scratch); // one huge draw: do not keep it all
+    }
+    std::vector<OutputVertex>& memo_triangles = gs_memo_scratch;
+    memo_triangles.clear();
     // After 32 misses in a row a program runs 256 draws without the memo, then probes again
     // (one more miss puts it back to skipping). `nogsmemoskip` keeps it always on.
     static const bool memo_skip = [] {
@@ -1984,7 +1991,7 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
         if (capture_out != nullptr) {
             capture_out->insert(capture_out->end(), memo_triangles.begin(), memo_triangles.end());
         }
-        const std::size_t entry_bytes = memo_triangles.capacity() * sizeof(OutputVertex);
+        const std::size_t entry_bytes = memo_triangles.size() * sizeof(OutputVertex);
         if (primitive_assembler.IsEmpty() && entry_bytes <= GsMemoMaxEntryBytes) {
             if (gs_memo_cur.size() >= GsMemoGenerationCap ||
                 gs_memo_cur_bytes + entry_bytes > GsMemoGenerationBytes) {
@@ -1994,7 +2001,9 @@ void PicaCore::RunShippedDraw(const DrawPayload& p) {
                 gs_memo_cur.clear();
                 gs_memo_cur_bytes = 0;
             }
-            if (gs_memo_cur.emplace(memo_key, std::move(memo_triangles)).second) {
+            if (gs_memo_cur.find(memo_key) == gs_memo_cur.end()) {
+                gs_memo_cur.emplace(memo_key, std::vector<OutputVertex>(memo_triangles.begin(),
+                                                                         memo_triangles.end()));
                 gs_memo_cur_bytes += entry_bytes;
             }
         }

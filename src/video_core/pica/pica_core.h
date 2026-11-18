@@ -502,6 +502,8 @@ private:
     static constexpr std::size_t GsMemoMaxEntryBytes = 1u << 20;
     std::unordered_map<u64, std::vector<OutputVertex>> gs_memo_cur, gs_memo_prev;
     std::size_t gs_memo_cur_bytes = 0, gs_memo_prev_bytes = 0;
+    /// RunShippedDraw records a memo miss here (kept: see there); trimmed when over 1 MiB.
+    std::vector<OutputVertex> gs_memo_scratch;
     u32 gs_memo_hits = 0, gs_memo_misses = 0;
     /// Per geometry program: misses in a row, and draws left to run without the memo. A program
     /// whose draws never repeat (MH4U's particles) stops paying for the key and the recording.
