@@ -39,21 +39,24 @@ Measurements and history are in `vita-mh4u-performance.md`.
 
 ## Testing and compatibility
 
-- **Long sessions (heap fragmentation).** In progress: large short-lived buffers moved to the
-  BigArena (performance notes, 2026-11-18). Still to do: the geometry-shader memo's scratch
-  recorder, the JIT label table, an emergency reserve, then a 90+ minute session with
-  `heapprof`; if in-use heap still grows ~6 MB an hour, cap the long-lived caches.
+- **Long sessions (heap fragmentation).** Fixed in two batches (BigArena for large short-lived
+  buffers; GS memo scratch, shared JIT label table, emergency reserve; performance notes,
+  2026-11-18). Still to do: a 90+ minute session with `heapprof` to confirm (pass: `arena - used`
+  within a few MB, largest free chunk in MiB, bigarena without fallbacks); if in-use heap still
+  grows ~6 MB an hour, cap the long-lived caches using the `heapgrow` list.
 - **Multiplayer: local and online.** Test local play (two Vitas, or a Vita and a PC running
   Azahar) through Azahar's network rooms, and online play through a room server: does it
-  connect, does the frame rate hold, do quests stay in sync. MH4UltimateDC's
-  `docs/research/community-enhancements.md` (section 4) and its lobby/room server notes are a
-  starting point.
-- **EUR game (v1.1.0 update, 0004000E00126100).** Test the European release and find what to
-  improve. Our code patches (the movie poll fix, `Mh4uPatchFmvPoll`) know only the USA v1.0 and
-  v1.1 addresses, so EUR gets none (`code differs`). MH4UltimateDC's `config/shifts/eur_v110.txt`
-  maps USA v1.3.0 (title version 1072, the same build as our "v1.1") addresses to EUR: the movie
-  poll's `bcc` (0x968764) is at +0x38 there, so adding that shift to `Mh4uFmvShifts` may be all
-  the patch needs (it checks the code word by word before writing).
+  connect, does the frame rate hold, do quests stay in sync. Port the UDS simultaneous-join fix
+  first (decomp ideas, O2).
+- **EUR game (v1.1.0 update, 0004000E00126100).** Branch `eur-support`, untested (no EUR dump):
+  the movie poll fix at +0x38 (from MH4UltimateDC's address map), an EUR cheat file, a
+  region-aware bug report. Needs a tester with the European game; then merge.
+- **Ideas from MH4UltimateDC** (`vita-mh4u-decomp-ideas.md`), in order: count second-eye list
+  refusals (P2) and log live screen filters (P3); bottom render pass off at the source in Single
+  screen (P1); native frame cap and a pacing check (P4, P5); gas-mode draws in cutscenes (G1).
+- **Start-up freeze.** Intermittent: the app stops right after `RunTitle: entering run loop`,
+  the console drops off the network and powers off later. Seen 4 times on 2026-11-18 (the last
+  on the first launch after a vpk install).
 
 ## Open bugs
 
