@@ -675,6 +675,16 @@ void ThreadedRasterizer::ShipDraw(Pica::DrawPayload&& payload, void* slot) {
         } else if (mirror_pica.regs.internal.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes &&
                    mirror_pica.GetPrimitiveAssembler().IsEmpty()) {
             drawn = real->AccelerateGsDraw(shipment->draw);
+            if (drawn) {
+                // The GPU took it: the pre-shade worker must not shade it too. It was queued for
+                // the worker at ship time like every point-mode GS draw, and shading what the GPU
+                // already drew kept the worker the limit (2026-11-18, dense vegetation: game at
+                // 100% but ~10 shown, the frames waiting for the worker). Pending -> Stolen makes
+                // the worker skip it; one it has already started simply finishes unused.
+                u32 pending = ShadePending;
+                shipment->shade_state.compare_exchange_strong(pending, ShadeStolen,
+                                                              std::memory_order_acq_rel);
+            }
         }
         if (!drawn) {
             const u64 sw_start = Common::PipelineStats::StatUs();

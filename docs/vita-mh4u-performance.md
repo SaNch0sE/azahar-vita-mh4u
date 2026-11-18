@@ -886,3 +886,18 @@ pause-menu option (83e4d6ddf). Playtest: no practical gain (sharp bilinear fits 
 1.25x still too slow), and the water by the camp's pond (slot 1 area) turned fully white - the
 water material's highlight does not survive per-vertex N.H. Reverted; `pvhalf` is a diag flag
 again and would need that water fixed before any further use.
+
+**Dense vegetation (slot 1, 2026-11-18): 8-11 -> 28 fps shown.** A new hunting area with dense
+grass: game 8-11 fps, speed 26-36%. Release counters: ~1,200 point-mode GS draws a second (33k
+input vertices, 66k triangles, 0 memo hits); the pre-shade worker saturated (VS ~300 ms, GS ~580
+ms a second), the render thread yield-spinning behind it (`rt ops`: sw 930 ms of which wait 819),
+the GX thread braked (`wait b` ~800-1000 ms). `hwgs` (GPU GS) already removed the CPU work from
+the render thread, but the worker still shaded every point draw the GPU took (QueuePreshade marks
+all of them, and the op never cancelled it), so frames still waited on it: game 30, shown ~10.
+Fix (Fable's plan): when AccelerateGsDraw takes a draw, the op moves it Pending -> Stolen and the
+worker skips it. GPU cost of the GPU GS here: 34.4 -> 38.5 ms (diag scenetime). Release: hwgs +
+fix 26.0 / 27.7 shown, speed 88-99%; slot 7 (GPU-bound hunting area) 30 either way. `hwgs` is on
+by default now; `nohwgs` (flag or ux0:data/mh4u/nohwgs) restores the software path. Default
+release at slot 1: game 29.8, shown 28.0, speed 99%. Next candidates from Fable's ranking: four
+indexed corners per point instead of six (a third less fused vertex work), merging consecutive
+GS draws, a CPU/GPU hybrid split, a cheaper CPU GS (emit path, JIT).

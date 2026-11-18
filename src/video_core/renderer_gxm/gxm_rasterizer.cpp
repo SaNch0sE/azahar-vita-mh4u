@@ -4944,23 +4944,27 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
  * its triangles one by one. The point's vertex data is repeated once per corner of its
  * triangles (the pattern the emitter derived from the GS's emits), next to a one-hot corner
  * stream; the draw is a plain triangle list over those copies. Anything the fused program
- * does not cover goes back to the software path. Off unless `hwgs` (flag or
- * ux0:data/mh4u/hwgs) turns it on; ux0:data/mh4u/hwgs_min.txt sets the fewest points a draw needs (default 4:
+ * does not cover goes back to the software path. On unless `nohwgs` (flag or
+ * ux0:data/mh4u/nohwgs) turns it off; ux0:data/mh4u/hwgs_min.txt sets the fewest points a draw needs (default 4:
  * smaller draws are HUD sprites that the software path merges into one draw).
  */
 bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
-    // Opt-in: in MH4U's area 3 (GPU-bound) it cost the GPU ~1.7 ms a frame (the VS runs per
-    // corner) and saved the render thread about nothing (no repeat merge, a uniform buffer
-    // per draw), measured 2026-11-15; see docs/plans/gs-gpu.md.
+    // Was opt-in: in MH4U's area 3 (GPU-bound) it cost the GPU ~1.7 ms a frame (the VS runs per
+    // corner) and, the worker still shading every draw it took, saved nothing (2026-11-15).
+    // On by default since 2026-11-18: with the pre-shade worker no longer shading what the GPU
+    // takes (ThreadedRasterizer, Pending -> Stolen), dense vegetation (slot 1) went from 8-11 to
+    // 26-28 fps shown, game 26-36% -> 88-99%, for ~4 ms more GPU (34.4 -> 38.5 ms); the GPU-bound
+    // hunting area (slot 7) stayed at 30. `nohwgs` (flag or ux0:data/mh4u/nohwgs) restores the
+    // software path for every GS draw.
     static const bool enabled = [] {
-        if (GxmFlag("hwgs")) {
-            return true;
+        if (GxmFlag("nohwgs")) {
+            return false;
         }
-        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/hwgs", "rb")) {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nohwgs", "rb")) {
             std::fclose(f);
-            return true;
+            return false;
         }
-        return false;
+        return true;
     }();
     static const u32 min_points = [] {
         u32 n = 4;
