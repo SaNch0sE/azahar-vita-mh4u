@@ -25,9 +25,6 @@ struct VideoOptions {
     bool wide = false;
     /// The speed / frame rate counter in the top right corner (Ui::DrawStatsHud).
     bool show_fps = true;
-    /// The highlights' half vector per vertex instead of per pixel (pvhalf): ~2 ms faster in
-    /// hunts, highlights on large surfaces shift slightly. Read once at start (next launch).
-    bool pv_half = false;
 };
 
 /// The live options (loaded from the file on first use).

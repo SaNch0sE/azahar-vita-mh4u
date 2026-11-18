@@ -223,15 +223,6 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().show_fps = value;
                GxmRenderer::SaveVideoOptions();
            });
-    toggle("Per-vertex highlights",
-           "Faster highlights (about 2 ms a frame in hunts): computed per triangle corner "
-           "instead of per pixel, so shine on large surfaces looks slightly different. "
-           "Applies on the next start.",
-           true, [] { return GxmRenderer::Video().pv_half; },
-           [](bool value) {
-               GxmRenderer::Video().pv_half = value;
-               GxmRenderer::SaveVideoOptions();
-           });
     choice("Picture shape",
            "3DS keeps the game's 5:3 picture with bars at the sides. Wide fills the screen; "
            "use it with the Heavenfall mod built with --cheat-aspect-ratio 16:9 (and 16:9 "
