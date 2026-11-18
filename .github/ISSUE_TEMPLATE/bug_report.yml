@@ -1,0 +1,95 @@
+name: Bug report
+description: Something wrong in the MH4U Vita port (a crash, slowdown, picture or sound problem)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The quickest way for us to see your problem is the port's own report:
+
+        1. **Right after the problem happens**, open the pause menu (**Select + Start**) and choose **Bug report**.
+        2. Choose **Save report** (about 1 MB), or **Save report with the newest save state** (about 30 MB) if the problem only shows at one spot or moment. For that, save a state there first (pause menu, **Save states**), then make the report.
+        3. Copy the zip from `ux0:data/mh4u/reports/` to a PC (VitaShell: FTP or USB).
+        4. Attach it below. GitHub takes files up to 25 MB: a report with a save state is larger, so upload that one to a cloud drive (Google Drive, Dropbox, MEGA...) and paste the link.
+
+        **What you share:** your hunter's name, guild cards and progress (in the save). A save state also holds the game's program as it was in memory. Please don't attach the game itself or other game files.
+
+  - type: input
+    id: version
+    attributes:
+      label: Port version
+      description: From the release you installed (also at the top of report.txt).
+      placeholder: 0.3.2-alpha
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What went wrong, and what you expected instead. Screenshots or a phone video help.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: how-often
+    attributes:
+      label: How often
+      options:
+        - Every time
+        - Sometimes
+        - Once so far
+    validations:
+      required: true
+
+  - type: textarea
+    id: report
+    attributes:
+      label: Bug report zip
+      description: Drag the zip here, or paste a cloud link for a report over 25 MB. If the app crashed before you could make one, make it on the next start (it includes the newest crash dump) and say so.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: state
+    attributes:
+      label: Save state
+      options:
+        - "No: steps from my save are below"
+        - "Yes: in the report (the newest state)"
+        - "Yes: shared separately (link below)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: with-state
+    attributes:
+      label: If you shared a save state - which one, and what to do after loading it
+      description: |
+        Which slot (the report includes only the newest; name the file if you shared others) and what to do after loading it to see the problem.
+      placeholder: |
+        Slot 3 (0004000000126300.03.cst). After loading, walk north to area 5; the frame rate drops when the Rathalos lands.
+
+  - type: textarea
+    id: without-state
+    attributes:
+      label: If you didn't share a save state - how to see it in the game
+      description: |
+        Starting from your save in the report: where to go and what to do, step by step. Name the village or area, the quest, monster, weapon, menu or cutscene involved.
+      placeholder: |
+        1. From Val Habar, take the 4★ quest "...".
+        2. In the Heaven's Mount, go to area 3.
+        3. Use the Kinsect on the ...: the game freezes.
+
+  - type: input
+    id: mod
+    attributes:
+      label: Heavenfall mod options
+      description: Web installer or your own build, and the options you chose.
+      placeholder: "Web installer: single screen, HUD 100%, 16:9, other module on"
+
+  - type: textarea
+    id: other
+    attributes:
+      label: Anything else
+      description: Other plugins you use, overclocking, whether it happened before a recent update, etc.
