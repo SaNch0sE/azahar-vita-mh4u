@@ -748,6 +748,19 @@ private:
         u32 bad_tiles = 0, tiles = 0; ///< transparent tiles in its window, of all
         u32 tile_min_alpha = 255, tile_low_texels = 0; ///< in the refusing tile
     };
+    /// coverlog: a quad-sized draw (software box >= 40x40, or any GPU-path draw) and why it
+    /// covered or not.
+    struct CoverCandLog {
+        u32 index;         ///< its place among the frame's proof draws
+        bool pre;          ///< before the grade
+        bool software;     ///< DrawTriangles (vertices seen) or a GPU path
+        u32 verts;
+        s32 box[4];
+        u32 reasons;       ///< bits: see the coverlog line
+        u32 quads_found;   ///< opaque axis-aligned quads >= 40x40 in it
+        u32 quads_accepted;
+        u32 tex;
+    };
     struct CoverFrame {
         bool active = false;      ///< the grade was seen: the 2D layer is being drawn
         s32 x0 = 0, y0 = 0;       ///< the grade's viewport, framebuffer pixels
@@ -766,12 +779,18 @@ private:
         std::array<CoverDrawLog, 8> draw_log{};
         u32 draw_logged = 0;
         /// d, p, r, T, q (a 2D-rendered surface, kept), m (memory content, a texture really)
-        std::array<u32, 6> kind_counts{};
+        std::array<u32, 7> kind_counts{}; ///< ... and w: a draw before the grade, not a cover
         u32 first_quad_index = 0, last_quad_index = 0; ///< layer draws that covered pixels
         std::array<CoverQuadLog, 8> refused{};
         u32 refused_logged = 0;
         std::array<CoverQuadLog, 4> accepted{};
         u32 accepted_logged = 0;
+        /// Before the grade: the picture as the draws since the last world draw leave it
+        /// (planks drawn just before the grade count, a world draw after them wipes them).
+        bool pre = false;
+        u32 pre_covered_px = 0; ///< carried into the layer at the grade (coverlog)
+        std::array<CoverCandLog, 8> cand{};
+        u32 cand_logged = 0;
     };
     CoverFrame cover;
     /// One bit per pixel of the picture (row_words words a row): under an opaque sprite now.
@@ -782,6 +801,13 @@ private:
     bool cover_draw_reads_target = false; ///< ...and a unit reads the target's memory
     s32 cover_bbox[4] = {};               ///< ...and the pixels it can touch (x0, y0, x1, y1)
     bool cover_in_sw = false;             ///< BeginDraw is called from DrawTriangles
+    bool cover_draw_pre = false;          ///< the software draw is before the grade
+    bool cover_pixel_local = false;       ///< BeginDraw: the grade family (drawn in place)
+    bool cover_last_tracked = false;      ///< the last full BeginDraw was a proof draw
+    bool cover_last_pre = false;          ///< ... before the grade
+    s32 cover_cand_slot = -1;             ///< its coverlog candidate entry
+    /// The picture's place, kept from the last grade for the next frame's pre-grade draws.
+    s32 cover_last_geom[4] = {};
     char cover_sample_kind = 0;           ///< BeginDraw: 'r', 'T', 'q' or 0 (CoverDrawLog)
     CoverTarget cover_sample_rt{};        ///< the producer record of the sampled surface
     VideoCore::SurfaceId cover_sample_id{}; ///< the sampled surface (coverlog)

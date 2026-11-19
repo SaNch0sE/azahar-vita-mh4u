@@ -172,3 +172,10 @@ Console results (release unless noted):
 Still to do before making it default: step 6 (item box, pause menu, equipment, smithy, map, guild
 card, loading fades), `covermagenta` through open/close/scroll, save with a menu open and reload,
 a 30 s open menu then close (animations, effects, sound).
+
+Fix 2026-11-19 (user session at the quest counter flapped: 18-20 fps, key blacklisted after two
+mispredicts): with the world hidden, MH4U leaves a texture unit enabled on the picture itself for
+the plank draws (never read by their program), and the proof treated that as a target read, so
+the planks stopped covering on exactly the armed frames. Now only units the program reads count;
+depth write or an Always test no longer refuses a cover; covers drawn after the last world draw
+but before the grade carry into the layer; arming needs 4 covered proofs in a row.

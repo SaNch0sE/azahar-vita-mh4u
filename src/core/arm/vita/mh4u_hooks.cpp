@@ -503,6 +503,7 @@ struct Cover {
     u32 proof_read = 0;   ///< proof ring position read up to
     Common::Mh4uCover::Proof proof{}; ///< the newest proof (by tag)
     bool have_proof = false;
+    u32 covered_run = 0;  ///< covered proofs in a row, newest last
     bool armed = false;
     u64 armed_key = 0;
     const char* why = "start"; ///< why not armed (the last refusal)
@@ -999,6 +1000,7 @@ void CoverKey() {
 // safe direction.
 
 constexpr u32 TagLag = 2;
+constexpr u32 MinCoveredRun = 4; ///< covered proofs in a row before an arm
 constexpr u32 ProofMaxAge = 30;
 constexpr u32 MaxTransitionLines = 64;
 
@@ -1099,6 +1101,8 @@ void TakeProofs() {
         if (good) {
             cov_proofs.fetch_add(1, std::memory_order_relaxed);
         }
+        // Covered proofs in a row: a cover that holds only every other frame never arms.
+        cv.covered_run = good ? cv.covered_run + 1 : 0;
         if (!cv.have_proof || static_cast<s32>(p.tag - cv.proof.tag) >= 0) {
             cv.proof = p;
             cv.have_proof = true;
@@ -1141,6 +1145,8 @@ void Decide() {
         why = "no proof";
     } else if (!cv.proof.covered) {
         why = "not covered";
+    } else if (!cv.armed && cv.covered_run < MinCoveredRun) {
+        why = "too few covered proofs in a row";
     } else if (static_cast<s32>(cv.proof.tag - (cv.key_start + 1 + TagLag)) < 0) {
         why = "no proof since the key changed";
     } else if (g_seq - cv.proof.tag >= ProofMaxAge) {
