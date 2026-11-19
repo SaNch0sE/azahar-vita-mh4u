@@ -1094,3 +1094,10 @@ bit clear already (`000F036E`), so the option only removes the 5:6:5 banding the
 (village sky) and slot 6 (Gallery cutscene and its fades): pictures correct, 30 fps either way.
 The banding difference needs a lossless capture (vita-agent captures JPEG) or a look on the
 console.
+
+User check (2026-11-19): with Smooth gradients on, the bands in the sky are gone. Sharp bilinear
+makes the HUD much less blurry, but the text stays low-resolution; the old Sharp HUD text
+(replayed glyphs) read much better, apart from its mixed sharp/soft text in menus such as the
+Quest Counter. So the alpha-mask HUD of the decomp plan (which would only equal Sharp bilinear on
+the HUD) is dropped; next is the whole 2D layer drawn at screen resolution, as an option
+(`plans/vita-mh4u-hud-hires.md`).
