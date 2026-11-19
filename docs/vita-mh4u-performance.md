@@ -1073,3 +1073,10 @@ menu itself is slow (see `plans/menu-rendering.md`).
 Test-harness note: vita-agent replays an identical upload (same file, same path) from its
 operation cache without writing, so re-creating a switch file after deleting it needs new
 content.
+
+**`srcbottom` is the default** (kill switch `ux0:data/mh4u/nosrcbottom`; `nobottomskip` keeps the
+whole bottom screen). The user's checks with it on: equipment box and appearance previews show,
+guild card and map work, the chat keyboard works (at ~20 fps, as at character creation), PS button
+and back works, switching to two screens brings the bottom screen and touch back, saving to slot
+8 and loading it works. One crash loading slot 7 after those menu tests, in the state loader's
+teardown of kernel objects - not this change (open bugs in the TODO).

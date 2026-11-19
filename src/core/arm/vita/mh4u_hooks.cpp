@@ -217,11 +217,13 @@ void LogFilters() {
     sceClibPrintf("[mh4u] filters (%u):%s\n", count, line.c_str());
 }
 
-/// P1 (opt-in `srcbottom`): the game stops building its bottom-screen pass while that screen is
-/// not shown. Re-asserted each frame (a byte compare); only while mDisplaySkip[1] is 0, when the
-/// game leaves the flag alone.
+/// P1: the game stops building its bottom-screen pass while that screen is not shown (Single
+/// screen layout): ~7,000-9,000 draws a second it built for us to drop, -11..15% emulation
+/// thread CPU (2026-11-19). Re-asserted each frame (a byte compare); only while mDisplaySkip[1]
+/// is 0, when the game leaves the flag alone. On by default; kill switch `nosrcbottom` (and
+/// `nobottomskip`, which keeps the whole bottom screen).
 void BottomPass(u32 lt_render) {
-    static const bool enabled = Switch("srcbottom") && !Switch("nosrcbottom");
+    static const bool enabled = !Switch("nosrcbottom");
     if (!enabled && !g.bottom_written) {
         return;
     }

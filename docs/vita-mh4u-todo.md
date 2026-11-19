@@ -74,6 +74,14 @@ Measurements and history are in `vita-mh4u-performance.md`.
 
 ## Open bugs
 
+- **Crash loading a state** (once, 2026-11-19: slot 7 loaded after browsing menus in slot 5; the
+  same load from a fresh start worked). In `System::LoadState`, the boost input archive's
+  destructor releases a tracked `Kernel::Process`; its `ClientSession` -> `ServerSession`
+  destructor calls `ClientPort::ConnectionClosed` on a port already freed (r0 `ff0a0000`). Order
+  of destruction in the archive's shared_ptr helper (a map by address), so intermittent. Dump
+  `psp2core-1795073616-...`, build 8333a4424.
+- **Software keyboard (chat, name entry) runs at ~20 fps.** Same as at character creation.
+
 - **Pause menu opens by itself after a load** (3 of ~20 scripted runs, 2026-11-18/19, with and
   without `srcbottom`; once before the autoload, which then never ran). `citra_vita_main.cpp`
   opens it on a resume system event when the wall clock jumped 2 s or more in the last 5 s - but a
