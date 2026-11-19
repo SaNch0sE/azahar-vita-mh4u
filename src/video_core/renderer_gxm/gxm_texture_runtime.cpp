@@ -1247,7 +1247,8 @@ u32 RenderScaleQ() {
 
 void Surface::Allocate() {
     const bool depth = IsDepthType(type);
-    scale_q = (type == SurfaceType::Color || depth) ? RenderScaleQ() : 4u;
+    scale_q = force_scale_q != 0 ? force_scale_q
+              : (type == SurfaceType::Color || depth) ? RenderScaleQ() : 4u;
     const bool cube = texture_type == TextureType::CubeMap;
     const u32 width = SX(this->width), height = SX(this->height) * (cube ? 6u : 1u);
     stride_texels = PitchFor(width, depth);

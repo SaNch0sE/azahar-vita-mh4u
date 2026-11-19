@@ -227,6 +227,17 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().smooth = value;
                GxmRenderer::SaveVideoOptions();
            });
+    choice("HUD resolution",
+           "Draws the game's HUD, text and menus at the Vita's resolution over the stretched 3D "
+           "picture: sharp, readable text. Costs GPU time (a few frames per second less in heavy "
+           "areas; the lighter setting costs less). FXAA and the Sharp upscale filter do not "
+           "apply to those frames.",
+           true, {"3DS (400x240)", "Screen", "Screen, lighter (1.5x)"},
+           [] { return static_cast<int>(GxmRenderer::Video().hudres); },
+           [](int value) {
+               GxmRenderer::Video().hudres = static_cast<u32>(value < 0 || value > 2 ? 0 : value);
+               GxmRenderer::SaveVideoOptions();
+           });
     toggle("FPS counter", "Shows the emulation speed and the frame rate in the top right corner.",
            true, [] { return GxmRenderer::Video().show_fps; },
            [](bool value) {

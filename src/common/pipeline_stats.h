@@ -240,6 +240,18 @@ inline std::atomic<u32> re_xfers_blocked{0};
 inline std::atomic<u32> top_xfers{0};
 /// Post-process draws and blits dropped by the bloom / depth-of-field chain rule (`postfx`).
 inline std::atomic<u32> fx_dropped{0};
+/// The 2D layer (hudres Stage 0): draws after the grade into its target, those of them using
+/// depth or stencil, scenes begun there, grades seen, and EndFrame arriving inside the layer.
+inline std::atomic<u32> hud_post_draws{0};
+inline std::atomic<u32> hud_post_depth{0};
+inline std::atomic<u32> hud_post_scenes{0};
+inline std::atomic<u32> hud_grades{0};
+inline std::atomic<u32> hud_cut{0};
+/// HUD resolution: draws redirected to the screen-sized target, frames it started, and
+/// resolves (the guest picture needed it: a read, a depth draw, an unmatched transfer).
+inline std::atomic<u32> hudres_draws{0};
+inline std::atomic<u32> hudres_frames{0};
+inline std::atomic<u32> hudres_resolves{0};
 /// Time the frame limiter slept on the emulation thread (the guest ahead of real time).
 inline std::atomic<u32> limiter_sleep_us{0};
 /// Time the GX thread spent parsing command lists, and how many.

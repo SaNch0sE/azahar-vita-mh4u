@@ -81,7 +81,8 @@ public:
     /// `rect` receives the framebuffer's place inside the returned texture, in texels.
     const SceGxmTexture* AccelerateDisplay(int screen, PAddr addr, u32 width, u32 height,
                                            u32 pixel_stride, Pica::PixelFormat format,
-                                           Common::Rectangle<u32>* out_rect);
+                                           Common::Rectangle<u32>* out_rect,
+                                           bool* out_flip = nullptr, bool* out_hires = nullptr);
 
     /// Once per present, from the renderer (render thread): ends the frame's scene, waits
     /// for the GPU, recycles per-frame memory, ticks the cache.
@@ -544,6 +545,10 @@ private:
         PAddr addr = 0;
         std::unique_ptr<Surface> surface;
         bool valid = false;
+        /// HUD resolution: the slot shows hud_pool[hud_index] (upside down along v when
+        /// flip) instead of `surface`.
+        int hud_index = -1;
+        bool flip = false;
     };
     std::array<DisplaySlot, 4> display_slots{};
     u32 display_slot_next = 0;
@@ -552,6 +557,31 @@ private:
     bool SmoothDisplayTransfer(const Pica::DisplayTransferConfig& config);
     /// Anything else writing guest memory over a slot makes it stale.
     void InvalidateDisplaySlots(PAddr addr, u32 size);
+
+    /// HUD resolution (VideoOptions::hudres; docs/plans/vita-mh4u-hud-hires.md): after the
+    /// grade (hud_phase) the frame's 2D draws into the graded target go to a screen-sized
+    /// target over an upscaled copy of the 3D picture, which the present shows 1:1.
+    enum class HudState : u8 { Idle, Armed, Active, Shown };
+    HudState hud_state = HudState::Idle;
+    VideoCore::SurfaceId hud_guest_id{}; ///< the graded target's cached surface
+    u32 hud_rx = 0, hud_ry = 0, hud_rw = 0, hud_rh = 0; ///< the picture in it (guest texels)
+    std::array<std::unique_ptr<Surface>, 4> hud_pool{};
+    std::array<std::unique_ptr<Framebuffer>, 4> hud_fbs{};
+    u32 hud_pool_w = 0, hud_pool_h = 0;
+    int hud_work = -1;            ///< the pool entry being drawn this frame
+    u32 hud_block_until = 0;      ///< frame_index before which no redirect starts (blockers)
+    bool hud_redirect_now = false; ///< SyncState maps this draw into the HUD target
+    [[nodiscard]] bool HudEnabled() const;
+    bool HudEnsurePool();
+    bool HudBegin();
+    /// Draws the HUD target back into the guest picture (scaled down) and returns to Idle:
+    /// for anything that reads the guest picture, or a draw that cannot be done at hi-res.
+    void HudResolve(const char* why);
+    /// Back to Idle without copying anything back (a fill over the target starts a frame).
+    void HudAbandon();
+    bool HudTransfer(const Pica::DisplayTransferConfig& config);
+    bool HudOverlaps(PAddr addr, u32 size);
+    bool gpu_blit_linear = false; ///< GpuBlit samples bilinearly (HudResolve's scale-down)
     /// The cached surfaces this draw's texture units sample, noted before the scene begins
     /// and given its serial once it has one.
     std::array<VideoCore::SurfaceId, 3> bound_surfaces{};
@@ -648,6 +678,7 @@ private:
     /// The frame's 2D layer: draws into `hud_target` after its grade (dbgnohud, dbgonlyhud,
     /// hudlog). Cleared at a display transfer and at the frame's end.
     bool hud_phase = false;
+    bool hud_post_draw = false; ///< the draw in BeginDraw is in the 2D layer (counters)
     u32 hud_target = 0;
     u32 stat_alpha_only_feedback{};
     u32 stat_grade_double{};

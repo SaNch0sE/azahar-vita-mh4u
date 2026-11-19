@@ -388,6 +388,8 @@ bool EmuWindowVita::BuildScreen(int screen, GxmPresent::GuestScreen& out) {
         .fill_r = fb->fill_r,
         .fill_g = fb->fill_g,
         .fill_b = fb->fill_b,
+        .tex_flip = fb->tex_flip,
+        .tex_hires = fb->tex_hires,
     };
     return true;
 }

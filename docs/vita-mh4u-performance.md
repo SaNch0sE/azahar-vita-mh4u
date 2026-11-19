@@ -1101,3 +1101,39 @@ makes the HUD much less blurry, but the text stays low-resolution; the old Sharp
 Quest Counter. So the alpha-mask HUD of the decomp plan (which would only equal Sharp bilinear on
 the HUD) is dropped; next is the whole 2D layer drawn at screen resolution, as an option
 (`plans/vita-mh4u-hud-hires.md`).
+
+## HUD resolution: the 2D layer at the screen's resolution (2026-11-19)
+
+Plan: `plans/vita-mh4u-hud-hires.md`. Stage 0 (release counters `hud2d p d s g c`): slots 1, 4,
+5, 6, 7 - 2D draws per frame ~46 / 21 / 27 / 5 / 63, none with depth or stencil, no extra scene
+in the 2D layer, a grade every frame (the quest counter menu included), no EndFrame inside the
+layer.
+
+Built (pause menu "HUD resolution": 3DS / Screen / Screen, lighter 1.5x; `video.txt` `hudres=0|1|2`,
+off by default; kill switch `ux0:data/mh4u/nohudres`): at the first draw after the grade the
+world scene ends, a scene on a 544x960 (906 for 5:3; 360x600 lighter) RGBA8 target opens with the
+graded picture upscaled bilinearly (`HudBegin`), and every later 2D draw into that target is
+drawn there (`BeginDraw`: `BeginScene` on the HUD framebuffer, `SyncState` maps viewport, region
+clip and scissor by kx, ky with the half-pixel shift in guest pixels) - every draw path, in the
+game's order. The display transfer pairs the target with the display buffer instead of blitting
+(`HudTransfer`, a `DisplaySlot` with a pool index and flip); the present shows it 1:1 (no sharp
+filter, no FXAA on those frames). A read of the guest picture, a depth draw in the 2D layer or a
+transfer of another rectangle copies the picture back down (`HudResolve`); a fill over the target
+ends it. The next frame's world drawing over the target without a fill (MH4U every frame) just
+ends it (`hudresresolve` copies it back instead: that was a blit a frame). Release line
+`hudres r f b` (redirected draws, HUD frames, resolves).
+
+Result: all text and icons sharp and correctly layered - quest counter and item pouch fully
+consistent (the old Sharp HUD text's problem gone). Cost is the fill of the 2D layer's pixels at
+5.4x (2.25x lighter) through our generated fragment programs; the GPU is the limit (the GX thread
+waits on the render queue brake ~600-780 ms/s, the render thread's CPU drops):
+
+| shown fps | off | lighter (1.5x) | screen |
+|---|---|---|---|
+| slot 1 camp | 30 | 27-28 | 22-23 |
+| slot 4 village | 30 | - | 30 |
+| slot 5 item pouch open | 30 | - | 24-26 |
+| slot 7 quest counter | 23 | 17 | 10-11 |
+
+Next: where the GPU time goes in the 2D layer (diag `scenetime` on the HUD scene, per-draw fill:
+the big translucent panels of the menus), and whether the panels can stay cheaper.

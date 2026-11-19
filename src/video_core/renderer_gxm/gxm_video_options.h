@@ -29,6 +29,10 @@ struct VideoOptions {
     /// top screen kept in 8-bit colour from the render target to the present
     /// (RasterizerGxm::SmoothDisplayTransfer) instead of the 3DS's 5:6:5 display buffers.
     bool smooth = false;
+    /// "HUD resolution": the game's 2D layer (HUD, text, menus) drawn at the screen's
+    /// resolution over the stretched 3D picture (RasterizerGxm, HudBegin). 0 off (400x240),
+    /// 1 the screen's resolution, 2 lighter (1.5x). Uses the 8-bit display copies.
+    u32 hudres = 0;
 };
 
 /// The live options (loaded from the file on first use).

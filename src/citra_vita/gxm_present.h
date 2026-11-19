@@ -39,6 +39,8 @@ struct GuestScreen {
     int pica_format;  ///< Pica::PixelFormat as int, to keep video_core out of this header
     bool fill_enabled;
     u8 fill_r, fill_g, fill_b;
+    bool tex_flip = false;  ///< `texture` is upside down along v
+    bool tex_hires = false; ///< `texture` is the picture at the display's resolution
 };
 
 /// Frame lifecycle. All of these run on whichever single thread presents (the render thread

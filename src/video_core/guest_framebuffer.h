@@ -43,6 +43,10 @@ struct GuestFramebuffer {
     /// memory would miss it, so the frontend draws a solid quad instead.
     bool fill_enabled;
     u8 fill_r, fill_g, fill_b;
+    /// `texture` holds the picture upside down along its rows (v), and is the picture at the
+    /// display's resolution rather than the guest's (HUD resolution).
+    bool tex_flip = false;
+    bool tex_hires = false;
 };
 
 /// Which of a screen's candidate framebuffer addresses to present, for renderers whose output

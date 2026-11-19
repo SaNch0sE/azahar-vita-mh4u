@@ -58,7 +58,8 @@ std::optional<VideoCore::GuestFramebuffer> RendererGxm::GetGuestFramebuffer(int 
         }
         Common::Rectangle<u32> rect{};
         fb.texture = rasterizer.AccelerateDisplay(screen, fb.addr, config.width, fb.height,
-                                                  pixel_stride, fb.format, &rect);
+                                                  pixel_stride, fb.format, &rect, &fb.tex_flip,
+                                                  &fb.tex_hires);
         fb.tex_x = rect.left;
         fb.tex_y = rect.top;
         fb.tex_width = rect.right - rect.left;

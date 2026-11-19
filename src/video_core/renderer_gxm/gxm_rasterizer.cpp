@@ -685,8 +685,10 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
     // Point sampling, so a same-size conversion is exact; the CPU path this replaces was
     // nearest too, and a filtered result would not match what the guest expects of a
     // display transfer.
-    sceGxmTextureSetMinFilter(&bound, SCE_GXM_TEXTURE_FILTER_POINT);
-    sceGxmTextureSetMagFilter(&bound, SCE_GXM_TEXTURE_FILTER_POINT);
+    const SceGxmTextureFilter blit_filter =
+        gpu_blit_linear ? SCE_GXM_TEXTURE_FILTER_LINEAR : SCE_GXM_TEXTURE_FILTER_POINT;
+    sceGxmTextureSetMinFilter(&bound, blit_filter);
+    sceGxmTextureSetMagFilter(&bound, blit_filter);
     sceGxmTextureSetMipFilter(&bound, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
     sceGxmTextureSetUAddrMode(&bound, SCE_GXM_TEXTURE_ADDR_CLAMP);
     sceGxmTextureSetVAddrMode(&bound, SCE_GXM_TEXTURE_ADDR_CLAMP);
@@ -896,7 +898,7 @@ void RasterizerGxm::BeginScene(Framebuffer* fb) {
     // and starting a scene for them reloaded and stored the whole target (~1 ms of GPU).
     static const bool no_merge = GxmFlag("noscenemerge");
     if (!no_merge && in_scene && scene_fb != nullptr && fb->HasColor() && !fb->HasDepth() &&
-        scene_fb->HasColor() && fb->color_id == scene_fb->color_id &&
+        fb->color_id && scene_fb->HasColor() && fb->color_id == scene_fb->color_id &&
         fb->color_level == scene_fb->color_level) {
         stat_scene_merges++;
         return;
@@ -1576,10 +1578,23 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
     }();
     static const bool both_axes = GxmFlag("halfpixelxy");
     const float hud_shift = !no_half ? 0.5f : 0.0f;
-    const float vx = fb->SXf(static_cast<float>(vp.x)) + (both_axes ? hud_shift : 0.0f),
-                vy = fb->SXf(static_cast<float>(vp.y)) + hud_shift;
-    const float vw = fb->SXf(static_cast<float>(vp.width)),
-                vh = fb->SXf(static_cast<float>(vp.height));
+    // HUD resolution: this draw goes to the screen-sized target, which holds the guest
+    // rectangle (hud_rx, hud_ry, hud_rw, hud_rh) scaled by kx, ky; the half-pixel shift is half
+    // a guest pixel, so it scales too.
+    const bool hud = hud_redirect_now && hud_rw != 0 && hud_rh != 0;
+    const float kx = hud ? static_cast<float>(hud_pool_w) / static_cast<float>(hud_rw) : 0.0f;
+    const float ky = hud ? static_cast<float>(hud_pool_h) / static_cast<float>(hud_rh) : 0.0f;
+    const auto map_x = [&](float v) {
+        return hud ? (v - static_cast<float>(hud_rx)) * kx : fb->SXf(v);
+    };
+    const auto map_y = [&](float v) {
+        return hud ? (v - static_cast<float>(hud_ry)) * ky : fb->SXf(v);
+    };
+    const float vx = map_x(static_cast<float>(vp.x) + (both_axes ? hud_shift : 0.0f) *
+                                                          (hud ? 1.0f : 4.0f / fb->scale_q)),
+                vy = map_y(static_cast<float>(vp.y) + hud_shift * (hud ? 1.0f : 4.0f / fb->scale_q));
+    const float vw = hud ? static_cast<float>(vp.width) * kx : fb->SXf(static_cast<float>(vp.width)),
+                vh = hud ? static_cast<float>(vp.height) * ky : fb->SXf(static_cast<float>(vp.height));
     const float viewport[6] = {vx + vw * 0.5f, vw * 0.5f, vy + vh * 0.5f, vh * 0.5f, 0.0f, 1.0f};
     if (!state_cache.valid || std::memcmp(state_cache.vp, viewport, sizeof(viewport)) != 0) {
         std::memcpy(state_cache.vp, viewport, sizeof(viewport));
@@ -1588,9 +1603,19 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
                           viewport[4], viewport[5]);
     }
     auto draw = helper.DrawRect();
-    draw = {fb->SX(draw.left), fb->SX(draw.top), fb->SX(draw.right), fb->SX(draw.bottom)};
-    const u32 fbw = fb->Width();
-    const u32 fbh = fb->Height();
+    // Low edges round down, high edges up, clamped to the target (HUD resolution).
+    const auto map_lo = [](float v) { return static_cast<u32>(std::max(0.0f, std::floor(v))); };
+    const auto map_hi = [](float v) { return static_cast<u32>(std::max(0.0f, std::ceil(v))); };
+    if (hud) {
+        draw = {map_lo(map_x(static_cast<float>(draw.left))),
+                map_hi(map_y(static_cast<float>(draw.top))),
+                map_hi(map_x(static_cast<float>(draw.right))),
+                map_lo(map_y(static_cast<float>(draw.bottom)))};
+    } else {
+        draw = {fb->SX(draw.left), fb->SX(draw.top), fb->SX(draw.right), fb->SX(draw.bottom)};
+    }
+    const u32 fbw = hud ? hud_pool_w : fb->Width();
+    const u32 fbh = hud ? hud_pool_h : fb->Height();
     const u32 cx0 = std::min(draw.left, fbw), cx1 = std::min(draw.right, fbw);
     const u32 cy0 = std::min(draw.bottom, fbh), cy1 = std::min(draw.top, fbh);
     const bool clip_to_draw = cx1 > cx0 && cy1 > cy0;
@@ -1604,8 +1629,14 @@ void RasterizerGxm::SyncState(const VideoCore::FramebufferHelper<Traits>& helper
     // Scissor uniforms (the fragment program's discard test), window-relative like GL's.
     auto [guest_sx1, guest_sy2, guest_sx2, guest_sy1] = helper.Scissor();
     const auto ss = [fb](s32 v) { return v <= 0 ? v : static_cast<s32>(fb->SX(static_cast<u32>(v))); };
-    const s32 scissor_x1 = ss(guest_sx1), scissor_y2 = ss(guest_sy2), scissor_x2 = ss(guest_sx2),
-              scissor_y1 = ss(guest_sy1);
+    s32 scissor_x1 = ss(guest_sx1), scissor_y2 = ss(guest_sy2), scissor_x2 = ss(guest_sx2),
+        scissor_y1 = ss(guest_sy1);
+    if (hud) {
+        scissor_x1 = static_cast<s32>(map_lo(map_x(static_cast<float>(guest_sx1))));
+        scissor_y1 = static_cast<s32>(map_lo(map_y(static_cast<float>(guest_sy1))));
+        scissor_x2 = static_cast<s32>(map_hi(map_x(static_cast<float>(guest_sx2))));
+        scissor_y2 = static_cast<s32>(map_hi(map_y(static_cast<float>(guest_sy2))));
+    }
     // Most titles leave the scissor test on with the whole screen as its rectangle. The
     // region clip above already confines the draw to that, and a kill in the program
     // costs the tiler its hidden-surface removal (the phase before the kill runs for every
@@ -3841,9 +3872,92 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         static const bool hud_log = GxmFlag("hudlog");
         const u32 cb = regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress();
         const bool post = hud_phase && cb == hud_target;
+        hud_post_draw = post;
+        if (post) {
+            Common::PipelineStats::hud_post_draws.fetch_add(1, std::memory_order_relaxed);
+            if (using_depth_fb) {
+                Common::PipelineStats::hud_post_depth.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (grade_double) {
             hud_phase = true;
             hud_target = cb;
+            Common::PipelineStats::hud_grades.fetch_add(1, std::memory_order_relaxed);
+            // HUD resolution: the grade marks the picture's rectangle; the first 2D draw after
+            // it starts the screen-sized target.
+            if ((hud_state == HudState::Idle || hud_state == HudState::Shown) && HudEnabled() &&
+                frame_index >= hud_block_until && fb->color_id) {
+                const auto vp = setup.helper->Viewport();
+                hud_state = HudState::Armed;
+                hud_guest_id = fb->color_id;
+                hud_rx = static_cast<u32>(vp.x);
+                hud_ry = static_cast<u32>(vp.y);
+                hud_rw = static_cast<u32>(vp.width);
+                hud_rh = static_cast<u32>(vp.height);
+                repeat_ok = false;
+                begin_repeat_ok = false;
+                draw_epoch++;
+                nondraw_epoch++;
+            }
+        }
+        hud_redirect_now = false;
+        if (hud_state != HudState::Idle) {
+            // The copy and the resolve draw quads with unit 0 bound to their source, after
+            // SyncTextureUnits bound this draw's textures: put those back afterwards.
+            const auto saved_bindings = texture_bindings;
+            const auto saved_valid = texture_binding_valid;
+            const HudState state_before = hud_state;
+            if (post && (using_depth_fb || !fb->HasColor())) {
+                // A 2D draw that needs depth cannot be drawn at hi-res: this frame goes back
+                // to the guest picture, and the next few start no redirect.
+                hud_block_until = frame_index + 4;
+                if (hud_state == HudState::Active) {
+                    HudResolve("depth");
+                } else if (hud_state == HudState::Armed) {
+                    HudAbandon();
+                }
+            } else if (hud_state == HudState::Armed && post) {
+                if (!HudBegin()) {
+                    HudAbandon();
+                }
+            }
+            if (hud_state == HudState::Active || hud_state == HudState::Shown) {
+                if (cb != hud_target) {
+                    // Something samples the guest picture, which lacks the 2D layer.
+                    for (const VideoCore::SurfaceId id : bound_surfaces) {
+                        if (id && id == hud_guest_id) {
+                            HudResolve("read");
+                            break;
+                        }
+                    }
+                } else if (!post && hud_state == HudState::Shown) {
+                    // The next frame draws over the target without a fill first: MH4U's
+                    // world covers the whole picture every frame and its 2D layer is drawn
+                    // again, so the shown picture is simply done with - no copy back (that
+                    // cost a blit a frame). `hudresresolve` (file or flag) copies it back.
+                    static const bool resolve = [] {
+                        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/hudresresolve", "rb")) {
+                            std::fclose(f);
+                            return true;
+                        }
+                        return GxmFlag("hudresresolve");
+                    }();
+                    if (resolve) {
+                        HudResolve("overdraw");
+                    } else {
+                        HudAbandon();
+                    }
+                }
+            }
+            hud_redirect_now = hud_state == HudState::Active && post;
+            if (hud_state != state_before) {
+                for (u32 unit = 0; unit < 3; unit++) {
+                    if (saved_valid[unit]) {
+                        texture_binding_valid[unit] = false;
+                        BindFragmentTexture(unit, saved_bindings[unit]);
+                    }
+                }
+            }
         }
         if (hud_log && post) {
             static u32 logged_frame = ~0u;
@@ -3910,7 +4024,15 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     }
     {
         const PhaseTimer timer{time_draws, times.scene};
-        BeginScene(fb);
+        const u32 scenes_before = scenes_this_frame;
+        BeginScene(hud_redirect_now ? hud_fbs[hud_work].get() : fb);
+        if (hud_post_draw && scenes_this_frame != scenes_before) {
+            Common::PipelineStats::hud_post_scenes.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (hud_redirect_now) {
+            hud_pool[hud_work]->gpu_serial = runtime.CurrentEpoch();
+            Common::PipelineStats::hudres_draws.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (!in_scene) {
         return TraceDrop(regs, __LINE__);
@@ -3934,6 +4056,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
     {
         const PhaseTimer timer{time_draws, times.state};
         SyncState(*setup.helper);
+        hud_redirect_now = false;
     }
     DrawTrace("state synced");
     {
@@ -4154,7 +4277,10 @@ void RasterizerGxm::DrawTriangles() {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
     repeat_plain = !feedback_alpha_only && !skip_feedback_draw &&
                    regs.texturing.texture0.type.Value() == TextureType::Texture2D;
-    repeat_fb_color_id = scene_fb != nullptr && scene_fb->HasColor() ? scene_fb->color_id
+    repeat_fb_color_id = hud_state == HudState::Active && hud_work >= 0 &&
+                                 scene_fb == hud_fbs[hud_work].get()
+                             ? hud_guest_id
+                         : scene_fb != nullptr && scene_fb->HasColor() ? scene_fb->color_id
                                                                        : VideoCore::SurfaceId{};
     static const bool check = GxmFlag("texrepeatcheck");
     if (check) {
@@ -5460,6 +5586,9 @@ void RasterizerGxm::FlushAll() {
     nondraw_epoch++;
     DrawTrace("flush all");
     const PhaseTimer timer{time_draws, times.flush};
+    if (hud_state == HudState::Active || hud_state == HudState::Shown) {
+        HudResolve("flush");
+    }
     res_cache.FlushAll();
 }
 
@@ -5469,6 +5598,10 @@ void RasterizerGxm::FlushRegion(PAddr addr, u32 size) {
     DrawTrace("flush region");
     const PhaseTimer timer{time_draws, times.flush};
     stat_flushes++;
+    if ((hud_state == HudState::Active || hud_state == HudState::Shown) &&
+        HudOverlaps(addr, size)) {
+        HudResolve("flush");
+    }
     res_cache.FlushRegion(addr, size);
 }
 
@@ -5523,7 +5656,285 @@ void RasterizerGxm::ClearAll(bool flush) {
     draw_epoch++;
     nondraw_epoch++;
     InvalidateDisplaySlots(0, 0xFFFFFFFFu);
+    hud_state = HudState::Idle;
+    hud_work = -1;
+    hud_guest_id = {};
     res_cache.ClearAll(flush);
+}
+
+bool RasterizerGxm::HudEnabled() const {
+    static const bool killed = [] {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nohudres", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return GxmFlag("nohudres");
+    }();
+    return !killed && Video().hudres != 0;
+}
+
+bool RasterizerGxm::HudOverlaps(PAddr addr, u32 size) {
+    if (!hud_guest_id) {
+        return false;
+    }
+    const Surface& guest = res_cache.GetSurface(hud_guest_id);
+    return addr < guest.addr + guest.size && guest.addr < addr + size;
+}
+
+bool RasterizerGxm::HudEnsurePool() {
+    // The rotated top screen: the target's width runs along the screen's height (544), its
+    // height along the screen's width (960 wide, 906 for 5:3); 1.5x for the lighter setting.
+    const bool light = Video().hudres == 2;
+    const u32 w = light ? 360u : 544u;
+    const u32 h = light ? 600u : (Video().wide ? 960u : 906u);
+    if (hud_pool_w == w && hud_pool_h == h && hud_pool[0] && hud_fbs[0]) {
+        return true;
+    }
+    for (const auto& surface : hud_pool) {
+        if (surface && surface->presented) {
+            return false; // the present still samples one: resize next frame
+        }
+    }
+    for (DisplaySlot& slot : display_slots) {
+        if (slot.hud_index >= 0) {
+            slot.valid = false;
+            slot.hud_index = -1;
+        }
+    }
+    hud_fbs = {};
+    hud_pool = {};
+    hud_pool_w = hud_pool_h = 0;
+    VideoCore::SurfaceParams params;
+    params.addr = 0;
+    params.width = w;
+    params.height = h;
+    params.stride = w;
+    params.is_tiled = false;
+    params.pixel_format = VideoCore::PixelFormat::RGBA8;
+    params.res_scale = 1;
+    params.UpdateParams();
+    for (u32 i = 0; i < hud_pool.size(); i++) {
+        Surface::force_scale_q = 4;
+        hud_pool[i] = std::make_unique<Surface>(runtime, params);
+        Surface::force_scale_q = 0;
+        if (!hud_pool[i]->HasMemory() || !hud_pool[i]->IsColorTarget()) {
+            hud_pool = {};
+            return false;
+        }
+        hud_fbs[i] = std::make_unique<Framebuffer>(runtime, VideoCore::FramebufferParams{},
+                                                   hud_pool[i].get(), nullptr);
+        if (hud_fbs[i]->RenderTarget() == nullptr) {
+            hud_fbs = {};
+            hud_pool = {};
+            return false;
+        }
+    }
+    hud_pool_w = w;
+    hud_pool_h = h;
+    return true;
+}
+
+bool RasterizerGxm::HudBegin() {
+    if (!hud_guest_id || !HudEnsurePool()) {
+        return false;
+    }
+    for (Shader* shader : {blit_vertex_shader, blit_fragment_shader}) {
+        if (shader == nullptr || !shader->IsDone() || shader->failed) {
+            return false;
+        }
+    }
+    // A pool entry no display slot still shows and the present does not sample.
+    int pick = -1;
+    for (int i = 0; i < static_cast<int>(hud_pool.size()) && pick < 0; i++) {
+        bool used = hud_pool[i]->presented;
+        for (const DisplaySlot& slot : display_slots) {
+            used = used || (slot.valid && slot.hud_index == i);
+        }
+        if (!used) {
+            pick = i;
+        }
+    }
+    if (pick < 0) {
+        return false;
+    }
+    constexpr u32 QuadVertices = 6;
+    const u32 offset = (blit_ring_used + 15u) & ~15u;
+    if (offset + QuadVertices * sizeof(BlitVertex) > blit_ring_limit) {
+        return false;
+    }
+    Framebuffer* target = hud_fbs[pick].get();
+    BeginScene(target);
+    if (!in_scene || scene_fb != target) {
+        return false;
+    }
+    hud_work = pick;
+    blit_ring_used = offset + QuadVertices * sizeof(BlitVertex);
+    auto* quad = reinterpret_cast<BlitVertex*>(blit_ring + offset);
+    // The 3D picture, upscaled bilinearly into the whole target: the graded rectangle of the
+    // guest surface, by normalised coordinates (the render scale does not change them).
+    Surface& guest = res_cache.GetSurface(hud_guest_id);
+    const float su = 1.0f / static_cast<float>(std::max(guest.width, 1u));
+    const float sv = 1.0f / static_cast<float>(std::max(guest.height, 1u));
+    const float u0 = hud_rx * su, u1 = (hud_rx + hud_rw) * su;
+    const float v0 = hud_ry * sv, v1 = (hud_ry + hud_rh) * sv;
+    quad[0] = {-1.0f, -1.0f, u0, v0};
+    quad[1] = {1.0f, -1.0f, u1, v0};
+    quad[2] = {-1.0f, 1.0f, u0, v1};
+    quad[3] = {1.0f, -1.0f, u1, v0};
+    quad[4] = {1.0f, 1.0f, u1, v1};
+    quad[5] = {-1.0f, 1.0f, u0, v1};
+    PipelineInfo info{};
+    info.vertex = blit_vertex_shader;
+    info.fragment = blit_fragment_shader;
+    info.stream_count = 1;
+    info.strides[0] = sizeof(BlitVertex);
+    info.attribute_count = 2;
+    info.attributes[0] = {"vert_position", 0, SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 0};
+    info.attributes[1] = {"vert_texcoord", 8, SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 0};
+    info.blend_enabled = true;
+    info.blend.colorMask = SCE_GXM_COLOR_MASK_ALL;
+    info.blend.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
+    info.blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+    info.blend.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
+    info.blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    info.blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+    info.blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    if (!pipeline_cache->BindPipeline(info)) {
+        return false;
+    }
+    SceGxmContext* context = Device().context;
+    sceGxmSetViewportEnable(context, SCE_GXM_VIEWPORT_ENABLED);
+    sceGxmSetViewport(context, hud_pool_w * 0.5f, hud_pool_w * 0.5f, hud_pool_h * 0.5f,
+                      hud_pool_h * 0.5f, 0.0f, 1.0f);
+    sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_OUTSIDE, 0, 0, hud_pool_w - 1,
+                        hud_pool_h - 1);
+    sceGxmSetCullMode(context, SCE_GXM_CULL_NONE);
+    sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    sceGxmSetBackDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    for (int face = 0; face < 2; face++) {
+        const auto set = face == 0 ? sceGxmSetFrontStencilFunc : sceGxmSetBackStencilFunc;
+        set(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+            SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0, 0);
+    }
+    SceGxmTexture source = *guest.Texture();
+    sceGxmTextureSetMinFilter(&source, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetMagFilter(&source, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetMipFilter(&source, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+    sceGxmTextureSetUAddrMode(&source, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetVAddrMode(&source, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    BindFragmentTexture(0, source);
+    sceGxmSetVertexStream(context, 0, quad);
+    sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, identity_indices,
+               QuadVertices);
+    guest.gpu_serial = runtime.CurrentEpoch();
+    hud_pool[pick]->gpu_serial = runtime.CurrentEpoch();
+    pipeline_cache->InvalidateBinding();
+    state_cache = CachedState{};
+    uniform_pipeline = nullptr;
+    hud_state = HudState::Active;
+    Common::PipelineStats::hudres_frames.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void RasterizerGxm::HudResolve(const char* why) {
+    // Why the guest picture was needed, counted and printed now and then (release).
+    {
+        static u32 total = 0;
+        static std::string last_why;
+        if (hud_state != HudState::Idle && (total++ % 120 == 0 || last_why != why)) {
+            last_why = why;
+            sceClibPrintf("[mh4u] hudres: resolve (%s), state %d, frame %u\n", why,
+                          static_cast<int>(hud_state), frame_index);
+        }
+    }
+    if ((hud_state == HudState::Active || hud_state == HudState::Shown) && hud_work >= 0 &&
+        hud_pool[hud_work] && hud_guest_id) {
+        FlushDeferredDraws();
+        if (in_scene) {
+            EndScene();
+        }
+        Surface& src = *hud_pool[hud_work];
+        Surface& dst = res_cache.GetSurface(hud_guest_id);
+        const VideoCore::TextureBlit blit{
+            .src_level = 0,
+            .dst_level = 0,
+            .src_rect = {0, hud_pool_h, hud_pool_w, 0},
+            .dst_rect = {hud_rx, hud_ry + hud_rh, hud_rx + hud_rw, hud_ry},
+        };
+        gpu_blit_linear = true;
+        GpuBlit(src, dst, blit);
+        gpu_blit_linear = false;
+        Common::PipelineStats::hudres_resolves.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (hud_state == HudState::Active) {
+        hud_work = -1;
+    }
+    hud_state = HudState::Idle;
+}
+
+void RasterizerGxm::HudAbandon() {
+    if (hud_state == HudState::Active) {
+        hud_work = -1;
+    }
+    hud_state = HudState::Idle;
+}
+
+bool RasterizerGxm::HudTransfer(const Pica::DisplayTransferConfig& config) {
+    if (config.is_texture_copy || config.scaling != config.NoScale ||
+        config.output_width != 240 || config.output_height != 400 ||
+        (config.flip_vertically && config.crop_input_lines) || hud_work < 0) {
+        return false;
+    }
+    VideoCore::SurfaceParams src_params;
+    src_params.addr = config.GetPhysicalInputAddress();
+    src_params.width = config.output_width;
+    src_params.stride = config.input_width;
+    src_params.height = config.output_height;
+    src_params.is_tiled = !config.input_linear;
+    src_params.pixel_format = VideoCore::PixelFormatFromGPUPixelFormat(config.input_format);
+    src_params.UpdateParams();
+    const auto [src_id, src_rect] =
+        res_cache.GetSurfaceSubRect(src_params, VideoCore::ScaleMatch::Ignore, true);
+    if (!src_id || src_id != hud_guest_id) {
+        return false;
+    }
+    // The transfer must take exactly the graded picture.
+    const u32 lo = std::min(src_rect.top, src_rect.bottom);
+    const u32 hi = std::max(src_rect.top, src_rect.bottom);
+    if (src_rect.left != hud_rx || src_rect.right != hud_rx + hud_rw || lo != hud_ry ||
+        hi != hud_ry + hud_rh) {
+        return false;
+    }
+    const Surface& source = res_cache.GetSurface(src_id);
+    const PAddr out = config.GetPhysicalOutputAddress();
+    DisplaySlot* slot = nullptr;
+    for (DisplaySlot& s : display_slots) {
+        if (s.addr == out && (s.surface || s.hud_index >= 0)) {
+            slot = &s;
+        }
+    }
+    for (u32 tries = 0; slot == nullptr && tries < display_slots.size(); tries++) {
+        DisplaySlot& s = display_slots[display_slot_next++ % display_slots.size()];
+        if (!s.surface || !s.surface->presented) {
+            slot = &s;
+        }
+    }
+    if (slot == nullptr) {
+        return false;
+    }
+    FlushDeferredDraws();
+    if (in_scene) {
+        EndScene();
+    }
+    const bool dst_tiled = config.input_linear != config.dont_swizzle;
+    slot->addr = out;
+    slot->hud_index = hud_work;
+    slot->flip = (source.is_tiled != dst_tiled) != static_cast<bool>(config.flip_vertically);
+    slot->valid = true;
+    hud_state = HudState::Shown;
+    return true;
 }
 
 void RasterizerGxm::InvalidateDisplaySlots(PAddr addr, u32 size) {
@@ -5545,7 +5956,7 @@ bool RasterizerGxm::SmoothDisplayTransfer(const Pica::DisplayTransferConfig& con
         return GxmFlag("nofb8");
     }();
     // A top-screen frame into a 240x400 RGB565 buffer, unscaled: the game's display transfer.
-    if (killed || !Video().smooth || config.is_texture_copy ||
+    if (killed || !(Video().smooth || HudEnabled()) || config.is_texture_copy ||
         config.output_format != Pica::PixelFormat::RGB565 || config.scaling != config.NoScale ||
         config.output_width != 240 || config.output_height != 400 ||
         (config.flip_vertically && config.crop_input_lines)) {
@@ -5603,6 +6014,7 @@ bool RasterizerGxm::SmoothDisplayTransfer(const Pica::DisplayTransferConfig& con
             return false;
         }
     }
+    slot->hud_index = -1;
     Surface& dest = *slot->surface;
     if (source.is_tiled != dest.is_tiled) {
         std::swap(src_rect.top, src_rect.bottom);
@@ -5653,6 +6065,14 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         }
     }
     hud_phase = false;
+    if (hud_state == HudState::Active) {
+        if (HudTransfer(config)) {
+            return true;
+        }
+        HudResolve("transfer");
+    } else if (hud_state == HudState::Armed) {
+        HudAbandon(); // a frame without 2D draws (a movie, a cutscene): nothing was copied
+    }
     if (EnsureResources() && SmoothDisplayTransfer(config)) {
         return true;
     }
@@ -5698,6 +6118,10 @@ bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
     nondraw_epoch++;
     DrawTrace("texture copy");
     const PhaseTimer timer{time_draws, times.transfers};
+    if (hud_state != HudState::Idle &&
+        HudOverlaps(config.GetPhysicalInputAddress(), config.texture_copy.size)) {
+        HudResolve("copy");
+    }
     InvalidateDisplaySlots(config.GetPhysicalOutputAddress(), config.texture_copy.size);
     const bool done = EnsureResources() && res_cache.AccelerateTextureCopy(config);
     if (LogtexActive()) {
@@ -5716,6 +6140,11 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     nondraw_epoch++;
     DrawTrace("fill");
     const PhaseTimer timer{time_draws, times.transfers};
+    // A fill over the graded target starts the next frame: the HUD picture is done with.
+    if (hud_state != HudState::Idle &&
+        HudOverlaps(config.GetStartAddress(), config.GetEndAddress() - config.GetStartAddress())) {
+        HudAbandon();
+    }
     InvalidateDisplaySlots(config.GetStartAddress(), config.GetEndAddress() - config.GetStartAddress());
     const bool done = EnsureResources() && res_cache.AccelerateFill(config);
     if (LogtexActive()) {
@@ -5742,13 +6171,32 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
 
 const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u32 width, u32 height,
                                                       u32 pixel_stride, Pica::PixelFormat format,
-                                                      Common::Rectangle<u32>* out_rect) {
+                                                      Common::Rectangle<u32>* out_rect,
+                                                      bool* out_flip, bool* out_hires) {
     if (addr == 0 || !resources_ready) {
         return nullptr;
     }
     // Smooth gradients: this frame's 8-bit copy of the buffer, when the transfer made one.
-    if (Video().smooth && height == 400 && format == Pica::PixelFormat::RGB565) {
+    if ((Video().smooth || HudEnabled()) && height == 400 && format == Pica::PixelFormat::RGB565) {
         for (DisplaySlot& slot : display_slots) {
+            if (slot.valid && slot.addr == addr && slot.hud_index >= 0 &&
+                hud_pool[slot.hud_index]) {
+                // HUD resolution: the screen-sized picture, whole.
+                Surface& surface = *hud_pool[slot.hud_index];
+                surface.presented = true;
+                display_slot_shown[screen & 1] = &surface;
+                if (out_rect != nullptr) {
+                    *out_rect = {0, 0, hud_pool_w, hud_pool_h};
+                }
+                if (out_flip != nullptr) {
+                    *out_flip = slot.flip;
+                }
+                if (out_hires != nullptr) {
+                    *out_hires = true;
+                }
+                display_textures[screen & 1] = *surface.Texture();
+                return &display_textures[screen & 1];
+            }
             if (slot.valid && slot.addr == addr && slot.surface) {
                 Surface& surface = *slot.surface;
                 surface.presented = true;
@@ -5835,6 +6283,9 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
 }
 
 void RasterizerGxm::EndFrame() {
+    if (hud_phase) {
+        Common::PipelineStats::hud_cut.fetch_add(1, std::memory_order_relaxed);
+    }
     hud_phase = false;
     FlushDeferredDraws();
     draw_epoch++;

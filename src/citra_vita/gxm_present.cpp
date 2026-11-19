@@ -1728,7 +1728,7 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b, GuestScreen* top) {
         sceGxmNotificationWait(&wait);
     }
     g.arena_used[g.back] = 0;
-    if (top != nullptr && GxmRenderer::Video().fxaa) {
+    if (top != nullptr && GxmRenderer::Video().fxaa && !top->tex_hires) {
         FxaaPass(*top);
     }
 
@@ -1901,8 +1901,10 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
     sceGxmTextureSetUAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
     sceGxmTextureSetVAddrMode(&texture, SCE_GXM_TEXTURE_ADDR_CLAMP);
 
-    const bool sharp = g.sharp_fp != nullptr && GxmRenderer::Video().upscale ==
-                                                    GxmRenderer::VideoOptions::Upscale::SharpBilinear;
+    // A picture already at the display's resolution (HUD resolution) is drawn plainly.
+    const bool sharp = g.sharp_fp != nullptr && !screen.tex_hires &&
+                       GxmRenderer::Video().upscale ==
+                           GxmRenderer::VideoOptions::Upscale::SharpBilinear;
     sceGxmSetVertexProgram(g.context, g.quad_vp);
     sceGxmSetFragmentProgram(g.context, sharp ? g.sharp_fp : g.quad_fp);
     sceGxmSetFragmentTexture(g.context, 0, &texture);
@@ -1921,6 +1923,9 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
         u1 = static_cast<float>(screen.tex_x + screen.tex_width) / tex_width;
         v0 = static_cast<float>(screen.tex_y) / tex_height;
         v1 = static_cast<float>(screen.tex_y + screen.tex_height) / tex_height;
+        if (screen.tex_flip) {
+            std::swap(v0, v1);
+        }
     }
     const float x0 = ClipX(x), y0 = ClipY(y), x1 = ClipX(x + w), y1 = ClipY(y + h);
     const QuadVertex corners[4] = {

@@ -465,6 +465,9 @@ public:
     /// cache and every rectangle it hands over stay in guest texels; SX converts one to
     /// storage texels where memory is addressed or rendered into.
     u32 scale_q = 4;
+    /// Set around a constructor call (render thread) to store the next surface at this scale
+    /// instead of the render scale: the HUD resolution targets are sized in screen pixels.
+    static inline u32 force_scale_q = 0;
     /// Mip levels exposed to the sampler (Allocate).
     u32 mip_count = 1;
     [[nodiscard]] u32 SX(u32 v) const noexcept {
