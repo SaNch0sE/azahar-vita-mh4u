@@ -555,6 +555,8 @@ private:
     std::array<Surface*, 2> display_slot_shown{};
     /// The transfer into an 8-bit slot; false leaves it to the cache (and drops the slot).
     bool SmoothDisplayTransfer(const Pica::DisplayTransferConfig& config);
+    /// The slot for a guest display buffer (the one already there, or a free one).
+    DisplaySlot* DisplaySlotFor(PAddr out);
     /// Anything else writing guest memory over a slot makes it stale.
     void InvalidateDisplaySlots(PAddr addr, u32 size);
 

@@ -5909,18 +5909,7 @@ bool RasterizerGxm::HudTransfer(const Pica::DisplayTransferConfig& config) {
     }
     const Surface& source = res_cache.GetSurface(src_id);
     const PAddr out = config.GetPhysicalOutputAddress();
-    DisplaySlot* slot = nullptr;
-    for (DisplaySlot& s : display_slots) {
-        if (s.addr == out && (s.surface || s.hud_index >= 0)) {
-            slot = &s;
-        }
-    }
-    for (u32 tries = 0; slot == nullptr && tries < display_slots.size(); tries++) {
-        DisplaySlot& s = display_slots[display_slot_next++ % display_slots.size()];
-        if (!s.surface || !s.surface->presented) {
-            slot = &s;
-        }
-    }
+    DisplaySlot* slot = DisplaySlotFor(out);
     if (slot == nullptr) {
         return false;
     }
@@ -5944,6 +5933,39 @@ void RasterizerGxm::InvalidateDisplaySlots(PAddr addr, u32 size) {
             slot.valid = false;
         }
     }
+}
+
+RasterizerGxm::DisplaySlot* RasterizerGxm::DisplaySlotFor(PAddr out) {
+    // One slot per guest buffer, whichever path (8-bit copy or HUD picture) filled it last:
+    // two valid slots for one address made the present alternate between a new and a stale
+    // picture (the warning screen flashing through the intro, 2026-11-19).
+    DisplaySlot* slot = nullptr;
+    for (DisplaySlot& s : display_slots) {
+        if (s.addr == out && (s.surface || s.hud_index >= 0)) {
+            if (slot == nullptr) {
+                slot = &s;
+            } else {
+                s.valid = false;
+                s.hud_index = -1;
+                s.addr = 0;
+            }
+        }
+    }
+    // A new buffer address takes the next slot the present is not sampling this frame.
+    const auto busy = [this](const DisplaySlot& s) {
+        return (s.surface && s.surface->presented) ||
+               (s.hud_index >= 0 && hud_pool[s.hud_index] && hud_pool[s.hud_index]->presented);
+    };
+    for (u32 tries = 0; slot == nullptr && tries < display_slots.size(); tries++) {
+        DisplaySlot& s = display_slots[display_slot_next++ % display_slots.size()];
+        if (!busy(s)) {
+            slot = &s;
+            slot->valid = false;
+            slot->hud_index = -1;
+            slot->addr = out;
+        }
+    }
+    return slot;
 }
 
 bool RasterizerGxm::SmoothDisplayTransfer(const Pica::DisplayTransferConfig& config) {
@@ -5978,19 +6000,7 @@ bool RasterizerGxm::SmoothDisplayTransfer(const Pica::DisplayTransferConfig& con
     Surface& source = res_cache.GetSurface(src_id);
 
     const PAddr out = config.GetPhysicalOutputAddress();
-    DisplaySlot* slot = nullptr;
-    for (DisplaySlot& s : display_slots) {
-        if (s.surface && s.addr == out) {
-            slot = &s;
-        }
-    }
-    // A new buffer address takes the next slot the present is not sampling this frame.
-    for (u32 tries = 0; slot == nullptr && tries < display_slots.size(); tries++) {
-        DisplaySlot& s = display_slots[display_slot_next++ % display_slots.size()];
-        if (!s.surface || !s.surface->presented) {
-            slot = &s;
-        }
-    }
+    DisplaySlot* slot = DisplaySlotFor(out);
     if (slot == nullptr) {
         return false;
     }
