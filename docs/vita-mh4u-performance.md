@@ -1230,3 +1230,11 @@ The rest of the 76 ms comes with the full sprite program (texture + combiner + p
 texture), still unexplained (shortening it changed nothing). Vertex alpha of opaque 2D sprites
 arrives as 0.99999994 (`valphalog`: 144,798 of ~162,000 vertices in [0.99, 1), none exactly 1,
 max 0.99999994) - the fragment program rounds it to 255, so an opacity test must use >= 254.5/255.
+
+`ptcoord0` (diag: the procedural texture reads texcoord 0, so texcoord 2 is never an input; picture
+changes a lot, mean screenshot difference 64/255): HUD scene 76.4 -> 76.4 ms. Not the extra input
+either. What separates the full sprite program (~76 ms) from texture-only (~40 ms) is still open:
+not instruction count, the strip read, filtering, the texcoord 2 input or the parameter buffer.
+Left untested: the `minkeep_*` variants also change the colour the program writes (black) and the
+procedural-texture state the rasterizer syncs per draw (`SyncProcTexStrip`, unit 6, `table_dirty`
+blocking the repeat paths). Paused in favour of the menu world skip.
