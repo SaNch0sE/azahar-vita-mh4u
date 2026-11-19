@@ -1197,3 +1197,10 @@ the hidden 3D world under full-screen menus (~22 ms at the counter, menu plan Ph
   a frame with the menu open, picture identical (mean screenshot difference 0.09/255, only the
   fps counter differs). The hidden 3D world under a full-screen menu costs ~29 ms: option 2
   (skip what a full-screen opaque cover hides, decided from the layout data) is worth building.
+
+Opaque 2D sprites without blending (exact: alpha 1 everywhere makes SrcAlpha / OneMinusSrcAlpha
+an identity) - tried and dropped (2026-11-19): at the quest counter the 2D draws' texture 0
+formats per 5 s are A4 4,199 (font), ETC1A4 4,091 (the panels), RGBA4 842, IA4 505, RGBA8 112,
+ETC1 111; only ETC1 has no alpha, and the vertex alphas never read 1. The opaque panels rely on
+ETC1A4 texels being 255, which only a texel scan of each sprite's region could prove. The wider
+lever is making the blend itself cheaper for every 2D draw (8-bit program output).
