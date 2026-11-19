@@ -1264,3 +1264,23 @@ texture or the black output. Super-additive in two inputs fits a per-pixel input
 threshold: the colour varying is four f32 (`RoundPrimary`), the texture coordinate two f32, plus
 the sample result. Next experiment: the colour varying at lower precision (F16 or U8 x4) - in the
 vertex output declaration and the fragment input - and the texcoord as F16.
+
+**The 2D cost found: dead fragment lighting (2026-11-20).** The round-2 rows above that used
+`dbgminsel_unlit` measured nothing: MH4U's 2D programs have `lighting.enable` set, so the unlit
+filter skipped them and every such run drew the full program (76 ms). Without the filter (slot 7,
+hudres=1, HUD scene per frame): bare 21.6; texture 40.1; texture + combiner, proctex 0.5: 40.7
+(+24 temporaries: 45.7); + the real procedural texture 52.1 (computed instead: 48.0); + alpha test
+kept 52.2; full 76.3; `nofog` 76.4; `hudresnoblend` 18.0. Varying precision (`colorf16`,
+`coloru8`, `tcf16`, combinations): 76.3-76.5, no effect; `ptarith ptnosampler ptcoord0` 70.
+The last 24 ms was fragment lighting the sprites compute and never read: their combiners take the
+vertex colour, texture 0 and the procedural texture, never the lighting colours. The emitter now
+skips lighting no stage reads (`keepdeadlight` restores it):
+
+| | HUD scene | Main target |
+|---|---|---|
+| Slot 7 quest counter, hudres=1 | 76.3 -> 52.2 ms | 22.5 -> 22.7 ms |
+| Slot 1 field, hudres=1 | 17.3 -> 12.3 ms | 28.3 -> 27.5 ms |
+
+Pictures identical (counter: only the fps overlay differs; field: animation only). Remaining
+2D price: per-triangle floor ~18-21 ms, texture ~19 ms, procedural texture ~11 ms (~4 ms of it
+avoidable by computing the strip), blending/overdraw (unblended floor 18 ms).

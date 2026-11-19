@@ -105,6 +105,21 @@ inline void SetNoPvNormal(Pica::Shader::FSConfig& config, bool on) {
 }
 
 /**
+ * Diag varying precision (`colorf16`, `coloru8`, `tcf16`): the program's interpolated inputs
+ * take the reduced formats those switches name. Set by the rasterizer on software-shaded draws
+ * (the pass-through vertex program: the 2D layer), or on every draw with `varyall`, so those
+ * programs key apart from the same configuration drawn by a generated vertex program. Bit 31
+ * of lut_d1 (bits 0-4 are the PICA's; the word is otherwise unused by the emitter).
+ */
+inline void SetVaryingVariant(Pica::Shader::FSConfig& config, bool on) {
+    auto& raw = config.lighting.lut_d1.raw;
+    raw = on ? (raw | (1u << 31)) : (raw & ~(1u << 31));
+}
+[[nodiscard]] inline bool VaryingVariantOf(const Pica::Shader::FSConfig& config) {
+    return (config.lighting.lut_d1.raw >> 31) & 1u;
+}
+
+/**
  * Black lighting terms, from the light colour registers (spare bits of lut_d0, bits 0-4 being
  * the PICA's): bit 8 + i the i-th enabled light's specular_0, bit 16 + i its ambient, bit 24
  * the global ambient. A black term is not loaded or added.

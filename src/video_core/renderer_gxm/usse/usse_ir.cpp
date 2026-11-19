@@ -379,6 +379,16 @@ void Builder::PackF16(Dst dst, Reg lo, Reg hi, bool) {
     i.reg[1] = hi;
 }
 
+void Builder::UnpackF32(Dst dst, Reg src, uint8_t src_fmt, uint8_t comp0, bool scale) {
+    Inst& i = Push(Op::MoveF32x4);
+    i.dst = dst;
+    i.reg[0] = src;
+    i.reg[1] = src;
+    i.u[0] = static_cast<uint8_t>(src_fmt + 1);
+    i.u[1] = comp0;
+    i.b[0] = scale;
+}
+
 void Builder::MoveInternal(Dst dst, Src src, Pred pred, bool) {
     Inst& i = Push(Op::MoveInternal);
     i.dst = dst;
@@ -406,8 +416,10 @@ void Builder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, 
     i.pred = pred;
 }
 
-void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc, bool) {
+void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc, bool,
+                       bool coord_f16) {
     Inst& i = Push(Op::Sample2D);
+    i.b[1] = coord_f16;
     i.reg[0] = dst;
     i.reg[1] = coord;
     i.u[0] = sampler_sa;
@@ -3227,7 +3239,12 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             e.Comp(static_cast<CompOp>(i.u[0]), D(i.dst), S(i.src[0]), i.u[1], i.pred);
             break;
         case Op::MoveF32x4:
-            e.MoveF32x4(D(i.dst), Map(i.reg[0]), Map(i.reg[1]));
+            if (i.u[0] != 0) {
+                e.UnpackF32(D(i.dst), Map(i.reg[0]), static_cast<uint8_t>(i.u[0] - 1), i.u[1],
+                            i.b[0]);
+            } else {
+                e.MoveF32x4(D(i.dst), Map(i.reg[0]), Map(i.reg[1]));
+            }
             break;
         case Op::PackF16:
             e.PackF16(D(i.dst), Map(i.reg[0]), Map(i.reg[1]));
@@ -3244,7 +3261,8 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             break;
         case Op::Sample2D: {
             const Reg lod = Map(i.src[0].reg);
-            e.Sample2D(Map(i.reg[0]), Map(i.reg[1]), i.u[0], i.b[0] ? &lod : nullptr, i.u[1]);
+            e.Sample2D(Map(i.reg[0]), Map(i.reg[1]), i.u[0], i.b[0] ? &lod : nullptr, i.u[1], false,
+                       i.b[1]);
             break;
         }
         case Op::Lda32: {

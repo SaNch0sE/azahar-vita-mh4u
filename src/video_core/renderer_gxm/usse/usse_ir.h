@@ -157,12 +157,15 @@ public:
               bool nosched = false);
     void MoveF32x4(Dst dst, Reg lo, Reg hi, bool nosched = false);
     void PackF16(Dst dst, Reg lo, Reg hi, bool nosched = false);
+    /// Encoder::UnpackF32, carried as a MoveF32x4 (u[0] = format + 1, u[1] = comp0, b[0] =
+    /// scale): src is a physical register (an input), both halves of the pair counted read.
+    void UnpackF32(Dst dst, Reg src, uint8_t src_fmt, uint8_t comp0, bool scale);
     void MoveInternal(Dst dst, Src src, Pred pred = Pred::None, bool nosched = false);
     void CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched = false);
     void Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, bool src2_scalar,
               Pred pred = Pred::None);
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
-                  bool nosched = false);
+                  bool nosched = false, bool coord_f16 = false);
     void Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words, uint8_t count,
                uint8_t drc);
     void Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred = Pred::None);

@@ -215,6 +215,10 @@ public:
     void MoveF32x4(Dst dst, Reg lo, Reg hi, bool nosched = false);
     /// Four f32 in (lo, hi) packed to half4 at dst.
     void PackF16(Dst dst, Reg lo, Reg hi, bool nosched = false);
+    /// Unpack to f32 (VPCK, dest F32) from a packed source: `src_fmt` 5 = F16 (src the even
+    /// register of a pair holding four halves), 0 = U8 (src one register of four bytes,
+    /// `scale` normalising them to [0, 1]). dst lane k reads source component comp0 + k.
+    void UnpackF32(Dst dst, Reg src, uint8_t src_fmt, uint8_t comp0, bool scale);
     /// Four-wide f32 move between internal registers with a swizzle.
     void MoveInternal(Dst dst, Src src, Pred pred = Pred::None, bool nosched = false);
     /// dst = (src0 != 0) ? src1 : src2, per component, f32.
@@ -227,8 +231,9 @@ public:
     /// A 2D texture read: four f32 at dst (temp or pa) from sampler words at sa<sampler>,
     /// coordinates at coord.xy; `lod` is an internal register holding the level in x, or
     /// null for the hardware's own level. Counter `drc` is what Wdf waits on.
+    /// `coord_f16`: the coordinate is a half2 in one register (the pair's even register).
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
-                  bool nosched = false);
+                  bool nosched = false, bool coord_f16 = false);
 
 private:
     /// What FinishNosched needs of each word: the internal register components it reads

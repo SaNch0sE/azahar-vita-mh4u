@@ -64,9 +64,16 @@ enum class FragmentInput : uint32_t {
     Position = 0xD, ///< WPOS
 };
 
+/// How an interpolated input arrives in the primary attributes (the descriptor's bits 28-29
+/// and, for a colour, bit 20; Vita3K's spirv_recompiler reading): F32 one register per
+/// component; F16 two components per register; U8 four normalised bytes in one register
+/// (a colour iterator's own default, the type psp2cgc gives a colour without the float bit).
+enum class InputFormat : uint8_t { F32 = 0, F16 = 1, U8 = 2 };
+
 struct GxpInput {
     FragmentInput input;
-    uint8_t components; ///< 1-4, each one PA register (f32)
+    uint8_t components; ///< 1-4
+    InputFormat format = InputFormat::F32;
     /// A non-dependent texture read carried by this descriptor, as psp2cgc writes one
     /// (SDK quad_f/imgui_f): the sampler unit's float4 texel lands in the four PA registers
     /// right after this input's own, before the next input. -1: none.
@@ -81,6 +88,18 @@ struct GxpUniform {
     uint8_t components;  ///< 1-4
     uint32_t array_size; ///< 1 for a scalar or vector
 };
+
+/// The primary attribute registers an input's iterated value takes.
+inline uint32_t InputRegisters(const GxpInput& input) {
+    switch (input.format) {
+    case InputFormat::F16:
+        return (input.components + 1u) / 2u;
+    case InputFormat::U8:
+        return 1;
+    default:
+        return input.components;
+    }
+}
 
 struct GxpSampler {
     std::string name;

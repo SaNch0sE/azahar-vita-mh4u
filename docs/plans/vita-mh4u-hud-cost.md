@@ -163,3 +163,10 @@ Experiments (slot 7, `hudres=1`, `timedraw scenetime nodiskprograms`):
 Fix if confirmed: a sprite program below the threshold - one sampler, strip arithmetic (guarded by
 the bake's line check), the strip coordinate in a spare lane of texcoord 0, stage values in
 internal registers. Estimate: HUD scene 76 -> ~40 ms at `hudres=1`, ~7 ms saved at 1x.
+
+## 8. Outcome (2026-11-20)
+
+Not occupancy or inputs: the sprite programs carried MH4U's enabled-but-unread fragment lighting
+(~24 ms of 76 at hudres=1). Fixed in the emitter (skip lighting no combiner stage reads). Earlier
+`dbgminsel_unlit` runs were invalid (the 2D programs count as lit). Next candidates: the strip
+computed instead of sampled (~4 ms), opaque sprites unblended (floor 18 ms), the world skip.

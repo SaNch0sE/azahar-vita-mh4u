@@ -246,13 +246,18 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
             // of a colour iterator is otherwise fixed-point); bit 25 on the last descriptor.
             uint32_t info = 0x0c00000f | (static_cast<uint32_t>(input.input) << 12) |
                             (static_cast<uint32_t>(input.components - 1) << 22);
-            if (input.input == FragmentInput::Color0 || input.input == FragmentInput::Color1) {
+            const bool colour =
+                input.input == FragmentInput::Color0 || input.input == FragmentInput::Color1;
+            if (input.format == InputFormat::F16) {
+                info |= 0x20000000;
+            } else if (input.format == InputFormat::F32 && colour) {
                 info |= 0x00100000;
             }
+            // InputFormat::U8: a colour without the float bit (only a colour can be U8).
             if (i + 1 == program.inputs.size()) {
                 info |= 0x02000000;
             }
-            uint32_t resource = 0, size = static_cast<uint32_t>(input.components - 1) << 4;
+            uint32_t resource = 0, size = (InputRegisters(input) - 1) << 4;
             uint32_t component_info = 0;
             if (input.query_coord >= 0) {
                 // The query, as the SDK's imgui_f has it on its COLOR0 descriptor: the TEXCOORD

@@ -858,6 +858,27 @@ void Encoder::PackF16(Dst dst, Reg lo, Reg hi, bool nosched) {
          Writes(dst, Pred::None));
 }
 
+void Encoder::UnpackF32(Dst dst, Reg src, uint8_t src_fmt, uint8_t comp0, bool scale) {
+    // Vita3K's vpck decode: a float source addresses pairs (q), a non-float one single
+    // registers ((q << 1) | v); the first component select's high bit comes from src2's low
+    // bit when the source is not f32. Components past the first follow in order.
+    dst.reg = Map(dst.reg);
+    src = Map(src);
+    const auto [db, dext] = DestBank(dst.reg.bank);
+    const auto [sb, sext] = Src12Bank(src.bank);
+    const bool is_float = src_fmt == 5;
+    const uint64_t q = is_float ? DoubledNum(src, 7) : (SingleNum(src, 7) >> 1);
+    const uint64_t v = is_float ? 0 : (SingleNum(src, 7) & 1);
+    const auto sel = [&](int k) { return static_cast<uint64_t>((comp0 + k) & 3); };
+    Push(Pack(PatVpck, {
+        {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'u', 0}, {'y', 0}, {'d', dext},
+        {'e', 0}, {'r', sext}, {'c', sext}, {'a', 0}, {'f', src_fmt}, {'t', 6},
+        {'m', dst.mask}, {'b', db}, {'k', sb}, {'l', sb}, {'g', SingleNum(dst.reg, 7)},
+        {'o', sel(3)}, {'h', scale ? 1u : 0u}, {'i', sel(1)}, {'j', sel(2)}, {'q', q},
+        {'v', v}, {'w', (sel(0) >> 1) & 1}, {'x', sel(0) & 1},
+    }), 54, ReadsAll(src), Writes(dst, Pred::None));
+}
+
 void Encoder::MoveInternal(Dst dst, Src src, Pred pred, bool nosched) {
     dst.reg = Map(dst.reg);
     src.reg = Map(src.reg);
@@ -923,7 +944,7 @@ void Encoder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2,
 }
 
 void Encoder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
-                       bool nosched) {
+                       bool nosched, bool coord_f16) {
     const auto [cb, cext] = Src0Bank(coord.bank);
     if (dst.bank != Bank::Temp && dst.bank != Bank::PrimAttr) {
         Fail("usse: a texture read lands in a temporary or a primary attribute");
@@ -932,7 +953,7 @@ void Encoder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, u
         {'p', 0}, {'s', lod ? 1u : 0u}, {'n', 0}, {'y', 0}, {'m', 0},
         {'r', cext}, {'c', 0}, {'e', lod ? 0u : 1u}, {'f', 3}, {'a', 0}, {'d', 1},
         {'l', lod ? 2u : 0u}, {'t', dst.bank == Bank::PrimAttr ? 1u : 0u}, {'b', 0},
-        {'g', 0}, {'k', cb}, {'h', drc}, {'i', 3}, {'j', lod ? 0u : 2u}, {'o', dst.n},
+        {'g', coord_f16 ? 1u : 0u}, {'k', cb}, {'h', drc}, {'i', 3}, {'j', lod ? 0u : 2u}, {'o', dst.n},
         {'q', DoubledNum(coord, 8)}, {'u', static_cast<uint64_t>(sampler_sa >> 1)},
         {'v', lod ? DoubledNum(*lod, 8) : 0u},
     }), 54, static_cast<uint16_t>(ReadsAll(coord) | (lod ? ReadsAll(*lod) : 0)), 0);

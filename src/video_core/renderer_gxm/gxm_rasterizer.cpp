@@ -1819,6 +1819,16 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             }
         }
     }
+    // Diag varying precision (Usse::SetVaryingVariant): colorf16 / coloru8 / tcf16 act on the
+    // software-shaded draws' programs (the pass-through vertex program: the 2D layer), or on
+    // every program with `varyall`; the bit keys those programs apart.
+    {
+        static const bool any = GxmFlag("colorf16") || GxmFlag("coloru8") || GxmFlag("tcf16");
+        static const bool all = GxmFlag("varyall");
+        if (any && (all || layout.shader == vertex_shader)) {
+            Usse::SetVaryingVariant(fs_config, true);
+        }
+    }
     if (fs_config.lighting.enable && fs_config.lighting.lut_rr.enable) {
         // The reflection-red LUT's evaluation (Usse::ReflMode). `refllut` keeps the lookup,
         // `reflone` the old shortcut (taken as 1), `noreflpow` / `noreflskip` turn off the

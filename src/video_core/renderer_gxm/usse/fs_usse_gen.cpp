@@ -120,7 +120,8 @@ std::array<Source, 6> ReadSources(const TevStageConfig& stage, u32 index) {
  * the three internal registers only inside one pass, with nosched set for as long as one
  * of them holds a value.
  *
- * Primary attributes: pa0-3 COLOR0, then the inputs a configuration needs.
+ * Primary attributes: pa0-3 COLOR0 (pa0-1 as half4; last, one register, as bytes: the
+ * colorf16 / coloru8 diag), then the inputs a configuration needs.
  * Temporaries (32-bit each), fixed homes:
  */
 constexpr uint8_t TmpOutput = 0;      ///< combiner_output, the running result (4)
@@ -153,6 +154,8 @@ constexpr uint8_t TmpTex3 = 96;       ///< the procedural texture's colour (4)
 constexpr uint8_t TmpProcUv = 100;    ///< proctex: u, v (2), the level (.z)
 constexpr uint8_t TmpSnap = 104;      ///< a stage's output kept for a later stage's
                                       ///< PreviousBuffer read (4 per stage, 0-3)
+constexpr uint8_t TmpTcF16 = 120;     ///< tcf16: a half texcoord at an odd PA, unpacked (2
+                                      ///< per unit)
 constexpr uint8_t TmpLightAcc = 20;   ///< lighting: the spot direction, then the reflection
                                       ///< vector, then the specular accumulator, in
                                       ///< next_combiner_buffer's home (3). Nothing lighting
@@ -364,6 +367,10 @@ private:
     GxpProgram gxp;
     std::array<bool, 3> unit_used{};
     std::array<uint8_t, 3> texcoord_pa{}; ///< PA base of TEXCOORD0..2, when declared
+    std::array<bool, 3> texcoord_f16{};   ///< tcf16: TEXCOORDn arrives as half2 (one PA)
+    uint8_t colour_pa = 0;                ///< PA of COLOR0
+    InputFormat colour_format = InputFormat::F32; ///< colorf16 / coloru8
+    std::string varying_layout;           ///< the inputs as declared, for logtemps
     uint8_t position_pa = 0;              ///< PA base of WPOS (x, y, z, w), when declared
     uint8_t texcoord0_w_pa = 0;           ///< PA of TEXCOORD3 (unit 0's projective w)
     uint8_t scissor_pa = 0;               ///< scratch PA holding the scissor test's value
@@ -553,6 +560,18 @@ void FragmentEmitter::PlanInputs() {
             }
         }
     }
+    // Lighting nobody reads: the PICA's fragment lighting only reaches the picture through the
+    // two lighting colours (PrimaryFragmentColor / SecondaryFragmentColor; shadow, bump, Fresnel
+    // and the LUTs all feed those), so with no stage reading either it is dead work. MH4U leaves
+    // lighting enabled for its 2D sprites, whose combiners read the vertex colour, texture 0 and
+    // the procedural texture: per sprite pixel that was the whole lighting computation, ~24 ms
+    // of the quest counter's 76 ms HUD scene at hudres=1 (2026-11-20). `keepdeadlight` keeps it.
+    {
+        static const bool keep_dead = GxmFlag("keepdeadlight");
+        if (uses_lighting && !uses_primary_color && !uses_secondary_color && !keep_dead) {
+            uses_lighting = false;
+        }
+    }
     // Whether a used TEV operand reads the alpha of a lighting colour: the Fresnel LUT feeds
     // only those alphas, so without a reader it is not computed. (MH4U's lit world reads the
     // lighting colours' RGB only.) `nofresnelskip` computes it regardless.
@@ -666,18 +685,35 @@ void FragmentEmitter::PlanInputs() {
     // psp2cgc does it, and Position is no longer needed for fog.
     fog_query = fog_strip && FogQueryEnabled() && !const_fog_strip() && !fog_no_input();
 
-    // pa0-3 is the vertex colour; the four-wide inputs follow, then the pairs, then the
-    // one float3 (which need not be followed by anything pair-aligned).
+    // Diag varying precision (SetVaryingVariant): the colour as half4 (colorf16) or as four
+    // normalised bytes (coloru8), texcoords used only by plain 2D reads as half2 (tcf16).
+    // The vertex side is unchanged: the iterator converts the F32 outputs into the format
+    // the fragment descriptor names. A colour carrying the fog query stays F32.
+    const bool varying_variant = VaryingVariantOf(config);
     {
-        GxpInput colour{FragmentInput::Color0, 4};
+        static const bool colour_f16 = GxmFlag("colorf16");
+        static const bool colour_u8 = GxmFlag("coloru8");
+        if (varying_variant && !fog_query) {
+            colour_format = colour_u8    ? InputFormat::U8
+                            : colour_f16 ? InputFormat::F16
+                                         : InputFormat::F32;
+        }
+    }
+    // The vertex colour first (pa0-3, or pa0-1 as half4), the four-wide inputs follow, then
+    // the pairs, then the one float3; one-register inputs (half2 texcoords, the colour as
+    // bytes, texcoord0's w) go last, so nothing pair-aligned has to follow them.
+    uint8_t pa = 0;
+    if (colour_format != InputFormat::U8) {
+        GxpInput colour{FragmentInput::Color0, 4, colour_format};
         if (fog_query) {
             colour.query_coord = 7;
             colour.query_unit = FogStripUnit;
             colour.query_project_w = true;
         }
         gxp.inputs.push_back(colour);
+        colour_pa = pa;
+        pa += static_cast<uint8_t>(InputRegisters(colour));
     }
-    uint8_t pa = 4;
     if (fog_query) {
         fog_query_pa = pa;
         pa += 4;
@@ -705,8 +741,37 @@ void FragmentEmitter::PlanInputs() {
         (unit_used[2] && !tex.texture2_use_coord1) || proc_coord == 2};
     const FragmentInput coord_inputs[3] = {FragmentInput::TexCoord0, FragmentInput::TexCoord1,
                                            FragmentInput::TexCoord2};
+    // tcf16: a coordinate read only by plain 2D samples (no projection, cube, shadow, border,
+    // procedural texture or debug read) may arrive as half2.
+    {
+        static const bool tc_f16 = GxmFlag("tcf16");
+        using DebugOutput = Pica::Shader::Generator::Cg::DebugOutput;
+        const bool debug_uv1 =
+            Pica::Shader::Generator::Cg::GetDebugOutput() == DebugOutput::Texcoord2;
+        const auto plain_unit = [&](u32 unit) {
+            if (!unit_used[unit]) {
+                return true;
+            }
+            const auto& border = tex.texture_border_color[unit];
+            if (border.enable_s || border.enable_t) {
+                return false;
+            }
+            return unit != 0 || (tex.texture0_type == TextureType::Texture2D && !shadow_compare);
+        };
+        for (u32 c = 0; c < 3; c++) {
+            bool ok = varying_variant && tc_f16 && coord_needed[c] && proc_coord != c &&
+                      !(c == 1 && debug_uv1);
+            for (u32 unit = 0; unit < 3 && ok; unit++) {
+                const u32 coord = (unit == 2 && tex.texture2_use_coord1) ? 1u : unit;
+                if (coord == c) {
+                    ok = plain_unit(unit);
+                }
+            }
+            texcoord_f16[c] = ok;
+        }
+    }
     for (int c = 0; c < 3; c++) {
-        if (coord_needed[c]) {
+        if (coord_needed[c] && !texcoord_f16[c]) {
             gxp.inputs.push_back({coord_inputs[c], 2});
             texcoord_pa[c] = pa;
             pa += 2;
@@ -727,6 +792,32 @@ void FragmentEmitter::PlanInputs() {
         gxp.inputs.push_back({FragmentInput::TexCoord3, 1});
         texcoord0_w_pa = pa;
         pa += 1;
+    }
+    for (int c = 0; c < 3; c++) {
+        if (texcoord_f16[c]) {
+            gxp.inputs.push_back({coord_inputs[c], 2, InputFormat::F16});
+            texcoord_pa[c] = pa;
+            pa += 1;
+        }
+    }
+    if (colour_format == InputFormat::U8) {
+        gxp.inputs.push_back({FragmentInput::Color0, 4, InputFormat::U8});
+        colour_pa = pa;
+        pa += 1;
+    }
+    // The layout as declared (logtemps): name:format@pa per input.
+    {
+        static const char* names[] = {"tc0", "tc1", "tc2", "tc3", "tc4", "tc5", "tc6",
+                                      "tc7", "tc8", "tc9", "col0", "col1", "fog", "wpos"};
+        static const char* formats[] = {"f32", "f16", "u8"};
+        uint32_t at = 0;
+        for (const auto& input : gxp.inputs) {
+            varying_layout += fmt::format("{}{}:{}x{}@{}", varying_layout.empty() ? "" : ",",
+                                          names[static_cast<u32>(input.input) & 15],
+                                          formats[static_cast<u32>(input.format)],
+                                          input.components, at);
+            at += InputRegisters(input) + (input.query_coord >= 0 ? 4u : 0u);
+        }
     }
     // One kill per program, as the compiler has it: with both tests on, the scissor
     // result waits in a scratch PA (the compiler's pa9) for the alpha test's kill.
@@ -751,7 +842,9 @@ void FragmentEmitter::PlanInputs() {
         sampler_fog = static_cast<uint32_t>(gxp.samplers.size());
         gxp.samplers.push_back({"texture_fog_strip", FogStripUnit});
     }
-    if (proctex_strip) {
+    // ptnosampler (diag, with ptarith): the strip is computed, so its sampler is not declared
+    // either - prices the declaration itself (a dependent-sampler word, a texture-state load).
+    if (proctex_strip && !(GxmFlag("ptarith") && GxmFlag("ptnosampler"))) {
         sampler_strip = static_cast<uint32_t>(gxp.samplers.size());
         gxp.samplers.push_back({"texture_proctex_strip", ProcTexStripUnit});
     } else if (uses_proctex) {
@@ -1582,8 +1675,22 @@ void FragmentEmitter::SampleTextures() {
             CubeCoordinates(coords[0]);
             coords[0] = Reg::V(TmpProj);
         }
+        bool coord_f16 = false;
+        if (texcoord_f16[coord]) {
+            const uint8_t at = texcoord_pa[coord];
+            if ((at & 1) == 0) {
+                coord_f16 = true; // the sample reads the half2 itself
+            } else {
+                // Halves 2-3 of the pair: unpacked to f32 first (a sample's coordinate
+                // addresses pairs).
+                const Reg into = Reg::V(static_cast<uint8_t>(TmpTcF16 + unit * 2));
+                e.UnpackF32({I0, 0x3}, Reg::Pa(static_cast<uint8_t>(at & ~1u)), 5, 2, false);
+                e.MoveInternal({into, 0x3}, {I0, XYZW}, Pred::None, true);
+                coords[unit] = into;
+            }
+        }
         e.Sample2D(Reg::V(static_cast<uint8_t>(TmpTex0 + unit * 4)), coords[unit],
-                   SamplerSa(sampler_index), nullptr, 0);
+                   SamplerSa(sampler_index), nullptr, 0, false, coord_f16);
         sampler_index++;
         any = true;
     }
@@ -1678,7 +1785,17 @@ void FragmentEmitter::Normalize3(Reg into, Vec4Loc from, Reg scratch) {
 }
 
 void FragmentEmitter::RoundPrimary() {
-    LoadVec4(I0, {Bank::PrimAttr, 0});
+    switch (colour_format) {
+    case InputFormat::F16:
+        e.UnpackF32({I0, 0xf}, Reg::Pa(colour_pa), 5, 0, false);
+        break;
+    case InputFormat::U8:
+        e.UnpackF32({I0, 0xf}, Reg::Pa(colour_pa), 0, 0, true);
+        break;
+    default:
+        LoadVec4(I0, {Bank::PrimAttr, colour_pa});
+        break;
+    }
     Byteround(I0, I1);
     StoreVec4({Bank::Virtual, TmpPrimary}, I0);
 }
@@ -3134,16 +3251,19 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     if (log_temps) {
         if (std::FILE* f = std::fopen("ux0:data/mh4u/templog.txt", "a")) {
             std::fprintf(f,
-                         "level %d temps %u pa %u instrs %u lit %u lights %u bump %u pv %u kill %u "
-                         "fog %u tex %u%u%u refl %u n %u fr %u spec0black %u memlights %u\n",
-                         level, lowered.temp_count, lowered.pa_count, static_cast<u32>(encoder.Words().size()),
+                         "level %d temps %u pa %u inpa %u instrs %u lit %u lights %u bump %u pv %u "
+                         "kill %u fog %u tex %u%u%u refl %u n %u fr %u spec0black %u memlights %u "
+                         "vary %u layout %s\n",
+                         level, lowered.temp_count, lowered.pa_count, gxp.pa_count,
+                         static_cast<u32>(encoder.Words().size()),
                          config.lighting.enable.Value(), config.lighting.src_num.Value(),
                          static_cast<u32>(config.lighting.bump_mode.Value()),
                          PvHalfOf(config) ? 1u : 0u, uses_kill ? 1u : 0u, uses_fog ? 1u : 0u,
                          unit_used[0] ? 1u : 0u, unit_used[1] ? 1u : 0u, unit_used[2] ? 1u : 0u,
                          static_cast<u32>(ReflModeOf(config)), ReflExponentOf(config),
                          static_cast<u32>(FrModeOf(config)), Specular0Black(config, 0) ? 1u : 0u,
-                         static_cast<u32>(memory_uniforms.size() / 8));
+                         static_cast<u32>(memory_uniforms.size() / 8),
+                         VaryingVariantOf(config) ? 1u : 0u, varying_layout.c_str());
             std::fclose(f);
         }
     }
