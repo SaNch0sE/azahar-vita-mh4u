@@ -72,6 +72,17 @@ Measurements and history are in `vita-mh4u-performance.md`.
   the console drops off the network and powers off later. Seen 4 times on 2026-11-18 (the last
   on the first launch after a vpk install).
 
+- **2D layer cost** (`plans/vita-mh4u-2d-layer.md`, experiments in the performance notes), in
+  order: (1) skip the hidden 3D world under full-screen menus (~29 ms at the quest counter,
+  `plans/vita-mh4u-menu-world-skip.md`); (2) opaque sprites drawn without blending (exact);
+  (3) fragment programs with 8-bit output so the patcher's blend code is cheaper for all 2D.
+- **Heavenfall mod fixes** (built locally 2026-11-19 from the web build's own options; the base
+  build is byte-identical to the web build): (A) hidden panes also get scale 0, so the game stops
+  rasterising them (40 `.arc` files, only alpha-0 sprites changed; menus such as ui415, ui511,
+  ui800, ui481, ui500); (B, optional) drop the quest list's full-screen backdrop, which `ss_fill`
+  hides (~1 screen at the counter). Needs a play test reaching those menus without save states
+  (states hold the loaded layouts). The camp HUD's alpha-0 area is the game's own: emulator side.
+
 ## Open bugs
 
 - **Crash loading a state** (once, 2026-11-19: slot 7 loaded after browsing menus in slot 5; the
