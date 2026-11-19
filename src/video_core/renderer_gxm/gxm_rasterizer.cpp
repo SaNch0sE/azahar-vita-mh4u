@@ -3955,7 +3955,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
             if (!hud_phase && cb == hud_target && using_depth_fb) {
                 cover.world_draws++;
             }
-            if (cb != hud_target && cb != 0) {
+            if (cover_frame_on && cb != hud_target && cb != 0) {
                 using CF = Pica::FramebufferRegs::CompareFunc;
                 const auto& om_now = regs.framebuffer.output_merger;
                 CoverNoteTarget(cb,
@@ -3972,13 +3972,14 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
             const bool pre_draw = cover.pre && !hud_phase && cb == hud_target;
             cover_last_tracked = (post && cover.active) || pre_draw;
             cover_last_pre = pre_draw;
-            if (pre_draw) {
+            if (pre_draw && (cover.covered_px != 0 || cover_in_sw)) {
                 // Software draws before the grade are judged in CoverCommit (this decides
-                // their kind).
+                // their kind: a draw sampling a rendered picture must not cover). A GPU-path
+                // draw only ever uncovers - nothing to do while nothing is covered.
                 CoverClassifyDepth(using_depth_fb);
                 CoverClassifySamples();
             }
-            if (pre_draw && !cover_in_sw && !cover_pixel_local) {
+            if (pre_draw && !cover_in_sw && !cover_pixel_local && cover.covered_px != 0) {
                 // Before the grade, on a GPU path: whatever it is, its pixels are unknown.
                 cover.layer_draws++;
                 if (cover_depth_kind == 0 && cover.cand_logged < cover.cand.size()) {
@@ -4047,7 +4048,10 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                 cover.y0 = gy;
                 cover.w = gw;
                 cover.h = gh;
-                cover.active = cover.w > 0 && cover.h > 0 && cover.w <= 1024 && cover.h <= 1024;
+                // Only while the emulation thread has a cover key: without one no proof is
+                // wanted, and the layer costs nothing here.
+                cover.active = cover_frame_on && cover.w > 0 && cover.h > 0 && cover.w <= 1024 &&
+                               cover.h <= 1024;
                 cover.row_words = static_cast<u32>(std::max(cover.w, 0) + 63) / 64;
                 if (carry) {
                     cover.covered_px = carried;
@@ -4371,8 +4375,13 @@ void RasterizerGxm::DrawTriangles() {
         return;
     }
     const PhaseTimer total_timer{time_draws, times.total};
+    if (cover_gs_kept_us != 0) {
+        // A GS draw kept off the GPU for the proof was shaded in software just now.
+        cover.gs_kept_us += static_cast<u32>(Common::PipelineStats::NowUs() - cover_gs_kept_us);
+        cover_gs_kept_us = 0;
+    }
     // Cover proof: this draw's opaque quads, marked once it is issued (CoverCommit).
-    if (CoverOn()) {
+    if (CoverOn() && (cover.active || cover.pre)) {
         CoverScan();
     }
     // valphalog (diag): what the 2D layer's vertex alphas are, as a histogram, every 5 s.
@@ -5393,6 +5402,24 @@ bool RasterizerGxm::AccelerateGsDraw(const Pica::DrawPayload& payload) {
         payload.num_vertices < min_points || payload.vertex_max < payload.vertex_min) {
         return false;
     }
+    // Cover proof: a 2D sprite batch that could be a cover stays on the software path, where
+    // its quads are seen. MH4U batches the plank sprites into one draw on some frames (four
+    // points: the GPU's) and draws them one by one on others (under min_points: software) -
+    // its batching follows the sprites' per-frame vertex slots - so without this the proof
+    // held only every other frame. Not for the font and mask formats: never covers, many.
+    if (CoverOn() && (cover.active || cover.pre) &&
+        regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() == hud_target &&
+        (hud_phase ? cover.active : cover.pre)) {
+        using Fmt = Pica::TexturingRegs::TextureFormat;
+        const Fmt f = regs.texturing.texture0_format;
+        bool needs_primary = false, needs_texture = false;
+        if (f != Fmt::A4 && f != Fmt::A8 && f != Fmt::IA4 && f != Fmt::IA8 &&
+            CoverStateReasons(needs_primary, needs_texture) == 0) {
+            cover.gs_kept++;
+            cover_gs_kept_us = Common::PipelineStats::NowUs();
+            return false;
+        }
+    }
     if (!EnsureResources()) {
         return false;
     }
@@ -6042,38 +6069,24 @@ std::pair<int, int> RasterizerGxm::CoverAlphaBounds(std::pair<int, int> primary,
     return prev;
 }
 
-void RasterizerGxm::CoverScan() {
-    cover_pending.clear();
-    cover_draw = false;
-    cover_draw_perspective = false;
-    cover_draw_reads_target = false;
-    // In the 2D layer (after the grade), or before it on the target (CoverFrame::pre).
-    const bool in_layer = cover.active && hud_phase;
-    const bool in_pre = cover.pre && !hud_phase;
-    if (!CoverOn() || !(in_layer || in_pre) || vertex_ring.base == nullptr ||
-        !vertex_batch.empty() ||
-        regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() != hud_target) {
-        return;
-    }
-    cover_draw = true;
-    cover_draw_pre = in_pre;
-    cover.layer_draws++;
+u32 RasterizerGxm::CoverStateReasons(bool& needs_primary, bool& needs_texture) const {
     // A unit the program reads that holds the target's memory (the grade family, which our
     // renderer draws without the read, or a copy of the picture): never a cover - what it
     // writes comes from the picture, not from the sprite. Units left enabled but unread do
     // not count: MH4U leaves them pointing at the picture after the grade, which on frames
     // without the world (armed) made the planks look like reads of it.
+    bool reads_target = false;
     {
         const auto units = regs.texturing.GetTextures();
         const u32 target_end = hud_target + static_cast<u32>(cover.w * cover.h) * 4;
         for (u32 i = 0; i < units.size(); i++) {
             const u32 a = units[i].config.GetPhysicalAddress();
-            cover_draw_reads_target = cover_draw_reads_target ||
+            reads_target = reads_target ||
                                       (units[i].enabled && TextureUnitRead(i) && a >= hud_target &&
                                        a < target_end);
         }
     }
-    u32 reasons = cover_draw_reads_target ? 1u : 0u;
+    u32 reasons = reads_target ? 1u : 0u;
     using BF = Pica::FramebufferRegs::BlendFactor;
     using BE = Pica::FramebufferRegs::BlendEquation;
     using CF = Pica::FramebufferRegs::CompareFunc;
@@ -6142,8 +6155,8 @@ void RasterizerGxm::CoverScan() {
         state_ok = state_ok && pass;
         alpha_needed = true;
     }
-    bool needs_primary = false;
-    bool needs_texture = false;
+    needs_primary = false;
+    needs_texture = false;
     const Fmt format = regs.texturing.texture0_format;
     if (state_ok && alpha_needed) {
         state_ok = CoverAlphaBounds({255, 255}, {255, 255}).first >= 255;
@@ -6165,6 +6178,43 @@ void RasterizerGxm::CoverScan() {
         }
     }
 
+    return reasons;
+}
+
+void RasterizerGxm::CoverScan() {
+    cover_pending.clear();
+    cover_draw = false;
+    cover_draw_perspective = false;
+    cover_draw_reads_target = false;
+    // In the 2D layer (after the grade), or before it on the target (CoverFrame::pre).
+    const bool in_layer = cover.active && hud_phase;
+    const bool in_pre = cover.pre && !hud_phase;
+    if (!CoverOn() || !(in_layer || in_pre) || vertex_ring.base == nullptr ||
+        !vertex_batch.empty() ||
+        regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() != hud_target) {
+        return;
+    }
+    cover_draw = true;
+    cover_draw_pre = in_pre;
+    cover.layer_draws++;
+    bool needs_primary = false;
+    bool needs_texture = false;
+    u32 reasons = CoverStateReasons(needs_primary, needs_texture);
+    cover_draw_reads_target = (reasons & 1) != 0;
+    const bool state_ok = reasons == 0;
+    using TexConfig = Pica::TexturingRegs::TextureConfig;
+    const auto& rz = regs.rasterizer;
+    const auto& tex = regs.texturing.texture0;
+    const auto format = regs.texturing.texture0_format.Value();
+    // Nothing covered and nothing this draw could cover: an uncover would change nothing,
+    // so the rest (its vertices, its kind) is not worth reading - the world's draws before
+    // the grade end here.
+    if (in_pre && !state_ok && cover.covered_px == 0) {
+        cover_bbox[0] = cover_bbox[1] = 0;
+        cover_bbox[2] = cover_bbox[3] = -1;
+        cover_cand_slot = -1;
+        return;
+    }
     cover.opaque_draws += state_ok ? 1 : 0;
     const float vp_hw = Pica::f24::FromRaw(rz.viewport_size_x).ToFloat32();
     const float vp_hh = Pica::f24::FromRaw(rz.viewport_size_y).ToFloat32();
@@ -6428,6 +6478,9 @@ bool RasterizerGxm::CoverTexelWindow(const CoverQuad& q, s32 x0, s32 x1, s32 y0,
 }
 
 void RasterizerGxm::CoverFill(s32 x0, s32 y0, s32 x1, s32 y1, bool set) {
+    if (!set && cover.covered_px == 0) {
+        return; // nothing to uncover: the world's draws cost nothing here
+    }
     x0 = std::max(x0 - cover.x0, 0);
     y0 = std::max(y0 - cover.y0, 0);
     x1 = std::min(x1 - cover.x0, cover.w - 1);
@@ -6518,9 +6571,14 @@ void RasterizerGxm::CoverClassifyDepth(bool using_depth_fb) {
 }
 
 RasterizerGxm::CoverTarget* RasterizerGxm::CoverTargetOf(u32 addr, bool create) {
+    // The world draws into the same few targets in runs: the last one found first.
+    if (cover_target_last != nullptr && cover_target_last->addr == addr && addr != 0) {
+        return cover_target_last;
+    }
     CoverTarget* victim = nullptr;
     for (CoverTarget& t : cover_targets) {
         if (t.addr == addr && addr != 0) {
+            cover_target_last = &t;
             return &t;
         }
         // An empty slot first, else the one drawn longest ago.
@@ -6533,6 +6591,7 @@ RasterizerGxm::CoverTarget* RasterizerGxm::CoverTargetOf(u32 addr, bool create) 
         return nullptr;
     }
     *victim = CoverTarget{addr, frame_index, 0, 0, 0, 0};
+    cover_target_last = victim;
     return victim;
 }
 
@@ -6808,8 +6867,10 @@ void RasterizerGxm::CoverFrameEnd(bool top_transfer) {
             }
             sceClibPrintf("[mh4u] cover proof map (rows of x, y up): %s\n", map.c_str());
             sceClibPrintf("[mh4u] cover proof: %u px carried from before the grade, %u draws "
-                          "before it uncovered (not covers), %u quad-sized draws:\n",
-                          cover.pre_covered_px, cover.kind_counts[6], cover.cand_logged);
+                          "before it uncovered (not covers), %u GS draws kept on software "
+                          "(%u us), %u quad-sized draws:\n",
+                          cover.pre_covered_px, cover.kind_counts[6], cover.gs_kept,
+                          cover.gs_kept_us, cover.cand_logged);
             // Why each quad-sized draw covered or not: bits 1 reads the picture, 2 depth or
             // stencil test, 4 colour mask / write / fragment mode, 8 scissor exclude, 16
             // blend, 32 alpha test, 64 alpha not 1, 128 texture type or format, 256
@@ -6882,9 +6943,12 @@ void RasterizerGxm::CoverFrameEnd(bool top_transfer) {
     cover = CoverFrame{};
     cover_pending.clear();
     cover_draw = false;
+    // Is there a cover key (a layout with large opaque panes) at all? Read once a frame; none
+    // (the field, the village) and the next frame does no proof work.
+    cover_frame_on = Common::Mh4uCover::key_present.load(std::memory_order_relaxed);
     // The next frame's draws into the target before its grade: tracked over the same
     // rectangle, so covers drawn after its last world draw count (see the grade).
-    if (cover_last_geom[2] > 0 && cover_last_geom[3] > 0) {
+    if (cover_frame_on && cover_last_geom[2] > 0 && cover_last_geom[3] > 0) {
         cover.pre = true;
         cover.x0 = cover_last_geom[0];
         cover.y0 = cover_last_geom[1];

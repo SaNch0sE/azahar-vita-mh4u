@@ -791,6 +791,8 @@ private:
         u32 pre_covered_px = 0; ///< carried into the layer at the grade (coverlog)
         std::array<CoverCandLog, 8> cand{};
         u32 cand_logged = 0;
+        u32 gs_kept = 0;    ///< GS draws kept off the GPU so their quads are seen
+        u32 gs_kept_us = 0; ///< their software shading (coverlog)
     };
     CoverFrame cover;
     /// One bit per pixel of the picture (row_words words a row): under an opaque sprite now.
@@ -803,6 +805,9 @@ private:
     bool cover_in_sw = false;             ///< BeginDraw is called from DrawTriangles
     bool cover_draw_pre = false;          ///< the software draw is before the grade
     bool cover_pixel_local = false;       ///< BeginDraw: the grade family (drawn in place)
+    bool cover_frame_on = false;          ///< this frame has a cover key (emulation side)
+    u64 cover_gs_kept_us = 0;             ///< when a GS draw was kept for the software path
+    CoverTarget* cover_target_last = nullptr;
     bool cover_last_tracked = false;      ///< the last full BeginDraw was a proof draw
     bool cover_last_pre = false;          ///< ... before the grade
     s32 cover_cand_slot = -1;             ///< its coverlog candidate entry
@@ -820,6 +825,9 @@ private:
     /// Before a software draw (DrawTriangles): its opaque axis-aligned quads, kept until the
     /// draw is issued.
     void CoverScan();
+    /// Why the current draw state cannot cover (0: it can, if its quads are opaque): the
+    /// coverlog reason bits. Also says whether the alpha depends on the vertices or texture 0.
+    [[nodiscard]] u32 CoverStateReasons(bool& needs_primary, bool& needs_texture) const;
     /// The draw went out: its quads cover their pixels (texture opacity checked against the
     /// bound surface); a world-dependent draw uncovers what it touched. `textures_changed`:
     /// the texture-only repeat, whose units BeginDraw did not see.

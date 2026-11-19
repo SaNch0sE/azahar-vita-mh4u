@@ -179,3 +179,11 @@ the plank draws (never read by their program), and the proof treated that as a t
 the planks stopped covering on exactly the armed frames. Now only units the program reads count;
 depth write or an Always test no longer refuses a cover; covers drawn after the last world draw
 but before the grade carry into the layer; arming needs 4 covered proofs in a row.
+
+Fix 2 (2026-11-19): the user's counter still alternated because MH4U sometimes batches the four
+planks into one 4-point GS draw, which the hardware GS path took (vertices unseen by the proof).
+Cover-eligible GS draws in the 2D layer (state passes `CoverStateReasons`, texture not a font or
+mask format) now stay on the software path. The tracking added in fix 1 cost Val Habar 30 -> 18
+fps; all render-thread proof work is now gated by `key_present` from the walk, and uncovering an
+empty bitset returns at once. Console, release: Val Habar 30 fps with `covertrap` (30 without);
+counter 26 fps armed (22 without), every proof covered, 0 mispredicts.

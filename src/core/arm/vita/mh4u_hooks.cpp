@@ -938,6 +938,7 @@ void CoverKey() {
         cv.key_start = g_seq;
         cov_key_changes.fetch_add(1, std::memory_order_relaxed);
     }
+    Common::Mh4uCover::key_present.store(key != 0, std::memory_order_relaxed);
 
     const u32 us = static_cast<u32>(sceKernelGetProcessTimeWide() - start);
     if (!w.logging) {
@@ -1222,6 +1223,7 @@ void Tick(Core::System& system) {
         cv.proof_read = Common::Mh4uCover::proof_head.load(std::memory_order_acquire);
         cv.last_trap_frames = frames;
         Common::Mh4uCover::armed.store(false, std::memory_order_relaxed);
+        Common::Mh4uCover::key_present.store(false, std::memory_order_relaxed);
         return;
     }
     // Cover watchdog: the world stays hidden only while the main loop keeps trapping. Frames

@@ -22,6 +22,10 @@ inline bool render_enabled = false;
 /// whose frame it judged (give or take the game's own lag, which the decision allows for).
 inline std::atomic<u32> trap_seq{0};
 
+/// The emulation thread's layout walk found a plausible cover key (large opaque panes). The
+/// render thread reads it once a frame and does no proof work at all while it is false.
+inline std::atomic<bool> key_present{false};
+
 /// The skip is armed (emulation thread), for `covermagenta` on the render thread.
 inline std::atomic<bool> armed{false};
 
