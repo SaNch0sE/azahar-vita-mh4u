@@ -8,6 +8,7 @@
 #include <malloc.h>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <map>
 #include <vector>
 
@@ -1244,7 +1245,18 @@ bool Initialize() {
     init.displayQueueMaxPendingCount = display_buffers;
     init.displayQueueCallback = DisplayCallback;
     init.displayQueueCallbackDataSize = sizeof(DisplayData);
-    init.parameterBufferSize = ParameterBufferSize;
+    // pbmb<N> test switch (file ux0:data/mh4u/pb32 / pb48): a bigger parameter buffer, to see
+    // whether partial renders (the buffer filling mid-scene) cost the HUD resolution scene.
+    u32 pb_size = ParameterBufferSize;
+    for (const u32 mb : {48u, 32u}) {
+        if (std::FILE* f = std::fopen((std::string(VITA_DATA_DIR "/pb") + std::to_string(mb)).c_str(), "rb")) {
+            std::fclose(f);
+            pb_size = mb * 1024 * 1024;
+            break;
+        }
+    }
+    sceClibPrintf("[mh4u] gxm parameter buffer %u MiB\n", pb_size >> 20);
+    init.parameterBufferSize = pb_size;
     if (sceGxmInitialize(&init) < 0) {
         LOG_CRITICAL(Frontend, "sceGxmInitialize failed");
         return false;

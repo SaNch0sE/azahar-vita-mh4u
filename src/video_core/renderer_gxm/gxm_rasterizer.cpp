@@ -3114,6 +3114,28 @@ void RasterizerGxm::SyncProcTexStrip() {
     sceGxmTextureSetMagFilter(&strip.texture, f);
     stat_strip_bakes++;
     proc_strip_bound = slot;
+    // ptstriplog (diag): each baked strip's range per channel, and how far it is from a
+    // straight line. MH4U's 2D layer bakes one strip: a line 0..252, equal channels (2026-11-19).
+    static const bool strip_log = GxmFlag("ptstriplog");
+    if (strip_log) {
+        u32 lo[4] = {255, 255, 255, 255}, hi[4] = {0, 0, 0, 0};
+        float dev = 0;
+        for (u32 n = 0; n < Usse::ProcTexStripTexels; n++) {
+            for (u32 c = 0; c < 4; c++) {
+                const u32 v = (texels[n] >> (8 * c)) & 0xFF;
+                lo[c] = std::min(lo[c], v);
+                hi[c] = std::max(hi[c], v);
+            }
+        }
+        for (u32 n = 0; n < Usse::ProcTexStripTexels; n++) {
+            const float line = static_cast<float>(n) * static_cast<float>(hi[0]) /
+                               static_cast<float>(Usse::ProcTexStripTexels - 1);
+            dev = std::max(dev, std::abs(static_cast<float>(texels[n] & 0xFF) - line));
+        }
+        LOG_INFO(Render, "ptstrip bake: width {} offset {} -> r {}-{} g {}-{} b {}-{} a {}-{}, "
+                 "line deviation {:.2f}", width, offset, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
+                 lo[3], hi[3], dev);
+    }
 }
 
 int RasterizerGxm::AcquireStrip(u64 key, bool& fresh) {
@@ -3875,13 +3897,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         hud_post_draw = post;
         if (post) {
             Common::PipelineStats::hud_post_draws.fetch_add(1, std::memory_order_relaxed);
-            const auto area = setup.helper->DrawRect();
-            hud_area_acc += area.GetWidth() * area.GetHeight();
-            if (hud_area_acc >= 1000) {
-                Common::PipelineStats::hud_post_area.fetch_add(hud_area_acc / 1000,
-                                                               std::memory_order_relaxed);
-                hud_area_acc %= 1000;
-            }
+
             if (using_depth_fb) {
                 Common::PipelineStats::hud_post_depth.fetch_add(1, std::memory_order_relaxed);
             }
@@ -4183,6 +4199,33 @@ void RasterizerGxm::DrawTriangles() {
         return;
     }
     const PhaseTimer total_timer{time_draws, times.total};
+    // The 2D layer's real coverage: the screen area of its software-drawn triangles (guest
+    // pixels at 240x400; repeats count too), for the HUD cost work (release `hudres ... a`).
+    if (hud_post_draw && hud_phase && vertex_ring.base != nullptr) {
+        for (const auto& range : pending_ring_ranges) {
+            const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+                vertex_ring.base + static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+            for (u32 i = 0; i + 2 < range.count; i += 3) {
+                float px[3], py[3];
+                bool ok = true;
+                for (u32 k = 0; k < 3; k++) {
+                    const float w = v[i + k].pos.w.ToFloat32();
+                    ok = ok && w > 0.0f;
+                    px[k] = ok ? v[i + k].pos.x.ToFloat32() / w * 120.0f : 0.0f;
+                    py[k] = ok ? v[i + k].pos.y.ToFloat32() / w * 200.0f : 0.0f;
+                }
+                if (ok) {
+                    hud_area_acc += static_cast<u32>(std::abs(
+                        (px[1] - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (py[1] - py[0])) * 0.5f);
+                }
+            }
+        }
+        if (hud_area_acc >= 1000) {
+            Common::PipelineStats::hud_post_area.fetch_add(hud_area_acc / 1000,
+                                                           std::memory_order_relaxed);
+            hud_area_acc %= 1000;
+        }
+    }
     u32 vertex_count = static_cast<u32>(vertex_batch.size());
     for (const auto& range : pending_ring_ranges) {
         vertex_count += range.count;

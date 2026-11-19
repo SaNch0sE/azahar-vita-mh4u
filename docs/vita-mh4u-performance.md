@@ -1163,3 +1163,24 @@ colour, blending kept) - the floor no program change can beat; ~40 ms with the t
 (stage 1: `2 * (stage0 + proctex(u) - 0.5)`) and the general emitter's per-pixel rounding:
 option 1 of `plans/vita-mh4u-hud-cost.md` (a compact sprite program) is being built. The dumped
 HUD programs (`usse_dump`) are unlit; `dbgminsel_unlit` still changed nothing (not explained).
+
+**What does not make the HUD scene cheaper (2026-11-19, slot 7, diag scenetime, hudres=1, HUD
+scene ~76 ms a frame):**
+- A compact sprite fragment program (plan option 1: 23 instead of 45 USSE instructions, same
+  picture - mean screenshot difference 0.02/255): 75.7 ms. At 1x with hudres off, main target
+  43.7 vs 43.3 ms. No gain.
+- The procedural-texture strip read replaced by arithmetic: MH4U's 2D layer bakes one strip, a
+  straight line (v(n) = -0.54 + 0.989 n, equal channels, max deviation 0.98/255), so the compact
+  program computed it from the coordinate (19 instructions, one texture read): 75.6 ms. No gain.
+  (The earlier "proctex off -> 40 ms" also blacked the picture: not the read's price.) Both kept
+  out of the tree; the patch is in the session notes, not the repo.
+- Point-sampled 2D textures (`dbghudpoint`): 75.5 ms. A 32 or 48 MiB parameter buffer (test
+  switch file `ux0:data/mh4u/pb32` / `pb48`): 75.6 / 75.7 ms - no partial renders.
+
+What it is: the menu's 2D layer covers ~480,000 guest pixels a frame (~5 screens; new release
+counter `hudres ... a`, the real triangle area of the software-drawn 2D layer - camp ~84,000,
+village ~14,000). At 544x960 that is ~2.6 M blended pixels: ~27 ns each, ~24 GPU core cycles,
+independent of the program's length, the dependent read and the filter. Still unexplained; next
+suspects are the fragment inputs (every varying is f32 and four-wide colour; half-precision
+varyings), and the blend tail the patcher appends for the UCHAR4 output. Bigger wins elsewhere:
+the hidden 3D world under full-screen menus (~22 ms at the counter, menu plan Phase 3).
