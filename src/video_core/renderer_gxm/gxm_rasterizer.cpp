@@ -2586,6 +2586,17 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     // configuration of this hardware in which blocking on a compile is the better choice.
     // The disk cache makes it a first-run cost.
     (void)vertex_count;
+    // Diag: the HUD resolution draws written straight, no blending (picture wrong): what the
+    // blend costs per pixel.
+    static const bool hud_no_blend = GxmFlag("hudresnoblend");
+    if (hud_no_blend && hud_draw_redirected) {
+        info.blend.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
+        info.blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+        info.blend.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        info.blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
+        info.blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        info.blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    }
     DrawTrace("bind pipeline");
     const u64 bp_t2 = Common::PipelineStats::StatUs();
     const bool bound = pipeline_cache->BindPipeline(info);
@@ -3924,6 +3935,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
             }
         }
         hud_redirect_now = false;
+        hud_draw_redirected = false;
         if (hud_state != HudState::Idle) {
             // The copy and the resolve draw quads with unit 0 bound to their source, after
             // SyncTextureUnits bound this draw's textures: put those back afterwards.
@@ -3973,6 +3985,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                 }
             }
             hud_redirect_now = hud_state == HudState::Active && post;
+            hud_draw_redirected = hud_redirect_now;
             // Diag: where the HUD scene's GPU time goes - drop one class of its draws.
             if (hud_redirect_now) {
                 static const bool no_gs = GxmFlag("hudresnogs");

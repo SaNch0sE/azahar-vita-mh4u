@@ -37,6 +37,8 @@ struct Version {
     u32 scene;     ///< sScene* (filter array)
     u32 camera;    ///< sMhCamera*
     std::array<Filter, 11> filters;
+    u32 unit = 0;   ///< sUnit* (the unit lines)
+    u32 layout = 0; ///< sMhLayout*
 };
 
 // USA v1.1 (the update; MH4UltimateDC's "USA v1.3.0", title version 1072).
@@ -51,7 +53,8 @@ constexpr Version UsaV11{"USA v1.1", 0x010572CC, 0x010572F0, 0x0105729C,
                            {0x00E5FF74, "mhhaze"},
                            {0x00E62F28, "colcorr"},
                            {0x00E5E970, "color"},
-                           {0x00E5D474, "fade"}}}};
+                           {0x00E5D474, "fade"}}},
+                         0x010572F8, 0x01057534};
 // USA v1.0 (the base game's program, as the web installer's mod brings): singletons 8 lower,
 // filter vtables 0x30 lower (bloom, dof, bokeh, radial, multi-blur and haze checked in our dump;
 // the last three by the same rule).
@@ -66,10 +69,11 @@ constexpr Version UsaV10{"USA v1.0", 0x010572C4, 0x010572E8, 0x01057294,
                            {0x00E5FF44, "mhhaze"},
                            {0x00E62EF8, "colcorr"},
                            {0x00E5E940, "color"},
-                           {0x00E5D444, "fade"}}}};
+                           {0x00E5D444, "fade"}}},
+                         0x010572F0, 0x0105752C};
 // EUR v1.1: data (singletons, vtables) as USA v1.1; only code moved. Untested.
 constexpr Version EurV11{"EUR v1.1", UsaV11.lt_render, UsaV11.scene, UsaV11.camera,
-                         UsaV11.filters};
+                         UsaV11.filters, UsaV11.unit, UsaV11.layout};
 
 constexpr u64 TitleUsa = 0x0004000000126300;
 constexpr u64 TitleEur = 0x0004000000126100;
@@ -269,6 +273,43 @@ void Dither(u32 lt_render) {
     }
 }
 
+/// Experiment (switch file `worldoff`, not restored): every unit but the layout manager stops
+/// drawing on the top screen (bit 16 of unit+0x04, mDrawView view 0) - under a full-screen
+/// menu the picture should not change, and the GPU time of the hidden world is what it saves.
+/// Unit lines: sUnit+0x14, 32 of 0x18 bytes, first unit at line+0x0C, next at unit+0x0C.
+void WorldOff() {
+    static const bool enabled = Switch("worldoff");
+    if (!enabled || g.version->unit == 0) {
+        return;
+    }
+    const u32 units = Read32(g.version->unit);
+    const u32 layout = Read32(g.version->layout);
+    const u32 layout_unit = layout != 0 ? Read32(layout + 0x100) : 0;
+    if (units == 0) {
+        return;
+    }
+    u32 cleared = 0, seen = 0;
+    for (u32 line = 0; line < 32; line++) {
+        u32 unit = Read32(units + 0x14 + line * 0x18 + 0x0C);
+        for (u32 n = 0; unit != 0 && n < 4096; n++, unit = Read32(unit + 0x0C)) {
+            seen++;
+            if (unit == layout_unit) {
+                continue;
+            }
+            const u32 flags = Read32(unit + 0x04);
+            if ((flags & (1u << 16)) != 0) {
+                g_memory->Write32(unit + 0x04, flags & ~(1u << 16));
+                cleared++;
+            }
+        }
+    }
+    static u32 logged = 0;
+    if (cleared != 0 && logged++ < 20) {
+        sceClibPrintf("[mh4u] worldoff: %u of %u units cleared (layout unit %08X)\n", cleared,
+                      seen, layout_unit);
+    }
+}
+
 } // namespace
 
 bool Switch(const char* name) {
@@ -342,6 +383,7 @@ void Tick(Core::System& system) {
     LogFilters();
     BottomPass(lt_render);
     Dither(lt_render);
+    WorldOff();
 }
 
 void BeforeSave(Core::System& system) {

@@ -1184,3 +1184,16 @@ independent of the program's length, the dependent read and the filter. Still un
 suspects are the fragment inputs (every varying is f32 and four-wide colour; half-precision
 varyings), and the blend tail the patcher appends for the UCHAR4 output. Bigger wins elsewhere:
 the hidden 3D world under full-screen menus (~22 ms at the counter, menu plan Phase 3).
+
+**Two decisive experiments (2026-11-19, slot 7 quest counter, diag scenetime):**
+- `hudresnoblend` (the HUD resolution draws written without blending; picture wrong): HUD scene
+  76 -> **18 ms** a frame. Blending is ~75% of the 2D layer's GPU cost - the ~24 cycles per
+  pixel. Our fragment programs output half4 and the pipelines UCHAR4, so the shader patcher's
+  appended blend code (and its format conversions) runs per blended pixel. Next: which part of it
+  (output format) and which sprites can skip it exactly (opaque texture formats with vertex
+  alpha 1 make SrcAlpha/OneMinusSrcAlpha an identity).
+- `worldoff` switch file (hook module: bit 16, view 0, cleared on 3 of the 5 game units - all but
+  the layout manager; `plans/vita-mh4u-2d-layer.md` option 2a): main target 43.5 -> **14.7 ms**
+  a frame with the menu open, picture identical (mean screenshot difference 0.09/255, only the
+  fps counter differs). The hidden 3D world under a full-screen menu costs ~29 ms: option 2
+  (skip what a full-screen opaque cover hides, decided from the layout data) is worth building.

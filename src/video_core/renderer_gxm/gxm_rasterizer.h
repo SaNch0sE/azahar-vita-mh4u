@@ -573,6 +573,7 @@ private:
     int hud_work = -1;            ///< the pool entry being drawn this frame
     u32 hud_block_until = 0;      ///< frame_index before which no redirect starts (blockers)
     bool hud_redirect_now = false; ///< SyncState maps this draw into the HUD target
+    bool hud_draw_redirected = false; ///< this draw goes to the HUD target (until the next)
     [[nodiscard]] bool HudEnabled() const;
     bool HudEnsurePool();
     bool HudBegin();
