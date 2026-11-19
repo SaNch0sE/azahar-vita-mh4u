@@ -918,7 +918,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     namespace PS = Common::PipelineStats;
                     const auto take = [](auto& a) { return a.exchange(0, std::memory_order_relaxed); };
                     VitaFrontend::ReportPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u  "
-                                  "re l%u x%u t%u  bot d%u x%u  fx %u  hud2d p%u d%u s%u g%u c%u  hudres r%u f%u b%u a%uK\n",
+                                  "re l%u x%u t%u  bot d%u x%u  fx %u  hud2d p%u d%u s%u g%u c%u  hudres r%u f%u b%u a%uK z%uK\n",
                                   Common::ThreadCpuReport().c_str(),
                                   static_cast<unsigned>(take(PS::gxw_shade_us) / 1000),
                                   static_cast<unsigned>(take(PS::gxw_brake_us) / 1000),
@@ -947,7 +947,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                   static_cast<unsigned>(take(PS::hudres_draws)),
                                   static_cast<unsigned>(take(PS::hudres_frames)),
                                   static_cast<unsigned>(take(PS::hudres_resolves)),
-                                  static_cast<unsigned>(take(PS::hud_post_area)));
+                                  static_cast<unsigned>(take(PS::hud_post_area)),
+                                  static_cast<unsigned>(take(PS::hud_post_area_zero)));
                     if (PS::stat_timing) {
                         // Render thread, ms this second: draw ops (all), their register
                         // replay, software-shaded draws (incl. the pre-shade feed), the feed

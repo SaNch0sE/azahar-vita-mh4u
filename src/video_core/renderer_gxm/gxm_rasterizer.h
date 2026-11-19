@@ -682,6 +682,7 @@ private:
     bool hud_phase = false;
     bool hud_post_draw = false; ///< the draw in BeginDraw is in the 2D layer (counters)
     u32 hud_area_acc = 0;       ///< guest pixels of 2D draws not yet counted (thousands)
+    u32 hud_area_zero_acc = 0;  ///< the same, triangles with vertex alpha 0
     u32 hud_target = 0;
     u32 stat_alpha_only_feedback{};
     u32 stat_grade_double{};

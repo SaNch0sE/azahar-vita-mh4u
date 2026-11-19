@@ -255,6 +255,9 @@ inline std::atomic<u32> hudres_resolves{0};
 /// Guest pixels the 2D layer's draws cover (their draw rectangles), in thousands per second:
 /// the fill the HUD resolution multiplies.
 inline std::atomic<u32> hud_post_area{0};
+/// The part of it drawn by triangles whose three vertices have alpha 0 (invisible under
+/// SrcAlpha blending), thousands of guest pixels per second.
+inline std::atomic<u32> hud_post_area_zero{0};
 /// Time the frame limiter slept on the emulation thread (the guest ahead of real time).
 inline std::atomic<u32> limiter_sleep_us{0};
 /// Time the GX thread spent parsing command lists, and how many.

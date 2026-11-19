@@ -4215,8 +4215,13 @@ void RasterizerGxm::DrawTriangles() {
                     py[k] = ok ? v[i + k].pos.y.ToFloat32() / w * 200.0f : 0.0f;
                 }
                 if (ok) {
-                    hud_area_acc += static_cast<u32>(std::abs(
+                    const u32 area = static_cast<u32>(std::abs(
                         (px[1] - px[0]) * (py[2] - py[0]) - (px[2] - px[0]) * (py[1] - py[0])) * 0.5f);
+                    hud_area_acc += area;
+                    if (v[i].color.a().ToFloat32() <= 0.0f && v[i + 1].color.a().ToFloat32() <= 0.0f &&
+                        v[i + 2].color.a().ToFloat32() <= 0.0f) {
+                        hud_area_zero_acc += area;
+                    }
                 }
             }
         }
@@ -4224,6 +4229,11 @@ void RasterizerGxm::DrawTriangles() {
             Common::PipelineStats::hud_post_area.fetch_add(hud_area_acc / 1000,
                                                            std::memory_order_relaxed);
             hud_area_acc %= 1000;
+        }
+        if (hud_area_zero_acc >= 1000) {
+            Common::PipelineStats::hud_post_area_zero.fetch_add(hud_area_zero_acc / 1000,
+                                                                std::memory_order_relaxed);
+            hud_area_zero_acc %= 1000;
         }
     }
     u32 vertex_count = static_cast<u32>(vertex_batch.size());
