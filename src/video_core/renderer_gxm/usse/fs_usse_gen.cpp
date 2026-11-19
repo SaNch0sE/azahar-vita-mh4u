@@ -1308,6 +1308,15 @@ void FragmentEmitter::ProcTex() {
         e.Vec(VecOp::Add, {I0, 0x1}, {tc, use_v ? YYYY : XXXX, Mod::Abs}, ConstZero, Pred::None,
               true);
         ProcTexClamp(use_v ? pt.v_clamp.Value() : pt.u_clamp.Value());
+        // ptarith (diag, picture slightly off): the strip value is the clamped coordinate itself
+        // (MH4U's strip is a straight line 0..252/255), no sampler read - with ptcoord0 the
+        // program then has one texture read and no texcoord 2 input at all.
+        if (GxmFlag("ptarith")) {
+            e.Vec(VecOp::Add, {Reg::V(TmpTex3), 0x3}, {I0, XXXX}, ConstZero, Pred::None, true);
+            e.Vec(VecOp::Add, {Reg::V(TmpTex3 + 2), 0x3}, {I0, XXXX}, ConstZero, Pred::None,
+                  true);
+            return;
+        }
         e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX, Mod::Neg}, Lit(LitNeg255), Pred::None, true);
         e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, ConstHalf, Pred::None, true);
         e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, Lit(LitInv256), Pred::None, true);
@@ -1623,7 +1632,7 @@ void FragmentEmitter::SampleTextures() {
 
 void FragmentEmitter::LoadVec4(Reg internal, Vec4Loc from) {
     if (from.bank == Bank::Const) {
-        e.MoveInternal({internal, 0xf}, {Reg::C(0), XXXX}, Pred::None, true);
+        e.MoveInternal({internal, 0xf}, {Reg::C(from.base), XXXX}, Pred::None, true);
         return;
     }
     e.MoveF32x4({internal, 0xf}, from.Pair(0), from.Pair(1), true);
@@ -2582,7 +2591,12 @@ Vec4Loc FragmentEmitter::SourceLocation(Source source, u32 stage_index, bool alp
         return {Bank::Virtual, static_cast<uint8_t>(TmpSnap + from * 4)};
     }
     case Source::Texture3:
-        return uses_proctex ? Vec4Loc{Bank::Virtual, TmpTex3} : Vec4Loc{Bank::Const, 0};
+        // minkeep_pt05 (diag): with the procedural texture cut away it reads 0.5 instead of 0
+        // (constant register 12), so MH4U's AddSigned stage becomes an identity and the
+        // reduced program draws a near-correct picture instead of black.
+        return uses_proctex ? Vec4Loc{Bank::Virtual, TmpTex3}
+                            : Vec4Loc{Bank::Const, static_cast<uint8_t>(
+                                                       GxmFlag("minkeep_pt05") ? 12 : 0)};
     case Source::Constant:
         return {Bank::SecAttr, static_cast<uint8_t>(sa_const_color + stage_index * 4)};
     case Source::Previous:
@@ -2619,7 +2633,7 @@ void FragmentEmitter::LoadArg(uint8_t arg_index, const TevStageConfig& stage, u3
     // dst.<mask> = one component of `from` broadcast.
     const auto lane = [&](uint8_t mask, const Vec4Loc& from, int comp) {
         if (from.bank == Bank::Const) {
-            e.MoveInternal({dst, mask}, {Reg::C(0), XXXX}, Pred::None, true);
+            e.MoveInternal({dst, mask}, {Reg::C(from.base), XXXX}, Pred::None, true);
             return;
         }
         const auto [pair, ch] = channel(comp);
@@ -2646,7 +2660,7 @@ void FragmentEmitter::LoadArg(uint8_t arg_index, const TevStageConfig& stage, u3
     bool alpha_done = false;
     if (want_c) {
         if (c.bank == Bank::Const) {
-            e.MoveInternal({dst, 0x7}, {Reg::C(0), XXXX}, Pred::None, true);
+            e.MoveInternal({dst, 0x7}, {Reg::C(c.base), XXXX}, Pred::None, true);
         } else if (broadcast < 0) {
             // The whole quad; w is right already when the alpha comes from the same
             // source's own alpha.

@@ -136,3 +136,30 @@ stays above ~25 ms, the fixed part or overdraw dominates - run E4-E6 and move op
 
 The counter is CPU-bound at 23-26 fps with `hudres` off, so option 1 alone takes `hudres=1`
 there from ~10 to ~18-20 fps; 30 needs option 2. The camp should return to ~28-30.
+
+## 7. Second analysis (Fable, 2026-11-19, read-only)
+
+- The `dbgmin*` variants change only the emitted program (`EmitFragmentProgram` edits a copy of
+  the configuration); the rasterizer's proctex strip bake, unit-6 bind, repeat keys and merges
+  run from `regs` in every run. Per-draw state and blocked merges are ruled out; unit 6 is not
+  re-set per draw (`BindFragmentTexture` compares descriptors).
+- The strip read and the texcoord 2 input were each removed alone (both 76 ms), never together.
+  Cost independent of instruction count with a step between program shapes fits a threshold,
+  most likely occupancy (temporaries + primary attributes per pixel limiting how many pixels are
+  in flight to hide texture latency).
+- `hudresnoblend` (18 ms with the full program, below the blended bare program) is hidden-surface
+  removal, a second lever (opaque sprites unblended) for the 15-19 ms floor.
+
+Experiments (slot 7, `hudres=1`, `timedraw scenetime nodiskprograms`):
+
+| # | Flags | Reading |
+|---|---|---|
+| R1 | `dbgminfs dbgminsel_unlit minkeep_tex minkeep_tev tempinflate logtemps` | 40 ms program + 24 temporaries: toward 60-76 = occupancy |
+| R2 | `tempinflate logtemps` | full program, more temporaries: well above 76 = occupancy-sensitive |
+| R3 | `dbgminfs dbgminsel_unlit minkeep_tex minkeep_tev minkeep_pt05` | 0.5 instead of 0 for Texture3: near-correct picture; 40 ms = the black output was not why |
+| R4 | `ptarith ptcoord0` | one read, no texcoord 2: ~40 ms confirms the either-condition threshold |
+| R5 | `dbgminfs dbgminsel_unlit minconst hudresnoblend` | floor without blending: sizes the opaque-sprite lever |
+
+Fix if confirmed: a sprite program below the threshold - one sampler, strip arithmetic (guarded by
+the bake's line check), the strip coordinate in a spare lane of texcoord 0, stage values in
+internal registers. Estimate: HUD scene 76 -> ~40 ms at `hudres=1`, ~7 ms saved at 1x.
