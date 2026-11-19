@@ -1060,3 +1060,16 @@ quest counter), the software keyboard, HOME, switching layouts, saving and loadi
 
 The pause menu opened by itself over a garbled frame right after a state load in one of these
 runs (and once on 2026-11-18): the spurious pause after loads, not these changes.
+
+**New save states (2026-11-19).** The user remade slots 1-7 (map in
+`plans/vita-mh4u-decomp-perf-hud.md`, 1.4). With `srcbottom` all seven load and run (`bot d0`);
+the item box opens and stores items (slot 5), the Gallery cutscene plays (slot 6), the quest
+counter accepts a quest (slot 7). Slot 2 (heaviest field): 9,330 bottom draws a second without
+it; emulation thread 721 -> 616 ms/s (-15%), but shown fps stays ~28: there the pre-shade worker
+(~900 ms/s) and the render thread (~1,000 ms/s) are the limit, not the emulation thread. Slot 7
+(the quest counter menu open) runs at 23 fps with and without `srcbottom` (GX ~960 ms/s): the
+menu itself is slow (see `plans/menu-rendering.md`).
+
+Test-harness note: vita-agent replays an identical upload (same file, same path) from its
+operation cache without writing, so re-creating a switch file after deleting it needs new
+content.

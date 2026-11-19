@@ -74,6 +74,14 @@ Measurements and history are in `vita-mh4u-performance.md`.
 
 ## Open bugs
 
+- **Pause menu opens by itself after a load** (3 of ~20 scripted runs, 2026-11-18/19, with and
+  without `srcbottom`; once before the autoload, which then never ran). `citra_vita_main.cpp`
+  opens it on a resume system event when the wall clock jumped 2 s or more in the last 5 s - but a
+  boot or state-load stall is such a jump too, and vita-agent commands (which wake the console)
+  probably send the resume event. Fix: count a stop only when the process did not run (compare
+  wall time with process time), or ignore resumes right after our own long operations; log the
+  reason in release.
+
 - Lit draws sent through the software vertex path (`nohwvs`, or the `litsw` experiment) hang
   the GPU at the first lit frame.
 - The cutscene's colour grade on the depth-of-field focus pixels is lost (feedback draws are

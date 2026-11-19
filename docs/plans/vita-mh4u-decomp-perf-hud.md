@@ -113,8 +113,11 @@ From the hook module, on change only: `[mh4u] render word live %08X edit %08X ey
 - Speed: release build, scripted run, `autoload.txt` slot, 25-30 s, two passes; read `speed` and
   `cpu` lines (fps, `gx`, `render`, `gxc l/d`, per-thread CPU).
 - GPU ms: diagnostics build, `scenetime timedraw`.
-- Scenes: deck after load; slot 1 (camp), slot 2 (area 2, camera script), slot 3 (pond), slot 7
-  (GPU-bound hunt), slot 4 (village, minimap).
+- Scenes (save states remade 2026-11-19, Single screen layout): 1 camp in a hunting area (the
+  fishing spot), 2 heaviest open field in a quest, 3 water scene, 4 Val Habar with minimap, 5 in
+  the house next to the item box, 6 the cat's Gallery menu on a heavy cutscene (Circle starts
+  it), 7 the quest counter; 8 and 9 free. No "monster about to roar" state. Earlier numbers in
+  this plan and the performance notes used the old slots.
 - Picture: frame dumps (`dumpframe` / `DumpNextFrame`) on a still scene, compared pixel by pixel
   on the PC: zero differing pixels on a static shot, or noise level where the scene animates.
 
