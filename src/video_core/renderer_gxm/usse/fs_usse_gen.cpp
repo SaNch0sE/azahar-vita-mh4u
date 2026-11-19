@@ -3218,9 +3218,12 @@ std::vector<uint8_t> EmitFragmentProgram(const FSConfig& config, std::string* re
             c.texture.tev_stages[i].ops_raw = i == 0 || i >= 3 ? 0u : 0x00010001u;
             c.texture.tev_stages[i].scales_raw = 0;
         }
+        // minconst (diag): stage 0 takes the constant colour instead of the vertex colour, so
+        // the program reads no interpolated input at all - per-primitive cost vs input cost.
+        static const bool min_const = GxmFlag("minconst");
         for (u32 i = 0; !keep_tex && !keep_tev && i < c.texture.tev_stages.size(); i++) {
             // Replace with PrimaryColor (0x0), passthrough (Previous 0xf) after stage 0.
-            const u32 src = i == 0 ? 0x00000000u : 0x000f000fu;
+            const u32 src = i == 0 ? (min_const ? 0x000e000eu : 0x00000000u) : 0x000f000fu;
             c.texture.tev_stages[i].sources_raw = src;
             c.texture.tev_stages[i].modifiers_raw = 0;
             c.texture.tev_stages[i].ops_raw = 0;

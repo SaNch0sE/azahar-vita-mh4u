@@ -4212,6 +4212,32 @@ void RasterizerGxm::DrawTriangles() {
         return;
     }
     const PhaseTimer total_timer{time_draws, times.total};
+    // valphalog (diag): what the 2D layer's vertex alphas are, as a histogram, every 5 s.
+    static const bool valpha_log = GxmFlag("valphalog");
+    if (valpha_log && hud_post_draw && hud_phase && vertex_ring.base != nullptr) {
+        static u32 hist[6] = {};
+        static float mn = 9, mx = -9;
+        static u64 last = 0;
+        for (const auto& range : pending_ring_ranges) {
+            const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+                vertex_ring.base + static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+            for (u32 i = 0; i < range.count; i++) {
+                const float a = v[i].color.a().ToFloat32();
+                mn = std::min(mn, a);
+                mx = std::max(mx, a);
+                hist[a <= 0.0f ? 0 : a < 0.5f ? 1 : a < 0.99f ? 2 : a < 1.0f ? 3 : a == 1.0f ? 4 : 5]++;
+            }
+        }
+        const u64 now = Common::PipelineStats::NowUs();
+        if (now - last > 5000000) {
+            last = now;
+            LOG_INFO(Render, "valpha: <=0 {} <.5 {} <.99 {} <1 {} ==1 {} >1 {} (min {} max {})",
+                     hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], mn, mx);
+            for (u32& h : hist) {
+                h = 0;
+            }
+        }
+    }
     // The 2D layer's real coverage: the screen area of its software-drawn triangles (guest
     // pixels at 240x400; repeats count too), for the HUD cost work (release `hudres ... a`).
     if (hud_post_draw && hud_phase && vertex_ring.base != nullptr) {

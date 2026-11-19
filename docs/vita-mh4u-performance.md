@@ -1221,3 +1221,12 @@ power-off on slots 7 and 1. Traps per second = fps. The layout key (`coverlog`):
 quest counter (76 candidates, 213% of a screen, `k0`), changing every frame in the field (the
 animated HUD: never arms). The walk costs 1.5 ms a frame at the counter and 0.8 ms in the field -
 too slow; until it is fast and the skip works, the trap is opt-in (switch file `covertrap`).
+
+**Per-triangle cost and vertex alpha (2026-11-19, slot 7, hudres=1, diag):** with the sprite
+programs cut to a constant colour (`dbgminfs minconst`: no interpolated input at all) the HUD scene
+is still ~19.4 ms (bare vertex-colour program ~21.6 ms), against ~2.8 ms for four big full-screen
+blended quads: ~15 ms is per-triangle / tiling work for the ~2,000 small sprite triangles a frame.
+The rest of the 76 ms comes with the full sprite program (texture + combiner + procedural
+texture), still unexplained (shortening it changed nothing). Vertex alpha of opaque 2D sprites
+arrives as 0.99999994 (`valphalog`: 144,798 of ~162,000 vertices in [0.99, 1), none exactly 1,
+max 0.99999994) - the fragment program rounds it to 255, so an opacity test must use >= 254.5/255.
