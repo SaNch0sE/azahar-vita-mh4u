@@ -537,6 +537,21 @@ private:
     /// The surfaces handed to the presentation layer this frame, cleared once EndFrame has
     /// proved the frontend's scene is finished with them.
     std::array<VideoCore::SurfaceId, 2> display_surfaces{};
+    /// Smooth gradients (VideoOptions::smooth): 8-bit copies of the top-screen display buffers,
+    /// made by the display transfer's blit instead of the cache's RGB565 buffer and shown by
+    /// the present. Keyed by the guest buffer's address (the game cycles three).
+    struct DisplaySlot {
+        PAddr addr = 0;
+        std::unique_ptr<Surface> surface;
+        bool valid = false;
+    };
+    std::array<DisplaySlot, 4> display_slots{};
+    u32 display_slot_next = 0;
+    std::array<Surface*, 2> display_slot_shown{};
+    /// The transfer into an 8-bit slot; false leaves it to the cache (and drops the slot).
+    bool SmoothDisplayTransfer(const Pica::DisplayTransferConfig& config);
+    /// Anything else writing guest memory over a slot makes it stale.
+    void InvalidateDisplaySlots(PAddr addr, u32 size);
     /// The cached surfaces this draw's texture units sample, noted before the scene begins
     /// and given its serial once it has one.
     std::array<VideoCore::SurfaceId, 3> bound_surfaces{};

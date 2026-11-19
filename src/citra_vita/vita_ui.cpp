@@ -218,6 +218,15 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().fxaa = value;
                GxmRenderer::SaveVideoOptions();
            });
+    toggle("Smooth gradients",
+           "Turns off the game's dither pattern and keeps the picture in full colour, for smooth "
+           "skies and fades without the fine grid or banding. With the Heavenfall mod, choose "
+           "No Dithering in its Mod Settings as well.",
+           true, [] { return GxmRenderer::Video().smooth; },
+           [](bool value) {
+               GxmRenderer::Video().smooth = value;
+               GxmRenderer::SaveVideoOptions();
+           });
     toggle("FPS counter", "Shows the emulation speed and the frame rate in the top right corner.",
            true, [] { return GxmRenderer::Video().show_fps; },
            [](bool value) {

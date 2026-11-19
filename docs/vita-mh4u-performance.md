@@ -1080,3 +1080,17 @@ guild card and map work, the chat keyboard works (at ~20 fps, as at character cr
 and back works, switching to two screens brings the bottom screen and touch back, saving to slot
 8 and loading it works. One crash loading slot 7 after those menu tests, in the state loader's
 teardown of kernel objects - not this change (open bugs in the TODO).
+
+**G2, Smooth gradients (pause menu, `video.txt` `smooth=1`, off by default; kill switch
+`ux0:data/mh4u/nofb8` for the 8-bit copy).** A top-screen display transfer (240x400 RGB565,
+unscaled) is blitted into a renderer-owned RGBA8 copy instead of the cache's 5:6:5 buffer
+(`RasterizerGxm::SmoothDisplayTransfer`, four slots keyed by the guest address), and the present
+shows it (`AccelerateDisplay`). Fills, texture copies, other transfers and CPU writes over a
+slot make it stale (back to the cache's buffer); guest cache flushes do not, as for any
+GPU-written surface. The hook module clears the dither bits (0x100000 top, 0x200000 bottom) in
+the render word's edit copy while on, puts them back before a save, and gives up with a log line
+if something else keeps setting them. On the user's install the mod's "No Dithering" has the top
+bit clear already (`000F036E`), so the option only removes the 5:6:5 banding there. Slot 4
+(village sky) and slot 6 (Gallery cutscene and its fades): pictures correct, 30 fps either way.
+The banding difference needs a lossless capture (vita-agent captures JPEG) or a look on the
+console.

@@ -9,6 +9,7 @@
 #endif
 #include <unordered_map>
 #include "common/big_arena.h"
+#include "video_core/renderer_gxm/gxm_video_options.h"
 #include "common/vita_data_dir.h"
 #include <map>
 #include <bit>
@@ -5477,6 +5478,7 @@ void RasterizerGxm::InvalidateRegion(PAddr addr, u32 size) {
     DrawTrace("invalidate region");
     const PhaseTimer timer{time_draws, times.invalidate_region};
     stat_invalidates++;
+    InvalidateDisplaySlots(addr, size);
     res_cache.InvalidateRegion(addr, size);
 }
 
@@ -5513,13 +5515,113 @@ void RasterizerGxm::NoteGuestWrite(PAddr addr, u32 size) {
     DrawTrace("guest write");
     const PhaseTimer timer{time_draws, times.guest_writes};
     stat_guest_writes++;
+    InvalidateDisplaySlots(addr, size);
     res_cache.InvalidateRegion(addr, size);
 }
 
 void RasterizerGxm::ClearAll(bool flush) {
     draw_epoch++;
     nondraw_epoch++;
+    InvalidateDisplaySlots(0, 0xFFFFFFFFu);
     res_cache.ClearAll(flush);
+}
+
+void RasterizerGxm::InvalidateDisplaySlots(PAddr addr, u32 size) {
+    constexpr u32 SlotBytes = 240 * 400 * 2; // the guest buffer: 240x400 RGB565
+    for (DisplaySlot& slot : display_slots) {
+        if (slot.valid && addr < slot.addr + SlotBytes && slot.addr < addr + size) {
+            slot.valid = false;
+        }
+    }
+}
+
+bool RasterizerGxm::SmoothDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+    // Kill switch ux0:data/mh4u/nofb8: the option then only turns the dither off.
+    static const bool killed = [] {
+        if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nofb8", "rb")) {
+            std::fclose(f);
+            return true;
+        }
+        return GxmFlag("nofb8");
+    }();
+    // A top-screen frame into a 240x400 RGB565 buffer, unscaled: the game's display transfer.
+    if (killed || !Video().smooth || config.is_texture_copy ||
+        config.output_format != Pica::PixelFormat::RGB565 || config.scaling != config.NoScale ||
+        config.output_width != 240 || config.output_height != 400 ||
+        (config.flip_vertically && config.crop_input_lines)) {
+        return false;
+    }
+    VideoCore::SurfaceParams src_params;
+    src_params.addr = config.GetPhysicalInputAddress();
+    src_params.width = config.output_width;
+    src_params.stride = config.input_width;
+    src_params.height = config.output_height;
+    src_params.is_tiled = !config.input_linear;
+    src_params.pixel_format = VideoCore::PixelFormatFromGPUPixelFormat(config.input_format);
+    src_params.UpdateParams();
+    auto [src_id, src_rect] =
+        res_cache.GetSurfaceSubRect(src_params, VideoCore::ScaleMatch::Ignore, true);
+    if (!src_id) {
+        return false;
+    }
+    Surface& source = res_cache.GetSurface(src_id);
+
+    const PAddr out = config.GetPhysicalOutputAddress();
+    DisplaySlot* slot = nullptr;
+    for (DisplaySlot& s : display_slots) {
+        if (s.surface && s.addr == out) {
+            slot = &s;
+        }
+    }
+    // A new buffer address takes the next slot the present is not sampling this frame.
+    for (u32 tries = 0; slot == nullptr && tries < display_slots.size(); tries++) {
+        DisplaySlot& s = display_slots[display_slot_next++ % display_slots.size()];
+        if (!s.surface || !s.surface->presented) {
+            slot = &s;
+        }
+    }
+    if (slot == nullptr) {
+        return false;
+    }
+    VideoCore::SurfaceParams dst_params;
+    dst_params.addr = out;
+    dst_params.width = 240;
+    dst_params.height = 400;
+    dst_params.stride = 240;
+    dst_params.is_tiled = config.input_linear != config.dont_swizzle;
+    dst_params.pixel_format = VideoCore::PixelFormat::RGBA8;
+    dst_params.res_scale = source.res_scale;
+    dst_params.UpdateParams();
+    if (!slot->surface || slot->addr != out || slot->surface->res_scale != source.res_scale ||
+        slot->surface->is_tiled != dst_params.is_tiled) {
+        // Release defers the memory past the GPU's last use of it.
+        slot->surface = std::make_unique<Surface>(runtime, dst_params);
+        slot->addr = out;
+        slot->valid = false;
+        if (!slot->surface->HasMemory() || !slot->surface->IsColorTarget()) {
+            slot->surface.reset();
+            return false;
+        }
+    }
+    Surface& dest = *slot->surface;
+    if (source.is_tiled != dest.is_tiled) {
+        std::swap(src_rect.top, src_rect.bottom);
+    }
+    if (config.flip_vertically) {
+        std::swap(src_rect.top, src_rect.bottom);
+    }
+    const VideoCore::TextureBlit blit{
+        .src_level = source.LevelOf(src_params.addr),
+        .dst_level = 0,
+        .src_rect = src_rect,
+        .dst_rect = dest.GetScaledSubRect(dst_params),
+    };
+    if (!GpuBlit(source, dest, blit)) {
+        slot->valid = false;
+        return false;
+    }
+    slot->valid = true;
+    return true;
 }
 
 bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
@@ -5551,6 +5653,14 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         }
     }
     hud_phase = false;
+    if (EnsureResources() && SmoothDisplayTransfer(config)) {
+        return true;
+    }
+    if (!config.is_texture_copy) {
+        InvalidateDisplaySlots(config.GetPhysicalOutputAddress(),
+                               config.output_width * config.output_height *
+                                   Pica::BytesPerPixel(config.output_format));
+    }
     const bool done = EnsureResources() && res_cache.AccelerateDisplayTransfer(config);
     if (LogtexActive()) {
         logtex_lines++;
@@ -5588,6 +5698,7 @@ bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
     nondraw_epoch++;
     DrawTrace("texture copy");
     const PhaseTimer timer{time_draws, times.transfers};
+    InvalidateDisplaySlots(config.GetPhysicalOutputAddress(), config.texture_copy.size);
     const bool done = EnsureResources() && res_cache.AccelerateTextureCopy(config);
     if (LogtexActive()) {
         logtex_lines++;
@@ -5605,6 +5716,7 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     nondraw_epoch++;
     DrawTrace("fill");
     const PhaseTimer timer{time_draws, times.transfers};
+    InvalidateDisplaySlots(config.GetStartAddress(), config.GetEndAddress() - config.GetStartAddress());
     const bool done = EnsureResources() && res_cache.AccelerateFill(config);
     if (LogtexActive()) {
         logtex_lines++;
@@ -5633,6 +5745,21 @@ const SceGxmTexture* RasterizerGxm::AccelerateDisplay(int screen, PAddr addr, u3
                                                       Common::Rectangle<u32>* out_rect) {
     if (addr == 0 || !resources_ready) {
         return nullptr;
+    }
+    // Smooth gradients: this frame's 8-bit copy of the buffer, when the transfer made one.
+    if (Video().smooth && height == 400 && format == Pica::PixelFormat::RGB565) {
+        for (DisplaySlot& slot : display_slots) {
+            if (slot.valid && slot.addr == addr && slot.surface) {
+                Surface& surface = *slot.surface;
+                surface.presented = true;
+                display_slot_shown[screen & 1] = &surface;
+                if (out_rect != nullptr) {
+                    *out_rect = {0, 0, surface.SX(240), surface.SX(400)};
+                }
+                display_textures[screen & 1] = *surface.Texture();
+                return &display_textures[screen & 1];
+            }
+        }
     }
     VideoCore::SurfaceParams src_params;
     src_params.addr = addr;
@@ -5741,6 +5868,12 @@ void RasterizerGxm::EndFrame() {
         }
     }
     display_surfaces = {};
+    for (Surface*& shown : display_slot_shown) {
+        if (shown != nullptr) {
+            shown->presented = false;
+            shown = nullptr;
+        }
+    }
     last_frame_scenes = scene_records;
     last_frame_scene_count = std::min<u32>(scenes_this_frame, MaxSceneRecords);
     scenes_this_frame = 0;

@@ -25,6 +25,10 @@ struct VideoOptions {
     bool wide = false;
     /// The speed / frame rate counter in the top right corner (Ui::DrawStatsHud).
     bool show_fps = true;
+    /// "Smooth gradients": the game's dither pattern off (render word bits, Mh4uHooks) and the
+    /// top screen kept in 8-bit colour from the render target to the present
+    /// (RasterizerGxm::SmoothDisplayTransfer) instead of the 3DS's 5:6:5 display buffers.
+    bool smooth = false;
 };
 
 /// The live options (loaded from the file on first use).

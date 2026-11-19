@@ -18,6 +18,7 @@
 #include "core/hle/kernel/process.h"
 #include "core/memory.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
+#include "video_core/renderer_gxm/gxm_video_options.h"
 
 namespace Mh4uHooks {
 
@@ -98,6 +99,11 @@ struct State {
     std::array<u32, 8> unknown_vtables{};
     // P1: the bottom present flag this module wrote (restored before a save).
     bool bottom_written = false;
+    // G2: dither bits this module cleared in the edit word (put back before a save), and how
+    // often it had to clear them in the last second (another writer: give up).
+    u32 dither_cleared = 0;
+    u32 dither_clears = 0, dither_window = 0;
+    bool dither_gave_up = false;
 };
 State g;
 
@@ -237,6 +243,32 @@ void BottomPass(u32 lt_render) {
     g.bottom_written = want == 0;
 }
 
+/// G2 (Smooth gradients): the game's dither pattern off - render word bits 0x100000 (top) and
+/// 0x200000 (bottom) cleared in the edit word, which the game applies itself each frame. The
+/// 8-bit display copies (RasterizerGxm::SmoothDisplayTransfer) keep the picture from banding.
+/// If something else (a cheat, the mod) keeps setting the bits, stop after a second of it.
+void Dither(u32 lt_render) {
+    constexpr u32 DitherBits = 0x00100000 | 0x00200000;
+    const bool want_off = GxmRenderer::Video().smooth && !g.dither_gave_up;
+    const u32 edit = Read32(lt_render + RenderWordEdit);
+    if (want_off && (edit & DitherBits) != 0) {
+        g.dither_cleared |= edit & DitherBits;
+        g_memory->Write32(lt_render + RenderWordEdit, edit & ~DitherBits);
+        if (++g.dither_clears > 6) {
+            g.dither_gave_up = true;
+            sceClibPrintf("[mh4u] smooth: another writer keeps the dither on (mod or cheat); "
+                          "choose No Dithering in the mod's settings\n");
+        }
+    } else if (!want_off && g.dither_cleared != 0) {
+        g_memory->Write32(lt_render + RenderWordEdit, edit | g.dither_cleared);
+        g.dither_cleared = 0;
+    }
+    if (++g.dither_window >= 60) {
+        g.dither_window = 0;
+        g.dither_clears = 0;
+    }
+}
+
 } // namespace
 
 bool Switch(const char* name) {
@@ -309,18 +341,26 @@ void Tick(Core::System& system) {
     LogRenderWords(lt_render);
     LogFilters();
     BottomPass(lt_render);
+    Dither(lt_render);
 }
 
 void BeforeSave(Core::System& system) {
-    if (g.version == nullptr || !g.bottom_written) {
+    if (g.version == nullptr || (!g.bottom_written && g.dither_cleared == 0)) {
         return;
     }
     g_memory = &system.Memory();
     const u32 lt_render = Read32(g.version->lt_render);
     if (lt_render != 0 && Valid(lt_render + PresentBottom)) {
-        g_memory->Write8(lt_render + PresentBottom, 1);
+        if (g.bottom_written) {
+            g_memory->Write8(lt_render + PresentBottom, 1);
+        }
+        if (g.dither_cleared != 0) {
+            g_memory->Write32(lt_render + RenderWordEdit,
+                              Read32(lt_render + RenderWordEdit) | g.dither_cleared);
+        }
     }
     g.bottom_written = false;
+    g.dither_cleared = 0;
 }
 
 } // namespace Mh4uHooks
