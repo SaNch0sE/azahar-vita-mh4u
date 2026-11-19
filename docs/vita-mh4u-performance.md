@@ -1243,3 +1243,24 @@ blocking the repeat paths). Paused in favour of the menu world skip.
 from ~83 to 14.7 ms GPU per frame (diag `scenetime`), release 20-21 -> ~26 fps, screenshot
 identical. Layout walk 0.25-0.34 ms at the counter, 0.07-0.18 ms in the field. Details and
 remaining checks: `plans/vita-mh4u-menu-world-skip.md` section 7.
+
+**2D sprite cost experiments, round 2 (2026-11-20, slot 7, hudres=1, diag `timedraw scenetime
+nodiskprograms`, HUD scene per frame; plan `plans/vita-mh4u-hud-cost.md` section 7):**
+
+| Program | HUD scene |
+|---|---|
+| as built | 76.3 ms |
+| `dbgminfs dbgminsel_unlit minkeep_tex minkeep_tev` (combiner kept, proctex off: black) | 76.3 ms |
+| same + `minkeep_pt05` (proctex reads 0.5: near-correct picture) | 76.4 ms |
+| same as row 2 + `tempinflate` (+24 temporaries) | 79.8 ms |
+| `ptarith ptcoord0` (no strip read, no texcoord 2) | 70.3 ms |
+| `dbgminfs dbgminsel_unlit minconst hudresnoblend` (floor, unblended) | 17.9 ms |
+| `tempinflate` on the full program | console powered off - don't repeat |
+
+Earlier: bare vertex colour 21.6, `minkeep_tex` alone (Replace(texture 0), no vertex colour)
+~40 ms. So the "40 ms" was a different shape than assumed: the cost is texture 0 *and* the vertex
+colour together (21.6 and 40 apart, 76 combined, far more than the sum), not the procedural
+texture or the black output. Super-additive in two inputs fits a per-pixel input/occupancy
+threshold: the colour varying is four f32 (`RoundPrimary`), the texture coordinate two f32, plus
+the sample result. Next experiment: the colour varying at lower precision (F16 or U8 x4) - in the
+vertex output declaration and the fragment input - and the texcoord as F16.
