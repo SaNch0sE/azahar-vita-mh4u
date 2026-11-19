@@ -1154,3 +1154,12 @@ The pause menu opening by itself after a load: the resume rule took any resume e
 of a 2 s clock jump, and a state load's ~12 s stall followed by vita-agent waking the console a
 few seconds later matched it. The window is now 1 s (a real return from the shell delivers its
 resume event at the jump); release logs `[mh4u] resume event: pausing|ignored (N ms after ...)`.
+
+The fragment programs' share (diag `scenetime`, slot 7, hudres=1, `nodiskprograms` - without it
+the `dbgmin*` switches had no effect, the program cache on the card served the old programs):
+HUD scene ~76 ms a frame as built; ~22 ms with every fragment program bare (`dbgminfs`: vertex
+colour, blending kept) - the floor no program change can beat; ~40 ms with the texture kept
+(`minkeep_tex`). So ~36 ms is the combiner and procedural-texture stage of the sprite programs
+(stage 1: `2 * (stage0 + proctex(u) - 0.5)`) and the general emitter's per-pixel rounding:
+option 1 of `plans/vita-mh4u-hud-cost.md` (a compact sprite program) is being built. The dumped
+HUD programs (`usse_dump`) are unlit; `dbgminsel_unlit` still changed nothing (not explained).
