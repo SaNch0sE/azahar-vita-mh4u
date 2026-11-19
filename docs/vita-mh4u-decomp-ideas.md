@@ -12,6 +12,13 @@ cross-checked) unless marked EUR. "Not confirmed" marks what nobody has run yet.
 
 Priority order: performance, then correct graphics, then HUD, then the rest.
 
+**Corrections (2026-11-19, checked against our own v1.1/v1.0 executables; details in
+`plans/vita-mh4u-decomp-perf-hud.md` section 0):** v1.0 data addresses are *not* the same as
+v1.1 (singletons 8 lower, filter vtables 0x30 lower, code shifts vary per site); cheats run ~5.4
+times a second, not every 1/60 s; render-word bit `0x40` guards only a second display transfer in
+`buildFrame`, not a second scene draw (so P2 is probably worth little); the filter array is
+`sScene+0x20` with its count at `+0x24`; the Heavenfall mod already hooks bloom's `render`.
+
 ## How their hooks map onto our architecture
 
 Their hooks wrap recompiled C functions. We run the guest natively, so each becomes one of:

@@ -51,9 +51,23 @@ Measurements and history are in `vita-mh4u-performance.md`.
 - **EUR game (v1.1.0 update, 0004000E00126100).** Branch `eur-support`, untested (no EUR dump):
   the movie poll fix at +0x38 (from MH4UltimateDC's address map), an EUR cheat file, a
   region-aware bug report. Needs a tester with the European game; then merge.
-- **Ideas from MH4UltimateDC** (`vita-mh4u-decomp-ideas.md`), in order: count second-eye list
-  refusals (P2) and log live screen filters (P3); bottom render pass off at the source in Single
-  screen (P1); native frame cap and a pacing check (P4, P5); gas-mode draws in cutscenes (G1).
+- **Ideas from MH4UltimateDC** (`vita-mh4u-decomp-ideas.md`). Planned
+  (`plans/vita-mh4u-decomp-perf-hud.md`, order: groundwork hook module, P2 measure, P3 log, P1, G2,
+  HUD): P1 bottom render pass off at the source, P2 second-eye
+  pass, P3 screen filters, G2 dither option, the sharp HUD. Kept for later, in this order:
+  - **P4** frame cap and render word set natively (no dependence on the cheat file or the mod;
+    EUR and no-mod installs behave the same).
+  - **P5** pacing check: log the VBlank counter (`0x0110d004`) against frames submitted
+    (`0x010571d4`); if they beat, cap at half the emulated refresh instead of 30.0.
+  - **G1** cutscene depth of field drawn with PICA gas mode, which our fragment generator
+    refuses: check the log in a cutscene; if so, emit transparent black as upstream does. May
+    explain the lost colour grade on the focus pixels (open bug below).
+  - **G3** quest-start loading race (late reads make the quest list miss a file; "Quest
+    Failed" in a dark void): watch for it; fixes in the ideas doc.
+  - **O2** UDS fix for consoles joining at the same moment (before multiplayer tests); **O3**
+    net sync if area-load stalls drop us from a hall.
+  - **O4** Kick, target camera and panel taps on buttons for the Single screen layout.
+  - **O5** true wide render (424x240): late option, high risk. **O6** 60 fps: not feasible.
 - **Start-up freeze.** Intermittent: the app stops right after `RunTitle: entering run loop`,
   the console drops off the network and powers off later. Seen 4 times on 2026-11-18 (the last
   on the first launch after a vpk install).
