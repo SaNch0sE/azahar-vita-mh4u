@@ -1153,10 +1153,17 @@ void PicaCore::DrawArrays(bool is_indexed) {
     // with a display transfer) are not shipped at all - no vertex copy or shipment on this
     // thread, no setup on the render thread, no GPU time. Decided per draw from the live
     // setting, so switching the layout back in the pause menu brings the screen back.
-    // `nobottomskip` (gxm_flags.txt) draws it anyway.
+    // `nobottomskip` (gxm_flags.txt, or ux0:data/mh4u/nobottomskip in release, as for the
+    // transfer in GPU::QueueMemoryTransfer) draws it anyway.
     {
 #ifdef ENABLE_GXM
-        static const bool keep_bottom = GxmRenderer::GxmFlag("nobottomskip");
+        static const bool keep_bottom = [] {
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nobottomskip", "rb")) {
+                std::fclose(f);
+                return true;
+            }
+            return GxmRenderer::GxmFlag("nobottomskip");
+        }();
 #else
         constexpr bool keep_bottom = true;
 #endif
@@ -2061,9 +2068,12 @@ bool PicaCore::ShadeShippedDraw(const DrawPayload& payload, std::vector<OutputVe
 }
 
 PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u32 size) {
-    // Initialize command list tracking.
+    // A list of its own: this runs on the emulation thread (GPU::QueueCmdList, through the
+    // right-eye check) while the GX thread may be parsing the member cmd_list, which a Reset
+    // here would have moved under it.
+    CommandList guess_list{};
     const u8* head = memory.GetPhysicalPointer(list);
-    cmd_list.Reset(list, head, size);
+    guess_list.Reset(list, head, size);
 
     constexpr size_t max_iterations = 0x100;
 
@@ -2072,7 +2082,7 @@ PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u
     find_info.vp_height = regs.internal.rasterizer.viewport_size_y.Value();
     find_info.paddr = regs.internal.framebuffer.framebuffer.color_buffer_address.Value() * 8;
 
-    auto process_write = [this, &find_info](u32 cmd_id, u32 value) {
+    auto process_write = [this, &find_info, &guess_list](u32 cmd_id, u32 value) {
         switch (cmd_id) {
         case PICA_REG_INDEX(rasterizer.viewport_size_y):
             find_info.vp_height = value;
@@ -2089,7 +2099,7 @@ PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u
             const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
             const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
             const u8* head = memory.GetPhysicalPointer(addr);
-            cmd_list.Reset(addr, head, size);
+            guess_list.Reset(addr, head, size);
             break;
         }
         default:
@@ -2099,15 +2109,15 @@ PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u
     };
 
     size_t iterations = 0;
-    while (cmd_list.current_index < cmd_list.length && iterations < max_iterations) {
+    while (guess_list.current_index < guess_list.length && iterations < max_iterations) {
         // Align read pointer to 8 bytes
-        if (cmd_list.current_index % 2 != 0) {
-            cmd_list.current_index++;
+        if (guess_list.current_index % 2 != 0) {
+            guess_list.current_index++;
         }
 
         // Read the header and the value to write.
-        const u32 value = cmd_list.head[cmd_list.current_index++];
-        const CommandHeader header{cmd_list.head[cmd_list.current_index++]};
+        const u32 value = guess_list.head[guess_list.current_index++];
+        const CommandHeader header{guess_list.head[guess_list.current_index++]};
 
         // Write to the requested PICA register.
         if (process_write(header.cmd_id, value))
@@ -2116,7 +2126,7 @@ PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u
         // Write any extra paramters as well.
         for (u32 i = 0; i < header.extra_data_length; ++i) {
             const u32 cmd = header.cmd_id + (header.group_commands ? i + 1 : 0);
-            const u32 extra_value = cmd_list.head[cmd_list.current_index++];
+            const u32 extra_value = guess_list.head[guess_list.current_index++];
             if (process_write(cmd, extra_value))
                 break;
         }

@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include "common/pipeline_stats.h"
 #include "common/settings.h"
 #include "right_eye_disabler.h"
 #include "video_core/gpu.h"
@@ -28,6 +29,7 @@ bool RightEyeDisabler::ShouldAllowCmdQueueTrigger(PAddr addr, u32 size) {
         top_screen_drawn = true;
         if (top_screen_transfered) {
             cmd_trigger_blocked = true;
+            Common::PipelineStats::re_lists_blocked.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
     }
@@ -46,6 +48,7 @@ bool RightEyeDisabler::ShouldAllowDisplayTransfer(PAddr src_address, size_t size
 
         if (src_address == top_screen_buf && cmd_trigger_blocked) {
             top_screen_blocked = true;
+            Common::PipelineStats::re_xfers_blocked.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
     }

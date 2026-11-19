@@ -1014,3 +1014,49 @@ shader kept; `Run` reads a compact offset table for the compiled span. A 2 MiB e
 (`HeapReserveInit`) is freed on the first failed `operator new`, which is then retried and logged
 (`heap: OUT OF MEMORY ... emergency reserve released`). Slot 1: memo hit/miss pattern unchanged,
 same shader JIT compiles, 30 fps, picture unchanged.
+
+## Data hooks from the MH4UltimateDC research (2026-11-19)
+
+Plan: `plans/vita-mh4u-decomp-perf-hud.md`. New `src/core/arm/vita/mh4u_hooks.{h,cpp}`: once a
+guest frame (from `RunSlice`, the guest stopped) it reads, and for opt-in switches writes, the
+game's own objects - data only, no code patched. The executable is recognised by a vtable word
+(USA v1.1, USA v1.0, EUR v1.1); states made from another executable switch it (slot 7 is v1.1,
+the card's game is the web installer's v1.0). `Mh4uHooks::BeforeSave` puts the game's values
+back before a state is written. Kill switch `nohooks`. Also: `GuessCmdRenderProperties` (the
+right-eye check, on the emulation thread) now parses into a list of its own instead of resetting
+the one the GX thread may be parsing; `nobottomskip` as a file now also keeps the bottom draws in
+release (it kept only the transfer).
+
+New on the release `cpu` line: `re l x t` (second-eye lists and transfers refused, top-sized
+transfers), `bot d x` (bottom draws and transfers dropped), `fx` (post-process draws dropped).
+Logged on change: `render word live/edit`, `filters (n): ...` (the scene's unit list, class
+names read from the game's type info for unknown entries).
+
+**P2, second eye: nothing to gain.** Slot 1 and slot 7: `re l0 x0 t30` - no second-eye list or
+transfer at all, 30 top transfers a second. Bit 0x40 stays set in the live word and does nothing
+here. Closed.
+
+**P3, filters:** the scene list at `sScene+0x20` holds all scene units, not only filters: in the
+slot 7 hunt it was lights (`uInfiniteLight`, `uCameraLight`, `uHemiSphereLight`), a shadow
+(`uUniformShadow`), fog (`uColorFog`) and two colour corrections - no blur, haze or bloom
+(bloom is off through the mod). Radial blur should appear with a roar: the log is on in release
+to catch it in a play session. `fx 60` (two dropped bloom/DoF draws a frame) in slot 1, `fx 0` in
+slot 7.
+
+**P1, bottom render pass off at the source (`srcbottom`, opt-in):** the game builds ~6,800-7,200
+bottom-screen draws a second in Single screen (`bot d`), all parsed and then dropped. With byte
+`sLtRender+0x8AB2` held at 0 the game builds none (`bot d0 x0`):
+
+| | Slot 1 base | srcbottom | Slot 7 base | srcbottom |
+|---|---|---|---|---|
+| Emulation thread CPU ms/s | 719 | 621 (-14%) | 682 | 605 (-11%) |
+| GX thread wall ms/s | 382 | 334 (-13%) | 324 | 270 (-17%) |
+| GPU thread CPU ms/s | 593 | 566 | 474 | 455 |
+| Render ms/s | 594 | 572 | 510 | 470 |
+
+30 fps both ways (these scenes are GPU-bound); picture identical (screenshots). Still to test
+before it becomes the default: the menus with previews (item box, equipment, guild card, map,
+quest counter), the software keyboard, HOME, switching layouts, saving and loading states.
+
+The pause menu opened by itself over a garbled frame right after a state load in one of these
+runs (and once on 2026-11-18): the spurious pause after loads, not these changes.

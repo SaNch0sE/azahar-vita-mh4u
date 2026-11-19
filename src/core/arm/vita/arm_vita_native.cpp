@@ -10,6 +10,7 @@
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "core/arm/vita/native_stats.h"
 #include "core/arm/vita/mh4u_vector_hle.h"
+#include "core/arm/vita/mh4u_hooks.h"
 #include "common/emu_prof.h"
 
 #include <algorithm>
@@ -396,6 +397,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     }
 
     Mh4uPatchFmvPoll();
+    Mh4uHooks::Tick(system);
     // A command list finished on the GX thread since the last slice: post its interrupts now.
     system.GPU().GxPoll();
     const SceUInt64 prologue_start = Common::EmuProf::enabled ? sceKernelGetProcessTimeWide() : 0;

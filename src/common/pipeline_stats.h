@@ -232,6 +232,14 @@ inline std::atomic<u32> presents_superseded{0};
 inline std::atomic<u32> bottom_draws_dropped{0};
 /// Bottom-screen display transfers dropped in the single-screen layout (GPU::QueueMemoryTransfer).
 inline std::atomic<u32> bottom_xfers_dropped{0};
+/// RightEyeDisabler refusals: second-eye command lists and display transfers (per second).
+inline std::atomic<u32> re_lists_blocked{0};
+inline std::atomic<u32> re_xfers_blocked{0};
+/// Top-screen-sized display transfers (frame boundaries), per second: ~30 at 30 fps unless the
+/// game also copies a second eye.
+inline std::atomic<u32> top_xfers{0};
+/// Post-process draws and blits dropped by the bloom / depth-of-field chain rule (`postfx`).
+inline std::atomic<u32> fx_dropped{0};
 /// Time the frame limiter slept on the emulation thread (the guest ahead of real time).
 inline std::atomic<u32> limiter_sleep_us{0};
 /// Time the GX thread spent parsing command lists, and how many.

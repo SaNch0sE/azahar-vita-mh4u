@@ -452,6 +452,7 @@ void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in, bool
         }
         impl->frame_boundaries++;
         Common::PipelineStats::guest_frames_total.fetch_add(1, std::memory_order_relaxed);
+        Common::PipelineStats::top_xfers.fetch_add(1, std::memory_order_relaxed);
         // Boundaries are arriving, so flips happen at frame edges; the vblank timeouts below
         // must only rescue phases with no boundaries at all.
         impl->skip_flip_pending_vblanks = 0;

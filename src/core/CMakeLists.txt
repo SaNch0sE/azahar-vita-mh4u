@@ -574,6 +574,8 @@ if (VITA)
     target_sources(citra_core PRIVATE
         arm/vita/arm_vita_native.cpp
         arm/vita/arm_vita_native.h
+        arm/vita/mh4u_hooks.cpp
+        arm/vita/mh4u_hooks.h
     )
     target_compile_definitions(citra_core PUBLIC -DCITRA_HAS_VITA_NATIVE)
     # The module's ABI header, included from the module rather than copied here: the two halves

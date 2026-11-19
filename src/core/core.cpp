@@ -29,6 +29,7 @@
 #endif
 #ifdef CITRA_HAS_VITA_NATIVE
 #include "core/arm/vita/arm_vita_native.h"
+#include "core/arm/vita/mh4u_hooks.h"
 #endif
 #include "core/cheats/cheats.h"
 #include "core/core.h"
@@ -287,6 +288,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         StateNote("saving slot", slot);
         try {
             ScopedRenderContext context{*this, m_emu_window};
+#ifdef CITRA_HAS_VITA_NATIVE
+            Mh4uHooks::BeforeSave(*this); // vanilla game data in the state
+#endif
             System::SaveState(slot);
             LOG_INFO(Core, "Save completed");
             StateNote("saved slot", slot);

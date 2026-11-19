@@ -907,7 +907,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     // own shading ms; memo: GS memo hits/misses (all mirrors).
                     namespace PS = Common::PipelineStats;
                     const auto take = [](auto& a) { return a.exchange(0, std::memory_order_relaxed); };
-                    VitaFrontend::ReportPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u\n",
+                    VitaFrontend::ReportPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u  "
+                                  "re l%u x%u t%u  bot d%u x%u  fx %u\n",
                                   Common::ThreadCpuReport().c_str(),
                                   static_cast<unsigned>(take(PS::gxw_shade_us) / 1000),
                                   static_cast<unsigned>(take(PS::gxw_brake_us) / 1000),
@@ -918,7 +919,16 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                   static_cast<unsigned>(take(PS::preshade_waited)),
                                   static_cast<unsigned>(take(PS::preshade_local_us) / 1000),
                                   static_cast<unsigned>(take(PS::gs_memo_hit_n)),
-                                  static_cast<unsigned>(take(PS::gs_memo_miss_n)));
+                                  static_cast<unsigned>(take(PS::gs_memo_miss_n)),
+                                  // Second-eye refusals (lists, transfers) and top-sized
+                                  // transfers; bottom-screen draws and transfers dropped;
+                                  // post-process draws dropped (decomp plan, P1-P3).
+                                  static_cast<unsigned>(take(PS::re_lists_blocked)),
+                                  static_cast<unsigned>(take(PS::re_xfers_blocked)),
+                                  static_cast<unsigned>(take(PS::top_xfers)),
+                                  static_cast<unsigned>(take(PS::bottom_draws_dropped)),
+                                  static_cast<unsigned>(take(PS::bottom_xfers_dropped)),
+                                  static_cast<unsigned>(take(PS::fx_dropped)));
                     if (PS::stat_timing) {
                         // Render thread, ms this second: draw ops (all), their register
                         // replay, software-shaded draws (incl. the pre-shade feed), the feed

@@ -497,6 +497,7 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
     static const bool no_postfx = !GxmFlag("postfx");
     if (no_postfx && (dest.addr == 0x1847D400 || dest.addr == 0x1849D400 ||
                       (dest.addr >= 0x18070800 && dest.addr < 0x18090000))) {
+        Common::PipelineStats::fx_dropped.fetch_add(1, std::memory_order_relaxed);
         return true; // done, as far as anyone will look
     }
     static const bool no_gpu_blit = GxmFlag("nogpublit");
@@ -3902,6 +3903,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         }
         if (drop) {
             stat_skipped++;
+            Common::PipelineStats::fx_dropped.fetch_add(1, std::memory_order_relaxed);
             return TraceDrop(regs, __LINE__);
         }
     }
