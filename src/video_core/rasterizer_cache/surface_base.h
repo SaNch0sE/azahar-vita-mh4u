@@ -117,6 +117,27 @@ public:
     std::vector<u64> page_hashes;
     u64 page_hashes_of = 0;
 
+    /// MH4U cover proof (tile_opacity.h): per 8x8 tile of level 0, in guest memory order,
+    /// whether every texel has alpha 255 (`opaque_tiles`) and whether that is known
+    /// (`known_tiles`) - set from the guest bytes of each upload. Valid only while
+    /// `opacity_tick == modification_tick`: anything else that changes the pixels (a copy
+    /// from another surface, a fill, a render) moves the tick and leaves every tile unknown.
+    std::vector<u64> opaque_tiles;
+    std::vector<u64> known_tiles;
+    u64 opacity_tick = 0;
+    bool opacity_pending = false; ///< an upload set tiles; the validation's tick follows
+    /// The whole-surface upload hash the valid map describes (0: none). A guest write that the
+    /// hash check later finds changed nothing moves the tick twice (invalid, then valid): the
+    /// map stays good when the bytes hash the same as the ones it was made from.
+    u64 opacity_hash = 0;
+    u64 opacity_rebuilt_tick = 0; ///< the tick a lazy rebuild from guest memory was tried at
+    /// Some of the pixels came from the GPU (a draw, blit or fill into it, or a copy from
+    /// another surface) rather than from guest memory; cleared when the whole surface is
+    /// uploaded again. A surface the CPU writes and the cache uploads (a page of text, say)
+    /// keeps it false whatever its type.
+    bool gpu_content = false;
+    u32 upload_count = 0; ///< uploads into it (coverlog)
+
     /// Records the whole hash of `bytes` (the surface's own guest bytes, `size` long) and its
     /// per-page hashes.
     void SetUploadHash(u64 whole, const u8* bytes);

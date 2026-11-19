@@ -23,6 +23,7 @@
 #include "video_core/pica/regs_internal.h"
 #include "video_core/rasterizer_cache/rasterizer_cache_base.h"
 #include "video_core/rasterizer_cache/surface_base.h"
+#include "video_core/rasterizer_cache/tile_opacity.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture/texture_decode.h"
 
@@ -1153,6 +1154,8 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
     Surface& surface = slot_surfaces[surface_id];
     const SurfaceInterval validate_interval(addr, addr + size);
     surface.last_use_tick = runtime.GetResourceTick();
+    // Uploading every byte of it again leaves nothing the GPU made (gpu_content, below).
+    const bool fully_invalid_before = surface.gpu_content && surface.IsFullyInvalid();
 
     if (surface.type == SurfaceType::Fill) {
         ASSERT_MSG(surface.IsRegionValid(validate_interval),
@@ -1240,7 +1243,9 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         if (same) {
             guest_flush_hash_skips++;
             memory.WriteTracker().Arm(source.GetPtr(), surface.size);
+            const u64 tick_before = surface.modification_tick;
             surface.MarkValid(surface.GetInterval());
+            KeepOpacityTick(surface, tick_before); // same bytes: the opacity map still holds
             return;
         }
     }
@@ -1288,6 +1293,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
             CopySurface(copy_surface, surface, copy_interval);
             from_other = true;
             surface.upload_hash = 0;
+            surface.gpu_content = true;
             notify_validated(copy_interval);
             continue;
         }
@@ -1297,6 +1303,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         if (ValidateByReinterpretation(surface, params, interval)) {
             from_other = true;
             surface.upload_hash = 0;
+            surface.gpu_content = true;
             notify_validated(interval);
             continue;
         }
@@ -1313,7 +1320,9 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
                 if (hash == surface.upload_hash) {
                     guest_flush_hash_skips++;
                     memory.WriteTracker().Arm(source.GetPtr(), surface.size);
+                    const u64 tick_before = surface.modification_tick;
                     notify_validated(interval);
+                    KeepOpacityTick(surface, tick_before);
                     continue;
                 }
             }
@@ -1327,6 +1336,12 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
             uploaded = true;
         }
         notify_validated(params.GetInterval());
+        SyncOpacityTick(surface); // the tiles the upload noted describe the surface now
+    }
+
+    if (fully_invalid_before && uploaded && !from_other &&
+        surface.IsRegionValid(surface.GetInterval())) {
+        surface.gpu_content = false;
     }
 
     // Now that the whole texture matches memory again, remember what it matches, so the next
@@ -1337,6 +1352,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         if (source && source.GetSize() >= surface.size) {
             surface.SetUploadHash(Common::ComputeHash64(source.GetPtr(), surface.size),
                                   source.GetPtr());
+            NoteOpacityHash(surface);
         }
     }
 
@@ -1420,12 +1436,16 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
         if (!direct.empty()) {
             DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, direct,
                           runtime.NeedsConversion(surface));
+            NoteUploadOpacity(surface, load_info.addr, upload_data);
+            surface.upload_count++;
             return;
         }
     }
     DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
                   runtime.NeedsConversion(surface));
     surface.Upload(upload, staging);
+    NoteUploadOpacity(surface, load_info.addr, upload_data);
+    surface.upload_count++;
 }
 
 template <class T>
@@ -1954,6 +1974,7 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
         // The GPU wrote this surface: its content no longer matches any upload, so a guest
         // flush of the old upload bytes must not be mistaken for "unchanged".
         region_owner.upload_hash = 0;
+        region_owner.gpu_content = true;
     }
 
     boost::container::small_vector<SurfaceId, 4> remove_surfaces;

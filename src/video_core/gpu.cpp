@@ -5,6 +5,7 @@
 #include "common/archives.h"
 #include "common/big_arena.h"
 #include "common/emu_prof.h"
+#include "common/mh4u_cover.h"
 #include <thread>
 #include "common/vita_tuning.h"
 #include "common/scope_exit.h"
@@ -392,7 +393,8 @@ u64 GPU::TransferDelay(Pica::DisplayTransferConfig config) {
         config.input_width * config.input_height * BytesPerPixel(config.input_format));
 }
 
-void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in, bool post_completion) {
+void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in, bool post_completion,
+                              u32 frame_tag) {
     Pica::DisplayTransferConfig config = config_in;
     impl->pica.regs.display_transfer_config = config;
 
@@ -491,7 +493,7 @@ void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in, bool
     const bool allow = config.is_texture_copy ||
                        right_eye_disabler->ShouldAllowDisplayTransfer(
                            config.GetPhysicalInputAddress(), config.input_height);
-    const auto blit_op = [this, config, allow] {
+    const auto blit_op = [this, config, allow, frame_tag] {
         if (config.is_texture_copy) {
             if (!impl->rasterizer->AccelerateTextureCopy(config)) {
                 Common::PipelineStats::copy_soft.fetch_add(1, std::memory_order_relaxed);
@@ -500,6 +502,7 @@ void GPU::QueueMemoryTransfer(const Pica::DisplayTransferConfig& config_in, bool
                 Common::PipelineStats::copy_accel.fetch_add(1, std::memory_order_relaxed);
             }
         } else if (allow) {
+            impl->rasterizer->SetFrameTag(frame_tag);
             if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
                 Common::PipelineStats::xfer_soft.fetch_add(1, std::memory_order_relaxed);
                 impl->sw_blitter->DisplayTransfer(config);
@@ -1325,12 +1328,15 @@ void GPU::Execute(const Service::GSP::Command& command) {
         config.input_size = params.in_buffer_size;
         config.output_size = params.out_buffer_size;
         config.flags = params.flags;
+        // MH4U cover proof: the frame tag is the cover trap's count now, on the emulation
+        // thread, when the guest queues the transfer - not when the GX thread gets to it.
+        const u32 frame_tag = Common::Mh4uCover::trap_seq.load(std::memory_order_relaxed);
         if (fifo) {
             PostInterruptDeferred(Service::GSP::InterruptId::PPF, TransferDelay(config));
-            GxPush([this, config] { QueueMemoryTransfer(config, false); });
+            GxPush([this, config, frame_tag] { QueueMemoryTransfer(config, false, frame_tag); });
             break;
         }
-        QueueMemoryTransfer(config);
+        QueueMemoryTransfer(config, true, frame_tag);
         break;
     }
     case CommandId::TextureCopy: {
@@ -1478,7 +1484,10 @@ void GPU::ExecWriteReg(u32 index, u32 data) {
     }
     case GPU_REG_INDEX(display_transfer_config.trigger): {
         if (impl->pica.regs.display_transfer_config.trigger.Value()) {
-            QueueMemoryTransfer(impl->pica.regs.display_transfer_config);
+            // A transfer from a command list: its tag is the trap count as the list is
+            // processed (later than the guest queued it; the decision allows for lag).
+            QueueMemoryTransfer(impl->pica.regs.display_transfer_config, true,
+                                Common::Mh4uCover::trap_seq.load(std::memory_order_relaxed));
         }
         break;
     }

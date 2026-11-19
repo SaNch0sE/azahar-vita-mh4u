@@ -233,7 +233,10 @@ private:
     // effect is queued to the render thread.
     void QueueMemoryFill(u32 index, u32 start, u32 end, u32 value, u32 control, u32 intr_index,
                          bool post_completion = true);
-    void QueueMemoryTransfer(const Pica::DisplayTransferConfig& config, bool post_completion = true);
+    /// `frame_tag`: the MH4U cover trap's count when the guest queued it (0: none), handed to
+    /// the rasterizer with the transfer.
+    void QueueMemoryTransfer(const Pica::DisplayTransferConfig& config, bool post_completion = true,
+                             u32 frame_tag = 0);
 
     void RecreateRendererLocked(Frontend::EmuWindow& emu_window,
                                 Frontend::EmuWindow* secondary_window);

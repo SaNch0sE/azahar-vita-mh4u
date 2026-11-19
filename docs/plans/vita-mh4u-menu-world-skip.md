@@ -138,3 +138,37 @@ line per transition with its reason.
 Close-frame checks from step 5: capture the frames around each close against `nocoverskip`; keep a
 menu open 30 s then close (animations, effects, shadows, sound); save with a menu open, reload,
 close. Slots 1-4 must show `cov a0`.
+
+## 7. Status 2026-11-19: steps 1-5 built and tested (opt-in `covertrap`)
+
+Built as planned with these differences (code: `mh4u_hooks.cpp`, `common/mh4u_cover.h`,
+`rasterizer_cache/tile_opacity.h`, the proof in `gxm_rasterizer.cpp`):
+- **Walk**: direct host-pointer reads; a group whose signature (identity, order, position, colour,
+  flags without 0x200) is unchanged re-reads only its last candidates, and is skipped entirely when
+  the game marks it unchanged (`0x100`, not `0x200`, `+0x42` 0, `+0x0C` 0, same `+0x40`); one
+  group walked in full every 8th trap as a check (`nocoverrev`, `nocovercache` turn these off).
+  Counter 0.25-0.34 ms mean (was 1.5), field 0.07-0.18 ms.
+- **Tag**: a never-reset trap counter read when the top display transfer is queued, carried to the
+  render thread with the transfer (`SetFrameTag`); every rule allows a lag of 2.
+- **Proof**: per-pixel (240x400 bits) instead of cells. Opaque quads cover their pixel centres;
+  quads refused as a whole are judged in 8x8 blocks. World-dependent draws in the 2D layer (depth
+  or stencil test, varying w, sampling a GPU-made surface whose producer used depth, lighting or
+  copies) uncover what they touch; surfaces whose content came from guest memory (`gpu_content`
+  false: e.g. the CPU-written page at the counter) and 2D-rendered surfaces do not.
+- **Texture opacity**: 2 bits per 8x8 tile, built from the guest bytes at upload, kept valid by
+  the upload hash (MH4U rewrites its static textures with the same bytes every frame, which bumps
+  the modification tick), rebuilt lazily when stale. ETC1A4 / RGBA4 / RGBA8 / IA / A formats.
+- **Decision**: arm needs a covered proof with tag >= key start + 3, < 30 frames old; disarm on the
+  first trap where anything fails. Watchdog: 3 transfers without a trap.
+
+Console results (release unless noted):
+- Slot 7 (quest counter): arms ~6 frames after each menu change, 82 units hidden. Main target GPU
+  14.7 ms per frame (diag `scenetime`; ~83 ms without), 20-21 -> ~26 fps. Screenshot identical to
+  `nocoverskip` except the fps overlay.
+- Close to the world and reopen (Circle x6, X x3, three cycles): disarm "no cover key" on the close,
+  world visible, re-arm on the wooden "here come the Quests" screens; 0 mispredicts in all runs.
+- Slots 1-6: never armed (slot 6 Gallery menu does not cover the screen), 0 mispredicts.
+
+Still to do before making it default: step 6 (item box, pause menu, equipment, smithy, map, guild
+card, loading fades), `covermagenta` through open/close/scroll, save with a menu open and reload,
+a 30 s open menu then close (animations, effects, sound).

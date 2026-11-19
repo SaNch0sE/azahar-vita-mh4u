@@ -56,7 +56,13 @@ CoverSite FindCoverSite(const Kernel::Process& process, Memory::MemorySystem& me
 bool IsCoverSite(u32 addr);
 
 /// The trap was taken and the replaced instruction already emulated: every update of the guest
-/// frame is done, its render is about to be built. Walks the layouts (read-only).
+/// frame is done, its render is about to be built. Walks the layouts, takes the render
+/// thread's cover proofs and arms or disarms the menu world skip (clearing or restoring the
+/// view-0 bit of the non-layout units) for the frame about to be built.
+/// Switches: `covershadow` decides and counts but never writes; `nocoverskip` decides
+/// nothing; `nocovercache` walks every group every frame; `coverlog` prints the walk and the
+/// decision once a second; `covermagenta` (render thread) fills armed frames magenta under
+/// the 2D layer.
 void OnTrap(Core::System& system);
 
 /// Cover counters for the once-a-second line, reset by the call.
@@ -65,6 +71,10 @@ struct CoverStats {
     u32 key_changes = 0; ///< times the (gated) cover key changed
     u32 walk_avg_us = 0; ///< layout walk time, mean and worst
     u32 walk_max_us = 0;
+    u32 armed = 0;       ///< traps that armed the skip (would have, under covershadow)
+    u32 mispredicts = 0; ///< armed frames the render thread proved not covered
+    u32 hidden = 0;      ///< most units hidden at once
+    u32 proofs = 0;      ///< proofs that found a frame covered with nothing above
 };
 CoverStats TakeCoverStats();
 

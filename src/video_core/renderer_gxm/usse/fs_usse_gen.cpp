@@ -694,7 +694,11 @@ void FragmentEmitter::PlanInputs() {
         normquat_pa = pa;
         pa += 8;
     }
-    const u32 proc_coord = uses_proctex ? std::min<u32>(config.proctex.coord, 2) : 3;
+    // ptcoord0 (diag, picture wrong): the procedural texture reads texcoord 0, so texcoord 2 is
+    // never an input - prices the extra interpolated input against the procedural texture.
+    static const bool pt_coord0 = GxmFlag("ptcoord0");
+    const u32 proc_coord =
+        uses_proctex ? (pt_coord0 ? 0u : std::min<u32>(config.proctex.coord, 2)) : 3;
     const bool coord_needed[3] = {
         unit_used[0] || proc_coord == 0,
         unit_used[1] || (unit_used[2] && tex.texture2_use_coord1) || proc_coord == 1,
@@ -1299,7 +1303,7 @@ void FragmentEmitter::ProcTex() {
         // The baked strip: c = clamp(|coordinate|) on the combiner's axis, then the strip at
         // its texel centres, (c * 255 + 0.5) / 256 - one fetch where the general path below
         // takes four dependent ones and ~90 instructions.
-        const Reg tc = Reg::Pa(texcoord_pa[std::min<u32>(pt.coord, 2)]);
+        const Reg tc = Reg::Pa(texcoord_pa[GxmFlag("ptcoord0") ? 0u : std::min<u32>(pt.coord, 2)]);
         const bool use_v = pt.color_combiner == TexturingRegs::ProcTexCombiner::V;
         e.Vec(VecOp::Add, {I0, 0x1}, {tc, use_v ? YYYY : XXXX, Mod::Abs}, ConstZero, Pred::None,
               true);
@@ -1315,7 +1319,7 @@ void FragmentEmitter::ProcTex() {
     }
     const Vec4Loc uv_home{Bank::Virtual, TmpProcUv};
     const Reg uv = uv_home.Pair(0);
-    const Reg tc = Reg::Pa(texcoord_pa[std::min<u32>(pt.coord, 2)]);
+    const Reg tc = Reg::Pa(texcoord_pa[GxmFlag("ptcoord0") ? 0u : std::min<u32>(pt.coord, 2)]);
     // uv = |texcoord|
     e.Vec(VecOp::Add, {uv, 0x3}, {tc, XYZW, Mod::Abs}, ConstZero, Pred::None, true);
 

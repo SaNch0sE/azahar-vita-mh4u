@@ -862,11 +862,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     Common::PipelineStats::presents_superseded.exchange(0, std::memory_order_relaxed),
                     sema, phase, sgi);
                 {
-                    // MH4U cover trap: traps taken, cover key changes, layout walk us (mean/worst).
+                    // MH4U cover trap: traps taken, cover key changes, layout walk us (mean/worst),
+                    // armed frames, mispredicts, units hidden, proofs covered.
                     const Mh4uHooks::CoverStats cov = Mh4uHooks::TakeCoverStats();
                     if (cov.traps != 0) {
-                        sceClibPrintf("[mh4u] cov t%u k%u w%u/%u\n", cov.traps, cov.key_changes,
-                                      cov.walk_avg_us, cov.walk_max_us);
+                        sceClibPrintf("[mh4u] cov t%u k%u w%u/%u a%u m%u u%u p%u\n", cov.traps,
+                                      cov.key_changes, cov.walk_avg_us, cov.walk_max_us,
+                                      cov.armed, cov.mispredicts, cov.hidden, cov.proofs);
                     }
                 }
                 if (Common::EmuProf::enabled) {
@@ -929,7 +931,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const Mh4uHooks::CoverStats cov = Mh4uHooks::TakeCoverStats();
                     VitaFrontend::ReportPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u  "
                                   "re l%u x%u t%u  bot d%u x%u  fx %u  hud2d p%u d%u s%u g%u c%u  hudres r%u f%u b%u a%uK z%uK  "
-                                  "cov t%u k%u w%u/%u\n",
+                                  "cov t%u k%u w%u/%u a%u m%u u%u p%u\n",
                                   Common::ThreadCpuReport().c_str(),
                                   static_cast<unsigned>(take(PS::gxw_shade_us) / 1000),
                                   static_cast<unsigned>(take(PS::gxw_brake_us) / 1000),
@@ -961,8 +963,11 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                   static_cast<unsigned>(take(PS::hud_post_area)),
                                   static_cast<unsigned>(take(PS::hud_post_area_zero)),
                                   // MH4U cover trap: traps taken, cover key changes, layout
-                                  // walk us (mean/worst) - docs/plans/vita-mh4u-menu-world-skip.md.
-                                  cov.traps, cov.key_changes, cov.walk_avg_us, cov.walk_max_us);
+                                  // walk us (mean/worst), armed frames, mispredicts, units
+                                  // hidden (most at once), proofs covered -
+                                  // docs/plans/vita-mh4u-menu-world-skip.md.
+                                  cov.traps, cov.key_changes, cov.walk_avg_us, cov.walk_max_us,
+                                  cov.armed, cov.mispredicts, cov.hidden, cov.proofs);
                     if (PS::stat_timing) {
                         // Render thread, ms this second: draw ops (all), their register
                         // replay, software-shaded draws (incl. the pre-shade feed), the feed

@@ -35,6 +35,7 @@ static inline int sceIoMkdir(const char*, int) {
 #endif
 #include "common/hash.h"
 #include "common/logging/log.h"
+#include "common/mh4u_cover.h"
 #include "common/pipeline_stats.h"
 #include "common/timer.h"
 #include "core/memory.h"
@@ -189,6 +190,24 @@ void SetUniformF(void* buffer, const RasterizerGxm::UniformSlot& slot, const flo
 
 } // Anonymous namespace
 
+// MH4U cover proof (see CoverScan): switches and constants.
+namespace {
+
+bool CoverSwitch(const char* name) {
+    if (std::FILE* f = std::fopen((std::string(VITA_DATA_DIR "/") + name).c_str(), "rb")) {
+        std::fclose(f);
+        return true;
+    }
+    return GxmFlag(name);
+}
+
+constexpr float CoverMinSide = 40.0f;
+// Opaque 2D sprites carry alpha 0.99999994 (an f24 one); the fragment program rounds the
+// vertex colour to 8 bits, so anything from 254.5/255 up is drawn as 255.
+constexpr float CoverAlphaOne = 254.5f / 255.0f;
+
+} // namespace
+
 RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica_,
                              VideoCore::CustomTexManager& custom_tex_manager,
                              VideoCore::RendererBase& renderer_)
@@ -209,6 +228,8 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
     // pi5 in a Smash fight and an SM3DL level, and on the
     // console each read is the sceKernelGetProcessTimeWide syscall, 150k a second in SM3DL.
     time_draws = GxmFlag("timedraw");
+    // MH4U cover proof and texture opacity maps: only while the cover trap is wanted.
+    Common::Mh4uCover::render_enabled = CoverSwitch("covertrap") && !CoverSwitch("nocovertrap");
     // Release too, from ux0:data/mh4u/timedraw.
     if (std::FILE* f = std::fopen(VITA_DATA_DIR "/timedraw", "rb")) {
         std::fclose(f);
@@ -3835,6 +3856,15 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
         stat_begin_repeats++;
         TraceDrop(regs, 1);
+        // Cover proof: the same state as the draw before, so the same verdict on it.
+        if (CoverOn() && !cover_in_sw && hud_post_draw && cover.active &&
+            (cover_depth_kind != 0 || cover_sample_kind != 0)) {
+            cover.layer_draws++;
+            CoverWorldDraw(cover_depth_kind != 0 ? cover_depth_kind : cover_sample_kind,
+                           cover_sample_addr,
+                           cover_depth_kind != 0 ? cover_depth_detail : cover_sample_unit,
+                           nullptr);
+        }
         for (const VideoCore::SurfaceId id : bound_surfaces) {
             if (id) {
                 res_cache.GetSurface(id).gpu_serial = runtime.CurrentEpoch();
@@ -3913,10 +3943,69 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                 Common::PipelineStats::hud_post_depth.fetch_add(1, std::memory_order_relaxed);
             }
         }
+        if (CoverOn()) {
+            // Cover proof: the world's depth draws before the grade (covermagenta tells a
+            // skipped world by their absence), and any draw above a cover that tests depth or
+            // samples a rendered picture (every draw path, not only the software one).
+            if (!hud_phase && cb == hud_target && using_depth_fb) {
+                cover.world_draws++;
+            }
+            if (cb != hud_target && cb != 0) {
+                using CF = Pica::FramebufferRegs::CompareFunc;
+                const auto& om_now = regs.framebuffer.output_merger;
+                CoverNoteTarget(cb,
+                                using_depth_fb && ((om_now.depth_test_enable &&
+                                                    om_now.depth_test_func.Value() != CF::Always) ||
+                                                   om_now.stencil_test.enable),
+                                regs.lighting.disable == 0, false);
+            }
+            cover_depth_kind = 0;
+            cover_sample_kind = 0;
+            if (post && cover.active) {
+                // What makes this draw's pixels depend on the world: a depth or stencil test
+                // (the world's depth buffer), or a rendered surface it samples. A software
+                // draw is judged when it is issued (CoverCommit, which knows its pixels); any
+                // other path uncovers the whole picture now.
+                CoverClassifyDepth(using_depth_fb);
+                CoverClassifySamples();
+                if (!cover_in_sw) {
+                    cover.layer_draws++;
+                    if (cover_depth_kind != 0 || cover_sample_kind != 0) {
+                        // ('q' only logs, see CoverWorldDraw.)
+                        CoverWorldDraw(cover_depth_kind != 0 ? cover_depth_kind
+                                                             : cover_sample_kind,
+                                       cover_sample_addr,
+                                       cover_depth_kind != 0 ? cover_depth_detail
+                                                             : cover_sample_unit,
+                                       nullptr);
+                    }
+                }
+            }
+        }
         if (grade_double) {
+            const bool second = hud_phase && hud_target == cb;
             hud_phase = true;
             hud_target = cb;
             Common::PipelineStats::hud_grades.fetch_add(1, std::memory_order_relaxed);
+            if (CoverOn() && !second) {
+                // The picture the 2D layer must cover: the grade's viewport. A second grade in
+                // the same layer (MH4U draws one) doubles each pixel in place - a covered pixel
+                // stays the cover's - so it keeps what is covered.
+                const auto& rz = regs.rasterizer;
+                const u32 world_draws = cover.world_draws;
+                cover = CoverFrame{};
+                cover.world_draws = world_draws;
+                cover.x0 = rz.viewport_corner.x.Value();
+                cover.y0 = rz.viewport_corner.y.Value();
+                cover.w = static_cast<s32>(Pica::f24::FromRaw(rz.viewport_size_x).ToFloat32() * 2.0f);
+                cover.h = static_cast<s32>(Pica::f24::FromRaw(rz.viewport_size_y).ToFloat32() * 2.0f);
+                cover.active = cover.w > 0 && cover.h > 0 && cover.w <= 1024 && cover.h <= 1024;
+                cover.row_words = static_cast<u32>(std::max(cover.w, 0) + 63) / 64;
+                cover_bits.assign(static_cast<std::size_t>(cover.row_words) *
+                                      static_cast<u32>(std::max(cover.h, 0)),
+                                  0);
+                cover.fill_rect = setup.helper->DrawRect();
+            }
             // HUD resolution: the grade marks the picture's rectangle; the first 2D draw after
             // it starts the screen-sized target.
             if ((hud_state == HudState::Idle || hud_state == HudState::Shown) && HudEnabled() &&
@@ -4076,6 +4165,19 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         if (hud_post_draw && scenes_this_frame != scenes_before) {
             Common::PipelineStats::hud_post_scenes.fetch_add(1, std::memory_order_relaxed);
         }
+        // covermagenta (diag): on a frame whose world was skipped (armed, and no depth draw
+        // reached the target before the grade), fill the picture magenta just before the 2D
+        // layer: any magenta pixel on screen is a hole in the cover. HUD resolution off only.
+        static const bool cover_magenta = CoverSwitch("covermagenta");
+        if (cover_magenta && CoverOn() && hud_post_draw && cover.active && !cover.magenta_done &&
+            !hud_redirect_now && hud_state == HudState::Idle && cover.world_draws == 0 &&
+            in_scene && scene_fb == fb && fb->color_id &&
+            Common::Mh4uCover::armed.load(std::memory_order_relaxed)) {
+            cover.magenta_done = true;
+            res_cache.GetSurface(fb->color_id)
+                .pending_colour.push_back({cover.fill_rect, Common::Vec4f{1.0f, 0.0f, 1.0f, 1.0f}});
+            DrawPendingColourClears();
+        }
         if (hud_redirect_now) {
             hud_pool[hud_work]->gpu_serial = runtime.CurrentEpoch();
             Common::PipelineStats::hudres_draws.fetch_add(1, std::memory_order_relaxed);
@@ -4212,6 +4314,10 @@ void RasterizerGxm::DrawTriangles() {
         return;
     }
     const PhaseTimer total_timer{time_draws, times.total};
+    // Cover proof: this draw's opaque quads, marked once it is issued (CoverCommit).
+    if (CoverOn()) {
+        CoverScan();
+    }
     // valphalog (diag): what the 2D layer's vertex alphas are, as a histogram, every 5 s.
     static const bool valpha_log = GxmFlag("valphalog");
     if (valpha_log && hud_post_draw && hud_phase && vertex_ring.base != nullptr) {
@@ -4305,6 +4411,7 @@ void RasterizerGxm::DrawTriangles() {
         if (no_merge) {
             FlushDeferredDraws();
         }
+        CoverCommit();
         return;
     }
     if (!pending_ring_ranges.empty()) {
@@ -4325,13 +4432,19 @@ void RasterizerGxm::DrawTriangles() {
         }
     }
     if (TexOnlyRepeat()) {
+        CoverCommit(true);
         return;
     }
     repeat_ok = false;
     DrawSetup setup;
-    if (!BeginDraw(setup, fixed_layout, vertex_count)) {
+    cover_in_sw = true;
+    const bool began = BeginDraw(setup, fixed_layout, vertex_count);
+    cover_in_sw = false;
+    if (!began) {
         ReleaseDraw(setup);
         DropDraw();
+        cover_pending.clear(); // not drawn: it covers nothing
+        cover_draw = false;
         return;
     }
     static const bool log_draw = GxmFlag("logdraw");
@@ -4377,6 +4490,7 @@ void RasterizerGxm::DrawTriangles() {
     vertex_batch.clear();
     pending_ring_ranges.clear();
     ReleaseDraw(setup);
+    CoverCommit();
     // Now that everything this draw did is done (the release invalidates the drawn region,
     // and may itself have bumped the epoch), the next one may repeat it.
     repeat_ok = in_scene;
@@ -5772,6 +5886,868 @@ void RasterizerGxm::ClearAll(bool flush) {
     res_cache.ClearAll(flush);
 }
 
+// ---------------------------------------------------------------------------------------------
+// MH4U menu world skip, step 3: the cover proof (docs/plans/vita-mh4u-menu-world-skip.md).
+// The emulation thread hides the 3D world only while the layouts look like a frame this proof
+// found entirely covered. The proof follows the real draws, one bit per pixel of the picture:
+// after the grade, every software 2D draw into the graded target that provably replaces what
+// is under it (alpha 1 everywhere and a blend for which that means "source only") covers the
+// pixels its axis-aligned quads cover. A draw whose pixels depend on the world - a depth or
+// stencil test, perspective geometry, a sampled rendered surface - uncovers the pixels it can
+// touch (all of them for a draw whose vertices we do not see), and a later cover covers them
+// again: only what is still uncovered at the end can show the world. A read of the picture
+// itself uncovers likewise until everything is covered, and changes nothing after (see
+// CoverWorldDraw). The verdict goes out at the display transfer with the frame's tag.
+
+bool RasterizerGxm::CoverOn() const {
+    return Common::Mh4uCover::render_enabled;
+}
+
+std::pair<int, int> RasterizerGxm::CoverAlphaBounds(std::pair<int, int> primary,
+                                                    std::pair<int, int> tex0) const {
+    // Interval arithmetic over the combiner's alpha chain, in the PICA's 8-bit terms: 255*255/255
+    // is 255 there and 1*1 is 1 in our programs, so a lower bound of 255 means alpha 1 exactly.
+    using Tev = Pica::TexturingRegs::TevStageConfig;
+    using Range = std::pair<int, int>;
+    constexpr Range unknown{0, 255};
+    const auto clamp8 = [](int x) { return std::clamp(x, 0, 255); };
+    const auto stages = regs.texturing.GetTevStages();
+    Range prev = unknown; // the stage before stage 0 is not something we can know
+    for (u32 i = 0; i < stages.size(); i++) {
+        const Tev& st = stages[i];
+        const auto source = [&](Tev::Source src, Tev::AlphaModifier mod_in) -> Range {
+            const u32 mod = static_cast<u32>(mod_in);
+            const u32 channel = mod >> 1; // 0 alpha, 1 red, 2 green, 3 blue
+            Range v = unknown;
+            if (src == Tev::Source::Constant) {
+                const u32 c = channel == 0   ? st.const_a.Value()
+                              : channel == 1 ? st.const_r.Value()
+                              : channel == 2 ? st.const_g.Value()
+                                             : st.const_b.Value();
+                v = {static_cast<int>(c), static_cast<int>(c)};
+            } else if (channel == 0) {
+                switch (src) {
+                case Tev::Source::PrimaryColor:
+                    v = primary;
+                    break;
+                case Tev::Source::Texture0:
+                    v = tex0;
+                    break;
+                case Tev::Source::Previous:
+                    v = prev;
+                    break;
+                default:
+                    break;
+                }
+            }
+            if ((mod & 1) != 0) {
+                v = {255 - v.second, 255 - v.first};
+            }
+            return v;
+        };
+        const Range a = source(st.alpha_source1, st.alpha_modifier1);
+        const Range b = source(st.alpha_source2, st.alpha_modifier2);
+        const Range c = source(st.alpha_source3, st.alpha_modifier3);
+        Range r = unknown;
+        switch (st.alpha_op.Value()) {
+        case Tev::Operation::Replace:
+            r = a;
+            break;
+        case Tev::Operation::Modulate:
+            r = {a.first * b.first / 255, a.second * b.second / 255};
+            break;
+        case Tev::Operation::Add:
+            r = {clamp8(a.first + b.first), clamp8(a.second + b.second)};
+            break;
+        case Tev::Operation::AddSigned:
+            r = {clamp8(a.first + b.first - 128), clamp8(a.second + b.second - 128)};
+            break;
+        case Tev::Operation::Lerp:
+            r = {std::min(a.first, b.first), std::max(a.second, b.second)};
+            break;
+        case Tev::Operation::Subtract:
+            r = {clamp8(a.first - b.second), clamp8(a.second - b.first)};
+            break;
+        case Tev::Operation::MultiplyThenAdd:
+            r = {clamp8(a.first * b.first / 255 + c.first),
+                 clamp8(a.second * b.second / 255 + c.second)};
+            break;
+        case Tev::Operation::AddThenMultiply:
+            r = {clamp8(a.first + b.first) * c.first / 255,
+                 clamp8(a.second + b.second) * c.second / 255};
+            break;
+        default:
+            break;
+        }
+        const int scale = st.alpha_scale == 0 ? 1 : st.alpha_scale == 1 ? 2 : 4;
+        prev = {clamp8(r.first * scale), clamp8(r.second * scale)};
+    }
+    return prev;
+}
+
+void RasterizerGxm::CoverScan() {
+    cover_pending.clear();
+    cover_draw = false;
+    cover_draw_perspective = false;
+    cover_draw_reads_target = false;
+    if (!CoverOn() || !cover.active || !hud_phase || vertex_ring.base == nullptr ||
+        !vertex_batch.empty() ||
+        regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() != hud_target) {
+        return;
+    }
+    cover_draw = true;
+    cover.layer_draws++;
+    // A unit reading the target's memory (the grade family, which our renderer draws without
+    // the read, or a copy of the picture): never a cover - what it writes comes from the
+    // picture, not from the sprite.
+    {
+        const auto units = regs.texturing.GetTextures();
+        const u32 target_end = hud_target + static_cast<u32>(cover.w * cover.h) * 4;
+        for (const auto& unit : units) {
+            const u32 a = unit.config.GetPhysicalAddress();
+            cover_draw_reads_target =
+                cover_draw_reads_target || (unit.enabled && a >= hud_target && a < target_end);
+        }
+    }
+    using BF = Pica::FramebufferRegs::BlendFactor;
+    using BE = Pica::FramebufferRegs::BlendEquation;
+    using CF = Pica::FramebufferRegs::CompareFunc;
+    using Fmt = Pica::TexturingRegs::TextureFormat;
+    using TexConfig = Pica::TexturingRegs::TextureConfig;
+    const auto& om = regs.framebuffer.output_merger;
+    const auto& rz = regs.rasterizer;
+    const auto& tex = regs.texturing.texture0;
+
+    // Does this draw replace what lies under it wherever it draws? Depth, stencil, a partial
+    // colour mask or another fragment mode can keep what is there.
+    bool state_ok = om.fragment_operation_mode == Pica::FramebufferRegs::FragmentOperationMode::Default &&
+                    !om.depth_test_enable && !om.depth_write_enable && !om.stencil_test.enable &&
+                    om.red_enable && om.green_enable && om.blue_enable && om.alpha_enable &&
+                    regs.framebuffer.framebuffer.allow_color_write != 0 &&
+                    rz.scissor_test.mode != Pica::RasterizerRegs::ScissorMode::Exclude &&
+                    !cover_draw_reads_target;
+    bool alpha_needed = false;
+    if (om.alphablend_enable) {
+        // The 2D layer's blend, colour SrcAlpha/OneMinusSrcAlpha and alpha One/Zero (or the
+        // like), writes the source alone where alpha is 1; One/Zero writes it whatever alpha.
+        const auto& b = om.alpha_blending;
+        const bool add = b.blend_equation_rgb == BE::Add && b.blend_equation_a == BE::Add;
+        const bool rgb_replace = b.factor_source_rgb == BF::One && b.factor_dest_rgb == BF::Zero;
+        const bool rgb_over = b.factor_source_rgb == BF::SourceAlpha &&
+                              b.factor_dest_rgb == BF::OneMinusSourceAlpha;
+        const bool a_replace = b.factor_source_a == BF::One && b.factor_dest_a == BF::Zero;
+        const bool a_over =
+            (b.factor_source_a == BF::One || b.factor_source_a == BF::SourceAlpha) &&
+            (b.factor_dest_a == BF::Zero || b.factor_dest_a == BF::OneMinusSourceAlpha);
+        state_ok = state_ok && add && (rgb_replace || rgb_over) && (a_replace || a_over);
+        alpha_needed = rgb_over || !a_replace;
+    } else {
+        state_ok = state_ok && om.logic_op == Pica::FramebufferRegs::LogicOp::Copy;
+    }
+    if (om.alpha_test.enable && om.alpha_test.func != CF::Always) {
+        // With alpha 255 the test must pass.
+        const u32 ref = om.alpha_test.ref;
+        bool pass = false;
+        switch (om.alpha_test.func.Value()) {
+        case CF::Equal:
+        case CF::LessThanOrEqual:
+            pass = ref == 255;
+            break;
+        case CF::NotEqual:
+        case CF::GreaterThan:
+            pass = ref < 255;
+            break;
+        case CF::GreaterThanOrEqual:
+            pass = true;
+            break;
+        default:
+            break;
+        }
+        state_ok = state_ok && pass;
+        alpha_needed = true;
+    }
+    bool needs_primary = false;
+    bool needs_texture = false;
+    const Fmt format = regs.texturing.texture0_format;
+    if (state_ok && alpha_needed) {
+        state_ok = CoverAlphaBounds({255, 255}, {255, 255}).first >= 255;
+        needs_primary = CoverAlphaBounds({0, 255}, {255, 255}).first < 255;
+        needs_texture = CoverAlphaBounds({255, 255}, {0, 255}).first < 255;
+        if (needs_texture) {
+            state_ok = state_ok && regs.texturing.main_config.texture0_enable &&
+                       tex.type.Value() == TexConfig::TextureType::Texture2D;
+            // Formats without alpha read as 255.
+            needs_texture = !(format == Fmt::RGB8 || format == Fmt::RGB565 ||
+                              format == Fmt::ETC1 || format == Fmt::I8 || format == Fmt::I4 ||
+                              format == Fmt::RG8);
+            if (needs_texture && VideoCore::OpacityTileBytes(static_cast<VideoCore::PixelFormat>(
+                                     static_cast<u32>(format))) == 0) {
+                state_ok = false;
+            }
+        }
+    }
+
+    cover.opaque_draws += state_ok ? 1 : 0;
+    const float vp_hw = Pica::f24::FromRaw(rz.viewport_size_x).ToFloat32();
+    const float vp_hh = Pica::f24::FromRaw(rz.viewport_size_y).ToFloat32();
+    const float vp_cx = static_cast<float>(rz.viewport_corner.x.Value());
+    const float vp_cy = static_cast<float>(rz.viewport_corner.y.Value());
+    // Pixels the draw can reach: its viewport, the scissor, the cover's picture.
+    s32 clip_x0 = std::max(cover.x0, static_cast<s32>(vp_cx));
+    s32 clip_y0 = std::max(cover.y0, static_cast<s32>(vp_cy));
+    s32 clip_x1 = std::min(cover.x0 + cover.w, static_cast<s32>(vp_cx + 2.0f * vp_hw)) - 1;
+    s32 clip_y1 = std::min(cover.y0 + cover.h, static_cast<s32>(vp_cy + 2.0f * vp_hh)) - 1;
+    if (rz.scissor_test.mode == Pica::RasterizerRegs::ScissorMode::Include) {
+        clip_x0 = std::max(clip_x0, static_cast<s32>(rz.scissor_test.x1.Value()));
+        clip_y0 = std::max(clip_y0, static_cast<s32>(rz.scissor_test.y1.Value()));
+        clip_x1 = std::min(clip_x1, static_cast<s32>(rz.scissor_test.x2.Value()));
+        clip_y1 = std::min(clip_y1, static_cast<s32>(rz.scissor_test.y2.Value()));
+    }
+    const float tw = static_cast<float>(tex.width.Value());
+    const float th = static_cast<float>(tex.height.Value());
+    const bool bilinear = tex.mag_filter == TexConfig::Linear || tex.min_filter == TexConfig::Linear;
+    // Lower mip levels average wider footprints: widen the texel window to match (2D sprites
+    // are drawn near 1:1, so this rarely matters).
+    const s32 mip_pad = tex.lod.max_level == 0 ? 0 : (1 << std::min<u32>(tex.lod.max_level, 3)) - 1;
+
+    // The pixels the draw can touch (its vertices' box, clipped): what a world-dependent draw
+    // uncovers.
+    float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
+    bool bbox_ok = true;
+    for (const auto& range : pending_ring_ranges) {
+        const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+            vertex_ring.base + static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+        for (u32 i = 0; i < range.count; i++) {
+            const float w = v[i].pos.w.ToFloat32();
+            // Perspective: w differs within a triangle (a constant w is a 2D projection).
+            if (i % 3 != 0 && std::fabs(w - v[i - i % 3].pos.w.ToFloat32()) >
+                                  1e-3f * std::fabs(w) + 1e-6f) {
+                cover_draw_perspective = true;
+            }
+            if (!(w > 0.0f)) {
+                bbox_ok = false; // clipped geometry: the box is not the vertices'
+                continue;
+            }
+            const float x = (v[i].pos.x.ToFloat32() / w + 1.0f) * vp_hw + vp_cx;
+            const float y = (v[i].pos.y.ToFloat32() / w + 1.0f) * vp_hh + vp_cy;
+            bx0 = std::min(bx0, x);
+            by0 = std::min(by0, y);
+            bx1 = std::max(bx1, x);
+            by1 = std::max(by1, y);
+        }
+    }
+    if (bbox_ok && bx0 <= bx1 && std::fabs(bx0) < 1e5f && std::fabs(bx1) < 1e5f &&
+        std::fabs(by0) < 1e5f && std::fabs(by1) < 1e5f) {
+        cover_bbox[0] = std::max(clip_x0, static_cast<s32>(std::floor(bx0)) - 1);
+        cover_bbox[1] = std::max(clip_y0, static_cast<s32>(std::floor(by0)) - 1);
+        cover_bbox[2] = std::min(clip_x1, static_cast<s32>(std::ceil(bx1)) + 1);
+        cover_bbox[3] = std::min(clip_y1, static_cast<s32>(std::ceil(by1)) + 1);
+    } else {
+        cover_bbox[0] = clip_x0;
+        cover_bbox[1] = clip_y0;
+        cover_bbox[2] = clip_x1;
+        cover_bbox[3] = clip_y1;
+    }
+    if (!state_ok || cover_draw_perspective) {
+        return;
+    }
+    for (const auto& range : pending_ring_ranges) {
+        const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+            vertex_ring.base + static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+        for (u32 q = 0; q + 6 <= range.count; q += 6) {
+            const Pica::OutputVertex* qv = v + q;
+            float px[6], py[6];
+            bool ok = true;
+            for (u32 k = 0; k < 6 && ok; k++) {
+                const float w = qv[k].pos.w.ToFloat32();
+                ok = w > 0.0f &&
+                     (!needs_primary || qv[k].color.a().ToFloat32() >= CoverAlphaOne);
+                px[k] = (qv[k].pos.x.ToFloat32() / w + 1.0f) * vp_hw + vp_cx;
+                py[k] = (qv[k].pos.y.ToFloat32() / w + 1.0f) * vp_hh + vp_cy;
+            }
+            if (!ok) {
+                continue;
+            }
+            const float xmin = *std::min_element(px, px + 6), xmax = *std::max_element(px, px + 6);
+            const float ymin = *std::min_element(py, py + 6), ymax = *std::max_element(py, py + 6);
+            if (xmax - xmin < CoverMinSide || ymax - ymin < CoverMinSide) {
+                continue;
+            }
+            // Every vertex on a corner; the two triangles' shared edge a diagonal, so together
+            // they fill the rectangle. Corner index: bit 0 right, bit 1 top.
+            constexpr float eps = 1.0f / 64.0f;
+            std::array<float, 4> cu{}, cv{};
+            std::array<bool, 4> seen{};
+            u32 tri_mask[2] = {0, 0};
+            for (u32 k = 0; k < 6 && ok; k++) {
+                const bool l = std::fabs(px[k] - xmin) < eps, r = std::fabs(px[k] - xmax) < eps;
+                const bool b = std::fabs(py[k] - ymin) < eps, t = std::fabs(py[k] - ymax) < eps;
+                ok = (l || r) && (b || t);
+                const u32 c = (r ? 1 : 0) | (t ? 2 : 0);
+                const float u = qv[k].tc0.x.ToFloat32(), vv = qv[k].tc0.y.ToFloat32();
+                if (ok && seen[c]) {
+                    ok = std::fabs(cu[c] - u) < 1e-5f && std::fabs(cv[c] - vv) < 1e-5f;
+                }
+                seen[c] = true;
+                cu[c] = u;
+                cv[c] = vv;
+                tri_mask[k / 3] |= 1u << c;
+            }
+            const u32 shared = tri_mask[0] & tri_mask[1];
+            if (!ok || std::popcount(tri_mask[0]) != 3 || std::popcount(tri_mask[1]) != 3 ||
+                (tri_mask[0] | tri_mask[1]) != 0xF || (shared != 0x9 && shared != 0x6)) {
+                continue;
+            }
+            // The pixels whose centres it covers (the rasteriser's rule). No margin: two quads
+            // that share an edge cover every pixel between them, and a sprite's rim is judged
+            // by its texels below (the bilinear window reaches one texel past the edge).
+            s32 x0 = static_cast<s32>(std::ceil(xmin - 0.5f));
+            s32 x1 = static_cast<s32>(std::ceil(xmax - 0.5f)) - 1;
+            s32 y0 = static_cast<s32>(std::ceil(ymin - 0.5f));
+            s32 y1 = static_cast<s32>(std::ceil(ymax - 0.5f)) - 1;
+            x0 = std::max(x0, clip_x0);
+            y0 = std::max(y0, clip_y0);
+            x1 = std::min(x1, clip_x1);
+            y1 = std::min(y1, clip_y1);
+            if (x0 > x1 || y0 > y1) {
+                continue;
+            }
+            CoverQuad quad{};
+            quad.x0 = x0;
+            quad.x1 = x1;
+            quad.y0 = y0;
+            quad.y1 = y1;
+            quad.needs_texture = needs_texture;
+            quad.index = cover.layer_draws;
+            // Texture coordinates as a function of the pixel: exact for an affine quad (the
+            // 2D layer's), whichever way the texture lies on the rotated framebuffer.
+            quad.affine = std::fabs(cu[0] + cu[3] - cu[1] - cu[2]) < 1e-4f &&
+                          std::fabs(cv[0] + cv[3] - cv[1] - cv[2]) < 1e-4f;
+            if (quad.affine) {
+                quad.ux = (cu[1] - cu[0]) / (xmax - xmin);
+                quad.uy = (cu[2] - cu[0]) / (ymax - ymin);
+                quad.ua = cu[0] - quad.ux * xmin - quad.uy * ymin;
+                quad.vx = (cv[1] - cv[0]) / (xmax - xmin);
+                quad.vy = (cv[2] - cv[0]) / (ymax - ymin);
+                quad.va = cv[0] - quad.vx * xmin - quad.vy * ymin;
+            } else {
+                quad.u0 = *std::min_element(cu.begin(), cu.end());
+                quad.u1 = *std::max_element(cu.begin(), cu.end());
+                quad.v0 = *std::min_element(cv.begin(), cv.end());
+                quad.v1 = *std::max_element(cv.begin(), cv.end());
+            }
+            quad.tw = tw;
+            quad.th = th;
+            quad.wrap_s = static_cast<u8>(tex.wrap_s.Value());
+            quad.wrap_t = static_cast<u8>(tex.wrap_t.Value());
+            quad.bilinear = bilinear;
+            quad.border_opaque = tex.border_color.a == 255;
+            quad.mip_pad = mip_pad;
+            // The window of the visible pixels (already clipped to the viewport, the scissor
+            // and the picture: pixels off the screen do not matter).
+            const bool window_ok = CoverTexelWindow(quad, x0, x1, y0, y1, quad);
+            if (needs_texture && !window_ok) {
+                if (cover.refused_logged < cover.refused.size()) {
+                    cover.refused[cover.refused_logged++] =
+                        CoverQuadLog{quad, tex.GetPhysicalAddress(), static_cast<u32>(format),
+                                     tex.width, tex.height, 100, 0};
+                }
+                cover.quads_texture++;
+                continue;
+            }
+            cover_pending.push_back(quad);
+        }
+    }
+}
+
+bool RasterizerGxm::CoverTexelWindow(const CoverQuad& q, s32 x0, s32 x1, s32 y0, s32 y1,
+                                     CoverQuad& out) const {
+    using TexConfig = Pica::TexturingRegs::TextureConfig;
+    float umin = q.u0, umax = q.u1, vmin = q.v0, vmax = q.v1;
+    if (q.affine) {
+        // At the pixel centres of the corners of [x0, x1] x [y0, y1].
+        umin = vmin = 1e30f;
+        umax = vmax = -1e30f;
+        for (const s32 x : {x0, x1}) {
+            for (const s32 y : {y0, y1}) {
+                const float px = x + 0.5f, py = y + 0.5f;
+                const float u = q.ua + q.ux * px + q.uy * py;
+                const float v = q.va + q.vx * px + q.vy * py;
+                umin = std::min(umin, u);
+                umax = std::max(umax, u);
+                vmin = std::min(vmin, v);
+                vmax = std::max(vmax, v);
+            }
+        }
+    }
+    out.u0 = umin;
+    out.u1 = umax;
+    out.v0 = vmin;
+    out.v1 = vmax;
+    // Texels the filter can read: the bilinear footprint reaches the texel past each centre.
+    const auto texels = [&](float lo, float hi, float size, u32 wrap, s32& t0, s32& t1) {
+        const float a = lo * size, b = hi * size;
+        if (!(std::fabs(a) < 1e6f && std::fabs(b) < 1e6f) || size < 1.0f) {
+            return false;
+        }
+        t0 = static_cast<s32>(std::floor(q.bilinear ? a - 0.5f : a)) - q.mip_pad;
+        t1 = static_cast<s32>(std::floor(q.bilinear ? b - 0.5f : b)) + (q.bilinear ? 1 : 0) +
+             q.mip_pad;
+        const s32 last = static_cast<s32>(size) - 1;
+        if (t0 >= 0 && t1 <= last) {
+            return true;
+        }
+        switch (wrap) {
+        case TexConfig::ClampToEdge:
+            break;
+        case TexConfig::ClampToBorder:
+            if (!q.border_opaque) {
+                return false;
+            }
+            break;
+        default:
+            // Repeats: the window wraps somewhere into the texture - take all of it.
+            t0 = 0;
+            t1 = last;
+            return true;
+        }
+        t0 = std::clamp(t0, 0, last);
+        t1 = std::clamp(t1, 0, last);
+        return true;
+    };
+    s32 s0, s1, t0, t1;
+    if (!texels(umin, umax, q.tw, q.wrap_s, s0, s1) || !texels(vmin, vmax, q.th, q.wrap_t, t0, t1)) {
+        return false;
+    }
+    // The PICA counts t from the bottom; memory rows from the top.
+    const s32 last_row = static_cast<s32>(q.th) - 1;
+    out.s0 = static_cast<u32>(s0);
+    out.s1 = static_cast<u32>(s1);
+    out.m0 = static_cast<u32>(last_row - t1);
+    out.m1 = static_cast<u32>(last_row - t0);
+    return true;
+}
+
+void RasterizerGxm::CoverFill(s32 x0, s32 y0, s32 x1, s32 y1, bool set) {
+    x0 = std::max(x0 - cover.x0, 0);
+    y0 = std::max(y0 - cover.y0, 0);
+    x1 = std::min(x1 - cover.x0, cover.w - 1);
+    y1 = std::min(y1 - cover.y0, cover.h - 1);
+    if (x0 > x1 || y0 > y1) {
+        return;
+    }
+    for (s32 y = y0; y <= y1; y++) {
+        u64* row = cover_bits.data() + static_cast<std::size_t>(y) * cover.row_words;
+        for (s32 wi = x0 / 64; wi <= x1 / 64; wi++) {
+            const s32 lo = std::max(x0 - wi * 64, 0);
+            const s32 hi = std::min(x1 - wi * 64, 63);
+            const u64 mask = (hi == 63 ? ~0ull : (1ull << (hi + 1)) - 1) & ~((1ull << lo) - 1);
+            const u64 before = row[wi];
+            row[wi] = set ? before | mask : before & ~mask;
+            const u64 changed = before ^ row[wi];
+            if (set) {
+                cover.covered_px += static_cast<u32>(std::popcount(changed));
+            } else {
+                cover.covered_px -= static_cast<u32>(std::popcount(changed));
+            }
+        }
+    }
+}
+
+void RasterizerGxm::CoverClassifySamples() {
+    cover_sample_kind = 0;
+    cover_sample_addr = 0;
+    cover_sample_id = {};
+    const auto units = regs.texturing.GetTextures();
+    const u32 target_end = hud_target + static_cast<u32>(std::max(cover.w * cover.h, 0)) * 4;
+    for (u32 unit = 0; unit < bound_surfaces.size(); unit++) {
+        // Only a unit the program reads: MH4U leaves units enabled on surfaces it never
+        // samples (pointing at the picture, even).
+        if (!units[unit].enabled || !bound_surfaces[unit] || !TextureUnitRead(unit)) {
+            continue;
+        }
+        const Surface& surface = res_cache.GetSurface(bound_surfaces[unit]);
+        if (surface.type == VideoCore::SurfaceType::Texture) {
+            continue;
+        }
+        cover_sample_addr = surface.addr;
+        cover_sample_unit = unit;
+        // The picture itself ('T') or another rendered surface: world content ('r', a model
+        // drawn to a texture first, say) unless only flat 2D draws made it lately ('q').
+        if (surface.addr < target_end && hud_target < surface.end) {
+            cover_sample_kind = 'T';
+            continue;
+        }
+        cover_sample_id = bound_surfaces[unit];
+        if (!surface.gpu_content) {
+            // Never drawn into by the GPU: its pixels are guest memory the CPU wrote and the
+            // cache uploaded (MH4U's pages of text), a texture in all but type. Not world
+            // content, and its opacity map can make it a cover.
+            if (cover_sample_kind == 0) {
+                cover_sample_kind = 'm';
+            }
+            continue;
+        }
+        const CoverTarget* rt = CoverTargetOf(surface.addr, false);
+        cover_sample_rt = rt != nullptr ? *rt : CoverTarget{};
+        // However long ago: a page drawn once and kept is menu content too. A surface never
+        // seen drawn (or forgotten) counts as world content.
+        const bool flat_2d = rt != nullptr && rt->depth == 0 && rt->lit == 0 && rt->copies == 0;
+        if (!flat_2d) {
+            cover_sample_kind = 'r';
+            return;
+        }
+        if (cover_sample_kind == 0) {
+            cover_sample_kind = 'q';
+        }
+    }
+}
+
+void RasterizerGxm::CoverClassifyDepth(bool using_depth_fb) {
+    // A depth or stencil test against the world's buffers decides which pixels it writes; a
+    // depth write alone (or a test that always passes) does not change the picture.
+    using CF = Pica::FramebufferRegs::CompareFunc;
+    const auto& om = regs.framebuffer.output_merger;
+    const bool depth_test = om.depth_test_enable && om.depth_test_func.Value() != CF::Always;
+    const bool stencil_test =
+        om.stencil_test.enable && om.stencil_test.func.Value() != CF::Always;
+    cover_depth_kind = using_depth_fb && (depth_test || stencil_test) ? 'd' : 0;
+    cover_depth_detail = static_cast<u32>(om.depth_test_func.Value()) |
+                         (om.stencil_test.enable ? 0x10u : 0u) |
+                         (om.depth_write_enable ? 0x20u : 0u) |
+                         (om.depth_test_enable ? 0x40u : 0u);
+}
+
+RasterizerGxm::CoverTarget* RasterizerGxm::CoverTargetOf(u32 addr, bool create) {
+    CoverTarget* victim = nullptr;
+    for (CoverTarget& t : cover_targets) {
+        if (t.addr == addr && addr != 0) {
+            return &t;
+        }
+        // An empty slot first, else the one drawn longest ago.
+        if (victim == nullptr || (victim->addr != 0 &&
+                                  (t.addr == 0 || frame_index - t.frame > frame_index - victim->frame))) {
+            victim = &t;
+        }
+    }
+    if (!create) {
+        return nullptr;
+    }
+    *victim = CoverTarget{addr, frame_index, 0, 0, 0, 0};
+    return victim;
+}
+
+void RasterizerGxm::CoverNoteTarget(u32 addr, bool depth, bool lit, bool copy) {
+    CoverTarget* t = CoverTargetOf(addr, true);
+    if (t->frame != frame_index) {
+        // Counts of the latest frame that drew into it.
+        *t = CoverTarget{addr, frame_index, 0, 0, 0, 0};
+    }
+    t->draws += copy ? 0 : 1;
+    t->depth += depth ? 1 : 0;
+    t->lit += lit ? 1 : 0;
+    t->copies += copy ? 1 : 0;
+}
+
+void RasterizerGxm::CoverWorldDraw(char kind, u32 addr, u32 detail, const s32* bbox) {
+    const u32 before = cover.covered_px;
+    const u32 slot = cover.draw_logged;
+    cover.draw_logged++;
+    cover.kind_counts[kind == 'd'   ? 0
+                      : kind == 'p' ? 1
+                      : kind == 'r' ? 2
+                      : kind == 'T' ? 3
+                      : kind == 'q' ? 4
+                                    : 5]++;
+    const auto note = [&] {
+        if (slot < cover.draw_log.size()) {
+            CoverDrawLog& d = cover.draw_log[slot];
+            d = CoverDrawLog{kind,   bbox != nullptr, addr, cover.layer_draws, before,
+                             before - cover.covered_px, {}, detail};
+            if (bbox != nullptr) {
+                std::copy(bbox, bbox + 4, d.box);
+            }
+            if (kind == 'r' || kind == 'q' || kind == 'm') {
+                if (cover_sample_id) {
+                    const Surface& surf = res_cache.GetSurface(cover_sample_id);
+                    d.surf_type = static_cast<u32>(surf.type);
+                    d.surf_format = static_cast<u32>(surf.pixel_format);
+                    d.surf_w = surf.width;
+                    d.surf_h = surf.height;
+                    d.surf_uploads = surf.upload_count;
+                    d.surf_gpu = surf.gpu_content;
+                }
+                d.rt_draws = cover_sample_rt.draws;
+                d.rt_depth = cover_sample_rt.depth;
+                d.rt_lit = cover_sample_rt.lit;
+                d.rt_copies = cover_sample_rt.copies;
+                d.rt_age = cover_sample_rt.addr != 0 ? frame_index - cover_sample_rt.frame
+                                                     : 0xFFFFFFFF;
+            }
+        }
+    };
+    if (kind == 'q' || kind == 'm') {
+        // A surface only flat 2D draws made, or one the CPU wrote: menu content, there
+        // whatever the world does.
+        note();
+        return;
+    }
+    if (kind == 'T') {
+        // A read of the picture writes what it read. Once every pixel is under a cover, it
+        // can read only the cover's pixels (this frame's, or the last frame's stored picture,
+        // which was covered too when the skip arms), so it adds nothing of the world. Before
+        // that it may read world pixels: what it touched is uncovered until a later cover
+        // goes over it again.
+        if (CoverFull()) {
+            note();
+            return;
+        }
+    } else if (cover.covered_px != 0) {
+        cover.late3d++;
+    }
+    if (bbox != nullptr) {
+        CoverFill(bbox[0], bbox[1], bbox[2], bbox[3], false);
+    } else {
+        CoverFill(cover.x0, cover.y0, cover.x0 + cover.w - 1, cover.y0 + cover.h - 1, false);
+    }
+    note();
+}
+
+void RasterizerGxm::CoverCommit(bool textures_changed) {
+    if (!cover_draw) {
+        cover_pending.clear();
+        return;
+    }
+    cover_draw = false;
+    // World-dependent pixels (a depth test against the world's depth, perspective geometry, a
+    // rendered picture) are uncovered; a later opaque sprite over them covers them again, so
+    // only what stays visible at the end keeps a frame from being covered.
+    if (textures_changed) {
+        CoverClassifySamples();
+    }
+    const char kind = cover_depth_kind != 0         ? cover_depth_kind
+                      : cover_draw_perspective      ? 'p'
+                      : cover_sample_kind == 'r'    ? 'r'
+                      : cover_sample_kind == 'T'    ? 'T'
+                                                    : 0;
+    if (kind == 0 && (cover_sample_kind == 'q' || cover_sample_kind == 'm')) {
+        // Logged; its quads may still cover (an opaque format, or its texels' map).
+        CoverWorldDraw(cover_sample_kind, cover_sample_addr, cover_sample_unit, cover_bbox);
+    }
+    if (kind != 0) {
+        CoverWorldDraw(kind, kind == 'r' || kind == 'T' ? cover_sample_addr : 0,
+                       kind == 'd' ? cover_depth_detail : cover_sample_unit, cover_bbox);
+        cover_pending.clear();
+        return;
+    }
+    if (cover_pending.empty()) {
+        return;
+    }
+    const Surface* surface = bound_surfaces[0] ? &res_cache.GetSurface(bound_surfaces[0]) : nullptr;
+    const auto& tex = regs.texturing.texture0;
+    const auto format =
+        static_cast<VideoCore::PixelFormat>(static_cast<u32>(regs.texturing.texture0_format.Value()));
+    for (const CoverQuad& q : cover_pending) {
+        CoverQuadLog log{q, tex.GetPhysicalAddress(), static_cast<u32>(format), tex.width,
+                         tex.height, 0, 0};
+        if (q.needs_texture) {
+            if (surface == nullptr) {
+                log.why = 101; // no surface bound
+            } else if (surface->pixel_format != format) {
+                log.why = 102; // the surface holds another format
+            } else {
+                log.why = static_cast<u32>(VideoCore::RegionOpacity(
+                    *surface, tex.GetPhysicalAddress(), tex.width, q.s0, q.s1, q.m0, q.m1,
+                    &log.tile));
+                const auto why = static_cast<VideoCore::OpacityWhy>(log.why);
+                if ((why == VideoCore::OpacityWhy::Stale || why == VideoCore::OpacityWhy::Unknown) &&
+                    surface->opacity_rebuilt_tick != surface->modification_tick) {
+                    // A map lost (or never made) for a surface that still holds exactly what
+                    // was uploaded: made again from guest memory, once per change of the
+                    // surface, when the guest bytes hash to the upload's.
+                    Surface& mutable_surface = res_cache.GetSurface(bound_surfaces[0]);
+                    mutable_surface.opacity_rebuilt_tick = mutable_surface.modification_tick;
+                    const MemoryRef source = memory.GetPhysicalRef(mutable_surface.addr);
+                    if (mutable_surface.upload_hash != 0 && !mutable_surface.gpu_content && source &&
+                        source.GetSize() >= mutable_surface.size &&
+                        mutable_surface.IsRegionValid(mutable_surface.GetInterval()) &&
+                        Common::ComputeHash64(source.GetPtr(), mutable_surface.size) ==
+                            mutable_surface.upload_hash) {
+                        VideoCore::RebuildOpacity(
+                            mutable_surface, std::span<const u8>(source.GetPtr(), mutable_surface.size));
+                        cover.maps_rebuilt++;
+                        log.why = static_cast<u32>(VideoCore::RegionOpacity(
+                            *surface, tex.GetPhysicalAddress(), tex.width, q.s0, q.s1, q.m0,
+                            q.m1, &log.tile));
+                    }
+                }
+            }
+            if (log.why != 0) {
+                cover.quads_texture++;
+                CoverQuadLog& kept = log;
+                if (log.why == static_cast<u32>(VideoCore::OpacityWhy::Transparent) ||
+                    log.why == static_cast<u32>(VideoCore::OpacityWhy::Unknown)) {
+                    // coverlog: how much of its window is transparent, and the refusing tile's
+                    // texels (from guest memory, which holds what was uploaded).
+                    VideoCore::RegionTileCounts(*surface, tex.GetPhysicalAddress(), tex.width,
+                                                q.s0, q.s1, q.m0, q.m1, kept.bad_tiles,
+                                                kept.tiles);
+                    const u32 tile_bytes = VideoCore::OpacityTileBytes(surface->pixel_format);
+                    const MemoryRef tile_ref =
+                        memory.GetPhysicalRef(surface->addr + log.tile * tile_bytes);
+                    if (tile_ref && tile_ref.GetSize() >= tile_bytes) {
+                        kept.tile_min_alpha = VideoCore::TileAlphaStats(
+                            surface->pixel_format, tile_ref.GetPtr(), &kept.tile_low_texels);
+                    }
+                    // From the surface's tile count to the texture's.
+                    kept.tile -= (tex.GetPhysicalAddress() - surface->addr) / tile_bytes;
+                }
+                // Refused whole: the parts of it whose own texels are opaque still cover. In
+                // 8x8-pixel blocks, each judged by the texels its pixels can read - an edge
+                // or a hole in the texture then leaves only its own pixels open.
+                if (q.affine && surface != nullptr && surface->pixel_format == format &&
+                    (log.why == static_cast<u32>(VideoCore::OpacityWhy::Transparent) ||
+                     log.why == static_cast<u32>(VideoCore::OpacityWhy::Unknown))) {
+                    for (s32 by = q.y0; by <= q.y1; by += 8) {
+                        for (s32 bx = q.x0; bx <= q.x1; bx += 8) {
+                            const s32 ex = std::min(bx + 7, q.x1), ey = std::min(by + 7, q.y1);
+                            kept.quad.blocks++;
+                            CoverQuad part = q;
+                            if (CoverTexelWindow(q, bx, ex, by, ey, part) &&
+                                VideoCore::RegionOpaque(*surface, tex.GetPhysicalAddress(),
+                                                        tex.width, part.s0, part.s1, part.m0,
+                                                        part.m1)) {
+                                kept.quad.blocks_opaque++;
+                                CoverFill(bx, by, ex, ey, true);
+                            }
+                        }
+                    }
+                }
+                if (cover.refused_logged < cover.refused.size()) {
+                    cover.refused[cover.refused_logged++] = kept;
+                }
+                continue;
+            }
+        }
+        cover.quads++;
+        cover.first_quad_index = cover.quads == 1 ? cover.layer_draws : cover.first_quad_index;
+        cover.last_quad_index = cover.layer_draws;
+        if (cover.accepted_logged < cover.accepted.size()) {
+            cover.accepted[cover.accepted_logged++] = log;
+        }
+        CoverFill(q.x0, q.y0, q.x1, q.y1, true);
+    }
+    cover_pending.clear();
+}
+
+void RasterizerGxm::CoverFrameEnd(bool top_transfer) {
+    if (!CoverOn()) {
+        return;
+    }
+    if (cover.active && top_transfer && cover_frame_tag != 0) {
+        const bool covered = CoverFull();
+        Common::Mh4uCover::PublishProof(cover_frame_tag, covered, cover.late3d);
+        // coverlog: one proof a second, with what made it.
+        static const bool log = CoverSwitch("coverlog");
+        static u64 last_us = 0;
+        const u64 now = Common::PipelineStats::NowUs();
+        if (log && now - last_us >= 1'000'000) {
+            last_us = now;
+            sceClibPrintf("[mh4u] cover proof: tag %u %s, %u of %u px covered (%dx%d at %d,%d), "
+                          "late %u, layer draws %u, opaque draws %u, quads %u (texels refused "
+                          "%u, maps rebuilt %u), world draws before the grade %u, in the layer: "
+                          "depth %u perspective %u rendered %u target-read %u 2D-rendered %u memory-content %u; "
+                          "quads at layer "
+                          "draws %u..%u\n",
+                          cover_frame_tag, covered ? "covered" : "open", cover.covered_px,
+                          static_cast<u32>(cover.w * cover.h), cover.w, cover.h, cover.x0,
+                          cover.y0, cover.late3d, cover.layer_draws, cover.opaque_draws,
+                          cover.quads, cover.quads_texture, cover.maps_rebuilt,
+                          cover.world_draws, cover.kind_counts[0], cover.kind_counts[1],
+                          cover.kind_counts[2], cover.kind_counts[3], cover.kind_counts[4],
+                          cover.kind_counts[5],
+                          cover.first_quad_index,
+                          cover.last_quad_index);
+            // The picture in 16-px cells: '#' all covered, '+' partly, '.' not at all.
+            std::string map;
+            for (s32 cy = 0; cy < cover.h; cy += 16) {
+                for (s32 cx = 0; cx < cover.w; cx += 16) {
+                    u32 set = 0, all = 0;
+                    for (s32 y = cy; y < std::min(cy + 16, cover.h); y++) {
+                        for (s32 x = cx; x < std::min(cx + 16, cover.w); x++) {
+                            all++;
+                            set += (cover_bits[static_cast<std::size_t>(y) * cover.row_words +
+                                               x / 64] >>
+                                    (x % 64)) &
+                                   1;
+                        }
+                    }
+                    map += set == all ? '#' : set != 0 ? '+' : '.';
+                }
+                map += ' ';
+            }
+            sceClibPrintf("[mh4u] cover proof map (rows of x, y up): %s\n", map.c_str());
+            for (u32 i = 0; i < std::min<u32>(cover.draw_logged, cover.draw_log.size()); i++) {
+                const CoverDrawLog& d = cover.draw_log[i];
+                sceClibPrintf("[mh4u] cover proof:   %s %s draw %u of the layer, surface %08X, "
+                              "%s %02X, %u px covered before, %u uncovered by it, box %d,%d..%d,%d\n",
+                              d.kind == 'd'   ? "depth/stencil"
+                              : d.kind == 'p' ? "perspective"
+                              : d.kind == 'r' ? "rendered-surface"
+                              : d.kind == 'q' ? "2D-rendered-surface (kept)"
+                              : d.kind == 'm' ? "memory-content-surface (kept)"
+                                              : "target-read",
+                              d.software ? "software" : "gpu-path (whole picture)", d.index,
+                              d.addr, d.kind == 'd' ? "depth func|st<<4|dw<<5|dt<<6" : "unit",
+                              d.detail, d.covered_px, d.cleared_px, d.box[0], d.box[1], d.box[2],
+                              d.box[3]);
+                if (d.kind == 'r' || d.kind == 'q' || d.kind == 'm') {
+                    sceClibPrintf("[mh4u] cover proof:     surface type %u format %u %ux%u, %u "
+                                  "uploads, GPU-made content %s; last drawn into %d frames ago: "
+                                  "%u draws, %u depth-tested, %u lit, %u copies\n",
+                                  d.surf_type, d.surf_format, d.surf_w, d.surf_h, d.surf_uploads,
+                                  d.surf_gpu ? "yes" : "no", static_cast<int>(d.rt_age),
+                                  d.rt_draws, d.rt_depth, d.rt_lit, d.rt_copies);
+                }
+            }
+            const auto quad_line = [](const char* what, const CoverQuadLog& l) {
+                static constexpr const char* whys[] = {"opaque",     "no map",  "map stale",
+                                                       "misaligned", "past level 0",
+                                                       "tile unknown", "tile transparent"};
+                const char* why = l.why < 7      ? whys[l.why]
+                                  : l.why == 100 ? "texel window outside (wrap)"
+                                  : l.why == 101 ? "no surface bound"
+                                  : l.why == 102 ? "surface of another format"
+                                                 : "?";
+                // The refusing tile in texels of the texture: s (left to right) and m
+                // (memory rows, the PICA's t = height - 1 - m).
+                const u32 row_tiles = std::max<u32>(l.tex_w / 8, 1);
+                sceClibPrintf("[mh4u] cover proof:   %s quad (layer draw %u) x %d..%d y %d..%d "
+                              "tex %08X fmt %u %ux%u uv %.4f..%.4f, %.4f..%.4f texels s %u..%u "
+                              "m %u..%u%s: %s (texture tile %u = texels s %u.. m %u..; min alpha %u, %u of 64 texels below 255; %u of %u tiles "
+                              "transparent; blocks %u of %u covered)\n",
+                              what, l.quad.index, l.quad.x0, l.quad.x1, l.quad.y0, l.quad.y1,
+                              l.tex, l.format, l.tex_w, l.tex_h, l.quad.u0, l.quad.u1, l.quad.v0,
+                              l.quad.v1, l.quad.s0, l.quad.s1, l.quad.m0, l.quad.m1,
+                              l.quad.needs_texture ? "" : " (no texel check)", why, l.tile,
+                              (l.tile % row_tiles) * 8, (l.tile / row_tiles) * 8, l.tile_min_alpha,
+                              l.tile_low_texels, l.bad_tiles, l.tiles, l.quad.blocks_opaque,
+                              l.quad.blocks);
+            };
+            for (u32 i = 0; i < cover.accepted_logged; i++) {
+                quad_line("accepted", cover.accepted[i]);
+            }
+            for (u32 i = 0; i < cover.refused_logged; i++) {
+                quad_line("refused", cover.refused[i]);
+            }
+        }
+    }
+    cover_frame_tag = 0;
+    cover = CoverFrame{};
+    cover_pending.clear();
+    cover_draw = false;
+}
+
 bool RasterizerGxm::HudEnabled() const {
     static const bool killed = [] {
         if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nohudres", "rb")) {
@@ -6206,6 +7182,13 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
             }
         }
     }
+    // Cover proof: the frame ends at its top-screen transfer. Anything a transfer writes is a
+    // copy (of the picture, usually): world content when sampled.
+    if (CoverOn()) {
+        CoverNoteTarget(config.GetPhysicalOutputAddress(), false, false, true);
+    }
+    CoverFrameEnd(!config.is_texture_copy &&
+                  (config.output_width > 350 || config.output_height > 350));
     hud_phase = false;
     if (hud_state == HudState::Active) {
         if (HudTransfer(config)) {
@@ -6258,6 +7241,9 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
 bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     draw_epoch++;
     nondraw_epoch++;
+    if (CoverOn()) {
+        CoverNoteTarget(config.GetPhysicalOutputAddress(), false, false, true);
+    }
     DrawTrace("texture copy");
     const PhaseTimer timer{time_draws, times.transfers};
     if (hud_state != HudState::Idle &&
@@ -6429,6 +7415,9 @@ void RasterizerGxm::EndFrame() {
         Common::PipelineStats::hud_cut.fetch_add(1, std::memory_order_relaxed);
     }
     hud_phase = false;
+    if (cover.active) {
+        CoverFrameEnd(false); // a 2D layer cut short proves nothing
+    }
     FlushDeferredDraws();
     draw_epoch++;
     nondraw_epoch++;

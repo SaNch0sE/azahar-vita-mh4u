@@ -86,6 +86,10 @@ public:
         return false;
     }
 
+    /// The tag of the display transfer that follows (MH4U cover proof, Common::Mh4uCover):
+    /// the cover trap's count when the guest queued it. Render thread, just before the call.
+    virtual void SetFrameTag(u32) {}
+
     /// Attempt to use a faster method to perform a display transfer with is_texture_copy = 1
     virtual bool AccelerateTextureCopy(const Pica::DisplayTransferConfig&) {
         return false;

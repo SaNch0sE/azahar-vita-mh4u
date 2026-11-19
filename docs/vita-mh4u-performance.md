@@ -1238,3 +1238,8 @@ not instruction count, the strip read, filtering, the texcoord 2 input or the pa
 Left untested: the `minkeep_*` variants also change the colour the program writes (black) and the
 procedural-texture state the rasterizer syncs per draw (`SyncProcTexStrip`, unit 6, `table_dirty`
 blocking the repeat paths). Paused in favour of the menu world skip.
+
+**Menu world skip (2026-11-19, opt-in `covertrap`):** at the quest counter the main target drops
+from ~83 to 14.7 ms GPU per frame (diag `scenetime`), release 20-21 -> ~26 fps, screenshot
+identical. Layout walk 0.25-0.34 ms at the counter, 0.07-0.18 ms in the field. Details and
+remaining checks: `plans/vita-mh4u-menu-world-skip.md` section 7.

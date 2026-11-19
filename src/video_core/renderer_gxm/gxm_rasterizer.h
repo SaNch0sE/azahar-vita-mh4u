@@ -72,6 +72,9 @@ public:
     void WaitGpuIdle() override;
     void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
+    void SetFrameTag(u32 tag) override {
+        cover_frame_tag = tag;
+    }
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
 
@@ -685,6 +688,135 @@ private:
     u32 hud_area_acc = 0;       ///< guest pixels of 2D draws not yet counted (thousands)
     u32 hud_area_zero_acc = 0;  ///< the same, triangles with vertex alpha 0
     u32 hud_target = 0;
+
+    /// MH4U menu world skip, step 3 (docs/plans/vita-mh4u-menu-world-skip.md): the render
+    /// thread proves from the real 2D draws whether a frame's picture was entirely under
+    /// opaque sprites, and publishes the verdict with the frame's tag (Common::Mh4uCover).
+    struct CoverQuad {
+        s32 x0 = 0, x1 = 0, y0 = 0, y1 = 0; ///< pixels whose centres it covers (framebuffer)
+        bool needs_texture = false;  ///< its alpha depends on texture 0's texels
+        u32 s0 = 0, s1 = 0, m0 = 0, m1 = 0; ///< texels it can read (m: rows in memory order)
+        float u0 = 0, u1 = 0, v0 = 0, v1 = 0; ///< its texture coordinates over those pixels
+        u32 index = 0;               ///< its draw's place in the 2D layer
+        // The texture mapping, to judge parts of it (CoverTexelWindow).
+        bool affine = false;
+        float ua = 0, ux = 0, uy = 0, va = 0, vx = 0, vy = 0; ///< u = ua + ux X + uy Y
+        float tw = 0, th = 0;
+        u8 wrap_s = 0, wrap_t = 0;
+        bool bilinear = false, border_opaque = false;
+        s32 mip_pad = 0;
+        u32 blocks = 0, blocks_opaque = 0; ///< refused whole, judged in 8x8-px blocks
+    };
+    /// The texels the pixels [x0, x1] x [y0, y1] of `q` can read, into out's s/m (and its
+    /// u/v bounds); false when that cannot be known (a wrap to a border that is not opaque).
+    bool CoverTexelWindow(const CoverQuad& q, s32 x0, s32 x1, s32 y0, s32 y1,
+                          CoverQuad& out) const;
+    /// coverlog: a draw whose pixels depend on the world (or read the picture).
+    struct CoverDrawLog {
+        char kind;      ///< d depth/stencil, p perspective, r rendered surface, T the target
+        bool software;  ///< drawn by DrawTriangles (its pixels known), else the whole picture
+        u32 addr;       ///< the sampled surface
+        u32 index;      ///< its place among the 2D layer's draws
+        u32 covered_px; ///< covered pixels when it came
+        u32 cleared_px; ///< covered pixels it uncovered
+        s32 box[4];     ///< the pixels it could touch (software), else all
+        u32 detail;     ///< d: depth func | stencil enable << 4 | depth write << 5; r/T: unit
+        // r/q: what last drew the sampled surface (CoverTarget), and how many frames ago.
+        u32 rt_draws = 0, rt_depth = 0, rt_lit = 0, rt_copies = 0, rt_age = 0xFFFFFFFF;
+        // The sampled surface itself: cache type, format, size, uploads, GPU-made content.
+        u32 surf_type = 0, surf_format = 0, surf_w = 0, surf_h = 0, surf_uploads = 0;
+        bool surf_gpu = false;
+    };
+    /// What has drawn into a surface lately (any render target but the picture): a surface
+    /// drawn with depth tests or fragment lighting, or copied into, holds world content; one
+    /// drawn only by flat 2D draws (menu text pages, say) does not.
+    struct CoverTarget {
+        u32 addr = 0;
+        u32 frame = 0; ///< frame_index of the draws counted
+        u32 draws = 0, depth = 0, lit = 0, copies = 0;
+    };
+    std::array<CoverTarget, 64> cover_targets{};
+    CoverTarget* CoverTargetOf(u32 addr, bool create);
+    /// BeginDraw / transfers: note a draw (or a copy) into `addr`.
+    void CoverNoteTarget(u32 addr, bool depth, bool lit, bool copy);
+    /// coverlog: an opaque quad and what became of it.
+    struct CoverQuadLog {
+        CoverQuad quad;
+        u32 tex, format, tex_w, tex_h;
+        u32 why;  ///< VideoCore::OpacityWhy, or 100 + reason found here
+        u32 tile; ///< the tile that refused it
+        u32 bad_tiles = 0, tiles = 0; ///< transparent tiles in its window, of all
+        u32 tile_min_alpha = 255, tile_low_texels = 0; ///< in the refusing tile
+    };
+    struct CoverFrame {
+        bool active = false;      ///< the grade was seen: the 2D layer is being drawn
+        s32 x0 = 0, y0 = 0;       ///< the grade's viewport, framebuffer pixels
+        s32 w = 0, h = 0;
+        u32 row_words = 0;        ///< cover_bits words per row
+        u32 covered_px = 0;       ///< pixels under an opaque sprite (now)
+        u32 late3d = 0;           ///< world-dependent draws after the first cover
+        u32 world_draws = 0;      ///< depth draws into the target before the grade
+        u32 layer_draws = 0;      ///< draws of the 2D layer so far
+        u32 quads = 0;            ///< opaque quads that marked pixels (coverlog)
+        u32 quads_texture = 0;    ///< opaque quads refused for their texels (coverlog)
+        u32 opaque_draws = 0;     ///< draws whose state could cover (coverlog)
+        u32 maps_rebuilt = 0;     ///< opacity maps made again from guest memory (coverlog)
+        bool magenta_done = false;
+        Common::Rectangle<u32> fill_rect{}; ///< the grade's draw rectangle (covermagenta)
+        std::array<CoverDrawLog, 8> draw_log{};
+        u32 draw_logged = 0;
+        /// d, p, r, T, q (a 2D-rendered surface, kept), m (memory content, a texture really)
+        std::array<u32, 6> kind_counts{};
+        u32 first_quad_index = 0, last_quad_index = 0; ///< layer draws that covered pixels
+        std::array<CoverQuadLog, 8> refused{};
+        u32 refused_logged = 0;
+        std::array<CoverQuadLog, 4> accepted{};
+        u32 accepted_logged = 0;
+    };
+    CoverFrame cover;
+    /// One bit per pixel of the picture (row_words words a row): under an opaque sprite now.
+    std::vector<u64> cover_bits;
+    std::vector<CoverQuad> cover_pending; ///< the software draw's quads, marked once drawn
+    bool cover_draw = false;              ///< this software draw is in the proof's 2D layer
+    bool cover_draw_perspective = false;  ///< ...and its w varies (3D)
+    bool cover_draw_reads_target = false; ///< ...and a unit reads the target's memory
+    s32 cover_bbox[4] = {};               ///< ...and the pixels it can touch (x0, y0, x1, y1)
+    bool cover_in_sw = false;             ///< BeginDraw is called from DrawTriangles
+    char cover_sample_kind = 0;           ///< BeginDraw: 'r', 'T', 'q' or 0 (CoverDrawLog)
+    CoverTarget cover_sample_rt{};        ///< the producer record of the sampled surface
+    VideoCore::SurfaceId cover_sample_id{}; ///< the sampled surface (coverlog)
+    char cover_depth_kind = 0;            ///< BeginDraw: 'd' or 0
+    u32 cover_sample_addr = 0;
+    u32 cover_sample_unit = 0;
+    u32 cover_depth_detail = 0;
+    u32 cover_frame_tag = 0;              ///< SetFrameTag: the next display transfer's tag
+    [[nodiscard]] bool CoverOn() const;
+    /// Before a software draw (DrawTriangles): its opaque axis-aligned quads, kept until the
+    /// draw is issued.
+    void CoverScan();
+    /// The draw went out: its quads cover their pixels (texture opacity checked against the
+    /// bound surface); a world-dependent draw uncovers what it touched. `textures_changed`:
+    /// the texture-only repeat, whose units BeginDraw did not see.
+    void CoverCommit(bool textures_changed = false);
+    /// Which sampled surface makes the draw world-dependent ('r', 'T' or 0), from the bound
+    /// surfaces.
+    void CoverClassifySamples();
+    /// A world-dependent draw: uncover its pixels (whole picture when unknown) and log it.
+    void CoverWorldDraw(char kind, u32 addr, u32 detail, const s32* bbox);
+    /// BeginDraw: whether a depth or stencil test can reject pixels by the world's buffer.
+    void CoverClassifyDepth(bool using_depth_fb);
+    /// Sets (or clears) the pixels [x0, x1] x [y0, y1] (framebuffer, inclusive).
+    void CoverFill(s32 x0, s32 y0, s32 x1, s32 y1, bool set);
+    [[nodiscard]] bool CoverFull() const {
+        return cover.active && cover.covered_px == static_cast<u32>(cover.w * cover.h);
+    }
+    /// Lower and upper bound of the combiner's final alpha (0-255), given bounds for the
+    /// vertex alpha and texture 0's alpha.
+    [[nodiscard]] std::pair<int, int> CoverAlphaBounds(std::pair<int, int> primary,
+                                                       std::pair<int, int> tex0) const;
+    /// At a display transfer: publish the frame's proof and start over.
+    void CoverFrameEnd(bool top_transfer);
+
     u32 stat_alpha_only_feedback{};
     u32 stat_grade_double{};
 

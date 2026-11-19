@@ -59,6 +59,7 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     logging/types.h
     math_util.cpp
     math_util.h
+    mh4u_cover.h
     memory_detect.cpp
     named_thread.cpp
     named_thread.h
