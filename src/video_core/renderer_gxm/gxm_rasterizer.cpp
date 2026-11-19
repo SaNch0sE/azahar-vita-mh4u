@@ -3875,6 +3875,13 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
         hud_post_draw = post;
         if (post) {
             Common::PipelineStats::hud_post_draws.fetch_add(1, std::memory_order_relaxed);
+            const auto area = setup.helper->DrawRect();
+            hud_area_acc += area.GetWidth() * area.GetHeight();
+            if (hud_area_acc >= 1000) {
+                Common::PipelineStats::hud_post_area.fetch_add(hud_area_acc / 1000,
+                                                               std::memory_order_relaxed);
+                hud_area_acc %= 1000;
+            }
             if (using_depth_fb) {
                 Common::PipelineStats::hud_post_depth.fetch_add(1, std::memory_order_relaxed);
             }
@@ -3950,6 +3957,17 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                 }
             }
             hud_redirect_now = hud_state == HudState::Active && post;
+            // Diag: where the HUD scene's GPU time goes - drop one class of its draws.
+            if (hud_redirect_now) {
+                static const bool no_gs = GxmFlag("hudresnogs");
+                static const bool no_quads = GxmFlag("hudresnoquads");
+                const bool gs = regs.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes;
+                if ((no_gs && gs) || (no_quads && !gs)) {
+                    hud_redirect_now = false;
+                    stat_skipped++;
+                    return false;
+                }
+            }
             if (hud_state != state_before) {
                 for (u32 unit = 0; unit < 3; unit++) {
                     if (saved_valid[unit]) {
@@ -5826,8 +5844,11 @@ bool RasterizerGxm::HudBegin() {
     sceGxmTextureSetVAddrMode(&source, SCE_GXM_TEXTURE_ADDR_CLAMP);
     BindFragmentTexture(0, source);
     sceGxmSetVertexStream(context, 0, quad);
-    sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, identity_indices,
-               QuadVertices);
+    static const bool no_copy = GxmFlag("hudresnocopy"); // diag: price the copy
+    if (!no_copy) {
+        sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
+                   identity_indices, QuadVertices);
+    }
     guest.gpu_serial = runtime.CurrentEpoch();
     hud_pool[pick]->gpu_serial = runtime.CurrentEpoch();
     pipeline_cache->InvalidateBinding();

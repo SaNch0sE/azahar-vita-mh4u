@@ -82,14 +82,7 @@ Measurements and history are in `vita-mh4u-performance.md`.
   `psp2core-1795073616-...`, build 8333a4424.
 - **Software keyboard (chat, name entry) runs at ~20 fps.** Same as at character creation.
 
-- **Pause menu opens by itself after a load** (3 of ~20 scripted runs, 2026-11-18/19, with and
-  without `srcbottom`; once before the autoload, which then never ran). `citra_vita_main.cpp`
-  opens it on a resume system event when the wall clock jumped 2 s or more in the last 5 s - but a
-  boot or state-load stall is such a jump too, and vita-agent commands (which wake the console)
-  probably send the resume event. Fix: count a stop only when the process did not run (compare
-  wall time with process time), or ignore resumes right after our own long operations; log the
-  reason in release.
-
+- ~~Pause menu opens by itself after a load~~ (fixed 2026-11-19: 1 s window after the clock jump; verify in play).
 - Lit draws sent through the software vertex path (`nohwvs`, or the `litsw` experiment) hang
   the GPU at the first lit frame.
 - The cutscene's colour grade on the depth-of-field focus pixels is lost (feedback draws are

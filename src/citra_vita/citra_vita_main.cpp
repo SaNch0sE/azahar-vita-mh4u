@@ -628,7 +628,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         // A resume event alone is not proof of a suspend: one arrived mid-load with the app
         // never having left the screen (2026-11-14), and paused the game. It counts only when
         // the wall clock also jumped by two seconds or more between two of these checks (they
-        // run every 100 ms) - the process was stopped - within the last few seconds.
+        // run every 100 ms) - the process was stopped - within the last second.
         if (const SceUInt64 now = sceKernelGetProcessTimeWide(); now - last_event_us >= 100000) {
             last_event_us = now;
             SceRtcTick tick{};
@@ -641,7 +641,17 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             SceAppMgrSystemEvent event{};
             while (sceAppMgrReceiveSystemEvent(&event) == 0) {
                 if (event.systemEvent == SCE_APPMGR_SYSTEMEVENT_ON_RESUME) {
-                    const bool was_stopped = stopped_at_us != 0 && wall_us - stopped_at_us < 5000000;
+                    // A real return from the shell delivers its resume right after the jump; a
+                    // window of 5 s also caught our own stalls (a state load's ~12 s) followed
+                    // by an unrelated resume event a few seconds later (vita-agent waking the
+                    // console in scripted runs opened the menu over 1 in ~8 loads, 2026-11-19).
+                    const bool was_stopped = stopped_at_us != 0 && wall_us - stopped_at_us < 1000000;
+                    sceClibPrintf("[mh4u] resume event: %s (%u ms after a %s)\n",
+                                  was_stopped ? "pausing" : "ignored",
+                                  stopped_at_us != 0
+                                      ? static_cast<unsigned>((wall_us - stopped_at_us) / 1000)
+                                      : 0u,
+                                  stopped_at_us != 0 ? "2 s clock jump" : "run without jumps");
                     LOG_INFO(Frontend, "resume event ({})",
                              was_stopped ? "after a stop" : "ignored: no stop seen");
                     resumed |= was_stopped;
@@ -908,7 +918,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     namespace PS = Common::PipelineStats;
                     const auto take = [](auto& a) { return a.exchange(0, std::memory_order_relaxed); };
                     VitaFrontend::ReportPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u  "
-                                  "re l%u x%u t%u  bot d%u x%u  fx %u  hud2d p%u d%u s%u g%u c%u  hudres r%u f%u b%u\n",
+                                  "re l%u x%u t%u  bot d%u x%u  fx %u  hud2d p%u d%u s%u g%u c%u  hudres r%u f%u b%u a%uK\n",
                                   Common::ThreadCpuReport().c_str(),
                                   static_cast<unsigned>(take(PS::gxw_shade_us) / 1000),
                                   static_cast<unsigned>(take(PS::gxw_brake_us) / 1000),
@@ -936,7 +946,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                   static_cast<unsigned>(take(PS::hud_cut)),
                                   static_cast<unsigned>(take(PS::hudres_draws)),
                                   static_cast<unsigned>(take(PS::hudres_frames)),
-                                  static_cast<unsigned>(take(PS::hudres_resolves)));
+                                  static_cast<unsigned>(take(PS::hudres_resolves)),
+                                  static_cast<unsigned>(take(PS::hud_post_area)));
                     if (PS::stat_timing) {
                         // Render thread, ms this second: draw ops (all), their register
                         // replay, software-shaded draws (incl. the pre-shade feed), the feed

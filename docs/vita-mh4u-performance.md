@@ -1137,3 +1137,20 @@ waits on the render queue brake ~600-780 ms/s, the render thread's CPU drops):
 
 Next: where the GPU time goes in the 2D layer (diag `scenetime` on the HUD scene, per-draw fill:
 the big translucent panels of the menus), and whether the panels can stay cheaper.
+
+Fixed: frames flickering with stale pictures (the warning screen through the intro, other
+screens up to the village) with HUD resolution on - a buffer last shown as a HUD picture got a
+second display slot from the 8-bit copy path, and the present alternated between the two. Now
+one slot per guest buffer (`DisplaySlotFor`).
+
+Where the HUD scene's GPU time goes (diag `scenetime`, slot 7 quest counter, hudres=1): HUD scene
+~76 ms a frame for 88 draws (vertex ~2.5 ms); main target 22 ms (3D only) against ~44 ms with the
+option off, so the 2D layer costs ~22 ms at 1x already. Eliminations (diag `hudresnocopy`,
+`hudresnogs`, `hudresnoquads`): the upscale copy ~0.3 ms; without the geometry-shader draws the
+HUD scene is ~2.6 ms; there are no other draws. Every 2D draw of the menu is a GS sprite, and
+their fragment work is the cost (analysis: `plans/vita-mh4u-hud-cost.md`).
+
+The pause menu opening by itself after a load: the resume rule took any resume event within 5 s
+of a 2 s clock jump, and a state load's ~12 s stall followed by vita-agent waking the console a
+few seconds later matched it. The window is now 1 s (a real return from the shell delivers its
+resume event at the jump); release logs `[mh4u] resume event: pausing|ignored (N ms after ...)`.
