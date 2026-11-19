@@ -187,3 +187,12 @@ mask format) now stay on the software path. The tracking added in fix 1 cost Val
 fps; all render-thread proof work is now gated by `key_present` from the walk, and uncovering an
 empty bitset returns at once. Console, release: Val Habar 30 fps with `covertrap` (30 without);
 counter 26 fps armed (22 without), every proof covered, 0 mispredicts.
+
+User play test 2026-11-19 (07e424a64, `covertrap` only): Val Habar 30 fps (fine). Quest counter
+armed but only 22-23 fps (the user's counter pages have more 2D than slot 7; keeping every
+cover-eligible GS draw on the software path costs CPU); D-pad scrolling changes the key each press
+and the 4-proof arm keeps it disarmed (19-20 fps); blue box and item sets list never arm but pay the
+proof and software-GS cost (28-29 instead of 30). Net: +3 fps at the counter, -1..2 elsewhere.
+Paused, switch removed from the console; the 2D sprite cost is the bigger target. To resume: reroute
+GS draws to software only when the key's candidate area covers the screen, and only for few-point
+batches or proof frames; re-arm faster on scroll (fewer proofs when the previous key was proven).

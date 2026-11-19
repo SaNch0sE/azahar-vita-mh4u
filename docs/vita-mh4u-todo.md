@@ -75,8 +75,8 @@ Measurements and history are in `vita-mh4u-performance.md`.
 - **2D layer cost** (`plans/vita-mh4u-2d-layer.md`, experiments in the performance notes), in
   order: (1) skip the hidden 3D world under full-screen menus (`plans/vita-mh4u-menu-world-skip.md`):
   built 2026-11-19, opt-in `covertrap`; quest counter 20 -> ~26 fps, picture identical, 0
-  mispredicts; left: other menus (step 6), `covermagenta` run, save/reload with a menu open, then
-  default on; (2) opaque sprites drawn without blending (exact);
+  mispredicts; paused after the user test (+3 fps at the counter, -1..2 in non-covering menus; see the
+  plan's last section); (2) opaque sprites drawn without blending (exact);
   (3) fragment programs with 8-bit output so the patcher's blend code is cheaper for all 2D.
 - **Heavenfall mod fixes** (built locally 2026-11-19 from the web build's own options; the base
   build is byte-identical to the web build): (A) hidden panes also get scale 0, so the game stops
