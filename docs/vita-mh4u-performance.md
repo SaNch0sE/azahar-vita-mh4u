@@ -1204,3 +1204,20 @@ formats per 5 s are A4 4,199 (font), ETC1A4 4,091 (the panels), RGBA4 842, IA4 5
 ETC1 111; only ETC1 has no alpha, and the vertex alphas never read 1. The opaque panels rely on
 ETC1A4 texels being 255, which only a texel scan of each sprite's region could prove. The wider
 lever is making the blend itself cheaper for every 2D draw (8-bit program output).
+
+**Experiment A (blend price; plans/vita-mh4u-blend-cost.md):** HUD scene with the sprites
+dropped 2.6 ms; plus four full-screen quads blended SrcAlpha/OneMinusSrcAlpha after the copy
+(~2.1 M blended pixels of the blit program) 5.4 ms: **~1.3 ns per blended pixel**. Blending is
+cheap. The cost is shading MH4U's sprites themselves: ~28 ns a pixel for the real program, ~7.5 for
+the bare (vertex colour) one, against ~1.3 for the copy quad - not explained by program length
+(45 vs 19 instructions: no change), the dependent read, filtering or the parameter buffer. Left:
+the fragment inputs (colour + two coordinates, all f32, against one for the blit) and per-primitive
+cost of ~2,000 small triangles over 32x32 tiles.
+
+**Menu world skip, steps 1-2 (plans/vita-mh4u-menu-world-skip.md):** the cover trap (`svc 0xF1` at
+the `ldr r1,[r0]` before sLtRender::move; v1.0 0x00AF4E98, v1.1 0x00AF5510, EUR 0x00AF5560
+untested) patches at boot and, for a state without it, 120 guest frames after the load - no
+power-off on slots 7 and 1. Traps per second = fps. The layout key (`coverlog`): steady at the
+quest counter (76 candidates, 213% of a screen, `k0`), changing every frame in the field (the
+animated HUD: never arms). The walk costs 1.5 ms a frame at the counter and 0.8 ms in the field -
+too slow; until it is fast and the skip works, the trap is opt-in (switch file `covertrap`).

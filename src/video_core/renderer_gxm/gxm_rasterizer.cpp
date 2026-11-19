@@ -5915,6 +5915,25 @@ bool RasterizerGxm::HudBegin() {
         sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
                    identity_indices, QuadVertices);
     }
+    // Diag (experiment A, plans/vita-mh4u-blend-cost.md): the same quad 4 more times, blended
+    // SrcAlpha / OneMinusSrcAlpha - the picture stays (c*a + c*(1-a) = c) - to price ~2 M
+    // blended pixels of a cheap program: the blend tail itself, without translucent sprites.
+    static const bool blend_quads = GxmFlag("hudresblendquad");
+    if (blend_quads && !no_copy) {
+        PipelineInfo blended = info;
+        blended.blend.colorFunc = SCE_GXM_BLEND_FUNC_ADD;
+        blended.blend.alphaFunc = SCE_GXM_BLEND_FUNC_ADD;
+        blended.blend.colorSrc = SCE_GXM_BLEND_FACTOR_SRC_ALPHA;
+        blended.blend.colorDst = SCE_GXM_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blended.blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        blended.blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+        if (pipeline_cache->BindPipeline(blended)) {
+            for (int n = 0; n < 4; n++) {
+                sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
+                           identity_indices, QuadVertices);
+            }
+        }
+    }
     guest.gpu_serial = runtime.CurrentEpoch();
     hud_pool[pick]->gpu_serial = runtime.CurrentEpoch();
     pipeline_cache->InvalidateBinding();

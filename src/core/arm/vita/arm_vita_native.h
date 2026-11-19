@@ -202,6 +202,10 @@ private:
     u32 fmv_shift = 0; ///< patched copy's offset from the v1.1 addresses (v1.0: -0x698)
     void Mh4uPatchFmvPoll();
     bool Mh4uFmvPollSvc();
+    /// MH4U's cover trap (Mh4uHooks::CoverSvc in sMhMain::move): patched at boot, or 120 guest
+    /// frames after a state load whose code lacks it.
+    void Mh4uPatchCoverTrap();
+    bool Mh4uCoverTrapSvc();
 };
 
 } // namespace Core

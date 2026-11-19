@@ -4,10 +4,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <fmt/format.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/processmgr.h>
 
 #include "common/pipeline_stats.h"
 #include "common/settings.h"
@@ -39,6 +43,10 @@ struct Version {
     std::array<Filter, 11> filters;
     u32 unit = 0;   ///< sUnit* (the unit lines)
     u32 layout = 0; ///< sMhLayout*
+    // Cover trap (docs/plans/vita-mh4u-menu-world-skip.md): code addresses differ per version.
+    u32 trap = 0;        ///< `ldr r1,[r0]` before the call to sLtRender::move in sMhMain::move
+    u32 layout_draw = 0; ///< uLayout::draw, vtable slot +0x30 of the eight layout classes
+    u32 monnyan = 0;     ///< uLayoutMonnyan's vtable (its draw is its own)
 };
 
 // USA v1.1 (the update; MH4UltimateDC's "USA v1.3.0", title version 1072).
@@ -54,7 +62,7 @@ constexpr Version UsaV11{"USA v1.1", 0x010572CC, 0x010572F0, 0x0105729C,
                            {0x00E62F28, "colcorr"},
                            {0x00E5E970, "color"},
                            {0x00E5D474, "fade"}}},
-                         0x010572F8, 0x01057534};
+                         0x010572F8, 0x01057534, 0x00AF5510, 0x00B04774, 0x00E60E14};
 // USA v1.0 (the base game's program, as the web installer's mod brings): singletons 8 lower,
 // filter vtables 0x30 lower (bloom, dof, bokeh, radial, multi-blur and haze checked in our dump;
 // the last three by the same rule).
@@ -70,10 +78,11 @@ constexpr Version UsaV10{"USA v1.0", 0x010572C4, 0x010572E8, 0x01057294,
                            {0x00E62EF8, "colcorr"},
                            {0x00E5E940, "color"},
                            {0x00E5D444, "fade"}}},
-                         0x010572F0, 0x0105752C};
+                         0x010572F0, 0x0105752C, 0x00AF4E98, 0x00B040FC, 0x00E60DE4};
 // EUR v1.1: data (singletons, vtables) as USA v1.1; only code moved. Untested.
-constexpr Version EurV11{"EUR v1.1", UsaV11.lt_render, UsaV11.scene, UsaV11.camera,
-                         UsaV11.filters, UsaV11.unit, UsaV11.layout};
+constexpr Version EurV11{"EUR v1.1",     UsaV11.lt_render, UsaV11.scene,  UsaV11.camera,
+                         UsaV11.filters, UsaV11.unit,      UsaV11.layout, 0x00AF5560,
+                         0x00B047C4,     UsaV11.monnyan};
 
 constexpr u64 TitleUsa = 0x0004000000126300;
 constexpr u64 TitleEur = 0x0004000000126100;
@@ -108,8 +117,18 @@ struct State {
     u32 dither_cleared = 0;
     u32 dither_clears = 0, dither_window = 0;
     bool dither_gave_up = false;
+    // Cover key (OnTrap): the last gated key and when the last coverlog line was printed.
+    u64 cover_key = 0;
+    u64 cover_log_us = 0;
 };
 State g;
+
+// Cover counters, taken by the once-a-second line on the frontend's thread.
+std::atomic<u32> cov_traps{0};
+std::atomic<u32> cov_key_changes{0};
+std::atomic<u32> cov_walks{0};
+std::atomic<u32> cov_walk_us{0};
+std::atomic<u32> cov_walk_max_us{0};
 
 Memory::MemorySystem* g_memory = nullptr;
 
@@ -123,15 +142,30 @@ u8 Read8(u32 addr) {
     return Valid(addr) ? g_memory->Read8(addr) : 0;
 }
 
-const Version* Detect(u64 program_id) {
+/// The version by title id and the sLtRender vtable's move slot (it points into code, which
+/// moved between versions). Works for any process, before Tick has adopted it.
+const Version* DetectIn(const Kernel::Process& process, Memory::MemorySystem& memory) {
+    if (process.codeset == nullptr) {
+        return nullptr;
+    }
+    const auto read = [&](u32 addr) -> u32 {
+        if (!memory.IsValidVirtualAddress(process, addr) ||
+            !memory.IsValidVirtualAddress(process, addr + 3)) {
+            return 0;
+        }
+        u32 value = 0;
+        memory.ReadBlock(process, addr, &value, sizeof(value));
+        return value;
+    };
+    const u64 program_id = process.codeset->program_id;
     if (program_id == TitleUsa) {
-        if (Read32(0x00E6CAD8) == 0x00BFA670) {
+        if (read(0x00E6CAD8) == 0x00BFA670) {
             return &UsaV11;
         }
-        if (Read32(0x00E6CAA8) == 0x00BF9FF8) {
+        if (read(0x00E6CAA8) == 0x00BF9FF8) {
             return &UsaV10;
         }
-    } else if (program_id == TitleEur && Read32(0x00E6CAD8) == 0x00BFA6C0) {
+    } else if (program_id == TitleEur && read(0x00E6CAD8) == 0x00BFA6C0) {
         return &EurV11;
     }
     return nullptr;
@@ -273,40 +307,304 @@ void Dither(u32 lt_render) {
     }
 }
 
-/// Experiment (switch file `worldoff`, not restored): every unit but the layout manager stops
-/// drawing on the top screen (bit 16 of unit+0x04, mDrawView view 0) - under a full-screen
-/// menu the picture should not change, and the GPU time of the hidden world is what it saves.
-/// Unit lines: sUnit+0x14, 32 of 0x18 bytes, first unit at line+0x0C, next at unit+0x0C.
-void WorldOff() {
-    static const bool enabled = Switch("worldoff");
-    if (!enabled || g.version->unit == 0) {
+// ---------------------------------------------------------------------------------------------
+// Cover key (docs/plans/vita-mh4u-menu-world-skip.md, step 2). At the cover trap - every update
+// of the frame done, its render not built yet - walk the game's layouts and fold the large
+// opaque 2D panes into one number. A later step arms the world skip only while this key equals
+// the key of a frame the render thread proved covered; any change to a cover pane changes the
+// key before that frame is built. Read-only: nothing here writes guest memory.
+//
+// Objects (docs/plans/vita-mh4u-2d-layer.md, checked against the v1.1 disassembly):
+// - sUnit: [sUnit+0x614] lines (sUnit::draw's count), line i at sUnit+0x14+i*0x18, drawn only
+//   while bit 2 of line+0x08 is set; first unit at line+0x0C, next at unit+0x0C. A unit draws
+//   only in state 2 (unit+0x04 & 7) with bits 11 and 14 of unit+0x04 set.
+// - Layout unit: draw list at +0x120, groups linked through group+0x48.
+// - Group (0x50): +0x04 name, +0x08 first pane, +0x18 order, +0x24 texture array, +0x28 x/y/z,
+//   +0x3C RGBA, +0x40 revision (volatile), +0x44 flags (0x400 shown, 0x200 re-recorded this
+//   frame: volatile).
+// - Pane (0x24): +0x08 data, +0x10 kind (0 sprite, 1 null, 2 text, 3 boundary, 4 window),
+//   +0x14 next, +0x20 first child (nulls).
+// - Sprite (0x68): +0x00..+0x0B texture words, +0x10 x/y/z, +0x20 size, +0x28 scale, +0x30 uv,
+//   +0x40 four RGBA corners, +0x50 rotation, +0x58 bits 0-3 origin / bit 7 visible / bits 8+
+//   vertex slot (volatile). Windows are read with the same layout (medium confidence).
+// - Null (0x30): +0x00 x/y/z, +0x10 scale, +0x18 RGBA, +0x1C rotation, +0x24 bit 0 visible /
+//   bits 1+ matrix slot (volatile).
+
+constexpr u32 MaxUnitLines = 64;    // sUnit's line array ends at +0x614 = 0x14 + 64 * 0x18
+constexpr u32 MaxUnitsPerLine = 1024;
+constexpr u32 MaxGroupsPerUnit = 512;
+constexpr u32 MaxPanes = 16384;     // per walk: a runaway list cannot stall the frame
+constexpr u32 MaxPanesPerList = 2048;
+constexpr u32 MaxNullDepth = 12;
+constexpr float MinCandidateSide = 24.0f;
+constexpr u32 ScreenW = 400, ScreenH = 240;
+
+float AsFloat(u32 word) {
+    float f;
+    std::memcpy(&f, &word, sizeof(f));
+    return f;
+}
+
+u64 Mix(u64 h, u32 v) {
+    h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+    return h ^ (h >> 29);
+}
+
+/// Copies `size` (< one page) bytes of guest memory in one go; false, nothing read, unless both
+/// ends are mapped (so every page in between is).
+bool ReadGuest(u32 addr, void* out, u32 size) {
+    if (addr == 0 || (addr & 3) != 0 || addr + size < addr || !Valid(addr) ||
+        !Valid(addr + size - 1)) {
+        return false;
+    }
+    g_memory->ReadBlock(*g.process, addr, out, size);
+    return true;
+}
+
+std::string GuestString(u32 addr, u32 max) {
+    std::string out;
+    for (u32 i = 0; i < max && Valid(addr + i); i++) {
+        const char c = static_cast<char>(g_memory->Read8(addr + i));
+        if (c == 0) {
+            break;
+        }
+        out += (c >= 32 && c < 127) ? c : '?';
+    }
+    return out;
+}
+
+/// The position and scale a pane's own values are relative to (group, then nulls). Rotation is
+/// never carried: rotated nulls and sprites are not candidates.
+struct Xform {
+    float x, y, sx, sy;
+};
+
+/// One candidate group for the coverlog line, gathered during the walk, printed after it.
+struct GroupLog {
+    u32 group, name, order, flags, alpha;
+    u32 candidates, windows;
+    u32 area;
+    float big_w, big_h;
+    u32 big_area, big_tex0, big_tex1;
+};
+
+struct CoverWalk {
+    bool logging = false;
+    u32 panes = 0;
+    u64 key = 0xCBF29CE484222325ull;
+    u32 candidates = 0;
+    u64 area = 0; ///< clipped screen pixels of all candidates, overlaps counted each time
+    u32 units = 0, groups = 0;
+    std::array<GroupLog, 24> logs{};
+    u32 log_count = 0;
+    GroupLog* current = nullptr; ///< the group being walked, when logging
+};
+
+/// A visible sprite (or window) with four opaque corners, no rotation and a scaled size of at
+/// least 24x24: hash it and add its clipped area. The area model is simple - positions add,
+/// scales multiply, origin 0-8 as a 3x3 grid (row 0 top), screen point (200 - x, 120 - y) - and
+/// serves only as a plausibility gate.
+void Candidate(u32 data, u32 kind, const Xform& xf, u64 chain, CoverWalk& w) {
+    std::array<u32, 0x68 / 4> s;
+    if (!ReadGuest(data, s.data(), 0x68)) {
         return;
     }
-    const u32 units = Read32(g.version->unit);
-    const u32 layout = Read32(g.version->layout);
-    const u32 layout_unit = layout != 0 ? Read32(layout + 0x100) : 0;
-    if (units == 0) {
+    const u32 flags = s[0x58 / 4];
+    if ((flags & 0x80) == 0) {
         return;
     }
-    u32 cleared = 0, seen = 0;
-    for (u32 line = 0; line < 32; line++) {
-        u32 unit = Read32(units + 0x14 + line * 0x18 + 0x0C);
-        for (u32 n = 0; unit != 0 && n < 4096; n++, unit = Read32(unit + 0x0C)) {
-            seen++;
-            if (unit == layout_unit) {
-                continue;
-            }
-            const u32 flags = Read32(unit + 0x04);
-            if ((flags & (1u << 16)) != 0) {
-                g_memory->Write32(unit + 0x04, flags & ~(1u << 16));
-                cleared++;
-            }
+    for (u32 c = 0x40; c < 0x50; c += 4) {
+        if ((s[c / 4] >> 24) != 0xFF) {
+            return;
         }
     }
-    static u32 logged = 0;
-    if (cleared != 0 && logged++ < 20) {
-        sceClibPrintf("[mh4u] worldoff: %u of %u units cleared (layout unit %08X)\n", cleared,
-                      seen, layout_unit);
+    if (AsFloat(s[0x50 / 4]) != 0.0f) {
+        return; // rotated (or NaN)
+    }
+    const float width = std::fabs(AsFloat(s[0x20 / 4]) * AsFloat(s[0x28 / 4]) * xf.sx);
+    const float height = std::fabs(AsFloat(s[0x24 / 4]) * AsFloat(s[0x2C / 4]) * xf.sy);
+    if (!(width >= MinCandidateSide && height >= MinCandidateSide && width < 1e5f &&
+          height < 1e5f)) {
+        return; // too small, or not a number
+    }
+    const float px = xf.x + xf.sx * AsFloat(s[0x10 / 4]);
+    const float py = xf.y + xf.sy * AsFloat(s[0x14 / 4]);
+    if (!(std::fabs(px) < 1e5f && std::fabs(py) < 1e5f)) {
+        return;
+    }
+
+    // Key: the sprite's words up to its flags, the flags without the vertex slot, its kind and
+    // the words of the group and nulls above it.
+    u64 h = w.key;
+    for (u32 i = 0; i < 0x58 / 4; i++) {
+        h = Mix(h, s[i]);
+    }
+    h = Mix(h, flags & 0xFF);
+    h = Mix(h, kind);
+    w.key = Mix(h, static_cast<u32>(chain) ^ static_cast<u32>(chain >> 32));
+    w.candidates++;
+
+    const u32 origin = flags & 0xF;
+    const u32 col = origin < 9 ? origin % 3 : 1;
+    const u32 row = origin < 9 ? origin / 3 : 1;
+    const float x0 = px - width * 0.5f * static_cast<float>(col);
+    const float y0 = py - height * 0.5f * static_cast<float>(2 - row);
+    // Game (x0..x0+w, y0..y0+h) -> screen (200 - x, 120 - y): both axes flip, extents keep.
+    const float l = std::max(0.0f, 200.0f - (x0 + width));
+    const float r = std::min(static_cast<float>(ScreenW), 200.0f - x0);
+    const float t = std::max(0.0f, 120.0f - (y0 + height));
+    const float b = std::min(static_cast<float>(ScreenH), 120.0f - y0);
+    const u32 area = (r > l && b > t) ? static_cast<u32>((r - l) * (b - t)) : 0;
+    w.area += area;
+
+    if (GroupLog* gl = w.current) {
+        gl->candidates++;
+        gl->windows += kind == 4 ? 1 : 0;
+        gl->area += area;
+        if (gl->candidates == 1 || area > gl->big_area) {
+            gl->big_area = area;
+            gl->big_w = width;
+            gl->big_h = height;
+            gl->big_tex0 = s[0];
+            gl->big_tex1 = s[1];
+        }
+    }
+}
+
+void WalkPanes(u32 pane, const Xform& xf, u64 chain, u32 depth, CoverWalk& w) {
+    for (u32 n = 0; pane != 0 && n < MaxPanesPerList; n++) {
+        if (++w.panes > MaxPanes) {
+            return;
+        }
+        std::array<u32, 0x24 / 4> p;
+        if (!ReadGuest(pane, p.data(), 0x24)) {
+            return;
+        }
+        const u32 kind = p[0x10 / 4] & 0xFF;
+        const u32 data = p[0x08 / 4];
+        const u32 child = p[0x20 / 4];
+        if (kind == 0 || kind == 4) {
+            Candidate(data, kind, xf, chain, w);
+        } else if (kind == 1 && child != 0 && depth < MaxNullDepth) {
+            // A null: its subtree counts only while the null is visible, opaque and unrotated.
+            std::array<u32, 0x28 / 4> nl;
+            if (ReadGuest(data, nl.data(), 0x28) && (nl[0x24 / 4] & 1) != 0 &&
+                (nl[0x18 / 4] >> 24) == 0xFF && AsFloat(nl[0x1C / 4]) == 0.0f) {
+                const Xform inner{xf.x + xf.sx * AsFloat(nl[0]), xf.y + xf.sy * AsFloat(nl[1]),
+                                  xf.sx * AsFloat(nl[0x10 / 4]), xf.sy * AsFloat(nl[0x14 / 4])};
+                u64 c = chain;
+                for (u32 i = 0; i < 0x24 / 4; i++) {
+                    c = Mix(c, nl[i]);
+                }
+                c = Mix(c, nl[0x24 / 4] & 1); // the matrix slot above bit 0 is volatile
+                WalkPanes(child, inner, c, depth + 1, w);
+            }
+        }
+        // Text (2) and boundaries (3) are never candidates: text is many small glyphs and
+        // changes for reasons that do not move a cover.
+        pane = p[0x14 / 4];
+    }
+}
+
+void WalkLayout(u32 unit, u32 unit_flags, CoverWalk& w) {
+    u32 group = Read32(unit + 0x120);
+    for (u32 n = 0; group != 0 && n < MaxGroupsPerUnit && w.panes <= MaxPanes; n++) {
+        std::array<u32, 0x50 / 4> gw;
+        if (!ReadGuest(group, gw.data(), 0x50)) {
+            return;
+        }
+        const u32 flags = gw[0x44 / 4];
+        const u32 next = gw[0x48 / 4];
+        // Shown groups of any view (the mod picks the view at draw time), at full alpha.
+        if ((flags & 0x400) != 0 && (gw[0x3C / 4] >> 24) == 0xFF) {
+            w.groups++;
+            u64 chain = Mix(0x84222325u, unit_flags);
+            chain = Mix(chain, gw[0x18 / 4]);  // order
+            chain = Mix(chain, gw[0x24 / 4]);  // texture array
+            chain = Mix(chain, gw[0x28 / 4]);  // x, y, z
+            chain = Mix(chain, gw[0x2C / 4]);
+            chain = Mix(chain, gw[0x30 / 4]);
+            chain = Mix(chain, gw[0x3C / 4]);  // colour
+            chain = Mix(chain, flags & ~0x200u); // 0x200: re-recorded this frame
+            GroupLog* gl = nullptr;
+            if (w.logging && w.log_count < w.logs.size()) {
+                gl = &w.logs[w.log_count];
+                *gl = GroupLog{group, gw[0x04 / 4], gw[0x18 / 4], flags, gw[0x3C / 4] >> 24};
+            }
+            w.current = gl;
+            const u32 before = w.candidates;
+            WalkPanes(gw[0x08 / 4], Xform{AsFloat(gw[0x28 / 4]), AsFloat(gw[0x2C / 4]), 1, 1},
+                      chain, 0, w);
+            w.current = nullptr;
+            if (gl != nullptr && w.candidates != before) {
+                w.log_count++;
+            }
+        }
+        group = next;
+    }
+}
+
+void CoverKey() {
+    static const bool log_enabled = Switch("coverlog");
+    const SceUInt64 start = sceKernelGetProcessTimeWide();
+    CoverWalk w;
+    w.logging = log_enabled && start - g.cover_log_us >= 1'000'000;
+
+    const u32 units = Read32(g.version->unit);
+    const u32 lines = std::min<u32>(units != 0 ? Read32(units + 0x614) : 0, MaxUnitLines);
+    for (u32 i = 0; i < lines && w.panes <= MaxPanes; i++) {
+        const u32 line = units + 0x14 + i * 0x18;
+        if ((Read32(line + 0x08) & 4) == 0) {
+            continue; // sUnit::draw skips the line
+        }
+        u32 unit = Read32(line + 0x0C);
+        for (u32 n = 0; unit != 0 && n < MaxUnitsPerLine; n++) {
+            const u32 vtable = Read32(unit);
+            const u32 flags = Read32(unit + 0x04);
+            const bool layout =
+                vtable != 0 && (vtable == g.version->monnyan ||
+                                Read32(vtable + 0x30) == g.version->layout_draw);
+            if (layout && (flags & 7) == 2 && (flags & 0x4800) == 0x4800) {
+                w.units++;
+                WalkLayout(unit, flags, w);
+            }
+            unit = Read32(unit + 0x0C);
+        }
+    }
+
+    const u64 raw = w.candidates != 0 ? (w.key != 0 ? w.key : 1) : 0;
+    // Plausibility: the candidates must at least add up to one screen.
+    const bool plausible = w.area >= u64{ScreenW} * ScreenH;
+    const u64 key = plausible ? raw : 0;
+    if (key != g.cover_key) {
+        g.cover_key = key;
+        cov_key_changes.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const u32 us = static_cast<u32>(sceKernelGetProcessTimeWide() - start);
+    cov_walks.fetch_add(1, std::memory_order_relaxed);
+    cov_walk_us.fetch_add(us, std::memory_order_relaxed);
+    u32 max = cov_walk_max_us.load(std::memory_order_relaxed);
+    while (us > max && !cov_walk_max_us.compare_exchange_weak(max, us)) {
+    }
+
+    if (!w.logging) {
+        return;
+    }
+    g.cover_log_us = start;
+    sceClibPrintf("[mh4u] cover: key %016llX%s cand %u area %llu (%llu%% of a screen) units %u "
+                  "groups %u panes %u%s walk %u us\n",
+                  static_cast<unsigned long long>(raw), plausible ? "" : " (gated: too small)",
+                  w.candidates, static_cast<unsigned long long>(w.area),
+                  static_cast<unsigned long long>(w.area * 100 / (ScreenW * ScreenH)), w.units,
+                  w.groups, w.panes, w.panes > MaxPanes ? " (budget hit)" : "", us);
+    for (u32 i = 0; i < w.log_count; i++) {
+        const GroupLog& gl = w.logs[i];
+        sceClibPrintf("[mh4u] cover:   %-24s order %08X flags %08X a%u: %u cand (%u win) %u px, "
+                      "largest %dx%d %u px tex %08X %08X\n",
+                      GuestString(gl.name, 32).c_str(), gl.order, gl.flags, gl.alpha,
+                      gl.candidates, gl.windows, gl.area, static_cast<int>(gl.big_w),
+                      static_cast<int>(gl.big_h), gl.big_area, gl.big_tex0, gl.big_tex1);
     }
 }
 
@@ -363,7 +661,7 @@ void Tick(Core::System& system) {
         return;
     }
     if (g.version == nullptr) {
-        g.version = Detect(process->codeset->program_id);
+        g.version = DetectIn(*process, system.Memory());
         if (g.version == nullptr) {
             if (!g.unknown_logged) {
                 g.unknown_logged = true;
@@ -383,7 +681,40 @@ void Tick(Core::System& system) {
     LogFilters();
     BottomPass(lt_render);
     Dither(lt_render);
-    WorldOff();
+}
+
+CoverSite FindCoverSite(const Kernel::Process& process, Memory::MemorySystem& memory) {
+    const Version* version = DetectIn(process, memory);
+    return version != nullptr ? CoverSite{version->trap, version->name} : CoverSite{};
+}
+
+bool IsCoverSite(u32 addr) {
+    return addr == UsaV11.trap || addr == UsaV10.trap || addr == EurV11.trap;
+}
+
+void OnTrap(Core::System& system) {
+    cov_traps.fetch_add(1, std::memory_order_relaxed);
+    static const bool off = Switch("nohooks");
+    if (off || g.version == nullptr || g.process == nullptr || g_memory == nullptr) {
+        return;
+    }
+    // Tick adopts a new process (boot, state load) and detects its version a second later;
+    // until then the walk has no addresses to trust.
+    if (system.Kernel().GetCurrentProcess().get() != g.process) {
+        return;
+    }
+    CoverKey();
+}
+
+CoverStats TakeCoverStats() {
+    CoverStats out;
+    out.traps = cov_traps.exchange(0, std::memory_order_relaxed);
+    out.key_changes = cov_key_changes.exchange(0, std::memory_order_relaxed);
+    const u32 walks = cov_walks.exchange(0, std::memory_order_relaxed);
+    const u32 us = cov_walk_us.exchange(0, std::memory_order_relaxed);
+    out.walk_avg_us = walks != 0 ? us / walks : 0;
+    out.walk_max_us = cov_walk_max_us.exchange(0, std::memory_order_relaxed);
+    return out;
 }
 
 void BeforeSave(Core::System& system) {

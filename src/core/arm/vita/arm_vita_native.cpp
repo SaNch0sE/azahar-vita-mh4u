@@ -12,6 +12,7 @@
 #include "core/arm/vita/mh4u_vector_hle.h"
 #include "core/arm/vita/mh4u_hooks.h"
 #include "common/emu_prof.h"
+#include "common/pipeline_stats.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <utility>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
@@ -91,6 +93,25 @@ constexpr u32 Mh4uFmvLoopReturn = 0x0096417C;
 /// The same code in the game without its update (v1.0, which the Heavenfall web installer's mod
 /// is built from): 0x698 bytes lower. Each candidate is checked word by word before patching.
 constexpr std::array<u32, 2> Mh4uFmvShifts{0u, 0u - 0x698u};
+
+/// The cover trap's patch state, shared by both emulated cores (one guest process).
+struct CoverTrapPatch {
+    const void* process = nullptr; ///< the process last checked
+    bool seen_any = false;         ///< a process was checked before: a later one is a state load
+    u32 site = 0;                  ///< waiting to patch this address (0: nothing to do)
+    const char* version = nullptr;
+    u64 wait_from = 0; ///< guest_frames_total when the wait began
+};
+CoverTrapPatch cover_trap;
+
+/// The cover trap's lines, in release builds too (they start no logging backend).
+template <typename... Args>
+void CoverLog(fmt::format_string<Args...> format, Args&&... args) {
+    sceClibPrintf("[mh4u] cover trap %s\n",
+                  fmt::format(format, std::forward<Args>(args)...).c_str());
+}
+/// Guest frames to wait before patching a state's code (see Mh4uPatchCoverTrap).
+constexpr u64 CoverTrapWaitFrames = 120;
 
 } // Anonymous namespace
 
@@ -397,6 +418,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     }
 
     Mh4uPatchFmvPoll();
+    Mh4uPatchCoverTrap();
     Mh4uHooks::Tick(system);
     // A command list finished on the GX thread since the last slice: post its interrupts now.
     system.GPU().GxPoll();
@@ -573,7 +595,11 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                 }
             }
         }
-        if (run.svc_number != Mh4uFmvSvc || !Mh4uFmvPollSvc()) {
+        // The two private traps patched into MH4U; each handler declines (and the HLE gets the
+        // call) unless the trap is at its own site.
+        const bool handled = (run.svc_number == Mh4uFmvSvc && Mh4uFmvPollSvc()) ||
+                             (run.svc_number == Mh4uHooks::CoverSvc && Mh4uCoverTrapSvc());
+        if (!handled) {
             svc_context.CallSVC(run.svc_number);
         }
         const SceUInt64 svc_end = sceKernelGetProcessTimeWide();
@@ -743,6 +769,121 @@ bool ARM_VitaNative::Mh4uFmvPollSvc() {
     context.r[0] = sleep_ns;
     context.r[1] = 0;
     svc_context.CallSVC(0x0A); // svcSleepThread
+    return true;
+}
+
+// MH4U's cover trap (docs/plans/vita-mh4u-menu-world-skip.md): the `ldr r1,[r0]` in
+// sMhMain::move just before the call to sLtRender::move becomes `svc Mh4uHooks::CoverSvc`. All
+// of the frame's updates are done there and its render is built synchronously inside the call,
+// so it is the one point where the game's layouts can be read for the frame about to be drawn.
+// The handler emulates the load and hands over to Mh4uHooks::OnTrap. Kill switch `nocovertrap`
+// (file or flag): never patch (a state that carries the patch is still served).
+void ARM_VitaNative::Mh4uPatchCoverTrap() {
+    const auto process = system.Kernel().GetCurrentProcess();
+    if (!process) {
+        return;
+    }
+    const u64 frames = Common::PipelineStats::guest_frames_total.load(std::memory_order_relaxed);
+    if (process.get() != cover_trap.process) {
+        const bool state_load = cover_trap.seen_any;
+        cover_trap = CoverTrapPatch{process.get(), true};
+        // Opt-in while the menu world skip is being built (switch file `covertrap`): the trap
+        // and its layout walk (~0.8-1.5 ms a frame) give nothing yet. `nocovertrap` still wins.
+        static const bool off =
+            Mh4uHooks::Switch("nocovertrap") || !Mh4uHooks::Switch("covertrap");
+        if (process->codeset == nullptr) {
+            return;
+        }
+        const Mh4uHooks::CoverSite site = Mh4uHooks::FindCoverSite(*process, memory);
+        if (site.addr == 0) {
+            return; // not MH4U, or a version we do not know (the hooks log says which)
+        }
+        // The code around the site: the vtable call before (whose last word is the Heavenfall
+        // mod's hook `bl`, or the original `ldr r0,[r4,#0x290]`), and the call to
+        // sLtRender::move itself.
+        static constexpr std::array<u32, 8> expected{0xE5901000, 0xE591101C, 0xE12FFF31,
+                                                     0xE5940290, 0xE5901000, 0xE591101C,
+                                                     0xE12FFF31, 0xE59402B8};
+        const u32 base = site.addr - 0x10;
+        bool match = true;
+        bool patched = false;
+        std::string seen;
+        for (u32 i = 0; i < expected.size(); i++) {
+            const u32 addr = base + i * 4;
+            if (!memory.IsValidVirtualAddress(*process, addr)) {
+                match = false;
+                seen += fmt::format(" {:08X}=unmapped", addr);
+                continue;
+            }
+            const u32 have = memory.Read32(addr);
+            seen += fmt::format(" {:08X}={:08X}", addr, have);
+            bool ok = have == expected[i];
+            if (addr == site.addr - 4) {
+                ok = ok || (have & 0xFF000000u) == 0xEB000000u; // any `bl`
+            }
+            if (addr == site.addr && have == Mh4uHooks::CoverSvcWord) {
+                ok = patched = true; // a save state carries the code as it was saved
+            }
+            match = match && ok;
+        }
+        if (!match) {
+            CoverLog("({}): code differs, not patched (read:{})", site.version, seen);
+            return;
+        }
+        if (patched) {
+            // Never rewritten: writing code and syncing its page right after a state load
+            // powered the console off once (the movie poll, 2026-11-18).
+            CoverLog("({}) at {:08X}: already patched (save state)", site.version, site.addr);
+            return;
+        }
+        if (off) {
+            CoverLog("({}): not enabled (covertrap) or nocovertrap, not patched", site.version);
+            return;
+        }
+        cover_trap.site = site.addr;
+        cover_trap.version = site.version;
+        cover_trap.wait_from = frames;
+        if (state_load) {
+            // A state made by a build without the trap: let the loaded game run for a while
+            // before its code is rewritten (see above), then patch from this prologue.
+            CoverLog("({}) at {:08X}: state without it, patching in {} guest frames",
+                     site.version, site.addr, CoverTrapWaitFrames);
+            return;
+        }
+        // Boot: patch now, as the movie poll does.
+    } else if (cover_trap.site == 0 || frames - cover_trap.wait_from < CoverTrapWaitFrames) {
+        return;
+    }
+    const u32 site = std::exchange(cover_trap.site, 0);
+    // Checked again: nothing may have touched it in the meantime, but a word that is no longer
+    // the original load is left alone.
+    if (!memory.IsValidVirtualAddress(*process, site)) {
+        return;
+    }
+    const u32 have = memory.Read32(site);
+    if (have != 0xE5901000) {
+        CoverLog("({}) at {:08X}: word changed to {:08X}, not patched", cover_trap.version,
+                 site, have);
+        return;
+    }
+    memory.Write32(site, Mh4uHooks::CoverSvcWord);
+    map->SyncCode(site & ~0xFFFu, 0x1000);
+    CoverLog("({}) at {:08X}: patched", cover_trap.version, site);
+}
+
+bool ARM_VitaNative::Mh4uCoverTrapSvc() {
+    // r15 is past the svc. Served at a known site holding our word, whatever the kill switch or
+    // the patch state: a save state may carry the patched code into a session that never
+    // patched it.
+    const u32 site = context.r[15] - 4;
+    constexpr u32 ThumbBit = 1u << 5;
+    if ((context.cpsr & ThumbBit) != 0 || !Mh4uHooks::IsCoverSite(site) ||
+        memory.Read32(site) != Mh4uHooks::CoverSvcWord) {
+        return false;
+    }
+    // The replaced instruction, `ldr r1,[r0]` (sLtRender's vtable); execution goes on after it.
+    context.r[1] = memory.Read32(context.r[0]);
+    Mh4uHooks::OnTrap(system);
     return true;
 }
 
