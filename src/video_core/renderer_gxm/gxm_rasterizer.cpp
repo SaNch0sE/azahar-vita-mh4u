@@ -265,6 +265,8 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::TevStage0);
         } else if (GxmFlag("dbgout_const1")) {
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Alpha);
+        } else if (GxmFlag("dbgout_shadow")) {
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::View);
         } else if (GxmFlag("dbgout_uv0")) {
             // Shadow-map receivers' lookup coordinates (s, t, w) as colour.
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texcoord0);
@@ -4504,6 +4506,81 @@ void RasterizerGxm::DrawTriangles() {
     // Opaque 2D sprites: whether this draw may go unblended (the texture half once its
     // surface is known).
     Op2dScan();
+    // logshadowcoords (diag, with dbgshadowsw dbgshadowrecvsw so both sides are software
+    // draws): per draw, the shadow pass's vertex positions (x/w, y/w, z/w) and the receivers'
+    // map coordinates (s, t, w), min..max, with the vertex count - the hunter drawn into the
+    // map and drawn as a receiver are the same mesh, so their ranges must line up.
+    static const bool log_shadow_coords = GxmFlag("logshadowcoords");
+    if (log_shadow_coords && vertex_ring.base != nullptr) {
+        const auto& r = pica.regs.internal;
+        const bool caster = r.framebuffer.framebuffer.GetColorBufferPhysicalAddress() == 0x18154F00;
+        const bool receiver = r.texturing.main_config.texture0_enable &&
+                              r.texturing.texture0.type.Value() ==
+                                  Pica::TexturingRegs::TextureConfig::Shadow2D;
+        static u64 window = 0;
+        static u32 lines = 0;
+        const u64 now = Common::PipelineStats::NowUs();
+        if (now - window > 2000000) {
+            window = now;
+            lines = 0;
+        }
+        if ((caster || receiver) && lines < 24) {
+            float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+            u32 count = 0;
+            for (const auto& range : pending_ring_ranges) {
+                const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+                    vertex_ring.base +
+                    static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+                for (u32 i = 0; i < range.count; i++) {
+                    float c[3];
+                    if (caster) {
+                        const float w = v[i].pos.w.ToFloat32();
+                        const float iw = w != 0.0f ? 1.0f / w : 0.0f;
+                        c[0] = v[i].pos.x.ToFloat32() * iw;
+                        c[1] = v[i].pos.y.ToFloat32() * iw;
+                        c[2] = v[i].pos.z.ToFloat32() * iw;
+                    } else {
+                        c[0] = v[i].tc0.x.ToFloat32();
+                        c[1] = v[i].tc0.y.ToFloat32();
+                        c[2] = v[i].tc0_w.ToFloat32();
+                    }
+                    for (int k = 0; k < 3; k++) {
+                        lo[k] = std::min(lo[k], c[k]);
+                        hi[k] = std::max(hi[k], c[k]);
+                    }
+                    count++;
+                }
+            }
+            // Receiver vertices inside the casters' area of the map (s 0.30..0.50, t 0.70..0.95):
+            // their compare depth w against the casters' 0.89..0.93.
+            if (receiver) {
+                u32 shown = 0;
+                for (const auto& range : pending_ring_ranges) {
+                    const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+                        vertex_ring.base +
+                        static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+                    for (u32 i = 0; i < range.count && shown < 4; i++) {
+                        const float ss = v[i].tc0.x.ToFloat32(), tt = v[i].tc0.y.ToFloat32();
+                        if (ss > 0.30f && ss < 0.50f && tt > 0.70f && tt < 0.95f) {
+                            shown++;
+                            sceClibPrintf("[mh4u] shcoord   in-area vertex s %.3f t %.3f w %.4f\n", ss,
+                                          tt, v[i].tc0_w.ToFloat32());
+                        }
+                    }
+                }
+            }
+            if (count > 0) {
+                lines++;
+                sceClibPrintf("[mh4u] shcoord %s n%u: %s %.3f..%.3f  %s %.3f..%.3f  %s %.3f..%.3f "
+                              "(target %08X)\n",
+                              caster ? "CASTER" : "recv  ", static_cast<unsigned>(count),
+                              caster ? "x/w" : "s", lo[0], hi[0], caster ? "y/w" : "t", lo[1],
+                              hi[1], caster ? "z/w" : "w", lo[2], hi[2],
+                              static_cast<unsigned>(
+                                  r.framebuffer.framebuffer.GetColorBufferPhysicalAddress()));
+            }
+        }
+    }
     // valphalog (diag): what the 2D layer's vertex alphas are, as a histogram, every 5 s.
     static const bool valpha_log = GxmFlag("valphalog");
     if (valpha_log && hud_post_draw && hud_phase && vertex_ring.base != nullptr) {

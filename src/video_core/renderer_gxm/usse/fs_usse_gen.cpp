@@ -1119,6 +1119,12 @@ void FragmentEmitter::ShadowCompare() {
     }
     const Src bias = SaScalar(sa_shadow_bias);
     e.Vec(VecOp::Add, {I0, 0x1}, {bias.reg, bias.swz, Mod::Neg}, {I0, XXXX}, Pred::None, true);
+    // dbgout_shadow (diag, the View debug output): park (map depth, reference) for the output.
+    if (Pica::Shader::Generator::Cg::GetDebugOutput() ==
+        Pica::Shader::Generator::Cg::DebugOutput::View) {
+        e.MoveInternal({Reg::V(TmpProj), 0x1}, {I2, XXXX}, Pred::None, true);
+        e.MoveInternal({Reg::V(TmpProj), 0x2}, {I0, XXXX}, Pred::None, true);
+    }
     // map depth - reference > 0: lit.
     e.Vec(VecOp::Add, {I2, 0x1}, {I0, XXXX, Mod::Neg}, {I2, XXXX}, Pred::None, true);
     e.Test(Cond::Gt, 2, {I2}, 0, ConstZero, true);
@@ -3272,6 +3278,14 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
         }
         break;
     }
+    case DebugOutput::View:
+        // dbgout_shadow: shadow-map receivers as (map depth, reference depth, 0, 1).
+        if (shadow_compare) {
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput), 0x3}, {Reg::V(TmpProj), XYZW}, ConstZero);
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x1}, ConstZero, ConstZero);
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x2}, ConstOne, ConstZero);
+        }
+        break;
     case DebugOutput::Texcoord0:
         // dbgout_uv0: on shadow-map receivers only, texture coordinate 0 (the shadow map's
         // lookup) as (s, t, w, 1); every other program keeps its normal output.

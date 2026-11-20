@@ -182,3 +182,13 @@ by default (46f60cf2d). Established on the console:
   path (`dbgshadowrecvsw`) for the ground draws around the hunter, and the casters' projected
   positions in the map from the shadow pass, then compare; check the shadow pass's viewport and
   the 3DS framebuffer orientation conventions for a 256x256 target.
+- **Numbers (logshadowcoords, software paths at slot 8):** casters land at x/w -0.29..-0.09,
+  y/w 0.51..0.77, z/w -0.93..-0.89 -> map s 0.36..0.45, t 0.76..0.89 (matches the dumped
+  silhouette); ground receivers span s -2.7..2.6, t -0.7..4.2, w 0.67..1.28; ground vertices
+  inside the silhouette's area have w 0.918..0.922 -> reference ~0.904 (bias 0x02067B ~ 0.016),
+  while the map stores the hunter at 0.894..0.93: the comparison **should** shadow there. So the
+  remaining suspects are the decode of the sampled texel (channel order / swizzle of the
+  render-target texture as sampled, filtering) or the coordinate convention of the lookup.
+  Swap/flip/no-border variants tried by the user in-game: all wrong. Next: `dbgout_shadow` (new:
+  receivers painted (map depth, reference)) - captured once at slot 8 (o_shv) but not yet read;
+  a dimmer-red hunter shape on the ground = the lookup works, uniform red = decode/sampling bug.
