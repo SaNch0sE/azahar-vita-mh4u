@@ -318,6 +318,15 @@ void Ui::BuildSettings() {
                GxmRenderer::SaveVideoOptions();
            });
     settings.back().restart = GxmRenderer::FilterLocked();
+    toggle("Character shadows",
+           "The real-time shadows of hunters, Palicoes and monsters on the ground, as on the 3DS "
+           "(applies on the next launch).",
+           true, [] { return GxmRenderer::Video().shadows; },
+           [](bool value) {
+               GxmRenderer::Video().shadows = value;
+               GxmRenderer::SaveVideoOptions();
+           });
+    settings.back().restart = true;
     toggle("Smooth gradients",
            "Turns off the game's dither pattern and keeps the picture in full colour, for smooth "
            "skies and fades without the fine grid or banding. With the Heavenfall mod, choose "
@@ -768,7 +777,8 @@ Ui::Action Ui::DrawRestartPrompt() {
     Heading("Restart needed");
     ImGui::Separator();
     ImGui::TextWrapped("A setting you changed takes effect after a restart (render scale, HUD "
-                       "resolution, and with the sharp HUD on also the upscale filter and FXAA). "
+                       "resolution, character shadows, and with the sharp HUD on also the upscale "
+                       "filter and FXAA). "
                        "Restart now? Progress since your last in-game save (and since your "
                        "last save state) will be lost.");
     ImGui::Spacing();

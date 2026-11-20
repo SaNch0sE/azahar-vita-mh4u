@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "common/vita_data_dir.h"
+#include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/gxm_video_options.h"
 
 namespace GxmRenderer {
@@ -27,10 +28,10 @@ void Write(const VideoOptions& o) {
     }
     std::fprintf(f,
                  "version=%u\nupscale=%u\nfxaa=%u\nscale_q=%u\nmsaa=%u\nwide=%u\nfps=%u\nsmooth=%u\n"
-                 "hudres=%u\n",
+                 "hudres=%u\nshadows=%u\n",
                  OptionsVersion, static_cast<u32>(o.upscale), o.fxaa ? 1u : 0u, o.scale_q,
                  o.msaa ? 1u : 0u, o.wide ? 1u : 0u, o.show_fps ? 1u : 0u, o.smooth ? 1u : 0u,
-                 o.hudres);
+                 o.hudres, o.shadows ? 1u : 0u);
     std::fclose(f);
 }
 
@@ -66,6 +67,8 @@ VideoOptions Load(bool& reset) {
             o.show_fps = v != 0;
         } else if (std::strcmp(line, "smooth") == 0) {
             o.smooth = v != 0;
+        } else if (std::strcmp(line, "shadows") == 0) {
+            o.shadows = v != 0;
         } else if (std::strcmp(line, "hudres") == 0) {
             o.hudres = v <= 6 ? static_cast<u32>(v) : 0u;
         }
@@ -108,6 +111,11 @@ bool FilterLocked() {
 
 VideoOptions::Upscale EffectiveUpscale() {
     return FilterLocked() ? VideoAtLaunch().upscale : Video().upscale;
+}
+
+bool ShadowMapsEnabled() {
+    static const bool on = GxmFlag("shadowmap") || VideoAtLaunch().shadows;
+    return on;
 }
 
 bool EffectiveFxaa() {

@@ -393,7 +393,10 @@ bool RasterizerGxm::EnsureResources() {
                                      ? std::string(VITA_DATA_DIR "/programs.bin")
                                      : std::string(VITA_DATA_DIR "/programs_diag.bin");
         program_cache = std::make_unique<ProgramDiskCache>(
-            file, fmt::format("{}-{:016x}", GXM_PROGRAM_VERSION, flags_hash));
+            file, fmt::format("{}-{:016x}{}", GXM_PROGRAM_VERSION, flags_hash,
+                              // Character shadows change the lit programs: a toggle (a restart)
+                              // starts the cache over rather than serving the other kind.
+                              ShadowMapsEnabled() ? "" : "-noshadow"));
     }
     if (!GxmFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
@@ -938,7 +941,7 @@ void RasterizerGxm::BeginScene(Framebuffer* fb) {
     SceGxmContext* context = Device().context;
     // shadowmap: a shadow pass's own depth starts at 1.0 after the map was cleared (any
     // other scene on its colour), and is loaded otherwise, so a pass split over scenes goes on.
-    static const bool shadow_map = GxmFlag("shadowmap");
+    static const bool shadow_map = ShadowMapsEnabled();
     if (shadow_map && fb->color_id) {
         Surface& colour = res_cache.GetSurface(fb->color_id);
         if (fb->shadow_rendering) {
@@ -3462,7 +3465,7 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
                                 texture.config.height);
                 // shadowmap: a 2D shadow map is the render target the shadow pass drew, looked
                 // up as any texture; the program compares its packed depths (SampleTextures).
-                static const bool shadow_map_on = GxmFlag("shadowmap");
+                static const bool shadow_map_on = ShadowMapsEnabled();
                 if (shadow_map_on && texture.config.type.Value() == TextureType::Shadow2D) {
                     break;
                 }
@@ -3852,7 +3855,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
          (alpha.func == CompareFunc::GreaterThan && alpha.ref == 255))) {
         return TraceDrop(regs, __LINE__);
     }
-    static const bool shadow_map = GxmFlag("shadowmap");
+    static const bool shadow_map = ShadowMapsEnabled();
     const bool shadow_pass = shadow_map && fb_regs.IsShadowRendering();
     if (shadow_pass) {
         LogShadowDraw(regs, "shadow draw");

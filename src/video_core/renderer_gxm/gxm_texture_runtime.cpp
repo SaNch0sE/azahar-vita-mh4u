@@ -1689,7 +1689,7 @@ Framebuffer::Framebuffer(TextureRuntime&, const VideoCore::FramebufferParams& pa
         // shadowmap: the colour surface keeps the packed depths, a depth buffer of its own
         // does the "keep the nearest" (Surface::ShadowAux). Without the switch the draw is
         // dropped (no image load/store on this backend).
-        if (!GxmFlag("shadowmap") || color == nullptr || !color->HasMemory() ||
+        if (!ShadowMapsEnabled() || color == nullptr || !color->HasMemory() ||
             !color->IsColorTarget() || color_level != 0) {
             return;
         }

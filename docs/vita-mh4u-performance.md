@@ -1317,3 +1317,10 @@ at slot 7, HUD resolution Screen: HUD scene 50.4 -> 49.9 ms. Native A8/IA8/ETC f
 of the RGBA8 conversion would save at most ~0.5 ms here, so they are dropped. The ~19 ms
 "texture" share measured with `minkeep_tex` is the sample instruction and its latency in the
 program, not memory bandwidth.
+
+**Character shadows on by default (2026-11-20):** the user's slot 9 (Primal Forest area 1) showed
+no hunter / Palico shadow next to Android Azahar (the ground's view-dependent bright / dark areas
+are the game's own - Android shows the same). The shadow map pass (`shadowmap`, see "Shadow maps
+(P5)") is now a release setting, Display -> Character shadows (`shadows=` in video.txt, default
+on, applies on the next launch; the program cache version carries it). Release fps, on / off:
+slot 9 29.9 / 30.1, slot 4 30.1 / 29.9, slot 7 21.5 / 21.9 - no measurable cost.

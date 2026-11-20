@@ -36,6 +36,10 @@ struct VideoOptions {
     /// resolution over the stretched 3D picture (RasterizerGxm, HudBegin). 0 off (400x240),
     /// 1 the screen's resolution, 2 lighter (1.5x), 3 1.25x, 4 1.33x, 5 1.4x, 6 1.45x. Uses the 8-bit display copies.
     u32 hudres = 4; // 1.33x by default since 2026-11-20 (headroom for Sharp / FXAA)
+    /// "Character shadows": MH4U's real-time shadow map (hunters, monsters) drawn and read by the
+    /// lit materials, as on the 3DS; off draws them unshadowed (the map's pass is dropped).
+    /// Applies on the next launch (the programs differ).
+    bool shadows = true;
 };
 
 /// The live options (loaded from the file on first use).
@@ -49,6 +53,8 @@ const VideoOptions& VideoAtLaunch();
 bool FilterLocked();
 VideoOptions::Upscale EffectiveUpscale();
 bool EffectiveFxaa();
+/// Character shadows at launch (the option, or the diagnostics flag `shadowmap`).
+bool ShadowMapsEnabled();
 /// Writes the live options to the file.
 void SaveVideoOptions();
 

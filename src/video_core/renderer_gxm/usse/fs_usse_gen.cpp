@@ -8,6 +8,7 @@
 #include <bit>
 #include <cstdio>
 #include "common/vita_data_dir.h"
+#include "video_core/renderer_gxm/gxm_video_options.h"
 #include <stdexcept>
 #include <string>
 #include <fmt/format.h>
@@ -462,7 +463,7 @@ const char* FragmentEmitter::Unsupported() const {
     }
     // shadowmap: a Z-buffered shadow pass is emitted (ShadowOutput); W-buffered ones are not.
     if (fb.shadow_rendering &&
-        (!GxmFlag("shadowmap") ||
+        (!ShadowMapsEnabled() ||
          fb.depthmap_enable == Pica::RasterizerRegs::DepthBuffering::WBuffering)) {
         return "shadow rendering";
     }
@@ -638,7 +639,7 @@ void FragmentEmitter::PlanInputs() {
         uses_fog = false;
         uses_depth = false;
     }
-    static const bool shadow_map = GxmFlag("shadowmap");
+    static const bool shadow_map = ShadowMapsEnabled();
     if (uses_lighting && lighting.enable_shadow) {
         const u32 unit = lighting.shadow_selector;
         // A 2D shadow texture on unit 0 is bound white (shadow-map passes are dropped, P5), so
