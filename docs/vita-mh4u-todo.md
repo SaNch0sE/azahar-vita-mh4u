@@ -192,3 +192,13 @@ by default (46f60cf2d). Established on the console:
   Swap/flip/no-border variants tried by the user in-game: all wrong. Next: `dbgout_shadow` (new:
   receivers painted (map depth, reference)) - captured once at slot 8 (o_shv) but not yet read;
   a dimmer-red hunter shape on the ground = the lookup works, uniform red = decode/sampling bug.
+
+## Idea: one launcher for MH4U and MHXX (2026-11-20, later)
+
+A test build of Monster Hunter XX exists: `cmake -DVITA_GAME=MHXX` gives MHXXVITA0 ("Monster
+Hunter XX (test)"), data in ux0:data/mhxx, the game (`Monster Hunter XX ...` .cci) and its update
+CIA (name containing "mhxx", e.g. the English patch 3.1) taken from ux0:data/azahar/roms, Hybrid
+screen layout by default with the layout settings shown, 5:3 and the 3DS HUD by default. The
+MH4U-specific hooks stay inactive (exact version checks). User test: **it runs**, but fps is low
+in 3D scenes and in the system keyboard. Later: one launcher app that installs and runs both
+games, with per-game improvements (hooks, defaults, cheats, mods) - for now documented only.
