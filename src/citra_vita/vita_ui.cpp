@@ -172,7 +172,10 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     ImGui::GetIO().Fonts->ClearTexData();
     ImGui_ImplGxm_TouchUsage(true);
     ImGui_ImplGxm_GamepadUsage(true);
-    ImGui_ImplGxm_MouseStickUsage(true);
+    // No right-stick cursor: it is never drawn, every item is reachable by pad or touch, and a
+    // stick resting just past its dead zone moved it - ImGui then took the mouse as in use and
+    // hid the pad highlight a few seconds after each menu opened (focus stayed, 2026-11-20).
+    ImGui_ImplGxm_MouseStickUsage(false);
 
     BuildSettings();
     ScanGames();

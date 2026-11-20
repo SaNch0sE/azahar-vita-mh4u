@@ -203,11 +203,19 @@ void ImGui_ImplGxm_NewFrame() {
     bool touched = false;
     if (s.touch_enabled) {
         SceTouchData touch{};
+        static int held_frames = 0;
         if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0 && touch.reportNum > 0) {
-            // Panel coordinates are twice the display in each axis.
-            s.cursor_x = touch.report[0].x / 2.0f;
-            s.cursor_y = touch.report[0].y / 2.0f;
-            touched = true;
+            // A touch counts once it has lasted 3 frames (~50 ms): a charging Vita reports
+            // phantom single-frame touches, which moved the cursor (ImGui then hid the pad
+            // highlight) and could press whatever was under them. Real taps last longer.
+            if (++held_frames >= 3) {
+                // Panel coordinates are twice the display in each axis.
+                s.cursor_x = touch.report[0].x / 2.0f;
+                s.cursor_y = touch.report[0].y / 2.0f;
+                touched = true;
+            }
+        } else {
+            held_frames = 0;
         }
     }
     io.MousePos = ImVec2(s.cursor_x, s.cursor_y);
