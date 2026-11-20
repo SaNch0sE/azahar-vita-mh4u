@@ -598,6 +598,7 @@ private:
     /// Back to Idle without copying anything back (a fill over the target starts a frame).
     void HudAbandon();
     void HudFallback(int reason);
+    VideoCore::SurfaceId last_shadow_target{}; ///< the shadow pass's colour (logshadowbind)
     bool HudTransfer(const Pica::DisplayTransferConfig& config);
     bool HudOverlaps(PAddr addr, u32 size);
     bool gpu_blit_linear = false; ///< GpuBlit samples bilinearly (HudResolve's scale-down)

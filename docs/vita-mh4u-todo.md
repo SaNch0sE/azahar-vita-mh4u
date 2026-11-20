@@ -167,3 +167,13 @@ by default (46f60cf2d). Established on the console:
 - Test-harness note: a second diag run in one script often lands on our pause menu over a garbled
   screen ("resume event: pausing ... 2 s clock jump" during a slow load) - a false resume
   detection worth fixing too.
+- **2026-11-20, later:** `dbgshadowzero` darkens the bright ground (the path reaches the picture);
+  `dbgshadowlit` = normal picture (0.9/255): the big dark areas are the game's own lighting, and
+  normally almost every lookup is "lit". `dbgshadownoborder`, `dbgshadowflipt`: no change.
+  `logshadowbind`: receivers bind the shadow pass's own target (same surface, GPU content).
+  `dbgout_uv0` (new: receivers' lookup coordinates as colour): at the hunter's feet s~0.16
+  t~0.20, most of the ground >= 1 (outside the map: lit, as in GL); identical with
+  `dbgshadowrecvsw` (software vertex shading) - so the game's coordinates are what they are.
+  In the dumped map the hunter's silhouette is at s~0.37-0.45, t~0.10-0.23: **the shadow pass
+  places the casters elsewhere than the receivers look**. Next: the shadow pass's projection /
+  viewport / rotation-flip convention into the 256x256 map (a transpose fits better than a flip).

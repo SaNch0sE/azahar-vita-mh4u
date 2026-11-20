@@ -265,6 +265,9 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::TevStage0);
         } else if (GxmFlag("dbgout_const1")) {
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Alpha);
+        } else if (GxmFlag("dbgout_uv0")) {
+            // Shadow-map receivers' lookup coordinates (s, t, w) as colour.
+            Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texcoord0);
         } else if (GxmFlag("dbgout_uv1")) {
             // Texcoord2 stands for "texture coordinate 1 as colour" in the USSE emitter.
             Pica::Shader::Generator::Cg::SetDebugOutput(DebugOutput::Texcoord2);
@@ -945,6 +948,7 @@ void RasterizerGxm::BeginScene(Framebuffer* fb) {
     if (shadow_map && fb->color_id) {
         Surface& colour = res_cache.GetSurface(fb->color_id);
         if (fb->shadow_rendering) {
+            last_shadow_target = fb->color_id; // logshadowbind compares the receivers' surface
             if (SceGxmDepthStencilSurface* ds = fb->MutableDepthStencilSurface()) {
                 const bool fresh = !colour.shadow_aux_valid;
                 if (fresh) {
@@ -3555,6 +3559,30 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         if (memo_hit) {
             surface.last_use_tick = runtime.GetResourceTick();
         }
+        // logshadowbind (diag): which surface a receiver's 2D shadow map resolves to, once a
+        // second - the shadow pass's own target, or another surface at the same address.
+        static const bool log_shadow_bind = GxmFlag("logshadowbind");
+        if (log_shadow_bind && unit == 0 &&
+            texture.config.type.Value() == TextureType::Shadow2D) {
+            static u32 last_frame = 0;
+            if (frame_index - last_frame >= 60) {
+                last_frame = frame_index;
+                sceClibPrintf("[mh4u] shadowbind: frame %u addr %08X %ux%u fmt %u -> surface %u "
+                              "type %d addr %08X %ux%u fmt %d gpu_content %d tick %llu memo %d; "
+                              "shadow pass target %u (%s)\n",
+                              frame_index, static_cast<unsigned>(info.physical_address),
+                              static_cast<unsigned>(info.width), static_cast<unsigned>(info.height),
+                              static_cast<unsigned>(texture.format),
+                              static_cast<unsigned>(surface_id.index),
+                              static_cast<int>(surface.type), static_cast<unsigned>(surface.addr),
+                              static_cast<unsigned>(surface.width),
+                              static_cast<unsigned>(surface.height),
+                              static_cast<int>(surface.pixel_format), surface.gpu_content ? 1 : 0,
+                              static_cast<unsigned long long>(surface.modification_tick),
+                              memo_hit ? 1 : 0, static_cast<unsigned>(last_shadow_target.index),
+                              surface_id == last_shadow_target ? "same" : "DIFFERENT");
+            }
+        }
         // logtex: each distinct (colour target, unit, texture, resolved surface) once, so a
         // pass that samples the wrong thing can be told from the log - the surface the cache
         // answered with, its format next to the one asked for, and whether the texture lies in
@@ -5034,6 +5062,13 @@ bool RasterizerGxm::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
     // program translation fault from the rest.
     static const bool shadow_sw = GxmFlag("dbgshadowsw");
     if (shadow_sw && regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() == 0x18154F00) {
+        return DeclineHw(0);
+    }
+    // dbgshadowrecvsw (diag): draws that read a 2D shadow map on unit 0 (the receivers) shaded
+    // in software, to tell a vertex program translation fault in their lookup coordinates.
+    static const bool shadow_recv_sw = GxmFlag("dbgshadowrecvsw");
+    if (shadow_recv_sw && regs.texturing.main_config.texture0_enable &&
+        regs.texturing.texture0.type.Value() == Pica::TexturingRegs::TextureConfig::Shadow2D) {
         return DeclineHw(0);
     }
     if (!EnsureResources()) {

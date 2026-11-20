@@ -1136,8 +1136,12 @@ void FragmentEmitter::ShadowCompare() {
     // min(|w|, 1) - bias as the result, to look at what the receivers compare with.
     static const bool show_zero = GxmFlag("dbgshadowzero");
     static const bool show_ref = GxmFlag("dbgshadowref");
+    // dbgshadowlit (diag): every lookup fully lit - the opposite of dbgshadowzero.
+    static const bool show_lit = GxmFlag("dbgshadowlit");
     if (show_zero) {
         e.MoveInternal({I0, 0xf}, ConstZero, Pred::None, true);
+    } else if (show_lit) {
+        e.MoveInternal({I0, 0xf}, ConstOne, Pred::None, true);
     } else if (show_ref) {
         e.Vec(VecOp::Min, {I0, 0x1}, {w_pair, w_swz, Mod::Abs}, ConstOne, Pred::None, true);
         e.Vec(VecOp::Add, {I0, 0x1}, {bias.reg, bias.swz, Mod::Neg}, {I0, XXXX}, Pred::None,
@@ -1688,6 +1692,16 @@ void FragmentEmitter::SampleTextures() {
             e.Vec(VecOp::Mul, {Reg::V(TmpProj), 0x3}, {coords[0], XYZW}, {I0, XXXX}, Pred::None,
                   true);
             coords[0] = Reg::V(TmpProj);
+        }
+        // dbgshadowflipt (diag): the shadow map looked up at t' = 1 - t, to test whether the
+        // rendered map (stored bottom-up like every render target) is read upside down.
+        static const bool flip_t = GxmFlag("dbgshadowflipt");
+        if (unit == 0 && shadow_compare && flip_t) {
+            e.Vec(VecOp::Add, {Reg::V(TmpProj), 0x1}, {coords[0], XXXX}, ConstZero, Pred::None,
+                  true);
+            e.Vec(VecOp::Add, {Reg::V(TmpProj), 0x2}, {coords[0], YYYY, Mod::Neg}, ConstOne,
+                  Pred::None, true);
+            coords[0] = Reg::V(TmpProj);
         } else if (unit == 0 && tex.texture0_type == TextureType::TextureCube &&
                    !GxmFlag("cubeflat")) {
             CubeCoordinates(coords[0]);
@@ -1720,6 +1734,12 @@ void FragmentEmitter::SampleTextures() {
     for (u32 unit = 0; unit < 3; unit++) {
         const auto& border = tex.texture_border_color[unit];
         if (!unit_used[unit] || !(border.enable_s || border.enable_t)) {
+            continue;
+        }
+        // dbgshadownoborder (diag): the shadow map's lookups past its edge read the map's own
+        // (white, lit) edge texel instead of the border colour.
+        static const bool shadow_no_border = GxmFlag("dbgshadownoborder");
+        if (shadow_no_border && unit == 0 && shadow_compare) {
             continue;
         }
         const Vec4Loc colour{Bank::SecAttr, static_cast<uint8_t>(sa_border + unit * 4)};
@@ -3237,6 +3257,19 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
         }
         break;
     }
+    case DebugOutput::Texcoord0:
+        // dbgout_uv0: on shadow-map receivers only, texture coordinate 0 (the shadow map's
+        // lookup) as (s, t, w, 1); every other program keeps its normal output.
+        if (shadow_compare) {
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput), 0x3}, {Reg::Pa(texcoord_pa[0]), XYZW},
+                  ConstZero);
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x1},
+                  {Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u)),
+                   (texcoord0_w_pa & 1) ? YYYY : XXXX},
+                  ConstZero);
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x2}, ConstOne, ConstZero);
+        }
+        break;
     case DebugOutput::Texcoord2:
         // dbgout_uv1: texture coordinate 1 as (u, v, 0, 1). Coordinates a surface's texture is
         // sampled with come out as smooth gradients; broken ones as noise or flat blocks.
