@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <atomic>
 #include <psp2/appmgr.h>
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
@@ -158,6 +159,10 @@ unsigned int _pthread_stack_default_user = 1024 * 1024;
 // global symbol, and guarded by its own atomic once-flag, so calling it twice costs nothing.
 int _vita_net_init(void);
 }
+
+/// Set by the menu's "Restart now": main relaunches the app once everything has shut down.
+static std::atomic<bool> g_restart_requested{false};
+
 
 constexpr int MinAzaharNativeVersion = 1;
 
@@ -682,6 +687,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 window.SetUi(nullptr);
                 ShutdownSystem(system);
                 return keep_running;
+            case VitaFrontend::Ui::Action::RestartApplication:
+                // A setting that applies at launch changed: the same clean shutdown as Exit,
+                // then main starts the app again (sceAppMgrLoadExec).
+                g_restart_requested.store(true);
+                window.SetUi(nullptr);
+                ShutdownSystem(system);
+                return false;
             case VitaFrontend::Ui::Action::ExitApplication:
                 window.SetUi(nullptr);
                 ShutdownSystem(system);
@@ -1357,5 +1369,10 @@ int main(int argc, char* argv[]) {
         emu_thread.join();
     }
 
+    if (g_restart_requested.load()) {
+        // Settings are saved as they change; the emulator has shut down. Start over from the
+        // app's own executable (only returns on failure).
+        sceAppMgrLoadExec("app0:eboot.bin", nullptr, nullptr);
+    }
     return 0;
 }

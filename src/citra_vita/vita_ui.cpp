@@ -74,6 +74,19 @@ bool BeginCentered(const char* id, float width, float height) {
     }
     return open;
 }
+/// Makes the item just drawn the pad's target, as a D-pad press would. On a fresh window the
+/// old focus call only drew the highlight: X did nothing until a D-pad press or a touch set the
+/// navigation target for real. SetFocusID sets it, in the window navigation runs in (a
+/// NavFlattened child navigates in its parent).
+void FocusLastItem() {
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    ImGuiWindow* nav_window = window->RootWindowForNav != nullptr ? window->RootWindowForNav : window;
+    ImGui::FocusWindow(nav_window);
+    ImGui::SetFocusID(ImGui::GetItemID(), nav_window);
+    g.NavDisableHighlight = false;
+    g.NavDisableMouseHover = true;
+}
 } // Anonymous namespace
 
 Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{window_} {
@@ -164,15 +177,19 @@ void Ui::BuildSettings() {
         settings.push_back(std::move(setting));
     };
 
+#ifdef VITA_DIAGNOSTICS
+    // Diagnostics only: the release runs MH4U at full speed on one screen (2026-11-20).
     slider("Speed limit", "Percentage of full speed to aim for. Lower it to save battery.", true,
            0, 200, [] { return static_cast<int>(Settings::values.frame_limit.GetValue()); },
            [](int value) { Settings::values.frame_limit = static_cast<double>(value); });
+#endif
     slider("Volume", "Output volume.", true, 0, 100,
            [] { return static_cast<int>(Settings::values.volume.GetValue() * 100.0f); },
            [](int value) { Settings::values.volume = static_cast<float>(value) / 100.0f; });
     toggle("Stretch audio", "Keeps audio continuous when the emulator runs below full speed.",
            true, [] { return Settings::values.enable_audio_stretching.GetValue(); },
            [](bool value) { Settings::values.enable_audio_stretching = value; });
+#ifdef VITA_DIAGNOSTICS
     choice("Screen layout", "How the two screens are arranged on the display.", true,
            {"Default", "Single screen", "Large screen", "Side by side", "Hybrid"},
            // The list's order, not the enum's: SeparateWindows sits between SideScreen and
@@ -201,6 +218,7 @@ void Ui::BuildSettings() {
     toggle("Swap screens", "Puts the touch screen where the top screen would be.", true,
            [] { return Settings::values.swap_screen.GetValue(); },
            [](bool value) { Settings::values.swap_screen = value; });
+#endif
     choice("Upscale filter",
            "How the 400x240 picture is stretched to the screen. Sharp keeps pixels crisp, "
            "blending only at their edges.",
@@ -232,12 +250,23 @@ void Ui::BuildSettings() {
            "picture: sharp, readable text. Costs GPU time (a few frames per second less in heavy "
            "areas; the lighter setting costs less). FXAA and the Sharp upscale filter do not "
            "apply to those frames.",
+#ifdef VITA_DIAGNOSTICS
            true, {"3DS (400x240)", "Screen", "Screen, lighter (1.5x)"},
            [] { return static_cast<int>(GxmRenderer::Video().hudres); },
            [](int value) {
                GxmRenderer::Video().hudres = static_cast<u32>(value < 0 || value > 2 ? 0 : value);
                GxmRenderer::SaveVideoOptions();
            });
+#else
+           // The full "Screen" setting costs too much GPU time to play with; the release
+           // offers the 1.5x one (a saved hudres=1 still works, shown as on).
+           true, {"3DS (400x240)", "Screen (1.5x)"},
+           [] { return GxmRenderer::Video().hudres != 0 ? 1 : 0; },
+           [](int value) {
+               GxmRenderer::Video().hudres = value == 1 ? 2u : 0u;
+               GxmRenderer::SaveVideoOptions();
+           });
+#endif
     toggle("FPS counter", "Shows the emulation speed and the frame rate in the top right corner.",
            true, [] { return GxmRenderer::Video().show_fps; },
            [](bool value) {
@@ -265,6 +294,7 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().scale_q = static_cast<u32>(3 + (value < 0 || value > 5 ? 1 : value));
                GxmRenderer::SaveVideoOptions();
            });
+    settings.back().restart = true;
     choice("Region", "The console region reported to the title.", false,
            {"Auto", "Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"},
            [] { return Settings::values.region_value.GetValue() + 1; },
@@ -301,7 +331,7 @@ void Ui::ClearStatusMessage() {
     status_message.clear();
 }
 
-void Ui::DrawSetting(Setting& setting, std::size_t index) {
+void Ui::DrawSetting(Setting& setting, std::size_t index, bool focus) {
     ImGui::PushID(static_cast<int>(index));
     ImGui::TextUnformatted(setting.title);
     // Wrapped: the longer descriptions ran off the panel's edge.
@@ -315,6 +345,9 @@ void Ui::DrawSetting(Setting& setting, std::size_t index) {
         if (ImGui::Checkbox("##toggle", &value)) {
             setting.set_bool(value);
         }
+        if (focus) {
+            FocusLastItem();
+        }
         break;
     }
     case Setting::Kind::Choice: {
@@ -326,8 +359,15 @@ void Ui::DrawSetting(Setting& setting, std::size_t index) {
                 if (ImGui::Selectable(setting.choices[i], i == value)) {
                     setting.set_choice(i);
                 }
+                // The list opens on the current choice, not the first one.
+                if (i == value) {
+                    ImGui::SetItemDefaultFocus();
+                }
             }
             ImGui::EndCombo();
+        }
+        if (focus) {
+            FocusLastItem();
         }
         break;
     }
@@ -336,6 +376,9 @@ void Ui::DrawSetting(Setting& setting, std::size_t index) {
         ImGui::SetNextItemWidth(320.0f);
         if (ImGui::SliderInt("##slider", &value, setting.slider_min, setting.slider_max)) {
             setting.set_slider(value);
+        }
+        if (focus) {
+            FocusLastItem();
         }
         break;
     }
@@ -350,8 +393,40 @@ void Ui::DrawSettingsBody(bool runtime_only) {
         if (runtime_only && !settings[i].runtime) {
             continue;
         }
-        DrawSetting(settings[i], i);
+        DrawSetting(settings[i], i, focus_first_setting);
+        focus_first_setting = false;
     }
+}
+
+int Ui::SettingValue(const Setting& setting) {
+    switch (setting.kind) {
+    case Setting::Kind::Toggle:
+        return setting.get_bool() ? 1 : 0;
+    case Setting::Kind::Choice:
+        return setting.get_choice();
+    default:
+        return setting.get_slider();
+    }
+}
+
+void Ui::OpenSettings(State settings_state) {
+    state = settings_state;
+    overlay_focused = false;
+    focus_first_setting = true;
+    // What the restart-only settings held on the way in, to ask on the way out.
+    restart_snapshot.clear();
+    for (const Setting& setting : settings) {
+        restart_snapshot.push_back(setting.restart ? SettingValue(setting) : 0);
+    }
+}
+
+bool Ui::RestartSettingChanged() const {
+    for (std::size_t i = 0; i < settings.size() && i < restart_snapshot.size(); i++) {
+        if (settings[i].restart && SettingValue(settings[i]) != restart_snapshot[i]) {
+            return true;
+        }
+    }
+    return false;
 }
 
 Ui::Action Ui::DrawGameList() {
@@ -373,12 +448,16 @@ Ui::Action Ui::DrawGameList() {
                            GameDirectory);
     }
 
+    const bool appearing = ImGui::IsWindowAppearing();
     ImGui::BeginChild("##list", ImVec2(0.0f, 380.0f));
     for (int i = 0; i < static_cast<int>(games.size()); i++) {
         if (ImGui::Selectable(games[i].name.c_str(), i == selected_game)) {
             selected_game = i;
             selected_game_path = games[i].path;
             action = Action::LaunchGame;
+        }
+        if (appearing && i == 0) {
+            FocusLastItem();
         }
         if (ImGui::IsItemFocused()) {
             selected_game = i;
@@ -388,8 +467,7 @@ Ui::Action Ui::DrawGameList() {
 
     ImGui::Separator();
     if (ImGui::Button("Settings", ImVec2(200.0f, 48.0f))) {
-        state = State::GameSettings;
-        overlay_focused = false;
+        OpenSettings(State::GameSettings);
     }
     ImGui::SameLine();
     if (ImGui::Button("Rescan", ImVec2(200.0f, 48.0f))) {
@@ -434,16 +512,17 @@ Ui::Action Ui::DrawPauseMenu() {
     const ImVec2 button_size{320.0f, 48.0f};
     // Every opening starts on Resume: the menu otherwise remembers the last button, and the
     // same presses land somewhere else each time.
-    if (ImGui::IsWindowAppearing()) {
-        ImGui::SetKeyboardFocusHere();
-    }
+    const bool appearing = ImGui::IsWindowAppearing() || focus_pause_resume;
+    focus_pause_resume = false;
     if (ImGui::Button("Resume", button_size)) {
         action = Action::ResumeGame;
         window.UpdateCurrentFramebufferLayout();
     }
+    if (appearing) {
+        FocusLastItem();
+    }
     if (ImGui::Button("Settings", button_size)) {
-        state = State::PauseSettings;
-        overlay_focused = false;
+        OpenSettings(State::PauseSettings);
     }
     if (ImGui::Button("Save states", button_size)) {
         state = State::Savestates;
@@ -491,10 +570,42 @@ Ui::Action Ui::DrawPauseSettings() {
     ImGui::End();
 
     if (back) {
-        state = State::Pause;
+        state = RestartSettingChanged() ? State::RestartPrompt : State::Pause;
         overlay_focused = false;
+        focus_pause_resume = state == State::Pause;
     }
     return Action::None;
+}
+
+Ui::Action Ui::DrawRestartPrompt() {
+    Action action = Action::None;
+    BeginCentered("##restart", 600.0f, 300.0f);
+    const bool appearing = ImGui::IsWindowAppearing();
+    ImGui::TextUnformatted("Restart needed");
+    ImGui::Separator();
+    ImGui::TextWrapped("A setting you changed (render scale) takes effect after a restart. "
+                       "Restart now? Progress since your last in-game save (and since your "
+                       "last save state) will be lost.");
+    ImGui::Spacing();
+    const ImVec2 button_size{560.0f, 44.0f};
+    if (ImGui::Button("Later (keep playing)", button_size)) {
+        state = State::Pause;
+        focus_pause_resume = true;
+    }
+    // The safe choice is the default.
+    if (appearing) {
+        FocusLastItem();
+    }
+    if (ImGui::Button("Restart now", button_size)) {
+        action = Action::RestartApplication;
+    }
+    if (BackPressed()) {
+        state = State::Pause;
+        focus_pause_resume = true;
+    }
+    overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGui::End();
+    return action;
 }
 
 Ui::Action Ui::DrawSavestates() {
@@ -511,12 +622,12 @@ Ui::Action Ui::DrawSavestates() {
         ImGui::AlignTextToFramePadding();
         ImGui::Text("Slot %u", slot);
         ImGui::SameLine(140.0f);
-        if (appearing && slot == 1) {
-            ImGui::SetKeyboardFocusHere();
-        }
         if (ImGui::Button("Load", ImVec2(140.0f, 34.0f))) {
             selected_slot = slot;
             action = Action::LoadState;
+        }
+        if (appearing && slot == 1) {
+            FocusLastItem();
         }
         ImGui::SameLine();
         if (ImGui::Button("Save", ImVec2(140.0f, 34.0f))) {
@@ -534,6 +645,7 @@ Ui::Action Ui::DrawSavestates() {
     if (back) {
         state = State::Pause;
         overlay_focused = false;
+        focus_pause_resume = true;
     }
     return action;
 }
@@ -557,12 +669,12 @@ Ui::Action Ui::DrawBugReport() {
                        "problem happens.");
     ImGui::Spacing();
     const ImVec2 button_size{600.0f, 44.0f};
-    if (appearing) {
-        ImGui::SetKeyboardFocusHere();
-    }
     if (ImGui::Button("Save report", button_size) && !report_pending) {
         report_with_state = false;
         report_pending = true;
+    }
+    if (appearing) {
+        FocusLastItem();
     }
     if (ImGui::Button("Save report with the newest save state (+30 MB)", button_size) &&
         !report_pending) {
@@ -584,6 +696,7 @@ Ui::Action Ui::DrawBugReport() {
     if (back && !report_pending && action == Action::None) {
         state = State::Pause;
         overlay_focused = false;
+        focus_pause_resume = true;
     }
     return action;
 }
@@ -688,6 +801,9 @@ Ui::Action Ui::Update() {
             break;
         case State::BugReport:
             action = DrawBugReport();
+            break;
+        case State::RestartPrompt:
+            action = DrawRestartPrompt();
             break;
         }
     }

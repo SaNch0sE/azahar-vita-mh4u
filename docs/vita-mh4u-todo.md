@@ -123,3 +123,11 @@ most text readable (2026-11-18).
    this GPU - an experimental option at most.
 Not worth it: Lanczos (ringing, many reads), pixel-art scalers on the 3D scene (smeared look),
 per-vertex highlights (`pvhalf`: white pond, see the performance notes).
+
+- **Menu (done 2026-11-20):** every menu opens with its default button really focused (X works at
+  once; ImGui 1.79's SetKeyboardFocusHere only drew the highlight - now SetFocusID), dropdowns
+  open on the current value; release hides Speed limit, Screen layout, Swap screens and the full
+  "Screen" HUD resolution (the 1.5x one is offered as "Screen (1.5x)"); leaving the settings
+  after changing a launch-time setting (Render scale) asks to restart, and "Restart now" shuts
+  the emulator down and relaunches the app (sceAppMgrLoadExec). The white area at tunnel exits
+  (Primal Forest, slot 8) is the game's own: Azahar on Android (GL and Vulkan) shows the same.

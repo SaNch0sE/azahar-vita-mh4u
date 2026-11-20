@@ -41,6 +41,8 @@ public:
         SaveState,
         LoadState,
         SaveReport,
+        /// Shut down and start the app again (a setting that applies at launch changed).
+        RestartApplication,
     };
 
     explicit Ui(Core::System& system, EmuWindowVita& window);
@@ -98,6 +100,7 @@ private:
         PauseSettings,
         Savestates,
         BugReport,
+        RestartPrompt,
     };
 
     /// One row of the settings body. The value is read and written through closures so a row can
@@ -121,6 +124,8 @@ private:
         std::function<void(int)> set_slider;
         int slider_min;
         int slider_max;
+        /// Takes effect only after the app restarts: leaving the settings offers a restart.
+        bool restart = false;
     };
 
     struct GameEntry {
@@ -145,7 +150,14 @@ private:
 
     /// Draws the settings body, showing only runtime-changeable rows when asked.
     void DrawSettingsBody(bool runtime_only);
-    void DrawSetting(Setting& setting, std::size_t index);
+    void DrawSetting(Setting& setting, std::size_t index, bool focus);
+    Action DrawRestartPrompt();
+    static int SettingValue(const Setting& setting);
+    void OpenSettings(State settings_state);
+    [[nodiscard]] bool RestartSettingChanged() const;
+    bool focus_first_setting = false; ///< the next settings body focuses its first control
+    bool focus_pause_resume = false;  ///< the pause menu focuses Resume on its next frame
+    std::vector<int> restart_snapshot;
 
     /// True when the user pressed cancel and this overlay was the thing focused, which is what
     /// separates "close the menu" from "leave the combo box the cancel already closed" - ImGui
