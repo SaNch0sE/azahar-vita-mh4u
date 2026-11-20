@@ -57,6 +57,23 @@ bool BeginFullscreen(const char* id) {
                             ImGuiWindowFlags_NoBringToFrontOnFocus);
 }
 
+/// A centred panel exactly as tall as its contents (the pause menu: no empty space under the
+/// last button).
+bool BeginCenteredAuto(const char* id, float width) {
+    ImGui::SetNextWindowPos(ImVec2(ScreenWidth * 0.5f, ScreenHeight * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0.0f), ImVec2(width, ScreenHeight));
+    const bool open = ImGui::Begin(id, nullptr,
+                                   ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                       ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                                       ImGuiWindowFlags_AlwaysAutoResize);
+    if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)) {
+        ImGui::SetWindowFocus();
+    }
+    return open;
+}
+
 /// A centred panel over whatever is behind it, for the pause menu.
 bool BeginCentered(const char* id, float width, float height) {
     ImGui::SetNextWindowPos(ImVec2((ScreenWidth - width) * 0.5f, (ScreenHeight - height) * 0.5f));
@@ -635,7 +652,7 @@ Ui::Action Ui::DrawGameSettings() {
 
 Ui::Action Ui::DrawPauseMenu() {
     Action action = Action::None;
-    BeginCentered("##pause", 360.0f, 420.0f);
+    BeginCenteredAuto("##pause", 360.0f);
     Heading("Paused");
     ImGui::Separator();
 

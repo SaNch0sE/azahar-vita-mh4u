@@ -13,7 +13,9 @@ namespace GxmRenderer {
 /// "next launch" are read by the renderer when it is created.
 struct VideoOptions {
     enum class Upscale : u32 { Linear = 0, SharpBilinear = 1, EdgeAware = 2 };
-    Upscale upscale = Upscale::Linear;
+    // Defaults since 2026-11-20 (the user's choice): Sharp bilinear, no FPS counter, smooth
+    // gradients, HUD resolution 1.5x. A saved options file keeps its own values.
+    Upscale upscale = Upscale::SharpBilinear;
     bool fxaa = false;
     /// Internal render scale in quarters: 3 = 0.75x, 4 = 1x .. 8 = 2x (next launch).
     u32 scale_q = 4;
@@ -24,7 +26,7 @@ struct VideoOptions {
     /// game's views and interface for a stretched picture.
     bool wide = false;
     /// The speed / frame rate counter in the top right corner (Ui::DrawStatsHud).
-    bool show_fps = true;
+    bool show_fps = false;
     /// "Smooth gradients": the game's dither pattern off (render word bits, Mh4uHooks) and the
     /// top screen kept in 8-bit colour from the render target to the present
     /// (RasterizerGxm::SmoothDisplayTransfer) instead of the 3DS's 5:6:5 display buffers.
@@ -32,7 +34,7 @@ struct VideoOptions {
     /// "HUD resolution": the game's 2D layer (HUD, text, menus) drawn at the screen's
     /// resolution over the stretched 3D picture (RasterizerGxm, HudBegin). 0 off (400x240),
     /// 1 the screen's resolution, 2 lighter (1.5x). Uses the 8-bit display copies.
-    u32 hudres = 0;
+    u32 hudres = 2;
 };
 
 /// The live options (loaded from the file on first use).
