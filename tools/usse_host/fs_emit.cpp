@@ -15,6 +15,8 @@ bool GxmFlag(const char* name) {
     return s.find(std::string(" ") + name + " ") != std::string::npos;
 }
 bool LogtexActive() { return false; }
+// Character shadows (the video option) on, as the console's default.
+bool ShadowMapsEnabled() { return true; }
 unsigned logtex_lines = 0;
 }
 namespace Pica::Shader::Generator::Cg {

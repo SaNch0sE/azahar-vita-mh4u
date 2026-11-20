@@ -397,11 +397,20 @@ bool RasterizerGxm::EnsureResources() {
         const std::string file = flags.empty()
                                      ? std::string(VITA_DATA_DIR "/programs.bin")
                                      : std::string(VITA_DATA_DIR "/programs_diag.bin");
+        // The `shadowonetap` switch file (the single compared shadow lookup) changes the
+        // receivers' programs too.
+        const bool one_tap = [] {
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/shadowonetap", "rb")) {
+                std::fclose(f);
+                return true;
+            }
+            return false;
+        }();
         program_cache = std::make_unique<ProgramDiskCache>(
-            file, fmt::format("{}-{:016x}{}", GXM_PROGRAM_VERSION, flags_hash,
+            file, fmt::format("{}-{:016x}{}{}", GXM_PROGRAM_VERSION, flags_hash,
                               // Character shadows change the lit programs: a toggle (a restart)
                               // starts the cache over rather than serving the other kind.
-                              ShadowMapsEnabled() ? "" : "-noshadow"));
+                              ShadowMapsEnabled() ? "" : "-noshadow", one_tap ? "-1tap" : ""));
     }
     if (!GxmFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
@@ -2443,6 +2452,20 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             if (usse_refused.insert(fs_hash).second) {
                 LOG_WARNING(Render, "no fragment program for fs_{:016x}: {}", fs_hash, refusal);
                 stat_usse_refused++;
+                // usse_dump: the refused configuration too (tools/usse_host's fs_emit input),
+                // and the reason where the console log shows it.
+                static const bool dump_refused = GxmFlag("usse_dump");
+                if (dump_refused) {
+                    sceClibPrintf("[mh4u] fs refused fs_%016llx: %s\n",
+                                  static_cast<unsigned long long>(fs_hash), refusal.c_str());
+                    sceIoMkdir(VITA_DATA_DIR "/usse", 0777);
+                    const std::string fq =
+                        fmt::format(VITA_DATA_DIR "/usse/us_{:016x}.fq", fs_hash);
+                    if (FILE* f = std::fopen(fq.c_str(), "wb")) {
+                        std::fwrite(&fs_config, 1, sizeof(fs_config), f);
+                        std::fclose(f);
+                    }
+                }
             }
             return false;
         }
@@ -2770,6 +2793,7 @@ const RasterizerGxm::FsUniforms& RasterizerGxm::UniformsOf(Shader* fs) {
         u.tex_lod_bias = p("tex_lod_bias");
         u.tex_border_color = p("tex_border_color");
         u.shadow_texture_bias = p("shadow_texture_bias");
+        u.shadow_texture_size = p("shadow_texture_size");
         u.lighting_fr_coef = p("lighting_fr_coef");
         u.blend_color = p("blend_color");
         u.tex_dims = p("tex_dims");
@@ -2871,7 +2895,8 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
     last_fs = fs;
     static const bool dims_always = GxmFlag("texdimsalways");
     const FsUniforms& fu = UniformsOf(fs);
-    const bool tex_dims_needed = tex_dims_dirty && (dims_always || fu.tex_dims);
+    const bool tex_dims_needed =
+        tex_dims_dirty && (dims_always || fu.tex_dims || fu.shadow_texture_size);
     const bool fb_dims_needed = fb_dims_changed && (dims_always || fu.fb_dims);
     const bool fragment_dirty = rebind || fs_data_dirty || tex_dims_needed || fb_dims_needed;
     if (!vertex_dirty && !fragment_dirty) {
@@ -3001,7 +3026,7 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
     if (!fragment_dirty) {
         return;
     }
-    if (dims_always || fu.tex_dims) {
+    if (dims_always || fu.tex_dims || fu.shadow_texture_size) {
         tex_dims_dirty = false;
     }
     if (dims_always || fu.fb_dims) {
@@ -3043,6 +3068,13 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
         // The PICA's 24-bit depth units, as a fraction of the depth range.
         const float bias = static_cast<float>(d.shadow_texture_bias) / 16777215.0f;
         set(u.shadow_texture_bias, &bias, 1);
+    }
+    if (u.shadow_texture_size) {
+        // The bilinear shadow lookup's footprint, in the map's texels (unit 0's size).
+        const float w = tex_dims[0] > 0.0f ? tex_dims[0] : 1.0f;
+        const float h = tex_dims[1] > 0.0f ? tex_dims[1] : 1.0f;
+        const float size[4] = {w, h, 1.0f / w, 1.0f / h};
+        set(u.shadow_texture_size, size, 4);
     }
     if (u.lighting_lut_offset) {
         float lut[24];
@@ -3629,6 +3661,34 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
                          VideoCore::PixelFormatAsString(surface.pixel_format),
                          static_cast<u32>(surface.type), in_target ? " IN-TARGET" : "",
                          surface.HasMemory() ? "" : " NO-MEMORY");
+            }
+        }
+        // logtexmip (diag): the first 60 distinct textures with their mip levels (the game's and
+        // the surface's), LOD bias, filters and the surface's scale - for blurry world textures.
+        static const bool log_tex_mip = GxmFlag("logtexmip");
+        if (log_tex_mip) {
+            static std::set<u64> seen_mip;
+            const u64 key = (u64{texture.config.GetPhysicalAddress()} << 16) ^ (u64{unit} << 8) ^
+                            texture.config.lod.max_level.Value();
+            if (seen_mip.size() < 60 && seen_mip.insert(key).second) {
+                sceClibPrintf("[mh4u] texmip: unit %u tex %08X %ux%u fmt %u levels %u (min %u) "
+                              "bias %d filt min %u mag %u mip %u -> surface %ux%u levels %u "
+                              "scale %u\n",
+                              static_cast<unsigned>(unit),
+                              static_cast<unsigned>(texture.config.GetPhysicalAddress()),
+                              static_cast<unsigned>(texture.config.width),
+                              static_cast<unsigned>(texture.config.height),
+                              static_cast<unsigned>(texture.format),
+                              static_cast<unsigned>(texture.config.lod.max_level.Value() + 1),
+                              static_cast<unsigned>(texture.config.lod.min_level.Value()),
+                              static_cast<int>(texture.config.lod.bias.Value()),
+                              static_cast<unsigned>(texture.config.min_filter.Value()),
+                              static_cast<unsigned>(texture.config.mag_filter.Value()),
+                              static_cast<unsigned>(texture.config.mip_filter.Value()),
+                              static_cast<unsigned>(surface.width),
+                              static_cast<unsigned>(surface.height),
+                              static_cast<unsigned>(surface.levels),
+                              static_cast<unsigned>(surface.res_scale));
             }
         }
         // logcube (diag): what the other units of a cube-map draw sample, first 24.

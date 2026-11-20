@@ -142,7 +142,7 @@ per-vertex highlights (`pvhalf`: white pond, see the performance notes).
 - README and release notes: recommend the **USA** game with the **"v1.3 (v1.1)"** update
   (exactly that wording; README updated).
 
-## Open: character shadows camera-dependent (2026-11-20, user slots 8/9, Primal Forest area 1)
+## Fixed: character shadows camera-dependent (2026-11-20/21, user slots 8/9, Primal Forest area 1)
 
 User: on Android the hunter / Palico shadows are stable; on the Vita they are "highly dependent
 on camera angle - sometimes fine, sometimes partial or not visible". Character shadows are now on
@@ -192,6 +192,36 @@ by default (46f60cf2d). Established on the console:
   Swap/flip/no-border variants tried by the user in-game: all wrong. Next: `dbgout_shadow` (new:
   receivers painted (map depth, reference)) - captured once at slot 8 (o_shv) but not yet read;
   a dimmer-red hunter shape on the ground = the lookup works, uniform red = decode/sampling bug.
+
+**Outcome (2026-11-21):** the receivers compared a single map texel, where GL's
+`shadowTexture` compares four and blends them bilinearly. With one tap every map texel was a
+hard square (the hunter's shadow a staircase) and, where the ground's depth sits within a texel
+of the map's (reference ~0.904 against map 0.894-0.93), a pixel-sized lit/shadow speckle whose
+pattern moved with the camera. Now four taps (`ShadowSampleTaps` / `ShadowCompareBilinear`),
+which matches the Android shots: soft shadow edges, no speckle. Cost at slot 9: GPU +9 ms per
+second (~0.3 ms a frame), render thread ~+1 ms a frame; still 30 fps. `shadowonetap` (file or
+flag) restores the single lookup.
+- Ruled out on the way: none of the 14 renderer kill switches changes the floor; vertex
+  processing of casters and receivers on the CPU (`dbgshadowsw dbgshadowrecvsw`) gives the same
+  picture, so the map and the lookup coordinates were right. Note those switches only move the
+  vertex shader to the CPU - the pixels are still our fragment programs.
+- The `dbgout_shadow` view saturates (the post effects brighten it after the program), so it
+  cannot compare the two depths; not worth more time.
+- Found on the way: the program disk cache's version field (48 bytes) cut the key at 47
+  characters - MD5 (32) + '-' + the switch hash (16) is already 49 - so `-noshadow` (the
+  Character shadows option) never reached the file and a toggled option was served the other
+  kind's programs. Field now 80 bytes, file format 2 (old caches start over once).
+- Also: textures' PICA LOD bias is now applied (`Sampler::Apply`, GXM 1/8-level steps;
+  `nolodbias` file/flag to leave it out). MH4U's ground has a -1 level bias on unit 2; small
+  visible effect - the ground is still softer than Android's at 1x (open, below).
+
+## Open: ground textures softer than Android at the same 1x (2026-11-20)
+
+User: "it really is just blurry" - same content (the blue patches are there), less detail.
+Not the HUD copy (HUD 3DS vs 1.33x look the same), not the kill switches. The ground uses
+128x128 textures with 4 mip levels on units 1-2 (`logtexmip`); unit 2 has a -1 level bias,
+now applied, which helped only a little. Next: compare the mip level GXM picks with the PICA's
+(the 240x400 target is rotated; derivatives may come out differently), and the filtering.
 
 ## Idea: one launcher for MH4U and MHXX (2026-11-20, later)
 

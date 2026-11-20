@@ -1834,6 +1834,8 @@ Sampler::Sampler(TextureRuntime&, VideoCore::SamplerParams params) {
     // only then.
     mip_linear = params.mip_filter == TextureFilter::Linear;
     mip_allowed = params.lod_min == 0;
+    // The PICA's LOD bias, in 1/256 of a level; GXM takes 1/8 steps (sceGxmTextureSetLodBias).
+    lod_bias_eighths = (params.lod_bias >= 0 ? params.lod_bias + 16 : params.lod_bias - 16) / 32;
     wrap_s = wrap(params.wrap_s);
     wrap_t = wrap(params.wrap_t);
 }
@@ -1845,6 +1847,22 @@ void Sampler::Apply(SceGxmTexture& texture) const {
             sceGxmTextureSetMipmapCount(&texture, 1);
         } else if (mip_linear) {
             sceGxmTextureSetMipFilter(&texture, SCE_GXM_TEXTURE_MIP_FILTER_ENABLED);
+        }
+        // The texture's own LOD bias, as the GL generator applies it (tex_lod_bias): MH4U gives
+        // its ground textures one, and without it the Vita picked blurrier levels than Android
+        // at the same resolution (2026-11-20). Nothing else sets a bias, so the first texture
+        // seen carries GXM's neutral value. `nolodbias` (file or flag) leaves it out.
+        static const bool no_lod_bias = [] {
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nolodbias", "rb")) {
+                std::fclose(f);
+                return true;
+            }
+            return GxmFlag("nolodbias");
+        }();
+        static const int neutral = static_cast<int>(sceGxmTextureGetLodBias(&texture));
+        if (mip_allowed && !no_lod_bias && lod_bias_eighths != 0) {
+            const int value = std::clamp(neutral + lod_bias_eighths, 0, 63);
+            sceGxmTextureSetLodBias(&texture, static_cast<unsigned>(value));
         }
     }
     const int err_u = sceGxmTextureSetUAddrMode(&texture, wrap_s);

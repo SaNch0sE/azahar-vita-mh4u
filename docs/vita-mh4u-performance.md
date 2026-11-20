@@ -1324,3 +1324,24 @@ are the game's own - Android shows the same). The shadow map pass (`shadowmap`, 
 (P5)") is now a release setting, Display -> Character shadows (`shadows=` in video.txt, default
 on, applies on the next launch; the program cache version carries it). Release fps, on / off:
 slot 9 29.9 / 30.1, slot 4 30.1 / 29.9, slot 7 21.5 / 21.9 - no measurable cost.
+
+## Shadow receivers: four compared taps, as GL (2026-11-21)
+
+The 2D shadow lookup compared one map texel; GL's `shadowTexture` compares the four around
+`uv * size - 0.5` and blends the results by the fraction. One tap left the hunter's shadow a
+staircase and the near-coplanar terrain speckled with a camera-dependent pattern (todo,
+"character shadows camera-dependent"). `ShadowSampleTaps` computes the four tap coordinates from
+a new `shadow_texture_size` uniform (w, h, 1/w, 1/h), samples into lighting's scratch (free
+before lighting runs), the border test runs per tap, and `ShadowCompareBilinear` blends.
+Two emitter rules learnt the hard way: only the first source of a vector op takes a negation
+(the refusal "the second source of a vector operation cannot be negated" sent 17 programs to
+the slow path, black world), and a virtual register must be read through the base it was
+written with (V(84).z written, V(86).x read: garbage, a screen-regular grid of dashes).
+Refused programs are now dumped with `usse_dump` (reason in the console log, `.fq` for
+`tools/usse_host/fs_emit`), which checks a fix on the PC in seconds.
+
+| slot 9, release, warm-ish | gx ms/s | render ms/s |
+|---|---|---|
+| one tap (`shadowonetap`) | 264, 271 | 537, 538 |
+| four taps | 274, 279 | 562, 574 |
+

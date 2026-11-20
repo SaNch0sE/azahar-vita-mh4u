@@ -163,6 +163,7 @@ public:
         UniformSlot blend_color{};
         UniformSlot tex_dims{};
         UniformSlot shadow_texture_bias{};
+        UniformSlot shadow_texture_size{}; ///< (w, h, 1/w, 1/h) of unit 0's shadow map
         UniformSlot lighting_fr_coef{};
         UniformSlot fb_dims{};
         struct Light {

@@ -151,6 +151,14 @@ constexpr uint8_t TmpLightAtten = 0;  ///< lighting: per-light attenuation (.x) 
 constexpr uint8_t TmpShadow = 64;     ///< lighting: the shadow texture's colour (4)
 constexpr uint8_t TmpLightMem = 68;   ///< lighting: a light's parameters loaded from the
                                       ///< uniform buffer (24: the SA layout, six quads)
+// The bilinear shadow lookup (SampleTextures, before lighting needs its scratch): four
+// taps' texels in TmpLightMem's first 16, the footprint fraction (2) and the reference (1)
+// after them, the four compare results last; the taps' coordinates in TmpSnap's home,
+// which the combiner stages fill only later.
+constexpr uint8_t TmpShTap = 68;      ///< four taps' texels (4 each)
+constexpr uint8_t TmpShF = 84;        ///< fx, fy (2); the reference depth at +2 (1)
+constexpr uint8_t TmpShR = 88;        ///< the four compare results (4)
+constexpr uint8_t TmpShUv = 104;      ///< the four taps' coordinates (2 each)
 constexpr uint8_t TmpProj = 92;       ///< unit 0's projected coordinate (2), or the depth (1)
 constexpr uint8_t TmpTex3 = 96;       ///< the procedural texture's colour (4)
 constexpr uint8_t TmpProcUv = 100;    ///< proctex: u, v (2), the level (.z)
@@ -279,6 +287,8 @@ private:
     void PlanInputs();
     void PlanUniforms();
     void SampleTextures();
+    void ShadowSampleTaps(Reg coord, uint32_t sampler_sa);
+    void ShadowCompareBilinear();
     void RoundPrimary();
     void Lighting();
     void LightingLutLookup(Sampler sampler, bool abs_input, bool two_sided);
@@ -425,6 +435,8 @@ private:
     /// second light out of registers (MH4U's two-light world, 2026-11-16).
     uint32_t literal_count = LiteralCount;
     uint32_t sa_shadow_bias = 0;          ///< shadow_texture_bias, in depth units
+    uint32_t sa_shadow_size = 0;          ///< shadow_texture_size: (w, h, 1/w, 1/h)
+    bool shadow_bilinear = false;         ///< four compared taps, blended (ShadowSampleTaps)
     void ShadowCompare();
     void ShadowOutput();
     bool uses_border = false;             ///< a unit clamps to its border colour
@@ -933,6 +945,7 @@ void FragmentEmitter::PlanUniforms() {
     }
     if (shadow_compare) {
         sa_shadow_bias = AllocateUniform("shadow_texture_bias", 1, 1);
+        sa_shadow_size = AllocateUniform("shadow_texture_size", 4, 1);
     }
     if (uses_proctex && !proctex_strip) {
         sa_proctex = AllocateUniform("proctex_lut_offset", 1, 1);
@@ -1155,6 +1168,86 @@ void FragmentEmitter::ShadowCompare() {
         e.MoveInternal({I0, 0xf}, {I0, XXXX}, Pred::None, true);
     }
     StoreVec4(texel, I0);
+}
+
+void FragmentEmitter::ShadowSampleTaps(Reg coord, uint32_t sampler_sa) {
+    // GL's shadowTexture footprint: p = uv * size - 0.5, the four texels around it (their
+    // centres (floor(p) + {0, 1} + 0.5) / size), weights from frac(p). One compared lookup
+    // left every map texel a hard square and, where the ground's depth sits within a texel
+    // of the map's, a pixel-sized lit/shadow speckle that moved with the camera (MH4U's
+    // terrain, 2026-11-21).
+    const Src w = SaScalar(sa_shadow_size), h = SaScalar(sa_shadow_size + 1);
+    const Src inv_w = SaScalar(sa_shadow_size + 2), inv_h = SaScalar(sa_shadow_size + 3);
+    e.Vec(VecOp::Mul, {I0, 0x1}, {coord, XXXX}, w, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x2}, {coord, YYYY}, h, Pred::None, true);
+    // Only the first source of a vector operation takes a negation.
+    e.Vec(VecOp::Add, {I0, 0x3}, {ConstHalf.reg, ConstHalf.swz, Mod::Neg}, {I0, XYZW},
+          Pred::None, true);
+    e.Vec(VecOp::Frc, {I1, 0x3}, {I0, XYZW}, {I0, XYZW}, Pred::None, true); // f
+    e.Vec(VecOp::Add, {Reg::V(TmpShF), 0x3}, {I1, XYZW}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x3}, {I1, XYZW, Mod::Neg}, {I0, XYZW}, Pred::None, true); // floor
+    e.Vec(VecOp::Add, {I0, 0x3}, {I0, XYZW}, ConstHalf, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, inv_w, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x2}, {I0, YYYY}, inv_h, Pred::None, true);
+    // (0, 0), (1, 0), (0, 1), (1, 1)
+    for (uint8_t k = 0; k < 4; k++) {
+        const Reg uv = Reg::V(static_cast<uint8_t>(TmpShUv + k * 2));
+        if (k & 1) {
+            e.Vec(VecOp::Add, {uv, 0x1}, {I0, XXXX}, inv_w, Pred::None, true);
+        } else {
+            e.Vec(VecOp::Add, {uv, 0x1}, {I0, XXXX}, ConstZero, Pred::None, true);
+        }
+        if (k & 2) {
+            e.Vec(VecOp::Add, {uv, 0x2}, {I0, YYYY}, inv_h, Pred::None, true);
+        } else {
+            e.Vec(VecOp::Add, {uv, 0x2}, {I0, YYYY}, ConstZero, Pred::None, true);
+        }
+    }
+    for (uint8_t k = 0; k < 4; k++) {
+        e.Sample2D(Reg::V(static_cast<uint8_t>(TmpShTap + k * 4)),
+                   Reg::V(static_cast<uint8_t>(TmpShUv + k * 2)), static_cast<uint8_t>(sampler_sa),
+                   nullptr, 0, false, false);
+    }
+}
+
+void FragmentEmitter::ShadowCompareBilinear() {
+    // ShadowCompare at each of the four taps (lit: the tap's penumbra byte, shadow: 0), then
+    // mix(mix(r00, r10, fx), mix(r01, r11, fx), fy) into all four lanes of unit 0's colour.
+    const Reg w_pair = Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u));
+    const Swizzle w_swz = (texcoord0_w_pa & 1) ? YYYY : XXXX;
+    const Src bias = SaScalar(sa_shadow_bias);
+    e.Vec(VecOp::Min, {I0, 0x1}, {w_pair, w_swz, Mod::Abs}, ConstOne, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x1}, {bias.reg, bias.swz, Mod::Neg}, {I0, XXXX}, Pred::None, true);
+    // Written and read through the same base: the allocator places a virtual register by
+    // the base it is addressed with, so V(84).z and V(86).x are not the same value.
+    e.Vec(VecOp::Add, {Reg::V(TmpShF + 2), 0x1}, {I0, XXXX}, ConstZero, Pred::None, true);
+    const Src ref = Scalar(Bank::Virtual, TmpShF + 2);
+    for (uint8_t k = 0; k < 4; k++) {
+        const Vec4Loc tap{Bank::Virtual, static_cast<uint8_t>(TmpShTap + k * 4)};
+        e.MoveF32x4({I1, 0xf}, Lit(LitShadowK0).reg, Lit(LitShadowK2).reg, true);
+        e.Dot({I2, 0x1}, {tap.Pair(0), XYZW}, {I1, XYZW}, true, Pred::None, true); // map depth
+        e.Vec(VecOp::Add, {I2, 0x1}, {ref.reg, ref.swz, Mod::Neg}, {I2, XXXX}, Pred::None, true);
+        e.Test(Cond::Gt, 2, {I2}, 0, ConstZero, true);
+        LoadVec4(I1, tap);
+        e.MoveInternal({I0, 0x1}, ConstZero, Pred::None, true);
+        e.MoveInternal({I0, 0x1}, {I1, XXXX}, Pred::P2, true);
+        e.Vec(VecOp::Add, {Reg::V(static_cast<uint8_t>(TmpShR + (k & 2))), k & 1 ? uint8_t{0x2} : uint8_t{0x1}},
+              {I0, XXXX}, ConstZero, Pred::None, true);
+    }
+    const Src r00 = Scalar(Bank::Virtual, TmpShR), r10 = Scalar(Bank::Virtual, TmpShR + 1);
+    const Src r01 = Scalar(Bank::Virtual, TmpShR + 2), r11 = Scalar(Bank::Virtual, TmpShR + 3);
+    const Src fx = Scalar(Bank::Virtual, TmpShF), fy = Scalar(Bank::Virtual, TmpShF + 1);
+    e.Vec(VecOp::Add, {I0, 0x1}, {r00.reg, r00.swz, Mod::Neg}, r10, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, fx, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX}, r00, Pred::None, true); // top
+    e.Vec(VecOp::Add, {I0, 0x2}, {r01.reg, r01.swz, Mod::Neg}, r11, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x2}, {I0, YYYY}, fx, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x2}, {I0, YYYY}, r01, Pred::None, true); // bottom
+    e.Vec(VecOp::Add, {I0, 0x2}, {I0, XXXX, Mod::Neg}, {I0, YYYY}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x2}, {I0, YYYY}, fy, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX}, {I0, YYYY}, Pred::None, true);
+    e.MoveInternal({I0, 0xf}, {I0, XXXX}, Pred::None, true);
+    StoreVec4({Bank::Virtual, TmpTex0}, I0);
 }
 
 void FragmentEmitter::ShadowOutput() {
@@ -1742,8 +1835,27 @@ void FragmentEmitter::SampleTextures() {
                 coords[unit] = into;
             }
         }
-        e.Sample2D(Reg::V(static_cast<uint8_t>(TmpTex0 + unit * 4)), coords[unit],
-                   SamplerSa(sampler_index), nullptr, 0, false, coord_f16);
+        if (unit == 0 && shadow_compare) {
+            // The four-texel footprint unless a diagnostic wants the single lookup.
+            static const bool one_tap = [] {
+                if (std::FILE* f = std::fopen(VITA_DATA_DIR "/shadowonetap", "rb")) {
+                    std::fclose(f);
+                    return true;
+                }
+                return GxmFlag("shadowonetap") || GxmFlag("dbgshadowzero") ||
+                       GxmFlag("dbgshadowlit") || GxmFlag("dbgshadowref") ||
+                       GxmFlag("dbgshadowsil") || GxmFlag("dbgshadowdepth") ||
+                       Pica::Shader::Generator::Cg::GetDebugOutput() ==
+                           Pica::Shader::Generator::Cg::DebugOutput::View;
+            }();
+            shadow_bilinear = !one_tap && !coord_f16;
+        }
+        if (unit == 0 && shadow_bilinear) {
+            ShadowSampleTaps(coords[0], SamplerSa(sampler_index));
+        } else {
+            e.Sample2D(Reg::V(static_cast<uint8_t>(TmpTex0 + unit * 4)), coords[unit],
+                       SamplerSa(sampler_index), nullptr, 0, false, coord_f16);
+        }
         sampler_index++;
         any = true;
     }
@@ -1764,21 +1876,33 @@ void FragmentEmitter::SampleTextures() {
             continue;
         }
         const Vec4Loc colour{Bank::SecAttr, static_cast<uint8_t>(sa_border + unit * 4)};
-        const Vec4Loc texel{Bank::Virtual, static_cast<uint8_t>(TmpTex0 + unit * 4)};
-        const auto replace_when = [&](Cond cond, uint8_t chan, const Src& bound) {
-            e.Test(cond, 2, {coords[unit]}, chan, bound, true);
-            e.MoveInternal({texel.Pair(0), 0x3}, {colour.Pair(0), XYZW}, Pred::P2, true);
-            e.MoveInternal({texel.Pair(1), 0x3}, {colour.Pair(1), XYZW}, Pred::P2, true);
-        };
-        for (uint8_t chan = 0; chan < 2; chan++) {
-            if (chan == 0 ? border.enable_s : border.enable_t) {
-                replace_when(Cond::Lt, chan, ConstZero);
-                replace_when(Cond::Gt, chan, ConstOne);
+        // The bilinear shadow lookup tests each of its four taps' own coordinates.
+        const uint32_t taps = (unit == 0 && shadow_bilinear) ? 4 : 1;
+        for (uint32_t k = 0; k < taps; k++) {
+            const Vec4Loc texel{Bank::Virtual,
+                                static_cast<uint8_t>(taps == 4 ? TmpShTap + k * 4
+                                                               : TmpTex0 + unit * 4)};
+            const Reg at = taps == 4 ? Reg::V(static_cast<uint8_t>(TmpShUv + k * 2))
+                                     : coords[unit];
+            const auto replace_when = [&](Cond cond, uint8_t chan, const Src& bound) {
+                e.Test(cond, 2, {at}, chan, bound, true);
+                e.MoveInternal({texel.Pair(0), 0x3}, {colour.Pair(0), XYZW}, Pred::P2, true);
+                e.MoveInternal({texel.Pair(1), 0x3}, {colour.Pair(1), XYZW}, Pred::P2, true);
+            };
+            for (uint8_t chan = 0; chan < 2; chan++) {
+                if (chan == 0 ? border.enable_s : border.enable_t) {
+                    replace_when(Cond::Lt, chan, ConstZero);
+                    replace_when(Cond::Gt, chan, ConstOne);
+                }
             }
         }
     }
     if (shadow_compare) {
-        ShadowCompare();
+        if (shadow_bilinear) {
+            ShadowCompareBilinear();
+        } else {
+            ShadowCompare();
+        }
     }
     if (uses_shadow) {
         // shadow = tex, or 1 - tex when inverted.

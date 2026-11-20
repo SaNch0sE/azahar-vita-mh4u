@@ -15,8 +15,12 @@ namespace {
 
 constexpr u32 FileMagic = 0x4350484D;   // "MHPC"
 constexpr u32 RecordMagic = 0x5250484D; // "MHPR"
-constexpr u32 FormatVersion = 1;
-constexpr std::size_t VersionBytes = 48;
+// Format 2: the version field grew from 48 to 80 bytes. At 48 the key - the program
+// sources' MD5 (32), '-', the switch hash (16) - was already cut to 47, so the suffixes after
+// it (-noshadow for the Character shadows option, -1tap) never reached the file, and a
+// toggled option was served the other kind's programs (2026-11-21).
+constexpr u32 FormatVersion = 2;
+constexpr std::size_t VersionBytes = 80;
 /// Programs are a few KiB; anything larger is a damaged record.
 constexpr u32 MaxProgram = 64 * 1024;
 /// The card is shared with the saves: past this the cache stops growing.

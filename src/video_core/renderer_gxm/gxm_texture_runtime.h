@@ -583,6 +583,7 @@ private:
     SceGxmTextureAddrMode wrap_t{};
     bool mip_linear{};
     bool mip_allowed{true};
+    int lod_bias_eighths{}; ///< the PICA LOD bias in GXM's 1/8-level steps
 };
 
 class DebugScope {
