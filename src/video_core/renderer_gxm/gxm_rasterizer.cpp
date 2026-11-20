@@ -7445,6 +7445,14 @@ void RasterizerGxm::Op2dCount(bool opaque, VideoCore::SurfaceId tex0) {
     }
 }
 
+/// The HUD resolution the app started with. Changing it while running swapped the targets
+/// under frames in flight and left the picture flickering until a restart (2026-11-20), so a
+/// new choice is only saved and applies on the next launch (the menu offers a restart).
+static u32 HudModeAtLaunch() {
+    static const u32 mode = Video().hudres;
+    return mode;
+}
+
 bool RasterizerGxm::HudEnabled() const {
     static const bool killed = [] {
         if (std::FILE* f = std::fopen(VITA_DATA_DIR "/nohudres", "rb")) {
@@ -7453,7 +7461,7 @@ bool RasterizerGxm::HudEnabled() const {
         }
         return GxmFlag("nohudres");
     }();
-    return !killed && Video().hudres != 0;
+    return !killed && HudModeAtLaunch() != 0;
 }
 
 bool RasterizerGxm::HudOverlaps(PAddr addr, u32 size) {
@@ -7469,7 +7477,7 @@ bool RasterizerGxm::HudEnsurePool() {
     // height along the screen's width (960 wide, 906 for 5:3); 1.5x for the lighter setting.
     // 1 = the screen's resolution; the others a scale of the 3DS's 240x400 (rounded up to 8):
     // 2 = 1.5x (360x600), 3 = 1.25x, 4 = 1.33x, 5 = 1.4x, 6 = 1.45x.
-    const u32 mode = Video().hudres;
+    const u32 mode = HudModeAtLaunch();
     u32 w = 544u;
     u32 h = Video().wide ? 960u : 906u;
     if (mode >= 2) {

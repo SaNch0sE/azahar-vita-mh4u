@@ -322,9 +322,9 @@ void Ui::BuildSettings() {
     category = CategoryHud;
     choice("HUD resolution",
            "Draws the game's HUD, text and menus sharper than the 3DS's 400x240, over the "
-           "stretched 3D picture. Higher steps are sharper and cost more GPU time (1.5x holds "
-           "30 fps in most places). FXAA and the Sharp upscale filter do not apply to those "
-           "frames.",
+           "stretched 3D picture (applies on the next launch). Higher steps are sharper and "
+           "cost more GPU time (1.5x holds 30 fps in most places). FXAA and the Sharp upscale "
+           "filter do not apply to those frames.",
            true,
 #ifdef VITA_DIAGNOSTICS
            {"3DS (400x240)", "1.25x", "1.33x", "1.4x", "1.45x", "1.5x", "Screen"},
@@ -353,6 +353,7 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().hudres = stored[value < 0 || value > 6 ? 0 : value];
                GxmRenderer::SaveVideoOptions();
            });
+    settings.back().restart = true;
     toggle("FPS counter", "Shows the emulation speed and the frame rate in the top right corner.",
            true, [] { return GxmRenderer::Video().show_fps; },
            [](bool value) {
@@ -741,11 +742,12 @@ Ui::Action Ui::DrawPauseSettings() {
 
 Ui::Action Ui::DrawRestartPrompt() {
     Action action = Action::None;
-    BeginCentered("##restart", 600.0f, 300.0f);
+    BeginCenteredAuto("##restart", 600.0f);
     const bool appearing = ImGui::IsWindowAppearing();
     Heading("Restart needed");
     ImGui::Separator();
-    ImGui::TextWrapped("A setting you changed (render scale) takes effect after a restart. "
+    ImGui::TextWrapped("A setting you changed (render scale or HUD resolution) takes effect "
+                       "after a restart. "
                        "Restart now? Progress since your last in-game save (and since your "
                        "last save state) will be lost.");
     ImGui::Spacing();
