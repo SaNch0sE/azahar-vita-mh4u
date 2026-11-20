@@ -7,6 +7,7 @@
 #include <set>
 #include <bit>
 #include <cstdio>
+#include "common/vita_data_dir.h"
 #include <stdexcept>
 #include <string>
 #include <fmt/format.h>
@@ -567,7 +568,17 @@ void FragmentEmitter::PlanInputs() {
     // the procedural texture: per sprite pixel that was the whole lighting computation, ~24 ms
     // of the quest counter's 76 ms HUD scene at hudres=1 (2026-11-20). `keepdeadlight` keeps it.
     {
-        static const bool keep_dead = GxmFlag("keepdeadlight");
+        // A release kill switch too (file ux0:data/mh4u/keepdeadlight), like notexrepeat.
+        static const bool keep_dead = [] {
+            if (GxmFlag("keepdeadlight")) {
+                return true;
+            }
+            if (std::FILE* f = std::fopen(VITA_DATA_DIR "/keepdeadlight", "rb")) {
+                std::fclose(f);
+                return true;
+            }
+            return false;
+        }();
         if (uses_lighting && !uses_primary_color && !uses_secondary_color && !keep_dead) {
             uses_lighting = false;
         }

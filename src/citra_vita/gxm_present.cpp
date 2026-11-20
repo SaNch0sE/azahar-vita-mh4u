@@ -278,6 +278,22 @@ void LogMemBlock(const char* name, SceKernelMemBlockType type, SceSize size, Sce
     if (uid >= 0) {
         LOG_INFO(Frontend, "memblock {}: {} KiB {} -> {:#x}; {} so far {} KiB", name, size >> 10,
                  kind, static_cast<u32>(uid), kind, totals[slot] >> 10);
+    } else {
+        // Release builds print no LOG_* lines: a refused memblock goes to the console log
+        // directly (capped), with what this file already holds per kind, so an out-of-memory
+        // picture (textures missing) names the allocation that failed.
+        static u32 refused = 0;
+        if (++refused <= 16 || refused % 256 == 0) {
+            sceClibPrintf("[mh4u] memblock %s refused: %u KiB %s (%#x), %u times; held RW %u "
+                          "UNCACHE %u CDRAM %u PHYCONT %u other %u KiB\n",
+                          name, static_cast<unsigned>(size >> 10), kind,
+                          static_cast<unsigned>(uid), static_cast<unsigned>(refused),
+                          static_cast<unsigned>(totals[0] >> 10),
+                          static_cast<unsigned>(totals[1] >> 10),
+                          static_cast<unsigned>(totals[2] >> 10),
+                          static_cast<unsigned>(totals[3] >> 10),
+                          static_cast<unsigned>(totals[4] >> 10));
+        }
     }
 }
 
@@ -758,10 +774,15 @@ void* GpuAlloc(SceKernelMemBlockType type, u32 size, SceGxmMemoryAttribFlags att
         // The caller halves its ask and comes back, and once a pool is full it stays full,
         // so this is said a few times and then only occasionally.
         static u64 pool_out_reports = 0;
-        if (++pool_out_reports <= 4 || pool_out_reports % 1024 == 0) {
+        if (++pool_out_reports <= 8 || pool_out_reports % 1024 == 0) {
             LOG_WARNING(Frontend, "pool {} is out: {} KiB wanted, {} of {} KiB used, {} times",
                         pool->name, size >> 10, pool->used >> 10, pool->size >> 10,
                         pool_out_reports);
+            sceClibPrintf("[mh4u] pool %s is out: %u KiB wanted, %u of %u KiB used, %u times\n",
+                          pool->name, static_cast<unsigned>(size >> 10),
+                          static_cast<unsigned>(pool->used >> 10),
+                          static_cast<unsigned>(pool->size >> 10),
+                          static_cast<unsigned>(pool_out_reports));
         }
     }
     const u32 align = type == SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW             ? 256 * 1024
@@ -958,6 +979,12 @@ public:
         chunks.clear();
         live.clear();
         used = 0;
+    }
+
+    /// One chunk of `size` taken now (at boot, before CreatePools hands the partition to the
+    /// pools), so later growth is only needed past it.
+    bool Reserve(u32 size) {
+        return chunks.empty() && AddChunk(size);
     }
 
     [[nodiscard]] u32 Reserved() const noexcept {
@@ -1263,6 +1290,14 @@ bool Initialize() {
     }
     // Razor GPU Live wants libgxm up, as vitaGL orders it.
     StartGpuLive();
+    // Program code first: the patcher's USSE heaps grew 128-256 KiB at a time from the 32 MB
+    // CreatePools leaves free, and a fresh-cache session (hundreds of programs made in play,
+    // with the HUD-resolution targets and a full texture cache) found that margin gone - the
+    // kernel refused even 128 KiB, new programs failed, their draws were dropped: black sky,
+    // untextured ground, the previous area showing through (2026-11-20, 0.5 MiB in use at the
+    // first refusal). Taken before the pools, they cannot be crowded out.
+    patcher_vertex_usse_heap.Reserve(2 * 1024 * 1024);
+    patcher_fragment_usse_heap.Reserve(4 * 1024 * 1024);
     CreatePools();
 
     // The immediate context and its ring buffers. Both hold default uniform buffers, which a

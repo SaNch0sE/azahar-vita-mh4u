@@ -585,6 +585,7 @@ private:
     void HudResolve(const char* why);
     /// Back to Idle without copying anything back (a fill over the target starts a frame).
     void HudAbandon();
+    void HudFallback(int reason);
     bool HudTransfer(const Pica::DisplayTransferConfig& config);
     bool HudOverlaps(PAddr addr, u32 size);
     bool gpu_blit_linear = false; ///< GpuBlit samples bilinearly (HudResolve's scale-down)

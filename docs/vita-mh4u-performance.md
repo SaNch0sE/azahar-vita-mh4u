@@ -1284,3 +1284,17 @@ skips lighting no stage reads (`keepdeadlight` restores it):
 Pictures identical (counter: only the fps overlay differs; field: animation only). Remaining
 2D price: per-triangle floor ~18-21 ms, texture ~19 ms, procedural texture ~11 ms (~4 ms of it
 avoidable by computing the strip), blending/overdraw (unblended floor 18 ms).
+
+**Broken world after a normal load (2026-11-20, fixed):** with HUD resolution on and a fresh
+program cache (a new build, or `programs.bin` deleted), a normal load into a quest could show a
+black sky, untextured ground and the previous area under the HUD. The kernel refused the shader
+patcher's USSE heaps (`azahar-gxm-usse`, 128 KiB USER_RW_UNCACHE, with only ~0.5 MiB of them in
+use): they grew from the 32 MiB CreatePools leaves free, and hundreds of programs made during
+play plus a full texture cache had used that margin up, so new programs failed and their draws
+were dropped. Not the lighting change (broken with `keepdeadlight` too). Fix: the vertex and
+fragment USSE heaps take 2 / 4 MiB at boot, before CreatePools. Verified: fresh-cache normal load
+with HUD resolution, 1,357 programs made in play, no refusals, picture correct. Release now prints
+refused memblocks and pool exhaustion (`[mh4u] memblock ... refused`, `[mh4u] pool ... is out`),
+`keepdeadlight` is also a file switch, and `[mh4u] hudres fallbacks: ...` counts why frames go out
+with the 3DS-resolution HUD (the text "wobble" the user saw once at the counter: 17 of 23 frames
+hi-res; not reproduced since).

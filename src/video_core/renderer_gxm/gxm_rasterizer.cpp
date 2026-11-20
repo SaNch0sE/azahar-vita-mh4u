@@ -4080,6 +4080,10 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
             // HUD resolution: the grade marks the picture's rectangle; the first 2D draw after
             // it starts the screen-sized target.
             if ((hud_state == HudState::Idle || hud_state == HudState::Shown) && HudEnabled() &&
+                frame_index < hud_block_until) {
+                HudFallback(4); // blocked after a depth draw
+            }
+            if ((hud_state == HudState::Idle || hud_state == HudState::Shown) && HudEnabled() &&
                 frame_index >= hud_block_until && fb->color_id) {
                 const auto vp = setup.helper->Viewport();
                 hud_state = HudState::Armed;
@@ -4106,6 +4110,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                 // A 2D draw that needs depth cannot be drawn at hi-res: this frame goes back
                 // to the guest picture, and the next few start no redirect.
                 hud_block_until = frame_index + 4;
+                HudFallback(0);
                 if (hud_state == HudState::Active) {
                     HudResolve("depth");
                 } else if (hud_state == HudState::Armed) {
@@ -4113,6 +4118,7 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
                 }
             } else if (hud_state == HudState::Armed && post) {
                 if (!HudBegin()) {
+                    HudFallback(1);
                     HudAbandon();
                 }
             }
@@ -7204,6 +7210,22 @@ void RasterizerGxm::HudResolve(const char* why) {
     hud_state = HudState::Idle;
 }
 
+void RasterizerGxm::HudFallback(int reason) {
+    // Why frames go out with the 3DS-resolution HUD (the text "wobbles" between the two when
+    // this happens a few times a second), printed every ~5 s of HUD activity (release).
+    static std::array<u32, 5> counts{};
+    static u32 seen = 0;
+    if (reason >= 0 && reason < 5) {
+        counts[reason]++;
+    }
+    if (++seen % 150 == 0) {
+        sceClibPrintf("[mh4u] hudres fallbacks: depth draw %u, begin failed %u, no 2D %u, "
+                      "fill %u, blocked frames %u (frame %u)\n",
+                      counts[0], counts[1], counts[2], counts[3], counts[4], frame_index);
+        counts = {};
+    }
+}
+
 void RasterizerGxm::HudAbandon() {
     if (hud_state == HudState::Active) {
         hud_work = -1;
@@ -7418,6 +7440,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         }
         HudResolve("transfer");
     } else if (hud_state == HudState::Armed) {
+        HudFallback(2);
         HudAbandon(); // a frame without 2D draws (a movie, a cutscene): nothing was copied
     }
     if (EnsureResources() && SmoothDisplayTransfer(config)) {
@@ -7499,6 +7522,9 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     // A fill over the graded target starts the next frame: the HUD picture is done with.
     if (hud_state != HudState::Idle &&
         HudOverlaps(config.GetStartAddress(), config.GetEndAddress() - config.GetStartAddress())) {
+        if (hud_state != HudState::Shown) {
+            HudFallback(3);
+        }
         HudAbandon();
     }
     InvalidateDisplaySlots(config.GetStartAddress(), config.GetEndAddress() - config.GetStartAddress());
