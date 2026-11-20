@@ -1111,6 +1111,12 @@ void FragmentEmitter::ShadowCompare() {
     const Reg w_pair = Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u));
     const Swizzle w_swz = (texcoord0_w_pa & 1) ? YYYY : XXXX;
     e.Vec(VecOp::Min, {I0, 0x1}, {w_pair, w_swz, Mod::Abs}, ConstOne, Pred::None, true);
+    // dbgshadowsil (diag): the reference depth is 1 - bias, ignoring w, so every caster texel
+    // shadows - separates a wrong w (shadows turn stable) from wrong coordinates or lighting.
+    static const bool sil = GxmFlag("dbgshadowsil");
+    if (sil) {
+        e.MoveInternal({I0, 0x1}, ConstOne, Pred::None, true);
+    }
     const Src bias = SaScalar(sa_shadow_bias);
     e.Vec(VecOp::Add, {I0, 0x1}, {bias.reg, bias.swz, Mod::Neg}, {I0, XXXX}, Pred::None, true);
     // map depth - reference > 0: lit.
