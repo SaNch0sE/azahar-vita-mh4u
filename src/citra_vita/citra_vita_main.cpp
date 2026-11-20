@@ -1274,7 +1274,12 @@ int EmulatorMain() {
     // One screen by default: the port is played with the Heavenfall mod's single-screen mode
     // (the touch screen's menus moved to the top screen), and the top screen then fills the
     // display. The pause menu's Screen layout still switches back.
+#ifdef VITA_GAME_MHXX
+    // The XX test app: both screens (no single-screen mod), Hybrid by default.
+    Settings::values.layout_option = Settings::LayoutOption::HybridScreen;
+#else
     Settings::values.layout_option = Settings::LayoutOption::SingleScreen;
+#endif
     // Picture shape (video.txt `wide`): the whole display for the mod's 16:9 option.
     Settings::values.aspect_ratio = GxmRenderer::Video().wide ? Settings::AspectRatio::Stretch
                                                              : Settings::AspectRatio::Default;

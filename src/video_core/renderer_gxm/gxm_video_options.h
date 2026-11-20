@@ -25,7 +25,11 @@ struct VideoOptions {
     /// The top screen across the whole display (16:9) instead of the 3DS's 5:3 with side
     /// bars: for the Heavenfall mod built with --cheat-aspect-ratio 16:9, which widens the
     /// game's views and interface for a stretched picture.
+#ifdef VITA_GAME_MHXX
+    bool wide = false; // the XX test app: two screens, the game's own shape
+#else
     bool wide = true; // default 16:9 since 2026-11-20 (the user plays the Heavenfall 16:9 build)
+#endif
     /// The speed / frame rate counter in the top right corner (Ui::DrawStatsHud).
     bool show_fps = false;
     /// "Smooth gradients": the game's dither pattern off (render word bits, Mh4uHooks) and the
@@ -35,7 +39,11 @@ struct VideoOptions {
     /// "HUD resolution": the game's 2D layer (HUD, text, menus) drawn at the screen's
     /// resolution over the stretched 3D picture (RasterizerGxm, HudBegin). 0 off (400x240),
     /// 1 the screen's resolution, 2 lighter (1.5x), 3 1.25x, 4 1.33x, 5 1.4x, 6 1.45x. Uses the 8-bit display copies.
+#ifdef VITA_GAME_MHXX
+    u32 hudres = 0; // the XX test app: the sharp HUD is tuned to MH4U's single-screen layout
+#else
     u32 hudres = 4; // 1.33x by default since 2026-11-20 (headroom for Sharp / FXAA)
+#endif
     /// "Character shadows": MH4U's real-time shadow map (hunters, monsters) drawn and read by the
     /// lit materials, as on the 3DS; off draws them unshadowed (the map's pass is dropped).
     /// Applies on the next launch (the programs differ).

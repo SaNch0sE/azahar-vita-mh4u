@@ -266,7 +266,7 @@ void Ui::BuildSettings() {
            true, [] { return Settings::values.enable_audio_stretching.GetValue(); },
            [](bool value) { Settings::values.enable_audio_stretching = value; });
     category = CategoryDisplay;
-#ifdef VITA_DIAGNOSTICS
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_GAME_MHXX)
     choice("Screen layout", "How the two screens are arranged on the display.", true,
            {"Default", "Single screen", "Large screen", "Side by side", "Hybrid"},
            // The list's order, not the enum's: SeparateWindows sits between SideScreen and
