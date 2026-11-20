@@ -43,7 +43,7 @@ VideoOptions Load() {
         } else if (std::strcmp(line, "smooth") == 0) {
             o.smooth = v != 0;
         } else if (std::strcmp(line, "hudres") == 0) {
-            o.hudres = v <= 2 ? static_cast<u32>(v) : 0u;
+            o.hudres = v <= 6 ? static_cast<u32>(v) : 0u;
         }
     }
     std::fclose(f);

@@ -7467,9 +7467,18 @@ bool RasterizerGxm::HudOverlaps(PAddr addr, u32 size) {
 bool RasterizerGxm::HudEnsurePool() {
     // The rotated top screen: the target's width runs along the screen's height (544), its
     // height along the screen's width (960 wide, 906 for 5:3); 1.5x for the lighter setting.
-    const bool light = Video().hudres == 2;
-    const u32 w = light ? 360u : 544u;
-    const u32 h = light ? 600u : (Video().wide ? 960u : 906u);
+    // 1 = the screen's resolution; the others a scale of the 3DS's 240x400 (rounded up to 8):
+    // 2 = 1.5x (360x600), 3 = 1.25x, 4 = 1.33x, 5 = 1.4x, 6 = 1.45x.
+    const u32 mode = Video().hudres;
+    u32 w = 544u;
+    u32 h = Video().wide ? 960u : 906u;
+    if (mode >= 2) {
+        static constexpr float scales[] = {1.5f, 1.25f, 4.0f / 3.0f, 1.4f, 1.45f};
+        const float k = scales[std::min<u32>(mode, 6u) - 2u];
+        const auto up8 = [](float v) { return (static_cast<u32>(v + 0.5f) + 7u) & ~7u; };
+        w = up8(240.0f * k);
+        h = up8(400.0f * k);
+    }
     if (hud_pool_w == w && hud_pool_h == h && hud_pool[0] && hud_fbs[0]) {
         return true;
     }

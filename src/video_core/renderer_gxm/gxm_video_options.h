@@ -33,7 +33,7 @@ struct VideoOptions {
     bool smooth = true; // default on since 2026-11-20 (the user: sky bands gone, no cost)
     /// "HUD resolution": the game's 2D layer (HUD, text, menus) drawn at the screen's
     /// resolution over the stretched 3D picture (RasterizerGxm, HudBegin). 0 off (400x240),
-    /// 1 the screen's resolution, 2 lighter (1.5x). Uses the 8-bit display copies.
+    /// 1 the screen's resolution, 2 lighter (1.5x), 3 1.25x, 4 1.33x, 5 1.4x, 6 1.45x. Uses the 8-bit display copies.
     u32 hudres = 2;
 };
 

@@ -321,27 +321,38 @@ void Ui::BuildSettings() {
            });
     category = CategoryHud;
     choice("HUD resolution",
-           "Draws the game's HUD, text and menus at the Vita's resolution over the stretched 3D "
-           "picture: sharp, readable text. Costs GPU time (a few frames per second less in heavy "
-           "areas; the lighter setting costs less). FXAA and the Sharp upscale filter do not "
-           "apply to those frames.",
+           "Draws the game's HUD, text and menus sharper than the 3DS's 400x240, over the "
+           "stretched 3D picture. Higher steps are sharper and cost more GPU time (1.5x holds "
+           "30 fps in most places). FXAA and the Sharp upscale filter do not apply to those "
+           "frames.",
+           true,
 #ifdef VITA_DIAGNOSTICS
-           true, {"3DS (400x240)", "Screen", "Screen, lighter (1.5x)"},
-           [] { return static_cast<int>(GxmRenderer::Video().hudres); },
-           [](int value) {
-               GxmRenderer::Video().hudres = static_cast<u32>(value < 0 || value > 2 ? 0 : value);
-               GxmRenderer::SaveVideoOptions();
-           });
+           {"3DS (400x240)", "1.25x", "1.33x", "1.4x", "1.45x", "1.5x", "Screen"},
 #else
-           // The full "Screen" setting costs too much GPU time to play with; the release
-           // offers the 1.5x one (a saved hudres=1 still works, shown as on).
-           true, {"3DS (400x240)", "Screen (1.5x)"},
-           [] { return GxmRenderer::Video().hudres != 0 ? 1 : 0; },
+           // The full "Screen" setting costs too much GPU time to play with (a saved hudres=1
+           // still works, shown as 1.5x).
+           {"3DS (400x240)", "1.25x", "1.33x", "1.4x", "1.45x", "1.5x"},
+#endif
+           // List order against the stored value: 0 off, 3..6 = 1.25x..1.45x, 2 = 1.5x,
+           // 1 = the screen (diagnostics only).
+           [] {
+               switch (GxmRenderer::Video().hudres) {
+               case 0: return 0;
+               case 3: return 1;
+               case 4: return 2;
+               case 5: return 3;
+               case 6: return 4;
+#ifdef VITA_DIAGNOSTICS
+               case 1: return 6;
+#endif
+               default: return 5;
+               }
+           },
            [](int value) {
-               GxmRenderer::Video().hudres = value == 1 ? 2u : 0u;
+               static constexpr u32 stored[] = {0, 3, 4, 5, 6, 2, 1};
+               GxmRenderer::Video().hudres = stored[value < 0 || value > 6 ? 0 : value];
                GxmRenderer::SaveVideoOptions();
            });
-#endif
     toggle("FPS counter", "Shows the emulation speed and the frame rate in the top right corner.",
            true, [] { return GxmRenderer::Video().show_fps; },
            [](bool value) {
