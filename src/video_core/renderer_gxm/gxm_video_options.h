@@ -24,7 +24,7 @@ struct VideoOptions {
     /// The top screen across the whole display (16:9) instead of the 3DS's 5:3 with side
     /// bars: for the Heavenfall mod built with --cheat-aspect-ratio 16:9, which widens the
     /// game's views and interface for a stretched picture.
-    bool wide = false;
+    bool wide = true; // default 16:9 since 2026-11-20 (the user plays the Heavenfall 16:9 build)
     /// The speed / frame rate counter in the top right corner (Ui::DrawStatsHud).
     bool show_fps = false;
     /// "Smooth gradients": the game's dither pattern off (render word bits, Mh4uHooks) and the
