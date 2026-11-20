@@ -1696,7 +1696,22 @@ void FragmentEmitter::SampleTextures() {
         // dbgshadowflipt (diag): the shadow map looked up at t' = 1 - t, to test whether the
         // rendered map (stored bottom-up like every render target) is read upside down.
         static const bool flip_t = GxmFlag("dbgshadowflipt");
-        if (unit == 0 && shadow_compare && flip_t) {
+        // dbgshadowswapst (diag): the shadow map looked up at (t, s), to test a transposed map;
+        // with dbgshadowflipt as well, (t, 1 - s).
+        static const bool swap_st = GxmFlag("dbgshadowswapst");
+        if (unit == 0 && shadow_compare && swap_st) {
+            e.Vec(VecOp::Add, {Reg::V(TmpProj), 0x1}, {coords[0], YYYY}, ConstZero, Pred::None,
+                  true);
+            if (flip_t) {
+                e.Vec(VecOp::Add, {Reg::V(TmpProj), 0x2}, {coords[0], XXXX, Mod::Neg}, ConstOne,
+                      Pred::None, true);
+            } else {
+                e.Vec(VecOp::Add, {Reg::V(TmpProj), 0x2}, {coords[0], XXXX}, ConstZero,
+                      Pred::None, true);
+            }
+            coords[0] = Reg::V(TmpProj);
+        } else if (unit == 0 && shadow_compare && flip_t) {
+
             e.Vec(VecOp::Add, {Reg::V(TmpProj), 0x1}, {coords[0], XXXX}, ConstZero, Pred::None,
                   true);
             e.Vec(VecOp::Add, {Reg::V(TmpProj), 0x2}, {coords[0], YYYY, Mod::Neg}, ConstOne,

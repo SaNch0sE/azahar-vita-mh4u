@@ -174,6 +174,11 @@ by default (46f60cf2d). Established on the console:
   `dbgout_uv0` (new: receivers' lookup coordinates as colour): at the hunter's feet s~0.16
   t~0.20, most of the ground >= 1 (outside the map: lit, as in GL); identical with
   `dbgshadowrecvsw` (software vertex shading) - so the game's coordinates are what they are.
-  In the dumped map the hunter's silhouette is at s~0.37-0.45, t~0.10-0.23: **the shadow pass
-  places the casters elsewhere than the receivers look**. Next: the shadow pass's projection /
-  viewport / rotation-flip convention into the 256x256 map (a transpose fits better than a flip).
+  In the dumped map the hunter's silhouette is at s~0.37-0.45, t~0.10-0.23. **Correction:** the
+  "feet" reading came from a screenshot pixel on the hunter's own body (he is a receiver too) and
+  JPEG noise; screen sampling of `dbgout_uv0` is not reliable enough (the HUD/minimap keep their
+  colours). `dbgshadowswapst` (s<->t) and with `dbgshadowflipt`: no hunter shadow either.
+  Next: numeric, not visual - log the receivers' texcoord0 (s, t, w) per vertex from the software
+  path (`dbgshadowrecvsw`) for the ground draws around the hunter, and the casters' projected
+  positions in the map from the shadow pass, then compare; check the shadow pass's viewport and
+  the 3DS framebuffer orientation conventions for a 256x256 target.
