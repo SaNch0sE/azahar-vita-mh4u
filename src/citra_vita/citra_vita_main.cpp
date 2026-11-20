@@ -378,7 +378,11 @@ std::string FindRom() {
             std::transform(lower.begin(), lower.end(), lower.begin(),
                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (SCE_S_ISDIR(entry.d_stat.st_mode) ||
+#ifdef VITA_GAME_MHXX
+                (only_mh4u && lower.find("monster hunter xx") == std::string::npos)) {
+#else
                 (only_mh4u && lower.find("monster hunter 4") == std::string::npos)) {
+#endif
                 continue;
             }
             for (const char* ext : {".3ds", ".cci", ".cxi", ".app"}) {
@@ -393,7 +397,12 @@ std::string FindRom() {
         return found;
     };
     std::string rom = search(VITA_DATA_DIR "/roms", false);
-#ifdef VITA_DIAGNOSTICS
+#ifdef VITA_GAME_MHXX
+    // The XX test app: the game in Azahar's roms folder, by name.
+    if (rom.empty()) {
+        rom = search(VITA_AZAHAR_DIR "/roms", true);
+    }
+#elif defined(VITA_DIAGNOSTICS)
     if (rom.empty()) {
         rom = search(VITA_AZAHAR_DIR "/roms", true);
     }
@@ -437,23 +446,30 @@ void InstallDefaultCheats() {
 /// with progress on screen: the Heavenfall mod's executable is built for the update, so it has to
 /// be there before the game boots. An installed title is recognised by its TMD and skipped.
 void InstallPendingCias(VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui) {
-    const std::string folder = VITA_DATA_DIR "/roms";
     std::vector<std::string> cias;
-    const SceUID dir = sceIoDopen(folder.c_str());
-    if (dir < 0) {
-        return;
-    }
-    SceIoDirent entry{};
-    while (sceIoDread(dir, &entry) > 0) {
-        std::string lower = entry.d_name;
-        std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (!SCE_S_ISDIR(entry.d_stat.st_mode) && lower.size() > 4 &&
-            lower.compare(lower.size() - 4, 4, ".cia") == 0) {
-            cias.push_back(folder + "/" + entry.d_name);
+    const auto scan = [&](const std::string& folder, const char* must_contain) {
+        const SceUID dir = sceIoDopen(folder.c_str());
+        if (dir < 0) {
+            return;
         }
-    }
-    sceIoDclose(dir);
+        SceIoDirent entry{};
+        while (sceIoDread(dir, &entry) > 0) {
+            std::string lower = entry.d_name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (!SCE_S_ISDIR(entry.d_stat.st_mode) && lower.size() > 4 &&
+                lower.compare(lower.size() - 4, 4, ".cia") == 0 &&
+                (must_contain == nullptr || lower.find(must_contain) != std::string::npos)) {
+                cias.push_back(folder + "/" + entry.d_name);
+            }
+        }
+        sceIoDclose(dir);
+    };
+    scan(VITA_DATA_DIR "/roms", nullptr);
+#ifdef VITA_GAME_MHXX
+    // The XX test app also takes the XX update from Azahar's roms folder.
+    scan(VITA_AZAHAR_DIR "/roms", "mhxx");
+#endif
     for (const std::string& path : cias) {
         const auto infos = Service::AM::GetCIAInfos(path);
         if (infos.Failed()) {

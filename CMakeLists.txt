@@ -242,6 +242,13 @@ if (ENABLE_VITA_DIAGNOSTICS)
     add_compile_definitions(VITA_DIAGNOSTICS)
 endif()
 
+# Which game the Vita app is built for: MH4U (the release) or MHXX (a test app of its own,
+# MHXXVITA0, reading the game and its update from Azahar's roms folder; data in ux0:data/mhxx).
+set(VITA_GAME "MH4U" CACHE STRING "Vita app flavour: MH4U or MHXX")
+if (VITA_GAME STREQUAL "MHXX")
+    add_compile_definitions(VITA_GAME_MHXX)
+endif()
+
 option(ENABLE_VITA_RENDER_TRACE "Record where the Vita render thread is, for locating a hang" ${DEFAULT_VITA_DIAGNOSTICS})
 
 # Handle incompatible options for libretro builds

@@ -167,8 +167,13 @@ set_target_properties(citra_vita PROPERTIES
 # and one large FS read's std::bad_alloc froze the guest (see hle_ipc.h's async sections).
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
-set(VITA_TITLEID "MH4UVITA0")
-set(VITA_APP_NAME "Monster Hunter 4 Ultimate")
+if (VITA_GAME STREQUAL "MHXX")
+    set(VITA_TITLEID "MHXXVITA0")
+    set(VITA_APP_NAME "Monster Hunter XX (test)")
+else()
+    set(VITA_TITLEID "MH4UVITA0")
+    set(VITA_APP_NAME "Monster Hunter 4 Ultimate")
+endif()
 set(VITA_VERSION "00.32")
 
 # The SceShell authid grants the extra permissions the native backend needs (taking a core, the
