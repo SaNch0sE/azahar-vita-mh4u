@@ -3099,6 +3099,13 @@ void RasterizerGxm::BindFragmentTexture(u32 unit, const SceGxmTexture& texture_i
         sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
         sceGxmTextureSetMinFilter(&texture, SCE_GXM_TEXTURE_FILTER_POINT);
     }
+    // hudwhitetex (diag, picture wrong): the 2D layer's texture unit 0 is the 1x1 white
+    // texture - same programs and sample instructions, no texture memory traffic. Prices the
+    // bandwidth/cache share of the 2D textures (all converted to RGBA8 at upload).
+    static const bool hud_white = GxmFlag("hudwhitetex");
+    if (hud_white && hud_phase && unit == 0) {
+        texture = white_texture;
+    }
     if (texture_binding_valid[unit] &&
         std::memcmp(&texture_bindings[unit], &texture, sizeof(texture)) == 0) {
         return;

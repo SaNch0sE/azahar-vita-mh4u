@@ -1310,3 +1310,10 @@ candidate draws per 5 s qualify (`opaquelog`: 4,888 refused for transparent tile
 alpha). Splitting a sprite into an opaque interior and blended edges would be the next step;
 blending itself is cheap here (~1.3 ns/px), so the gain is the hidden-surface removal under them.
 Also: Smooth gradients is now on by default (saved settings keep their value).
+
+**2D texture traffic is not the cost (2026-11-20):** `hudwhitetex` (diag: the 2D layer's unit 0
+bound to the 1x1 white texture - same programs and sample instructions, picture very different)
+at slot 7, HUD resolution Screen: HUD scene 50.4 -> 49.9 ms. Native A8/IA8/ETC formats instead
+of the RGBA8 conversion would save at most ~0.5 ms here, so they are dropped. The ~19 ms
+"texture" share measured with `minkeep_tex` is the sample instruction and its latency in the
+program, not memory bandwidth.
