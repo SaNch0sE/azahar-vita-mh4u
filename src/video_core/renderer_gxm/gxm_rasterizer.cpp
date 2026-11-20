@@ -230,6 +230,11 @@ RasterizerGxm::RasterizerGxm(Memory::MemorySystem& memory_, Pica::PicaCore& pica
     time_draws = GxmFlag("timedraw");
     // MH4U cover proof and texture opacity maps: only while the cover trap is wanted.
     Common::Mh4uCover::render_enabled = CoverSwitch("covertrap") && !CoverSwitch("nocovertrap");
+    // Opaque 2D sprites unblended (Op2dScan): on unless `noopaque2d` (file or diag flag). Its
+    // texture verdicts need the opacity maps, so they are kept for it too.
+    op2d_on = !CoverSwitch("noopaque2d");
+    op_log = op2d_on && GxmFlag("opaquelog");
+    Common::Mh4uCover::opacity_maps = Common::Mh4uCover::render_enabled || op2d_on;
     // Release too, from ux0:data/mh4u/timedraw.
     if (std::FILE* f = std::fopen(VITA_DATA_DIR "/timedraw", "rb")) {
         std::fclose(f);
@@ -2324,6 +2329,47 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
             }
         }
     }
+    // An opaque 2D sprite (Op2dScan): the same program bound with blending off, which writes
+    // exactly what the blend would (its final alpha is 255 at every pixel). The draws that set
+    // their own blend (the grade, alpha-only feedback, prepass, shadow) keep it.
+    const bool op_eligible = op_in_sw && !grade_double && !feedback_alpha_only &&
+                             prepass_mode == 0 && !regs.framebuffer.IsShadowRendering();
+    const bool op_opaque = op_eligible && Op2dDecide(bound_surfaces[0]);
+    // opaquemagenta (diag): those draws' program outputs white (its proven alpha, through a
+    // stage after the last one in use) into red and blue only: every pixel drawn unblended
+    // shows red and blue at 255, green as it was. A program using all six stages is left as
+    // it is.
+    bool op_magenta = false;
+    {
+        static const bool magenta = GxmFlag("opaquemagenta");
+        if (op_opaque && magenta) {
+            using Tev = Pica::TexturingRegs::TevStageConfig;
+            auto& st = fs_config.texture.tev_stages;
+            s32 last = -1;
+            for (u32 i = 0; i < st.size(); i++) {
+                const Tev c = st[i];
+                const bool pass =
+                    c.color_op == Tev::Operation::Replace && c.alpha_op == Tev::Operation::Replace &&
+                    c.color_source1 == Tev::Source::Previous &&
+                    c.alpha_source1 == Tev::Source::Previous &&
+                    c.color_modifier1 == Tev::ColorModifier::SourceColor &&
+                    c.alpha_modifier1 == Tev::AlphaModifier::SourceAlpha &&
+                    c.GetColorMultiplier() == 1 && c.GetAlphaMultiplier() == 1;
+                if (!pass) {
+                    last = static_cast<s32>(i);
+                }
+            }
+            if (last < 5) {
+                // Colour = Previous with the SourceAlpha modifier, alpha = Previous.
+                auto& next = st[static_cast<u32>(last + 1)];
+                next.sources_raw = 0x000F000Fu;
+                next.modifiers_raw = 0x2u;
+                next.ops_raw = 0;
+                next.scales_raw = 0;
+                op_magenta = true;
+            }
+        }
+    }
     if (prepass_mode == 1) {
         fs_config = AlphaOnlyConfig(fs_config);
     } else if (prepass_mode == 2) {
@@ -2628,6 +2674,19 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
         info.blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
         info.blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
     }
+    if (op_opaque) {
+        // Keyed apart by the blend info, as any blend state is (the pipeline cache compares
+        // it whole): the same program unblended is the pipeline an unblended draw gets.
+        info.blend.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
+        info.blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+        info.blend.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        info.blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
+        info.blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+        info.blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+        if (op_magenta) {
+            info.blend.colorMask &= SCE_GXM_COLOR_MASK_R | SCE_GXM_COLOR_MASK_B;
+        }
+    }
     DrawTrace("bind pipeline");
     const u64 bp_t2 = Common::PipelineStats::StatUs();
     const bool bound = pipeline_cache->BindPipeline(info);
@@ -2635,6 +2694,10 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
     if (!bound) {
         return false;
     }
+    // The repeat paths keep this pipeline: they may only when their draw wants the same
+    // variant (Op2dMatches).
+    op_bound = op_opaque;
+    op_bound_eligible = op_eligible;
     NoteScenePipeline(info.vertex != nullptr ? info.vertex->name.c_str() : "?",
                       info.fragment != nullptr ? info.fragment->name.c_str() : "?");
     DrawTrace("pipeline bound");
@@ -4400,6 +4463,9 @@ void RasterizerGxm::DrawTriangles() {
     if (CoverOn() && (cover.active || cover.pre)) {
         CoverScan();
     }
+    // Opaque 2D sprites: whether this draw may go unblended (the texture half once its
+    // surface is known).
+    Op2dScan();
     // valphalog (diag): what the 2D layer's vertex alphas are, as a histogram, every 5 s.
     static const bool valpha_log = GxmFlag("valphalog");
     if (valpha_log && hud_post_draw && hud_phase && vertex_ring.base != nullptr) {
@@ -4471,9 +4537,12 @@ void RasterizerGxm::DrawTriangles() {
     const u64 key = no_repeat ? 0 : RepeatKey();
     if (!no_repeat && repeat_ok && in_scene && vertex_batch.empty() && key == repeat_key &&
         draw_epoch == repeat_epoch && scene_seq == repeat_scene && !pica.lighting.lut_dirty &&
-        !pica.fog.lut_dirty && !pica.proctex.table_dirty) {
+        !pica.fog.lut_dirty && !pica.proctex.table_dirty && Op2dMatches(bound_surfaces[0])) {
         // The previous draw's state is still bound and still right: this draw's triangles
         // join the deferred run (FlushDeferredDraws), one draw for a whole line of glyphs.
+        // (Not across a change between the blended and the unblended pipeline: the run is
+        // one draw call under one of them.)
+        Op2dCount(op_bound, bound_surfaces[0]);
         stat_draws++;
         stat_repeat_draws++;
         static const bool no_merge = GxmFlag("nodrawmerge");
@@ -4514,14 +4583,17 @@ void RasterizerGxm::DrawTriangles() {
         }
     }
     if (TexOnlyRepeat()) {
+        Op2dCount(op_bound, bound_surfaces[0]);
         CoverCommit(true);
         return;
     }
     repeat_ok = false;
     DrawSetup setup;
     cover_in_sw = true;
+    op_in_sw = true;
     const bool began = BeginDraw(setup, fixed_layout, vertex_count);
     cover_in_sw = false;
+    op_in_sw = false;
     if (!began) {
         ReleaseDraw(setup);
         DropDraw();
@@ -4529,6 +4601,7 @@ void RasterizerGxm::DrawTriangles() {
         cover_draw = false;
         return;
     }
+    Op2dCount(op_bound, bound_surfaces[0]);
     static const bool log_draw = GxmFlag("logdraw");
     if (log_draw && stat_draws == 0 && !pending_ring_ranges.empty()) {
         const auto& v = *reinterpret_cast<const Pica::OutputVertex*>(
@@ -4663,6 +4736,11 @@ bool RasterizerGxm::TexOnlyRepeat() {
     }
     // A size change the bound program reads needs its uniforms: the full path.
     if (dimensions != tex_dims && (last_fs == nullptr || UniformsOf(last_fs).tex_dims)) {
+        return false;
+    }
+    // The bound pipeline is blended or not by the previous draw's verdict: the new textures
+    // must give this draw the same one (Op2dScan), else the full path binds the other.
+    if (!Op2dMatches(ids[0])) {
         return false;
     }
     static const bool check = GxmFlag("texrepeatcheck");
@@ -6973,6 +7051,390 @@ void RasterizerGxm::CoverFrameEnd(bool top_transfer) {
         cover.row_words = static_cast<u32>(cover.w + 63) / 64;
         cover_bits.assign(static_cast<std::size_t>(cover.row_words) * static_cast<u32>(cover.h),
                           0);
+    }
+}
+
+// Opaque 2D sprites drawn unblended.
+//
+// With the 2D layer's blend - colour Add(SrcAlpha, OneMinusSrcAlpha), alpha Add(One or
+// SrcAlpha, Zero or OneMinusSrcAlpha), or One/Zero - a fragment whose final alpha is exactly 1
+// writes exactly its own colour and alpha 1: what it writes unblended. Our programs byte-round
+// the last combiner stage, so a final alpha proven 255 in the PICA's 8-bit terms
+// (CoverAlphaBounds) is 1.0 exactly. A draw goes unblended when that holds at every pixel it
+// can write: the state allows it (CoverStateReasons, less the bits that only matter to a
+// cover), every vertex alpha the result depends on is >= 254.5/255 (the program rounds the
+// vertex colour to 8 bits), and texture 0's alpha is 255 over every triangle's texel
+// footprint when the result depends on it (a format without alpha, or the surface's opacity
+// map). The footprint comes from the triangle's vertex texture coordinates, which bound every
+// interpolated one at any resolution - the HUD target's too.
+
+void RasterizerGxm::Op2dScan() {
+    op_seq++;
+    op_scan = Op2dScanState{};
+    if (!op2d_on || !hud_phase || vertex_ring.base == nullptr || !vertex_batch.empty() ||
+        pending_ring_ranges.empty() ||
+        regs.framebuffer.framebuffer.GetColorBufferPhysicalAddress() != hud_target) {
+        return;
+    }
+    const auto& om = regs.framebuffer.output_merger;
+    if (!om.alphablend_enable) {
+        return; // written straight already
+    }
+    op_scan.candidate = true;
+    bool needs_primary = false;
+    bool needs_texture = false;
+    // Reading the picture, a depth or stencil test and an exclusive scissor keep a draw from
+    // covering, but not from going unblended: a fragment is written or not, the same in both.
+    const u32 reasons = CoverStateReasons(needs_primary, needs_texture) & ~(1u | 2u | 8u);
+    u32 draw_reason = 0;
+    if (reasons != 0) {
+        draw_reason = static_cast<u32>(Op2dWhy::State) | reasons << 8;
+    } else if (needs_texture && regs.texturing.texture0.lod.max_level != 0) {
+        draw_reason = static_cast<u32>(Op2dWhy::Mip);
+    }
+    op_scan.needs_texture = needs_texture;
+    if (draw_reason != 0 && !op_log) {
+        op_scan.reason = draw_reason;
+        return;
+    }
+    const auto& rz = regs.rasterizer;
+    const float vp_hw = Pica::f24::FromRaw(rz.viewport_size_x).ToFloat32();
+    const float vp_hh = Pica::f24::FromRaw(rz.viewport_size_y).ToFloat32();
+    const float vp_cx = static_cast<float>(rz.viewport_corner.x.Value());
+    const float vp_cy = static_cast<float>(rz.viewport_corner.y.Value());
+    if (op_log) {
+        op_tri_bad.clear();
+        op_tri_area.clear();
+        op_scan.bbox[0] = op_scan.bbox[1] = 1e30f;
+        op_scan.bbox[2] = op_scan.bbox[3] = -1e30f;
+    }
+    u32 first_reason = draw_reason;
+    u32 tris = 0;
+    float area = 0.0f;
+    for (const auto& range : pending_ring_ranges) {
+        const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+            vertex_ring.base + static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+        for (u32 i = 0; i + 2 < range.count; i += 3) {
+            u32 bad = draw_reason;
+            float px[3] = {}, py[3] = {};
+            bool w_ok = true;
+            for (u32 k = 0; k < 3; k++) {
+                const Pica::OutputVertex& vx = v[i + k];
+                const float w = vx.pos.w.ToFloat32();
+                if (!(w > 0.0f)) {
+                    w_ok = false;
+                    continue;
+                }
+                if (needs_primary && bad == 0 && vx.color.a().ToFloat32() < CoverAlphaOne) {
+                    bad = static_cast<u32>(Op2dWhy::VertexAlpha);
+                }
+                px[k] = (vx.pos.x.ToFloat32() / w + 1.0f) * vp_hw + vp_cx;
+                py[k] = (vx.pos.y.ToFloat32() / w + 1.0f) * vp_hh + vp_cy;
+            }
+            if (!w_ok && bad == 0) {
+                bad = static_cast<u32>(Op2dWhy::W);
+            }
+            const float a =
+                w_ok ? 0.5f * std::fabs((px[1] - px[0]) * (py[2] - py[0]) -
+                                        (px[2] - px[0]) * (py[1] - py[0]))
+                     : 0.0f;
+            if (bad != 0) {
+                if (first_reason == 0) {
+                    first_reason = bad;
+                }
+                if (!op_log) {
+                    op_scan.reason = first_reason;
+                    return;
+                }
+                op_scan.bad_tris++;
+            } else {
+                area += a;
+            }
+            if (op_log) {
+                op_tri_bad.push_back(static_cast<u8>(bad & 0xFF));
+                op_tri_area.push_back(a);
+                if (w_ok) {
+                    for (u32 k = 0; k < 3; k++) {
+                        op_scan.bbox[0] = std::min(op_scan.bbox[0], px[k]);
+                        op_scan.bbox[1] = std::min(op_scan.bbox[1], py[k]);
+                        op_scan.bbox[2] = std::max(op_scan.bbox[2], px[k]);
+                        op_scan.bbox[3] = std::max(op_scan.bbox[3], py[k]);
+                    }
+                }
+            }
+            tris++;
+        }
+    }
+    op_scan.tris = tris;
+    op_scan.area = area;
+    op_scan.reason = first_reason;
+    op_scan.ok = first_reason == 0 && tris != 0;
+}
+
+bool RasterizerGxm::Op2dTextureOk(VideoCore::SurfaceId id) {
+    if (!op_scan.needs_texture) {
+        return true;
+    }
+    if (op_scan.tex_seq == op_seq && op_scan.tex_id == id) {
+        return op_scan.tex_ok;
+    }
+    op_scan.tex_seq = op_seq;
+    op_scan.tex_id = id;
+    using TexConfig = Pica::TexturingRegs::TextureConfig;
+    const auto& tex = regs.texturing.texture0;
+    const auto format =
+        static_cast<VideoCore::PixelFormat>(static_cast<u32>(regs.texturing.texture0_format.Value()));
+    const Surface* surface = id ? &res_cache.GetSurface(id) : nullptr;
+    u32 surface_reason = 0;
+    if (surface == nullptr) {
+        surface_reason = static_cast<u32>(Op2dWhy::NoSurface);
+    } else if (surface->pixel_format != format) {
+        surface_reason = static_cast<u32>(Op2dWhy::Format);
+    }
+    u32 first_reason = surface_reason;
+    if (first_reason != 0 && !op_log) {
+        op_scan.tex_ok = false;
+        op_scan.tex_reason = first_reason;
+        return false;
+    }
+    CoverQuad q{};
+    q.affine = false;
+    q.tw = static_cast<float>(tex.width.Value());
+    q.th = static_cast<float>(tex.height.Value());
+    q.wrap_s = static_cast<u8>(tex.wrap_s.Value());
+    q.wrap_t = static_cast<u8>(tex.wrap_t.Value());
+    q.bilinear = tex.mag_filter == TexConfig::Linear || tex.min_filter == TexConfig::Linear;
+    q.border_opaque = tex.border_color.a == 255;
+    q.mip_pad = 0; // Op2dScan refused mip levels
+    // A 64th of a texel either way: the GPU's interpolation of the coordinates is not exact,
+    // and a centre on a texel boundary could otherwise floor to its neighbour.
+    const float eu = q.tw >= 1.0f ? (1.0f / 64.0f) / q.tw : 0.0f;
+    const float ev = q.th >= 1.0f ? (1.0f / 64.0f) / q.th : 0.0f;
+    const PAddr tex_addr = tex.GetPhysicalAddress();
+    bool tried_rebuild = false;
+    u32 last_window[4] = {~0u, ~0u, ~0u, ~0u};
+    u32 last_reason = 0;
+    u32 t = 0;
+    for (const auto& range : pending_ring_ranges) {
+        const auto* v = reinterpret_cast<const Pica::OutputVertex*>(
+            vertex_ring.base + static_cast<std::size_t>(range.first) * sizeof(Pica::OutputVertex));
+        for (u32 i = 0; i + 2 < range.count; i += 3, t++) {
+            if (op_log && t < op_tri_bad.size() && op_tri_bad[t] != 0) {
+                continue; // refused already by its vertices
+            }
+            u32 bad = surface_reason;
+            if (bad == 0) {
+                float umin = 1e30f, umax = -1e30f, vmin = 1e30f, vmax = -1e30f;
+                for (u32 k = 0; k < 3; k++) {
+                    const float u = v[i + k].tc0.x.ToFloat32();
+                    const float vv = v[i + k].tc0.y.ToFloat32();
+                    umin = std::min(umin, u);
+                    umax = std::max(umax, u);
+                    vmin = std::min(vmin, vv);
+                    vmax = std::max(vmax, vv);
+                }
+                q.u0 = umin - eu;
+                q.u1 = umax + eu;
+                q.v0 = vmin - ev;
+                q.v1 = vmax + ev;
+                CoverQuad window{};
+                if (!CoverTexelWindow(q, 0, 0, 0, 0, window)) {
+                    bad = static_cast<u32>(Op2dWhy::Window);
+                } else if (window.s0 == last_window[0] && window.s1 == last_window[1] &&
+                           window.m0 == last_window[2] && window.m1 == last_window[3]) {
+                    bad = last_reason; // the quad's other triangle
+                } else {
+                    auto why = VideoCore::RegionOpacity(*surface, tex_addr, tex.width, window.s0,
+                                                        window.s1, window.m0, window.m1);
+                    if ((why == VideoCore::OpacityWhy::Stale ||
+                         why == VideoCore::OpacityWhy::Unknown) &&
+                        !tried_rebuild &&
+                        surface->opacity_rebuilt_tick != surface->modification_tick) {
+                        // A map lost (or never made) for a surface that still holds exactly
+                        // what was uploaded: made again from guest memory, once per change of
+                        // the surface (as CoverCommit does).
+                        tried_rebuild = true;
+                        Surface& ms = res_cache.GetSurface(id);
+                        ms.opacity_rebuilt_tick = ms.modification_tick;
+                        const MemoryRef source = memory.GetPhysicalRef(ms.addr);
+                        if (ms.upload_hash != 0 && !ms.gpu_content && source &&
+                            source.GetSize() >= ms.size && ms.IsRegionValid(ms.GetInterval()) &&
+                            Common::ComputeHash64(source.GetPtr(), ms.size) == ms.upload_hash) {
+                            VideoCore::RebuildOpacity(ms,
+                                                      std::span<const u8>(source.GetPtr(), ms.size));
+                            why = VideoCore::RegionOpacity(*surface, tex_addr, tex.width,
+                                                           window.s0, window.s1, window.m0,
+                                                           window.m1);
+                        }
+                    }
+                    bad = why == VideoCore::OpacityWhy::Opaque
+                              ? 0u
+                              : static_cast<u32>(Op2dWhy::Map) + static_cast<u32>(why);
+                    last_window[0] = window.s0;
+                    last_window[1] = window.s1;
+                    last_window[2] = window.m0;
+                    last_window[3] = window.m1;
+                    last_reason = bad;
+                }
+            }
+            if (bad != 0) {
+                if (first_reason == 0) {
+                    first_reason = bad;
+                }
+                if (!op_log) {
+                    op_scan.tex_ok = false;
+                    op_scan.tex_reason = first_reason;
+                    return false;
+                }
+                if (t < op_tri_bad.size()) {
+                    op_tri_bad[t] = static_cast<u8>(bad);
+                    op_scan.bad_tris++;
+                }
+            }
+        }
+    }
+    op_scan.tex_ok = first_reason == 0;
+    op_scan.tex_reason = first_reason;
+    return op_scan.tex_ok;
+}
+
+void RasterizerGxm::Op2dCount(bool opaque, VideoCore::SurfaceId tex0) {
+    if (!op_scan.candidate) {
+        return;
+    }
+    namespace PS = Common::PipelineStats;
+    PS::op2d_cands.fetch_add(1, std::memory_order_relaxed);
+    if (opaque) {
+        PS::op2d_draws.fetch_add(1, std::memory_order_relaxed);
+        op_area_acc += static_cast<u32>(op_scan.area);
+        if (op_area_acc >= 1000) {
+            PS::op2d_area.fetch_add(op_area_acc / 1000, std::memory_order_relaxed);
+            op_area_acc %= 1000;
+        }
+    }
+    if (!op_log) {
+        return;
+    }
+    // opaquelog (diag): once a second, what the refused draws were refused for, how many were
+    // refused for a few triangles only, what an opaque prefix / suffix split would draw
+    // unblended, and the first big (>= 40x40 guest px) refused draws.
+    static constexpr u32 Reasons = 32;
+    struct Agg {
+        u32 cands = 0, opaque = 0, refused = 0;
+        float opaque_area = 0.0f;
+        u32 by_reason[Reasons] = {};
+        u32 few = 0;          ///< refused, <= 1/8 of their triangles bad (at least 2 triangles)
+        float few_ok_area = 0.0f;
+        float ok_area = 0.0f; ///< opaque triangles' area in refused draws
+        u32 prefix_draws = 0, suffix_draws = 0;
+        float prefix_area = 0.0f, suffix_area = 0.0f;
+        std::vector<std::string> lines;
+    };
+    static Agg agg;
+    static u64 last_us = 0;
+    agg.cands++;
+    if (opaque) {
+        agg.opaque++;
+        agg.opaque_area += op_scan.area;
+    } else {
+        agg.refused++;
+        // The texture half for draws whose own vertices or state refused them first: which of
+        // their triangles the texels would also refuse.
+        const bool state_refused = (op_scan.reason & 0xFF) == static_cast<u32>(Op2dWhy::State) ||
+                                   op_scan.reason == static_cast<u32>(Op2dWhy::Mip);
+        if (!state_refused) {
+            Op2dTextureOk(tex0);
+        }
+        u32 reason = op_scan.reason != 0       ? op_scan.reason
+                     : op_scan.tex_reason != 0 ? op_scan.tex_reason
+                                               : static_cast<u32>(Op2dWhy::Excluded);
+        agg.by_reason[std::min<u32>(reason & 0xFF, Reasons - 1)]++;
+        const u32 n = static_cast<u32>(op_tri_bad.size());
+        u32 first_bad = n, last_bad = 0, bad = 0;
+        float ok_area = 0.0f;
+        for (u32 i = 0; i < n; i++) {
+            if (op_tri_bad[i] != 0) {
+                first_bad = std::min(first_bad, i);
+                last_bad = i;
+                bad++;
+            } else {
+                ok_area += op_tri_area[i];
+            }
+        }
+        float prefix = 0.0f, suffix = 0.0f;
+        if (bad != 0 && bad < n) {
+            for (u32 i = 0; i < first_bad; i++) {
+                prefix += op_tri_area[i];
+            }
+            for (u32 i = last_bad + 1; i < n; i++) {
+                suffix += op_tri_area[i];
+            }
+        }
+        agg.ok_area += ok_area;
+        if (n >= 2 && bad != 0 && bad <= std::max<u32>(1, n / 8)) {
+            agg.few++;
+            agg.few_ok_area += ok_area;
+        }
+        agg.prefix_draws += prefix > 0.0f ? 1 : 0;
+        agg.suffix_draws += suffix > 0.0f ? 1 : 0;
+        agg.prefix_area += prefix;
+        agg.suffix_area += suffix;
+        const float bw = op_scan.bbox[2] - op_scan.bbox[0];
+        const float bh = op_scan.bbox[3] - op_scan.bbox[1];
+        if (bw >= 40.0f && bh >= 40.0f && agg.lines.size() < 8) {
+            const auto& om = regs.framebuffer.output_merger;
+            const auto& tex = regs.texturing.texture0;
+            u32 blend_raw = 0;
+            std::memcpy(&blend_raw, &om.alpha_blending, sizeof(blend_raw));
+            static constexpr const char* map_whys[] = {"opaque",       "no map",
+                                                       "map stale",    "misaligned",
+                                                       "past level 0", "tile unknown",
+                                                       "tile transparent"};
+            const u32 r = reason & 0xFF;
+            const std::string why =
+                r == 1   ? fmt::format("state {:03X}", reason >> 8)
+                : r == 2 ? "mip levels"
+                : r == 3 ? "w <= 0"
+                : r == 4 ? "vertex alpha"
+                : r == 5 ? "no surface"
+                : r == 6 ? "surface format"
+                : r == 7 ? "texel window (border)"
+                : r >= 8 && r < 15 ? fmt::format("map: {}", map_whys[r - 8])
+                : r == 20 ? "excluded (own blend)"
+                           : fmt::format("? {}", r);
+            agg.lines.push_back(fmt::format(
+                "box {:.0f},{:.0f}..{:.0f},{:.0f} tris {} bad {} (first {} last {}) why {} | tex "
+                "{:08X} fmt {} {}x{} blend {:08X} alpha test {} | opaque-tri area {:.0f} px, "
+                "prefix {:.0f} suffix {:.0f}",
+                op_scan.bbox[0], op_scan.bbox[1], op_scan.bbox[2], op_scan.bbox[3], n, bad,
+                first_bad == n ? -1 : static_cast<int>(first_bad),
+                bad == 0 ? -1 : static_cast<int>(last_bad), why, tex.GetPhysicalAddress(),
+                static_cast<u32>(regs.texturing.texture0_format.Value()), tex.width.Value(),
+                tex.height.Value(), blend_raw,
+                om.alpha_test.enable ? static_cast<u32>(om.alpha_test.func.Value()) : 99u,
+                ok_area, prefix, suffix));
+        }
+    }
+    const u64 now = PS::NowUs();
+    if (now - last_us >= 1'000'000) {
+        last_us = now;
+        sceClibPrintf("[mh4u] opaque2d: %u candidates, %u unblended (%.0f px), %u refused: "
+                      "state %u mip %u w %u valpha %u nosurf %u fmt %u window %u map(stale %u "
+                      "unknown %u transp %u other %u) excluded %u; refused with <= 1/8 bad tris "
+                      "%u (their opaque tris %.0f px); opaque tris in refused draws %.0f px; "
+                      "split gain: prefix %u draws %.0f px, suffix %u draws %.0f px\n",
+                      agg.cands, agg.opaque, agg.opaque_area, agg.refused, agg.by_reason[1],
+                      agg.by_reason[2], agg.by_reason[3], agg.by_reason[4], agg.by_reason[5],
+                      agg.by_reason[6], agg.by_reason[7], agg.by_reason[10], agg.by_reason[13],
+                      agg.by_reason[14],
+                      agg.by_reason[8] + agg.by_reason[9] + agg.by_reason[11] +
+                          agg.by_reason[12],
+                      agg.by_reason[20], agg.few, agg.few_ok_area, agg.ok_area,
+                      agg.prefix_draws, agg.prefix_area, agg.suffix_draws, agg.suffix_area);
+        for (const std::string& line : agg.lines) {
+            sceClibPrintf("[mh4u] opaque2d:   refused %s\n", line.c_str());
+        }
+        agg = Agg{};
     }
 }
 

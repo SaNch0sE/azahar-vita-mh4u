@@ -930,7 +930,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const auto take = [](auto& a) { return a.exchange(0, std::memory_order_relaxed); };
                     const Mh4uHooks::CoverStats cov = Mh4uHooks::TakeCoverStats();
                     VitaFrontend::ReportPrintf("[mh4u] cpu%s  wait s%u b%u r%u a%u  ps u%u s%u w%u l%u  memo %u/%u  "
-                                  "re l%u x%u t%u  bot d%u x%u  fx %u  hud2d p%u d%u s%u g%u c%u  hudres r%u f%u b%u a%uK z%uK  "
+                                  "re l%u x%u t%u  bot d%u x%u  fx %u  hud2d p%u d%u s%u g%u c%u  hudres r%u f%u b%u a%uK z%uK  op d%u/%u a%uK  "
                                   "cov t%u k%u w%u/%u a%u m%u u%u p%u\n",
                                   Common::ThreadCpuReport().c_str(),
                                   static_cast<unsigned>(take(PS::gxw_shade_us) / 1000),
@@ -962,6 +962,11 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                   static_cast<unsigned>(take(PS::hudres_resolves)),
                                   static_cast<unsigned>(take(PS::hud_post_area)),
                                   static_cast<unsigned>(take(PS::hud_post_area_zero)),
+                                  // Opaque 2D sprites drawn unblended: draws / candidate
+                                  // (blended software) 2D draws, their area (K guest px).
+                                  static_cast<unsigned>(take(PS::op2d_draws)),
+                                  static_cast<unsigned>(take(PS::op2d_cands)),
+                                  static_cast<unsigned>(take(PS::op2d_area)),
                                   // MH4U cover trap: traps taken, cover key changes, layout
                                   // walk us (mean/worst), armed frames, mispredicts, units
                                   // hidden (most at once), proofs covered -

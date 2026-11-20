@@ -258,6 +258,11 @@ inline std::atomic<u32> hud_post_area{0};
 /// The part of it drawn by triangles whose three vertices have alpha 0 (invisible under
 /// SrcAlpha blending), thousands of guest pixels per second.
 inline std::atomic<u32> hud_post_area_zero{0};
+/// Opaque 2D sprites drawn unblended (RasterizerGxm::Op2dScan): blended software draws in the
+/// 2D layer (candidates), those drawn unblended, and their area in thousands of guest pixels.
+inline std::atomic<u32> op2d_cands{0};
+inline std::atomic<u32> op2d_draws{0};
+inline std::atomic<u32> op2d_area{0};
 /// Time the frame limiter slept on the emulation thread (the guest ahead of real time).
 inline std::atomic<u32> limiter_sleep_us{0};
 /// Time the GX thread spent parsing command lists, and how many.

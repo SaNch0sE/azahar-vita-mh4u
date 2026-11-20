@@ -852,6 +852,65 @@ private:
     /// At a display transfer: publish the frame's proof and start over.
     void CoverFrameEnd(bool top_transfer);
 
+    /// Opaque 2D sprites drawn unblended: a blended
+    /// software draw in the 2D layer whose final combiner alpha is provably 255 at every pixel
+    /// it writes produces exactly what blending it would, so it is bound with blending off and
+    /// the SGX's hidden-surface removal stops shading what it covers. Whole draws only.
+    /// Kill switch `noopaque2d` (file ux0:data/mh4u/noopaque2d or diag flag).
+    enum class Op2dWhy : u8 {
+        Opaque = 0,
+        State = 1,       ///< blend / alpha test / mask / combiner (CoverStateReasons bits)
+        Mip = 2,         ///< texture 0 has mip levels (the maps describe level 0 only)
+        W = 3,           ///< a vertex with w <= 0
+        VertexAlpha = 4, ///< a vertex alpha below 254.5/255 the alpha depends on
+        NoSurface = 5,   ///< no surface bound to unit 0
+        Format = 6,      ///< the bound surface holds another format
+        Window = 7,      ///< the texel window wraps to a border that is not opaque
+        Map = 8,         ///< 8 + VideoCore::OpacityWhy: the opacity map refused
+        Excluded = 20,   ///< grade, alpha-only feedback, prepass, shadow (own blend)
+    };
+    struct Op2dScanState {
+        bool candidate = false;     ///< a blended software draw in the 2D layer
+        bool ok = false;            ///< state and vertices pass; texture 0 still to check
+        bool needs_texture = false; ///< the alpha depends on texture 0's texels
+        u32 reason = 0;             ///< Op2dWhy, or State | CoverStateReasons bits << 8
+        u32 tris = 0;
+        float area = 0.0f;          ///< guest pixels, from the triangle areas
+        // Texture verdict, cached per scan and surface (repeat check, then BindPrograms).
+        u64 tex_seq = ~0ull;
+        VideoCore::SurfaceId tex_id{};
+        bool tex_ok = false;
+        u32 tex_reason = 0;
+        // opaquelog (diag): the whole draw is scanned; which triangles failed.
+        float bbox[4] = {};
+        u32 bad_tris = 0;
+    };
+    Op2dScanState op_scan{};
+    u64 op_seq = 0;
+    bool op2d_on = false;            ///< the feature (not `noopaque2d`)
+    bool op_log = false;             ///< opaquelog (diag): scan whole draws, log refusals
+    bool op_in_sw = false;           ///< BeginDraw is called from DrawTriangles
+    bool op_bound = false;           ///< the pipeline last bound is the unblended variant
+    bool op_bound_eligible = false;  ///< ...and its draw could have taken the variant
+    u32 op_area_acc = 0;             ///< opaque guest pixels not yet counted (thousands)
+    std::vector<u8> op_tri_bad;      ///< opaquelog: per triangle, its Op2dWhy (0 opaque)
+    std::vector<float> op_tri_area;  ///< opaquelog: per triangle, its guest-pixel area
+    /// DrawTriangles: the state and vertex half of the verdict for the pending draw.
+    void Op2dScan();
+    /// Texture 0's alpha is 255 over every triangle's texel footprint (by the opacity map
+    /// of the surface `id`), or the alpha does not depend on it.
+    bool Op2dTextureOk(VideoCore::SurfaceId id);
+    /// The pending draw may be drawn unblended with `id` bound to unit 0.
+    bool Op2dDecide(VideoCore::SurfaceId id) {
+        return op_scan.candidate && op_scan.ok && Op2dTextureOk(id);
+    }
+    /// A repeat keeps the pipeline bound: only when the pending draw wants the same variant.
+    bool Op2dMatches(VideoCore::SurfaceId id) {
+        return (op_bound_eligible && Op2dDecide(id)) == op_bound;
+    }
+    /// The pending draw went out (unblended or not): counters and opaquelog.
+    void Op2dCount(bool opaque, VideoCore::SurfaceId tex0);
+
     u32 stat_alpha_only_feedback{};
     u32 stat_grade_double{};
 

@@ -17,6 +17,11 @@ namespace Common::Mh4uCover {
 /// start-up from the `covertrap` switch, before any texture is uploaded.
 inline bool render_enabled = false;
 
+/// The texture cache keeps opacity bitmaps (rasterizer_cache/tile_opacity.h): for the cover
+/// proof (`render_enabled`) or for drawing opaque 2D sprites unblended (on unless
+/// `noopaque2d`). Set once at start-up, before any texture is uploaded.
+inline bool opacity_maps = false;
+
 /// Cover traps taken so far (emulation thread). The frame tag: read when a frame's display
 /// transfer is queued and carried with it to the render thread, so a proof names the trap
 /// whose frame it judged (give or take the game's own lag, which the decision allows for).

@@ -1298,3 +1298,15 @@ refused memblocks and pool exhaustion (`[mh4u] memblock ... refused`, `[mh4u] po
 `keepdeadlight` is also a file switch, and `[mh4u] hudres fallbacks: ...` counts why frames go out
 with the 3DS-resolution HUD (the text "wobble" the user saw once at the counter: 17 of 23 frames
 hi-res; not reproduced since).
+
+**Opaque 2D sprites unblended (2026-11-20):** software-drawn 2D draws whose every pixel provably
+ends at alpha 255 (CoverStateReasons + CoverAlphaBounds, vertex alpha >= 254.5/255, texture 0
+footprint opaque in the per-tile opacity map - now built for every alpha texture, ~0.4% of its
+size) get blending off; same picture (alpha 1: src*1 + dst*0 = src). Kill switch `noopaque2d`
+(file or flag). Slot 7, HUD resolution Screen: HUD scene 52.1 -> 50.4 ms (diag), release
+13.9 -> 14.2 fps; slot 4 30 fps either way; screenshot identical. Small: whole draws only, and
+most panels have a few transparent texels (`ss_fill`'s corner, `ui408_ita`'s edge) - 56 of ~5,500
+candidate draws per 5 s qualify (`opaquelog`: 4,888 refused for transparent tiles, 620 for vertex
+alpha). Splitting a sprite into an opaque interior and blended edges would be the next step;
+blending itself is cheap here (~1.3 ns/px), so the gain is the hidden-surface removal under them.
+Also: Smooth gradients is now on by default (saved settings keep their value).

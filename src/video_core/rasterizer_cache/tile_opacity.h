@@ -15,7 +15,8 @@
 // memory order, so one bit per tile is read straight from the guest bytes an upload decodes -
 // no geometry, no decoded copy. The panels of the quest counter are an opaque region of an
 // ETC1A4 texture: only such a map can prove them opaque. Costs 2 bits per 64 texels (4 KiB for
-// a 1024x1024 texture), only for textures with alpha, only under `covertrap`.
+// a 1024x1024 texture), only for textures with alpha; kept under `covertrap` and for the
+// opaque 2D sprites (Common::Mh4uCover::opacity_maps).
 namespace VideoCore {
 
 /// Bytes of one 8x8 tile of `format`, 0 for formats without alpha (always opaque) or that
@@ -151,7 +152,7 @@ inline u32 OpacityTiles(const SurfaceBase& s) {
 /// every whole level-0 tile among them. A map that went stale (the tick moved since it was
 /// last made valid) starts over with every tile unknown.
 inline void NoteUploadOpacity(SurfaceBase& s, PAddr addr, std::span<const u8> data) {
-    if (!Common::Mh4uCover::render_enabled) {
+    if (!Common::Mh4uCover::opacity_maps) {
         return;
     }
     const u32 tiles = OpacityTiles(s);
