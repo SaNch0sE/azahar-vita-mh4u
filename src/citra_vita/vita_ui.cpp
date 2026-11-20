@@ -177,6 +177,9 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     // hid the pad highlight a few seconds after each menu opened (focus stayed, 2026-11-20).
     ImGui_ImplGxm_MouseStickUsage(false);
 
+    // The launch values (settings that apply on the next start) are fixed here, before any
+    // menu can change them.
+    (void)GxmRenderer::VideoAtLaunch();
     BuildSettings();
     ScanGames();
 }
@@ -304,6 +307,8 @@ void Ui::BuildSettings() {
                    static_cast<GxmRenderer::VideoOptions::Upscale>(value < 0 || value > 1 ? 0 : value);
                GxmRenderer::SaveVideoOptions();
            });
+    // With the hi-res HUD on, the filter applies on the next start (it jiggled when switched live).
+    settings.back().restart = GxmRenderer::FilterLocked();
     toggle("FXAA", "Smooths jagged edges of the game's picture (top screen) before it is "
            "stretched. With HUD resolution on only the 3D picture is smoothed, not the HUD. "
            "Costs about 1-2 ms of GPU a frame.",
@@ -312,6 +317,7 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().fxaa = value;
                GxmRenderer::SaveVideoOptions();
            });
+    settings.back().restart = GxmRenderer::FilterLocked();
     toggle("Smooth gradients",
            "Turns off the game's dither pattern and keeps the picture in full colour, for smooth "
            "skies and fades without the fine grid or banding. With the Heavenfall mod, choose "
@@ -541,6 +547,7 @@ void Ui::DrawCategoryTabs(bool runtime_only) {
         pos = (pos + step + count) % count;
         settings_category = visible[pos];
         focus_first_setting = true;
+        focus_delay_frames = 1;
         settings_scroll_reset = true;
     }
 }
@@ -550,12 +557,24 @@ void Ui::DrawSettingsBody(bool runtime_only) {
         ImGui::SetScrollY(0.0f);
         settings_scroll_reset = false;
     }
+    // The first row takes the focus one frame after the list (re)appears: on the frame the
+    // scrolling child is created ImGui's own navigation start overrode the request, the tab
+    // looked selected and X did nothing until a D-pad press.
+    bool focus_now = false;
+    if (focus_first_setting) {
+        if (focus_delay_frames > 0) {
+            focus_delay_frames--;
+        } else {
+            focus_now = true;
+            focus_first_setting = false;
+        }
+    }
     for (std::size_t i = 0; i < settings.size(); i++) {
         if ((runtime_only && !settings[i].runtime) || settings[i].category != settings_category) {
             continue;
         }
-        DrawSetting(settings[i], i, focus_first_setting);
-        focus_first_setting = false;
+        DrawSetting(settings[i], i, focus_now);
+        focus_now = false;
     }
 }
 
@@ -574,6 +593,7 @@ void Ui::OpenSettings(State settings_state) {
     state = settings_state;
     overlay_focused = false;
     focus_first_setting = true;
+    focus_delay_frames = 1;
     settings_scroll_reset = true;
     // What the restart-only settings held on the way in, to ask on the way out.
     restart_snapshot.clear();
@@ -747,8 +767,8 @@ Ui::Action Ui::DrawRestartPrompt() {
     const bool appearing = ImGui::IsWindowAppearing();
     Heading("Restart needed");
     ImGui::Separator();
-    ImGui::TextWrapped("A setting you changed (render scale or HUD resolution) takes effect "
-                       "after a restart. "
+    ImGui::TextWrapped("A setting you changed takes effect after a restart (render scale, HUD "
+                       "resolution, and with the sharp HUD on also the upscale filter and FXAA). "
                        "Restart now? Progress since your last in-game save (and since your "
                        "last save state) will be lost.");
     ImGui::Spacing();

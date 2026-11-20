@@ -97,4 +97,21 @@ void SaveVideoOptions() {
     Write(Video());
 }
 
+const VideoOptions& VideoAtLaunch() {
+    static const VideoOptions launch = Video();
+    return launch;
+}
+
+bool FilterLocked() {
+    return VideoAtLaunch().hudres != 0;
+}
+
+VideoOptions::Upscale EffectiveUpscale() {
+    return FilterLocked() ? VideoAtLaunch().upscale : Video().upscale;
+}
+
+bool EffectiveFxaa() {
+    return FilterLocked() ? VideoAtLaunch().fxaa : Video().fxaa;
+}
+
 } // namespace GxmRenderer

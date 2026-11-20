@@ -163,6 +163,7 @@ private:
     void OpenSettings(State settings_state);
     [[nodiscard]] bool RestartSettingChanged() const;
     bool focus_first_setting = false; ///< the next settings body focuses its first control
+    int focus_delay_frames = 0;       ///< frames to wait before that focus request
     bool focus_pause_resume = false;  ///< the pause menu focuses Resume on its next frame
     std::vector<int> restart_snapshot;
 

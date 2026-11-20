@@ -7449,8 +7449,7 @@ void RasterizerGxm::Op2dCount(bool opaque, VideoCore::SurfaceId tex0) {
 /// under frames in flight and left the picture flickering until a restart (2026-11-20), so a
 /// new choice is only saved and applies on the next launch (the menu offers a restart).
 static u32 HudModeAtLaunch() {
-    static const u32 mode = Video().hudres;
-    return mode;
+    return VideoAtLaunch().hudres;
 }
 
 bool RasterizerGxm::HudEnabled() const {
@@ -7563,8 +7562,8 @@ bool RasterizerGxm::HudBegin() {
     // plain bilinear copy whatever the settings say.
     static const bool plain_copy = GxmFlag("hudcopyplain");
     const bool want_sharp =
-        !plain_copy && Video().upscale == VideoOptions::Upscale::SharpBilinear;
-    const bool want_fxaa = !plain_copy && Video().fxaa;
+        !plain_copy && EffectiveUpscale() == VideoOptions::Upscale::SharpBilinear;
+    const bool want_fxaa = !plain_copy && EffectiveFxaa();
     Shader* copy_fs = blit_fragment_shader;
     if (want_sharp) {
         if (hud_sharp_shader == nullptr) {

@@ -1775,7 +1775,7 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b, GuestScreen* top) {
         sceGxmNotificationWait(&wait);
     }
     g.arena_used[g.back] = 0;
-    if (top != nullptr && GxmRenderer::Video().fxaa && !top->tex_hires) {
+    if (top != nullptr && GxmRenderer::EffectiveFxaa() && !top->tex_hires) {
         FxaaPass(*top);
     }
 
@@ -1950,7 +1950,7 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
 
     // A picture already at the display's resolution (HUD resolution) is drawn plainly.
     const bool sharp = g.sharp_fp != nullptr && !screen.tex_hires &&
-                       GxmRenderer::Video().upscale ==
+                       GxmRenderer::EffectiveUpscale() ==
                            GxmRenderer::VideoOptions::Upscale::SharpBilinear;
     sceGxmSetVertexProgram(g.context, g.quad_vp);
     sceGxmSetFragmentProgram(g.context, sharp ? g.sharp_fp : g.quad_fp);

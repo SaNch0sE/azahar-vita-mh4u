@@ -40,6 +40,15 @@ struct VideoOptions {
 
 /// The live options (loaded from the file on first use).
 VideoOptions& Video();
+/// The options as the app started (the first Video() call), for settings that apply on the next
+/// launch.
+const VideoOptions& VideoAtLaunch();
+/// With the hi-res HUD on at launch, the upscale filter and FXAA keep their launch values until
+/// a restart: changed live, the HUD copy and the present's own frames disagreed for a while and
+/// the interface jiggled (2026-11-20). The menu asks for a restart instead.
+bool FilterLocked();
+VideoOptions::Upscale EffectiveUpscale();
+bool EffectiveFxaa();
 /// Writes the live options to the file.
 void SaveVideoOptions();
 
