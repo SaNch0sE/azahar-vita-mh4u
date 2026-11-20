@@ -202,3 +202,11 @@ screen layout by default with the layout settings shown, 5:3 and the 3DS HUD by 
 MH4U-specific hooks stay inactive (exact version checks). User test: **it runs**, but fps is low
 in 3D scenes and in the system keyboard. Later: one launcher app that installs and runs both
 games, with per-game improvements (hooks, defaults, cheats, mods) - for now documented only.
+- **Comparison with the other Vita Azahar app (AZAHARPSV), same spot, 2026-11-20:** it also shows
+  camera-dependent terrain shadows (a sharp diagonal dark area that appears / vanishes with a
+  small camera turn) and no visible hunter shadow - but, per the user, much less visible and in
+  fewer places than ours, where it covers larger areas with bigger visible issues. Android is
+  stable. So: a shared Vita-side cause (core / GPU behaviour) plus something in our renderer that
+  widens it. Next session: same spot, same angles in both Vita apps (and Android), then bisect
+  our renderer's differences (our lighting programs and shortcuts, Smooth gradients / dither,
+  opaque-sprite, dead-lighting, HUD copy) with their kill switches against the AZAHARPSV look.
