@@ -185,8 +185,10 @@ keyboard.
 ## 6. Settings
 
 `video.txt` `hudres=0|1|2`, default 0, read live. Pause menu "HUD resolution": "3DS (400x240)" /
-"Screen" / "Screen, lighter (1.5x)". It turns on the 8-bit display copy by itself; FXAA and the
-Sharp filter do not apply to hi-res frames.
+"Screen" / "Screen, lighter (1.5x)". It turns on the 8-bit display copy by itself. The present
+skips FXAA and the Sharp filter for hi-res frames, so HudBegin's copy does them instead: the
+sharp-bilinear program on the copy quad, and FXAA of the 3D picture at its own resolution into a
+scratch surface (its own scene) ahead of the copy. Diag `hudcopyplain` keeps the plain copy.
 
 ## 7. Diagnostics
 

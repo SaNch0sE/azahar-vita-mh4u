@@ -580,6 +580,18 @@ private:
     [[nodiscard]] bool HudEnabled() const;
     bool HudEnsurePool();
     bool HudBegin();
+    /// The present skips its Sharp bilinear upscale and FXAA for a picture already at the
+    /// display's size, so with HUD resolution on they run in HudBegin's copy instead: the
+    /// sharp program for the copy quad, and FXAA over the 3D picture at its own resolution
+    /// into hud_fxaa_surface first (made on first use, both programs too).
+    Shader* hud_sharp_shader{};
+    Shader* hud_fxaa_shader{};
+    std::unique_ptr<Surface> hud_fxaa_surface{};
+    std::unique_ptr<Framebuffer> hud_fxaa_fb{};
+    u32 hud_fxaa_w = 0, hud_fxaa_h = 0;
+    /// FXAA of the guest texture's (u0, v0)-(u1, v1) into hud_fxaa_surface, in a scene of its
+    /// own; false (nothing drawn, or the scene could not be had) leaves the copy on the guest.
+    bool HudFxaaPass(Surface& guest, float u0, float u1, float v0, float v1);
     /// Draws the HUD target back into the guest picture (scaled down) and returns to Idle:
     /// for anything that reads the guest picture, or a draw that cannot be done at hi-res.
     void HudResolve(const char* why);

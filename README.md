@@ -21,7 +21,7 @@ This repository contains no game files. You need your own copy of the game.
 | `MH4U.vpk` and `mh4unative.skprx` | this repository's [releases](https://github.com/SaNch0sE/azahar-vita-mh4u/releases) |
 | `CapUnlocker.skprx` | [GrapheneCt/CapUnlocker releases](https://github.com/GrapheneCt/CapUnlocker/releases) |
 | Monster Hunter 4 Ultimate, **USA**, decrypted (`.3ds`, `.cci` or `.cxi`) | dumped from your own cartridge or 3DS ([how to dump](https://3ds.hacks.guide/dumping-titles-and-game-cartridges.html)); decrypted, for example with GodMode9 |
-| Not needed with the web installer's mod: the game's v1.1 update, decrypted `.cia` | dumped from your own 3DS (see step 2) |
+| Recommended: the game's **v1.3 (v1.1)** update, decrypted `.cia` | dumped from your own 3DS (see step 2) |
 | The Heavenfall mod, made from your own game | the [web installer](https://popzol.github.io/4u-heavenfall-mod-beta/) (below) |
 
 Only the American release (title `0004000000126300`) has been tested. The European one may run, but
@@ -51,12 +51,11 @@ calls it. The app refuses to start, with a message, if either plugin is missing 
 
 1. Create the folder `ux0:data/mh4u/roms/`. The app also creates it on its first start.
 2. Put your decrypted game (`.3ds`, `.cci` or `.cxi`) in it.
-3. **The update (v1.1) is not needed** if you make the mod with the web installer (step 3
-   below): that mod brings its own copy of the game's program, built from the base game, and
-   it replaces the update's program whenever the mod is active. The update matters only if you
-   build the mod yourself from the update with Heavenfall's command-line tool (`--code`, below).
-   If you do want it: put the decrypted v1.1 update `.cia` in the same folder. On its next start
-   the app installs it, with a progress bar; after that you can delete the `.cia`.
+3. **Recommended: the USA game with the v1.3 (v1.1) update.** Put the decrypted update `.cia`
+   in the same folder; on its next start the app installs it, with a progress bar, and after
+   that you can delete the `.cia`. (A mod made with the web installer from the base game brings
+   its own copy of the game's program and replaces the update's while the mod is active, so the
+   game also runs without the update.)
    (Any other `.cia` in that folder, such as DLC, is installed the same way.)
 
 ### 3. The Heavenfall mod
@@ -70,11 +69,12 @@ The port is meant to be played with the mod's single-screen mode.
    game itself").
 3. Options:
    - **Single Screen mode**: on (the default).
-   - **HUD size**: **100%** (or 90%). The default 70% makes the HUD's text hard to read on the
-     Vita's screen, since the game draws it at the 3DS's resolution.
+   - **HUD size**: **80%**. The port draws the HUD, text and menus sharper than the 3DS does
+     (the app's **HUD resolution** setting, 1.33x by default), so 80% stays readable on the
+     Vita's screen and leaves more of the picture free. 90% or 100% if you prefer it bigger.
    - **Aspect ratio**: tick **Allow other aspect ratios (EXPERIMENTAL)** and choose **16:9**, so
-     the game fills the Vita's screen with correct proportions. This is the setup we play and
-     measure (16:9, HUD 100%): since 0.3 it holds 30 fps in the areas we test. 5:3, the default,
+     the game fills the Vita's screen with correct proportions (the app's **Picture shape**
+     setting is Wide by default to match). This is the setup we play and measure (16:9). 5:3, the default,
      works too and keeps the 3DS shape.
    - Keep the **other / quality-of-life module on**. The port needs it: without it the game
      crashes about 15 seconds after boot.

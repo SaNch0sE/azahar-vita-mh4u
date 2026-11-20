@@ -131,3 +131,13 @@ per-vertex highlights (`pvhalf`: white pond, see the performance notes).
   after changing a launch-time setting (Render scale) asks to restart, and "Restart now" shuts
   the emulator down and relaunches the app (sceAppMgrLoadExec). The white area at tunnel exits
   (Primal Forest, slot 8) is the game's own: Azahar on Android (GL and Vulkan) shows the same.
+
+## Next release checklist (from the user, 2026-11-20)
+
+- Recommend the mod's **80% HUD size** (README updated).
+- Default HUD resolution **1.33x** (done); Sharp bilinear / FXAA now also apply under the hi-res
+  HUD (in progress) - the user decides their defaults after testing.
+- Settings reset on the first start of the new release so the defaults apply (done:
+  `version=` in video.txt, OptionsVersion 1; older files are replaced by the defaults once).
+- README and release notes: recommend the **USA** game with the **"v1.3 (v1.1)"** update
+  (exactly that wording; README updated).

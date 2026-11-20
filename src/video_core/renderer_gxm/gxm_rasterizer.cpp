@@ -7557,7 +7557,50 @@ bool RasterizerGxm::HudBegin() {
     if (pick < 0) {
         return false;
     }
+    // The user's upscale filter and FXAA, which the present leaves out for these frames (the
+    // picture it gets is already the target's): applied here to the 3D picture only, so the
+    // HUD drawn over it afterwards stays as sharp as it is. `hudcopyplain` (diag) keeps the
+    // plain bilinear copy whatever the settings say.
+    static const bool plain_copy = GxmFlag("hudcopyplain");
+    const bool want_sharp =
+        !plain_copy && Video().upscale == VideoOptions::Upscale::SharpBilinear;
+    const bool want_fxaa = !plain_copy && Video().fxaa;
+    Shader* copy_fs = blit_fragment_shader;
+    if (want_sharp) {
+        if (hud_sharp_shader == nullptr) {
+            hud_sharp_shader = pipeline_cache->UseBuiltinShader(
+                0x73686172705f6673ull, "sharp_fs", Usse::EmitSharpBilinearFragmentProgram());
+        }
+        if (hud_sharp_shader != nullptr && hud_sharp_shader->IsDone() &&
+            !hud_sharp_shader->failed) {
+            copy_fs = hud_sharp_shader;
+        }
+    }
+    Surface& guest = res_cache.GetSurface(hud_guest_id);
+    // The graded rectangle of the guest surface, by normalised coordinates (the render scale
+    // does not change them).
+    const float su = 1.0f / static_cast<float>(std::max(guest.width, 1u));
+    const float sv = 1.0f / static_cast<float>(std::max(guest.height, 1u));
+    float u0 = hud_rx * su, u1 = (hud_rx + hud_rw) * su;
+    float v0 = hud_ry * sv, v1 = (hud_ry + hud_rh) * sv;
+    SceGxmTexture source = *guest.Texture();
+    // FXAA first, at the 3D picture's own resolution (as the present does it; at 1x render
+    // scale that is under half the pixels of running it per target pixel at 1.5x): the copy
+    // below then reads the smoothed picture, which fills its scratch surface exactly.
+    // Only with room in the blit ring for both quads: a pass whose copy then failed would
+    // have ended the 3D picture's scene for nothing, and the fallback reopens it.
     constexpr u32 QuadVertices = 6;
+    const bool ring_room = ((blit_ring_used + 15u) & ~15u) + 16u +
+                               2u * QuadVertices * sizeof(BlitVertex) <=
+                           blit_ring_limit;
+    const bool fxaa_done = want_fxaa && ring_room && HudFxaaPass(guest, u0, u1, v0, v1);
+    if (fxaa_done) {
+        source = *hud_fxaa_surface->Texture();
+        u0 = 0.0f;
+        u1 = 1.0f;
+        v0 = 0.0f;
+        v1 = 1.0f;
+    }
     const u32 offset = (blit_ring_used + 15u) & ~15u;
     if (offset + QuadVertices * sizeof(BlitVertex) > blit_ring_limit) {
         return false;
@@ -7570,13 +7613,8 @@ bool RasterizerGxm::HudBegin() {
     hud_work = pick;
     blit_ring_used = offset + QuadVertices * sizeof(BlitVertex);
     auto* quad = reinterpret_cast<BlitVertex*>(blit_ring + offset);
-    // The 3D picture, upscaled bilinearly into the whole target: the graded rectangle of the
-    // guest surface, by normalised coordinates (the render scale does not change them).
-    Surface& guest = res_cache.GetSurface(hud_guest_id);
-    const float su = 1.0f / static_cast<float>(std::max(guest.width, 1u));
-    const float sv = 1.0f / static_cast<float>(std::max(guest.height, 1u));
-    const float u0 = hud_rx * su, u1 = (hud_rx + hud_rw) * su;
-    const float v0 = hud_ry * sv, v1 = (hud_ry + hud_rh) * sv;
+    // The 3D picture (or its FXAA copy), upscaled into the whole target: bilinearly, or by
+    // the sharp program when that is the chosen filter.
     quad[0] = {-1.0f, -1.0f, u0, v0};
     quad[1] = {1.0f, -1.0f, u1, v0};
     quad[2] = {-1.0f, 1.0f, u0, v1};
@@ -7585,7 +7623,7 @@ bool RasterizerGxm::HudBegin() {
     quad[5] = {-1.0f, 1.0f, u0, v1};
     PipelineInfo info{};
     info.vertex = blit_vertex_shader;
-    info.fragment = blit_fragment_shader;
+    info.fragment = copy_fs;
     info.stream_count = 1;
     info.strides[0] = sizeof(BlitVertex);
     info.attribute_count = 2;
@@ -7603,6 +7641,28 @@ bool RasterizerGxm::HudBegin() {
         return false;
     }
     SceGxmContext* context = Device().context;
+    if (copy_fs == hud_sharp_shader) {
+        // The present's sharp-bilinear uniforms, in source texels: the texture's size, and
+        // the target pixels each texel of the rectangle covers per axis (u runs along the
+        // target's width, v along its height; no rotation here). Below 1x the band is the
+        // whole texel, which is plain bilinear.
+        const float tw = static_cast<float>(std::max(sceGxmTextureGetWidth(&source), 1u));
+        const float th = static_cast<float>(std::max(sceGxmTextureGetHeight(&source), 1u));
+        const float ku = std::max(1.0f, hud_pool_w / std::max(1.0f, (u1 - u0) * tw));
+        const float kv = std::max(1.0f, hud_pool_h / std::max(1.0f, (v1 - v0) * th));
+        const float values[5][2] = {{tw, th},
+                                    {1.0f / tw, 1.0f / th},
+                                    {ku, kv},
+                                    {0.5f / ku, 0.5f / kv},
+                                    {1.0f - 0.5f / ku, 1.0f - 0.5f / kv}};
+        static const char* const names[5] = {"sb_size", "sb_inv", "sb_scale", "sb_lo", "sb_hi"};
+        void* fbuf = nullptr;
+        if (sceGxmReserveFragmentDefaultUniformBuffer(context, &fbuf) >= 0 && fbuf != nullptr) {
+            for (int i = 0; i < 5; i++) {
+                SetUniformF(fbuf, MakeSlot(copy_fs->Param(names[i])), values[i], 2, "hudsharp");
+            }
+        }
+    }
     sceGxmSetViewportEnable(context, SCE_GXM_VIEWPORT_ENABLED);
     sceGxmSetViewport(context, hud_pool_w * 0.5f, hud_pool_w * 0.5f, hud_pool_h * 0.5f,
                       hud_pool_h * 0.5f, 0.0f, 1.0f);
@@ -7618,7 +7678,6 @@ bool RasterizerGxm::HudBegin() {
         set(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
             SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0, 0);
     }
-    SceGxmTexture source = *guest.Texture();
     sceGxmTextureSetMinFilter(&source, SCE_GXM_TEXTURE_FILTER_LINEAR);
     sceGxmTextureSetMagFilter(&source, SCE_GXM_TEXTURE_FILTER_LINEAR);
     sceGxmTextureSetMipFilter(&source, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
@@ -7651,12 +7710,160 @@ bool RasterizerGxm::HudBegin() {
         }
     }
     guest.gpu_serial = runtime.CurrentEpoch();
+    if (fxaa_done) {
+        hud_fxaa_surface->gpu_serial = runtime.CurrentEpoch();
+    }
     hud_pool[pick]->gpu_serial = runtime.CurrentEpoch();
     pipeline_cache->InvalidateBinding();
     state_cache = CachedState{};
     uniform_pipeline = nullptr;
     hud_state = HudState::Active;
     Common::PipelineStats::hudres_frames.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool RasterizerGxm::HudFxaaPass(Surface& guest, float u0, float u1, float v0, float v1) {
+    if (hud_fxaa_shader == nullptr) {
+        hud_fxaa_shader = pipeline_cache->UseBuiltinShader(0x667861615f667300ull, "fxaa_fs",
+                                                           Usse::EmitFxaaFragmentProgram());
+    }
+    if (hud_fxaa_shader == nullptr || !hud_fxaa_shader->IsDone() || hud_fxaa_shader->failed) {
+        return false;
+    }
+    SceGxmTexture source = *guest.Texture();
+    // The taps lean on the linear filter, which a strided texture cannot be given for
+    // minification (the present skips those too); colour surfaces are never strided today.
+    if (sceGxmTextureGetType(&source) == SCE_GXM_TEXTURE_LINEAR_STRIDED) {
+        return false;
+    }
+    const u32 tw = std::max(sceGxmTextureGetWidth(&source), 1u);
+    const u32 th = std::max(sceGxmTextureGetHeight(&source), 1u);
+    // The rectangle in storage texels (the render scale applied): one target pixel each.
+    const u32 w = std::max(1u, static_cast<u32>((u1 - u0) * tw + 0.5f));
+    const u32 h = std::max(1u, static_cast<u32>((v1 - v0) * th + 0.5f));
+    if (!hud_fxaa_fb || hud_fxaa_w != w || hud_fxaa_h != h) {
+        if (hud_fxaa_fb) {
+            // A new size (render scale or viewport changed, so rare): the old target's render
+            // targets go at once, so the GPU must be done with them first.
+            FlushDeferredDraws();
+            if (in_scene) {
+                EndScene();
+            }
+            sceGxmFinish(Device().context);
+        }
+        hud_fxaa_fb.reset();
+        hud_fxaa_surface.reset();
+        hud_fxaa_w = hud_fxaa_h = 0;
+        VideoCore::SurfaceParams params;
+        params.addr = 0;
+        params.width = w;
+        params.height = h;
+        params.stride = w;
+        params.is_tiled = false;
+        params.pixel_format = VideoCore::PixelFormat::RGBA8;
+        params.res_scale = 1;
+        params.UpdateParams();
+        // Stored at 1x of those storage texels, like the HUD targets: no second scaling.
+        Surface::force_scale_q = 4;
+        hud_fxaa_surface = std::make_unique<Surface>(runtime, params);
+        Surface::force_scale_q = 0;
+        if (!hud_fxaa_surface->HasMemory() || !hud_fxaa_surface->IsColorTarget()) {
+            hud_fxaa_surface.reset();
+            return false;
+        }
+        hud_fxaa_fb = std::make_unique<Framebuffer>(runtime, VideoCore::FramebufferParams{},
+                                                    hud_fxaa_surface.get(), nullptr);
+        if (hud_fxaa_fb->RenderTarget() == nullptr) {
+            hud_fxaa_fb.reset();
+            hud_fxaa_surface.reset();
+            return false;
+        }
+        hud_fxaa_w = w;
+        hud_fxaa_h = h;
+        LOG_INFO(Render, "hudres: FXAA target {}x{}", w, h);
+    }
+    constexpr u32 QuadVertices = 6;
+    const u32 offset = (blit_ring_used + 15u) & ~15u;
+    if (offset + QuadVertices * sizeof(BlitVertex) > blit_ring_limit) {
+        return false;
+    }
+    // Its own scene, ahead of the HUD target's: fragment processing runs scene by scene in
+    // order, so this one sees the finished 3D picture and the copy after it sees the result.
+    Framebuffer* target = hud_fxaa_fb.get();
+    BeginScene(target);
+    if (!in_scene || scene_fb != target) {
+        return false;
+    }
+    blit_ring_used = offset + QuadVertices * sizeof(BlitVertex);
+    auto* quad = reinterpret_cast<BlitVertex*>(blit_ring + offset);
+    // Pixel (x, y) of the scratch target is texel (x, y) of the rectangle, in the same
+    // orientation as the copy's quad, so the copy reads it with the whole 0..1 range.
+    quad[0] = {-1.0f, -1.0f, u0, v0};
+    quad[1] = {1.0f, -1.0f, u1, v0};
+    quad[2] = {-1.0f, 1.0f, u0, v1};
+    quad[3] = {1.0f, -1.0f, u1, v0};
+    quad[4] = {1.0f, 1.0f, u1, v1};
+    quad[5] = {-1.0f, 1.0f, u0, v1};
+    PipelineInfo info{};
+    info.vertex = blit_vertex_shader;
+    info.fragment = hud_fxaa_shader;
+    info.stream_count = 1;
+    info.strides[0] = sizeof(BlitVertex);
+    info.attribute_count = 2;
+    info.attributes[0] = {"vert_position", 0, SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 0};
+    info.attributes[1] = {"vert_texcoord", 8, SCE_GXM_ATTRIBUTE_FORMAT_F32, 2, 0};
+    info.blend_enabled = true;
+    info.blend.colorMask = SCE_GXM_COLOR_MASK_ALL;
+    info.blend.colorFunc = SCE_GXM_BLEND_FUNC_NONE;
+    info.blend.alphaFunc = SCE_GXM_BLEND_FUNC_NONE;
+    info.blend.colorSrc = SCE_GXM_BLEND_FACTOR_ONE;
+    info.blend.colorDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    info.blend.alphaSrc = SCE_GXM_BLEND_FACTOR_ONE;
+    info.blend.alphaDst = SCE_GXM_BLEND_FACTOR_ZERO;
+    if (!pipeline_cache->BindPipeline(info)) {
+        // The scene is open and empty: ending it costs a store of the scratch, nothing else.
+        EndScene();
+        return false;
+    }
+    SceGxmContext* context = Device().context;
+    // The present's FXAA constants, in the source texture's texels.
+    const float tu = 1.0f / static_cast<float>(tw), tv = 1.0f / static_cast<float>(th);
+    const float values[4][2] = {{0.5f * tu, 0.5f * tv},
+                                {0.25f / 8.0f, 1.0f / 128.0f},
+                                {8.0f, 1.0f / 6.0f},
+                                {tu, tv}};
+    static const char* const names[4] = {"fx_half", "fx_reduce", "fx_span", "fx_texel"};
+    void* fbuf = nullptr;
+    if (sceGxmReserveFragmentDefaultUniformBuffer(context, &fbuf) >= 0 && fbuf != nullptr) {
+        for (int i = 0; i < 4; i++) {
+            SetUniformF(fbuf, MakeSlot(hud_fxaa_shader->Param(names[i])), values[i], 2,
+                        "hudfxaa");
+        }
+    }
+    sceGxmSetViewportEnable(context, SCE_GXM_VIEWPORT_ENABLED);
+    sceGxmSetViewport(context, w * 0.5f, w * 0.5f, h * 0.5f, h * 0.5f, 0.0f, 1.0f);
+    sceGxmSetRegionClip(context, SCE_GXM_REGION_CLIP_OUTSIDE, 0, 0, w - 1, h - 1);
+    sceGxmSetCullMode(context, SCE_GXM_CULL_NONE);
+    sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
+    sceGxmSetFrontDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    sceGxmSetBackDepthWriteEnable(context, SCE_GXM_DEPTH_WRITE_DISABLED);
+    for (int face = 0; face < 2; face++) {
+        const auto set = face == 0 ? sceGxmSetFrontStencilFunc : sceGxmSetBackStencilFunc;
+        set(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
+            SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0, 0);
+    }
+    sceGxmTextureSetMinFilter(&source, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetMagFilter(&source, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    sceGxmTextureSetMipFilter(&source, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+    sceGxmTextureSetUAddrMode(&source, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    sceGxmTextureSetVAddrMode(&source, SCE_GXM_TEXTURE_ADDR_CLAMP);
+    BindFragmentTexture(0, source);
+    sceGxmSetVertexStream(context, 0, quad);
+    sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, identity_indices,
+               QuadVertices);
+    guest.gpu_serial = runtime.CurrentEpoch();
+    hud_fxaa_surface->gpu_serial = runtime.CurrentEpoch();
     return true;
 }
 

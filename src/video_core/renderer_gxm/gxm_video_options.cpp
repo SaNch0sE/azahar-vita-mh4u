@@ -14,12 +14,34 @@ namespace {
 
 constexpr const char* OptionsPath = VITA_DATA_DIR "/video.txt";
 
-VideoOptions Load() {
+/// The settings file's version. A file from before it (or an older one) is replaced by the
+/// defaults on the first start of a release, so new defaults reach players who installed an
+/// earlier build; their choices are kept from then on. Bump it when the defaults should
+/// apply once more. 1: 2026-11-20 (Sharp bilinear, Smooth, HUD 1.33x, Wide, no FPS counter).
+constexpr u32 OptionsVersion = 1;
+
+void Write(const VideoOptions& o) {
+    std::FILE* f = std::fopen(OptionsPath, "wb");
+    if (f == nullptr) {
+        return;
+    }
+    std::fprintf(f,
+                 "version=%u\nupscale=%u\nfxaa=%u\nscale_q=%u\nmsaa=%u\nwide=%u\nfps=%u\nsmooth=%u\n"
+                 "hudres=%u\n",
+                 OptionsVersion, static_cast<u32>(o.upscale), o.fxaa ? 1u : 0u, o.scale_q,
+                 o.msaa ? 1u : 0u, o.wide ? 1u : 0u, o.show_fps ? 1u : 0u, o.smooth ? 1u : 0u,
+                 o.hudres);
+    std::fclose(f);
+}
+
+VideoOptions Load(bool& reset) {
     VideoOptions o{};
+    reset = false;
     std::FILE* f = std::fopen(OptionsPath, "rb");
     if (f == nullptr) {
         return o;
     }
+    u32 version = 0;
     char line[128];
     while (std::fgets(line, sizeof(line), f) != nullptr) {
         char* eq = std::strchr(line, '=');
@@ -28,7 +50,9 @@ VideoOptions Load() {
         }
         *eq = '\0';
         const u32 v = static_cast<u32>(std::strtoul(eq + 1, nullptr, 10));
-        if (std::strcmp(line, "upscale") == 0 && v <= 2) {
+        if (std::strcmp(line, "version") == 0) {
+            version = v;
+        } else if (std::strcmp(line, "upscale") == 0 && v <= 2) {
             o.upscale = static_cast<VideoOptions::Upscale>(v);
         } else if (std::strcmp(line, "fxaa") == 0) {
             o.fxaa = v != 0;
@@ -47,26 +71,30 @@ VideoOptions Load() {
         }
     }
     std::fclose(f);
+    if (version != OptionsVersion) {
+        // An earlier release's file: start over from the defaults (saved below).
+        reset = true;
+        return VideoOptions{};
+    }
     return o;
 }
 
 } // Anonymous namespace
 
 VideoOptions& Video() {
-    static VideoOptions options = Load();
+    static VideoOptions options = [] {
+        bool reset = false;
+        VideoOptions o = Load(reset);
+        if (reset) {
+            Write(o);
+        }
+        return o;
+    }();
     return options;
 }
 
 void SaveVideoOptions() {
-    const VideoOptions& o = Video();
-    std::FILE* f = std::fopen(OptionsPath, "wb");
-    if (f == nullptr) {
-        return;
-    }
-    std::fprintf(f, "upscale=%u\nfxaa=%u\nscale_q=%u\nmsaa=%u\nwide=%u\nfps=%u\nsmooth=%u\nhudres=%u\n",
-                 static_cast<u32>(o.upscale), o.fxaa ? 1u : 0u, o.scale_q, o.msaa ? 1u : 0u,
-                 o.wide ? 1u : 0u, o.show_fps ? 1u : 0u, o.smooth ? 1u : 0u, o.hudres);
-    std::fclose(f);
+    Write(Video());
 }
 
 } // namespace GxmRenderer

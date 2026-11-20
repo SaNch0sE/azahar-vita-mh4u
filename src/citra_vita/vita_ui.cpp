@@ -295,7 +295,8 @@ void Ui::BuildSettings() {
 #endif
     choice("Upscale filter",
            "How the 400x240 picture is stretched to the screen. Sharp keeps pixels crisp, "
-           "blending only at their edges.",
+           "blending only at their edges. With HUD resolution on it applies to the 3D picture "
+           "under the HUD.",
            true, {"Linear", "Sharp bilinear"},
            [] { return static_cast<int>(GxmRenderer::Video().upscale); },
            [](int value) {
@@ -304,7 +305,8 @@ void Ui::BuildSettings() {
                GxmRenderer::SaveVideoOptions();
            });
     toggle("FXAA", "Smooths jagged edges of the game's picture (top screen) before it is "
-           "stretched. Costs about 1-2 ms of GPU a frame.",
+           "stretched. With HUD resolution on only the 3D picture is smoothed, not the HUD. "
+           "Costs about 1-2 ms of GPU a frame.",
            true, [] { return GxmRenderer::Video().fxaa; },
            [](bool value) {
                GxmRenderer::Video().fxaa = value;
@@ -323,8 +325,7 @@ void Ui::BuildSettings() {
     choice("HUD resolution",
            "Draws the game's HUD, text and menus sharper than the 3DS's 400x240, over the "
            "stretched 3D picture (applies on the next launch). Higher steps are sharper and "
-           "cost more GPU time (1.5x holds 30 fps in most places). FXAA and the Sharp upscale "
-           "filter do not apply to those frames.",
+           "cost more GPU time (1.5x holds 30 fps in most places).",
            true,
 #ifdef VITA_DIAGNOSTICS
            {"3DS (400x240)", "1.25x", "1.33x", "1.4x", "1.45x", "1.5x", "Screen"},
