@@ -141,3 +141,29 @@ per-vertex highlights (`pvhalf`: white pond, see the performance notes).
   `version=` in video.txt, OptionsVersion 1; older files are replaced by the defaults once).
 - README and release notes: recommend the **USA** game with the **"v1.3 (v1.1)"** update
   (exactly that wording; README updated).
+
+## Open: character shadows camera-dependent (2026-11-20, user slots 8/9, Primal Forest area 1)
+
+User: on Android the hunter / Palico shadows are stable; on the Vita they are "highly dependent
+on camera angle - sometimes fine, sometimes partial or not visible". Character shadows are now on
+by default (46f60cf2d). Established on the console:
+- The shadow map (0x18154F00, 256x256) is right and camera-independent: dumped at two angles it
+  holds the same hunter + Palico silhouettes (~200 texels, near the top-left).
+- No effect: dbgshadownocull, nolightprenorm, nospottrim, nofresnelskip, refllut, noreflskip,
+  nofogquery, keepdeadlight, nofrfit; dbgshadowsil (reference 1 - bias, ignoring w) still shows
+  no hunter shadow at slot 8 at any angle -> not the w path; coordinates or the lighting hookup.
+- logshadow at slot 8: receivers sample with ortho 1, bias 0x02067B, lighting shadow 1 primary 1
+  secondary 1 invert 0 **alpha 1** selector 0, lights 1, **disable_shadow FF** (per-light shadow
+  off for every light), tex0 in no TEV stage, wrap 1 1, border FFFFFFFF. So the shadow reaches the
+  picture only through the lighting colours' alpha (shadow_alpha), which a TEV stage must read -
+  check that path in fs_usse_gen (primary/secondary alpha with shadow_alpha, the Fresnel-skip
+  `primary_alpha_read` logic, the dead-lighting skip with alpha-only readers) against
+  glsl_fs_shader_gen.cpp:588-597 / 805-827.
+- nohwvs never got past loading (black) - broken or too slow in this build.
+- Fable's static comparison (receiver vs GLSL / software renderer) found no proven defect; its
+  other candidates: TEXCOORD3 declared one wide vs the VS's two (fs_usse_gen ~786-806,
+  vs_usse_gen VertexOutputs2), the 1-tap compare, the border handling, the half-pixel y shift on
+  the shadow pass.
+- Test-harness note: a second diag run in one script often lands on our pause menu over a garbled
+  screen ("resume event: pausing ... 2 s clock jump" during a slow load) - a false resume
+  detection worth fixing too.
