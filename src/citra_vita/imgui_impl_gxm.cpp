@@ -182,8 +182,10 @@ void ImGui_ImplGxm_NewFrame() {
         nav(ImGuiNavInput_DpadDown, SCE_CTRL_DOWN);
         nav(ImGuiNavInput_DpadLeft, SCE_CTRL_LEFT);
         nav(ImGuiNavInput_DpadRight, SCE_CTRL_RIGHT);
-        nav(ImGuiNavInput_FocusPrev, SCE_CTRL_LTRIGGER);
-        nav(ImGuiNavInput_FocusNext, SCE_CTRL_RTRIGGER);
+        // The shoulder buttons page the settings tabs. Both bit pairs: the handheld reports
+        // L/R as the triggers, a PS TV pad and injected input can arrive as L1/R1.
+        nav(ImGuiNavInput_FocusPrev, SCE_CTRL_LTRIGGER | SCE_CTRL_L1);
+        nav(ImGuiNavInput_FocusNext, SCE_CTRL_RTRIGGER | SCE_CTRL_R1);
 
         if (s.mouse_stick_enabled) {
             // The right stick drives a cursor, for the odd widget navigation cannot reach.

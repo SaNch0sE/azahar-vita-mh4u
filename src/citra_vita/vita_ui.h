@@ -126,6 +126,7 @@ private:
         int slider_max;
         /// Takes effect only after the app restarts: leaving the settings offers a restart.
         bool restart = false;
+        int category = 0; ///< Category* (the tab it is listed under)
     };
 
     struct GameEntry {
@@ -152,6 +153,12 @@ private:
     void DrawSettingsBody(bool runtime_only);
     void DrawSetting(Setting& setting, std::size_t index, bool focus);
     Action DrawRestartPrompt();
+    enum : int { CategoryDisplay, CategoryHud, CategoryAudio, CategorySystem, CategoryCount };
+    static constexpr float ControlWidth = 300.0f; ///< every setting's control, right-aligned
+    void DrawCategoryTabs(bool runtime_only);
+    [[nodiscard]] bool CategoryVisible(int category, bool runtime_only) const;
+    int settings_category = CategoryDisplay;
+    bool settings_scroll_reset = false;
     static int SettingValue(const Setting& setting);
     void OpenSettings(State settings_state);
     [[nodiscard]] bool RestartSettingChanged() const;

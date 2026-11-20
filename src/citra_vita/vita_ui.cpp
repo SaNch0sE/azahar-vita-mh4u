@@ -74,6 +74,47 @@ bool BeginCentered(const char* id, float width, float height) {
     }
     return open;
 }
+/// Dark wood, brass edges and parchment text: the look of the series' own menus, in colours only
+/// (no artwork from the games).
+void ApplyHunterTheme(ImGuiStyle& style) {
+    ImVec4* c = style.Colors;
+    const ImVec4 parchment{0.96f, 0.91f, 0.80f, 1.0f};
+    const ImVec4 brass{0.78f, 0.60f, 0.28f, 1.0f};
+    const ImVec4 gold{0.98f, 0.82f, 0.38f, 1.0f};
+    c[ImGuiCol_Text] = parchment;
+    c[ImGuiCol_TextDisabled] = ImVec4(0.66f, 0.58f, 0.46f, 1.0f);
+    c[ImGuiCol_WindowBg] = ImVec4(0.15f, 0.10f, 0.06f, 0.96f);
+    c[ImGuiCol_ChildBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    c[ImGuiCol_PopupBg] = ImVec4(0.20f, 0.13f, 0.08f, 0.98f);
+    c[ImGuiCol_Border] = brass;
+    c[ImGuiCol_BorderShadow] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    c[ImGuiCol_FrameBg] = ImVec4(0.27f, 0.18f, 0.11f, 1.0f);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.38f, 0.26f, 0.15f, 1.0f);
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.46f, 0.32f, 0.17f, 1.0f);
+    c[ImGuiCol_Button] = ImVec4(0.33f, 0.22f, 0.12f, 1.0f);
+    c[ImGuiCol_ButtonHovered] = ImVec4(0.50f, 0.34f, 0.17f, 1.0f);
+    c[ImGuiCol_ButtonActive] = ImVec4(0.62f, 0.43f, 0.19f, 1.0f);
+    c[ImGuiCol_Header] = ImVec4(0.50f, 0.34f, 0.17f, 1.0f);
+    c[ImGuiCol_HeaderHovered] = ImVec4(0.58f, 0.40f, 0.19f, 1.0f);
+    c[ImGuiCol_HeaderActive] = ImVec4(0.66f, 0.46f, 0.21f, 1.0f);
+    c[ImGuiCol_CheckMark] = gold;
+    c[ImGuiCol_SliderGrab] = brass;
+    c[ImGuiCol_SliderGrabActive] = gold;
+    c[ImGuiCol_Separator] = ImVec4(0.52f, 0.39f, 0.20f, 1.0f);
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0.10f, 0.07f, 0.04f, 0.8f);
+    c[ImGuiCol_ScrollbarGrab] = ImVec4(0.52f, 0.39f, 0.20f, 1.0f);
+    c[ImGuiCol_ScrollbarGrabHovered] = brass;
+    c[ImGuiCol_ScrollbarGrabActive] = gold;
+    c[ImGuiCol_NavHighlight] = gold;
+}
+
+/// A panel heading in gold.
+void Heading(const char* text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.82f, 0.38f, 1.0f));
+    ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
+}
+
 /// Makes the item just drawn the pad's target, as a D-pad press would. On a fresh window the
 /// old focus call only drew the highlight: X did nothing until a D-pad press or a touch set the
 /// navigation target for real. SetFocusID sets it, in the window navigation runs in (a
@@ -97,8 +138,13 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 6.0f;
     style.FrameRounding = 4.0f;
-    style.WindowPadding = ImVec2(16.0f, 16.0f);
-    style.ItemSpacing = ImVec2(10.0f, 10.0f);
+    style.WindowPadding = ImVec2(16.0f, 14.0f);
+    style.ItemSpacing = ImVec2(10.0f, 8.0f);
+    style.WindowBorderSize = 2.0f;
+    style.FrameBorderSize = 1.0f;
+    style.GrabMinSize = 18.0f;
+    style.ScrollbarSize = 14.0f;
+    ApplyHunterTheme(style);
     // The console is held at arm's length, so everything is a size up from a desktop default.
     ImGui::GetIO().FontGlobalScale = 1.2f;
 
@@ -139,12 +185,15 @@ void Ui::ScanGames() {
 }
 
 void Ui::BuildSettings() {
+    // Each row lands in the category set last (the tabs at the top of the settings).
+    int category = CategorySystem;
     const auto toggle = [&](const char* title, const char* description, bool runtime,
                             std::function<bool()> get, std::function<void(bool)> set) {
         Setting setting{};
         setting.title = title;
         setting.description = description;
         setting.kind = Setting::Kind::Toggle;
+        setting.category = category;
         setting.runtime = runtime;
         setting.get_bool = std::move(get);
         setting.set_bool = std::move(set);
@@ -157,6 +206,7 @@ void Ui::BuildSettings() {
         setting.title = title;
         setting.description = description;
         setting.kind = Setting::Kind::Choice;
+        setting.category = category;
         setting.runtime = runtime;
         setting.choices = std::move(choices);
         setting.get_choice = std::move(get);
@@ -169,6 +219,7 @@ void Ui::BuildSettings() {
         setting.title = title;
         setting.description = description;
         setting.kind = Setting::Kind::Slider;
+        setting.category = category;
         setting.runtime = runtime;
         setting.slider_min = min;
         setting.slider_max = max;
@@ -179,16 +230,19 @@ void Ui::BuildSettings() {
 
 #ifdef VITA_DIAGNOSTICS
     // Diagnostics only: the release runs MH4U at full speed on one screen (2026-11-20).
+    category = CategorySystem;
     slider("Speed limit", "Percentage of full speed to aim for. Lower it to save battery.", true,
            0, 200, [] { return static_cast<int>(Settings::values.frame_limit.GetValue()); },
            [](int value) { Settings::values.frame_limit = static_cast<double>(value); });
 #endif
+    category = CategoryAudio;
     slider("Volume", "Output volume.", true, 0, 100,
            [] { return static_cast<int>(Settings::values.volume.GetValue() * 100.0f); },
            [](int value) { Settings::values.volume = static_cast<float>(value) / 100.0f; });
     toggle("Stretch audio", "Keeps audio continuous when the emulator runs below full speed.",
            true, [] { return Settings::values.enable_audio_stretching.GetValue(); },
            [](bool value) { Settings::values.enable_audio_stretching = value; });
+    category = CategoryDisplay;
 #ifdef VITA_DIAGNOSTICS
     choice("Screen layout", "How the two screens are arranged on the display.", true,
            {"Default", "Single screen", "Large screen", "Side by side", "Hybrid"},
@@ -245,6 +299,7 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().smooth = value;
                GxmRenderer::SaveVideoOptions();
            });
+    category = CategoryHud;
     choice("HUD resolution",
            "Draws the game's HUD, text and menus at the Vita's resolution over the stretched 3D "
            "picture: sharp, readable text. Costs GPU time (a few frames per second less in heavy "
@@ -273,6 +328,7 @@ void Ui::BuildSettings() {
                GxmRenderer::Video().show_fps = value;
                GxmRenderer::SaveVideoOptions();
            });
+    category = CategoryDisplay;
     choice("Picture shape",
            "3DS keeps the game's 5:3 picture with bars at the sides. Wide fills the screen; "
            "use it with the Heavenfall mod built with --cheat-aspect-ratio 16:9 (and 16:9 "
@@ -295,6 +351,7 @@ void Ui::BuildSettings() {
                GxmRenderer::SaveVideoOptions();
            });
     settings.back().restart = true;
+    category = CategorySystem;
     choice("Region", "The console region reported to the title.", false,
            {"Auto", "Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"},
            [] { return Settings::values.region_value.GetValue() + 1; },
@@ -333,27 +390,27 @@ void Ui::ClearStatusMessage() {
 
 void Ui::DrawSetting(Setting& setting, std::size_t index, bool focus) {
     ImGui::PushID(static_cast<int>(index));
+    // Where the row starts: a focused control brings its title and description into view too
+    // (ImGui scrolls only far enough for the control, so going back up stopped one row short
+    // and the first title never came back).
+    const float row_top = ImGui::GetCursorPosY();
+    const float control_x = ImGui::GetWindowContentRegionMax().x - ControlWidth;
+    ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(setting.title);
-    // Wrapped: the longer descriptions ran off the panel's edge.
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
-    ImGui::TextWrapped("%s", setting.description);
-    ImGui::PopStyleColor();
+    ImGui::SameLine(control_x);
+    ImGui::SetNextItemWidth(ControlWidth);
 
     switch (setting.kind) {
     case Setting::Kind::Toggle: {
         bool value = setting.get_bool();
-        if (ImGui::Checkbox("##toggle", &value)) {
+        if (ImGui::Checkbox(value ? "On##toggle" : "Off##toggle", &value)) {
             setting.set_bool(value);
-        }
-        if (focus) {
-            FocusLastItem();
         }
         break;
     }
     case Setting::Kind::Choice: {
         int value = setting.get_choice();
         value = std::clamp(value, 0, static_cast<int>(setting.choices.size()) - 1);
-        ImGui::SetNextItemWidth(320.0f);
         if (ImGui::BeginCombo("##choice", setting.choices[value])) {
             for (int i = 0; i < static_cast<int>(setting.choices.size()); i++) {
                 if (ImGui::Selectable(setting.choices[i], i == value)) {
@@ -366,31 +423,102 @@ void Ui::DrawSetting(Setting& setting, std::size_t index, bool focus) {
             }
             ImGui::EndCombo();
         }
-        if (focus) {
-            FocusLastItem();
-        }
         break;
     }
     case Setting::Kind::Slider: {
         int value = setting.get_slider();
-        ImGui::SetNextItemWidth(320.0f);
         if (ImGui::SliderInt("##slider", &value, setting.slider_min, setting.slider_max)) {
             setting.set_slider(value);
-        }
-        if (focus) {
-            FocusLastItem();
         }
         break;
     }
     }
+    if (focus) {
+        FocusLastItem();
+    }
+    if (ImGui::IsItemFocused() && row_top < ImGui::GetScrollY()) {
+        ImGui::SetScrollY(row_top);
+    }
 
+    // The description a size smaller, in a muted parchment.
+    ImGui::SetWindowFontScale(0.85f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.80f, 0.72f, 0.58f, 1.0f));
+    ImGui::TextWrapped("%s", setting.description);
+    ImGui::PopStyleColor();
+    ImGui::SetWindowFontScale(1.0f);
     ImGui::Separator();
     ImGui::PopID();
 }
 
+bool Ui::CategoryVisible(int category, bool runtime_only) const {
+    for (const Setting& setting : settings) {
+        if (setting.category == category && (!runtime_only || setting.runtime)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Ui::DrawCategoryTabs(bool runtime_only) {
+    static constexpr const char* names[CategoryCount] = {"Display", "HUD", "Audio", "System"};
+    int visible[CategoryCount];
+    int count = 0;
+    for (int c = 0; c < CategoryCount; c++) {
+        if (CategoryVisible(c, runtime_only)) {
+            visible[count++] = c;
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+    int pos = 0;
+    for (int k = 0; k < count; k++) {
+        if (visible[k] == settings_category) {
+            pos = k;
+        }
+    }
+    settings_category = visible[pos];
+    // L and R step through the tabs, as the games' own menus page with the shoulder buttons.
+    const ImGuiIO& io = ImGui::GetIO();
+    int step = 0;
+    if (io.NavInputsDownDuration[ImGuiNavInput_FocusPrev] == 0.0f) {
+        step = -1;
+    } else if (io.NavInputsDownDuration[ImGuiNavInput_FocusNext] == 0.0f) {
+        step = 1;
+    }
+    ImGui::TextDisabled("L");
+    ImGui::SameLine();
+    for (int k = 0; k < count; k++) {
+        const bool current = k == pos;
+        ImGui::PushStyleColor(ImGuiCol_Button, current ? ImVec4(0.66f, 0.46f, 0.21f, 1.0f)
+                                                       : ImVec4(0.24f, 0.16f, 0.09f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, current ? ImVec4(1.0f, 0.95f, 0.82f, 1.0f)
+                                                     : ImVec4(0.75f, 0.66f, 0.52f, 1.0f));
+        // Tabs are for touch; the pad pages with L/R and stays in the list.
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+        if (ImGui::Button(names[visible[k]], ImVec2(150.0f, 36.0f)) && !current) {
+            step = k - pos;
+        }
+        ImGui::PopItemFlag();
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+    }
+    ImGui::TextDisabled("R");
+    if (step != 0) {
+        pos = (pos + step + count) % count;
+        settings_category = visible[pos];
+        focus_first_setting = true;
+        settings_scroll_reset = true;
+    }
+}
+
 void Ui::DrawSettingsBody(bool runtime_only) {
+    if (settings_scroll_reset) {
+        ImGui::SetScrollY(0.0f);
+        settings_scroll_reset = false;
+    }
     for (std::size_t i = 0; i < settings.size(); i++) {
-        if (runtime_only && !settings[i].runtime) {
+        if ((runtime_only && !settings[i].runtime) || settings[i].category != settings_category) {
             continue;
         }
         DrawSetting(settings[i], i, focus_first_setting);
@@ -413,6 +541,7 @@ void Ui::OpenSettings(State settings_state) {
     state = settings_state;
     overlay_focused = false;
     focus_first_setting = true;
+    settings_scroll_reset = true;
     // What the restart-only settings held on the way in, to ask on the way out.
     restart_snapshot.clear();
     for (const Setting& setting : settings) {
@@ -484,10 +613,11 @@ Ui::Action Ui::DrawGameList() {
 
 Ui::Action Ui::DrawGameSettings() {
     BeginFullscreen("##gamesettings");
-    ImGui::TextUnformatted("Settings");
+    Heading("Settings");
+    DrawCategoryTabs(false);
     ImGui::Separator();
 
-    ImGui::BeginChild("##settings_scroll", ImVec2(0.0f, 420.0f), false, ImGuiWindowFlags_NavFlattened);
+    ImGui::BeginChild("##settings_scroll", ImVec2(0.0f, 380.0f), false, ImGuiWindowFlags_NavFlattened);
     DrawSettingsBody(false);
     ImGui::EndChild();
 
@@ -506,7 +636,7 @@ Ui::Action Ui::DrawGameSettings() {
 Ui::Action Ui::DrawPauseMenu() {
     Action action = Action::None;
     BeginCentered("##pause", 360.0f, 420.0f);
-    ImGui::TextUnformatted("Paused");
+    Heading("Paused");
     ImGui::Separator();
 
     const ImVec2 button_size{320.0f, 48.0f};
@@ -555,11 +685,12 @@ Ui::Action Ui::DrawPauseMenu() {
 }
 
 Ui::Action Ui::DrawPauseSettings() {
-    BeginCentered("##pausesettings", 700.0f, 460.0f);
-    ImGui::TextUnformatted("Settings");
+    BeginCentered("##pausesettings", 880.0f, 500.0f);
+    Heading("Settings");
+    DrawCategoryTabs(true);
     ImGui::Separator();
 
-    ImGui::BeginChild("##pause_settings_scroll", ImVec2(0.0f, 320.0f), false, ImGuiWindowFlags_NavFlattened);
+    ImGui::BeginChild("##pause_settings_scroll", ImVec2(0.0f, 330.0f), false, ImGuiWindowFlags_NavFlattened);
     // Only what can be changed under a running title; the rest would need a reboot.
     DrawSettingsBody(true);
     ImGui::EndChild();
@@ -581,7 +712,7 @@ Ui::Action Ui::DrawRestartPrompt() {
     Action action = Action::None;
     BeginCentered("##restart", 600.0f, 300.0f);
     const bool appearing = ImGui::IsWindowAppearing();
-    ImGui::TextUnformatted("Restart needed");
+    Heading("Restart needed");
     ImGui::Separator();
     ImGui::TextWrapped("A setting you changed (render scale) takes effect after a restart. "
                        "Restart now? Progress since your last in-game save (and since your "
@@ -614,7 +745,7 @@ Ui::Action Ui::DrawSavestates() {
     // Opening lands on slot 1's Load (Load comes first, so the default can't overwrite a slot).
     // No scrolling child: ImGui 1.79's pad navigation into one starts on its frame or on Back.
     const bool appearing = ImGui::IsWindowAppearing();
-    ImGui::TextUnformatted("Save states");
+    Heading("Save states");
     ImGui::Separator();
 
     for (u32 slot = 1; slot <= 9; slot++) {
@@ -660,7 +791,7 @@ Ui::Action Ui::DrawBugReport() {
     }
     BeginCentered("##bugreport", 640.0f, 470.0f);
     const bool appearing = ImGui::IsWindowAppearing();
-    ImGui::TextUnformatted("Bug report");
+    Heading("Bug report");
     ImGui::Separator();
     ImGui::TextWrapped("Saves one zip to ux0:data/mh4u/reports (the newest 3 are kept) with what we need to look into a "
                        "problem: the app and game versions, your mod files list and settings, the "
