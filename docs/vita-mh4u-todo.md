@@ -215,13 +215,89 @@ flag) restores the single lookup.
   `nolodbias` file/flag to leave it out). MH4U's ground has a -1 level bias on unit 2; small
   visible effect - the ground is still softer than Android's at 1x (open, below).
 
-## Open: ground textures softer than Android at the same 1x (2026-11-20)
+## Open: ground lighting detail fades with the camera (2026-11-20/21, slots 8/9, Primal Forest area 1)
 
-User: "it really is just blurry" - same content (the blue patches are there), less detail.
-Not the HUD copy (HUD 3DS vs 1.33x look the same), not the kill switches. The ground uses
-128x128 textures with 4 mip levels on units 1-2 (`logtexmip`); unit 2 has a -1 level bias,
-now applied, which helped only a little. Next: compare the mip level GXM picks with the PICA's
-(the 240x400 target is rotated; derivatives may come out differently), and the filtering.
+User: on the ground, the bump/lighting detail (dark blotches, cyan glints, "looks 3D") is there at
+some camera angles and gone at others ("soft": even, blurrier, darker or brighter); a tiny camera
+move flips it. Android Azahar and the other Vita Azahar app (GL) show the detail at every angle
+(other app at the same spot: detail measure 35.5-37 at three angles; ours 26-33; Android 37-42 -
+edge energy of the floor region downscaled to 400x240). Slot 9 starts at a soft view, slot 8 at a
+detailed one. The character-shadow fix above (four-tap compare) is real but is not this.
+
+### Where it is (proven)
+- **Our GPU vertex path computes a wrong surface normal for the floor draws.** With the floor's
+  vertex processing on Azahar's CPU reference path the detail stays at every angle ("looks more
+  3D, like normal maps"): `swlitw` (lit draws whose unit 1 texture is at 0x21Fxxxxx go to the CPU
+  path; ~8 fps) and `swdefattr` (only those floor draws that have a default/fixed vertex
+  attribute; fewer fps hit) both fix it.
+- Slot 9, static camera, GPU vs CPU path for those draws (debug views): texture coordinate 1
+  identical (diff 0.4/255), vertex colour identical (0.6), diffuse lighting sum very different
+  (19.4, GPU darker over the floor), quaternion as colour very different (64.6; y/z of opposite
+  sign - red saturated by the post effects, and a CPU z < 0 cannot come from the dumped shader,
+  so the decode needs checking).
+- The draw list is identical between detailed and soft angles (`logframe`: same programs,
+  textures, sizes, mip levels, filters) - the game sends the same work.
+- Floor draws: vertex attributes 0 f32x3 position, 1 s8x4, 2 f32x2 uv, 3 u8x4, 4 s8x4 or default,
+  5 default (0,0,0,0); attribute -> register map identity; max_input_attribute_index 5; all on
+  the GPU vertex path normally; Z-buffered (depthmap 1 = Z; W is 0), LEQUAL, blended, overlay
+  layers zwrite 0 with near-plane offset 0x00AE0000. Fragment side: one directional light,
+  config 1 (SP, FR on N.V into secondary alpha, RR on N.H), some programs bump-mapped (unit 2
+  normal map, ETC1 128x128, 4 mips, LOD bias -1); the default-attribute draws are all non-bump.
+- The game never writes default attributes during play (write log silent for 40 s) and the
+  render thread's copy is (0,0,0,0); the CPU fallback reads the same copy (Fable's reading of
+  pica_core.cpp), so the default value itself is not the difference.
+
+### Ruled out (no change; most both as a slot 9 screenshot and live by the user at slot 8)
+- Textures: `texnomips` (level 0 only - also shows the "soft" look near the player, so not mips),
+  `lodplus1/2`, `lodminus1/2/3` (sharper helps far ground only; near ground plateaus at ~32).
+- Lighting terms: `dbgconstfr` (Fresnel 1), `reflone` (specular 1), both together (floor still
+  changes between angles: hard-edged dark patches vs none), `dbgshadowlit`, `nofrfit`, `refllut`
+  and the other 12 lighting/renderer kill switches (one angle only).
+- Depth: `dbgdecalalways` (overlays pass the depth test always).
+- Normals on our side: `nopvnormal`, `pvframe` (normal rebuilt per pixel, sign-safe), the N/T
+  frame mode for bump programs (kept, below).
+- Shader data: `uniformsalways` (every draw re-uploads uniforms), `fullbank uniformsalways`
+  (the whole f24 bank re-converted every upload).
+- Program compilation: `usse_nomadfold usse_nocse novtxcache`, `notier2` (no tier-2 optimiser),
+  `novsmemo` (no vertex setup memo).
+- Screen output: Android uses native 400x240 with linear filtering too; its new screenshot with
+  filtering measures the same as without.
+
+### Next step (not started)
+Replay on the PC: run Azahar's reference shader interpreter on the floor's dumped inputs and
+compare intermediate values with our USSE translation, to name the mistranslated instruction.
+- `vsdump` with the key `floor` (vsdump.txt: `floor 600`) dumps the floor draws' vertex stream 0
+  and default uniform buffer as the GPU sees them, now with the uniform offsets (f, i, b,
+  vs_in_reg0-15) after the header. 25 dumps were taken at slot 9 (stride 32, f at float 24,
+  reg5 default uniform at float 4, u94 = (1/255, 1/127, 0, 1), u95 = (1, 0, 0, 0)).
+- Transcribing `uv_ca1204af5ec65c86.cg` (a skinned shader: bone indices/weights from reg3 via
+  MOVA, second bone from reg5, normal from reg1 through the bone rows and rows 78-80, quaternion
+  built from the view-space normal) and running it on those dumps gives zero weights and NaN -
+  so the floor runs a different bool-specialised variant (programs are compiled per used bool
+  uniform; that file has bools 0x0802). The replay needs the actual program: dump the PICA code
+  and swizzles with the request (`usse_dump` writes `uv_<key>.vq`) for the same draw.
+- Fable's review (2026-11-21) also noted: a latent emitter bug in RSQ/RCP when the destination
+  overlaps the source across both pairs (vs_usse_gen.cpp, complex ops) - harmless in the dumped
+  shader only because the overwritten lanes are not read; MOVA uses PackS16 (rounding mode
+  unknown) and zeroes indices outside [-128, 127] where the CPU JIT truncates and wraps; and
+  `sceClibPrintf` may not format floats (print raw bits).
+
+### Code from this investigation (in the working tree, not committed)
+- Correct per Azahar, kept: attributes marked default no longer read from the stream (their
+  bytes still advance the offset); the last attribute mapped to a register wins
+  (ShaderUnit::LoadInput); a loaded state re-ships the default attributes
+  (default_attributes_sync_dirty in PicaCore::serialize); bump-mapped programs get the normal
+  frame (N in TEXCOORD5, tangent in TEXCOORD4, rebuilt per pixel) instead of an interpolated
+  quaternion. None of these fixed the floor.
+- Diag switches: `swlitw`, `swdefattr`, `pvframe`, `dbgout_quat`, `dbgdecalalways`,
+  `uniformsalways`, `fullbank`, `lodplus1/2`, `lodminus05/1/15/2/3`, `texnomips`,
+  `loaddefaultattr`, `logframe` (with `dumpfile logtex`: per-draw program, vertex path, depth
+  state, attributes, attribute->register map, default values, textures, to
+  frame_draws_<n>.txt; skips the surface dump), `usse_dump` now also dumps refused fragment
+  configs with the reason, `vsdump` key `floor`. Host tools: tools/usse_host fs_emit stub for
+  ShadowMapsEnabled; config/TEV decoders were ad hoc in the job's tmp.
+- Two logs that never printed (pica_core.cpp default-attribute writes, threaded_rasterizer.cpp
+  emu-side defaults; `logdefattr` file switch): likely float formatting; remove or switch to hex.
 
 ## Idea: one launcher for MH4U and MHXX (2026-11-20, later)
 
