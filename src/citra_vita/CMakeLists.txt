@@ -80,6 +80,8 @@ set(CITRA_VITA_SOURCES
     menu_glyphs.h
     multiplayer.cpp
     multiplayer.h
+    rom_check.cpp
+    rom_check.h
     sgxd_present.cpp
     sgxd_present.h
     stats_hud.cpp

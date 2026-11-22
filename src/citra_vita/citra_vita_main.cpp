@@ -2916,6 +2916,11 @@ int EmulatorMain() {
         sceClibPrintf("[azahar] install: %s\n", outcome.c_str());
         show_outcome(std::move(outcome));
     };
+    const auto check_selected = [&] {
+        const std::string outcome = ui.CheckSelected(present_list);
+        sceClibPrintf("[azahar] check: %s\n", outcome.c_str());
+        show_notice(outcome + "\n\n" + Tr("Press X or O to continue."));
+    };
     while (running && !window.IsQuitRequested()) {
         if (!g_crash_notice.empty()) {
             sceClibPrintf("[azahar] crash notice shown\n");
@@ -2951,6 +2956,9 @@ int EmulatorMain() {
         case VitaFrontend::Ui::Action::InstallTitle:
             install_selected();
             break;
+        case VitaFrontend::Ui::Action::CheckFile:
+            check_selected();
+            break;
         default:
             break;
         }
@@ -2970,6 +2978,16 @@ int EmulatorMain() {
             if (ui.SelectTitle(command.substr(8))) {
                 sceClibPrintf("[azahar] %s (command)\n", command.c_str());
                 install_selected();
+            } else {
+                sceClibPrintf("[azahar] %s: no such title (command)\n", command.c_str());
+            }
+        } else if (command.starts_with("check ")) {
+            // The title whose name or path holds the text, checked as its File tab does.
+            if (ui.SelectTitle(command.substr(6))) {
+                sceClibPrintf("[azahar] %s (command)\n", command.c_str());
+                const std::string outcome = ui.CheckSelected(present_list);
+                sceClibPrintf("[azahar] check: %s\n", outcome.c_str());
+                show_outcome(outcome);
             } else {
                 sceClibPrintf("[azahar] %s: no such title (command)\n", command.c_str());
             }

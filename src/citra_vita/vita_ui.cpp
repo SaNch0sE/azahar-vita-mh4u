@@ -38,6 +38,7 @@
 #include "citra_vita/i18n.h"
 #include "citra_vita/i18n_tables.h"
 #include "citra_vita/menu_glyphs.h"
+#include "citra_vita/rom_check.h"
 #include "citra_vita/sgxd_present.h"
 #include "citra_vita/stats_hud.h"
 #include "citra_vita/uvc_stream.h"
@@ -1042,13 +1043,15 @@ const char* CategoryName(int category) {
     static constexpr const char* names[] = {Translatable("Display"), Translatable("Speed"),
                                             Translatable("Sound"),   Translatable("Controls"),
                                             Translatable("System"),  Translatable("Patches"),
-                                            Translatable("Cheats"),  Translatable("Installed")};
+                                            Translatable("Cheats"),  Translatable("Installed"),
+                                            Translatable("File")};
     return names[category];
 }
 
 Icon CategoryIcon(int category) {
-    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge, Icon::Speaker, Icon::Pad,
-                                     Icon::Globe,   Icon::Patch, Icon::Cheat,   Icon::Disk};
+    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge,     Icon::Speaker,
+                                     Icon::Pad,     Icon::Globe,     Icon::Patch,
+                                     Icon::Cheat,   Icon::Disk,      Icon::Cartridge};
     return icons[category];
 }
 
@@ -1745,10 +1748,12 @@ void Ui::ClearStatusMessage() {
     status_progress = -1.0f;
 }
 
-void Ui::OpenSettings(std::string title, std::string name, State back, u64 program_id) {
+void Ui::OpenSettings(std::string title, std::string name, State back, u64 program_id,
+                      std::string path) {
     settings_title = std::move(title);
     settings_name = std::move(name);
     settings_back = back;
+    settings_path = std::move(path);
     // The title's built-in patches; the running title's as its load left them (a loader that
     // applies none: none).
     settings_patches = Loader::TitlePatchesOf(program_id);
@@ -1810,8 +1815,9 @@ std::vector<Ui::Category> Ui::SettingsCategories() const {
         const bool has_rows =
             tab == Category::Patches  ? !settings_patches.empty()
             : tab == Category::Cheats ? settings_program_id != 0
-            : tab == Category::Installed
-                ? !settings_installed.empty()
+            : tab == Category::Installed ? !settings_installed.empty()
+            : tab == Category::File
+                ? !settings_path.empty()
                 : std::any_of(rows.begin(), rows.end(), [&](const Row& row) {
                       return row.category == tab &&
                              (settings_title.empty() || Config::PerTitle(row.option));
@@ -2283,6 +2289,39 @@ void Ui::DrawInstalledInfo() {
     Note(palette->TextDim, TrFormat("Title {:016X}.", part.title_id));
 }
 
+void Ui::DrawFileRow() {
+    constexpr float Pad = 18.0f;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const Card card = CardItem("##check", ImVec2(width, RowHeight));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const char* const label = Tr("Check file");
+        const ImVec2 size = ImGui::CalcTextSize(label);
+        dl->AddText(ImVec2(card.bb.Min.x + Pad, card.bb.GetCenter().y - size.y * 0.5f),
+                    Colour(palette->Text), label);
+    }
+    check_requested |= card.pressed;
+}
+
+void Ui::DrawFileInfo() {
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", Tr("Check file"));
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", Tr("Reads the whole file and compares every part with the checksums "
+                                "3DS files carry, to find a damaged or incomplete copy. A large "
+                                "game takes a few minutes."));
+    ImGui::Spacing();
+    Note(palette->TextDim, std::string{FileUtil::GetFilename(settings_path)});
+    if (const auto found = check_results.find(settings_path); found != check_results.end()) {
+        Note(palette->Accent, found->second);
+    }
+}
+
 void Ui::DrawRomFolderRows() {
     constexpr float Pad = 18.0f;
     const float width = ImGui::GetContentRegionAvail().x;
@@ -2439,7 +2478,7 @@ Ui::Action Ui::DrawSettings() {
     // The Patches tab changes nothing; the Cheats tab's rows are switches alone, the Installed
     // tab's are removed.
     const bool option_rows = category != Category::Patches && category != Category::Cheats &&
-                             category != Category::Installed;
+                             category != Category::Installed && category != Category::File;
     bool back = FooterButton(Glyph::Circle, Tr("Back"));
     if (option_rows) {
         FooterButton(Glyph::LeftRight, Tr("Change"));
@@ -2447,6 +2486,8 @@ Ui::Action Ui::DrawSettings() {
         FooterButton(Glyph::Cross, Tr("On or off"));
     } else if (category == Category::Installed) {
         FooterButton(Glyph::Cross, Tr("Remove"));
+    } else if (category == Category::File && FooterButton(Glyph::Cross, Tr("Check"))) {
+        check_requested = true;
     }
     if (categories.size() > 1 && FooterButton(Glyph::Shoulders, Tr("Tab")) && !next_category) {
         const int at = static_cast<int>(current - categories.begin());
@@ -2516,6 +2557,8 @@ Ui::Action Ui::DrawSettings() {
         for (std::size_t i = 0; i < settings_installed.size() && state == State::Settings; i++) {
             DrawInstalledRow(i);
         }
+    } else if (category == Category::File) {
+        DrawFileRow();
     } else {
         for (std::size_t i = 0; i < rows.size(); i++) {
             const Row& row = rows[i];
@@ -2539,6 +2582,8 @@ Ui::Action Ui::DrawSettings() {
         DrawCheatInfo();
     } else if (category == Category::Installed) {
         DrawInstalledInfo();
+    } else if (category == Category::File) {
+        DrawFileInfo();
     } else {
         DrawRowInfo();
     }
@@ -2550,6 +2595,11 @@ Ui::Action Ui::DrawSettings() {
         state = settings_back;
         overlay_focused = false;
         focus_first_row = true;
+    }
+    if (std::exchange(check_requested, false) && !back) {
+        check_path = settings_path;
+        check_name = settings_name;
+        return Action::CheckFile;
     }
     return Action::None;
 }
@@ -2722,6 +2772,8 @@ Ui::Action Ui::DrawGameList() {
         !games.empty() && FooterButton(Glyph::Cross, installer ? Tr("Install") : Tr("Open"));
     bool game_settings =
         !games.empty() && !installer && FooterButton(Glyph::Triangle, Tr("Game settings"));
+    // A CIA's triangle checks its file: it has no settings of its own.
+    bool check = !games.empty() && installer && FooterButton(Glyph::Triangle, Tr("Check file"));
     bool pin = false;
     if (!games.empty() && !installer) {
         const std::string& path = games[static_cast<std::size_t>(selected_game)].path;
@@ -3012,11 +3064,16 @@ Ui::Action Ui::DrawGameList() {
     }
     const GameEntry& game = games[static_cast<std::size_t>(selected_game)];
     if (game.installer) {
+        check |= game_settings;
         game_settings = pin = false;
     }
     if (game_settings) {
         OpenSettings(Config::TitleKeyOf(game.path), game.name, State::GameList,
-                     ProgramIdOf(game.path));
+                     ProgramIdOf(game.path), game.path);
+    } else if (check) {
+        check_path = game.path;
+        check_name = game.name;
+        action = Action::CheckFile;
     } else if (pin) {
         selected_game_path = game.path;
         action = Action::TogglePin;
@@ -3119,6 +3176,52 @@ std::string Ui::InstallSelected(const std::function<void()>& present) {
     default:
         return TrFormat("{} is installed.", entry.name);
     }
+}
+
+std::string Ui::CheckSelected(const std::function<void()>& present) {
+    std::string path = std::exchange(check_path, {});
+    std::string name = std::exchange(check_name, {});
+    if (path.empty()) {
+        if (games.empty()) {
+            return Tr("Choose a game to check.");
+        }
+        const GameEntry& game = games[static_cast<std::size_t>(selected_game)];
+        path = game.path;
+        name = game.name;
+    }
+    SetStatusMessage(TrFormat("Checking {}...", name));
+    SetProgress(0.0f);
+    present();
+    const RomCheck::Result result = RomCheck::Check(path, [&](float done) {
+        SetProgress(done);
+        present();
+    });
+    ClearStatusMessage();
+    std::string text;
+    switch (result.outcome) {
+    case RomCheck::Outcome::Intact:
+        text = TrFormat("{} is intact: every part matches its checksum.", name);
+        break;
+    case RomCheck::Outcome::Damaged:
+        text = TrFormat("{} is damaged in {}. Copy it again from your game.", name,
+                        Tr(result.part));
+        break;
+    case RomCheck::Outcome::CutShort:
+        text = TrFormat("{} is incomplete: the file ends early. Copy it again from your game.",
+                        name);
+        break;
+    case RomCheck::Outcome::Encrypted:
+        text = TrFormat("{} is encrypted, so it can't be checked. Decrypt it first.", name);
+        break;
+    case RomCheck::Outcome::NoChecksums:
+        text = TrFormat("{} can't be checked: its file type carries no checksums.", name);
+        break;
+    case RomCheck::Outcome::Unreadable:
+        text = TrFormat("{} can't be read as a 3DS game.", name);
+        break;
+    }
+    check_results[path] = text;
+    return text;
 }
 
 Ui::Action Ui::DrawPauseMenu() {

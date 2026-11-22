@@ -83,6 +83,7 @@ public:
         LoadState,
         TogglePin,
         InstallTitle,
+        CheckFile,
     };
 
     explicit Ui(Core::System& system, EmuWindowVita& window);
@@ -108,6 +109,11 @@ public:
     /// interface), then lists the title it installed and selects it: what happened, for the
     /// status message. After Action::InstallTitle.
     std::string InstallSelected(const std::function<void()>& present);
+
+    /// Checks the file a game's File tab chose, else the selected title's, against the checksums
+    /// its format carries (RomCheck), its progress shown through `present`: what it found, for a
+    /// notice. After Action::CheckFile, or the command channel's `check`.
+    std::string CheckSelected(const std::function<void()>& present);
 
     /// Lists the titles again (at the start, after an install, the command channel's `rescan`),
     /// keeping the selected one selected.
@@ -152,8 +158,9 @@ private:
         InstallPicker,
     };
 
-    /// The settings screen's groups, its tabs. Patches, Cheats and Installed hold no rows: a
-    /// title's built-in patches, its cheat file's cheats, and what of it is installed.
+    /// The settings screen's groups, its tabs. Patches, Cheats, Installed and File hold no rows: a
+    /// title's built-in patches, its cheat file's cheats, what of it is installed, and its file's
+    /// check.
     enum class Category {
         Display,
         Speed,
@@ -163,6 +170,7 @@ private:
         Patches,
         Cheats,
         Installed,
+        File,
         Count,
     };
 
@@ -227,7 +235,9 @@ private:
 
     /// Opens the settings screen on the values for all games (an empty `title`) or the title's
     /// own (`name`: what the screen calls it; `program_id`: its patches'). Back returns to `back`.
-    void OpenSettings(std::string title, std::string name, State back, u64 program_id = 0);
+    /// `path`: the title's file, from the game list (its File tab), else empty.
+    void OpenSettings(std::string title, std::string name, State back, u64 program_id = 0,
+                      std::string path = {});
 
     Action DrawGameList();
     Action DrawSettings();
@@ -354,6 +364,25 @@ private:
     std::vector<InstalledPart> settings_installed;
     int focused_installed = -1;
     int armed_installed = -1;
+    /// The File tab: the title's file (OpenSettings' path), the check it asked for (CheckSelected
+    /// takes it), and each file's last check's outcome, by path.
+    std::string settings_path;
+    std::string check_path;
+    std::string check_name;
+    bool check_requested{};
+    std::unordered_map<std::string, std::string> check_results;
+    /// The System tab's rows after it, all games' only: each ROM folder the player added
+    /// (Config::RomFolders), which cross pressed twice takes off, then the row whose cross opens
+    /// the folder picker to add one (picker_folders). Their info beside the list (focused_row
+    /// RomFolderRow with focused_rom_folder, or AddRomFolderRow).
+    void DrawRomFolderRows();
+    void DrawRomFolderInfo();
+    static constexpr int RomFolderRow = -5;
+    static constexpr int AddRomFolderRow = -6;
+    int focused_rom_folder = -1;
+    int armed_rom_folder = -1;
+    void DrawFileRow();
+    void DrawFileInfo();
 
     /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none).
     Multiplayer::Fields room_fields{};
