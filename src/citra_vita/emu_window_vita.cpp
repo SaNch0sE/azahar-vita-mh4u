@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -122,21 +123,39 @@ void EmuWindowVita::UpdateCurrentFramebufferLayout() {
     NotifyFramebufferLayoutChanged(layout);
 }
 
-std::pair<float, float> EmuWindowVita::LeftStick() const {
+namespace {
+
+/// A stick's two bytes as the guest's axes: radially, its direction kept. Within the dead zone
+/// it is centred; from there its distance scales to the 3DS's full reach at `full`, and past it
+/// stays there.
+std::pair<float, float> StickAxes(s32 x, s32 y) {
     // The pad reports each axis as a byte around 128. The dead zone is wide because the sticks on
-    // this console rest off-centre often enough that a narrow one walks the character.
+    // this console rest off-centre often enough that a narrow one walks the character. Not every
+    // stick reaches the bytes' ends, and a round gate's diagonal gives each axis ~0.71: scaled to
+    // the ends per axis, the guest's pad stops short.
     constexpr float dead_zone = 0.2f;
-    const auto axis = [](s32 raw) {
-        const float value = (static_cast<float>(raw) - 128.0f) / 128.0f;
-        if (std::abs(value) < dead_zone) {
-            return 0.0f;
-        }
-        const float scaled = (std::abs(value) - dead_zone) / (1.0f - dead_zone);
-        return value < 0.0f ? -scaled : scaled;
-    };
-    // y is reported downwards; the guest's circle pad is upwards.
-    return {axis(stick_x.load(std::memory_order_relaxed)),
-            -axis(stick_y.load(std::memory_order_relaxed))};
+    constexpr float full = 0.9f;
+    // y is reported downwards; the guest's sticks are upwards.
+    const float fx = (static_cast<float>(x) - 128.0f) / 128.0f;
+    const float fy = (128.0f - static_cast<float>(y)) / 128.0f;
+    const float r = std::sqrt(fx * fx + fy * fy);
+    if (r < dead_zone) {
+        return {0.0f, 0.0f};
+    }
+    const float scale = std::min((r - dead_zone) / (full - dead_zone), 1.0f) / r;
+    return {std::clamp(fx * scale, -1.0f, 1.0f), std::clamp(fy * scale, -1.0f, 1.0f)};
+}
+
+} // namespace
+
+std::pair<float, float> EmuWindowVita::LeftStick() const {
+    return StickAxes(stick_x.load(std::memory_order_relaxed),
+                     stick_y.load(std::memory_order_relaxed));
+}
+
+std::pair<float, float> EmuWindowVita::RightStick() const {
+    return StickAxes(right_x.load(std::memory_order_relaxed),
+                     right_y.load(std::memory_order_relaxed));
 }
 
 namespace {
@@ -369,6 +388,8 @@ void EmuWindowVita::ReadPad() {
         buttons_held.store(pad.buttons, std::memory_order_relaxed);
         stick_x.store(pad.lx, std::memory_order_relaxed);
         stick_y.store(pad.ly, std::memory_order_relaxed);
+        right_x.store(pad.rx, std::memory_order_relaxed);
+        right_y.store(pad.ry, std::memory_order_relaxed);
         // The volume keys are in no app's pad data while sgxd owns the GPU (out of SceShell's,
         // they are out of every app's too): azaharnative reads them from Syscon. Pad data a
         // debugger injects presses them past SceCtrl's masks, into the pad data only.

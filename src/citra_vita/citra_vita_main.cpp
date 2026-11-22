@@ -315,6 +315,13 @@ StateArguments TakeStateArguments() {
                 static_cast<Settings::LayoutOption>(std::atoi(argument.c_str() + 7));
         } else if (argument == "wide") {
             VitaFrontend::EmuWindowVita::SetWidescreen(true);
+        } else if (argument == "rightstick=cstick" || argument == "rightstick=lr" ||
+                   argument == "rightstick=dpad") {
+            using Mode = Config::RightStickMode;
+            const Mode mode = argument.ends_with("lr")     ? Mode::ShoulderButtons
+                              : argument.ends_with("dpad") ? Mode::DPad
+                                                           : Mode::CStick;
+            Config::Pin(Option::RightStick, static_cast<int>(mode));
         } else if (argument.starts_with("opacity=")) {
             // The overlay layout's other screen, in percent (10 to 100).
             VitaFrontend::EmuWindowVita::SetOverlayOpacity(

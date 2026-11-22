@@ -18,4 +18,7 @@ class EmuWindowVita;
 void InitInput(EmuWindowVita& window);
 void ShutdownInput();
 
+/// What the right stick drives (Config's RightStick option). At once; any thread.
+void SetRightStick(Config::RightStickMode mode);
+
 } // namespace VitaFrontend
