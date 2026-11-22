@@ -1023,6 +1023,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         return true;
     }
     ui.ClearStatusMessage();
+    // nwm::UDS signals its events directly only on this thread; the room's thread queues them.
+    system.RegisterCoreLoopThreadId();
     StateArguments state_arguments = TakeStateArguments();
     window.UpdateCurrentFramebufferLayout(); // a layout=N argument's
 
