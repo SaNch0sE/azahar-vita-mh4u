@@ -159,6 +159,9 @@ public:
     }
 #endif
     void GpuIdle() override;
+    u64 InterruptFence() override;
+    bool InterruptPoll(u64 fence) override;
+    void InterruptWait(u64 fence) override;
     u64 GpuWaitUs() const override;
 #endif
     std::vector<std::pair<PAddr, u32>> TakeCachedReads() override;

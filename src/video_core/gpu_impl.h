@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include "common/archives.h"
 #include "common/microprofile.h"
 #include "common/thread.h"
@@ -44,6 +45,11 @@ struct GPU::Impl {
     std::chrono::steady_clock::time_point last_present{};
     /// vprof's replay runs: GPU::Signal drops the interrupts.
     bool interrupts_muted{};
+    /// The interrupts GPU::Signal holds until the GPU has done the work before them: the id and
+    /// the rasterizer's fence, oldest first (GPU::DeliverInterrupts).
+    std::deque<std::pair<Service::GSP::InterruptId, u64>> held_interrupts;
+    /// gxm_flags `irqnow`: every interrupt at once, as upstream (no fence).
+    bool interrupts_now{};
 
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)

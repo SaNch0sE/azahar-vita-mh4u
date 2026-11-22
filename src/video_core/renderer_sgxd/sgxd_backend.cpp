@@ -296,6 +296,36 @@ void SgxdBackend::RenderBefore(u32 lo, u32 hi, [[maybe_unused]] const char* why)
     }
 }
 
+SgxdBackend::InterruptFence SgxdBackend::InterruptFenceNow() const {
+    return {sgxd_chain_fence() + (sgxd_session_pending() != nullptr ? 1u : 0u),
+            sgxd_ptla_fence()};
+}
+
+bool SgxdBackend::InterruptPoll(const InterruptFence& fence) {
+    // The pending 3D finishes in the list after the last one sent: with the chain free, that list
+    // goes.
+    if (static_cast<s32>(fence.render - sgxd_chain_fence()) > 0 && sgxd_session_pending() &&
+        sgxd_chain_reached(sgxd_chain_fence())) {
+        FinishPending(FinishWhy::Poll);
+    }
+    if (!sgxd_chain_reached(fence.render) || !sgxd_ptla_reached(fence.ptla)) {
+        return false;
+    }
+    // The CPU's part of the work (a DMA's cache lines) before the guest hears of it.
+    TraceStamps();
+    RetireReached();
+    return true;
+}
+
+void SgxdBackend::InterruptWait(const InterruptFence& fence) {
+    RenderWait(fence.render, "a guest interrupt");
+    if (!sgxd_ptla_reached(fence.ptla)) {
+        [[maybe_unused]] const u64 before = WaitMark();
+        ASSERT_MSG(sgxd_ptla_idle() == 0, "sgxd: the PTLA op before a guest interrupt stopped");
+        WaitSite("a guest interrupt's PTLA op", before);
+    }
+}
+
 u32 SgxdBackend::PtlaFence() const {
     return sgxd_ptla_fence();
 }

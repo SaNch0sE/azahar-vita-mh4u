@@ -209,6 +209,27 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         return ResultStatus::ErrorSavestate;
     }
 
+#ifdef ENABLE_GXM
+    // The GSP interrupts the GPU holds until the SGX has done their work (VideoCore::GPU::Signal)
+    // go out between slices. A core with nothing to run, when no core has a thread, waits for
+    // that work instead of idling ahead in guest time: guest time stands still while the guest
+    // waits for the GPU, and runs on while the GPU works for a guest that does not.
+    gpu->DeliverInterrupts();
+    const auto idle = [this](ARM_Interface& core) {
+        for (const auto& c : cpu_cores) {
+            if (kernel->GetThreadManager(c->GetID()).GetCurrentThread() != nullptr) {
+                core.GetTimer().Idle();
+                return;
+            }
+        }
+        if (!gpu->WaitInterrupt()) {
+            core.GetTimer().Idle();
+        }
+    };
+#else
+    const auto idle = [](ARM_Interface& core) { core.GetTimer().Idle(); };
+#endif
+
     // All cores should have executed the same amount of ticks. If this is not the case an event was
     // scheduled with a cycles_into_future smaller then the current downcount.
     // So we have to get those cores to the same global time first
@@ -249,7 +270,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             SgxdRenderer::SgxdTrace("idle", static_cast<unsigned>(
                                               current_core_to_execute->GetTimer().GetDowncount()));
 #endif
-            current_core_to_execute->GetTimer().Idle();
+            idle(*current_core_to_execute);
             PrepareReschedule();
         } else {
             if (tight_loop) {
@@ -287,7 +308,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 SgxdRenderer::SgxdTrace("idle",
                                       static_cast<unsigned>(cpu_core->GetTimer().GetDowncount()));
 #endif
-                cpu_core->GetTimer().Idle();
+                idle(*cpu_core);
                 PrepareReschedule();
             } else {
                 // In the rare case the break flag is set (due to exception thrown)

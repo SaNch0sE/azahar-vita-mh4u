@@ -106,6 +106,17 @@ public:
     /// A GSP operation or a present has run: GPU work held back for the next one starts.
     virtual void GpuIdle() {}
 
+    /// A guest interrupt raised when the GPU has done its work (VideoCore::GPU::Signal): a
+    /// fence over everything sent so far, whether that work has completed (without waiting),
+    /// and a wait for it.
+    virtual u64 InterruptFence() {
+        return 0;
+    }
+    virtual bool InterruptPoll([[maybe_unused]] u64 fence) {
+        return true;
+    }
+    virtual void InterruptWait([[maybe_unused]] u64 fence) {}
+
     /// The time spent waiting for the GPU so far, in microseconds (diagnostics builds; 0
     /// otherwise).
     virtual u64 GpuWaitUs() const {

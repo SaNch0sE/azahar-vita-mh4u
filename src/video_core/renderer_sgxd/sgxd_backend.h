@@ -165,6 +165,19 @@ public:
     /// A PTLA fill or copy is about to touch GPU addresses [lo, hi): the pending 3D's finish
     /// goes in the queue first if it writes or samples any of them. Nothing waits.
     void RenderBefore(u32 lo, u32 hi, const char* why);
+    /// A guest interrupt's GPU work (VideoCore::GPU::Signal): every list and PTLA op sent so
+    /// far, the pending 3D included. Unlike RenderFence it leaves the pending 3D unmarked, so
+    /// no op waits for the list before it; InterruptPoll sends its finish once that list ends.
+    struct InterruptFence {
+        u32 render;
+        u32 ptla;
+    };
+    [[nodiscard]] InterruptFence InterruptFenceNow() const;
+    /// Whether the fence's work has completed, without waiting. A pending 3D the fence takes
+    /// gets its finishing list here once the list before it has ended.
+    [[nodiscard]] bool InterruptPoll(const InterruptFence& fence);
+    /// Waits for the fence's work; a failed render stops the process as RenderIdle does.
+    void InterruptWait(const InterruptFence& fence);
     [[nodiscard]] const SgxdEvents& Events() const {
         return events;
     }

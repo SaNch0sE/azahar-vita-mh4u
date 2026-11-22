@@ -103,6 +103,13 @@ public:
     /// Releases the renderer (for GL context destroy in libretro)
     void ReleaseRenderer();
 
+    /// Raises the held interrupts (Signal) whose GPU work has completed, in order, without
+    /// waiting: the emulation loop's, between slices.
+    void DeliverInterrupts();
+    /// The guest has nothing to run: waits for the oldest held interrupt's GPU work and raises
+    /// what has completed. False when none is held (core timing may idle ahead then).
+    bool WaitInterrupt();
+
     /// What a GPU operation is, for `perflog`'s split of the GPU's work and vprof's numbering.
     enum class OpKind : u32 { CmdList, RegWrite, Fill, Transfer, Dma, Count };
 
@@ -172,8 +179,9 @@ private:
     /// Runs op, a GSP command's or a register trigger's work (vprof numbers it, perflog times
     /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).
     void RunGpuOp(OpKind kind, const std::function<void()>& op);
-    /// Raises a GSP interrupt after delay nanoseconds of guest time, as upstream; none while
-    /// vprof's replay runs.
+    /// Raises a GSP interrupt: a vblank at once; any other once the GPU has done the work sent
+    /// before it (held until DeliverInterrupts or WaitInterrupt sees it done), or at once after
+    /// delay with gxm_flags `irqnow`, as upstream. None while vprof's replay runs.
     void Signal(Service::GSP::InterruptId id, u64 delay);
 
     friend class boost::serialization::access;

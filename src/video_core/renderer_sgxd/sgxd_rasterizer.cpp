@@ -935,11 +935,8 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     return true;
 }
 
-// P3D tells the guest it may overwrite the vertex and index buffers, which the open pass reads
-// at its TA: the pass renders now. TA append (H5) will later
-// run only the TA here.
-// P3D goes to the guest right after, as upstream's does (GPU::Signal): the pass's TA may still
-// be reading the vertices and indices the guest is now free to overwrite.
+// P3D lets the guest overwrite the vertex and index buffers the open pass reads at its TA: the
+// pass renders now. The page holds keep the guest off the buffers until the work is done.
 void RasterizerSgxd::NotifyP3D() {
     FlushImmediate();
     const bool in_pass = backend.InPass();
@@ -958,6 +955,20 @@ void RasterizerSgxd::GpuIdle() {
     backend.RenderFinish();
 }
 
+u64 RasterizerSgxd::InterruptFence() {
+    const SgxdBackend::InterruptFence f = backend.InterruptFenceNow();
+    return u64{f.render} << 32 | f.ptla;
+}
+
+bool RasterizerSgxd::InterruptPoll(u64 fence) {
+    return backend.InterruptPoll({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
+}
+
+void RasterizerSgxd::InterruptWait(u64 fence) {
+    backend.InterruptWait({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
+}
+
+#ifdef VITA_DIAGNOSTICS
 u64 RasterizerSgxd::GpuWaitUs() const {
     return sgxd_wait_us_total();
 }

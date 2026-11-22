@@ -105,11 +105,13 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
         [this](uintptr_t user_data, s64 cycles_late) { VBlankCallback(user_data, cycles_late); });
     impl->timing.ScheduleEvent(FRAME_TICKS, impl->vblank_event);
 
-    // The PICA raises P3D from inside a command list, as upstream: with its modelled delay,
-    // when the list's IRQ request comes, whatever sgxd still has running from it.
+    // The PICA raises P3D from inside a command list, when the list's IRQ request comes; Signal
+    // holds it until the GPU has run the list's work.
     Service::GSP::InterruptHandler pica_interrupt = [this](Service::GSP::InterruptId id,
                                                            u64 delay) { Signal(id, delay); };
     impl->pica.SetInterruptHandler(pica_interrupt);
+#ifdef ENABLE_GXM
+#endif
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
@@ -143,11 +145,46 @@ void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op
 }
 
 void GPU::Signal(Service::GSP::InterruptId id, [[maybe_unused]] u64 delay) {
+    using Service::GSP::InterruptId;
     if (impl->interrupts_muted) {
         return;
     }
-    GPU_TRACE("irq", static_cast<unsigned>(id));
-    impl->signal_interrupt(id, delay);
+    // The vblanks keep core timing's cadence. Every other interrupt comes when the GPU has
+    // done the work sent before it, as the PICA's units raise theirs: no modelled delay, and
+    // not at once while the SGX still runs it.
+    if (id == InterruptId::PDC0 || id == InterruptId::PDC1 || impl->interrupts_now) {
+        GPU_TRACE("irq", static_cast<unsigned>(id));
+        impl->signal_interrupt(id, impl->interrupts_now ? delay : 0);
+        return;
+    }
+    const u64 fence = impl->rasterizer->InterruptFence();
+    if (impl->held_interrupts.empty() && impl->rasterizer->InterruptPoll(fence)) {
+        GPU_TRACE("irq", static_cast<unsigned>(id));
+        impl->signal_interrupt(id, 0);
+        return;
+    }
+    GPU_TRACE("irq_held", static_cast<unsigned>(id));
+    impl->held_interrupts.emplace_back(id, fence);
+}
+
+void GPU::DeliverInterrupts() {
+    // The fences grow with the work sent, so the interrupts complete in the order raised.
+    auto& held = impl->held_interrupts;
+    while (!held.empty() && impl->rasterizer->InterruptPoll(held.front().second)) {
+        const Service::GSP::InterruptId id = held.front().first;
+        held.pop_front();
+        GPU_TRACE("irq", static_cast<unsigned>(id));
+        impl->signal_interrupt(id, 0);
+    }
+}
+
+bool GPU::WaitInterrupt() {
+    if (impl->held_interrupts.empty()) {
+        return false;
+    }
+    impl->rasterizer->InterruptWait(impl->held_interrupts.front().second);
+    DeliverInterrupts();
+    return true;
 }
 
 void GPU::RunOnRenderThread(const std::function<void()>& fn) {
