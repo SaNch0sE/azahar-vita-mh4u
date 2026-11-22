@@ -57,6 +57,10 @@ void RendererSgxd::PollWindow() {
     render_window.PollEvents();
 }
 
+bool RendererSgxd::PresentBusy() {
+    return render_window.PresentBusy();
+}
+
 void RendererSgxd::FlipDone() {
     render_window.FlipDone();
 }

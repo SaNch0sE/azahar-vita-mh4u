@@ -185,9 +185,10 @@ public:
     void Present(const std::array<Pica::FramebufferConfig, 2>& fb,
                  const std::array<Pica::ColorFill, 2>& fill);
 
-    /// A guest frame's end, each vblank, presented or not: the rasterizer's next draws start a
-    /// new frame (RasterizerGxm::EndFrame), in order with the work.
+    /// A guest frame's end, each vblank, presented or not. The late skip decides here whether the next
+    /// frame is late.
     void EndFrame();
+    void FrameTicket(u64 ticket);
 
     /// Parks the thread once it has run everything queued; nests. Under the GPU's lock, which
     /// the caller may let go of and take again while the hold lasts.
@@ -239,11 +240,24 @@ public:
         u32 presents_behind;
         u32 presents_soon;
         u32 late_frames;
+        u32 late_waits;
+        u64 late_wait_us;
+        u64 lead_frames_sum;
+        u32 lead_samples;
+        u32 lead_frames_max;
+        u32 lead_bytes_max;
         u32 late_draws;
         u32 late_kept;
         u32 merged_draws; ///< the parse's merged runs' vertices (MergeDraw), and the runs
         u32 merged_runs;
         u32 late_partial;
+        u32 gpu_samples;
+        u32 gpu_busy;
+        u32 gpu_held;
+        std::array<u32, GpuAtCells> gpu_at;
+        std::array<u32, GpuLabels> gpu_3d_by;
+        std::array<u32, GpuLabels> gpu_ta_by;
+        std::array<u32, GpuLabels> jobs_by;
         std::array<u32, 4> present_gaps;
         u32 holds;
         u64 hold_us;
@@ -407,6 +421,20 @@ private:
     /// The thread that writes the ring (the emulation thread): HLE threads may wait, never queue.
     const s32 producer;
     Common::ProcessClock::time_point last_present{};
+    /// Presents at most this often: the display shows one picture each 16.7 ms.
+    static constexpr std::chrono::microseconds PresentInterval{12000};
+    /// A present two newer ones would replace is shown anyway past this long without one: a GPU-bound
+    /// scene keeps the thread that far behind.
+    static constexpr std::chrono::microseconds PresentStarved{33000};
+    /// A present within PresentInterval of the last, or while the last one is still on the GPU, shown
+    /// once both allow unless a newer one takes its place (presents come in bursts).
+    bool present_pending{};
+    std::array<Pica::FramebufferConfig, 2> pending_fb{};
+    std::array<Pica::ColorFill, 2> pending_fill{};
+    void ShowDuePresent();
+    void ShowPresent(const std::array<Pica::FramebufferConfig, 2>& fb,
+                     const std::array<Pica::ColorFill, 2>& fill,
+                     Common::ProcessClock::time_point now);
     /// The window's input at least this often while the thread runs, so the PS button answers.
     static constexpr std::chrono::milliseconds WindowPollInterval{16};
     Common::ProcessClock::time_point last_window_poll{};
@@ -416,6 +444,17 @@ private:
     /// game keeps its CPU speed. The screen a late frame keeps (or -1), and an open batch's decision.
     bool late_skip{};
     int late_keep{-1};
+    /// Each screen's frames in a row the late skip dropped; past MaxScreenSkips() the frame is drawn
+    /// whole, with the vblank waiting for the frame LeadFramesBack before.
+    std::array<u32, 2> screen_skips{};
+    /// The vblank tickets of the last frames: the next frame is late when the one TicketFramesBack
+    /// before the newest is not reached.
+    static constexpr u32 TicketFramesBack = 3;
+    /// The frame the vblank's wait waits for, one older than the late decision's, so the GPU keeps that
+    /// frame's work queued while the guest makes the next.
+    static constexpr u32 LeadFramesBack = TicketFramesBack + 1;
+    std::array<u64, LeadFramesBack> frame_tickets{};
+    u32 frame_ticket_at{};
     bool late_batch_open{};
     bool late_batch_skip{};
     bool late_triangles_open{};
@@ -423,13 +462,18 @@ private:
     /// The colour buffers drawn lately (the newest 16), each with its segments: a segment is
     /// the draws into it up to a transfer from it. a game draws both screens into one colour
     /// buffer (skiplog: the top screen's draws, its transfer, the bottom screen's draws, its
-    /// transfer). Per buffer: this frame's segment, whether a draw of it was dropped, and each
-    /// segment's screen as the transfer that ended it last found it (-1: none, or no LCD).
+    /// transfer). Per buffer: this frame's segment, whether a draw of it was dropped, whether
+    /// it is open (drawn since its last transfer), and each segment's screen as the transfer
+    /// that ended it last found it (-1: none, or no LCD). A segment open at a frame's end goes
+    /// on into the next frame with its number and its dropped draws: MH Generations' frames
+    /// sometimes draw the bottom screen and the top screen's first draws before a vblank and
+    /// the rest of the top screen after it.
     struct SegmentTarget {
         PAddr addr;
         u32 bytes;
         u32 segment;
         bool dropped;
+        bool open;
         std::array<s8, 4> screens;
         u8 readers;
         /// segment_draws at its last draw: of the buffers holding a transfer's source, the newest drawn.
@@ -493,12 +537,26 @@ private:
     static constexpr u32 LateDrawCost = 32;
     [[nodiscard]] int LcdScreenOf(PAddr addr, u32 bytes, PAddr* buffer = nullptr) const;
     /// A draw (a batch's first vertex, the first CPU-path triangle): its screen (its colour
-    /// buffer's segment's) counted, and whether the late skip drops it.
+    /// buffer's segment's) counted, and whether the late skip drops it. Emulation side, before
+    /// the draw is recorded.
     [[nodiscard]] bool LateDraw();
+    /// A display transfer or texture copy: the segment it ends gets its screen, and whether the late
+    /// skip drops it. Emulation side.
+    [[nodiscard]] bool LateTransfer(const Pica::DisplayTransferConfig& config, bool display);
 
     /// The emulation side waits for waited_ticket: the loop kicks the pending 3D up to it.
     std::atomic<bool> ticket_wait{false};
     std::atomic<u32> waited_ticket{};
+#ifdef VITA_DIAGNOSTICS
+    void SampleGpu(std::stop_token stop);
+    std::atomic<u32> gpu_samples{};
+    std::atomic<u32> gpu_busy{};
+    std::atomic<u32> gpu_held{};
+    std::array<std::atomic<u32>, GpuAtCells> gpu_at{};
+    std::array<std::atomic<u32>, GpuLabels> gpu_3d_by{};
+    std::array<std::atomic<u32>, GpuLabels> gpu_ta_by{};
+    Common::NamedThread gpu_sampler;
+#endif
 
     void SleepDone(EmuWait kind);
     /// Whether this thread holds (Hold): the render side's while the hold lasts.
@@ -513,6 +571,15 @@ private:
     std::atomic<u32> presents_behind{};
     std::atomic<u32> presents_soon{};
     std::atomic<u32> late_frames{};
+    std::atomic<u32> late_waits{};
+    PAddr trace_top{}; ///< tracelog: the top screen's buffer the last present showed
+    std::atomic<u64> late_wait_us{};
+    u32 frames_put{};
+    std::atomic<u32> frames_done{};
+    std::atomic<u64> lead_frames_sum{};
+    std::atomic<u32> lead_samples{};
+    std::atomic<u32> lead_frames_max{};
+    std::atomic<u32> lead_bytes_max{};
     std::atomic<u32> late_draws{};
     std::atomic<u32> late_kept{};
     std::atomic<u32> merged_draws{};

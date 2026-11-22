@@ -941,6 +941,15 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     // the GPU; the render thread drops the frames it is two behind on (the late skip,
     // RenderThread's Op::FrameEnd), which keeps it near the guest.
     impl->vblank_ticket = impl->rasterizer->InterruptFence();
+    impl->render->FrameTicket(impl->vblank_ticket);
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags `serial`: the vblank waits for the GPU to finish the frame, so that no frame's
+    // work overlaps the guest's next one (and the late skip never finds the GPU behind).
+    static const bool serial = SgxdRenderer::SgxdFlag("serial");
+    if (serial) {
+        impl->render->InterruptWait(impl->vblank_ticket);
+    }
+#endif
 #else
     // A present has no guest-visible effect: well past the display's rate it is dropped. 12 ms,
     // not a frame's 16.7: at 100% the guest's VBlanks jitter around the frame, and a frame's cap

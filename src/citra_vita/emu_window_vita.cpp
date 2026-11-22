@@ -363,6 +363,10 @@ void EmuWindowVita::PresentGuestScreens(const GuestScreen (&next)[2]) {
     Present(render_ui.load(std::memory_order_acquire));
 }
 
+bool EmuWindowVita::PresentBusy() {
+    return SgxdPresent::Busy();
+}
+
 bool EmuWindowVita::FlipPending(u32* fence) {
     return SgxdPresent::FlipPending(fence);
 }

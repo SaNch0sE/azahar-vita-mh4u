@@ -50,6 +50,8 @@ public:
     /// The renderer is going, and guest memory with it: presents show no guest screens again
     /// until the next PresentGuestScreens.
     void ForgetGuestScreens() override;
+    /// The last present's picture still rendering on the GPU (SgxdPresent::Busy).
+    bool PresentBusy() override;
     /// SgxdPresent::FlipPending, FlipDone: the last present on screen once its 3D is done.
     bool FlipPending(u32* fence) override;
     s64 FlipDueIn() override;

@@ -204,6 +204,12 @@ public:
         return false;
     }
 
+    /// Whether a PresentGuestScreens now would be dropped because the last one is still being
+    /// drawn: the caller keeps the newest screens for later instead.
+    virtual bool PresentBusy() {
+        return false;
+    }
+
     /// The last present's picture, still being drawn on the GPU: true, with the fence its work
     /// reaches (the renderer's own count). Drawn, it goes on screen when FlipDueIn (us) comes to
     /// 0 (a paced flip): FlipDone shows it then.

@@ -130,10 +130,11 @@ namespace GxmRenderer {
  *             decode (ETC1's, and a split ETC1A4's colour and alpha, decoded back through the
  *             texture unit), once its batch is sent; the log counts the levels that differ
  *             (with dumptex, a "want" file too)
- *   gpuwiden  8-bit index lists widened on the GPU, a pass's in one side render whose 3D the
- *             pass's TA waits for (SgxdBackend::WidenIndices), not by the render thread
- *   widencheck  every 8-bit index list's GPU widening (SgxdBackend::WidenIndices) against its
- *             guest bytes, once its render is done
+ *   keycheck  the fragment and vertex format registers' kept hashes, the program the hash
+ *             found and the cached LUT rows against the registers at every draw: a register
+ *             missing from StateRegs (or a collision) stops the run
+ *   remapcheck  each page's newest remap whose list is done read back from the GPU's page
+ *             table (sgxdTranslate) before the next list goes; a wrong entry is logged
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks
  *   (docs/debugging.md, "Wrong pictures")
@@ -147,7 +148,7 @@ namespace GxmRenderer {
  *             sync/sync_end, the present sgx_present/sgx_present_end; the async lists, which
  *             sgxd's microkernel runs, carry no GPU stamps. Frame pacing: late (the next frame's
  *             decision: 0 whole, 1 whole with the GPU late, 2 the top's draws dropped, 3 the
- *             bottom's; +4 when the display's rate made it late), lead_wait/lead_wait_end,
+ *             bottom's), lead_wait/lead_wait_end,
  *             present (1: the top screen's buffer differs from the last shown),
  *             present_behind, present_pending, flip (1: its 3D was done before the flip);
  *             emu_ticket, emu_space, emu_sync (the emulation thread's waits for the render

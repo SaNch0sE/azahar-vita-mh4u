@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -237,6 +238,7 @@ void ShutdownSystem(Core::System& system) {
 /// operations, the presents' parts and the page moves. Like every counter behind perflog, the
 /// diagnostics build's only.
 struct RenderCounters {
+    SceUInt64 us; ///< the time since the take before
     SgxdRenderer::RenderThread::Stats thread;
     u64 gpu_wait_us;
     VitaFrontend::PresentTimes present;
@@ -244,20 +246,45 @@ struct RenderCounters {
     SgxdRenderer::GuestGpuMemory::MoveStats moves;
 };
 
-/// Taken on the render thread: sgxd's and the window's counters are plain, written there.
-RenderCounters TakeRenderCounters(Core::System& system) {
-    auto& gpu = system.GPU();
-    RenderCounters c{};
-    gpu.GetRenderThread().RunSync([&] {
-        c.thread = gpu.GetRenderThread().TakeStats();
-        c.gpu_wait_us = sgxd_wait_us_take();
-        c.present = VitaFrontend::TakePresentTimes();
-        c.cache = GxmRenderer::SgxdTakeCacheTimes();
-        if (auto* gxm = dynamic_cast<GxmRenderer::RendererGxm*>(&gpu.Renderer())) {
-            c.moves = gxm->TakeMoveStats();
-        }
-    });
-    return c;
+/// The counters the render thread took last, and the request's state: 0 none asked, 1 asked,
+/// 2 taken.
+RenderCounters render_counters_taken{};
+std::atomic<u32> render_counters_state{};
+
+/// Taken on the render thread when it reaches the request, after the work queued before it: sgxd's
+/// and the window's counters are plain, written there. perflog does not wait for it: a RunSync
+/// would pace the guest as release builds are not. Whether there were counters taken since the
+/// last call, in `out`; and the next take asked for.
+bool TakeRenderCounters(Core::System& system, RenderCounters& out) {
+    u32 state = render_counters_state.load(std::memory_order_acquire);
+    const bool taken = state == 2;
+    if (taken) {
+        out = render_counters_taken;
+        state = 0;
+    }
+    if (state == 0) {
+        render_counters_state.store(1, std::memory_order_relaxed);
+        // The request runs on the render thread, which may reach it while GPU::~GPU stops the
+        // thread (a quit): the GPU's pointer to it is gone by then, the thread is not.
+        auto& gpu = system.GPU();
+        auto& render = gpu.GetRenderThread();
+        render.Run([&gpu, &render] {
+            static SceUInt64 last_us = 0;
+            const SceUInt64 now_us = sceKernelGetProcessTimeWide();
+            RenderCounters& c = render_counters_taken;
+            c.us = last_us != 0 ? now_us - last_us : 0;
+            last_us = now_us;
+            c.thread = render.TakeStats();
+            c.gpu_wait_us = sgxd_wait_us_take();
+            c.present = VitaFrontend::TakePresentTimes();
+            c.cache = SgxdRenderer::SgxdTakeCacheTimes();
+            if (auto* gxm = dynamic_cast<GxmRenderer::RendererGxm*>(&gpu.Renderer())) {
+                c.moves = gxm->TakeMoveStats();
+            }
+            render_counters_state.store(2, std::memory_order_release);
+        });
+    }
+    return taken;
 }
 #endif
 
@@ -392,9 +419,11 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 #ifdef VITA_DIAGNOSTICS
                 static const bool perflog = SgxdRenderer::SgxdFlag("perflog");
                 if (perflog) {
-                    // The render thread's counters (sgxd's, the presents', the page moves'),
-                    // before the HLE lock: the call waits for the work queued.
-                    const auto render_counters = TakeRenderCounters(system);
+                    // The render thread's counters (sgxd's, the presents', the page moves'):
+                    // the last ones it took, over their own interval (zero when it has not
+                    // reached the last request).
+                    RenderCounters render_counters{};
+                    const bool render_taken = TakeRenderCounters(system, render_counters);
                     // The vblank interval split as core/perf_stats.h measures it, in ms.
                     LOG_INFO(Frontend,
                              "perf: speed {:.1f}% game {:.1f} fps shown {:.1f} fps; vblank "
@@ -479,6 +508,21 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              r.kind_us[0] / 1e3, r.kind_ops[0], r.kind_us[1] / 1e3, r.kind_ops[1],
                              r.kind_us[2] / 1e3, r.kind_ops[2], r.kind_us[3] / 1e3, r.kind_ops[3],
                              r.kind_us[4] / 1e3, r.kind_ops[4]);
+                    // Room for the lists' scan off the emulation thread (GPU::GuestIdle).
+                    const auto room = system.GPU().TakeScanRoom();
+                    LOG_INFO(Frontend,
+                             "perf: scan room: {} lists, scan {:.1f} ms, hideable {:.1f} ms; scan "
+                             "end to the guest's idle {} under 0.5 ms, {} under 2, {} under 8, {} "
+                             "under 16, {} longer; {} not followed by an idle yet",
+                             room.lists, room.scan_us / 1e3, room.hidden_us / 1e3, room.gaps[0],
+                             room.gaps[1], room.gaps[2], room.gaps[3], room.gaps[4], room.pending);
+                    if (render_taken) {
+                        LOG_INFO(Frontend, "perf: render side's counters below over {:.1f} ms",
+                                 render_counters.us / 1e3);
+                    } else {
+                        LOG_INFO(Frontend, "perf: render side's counters below none: the render "
+                                           "thread has not reached the last request");
+                    }
                     const auto& t = render_counters.thread;
                     using K = SgxdRenderer::RenderThread::Stats;
                     LOG_INFO(Frontend,
@@ -495,10 +539,75 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              t.presents, t.presents_behind, t.presents_soon, t.present_gaps[0],
                              t.present_gaps[1], t.present_gaps[2], t.present_gaps[3], t.holds,
                              t.hold_us / 1e3);
-                    LOG_INFO(Frontend,
-                             "perf: late skip: {} frames, {} draws dropped, {} kept for the "
-                             "other screen; screens presented from another buffer {}",
-                             t.late_frames, t.late_draws, t.late_kept, t.late_partial);
+                    LOG_INFO(
+                        Frontend,
+                        "perf: late skip: {} frames, {} draws dropped, "
+                        "{} kept for the other screen; screens presented from another buffer {}; "
+                        "drawn whole with the GPU late {}, the vblank waiting {:.1f} ms",
+                        t.late_frames, t.late_draws, t.late_kept, t.late_partial, t.late_waits,
+                        t.late_wait_us / 1e3);
+                    if (t.lead_samples != 0) {
+                        LOG_INFO(Frontend,
+                                 "perf: frames queued ahead of the render thread at the vblanks: "
+                                 "{:.1f} mean, {} most; ring {} KiB most",
+                                 static_cast<double>(t.lead_frames_sum) / t.lead_samples,
+                                 t.lead_frames_max, t.lead_bytes_max / 1024);
+                    }
+                    if (t.gpu_samples != 0) {
+                        LOG_INFO(Frontend,
+                                 "perf: GPU busy {:.0f}% of {} samples, idle with a 3D held for "
+                                 "the next list {:.0f}%",
+                                 100.0 * t.gpu_busy / t.gpu_samples, t.gpu_samples,
+                                 100.0 * t.gpu_held / t.gpu_samples);
+                        // Where: the running job's kind (sgxd_mkq's), the wait its run stopped
+                        // at (code: none, in its code), "+end" with a 3D's end latched (the 3D
+                        // unit idle).
+                        using RT = SgxdRenderer::RenderThread;
+                        static constexpr const char* kinds[] = {"other", "render", "over", "finish",
+                                                                "ptla"};
+                        static constexpr const char* waits[] = {"code", "TA", "3D", "2D", "event"};
+                        const auto pct = [&](u32 n) { return 100.0 * n / t.gpu_samples; };
+                        std::string at = fmt::format(
+                            "idle {:.1f}%, held 3D running {:.1f}%, held 3D done {:.1f}%",
+                            pct(t.gpu_at[RT::GpuAtIdle]), pct(t.gpu_at[RT::GpuAtHeldRunning]),
+                            pct(t.gpu_at[RT::GpuAtHeldDone]));
+                        for (u32 k = 0; k < RT::GpuAtKinds; k++) {
+                            for (u32 w = 0; w < RT::GpuAtWaits; w++) {
+                                for (u32 e = 0; e < 2; e++) {
+                                    const u32 n =
+                                        t.gpu_at[RT::GpuAtBusy + (k * RT::GpuAtWaits + w) * 2 + e];
+                                    if (n != 0) {
+                                        at += fmt::format(", {}:{}{} {:.1f}%", kinds[k], waits[w],
+                                                          e ? "+end" : "", pct(n));
+                                    }
+                                }
+                            }
+                        }
+                        LOG_INFO(Frontend, "perf: GPU at: {}", at);
+                        // Whose 3D and TA the samples found running, by the render job's
+                        // sender, with the jobs it sent; most first.
+                        const auto by_sender = [&](const std::array<u32, RT::GpuLabels>& by) {
+                            std::array<u32, RT::GpuLabels> order;
+                            std::iota(order.begin(), order.end(), 0u);
+                            std::ranges::sort(order, [&](u32 a, u32 b) { return by[a] > by[b]; });
+                            std::string out;
+                            for (const u32 l : order) {
+                                if (by[l] * 200 < t.gpu_samples) {
+                                    break;
+                                }
+                                u32 key = 0;
+                                const char* what = sgxd_mkq_label_what(static_cast<u8>(l), &key);
+                                out += fmt::format("{}{} {:#x} {:.1f}% ({} jobs)",
+                                                   out.empty() ? "" : ", ", what, key, pct(by[l]),
+                                                   t.jobs_by[l]);
+                            }
+                            return out;
+                        };
+                        LOG_INFO(Frontend, "perf: GPU 3D running by sender: {}",
+                                 by_sender(t.gpu_3d_by));
+                        LOG_INFO(Frontend, "perf: GPU TA running by sender: {}",
+                                 by_sender(t.gpu_ta_by));
+                    }
                     // This thread, the emulation thread: its run time by the kernel's count
                     // over the interval, and its waits for the render thread by kind (sleeps,
                     // the 1 ms timeouts among them). The holds are above, the DSP's waits below.

@@ -37,6 +37,8 @@ public:
     /// presents; the frame's end on the emulation thread leaves it alone.
     void PollWindowEvents() override {}
     void PollWindow();
+    /// The window's last present still being drawn: a present now would be dropped.
+    bool PresentBusy();
     /// The window's last present on screen once its GPU work is done (EmuWindow::FlipDone), and
     /// whether one waits, with its fence (FlipPending). The backend's GPU waits flip it too
     /// (SgxdBackend::SetFlipHook).

@@ -228,6 +228,46 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
     LOG_INFO(Render, "render thread: on Vita core 1, woken by sgxd when a ticket's GPU work is "
                      "done");
     check = GxmFlag("rendercheck");
+#ifdef VITA_DIAGNOSTICS
+    if (SgxdFlag("perflog")) {
+        gpu_sampler = Common::NamedThread{Common::ThreadCfg{"gpu sampler", 16 * 1024},
+                                          [this](std::stop_token stop) { SampleGpu(stop); }};
+    }
+#endif
+}
+
+#ifdef VITA_DIAGNOSTICS
+void RenderThread::SampleGpu(std::stop_token stop) {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
+    static_assert(GpuAtKinds == SGXD_MKQ_KINDS && GpuAtWaits == SGXD_MKQ_WAITS);
+    // The master bank's EVENT_STATUS and its PIXELBE_END_RENDER: a 3D has ended and no list has
+    // taken the end yet (a finish phase clears it), so the 3D unit idles until the next kick.
+    constexpr u32 EventStatus = 0x412c;
+    constexpr u32 EndRender = 0x00040000;
+    while (!stop.stop_requested()) {
+        sceKernelDelayThread(1000);
+        // Busy: a list or a PTLA op sent and not completed. Held: none, but the last render's
+        // 3D waits for the list after it.
+        const bool busy =
+            sgxd_chain_done() != sgxd_chain_fence() || sgxd_ptla_done() != sgxd_ptla_fence();
+        u32 status = 0;
+        const bool ended = sgxdReadRegs(EventStatus, 1, &status) == 1 && (status & EndRender);
+        gpu_samples.fetch_add(1, std::memory_order_relaxed);
+        u32 cell = GpuAtIdle;
+        if (busy) {
+            gpu_busy.fetch_add(1, std::memory_order_relaxed);
+            // The running job (POS is the next) and the wait its run stopped at, if it did.
+            const volatile u32* const mk = sgxd_mkq_state();
+            const u32 resume = mk[SGXD_MK_RESUME];
+            const u32 kind = sgxd_mkq_job_kind(mk[SGXD_MK_POS] - 1);
+            const u32 wait = resume != 0 ? sgxd_mkq_wait_kind(resume) : SGXD_MKQ_WAIT_NONE;
+            cell = GpuAtBusy + (kind * GpuAtWaits + wait) * 2 + (ended ? 1 : 0);
+        } else if (sgxd_session_pending() != nullptr) {
+            gpu_held.fetch_add(1, std::memory_order_relaxed);
+            cell = ended ? GpuAtHeldDone : GpuAtHeldRunning;
+        }
+        gpu_at[cell].fetch_add(1, std::memory_order_relaxed);
+    }
 }
 #endif
 
@@ -629,6 +669,14 @@ void RenderThread::RunCheck(const u8* payload) {
 
 void RenderThread::AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                                const Pica::OutputVertex& v2) {
+    // The triangles up to the next DrawTriangles keep the decision the first found.
+    if (!late_triangles_open) {
+        late_triangles_open = true;
+        late_triangles_skip = LateDraw();
+    }
+    if (late_triangles_skip) {
+        return;
+    }
     // RasterizerGxm stops the emulator on it, with the draw's description.
     SyncState();
     Put(Op::AddTriangle, TriangleRecord{{v0, v1, v2}});
@@ -677,7 +725,34 @@ void RenderThread::DrawMerged(const u16* vertices, u32 count) {
 #endif
 }
 
+bool RenderThread::ReadsDroppedOutput(PAddr lo, PAddr hi) const {
+    return std::any_of(dropped_outputs.begin(), dropped_outputs.end(),
+                       [&](const DroppedOutput& o) { return lo < o.hi && o.lo < hi; });
+}
+
+void RenderThread::ForgetDroppedOutputs(PAddr lo, PAddr hi) {
+    // What a kept write leaves of each output it reaches: the part before it, the part after.
+    const std::size_t count = dropped_outputs.size();
+    for (std::size_t i = 0; i < count; i++) {
+        DroppedOutput& o = dropped_outputs[i];
+        if (!(lo < o.hi && o.lo < hi)) {
+            continue;
+        }
+        const DroppedOutput after{hi, o.hi, o.earlier};
+        o.hi = std::max(o.lo, std::min(o.hi, lo));
+        if (after.lo < after.hi) {
+            dropped_outputs.push_back(after);
+        }
+    }
+    std::erase_if(dropped_outputs, [](const DroppedOutput& o) { return o.lo >= o.hi; });
+}
+
 void RenderThread::DrawTriangles() {
+    const bool skip = late_triangles_open && late_triangles_skip;
+    late_triangles_open = false;
+    if (skip) {
+        return;
+    }
     // The vertices were loaded on this thread (PicaCore::LoadVertices).
     DrawTextures textures;
     const u32 count = TextureRanges(pica.regs.internal, textures);
@@ -686,7 +761,102 @@ void RenderThread::DrawTriangles() {
     Put(Op::DrawTriangles);
 }
 
+bool RenderThread::LateTransfer(const Pica::DisplayTransferConfig& config, bool display) {
+    const PAddr in = config.GetPhysicalInputAddress();
+    PAddr lcd = 0;
+    const int screen = LcdScreenOf(config.GetPhysicalOutputAddress(),
+                                   display ? config.OutputBytes() : config.texture_copy.size, &lcd);
+    // A transfer from a colour buffer drawn lately ends its segment: the segment gets the
+    // transfer's screen, and the transfer is dropped when a draw of the segment was, in this
+    // frame or an earlier one (the buffer does not hold the picture). A late frame that dropped
+    // a top-screen segment's first draws and then a frame on time that kept its transfer showed
+    // MH Generations' bottom screen, under the top screen's last draws, on the top screen.
+    bool dropped = false;
+    // The source: the colour buffer the transfer reads as the draws found it (by its address and the
+    // size it reads, then its whole input's), else the newest drawn of the buffers holding its address
+    // (a buffer drawn over another's memory, or two screens in one buffer).
+    const u32 in_bytes = display ? config.input_width * config.input_height *
+                                       Pica::BytesPerPixel(config.input_format)
+                                 : config.texture_copy.size;
+    const u32 read_bytes =
+        display ? config.output_height * (config.scaling == config.ScaleXY ? 2u : 1u) *
+                      config.input_width * Pica::BytesPerPixel(config.input_format)
+                : in_bytes;
+    SegmentTarget* source = nullptr;
+    for (const u32 bytes : {read_bytes, in_bytes}) {
+        for (SegmentTarget& t : segment_targets) {
+            if (t.addr == in && t.bytes == bytes) {
+                source = &t;
+                break;
+            }
+        }
+        if (source != nullptr) {
+            break;
+        }
+    }
+    if (source == nullptr) {
+        for (SegmentTarget& t : segment_targets) {
+            if (in >= t.addr && in < t.addr + t.bytes &&
+                (source == nullptr || t.drawn > source->drawn)) {
+                source = &t;
+            }
+        }
+    }
+    if (source) {
+        source->screens[std::min<u32>(source->segment, 3)] = static_cast<s8>(screen);
+        dropped = source->dropped;
+        source->segment++;
+        source->dropped = false;
+        source->open = false;
+    } else {
+        // From no drawn colour buffer: from a dropped transfer's output, a picture never made.
+        const auto& tc = config.texture_copy;
+        dropped = ReadsDroppedOutput(
+            in, in + (display ? in_bytes : CopySpan(tc.size, tc.input_width, tc.input_gap)));
+    }
+    const bool lcd_dropped =
+        screen >= 0 && std::find(dropped_lcd.begin(), dropped_lcd.end(), lcd) != dropped_lcd.end();
+    dropped |= lcd_dropped;
+    {
+        const PAddr out = config.GetPhysicalOutputAddress();
+        const auto& tc = config.texture_copy;
+        const PAddr out_end =
+            out + (display ? config.OutputBytes() : CopySpan(tc.size, tc.output_width, tc.output_gap));
+        ForgetDroppedOutputs(out, out_end);
+        if (dropped) {
+            // Not an LCD buffer: it keeps its last whole picture, which a copy of it may read.
+            if (screen < 0) {
+                dropped_outputs.push_back({out, out_end});
+            }
+            // Into a colour buffer drawn lately: as a dropped draw of its segment, whose transfer goes too.
+            for (SegmentTarget& t : segment_targets) {
+                if (out < t.addr + t.bytes && t.addr < out_end) {
+                    t.dropped = true;
+                }
+            }
+        }
+    }
+#ifdef VITA_DIAGNOSTICS
+    if (screenlog_on) {
+        screenlog_transfers +=
+            fmt::format(" {}{:#x}+{:#x}->{:#x}(s{}{}{})", display ? "" : "copy ", in, in_bytes,
+                        config.GetPhysicalOutputAddress(), screen, dropped ? " dropped" : "",
+                        right_eye ? " right" : "");
+    }
+#endif
+    if (screen >= 0) {
+        NoteLcdWrite(screen, lcd, dropped);
+        if (dropped && !lcd_dropped && dropped_lcd.size() < 8) {
+            dropped_lcd.push_back(lcd);
+        }
+    }
+    return dropped;
+}
+
 bool RenderThread::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+    if (LateTransfer(config, true)) {
+        return true;
+    }
     // The output's pages move to CDRAM without their contents: only the bytes the transfer writes
     // (OutputBytes, the scaling's). After the late skip's answer: a dropped transfer's pages would
     // hold the pool's old bytes.
@@ -723,6 +893,9 @@ u32 CopySpan(u32 size, u32 width, u32 gap) {
 } // namespace
 
 bool RenderThread::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
+    if (LateTransfer(config, false)) {
+        return true;
+    }
     const auto& tc = config.texture_copy;
     HoldRead(config.GetPhysicalInputAddress(), CopySpan(tc.size, tc.input_width, tc.input_gap),
              PageHolds::TransferIn);
@@ -982,6 +1155,10 @@ void RenderThread::HoldVertices(bool is_indexed) {
 }
 
 bool RenderThread::AccelerateDrawBatch(bool is_indexed) {
+    // The late skip: a late frame's dropped draw is not recorded (its state goes with the next one).
+    if (LateDraw()) {
+        return true;
+    }
     // The textures' pages are held here; the render thread moves them to CDRAM at the untile.
     DrawTextures textures;
     const u32 count = TextureRanges(pica.regs.internal, textures);
@@ -1022,6 +1199,14 @@ void RenderThread::PutGsIndices() {
 }
 
 bool RenderThread::AccelerateImmediateVertex(const Pica::AttributeBuffer& input) {
+    // A batch keeps the decision its first vertex found.
+    if (!late_batch_open) {
+        late_batch_open = true;
+        late_batch_skip = LateDraw();
+    }
+    if (late_batch_skip) {
+        return true;
+    }
     SyncState();
     if (check) {
         PutCheck();
@@ -1031,6 +1216,11 @@ bool RenderThread::AccelerateImmediateVertex(const Pica::AttributeBuffer& input)
 }
 
 void RenderThread::FlushImmediate() {
+    const bool skip = late_batch_open && late_batch_skip;
+    late_batch_open = false;
+    if (skip) {
+        return;
+    }
     DrawTextures textures;
     const u32 count = TextureRanges(pica.regs.internal, textures);
     const PublishTogether together{*this};
@@ -1485,9 +1675,89 @@ void RenderThread::CountEmuWait(EmuWait kind, Clock::time_point start) {
 }
 #endif
 
-void RenderThread::Present(const std::array<Pica::FramebufferConfig, 2>& fb,
+void RenderThread::Present(const std::array<Pica::FramebufferConfig, 2>& guest_fb,
                            const std::array<Pica::ColorFill, 2>& fill) {
-    // The present reads the screens the LCD shows (its picture is drawn from them on the GPU).
+    std::array<Pica::FramebufferConfig, 2> fb = guest_fb;
+    lcd_fb = fb;
+    late_generation++;
+    // Each buffer a present names is noted with the present; one no present named in the last eight is
+    // forgotten (a title's memory reuses buffers it showed before).
+    presents_named++;
+    const auto note = [this](std::vector<LcdBuffer>& known, PAddr a) {
+        const auto it = std::find_if(known.begin(), known.end(),
+                                     [a](const LcdBuffer& b) { return b.addr == a; });
+        if (it != known.end()) {
+            it->named = presents_named;
+            return;
+        }
+        if (known.size() == 4) {
+            known.erase(known.begin());
+        }
+        known.push_back({a, 0, presents_named});
+    };
+    const auto forget = [this](std::vector<LcdBuffer>& known) {
+        std::erase_if(known, [this](const LcdBuffer& b) { return presents_named - b.named > 8; });
+    };
+    forget(right_eye_buffers);
+    // Every buffer a screen has been shown from (a title may render into a third one the LCD's two
+    // registers do not name yet).
+    for (u32 i = 0; i < 2; i++) {
+        for (const PAddr a :
+             {static_cast<PAddr>(fb[i].address_left1), static_cast<PAddr>(fb[i].address_left2)}) {
+            if (a != 0) {
+                note(lcd_buffers[i], a);
+            }
+        }
+        forget(lcd_buffers[i]);
+    }
+    // The late skip: a screen whose selected LCD buffer holds a picture older than the one it last
+    // showed (a late frame's write into it dropped, or a buffer shown in its place rewritten
+    // since) shows the oldest picture no older than that instead.
+    for (u32 i = 0; i < 2; i++) {
+        const PAddr selected = fb[i].second_fb_active ? fb[i].address_left2 : fb[i].address_left1;
+        auto& buffers = lcd_buffers[i];
+        const auto it = std::find_if(buffers.begin(), buffers.end(),
+                                     [selected](const LcdBuffer& b) { return b.addr == selected; });
+        if (it == buffers.end() || it->stamp >= shown_stamp[i]) {
+#ifdef VITA_DIAGNOSTICS
+            if (screenlog_on) {
+                LOG_INFO(Render, "screenlog frame {}: screen {} shows selected {:#x} (stamp {}{})",
+                         screenlog_frame, i, selected, it == buffers.end() ? 0 : it->stamp,
+                         it == buffers.end() ? ", unknown" : "");
+            }
+#endif
+            shown_stamp[i] = it == buffers.end() ? shown_stamp[i] : it->stamp;
+            continue;
+        }
+        // The oldest picture no older than the last shown: the screen follows the guest's buffers again
+        // once they catch up.
+        LcdBuffer* next = nullptr;
+        for (LcdBuffer& b : buffers) {
+            if (b.stamp >= shown_stamp[i] && (!next || b.stamp < next->stamp)) {
+                next = &b;
+            }
+        }
+        DEBUG_ASSERT_MSG(next, "late skip: no LCD buffer of screen {} holds stamp {} or newer", i,
+                         shown_stamp[i]);
+#ifdef VITA_DIAGNOSTICS
+        if (screenlog_on) {
+            LOG_INFO(Render,
+                     "screenlog frame {}: screen {} selected {:#x} (stamp {}), older than shown "
+                     "{}: shows {:#x} (stamp {})",
+                     screenlog_frame, i, selected, it->stamp, shown_stamp[i], next->addr,
+                     next->stamp);
+        }
+#endif
+        fb[i].address_left1 = next->addr;
+        fb[i].address_left2 = next->addr;
+        shown_stamp[i] = next->stamp;
+        // Shown, it is named (kept while the screen waits on it).
+        next->named = presents_named;
+#ifdef VITA_DIAGNOSTICS
+        late_partial.fetch_add(1, std::memory_order_relaxed);
+#endif
+    }
+    // The present reads the screens it shows (its picture is drawn from them on the GPU).
     for (u32 i = 0; i < 2; i++) {
         const Pica::FramebufferConfig& f = fb[i];
         HoldRead(f.second_fb_active ? f.address_left2 : f.address_left1,
@@ -1500,7 +1770,117 @@ void RenderThread::Present(const std::array<Pica::FramebufferConfig, 2>& fb,
     Commit();
 }
 
+void RenderThread::FrameTicket(u64 ticket) {
+    frame_ticket_at = (frame_ticket_at + 1) % LeadFramesBack;
+    frame_tickets[frame_ticket_at] = ticket;
+    SgxdTrace("frame_ticket", static_cast<unsigned>(ticket));
+}
+
 void RenderThread::EndFrame() {
+#ifdef VITA_DIAGNOSTICS
+    if (screenlog_on) {
+        std::string targets, map;
+        for (const ScreenlogTarget& t : screenlog_targets) {
+            targets += fmt::format(" {:#x}+{:#x}:s{} {}d/{}x", t.addr, t.bytes, t.screen, t.draws,
+                                   t.dropped);
+        }
+        for (const SegmentTarget& t : segment_targets) {
+            map += fmt::format(" {:#x}+{:#x}:s{}/{}/{}/{}", t.addr, t.bytes, t.screens[0],
+                               t.screens[1], t.screens[2], t.screens[3]);
+        }
+        LOG_INFO(
+            Render,
+            "screenlog frame {}: late {} keep {} sums {}/{}; LCD top {:#x}/{:#x} right "
+            "{:#x}/{:#x} bottom {:#x}/{:#x}; drawn:{}; transfers:{}; map:{}",
+            screenlog_frame, late_skip, late_keep, screen_cost[0], screen_cost[1],
+            static_cast<u32>(lcd_fb[0].address_left1), static_cast<u32>(lcd_fb[0].address_left2),
+            static_cast<u32>(lcd_fb[0].address_right1), static_cast<u32>(lcd_fb[0].address_right2),
+            static_cast<u32>(lcd_fb[1].address_left1), static_cast<u32>(lcd_fb[1].address_left2),
+            targets, screenlog_transfers, map);
+        screenlog_targets.clear();
+        screenlog_transfers.clear();
+    }
+    static const bool screenlog = SgxdFlag("screenlog");
+    static const u64 screenlog_from_us = u64{SgxdFlagValue("screenlog_at")} * 1000000;
+    static u32 screenlog_window = 0;
+    const bool window = screenlog_from_us != 0 &&
+                        static_cast<u64>(Clock::now().time_since_epoch().count()) >=
+                            screenlog_from_us &&
+                        screenlog_window < 600;
+    screenlog_window += window ? 1 : 0;
+    screenlog_frame++;
+    screenlog_on = window || (screenlog && screenlog_frame % 600 < 4);
+#endif
+    // The late skip, decided where the draws are recorded so a late frame's dropped draws and
+    // transfers never are. The next frame is late when the guest's frame TicketFramesBack vblanks back
+    // is not done. A late frame drops the busier screen's draws (each draw's screen its buffer's
+    // segment's), the draws of no known screen, and the transfers ending a segment with a dropped draw.
+    for (SegmentTarget& t : segment_targets) {
+        if (!t.open) {
+            t.segment = 0;
+            t.dropped = false;
+        }
+    }
+    for (u32 i = 0; i < 2; i++) {
+        screen_cost[i] = screen_cost[i] - screen_cost[i] / 8 + frame_cost[i];
+    }
+    frame_cost = {};
+    // The ticket TicketFramesBack vblanks back, and the oldest kept, LeadFramesBack back.
+    const u64 back =
+        frame_tickets[(frame_ticket_at + LeadFramesBack - (TicketFramesBack - 1)) % LeadFramesBack];
+    const u64 lead = frame_tickets[(frame_ticket_at + 1) % LeadFramesBack];
+    const bool gpu_late = back != 0 && !InterruptPoll(back);
+    for (u32 i = 0; i < 2; i++) {
+        screen_skips[i] = late_skip && late_keep != static_cast<int>(i) ? screen_skips[i] + 1 : 0;
+    }
+    // The GPU's lag drops the busier screen whatever the guest's pace: a GPU-bound scene runs the game
+    // at the emulation's speed and shows fewer pictures. MaxScreenSkips() bounds the drops in a row.
+    late_skip = gpu_late;
+    if (late_skip) {
+        late_keep = screen_cost[0] >= screen_cost[1] ? 1 : 0;
+        if (screen_skips[1 - late_keep] >= MaxScreenSkips()) {
+            late_skip = false;
+        }
+    }
+    // Drawn whole while the GPU lags: the vblank waits for the frame LeadFramesBack before, so the GPU
+    // has a frame's work queued at the wake.
+    SgxdTrace("late", !late_skip ? (gpu_late ? 1u : 0u) : static_cast<u32>(late_keep == 1 ? 2 : 3));
+    if (gpu_late && !late_skip) {
+#ifdef VITA_DIAGNOSTICS
+        const auto wait_start = Clock::now();
+#endif
+        SgxdTrace("lead_wait");
+        InterruptWait(lead);
+        SgxdTrace("lead_wait_end");
+#ifdef VITA_DIAGNOSTICS
+        late_waits.fetch_add(1, std::memory_order_relaxed);
+        late_wait_us.fetch_add(
+            static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - wait_start)
+                    .count()),
+            std::memory_order_relaxed);
+#endif
+    }
+#ifdef VITA_DIAGNOSTICS
+    {
+        const u32 lead = frames_put - frames_done.load(std::memory_order_relaxed);
+        const u32 bytes = write - read.load(std::memory_order_relaxed);
+        lead_frames_sum.fetch_add(lead, std::memory_order_relaxed);
+        lead_samples.fetch_add(1, std::memory_order_relaxed);
+        if (lead > lead_frames_max.load(std::memory_order_relaxed)) {
+            lead_frames_max.store(lead, std::memory_order_relaxed);
+        }
+        if (bytes > lead_bytes_max.load(std::memory_order_relaxed)) {
+            lead_bytes_max.store(bytes, std::memory_order_relaxed);
+        }
+        frames_put++;
+    }
+#endif
+    if (late_skip) {
+#ifdef VITA_DIAGNOSTICS
+        late_frames.fetch_add(1, std::memory_order_relaxed);
+#endif
+    }
     Put(Op::FrameEnd);
 }
 
@@ -1540,11 +1920,12 @@ RenderThread::SegmentTarget& RenderThread::SegmentTargetFor(PAddr addr, u32 byte
     if (segment_targets.size() == 16) {
         segment_targets.erase(segment_targets.begin());
     }
-    return segment_targets.emplace_back(SegmentTarget{addr, bytes, 0, false, {-1, -1, -1, -1}});
+    return segment_targets.emplace_back(
+        SegmentTarget{addr, bytes, 0, false, false, {-1, -1, -1, -1}, 0, 0});
 }
 
 bool RenderThread::LateDraw() {
-    const auto& fb = render_pica.regs.internal.framebuffer.framebuffer;
+    const auto& fb = pica.regs.internal.framebuffer.framebuffer;
     const PAddr addr = fb.GetColorBufferPhysicalAddress();
     const u32 bytes =
         fb.GetWidth() * fb.GetHeight() * Pica::FramebufferRegs::BytesPerColorPixel(fb.color_format);
@@ -1562,6 +1943,7 @@ bool RenderThread::LateDraw() {
     const PAddr lcd = late_cache.lcd;
     const int lcd_screen = late_cache.lcd_screen;
     SegmentTarget& t = segment_targets[late_cache.target];
+    t.open = true;
     t.drawn = ++segment_draws;
     const int screen = lcd_screen >= 0 ? lcd_screen : t.screens[std::min<u32>(t.segment, 3)];
     if (screen >= 0) {
@@ -1714,11 +2096,28 @@ RenderThread::Stats RenderThread::TakeStats() {
     s.presents_behind = presents_behind.exchange(0);
     s.presents_soon = presents_soon.exchange(0);
     s.late_frames = late_frames.exchange(0);
+    s.late_waits = late_waits.exchange(0);
+    s.late_wait_us = late_wait_us.exchange(0);
+    s.lead_frames_sum = lead_frames_sum.exchange(0);
+    s.lead_samples = lead_samples.exchange(0);
+    s.lead_frames_max = lead_frames_max.exchange(0);
+    s.lead_bytes_max = lead_bytes_max.exchange(0);
     s.late_draws = late_draws.exchange(0);
     s.late_kept = late_kept.exchange(0);
     s.merged_draws = merged_draws.exchange(0);
     s.merged_runs = merged_runs.exchange(0);
     s.late_partial = late_partial.exchange(0);
+    s.gpu_samples = gpu_samples.exchange(0);
+    s.gpu_busy = gpu_busy.exchange(0);
+    s.gpu_held = gpu_held.exchange(0);
+    for (u32 k = 0; k < GpuAtCells; k++) {
+        s.gpu_at[k] = gpu_at[k].exchange(0);
+    }
+    for (u32 k = 0; k < GpuLabels; k++) {
+        s.gpu_3d_by[k] = gpu_3d_by[k].exchange(0);
+        s.gpu_ta_by[k] = gpu_ta_by[k].exchange(0);
+        s.jobs_by[k] = __atomic_exchange_n(&sgxd_mkq_label_sent[k], 0u, __ATOMIC_RELAXED);
+    }
     for (u32 k = 0; k < s.present_gaps.size(); k++) {
         s.present_gaps[k] = present_gaps[k].exchange(0);
     }
@@ -1769,6 +2168,9 @@ void RenderThread::RunAvailable() {
 #ifdef VITA_DIAGNOSTICS
     const auto start = Clock::now();
 #endif
+    // A pending present goes once its interval is up, between records: the clock is read every 64
+    // records only (a syscall), the window's present every 8.
+    u32 since_check = 0;
     u32 since_flip = 0;
     while (r != published.load(std::memory_order_acquire)) {
         Head head;
@@ -1790,6 +2192,9 @@ void RenderThread::RunAvailable() {
         }
         if ((++since_flip & 7) == 0) {
             renderer.FlipDone();
+        }
+        if (present_pending && (++since_check & 63) == 0) {
+            ShowDuePresent();
         }
     }
 #ifdef VITA_DIAGNOSTICS
@@ -1831,6 +2236,44 @@ RenderThread::Stats::Kind RenderThread::KindOf(Op op) {
     }
 }
 #endif
+
+void RenderThread::ShowPresent(const std::array<Pica::FramebufferConfig, 2>& fb,
+                               const std::array<Pica::ColorFill, 2>& fill,
+                               Common::ProcessClock::time_point now) {
+#ifdef VITA_DIAGNOSTICS
+    const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_present);
+    present_gaps[gap.count() <= 20   ? 0
+                 : gap.count() <= 37 ? 1
+                 : gap.count() <= 54 ? 2
+                                     : 3]
+        .fetch_add(1, std::memory_order_relaxed);
+#endif
+    last_present = now;
+#ifdef VITA_DIAGNOSTICS
+    const PAddr top = fb[0].second_fb_active ? fb[0].address_left2 : fb[0].address_left1;
+    SgxdTrace("present", top != trace_top ? 1u : 0u);
+    trace_top = top;
+#endif
+    renderer.PresentFrame(fb, fill);
+    shown_frames.fetch_add(1, std::memory_order_relaxed);
+    SgxdTrace("presented");
+    rasterizer.GpuIdle();
+#ifdef VITA_DIAGNOSTICS
+    presents.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+void RenderThread::ShowDuePresent() {
+    if (!present_pending) {
+        return;
+    }
+    const auto now = Clock::now();
+    if (now - last_present < PresentInterval || renderer.PresentBusy()) {
+        return;
+    }
+    present_pending = false;
+    ShowPresent(pending_fb, pending_fill, now);
+}
 
 void RenderThread::RunRecord(const Head& head, const u8* p) {
     const auto take = [p]<typename T>(T& out) { std::memcpy(&out, p, sizeof(T)); };
@@ -1938,9 +2381,6 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         if (indices.scanned != 0) {
             rasterizer.ScannedIndices(indices.lo, indices.hi);
         }
-        if (LateDraw()) {
-            break;
-        }
         // RasterizerSgxd draws or stops the emulator; the emulation side was told it drew.
         [[maybe_unused]] const bool drawn = rasterizer.AccelerateDrawBatch(head.extra != 0);
         DEBUG_ASSERT(drawn);
@@ -1956,49 +2396,22 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     case Op::ImmediateVertex: {
         Pica::AttributeBuffer input;
         take(input);
-        if (!late_batch_open) {
-            late_batch_open = true;
-            late_batch_skip = LateDraw();
-        }
-        if (late_batch_skip) {
-            break;
-        }
         [[maybe_unused]] const bool taken = rasterizer.AccelerateImmediateVertex(input);
         DEBUG_ASSERT(taken);
         break;
     }
-    case Op::FlushImmediate: {
-        // A batch keeps the decision its first vertex found.
-        const bool skip = late_batch_open && late_batch_skip;
-        late_batch_open = false;
-        if (skip) {
-            break;
-        }
+    case Op::FlushImmediate:
         rasterizer.FlushImmediate();
         break;
-    }
     case Op::AddTriangle: {
         TriangleRecord t;
         take(t);
-        // The triangles up to the next DrawTriangles keep the decision the first found.
-        if (!late_triangles_open) {
-            late_triangles_open = true;
-            late_triangles_skip = LateDraw();
-        }
-        if (!late_triangles_skip) {
-            rasterizer.AddTriangle(t.v[0], t.v[1], t.v[2]);
-        }
+        rasterizer.AddTriangle(t.v[0], t.v[1], t.v[2]);
         break;
     }
-    case Op::DrawTriangles: {
-        const bool skip = late_triangles_open && late_triangles_skip;
-        late_triangles_open = false;
-        if (skip) {
-            break;
-        }
+    case Op::DrawTriangles:
         rasterizer.DrawTriangles();
         break;
-    }
     case Op::P3D:
         rasterizer.NotifyP3D();
         break;
@@ -2012,45 +2425,8 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     case Op::TextureCopy: {
         Pica::DisplayTransferConfig config;
         take(config);
-        const PAddr in = config.GetPhysicalInputAddress();
+        // The late skip's dropped transfers are not recorded (RenderThread::LateTransfer).
         const bool display = head.op == Op::DisplayTransfer;
-        const u32 in_bytes = display ? config.input_width * config.input_height *
-                                           Pica::BytesPerPixel(config.input_format)
-                                     : config.texture_copy.size;
-        PAddr lcd = 0;
-        const int screen = LcdScreenOf(config.GetPhysicalOutputAddress(),
-                                       display ? config.output_width * config.output_height *
-                                                     Pica::BytesPerPixel(config.output_format)
-                                               : config.texture_copy.size,
-                                       &lcd);
-        // A transfer from a colour buffer drawn lately ends its segment: the segment gets the
-        // transfer's screen, and the transfer is dropped when a draw of the segment was.
-        bool dropped = false;
-        SegmentTarget* source = nullptr;
-        for (SegmentTarget& t : segment_targets) {
-            if (in >= t.addr && in < t.addr + t.bytes) {
-                source = &t;
-            }
-        }
-        if (source) {
-            source->screens[std::min<u32>(source->segment, 3)] = static_cast<s8>(screen);
-            dropped = late_skip && source->dropped;
-            source->segment++;
-            source->dropped = false;
-        }
-#ifdef VITA_DIAGNOSTICS
-        if (screenlog_on) {
-            screenlog_transfers +=
-                fmt::format(" {}{:#x}+{:#x}->{:#x}(s{}{})", display ? "" : "copy ", in, in_bytes,
-                            config.GetPhysicalOutputAddress(), screen, dropped ? " dropped" : "");
-        }
-#endif
-        if (screen >= 0) {
-            NoteLcdWrite(screen, lcd, dropped);
-        }
-        if (dropped) {
-            break;
-        }
         if (display) {
             rasterizer.AccelerateDisplayTransfer(config);
         } else {
@@ -2087,60 +2463,10 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         take(r);
         renderer.PollWindow();
         last_window_poll = Clock::now();
-        lcd_fb = r.fb;
-        // Every buffer a screen has been shown from: a title that renders into a third one
-        // (a game's top screen) writes the one the LCD's two registers do not name yet.
-        for (u32 i = 0; i < 2; i++) {
-            for (const PAddr fb : {static_cast<PAddr>(r.fb[i].address_left1),
-                                   static_cast<PAddr>(r.fb[i].address_left2)}) {
-                auto& known = lcd_buffers[i];
-                if (fb == 0 || std::any_of(known.begin(), known.end(),
-                                           [fb](const LcdBuffer& b) { return b.addr == fb; })) {
-                    continue;
-                }
-                if (known.size() == 4) {
-                    known.erase(known.begin());
-                }
-                known.push_back({fb, 0});
-            }
-        }
-        // Two newer presents queued: the thread is more than the vblank's one present behind,
-        // and the newest shows a newer picture. With one, this is the vblank's normal lag.
+        // Two newer presents queued: the thread is more than the vblank's one present behind, and the
+        // newest shows a newer picture. Not with none shown for PresentStarved.
         const u32 behind = presents_queued.fetch_sub(1, std::memory_order_relaxed) - 1;
-        // The late skip: a screen whose selected LCD buffer holds a picture older than the one it last
-        // showed (a late frame's write into it dropped, or a buffer shown in its place rewritten
-        // since) shows the oldest picture no older than that instead.
-        for (u32 i = 0; i < 2; i++) {
-            const PAddr selected =
-                r.fb[i].second_fb_active ? r.fb[i].address_left2 : r.fb[i].address_left1;
-            const auto& buffers = lcd_buffers[i];
-            const auto it =
-                std::find_if(buffers.begin(), buffers.end(),
-                             [selected](const LcdBuffer& b) { return b.addr == selected; });
-            if (it == buffers.end() || it->stamp >= shown_stamp[i]) {
-                shown_stamp[i] = it == buffers.end() ? shown_stamp[i] : it->stamp;
-                continue;
-            }
-            // The oldest picture no older than the last shown: the screen goes on from there,
-            // and follows the guest's buffers again once they catch up (the newest would keep it
-            // ahead of the guest: a game shows a bottom-screen picture three frames after it drew
-            // it).
-            const LcdBuffer* next = nullptr;
-            for (const LcdBuffer& b : buffers) {
-                if (b.stamp >= shown_stamp[i] && (!next || b.stamp < next->stamp)) {
-                    next = &b;
-                }
-            }
-            DEBUG_ASSERT_MSG(next, "late skip: no LCD buffer of screen {} holds stamp {} or newer",
-                             i, shown_stamp[i]);
-            r.fb[i].address_left1 = next->addr;
-            r.fb[i].address_left2 = next->addr;
-            shown_stamp[i] = next->stamp;
-#ifdef VITA_DIAGNOSTICS
-            late_partial.fetch_add(1, std::memory_order_relaxed);
-#endif
-        }
-        if (behind >= 2) {
+        if (behind >= 2 && Clock::now() - last_present < PresentStarved) {
 #ifdef VITA_DIAGNOSTICS
             presents_behind.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -2148,10 +2474,17 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
             break;
         }
         const auto now = Clock::now();
-        if (now - last_present < std::chrono::microseconds(12000)) {
+        if (now - last_present < PresentInterval || renderer.PresentBusy()) {
+            // Too soon after the last, or the last still on the GPU: shown later unless a newer one comes.
 #ifdef VITA_DIAGNOSTICS
-            presents_soon.fetch_add(1, std::memory_order_relaxed);
+            if (present_pending) {
+                presents_soon.fetch_add(1, std::memory_order_relaxed);
+            }
 #endif
+            present_pending = true;
+            pending_fb = r.fb;
+            pending_fill = r.fill;
+            SgxdTrace("present_pending");
             break;
         }
 #ifdef VITA_DIAGNOSTICS
@@ -2170,60 +2503,15 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
 #ifdef VITA_DIAGNOSTICS
         presents.fetch_add(1, std::memory_order_relaxed);
 #endif
+        present_pending = false;
+        ShowPresent(r.fb, r.fill, now);
         break;
     }
     case Op::FrameEnd:
         rasterizer.EndFrame();
 #ifdef VITA_DIAGNOSTICS
-        // gxm_flags `screenlog`: the late skip's screen map, four frames in every 600: the colour buffers
-        // drawn (draws, dropped, the screen each maps to), the transfers (source, destination,
-        // the LCD screen, dropped), the LCD buffers and the map.
-        if (screenlog_on) {
-            std::string targets, map;
-            for (const ScreenlogTarget& t : screenlog_targets) {
-                targets += fmt::format(" {:#x}+{:#x}:s{} {}d/{}x", t.addr, t.bytes, t.screen,
-                                       t.draws, t.dropped);
-            }
-            for (const SegmentTarget& t : segment_targets) {
-                map += fmt::format(" {:#x}+{:#x}:s{}/{}/{}/{}", t.addr, t.bytes, t.screens[0],
-                                   t.screens[1], t.screens[2], t.screens[3]);
-            }
-            LOG_INFO(Render,
-                     "screenlog frame {}: late {} keep {} sums {}/{}; LCD top {:#x}/{:#x} bottom "
-                     "{:#x}/{:#x}; drawn:{}; transfers:{}; map:{}",
-                     screenlog_frame, late_skip, late_keep, screen_draws[0], screen_draws[1],
-                     static_cast<u32>(lcd_fb[0].address_left1),
-                     static_cast<u32>(lcd_fb[0].address_left2),
-                     static_cast<u32>(lcd_fb[1].address_left1),
-                     static_cast<u32>(lcd_fb[1].address_left2), targets, screenlog_transfers, map);
-            screenlog_targets.clear();
-            screenlog_transfers.clear();
-        }
-        static const bool screenlog = GxmFlag("screenlog");
-        screenlog_frame++;
-        screenlog_on = screenlog && screenlog_frame % 600 < 4;
+        frames_done.fetch_add(1, std::memory_order_relaxed);
 #endif
-        // The late skip: this frame's present follows; the next frame is late when this
-        // thread is two frames behind the guest (that frame's present and a newer one queued
-        // past this one's). A late frame drops the busier screen's draws (by the running sum,
-        // each draw's screen its colour buffer's segment's), the draws whose screen is not
-        // known, and the transfers that end a segment with a dropped draw; the other screen's
-        // draws and transfers run.
-        for (SegmentTarget& t : segment_targets) {
-            t.segment = 0;
-            t.dropped = false;
-        }
-        for (u32 i = 0; i < 2; i++) {
-            screen_draws[i] = screen_draws[i] - screen_draws[i] / 8 + frame_draws[i];
-        }
-        frame_draws = {};
-        late_skip = presents_queued.load(std::memory_order_relaxed) >= 3;
-        if (late_skip) {
-            late_keep = screen_draws[0] >= screen_draws[1] ? 1 : 0;
-#ifdef VITA_DIAGNOSTICS
-            late_frames.fetch_add(1, std::memory_order_relaxed);
-#endif
-        }
         break;
     case Op::GuestWrote: {
         u32 addr;
@@ -2296,6 +2584,7 @@ void RenderThread::Loop() {
         RunAvailable();
         PollFences();
         renderer.FlipDone();
+        ShowDuePresent();
         // The emulation side waits for a ticket: its work's pending 3D finishes now.
         if (!pending.empty() && ticket_wait.load(std::memory_order_relaxed)) {
             const u32 waited = waited_ticket.load(std::memory_order_relaxed);
@@ -2368,8 +2657,19 @@ void RenderThread::Loop() {
                 const auto start = now;
 #endif
                 work.unlock();
-                [[maybe_unused]] const bool woken = Sleep(
-                    std::chrono::duration_cast<std::chrono::microseconds>(WindowPollInterval));
+                auto sleep =
+                    std::chrono::duration_cast<std::chrono::microseconds>(WindowPollInterval);
+                if (present_pending) {
+                    // Its interval, or the last present's GPU work, polled every 2 ms.
+                    sleep = std::clamp(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           last_present + PresentInterval - now),
+                                       std::chrono::microseconds(2000), sleep);
+                }
+                // The window's present drawn and held for its paced flip (FlipDone).
+                if (const s64 due_in = renderer.FlipDueIn(); due_in > 0) {
+                    sleep = std::min(sleep, std::chrono::microseconds(std::max<s64>(due_in, 500)));
+                }
+                [[maybe_unused]] const bool woken = Sleep(sleep);
                 work.lock();
                 if (waiting) {
                     rasterizer.InterruptDisarm();
