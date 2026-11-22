@@ -58,7 +58,7 @@
     .equ CPU_SIZE, 0x6c8            @ the last 8 bytes keep the tops inside the block
 @ AzaharFast, at CPU_FAST (native.c): on 0x00, timer 0x04, quantum 0x08, mult_int 0x0c,
 @ mult_frac 0x10, base 0x14 (low) and 0x18, thread_id 0x1c, process_id 0x20, count[5] 0x24,
-@ save[4] 0x38.
+@ save[4] 0x38. AzaharCpu.fast_site is the word before it.
     .equ FAST_ON, 0x00
     .equ FAST_TIMER, 0x04
     .equ FAST_QUANTUM, 0x08
@@ -70,6 +70,7 @@
     .equ FAST_PROCESS_ID, 0x20
     .equ FAST_COUNT, 0x24
     .equ FAST_SAVE, 0x38
+    .equ FAST_SITE, -4
 
     .global azahar_enter
     .type azahar_enter, %function
@@ -366,11 +367,18 @@ azahar_svc_fast:
     beq     8f
     mov     r4, #(FAST_COUNT + 4 * 4)
 
-7:  @ answered: count it, put r4-r7 back, resume the guest after its svc
+7:  @ answered: count it, record an ARM site for the app to patch (AzaharRunRequest.fast_site;
+    @ the VFP svc's are patched already, a Thumb svc has no room for a branch), put r4-r7 back,
+    @ resume the guest after its svc
     ldr     r5, [r6, r4]
     add     r5, r5, #1
     str     r5, [r6, r4]
-    add     sp, r6, #FAST_SAVE
+    cmp     r4, #(FAST_COUNT + 4 * 4)
+    beq     6f
+    mrs     r5, spsr
+    tst     r5, #0x20
+    streq   lr, [r6, #FAST_SITE]
+6:  add     sp, r6, #FAST_SAVE
     ldmia   sp, {r4-r7}
     movs    pc, lr
 

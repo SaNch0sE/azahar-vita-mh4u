@@ -574,6 +574,15 @@ if (VITA)
         arm/vita/arm_vita_native.h
     )
     target_compile_definitions(citra_core PUBLIC -DCITRA_HAS_VITA_NATIVE)
+    # Every svc an upcall (arm/vita/arm_vita_native.cpp, "Upcalls"): the module built unsealed
+    # (AZAHAR_SEAL=0), so the guest's world has the app's pages.
+    option(VITA_UPCALLS "Vita native core: every svc answered by an upcall (unsealed module)" ON)
+    if (VITA_UPCALLS)
+        target_compile_definitions(citra_core PUBLIC -DVITA_UPCALLS)
+        set(VITA_NATIVE_SEAL 0)
+    else()
+        set(VITA_NATIVE_SEAL 1)
+    endif()
     # The module's ABI header, included from the module rather than copied here: the two halves
     # of one interface, and a copy is a thing that drifts.
     target_include_directories(citra_core PUBLIC "${CMAKE_SOURCE_DIR}/vita_native/src")
@@ -603,6 +612,7 @@ if (VITA)
             CMAKE_ARGS
                 "-DCMAKE_TOOLCHAIN_FILE=$ENV{VITASDK}/share/vita.toolchain.cmake"
                 "-DCMAKE_BUILD_TYPE=Release"
+                "-DAZAHAR_SEAL=${VITA_NATIVE_SEAL}"
             BUILD_ALWAYS 1
             INSTALL_COMMAND ""
             BUILD_BYPRODUCTS

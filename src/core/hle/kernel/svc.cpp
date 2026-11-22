@@ -408,6 +408,7 @@ class SVC : public SVCWrapper<SVC> {
 public:
     SVC(Core::System& system);
     void CallSVC(u32 immediate);
+    void CallSVCForUpcall(u32 immediate);
 
 private:
     Core::System& system;
@@ -2432,6 +2433,17 @@ const SVC::FunctionDef* SVC::GetSVCInfo(u32 func_num) {
 
 MICROPROFILE_DEFINE(Kernel_SVC, "Kernel", "SVC", MP_RGB(70, 200, 70));
 
+void SVC::CallSVCForUpcall(u32 immediate) {
+    std::scoped_lock lock{kernel.GetHLELock()};
+    const FunctionDef* info = GetSVCInfo(immediate);
+    if (info && info->func) {
+        system.GetRunningCore().GetTimer().AddTicks(info->cycles);
+        (this->*(info->func))();
+    } else {
+        LOG_ERROR(Kernel_SVC, "unimplemented SVC function {:02X}", immediate);
+    }
+}
+
 void SVC::CallSVC(u32 immediate) {
     MICROPROFILE_SCOPE(Kernel_SVC);
     system.perf_stats->BeginSVCProcessing();
@@ -2470,6 +2482,10 @@ SVCContext::~SVCContext() = default;
 
 void SVCContext::CallSVC(u32 immediate) {
     impl->CallSVC(immediate);
+}
+
+void SVCContext::CallSVCForUpcall(u32 immediate) {
+    impl->CallSVCForUpcall(immediate);
 }
 
 } // namespace Kernel

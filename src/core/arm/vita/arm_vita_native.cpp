@@ -22,10 +22,19 @@
 #include "common/logging/log.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/hle/kernel/address_arbiter.h"
+#include "core/hle/kernel/client_session.h"
+#include "core/hle/kernel/errors.h"
+#include "core/hle/kernel/event.h"
+#include "core/hle/kernel/ipc_debugger/recorder.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/mutex.h"
 #include "core/hle/kernel/process.h"
+#include "core/hle/kernel/resource_limit.h"
+#include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/thread.h"
 #include "core/hle/kernel/vm_manager.h"
+#include "core/hle/kernel/wait_object.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
@@ -47,10 +56,16 @@ bool in_kernel_scheduling = true;
 /// of it (the threads' contexts in place), and the states the slice left.
 std::vector<Kernel::ThreadManager::NativeSchedEntry> sched_before, sched_after;
 std::array<AzaharSchedThread, AZAHAR_SCHED_MAX> sched_table;
-/// The threads whose last stop was a SleepThread (an exit for one, or one the module answered):
-/// only their slices carry the table. A title that sleeps rarely (a game: 200 a second among 5,000
-/// svc exits) paid the table's export and import on every slice, 6% of its race.
-std::unordered_set<u32> sched_sleepers;
+/// The arbiter the slice's table carries the waiters of, from export to import.
+std::shared_ptr<Kernel::AddressArbiter> sched_arbiter;
+/// The threads whose last stop was a SleepThread or an ArbitrateAddress (an exit for one, or one
+/// the module answered): only their slices carry the table. A title that sleeps rarely (a game: 200
+/// a second among 5,000 svc exits) paid the table's export and import on every slice, 6% of its
+/// race.
+std::unordered_set<u32> sched_waiters;
+/// The arbiter handle of the last ArbitrateAddress that exited: the one the module answers
+/// (azaharnative 36; a title has one, MH Generations its single CreateAddressArbiter).
+Kernel::Handle sched_arbiter_handle{};
 
 // A thread's context is the module's AzaharContext, fpexc after it: the module loads a thread
 // from its own context in place (the upcall's switch, the in-kernel scheduler's table).
@@ -397,17 +412,17 @@ bool RunVfpVector(AzaharContext& ctx, u32 insn) {
 
 /// The thunk area, below PROCESS_IMAGE_VADDR: ARM sites below ~0x020C0000 reach it, Thumb sites
 /// below ~0x010C0000; farther ones take the svc.
-constexpr VAddr VfpAreaBase = 0x000C0000;
-constexpr u32 VfpAreaSize = 0x40000;
+constexpr VAddr ThunkAreaBase = 0x000C0000;
+constexpr u32 ThunkAreaSize = 0x40000;
 /// The largest thunk: ARM 19 words and eight elements, Thumb about as many bytes.
 constexpr u32 VfpThunkMax = 128;
 
-bool InVfpArea(u32 addr) {
-    return addr - VfpAreaBase < VfpAreaSize;
+bool InThunkArea(u32 addr) {
+    return addr - ThunkAreaBase < ThunkAreaSize;
 }
 
 /// A patched site: the original instruction (Thumb's halfwords high first, as fetched).
-struct VfpSite {
+struct PatchedSite {
     u32 insn;
     bool thumb;
 };
@@ -426,21 +441,62 @@ struct VfpThunk {
     u32 end;
 };
 
-/// The guest's patched sites and thunks (one guest, whichever core runs it), the area, and the
-/// map it is mapped into.
-std::unordered_map<u32, VfpSite> vfp_patched;
+// The svcs the module answers in the vector (AZAHAR_FAST_*) are answered by thunks as well, from
+// two read-only pages it maps into the guest's table (AZAHAR_USER_TIMER_VA): GetSystemTick from
+// the private timer and the entry's clock, GetThreadId and GetProcessId on the current thread and
+// process, and the process data cache svcs on the current process. The module reports an ARM site
+// it answered (AzaharRunRequest.fast_site) and PatchSvc branches the site to a thunk. An svc keeps
+// every register but its outputs, and the flags: the thunk works in the caller-saved r2, r3 and
+// r12 with LR holding the flags, all four on the guest's stack meanwhile, and writes its answer
+// to r0 and r1. A handle it does not answer, or an answer the page does not hold this entry, runs
+// the original svc in the thunk's miss path (an exit, or the module's own answer). Thumb's 16-bit
+// svc has no room for a branch and stays.
+
+/// An svc thunk's instructions by address, for a thread stopped inside it (FinishSvcThunk).
+struct SvcThunk {
+    u32 site;
+    u32 mrs;      ///< mrs lr: past it LR holds the guest's flags
+    u32 answered; ///< from here the answer is in r0 and r1 (and the svc's inputs may be gone)
+    u32 done;     ///< the hit's msr
+    u32 pop;      ///< pop {r2, r3, r12, lr}
+    u32 back;
+    u32 miss; ///< the miss's msr
+    u32 miss_pop;
+    u32 miss_svc;
+    u32 miss_back;
+    u32 end;
+};
+/// The largest svc thunk: GetSystemTick's 31 words.
+constexpr u32 SvcThunkMax = 136;
+
+/// The guest's patched sites and thunks; the svc sites PatchSvc could not patch.
+std::unordered_map<u32, PatchedSite> patched_sites;
 std::map<u32, VfpThunk> vfp_thunks;
-std::unique_ptr<Common::HostSharedMemory> vfp_area;
-const VitaGuestMap* vfp_area_map{};
-u32 vfp_area_used{};
+std::map<u32, SvcThunk> svc_thunks;
+/// An upcall thunk (the experiment below): its site, end, and the svcs its tail may run (the
+/// reschedule's and the original's), each followed by the branch back.
+struct UpcallThunk {
+    u32 site;
+    u32 end;
+    u32 svc_reschedule;
+    u32 svc_original;
+};
+std::map<u32, UpcallThunk> upcall_thunks;
+std::unordered_set<u32> svc_refused;
+std::unique_ptr<Common::HostSharedMemory> thunk_area;
+const VitaGuestMap* thunk_area_map{};
+u32 thunk_area_used{};
 
 /// The guest that map held is gone, and its patches with it.
-void ForgetVfpPatches(const VitaGuestMap* map) {
-    if (vfp_area_map == map) {
-        vfp_patched.clear();
+void ForgetThunks(const VitaGuestMap* map) {
+    if (thunk_area_map == map) {
+        patched_sites.clear();
         vfp_thunks.clear();
-        vfp_area_used = 0;
-        vfp_area_map = nullptr;
+        svc_thunks.clear();
+        svc_refused.clear();
+        upcall_thunks.clear();
+        thunk_area_used = 0;
+        thunk_area_map = nullptr;
     }
 }
 
@@ -518,7 +574,7 @@ void FinishVfpThunk(Memory::MemorySystem& memory, AzaharContext& c) {
     }
     if (pc < t.back) {
         for (u32 a = std::max(pc, t.elements); a < t.restore; a += 4) {
-            const u8* const p = vfp_area->Data() + (a - VfpAreaBase);
+            const u8* const p = thunk_area->Data() + (a - ThunkAreaBase);
             u32 e;
             if (t.thumb) {
                 u16 hw[2];
@@ -547,6 +603,193 @@ void FinishVfpThunk(Memory::MemorySystem& memory, AzaharContext& c) {
     c.r[15] = t.site; // the miss path before its original ran
 }
 
+/// FinishVfpThunk's for an svc thunk: before its answer the thread stands at the site, after it
+/// past it.
+void FinishSvcThunk(Memory::MemorySystem& memory, AzaharContext& c) {
+    const u32 pc = c.r[15];
+    auto it = svc_thunks.upper_bound(pc);
+    ASSERT_MSG(it != svc_thunks.begin(), "a thread at {:08X} in no svc thunk", pc);
+    const SvcThunk& t = (--it)->second;
+    ASSERT_MSG(pc < t.end && (c.cpsr & 0x20) == 0, "a thread at {:08X} past its svc thunk", pc);
+    const auto pop = [&] {
+        c.r[2] = memory.Read32(c.r[13]);
+        c.r[3] = memory.Read32(c.r[13] + 4);
+        c.r[12] = memory.Read32(c.r[13] + 8);
+        c.r[14] = memory.Read32(c.r[13] + 12);
+        c.r[13] += 16;
+    };
+    const auto flags = [&] { c.cpsr = (c.cpsr & ~0xF8000000u) | (c.r[14] & 0xF8000000u); };
+    if (pc == it->first || pc == t.miss_svc) {
+        c.r[15] = t.site;
+    } else if (pc == t.back || pc == t.miss_back) {
+        c.r[15] = t.site + 4;
+    } else if (pc == t.pop || pc == t.miss_pop) {
+        pop();
+        c.r[15] = pc == t.pop ? t.site + 4 : t.site;
+    } else {
+        // Between the mrs and an msr: the flags are in LR.
+        DEBUG_ASSERT_MSG(pc <= t.done || pc == t.miss, "a thread at {:08X} in svc thunk {:08X}", pc,
+                         it->first);
+        if (pc > t.mrs) {
+            flags();
+        }
+        pop();
+        c.r[15] = pc >= t.answered && pc <= t.done ? t.site + 4 : t.site;
+    }
+}
+
+// Upcalls (the module built with AZAHAR_SEAL=0; on in a VITA_UPCALLS build, else sgxd_flags
+// `upcalls`): an svc that leaves the guest is answered by the HLE kernel's own
+// handler, called from the guest's world. The unsealed table has the app's pages (the process's
+// TTBR1 entries, with the domains granted for the slice), so a thunk in place of the svc switches
+// to a stack of the app's and BLXes into the app's code at user level, with no exception and no
+// world switch. The C++ for svc N (UpcallSvcN, ARM_VitaNative::UpcallSvc) loads the running
+// core's register file from the svc's r0-r7, runs SVC::CallSVCForUpcall under the HLE lock, and
+// answers in r0 (the svc's result) and r1 (UpcallStatus), r1-r3's outputs in the thunk's frame.
+//
+// An svc keeps every register but its outputs, and the flags; the C++ keeps r4-r11, d8-d15 and
+// SP by the calling convention, so the thunk keeps the caller-saved rest: r0-r3, r12, LR (the
+// BLX's) and the flags on the guest's stack, the guest's SP on the app's stack, r4-r7 copied as
+// the C++'s stack arguments. FPSCR stays the guest's (LEN and STRIDE are 0 at a call). The C++
+// runs with the guest's TPIDRURO (user mode cannot write it): the frontend's wraps find the
+// emulation thread's thread-local storage for it (citra_vita/upcall_tls.cpp), and a Sony syscall
+// it makes is forwarded to Sony's world (ForwardSonySyscall).
+//
+// A svc that stopped the thread or asked for a reschedule answers UpcallReschedule, and the
+// thunk's tail runs svc UpcallRescheduleSvc for an exit that only reschedules. (The tail's other
+// svc, the original for UpcallBusy, is no longer answered.) A quantum that ends inside a thunk or
+// the C++ runs the same thread on at once, and the in-kernel scheduler is off meanwhile: another
+// thread's upcall would use the same stack.
+
+enum UpcallStatus : u32 { UpcallDone = 0, UpcallReschedule = 1, UpcallBusy = 2 };
+constexpr u32 UpcallRescheduleSvc = 0xFD;
+
+alignas(16) std::array<u8, 64 * 1024> upcall_stack;
+Core::System* upcall_system{};
+/// Every svc an upcall (a VITA_UPCALLS build); the svcs the
+/// module does not answer go to the redirect too. Idle loops are skipped (CheckTickPolls) with
+/// upcalls only: the skip is one.
+bool upcall_all{};
+
+u32 upcall_quantums{};
+/// The core whose slice an upcall runs in: its register file is the svc's for the HLE handlers.
+ARM_VitaNative* upcall_core{};
+
+bool UpcallsOn() {
+    return upcall_all;
+}
+
+/// Whether svc `number`'s sites become upcalls: with upcalls on, every svc PatchUpcall has a C++
+/// answer for.
+bool UpcallFor(u32 number) {
+    if (!upcall_all) {
+        return false;
+    }
+    // Every svc but the module's own.
+    return number != 0 && number != AZAHAR_VFP_SVC && number != UpcallRescheduleSvc;
+}
+
+/// The upcall for svc N: its eight input registers to ARM_VitaNative::UpcallSvc.
+template <u32 N>
+u64 UpcallSvcN(u32 r0, u32 r1, u32 r2, u32 r3, u32 r4, u32 r5, u32 r6, u32 r7) {
+    return ARM_VitaNative::UpcallSvc(N, {r0, r1, r2, r3, r4, r5, r6, r7});
+}
+using UpcallFn = u64 (*)(u32, u32, u32, u32, u32, u32, u32, u32);
+template <std::size_t... I>
+constexpr std::array<UpcallFn, sizeof...(I)> MakeUpcallTable(std::index_sequence<I...>) {
+    return {&UpcallSvcN<static_cast<u32>(I)>...};
+}
+constexpr auto upcall_table = MakeUpcallTable(std::make_index_sequence<0x100>{});
+/// Whether a reschedule was asked while an upcall ran (ARM_VitaNative::PrepareReschedule).
+std::atomic<bool> upcall_reschedule_asked{};
+
+bool InUpcall(u32 pc) {
+    if (pc >= 0x40000000u) {
+        return true; // the app's own code
+    }
+    const auto it = upcall_thunks.upper_bound(pc);
+    return it != upcall_thunks.begin() && pc < std::prev(it)->second.end;
+}
+
+/// The svc at `pc` is one an upcall thunk's tail runs: the guest's registers and stack are its
+/// own again there, and the exit is an ordinary one.
+bool IsUpcallTailSvc(u32 pc) {
+    const auto it = upcall_thunks.upper_bound(pc);
+    if (it == upcall_thunks.begin()) {
+        return false;
+    }
+    const UpcallThunk& t = std::prev(it)->second;
+    return pc == t.svc_reschedule || pc == t.svc_original;
+}
+
+u64 UpcallAnswer(u32 result, UpcallStatus status) {
+    return u64{result} | u64{status} << 32;
+}
+
+/// The guest's r0-r3, r12 and LR as the thunk saved them on the guest's stack (the guest's SP is
+/// at the top of the app's stack): an output beyond r0 goes into its slot, which the thunk's
+/// tail pops. A guest address, reachable as it is because the upcall runs in the guest's world.
+u32* UpcallGuestRegs() {
+    u32 guest_sp;
+    std::memcpy(&guest_sp, upcall_stack.data() + upcall_stack.size() - 8, sizeof(guest_sp));
+    return reinterpret_cast<u32*>(static_cast<uintptr_t>(guest_sp)) + 1; // past the flags word
+}
+
+/// A Sony syscall (svc 0, its number in r12) an upcall's C++ made in the guest's world, made again
+/// in Sony's with the same r0-r3 and r12 and the eight words past the upcall's SP copied onto this
+/// thread's own stack (the kernel never answers a syscall made with SP on the upcall stack).
+void ForwardSonySyscall(AzaharContext& c) {
+    alignas(8) std::array<u32, 8> args;
+    std::memcpy(args.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(c.r[13])),
+                sizeof(args));
+    register u32 r0 asm("r0") = c.r[0];
+    register u32 r1 asm("r1") = c.r[1];
+    register u32 r2 asm("r2") = c.r[2];
+    register u32 r3 asm("r3") = c.r[3];
+    register u32 r12 asm("r12") = c.r[12];
+    asm volatile("mov r4, sp\n"
+                 "mov sp, %[sp]\n"
+                 "svc 0\n"
+                 "mov sp, r4\n"
+                 : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r12)
+                 : [sp] "r"(args.data())
+                 : "r4", "memory", "cc");
+    c.r[0] = r0;
+    c.r[1] = r1;
+    c.r[2] = r2;
+    c.r[3] = r3;
+    c.r[12] = r12;
+}
+
+/// A thread stopped in an upcall thunk stands after one of its tail's svcs (any other stop runs
+/// on at once): it goes on after the site.
+void FinishUpcallThunk(AzaharContext& c) {
+    const u32 pc = c.r[15];
+    const auto it = upcall_thunks.upper_bound(pc);
+    ASSERT_MSG(it != upcall_thunks.begin(), "a thread at {:08X} in no upcall thunk", pc);
+    const UpcallThunk& t = std::prev(it)->second;
+    ASSERT_MSG(pc == t.svc_reschedule + 4 || pc == t.svc_original + 4,
+               "a thread at {:08X} inside upcall thunk {:08X}", pc, std::prev(it)->first);
+    c.r[15] = t.site + 4;
+}
+
+/// The Finish* for the thunk the thread stands in.
+void FinishThunk(Memory::MemorySystem& memory, AzaharContext& c) {
+    const u32 pc = c.r[15];
+    const auto below = [pc](const auto& thunks) -> s64 {
+        const auto it = thunks.upper_bound(pc);
+        return it == thunks.begin() ? -1 : s64{std::prev(it)->first};
+    };
+    const s64 v = below(vfp_thunks), s = below(svc_thunks), u = below(upcall_thunks);
+    if (u > v && u > s) {
+        FinishUpcallThunk(c);
+    } else if (s > v) {
+        FinishSvcThunk(memory, c);
+    } else {
+        FinishVfpThunk(memory, c);
+    }
+}
+
 } // Anonymous namespace
 
 // ---------------------------------------------------------------------------- VitaGuestMap
@@ -557,7 +800,7 @@ VitaGuestMap::~VitaGuestMap() {
     // The module takes a release from a core taken but never mapped (a state loaded before the
     // guest's first slice).
     azaharRelease();
-    ForgetVfpPatches(this);
+    ForgetThunks(this);
 }
 
 bool VitaGuestMap::Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) const {
@@ -819,6 +1062,11 @@ ARM_VitaNative::ARM_VitaNative(Core::System& system_, Memory::MemorySystem& memo
       map{std::move(map_)} {
     usable = map != nullptr;
     run.ctx.cpsr = 0x10;
+    upcall_system = &system;
+#ifdef VITA_UPCALLS
+    // Every svc an upcall (the module built with AZAHAR_SEAL=0); gxm_flags noupcalls turns it off.
+    upcall_all = !GxmRenderer::GxmFlag("noupcalls");
+#endif
 }
 
 ARM_VitaNative::~ARM_VitaNative() {
@@ -856,7 +1104,7 @@ void ARM_VitaNative::PatchVfp(u32 pc, u32 insn, bool thumb) {
     // A trapping instruction becomes a branch to a thunk; out of reach or room, svc AZAHAR_VFP_SVC,
     // which the module runs without an exit. The caller syncs the site's code.
     VfpDecoded v;
-    if (InVfpArea(pc) || !DecodeVfp(insn, v)) {
+    if (InThunkArea(pc) || !DecodeVfp(insn, v)) {
         return;
     }
     if (PatchVfpThunk(pc, insn, thumb)) {
@@ -874,7 +1122,7 @@ void ARM_VitaNative::PatchVfp(u32 pc, u32 insn, bool thumb) {
     } else {
         memory.Write32(pc, (insn & 0xF0000000u) | 0x0F000000u | AZAHAR_VFP_SVC);
     }
-    vfp_patched[pc] = VfpSite{insn, thumb};
+    patched_sites[pc] = PatchedSite{insn, thumb};
 #ifdef VITA_DIAGNOSTICS
     census.vfp_svcs++;
 #endif
@@ -925,22 +1173,11 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
         }
     }
 
-    // The area, mapped into this guest's table.
-    if (!vfp_area) {
-        vfp_area = std::make_unique<Common::HostSharedMemory>(VfpAreaSize, "azahar-vfp-thunks");
-        ASSERT_MSG(vfp_area->Data() != nullptr &&
-                       (reinterpret_cast<uintptr_t>(vfp_area->Data()) & 0xFFFu) == 0,
-                   "the VFP thunk area's {} KiB", VfpAreaSize >> 10);
-    }
-    if (vfp_area_map != map.get()) {
-        ForgetVfpPatches(vfp_area_map); // another guest's
-        map->MapExtra(VfpAreaBase, VfpAreaSize, vfp_area->Data());
-        vfp_area_map = map.get();
-    }
-    if (vfp_area_used + VfpThunkMax > VfpAreaSize) {
+    const auto room = ThunkRoom(VfpThunkMax);
+    if (!room) {
         return false;
     }
-    const u32 base = VfpAreaBase + vfp_area_used;
+    const u32 base = *room;
 
     // The thunk goes to a buffer first: nothing changes unless every branch reaches.
     std::array<u8, VfpThunkMax> buf{};
@@ -1088,9 +1325,9 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
         site_word = *b;
     }
 
-    std::memcpy(vfp_area->Data() + vfp_area_used, buf.data(), size);
+    std::memcpy(thunk_area->Data() + thunk_area_used, buf.data(), size);
     map->SyncCode(base, size);
-    vfp_area_used += (size + 3) & ~3u;
+    thunk_area_used += (size + 3) & ~3u;
     vfp_thunks[base] = t;
     if (thumb) {
         memory.Write16(pc, site_hw[0]);
@@ -1098,13 +1335,377 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
     } else {
         memory.Write32(pc, site_word);
     }
-    vfp_patched[pc] = VfpSite{insn, thumb};
+    patched_sites[pc] = PatchedSite{insn, thumb};
     return true;
 }
 
+std::optional<u32> ARM_VitaNative::ThunkRoom(u32 size) {
+    if (!thunk_area) {
+        thunk_area = std::make_unique<Common::HostSharedMemory>(ThunkAreaSize, "azahar-thunks");
+        ASSERT_MSG(thunk_area->Data() != nullptr &&
+                       (reinterpret_cast<uintptr_t>(thunk_area->Data()) & 0xFFFu) == 0,
+                   "the thunk area's {} KiB", ThunkAreaSize >> 10);
+    }
+    if (thunk_area_map != map.get()) {
+        ForgetThunks(thunk_area_map); // another guest's
+        map->MapExtra(ThunkAreaBase, ThunkAreaSize, thunk_area->Data());
+        thunk_area_map = map.get();
+    }
+    if (thunk_area_used + size > ThunkAreaSize) {
+        return std::nullopt;
+    }
+    return ThunkAreaBase + thunk_area_used;
+}
+
+void ARM_VitaNative::PatchSvc(u32 pc) {
+    if (InThunkArea(pc) || svc_refused.contains(pc) || patched_sites.contains(pc)) {
+        return;
+    }
+    const u32 insn = memory.Read32(pc);
+    const u32 cond = insn >> 28;
+    const u32 number = insn & 0x00FFFFFFu;
+    // The svc and what answers it: the handle it must name (register, value; none for the
+    // clock) and the AzaharUserPage bit that says the page holds the answer.
+    u32 kind;
+    switch (number) {
+    case 0x28:
+        kind = AZAHAR_FAST_TICK;
+        break;
+    case 0x37:
+        kind = AZAHAR_FAST_THREAD_ID;
+        break;
+    case 0x35:
+        kind = AZAHAR_FAST_PROCESS_ID;
+        break;
+    case 0x52:
+    case 0x53:
+    case 0x54:
+        kind = AZAHAR_FAST_CACHE;
+        break;
+    default:
+        kind = AZAHAR_FAST_KINDS;
+        break;
+    }
+    if ((insn & 0x0F000000u) != 0x0F000000u || cond == 0xF || kind == AZAHAR_FAST_KINDS) {
+        svc_refused.insert(pc);
+        return;
+    }
+    const auto room = ThunkRoom(SvcThunkMax);
+    if (!room) {
+        svc_refused.insert(pc);
+        return;
+    }
+    const u32 base = *room;
+
+    std::array<u32, SvcThunkMax / 4> buf{};
+    u32 n = 0;
+    const auto at = [&] { return base + n * 4; };
+    const auto put = [&](u32 w) {
+        ASSERT(n < buf.size());
+        buf[n++] = w;
+    };
+    // ARM encodings, unconditional.
+    const auto movw = [](u32 rd, u32 v) {
+        return 0xE3000000u | (v >> 12 & 0xF) << 16 | rd << 12 | (v & 0xFFF);
+    };
+    const auto movt = [](u32 rd, u32 v) {
+        return 0xE3400000u | (v >> 28 & 0xF) << 16 | rd << 12 | (v >> 16 & 0xFFF);
+    };
+    const auto ldr = [](u32 rt, u32 rn, s32 off) {
+        return (off < 0 ? 0xE5100000u : 0xE5900000u) | rn << 16 | rt << 12 |
+               static_cast<u32>(off < 0 ? -off : off);
+    };
+    const auto cmp = [](u32 rn, u32 rm) { return 0xE1500000u | rn << 16 | rm; };
+    const auto tst = [](u32 rn, u32 imm8) { return 0xE3100000u | rn << 16 | imm8; };
+    const auto umull = [](u32 lo, u32 hi, u32 rn, u32 rm) {
+        return 0xE0800090u | hi << 16 | lo << 12 | rm << 8 | rn;
+    };
+    const auto adds = [](u32 rd, u32 rn, u32 rm) { return 0xE0900000u | rn << 16 | rd << 12 | rm; };
+    std::vector<std::pair<u32, u32>> to_miss; // (word, condition)
+    const auto branch_miss = [&](u32 c) {
+        to_miss.emplace_back(n, c);
+        put(0);
+    };
+    constexpr u32 EQ = 0x0, NE = 0x1;
+    const auto page = [&] {
+        put(movw(12, AZAHAR_USER_PAGE_VA & 0xFFFF));
+        put(movt(12, AZAHAR_USER_PAGE_VA));
+    };
+    // r3 = the page's answers; the miss unless this one's bit is set.
+    const auto answers = [&] {
+        put(ldr(3, 12, offsetof(AzaharUserPage, on)));
+        put(tst(3, 1u << kind));
+        branch_miss(EQ);
+    };
+    // The miss unless register `reg` names `value` (r12 holds it).
+    const auto handle = [&](u32 reg, u32 value) {
+        put(movw(12, value & 0xFFFF));
+        put(movt(12, value));
+        put(cmp(reg, 12));
+        branch_miss(NE);
+    };
+
+    SvcThunk t{};
+    t.site = pc;
+    put(0xE92D500Cu); // push {r2, r3, r12, lr}
+    t.mrs = at();
+    put(0xE10FE000u); // mrs lr, apsr
+    switch (kind) {
+    case AZAHAR_FAST_TICK: {
+        // r1:r0 = base + (quantum - counter) * mult, the counter read between two reads of the
+        // same gen (r2): azahar_svc_fast's computation.
+        page();
+        const u32 loop = at();
+        put(ldr(2, 12, offsetof(AzaharUserPage, gen)));
+        answers();
+        put(ldr(3, 12,
+                static_cast<s32>(AZAHAR_USER_TIMER_VA + 0x604) -
+                    static_cast<s32>(AZAHAR_USER_PAGE_VA)));
+        put(ldr(0, 12, offsetof(AzaharUserPage, quantum)));
+        put(0xE0403003u); // sub r3, r0, r3: the timer ticks spent
+        put(ldr(0, 12, offsetof(AzaharUserPage, mult_frac)));
+        put(umull(0, 1, 3, 0)); // r1 = spent * frac >> 32
+        put(ldr(0, 12, offsetof(AzaharUserPage, mult_int)));
+        put(umull(0, 3, 3, 0)); // r3:r0 = spent * int
+        put(adds(0, 0, 1));
+        put(0xE2A33000u); // adc r3, r3, #0
+        put(ldr(1, 12, offsetof(AzaharUserPage, base_lo)));
+        put(adds(0, 0, 1));
+        put(ldr(1, 12, offsetof(AzaharUserPage, base_hi)));
+        put(0xE0A31001u); // adc r1, r3, r1
+        put(ldr(3, 12, offsetof(AzaharUserPage, gen)));
+        put(cmp(3, 2));
+        const auto again = ArmBranch(NE, at(), loop);
+        ASSERT(again.has_value());
+        put(*again);
+        t.answered = at();
+        break;
+    }
+    case AZAHAR_FAST_THREAD_ID:
+    case AZAHAR_FAST_PROCESS_ID:
+        // r0 = 0, r1 = the ID, for the current thread (0xFFFF8000) or process (0xFFFF8001).
+        handle(1, kind == AZAHAR_FAST_THREAD_ID ? 0xFFFF8000u : 0xFFFF8001u);
+        page();
+        answers();
+        put(0xE3A00000u); // mov r0, #0
+        put(ldr(1, 12,
+                kind == AZAHAR_FAST_THREAD_ID ? offsetof(AzaharUserPage, thread_id)
+                                              : offsetof(AzaharUserPage, process_id)));
+        t.answered = at();
+        break;
+    default:
+        // The process data cache svcs on the current process (r0 0xFFFF8001): success.
+        handle(0, 0xFFFF8001u);
+        page();
+        answers();
+        put(0xE3A00000u); // mov r0, #0
+        t.answered = at();
+        break;
+    }
+    // msr apsr_nzcvq, lr; pop {r2, r3, r12, lr}; b back
+    t.done = at();
+    put(0xE128F00Eu);
+    t.pop = at();
+    put(0xE8BD500Cu);
+    const auto put_back = [&] {
+        const auto b = ArmBranch(0xE, at(), pc + 4);
+        if (b) {
+            put(*b);
+        }
+        return b.has_value();
+    };
+    t.back = at();
+    if (!put_back()) {
+        svc_refused.insert(pc);
+        return;
+    }
+    // miss: msr apsr_nzcvq, lr; pop {r2, r3, r12, lr}; the svc, its inputs untouched; b back
+    t.miss = at();
+    put(0xE128F00Eu);
+    t.miss_pop = at();
+    put(0xE8BD500Cu);
+    t.miss_svc = at();
+    put(0xEF000000u | number);
+    t.miss_back = at();
+    put_back();
+    t.end = at();
+    for (const auto& [word, c] : to_miss) {
+        const auto b = ArmBranch(c, base + word * 4, t.miss);
+        ASSERT(b.has_value());
+        buf[word] = *b;
+    }
+    const auto site = ArmBranch(cond, pc, base);
+    if (!site) {
+        svc_refused.insert(pc);
+        return;
+    }
+
+    std::memcpy(thunk_area->Data() + thunk_area_used, buf.data(), n * 4);
+    map->SyncCode(base, n * 4);
+    thunk_area_used += n * 4;
+    svc_thunks[base] = t;
+    memory.Write32(pc, *site);
+    map->SyncCode(pc, 4);
+    patched_sites[pc] = PatchedSite{insn, false};
+#ifdef VITA_DIAGNOSTICS
+    census.svc_thunks++;
+#endif
+}
+
+void ARM_VitaNative::PatchUpcall(u32 pc) {
+    if (InThunkArea(pc) || patched_sites.contains(pc) || svc_refused.contains(pc)) {
+        return;
+    }
+    const u32 insn = memory.Read32(pc);
+    const u32 cond = insn >> 28;
+    if ((insn & 0x0F000000u) != 0x0F000000u || cond == 0xF) {
+        return;
+    }
+    const u32 number = insn & 0x00FFFFFFu;
+    if (number >= upcall_table.size()) {
+        svc_refused.insert(pc);
+        return;
+    }
+    const UpcallFn fn = upcall_table[number];
+    constexpr u32 UpcallThunkMax = 160;
+    const auto room = ThunkRoom(UpcallThunkMax);
+    if (!room) {
+        svc_refused.insert(pc);
+        return;
+    }
+    const u32 base = *room;
+    std::array<u32, UpcallThunkMax / 4> buf{};
+    u32 n = 0;
+    const auto at = [&] { return base + n * 4; };
+    const auto put = [&](u32 w) {
+        ASSERT(n < buf.size());
+        buf[n++] = w;
+    };
+    const auto movw = [](u32 rd, u32 v) {
+        return 0xE3000000u | (v >> 12 & 0xF) << 16 | rd << 12 | (v & 0xFFF);
+    };
+    const auto movt = [](u32 rd, u32 v) {
+        return 0xE3400000u | (v >> 28 & 0xF) << 16 | rd << 12 | (v >> 16 & 0xFFF);
+    };
+    const u32 top =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(upcall_stack.data() + upcall_stack.size()));
+    const u32 target = static_cast<u32>(reinterpret_cast<uintptr_t>(fn));
+    put(0xE92D500Fu); // push {r0-r3, r12, lr}: the guest's stack
+    put(0xE10FC000u); // mrs r12, apsr
+    put(0xE52DC004u); // push {r12}
+    put(movw(14, top));
+    put(movt(14, top));
+    put(0xE52ED008u); // str sp, [lr, #-8]!: the guest's SP at the app stack's top
+    put(0xE1A0D00Eu); // mov sp, lr
+    put(0xE92D00F0u); // push {r4-r7}: an svc's fifth to eighth inputs, the C++'s stack arguments
+    put(movw(12, target));
+    put(movt(12, target));
+    put(0xE12FFF3Cu); // blx r12: the arguments in r0-r7; r0 the result, r1 UpcallStatus
+    put(0xE59DD010u); // ldr sp, [sp, #16]
+    put(0xE3510001u); // cmp r1, #1
+    put(0xE49DC004u); // pop {r12}: the guest's flags
+    const u32 to_busy = n;
+    put(0); // bhi busy
+    const u32 to_reschedule = n;
+    put(0); // beq reschedule
+    UpcallThunk t{};
+    t.site = pc;
+    std::array<u32, 2> backs{};
+    // done: the result over the guest's r0; msr apsr_nzcvq, r12; pop {r0-r3, r12, lr}; b back
+    put(0xE58D0000u);
+    put(0xE128F00Cu);
+    put(0xE8BD500Fu);
+    backs[0] = n;
+    put(0);
+    // reschedule: the same, then svc UpcallRescheduleSvc
+    const u32 reschedule = at();
+    put(0xE58D0000u);
+    put(0xE128F00Cu);
+    put(0xE8BD500Fu);
+    t.svc_reschedule = at();
+    put(0xEF000000u | UpcallRescheduleSvc);
+    backs[1] = n;
+    put(0);
+    // busy: msr apsr_nzcvq, r12; pop {r0-r3, r12, lr}; the original svc; b back
+    const u32 busy = at();
+    put(0xE128F00Cu);
+    put(0xE8BD500Fu);
+    t.svc_original = at();
+    put(0xEF000000u | number);
+    const u32 last_back = n;
+    put(0);
+    t.end = at();
+    for (const u32 word : {backs[0], backs[1], last_back}) {
+        const auto b = ArmBranch(0xE, base + word * 4, pc + 4);
+        if (!b) {
+            svc_refused.insert(pc);
+            return;
+        }
+        buf[word] = *b;
+    }
+    const auto b_busy = ArmBranch(0x8, base + to_busy * 4, busy);                // HI
+    const auto b_resched = ArmBranch(0x0, base + to_reschedule * 4, reschedule); // EQ
+    const auto site = ArmBranch(cond, pc, base);
+    if (!b_busy || !b_resched || !site) {
+        svc_refused.insert(pc);
+        return;
+    }
+    buf[to_busy] = *b_busy;
+    buf[to_reschedule] = *b_resched;
+    std::memcpy(thunk_area->Data() + thunk_area_used, buf.data(), n * 4);
+    map->SyncCode(base, n * 4);
+    thunk_area_used += n * 4;
+    upcall_thunks[base] = t;
+    memory.Write32(pc, *site);
+    map->SyncCode(pc, 4);
+    patched_sites[pc] = PatchedSite{insn, false};
+    LOG_INFO(Core_ARM11, "upcall: svc {:#x} at {:08X} -> thunk {:08X}, C++ {:08X}, stack {:08X}",
+             insn & 0x00FFFFFFu, pc, base, target, top);
+#ifdef VITA_DIAGNOSTICS
+    census.upcall_sites++;
+#endif
+}
+
+u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
+    ARM_VitaNative& core = *upcall_core;
+#ifdef VITA_DIAGNOSTICS
+    census.upcall_runs++;
+    census.upcall_svcs[svc & 0xff]++;
+#endif
+    // The svc's register file for the HLE kernel's handler (SVC::GetReg reads the running
+    // core's): r0-r7 as they came, r12 and LR from the thunk's frame, SP the guest's at the svc.
+    u32* const frame = UpcallGuestRegs();
+    for (u32 i = 0; i < in.size(); i++) {
+        core.context.r[i] = in[i];
+    }
+    core.context.r[12] = frame[4];
+    core.context.r[13] = static_cast<u32>(reinterpret_cast<uintptr_t>(frame + 6));
+    core.context.r[14] = frame[5];
+    auto& kernel = upcall_system->Kernel();
+    const Kernel::Thread* const thread = kernel.GetCurrentThreadManager().GetCurrentThread();
+    upcall_reschedule_asked.store(false, std::memory_order_relaxed);
+    core.svc_context.CallSVCForUpcall(svc);
+    // The outputs: r0 as the result, r1-r3 into the frame the thunk's tail pops. The thunk keeps
+    // r4-r7 (callee-saved), so an svc must not write them.
+    for (u32 i = 1; i < 4; i++) {
+        frame[i] = core.context.r[i];
+    }
+    for (u32 i = 4; i < in.size(); i++) {
+        DEBUG_ASSERT_MSG(core.context.r[i] == in[i], "upcall: svc {:#x} wrote r{}", svc, i);
+    }
+    // The thread stopped running, or one more urgent may run: the scheduler's, after an exit.
+    const bool reschedule = upcall_reschedule_asked.load(std::memory_order_relaxed) ||
+                            thread == nullptr || thread->status != Kernel::ThreadStatus::Running ||
+                            kernel.GetCurrentThreadManager().GetCurrentThread() != thread;
+#ifdef VITA_DIAGNOSTICS
+    census.upcall_reschedules += reschedule;
+#endif
+    return UpcallAnswer(core.context.r[0], reschedule ? UpcallReschedule : UpcallDone);
+}
+
 u32 ARM_VitaNative::FetchCode(u32 pc, bool thumb) const {
-    if (InVfpArea(pc) && vfp_area) {
-        const u8* const p = vfp_area->Data() + (pc - VfpAreaBase);
+    if (InThunkArea(pc) && thunk_area) {
+        const u8* const p = thunk_area->Data() + (pc - ThunkAreaBase);
         if (thumb) {
             u16 hw[2];
             std::memcpy(hw, p, 4);
@@ -1118,21 +1719,21 @@ u32 ARM_VitaNative::FetchCode(u32 pc, bool thumb) const {
 }
 
 void ARM_VitaNative::PrepareSaveState() {
-    if (vfp_patched.empty()) {
+    if (patched_sites.empty()) {
         return;
     }
     // Every thread that stands in a thunk leaves it (FinishVfpThunk): each core's running one,
     // through the core, and every other one through its saved context.
     for (u32 i = 0; i < system.GetNumCores(); i++) {
         ARM_Interface& core = system.GetCore(i);
-        if (!InVfpArea(core.GetPC())) {
+        if (!InThunkArea(core.GetPC())) {
             continue;
         }
         ThreadContext t;
         core.SaveContext(t);
         AzaharContext c{};
         ToAzahar(t, c);
-        FinishVfpThunk(memory, c);
+        FinishThunk(memory, c);
         FromAzahar(c, t);
         core.LoadContext(t);
     }
@@ -1141,17 +1742,17 @@ void ARM_VitaNative::PrepareSaveState() {
         auto& manager = kernel.GetThreadManager(i);
         const Kernel::Thread* const running = manager.GetCurrentThread();
         for (const auto& thread : manager.GetThreadList()) {
-            if (thread.get() == running || !InVfpArea(thread->context.cpu_registers[15] & ~1u)) {
+            if (thread.get() == running || !InThunkArea(thread->context.cpu_registers[15] & ~1u)) {
                 continue;
             }
             AzaharContext c{};
             ToAzahar(thread->context, c);
-            FinishVfpThunk(memory, c);
+            FinishThunk(memory, c);
             FromAzahar(c, thread->context);
         }
     }
     // The guest's own instructions back; each traps and is patched again at its next run.
-    for (const auto& [pc, site] : vfp_patched) {
+    for (const auto& [pc, site] : patched_sites) {
         if (site.thumb) {
             memory.Write16(pc, static_cast<u16>(site.insn >> 16));
             memory.Write16(pc + 2, static_cast<u16>(site.insn));
@@ -1160,14 +1761,31 @@ void ARM_VitaNative::PrepareSaveState() {
         }
         map->SyncCode(pc, 4);
     }
-    LOG_INFO(Core_ARM11, "VFP: {} patched sites restored for the savestate ({} thunks)",
-             vfp_patched.size(), vfp_thunks.size());
-    vfp_patched.clear();
+    LOG_INFO(Core_ARM11,
+             "thunks: {} patched sites restored for the savestate ({} VFP thunks, {} svc thunks)",
+             patched_sites.size(), vfp_thunks.size(), svc_thunks.size());
+    patched_sites.clear();
     vfp_thunks.clear();
-    vfp_area_used = 0;
+    svc_thunks.clear();
+    svc_refused.clear();
+    upcall_thunks.clear();
+    thunk_area_used = 0;
 }
 
 bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
+    // A slice that ended inside an upcall runs the same thread on at once, a minimal quantum at a
+    // time, until it is back in its own code (RunSliceOnce sets upcall_again).
+    for (;;) {
+        upcall_again = false;
+        const bool go_on = RunSliceOnce(quantum_ns);
+        if (!upcall_again) {
+            return go_on;
+        }
+        quantum_ns = MinQuantumNs;
+    }
+}
+
+bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
     if (!usable) [[unlikely]] {
         system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
                          "Vita native backend is not usable");
@@ -1215,21 +1833,34 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     run.sched_deadline = 0;
     run.sched_arbiter = 0;
     bool scheduled = false;
+    int current_before = -1;
     const auto* const running = kernel.GetCurrentThreadManager().GetCurrentThread();
-    if (in_kernel_scheduling && timer->GetClockScale() == 1.0 && running != nullptr &&
-        sched_sleepers.contains(running->thread_id)) {
+    if (!UpcallsOn() && timer->GetClockScale() == 1.0 &&
+        running != nullptr && sched_waiters.contains(running->thread_id)) {
         auto& threads = kernel.GetCurrentThreadManager();
-        const int current = threads.ExportNativeSchedule(sched_before, AZAHAR_SCHED_MAX);
+        // The DSP's interrupt wakes the guest's event waiters from its own thread, under the HLE
+        // lock: the ready queue and the threads' states are read here, and rewritten at the
+        // import, under it too.
+        std::scoped_lock hle_lock{kernel.GetHLELock()};
+        sched_arbiter = sched_arbiter_handle != 0
+                            ? kernel.GetCurrentProcess()->handle_table.Get<Kernel::AddressArbiter>(
+                                  sched_arbiter_handle)
+                            : nullptr;
+        const int current =
+            threads.ExportNativeSchedule(sched_before, AZAHAR_SCHED_MAX, sched_arbiter.get());
         if (current >= 0) {
             const s64 base = static_cast<s64>(run.tick_base);
             const auto* const wakeup = threads.WakeupEventType();
             const s64 deadline = timer->NextEventTime(
                 base + Timing::MAX_SLICE_LENGTH, [&](const TimingEventType* type, uintptr_t id) {
-                    return type == wakeup && std::any_of(sched_before.begin(), sched_before.end(),
-                                                         [&](const auto& e) {
-                                                             return e.state == AZAHAR_SCHED_SLEEP &&
-                                                                    e.thread->thread_id == id;
-                                                         });
+                    // The sleepers' and the timed arbitration waits' wakes are the module's.
+                    return type == wakeup &&
+                           std::any_of(
+                               sched_before.begin(), sched_before.end(), [&](const auto& e) {
+                                   return (e.state == AZAHAR_SCHED_SLEEP ||
+                                           (e.state == AZAHAR_SCHED_ARB && e.wake != ~0ull)) &&
+                                          e.thread->thread_id == id;
+                               });
                 });
             if (deadline > base) {
                 for (std::size_t i = 0; i < sched_before.size(); i++) {
@@ -1242,7 +1873,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                                                        e.thread->GetTLSAddress(),
                                                        0,
                                                        AsAzahar(e.thread->context),
-                                                       0};
+                                                       e.address};
                     // The module loads it as it is (a thread that never ran has its entry's
                     // Thumb bit in the PC).
                     e.thread->context.cpu_registers[15] &= ~1u;
@@ -1251,11 +1882,14 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                 run.sched_count = static_cast<u32>(sched_before.size());
                 run.sched_current = current;
                 run.sched_deadline = static_cast<u64>(deadline);
+                run.sched_arbiter = sched_arbiter ? sched_arbiter_handle : 0;
+                current_before = current;
                 scheduled = true;
             }
         }
     }
 
+    upcall_core = this;
     const int ret = azaharRun(&run);
     if (ret < 0) {
         system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
@@ -1265,6 +1899,71 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     }
 
     cp15[CP15_THREAD_UPRW] = run.ctx.tpidrurw;
+    if (run.fast_site != 0) {
+        PatchSvc(run.fast_site - 4);
+    }
+    if (UpcallsOn() && InUpcall(context.r[15]) &&
+        !(run.reason == AZAHAR_EXIT_SVC && IsUpcallTailSvc(context.r[15] - 4))) {
+        // The words on the upcall stack that point into the app's code (0x81000000 up), deepest
+        // first: the C++ path's return addresses, for addr2line on the run's ELF.
+        const auto returns = [&] {
+            std::string list;
+            const u32 stack_lo = static_cast<u32>(reinterpret_cast<uintptr_t>(upcall_stack.data()));
+            const u32 stack_hi = stack_lo + static_cast<u32>(upcall_stack.size());
+            if (context.r[13] >= stack_lo && context.r[13] < stack_hi) {
+                for (u32 a = context.r[13] & ~3u; a < stack_hi && list.size() < 400; a += 4) {
+                    u32 w;
+                    std::memcpy(&w, upcall_stack.data() + (a - stack_lo), 4);
+                    if (w >= 0x81000000u && w < 0x82000000u) {
+                        list += fmt::format(" {:08X}", w);
+                    }
+                }
+            }
+            return list;
+        };
+        // A Sony syscall from the app's code in the guest's world: made in Sony's, then the same
+        // thread on. Each is logged before and after: one that never answers is the last line.
+        if (run.reason == AZAHAR_EXIT_SVC && run.svc_number == 0 && context.r[15] >= 0x40000000u) {
+            const u32 number = context.r[12];
+            LOG_INFO(Core_ARM11, "upcall: Sony syscall {:#x} from {:08X} (lr {:08X}); path:{}",
+                     number, context.r[15], context.r[14], returns());
+            ForwardSonySyscall(run.ctx);
+            LOG_INFO(Core_ARM11, "upcall: Sony syscall {:#x} answered {:08X}", number,
+                     context.r[0]);
+            timer->AddScaledTicks(run.guest_ticks);
+#ifdef VITA_DIAGNOSTICS
+            census.upcall_syscalls++;
+#endif
+            upcall_again = true;
+            return true;
+        }
+        // The experiment's observation: anything but a quantum's end inside an upcall.
+        if (run.reason != AZAHAR_EXIT_TIMER) {
+            ASSERT_MSG(false,
+                       "upcall: {} at {:08X} (svc {:#x}, lr {:08X}, sp {:08X}, fsr {:08X}, far "
+                       "{:08X}); app code on the upcall stack:{}",
+                       ReasonName(run.reason), context.r[15], run.svc_number, context.r[14],
+                       context.r[13], run.fsr, run.far, returns());
+        }
+        // An upcall that does not come back (a spin on a lock another thread holds) runs one
+        // quantum after another: logged at a quarter second, stopped at five.
+        upcall_quantums++;
+        if (upcall_quantums == 1000) {
+            LOG_WARNING(Core_ARM11, "upcall: 1000 quantums in one, pc {:08X} lr {:08X}; path:{}",
+                        context.r[15], context.r[14], returns());
+        }
+        ASSERT_MSG(upcall_quantums < 20000,
+                   "upcall: 20000 quantums in one, pc {:08X} lr {:08X}; app code on the upcall "
+                   "stack:{}",
+                   context.r[15], context.r[14], returns());
+        timer->AddScaledTicks(run.guest_ticks);
+#ifdef VITA_DIAGNOSTICS
+        census.upcall_preempted++;
+#endif
+        upcall_again = true; // the same thread on, until it is back in its own code
+        return true;
+    }
+    upcall_quantums = 0;
     // The guest ticks the module counted, converted as its GetSystemTick answers were: the clock ends
     // at or past every value the guest read in the slice.
     timer->AddScaledTicks(run.guest_ticks);
@@ -1279,21 +1978,44 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
             sched_after[i].state = t.state;
             sched_after[i].order = t.order;
             sched_after[i].wake = t.wake;
+            sched_after[i].address = t.address;
             if (t.saved) {
-                // A thread the module put to sleep slept at its last stop.
-                if (t.state == AZAHAR_SCHED_SLEEP) {
-                    sched_sleepers.insert(t.id);
+                // A thread the module put to sleep, or to wait at the arbiter, stopped there.
+                if (t.state == AZAHAR_SCHED_SLEEP || t.state == AZAHAR_SCHED_ARB) {
+                    sched_waiters.insert(t.id);
                 }
             }
         }
         cp15[CP15_THREAD_URO] = run.ctx.tpidruro;
-        kernel.GetCurrentThreadManager().ImportNativeSchedule(sched_before, sched_after,
-                                                              run.sched_current, timer->GetTicks());
+#ifdef VITA_DIAGNOSTICS
+        static const bool trace_arb = SgxdRenderer::SgxdFlag("perflog");
+        if (trace_arb && run.sched_arbitrations != 0 && census.arb_traces.size() < 16) {
+            std::string trace = fmt::format(
+                "arbiter {:#x}, current {} -> {}, exit {} svc {:#x}:", run.sched_arbiter,
+                current_before, run.sched_current, ReasonName(run.reason), run.svc_number);
+            for (std::size_t i = 0; i < sched_before.size(); i++) {
+                const auto& b = sched_before[i];
+                const auto& a = sched_after[i];
+                trace += fmt::format(" [{} {}->{} {:08x}->{:08x} o{}->{} w{:x}->{:x} r0 {:08x}]",
+                                     b.thread->thread_id, b.state, a.state, b.address, a.address,
+                                     b.order, a.order, b.wake, a.wake,
+                                     b.thread->context.cpu_registers[0]);
+            }
+            census.arb_traces.push_back(std::move(trace));
+        }
+#endif
+        {
+            std::scoped_lock hle_lock{kernel.GetHLELock()};
+            kernel.GetCurrentThreadManager().ImportNativeSchedule(
+                sched_before, sched_after, run.sched_current, timer->GetTicks(),
+                sched_arbiter.get());
+        }
 #ifdef VITA_DIAGNOSTICS
         census.sched_slices++;
         census.sched_switches += run.sched_switches;
         census.sched_sleeps += run.sched_sleeps;
         census.sched_idle += run.sched_idle;
+        census.sched_arbitrations += run.sched_arbitrations;
 #endif
         if (run.sched_current < 0) {
             return false;
@@ -1316,33 +2038,44 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     }
 #endif
 
-    // Whether this thread's slices carry the table from now on: a SleepThread exit says yes,
-    // any other svc exit no.
+    // Whether this thread's slices carry the table from now on: a SleepThread or ArbitrateAddress
+    // exit says yes (the latter's arbiter the one the module answers), any other svc exit no.
     if (run.reason == AZAHAR_EXIT_SVC) {
         if (const auto* const t = kernel.GetCurrentThreadManager().GetCurrentThread()) {
-            if (run.svc_number == 0x0A) {
-                sched_sleepers.insert(t->thread_id);
+            if (run.svc_number == 0x0A || run.svc_number == 0x22) {
+                sched_waiters.insert(t->thread_id);
             } else {
-                sched_sleepers.erase(t->thread_id);
+                sched_waiters.erase(t->thread_id);
+            }
+            if (run.svc_number == 0x22) {
+                sched_arbiter_handle = run.ctx.r[0];
             }
         }
     }
 
     switch (run.reason) {
     case AZAHAR_EXIT_SVC:
+        // An upcall asked for a reschedule: this exit is for it alone.
+        if (run.svc_number == UpcallRescheduleSvc && UpcallsOn() &&
+            IsUpcallTailSvc(context.r[15] - 4)) {
+            return false;
+        }
         // A patched VFP instruction the module did not run: run here. One with no record is from a
         // savestate made before the restore at each save, and is lost.
         if (run.svc_number == AZAHAR_VFP_SVC) {
             const bool thumb = run.ctx.cpsr >> 5 & 1;
             const u32 site = run.ctx.r[15] - (thumb ? 2u : 4u);
-            const auto it = vfp_patched.find(site);
-            ASSERT_MSG(it != vfp_patched.end(),
+            const auto it = patched_sites.find(site);
+            ASSERT_MSG(it != patched_sites.end(),
                        "svc {:#x} at {:08X} with no patched VFP instruction behind it (a savestate "
                        "from a build that saved the module's svcs)",
                        AZAHAR_VFP_SVC, site);
             [[maybe_unused]] const bool ran = RunVfpVector(run.ctx, it->second.insn);
             DEBUG_ASSERT_MSG(ran, "a patched VFP instruction at {:08X} did not run", it->first);
             return !break_flag && !stop_requested;
+        }
+        if (UpcallFor(run.svc_number) && (context.cpsr & 0x20) == 0) {
+            PatchUpcall(context.r[15] - 4);
         }
         svc_context.CallSVC(run.svc_number);
         // An svc can reschedule, which replaces the register file wholesale.
@@ -1407,41 +2140,6 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
 }
 
 #ifdef VITA_DIAGNOSTICS
-void ARM_VitaNative::CountArbitration() {
-    // ArbitrateAddress(handle r0, address r1, type r2, value r3, ns r4:r5): would it wake a thread or
-    // block this one?
-    const VAddr address = run.ctx.r[1];
-    const u32 type = run.ctx.r[2];
-    const s32 value = static_cast<s32>(run.ctx.r[3]);
-    auto& kernel = system.Kernel();
-    switch (type) {
-    case 0: { // Signal
-        bool waiter = false;
-        for (u32 core = 0; core < system.GetNumCores() && !waiter; core++) {
-            for (const auto& thread : kernel.GetThreadManager(core).GetThreadList()) {
-                if (thread->status == Kernel::ThreadStatus::WaitArb &&
-                    thread->wait_address == address) {
-                    waiter = true;
-                    break;
-                }
-            }
-        }
-        (waiter ? census.arb_signal_wake : census.arb_signal_idle)++;
-        break;
-    }
-    case 1: // WaitIfLessThan
-    case 2: // DecrementAndWaitIfLessThan
-    case 3: // WaitIfLessThanWithTimeout
-    case 4: // DecrementAndWaitIfLessThanWithTimeout
-        (static_cast<s32>(memory.Read32(address)) < value ? census.arb_wait_block
-                                                          : census.arb_wait_pass)++;
-        break;
-    default:
-        census.arb_other++;
-        break;
-    }
-}
-
 VitaNativeCensus TakeVitaNativeCensus() {
     return std::exchange(census, VitaNativeCensus{});
 }
@@ -1683,9 +2381,10 @@ void ARM_VitaNative::LoadContext(const ThreadContext& ctx) {
 }
 
 void ARM_VitaNative::PrepareReschedule() {
-    // Called from the HLE side while the guest is stopped at an exit, or from another host thread
-    // while it runs. The former ends the slice loop; the latter is bounded by the quantum.
+    // From the HLE while the guest is stopped at an exit, or from another thread while it runs
+    // (bounded by the quantum). An upcall takes an exit for it.
     stop_requested = true;
+    upcall_reschedule_asked.store(true, std::memory_order_relaxed);
 }
 
 } // namespace Core

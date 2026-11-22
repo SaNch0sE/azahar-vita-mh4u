@@ -116,6 +116,20 @@ private:
     friend class boost::serialization::access;
 };
 
+// Below Callback's definition: the conversion to WakeupCallback needs it complete.
+void AddressArbiter::RemoveNativeWaiter(const Thread* thread) {
+    std::erase_if(waiting_threads, [thread](const auto& t) { return t.get() == thread; });
+}
+
+void AddressArbiter::AddNativeWaiter(std::shared_ptr<Thread> thread, VAddr address, bool timed) {
+    if (timed) {
+        thread->wakeup_callback = timeout_callback;
+    } else {
+        thread->wakeup_callback = nullptr;
+    }
+    WaitThread(std::move(thread), address);
+}
+
 void AddressArbiter::WakeUp(ThreadWakeupReason reason, std::shared_ptr<Thread> thread,
                             std::shared_ptr<WaitObject> object) {
     ASSERT(reason == ThreadWakeupReason::Timeout);

@@ -28,6 +28,7 @@
 
 namespace Kernel {
 
+class AddressArbiter;
 class Mutex;
 
 enum ThreadPriority : u32 {
@@ -207,23 +208,31 @@ public:
      */
     struct NativeSchedEntry {
         Thread* thread;
-        u32 state; ///< 1 ready, 2 asleep, 3 running (AZAHAR_SCHED_*)
-        s32 order; ///< ready: its place in its level, lower first
-        u64 wake;  ///< asleep: the tick its wakeup event is due at
+        u32 state; ///< 1 ready, 2 asleep, 3 running, 4 waiting at the arbiter, 5 another core's
+                   ///< thread waiting there, 6 that one woken (AZAHAR_SCHED_*)
+        s32 order; ///< ready: its place in its level; at the arbiter: in its list; lower first
+        u64 wake;  ///< asleep, or a timed wait at the arbiter: the tick its wakeup event is due
+                   ///< at (~0: none)
+        VAddr address = 0; ///< at the arbiter: the address it waits on
     };
     /**
-     * The running thread, the ready ones in their queue's order and the sleepers with a wakeup
-     * event; the running one's index, or -1 for a state the module does not take (nothing runs,
-     * a thread of another process or one that cannot be scheduled is ready, more than `max`).
+     * The running thread, the ready ones in their queue's order, the sleepers with a wakeup
+     * event and `arbiter`'s waiters in its list's order (none without one); the running one's
+     * index, or -1 for a state the module does not take (nothing runs, a thread of another
+     * process or one that cannot be scheduled is ready or waits at the arbiter, more than
+     * `max`).
      */
-    int ExportNativeSchedule(std::vector<NativeSchedEntry>& out, std::size_t max);
+    int ExportNativeSchedule(std::vector<NativeSchedEntry>& out, std::size_t max,
+                             const AddressArbiter* arbiter = nullptr);
     /**
      * The module's view taken back: `after` is `before` (ExportNativeSchedule's) with the states
      * the slice left, `current` the running index or -1. The contexts of the threads that stopped
-     * running are already in their Thread::context; `now` is the clock after the slice.
+     * running are already in their Thread::context; `now` is the clock after the slice. The
+     * waits the module ended leave `arbiter`'s list and the ones it began join it, in its order.
      */
     void ImportNativeSchedule(const std::vector<NativeSchedEntry>& before,
-                              const std::vector<NativeSchedEntry>& after, int current, u64 now);
+                              const std::vector<NativeSchedEntry>& after, int current, u64 now,
+                              AddressArbiter* arbiter = nullptr);
     [[nodiscard]] const Core::TimingEventType* WakeupEventType() const {
         return ThreadWakeupEventType;
     }

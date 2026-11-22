@@ -21,6 +21,9 @@ public:
     SVCContext(Core::System& system);
     ~SVCContext();
     void CallSVC(u32 immediate);
+    /// CallSVC without the perf stats' clock: the Vita native core's upcalls, which run the svc
+    /// in the guest's world, where reading the clock is a syscall.
+    void CallSVCForUpcall(u32 immediate);
 
 private:
     std::unique_ptr<SVC> impl;

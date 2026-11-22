@@ -20,6 +20,7 @@
 #ifdef ENABLE_GDBSTUB
 #include "core/gdbstub/gdbstub.h"
 #endif
+#include "core/hle/kernel/address_arbiter.h"
 #include "core/hle/kernel/errors.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/mutex.h"
@@ -508,7 +509,8 @@ std::shared_ptr<Thread> SetupMainThread(KernelSystem& kernel, u32 entry_point, u
     return thread;
 }
 
-int ThreadManager::ExportNativeSchedule(std::vector<NativeSchedEntry>& out, std::size_t max) {
+int ThreadManager::ExportNativeSchedule(std::vector<NativeSchedEntry>& out, std::size_t max,
+                                        const AddressArbiter* arbiter) {
     out.clear();
     Thread* const running = GetCurrentThread();
     if (running == nullptr || running->status != ThreadStatus::Running || !running->CanSchedule()) {
@@ -541,14 +543,36 @@ int ThreadManager::ExportNativeSchedule(std::vector<NativeSchedEntry>& out, std:
             out.push_back({t.get(), 2, 0, static_cast<u64>(wake)});
         }
     }
+    // The arbiter's waiters, every one of them: a signal in the module must see them all. The
+    // arbiter is the process's, and another emulated core's threads wait on it too: those are
+    // woken there but never run here (state 5), their timeouts on their own core's timer.
+    if (arbiter != nullptr) {
+        s32 index = 0;
+        for (const auto& t : arbiter->GetWaitingThreads()) {
+            if (t->status != ThreadStatus::WaitArb || t->owner_process.lock() != process) {
+                return -1;
+            }
+            if (t->core_id != core_id) {
+                out.push_back({t.get(), 5, index++, ~0ull, t->wait_address});
+                continue;
+            }
+            if (!t->CanSchedule()) {
+                return -1;
+            }
+            const s64 wake = timer.EventTime(ThreadWakeupEventType, t->thread_id);
+            out.push_back(
+                {t.get(), 4, index++, wake >= 0 ? static_cast<u64>(wake) : ~0ull, t->wait_address});
+        }
+    }
     return out.size() <= max ? 0 : -1;
 }
 
 void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& before,
                                          const std::vector<NativeSchedEntry>& after, int current,
-                                         u64 now) {
+                                         u64 now, AddressArbiter* arbiter) {
     Core::Timing& timing = kernel.timing;
     std::vector<const NativeSchedEntry*> ready;
+    std::vector<const NativeSchedEntry*> waits;
     for (std::size_t i = 0; i < after.size(); i++) {
         const NativeSchedEntry& was = before[i];
         const NativeSchedEntry& is = after[i];
@@ -559,6 +583,17 @@ void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& be
         const bool same_sleep = was.state == 2 && is.state == 2 && was.wake == is.wake;
         if (was.state == 2 && !same_sleep) {
             timing.UnscheduleEvent(ThreadWakeupEventType, t->thread_id);
+        }
+        // A wait at the arbiter the module left alone keeps its place (a new wait takes the
+        // list's next order); any other leaves the list and its timeout.
+        const bool same_wait = was.state == 4 && is.state == 4 && was.order == is.order;
+        if (was.state == 4 && !same_wait) {
+            ASSERT(arbiter != nullptr);
+            arbiter->RemoveNativeWaiter(t);
+            if (was.wake != ~0ull) {
+                timing.UnscheduleEvent(ThreadWakeupEventType, t->thread_id);
+            }
+            t->wakeup_callback = nullptr;
         }
         switch (is.state) {
         case 1:
@@ -571,6 +606,20 @@ void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& be
                 timing.ScheduleEvent(is.wake > now ? static_cast<s64>(is.wake - now) : 0,
                                      ThreadWakeupEventType, t->thread_id);
             }
+            break;
+        case 4:
+            if (!same_wait) {
+                waits.push_back(&is);
+            }
+            break;
+        case 5:
+            break; // another core's waiter the slice left waiting
+        case 6:
+            // Another core's waiter a signal here woke: ready on its own core, as
+            // AddressArbiter::ResumeSignaled leaves it (its context has the module's success).
+            ASSERT(arbiter != nullptr && was.state == 5);
+            arbiter->RemoveNativeWaiter(t);
+            t->ResumeFromWait();
             break;
         default:
             t->status = ThreadStatus::Running;
@@ -586,6 +635,19 @@ void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& be
     });
     for (const NativeSchedEntry* e : ready) {
         ready_queue.push_back(e->thread->current_priority, e->thread);
+    }
+    // The waits the module began, at the arbiter list's back in the order it began them.
+    std::sort(waits.begin(), waits.end(), [](const NativeSchedEntry* a, const NativeSchedEntry* b) {
+        return a->order < b->order;
+    });
+    for (const NativeSchedEntry* e : waits) {
+        ASSERT(arbiter != nullptr);
+        const bool timed = e->wake != ~0ull;
+        arbiter->AddNativeWaiter(SharedFrom(e->thread), e->address, timed);
+        if (timed) {
+            timing.ScheduleEvent(e->wake > now ? static_cast<s64>(e->wake - now) : 0,
+                                 ThreadWakeupEventType, e->thread->thread_id);
+        }
     }
     current_thread = current >= 0 ? SharedFrom(after[current].thread) : nullptr;
 }

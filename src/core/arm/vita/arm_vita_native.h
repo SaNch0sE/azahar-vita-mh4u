@@ -8,11 +8,12 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "core/arm/arm_interface.h"
 #include "azahar_native.h"
+#include "core/arm/arm_interface.h"
 #include "core/hle/kernel/svc.h"
 #include "core/memory.h"
 
@@ -126,16 +127,20 @@ struct VitaNativeCensus {
     /// VFP instructions run under short vectors, the exits that ran them, and the sites patched to a
     /// thunk or to the module's svc.
     u32 vfp_insns{}, vfp_exits{}, vfp_thunks{}, vfp_svcs{};
-    /// SleepThread exits by caller (return address, thread, last ns, count); past 16, `sleep_other`.
-    struct SleepCaller {
-        u32 lr{}, thread{}, count{};
-        s64 ns{};
-    };
-    std::array<SleepCaller, 16> sleeps{};
-    u32 sleep_other{};
+    u32 svc_thunks{};
+    u32 upcall_sites{}, upcall_runs{}, upcall_preempted{};
+    /// Upcalls that asked for a reschedule, and those that answered busy (none since the generic
+    /// upcall).
+    u32 upcall_reschedules{}, upcall_busy{};
+    u32 upcall_syscalls{};
     /// In-kernel scheduling: the slices that carried the thread table, and the module's
     /// switches, SleepThreads answered and idle stretches skipped in them.
     u32 sched_slices{}, sched_switches{}, sched_sleeps{}, sched_idle{};
+    /// ArbitrateAddresses the module answered (azaharnative 36).
+    u32 sched_arbitrations{};
+    /// With `perflog`: the last slices in which the module answered one, each table entry's
+    /// state, address, order, wake and r0 before and after (the module's transitions).
+    std::vector<std::string> arb_traces;
 };
 VitaNativeCensus TakeVitaNativeCensus();
 #endif
@@ -182,10 +187,13 @@ public:
     void SaveContext(ThreadContext& ctx) override;
     void LoadContext(const ThreadContext& ctx) override;
     void PrepareReschedule() override;
-    /// Puts back every VFP instruction PatchVfp replaced, after finishing or undoing the thunk
-    /// any thread stands in: the state holds the guest's own code, and each site is patched again
-    /// at its next trap.
+    /// Puts back every instruction PatchVfp and PatchSvc replaced, after every thread left its
+    /// thunk: the state holds the guest's own code.
     void PrepareSaveState() override;
+
+    /// An upcall: svc `svc` answered from the guest's world by the HLE handler with r0-r7 from `in`.
+    /// Returns the result (r0) and the thunk's UpcallStatus.
+    static u64 UpcallSvc(u32 svc, const std::array<u32, 8>& in);
 
     bool HasSingleInstructionBreakAccuracy() override {
         return false;
@@ -195,13 +203,23 @@ protected:
     std::shared_ptr<Memory::PageTable> GetPageTable() const override;
 
 private:
-    /// One trip into the guest. Returns false if the core should stop running for now.
+    /// One trip into the guest, or more while it stands inside an upcall. False if the core should
+    /// stop for now.
     bool RunSlice(u64 quantum_ns);
+    bool RunSliceOnce(u64 quantum_ns);
     void ReportFault();
     /// Patches a VFP instruction that trapped under the guest's LEN and STRIDE into a branch to a
     /// thunk, or out of reach into the module's svc.
     void PatchVfp(u32 pc, u32 insn, bool thumb);
     bool PatchVfpThunk(u32 pc, u32 insn, bool thumb);
+    /// `size` bytes free in the thunk area, mapped into this guest's table.
+    std::optional<u32> ThunkRoom(u32 size);
+    /// Patches an ARM svc the module answered in the vector into a branch to a thunk answering it
+    /// from the module's user pages.
+    void PatchSvc(u32 pc);
+    /// The upcall experiment: the ARM svc at `pc` (gxm_flags `upcall=N`'s) into a branch to a
+    /// thunk that calls the emulator's C++ for it in the guest's world (AZAHAR_SEAL=0 only).
+    void PatchUpcall(u32 pc);
     u32 FetchCode(u32 pc, bool thumb) const;
 
     Core::System& system;
@@ -216,6 +234,8 @@ private:
     std::array<u32, CP15_REGISTER_COUNT> cp15{};
     u32 fpexc{};
     std::atomic<bool> stop_requested{};
+    /// The slice ended inside an upcall: RunSlice runs the thread on.
+    bool upcall_again{};
     bool usable{};
 };
 

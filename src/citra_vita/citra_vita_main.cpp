@@ -636,34 +636,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     LOG_INFO(Frontend, "perf: svc exits: {}", svcs.empty() ? "none" : svcs);
                     LOG_INFO(Frontend,
                              "perf: in-kernel scheduling: {} slices with the thread table, {} "
-                             "switches, {} SleepThreads answered, {} idle stretches skipped",
-                             n.sched_slices, n.sched_switches, n.sched_sleeps, n.sched_idle);
-                    std::string sleeps;
-                    for (const auto& s : n.sleeps) {
-                        if (s.count != 0) {
-                            sleeps += fmt::format("{}{:08x} thread {} ({} ns) {}",
-                                                  sleeps.empty() ? "" : ", ", s.lr, s.thread, s.ns,
-                                                  s.count);
-                        }
+                             "switches, {} SleepThreads and {} ArbitrateAddresses answered, {} "
+                             "idle stretches skipped",
+                             n.sched_slices, n.sched_switches, n.sched_sleeps, n.sched_arbitrations,
+                             n.sched_idle);
+                    for (const auto& trace : n.arb_traces) {
+                        LOG_INFO(Frontend, "perf: in-kernel arbitration: {}", trace);
                     }
-                    if (!sleeps.empty()) {
-                        LOG_INFO(Frontend, "perf: SleepThread exits by caller: {}; {} more", sleeps,
-                                 n.sleep_other);
-                    }
-                    LOG_INFO(Frontend,
-                             "perf: ArbitrateAddress exits: signal {} with no waiter, {} waking; "
-                             "wait {} passing, {} blocking; {} other",
-                             n.arb_signal_idle, n.arb_signal_wake, n.arb_wait_pass,
-                             n.arb_wait_block, n.arb_other);
-                    // The GPU's operations in the second (ms): the emulation side's parse and
-                    // queueing by kind, then the render thread's work.
-                    const auto r = system.GPU().TakeOpStats();
-                    LOG_INFO(Frontend,
-                             "perf: queued cmdlist {:.1f} ms in {}, regwrite {:.1f} ms in {}, "
-                             "fill {:.1f} ms in {}, transfer {:.1f} ms in {}, dma {:.1f} ms in {}",
-                             r.kind_us[0] / 1e3, r.kind_ops[0], r.kind_us[1] / 1e3, r.kind_ops[1],
-                             r.kind_us[2] / 1e3, r.kind_ops[2], r.kind_us[3] / 1e3, r.kind_ops[3],
-                             r.kind_us[4] / 1e3, r.kind_ops[4]);
                     // Room for the lists' scan off the emulation thread (GPU::GuestIdle).
                     const auto room = system.GPU().TakeScanRoom();
                     LOG_INFO(Frontend,
