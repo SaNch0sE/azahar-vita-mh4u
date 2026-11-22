@@ -45,7 +45,7 @@ constexpr VAddr VADDR_LCD = 0x1ED02000;
 constexpr VAddr VADDR_GPU = 0x1EF00000;
 
 // Upstream's: how long the 3DS's transfer engines take, which GSP adds to their
-// interrupts when simulate_3ds_gpu_timings is on.
+// interrupts.
 class DelayGenerator {
 private:
     DelayGenerator() = default;
@@ -930,6 +930,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         impl->presented_fb = fb;
         impl->presented_fill = fill;
     }
+    impl->render->StartFramePageHolds();
     impl->render->ApplyPageHolds();
     // The guest hears of the GPU's work when it is submitted, so nothing else keeps the GPU
     // near the guest: each vblank waits for the work queued before the last one (the present

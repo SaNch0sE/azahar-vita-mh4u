@@ -135,6 +135,20 @@ typedef struct AzaharHoldRun {
     uint32_t hold;    // AZAHAR_HOLD_*
 } AzaharHoldRun;
 
+// Versions of the app's pages (reback.c; the emulator's page versions): the adopted app page at
+// user_va, and every guest descriptor showing it, take the physical page behind version_va with
+// that mapping's attributes, while the GPU's mapping keeps the page it names (the page's home).
+// version_va 0 puts the page back on its home with the home's attributes. The first flip of a
+// page cleans and invalidates its home's lines through the app's address first: from then on
+// only the GPU writes the home until the page goes back. Contents do not move (the emulator
+// copies them), and the guest's descriptors keep their access (azaharHold). A page moved
+// (azaharReback) or returned while flipped is refused. Version 26.
+#define AZAHAR_FLIP_MAX_RUNS 64u
+typedef struct AzaharFlipRun {
+    uint32_t user_va;    // page aligned, in the adopted block
+    uint32_t version_va; // page aligned app memory, or 0: back home
+} AzaharFlipRun;
+
 // Moving pages of the app's memory onto other physical pages of its own (reback.c). First
 // azaharAdopt takes a block of the app's (1 MiB aligned, at most 256 MiB, all of it the app's
 // writable memory) under translation tables of the module's: the same pages and attributes.
@@ -185,6 +199,9 @@ int azaharEdit(const AzaharEditRequest *req);
 /// See AzaharHoldRun: `count` runs, 1 to AZAHAR_HOLD_MAX_RUNS. Returns the guest descriptors it
 /// changed. Version 25.
 int azaharHold(const AzaharHoldRun *runs, uint32_t count);
+/// See AzaharFlipRun: `count` runs, 1 to AZAHAR_FLIP_MAX_RUNS. Returns the guest descriptors it
+/// retargeted. Version 26.
+int azaharFlip(const AzaharFlipRun *runs, uint32_t count);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.

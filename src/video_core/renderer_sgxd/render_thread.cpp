@@ -62,7 +62,8 @@ enum class RenderThread::Op : u16 {
     FrameEnd,   ///< a guest frame's end, each vblank: RasterizerGxm::EndFrame
     GuestWrote, ///< T12: a watched texture page's address, written by the guest or the HLE
     Call,
-    Check, ///< rendercheck: CheckRecord
+    Check,     ///< rendercheck: CheckRecord
+    PageRemap, ///< extra: the count; PageHolds::Remap each: the GPU's MMU onto pages' slots
 };
 
 struct RenderThread::Head {
@@ -820,6 +821,7 @@ void RenderThread::KeepTargetUncached(const DrawTextures& textures, u32 count) {
 void RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
     if (page_holds_on) {
         page_holds.Read(addr, bytes, HoldTicket(), kind);
+        PutPageRemaps();
     }
 }
 
@@ -827,6 +829,28 @@ void RenderThread::HoldWrite(PAddr addr, u32 bytes, PageHolds::Kind kind) {
     last_write_ticket = HoldTicket();
     if (page_holds_on) {
         page_holds.Write(addr, bytes, HoldTicket(), kind);
+        PutPageRemaps();
+    }
+}
+
+void RenderThread::PutPageRemaps() {
+    // Before the record of the work that uses the pages, as many to a list as it takes.
+    auto& remaps = page_holds.Remaps();
+    for (std::size_t at = 0; at < remaps.size(); at += SGXD_REMAP_MAX) {
+        const u32 n = static_cast<u32>(std::min<std::size_t>(SGXD_REMAP_MAX, remaps.size() - at));
+        u8* const out = Begin(Op::PageRemap, n * sizeof(PageHolds::Remap), static_cast<u16>(n));
+        std::memcpy(out, remaps.data() + at, n * sizeof(PageHolds::Remap));
+        Commit();
+    }
+    remaps.clear();
+}
+
+void RenderThread::StartFramePageHolds() {
+    held_colour = {};
+    held_depth = {};
+    if (page_holds_on) {
+        page_holds.StartFrame(reached.load(std::memory_order_acquire), HoldTicket());
+        PutPageRemaps();
     }
 }
 
@@ -1165,6 +1189,31 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
             return true;
         }
     }
+    // T12: a write to a texture's page: the textures over it are untiled again at their next
+    // use, the page open to writes as its holds allow.
+    if (write && page_holds.Watched(page)) {
+        TexturesWritten(page_holds.AddressOf(page), 0x1000);
+        page_holds.Unwatch(page, reached.load(std::memory_order_acquire));
+#ifdef VITA_DIAGNOSTICS
+        texture_write_faults++;
+#endif
+        if (page_holds.Applied(page) == PageHolds::Unheld) {
+            return true;
+        }
+    }
+    // A write to an FCRAM page the GPU still reads takes a version of it (moved pages only:
+    // their home in CDRAM needs no cache work), and the guest goes on at once.
+    const PAddr address = page_holds.AddressOf(page);
+    if (write && address >= Memory::FCRAM_PADDR && address < Memory::FCRAM_PADDR_END &&
+        !renderer.WouldMakeUncached(address, 0x1000)) {
+        if (page_holds.Version(page, reached.load(std::memory_order_acquire))) {
+#ifdef VITA_DIAGNOSTICS
+            faults++;
+            versioned_faults++;
+#endif
+            return true;
+        }
+    }
     // A write to a cached FCRAM page that only queued draws' geometry reads holds (a buffer the guest
     // refills while the GPU still draws it): the page moves to CDRAM after this wait, so the next write
     // takes a version instead.
@@ -1187,15 +1236,27 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
         fault_wait_us += us;
         fault_kinds[kind]++;
         fault_kind_us[kind] += us;
-        // gxm_flags `holdlog`: the first aborts that waited, with where the guest was.
-        static const bool holdlog = GxmFlag("holdlog");
+        auto& site = fault_sites[(static_cast<u64>(guest_pc) << 8) | kind];
+        site.count++;
+        site.us += us;
+        site.page = page_holds.AddressOf(page);
+        static const bool holdlog = SgxdFlag("holdlog") || SgxdFlagValue("holdlog") != 0;
+        static const u64 holdlog_from_us = u64{SgxdFlagValue("holdlog")} * 1000000;
         static u32 logged = 0;
-        if (holdlog && logged++ < 200) {
+        if (holdlog &&
+            static_cast<u64>(Clock::now().time_since_epoch().count()) >= holdlog_from_us &&
+            logged++ < 200) {
+            const auto [range_addr, range_bytes] = page_holds.RangeOf(page);
+            const auto [writer, write_range] = page_holds.WriterOf(page);
             LOG_INFO(Render,
-                     "holdlog: guest {} at {:#010x} (pc {:#010x}) on {:#010x}: {} hold, ticket "
-                     "{} with {} reached and {} queued, waited {} us",
-                     write ? "write" : "read", guest_va, guest_pc, page_holds.AddressOf(page),
-                     PageHolds::KindName(kind), waited, before, tickets, us);
+                     "holdlog: guest {} at {:#010x} (pc {:#010x}, {:08x}) on {:#010x}+{:#x}: {} "
+                     "hold of {:#010x}+{:#x}, ticket {} with {} reached and {} queued, waited {} "
+                     "us; last write {} of {:#010x}+{:#x}; {}",
+                     write ? "write" : "read", guest_va, guest_pc, memory.Read32(guest_pc),
+                     page_holds.AddressOf(page),
+                     guest_va & 0xfff, PageHolds::KindName(kind), range_addr, range_bytes, waited,
+                     before, tickets, us, PageHolds::KindName(writer), write_range.first,
+                     write_range.second, page_holds.DisplayState(page, before));
         }
     }
 #endif
@@ -1322,9 +1383,19 @@ RenderThread::HoldStats RenderThread::TakeHoldStats() {
     h.fault_wait_us = std::exchange(fault_wait_us, 0);
     h.host_waits = std::exchange(host_waits, 0);
     h.host_wait_us = std::exchange(host_wait_us, 0);
+    h.versioned_faults = std::exchange(versioned_faults, 0);
     h.geometry_moves = std::exchange(geometry_moves, 0);
     h.fault_kinds = std::exchange(fault_kinds, {});
     h.fault_kind_us = std::exchange(fault_kind_us, {});
+    std::vector<std::pair<u64, FaultSite>> sites(fault_sites.begin(), fault_sites.end());
+    fault_sites.clear();
+    std::sort(sites.begin(), sites.end(),
+              [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+    h.site_count = static_cast<u32>(std::min<std::size_t>(sites.size(), h.sites.size()));
+    for (u32 i = 0; i < h.site_count; i++) {
+        h.sites[i] = {static_cast<u32>(sites[i].first >> 8),
+                      static_cast<PageHolds::Kind>(sites[i].first & 0xff), sites[i].second};
+    }
     return h;
 }
 #endif
@@ -1826,6 +1897,20 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     case Op::Check:
         RunCheck(p);
         break;
+    case Op::PageRemap: {
+        std::array<u32, SGXD_REMAP_MAX> pages, pte_va, pte;
+        bool direct = false;
+        for (u32 k = 0; k < head.extra; k++) {
+            PageHolds::Remap r;
+            std::memcpy(&r, p + k * sizeof(r), sizeof(r));
+            pages[k] = r.page;
+            pte_va[k] = r.pte_va;
+            pte[k] = r.pte;
+            direct |= r.direct != 0;
+        }
+        rasterizer.RemapPages(pages.data(), pte_va.data(), pte.data(), head.extra, direct);
+        break;
+    }
     case Op::Call: {
         CallRecord* c;
         take(c);

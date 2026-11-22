@@ -1095,6 +1095,39 @@ bool RasterizerSgxd::AccelerateDma(PAddr src, PAddr dst, u32 size) {
     return CopyLines(src, size, dst, size, size, 1);
 }
 
+void RasterizerSgxd::RemapPages(const u32* pages, const u32* pte_va, const u32* pte, u32 count,
+                               bool direct) {
+    // Page versions: the GPU's MMU moves onto the slots the guest wrote, in the GPU's order. What reads
+    // the pages before is sent first: the queued untiles, and the open pass when queued work read a
+    // page other than as a texture (direct) or a texture of the pass is untiled in place again. The
+    // pending 3D finishes, so no unit runs while the remap invalidates the MMU's caches.
+    const auto pass_texture_in_place = [&] {
+        for (const Texture& t : textures) {
+            if (!t.in_place || t.last_used != passes) {
+                continue;
+            }
+            for (u32 k = 0; k < count; k++) {
+                for (u32 part = 0; part < t.parts; part++) {
+                    if (pages[k] < t.part_addr[part] + t.part_bytes &&
+                        t.part_addr[part] < pages[k] + 0x1000) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+    if (backend.InPass() && (direct || pass_texture_in_place())) {
+        EndPass("a page version's remap");
+    }
+    for (u32 k = 0; k < count; k++) {
+        ForgetClears(pages[k], pages[k] + 0x1000);
+        TexturesWritten(pages[k], pages[k] + 0x1000);
+        DepthStoresWritten(pages[k], pages[k] + 0x1000);
+    }
+    backend.RemapPages(pte_va, pte, count);
+}
+
 void RasterizerSgxd::MoveWaits() {
     if (backend.RetirePending()) {
         backend.RetireAll("a page move after a DMA's cache work");
@@ -1590,6 +1623,7 @@ RasterizerGxm::Texture& RasterizerGxm::TextureFromRegs(u32 unit, bool written) {
         IndexTexture(*it);
     }
     it->checked_seq = write_seq;
+    it->in_place = cube || etc1a4_levels;
     it->alpha_one = t.format == Pica::TexturingRegs::TextureFormat::RG8;
     it->byte_swizzle = 0;
     // Each FCRAM part moves to CDRAM here, under the draw's read hold. A texture past VRAM's end reads

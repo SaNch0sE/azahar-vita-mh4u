@@ -385,7 +385,8 @@ int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
     *refused = 0xffffffffu;
     uint32_t nvar = 0;
     for (uint32_t n = 0; n < nops; n++) {
-        if (sgxd_mk_is_variable(&ops[n], variable, n) && ++nvar > SGXD_MK_DATA_WORDS) {
+        if (sgxd_mk_is_variable(&ops[n], variable, n) &&
+            (nvar += sgxd_mk_var_words(&ops[n])) > SGXD_MK_DATA_WORDS) {
             *refused = n;
             return SGX_USSE_EINVAL;
         }
@@ -400,7 +401,9 @@ int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
         uint32_t seg_end = n, seg_vars = 0;
         while (seg_end < nops && ops[seg_end].op != SGXD_OP_WAIT_EVENT &&
                ops[seg_end].op != SGXD_OP_WAIT_TWOD) {
-            seg_vars += sgxd_mk_is_variable(&ops[seg_end], variable, seg_end) ? 1u : 0u;
+            seg_vars += sgxd_mk_is_variable(&ops[seg_end], variable, seg_end)
+                            ? sgxd_mk_var_words(&ops[seg_end])
+                            : 0u;
             seg_end++;
         }
         const uint32_t batch = seg_vars < VAR_BATCH ? seg_vars : VAR_BATCH;
@@ -479,6 +482,18 @@ int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
                 } else {
                     sgx_usse_str(a, AL, op->reg, cached(a, &cache, 9, op->value));
                 }
+                n++;
+                break;
+            case SGXD_OP_STORE:
+                // The address and the word from the data slot, the store fenced before what
+                // follows (a PTE's, before the MMU invalidate).
+                sgx_usse_ld(a, AL, R(6), R(MK_DATA_REG), IMM(var), 0);
+                sgx_usse_ld(a, AL, R(7), R(MK_DATA_REG), IMM(var + 1u), 0);
+                sgx_usse_wdf(a, 0);
+                sgx_usse_st(a, AL, R(6), IMM(0), R(7));
+                sgx_usse_idf(a, 0);
+                sgx_usse_wdf(a, 0);
+                var += 2u;
                 n++;
                 break;
             case SGXD_OP_READ:

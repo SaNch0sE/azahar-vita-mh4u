@@ -161,7 +161,9 @@ static const uint16_t owned[] = {0x0110, 0x0130, 0x0a44, 0x0a48, 0x0a58, 0x0a68,
 
 static int writable(uint32_t reg) {
     const uint32_t r = reg & 0x3fffu;
-    if ((reg & 3u) || reg >= 0x18000u || r == 0x0c00u || (r >= 0x0c34u && r <= 0x0c84u)) {
+    // The MMU invalidate after a remap's STORE (sgxd_remap_submit) is a list's to write; the BIF's
+    // set-up and directories stay the kernel's.
+    if ((reg & 3u) || reg >= 0x18000u || r == 0x0c00u || (r > 0x0c34u && r <= 0x0c84u)) {
         return 0;
     }
     for (unsigned n = 0; n < sizeof(owned) / sizeof(owned[0]); n++) {
@@ -316,9 +318,9 @@ void sgxd_mkq_check_render(char *out, unsigned size) {
     for (uint32_t k = 0; k < s->count; k++) {
         const SgxdOp *op = &pool[s->at + k];
         const int is_var = pool_var[s->at + k] || op->op == SGXD_OP_WAIT_TWOD;
-        const uint32_t value = is_var ? slot[var] : op->value;
+        const uint32_t value = is_var ? slot[var + sgxd_mk_var_words(op) - 1u] : op->value;
         if (is_var) {
-            var++;
+            var += sgxd_mk_var_words(op);
         }
         if (op->op != SGXD_OP_WRITE || !kept_state(op->reg)) {
             continue;
@@ -387,8 +389,10 @@ static uint64_t shape_hash(const SgxdOp *ops, unsigned count, const uint8_t *var
     uint64_t h = 0xcbf29ce484222325ull;
     for (unsigned n = 0; n < count; n++) {
         const int var = sgxd_mk_is_variable(&ops[n], variable, n);
-        const uint32_t w[6] = {ops[n].op, ops[n].reg, var ? 0u : ops[n].value, ops[n].mask,
-                               ops[n].timeout_us, (uint32_t)var};
+        // A STORE's address is a value too (the data slot's).
+        const uint32_t mask = ops[n].op == SGXD_OP_STORE ? 0u : ops[n].mask;
+        const uint32_t w[6] = {ops[n].op, ops[n].reg,        var ? 0u : ops[n].value,
+                               mask,      ops[n].timeout_us, (uint32_t)var};
         for (unsigned k = 0; k < 6; k++) {
             h = (h ^ w[k]) * 0x100000001b3ull;
         }
@@ -403,7 +407,8 @@ static int shape_equal(const Shape *s, const SgxdOp *ops, unsigned count, const 
     for (unsigned n = 0; n < count; n++) {
         const SgxdOp *p = &pool[s->at + n];
         const int var = sgxd_mk_is_variable(&ops[n], variable, n);
-        if (p->op != ops[n].op || p->reg != ops[n].reg || p->mask != ops[n].mask ||
+        if (p->op != ops[n].op || p->reg != ops[n].reg ||
+            (ops[n].op != SGXD_OP_STORE && p->mask != ops[n].mask) ||
             p->timeout_us != ops[n].timeout_us || pool_var[s->at + n] != (uint8_t)var ||
             (!var && p->value != ops[n].value)) {
             return 0;

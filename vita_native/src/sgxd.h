@@ -62,6 +62,10 @@ typedef struct SgxdOp {
 #define SGXD_OP_SIGNAL 7u
 #define SGXD_SIGNAL_TA 0u      // the render's vertices are read
 #define SGXD_SIGNAL_DONE 1u    // the list is complete
+// STORE (an async list's, version 14): the word `value` stored at GPU address `mask`, both from
+// the job's data slot, the store fenced. For a page table entry the GPU itself rewrites, in the
+// queue's order (sgxdMapTables, sgxdPte), before the MMU invalidate after it.
+#define SGXD_OP_STORE 8u
 #define SGXD_MAX_OPS 256u
 // An async list's ops at most (the app's rule).
 #define SGXD_MAX_CHAIN_OPS 1024u
@@ -92,7 +96,7 @@ typedef struct SgxdOp {
 #define SGXD_DUMP_BANK_REGS 266u
 #define SGXD_DUMP_CORE_REGS 399u
 
-#define SGXD_VERSION 13
+#define SGXD_VERSION 15
 
 // sgxdEvents (version 4; 13: the microkernel's alone): the SGX's host interrupt (GIC 0x34,
 // SceGpu's "SceGpuLisr" otherwise) is sgxd's while the app has registered this page. The async
@@ -155,6 +159,17 @@ int sgxdWaker(int32_t event_flag, uint32_t bits);
 // sgxdTranslate: the GPU's view of gpu_va: out[0] its directory entry, out[1] its page table
 // entry (0 where no page table covers it). A PTE is the page's physical address | flags | VALID.
 int sgxdTranslate(uint32_t gpu_va, uint32_t out[2]);
+// Remaps the GPU does itself (version 14; azahar's page versions): sgxdMapTables maps sgxd's
+// page directory and tables (SGXD_MMU_BYTES, physically one block, uncached for the CPU) at
+// gpu_va, CACHECONSISTENT, so that a list's STORE reaches memory past the SLC and the walker
+// reads it after an invalidate. With the GPU idle, once. sgxdPte gives a mapped page's remap:
+// out[0] the GPU address of gpu_va's PTE in that mapping, out[1] the PTE naming the physical
+// page behind the app's user_va with gpu_va's flags. The GPU stores it in its queue's order; the
+// kernel's own bookkeeping of the mapping (sgxdMap's ranges, a page move's retarget) does not
+// follow, so the app puts every such PTE back before it moves or unmaps the page.
+#define SGXD_MMU_BYTES ((1u + SGXD_MAP_TABLES) * 0x1000u)
+int sgxdMapTables(uint32_t gpu_va);
+int sgxdPte(uint32_t gpu_va, const void *user_va, uint32_t out[2]);
 // Every unit of the GPU reset as the take leaves it, without its power cycle (version 92): the
 // start sequence again (its MASTER_SOFT_RESET pulse resets the four cores and the master's DPM,
 // VDM, SLC, BIF, MCI and PTLA), every core's caches, and the MMU's banks and directory, which the

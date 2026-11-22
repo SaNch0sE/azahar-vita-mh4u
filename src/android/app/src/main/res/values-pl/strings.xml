@@ -241,8 +241,6 @@
     <string name="texture_filter_description">Ulepsza oprawę wizualną aplikacji poprzez zastosowanie filtrów do tekstur. Obsługiwane filtry to Anime4K Ultrafast, Bicubic, ScaleForce, xBRZ freescale i MMPX.</string>
     <string name="delay_render_thread">Opóźnienie Renderowania Wątku Gry</string>
     <string name="delay_render_thread_description">Opóźnia wątek renderowania aplikacji podczas przesyłania danych do GPU. Pomaga w kwestiach wydajności w (bardzo niewielu) aplikacjach z dynamiczną liczbą klatek na sekundę.</string>
-    <string name="simulate_3ds_gpu_timings">Symuluj czasy pracy procesora graficznego 3DS</string>
-    <string name="simulate_3ds_gpu_timings_description">Opóźnia zdarzenia zakończenia pracy procesora graficznego GPU na podstawie pomiarów przeprowadzonych na rzeczywistym sprzęcie, dzięki czemu gry uzyskują bardziej realistyczne pomiary czasu pracy procesora graficznego. Pomaga to ustabilizować działanie gier z dynamiczną liczbą klatek na sekundę. Wyłączenie tej funkcji może w niektórych rzadkich przypadkach poprawić wydajność, ale kosztem stabilności działania.</string>
     <string name="advanced">Zaawansowane</string>
     <string name="texture_sampling_name">Próbkowanie tekstur</string>
     <string name="texture_sampling_description">Zastępuje filtr próbkowania używany przez gry. Może to być przydatne w niektórych przypadkach, gdy gry źle zachowują się podczas skalowania w górę. Jeśli nie masz pewności, ustaw tę opcję na Kontrolowane przez grę.</string>

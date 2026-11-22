@@ -39,6 +39,28 @@ static RebackMoved *reback_moved;
 static SceUID reback_moved_uid = -1;
 static unsigned reback_moved_count;
 
+// A flipped page (azaharFlip): the app's address, its home (the page the GPU's mapping keeps,
+// with the attributes the app's view had on it) and the version it shows now.
+#define REBACK_MAX_FLIPPED 1024u
+typedef struct RebackFlipped {
+    uint32_t uva;
+    uint32_t home_pa;
+    uint32_t home_attr;
+    uint32_t version_pa;
+    uint32_t version_attr;
+} RebackFlipped;
+static RebackFlipped reback_flipped[REBACK_MAX_FLIPPED];
+static unsigned reback_flipped_count;
+
+static unsigned reback_flipped_find(uint32_t uva) {
+    for (unsigned i = 0; i < reback_flipped_count; i++) {
+        if (reback_flipped[i].uva == uva) {
+            return i;
+        }
+    }
+    return reback_flipped_count;
+}
+
 typedef struct RebackPair {
     uint32_t uva;
     uint32_t old_pa;
@@ -80,11 +102,20 @@ static unsigned reback_moved_find(uint32_t pa) {
     return lo < reback_moved_count && reback_moved[lo].new_pa == pa ? lo : reback_moved_count;
 }
 
-// The new page's attributes, if `pa` is a page this module moved something onto; 0 otherwise.
-// map_range asks, so that a guest window made after the move maps it as the app does.
+// The new page's attributes, if `pa` is a page this module moved something onto, or a version a
+// flipped page shows; 0 otherwise. map_range asks, so that a guest window made after the move
+// maps it as the app does.
 static uint32_t reback_attr_for(uint32_t pa) {
     const unsigned i = reback_moved_find(pa);
-    return i < reback_moved_count ? reback_moved[i].attr : 0;
+    if (i < reback_moved_count) {
+        return reback_moved[i].attr;
+    }
+    for (unsigned f = 0; f < reback_flipped_count; f++) {
+        if (reback_flipped[f].version_pa == pa) {
+            return reback_flipped[f].version_attr;
+        }
+    }
+    return 0;
 }
 
 // The process's level-1 entry for `uva`, through a mapping of its table's page of our own. The
@@ -186,6 +217,7 @@ static void reback_restore_locked(void) {
     reback_base = 0;
     reback_mbs = 0;
     reback_moved_count = 0;
+    reback_flipped_count = 0;
     reback_owner = -1;
 }
 
@@ -193,7 +225,7 @@ static void reback_restore_locked(void) {
 // its attributes; permissions stay. The descriptors are the ones the guest's windows put the
 // page's app address under (native.c's azahar_windows), a guest address can alias it more than
 // once; each must still name the old page.
-static unsigned reback_retarget_guest(void) {
+static unsigned reback_retarget_guest(int code) {
     if (azahar_state != ST_MAPPED) {
         return 0;
     }
@@ -219,7 +251,7 @@ static unsigned reback_retarget_guest(void) {
     }
     if (changed) {
         // A moved page can hold code.
-        tables_changed(1);
+        tables_changed(code);
     }
     return changed;
 }
@@ -380,6 +412,12 @@ int azaharReback(const AzaharRebackRequest *user_req) {
         ret = AZAHAR_ERR_ALLOC;
         goto out;
     }
+    for (uint32_t i = 0; i < pages; i++) {
+        if (reback_flipped_find(req.user_va + i * 0x1000u) != reback_flipped_count) {
+            ret = AZAHAR_ERR_STATE;
+            goto out;
+        }
+    }
     log_open();
 
     // The new pages and their attributes, from the app's own mapping of them.
@@ -425,7 +463,7 @@ int azaharReback(const AzaharRebackRequest *user_req) {
     // The guest's descriptors for these app pages follow. The GPU's keep the old pages: the app
     // remaps them in its queue's order (sgxdPte), after the work that still reads them.
     reback_pair_count = moved;
-    const unsigned guest = reback_retarget_guest();
+    const unsigned guest = reback_retarget_guest(1);
     emit("== azaharReback user %08x pool %08x size %08x%s: %u page(s) moved, %u guest "
          "descriptor(s) retargeted\n",
          req.user_va, req.pool_va, req.size, (req.flags & AZAHAR_REBACK_COPY) ? " copy" : "",
@@ -459,8 +497,13 @@ int azaharRebackReturn(uint32_t user_va, uint32_t size) {
         goto out;
     }
     log_open();
-    // Every page must be a moved one: nothing changes otherwise.
+    // Every page must be a moved one, and none flipped: nothing changes otherwise.
     for (uint32_t i = 0; i < pages; i++) {
+        if (reback_flipped_find(user_va + i * 0x1000u) != reback_flipped_count) {
+            emit("  return: user %08x is flipped\n", user_va + i * 0x1000u);
+            ret = AZAHAR_ERR_STATE;
+            goto out_log;
+        }
         const uint32_t d = reback_l2[(user_va - reback_base) / 0x1000u + i];
         if (reback_moved_find(d & 0xFFFFF000u) == reback_moved_count) {
             emit("  return: user %08x (pa %08x) was not moved\n", user_va + i * 0x1000u,
@@ -500,7 +543,7 @@ int azaharRebackReturn(uint32_t user_va, uint32_t size) {
     }
     // The guest's view follows, as a move's; the GPU's is the app's to remap.
     reback_pair_count = returned;
-    const unsigned guest = reback_retarget_guest();
+    const unsigned guest = reback_retarget_guest(1);
     emit("== azaharRebackReturn user %08x size %08x: %u page(s) back, %u guest descriptor(s) "
          "retargeted\n",
          user_va, size, returned, guest);
@@ -511,6 +554,102 @@ out:
     reback_unlock();
     EXIT_SYSCALL(state);
     return ret < 0 ? ret : (int)returned;
+}
+
+static AzaharFlipRun reback_flip_runs[AZAHAR_FLIP_MAX_RUNS];
+
+int azaharFlip(const AzaharFlipRun *user_runs, uint32_t count) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    if (count == 0 || count > AZAHAR_FLIP_MAX_RUNS) {
+        EXIT_SYSCALL(state);
+        return AZAHAR_ERR_ARG;
+    }
+    int ret = reback_lock();
+    if (ret) {
+        EXIT_SYSCALL(state);
+        return ret;
+    }
+    unsigned flipped = 0;
+    if (reback_owner != ksceKernelGetProcessId()) {
+        ret = AZAHAR_ERR_STATE;
+        goto out;
+    }
+    if (ksceKernelCopyFromUser(reback_flip_runs, user_runs, count * sizeof(AzaharFlipRun)) < 0) {
+        ret = AZAHAR_ERR_ARG;
+        goto out;
+    }
+    for (uint32_t r = 0; r < count; r++) {
+        const AzaharFlipRun *run = &reback_flip_runs[r];
+        const uint32_t uva = run->user_va;
+        if (((uva | run->version_va) & 0xFFFu) || uva < reback_base ||
+            uva - reback_base >= reback_mbs << 20) {
+            ret = AZAHAR_ERR_ARG;
+            break;
+        }
+        uint32_t *const d = &reback_l2[(uva - reback_base) / 0x1000u];
+        const uint32_t cur_pa = *d & 0xFFFFF000u;
+        const unsigned f = reback_flipped_find(uva);
+        uint32_t new_pa, attr;
+        if (run->version_va) {
+            const uint32_t par = reback_user_par(run->version_va);
+            attr = PAR_FAULTED(par) ? 0 : azahar_attr_from_par(par);
+            if (!attr) {
+                ret = AZAHAR_ERR_PAGE;
+                break;
+            }
+            new_pa = PAR_PA(par);
+            if (f == reback_flipped_count) {
+                if (reback_flipped_count == REBACK_MAX_FLIPPED) {
+                    ret = AZAHAR_ERR_ALLOC;
+                    break;
+                }
+                // The home's lines leave the cache through the app's address while it still
+                // shows the home: the GPU alone writes it from now on.
+                SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
+                const uint32_t dacr = rd_dacr();
+                wr_dacr(dacr_grant_all(dacr));
+                ksceKernelDcacheCleanInvalidateRange((void *)(uintptr_t)uva, 0x1000);
+                wr_dacr(dacr);
+                ksceKernelCpuResumeIntr(st);
+                RebackFlipped *const e = &reback_flipped[reback_flipped_count++];
+                e->uva = uva;
+                e->home_pa = cur_pa;
+                e->home_attr = *d & AZAHAR_ATTR_MASK;
+            }
+            RebackFlipped *const e = &reback_flipped[reback_flipped_find(uva)];
+            e->version_pa = new_pa;
+            e->version_attr = attr;
+        } else {
+            if (f == reback_flipped_count) {
+                ret = AZAHAR_ERR_PAGE;
+                break;
+            }
+            new_pa = reback_flipped[f].home_pa;
+            attr = reback_flipped[f].home_attr;
+            reback_flipped[f] = reback_flipped[--reback_flipped_count];
+        }
+        *d = reback_host_page(new_pa, attr);
+        reback_pairs[flipped].uva = uva;
+        reback_pairs[flipped].old_pa = cur_pa;
+        reback_pairs[flipped].new_pa = new_pa;
+        reback_pairs[flipped].attr = attr;
+        flipped++;
+    }
+    if (flipped) {
+        reback_tlb_flush_all();
+        // The guest's view follows; the GPU's keeps its pages.
+        reback_pair_count = flipped;
+        const unsigned guest = reback_retarget_guest(0);
+        if (ret == 0) {
+            ret = (int)guest;
+        }
+    }
+
+out:
+    reback_unlock();
+    EXIT_SYSCALL(state);
+    return ret;
 }
 
 int azaharRebackRestore(void) {

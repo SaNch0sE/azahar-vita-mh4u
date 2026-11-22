@@ -124,11 +124,6 @@ enum class BooleanSetting(
     APPLY_REGION_FREE_PATCH(SettingKeys.apply_region_free_patch(), Settings.SECTION_SYSTEM, true),
     USE_INTEGER_SCALING(SettingKeys.use_integer_scaling(), Settings.SECTION_RENDERER, false),
     ENABLE_SECONDARY_DISPLAY(SettingKeys.enable_secondary_display(), Settings.SECTION_LAYOUT, true),
-    SIMULATE_3DS_GPU_TIMINGS(
-        SettingKeys.simulate_3ds_gpu_timings(),
-        Settings.SECTION_RENDERER,
-        false
-    ),
     CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), Settings.SECTION_MISC, true);
 
     override var boolean: Boolean = defaultValue

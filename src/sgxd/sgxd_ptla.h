@@ -98,6 +98,14 @@ int sgxd_chain_submit(const SgxdOp *ops, unsigned count);
 // send) and the sender's kept code (sgxd_mkq_submit); either may be NULL.
 int sgxd_chain_submit_vars(const SgxdOp *ops, unsigned count, const uint8_t *variable,
                            SgxdMkqCode *code);
+// Remaps the GPU makes in its queue's order (azahar's page versions): behind every list and PTLA
+// op sent before it, each PTE word pte[k] stored at pte_va[k] (sgxdPte), then the MMU invalidate
+// in every bank, as the kernel's sgxdMap runs it. 1 to SGXD_REMAP_MAX at a time. The caller has
+// had the pending 3D finished, so no unit runs while the MMU's caches go. A list like any other
+// (its fence).
+#define SGXD_REMAP_MAX 31u
+int sgxd_remap_submit(const uint32_t* pte_va, const uint32_t* pte, unsigned count, char* failed,
+                      unsigned failed_size);
 // The lists completed (the SGXD_SIGNAL_DONE count), the PTLA ops completed and the queue's
 // fault (0, or 1 + the op it stopped at): the microkernel's state words.
 uint32_t sgxd_chain_done(void);

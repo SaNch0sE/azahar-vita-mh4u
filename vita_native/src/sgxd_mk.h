@@ -11,22 +11,9 @@
 // own index in RESUME and ends the run. A POLL that runs out stores 1 + its index in FAULT and
 // raises SW_EVENT; no job runs after a fault.
 //
-// A list compiled (sgxd_mk_compile) is the Sony-like form: a register write is an immediate
-// `str` (with a `limm` for a value past 7 bits, or a temporary holding a value the segment uses
-// more than once), a POLL an inline loop, a WAIT_EVENT or WAIT_TWOD that is not met stores its own
-// index in RESUME and ends the run; the next event's run goes on there. The writes are checked
-// when the code is made, not as it runs. A WAIT_TWOD's value and a WRITE marked variable come
-// from the job's data slot, in the list's order: the code stays the same while those change.
-// SIGNAL counts CHAIN_TA or CHAINS, and a list's end (SGXD_SIGNAL_DONE) runs the wake check: with
-// WAKE_ARMED set and CHAINS and TWOD past WAKE_CHAINS and WAKE_TWOD, it clears WAKE_ARMED, counts
-// WAKES and raises SW_EVENT (bank 0's EVENT_STATUS bit 14) for the host. A POLL that runs out
-// stores 1 + its index in FAULT, its kind in FAULT_KIND, the last read in VALUE, and raises
-// SW_EVENT; no job runs after a fault.
-//
-// The state block, the jobs and the data slots are words the CPU maps uncached and the GPU
-// CACHECONSISTENT (past the SLC with BYP_CC): no flush between the two sides. Costs (test 19):
-// one thread issues an instruction every 0.2-0.25 us, a register read with its WDF costs 1.1 us,
-// a memory load with its WDF 2.4 us. Freestanding C, built into azahar and sgxd_test.
+// The state block, the jobs and the data slots are mapped uncached for the CPU and
+// CACHECONSISTENT for the GPU: no flush between the two sides. Freestanding C, built into
+// azahar and sgxd_test.
 #ifndef SGXD_MK_H
 #define SGXD_MK_H
 
@@ -122,18 +109,31 @@ int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
                     const SgxdMkRuntime *rt, const SgxdOp *ops, uint32_t nops,
                     const uint8_t *variable, int (*writable)(uint32_t reg), uint32_t *refused);
 
-// Whether op n of a list takes its value from the data slot (sgxd_mk_compile's rule).
+// Whether op n of a list takes its value from the data slot (sgxd_mk_compile's rule): a
+// WAIT_TWOD's and a STORE's always, a WRITE's when marked.
 static inline int sgxd_mk_is_variable(const SgxdOp *op, const uint8_t *variable, uint32_t n) {
-    return op->op == SGXD_OP_WAIT_TWOD || (op->op == SGXD_OP_WRITE && variable && variable[n]);
+    return op->op == SGXD_OP_WAIT_TWOD || op->op == SGXD_OP_STORE ||
+           (op->op == SGXD_OP_WRITE && variable && variable[n]);
 }
 
-// The list's data slot: its variable values in order. Returns how many (at most
+// The data slot's words a variable op takes: a STORE its address, then its value.
+static inline uint32_t sgxd_mk_var_words(const SgxdOp *op) {
+    return op->op == SGXD_OP_STORE ? 2u : 1u;
+}
+
+// The list's data slot: its variable values in order. Returns how many words (at most
 // SGXD_MK_DATA_WORDS are written; more is a list sgxd_mk_compile refused).
 static inline uint32_t sgxd_mk_values(volatile uint32_t *slot, const SgxdOp *ops, uint32_t nops,
                                       const uint8_t *variable) {
     uint32_t k = 0;
     for (uint32_t n = 0; n < nops; n++) {
         if (sgxd_mk_is_variable(&ops[n], variable, n)) {
+            if (ops[n].op == SGXD_OP_STORE) {
+                if (k < SGXD_MK_DATA_WORDS) {
+                    slot[k] = ops[n].mask;
+                }
+                k++;
+            }
             if (k < SGXD_MK_DATA_WORDS) {
                 slot[k] = ops[n].value;
             }

@@ -530,12 +530,26 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const auto hs = system.GPU().GetRenderThread().TakeHoldStats();
                     LOG_INFO(Frontend,
                              "perf: page holds: azaharHold {} calls, {} runs, {} descriptors; "
-                             "{} pages held, {} let go; guest aborts {} ({} waited, {:.1f} ms), "
-                             "HLE waits {} ({:.1f} ms), vblank waits {} ({:.1f} ms)",
+                             "{} pages held, {} let go; guest aborts {} ({} versioned, {} "
+                             "waited, {:.1f} ms; {} geometry pages moved), HLE waits {} ({:.1f} "
+                             "ms), vblank waits {} ({:.1f} ms)",
                              hs.holds.calls, hs.holds.runs, hs.holds.descriptors,
                              hs.holds.held_pages, hs.holds.released_pages, hs.faults,
-                             hs.fault_waits, hs.fault_wait_us / 1e3, hs.host_waits,
-                             hs.host_wait_us / 1e3, hs.vblank_waits, hs.vblank_wait_us / 1e3);
+                             hs.versioned_faults, hs.fault_waits, hs.fault_wait_us / 1e3,
+                             hs.geometry_moves,
+                             hs.host_waits, hs.host_wait_us / 1e3, hs.vblank_waits,
+                             hs.vblank_wait_us / 1e3);
+                    // Page versions: azaharFlip's calls, the pages that got a second slot,
+                    // the swaps, the writes in place (with queued work reading the guest's slot,
+                    // and with none), the remaps at frame starts and before a same-frame use,
+                    // the pages gone home, and the pool's slots in use.
+                    LOG_INFO(Frontend,
+                             "perf: page versions: azaharFlip {} calls; {} versioned, {} swaps, "
+                             "{} written in place under queued reads, {} in place; remaps {} at "
+                             "frame starts, {} early; {} home; {} slots in use",
+                             hs.holds.flip_calls, hs.holds.versions, hs.holds.swaps,
+                             hs.holds.in_place_read, hs.holds.in_place, hs.holds.frame_remaps,
+                             hs.holds.early_remaps, hs.holds.homes, hs.holds.slots_used);
                     std::string by_kind;
                     for (u32 k = 0; k < SgxdRenderer::PageHolds::Kinds; k++) {
                         if (hs.fault_kinds[k] != 0) {
@@ -548,6 +562,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     }
                     LOG_INFO(Frontend, "perf: aborts that waited by hold: {}",
                              by_kind.empty() ? "none" : by_kind);
+                    if (hs.site_count != 0) {
+                        std::string sites;
+                        for (u32 i = 0; i < hs.site_count; i++) {
+                            const auto& site = hs.sites[i];
+                            fmt::format_to(std::back_inserter(sites),
+                                           "{}pc {:#010x} {} {} ({:.1f} ms, page {:#010x})",
+                                           i == 0 ? "" : ", ", site.pc,
+                                           SgxdRenderer::PageHolds::KindName(site.kind),
+                                           site.at.count, site.at.us / 1e3, site.at.page);
+                        }
+                        LOG_INFO(Frontend, "perf: abort sites: {}", sites);
+                    }
                     const auto& p = render_counters.present;
                     LOG_INFO(Frontend,
                              "perf: present ui update {:.1f} ms, screens {:.1f} ms, ui draw "

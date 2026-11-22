@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include "common/common_types.h"
 #include "common/named_thread.h"
 #include "common/process_clock.h"
@@ -136,20 +137,35 @@ public:
     /// the texture pages the HLE wrote (InvalidateWritten).
     std::pair<u32, u32> TakeTextureWrites();
 #endif
+    /// A vblank: a frame starts for the page versions (changed pages remapped, versions armed again).
+    void StartFramePageHolds();
     /// A byte a page of FCRAM then VRAM, nonzero where the guest's view is held.
     [[nodiscard]] const u8* PageHeldMap() const {
         return page_holds.HeldMap();
     }
 #ifdef VITA_DIAGNOSTICS
+    struct FaultSite {
+        u32 count;
+        u64 us;
+        PAddr page;
+    };
     struct HoldStats {
         PageHolds::Stats holds;
         u32 faults, fault_waits;
+        u32 versioned_faults; ///< of the aborts, those a page version took
         u32 geometry_moves;   ///< geometry pages moved to CDRAM after a write waited on them
         u64 fault_wait_us;
         u32 host_waits;
         u64 host_wait_us;
         std::array<u32, PageHolds::Kinds> fault_kinds;
         std::array<u64, PageHolds::Kinds> fault_kind_us;
+        struct Site {
+            u32 pc;
+            PageHolds::Kind kind;
+            FaultSite at;
+        };
+        std::array<Site, 6> sites;
+        u32 site_count;
     };
     HoldStats TakeHoldStats();
 #endif
@@ -342,6 +358,8 @@ private:
         u32 scanned;
     };
     DrawIndexRange draw_indices{};
+    /// The GPU remaps the last holds asked for, as records before the work's.
+    void PutPageRemaps();
     /// Waits for the work a guest access to the page waits for, the open holds' ticket fenced first.
     void WaitHeldPage(u32 page, bool write);
     /// A texture page the HLE wrote: the render side marks the textures over it written
@@ -351,11 +369,12 @@ private:
     u32 texture_write_faults{}, texture_write_hle{};
 #endif
 #ifdef VITA_DIAGNOSTICS
-    u32 faults{}, fault_waits{}, host_waits{}, vblank_waits{};
+    u32 faults{}, fault_waits{}, host_waits{}, versioned_faults{};
     u32 geometry_moves{};
     u64 fault_wait_us{}, host_wait_us{};
     std::array<u32, PageHolds::Kinds> fault_kinds{};
     std::array<u64, PageHolds::Kinds> fault_kind_us{};
+    std::unordered_map<u64, FaultSite> fault_sites; ///< by the guest's PC << 8 | the kind
 #endif
 
     /// The thread's state (a hold, the end) is under `work`. It sleeps on `wake_flag`, an event

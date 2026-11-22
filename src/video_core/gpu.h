@@ -211,8 +211,8 @@ private:
     /// A write of [addr, addr + size): one into a framebuffer the LCD shows has the next vblank
     /// present (VBlankCallback).
     void ScreensWritten(PAddr addr, u32 size);
-    /// Raises a GSP interrupt as upstream does: when its work is submitted, with upstream's
-    /// modelled delay, which GSP applies or drops (simulate_3ds_gpu_timings). Any but a vblank
+    /// Raises a GSP interrupt as upstream does: when its work is submitted, after the delay
+    /// generators' estimate of that work, which GSP adds. Any but a vblank
     /// first takes the rasterizer's ticket for the work before it, which the page holds made
     /// for that work wait for (SgxdRenderer::PageHolds): the guest hears of the work before the
     /// SGX has done it, and a guest access to its pages waits. None while vprof's replay runs.

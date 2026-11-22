@@ -258,8 +258,6 @@ S\'esperen errors gràfics temporals quan estigue activat.</string>
     <string name="texture_filter_description">Millora l\'aspecte visual de les aplicacions aplicant un filtre a les textures. Els filtres compatibles són Anime4K, Ultrafast, Bicubic, ScaleForce, xBRZ Freescale i MMPX.</string>
     <string name="delay_render_thread">Endarrerir fil de renderitzat del joc</string>
     <string name="delay_render_thread_description">Retarda el fil de renderitzat del joc en enviar dades a la GPU. Ajuda a solucionar problemes de rendiment en les (poques) aplicacions amb velocitats de fotogrames dinàmiques.</string>
-    <string name="simulate_3ds_gpu_timings">Simular Temps de GPU de 3DS</string>
-    <string name="simulate_3ds_gpu_timings_description">Retarda els esdeveniments de finalització de la GPU segons els mesuraments presos del maquinari real, perquè els jocs tinguen mesuraments de temps de GPU més realistes. Ajuda a estabilitzar els jocs de FPS dinàmics. Deshabilitar esta funció pot millorar el rendiment en alguns casos excepcionals, però a costa de l\'estabilitat.</string>
     <string name="advanced">Avançat</string>
     <string name="texture_sampling_name">Mostreig de Textures</string>
     <string name="texture_sampling_description">Sobreescriu el filtre de mostreig usat en jocs. Pot ser útil en uns certs casos de jocs amb baix rendiment en pujar la resolució. Si no estàs segur, possa\'l en Controlat per Joc.</string>

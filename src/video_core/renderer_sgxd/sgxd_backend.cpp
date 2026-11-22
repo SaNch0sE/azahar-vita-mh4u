@@ -291,6 +291,19 @@ void SgxdBackend::WaitPassMark(u32 mark, const char* why) {
     RenderWait(pass_fences[at % PassFences], why);
 }
 
+void SgxdBackend::RemapPages(const u32* pte_va, const u32* pte, u32 count) {
+    // The queued untiles and stream-out draws read before it; the pending 3D finishes, so nothing
+    // runs beside the remaps' MMU invalidate.
+    FlushUntiles();
+    FlushStreamOut(false);
+    if (sgxd_session_pending()) {
+        FinishPending(FinishWhy::Remap);
+    }
+    char failed[160];
+    [[maybe_unused]] const int sent = sgxd_remap_submit(pte_va, pte, count, failed, sizeof(failed));
+    ASSERT_MSG(sent == 0, "sgxd: {}", failed);
+}
+
 void SgxdBackend::AfterGpu(std::function<void()> action) {
     retire.emplace_back(FenceAll(), std::move(action));
 }

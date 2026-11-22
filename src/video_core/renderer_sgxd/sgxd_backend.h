@@ -209,6 +209,10 @@ public:
     /// so far has completed, before the guest's interrupt for it (InterruptPoll, InterruptWait)
     /// or a wait for everything. RetireAll waits for and runs every one.
     void AfterGpu(std::function<void()> action);
+    /// A remap list (sgxd_remap_submit): the GPU stores each pte[k] at pte_va[k] in its queue's
+    /// order, after the queued untiles and the pending 3D, then invalidates its MMU. At most
+    /// SGXD_REMAP_MAX.
+    void RemapPages(const u32* pte_va, const u32* pte, u32 count);
     void RetireAll(const char* why);
     [[nodiscard]] bool RetirePending() const {
         return !retire.empty();

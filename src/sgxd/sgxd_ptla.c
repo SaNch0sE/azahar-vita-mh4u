@@ -204,6 +204,35 @@ int sgxd_chain_submit_vars(const SgxdOp *ops, unsigned count, const uint8_t *var
     return r;
 }
 
+int sgxd_remap_submit(const uint32_t* pte_va, const uint32_t* pte, unsigned count, char* failed,
+                      unsigned failed_size) {
+    // The master's and the cores' BIFs (sgxd.c's banks), BIF_CTRL_INVAL each.
+    static const uint32_t banks[] = {0x0000u, 0x4000u, 0x8000u, 0xc000u, 0x10000u, 0x14000u};
+    if (count == 0 || count > SGXD_REMAP_MAX) {
+        snprintf(failed, failed_size, "remap of %u PTEs", count);
+        return -1;
+    }
+    SgxdOp ops[1 + SGXD_REMAP_MAX + 2 * 6 + 2];
+    unsigned n = 0;
+    ops[n++] = (SgxdOp){SGXD_OP_WAIT_TWOD, 0, twod_sent, 0, TWOD_POLL_US};
+    for (unsigned k = 0; k < count; k++) {
+        ops[n++] = (SgxdOp){SGXD_OP_STORE, 0, pte[k], pte_va[k], 0};
+    }
+    for (unsigned b = 0; b < sizeof(banks) / sizeof(banks[0]); b++) {
+        ops[n++] = (SgxdOp){SGXD_OP_WRITE, banks[b] + 0x0c34u, 0, 0, 0};
+        ops[n++] = (SgxdOp){SGXD_OP_WRITE, banks[b] + 0x0c34u, 0x8u, 0, 0};
+    }
+    ops[n++] = (SgxdOp){SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0, 0};
+    ops[n++] = (SgxdOp){SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0, 0};
+    const int r = sgxd_chain_submit_vars(ops, n, NULL, NULL);
+    if (r < 0) {
+        snprintf(failed, failed_size, "remap of %u PTEs from %08x: sgxd_chain_submit %08x", count,
+                 pte_va[0], (unsigned)r);
+        return -1;
+    }
+    return 0;
+}
+
 int sgxd_ptla_waker(int32_t flag, uint32_t bits) {
     return sgxdWaker(flag, bits);
 }

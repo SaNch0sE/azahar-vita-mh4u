@@ -93,6 +93,10 @@ public:
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
     bool AccelerateDma(PAddr src, PAddr dst, u32 size) override;
+    /// The GPU's MMU onto the guest's slots of `pages`, in order with the work queued (each pte[k]
+    /// stored at pte_va[k]). At most SGXD_REMAP_MAX. `direct`: queued work read or wrote a page's old
+    /// slot other than as a texture.
+    void RemapPages(const u32* pages, const u32* pte_va, const u32* pte, u32 count, bool direct);
     /// The GPU's MMU onto the pages a page move or return put under the CPU's views. Returns the fence
     /// the work queued with it is done by.
     u32 RemapMoved(const u32* pte_va, const u32* pte, u32 count);
@@ -251,6 +255,8 @@ private:
         /// A non-power-of-two 2D texture's rows this many texels apart (a multiple of 32); 0 for a
         /// power-of-two chain.
         u32 stride = 0;
+        /// Untiled into its own memory again when written (a cube, an ETC1A4 chain), not into a new copy.
+        bool in_place = false;
         /// A byte copy's U8 swizzle: 6 for A8 and A4 (alpha), 5 for I8 and I4 (intensity); 0 for
         /// A8B8G8R8.
         u8 byte_swizzle = 0;

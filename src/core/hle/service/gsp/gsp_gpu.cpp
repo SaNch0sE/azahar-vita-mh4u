@@ -426,11 +426,6 @@ void GSP_GPU::UnregisterInterruptRelayQueue(Kernel::HLERequestContext& ctx) {
 
 void GSP_GPU::SignalInterruptForThread(InterruptId interrupt_id, u32 thread_id, u64 wait_delay_ns) {
 
-    // Every gsp request takes a constant amount of time to be
-    // processed and control returned to the application. This
-    // time is estimated below.
-    static constexpr u64 sync_delay_nanoseconds = 300 * 1000;
-
     // For a reason not yet understood, Super Mario 3D Land hangs on a white screen after the title
     // screen when any of the save slots have the completion star icons. This is in some way related
     // to the timings of texture copy commands, and gets fixed if we increase the amount of time
@@ -491,21 +486,12 @@ void GSP_GPU::SignalInterruptForThread(InterruptId interrupt_id, u32 thread_id, 
         perf_recorder.UpdateTime(interrupt_id, wait_delay_ns);
     }
 
-    if (Settings::values.simulate_3ds_gpu_timings.GetValue()) {
-
-        if (delay_texture_copy_completion) {
-            wait_delay_ns += (interrupt_id == InterruptId::PPF)
-                                 ? sync_delay_nanoseconds_delayed_texcopy
-                                 : sync_delay_nanoseconds;
-        } else {
-            wait_delay_ns += sync_delay_nanoseconds;
-        }
-    } else {
-        if (delay_texture_copy_completion && interrupt_id == InterruptId::PPF) {
-            wait_delay_ns += sync_delay_nanoseconds_delayed_texcopy;
-        } else {
-            wait_delay_ns = 0;
-        }
+    // The delay is the GPU's delay generators' estimate of the work (VideoCore::GPU::Signal),
+    // always: the GPU's work itself goes on behind the interrupt over the page holds
+    // (SgxdRenderer::PageHolds). Upstream's simulate_3ds_gpu_timings, which turned it
+    // and a fixed 300 us a request on and off, is gone.
+    if (delay_texture_copy_completion && interrupt_id == InterruptId::PPF) {
+        wait_delay_ns += sync_delay_nanoseconds_delayed_texcopy;
     }
 
 #ifdef SHOW_AVERAGE_TIME_PER_FRAME

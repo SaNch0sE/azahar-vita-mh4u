@@ -29,7 +29,7 @@ namespace Pica {
 class ShaderEngine;
 
 /// Upstream's: how long the PICA takes for a command list, from its commands and
-/// triangles, which GSP adds to P3D when simulate_3ds_gpu_timings is on.
+/// triangles, which GSP adds to P3D.
 class DelayGenerator {
 private:
     // A GPU is a very complex system, the timings resulting from

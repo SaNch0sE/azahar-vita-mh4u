@@ -3,11 +3,18 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cstring>
 #include <utility>
 #include "azahar_native.h"
 #include "common/assert.h"
+#include "common/host_shared_memory.h"
+#include "common/logging/log.h"
 #include "core/memory.h"
-#include "video_core/renderer_gxm/page_holds.h"
+#include "sgxd.h"
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#include "video_core/renderer_sgxd/page_holds.h"
 
 namespace SgxdRenderer {
 
@@ -15,6 +22,8 @@ namespace {
 
 constexpr u32 PageBits = 12;
 constexpr u32 PageSize = 1u << PageBits;
+/// The versions' pool: CDRAM, uncached for the CPU, as the moved pages it versions are.
+constexpr u32 VersionPoolSize = 4u << 20;
 
 static_assert(sizeof(AzaharHoldRun) == sizeof(std::array<u32, 3>));
 static_assert(PageHolds::Unheld == AZAHAR_HOLD_NONE && PageHolds::ReadOnly == AZAHAR_HOLD_WRITES &&
@@ -30,10 +39,28 @@ PageHolds::PageHolds(Memory::MemorySystem& memory)
       write_ticket(pages), applied(pages), watched(fcram_pages) {
 #ifdef VITA_DIAGNOSTICS
     kinds.resize(pages);
+    ranges.resize(pages);
+    write_kinds.resize(pages);
+    write_ranges.resize(pages);
 #endif
     ASSERT_MSG(fcram_host != nullptr && vram_host != nullptr,
                "page holds: guest FCRAM or VRAM has no host address");
+    version_pool = std::make_unique<Common::HostSharedMemory>(
+        VersionPoolSize, "azahar-page-versions", Common::HostSharedMemory::Placement::GpuLocal);
+    // sgxd's page tables in the GPU's own view, for the remaps the microkernel stores (GPU idle).
+    const int tables = sgxdMapTables(TablesVa);
+    ASSERT_MSG(tables >= 0,
+               "page holds: sgxd's page tables were not mapped at GPU {:#010x}: {:#010x}", TablesVa,
+               static_cast<u32>(tables));
+    versions.resize(fcram_pages);
+    const u32 count = VersionPoolSize >> PageBits;
+    free_slots.reserve(count);
+    for (u32 s = count; s-- > 0;) {
+        free_slots.push_back(static_cast<u16>(s));
+    }
 }
+
+PageHolds::~PageHolds() = default;
 
 bool PageHolds::PagesOf(PAddr addr, u32 bytes, u32& first, u32& count) const {
     if (bytes == 0) {
@@ -104,7 +131,7 @@ const char* PageHolds::KindName(Kind kind) {
     return kind < Kinds ? names[kind] : "?";
 }
 
-void PageHolds::Read(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind kind) {
+void PageHolds::Read(PAddr addr, u32 bytes, u32 ticket, Kind kind) {
     u32 first, count;
     if (!PagesOf(addr, bytes, first, count)) {
         return;
@@ -112,7 +139,8 @@ void PageHolds::Read(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind ki
     DEBUG_ASSERT_MSG(open_ticket == 0 || open_ticket == ticket,
                      "page holds: ticket {} while {}'s are open", ticket, open_ticket);
     open_ticket = ticket;
-    if (Seen(addr, bytes, 0)) {
+    // A texture's range apart from the same range read otherwise (PageVersion::direct).
+    if (Seen(addr, bytes, kind == Texture ? 0 : 2)) {
         return;
     }
     if (first >= fcram_pages) {
@@ -143,7 +171,21 @@ void PageHolds::Read(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind ki
         geometry_read[p] = kind == Vertex || kind == Index ? 1 : 0;
 #ifdef VITA_DIAGNOSTICS
         kinds[p] = kind;
+        ranges[p] = {addr, bytes};
 #endif
+        if (versions[p].on) {
+            // A changed page that later work in the frame reads: the GPU's MMU onto the guest's
+            // slot before it. Protected by the frame (StartFrame), not by this work.
+            if (Changed(p)) {
+                RemapToGuest(p, ticket);
+#ifdef VITA_DIAGNOSTICS
+                stats.early_remaps++;
+#endif
+            }
+            versions[p].direct |= kind != Texture;
+            versions[p].use_frame = frame;
+            continue;
+        }
         if (applied[p] < ReadOnly) {
             Change(p, ReadOnly);
         }
@@ -163,6 +205,17 @@ void PageHolds::Write(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind k
         return;
     }
     for (u32 p = first; p < first + count; p++) {
+        // The GPU writes the guest's slot.
+        if (p < fcram_pages && versions[p].on) {
+            if (Changed(p)) {
+                RemapToGuest(p, ticket);
+#ifdef VITA_DIAGNOSTICS
+                stats.early_remaps++;
+#endif
+            }
+            versions[p].direct = true;
+            versions[p].use_frame = frame;
+        }
         write_ticket[p] = ticket;
         if (p < fcram_pages) {
             index_stamp[p]++;
@@ -170,6 +223,9 @@ void PageHolds::Write(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind k
         }
 #ifdef VITA_DIAGNOSTICS
         kinds[p] = kind;
+        ranges[p] = {addr, bytes};
+        write_kinds[p] = kind;
+        write_ranges[p] = {addr, bytes};
 #endif
         if (applied[p] < NoAccess) {
             Change(p, NoAccess);
@@ -327,10 +383,18 @@ PageHolds::Access PageHolds::HoldsWant(u32 page, u32 reached) const {
     if (page >= fcram_pages) {
         return vram_held ? ReadOnly : Unheld;
     }
+    if (versions[page].on) {
+        // Protected by the frame: closed to writes while the frame's arming lasts.
+        return versions[page].armed ? ReadOnly : Unheld;
+    }
     return Live(read_ticket[page], reached) ? ReadOnly : Unheld;
 }
 
 u32 PageHolds::WaitFor(u32 page, bool write, u32 reached) const {
+    // A versioned page: writes go on without a wait (a GPU write queued aside).
+    if (page < fcram_pages && versions[page].on) {
+        return Live(write_ticket[page], reached) ? write_ticket[page] : 0;
+    }
     u32 ticket = Live(write_ticket[page], reached) ? write_ticket[page] : 0;
     if (write) {
         const u32 read = page >= fcram_pages ? vram_read : read_ticket[page];
@@ -385,7 +449,173 @@ void PageHolds::Apply() {
     Flush();
 }
 
+u16 PageHolds::AllocSlot() {
+    ASSERT_MSG(!free_slots.empty(), "page holds: the {} KiB versions' pool is full",
+               VersionPoolSize >> 10);
+    const u16 s = free_slots.back();
+    free_slots.pop_back();
+    return s;
+}
+
+u8* PageHolds::SlotHost(u16 slot) const {
+    return version_pool->Data() + (static_cast<u32>(slot) << PageBits);
+}
+
+void PageHolds::Flip(u32 page, u16 slot) {
+    const u32 va = static_cast<u32>(reinterpret_cast<uintptr_t>(fcram_host + (page << PageBits)));
+    const u32 to =
+        slot == NoSlot ? 0u : static_cast<u32>(reinterpret_cast<uintptr_t>(SlotHost(slot)));
+    flips.push_back({va, to});
+}
+
+bool PageHolds::Version(u32 page, u32 reached) {
+    DEBUG_ASSERT(page < fcram_pages);
+    PageVersion& v = versions[page];
+    // A GPU write queued: the guest waits for it, as the ordinary holds decide.
+    if (Live(write_ticket[page], reached)) {
+        return false;
+    }
+    u8* const host = fcram_host + (page << PageBits);
+    const bool read = Live(read_ticket[page], reached);
+    if (!v.on) {
+        // Nothing queued reads it: the ordinary holds open it.
+        if (!read) {
+            return false;
+        }
+        v = PageVersion{};
+        v.pool[0] = AllocSlot();
+        v.on = true;
+        index_stamp[page]++;
+        index_watch[page] = 0;
+        versioned.push_back(page);
+#ifdef VITA_DIAGNOSTICS
+        stats.versions++;
+#endif
+    }
+    // Onto a slot no queued work reads when queued work reads the guest's: the GPU's MMU keeps
+    // the slot its queued work reads. Otherwise the write goes where the guest is, without a wait.
+    u8 target = Slots;
+    if (read && !Changed(page)) {
+        for (u8 i = 1; i < Slots && target == Slots; i++) {
+            const u8 s = static_cast<u8>((v.guest + i) % Slots);
+            if ((s == 0 || v.pool[s - 1] != NoSlot) && !Live(v.busy[s], reached)) {
+                target = s;
+            }
+        }
+        for (u8 s = 1; s < Slots && target == Slots; s++) {
+            if (v.pool[s - 1] == NoSlot) {
+                v.pool[s - 1] = AllocSlot();
+                target = s;
+            }
+        }
+    }
+    if (target != Slots) {
+        if (target == 0) {
+            // Home: the app's view goes there first, the home's only CPU mapping.
+            Flip(page, NoSlot);
+            Flush();
+            std::memcpy(host, SlotHost(v.pool[v.guest - 1]), PageSize);
+        } else {
+            std::memcpy(SlotHost(v.pool[target - 1]), host, PageSize);
+            Flip(page, v.pool[target - 1]);
+        }
+        v.guest = target;
+        // The ranges held for the open ticket are read again: a later read remaps.
+        seen = {};
+#ifdef VITA_DIAGNOSTICS
+        stats.swaps++;
+    } else if (read) {
+        stats.in_place_read++;
+    } else {
+        stats.in_place++;
+#endif
+    }
+    // Open for the rest of the frame.
+    v.armed = false;
+    v.use_frame = frame;
+    if (applied[page] != Unheld) {
+        Change(page, Unheld);
+    }
+    Flush();
+    return true;
+}
+
+void PageHolds::RemapToGuest(u32 page, u32 ticket) {
+    // The PTE word now, while the app's view shows the guest's slot of this ticket.
+    u32 out[2];
+    const int r = sgxdPte(AddressOf(page), fcram_host + (page << PageBits), out);
+    ASSERT_MSG(r == 0, "page holds: no remap of page {:#010x}: {:#010x}", AddressOf(page),
+               static_cast<u32>(r));
+    PageVersion& v = versions[page];
+    remaps.push_back({AddressOf(page), out[0], out[1], v.direct ? 1u : 0u});
+    // The slot the GPU leaves is read by queued work up to this ticket.
+    v.busy[v.gpu] = ticket;
+    v.gpu = v.guest;
+    v.direct = false;
+    v.use_frame = frame;
+}
+
+void PageHolds::StartFrame(u32 reached, u32 ticket) {
+    frame++;
+    std::size_t kept = 0;
+    for (const u32 page : versioned) {
+        PageVersion& v = versions[page];
+        // The changed pages onto the GPU, in one batch at the frame's start.
+        if (Changed(page)) {
+            RemapToGuest(page, ticket);
+#ifdef VITA_DIAGNOSTICS
+            stats.frame_remaps++;
+#endif
+        }
+        const bool idle = frame - v.use_frame >= ConvergeFrames &&
+                          !Live(read_ticket[page], reached) && !Live(write_ticket[page], reached);
+        const bool pool_read = std::any_of(v.busy.begin() + 1, v.busy.end(),
+                                           [&](u32 busy) { return Live(busy, reached); });
+        if (idle && v.guest == 0 && v.gpu == 0 && !pool_read) {
+            // Home on both sides and nothing reads its pool slots: they go back, one page again.
+            for (const u16 slot : v.pool) {
+                if (slot != NoSlot) {
+                    free_slots.push_back(slot);
+                }
+            }
+            v = PageVersion{};
+#ifdef VITA_DIAGNOSTICS
+            stats.homes++;
+#endif
+        } else {
+            if (idle && v.guest != 0 && v.guest == v.gpu && !Live(v.busy[0], reached)) {
+                // Unused for a while on a pool slot: the guest goes home with its bytes (no
+                // queued work reads the home), the GPU at the next frame's start.
+                Flip(page, NoSlot);
+                Flush();
+                std::memcpy(fcram_host + (page << PageBits), SlotHost(v.pool[v.guest - 1]),
+                            PageSize);
+                v.guest = 0;
+            }
+            v.armed = true;
+            versioned[kept++] = page;
+        }
+        const Access wanted = Wanted(page, reached);
+        if (wanted != applied[page]) {
+            Change(page, wanted);
+        }
+    }
+    versioned.resize(kept);
+    Flush();
+}
+
 void PageHolds::Flush() {
+    for (std::size_t at = 0; at < flips.size(); at += AZAHAR_FLIP_MAX_RUNS) {
+        const u32 n =
+            static_cast<u32>(std::min<std::size_t>(AZAHAR_FLIP_MAX_RUNS, flips.size() - at));
+        const int r = azaharFlip(reinterpret_cast<const AzaharFlipRun*>(flips.data() + at), n);
+        ASSERT_MSG(r >= 0, "page holds: azaharFlip of {} pages failed: {:#010x}", n,
+                   static_cast<u32>(r));
+#ifdef VITA_DIAGNOSTICS
+        stats.flip_calls++;
+#endif
+    }
+    flips.clear();
     if (changed.empty()) {
         return;
     }
@@ -422,8 +652,14 @@ void PageHolds::Flush() {
     }
 }
 
+PAddr PageHolds::AddressOf(u32 page) const {
+    return page < fcram_pages ? Memory::FCRAM_PADDR + (page << PageBits)
+                              : Memory::VRAM_PADDR + ((page - fcram_pages) << PageBits);
+}
+
 #ifdef VITA_DIAGNOSTICS
 PageHolds::Stats PageHolds::TakeStats() {
+    stats.slots_used = static_cast<u32>((VersionPoolSize >> PageBits) - free_slots.size());
     return std::exchange(stats, {});
 }
 
@@ -451,11 +687,6 @@ PageHolds::Kind PageHolds::WaitKind(u32 page, bool write, u32 reached) const {
         return static_cast<Kind>(vram_read_kind);
     }
     return static_cast<Kind>(kinds[page]);
-}
-
-PAddr PageHolds::AddressOf(u32 page) const {
-    return page < fcram_pages ? Memory::FCRAM_PADDR + (page << PageBits)
-                              : Memory::VRAM_PADDR + ((page - fcram_pages) << PageBits);
 }
 #endif
 
