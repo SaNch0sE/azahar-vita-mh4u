@@ -25,6 +25,8 @@ static const uint16_t triangle_indices[3] = {0, 1, 2};
 static const SgxdRecipeDraw triangle_draw = {0, 3, SGXD_RECIPE_ISP_A, SGXD_R_FPRIM, 0, 0};
 
 #define OUTSELECTS (4u << 24 | 0x1000u)
+// VTXSIZE 8: the position and the base colour (bit 11, the TSP data's base colour).
+#define IMGUI_OUTSELECTS (8u << 24 | 0x1000u | 0x800u)
 
 static uint32_t fbits(float x) {
     uint32_t bits;
@@ -101,6 +103,67 @@ static void colour_fs(Code *c, uint32_t offset, uint32_t colour) {
 enum { CV_DUMMY_VS, CV_COPY_STATE, CV_COPY_TERM, CV_VS, CV_COUNT };
 enum { CF_DUMMY_FS, CF_BG_FS, CF_EOR, CF_PTOFF, CF_EOT, CF_TRI_FS, CF_COUNT };
 
+// Step E2's vertex program over an ImDrawVert in pa0..pa4 and the scale and offset in sa0..sa3:
+// o0, o1 = position * scale + offset, o2 = 0.5, o3 = 1.0, o4..o7 = the colour's four bytes / 255
+// (the base colour): vnmad, vunpck_u8 and limm with skipinv (a mask-3
+// VPCK U8-to-F32 writes two registers, docs/sgxd/usse.md), here into o. Temporaries
+// r0, r1.
+#define IMGUI_VS_TEMPS 2u
+static const uint64_t imgui_vs[] = {
+    0x08a44184b0040000ull,   // mul r0.xy, pa0.xy, sa0.xy
+    0x08a4418530041001ull,   // add o0.xy, r0.xy, sa2.xy
+    0x4080018da09d8200ull,   // unpck.u8.scl o4.xy, pa4 bytes 0 1
+    0x4080018da0df8202ull,   // unpck.u8.scl o6.xy, pa4 bytes 2 3
+    0xfc20f18100400000ull,   // limm o2, 0.5
+    0xfc20f1c100600000ull,   // limm o3, 1.0
+};
+// SGXD_IMGUI_COLOUR_UV (sgxd_test 07) also copies the UV to o8, o9, the recipe's own copy form
+// (copyprog's OR with a repeat), as TC0.
+#define IMGUI_VS_UV 0x50a11009a1000100ull   // or o8..o9, pa2..pa3 (repeat 2)
+// Its fragment program there: r and g of the iterated colour (pa0, pa1) and the iterated u and v
+// (pa4, pa5) as four unorm bytes into o0, one scaled VPCK F32 to U8 (its rounding and saturation
+// in docs/sgxd/usse.md), then the end.
+#define IMGUI_FS_UV 0x40800c3da01d8004ull   // pack.u8.f32.scl o0, pa0.xy pa4.xy
+// SGXD_IMGUI_UV_RAW + n: or o0, pa n, #0, the copy form with one word. SGXD_IMGUI_TEXEL copies
+// the texel from pa4 so.
+#define IMGUI_FS_RAW(n) (0x50a10009a0000000ull | (uint64_t)(n) << 7)
+// SGXD_IMGUI_TEXEL's texture issue: USEISSUE NONE, TEXISSUE TC0, TEXPROJ RHW, TEXLASTISSUE
+// (issues fill the PA words in PDS order, docs/sgxd/pds.md).
+#define IMGUI_DOUTI_TEX 0x0000f900u
+
+static int imgui_uv(const SgxdRecipe *r) {
+    return (r->imgui_fs >= SGXD_IMGUI_COLOUR_UV && r->imgui_fs <= SGXD_IMGUI_TEXEL) ||
+           r->imgui_fs == SGXD_IMGUI_MODULATE;
+}
+// The modes that sample texture 0 into pa4.
+static int imgui_texel(const SgxdRecipe *r) {
+    return r->imgui_fs == SGXD_IMGUI_TEXEL || r->imgui_fs == SGXD_IMGUI_MODULATE;
+}
+
+// Its fragment program, the pixel's iterated base colour (four F32 lanes in pa0..pa3) to o0 as
+// four unorm bytes: a pack of F32 to F16 into pa0 and one of F16 to U8 scaled into o0, with END.
+static const uint64_t imgui_fs[] = {
+    0x40800d7ea0198002ull,   // pack.f16.f32 pa0, pa0..pa3
+    0x40a40a3da01d8000ull,   // pack.u8.f16.scl o0, pa0 (end)
+};
+// SGXD_IMGUI_BLEND's (sgxd_test 09): the same packs into pa0, then the blend over the output
+// buffer's o0 (the pixel's current value), one SOP2: colour = pa0 * pa0.a
+// + o0 * (1 - pa0.a), alpha = pa0.a + o0.a * (1 - pa0.a), ends the program.
+static const uint64_t imgui_fs_blend[] = {
+    0x40800d7ea0198002ull,   // pack.f16.f32 pa0, pa0..pa3
+    0x40a00a3ea01d8000ull,   // pack.u8.f16.scl pa0, pa0
+    0x80848add90000000ull,   // sop2 o0, pa0, o0: SRCALPHA, ONE_MINUS_SRCALPHA (end)
+};
+// SGXD_IMGUI_MODULATE's (sgxd_test 12): SGXD_IMGUI_BLEND's packs, then texel * colour as one SOP2
+// (CSEL1 SRC2, CSEL2 ZERO, ASEL1 SRC2ALPHA, ASEL2 ZERO, ADD;
+// SKIPINV; source 1 pa0, source 2 pa4, destination pa0), then E5's blend.
+static const uint64_t imgui_fs_modulate[] = {
+    0x40800d7ea0198002ull,   // pack.f16.f32 pa0, pa0..pa3
+    0x40a00a3ea01d8000ull,   // pack.u8.f16.scl pa0, pa0
+    0x80a00082a0000004ull,   // sop2 pa0, pa0, pa4: SRC2, ZERO (pa0 * pa4 per byte)
+    0x80848add90000000ull,   // sop2 o0, pa0, o0: SRCALPHA, ONE_MINUS_SRCALPHA (end)
+};
+
 static void make_cv(const SgxdRecipe *r, Code cv[CV_COUNT]) {
     memset(cv, 0, sizeof(Code) * CV_COUNT);
     cv[CV_DUMMY_VS].offset = 0x00;
@@ -108,6 +171,18 @@ static void make_cv(const SgxdRecipe *r, Code cv[CV_COUNT]) {
     copyprog(&cv[CV_COPY_STATE], 0x40, 24);
     copyprog(&cv[CV_COPY_TERM], 0x80, 2);
     cv[CV_VS].offset = 0xc0;
+    if (r->imgui) {
+        code_add(&cv[CV_VS], PHAS_LAST);
+        code_add(&cv[CV_VS], NOP);
+        for (unsigned i = 0; i < sizeof(imgui_vs) / sizeof(imgui_vs[0]); i++) {
+            code_add(&cv[CV_VS], imgui_vs[i]);
+        }
+        if (imgui_uv(r)) {
+            code_add(&cv[CV_VS], IMGUI_VS_UV);
+        }
+        code_add(&cv[CV_VS], END_VERTEX);
+        return;
+    }
     if (r->copy_vs) {
         // A caller's scene: o[n] = pa[n] for every vertex word, 16 to an instruction.
         code_add(&cv[CV_VS], PHAS_LAST);
@@ -163,6 +238,35 @@ static void make_cf(const SgxdRecipe *r, Code cf[CF_COUNT]) {
         code_add(&cf[CF_EOT], usse_limm(i, r->pbe[i]) | SKIPINV);
     }
     code_add(&cf[CF_EOT], EMITPIX_EOT);
+    if (r->imgui) {
+        cf[CF_TRI_FS].offset = 0x140;
+        code_add(&cf[CF_TRI_FS], PHAS_LAST);
+        if (r->imgui_fs == SGXD_IMGUI_MODULATE) {
+            for (unsigned i = 0; i < sizeof(imgui_fs_modulate) / sizeof(imgui_fs_modulate[0]);
+                 i++) {
+                code_add(&cf[CF_TRI_FS], imgui_fs_modulate[i]);
+            }
+            return;
+        }
+        if (imgui_uv(r)) {
+            code_add(&cf[CF_TRI_FS], (r->imgui_fs == SGXD_IMGUI_TEXEL ? IMGUI_FS_RAW(4) :
+                                      r->imgui_fs >= SGXD_IMGUI_UV_RAW ?
+                                      IMGUI_FS_RAW(r->imgui_fs - SGXD_IMGUI_UV_RAW) :
+                                      IMGUI_FS_UV) | SKIPINV);
+            code_add(&cf[CF_TRI_FS], NOP_END);
+            return;
+        }
+        if (r->imgui_fs == SGXD_IMGUI_BLEND) {
+            for (unsigned i = 0; i < sizeof(imgui_fs_blend) / sizeof(imgui_fs_blend[0]); i++) {
+                code_add(&cf[CF_TRI_FS], imgui_fs_blend[i]);
+            }
+            return;
+        }
+        for (unsigned i = 0; i < sizeof(imgui_fs) / sizeof(imgui_fs[0]); i++) {
+            code_add(&cf[CF_TRI_FS], imgui_fs[i]);
+        }
+        return;
+    }
     colour_fs(&cf[CF_TRI_FS], 0x140, SGXD_RECIPE_TRI);
 }
 
@@ -193,6 +297,15 @@ static uint32_t movsa(uint32_t i) { return i | 5u << 27; }
 static uint32_t mul(unsigned s1reg, unsigned s1, unsigned s2, unsigned d1, unsigned d) {
     return 1u << 30 | 4u << 27 | 7u << 24 | s1reg << 23 | s1 << 16 | s2 << 8 | d1 << 6 | d;
 }
+// DOUTI of DS1 word w whose USE iterator writes itr_words words: the MOVS's last two swizzle
+// fields are TAGSIZE and ITRSIZE, each one less than the words.
+static uint32_t douti(unsigned w, unsigned itr_words) {
+    return (movs(2, 0, 1, 0, w / 2, w & 1 ? S2H : S2L, S1L, S1L, S1L) & ~0xf0u) |
+           (itr_words - 1) << 4;
+}
+static uint32_t doutt(unsigned p, unsigned fconv) {
+    return movs(4, 0, p, 0, p, S1L, S1L, S1L, S1L) | fconv << 4;
+}
 static uint32_t doutu0(unsigned cb, unsigned idx, unsigned tu) { return cb | idx << 4 | tu << 24; }
 static uint32_t doutd1(unsigned pa, unsigned n) { return (n - 1) | pa << 8; }
 static uint32_t douta1(unsigned pa) { return pa << 8; }
@@ -216,6 +329,19 @@ static unsigned pds_pair(Pds *p, unsigned b, uint32_t lo, uint32_t hi) {
     p->ds[b][p->len[b]++] = lo;
     p->ds[b][p->len[b]++] = hi;
     return p->len[b] / 2 - 1;
+}
+// Four words at one pair index of both segments, a DOUTT's: DS0 takes words 0 and 1, DS1 2 and 3.
+static unsigned pds_quad(Pds *p, const uint32_t w[4]) {
+    unsigned n = p->len[0] > p->len[1] ? p->len[0] : p->len[1];
+    n = (n + 1) & ~1u;
+    for (unsigned b = 0; b < 2; b++) {
+        while (p->len[b] < n) {
+            p->ds[b][p->len[b]++] = 0;
+        }
+        p->ds[b][p->len[b]++] = w[2 * b];
+        p->ds[b][p->len[b]++] = w[2 * b + 1];
+    }
+    return n / 2;
 }
 static void pds_emit(Pds *p, uint32_t i) { p->code[p->ncode++] = i; }
 static unsigned pds_units(const Pds *p) {
@@ -255,6 +381,33 @@ static void colour_prim(Pds *p, unsigned idx) {
     pds_emit(p, HALT);
 }
 
+// ImGui mode's FPRIM: DOUTU, then the base colour's iterator into pa0..pa3: DOUTI 0x0ed0a00f,
+// (V0, USECOLFLOAT, four F32 lanes, Gouraud, linear), ITRSIZE 4. With the UV, TC0's iterator
+// follows into pa4, pa5 (two F32 lanes, ITRSIZE 2) and takes USELASTISSUE (bit 25) from V0's. In
+// SGXD_IMGUI_TEXEL mode the texture issue follows V0's instead, then the DOUTT of tex, the texel
+// unconverted into pa4 (TAGSIZE 1): DOUTI then DOUTT.
+static void imgui_prim(const SgxdRecipe *r, const Code *cf, Pds *p, const uint32_t tex[4]) {
+    memset(p, 0, sizeof(*p));
+    const int texel = imgui_texel(r), uv = imgui_uv(r) && !texel;
+    // DOUTU1: SDSOFT, ITERATORSDEPENDENCY and, with a texture issue, TEXTUREDEPENDENCY (bit 3).
+    // Without it the task starts before the sample lands: pa4 then holds stale words.
+    const unsigned k = pds_pair(p, 0, doutu0(1, FI(cf, CF_TRI_FS), 0),
+                                1u << 1 | 1u << 2 | (texel ? 1u << 3 : 0));
+    pds_word(p, 1, 0);
+    const unsigned w = pds_word(p, 1, uv ? 0x0cd0a00fu : 0x0ed0a00fu);
+    const unsigned t = uv ? pds_word(p, 1, 0x0e40000fu) : texel ? pds_word(p, 1, IMGUI_DOUTI_TEX) : 0;
+    const unsigned q = texel ? pds_quad(p, tex) : 0;
+    pds_emit(p, doutu(k, 0));
+    pds_emit(p, douti(w, 4));
+    if (uv || texel) {
+        pds_emit(p, douti(t, uv ? 2 : 1));
+    }
+    if (texel) {
+        pds_emit(p, doutt(q, 0));
+    }
+    pds_emit(p, HALT);
+}
+
 // State words 10 and 11, the region clip: MODE OUTSIDE (2), left
 // and right tiles in the first, top and bottom in the second, inclusive; clip 0 is the target.
 static uint32_t clip_x(const SgxdRecipe *r, uint32_t clip) {
@@ -282,20 +435,34 @@ static void make_pds(const SgxdRecipe *r, const Code *cv, const Code *cf, Pds *p
     for (unsigned n = 0; n < r->ndraws && n < 8; n++) {
         copy_pds(r, cv, n, &pds[copy_part(n)]);
     }
-    // The vertex fetch: ds1[50] = IR0L * 16, then a MOVSA DOUTD of the vertex and DOUTU (IF0).
+    // The vertex fetch: ds1[50] = IR0L * stride, then a MOVSA DOUTD of the vertex and DOUTU (IF0).
     p = &pds[SGXD_R_VSPDS];
     memset(p, 0, sizeof(*p));
     {
-        pds_word(p, 1, NV * 4);
+        const unsigned words = r->vertex_words;
+        pds_word(p, 1, words * 4);
         pds_word(p, 1, 0);
-        const unsigned k = pds_pair(p, 0, sgxd_recipe_va(r, SGXD_R_VERTS), doutd1(0, NV));
-        const unsigned kick = pds_pair(p, 0, doutu0(0, VI(cv, CV_VS), 0), 0);
+        const unsigned k = pds_pair(p, 0, sgxd_recipe_va(r, SGXD_R_VERTS), doutd1(0, words));
+        const unsigned kick = pds_pair(p, 0, doutu0(0, VI(cv, CV_VS), r->imgui ? 1 : 0), 0);
         pds_emit(p, mul(1, 0, 0, 1, 50));
         pds_emit(p, movsa(movs(3, 0, k, 0, 25, S1L, S1H, S2L, S2L)));
         pds_emit(p, cc(doutu(kick, 1), 3));
         pds_emit(p, HALT);
     }
-    secondary(&pds[SGXD_R_VSEC], doutu0(0, VI(cv, CV_DUMMY_VS), 0));
+    if (r->imgui) {
+        // The vertex program's scale and offset: four words into sa0..sa3, then the dummy
+        // program.
+        p = &pds[SGXD_R_VSEC];
+        memset(p, 0, sizeof(*p));
+        const unsigned k = pds_pair(p, 0, r->base + r->vertex_sa, doutd1(0, 4));
+        const unsigned i = pds_pair(p, 0, doutu0(0, VI(cv, CV_DUMMY_VS), 0), 0);
+        pds_word(p, 1, 0);
+        pds_emit(p, doutd(k));
+        pds_emit(p, doutu(i, 0));
+        pds_emit(p, HALT);
+    } else {
+        secondary(&pds[SGXD_R_VSEC], doutu0(0, VI(cv, CV_DUMMY_VS), 0));
+    }
     // The terminate state: PA0 = 0x2000 (TERMINATE present), PA1..3 = TARNDCLIP.
     p = &pds[SGXD_R_TERM];
     memset(p, 0, sizeof(*p));
@@ -313,7 +480,12 @@ static void make_pds(const SgxdRecipe *r, const Code *cv, const Code *cf, Pds *p
         pds_emit(p, HALT);
     }
     secondary(&pds[SGXD_R_FSEC], doutu0(1, FI(cf, CF_DUMMY_FS), 0));
-    colour_prim(&pds[SGXD_R_FPRIM], FI(cf, CF_TRI_FS));
+    if (r->imgui) {
+        static const uint32_t no_texture[4] = {0};
+        imgui_prim(r, cf, &pds[SGXD_R_FPRIM], no_texture);
+    } else {
+        colour_prim(&pds[SGXD_R_FPRIM], FI(cf, CF_TRI_FS));
+    }
     secondary(&pds[SGXD_R_BGSEC], doutu0(1, FI(cf, CF_DUMMY_FS), 0));
     colour_prim(&pds[SGXD_R_BGPRIM], FI(cf, CF_BG_FS));
 }
@@ -362,36 +534,59 @@ static void vertex_dms(unsigned pa, unsigned temps, unsigned sa, unsigned out, u
     *w5 = (out >> 2) << 25 | adv << 23 | (size >> 2) << 9;
 }
 
+// A draw init and sgxd_recipe_set_draws accept: first a multiple of 8, its indices inside nindices.
+static int draw_valid(const SgxdRecipeDraw *d, unsigned nindices) {
+    return !(d->first & 7) && d->first <= nindices && d->count && d->count <= nindices - d->first &&
+           (d->fprim == SGXD_R_FPRIM || d->fprim == SGXD_R_BGPRIM) && d->cull <= 2 &&
+           !(d->clip && (d->clip & 0x40404040u));
+}
+
 static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, uint32_t pages,
-                const float *verts, unsigned nverts, const uint16_t *indices, unsigned nindices,
-                const SgxdRecipeDraw *draws, unsigned ndraws, int copy_vs);
+                const float *verts, const uint32_t *imgui_verts, unsigned nverts,
+                const uint16_t *indices, unsigned nindices, const SgxdRecipeDraw *draws,
+                unsigned ndraws, int copy_vs, uint32_t vertex_sa, unsigned imgui_fs);
+
+// A draw's VDM stream words: the state copy and the index list, and in ImGui mode the vertex
+// secondary between them, which loads the program's SA.
+static unsigned draw_words(const SgxdRecipe *r) { return r->imgui ? 10 : 8; }
 
 int sgxd_recipe_init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
                      uint32_t pages) {
-    return init(r, width, height, base, pages, triangle_verts, 3, triangle_indices, 3,
-                &triangle_draw, 1, 0);
+    return init(r, width, height, base, pages, triangle_verts, NULL, 3, triangle_indices, 3,
+                &triangle_draw, 1, 0, 0, 0);
 }
 
 int sgxd_recipe_init_scene(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
                            uint32_t pages, const float *verts, unsigned nverts,
                            const uint16_t *indices, unsigned nindices,
                            const SgxdRecipeDraw *draws, unsigned ndraws) {
-    return init(r, width, height, base, pages, verts, nverts, indices, nindices, draws, ndraws, 1);
+    return init(r, width, height, base, pages, verts, NULL, nverts, indices, nindices, draws,
+                ndraws, 1, 0, 0);
+}
+
+int sgxd_recipe_init_imgui(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
+                           uint32_t pages, const uint32_t *verts, unsigned nverts,
+                           const uint16_t *indices, unsigned nindices,
+                           const SgxdRecipeDraw *draws, unsigned ndraws, uint32_t sa_offset,
+                           unsigned fs) {
+    if ((sa_offset & 15) || fs > SGXD_IMGUI_MODULATE) {
+        return -1;
+    }
+    return init(r, width, height, base, pages, NULL, verts, nverts, indices, nindices, draws,
+                ndraws, 0, sa_offset, fs);
 }
 
 static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, uint32_t pages,
-                const float *verts, unsigned nverts, const uint16_t *indices, unsigned nindices,
-                const SgxdRecipeDraw *draws, unsigned ndraws, int copy_vs) {
+                const float *verts, const uint32_t *imgui_verts, unsigned nverts,
+                const uint16_t *indices, unsigned nindices, const SgxdRecipeDraw *draws,
+                unsigned ndraws, int copy_vs, uint32_t vertex_sa, unsigned imgui_fs) {
     if (width < 32 || height < 32 || width > 2048 || height > 2048 || (base & 0xfffffu) ||
         pages < 64 || pages > 0x8000 || !nverts || nverts > 0xffff || !nindices ||
         nindices > SGXD_RECIPE_MAX_INDICES || !ndraws || ndraws > SGXD_RECIPE_MAX_DRAWS) {
         return -1;
     }
     for (unsigned n = 0; n < ndraws; n++) {
-        const SgxdRecipeDraw *d = &draws[n];
-        if ((d->first & 7) || d->first > nindices || !d->count || d->count > nindices - d->first ||
-            (d->fprim != SGXD_R_FPRIM && d->fprim != SGXD_R_BGPRIM) ||
-            d->cull > 2 || (d->clip && (d->clip & 0x40404040u))) {
+        if (!draw_valid(&draws[n], nindices)) {
             return -1;
         }
     }
@@ -404,6 +599,11 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     r->base = base;
     r->pages = pages;
     r->verts = verts;
+    r->imgui_verts = imgui_verts;
+    r->imgui = imgui_verts != NULL;
+    r->vertex_words = r->imgui ? SGXD_RECIPE_IMGUI_WORDS : NV;
+    r->vertex_sa = vertex_sa;
+    r->imgui_fs = imgui_fs;
     r->nverts = nverts;
     r->indices = indices;
     r->nindices = nindices;
@@ -459,7 +659,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     o += W * H * 4;
     L[SGXD_R_STREAM] = o;
     {
-        const uint32_t s = ((8 * ndraws + 5) * 4 + 0xff) & ~0xffu;
+        const uint32_t s = ((draw_words(r) * ndraws + 5) * 4 + 0xff) & ~0xffu;
         o += s > 0x200 ? s : 0x200;
     }
     L[SGXD_R_STATE] = o;
@@ -467,7 +667,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
         const uint32_t s = (ndraws * 0x60 + 0xff) & ~0xffu;
         o += s > 0x100 ? s : 0x100;
     }
-    uint32_t index_offset = (nverts * NV * 4 + 0x3f) & ~0x3fu;
+    uint32_t index_offset = (nverts * r->vertex_words * 4 + 0x3f) & ~0x3fu;
     index_offset = index_offset > 0x40 ? index_offset : 0x40;
     L[SGXD_R_VERTS] = o;
     L[SGXD_R_INDICES] = o + index_offset;
@@ -522,7 +722,13 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     for (unsigned n = 1; n < ndraws && n < 8; n++) {
         r->units[copy_part(n)] = pds_units(&pds[copy_part(n)]);
     }
-    vertex_dms(NV, 0, 0, NV, &r->vdm_w2, &r->vdm_w4, &r->vdm_w5);
+    if (r->imgui) {
+        vertex_dms(SGXD_RECIPE_IMGUI_WORDS, IMGUI_VS_TEMPS, 4,
+                   imgui_uv(r) ? 10 : 8, &r->vdm_w2, &r->vdm_w4,
+                   &r->vdm_w5);
+    } else {
+        vertex_dms(NV, 0, 0, NV, &r->vdm_w2, &r->vdm_w4, &r->vdm_w5);
+    }
     return 0;
 }
 
@@ -573,8 +779,8 @@ void sgxd_recipe_restage(const SgxdRecipe *r, void *memory_) {
 void sgxd_recipe_write_scene(const SgxdRecipe *r, void *memory_) {
     uint8_t *memory = memory_;
     uint32_t *verts = (uint32_t *)(memory + r->offset[SGXD_R_VERTS]);
-    for (unsigned n = 0; n < r->nverts * NV; n++) {
-        verts[n] = fbits(r->verts[n]);
+    for (unsigned n = 0; n < r->nverts * r->vertex_words; n++) {
+        verts[n] = r->imgui ? r->imgui_verts[n] : fbits(r->verts[n]);
     }
     uint32_t *words = (uint32_t *)(memory + r->offset[SGXD_R_INDICES]);
     for (unsigned n = 0; n < r->nindices; n += 2) {
@@ -594,6 +800,125 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory_, uint32_t fb_va, uint32
     }
 }
 
+void sgxd_recipe_write_vertex_sa(const SgxdRecipe *r, void *memory_, const float sa[4]) {
+    uint32_t *words = (uint32_t *)((uint8_t *)memory_ + r->vertex_sa);
+    for (unsigned n = 0; n < 4; n++) {
+        words[n] = fbits(sa[n]);
+    }
+}
+
+// libgxm's CalculatePixelDMSInfo for one sample: the pixel
+// task's size word from its PAs, temporaries and SA. 0x08018000 for up to 4 PAs (Sony's).
+static uint32_t pixel_dms(unsigned pa, unsigned temps, unsigned sa) {
+    const unsigned size = (pa + (temps + 1) / 2 * 2 + 3) / 4 * 4, regs = size * 4;
+    const unsigned sa_chunks = (sa + 31) / 32;
+    if (!regs) {
+        return 3u << 15 | sa_chunks << 17;
+    }
+    const unsigned chunks = 0x900 / 32 - sa_chunks;
+    const unsigned use_regs = (chunks - 2) / 3 * 32, quarter = (chunks - 4) / 4 * 32;
+    unsigned use = use_regs / regs, pds;
+    use = use > 4 ? 4 : use < 1 ? 1 : use;
+    if (quarter < regs) {
+        pds = 1;
+    } else {
+        const unsigned use_chunks = (regs * use + 31) / 32;
+        const unsigned pds_chunks = chunks - 4 - 2 * (use_chunks - 1);
+        const unsigned full = pds_chunks / use_chunks;
+        unsigned limit = quarter / regs;
+        limit = limit < 16 ? limit : 16;
+        limit = limit < 4 * use ? limit : 4 * use;
+        pds = use * full + (pds_chunks - use_chunks * full) * 32 / regs;
+        pds = pds < limit ? pds : limit;
+    }
+    return (pds & 15) << 22 | (use - 1) << 15 | sa_chunks << 17 | (size >> 2) << 27;
+}
+
+// State word 8 of a draw: the colour+UV program's six PAs need two size units.
+static uint32_t pixel_size_word(const SgxdRecipe *r, unsigned fprim) {
+    if (fprim == SGXD_R_FPRIM && imgui_uv(r)) {
+        return pixel_dms(6, 0, 0);
+    }
+    return 0x08018000u;
+}
+
+// State word 19: VTXSIZE 4, the position; ImGui mode adds the base colour (bit 11) and with the
+// UV TC0's two words (TEXSIZE 1 in word 22).
+static uint32_t outselects(const SgxdRecipe *r) {
+    if (!r->imgui) {
+        return OUTSELECTS;
+    }
+    return imgui_uv(r) ? 10u << 24 | 0x1000u | 0x800u : IMGUI_OUTSELECTS;
+}
+
+// The vertex secondary's VDM word: its units, all pipes, SECONDARY, and USEATTRIBUTESIZE in
+// 4-word units: the ImGui program's four SA words.
+static uint32_t vsec_word(const SgxdRecipe *r) {
+    return r->units[SGXD_R_VSEC] << 27 | 7u << 13 | 1u << 8 | (r->imgui ? 1u : 0u);
+}
+
+// Draw n's MTE state packet, and in the VDM control stream its state copy
+// and index list.
+static void write_draw(const SgxdRecipe *r, uint8_t *memory, unsigned n, const SgxdRecipeDraw *d) {
+    const uint32_t *L = r->offset;
+    const uint32_t W = r->width, H = r->height;
+    uint32_t *stream = (uint32_t *)(memory + L[SGXD_R_STREAM]);
+    // Every copy program has COPY's shape and units.
+    const uint32_t copy_va = r->base + copy_offset(r, n);
+    const uint32_t clip = d->clip;
+    const uint32_t state[24] = {
+        0xdfff, d->isp, 0, 0x0e000000, d->isp, 0, 0x0e000000, ptr(r, SGXD_R_FSEC),
+        pixel_size_word(r, d->fprim) | msbs(r, SGXD_R_FSEC, d->fprim), ptr(r, d->fprim),
+        clip_x(r, clip), clip_y(r, clip),
+        fbits(W / 2.0f), fbits(W / 2.0f), fbits(H / 2.0f), fbits(H / 2.0f), fbits(0.5f),
+        fbits(0.5f), 0, outselects(r), 0x3727c5ac, 0x8000 | d->cull,
+        imgui_uv(r) ? 1u : 0u, 0,
+    };
+    put(memory, L[SGXD_R_STATE] + n * 0x60, state, 24);
+    uint32_t *w = stream + draw_words(r) * n;
+    *w++ = 1u << 30 | copy_va >> 4;
+    *w++ = r->units[SGXD_R_COPY] << 27 | 1u << 25 | 1u << 17 | (1u + n % 4) << 13 | 1u << 9 | 6;
+    if (r->imgui) {
+        *w++ = 1u << 30 | sgxd_recipe_va(r, SGXD_R_VSEC) >> 4;
+        *w++ = vsec_word(r);
+    }
+    *w++ = 2u << 30 | 0u << 26 | 7u << 22 | d->count;
+    *w++ = sgxd_recipe_va(r, SGXD_R_INDICES) + 2 * d->first;
+    *w++ = r->vdm_w2;
+    *w++ = 0;
+    *w++ = r->vdm_w4 | ((sgxd_recipe_va(r, SGXD_R_VSPDS) >> 4) & 0x0fffffffu);
+    *w++ = r->vdm_w5 | 0x100 | r->units[SGXD_R_VSPDS];
+}
+
+// The stream's end after count draws: the secondary and the terminate.
+static void write_stream_end(const SgxdRecipe *r, uint8_t *memory, unsigned count) {
+    uint32_t *stream = (uint32_t *)(memory + r->offset[SGXD_R_STREAM]);
+    const uint32_t end[5] = {
+        1u << 30 | sgxd_recipe_va(r, SGXD_R_VSEC) >> 4, vsec_word(r),
+        1u << 30 | 1u << 29 | sgxd_recipe_va(r, SGXD_R_TERM) >> 4,
+        r->units[SGXD_R_TERM] << 27 | 1u << 25 | 1u << 17 | 1u << 13 | 1u << 9 | 1,
+        0xc0000000u,
+    };
+    memcpy(stream + draw_words(r) * count, end, sizeof(end));
+}
+
+int sgxd_recipe_set_draws(const SgxdRecipe *r, void *memory, const SgxdRecipeDraw *draws,
+                          unsigned count) {
+    if (!count || count > r->ndraws) {
+        return -1;
+    }
+    for (unsigned n = 0; n < count; n++) {
+        if (!draw_valid(&draws[n], r->nindices)) {
+            return -1;
+        }
+    }
+    for (unsigned n = 0; n < count; n++) {
+        write_draw(r, memory, n, &draws[n]);
+    }
+    write_stream_end(r, memory, count);
+    return 0;
+}
+
 void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
     uint8_t *memory = memory_;
     const uint32_t *L = r->offset;
@@ -608,38 +933,10 @@ void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
     make_cf(r, cf);
     make_pds(r, cv, cf, pds);
 
-    // Each draw's MTE state packet, and in the VDM control stream its state
-    // copy and index list; then the secondary and the terminate.
-    uint32_t *stream = (uint32_t *)(memory + L[SGXD_R_STREAM]);
     for (unsigned n = 0; n < r->ndraws; n++) {
-        const SgxdRecipeDraw *d = &r->draws[n];
-        // Every copy program has COPY's shape and units.
-        const uint32_t copy_va = r->base + copy_offset(r, n);
-        const uint32_t clip = d->clip;
-        const uint32_t state[24] = {
-            0xdfff, d->isp, 0, 0x0e000000, d->isp, 0, 0x0e000000, ptr(r, SGXD_R_FSEC),
-            0x08018000u | msbs(r, SGXD_R_FSEC, d->fprim), ptr(r, d->fprim),
-            clip_x(r, clip), clip_y(r, clip),
-            fbits(W / 2.0f), fbits(W / 2.0f), fbits(H / 2.0f), fbits(H / 2.0f), fbits(0.5f),
-            fbits(0.5f), 0, OUTSELECTS, 0x3727c5ac, 0x8000 | d->cull, 0, 0,
-        };
-        put(memory, L[SGXD_R_STATE] + n * 0x60, state, 24);
-        const uint32_t words[8] = {
-            1u << 30 | sgxd_recipe_va(r, copy) >> 4,
-            r->units[copy] << 27 | 1u << 25 | 1u << 17 | (1u + n % 4) << 13 | 1u << 9 | 6,
-            2u << 30 | 0u << 26 | 7u << 22 | d->count, sgxd_recipe_va(r, SGXD_R_INDICES) + 2 * d->first,
-            r->vdm_w2, 0, r->vdm_w4 | ((sgxd_recipe_va(r, SGXD_R_VSPDS) >> 4) & 0x0fffffffu),
-            r->vdm_w5 | 0x100 | r->units[SGXD_R_VSPDS],
-        };
-        memcpy(stream + 8 * n, words, sizeof(words));
+        write_draw(r, memory, n, &r->draws[n]);
     }
-    const uint32_t end[5] = {
-        1u << 30 | sgxd_recipe_va(r, SGXD_R_VSEC) >> 4, r->units[SGXD_R_VSEC] << 27 | 7u << 13 | 1u << 8,
-        1u << 30 | 1u << 29 | sgxd_recipe_va(r, SGXD_R_TERM) >> 4,
-        r->units[SGXD_R_TERM] << 27 | 1u << 25 | 1u << 17 | 1u << 13 | 1u << 9 | 1,
-        0xc0000000u,
-    };
-    memcpy(stream + 8 * r->ndraws, end, sizeof(end));
+    write_stream_end(r, memory, r->ndraws);
 
     sgxd_recipe_write_scene(r, memory);
 
@@ -673,20 +970,39 @@ void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
 
 #define SA_BG_FS 0x180u   // CF offset of o0 = sa0
 
-void sgxd_recipe_sa_background(const SgxdRecipe *r, void *memory_, uint32_t colour_offset,
-                               uint32_t colour) {
-    uint8_t *memory = memory_;
-    const uint32_t *L = r->offset;
-    // or o0, sa0, #0 (SKIPINV): the recipe's o0 = pa0 with source bank 3, SA.
+// or o0, sa0, #0 (SKIPINV): the recipe's o0 = pa0 with source bank 3, SA.
+static void put_sa_shader(const SgxdRecipe *r, uint8_t *memory) {
     const uint64_t shader[3] = {PHAS_LAST, 0x50a10009e0000000ull | SKIPINV, NOP_END};
-    memcpy(memory + L[SGXD_R_CF] + SA_BG_FS, shader, sizeof(shader));
-    *(uint32_t *)(memory + colour_offset) = colour;
-    // DS0 pair 0 = DOUTD of one word to AO 0, DS1 pair 0 = DOUTU2 0, DS0 pair 1 = the dummy DOUTU.
+    memcpy(memory + r->offset[SGXD_R_CF] + SA_BG_FS, shader, sizeof(shader));
+}
+
+// xor o0, sa0, #imm: the or above as opcode 11 (OP2 bit 35 clear), the
+// immediate in bits 6..0, 20..14 and 37..36.
+void sgxd_recipe_sa_xor(const SgxdRecipe *r, void *memory, uint32_t imm) {
+    const uint64_t xor = 0x58a10001e0000000ull | SKIPINV | (imm & 0x7fu) |
+                         (uint64_t)(imm >> 7 & 0x7fu) << 14 | (uint64_t)(imm >> 14 & 3u) << 36;
+    const uint64_t shader[3] = {PHAS_LAST, xor, NOP_END};
+    memcpy((uint8_t *)memory + r->offset[SGXD_R_CF] + SA_BG_FS, shader, sizeof(shader));
+}
+
+// A secondary that DMAs the word at base + colour_offset into sa0: DS0 pair 0 = DOUTD of one word
+// to AO 0, DS1 pair 0 = DOUTU2 0, DS0 pair 1 = the dummy DOUTU. Two data units.
+static void put_sa_secondary(const SgxdRecipe *r, uint8_t *memory, uint32_t at,
+                             uint32_t colour_offset) {
     const uint32_t secondary[11] = {
         r->base + colour_offset, doutd1(0, 1), 0, 0, doutu0(1, 0, 0), 0, 0, 0,
         doutd(0), doutu(1, 0), HALT,
     };
-    put(memory, L[SGXD_R_BGSEC], secondary, 11);
+    put(memory, at, secondary, 11);
+}
+
+void sgxd_recipe_sa_background(const SgxdRecipe *r, void *memory_, uint32_t colour_offset,
+                               uint32_t colour) {
+    uint8_t *memory = memory_;
+    const uint32_t *L = r->offset;
+    put_sa_shader(r, memory);
+    *(uint32_t *)(memory + colour_offset) = colour;
+    put_sa_secondary(r, memory, L[SGXD_R_BGSEC], colour_offset);
     uint32_t *bg = (uint32_t *)(memory + L[SGXD_R_BGREC]);
     bg[0] = 2u << 27 | ((sgxd_recipe_va(r, SGXD_R_BGSEC) >> 4) & 0x07ffffffu);
     bg[1] = (bg[1] & ~(0x1fu << 17)) | 1u << 17;   // SECATTRSIZE: one 32-dword chunk
@@ -739,7 +1055,12 @@ void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
         0x0810, 0x0808, 0x0a08, 0x8810, 0x8808, 0x8a08, 0xc810, 0xc808, 0xca08,
     };
     for (unsigned n = 0; n < sizeof(invalidates) / 4; n++) {
-        wr(l, invalidates[n], 1);
+        if ((sgxd_recipe_tatrim & 2) && invalidates[n] >= 0x8000) {
+            continue;
+        }
+        if (!r->keep_code_caches || (invalidates[n] & 0x3fff) != 0x0a08) {
+            wr(l, invalidates[n], 1);
+        }
     }
     wr(l, 0x043c, 1);
     wr(l, 0x0ad0, 1);
@@ -866,7 +1187,9 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
     wr(l, 0x0134, 0x04000000);
     wr(l, 0x0810, 1);
     wr(l, 0x0808, 1);
-    wr(l, 0x0a08, 1);
+    if (!r->keep_code_caches) {
+        wr(l, 0x0a08, 1);
+    }
     poll(l, 0x0118, 0x80, 0x80, SETUP_POLL_US);
     poll(l, 0x012c, 0x04000000, 0x04000000, SETUP_POLL_US);
     wr(l, 0x0114, 0x80);
@@ -920,4 +1243,65 @@ void sgxd_recipe_3d_done(const SgxdRecipe *r, SgxdOpList *l) {
     }
     wr(l, 0x0004, 0x0a8a8aaa);
     sgxd_recipe_slc(l, 1);
+}
+
+void sgxd_recipe_set_clip(const SgxdRecipe *r, void *memory, unsigned draw, uint32_t clip) {
+    uint32_t *state = (uint32_t *)((uint8_t *)memory + r->offset[SGXD_R_STATE] + draw * 0x60);
+    state[10] = clip_x(r, clip);
+    state[11] = clip_y(r, clip);
+}
+
+void sgxd_recipe_set_texture(const SgxdRecipe *r, void *memory, const uint32_t words[4]) {
+    Code cf[CF_COUNT];
+    Pds p;
+    uint32_t program[SGXD_RECIPE_TEX_PDS / 4];
+    make_cf(r, cf);
+    imgui_prim(r, cf, &p, words);
+    put(memory, r->offset[SGXD_R_FPRIM], program, pds_words(&p, program));
+}
+
+void sgxd_recipe_draw_texture(const SgxdRecipe *r, void *memory, uint32_t offset, unsigned draw,
+                              const uint32_t words[4]) {
+    Code cf[CF_COUNT];
+    Pds p;
+    uint32_t program[SGXD_RECIPE_TEX_PDS / 4];
+    make_cf(r, cf);
+    imgui_prim(r, cf, &p, words);
+    const unsigned n = pds_words(&p, program);
+    memcpy((uint8_t *)memory + offset + draw * SGXD_RECIPE_TEX_PDS, program, n * 4);
+}
+
+void sgxd_recipe_draw_textures(const SgxdRecipe *r, void *memory, uint32_t offset,
+                               const uint32_t (*words)[4]) {
+    for (unsigned n = 0; n < r->ndraws; n++) {
+        if (r->draws[n].fprim != SGXD_R_FPRIM) {
+            continue;
+        }
+        sgxd_recipe_draw_texture(r, memory, offset, n, words[n]);
+        // State words 8 and 9: the primary's top address bit, and its pointer (FPRIM's units).
+        uint32_t *state = (uint32_t *)((uint8_t *)memory + r->offset[SGXD_R_STATE] + n * 0x60);
+        const uint32_t va = r->base + offset + n * SGXD_RECIPE_TEX_PDS;
+        state[8] = (state[8] & ~(1u << 13)) | (va & 0x80000000u ? 1u << 13 : 0);
+        state[9] = r->units[SGXD_R_FPRIM] << 27 | ((va >> 4) & 0x07ffffffu);
+    }
+}
+
+void sgxd_recipe_sa_draw_colours(const SgxdRecipe *r, void *memory_, uint32_t offset,
+                                 const uint32_t *colours) {
+    uint8_t *memory = memory_;
+    const uint32_t *L = r->offset;
+    put_sa_shader(r, memory);
+    for (unsigned n = 0; n < r->ndraws; n++) {
+        const uint32_t at = offset + 0x40 * (n + 1);
+        *(uint32_t *)(memory + sgxd_recipe_sa_colour_offset(offset, n)) = colours[n];
+        put_sa_secondary(r, memory, at, sgxd_recipe_sa_colour_offset(offset, n));
+        // State words 7 and 8: the secondary's pointer, and DMS info with SECATTRSIZE 1 and
+        // the pointers' top bits.
+        uint32_t *state = (uint32_t *)(memory + L[SGXD_R_STATE] + n * 0x60);
+        const uint32_t va = r->base + at;
+        state[7] = 2u << 27 | ((va >> 4) & 0x07ffffffu);
+        state[8] = (state[8] & ~(0x1fu << 17 | 1u << 14)) | 1u << 17 |
+                   (va & 0x80000000u ? 1u << 14 : 0);
+    }
+    ((uint32_t *)(memory + L[SGXD_R_FPRIM]))[4] = doutu0(1, SA_BG_FS >> 3, 0);
 }

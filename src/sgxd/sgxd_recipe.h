@@ -42,6 +42,27 @@ extern const char *const sgxd_recipe_names[SGXD_R_COUNT];
 // drawn: a tile no primitive touches is left as it was.
 #define SGXD_RECIPE_ISP_A (0u << 25 | 7u << 22 | 1u << 20 | 0u << 15 | 1u << 9)
 #define SGXD_RECIPE_ISP_NEVER (SGXD_RECIPE_ISP_A & ~(7u << 22))
+// ISP A with PASSTYPE translucent (bits 27..25 = 1): what lies under the draw is shaded first,
+// so a program that reads the output buffer sees it.
+#define SGXD_RECIPE_ISP_TRANS (SGXD_RECIPE_ISP_A | 1u << 25)
+// Words of an ImDrawVert: x and y in pixels, u and v (f32), colour A8B8G8R8 unorm.
+#define SGXD_RECIPE_IMGUI_WORDS 5u
+// ImGui mode's pixel output (sgxd_recipe_init_imgui): the iterated colour (sgxd_test 06), or r
+// and g of the colour with the iterated u and v as blue and alpha (sgxd_test 07, TC0 through
+// DOUTI).
+// SGXD_IMGUI_UV_RAW + n iterates as SGXD_IMGUI_COLOUR_UV does and writes pa n's F32 bits as the
+// pixel word (n 0..5: r, g, b, a, u, v), so the frame holds the iterators' values.
+// SGXD_IMGUI_TEXEL (sgxd_test 08) iterates the colour into pa0..pa3 and samples texture 0 at TC0
+// into pa4, a texture issue and a DOUTT with the texel unconverted; the pixel word is the
+// texel's bits. Each draw's texture comes from sgxd_recipe_draw_textures.
+// SGXD_IMGUI_BLEND (sgxd_test 09) iterates the colour as SGXD_IMGUI_COLOUR does and blends it over
+// the pixel's current value in the output buffer: colour = src * a + dst * (1 - a), alpha = a +
+// dst.a * (1 - a), ImGui's blend. Overlapping draws need a translucent ISP pass type.
+// SGXD_IMGUI_MODULATE (sgxd_test 12, ImGui's own program) samples as SGXD_IMGUI_TEXEL does,
+// multiplies the texel by the colour bytewise (texel * colour / 255 on each of the four bytes) and
+// blends the product over the output buffer as SGXD_IMGUI_BLEND does.
+enum { SGXD_IMGUI_COLOUR, SGXD_IMGUI_COLOUR_UV, SGXD_IMGUI_UV_RAW,
+       SGXD_IMGUI_TEXEL = SGXD_IMGUI_UV_RAW + 6, SGXD_IMGUI_BLEND, SGXD_IMGUI_MODULATE };
 
 // One draw of a scene: a triangle list of indices[first .. first + count),
 // first a multiple of 8, in the ISP A word's state, shaded by FPRIM (the triangle's colour) or
@@ -75,7 +96,13 @@ typedef struct SgxdRecipe {
     const SgxdRecipeDraw *draws;     // the caller's
     unsigned ndraws;
     int copy_vs;                     // the vertex program copies w too (a caller's scene)
+    const uint32_t *imgui_verts;     // ImGui mode (sgxd_recipe_init_imgui): its vertices
+    int imgui;
+    unsigned vertex_words;           // a vertex's words in VERTS: 4, or 5 in ImGui mode
+    uint32_t vertex_sa;              // ImGui mode: the vertex program's SA block, from base
+    unsigned imgui_fs;               // ImGui mode: SGXD_IMGUI_*
     int fb_external;                 // the target is not the block's FB (sgxd_recipe_set_target)
+    int keep_code_caches;            // sgxd_test 11: the kicks skip the USE_CACHE invalidates
 } SgxdRecipe;
 
 // A width x height (32 to 2048) target at GPU address base (1 MiB aligned), with pages parameter
@@ -93,6 +120,21 @@ int sgxd_recipe_init_scene(SgxdRecipe *r, uint32_t width, uint32_t height, uint3
                            const uint16_t *indices, unsigned nindices,
                            const SgxdRecipeDraw *draws, unsigned ndraws);
 
+// ImGui's vertex path. nverts ImDrawVert records (SGXD_RECIPE_IMGUI_WORDS words each)
+// fetched at stride 20 into pa0..pa4; the vertex program maps x, y through the scale and offset in
+// its SA (clip = pixel * scale + offset; sa0, sa1 the scale, sa2, sa3 the offset), which each
+// draw's vertex secondary DMAs from base + sa_offset (16-byte aligned, outside the layout: write
+// it with sgxd_recipe_write_vertex_sa), and unpacks the colour into the base colour. Draws
+// shaded by FPRIM iterate it (DOUTI V0, four F32 lanes) and pack it into the pixel; with fs
+// SGXD_IMGUI_COLOUR_UV the UV goes out as TC0 too and the pixel is (r, g, u, v). BGPRIM draws
+// and the background are unchanged; sgxd_recipe_sa_draw_colours does not apply.
+int sgxd_recipe_init_imgui(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
+                           uint32_t pages, const uint32_t *verts, unsigned nverts,
+                           const uint16_t *indices, unsigned nindices,
+                           const SgxdRecipeDraw *draws, unsigned ndraws, uint32_t sa_offset,
+                           unsigned fs);
+void sgxd_recipe_write_vertex_sa(const SgxdRecipe *r, void *memory, const float sa[4]);
+
 static inline uint32_t sgxd_recipe_va(const SgxdRecipe *r, unsigned part) {
     return r->base + r->offset[part];
 }
@@ -107,11 +149,52 @@ void sgxd_recipe_write(const SgxdRecipe *r, void *memory);
 void sgxd_recipe_sa_background(const SgxdRecipe *r, void *memory, uint32_t colour_offset,
                                uint32_t colour);
 
+// Rewrites CF + 0x180, the program sgxd_recipe_sa_background and
+// sgxd_recipe_sa_draw_colours run, as xor o0, sa0, #imm (16 bits, into the low bytes). The
+// program keeps its address, so the kicks' USE_CACHE invalidates must reach every core's code
+// cache before it runs; with r->keep_code_caches set they are skipped, to show the rule.
+void sgxd_recipe_sa_xor(const SgxdRecipe *r, void *memory, uint32_t imm);
+
+// Each draw's colour through SA, as the background's above. At base + offset (64-byte
+// aligned, 0x40 * (ndraws + 1) bytes, outside the layout) go each draw's own SA block, 0x40
+// bytes from offset + 0x40 * (draw + 1): its secondary, which DMAs the block's colour word
+// (at + 0x30) into sa0, and the word; the draw's state packet points at the secondary
+// with one SECATTRSIZE chunk, and FPRIM runs o0 = sa0. Every draw shaded by FPRIM takes its
+// colour so; a new colour needs only its word rewritten (sgxd_recipe_sa_colour_offset).
+void sgxd_recipe_sa_draw_colours(const SgxdRecipe *r, void *memory, uint32_t offset,
+                                 const uint32_t *colours);
+
+// SGXD_IMGUI_TEXEL and SGXD_IMGUI_MODULATE modes: each draw's own texture. At base +
+// offset (16-byte aligned, SGXD_RECIPE_TEX_PDS bytes a draw, outside the layout) go the draws'
+// copies of FPRIM, each sending its draw's four texture control words (SceGxmTexture's,
+// DOUTT0..3); every draw's state packet then points at its copy. sgxd_recipe_draw_texture
+// rewrites one draw's copy, for a new texture. Call both after sgxd_recipe_write, which points
+// the draws back at FPRIM.
+#define SGXD_RECIPE_TEX_PDS 0x80u
+void sgxd_recipe_draw_textures(const SgxdRecipe *r, void *memory, uint32_t offset,
+                               const uint32_t (*words)[4]);
+void sgxd_recipe_draw_texture(const SgxdRecipe *r, void *memory, uint32_t offset, unsigned draw,
+                              const uint32_t words[4]);
+static inline uint32_t sgxd_recipe_sa_colour_offset(uint32_t offset, unsigned draw) {
+    return offset + 0x40 * (draw + 1) + 0x30;
+}
+
 // What a render changes, set back: the page table's free list, the region headers, EXTZ, the
 // tail pointer caches and, unless the target is external, FB and DEPTH (to the sentinel).
 void sgxd_recipe_restage(const SgxdRecipe *r, void *memory);
 
 void sgxd_recipe_write_scene(const SgxdRecipe *r, void *memory);
+// This frame's draws, count of them (1 to r->ndraws, the number init sized the layout
+// for), each checked as init checks r->draws against r->nindices. Rewrites their state packets
+// and the VDM stream, which then ends after them. The vertices and indices they use are the
+// caller's to write in place: vertex n at offset[SGXD_R_VERTS] + n * vertex_words * 4, the
+// indices as 16-bit values from offset[SGXD_R_INDICES]. Returns 0, or -1 with nothing written.
+int sgxd_recipe_set_draws(const SgxdRecipe *r, void *memory, const SgxdRecipeDraw *draws,
+                          unsigned count);
+// SGXD_IMGUI_TEXEL and SGXD_IMGUI_MODULATE: FPRIM with the texture words of texture 0, for
+// every draw shaded by FPRIM. FPRIM is a PDS program: rewrite it only before its first kick, or
+// after the PDS cache rule's invalidate (docs/sgxd/pds.md).
+void sgxd_recipe_set_texture(const SgxdRecipe *r, void *memory, const uint32_t words[4]);
 // Draw n's region clip (SgxdRecipeDraw's clip: 0 or SGXD_RECIPE_CLIP), its state words 10 and 11.
 void sgxd_recipe_set_clip(const SgxdRecipe *r, void *memory, unsigned draw, uint32_t clip);
 

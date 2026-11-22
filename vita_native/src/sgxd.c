@@ -817,12 +817,16 @@ int sgxdSubmit(SgxdOp *user_ops, uint32_t count) {
                 sgxd_write(op->reg, op->value);
             } else if (op->op == SGXD_OP_POLL && !(op->reg & 3u) && op->reg < SGXD_REG_SIZE &&
                        op->timeout_us <= SGXD_MAX_POLL_US) {
-                // Spins for the first 100 us, the TA and 3D kicks' own scale, then sleeps.
+                // Spins for the first 100 us, the TA and 3D kicks' own scale, then sleeps. The
+                // time is taken before each read, so a wake-up past the timeout still reads the
+                // register once more (a slow wake would time out on an SLC flush that had
+                // completed).
                 const uint32_t t0 = ksceKernelGetSystemTimeLow();
                 uint32_t v, waited;
-                while (((v = sgxd_read(op->reg)) & op->mask) != op->value) {
+                for (;;) {
                     waited = ksceKernelGetSystemTimeLow() - t0;
-                    if (waited > op->timeout_us) {
+                    v = sgxd_read(op->reg);
+                    if ((v & op->mask) == op->value || waited > op->timeout_us) {
                         break;
                     }
                     if (waited > 100u) {
