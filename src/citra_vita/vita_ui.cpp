@@ -167,12 +167,43 @@ void Ui::BuildSettings() {
     toggle("Stretch audio", "Keeps audio continuous when the emulator runs below full speed.",
            true, [] { return Settings::values.enable_audio_stretching.GetValue(); },
            [](bool value) { Settings::values.enable_audio_stretching = value; });
-    choice("Screen layout", "How the two screens are arranged on the display.", true,
-           {"Default", "Single screen", "Large screen", "Side by side", "Hybrid"},
-           [] { return static_cast<int>(Settings::values.layout_option.GetValue()); },
+    // The menu's layouts in its order (the enum's own order has SeparateWindows before Hybrid
+    // here), then the overlay layout: the single screen with the other one over it.
+    static constexpr Settings::LayoutOption layouts[] = {
+        Settings::LayoutOption::Default, Settings::LayoutOption::SingleScreen,
+        Settings::LayoutOption::LargeScreen, Settings::LayoutOption::SideScreen,
+        Settings::LayoutOption::HybridScreen};
+    constexpr int overlay_choice = static_cast<int>(std::size(layouts));
+    choice("Screen layout",
+           "How the two screens are arranged on the display. Overlay: the single screen with the "
+           "other one smaller in the bottom right corner, translucent, and touchable there.",
+           true,
+           {"Default", "Single screen", "Large screen", "Side by side", "Hybrid",
+            "Single screen, overlay"},
+           [] {
+               const auto option = Settings::values.layout_option.GetValue();
+               if (option == Settings::LayoutOption::SingleScreen && EmuWindowVita::Overlay()) {
+                   return overlay_choice;
+               }
+               const auto it = std::find(std::begin(layouts), std::end(layouts), option);
+               return it == std::end(layouts) ? 0 : static_cast<int>(it - std::begin(layouts));
+           },
            [](int value) {
-               Settings::values.layout_option = static_cast<Settings::LayoutOption>(value);
+               EmuWindowVita::SetOverlay(value == overlay_choice);
+               Settings::values.layout_option = value == overlay_choice
+                                                    ? Settings::LayoutOption::SingleScreen
+                                                    : layouts[std::clamp(value, 0, overlay_choice - 1)];
            });
+    toggle("Widescreen",
+           "Draws the top screen wider than the 3DS's, showing more of the scene at its sides "
+           "instead of stretching it, so that it fills the display in the single screen and "
+           "overlay layouts. A title may leave the new sides empty where it draws nothing past "
+           "its screen's edges.",
+           true, [] { return EmuWindowVita::Widescreen(); },
+           [](bool value) { EmuWindowVita::SetWidescreen(value); });
+    slider("Overlay opacity", "How opaque the overlaid screen is, in percent.", true, 10, 100,
+           [] { return static_cast<int>(EmuWindowVita::OverlayOpacity()); },
+           [](int value) { EmuWindowVita::SetOverlayOpacity(static_cast<u32>(value)); });
     choice("Top screen resolution",
            "Draws the top screen's picture above the 3DS's resolution: sharper in the single and "
            "large screen layouts, the GPU's work for that picture growing with the scale's "

@@ -70,6 +70,7 @@ constexpr u32 ScreenAreaSize = 0x4000;
 constexpr u32 ScreenVertexCode = 0x000;
 constexpr u32 ScreenFragmentCode = 0x040;
 constexpr u32 ScreenIndices = 0x080;
+constexpr u32 ScreenBlendCode = 0x0c0; // a translucent screen's fragment program, six words
 constexpr u32 ScreenVertices = 0x100; // + 0x100 a screen
 constexpr u32 ScreenVertexPds = 0x400; // + 0x80 a screen
 constexpr u32 ScreenVsecPds = 0x500;
@@ -120,11 +121,12 @@ struct State {
     char failed_text[160]{};
 
     u32 screen_offset = 0;
-    u32 screen_vertex = 0, screen_fragment = 0;   // DOUTU word 0s
+    u32 screen_vertex = 0, screen_fragment = 0, screen_blend = 0; // DOUTU word 0s
     SgxdRecipeDrawPrograms screen_programs[ScreenSlots]{};
     u32 screens_in_frame = 0;
     struct PixelEntry {
         u32 tex[4];
+        bool blend; ///< the translucent screen's fragment program
         u32 va, units;
     } pixel_entries[ScreenPixelEntries]{};
     u32 pixel_used = 0, pixel_next = 0;
@@ -259,13 +261,16 @@ void PutPds(u32 offset, const SgxdPdsProgram& p) {
 void WriteScreenPrograms() {
     const SgxdRecipe& r = g.recipe;
     u8* area = g.memory + g.screen_offset;
-    u64 words[4];
+    u64 words[6];
     std::memcpy(area + ScreenVertexCode, words, sgxd_program_blit_vertex(words) * 8);
     std::memcpy(area + ScreenFragmentCode, words, sgxd_program_screen_fragment(words) * 8);
+    std::memcpy(area + ScreenBlendCode, words, sgxd_program_screen_blend_fragment(words) * 8);
     g.screen_vertex = sgxd_program_doutu0(0, g.screen_offset + ScreenVertexCode -
                                                  r.offset[SGXD_R_CV], 0);
     g.screen_fragment = sgxd_program_doutu0(1, g.screen_offset + ScreenFragmentCode -
                                                    r.offset[SGXD_R_CF], 0);
+    g.screen_blend = sgxd_program_doutu0(1, g.screen_offset + ScreenBlendCode -
+                                                r.offset[SGXD_R_CF], 0);
     static const u16 indices[8] = {0, 1, 2, 3, 4, 5, 0, 0};
     std::memcpy(area + ScreenIndices, indices, sizeof(indices));
 
@@ -301,11 +306,11 @@ void WriteScreenPrograms() {
     }
 }
 
-// The pixel primary sampling tex, written the first time tex is seen. A full table starts
-// over at its oldest entry.
-const State::PixelEntry& PixelEntryFor(const u32 tex[4]) {
+// The pixel primary sampling tex (into the blending fragment program for a translucent screen),
+// written the first time it is seen. A full table starts over at its oldest entry.
+const State::PixelEntry& PixelEntryFor(const u32 tex[4], bool blend) {
     for (u32 i = 0; i < g.pixel_used; i++) {
-        if (std::memcmp(g.pixel_entries[i].tex, tex, 16) == 0) {
+        if (std::memcmp(g.pixel_entries[i].tex, tex, 16) == 0 && g.pixel_entries[i].blend == blend) {
             return g.pixel_entries[i];
         }
     }
@@ -313,9 +318,10 @@ const State::PixelEntry& PixelEntryFor(const u32 tex[4]) {
     g.pixel_next = (i + 1) % ScreenPixelEntries;
     State::PixelEntry& e = g.pixel_entries[i];
     SgxdPdsProgram pds{};
-    sgxd_program_screen_pixel_pds(g.screen_fragment, tex, &pds);
+    sgxd_program_screen_pixel_pds(blend ? g.screen_blend : g.screen_fragment, tex, &pds);
     PutPds(ScreenPixelPds + i * ScreenPdsSlot, pds);
     std::memcpy(e.tex, tex, 16);
+    e.blend = blend;
     e.va = ScreenVa(ScreenPixelPds + i * ScreenPdsSlot);
     e.units = pds.units;
     return e;
@@ -681,7 +687,7 @@ Batch& CurrentBatch() {
 }
 
 bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_format, u32 x,
-                     u32 y, u32 w, u32 h) {
+                     u32 y, u32 w, u32 h, float opacity) {
     u32 code, swizzle, bytes;
     Batch& b = g.batch;
     // A linear texture's rows are its width rounded up to 8 texels: the framebuffer's stride is the
@@ -716,26 +722,30 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
     };
     float* v = reinterpret_cast<float*>(g.memory + g.screen_offset + ScreenVertices + slot * 0x100);
     for (u32 n = 0; n < 6; n++) {
-        const float words[N] = {corner[n][0], corner[n][1], 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        const float words[N] = {corner[n][0], corner[n][1], 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, opacity,
                                 corner[n][2] * u_end, corner[n][3]};
         std::memcpy(v + n * N, words, sizeof(words));
     }
 
-    // Point sampled: each display pixel shows the framebuffer pixel under its centre.
+    // Point sampled: each display pixel shows the framebuffer pixel under its centre. A
+    // translucent screen (the overlay, drawn smaller than the 3DS's) is filtered, and reads its
+    // alpha as one (RGBA as RGB1: the LCD shows no alpha).
+    const bool blend = opacity < 1.0f;
     u32 tex[4];
-    sgxd_recipe_texture_words_format(va, texels, columns, 0, code, swizzle, tex);
-    const State::PixelEntry& e = PixelEntryFor(tex);
+    sgxd_recipe_texture_words_format(va, texels, columns, blend ? 1 : 0, code,
+                                     blend && swizzle == 2 ? 6 : swizzle, tex);
+    const State::PixelEntry& e = PixelEntryFor(tex, blend);
     SgxdRecipeDrawPrograms& p = g.screen_programs[slot];
     p.fprim = e.va;
     p.fprim_units = e.units;
-    // Opaque, DCMP ALWAYS, no depth write (the blit's ISP word).
-    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    // Opaque, DCMP ALWAYS, no depth write (the blit's ISP word); translucent to blend.
+    const u32 isp = (blend ? 1u << 25 : 0u) | 7u << 22 | 1u << 20 | 1u << 9;
     b.draws[b.draw_count++] = SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, &p};
     return true;
 }
 
-bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32 x, u32 y, u32 w,
-                       u32 h) {
+bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32 margin,
+                       bool flip, u32 x, u32 y, u32 w, u32 h, float opacity) {
     Batch& b = g.batch;
     if (!g.in_frame || g.screens_in_frame >= ScreenSlots || b.draw_count >= b.max_draws ||
         width % 8 != 0 || width == 0 || height == 0 || w == 0 || h == 0) {
@@ -750,8 +760,18 @@ bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32
     constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
     const float x0 = 2.0f * x / DisplayWidth - 1, x1 = 2.0f * (x + w) / DisplayWidth - 1;
     const float y0 = 2.0f * y / DisplayHeight - 1, y1 = 2.0f * (y + h) / DisplayHeight - 1;
+    // The widescreen picture's margins (margin of the screen's rows each side, the picture's
+    // first column the screen's row -margin): as much of them as the rectangle is wider than
+    // the screen's 5:3, none in a 5:3 one.
     const float scale = static_cast<float>(quarters) / 4.0f;
-    const float u0 = scale * row / width, u1 = scale * (row + 400) / width;
+    const float shown = std::clamp((static_cast<float>(w) * 240.0f / static_cast<float>(h) -
+                                    400.0f) / 2.0f,
+                                   0.0f, static_cast<float>(margin));
+    // Flipped, the display's left edge is the picture's column row + margin plus the margin
+    // shown, and the columns go down to its right edge.
+    const float first = static_cast<float>(row + margin) + (flip ? shown : -shown);
+    const float last = flip ? first - 400 - 2 * shown : first + 400 + 2 * shown;
+    const float u0 = scale * first / width, u1 = scale * last / width;
     const float v1 = scale * 240 / height;
     const float corner[6][4] = {
         {x0, y0, u0, v1}, {x1, y0, u1, v1}, {x0, y1, u0, 0},
@@ -759,19 +779,20 @@ bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32
     };
     float* v = reinterpret_cast<float*>(g.memory + g.screen_offset + ScreenVertices + slot * 0x100);
     for (u32 n = 0; n < 6; n++) {
-        const float words[N] = {corner[n][0], corner[n][1], 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        const float words[N] = {corner[n][0], corner[n][1], 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, opacity,
                                 corner[n][2], corner[n][3]};
         std::memcpy(v + n * N, words, sizeof(words));
     }
     // Bilinear: the scaled picture scaled again to the layout's rectangle. U8888 as the pass's tile held
-    // it (SGXD_RECIPE_PACK_U8888), so unmirrored.
+    // it (SGXD_RECIPE_PACK_U8888), so unmirrored; translucent, its alpha read as one (1BGR).
+    const bool blend = opacity < 1.0f;
     u32 tex[4];
-    sgxd_recipe_texture_words_format(va, width, height, 1, 0x0c, 0, tex);
-    const State::PixelEntry& e = PixelEntryFor(tex);
+    sgxd_recipe_texture_words_format(va, width, height, 1, 0x0c, blend ? 4 : 0, tex);
+    const State::PixelEntry& e = PixelEntryFor(tex, blend);
     SgxdRecipeDrawPrograms& p = g.screen_programs[slot];
     p.fprim = e.va;
     p.fprim_units = e.units;
-    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    const u32 isp = (blend ? 1u << 25 : 0u) | 7u << 22 | 1u << 20 | 1u << 9;
     b.draws[b.draw_count++] = SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, &p};
     return true;
 }

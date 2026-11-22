@@ -86,12 +86,20 @@ public:
     /// row * quarters / 4 (the LCD may point into the output), its 400 rows 100 * quarters
     /// picture columns from there and its 240 columns 60 * quarters picture rows. False when the
     /// buffer holds the 1x picture alone. On the render thread, as the present is.
+    /// Widescreen, margin of the screen's rows each side past its 400 (the picture's first
+    /// column is the screen's row -margin, scaled), 0 without. flip (the transfer's
+    /// flip_vertically): the screen's rows run the other way through the picture, its first
+    /// row's left edge at picture column (row + margin) * quarters / 4 and the 400 lower.
     static bool TopScreenPicture(PAddr lcd, u32& gpu, u32& width, u32& height, u32& row,
-                                 u32& quarters);
+                                 u32& quarters, u32& margin, bool& flip);
     /// The upscaled top screen's scale in quarters: 4 (none, the default), 5 (1.25x) or 6
     /// (1.5x); the frontend's setting, read at each pass on the buffer. Any thread.
     static void SetTopScale(u32 quarters);
     [[nodiscard]] static u32 TopScale();
+    /// Widescreen: the top screen's colour buffers drawn margin rows wider each side (a multiple of 4,
+    /// 0 for none). Any thread.
+    static void SetWidescreen(u32 margin);
+    [[nodiscard]] static u32 Widescreen();
     /// A guest frame has ended (each VBlank, its present shown or dropped): the draw logs count frames.
     void EndFrame() {
         frames++;
@@ -831,6 +839,7 @@ private:
         PAddr addr;
         u32 width, height, bytes; ///< the guest buffer's
         u32 quarters;              ///< its scale (TopScale when it was made)
+        u32 margin;                ///< its widescreen margin (Widescreen when it was made)
         SgxdBackend::Data picture; ///< height x width scaled (the pass's transpose), LINEAR U8888
         u32 stride;                ///< its rows apart, in pixels (a multiple of 8)
         bool valid = false; ///< it holds the buffer's picture: only its scaled passes wrote since
@@ -840,6 +849,9 @@ private:
     Upscaled* pass_upscaled = nullptr;           ///< the open pass's buffer, drawn scaled
     SgxdBackend::PicaTarget pass_scaled_target{}; ///< its target, for DownscalePicture after it
     u32 pass_quarters = 4;                       ///< the pass's pixels to the guest's, in quarters
+    static constexpr u32 TopScreenRows = 400;
+    u32 pass_margin = 0;  ///< its widescreen margin, in the buffer's rows (Upscaled::margin)
+    bool pass_widened{};  ///< its part as wide as the screen: the margins beside it drawn too
     /// A guest size in the pass's pixels: exact for the upscaled buffers' sizes (UpscaledFor).
     [[nodiscard]] u32 PassSize(u32 v) const {
         return v * pass_quarters / 4;
@@ -847,6 +859,11 @@ private:
     /// A guest pixel edge in the pass's pixels: the first pixel whose centre is at or past it.
     [[nodiscard]] s32 PassEdge(s32 v) const {
         return (2 * v * static_cast<s32>(pass_quarters) + 3 + (v < 0 ? -7 : 0)) / 8;
+    }
+    /// The same for the target's x (the buffer's rows), past the widescreen margin; `widen` takes the
+    /// margins beside a part.
+    [[nodiscard]] s32 PassX(s32 v, s32 widen = 0) const {
+        return PassEdge(v + static_cast<s32>(pass_margin) + widen * static_cast<s32>(pass_margin));
     }
     /// The pass stores all of its depth (its draws kept off the margin by the ISP's mask or a kill):
     /// guest memory's depth untiled into the store. A scaled pass keeps the scratch and the copy
@@ -876,6 +893,7 @@ private:
         u32 width, height; ///< the output's rows by its columns scaled, width up to 8s (its rows
                            ///< apart)
         u32 quarters;
+        u32 margin; ///< the picture's widescreen margin, in the screen's rows
         bool flip;  ///< the transfer's flip_vertically: the output's rows the other way round
         bool valid;
     };
@@ -1019,13 +1037,15 @@ private:
         PAddr addr;
         u32 width, height, format; // the guest buffer's
         u32 quarters;              // the store's samples a pixel side, in quarters: 4 at 1x
+        u32 margin;                // the widescreen margin it is wider by, the buffer's rows
         SgxdBackend::DepthStore store;
         bool valid; // the last pass on the buffer stored it, and nothing wrote there since
         // A pass storing part of its target stores its depth here, then that part into store.
         SgxdBackend::DepthStore scratch{};
     };
     std::vector<DepthStore> depth_stores;
-    DepthStore& DepthStoreFor(PAddr addr, u32 width, u32 height, u32 format, u32 quarters = 4);
+    DepthStore& DepthStoreFor(PAddr addr, u32 width, u32 height, u32 format, u32 quarters = 4,
+                              u32 margin = 0);
     SgxdBackend::DepthStore NewDepthStore(u32 width, u32 height, u32 format,
                                           bool upscaled = false);
     void DepthStoresWritten(PAddr start, PAddr end);

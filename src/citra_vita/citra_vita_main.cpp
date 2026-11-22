@@ -307,9 +307,18 @@ StateArguments TakeStateArguments() {
             // The top screen's scale: 1, 1.25 or 1.5.
             SgxdRenderer::RasterizerSgxd::SetTopScale(
                 static_cast<u32>(std::lround(std::atof(argument.c_str() + 6) * 4)));
+        } else if (argument == "layout=overlay") {
+            Settings::values.layout_option = Settings::LayoutOption::SingleScreen;
+            VitaFrontend::EmuWindowVita::SetOverlay(true);
         } else if (argument.starts_with("layout=")) {
             Settings::values.layout_option =
                 static_cast<Settings::LayoutOption>(std::atoi(argument.c_str() + 7));
+        } else if (argument == "wide") {
+            VitaFrontend::EmuWindowVita::SetWidescreen(true);
+        } else if (argument.starts_with("opacity=")) {
+            // The overlay layout's other screen, in percent (10 to 100).
+            VitaFrontend::EmuWindowVita::SetOverlayOpacity(
+                static_cast<u32>(std::clamp(std::atoi(argument.c_str() + 8), 10, 100)));
         } else if (argument == "sched=0") {
             // The module's in-kernel scheduling off: every SleepThread exits to the HLE kernel.
             Core::SetVitaInKernelScheduling(false);

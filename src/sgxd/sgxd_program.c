@@ -180,6 +180,17 @@ unsigned sgxd_program_screen_fragment(uint64_t words[4]) {
     return 2;
 }
 
+unsigned sgxd_program_screen_blend_fragment(uint64_t words[6]) {
+    words[0] = USSE_PHAS_LAST;
+    words[1] = 0x40800d7ea0198002ull; // pack.f16.f32 pa0, pa0..pa3
+    words[2] = 0x40a00a3ea01d8000ull; // pack.u8.f16.scl pa0, pa0
+    words[3] = 0x40a00a3ea09d8200ull; // pack.u8.f16.scl pa4, pa4 (the line before's, USE0 bits
+                                      // 13..8 at 2 and the destination at 4)
+    words[4] = 0x80a00082a0000004ull; // sop2 pa0, pa0, pa4: SRC2, ZERO (pa0 * pa4 per byte)
+    words[5] = 0x80848add90000000ull; // sop2 o0, pa0, o0: SRCALPHA, ONE_MINUS_SRCALPHA (end)
+    return 6;
+}
+
 // The blit's pixel primary, with the texel converted by fconv into tag_words PA words.
 static int textured_pixel_pds(uint32_t kick0, const uint32_t tex[4], unsigned fconv,
                               unsigned tag_words, SgxdPdsProgram *out) {

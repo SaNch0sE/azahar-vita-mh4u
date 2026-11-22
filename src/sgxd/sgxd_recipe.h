@@ -391,8 +391,9 @@ typedef struct SgxdPicaStore {
 // not take (width a multiple of 8 up to 1024, height of 16 from 32 to 1024) or a part of it not
 // in 8s (y0 in 16s).
 unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out);
-// The end of tile of a target r draws at quarters / 4 times the size of s's buffer (5 to 8: 1.25x
-// to 2x): s's part (or all of it) scaled into picture, LINEAR U8888 rows picture_stride pixels
+// The end of tile of a target r draws at quarters / 4 times the size of s's buffer (4 to 8: 1x
+// to 2x; 1x for a widescreen picture, whose buffer is the picture's columns at 1x and whose part
+// is in them): s's part (or all of it) scaled into picture, LINEAR U8888 rows picture_stride pixels
 // apart; s's buffer is left as it is. A part's edge at x lands on the first pixel whose centre is
 // at or past x * quarters / 4. Returns the count, or 0 for r not a whole buffer's size scaled, a
 // part outside it, or a stride under r's width or odd.

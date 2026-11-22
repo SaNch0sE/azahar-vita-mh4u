@@ -166,11 +166,15 @@ public:
         u32 bpp;
         // The part of the transpose stored (SgxdPicaStore's x0..x1, y0..y1); x1 0 for all of it.
         u32 x0{}, x1{}, y0{}, y1{};
-        // Drawn scaled by picture_quarters / 4 (5 to 8: the upscaled top screen): the pass is
-        // height x width scaled, each tile stored whole into picture, LINEAR U8888 rows
-        // picture_stride pixels apart (sgxd_recipe_pica_eot_scaled), the guest's buffer left to
-        // DownscalePicture; picture 0 for 1x.
-        u32 picture{}, picture_stride{}, picture_quarters{};
+        // Drawn scaled by picture_quarters / 4 (4 to 6: the upscaled or widescreen top screen):
+        // the pass is height x width scaled, each tile stored whole into picture, LINEAR U8888
+        // rows picture_stride pixels apart (sgxd_recipe_pica_eot_scaled), the guest's buffer left
+        // to DownscalePicture; picture 0 for none. Widescreen, the pass and the picture are
+        // picture_margin of the buffer's rows (its transpose's columns) wider on each side, the
+        // buffer's first row at the picture's picture_margin (scaled); with picture_widen the
+        // part's columns grow by the margin each side too (a viewport as wide as the screen).
+        u32 picture{}, picture_stride{}, picture_quarters{}, picture_margin{};
+        bool picture_widen{};
     };
     /// Opens a pass on target. The background is clear (A8B8G8R8) at depth, what a fill left
     /// pending in guest memory. before: as BeginPassLoaded's.
@@ -515,7 +519,7 @@ public:
     /// texels (the display transfer's ScaleX and ScaleXY).
     SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height,
                                         bool mirror = false, u32 source_stride = 0,
-                                        float scale_x = 1, float scale_y = 1);
+                                        float scale_x = 1, float scale_y = 1, u32 source_x = 0);
     /// A display transfer from a PICA-tiled picture in guest memory: one pass whose draws read
     /// it a band of tile rows at a time (DrawTiled), into dest_gpu as width x height pixels of
     /// pack (an SGXD_RECIPE_PACK_*), rows width apart, the source's top-left width * scale_x x

@@ -1021,7 +1021,7 @@ unsigned sgxd_recipe_pica_eot_scaled(const SgxdRecipe *r, const SgxdPicaStore *s
                                      unsigned quarters, uint32_t picture, uint32_t picture_stride,
                                      uint64_t *out) {
     // The guest's transpose at 1x, as sgxd_recipe_pica_eot takes it; the render is that scaled.
-    if (quarters < 5 || quarters > 8 || r->width * 4 % quarters || r->height * 4 % quarters) {
+    if (quarters < 4 || quarters > 8 || r->width * 4 % quarters || r->height * 4 % quarters) {
         return 0;
     }
     const uint32_t width = r->width * 4 / quarters, height = r->height * 4 / quarters;

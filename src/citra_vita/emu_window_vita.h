@@ -126,7 +126,25 @@ public:
         loading.store(on, std::memory_order_relaxed);
     }
 
+    /// The shared layout for the display, with the Vita's own options over it: the widescreen
+    /// top screen filling the display in the single screen layout, and the overlay layout's
+    /// other screen at the bottom, translucent (SetOverlay).
     void UpdateCurrentFramebufferLayout();
+
+    /// Widescreen: the top screen drawn wider than the 3DS's (RasterizerSgxd::SetWidescreen),
+    /// filling the display in the single screen layouts; elsewhere it shows at 5:3 as before.
+    static void SetWidescreen(bool on);
+    [[nodiscard]] static bool Widescreen();
+    /// The overlay layouts: the single screen layout with the other screen at quarters/4 of its
+    /// size in the display's bottom right corner (3, or 5 for the large overlay; 0 for none),
+    /// opacity percent opaque, and touchable there.
+    static void SetOverlay(u32 quarters);
+    [[nodiscard]] static bool Overlay();
+    static void SetOverlayOpacity(u32 percent);
+    [[nodiscard]] static u32 OverlayOpacity();
+    /// The widescreen picture's extra rows on each side of the top screen's 400: the display's
+    /// 960x544 at the top screen's 240 rows is 423.5 wide.
+    static constexpr u32 WidescreenMargin = 12;
 
 private:
     void ReadPad();

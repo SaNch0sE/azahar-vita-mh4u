@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include "citra_vita/vita_ui.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
+#include "core/3ds.h"
 #include "core/core.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/renderer_gxm/gxm_rasterizer.h"
@@ -51,8 +53,73 @@ EmuWindowVita::~EmuWindowVita() {
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_STOP);
 }
 
+namespace {
+std::atomic<EmuWindowVita::Wide> widescreen{EmuWindowVita::Wide::Off};
+std::atomic<u32> overlay_quarters{0};
+std::atomic<u32> overlay_percent{60};
+} // namespace
+
+void EmuWindowVita::SetWidescreen(Wide mode) {
+    widescreen.store(mode, std::memory_order_relaxed);
+}
+
+EmuWindowVita::Wide EmuWindowVita::Widescreen() {
+    return widescreen.load(std::memory_order_relaxed);
+}
+
+void EmuWindowVita::SetOverlay(u32 quarters) {
+    overlay_quarters.store(quarters, std::memory_order_relaxed);
+}
+
+bool EmuWindowVita::Overlay() {
+    return overlay_quarters.load(std::memory_order_relaxed) != 0;
+}
+
+void EmuWindowVita::SetOverlayOpacity(u32 percent) {
+    overlay_percent.store(std::clamp(percent, 10u, 100u), std::memory_order_relaxed);
+}
+
+u32 EmuWindowVita::OverlayOpacity() {
+    return overlay_percent.load(std::memory_order_relaxed);
+}
+
 void EmuWindowVita::UpdateCurrentFramebufferLayout() {
     EmuWindow::UpdateCurrentFramebufferLayout(DisplayWidth, DisplayHeight, false);
+    Layout::FramebufferLayout layout = GetFramebufferLayout();
+    const bool single =
+        Settings::values.layout_option.GetValue() == Settings::LayoutOption::SingleScreen;
+    const bool swapped = Settings::values.swap_screen.GetValue();
+    // The widescreen top screen fills the display where it is the one screen shown; the
+    // renderer draws its margins only then.
+    const bool wide = Widescreen() && single && !swapped;
+    SgxdRenderer::RasterizerSgxd::SetWidescreen(wide ? WidescreenMargin : 0);
+    if (wide) {
+        layout.top_screen = {0, 0, DisplayWidth, DisplayHeight};
+    }
+    if (single && Overlay()) {
+        // The other screen at 3/4 of its size (5/4 for the large overlay) in the display's
+        // bottom right corner, translucent. Touch follows the bottom screen's rectangle
+        // (EmuWindow::IsWithinTouchscreen).
+        const float opacity = static_cast<float>(OverlayOpacity()) / 100.0f;
+        const u32 quarters = overlay_quarters.load(std::memory_order_relaxed);
+        const u32 w = static_cast<u32>(swapped ? Core::kScreenTopWidth : Core::kScreenBottomWidth) *
+                      quarters / 4;
+        const u32 h =
+            static_cast<u32>(swapped ? Core::kScreenTopHeight : Core::kScreenBottomHeight) *
+            quarters / 4;
+        const Common::Rectangle<u32> rect{DisplayWidth - w, DisplayHeight - h, DisplayWidth,
+                                          DisplayHeight};
+        if (!swapped) {
+            layout.bottom_screen_enabled = true;
+            layout.bottom_screen = rect;
+            layout.bottom_opacity = opacity;
+        } else {
+            layout.top_screen_enabled = true;
+            layout.top_screen = rect;
+            layout.top_opacity = opacity;
+        }
+    }
+    NotifyFramebufferLayoutChanged(layout);
 }
 
 std::pair<float, float> EmuWindowVita::LeftStick() const {
@@ -446,7 +513,11 @@ void EmuWindowVita::DrawGuestScreens() {
     const auto& layout = GetFramebufferLayout();
     const bool enabled[2] = {layout.top_screen_enabled, layout.bottom_screen_enabled};
     const Common::Rectangle<u32> rects[2] = {layout.top_screen, layout.bottom_screen};
-    for (u32 i = 0; i < 2; i++) {
+    const float opacity[2] = {std::min(layout.top_opacity, 1.0f),
+                              std::min(layout.bottom_opacity, 1.0f)};
+    // An overlaid (translucent) screen after the one under it.
+    const u32 order[2] = {opacity[0] < 1.0f ? 1u : 0u, opacity[0] < 1.0f ? 0u : 1u};
+    for (const u32 i : order) {
         const GuestScreen& s = screens[i];
         const Common::Rectangle<u32>& r = rects[i];
         std::array<u32, 5>& seen = screens_seen[i];
@@ -465,19 +536,20 @@ void EmuWindowVita::DrawGuestScreens() {
         if (!enabled[i] || s.fill || s.address == 0 || s.pixels == nullptr) {
             continue;
         }
-        // The upscaled top screen's picture, when the buffer's transfer copied one.
-        u32 picture = 0, picture_w = 0, picture_h = 0, picture_row = 0, quarters = 4;
+        // The upscaled or widescreen top screen's picture, when the buffer's transfer copied one.
+        u32 picture = 0, picture_w = 0, picture_h = 0, picture_row = 0, quarters = 4, margin = 0;
         bool flip = false;
         if (i == 0 &&
             SgxdRenderer::RasterizerSgxd::TopScreenPicture(s.address, picture, picture_w, picture_h,
-                                                         picture_row, quarters) &&
+                                                         picture_row, quarters, margin, flip) &&
             SgxdPresent::DrawPictureScreen(picture, picture_w, picture_h, picture_row, quarters,
-                                           r.left, r.top, r.GetWidth(), r.GetHeight())) {
+                                           margin, flip, r.left, r.top, r.GetWidth(),
+                                           r.GetHeight(), opacity[i])) {
             continue;
         }
         if (!SgxdPresent::DrawGuestScreen(s.address, s.uncached ? nullptr : s.pixels, s.stride,
-                                          s.columns, s.format,
-                                          r.left, r.top, r.GetWidth(), r.GetHeight()) &&
+                                          s.columns, s.format, r.left, r.top, r.GetWidth(),
+                                          r.GetHeight(), opacity[i]) &&
             screens_skipped++ % 600 == 0) {
             LOG_WARNING(Frontend,
                         "screen {} not drawn: framebuffer {:#010x}, format {}, stride {} ({} "

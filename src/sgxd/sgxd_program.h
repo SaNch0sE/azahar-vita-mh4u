@@ -111,6 +111,11 @@ int sgxd_program_blit_pixel_pds(uint32_t doutu0, const uint32_t tex[4], SgxdPdsP
 // (DOUTT FCONV F16, TAGSIZE 2 words) into pa4..pa5, packed to o0 (pack.u8.f16.scl o0, pa4).
 // The PA count stays SGXD_PROGRAM_BLIT_PA.
 unsigned sgxd_program_screen_fragment(uint64_t words[4]);
+// The same blended over the display (a screen overlaid translucent): the colour iterator (white,
+// its alpha the screen's opacity) and the texel (its alpha one by the texture's swizzle) as bytes,
+// their product, and that over o0 by its alpha (sgxd_recipe.c's SGXD_IMGUI_MODULATE words). The
+// draw's ISP pass type must be translucent. Six words.
+unsigned sgxd_program_screen_blend_fragment(uint64_t words[6]);
 int sgxd_program_screen_pixel_pds(uint32_t doutu0, const uint32_t tex[4], SgxdPdsProgram *out);
 
 // A 64-bit texel copied raw (azahar's ETC1 untile: an 8-byte block a pixel): the texture issued

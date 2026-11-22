@@ -1308,8 +1308,12 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
         FlipPdsHalf();
     }
     const u32 q = pica && pica->picture ? pica->picture_quarters : 4;
-    DEBUG_ASSERT(q >= 4 && q <= 8 && width * q % 4 == 0 && height * q % 4 == 0);
-    Recipe& r = RecipeFor(width * q / 4, height * q / 4, pica ? Kind::Pica : Kind::Linear);
+    // The widescreen picture's margins: the render is the buffer that many rows wider each side.
+    const u32 margin = pica && pica->picture ? pica->picture_margin : 0;
+    DEBUG_ASSERT(q >= 4 && q <= 8 && width * q % 4 == 0 && height * q % 4 == 0 &&
+                 margin * q % 4 == 0);
+    Recipe& r = RecipeFor((width + 2 * margin) * q / 4, height * q / 4,
+                          pica ? Kind::Pica : Kind::Linear);
     current = &r;
     pass_target = pica ? Footprint{pica->gpu, pica->gpu + pica->width * pica->height * pica->bpp}
                        : Footprint{target_gpu, target_gpu + width * height * 4};
@@ -1355,8 +1359,14 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     data_begin = at;
     data_end = data_begin + DataSize;
     if (pica) {
-        const SgxdPicaStore store{pica->gpu, pica->pack, pica->bpp, pica->x0,
-                                  pica->x1,  pica->y0,   pica->y1};
+        SgxdPicaStore store{pica->gpu, pica->pack, pica->bpp, pica->x0,
+                            pica->x1,  pica->y0,   pica->y1};
+        if (margin != 0 && pica->x1 != 0) {
+            // margins too.
+            const u32 widen = pica->picture_widen ? margin : 0;
+            store.x0 = pica->x0 + margin - widen;
+            store.x1 = pica->x1 + margin + widen;
+        }
         u64 eot[SGXD_RECIPE_PICA_EOT_MAX];
         const unsigned words =
             pica->picture ? sgxd_recipe_pica_eot_scaled(&r.recipe, &store, q, pica->picture,
@@ -1431,7 +1441,8 @@ void SgxdBackend::BeginPassLoadedScaled(const PicaTarget& target, float depth,
     }
     if (magnified) {
         pass_source = {guest.gpu, guest.gpu + guest.width * guest.height * guest.bits / 8};
-        DrawTiled(guest, true, 1, 1, target.picture_quarters);
+        DrawTiled(guest, true, 1, 1, target.picture_quarters,
+                  target.picture_margin * target.picture_quarters / 4);
         return;
     }
     const Recipe& r = *current;
@@ -1453,9 +1464,11 @@ void SgxdBackend::DownscalePicture(const PicaTarget& target) {
                    target.picture + target.picture_stride * (r.height * q / 4) * 4};
     // Pixel (x, y) reads the picture at its centre scaled (BlitPrograms' scale): the two
     // nearest texels a side, weighed by the distance.
+    // The widescreen picture's buffer starts past its left margin.
     const float s = static_cast<float>(q) / 4.0f;
-    const SgxdRecipeDrawPrograms p = BlitPrograms(Data{nullptr, target.picture}, r.width,
-                                                  r.height, false, target.picture_stride, s, s);
+    const SgxdRecipeDrawPrograms p =
+        BlitPrograms(Data{nullptr, target.picture}, r.width, r.height, false,
+                     target.picture_stride, s, s, target.picture_margin * q / 4);
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
     Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
     EndPass();
@@ -2243,7 +2256,7 @@ void SgxdBackend::PlaceFixedPrograms() {
 
 SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, u32 height,
                                                  bool mirror, u32 source_stride, float scale_x,
-                                                 float scale_y) {
+                                                 float scale_y, u32 source_x) {
     const u32 source_rows = static_cast<u32>(std::lround(height * scale_y));
     DEBUG_ASSERT(scale_x >= 1 && scale_x <= 2 && scale_y >= 1 && scale_y <= 2 &&
                  static_cast<float>(source_rows) == height * scale_y);
@@ -2257,11 +2270,10 @@ SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, 
     float* v = reinterpret_cast<float*>(vertices.cpu);
     for (u32 n = 0; n < 6; n++) {
         const float x = corner[n][0], y = corner[n][1];
-        // Scaled, output pixel x's centre is source column 2x + 1, between texels 2x and
-        // 2x + 1: the bilinear read weighs both 32/64 (exact; the filter's weights are
-        // 6 bits) and rounds halves up, where the
-        // PICA's box filter truncates (upstream's sw_blitter): one LSB on odd sums.
-        const float u = (x + 1) / 2 * width * scale_x / stride;
+        // Scaled, pixel x's centre is source column 2x + 1: the bilinear read weighs texels 2x and
+        // 2x + 1 32/64 and rounds halves up, where the PICA's box filter truncates (one LSB on odd
+        // sums). From column source_x on (past a widescreen margin).
+        const float u = (static_cast<float>(source_x) + (x + 1) / 2 * width * scale_x) / stride;
         const float words[N] = {x, y, 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, u, (y + 1) / 2};
         std::memcpy(v + n * N, words, sizeof(words));
     }
@@ -3199,8 +3211,11 @@ void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_
     p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
     p.outselects = SGXD_PROGRAM_BLIT_OUTSELECTS;
     p.texsize = SGXD_PROGRAM_BLIT_TEXSIZE;
-    const float viewport[6] = {r.width / 2.0f, r.width / 2.0f, r.height / 2.0f, r.height / 2.0f,
-                               0.0f, 1.0f};
+    // offset_x: on a transposed target the picture starts that many columns in (a widescreen
+    // picture's margin), its geometry the same; what it moves past the target is clipped.
+    DEBUG_ASSERT(offset_x == 0 || transposed);
+    const float viewport[6] = {r.width / 2.0f + static_cast<float>(offset_x), r.width / 2.0f,
+                               r.height / 2.0f, r.height / 2.0f, 0.0f, 1.0f};
     std::memcpy(p.viewport, viewport, sizeof(viewport));
     p.indices = 0;
     p.primitive = SGXD_PROGRAM_TRIANGLES;
