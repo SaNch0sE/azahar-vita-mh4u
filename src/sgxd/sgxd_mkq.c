@@ -14,6 +14,7 @@
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
 
 #define W(r, v) {SGXD_OP_WRITE, (r), (v), 0, 0}
 
@@ -84,6 +85,12 @@ static uint32_t runtime_len, code_used;
 static uint32_t job_end;
 static uint32_t sprv_before, base15_before;
 static uint32_t generation = 1, flips_done;
+// sgxd_mkq_park's: set while a suspend holds the submits, and the event flag they wait on (bit 0
+// set while they may go on). The lists between sgxd_mkq_enter and their send (`building`) were
+// built before the suspend held the submits: they go out before it, which waits for them.
+static volatile int parked;
+static SceUID park_flag = -1;
+static volatile int building;
 static Shape shapes[SHAPES];
 static uint32_t nshapes;
 static SgxdOp pool[POOL_OPS];
@@ -433,6 +440,59 @@ static int shape_equal(const Shape *s, const SgxdOp *ops, unsigned count, const 
     return 1;
 }
 
+void sgxd_mkq_enter(void) {
+    for (;;) {
+        if (parked) {
+            sceKernelWaitEventFlag(park_flag, 1, SCE_EVENT_WAITOR, NULL, NULL);
+        }
+        // The count before the look at `parked`, the park's store before its look at the count:
+        // either the suspend waits for this list or the list waits for the resume.
+        __atomic_add_fetch(&building, 1, __ATOMIC_SEQ_CST);
+        if (!__atomic_load_n(&parked, __ATOMIC_SEQ_CST)) {
+            return;
+        }
+        __atomic_sub_fetch(&building, 1, __ATOMIC_SEQ_CST);
+    }
+}
+
+void sgxd_mkq_leave(void) {
+    __atomic_sub_fetch(&building, 1, __ATOMIC_SEQ_CST);
+}
+
+void sgxd_mkq_park(int park) {
+    if (park_flag < 0) {
+        park_flag = sceKernelCreateEventFlag("SgxdMkqPark", SCE_EVENT_WAITMULTIPLE, 1, NULL);
+    }
+    if (park) {
+        __atomic_store_n(&parked, 1, __ATOMIC_SEQ_CST);
+        sceKernelClearEventFlag(park_flag, ~1u);
+    } else {
+        parked = 0;
+        __asm__ volatile("dmb" ::: "memory");
+        sceKernelSetEventFlag(park_flag, 1);
+    }
+}
+
+int sgxd_mkq_drained(void) {
+    return !__atomic_load_n(&building, __ATOMIC_SEQ_CST) &&
+           (!state || (!state[SGXD_MK_BUSY] && state[SGXD_MK_POS] == job_end &&
+                       state[SGXD_MK_POS3] == job_end));
+}
+
+int sgxd_mkq_resume(char *failed, unsigned failed_size) {
+    if (!state) {
+        return 0;
+    }
+    __asm__ volatile("dmb" ::: "memory");
+    SgxdOp ops[] = {W(CODE_BASE_REG, (code_va + CODE_OFFSET) >> 6), W(USE_CACHE_INVAL, 1),
+                    W(CORE0_PDS, code_va), W(CORE0_PDS_UNITS, PDS_DOUTA_UNITS),
+                    W(CORE0_EVENT_TIMER, 0),
+                    W(CODE_BASE_15, (code_va + CODE_OFFSET) >> 6),
+                    W(CORE0_USE_SPRV, rt.supervisor)};
+    return submit_sync(ops, sizeof(ops) / sizeof(ops[0]), "event program again", failed,
+                       failed_size);
+}
+
 int sgxd_mkq_idle(void) {
     const SceUInt64 t0 = sceKernelGetProcessTimeWide();
     while (state[SGXD_MK_BUSY] || state[SGXD_MK_POS] != job_end ||
@@ -599,7 +659,23 @@ static void plan_values(volatile uint32_t *slot, const SgxdOp *ops, const uint16
     }
 }
 
+static int submit(const SgxdOp *ops, unsigned count, const uint8_t *variable, SgxdMkqCode *code);
+
 int sgxd_mkq_submit(const SgxdOp *ops, unsigned count, const uint8_t *variable, SgxdMkqCode *code) {
+    if (parked) {
+        sceKernelWaitEventFlag(park_flag, 1, SCE_EVENT_WAITOR, NULL, NULL);
+    }
+    return submit(ops, count, variable, code);
+}
+
+int sgxd_mkq_submit_entered(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                            SgxdMkqCode *code) {
+    const int r = submit(ops, count, variable, code);
+    sgxd_mkq_leave();
+    return r;
+}
+
+static int submit(const SgxdOp *ops, unsigned count, const uint8_t *variable, SgxdMkqCode *code) {
     if (state[SGXD_MK_FAULT]) {
         return AZAHAR_ERR_STATE;
     }

@@ -52,6 +52,7 @@ azaharnative:
         - azaharBusErrorWatch: 0x3C1A7E33
         - azaharVolumeKeys: 0x3C1A7E34
         - azaharModuleUid: 0x3C1A7E35
+        - sgxdResumed: 0x3C1A7E36
         - azaharKernelPlugins: 0x3C1A7E41
         - azaharVaReport: 0x3C1A7E42
         - sgxdResetAll: 0x3C1A7E44

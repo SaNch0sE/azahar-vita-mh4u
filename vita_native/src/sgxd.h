@@ -111,7 +111,7 @@ typedef struct SgxdOp {
 #define SGXD_DUMP_BANK_REGS 266u
 #define SGXD_DUMP_CORE_REGS 399u
 
-#define SGXD_VERSION 15
+#define SGXD_VERSION 16
 
 // sgxdEvents (version 4; 13: the microkernel's alone): the SGX's host interrupt (GIC 0x34,
 // SceGpu's "SceGpuLisr" otherwise) is sgxd's while the app has registered this page. The async
@@ -185,6 +185,12 @@ int sgxdTranslate(uint32_t gpu_va, uint32_t out[2]);
 #define SGXD_MMU_BYTES ((1u + SGXD_MAP_TABLES) * 0x1000u)
 int sgxdMapTables(uint32_t gpu_va);
 int sgxdPte(uint32_t gpu_va, const void *user_va, uint32_t out[2]);
+// A system suspend while the app holds the GPU (version 16): sgxd takes its side down and the
+// shell gets its CDRAM back, the app's contents kept; every sgxd call of the app's then waits
+// instead of failing. The app takes the GPU again with sgxdTake (its shell CDRAM back with it),
+// sets its own state on the GPU up again from that thread, and lets its other threads go on
+// with sgxdResumed.
+int sgxdResumed(void);
 // Every unit of the GPU reset as the take leaves it, without its power cycle (version 92): the
 // start sequence again (its MASTER_SOFT_RESET pulse resets the four cores and the master's DPM,
 // VDM, SLC, BIF, MCI and PTLA), every core's caches, and the MMU's banks and directory, which the

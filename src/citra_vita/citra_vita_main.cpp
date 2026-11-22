@@ -25,6 +25,7 @@
 #include <psp2/appmgr.h>
 #include <psp2/audioout.h>
 #include <psp2/ctrl.h>
+#include <psp2/touch.h>
 #include <psp2/display.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -644,6 +645,13 @@ void PrintReentSlots() {
 /// and the largest block it can still give (what scattered leftovers cut it into), and the
 /// system's free memory beside it.
 bool RunSettingCommand(const std::string& command) {
+    if (command == "suspend") {
+        // The power button's short press, for a console with none to press remotely; its
+        // resume is the CP's power-on.
+        sceClibPrintf("[azahar] suspend (command): 0x%08x\n",
+                      static_cast<unsigned>(scePowerRequestSuspend()));
+        return true;
+    }
 #ifdef VITA_DIAGNOSTICS
     if (command == "heap") {
         const struct mallinfo m = mallinfo();
@@ -1089,6 +1097,90 @@ void RestoreStateAtStart(Core::System& system, u32 slot) {
     if (system.IsSaveStateRequestPending()) {
         sceClibPrintf("[azahar] savestate: slot %u never became loadable\n", slot);
     }
+}
+
+/**
+ */
+std::atomic<bool> power_suspended{false}, power_resumed{false};
+
+constexpr int PowerSuspend = SCE_POWER_CB_SYSTEM_SUSPEND | SCE_POWER_CB_APP_SUSPEND;
+constexpr int PowerResume = SCE_POWER_CB_SYSTEM_RESUME | SCE_POWER_CB_APP_RESUME;
+
+int OnPower(int, int, int arg, void*) {
+    if ((arg & PowerSuspend) && !power_suspended && VitaFrontend::SgxdPresent::IsInitialized()) {
+        power_resumed = false;
+        VitaFrontend::SgxdPresent::Suspend();
+        power_suspended = true;
+    }
+    if ((arg & PowerResume) && power_suspended) {
+        power_resumed = true;
+        VitaFrontend::CrashReport::NoteResume();
+    }
+    return 0;
+}
+
+// The frontend's loop waits at sgxd's gate from the suspend to the take after it: the stall
+// watch is told it lives (it would take the wait for a hang and end the process).
+
+int PowerThread(SceSize, void*) {
+    const SceUID callback = sceKernelCreateCallback("AzaharPower", 0, OnPower, nullptr);
+    ASSERT_MSG(callback >= 0 && scePowerRegisterCallback(callback) >= 0,
+               "the power callback was not registered");
+    for (;;) {
+        sceKernelDelayThreadCB(100 * 1000);
+#ifdef VITA_DIAGNOSTICS
+        // SceAppMgr's view of the app as it changes, and its system events: what tells, without
+        // a press, that the app is in front again after a resume (the lock screen gone).
+        {
+            static SceAppMgrAppState last{};
+            static int last_got = 1;
+            SceAppMgrAppState state{};
+            const int got = _sceAppMgrGetAppState(&state, sizeof(state), 0);
+            if (got != last_got || state.isSystemUiOverlaid != last.isSystemUiOverlaid ||
+                state.systemEventNum != last.systemEventNum ||
+                state.appEventNum != last.appEventNum) {
+                sceClibPrintf("[azahar] app state %08x: overlaid %d, system events %u, app events "
+                              "%u (suspended %d, resumed %d) at %llu us\n",
+                              static_cast<unsigned>(got), state.isSystemUiOverlaid,
+                              state.systemEventNum, state.appEventNum, power_suspended.load(),
+                              power_resumed.load(),
+                              static_cast<unsigned long long>(sceKernelGetProcessTimeWide()));
+                last = state;
+                last_got = got;
+            }
+            if (got >= 0 && state.systemEventNum != 0) {
+                SceAppMgrSystemEvent event{};
+                while (sceAppMgrReceiveSystemEvent(&event) >= 0) {
+                    sceClibPrintf("[azahar] system event %08x at %llu us\n",
+                                  static_cast<unsigned>(event.systemEvent),
+                                  static_cast<unsigned long long>(sceKernelGetProcessTimeWide()));
+                    event = {};
+                }
+            }
+        }
+#endif
+        if (power_suspended) {
+            VitaFrontend::CrashReport::StallWatchBeat();
+        }
+        if (!power_resumed) {
+            continue;
+        }
+        SceCtrlData pad{};
+        SceTouchData touch{};
+        const bool pressed =
+            (sceCtrlPeekBufferPositive(0, &pad, 1) > 0 && pad.buttons != 0) ||
+            (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0 && touch.reportNum > 0);
+        if (!pressed) {
+            continue;
+        }
+        std::string error;
+        const bool resumed = VitaFrontend::SgxdPresent::Resume(&error);
+        ASSERT_MSG(resumed, "sgxd: after the resume: {}", error);
+        sceClibPrintf("[azahar] the GPU is ours again after the resume\n");
+        power_suspended = false;
+        power_resumed = false;
+    }
+    return 0;
 }
 
 /// What copy runs, for a crash report: the name, the product code and version (an update's or the
@@ -2288,6 +2380,12 @@ int EmulatorMain() {
         SCE_SHELL_UTIL_LOCK_TYPE_MC_REMOVED | SCE_SHELL_UTIL_LOCK_TYPE_MUSIC_PLAYER);
     sceShellUtilInitEvents(0);
     sceShellUtilLock(shell_locks);
+    {
+        const SceUID power = sceKernelCreateThread("AzaharPower", PowerThread, 0x10000100, 0x4000,
+                                                   0, 0, nullptr);
+        ASSERT_MSG(power >= 0 && sceKernelStartThread(power, 0, nullptr) >= 0,
+                   "the power thread did not start");
+    }
 
     auto& system = Core::System::GetInstance();
 

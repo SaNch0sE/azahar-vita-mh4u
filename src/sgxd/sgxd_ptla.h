@@ -98,6 +98,9 @@ int sgxd_chain_submit(const SgxdOp *ops, unsigned count);
 // send) and the sender's kept code (sgxd_mkq_submit); either may be NULL.
 int sgxd_chain_submit_vars(const SgxdOp *ops, unsigned count, const uint8_t *variable,
                            SgxdMkqCode *code);
+// The same for a list built after sgxd_mkq_enter: never waits for a suspend, and leaves.
+int sgxd_chain_submit_entered(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                              SgxdMkqCode *code);
 // Remaps the GPU makes in its queue's order (azahar's page versions): behind every list and PTLA
 // op sent before it, each PTE word pte[k] stored at pte_va[k] (sgxdPte), then the MMU invalidate
 // in every bank, as the kernel's sgxdMap runs it. 1 to SGXD_REMAP_MAX at a time. The caller has
@@ -117,6 +120,10 @@ uint32_t sgxd_chain_faulted(void);
 // after it, woken or not; a flag set after the disarm only ends the next wait early. wakes
 // counts the flags set.
 int sgxd_ptla_waker(int32_t flag, uint32_t bits);
+// After a suspend, the GPU taken again: the events page registered again, the microkernel on
+// core 0's event program where it stood (sgxd_mkq_resume), the waker set again. 0 without
+// events (nothing to restore), or -1 with failed filled.
+int sgxd_ptla_resume(char *failed, unsigned failed_size);
 int sgxd_wake_arm(uint32_t chains, uint32_t twod);
 void sgxd_wake_disarm(void);
 uint32_t sgxd_wake_count(void);

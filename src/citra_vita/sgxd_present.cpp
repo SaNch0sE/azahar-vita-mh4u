@@ -24,6 +24,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "sgxd.h"
+#include "sgxd_mkq.h"
 #include "sgxd_program.h"
 #include "sgxd_ptla.h"
 #include "sgxd_recipe.h"
@@ -522,6 +523,60 @@ bool Initialize(std::string* error) {
 
 bool IsInitialized() {
     return g.initialized;
+}
+
+void Suspend() {
+    if (!g.initialized) {
+        return;
+    }
+    sgxd_mkq_park(1);
+    // The suspend waits for this callback, three seconds at most here: a job of the queue's
+    // finishes in milliseconds.
+    const SceUInt64 t0 = sceKernelGetProcessTimeWide();
+    while (!sgxd_mkq_drained() && sceKernelGetProcessTimeWide() - t0 < 3000000) {
+        sceKernelDelayThread(1000);
+    }
+    const bool drained = sgxd_mkq_drained();
+    Report("sgxd: suspend: the queue {} after {} us", drained ? "drained" : "not drained",
+           sceKernelGetProcessTimeWide() - t0);
+    ASSERT_MSG(drained, "sgxd: the GPU's queue did not drain for the suspend");
+}
+
+bool Resume(std::string* error) {
+    SgxdInfo info{};
+    info.size = sizeof(info);
+    const int taken = sgxdTake(&info);
+    if (taken == AZAHAR_ERR_STATE) {
+        // The application's suspend without the system's (the GPU stayed ours): the queue goes on.
+        sgxd_mkq_park(0);
+        Report("sgxd: resumed, the GPU still ours");
+        return true;
+    }
+    Report("sgxd take again {:#x}: step {} status {:#010x}, {} us", static_cast<u32>(taken),
+           info.step, static_cast<u32>(info.step_status), info.take_us);
+    if (taken < 0) {
+        *error = fmt::format("the GPU was not taken again ({:#010x} at step {})",
+                             static_cast<u32>(taken), info.step);
+        return false;
+    }
+    // The power-off emptied the DPM, and the page list it keeps in memory is as it left it: the
+    // list written afresh, every page free (the GPU was idle at the suspend), and the next TA
+    // and 3D load it again (their lists' keys change with it, so no kept list skips the load).
+    sgxd_recipe_pb_write(g.pb_memory);
+    char failed[160] = "";
+    if (sgxd_session_resume(&g.recipe, RecipeVa + g.kicker_offset, failed, sizeof(failed)) < 0 ||
+        sgxd_ptla_resume(failed, sizeof(failed)) < 0) {
+        *error = failed;
+        return false;
+    }
+    const int resumed = sgxdResumed();
+    sgxd_mkq_park(0);
+    if (resumed < 0) {
+        *error = fmt::format("sgxdResumed {:#010x}", static_cast<u32>(resumed));
+        return false;
+    }
+    Report("sgxd: resumed");
+    return true;
 }
 
 void ShowLast();

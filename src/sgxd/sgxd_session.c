@@ -19,9 +19,13 @@
 
 // The ops through sgxdSubmit, after any PTLA op still running (sgxd_ptla_idle); on a stop,
 // the op it stopped at goes into failed.
+// Set while sgxd_session_resume runs: the GPU just taken again is idle, and the drain
+// sgxd_gpu_idle runs first is the render thread's own.
+static int resuming;
+
 static int submit(SgxdOp *ops, unsigned count, int overflow, const char *what, char *failed,
                   unsigned failed_size) {
-    if (sgxd_gpu_idle() < 0) {
+    if (!resuming && sgxd_gpu_idle() < 0) {
         snprintf(failed, failed_size, "%s: a PTLA op before it never completed", what);
         return -1;
     }
@@ -108,6 +112,14 @@ int sgxd_session_reinit(char *failed, unsigned failed_size) {
         return -1;
     }
     return sgxd_session_resume(reinit_recipe, reinit_kicker, failed, failed_size);
+}
+
+int sgxd_session_resume(const SgxdRecipe *r, uint32_t kicker_va, char *failed,
+                        unsigned failed_size) {
+    resuming = 1;
+    const int done = sgxd_session_init(r, kicker_va, failed, failed_size);
+    resuming = 0;
+    return done;
 }
 
 int sgxd_session_phase(const SgxdRecipe *r, SgxdSessionBuild build, const char *what,
@@ -279,14 +291,17 @@ void sgxd_session_render_list(const SgxdRecipe *r, int read_pages, uint32_t ptla
 
 int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
                               unsigned failed_size) {
-    // Queued behind the lists before it, which the kernel runs first.
+    // Queued behind the lists before it, which the kernel runs first. Built and sent between two
+    // suspends: its DPM loads are the state's (sgxd_mkq_enter).
+    sgxd_mkq_enter();
     SgxdOpList l = {chain_ops, 0, SGXD_MAX_CHAIN_OPS, 0};
     sgxd_session_render_list(r, read_pages, sgxd_ptla_fence(), &l);
     if (l.overflow) {
+        sgxd_mkq_leave();
         snprintf(failed, failed_size, "async render: more than %u ops", SGXD_MAX_CHAIN_OPS);
         return -1;
     }
-    const int ret = sgxd_chain_submit(chain_ops, l.count);
+    const int ret = sgxd_chain_submit_entered(chain_ops, l.count, NULL, NULL);
     if (ret < 0) {
         snprintf(failed, failed_size, "async render: sgxd_chain_submit %08x", (unsigned)ret);
         return -1;
@@ -409,6 +424,8 @@ int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], 
         snprintf(failed, failed_size, "overlapped render: a recipe with its own parameter buffer");
         return -1;
     }
+    // Keyed, built and sent between two suspends: its DPM loads are the state's (sgxd_mkq_enter).
+    sgxd_mkq_enter();
     uint32_t key[KEY_WORDS];
     kept_key(r, key);
     KeptList *k = NULL, *oldest = &kept_lists[0];
@@ -427,6 +444,7 @@ int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], 
         build_overlap(r, &l);
         if (l.overflow) {
             k->r = NULL;
+            sgxd_mkq_leave();
             snprintf(failed, failed_size, "overlapped render: more than %u ops or %u kept values",
                      KEPT_OPS, KEPT_VALUES);
             return -1;
@@ -458,7 +476,7 @@ int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], 
 #ifdef VITA_DIAGNOSTICS
     sgxd_mkq_kind_next = SGXD_MKQ_KIND_RENDER;
 #endif
-    const int ret = sgxd_chain_submit_vars(k->ops, k->count, k->variable, &k->code);
+    const int ret = sgxd_chain_submit_entered(k->ops, k->count, k->variable, &k->code);
     if (ret < 0) {
         snprintf(failed, failed_size, "overlapped render: sgxd_chain_submit %08x", (unsigned)ret);
         return -1;

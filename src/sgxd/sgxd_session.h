@@ -43,6 +43,10 @@ int sgxd_session_init_script(const SgxdSessionAddresses *a, char *failed, unsign
 int sgxd_session_slc(int inval, char *failed, unsigned failed_size);
 
 // The SLC invalidate, then the init script: the take's bring-up for a recipe.
+// sgxd_session_init again after a suspend, the GPU taken again: the same lists, sent without
+// waiting for the renderer's drain first (the GPU is idle, and the drain is the render thread's).
+int sgxd_session_resume(const SgxdRecipe *r, uint32_t kicker_va, char *failed,
+                        unsigned failed_size);
 // The session whose init script sgxd_session_reinit runs again (the take's): after a reset of
 // every unit (sgxdResetAll), as Sony's driver runs its init script after every start.
 void sgxd_session_set_reinit(const SgxdRecipe *r, uint32_t kicker_va);

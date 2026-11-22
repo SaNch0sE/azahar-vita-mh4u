@@ -125,7 +125,16 @@ typedef void (*sgxd_void_fn)(void);
 enum { SGXD_NONE, SGXD_OWNED, SGXD_LOST };
 static int sgxd_state;
 static SceUID sgxd_owner = -1;
+// A suspend while owned closes the gate: the owner's calls wait in sgxd_enter until the app has
+// taken the GPU again and its own state on it is back (sgxdResumed), so no thread of it meets a
+// GPU that is not set up. The thread that takes it again goes through (sgxd_resume_thread).
+static SceUID sgxd_gate = -1; // an event flag: bit 0 set while the gate is open
+static int sgxd_gate_closed;
+static SceUID sgxd_resume_thread = -1;
 static void shellcdram_give_back(void); // shellcdram.c
+static void shellcdram_suspend(void);
+static int shellcdram_resume(void);
+static void shellcdram_free(int written);
 static void shell_take(void);           // shell.c
 static void shell_give(void);
 static SceUID sgxd_mutex = -1;
@@ -671,25 +680,57 @@ static int sgxd_sysevent(int resume, int eventid, void *args, void *opt) {
         ksceKernelLockMutex(sgxd_mutex, 1, NULL);
         if (sgxd_state == SGXD_OWNED) {
             sgxd_hw_down();
-            // SceGpu has the GPU at resume, before the app takes it again.
-            shellcdram_give_back();
+            // SceGpu has the GPU at resume, before the app takes it again: the shell's CDRAM is
+            // the shell's until then, the app's contents kept for the take.
+            shellcdram_suspend();
             sgxd_state = SGXD_LOST;
-            SGXD_LOG("suspend while owned: our side down, lost until the next take\n");
+            sgxd_gate_closed = 1;
+            ksceKernelClearEventFlag(sgxd_gate, ~1u);
+            SGXD_LOG("suspend while owned: our side down, the owner's calls held until it takes "
+                     "the GPU again\n");
         }
         ksceKernelUnlockMutex(sgxd_mutex, 1);
     }
     return 0;
 }
 
-static int sgxd_enter(void) {
+// sgxd's mutex, once the gate lets the caller through (with `gated` clear, at once: the take
+// and the release).
+static int sgxd_enter_gated(int gated) {
     if (sgxd_mutex < 0) {
         sgxd_mutex = ksceKernelCreateMutex("SceSgxdMutex", 0, 0, NULL);
         if (sgxd_mutex < 0) {
             return AZAHAR_ERR_ALLOC;
         }
     }
-    ksceKernelLockMutex(sgxd_mutex, 1, NULL);
-    return 0;
+    if (sgxd_gate < 0) {
+        sgxd_gate = ksceKernelCreateEventFlag("SceSgxdGate", SCE_EVENT_WAITMULTIPLE, 1, NULL);
+        if (sgxd_gate < 0) {
+            return AZAHAR_ERR_ALLOC;
+        }
+    }
+    for (;;) {
+        ksceKernelLockMutex(sgxd_mutex, 1, NULL);
+        if (!gated || !sgxd_gate_closed || ksceKernelGetProcessId() != sgxd_owner ||
+            ksceKernelGetThreadId() == sgxd_resume_thread) {
+            return 0;
+        }
+        ksceKernelUnlockMutex(sgxd_mutex, 1);
+        ksceKernelWaitEventFlag(sgxd_gate, 1, SCE_EVENT_WAITOR, NULL, NULL);
+    }
+}
+
+static int sgxd_enter(void) {
+    return sgxd_enter_gated(1);
+}
+
+// The gate open again, whoever waits at it let through.
+static void sgxd_gate_open(void) {
+    sgxd_gate_closed = 0;
+    sgxd_resume_thread = -1;
+    if (sgxd_gate >= 0) {
+        ksceKernelSetEventFlag(sgxd_gate, 1);
+    }
 }
 
 static void sgxd_leave(void) {
@@ -776,7 +817,7 @@ int sgxdTake(SgxdInfo *user_info) {
     uint32_t state;
     ENTER_SYSCALL(state);
     SgxdInfo info = {0};
-    int ret = sgxd_enter();
+    int ret = sgxd_enter_gated(0);
     if (ret < 0) {
         goto out;
     }
@@ -784,11 +825,23 @@ int sgxdTake(SgxdInfo *user_info) {
     if (sgxd_state == SGXD_OWNED || (sgxd_state == SGXD_LOST && pid != sgxd_owner)) {
         ret = pid == sgxd_owner ? AZAHAR_ERR_STATE : SGXD_ERR_OWNER;
     } else {
+        const int again = sgxd_state == SGXD_LOST;
         ret = sgxd_take_locked(&info);
-        if (ret == 0) {
+        if (ret == 0 && again && (ret = shellcdram_resume()) < 0) {
+            // The shell's CDRAM not the app's again: the GPU goes back, still lost.
+            sgxd_hw_down();
+            sgxd_hand_back();
+        } else if (ret == 0) {
             sgxd_state = SGXD_OWNED;
             sgxd_owner = pid;
             shell_take();
+            if (again) {
+                // The gate stays closed for the app's other threads until sgxdResumed; this
+                // one sets its state on the GPU up again meanwhile.
+                sgxd_resume_thread = ksceKernelGetThreadId();
+            }
+        } else if (again) {
+            // Still lost: the app may try again.
         } else {
             sgxd_mmu_free();
             sgxd_state = SGXD_NONE;
@@ -820,8 +873,12 @@ static int sgxd_release_locked(void) {
         // The shell's CDRAM back before SceGpu, and the shell's GPU work with it, runs again.
         shellcdram_give_back();
         sgxd_hand_back();
+    } else {
+        // LOST: the system's resume already gave SceGpu its GPU back, and the suspend the shell
+        // its CDRAM; the app's view and copy go.
+        shellcdram_free(1);
     }
-    // LOST: the system's resume already gave SceGpu its GPU back.
+    sgxd_gate_open();
     shell_give();
     const int was = sgxd_state;
     const uint32_t pages = sgxd_mmu_pages;
@@ -836,7 +893,7 @@ static int sgxd_release_locked(void) {
 int sgxdRelease(void) {
     uint32_t state;
     ENTER_SYSCALL(state);
-    int ret = sgxd_enter();
+    int ret = sgxd_enter_gated(0);
     if (ret == 0) {
         ret = sgxd_owner == ksceKernelGetProcessId() ? sgxd_release_locked() : SGXD_ERR_OWNER;
         sgxd_leave();
@@ -997,6 +1054,29 @@ int sgxdSubmit(SgxdOp *user_ops, uint32_t count) {
         }
         ret = ksceKernelCopyToUser(user_ops, sgxd_ops, count * sizeof(SgxdOp)) < 0
                   ? AZAHAR_ERR_ARG : (int)i;
+    }
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdResumed(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (sgxd_state != SGXD_OWNED) {
+        ret = SGXD_ERR_LOST;
+    } else {
+        const int was_closed = sgxd_gate_closed;
+        sgxd_gate_open();
+        SGXD_LOG("resumed: the owner's calls go on%s\n", was_closed ? "" : " (none held)");
+        ret = 0;
     }
     sgxd_leave();
 out:

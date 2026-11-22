@@ -419,6 +419,10 @@ int module_stop(SceSize argc, const void *args) {
         }
     }
     sgxd_mutex = reback_mutex = azahar_edit_mutex = -1;
+    if (sgxd_gate >= 0) {
+        ksceKernelDeleteEventFlag(sgxd_gate);
+        sgxd_gate = -1;
+    }
     ksceKernelPrintf("[azaharnative] stopped (version %d)\n", AZAHAR_NATIVE_VERSION);
     return SCE_KERNEL_STOP_SUCCESS;
 }

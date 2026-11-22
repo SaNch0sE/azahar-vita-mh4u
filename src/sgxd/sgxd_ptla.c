@@ -191,19 +191,33 @@ int sgxd_chain_submit(const SgxdOp *ops, unsigned count) {
     return sgxd_chain_submit_vars(ops, count, NULL, NULL);
 }
 
-int sgxd_chain_submit_vars(const SgxdOp *ops, unsigned count, const uint8_t *variable,
-                           SgxdMkqCode *code) {
-    if (count == 0 || count > SGXD_MAX_CHAIN_OPS) {
-        return AZAHAR_ERR_ARG;
+static int chain_submit(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                        SgxdMkqCode *code, int entered) {
+    const int refused = count == 0 || count > SGXD_MAX_CHAIN_OPS ? AZAHAR_ERR_ARG
+                        : !events                                 ? AZAHAR_ERR_STATE
+                                                                  : 0;
+    if (refused) {
+        if (entered) {
+            sgxd_mkq_leave();
+        }
+        return refused;
     }
-    if (!events) {
-        return AZAHAR_ERR_STATE;
-    }
-    const int r = sgxd_mkq_submit(ops, count, variable, code);
+    const int r = entered ? sgxd_mkq_submit_entered(ops, count, variable, code)
+                          : sgxd_mkq_submit(ops, count, variable, code);
     if (r == 0) {
         chains_sent++;
     }
     return r;
+}
+
+int sgxd_chain_submit_vars(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                           SgxdMkqCode *code) {
+    return chain_submit(ops, count, variable, code, 0);
+}
+
+int sgxd_chain_submit_entered(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                              SgxdMkqCode *code) {
+    return chain_submit(ops, count, variable, code, 1);
 }
 
 int sgxd_remap_submit(const uint32_t* pte_va, const uint32_t* pte, unsigned count, char* failed,
@@ -236,8 +250,34 @@ int sgxd_remap_submit(const uint32_t* pte_va, const uint32_t* pte, unsigned coun
     return 0;
 }
 
+// The waker's last flag and bits, for sgxd_ptla_resume.
+static int32_t waker_flag = -1;
+static uint32_t waker_bits;
+
 int sgxd_ptla_waker(int32_t flag, uint32_t bits) {
+    waker_flag = flag;
+    waker_bits = bits;
     return sgxdWaker(flag, bits);
+}
+
+int sgxd_ptla_resume(char *failed, unsigned failed_size) {
+    if (!events) {
+        return 0;
+    }
+    int r = sgxdEvents((SgxdEvents *)events);
+    if (r < 0) {
+        snprintf(failed, failed_size, "no GPU interrupt after the resume: sgxdEvents 0x%08x",
+                 (unsigned)r);
+        return -1;
+    }
+    if (sgxd_mkq_resume(failed, failed_size) < 0) {
+        return -1;
+    }
+    if (waker_flag >= 0 && (r = sgxdWaker(waker_flag, waker_bits)) < 0) {
+        snprintf(failed, failed_size, "the waker not set again: sgxdWaker 0x%08x", (unsigned)r);
+        return -1;
+    }
+    return 0;
 }
 
 int sgxd_wake_arm(uint32_t chains, uint32_t twod) {

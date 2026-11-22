@@ -175,6 +175,130 @@ static int shellcdram_shell_redirect(const uint8_t *save, int on_copy) {
     return ret;
 }
 
+// The shell's pages moved between the range and the copy one at a time as its CPU runs on: the
+// page copied, its descriptor turned, its TLB entries dropped, then each word the shell changed
+// in the old place carried over unless it wrote that word in the new place since; the old place
+// then takes the app's contents. The range's alias is uncached: pages go through it whole into
+// cached buffers, compared there. The window is on our tables, sgxd's side is down.
+static void shellcdram_move(int to_copy) {
+    uint8_t *alias = NULL, *save = NULL;
+    ksceKernelGetMemBlockBase(shellcdram_alias, (void **)&alias);
+    ksceKernelGetMemBlockBase(shellcdram_save, (void **)&save);
+    static uint32_t snap[1024], keep[1024], now_words[1024], done[SHELLCDRAM_PAGES / 32];
+    for (uint32_t i = 0; i < SHELLCDRAM_PAGES / 32; i++) {
+        done[i] = 0;
+    }
+    uint32_t carried = 0, moved = 0;
+    // The move's time by step, in microseconds (the log line at its end).
+    SceUInt64 t_copy = 0, t_turn = 0, t_carry = 0, t_restore = 0;
+    const SceUInt64 t0 = ksceKernelGetSystemTimeWide();
+    for (uint32_t slot = 0; slot < SHELLCDRAM_SLOTS; slot++) {
+        const uint32_t page = shellcdram_shell_page[slot];
+        if (page == SHELLCDRAM_NO_PAGE) {
+            continue;
+        }
+        moved++;
+        SceUInt64 t = ksceKernelGetSystemTimeWide();
+        // The copy: the kernel's cached view, which the shell's shares (one cache).
+        uint32_t *const r = (uint32_t *)(alias + (page << 12));
+        uint32_t *const c = (uint32_t *)(save + (page << 12));
+        uint32_t *const from = to_copy ? r : c;
+        uint32_t *const to = to_copy ? c : r;
+        memcpy(keep, to, 0x1000);
+        memcpy(snap, from, 0x1000);
+        memcpy(to, snap, 0x1000);
+        SceUInt64 now = ksceKernelGetSystemTimeWide();
+        t_copy += now - t;
+        t = now;
+        asm volatile("dsb" ::: "memory");
+        shellcdram_shell_l2[slot] = (to_copy ? shellcdram_shell_on_copy : shellcdram_shell_on_range)[slot];
+        // TLBIMVAAIS: the shell's entries for the page, on every core.
+        asm volatile("dsb \n mcr p15, 0, %0, c8, c3, 3 \n dsb \n isb" ::"r"(
+                         SHELLCDRAM_SHELL_VA + (slot << 12))
+                     : "memory");
+        now = ksceKernelGetSystemTimeWide();
+        t_turn += now - t;
+        t = now;
+        // The old place as the shell left it, then each word it changed there, unless it has
+        // written that word in the new place since (read there, a word, only then).
+        memcpy(now_words, from, 0x1000);
+        volatile uint32_t *const to_words = to;
+        for (uint32_t w = 0; w < 1024; w++) {
+            const uint32_t v = now_words[w];
+            if (v != snap[w] && to_words[w] == snap[w]) {
+                to_words[w] = v;
+                carried++;
+            }
+        }
+        now = ksceKernelGetSystemTimeWide();
+        t_carry += now - t;
+        t = now;
+        memcpy(from, keep, 0x1000);
+        t_restore += ksceKernelGetSystemTimeWide() - t;
+        done[page / 32] |= 1u << (page % 32);
+    }
+    const SceUInt64 t1 = ksceKernelGetSystemTimeWide();
+    for (uint32_t page = 0; page < SHELLCDRAM_PAGES; page++) {
+        if (done[page / 32] & (1u << (page % 32))) {
+            continue;
+        }
+        uint8_t *const r = alias + (page << 12);
+        uint8_t *const c = save + (page << 12);
+        memcpy(keep, r, 0x1000);
+        memcpy(r, c, 0x1000);
+        memcpy(c, keep, 0x1000);
+    }
+    const SceUInt64 t2 = ksceKernelGetSystemTimeWide();
+    ksceKernelDcacheCleanRange(save, SHELLCDRAM_SIZE);
+    asm volatile("dsb" ::: "memory");
+    const SceUInt64 t3 = ksceKernelGetSystemTimeWide();
+    SGXD_LOG("shell CDRAM: %u pages moved to the %s in %u ms (copy %u, turn %u, carry %u, "
+             "restore %u), the other %u exchanged in %u ms, the copy cleaned in %u ms\n",
+             moved, to_copy ? "copy" : "range", (uint32_t)((t1 - t0) / 1000),
+             (uint32_t)(t_copy / 1000), (uint32_t)(t_turn / 1000), (uint32_t)(t_carry / 1000),
+             (uint32_t)(t_restore / 1000), SHELLCDRAM_PAGES - moved, (uint32_t)((t2 - t1) / 1000),
+             (uint32_t)((t3 - t2) / 1000));
+    if (carried) {
+        SGXD_LOG("shell CDRAM: %u words the shell wrote while its pages moved carried over\n",
+                 carried);
+    }
+}
+
+// Set while a suspend has given the shell its contents back and the copy holds the app's.
+static int shellcdram_suspended;
+
+// A suspend while the app has the range: the shell's contents back in it and the app's in the
+// copy, the shell's window back on the range. The app's view and every block stay for the take
+// after the resume (shellcdram_resume); the app makes no call meanwhile (sgxd's gate). sgxd's
+// mutex is held and its side is down.
+static void shellcdram_suspend(void) {
+    if (shellcdram_pid < 0) {
+        return;
+    }
+    shellcdram_move(0);
+    shellcdram_shell_restore();
+    shellcdram_suspended = 1;
+    SGXD_LOG("shell CDRAM: the shell's again for the suspend, the app's contents in the copy\n");
+}
+
+// The take after a suspend: the app's contents back in the range, the shell's in the copy and
+// its window on it again. 0, or an error with the range still the shell's.
+static int shellcdram_resume(void) {
+    if (shellcdram_pid < 0 || !shellcdram_suspended) {
+        return 0;
+    }
+    void *save = NULL;
+    ksceKernelGetMemBlockBase(shellcdram_save, &save);
+    const int ret = shellcdram_shell_redirect(save, 0);
+    if (ret) {
+        return ret;
+    }
+    shellcdram_move(1);
+    shellcdram_suspended = 0;
+    SGXD_LOG("shell CDRAM: the app's again after the resume\n");
+    return 0;
+}
+
 // The app's level-1 entries back (when they were written), then every block freed.
 static void shellcdram_free(int written) {
     shellcdram_shell_restore();
@@ -203,6 +327,7 @@ static void shellcdram_free(int written) {
     }
     shellcdram_pid = -1;
     shellcdram_user_va = 0;
+    shellcdram_suspended = 0;
 }
 
 // The shell's contents back, the app's view gone. sgxd's mutex is held and the GPU is idle

@@ -57,6 +57,14 @@ volatile uint32_t *sgxd_mkq_state(void);
 // flip found the GPU not idle within a second, which the console names; the compiler's
 // SGX_USSE_E* for a list it refused, at sgxd_mkq_refused).
 int sgxd_mkq_submit(const SgxdOp *ops, unsigned count, const uint8_t *variable, SgxdMkqCode *code);
+// A list built for the GPU's state as it stands (the DPM's free lists loaded once): waits while a
+// suspend holds the submits, then counts the list as built until sgxd_mkq_submit_entered sends
+// it, which never waits, or sgxd_mkq_leave drops it. The suspend's drain waits for every list
+// counted, so none built before a suspend runs after it, on the state the resume left.
+void sgxd_mkq_enter(void);
+void sgxd_mkq_leave(void);
+int sgxd_mkq_submit_entered(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                            SgxdMkqCode *code);
 // The jobs sent (the END word, free-running).
 uint32_t sgxd_mkq_jobs_sent(void);
 // Job n's entry (its list's first instruction), as the ring holds it now; the code space's
@@ -67,6 +75,17 @@ uint32_t sgxd_mkq_flips_done(void);
 // Spins until every job sent has been taken and the GPU has run out of jobs (BUSY clear): no run
 // is left but one finishing its last few instructions. 0, or -1 on a fault or after a second.
 int sgxd_mkq_idle(void);
+// A system suspend (the frontend's power callback): with `park` set, a submit waits before it
+// publishes its job, and sgxd_mkq_enter before its list is built, until the call with it clear,
+// after the GPU was taken again. Any thread.
+void sgxd_mkq_park(int park);
+// Whether every list entered is sent and every job sent has run (the idle's condition, without
+// the wait): the suspend's drain.
+int sgxd_mkq_drained(void);
+// After a suspend, the GPU taken again: core 0's event program and code base 14 back on the
+// microkernel, the state block's counts and positions as they stood (every job had run, so the
+// app's fences keep their meaning). 0, or -1 with failed filled.
+int sgxd_mkq_resume(char *failed, unsigned failed_size);
 // Shapes compiled, their instructions and flips (the code space full: the GPU idled, the USE
 // code cache invalidated, every shape dropped): perflog's and sgxd_test's, diagnostics builds
 // only. And the last refusal: the op's index and kind.

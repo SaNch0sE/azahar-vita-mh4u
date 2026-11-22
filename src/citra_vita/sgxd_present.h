@@ -28,6 +28,15 @@ bool Initialize(std::string* error);
 /// gives the GPU back and frees the memory.
 void Shutdown();
 [[nodiscard]] bool IsInitialized();
+/// A system suspend while the GPU is ours (docs/sgxd/takeover.md), from the power callback that
+/// comes before the system's suspend events: no async job is sent from now on, and the ones sent
+/// are waited for, so sgxd's side goes down with the GPU idle. Every sgxd call waits from then on
+/// (sgxd's gate).
+void Suspend();
+/// After the resume: the GPU taken again, the init script and the microkernel's state on it
+/// again, and every sgxd call and job let go; after an application's suspend the system did not
+/// follow (the GPU still ours), only the jobs. False with the reason in error (still lost).
+bool Resume(std::string* error);
 
 /// The texture every draw samples (ImGui's font atlas): width x height texels of A8B8G8R8,
 /// width a multiple of 8. Once, before the first frame: it is written into a PDS program.
