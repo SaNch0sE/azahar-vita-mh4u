@@ -52,10 +52,10 @@
     .equ CPU_CHAIN_IRQ, 0x1c4
     .equ CPU_STRAY, 0x1cc           @ count, reason, lr, spsr, dfsr, dfar, ifsr, ifar
     .equ CPU_FAST, 0x1f0            @ AzaharFast
-    .equ CPU_STRAY_STACK_TOP, 0x290 @ 64 bytes below each
-    .equ CPU_IRQ_STACK_TOP, 0x2d0
-    .equ CPU_VFP_STACK_TOP, 0x6d8   @ azahar_vfp_svc's stack (1 KiB below)
-    .equ CPU_SIZE, 0x6e0            @ the last 8 bytes keep the tops inside the block
+    .equ CPU_STRAY_STACK_TOP, 0x2a0 @ 64 bytes below each
+    .equ CPU_IRQ_STACK_TOP, 0x2e0
+    .equ CPU_VFP_STACK_TOP, 0x6e8   @ azahar_vfp_svc's stack (1 KiB below)
+    .equ CPU_SIZE, 0x6f0            @ the last 8 bytes keep the tops inside the block
 @ AzaharFast, at CPU_FAST (native.c): on 0x00, timer 0x04, quantum 0x08, mult_int 0x0c,
 @ mult_frac 0x10, base 0x14 (low) and 0x18, thread_id 0x1c, process_id 0x20, count[5] 0x24,
 @ save[4] 0x38. AzaharCpu.fast_site is the word before it.
@@ -75,6 +75,10 @@
     .equ FAST_ACCRUED_LO, 0x50
     .equ FAST_ACCRUED_HI, 0x54
     .equ FAST_REARMS, 0x58
+    .equ FAST_USER_KVA, 0x5c        @ version 68: this core's user page, switch, redirect, permits
+    .equ FAST_SWITCH_VA, 0x60
+    .equ FAST_REDIRECT_VA, 0x64
+    .equ FAST_STORE_VA, 0x68
     .equ FAST_SITE, -4
     .equ USER_GEN, 0x00             @ AzaharUserPage
     .equ USER_QUANTUM, 0x08
@@ -459,8 +463,7 @@ azahar_svc_fast:
     adceq   r3, r3, r4
     str     r2, [r6, #FAST_BASE_LO]
     str     r3, [r6, #FAST_BASE_HI]
-    ldr     r7, =azahar_user_page_kva
-    ldr     r7, [r7]
+    ldr     r7, [r6, #FAST_USER_KVA]
     ldr     r12, [r6, #FAST_QUANTUM]
     str     r12, [r7, #USER_QUANTUM]
     str     r2, [r7, #USER_BASE_LO]
@@ -477,8 +480,7 @@ azahar_svc_fast:
 9:  @ AZAHAR_SWITCH_SVC: the thread switch the app armed from the guest's world (AzaharSwitch):
     @ the next thread's state loaded and resumed, no exit. The outgoing thread's state is the
     @ app's (the upcall saved it). Not armed: the ordinary exit, which reschedules in the app.
-    ldr     r4, =azahar_switch_va
-    ldr     r4, [r4]
+    ldr     r4, [r6, #FAST_SWITCH_VA]
     cmp     r4, #0
     beq     8f
     ldr     r5, [r4, #SWITCH_ARMED]
@@ -489,8 +491,7 @@ azahar_svc_fast:
     ldr     r7, [r4, #SWITCH_THREAD_ID]
     ldr     r5, [r4, #SWITCH_IN]
     str     r7, [r6, #FAST_THREAD_ID]
-    ldr     r4, =azahar_user_page_kva
-    ldr     r4, [r4]
+    ldr     r4, [r6, #FAST_USER_KVA]
     str     r7, [r4, #USER_THREAD_ID]
     add     r4, r5, #0x50
     vldmia  r4!, {d0-d15}
@@ -518,8 +519,7 @@ azahar_svc_fast:
     @ upcall thunk instead of exiting (its number and return address in the record). Not one from
     @ the app's own code (svc 0, a Sony syscall the app forwards), the module's own (0xFD, 0xFE),
     @ or one in an IT block, whose state user mode cannot put back: those exit.
-    ldr     r4, =azahar_redirect_va
-    ldr     r4, [r4]
+    ldr     r4, [r6, #FAST_REDIRECT_VA]
     cmp     r4, #0
     beq     18f
     cmp     lr, #0x40000000
@@ -642,8 +642,7 @@ azahar_irq_rearm:
     str     r4, [r5, #0x600]        @ load
     mov     r2, #5
     str     r2, [r5, #0x608]        @ enable, interrupt, one shot
-    ldr     r6, =azahar_user_page_kva
-    ldr     r6, [r6]
+    ldr     r6, [sp, #(CPU_FAST + FAST_USER_KVA)]
     str     r4, [r6, #USER_QUANTUM]
     str     r0, [r6, #USER_BASE_LO]
     str     r1, [r6, #USER_BASE_HI]
@@ -667,8 +666,7 @@ azahar_irq_rearm:
 @ back from the block). The call runs on the core's VFP stack: its other user, azahar_vfp_svc,
 @ runs in the svc fast path with IRQs masked and makes no guest access, so the two never nest.
 azahar_dabt_fast:
-    ldr     r0, =azahar_store_va
-    ldr     r0, [r0]
+    ldr     r0, [sp, #(CPU_FAST + FAST_STORE_VA)]
     cmp     r0, #0
     beq     8f
     mov     r4, sp

@@ -17,6 +17,7 @@
 #include <boost/serialization/export.hpp>
 #include <queue>
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "common/thread_queue_list.h"
 #include "core/arm/arm_interface.h"
 #include "core/core_timing.h"
@@ -202,6 +203,10 @@ public:
      */
     std::span<const std::shared_ptr<Thread>> GetThreadList() const;
 
+    /// A thread made for this core (KernelSystem::CreateThread) into its lists, by this core's
+    /// emulation thread (HostMessage::NewThread from another).
+    void AdoptThread(std::shared_ptr<Thread> thread);
+
     std::shared_ptr<Thread> GetThreadByID(u32 thread_id) const;
 
     void SetCPU(Core::ARM_Interface& cpu_) {
@@ -234,6 +239,11 @@ private:
      */
     Thread* PopNextReadyThread();
 
+    /// Into the ready queue at the thread's priority now, the level it is taken out of again
+    /// (Thread::queued_priority): the other emulation thread may change the priority meanwhile.
+    void PushReady(Thread* thread, bool front);
+    void RemoveReady(Thread* thread);
+
     /**
      * Callback that will wake up the thread it was scheduled for
      * @param thread_id The ID of the thread that's been awoken
@@ -248,6 +258,10 @@ private:
     std::shared_ptr<Thread> current_thread;
     Common::ThreadQueueList<Thread*, ThreadPrioLowest + 1> ready_queue;
     std::unordered_map<u64, Thread*> wakeup_callback_table;
+    /// The table's lock: host 0 looks a thread up in another core's table when it runs the
+    /// timeout of a wait it made for that core (System::MoveWaitsToFirstHost) while the core's
+    /// own host adds its new threads (AdoptThread).
+    Common::Mutex wakeup_table_mutex;
 
     /// Event type for the thread wake up event
     Core::TimingEventType* ThreadWakeupEventType = nullptr;
@@ -312,6 +326,11 @@ public:
      * @param priority The new priority
      */
     void BoostPriority(u32 priority);
+
+    /// A ready thread to the back of its current priority's level. Another emulation thread's
+    /// queue is that thread's to change: it moves the thread when it takes the message
+    /// (HostMessage::Requeue), as a core takes the 3DS kernel's interrupt for a reschedule.
+    void Requeue();
 
     /**
      * Gets the thread's thread ID
@@ -411,6 +430,10 @@ public:
 
     u32 nominal_priority; ///< Nominal thread priority, as set by the emulated application
     u32 current_priority; ///< Current thread priority, can be temporarily changed
+    /// While ready: its level in its core's ready queue, which only that core's emulation thread
+    /// changes; current_priority is the other's to set too (Requeue). Not saved: the loaded
+    /// queue's.
+    u32 queued_priority{};
 
     u64 last_running_ticks; ///< CPU tick when thread was last running
     /// Whether a wakeup event of this thread's may be queued: set where one is scheduled, cleared

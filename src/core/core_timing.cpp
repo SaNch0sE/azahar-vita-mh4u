@@ -32,7 +32,7 @@ Timing::Timing(std::size_t num_cores, u32 cpu_clock_percentage, s64 override_bas
         timers[i] = std::make_shared<Timer>(base_ticks);
     }
     UpdateClockSpeed(cpu_clock_percentage);
-    current_timer = timers[0].get();
+    current_timer.fill(timers[0].get());
 }
 
 s64 Timing::GenerateBaseTicks() {
@@ -71,8 +71,9 @@ void Timing::ScheduleEvent(s64 cycles_into_future, const TimingEventType* event_
 
     ASSERT(event_type != nullptr);
     Timing::Timer* timer = nullptr;
+    Timing::Timer* const current = current_timer[ThisHost()];
     if (core_id == std::numeric_limits<std::size_t>::max()) {
-        timer = current_timer;
+        timer = current;
     } else {
         ASSERT(core_id < timers.size());
         timer = timers.at(core_id).get();
@@ -90,7 +91,7 @@ void Timing::ScheduleEvent(s64 cycles_into_future, const TimingEventType* event_
             Event{std::max<s64>(0, cycles_into_future), 0, user_data, event_type, true});
     } else {
         s64 timeout = timer->GetTicks() + cycles_into_future;
-        if (current_timer == timer) {
+        if (current == timer) {
             // If this event needs to be scheduled before the next advance(), force one early
             if (!timer->is_timer_sane)
                 timer->ForceExceptionCheck(cycles_into_future);
@@ -129,6 +130,26 @@ void Timing::UnscheduleEvent(const TimingEventType* event_type, std::uintptr_t u
     // TODO:remove events from ts_queue
 }
 
+bool Timing::MoveEvent(const TimingEventType* event_type, std::uintptr_t user_data,
+                       std::size_t from, std::size_t to) {
+    Timer& src = *timers.at(from);
+    Timer& dst = *timers.at(to);
+    src.MoveEvents();
+    const auto it = std::find_if(src.event_queue.begin(), src.event_queue.end(), [&](const Event& e) {
+        return e.type == event_type && e.user_data == user_data;
+    });
+    if (it == src.event_queue.end()) {
+        return false;
+    }
+    Event moved = *it;
+    src.event_queue.erase(it);
+    std::make_heap(src.event_queue.begin(), src.event_queue.end(), std::greater<>());
+    moved.fifo_order = dst.event_fifo_id++;
+    dst.event_queue.push_back(moved);
+    std::push_heap(dst.event_queue.begin(), dst.event_queue.end(), std::greater<>());
+    return true;
+}
+
 void Timing::RemoveEvent(const TimingEventType* event_type) {
     if (event_queue_locked) {
         return;
@@ -152,11 +173,11 @@ void Timing::RemoveEvent(const TimingEventType* event_type) {
 }
 
 void Timing::SetCurrentTimer(std::size_t core_id) {
-    current_timer = timers[core_id].get();
+    current_timer[ThisHost()] = timers[core_id].get();
 }
 
 s64 Timing::GetTicks() const {
-    return current_timer->GetTicks();
+    return current_timer[ThisHost()]->GetTicks();
 }
 
 s64 Timing::GetGlobalTicks() const {

@@ -70,23 +70,25 @@ u32 KernelSystem::GenerateObjectID() {
 }
 
 const std::shared_ptr<Process>& KernelSystem::GetCurrentProcess() const {
-    return current_process;
+    return current_process[Core::ThisHost()];
 }
 
 void KernelSystem::SetCurrentProcess(const std::shared_ptr<Process>& process) {
     // This runs on every core switch, almost always with the process (and therefore the page
     // table) already in force; the reference-count and page-table churn was measurable, so
     // skip the redundant work.
-    if (current_process != process) {
-        current_process = process;
+    auto& current = current_process[Core::ThisHost()];
+    if (current != process) {
+        current = process;
     }
     SetCurrentMemoryPageTable(process->vm_manager.page_table);
 }
 
 void KernelSystem::SetCurrentProcessForCPU(const std::shared_ptr<Process>& process, u32 core_id) {
-    if (current_cpu->GetID() == core_id) {
-        if (current_process != process) {
-            current_process = process;
+    const u32 host = Core::ThisHost();
+    if (current_cpu[host]->GetID() == core_id) {
+        if (current_process[host] != process) {
+            current_process[host] = process;
         }
         SetCurrentMemoryPageTable(process->vm_manager.page_table);
     } else {
@@ -99,8 +101,8 @@ void KernelSystem::SetCurrentProcessForCPU(const std::shared_ptr<Process>& proce
 
 void KernelSystem::SetCurrentMemoryPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
     memory.SetCurrentPageTable(page_table);
-    if (current_cpu != nullptr) {
-        current_cpu->SetPageTable(page_table);
+    if (Core::ARM_Interface* const cpu = CurrentCPU(); cpu != nullptr) {
+        cpu->SetPageTable(page_table);
     }
 }
 
@@ -112,17 +114,20 @@ void KernelSystem::SetCPUs(std::vector<std::shared_ptr<Core::ARM_Interface>> cpu
 }
 
 void KernelSystem::SetRunningCPU(Core::ARM_Interface* cpu) {
-    if (current_cpu == cpu) {
+    const u32 host = Core::ThisHost();
+    Core::ARM_Interface*& current = current_cpu[host];
+    if (current == cpu) {
         timing.SetCurrentTimer(cpu->GetID());
         return;
     }
-    if (current_process && stored_processes[current_cpu->GetID()] != current_process) {
-        stored_processes[current_cpu->GetID()] = current_process;
+    const auto& process = current_process[host];
+    if (current != nullptr && process && stored_processes[current->GetID()] != process) {
+        stored_processes[current->GetID()] = process;
     }
-    current_cpu = cpu;
+    current = cpu;
     timing.SetCurrentTimer(cpu->GetID());
-    if (stored_processes[current_cpu->GetID()]) {
-        SetCurrentProcess(stored_processes[current_cpu->GetID()]);
+    if (stored_processes[cpu->GetID()]) {
+        SetCurrentProcess(stored_processes[cpu->GetID()]);
     }
 }
 
@@ -131,13 +136,17 @@ void KernelSystem::SendToHost(u32 host, HostMessage&& message) {
 }
 
 void KernelSystem::ProcessHostMessages() {
-    const u32 host = Core::ThisHost();
+    ProcessHostMessages(Core::ThisHost());
+}
+
+void KernelSystem::ProcessHostMessages(u32 host) {
+    DEBUG_ASSERT(host == Core::ThisHost() || !Core::multi_host.load(std::memory_order_relaxed));
     HostInbox& inbox = *host_inboxes[host];
     if (inbox.Empty()) {
         return;
     }
     std::unique_lock<Common::RecursiveMutex> lock{hle_lock, std::defer_lock};
-    if (host == 0) {
+    if (Core::ThisHost() == 0) {
         lock.lock();
     }
     HostMessage message;
@@ -153,6 +162,15 @@ void KernelSystem::ProcessHostMessages() {
             static_cast<AddressArbiter&>(*message.object)
                 .ReceiveSignal(message.seq, message.count);
             break;
+        case HostMessage::Kind::NewThread: {
+            auto thread = std::static_pointer_cast<Thread>(message.object);
+            GetThreadManager(thread->core_id).AdoptThread(std::move(thread));
+            break;
+        }
+        case HostMessage::Kind::Requeue:
+            static_cast<Thread&>(*message.object).Requeue();
+            PrepareReschedule();
+            break;
         }
         message.object.reset();
     }
@@ -167,11 +185,11 @@ const ThreadManager& KernelSystem::GetThreadManager(u32 core_id) const {
 }
 
 ThreadManager& KernelSystem::GetCurrentThreadManager() {
-    return *thread_managers[current_cpu->GetID()];
+    return *thread_managers[CurrentCPU()->GetID()];
 }
 
 const ThreadManager& KernelSystem::GetCurrentThreadManager() const {
-    return *thread_managers[current_cpu->GetID()];
+    return *thread_managers[CurrentCPU()->GetID()];
 }
 
 TimerManager& KernelSystem::GetTimerManager() {
@@ -271,7 +289,7 @@ void KernelSystem::serialize(Archive& ar, const unsigned int) {
     ar&* timer_manager.get();
     ar & next_process_id;
     ar & process_list;
-    ar & current_process;
+    ar & current_process[0];
     // NB: core count checked in 'core'
     for (auto& thread_manager : thread_managers) {
         ar&* thread_manager.get();

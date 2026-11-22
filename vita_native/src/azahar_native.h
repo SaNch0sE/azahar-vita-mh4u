@@ -88,9 +88,10 @@ typedef struct AzaharContext {
 //   interface's ICCIAR (+0x10c) acknowledges an interrupt: only the thunks read this page.
 // - AZAHAR_USER_PAGE_VA: AzaharUserPage, written before each entry into the guest (sub-slices
 //   included) with `gen` changed. A reader that sees the same gen before and after its reads
-//   read one entry's values: an exit is the only time they change.
-// GetSystemTick's answer is base + (quantum - counter) * mult, as azahar_svc_fast computes it.
-// azaharMap refuses a guest range over either page.
+//   read one entry's values: an exit is the only time they change. Each core has its own page
+//   there (version 68: an attached core's own view of the guest's first megabyte, azaharAttach).
+// GetSystemTick's answer is base + (quantum - counter) * mult, as azahar_svc_fast computes it;
+// the counter is each core's own at one address. azaharMap refuses a guest range over either page.
 #define AZAHAR_USER_TIMER_VA 0x000BE000u
 #define AZAHAR_USER_PAGE_VA 0x000BF000u
 // A thread switch the app arms from the guest's world (version 37): the emulator's upcalls (C++
@@ -329,6 +330,24 @@ int azaharTakeCore(void);
 int azaharMap(const AzaharMapRequest *req);
 int azaharRun(AzaharRunRequest *req);
 int azaharRelease(void);
+/// A second emulation thread's core (folded mode only, version 68): the caller, pinned to the one
+/// core it runs on, runs slices there from now on, as azaharMap's caller does on its own. Each
+/// attached core runs its slices at the same time as the others'; a table edit reaches a core
+/// inside a slice (the inner-shareable maintenance). In-kernel scheduling stays on azaharMap's
+/// core, and so do each core's switch, redirect and permits as its own run request gives them.
+/// An attached core has its own view of the guest's first megabyte, which the guest never maps
+/// (the module's pages and the app's thunks): the mapping core's, its own user page at
+/// AZAHAR_USER_PAGE_VA, and each of `overrides` there instead (app memory, page aligned, at
+/// most AZAHAR_ATTACH_OVERRIDES): the app's own code for the core where the mapping core runs
+/// the app's thunks. The view follows every later edit of the first megabyte. azaharRun refuses
+/// a core no one attached (AZAHAR_ERR_CORE); azaharDetach ends the caller's core's part.
+#define AZAHAR_ATTACH_OVERRIDES 8u
+typedef struct AzaharAttachRequest {
+    uint32_t count;
+    AzaharRange overrides[AZAHAR_ATTACH_OVERRIDES]; // guest_va below 1 MiB, user_va, size, perm
+} AzaharAttachRequest;
+int azaharAttach(const AzaharAttachRequest *req);
+int azaharDetach(void);
 int azaharEdit(const AzaharEditRequest *req);
 /// Registers the decoded VFP instruction `form` at `guest_pc` (see AZAHAR_VFP_SVC), replacing one
 /// registered there before. Between slices. 0, or AZAHAR_ERR_ARG for a bad form and
@@ -458,7 +477,7 @@ int azaharBusErrorWatch(AzaharBusErrorCatch *out);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.
-#define AZAHAR_NATIVE_VERSION 67
+#define AZAHAR_NATIVE_VERSION 68
 #define AZAHAR_NATIVE_UNLOADABLE 67
 int azaharVersion();
 /// This module as a UID of the calling process, for taiStopUnloadKernelModule: taiHEN stops and

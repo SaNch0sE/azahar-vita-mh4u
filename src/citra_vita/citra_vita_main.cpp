@@ -20,6 +20,7 @@
 #include <pthread.h>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <psp2/appmgr.h>
 #include <psp2/audioout.h>
 #include <psp2/ctrl.h>
@@ -1319,6 +1320,69 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              perf.time_vblank_interval * 1e3, perf.time_hle_svc * 1e3,
                              perf.time_hle_ipc * 1e3, perf.time_gpu * 1e3, perf.time_swap * 1e3,
                              perf.time_remaining * 1e3);
+                    // The second emulation thread (emu_host.h): its passes and slices, its idles
+                    // (and host 0's) with the time asleep, its svcs answered there and handed to
+                    // host 0 (the busiest by number), the wait for those, and how far its clock
+                    // was ahead of host 0's.
+                    {
+                        const auto c = system.TakeSecondHostCensus();
+                        const auto top = [](const std::array<u16, 256>& by) {
+                            std::array<std::pair<u32, u32>, 256> all{};
+                            for (u32 i = 0; i < 256; i++) {
+                                all[i] = {by[i], i};
+                            }
+                            std::sort(all.begin(), all.end(), std::greater<>());
+                            std::string list;
+                            for (u32 i = 0; i < 6 && all[i].first != 0; i++) {
+                                fmt::format_to(std::back_inserter(list), " {:02x}:{}",
+                                               all[i].second, all[i].first);
+                            }
+                            return list;
+                        };
+                        if (c.passes != 0 || c.host0_idles != 0) {
+                            LOG_INFO(Frontend,
+                                     "perf: second thread: {} passes, {} runs, {} idles ({:.1f} "
+                                     "ms asleep); local svcs {}{}; forwarded {} ({:.1f} ms "
+                                     "waiting, {} served){}; held pages {} ({} raced a release); "
+                                     "host 0 idles {} ({:.1f} ms asleep; woken by a message {} "
+                                     "{:.1f} ms, the "
+                                     "clock {} {:.1f} ms, an idle {} {:.1f} ms, else {} {:.1f} "
+                                     "ms); lead {} ticks; clock wakes {:.1f} us after the "
+                                     "clock ({} timed), sleeps <10/25/50/100/250/more us {}",
+                                     c.passes, c.runs, c.idles, c.idle_us / 1000.0, c.local_svcs,
+                                     top(c.local_svcs_by), c.forwards, c.forward_wait_us / 1000.0,
+                                     c.served, top(c.forward_svcs), c.held_pages, c.raced_holds,
+                                     c.host0_idles,
+                                     c.host0_idle_us / 1000.0, c.host0_woken[0],
+                                     c.host0_woken_us[0] / 1000.0, c.host0_woken[1],
+                                     c.host0_woken_us[1] / 1000.0, c.host0_woken[2],
+                                     c.host0_woken_us[2] / 1000.0, c.host0_woken[3],
+                                     c.host0_woken_us[3] / 1000.0, c.lead,
+                                     c.clock_wakes_timed == 0
+                                         ? 0.0
+                                         : static_cast<double>(c.clock_wake_latency_us) /
+                                               c.clock_wakes_timed,
+                                     c.clock_wakes_timed,
+                                     fmt::join(c.clock_sleeps_by_length, "/"));
+                            const auto& h = c.host0_idle_how;
+                            const u32 jumps = h[1] + h[2] + h[3];
+                            LOG_INFO(Frontend,
+                                     "perf: host 0 idles: work at once {}, no sleep to its own "
+                                     "event with host 1 idle {}, with host 1 past it {}, to host "
+                                     "1's clock or event {}, slept {}; {:.1f} us of guest time a "
+                                     "no-sleep idle",
+                                     h[0], h[1], h[2], h[3], h[4],
+                                     jumps == 0 ? 0.0
+                                                : c.host0_jump_ticks /
+                                                      (BASE_CLOCK_RATE_ARM11 / 1e6) / jumps);
+                        }
+                        // Seconds with no game frame: every guest thread once, to the log.
+                        static u32 frameless = 0;
+                        frameless = perf.game_fps < 0.5 ? frameless + 1 : 0;
+                        if (frameless == 3) {
+                            system.RequestThreadDump();
+                        }
+                    }
                     // The native core's slices: time in the guest and in azaharRun (ms), how
                     // the slices ended, the svcs answered in the guest, and the svcs that left
                     // it, most frequent first.

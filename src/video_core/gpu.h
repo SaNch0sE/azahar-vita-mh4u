@@ -128,6 +128,9 @@ public:
     /// it. If so, the GPU work it waited for is done and the guest may run the access again.
     /// `guest_pc` and `guest_va` are the abort's instruction and address (for `holdlog`).
     bool GuestAbort(const u8* host, bool write, u32 guest_pc, u32 guest_va);
+    /// After an abort no hold refused (GuestAbort false): the holds' changes sent, whether the
+    /// page is open to the access now (RenderThread::AccessOpenAfterFlush).
+    bool GuestAccessOpen(const u8* host, bool write);
     /// Whether an aborted guest access at host opened its page, held for the display alone,
     /// the `reach` bytes its instruction may touch from host on being clear of the display's
     /// bytes (renderer_sgxd's PageHolds::OpenPastDisplay).

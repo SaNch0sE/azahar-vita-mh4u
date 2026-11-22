@@ -8,6 +8,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <boost/optional.hpp>
@@ -17,6 +18,7 @@
 #include "common/vector_math.h"
 #include "core/arm/arm_interface.h"
 #include "core/cheats/cheats.h"
+#include "core/emu_host.h"
 #include "core/hle/service/apt/applet_manager.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/movie.h"
@@ -50,8 +52,13 @@ class ArchiveManager;
 }
 } // namespace Service
 
+namespace Common {
+class NamedThread;
+}
+
 namespace Kernel {
 class KernelSystem;
+class SVCContext;
 struct New3dsHwCapabilities;
 enum class MemoryMode : u8;
 } // namespace Kernel
@@ -195,6 +202,8 @@ public:
     /// kernel's current core, its timer and its process (the Vita native core's upcalls run the
     /// other cores' timer events while the guest idles).
     void SelectCore(u32 core_id);
+    /// SelectCore by the core itself, for the calling emulation thread.
+    void SetRunning(ARM_Interface* core);
 
     [[nodiscard]] PerfStats::Results GetAndResetPerfStats();
 
@@ -220,7 +229,7 @@ public:
      */
 
     [[nodiscard]] ARM_Interface& GetRunningCore() {
-        return *running_core;
+        return *running_core[ThisHost()];
     };
 
     /**
@@ -349,11 +358,80 @@ public:
     FrameLimiter frame_limiter;
 
     void SetStatus(ResultStatus new_status, const char* details = nullptr) {
+        // The second emulation thread's: RunLoop's own status starts over each call, so it takes
+        // this one over there (second_failed).
+        if (ThisHost() == 1) {
+            second_status = new_status;
+            second_details = details ? details : "";
+            second_failed.store(true, std::memory_order_release);
+            return;
+        }
         status = new_status;
         if (details) {
             status_details = details;
         }
     }
+
+    /**
+     * The second emulation thread (emu_host.h): the emulated cores other than core 0, beside
+     * RunLoop's, on a Vita core of its own, with no lock between the two. RunLoop starts it once
+     * the guest's table is in and stops it before a savestate, a load and the end.
+     */
+    void StartSecondHost();
+    void StopSecondHost();
+    /// An svc of core `core_id` on the second thread: answered there (LocalToSecondHost), else
+    /// by host 0 while the second thread waits (ServeForward).
+    void SecondHostSvc(u32 core_id, Kernel::SVCContext& svc, u32 immediate);
+    /// Host 0: the second thread's svc or fault it waits for, if there is one.
+    void ServeForward();
+    /// Whether host 0 may idle in the guest's world (an upcall, no exit) up to tick `until`: the
+    /// second thread asleep with nothing due before it, no message and no svc for host 0. Host
+    /// 0's clock goes out to it meanwhile (PublishClock).
+    [[nodiscard]] bool SecondHostQuiet(u64 until) const;
+    void PublishClock(u32 host);
+    /// A permission fault of core `core_id` on the second thread (a store or load on a page the
+    /// GPU's queued work holds): host 0 takes the page as its own aborts do while the second
+    /// thread waits. Whether a hold took it (the access runs again, or ran).
+    bool SecondHostHeldPage(u32 core_id);
+
+#ifdef VITA_DIAGNOSTICS
+    /// The two emulation threads' counters since the last call (perflog).
+    struct SecondHostCensus {
+        u32 passes{}, runs{}, idles{}, local_svcs{}, forwards{}, held_pages{};
+        /// Of the held pages, the aborts that raced a release (TakeForwardedHeldPage).
+        u32 raced_holds{};
+        u64 idle_us{}, forward_wait_us{};
+        u32 host0_idles{}, served{};
+        u64 host0_idle_us{};
+        /// Host 0's sleeps by what ended them: a message, the other's clock, the other's idle
+        /// changing, none of those.
+        std::array<u32, 4> host0_woken{};
+        std::array<u64, 4> host0_woken_us{};
+        /// Of host 0's sleeps the clock ended: those whose wake was timed, the time from the
+        /// other's clock reaching this one's next event to this one running, and the sleeps by
+        /// length (under 10, 25, 50, 100, 250 us, longer).
+        u32 clock_wakes_timed{};
+        u64 clock_wake_latency_us{};
+        std::array<u32, 6> clock_sleeps_by_length{};
+        std::array<u16, 256> forward_svcs{};
+        std::array<u16, 256> local_svcs_by{};
+        /// Host 1's clock less host 0's at host 1's last pass, in ticks.
+        s64 lead{};
+        /// Host 0's idles by how they ended: work at once, no sleep to its own next event with
+        /// host 1 idle, the same with host 1 running past it, no sleep to host 1's clock or next
+        /// event, a sleep; and the ticks the idles with no sleep moved host 0's clock.
+        std::array<u32, 5> host0_idle_how{};
+        u64 host0_jump_ticks{};
+    };
+    /// Why SecondHostQuiet(until) is false: host 1 running, its next event by `until`, a message
+    /// for it, one for host 0, a forwarded svc; 5 when quiet.
+    [[nodiscard]] u32 SecondHostBusyWhy(u64 until) const;
+    SecondHostCensus TakeSecondHostCensus();
+    /// Every guest thread to the log at the next RunLoop (perflog: seconds with no frame).
+    void RequestThreadDump() {
+        thread_dump_requested.store(true, std::memory_order_relaxed);
+    }
+#endif
 
     [[nodiscard]] const std::string& GetStatusDetails() const {
         return status_details;
@@ -539,7 +617,8 @@ private:
 
     /// ARM11 CPU core
     std::vector<std::shared_ptr<ARM_Interface>> cpu_cores;
-    ARM_Interface* running_core = nullptr;
+    /// Each emulation thread's core (emu_host.h).
+    std::array<ARM_Interface*, NumHosts> running_core{};
     CodeSyncBatch* code_sync_batch = nullptr;
 
     /// IsNew3ds, set by Load before the system's parts are made.
@@ -548,8 +627,8 @@ private:
     /// DSP core
     std::unique_ptr<AudioCore::DspInterface> dsp_core;
 
-    /// When true, signals that a reschedule should happen
-    bool curr_core_reschedule_pending{};
+    /// When true, signals that a reschedule should happen (each emulation thread's core)
+    std::array<bool, NumHosts> curr_core_reschedule_pending{};
 
     std::unique_ptr<VideoCore::GPU> gpu;
 
@@ -601,6 +680,55 @@ private:
 
     ResultStatus status = ResultStatus::Success;
     std::string status_details = "";
+
+    /// The second emulation thread (StartSecondHost) and what the two publish to each other.
+    void SecondHostMain();
+    /// Whether the second thread can take its cores: the guest's table is in.
+    [[nodiscard]] bool SecondHostCanStart() const;
+    /// The calling host's cores: host 0's core 0 (every core with no second thread), host 1's
+    /// the others.
+    [[nodiscard]] std::span<const std::shared_ptr<ARM_Interface>> HostCores(u32 host) const;
+    /// No thread of host `host`'s cores can run: its clock follows the other host's while that
+    /// one runs, up to its own next event; with both idle, both go to the sooner next event.
+    /// Returns once there is something to do (a message, an event due, a forwarded svc, a stop).
+    void HostIdle(u32 host);
+
+    /// The waits host 0 made for the other cores' threads, whose timeouts sit on those cores'
+    /// timers, onto core 0's (the second thread starts); host 1's event waits into host 0's
+    /// lists (it stops).
+    void MoveWaitsToFirstHost(bool starting);
+    struct HostClock {
+        std::atomic<u64> clock{};
+        std::atomic<u64> next{};
+        std::atomic<bool> idle{};
+#ifdef VITA_DIAGNOSTICS
+        /// When this host's clock last reached the other's next event and woke it (us, steady).
+        std::atomic<u64> woke_other_us{};
+#endif
+    };
+    std::array<HostClock, NumHosts> host_clock;
+    std::unique_ptr<Common::NamedThread> second_host;
+    std::atomic<bool> second_host_attached{};
+    std::atomic<bool> second_host_stop{};
+    std::atomic<bool> second_failed{};
+    ResultStatus second_status = ResultStatus::Success;
+    std::string second_details;
+    /// What the second thread hands host 0: an svc (its core, context and number) or a held
+    /// page's fault (its core), and the fault's answer.
+    enum class ForwardKind : u8 { Svc, HeldPage };
+    std::atomic<bool> forward_pending{};
+    ForwardKind forward_kind{};
+    u32 forward_core{};
+    u32 forward_immediate{};
+    Kernel::SVCContext* forward_svc{};
+    bool forward_taken{};
+    /// The second thread's side: hands it over and waits for host 0.
+    void ForwardToFirstHost();
+#ifdef VITA_DIAGNOSTICS
+    SecondHostCensus second_census{};
+    std::atomic<bool> thread_dump_requested{};
+    void DumpGuestThreads();
+#endif
     /// Saved variables for reset
     Frontend::EmuWindow* m_emu_window;
     Frontend::EmuWindow* m_secondary_window;

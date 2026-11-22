@@ -318,6 +318,10 @@ public:
 
     /// The emulated process changed, so every mapping the observer holds is stale.
     virtual void OnPageTableChanged() = 0;
+
+    /// Every mapping of `page_table` has just been announced (after OnPageTableChanged): the
+    /// observer's mappings mirror that table now.
+    virtual void OnMirroring(const PageTable& page_table) {}
 };
 
 /**

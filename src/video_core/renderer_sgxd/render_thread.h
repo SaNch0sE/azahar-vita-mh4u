@@ -165,6 +165,9 @@ public:
     /// A guest access aborted on the page of `host`: whether a hold refused it. If so, the work it
     /// waited for is done and the page open, and the guest runs the access again.
     bool PageFault(const u8* host, bool write, u32 guest_pc, u32 guest_va);
+    /// The holds' changes sent, then whether the record lets this access through: an abort that came
+    /// before its page's change reached the descriptor (host 1's) may run again.
+    bool AccessOpenAfterFlush(const u8* host, bool write);
     bool OpensDisplayPage(const u8* host, bool write, u32 reach);
     /// GPU::GuestReadMissesWrites: a page held for a GPU write (the guest's view closed), the
     /// read clear of that write's bytes (PageHolds::TouchesWrite), as the HLE's reads go on;

@@ -266,15 +266,15 @@ static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at ma
 // Resident thread <-> syscall side. Everything volatile, no kernel calls on the core-2 side.
 enum { CMD_NONE, CMD_INSTALL, CMD_RUN, CMD_UNINSTALL };
 static volatile uint32_t azahar_cmd, azahar_cmd_done, azahar_cmd_status;
+// azahar_on_core: the resident thread's core, or (folded) azaharMap's: the core with the shared
+// table's own first megabyte, which an attached core's view stands in for (azaharAttach).
 static volatile uint32_t azahar_heartbeat, azahar_on_core, azahar_stop, azahar_park;
 
 static volatile uint32_t azahar_core2_vbar, azahar_core2_cpsr, azahar_core2_ttbr1, azahar_core2_sp;
 
 
-// azaharRun's phases (AZAHAR_PHASE_*), this call's: the cycle counter, its enable set at the
-// call's start (a thread's resume clears it).
-static uint32_t azahar_phase[AZAHAR_PHASES];
-static inline uint32_t phase_now(void) {
+// The cycle counter, its enable set at azaharRun's start (a thread's resume clears it).
+static inline uint32_t cycles_now(void) {
     uint32_t c;
     asm volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(c));
     return c;
@@ -332,6 +332,10 @@ typedef struct AzaharFast {
     uint32_t rearm_ticks, rearm_left;
     uint32_t accrued_lo, accrued_hi;
     uint32_t rearms;
+    // Version 68, this core's: its user page (the kernel's address) and the app's switch,
+    // redirect and permits for this slice (AzaharRunRequest). Two cores in slices at once read
+    // their own here; they were module globals.
+    uint32_t user_kva, switch_va, redirect_va, store_va;
     uint32_t spare;       // keeps the stacks after the block 8-byte aligned
 } AzaharFast;
 _Static_assert(__builtin_offsetof(AzaharFast, mult_int) == 0x0c, "entry.S FAST_MULT_INT");
@@ -342,7 +346,9 @@ _Static_assert(__builtin_offsetof(AzaharFast, save) == 0x38, "entry.S FAST_SAVE"
 _Static_assert(__builtin_offsetof(AzaharFast, rearm_ticks) == 0x48, "entry.S FAST_REARM_TICKS");
 _Static_assert(__builtin_offsetof(AzaharFast, accrued_lo) == 0x50, "entry.S FAST_ACCRUED_LO");
 _Static_assert(__builtin_offsetof(AzaharFast, rearms) == 0x58, "entry.S FAST_REARMS");
-_Static_assert(sizeof(AzaharFast) == 0x60, "AzaharCpu's stacks after it");
+_Static_assert(__builtin_offsetof(AzaharFast, user_kva) == 0x5c, "entry.S FAST_USER_KVA");
+_Static_assert(__builtin_offsetof(AzaharFast, store_va) == 0x68, "entry.S FAST_STORE_VA");
+_Static_assert(sizeof(AzaharFast) == 0x70, "AzaharCpu's stacks after it");
 
 // One block per Vita core (MPIDR & 3): a slice on a core reads and writes its own only. This is
 // entry.S's part, its CPU_* offsets checked below, with the context first so that a stub's SP
@@ -394,10 +400,10 @@ _Static_assert(__builtin_offsetof(AzaharUserPage, thread_id) == 0x1c, "entry.S U
 _Static_assert(__builtin_offsetof(AzaharSwitch, in) == 0x08, "entry.S SWITCH_IN");
 _Static_assert(__builtin_offsetof(AzaharRedirect, site) == 0x0c, "entry.S REDIRECT_SITE");
 _Static_assert(__builtin_offsetof(AzaharContext, fpregs) == 0x50, "entry.S context layout");
-_Static_assert(__builtin_offsetof(AzaharCpu, stray_stack) + 64 == 0x290, "entry.S CPU_STRAY_STACK_TOP");
-_Static_assert(__builtin_offsetof(AzaharCpu, irq_stack) + 64 == 0x2d0, "entry.S CPU_IRQ_STACK_TOP");
-_Static_assert(__builtin_offsetof(AzaharCpu, vfp_stack) + 1024 == 0x6d8, "entry.S CPU_VFP_STACK_TOP");
-_Static_assert(sizeof(AzaharCpu) == 0x6e0, "entry.S CPU_SIZE");
+_Static_assert(__builtin_offsetof(AzaharCpu, stray_stack) + 64 == 0x2a0, "entry.S CPU_STRAY_STACK_TOP");
+_Static_assert(__builtin_offsetof(AzaharCpu, irq_stack) + 64 == 0x2e0, "entry.S CPU_IRQ_STACK_TOP");
+_Static_assert(__builtin_offsetof(AzaharCpu, vfp_stack) + 1024 == 0x6e8, "entry.S CPU_VFP_STACK_TOP");
+_Static_assert(sizeof(AzaharCpu) == 0x6f0, "entry.S CPU_SIZE");
 
 // The rest of a core's state, C's alone: Sony's registers saved at install and put back at
 // uninstall, the private timer's clock, and the slice's figures.
@@ -418,25 +424,22 @@ typedef struct AzaharCore {
     uint32_t fast_timer_hz;
     // AzaharRunRequest.upcall_rearm_us and the timer clock AzaharFast.rearm_ticks were made for.
     uint32_t rearm_us, rearm_timer_hz, rearm_ticks;
-    // azaharMap's core: azaharRun runs a slice here only then.
+    // azaharMap's core or one azaharAttach added: azaharRun runs a slice here only then.
     uint32_t attached;
     // The azahar_code_gen this core's instruction cache last caught up with (core2_install).
     uint32_t code_gen;
 } AzaharCore;
 static AzaharCore azahar_core[AZAHAR_CORES];
-// The page AZAHAR_USER_PAGE_VA shows the guest (version 35): the page-aligned one inside this
-// array, so that the guest sees nothing else of the module's whatever alignment the loader gave
-// the data segment. Written before each entry into the guest (core2_run), sealed.
-static uint8_t azahar_user_area[2 * 4096];
-static inline AzaharUserPage *azahar_user(void) {
-    return (AzaharUserPage *)(((uintptr_t)azahar_user_area + 0xFFFu) & ~(uintptr_t)0xFFFu);
+// The page AZAHAR_USER_PAGE_VA shows the guest, one per core, each core's
+// view showing its own there): the page-aligned ones inside this array, so that the guest sees
+// nothing else of the module's whatever alignment the loader gave the data segment. Written
+// before each entry into the guest (core2_run), sealed. Each core's switch, redirect and permits
+// are in its AzaharFast.
+static uint8_t azahar_user_area[(AZAHAR_CORES + 1) * 4096];
+static inline AzaharUserPage *azahar_user(unsigned n) {
+    return (AzaharUserPage *)((((uintptr_t)azahar_user_area + 0xFFFu) & ~(uintptr_t)0xFFFu) +
+                              n * 4096u);
 }
-// For entry.S's AZAHAR_SWITCH_SVC: the user page (its thread_id) and the app's AzaharSwitch,
-// set per slice from AzaharRunRequest.upcall_switch.
-uint32_t azahar_user_page_kva;
-uint32_t azahar_switch_va;
-uint32_t azahar_redirect_va; // entry.S's svc redirect: AzaharRunRequest.upcall_redirect
-uint32_t azahar_store_va;    // azahar_store_fast's permits: AzaharRunRequest.store_permits
 uint32_t azahar_store_fast(AzaharContext *ctx, uint32_t pc);
 
 // The core this runs on. Not ksceKernelCpuId: nothing of Sony's kernel is mapped once a core is
@@ -477,7 +480,8 @@ extern int module_get_offset(SceUID pid, SceUID modid, int segidx, size_t offset
 
 #define MODE_IRQ 0x12u
 static volatile uint32_t azahar_timer_sample;   // idle loop: the free-running counter
-static volatile uint32_t azahar_tlb_dirty;      // an edit happened since the guest last ran
+// A bit per core: an edit happened since that core's guest last ran (each core clears its own).
+static volatile uint32_t azahar_tlb_dirty;
 static uint32_t azahar_run_count;
 // Core-2 side: our table/vectors/PMR are in (set at the end of core2_install, cleared first
 // thing in core2_uninstall), so the resident loop knows when the SGI poll applies.
@@ -500,24 +504,64 @@ static int azahar_folded = 1;
 // can change what an address executes bumps the generation (tables_changed); each core's
 // install, and core2_run's azahar_tlb_dirty path, catch up with it on that core.
 static volatile uint32_t azahar_code_gen = 1;
-// Serialises the table and L2 pool edits (azaharEdit, azaharHold). Created by the first folded
-// azaharTakeCore.
+// Cores attached (AzaharCore.attached). With more than one, an edit may change what
+// a core in a slice right now translates or executes, and tables_changed reaches it with the
+// inner-shareable forms of the maintenance.
+static volatile uint32_t azahar_attached_cores;
+// The ASID the guest's translations carry: core2_install keeps the caller's CONTEXTIDR, and every
+// attached thread belongs to the one process (azaharAttach checks).
+static uint32_t azahar_asid;
+// Serialises the table and L2 pool edits (azaharEdit, azaharHold, azaharAttach): two emulation
+// threads can both edit. Created by the first folded azaharTakeCore.
 static SceUID azahar_edit_mutex = -1;
 
+// ----------------------------------------------------------------- an attached core's own view
+// An attached core other than azaharMap's has its own level-1 table: the shared
+// one's copy but for entry 0, the guest's first megabyte, which the guest never maps (the module's
+// pages, the app's thunks). There it has a table of its own: the shared one's copy with its own
+// user page and the app's overrides (azaharAttach), made again after every edit of the shared
+// one. One block: the level-1 table (16 KiB), then the megabyte's (1 KiB).
+typedef struct AzaharView {
+    SceUID uid;
+    uint32_t *l1, *mb0;
+    uintptr_t l1_pa, mb0_pa;
+    uint32_t count;
+    AzaharRange overrides[AZAHAR_ATTACH_OVERRIDES];
+} AzaharView;
+static AzaharView azahar_view[AZAHAR_CORES];
+static void view_free(unsigned n);
+static void views_l1_set(uint32_t idx);
+static void views_rebuild_mb0(void);
 static void detach_all(void) {
     for (unsigned n = 0; n < AZAHAR_CORES; n++) {
         azahar_core[n].attached = 0;
+        view_free(n);
     }
+    azahar_attached_cores = 0;
 }
 
-// After descriptors changed (`code`: and what an address executes may have): the attached core
-// drops its stale translations at its next install (core2_switch's TLBIALL) and, for a new code
-// generation, its instruction cache.
+// After descriptors changed (`code`: and what an address executes may have): every core that
+// installs from now on drops its stale translations there (core2_run's TLBIALL) and, for a new
+// code generation, its instruction cache. A core inside a slice right now does neither until its
+// slice ends, so with two cores attached the inner-shareable forms reach it: they need nothing
+// from the other core, whose GIC mask would hold an interrupt for a whole slice. TLBIALLIS, not
+// TLBIASIDIS: the guest's descriptors carry no nG bit, so their entries are global. When this
+// returns no core can reach a translation the edit removed.
 static void tables_changed(int code) {
     asm volatile("dsb ish" ::: "memory");
-    azahar_tlb_dirty = 1;
+    azahar_tlb_dirty = (1u << AZAHAR_CORES) - 1u;
     if (code) {
         azahar_code_gen++;
+    }
+    if (azahar_attached_cores > 1) {
+        asm volatile("mcr p15, 0, %0, c8, c3, 0" ::"r"(0u) : "memory"); // TLBIALLIS
+        if (code) {
+            asm volatile("mcr p15, 0, %0, c7, c1, 0 \n"  // ICIALLUIS
+                         "mcr p15, 0, %0, c7, c1, 6"      // BPIALLIS
+                         ::"r"(0u)
+                         : "memory");
+        }
+        asm volatile("dsb ish \n isb" ::: "memory");
     }
 }
 
@@ -730,7 +774,6 @@ static void core2_sgi_window(unsigned n) {
 
 // One trip into the guest. Interrupts are masked at the GIC for its duration — the core is
 // owned, not shared, while guest code runs — and put back afterwards.
-static uint32_t azahar_t_post; // the cycle counter at the guest's exit (AZAHAR_PHASE_POST)
 static void core2_run(unsigned n) {
     AzaharCpu *const cpu = &azahar_cpu[n];
     AzaharCore *const core = &azahar_core[n];
@@ -741,7 +784,7 @@ static void core2_run(unsigned n) {
         core->run_pmr_before = *pmr & 0xFFu; // masked since install
     }
 
-    if (azahar_tlb_dirty) {
+    if (azahar_tlb_dirty & (1u << n)) {
         // Descriptors changed under us since the last run, so a translation may be stale and
         // the TLB always goes. What else is stale depends on the edit: mapping a guest code
         // range needs all three, since the app wrote those instructions through its own view
@@ -763,15 +806,16 @@ static void core2_run(unsigned n) {
             core->code_gen = gen;
         }
         asm volatile("dsb \n isb" ::: "memory");
-        azahar_tlb_dirty = 0;
+        __atomic_and_fetch(&azahar_tlb_dirty, ~(1u << n), __ATOMIC_SEQ_CST);
     }
     cpu->progress = 2;
     wr_tpidruro(cpu->ctx.tpidruro);
     wr_tpidrurw(cpu->ctx.tpidrurw);
-    // The fast svcs' answers for the guest's thunks (AzaharUserPage), this entry's.
+    // The fast svcs' answers for the guest's thunks (AzaharUserPage), this entry's: this core's
+    // own page, the one its view shows at AZAHAR_USER_PAGE_VA.
     {
         const AzaharFast *const f = &cpu->fast;
-        AzaharUserPage *const u = azahar_user();
+        AzaharUserPage *const u = azahar_user(n);
         u->on = f->on & ~((f->timer && core->quantum_ticks) ? 0u : 1u << AZAHAR_FAST_TICK);
         u->quantum = core->quantum_ticks;
         u->mult_int = f->mult_int;
@@ -798,9 +842,6 @@ static void core2_run(unsigned n) {
     }
     cpu->progress = 3;
     const uint32_t reason = (uint32_t)azahar_enter(cpu);
-    const uint32_t t_post = phase_now();
-    azahar_phase[AZAHAR_PHASE_GUEST] += t_post - t_guest;
-    azahar_t_post = t_post;
     cpu->progress = 42;
     if (pmr) {
         core->timer_left = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
@@ -864,7 +905,7 @@ static void fold_run(unsigned n) {
     core2_install(n);
     core2_run(n);
     t = phase_now();
-    azahar_phase[AZAHAR_PHASE_POST] += t - azahar_t_post;
+    azahar_phase[AZAHAR_PHASE_POST] += t - azahar_t_post[n];
     core2_uninstall(n);
 }
 
@@ -1387,7 +1428,140 @@ static int l2_for(uint32_t idx, int create) {
         azahar_l2[t * 256u + i] = 0;
     }
     azahar_l1[idx] = AZAHAR_COARSE((uint32_t)azahar_l2_pa + t * 0x400u);
+    views_l1_set(idx);
     return (int)t;
+}
+
+// ----------------------------------------------------------------- an attached core's own view
+// (AzaharView, above.)
+
+// The views' builds that failed, for azaharVaReport: a rebuild after an edit keeps the megabyte
+// as it was, and its line is muted with the rest of the native calls' log.
+static uint32_t azahar_view_failures;
+static int azahar_view_last_error;
+static uint32_t azahar_view_last_core;
+
+static int view_build_failed(unsigned n, int error) {
+    azahar_view_failures++;
+    azahar_view_last_error = error;
+    azahar_view_last_core = n;
+    return error;
+}
+
+// Core n's first megabyte from the shared table's, with its own user page and its overrides:
+// made aside, then each entry written once, so that the core, maybe in a slice now, never sees
+// the shared table's entry where an override goes (the mapping core's thunks there).
+static int view_build_mb0(unsigned n) {
+    AzaharView *const v = &azahar_view[n];
+    uint32_t e[256];
+    const int t = l2_for(0, 0);
+    for (unsigned i = 0; i < 256u; i++) {
+        e[i] = t < 0 ? 0u : azahar_l2[(unsigned)t * 256u + i];
+    }
+    const uint32_t upar = translate((uint32_t)(uintptr_t)azahar_user(n), AT_PRIV_R);
+    const uint32_t uattr = azahar_attr_from_par(upar);
+    if (PAR_FAULTED(upar) || !uattr) {
+        emit("  view cpu%u: its user page does not translate (par %08x)\n", n, upar);
+        return view_build_failed(n, AZAHAR_ERR_TABLE);
+    }
+    e[(AZAHAR_USER_PAGE_VA >> 12) & 0xFFu] = azahar_small_page(PAR_PA(upar), AZAHAR_PERM_R, uattr);
+    for (unsigned r = 0; r < v->count; r++) {
+        const AzaharRange *const rg = &v->overrides[r];
+        const int app_attr = (rg->perm & AZAHAR_PERM_APP_ATTR) != 0;
+        for (uint32_t off = 0; off < rg->size; off += 0x1000) {
+            uint32_t pa = 0, par = 0;
+            int how = -1;
+            if (azahar_user_page(rg->user_va + off, &pa, &how, &par, app_attr) != 0) {
+                emit("  view cpu%u: override user %08x does not translate (par %08x)\n", n,
+                     rg->user_va + off, par);
+                return view_build_failed(n, AZAHAR_ERR_PAGE);
+            }
+            const uint32_t attr = app_attr ? azahar_attr_from_par(par) : AZAHAR_ATTR_WB;
+            if (!attr) {
+                emit("  view cpu%u: override user %08x is not Normal memory\n", n,
+                     rg->user_va + off);
+                return view_build_failed(n, AZAHAR_ERR_PAGE);
+            }
+            e[((rg->guest_va + off) >> 12) & 0xFFu] = azahar_small_page(pa, rg->perm, attr);
+        }
+    }
+    for (unsigned i = 0; i < 256u; i++) {
+        if (v->mb0[i] != e[i]) {
+            v->mb0[i] = e[i];
+        }
+    }
+    asm volatile("dsb ish" ::: "memory");
+    return 0;
+}
+
+// Every view's first megabyte again, after an edit of the shared table's.
+static void views_rebuild_mb0(void) {
+    for (unsigned n = 0; n < AZAHAR_CORES; n++) {
+        if (azahar_view[n].l1) {
+            view_build_mb0(n);
+        }
+    }
+}
+
+// The shared table's level-1 entry idx into every view (entry 0 is each view's own).
+static void views_l1_set(uint32_t idx) {
+    if (idx == 0) {
+        return;
+    }
+    for (unsigned n = 0; n < AZAHAR_CORES; n++) {
+        if (azahar_view[n].l1) {
+            azahar_view[n].l1[idx] = azahar_l1[idx];
+        }
+    }
+}
+
+int azaharVaReport(uint32_t va, AzaharVaReport *out) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    // No lock: a crash's report, which must not wait on an edit that may never end. An edit at
+    // the same moment can show half done.
+    AzaharVaReport r;
+    __builtin_memset(&r, 0, sizeof(r));
+    r.va = va;
+    r.core = this_core();
+    r.map_core = azahar_on_core & 3u;
+    const uint32_t idx = va >> 20;
+    const uint32_t page = (va >> 12) & 0xFFu;
+    if (azahar_l1) {
+        r.shared_l1 = azahar_l1[idx];
+        const int t = l2_for(idx, 0);
+        r.shared_l2 = t < 0 ? 0u : azahar_l2[(unsigned)t * 256u + page];
+    }
+    for (unsigned n = 0; n < AZAHAR_CORES; n++) {
+        const AzaharView *const v = &azahar_view[n];
+        r.attached[n] = azahar_core[n].attached;
+        if (v->l1) {
+            r.view_l1[n] = v->l1[idx];
+            r.view_l2[n] = idx == 0 ? v->mb0[page] : r.shared_l2;
+            r.view_overrides[n] = v->count;
+        }
+    }
+    const AzaharView *const own = &azahar_view[r.core & 3u];
+    for (unsigned i = 0; i < own->count && i < AZAHAR_ATTACH_OVERRIDES; i++) {
+        r.overrides[i] = own->overrides[i];
+    }
+    r.view_failures = azahar_view_failures;
+    r.view_last_error = azahar_view_last_error;
+    r.view_last_core = azahar_view_last_core;
+    ksceKernelCopyToUser(out, &r, sizeof(r));
+    EXIT_SYSCALL(state);
+    return 0;
+}
+
+static void view_free(unsigned n) {
+    AzaharView *const v = &azahar_view[n];
+    if (v->l1) {
+        ksceKernelFreeMemBlock(v->uid);
+    }
+    v->uid = -1;
+    v->l1 = v->mb0 = 0;
+    v->l1_pa = v->mb0_pa = 0;
+    v->count = 0;
 }
 
 // The guest's window for the first `done` bytes of a range map_range wrote; the pages past
@@ -1552,8 +1726,7 @@ static int build_table(const AzaharMapRequest *req) {
                 (uint32_t)(uintptr_t)&azahar_state,
                 (uint32_t)(uintptr_t)azahar_user_area,
                 (uint32_t)(uintptr_t)azahar_user_area + sizeof(azahar_user_area) - 1,
-                (uint32_t)(uintptr_t)&azahar_user_page_kva, (uint32_t)(uintptr_t)&azahar_switch_va,
-                (uint32_t)(uintptr_t)&azahar_redirect_va, (uint32_t)(uintptr_t)&azahar_store_va,
+                (uint32_t)(uintptr_t)&azahar_tlb_dirty,
             };
             uint32_t bases[2] = {0, 0};
             for (unsigned seg = 0; seg < 2; seg++) {
@@ -1804,17 +1977,22 @@ static int build_table(const AzaharMapRequest *req) {
     // the kernel maps the module's data; the timer's page as it maps the GIC (device or strongly
     // ordered), and without the GIC none: GetSystemTick is then never answered there.
     {
+        // A user page per core; the mapping core's in this table, an attached
+        // core's in its own view (azaharAttach).
+        for (unsigned c = 0; c < AZAHAR_CORES; c++) {
+            for (unsigned i = 0; i < 4096u; i++) {
+                ((uint8_t *)azahar_user(c))[i] = 0;
+            }
+            azahar_cpu[c].fast.user_kva = (uint32_t)(uintptr_t)azahar_user(c);
+        }
         const int t = l2_for(AZAHAR_USER_PAGE_VA >> 20, 1);
-        const uint32_t par = translate((uint32_t)(uintptr_t)azahar_user(), AT_PRIV_R);
+        const uint32_t par =
+            translate((uint32_t)(uintptr_t)azahar_user(azahar_on_core & 3u), AT_PRIV_R);
         const uint32_t attr = azahar_attr_from_par(par);
         if (t < 0 || PAR_FAULTED(par) || !attr) {
             emit("  user page: no L2 or no translation (par %08x)\n", par);
             return AZAHAR_ERR_TABLE;
         }
-        for (unsigned i = 0; i < 4096u; i++) {
-            ((uint8_t *)azahar_user())[i] = 0;
-        }
-        azahar_user_page_kva = (uint32_t)(uintptr_t)azahar_user();
         azahar_l2[(unsigned)t * 256u + ((AZAHAR_USER_PAGE_VA >> 12) & 0xFFu)] =
             azahar_small_page(PAR_PA(par), AZAHAR_PERM_R, attr);
         if (gic_va) {
@@ -1930,9 +2108,12 @@ int azaharMap(const AzaharMapRequest *user_req) {
              azahar_vec_va + n * AZAHAR_VEC_STRIDE, core->sv_pmr, AZAHAR_PMR_MASK, core->sv_cpacr,
              core->sv_fpexc);
         fold_measure_timer(n);
-        // The mapping thread's core is the attached one.
+        // The mapping thread's core is the first attached one, and its process's ASID the one
+        // the guest's translations carry.
+        azahar_asid = rd_contextidr() & 0xFFu;
         detach_all();
         azahar_core[n].attached = 1;
+        azahar_attached_cores = 1;
         azahar_state = ST_MAPPED;
         goto out;
     }
@@ -1987,12 +2168,28 @@ static void request_copy(void *dst, const void *src, unsigned bytes) {
 
 // The kernel's view of the app's request block `user`, mapped at its first call; NULL if it
 // cannot be.
+static AzaharRunRequest *run_block_new(const AzaharRunRequest *user);
 static AzaharRunRequest *run_block(const AzaharRunRequest *user) {
-    AzaharRunBlock *slot = &azahar_run_blocks[0];
     for (unsigned i = 0; i < AZAHAR_RUN_BLOCKS; i++) {
         AzaharRunBlock *const b = &azahar_run_blocks[i];
         if (b->user == user) {
             b->last_run = azahar_run_count;
+            return b->req;
+        }
+    }
+    // A block's first call: its slot under the edit mutex, which two emulation threads' first
+    // calls take in turn.
+    ksceKernelLockMutex(azahar_edit_mutex, 1, NULL);
+    AzaharRunRequest *const req = run_block_new(user);
+    ksceKernelUnlockMutex(azahar_edit_mutex, 1);
+    return req;
+}
+
+static AzaharRunRequest *run_block_new(const AzaharRunRequest *user) {
+    AzaharRunBlock *slot = &azahar_run_blocks[0];
+    for (unsigned i = 0; i < AZAHAR_RUN_BLOCKS; i++) {
+        AzaharRunBlock *const b = &azahar_run_blocks[i];
+        if (b->user == user) {
             return b->req;
         }
         if (slot->user && (!b->user || b->last_run < slot->last_run)) {
@@ -2111,9 +2308,10 @@ int azaharRun(AzaharRunRequest *user_req) {
     fast->accrued_lo = fast->accrued_hi = 0;
     fast->rearms = 0;
     cpu->fast_site = 0;
-    azahar_switch_va = (uint32_t)(uintptr_t)req->upcall_switch;
-    azahar_redirect_va = (uint32_t)(uintptr_t)req->upcall_redirect;
-    azahar_store_va = (uint32_t)(uintptr_t)req->store_permits;
+    // This core's, read by its vector (two cores may run at once).
+    fast->switch_va = (uint32_t)(uintptr_t)req->upcall_switch;
+    fast->redirect_va = (uint32_t)(uintptr_t)req->upcall_redirect;
+    fast->store_va = (uint32_t)(uintptr_t)req->store_permits;
     if (azahar_verbose) {
         emit("== azaharRun  cpu%u pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u "
              "ticks\n",
@@ -2121,57 +2319,7 @@ int azaharRun(AzaharRunRequest *user_req) {
              req->quantum_us, core->quantum_ticks);
     }
 
-    // In-kernel scheduling (version 34): folded and timed only. The table and the contexts of
-    // the threads that do not run come in now, while the app is mapped.
-    SchedRun sched = {0};
-    const int sched_on = azahar_folded && timed && req->sched && req->sched_count &&
-                         req->sched_count <= AZAHAR_SCHED_MAX && req->sched_current >= 0 &&
-                         (uint32_t)req->sched_current < req->sched_count;
-    if (sched_on) {
-        fast->rearm_ticks = 0; // the in-kernel scheduling times its own sub-slices
-    }
-    req->sched_handled = req->sched_switches = req->sched_sleeps = req->sched_idle = 0;
-    req->sched_arbitrations = 0;
-    if (sched_on) {
-        if (ksceKernelCopyFromUser(sched_table, req->sched,
-                                   req->sched_count * sizeof(AzaharSchedThread)) < 0) {
-            ret = AZAHAR_ERR_ARG;
-            goto out;
-        }
-        sched.count = req->sched_count;
-        sched.current = req->sched_current;
-        sched.now = req->tick_base;
-        sched.deadline = req->sched_deadline;
-        sched.timer_int = (uint32_t)(core->timer_hz / req->tick_hz);
-        sched.timer_frac = (uint32_t)((((uint64_t)core->timer_hz % req->tick_hz) << 32) / req->tick_hz);
-        sched.ns_int = (uint32_t)(req->tick_hz / 1000000000ull);
-        sched.ns_frac = (uint32_t)(((req->tick_hz % 1000000000ull) << 32) / 1000000000ull);
-        sched.front = -1;
-        sched.back = 0;
-        sched.arbiter = req->sched_arbiter;
-        sched.arb_next = 0;
-        for (unsigned i = 0; i < sched.count; i++) {
-            AzaharSchedThread *t = &sched_table[i];
-            t->saved = 0;
-            if (t->state == AZAHAR_SCHED_READY && t->order >= sched.back) {
-                sched.back = t->order + 1;
-            }
-            if (t->state == AZAHAR_SCHED_READY && t->order <= sched.front) {
-                sched.front = t->order - 1;
-            }
-            if (t->state == AZAHAR_SCHED_ARB && t->order >= sched.arb_next) {
-                sched.arb_next = t->order + 1;
-            }
-            if ((int)i != sched.current && t->state != AZAHAR_SCHED_RUNNING &&
-                ksceKernelCopyFromUser(&sched_ctx[i], t->ctx, sizeof(AzaharContext)) < 0) {
-                ret = AZAHAR_ERR_ARG;
-                goto out;
-            }
-        }
-    }
-
     if (azahar_folded) {
-        azahar_on_core = n;
         fold_run(n);
         ret = 0;
     } else if ((ret = core2_command(CMD_RUN, AZAHAR_RUN_WAIT_STEPS)) != 0) {
@@ -2235,6 +2383,164 @@ out:
     if (ret) {
         emit("  -> %d\n", ret);
     }
+    log_close();
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+// The kernel's L1 entries for [addr, addr + len) into the guest's table, for megabytes it leaves
+// invalid: the caller's own tables (TTBR0's global low gigabyte, its process's TTBR1 above), as
+// build_table's seal keeps what the mapping core touches. An invalid entry made valid needs no
+// TLB maintenance: translation faults are not cached (ARM ARM B3.10).
+static int keep_kernel_range(uint32_t addr, uint32_t len) {
+    const uint32_t *const low = find_kernel_page(rd_ttbr0() & 0xFFFFF000u);
+    const uint32_t ttbr1_pa = rd_ttbr1() & 0xFFFFC000u;
+    unsigned kept = 0;
+    for (uint32_t idx = addr >> 20; idx <= (addr + len - 1u) >> 20; idx++) {
+        if (azahar_l1[idx] & 3u) {
+            continue;
+        }
+        const uint32_t *const t =
+            idx < 1024u ? low : find_kernel_page(ttbr1_pa + (idx >> 10) * 0x1000u);
+        if (!t) {
+            emit("  keep %08x+%x: the kernel's table for l1[%03x] not found\n", addr, len, idx);
+            return AZAHAR_ERR_TABLE;
+        }
+        const uint32_t e = t[idx & 1023u];
+        if ((e & 3u) == 0) {
+            continue;
+        }
+        azahar_l1[idx] = e;
+        views_l1_set(idx);
+        kept++;
+    }
+    asm volatile("dsb ish" ::: "memory");
+    emit("  kept %u kernel megabyte(s) for %08x+%x\n", kept, addr, len);
+    return 0;
+}
+
+// A second emulation thread's core: the caller, pinned to the one core it runs on,
+// runs slices there from now on. Folded mode only. The caller's kernel stack joins the guest's
+// table (PL1 only), and the core proves the world switch once and measures its private timer,
+// as azaharMap does for the first core. Nothing here can check the pinning; azaharRun refuses a
+// core no one attached.
+static AzaharAttachRequest azahar_attach_req;
+
+int azaharAttach(const AzaharAttachRequest *user_req) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    log_open();
+    emit("== azaharAttach\n");
+    int ret = 0;
+    int locked = 0;
+    const unsigned n = this_core();
+
+    if (!azahar_folded || azahar_state != ST_MAPPED) {
+        ret = AZAHAR_ERR_STATE;
+        goto out;
+    }
+    if (ksceKernelCopyFromUser(&azahar_attach_req, user_req, sizeof(azahar_attach_req)) < 0 ||
+        azahar_attach_req.count > AZAHAR_ATTACH_OVERRIDES) {
+        ret = AZAHAR_ERR_ARG;
+        goto out;
+    }
+    for (unsigned r = 0; r < azahar_attach_req.count; r++) {
+        const AzaharRange *const rg = &azahar_attach_req.overrides[r];
+        if (((rg->guest_va | rg->user_va | rg->size) & 0xFFFu) || !rg->size ||
+            rg->guest_va + rg->size > 0x100000u || rg->guest_va + rg->size < rg->guest_va ||
+            (rg->guest_va < AZAHAR_USER_PAGE_VA + 0x1000u &&
+             rg->guest_va + rg->size > AZAHAR_USER_TIMER_VA)) {
+            emit("  override %u: guest %08x+%x user %08x refused\n", r, rg->guest_va, rg->size,
+                 rg->user_va);
+            ret = AZAHAR_ERR_ARG;
+            goto out;
+        }
+    }
+    if ((rd_contextidr() & 0xFFu) != azahar_asid) {
+        // The guest's translations carry the mapping process's ASID (tables_changed).
+        emit("  asid %02x is not the mapping process's %02x\n", rd_contextidr() & 0xFFu,
+             azahar_asid);
+        ret = AZAHAR_ERR_STATE;
+        goto out;
+    }
+    ksceKernelLockMutex(azahar_edit_mutex, 1, NULL);
+    locked = 1;
+    if (azahar_core[n].attached) {
+        // Another thread's core (azaharMap's, or another attach): this thread would run its
+        // slices in that core's view, not one of its own.
+        emit("  cpu%u is attached already\n", n);
+        ret = AZAHAR_ERR_STATE;
+        goto out;
+    }
+    uint32_t sp;
+    asm volatile("mov %0, sp" : "=r"(sp));
+    // The syscall stack's depth differs between this call and azaharRun: slack each way, as
+    // build_table keeps for the mapping thread.
+    if ((ret = keep_kernel_range(sp - 0x8000u, 0x10000u)) != 0) {
+        goto out;
+    }
+    // Its own view: the shared level-1 table's copy, its first megabyte its own.
+    if (n != (azahar_on_core & 3u)) {
+        AzaharView *const v = &azahar_view[n];
+        view_free(n);
+        if ((ret = alloc_block("azahar_view", 0x5000, 0x4000, &v->uid, &v->l1, &v->l1_pa)) != 0) {
+            v->l1 = 0;
+            goto out;
+        }
+        v->mb0 = v->l1 + AZAHAR_L1_ENTRIES;
+        v->mb0_pa = v->l1_pa + AZAHAR_L1_ENTRIES * 4u;
+        v->count = azahar_attach_req.count;
+        for (unsigned r = 0; r < v->count; r++) {
+            v->overrides[r] = azahar_attach_req.overrides[r];
+        }
+        for (unsigned i = 1; i < AZAHAR_L1_ENTRIES; i++) {
+            v->l1[i] = azahar_l1[i];
+        }
+        v->l1[0] = AZAHAR_COARSE((uint32_t)v->mb0_pa);
+        if ((ret = view_build_mb0(n)) != 0) {
+            view_free(n);
+            goto out;
+        }
+    }
+    core2_install(n);
+    core2_uninstall(n);
+    fold_measure_timer(n);
+    azahar_core[n].attached = 1;
+    azahar_attached_cores++;
+    asm volatile("dsb ish" ::: "memory");
+    emit("  cpu%u attached (%u cores), sp %08x, ttbcr %08x, private timer %u Hz\n", n,
+         azahar_attached_cores, sp, azahar_core[n].ttbcr_seen, azahar_core[n].timer_hz);
+
+out:
+    if (locked) {
+        ksceKernelUnlockMutex(azahar_edit_mutex, 1);
+    }
+    emit("  -> %d\n", ret);
+    log_close();
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+// The caller's core runs no more slices. Its stack stays in the table, PL1 only.
+int azaharDetach(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    log_open();
+    emit("== azaharDetach\n");
+    int ret = 0;
+    const unsigned n = this_core();
+    if (!azahar_folded || azahar_state != ST_MAPPED || !azahar_core[n].attached) {
+        ret = AZAHAR_ERR_STATE;
+        goto out;
+    }
+    ksceKernelLockMutex(azahar_edit_mutex, 1, NULL);
+    azahar_core[n].attached = 0;
+    azahar_attached_cores--;
+    view_free(n);
+    ksceKernelUnlockMutex(azahar_edit_mutex, 1);
+
+out:
+    emit("  -> %d\n", ret);
     log_close();
     EXIT_SYSCALL(state);
     return ret;
@@ -2371,7 +2677,9 @@ void azahar_vfp_reset(void) {
 // ctx: 1; else 0, the ordinary exit. Sealed: nothing of Sony's.
 
 uint32_t azahar_store_fast(AzaharContext *ctx, uint32_t pc) {
-    const AzaharStorePermits *const t = (const AzaharStorePermits *)(uintptr_t)azahar_store_va;
+    // ctx is the core's AzaharCpu (its first member): this core's permits.
+    const AzaharStorePermits *const t =
+        (const AzaharStorePermits *)(uintptr_t)((const AzaharCpu *)ctx)->fast.store_va;
     uint32_t dfsr, far, spsr;
     asm volatile("mrc p15, 0, %0, c5, c0, 0" : "=r"(dfsr));
     asm volatile("mrc p15, 0, %0, c6, c0, 0" : "=r"(far));
@@ -2498,61 +2806,8 @@ int azaharSyncUpper(uint32_t user_va) {
                 // install's TLBIALL drops whatever the old one left.
                 asm volatile("dsb" ::: "memory");
                 ksceKernelDcacheCleanRange((void *)&azahar_l1[idx], 4);
+                views_l1_set(idx);
                 ret = 1;
-            }
-        }
-    }
-    EXIT_SYSCALL(state);
-    return ret;
-}
-
-int azaharUpperDrift(int fix) {
-    uint32_t state;
-    ENTER_SYSCALL(state);
-    int ret = 0;
-    // The guest's table holds a copy of the process's level-1 entries for 0x40000000 up, made at
-    // azaharMap (and a megabyte at a time by azaharSyncUpper on a translation fault). Each entry
-    // that differs from the process's now: in the low 16 bits one the copy lacks (taken on its
-    // first fault), in the bits above one the copy holds otherwise (stale: a translation the
-    // process no longer makes), the first few printed. With `fix` both are taken over.
-    if (azahar_state != ST_MAPPED) {
-        ret = AZAHAR_ERR_STATE;
-    } else {
-        uint32_t missing = 0, stale = 0;
-        for (uint32_t pg = 1; pg < 4; pg++) {
-            SceUID uid = -1;
-            const volatile uint32_t *const t = reback_map_l1(pg << 30, 1024u, &uid);
-            if (!t) {
-                ret = AZAHAR_ERR_TABLE;
-                break;
-            }
-            for (uint32_t i = 0; i < 1024u; i++) {
-                const uint32_t idx = pg * 1024u + i;
-                const uint32_t e = t[i], g = azahar_l1[idx];
-                if (g == e) {
-                    continue;
-                }
-                if ((g & 3u) == 0) {
-                    missing++;
-                } else {
-                    if (stale < 4) {
-                        ksceKernelPrintf("[azaharnative] upper drift: %08x guest %08x process %08x\n",
-                                         idx << 20, g, e);
-                    }
-                    stale++;
-                }
-                if (fix) {
-                    azahar_l1[idx] = e;
-                }
-            }
-            ksceKernelFreeMemBlock(uid);
-        }
-        if (ret == 0) {
-            ret = (int)((stale << 16) | (missing & 0xFFFFu));
-            if (fix && (stale | missing) != 0) {
-                asm volatile("dsb" ::: "memory");
-                ksceKernelDcacheCleanRange((void *)&azahar_l1[1024], 3072u * 4u);
-                tables_changed(0);
             }
         }
     }
@@ -2696,8 +2951,10 @@ int azaharEdit(const AzaharEditRequest *user_req) {
         // memory and our TTBR0 keeps Sony's own walk attributes (core2_install takes the low
         // fourteen bits of the kernel's), so the table walker reads them coherently, the way
         // the kernel's own tables are read: it edits those constantly and cleans nothing.
-        // Cleaning the whole array on every call would be 256 KB of descriptors plus 16 KB of
-        // the top level, whatever the edit had touched.
+        // An attached core's first megabyte is its own copy of this one's.
+        if (rg->guest_va < 0x100000u) {
+            views_rebuild_mb0();
+        }
         // A map can bring different code to an address a core has executed at, and an unmap
         // is cheap enough not to argue about.
         tables_changed(op != AZAHAR_EDIT_PROTECT);

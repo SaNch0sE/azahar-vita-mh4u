@@ -63,6 +63,17 @@ public:
     /// those that waited before it; for a one-shot event with `token`, the signal itself.
     void ReceiveSignal(u32 seq, bool token);
 
+    /// Thread `thread`'s wait from host `from`'s list to host `to`'s (one emulation thread owning
+    /// both: the second one stopped).
+    void MoveWaiter(Thread* thread, u32 from, u32 to);
+
+    /// The state word and each host's waiters, for a thread dump.
+    [[nodiscard]] std::array<u32, 3> DebugState() const {
+        return {state.load(std::memory_order_relaxed),
+                waiter_count[0].load(std::memory_order_relaxed),
+                waiter_count[1].load(std::memory_order_relaxed)};
+    }
+
     std::shared_ptr<ResourceLimit> resource_limit;
 
 private:

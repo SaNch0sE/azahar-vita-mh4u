@@ -24,6 +24,12 @@ public:
     /// CallSVC without the perf stats' clock: the Vita native core's upcalls, which run the svc
     /// in the guest's world, where reading the clock is a syscall.
     void CallSVCForUpcall(u32 immediate);
+    /// The second emulation thread's svcs it answers itself (emu_host.h): the ones that touch
+    /// only its own cores' threads and events, which need no lock (Event's lists are each
+    /// host's). Every other svc it hands to host 0 (System::SecondHostSvc).
+    [[nodiscard]] bool LocalToSecondHost(u32 immediate);
+    /// CallSVC for those, with no HLE lock.
+    void CallSVCLocal(u32 immediate);
 
 private:
     std::unique_ptr<SVC> impl;

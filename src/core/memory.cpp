@@ -548,6 +548,7 @@ void MemorySystem::SetCurrentPageTable(const std::shared_ptr<PageTable>& page_ta
         impl->mapping_observer->OnPageTableChanged();
         if (page_table != nullptr) {
             NotifyMappingObserver(*page_table, 0, PAGE_TABLE_NUM_ENTRIES);
+            impl->mapping_observer->OnMirroring(*page_table);
         }
     }
 }
@@ -750,6 +751,7 @@ void MemorySystem::SyncMappingObserver(PageTable& page_table) {
     }
     impl->mapping_observer->OnPageTableChanged();
     NotifyMappingObserver(page_table, 0, PAGE_TABLE_NUM_ENTRIES);
+    impl->mapping_observer->OnMirroring(page_table);
 }
 
 void MemorySystem::RefreshMappingObserver() {
@@ -759,6 +761,7 @@ void MemorySystem::RefreshMappingObserver() {
     impl->mapping_observer->OnPageTableChanged();
     if (impl->current_page_table != nullptr) {
         NotifyMappingObserver(*impl->current_page_table, 0, PAGE_TABLE_NUM_ENTRIES);
+        impl->mapping_observer->OnMirroring(*impl->current_page_table);
     }
 }
 
@@ -767,6 +770,7 @@ void MemorySystem::SetMappingObserver(MappingObserver* observer) {
     if (observer != nullptr && impl->current_page_table != nullptr) {
         observer->OnPageTableChanged();
         NotifyMappingObserver(*impl->current_page_table, 0, PAGE_TABLE_NUM_ENTRIES);
+        observer->OnMirroring(*impl->current_page_table);
     }
 }
 

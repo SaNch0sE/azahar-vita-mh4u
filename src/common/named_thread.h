@@ -21,6 +21,10 @@ namespace Common {
 struct ThreadCfg {
     const char* name;
     std::size_t stack_size = 1024 * 1024;
+    /// The Vita: the cores the thread may begin on, a bit per core (RoleCoreMask); 0 for any.
+    /// SetCurrentThreadRole's pin need not move the thread before its next reschedule, so one
+    /// whose first steps belong to its core is created there.
+    int cores = 0;
 };
 
 #ifdef __vita__

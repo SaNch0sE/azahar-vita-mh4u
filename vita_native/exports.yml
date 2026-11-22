@@ -32,6 +32,8 @@ azaharnative:
         - sgxdReadRegs: 0x3C1A7E18
         - sgxdTranslate: 0x3C1A7E19
         - sgxdEvents: 0x3C1A7E1A
+        - azaharAttach: 0x3C1A7E20
+        - azaharDetach: 0x3C1A7E21
         - azaharCycleCounter: 0x3C1A7E22
         - sgxdKick: 0x3C1A7E24
         - sgxdWaker: 0x3C1A7E25

@@ -162,10 +162,11 @@ void Event::WakeHostWaiters(u32 host, u32 seq, bool token) {
         thread->wait_objects.clear();
         thread->ResumeFromWait();
     }
-    // A one-shot signal handed over for a waiter that left meanwhile (its timeout): nothing has
-    // shown it yet.
-    ASSERT_MSG(!token, "event {}: the other host's signal found no waiter on host {}", name,
-               host);
+    // A one-shot signal handed over for a waiter that left meanwhile (its timeout): signalled again
+    // here, as a signal just after the timeout is.
+    if (token) {
+        Signal();
+    }
 }
 
 void Event::Signal() {
@@ -213,6 +214,23 @@ void Event::ReceiveSignal(u32 seq, bool token) {
     if (host == 0 && hle_notifier) {
         hle_notifier();
     }
+}
+
+void Event::MoveWaiter(Thread* thread, u32 from, u32 to) {
+    auto& src = Waiters(from);
+    const auto it = std::find_if(src.begin(), src.end(),
+                                 [thread](const auto& p) { return p.get() == thread; });
+    if (it == src.end()) {
+        return;
+    }
+    const std::size_t i = static_cast<std::size_t>(it - src.begin());
+    Waiters(to).push_back(std::move(*it));
+    marks[to].push_back(marks[from][i]);
+    marks[from].erase(marks[from].begin() + i);
+    src.erase(src.begin() + i);
+    waiter_count[from].fetch_sub(1, std::memory_order_relaxed);
+    waiter_count[to].fetch_add(1, std::memory_order_relaxed);
+    thread->wait_host = static_cast<u8>(to);
 }
 
 void Event::Clear() {

@@ -250,6 +250,10 @@ bool GPU::GuestAbort([[maybe_unused]] const u8* host, [[maybe_unused]] bool writ
     return impl->render->PageFault(host, write, guest_pc, guest_va);
 }
 
+bool GPU::GuestAccessOpen(const u8* host, bool write) {
+    return impl->render->AccessOpenAfterFlush(host, write);
+}
+
 #ifdef VITA_DIAGNOSTICS
 void GPU::CheckHoldsSent(const char* where) {
     impl->render->CheckHoldsSent(where);

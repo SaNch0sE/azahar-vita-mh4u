@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <string>
@@ -42,15 +43,13 @@ public:
     void OnMapped(VAddr base, u32 size, MemoryRef target) override;
     void OnUnmapped(VAddr base, u32 size) override;
     void OnPageTableChanged() override;
+    void OnMirroring(const Memory::PageTable& page_table) override;
 
     /// Installs the table on the taken core with everything recorded so far. Idempotent.
     bool Install();
 
     const void* MirroredTable() const {
         return mirrored;
-    }
-    void SetMirroredTable(const void* table) {
-        mirrored = table;
     }
     bool IsInstalled() const {
         return installed;
@@ -60,6 +59,8 @@ public:
     /// core's instruction cache.
     void SyncCode(VAddr base, u32 size);
     void SyncAllCode();
+    /// SyncCode for app memory another core's view maps at `guest`: whole pages.
+    void SyncViewCode(const u8* host, VAddr guest, u32 size) const;
 
     /// Highest guest address the module's table can hold, exclusive.
     static constexpr u32 GuestEnd = 0x40000000;
@@ -91,6 +92,7 @@ private:
     const void* mirrored{};
     /// Guest ranges mapped (or recorded for the install), by guest base, disjoint.
     std::map<VAddr, Mapping> live_mappings;
+    std::set<VAddr> announced;
     VAddr extra_base{};
     Mapping extra{};
 };
@@ -229,6 +231,9 @@ public:
     /// Puts back every instruction PatchVfp and PatchSvc replaced, after every thread left its
     /// thunk: the state holds the guest's own code.
     void PrepareSaveState() override;
+    /// Every thread of cores `first_core` on standing in a thunk leaves it (through host 1's thunks
+    /// when `host1_ran`).
+    void LeaveThunks(u32 first_core, bool host1_ran);
 
     /// An upcall: svc `svc` answered from the guest's world by the HLE handler with r0-r7 from `in`.
     /// Returns the result (r0) and the thunk's UpcallStatus.
@@ -241,6 +246,24 @@ public:
         return false;
     }
 
+    /// Whether the guest's table is in (the first core's first slice); host 1's view is made from it.
+    [[nodiscard]] bool GuestTableInstalled() const {
+        return map != nullptr && map->IsInstalled();
+    }
+    /// From host 0, before the second thread starts: its thunk area made, threads out of host 0's
+    /// thunks.
+    void PrepareSecondHost();
+    /// From the second thread, pinned to its core: the core joins the guest, and leaves it.
+    static bool AttachSecondHost();
+    static void DetachSecondHost();
+    /// Host 0 runs svc `immediate` of this core for the second thread, as an upcall of it would.
+    void CallForwardedSvc(u32 immediate);
+    /// Host 0 takes this core's permission fault for the second thread, as its own (TakeHeldPage),
+    /// or as one that raced a hold's release: forward_raced then.
+    bool TakeForwardedHeldPage();
+    /// TakeForwardedHeldPage's last answer was a raced release: the access runs again.
+    bool forward_raced = false;
+
 protected:
     std::shared_ptr<Memory::PageTable> GetPageTable() const override;
 
@@ -249,6 +272,14 @@ private:
     /// stop for now.
     bool RunSlice(u64 quantum_ns);
     bool RunSliceOnce(u64 quantum_ns);
+    /// RunSliceOnce on the second emulation thread: no upcalls, store permits or in-kernel
+    /// scheduling, nothing patched; svcs to System::SecondHostSvc.
+    bool RunSliceSecond(u64 quantum_ns);
+    /// Host 1 ran into one of its thunks it has not built yet: built from host 0's claim.
+    void BuildHost1Thunk();
+    /// Whether host 0 patched this svc exit's site after this core fetched its svc: the module read
+    /// the number from the branch now there. The PC goes back to the site, which runs again.
+    bool SvcSitePatched();
     /// A Thumb thread's resume PC past a patched svc site's moved instruction.
     u32 PastPatchedThumbSvc(u32 pc);
     void ReportFault();
@@ -293,6 +324,8 @@ private:
     static constexpr u32 AccessesPerHold = 32;
     std::array<HoldBudget, 4> hold_budgets{};
     u32 hold_budget_next{};
+    /// The access TakeForwardedHeldPage let run again after a raced release.
+    u32 raced_far{}, raced_pc{};
     bool TakeHoldBudget(u32 page, u32 ticket);
     /// The most bytes the instruction at `pc` may touch from its faulting address on: 8 for a single
     /// access, 128 for a block.
@@ -332,6 +365,8 @@ private:
     std::atomic<bool> stop_requested{};
     /// The slice ended inside an upcall: RunSlice runs the thread on.
     bool upcall_again{};
+    /// Host 1's slice ended inside a mutex thunk: RunSlice runs the thread on until it is out.
+    bool host1_in_thunk{};
 #ifdef VITA_DIAGNOSTICS
     /// This round of RunSlice goes on inside an upcall the last one left held.
     bool upcall_held{};

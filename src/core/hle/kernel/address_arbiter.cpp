@@ -184,7 +184,7 @@ Result AddressArbiter::ArbitrateAddress(std::shared_ptr<Thread> thread, Arbitrat
         // than official kernel as the affected FMV threads dont meet the priority threshold of 50.
         // TODO: Revisit this when scheduler is rewritten and adjust if there isn't a problem there.
         if (num_threads == 0 && thread->current_priority >= 49) {
-            kernel.current_cpu->GetTimer().AddTicks(1614u);
+            kernel.CurrentCPU()->GetTimer().AddTicks(1614u);
         }
         break;
     }

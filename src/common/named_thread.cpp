@@ -129,7 +129,8 @@ int NamedThread::Trampoline(unsigned int args, void* argp) {
 void NamedThread::Launch(const ThreadCfg& cfg, std::function<void()> f) {
     auto* c = new Ctrl{std::move(f)};
     uid = sceKernelCreateThread(cfg.name, &Trampoline, 0x10000100,
-                                static_cast<SceSize>(cfg.stack_size), 0, 0, nullptr);
+                                static_cast<SceSize>(cfg.stack_size), 0,
+                                SCE_KERNEL_CPU_MASK_USER_0 * cfg.cores, nullptr);
     // A thread that never runs leaves whoever waits on it waiting for good. The stack comes out
     // of the game
     // partition, which a launch can find too short.

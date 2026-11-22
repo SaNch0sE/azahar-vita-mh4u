@@ -552,6 +552,125 @@ void ResetLeases() {
     LeaseProcess() = NoLeaseProcess;
 }
 
+/// Host 1's own thunk area: host 1 builds each thunk host 0 published (ClaimThunk) the first time
+/// it runs into it; until then the place traps.
+constexpr u32 Host1ThunkSize = ThreadIdsOffset & ~0xFFFu;
+constexpr u32 ThunkTrapSvc = 0xF9;
+constexpr u32 ThunkTrapArm = 0xEF000000u | ThunkTrapSvc;
+constexpr u16 ThunkTrapThumb = 0xDF00u | ThunkTrapSvc;
+std::unique_ptr<Common::HostSharedMemory> host1_area;
+/// Host 1's area holds thunks of a guest or area that is gone: reset before the next thunk.
+bool host1_area_stale = true;
+/// Host 1 ran in this area since its reset (PrepareSaveState).
+bool host1_area_used = false;
+/// A thunk's site: its entry, the site, the instruction(s) the branch replaced (Thumb's halfwords
+/// high first, PatchedSite's), whether Thumb, and what host 1 builds: the svc or VFP instruction
+/// and a branch back, or a mutex svc's lock or unlock on the shared leases first (MutexFastPath,
+/// its entry 20 bytes into the room).
+enum class ClaimKind : u8 { Svc, Vfp, Mutex };
+struct ThunkClaim {
+    u32 entry;
+    u32 site;
+    u32 insn;
+    bool thumb;
+    ClaimKind kind;
+};
+constexpr u32 MaxThunkClaims = 8192;
+/// By entry, ascending (ThunkRoom's addresses rise); `thunk_claims` of them published.
+std::array<ThunkClaim, MaxThunkClaims> thunk_claim;
+std::atomic<u32> thunk_claims{};
+
+/// Host 1's area: traps throughout, out to memory for its instruction fetches.
+void ResetHost1Area(const VitaGuestMap& map) {
+    thunk_claims.store(0, std::memory_order_relaxed);
+    if (!host1_area) {
+        host1_area = std::make_unique<Common::HostSharedMemory>(Host1ThunkSize, "azahar-thunks-1");
+        ASSERT_MSG(host1_area->Data() != nullptr &&
+                       (reinterpret_cast<uintptr_t>(host1_area->Data()) & 0xFFFu) == 0,
+                   "host 1's thunk area's {} KiB", Host1ThunkSize >> 10);
+    }
+    u32* const words = reinterpret_cast<u32*>(host1_area->Data());
+    std::fill(words, words + Host1ThunkSize / 4, ThunkTrapArm);
+    map.SyncViewCode(host1_area->Data(), ThunkAreaBase, Host1ThunkSize);
+    host1_area_used = false;
+}
+
+/// Host 0 publishes a thunk before branching its site to it; a Thumb thunk's trap goes in now.
+void ClaimThunk(const VitaGuestMap& map, u32 entry, u32 site, u32 insn, bool thumb,
+                ClaimKind kind) {
+    const u32 n = thunk_claims.load(std::memory_order_relaxed);
+    ASSERT_MSG(n < MaxThunkClaims, "{} thunk claims", n);
+    DEBUG_ASSERT(n == 0 || thunk_claim[n - 1].entry < entry);
+    thunk_claim[n] = ThunkClaim{entry, site, insn, thumb, kind};
+    if (thumb) {
+        const u32 off = entry - ThunkAreaBase;
+        std::memcpy(host1_area->Data() + off, &ThunkTrapThumb, 2);
+        map.SyncViewCode(host1_area->Data() + (off & ~0xFFFu), ThunkAreaBase + (off & ~0xFFFu),
+                         0x1000);
+    }
+    thunk_claims.store(n + 1, std::memory_order_release);
+}
+
+std::optional<std::vector<u32>> MutexFastPath(u32 svc, u32 base, u32 resume);
+std::optional<u32> ArmBranch(u32 cond, u32 from, u32 to);
+
+/// Host 1's version of a mutex claim: the lock or unlock on the lease, then its svc (at
+/// `svc_at`) and the branch back, from the room's start (`base`).
+struct Host1Mutex {
+    u32 base;
+    u32 svc_at;
+    std::vector<u32> words;
+};
+Host1Mutex Host1MutexThunk(const ThunkClaim& c) {
+    const u32 base = c.entry - 20;
+    const u32 number = c.insn & 0x00FFFFFFu;
+    auto words = MutexFastPath(number, base, c.site + 4);
+    ASSERT(words.has_value());
+    const u32 svc_at = base + static_cast<u32>(words->size()) * 4;
+    words->push_back(0xEF000000u | number);
+    words->push_back(*ArmBranch(0xE, svc_at + 4, c.site + 4));
+    return Host1Mutex{base, svc_at, std::move(*words)};
+}
+
+/// The claim whose thunk holds `pc` in host 1's version, or nullptr.
+const ThunkClaim* Host1ClaimAt(u32 pc) {
+    const u32 n = thunk_claims.load(std::memory_order_acquire);
+    const auto it = std::upper_bound(thunk_claim.begin(), thunk_claim.begin() + n, pc,
+                                     [](u32 v, const ThunkClaim& c) { return v < c.entry; });
+    if (it == thunk_claim.begin()) {
+        return nullptr;
+    }
+    const ThunkClaim& c = *std::prev(it);
+    const u32 end = c.kind == ClaimKind::Mutex ? Host1MutexThunk(c).svc_at + 8 : c.entry + 8;
+    return pc < end ? &c : nullptr;
+}
+
+/// Host 1's version of a claim's thunk, in host 1's area at the claim's entry.
+void WriteHost1Thunk(const ThunkClaim& claim, const VitaGuestMap& map);
+
+/// Whether host 1's thread at `pc` is in a mutex thunk before its svc, its registers in the
+/// thunk's shared slots.
+bool InHost1MutexSlots(u32 pc) {
+    if (!InThunkArea(pc)) {
+        return false;
+    }
+    const ThunkClaim* const c = Host1ClaimAt(pc);
+    return c != nullptr && c->kind == ClaimKind::Mutex && pc < Host1MutexThunk(*c).svc_at;
+}
+
+/// Where host 1's thread at `pc` in its own thunk stands in the guest's code.
+u32 Host1ThunkReturn(u32 pc) {
+    const ThunkClaim* const c = Host1ClaimAt(pc);
+    ASSERT_MSG(c != nullptr, "a thread at {:08X} in host 1's thunk area outside a thunk", pc);
+    if (c->kind == ClaimKind::Mutex) {
+        const u32 svc_at = Host1MutexThunk(*c).svc_at;
+        ASSERT_MSG(pc == svc_at || pc == svc_at + 4,
+                   "a thread at {:08X} inside host 1's mutex thunk for {:08X}", pc, c->site);
+        return pc == svc_at ? c->site : c->site + 4;
+    }
+    return c->site + (pc - c->entry);
+}
+
 void LeaseClosed(Kernel::Mutex& mutex, Kernel::Handle handle) {
     LeaseEntry& entry = LeaseEntries()[handle >> 15];
     if (entry.handle == handle) {
@@ -622,7 +741,9 @@ void LeaseMutex(Kernel::KernelSystem& kernel, u32 handle) {
     if (entry.handle != 0) {
         lease_entry_of[(entry.word - ThunkAreaBase - LeaseWordsOffset) / 4] = 0;
     }
-    entry = {handle, ThunkAreaBase + LeaseWordsOffset + i * 4};
+    // The word before the handle: host 1's thunks read the handle first.
+    std::atomic_ref<u32>(entry.word).store(ThunkAreaBase + LeaseWordsOffset + i * 4);
+    std::atomic_ref<u32>(entry.handle).store(handle, std::memory_order_release);
     lease_entry_of[i] = static_cast<u16>(slot + 1);
 }
 
@@ -676,6 +797,7 @@ void ForgetThunks(const VitaGuestMap* map) {
         upcall_redirect.entry = 0;
         thunk_area_used = 0;
         thunk_area_map = nullptr;
+        host1_area_stale = true;
     }
 }
 
@@ -1080,6 +1202,10 @@ VitaGuestMap::~VitaGuestMap() {
 
 bool VitaGuestMap::Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) const {
     ClearStorePermits();
+    // The guest's memory svcs run on host 0.
+    DEBUG_ASSERT_MSG(op == AZAHAR_EDIT_SYNC_CODE || Core::ThisHost() == 0,
+                     "azaharEdit op {} of {:#010x}+{:#x} on the second emulation thread", op,
+                     guest_va, size);
     AzaharEditRequest req{};
     req.op = op;
     req.range = AzaharRange{user_va, guest_va, size, perm};
@@ -1119,6 +1245,7 @@ void VitaGuestMap::OnMapped(VAddr base, u32 size, MemoryRef target) {
     }
 
     const Mapping wanted{size, host};
+    announced.insert(base);
     const auto existing = live_mappings.find(base);
     if (existing != live_mappings.end() && existing->second == wanted) {
         return;
@@ -1206,13 +1333,24 @@ void VitaGuestMap::ForgetRange(VAddr base, u32 size, bool unmap) {
 }
 
 void VitaGuestMap::OnPageTableChanged() {
+    // Nothing unmapped here: the ranges are announced again and OnMirroring unmaps those that did not
+    // come back. Unmapping first would leave a gap the other thread's guest fetches code from.
     mirrored = nullptr;
-    if (installed) {
-        for (const auto& [base, mapping] : live_mappings) {
-            Edit(AZAHAR_EDIT_UNMAP, 0, base, mapping.size, 0);
+    announced.clear();
+}
+
+void VitaGuestMap::OnMirroring(const Memory::PageTable& page_table) {
+    std::vector<std::pair<VAddr, u32>> gone;
+    for (const auto& [base, mapping] : live_mappings) {
+        if (!announced.contains(base)) {
+            gone.emplace_back(base, mapping.size);
         }
     }
-    live_mappings.clear();
+    for (const auto& [base, size] : gone) {
+        ForgetRange(base, size, installed);
+    }
+    announced.clear();
+    mirrored = &page_table;
 }
 
 bool VitaGuestMap::Install() {
@@ -1273,6 +1411,15 @@ void VitaGuestMap::SyncCode(VAddr base, u32 size) {
                  hi - lo, 0);
         }
     }
+}
+
+void VitaGuestMap::SyncViewCode(const u8* host, VAddr guest, u32 size) const {
+    if (!installed) {
+        return;
+    }
+    const bool synced = Edit(AZAHAR_EDIT_SYNC_CODE, reinterpret_cast<u32>(host), guest, size, 0);
+    ASSERT_MSG(synced, "the code at {:08X}+{:#x} of another core's view was not synced", guest,
+               size);
 }
 
 void VitaGuestMap::MapExtra(VAddr base, u32 size, u8* host) {
@@ -1596,6 +1743,7 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
     map->SyncCode(base, size);
     thunk_area_used += (size + 3) & ~3u;
     vfp_thunks[base] = t;
+    ClaimThunk(*map, base, pc, insn, thumb, ClaimKind::Vfp);
     if (thumb) {
         memory.Write16(pc, site_hw[0]);
         memory.Write16(pc + 2, site_hw[1]);
@@ -1621,7 +1769,12 @@ std::optional<u32> ARM_VitaNative::ThunkRoom(u32 size) {
         map->MapExtra(ThunkAreaBase, ThunkAreaSize, thunk_area->Data());
         thunk_area_map = map.get();
     }
-    if (thunk_area_used + size > LeaseTableOffset) {
+    if (host1_area_stale) {
+        ResetHost1Area(*map);
+        host1_area_stale = false;
+    }
+    // Host 1's view ends at the thread IDs' and leases' pages (Host1ThunkSize).
+    if (thunk_area_used + size > Host1ThunkSize) {
         return std::nullopt;
     }
     return ThunkAreaBase + thunk_area_used;
@@ -1911,6 +2064,7 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
     if (kind == AZAHAR_FAST_TICK) {
         tick_thunks.push_back(TickThunk{base, pc, t.data});
     }
+    ClaimThunk(*map, base, pc, insn, false, ClaimKind::Svc);
     memory.Write32(pc, *site);
     map->SyncCode(pc, 4);
     patched_sites[pc] = PatchedSite{insn, false};
@@ -2043,7 +2197,16 @@ std::optional<std::vector<u32>> MutexFastPath(u32 svc, u32 base, u32 resume) {
     w.push_back(0xE5912000u); // ldr r2, [r1]: the entry's handle
     w.push_back(0xE1520000u); // cmp r2, r0
     branch(0x1, Slow);        // bne
+    // The word's address made to depend on the handle read: host 0 publishes the word before
+    // the handle (LeaseMutex), and a branch alone does not keep this thread's two loads in that
+    // order (host 1 reads while host 0 writes).
+    w.push_back(0xE022C002u); // eor r12, r2, r2
+    w.push_back(0xE081100Cu); // add r1, r1, r12
     w.push_back(0xE5911004u); // ldr r1, [r1, #4]: the lease word
+    // 0: the entry cleared after its handle was read (LeaseClosed, LeaseFreed from host 0 while
+    // host 1 runs a lock through the same handle): the svc answers for the handle as it is now.
+    w.push_back(0xE3510000u); // cmp r1, #0
+    branch(0x0, Slow);        // beq
     static_assert(offsetof(AzaharUserPage, thread_id) == 0x1c);
     w.push_back(0xE593301Cu); // ldr r3, [r3, #0x1c]: the running thread's ID
     labels[Retry] = w.size();
@@ -2359,6 +2522,7 @@ void ARM_VitaNative::PatchUpcall(u32 pc, bool thumb) {
     map->SyncCode(base, bytes);
     thunk_area_used += bytes;
     upcall_thunks[base] = UpcallThunk{pc, base + bytes, base + bytes};
+    ClaimThunk(*map, in, pc, insn, false, fast ? ClaimKind::Mutex : ClaimKind::Svc);
     memory.Write32(pc, *site);
     map->SyncCode(pc, 4);
     patched_sites[pc] = PatchedSite{insn, false};
@@ -2441,6 +2605,7 @@ void ARM_VitaNative::PatchUpcallThumb(u32 pc) {
     map->SyncCode(base, static_cast<u32>(stub.size()));
     thunk_area_used += (static_cast<u32>(stub.size()) + 3) & ~3u;
     upcall_thunks[base] = UpcallThunk{pc, base + static_cast<u32>(stub.size()), moved};
+    ClaimThunk(*map, base, pc, u32{svc} << 16 | next, true, ClaimKind::Svc);
     memory.Write16(pc, (*site)[0]);
     memory.Write16(pc + 2, (*site)[1]);
     map->SyncCode(pc, 4);
@@ -2582,6 +2747,21 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
     std::memcpy(&out.fpu_registers[16], UpcallVfpSave(), 64);
     out.fpscr = UpcallGuestFpscr();
     exited.reset();
+    // With the second emulation thread an idle is RunLoop's (System::HostIdle), unless it sleeps with
+    // nothing due before this core's next event.
+    const bool multi = Core::multi_host.load(std::memory_order_relaxed);
+    const auto own_next = [&] {
+        return slice_timer.GetTicks() +
+               static_cast<u64>(std::max<s64>(slice_timer.GetMaxSliceLength(), 0));
+    };
+    if (idle && multi && !upcall_system->SecondHostQuiet(own_next())) {
+        ResumeUpcallClock(slice_timer, MinQuantumNs);
+#ifdef VITA_DIAGNOSTICS
+        census.upcall_idle_exits++;
+        census.upcall_idle_exit_why[upcall_system->SecondHostBusyWhy(own_next())]++;
+#endif
+        return UpcallAnswer(regs[0], UpcallReschedule);
+    }
     if (idle) {
         // No thread to run: the guest idles here with no exit. Every core's timer moves on together,
         // event by event, until a thread of this core's is ready; another core with work, or an HLE host
@@ -2594,6 +2774,9 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
         const u32 cores = upcall_system->GetNumCores();
         const Core::TimingEventType* const vblank = upcall_system->GPU().VBlankEventType();
         const auto others_busy = [&] {
+            if (multi) {
+                return !upcall_system->SecondHostQuiet(own_next());
+            }
             std::scoped_lock others_lock{kernel.GetHLELock()};
             for (u32 c = 0; c < cores; c++) {
                 if (c == self) {
@@ -2648,7 +2831,7 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
             // Where every core goes next: this core's next event, or another's if sooner.
             u64 to = timer.GetTicks() + static_cast<u64>(std::max<s64>(timer.GetDowncount(), 0));
             for (u32 c = 0; c < cores; c++) {
-                if (c != self) {
+                if (c != self && !multi) {
                     const auto& other = upcall_system->GetCore(c).GetTimer();
                     to = std::min(to,
                                   other.GetTicks() + static_cast<u64>(other.GetMaxSliceLength()));
@@ -2656,6 +2839,9 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
             }
             // The vblank is RunLoop's: its many Sony syscalls would each be an exit from here.
             for (u32 c = 0; c < cores; c++) {
+                if (multi && c != self) {
+                    continue; // the second thread's timers are its own
+                }
                 const auto& t = upcall_system->GetCore(c).GetTimer();
                 if (t.NextEventType() == vblank &&
                     t.GetTicks() + static_cast<u64>(t.GetMaxSliceLength()) <= to) {
@@ -2677,6 +2863,9 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
             timer.Advance();
             // The other cores to the same time, their events their own.
             for (u32 c = 0; c < cores; c++) {
+                if (multi) {
+                    break; // the second thread's cores follow on their own (HostIdle)
+                }
                 auto& other = upcall_system->GetCore(c).GetTimer();
                 if (c == self || other.GetTicks() >= to) {
                     continue;
@@ -2691,6 +2880,9 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
             upcall_system->GPU().GuestIdle();
 #endif
             upcall_system->SelectCore(self);
+            if (multi) {
+                upcall_system->PublishClock(0);
+            }
             lock.lock();
             next = threads.SwitchForNative();
             DEBUG_ASSERT_MSG(next != nullptr || !threads.HaveReadyThreads(),
@@ -2746,7 +2938,9 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
 
 u32 ARM_VitaNative::FetchCode(u32 pc, bool thumb) const {
     if (InThunkArea(pc) && thunk_area) {
-        const u8* const p = thunk_area->Data() + (pc - ThunkAreaBase);
+        // Host 1 runs its own thunks there.
+        const bool own = Core::ThisHost() == 1 && pc - ThunkAreaBase < Host1ThunkSize;
+        const u8* const p = (own ? host1_area : thunk_area)->Data() + (pc - ThunkAreaBase);
         if (thumb) {
             u16 hw[2];
             std::memcpy(hw, p, 4);
@@ -2759,13 +2953,21 @@ u32 ARM_VitaNative::FetchCode(u32 pc, bool thumb) const {
     return thumb ? u32{memory.Read16(pc)} << 16 | memory.Read16(pc + 2) : memory.Read32(pc);
 }
 
-void ARM_VitaNative::PrepareSaveState() {
-    if (patched_sites.empty()) {
-        return;
-    }
-    // Every thread that stands in a thunk leaves it (FinishVfpThunk): each core's running one,
-    // through the core, and every other one through its saved context.
-    for (u32 i = 0; i < system.GetNumCores(); i++) {
+void ARM_VitaNative::LeaveThunks(u32 first_core, bool host1_ran) {
+    // Each core's running thread through the core, the others through their saved contexts; in host
+    // 1's own thunks once it ran there, else host 0's.
+    const auto finish = [&](u32 core_id, AzaharContext& c) {
+        const u32 pc = c.r[15];
+        const bool host1 = core_id != 0 && host1_ran;
+        if (host1) {
+            c.r[15] = Host1ThunkReturn(c.r[15]);
+        } else {
+            FinishThunk(memory, c);
+        }
+        LOG_INFO(Core_ARM11, "thunks: core {} left a thunk at {:08X} for {:08X} ({})", core_id, pc,
+                 c.r[15], host1 ? "host 1's" : "host 0's");
+    };
+    for (u32 i = first_core; i < system.GetNumCores(); i++) {
         ARM_Interface& core = system.GetCore(i);
         if (!InThunkArea(core.GetPC())) {
             continue;
@@ -2774,12 +2976,12 @@ void ARM_VitaNative::PrepareSaveState() {
         core.SaveContext(t);
         AzaharContext c{};
         ToAzahar(t, c);
-        FinishThunk(memory, c);
+        finish(i, c);
         FromAzahar(c, t);
         core.LoadContext(t);
     }
     auto& kernel = system.Kernel();
-    for (u32 i = 0; i < system.GetNumCores(); i++) {
+    for (u32 i = first_core; i < system.GetNumCores(); i++) {
         auto& manager = kernel.GetThreadManager(i);
         const Kernel::Thread* const running = manager.GetCurrentThread();
         for (const auto& thread : manager.GetThreadList()) {
@@ -2788,10 +2990,18 @@ void ARM_VitaNative::PrepareSaveState() {
             }
             AzaharContext c{};
             ToAzahar(thread->context, c);
-            FinishThunk(memory, c);
+            finish(i, c);
             FromAzahar(c, thread->context);
         }
     }
+}
+
+void ARM_VitaNative::PrepareSaveState() {
+    if (patched_sites.empty()) {
+        return;
+    }
+    // Every thread that stands in a thunk leaves it.
+    LeaveThunks(0, host1_area_used);
     // The guest's own instructions back; each traps and is patched again at its next run.
     for (const auto& [pc, site] : patched_sites) {
         if (site.thumb) {
@@ -2814,9 +3024,22 @@ void ARM_VitaNative::PrepareSaveState() {
     upcall_body = upcall_after_svc = 0;
     upcall_redirect.entry = 0;
     thunk_area_used = 0;
+    host1_area_stale = true;
 }
 
 bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
+    if (Core::ThisHost() == 1) {
+        // A thread stopped in a mutex thunk runs on until it is out: another thread through the same
+        // site would overwrite the registers the thunk keeps in its slots.
+        for (;;) {
+            host1_in_thunk = false;
+            const bool go_on = RunSliceSecond(quantum_ns);
+            if (!host1_in_thunk) {
+                return go_on;
+            }
+            quantum_ns = MinQuantumNs;
+        }
+    }
     // A slice that ended inside an upcall runs the same thread on at once, a minimal quantum at a
     // time, until it is back in its own code (RunSliceOnce sets upcall_again).
     for (;;) {
@@ -3145,6 +3368,286 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
             if (ran > 0) {
                 // The patched instructions past the guest's instruction cache.
                 map->SyncCode(run.ctx.r[15], pc - run.ctx.r[15]);
+                run.ctx.r[15] = pc;
+                return !break_flag && !stop_requested;
+            }
+        }
+        ReportFault();
+        return false;
+    }
+    case AZAHAR_EXIT_PABT:
+    default:
+        ReportFault();
+        return false;
+    }
+}
+
+void ARM_VitaNative::PrepareSecondHost() {
+    ASSERT(GuestTableInstalled());
+    ThunkRoom(0); // the areas, host 1's reset if it is stale
+    // The other cores ran on host 0 until now (after a state load): a thread stopped in one of host
+    // 0's thunks leaves it, since host 1's view has its own area at those addresses.
+    if (!patched_sites.empty()) {
+        LeaveThunks(1, false);
+    }
+}
+
+bool ARM_VitaNative::AttachSecondHost() {
+    ASSERT(host1_area && !host1_area_stale);
+    AzaharAttachRequest req{};
+    req.count = 1;
+    // RWX as host 0's: a mutex thunk keeps the guest's registers in it.
+    req.overrides[0] = AzaharRange{reinterpret_cast<u32>(host1_area->Data()), ThunkAreaBase,
+                                   Host1ThunkSize, GuestPerm};
+    const int ret = azaharAttach(&req);
+    if (ret < 0) {
+        LOG_CRITICAL(Core_ARM11, "azaharAttach failed: {:#010x}", static_cast<u32>(ret));
+        return false;
+    }
+    host1_area_used = true;
+    LOG_INFO(Core_ARM11, "second host: attached on Vita core {}", sceKernelGetCpuId());
+    return true;
+}
+
+void ARM_VitaNative::CallForwardedSvc(u32 immediate) {
+    // Patched as host 0's svc exits patch theirs; host 1 builds its own thunk there when it next runs it.
+    if (UpcallFor(immediate)) {
+        const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
+        if (!thumb) {
+            PatchUpcall(run.ctx.r[15] - 4, false);
+        } else if ((run.ctx.cpsr & 0x0600FC00u) == 0) {
+            PatchUpcall(run.ctx.r[15] - 2, true);
+            run.ctx.r[15] = PastPatchedThumbSvc(run.ctx.r[15]);
+        }
+    }
+    if (immediate == 0x14 || immediate == 0x24) {
+        // No HLE lock: host 1 waits meanwhile, and nothing else touches the leases.
+        LeaseMutex(system.Kernel(), run.ctx.r[0]);
+    }
+    svc_context.CallSVC(immediate);
+}
+
+bool ARM_VitaNative::TakeForwardedHeldPage() {
+    const bool write = (run.fsr & (1u << 11)) != 0;
+    forward_raced = false;
+    if (TakeHeldPage(run.far, write, run.ctx.r[15])) {
+        return true;
+    }
+    // The holds' record opens a page before its descriptor does: an access between the two aborts on
+    // a page the record has open. Sent now, the descriptor agrees and the access runs again; the same
+    // access aborting right after is a real disagreement (RunSliceSecond).
+    const u8* const host = map->HostAt(run.far);
+    if (host == nullptr || !system.GPU().GuestAccessOpen(host, write)) {
+        return false;
+    }
+    forward_raced = true;
+    raced_far = run.far;
+    raced_pc = run.ctx.r[15];
+    return true;
+}
+
+void ARM_VitaNative::DetachSecondHost() {
+    const int ret = azaharDetach();
+    ASSERT_MSG(ret >= 0, "azaharDetach failed: {:#010x}", static_cast<u32>(ret));
+}
+
+void ARM_VitaNative::BuildHost1Thunk() {
+    const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
+    const u32 entry = run.ctx.r[15] - (thumb ? 2u : 4u);
+    const ThunkClaim* const c = Host1ClaimAt(entry);
+    ASSERT_MSG(c != nullptr && c->entry == entry && c->thumb == thumb,
+               "host 1 trapped at {:08X} ({}), no thunk begins there", entry,
+               thumb ? "Thumb" : "ARM");
+    WriteHost1Thunk(*c, *map);
+    run.ctx.r[15] = entry;
+}
+
+bool ARM_VitaNative::SvcSitePatched() {
+    const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
+    const u32 site = run.ctx.r[15] - (thumb ? 2u : 4u);
+    // The thunk area is this host's own: its svcs are not read through the guest's memory.
+    if (InThunkArea(site) || (thumb ? (memory.Read16(site) & 0xFF00u) == 0xDF00u
+                                    : (memory.Read32(site) & 0x0F000000u) == 0x0F000000u)) {
+        return false;
+    }
+#ifdef VITA_DIAGNOSTICS
+    LOG_INFO(Core_ARM11, "second host: the svc site {:08X} was patched under its svc (read as {:#x})",
+             site, run.svc_number);
+#endif
+    run.ctx.r[15] = site;
+    return true;
+}
+
+u32 ARM_VitaNative::PastPatchedThumbSvc(u32 pc) {
+    // A Thumb site patched to a B.W after a thread stopped past the svc: the PC is the B.W's second
+    // halfword, and the moved instruction runs in the thunk.
+    const u32 site = pc - 2;
+    const u16 hw1 = memory.Read16(site);
+    if ((hw1 & 0xF800u) != 0xF000u) [[likely]] {
+        return pc;
+    }
+    const u16 hw2 = memory.Read16(pc);
+    if ((hw2 & 0xD000u) != 0x9000u) {
+        return pc;
+    }
+    const u32 s = hw1 >> 10 & 1u, j1 = hw2 >> 13 & 1u, j2 = hw2 >> 11 & 1u;
+    const u32 i1 = ~(j1 ^ s) & 1u, i2 = ~(j2 ^ s) & 1u;
+    u32 off = s << 24 | i1 << 23 | i2 << 22 | (hw1 & 0x3FFu) << 12 | (hw2 & 0x7FFu) << 1;
+    if (s != 0) {
+        off |= 0xFE000000u;
+    }
+    const u32 entry = site + 4 + off;
+    const ThunkClaim* const c = InThunkArea(entry) ? Host1ClaimAt(entry) : nullptr;
+    if (c == nullptr || c->entry != entry || c->site != site || !c->thumb ||
+        c->kind != ClaimKind::Svc) {
+        return pc;
+    }
+    if (HostOfCore(GetID()) == 1) {
+        WriteHost1Thunk(*c, *map);
+        return entry + 2;
+    }
+    const auto it = upcall_thunks.find(entry);
+    ASSERT_MSG(it != upcall_thunks.end() && it->second.site == site,
+               "the Thumb svc site {:08X} branches to {:08X}, no upcall thunk of it", site, entry);
+    return it->second.moved;
+}
+
+namespace {
+
+void WriteHost1Thunk(const ThunkClaim& claim, const VitaGuestMap& map) {
+    const ThunkClaim* const c = &claim;
+    const u32 entry = c->entry;
+    const bool thumb = c->thumb;
+    u8* p = host1_area->Data() + (entry - ThunkAreaBase);
+    u32 bytes = 8;
+    // The site's own instruction(s), then the branch back: an ARM svc unconditional, a VFP instruction
+    // as it was, a Thumb svc with its moved instruction. A mutex svc's fast path first.
+    if (c->kind == ClaimKind::Mutex) {
+        const Host1Mutex m = Host1MutexThunk(*c);
+        p = host1_area->Data() + (m.base - ThunkAreaBase);
+        bytes = static_cast<u32>(m.words.size()) * 4;
+        std::memcpy(p, m.words.data(), bytes);
+    } else if (thumb) {
+        const auto back = ThumbBranchW(entry + 4, c->site + 4);
+        ASSERT(back.has_value());
+        const u16 hw[4] = {static_cast<u16>(c->insn >> 16), static_cast<u16>(c->insn),
+                           (*back)[0], (*back)[1]};
+        std::memcpy(p, hw, sizeof(hw));
+    } else {
+        const auto back = ArmBranch(0xE, entry + 4, c->site + 4);
+        ASSERT(back.has_value());
+        const u32 w[2] = {c->kind == ClaimKind::Svc ? 0xEF000000u | (c->insn & 0x00FFFFFFu) : c->insn, *back};
+        std::memcpy(p, w, sizeof(w));
+    }
+    const u32 first = static_cast<u32>(p - host1_area->Data()) & ~0xFFFu;
+    const u32 last = (static_cast<u32>(p - host1_area->Data()) + bytes - 1) & ~0xFFFu;
+    map.SyncViewCode(host1_area->Data() + first, ThunkAreaBase + first, last + 0x1000 - first);
+}
+
+} // namespace
+
+bool ARM_VitaNative::RunSliceSecond(u64 quantum_ns) {
+    if (!usable) [[unlikely]] {
+        system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
+                         "Vita native backend is not usable");
+        return false;
+    }
+    run.ctx.tpidruro = cp15[CP15_THREAD_URO];
+    run.ctx.tpidrurw = cp15[CP15_THREAD_UPRW];
+    DEBUG_ASSERT(quantum_ns <= MaxQuantumNs);
+    run.quantum_us = static_cast<u32>(quantum_ns) / 1000u;
+    run.fast = AZAHAR_FAST_ALL;
+    auto& kernel = system.Kernel();
+    if (const auto* thread = kernel.GetCurrentThreadManager().GetCurrentThread()) {
+        run.thread_id = thread->GetThreadId();
+    } else {
+        run.thread_id = 0;
+        run.fast &= ~(1u << AZAHAR_FAST_THREAD_ID);
+    }
+    if (const auto process = kernel.GetCurrentProcess()) {
+        run.process_id = process->process_id;
+    } else {
+        run.process_id = 0;
+        run.fast &= ~(1u << AZAHAR_FAST_PROCESS_ID);
+    }
+    run.tick_hz = static_cast<u64>(BASE_CLOCK_RATE_ARM11 * timer->GetClockScale() + 0.5);
+    run.tick_base = timer->GetTicks();
+    run.upcall_rearm_us = run.upcall_rearm_max = 0;
+    run.upcall_switch = nullptr;
+    run.upcall_redirect = nullptr;
+    run.store_permits = nullptr;
+
+    const int ret = azaharRun(&run);
+    if (ret < 0) {
+        system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
+                         fmt::format("azaharRun failed on the second emulation thread: {}", ret)
+                             .c_str());
+        usable = false;
+        return false;
+    }
+    cp15[CP15_THREAD_UPRW] = run.ctx.tpidrurw;
+    cp15[CP15_THREAD_URO] = run.ctx.tpidruro;
+    timer->AddScaledTicks(run.guest_ticks);
+    // An access host 0 let run again after a raced hold runs first.
+    const bool after_race = std::exchange(forward_raced, false);
+
+    // An LDREX's monitor past the holds lasts for this exit alone.
+    exclusive_held = std::exchange(exclusive, Exclusive{});
+    switch (run.reason) {
+    case AZAHAR_EXIT_SVC:
+        if (run.svc_number == ThunkTrapSvc && InThunkArea(run.ctx.r[15])) {
+            BuildHost1Thunk();
+            return !break_flag && !stop_requested;
+        }
+        if (SvcSitePatched()) {
+            return !break_flag && !stop_requested;
+        }
+        // A VFP instruction patched to the module's svc that the module did not run: not seen here yet.
+        ASSERT_MSG(run.svc_number != AZAHAR_VFP_SVC,
+                   "svc {:#x} at {:08X} on the second emulation thread", AZAHAR_VFP_SVC,
+                   run.ctx.r[15]);
+        system.SecondHostSvc(GetID(), svc_context, run.svc_number);
+        return !break_flag && !stop_requested;
+
+    case AZAHAR_EXIT_TIMER:
+        host1_in_thunk = InHost1MutexSlots(run.ctx.r[15]);
+        return false;
+
+    case AZAHAR_EXIT_DABT: {
+        // A small-page permission fault is a GPU page hold's, which host 0 takes while this thread waits.
+        const u32 status = (run.fsr & 0xFu) | ((run.fsr >> 6) & 0x10u);
+        ASSERT_MSG(!after_race || run.far != raced_far || run.ctx.r[15] != raced_pc,
+                   "the second thread's access at {:08X} (pc {:08X}) aborted again on a page the "
+                   "holds' record has open, its changes sent",
+                   run.far, run.ctx.r[15]);
+        if (status == 0xFu && system.SecondHostHeldPage(GetID())) {
+            return !break_flag && !stop_requested;
+        }
+        if (LumaAliasAccess((run.fsr & (1u << 11)) != 0)) {
+            return !break_flag && !stop_requested;
+        }
+        ReportFault();
+        return false;
+    }
+    case AZAHAR_EXIT_UND: {
+        // RunSliceOnce's VFP short vectors, nothing patched.
+        if ((run.ctx.fpscr & FpscrVectorBits) != 0) {
+            u32 pc = run.ctx.r[15];
+            const bool thumb = run.ctx.cpsr >> 5 & 1;
+            u32 ran = 0;
+            for (; ran < MaxVfpRun; ran++) {
+                const u32 insn = FetchCode(pc, thumb);
+                const u32 cond = thumb ? 0xEu : insn >> 28;
+                if (ran > 0 && (thumb ? (insn >> 24) != 0xEE : !IsVfpDataProcessing(insn))) {
+                    break;
+                }
+                if (cond == 0xF ||
+                    !(!ConditionPasses(cond, run.ctx.cpsr) || RunVfpVector(run.ctx, insn))) {
+                    break;
+                }
+                pc += 4;
+            }
+            if (ran > 0) {
                 run.ctx.r[15] = pc;
                 return !break_flag && !stop_requested;
             }
@@ -3880,9 +4383,9 @@ void ARM_VitaNative::ReportFault() {
     }
     const std::string message =
         fmt::format("{}Guest {} at PC {:08X} (cpsr {:08X}, fpscr {:08X}, fpexc {:08X}), fsr {:08X} "
-                    "far {:08X}",
+                    "far {:08X}; core {}, host {}",
                     registers, ReasonName(run.reason), run.ctx.r[15], run.ctx.cpsr, run.ctx.fpscr,
-                    fpexc, run.fsr, run.far);
+                    fpexc, run.fsr, run.far, GetID(), Core::ThisHost());
     LOG_CRITICAL(Core_ARM11, "{}", message);
     // The thunk area's code as this host fetches it, not guest memory.
     std::string code;
@@ -3990,7 +4493,6 @@ void ARM_VitaNative::SetPageTable(const std::shared_ptr<Memory::PageTable>& page
     // given here for every core.
     if (map && page_table && map->MirroredTable() != page_table.get()) {
         memory.SyncMappingObserver(*page_table);
-        map->SetMirroredTable(page_table.get());
     }
 }
 
@@ -4096,7 +4598,10 @@ void ARM_VitaNative::PrepareReschedule() {
     // From the HLE while the guest is stopped at an exit, or from another thread while it runs
     // (bounded by the quantum). An upcall takes an exit for it.
     stop_requested = true;
-    upcall_reschedule_asked.store(true, std::memory_order_relaxed);
+    // The upcalls are host 0's.
+    if (Core::ThisHost() == 0) {
+        upcall_reschedule_asked.store(true, std::memory_order_relaxed);
+    }
 }
 
 } // namespace Core

@@ -40,6 +40,9 @@ template <class Archive>
 void ThreadManager::serialize(Archive& ar, const unsigned int) {
     ar & current_thread;
     ar & ready_queue;
+    if (Archive::is_loading::value) {
+        ready_queue.for_each([](u32 priority, Thread* t) { t->queued_priority = priority; });
+    }
     ar & wakeup_callback_table;
     ar & thread_list;
     ar & current_schedule_mode;
@@ -111,6 +114,8 @@ Thread* ThreadManager::GetCurrentThread() const {
 }
 
 void Thread::Stop() {
+    ASSERT_MSG(Core::OwnsCore(core_id), "thread {} stopped from host {}", thread_id,
+               Core::ThisHost());
     // The callback that would have woken the thread goes first. An HLE async section's waits for
     // its section to end (which then schedules this thread's wakeup, cancelled below), and holds
     // what the request captured: a mapped buffer holds its process, whose handle table holds this
@@ -121,12 +126,15 @@ void Thread::Stop() {
 
     // Cancel any outstanding wakeup events for this thread
     CancelWakeup();
-    thread_manager.wakeup_callback_table.erase(thread_id);
+    {
+        std::scoped_lock lock{thread_manager.wakeup_table_mutex};
+        thread_manager.wakeup_callback_table.erase(thread_id);
+    }
 
     // Clean up thread from ready queue
     // This is only needed when the thread is termintated forcefully (SVC TerminateProcess)
     if (status == ThreadStatus::Ready) {
-        thread_manager.ready_queue.remove(current_priority, this);
+        thread_manager.RemoveReady(this);
     }
 
     status = ThreadStatus::Dead;
@@ -171,7 +179,7 @@ void ThreadManager::SwitchContext(Thread* new_thread) {
         if (previous_thread->status == ThreadStatus::Running) {
             // This is only the case when a reschedule is triggered without the current thread
             // yielding execution (i.e. an event triggered, system core time-sliced, etc)
-            ready_queue.push_front(previous_thread->current_priority, previous_thread);
+            PushReady(previous_thread, true);
             previous_thread->status = ThreadStatus::Ready;
         }
     }
@@ -186,7 +194,7 @@ void ThreadManager::SwitchContext(Thread* new_thread) {
 
         current_thread = SharedFrom(new_thread);
 
-        ready_queue.remove(new_thread->current_priority, new_thread);
+        RemoveReady(new_thread);
         new_thread->status = ThreadStatus::Running;
 
         ASSERT(current_thread->owner_process.lock());
@@ -289,7 +297,11 @@ void ThreadManager::TerminateProcessThreads(std::shared_ptr<Process> process) {
 }
 
 void ThreadManager::ThreadWakeupCallback(u64 thread_id, s64 cycles_late) {
-    std::shared_ptr<Thread> thread = SharedFrom(wakeup_callback_table.at(thread_id));
+    std::shared_ptr<Thread> thread;
+    {
+        std::scoped_lock lock{wakeup_table_mutex};
+        thread = SharedFrom(wakeup_callback_table.at(thread_id));
+    }
     if (thread == nullptr) {
         LOG_CRITICAL(Kernel, "Callback fired for invalid thread {:08X}", thread_id);
         return;
@@ -392,7 +404,7 @@ void Thread::ResumeFromWait() {
         return;
     }
 
-    thread_manager.ready_queue.push_back(current_priority, this);
+    thread_manager.PushReady(this, false);
     status = ThreadStatus::Ready;
     thread_manager.kernel.PrepareReschedule();
 }
@@ -400,7 +412,7 @@ void Thread::ResumeFromWait() {
 void Thread::ResumeHandedOff() {
     ASSERT(handoff_pending && Core::HostOfCore(core_id) == Core::ThisHost());
     handoff_pending = false;
-    thread_manager.ready_queue.push_back(current_priority, this);
+    thread_manager.PushReady(this, false);
     status = ThreadStatus::Ready;
     thread_manager.kernel.PrepareReschedule();
 }
@@ -467,20 +479,17 @@ ResultVal<std::shared_ptr<Thread>> KernelSystem::CreateThread(
 
     auto thread = std::make_shared<Thread>(*this, processor_id);
 
-    thread_managers[processor_id]->thread_list.push_back(thread);
-    thread_managers[processor_id]->ready_queue.prepare(priority);
-
     thread->thread_id = NewThreadId();
     thread->status = ThreadStatus::Dormant;
     thread->entry_point = entry_point;
     thread->stack_top = stack_top;
     thread->nominal_priority = thread->current_priority = priority;
-    thread->last_running_ticks = timing.GetTimer(processor_id)->GetTicks();
+    // The clock of the calling emulation thread: another one's timer is not this one's to read.
+    thread->last_running_ticks = timing.GetTicks();
     thread->processor_id = processor_id;
     thread->wait_objects.clear();
     thread->wait_address = 0;
     thread->name = std::move(name);
-    thread_managers[processor_id]->wakeup_callback_table[thread->thread_id] = thread.get();
     thread->owner_process = owner_process;
     thread->resource_limit_category = owner_process->resource_limit->GetCategory();
     CASCADE_RESULT(thread->tls_address, owner_process->AllocateThreadLocalStorage());
@@ -490,24 +499,38 @@ ResultVal<std::shared_ptr<Thread>> KernelSystem::CreateThread(
     ResetThreadContext(thread->context, stack_top, entry_point, arg);
 
     if (make_ready) {
-        thread_managers[processor_id]->ready_queue.push_back(thread->current_priority,
-                                                             thread.get());
         thread->status = ThreadStatus::Ready;
+    }
+    // Its core's lists are its core's emulation thread's to change: another one sends it over.
+    if (Core::OwnsCore(static_cast<u32>(processor_id))) {
+        thread_managers[processor_id]->AdoptThread(thread);
+    } else {
+        SendToHost(Core::HostOfCore(static_cast<u32>(processor_id)),
+                   HostMessage{HostMessage::Kind::NewThread, false, 0, thread});
     }
 
     return thread;
 }
 
+void ThreadManager::AdoptThread(std::shared_ptr<Thread> thread) {
+    DEBUG_ASSERT(Core::OwnsCore(core_id));
+    ready_queue.prepare(thread->current_priority);
+    {
+        std::scoped_lock lock{wakeup_table_mutex};
+        wakeup_callback_table[thread->thread_id] = thread.get();
+    }
+    if (thread->status == ThreadStatus::Ready) {
+        PushReady(thread.get(), false);
+    }
+    thread_list.push_back(std::move(thread));
+}
+
 void Thread::SetPriority(u32 priority) {
     ASSERT_MSG(priority <= ThreadPrioLowest && priority >= ThreadPrioHighest,
                "Invalid priority value.");
-    // If thread was ready, adjust queues
-    if (status == ThreadStatus::Ready)
-        thread_manager.ready_queue.move(this, current_priority, priority);
-    else
-        thread_manager.ready_queue.prepare(priority);
-
     nominal_priority = current_priority = priority;
+    // If thread was ready, adjust queues
+    Requeue();
 }
 
 void Thread::UpdatePriority() {
@@ -520,12 +543,28 @@ void Thread::UpdatePriority() {
 }
 
 void Thread::BoostPriority(u32 priority) {
-    // If thread was ready, adjust queues
-    if (status == ThreadStatus::Ready)
-        thread_manager.ready_queue.move(this, current_priority, priority);
-    else
-        thread_manager.ready_queue.prepare(priority);
+    if (priority == current_priority) {
+        return;
+    }
     current_priority = priority;
+    // If thread was ready, adjust queues
+    Requeue();
+}
+
+void Thread::Requeue() {
+    // A thread's priority can be set from another core as it starts.
+    if (!Core::OwnsCore(core_id)) {
+        thread_manager.kernel.SendToHost(
+            Core::HostOfCore(core_id),
+            HostMessage{HostMessage::Kind::Requeue, false, 0, SharedFrom(this)});
+        return;
+    }
+    if (status == ThreadStatus::Ready) {
+        // One read, as PushReady's.
+        const u32 priority = current_priority;
+        thread_manager.ready_queue.move(this, queued_priority, priority);
+        queued_priority = priority;
+    }
 }
 
 std::shared_ptr<Thread> SetupMainThread(KernelSystem& kernel, u32 entry_point, u32 priority,
@@ -564,151 +603,6 @@ std::shared_ptr<Thread> SetupMainThread(KernelSystem& kernel, u32 entry_point, u
     return thread;
 }
 
-int ThreadManager::ExportNativeSchedule(std::vector<NativeSchedEntry>& out, std::size_t max,
-                                        const AddressArbiter* arbiter) {
-    out.clear();
-    Thread* const running = GetCurrentThread();
-    if (running == nullptr || running->status != ThreadStatus::Running || !running->CanSchedule()) {
-        return -1;
-    }
-    const auto process = running->owner_process.lock();
-    out.push_back({running, 3, 0, 0});
-    bool takeable = true;
-    std::array<s32, ThreadPrioLowest + 1> next{};
-    ready_queue.for_each([&](u32 priority, Thread* t) {
-        if (t->owner_process.lock() != process || !t->CanSchedule()) {
-            takeable = false;
-            return;
-        }
-        out.push_back({t, 1, next[priority]++, 0});
-    });
-    if (!takeable) {
-        return -1;
-    }
-    Core::Timing::Timer& timer = cpu->GetTimer();
-    timer.MoveEvents();
-    for (const auto& t : thread_list) {
-        if (t->status != ThreadStatus::WaitSleep || t->owner_process.lock() != process ||
-            !t->CanSchedule()) {
-            continue;
-        }
-        // Asleep for good (no wakeup event) stays the app's.
-        const s64 wake = timer.EventTime(ThreadWakeupEventType, t->thread_id);
-        if (wake >= 0) {
-            out.push_back({t.get(), 2, 0, static_cast<u64>(wake)});
-        }
-    }
-    // The arbiter's waiters, every one of them: a signal in the module must see them all. The
-    // arbiter is the process's, and another emulated core's threads wait on it too: those are
-    // woken there but never run here (state 5), their timeouts on their own core's timer.
-    if (arbiter != nullptr) {
-        s32 index = 0;
-        for (const auto& t : arbiter->GetWaitingThreads()) {
-            if (t->status != ThreadStatus::WaitArb || t->owner_process.lock() != process) {
-                return -1;
-            }
-            if (t->core_id != core_id) {
-                out.push_back({t.get(), 5, index++, ~0ull, t->wait_address});
-                continue;
-            }
-            if (!t->CanSchedule()) {
-                return -1;
-            }
-            const s64 wake = timer.EventTime(ThreadWakeupEventType, t->thread_id);
-            out.push_back(
-                {t.get(), 4, index++, wake >= 0 ? static_cast<u64>(wake) : ~0ull, t->wait_address});
-        }
-    }
-    return out.size() <= max ? 0 : -1;
-}
-
-void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& before,
-                                         const std::vector<NativeSchedEntry>& after, int current,
-                                         u64 now, AddressArbiter* arbiter) {
-    Core::Timing& timing = kernel.timing;
-    std::vector<const NativeSchedEntry*> ready;
-    std::vector<const NativeSchedEntry*> waits;
-    for (std::size_t i = 0; i < after.size(); i++) {
-        const NativeSchedEntry& was = before[i];
-        const NativeSchedEntry& is = after[i];
-        Thread* const t = is.thread;
-        if (was.state == 1) {
-            ready_queue.remove(t->current_priority, t);
-        }
-        const bool same_sleep = was.state == 2 && is.state == 2 && was.wake == is.wake;
-        if (was.state == 2 && !same_sleep) {
-            t->CancelWakeup();
-        }
-        // A wait at the arbiter the module left alone keeps its place (a new wait takes the
-        // list's next order); any other leaves the list and its timeout.
-        const bool same_wait = was.state == 4 && is.state == 4 && was.order == is.order;
-        if (was.state == 4 && !same_wait) {
-            ASSERT(arbiter != nullptr);
-            arbiter->RemoveNativeWaiter(t);
-            if (was.wake != ~0ull) {
-                t->CancelWakeup();
-            }
-            t->wakeup_callback = nullptr;
-        }
-        switch (is.state) {
-        case 1:
-            t->status = ThreadStatus::Ready;
-            ready.push_back(&is);
-            break;
-        case 2:
-            t->status = ThreadStatus::WaitSleep;
-            if (!same_sleep) {
-                timing.ScheduleEvent(is.wake > now ? static_cast<s64>(is.wake - now) : 0,
-                                     ThreadWakeupEventType, t->thread_id);
-                t->wakeup_queued = true;
-            }
-            break;
-        case 4:
-            if (!same_wait) {
-                waits.push_back(&is);
-            }
-            break;
-        case 5:
-            break; // another core's waiter the slice left waiting
-        case 6:
-            // Another core's waiter a signal here woke: ready on its own core, as
-            // AddressArbiter::ResumeSignaled leaves it (its context has the module's success).
-            ASSERT(arbiter != nullptr && was.state == 5);
-            arbiter->RemoveNativeWaiter(t);
-            t->ResumeFromWait();
-            break;
-        default:
-            t->status = ThreadStatus::Running;
-            break;
-        }
-        if (was.state == 3 && is.state != 3) {
-            t->last_running_ticks = now;
-        }
-    }
-    // The module's ready order: its pushes to the front and back of each level.
-    std::sort(ready.begin(), ready.end(), [](const NativeSchedEntry* a, const NativeSchedEntry* b) {
-        return a->order < b->order;
-    });
-    for (const NativeSchedEntry* e : ready) {
-        ready_queue.push_back(e->thread->current_priority, e->thread);
-    }
-    // The waits the module began, at the arbiter list's back in the order it began them.
-    std::sort(waits.begin(), waits.end(), [](const NativeSchedEntry* a, const NativeSchedEntry* b) {
-        return a->order < b->order;
-    });
-    for (const NativeSchedEntry* e : waits) {
-        ASSERT(arbiter != nullptr);
-        const bool timed = e->wake != ~0ull;
-        arbiter->AddNativeWaiter(SharedFrom(e->thread), e->address, timed);
-        if (timed) {
-            timing.ScheduleEvent(e->wake > now ? static_cast<s64>(e->wake - now) : 0,
-                                 ThreadWakeupEventType, e->thread->thread_id);
-            e->thread->wakeup_queued = true;
-        }
-    }
-    current_thread = current >= 0 ? SharedFrom(after[current].thread) : nullptr;
-}
-
 Thread* ThreadManager::SwitchForNative() {
     Thread* const cur = GetCurrentThread();
     Thread* const next = PopNextReadyThread();
@@ -718,21 +612,36 @@ Thread* ThreadManager::SwitchForNative() {
         return next;
     }
     if (cur == nullptr || next->owner_process.lock() != cur->owner_process.lock()) {
-        ready_queue.push_front(next->current_priority, next);
+        PushReady(next, true);
         return nullptr;
     }
     // SwitchContext's, but for SaveContext and LoadContext.
     cur->last_running_ticks = cpu->GetTimer().GetTicks();
     if (cur->status == ThreadStatus::Running) {
-        ready_queue.push_front(cur->current_priority, cur);
+        PushReady(cur, true);
         cur->status = ThreadStatus::Ready;
     }
     ASSERT_MSG(next->status == ThreadStatus::Ready, "Thread must be ready to become running.");
     next->CancelWakeup();
     current_thread = SharedFrom(next);
-    ready_queue.remove(next->current_priority, next);
+    RemoveReady(next);
     next->status = ThreadStatus::Running;
     return next;
+}
+
+void ThreadManager::PushReady(Thread* thread, bool front) {
+    // One read: the other emulation thread may set it meanwhile, and sends a Requeue after.
+    const u32 priority = thread->current_priority;
+    thread->queued_priority = priority;
+    if (front) {
+        ready_queue.push_front(priority, thread);
+    } else {
+        ready_queue.push_back(priority, thread);
+    }
+}
+
+void ThreadManager::RemoveReady(Thread* thread) {
+    ready_queue.remove(thread->queued_priority, thread);
 }
 
 bool ThreadManager::HaveReadyThreads() {

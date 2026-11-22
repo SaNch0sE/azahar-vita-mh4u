@@ -7,9 +7,8 @@
 #include <array>
 #include <atomic>
 #include <memory>
-#include <mutex>
 #include "common/common_types.h"
-#include "common/thread.h"
+#include "common/wake_flag.h"
 
 namespace Kernel {
 
@@ -17,14 +16,16 @@ class Object;
 
 /**
  * What one emulation thread (Core::ThisHost) hands the other, with no lock on either side: an
- * event's signal for the waiters on the receiving host's list, or a thread the sender woke whose
- * core the receiver runs.
+ * event's signal for the waiters on the receiving host's list, or a thread the sender woke,
+ * created or changed the priority of whose core the receiver runs.
  */
 struct HostMessage {
     enum class Kind : u8 {
         EventSignal, ///< Event::ReceiveSignal(seq, token)
         Handoff,     ///< Thread::ResumeHandedOff
+        NewThread,   ///< ThreadManager::AdoptThread
         ArbiterSignal, ///< AddressArbiter::ReceiveSignal(seq, count)
+        Requeue,       ///< Thread::Requeue: its priority changed on the sending host
     };
     Kind kind{};
     /// EventSignal of a one-shot event: the sender took its signal for this host's waiters.
@@ -51,16 +52,25 @@ public:
     /// The owning host only.
     bool Pop(HostMessage& out);
     [[nodiscard]] bool Empty() const;
+    /// Any thread: messages sent that the owning host has not taken yet.
+    [[nodiscard]] bool Pending() const;
 
-    /// The owning host, with nothing to run: returns at once if `has_work()` (checked with the
-    /// sleeper published, so no Push or Wake is lost), else after the next Push or Wake.
+    /// The owning host, with nothing to run: returns at once if `has_work()`, else after the
+    /// next Push or Wake. No lock: the flag goes down before the sleeper is published and the
+    /// work checked, so a Push or Wake after the check raises it again and the wait ends.
     template <typename HasWork>
     void Sleep(HasWork&& has_work) {
-        std::scoped_lock lock{cond};
+        SleepUntil([&] { return !Empty() || has_work(); });
+    }
+    /// Sleep that leaves the messages where they are: returns once `done()`, a Push or a Wake
+    /// also ending a wait the caller then makes again.
+    template <typename Done>
+    void SleepUntil(Done&& done) {
+        flag.Lower();
         sleeping.store(true, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (Empty() && !has_work()) {
-            cond.Wait();
+        if (!done()) {
+            flag.Wait();
         }
         sleeping.store(false, std::memory_order_relaxed);
     }
@@ -74,9 +84,10 @@ private:
     };
     std::array<Cell, Size> cells;
     alignas(64) std::atomic<u32> tail{};
-    alignas(64) u32 head{};
+    alignas(64) std::atomic<u32> head{};
     std::atomic<bool> sleeping{};
-    Common::CoreCondition cond;
+    /// The Vita kernel's event flag (WakeFlag): the sleeper's wait and the senders' wake.
+    Common::WakeFlag flag;
 };
 
 } // namespace Kernel

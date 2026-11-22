@@ -411,6 +411,8 @@ public:
     SVC(Core::System& system);
     void CallSVC(u32 immediate);
     void CallSVCForUpcall(u32 immediate);
+    bool LocalToSecondHost(u32 immediate);
+    void CallSVCLocal(u32 immediate);
 
 private:
     Core::System& system;
@@ -2489,6 +2491,45 @@ void SVC::CallSVCForUpcall(u32 immediate) {
     }
 }
 
+bool SVC::LocalToSecondHost(u32 immediate) {
+    const auto& handles = kernel.GetCurrentProcess()->handle_table;
+    switch (immediate) {
+    case 0x0A: // SleepThread
+    case 0x18: // SignalEvent
+    case 0x19: // ClearEvent
+    case 0x28: // GetSystemTick
+    case 0x35: // GetProcessId
+    case 0x37: // GetThreadId
+        return true;
+    case 0x24: // WaitSynchronization1 (handle r0) on an event
+        return handles.Get<Event>(GetReg(0)) != nullptr;
+    case 0x22: // ArbitrateAddress (handle r0): its waiters are each host's, its signals messages
+        return handles.Get<AddressArbiter>(GetReg(0)) != nullptr;
+    case 0x25: { // WaitSynchronizationN (handles r1, count r2, wait_all r3) for any of events
+        const VAddr address = GetReg(1);
+        const s32 count = static_cast<s32>(GetReg(2));
+        if (GetReg(3) != 0 || count <= 0 || count > 256 ||
+            !memory.IsValidVirtualAddress(*kernel.GetCurrentProcess(), address)) {
+            return false;
+        }
+        for (s32 i = 0; i < count; i++) {
+            if (handles.Get<Event>(memory.Read32(address + i * 4)) == nullptr) {
+                return false;
+            }
+        }
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+void SVC::CallSVCLocal(u32 immediate) {
+    const FunctionDef* info = GetSVCInfo(immediate);
+    system.GetRunningCore().GetTimer().AddTicks(info->cycles);
+    (this->*(info->func))();
+}
+
 void SVC::CallSVC(u32 immediate) {
     MICROPROFILE_SCOPE(Kernel_SVC);
     system.perf_stats->BeginSVCProcessing();
@@ -2536,6 +2577,14 @@ void SVCContext::CallSVC(u32 immediate) {
 
 void SVCContext::CallSVCForUpcall(u32 immediate) {
     impl->CallSVCForUpcall(immediate);
+}
+
+bool SVCContext::LocalToSecondHost(u32 immediate) {
+    return impl->LocalToSecondHost(immediate);
+}
+
+void SVCContext::CallSVCLocal(u32 immediate) {
+    impl->CallSVCLocal(immediate);
 }
 
 } // namespace Kernel

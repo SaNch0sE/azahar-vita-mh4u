@@ -161,6 +161,9 @@ void SetCurrentThreadName(const char* name);
 enum class ThreadRole {
     Other,
     Emulation,
+    /// The second emulation thread (Core::System::SecondHostMain): the emulated cores other than
+    /// core 0.
+    SecondEmulation,
     Render,
     RasterWorker,
     ShaderCompiler,
@@ -184,6 +187,9 @@ enum class ThreadRole {
 void SetCurrentThreadRole(ThreadRole role, std::size_t index = 0);
 
 #ifdef __vita__
+/// The cores `role` owns, a bit per core: where a thread of it is created (ThreadCfg::cores).
+int RoleCoreMask(ThreadRole role);
+
 /// A thread SetCurrentThreadRole placed: its kernel ID and the cores its role allows.
 struct RoleThread {
     ThreadRole role;

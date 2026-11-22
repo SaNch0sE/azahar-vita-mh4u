@@ -2,7 +2,6 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
-#include <mutex>
 #include "common/assert.h"
 #include "core/hle/kernel/host_link.h"
 #include "core/hle/kernel/object.h"
@@ -35,32 +34,37 @@ void HostInbox::Push(HostMessage&& message) {
     // The sleeper publishes itself before it checks the ring: one of the two sees the other.
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (sleeping.load(std::memory_order_relaxed)) {
-        std::scoped_lock lock{cond};
-        cond.NotifyAll();
+        flag.Raise();
     }
 }
 
 bool HostInbox::Pop(HostMessage& out) {
-    Cell& cell = cells[head & (Size - 1)];
-    if (cell.seq.load(std::memory_order_acquire) != head + 1) {
+    const u32 h = head.load(std::memory_order_relaxed);
+    Cell& cell = cells[h & (Size - 1)];
+    if (cell.seq.load(std::memory_order_acquire) != h + 1) {
         return false;
     }
     out = std::move(cell.message);
     cell.message.object.reset();
-    cell.seq.store(head + Size, std::memory_order_release);
-    head++;
+    cell.seq.store(h + Size, std::memory_order_release);
+    head.store(h + 1, std::memory_order_seq_cst);
     return true;
 }
 
 bool HostInbox::Empty() const {
-    return cells[head & (Size - 1)].seq.load(std::memory_order_acquire) != head + 1;
+    const u32 h = head.load(std::memory_order_relaxed);
+    return cells[h & (Size - 1)].seq.load(std::memory_order_acquire) != h + 1;
+}
+
+bool HostInbox::Pending() const {
+    // A slot claimed counts (its message is on the way).
+    return tail.load(std::memory_order_seq_cst) != head.load(std::memory_order_seq_cst);
 }
 
 void HostInbox::Wake() {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (sleeping.load(std::memory_order_relaxed)) {
-        std::scoped_lock lock{cond};
-        cond.NotifyAll();
+        flag.Raise();
     }
 }
 

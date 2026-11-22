@@ -233,9 +233,16 @@ constexpr int RoleCores(ThreadRole role, std::size_t index) {
         // slice at a time inside azaharRun (the folded design), so this core is the guest's
         // too and nothing else of ours goes there.
         return 1 << 2;
+    case ThreadRole::SecondEmulation:
+        // The emulated cores other than core 0, the guest on this core as on core 2.
+        return 1 << 1;
     case ThreadRole::Dsp:
-        // The DSP's frames take a fifth of the emulation thread's time in a game's race.
-        return 0;
+        // The DSP's frames take a fifth of the emulation thread's time in a game's race. Beside the
+        // second emulation thread, which sleeps most of the time (a game's ~870 ms a second)
+        // and leaves the core to it between its slices (PriorityCore), or on core 3: on core 1
+        // alone, the DSP ran ahead of core 2's job for half of the main thread's wait for it
+        // (a game).
+        return 1 << 1 | 1 << 3;
     case ThreadRole::Parse:
         // The command lists' parse, ahead of the render thread, on a core of its own (on core 0 the
         // render thread waited for it). Core 3, with the mostly idle rest.
@@ -244,9 +251,9 @@ constexpr int RoleCores(ThreadRole role, std::size_t index) {
         // A video's frames, converted while the guest decodes the next one: core 0 again.
         return 1 << 0;
     case ThreadRole::Render:
-        // The PICA stays on the emulation thread; what it draws is built and sent here. Core 1
-        // is otherwise idle.
-        return 1;
+        // The PICA stays on the emulation thread; what it draws is built and sent here. Core 0:
+        // the second emulation thread has core 1.
+        return 1 << 0;
     case ThreadRole::RasterWorker:
     case ThreadRole::ShaderCompiler:
     case ThreadRole::AudioSink:
@@ -334,13 +341,17 @@ std::vector<RoleThread> RoleThreads() {
     return out;
 }
 
+int RoleCoreMask(ThreadRole role) {
+    return RoleCores(role, 0);
+}
+
 void SetCurrentThreadRole(ThreadRole role, std::size_t index) {
     const int cores = RoleCores(role, index);
     // Affinity is one bit per core from bit 16. The top of the four, SCE_KERNEL_CPU_MASK_SYSTEM,
     // is the core the kernel keeps for itself; it is reachable from homebrew loaded through
     // taiHEN, which is how this build runs. Miscellaneous threads are mostly idle, so they may
     // float between the emulation core and the system core rather than crowding either.
-    const int mask = SCE_KERNEL_CPU_MASK_USER_0 << core;
+    const int mask = SCE_KERNEL_CPU_MASK_USER_0 * cores;
     const int thread_id = sceKernelGetThreadId();
     const int result = sceKernelChangeThreadCpuAffinityMask(thread_id, mask);
     if (result < 0) {

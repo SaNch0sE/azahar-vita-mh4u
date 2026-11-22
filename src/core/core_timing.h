@@ -17,6 +17,7 @@
  *   ScheduleEvent(periodInCycles - cyclesLate, callback, "whatever")
  */
 
+#include <array>
 #include <chrono>
 #include <functional>
 #include <limits>
@@ -28,6 +29,7 @@
 #include "common/common_types.h"
 #include "common/logging/log.h"
 #include "common/threadsafe_queue.h"
+#include "core/emu_host.h"
 #include "core/global.h"
 
 // The timing we get from the assembly is 268,111,855.956 Hz
@@ -324,6 +326,10 @@ public:
                        bool thread_safe_mode = false);
 
     void UnscheduleEvent(const TimingEventType* event_type, std::uintptr_t user_data);
+    /// An event queued on core `from`'s timer to core `to`'s, at the same tick (one emulation
+    /// thread owning both: the second one starting or stopped). Whether there was one.
+    bool MoveEvent(const TimingEventType* event_type, std::uintptr_t user_data, std::size_t from,
+                   std::size_t to);
 
     /// We only permit one event of each type in the queue at a time.
     void RemoveEvent(const TimingEventType* event_type);
@@ -357,7 +363,8 @@ private:
     std::unordered_map<std::string, TimingEventType> event_types = {};
 
     std::vector<std::shared_ptr<Timer>> timers;
-    Timer* current_timer = nullptr;
+    /// Each emulation thread's (Core::ThisHost).
+    std::array<Timer*, NumHosts> current_timer{};
     /// The CPU clock in percent (UpdateClockSpeed): a state's timers are new ones, at 100% until
     /// it is applied to them again.
     u32 clock_percentage = 100;
@@ -370,7 +377,7 @@ private:
     void serialize(Archive& ar, const unsigned int file_version) {
         // event_types set during initialization of other things
         ar & timers;
-        ar & current_timer;
+        ar & current_timer[0];
         if (Archive::is_loading::value) {
             event_queue_locked = true;
             UpdateClockSpeed(clock_percentage);

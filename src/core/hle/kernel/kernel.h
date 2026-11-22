@@ -20,6 +20,7 @@
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
 #include "common/mutex.h"
+#include "core/emu_host.h"
 #include "core/hle/kernel/host_link.h"
 #include "core/hle/kernel/memory.h"
 #include "core/hle/result.h"
@@ -385,8 +386,10 @@ public:
     /// A message for emulation thread `host` (Core::ThisHost), from any thread.
     void SendToHost(u32 host, HostMessage&& message);
     /// The calling emulation thread's messages: the other's event signals and handed-off threads
-    /// (host 0's under the HLE lock, as its other kernel work).
+    /// (host 0's under the HLE lock, as its other kernel work). Host 0 takes host 1's too once
+    /// the second thread is gone (`host`).
     void ProcessHostMessages();
+    void ProcessHostMessages(u32 host);
     [[nodiscard]] HostInbox& GetHostInbox(u32 host) {
         return *host_inboxes[host];
     }
@@ -394,7 +397,11 @@ public:
     /// Map of named ports managed by the kernel, which can be retrieved using the ConnectToPort
     std::unordered_map<std::string, std::shared_ptr<ClientPort>> named_ports;
 
-    Core::ARM_Interface* current_cpu = nullptr;
+    /// Each emulation thread's core (Core::ThisHost).
+    std::array<Core::ARM_Interface*, Core::NumHosts> current_cpu{};
+    [[nodiscard]] Core::ARM_Interface* CurrentCPU() const {
+        return current_cpu[Core::ThisHost()];
+    }
 
     Memory::MemorySystem& memory;
 
@@ -459,7 +466,8 @@ private:
     // Lists all processes that exist in the current session.
     std::vector<std::shared_ptr<Process>> process_list;
 
-    std::shared_ptr<Process> current_process;
+    /// Each emulation thread's (Core::ThisHost).
+    std::array<std::shared_ptr<Process>, Core::NumHosts> current_process;
     std::vector<std::shared_ptr<Process>> stored_processes;
 
     std::vector<std::unique_ptr<ThreadManager>> thread_managers;

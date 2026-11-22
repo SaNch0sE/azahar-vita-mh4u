@@ -2124,6 +2124,20 @@ bool RenderThread::OpensDisplayPage(const u8* host, bool write, u32 reach) {
     return page_holds.OpenPastDisplay(host, now, reach);
 }
 
+bool RenderThread::AccessOpenAfterFlush(const u8* host, bool write) {
+    if (!page_holds_on) {
+        return false;
+    }
+    const u32 page = page_holds.PageOf(host);
+    if (page == PageHolds::NoPage) {
+        return false;
+    }
+    // The record changes first (PageHolds::Change), the descriptors when they are sent.
+    page_holds.Apply();
+    const PageHolds::Access access = page_holds.Applied(page);
+    return access == PageHolds::Unheld || (access == PageHolds::ReadOnly && !write);
+}
+
 bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 guest_pc,
                              [[maybe_unused]] u32 guest_va) {
     if (!page_holds_on) {

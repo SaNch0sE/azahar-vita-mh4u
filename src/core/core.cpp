@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -13,6 +14,8 @@
 #endif
 #include "common/arch.h"
 #include "common/logging/log.h"
+#include "common/named_thread.h"
+#include "common/thread.h"
 #include "common/settings.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/exclusive_monitor.h"
@@ -43,9 +46,11 @@
 #endif
 #include "core/global.h"
 #include "core/hle/kernel/address_arbiter.h"
+#include "core/hle/kernel/event.h"
 #include "core/hle/kernel/ipc_debugger/recorder.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
+#include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/thread.h"
 #include "core/hle/service/apt/applet_manager.h"
 #include "core/hle/service/apt/apt.h"
@@ -70,6 +75,10 @@
 #include "video_core/gpu.h"
 
 namespace Core {
+
+u32 host1_tp{};
+std::atomic<bool> multi_host{};
+std::atomic<bool> host1_parked{};
 
 /*static*/ System System::s_instance;
 
@@ -178,6 +187,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         const u32 slot = save_state_slot;
         save_state_request_status = SaveStateStatus::NONE;
         LOG_INFO(Core, "Begin load of slot {}", slot);
+        StopSecondHost();
         try {
             System::LoadState(slot);
             LOG_INFO(Core, "Load completed");
@@ -193,6 +203,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         save_state_request_status = SaveStateStatus::NONE;
         const u32 slot = save_state_slot;
         LOG_INFO(Core, "Begin save to slot {}", slot);
+        StopSecondHost();
         try {
             System::SaveState(slot);
             LOG_INFO(Core, "Save completed");
@@ -212,23 +223,48 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         return ResultStatus::ErrorSavestate;
     }
 
+    // The second emulation thread takes the other cores once the guest's table is in (its view
+    // of the guest is made from it); it stops before a savestate (above) and at the end. From
+    // then on this loop runs core 0, takes the second thread's messages and its svcs.
+    if (!second_host && cpu_cores.size() > 1 && SecondHostCanStart()) {
+        StartSecondHost();
+    }
+    const bool multi = multi_host.load(std::memory_order_relaxed);
+#ifdef VITA_DIAGNOSTICS
+    if (thread_dump_requested.exchange(false, std::memory_order_relaxed)) {
+        DumpGuestThreads();
+    }
+#endif
+    if (multi) {
+        if (second_failed.load(std::memory_order_acquire)) {
+            status = second_status;
+            status_details = second_details;
+            return status;
+        }
+        kernel->ProcessHostMessages();
+        ServeForward();
+    }
+
     // The GSP interrupts go to the guest as upstream raises them, when the work is submitted
     // (VideoCore::GPU::Signal); the guest pages that work still reads or writes are held until
     // it is done. The holds whose work is done go between slices.
     gpu->DeliverInterrupts();
     const auto idle = [](ARM_Interface& core) { core.GetTimer().Idle(); };
+    const auto cores = HostCores(0);
 
     // All cores should have executed the same amount of ticks. If this is not the case an event was
     // scheduled with a cycles_into_future smaller then the current downcount.
     // So we have to get those cores to the same global time first
-    u64 global_ticks = timing->GetGlobalTicks();
+    u64 global_ticks = 0;
+    for (const auto& cpu_core : cores) {
+        global_ticks = std::max<u64>(global_ticks, cpu_core->GetTimer().GetTicks());
+    }
     s64 max_delay = 0;
     ARM_Interface* current_core_to_execute = nullptr;
-    for (auto& cpu_core : cpu_cores) {
+    for (auto& cpu_core : cores) {
         if (cpu_core->GetTimer().GetTicks() < global_ticks) {
             s64 delay = global_ticks - cpu_core->GetTimer().GetTicks();
-            running_core = cpu_core.get();
-            kernel->SetRunningCPU(running_core);
+            SetRunning(cpu_core.get());
             cpu_core->GetTimer().Advance();
             cpu_core->PrepareReschedule();
             kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
@@ -248,9 +284,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         LOG_TRACE(Core_ARM11, "Core {} running (delayed) for {} ticks",
                   current_core_to_execute->GetID(),
                   current_core_to_execute->GetTimer().GetDowncount());
-        if (running_core != current_core_to_execute) {
-            running_core = current_core_to_execute;
-            kernel->SetRunningCPU(running_core);
+        if (running_core[ThisHost()] != current_core_to_execute) {
+            SetRunning(current_core_to_execute);
         }
         if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
             LOG_TRACE(Core_ARM11, "Core {} idling", current_core_to_execute->GetID());
@@ -271,9 +306,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         // with a max slice that is the minimum of all max slices of all cores
         // TODO: Make special check for idle since we can easily revert the time of idle cores
         s64 max_slice = Timing::MAX_SLICE_LENGTH;
-        for (const auto& cpu_core : cpu_cores) {
-            running_core = cpu_core.get();
-            kernel->SetRunningCPU(running_core);
+        for (const auto& cpu_core : cores) {
+            SetRunning(cpu_core.get());
             cpu_core->GetTimer().Advance();
             cpu_core->PrepareReschedule();
             kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
@@ -286,7 +320,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
 #ifdef VITA_DIAGNOSTICS
         bool ran = false;
 #endif
-        for (auto& cpu_core : cpu_cores) {
+        for (auto& cpu_core : cores) {
             if (reached) {
                 const u64 at = cpu_core->GetTimer().GetTicks();
                 max_slice = *reached > at ? static_cast<s64>(*reached - at) : 0;
@@ -295,15 +329,18 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             auto start_ticks = cpu_core->GetTimer().GetTicks();
             LOG_TRACE(Core_ARM11, "Core {} running for {} ticks", cpu_core->GetID(),
                       cpu_core->GetTimer().GetDowncount());
-            running_core = cpu_core.get();
-            kernel->SetRunningCPU(running_core);
+            SetRunning(cpu_core.get());
             // If we don't have a currently active thread then don't execute instructions,
             // instead advance to the next event and try to yield to the next thread
             if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
                 LOG_TRACE(Core_ARM11, "Core {} idling", cpu_core->GetID());
                 SgxdRenderer::SgxdTrace("idle",
                                       static_cast<unsigned>(cpu_core->GetTimer().GetDowncount()));
-                idle(*cpu_core);
+                if (multi) {
+                    HostIdle(0);
+                } else {
+                    idle(*cpu_core);
+                }
                 PrepareReschedule();
             } else {
 #ifdef VITA_DIAGNOSTICS
@@ -327,6 +364,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             gpu->GuestIdle();
         }
 #endif
+    }
+    if (multi) {
+        PublishClock(0);
     }
 
     return status;
@@ -543,13 +583,18 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
 }
 
 void System::SelectCore(u32 core_id) {
-    running_core = cpu_cores[core_id].get();
-    kernel->SetRunningCPU(running_core);
+    SetRunning(cpu_cores[core_id].get());
+}
+
+void System::SetRunning(ARM_Interface* core) {
+    running_core[ThisHost()] = core;
+    kernel->SetRunningCPU(core);
 }
 
 void System::PrepareReschedule() {
-    running_core->PrepareReschedule();
-    curr_core_reschedule_pending = true;
+    const u32 host = ThisHost();
+    running_core[host]->PrepareReschedule();
+    curr_core_reschedule_pending[host] = true;
 }
 
 PerfStats::Results System::GetAndResetPerfStats() {
@@ -566,12 +611,543 @@ double System::GetStableFrameTimeScale() {
 }
 
 void System::Reschedule() {
-    if (!curr_core_reschedule_pending) {
+    const u32 host = ThisHost();
+    if (!curr_core_reschedule_pending[host]) {
         return;
     }
 
-    curr_core_reschedule_pending = false;
-    kernel->GetThreadManager(running_core->GetID()).Reschedule();
+    curr_core_reschedule_pending[host] = false;
+    kernel->GetThreadManager(running_core[host]->GetID()).Reschedule();
+}
+
+std::span<const std::shared_ptr<ARM_Interface>> System::HostCores(u32 host) const {
+    const std::span<const std::shared_ptr<ARM_Interface>> all{cpu_cores};
+    if (!multi_host.load(std::memory_order_relaxed)) {
+        return host == 0 ? all : all.first(0);
+    }
+    return host == 0 ? all.first(1) : all.subspan(1);
+}
+
+bool System::SecondHostCanStart() const {
+#ifdef CITRA_HAS_VITA_NATIVE
+    return static_cast<const ARM_VitaNative&>(*cpu_cores[0]).GuestTableInstalled();
+#else
+    return false;
+#endif
+}
+
+void System::PublishClock(u32 host) {
+    const u64 now = HostCores(host).front()->GetTimer().GetTicks();
+    host_clock[host].clock.store(now, std::memory_order_seq_cst);
+    // The other one idles until this time reaches its next event (HostIdle).
+    const HostClock& other = host_clock[host ^ 1];
+    if (other.idle.load(std::memory_order_seq_cst) &&
+        now >= other.next.load(std::memory_order_relaxed)) {
+#ifdef VITA_DIAGNOSTICS
+        host_clock[host].woke_other_us.store(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count()),
+            std::memory_order_relaxed);
+#endif
+        kernel->GetHostInbox(host ^ 1).Wake();
+    }
+}
+
+bool System::SecondHostQuiet(u64 until) const {
+    const HostClock& second = host_clock[1];
+    return second.idle.load(std::memory_order_seq_cst) &&
+           second.next.load(std::memory_order_relaxed) > until &&
+           !kernel->GetHostInbox(1).Pending() && kernel->GetHostInbox(0).Empty() &&
+           !forward_pending.load(std::memory_order_acquire);
+}
+
+#ifdef VITA_DIAGNOSTICS
+u32 System::SecondHostBusyWhy(u64 until) const {
+    const HostClock& second = host_clock[1];
+    if (!second.idle.load(std::memory_order_seq_cst)) {
+        return 0;
+    }
+    if (second.next.load(std::memory_order_relaxed) <= until) {
+        return 1;
+    }
+    if (kernel->GetHostInbox(1).Pending()) {
+        return 2;
+    }
+    if (!kernel->GetHostInbox(0).Empty()) {
+        return 3;
+    }
+    return forward_pending.load(std::memory_order_acquire) ? 4 : 5;
+}
+#endif
+
+void System::HostIdle(u32 host) {
+    const auto cores = HostCores(host);
+    HostClock& me = host_clock[host];
+    const HostClock& other = host_clock[host ^ 1];
+    Kernel::HostInbox& inbox = kernel->GetHostInbox(host);
+    const u64 now = cores.front()->GetTimer().GetTicks();
+    s64 slice = Timing::MAX_SLICE_LENGTH;
+    for (const auto& core : cores) {
+        slice = std::min(slice, core->GetTimer().GetMaxSliceLength());
+    }
+    u64 next = now + static_cast<u64>(std::max<s64>(slice, 0));
+    // The second thread with no guest thread at all: nothing of its timer needs it awake. A thread
+    // made for it comes as a message, which wakes it.
+    if (host == 1 && std::all_of(cores.begin(), cores.end(), [&](const auto& core) {
+            return kernel->GetThreadManager(core->GetID()).GetThreadList().empty();
+        })) {
+        next = ~0ull;
+    }
+    me.next.store(next, std::memory_order_relaxed);
+    me.clock.store(now, std::memory_order_relaxed);
+    // No wake for the other here: of two hosts going idle, one sees the other idle (both store
+    // their own flag before reading the other's), goes to the sooner of their next events and wakes
+    // the other when its own is due (below). A wake at every idle is a syscall for nothing.
+    me.idle.store(true, std::memory_order_seq_cst);
+    // Something to do at once: a message, host 1's stop, host 0's forwarded svc.
+    const auto work = [&] {
+        return !inbox.Empty() || (host == 0 ? forward_pending.load(std::memory_order_acquire)
+                                            : second_host_stop.load(std::memory_order_acquire));
+    };
+    // The other host idle: no thread to run and no message waiting for it (a message runs a
+    // thread there, at its clock).
+    Kernel::HostInbox& other_inbox = kernel->GetHostInbox(host ^ 1);
+    const auto other_idles = [&] {
+        return other.idle.load(std::memory_order_seq_cst) && !other_inbox.Pending();
+    };
+    u64 to = now;
+#ifdef VITA_DIAGNOSTICS
+    bool slept_any = false, at_work = false, last_other_idle = false;
+#endif
+    for (;;) {
+        const bool other_idle = other_idles();
+        const u64 other_clock = other.clock.load(std::memory_order_seq_cst);
+#ifdef VITA_DIAGNOSTICS
+        last_other_idle = other_idle;
+#endif
+        if (work()) {
+            // Woken: where the other one runs, at most to this one's next event.
+            to = other_idle ? now : std::clamp(other_clock, now, next);
+#ifdef VITA_DIAGNOSTICS
+            at_work = true;
+#endif
+            break;
+        }
+        // The clock jumps to the next event only with both hosts idle (the sooner of their next
+        // events); while the other runs, this one follows its clock, up to its own next event. A
+        // jump past the running one let host 0 run its events before the other's threads answered
+        // them: DSP frames written a tick late, ticks in bursts, frames paced wrong. Following
+        // exactly makes host 0 sleep for the second thread's clock; a slice of slack each way, or
+        // none only before the DSP's tick, let the second thread idle past host 0 and take its
+        // interrupts in its past. Most of the sleep is the second thread's own run, not the wake: a
+        // spin before the sleep gained nothing.
+        to = std::min(next, other_idle ? other.next.load(std::memory_order_seq_cst) : other_clock);
+        if (to > now) {
+            break;
+        }
+        // Both idle, and the other's next event due by this clock (it is behind): it moves.
+        if (other_idle && now >= other.next.load(std::memory_order_seq_cst)) {
+            kernel->GetHostInbox(host ^ 1).Wake();
+        }
+#ifdef VITA_DIAGNOSTICS
+        const auto slept_from = std::chrono::steady_clock::now();
+#endif
+        inbox.SleepUntil([&] {
+            return work() || other_idles() != other_idle ||
+                   other.clock.load(std::memory_order_seq_cst) >= next;
+        });
+#ifdef VITA_DIAGNOSTICS
+        slept_any = true;
+        const u64 slept = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                               std::chrono::steady_clock::now() - slept_from)
+                                               .count());
+        (host == 0 ? second_census.host0_idle_us : second_census.idle_us) += slept;
+        // What ended host 0's sleep: a message (or forwarded svc), the other's clock at its next
+        // event, the other going idle or running again.
+        if (host == 0) {
+            const u32 why = work()                                                   ? 0
+                            : other.clock.load(std::memory_order_relaxed) >= next ? 1
+                            : other_idles() != other_idle                         ? 2
+                                                                                  : 3;
+            second_census.host0_woken[why]++;
+            second_census.host0_woken_us[why] += slept;
+            if (why == 1) {
+                const u64 from_us = static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        slept_from.time_since_epoch())
+                        .count());
+                const u64 woke_us = other.woke_other_us.load(std::memory_order_relaxed);
+                if (woke_us >= from_us) {
+                    second_census.clock_wakes_timed++;
+                    second_census.clock_wake_latency_us += from_us + slept - woke_us;
+                }
+                constexpr std::array<u64, 5> limits{10, 25, 50, 100, 250};
+                second_census.clock_sleeps_by_length[static_cast<std::size_t>(
+                    std::upper_bound(limits.begin(), limits.end(), slept) - limits.begin())]++;
+            }
+        }
+#endif
+    }
+#ifdef VITA_DIAGNOSTICS
+    (host == 0 ? second_census.host0_idles : second_census.idles)++;
+    if (host == 0) {
+        const u32 how = slept_any ? 4 : at_work ? 0 : to >= next ? (last_other_idle ? 1 : 2) : 3;
+        second_census.host0_idle_how[how]++;
+        if (!slept_any && to > now) {
+            second_census.host0_jump_ticks += to - now;
+        }
+    }
+#endif
+    me.idle.store(false, std::memory_order_seq_cst);
+    if (to > now) {
+        for (const auto& core : cores) {
+            Timing::Timer& timer = core->GetTimer();
+            const u64 at = timer.GetTicks();
+            if (to > at) {
+                timer.SetNextSlice(static_cast<s64>(to - at));
+                timer.Idle();
+            }
+        }
+        me.clock.store(to, std::memory_order_seq_cst);
+        if (other.idle.load(std::memory_order_seq_cst) &&
+            to >= other.next.load(std::memory_order_relaxed)) {
+            kernel->GetHostInbox(host ^ 1).Wake();
+        }
+    }
+}
+
+void System::MoveWaitsToFirstHost(bool starting) {
+    for (u32 core = 1; core < cpu_cores.size(); core++) {
+        auto& manager = kernel->GetThreadManager(core);
+        for (const auto& thread : manager.GetThreadList()) {
+            switch (thread->status) {
+            case Kernel::ThreadStatus::WaitSynchAny:
+            case Kernel::ThreadStatus::WaitSynchAll:
+            case Kernel::ThreadStatus::WaitHleEvent:
+            case Kernel::ThreadStatus::WaitIPC:
+            case Kernel::ThreadStatus::WaitArb:
+                break;
+            default:
+                continue; // sleeps stay on their own core's timer
+            }
+            if (starting) {
+                // A wait host 0 made: it stays host 0's, its timeout on host 0's timer.
+                timing->MoveEvent(manager.WakeupEventType(), thread->thread_id, core, 0);
+            } else if (thread->wait_host == 1) {
+                // Host 1's event or arbiter wait: into host 0's lists, which host 0 alone wakes
+                // now.
+                for (const auto& object : thread->wait_objects) {
+                    if (object->GetHandleType() == Kernel::HandleType::Event) {
+                        static_cast<Kernel::Event&>(*object).MoveWaiter(thread.get(), 1, 0);
+                    }
+                }
+                if (thread->status == Kernel::ThreadStatus::WaitArb &&
+                    thread->wait_arbiter != nullptr) {
+                    thread->wait_arbiter->MoveWaiterToFirstHost(thread.get());
+                }
+                thread->wait_host = 0;
+            }
+        }
+    }
+}
+
+#ifdef VITA_DIAGNOSTICS
+System::SecondHostCensus System::TakeSecondHostCensus() {
+    const SecondHostCensus taken = second_census;
+    second_census = {};
+    return taken;
+}
+
+void System::DumpGuestThreads() {
+    for (u32 c = 0; c < cpu_cores.size(); c++) {
+        auto& manager = kernel->GetThreadManager(c);
+        const Kernel::Thread* const current = manager.GetCurrentThread();
+        std::string line = fmt::format("threads: core {} (host {}, clock {}) current {}:", c,
+                                       HostOfCore(c), cpu_cores[c]->GetTimer().GetTicks(),
+                                       current != nullptr ? current->thread_id : 0);
+        for (const auto& t : manager.GetThreadList()) {
+            fmt::format_to(std::back_inserter(line),
+                           " [{} p{} s{} h{}{}{} pc {:08x} lr {:08x} r0 {:08x}", t->thread_id,
+                           t->current_priority, static_cast<u32>(t->status), t->wait_host,
+                           t->handoff_pending ? " handoff" : "",
+                           t->wakeup_queued ? " timed" : "", t->context.cpu_registers[15],
+                           t->context.cpu_registers[14], t->context.cpu_registers[0]);
+            for (const auto& o : t->wait_objects) {
+                fmt::format_to(std::back_inserter(line), " {}:{}", o->GetTypeName(), o->GetName());
+                if (o->GetHandleType() == Kernel::HandleType::Event) {
+                    const auto st = static_cast<const Kernel::Event&>(*o).DebugState();
+                    fmt::format_to(std::back_inserter(line), "({:x} {}/{})", st[0], st[1],
+                                   st[2]);
+                }
+            }
+            if (t->status == Kernel::ThreadStatus::WaitArb) {
+                fmt::format_to(std::back_inserter(line), " arb {:08x}", t->wait_address);
+            }
+            line += "]";
+        }
+        LOG_INFO(Core, "{}", line);
+    }
+    if (cpu_cores.size() > 1) {
+        LOG_INFO(Core, "threads: core 1's CPU limiter: {}",
+                 kernel->GetThreadManager(1).GetCpuLimiter()->DebugState());
+    }
+    LOG_INFO(Core, "threads: hosts idle {}/{} clocks {}/{} next {}/{}, forward {}",
+             host_clock[0].idle.load(), host_clock[1].idle.load(), host_clock[0].clock.load(),
+             host_clock[1].clock.load(), host_clock[0].next.load(), host_clock[1].next.load(),
+             forward_pending.load());
+}
+#endif
+
+void System::StartSecondHost() {
+#ifdef CITRA_HAS_VITA_NATIVE
+    static_cast<ARM_VitaNative&>(*cpu_cores[0]).PrepareSecondHost();
+    second_host_stop.store(false, std::memory_order_relaxed);
+    second_host_attached.store(false, std::memory_order_relaxed);
+    second_failed.store(false, std::memory_order_relaxed);
+    const u64 now = cpu_cores[0]->GetTimer().GetTicks();
+    for (HostClock& c : host_clock) {
+        c.clock.store(now, std::memory_order_relaxed);
+        c.next.store(now, std::memory_order_relaxed);
+        c.idle.store(false, std::memory_order_relaxed);
+    }
+    // Created on its own core: azaharAttach joins the core it is called on, and the role's pin
+    // need not move a thread before its next reschedule. Begun on this core, which waits below,
+    // it could attach here and run the other cores' guest in host 0's view (Super Monkey Ball's
+    // undefined instruction after a savestate); azaharnative 74 refuses such an attach.
+    second_host = std::make_unique<Common::NamedThread>(
+        Common::ThreadCfg{"emulation-2", 1024 * 1024,
+                          Common::RoleCoreMask(Common::ThreadRole::SecondEmulation)},
+        [this] { SecondHostMain(); });
+    Kernel::HostInbox& inbox = kernel->GetHostInbox(0);
+    while (!second_host_attached.load(std::memory_order_acquire) &&
+           !second_failed.load(std::memory_order_acquire)) {
+        inbox.SleepUntil([&] {
+            return second_host_attached.load(std::memory_order_acquire) ||
+                   second_failed.load(std::memory_order_acquire);
+        });
+    }
+    if (second_failed.load(std::memory_order_acquire)) {
+        second_host->join();
+        second_host.reset();
+        return; // RunLoop takes its status
+    }
+    // Every core is host 0's until here: the waits it made for the others time out on its own
+    // timer from now on; then the cores are the second thread's.
+    MoveWaitsToFirstHost(true);
+    multi_host.store(true, std::memory_order_seq_cst);
+    kernel->GetHostInbox(1).Wake();
+    LOG_INFO(Core, "second emulation thread: cores 1-{} on their own Vita core",
+             cpu_cores.size() - 1);
+#endif
+}
+
+void System::StopSecondHost() {
+    if (!second_host) {
+        return;
+    }
+    second_host_stop.store(true, std::memory_order_seq_cst);
+    kernel->GetHostInbox(1).Wake();
+    // It may wait for an svc of its own meanwhile.
+    Kernel::HostInbox& inbox = kernel->GetHostInbox(0);
+    while (second_host_attached.load(std::memory_order_acquire)) {
+        ServeForward();
+        inbox.SleepUntil([&] {
+            return !second_host_attached.load(std::memory_order_acquire) ||
+                   forward_pending.load(std::memory_order_acquire);
+        });
+    }
+    second_host->join();
+    second_host.reset();
+    multi_host.store(false, std::memory_order_seq_cst);
+    host1_tp = 0;
+    running_core[1] = cpu_cores[0].get();
+    kernel->current_cpu[1] = nullptr;
+    MoveWaitsToFirstHost(false);
+    // What was on its way to the second thread is host 0's now.
+    kernel->ProcessHostMessages(1);
+    kernel->ProcessHostMessages(0);
+    LOG_INFO(Core, "second emulation thread stopped");
+}
+
+void System::SecondHostSvc(u32 core_id, Kernel::SVCContext& svc, u32 immediate) {
+    if (svc.LocalToSecondHost(immediate)) {
+#ifdef VITA_DIAGNOSTICS
+        second_census.local_svcs++;
+        second_census.local_svcs_by[immediate & 0xFF]++;
+#endif
+        svc.CallSVCLocal(immediate);
+        return;
+    }
+#ifdef VITA_DIAGNOSTICS
+    second_census.forwards++;
+    second_census.forward_svcs[immediate & 0xFF]++;
+    const auto forward_from = std::chrono::steady_clock::now();
+#endif
+    forward_kind = ForwardKind::Svc;
+    forward_core = core_id;
+    forward_immediate = immediate;
+    forward_svc = &svc;
+    ForwardToFirstHost();
+#ifdef VITA_DIAGNOSTICS
+    second_census.forward_wait_us += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                              forward_from)
+            .count());
+#endif
+    // Host 0 rescheduled the core after the svc: its thread may be another.
+    PrepareReschedule();
+}
+
+bool System::SecondHostHeldPage(u32 core_id) {
+#ifdef VITA_DIAGNOSTICS
+    second_census.held_pages++;
+#endif
+    forward_kind = ForwardKind::HeldPage;
+    forward_core = core_id;
+    ForwardToFirstHost();
+    return forward_taken;
+}
+
+void System::ForwardToFirstHost() {
+    host1_parked.store(true, std::memory_order_seq_cst);
+    forward_pending.store(true, std::memory_order_seq_cst);
+    kernel->GetHostInbox(0).Wake();
+    Kernel::HostInbox& inbox = kernel->GetHostInbox(1);
+    while (forward_pending.load(std::memory_order_acquire)) {
+        inbox.SleepUntil([&] { return !forward_pending.load(std::memory_order_acquire); });
+    }
+    host1_parked.store(false, std::memory_order_seq_cst);
+}
+
+void System::ServeForward() {
+    if (!forward_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    // The core's register file, thread manager and process are the svc's; the waits it makes
+    // time out on host 0's timer (core 0's), whose events are host 0's to run.
+    ARM_Interface* const own = running_core[0];
+    SetRunning(cpu_cores[forward_core].get());
+    timing->SetCurrentTimer(0);
+#ifdef CITRA_HAS_VITA_NATIVE
+    auto& core = static_cast<ARM_VitaNative&>(*cpu_cores[forward_core]);
+    if (forward_kind == ForwardKind::HeldPage) {
+        // The second core stores to pages the GPU's queued work holds.
+        forward_taken = core.TakeForwardedHeldPage();
+#ifdef VITA_DIAGNOSTICS
+        second_census.raced_holds += core.forward_raced ? 1 : 0;
+#endif
+    } else {
+        core.CallForwardedSvc(forward_immediate);
+        // The core's thread switch, here: a thread the svc put to wait has its registers saved
+        // before host 0 may wake it and write its result.
+        kernel->GetThreadManager(forward_core).Reschedule();
+    }
+#else
+    forward_svc->CallSVC(forward_immediate);
+    kernel->GetThreadManager(forward_core).Reschedule();
+#endif
+    SetRunning(own);
+    forward_pending.store(false, std::memory_order_seq_cst);
+    kernel->GetHostInbox(1).Wake();
+#ifdef VITA_DIAGNOSTICS
+    second_census.served++;
+#endif
+}
+
+void System::SecondHostMain() {
+#ifdef CITRA_HAS_VITA_NATIVE
+    Common::SetCurrentThreadRole(Common::ThreadRole::SecondEmulation);
+    u32 tp;
+    asm volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(tp));
+    host1_tp = tp; // ThisHost() is 1 on this thread from here on
+    Kernel::HostInbox& inbox = kernel->GetHostInbox(1);
+    if (!ARM_VitaNative::AttachSecondHost()) {
+        SetStatus(ResultStatus::ErrorCoreExceptionRaised,
+                  "the second emulation thread's core could not join the guest");
+        kernel->GetHostInbox(0).Wake();
+        return;
+    }
+    second_host_attached.store(true, std::memory_order_seq_cst);
+    kernel->GetHostInbox(0).Wake();
+    while (!multi_host.load(std::memory_order_acquire) &&
+           !second_host_stop.load(std::memory_order_acquire)) {
+        inbox.SleepUntil([&] {
+            return multi_host.load(std::memory_order_acquire) ||
+                   second_host_stop.load(std::memory_order_acquire);
+        });
+    }
+    const auto cores = HostCores(1);
+    SetRunning(cores.front().get());
+    while (!second_host_stop.load(std::memory_order_acquire) &&
+           !second_failed.load(std::memory_order_acquire)) {
+        kernel->ProcessHostMessages();
+        // RunLoop's pass over these cores: each core's events, then each runs up to where the
+        // one before it got.
+        s64 max_slice = Timing::MAX_SLICE_LENGTH;
+        bool any = false;
+        for (const auto& core : cores) {
+            SetRunning(core.get());
+            core->GetTimer().Advance();
+            core->PrepareReschedule();
+            kernel->GetThreadManager(core->GetID()).Reschedule();
+            max_slice = std::min(max_slice, core->GetTimer().GetMaxSliceLength());
+            any |= kernel->GetCurrentThreadManager().GetCurrentThread() != nullptr;
+        }
+#ifdef VITA_DIAGNOSTICS
+        second_census.passes++;
+#endif
+        if (!any) {
+            HostIdle(1);
+            continue;
+        }
+        // The cores with a thread run, each up to where the one before it got; then the idle
+        // ones follow the furthest, never ahead of it (an idle core first in the pass would run a
+        // whole slice ahead each pass and take the clock with it).
+        std::optional<u64> reached;
+        u32 ran = 0;
+        for (const auto& core : cores) {
+            SetRunning(core.get());
+            if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
+                continue;
+            }
+            ran |= 1u << core->GetID();
+            if (reached) {
+                const u64 at = core->GetTimer().GetTicks();
+                max_slice = *reached > at ? static_cast<s64>(*reached - at) : 0;
+            }
+            core->GetTimer().SetNextSlice(max_slice);
+            const u64 start = core->GetTimer().GetTicks();
+#ifdef VITA_DIAGNOSTICS
+            second_census.runs++;
+#endif
+            core->Run();
+            max_slice = static_cast<s64>(core->GetTimer().GetTicks() - start);
+            reached = std::max(reached.value_or(0), core->GetTimer().GetTicks());
+            Reschedule();
+        }
+        for (const auto& core : cores) {
+            if ((ran >> core->GetID() & 1) != 0) {
+                continue; // its slice is its timer's until the next Advance
+            }
+            Timing::Timer& timer = core->GetTimer();
+            const u64 at = timer.GetTicks();
+            if (*reached > at) {
+                SetRunning(core.get());
+                timer.SetNextSlice(static_cast<s64>(*reached - at));
+                timer.Idle();
+            }
+        }
+        PublishClock(1);
+#ifdef VITA_DIAGNOSTICS
+        second_census.lead = static_cast<s64>(host_clock[1].clock.load(std::memory_order_relaxed) -
+                                              host_clock[0].clock.load(std::memory_order_relaxed));
+#endif
+    }
+    ARM_VitaNative::DetachSecondHost();
+    second_host_attached.store(false, std::memory_order_seq_cst);
+    kernel->GetHostInbox(0).Wake();
+#endif
 }
 
 System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
@@ -645,7 +1221,7 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
         }
     }
 #endif // CITRA_HAS_VITA_NATIVE
-    running_core = cpu_cores[0].get();
+    running_core.fill(cpu_cores[0].get());
 
     kernel->SetCPUs(cpu_cores);
     kernel->SetRunningCPU(cpu_cores[0].get());
@@ -821,6 +1397,7 @@ static void SavestateTrace(const char* what) {
 }
 
 void System::Shutdown(bool is_deserializing) {
+    StopSecondHost();
 
     // Shutdown emulation session
     is_powered_on = false;
