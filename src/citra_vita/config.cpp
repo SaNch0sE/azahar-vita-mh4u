@@ -68,6 +68,7 @@ const std::array<Definition, Count> definitions{{
     // Full speed: applied only with vsync off (vsync holds the display's rate itself).
     {"speed_limit", true, true, 0, 200, 100, {}},
     {"frame_skip_limit", true, true, 0, NoFrameSkipLimit, 2, Skips},
+    {"wait_for_gpu", true, true, 0, 1, 1, Toggle},
     {"skip_right_eye", true, true, 0, 1, 1, Toggle},
     {"stretch_audio", false, true, 0, 1, 1, Toggle},
     {"right_stick", true, true, 0, static_cast<int>(RightStickMode::Count) - 1, 0, RightStickWords},
@@ -187,6 +188,9 @@ void ApplyLocked(Option option) {
         SgxdRenderer::RenderThread::SetMaxScreenSkips(
             value == NoFrameSkipLimit ? SgxdRenderer::RenderThread::NoScreenSkipLimit
                                       : static_cast<u32>(value));
+        break;
+    case Option::WaitForGpu:
+        SgxdRenderer::RenderThread::SetReadbackHolds(value != 0);
         break;
     case Option::SkipRightEye:
         Settings::values.disable_right_eye_render = value != 0;

@@ -338,6 +338,9 @@ struct HostGuard {
     std::function<void(const u8* host, u32 size, bool write)> access;
     /// A guest window was mapped over [host, host + size): its holds go to it too.
     std::function<void(const u8* host, u32 size)> remapped;
+    /// A read by the GPU's own side (GuardPhysicalRead), within one page: it waits for the queued
+    /// GPU writes over those bytes whatever the guest's view of the page.
+    std::function<void(const u8* host, u32 size)> gpu_read;
 };
 
 class MemorySystem {
@@ -350,9 +353,10 @@ public:
     /// The native backend mapped a guest window over [host, host + size) (HostGuard::remapped).
     void HostRemapped(const u8* host, u32 size);
     /**
-     * The host reads [address, address + size), physical, through GetPhysicalPointer: each held
-     * page waits for its GPU work first, as the block reads do (HostGuard). The PICA's command
-     * list parser reads this way what a queued DMA may still be writing.
+     * The GPU's own side reads [address, address + size), physical, through GetPhysicalPointer:
+     * the queued GPU writes over those bytes are waited for first (HostGuard::gpu_read), whatever
+     * the guest's view of the page. The PICA's command list parser reads this way what a queued
+     * DMA may still be writing.
      */
     void GuardPhysicalRead(PAddr address, u32 size);
 

@@ -210,6 +210,7 @@ void GPU::EnablePageHolds() {
             impl->render->HostAccess(host, size, write);
         },
         [this](const u8* host, u32 size) { impl->render->HostRemapped(host, size); },
+        [this](const u8* host, u32 size) { impl->render->GpuRead(host, size); },
     });
 }
 

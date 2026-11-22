@@ -78,6 +78,7 @@ public:
     /// The late skip's cap: how many frames in a row it may drop one screen's draws while the GPU lags
     /// (0 none, NoScreenSkipLimit any number). Read at each frame's end; any thread.
     static void SetMaxScreenSkips(u32 frames);
+    static void SetReadbackHolds(bool on);
     [[nodiscard]] static u32 MaxScreenSkips();
     static constexpr u32 NoScreenSkipLimit = 0xFFFFFFFF;
 
@@ -175,6 +176,9 @@ public:
     /// A guest access aborted on the page of `host`: whether a hold refused it. If so, the work it
     /// waited for is done and the page open, and the guest runs the access again.
     bool PageFault(const u8* host, bool write, u32 guest_pc, u32 guest_va);
+    /// A GPU-side read of guest memory (a list's parse, an index scan): waits for the queued GPU writes
+    /// over those bytes, whatever the guest's view.
+    void GpuRead(const u8* host, u32 size);
     /// The holds' changes sent, then whether the record lets this access through: an abort that came
     /// before its page's change reached the descriptor (host 1's) may run again.
     bool AccessOpenAfterFlush(const u8* host, bool write);
@@ -641,6 +645,9 @@ private:
     void PutPageRemaps();
     /// Waits for the work a guest access to the page waits for, the open holds' ticket fenced first.
     void WaitHeldPage(u32 page, bool write);
+    /// Waits until the GPU has reached `ticket` (0: nothing to wait for), the open holds'
+    /// ticket fenced first.
+    void WaitTicket(u32 ticket);
     /// Guest FCRAM written (a watched texture page, or the HLE's write): the render side marks the
     /// textures over it written, in order with the work.
     void TexturesWritten(PAddr address, u32 size);

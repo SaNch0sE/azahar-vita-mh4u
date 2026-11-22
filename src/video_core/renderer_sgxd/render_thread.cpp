@@ -2242,7 +2242,24 @@ void RenderThread::ReleasePageHolds() {
 }
 
 void RenderThread::WaitHeldPage(u32 page, bool write) {
-    const u32 ticket = page_holds.WaitFor(page, write, reached.load(std::memory_order_acquire));
+    WaitTicket(page_holds.WaitFor(page, write, reached.load(std::memory_order_acquire)));
+}
+
+void RenderThread::GpuRead(const u8* host, u32 size) {
+    if (!page_holds_on) {
+        return;
+    }
+    const u8* const end = host + size;
+    for (const u8* p = host; p < end;
+         p = reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1)) {
+        const u8* const page_end =
+            reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1);
+        const u32 bytes = static_cast<u32>(std::min(end, page_end) - p);
+        WaitTicket(page_holds.GpuReadWaitFor(p, bytes, reached.load(std::memory_order_acquire)));
+    }
+}
+
+void RenderThread::WaitTicket(u32 ticket) {
     if (ticket == 0) {
         return;
     }
@@ -3776,6 +3793,10 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         break;
     }
     }
+}
+
+void RenderThread::SetReadbackHolds(bool on) {
+    PageHolds::SetReadbackHolds(on);
 }
 
 void RenderThread::SetMaxScreenSkips(u32 frames) {

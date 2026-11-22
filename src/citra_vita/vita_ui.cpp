@@ -1304,6 +1304,16 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::WaitForGpu,
+         Category::Speed,
+         Kind::Toggle,
+         "Wait for GPU results",
+         "The game waits for the GPU to finish a picture before reading it, as on a 3DS. Off can "
+         "run faster, but may cause flickering, outdated or missing pictures and broken effects.",
+         {},
+         0,
+         nullptr,
+         nullptr});
     add({Option::SkipRightEye,
          Category::Speed,
          Kind::Toggle,

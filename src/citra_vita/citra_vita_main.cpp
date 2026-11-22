@@ -427,6 +427,10 @@ StateArguments TakeStateArguments() {
                    std::atoi(argument.c_str() + 6) < Config::NoFrameSkipLimit) {
             // The late skip's cap in frames, 0 to 4 as the settings offer them.
             Config::Pin(Option::FrameSkipLimit, std::atoi(argument.c_str() + 6));
+        } else if (argument.starts_with("gpuwait=")) {
+            Config::Pin(Option::WaitForGpu, std::atoi(argument.c_str() + 8) != 0 ? 1 : 0);
+        } else if (argument.starts_with("righteye=")) {
+            Config::Pin(Option::SkipRightEye, std::atoi(argument.c_str() + 9) != 0 ? 1 : 0);
         } else if (argument.starts_with("save=")) {
             a.save = std::atoi(argument.c_str() + 5);
             if (const std::size_t at = argument.find('@'); at != std::string::npos) {

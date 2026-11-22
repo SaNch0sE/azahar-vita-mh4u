@@ -572,14 +572,16 @@ void MemorySystem::HostRemapped(const u8* host, u32 size) {
 }
 
 void MemorySystem::GuardPhysicalRead(PAddr address, u32 size) {
-    if (impl->host_guard.held == nullptr) {
+    if (!impl->host_guard.gpu_read) {
         return;
     }
     const PAddr end = address + size;
     for (PAddr at = address; at < end;) {
         const PAddr page_end = (at & ~CITRA_PAGE_MASK) + CITRA_PAGE_SIZE;
         const u32 bytes = std::min(end, page_end) - at;
-        impl->Guard(GetPhysicalPointer(at), bytes, false);
+        if (const u8* const host = GetPhysicalPointer(at)) {
+            impl->host_guard.gpu_read(host, bytes);
+        }
         at += bytes;
     }
 }

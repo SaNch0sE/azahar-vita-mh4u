@@ -104,7 +104,18 @@ public:
     static constexpr u32 NoPage = ~0u;
     /// The ticket a guest access to the page must wait for, 0 for none: a read waits for the
     /// page's last GPU writer, a write for its last reader too. Tickets past `reached` only.
+    /// With the readback holds off, no GPU writer.
     [[nodiscard]] u32 WaitFor(u32 page, bool write, u32 reached) const;
+    /// The frontend's "wait for GPU results" (any thread). Off: a queued GPU write closes no page
+    /// to the guest, and no access of the guest's or the HLE's waits for one: they read what
+    /// is there before the GPU's work lands. Queued reads still hold their pages against
+    /// writes, and the GPU's own reads of guest memory still wait (GpuReadWaitFor): a stale
+    /// command list or index buffer could stop the GPU.
+    static void SetReadbackHolds(bool on);
+    /// The ticket a read by the GPU's own side of [host, host + bytes), inside one page, waits
+    /// for (a list's parse, an index scan: MemorySystem::GuardPhysicalRead): the page's live GPU
+    /// write when it covers those bytes, else 0. Whatever the guest's view.
+    [[nodiscard]] u32 GpuReadWaitFor(const u8* host, u32 bytes, u32 reached) const;
     /// Whether [host, host + bytes), inside one page, touches the bytes the page's live GPU writes
     /// cover: a read clear of them needs no wait for those writes. A hold takes whole pages, and a
     /// buffer's first and last pages are shared with what lies beside it (command buffers past a

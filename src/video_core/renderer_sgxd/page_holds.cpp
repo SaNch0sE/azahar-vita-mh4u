@@ -426,6 +426,14 @@ void PageHolds::IndexWrittenUnsent(u32 page, u32 reached) {
     }
 }
 
+namespace {
+std::atomic<bool> readback_holds{true};
+} // namespace
+
+void PageHolds::SetReadbackHolds(bool on) {
+    readback_holds.store(on, std::memory_order_relaxed);
+}
+
 void PageHolds::Unwatch(u32 page, u32 reached) {
     UnwatchUnsent(page, reached);
     Flush();
@@ -443,7 +451,7 @@ void PageHolds::UnwatchUnsent(u32 page, u32 reached) {
 }
 
 PageHolds::Access PageHolds::HoldsWant(u32 page, u32 reached) const {
-    if (Live(write_ticket[page], reached)) {
+    if (Live(write_ticket[page], reached) && readback_holds.load(std::memory_order_relaxed)) {
         return NoAccess;
     }
     if (page >= fcram_pages) {
@@ -457,11 +465,14 @@ PageHolds::Access PageHolds::HoldsWant(u32 page, u32 reached) const {
 }
 
 u32 PageHolds::WaitFor(u32 page, bool write, u32 reached) const {
-    // A versioned page: writes go on without a wait (a GPU write queued aside).
+    const bool writer = Live(write_ticket[page], reached) &&
+                        readback_holds.load(std::memory_order_relaxed);
+    // A versioned page: writes go on without a wait, but for a queued GPU write to it, which a
+    // write waits for even with Wait for GPU off: Version takes no slot past a queued GPU write.
     if (page < fcram_pages && versions[page].on) {
-        return Live(write_ticket[page], reached) ? write_ticket[page] : 0;
+        return writer || (write && Live(write_ticket[page], reached)) ? write_ticket[page] : 0;
     }
-    u32 ticket = Live(write_ticket[page], reached) ? write_ticket[page] : 0;
+    u32 ticket = writer ? write_ticket[page] : 0;
     if (write) {
         const u32 read = page >= fcram_pages ? vram_read : read_ticket[page];
         if (Live(read, reached) && (ticket == 0 || static_cast<s32>(read - ticket) > 0)) {
@@ -469,6 +480,14 @@ u32 PageHolds::WaitFor(u32 page, bool write, u32 reached) const {
         }
     }
     return ticket;
+}
+
+u32 PageHolds::GpuReadWaitFor(const u8* host, u32 bytes, u32 reached) const {
+    const u32 page = PageOf(host);
+    if (page == NoPage || !Live(write_ticket[page], reached) || !TouchesWrite(host, bytes)) {
+        return 0;
+    }
+    return write_ticket[page];
 }
 
 void PageHolds::AddRange(std::array<u16, 2>& lo, std::array<u16, 2>& hi, u16 l, u16 h) {
@@ -625,7 +644,7 @@ void PageHolds::Flip(u32 page, u16 slot) {
 bool PageHolds::Version(u32 page, u32 reached) {
     DEBUG_ASSERT(page < fcram_pages);
     PageVersion& v = versions[page];
-    // A GPU write queued: the guest waits for it, as the ordinary holds decide.
+    // A GPU write queued: the guest's write waits for it (WaitFor, whatever Wait for GPU says).
     if (Live(write_ticket[page], reached)) {
         return false;
     }

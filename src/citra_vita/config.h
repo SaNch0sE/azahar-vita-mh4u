@@ -46,6 +46,9 @@ enum class Option : u32 {
     /// How many frames in a row the late skip may leave a screen out while the GPU lags
     /// (RenderThread::SetMaxScreenSkips): 0 to 4, or NoFrameSkipLimit.
     FrameSkipLimit,
+    /// Whether the game waits for queued GPU work before it reads what that work writes
+    /// (RenderThread::SetReadbackHolds): 1, or 0 to read what is there at once.
+    WaitForGpu,
     /// A stereo title's right eye left undrawn: 1, or 0 to draw both eyes.
     SkipRightEye,
     StretchAudio,
