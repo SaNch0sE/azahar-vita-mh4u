@@ -76,6 +76,8 @@ void Timing::ScheduleEvent(s64 cycles_into_future, const TimingEventType* event_
     } else {
         ASSERT(core_id < timers.size());
         timer = timers.at(core_id).get();
+        // Another emulation thread's timer: its tick count is not this thread's to read.
+        thread_safe_mode |= HostOfCore(static_cast<u32>(core_id)) != ThisHost();
     }
 
     if (thread_safe_mode) {
@@ -107,7 +109,13 @@ void Timing::UnscheduleEvent(const TimingEventType* event_type, std::uintptr_t u
     if (event_queue_locked) {
         return;
     }
-    for (auto timer : timers) {
+    // This emulation thread's timers: the other's queues are its own to change.
+    const u32 host = ThisHost();
+    for (u32 i = 0; i < timers.size(); i++) {
+        if (HostOfCore(i) != host) {
+            continue;
+        }
+        const auto& timer = timers[i];
         auto itr = std::remove_if(
             timer->event_queue.begin(), timer->event_queue.end(),
             [&](const Event& e) { return e.type == event_type && e.user_data == user_data; });
@@ -125,7 +133,12 @@ void Timing::RemoveEvent(const TimingEventType* event_type) {
     if (event_queue_locked) {
         return;
     }
-    for (auto timer : timers) {
+    const u32 host = ThisHost();
+    for (u32 i = 0; i < timers.size(); i++) {
+        if (HostOfCore(i) != host) {
+            continue;
+        }
+        const auto& timer = timers[i];
         auto itr = std::remove_if(timer->event_queue.begin(), timer->event_queue.end(),
                                   [&](const Event& e) { return e.type == event_type; });
 

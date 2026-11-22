@@ -63,10 +63,14 @@ public:
     /// code locks and unlocks it through this word, which the core's svc thunks share: free
     /// (LeaseFree), held by a thread (its ID << 8 | its lock count, 1-255), or the kernel's
     /// (LeaseKernel: lock_count and holding_thread are the truth). Every kernel use of the mutex
-    /// takes the state back first (Reclaim), and an unlocked mutex no thread waits on is lent
-    /// again (Relet).
+    /// takes the state back first (Reclaim), and it is lent again free, held, or held with
+    /// waiters (Relet).
     static constexpr u32 LeaseFree = 0;
     static constexpr u32 LeaseKernel = 0xFFFFFFFF;
+    /// With a holder's word: threads wait on it (the kernel has them, and the holder's boost).
+    /// The holder's nested locks and unlocks change the count in the word; its last unlock comes
+    /// to the kernel.
+    static constexpr u32 LeaseWaiters = 0x80000000;
     u32* lease = nullptr;
     void Reclaim() const;
     void Relet();

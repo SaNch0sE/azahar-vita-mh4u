@@ -576,7 +576,8 @@ void LeaseReclaimHeld(u32 thread_id) {
     for (u32 i = 0; i < LeaseSlots; i++) {
         const u32 state = words[i];
         if (lease_owner[i] != nullptr && state != Kernel::Mutex::LeaseFree &&
-            state != Kernel::Mutex::LeaseKernel && state >> 8 == thread_id) {
+            state != Kernel::Mutex::LeaseKernel &&
+            (state & ~Kernel::Mutex::LeaseWaiters) >> 8 == thread_id) {
             lease_owner[i]->Reclaim();
         }
     }
@@ -2047,14 +2048,21 @@ std::optional<std::vector<u32>> MutexFastPath(u32 svc, u32 base, u32 resume) {
     w.push_back(0xE593301Cu); // ldr r3, [r3, #0x1c]: the running thread's ID
     labels[Retry] = w.size();
     w.push_back(0xE1912F9Fu); // ldrex r2, [r1]
+    // Held by this thread whether or not another waits (bit 31, Kernel::Mutex::LeaseWaiters):
+    // its nested locks and unlocks stay here; its last unlock with a waiter goes to the kernel.
     if (svc == 0x14) {
-        w.push_back(0xE023C422u); // eor r12, r3, r2, lsr #8
+        w.push_back(0xE3C2C102u); // bic r12, r2, #0x80000000
+        w.push_back(0xE023C42Cu); // eor r12, r3, r12, lsr #8
         w.push_back(0xE35C0000u); // cmp r12, #0: held by this thread
         branch(0x1, SlowClrex);
         w.push_back(0xE202C0FFu); // and r12, r2, #0xff
         w.push_back(0xE35C0001u); // cmp r12, #1
-        w.push_back(0x03A02000u); // moveq r2, #0: free
-        w.push_back(0x12422001u); // subne r2, r2, #1
+        w.push_back(0x12422001u); // subne r2, r2, #1: a nested unlock
+        branch(0x1, Store);
+        w.push_back(0xE3120102u); // tst r2, #0x80000000: a waiter
+        branch(0x1, SlowClrex);
+        w.push_back(0xE3A02000u); // mov r2, #0: free
+        labels[Store] = w.size();
         w.push_back(0xE181CF92u); // strex r12, r2, [r1]
         w.push_back(0xE35C0000u); // cmp r12, #0
         branch(0x1, Retry);
@@ -2063,7 +2071,8 @@ std::optional<std::vector<u32>> MutexFastPath(u32 svc, u32 base, u32 resume) {
         w.push_back(0x01A0C403u); // moveq r12, r3, lsl #8
         w.push_back(0x038CC001u); // orreq r12, r12, #1
         branch(0x0, Store);
-        w.push_back(0xE023C422u); // eor r12, r3, r2, lsr #8
+        w.push_back(0xE3C2C102u); // bic r12, r2, #0x80000000
+        w.push_back(0xE023C42Cu); // eor r12, r3, r12, lsr #8
         w.push_back(0xE35C0000u); // cmp r12, #0: held by this thread
         branch(0x1, SlowClrex);
         w.push_back(0xE202C0FFu); // and r12, r2, #0xff
@@ -2504,9 +2513,8 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
         ResumeUpcallClock(slice_timer, MinQuantumNs);
         return UpcallAnswer(regs[0], UpcallReschedule);
     };
-    // A mutex the thunk did not lock or unlock itself: lent to it from the next call on.
+    // A mutex the thunk did not handle itself: lent to it from the next call on.
     if (svc == 0x14 || svc == 0x24) {
-        std::scoped_lock lock{kernel.GetHLELock()};
         LeaseMutex(kernel, regs[0]);
     }
     core.svc_context.CallSVCForUpcall(svc);

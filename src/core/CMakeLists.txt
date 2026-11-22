@@ -140,6 +140,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hle/kernel/handle_table.h
     hle/kernel/hle_ipc.cpp
     hle/kernel/hle_ipc.h
+    hle/kernel/host_link.cpp
+    hle/kernel/host_link.h
     hle/kernel/ipc.cpp
     hle/kernel/ipc.h
     hle/kernel/ipc_debugger/recorder.cpp

@@ -4,10 +4,13 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <memory>
 #include <vector>
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
+#include "core/emu_host.h"
 #include "core/hle/kernel/object.h"
 #include "core/hle/kernel/thread.h"
 #include "core/hle/result.h"
@@ -53,6 +56,12 @@ public:
     Result ArbitrateAddress(std::shared_ptr<Thread> thread, ArbitrationType type, VAddr address,
                             s32 value, u64 nanoseconds);
 
+    /// The other emulation thread's signal of `address` (HostMessage::ArbiterSignal): up to
+    /// `count` of this host's waiters there (-1: all).
+    void ReceiveSignal(VAddr address, s32 count);
+    /// Thread `thread`'s wait from host 1's list to host 0's (the second emulation thread stopped).
+    void MoveWaiterToFirstHost(Thread* thread);
+
     class Callback;
 
 private:
@@ -67,6 +76,15 @@ private:
     /// Resume one thread found to be waiting on the address under this address arbiter and return
     /// the resumed thread.
     bool ResumeHighestPriorityThread(VAddr address);
+    /// Up to `count` of the calling host's waiters on `address` (-1: all), highest priority first.
+    u64 ResumeHostWaiters(VAddr address, s32 count);
+    /// The calling host's waiters (Core::ThisHost): host 0's are `waiting_threads` (the
+    /// savestate's), host 1's its own; each published count is for the other host's signals.
+    std::vector<std::shared_ptr<Thread>>& HostWaiters() {
+        return Core::ThisHost() == 0 ? waiting_threads : host1_waiting;
+    }
+    std::vector<std::shared_ptr<Thread>> host1_waiting;
+    std::array<std::atomic<u32>, Core::NumHosts> waiter_count{};
     /// Wakes a waiter a signal released, with a success result.
     static void ResumeSignaled(Thread& thread);
 

@@ -22,6 +22,7 @@
 #endif
 #include "core/hle/kernel/address_arbiter.h"
 #include "core/hle/kernel/errors.h"
+#include "core/hle/kernel/host_link.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/mutex.h"
 #include "core/hle/kernel/process.h"
@@ -316,7 +317,12 @@ void Thread::WakeAfterDelay(s64 nanoseconds, bool thread_safe_mode) {
     // Don't schedule a wakeup if the thread wants to wait forever
     if (nanoseconds == -1)
         return;
-    std::size_t core = thread_safe_mode ? core_id : std::numeric_limits<std::size_t>::max();
+    // From another host thread (an async section's end): on the timer of the emulation thread
+    // whose lists the wait is on, core 0's for a wait host 0 made for another host's thread.
+    std::size_t core = std::numeric_limits<std::size_t>::max();
+    if (thread_safe_mode) {
+        core = wait_host == Core::HostOfCore(core_id) ? core_id : 0;
+    }
 
     thread_manager.kernel.timing.ScheduleEvent(nsToCycles(nanoseconds),
                                                thread_manager.ThreadWakeupEventType, thread_id,
@@ -327,6 +333,7 @@ void Thread::WakeAfterDelay(s64 nanoseconds, bool thread_safe_mode) {
 void Thread::CancelWakeup() {
     if (!wakeup_queued) {
         DEBUG_ASSERT_MSG(thread_manager.cpu == nullptr ||
+                             Core::HostOfCore(core_id) != Core::ThisHost() ||
                              thread_manager.cpu->GetTimer().EventTime(
                                  thread_manager.ThreadWakeupEventType, thread_id) < 0,
                          "thread {} has a wakeup queued but no mark of it", thread_id);
@@ -338,6 +345,11 @@ void Thread::CancelWakeup() {
 
 void Thread::ResumeFromWait() {
     ASSERT_MSG(wait_objects.empty(), "Thread is waking up while waiting for objects");
+
+    // Woken already, on its way to the emulation thread that runs its core.
+    if (handoff_pending) {
+        return;
+    }
 
     switch (status) {
     case ThreadStatus::WaitSynchAll:
@@ -370,6 +382,24 @@ void Thread::ResumeFromWait() {
 
     wakeup_callback = nullptr;
 
+    // A thread of the other emulation thread's cores: its scheduler is that thread's to change.
+    // Its wakeup is this host's to cancel (a wait this host made for it times out here).
+    if (const u32 owner = Core::HostOfCore(core_id); owner != Core::ThisHost()) {
+        CancelWakeup();
+        handoff_pending = true;
+        thread_manager.kernel.SendToHost(
+            owner, HostMessage{HostMessage::Kind::Handoff, false, 0, SharedFrom(this)});
+        return;
+    }
+
+    thread_manager.ready_queue.push_back(current_priority, this);
+    status = ThreadStatus::Ready;
+    thread_manager.kernel.PrepareReschedule();
+}
+
+void Thread::ResumeHandedOff() {
+    ASSERT(handoff_pending && Core::HostOfCore(core_id) == Core::ThisHost());
+    handoff_pending = false;
     thread_manager.ready_queue.push_back(current_priority, this);
     status = ThreadStatus::Ready;
     thread_manager.kernel.PrepareReschedule();

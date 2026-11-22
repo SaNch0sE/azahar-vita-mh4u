@@ -10,6 +10,7 @@
 #include "common/archives.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "core/emu_host.h"
 #include "core/hle/kernel/errors.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/memory.h"
@@ -32,6 +33,9 @@ void WaitObject::serialize(Archive& ar, const unsigned int) {
 SERIALIZE_IMPL(WaitObject)
 
 void WaitObject::AddWaitingThread(std::shared_ptr<Thread> thread) {
+    // Host 0's objects but events (Event's own lists).
+    DEBUG_ASSERT_MSG(Core::ThisHost() == 0, "{} waited on from host 1", GetTypeName());
+    thread->wait_host = 0;
     auto itr = std::find(waiting_threads.begin(), waiting_threads.end(), thread);
     if (itr == waiting_threads.end())
         waiting_threads.push_back(std::move(thread));

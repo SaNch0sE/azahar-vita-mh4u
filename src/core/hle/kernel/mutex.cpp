@@ -6,6 +6,7 @@
 #include <boost/serialization/shared_ptr.hpp>
 #include <boost/serialization/string.hpp>
 #include "common/archives.h"
+#include <atomic>
 #include "common/assert.h"
 #include "core/core.h"
 #include "core/hle/kernel/errors.h"
@@ -59,16 +60,25 @@ std::shared_ptr<Mutex> KernelSystem::CreateMutex(bool initial_locked, std::strin
 }
 
 void Mutex::Reclaim() const {
-    if (lease == nullptr || *lease == LeaseKernel) {
+    if (lease == nullptr || std::atomic_ref<u32>(*lease).load() == LeaseKernel) {
         return;
     }
-    const u32 state = *lease;
-    *lease = LeaseKernel;
+    // One exchange: the second emulation thread's guest may lock or unlock it in its thunk at
+    // the same time (ldrex/strex), and a store between a read and this one would be lost.
+    const u32 state = std::atomic_ref<u32>(*lease).exchange(LeaseKernel);
     if (state == LeaseFree) {
         return;
     }
-    // Held by the guest's own lock: the holder and its count as Acquire would have kept them.
     auto& self = const_cast<Mutex&>(*this);
+    if ((state & LeaseWaiters) != 0) {
+        // Lent with waiters: the holder and its boost stayed the kernel's, the count is the
+        // word's.
+        DEBUG_ASSERT(self.holding_thread != nullptr &&
+                     ((state & ~LeaseWaiters) >> 8) == self.holding_thread->thread_id);
+        self.lock_count = static_cast<int>(state & 0xFF);
+        return;
+    }
+    // Held by the guest's own lock: the holder and its count as Acquire would have kept them.
     DEBUG_ASSERT(self.lock_count == 0 && self.holding_thread == nullptr);
     const std::shared_ptr<Thread> holder = kernel.GetThreadByID(state >> 8);
     ASSERT_MSG(holder != nullptr, "mutex lease held by thread {}, which is gone", state >> 8);
@@ -80,10 +90,39 @@ void Mutex::Reclaim() const {
 }
 
 void Mutex::Relet() {
-    if (lease != nullptr && lock_count == 0 && GetWaitingThreads().empty()) {
-        DEBUG_ASSERT(holding_thread == nullptr);
-        *lease = LeaseFree;
+    // From the kernel's state only: a release that woke a waiter lent the mutex as held by it
+    // already (RemoveWaitingThread), and its count here is 0 then, not free.
+    if (lease == nullptr || std::atomic_ref<u32>(*lease).load() != LeaseKernel) {
+        return;
     }
+    if (!GetWaitingThreads().empty()) {
+        // Held with waiters: the holder's nested locks and unlocks stay in the guest (each a
+        // forwarded svc otherwise); the kernel keeps the holder and its boost.
+        if (holding_thread != nullptr && lock_count > 0 && lock_count <= 0xFF) {
+            const u32 word = LeaseWaiters | holding_thread->thread_id << 8 |
+                             static_cast<u32>(lock_count);
+            lock_count = 0;
+            std::atomic_ref<u32>(*lease).store(word);
+        }
+        return;
+    }
+    if (lock_count == 0) {
+        DEBUG_ASSERT(holding_thread == nullptr);
+        std::atomic_ref<u32>(*lease).store(LeaseFree);
+        return;
+    }
+    // Held, and no thread waits: lent as held, so the holder's nested locks and unlocks stay in the
+    // guest's thunks (a kernel lock kept the lease the kernel's until the last unlock: every nested
+    // lock an upcall, or on the second emulation thread a forwarded svc).
+    if (lock_count > 0xFF || holding_thread == nullptr) {
+        return;
+    }
+    const u32 word = holding_thread->thread_id << 8 | static_cast<u32>(lock_count);
+    holding_thread->held_mutexes.erase(SharedFrom(this));
+    const std::shared_ptr<Thread> holder = std::move(holding_thread);
+    lock_count = 0;
+    holder->UpdatePriority();
+    std::atomic_ref<u32>(*lease).store(word);
 }
 
 bool Mutex::ShouldWait(const Thread* thread) const {
@@ -105,6 +144,7 @@ void Mutex::Acquire(Thread* thread) {
     }
 
     lock_count++;
+    Relet();
 }
 
 Result Mutex::Release(Thread* thread) {
@@ -136,8 +176,8 @@ Result Mutex::Release(Thread* thread) {
         holding_thread = nullptr;
         WakeupAllWaitingThreads();
         kernel.PrepareReschedule();
-        Relet();
     }
+    Relet();
 
     return ResultSuccess;
 }
@@ -147,6 +187,7 @@ void Mutex::AddWaitingThread(std::shared_ptr<Thread> thread) {
     WaitObject::AddWaitingThread(thread);
     thread->pending_mutexes.insert(SharedFrom(this));
     UpdatePriority();
+    Relet();
 }
 
 void Mutex::RemoveWaitingThread(Thread* thread) {

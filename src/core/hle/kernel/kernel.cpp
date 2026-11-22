@@ -13,6 +13,8 @@
 #include "core/hle/kernel/config_mem.h"
 #include "core/hle/kernel/handle_table.h"
 #include "core/hle/kernel/ipc_debugger/recorder.h"
+#include "core/hle/kernel/address_arbiter.h"
+#include "core/hle/kernel/event.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/memory.h"
 #include "core/hle/kernel/process.h"
@@ -43,6 +45,9 @@ KernelSystem::KernelSystem(Memory::MemorySystem& memory, Core::Timing& timing,
     timer_manager = std::make_unique<TimerManager>(timing);
     ipc_recorder = std::make_unique<IPCDebugger::Recorder>();
     stored_processes.assign(num_cores, nullptr);
+    for (auto& inbox : host_inboxes) {
+        inbox = std::make_unique<HostInbox>();
+    }
 
     next_thread_id = 1;
 }
@@ -118,6 +123,38 @@ void KernelSystem::SetRunningCPU(Core::ARM_Interface* cpu) {
     timing.SetCurrentTimer(cpu->GetID());
     if (stored_processes[current_cpu->GetID()]) {
         SetCurrentProcess(stored_processes[current_cpu->GetID()]);
+    }
+}
+
+void KernelSystem::SendToHost(u32 host, HostMessage&& message) {
+    host_inboxes[host]->Push(std::move(message));
+}
+
+void KernelSystem::ProcessHostMessages() {
+    const u32 host = Core::ThisHost();
+    HostInbox& inbox = *host_inboxes[host];
+    if (inbox.Empty()) {
+        return;
+    }
+    std::unique_lock<Common::RecursiveMutex> lock{hle_lock, std::defer_lock};
+    if (host == 0) {
+        lock.lock();
+    }
+    HostMessage message;
+    while (inbox.Pop(message)) {
+        switch (message.kind) {
+        case HostMessage::Kind::EventSignal:
+            static_cast<Event&>(*message.object).ReceiveSignal(message.seq, message.token);
+            break;
+        case HostMessage::Kind::Handoff:
+            static_cast<Thread&>(*message.object).ResumeHandedOff();
+            break;
+        case HostMessage::Kind::ArbiterSignal:
+            static_cast<AddressArbiter&>(*message.object)
+                .ReceiveSignal(message.seq, message.count);
+            break;
+        }
+        message.object.reset();
     }
 }
 

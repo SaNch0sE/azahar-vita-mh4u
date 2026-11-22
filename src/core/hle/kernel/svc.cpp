@@ -822,7 +822,8 @@ Result SVC::WaitSynchronization1(Handle handle, s64 nano_seconds) {
     LOG_TRACE(Kernel_SVC, "called handle=0x{:08X}({}:{}), nanoseconds={}", handle,
               object->GetTypeName(), object->GetName(), nano_seconds);
 
-    if (object->ShouldWait(thread)) {
+    // An event the other emulation thread may take in between: checked and taken in one step.
+    if (!object->TryAcquire(thread)) {
         R_UNLESS(nano_seconds != 0, ResultTimeout);
 
         thread->wait_objects = {object};
@@ -842,7 +843,6 @@ Result SVC::WaitSynchronization1(Handle handle, s64 nano_seconds) {
         return ResultTimeout;
     }
 
-    object->Acquire(thread);
     return ResultSuccess;
 }
 
@@ -915,15 +915,12 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
         // a signal in one of its wait objects.
         return ResultTimeout;
     } else {
-        // Find the first object that is acquirable in the provided list of objects
+        // Find the first object that is acquirable in the provided list of objects, and take it
         auto itr = std::find_if(objects.begin(), objects.end(), [thread](const ObjectPtr& object) {
-            return !object->ShouldWait(thread);
+            return object->TryAcquire(thread);
         });
 
         if (itr != objects.end()) {
-            // We found a ready object, acquire it and set the result value
-            WaitObject* object = itr->get();
-            object->Acquire(thread);
             *out = static_cast<s32>(std::distance(objects.begin(), itr));
             return ResultSuccess;
         }
@@ -1056,15 +1053,13 @@ Result SVC::ReplyAndReceive(s32* index, VAddr handles_address, s32 handle_count,
         return Result(0xE7E3FFFF);
     }
 
-    // Find the first object that is acquirable in the provided list of objects
+    // Find the first object that is acquirable in the provided list of objects, and take it
     auto itr = std::find_if(objects.begin(), objects.end(), [thread](const ObjectPtr& object) {
-        return !object->ShouldWait(thread);
+        return object->TryAcquire(thread);
     });
 
     if (itr != objects.end()) {
-        // We found a ready object, acquire it and set the result value
         WaitObject* object = itr->get();
-        object->Acquire(thread);
         *index = static_cast<s32>(std::distance(objects.begin(), itr));
 
         R_SUCCEED_IF(object->GetHandleType() != HandleType::ServerSession);

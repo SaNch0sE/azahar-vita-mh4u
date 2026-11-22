@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/shared_ptr.hpp>
 #include <boost/serialization/string.hpp>
@@ -12,6 +13,7 @@
 #include "common/logging/log.h"
 #include "core/hle/kernel/address_arbiter.h"
 #include "core/hle/kernel/errors.h"
+#include "core/hle/kernel/host_link.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/resource_limit.h"
 #include "core/hle/kernel/thread.h"
@@ -23,9 +25,12 @@ SERIALIZE_EXPORT_IMPL(Kernel::AddressArbiter::Callback)
 namespace Kernel {
 
 void AddressArbiter::WaitThread(std::shared_ptr<Thread> thread, VAddr wait_address) {
+    // Counted already (waiter_count), before the address was read.
     thread->wait_address = wait_address;
     thread->status = ThreadStatus::WaitArb;
-    waiting_threads.emplace_back(std::move(thread));
+    thread->wait_host = static_cast<u8>(Core::ThisHost());
+    thread->wait_arbiter = this;
+    HostWaiters().emplace_back(std::move(thread));
 }
 
 void AddressArbiter::ResumeSignaled(Thread& thread) {
@@ -37,50 +42,76 @@ void AddressArbiter::ResumeSignaled(Thread& thread) {
     thread.ResumeFromWait();
 }
 
+u64 AddressArbiter::ResumeHostWaiters(VAddr address, s32 count) {
+    // The threads waiting on this address, taken in the list's order where it is kept. No
+    // std::stable_partition: its temporary buffer was an allocation a call.
+    auto& list = HostWaiters();
+    const auto waits_here = [address](const auto& thread) {
+        ASSERT_MSG(thread->status == ThreadStatus::WaitArb, "Inconsistent AddressArbiter state");
+        return thread->wait_address == address;
+    };
+    u64 woken = 0;
+    if (count < 0) {
+        // Negative count means resume all threads
+        auto kept = list.begin();
+        for (auto it = list.begin(); it != list.end(); ++it) {
+            if (waits_here(*it)) {
+                ResumeSignaled(**it);
+                woken++;
+            } else {
+                if (kept != it) {
+                    *kept = std::move(*it);
+                }
+                ++kept;
+            }
+        }
+        list.erase(kept, list.end());
+    } else {
+        // The highest priority one each time. Note: The real kernel will pick the first thread in
+        // the list if more than one have the same highest priority value. Lower priority values
+        // mean higher priority.
+        for (; woken < static_cast<u64>(count); woken++) {
+            auto itr = list.end();
+            for (auto it = list.begin(); it != list.end(); ++it) {
+                if (waits_here(*it) &&
+                    (itr == list.end() || (*it)->current_priority < (*itr)->current_priority)) {
+                    itr = it;
+                }
+            }
+            if (itr == list.end()) {
+                break;
+            }
+            ResumeSignaled(**itr);
+            list.erase(itr);
+        }
+    }
+    waiter_count[Core::ThisHost()].fetch_sub(static_cast<u32>(woken), std::memory_order_relaxed);
+    return woken;
+}
+
 u64 AddressArbiter::ResumeAllThreads(VAddr address) {
-    // Determine which threads are waiting on this address, those should be woken up.
-    auto itr = std::stable_partition(waiting_threads.begin(), waiting_threads.end(),
-                                     [address](const auto& thread) {
-                                         ASSERT_MSG(thread->status == ThreadStatus::WaitArb,
-                                                    "Inconsistent AddressArbiter state");
-                                         return thread->wait_address != address;
-                                     });
-
-    // Wake up all the found threads
-    const u64 num_threads = std::distance(itr, waiting_threads.end());
-    std::for_each(itr, waiting_threads.end(), [](auto& thread) { ResumeSignaled(*thread); });
-
-    // Remove the woken up threads from the wait list.
-    waiting_threads.erase(itr, waiting_threads.end());
-    return num_threads;
+    return ResumeHostWaiters(address, -1);
 }
 
 bool AddressArbiter::ResumeHighestPriorityThread(VAddr address) {
-    // Determine which threads are waiting on this address, those should be considered for wakeup.
-    auto matches_start = std::stable_partition(
-        waiting_threads.begin(), waiting_threads.end(), [address](const auto& thread) {
-            ASSERT_MSG(thread->status == ThreadStatus::WaitArb,
-                       "Inconsistent AddressArbiter state");
-            return thread->wait_address != address;
-        });
+    return ResumeHostWaiters(address, 1) != 0;
+}
 
-    // Iterate through threads, find highest priority thread that is waiting to be arbitrated.
-    // Note: The real kernel will pick the first thread in the list if more than one have the
-    // same highest priority value. Lower priority values mean higher priority.
-    auto itr = std::min_element(matches_start, waiting_threads.end(),
-                                [](const auto& lhs, const auto& rhs) {
-                                    return lhs->current_priority < rhs->current_priority;
-                                });
+void AddressArbiter::ReceiveSignal(VAddr address, s32 count) {
+    ResumeHostWaiters(address, count);
+}
 
-    if (itr == waiting_threads.end()) {
-        return false;
+void AddressArbiter::MoveWaiterToFirstHost(Thread* thread) {
+    const auto it = std::find_if(host1_waiting.begin(), host1_waiting.end(),
+                                 [thread](const auto& t) { return t.get() == thread; });
+    if (it == host1_waiting.end()) {
+        return;
     }
-
-    auto thread = *itr;
-    ResumeSignaled(*thread);
-    waiting_threads.erase(itr);
-
-    return true;
+    waiting_threads.push_back(std::move(*it));
+    host1_waiting.erase(it);
+    waiter_count[1].fetch_sub(1, std::memory_order_relaxed);
+    waiter_count[0].fetch_add(1, std::memory_order_relaxed);
+    thread->wait_host = 0;
 }
 
 AddressArbiter::AddressArbiter(KernelSystem& kernel)
@@ -116,26 +147,14 @@ private:
     friend class boost::serialization::access;
 };
 
-// Below Callback's definition: the conversion to WakeupCallback needs it complete.
-void AddressArbiter::RemoveNativeWaiter(const Thread* thread) {
-    std::erase_if(waiting_threads, [thread](const auto& t) { return t.get() == thread; });
-}
-
-void AddressArbiter::AddNativeWaiter(std::shared_ptr<Thread> thread, VAddr address, bool timed) {
-    if (timed) {
-        thread->wakeup_callback = timeout_callback;
-    } else {
-        thread->wakeup_callback = nullptr;
-    }
-    WaitThread(std::move(thread), address);
-}
-
 void AddressArbiter::WakeUp(ThreadWakeupReason reason, std::shared_ptr<Thread> thread,
                             std::shared_ptr<WaitObject> object) {
     ASSERT(reason == ThreadWakeupReason::Timeout);
-    // Remove the newly-awakened thread from the Arbiter's waiting list.
-    waiting_threads.erase(std::remove(waiting_threads.begin(), waiting_threads.end(), thread),
-                          waiting_threads.end());
+    // Remove the newly-awakened thread from the Arbiter's waiting list (its host's: a timeout runs
+    // on the host that made the wait).
+    DEBUG_ASSERT(thread->wait_host == Core::ThisHost());
+    const auto removed = std::erase(HostWaiters(), thread);
+    waiter_count[Core::ThisHost()].fetch_sub(static_cast<u32>(removed), std::memory_order_relaxed);
 };
 
 Result AddressArbiter::ArbitrateAddress(std::shared_ptr<Thread> thread, ArbitrationType type,
@@ -144,16 +163,20 @@ Result AddressArbiter::ArbitrateAddress(std::shared_ptr<Thread> thread, Arbitrat
 
     // Signal thread(s) waiting for arbitrate address...
     case ArbitrationType::Signal: {
-        u64 num_threads{};
-
-        // Negative value means resume all threads
-        if (value < 0) {
-            num_threads = ResumeAllThreads(address);
-        } else {
-            // Resume first N threads
-            for (s32 i = 0; i < value; i++) {
-                num_threads += ResumeHighestPriorityThread(address);
-            }
+        // The guest stored to the address before this svc; the other emulation thread's waiter
+        // counts itself before it reads the address (below): one of the two sees the other.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // Negative value means resume all threads; this host's waiters, then the rest of the
+        // signal to the other emulation thread's.
+        const u64 num_threads = ResumeHostWaiters(address, value < 0 ? -1 : value);
+        const u32 other = Core::ThisHost() ^ 1u;
+        if (Core::multi_host.load(std::memory_order_relaxed) &&
+            (value < 0 || num_threads < static_cast<u64>(value)) &&
+            waiter_count[other].load(std::memory_order_seq_cst) != 0) {
+            HostMessage message{HostMessage::Kind::ArbiterSignal, false, address,
+                                SharedFrom(this)};
+            message.count = value < 0 ? -1 : value - static_cast<s32>(num_threads);
+            kernel.SendToHost(other, std::move(message));
         }
 
         // Prevents lag from low priority threads that spam svcArbitrateAddress and wake no threads
@@ -167,35 +190,38 @@ Result AddressArbiter::ArbitrateAddress(std::shared_ptr<Thread> thread, Arbitrat
     }
     // Wait current thread (acquire the arbiter)...
     case ArbitrationType::WaitIfLessThan:
-        if ((s32)kernel.memory.Read32(address) < value) {
-            WaitThread(std::move(thread), address);
-        }
-        break;
     case ArbitrationType::WaitIfLessThanWithTimeout:
-        if ((s32)kernel.memory.Read32(address) < value) {
-            thread->wakeup_callback = timeout_callback;
-            thread->WakeAfterDelay(nanoseconds);
-            WaitThread(std::move(thread), address);
-        }
-        break;
-    case ArbitrationType::DecrementAndWaitIfLessThan: {
-        s32 memory_value = kernel.memory.Read32(address);
-        if (memory_value < value) {
-            // Only change the memory value if the thread should wait
-            kernel.memory.Write32(address, (s32)memory_value - 1);
-            WaitThread(std::move(thread), address);
-        }
-        break;
-    }
+    case ArbitrationType::DecrementAndWaitIfLessThan:
     case ArbitrationType::DecrementAndWaitIfLessThanWithTimeout: {
-        s32 memory_value = kernel.memory.Read32(address);
-        if (memory_value < value) {
-            // Only change the memory value if the thread should wait
-            kernel.memory.Write32(address, (s32)memory_value - 1);
+        // Counted before the address is read: the other emulation thread's signal either sees
+        // the count and sends the rest of its signal here, or this read sees the store it
+        // signalled for.
+        const u32 host = Core::ThisHost();
+        waiter_count[host].fetch_add(1, std::memory_order_seq_cst);
+        u8* const word = kernel.memory.GetPointer(address);
+        ASSERT_MSG(word != nullptr, "arbitration on unmapped address {:08X}", address);
+        std::atomic_ref<u32> memory_value{*reinterpret_cast<u32*>(word)};
+        const bool decrement = type == ArbitrationType::DecrementAndWaitIfLessThan ||
+                               type == ArbitrationType::DecrementAndWaitIfLessThanWithTimeout;
+        u32 current = memory_value.load(std::memory_order_seq_cst);
+        bool wait = static_cast<s32>(current) < value;
+        // Only change the memory value if the thread should wait, in one step: the other core's
+        // guest may change it meanwhile.
+        while (wait && decrement &&
+               !memory_value.compare_exchange_weak(current, current - 1,
+                                                   std::memory_order_seq_cst)) {
+            wait = static_cast<s32>(current) < value;
+        }
+        if (!wait) {
+            waiter_count[host].fetch_sub(1, std::memory_order_relaxed);
+            break;
+        }
+        if (type == ArbitrationType::WaitIfLessThanWithTimeout ||
+            type == ArbitrationType::DecrementAndWaitIfLessThanWithTimeout) {
             thread->wakeup_callback = timeout_callback;
             thread->WakeAfterDelay(nanoseconds);
-            WaitThread(std::move(thread), address);
         }
+        WaitThread(std::move(thread), address);
         break;
     }
 
@@ -217,9 +243,12 @@ template <class Archive>
 void AddressArbiter::serialize(Archive& ar, const unsigned int) {
     ar& boost::serialization::base_object<Object>(*this);
     ar & name;
-    ar & waiting_threads;
+    ar & waiting_threads; // host 0's: a savestate is made with the second thread stopped
     ar & timeout_callback;
     ar & resource_limit;
+    if (Archive::is_loading::value) {
+        waiter_count[0].store(static_cast<u32>(waiting_threads.size()), std::memory_order_relaxed);
+    }
 }
 SERIALIZE_IMPL(AddressArbiter)
 

@@ -20,6 +20,7 @@
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
 #include "common/mutex.h"
+#include "core/hle/kernel/host_link.h"
 #include "core/hle/kernel/memory.h"
 #include "core/hle/result.h"
 #include "core/memory.h"
@@ -381,6 +382,15 @@ public:
         return hle_lock;
     }
 
+    /// A message for emulation thread `host` (Core::ThisHost), from any thread.
+    void SendToHost(u32 host, HostMessage&& message);
+    /// The calling emulation thread's messages: the other's event signals and handed-off threads
+    /// (host 0's under the HLE lock, as its other kernel work).
+    void ProcessHostMessages();
+    [[nodiscard]] HostInbox& GetHostInbox(u32 host) {
+        return *host_inboxes[host];
+    }
+
     /// Map of named ports managed by the kernel, which can be retrieved using the ConnectToPort
     std::unordered_map<std::string, std::shared_ptr<ClientPort>> named_ports;
 
@@ -472,6 +482,8 @@ private:
      * threads other than the CPU thread.
      */
     Common::RecursiveMutex hle_lock;
+
+    std::array<std::unique_ptr<HostInbox>, Core::NumHosts> host_inboxes;
 
     /*
      * Flags non system module main threads to wait a bit before running. On real hardware,

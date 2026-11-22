@@ -29,6 +29,16 @@ public:
     /// Acquire/lock the object for the specified thread if it is available
     virtual void Acquire(Thread* thread) = 0;
 
+    /// Acquire if it is available, in one step: an event the other emulation thread may take
+    /// meanwhile (Event::TryAcquire). Whether it was.
+    virtual bool TryAcquire(Thread* thread) {
+        if (ShouldWait(thread)) {
+            return false;
+        }
+        Acquire(thread);
+        return true;
+    }
+
     /**
      * Add a thread to wait on this object
      * @param thread Pointer to thread to add
@@ -56,7 +66,7 @@ public:
     /// Sets a callback which is called when the object becomes available
     void SetHLENotifier(std::function<void()> callback);
 
-private:
+protected:
     /// Threads waiting for this object to become available
     std::vector<std::shared_ptr<Thread>> waiting_threads;
 

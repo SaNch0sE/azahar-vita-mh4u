@@ -42,6 +42,7 @@
 #include "core/gdbstub/gdbstub.h"
 #endif
 #include "core/global.h"
+#include "core/hle/kernel/address_arbiter.h"
 #include "core/hle/kernel/ipc_debugger/recorder.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"

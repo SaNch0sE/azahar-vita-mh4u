@@ -326,6 +326,10 @@ public:
      */
     void ResumeFromWait();
 
+    /// ResumeFromWait's end on the emulation thread that runs this thread's core, for a wake the
+    /// other one made (HostMessage::Handoff).
+    void ResumeHandedOff();
+
     /**
      * Schedules an event to wake up the specified thread after the specified delay
      * @param nanoseconds The time this thread will be allowed to sleep for
@@ -412,6 +416,11 @@ public:
     /// Whether a wakeup event of this thread's may be queued: set where one is scheduled, cleared
     /// when it fires or is cancelled; true after a savestate load (not saved).
     bool wakeup_queued = false;
+    /// The emulation thread whose event lists this thread waits on (Event::AddWaitingThread).
+    u8 wait_host = 0;
+    /// Woken by the emulation thread that does not run its core, and on its way to the one that
+    /// does (HostMessage::Handoff, ResumeHandedOff).
+    bool handoff_pending = false;
 
     s32 processor_id;
 
@@ -432,6 +441,9 @@ public:
     std::vector<std::shared_ptr<WaitObject>> wait_objects{};
 
     VAddr wait_address; ///< If waiting on an AddressArbiter, this is the arbitration address
+    /// The arbiter it waits at (AddressArbiter::WaitThread), for the second emulation thread's
+    /// stop (System::MoveWaitsToFirstHost).
+    AddressArbiter* wait_arbiter = nullptr;
 
     std::string name{};
 
