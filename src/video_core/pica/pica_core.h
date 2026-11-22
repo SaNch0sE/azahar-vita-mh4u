@@ -26,7 +26,6 @@ class RasterizerInterface;
 
 namespace Pica {
 
-class DebugContext;
 class ShaderEngine;
 
 class DelayGenerator {
@@ -111,7 +110,7 @@ private:
 
 class PicaCore {
 public:
-    explicit PicaCore(Memory::MemorySystem& memory, std::shared_ptr<DebugContext> debug_context_);
+    explicit PicaCore(Memory::MemorySystem& memory);
     ~PicaCore();
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
@@ -120,12 +119,15 @@ public:
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
+    // Special-register dispatch: a handler per register id, called through tables indexed by
+    // the id; see PicaCore::Dispatch in pica_core.cpp.
+    using SpecialFn = void (*)(PicaCore&, u32 id, u32 value, bool& stop_requested);
+    using BatchFn = void (*)(PicaCore&, const u32* values, u32 count);
+    struct Dispatch;
+
 private:
     void InitializeRegs();
 
-    void HandleSpecialRegBatch(u32 id, const u32* values, u32 count);
-
-    void HandleSpecialReg(u32 id, u32 value, bool& stop_requested);
 
     void WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                bool& stop_requested);
@@ -147,6 +149,8 @@ private:
     }
 
     void DrawArrays(bool is_indexed);
+    /// The primitive assembler's topology from the register, before the assembler is used.
+    void SyncAssemblerTopology();
 
     void LoadVertices(bool is_indexed);
 
@@ -367,6 +371,9 @@ public:
     DirtyRegs dirty_regs{};
     GeometryShaderUnit gs_unit;
     ShaderSetup vs_setup;
+    /// The geometry unit's setup. While it mirrors the vertex unit's (GsMirrorsVs) it may lag:
+    /// FlushGsMirror brings it up to date, which everything that reads it as the geometry
+    /// unit's own does first.
     ShaderSetup gs_setup;
     ProcTex proctex{};
     Lighting lighting{};
@@ -379,10 +386,24 @@ public:
 
     DelayGenerator delay_generator{};
 
+    /// Whether the geometry unit takes the vertex unit's uniforms, code and swizzles: not
+    /// configured on its own, and no geometry shader.
+    bool GsMirrorsVs() const {
+        return !regs.internal.pipeline.gs_unit_exclusive_configuration &&
+               regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No;
+    }
+
+    /// The vertex unit's writes made while the geometry unit mirrored it, into gs_setup: the
+    /// geometry unit's state as each mirrored write would have left it.
+    void FlushGsMirror();
+
 private:
     friend class boost::serialization::access;
     template <class Archive>
     void serialize(Archive& ar, const u32 file_version) {
+        if constexpr (Archive::is_saving::value) {
+            FlushGsMirror();
+        }
         ar & regs_lcd;
         ar & regs.reg_array;
         ar & gs_unit;
@@ -415,12 +436,25 @@ public:
 private:
     Memory::MemorySystem& memory;
     VideoCore::RasterizerInterface* rasterizer;
-    std::shared_ptr<DebugContext> debug_context;
     Service::GSP::InterruptHandler signal_interrupt;
     GeometryPipeline geometry_pipeline;
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
     std::unique_ptr<ShaderEngine> shader_engine;
+
+    /// What the vertex unit wrote while the geometry unit mirrored it, not yet in gs_setup
+    /// (FlushGsMirror): float uniforms, int uniforms and bools by index, code and swizzle words by
+    /// bitmap (a word between two uploads stays the geometry unit's own). A game can mirror every
+    /// upload into a setup no draw of its reads.
+    struct GsMirrorLog {
+        std::array<u32, 3> f{};
+        u32 i{};
+        bool b{};
+        bool pending{};
+        std::array<u32, MAX_PROGRAM_CODE_LENGTH / 32> code{};
+        std::array<u32, MAX_SWIZZLE_DATA_LENGTH / 32> swizzle{};
+    };
+    GsMirrorLog gs_mirror{};
 };
 
 #define GPU_REG_INDEX(field_name) (offsetof(Pica::PicaCore::Regs, field_name) / sizeof(u32))

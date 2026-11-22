@@ -11,7 +11,6 @@
 #include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/loader/loader.h"
-#include "video_core/debug_utils/debug_utils.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_debugger.h"
 #include "video_core/gpu_impl.h"
@@ -268,6 +267,11 @@ void GPU::Execute(const Service::GSP::Command& command) {
             cmdbuffer.addr[0].Assign(address >> 3);
             cmdbuffer.size[0].Assign(size >> 3);
             cmdbuffer.trigger[0] = 1;
+            // As a command list's writes mark them: the render thread's copy takes them.
+            auto& dirty = impl->pica.dirty_regs;
+            dirty.Set(PICA_REG_INDEX(pipeline.command_buffer.addr[0]));
+            dirty.Set(PICA_REG_INDEX(pipeline.command_buffer.size[0]));
+            dirty.Set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
 
             // Trigger processing of the command list
             SubmitCmdList(0);
@@ -340,9 +344,6 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
 
     // Notify debugger that a GSP command was processed.
-    if (impl->debug_context) {
-        impl->debug_context->OnEvent(Pica::DebugContext::Event::GSPCommandProcessed, &command);
-    }
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
@@ -364,9 +365,6 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     framebuffer.active_fb = info.shown_fb;
 
     // Notify debugger about the buffer swap.
-    if (impl->debug_context) {
-        impl->debug_context->OnEvent(Pica::DebugContext::Event::BufferSwapped, nullptr);
-    }
 
     if (screen_id == 0) {
         MicroProfileFlip();
@@ -505,6 +503,7 @@ void GPU::SubmitCmdList(u32 index) {
     impl->pica.ProcessCmdList(addr, size,
                               !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
     config.trigger[index] = 0;
+    impl->pica.dirty_regs.Set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + index);
 }
 
 void GPU::MemoryFill(u32 index, u32 intr_index) {
@@ -628,9 +627,6 @@ void GPU::RunMemoryTransfer(const Pica::DisplayTransferConfig& config,
     MICROPROFILE_SCOPE(GPU_DisplayTransfer);
 
     // Notify debugger about the display transfer.
-    if (impl->debug_context) {
-        impl->debug_context->OnEvent(Pica::DebugContext::Event::IncomingDisplayTransfer, nullptr);
-    }
 
     // Perform memory transfer
     if (config.is_texture_copy) {

@@ -23,7 +23,6 @@ class System;
 }
 
 namespace Pica {
-class DebugContext;
 class PicaCore;
 struct RegsLcd;
 union ColorFill;

@@ -63,10 +63,6 @@ class CustomTexManager;
 class GPU;
 } // namespace VideoCore
 
-namespace Pica {
-class DebugContext;
-}
-
 namespace Loader {
 class AppLoader;
 }

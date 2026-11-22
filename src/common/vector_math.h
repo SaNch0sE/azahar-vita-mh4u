@@ -36,11 +36,32 @@
 #endif
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <type_traits>
 #include <boost/serialization/access.hpp>
 
 namespace Common {
+
+namespace Detail {
+/// Bitwise equality of two objects of N bytes, as memcmp() == 0. Clang does not expand a
+/// constant-size memcmp for ARM32 (a call into newlib's byte loop): whole words compare inline.
+template <std::size_t N>
+[[nodiscard]] inline bool BitsEqual(const void* a, const void* b) {
+    if constexpr (N % 4 == 0) {
+        std::uint32_t diff = 0;
+        for (std::size_t i = 0; i < N; i += 4) {
+            std::uint32_t x, y;
+            std::memcpy(&x, static_cast<const char*>(a) + i, 4);
+            std::memcpy(&y, static_cast<const char*>(b) + i, 4);
+            diff |= x ^ y;
+        }
+        return diff == 0;
+    } else {
+        return std::memcmp(a, b, N) == 0;
+    }
+}
+} // namespace Detail
 
 template <typename T>
 class Vec2;
@@ -134,11 +155,11 @@ public:
     }
 
     [[nodiscard]] constexpr bool operator!=(const Vec2& other) const {
-        return std::memcmp(AsArray(), other.AsArray(), sizeof(Vec2)) != 0;
+        return !Detail::BitsEqual<sizeof(Vec2)>(AsArray(), other.AsArray());
     }
 
     [[nodiscard]] constexpr bool operator==(const Vec2& other) const {
-        return std::memcmp(AsArray(), other.AsArray(), sizeof(Vec2)) == 0;
+        return Detail::BitsEqual<sizeof(Vec2)>(AsArray(), other.AsArray());
     }
 
     // Only implemented for T=float
@@ -305,11 +326,11 @@ public:
     }
 
     [[nodiscard]] constexpr bool operator!=(const Vec3& other) const {
-        return std::memcmp(AsArray(), other.AsArray(), sizeof(Vec3)) != 0;
+        return !Detail::BitsEqual<sizeof(Vec3)>(AsArray(), other.AsArray());
     }
 
     [[nodiscard]] constexpr bool operator==(const Vec3& other) const {
-        return std::memcmp(AsArray(), other.AsArray(), sizeof(Vec3)) == 0;
+        return Detail::BitsEqual<sizeof(Vec3)>(AsArray(), other.AsArray());
     }
 
     [[nodiscard]] constexpr T Length2() const {
@@ -542,11 +563,11 @@ public:
     }
 
     [[nodiscard]] constexpr bool operator!=(const Vec4& other) const {
-        return std::memcmp(AsArray(), other.AsArray(), sizeof(Vec4)) != 0;
+        return !Detail::BitsEqual<sizeof(Vec4)>(AsArray(), other.AsArray());
     }
 
     [[nodiscard]] constexpr bool operator==(const Vec4& other) const {
-        return std::memcmp(AsArray(), other.AsArray(), sizeof(Vec4)) == 0;
+        return Detail::BitsEqual<sizeof(Vec4)>(AsArray(), other.AsArray());
     }
 
     [[nodiscard]] constexpr T Length2() const {

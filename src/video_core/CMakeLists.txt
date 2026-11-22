@@ -46,6 +46,7 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
         pica/packed_attribute.h
         pica/vertex_loader.cpp
         pica/vertex_loader.h
+        pica/words_differ.h
         rasterizer_cache/framebuffer_base.h
         rasterizer_cache/pixel_format.cpp
         rasterizer_cache/pixel_format.h

@@ -160,6 +160,15 @@ public:
     u32 entry_point{};
     const void* cached_shader{};
     bool uniforms_dirty = true;
+    /// Float uniform `index` changed.
+    void FloatChanged(u32 index) {
+        uniforms_dirty = true;
+        f_changed[index / 32] |= 1u << (index % 32);
+        f_version++;
+#ifdef VITA_DIAGNOSTICS
+        f_stamp[index] = f_version;
+#endif
+    }
 
     // bool requires_fixup = false;
     // bool has_fixup = false;

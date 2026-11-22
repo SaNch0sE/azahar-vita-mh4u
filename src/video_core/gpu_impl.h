@@ -14,7 +14,6 @@
 #include "core/core_timing.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/hle/service/plgldr/plgldr.h"
-#include "video_core/debug_utils/debug_utils.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_debugger.h"
 #include "video_core/gpu_impl.h"
@@ -29,7 +28,6 @@ struct GPU::Impl {
     Core::Timing& timing;
     Core::System& system;
     Memory::MemorySystem& memory;
-    std::shared_ptr<Pica::DebugContext> debug_context;
     Pica::PicaCore pica;
     GraphicsDebugger gpu_debugger;
     std::unique_ptr<RendererBase> renderer;

@@ -65,6 +65,14 @@ struct PrimitiveAssembler {
     }
 
     /**
+     * Whether a Reset would change nothing: no vertex buffered, no strip started, no winding
+     * flip pending. A topology or restart write then changes only the topology.
+     */
+    bool IsIdle() const {
+        return buffer_index == 0 && !strip_ready && !winding;
+    }
+
+    /**
      * Returns the current topology.
      */
     PipelineRegs::TriangleTopology GetTopology() const {
