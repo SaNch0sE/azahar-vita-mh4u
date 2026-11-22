@@ -2310,8 +2310,12 @@ RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width,
             if (d.width == width && d.height == height && d.format == format) {
                 return d;
             }
-            const auto& old = d.store;
-            backend.FreeSurface(old.memory, old.width, old.height * (old.stencil ? 5 : 4) / 4);
+            for (const auto* old : {&d.store, &d.scratch}) {
+                if (old->memory.cpu) {
+                    backend.FreeSurface(old->memory, old->width,
+                                        old->height * (old->stencil ? 5 : 4) / 4);
+                }
+            }
             d = DepthStore{addr, width, height, format};
             d.store = NewDepthStore(width, height, format);
             return d;
@@ -2358,11 +2362,18 @@ void RasterizerSgxd::EndPass(const char* why) {
         }
     }
 #endif
-    // A pass that used depth keeps it for the next one on the buffer: stored, and loaded first
-    // when it was loaded, or the store filled with the clear (tiles it did not touch). A clear
-    // no draw used is the store's fill alone.
-    // A pass that neither cleared nor loaded it leaves depth known only where it drew: the
-    // store is stale.
+    // A pass that used depth keeps it for the next one on the buffer, stored (loaded first when it
+    // was loaded, else filled with the clear). A clear no draw used is the store's fill alone; a pass
+    // that neither cleared nor loaded it leaves the store stale. An unused depth in the bytes the
+    // pass's colour drew keeps no store: guest memory holds the colour.
+    const PAddr depth_end = pass_depth + s.width * s.height * pass_depth_bytes;
+    const bool depth_under_colour = pass_drawn_lo < pass_drawn_hi && pass_depth < pass_drawn_hi &&
+                                    pass_drawn_lo < depth_end;
+    DEBUG_ASSERT_MSG(!depth_under_colour || !pass_depth_used,
+                     "sgxd: {}: a pass on the colour buffer at {:#x} ({}x{}) used the depth "
+                     "buffer at {:#x} in the bytes it drew ({:#x}..{:#x})",
+                     why, s.addr, s.width, s.height, pass_depth, pass_drawn_lo, pass_drawn_hi);
+    DepthStore* part_copy = nullptr;
 #ifdef VITA_DIAGNOSTICS
     // sgxd_flags eotmixnozls: the mixed end of tile's 2x passes store no depth (the eotmix probe;
     // the next pass's depth is wrong).
@@ -2378,9 +2389,27 @@ void RasterizerSgxd::EndPass(const char* why) {
         }
         if (pass_depth_used) {
             using DL = SgxdBackend::DepthLoad;
-            backend.SetDepthStore(d.store, !pass_depth_load    ? DL::None
-                                           : pass_depth_guest ? DL::Guest
-                                                              : DL::Store);
+            DL load = !pass_depth_load ? DL::None : pass_depth_guest ? DL::Guest : DL::Store;
+#ifdef VITA_DIAGNOSTICS
+            static const bool no_zload = SgxdFlag("nozload");
+            load = no_zload ? DL::None : load;
+#endif
+            // A pass storing part of its target (StorePartFor) drew depth past it as well,
+            // where the PICA's viewport clipped: its depth goes to the scratch, every tile of it,
+            // and only its part into the store once its 3D is done, the rest as it was. Guest
+            // memory's depth, untiled into the store as its words, is no F32 to keep: such a
+            // pass stores its whole target, and its draws writing depth or stencil kill past
+            // their viewport (draw_kills_viewport), so the store is exact in all of it.
+            if (pass_part.x1 != 0 && !pass_depth_guest) {
+                if (!d.scratch.memory.cpu) {
+                    d.scratch = NewDepthStore(d.width, d.height, d.format);
+                }
+                backend.SetDepthStore(d.store, load, &d.scratch);
+                backend.TouchAllTiles();
+                part_copy = &d;
+            } else {
+                backend.SetDepthStore(d.store, load);
+            }
         }
         d.valid = true;
 #ifdef VITA_DIAGNOSTICS
@@ -2394,6 +2423,10 @@ void RasterizerSgxd::EndPass(const char* why) {
 #endif
     u32 ta_us = 0, d3_us = 0;
     backend.EndPass(&ta_us, &d3_us);
+    if (part_copy) {
+        backend.CopyDepthPart(part_copy->scratch, part_copy->store, pass_part.x0, pass_part.x1,
+                              pass_part.y0, pass_part.y1);
+    }
     // A narrow buffer's scratch back into it, behind the pass's 3D.
     if (pass_narrow) {
         const NarrowScratch& n = *pass_narrow;
@@ -2490,7 +2523,8 @@ void RasterizerSgxd::LogTextureStats() {
     for (const auto& [why, n] : t.pass_ends) {
         ends += fmt::format("{}{} {}", ends.empty() ? "" : "; ", why, n);
     }
-    LOG_INFO(Render, "perf: passes ended by: {}", ends);
+    LOG_INFO(Render, "perf: passes ended by: {}; kept, a narrower viewport masked: {}", ends,
+             std::exchange(viewport_masks, 0));
     t.pass_ends.clear();
     t = TextureStats{};
     t.tiny_logged = tiny_logged;
@@ -2580,11 +2614,9 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         bools |= static_cast<u16>((pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n);
     }
     bools &= *used;
-    const u8 clip_planes = ClipPlanes(mode);
     const u64 key = Common::HashCombine(
         config.Hash(),
-        static_cast<u64>(clip_planes) << 40 | static_cast<u64>(mode) << 32 |
-            static_cast<u64>(u8_regs) << 16 | default_regs,
+        static_cast<u64>(mode) << 32 | static_cast<u64>(u8_regs) << 16 | default_regs,
         static_cast<u64>(bools) << 16 | *used |
             (static_cast<u64>(s8_regs) << 32 | static_cast<u64>(s16_regs) << 48),
         Common::ComputeHash64(reg_components.data(), reg_components.size()));
@@ -2610,7 +2642,6 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         request.s8_regs = s8_regs;
         request.s16_regs = s16_regs;
         request.mode = mode;
-        request.clip_planes = clip_planes;
         return request;
     };
     if (VertexProgram* const found = vertex_programs.Find(key)) {
@@ -2834,9 +2865,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
                                                                             u32 output_mask) {
     const Pica::Shader::Generator::PicaFixedGSConfig gs_config{regs};
     const auto maps = gs_config.state.GetSemanticMaps();
-    const u8 clip_planes = ClipPlanes(Usse::VsMode::Draw);
-    u64 key = Common::HashCombine(0x6770617373ull /* "gpass" */,
-                                  static_cast<u64>(clip_planes) << 32 | output_mask);
+    u64 key = Common::HashCombine(0x6770617373ull /* "gpass" */, output_mask);
     for (const auto& m : maps) {
         key = Common::HashCombine(key, static_cast<u64>(m.attribute_index) << 8 | m.component_index);
     }
@@ -2845,7 +2874,6 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
     }
     std::vector<u32> code;
     Usse::VsRequest request{};
-    request.clip_planes = clip_planes;
     request.output_map.fill(16);
     for (u32 reg = 0; reg < 16; reg++) {
         if ((output_mask >> reg) & 1) {
@@ -3416,14 +3444,18 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
             config.framebuffer.alpha_test_blends.Assign(1);
         }
     }
-    // An include box, [x1, x2 + 1) x [y1, y2 + 1), over the whole viewport (within the colour
-    // buffer) keeps every fragment, as the viewport clips x and y: the test goes, and with it
-    // the kill that made the draw punch-through, so the ISP removes what the draw hides before
-    // the shading. a game sets (0, 0)-(239, 399) with its 240x400 viewport on a 256x416 buffer
-    // for every draw.
+    // An include box over the whole viewport (within the colour buffer) keeps every fragment the pass
+    // stores: the test goes, and with it the kill that made the draw punch-through.
     const auto& rs = regs.rasterizer;
     const auto& sc = rs.scissor_test;
-    if (config.framebuffer.scissor_test_mode == Pica::RasterizerRegs::ScissorMode::Include) {
+    // A draw writing depth past its part into a store that keeps all of it keeps its fragments by the
+    // scissor's kill (the viewport's box); a viewport off the tile grid is the ISP's mask instead.
+    if (draw_kills_viewport) {
+        DEBUG_ASSERT_MSG(config.framebuffer.scissor_test_mode !=
+                             Pica::RasterizerRegs::ScissorMode::Exclude,
+                         "sgxd: an excluding scissor with a viewport kept by the kill: not built");
+        config.framebuffer.scissor_test_mode.Assign(Pica::RasterizerRegs::ScissorMode::Include);
+    } else if (config.framebuffer.scissor_test_mode == Pica::RasterizerRegs::ScissorMode::Include) {
         const auto& fb = regs.framebuffer.framebuffer;
         const s32 vx0 = std::max<s32>(rs.viewport_corner.x, 0);
         const s32 vy0 = std::max<s32>(rs.viewport_corner.y, 0);
@@ -3457,14 +3489,20 @@ const RasterizerSgxd::FragmentProgram& RasterizerSgxd::FragmentProgramFor(const 
         fragment_regs_hash = StateRegs::Hash(StateRegs::Fragment, regs.reg_array);
     }
     if (!last_fragment || fragment_regs_hash != last_fragment_regs ||
-        epilogue_key != last_fragment_epilogue || draw_own_pixel != last_fragment_own) {
+        epilogue_key != last_fragment_epilogue || draw_own_pixel != last_fragment_own ||
+        draw_kills_viewport != last_fragment_kills) {
         last_fragment_regs = fragment_regs_hash;
         last_fragment_epilogue = epilogue_key;
         last_fragment_own = draw_own_pixel;
-        // The own-pixel units come from the vertices, not the registers.
+        last_fragment_kills = draw_kills_viewport;
+        // The own-pixel units come from the vertices, not the registers, and the viewport's
+        // kill from the pass.
         u64 state = Common::HashCombine(fragment_regs_hash, epilogue_key);
         if (draw_own_pixel != 0) {
             state = Common::HashCombine(state, draw_own_pixel);
+        }
+        if (draw_kills_viewport) {
+            state = Common::HashCombine(state, 0x6b696c6cu);
         }
         if (const FragmentState* const found = fragment_states.Find(state)) {
             last_fragment = found->program;
@@ -4285,34 +4323,80 @@ std::array<u32, RasterizerSgxd::VertexLayout::ProgramKeyWords> RasterizerSgxd::V
     for (u32 n = 0; n < 16; n++) {
         bools |= (pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n;
     }
-    key[15] = static_cast<u32>(mode) | static_cast<u32>(ClipPlanes(mode)) << 8;
+    key[15] = static_cast<u32>(mode);
     key[16] = bools;
     return key;
 }
 
-u8 RasterizerGxm::ClipPlanes(Usse::VsMode mode) const {
-    // The PICA clips x and y at the viewport (its frustum); the SGX clips at a guard band and
-    // keeps what lies on the target, so a viewport smaller than its colour buffer needs planes
-    // at its inner edges, or a draw writes the buffer's margin.
-    if (mode != Usse::VsMode::Draw) {
-        return 0;
-    }
-#ifdef VITA_DIAGNOSTICS
-    // gxm_flags noclipplanes: none, to tell whether the TA's lockups come with the clipping the planes ask for.
-    static const bool no_clip_planes = GxmFlag("noclipplanes");
-    if (no_clip_planes) {
-        return 0;
-    }
-#endif
+RasterizerSgxd::StorePart RasterizerSgxd::ViewportPart(const ColourBuffer& target) const {
     const auto& rs = regs.rasterizer;
-    const auto& fb = regs.framebuffer.framebuffer;
-    const s32 x0 = rs.viewport_corner.x;
-    const s32 y0 = rs.viewport_corner.y;
-    const s32 x1 = x0 + static_cast<s32>(f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2);
-    const s32 y1 = y0 + static_cast<s32>(f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2);
-    return static_cast<u8>((x1 < static_cast<s32>(fb.GetWidth()) ? 1u : 0u) |
-                           (y1 < static_cast<s32>(fb.GetHeight()) ? 2u : 0u) | (x0 > 0 ? 4u : 0u) |
-                           (y0 > 0 ? 8u : 0u));
+    const s32 vw = static_cast<s32>(f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2);
+    const s32 vh = static_cast<s32>(f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2);
+    // The target is the buffer transposed: rows corner.y .. + vh are columns H - corner.y - vh ..
+    // H - corner.y, and the PICA's columns are its rows. A narrow buffer is drawn into its scratch.
+    const s32 w = static_cast<s32>(target.width), h = static_cast<s32>(target.height);
+    const s32 cx = rs.viewport_corner.x, cy = rs.viewport_corner.y;
+    StorePart p{static_cast<u32>(std::clamp(h - cy - vh, 0, h)),
+                static_cast<u32>(std::clamp(h - cy, 0, h)), static_cast<u32>(std::clamp(cx, 0, w)),
+                static_cast<u32>(std::clamp(cx + vw, 0, w))};
+    const u32 scratch = NarrowWidth(target);
+    if (scratch != 0) {
+        p.y0 = 0;
+        p.y1 = scratch;
+    }
+    if (p.x0 == 0 && p.x1 == static_cast<u32>(h) && p.y0 == 0 &&
+        p.y1 == (scratch != 0 ? scratch : static_cast<u32>(w))) {
+        return {};
+    }
+    return p;
+}
+
+bool RasterizerSgxd::OnStoreGrid(const StorePart& p) {
+    // An empty part (a viewport past the buffer) keeps nothing.
+    return p.x1 == 0 || (p.x0 < p.x1 && p.y0 < p.y1 && p.x0 % 8 == 0 && p.x1 % 8 == 0 &&
+                         p.y0 % 16 == 0 && p.y1 % 8 == 0);
+}
+
+bool RasterizerSgxd::KeepPassForViewport(const ColourBuffer& target) {
+    // A pass storing a part of its buffer, or all of it, keeps its draws to their viewports by the part
+    // or by the ISP's mask over the margin (MaskOutside). A draw whose viewport lies inside that region
+    // clears the mask outside its own; the region only narrows, so a wider viewport ends the pass.
+    // Scaled and widened passes, and a narrow buffer's scratch, keep to their parts.
+    if (pass_quarters != 4 || pass_margin != 0 || pass_narrow) {
+        return false;
+    }
+    const StorePart view = ViewportPart(target);
+    if (view.x1 == 0) {
+        return false;
+    }
+    const StorePart whole{0, target.height, 0, std::max(target.width, 32u)};
+    const StorePart region = pass_mask.x1 != 0   ? pass_mask
+                             : pass_part.x1 != 0 ? pass_part
+                                                 : whole;
+    if (view.x0 < region.x0 || view.x1 > region.x1 || view.y0 < region.y0 ||
+        view.y1 > region.y1 || view.x0 >= view.x1 || view.y0 >= view.y1) {
+        return false;
+    }
+    if (view != region) {
+        // In a pass masked to its part the draws stay in the part's tiles, and the narrower mask with them.
+        backend.MaskOutside(PassX(static_cast<s32>(view.x0)), PassX(static_cast<s32>(view.x1)),
+                            PassEdge(static_cast<s32>(view.y0)),
+                            PassEdge(static_cast<s32>(view.y1)), pass_margin_masked);
+        pass_mask = view;
+#ifdef VITA_DIAGNOSTICS
+        viewport_masks++;
+#endif
+    }
+    return true;
+}
+
+RasterizerSgxd::StorePart RasterizerSgxd::StorePartFor(const ColourBuffer& target) const {
+    // The PICA draws inside its viewport alone; the SGX clips at a guard band, so a viewport smaller
+    // than the buffer stores only its part of the target (SgxdPicaStore's part) and guest memory keeps
+    // the margin's bytes. TA clip planes at the viewport's edges would lock up the MTE's clipper
+    // (docs/sgxd/ta.md). A part off the strips' grid is kept by the ISP's mask (MaskOutside).
+    const StorePart p = ViewportPart(target);
+    return OnStoreGrid(p) ? p : StorePart{};
 }
 
 namespace {
@@ -5234,19 +5318,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     fragment_regs_dirty |= StateRegs::AnyDirty(StateRegs::FragmentMask, pica.dirty_regs.qwords);
     layout_regs_dirty |= StateRegs::AnyDirty(StateRegs::LayoutMask, pica.dirty_regs.qwords);
     SyncDrawUniforms();
-    {
-        // The scissor box in the fragment program's position (WPOS: pixel centres from the
-        // target's top-left). The target is the buffer transposed (SgxdBackend::PicaTarget):
-        // WPOS x is the memory's row, so the PICA's y, mirrored like the viewport's corner
-        // (upstream's Vulkan path, FramebufferHelper with flip_rect); WPOS y is the PICA's x,
-        // [x1, x2 + 1).
-        const auto& sc = regs.rasterizer.scissor_test;
-        const s32 target_height = static_cast<s32>(regs.framebuffer.framebuffer.GetHeight());
-        fs_data.scissor_x1 = target_height - (static_cast<s32>(sc.y2.Value()) + 1);
-        fs_data.scissor_x2 = target_height - static_cast<s32>(sc.y1.Value());
-        fs_data.scissor_y1 = static_cast<s32>(sc.x1.Value());
-        fs_data.scissor_y2 = static_cast<s32>(sc.x2.Value()) + 1;
-    }
 
     // --- the target and the output merger ---
     const auto& fb = regs.framebuffer.framebuffer;
@@ -5397,6 +5468,21 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
          (uses_depth && pass_depth != depth))) {
         EndPass("a draw to other buffers");
     }
+    // A pass stores its draws' viewport's part of the buffer: a draw with another viewport starts the
+    // next pass, so no draw stores past its own.
+    const StorePart part = StorePartFor(target);
+    if (backend.InPass() && pass_part != part && !KeepPassForViewport(target)) {
+        EndPass("a draw with another viewport");
+    }
+    // A viewport off the store's grid keeps its fragments by the ISP's mask (MaskOutside): no kill, no
+    // punch-through. A draw with another viewport after the mask starts the next pass (a mask set again
+    // is not verified). A pass masked to its part keeps its draws with that viewport.
+    const StorePart view = ViewportPart(target);
+    const StorePart view_mask = OnStoreGrid(view) ? StorePart{} : view;
+    if (backend.InPass() && pass_mask.x1 != 0 && pass_mask != view_mask &&
+        !(view_mask.x1 == 0 && pass_mask == part) && !KeepPassForViewport(target)) {
+        EndPass("a draw with another viewport's mask");
+    }
     // A geometry draw's stages take the pass's data (GeometryStage): the stored vertex outputs, the
     // triangles, B's index list and the row tables. A pass that may not hold them ends first; the
     // bound keeps the room small where the program has one.
@@ -5490,7 +5576,14 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             drawn.height = std::max(target.height, 32u);
             pass_narrow = &n;
         }
-        const SgxdBackend::PicaTarget t = PicaTargetFor(drawn, "a draw");
+        SgxdBackend::PicaTarget t = PicaTargetFor(drawn, "a draw");
+        t.x0 = part.x0;
+        t.x1 = part.x1;
+        t.y0 = part.y0;
+        t.y1 = part.y1;
+        pass_part = part;
+        pass_mask = {};
+        pass_margin_masked = false;
         ClearedRange clear{};
         const bool took = TakeClear(colour, target.End(), clear);
         ClearedRange depth_clear{};
@@ -5499,6 +5592,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         pass_depth_cleared = false;
         pass_depth_format = static_cast<u32>(fb.depth_format.Value());
         pass_depth_used = false;
+        pass_depth_written = false;
         pass_depth_load = false;
         pass_depth_covered = false;
         pass_depth_guest = false;
@@ -5568,6 +5662,16 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         pass_open_draws = backend.PassDraws();
         pass_drawn_lo = pass_drawn_hi = 0;
     }
+    // After the pass's load, whose draws cover the margin too.
+    if (view_mask.x1 != 0 && pass_mask != view_mask) {
+        DEBUG_ASSERT(pass_mask.x1 == 0);
+        const bool opening = backend.PassDraws() == pass_open_draws;
+        backend.MaskOutside(view_mask.x0, view_mask.x1, view_mask.y0, view_mask.y1);
+        pass_mask = view_mask;
+        if (opening) {
+            pass_open_draws = backend.PassDraws();
+        }
+    }
     // Without a clear, the depth is what the last pass on the buffer stored, or what guest
     // memory holds when none did (a buffer the CPU cleared, or one reshaped). A draw that
     // writes every pixel's depth without reading any (DCMP ALWAYS, no stencil test) needs
@@ -5616,6 +5720,54 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         }
     }
     pass_depth_used |= uses_depth;
+    pass_depth_written |= dwrite || (stencil && StencilWrites(regs.framebuffer));
+    // A pass that loaded guest memory's depth stores all of it (EndPass): a draw writing depth
+    // or stencil past the part the pass stores, where the PICA's viewport clips, must not. The
+    // ISP's mask over the margin keeps it out from here to the pass's end, as a viewport off the
+    // store grid's (MaskOutside): the draws stay opaque, where a kill made them punch-through
+    // and their programs read the position.
+    if (pass_depth_guest && pass_part.x1 != 0 && (dwrite || stencil) && pass_mask.x1 == 0) {
+        const bool opening = backend.PassDraws() == pass_open_draws;
+        backend.MaskOutside(pass_part.x0 * pass_scale, pass_part.x1 * pass_scale,
+                            pass_part.y0 * pass_scale, pass_part.y1 * pass_scale);
+        pass_mask = pass_part;
+        if (opening) {
+            pass_open_draws = backend.PassDraws();
+        }
+    }
+    // A mask inside the part keeps the draw inside it already.
+    const bool masked_inside = pass_mask.x1 != 0 && pass_mask.x0 >= pass_part.x0 &&
+                               pass_mask.x1 <= pass_part.x1 && pass_mask.y0 >= pass_part.y0 &&
+                               pass_mask.y1 <= pass_part.y1;
+    draw_kills_viewport = pass_depth_guest && pass_part.x1 != 0 && (dwrite || stencil) &&
+                          !masked_inside;
+    {
+        // The scissor box in WPOS (pixel centres from the target's top-left). The target is transposed:
+        // WPOS x is the PICA's y mirrored like the viewport's corner, WPOS y the PICA's x. A draw killing
+        // past its viewport takes its box's overlap with the viewport.
+        const auto& rs = regs.rasterizer;
+        const auto& sc = rs.scissor_test;
+        s32 x1 = static_cast<s32>(sc.x1.Value()), x2 = static_cast<s32>(sc.x2.Value()) + 1;
+        s32 y1 = static_cast<s32>(sc.y1.Value()), y2 = static_cast<s32>(sc.y2.Value()) + 1;
+        if (draw_kills_viewport) {
+            if (sc.mode != Pica::RasterizerRegs::ScissorMode::Include) {
+                x1 = y1 = 0;
+                x2 = y2 = 0x10000;
+            }
+            const s32 vx = rs.viewport_corner.x, vy = rs.viewport_corner.y;
+            x1 = std::max(x1, vx);
+            x2 = std::min(x2,
+                          vx + static_cast<s32>(f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2));
+            y1 = std::max(y1, vy);
+            y2 = std::min(y2,
+                          vy + static_cast<s32>(f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2));
+        }
+        const s32 target_height = static_cast<s32>(regs.framebuffer.framebuffer.GetHeight());
+        fs_data.scissor_x1 = target_height - y2;
+        fs_data.scissor_x2 = target_height - y1;
+        fs_data.scissor_y1 = x1;
+        fs_data.scissor_y2 = x2;
+    }
 
     // --- the vertex stage: the loaders' attributes into the vertex program, or with a
     // geometry shader, the triangles its passes stored ---
@@ -5974,6 +6126,13 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                        static_cast<u32>(st.action_depth_pass.Value()) << 16 |
                        st.input_mask << 8 |
                        (fb.allow_depth_stencil_write != 0 ? static_cast<u32>(st.write_mask) : 0u);
+    // A pass masked to the part it stores: nothing of the draw in the tiles past the part's.
+    const u32 clip = !pass_margin_masked
+                         ? 0u
+                         : SGXD_RECIPE_CLIP(static_cast<u32>(PassX(pass_part.x0)) / 32,
+                                            static_cast<u32>(PassEdge(pass_part.y0)) / 32,
+                                            (static_cast<u32>(PassX(pass_part.x1)) - 1) / 32,
+                                            (static_cast<u32>(PassEdge(pass_part.y1)) - 1) / 32);
     const SgxdRecipeDraw draw{0, stage.count, isp, SGXD_R_FPRIM,
                               CullMode(regs.rasterizer.cull_mode), 0, nullptr, ispc};
     backend.Draw(draw, p);

@@ -65,8 +65,6 @@ namespace GxmRenderer {
  *   noload    a pass that would load its colour buffer's picture (BeginPassLoaded) starts from
  *             a clear instead; nozload: a pass's depth is not loaded (still stored): what the
  *             loads cost, in syncpasses' or a replay's pass times (the pictures are wrong)
- *   noviewkill  a viewport off the end of tile's store grid (StorePartFor) keeps no kill: its
- *             margin is drawn over and stored (wrong), for what the punch-through kill costs
  *   syncpasses every pass runs whole, TA then 3D, before EndPass returns: exact pass times, in
  *             perflog's per-target lines (async passes take no times)
  *   syncside  with syncpasses or in a replay, the side renders (texture untiles and their
@@ -83,8 +81,6 @@ namespace GxmRenderer {
  *             and pixels sent on to be shaded, 3 the ISP's parameter fetch) around the same
  *             renders, each core's eight counters; gpuperfsum=MASK: those counters'
  *             SUM_MUX bits set
- *   maskview  a probe: the ISP's mask outside every viewport, also one on the store's grid
- *             (what a pass shades in its target's margin, past the viewport, and never stores)
  *   u8colour  a probe: the U8 combiners read the vertex colour's bytes from a second,
  *             fixed-point iterator of it (what that iterator delivers; a pack fewer)
  *   smpskip   a probe: skip-invalid on the texture reads that are point sampled from one level
@@ -124,8 +120,6 @@ namespace GxmRenderer {
  *             those left with w near 0 by the near and far planes (the TA has no w plane), and
  *             non-finite positions; a line for each draw with the last two (600 at most) and
  *             each second's totals
- *   noclipplanes  no clip planes at a viewport smaller than its buffer (RasterizerGxm::
- *             ClipPlanes): whether the TA's lockups come with the MTE clipper's work
  *
  * Checking guest memory against the CPU:
  *   untilecheck  every RGBA8, RGB8, ETC1 and ETC1A4 untile's levels against upstream's CPU

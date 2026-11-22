@@ -678,8 +678,21 @@ private:
     VertexLayout DecodeVertexLayout() const;
     /// The raw words VertexProgramFor's program depends on past the layout.
     std::array<u32, VertexLayout::ProgramKeyWords> VertexProgramKey(Usse::VsMode mode);
-    /// Usse::VsRequest::clip_planes for the draw: the viewport's edges inside the colour buffer.
-    u8 ClipPlanes(Usse::VsMode mode) const;
+    /// The part of a pass's target (the colour buffer transposed) a draw's viewport covers, in
+    /// the target's pixels (SgxdPicaStore's x0..x1 and y0..y1: in 8s, y0 in 16s); x1 0 for all
+    /// of it.
+    struct StorePart {
+        u32 x0{}, x1{}, y0{}, y1{};
+        bool operator==(const StorePart&) const = default;
+    };
+    /// What a pass on target stores for the draw (its viewport's part, or all of it off the grid).
+    StorePart StorePartFor(const ColourBuffer& target) const;
+    StorePart ViewportPart(const ColourBuffer& target) const;
+    /// Whether the open pass takes a draw whose viewport lies inside the region its draws are kept to:
+    /// the ISP's mask is cleared outside it and the pass goes on.
+    bool KeepPassForViewport(const ColourBuffer& target);
+    /// Whether a part's edges lie where the end of tile drops strips (x0, x1, y1 in 8s, y0 in 16s).
+    static bool OnStoreGrid(const StorePart& p);
     KeyIndex<u16> used_bools;
     /// The second tier by fragment config (ShaderTier1::ConfigKey): the program is the config's
     /// under every epilogue, so one job a config. The programs waiting for it, and once done the
@@ -725,11 +738,15 @@ private:
     u64 last_fragment_regs = 0;
     u64 last_fragment_epilogue = 0;
     u32 last_fragment_own = 0;
+    bool last_fragment_kills = false;
     /// The open pass's colour buffer bytes its draws covered so far, whole tile rows.
     PAddr pass_drawn_lo = 0;
     PAddr pass_drawn_hi = 0;
     std::array<UnitRead, 3> unit_reads{};
     u32 draw_own_pixel = 0;
+    /// The draw keeps its fragments inside its viewport by the scissor's kill: it writes depth or
+    /// stencil in a pass that loaded guest memory's depth and stores part of its target.
+    bool draw_kills_viewport = false;
     /// FSConfig from the registers, with the sgxd_flags' changes and the units' alpha split.
     Pica::Shader::FSConfig FragmentConfig() const;
     /// The hashes of StateRegs' sets, and whether a set's registers changed since.
@@ -784,6 +801,12 @@ private:
     KeyIndex<u32> proctex_tables_by_contents;
 
     ColourBuffer pass_colour{}; // while the backend is in a pass
+    StorePart pass_part{};      // what its end of tile stores (its draws' viewport)
+    StorePart pass_mask{};      // its draws' viewport off the store's grid, masked (MaskOutside)
+    bool pass_margin_masked{};  // masked to the part it stores from its first draw on
+#ifdef VITA_DIAGNOSTICS
+    u32 viewport_masks{}; // perflog: draws whose narrower viewport kept the pass (masked)
+#endif
     /// A colour buffer of a width no pass draws (under 32, or not in 16s): the pass draws into a
     /// scratch of the next width in 16s (32 at least) and 32 rows at least, copied in before and out
     /// after.
@@ -831,6 +854,7 @@ private:
     float pass_bg_depth{1.0f};  // the depth clear the pass took
     u32 pass_bg_stencil{};
     bool pass_depth_used{};     // a draw tested or wrote depth or stencil
+    bool pass_depth_written{};  // a draw wrote depth or stencil
     bool pass_depth_load{};     // it starts from the depth an earlier pass stored
     bool pass_depth_covered{};  // or a draw wrote every pixel's depth before any read it
     bool pass_depth_guest{};    // or from guest memory's, untiled into the store
@@ -842,6 +866,8 @@ private:
         u32 width, height, format;
         SgxdBackend::DepthStore store;
         bool valid; // the last pass on the buffer stored it, and nothing wrote there since
+        // A pass storing part of its target stores its depth here, then that part into store.
+        SgxdBackend::DepthStore scratch{};
     };
     std::vector<DepthStore> depth_stores;
     DepthStore& DepthStoreFor(PAddr addr, u32 width, u32 height, u32 format);

@@ -1274,13 +1274,16 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     data_begin = pds_end + data_slot * DataSize;
     data_end = data_begin + DataSize;
     if (pica) {
-        const SgxdPicaStore store{pica->gpu, pica->pack, pica->bpp};
+        const SgxdPicaStore store{pica->gpu, pica->pack, pica->bpp, pica->x0,
+                                  pica->x1,  pica->y0,   pica->y1};
         u64 eot[SGXD_RECIPE_PICA_EOT_MAX];
         const unsigned words = sgxd_recipe_pica_eot(&r.recipe, &store, eot);
-        DEBUG_ASSERT_MSG(words != 0,
-                         "sgxd: a {}x{} colour buffer at {:#010x}: route 1 takes widths of 32 to "
-                         "1024 in 16s and heights of 8 to 1024 in 8s",
-                         pica->width, pica->height, pica->gpu);
+        // No end of tile: the instance would keep the last target's.
+        ASSERT_MSG(words != 0,
+                   "sgxd: a {}x{} colour buffer at {:#010x} (its part {}..{} x {}..{}): route 1 "
+                   "takes widths of 32 to 1024 in 16s and heights of 8 to 1024 in 8s, and parts "
+                   "in 8s (y0 in 16s)",
+                   pica->width, pica->height, pica->gpu, pica->x0, pica->x1, pica->y0, pica->y1);
         std::memcpy(r.memory + r.bg_offset + PicaEotOffset, eot, words * 8);
     } else {
         sgxd_recipe_set_target(&r.recipe, r.memory, target_gpu, width);
@@ -1329,13 +1332,55 @@ void SgxdBackend::BeginPassLoaded(const PicaTarget& target, float depth, const U
     DrawTiled(guest, true);
 }
 
-void SgxdBackend::SetDepthStore(const DepthStore& store, DepthLoad load) {
+void SgxdBackend::SetDepthStore(const DepthStore& store, DepthLoad load,
+                                const DepthStore* store_to) {
     DEBUG_ASSERT(in_pass);
+    const DepthStore& out = store_to ? *store_to : store;
+    DEBUG_ASSERT(out.width == store.width && out.height == store.height &&
+                 out.stencil == store.stencil);
     const u32 samples = store.width * store.height;
-    sgxd_recipe_set_zls(&current->recipe, store.memory.gpu,
-                        store.stencil ? store.memory.gpu + samples * 4 : 0,
-                        static_cast<int>(load), 1);
+    sgxd_recipe_set_zls_to(
+        &current->recipe, store.memory.gpu, store.stencil ? store.memory.gpu + samples * 4 : 0,
+        static_cast<int>(load), out.memory.gpu, out.stencil ? out.memory.gpu + samples * 4 : 0);
     pass_zls = {store.memory.gpu, store.memory.gpu + samples * (store.stencil ? 5 : 4)};
+}
+
+void SgxdBackend::CopyDepthPart(const DepthStore& from, const DepthStore& to, u32 x0, u32 x1,
+                                u32 y0, u32 y1) {
+    DEBUG_ASSERT(from.width == to.width && from.height == to.height && from.stencil == to.stencil &&
+                 x0 % 8 == 0 && x1 % 8 == 0 && x0 < x1 && y0 < y1 && x1 <= to.width &&
+                 y1 <= to.height);
+    const u32 samples = to.width * to.height;
+    RenderBefore(to.memory.gpu, to.memory.gpu + samples * (to.stencil ? 5 : 4),
+                 "a depth store's part");
+    char failed[160];
+    const u32 at = (y0 * to.width + x0) * 4;
+    const SgxdPtlaCopy depth{from.memory.gpu + at,
+                             to.memory.gpu + at,
+                             SGXD_PTLA_8888,
+                             to.width * 4,
+                             x1 - x0,
+                             y1 - y0,
+                             0,
+                             0};
+    [[maybe_unused]] int copied = sgxd_ptla_copy(&depth, nullptr, failed, sizeof(failed));
+    DEBUG_ASSERT_MSG(copied == 0, "sgxd: a {}x{} depth store's part copy stopped: {}", to.width,
+                     to.height, failed);
+    if (to.stencil) {
+        // One byte a sample: four samples a PTLA pixel.
+        const u32 bytes = samples * 4 + y0 * to.width + x0;
+        const SgxdPtlaCopy stencil{from.memory.gpu + bytes,
+                                   to.memory.gpu + bytes,
+                                   SGXD_PTLA_8888,
+                                   to.width,
+                                   (x1 - x0) / 4,
+                                   y1 - y0,
+                                   0,
+                                   0};
+        copied = sgxd_ptla_copy(&stencil, nullptr, failed, sizeof(failed));
+        DEBUG_ASSERT_MSG(copied == 0, "sgxd: a {}x{} stencil store's part copy stopped: {}",
+                         to.width, to.height, failed);
+    }
 }
 
 void SgxdBackend::TouchAllTiles() {
@@ -1344,6 +1389,60 @@ void SgxdBackend::TouchAllTiles() {
     const SgxdRecipeDrawPrograms p =
         BlitPrograms(Data{nullptr, pass_target.lo}, r.width, r.height, false, r.width);
     Draw(SgxdRecipeDraw{0, 6, SGXD_RECIPE_ISP_NEVER, SGXD_R_FPRIM, 0, 0, nullptr}, p);
+}
+
+void SgxdBackend::MaskOutside(u32 x0, u32 x1, u32 y0, u32 y1, bool part_tiles) {
+    DEBUG_ASSERT(in_pass);
+    const Recipe& r = *current;
+    DEBUG_ASSERT(x0 <= x1 && x1 <= r.width && y0 <= y1 && y1 <= r.height);
+    // The margin as rectangles: the rows above and below the part, the columns beside it.
+    // part_tiles: only the margin inside the tiles the part touches (the region clip keeps its
+    // draws there).
+    const u32 bx0 = part_tiles ? x0 & ~31u : 0, by0 = part_tiles ? y0 & ~31u : 0;
+    const u32 bx1 = part_tiles ? std::min((x1 + 31) & ~31u, r.width) : r.width;
+    const u32 by1 = part_tiles ? std::min((y1 + 31) & ~31u, r.height) : r.height;
+    std::array<std::array<u32, 4>, 4> rects;
+    u32 n = 0;
+    const auto add = [&](u32 ax0, u32 ax1, u32 ay0, u32 ay1) {
+        if (ax0 < ax1 && ay0 < ay1) {
+            rects[n++] = {ax0, ax1, ay0, ay1};
+        }
+    };
+    add(bx0, bx1, by0, y0);
+    add(bx0, bx1, y1, by1);
+    add(bx0, x0, y0, y1);
+    add(x1, bx1, y0, y1);
+    if (n == 0) {
+        return;
+    }
+    // The blit's programs; corners on pixel edges, so a pixel is masked when its centre is in the
+    // margin.
+    SgxdRecipeDrawPrograms p =
+        BlitPrograms(Data{nullptr, pass_target.lo}, r.width, r.height, false, r.width);
+    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    const Data vertices = AllocData(n * 6 * N * 4);
+    float* v = reinterpret_cast<float*>(vertices.cpu);
+    for (u32 i = 0; i < n; i++) {
+        const auto [rx0, rx1, ry0, ry1] = rects[i];
+        const float l = 2.0f * static_cast<float>(rx0) / static_cast<float>(r.width) - 1.0f;
+        const float rr = 2.0f * static_cast<float>(rx1) / static_cast<float>(r.width) - 1.0f;
+        const float t = 2.0f * static_cast<float>(ry0) / static_cast<float>(r.height) - 1.0f;
+        const float b = 2.0f * static_cast<float>(ry1) / static_cast<float>(r.height) - 1.0f;
+        const float corner[6][2] = {{l, t}, {rr, t}, {l, b}, {rr, t}, {rr, b}, {l, b}};
+        for (u32 c = 0; c < 6; c++) {
+            const float words[N] = {corner[c][0], corner[c][1], 0.5f, 1.0f, 1.0f,
+                                    1.0f,         1.0f,         1.0f, 0.0f, 0.0f};
+            std::memcpy(v + (i * 6 + c) * N, words, sizeof(words));
+        }
+    }
+    const SgxdVertexFetch fetch{vertices.gpu, N * 4, N, 0};
+    const auto vspds = VertexPds(&fetch, 1, blit_vertex, false);
+    DEBUG_ASSERT(vspds.va != 0);
+    p.vspds = vspds.va;
+    p.vspds_units = vspds.units;
+    Draw(SgxdRecipeDraw{0, n * 6, SGXD_RECIPE_ISP_MASK_UPDATE, SGXD_R_FPRIM, 0, 0, nullptr,
+                        SGXD_RECIPE_ISP_C_MASK_CLEAR},
+         p);
 }
 
 void SgxdBackend::FillDepthStore(const DepthStore& store, float z, u32 stencil) {

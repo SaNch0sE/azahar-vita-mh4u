@@ -829,12 +829,112 @@ static uint64_t usse_ima32(unsigned dest, unsigned src0, unsigned src1, unsigned
 #define PBE_TWIDDLED (2u << 26)
 #define PBE_NOADVANCE (1u << 31)
 
+// The end of tile storing a part of the target (SgxdPicaStore's x0..x1, y0..y1): the strips of
+// the program below, each kept whole, in part or not at all by where it lies. A tile's strips
+// start at x = 16 X + 0, 8, 16, 24 and y = 16 Y + 0, 16 and are 8 wide and 16 high, two PICA tiles
+// each, the first PICA tile its first 8 rows. Each test is the sign of a difference in r12's
+// 12-bit fields (16 X; 16 Y at bit 12; both under 1024):
+// - a strip before the part (x - x0 negative) or past it (x - x1 not negative) adds 8 to its XMIN
+//   (word 4), past its XMAX, tested in r0 and r2 before they take the PBE's words;
+// - a 16-row half before the part (y - y0 negative) adds 16 rows to YMIN;
+// - YMAX (word 5) starts a row above the strip and takes 8 rows for each of its two PICA tiles that
+//   starts before y1, so a part ending 8 rows into a strip stores its first PICA tile.
+// Before a part's start the strip is dropped through its minimum, as the strip at x or y 0 has no
+// maximum below it. Clip planes would lock up the MTE's clipper (docs/sgxd/ta.md).
+static unsigned pica_eot_part(const SgxdRecipe* r, const SgxdPicaStore* s, uint64_t* out) {
+    const uint32_t width = r->width, height = r->height;
+    if (s->x0 % 8 || s->x1 % 8 || s->y0 % 16 || s->y1 % 8 || s->x0 >= s->x1 || s->y0 >= s->y1 ||
+        s->x1 > width || s->y1 > height) {
+        return 0;
+    }
+    const uint32_t tpr = height / 8, bpp = s->bpp;
+    const uint32_t aw = (width + 31) & ~31u;
+    unsigned xsize = 0;
+    while ((16u << xsize) < aw) {
+        xsize++;
+    }
+    unsigned n = 0;
+#define PUT(w) (out[n++] = (w))
+    PUT(PHAS_LAST);
+    PUT(usse_bitwise_imm(BW_OR, 8, 0, 0, 1));     // r8 = pa0 (IR0)
+    PUT(usse_bitwise_imm(BW_AND, 9, 8, 0xff, 0)); // r9 = X
+    PUT(usse_bitwise_imm(BW_SHR, 10, 8, 8, 0));
+    PUT(usse_bitwise_imm(BW_AND, 10, 10, 0xff, 0)); // r10 = Y
+    PUT(usse_limm(13, 1));
+    // r11 = the tile's base: X bpp (128 tpr - 256) + Y bpp 128 + buffer; r12 = 16 X | 16 Y << 12.
+    PUT(usse_limm(0, bpp * (128 * tpr - 256)));
+    PUT(usse_limm(1, s->buffer));
+    PUT(usse_ima32(11, 9, 0, 1));
+    PUT(usse_limm(0, bpp * 128));
+    PUT(usse_ima32(11, 10, 0, 11));
+    PUT(usse_bitwise_imm(BW_SHL, 12, 10, 16, 0));
+    PUT(usse_limm(0, 16));
+    PUT(usse_ima32(12, 9, 0, 12));
+    // dest = whether (r12 + (c << shift)) is negative in the field whose sign bit is `sign`,
+    // with `flip` its opposite.
+#define SIGN(dest, c, shift, sign, flip)                                                           \
+    do {                                                                                           \
+        PUT(usse_limm(dest, (uint32_t)(c) << (shift)));                                            \
+        PUT(usse_ima32(dest, 12, 13, dest));                                                       \
+        PUT(usse_bitwise_imm(BW_SHR, dest, dest, sign, 0));                                        \
+        PUT(usse_bitwise_imm(BW_AND, dest, dest, 1, 0));                                           \
+        if (flip) {                                                                                \
+            PUT(usse_bitwise_imm(BW_XOR, dest, dest, 1, 0));                                       \
+        }                                                                                          \
+    } while (0)
+    // YMIN's addition (r8, r9) and YMAX's (r10, r14) for each 16-row half.
+    static const unsigned ymin_add[2] = {8, 9}, ymax_add[2] = {10, 14};
+    for (unsigned q = 0; q < 2; q++) {
+        const uint32_t c = 16 * q;
+        SIGN(ymin_add[q], c - s->y0, 12, 23, 0);
+        PUT(usse_bitwise_imm(BW_SHL, ymin_add[q], ymin_add[q], 16, 0));
+        SIGN(0, c - s->y1, 12, 23, 0);     // r0: its first PICA tile before y1
+        SIGN(1, c + 8 - s->y1, 12, 23, 0); // r1: its second
+        PUT(usse_ima32(ymax_add[q], 1, 13, 0));
+        PUT(usse_bitwise_imm(BW_SHL, ymax_add[q], ymax_add[q], 15, 0));
+    }
+    const uint64_t emit = EMITPIX_EOT & ~(EMIT_FREEP | USE1_END | 3ull << 32);
+    for (unsigned k = 0; k < 8; k++) {
+        const unsigned qy = k / 4, qx = k / 2 % 2, h = k % 2;
+        const uint32_t cx = 16 * qx + 8 * h, cy = 16 * qy;
+        const uint32_t cb = bpp * (qx * (128 * tpr - 256) + qy * 128 + h * (64 * tpr - 128));
+        const uint32_t c4 = cx | cy << 12 | xsize << 24;
+        uint32_t c5 = (cx + 7) + ((cy - 1) << 12) + PBE_NOADVANCE;
+        if (k == 7) {
+            c5 -= PBE_NOADVANCE; // the tile's last emit advances the PBE
+        }
+        SIGN(0, cx - s->x0, 0, 11, 0); // r0: before the part
+        SIGN(2, cx - s->x1, 0, 11, 1); // r2: past it
+        PUT(usse_ima32(0, 2, 13, 0));
+        PUT(usse_bitwise_imm(BW_SHL, 0, 0, 3, 0));
+        PUT(usse_limm(1, cb));
+        PUT(usse_ima32(1, 11, 13, 1));
+        PUT(usse_limm(4, c4));
+        PUT(usse_ima32(4, 12, 13, 4));
+        PUT(usse_ima32(4, 0, 13, 4));
+        PUT(usse_ima32(4, ymin_add[qy], 13, 4));
+        PUT(usse_limm(5, c5));
+        PUT(usse_ima32(5, 12, 13, 5));
+        PUT(usse_ima32(5, ymax_add[qy], 13, 5));
+        PUT(usse_limm(0, s->pack | PBE_TWIDDLED));
+        PUT(usse_limm(2, (width - 1) >> 1));
+        PUT(usse_limm(3, 0));
+        PUT(k == 7 ? EMITPIX_EOT : emit); // the last frees the partition and ends
+    }
+#undef SIGN
+#undef PUT
+    return n;
+}
+
 // tools/sgx_pica_eot_probe.py prod_program, word for word.
 unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out) {
     const uint32_t width = r->width, height = r->height;
     if (width % 8 || height % 16 || width < 8 || width > 1024 || height < 32 || height > 1024 ||
         (s->bpp != 2 && s->bpp != 3 && s->bpp != 4)) {
         return 0;
+    }
+    if (s->x1 != 0 && (s->x0 != 0 || s->x1 != width || s->y0 != 0 || s->y1 != height)) {
+        return pica_eot_part(r, s, out);
     }
     // The guest's tiles a row (its width is our height); the target in whole tiles, its last
     // tile column and row (in 16 pixels, as IR0 has them), and the pixels they hold.
@@ -958,6 +1058,11 @@ void sgxd_recipe_set_background_stencil(SgxdRecipe *r, uint8_t stencil) {
 }
 
 void sgxd_recipe_set_zls(SgxdRecipe *r, uint32_t depth, uint32_t stencil, int load, int store) {
+    sgxd_recipe_set_zls_to(r, depth, stencil, load, store ? depth : 0, store ? stencil : 0);
+}
+
+void sgxd_recipe_set_zls_to(SgxdRecipe* r, uint32_t depth, uint32_t stencil, int load,
+                            uint32_t store_depth, uint32_t store_stencil) {
     memset(r->zls, 0, sizeof(r->zls));
     if (depth == 0) {
         return;
@@ -973,14 +1078,16 @@ void sgxd_recipe_set_zls(SgxdRecipe *r, uint32_t depth, uint32_t stencil, int lo
     if (load) {
         ctl |= 1u << 14 | 1u << 1 | (stencil ? 1u << 13 : 0) | (load == 2 ? 1u << 21 : 0);
     }
-    if (store) {
+    if (store_depth) {
         ctl |= 1u << 18 | 1u << 2 | (stencil ? 1u << 17 : 0);
     }
+    // ZLOAD_BASE, ZSTORE_BASE, STENCIL_LOAD_BASE, STENCIL_STORE_BASE (0x0484..0x0490).
     r->zls[0] = ctl;
-    r->zls[1] = r->zls[2] = depth - r->req_base;
+    r->zls[1] = depth - r->req_base;
+    r->zls[2] = store_depth ? store_depth - r->req_base : 0;
     if (stencil) {
         r->zls[3] = load == 2 ? 0 : (stencil - r->req_base) | 1u;
-        r->zls[4] = (stencil - r->req_base) | 1u;
+        r->zls[4] = store_depth ? (store_stencil - r->req_base) | 1u : 0;
     }
 }
 

@@ -178,7 +178,10 @@ public:
     void Mad(Dst dst, Src src1, Src gpi0, Src gpi1, bool vec4, Pred pred = Pred::None,
              bool nosched = false);
     void Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred = Pred::None, bool nosched = false);
-    /// A four-wide dot product that is also user clip plane `plane`'s test: the TA clips at the plane by the result's sign.
+    /// A four-wide dot product that is also user clip plane `plane`'s test (psp2cgc's CLPn
+    /// output, FDPC4): the TA clips at the plane by the result's sign. A plain write of the
+    /// distance leaves the clip flags unset (triangles go missing). Unused: clip planes lock up
+    /// the MTE's clipper (docs/sgxd/ta.md).
     void DotClip(Dst dst, Src src1, Src gpi0, uint8_t plane);
     void Mad2(Dst dst, Src src0, Src src1, Src src2, Pred pred = Pred::None);
     void Comp(CompOp op, Dst dst, Src src, uint8_t src_comp, Pred pred = Pred::None,

@@ -160,6 +160,8 @@ public:
         u32 width, height;
         u32 pack;
         u32 bpp;
+        // The part of the transpose stored (SgxdPicaStore's x0..x1, y0..y1); x1 0 for all of it.
+        u32 x0{}, x1{}, y0{}, y1{};
     };
     /// Opens a pass on target. The background is clear (A8B8G8R8) at depth, what a fill left
     /// pending in guest memory. before: as BeginPassLoaded's.
@@ -365,11 +367,21 @@ public:
     /// a guest D24S8 (D24) buffer's words untiled into the store (ZLS I24ZI8S).
     enum class DepthLoad { None, Store, Guest };
     /// The open pass's depth (and stencil) loaded from store at its start as load says, and
-    /// stored there at its end (ZLS, sgxd_recipe_set_zls). OpenPass turns it off.
-    void SetDepthStore(const DepthStore& store, DepthLoad load);
+    /// stored there at its end, or into store_to, of store's shape (ZLS, sgxd_recipe_set_zls_to).
+    /// OpenPass turns it off.
+    void SetDepthStore(const DepthStore& store, DepthLoad load,
+                       const DepthStore* store_to = nullptr);
+    /// from's samples x0 <= x < x1, y0 <= y < y1 (x in 8s) into to, of the same shape, depth and
+    /// stencil, through the PTLA, behind every 3D sent before (sgxd_ptla's queued copies).
+    void CopyDepthPart(const DepthStore& from, const DepthStore& to, u32 x0, u32 x1, u32 y0,
+                       u32 y1);
     /// A quad over the open pass's whole target that the ISP rejects (DCMP NEVER): every tile
     /// holds an object, so none stays EMPTY and skips its ZLS load and store.
     void TouchAllTiles();
+    /// The open pass's target outside [x0, x1) x [y0, y1) masked from here on: mask updates
+    /// clear the mask there (SGXD_RECIPE_ISP_MASK_UPDATE), so the ISP rejects every later draw's
+    /// samples there before any shading, and they keep what the pass loaded or cleared.
+    void MaskOutside(u32 x0, u32 x1, u32 y0, u32 y1, bool part_tiles = false);
     /// store's samples as a clear leaves them, depth z and stencil, through the PTLA: a tile no
     /// primitive touches neither loads nor stores.
     void FillDepthStore(const DepthStore& store, float z, u32 stencil);

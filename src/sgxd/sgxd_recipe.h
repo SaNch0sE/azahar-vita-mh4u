@@ -107,6 +107,15 @@ typedef struct SgxdRecipeDraw {
 #define SGXD_RECIPE_ISP_C 0x0e000000u
 // ISP A's CPRES: the object carries its ISP C word.
 #define SGXD_RECIPE_ISP_CPRES (1u << 8)
+// ISP A of a mask update, libgxm's SCE_GXM_PASS_TYPE_MASK_UPDATE: its fragment state 0x6200000
+// is PASSTYPE 3 and TAGWRITEDIS, so it is never shaded; the
+// samples it covers take its stencil test's result as their mask (Sony: NEVER clears it, ALWAYS
+// sets it). A sample whose mask is 0 rejects every later object but the background.
+#define SGXD_RECIPE_ISP_MASK_UPDATE                                                                \
+    ((SGXD_RECIPE_ISP_A & ~(7u << 25)) | 3u << 25 | 1u << 21 | SGXD_RECIPE_ISP_CPRES)
+// ISP C of a mask update that clears the mask: SCMP NEVER, every op KEEP; the compare mask is
+// set only so that the word is not 0 (SGXD_RECIPE_ISP_C).
+#define SGXD_RECIPE_ISP_C_MASK_CLEAR 0x0000ff00u
 #define SGXD_RECIPE_CLIP(x0, y0, x1, y1)                                                          \
     (1u << 31 | (uint32_t)(x0) << 24 | (uint32_t)(x1) << 16 | (uint32_t)(y0) << 8 | (uint32_t)(y1))
 
@@ -231,6 +240,10 @@ void sgxd_recipe_set_background_stencil(SgxdRecipe *r, uint8_t stencil);
 // buffer's, the stencil their top byte) and store force the ZLS for every tile a primitive touches;
 // the store is always F32. depth 0 turns the ZLS off, as written.
 void sgxd_recipe_set_zls(SgxdRecipe *r, uint32_t depth, uint32_t stencil, int load, int store);
+// The same, stored at store_depth and store_stencil (ZSTORE_BASE, STENCIL_STORE_BASE) instead of
+// where it loads from; store_depth 0 stores nothing.
+void sgxd_recipe_set_zls_to(SgxdRecipe* r, uint32_t depth, uint32_t stencil, int load,
+                            uint32_t store_depth, uint32_t store_stencil);
 
 // ImGui's vertex path. nverts ImDrawVert records (SGXD_RECIPE_IMGUI_WORDS words each)
 // fetched at stride 20 into pa0..pa4; the vertex program maps x, y through the scale and offset in
@@ -368,11 +381,15 @@ typedef struct SgxdPicaStore {
     uint32_t buffer;   // the guest colour buffer's GPU address
     uint32_t pack;     // its format: PBE word 0's pack and swizzle (SGXD_RECIPE_PACK_*)
     uint32_t bpp;      // its bytes a pixel: 2, 3 or 4
+    // The part of the target stored, x0 <= x < x1 and y0 <= y < y1 (x0, x1 and y1 in 8s, y0 in
+    // 16s); x1 0 for all of it. Outside it nothing is stored: guest memory keeps its bytes there.
+    uint32_t x0, x1, y0, y1;
 } SgxdPicaStore;
-#define SGXD_RECIPE_PICA_EOT_MAX 128u
+#define SGXD_RECIPE_PICA_EOT_MAX 256u
 // The end-of-tile program storing r's target into s's buffer: up to SGXD_RECIPE_PICA_EOT_MAX
 // instructions into out, temporaries r0..r15. Returns the count, or 0 for a target route 1 does
-// not take (width a multiple of 8 up to 1024, height of 16 from 32 to 1024).
+// not take (width a multiple of 8 up to 1024, height of 16 from 32 to 1024) or a part of it not
+// in 8s (y0 in 16s).
 unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out);
 // The pixel event program for it: the recipe's, with IR0 DOUTAed into the end-of-tile task's pa0
 // first (three times: a DOUTA is repeated), and the end of tile at eot_index (DOUTU's

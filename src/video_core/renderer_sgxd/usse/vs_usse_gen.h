@@ -74,11 +74,6 @@ struct VsRequest {
     uint16_t s8_regs = 0;
     uint16_t s16_regs = 0;
     VsMode mode = VsMode::Draw;
-    /// Draw mode: the TA's user clip planes, in the PICA's clip space, for the viewport's edges
-    /// inside the colour buffer, which the PICA's clipping keeps fragments within and the SGX's
-    /// guard band would not: bit 0 x <= w (the right edge), 1 y <= w (the top), 2 x >= -w, 3
-    /// y >= -w.
-    uint8_t clip_planes = 0;
     uint32_t gs_rows = 0;
     bool gs_rows_uniform = false;
     bool gs_rows_table = false;
