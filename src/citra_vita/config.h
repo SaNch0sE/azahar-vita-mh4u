@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "citra_vita/control_layouts.h"
 #include "citra_vita/screen_layout.h"
 #include "common/common_types.h"
 
@@ -72,6 +73,10 @@ enum class Option : u32 {
     MapZR,
     MapStart,
     MapSelect,
+    /// The control layout (ControlLayouts): 0 the Map* options' mapping, then the player's own
+    /// layouts (custom layout N is CustomControlValue(N)), each its own mapping and on-screen
+    /// buttons in place of the Map* options'.
+    ControlLayout,
     RightStick,
     Region,
     /// The 3DS's system language (Service::CFG::SystemLanguage's order: Japanese, English, French,
@@ -120,6 +125,24 @@ std::size_t SaveScreenLayout(std::optional<std::size_t> index, ScreenLayouts::Sc
 /// one after it follow it down.
 void DeleteScreenLayout(std::size_t index);
 
+/// ControlLayout's value for custom control layout `index`, and the one a value is, if any.
+[[nodiscard]] constexpr int CustomControlValue(std::size_t index) {
+    return 1 + static_cast<int>(index);
+}
+[[nodiscard]] constexpr std::optional<std::size_t> CustomControlIndex(int value) {
+    return value >= 1 ? std::optional<std::size_t>{static_cast<std::size_t>(value) - 1}
+                      : std::nullopt;
+}
+
+/// Saves a control layout (ControlLayouts::Put) as layout `index`'s new self, or (nullopt) as a
+/// new one: its index. The settings that choose it apply it again, and the settings file is
+/// written again.
+std::size_t SaveControlLayout(std::optional<std::size_t> index,
+                              ControlLayouts::ControlLayout layout);
+/// Deletes control layout `index`: the settings that chose it go back to the Controls tab's
+/// mapping (0), and those that chose one after it follow it down.
+void DeleteControlLayout(std::size_t index);
+
 /// FrameSkipLimit's value for no limit.
 constexpr int NoFrameSkipLimit = 5;
 
@@ -153,6 +176,10 @@ enum class RightStickMode : int {
     Count,
 };
 
+/// An input's word in the files (settings.txt's map_ keys, control_layouts.txt), and the input a
+/// word names.
+[[nodiscard]] const char* InputWord(ControlInput input);
+[[nodiscard]] std::optional<ControlInput> InputFromWord(const std::string& word);
 
 /// Whether a title can have its own value. The options for the screens, the speed and the
 /// controls are: what suits one title (a top screen it needs whole, a scale its GPU work allows,

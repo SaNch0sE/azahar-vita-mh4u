@@ -71,6 +71,9 @@ EmuWindowVita::~EmuWindowVita() {
 namespace {
 std::atomic<EmuWindowVita::Wide> widescreen{EmuWindowVita::Wide::Off};
 std::atomic<u32> overlay_percent{60};
+Common::Mutex on_screen_mutex;
+std::optional<ControlLayouts::ControlLayout> on_screen_chosen;
+std::atomic<u32> on_screen_generation_set{};
 Common::Mutex chosen_mutex;
 ScreenLayouts::Builtin chosen_builtin{ScreenLayouts::Builtin::Default};
 std::optional<ScreenLayouts::ScreenLayout> chosen_custom;
@@ -542,14 +545,29 @@ void EmuWindowVita::VolumeKeys(u32 buttons) {
 }
 
 void EmuWindowVita::UpdateTouch() {
+    if (const u32 generation = on_screen_generation_set.load(std::memory_order_acquire);
+        generation != on_screen_generation) {
+        std::scoped_lock lk{on_screen_mutex};
+        on_screen_generation = generation;
+        on_screen = on_screen_chosen;
+    }
+    u32 held = 0;
+    const auto hold = [&](u32 buttons) {
+        if (on_screen_held.exchange(buttons, std::memory_order_relaxed) != buttons) {
+            MarkOverlayChanged();
+        }
+    };
     const auto release = [this] {
         if (touch_down) {
             TouchReleased();
             touch_down = touch_on_screen = false;
         }
+        touch_finger = -1;
     };
     if (!input_to_guest.load(std::memory_order_relaxed)) {
         release();
+        button_finger_count = 0;
+        hold(0);
         return;
     }
     // The touch screen's coordinates, 0 to 1 across it, kept just inside: the 3DS's panel reads
@@ -569,35 +587,71 @@ void EmuWindowVita::UpdateTouch() {
     }
 
     SceTouchData touch{};
-    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) <= 0 || touch.reportNum == 0) {
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) <= 0) {
+        touch.reportNum = 0;
+    }
+    // Each finger by its report ID: one that came down on an on-screen button holds the button
+    // under it; the first other one is the touch screen's, as the 3DS has one touch point; any
+    // more touch nothing.
+    std::array<int, 8> fingers_now{};
+    std::size_t fingers_now_count = 0;
+    std::optional<ScreenLayouts::Point> touch_at;
+    const u32 reports = std::min<u32>(touch.reportNum, SCE_TOUCH_MAX_REPORT);
+    for (u32 i = 0; i < reports; i++) {
+        const int id = touch.report[i].id;
+        const ScreenLayouts::Point on_display{
+            static_cast<float>(touch.report[i].x) * DisplayWidth / TouchPanelWidth,
+            static_cast<float>(touch.report[i].y) * DisplayHeight / TouchPanelHeight};
+        const auto button =
+            on_screen ? ControlLayouts::Hit(*on_screen, on_display.x, on_display.y) : std::nullopt;
+        const bool button_finger =
+            std::find(button_fingers.begin(), button_fingers.begin() + button_finger_count, id) !=
+            button_fingers.begin() + button_finger_count;
+        if (button_finger || (id != touch_finger && button)) {
+            if (button) {
+                held |= 1u << ControlLayouts::NativeButtonOf(*button);
+            }
+            if (fingers_now_count < fingers_now.size()) {
+                fingers_now[fingers_now_count++] = id;
+            }
+            continue;
+        }
+        if (id == touch_finger) {
+            touch_at = on_display;
+        } else if (touch_finger < 0) {
+            touch_finger = id;
+            touch_at = on_display;
+        }
+    }
+    button_fingers = fingers_now;
+    button_finger_count = fingers_now_count;
+    hold(held);
+    if (!touch_at) {
         release();
         return;
     }
 
-    // The panel's coordinates are its own, twice the display's in each axis. The bottom screen's
-    // inverse takes the display's point onto the touch screen.
-    const ScreenLayouts::Point on_display{
-        static_cast<float>(touch.report[0].x) * DisplayWidth / TouchPanelWidth,
-        static_cast<float>(touch.report[0].y) * DisplayHeight / TouchPanelHeight};
-    const ScreenLayouts::Point on_screen = touch_from_display.Apply(on_display);
+    // The bottom screen's inverse takes the display's point onto the touch screen.
+    const ScreenLayouts::Point on_screen_point = touch_from_display.Apply(*touch_at);
     if (!touch_down) {
         touch_down = true;
-        touch_on_screen = on_screen.x >= 0.0f && on_screen.x < 1.0f && on_screen.y >= 0.0f &&
-                          on_screen.y < 1.0f;
-#ifdef VITA_DIAGNOSTICS
-        // sgxd_flags `touchlog`: where each touch came down, on the display and on the touch
-        // screen in its pixels.
-        static const bool touch_log = SgxdRenderer::SgxdFlag("touchlog");
-        if (touch_log) {
-            LOG_INFO(Frontend, "touch: ({:.1f}, {:.1f}) on the display, ({:.1f}, {:.1f}) on the "
-                               "touch screen{}",
-                     on_display.x, on_display.y, on_screen.x * 320.0f, on_screen.y * 240.0f,
-                     touch_on_screen ? "" : ", off it");
-        }
-#endif
+        touch_on_screen = on_screen_point.x >= 0.0f && on_screen_point.x < 1.0f &&
+                          on_screen_point.y >= 0.0f && on_screen_point.y < 1.0f;
     }
     if (touch_on_screen) {
-        press(on_screen.x, on_screen.y);
+        press(on_screen_point.x, on_screen_point.y);
+    }
+}
+
+void EmuWindowVita::SetOnScreenButtons(std::optional<ControlLayouts::ControlLayout> layout) {
+    std::scoped_lock lk{on_screen_mutex};
+    on_screen_chosen = layout && layout->HasOnScreen() ? std::move(layout) : std::nullopt;
+    on_screen_generation_set.fetch_add(1, std::memory_order_release);
+}
+
+void EmuWindowVita::DrawOnScreenButtons() {
+    if (on_screen) {
+        ControlLayouts::DrawHud(*on_screen, on_screen_held.load(std::memory_order_relaxed));
     }
 }
 

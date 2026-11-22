@@ -72,6 +72,8 @@ constexpr std::array table{std::to_array<Translation>({
     {"Built in", "内置"},
     {"Built into Azahar for this game. It can't be turned off.",
      "由 Azahar 为此游戏内置，无法关闭。"},
+    {"Buttons", "按键"},
+    {"Buttons below", "下方的按键"},
     {"C-stick", "C 摇杆"},
     {"Cancel", "取消"},
     {"Centre on the display", "在显示屏上居中"},
@@ -90,6 +92,8 @@ constexpr std::array table{std::to_array<Translation>({
     {"Command buffer reported", "上报命令缓冲区"},
     {"Console name", "主机名称"},
     {"Continue", "继续"},
+    {"Control layout", "按键布局"},
+    {"Control layout editor", "按键布局编辑器"},
     {"Controls", "按键"},
     {"Could not load this title: {}", "无法加载此游戏：{}"},
     {"Could not pin this title. Install Azahar's vpk again with VitaShell, then try again.",
@@ -111,6 +115,9 @@ constexpr std::array table{std::to_array<Translation>({
     {"Decrypt this game, then install it again.", "请先解密此游戏，然后重新安装。"},
     {"Default", "默认"},
     {"Delete", "删除"},
+    {"Delete the control layout {}? The games that use it go back to the buttons in the "
+     "Controls tab.",
+     "删除按键布局 {}？使用它的游戏将改回“操作”标签页中的按键。"},
     {"Delete the layout {}? The games that use it go back to Default.",
      "要删除布局 {} 吗？使用它的游戏将恢复为“默认”。"},
     {"Delete this layout", "删除此布局"},
@@ -223,8 +230,12 @@ constexpr std::array table{std::to_array<Translation>({
     {"Layout editor", "布局编辑器"},
     {"Layout name", "布局名称"},
     {"Leave", "离开"},
+    {"Leave the control layout editor? The changes are not saved.", "离开按键布局编辑器？更改不会保存。"},
     {"Leave the layout editor? The changes are not saved.", "要离开布局编辑器吗？更改不会被保存。"},
     {"Left", "方向键左"},
+    {"Left and right: the Vita input that presses it. Cross: a button on the screen for it, or "
+     "none.",
+     "左右：按下它的 Vita 输入。叉键：为它在屏幕上放一个按钮，或取消。"},
     {"Left eye only", "仅绘制左眼"},
     {"Left out", "未应用"},
     {"Left out: your copy is a different version from the one it was made for.",
@@ -236,9 +247,15 @@ constexpr std::array table{std::to_array<Translation>({
     {"Loading slot {}...", "正在读取槽位 {}…"},
     {"Loading...", "正在加载…"},
     {"Looking for an ad hoc room...", "正在寻找本地联机房间…"},
+    {"Make a control layout of your own: the Vita input each 3DS button answers to, and "
+     "buttons on the screen that a finger on the display presses, such as ZL and ZR without "
+     "the rear touch panel. It opens on the Control layout above: a layout of your own is "
+     "changed, the buttons below are the start of a new one.",
+     "制作你自己的按键布局：每个 3DS 按键对应的 Vita 输入，以及手指在屏幕上按下的屏幕按钮，例如不用背面触摸板的 ZL 和 ZR。它从上方的“按键布局”打开：你自己的布局会被修改，下方的按键则作为新布局的起点。"},
     {"Memory devices", "存储设备"},
     {"Menu theme", "菜单主题"},
     {"Model files reported", "上报模型文件"},
+    {"Move: d-pad, left stick or drag. Size: L, R or pinch.", "移动：方向键、左摇杆或拖动。大小：L、R 或双指缩放。"},
     {"Move: d-pad, left stick or drag. Size: L, R or pinch. Stretch: right stick.",
      "移动：方向键、左摇杆或拖动。缩放：L、R 或双指捏合。拉伸：右摇杆。"},
     {"Multiplayer", "多人游戏"},
@@ -249,7 +266,9 @@ constexpr std::array table{std::to_array<Translation>({
      "开启抗锯齿时固定为原生分辨率。关闭抗锯齿后才能选择分辨率。"},
     {"Needs {} MiB on the memory card.", "需要存储卡上 {} MiB 的空间。"},
     {"New layout", "新布局"},
+    {"Next button", "下一个按钮"},
     {"Nickname", "昵称"},
+    {"No button on the screen yet: put some there with Buttons.", "屏幕上还没有按钮：用“按键”放置一些。"},
     {"No cheats", "没有金手指"},
     {"No patches", "没有补丁"},
     {"Azahar has no patches or engine settings for this game.",
@@ -282,6 +301,8 @@ constexpr std::array table{std::to_array<Translation>({
     {"OK", "确定"},
     {"On", "开"},
     {"On or off", "开/关"},
+    {"On screen", "屏幕上"},
+    {"On-screen buttons' opacity", "屏幕按钮的不透明度"},
     {"On: active now.", "已开启：正在生效。"},
     {"On: applied while the game runs.", "已开启：游戏运行时生效。"},
     {"Opacity", "不透明度"},
@@ -348,6 +369,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Russian", "俄语"},
     {"Save", "保存"},
     {"Save as new", "另存为新布局"},
+    {"Save control layout", "保存按键布局"},
     {"Save layout", "保存布局"},
     {"Save over slot {}? Its state from {} is replaced.",
      "要覆盖槽位 {} 吗？{} 保存的即时存档将被替换。"},
@@ -359,6 +381,9 @@ constexpr std::array table{std::to_array<Translation>({
      "needed).",
      "通过 USB 线将一个屏幕发送到电脑，在电脑上显示为名为 Azahar 的 400x240 摄像头。Vita "
      "上的屏幕布局不变：如果只想在 Vita 上看到另一个屏幕，请使用“单屏”（必要时配合“交换屏幕”）。"},
+    {"Set by the control layout. Change it in the control layout editor, or choose Buttons "
+     "below.",
+     "由按键布局设定。请在按键布局编辑器中更改，或选择“下方的按键”。"},
     {"Set for this game, the same as all games for now. Changing it for all games won't change it "
      "here.",
      "已为此游戏单独设置，目前与所有游戏的设置相同。更改所有游戏的设置不会影响此游戏。"},
@@ -545,6 +570,10 @@ constexpr std::array table{std::to_array<Translation>({
      "Off draws every frame and the game slows down instead.",
      "GPU 跟不上时，较忙的屏幕会跳帧，以保持游戏速度。此项设置最多可连续跳过的帧数：越高，负担重的"
      "游戏越快，但越不流畅。关：绘制每一帧，游戏会变慢。"},
+    {"Which Vita input presses each 3DS button. Buttons below: the rows below this one. Your "
+     "own layouts, made in the control layout editor, have a mapping of their own and can put "
+     "buttons on the screen, which a finger on the display presses.",
+     "每个 3DS 按键由哪个 Vita 输入按下。下方的按键：此行下方的各行。你在按键布局编辑器中制作的布局有自己的映射，并可在屏幕上放置按钮，用手指在屏幕上按下。"},
     {"Widescreen", "宽屏"},
     {"Widescreen hack", "扩展宽屏"},
     {"Widescreen stretch", "拉伸宽屏"},
@@ -578,6 +607,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"{} titles", "{} 个游戏"},
     {"{}: its downloadable content is installed.", "{}：追加内容已安装。"},
     {"{}: its update is installed.", "{}：更新数据已安装。"},
+    {"{}: {} pixels across at {}, {}", "{}：直径 {} 像素，位于 {}, {}"},
     {"{}: {}x{} at {}, {}, turned {} degrees, {}% opaque{}",
      "{}：{}x{}，位于 {}, {}，旋转 {} 度，不透明度 {}%{}"},
 })};

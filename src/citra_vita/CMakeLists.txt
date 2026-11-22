@@ -56,6 +56,8 @@ set(CITRA_VITA_SOURCES
     citra_vita_main.cpp
     config.cpp
     config.h
+    control_layouts.cpp
+    control_layouts.h
     crash_report.cpp
     crash_report.h
     emu_window_vita.cpp

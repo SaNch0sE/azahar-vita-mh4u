@@ -87,10 +87,13 @@ public:
 
     bool GetStatus() const override {
         const u32 mask = button_masks[button].load(std::memory_order_relaxed);
-        if (g_window == nullptr || mask == 0) {
+        if (g_window == nullptr) {
             return false;
         }
-        return (g_window->GuestButtons() & mask) != 0;
+        // The control layout's on-screen button for it and the right stick's mode, as well as
+        // its input.
+        return (mask != 0 && (g_window->GuestButtons() & mask) != 0) ||
+               (g_window->OnScreenButtons() >> button & 1) != 0 || RightStickPresses(button);
     }
 
 private:

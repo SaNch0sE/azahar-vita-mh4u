@@ -18,6 +18,7 @@
 #include "citra_vita/config.h"
 #include "citra_vita/multiplayer.h"
 #include "citra_vita/rom_check.h"
+#include "citra_vita/control_layouts.h"
 #include "citra_vita/screen_layout.h"
 #include "common/common_types.h"
 #include "common/math_util.h"
@@ -183,6 +184,7 @@ private:
         Multiplayer,
         InstallPicker,
         LayoutEditor,
+        ControlEditor,
     };
 
     /// The settings screen's groups, its tabs. Patches, Cheats, Installed and File hold no rows: a
@@ -491,6 +493,46 @@ private:
         bool bars_hidden{};
     };
     LayoutEditor editor;
+
+    /// The Controls tab's row under Control layout: the control layout editor, opened on the
+    /// control layout the tab shows; its info beside the list (focused_row ControlEditorRow).
+    void DrawControlEditorRow();
+    void DrawControlEditorInfo();
+    static constexpr int ControlEditorRow = -4;
+    /**
+     * The control layout editor: the whole display its preview, the layout's on-screen buttons
+     * where it places them over a running game's screens (in the game list, over cards where the
+     * screen layout puts the screens). The pad and touch move and size the selected on-screen
+     * button; the Buttons panel holds each 3DS button's Vita input and whether it is on screen,
+     * and the save panel the layout's name. Opened from the settings screen, which it goes back
+     * to; saving makes the layout the one those settings choose.
+     */
+    Action DrawControlEditor();
+    void OpenControlEditor();
+    void CloseControlEditor();
+    void EditControls();
+    void DrawControlPreview();
+    void DrawControlBars();
+    void DrawControlButtons();
+    void DrawControlSave();
+    void SaveEditedControls(bool as_new);
+    struct ControlEditor {
+        ControlLayouts::ControlLayout layout;
+        std::optional<std::size_t> index;
+        std::string name;
+        std::optional<ControlLayouts::Button> selected;
+        EditorPanel panel{EditorPanel::None};
+        bool changed{};
+        u32 pad{};
+        std::array<float, 6> held_for{};
+        int touches{};
+        std::array<ScreenLayouts::Point, 2> touch{};
+        bool preview_touch{};
+        bool dragging{};
+        ScreenLayouts::ScreenLayout screens;
+    };
+    ControlEditor control_editor;
+    ScreenLayouts::ScreenLayout SettingsScreenLayout() const;
     void DrawFileInfo();
 
     /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none; 0-3 the room's
@@ -499,6 +541,7 @@ private:
     Multiplayer::Fields room_fields{};
     static constexpr int KeyboardConsoleName = 4;
     static constexpr int KeyboardLayoutName = 5;
+    static constexpr int KeyboardControlName = 6;
     int editing_field = -1;
     std::string edit_text;
     bool keyboard_shift{};

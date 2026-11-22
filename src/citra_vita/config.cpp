@@ -68,6 +68,7 @@ const std::vector<const char*> SystemLanguages{
 const std::vector<const char*> Themes{"dark", "light"};
 const std::vector<const char*> UsbVideoScreens{"off", "top", "bottom"};
 const std::vector<const char*> Languages{"english", "chinese_simplified"};
+const std::vector<const char*> ControlLayoutWords{"default"};
 const std::vector<const char*> RightStickWords{"cstick", "lr", "dpad"};
 const std::vector<const char*> Inputs{"circle", "cross",  "triangle",  "square",     "up",
                                       "down",   "left",   "right",     "l",          "r",
@@ -104,6 +105,7 @@ const std::array<Definition, Count> definitions{{
     {"map_zr", true, true, 0, 14, 13, Inputs},
     {"map_start", true, true, 0, 14, 10, Inputs},
     {"map_select", true, true, 0, 14, 11, Inputs},
+    {"control_layout", true, true, 0, 0, 0, ControlLayoutWords},
     {"right_stick", true, true, 0, static_cast<int>(RightStickMode::Count) - 1, 0, RightStickWords},
     {"region", false, false, 0, 7, 0, Regions},
     // English, the config save's own on a new card.
@@ -162,8 +164,10 @@ const Definition& Of(Option option) {
 
 /// The option's last value: the screen layout's after the built-in ones, its custom layouts'.
 int MaximumOf(Option option) {
-    const int custom =
-        option == Option::ScreenLayout ? static_cast<int>(ScreenLayouts::Count()) : 0;
+    const int custom = option == Option::ScreenLayout ? static_cast<int>(ScreenLayouts::Count())
+                       : option == Option::ControlLayout
+                           ? static_cast<int>(ControlLayouts::Count())
+                           : 0;
     return Of(option).maximum + custom;
 }
 
@@ -282,8 +286,31 @@ void ApplyLocked(Option option) {
     case Option::MapZR:
     case Option::MapStart:
     case Option::MapSelect:
-        SetControl(static_cast<int>(option) - static_cast<int>(Option::MapA),
-                   static_cast<ControlInput>(value));
+        // A control layout of the player's maps every button in their place.
+        if (!CustomControlIndex(EffectiveLocked(Option::ControlLayout))) {
+            SetControl(static_cast<int>(option) - static_cast<int>(Option::MapA),
+                       static_cast<ControlInput>(value));
+        }
+        break;
+    case Option::ControlLayout:
+        if (const auto custom = CustomControlIndex(value)) {
+            // Its mapping and on-screen buttons as the file has them now (a value past the last
+            // is clamped before it gets here).
+            const std::optional<ControlLayouts::ControlLayout> layout =
+                ControlLayouts::Get(*custom);
+            ASSERT_MSG(layout, "settings: control layout {} of {}", *custom,
+                       ControlLayouts::Count());
+            for (std::size_t b = 0; b < ControlLayouts::ButtonCount; b++) {
+                SetControl(static_cast<int>(b), static_cast<ControlInput>(layout->inputs[b]));
+            }
+            EmuWindowVita::SetOnScreenButtons(*layout);
+        } else {
+            for (int b = 0; b < static_cast<int>(ControlLayouts::ButtonCount); b++) {
+                SetControl(b, static_cast<ControlInput>(EffectiveLocked(
+                                  static_cast<Option>(static_cast<int>(Option::MapA) + b))));
+            }
+            EmuWindowVita::SetOnScreenButtons(std::nullopt);
+        }
         break;
     case Option::RightStick:
         SetRightStick(static_cast<RightStickMode>(value));
@@ -331,6 +358,10 @@ std::optional<int> ParseValue(Option option, const std::string& text) {
         const auto index = ScreenLayouts::Find(text.substr(std::strlen(CustomLayoutWord)));
         return index ? std::optional<int>{CustomLayoutValue(*index)} : std::nullopt;
     }
+    if (option == Option::ControlLayout && text.starts_with(CustomLayoutWord)) {
+        const auto index = ControlLayouts::Find(text.substr(std::strlen(CustomLayoutWord)));
+        return index ? std::optional<int>{CustomControlValue(*index)} : std::nullopt;
+    }
     if (!d.words.empty()) {
         for (std::size_t i = 0; i < d.words.size(); i++) {
             if (text == d.words[i]) {
@@ -351,6 +382,9 @@ std::string FormatValue(Option option, int value) {
     const Definition& d = Of(option);
     if (const auto custom = CustomLayoutIndex(value); custom && option == Option::ScreenLayout) {
         return CustomLayoutWord + ScreenLayouts::Get(*custom)->name;
+    }
+    if (const auto custom = CustomControlIndex(value); custom && option == Option::ControlLayout) {
+        return CustomLayoutWord + ControlLayouts::Get(*custom)->name;
     }
     if (!d.words.empty()) {
         return d.words[static_cast<std::size_t>(value)];
@@ -432,6 +466,7 @@ void Load() {
     std::scoped_lock lock{mutex};
     // The custom layouts first: the file names those it chooses.
     ScreenLayouts::Load();
+    ControlLayouts::Load();
     for (std::size_t i = 0; i < Count; i++) {
         const Definition& d = definitions[i];
         ASSERT_MSG(d.words.empty() || static_cast<int>(d.words.size()) == d.maximum + 1,
@@ -594,6 +629,53 @@ void DeleteScreenLayout(std::size_t index) {
     dirty = true;
     ApplyLocked(Option::ScreenLayout);
     SaveLocked();
+}
+
+std::size_t SaveControlLayout(std::optional<std::size_t> index,
+                              ControlLayouts::ControlLayout layout) {
+    std::scoped_lock lock{mutex};
+    const std::size_t at = ControlLayouts::Put(index, std::move(layout));
+    dirty = true;
+    ApplyLocked(Option::ControlLayout);
+    SaveLocked();
+    return at;
+}
+
+void DeleteControlLayout(std::size_t index) {
+    std::scoped_lock lock{mutex};
+    ControlLayouts::Remove(index);
+    const int gone = CustomControlValue(index);
+    const auto follow = [gone](int value) {
+        return value == gone ? 0 : value > gone ? value - 1 : value;
+    };
+    constexpr std::size_t i = static_cast<std::size_t>(Option::ControlLayout);
+    global_values[i] = follow(global_values[i]);
+    for (auto& [title, values] : title_values) {
+        if (values[i]) {
+            values[i] = follow(*values[i]);
+        }
+    }
+    if (pins[i]) {
+        pins[i] = follow(*pins[i]);
+    }
+    dirty = true;
+    ApplyLocked(Option::ControlLayout);
+    SaveLocked();
+}
+
+const char* InputWord(ControlInput input) {
+    ASSERT_MSG(input >= ControlInput{} && input < ControlInput::Count, "settings: input {}",
+               static_cast<int>(input));
+    return Inputs[static_cast<std::size_t>(input)];
+}
+
+std::optional<ControlInput> InputFromWord(const std::string& word) {
+    for (std::size_t i = 0; i < Inputs.size(); i++) {
+        if (word == Inputs[i]) {
+            return static_cast<ControlInput>(i);
+        }
+    }
+    return std::nullopt;
 }
 
 std::string TitleKeyOf(const std::string& path) {
@@ -777,6 +859,9 @@ std::size_t WriteApplied(char* out, std::size_t size) {
         } else if (const auto custom = CustomLayoutIndex(value);
                    custom && static_cast<Option>(i) == Option::ScreenLayout) {
             add(" %s=custom%u%s", d.key, static_cast<unsigned>(*custom), mark);
+        } else if (const auto control = CustomControlIndex(value);
+                   control && static_cast<Option>(i) == Option::ControlLayout) {
+            add(" %s=custom%u%s", d.key, static_cast<unsigned>(*control), mark);
         } else {
             add(" %s=%d%s", d.key, value, mark);
         }

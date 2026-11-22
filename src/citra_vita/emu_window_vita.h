@@ -8,6 +8,7 @@
 #include <atomic>
 #include <optional>
 
+#include "citra_vita/control_layouts.h"
 #include "citra_vita/screen_layout.h"
 #include "citra_vita/sgxd_present.h"
 #include "common/common_types.h"
@@ -153,6 +154,17 @@ public:
                ~menu_held.load(std::memory_order_relaxed);
     }
 
+    /// The 3DS buttons the on-screen buttons hold as of the last PollEvents, NativeButton bits.
+    [[nodiscard]] u32 OnScreenButtons() const {
+        return on_screen_held.load(std::memory_order_relaxed);
+    }
+    /// The control layout's on-screen buttons the settings choose (Config::Option::ControlLayout;
+    /// nullopt or a layout without any: none). Any thread; the next poll takes them.
+    static void SetOnScreenButtons(std::optional<ControlLayouts::ControlLayout> layout);
+    /// The on-screen buttons into the frame being built, in game (Ui::Draw). The presenting
+    /// thread's, which polls.
+    void DrawOnScreenButtons();
+
     /// Left stick, each axis in [-1, 1] with y positive upwards.
     [[nodiscard]] std::pair<float, float> LeftStick() const;
     /// Right stick, as LeftStick: the guest's C-stick (the Circle Pad Pro's, the New 3DS's).
@@ -242,6 +254,16 @@ private:
     /// screen, which it then holds wherever it slides: one that comes down off it touches nothing.
     bool touch_down{};
     bool touch_on_screen{};
+    /// That finger's report ID (-1: none), and the fingers that came down on an on-screen
+    /// button, which hold the button under them until they lift and never touch the screen.
+    int touch_finger = -1;
+    std::array<int, 8> button_fingers{};
+    std::size_t button_finger_count{};
+    /// The on-screen buttons in use (SetOnScreenButtons's, taken at a poll: the polling thread's),
+    /// the SetOnScreenButtons generation they are, and what they hold.
+    std::optional<ControlLayouts::ControlLayout> on_screen;
+    u32 on_screen_generation{};
+    std::atomic<u32> on_screen_held{};
     /// The rear panel's middle in its own coordinates (its active area's), splitting its halves.
     int rear_middle{};
     /// The volume key held (the polling thread's), and when it steps again.
