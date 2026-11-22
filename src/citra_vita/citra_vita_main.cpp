@@ -10,6 +10,8 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <typeinfo>
+#include <unordered_map>
 #include <vector>
 #include <pthread.h>
 
@@ -21,12 +23,12 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
-#include <unwind.h>
 #include <psp2/message_dialog.h>
 #include <psp2/power.h>
 #include <psp2/shellutil.h>
 #include <psp2/vshbridge.h>
 #include <taihen.h>
+#include "citra_vita/crash_report.h"
 #include "citra_vita/gxm_present.h"
 #include "citra_vita/sgxd_present.h"
 
@@ -56,6 +58,7 @@
 #include "core/core.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/image_interface.h"
+#include "core/hle/service/plgldr/plgldr.h"
 #include "core/hle/service/service.h"
 #include "core/movie.h"
 #include "video_core/gpu.h"
@@ -107,58 +110,31 @@ void SetupPaths() {
     FileUtil::SetUserPath(UserDirectory);
 }
 
-/// Names the exception behind an abort. std::terminate goes to newlib's abort(), which raises
-/// SIGABRT - the crash dump then points at _kill_r and says nothing about the cause, and azahar's
-/// own ASSERT is not it (that traps). std::bad_alloc and the std::system_error that a failing
-/// pthread call turns into both arrive here.
-/// The return addresses on the calling thread's stack, innermost first (ARM EHABI unwind tables).
-struct TerminateTrace {
-    std::array<uintptr_t, 24> pcs{};
-    std::size_t n = 0;
-};
-_Unwind_Reason_Code TerminateTraceStep(_Unwind_Context* context, void* arg) {
-    auto* const trace = static_cast<TerminateTrace*>(arg);
-    if (trace->n == trace->pcs.size()) {
-        return _URC_END_OF_STACK;
-    }
-    trace->pcs[trace->n++] = _Unwind_GetIP(context);
-    return _URC_NO_REASON;
-}
-
+/// Names the exception behind an abort, in every build: std::terminate goes to newlib's abort(),
+/// whose crash dump points at _kill_r, and libstdc++'s handler writes to stderr, which no console
+/// shows. std::bad_alloc and a failing pthread call's std::system_error arrive here. The return
+/// addresses come from the stack as the throw left it, and the process aborts rather than exits, so
+/// that a core file can be taken of it.
 void SetupTerminateHandler() {
     std::set_terminate([] {
-        // First, while the stack is still the throw's: an exception nothing catches reaches
-        // here before any unwinding. The ELF is linked NOASLR, so the addresses are its own
-        // (arm-vita-eabi-addr2line -e citra_vita).
-        TerminateTrace trace;
-        _Unwind_Backtrace(TerminateTraceStep, &trace);
-        char where[24 * 11 + 1] = {};
-        for (std::size_t i = 0, at = 0; i < trace.n; i++) {
-            at += std::snprintf(where + at, sizeof(where) - at, " %08x",
-                                static_cast<unsigned>(trace.pcs[i]));
-        }
-        SceKernelThreadInfo info{};
-        info.size = sizeof(info);
-        const SceUID self = sceKernelGetThreadId();
-        sceKernelGetThreadInfo(self, &info);
-        sceClibPrintf("[azahar] std::terminate on thread %08x \"%s\", stack:%s\n",
-                      static_cast<unsigned>(self), info.name, where);
-        std::string what = "no active exception";
+        const char* type = "";
+        const char* what = "no active exception";
         if (std::current_exception()) {
             try {
                 std::rethrow_exception(std::current_exception());
             } catch (const std::exception& e) {
+                type = typeid(e).name();
                 what = e.what();
             } catch (...) {
                 what = "an exception not derived from std::exception";
             }
         }
-        // Straight to the kernel channel as well as the log: whatever broke may have been the
-        // logging thread, and this is the last thing the process does.
-        sceClibPrintf("[azahar] std::terminate: %s\n", what.c_str());
-        LOG_CRITICAL(Frontend, "std::terminate: {}", what);
+        // Nothing here allocates: the exception may be std::bad_alloc.
+        char reason[320];
+        std::snprintf(reason, sizeof(reason), "std::terminate: %s %s", type, what);
+        VitaFrontend::CrashReport::WriteStackReport(reason);
         Common::Log::Stop();
-        sceKernelExitProcess(1);
+        std::abort();
     });
 }
 
@@ -392,6 +368,7 @@ void RestoreStateAtStart(Core::System& system, u32 slot) {
         }
         if (!system.IsSaveStateRequestPending()) {
             sceClibPrintf("[azahar] savestate: slot %u restored\n", slot);
+            VitaFrontend::CrashReport::NoteStateLoaded(slot);
             break;
         }
     }
@@ -399,6 +376,32 @@ void RestoreStateAtStart(Core::System& system, u32 slot) {
     if (system.IsSaveStateRequestPending()) {
         sceClibPrintf("[azahar] savestate: slot %u never became loadable\n", slot);
     }
+}
+
+/// What copy runs, for a crash report: the name, the product code and version (an update's or the
+/// cartridge's), the file's type and size, and its 3GX plugin. At a title's start and after a jump
+/// to another title, which the core makes alone.
+void NoteRunningTitle(Core::System& system) {
+    const std::string& path = system.GetFilePath();
+    auto& loader = system.GetAppLoader();
+    u64 program_id = 0;
+    loader.ReadProgramId(program_id);
+    std::string name;
+    loader.ReadTitle(name);
+    VitaFrontend::CrashReport::NoteGame(
+        path, program_id,
+        fmt::format("\"{}\", {}, {}, {} MiB", name, loader.ProductSummary(),
+                    Loader::GetFileTypeString(loader.GetFileType(), loader.IsFileCompressed()),
+                    FileUtil::GetSize(path) >> 20));
+    std::string plugin;
+    if (const auto plg_ldr = Service::PLGLDR::GetService(system)) {
+        const auto& context = plg_ldr->GetPluginLoaderContext();
+        if (context.plugin_loaded) {
+            plugin = fmt::format("\"{}\" by {}, {}", context.plugin_title, context.plugin_author,
+                                 context.plugin_path);
+        }
+    }
+    VitaFrontend::CrashReport::NotePlugin(plugin);
 }
 
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
@@ -454,6 +457,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     bool state_save_sent = false;
     // A save or load sent (the argument's or the menu's) whose result is still to print.
     bool state_watch = false;
+    bool state_watch_is_load = false;
     CommandFile commands;
 
     ui.EnterGame();
@@ -475,10 +479,12 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             ShutdownSystem(system);
             return action == VitaFrontend::Ui::Action::QuitGame;
         case VitaFrontend::Ui::Action::SaveState:
+            state_watch_is_load = false;
             state_watch = system.SendSignal(Core::System::Signal::Save, ui.SelectedSlot());
             sceClibPrintf("[azahar] savestate: saving slot %u from the menu\n", ui.SelectedSlot());
             break;
         case VitaFrontend::Ui::Action::LoadState:
+            state_watch_is_load = true;
             state_watch = system.SendSignal(Core::System::Signal::Load, ui.SelectedSlot());
             sceClibPrintf("[azahar] savestate: loading slot %u from the menu\n", ui.SelectedSlot());
             break;
@@ -489,6 +495,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         if (state_arguments.save >= 0 && !state_save_sent &&
             sceKernelGetProcessTimeWide() - title_start_us >= state_arguments.save_after_us) {
             state_save_sent = true;
+            state_watch_is_load = false;
             state_watch = system.SendSignal(Core::System::Signal::Save,
                                             static_cast<u32>(state_arguments.save));
             sceClibPrintf("[azahar] savestate: saving slot %d %s\n", state_arguments.save,
@@ -501,6 +508,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 const bool load = !save && std::sscanf(command.c_str(), "load %d", &slot) == 1;
                 if ((save || load) && slot >= 0) {
                     system.SetLoadStateAnyBuild(true);
+                    state_watch_is_load = load;
                     state_watch = system.SendSignal(save ? Core::System::Signal::Save
                                                          : Core::System::Signal::Load,
                                                     static_cast<u32>(slot));
@@ -520,6 +528,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             const bool ok = status == Core::System::ResultStatus::Success;
             sceClibPrintf("[azahar] savestate: %s%s\n",
                           ok ? "done" : "failed: ", ok ? "" : system.GetStatusDetails().c_str());
+            if (ok && state_watch_is_load) {
+                VitaFrontend::CrashReport::NoteStateLoaded(progress_slot);
+            }
         }
         if (status == Core::System::ResultStatus::ErrorSavestate && system.IsStateLoadPartial()) {
             // A load that failed partway through the file left a state the title cannot run on
@@ -1326,9 +1337,11 @@ int main(int argc, char* argv[]) {
         }
     }
     SetupTerminateHandler();
-#endif
+    VitaFrontend::CrashReport::PrintLast();
     // Before anything is brought up, because the first start after a boot restarts from here.
     g_native_error = LoadAzaharNative(relaunched);
+    // Without the module (g_native_error) its calls are not bound: the report lists no plugins.
+    VitaFrontend::CrashReport::NoteSystem(g_native_error ? 0 : azaharVersion(), g_cores_unlocked);
     Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     // The process's own thread gets a stack sized for a homebrew launcher, and the global that
     // is supposed to change that does not work. Everything therefore runs on a thread created

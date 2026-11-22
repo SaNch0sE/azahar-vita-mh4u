@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <tuple>
 #include <vector>
 #include "common/assert.h"
@@ -38,7 +39,49 @@ constexpr u32 IdleFrames = 60;
 constexpr u32 MaxPagesPerMove = 256;
 } // namespace
 
+namespace {
+std::atomic<const GuestGpuMemory*> live_guest_memory{};
+}
+
+void GuestGpuMemory::DescribePool(char* out, std::size_t size) {
+    const GuestGpuMemory* const live = live_guest_memory.load(std::memory_order_acquire);
+    if (live == nullptr) {
+        std::snprintf(out, size, "no GPU pool");
+        return;
+    }
+    std::snprintf(out, size, "GPU pool %u of %u KiB", live->pool_used.load() * 4,
+                  live->pool_pages.load() * 4);
+}
+
+#ifdef VITA_DIAGNOSTICS
+namespace {
+// pagewatch's range, [start, end): none when end is 0.
+std::pair<PAddr, PAddr> WatchRange() {
+    static const std::pair<PAddr, PAddr> range = [] {
+        const PAddr start = SgxdFlagValue("pagewatch");
+        const u32 bytes = SgxdFlagValue("pagewatch_bytes");
+        return std::pair<PAddr, PAddr>{start, start != 0 && bytes != 0 ? start + bytes : 0};
+    }();
+    return range;
+}
+} // namespace
+
+void GuestGpuMemory::WatchNote(const char* what, PAddr addr, u32 size, const std::string& detail) {
+    const auto [start, end] = WatchRange();
+    if (end == 0 || addr >= end || addr + size <= start) {
+        return;
+    }
+    const GuestGpuMemory* const live = live_guest_memory.load(std::memory_order_acquire);
+    sceClibPrintf("[azahar] pagewatch: sys %u frame %u: move %08x+%x by %s%s%s\n",
+                  static_cast<unsigned>(sceKernelGetSystemTimeWide()),
+                  live ? static_cast<unsigned>(live->frame.load(std::memory_order_relaxed)) : 0u,
+                  static_cast<unsigned>(addr), static_cast<unsigned>(size), what,
+                  detail.empty() ? "" : ": ", detail.c_str());
+}
+#endif
+
 GuestGpuMemory::GuestGpuMemory([[maybe_unused]] Memory::MemorySystem& memory) {
+    live_guest_memory.store(this, std::memory_order_release);
     const u8* host = memory.GetPhysicalPointer(Memory::VRAM_PADDR);
     // CDRAM is uncached for the CPU and the GPU does not snoop it: no CACHECONSISTENT.
     const int ret = sgxdMap(Memory::VRAM_PADDR, host, Memory::VRAM_SIZE, 0);
@@ -116,6 +159,7 @@ bool GuestGpuMemory::GrowPool() {
 }
 
 GuestGpuMemory::~GuestGpuMemory() {
+    live_guest_memory.store(nullptr, std::memory_order_release);
     // Sony's descriptors go back before the pool's block and FCRAM's do.
     if (adopted) {
         const int ret = azaharRebackRestore();

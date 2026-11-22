@@ -15,6 +15,7 @@
 #include <psp2/kernel/sysmem.h>
 #include <fmt/format.h>
 
+#include "citra_vita/crash_report.h"
 #include "citra_vita/sgxd_present.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -423,6 +424,7 @@ bool Initialize(std::string* error) {
     Report("sgxd take {:#x}: step {} status {:#010x} core id {:#010x}, {} us",
            static_cast<u32>(taken), info.step, static_cast<u32>(info.step_status), info.core_id,
            info.take_us);
+    CrashReport::NoteGpuDriver(info.module_nid);
     if (taken < 0) {
         *error = fmt::format("sgxd: the GPU could not be taken ({:#010x} at step {})",
                              static_cast<u32>(taken), info.step);

@@ -290,6 +290,13 @@ public:
         return false;
     }
 
+    /// The loaded code's product code and remaster version, and whether an installed update's code
+    /// replaced the cartridge's ("CTR-P-AVZE, version 3, an update's"): which copy a crash report's
+    /// game is. Empty for a loader without them.
+    [[nodiscard]] virtual std::string ProductSummary() const {
+        return {};
+    }
+
     virtual CompressFileInfo GetCompressFileInfo() {
         CompressFileInfo info{};
         info.is_supported = false;

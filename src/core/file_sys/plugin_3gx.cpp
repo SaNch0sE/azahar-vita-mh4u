@@ -107,6 +107,8 @@ Loader::ResultStatus FileSys::Plugin3GXLoader::Load(
     summary = ReadTextInfo(file, header.infos.summary_msg_offset, header.infos.summary_len);
 
     LOG_INFO(Service_PLGLDR, "Trying to load plugin - Title: {} - Author: {}", title, author);
+    plg_context.plugin_title = title;
+    plg_context.plugin_author = author;
 
     // Load compatible TIDs
     {

@@ -39,6 +39,10 @@ public:
 
     ResultStatus Load(std::shared_ptr<Kernel::Process>& process) override;
 
+    [[nodiscard]] std::string ProductSummary() const override {
+        return product_summary;
+    }
+
     std::pair<std::optional<u32>, ResultStatus> LoadCoreVersion() override;
 
     /**

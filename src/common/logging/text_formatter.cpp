@@ -12,6 +12,7 @@
 #endif
 
 #include "common/assert.h"
+#include "common/logging/backend.h"
 #include "common/logging/filter.h"
 #include "common/logging/log.h"
 #include "common/logging/log_entry.h"

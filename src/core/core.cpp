@@ -900,8 +900,10 @@ void System::Reset() {
     }
 
     // Reload the system with the same setting
-    [[maybe_unused]] const System::ResultStatus result =
-        Load(*m_emu_window, m_filepath, m_secondary_window);
+    const System::ResultStatus result = Load(*m_emu_window, m_filepath, m_secondary_window);
+    if (result == ResultStatus::Success && reset_callback) {
+        reset_callback();
+    }
 }
 
 void System::ApplySettings() {

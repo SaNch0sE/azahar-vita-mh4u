@@ -1360,6 +1360,36 @@ void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
                                      static_cast<int>(c->kind))
                        : std::string("none"));
     }
+    // How the module's tables map the PC and the fault address on each core.
+    if (azaharVersion() >= 87) {
+        const auto tables = [](u32 va) {
+            AzaharVaReport t{};
+            azaharVaReport(va, &t);
+            std::string cores;
+            for (u32 n = 0; n < 4; n++) {
+                cores += fmt::format("; core {}: attached {}, view {:08X}/{:08X}, {} overrides", n,
+                                     t.attached[n], t.view_l1[n], t.view_l2[n],
+                                     t.view_overrides[n]);
+            }
+            LOG_CRITICAL(Core_ARM11,
+                         "tables at {:08X} from core {} (azaharMap's {}): shared {:08X}/{:08X}{}; "
+                         "failed view builds {} (the last {:08X} on core {})",
+                         va, t.core, t.map_core, t.shared_l1, t.shared_l2, cores, t.view_failures,
+                         static_cast<u32>(t.view_last_error), t.view_last_core);
+            std::string overrides;
+            for (u32 i = 0; i < t.view_overrides[t.core & 3] && i < AZAHAR_ATTACH_OVERRIDES; i++) {
+                const AzaharRange& r = t.overrides[i];
+                overrides += fmt::format(" {:08X}+{:X} <- {:08X} ({:X})", r.guest_va, r.size,
+                                         r.user_va, r.perm);
+            }
+            LOG_CRITICAL(Core_ARM11, "core {}'s view overrides:{}", t.core,
+                         overrides.empty() ? std::string{" none"} : overrides);
+        };
+        tables(run.ctx.r[15]);
+        if (run.far != run.ctx.r[15]) {
+            tables(run.far);
+        }
+    }
     // Where the guest came from: the code before LR and the stack from SP.
     const u32 lr = context.r[14] & ~1u;
     std::string call;

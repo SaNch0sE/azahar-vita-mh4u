@@ -10,6 +10,7 @@
 #include "citra_vita/imgui_impl_sgxd.h"
 #include "citra_vita/imgui_impl_vita.h"
 
+#include "citra_vita/crash_report.h"
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/sgxd_present.h"
 #include "citra_vita/stats_hud.h"

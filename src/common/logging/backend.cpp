@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <boost/algorithm/string/replace.hpp>
@@ -17,7 +18,9 @@
 #endif
 
 #ifdef __vita__
+#include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/processmgr.h>
 #endif
 
 #ifdef CITRA_LINUX_GCC_BACKTRACE
@@ -248,7 +251,11 @@ public:
     ~VitaBackend() override = default;
 
     void Write(const Entry& entry) override {
-        sceClibPrintf("%s\n", FormatLogMessage(entry).c_str());
+        const std::string text = FormatLogMessage(entry).append(1, '\n');
+        sceClibPrintf("%s", text.c_str());
+        if (entry.log_level == Level::Critical) {
+            AppendCrashReport(text);
+        }
     }
 
     void Flush() override {}
@@ -624,4 +631,33 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename,
         PrintMessage(new_entry);
     }
 }
+#ifdef __vita__
+void AppendCrashReport(std::string_view text) {
+    // The preamble's own lines come through here too, after the flag is set.
+    if (report_preamble != nullptr && !report_begun.test_and_set()) {
+        report_preamble_us.store(sceKernelGetProcessTimeWide(), std::memory_order_relaxed);
+        report_preamble();
+    }
+    const SceUID fd = sceIoOpen(CrashReportPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
+    if (fd >= 0) {
+        sceIoWrite(fd, text.data(), text.size());
+        sceIoClose(fd);
+    }
+}
+
+void RenewCrashReport() {
+    const u64 at = report_preamble_us.load(std::memory_order_relaxed);
+    if (at != 0 && sceKernelGetProcessTimeWide() - at > RenewAfterUs) {
+        report_begun.clear();
+    }
+}
+
+void EndCrashReport(bool remove) {
+    if (remove) {
+        sceIoRemove(CrashReportPath);
+    }
+    report_preamble_us.store(0, std::memory_order_relaxed);
+    report_begun.clear();
+}
+#endif
 } // namespace Common::Log

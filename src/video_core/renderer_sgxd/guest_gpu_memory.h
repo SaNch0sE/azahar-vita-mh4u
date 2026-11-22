@@ -58,6 +58,9 @@ public:
     GuestGpuMemory(const GuestGpuMemory&) = delete;
     GuestGpuMemory& operator=(const GuestGpuMemory&) = delete;
 
+    /// The live instance's pool in use and whole, for a crash report: its atomics only.
+    static void DescribePool(char* out, std::size_t size);
+
     /// A moved page no GPU use has stamped for this many frames goes back to FCRAM.
     static constexpr u32 StaleFrames = 1000;
 

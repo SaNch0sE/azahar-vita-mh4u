@@ -64,6 +64,9 @@ public:
         bool plugin_loaded = false;
         bool is_default_path = false;
         std::string plugin_path = "";
+        /// The loaded plugin's own title and author, for a crash report: not saved in a state.
+        std::string plugin_title = "";
+        std::string plugin_author = "";
         u32 plugin_process_id = UINT32_MAX;
         Kernel::MemoryRegion memory_region{};
         std::pair<u32, u32> memory_block{};

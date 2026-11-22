@@ -38,4 +38,25 @@ void SetGlobalFilter(const Filter& filter);
 bool SetRegexFilter(const std::string& regex);
 
 void SetColorConsoleBackendEnabled(bool enabled);
+
+#ifdef __vita__
+/// The crash report the next start prints (citra_vita's CrashReport::PrintLast).
+constexpr char CrashReportPath[] = "ux0:data/azahar/crash.txt";
+/// Appends `text` to the crash report, where a critical message outlives a lost debug
+/// link and the next launch's console. Allocates nothing.
+void AppendCrashReport(std::string_view text);
+/// Called before the first text a report appends to the crash report: the frontend's lines on
+/// what the run had (the console's plugins, the settings), appended through AppendCrashReport.
+/// It allocates nothing. A run's first report starts at its first critical line; a crash renews
+/// it (RenewCrashReport), and a report packed away ends it (EndCrashReport).
+void SetCrashReportPreamble(void (*hook)());
+/// At a crash's start: a preamble written more than a few seconds before (an earlier critical
+/// line's, a load error's) is written again before the crash's next line, with the game, the
+/// settings and the console's text as they are now. One written for this crash's own earlier
+/// lines stays.
+void RenewCrashReport();
+/// The crash report is done with (packed into an archive): removed when `remove`, and the next
+/// report starts with its own preamble.
+void EndCrashReport(bool remove);
+#endif
 } // namespace Common::Log

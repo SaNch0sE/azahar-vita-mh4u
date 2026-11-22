@@ -1,8 +1,6 @@
 /* Linker script for the PS Vita build, derived from the vitasdk's own armelf.xc.
  *
- * Four changes, marked [1] to [4] below. They exist because this build links with lld rather
- * than the bfd linker the stock script was written for, and because vita-elf-create has to fit
- * its module information into the result afterwards.
+ * Five changes, marked [1] to [5] below, for lld and for vita-elf-create's module information.
  */
 /* Script for -z combreloc */
 /* Copyright (C) 2014-2024 Free Software Foundation, Inc.
@@ -19,7 +17,13 @@ SECTIONS
   /* Read-only sections, merged into text segment: */
   PROVIDE (__executable_start = SEGMENT_START("text-segment", 0x81000000)); . = SEGMENT_START("text-segment", 0x81000000);
   .interp         : { *(.interp) }
-  .note.gnu.build-id  : { *(.note.gnu.build-id) }
+  /* [5] named for the crash report's header (crash_report.cpp). */
+  .note.gnu.build-id  :
+  {
+    PROVIDE_HIDDEN (__build_id_start = .);
+    *(.note.gnu.build-id)
+    PROVIDE_HIDDEN (__build_id_end = .);
+  }
   .hash           : { *(.hash) }
   .gnu.hash       : { *(.gnu.hash) }
   .dynsym         : { *(.dynsym) }

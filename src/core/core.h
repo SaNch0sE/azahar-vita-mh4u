@@ -333,6 +333,17 @@ public:
         return status_details;
     }
 
+    /// The file the running title came from: the first one's, or a jump's (Reset).
+    [[nodiscard]] const std::string& GetFilePath() const {
+        return m_filepath;
+    }
+
+    /// Called after Reset has loaded the title it was for, on the thread that ran it: a title's
+    /// jump to another one ends here, with no call from the frontend.
+    void SetResetCallback(std::function<void()> callback) {
+        reset_callback = std::move(callback);
+    }
+
     [[nodiscard]] Loader::AppLoader& GetAppLoader() const {
         return *app_loader;
     }
@@ -565,6 +576,7 @@ private:
     Signal current_signal;
     u32 signal_param;
 
+    std::function<void()> reset_callback;
     std::function<bool()> mic_permission_func;
     bool mic_permission_granted = false;
 

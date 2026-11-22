@@ -18,6 +18,8 @@ add_custom_command(
 set(CITRA_VITA_SOURCES
     ../vita_compat/src/vita_libc_shims.c
     citra_vita_main.cpp
+    crash_report.cpp
+    crash_report.h
     emu_window_vita.cpp
     emu_window_vita.h
     gxm_present.cpp
@@ -44,6 +46,8 @@ set(CITRA_VITA_SOURCES
 # can always see them.
 set_source_files_properties(../vita_compat/src/vita_libc_shims.c PROPERTIES
     COMPILE_OPTIONS "-fno-lto")
+# And for the abort report's wraps of raise and __assert_func (crash_report.cpp).
+set_source_files_properties(crash_report.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 
 # The emulator's executable, and the replay player's below: the same frontend, told its title ID.
 # The kernel opens the module by its installed path rather than through app0:, so the app is
@@ -54,6 +58,8 @@ function(citra_vita_executable target titleid)
     create_target_directory_groups(${target})
 
     target_link_libraries(${target} PRIVATE citra_common citra_core input_common video_core)
+    # The ID the crash report names the build by: a commit does not tell a dirty build's ELF.
+    target_link_options(${target} PRIVATE "LINKER:--build-id=sha1")
 
     # imgui's core objects come from the VITASDK's imgui_vita2d archive (its 1.79 imgui build);
     # the vita2d backend object inside it is never referenced, so vita2d itself is not linked.
