@@ -53,7 +53,11 @@ azaharnative:
         - azaharVolumeKeys: 0x3C1A7E34
         - azaharModuleUid: 0x3C1A7E35
         - sgxdResumed: 0x3C1A7E36
+        - sgxdSuspend: 0x3C1A7E37
         - azaharCoredump: 0x3C1A7E38
+        - sgxdOwned: 0x3C1A7E39
+        - sgxdQueue: 0x3C1A7E3A
+        - sgxdStandby: 0x3C1A7E3B
         - azaharKernelPlugins: 0x3C1A7E41
         - azaharVaReport: 0x3C1A7E42
         - sgxdResetAll: 0x3C1A7E44

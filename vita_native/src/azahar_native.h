@@ -471,7 +471,7 @@ int azaharBusErrorWatch(AzaharBusErrorCatch *out);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.
-#define AZAHAR_NATIVE_VERSION 69
+#define AZAHAR_NATIVE_VERSION 81
 #define AZAHAR_NATIVE_UNLOADABLE 67
 int azaharVersion();
 /// This module as a UID of the calling process, for taiStopUnloadKernelModule: taiHEN stops and

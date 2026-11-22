@@ -139,6 +139,13 @@ int sgxd_ptla_events(SgxdEvents *page, uint32_t mk_va, char *failed, unsigned fa
     cycles_per_us = (uint32_t)scePowerGetArmClockFrequency();
     events = page;
     mk = sgxd_mkq_state();
+    // A system suspend while the GPU is ours lets this queue run out first (sgxdQueue).
+    const int queued = sgxdQueue((const uint32_t *)mk);
+    if (queued < 0) {
+        snprintf(failed, failed_size, "the queue not registered: sgxdQueue 0x%08x",
+                 (unsigned)queued);
+        return -1;
+    }
     twod_sent = 0;
     chains_sent = 0;
     // The recipes' kicks leave core 0's event program on it, and their SLC requests are Sony's.
@@ -271,6 +278,11 @@ int sgxd_ptla_resume(char *failed, unsigned failed_size) {
         return -1;
     }
     if (sgxd_mkq_resume(failed, failed_size) < 0) {
+        return -1;
+    }
+    if ((r = sgxdQueue((const uint32_t *)mk)) < 0) {
+        snprintf(failed, failed_size, "the queue not registered after the resume: sgxdQueue 0x%08x",
+                 (unsigned)r);
         return -1;
     }
     if (waker_flag >= 0 && (r = sgxdWaker(waker_flag, waker_bits)) < 0) {

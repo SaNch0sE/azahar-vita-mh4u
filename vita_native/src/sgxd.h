@@ -112,7 +112,7 @@ typedef struct SgxdOp {
 #define SGXD_DUMP_BANK_REGS 266u
 #define SGXD_DUMP_CORE_REGS 399u
 
-#define SGXD_VERSION 16
+#define SGXD_VERSION 17
 
 // sgxdEvents (version 4; 13: the microkernel's alone): the SGX's host interrupt (GIC 0x34,
 // SceGpu's "SceGpuLisr" otherwise) is sgxd's while the app has registered this page. The async
@@ -192,6 +192,24 @@ int sgxdPte(uint32_t gpu_va, const void *user_va, uint32_t out[2]);
 // sets its own state on the GPU up again from that thread, and lets its other threads go on
 // with sgxdResumed.
 int sgxdResumed(void);
+// The app's own suspend (version 17), its GPU work done: what a system suspend does, and the GPU
+// SceGpu's again at once, so the shell can draw (a retail console's lock screen, after a screen
+// turned off that no standby followed). sgxdTake and sgxdResumed as after a system suspend.
+// SGXD_ERR_LOST when it is not held: a system suspend took the GPU down before it (version 81: it
+// does not wait at the gate a system suspend closes, so a late call returns at once).
+int sgxdSuspend(void);
+// Whether the calling app holds the GPU now (version 81): 0 after a system suspend took its side
+// down, until it takes the GPU again. Not held at the gate.
+int sgxdOwned(void);
+// The microkernel's state words (sgxd_mk.h's SGXD_MK_STATE_WORDS, version 81), for a system
+// suspend while owned to let the queue run out before it takes the cores down. After each take,
+// as sgxdEvents; let go of with it.
+int sgxdQueue(const uint32_t *user_state);
+// The event flag (the app's UID) a standby sets `bits` in while the app owns the GPU (version 81),
+// before the system stops the app: the standby waits until the app has given the GPU back
+// (sgxdSuspend), 3 s at most; then the module takes its side down itself. Kept until the release;
+// a negative flag clears it.
+int sgxdStandby(int32_t flag, uint32_t bits);
 // Every unit of the GPU reset as the take leaves it, without its power cycle (version 92): the
 // start sequence again (its MASTER_SOFT_RESET pulse resets the four cores and the master's DPM,
 // VDM, SLC, BIF, MCI and PTLA), every core's caches, and the MMU's banks and directory, which the

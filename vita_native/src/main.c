@@ -405,6 +405,10 @@ int module_stop(SceSize argc, const void *args) {
         ksceKernelUnregisterSysEventHandler(sgxd_sysevent_uid);
         sgxd_sysevent_uid = -1;
     }
+    if (sgxd_standby_uid >= 0) {
+        ksceKernelUnregisterSysEventHandler(sgxd_standby_uid);
+        sgxd_standby_uid = -1;
+    }
     sgxd_unmap();
     const SceUID blocks[] = {coresample_dbg_uid, reback_moved_uid};
     for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
@@ -420,6 +424,10 @@ int module_stop(SceSize argc, const void *args) {
         }
     }
     sgxd_mutex = reback_mutex = azahar_edit_mutex = -1;
+    if (sgxd_standby_given >= 0) {
+        ksceKernelDeleteEventFlag(sgxd_standby_given);
+        sgxd_standby_given = -1;
+    }
     if (sgxd_gate >= 0) {
         ksceKernelDeleteEventFlag(sgxd_gate);
         sgxd_gate = -1;

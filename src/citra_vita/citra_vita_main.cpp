@@ -140,7 +140,14 @@ int _vita_net_init(void);
 // 63: azaharVolumeKeys, the volume keys from Syscon (no SceCtrl mask gave them to the app).
 // 64: page moves up to 32 MiB in all (the CDRAM pool for moved FCRAM grows).
 // 69: sgxdResumed, the GPU taken again after a suspend.
-constexpr int MinAzaharNativeVersion = 69;
+// 70: sgxdSuspend, the GPU given back at the app's own suspend.
+// 72: AzaharRunRequest without store_permits (the vector's stores past holds, 65-71, gone).
+// 73: firmware 3.68 known (a 3.68 console that ran an older build still has its module).
+// 74: azaharAttach refuses a core attached already (the second emulation thread on host 0's).
+// 75: the shell's CDRAM moves faster at a suspend, its resume and the exit (nothing to call).
+// 76: and faster again (its kernel alias normal non-cacheable).
+// 93: firmware 3.73 known (a 3.73 console that ran an older build still has its module).
+// The app runs with its own version only: another one loaded stops the start (LoadAzaharNative).
 
 namespace {
 /// The process's own arguments, kept for LaunchParameter.
@@ -1169,17 +1176,57 @@ void RestoreStateAtStart(Core::System& system, u32 slot) {
 }
 
 /**
+ * A suspend while sgxd holds the GPU (docs/sgxd/takeover.md). The title is paused, the GPU's
+ * queue stopped and waited for, and the GPU given back (SuspendGpu); every thread's sgxd call
+ * waits from then on. A standby asks for it and waits (StandbyThread); the power callback asks
  */
 std::atomic<bool> power_suspended{false}, power_resumed{false};
+/// The window whose pause menu a suspend opens over a running title (EmulatorMain's).
+std::atomic<VitaFrontend::EmuWindowVita*> power_window{nullptr};
 
 constexpr int PowerSuspend = SCE_POWER_CB_SYSTEM_SUSPEND | SCE_POWER_CB_APP_SUSPEND;
-constexpr int PowerResume = SCE_POWER_CB_SYSTEM_RESUME | SCE_POWER_CB_APP_RESUME;
+constexpr int PowerResume =
+    SCE_POWER_CB_SYSTEM_RESUME | SCE_POWER_CB_APP_RESUME | SCE_POWER_CB_APP_RESUMING;
+
+/// One hand-back or take at a time: the standby's, the power callback's and the take after the
+/// resume.
+Common::CoreCondition& PowerLock() {
+    static Common::CoreCondition lock;
+    return lock;
+}
+
+/// The GPU given back for a suspend, once. A running title is paused first, as its pause menu
+/// leaves it: the run loop parked and only the menu drawing. Not once the system's suspend has
+/// taken the GPU (the app late for the standby), when the menu could not draw.
+void SuspendGpu() {
+    std::scoped_lock lk{PowerLock()};
+    if (power_suspended || !VitaFrontend::SgxdPresent::IsInitialized()) {
+        return;
+    }
+    VitaFrontend::EmuWindowVita* const window = power_window.load();
+    if (window != nullptr && VitaFrontend::SgxdPresent::Owned()) {
+        const bool paused = window->PauseForSuspend(std::chrono::seconds(1));
+        sceClibPrintf("[azahar] suspend: the title %s\n",
+                      paused ? "paused" : "not paused (none running, or the timeout)");
+    }
+    VitaFrontend::SgxdPresent::Suspend();
+    power_suspended = true;
+}
 
 int OnPower(int, int, int arg, void*) {
-    if ((arg & PowerSuspend) && !power_suspended && VitaFrontend::SgxdPresent::IsInitialized()) {
+#ifdef VITA_DIAGNOSTICS
+    // The callbacks' bits as they change, with the process time: which a power press sends, in
+    // what order, and whether the standby waits for this callback.
+    static int last_arg = -1;
+    if (arg != last_arg) {
+        sceClibPrintf("[azahar] power callback %08x at %llu us\n", static_cast<unsigned>(arg),
+                      static_cast<unsigned long long>(sceKernelGetProcessTimeWide()));
+        last_arg = arg;
+    }
+#endif
+    if (arg & PowerSuspend) {
+        SuspendGpu();
         power_resumed = false;
-        VitaFrontend::SgxdPresent::Suspend();
-        power_suspended = true;
     }
     if ((arg & PowerResume) && power_suspended) {
         power_resumed = true;
@@ -1189,12 +1236,20 @@ int OnPower(int, int, int arg, void*) {
 }
 
 // The frontend's loop waits at sgxd's gate from the suspend to the take after it: the stall
-// watch is told it lives (it would take the wait for a hang and end the process).
+// watch is told it lives (it would take the wait for a hang and end the process). The take
+// waits for a press of the game's buttons or the screen begun after the resume: as the power
+// button turned the display on, before the lock screen took the input, the pad data was not
+// empty (its power bit, held still), and taken then, the GPU left the lock screen undrawn.
+constexpr u32 PressButtons = 0x0000FFFF;
 
 int PowerThread(SceSize, void*) {
     const SceUID callback = sceKernelCreateCallback("AzaharPower", 0, OnPower, nullptr);
     ASSERT_MSG(callback >= 0 && scePowerRegisterCallback(callback) >= 0,
                "the power callback was not registered");
+    // What was held at the last look: everything until the resume, so only a press begun
+    // after it counts.
+    u32 held = PressButtons;
+    bool touched = true;
     for (;;) {
         sceKernelDelayThreadCB(100 * 1000);
 #ifdef VITA_DIAGNOSTICS
@@ -1232,22 +1287,64 @@ int PowerThread(SceSize, void*) {
             VitaFrontend::CrashReport::StallWatchBeat();
         }
         if (!power_resumed) {
+            held = PressButtons;
+            touched = true;
             continue;
         }
         SceCtrlData pad{};
         SceTouchData touch{};
-        const bool pressed =
-            (sceCtrlPeekBufferPositive(0, &pad, 1) > 0 && pad.buttons != 0) ||
-            (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0 && touch.reportNum > 0);
+        const int peeked = sceCtrlPeekBufferPositive(0, &pad, 1);
+        const u32 buttons = peeked > 0 ? pad.buttons & PressButtons : 0;
+        const bool touching =
+            sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0 && touch.reportNum > 0;
+        const bool pressed = (buttons & ~held) != 0 || (touching && !touched);
+#ifdef VITA_DIAGNOSTICS
+        // What the wait for the press sees, as it changes.
+        static int last_peeked = 0x7fffffff;
+        static u32 last_buttons = ~0u;
+        if (peeked != last_peeked || pad.buttons != last_buttons) {
+            sceClibPrintf("[azahar] after the resume: pad %08x buttons %08x (held %08x), touch "
+                          "%d\n",
+                          static_cast<unsigned>(peeked), static_cast<unsigned>(pad.buttons),
+                          static_cast<unsigned>(held), touching ? 1 : 0);
+            last_peeked = peeked;
+            last_buttons = pad.buttons;
+        }
+#endif
+        held = buttons;
+        touched = touching;
         if (!pressed) {
             continue;
         }
+        sceClibPrintf("[azahar] after the resume: a press, the GPU taken again\n");
+        std::scoped_lock lk{PowerLock()};
         std::string error;
         const bool resumed = VitaFrontend::SgxdPresent::Resume(&error);
         ASSERT_MSG(resumed, "sgxd: after the resume: {}", error);
         sceClibPrintf("[azahar] the GPU is ours again after the resume\n");
         power_suspended = false;
         power_resumed = false;
+    }
+    return 0;
+}
+
+// A standby's ask for the GPU (sgxd's handler of (0, 0x20f), before SceAppMgr stops the app): the
+// system's suspend waits until it is given back, 3 s at most. At the emulation and render threads'
+// priority (the highest an application's thread has), on any core: the default one waits behind
+// them.
+int StandbyThread(SceSize, void* arg) {
+    const SceUID flag = *static_cast<const SceUID*>(arg);
+    for (;;) {
+        u32 bits = 0;
+        const int waited =
+            sceKernelWaitEventFlag(flag, 1, SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR, &bits, nullptr);
+        ASSERT_MSG(waited == 0, "the standby's flag wait failed ({:#010x})",
+                   static_cast<u32>(waited));
+        const SceUInt64 t0 = sceKernelGetProcessTimeWide();
+        sceClibPrintf("[azahar] standby: the GPU asked for\n");
+        SuspendGpu();
+        sceClibPrintf("[azahar] standby: answered in %llu ms\n",
+                      static_cast<unsigned long long>((sceKernelGetProcessTimeWide() - t0) / 1000));
     }
     return 0;
 }
@@ -2593,6 +2690,16 @@ int EmulatorMain() {
                                                    0, 0, nullptr);
         ASSERT_MSG(power >= 0 && sceKernelStartThread(power, 0, nullptr) >= 0,
                    "the power thread did not start");
+        SceUID standby_flag = sceKernelCreateEventFlag("AzaharStandby", 0, 0, nullptr);
+        ASSERT_MSG(standby_flag >= 0, "the standby's flag was not created ({:#010x})",
+                   static_cast<u32>(standby_flag));
+        const SceUID standby = sceKernelCreateThread(
+            "AzaharStandby", StandbyThread, SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH, 0x4000, 0,
+            0, nullptr);
+        ASSERT_MSG(standby >= 0 &&
+                       sceKernelStartThread(standby, sizeof(standby_flag), &standby_flag) >= 0,
+                   "the standby thread did not start");
+        VitaFrontend::SgxdPresent::WatchStandby(standby_flag, 1);
     }
 
     auto& system = Core::System::GetInstance();
@@ -2610,6 +2717,7 @@ int EmulatorMain() {
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());
 
     VitaFrontend::EmuWindowVita window(system);
+    power_window = &window;
     // Not InputCommon::Init(): every factory it registers is one this frontend does not use (the
     // buttons, circle pad and touch come from the "vita" engine and EmuWindow's own factory).
     VitaFrontend::InitInput(window);
@@ -2791,6 +2899,7 @@ int EmulatorMain() {
 
     banner.Stop();
     Config::Save();
+    power_window = nullptr;
     VitaFrontend::Multiplayer::Shutdown();
     VitaFrontend::ShutdownInput();
     Common::Log::Stop();

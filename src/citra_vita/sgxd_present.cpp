@@ -569,9 +569,15 @@ void Suspend() {
     if (!g.initialized) {
         return;
     }
+    // A standby waits 3 s for this (WatchStandby); past that the module's own suspend (sgxd.c's
+    // sysevent) takes the GPU down, and this runs after it, after the resume even. Nothing to
+    // hand back then; the drain would never come, and the take after the resume is all.
+    if (sgxdOwned() <= 0) {
+        Report("sgxd: suspend: the system's suspend took the GPU already");
+        return;
+    }
     sgxd_mkq_park(1);
-    // The suspend waits for this callback, three seconds at most here: a job of the queue's
-    // finishes in milliseconds.
+    // A job of the queue's finishes in milliseconds: three seconds at most here.
     const SceUInt64 t0 = sceKernelGetProcessTimeWide();
     while (!sgxd_mkq_drained() && sceKernelGetProcessTimeWide() - t0 < 3000000) {
         sceKernelDelayThread(1000);
@@ -579,19 +585,37 @@ void Suspend() {
     const bool drained = sgxd_mkq_drained();
     Report("sgxd: suspend: the queue {} after {} us", drained ? "drained" : "not drained",
            sceKernelGetProcessTimeWide() - t0);
+    if (!drained && sgxdOwned() <= 0) {
+        Report("sgxd: suspend: the system's suspend took the GPU during the drain");
+        return;
+    }
     ASSERT_MSG(drained, "sgxd: the GPU's queue did not drain for the suspend");
+    // The GPU the system's until the take after the resume: a retail console turns its display
+    // off after a while without input with no standby after it, and its lock screen draws with
+    // the GPU.
+    const int given = sgxdSuspend();
+    if (given == SGXD_ERR_LOST) {
+        Report("sgxd: suspend: the system's suspend took the GPU before the hand-back");
+        return;
+    }
+    ASSERT_MSG(given == 0, "sgxd: the GPU was not given back for the suspend ({:#010x})",
+               static_cast<u32>(given));
+}
+
+bool Owned() {
+    return g.initialized && sgxdOwned() > 0;
+}
+
+void WatchStandby(int flag, u32 bits) {
+    const int watched = sgxdStandby(flag, bits);
+    ASSERT_MSG(watched == 0, "sgxd: the standby's flag was not registered ({:#010x})",
+               static_cast<u32>(watched));
 }
 
 bool Resume(std::string* error) {
     SgxdInfo info{};
     info.size = sizeof(info);
     const int taken = sgxdTake(&info);
-    if (taken == AZAHAR_ERR_STATE) {
-        // The application's suspend without the system's (the GPU stayed ours): the queue goes on.
-        sgxd_mkq_park(0);
-        Report("sgxd: resumed, the GPU still ours");
-        return true;
-    }
     Report("sgxd take again {:#x}: step {} status {:#010x}, {} us", static_cast<u32>(taken),
            info.step, static_cast<u32>(info.step_status), info.take_us);
     if (taken < 0) {

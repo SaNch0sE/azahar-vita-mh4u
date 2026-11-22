@@ -27,6 +27,7 @@
 #include "citra_vita/vita_ui.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/process_clock.h"
 #include "common/settings.h"
 #include "core/3ds.h"
 #include "core/core.h"
@@ -345,6 +346,7 @@ void EmuWindowVita::RunPauseMenu(Ui& ui) {
     {
         std::scoped_lock lk{pause_gate};
         paused = true;
+        pause_gate.NotifyAll();
     }
     ui.OpenPauseMenu();
     LOG_INFO(Frontend, "pause menu: open");
@@ -397,11 +399,37 @@ void EmuWindowVita::RunPauseMenu(Ui& ui) {
 
 void EmuWindowVita::WaitWhilePaused() {
     std::scoped_lock lk{pause_gate};
+    if (paused) {
+        parked = true;
+        pause_gate.NotifyAll();
+    }
     while (paused) {
         pause_gate.WaitFor(std::chrono::milliseconds(100));
         // Paused is not stalled (the stall watch).
         CrashReport::StallWatchBeat();
     }
+    parked = false;
+}
+
+bool EmuWindowVita::PauseForSuspend(std::chrono::milliseconds timeout) {
+    if (pause_ui.load(std::memory_order_acquire) == nullptr) {
+        return false;
+    }
+    std::scoped_lock lk{pause_gate};
+    // Opened by the next poll (the render thread's present), as ScriptPauseMenu does; one open
+    // already stays, and no second one opens after it closes.
+    if (!paused) {
+        script_menu_open.store(true, std::memory_order_release);
+    }
+    const auto until = Common::ProcessClock::now() + timeout;
+    while (!(paused && parked)) {
+        const auto now = Common::ProcessClock::now();
+        if (now >= until) {
+            return false;
+        }
+        pause_gate.WaitFor(std::chrono::duration_cast<std::chrono::milliseconds>(until - now));
+    }
+    return true;
 }
 
 void EmuWindowVita::ReadPad() {

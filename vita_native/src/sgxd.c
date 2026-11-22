@@ -34,6 +34,7 @@
 #include <psp2kern/kernel/suspend.h>
 #include <psp2kern/kernel/threadmgr/mutex.h>
 #include "sgxd.h"
+#include "sgxd_mk.h"
 
 // SceKernelSuspendForDriver 0xDD61D621 (the stub has it; the SDK's header does not).
 int ksceKernelUnregisterSysEventHandler(SceUID uid);
@@ -158,6 +159,17 @@ static const uint32_t *sgxd_gpu_device;   // SceGpu's device pointer, its handle
 static SceUID sgxd_events_uid = -1;
 static SgxdEvents *sgxd_events;
 static int sgxd_isr_ours;
+// sgxdQueue: the microkernel's state words (sgxd_mk.h), mapped for the drain at a suspend.
+static SceUID sgxd_queue_uid = -1;
+static volatile uint32_t *sgxd_queue;
+// sgxdStandby: the owner's event flag (its kernel UID) and the bits a standby sets in it, under
+// sgxd_mutex; bit 0 of sgxd_standby_given set while the owner holds no GPU to give back
+// (sgxd_standby_sysevent waits for it); the handler at the sysevent list's head.
+static SceUID sgxd_standby_flag = -1;
+static uint32_t sgxd_standby_bits;
+static SceUID sgxd_standby_given = -1;
+static SceUID sgxd_standby_uid = -1;
+#define SGXD_STANDBY_WAIT_US 3000000u
 
 static SceUID sgxd_reg_uid = -1;
 static volatile uint32_t *sgxd_reg;
@@ -483,6 +495,11 @@ static void sgxd_isr_give_back(void) {
         ksceKernelUserUnmap(sgxd_events_uid);
         sgxd_events_uid = -1;
     }
+    sgxd_queue = NULL;
+    if (sgxd_queue_uid >= 0) {
+        ksceKernelUserUnmap(sgxd_queue_uid);
+        sgxd_queue_uid = -1;
+    }
 }
 
 // Our side down: the SLC written back and emptied, the cores reset, the block unmapped, the
@@ -702,11 +719,40 @@ static int sgxd_writable(uint32_t reg) {
            !(r >= SGX_BIF_CTRL_INVAL && r <= SGX_BIF_DIR_LIST_BASE0);
 }
 
+// The app's queue run to its end before the cores go down, for an owner that did not give the GPU
+// back in the standby's time (sgxd_standby_sysevent). The GPU still runs here and the app's kicks
+// wait at the mutex this holds, so the queue only shrinks: the jobs it holds finish, half a second
+// at most. The app's lists built before its stop are not made whole by it: they run after the
+// resume with the DPM empty, which their parameter buffer loads do not expect.
+static void sgxd_queue_drain(void) {
+    volatile uint32_t *const q = sgxd_queue;
+    if (!q) {
+        return;
+    }
+    for (uint32_t ms = 0;; ms++) {
+        if (!q[SGXD_MK_BUSY] && q[SGXD_MK_POS] == q[SGXD_MK_END] &&
+            q[SGXD_MK_POS3] == q[SGXD_MK_END3] && !q[SGXD_MK_TA_BUSY] &&
+            q[SGXD_MK_RUNS] == q[SGXD_MK_RUNS_ENDED]) {
+            SGXD_LOG("suspend while owned: the queue ran out after %u ms\n", ms);
+            return;
+        }
+        if (ms == 500) {
+            SGXD_LOG("suspend while owned: the queue not out after 500 ms: job %u of %u (busy %u), "
+                     "3D %u of %u, TA busy %u, runs %u ended %u\n",
+                     q[SGXD_MK_POS], q[SGXD_MK_END], q[SGXD_MK_BUSY], q[SGXD_MK_POS3],
+                     q[SGXD_MK_END3], q[SGXD_MK_TA_BUSY], q[SGXD_MK_RUNS], q[SGXD_MK_RUNS_ENDED]);
+            return;
+        }
+        ksceKernelDelayThread(1000);
+    }
+}
+
 // Registered once, after SceGpu's "SceGpu", so it runs after SceGpu's in every phase
-// (ksceKernelSysEventDispatch walks the list in order). SceGpu's own suspend meets the state
-// the take left: its gate already armed, power state 3 already (a no-op). Ours then takes our
-// side down. On resume SceGpu comes back first and owns the GPU again; the app's next call
-// sees SGXD_ERR_LOST and takes again.
+// (ksceKernelSysEventDispatch walks the list in order). The app gives the GPU back at the
+// standby's ask, before these (sgxd_standby_sysevent); this is for an owner that did not in time.
+// SceGpu's own suspend then meets the state the take left: its gate already armed, power state
+// 3 already (a no-op). Ours then takes our side down. On resume SceGpu comes back first and owns
+// the GPU again; the app takes it again.
 static int sgxd_sysevent(int resume, int eventid, void *args, void *opt) {
     (void)args; (void)opt;
     if (resume == 0 && eventid == 0x402) {
@@ -721,6 +767,7 @@ static int sgxd_sysevent(int resume, int eventid, void *args, void *opt) {
         // A call that started after the 0x402 query is waited for; they are all bounded.
         ksceKernelLockMutex(sgxd_mutex, 1, NULL);
         if (sgxd_state == SGXD_OWNED) {
+            sgxd_queue_drain();
             sgxd_hw_down();
             // SceGpu has the GPU at resume, before the app takes it again: the shell's CDRAM is
             // the shell's until then, the app's contents kept for the take.
@@ -734,6 +781,80 @@ static int sgxd_sysevent(int resume, int eventid, void *args, void *opt) {
         ksceKernelUnlockMutex(sgxd_mutex, 1);
     }
     return 0;
+}
+
+// The standby's ask, first of all the handlers (sgxd_sysevent_first). A standby notifies the
+// power callbacks and then sends (0, 0x20f) to (0, 0x200) with interrupts on (ScePower, decomp
+// power.c); SceAppMgr suspends the applications at (0, 0x20f) (its handler at 0x81000070, 3.65).
+// Before that the owner is asked for the GPU (sgxdStandby's flag): it pauses its title, stops and
+// waits for its queue and gives the GPU back (sgxdSuspend), and the standby waits for it here, 3 s
+// at most. Its power callback cannot make the standby wait: ScePower waits for a callback to be
+// entered, not to return, and SceAppMgr stopped the app 2 ms after the callback's entry; its
+// lists built before the stop then ran after the resume with the DPM empty, and the first TA
+// never ended.
+static int sgxd_standby_sysevent(int resume, int eventid, void *args, void *opt) {
+    (void)args; (void)opt;
+    if (resume != 0 || eventid != 0x20f || sgxd_mutex < 0) {
+        return 0;
+    }
+    ksceKernelLockMutex(sgxd_mutex, 1, NULL);
+    const SceUID flag = sgxd_state == SGXD_OWNED ? sgxd_standby_flag : -1;
+    const uint32_t bits = sgxd_standby_bits;
+    if (flag >= 0) {
+        ksceKernelClearEventFlag(sgxd_standby_given, ~1u);
+    }
+    ksceKernelUnlockMutex(sgxd_mutex, 1);
+    if (flag < 0) {
+        return 0;
+    }
+    const uint32_t t0 = ksceKernelGetSystemTimeLow();
+    const int asked = ksceKernelSetEventFlag(flag, bits);
+    SceUInt timeout = SGXD_STANDBY_WAIT_US;
+    const int given = asked < 0 ? asked
+                                : ksceKernelWaitEventFlag(sgxd_standby_given, 1, SCE_EVENT_WAITOR,
+                                                          NULL, &timeout);
+    SGXD_LOG("standby: the owner asked (%08x), the GPU %s after %u ms (%08x)\n", (uint32_t)asked,
+             given == 0 ? "given back" : "still the owner's",
+             (ksceKernelGetSystemTimeLow() - t0) / 1000u, (uint32_t)given);
+    return 0;
+}
+
+// The sysevent list's node in a handler's object (SceSysmem's ksceKernelRegisterSysEventHandler,
+// decomp sysmem.c): next, prev, UID, handler, argument from +8, in a circular list whose head is
+// SceSysmem's. Registration puts a node at the tail, so a handler registered as the last one is
+// moved to the head: the tail's next is the head.
+typedef struct SgxdSysEventNode {
+    struct SgxdSysEventNode *next, *prev;
+    SceUID uid;
+    void *handler;
+    void *arg;
+} SgxdSysEventNode;
+
+static int sgxd_sysevent_first(SceUID uid, void *handler) {
+    SceObjectBase *obj = NULL;
+    int r = ksceGUIDReferObject(uid, &obj);
+    if (r < 0) {
+        return r;
+    }
+    SgxdSysEventNode *const n = (SgxdSysEventNode *)((uint8_t *)obj + 8);
+    r = n->uid == uid && n->handler == handler ? 0 : AZAHAR_ERR_STATE;
+    if (r == 0) {
+        const SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
+        SgxdSysEventNode *const head = n->next;
+        if (head->prev != n) {
+            r = AZAHAR_ERR_STATE;
+        } else if (head->next != n) {
+            n->prev->next = head;
+            head->prev = n->prev;
+            n->next = head->next;
+            n->prev = head;
+            head->next->prev = n;
+            head->next = n;
+        }
+        ksceKernelCpuResumeIntr(st);
+    }
+    ksceGUIDReleaseObject(uid);
+    return r;
 }
 
 // sgxd's mutex, once the gate lets the caller through (with `gated` clear, at once: the take
@@ -791,6 +912,17 @@ static int sgxd_take_locked(SgxdInfo *info) {
         r = ksceKernelRegisterSysEventHandler("SceSgxd", sgxd_sysevent, NULL);
         SGXD_LOG("sysevent handler: 0x%08x\n", (uint32_t)r);
         sgxd_sysevent_uid = r;
+    }
+    if (sgxd_standby_uid < 0) {
+        r = ksceKernelRegisterSysEventHandler("SceSgxdStandby", sgxd_standby_sysevent, NULL);
+        const int first = r < 0 ? r : sgxd_sysevent_first(r, sgxd_standby_sysevent);
+        SGXD_LOG("standby handler: 0x%08x, first 0x%08x\n", (uint32_t)r, (uint32_t)first);
+        if (r >= 0 && first < 0) {
+            // A list not as decomp sysmem.c has it: no early ask, the standby goes on as before.
+            ksceKernelUnregisterSysEventHandler(r);
+        } else {
+            sgxd_standby_uid = r;
+        }
     }
     if (azahar_proc_handler < 0) {
         azahar_proc_handler = ksceKernelRegisterProcEventHandler("azaharnative", &azahar_proc_events, 0);
@@ -922,6 +1054,10 @@ static int sgxd_release_locked(void) {
     }
     sgxd_gate_open();
     shell_give();
+    sgxd_standby_flag = -1;
+    if (sgxd_standby_given >= 0) {
+        ksceKernelSetEventFlag(sgxd_standby_given, 1);
+    }
     const int was = sgxd_state;
     const uint32_t pages = sgxd_mmu_pages;
     sgxd_mmu_free();
@@ -1103,6 +1239,82 @@ out:
     return ret;
 }
 
+int sgxdSuspend(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    // Past the gate: after a system suspend that came first, the GPU is lost and the answer is
+    // at once; waiting would hold the app's thread that takes it again.
+    int ret = sgxd_enter_gated(0);
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (sgxd_state != SGXD_OWNED) {
+        ret = SGXD_ERR_LOST;
+    } else {
+        // The system suspend's handling (sgxd_sysevent), then SceGpu's GPU back as at a
+        // release: the shell draws again whether or not the system suspends after this.
+        sgxd_hw_down();
+        shellcdram_suspend();
+        sgxd_hand_back();
+        shell_give();
+        sgxd_state = SGXD_LOST;
+        sgxd_gate_closed = 1;
+        ksceKernelClearEventFlag(sgxd_gate, ~1u);
+        if (sgxd_standby_given >= 0) {
+            ksceKernelSetEventFlag(sgxd_standby_given, 1);
+        }
+        SGXD_LOG("the owner's suspend: the GPU SceGpu's, the owner's calls held until it takes "
+                 "the GPU again\n");
+        ret = 0;
+    }
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdResetAll(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (sgxd_state != SGXD_OWNED) {
+        ret = SGXD_ERR_LOST;
+    } else if (sgxd_events) {
+        // A microkernel may run: its event programs and the interrupt are the app's to stop first.
+        ret = AZAHAR_ERR_STATE;
+    } else {
+        // The take's steps after its power-on (sgxd_take_locked), in its order.
+        sgxd_start_sequence();
+        sgxd_reset_cores();
+        sgxd_mmu_program();
+        ret = 0;
+    }
+    SGXD_LOG("reset all -> %08x\n", (uint32_t)ret);
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdOwned(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter_gated(0);
+    if (ret >= 0) {
+        ret = sgxd_owner == ksceKernelGetProcessId() && sgxd_state == SGXD_OWNED;
+        sgxd_leave();
+    }
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
 int sgxdResumed(void) {
     uint32_t state;
     ENTER_SYSCALL(state);
@@ -1224,6 +1436,76 @@ int sgxdEvents(SgxdEvents *user_events) {
         }
     }
     SGXD_LOG("events %p -> %08x\n", user_events, (uint32_t)ret);
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdStandby(int32_t user_flag, uint32_t bits) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else {
+        SceUID flag = -1;
+        ret = 0;
+        if (user_flag >= 0) {
+            flag = kscePUIDtoGUID(ksceKernelGetProcessId(), user_flag);
+            if (flag < 0) {
+                ret = flag;
+            }
+        }
+        if (ret == 0 && sgxd_standby_given < 0) {
+            sgxd_standby_given = ksceKernelCreateEventFlag("SceSgxdStandby", SCE_EVENT_WAITMULTIPLE,
+                                                           0, NULL);
+            if (sgxd_standby_given < 0) {
+                ret = sgxd_standby_given;
+            }
+        }
+        if (ret == 0) {
+            sgxd_standby_flag = flag;
+            sgxd_standby_bits = bits;
+        }
+    }
+    SGXD_LOG("standby flag %08x bits %x -> %08x\n", (uint32_t)user_flag, bits, (uint32_t)ret);
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdQueue(const uint32_t *user_state) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (sgxd_state == SGXD_LOST) {
+        ret = SGXD_ERR_LOST;
+    } else if (!user_state || sgxd_queue_uid >= 0) {
+        ret = AZAHAR_ERR_STATE;
+    } else {
+        void *page = NULL;
+        SceSize size = 0;
+        SceUInt32 offset = 0;
+        const SceUID uid = ksceKernelUserMap("SceSgxdQueue", 3, (void *)user_state,
+                                             SGXD_MK_STATE_WORDS * 4u, &page, &size, &offset);
+        if (uid < 0) {
+            ret = uid;
+        } else {
+            sgxd_queue_uid = uid;
+            sgxd_queue = (volatile uint32_t *)((uintptr_t)page + offset);
+            ret = 0;
+        }
+    }
     sgxd_leave();
 out:
     EXIT_SYSCALL(state);

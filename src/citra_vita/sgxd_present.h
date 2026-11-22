@@ -28,14 +28,20 @@ bool Initialize(std::string* error);
 /// gives the GPU back and frees the memory.
 void Shutdown();
 [[nodiscard]] bool IsInitialized();
-/// A system suspend while the GPU is ours (docs/sgxd/takeover.md), from the power callback that
-/// comes before the system's suspend events: no async job is sent from now on, and the ones sent
-/// are waited for, so sgxd's side goes down with the GPU idle. Every sgxd call waits from then on
-/// (sgxd's gate).
+/// A suspend while the GPU is ours (docs/sgxd/takeover.md), at a standby's ask (WatchStandby) or
+/// from the power callback: no async job is sent from now on, the ones sent are waited for, and
+/// the GPU goes back to the system with sgxd's side down idle, whether or not the system
+/// suspends after it. Every sgxd call waits from then on (sgxd's gate). When the system's
+/// suspend has taken the GPU first (the app late for the standby), there is nothing left to do.
 void Suspend();
+/// The event flag a standby sets `bits` in while the GPU is ours (sgxdStandby): the standby
+/// waits for Suspend, 3 s at most.
+void WatchStandby(int flag, u32 bits);
+/// Whether the app holds the GPU: false once a system suspend has taken it, until the take after
+/// the resume.
+bool Owned();
 /// After the resume: the GPU taken again, the init script and the microkernel's state on it
-/// again, and every sgxd call and job let go; after an application's suspend the system did not
-/// follow (the GPU still ours), only the jobs. False with the reason in error (still lost).
+/// again, and every sgxd call and job let go. False with the reason in error (still lost).
 bool Resume(std::string* error);
 
 /// The texture every draw samples (ImGui's font atlas): width x height texels of A8B8G8R8,

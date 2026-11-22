@@ -125,6 +125,11 @@ public:
     /// The command channel: the pause menu opens as the PS button opens it, stays a
     /// second, and closes with `action` (a Ui::Action) as if chosen in it.
     void ScriptPauseMenu(int action);
+    /// A suspend's (the power callback's, before the GPU goes back): the pause menu opens over a
+    /// running title as the PS button opens it, unless it is open, and this waits until the run
+    /// loop is parked at WaitWhilePaused, `timeout` at most. The title then sleeps and wakes in
+    /// the state the pause menu leaves it in. False with no title running, or at the timeout.
+    bool PauseForSuspend(std::chrono::milliseconds timeout);
 
     /// True once the user has asked to leave.
     [[nodiscard]] bool IsQuitRequested() const {
@@ -203,9 +208,11 @@ private:
     /// ScriptPauseMenu's: the menu to open at the next poll, and the action it closes with.
     std::atomic<bool> script_menu_open{};
     std::atomic<int> script_menu_action{};
-    /// The pause menu is open (under `pause_gate`): the run loop waits on it.
+    /// The pause menu is open (under `pause_gate`): the run loop waits on it, `parked` while it
+    /// does.
     Common::CoreCondition pause_gate;
     bool paused{};
+    bool parked{};
 
     std::atomic<u32> buttons_held{};
     /// The buttons held when the pause menu closed, each kept from the guest until released: the
