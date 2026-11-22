@@ -76,6 +76,15 @@ public:
     void FlushAndInvalidateRegion(PAddr addr, u32 size) override;
     void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
+    /// A guest frame has been presented (RendererGxm::PresentFrame, each VBlank, on the render
+    /// thread): the next draws start a new frame, whose first use of an FCRAM texture untiles
+    /// it again (TextureFor).
+    void EndFrame() {
+        frames++;
+#ifdef VITA_DIAGNOSTICS
+        ProbeEotMix();
+#endif
+    }
     /// The HLE wrote a texture page (RenderThread's GuestWrote, Y2R's picture): the textures
     /// over it are untiled again at their next use.
     void GuestWrote(PAddr page) {
@@ -208,15 +217,17 @@ private:
         u32 height;
         Pica::TexturingRegs::TextureFormat format;
         SgxdBackend::Data memory;
-        u32 bytes;        // of memory
+        u32 bytes;        // of memory (0 before a queued untile gives it one)
         u32 levels;       // the chain's, 1 to the PICA's max_level + 1
         u32 parts;        // 1, or a cube's 6 faces (SWIZZLED squares, one level)
         std::array<PAddr, 6> part_addr; // the guest's, in the host copy's order
         u32 part_bytes;   // a part's guest bytes: the levels back to back, or a face
-        u32 untiled_pass; // the pass that last untiled it (cached FCRAM: each that samples it)
         bool dirty;       // a fill, DMA or transfer wrote over the guest bytes
         bool alpha_one = false; // a surface without alpha, read as a texture (swizzle bit 2)
         u32 last_used = 0;      // the pass count when a draw last took it (eviction order)
+        SgxdBackend::Data alpha{}; // a split ETC1A4's A8 chain (alpha_bytes 0: none)
+        u32 alpha_bytes = 0;
+        Texture* bucket_next = nullptr; // the next texture of its bucket (texture_buckets)
         /// A non-power-of-two 2D texture's rows this many texels apart (a multiple of 32); 0 for a
         /// power-of-two chain.
         u32 stride = 0;
@@ -409,16 +420,23 @@ private:
                                          u64 hash);
     void InstallTier2();
     void InstallVertexTier2(ShaderTier2::Result& result);
-    /// The host copy of texture unit `unit`'s texture for the open pass, untiled when it is
-    /// new or the guest's bytes changed: cached FCRAM by its hash, compared once a pass;
-    /// uncached memory (VRAM, FCRAM moved to CDRAM) when a GPU operation wrote over it.
+    /// The host copy of texture unit `unit`'s texture for the open pass: untiled when it is
+    /// new, in every pass that samples it for FCRAM (no hash: the guest CPU's writes leave no
+    /// mark), and for VRAM when a GPU operation wrote over it. ETC1 stays compressed. Its untile
+    /// is queued (SgxdBackend::QueueUntile): the copy moves at each one, and the pass's
+    /// untiles of a kind are one side render, sent before the pass's own.
     const Texture& TextureFor(u32 unit);
+    /// Whether the unit holds an ETC1A4 texture split into compressed colour and an A8 alpha texture.
+    bool SplitAlpha(u32 unit) const;
+    /// The alpha texture's words of a split unit from its colour's, over its A8 chain (swizzle R000).
+    static void AlphaTextureWords(const Texture& tex, const u32 colour[4], u32 words[4]);
     /// Frees the least recently used texture no open pass reads; false when there is none.
     bool EvictTexture();
     /// The GPU address of a fixed palette for a 4-bit format (0 for none), written at the first use.
     u32 PaletteFor(TexturePalette palette);
-    /// The sampler's four state words for unit `unit`'s texture.
-    void TextureWords(u32 unit, u32 words[4]);
+    /// The sampler's four state words for the unit's texture, which it returns (NullTexture when off).
+    const Texture& TextureWords(u32 unit, u32 words[4]);
+    const Texture& NullTexture(u32 unit);
     /// Marks the textures over [start, end) to be untiled again.
     void TexturesWritten(PAddr start, PAddr end);
     /// The lighting and fog LUTs the guest changed into fresh rows, fs_data's offsets pointed at them.
@@ -446,6 +464,13 @@ private:
     std::list<Texture> textures;
     /// The zeros of a unit that is off, 2D and cube (NullTexture), outside the eviction.
     std::array<Texture, 2> null_textures{};
+    /// Textures by address: a bucket for each 4 KiB guest page (TextureBucket), each a chain of the
+    /// textures starting there (Texture::bucket_next).
+    std::vector<Texture*> texture_buckets;
+    static u32 TextureBucket(PAddr addr);
+    Texture* FindTexture(PAddr addr) const;
+    void IndexTexture(Texture& texture);
+    void DropTexture(Texture& texture);
     SgxdBackend::Data palettes{};
     /// The proctex noise NoiseRand2D(x, y) = h for x, y < 256 as F16x4 texels h * (x odd),
     /// h * (y odd), h, 0.
@@ -547,6 +572,7 @@ private:
     u32 draws{};
     u32 gs_draws{};
     u32 passes{};
+    u32 frames{}; ///< frames presented (EndFrame)
 #ifdef VITA_DIAGNOSTICS
     bool vprof_frame_start = false; // VprofFrameStart's own EndPass is not a frame's result
     int replay_limit = -2; // -2: no replay; -1: a replay of every draw

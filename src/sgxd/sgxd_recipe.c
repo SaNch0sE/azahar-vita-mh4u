@@ -351,6 +351,22 @@ static void copy_pds(const SgxdRecipe *r, const Code *cv, unsigned n, Pds *p) {
 }
 
 // The PDS programs COPY .. BGPRIM, by layout part.
+// The terminate state: PA0 = 0x2000 (TERMINATE present), PA1..3 = TARNDCLIP, the target's tiles.
+static void term_pds(const SgxdRecipe *r, const Code *cv, Pds *p) {
+    memset(p, 0, sizeof(*p));
+    const uint32_t region = (r->tx - 1) << 16 | (r->ty - 1);
+    const unsigned k = pds_pair(p, 0, 0x2000, douta1(0));
+    const unsigned n = pds_pair(p, 0, region, douta1(1));
+    const unsigned i = pds_pair(p, 0, doutu0(0, VI(cv, CV_COPY_TERM), 0), 0);
+    pds_word(p, 1, 0);
+    pds_emit(p, douta(k));
+    pds_emit(p, douta(n));
+    pds_emit(p, douta(n));
+    pds_emit(p, douta(n));
+    pds_emit(p, doutu(i, 0));
+    pds_emit(p, HALT);
+}
+
 static void make_pds(const SgxdRecipe *r, const Code *cv, const Code *cf, Pds *pds) {
     Pds *p;
     // The state copies of the first eight draws (the rest are written with the scene).
@@ -385,22 +401,7 @@ static void make_pds(const SgxdRecipe *r, const Code *cv, const Code *cf, Pds *p
     } else {
         secondary(&pds[SGXD_R_VSEC], doutu0(0, VI(cv, CV_DUMMY_VS), 0));
     }
-    // The terminate state: PA0 = 0x2000 (TERMINATE present), PA1..3 = TARNDCLIP.
-    p = &pds[SGXD_R_TERM];
-    memset(p, 0, sizeof(*p));
-    {
-        const uint32_t region = (r->tx - 1) << 16 | (r->ty - 1);
-        const unsigned k = pds_pair(p, 0, 0x2000, douta1(0));
-        const unsigned n = pds_pair(p, 0, region, douta1(1));
-        const unsigned i = pds_pair(p, 0, doutu0(0, VI(cv, CV_COPY_TERM), 0), 0);
-        pds_word(p, 1, 0);
-        pds_emit(p, douta(k));
-        pds_emit(p, douta(n));
-        pds_emit(p, douta(n));
-        pds_emit(p, douta(n));
-        pds_emit(p, doutu(i, 0));
-        pds_emit(p, HALT);
-    }
+    term_pds(r, cv, &pds[SGXD_R_TERM]);
     secondary(&pds[SGXD_R_FSEC], doutu0(1, FI(cf, CF_DUMMY_FS), 0));
     if (r->imgui) {
         static const uint32_t no_texture[4] = {0};
@@ -489,6 +490,40 @@ int sgxd_recipe_init_imgui(SgxdRecipe *r, uint32_t width, uint32_t height, uint3
                 ndraws, 0, sa_offset, fs, 0);
 }
 
+// The tiling of a W x H target under r's macrotile grid (r->count).
+static void tiling(SgxdRecipe *r, uint32_t W, uint32_t H) {
+    r->tx = (W + 31) / 32;
+    r->ty = (H + 31) / 32;
+    if (r->count == 2) {
+        r->mx = ((r->tx + 1) / 2 + 3) & ~3u;
+        r->my = ((r->ty + 1) / 2 + 3) & ~3u;
+        r->mtile1 = r->mx << 22 | r->mx << 12 | r->mx;
+        r->mtile2 = r->my << 22 | r->my << 12 | r->my;
+    } else {
+        // The 4x4 grid (960x544, Sony's display form).
+        r->mx = ((r->tx + 3) / 4 + 3) & ~3u;
+        r->my = ((r->ty + 3) / 4 + 3) & ~3u;
+        r->mtile1 = 1u << 31 | r->mx << 22 | 2 * r->mx << 12 | 3 * r->mx;
+        r->mtile2 = r->my << 22 | 2 * r->my << 12 | 3 * r->my;
+    }
+    r->stride = r->mx * r->my;
+    r->te_screen = (r->ty - 1) << 12 | (r->tx - 1);
+    r->mte_screen = (H - 1) << 12 | (W - 1);
+    r->rgn_size = (r->count * r->count * r->mx * r->my * 12 + 63) & ~63u;
+    uint32_t pp = 1;
+    const uint32_t cm = r->count * (r->mx > r->my ? r->mx : r->my);
+    while (pp < cm) {
+        pp *= 2;
+    }
+    r->tpc_size = (pp * pp * 8 + 63) & ~63u;
+}
+
+// PBE words 4 and 5: the target's size in 16-pixel steps (log2) and its last pixel.
+static void pbe_size(SgxdRecipe *r, uint32_t W, uint32_t H) {
+    r->pbe[4] = floor_log2((W + 15) / 16) << 24 | floor_log2((H + 15) / 16) << 28;
+    r->pbe[5] = (W - 1) | (H - 1) << 12;
+}
+
 static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, uint32_t pages,
                 const float *verts, const uint32_t *imgui_verts, unsigned nverts,
                 const uint16_t *indices, unsigned nindices, const SgxdRecipeDraw *draws,
@@ -523,34 +558,16 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     r->nindices = nindices;
     const uint32_t W = width, H = height;
 
-    r->tx = (W + 31) / 32;
-    r->ty = (H + 31) / 32;
     r->count = sgxd_recipe_grid ? sgxd_recipe_grid : W * H < 0x4b000 ? 2 : 4;
-    if (r->count == 2) {
-        r->mx = ((r->tx + 1) / 2 + 3) & ~3u;
-        r->my = ((r->ty + 1) / 2 + 3) & ~3u;
-        r->mtile1 = r->mx << 22 | r->mx << 12 | r->mx;
-        r->mtile2 = r->my << 22 | r->my << 12 | r->my;
-    } else {
-        // The 4x4 grid (960x544, Sony's display form).
-        r->mx = ((r->tx + 3) / 4 + 3) & ~3u;
-        r->my = ((r->ty + 3) / 4 + 3) & ~3u;
-        r->mtile1 = 1u << 31 | r->mx << 22 | 2 * r->mx << 12 | 3 * r->mx;
-        r->mtile2 = r->my << 22 | 2 * r->my << 12 | 3 * r->my;
-    }
-    r->stride = r->mx * r->my;
-    r->te_screen = (r->ty - 1) << 12 | (r->tx - 1);
-    r->mte_screen = (H - 1) << 12 | (W - 1);
-    r->rgn_size = (r->count * r->count * r->mx * r->my * 12 + 63) & ~63u;
-    uint32_t pp = 1;
-    const uint32_t cm = r->count * (r->mx > r->my ? r->mx : r->my);
-    while (pp < cm) {
-        pp *= 2;
-    }
-    r->tpc_size = (pp * pp * 8 + 63) & ~63u;
+    tiling(r, W, H);
+    r->layout_width = W;
+    r->layout_height = H;
+    r->layout_rgn_size = r->rgn_size;
+    r->layout_tpc_size = r->tpc_size;
 
     uint32_t *L = r->offset;
     uint32_t o;
+
     // The shared buffer's recipes have no page table or pages of their own.
     const int own_pb = sgxd_recipe_pb.last == 0;
     L[SGXD_R_PT] = 0;
@@ -644,8 +661,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     r->pbe[1] = sgxd_recipe_va(r, SGXD_R_FB);
     r->pbe[2] = (W - 1) >> 1;
     r->pbe[3] = 0;
-    r->pbe[4] = floor_log2((W + 15) / 16) << 24 | floor_log2((H + 15) / 16) << 28;
-    r->pbe[5] = (W - 1) | (H - 1) << 12;
+    pbe_size(r, W, H);
     sgxd_recipe_set_pixel_event(r, sgxd_recipe_va(r, SGXD_R_PIXEV), 3, 2);
 
     Code cv[CV_COUNT], cf[CF_COUNT];
@@ -1043,10 +1059,12 @@ static void write_draw(const SgxdRecipe *r, uint8_t *memory, unsigned n, const S
 // The stream's end after count draws: the secondary and the terminate.
 static void write_stream_end(const SgxdRecipe *r, uint8_t *memory, unsigned count) {
     uint32_t *stream = (uint32_t *)(memory + r->offset[SGXD_R_STREAM]);
+    const uint32_t term_va = r->term_va ? r->term_va : sgxd_recipe_va(r, SGXD_R_TERM);
+    const uint32_t term_units = r->term_va ? r->term_units : r->units[SGXD_R_TERM];
     const uint32_t end[5] = {
         1u << 30 | sgxd_recipe_va(r, SGXD_R_VSEC) >> 4, vsec_word(r),
-        1u << 30 | 1u << 29 | sgxd_recipe_va(r, SGXD_R_TERM) >> 4,
-        r->units[SGXD_R_TERM] << 27 | 1u << 25 | 1u << 17 | 1u << 13 | 1u << 9 | 1,
+        1u << 30 | 1u << 29 | term_va >> 4,
+        term_units << 27 | 1u << 25 | 1u << 17 | 1u << 13 | 1u << 9 | 1,
         0xc0000000u,
     };
     memcpy(stream + draw_words(r) * count, end, sizeof(end));
@@ -1056,6 +1074,10 @@ int sgxd_recipe_set_draws(const SgxdRecipe *r, void *memory, const SgxdRecipeDra
                           unsigned count) {
     if (!count || count > r->ndraws) {
         return -1;
+    }
+    // The layout's own terminate program carries the layout's tiles.
+    if (!r->term_va && (r->width != r->layout_width || r->height != r->layout_height)) {
+        return -2;
     }
     for (unsigned n = 0; n < count; n++) {
         if (!draw_valid(&draws[n], r->nindices)) {
@@ -1069,10 +1091,72 @@ int sgxd_recipe_set_draws(const SgxdRecipe *r, void *memory, const SgxdRecipeDra
     return 0;
 }
 
+// The background object: its PDS pointers, then (0, 0), (W, 0), (0, H) as (x + 1024) * 16.
+static void put_bgrec(const SgxdRecipe *r, uint8_t *memory) {
+    const uint32_t W = r->width, H = r->height;
+    const uint32_t bg[17] = {
+        ptr(r, SGXD_R_BGSEC), 1u << 27 | 3u << 15 | msbs(r, SGXD_R_BGSEC, SGXD_R_BGPRIM),
+        ptr(r, SGXD_R_BGPRIM), 0, 0, fbits(1.0f), 0, 0, fbits(1.0f), 2, 0,
+        0x4000u << 16 | 0x4000, fbits(1.0f), ((W + 0x400) * 0x10) << 16 | 0x4000, fbits(1.0f),
+        0x4000u << 16 | (H + 0x400) * 0x10, fbits(1.0f),
+    };
+    put(memory, r->offset[SGXD_R_BGREC], bg, 17);
+}
+
+int sgxd_recipe_set_size(SgxdRecipe *r, void *memory_, uint32_t width, uint32_t height) {
+    uint8_t *memory = memory_;
+    const uint32_t *L = r->offset;
+    if (!width || !height || width > r->layout_width || height > r->layout_height) {
+        return -1;
+    }
+    tiling(r, width, height);
+    if (r->rgn_size > r->layout_rgn_size || r->tpc_size > r->layout_tpc_size) {
+        tiling(r, r->width, r->height);
+        return -1;
+    }
+    r->width = width;
+    r->height = height;
+    pbe_size(r, width, height);
+    uint64_t *eot = (uint64_t *)(memory + L[SGXD_R_CF] + CF_EOT_OFFSET);
+    for (unsigned i = 4; i <= 5; i++) {
+        eot[1 + i] = usse_limm(i, r->pbe[i]) | SKIPINV;
+    }
+    put_bgrec(r, memory);
+    // EXTZ and the tail pointer caches stay as sgxd_recipe_write zeroed them and the renders since
+    // left them, whatever size those were (zeroing them at every size change costs the render
+    // thread).
+    r->term_va = 0;
+    r->term_units = 0;
+    return 0;
+}
+
+unsigned sgxd_recipe_term_pds(const SgxdRecipe *r, uint32_t *out, uint32_t *units) {
+    Code cv[CV_COUNT];
+    make_cv(r, cv);
+    Pds p;
+    term_pds(r, cv, &p);
+    *units = pds_units(&p);
+    uint32_t words[64];
+    const unsigned n = pds_words(&p, words);
+    if (n > SGXD_RECIPE_TERM_WORDS) {
+        return 0;
+    }
+    memcpy(out, words, n * 4);
+    return n;
+}
+
+void sgxd_recipe_set_term(SgxdRecipe *r, uint32_t va, uint32_t units) {
+    r->term_va = va;
+    r->term_units = units;
+}
+
+void sgxd_recipe_set_double_pixels(SgxdRecipe *r, int on) {
+    r->double_pixels = on ? 1u : 0u;
+}
+
 void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
     uint8_t *memory = memory_;
     const uint32_t *L = r->offset;
-    const uint32_t W = r->width, H = r->height;
     memset(memory, 0, L[SGXD_R_END]);
     if (!r->shared_pb) {
         fill(memory, L[SGXD_R_PAGES], SGXD_RECIPE_SENTINEL, r->pages * 0x1000);
@@ -1094,14 +1178,7 @@ void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
 
     sgxd_recipe_write_scene(r, memory);
 
-    // The background object: its PDS pointers, then (0, 0), (W, 0), (0, H) as (x + 1024) * 16.
-    const uint32_t bg[17] = {
-        ptr(r, SGXD_R_BGSEC), 1u << 27 | 3u << 15 | msbs(r, SGXD_R_BGSEC, SGXD_R_BGPRIM),
-        ptr(r, SGXD_R_BGPRIM), 0, 0, fbits(1.0f), 0, 0, fbits(1.0f), 2, 0,
-        0x4000u << 16 | 0x4000, fbits(1.0f), ((W + 0x400) * 0x10) << 16 | 0x4000, fbits(1.0f),
-        0x4000u << 16 | (H + 0x400) * 0x10, fbits(1.0f),
-    };
-    put(memory, L[SGXD_R_BGREC], bg, 17);
+    put_bgrec(r, memory);
 
     uint32_t words[64];
     for (unsigned s = SGXD_R_COPY; s <= SGXD_R_BGPRIM; s++) {
@@ -1389,7 +1466,7 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
         {0x0488, r->zls[2]}, {0x048c, r->zls[3]}, {0x0490, r->zls[4]},
         {0x04b8, r->bgobjdepth}, {0x04bc, r->bgobj}, {0x04c4, r->bgobjtag},
         {0x04c8, 0x88}, {0x04cc, 0x188}, {0x04dc, 8}, {0x0520, r->mtile1},
-        {0x0524, r->mtile2}, {0x0528, r->stride}, {0x0148, 0},
+        {0x0524, r->mtile2}, {0x0528, r->stride}, {0x0148, r->double_pixels},
         {0x0a5c, r->pixev_va}, {0x0a60, r->pixev_units},
         {0x0a64, r->pixev_attribute_size << 13}, {0x0ae8, 0},
     };

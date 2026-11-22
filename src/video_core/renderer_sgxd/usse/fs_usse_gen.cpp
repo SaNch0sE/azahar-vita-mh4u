@@ -88,6 +88,9 @@ constexpr uint8_t TmpTexFlip = 16;    ///< the texture units' (s, 1 - t) (2 each
 constexpr uint8_t TmpPrimary = 24;    ///< the vertex colour, byte-rounded (4)
 constexpr uint8_t TmpArg = 28;        ///< the three stage arguments (4 each); lighting
                                       ///< scratch before the stages run
+constexpr uint8_t TmpAlphaSplit = 28; ///< a split unit's alpha texel (4 each,
+                                      ///< FSConfig alpha_split), in the stage arguments'
+                                      ///< homes while SampleTextures runs
 constexpr uint8_t TmpLutCoord = 28;   ///< lighting/fog: the LUT texel coordinate (2)
 constexpr uint8_t TmpLutDelta = 30;   ///< lighting/fog: the interpolation weight (1)
 constexpr uint8_t TmpLutEntry = 32;   ///< lighting/fog: the fetched LUT entry (4)
@@ -362,6 +365,7 @@ private:
     /// ProcTexTabled), its texel in proctex_loc: no program of its own.
     bool proctex_tabled = false;
     Vec4Loc proctex_loc{};
+    uint32_t sampler_alpha[3] = {};       ///< the split units' alpha samplers' indices
     uint32_t sampler_rg = 0;              ///< the rg and rgba LUT samplers' indices
     uint32_t sampler_rgba = 0;
     uint32_t sampler_noise = 0;           ///< the noise hash table's (RasterizerSgxd)
@@ -386,6 +390,9 @@ const char* FragmentEmitter::Unsupported() const {
     }
     if (fb.shadow_rendering) {
         return "shadow rendering";
+    }
+    if ((tex.alpha_split & 1) && tex.texture0_type == TextureType::TextureCube) {
+        return "a split alpha texture on a cube";
     }
     if (fb.logic_op != FramebufferRegs::LogicOp::Copy &&
         fb.logic_op != FramebufferRegs::LogicOp::NoOp) {
@@ -659,6 +666,15 @@ void FragmentEmitter::PlanInputs() {
         if (config.proctex.noise_enable) {
             sampler_noise = static_cast<uint32_t>(gxp.samplers.size());
             gxp.samplers.push_back({"proctex_noise", 6});
+        }
+    }
+    // A split unit's alpha texture (TEXUNIT 7 + unit), after everything else so the other
+    // samplers keep their indices.
+    for (u32 unit = 0; unit < 3; unit++) {
+        if (unit_used[unit] && (config.texture.alpha_split >> unit & 1)) {
+            const char* names[3] = {"tex0a", "tex1a", "tex2a"};
+            sampler_alpha[unit] = static_cast<uint32_t>(gxp.samplers.size());
+            gxp.samplers.push_back({names[unit], 7 + unit});
         }
     }
 }
@@ -1415,10 +1431,23 @@ void FragmentEmitter::SampleTextures() {
         e.Sample2D(Reg::V(static_cast<uint8_t>(TmpTex0 + unit * 4)), coords[unit],
                    SamplerSa(sampler_index), nullptr, 0);
         sampler_index++;
+        if (config.texture.alpha_split >> unit & 1) {
+            // The alpha from the unit's A8 texture, its byte in .w (swizzle R000): the colour
+            // texture is ETC1 kept compressed (SgxdBackend::QueueUntile).
+            e.Sample2D(Reg::V(static_cast<uint8_t>(TmpAlphaSplit + unit * 4)), coords[unit],
+                       SamplerSa(sampler_alpha[unit]), nullptr, 0);
+        }
         any = true;
     }
     if (any) {
         e.Wdf(0);
+    }
+    for (u32 unit = 0; unit < 3; unit++) {
+        if (unit_used[unit] && (config.texture.alpha_split >> unit & 1)) {
+            const Vec4Loc texel{Bank::Virtual, static_cast<uint8_t>(TmpTex0 + unit * 4)};
+            const Vec4Loc alpha{Bank::Virtual, static_cast<uint8_t>(TmpAlphaSplit + unit * 4)};
+            e.MoveInternal({texel.Pair(1), 0x2}, {alpha.Pair(1), XYZW}, Pred::None, true);
+        }
     }
     // A coordinate past [0, 1] on an axis that clamps to the border colour replaces the
     // texel with it (the generator's sampleTexUnit).

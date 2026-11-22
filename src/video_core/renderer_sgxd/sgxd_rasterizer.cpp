@@ -31,6 +31,7 @@
 #include "video_core/shader/shader.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/gxm_rasterizer.h"
+#include "video_core/renderer_gxm/untile_geometry.h"
 #include "video_core/renderer_gxm/vprof.h"
 #include "video_core/texture/texture_decode.h"
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
@@ -89,7 +90,7 @@ UntileFormat UntileFormatFor(Pica::TexturingRegs::TextureFormat format) {
         return {0x94, 0, 4, TexturePalette::I4};
     case F::A4:
         return {0x94, 0, 4, TexturePalette::A4};
-    case F::ETC1: // the texture unit's ETC1 once its blocks are reordered (Untile)
+    case F::ETC1: // the texture unit's ETC1, its blocks moved (QueueUntile; a cube face: Untile)
         return {SgxdBackend::UntileEtc1, 0, 4};
     case F::ETC1A4: // its colour as ETC1's, the alpha joined by a merge render (Untile)
         return {SgxdBackend::UntileEtc1A4, 0, 8};
@@ -1356,14 +1357,14 @@ bool RasterizerSgxd::EvictTexture() {
                      textures.size(), kib);
         return false;
     }
-    backend.FreeTexture(victim->memory, victim->bytes);
-    textures.erase(victim);
+    DropTexture(*victim);
     evictions++;
     return true;
 }
 
 const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
+    using TF = Pica::TexturingRegs::TextureFormat;
     const auto t = regs.texturing.GetTextures()[unit];
     const auto& c = t.config;
     const PAddr addr = c.GetPhysicalAddress();
@@ -1379,6 +1380,9 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     }
     DEBUG_ASSERT_MSG(!cube || width == height, "sgxd: a {}x{} cube texture is not built", width,
                      height);
+    // ETC1A4 as compressed colour and A8 alpha, or level by level into RGBA.
+    const bool split = SplitAlpha(unit);
+    const bool etc1a4_levels = !cube && t.format == TF::ETC1A4 && !split;
     // The guest's parts: a 2D texture's levels, which follow each other, or a cube's six
     // faces, each at its own address. The host cube's slots are the SGX's +X, -X, +Y, -Y, +Z,
     // -Z with the PICA's +Y and -Y swapped: the fragment program reads at (u, -v, w), which
@@ -1408,47 +1412,48 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
                          "pass draws",
                          unit, part_addr[k], pass_colour.addr);
     }
-    auto it = std::find_if(textures.begin(), textures.end(),
-                           [addr](const Texture& e) { return e.addr == addr; });
-    if (it != textures.end() &&
-        (it->width != width || it->height != height || it->format != t.format ||
-         it->levels != levels || it->parts != parts || it->part_addr != part_addr)) {
-        backend.FreeTexture(it->memory, it->bytes);
-        textures.erase(it);
-        it = textures.end();
+    Texture* it = FindTexture(addr);
+    if (it && (it->width != width || it->height != height || it->format != t.format ||
+               it->levels != levels || it->parts != parts || it->part_addr != part_addr)) {
+        DropTexture(*it);
+        it = nullptr;
     }
-    // A texture in FCRAM is untiled again in each pass that samples it: the guest's CPU writes
-    // there leave no mark, and nothing compares the bytes. Its pages are in CDRAM by now
-    // (RenderThread::KeepTargetUncached), so the GPU reads what the guest wrote with no clean.
-    // Guest VRAM changes only through the GPU operations that mark its textures dirty.
+    // A texture in FCRAM is untiled at its first use in each frame, and every pass of the frame
+    // after it reads that copy: the guest's CPU writes there leave no mark, and nothing compares
+    // the bytes. Its pages are in CDRAM by now (RenderThread::KeepTargetUncached), so the GPU
+    // reads what the guest wrote with no clean. Guest VRAM changes only through the GPU
+    // operations that mark its textures dirty, which in FCRAM untile it again within the frame
+    // too (a pass's colour buffer a later pass samples).
     const bool fcram = addr >= Memory::FCRAM_PADDR;
-    if (it != textures.end()) {
+    if (it) {
         it->last_used = passes;
-        if (!it->dirty && (!fcram || it->untiled_pass == passes)) {
+        if (!it->dirty && (!fcram || it->untiled_frame == frames)) {
             return *it;
         }
     } else {
-        // The PBE writes whole 32-pixel tiles: a level's untile writes up to 32 rows of at
-        // least 32 texels (SgxdBackend::Untile), past the chain's end for the last levels; a
-        // cube face max(w, 32)^2 texels.
+        // A cube's faces and a wide ETC1A4's levels are untiled at once into the texture's own copy; the
+        // others are queued (QueueUntile). The PBE writes whole 32-pixel tiles, so those copies leave room
+        // past the chain's end.
         u32 host_bytes = 0;
         if (cube) {
             host_bytes = levels == 1 ? 5 * width * width * 4 +
                                            std::max(width, 32u) * std::max(width, 32u) * 4
                                      : 6 * CubeFaceStride(width) + 32 * 32 * 4;
         }
-        for (u32 l = 0, offset = 0; !cube && l < levels; l++) {
+        for (u32 l = 0, offset = 0; etc1a4_levels && l < levels; l++) {
             const u32 w = width >> l, h = height >> l;
             const u32 rows = w < 32 ? h * w / 32 : h;
             host_bytes = std::max(host_bytes, offset + std::max(w, 32u) * std::max(rows, 32u) * 4);
             offset += w * h * 4;
         }
-        textures.push_back({addr, width, height, t.format, backend.AllocTexture(host_bytes),
-                            host_bytes, levels, parts, part_addr, bytes, passes, false});
-        it = std::prev(textures.end());
+        textures.push_back({addr, width, height, t.format,
+                            host_bytes != 0 ? backend.AllocTexture(host_bytes)
+                                            : SgxdBackend::Data{},
+                            host_bytes, levels, parts, part_addr, bytes, frames, false});
+        it = &textures.back();
         it->last_used = passes;
+        IndexTexture(*it);
     }
-    it->untiled_pass = passes;
     it->dirty = false;
     it->alpha_one = t.format == Pica::TexturingRegs::TextureFormat::RG8;
     it->byte_swizzle = 0;
@@ -1494,8 +1499,87 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
             }
         }
     }
-    // Largest first: a level's whole tiles run over the ones after it, written next.
-    for (u32 l = 0, guest = 0, host = 0; !cube && l < levels; l++) {
+    // ETC1 stays compressed in the texture unit's SWIZZLED order, and so does ETC1A4's colour, its
+    // alpha an A8 texture beside it (SplitAlpha); the others untile to a LINEAR chain.
+    SgxdBackend::UntileSource source{addr, width, height, f.bits, f.code, f.swizzle, palette};
+    // A side that is no power of two, which QueueUntile's batches do not take: one level, untiled on
+    // its own, rows a multiple of 32 texels apart. As a power-of-two chain its render would need a
+    // parameter buffer of its own.
+    const bool npot = !cube && (!std::has_single_bit(width) || !std::has_single_bit(height));
+    // A side under 8 is less than a tile: the PICA's tile rows are width / 8 tiles apart (none for a
+    // 4-wide texture), so rows 8 on read tile 0 again. Decoded on the CPU, rows 32 texels apart.
+    const bool tiny = !cube && (width < 8 || height < 8);
+    // A one-channel format's queued copy is a byte a texel, which the draws read with the format's
+    // own U8 swizzle: a quarter of A8B8G8R8.
+    const bool one_channel =
+        t.format == TF::A8 || t.format == TF::I8 || t.format == TF::A4 || t.format == TF::I4;
+    const bool byte_copy = one_channel && !cube && !npot && !tiny && !etc1a4_levels;
+    if (byte_copy) {
+        const UntileFormat alpha = UntileFormatFor(f.bits == 8 ? TF::A8 : TF::A4);
+        source.code = alpha.code;
+        source.swizzle = alpha.swizzle;
+        source.palette = PaletteFor(alpha.palette);
+        source.byte_copy = true;
+    }
+    if (tiny) {
+        DEBUG_ASSERT_MSG(levels == 1 && t.format != TF::ETC1 && t.format != TF::ETC1A4,
+                         "sgxd: texture unit {} at {:#x}, {}x{} in format {} with {} levels: a "
+                         "side under 8 is built for one level, not ETC1",
+                         unit, addr, width, height, static_cast<u32>(t.format), levels);
+        if (it->bytes != 0) {
+            backend.FreeTextureAfterPass(it->memory, it->bytes);
+        }
+        // Rows 32 texels apart, or the width's 32s.
+        it->stride = Common::AlignUp(width, 32u);
+        it->bytes = it->stride * Common::AlignUp(height, 32u) * 4;
+        // Written by the CPU at once: the work that may still sample or untile into the range goes first.
+        u32 ready = 0;
+        it->memory = backend.AllocTexture(it->bytes, &ready);
+        backend.RenderWait(ready, "a tiny texture's range");
+        Pica::Texture::TextureInfo info{addr, width, height, 0, t.format, false};
+        info.SetDefaultStride();
+        const u8* const guest = memory.GetPhysicalPointer(addr);
+        for (u32 y = 0; y < height; y++) {
+            for (u32 x = 0; x < width; x++) {
+                const auto texel = Pica::Texture::LookupTexture(guest, x, y, info);
+                u8* const out = it->memory.cpu + (y * it->stride + x) * 4;
+                for (u32 k = 0; k < 4; k++) {
+                    out[k] = texel[k];
+                }
+            }
+        }
+    } else if (npot) {
+        DEBUG_ASSERT_MSG(levels == 1 && !etc1a4_levels && t.format != TF::ETC1 &&
+                             t.format != TF::ETC1A4,
+                         "sgxd: texture unit {} at {:#x}, {}x{} in format {} with {} levels: a "
+                         "side that is no power of two is built for one level, not ETC1",
+                         unit, addr, width, height, static_cast<u32>(t.format), levels);
+        if (it->bytes != 0) {
+            backend.FreeTextureAfterPass(it->memory, it->bytes);
+        }
+        it->stride = Common::AlignUp(width, 32u);
+        it->bytes = it->stride * Common::AlignUp(height, 32u) * 4;
+        it->memory = backend.AllocTexture(it->bytes);
+        backend.Untile(source, it->memory.gpu, it->stride);
+    } else if (!cube && !etc1a4_levels) {
+        // The copy moves: the last one's ranges go back once the open pass is sent.
+        if (it->bytes != 0) {
+            backend.FreeTextureAfterPass(it->memory, it->bytes);
+        }
+        if (it->alpha_bytes != 0) {
+            backend.FreeTextureAfterPass(it->alpha, it->alpha_bytes);
+        }
+        const SgxdBackend::UntileCopy copy = backend.QueueUntile(source, levels);
+        it->memory = copy.colour;
+        it->bytes = copy.colour_bytes;
+        it->byte_swizzle = !byte_copy                                   ? 0
+                           : t.format == TF::A8 || t.format == TF::A4 ? 6
+                                                                        : 5;
+        it->alpha = copy.alpha;
+        it->alpha_bytes = copy.alpha_bytes;
+    }
+    // An ETC1A4 level 0 wider than a split takes: level by level, largest first.
+    for (u32 l = 0, guest = 0, host = 0; etc1a4_levels && l < levels; l++) {
         const u32 w = width >> l, h = height >> l;
         backend.Untile({addr + guest, w, h, f.bits, f.code, f.swizzle, palette},
                        it->memory.gpu + host, w);
@@ -1505,137 +1589,124 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
 #ifdef VITA_DIAGNOSTICS
     texture_stats.untiles++;
     texture_stats.untiled_bytes += u64{bytes} * parts;
-    // untilecheck: every level against upstream's decoder, for the formats whose host copy is
-    // R, G, B, A bytes; either row order (the rows it matches, the first it does not). The
-    // levels follow each other in both copies: the guest's packed, the host's rows of their
-    // width (a LINEAR chain, down to a side of 8).
-    using TF = Pica::TexturingRegs::TextureFormat;
-    // Upstream's level 0 (RGBA bytes) when the check failed, for dumptex's "want" file.
-    std::vector<u8> want_image;
-    if (!cube && GxmFlag("untilecheck") &&
-        (t.format == TF::RGBA8 || t.format == TF::RGB8 || t.format == TF::ETC1 ||
-         t.format == TF::ETC1A4)) {
-        const bool alpha = t.format == TF::RGBA8 || t.format == TF::ETC1A4;
-        backend.RenderIdle("untilecheck");
-        static u32 untile_checks, untile_bad;
-        untile_checks++;
-        bool level0_bad = false;
-        for (u32 l = 0, guest_at = 0, host_at = 0; l < levels; l++) {
-            const u32 w = width >> l, h = height >> l;
-            Pica::Texture::TextureInfo info{addr + guest_at, w, h, 0, t.format, false};
-            info.SetDefaultStride();
-            const u8* const guest = memory.GetPhysicalPointer(addr + guest_at);
-            const u8* const host = it->memory.cpu + host_at;
-            guest_at += w * h * f.bits / 8;
-            host_at += w * h * 4;
-            u32 wrong[2] = {}, first_bad[2] = {h, h};
-            // The first differing texel of each order: x, y, then want and got as RGBA words.
-            std::array<u32, 4> first_texel[2]{};
-            if (l == 0) {
-                want_image.resize(w * h * 4);
-            }
-            for (u32 y = 0; y < h; y++) {
-                for (u32 x = 0; x < w; x++) {
-                    const auto want = Pica::Texture::LookupTexture(guest, x, y, info);
-                    if (l == 0) {
-                        for (u32 c = 0; c < 4; c++) {
-                            want_image[(y * w + x) * 4 + c] = want[c];
-                        }
-                    }
-                    for (u32 o = 0; o < 2; o++) {
-                        const u8* got = host + ((o ? h - 1 - y : y) * w + x) * 4;
-                        bool bad = false;
-                        for (u32 c = 0; c < (alpha ? 4u : 3u); c++) {
-                            bad = bad || std::abs(static_cast<int>(got[c]) - want[c]) > 3;
-                        }
-                        if (bad) {
-                            if (wrong[o]++ == 0) {
-                                first_texel[o] = {
-                                    x, y,
-                                    u32{want[0]} | u32{want[1]} << 8 | u32{want[2]} << 16 |
-                                        u32{want[3]} << 24,
-                                    u32{got[0]} | u32{got[1]} << 8 | u32{got[2]} << 16 |
-                                        u32{got[3]} << 24};
-                            }
-                            first_bad[o] = std::min(first_bad[o], o ? h - 1 - y : y);
-                        }
-                    }
-                }
-            }
-            const u32 o = wrong[1] < wrong[0] ? 1 : 0;
-            if (wrong[o] == 0) {
-                continue;
-            }
-            level0_bad = level0_bad || l == 0;
-            if (untile_bad++ < 64) {
-                LOG_ERROR(Render,
-                          "untilecheck {}: texture {:#x} {}x{} format {}, level {} of {} ({}x{}) "
-                          "at GPU {:#x}: {} of {} texels differ ({} row order), the first in "
-                          "host row {}; texel ({}, {}) want {:#010x} got {:#010x} (RGBA from "
-                          "the low byte)",
-                          untiles, addr, width, height, static_cast<u32>(t.format), l, levels, w,
-                          h, it->memory.gpu + (host_at - w * h * 4), wrong[o], w * h,
-                          o ? "flipped" : "same", first_bad[o], first_texel[o][0],
-                          first_texel[o][1], first_texel[o][2], first_texel[o][3]);
-            }
-        }
-        if (!level0_bad) {
-            want_image.clear();
-        }
-        if (untile_checks % 64 == 0) {
-            LOG_INFO(Render, "untilecheck: {} checked, {} levels differ", untile_checks,
-                     untile_bad);
+#endif
+#ifdef VITA_DIAGNOSTICS
+    static const u64 untile_log_at = u64{SgxdFlagValue("passlog")} * 1000000;
+    if (untile_log_at != 0) {
+        const u64 now = sceKernelGetProcessTimeWide();
+        if (now >= untile_log_at && now < untile_log_at + 1000000) {
+            LOG_INFO(Render, "perf: untile {:#x} {}x{} format {}, {} levels{}{}, {} KiB{}", addr,
+                     width, height, static_cast<u32>(t.format), levels, cube ? ", cube" : "",
+                     tiny   ? ", tiny"
+                     : npot ? ", npot"
+                            : "",
+                     (u64{bytes} * parts) >> 10, written ? ", the memo saw a write" : "");
         }
     }
 #endif
-    // Each format's first 8 untiles (dumptex), or 48 from untile N on (dumptexfrom=N); the
-    // log's first 8 of any.
     static std::array<u32, 16> format_untiles{};
-    static const u32 dump_from = GxmFlagValue("dumptexfrom");
-    static u32 dumped_from;
     const u32 format_untile = format_untiles[static_cast<u32>(t.format) & 15]++;
-    const bool dump_this = (format_untile < 8 && GxmFlag("dumptex")) ||
-                           (dump_from != 0 && untiles >= dump_from && dumped_from++ < 48);
+    const bool dump_this = format_untile < 8 && SgxdFlag("dumptex");
+    // Out of a pass, nothing sends the queue later.
+    if (!backend.InPass()) {
+        backend.FlushUntiles();
+    }
     if (untiles++ < 8 || dump_this) {
-        LOG_INFO(Render, "texture {:#x}: {}x{} format {}, {} levels{}, untiled to GPU {:#010x}",
+        LOG_INFO(Render, "texture {:#x}: {}x{} format {}, {} levels{}, untiled to GPU {:#010x}{}",
                  addr, width, height, static_cast<u32>(t.format), levels, cube ? ", cube" : "",
-                 it->memory.gpu);
+                 it->memory.gpu, it->byte_swizzle != 0 ? ", a byte a texel" : "");
 #ifdef VITA_DIAGNOSTICS
-        // dumptex: each level's (a cube: each face's) guest bytes and host copy to host0,
-        // named by its guest address. A 2D level's host copy has rows of its width; a cube
-        // face is SWIZZLED, written as -s0.
         if (dump_this) {
-            const auto write = [&](PAddr at, u32 w, u32 h, u32 stride, const char* what,
-                                   const void* data, u32 size) {
-                const std::string path =
-                    fmt::format("host0:azahar-tex{}-{:x}-{}x{}-f{}-s{}-{}.bin", untiles, at, w, h,
-                                static_cast<u32>(t.format), stride, what);
-                if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
-                    std::fwrite(data, 1, size, file);
-                    std::fclose(file);
-                }
-            };
-            for (u32 k = 0; cube && k < 6; k++) {
-                const u32 size = width * height * 4;
-                write(part_addr[k], width, height, 0, "guest",
-                      memory.GetPhysicalPointer(part_addr[k]), bytes);
-                write(part_addr[k], width, height, 0, "host", it->memory.cpu + k * size, size);
-            }
-            for (u32 l = 0, guest = 0, host = 0; !cube && l < levels; l++) {
-                const u32 w = width >> l, h = height >> l;
-                write(addr + guest, w, h, w, "guest", memory.GetPhysicalPointer(addr) + guest,
-                      w * h * f.bits / 8);
-                write(addr + guest, w, h, w, "host", it->memory.cpu + host, w * h * 4);
-                if (l == 0 && !want_image.empty()) {
-                    write(addr, w, h, w, "want", want_image.data(), w * h * 4);
-                }
-                guest += w * h * f.bits / 8;
-                host += w * h * 4;
-            }
+            backend.FlushUntiles();
+            backend.RenderIdle("dumptex");
+            DumpTexture(*it, f.bits, split);
         }
 #endif
     }
     return *it;
+}
+
+u32 RasterizerSgxd::TextureBucket(PAddr addr) {
+    if (addr >= Memory::VRAM_PADDR && addr - Memory::VRAM_PADDR < Memory::VRAM_SIZE) {
+        return (addr - Memory::VRAM_PADDR) >> 12;
+    }
+    DEBUG_ASSERT_MSG(addr >= Memory::FCRAM_PADDR &&
+                         addr - Memory::FCRAM_PADDR < Memory::FCRAM_N3DS_SIZE,
+                     "sgxd: a texture at {:#x}, outside VRAM and FCRAM", addr);
+    return (Memory::VRAM_SIZE >> 12) + ((addr - Memory::FCRAM_PADDR) >> 12);
+}
+
+RasterizerSgxd::Texture* RasterizerSgxd::FindTexture(PAddr addr) const {
+    const u32 bucket = TextureBucket(addr);
+    if (bucket >= texture_buckets.size()) {
+        return nullptr;
+    }
+    for (Texture* t = texture_buckets[bucket]; t; t = t->bucket_next) {
+        if (t->addr == addr) {
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+u32 RasterizerSgxd::ReadableBytes(PAddr addr, u32 bytes) {
+    if (addr >= Memory::VRAM_PADDR && addr - Memory::VRAM_PADDR < Memory::VRAM_SIZE) {
+        const u32 inside = Memory::VRAM_PADDR + Memory::VRAM_SIZE - addr;
+        ASSERT_MSG(bytes <= inside + GuestGpuMemory::PastVramBytes,
+                   "sgxd: a texture at {:#x}, {} bytes: past the filler after VRAM's end", addr,
+                   bytes);
+        return std::min(bytes, inside);
+    }
+    ASSERT_MSG(addr >= Memory::FCRAM_PADDR &&
+                   addr - Memory::FCRAM_PADDR + u64{bytes} <= Memory::FCRAM_N3DS_SIZE,
+               "sgxd: a texture at {:#x}, {} bytes: outside VRAM and FCRAM, or past FCRAM's end",
+               addr, bytes);
+    return bytes;
+}
+
+void RasterizerSgxd::IndexTexture(Texture& texture) {
+    if (texture_buckets.empty()) {
+        texture_buckets.assign((Memory::VRAM_SIZE + Memory::FCRAM_N3DS_SIZE) >> 12, nullptr);
+    }
+    Texture*& head = texture_buckets[TextureBucket(texture.addr)];
+    texture.bucket_next = head;
+    head = &texture;
+}
+
+void RasterizerSgxd::DropTexture(Texture& texture) {
+    for (Texture** link = &texture_buckets[TextureBucket(texture.addr)]; *link;
+         link = &(*link)->bucket_next) {
+        if (*link == &texture) {
+            *link = texture.bucket_next;
+            break;
+        }
+    }
+    // A copy the open pass samples goes back once the pass is sent; an evicted one's at once.
+    const bool sampled = texture.last_used >= passes;
+    for (const auto& [copy, size] : {std::pair{texture.memory, texture.bytes},
+                                     std::pair{texture.alpha, texture.alpha_bytes}}) {
+        if (size != 0) {
+            sampled ? backend.FreeTextureAfterPass(copy, size) : backend.FreeTexture(copy, size);
+        }
+    }
+    // Rare: the list has no way from an element to its place.
+    textures.remove_if([&](const Texture& t) { return &t == &texture; });
+}
+
+bool RasterizerSgxd::SplitAlpha(u32 unit) const {
+    const auto t = regs.texturing.GetTextures()[unit];
+    return t.enabled && t.format == Pica::TexturingRegs::TextureFormat::ETC1A4 &&
+           !(unit == 0 && t.config.type == Pica::TexturingRegs::TextureConfig::TextureCube) &&
+           t.config.width <= UntileGeometry::Etc1A4MaxWidth;
+}
+
+void RasterizerSgxd::AlphaTextureWords(const Texture& tex, const u32 colour[4], u32 words[4]) {
+    DEBUG_ASSERT(tex.alpha_bytes != 0);
+    // LINEAR U8 (0x00, sizes less one); the LODMIN bits in words 2 and 3 kept.
+    words[0] = colour[0] & ~(1u << 31);
+    words[1] = 3u << 29 | (tex.width - 1) << 12 | (tex.height - 1);
+    words[2] = tex.alpha.gpu | (colour[2] & 3u);
+    words[3] = 1u << 31 | 6u << 28 | (colour[3] & 3u << 26);
 }
 
 u32 RasterizerSgxd::PaletteFor(TexturePalette palette) {
@@ -1688,7 +1759,7 @@ const RasterizerSgxd::Texture& RasterizerSgxd::NullTexture(u32 unit) {
     return tex;
 }
 
-void RasterizerGxm::TextureWords(u32 unit, u32 words[4]) {
+const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[4]) {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
     const auto t = regs.texturing.GetTextures()[unit];
     // A unit that is off still reaches the TEV: it reads zeros, point sampled and clamped.
@@ -1717,17 +1788,46 @@ void RasterizerGxm::TextureWords(u32 unit, u32 words[4]) {
                      "sgxd: texture unit {}: LOD bias {} is past DADJUST's range", unit,
                      static_cast<s32>(c.lod.bias) / 256.0f);
     // U8U8U8U8, ABGR (R the lowest byte), LINEAR or a CUBE of SWIZZLED faces (log2 sizes);
-    // NORM.
-    words[0] = static_cast<u32>(std::clamp(dadjust, 0, 63)) << 21 | clamp << 17 | mag << 12 |
-               min << 10 | mipf << 9 | addressing;
-    words[1] = tex.parts == 6 ? 2u << 29 | 0x0cu << 24 |
-                                    static_cast<u32>(std::countr_zero(tex.width)) << 16 |
-                                    static_cast<u32>(std::countr_zero(tex.height))
-                              : 3u << 29 | 0x0cu << 24 | (tex.width - 1) << 12 | (tex.height - 1);
+    // a 2D ETC1, and a split ETC1A4's colour, a SWIZZLED chain of its blocks
+    // (SgxdBackend::QueueUntile; TEXFEXT and 0x04, log2 sizes; an ETC1 cube's faces are
+    // untiled); NORM.
+    if (tex.stride > tex.width) {
+        // LINEAR_STRIDED: its stride (in words less one) takes DADJUST's, MIPMAPCLAMP's and the
+        // minification filters' bits, so one level, no bias, the magnification filter for both. REPEAT
+        // and MIRROR wrap over each side rounded up to a power of two (exact on a power-of-two side).
+        const bool pot = std::has_single_bit(tex.width) && std::has_single_bit(tex.height);
+        DEBUG_ASSERT_MSG(min == mag &&
+                             (pot || (AddressMode(c.wrap_s) == 2 && AddressMode(c.wrap_t) == 2)),
+                         "sgxd: texture unit {}: a {}x{} texture (rows {} apart) with filters {} "
+                         "{} or wrap {} {}: LINEAR_STRIDED magnifies and minifies alike, and "
+                         "repeats or mirrors over a power of two",
+                         unit, tex.width, tex.height, tex.stride, mag, min,
+                         static_cast<u32>(c.wrap_s.Value()), static_cast<u32>(c.wrap_t.Value()));
+        const u32 internal = tex.stride - 1;
+        words[0] = (internal >> 3 & 0x3ffu) << 17 | mag << 12 | (internal & 7u) << 9 | addressing |
+                   (internal >> 13 & 3u) << 1;
+        words[1] = 6u << 29 | 0x0cu << 24 | (tex.width - 1) << 12 | (tex.height - 1);
+        words[2] = tex.memory.gpu;
+        words[3] = 1u << 31 | (tex.alpha_one ? 4u << 28 : 0u);
+        return tex;
+    }
+    const bool etc1 = (tex.format == Pica::TexturingRegs::TextureFormat::ETC1 ||
+                       tex.alpha_bytes != 0) &&
+                      tex.parts == 1;
+    const u32 log2_sizes = static_cast<u32>(std::countr_zero(tex.width)) << 16 |
+                           static_cast<u32>(std::countr_zero(tex.height));
+    words[0] = (etc1 ? 1u << 31 : 0u) | static_cast<u32>(std::clamp(dadjust, 0, 63)) << 21 |
+               clamp << 17 | mag << 12 | min << 10 | mipf << 9 | addressing;
+    // A byte copy is U8 (0x00) with its format's swizzle (Texture::byte_swizzle).
+    const u32 code = tex.byte_swizzle != 0 ? 0x00u : 0x0cu;
+    words[1] = etc1             ? (SgxdBackend::UntileEtc1 & 0x1fu) << 24 | log2_sizes
+               : tex.parts == 6 ? 2u << 29 | code << 24 | log2_sizes
+                                : 3u << 29 | code << 24 | (tex.width - 1) << 12 | (tex.height - 1);
     words[2] = tex.memory.gpu | lod_min >> 2;
     // Swizzle 4 on U8U8U8U8: alpha one (bit 2).
     const u32 swizzle = tex.byte_swizzle != 0 ? tex.byte_swizzle : tex.alpha_one ? 4u : 0u;
     words[3] = 1u << 31 | swizzle << 28 | (lod_min & 3u) << 26;
+    return tex;
 }
 
 void RasterizerSgxd::CachedRead(PAddr addr, u32 size) {
@@ -2761,6 +2861,12 @@ const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(const Ep
             blend->SetMinMaxEmulationDisabled();
         }
     }
+    u32 alpha_split = 0;
+    for (u32 unit = 0; unit < 3; unit++) {
+        alpha_split |= SplitAlpha(unit) ? 1u << unit : 0u;
+    }
+    config.texture.alpha_split.Assign(alpha_split);
+    config.texture.own_pixel.Assign(draw_own_pixel);
     const u64 key = Common::HashCombine(config.Hash(), epilogue.Key());
     if (const auto it = fragment_programs.find(key); it != fragment_programs.end()) {
         FragmentProgram& f = it->second;
@@ -2920,8 +3026,8 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
     for (const Usse::GxpSampler& sampler : g.samplers) {
         if (sampler.name != "texture_buffer_lut_lf" && sampler.name != "texture_buffer_lut_rg" &&
             sampler.name != "texture_buffer_lut_rgba" && sampler.name != "proctex_noise" &&
-            sampler.name != "tex0" &&
-            sampler.name != "tex1" && sampler.name != "tex2") {
+            sampler.name != "tex0" && sampler.name != "tex1" && sampler.name != "tex2" &&
+            sampler.name != "tex0a" && sampler.name != "tex1a" && sampler.name != "tex2a") {
             std::string names;
             for (const Usse::GxpSampler& s : g.samplers) {
                 names += fmt::format(" {} (unit {})", s.name, s.unit);
@@ -4935,11 +5041,21 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         }
         // The LUT textures, linear and point sampled (the program computes texel centres): F32F32 (value,
         // delta) for lighting, fog and the proctex maps, F16x4 for its colours, read by the float4 query.
+        // A unit's texture and words, for its alpha sampler (a split ETC1A4).
+        const Texture* unit_texture[3] = {};
+        u32 unit_words[3][4];
         for (size_t i = 0; i < fg.samplers.size(); i++) {
             const std::string& name = fg.samplers[i].name;
             u32 words[4];
             if (name == "tex0" || name == "tex1" || name == "tex2") {
-                TextureWords(fg.samplers[i].unit, words);
+                const u32 unit = fg.samplers[i].unit;
+                unit_texture[unit] = &TextureWords(unit, words);
+                std::memcpy(unit_words[unit], words, sizeof(words));
+            } else if (name == "tex0a" || name == "tex1a" || name == "tex2a") {
+                // After the unit's own sampler (PlanInputs puts it last).
+                const u32 unit = fg.samplers[i].unit - 7;
+                DEBUG_ASSERT(unit_texture[unit] != nullptr);
+                AlphaTextureWords(*unit_texture[unit], unit_words[unit], words);
             } else if (name == "texture_buffer_lut_rg") {
                 sgxd_recipe_texture_words_format(backend.LutRgRows().gpu,
                                                  Pica::Shader::LUT_TEX_WIDTH,

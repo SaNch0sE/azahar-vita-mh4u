@@ -142,6 +142,9 @@ typedef struct SgxdRecipe {
     int keep_code_caches;            // sgxd_test 11: the kicks skip the USE_CACHE invalidates
     int programs;                    // sgxd_recipe_init_programs: draws bring programs
     uint32_t pixev_va, pixev_units, pixev_attribute_size;  // sgxd_recipe_set_pixel_event
+    uint32_t layout_width, layout_height, layout_rgn_size, layout_tpc_size;
+    uint32_t term_va, term_units;          // sgxd_recipe_set_term: the stream's terminate program
+    uint32_t double_pixels;                // DOUBLE_PIXEL_PARTITIONS (0x0148) at the 3D kick
 } SgxdRecipe;
 
 // The macrotile grid of later inits. 0 (the default) picks by size as Sony's kernel does: 4x4
@@ -324,6 +327,11 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory, uint32_t fb_va, uint32_
 #define SGXD_RECIPE_PACK_A1R5G5B5_RGBA 0x40210000u
 // A4R4G4B4 SWIZ 2: R in bits 15:12, A in 3:0, the PICA's RGBA4 from an A8B8G8R8 source.
 #define SGXD_RECIPE_PACK_A4R4G4B4_RGBA 0x50210000u
+// F32F32 SWIZ 1: a two-word pixel (DOUBLE_PIXEL_PARTITIONS 1, sgxd_recipe_set_double_pixels)
+// stored word 1 first.
+#define SGXD_RECIPE_PACK_F32F32_SWAPPED 0x11110000u
+// EXTMODE1 U8 SWIZ 1: one byte a pixel, the colour's A.
+#define SGXD_RECIPE_PACK_U8_A 0x80910000u
 void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory, uint32_t pbe0);
 
 // Route 1: a pass renders the guest's picture
@@ -352,6 +360,24 @@ unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint6
 #define SGXD_RECIPE_PICA_PIXEV_WORDS 32u
 void sgxd_recipe_pica_pixev(const SgxdRecipe *r, uint32_t eot_index,
                             uint32_t out[SGXD_RECIPE_PICA_PIXEV_WORDS]);
+// A target of width x height (1 to the layout's size) drawn with the recipe's layout: the tiling
+// and everything that follows from it, the end of tile's PBE words 4 and 5 and the background
+// record; EXTZ and the tail pointer caches are left as they are. The terminate state
+// carries the tiling too, and the PDS keeps a program it has run by its address, so the caller
+// places sgxd_recipe_term_pds's program elsewhere and names it with sgxd_recipe_set_term before
+// the draws; set_draws refuses (-2) until then when the size is not the layout's. -1: too big.
+int sgxd_recipe_set_size(SgxdRecipe *r, void *memory, uint32_t width, uint32_t height);
+// The terminate state's PDS program for the recipe's current size: its words (at most
+// SGXD_RECIPE_TERM_WORDS) into out, its data units into *units; returns the words.
+#define SGXD_RECIPE_TERM_WORDS 32u
+unsigned sgxd_recipe_term_pds(const SgxdRecipe *r, uint32_t *out, uint32_t *units);
+// The VDM stream's terminate state from the PDS program at va with units (0: the layout's own),
+// for the next sgxd_recipe_set_draws.
+void sgxd_recipe_set_term(SgxdRecipe *r, uint32_t va, uint32_t units);
+// The 3D kick's DOUBLE_PIXEL_PARTITIONS (0x0148): 1 gives each pixel two output words, one 64-bit
+// o register; 0 at init.
+void sgxd_recipe_set_double_pixels(SgxdRecipe *r, int on);
+
 // The pixel event program the 3D kick names (EVENT_PIXEL_PDS_EXEC, _DATA's units and _INFO's
 // ATTRIBUTE_SIZE): as init sets it, the layout's PIXEV, 3 units and 2.
 void sgxd_recipe_set_pixel_event(SgxdRecipe *r, uint32_t va, uint32_t units,

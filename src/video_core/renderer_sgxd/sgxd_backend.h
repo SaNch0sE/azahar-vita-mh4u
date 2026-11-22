@@ -178,8 +178,9 @@ public:
     /// (RenderFence): after each GPU op (RasterizerInterface::GpuIdle). Otherwise the next
     /// pass's list finishes it.
     void RenderFinish();
-    /// A PTLA fill or copy is about to touch GPU addresses [lo, hi): the pending 3D's finish
-    /// goes in the queue first if it writes or samples any of them. Nothing waits.
+    /// A PTLA fill or copy is about to touch GPU addresses [lo, hi): the queued untiles
+    /// (QueueUntile) are sent, and the pending 3D's finish goes in the queue first if it writes
+    /// or samples any of them. Nothing waits.
     void RenderBefore(u32 lo, u32 hi, const char* why);
     /// A guest interrupt's GPU work (VideoCore::GPU::Signal): every list and PTLA op sent so
     /// far, the pending 3D included. Unlike RenderFence it leaves the pending 3D unmarked, so
@@ -259,9 +260,10 @@ public:
     Data AllocTextureFixed(u32 bytes);
     [[nodiscard]] bool TextureFits(u32 bytes) const;
     void FreeTexture(const Data& texture, u32 bytes);
-    /// poolcheck (diagnostics): each page of the textures pool in use as the GPU reads it (a
-    /// PTLA copy to a probe page) against the CPU's view; logs the pages that differ.
-    void CheckTexturePool();
+    /// FreeTexture for a host copy the open pass may sample: the range is given back once the
+    /// pass's render is sent (EndPass), so whatever takes it next is written behind that 3D.
+    /// Outside a pass, FreeTexture.
+    void FreeTextureAfterPass(const Data& texture, u32 bytes);
 
     /// A PICA texture as the untile reads it: width x height texels (powers of two, 8 to
     /// UntileSide) of bits each at gpu, in 8x8 tiles with Morton order inside, read through
@@ -345,6 +347,50 @@ public:
      */
     void Untile(const UntileSource& source, u32 dest_gpu, u32 dest_stride, bool swizzled = false,
                 bool transposed = false);
+    /**
+     * A 2D texture's levels untiled as the texture unit's LINEAR chain at dest_gpu: level l is
+     * w_l x h_l A8B8G8R8 texels in rows of w_l, the levels back to back from level 0
+     * (docs/sgxd/tsp.md), each in Untile's row order. source is level 0, and the
+     * guest's levels follow it; every level's sides are 8 or more. Not ETC1 or ETC1A4.
+     *
+     * The levels share one target, rows max(w, 32) texels apart, where a level narrower than
+     * that puts that many texels of its rows on each target row: one side render for the whole
+     * chain, or a second for the levels after the first where the target would pass
+     * UntileSide rows (a 1024x1024 chain, or a 32-wide one 1024 tall).
+     */
+    void UntileChain(const UntileSource& source, u32 levels, u32 dest_gpu);
+    /// The bytes UntileChain writes from dest_gpu: the chain, and the PBE's whole tiles past it,
+    /// at `bytes` a texel (4, or 1 for a byte copy).
+    static u32 ChainBytes(u32 width, u32 height, u32 levels, u32 bytes);
+    /// A queued untile's host copy (QueueUntile): its chain, and a split ETC1A4's A8 alpha
+    /// chain (alpha_bytes 0 for none), each a range of the texture pool for FreeTexture.
+    struct UntileCopy {
+        Data colour;
+        u32 colour_bytes;
+        Data alpha;
+        u32 alpha_bytes;
+    };
+    /**
+     * A 2D texture's levels for the texture unit (source is level 0, the guest's levels follow
+     * it, every level's sides 8 or more), queued: returns where the copy will be, which the
+     * open pass's draws may sample at once. FlushUntiles sends the queue's side renders, before
+     * the open pass's own (EndPass) and before a PTLA op (RenderBefore); out of a pass, the
+     * caller flushes at once. By format:
+     * - ETC1: the texture unit's SWIZZLED ETC1 (0x84) chain, still compressed: each block moved
+     *   to its SWIZZLED place with its two words swapped (docs/sgxd/tsp.md), rendered into a
+     *   64-bit TWIDDLED target (Etc1TargetFor).
+     * - ETC1A4 up to Etc1A4MaxWidth wide: split into an ETC1 colour chain and an A8 LINEAR
+     *   alpha chain the draws join, through a gather of raw words (Etc1A4GatherVertices).
+     * - Any other: the LINEAR A8B8G8R8 chain UntileChain writes. A chain past one render's
+     *   UntileSide rows is untiled at once into a copy of its own.
+     * Block rows and texel rows stay in the guest's order: the draws read at (s, 1 - t).
+     * The queue's untiles of a kind share one side render (untile_geometry.h), each copy a slot
+     * of its target; a copy that does not fit flushes the queue first.
+     */
+    UntileCopy QueueUntile(const UntileSource& source, u32 levels);
+    /// Sends the queued untiles' side renders, the gather first (the ETC1 and alpha renders
+    /// read it): one render for each batch the queue holds.
+    void FlushUntiles();
 
     /// The geometry shader's stream-out stages (RasterizerSgxd::GeometryStage): A0 stores
     /// the vertex program's outputs, A1 runs the geometry program over them.
@@ -422,6 +468,11 @@ private:
         bool converted;
         u32 first, count;
         u32 tex1[4];
+        bool raw64 = false; ///< a 64-bit texel copied raw (sgxd_program_raw64_*), not converted
+        u32 vertices = 0;   ///< the draw's own vertex array (GPU address); 0: the render's
+        /// A batch member's quads, put for a view_width x view_height target whose (0, 0) is
+        /// this render's pixel (view_x, view_y); view_width 0: put for this render's target.
+        u32 view_x = 0, view_y = 0, view_width = 0, view_height = 0;
     };
     /// A render of its own under the side recipe, sent ahead of the open pass's: the quads in
     /// vertices into a width x height target of pack at dest_gpu, rows dest_stride pixels apart.
@@ -429,7 +480,58 @@ private:
     /// layout.
     void SideRender(const Data& vertices, std::span<const SideDraw> list, u32 dest_gpu,
                     u32 dest_stride, u32 width, u32 height, bool merge = false,
-                    bool twiddled = false, u32 pack = SGXD_RECIPE_PACK_U8888);
+                    bool twiddled = false, u32 pack = SGXD_RECIPE_PACK_U8888,
+                    bool double_pixels = false);
+    PdsRef TermPds(const SgxdRecipe& recipe);
+    /// QueueUntile's batches, each one side render's target: LINEAR U8888 chains in rows of
+    /// 256, 512 or UntileSide texels (ChainBatchStride), the byte copies' U8 chains the same in
+    /// bytes, TWIDDLED ETC1 chains in squares of 32, 64, 128 or 256 blocks a side, A8 alpha
+    /// chains in rows of AlphaBatchStride bytes. A batch's block is taken from the texture pool
+    /// at its first member, a slot (in units: rows, or squares) at a time.
+    enum UntileBatchKind : u32 {
+        BatchChain256,
+        BatchChain512,
+        BatchChainWide,
+        BatchBytes256,
+        BatchBytes512,
+        BatchBytesWide,
+        BatchEtc1, // + log2(height / 32)
+        BatchAlpha = BatchEtc1 + 4,
+        UntileBatchKinds,
+    };
+    struct UntileBatch {
+        Data block{};
+        u32 capacity = 0; ///< its units
+        u32 used = 0;     ///< the units its members' slots take
+        u32 draws = 0;
+    };
+    /// A queued untile: its source, its slot's first unit in its chain's batch, and a split
+    /// ETC1A4's first row in the A8 batch and in the gather.
+    struct UntileMember {
+        UntileSource source;
+        u32 levels;
+        u32 batch;
+        u32 at;
+        u32 alpha_at;
+        u32 gather_row;
+    };
+    std::array<UntileBatch, UntileBatchKinds> untile_batches{};
+    std::vector<UntileMember> untile_members;
+    u32 gather_rows = 0;  ///< the queued gathers' rows
+    u32 gather_draws = 0; ///< and draws
+    bool flushing_untiles = false;
+    std::vector<std::pair<Data, u32>> pass_frees;
+    /// A unit's bytes, a batch's most units (UntileSide rows, the target's width in squares),
+    /// and the units a slot rounds up to (a 4 KiB multiple).
+    static u32 UnitBytes(u32 kind);
+    static u32 MaxUnits(u32 kind);
+    static u32 SlotUnits(u32 kind);
+    /// A texture pool range back on the free list, with no finish of the pending 3D: for
+    /// ranges only side renders write next, whose lists finish that 3D before their own 3D
+    /// kick (sgxd_session_render_overlap).
+    void GiveTexture(const Data& texture, u32 bytes);
+    /// The ETC1 render's pixel primary: the texel's two words raw into pa0 and pa1.
+    PdsRef Raw64PixelPds(u32 doutu0, const u32 tex[4]);
     void UntileEtc1Blocks(const UntileSource& source, u32 dest_gpu, u32 dest_stride,
                           bool swizzled);
     void UntileEtc1A4Merge(const UntileSource& source, u32 colour_gpu, u32 colour_stride,
@@ -597,6 +699,7 @@ private:
 
     bool blit_ready{};
     u32 blit_vertex{}, blit_fragment{}, untile_fragment{}, merge_vertex{}, merge_fragment{};
+    u32 raw64_fragment{};
     std::vector<SgxdRecipeDraw> untile_draws;
     std::vector<SgxdRecipeDrawPrograms> untile_programs;
     // StreamOut's target: one tile, which the render never writes.

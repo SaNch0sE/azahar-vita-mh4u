@@ -132,6 +132,7 @@ if (ENABLE_GXM)
             renderer_gxm/renderer_gxm.h
             renderer_gxm/sgxd_backend.cpp
             renderer_gxm/sgxd_backend.h
+            renderer_gxm/untile_geometry.h
             # sgxd's plain C pieces the rasterizer builds its passes with.
             ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_program.c
             ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_recipe.c

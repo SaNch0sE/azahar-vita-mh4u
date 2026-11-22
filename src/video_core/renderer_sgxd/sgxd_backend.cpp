@@ -14,10 +14,11 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/named_thread.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
-#include "video_core/renderer_gxm/sgxd_backend.h"
-#include "video_core/renderer_gxm/vprof.h"
-#include "video_core/renderer_gxm/usse/usse_encoder.h"
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#include "video_core/renderer_sgxd/sgxd_backend.h"
+#include "video_core/renderer_sgxd/untile_geometry.h"
+#include "video_core/renderer_sgxd/vprof.h"
+#include "video_core/renderer_sgxd/usse/usse_encoder.h"
 #include "video_core/shader/generator/profile.h"
 
 #include <psp2/kernel/processmgr.h>
@@ -28,6 +29,9 @@
 #include "sgxd_session.h"
 
 namespace SgxdRenderer {
+
+using namespace UntileGeometry;
+static_assert(SgxdBackend::UntileSide == UntileGeometry::UntileSide);
 
 namespace {
 
@@ -293,6 +297,9 @@ void SgxdBackend::RenderFinish() {
 }
 
 void SgxdBackend::RenderBefore(u32 lo, u32 hi, [[maybe_unused]] const char* why) {
+    // The queued untiles and the stream-out draws' programs read guest memory as it is before the
+    // op.
+    FlushUntiles();
     FlushStreamOut(false);
     // The op is queued behind the finish, which the kernel runs first.
     if (sgxd_session_pending_touches(lo, hi)) {
@@ -726,9 +733,30 @@ SgxdBackend::Data SgxdBackend::AllocTextureFixed(u32 bytes) {
 }
 
 void SgxdBackend::FreeTexture(const Data& texture, u32 bytes) {
+    // A copy in a queued batch's block: its untile goes first, or it would write over the next
+    // owner.
+    for (u32 k = 0; k < UntileBatchKinds; k++) {
+        const UntileBatch& b = untile_batches[k];
+        if (b.block.cpu && texture.gpu - b.block.gpu < b.capacity * UnitBytes(k)) {
+            FlushUntiles();
+            break;
+        }
+    }
     // The range goes to the next texture, written behind the lists that sample this one; the
     // pending 3D's finish goes ahead of them.
     FinishPending(FinishWhy::FreeTexture);
+    GiveTexture(texture, bytes);
+}
+
+void SgxdBackend::FreeTextureAfterPass(const Data& texture, u32 bytes) {
+    if (!in_pass) {
+        FreeTexture(texture, bytes);
+        return;
+    }
+    pass_frees.emplace_back(texture, bytes);
+}
+
+void SgxdBackend::GiveTexture(const Data& texture, u32 bytes) {
     GiveFree(textures_free,
              FreeRange{texture.gpu - TexturesVa, AlignUp(bytes, 0x1000), FenceAll()});
     if (!textures_free.empty() &&
@@ -891,15 +919,25 @@ void SgxdBackend::ReadsCached(const u8* cpu, u32 bytes) {
 
 void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
     DEBUG_ASSERT(in_pass);
+    FlushUntiles();
     FlushStreamOut(false);
     if (draw_count != 0 && draw_count < MaxDraws && hang_test.exchange(false)) {
         DrawHang();
     }
     in_pass = false;
     passes++;
+    // The copies the pass may sample, freed while it was open (FreeTextureAfterPass), go back
+    // once its render is sent: whatever takes them is written behind its 3D.
+    const auto give_back = [this] {
+        for (const auto& [texture, bytes] : pass_frees) {
+            GiveTexture(texture, bytes);
+        }
+        pass_frees.clear();
+    };
     if (draw_count == 0) {
         // Its data may hold a side render's vertices, sent already.
         data_fence[data_slot] = pass_fences[passes % PassFences] = FenceAll();
+        give_back();
         return;
     }
     Recipe& r = *current;
@@ -981,6 +1019,7 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
         if (d3_us) {
             *d3_us = render.d3_us;
         }
+        give_back();
         return;
     }
     const bool ok =
@@ -1401,6 +1440,8 @@ void SgxdBackend::PlaceFixedPrograms() {
               Usse::IOp::R(Usse::Reg::Pa(5)));
     const u64 merge[3] = {words[0], e.Words()[0], words[2]};
     merge_fragment = sgxd_program_doutu0(1, PlaceCode(1, merge), 0);
+    raw64_fragment =
+        sgxd_program_doutu0(1, PlaceCode(1, {words, sgxd_program_raw64_fragment(words)}), 0);
     blit_ready = true;
 }
 
@@ -1523,32 +1564,6 @@ void SgxdBackend::TransferFromGuest(const UntileSource& source, u32 dest_gpu, u3
 
 namespace {
 
-constexpr u32 QuadVertexWords = 6 * SGXD_PROGRAM_BLIT_VERTEX_WORDS;
-
-/// One quad as the blit's two triangles into v: target pixels [x0, x1) x [y0, y1) of a
-/// width x height viewport, and the texture coordinate at each corner (00 at x0, y0; 10 at
-/// x1, y0; 01 at x0, y1; 11 at x1, y1).
-void PutQuad(float* v, u32 width, u32 height, float x0, float y0, float x1, float y1,
-             const float (&uv)[4][2]) {
-    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
-    const float corner[4][2] = {{x0, y0}, {x1, y0}, {x0, y1}, {x1, y1}};
-    static constexpr u32 order[6] = {0, 1, 2, 1, 3, 2};
-    for (u32 n = 0; n < 6; n++) {
-        const u32 c = order[n];
-        const float words[N] = {2 * corner[c][0] / width - 1,
-                                2 * corner[c][1] / height - 1,
-                                0.5f,
-                                1.0f,
-                                1.0f,
-                                1.0f,
-                                1.0f,
-                                1.0f,
-                                uv[c][0],
-                                uv[c][1]};
-        std::memcpy(v + n * N, words, sizeof(words));
-    }
-}
-
 /// Where an untile writes a w x h image with rows `stride` texels apart: a PBE target of width x
 /// height with rows target_stride apart, per_row image rows on each. A stride under 32 packs
 /// 32 / w image rows side by side per 32-pixel row (the PBE takes multiples of 32). Swizzled:
@@ -1572,32 +1587,8 @@ UntileTarget UntileTargetFor(u32 w, u32 h, u32 stride, bool swizzled = false) {
     return {32, h * w / 32, 32, 32 / w, false};
 }
 
-/// PutQuad for image rows [y0, y1), w texels wide, placed on target t: one quad when t's rows
-/// are the image's, else a quad per row with the coordinates interpolated down the block.
-/// Returns the quads written, each QuadVertexWords.
 u32 PutRows(float* v, const UntileTarget& t, u32 w, u32 y0, u32 y1, const float (&uv)[4][2]) {
-    if (t.per_row == 1) {
-        PutQuad(v, t.width, t.height, 0, static_cast<float>(y0), static_cast<float>(w),
-                static_cast<float>(y1), uv);
-        return 1;
-    }
-    const auto lerp = [](const float (&a)[2], const float (&b)[2], float f, u32 i) {
-        return a[i] + (b[i] - a[i]) * f;
-    };
-    for (u32 y = y0; y < y1; y++) {
-        const float f0 = static_cast<float>(y - y0) / (y1 - y0);
-        const float f1 = static_cast<float>(y + 1 - y0) / (y1 - y0);
-        const float row[4][2] = {
-            {lerp(uv[0], uv[2], f0, 0), lerp(uv[0], uv[2], f0, 1)},
-            {lerp(uv[1], uv[3], f0, 0), lerp(uv[1], uv[3], f0, 1)},
-            {lerp(uv[0], uv[2], f1, 0), lerp(uv[0], uv[2], f1, 1)},
-            {lerp(uv[1], uv[3], f1, 0), lerp(uv[1], uv[3], f1, 1)},
-        };
-        const float x0 = static_cast<float>(y % t.per_row * w);
-        const float ty = static_cast<float>(y / t.per_row);
-        PutQuad(v + (y - y0) * QuadVertexWords, t.width, t.height, x0, ty, x0 + w, ty + 1, row);
-    }
-    return y1 - y0;
+    return PutRowsAt(v, t.width, t.height, w * t.per_row, w, 0, y0, y1, uv);
 }
 
 u32 TileRowQuads(const UntileTarget& t) {
@@ -1652,13 +1643,25 @@ void SideTextureWords(u32 type, u32 code, u32 swizzle, u32 width, u32 height, u3
 
 void SgxdBackend::SideRender(const Data& vertices, std::span<const SideDraw> list, u32 dest_gpu,
                              u32 dest_stride, u32 width, u32 height, bool merge, bool twiddled,
-                             u32 pack) {
+                             u32 pack, bool double_pixels) {
     // Inside a pass or not: the vertices are the caller's, in the textures pool or the pass data.
     ASSERT(!list.empty() && list.size() <= MaxDraws);
     DEBUG_ASSERT(dest_stride >= std::max(width, 32u) && dest_stride % 32 == 0 &&
                  width <= UntileSide && height <= UntileSide);
     Recipe& r = RecipeFor(UntileSide, UntileSide, Kind::Side);
     PlaceFixedPrograms();
+    // At the target's size inside the 1024x1024 layout: the TE and 3D walk only its macrotiles, the
+    // PBE takes its size. The PDS keeps a program by address, so another size's comes from the
+    // flipping half.
+    [[maybe_unused]] const int sized = sgxd_recipe_set_size(&r.recipe, r.memory, width, height);
+    DEBUG_ASSERT_MSG(sized == 0, "sgxd: a {}x{} side render does not fit the side recipe", width,
+                     height);
+    if (width != r.recipe.layout_width || height != r.recipe.layout_height) {
+        const PdsRef term = TermPds(r.recipe);
+        DEBUG_ASSERT(term.va != 0);
+        sgxd_recipe_set_term(&r.recipe, term.va, term.units);
+    }
+    sgxd_recipe_set_double_pixels(&r.recipe, double_pixels ? 1 : 0);
     const u32 N = merge ? SGXD_PROGRAM_MERGE_VERTEX_WORDS : SGXD_PROGRAM_BLIT_VERTEX_WORDS;
 
     SgxdRecipeDrawPrograms p{};
@@ -1690,18 +1693,32 @@ void SgxdBackend::SideRender(const Data& vertices, std::span<const SideDraw> lis
     p.indices = 0;
     p.primitive = SGXD_PROGRAM_TRIANGLES;
 
-    // The quads' right and bottom edges put the next tile column and row in the TA's lists,
-    // where the background alone would be written past the target: rows stride apart, so the
-    // column's tiles land on the next rows' first 32 texels (a 256x128 texture's texels 0-31 of
-    // rows 1-127 would hold the background). The clip keeps the tiles
-    // the target covers.
-    const u32 clip =
-        SGXD_RECIPE_CLIP(0, 0, std::max(width, 32u) / 32 - 1, std::max(height, 32u) / 32 - 1);
+    // The quads' right and bottom edges put the next tile column and row in the TA's lists, whose
+    // background would land past the target: the clip keeps the tiles the target covers (LastTile).
+    const auto [last_x, last_y] = LastTile(width, height);
+    const u32 clip = SGXD_RECIPE_CLIP(0, 0, last_x, last_y);
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
     untile_draws.resize(list.size());
     untile_programs.assign(list.size(), p);
+    // moved to its slot by the viewport.
+    u32 fetched = 0;
+    PdsRef vspds{};
     for (std::size_t d = 0; d < list.size(); d++) {
         const SideDraw& sd = list[d];
+        const u32 from = sd.vertices != 0 ? sd.vertices : vertices.gpu;
+        if (from != fetched || vspds.va == 0) {
+            const SgxdVertexFetch fetch{from, N * 4, N, 0};
+            vspds = VertexPds(&fetch, 1, merge ? merge_vertex : blit_vertex, false);
+            DEBUG_ASSERT(vspds.va != 0);
+            fetched = from;
+        }
+        untile_programs[d].vspds = vspds.va;
+        untile_programs[d].vspds_units = vspds.units;
+        if (sd.view_width != 0) {
+            const float w = sd.view_width / 2.0f, h = sd.view_height / 2.0f;
+            const float view[6] = {w + sd.view_x, w, h + sd.view_y, h, 0.0f, 1.0f};
+            std::memcpy(untile_programs[d].viewport, view, sizeof(view));
+        }
         // the word unconverted.
         [[maybe_unused]] const int fprim =
             merge          ? sgxd_program_merge_pixel_pds(merge_fragment, sd.tex, sd.tex1, &pds)
@@ -1780,6 +1797,13 @@ void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
     DEBUG_ASSERT(in_pass && !queued.empty() && queued.size() <= StreamMaxDraws);
     Recipe& r = RecipeFor(UntileSide, UntileSide, Kind::Side);
     PlaceFixedPrograms();
+    // At its 32x32 target's size, as SideRender sizes the recipe (whatever it drew last).
+    [[maybe_unused]] const int sized = sgxd_recipe_set_size(&r.recipe, r.memory, 32, 32);
+    DEBUG_ASSERT(sized == 0);
+    const PdsRef term = TermPds(r.recipe);
+    DEBUG_ASSERT(term.va != 0);
+    sgxd_recipe_set_term(&r.recipe, term.va, term.units);
+    sgxd_recipe_set_double_pixels(&r.recipe, 0);
     if (stream_target.cpu == nullptr) {
         stream_target = AllocSurface(32, 32);
     }
@@ -1836,31 +1860,6 @@ void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
     RenderAsync(r, everything);
     NoteSent(&queued == &stream_draws[0] ? "stream-out A0" : "stream-out A1", draws);
 }
-
-namespace {
-
-/// A PICA-tiled picture's bands of tile rows (Untile, DrawTiled): a band's tiles are a SWIZZLED
-/// texture 8 texels wide and rows * w tall, at most 4096 (the texture unit's largest side), its
-/// height rounded up to a power of two; the quads read only the band's own rows. Each band's
-/// first vertex is a multiple of 8 (the recipe's rule), after unused vertices where the band
-/// before ends short of it.
-struct Band {
-    u32 first_row, rows, first_vertex;
-};
-std::vector<Band> TileBands(u32 w, u32 tile_rows, u32 quads_a_row, u32& vertex_count) {
-    const u32 max_band = std::min(tile_rows, 4096 / w);
-    std::vector<Band> bands;
-    vertex_count = 0;
-    for (u32 ty = 0; ty < tile_rows; ty += max_band) {
-        const u32 first = (vertex_count + 7) & ~7u;
-        const u32 rows = std::min(max_band, tile_rows - ty);
-        bands.push_back({ty, rows, first});
-        vertex_count = first + rows * quads_a_row * 6;
-    }
-    return bands;
-}
-
-} // namespace
 
 void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride, bool swizzled,
                          bool transposed) {
@@ -1922,6 +1921,387 @@ void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride,
         list[b].count = band.rows * quads * 6;
     }
     SideRender(vertices, list, dest_gpu, t.stride, t.width, t.height, false, t.twiddled);
+}
+
+u32 SgxdBackend::ChainBytes(u32 width, u32 height, u32 levels, u32 bytes) {
+    u32 end = 0;
+    for (const ChainRender& r : ChainRenders(width, height, levels)) {
+        end = std::max(end, (r.offset + r.stride * AlignUp(r.rows, 32)) * bytes);
+    }
+    return end;
+}
+
+void SgxdBackend::UntileChain(const UntileSource& src, u32 levels, u32 dest_gpu) {
+    const u32 w0 = src.width, h0 = src.height;
+    DEBUG_ASSERT_MSG(levels >= 1 && std::has_single_bit(w0) && std::has_single_bit(h0) &&
+                         w0 <= UntileSide && h0 <= UntileSide && (w0 >> (levels - 1)) >= 8 &&
+                         (h0 >> (levels - 1)) >= 8 && src.code != UntileEtc1 &&
+                         src.code != UntileEtc1A4,
+                     "sgxd: a {}x{} chain of {} levels (format {:#x}): the chain untile takes "
+                     "power-of-two sides from 8 to {}, not ETC1",
+                     w0, h0, levels, src.code, UntileSide);
+    std::vector<GeometryDraw> draws;
+    for (const ChainRender& cr : ChainRenders(w0, h0, levels)) {
+        const u32 vertex_count = ChainVertices(cr, w0, h0, src.bits, nullptr, draws);
+        bool fresh = false;
+        const Data vertices =
+            GeometryVertices(GeometryKey(7, w0, h0, cr.first | cr.end << 4, false, false),
+                             vertex_count * SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4, fresh);
+        if (fresh) {
+            ChainVertices(cr, w0, h0, src.bits, reinterpret_cast<float*>(vertices.cpu), draws);
+        }
+        std::vector<SideDraw> list(draws.size());
+        for (std::size_t n = 0; n < draws.size(); n++) {
+            SideTextureWords(0, src.code, src.swizzle, 8, draws[n].view_rows,
+                             src.gpu + draws[n].source, list[n].tex, src.palette);
+            list[n].converted = true;
+            list[n].first = draws[n].first;
+            list[n].count = draws[n].count;
+        }
+        SideRender(vertices, list, dest_gpu + cr.offset * (src.byte_copy ? 1 : 4), cr.stride,
+                   cr.stride, cr.rows, false, false,
+                   src.byte_copy ? SGXD_RECIPE_PACK_U8_A : SGXD_RECIPE_PACK_U8888);
+    }
+}
+
+u32 SgxdBackend::UnitBytes(u32 kind) {
+    switch (kind) {
+    case BatchChain256:
+        return 256 * 4;
+    case BatchChain512:
+        return 512 * 4;
+    case BatchChainWide:
+        return UntileSide * 4;
+    case BatchBytes256:
+        return 256;
+    case BatchBytes512:
+        return 512;
+    case BatchBytesWide:
+        return UntileSide;
+    case BatchAlpha:
+        return AlphaBatchStride;
+    default: {
+        const u32 side = 32u << (kind - BatchEtc1);
+        return side * side * 8;
+    }
+    }
+}
+
+u32 SgxdBackend::MaxUnits(u32 kind) {
+    return kind >= BatchEtc1 && kind < BatchAlpha ? UntileSide >> (5 + kind - BatchEtc1)
+                                                   : UntileSide;
+}
+
+u32 SgxdBackend::SlotUnits(u32 kind) {
+    return std::max(1u, 0x1000 / UnitBytes(kind));
+}
+
+namespace {
+/// A batch's block at its first member: room for this many bytes of members, or the member's
+/// own slot where that is more.
+constexpr u32 UntileBlockBytes = 1u << 20;
+} // namespace
+
+SgxdBackend::UntileCopy SgxdBackend::QueueUntile(const UntileSource& src, u32 levels) {
+    const u32 w0 = src.width, h0 = src.height;
+    const bool split = src.code == UntileEtc1A4;
+    const bool etc1 = split || src.code == UntileEtc1;
+    DEBUG_ASSERT_MSG(levels >= 1 && std::has_single_bit(w0) && std::has_single_bit(h0) &&
+                         w0 <= UntileSide && h0 <= UntileSide && (w0 >> (levels - 1)) >= 8 &&
+                         (h0 >> (levels - 1)) >= 8 && (!split || w0 <= Etc1A4MaxWidth),
+                     "sgxd: a {}x{} chain of {} levels (format {:#x}): the untile takes "
+                     "power-of-two sides from 8 to {}, ETC1A4 up to {} wide",
+                     w0, h0, levels, src.code, UntileSide, Etc1A4MaxWidth);
+    DEBUG_ASSERT(!flushing_untiles);
+    // The chain's batch, its slot there and its draws.
+    std::vector<GeometryDraw> draws;
+    u32 batch = 0, units = 0;
+    if (etc1) {
+        const u32 side = Etc1TargetFor(w0, h0, levels).height;
+        batch = BatchEtc1 + static_cast<u32>(std::countr_zero(side / 32));
+        units = Etc1Squares(w0, h0, levels);
+        Etc1Vertices(w0, h0, levels, nullptr, draws);
+    } else {
+        const u32 stride = ChainBatchStride(w0);
+        const ChainRender cr = ChainAt(w0, h0, levels, stride);
+        if (cr.rows > UntileSide) {
+            // More rows than a render's (a 1024x1024 chain): a copy of its own, untiled now.
+            const u32 bytes = ChainBytes(w0, h0, levels, src.byte_copy ? 1 : 4);
+            const Data own = AllocTexture(bytes);
+            UntileChain(src, levels, own.gpu);
+            return {own, bytes, {}, 0};
+        }
+        batch = (stride == UntileSide ? BatchChainWide
+                 : stride == 512      ? BatchChain512
+                                      : BatchChain256) +
+                (src.byte_copy ? BatchBytes256 - BatchChain256 : 0);
+        units = cr.rows;
+        ChainVertices(cr, w0, h0, src.bits, nullptr, draws);
+    }
+    units = AlignUp(units, SlotUnits(batch));
+    DEBUG_ASSERT(units <= MaxUnits(batch));
+    const u32 batch_draws = static_cast<u32>(draws.size());
+    // A split ETC1A4's A8 slot, a draw a level, and its gather's rows, a draw for the colour
+    // words and one a level.
+    const u32 alpha_units =
+        split ? AlignUp(ChainAt(w0, h0, levels, AlphaBatchStride).rows, SlotUnits(BatchAlpha))
+              : 0;
+    const u32 member_gather_rows = split ? Etc1A4GatherFor(w0, h0, levels).rows : 0;
+    const auto fits = [this](u32 kind, u32 n, u32 d) {
+        const UntileBatch& b = untile_batches[kind];
+        return b.draws + d <= MaxDraws && (!b.block.cpu || b.used + n <= b.capacity);
+    };
+    if (!fits(batch, units, batch_draws) ||
+        (split && (!fits(BatchAlpha, alpha_units, levels) ||
+                   gather_rows + member_gather_rows > UntileSide ||
+                   gather_draws + 1 + levels > MaxDraws))) {
+        FlushUntiles();
+    }
+    const auto take = [this](u32 kind, u32 n, u32 d) {
+        UntileBatch& b = untile_batches[kind];
+        const u32 unit = UnitBytes(kind);
+        if (!b.block.cpu) {
+            // A LINEAR target in whole tile rows: the tiles its render stores stay in the block.
+            const u32 band = kind >= BatchEtc1 && kind < BatchAlpha ? 1 : 32;
+            b.capacity =
+                std::min(MaxUnits(kind), std::max(AlignUp(n, band), UntileBlockBytes / unit));
+            b.block = AllocTexture(b.capacity * unit);
+            b.used = 0;
+            b.draws = 0;
+        }
+        const u32 at = b.used;
+        b.used += n;
+        b.draws += d;
+        return Data{b.block.cpu + at * unit, b.block.gpu + at * unit};
+    };
+    UntileCopy copy{take(batch, units, batch_draws), units * UnitBytes(batch), {}, 0};
+    UntileMember m{src, levels, batch, 0, 0, 0};
+    m.at = (copy.colour.gpu - untile_batches[batch].block.gpu) / UnitBytes(batch);
+    if (split) {
+        copy.alpha = take(BatchAlpha, alpha_units, levels);
+        copy.alpha_bytes = alpha_units * AlphaBatchStride;
+        m.alpha_at = (copy.alpha.gpu - untile_batches[BatchAlpha].block.gpu) / AlphaBatchStride;
+        m.gather_row = gather_rows;
+        gather_rows += member_gather_rows;
+        gather_draws += 1 + levels;
+    }
+    untile_members.push_back(m);
+    return copy;
+}
+
+void SgxdBackend::FlushUntiles() {
+    if (untile_members.empty()) {
+        return;
+    }
+    DEBUG_ASSERT(!flushing_untiles);
+    flushing_untiles = true;
+    constexpr u32 G = Etc1A4GatherStride;
+    constexpr u32 VertexBytes = SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4;
+    std::vector<GeometryDraw> draws;
+    std::vector<SideDraw> list;
+    // A member's draws: its quads (cached by their geometry, put for its own target), each
+    // view moved to its slot.
+    const auto add = [&](const Data& vertices, u32 view_x, u32 view_y, u32 view_width,
+                         u32 view_height, const auto& texture) {
+        for (const GeometryDraw& d : draws) {
+            SideDraw& sd = list.emplace_back();
+            texture(d, sd);
+            sd.first = d.first;
+            sd.count = d.count;
+            sd.vertices = vertices.gpu;
+            sd.view_x = view_x;
+            sd.view_y = view_y;
+            sd.view_width = view_width;
+            sd.view_height = view_height;
+        }
+    };
+
+    // The gather first: the ETC1 and alpha renders read the split members' words from it.
+    Data scratch{};
+    u32 scratch_bytes = 0;
+    if (gather_rows != 0) {
+        scratch_bytes = G * 4 * AlignUp(gather_rows, 32u);
+        scratch = AllocTexture(scratch_bytes);
+        list.clear();
+        for (const UntileMember& m : untile_members) {
+            if (m.source.code != UntileEtc1A4) {
+                continue;
+            }
+            const u32 w = m.source.width, h = m.source.height;
+            const u32 count = Etc1A4GatherVertices(w, h, m.levels, nullptr, draws);
+            bool fresh = false;
+            const Data vertices = GeometryVertices(GeometryKey(13, w, h, m.levels, true, false),
+                                                   count * VertexBytes, fresh);
+            if (fresh) {
+                Etc1A4GatherVertices(w, h, m.levels, reinterpret_cast<float*>(vertices.cpu),
+                                     draws);
+            }
+            add(vertices, 0, m.gather_row, G, Etc1A4GatherFor(w, h, m.levels).rows,
+                [&](const GeometryDraw& d, SideDraw& sd) {
+                    SideTextureWords(3, 0x0c, 0, d.view_width, d.view_rows,
+                                     m.source.gpu + d.source, sd.tex);
+                });
+        }
+        SideRender({}, list, scratch.gpu, G, G, gather_rows);
+    }
+
+    for (u32 k = 0; k < BatchAlpha; k++) {
+        const UntileBatch& b = untile_batches[k];
+        if (!b.block.cpu) {
+            continue;
+        }
+        const bool etc1 = k >= BatchEtc1;
+        const bool bytes = k >= BatchBytes256 && k < BatchEtc1;
+        const u32 pack = bytes ? SGXD_RECIPE_PACK_U8_A : SGXD_RECIPE_PACK_U8888;
+        // A LINEAR batch whose members share one width under its stride is drawn in rows of that
+        // width: a level as wide as the rows is a quad a tile row, not one a texel row.
+        const u32 batch_stride = etc1 ? 0 : UnitBytes(k) / (bytes ? 1 : 4);
+        u32 narrow = 0;
+        for (const UntileMember& m : untile_members) {
+            if (!etc1 && m.batch == k) {
+                narrow = narrow == 0 || narrow == m.source.width ? m.source.width : ~0u;
+            }
+        }
+        if (narrow == ~0u || narrow < 32 || narrow >= batch_stride ||
+            b.used * (batch_stride / narrow) > UntileSide) {
+            narrow = 0;
+        }
+        list.clear();
+        for (const UntileMember& m : untile_members) {
+            if (m.batch != k) {
+                continue;
+            }
+            const UntileSource& src = m.source;
+            const u32 w = src.width, h = src.height;
+            bool fresh = false;
+            if (etc1) {
+                // U32U32 (0x1f), read raw: a block's two words as the guest stores them, a split
+                // member's from its gather's colour rows.
+                const u32 base =
+                    src.code == UntileEtc1A4 ? scratch.gpu + m.gather_row * G * 4 : src.gpu;
+                const u32 count = Etc1Vertices(w, h, m.levels, nullptr, draws);
+                const Data vertices = GeometryVertices(
+                    GeometryKey(9, w, h, m.levels, false, false), count * VertexBytes, fresh);
+                if (fresh) {
+                    Etc1Vertices(w, h, m.levels, reinterpret_cast<float*>(vertices.cpu), draws);
+                }
+                const Etc1Target t = Etc1TargetFor(w, h, m.levels);
+                const auto size = list.size();
+                add(vertices, m.at * t.height, 0, t.width, t.height,
+                    [&](const GeometryDraw& d, SideDraw& sd) {
+                        SideTextureWords(0, 0x1f, 0, 2, d.view_rows, base + d.source, sd.tex);
+                    });
+                for (auto n = size; n < list.size(); n++) {
+                    list[n].raw64 = true;
+                }
+            } else if (narrow != 0) {
+                const ChainRender cr = ChainAt(w, h, m.levels, narrow);
+                constexpr u32 VertexBytes = SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4;
+                const Geometry& g = GeometryFor(
+                    GeometryKey(16, w, h, m.levels | src.bits << 4, false, false), VertexBytes,
+                    [&](float* v, Geometry& geometry) {
+                        return ChainVertices(cr, w, h, src.bits, v, geometry.draws);
+                    });
+                const auto size = list.size();
+                add(g, 0, m.at * (batch_stride / narrow), cr.stride, cr.rows,
+                    [&](const GeometryDraw& d, SideDraw& sd) {
+                        SideTextureWords(0, src.code, src.swizzle, 8, d.view_rows,
+                                         src.gpu + d.source, sd.tex, src.palette);
+                    });
+                for (auto n = size; n < list.size(); n++) {
+                    list[n].converted = true;
+                }
+            } else {
+                const ChainRender cr = ChainAt(w, h, m.levels, ChainBatchStride(w));
+                const u32 count = ChainVertices(cr, w, h, src.bits, nullptr, draws);
+                const Data vertices = GeometryVertices(
+                    GeometryKey(15, w, h, m.levels, false, false), count * VertexBytes, fresh);
+                if (fresh) {
+                    ChainVertices(cr, w, h, src.bits, reinterpret_cast<float*>(vertices.cpu),
+                                  draws);
+                }
+                const auto size = list.size();
+                add(vertices, 0, m.at, cr.stride, cr.rows,
+                    [&](const GeometryDraw& d, SideDraw& sd) {
+                        SideTextureWords(0, src.code, src.swizzle, 8, d.view_rows,
+                                         src.gpu + d.source, sd.tex, src.palette);
+                    });
+                for (auto n = size; n < list.size(); n++) {
+                    list[n].converted = true;
+                }
+            }
+        }
+        if (etc1) {
+            const u32 side = 32u << (k - BatchEtc1);
+            const u32 width = std::bit_ceil(b.used) * side;
+            SideRender({}, list, b.block.gpu, std::max(width, 32u), width, side, false, true,
+                       SGXD_RECIPE_PACK_F32F32_SWAPPED, true);
+        } else if (narrow != 0) {
+            SideRender({}, list, b.block.gpu, narrow, narrow, b.used * (batch_stride / narrow),
+                       false, false, pack);
+        } else {
+            SideRender({}, list, b.block.gpu, batch_stride, batch_stride, b.used, false, false,
+                       pack);
+        }
+    }
+
+    // The alpha: the gathered nibbles as P4 through (17n) << 24 | 0xffffff, its A a byte.
+    if (const UntileBatch& b = untile_batches[BatchAlpha]; b.block.cpu) {
+        if (!merge_palette.cpu) {
+            merge_palette = AllocTextureFixed(0x1000);
+            u32* const entries = reinterpret_cast<u32*>(merge_palette.cpu);
+            for (u32 n = 0; n < 16; n++) {
+                entries[n] = (n * 17) << 24 | 0xffffffu;
+            }
+        }
+        list.clear();
+        for (const UntileMember& m : untile_members) {
+            if (m.source.code != UntileEtc1A4) {
+                continue;
+            }
+            const u32 w = m.source.width, h = m.source.height;
+            const ChainRender cr = ChainAt(w, h, m.levels, AlphaBatchStride);
+            const u32 count = Etc1A4AlphaVertices(cr, w, h, m.levels, nullptr, draws);
+            bool fresh = false;
+            const Data vertices = GeometryVertices(GeometryKey(14, w, h, m.levels, true, false),
+                                                   count * VertexBytes, fresh);
+            if (fresh) {
+                Etc1A4AlphaVertices(cr, w, h, m.levels, reinterpret_cast<float*>(vertices.cpu),
+                                    draws);
+            }
+            const u32 gather = scratch.gpu + m.gather_row * G * 4;
+            add(vertices, 0, m.alpha_at, cr.stride, cr.rows,
+                [&](const GeometryDraw& d, SideDraw& sd) {
+                    SideTextureWords(3, 0x94, 0, d.view_width, d.view_rows, gather + d.source,
+                                     sd.tex, merge_palette.gpu);
+                });
+        }
+        SideRender({}, list, b.block.gpu, AlphaBatchStride, AlphaBatchStride, b.used, false,
+                   false, SGXD_RECIPE_PACK_U8_A);
+    }
+
+    // What no member took goes back, and the gather's scratch. Only side renders write these next,
+    // behind the renders above; the tiles a render stores past its last slot the next owner writes
+    // over.
+    for (u32 k = 0; k < UntileBatchKinds; k++) {
+        UntileBatch& b = untile_batches[k];
+        if (!b.block.cpu) {
+            continue;
+        }
+        const u32 unit = UnitBytes(k);
+        if (b.used < b.capacity) {
+            GiveTexture({b.block.cpu + b.used * unit, b.block.gpu + b.used * unit},
+                        (b.capacity - b.used) * unit);
+        }
+        b = UntileBatch{};
+    }
+    if (scratch.cpu) {
+        GiveTexture(scratch, scratch_bytes);
+    }
+    untile_members.clear();
+    gather_rows = 0;
+    gather_draws = 0;
+    flushing_untiles = false;
 }
 
 void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_x, u32 scale_y) {

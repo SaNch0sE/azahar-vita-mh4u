@@ -193,6 +193,33 @@ int sgxd_program_screen_pixel_pds(uint32_t kick0, const uint32_t tex[4], SgxdPds
     return textured_pixel_pds(kick0, tex, 2, 2, out);
 }
 
+// The texel's two words raw (FCONV 0) into pa0 and pa1, then the colour iterator into pa2-pa5.
+// A pixel task starts at a USE issue with USELASTISSUE, which the colour's DOUTI carries: with
+// texture issues alone the 3D never finishes. Issues fill the PAs in PDS order.
+int sgxd_program_raw64_pixel_pds(uint32_t kick0, const uint32_t tex[4], SgxdPdsProgram *out) {
+    Pds p;
+    memset(&p, 0, sizeof(p));
+    const unsigned kick = pds_pair(&p, 0, kick0,
+                                   DOUTU1_SDSOFT | DOUTU1_ITERATORSDEPENDENCY |
+                                       DOUTU1_TEXTUREDEPENDENCY);
+    pds_word(&p, 1, 0);   // DOUTU word 2
+    const unsigned issue = pds_word(&p, 1, BLIT_DOUTI_TEX);
+    const unsigned colour = pds_word(&p, 1, BLIT_DOUTI_COLOUR);
+    const unsigned quad = pds_quad(&p, tex);
+    pds_emit(&p, doutu(kick, 0));
+    pds_emit(&p, douti(issue, 1) | 1u << 6);   // TAGSIZE 1: two words
+    pds_emit(&p, doutt(quad, 0));
+    pds_emit(&p, douti(colour, 4));
+    pds_emit(&p, HALT);
+    return finish(&p, out);
+}
+
+unsigned sgxd_program_raw64_fragment(uint64_t words[2]) {
+    words[0] = USSE_PHAS_LAST;
+    words[1] = 0x3884054183000000ull;   // vmov.f32 o0.xy, pa0.xy (END)
+    return 2;
+}
+
 unsigned sgxd_program_merge_vertex(uint64_t words[4]) {
     words[0] = USSE_PHAS_LAST;
     words[1] = USSE_NOP;

@@ -47,6 +47,7 @@ void RendererSgxd::PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb
     }
     // No swap timing: PerfStats' swap counters are the emulation thread's.
     render_window.PresentGuestScreens(screens);
+    rasterizer.EndFrame();
 }
 
 void RendererSgxd::PollWindow() {

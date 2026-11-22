@@ -85,6 +85,15 @@ int sgxd_program_blit_pixel_pds(uint32_t doutu0, const uint32_t tex[4], SgxdPdsP
 unsigned sgxd_program_screen_fragment(uint64_t words[4]);
 int sgxd_program_screen_pixel_pds(uint32_t doutu0, const uint32_t tex[4], SgxdPdsProgram *out);
 
+// A 64-bit texel copied raw (azahar's ETC1 untile: an 8-byte block a pixel): the texture issued
+// with no conversion into pa0 and pa1, then the colour iterator (pa2-pa5), whose USELASTISSUE
+// starts the pixel task; sgxd_program_raw64_fragment moves both words to the pixel's output, for
+// a render with DOUBLE_PIXEL_PARTITIONS 1 into a 64-bit target.
+#define SGXD_PROGRAM_RAW64_PA 2u
+int sgxd_program_raw64_pixel_pds(uint32_t doutu0, const uint32_t tex[4], SgxdPdsProgram *out);
+// vmov.f32 o0.xy, pa0.xy (END).
+unsigned sgxd_program_raw64_fragment(uint64_t words[2]);
+
 // Two textures joined per pixel (azahar's ETC1A4 untile): the blit's vertex with a second
 // texture coordinate after the first, twelve words (the position, a colour, TC0, TC1;
 // OUTSELECTS VTXSIZE 12, TEXSIZE TC0 and TC1 two-dimensional), and a pixel primary that reads

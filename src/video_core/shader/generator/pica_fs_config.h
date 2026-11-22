@@ -163,6 +163,10 @@ struct TextureConfig {
         BitField<12, 3, Pica::TexturingRegs::FogMode> fog_mode;
         BitField<15, 1, u32> fog_flip;
         BitField<16, 1, u32> shadow_texture_orthographic;
+        // sgxd only: the units whose alpha is a texture of its own, set
+        // by the rasterizer after construction (an ETC1A4 texture split into compressed colour
+        // and A8 alpha, SgxdBackend::QueueUntile).
+        BitField<17, 3, u32> alpha_split;
         // sgxd only: the units whose texel is the pixel's own colour in the buffer the draw
         // writes, texel for pixel (RasterizerSgxd::OwnPixelUnits), set by the rasterizer: the
         // program reads the tile's colour (o0) for them and samples nothing.
