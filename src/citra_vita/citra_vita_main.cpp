@@ -33,6 +33,7 @@
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/error.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
@@ -2884,6 +2885,17 @@ StartError LoadAzaharNative(bool relaunched) {
         }
     }
     const SceUID module = taiLoadStartKernelModule(AzaharNativePath, 0, nullptr, 0);
+    if (module == static_cast<SceUID>(SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE)) {
+        // The kernel's own memory, which kernel plugins share, has no room for the module.
+        sceClibPrintf("[azahar] azaharnative.skprx not loaded: 0x%08x, kernel memory full\n",
+                      static_cast<u32>(module));
+        return [] {
+            return std::string{Tr("Your kernel plugins leave too little memory for Azahar. Remove "
+                                  "some lines under *KERNEL in your taiHEN config.txt "
+                                  "(ux0:tai/config.txt or ur0:tai/config.txt), then reboot your "
+                                  "console.")};
+        };
+    }
     if (module < 0) {
         return [module] {
             return TrFormat("{} could not be loaded ({:#010x}). Reinstall the vpk.",

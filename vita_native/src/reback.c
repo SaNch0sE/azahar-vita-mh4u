@@ -33,10 +33,8 @@ typedef struct RebackMoved {
     uint32_t old_pa;
     uint32_t old_attr;  // the app's page's, as azaharAdopt found them
 } RebackMoved;
-// REBACK_MAX_PAGES of them, sorted by new_pa: a kernel block made at the first azaharAdopt and
-// kept (128 KiB, not .bss).
+// REBACK_MAX_PAGES of them, sorted by new_pa.
 static RebackMoved *reback_moved;
-static SceUID reback_moved_uid = -1;
 static unsigned reback_moved_count;
 
 // A flipped page (azaharFlip): the app's address, its home (the page the GPU's mapping keeps,
@@ -49,8 +47,17 @@ typedef struct RebackFlipped {
     uint32_t version_pa;
     uint32_t version_attr;
 } RebackFlipped;
-static RebackFlipped reback_flipped[REBACK_MAX_FLIPPED];
+static RebackFlipped *reback_flipped;
 static unsigned reback_flipped_count;
+
+// Both tables in one block of the game's memory, made at a process's first azaharAdopt and freed
+// when the process that last adopted ends: map_range reads them without reback's lock, so
+// nothing frees them while that process can still call.
+#define REBACK_TABLES_SIZE                                                                         \
+    ((REBACK_MAX_PAGES * sizeof(RebackMoved) + REBACK_MAX_FLIPPED * sizeof(RebackFlipped) +       \
+      0xFFFu) & ~0xFFFu)
+static SceUID reback_tables_uid = -1;
+static SceUID reback_tables_pid = -1;
 
 static unsigned reback_flipped_find(uint32_t uva) {
     for (unsigned i = 0; i < reback_flipped_count; i++) {
@@ -354,20 +361,20 @@ int azaharAdopt(uint32_t user_va, uint32_t size) {
         ret = AZAHAR_ERR_STATE;
         goto out;
     }
-    if (reback_moved_uid < 0) {
-        reback_moved_uid =
-            ksceKernelAllocMemBlock("AzaharRebackMoved", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_RW,
-                                    (REBACK_MAX_PAGES * sizeof(RebackMoved) + 0xFFFu) & ~0xFFFu,
-                                    NULL);
-        if (reback_moved_uid < 0 ||
-            ksceKernelGetMemBlockBase(reback_moved_uid, (void **)&reback_moved) < 0) {
-            emit("  adopt: no block for the moved pages' table (%08x)\n",
-                 (uint32_t)reback_moved_uid);
-            reback_moved_uid = -1;
+    if (reback_tables_uid < 0) {
+        void *base = NULL;
+        const SceUID uid = game_block_alloc("AzaharReback", REBACK_TABLES_SIZE, &base);
+        if (uid < 0) {
+            emit("  adopt: no block for the moved and flipped pages' tables (%08x)\n",
+                 (uint32_t)uid);
             ret = AZAHAR_ERR_ALLOC;
             goto fail;
         }
+        reback_tables_uid = uid;
+        reback_moved = base;
+        reback_flipped = (RebackFlipped *)(reback_moved + REBACK_MAX_PAGES);
     }
+    reback_tables_pid = ksceKernelGetProcessId();
     if ((ret = alloc_block("azahar_host_l2", mbs * 0x400u < 0x1000u ? 0x1000u : mbs * 0x400u,
                            0x1000, &reback_l2_uid, &reback_l2, &reback_l2_pa)) != 0) {
         goto fail;
@@ -780,13 +787,20 @@ int azaharRebackRestore(void) {
 }
 
 // The owner process is ending: the kernel's level-1 entries go back before it frees the block.
+// The tables go with the process that last adopted.
 static void reback_on_proc_gone(SceUID pid) {
-    if (reback_mutex < 0 || pid != reback_owner) {
+    if (reback_mutex < 0 || (pid != reback_owner && pid != reback_tables_pid)) {
         return;
     }
     ksceKernelLockMutex(reback_mutex, 1, NULL);
     if (pid == reback_owner) {
         reback_restore_locked();
+    }
+    if (pid == reback_tables_pid) {
+        ksceKernelFreeMemBlock(reback_tables_uid);
+        reback_tables_uid = reback_tables_pid = -1;
+        reback_moved = NULL;
+        reback_flipped = NULL;
     }
     ksceKernelUnlockMutex(reback_mutex, 1);
 }

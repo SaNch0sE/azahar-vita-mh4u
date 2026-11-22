@@ -102,8 +102,8 @@ static inline uint32_t par_large_page(uint32_t va, uint32_t par, uint32_t base_p
 
 // ---------------------------------------------------------------------------- report
 
-// Streamed, so the upper-half scan cannot overflow a fixed report buffer.
-static char buf[16 * 1024];
+// A line or two: emit prints each line, and a log file open (log_open) has it written at once.
+static char buf[1024];
 static int buf_len;
 static SceUID out_fd = -1;
 static int total_written;
@@ -355,13 +355,13 @@ int module_stop(SceSize argc, const void *args) {
     caps_release();
     shellcdram_iftu_release();
     sgxd_unmap();
-    const SceUID blocks[] = {coresample_dbg_uid, reback_moved_uid};
+    const SceUID blocks[] = {coresample_dbg_uid, reback_tables_uid};
     for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
         if (blocks[i] >= 0) {
             ksceKernelFreeMemBlock(blocks[i]);
         }
     }
-    coresample_dbg_uid = reback_moved_uid = -1;
+    coresample_dbg_uid = reback_tables_uid = -1;
     const SceUID mutexes[] = {sgxd_mutex, reback_mutex, azahar_edit_mutex};
     for (unsigned i = 0; i < sizeof(mutexes) / sizeof(mutexes[0]); i++) {
         if (mutexes[i] >= 0) {

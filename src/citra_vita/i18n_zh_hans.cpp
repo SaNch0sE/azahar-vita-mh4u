@@ -731,6 +731,10 @@ constexpr std::array table{std::to_array<Translation>({
     {"wrong password", "密码错误"},
     {"You can turn this screen off in Settings > System > Startup notice.",
      "可在“设置 > 系统 > 启动提示”中关闭此画面。"},
+    {"Your kernel plugins leave too little memory for Azahar. Remove some lines under *KERNEL in "
+     "your taiHEN config.txt (ux0:tai/config.txt or ur0:tai/config.txt), then reboot your console.",
+     "内核插件占用的内存过多，Azahar 无法启动。请在 taiHEN 的 config.txt（ux0:tai/config.txt 或 "
+     "ur0:tai/config.txt）中删除 *KERNEL 下的部分插件行，然后重启主机。"},
     {"{} (hidden)", "{}（已隐藏）"},
     {"{} can't be checked: its file type carries no checksums.",
      "无法检查 {}：这种文件类型不带校验值。"},

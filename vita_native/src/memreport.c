@@ -72,10 +72,10 @@ int azaharMemReport(void) {
         ret = AZAHAR_ERR_RESOLVE;
         goto out;
     }
-    const SceUID vector_uid = ksceKernelAllocMemBlock("AzaharMemReport", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_RW,
-                                                      MEMREPORT_VECTOR_SIZE, NULL);
     SceUID *memreport_uids = NULL;
-    if (vector_uid < 0 || ksceKernelGetMemBlockBase(vector_uid, (void **)&memreport_uids) < 0) {
+    const SceUID vector_uid =
+        game_block_alloc("AzaharMemReport", MEMREPORT_VECTOR_SIZE, (void **)&memreport_uids);
+    if (vector_uid < 0) {
         ret = AZAHAR_ERR_ALLOC;
         goto out;
     }

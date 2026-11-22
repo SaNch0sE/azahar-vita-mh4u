@@ -194,8 +194,6 @@ int azaharStrayTest(uint32_t mode) {
 #define BUSERROR_COPY 0xEBB1F135u
 #define BUSERROR_MAX 0x3000u
 
-static uint8_t buserror_dump[BUSERROR_MAX];
-
 int azaharBusError(void *user_out, uint32_t size) {
     uint32_t state;
     ENTER_SYSCALL(state);
@@ -208,8 +206,15 @@ int azaharBusError(void *user_out, uint32_t size) {
         ret = AZAHAR_ERR_RESOLVE;
     } else {
         uint32_t (*const copy)(void *, uint32_t) = (uint32_t (*)(void *, uint32_t))fn;
-        const uint32_t got = copy(buserror_dump, size < BUSERROR_MAX ? size : BUSERROR_MAX);
-        ret = ksceKernelCopyToUser(user_out, buserror_dump, got) < 0 ? AZAHAR_ERR_ARG : (int)got;
+        void *dump = NULL;
+        const SceUID uid = game_block_alloc("AzaharBusError", BUSERROR_MAX, &dump);
+        if (uid < 0) {
+            ret = AZAHAR_ERR_ALLOC;
+        } else {
+            const uint32_t got = copy(dump, size < BUSERROR_MAX ? size : BUSERROR_MAX);
+            ret = ksceKernelCopyToUser(user_out, dump, got) < 0 ? AZAHAR_ERR_ARG : (int)got;
+            ksceKernelFreeMemBlock(uid);
+        }
     }
     EXIT_SYSCALL(state);
     return ret;

@@ -1123,6 +1123,25 @@ static int core2_command(uint32_t cmd, unsigned steps) {
     return ret;
 }
 
+// A kernel block in the game's memory, for what the module keeps only while an app uses it:
+// ScePhyMemPartKD holds the module's own segments and the system's kernel plugins, and has
+// little left. The uid, its base in *va; or the error, nothing allocated.
+static SceUID game_block_alloc(const char *name, SceSize size, void **va) {
+    const SceUID uid =
+        ksceKernelAllocMemBlock(name, SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_GAME_RW, size, NULL);
+    if (uid < 0) {
+        ksceKernelPrintf("[azaharnative] %s: %u KiB not allocated (0x%08x)\n", name,
+                         (unsigned)(size >> 10), (unsigned)uid);
+        return uid;
+    }
+    const int r = ksceKernelGetMemBlockBase(uid, va);
+    if (r < 0) {
+        ksceKernelFreeMemBlock(uid);
+        return r;
+    }
+    return uid;
+}
+
 // Physically contiguous kernel memory, its base and its physical address: what the table walker,
 // the GPU's MMU and the USB controller's DMA reach as base + offset. A *_PHYCONT_* memory type
 // only names the partition; its pages are contiguous only with ATTR_PHYCONT. Without it a page

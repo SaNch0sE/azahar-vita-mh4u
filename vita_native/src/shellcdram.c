@@ -35,12 +35,19 @@ static uint32_t *shellcdram_shell_l2;
 static uintptr_t shellcdram_shell_l2_pa;
 // While the shell's window is on our tables (shellcdram_shell_l2, its live level-2 tables): each
 // of its pages' descriptor onto the range and onto the copy, after the live tables in the same
-// block, and the range's page it shows (SHELLCDRAM_NO_PAGE for none), for shellcdram_move.
+// block; and, in a block of the game's memory, the range's page it shows (SHELLCDRAM_NO_PAGE
+// for none) and shellcdram_move's page buffers.
 #define SHELLCDRAM_PAGES (SHELLCDRAM_SIZE >> 12)
 #define SHELLCDRAM_SLOTS (SHELLCDRAM_MBS * 256u)
 #define SHELLCDRAM_NO_PAGE 0xFFFFu
 static uint32_t *shellcdram_shell_on_range, *shellcdram_shell_on_copy;
-static uint16_t shellcdram_shell_page[SHELLCDRAM_SLOTS];
+typedef struct ShellcdramWork {
+    uint16_t page[SHELLCDRAM_SLOTS];
+    uint32_t snap[1024], keep[1024], now_words[1024];
+    uint32_t done[SHELLCDRAM_PAGES / 32];
+} ShellcdramWork;
+static SceUID shellcdram_work_uid = -1;
+static ShellcdramWork *shellcdram_work;
 
 // A 1 MiB section of `pa` with the attributes of a level-2 descriptor `d` under the level-1
 // page-table entry `table` (ARMv7 short descriptors: its domain and NS come from the table).
@@ -80,6 +87,11 @@ static void shellcdram_shell_restore(void) {
     }
     shellcdram_shell_l2 = NULL;
     shellcdram_shell_on_range = shellcdram_shell_on_copy = NULL;
+    if (shellcdram_work_uid >= 0) {
+        ksceKernelFreeMemBlock(shellcdram_work_uid);
+        shellcdram_work_uid = -1;
+    }
+    shellcdram_work = NULL;
     shellcdram_shell_pid = -1;
 }
 
@@ -96,8 +108,15 @@ static int shellcdram_shell_redirect(const uint8_t *save, int on_copy) {
     }
     shellcdram_shell_on_range = shellcdram_shell_l2 + SHELLCDRAM_SLOTS;
     shellcdram_shell_on_copy = shellcdram_shell_l2 + 2u * SHELLCDRAM_SLOTS;
+    const SceUID work_uid = game_block_alloc(
+        "AzaharShellWork", (sizeof(ShellcdramWork) + 0xFFFu) & ~0xFFFu, (void **)&shellcdram_work);
+    if (work_uid < 0) {
+        shellcdram_work = NULL;
+        return work_uid;
+    }
+    shellcdram_work_uid = work_uid;
     for (uint32_t slot = 0; slot < SHELLCDRAM_SLOTS; slot++) {
-        shellcdram_shell_page[slot] = SHELLCDRAM_NO_PAGE;
+        shellcdram_work->page[slot] = SHELLCDRAM_NO_PAGE;
     }
     if (pid < 0 || ksceKernelProcessGetContext(pid, &ctx) < 0 || !ctx) {
         SGXD_LOG("shell CDRAM: no shell context (pid %08x)\n", (uint32_t)pid);
@@ -144,7 +163,7 @@ static int shellcdram_shell_redirect(const uint8_t *save, int on_copy) {
                     uintptr_t copy_pa = 0;
                     ksceKernelVAtoPA(save + (pa - SHELLCDRAM_PA), &copy_pa);
                     on_copy_d = reback_host_page((uint32_t)copy_pa, copy_attr) | apx;
-                    shellcdram_shell_page[mb * 256u + i] = (uint16_t)((pa - SHELLCDRAM_PA) >> 12);
+                    shellcdram_work->page[mb * 256u + i] = (uint16_t)((pa - SHELLCDRAM_PA) >> 12);
                     moved++;
                 } else {
                     kept++;
@@ -186,13 +205,14 @@ static void shellcdram_move(int to_copy) {
     uint8_t *alias = NULL, *save = NULL;
     ksceKernelGetMemBlockBase(shellcdram_alias, (void **)&alias);
     ksceKernelGetMemBlockBase(shellcdram_save, (void **)&save);
-    static uint32_t snap[1024], keep[1024], now_words[1024], done[SHELLCDRAM_PAGES / 32];
+    uint32_t *const snap = shellcdram_work->snap, *const keep = shellcdram_work->keep;
+    uint32_t *const now_words = shellcdram_work->now_words, *const done = shellcdram_work->done;
     for (uint32_t i = 0; i < SHELLCDRAM_PAGES / 32; i++) {
         done[i] = 0;
     }
     uint32_t carried = 0;
     for (uint32_t slot = 0; slot < SHELLCDRAM_SLOTS; slot++) {
-        const uint32_t page = shellcdram_shell_page[slot];
+        const uint32_t page = shellcdram_work->page[slot];
         if (page == SHELLCDRAM_NO_PAGE) {
             continue;
         }

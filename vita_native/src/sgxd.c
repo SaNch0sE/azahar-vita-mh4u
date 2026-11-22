@@ -191,10 +191,13 @@ static SgxdOp sgxd_ops[SGXD_MAX_OPS];
 static SceUID sgxd_wake_flag = -1;
 static uint32_t sgxd_wake_bits;
 static SceKernelSpinlock sgxd_isr_lock;
-static uint32_t sgxd_dump_words[SGXD_DUMP_WORDS];
-// The dump sgxdSubmit took when a poll last timed out (sgxdFaultDump); [0] 0 when none.
-static uint32_t sgxd_fault_words[SGXD_DUMP_WORDS];
-static uint32_t sgxd_read_words[SGXD_MAX_READ_REGS];
+// sgxdDump's words, then the dump sgxdSubmit took when a poll last timed out (sgxdFaultDump; [0]
+// 0 when none): a block of the game's memory while a process owns the GPU.
+#define SGXD_DUMPS_SIZE ((2u * SGXD_DUMP_WORDS * 4u + 0xFFFu) & ~0xFFFu)
+static SceUID sgxd_dumps_uid = -1;
+static uint32_t *sgxd_dump_words, *sgxd_fault_words;
+// sgxdReadRegs' words, read and copied out this many at a time.
+#define SGXD_READ_CHUNK 32u
 
 static uint32_t sgxd_fingerprint(const uint8_t *data, unsigned size) {
     uint32_t hash = 2166136261u;
@@ -330,6 +333,27 @@ static void sgxd_unmap(void) {
     }
     sgxd_reg_uid = -1;
     sgxd_reg = NULL;
+}
+
+static int sgxd_dumps_alloc(void) {
+    void *base = NULL;
+    const SceUID uid = game_block_alloc("SceSgxdDumps", SGXD_DUMPS_SIZE, &base);
+    if (uid < 0) {
+        return uid;
+    }
+    sgxd_dumps_uid = uid;
+    sgxd_dump_words = base;
+    sgxd_fault_words = sgxd_dump_words + SGXD_DUMP_WORDS;
+    sgxd_fault_words[0] = 0;
+    return 0;
+}
+
+static void sgxd_dumps_free(void) {
+    if (sgxd_dumps_uid >= 0) {
+        ksceKernelFreeMemBlock(sgxd_dumps_uid);
+    }
+    sgxd_dumps_uid = -1;
+    sgxd_dump_words = sgxd_fault_words = NULL;
 }
 
 // What SceGpu's SGXStart writes after the power-up and before its first read: the
@@ -1005,7 +1029,11 @@ int sgxdTake(SgxdInfo *user_info) {
         ret = pid == sgxd_owner ? AZAHAR_ERR_STATE : SGXD_ERR_OWNER;
     } else {
         const int again = sgxd_state == SGXD_LOST;
-        ret = sgxd_take_locked(&info);
+        // A take again after a suspend keeps the first take's dumps.
+        ret = again ? 0 : sgxd_dumps_alloc();
+        if (ret == 0) {
+            ret = sgxd_take_locked(&info);
+        }
         if (ret == 0 && again && (ret = shellcdram_resume()) < 0) {
             // The shell's CDRAM not the app's again: the GPU goes back, still lost.
             sgxd_hw_down();
@@ -1023,6 +1051,7 @@ int sgxdTake(SgxdInfo *user_info) {
             // Still lost: the app may try again.
         } else {
             sgxd_mmu_free();
+            sgxd_dumps_free();
             sgxd_state = SGXD_NONE;
             sgxd_owner = -1;
         }
@@ -1068,6 +1097,7 @@ static int sgxd_release_locked(void) {
     const int was = sgxd_state;
     const uint32_t pages = sgxd_mmu_pages;
     sgxd_mmu_free();
+    sgxd_dumps_free();
     sgxd_state = SGXD_NONE;
     sgxd_owner = -1;
     if (was != SGXD_OWNED) {
@@ -1590,11 +1620,17 @@ int sgxdReadRegs(uint32_t reg, uint32_t count, uint32_t *user_words) {
                count > (SGXD_OP_REG_LIMIT - reg) / 4u) {
         ret = AZAHAR_ERR_ARG;
     } else {
-        for (uint32_t i = 0; i < count; i++) {
-            sgxd_read_words[i] = sgxd_read(reg + i * 4u);
+        ret = (int)count;
+        uint32_t words[SGXD_READ_CHUNK];
+        for (uint32_t at = 0; at < count && ret > 0; at += SGXD_READ_CHUNK) {
+            const uint32_t n = count - at < SGXD_READ_CHUNK ? count - at : SGXD_READ_CHUNK;
+            for (uint32_t i = 0; i < n; i++) {
+                words[i] = sgxd_read(reg + (at + i) * 4u);
+            }
+            if (ksceKernelCopyToUser(user_words + at, words, n * 4u) < 0) {
+                ret = AZAHAR_ERR_ARG;
+            }
         }
-        ret = ksceKernelCopyToUser(user_words, sgxd_read_words, count * 4u) < 0 ? AZAHAR_ERR_ARG
-                                                                               : (int)count;
     }
     sgxd_leave();
 out:
