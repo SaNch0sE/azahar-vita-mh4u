@@ -745,7 +745,6 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
     Usse::sched_probe.lut_reads = SgxdFlagValue("fslut");
     Usse::sched_probe.lut_kind = SgxdFlagValue("fslutkind");
     Usse::sched_probe.nosched = static_cast<int>(SgxdFlagValue("fsnosched"));
-    Usse::sched_probe.u8_colour = SgxdFlag("u8colour");
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
     }
@@ -3159,6 +3158,27 @@ bool RasterizerSgxd::SplitAlphaIn(const Pica::RegsInternal& regs, u32 unit) {
     return t.enabled && t.format == Pica::TexturingRegs::TextureFormat::ETC1A4 &&
            !(unit == 0 && t.config.type == Pica::TexturingRegs::TextureConfig::TextureCube) &&
            t.config.width <= UntileGeometry::Etc1A4MaxWidth;
+}
+
+bool RasterizerSgxd::RawBytesIn(const Pica::RegsInternal& regs, u32 unit) {
+    using TF = Pica::TexturingRegs::TextureFormat;
+    const auto t = regs.texturing.GetTextures()[unit];
+    if (!t.enabled) {
+        return false;
+    }
+    // Every format the untile writes as U8U8U8U8: not ETC1 and ETC1A4, the one-channel ones, or RG8.
+    switch (t.format) {
+    case TF::RGBA8:
+    case TF::RGB8:
+    case TF::RGB5A1:
+    case TF::RGB565:
+    case TF::RGBA4:
+    case TF::IA8:
+    case TF::IA4:
+        return true;
+    default:
+        return false;
+    }
 }
 
 void RasterizerSgxd::AlphaTextureWords(const Texture& tex, const u32 colour[4], u32 words[4]) {
@@ -5603,6 +5623,11 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInterna
     }
     config.texture.alpha_split.Assign(alpha_split);
     config.texture.own_pixel.Assign(own_pixel);
+    u32 raw_u8 = 0;
+    for (u32 unit = 0; unit < 3; unit++) {
+        raw_u8 |= RawBytesIn(regs, unit) ? 1u << unit : 0u;
+    }
+    config.texture.raw_u8.Assign(raw_u8);
     // A shadow unit 0 that is off reads zeros, as the software renderer leaves its colour: the null
     // texture, read as a plain 2D unit's.
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
@@ -9015,6 +9040,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                 std::memcpy(issues[i].tex, unit_words[issue.unit], sizeof(issues[i].tex));
             }
             issues[i].coord = issue.coord;
+            if (issue.raw) {
+                issues[i].raw = 1u;
+            }
+            static_assert(SGXD_ISSUE_BEFORE_ITERATORS == Usse::IssueBeforeInputs);
             issues[i].after = issue.after_input;
             issues[i].f16 = issue.f16 ? 1u : 0u;
         }

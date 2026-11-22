@@ -714,6 +714,9 @@ private:
     /// Whether the unit holds an ETC1A4 texture split into compressed colour and an A8 alpha texture.
     bool SplitAlpha(u32 unit) const;
     static bool SplitAlphaIn(const Pica::RegsInternal& regs, u32 unit);
+    /// Whether the unit's texture is stored as four bytes in channel order, R lowest (U8U8U8U8,
+    /// swizzle 0): the U8 combiners read its stored word.
+    static bool RawBytesIn(const Pica::RegsInternal& regs, u32 unit);
     /// The alpha texture's words of a split unit from its colour's, over its A8 chain (swizzle R000).
     static void AlphaTextureWords(const Texture& tex, const u32 colour[4], u32 words[4]);
     /// The GPU address of a fixed palette for a 4-bit format (0 for none), written at the first use.

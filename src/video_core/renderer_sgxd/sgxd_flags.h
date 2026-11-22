@@ -78,8 +78,6 @@ namespace SgxdRenderer {
  *             and pixels sent on to be shaded, 3 the ISP's parameter fetch) around the same
  *             renders, each core's eight counters; gpuperfsum=MASK: those counters'
  *             SUM_MUX bits set
- *   u8colour  a probe: the U8 combiners read the vertex colour's bytes from a second,
- *             fixed-point iterator of it (what that iterator delivers; a pack fewer)
  *   fsonly=N  fswhite and fscut on the program whose key's low 32 bits are N alone
  *             (drawkeys logs each draw's fs key; the word repeated names more)
  *   fscut=N   a single-phase fragment program cut to its first N instructions, then the white

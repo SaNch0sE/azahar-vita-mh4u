@@ -179,6 +179,10 @@ struct TextureConfig {
         // writes, texel for pixel (RasterizerSgxd::OwnPixelUnits), set by the rasterizer: the
         // program reads the tile's colour (o0) for them and samples nothing.
         BitField<26, 3, u32> own_pixel;
+        // sgxd only: the units whose texture is stored as four bytes in their channels' order
+        // (R the lowest, alpha its own), set by the rasterizer (RasterizerSgxd::RawBytesIn):
+        // the U8 combiners take the texel's stored word (FCONV raw) for them.
+        BitField<29, 3, u32> raw_u8;
     };
     std::array<TextureBorder, 3> texture_border_color{};
     std::array<TevStageConfigRaw, 6> tev_stages{};

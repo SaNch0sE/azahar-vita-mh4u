@@ -81,8 +81,9 @@ inline uint8_t VaryingWords(const Varying& v) {
 
 /// A texture read the pixel PDS program issues before the program starts (a non-dependent
 /// read): its own DOUTI (TEXISSUE the coordinate set, no USE issue) and DOUTT of the unit's
-/// state words, after the DOUTI of inputs[after_input]. The texel lands as four F32 words at
-/// `pa` (FCONV F32): issues fill the PAs in PDS order (docs/sgxd/pds.md).
+/// state words, after the DOUTI of inputs[after_input] (IssueBeforeInputs: ahead of every
+/// input, as Sony's programs that read a texture and iterate nothing). The texel lands as four
+/// F32 words at `pa` (FCONV F32): issues fill the PAs in PDS order (docs/sgxd/pds.md).
 struct TextureIssue {
     uint8_t unit;        ///< the PICA texture unit whose state words the DOUTT carries
     uint8_t coord;       ///< TEXISSUE: the coordinate set, TCn
@@ -97,7 +98,16 @@ struct TextureIssue {
     /// The unit's split alpha texture (RasterizerSgxd::AlphaTextureWords, A8 with its byte in
     /// .w), read at the unit's coordinate in the texel's form, f16 or F32.
     bool alpha = false;
+    /// The texel's stored word (FCONV raw, one word, filtered bytewise), for the U8 combiners: a
+    /// unit whose texture keeps its four bytes in their channels' order (FSConfig raw_u8).
+    bool raw = false;
+    /// The procedural texture's table (RasterizerSgxd::ProcTexTableWords), not a unit: the texture
+    /// as a function of u alone, read at its coordinate set in the texel's form, f16 or F32.
+    bool proctex = false;
 };
+/// TextureIssue::after_input of an issue ahead of every input (sgxd_program's
+/// SGXD_ISSUE_BEFORE_ITERATORS).
+inline constexpr uint8_t IssueBeforeInputs = 0xff;
 inline constexpr uint8_t IssueTexelWords = 4;
 /// The issues a pixel PDS program takes (sgxd_program_pica_pixel_pds).
 inline constexpr uint32_t MaxTextureIssues = 7;

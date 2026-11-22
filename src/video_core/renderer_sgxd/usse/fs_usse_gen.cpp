@@ -446,6 +446,12 @@ private:
     /// each argument a U8 stage reads, the sources as ColorSource and AlphaSource give them.
     template <typename F>
     void ForEachU8Arg(F&& f) const;
+    bool PrimaryLaneMoved() const;
+    /// A texture issue's place in PDS order: after the last input so far, or before them all.
+    uint8_t IssueAfter() const {
+        return program.inputs.empty() ? IssueBeforeInputs
+                                      : static_cast<uint8_t>(program.inputs.size() - 1);
+    }
     /// Whether U8Inputs packs `source` (BroadcastInput's inputs): absent, it reads as zero.
     bool U8InputPresent(Source source) const;
     /// Channel `lane` of a packed input in every byte, for the channel-moving modifiers: the
@@ -569,7 +575,7 @@ private:
     FSConfig config;
     Ir::Builder e; ///< the program, in virtual quads; usse_ir places them
     bool u8_tev = false;             ///< the U8 combiners (U8TevSupported)
-    int colour_u8_pa = -1;           ///< sgxd_flags u8colour: the colour's bytes' register
+    int colour_u8_pa = -1;           ///< the vertex colour's bytes' register (PlanInputs)
     /// The U8 combiners read a unit's texel as four F16, packed to U8 from there: not a unit
     /// whose split alpha is a dependent read or that clamps to its border colour (U8Inputs
     /// would merge that alpha into the border's), or that the lighting reads as its shadow or
@@ -586,12 +592,26 @@ private:
                !(uses_lighting && lighting.bump_mode != LightingRegs::LightingBumpMode::None &&
                  lighting.bump_selector == unit);
     }
+    /// An issued unit the U8 combiners read as its texture's stored bytes (FSConfig raw_u8): one
+    /// register, no pack. Not a split unit (its alpha is merged from the F16 alpha) nor one
+    /// clamping to its border colour (an F16 colour moves in).
+    bool TexelRaw(u32 unit) const {
+        const auto& tex = config.texture;
+        const auto& border = tex.texture_border_color[unit];
+        return TexelF16(unit) && unit_issued[unit] && (tex.raw_u8 >> unit & 1) &&
+               !(tex.alpha_split >> unit & 1) && !border.enable_s && !border.enable_t;
+    }
+    std::array<bool, 3> texel_raw{}; ///< TexelRaw's units, issued after every input (PlanInputs)
     /// A split unit whose alpha texture the PDS reads too (TextureIssue::alpha), into alpha_loc.
     bool AlphaIssued(u32 unit) const {
         return (config.texture.alpha_split >> unit & 1) && unit_issued[unit];
     }
     std::array<Reg, 6> u8_out{};     ///< each stage's output, U8
     Reg u8_prev = Reg::V(TmpU8Zero); ///< the combiner output so far, U8
+    /// White (0xffffffff) and AddSigned's half (U8Inputs): their literal words themselves, or
+    /// their copies where a SOP cannot name the literal.
+    Reg u8_white = Reg::V(TmpU8White);
+    Reg u8_half = Reg::V(TmpU8Half);
     /// The lighting's sums packed to TmpU8Diffuse and TmpU8Specular where Lighting ends, not by
     /// U8Inputs.
     bool u8_lighting_packed = false;
@@ -935,15 +955,17 @@ void FragmentEmitter::PlanInputs() {
     fog_issued = uses_fog && u8_tev;
     lut_used = uses_fog && !fog_issued;
 
-    // pa0-3 is the vertex colour. The quaternions and the view arrive as psp2cgc's `half4`
-    // varyings (two lanes a register; the GPU User's Guide's fragment input advice), read once
-    // into an internal register with pack.f32.f16 (LoadVec4). The colour, the position and the
-    // texture coordinates stay F32: an F16 colour moved 1% of a game's grid frame by up to 9/255
-    // after the byte rounding, and depth and a repeating texture's
-    // coordinates need the bits. The four-wide inputs follow, then the pairs, then the one
-    // float3 (which need not be followed by anything pair-aligned).
-    program.inputs.push_back({FragmentInput::Color0, 4});
-    uint8_t pa = 4;
+    // The U8 combiners read the vertex colour as the iterator's bytes: one register after the
+    // other inputs, no pack. Not where a stage moves one of its channels (U8Inputs packs that
+    // from the F32 lanes); unread, the colour is not iterated.
+    const bool colour_u8 = u8_tev && StageReads(Source::PrimaryColor) && !PrimaryLaneMoved();
+    // Otherwise pa0-3 is the vertex colour; the quaternions and the view arrive as half4. The
+    // colour, position and coordinates stay F32: F16 is too coarse for byte rounding and depth.
+    uint8_t pa = 0;
+    if (!u8_tev || (StageReads(Source::PrimaryColor) && !colour_u8)) {
+        program.inputs.push_back({FragmentInput::Color0, 4});
+        pa = 4;
+    }
     if (uses_scissor || (uses_fog && !fog_issued && !w_buffered) || shadow_write) {
         program.inputs.push_back({FragmentInput::Position, 4});
         position_pa = pa;
@@ -988,16 +1010,18 @@ void FragmentEmitter::PlanInputs() {
             pa += 2;
         }
     }
-    // The texels follow the iterated inputs so far, in PDS order, pair-aligned.
+    // The texels follow the iterated inputs so far, in PDS order, pair-aligned; a raw one (a
+    // word) after every input instead, so nothing pair-aligned follows it.
     for (u32 unit = 0; unit < 3; unit++) {
-        if (!unit_issued[unit]) {
+        texel_raw[unit] = TexelRaw(unit);
+        if (!unit_issued[unit] || texel_raw[unit]) {
             continue;
         }
         const bool f16 = TexelF16(unit);
         texel_loc[unit] = {Bank::PrimAttr, pa, f16};
         program.issues.push_back({static_cast<uint8_t>(unit),
                                   static_cast<uint8_t>(unit_coord[unit]), pa,
-                                  static_cast<uint8_t>(program.inputs.size() - 1), f16});
+                                  IssueAfter(), f16});
         pa += f16 ? IssueTexelWordsF16 : IssueTexelWords;
         if (AlphaIssued(unit)) {
             // The split alpha's A8 texture at the same coordinate, its byte in .w, in the
@@ -1005,7 +1029,7 @@ void FragmentEmitter::PlanInputs() {
             alpha_loc[unit] = {Bank::PrimAttr, pa, f16};
             program.issues.push_back(
                 {static_cast<uint8_t>(unit), static_cast<uint8_t>(unit_coord[unit]), pa,
-                 static_cast<uint8_t>(program.inputs.size() - 1), f16, false, true});
+                 IssueAfter(), f16, false, true});
             pa += f16 ? IssueTexelWordsF16 : IssueTexelWords;
         }
     }
@@ -1037,18 +1061,28 @@ void FragmentEmitter::PlanInputs() {
         fog_coord_pa = pa;
         pa += 2;
     }
-    if (sched_probe.u8_colour && u8_tev && StageReads(Source::PrimaryColor)) {
-        // sgxd_flags u8colour (a probe): the colour again, as the iterator's bytes.
+    if (colour_u8) {
+        // The colour's four bytes (DOUTI without the colour's float bit).
         program.inputs.push_back({FragmentInput::Color0, 4, false, true});
         colour_u8_pa = pa;
         pa += 1;
+    }
+    for (u32 unit = 0; unit < 3; unit++) {
+        if (texel_raw[unit]) {
+            texel_loc[unit] = {Bank::PrimAttr, pa, false};
+            TextureIssue issue{static_cast<uint8_t>(unit), static_cast<uint8_t>(unit_coord[unit]),
+                               pa, IssueAfter()};
+            issue.raw = true;
+            program.issues.push_back(issue);
+            pa += IssueTexelWordsRaw;
+        }
     }
     if (fog_issued) {
         // The fog factor's word, after every input: one register, so nothing pair-aligned
         // follows it either.
         fog_pa = pa;
         program.issues.push_back(
-            {0, 3, pa, static_cast<uint8_t>(program.inputs.size() - 1), false, true});
+            {0, 3, pa, IssueAfter(), false, true});
         pa += IssueTexelWordsRaw;
     }
     // One kill per program, as the compiler has it: with both tests on, the scissor
@@ -3841,6 +3875,15 @@ void FragmentEmitter::ForEachU8Arg(F&& f) const {
     }
 }
 
+bool FragmentEmitter::PrimaryLaneMoved() const {
+    bool moved = false;
+    ForEachU8Arg([&](u32, Source csrc, ColorModifier cmod, Source asrc, AlphaModifier amod) {
+        moved = moved || (csrc == Source::PrimaryColor && MovedLane(cmod) >= 0) ||
+                (asrc == Source::PrimaryColor && MovedLane(amod) >= 0);
+    });
+    return moved;
+}
+
 bool FragmentEmitter::U8TevSupported() const {
     // Every operation but Dot3. The modifiers: the colour itself, its alpha, or either
     // complemented; the alpha itself or complemented; and a colour channel (SourceRed, Green,
@@ -3933,12 +3976,20 @@ void FragmentEmitter::U8Inputs(uint32_t parts) {
         return early_alpha && (early_units >> unit & 1) ? first : second;
     };
     if (first) {
-        // White and AddSigned's half from their literal words through a VBW, so no SOP reads a
-        // secondary attribute (the colour format control's C10 reading of a high register
-        // number is not measured); zero from white.
-        e.Bitwise(BwOp::Or, Reg::V(TmpU8White),
-                  IOp::R(Reg::Sa(static_cast<uint8_t>(LitSa(LitU8White)))), IOp::Imm(0));
-        e.Bitwise(BwOp::And, Reg::V(TmpU8Zero), IOp::R(Reg::V(TmpU8White)), IOp::Imm(0));
+        // White and AddSigned's half: the literal words themselves, as the SOPs read the
+        // constant colours; copied through a VBW only past register 63, whose number's top bit
+        // selects the colour format control's C10 reading (SopOperand). Zero from white.
+        const auto literal = [&](uint8_t lit, uint8_t tmp) {
+            const uint32_t sa = LitSa(lit);
+            if (sa < 64) {
+                return Reg::Sa(static_cast<uint8_t>(sa));
+            }
+            e.Bitwise(BwOp::Or, Reg::V(tmp), IOp::R(Reg::Sa(static_cast<uint8_t>(sa))),
+                      IOp::Imm(0));
+            return Reg::V(tmp);
+        };
+        u8_white = literal(LitU8White, TmpU8White);
+        e.Bitwise(BwOp::And, Reg::V(TmpU8Zero), IOp::R(u8_white), IOp::Imm(0));
         bool half = false;
         for (u32 k = 0; k < config.texture.tev_stages.size(); k++) {
             const TevStageConfig stage = config.texture.tev_stages[k];
@@ -3947,8 +3998,7 @@ void FragmentEmitter::U8Inputs(uint32_t parts) {
                                                       stage.alpha_op == Operation::AddSigned));
         }
         if (half) {
-            e.Bitwise(BwOp::Or, Reg::V(TmpU8Half),
-                      IOp::R(Reg::Sa(static_cast<uint8_t>(LitSa(LitU8Half)))), IOp::Imm(0));
+            u8_half = literal(LitU8Half, TmpU8Half);
         }
         // The inputs, packed to nearest as the F32 path's byte rounding has them (the vertex
         // colour); the texels and the lighting's colours are rounded here, where the F32 path
@@ -3968,8 +4018,9 @@ void FragmentEmitter::U8Inputs(uint32_t parts) {
             e.Sop2(Reg::V(static_cast<uint8_t>(TmpU8Tex + unit)), Reg::O(0), Reg::O(0), s);
             continue;
         }
-        // A unit only the lighting reads (the shadow, a bump map) has no stage to pack for.
-        if (!unit_used[unit] ||
+        // A unit only the lighting reads (the shadow, a bump map) has no stage to pack for; a
+        // raw one's texel is its bytes already (U8Source).
+        if (!unit_used[unit] || texel_raw[unit] ||
             !StageReads(static_cast<Source>(static_cast<u32>(Source::Texture0) + unit))) {
             continue;
         }
@@ -4051,8 +4102,11 @@ void FragmentEmitter::U8Inputs(uint32_t parts) {
             break;
         default: {
             // The colour texel's lanes: a split alpha is not a colour channel.
-            const Vec4Loc texel = texel_loc[input - BroadcastInput(Source::Texture0)];
-            if (texel.f16) {
+            const u32 unit = static_cast<u32>(input - BroadcastInput(Source::Texture0));
+            const Vec4Loc texel = texel_loc[unit];
+            if (texel_raw[unit]) {
+                U8LaneBroadcast(Reg::Pa(texel.base), lane, dst);
+            } else if (texel.f16) {
                 e.PackU8F16(dst, texel.Pair(0), sel);
             } else {
                 e.PackU8(dst, texel.Pair(0), texel.Pair(1), sel);
@@ -4120,6 +4174,9 @@ Reg FragmentEmitter::U8Source(Source source, u32 stage_index, bool alpha) const 
     case Source::Texture1:
     case Source::Texture2: {
         const u32 unit = static_cast<u32>(source) - static_cast<u32>(Source::Texture0);
+        if (texel_raw[unit]) {
+            return Reg::Pa(texel_loc[unit].base);
+        }
         return unit_used[unit] || unit_own[unit] ? Reg::V(static_cast<uint8_t>(TmpU8Tex + unit))
                                                  : Reg::V(TmpU8Zero);
     }
@@ -4152,9 +4209,8 @@ Reg FragmentEmitter::U8Arg(uint8_t k, u32 stage_index, Source csrc, ColorModifie
     // only its complement.
     const int clane = MovedLane(cmod);
     const int alane = MovedLane(amod);
-    // Lanes no operation reads take the other's register as it is (an unread SA alpha takes
-    // white's, which a SOP3's source 0 can name without a copy).
-    Reg c = Reg::V(TmpU8White), a = Reg::V(TmpU8White);
+    // Lanes no operation reads take the other's register as it is.
+    Reg c = u8_white, a = u8_white;
     u32 cm = 0, am = 0;
     // A moved channel U8Inputs did not broadcast: made here from the source's colour.
     const auto lazy = [&](Source src) {
@@ -4187,20 +4243,34 @@ Reg FragmentEmitter::U8Arg(uint8_t k, u32 stage_index, Source csrc, ColorModifie
         c = a;
     }
     if (!need_alpha) {
-        a = c.bank == Bank::SecAttr ? Reg::V(TmpU8White) : c;
+        a = c;
     }
-    if (cm == 0 && am == 0 && (!need_alpha || (c.bank == a.bank && c.n == a.n))) {
+    const bool one = c.bank == a.bank && c.n == a.n;
+    if (cm == 0 && am == 0 && one) {
         return c;
     }
-    // One SOP3 over white: colour = the colour source's colour or alpha, complemented or not,
-    // times one; alpha = the alpha source's alpha (source 0), complemented or not.
+    // One word over white: colour = the colour source's colour or alpha, complemented or not, times
+    // one; alpha = the alpha source's alpha, complemented or not. A SOP3's source 0 is no secondary
+    // attribute (U8Src0 copies one): the alpha's source goes there, or else the colour's, its alpha
+    // then from source 2; one secondary attribute for both takes a SOP2, which names it as source
+    // 2.
     SopCtl s;
-    s.csel1 = (cm & 2) ? 7 : 6; // src2 alpha : src2
     s.cmod1 = (cm & 1) != 0;
-    s.asel1 = 1; // src0 alpha
     s.amod1 = (am & 1) != 0;
     const Reg dst = Reg::V(static_cast<uint8_t>(TmpU8Arg + k));
-    e.Sop3(dst, U8Src0(a), Reg::V(TmpU8White), c, s);
+    if (one && c.bank == Bank::SecAttr) {
+        s.csel1 = (cm & 2) ? 4 : 2; // src2 alpha : src2
+        s.asel1 = 2;                // src2 alpha
+        e.Sop2(dst, u8_white, c, s);
+    } else if (a.bank != Bank::SecAttr || c.bank == Bank::SecAttr) {
+        s.csel1 = (cm & 2) ? 7 : 6; // src2 alpha : src2
+        s.asel1 = 1;                // src0 alpha
+        e.Sop3(dst, U8Src0(a), u8_white, c, s);
+    } else {
+        s.csel1 = (cm & 2) ? 5 : 4; // src0 alpha : src0
+        s.asel1 = 3;                // src2 alpha
+        e.Sop3(dst, c, u8_white, a, s);
+    }
     return dst;
 }
 
@@ -4302,7 +4372,7 @@ void FragmentEmitter::U8Op(Operation op, Reg dst, const std::array<Reg, 3>& args
     case Operation::AddSigned: {
         // a + b - 127 (the F32 path's 0.5, rounded), clamped: p = max(a - h, 0), q = max(h - a,
         // 0), one of them zero; the result is max(min(p + b, 255) - q, 0).
-        const Reg h = Reg::V(TmpU8Half);
+        const Reg h = u8_half;
         e.Sop2(scratch, a, h, one_plus_one(1));
         e.Sop2(dst, h, a, one_plus_one(1));
         e.Sop2(scratch, scratch, b, one_plus_one(0));
@@ -4320,13 +4390,15 @@ void FragmentEmitter::U8Op(Operation op, Reg dst, const std::array<Reg, 3>& args
         break;
     }
     case Operation::MultiplyThenAdd: {
-        // a * b + c: b in source 0, ONE * c.
+        // a * b + c: b in source 0 (a where b is a secondary attribute and a is not: source 0
+        // names none), ONE * c.
         SopCtl s;
         s.csel1 = 4;
         s.csel2 = 0;
         s.cmod2 = true;
         s.asel1 = 1;
-        e.Sop3(dst, U8Src0(b), a, c, s);
+        const bool swap = b.bank == Bank::SecAttr && a.bank != Bank::SecAttr;
+        e.Sop3(dst, U8Src0(swap ? a : b), swap ? b : a, c, s);
         break;
     }
     case Operation::AddThenMultiply: {

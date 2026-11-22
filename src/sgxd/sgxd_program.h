@@ -71,7 +71,9 @@ int sgxd_program_pixel_pds(uint32_t doutu0, const uint32_t *iterators, const uns
                            unsigned count, SgxdPdsProgram *out);
 
 // A texture read the pixel primary issues (a non-dependent read): the unit's four state words
-// (DOUTT0-3), its coordinate set TCn, and the iterator whose DOUTI it follows.
+// (DOUTT0-3), its coordinate set TCn, and the iterator whose DOUTI it follows
+// (SGXD_ISSUE_BEFORE_ITERATORS: ahead of every iterator).
+#define SGXD_ISSUE_BEFORE_ITERATORS 0xffu
 typedef struct SgxdTextureIssue {
     uint32_t tex[4];
     unsigned coord;

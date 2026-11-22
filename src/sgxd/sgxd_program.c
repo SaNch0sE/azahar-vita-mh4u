@@ -311,13 +311,18 @@ int sgxd_program_pica_pixel_pds(uint32_t kick0, const uint32_t *iterators, const
     pds_word(&p, 1, 0);   // DOUTU word 2
     pds_emit(&p, doutu(kick, 0));
     unsigned issued = 0;
-    for (unsigned i = 0; i < count; i++) {
-        if (words[i] == 0 || words[i] > 4) {
-            return -1;
+    // Step i: iterator i - 1's DOUTI, then the issues after it; step 0 the issues ahead of every
+    // iterator (a program that reads a texture and iterates nothing before it).
+    for (unsigned i = 0; i <= count; i++) {
+        if (i > 0) {
+            if (words[i - 1] == 0 || words[i - 1] > 4) {
+                return -1;
+            }
+            pds_emit(&p, douti(pds_word(&p, 1, iterators[i - 1]), words[i - 1]));
         }
-        pds_emit(&p, douti(pds_word(&p, 1, iterators[i]), words[i]));
+        const unsigned after = i == 0 ? SGXD_ISSUE_BEFORE_ITERATORS : i - 1;
         for (unsigned k = 0; k < issue_count; k++) {
-            if (issues[k].after != i) {
+            if (issues[k].after != after) {
                 continue;
             }
             const unsigned last = ++issued == issue_count;
