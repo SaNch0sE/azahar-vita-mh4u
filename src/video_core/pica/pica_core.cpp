@@ -32,7 +32,10 @@ class RegImplInfo {
 private:
     using NeedsSpecialHandlingBF = BitField<0, 1, u16>;
     using SupportsBatchBF = BitField<1, 1, u16>;
-    using RegsUntilSpecialBF = BitField<2, 14, u16>;
+    /// The scan's: a data port (an upload's), whose writes the scan steps over.
+    using DataPortBF = BitField<2, 1, u16>;
+    /// For a data port in the scan's table, the run of data ports from it instead.
+    using RegsUntilSpecialBF = BitField<3, 13, u16>;
 
     u16 raw{};
 
@@ -51,6 +54,14 @@ public:
 
     constexpr void SetSupportsBatch() {
         raw = (raw & ~SupportsBatchBF::mask) | SupportsBatchBF::FormatValue(1);
+    }
+
+    constexpr bool DataPort() const {
+        return DataPortBF::ExtractValue(raw) != 0;
+    }
+
+    constexpr void SetDataPort() {
+        raw = (raw & ~DataPortBF::mask) | DataPortBF::FormatValue(1);
     }
 
     constexpr u16 RegsUntilSpecial() const {
@@ -76,7 +87,6 @@ PicaCore::PicaCore(Memory::MemorySystem& memory_)
       shader_engine{CreateEngine(Settings::values.use_shader_jit.GetValue())} {
     InitializeRegs();
     dirty_regs.SetAllDirty();
-    SetSplit(CmdListMode::Whole, nullptr);
 
     const auto submit_vertex = [this](const AttributeBuffer& buffer) {
         const auto add_triangle = [this](const OutputVertex& v0, const OutputVertex& v1,
@@ -176,6 +186,7 @@ struct PicaCore::Dispatch {
         }
     }
 
+    template <CmdListMode M>
     static void IrqRequest(PicaCore& p, u32 id, u32, bool& stop_requested) {
         // TODO(PabloMK7): This logic is not fully accurate, but close enough:
         // https://problemkaputt.de/gbatek-3ds-gpu-internal-registers-finalize-interrupt-registers.htm
@@ -183,14 +194,10 @@ struct PicaCore::Dispatch {
             [[likely]] {
             // Split, the scan raises P3D once the list is handed over, and the render side's
             // rasterizer ends the list's work where the request is.
-            if (p.mode == CmdListMode::Scan) {
+            if constexpr (M == CmdListMode::Scan) {
                 p.split->ScanIrq(p.delay_generator.CalculateAndResetDelay());
             } else {
                 p.rasterizer->NotifyP3D();
-                if (p.mode == CmdListMode::Whole) {
-                    p.signal_interrupt(Service::GSP::InterruptId::P3D,
-                                       p.delay_generator.CalculateAndResetDelay());
-                }
             }
             if (p.regs.internal.irq_autostop) [[likely]] {
                 stop_requested = true;
@@ -211,26 +218,30 @@ struct PicaCore::Dispatch {
     }
 
     // Load default vertex input attributes
+    template <CmdListMode M>
     static void DefaultAttributesValue(PicaCore& p, u32, u32 value, bool&) {
-        p.SubmitImmediate(value);
+        p.SubmitImmediate<M>(value);
     }
 
+    template <CmdListMode M>
     static void DefaultAttributesValueBatch(PicaCore& p, const u32* values, u32 count) {
         for (u32 i = 0; i < count; i++) {
-            p.SubmitImmediate(values[i]);
+            p.SubmitImmediate<M>(values[i]);
         }
     }
 
+    template <CmdListMode M>
     static void CommandBufferTrigger(PicaCore& p, u32 id, u32, bool&) {
         const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
         const PAddr addr = p.regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
         const u32 size = p.regs.internal.pipeline.command_buffer.GetSize(index);
-        p.cmd_list.Reset(addr, p.ListWords(addr, size), size);
+        p.cmd_list.Reset(addr, p.ListWords<M>(addr, size), size);
     }
 
     // It seems like these trigger vertex rendering
+    template <CmdListMode M>
     static void TriggerDraw(PicaCore& p, u32 id, u32, bool&) {
-        p.DrawArrays(id == PICA_REG_INDEX(pipeline.trigger_draw_indexed));
+        p.DrawArrays<M>(id == PICA_REG_INDEX(pipeline.trigger_draw_indexed));
     }
 
     static void GsBoolUniforms(PicaCore& p, u32, u32, bool&) {
@@ -450,10 +461,12 @@ struct PicaCore::Dispatch {
         p.dirty_regs.Set(PICA_REG_INDEX(lighting.lut_config));
     }
 
+    template <CmdListMode M>
     static void FogLutData(PicaCore& p, u32, u32 value, bool&) {
-        FogLutDataBatch(p, &value, 1);
+        FogLutDataBatch<M>(p, &value, 1);
     }
 
+    template <CmdListMode M>
     static void FogLutDataBatch(PicaCore& p, const u32* values, u32 count) {
         auto& offset = p.regs.internal.texturing.fog_lut_offset;
         bool changed = false;
@@ -463,8 +476,10 @@ struct PicaCore::Dispatch {
         }
         p.fog.lut_dirty |= changed;
         // The rasterizer's fog table follows the LUT (RasterizerSgxd::FogLutChanged).
-        if (changed && p.mode == CmdListMode::Render) {
-            p.split->RenderFogLut();
+        if constexpr (M == CmdListMode::Render) {
+            if (changed) {
+                p.split->RenderFogLut();
+            }
         }
         offset.Assign(offset + count);
         p.dirty_regs.Set(PICA_REG_INDEX(texturing.fog_lut_offset));
@@ -505,6 +520,7 @@ struct PicaCore::Dispatch {
         p.dirty_regs.Set(PICA_REG_INDEX(texturing.proctex_lut_config));
     }
 
+    template <CmdListMode M>
     static consteval std::array<SpecialFn, RegsInternal::NUM_REGS> BuildSpecialLUT() {
         std::array<SpecialFn, RegsInternal::NUM_REGS> table{};
         const auto set = [&table](u32 base, u32 n, SpecialFn fn) {
@@ -512,16 +528,16 @@ struct PicaCore::Dispatch {
                 table[base + i] = fn;
             }
         };
-        set(PICA_REG_INDEX(irq_request), 1, &IrqRequest);
+        set(PICA_REG_INDEX(irq_request), 1, &IrqRequest<M>);
         set(PICA_REG_INDEX(pipeline.triangle_topology), 1, &TriangleTopology);
         set(PICA_REG_INDEX(pipeline.restart_primitive), 1, &RestartPrimitive);
         set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index), 1,
             &DefaultAttributesIndex);
         set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]), 3,
-            &DefaultAttributesValue);
-        set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]), 2, &CommandBufferTrigger);
-        set(PICA_REG_INDEX(pipeline.trigger_draw), 1, &TriggerDraw);
-        set(PICA_REG_INDEX(pipeline.trigger_draw_indexed), 1, &TriggerDraw);
+            &DefaultAttributesValue<M>);
+        set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]), 2, &CommandBufferTrigger<M>);
+        set(PICA_REG_INDEX(pipeline.trigger_draw), 1, &TriggerDraw<M>);
+        set(PICA_REG_INDEX(pipeline.trigger_draw_indexed), 1, &TriggerDraw<M>);
         set(PICA_REG_INDEX(gs.bool_uniforms), 1, &GsBoolUniforms);
         set(PICA_REG_INDEX(gs.int_uniforms[0]), 4, &GsIntUniform);
         set(PICA_REG_INDEX(gs.uniform_setup.set_value[0]), 8, &GsUniformValue);
@@ -534,11 +550,12 @@ struct PicaCore::Dispatch {
         set(PICA_REG_INDEX(vs.program.set_word[0]), 8, &VsProgramWord);
         set(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]), 8, &VsSwizzleWord);
         set(PICA_REG_INDEX(lighting.lut_data[0]), 8, &LightingLutData);
-        set(PICA_REG_INDEX(texturing.fog_lut_data[0]), 8, &FogLutData);
+        set(PICA_REG_INDEX(texturing.fog_lut_data[0]), 8, &FogLutData<M>);
         set(PICA_REG_INDEX(texturing.proctex_lut_data[0]), 8, &ProcTexLutData);
         return table;
     }
 
+    template <CmdListMode M>
     static consteval std::array<BatchFn, RegsInternal::NUM_REGS> BuildBatchLUT() {
         std::array<BatchFn, RegsInternal::NUM_REGS> table{};
         const auto set = [&table](u32 base, u32 n, BatchFn fn) {
@@ -547,7 +564,7 @@ struct PicaCore::Dispatch {
             }
         };
         set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]), 3,
-            &DefaultAttributesValueBatch);
+            &DefaultAttributesValueBatch<M>);
         set(PICA_REG_INDEX(gs.uniform_setup.set_value[0]), 8, &GsUniformValueBatch);
         set(PICA_REG_INDEX(gs.program.set_word[0]), 8, &GsProgramWordBatch);
         set(PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]), 8, &GsSwizzleWordBatch);
@@ -555,7 +572,7 @@ struct PicaCore::Dispatch {
         set(PICA_REG_INDEX(vs.program.set_word[0]), 8, &VsProgramWordBatch);
         set(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]), 8, &VsSwizzleWordBatch);
         set(PICA_REG_INDEX(lighting.lut_data[0]), 8, &LightingLutDataBatch);
-        set(PICA_REG_INDEX(texturing.fog_lut_data[0]), 8, &FogLutDataBatch);
+        set(PICA_REG_INDEX(texturing.fog_lut_data[0]), 8, &FogLutDataBatch<M>);
         set(PICA_REG_INDEX(texturing.proctex_lut_data[0]), 8, &ProcTexLutDataBatch);
         return table;
     }
@@ -571,14 +588,15 @@ struct PicaCore::Dispatch {
                 table[base + i] = fn;
             }
         };
-        set(PICA_REG_INDEX(irq_request), 1, &IrqRequest);
+        set(PICA_REG_INDEX(irq_request), 1, &IrqRequest<CmdListMode::Scan>);
         set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index), 1,
             &DefaultAttributesIndex);
         set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]), 3,
-            &DefaultAttributesValue);
-        set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]), 2, &CommandBufferTrigger);
-        set(PICA_REG_INDEX(pipeline.trigger_draw), 1, &TriggerDraw);
-        set(PICA_REG_INDEX(pipeline.trigger_draw_indexed), 1, &TriggerDraw);
+            &DefaultAttributesValue<CmdListMode::Scan>);
+        set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]), 2,
+            &CommandBufferTrigger<CmdListMode::Scan>);
+        set(PICA_REG_INDEX(pipeline.trigger_draw), 1, &TriggerDraw<CmdListMode::Scan>);
+        set(PICA_REG_INDEX(pipeline.trigger_draw_indexed), 1, &TriggerDraw<CmdListMode::Scan>);
         return table;
     }
 
@@ -586,30 +604,54 @@ struct PicaCore::Dispatch {
         std::array<BatchFn, RegsInternal::NUM_REGS> table{};
         for (u32 i = 0; i < 3; ++i) {
             table[PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]) + i] =
-                &DefaultAttributesValueBatch;
+                &DefaultAttributesValueBatch<CmdListMode::Scan>;
         }
         return table;
     }
+
+    /// The mode's tables: the scan's own, or the full set (the parse's).
+    template <CmdListMode M>
+    static consteval std::array<SpecialFn, RegsInternal::NUM_REGS> SpecialLUT() {
+        if constexpr (M == CmdListMode::Scan) {
+            return BuildScanSpecialLUT();
+        } else {
+            return BuildSpecialLUT<M>();
+        }
+    }
+
+    template <CmdListMode M>
+    static consteval std::array<BatchFn, RegsInternal::NUM_REGS> BatchLUT() {
+        if constexpr (M == CmdListMode::Scan) {
+            return BuildScanBatchLUT();
+        } else {
+            return BuildBatchLUT<M>();
+        }
+    }
 };
 
-static constexpr std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS> special_lut =
-    PicaCore::Dispatch::BuildSpecialLUT();
-static constexpr std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> batch_lut =
-    PicaCore::Dispatch::BuildBatchLUT();
-static constexpr std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS> scan_special_lut =
-    PicaCore::Dispatch::BuildScanSpecialLUT();
-static constexpr std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> scan_batch_lut =
-    PicaCore::Dispatch::BuildScanBatchLUT();
+// Each mode's dispatch tables, constants: the list walk (ProcessCmdList) is the mode's at
+// compile time.
+template <CmdListMode M>
+static constexpr std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS> specials_of =
+    PicaCore::Dispatch::SpecialLUT<M>();
+template <CmdListMode M>
+static constexpr std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> batches_of =
+    PicaCore::Dispatch::BatchLUT<M>();
 
 // With assembler_idle, the primitive topology and restart registers are plain: their handlers only
 // reset the primitive assembler (and take the topology), which changes nothing while it holds no
 // vertex, no strip and no winding flip, and PicaCore::SyncAssemblerTopology takes the topology
 // before anything uses the assembler. With hardware draws it is always idle, and games write those
 // two registers hundreds of times a frame.
+//
+// The scan's table (data_ports) marks the uploads' data ports: the uniform, program, swizzle and
+// LUT words, which the render side takes and the scan has no use for. Their values in the scan's
+// register file are never read (no handler, no draw reads a port), so PicaCmdListScanLoop steps
+// over a batch or a group of them whole. For a port the RegsUntilSpecial field holds the run of
+// ports from it, which is never more than the distance to the next special register.
 static consteval std::array<RegImplInfo, RegsInternal::NUM_REGS> BuildRegImplFlagsLUT(
-    bool assembler_idle,
-    const std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS>& specials = special_lut,
-    const std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS>& batches = batch_lut) {
+    bool assembler_idle, const std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS>& specials,
+    const std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS>& batches, bool data_ports) {
     std::array<RegImplInfo, RegsInternal::NUM_REGS> table{};
 
     // Special and batch registers are the ones with a dispatch handler.
@@ -636,24 +678,41 @@ static consteval std::array<RegImplInfo, RegsInternal::NUM_REGS> BuildRegImplFla
         }
     }
 
+    if (data_ports) {
+        for (const u32 base :
+             {PICA_REG_INDEX(gs.uniform_setup.set_value[0]), PICA_REG_INDEX(gs.program.set_word[0]),
+              PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]),
+              PICA_REG_INDEX(vs.uniform_setup.set_value[0]), PICA_REG_INDEX(vs.program.set_word[0]),
+              PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]), PICA_REG_INDEX(lighting.lut_data[0]),
+              PICA_REG_INDEX(texturing.fog_lut_data[0]),
+              PICA_REG_INDEX(texturing.proctex_lut_data[0])}) {
+            for (u32 i = 0; i < 8; i++) {
+                table[base + i].SetDataPort();
+            }
+        }
+        u16 run = 0;
+        for (size_t i = RegsInternal::NUM_REGS; i-- > 0;) {
+            run = table[i].DataPort() ? run + 1 : 0;
+            if (run != 0) {
+                table[i].SetRegsUntilSpecial(run);
+            }
+        }
+    }
+
     return table;
 }
 
-static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> reg_impl_flags_lut =
-    BuildRegImplFlagsLUT(false);
-static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> reg_impl_flags_lut_idle =
-    BuildRegImplFlagsLUT(true);
-static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> scan_flags_lut =
-    BuildRegImplFlagsLUT(true, scan_special_lut, scan_batch_lut);
+// The flags: with the primitive assembler busy, and idle (flags_idle_of). The scan never
+// assembles: its two are one.
+template <CmdListMode M>
+static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> flags_of = BuildRegImplFlagsLUT(
+    M == CmdListMode::Scan, specials_of<M>, batches_of<M>, M == CmdListMode::Scan);
+template <CmdListMode M>
+static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> flags_idle_of =
+    BuildRegImplFlagsLUT(true, specials_of<M>, batches_of<M>, M == CmdListMode::Scan);
 
-void PicaCore::SetSplit(CmdListMode mode_, CmdListSplit* split_) {
-    mode = mode_;
+void PicaCore::BindSplit(SgxdRenderer::RenderThread* split_) {
     split = split_;
-    const bool scan = mode == CmdListMode::Scan;
-    specials = scan ? scan_special_lut.data() : special_lut.data();
-    batches = scan ? scan_batch_lut.data() : batch_lut.data();
-    flags = scan ? scan_flags_lut.data() : reg_impl_flags_lut.data();
-    flags_idle = scan ? scan_flags_lut.data() : reg_impl_flags_lut_idle.data();
 }
 
 // Expand a 4-bit mask to 4-byte mask, e.g. 0b0101 -> 0x00FF00FF
@@ -668,6 +727,9 @@ static constexpr std::array<u32, 16> ExpandBitsToBytes = {
 extern "C" u32 PicaCmdListFastLoop(const u32* head, u32 index, u32 length, const u16* flags_lut,
                                    const u32* expand_lut, u32* reg_array, u8* dirty_bytes,
                                    u32* out_count);
+// The scan's (CmdListMode::Scan): no dirty marks, the data ports stepped over.
+extern "C" u32 PicaCmdListScanLoop(const u32* head, u32 index, u32 length, const u16* flags_lut,
+                                   const u32* expand_lut, u32* reg_array, u32* out_count);
 static_assert(sizeof(RegImplInfo) == sizeof(u16), "the loop reads the flags as halfwords");
 #endif
 
@@ -709,19 +771,20 @@ static_assert(sizeof(RegImplInfo) == sizeof(u16), "the loop reads the flags as h
  *  - Commands with extra length should be processed in batch if possible.
  *  - Vectorization should be used as much as possible.
  */
-void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
-    if (ignore_list) {
-        rasterizer->NotifyP3D();
-        signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
-        return;
-    }
+void PicaCore::SkipCmdList() {
+    rasterizer->NotifyP3D();
+    signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
+}
 
-    cmd_list.Reset(list, ListWords(list, size), size);
+template <CmdListMode M>
+void PicaCore::ProcessCmdList(PAddr list, u32 size) [[hot]] {
+    cmd_list.Reset(list, ListWords<M>(list, size), size);
 
     bool stop_requested = false;
     bool skip_fast_path = false;
+    list_stopped = false;
     while (cmd_list.current_index < cmd_list.length) {
-        if (stop_requested) [[unlikely]] {
+        if (stop_requested || list_stopped) [[unlikely]] {
             break;
         }
         if (cmd_list.current_index % 2 != 0) {
@@ -739,7 +802,9 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         if (!skip_fast_path && !immediate_open) {
             // Chosen at each entry: only a slow-path command (a draw) can fill the
             // assembler.
-            const RegImplInfo* const flags_lut = primitive_assembler.IsIdle() ? flags_idle : flags;
+            const RegImplInfo* const flags_lut =
+                M == CmdListMode::Scan || primitive_assembler.IsIdle() ? flags_idle_of<M>.data()
+                                                                       : flags_of<M>.data();
 #if CITRA_ARCH(arm32)
             // Hand-written Thumb-2 loop (pica_cmdlist_a32.S): applies plain register writes, group
             // writes of plain registers among them, until list end or a special command, which
@@ -750,17 +815,25 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
             u32 run = 0;
             u32 index = cmd_list.current_index;
             const CommandHeader next{index + 1 < cmd_list.length ? cmd_list.head[index + 1] : 0u};
+            // A batch of a data port stays in the scan's loop (only the scan's table has them).
             const bool slow_next =
                 index + 1 < cmd_list.length &&
                 (next.cmd_id >= RegsInternal::NUM_REGS ||
-                 (next.extra_data_length != 0 ? !next.group_commands
-                                              : flags_lut[next.cmd_id].NeedsSpecialHandling()));
+                 (next.extra_data_length != 0
+                      ? !next.group_commands && !flags_lut[next.cmd_id].DataPort()
+                      : flags_lut[next.cmd_id].NeedsSpecialHandling()));
             if (!slow_next) {
-                index =
-                    PicaCmdListFastLoop(cmd_list.head, cmd_list.current_index, cmd_list.length,
-                                        reinterpret_cast<const u16*>(flags_lut),
-                                        ExpandBitsToBytes.data(), regs.internal.reg_array.data(),
-                                        reinterpret_cast<u8*>(dirty_regs.qwords.data()), &run);
+                const u16* const lut = reinterpret_cast<const u16*>(flags_lut);
+                if constexpr (M == CmdListMode::Scan) {
+                    index = PicaCmdListScanLoop(cmd_list.head, cmd_list.current_index,
+                                                cmd_list.length, lut, ExpandBitsToBytes.data(),
+                                                regs.internal.reg_array.data(), &run);
+                } else {
+                    index = PicaCmdListFastLoop(
+                        cmd_list.head, cmd_list.current_index, cmd_list.length, lut,
+                        ExpandBitsToBytes.data(), regs.internal.reg_array.data(),
+                        reinterpret_cast<u8*>(dirty_regs.qwords.data()), &run);
+                }
             }
             if (run > 0) {
                 delay_generator.AddCommands(run);
@@ -823,7 +896,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         const CommandHeader header{cmd_list.head[cmd_list.current_index++]};
 
         // Write to the requested PICA register.
-        WriteInternalReg(header.cmd_id, value, header.parameter_mask, stop_requested);
+        WriteInternalReg<M>(header.cmd_id, value, header.parameter_mask, stop_requested);
 
         // Write any extra paramters as well.
         const u32 count = header.extra_data_length;
@@ -836,39 +909,31 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
 
         if (!header.group_commands) {
             // Same register written count times in a row (program/swizzle upload, LUT, etc.).
-            WriteInternalRegBatch(header.cmd_id, extra, count, header.parameter_mask,
-                                  stop_requested);
+            WriteInternalRegBatch<M>(header.cmd_id, extra, count, header.parameter_mask,
+                                     stop_requested);
         } else {
             // Sequential registers written from header.cmd_id+1 to header.cmd_id+count.
-            WriteInternalRegSequential(header.cmd_id + 1, extra, count, header.parameter_mask,
-                                       stop_requested);
+            WriteInternalRegSequential<M>(header.cmd_id + 1, extra, count, header.parameter_mask,
+                                          stop_requested);
         }
     }
 }
 
+template <CmdListMode M>
 const u8* PicaCore::ListWords(PAddr addr, u32 size) {
-    switch (mode) {
-    case CmdListMode::Scan: {
+    if constexpr (M == CmdListMode::Scan) {
         const u8* const words = split->ScanList(addr, size);
         // A capture's load of the list, in the GSP command's op, as the guest submitted it: the
         // parse thread's PicaCore runs outside the op.
         SgxdRenderer::Vprof::Memory(SgxdRenderer::Vprof::Mem::CmdList, addr, size);
         return words;
-    }
-    case CmdListMode::Render:
+    } else {
         return split->RenderList(addr, size);
-    case CmdListMode::Whole:
-        break;
     }
-    // A list, or a buffer it jumps to, a queued DMA still writes waits for it (a game Triple
-    // Deluxe's lists jump into VRAM its DMAs fill each frame: a stale buffer there ended the
-    // list before its P3D, and the game waited for that P3D for good).
-    memory.GuardPhysicalRead(addr, size);
-    SgxdRenderer::Vprof::Memory(SgxdRenderer::Vprof::Mem::CmdList, addr, size);
-    return memory.GetPhysicalPointer(addr);
 }
 
 // Handle batch register writes
+template <CmdListMode M>
 void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                      bool& stop_requested) {
     if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
@@ -882,7 +947,7 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
 
     delay_generator.AddCommands(count);
     if (immediate_open && !IsImmediateData(id)) {
-        FlushImmediate();
+        FlushImmediate<M>();
     }
     const u32 write_mask = ExpandBitsToBytes[mask];
     // Only write the last value to the register array.
@@ -891,19 +956,20 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
         (regs.internal.reg_array[id] & ~write_mask) | (values[count - 1] & write_mask);
     dirty_regs.Set(id);
 
-    if (flags[id].SupportsBatch()) {
+    if (flags_of<M>[id].SupportsBatch()) {
         // If the register supports batch then call the handler.
-        batches[id](*this, values, count);
-    } else if (flags[id].NeedsSpecialHandling()) [[unlikely]] {
+        batches_of<M>[id](*this, values, count);
+    } else if (flags_of<M>[id].NeedsSpecialHandling()) [[unlikely]] {
         // Unlikely as all special regs that make sense to use batch mode already
         // support batch handling.
         for (u32 i = 0; i < count && !stop_requested; ++i) {
-            specials[id](*this, id, values[i], stop_requested);
+            specials_of<M>[id](*this, id, values[i], stop_requested);
         }
     }
 }
 
 // Handle sequential register writes.
+template <CmdListMode M>
 void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, u32 count, u32 mask,
                                           bool& stop_requested) {
     if (id + count > RegsInternal::NUM_REGS) [[unlikely]] {
@@ -919,7 +985,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         }
     }
     if (immediate_open && !(IsImmediateData(id) && IsImmediateData(id + count - 1))) {
-        FlushImmediate();
+        FlushImmediate<M>();
     }
     const u32 write_mask = ExpandBitsToBytes[mask];
     u32* __restrict dst = &regs.internal.reg_array[id];
@@ -935,8 +1001,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         const u32 reg = id + offset;
         // Distance to the next special register, capped by how many writes
         // are actually left in this write. If this register is special this is 0.
-        const u32 batch_count =
-            std::min<u32>(flags[reg].RegsUntilSpecial(), count - offset);
+        const u32 batch_count = std::min<u32>(flags_of<M>[reg].RegsUntilSpecial(), count - offset);
         if (batch_count > 0) {
             delay_generator.AddCommands(batch_count);
 
@@ -957,9 +1022,9 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
             break;
         }
         const u32 special = id + offset;
-        const BatchFn batch = batches[special];
+        const BatchFn batch = batches_of<M>[special];
         if (!batch) {
-            WriteInternalReg(special, values[offset], mask, stop_requested);
+            WriteInternalReg<M>(special, values[offset], mask, stop_requested);
             ++offset;
             continue;
         }
@@ -967,12 +1032,12 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         // attribute's three) are one stream into the port, as WriteInternalReg would feed it a word
         // at a time: the port's batch handler takes them at once.
         u32 run = 1;
-        while (offset + run < count && batches[special + run] == batch) {
+        while (offset + run < count && batches_of<M>[special + run] == batch) {
             ++run;
         }
         delay_generator.AddCommands(run);
         if (immediate_open && !IsImmediateData(special)) {
-            FlushImmediate();
+            FlushImmediate<M>();
         }
         for (u32 i = 0; i < run; ++i) {
             dst[offset + i] = (dst[offset + i] & ~write_mask) | (values[offset + i] & write_mask);
@@ -984,6 +1049,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
 }
 
 // Handle individual command write.
+template <CmdListMode M>
 void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requested) {
     if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
         // Writes to OOB registers are no-op.
@@ -997,7 +1063,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     delay_generator.AddCommands(1);
 
     if (immediate_open && !IsImmediateData(id)) {
-        FlushImmediate();
+        FlushImmediate<M>();
     }
 
     // TODO: Figure out how register masking acts on e.g. vs.uniform_setup.set_value
@@ -1009,7 +1075,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     // rewrite most of them with the values they hold); a special one at every write, before its
     // handler, which may draw (the render thread's copy takes it with that draw). The registers
     // a handler advances (the upload indexes and offsets) the handler marks.
-    if (const SpecialFn handler = specials[id]) {
+    if (const SpecialFn handler = specials_of<M>[id]) {
         dirty_regs.Set(id);
         handler(*this, id, value, stop_requested);
     } else if (regs.internal.reg_array[id] != old_value) {
@@ -1017,6 +1083,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     }
 }
 
+template <CmdListMode M>
 void PicaCore::SubmitImmediate(u32 value) {
     // Push to word to the queue. This returns true when a full attribute is formed.
     if (!immediate.queue.Push(value)) {
@@ -1053,7 +1120,7 @@ void PicaCore::SubmitImmediate(u32 value) {
     }
 
     // We formed a vertex, flush.
-    DrawImmediate();
+    DrawImmediate<M>();
 }
 
 void PicaCore::FlushGsMirror() {
@@ -1127,9 +1194,10 @@ void PicaCore::SyncAssemblerTopology() {
     }
 }
 
+template <CmdListMode M>
 void PicaCore::DrawImmediate() {
     const bool gs = regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
-    if (mode == CmdListMode::Scan) {
+    if constexpr (M == CmdListMode::Scan) {
         // A batch's decision at its first vertex; a vertex the geometry unit takes is drawn
         // alone, on the render side's CPU.
         if (!gs) {
@@ -1151,7 +1219,7 @@ void PicaCore::DrawImmediate() {
     // them as one batch at the next register write that is not immediate data. A batch the scan
     // dropped keeps none.
     if (!gs) {
-        if (mode == CmdListMode::Render && !immediate_open) {
+        if (M == CmdListMode::Render && !immediate_open) {
             immediate_drop = !split->RenderDraw();
         }
         if (immediate_drop || rasterizer->AccelerateImmediateVertex(immediate.input_vertex)) {
@@ -1160,7 +1228,7 @@ void PicaCore::DrawImmediate() {
             return;
         }
     }
-    if (mode == CmdListMode::Render && !split->RenderDraw()) {
+    if (M == CmdListMode::Render && !split->RenderDraw()) {
         immediate.current_attribute = 0;
         return;
     }
@@ -1192,9 +1260,10 @@ void PicaCore::DrawImmediate() {
     immediate.current_attribute = 0;
 }
 
+template <CmdListMode M>
 void PicaCore::FlushImmediate() {
     immediate_open = false;
-    if (mode == CmdListMode::Scan) {
+    if constexpr (M == CmdListMode::Scan) {
         split->ScanImmediateFlush();
         return;
     }
@@ -1204,8 +1273,9 @@ void PicaCore::FlushImmediate() {
     rasterizer->FlushImmediate();
 }
 
+template <CmdListMode M>
 void PicaCore::DrawArrays(bool is_indexed) {
-    if (mode == CmdListMode::Scan) {
+    if constexpr (M == CmdListMode::Scan) {
         // The draw's holds and decision; the render side draws it.
         delay_generator.AddVertices(regs.internal.pipeline.num_vertices,
                                     regs.internal.pipeline.triangle_topology);
@@ -1219,7 +1289,7 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }
     // A draw the scan dropped (the late skip, the right eye): its state stays, as the GPU's
     // would.
-    if (mode == CmdListMode::Render && !split->RenderDraw()) {
+    if (M == CmdListMode::Render && !split->RenderDraw()) {
         return;
     }
 
@@ -1255,8 +1325,7 @@ void PicaCore::DrawArrays(bool is_indexed) {
         // Split, the render side's geometry passes ran the geometry shader: every draw with
         // vertices runs at least one invocation, which leaves the uniform b15 true until the
         // game writes the bool register again (upstream GeometryPipeline::SubmitVertex).
-        if (mode == CmdListMode::Render &&
-            regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
+        if (M == CmdListMode::Render && regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
             regs.internal.pipeline.num_vertices != 0) {
             gs_setup.uniforms.b[15] = true;
         }
@@ -1354,156 +1423,31 @@ void PicaCore::LoadVertices(bool is_indexed) {
     }
 }
 
-PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u32 size) {
-    // Initialize command list tracking.
-    memory.GuardPhysicalRead(list, size);
-    const u8* head = memory.GetPhysicalPointer(list);
-    cmd_list.Reset(list, head, size);
-
-    constexpr size_t max_iterations = 0x100;
-
-    RenderPropertiesGuess find_info{};
-
-    find_info.vp_height = regs.internal.rasterizer.viewport_size_y.Value();
-    find_info.paddr = regs.internal.framebuffer.framebuffer.color_buffer_address.Value() * 8;
-
-    auto process_write = [this, &find_info](u32 cmd_id, u32 value) {
-        switch (cmd_id) {
-        case PICA_REG_INDEX(rasterizer.viewport_size_y):
-            find_info.vp_height = value;
-            find_info.vp_heigh_found = true;
-            break;
-        case PICA_REG_INDEX(framebuffer.framebuffer.color_buffer_address):
-            find_info.paddr = value * 8;
-            find_info.paddr_found = true;
-            break;
-        [[unlikely]] case PICA_REG_INDEX(pipeline.command_buffer.trigger[0]):
-        [[unlikely]] case PICA_REG_INDEX(pipeline.command_buffer.trigger[1]): {
-            const u32 index =
-                static_cast<u32>(cmd_id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
-            const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
-            const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
-            memory.GuardPhysicalRead(addr, size);
-            const u8* head = memory.GetPhysicalPointer(addr);
-            cmd_list.Reset(addr, head, size);
-            break;
-        }
-        default:
-            break;
-        }
-        return find_info.vp_heigh_found && find_info.paddr_found;
-    };
-
-    size_t iterations = 0;
-    while (cmd_list.current_index < cmd_list.length && iterations < max_iterations) {
-        // Align read pointer to 8 bytes
-        if (cmd_list.current_index % 2 != 0) {
-            cmd_list.current_index++;
-        }
-
-        // Read the header and the value to write.
-        const u32 value = cmd_list.head[cmd_list.current_index++];
-        const CommandHeader header{cmd_list.head[cmd_list.current_index++]};
-
-        // Write to the requested PICA register.
-        if (process_write(header.cmd_id, value))
-            break;
-
-        // Write any extra paramters as well. A run that reaches none of the registers the guess
-        // looks at is skipped whole: a 256-word LUT upload took 256 calls (3.2% of a game's
-        // emulation thread went to the guess, its lists 66 commands deep on average).
-        const u32 extra = header.extra_data_length;
-        const u32 first = header.group_commands ? header.cmd_id + 1 : header.cmd_id;
-        const u32 last = header.group_commands ? header.cmd_id + extra : header.cmd_id;
-        const auto reaches = [first, last](u32 reg) { return first <= reg && reg <= last; };
-        if (extra != 0 && !reaches(PICA_REG_INDEX(rasterizer.viewport_size_y)) &&
-            !reaches(PICA_REG_INDEX(framebuffer.framebuffer.color_buffer_address)) &&
-            !reaches(PICA_REG_INDEX(pipeline.command_buffer.trigger[0])) &&
-            !reaches(PICA_REG_INDEX(pipeline.command_buffer.trigger[1]))) {
-            cmd_list.current_index += extra;
-            iterations++;
-            continue;
-        }
-        for (u32 i = 0; i < header.extra_data_length; ++i) {
-            const u32 cmd = header.cmd_id + (header.group_commands ? i + 1 : 0);
-            const u32 extra_value = cmd_list.head[cmd_list.current_index++];
-            if (process_write(cmd, extra_value))
-                break;
-        }
-
-        iterations++;
+void PicaCore::MarkList() {
+    if (!list_mark) {
+        list_mark = std::make_unique<ListMark>();
     }
-
-    return find_info;
+    ListMark& m = *list_mark;
+    m.regs = regs.internal.reg_array;
+    m.default_attributes = input_default_attributes;
+    m.immediate = immediate;
+    m.immediate_open = immediate_open;
+    m.default_attributes_changed = default_attributes_changed;
+    m.delay_generator = delay_generator;
 }
 
-bool PicaCore::CmdListMayDraw(PAddr list, u32 size) {
-    constexpr u32 draw = PICA_REG_INDEX(pipeline.trigger_draw);
-    constexpr u32 draw_indexed = PICA_REG_INDEX(pipeline.trigger_draw_indexed);
-    constexpr u32 attribute_index = PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index);
-    constexpr u32 attribute_value = PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]);
-    constexpr u32 channels = PICA_REG_INDEX(pipeline.command_buffer.size[0]);
-    constexpr u32 jump = PICA_REG_INDEX(pipeline.command_buffer.trigger[0]);
-    static_assert(draw < draw_indexed && draw_indexed < attribute_index &&
-                  attribute_index < attribute_value && attribute_value + 3 <= channels &&
-                  channels + 4 == jump);
-    // The channels' sizes and addresses and the default attribute index, as the list sets them.
-    std::array<u32, 4> channel;
-    std::copy_n(&regs.internal.reg_array[channels], 4, channel.begin());
-    u32 index = regs.internal.reg_array[attribute_index];
-    u32 attribute_words = 0;
-    for (u32 lists = 0; lists < 8; lists++) {
-        memory.GuardPhysicalRead(list, size);
-        const u32* const words = reinterpret_cast<const u32*>(memory.GetPhysicalPointer(list));
-        if (words == nullptr) {
-            return true;
-        }
-        const u32 length = size / 4;
-        std::optional<u32> next;
-        u32 i = 0;
-        while (i + 1 < length && !next) {
-            const CommandHeader header{words[i + 1]};
-            const u32 extra = header.extra_data_length;
-            const u32 first = header.cmd_id;
-            const u32 last = header.group_commands ? first + extra : first;
-            if (last >= draw && first <= jump + 1) {
-                const u32 mask = ExpandBitsToBytes[header.parameter_mask];
-                for (u32 k = 0; k <= extra && !next; k++) {
-                    if (k != 0 && i + 1 + k >= length) {
-                        break;
-                    }
-                    const u32 id = header.group_commands ? first + k : first;
-                    const u32 value = k == 0 ? words[i] : words[i + 1 + k];
-                    if (id == draw || id == draw_indexed) {
-                        return true;
-                    } else if (id == attribute_index) {
-                        index = (index & ~mask) | (value & mask);
-                        attribute_words = 0;
-                    } else if (id >= attribute_value && id < attribute_value + 3) {
-                        // An attribute at index 0xF is an immediate-mode vertex; each one below
-                        // steps the index, and up to two words may be queued from before.
-                        attribute_words++;
-                        if (index + (attribute_words + 2) / 3 > 0xF) {
-                            return true;
-                        }
-                    } else if (id >= channels && id < jump) {
-                        channel[id - channels] = (channel[id - channels] & ~mask) | (value & mask);
-                    } else if (id == jump || id == jump + 1) {
-                        next = id - jump;
-                    }
-                }
-            }
-            i += 2 + extra;
-            i += i & 1;
-        }
-        if (!next) {
-            return false;
-        }
-        size = 8 * (channel[*next] & 0xFFFFF);
-        list = 8 * (channel[2 + *next] & 0xFFFFFFF);
-    }
-    return true;
+void PicaCore::RewindList() {
+    const ListMark& m = *list_mark;
+    regs.internal.reg_array = m.regs;
+    input_default_attributes = m.default_attributes;
+    immediate = m.immediate;
+    immediate_open = m.immediate_open;
+    default_attributes_changed = m.default_attributes_changed;
+    delay_generator = m.delay_generator;
 }
+
+template void PicaCore::ProcessCmdList<CmdListMode::Scan>(PAddr list, u32 size);
+template void PicaCore::ProcessCmdList<CmdListMode::Render>(PAddr list, u32 size);
 
 template <class Archive>
 void PicaCore::CommandList::serialize(Archive& ar, const u32 file_version) {

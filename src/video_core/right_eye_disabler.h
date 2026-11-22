@@ -13,7 +13,16 @@ class RightEyeDisabler {
 public:
     RightEyeDisabler(GPU& gpu) : gpu{gpu} {}
 
-    bool ShouldAllowCmdQueueTrigger(PAddr addr, u32 size);
+    /// The top screen's viewport height (the register's value): a list drawn with it is a
+    /// top-screen picture, the left eye's or the right eye's.
+    static constexpr u32 TopScreenHeight = 0x00469000;
+
+    /// Before a list: whether it is left out if its first draw is a top-screen picture (the
+    /// right eye's). The scan stops there and leaves it out (RenderThread::SubmitCmdList).
+    bool BeforeCmdList();
+    /// After the list's scan: whether it drew, and its first draw's viewport height (the
+    /// register's value) and colour buffer.
+    void AfterCmdList(bool drew, u32 vp_height, PAddr paddr);
     /// `size` the transfer's input rows, `output_rows` its output's.
     bool ShouldAllowDisplayTransfer(PAddr src_address, size_t size, u32 output_rows,
                                     bool to_right_eye);
@@ -61,6 +70,11 @@ private:
     bool bottom_after_top = false;
     /// This frame's picture after the top screen's transfer went out (bottom_after_top is set).
     bool second_picture_out = false;
+
+    /// BeforeCmdList ran for the list: AfterCmdList takes its first draw.
+    bool after_list = false;
+    /// The list is left out if its first draw is a top-screen picture.
+    bool may_leave_out = false;
 
     bool cmd_queue_trigger_happened = false;
     bool display_tranfer_happened = false;

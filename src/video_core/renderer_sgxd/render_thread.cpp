@@ -296,8 +296,8 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& parse_pica_,
     static_assert(sizeof(Head) == 8, "records stay 8-byte aligned");
     parsed = std::make_unique<u8[]>(ParsedSize);
     parsed_output = std::make_unique<ParsedOutput>(*this);
-    pica.SetSplit(Pica::CmdListMode::Scan, this);
-    parse_pica.SetSplit(Pica::CmdListMode::Render, this);
+    pica.BindSplit(this);
+    parse_pica.BindSplit(this);
     parse_pica.BindRasterizer(parsed_output.get());
     render_pica.BindRasterizer(&rasterizer);
     wake_flag = sceKernelCreateEventFlag("render wake", SCE_EVENT_WAITSINGLE, 0, nullptr);
@@ -415,8 +415,8 @@ RenderThread::~RenderThread() {
     ParseWake();
     parse_thread.join();
     sceKernelDeleteEventFlag(parse_wake_flag);
-    pica.SetSplit(Pica::CmdListMode::Whole, nullptr);
-    parse_pica.SetSplit(Pica::CmdListMode::Whole, nullptr);
+    pica.BindSplit(nullptr);
+    parse_pica.BindSplit(nullptr);
     // The backend may have given sgxd's interrupt back already, and the waker with it.
     rasterizer.InterruptWaker(-1, 0);
     sceKernelDeleteEventFlag(wake_flag);
@@ -1526,20 +1526,17 @@ void RenderThread::NotifyP3D() {
     Put(Op::P3D);
 }
 
-void RenderThread::SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::vector<u64>& irqs) {
-    // transfer, which looked like the right eye's: left out, its bottom screen was drawn into
-    // the top screen's height, offset in the buffer. Every right-eye list scanned with its draws
-    // dropped cost a game's race 195% -> 168%.
-    DEBUG_ASSERT(!ignore_list || pica.CmdListMayDraw(addr, size));
-    if (ignore_list) {
-        pica.ProcessCmdList(addr, size, true);
-        return;
-    }
-    // The scan's records (its holds' remaps, the decisions) and the list go out together.
+bool RenderThread::SubmitCmdList(PAddr addr, u32 size, bool may_leave_out, std::vector<u64>& irqs) {
+    // A list the right-eye disabler leaves out is left out whole at its first draw: nothing the scan
+    // did before it reaches the parse or guest memory, and the scan's PicaCore goes back to its mark.
+    // A list of no draws runs. The scan's records and the list go out together.
     const PublishTogether together{*this};
     const TraceSpan span{"scan", "scan_end"};
     scan_draws.clear();
     scan_draw_count = 0;
+    scan_first = {};
+    scan_may_leave_out = may_leave_out;
+    scan_left_out = false;
     scan_lists.clear();
     scan_offsets.clear();
     scan_words_size = 0;
@@ -1547,8 +1544,18 @@ void RenderThread::SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::ve
 #ifdef VITA_DIAGNOSTICS
     const auto scan_start = Clock::now();
 #endif
-    pica.ProcessCmdList(addr, size, false);
+    if (may_leave_out) {
+        pica.MarkList();
+    }
+    pica.ProcessCmdList<Pica::CmdListMode::Scan>(addr, size);
     scan_irqs = nullptr;
+    if (scan_left_out) {
+        DEBUG_ASSERT(scan_draws.empty());
+        pica.RewindList();
+        irqs.clear();
+        pica.SkipCmdList();
+        return true;
+    }
     FlushScanDraws();
 #ifdef VITA_DIAGNOSTICS
     {
@@ -1602,6 +1609,7 @@ void RenderThread::SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::ve
                 scan_words_size);
     parse_wake_due = true;
     Commit();
+    return false;
 }
 
 void RenderThread::RegWrite(u32 id, u32 value) {
@@ -1688,7 +1696,28 @@ const u8* RenderThread::ScanList(PAddr addr, u32 size) {
     return scan_words.get() + at;
 }
 
+bool RenderThread::FirstDrawLeavesOut() {
+    if (scan_left_out) {
+        return true;
+    }
+    if (scan_first.drew) {
+        return false;
+    }
+    const auto& regs = pica.regs.internal;
+    scan_first = {true, regs.rasterizer.viewport_size_y.Value(),
+                  regs.framebuffer.framebuffer.color_buffer_address.Value() * 8};
+    if (scan_may_leave_out &&
+        scan_first.vp_height == VideoCore::RightEyeDisabler::TopScreenHeight) {
+        scan_left_out = true;
+        pica.StopList();
+    }
+    return scan_left_out;
+}
+
 void RenderThread::ScanDraw(bool is_indexed) {
+    if (FirstDrawLeavesOut()) {
+        return;
+    }
     ListDraw d{};
     if (LateDraw(d, pica.regs.internal.pipeline.num_vertices)) {
         PutScanDraw(d, nullptr);
@@ -1716,6 +1745,9 @@ void RenderThread::ScanDraw(bool is_indexed) {
 }
 
 void RenderThread::ScanImmediateBatch() {
+    if (FirstDrawLeavesOut()) {
+        return;
+    }
     // A batch keeps the decision its first vertex found; its holds come at its end.
     ListDraw d{};
     late_batch_skip = LateDraw(d, 0);
@@ -1735,6 +1767,9 @@ void RenderThread::ScanImmediateFlush() {
 }
 
 void RenderThread::ScanImmediateVertex() {
+    if (FirstDrawLeavesOut()) {
+        return;
+    }
     // RasterizerSgxd stops the emulator on the CPU path, with the draw's description.
     ListDraw d{};
     if (!LateDraw(d, 0)) {
@@ -1992,7 +2027,7 @@ void RenderThread::ParseRecord(const Head& head, const u8* p) {
         }
         parse_draw_at = 0;
         parse_range_at = 0;
-        parse_pica.ProcessCmdList(c.addr, c.size, false);
+        parse_pica.ProcessCmdList<Pica::CmdListMode::Render>(c.addr, c.size);
         DEBUG_ASSERT_MSG(parse_draw_at == parse_draws.size(),
                          "render thread: list {} at {:#010x}: {} bytes of the scan's {} draw "
                          "decisions left after its parse",

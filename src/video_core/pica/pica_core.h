@@ -121,7 +121,6 @@ private:
 /// uniform, program and LUT uploads as plain register writes; the parse thread's parses it whole
 /// for the render thread's draws.
 enum class CmdListMode : u8 {
-    Whole, ///< one PicaCore does everything
     Scan,
     Render,
 };
@@ -135,10 +134,16 @@ public:
 
     void SetInterruptHandler(Service::GSP::InterruptHandler& signal_interrupt);
 
-    /// The lists split (Scan or Render, through `split`) or taken whole.
-    void SetSplit(CmdListMode mode, CmdListSplit* split);
+    /// The render thread whose split the lists' walk calls (its Scan* and Render* calls, direct:
+    /// it is the only one); nullptr when it stops.
+    void BindSplit(SgxdRenderer::RenderThread* split);
 
-    void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
+    /// A list's walk, as the scan's or the parse's PicaCore (the caller's, at compile time: the
+    /// dispatch tables and every mode check of the walk are the mode's constants).
+    template <CmdListMode M>
+    void ProcessCmdList(PAddr list, u32 size);
+    /// A list left out (the right eye's): its P3D alone.
+    void SkipCmdList();
 
     // Special-register dispatch: a handler per register id, called through tables indexed by
     // the id; see PicaCore::Dispatch in pica_core.cpp.
@@ -149,19 +154,25 @@ public:
 private:
     void InitializeRegs();
 
-
+    // What the walk calls, the mode's too (pica_core.cpp specials_of, batches_of, flags_of).
+    template <CmdListMode M>
     void WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                bool& stop_requested);
 
+    template <CmdListMode M>
     void WriteInternalRegSequential(u32 id, const u32* __restrict values, u32 count, u32 mask,
                                     bool& stop_requested);
 
+    template <CmdListMode M>
     void WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requested);
 
+    template <CmdListMode M>
     void SubmitImmediate(u32 data);
 
+    template <CmdListMode M>
     void DrawImmediate();
     /// Draws the immediate-mode vertices the rasterizer collected (AccelerateImmediateVertex).
+    template <CmdListMode M>
     void FlushImmediate();
     /// True for the registers that carry immediate-mode data, which do not end a batch.
     static constexpr bool IsImmediateData(u32 id) {
@@ -170,8 +181,10 @@ private:
     }
 
     /// A list's words at addr: the split's, or guest memory's once queued DMAs into it are done.
+    template <CmdListMode M>
     const u8* ListWords(PAddr addr, u32 size);
 
+    template <CmdListMode M>
     void DrawArrays(bool is_indexed);
     /// The primitive assembler's topology from the register, before the assembler is used.
     void SyncAssemblerTopology();
@@ -466,18 +479,15 @@ private:
     }
 
 public:
-    struct RenderPropertiesGuess {
-        u32 vp_height;
-        PAddr paddr;
-        bool vp_heigh_found = false;
-        bool paddr_found = false;
-    };
-
-    RenderPropertiesGuess GuessCmdRenderProperties(PAddr list, u32 size);
-
-    /// Whether a list, with the lists it jumps to, can draw: a draw trigger or an immediate-mode
-    /// vertex in reach, or a jump it does not follow. The registers as they are now, before it.
-    bool CmdListMayDraw(PAddr list, u32 size);
+    /// The scan's mark before a list the right-eye disabler may leave out at its first draw
+    /// (RenderThread::SubmitCmdList): what the list's commands change until then.
+    void MarkList();
+    /// Back to MarkList's state: the list is left out.
+    void RewindList();
+    /// Ends ProcessCmdList's walk after the command it is in (a list left out at its first draw).
+    void StopList() {
+        list_stopped = true;
+    }
 
 private:
     Memory::MemorySystem& memory;
@@ -487,13 +497,7 @@ private:
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
     std::unique_ptr<ShaderEngine> shader_engine;
-    CmdListMode mode{CmdListMode::Whole};
     SgxdRenderer::RenderThread* split{};
-    /// The special-register tables of the mode (pica_core.cpp's, or the scan's).
-    const SpecialFn* specials;
-    const BatchFn* batches;
-    const RegImplInfo* flags;
-    const RegImplInfo* flags_idle;
 
     /// What the vertex unit wrote while the geometry unit mirrored it, not yet in gs_setup
     /// (FlushGsMirror): float uniforms, int uniforms and bools by index, code and swizzle words by
@@ -508,6 +512,18 @@ private:
         std::array<u32, MAX_SWIZZLE_DATA_LENGTH / 32> swizzle{};
     };
     GsMirrorLog gs_mirror{};
+
+    /// MarkList's copy.
+    struct ListMark {
+        std::array<u32, RegsInternal::NUM_REGS> regs;
+        AttributeBuffer default_attributes;
+        ImmediateModeState immediate;
+        bool immediate_open;
+        bool default_attributes_changed;
+        DelayGenerator delay_generator;
+    };
+    std::unique_ptr<ListMark> list_mark;
+    bool list_stopped{};
 };
 
 #define GPU_REG_INDEX(field_name) (offsetof(Pica::PicaCore::Regs, field_name) / sizeof(u32))

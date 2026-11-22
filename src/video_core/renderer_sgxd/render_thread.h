@@ -91,10 +91,18 @@ public:
     };
     using DrawTextures = std::array<GuestRange, 8>;
 
-    /// A command list the guest submitted (GPU::SubmitCmdList), its interrupt requests' delays
-    /// into `irqs`, for P3D once it is queued. ignore_list: the right eye's, its P3D alone when
-    /// it can draw.
-    void SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::vector<u64>& irqs);
+    /// A command list the guest submitted, its interrupts' delays into `irqs`. may_leave_out: a list
+    /// whose first draw is a top-screen picture is the right eye's, left out with its P3D alone.
+    /// Returns whether it was.
+    bool SubmitCmdList(PAddr addr, u32 size, bool may_leave_out, std::vector<u64>& irqs);
+    struct ScanFirstDraw {
+        bool drew;
+        u32 vp_height;
+        PAddr paddr;
+    };
+    const ScanFirstDraw& FirstDraw() const {
+        return scan_first;
+    }
     /// A PICA register the guest wrote outside a list, in order with the lists. Only the parse thread
     /// reads it, so the next list's publish takes it along.
     void RegWrite(u32 id, u32 value);
@@ -594,6 +602,10 @@ private:
     };
     std::vector<u8> scan_draws;
     u32 scan_draw_count{};
+    ScanFirstDraw scan_first{};
+    bool scan_may_leave_out{};
+    bool scan_left_out{};
+    bool FirstDrawLeavesOut();
     std::vector<GuestRange> scan_lists;
     /// Each range's words in scan_words (an 8-byte offset), or NotCopied. A range in guest VRAM
     /// is copied as the scan meets it, the scan reads the copy, and the list's record carries it

@@ -113,7 +113,7 @@ PicaCmdListFastLoop:
     tst     r10, #0x80000000
     beq     3f
     ubfx    r8, r10, #20, #8        // n, the extra words: registers id..id+n
-    lsrs    r12, r12, #2            // RegsUntilSpecial: id..id+until-1 are plain
+    lsrs    r12, r12, #3            // RegsUntilSpecial: id..id+until-1 are plain
     cmp     r12, r8
     bls     3f                      // until <= n: the group reaches a special register
     add     r12, r11, r8
@@ -152,6 +152,138 @@ PicaCmdListFastLoop:
     .cfi_endproc
     .fnend
 .size PicaCmdListFastLoop, . - PicaCmdListFastLoop
+
+// The scan's walk (CmdListMode::Scan, the emulation thread): the same commands, for a register
+// file nothing reads the dirty marks of and only some registers of. A plain write is stored
+// as it lands (a full mask, nearly every write, needs neither the old value nor the mask word),
+// with no dirty mark. A group or a same-register batch of the data ports (flags bit 2: the
+// uniform, program, swizzle and LUT uploads, which the render side takes; their register
+// values are never read) is stepped over whole, its words counted. It exits as
+// PicaCmdListFastLoop does, and also at a batch of any other register.
+//
+//   extern "C" u32 PicaCmdListScanLoop(const u32* head, u32 index, u32 length,
+//                                      const u16* flags_lut, const u32* expand_lut,
+//                                      u32* reg_array, u32* out_count);
+.global PicaCmdListScanLoop
+.hidden PicaCmdListScanLoop
+.type PicaCmdListScanLoop, %function
+.thumb_func
+.p2align 2
+PicaCmdListScanLoop:
+    .fnstart
+    .cfi_startproc
+    // r0 = head, r1 = index, r2 = length, r3 = flags_lut
+    .save   {r4-r11, lr}
+    push    {r4-r11, lr}
+    .cfi_def_cfa_offset 36
+    .cfi_offset r4, -36
+    .cfi_offset r5, -32
+    .cfi_offset r6, -28
+    .cfi_offset r7, -24
+    .cfi_offset r8, -20
+    .cfi_offset r9, -16
+    .cfi_offset r10, -12
+    .cfi_offset r11, -8
+    .cfi_offset lr, -4
+    ldr     r4, [sp, #36]           // expand_lut
+    ldr     r5, [sp, #40]           // reg_array
+    movs    r7, #0                  // applied-write count
+    add     r2, r0, r2, lsl #2
+    add     r1, r0, r1, lsl #2
+    subs    r2, r2, #4              // r1 < r2: a pair to read
+
+.p2align 2
+1:  cmp     r1, r2
+    bhs     3f
+    pld     [r1, #256]              // the scan is the first to read the list's lines
+    ldrd    r9, r10, [r1]           // value, header
+    ubfx    r11, r10, #0, #16       // cmd_id
+    cmp     r11, #0x300
+    bhs     3f
+    ldrh    r12, [r3, r11, lsl #1]  // RegImplInfo flags
+    ubfx    lr, r10, #16, #4        // parameter mask nibble
+    tst     r10, #0x0ff00000        // extra data
+    bne     5f
+    tst     r12, #1                 // NeedsSpecialHandling
+    bne     3f
+    cmp     lr, #15
+    bne     4f
+    str     r9, [r5, r11, lsl #2]   // a full mask: the value
+    adds    r1, #8
+    adds    r7, #1
+    b       1b
+
+4:  // A partial mask: old ^ ((old ^ new) & mask).
+    ldr     lr, [r4, lr, lsl #2]
+    ldr     r8, [r5, r11, lsl #2]
+    eor     r9, r9, r8
+    and     r9, r9, lr
+    eor     r8, r8, r9
+    str     r8, [r5, r11, lsl #2]
+    adds    r1, #8
+    adds    r7, #1
+    b       1b
+
+5:  // Extra data: n words after the pair.
+    ubfx    r8, r10, #20, #8        // n
+    add     r6, r1, r8, lsl #2      // its last word, &head[i + 1 + n], within the list:
+    adds    r6, #4                  // r1 + 4 + 4n <= &head[length - 1]
+    cmp     r6, r2
+    bhi     3f
+    tst     r12, #4                 // a data port
+    bne     8f
+    tst     r10, #0x80000000        // a group (else a batch of the register: the slow path)
+    beq     3f
+    tst     r12, #1
+    bne     3f
+    lsrs    r12, r12, #3            // RegsUntilSpecial: id..id+until-1 are plain
+    cmp     r12, r8
+    bls     3f                      // the group reaches a special register
+    add     r12, r11, r8
+    cmp     r12, #0x300
+    bhs     3f                      // past the register file
+    ldr     r12, [r4, lr, lsl #2]   // the mask, the same for every register of the group
+    add     r7, r7, r8
+    adds    r7, #1
+    adds    r1, #8                  // the first extra word
+6:  ldr     r6, [r5, r11, lsl #2]
+    eor     r9, r9, r6
+    and     r9, r9, r12
+    eor     r6, r6, r9
+    str     r6, [r5, r11, lsl #2]
+    subs    r8, #1
+    bmi     7f
+    ldr     r9, [r1], #4
+    adds    r11, #1
+    b       6b
+
+8:  // A data port: a batch of it, or a group within its run of ports (for a port the flags'
+    // RegsUntilSpecial holds that run), is stepped over.
+    tst     r10, #0x80000000
+    beq     9f
+    lsrs    r12, r12, #3
+    cmp     r12, r8
+    bls     3f                      // the group leaves the ports
+9:  add     r7, r7, r8
+    adds    r7, #1
+    add     r1, r1, r8, lsl #2
+    adds    r1, #8
+7:  // The next command on an even index (the C++ loop's alignment), relative to head.
+    sub     r10, r1, r0
+    tst     r10, #4
+    it      ne
+    addne   r1, #4
+    b       1b
+
+3:  // Done: list end or a command for the slow path.
+    ldr     r12, [sp, #44]          // out_count
+    str     r7, [r12]
+    sub     r0, r1, r0              // back to a command index
+    lsrs    r0, r0, #2
+    pop     {r4-r11, pc}
+    .cfi_endproc
+    .fnend
+.size PicaCmdListScanLoop, . - PicaCmdListScanLoop
 
 .section .note.GNU-stack, "", %progbits
 

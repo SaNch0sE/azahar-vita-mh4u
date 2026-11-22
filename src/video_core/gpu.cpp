@@ -737,11 +737,13 @@ void GPU::SubmitCmdList(u32 index) {
         return;
     }
 
-    const bool ignore = !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size);
+    const bool may_leave_out = right_eye_disabler->BeforeCmdList();
     // Scanned here, parsed on the render thread (RenderThread::SubmitCmdList); P3D once the list
     // is queued, so its fence's ticket covers the list's work.
     std::vector<u64> irqs;
-    impl->render->SubmitCmdList(addr, size, ignore, irqs);
+    impl->render->SubmitCmdList(addr, size, may_leave_out, irqs);
+    const auto& first = impl->render->FirstDraw();
+    right_eye_disabler->AfterCmdList(first.drew, first.vp_height, first.paddr);
     for (const u64 delay_ns : irqs) {
         Signal(Service::GSP::InterruptId::P3D, delay_ns);
     }

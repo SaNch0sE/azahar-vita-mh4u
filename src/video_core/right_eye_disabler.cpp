@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <utility>
+
 #include "common/settings.h"
 #include "right_eye_disabler.h"
 #include "video_core/gpu.h"
@@ -9,11 +11,11 @@
 
 namespace VideoCore {
 
-bool RightEyeDisabler::ShouldAllowCmdQueueTrigger(PAddr addr, u32 size) {
+bool RightEyeDisabler::BeforeCmdList() {
+    after_list = false;
+    may_leave_out = false;
     if (!enabled || !enable_for_frame)
-        return true;
-
-    constexpr u32 top_screen_size = 0x00469000;
+        return false;
 
     if (report_end_frame_pending) {
         ReportEndFrame();
@@ -21,43 +23,40 @@ bool RightEyeDisabler::ShouldAllowCmdQueueTrigger(PAddr addr, u32 size) {
     }
     cmd_queue_trigger_happened = true;
     list_after_top_transfer = true;
+    cmd_trigger_blocked = false;
+    after_list = true;
 
-    auto guess = gpu.impl->pica.GuessCmdRenderProperties(addr, size);
-#ifdef VITA_DIAGNOSTICS
-    if (EyeLog()) {
-        LOG_INFO(HW_GPU,
-                 "eyelog: list {:#x} ({:#x} bytes): viewport height {:#x}, colour {:#x}; top "
-                 "{:#x} drawn {} transferred {} blocked {} both eyes {}",
-                 addr, size, guess.vp_height, guess.paddr, top_screen_buf, top_screen_drawn,
-                 top_screen_transfered, top_screen_blocked, both_eyes_transfered);
+    // Each list is walked once on the emulation thread, by the scan. Only a list after the top
+    // screen's transfer can be the right eye's, and only while the eyes are told apart: the scan of
+    // such a list stops at its first draw if that draws a top-screen picture, and the list is left
+    // out as if never scanned (PicaCore::RewindList). A list that issues no geometry makes no
+    // picture: never the right eye's (upstream c3204e25f); taken as one, state-only lists blocked
+    // the top screen's transfer after them.
+    may_leave_out =
+        top_screen_transfered && !bottom_after_top && !top_screen_blocked && !both_eyes_transfered;
+    return may_leave_out;
+}
+
+void RightEyeDisabler::AfterCmdList(bool drew, u32 vp_height, PAddr paddr) {
+    if (!std::exchange(after_list, false)) {
+        return;
     }
-#endif
-    // A list that issues no geometry makes no picture: never the right eye's (upstream
-    // c3204e25f). Majora's Mask 3D's intro sends state-only lists after its bloom; one taken as
-    // a right eye blocked the top screen's transfer after it, and the screen kept the white of
-    // the fade before the scene. Whether it draws is CmdListMayDraw's answer, as the render
-    // thread's: upstream's flag from the guess's own scan, which stops at its registers and
-    // after 256 commands and counts no immediate-mode vertex, found no draw in any of a game's
-    // lists, and no right eye was left out (its race 195% -> 170%). Asked last, of a candidate
-    // only.
-    if (guess.vp_height == top_screen_size && !top_screen_blocked && !both_eyes_transfered &&
-        gpu.impl->pica.CmdListMayDraw(addr, size)) {
+    // The list's first draw, as the scan met it: a top-screen picture names the top screen's
+    // buffer, and a list that could be left out was (RenderThread::SubmitCmdList).
+    if (drew && vp_height == TopScreenHeight && !top_screen_blocked && !both_eyes_transfered) {
         if (top_screen_buf == 0) {
-            top_screen_buf = guess.paddr;
+            top_screen_buf = paddr;
         }
         top_screen_drawn = true;
-        if (top_screen_transfered && !bottom_after_top) {
+        if (may_leave_out) {
             cmd_trigger_blocked = true;
 #ifdef VITA_DIAGNOSTICS
             counts.lists++;
 #endif
-            return false;
         }
     }
-
-    cmd_trigger_blocked = false;
-    return true;
 }
+
 bool RightEyeDisabler::ShouldAllowDisplayTransfer(PAddr src_address, size_t size,
                                                   u32 output_rows, bool to_right_eye) {
     if (!enabled || !enable_for_frame)
