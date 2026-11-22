@@ -43,8 +43,6 @@ namespace GxmRenderer {
  *             the optimising passes after RasterizerSgxd::Tier2Draws draws
  *   dumpgxp   write each emitted program to host0 as azahar-vs-KEY.gxp / azahar-fs-KEY.gxp
  *             (vs2 / fs2 for the second tier's), a GXP container psp2shaderperf -disasm lists
- *   usse_sechoist
- *             opt in to hoisting vertex uniform loads into the secondary program
  *
  * Debugging a pass on the console:
  *   dumpat=N  check transfers N and N + 1 (counted from 1) against their surfaces and write

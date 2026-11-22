@@ -2798,6 +2798,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     }
     const auto& pipeline = regs.pipeline;
     const u32 count = immediate ? immediate_count : pipeline.num_vertices;
+    draw_serial++;
     const auto describe = [&] {
         return fmt::format("{} draw, topology {}, {} vertices",
                            immediate ? "immediate" : (is_indexed ? "indexed" : "non-indexed"),

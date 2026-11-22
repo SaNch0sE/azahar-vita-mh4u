@@ -13,7 +13,6 @@
 #include <optional>
 #include <stdexcept>
 #include <nihstro/shader_bytecode.h>
-#include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 #include "video_core/renderer_gxm/usse/usse_encoder.h"
 #include "video_core/renderer_gxm/usse/usse_ir.h"
@@ -258,6 +257,12 @@ private:
     };
     void ScanProgram();
     void MarkReachable(uint32_t begin, uint32_t end);
+    /// OpenContext's walk over [begin, end) from `entry`: the instructions a context's emission
+    /// may pass; `backward` takes each taken jump's target at or before the jump. A subroutine's
+    /// walk goes on past every jump (its range is emitted whole); main's (`precise`) not past a
+    /// JMPU its baked bool always takes, nor an END: main emits what it passes (main_walk).
+    std::vector<bool> Walk(uint32_t begin, uint32_t end, uint32_t entry, bool precise,
+                           const std::function<void(uint32_t)>& backward) const;
     void NoteSource(const SourceRegister& reg, uint32_t addr, const Swizzle& swz);
     void NoteDest(const DestRegister& reg, uint8_t mask);
 
@@ -266,15 +271,9 @@ private:
     Quad AllocateQuad();
 
     // --- emission ---
-    void EmitSecondary();
-    void PlanHoist();
-    void CopyHoisted(uint32_t temp, uint8_t lanes);
-    void HoistCopy(Ir::Builder& b, const Quad& dst, uint8_t lanes, const Quad& src,
-                   const Swizzle& swz);
-    int AliasUniform(const Instruction& instr, const SwizzlePattern& swz) const;
-    void NotePrimaryWrite(const DestRegister& dest, uint8_t mask, OpCode::Id op);
     void Prologue();
     void Epilogue();
+    /// In main's context, the instructions main's walk does not pass (main_walk) are left out.
     uint32_t EmitRange(uint32_t begin, uint32_t end);
     uint32_t EmitInstruction(uint32_t offset);
     void EmitArithmetic(const Instruction& instr, const SwizzlePattern& swz);
@@ -284,8 +283,6 @@ private:
     std::optional<Quad> Dest(const DestRegister& reg);
     /// The operand read four wide into `internal` with its swizzle and sign applied.
     Src Materialize(Reg internal, const Operand& op);
-    /// Console bisecting (gxm_flags `vs_noflow`, `vs_nodyn`): programs with control flow,
-    /// or with uniform reads through the address registers, go to the software renderer.
     /// The operand as a four-wide source straight from the unified store (V32NMAD's and
     /// VDP's first source take any swizzle).
     static Src Direct(const Operand& op) {
@@ -309,7 +306,7 @@ private:
     // Control flow.
     int NewLabel();
     int LabelAt(uint32_t offset);
-    void OpenContext(uint32_t begin, uint32_t end);
+    void OpenContext(uint32_t begin, uint32_t end, uint32_t entry, bool precise);
     void Bind(int label);
     bool Bound(int label) const {
         return label_bound[static_cast<std::size_t>(label)];
@@ -333,33 +330,9 @@ private:
     const VsRequest& req;
     Scan scan;
     std::vector<bool> reachable;
+    /// Main's walk over the whole program from its entry (ScanProgram): what main emits.
+    std::vector<bool> main_walk;
     Ir::Builder e;   ///< the primary program
-    Ir::Builder sec; ///< the secondary program
-    /// Where the arithmetic emitters write: the primary program, or the secondary while an
-    /// instruction is being hoisted there (see PlanHoist).
-    Ir::Builder* out = &e;
-    /// The uniform-only hoist: instructions of main's straight-line prefix whose every
-    /// source is a prefetched uniform, a constant, or a temporary lane an earlier hoisted
-    /// instruction wrote, and whose destination is a temporary, run in the secondary
-    /// program - once per draw instead of once per vertex - and leave their result in an
-    /// SA quad. psp2cgc puts a skinning program's whole bone blend there.
-    /// Per instruction offset: 0 not hoisted, 1 hoisted, 2 hoisted into a fresh SA home for
-    /// its temporary (a lane it writes was hoisted before, and the earlier value may still
-    /// have primary readers).
-    std::vector<uint8_t> hoist_at;
-    /// Before the conditional region starting at this offset: the lanes, per temporary, whose
-    /// hoisted value the primary's quad must hold going in (PlanHoist).
-    std::map<uint32_t, std::array<uint8_t, 16>> hoist_flush;
-    int region_depth = 0; ///< conditional regions the emitter is inside (IFC arms, CALLC bodies)
-    std::array<uint8_t, 16> hoist_lanes{};    ///< temp -> lanes whose value is in its SA home
-    std::array<uint8_t, 16> hoist_uncopied{}; ///< of those, lanes the primary's quad lacks
-    std::array<int, 16> hoist_sa{};           ///< temp -> SA home, or -1
-    /// A hoisted whole-register MOV from a prefetched uniform makes that uniform's SA quad
-    /// the temporary's home, read through the MOV's swizzle: no copy, no SA quad of its own.
-    std::array<Swizzle, 16> hoist_swz{};
-    std::array<bool, 16> hoist_alias{};
-    bool hoisting = false; ///< the instruction being emitted is hoisted
-    uint32_t hoisted_count = 0;
     GxpProgram gxp;
 
     // Where things landed.
@@ -375,12 +348,13 @@ private:
     int int_sa = -1;                   ///< uniforms_i's SA base
     uint8_t pa_inputs = 0;             ///< PA registers the attributes take
     uint32_t next_virtual = TmpQuads;  ///< the next free virtual quad's first register
-    std::vector<uint8_t> prefetch;     ///< uniforms the secondary program loads, by index
+    std::vector<uint8_t> prefetch;     ///< uniforms the SA image carries, by index
 
     std::vector<bool> label_bound;
     int end_label = -1;
     std::vector<Context> contexts;
     int loop_depth = 0;
+    std::vector<int> loop_breaks; ///< each open LOOP's label for a BREAKC (-1: none yet)
     bool per_instance = false;
 
     int out_address_pa = -1;          ///< StoreOutputs: the vertex's store address
@@ -501,6 +475,15 @@ void VertexEmitter::ScanProgram() {
         std::min<uint32_t>(req.code_size, static_cast<uint32_t>(req.code.size()));
     reachable.assign(extent, false);
     MarkReachable(req.main_offset, extent);
+    // Main emits what its walk passes (Emit), on either side of its entry: the scan takes all
+    // of it in. MarkReachable stops where it joins a range already marked, which may have been a
+    // subroutine's shorter one.
+    main_walk = Walk(0, extent, req.main_offset, true, nullptr);
+    for (uint32_t offset = 0; offset < extent; offset++) {
+        if (main_walk[offset] && !reachable[offset]) {
+            MarkReachable(offset, extent);
+        }
+    }
     for (uint32_t offset = 0; offset < extent; offset++) {
         if (!reachable[offset]) {
             continue;
@@ -543,6 +526,7 @@ void VertexEmitter::ScanProgram() {
             case OpCode::Id::IFC:
             case OpCode::Id::JMPC:
             case OpCode::Id::CALLC:
+            case OpCode::Id::BREAKC:
                 scan.cc = true;
                 break;
             default:
@@ -671,6 +655,26 @@ void VertexEmitter::Layout() {
         sa_top += 4;
     }
     std::sort(prefetch.begin(), prefetch.end());
+    // The bank, for what the SAs do not hold: an indexed read, a row read with a constant index that
+    // was not prefetched (one past the SAs, a geometry program's own rows), and the variable-primitive
+    // mode's tables, which point past an invocation's rows into it. A program whose reads all fit has
+    // none: the pass copies no bank for it (its pointer slot stays, as a literal).
+    bool bank = scan.a0x || scan.a0y || scan.al || req.gs_rows_table || req.gs_uniform_table;
+    for (uint32_t n = 0; n < 128 && !bank; n++) {
+        bank = scan.uniform_uses[n] != 0 && uniform_sa[n] < 0;
+    }
+    if (bank) {
+        // 128 entries plus a mirror of the first four: an indexed read whose index wraps at 128 may
+        // be issued at an immediate offset from a neighbouring row's address, and the offset runs
+        // into the mirror.
+        program.uniforms.push_back(
+            {UniformKind::FloatBank, 0, resident, 4, 128 + Ir::UniformMirrorRows});
+        program.buffer_pointer = true;
+        program.ldst_base_value = static_cast<int32_t>(resident * 4) - 4;
+        program.buffer_floats = resident + 512 + Ir::UniformMirrorRows * 4;
+    }
+    // The header's secondary register count decides what the hardware allocates: undeclared SA
+    // quads read as black screens.
     gxp.secondary_reg_count = sa_top;
 
     // Output attributes, then the temporaries.
@@ -731,13 +735,10 @@ std::optional<Operand> VertexEmitter::GsSource(const SourceRegister& reg, uint32
         if (n < req.gs_first_uniform || n >= req.gs_first_uniform + req.gs_rows) {
             return std::nullopt;
         }
-        if (hoisting) {
-            Refuse("hoisted read of a geometry input row");
-        }
         const Reg dst = Reg::V(TmpLoad);
-        out->Lda32(dst, Reg::Pa(static_cast<uint8_t>(2 + n - req.gs_first_uniform)), nullptr, 0,
+        e.Lda32(dst, Reg::Pa(static_cast<uint8_t>(2 + n - req.gs_first_uniform)), nullptr, 0,
                    4, 0);
-        out->WdfVertex(0);
+        e.WdfVertex(0);
         return Operand{{Bank::Virtual, TmpLoad}, swz, mod};
     }
     default:
@@ -754,41 +755,22 @@ std::optional<Operand> VertexEmitter::GsTableRead(uint32_t index, uint32_t addr,
     if (addr == 0 && n >= req.gs_rows) {
         return std::nullopt;
     }
-    if (hoisting) {
-        Refuse("hoisted read of a geometry input row");
-    }
     const Reg dst = Reg::V(TmpLoad);
     if (addr == 0) {
-        out->Lda32(dst, Reg::Pa(2), nullptr, static_cast<uint8_t>(n), 4, 0);
+        e.Lda32(dst, table, nullptr, static_cast<uint8_t>(n), 4, 0);
     } else {
         // (index + a) & 127, times 4, plus the table: as the indexed uniform read's address.
         const Reg areg = addr == 1 ? Reg::V(TmpA0X) : addr == 2 ? Reg::V(TmpA0Y) : Reg::V(TmpAlS16);
         const Reg address = Reg::V(TmpAddr);
-        out->MadI16(address, areg, DataReg(DataOnes16), IOp::Imm(static_cast<uint8_t>(n)));
-        out->Bitwise(BwOp::And, address, IOp::Imm(0x7f), IOp::R(address));
-        out->MadI32(address, address, 4, Reg::Pa(2));
-        out->Lda32(dst, address, nullptr, 0, 4, 0);
+        e.MadI16(address, areg, DataReg(DataOnes16), IOp::Imm(static_cast<uint8_t>(n)));
+        e.Bitwise(BwOp::And, address, IOp::Imm(0x7f), IOp::R(address));
+        e.MadI32(address, address, 4, table);
+        e.Lda32(dst, address, nullptr, 0, 4, 0);
     }
-    out->WdfVertex(0);
-    out->Lda32(dst, dst, nullptr, 0, 4, 0);
-    out->WdfVertex(0);
+    e.WdfVertex(0);
+    e.Lda32(dst, dst, nullptr, 0, 4, 0);
+    e.WdfVertex(0);
     return Operand{{Bank::Virtual, TmpLoad}, swz, mod};
-}
-
-// ---------------------------------------------------------------------------------------
-
-void VertexEmitter::EmitSecondary() {
-    sec.secondary = true;
-    sec.skip_invalid = true;
-    const bool any_hoist =
-        std::any_of(hoist_at.begin(), hoist_at.end(), [](uint8_t h) { return h != 0; });
-    if (!any_hoist) {
-        // Nothing to do: no words at all, as the compiler's programs without one.
-        return;
-    }
-    sec.Phas(true);
-    // The hoisted instructions follow, appended as the primary walk reaches them; the
-    // program is ended once that walk is done (Emit).
 }
 
 // ---------------------------------------------------------------------------------------
@@ -813,38 +795,8 @@ Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Sw
         Refuse("input register without a place");
     case RegisterType::Temporary: {
         const uint32_t t = index & 15;
-        uint8_t lanes = 0;
-        for (int l = 0; l < 4; l++) {
-            if (swz[l] <= Ch::W) {
-                lanes |= static_cast<uint8_t>(1u << static_cast<int>(swz[l]));
-            }
-        }
-        const auto home_read = [&]() -> Operand {
-            Swizzle composed = swz;
-            for (int l = 0; l < 4; l++) {
-                if (swz[l] <= Ch::W) {
-                    composed[l] = hoist_swz[t][static_cast<int>(swz[l])];
-                }
-            }
-            return {Quad{Bank::SecAttr, static_cast<uint8_t>(hoist_sa[t])}, composed, mod};
-        };
-        if (hoisting) {
-            // Planned only where every lane read sits in the SA home.
-            if ((hoist_lanes[t] & lanes) != lanes || hoist_sa[t] < 0) {
-                Refuse("hoisted read of a lane the secondary program did not write");
-            }
-            return home_read();
-        }
-        // Every lane read holds the hoisted value: read the SA home itself, like a uniform.
-        // Otherwise the quad, after the hoisted lanes it lacks are copied in.
-        if (hoist_sa[t] >= 0 && (hoist_lanes[t] & lanes) == lanes) {
-            return home_read();
-        }
         if (!temp_quad[t]) {
             Refuse("temporary without a place");
-        }
-        if ((hoist_uncopied[t] & lanes) != 0) {
-            CopyHoisted(t, static_cast<uint8_t>(hoist_uncopied[t] & lanes));
         }
         return {*temp_quad[t], swz, mod};
     }
@@ -855,20 +807,17 @@ Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Sw
             if (uniform_sa[index & 127] >= 0) {
                 return {{Bank::SecAttr, static_cast<uint8_t>(uniform_sa[index & 127])}, swz, mod};
             }
-            if (hoisting) {
-                Refuse("hoisted read of a uniform that is not prefetched");
-            }
             // Not prefetched: loaded here.
             const uint32_t n = index & 127;
             if (n <= 31) {
-                out->Lda32(dst, ptr, nullptr, static_cast<uint8_t>(n * 4), 4, 0);
+                e.Lda32(dst, ptr, nullptr, static_cast<uint8_t>(n * 4), 4, 0);
             } else {
                 const Reg address = Reg::V(TmpAddr);
-                out->Bitwise(BwOp::Or, address, IOp::Imm(static_cast<uint8_t>(n)), IOp::Imm(0));
-                out->MadI32(address, address, 16, ptr);
-                out->Lda32(dst, address, nullptr, 0, 4, 0);
+                e.Bitwise(BwOp::Or, address, IOp::Imm(static_cast<uint8_t>(n)), IOp::Imm(0));
+                e.MadI32(address, address, 16, ptr);
+                e.Lda32(dst, address, nullptr, 0, 4, 0);
             }
-            out->WdfVertex(0);
+            e.WdfVertex(0);
             return {{Bank::Virtual, load_quad}, swz, mod};
         }
         // Indexed by an address register: (index + a) & 127, times 16, plus the buffer
@@ -878,12 +827,12 @@ Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Sw
         // in programs without branches broke skinned vertices on the console (2026-09-06).
         const Reg areg = addr == 1 ? Reg::V(TmpA0X) : addr == 2 ? Reg::V(TmpA0Y) : Reg::V(TmpAlS16);
         const Reg address = Reg::V(TmpAddr);
-        out->MadI16(address, areg, DataReg(DataOnes16),
+        e.MadI16(address, areg, DataReg(DataOnes16),
                     IOp::Imm(static_cast<uint8_t>(index & 127)));
-        out->Bitwise(BwOp::And, address, IOp::Imm(0x7f), IOp::R(address));
-        out->MadI32(address, address, 16, ptr);
-        out->Lda32(dst, address, nullptr, 0, 4, 0);
-        out->WdfVertex(0);
+        e.Bitwise(BwOp::And, address, IOp::Imm(0x7f), IOp::R(address));
+        e.MadI32(address, address, 16, ptr);
+        e.Lda32(dst, address, nullptr, 0, 4, 0);
+        e.WdfVertex(0);
         return {{Bank::Virtual, load_quad}, swz, mod};
     }
     default:
@@ -903,19 +852,6 @@ std::optional<Quad> VertexEmitter::Dest(const DestRegister& reg) {
     }
     case RegisterType::Temporary: {
         const uint32_t t = index & 15;
-        if (hoisting) {
-            if (hoist_sa[t] < 0) {
-                if (sa_top + 4 > SaLimit) {
-                    Refuse("no secondary attributes left for a hoisted temporary");
-                }
-                hoist_sa[t] = static_cast<int>(sa_top);
-                sa_top += 4;
-            }
-            if (hoist_alias[t]) {
-                Refuse("hoisted write into a uniform's own quad");
-            }
-            return Quad{Bank::SecAttr, static_cast<uint8_t>(hoist_sa[t])};
-        }
         if (!temp_quad[t]) {
             Refuse("temporary without a place");
         }
@@ -927,16 +863,16 @@ std::optional<Quad> VertexEmitter::Dest(const DestRegister& reg) {
 }
 
 Src VertexEmitter::Materialize(Reg internal, const Operand& op) {
-    out->Vec(VecOp::Mul, {internal, 0xf}, Direct(op), ConstOne);
+    e.Vec(VecOp::Mul, {internal, 0xf}, Direct(op), ConstOne);
     return {internal, XYZW};
 }
 
 void VertexEmitter::Store(const Quad& dst, uint8_t mask, Reg internal) {
     if (mask & 0x3) {
-        out->MoveInternal({dst.Pair(0), static_cast<uint8_t>(mask & 0x3)}, {internal, XYZW});
+        e.MoveInternal({dst.Pair(0), static_cast<uint8_t>(mask & 0x3)}, {internal, XYZW});
     }
     if (mask & 0xc) {
-        out->MoveInternal({dst.Pair(1), static_cast<uint8_t>(mask >> 2)}, {internal, ZWZW});
+        e.MoveInternal({dst.Pair(1), static_cast<uint8_t>(mask >> 2)}, {internal, ZWZW});
     }
 }
 
@@ -964,10 +900,16 @@ int VertexEmitter::LabelAt(uint32_t offset) {
 /// Enters main or a subroutine. A backward jump's target gets its label now: EmitRange binds
 /// labels as it walks past their offsets, and the jump comes after the target. Only the jumps
 /// the context's own walk reaches count (main's range runs over the subroutines after its END).
-void VertexEmitter::OpenContext(uint32_t begin, uint32_t end) {
+/// The walk starts at `entry`, which main's range may have code before (Emit).
+void VertexEmitter::OpenContext(uint32_t begin, uint32_t end, uint32_t entry, bool precise) {
     contexts.push_back({begin, end, {}});
+    Walk(begin, end, entry, precise, [this](uint32_t target) { LabelAt(target); });
+}
+
+std::vector<bool> VertexEmitter::Walk(uint32_t begin, uint32_t end, uint32_t entry, bool precise,
+                                      const std::function<void(uint32_t)>& backward) const {
     std::vector<bool> seen(end - begin, false);
-    std::vector<uint32_t> work{begin};
+    std::vector<uint32_t> work{entry};
     while (!work.empty()) {
         const uint32_t offset = work.back();
         work.pop_back();
@@ -982,19 +924,30 @@ void VertexEmitter::OpenContext(uint32_t begin, uint32_t end) {
             continue;
         }
         bool taken = op == OpCode::Id::JMPC;
+        bool always = false;
         if (op == OpCode::Id::JMPU) {
             const auto known = KnownBool(flow.bool_uniform_id);
             taken = known && *known != ((flow.num_instructions & 1) != 0);
+            always = taken;
         }
         if (taken || op == OpCode::Id::IFC || op == OpCode::Id::IFU) {
-            if (taken && flow.dest_offset <= offset && flow.dest_offset >= begin) {
-                LabelAt(flow.dest_offset);
+            if (taken && flow.dest_offset <= offset && flow.dest_offset >= begin && backward) {
+                backward(flow.dest_offset);
             }
             work.push_back(flow.dest_offset);
         }
+        if (op == OpCode::Id::IFC || op == OpCode::Id::IFU) {
+            // The if-branch's end goes on at the join past the else-branch, which the walk
+            // along the else-branch need not reach: an END or an always-taken JMPU ends it
+            // (emitted, the code after the join would be left out).
+            work.push_back(flow.dest_offset + flow.num_instructions);
+        }
         // Calls return here; the subroutine opens its own context.
-        work.push_back(offset + 1);
+        if (!(precise && always)) {
+            work.push_back(offset + 1);
+        }
     }
+    return seen;
 }
 
 void VertexEmitter::Bind(int label) {
@@ -1054,6 +1007,10 @@ void VertexEmitter::CondBranch(Instruction::FlowControlType flow, int target, bo
 uint32_t VertexEmitter::EmitRange(uint32_t begin, uint32_t end) {
     uint32_t pc = begin;
     while (pc < end) {
+        if (contexts.size() == 1 && !main_walk[pc]) {
+            pc++;
+            continue;
+        }
         const Context& ctx = contexts.back();
         const auto it = ctx.labels.find(pc);
         if (it != ctx.labels.end() && !Bound(it->second)) {
@@ -1099,7 +1056,7 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
         // swizzle nor a negation, and a four-wide read of the unified store is only proven
         // for the first.
         const Src sb = Materialize(I1, b);
-        out->Vec(vop, {I2, 0xf}, Direct(a), sb);
+        e.Vec(vop, {I2, 0xf}, Direct(a), sb);
         Store(*dst, mask, I2);
         return;
     }
@@ -1120,15 +1077,15 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
         const Src sb = Materialize(I1, b);
         if (std::popcount(mask) == 1) {
             const int lane = std::countr_zero(mask);
-            out->Dot({dst->Pair(lane / 2), static_cast<uint8_t>(1u << (lane & 1))}, Direct(a), sb,
+            e.Dot({dst->Pair(lane / 2), static_cast<uint8_t>(1u << (lane & 1))}, Direct(a), sb,
                      vec4);
         } else {
-            out->Dot({I2, 0x1}, Direct(a), sb, vec4);
+            e.Dot({I2, 0x1}, Direct(a), sb, vec4);
             if (mask & 0x3) {
-                out->MoveInternal({dst->Pair(0), static_cast<uint8_t>(mask & 0x3)}, {I2, XXXX});
+                e.MoveInternal({dst->Pair(0), static_cast<uint8_t>(mask & 0x3)}, {I2, XXXX});
             }
             if (mask & 0xc) {
-                out->MoveInternal({dst->Pair(1), static_cast<uint8_t>(mask >> 2)}, {I2, XXXX});
+                e.MoveInternal({dst->Pair(1), static_cast<uint8_t>(mask >> 2)}, {I2, XXXX});
             }
         }
         return;
@@ -1178,9 +1135,9 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
                     s = YYYY;
                 }
                 if (a.mod == Mod::None) {
-                    out->MoveInternal({dst->Pair(h), m}, {pair, s});
+                    e.MoveInternal({dst->Pair(h), m}, {pair, s});
                 } else {
-                    out->Vec(VecOp::Mul, {dst->Pair(h), m}, {pair, s, a.mod}, ConstOne);
+                    e.Vec(VecOp::Mul, {dst->Pair(h), m}, {pair, s, a.mod}, ConstOne);
                 }
             }
             return;
@@ -1195,8 +1152,8 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
             return;
         }
         const Src sa = Materialize(I0, src1());
-        out->Vec(VecOp::Frc, {I1, 0xf}, sa, sa);                   // a - floor(a)
-        out->Vec(VecOp::Add, {I2, 0xf}, {I1, XYZW, Mod::Neg}, sa); // a - frac
+        e.Vec(VecOp::Frc, {I1, 0xf}, sa, sa);                   // a - floor(a)
+        e.Vec(VecOp::Add, {I2, 0xf}, {I1, XYZW, Mod::Neg}, sa); // a - frac
         Store(*dst, mask, I2);
         return;
     }
@@ -1218,7 +1175,7 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
         Pred pred = Pred::None;
         if (op == OpCode::Id::RCP) {
             // The GLSL emitter's guard: 1/0 leaves the register alone.
-            out->Test(Cond::Ne, 2, {pair}, comp, ConstZero, true);
+            e.Test(Cond::Ne, 2, {pair}, comp, ConstZero, true);
             pred = Pred::P2;
         } else if (op == OpCode::Id::RSQ) {
             Cond cond = Cond::Gt;
@@ -1229,7 +1186,7 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
             } else if (a.mod == Mod::NegAbs) {
                 return; // never positive
             }
-            out->Test(cond, 2, {pair}, comp, ConstZero, true);
+            e.Test(cond, 2, {pair}, comp, ConstZero, true);
             pred = Pred::P2;
         }
         const CompOp cop = op == OpCode::Id::RCP   ? CompOp::Rcp
@@ -1239,7 +1196,7 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
         for (int h = 0; h < 2; h++) {
             const uint8_t m = static_cast<uint8_t>((mask >> (2 * h)) & 3);
             if (m != 0) {
-                out->Comp(cop, {dst->Pair(h), m}, {pair, XYZW, a.mod}, comp, pred);
+                e.Comp(cop, {dst->Pair(h), m}, {pair, XYZW, a.mod}, comp, pred);
             }
         }
         return;
@@ -1264,9 +1221,9 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
                 continue;
             }
             const Dst d{dst->Pair(lane / 2), static_cast<uint8_t>(1u << (lane & 1))};
-            out->Test(cond, 2, {I0}, static_cast<uint8_t>(lane), {I1}, false);
-            out->MoveInternal(d, ConstZero);
-            out->MoveInternal(d, ConstOne, Pred::P2);
+            e.Test(cond, 2, {I0}, static_cast<uint8_t>(lane), {I1}, false);
+            e.MoveInternal(d, ConstZero);
+            e.MoveInternal(d, ConstOne, Pred::P2);
         }
         return;
     }
@@ -1298,41 +1255,36 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
         const Operand b = src2();
         Materialize(I0, a);
         Materialize(I1, b);
-        out->Test(cx, 0, {I0}, 0, {I1}, false);
-        out->Test(cy, 1, {I0}, 1, {I1}, false);
+        e.Test(cx, 0, {I0}, 0, {I1}, false);
+        e.Test(cy, 1, {I0}, 1, {I1}, false);
         return;
     }
     case OpCode::Id::MOVA: {
-        // a0.x/y = (int) src.x/y when within [-128, 127], else 0 (the GLSL helper's rule),
-        // as int16 words the address arithmetic reads. In psp2cgc's shape (2026-09-06):
-        // the pack reads the unified register directly and is never predicated (the
-        // compiler never packs from an internal register nor under a predicate; the
-        // console showed wrong glyph indices with both), the out-of-range case zeroes
-        // the result through a predicated `or.u32`, the compiler's own idiom.
-        const Operand a = src1();
+        // a0.x/y = (int) src.x/y when within [-128, 127], else 0 (the GLSL helper's rule), as int16
+        // words the address arithmetic reads. The conversion truncates toward zero, and SGX543's
+        // pack rounds to nearest only, so the lanes are truncated first, into the load quad: with f
+        // = floor(|a|), min(f, max(-f, a)) is f where a >= 0 and -f where a < 0 (-f >= a there),
+        // without a predicate.
+        // In psp2cgc's shape: the pack reads the unified register directly and is never predicated
+        // (both gave wrong indices), and the out-of-range case zeroes the result through a
+        // predicated `or.u32`.
+        Materialize(I0, src1());
+        e.Vec(VecOp::Frc, {I1, 0x3}, {I0, XYZW, Mod::Abs}, {I0, XYZW, Mod::Abs});
+        e.Vec(VecOp::Add, {I1, 0x3}, {I1, XYZW, Mod::Neg}, {I0, XYZW, Mod::Abs}); // f
+        e.Vec(VecOp::Max, {I2, 0x3}, {I1, XYZW, Mod::Neg}, {I0, XYZW});
+        const Reg pair = Reg::V(TmpLoad);
+        e.Vec(VecOp::Min, {pair, 0x3}, {I1, XYZW}, {I2, XYZW});
         for (int lane = 0; lane < 2; lane++) {
             if (!swz.DestComponentEnabled(lane)) {
                 continue;
             }
             const Reg areg = Reg::V(lane == 0 ? TmpA0X : TmpA0Y);
-            const Ch ch = a.swz[lane];
-            if (ch > Ch::W || a.mod != Mod::None) {
-                // A constant channel or a modifier: through an internal register.
-                const Src sa = Materialize(I0, a);
-                out->Bitwise(BwOp::Or, areg, IOp::Imm(0), IOp::Imm(0));
-                out->Test(Cond::Ge, 2, sa, static_cast<uint8_t>(lane), Data(DataNeg128), true);
-                out->Test(Cond::Le, 2, sa, static_cast<uint8_t>(lane), Data(Data127), true,
-                          Pred::P2);
-                out->PackS16(areg, I0, static_cast<uint8_t>(lane), Pred::P2);
-                continue;
-            }
-            const Reg pair = a.quad.Pair(static_cast<int>(ch) / 2);
-            const uint8_t comp = static_cast<uint8_t>(static_cast<int>(ch) & 1);
-            out->PackS16(areg, pair, comp);
-            out->Test(Cond::Lt, 2, {pair}, comp, Data(DataNeg128), true);
-            out->Bitwise(BwOp::Or, areg, IOp::Imm(0), IOp::Imm(0), Pred::P2);
-            out->Test(Cond::Gt, 2, {pair}, comp, Data(Data127), true);
-            out->Bitwise(BwOp::Or, areg, IOp::Imm(0), IOp::Imm(0), Pred::P2);
+            const uint8_t comp = static_cast<uint8_t>(lane);
+            e.PackS16(areg, pair, comp);
+            e.Test(Cond::Lt, 2, {pair}, comp, Data(DataNeg128), true);
+            e.Bitwise(BwOp::Or, areg, IOp::Imm(0), IOp::Imm(0), Pred::P2);
+            e.Test(Cond::Gt, 2, {pair}, comp, Data(Data127), true);
+            e.Bitwise(BwOp::Or, areg, IOp::Imm(0), IOp::Imm(0), Pred::P2);
         }
         return;
     }
@@ -1360,80 +1312,16 @@ void VertexEmitter::EmitMad(const Instruction& instr, const SwizzlePattern& swz)
     const Src sc = Materialize(I1, c);
     // VMAD's first source only has the table swizzles.
     const Src sa = InVec4Table(a.swz) ? Direct(a) : Materialize(I2, a);
-    out->Mad({I2, 0xf}, sa, sb, sc, true);
+    e.Mad({I2, 0xf}, sa, sb, sc, true);
     Store(*dst, mask, I2);
 }
 
 uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
     const Instruction instr = {req.code[offset]};
     const OpCode::Info info = instr.opcode.Value().GetInfo();
-    // A hoisted instruction is emitted into the secondary program, its temporary
-    // destination an SA home; the first primary read of that temporary copies the home
-    // into the quad (Source), the first primary write ends the hoisted lanes (Dest).
-    const bool hoist = offset < hoist_at.size() && hoist_at[offset] != 0;
-    if (const auto flush = hoist_flush.find(offset); flush != hoist_flush.end()) {
-        // Hoisted lanes this region's primary code writes: into the quad before the branch,
-        // so every path after it finds them where NotePrimaryWrite will say they are.
-        for (uint32_t t = 0; t < 16; t++) {
-            if (const uint8_t lanes = static_cast<uint8_t>(flush->second[t] & hoist_uncopied[t])) {
-                CopyHoisted(t, lanes);
-            }
-        }
-    }
-    const auto begin_hoist = [&](const DestRegister& dest) {
-        hoisting = true;
-        out = &sec;
-        const uint32_t t = static_cast<uint32_t>(dest.GetIndex()) & 15;
-        if (hoist_at[offset] == 2 && hoist_sa[t] >= 0) {
-            // A second value for a lane of this temporary: a fresh home, so readers of the
-            // first, emitted earlier into the primary, keep the home they were given. The
-            // lanes still current move over first, the instruction itself reads them there.
-            if (sa_top + 4 > SaLimit) {
-                Refuse("no secondary attributes left for a hoisted temporary");
-            }
-            const Quad old{Bank::SecAttr, static_cast<uint8_t>(hoist_sa[t])};
-            const Quad fresh{Bank::SecAttr, static_cast<uint8_t>(sa_top)};
-            sa_top += 4;
-            HoistCopy(sec, fresh, hoist_lanes[t], old, hoist_swz[t]);
-            hoist_sa[t] = static_cast<int>(fresh.base);
-            hoist_swz[t] = XYZW;
-            hoist_alias[t] = false;
-        }
-    };
-    const auto end_hoist = [&](const DestRegister& dest, uint8_t mask) {
-        hoisting = false;
-        out = &e;
-        const uint32_t t = static_cast<uint32_t>(dest.GetIndex()) & 15;
-        hoist_lanes[t] |= mask;
-        hoist_uncopied[t] |= mask;
-        hoisted_count++;
-    };
     if (info.type == OpCode::Type::Arithmetic) {
         const SwizzlePattern swz{req.swizzle[instr.common.operand_desc_id]};
-        if (hoist_at[offset] == 3) {
-            // The whole register from a prefetched uniform: the uniform's quad is its home.
-            const uint32_t t = static_cast<uint32_t>(instr.common.dest.Value().GetIndex()) & 15;
-            const int n = AliasUniform(instr, swz);
-            if (n < 0) {
-                Refuse("planned alias is not one");
-            }
-            hoist_sa[t] = uniform_sa[n];
-            hoist_swz[t] = SelectorSwizzle(swz, 1);
-            hoist_alias[t] = true;
-            hoist_lanes[t] = 0xf;
-            hoist_uncopied[t] = 0xf;
-            hoisted_count++;
-            return offset + 1;
-        }
-        if (hoist) {
-            begin_hoist(instr.common.dest.Value());
-            EmitArithmetic(instr, swz);
-            end_hoist(instr.common.dest.Value(), DestMask(swz));
-            return offset + 1;
-        }
         EmitArithmetic(instr, swz);
-        NotePrimaryWrite(instr.common.dest.Value(), DestMask(swz),
-                         instr.opcode.Value().EffectiveOpCode());
         return offset + 1;
     }
     if (info.type == OpCode::Type::MultiplyAdd) {
@@ -1442,14 +1330,7 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
             Refuse("unhandled multiply-add instruction");
         }
         const SwizzlePattern swz{req.swizzle[instr.mad.operand_desc_id]};
-        if (hoist) {
-            begin_hoist(instr.mad.dest.Value());
-            EmitMad(instr, swz);
-            end_hoist(instr.mad.dest.Value(), DestMask(swz));
-            return offset + 1;
-        }
         EmitMad(instr, swz);
-        NotePrimaryWrite(instr.mad.dest.Value(), DestMask(swz), op);
         return offset + 1;
     }
 
@@ -1512,10 +1393,8 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         }
         const uint32_t begin = flow.dest_offset;
         const uint32_t end = begin + flow.num_instructions;
-        OpenContext(begin, end);
-        region_depth += skip >= 0;
+        OpenContext(begin, end, begin, false);
         EmitRange(begin, end);
-        region_depth -= skip >= 0;
         for (const auto& [at, label] : contexts.back().labels) {
             if (!Bound(label)) {
                 Refuse("jump into code the subroutine never reaches");
@@ -1547,7 +1426,6 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         }
         const int else_label = NewLabel();
         CondBranch(flow, else_label, false);
-        region_depth++;
         EmitRange(if_begin, else_begin);
         if (flow.num_instructions != 0) {
             const int end = NewLabel();
@@ -1558,7 +1436,6 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         } else {
             Bind(else_label);
         }
-        region_depth--;
         return endif;
     }
 
@@ -1578,15 +1455,38 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         e.Test(Cond::Gt, 2, {count}, 0, {Reg::Sa(iq)}, true);
         Branch(Pred::P2, exit);
         loop_depth++;
+        loop_breaks.push_back(-1);
         EmitRange(offset + 1, flow.dest_offset + 1);
+        const int broken = loop_breaks.back();
+        loop_breaks.pop_back();
         loop_depth--;
-        e.Vec(VecOp::Add, {Reg::V(TmpAlF), 0x1}, {Reg::V(TmpAlF), XYZW},
-              {Reg::Sa(static_cast<uint8_t>(iq + 2)), XXXX});
-        e.PackS16(Reg::V(TmpAlS16), Reg::V(TmpAlF), 0);
+        const auto step = [&] {
+            e.Vec(VecOp::Add, {Reg::V(TmpAlF), 0x1}, {Reg::V(TmpAlF), XYZW},
+                  {Reg::Sa(static_cast<uint8_t>(iq + 2)), XXXX});
+            e.PackS16(Reg::V(TmpAlS16), Reg::V(TmpAlF), 0);
+        };
+        step();
         e.Vec(VecOp::Add, {count, 0x1}, {count, XYZW}, ConstOne);
         Branch(Pred::None, top);
+        if (broken >= 0) {
+            // A round left by a BREAKC still steps aL (upstream's interpreter).
+            Bind(broken);
+            step();
+        }
         Bind(exit);
         return flow.dest_offset + 1;
+    }
+
+    case OpCode::Id::BREAKC: {
+        // Out of the innermost LOOP, from an IF or a subroutine inside it too (both inlined).
+        if (loop_breaks.empty()) {
+            Refuse("BREAKC outside a LOOP");
+        }
+        if (loop_breaks.back() < 0) {
+            loop_breaks.back() = NewLabel();
+        }
+        CondBranch(flow, loop_breaks.back(), true);
+        return offset + 1;
     }
 
     case OpCode::Id::SETEMIT:
@@ -1674,431 +1574,6 @@ void VertexEmitter::EpilogueStreamOut() {
 }
 
 // ---------------------------------------------------------------------------------------
-// ---------------------------------------------------------------------------------------
-// The uniform-only hoist
-
-void VertexEmitter::NotePrimaryWrite(const DestRegister& dest, uint8_t mask, OpCode::Id op) {
-    if (op == OpCode::Id::MOVA || op == OpCode::Id::CMP ||
-        dest.GetRegisterType() != RegisterType::Temporary) {
-        return;
-    }
-    const uint32_t t = static_cast<uint32_t>(dest.GetIndex()) & 15;
-    hoist_lanes[t] &= static_cast<uint8_t>(~mask);
-    hoist_uncopied[t] &= static_cast<uint8_t>(~mask);
-}
-
-void VertexEmitter::CopyHoisted(uint32_t t, uint8_t lanes) {
-    // The SA home's lanes into the primary's quad, a pair at a time. Inside a conditional
-    // region the copy runs on one path only, so the lanes stay marked uncopied and a later
-    // reader copies again; outside, the quad holds them from here on.
-    const Quad home{Bank::SecAttr, static_cast<uint8_t>(hoist_sa[t])};
-    HoistCopy(e, *temp_quad[t], lanes, home, hoist_swz[t]);
-    if (region_depth == 0) {
-        hoist_uncopied[t] &= static_cast<uint8_t>(~lanes);
-    }
-}
-
-// dst's lanes from src read through swz, a pair at a time. Both moves name the source by its
-// quad base, the second pair through the swizzle's z and w entries, which is the form Store
-// uses and the passes that rebase pair moves expect.
-void VertexEmitter::HoistCopy(Ir::Builder& b, const Quad& dst, uint8_t lanes, const Quad& src,
-                              const Swizzle& swz) {
-    if (lanes & 0x3) {
-        b.MoveInternal({dst.Pair(0), static_cast<uint8_t>(lanes & 0x3)}, {src.Pair(0), swz});
-    }
-    if (lanes & 0xc) {
-        b.MoveInternal({dst.Pair(1), static_cast<uint8_t>(lanes >> 2)},
-                       {src.Pair(0), Swizzle{swz[2], swz[3], swz[2], swz[3]}});
-    }
-}
-
-// The uniform a hoisted MOV of a whole register from a prefetched uniform copies, or -1: such
-// a MOV needs no instruction, the temporary's home becomes the uniform's quad.
-int VertexEmitter::AliasUniform(const Instruction& instr, const SwizzlePattern& swz) const {
-    const OpCode::Info info = instr.opcode.Value().GetInfo();
-    if (info.type != OpCode::Type::Arithmetic ||
-        instr.opcode.Value().EffectiveOpCode() != OpCode::Id::MOV || DestMask(swz) != 0xf ||
-        swz.negate_src1 || instr.common.address_register_index != 0) {
-        return -1;
-    }
-    const SourceRegister src = instr.common.GetSrc1(false);
-    if (src.GetRegisterType() != RegisterType::FloatUniform) {
-        return -1;
-    }
-    // Only a swizzle whose composition with any later read stays in the hardware's tables:
-    // the identity leaves the read's own, a broadcast turns it into a broadcast.
-    const Swizzle read = SelectorSwizzle(swz, 1);
-    const bool broadcast = read[0] == read[1] && read[1] == read[2] && read[2] == read[3];
-    if (read != XYZW && !broadcast) {
-        return -1;
-    }
-    const uint32_t n = static_cast<uint32_t>(src.GetIndex()) & 127;
-    return uniform_sa[n] >= 0 ? static_cast<int>(n) : -1;
-}
-
-void VertexEmitter::PlanHoist() {
-    // Walks the program in the order the emitter emits it, deciding per instruction. The
-    // state per temporary lane: whether an earlier hoisted instruction wrote it and nothing
-    // in the primary has since (hoisted), whether anything wrote it (defined), whether a
-    // hoisted instruction ever wrote it (ever). A lane hoisted a second time gets a fresh SA
-    // home for its temporary: the first home holds the first value for the primary readers
-    // already emitted against it, the fresh one the second.
-    //
-    // Conditional regions, an IFC's two arms and a CALLC's subroutine, run on one path only;
-    // the secondary runs unconditionally. Inside one, a hoisted write is allowed only to a
-    // lane that was undefined at the region's entry and is written once in the whole region
-    // (the two arms included), so no path can observe a value the hoist replaced. Lanes
-    // hoisted before the region that the region's primary code writes are copied into the
-    // quad before the branch, so the paths agree on where the value lives afterwards.
-    // Straight-line inlining, a CALL or a bool-known CALLU or IFU, opens no region. Anything
-    // else - loops, jumps - ends the walk; what was decided before stays valid.
-    hoist_at.assign(req.code_size, 0);
-    hoist_flush.clear();
-    hoist_sa.fill(-1);
-    hoist_swz.fill(XYZW);
-    hoist_alias.fill(false);
-    hoist_lanes.fill(0);
-    hoist_uncopied.fill(0);
-    // Opt-in until the console has shown the declared-SA fix holds: `usse_sechoist`.
-    static const bool hoist_on = GxmFlag("usse_sechoist");
-    if (!hoist_on || level < 2 || req.mode != VsMode::Draw) {
-        return;
-    }
-    using Lanes = std::array<uint8_t, 16>;
-    Lanes hoisted{}, defined{}, ever{};
-    // Lanes the primary has read since the hoisted write that produced them: a second
-    // hoisted write to such a lane needs a fresh home, one to a lane nothing has read since
-    // can overwrite in place (the secondary runs in order; only primary readers, emitted
-    // against the earlier home, would see the later value).
-    Lanes pread{};
-    std::array<uint8_t, 16> home{}; // 0 none, 1 an SA quad of its own, 2 a uniform's quad
-    uint32_t reserved = 0;          // SA quads the hoisted temporaries would take
-    std::vector<Lanes> forbidden;   // per open region: lanes no hoisted write may touch
-    std::vector<uint32_t> entered;
-    int depth = 0;
-
-    const auto read_lanes = [](const Swizzle& swz) {
-        uint8_t read = 0;
-        for (int l = 0; l < 4; l++) {
-            if (swz[l] <= Ch::W) {
-                read |= static_cast<uint8_t>(1u << static_cast<int>(swz[l]));
-            }
-        }
-        return read;
-    };
-    const auto note_read = [&](const SourceRegister& reg, const Swizzle& swz) {
-        if (reg.GetRegisterType() == RegisterType::Temporary) {
-            pread[static_cast<uint32_t>(reg.GetIndex()) & 15] |= read_lanes(swz);
-        }
-    };
-    const auto source_ok = [&](const SourceRegister& reg, uint32_t addr, const Swizzle& swz) {
-        if (addr != 0) {
-            return false;
-        }
-        const uint32_t index = static_cast<uint32_t>(reg.GetIndex());
-        switch (reg.GetRegisterType()) {
-        case RegisterType::FloatUniform:
-            return uniform_sa[index & 127] >= 0;
-        case RegisterType::Temporary: {
-            const uint8_t read = read_lanes(swz);
-            return (hoisted[index & 15] & read) == read;
-        }
-        default:
-            return false;
-        }
-    };
-    // The destination side of a decision: whether the write may be hoisted, and the state
-    // after it either way. The value is what hoist_at records: 1 hoisted into the
-    // temporary's home, 2 into a fresh home (a lane written was hoisted before, or the home is
-    // a uniform's quad), 3 an alias of a uniform's quad, no instruction at all.
-    const auto decide = [&](const DestRegister& dest, uint8_t mask, bool sources_ok,
-                            bool alias) -> uint8_t {
-        if (dest.GetRegisterType() != RegisterType::Temporary) {
-            return 0;
-        }
-        const uint32_t t = static_cast<uint32_t>(dest.GetIndex()) & 15;
-        bool ok =
-            sources_ok && mask != 0 && (forbidden.empty() || (forbidden.back()[t] & mask) == 0);
-        const bool fresh = home[t] == 2 || (ever[t] & mask & pread[t]) != 0;
-        uint8_t kind = 0;
-        if (ok && alias) {
-            kind = 3;
-            home[t] = 2;
-        } else if (ok) {
-            // A quad of its own: the first, or a fresh one.
-            if (home[t] != 1 || fresh) {
-                ok = sa_top + (reserved + 1) * 4 <= SaLimit;
-                reserved += ok;
-            }
-            if (ok) {
-                kind = fresh ? 2 : 1;
-                home[t] = 1;
-            }
-        }
-        if (ok) {
-            ever[t] |= mask;
-            hoisted[t] |= mask;
-            pread[t] &= static_cast<uint8_t>(~mask);
-        } else {
-            hoisted[t] &= static_cast<uint8_t>(~mask);
-        }
-        defined[t] |= mask;
-        return kind;
-    };
-
-    // Every temporary lane written in [begin, end) as the emitter inlines it: once, and more
-    // than once. False when the range holds flow control the walk does not model.
-    const std::function<bool(uint32_t, uint32_t, Lanes&, Lanes&)> scan_writes =
-        [&](uint32_t begin, uint32_t end, Lanes& once, Lanes& multi) {
-            const auto note = [&](const DestRegister& dest, uint8_t mask) {
-                if (dest.GetRegisterType() != RegisterType::Temporary) {
-                    return;
-                }
-                const uint32_t t = static_cast<uint32_t>(dest.GetIndex()) & 15;
-                multi[t] |= static_cast<uint8_t>(once[t] & mask);
-                once[t] |= mask;
-            };
-            for (uint32_t offset = begin; offset < end && offset < req.code_size; offset++) {
-                const Instruction instr = {req.code[offset]};
-                const OpCode::Info info = instr.opcode.Value().GetInfo();
-                const auto op = instr.opcode.Value().EffectiveOpCode();
-                if (info.type == OpCode::Type::Arithmetic) {
-                    if (op != OpCode::Id::MOVA && op != OpCode::Id::CMP) {
-                        note(instr.common.dest.Value(),
-                             DestMask(SwizzlePattern{req.swizzle[instr.common.operand_desc_id]}));
-                    }
-                    continue;
-                }
-                if (info.type == OpCode::Type::MultiplyAdd) {
-                    note(instr.mad.dest.Value(),
-                         DestMask(SwizzlePattern{req.swizzle[instr.mad.operand_desc_id]}));
-                    continue;
-                }
-                const auto& flow = instr.flow_control;
-                switch (op) {
-                case OpCode::Id::NOP:
-                    continue;
-                case OpCode::Id::END:
-                    return true;
-                case OpCode::Id::CALL:
-                case OpCode::Id::CALLC:
-                    if (!scan_writes(flow.dest_offset, flow.dest_offset + flow.num_instructions,
-                                     once, multi)) {
-                        return false;
-                    }
-                    continue;
-                case OpCode::Id::CALLU: {
-                    const auto known = KnownBool(flow.bool_uniform_id);
-                    if (!known) {
-                        return false;
-                    }
-                    if (*known &&
-                        !scan_writes(flow.dest_offset, flow.dest_offset + flow.num_instructions,
-                                     once, multi)) {
-                        return false;
-                    }
-                    continue;
-                }
-                case OpCode::Id::IFC:
-                case OpCode::Id::IFU: {
-                    const uint32_t endif = flow.dest_offset + flow.num_instructions;
-                    if (op == OpCode::Id::IFU && !KnownBool(flow.bool_uniform_id)) {
-                        return false;
-                    }
-                    if (!scan_writes(offset + 1, endif, once, multi)) {
-                        return false;
-                    }
-                    offset = endif - 1;
-                    continue;
-                }
-                default:
-                    return false;
-                }
-            }
-            return true;
-        };
-
-    // A conditional region about to be walked: what to flush before it, what its hoisted
-    // writes must avoid.
-    const auto enter_region = [&](uint32_t at, uint32_t begin, uint32_t end) {
-        Lanes once{}, multi{};
-        if (!scan_writes(begin, end, once, multi)) {
-            return false;
-        }
-        Lanes flush{}, forbid{};
-        bool any_flush = false;
-        for (uint32_t t = 0; t < 16; t++) {
-            flush[t] = static_cast<uint8_t>(hoisted[t] & (once[t] | multi[t]));
-            any_flush = any_flush || flush[t] != 0;
-            forbid[t] = static_cast<uint8_t>(defined[t] | multi[t]);
-        }
-        if (any_flush) {
-            hoist_flush[at] = flush;
-        }
-        forbidden.push_back(forbid);
-        return true;
-    };
-
-    const std::function<bool(uint32_t, uint32_t)> walk = [&](uint32_t begin, uint32_t end) {
-        for (uint32_t offset = begin; offset < end && offset < req.code_size; offset++) {
-            const Instruction instr = {req.code[offset]};
-            const OpCode::Info info = instr.opcode.Value().GetInfo();
-            const auto op = instr.opcode.Value().EffectiveOpCode();
-            if (info.type == OpCode::Type::Arithmetic) {
-                const SwizzlePattern swz = {req.swizzle[instr.common.operand_desc_id]};
-                const bool inverted = (info.subtype & OpCode::Info::SrcInversed) != 0;
-                const auto src1_ok = [&] {
-                    return source_ok(instr.common.GetSrc1(inverted),
-                                     !inverted * instr.common.address_register_index,
-                                     SelectorSwizzle(swz, 1));
-                };
-                const auto src2_ok = [&] {
-                    return source_ok(instr.common.GetSrc2(inverted),
-                                     inverted * instr.common.address_register_index,
-                                     SelectorSwizzle(swz, 2));
-                };
-                bool ok = false;
-                switch (op) {
-                case OpCode::Id::ADD:
-                case OpCode::Id::MUL:
-                case OpCode::Id::MAX:
-                case OpCode::Id::MIN:
-                case OpCode::Id::DP3:
-                case OpCode::Id::DP4:
-                case OpCode::Id::DPH:
-                case OpCode::Id::DPHI:
-                    ok = src1_ok() && src2_ok();
-                    break;
-                case OpCode::Id::MOV:
-                case OpCode::Id::FLR:
-                case OpCode::Id::RCP:
-                case OpCode::Id::RSQ:
-                case OpCode::Id::EX2:
-                case OpCode::Id::LG2:
-                    ok = src1_ok();
-                    break;
-                default:
-                    break;
-                }
-                const bool two_sources = op != OpCode::Id::MOV && op != OpCode::Id::FLR &&
-                                         op != OpCode::Id::RCP && op != OpCode::Id::RSQ &&
-                                         op != OpCode::Id::EX2 && op != OpCode::Id::LG2 &&
-                                         op != OpCode::Id::MOVA;
-                const auto note_reads = [&] {
-                    note_read(instr.common.GetSrc1(inverted), SelectorSwizzle(swz, 1));
-                    if (two_sources) {
-                        note_read(instr.common.GetSrc2(inverted), SelectorSwizzle(swz, 2));
-                    }
-                };
-                if (op == OpCode::Id::MOVA || op == OpCode::Id::CMP) {
-                    note_reads();
-                    continue; // no temporary written, nothing to hoist
-                }
-                hoist_at[offset] = decide(instr.common.dest.Value(), DestMask(swz), ok,
-                                          AliasUniform(instr, swz) >= 0);
-                if (hoist_at[offset] == 0) {
-                    note_reads();
-                }
-                continue;
-            }
-            if (info.type == OpCode::Type::MultiplyAdd) {
-                const SwizzlePattern swz = {req.swizzle[instr.mad.operand_desc_id]};
-                const bool inverted = op == OpCode::Id::MADI;
-                const bool ok =
-                    (op == OpCode::Id::MAD || op == OpCode::Id::MADI) &&
-                    source_ok(instr.mad.GetSrc1(inverted), 0, SelectorSwizzle(swz, 1)) &&
-                    source_ok(instr.mad.GetSrc2(inverted),
-                              !inverted * instr.mad.address_register_index,
-                              SelectorSwizzle(swz, 2)) &&
-                    source_ok(instr.mad.GetSrc3(inverted),
-                              inverted * instr.mad.address_register_index, SelectorSwizzle(swz, 3));
-                hoist_at[offset] = decide(instr.mad.dest.Value(), DestMask(swz), ok, false);
-                if (hoist_at[offset] == 0) {
-                    note_read(instr.mad.GetSrc1(inverted), SelectorSwizzle(swz, 1));
-                    note_read(instr.mad.GetSrc2(inverted), SelectorSwizzle(swz, 2));
-                    note_read(instr.mad.GetSrc3(inverted), SelectorSwizzle(swz, 3));
-                }
-                continue;
-            }
-            const auto& flow = instr.flow_control;
-            switch (op) {
-            case OpCode::Id::NOP:
-                continue;
-            case OpCode::Id::END:
-                return true;
-            case OpCode::Id::CALL:
-            case OpCode::Id::CALLU:
-            case OpCode::Id::CALLC: {
-                if (op == OpCode::Id::CALLU) {
-                    const auto known = KnownBool(flow.bool_uniform_id);
-                    if (!known) {
-                        return false;
-                    }
-                    if (!*known) {
-                        continue;
-                    }
-                }
-                // A subroutine reached twice would emit its hoisted instructions twice into
-                // one secondary program, the second overwriting the homes the first's readers
-                // use; the walk ends before the second entry.
-                const uint32_t sub = flow.dest_offset;
-                const uint32_t sub_end = sub + flow.num_instructions;
-                if (depth >= 8 || std::find(entered.begin(), entered.end(), sub) != entered.end()) {
-                    return false;
-                }
-                entered.push_back(sub);
-                const bool conditional = op == OpCode::Id::CALLC;
-                if (conditional && !enter_region(offset, sub, sub_end)) {
-                    return false;
-                }
-                depth++;
-                const bool more = walk(sub, sub_end);
-                depth--;
-                if (conditional) {
-                    forbidden.pop_back();
-                }
-                if (!more) {
-                    return false;
-                }
-                continue;
-            }
-            case OpCode::Id::IFU:
-            case OpCode::Id::IFC: {
-                const uint32_t if_begin = offset + 1;
-                const uint32_t else_begin = flow.dest_offset;
-                const uint32_t endif = else_begin + flow.num_instructions;
-                if (op == OpCode::Id::IFU) {
-                    const auto known = KnownBool(flow.bool_uniform_id);
-                    if (!known) {
-                        return false;
-                    }
-                    const bool more = *known ? walk(if_begin, else_begin) : walk(else_begin, endif);
-                    if (!more) {
-                        return false;
-                    }
-                    offset = endif - 1;
-                    continue;
-                }
-                if (!enter_region(offset, if_begin, endif)) {
-                    return false;
-                }
-                const bool more = walk(if_begin, else_begin) && walk(else_begin, endif);
-                forbidden.pop_back();
-                if (!more) {
-                    return false;
-                }
-                offset = endif - 1;
-                continue;
-            }
-            default:
-                return false; // loops and jumps end the walk
-            }
-        }
-        return true;
-    };
-    walk(req.main_offset, req.code_size);
-}
-
 // Prologue and epilogue
 
 void VertexEmitter::Prologue() {
@@ -2285,15 +1760,24 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
     ScanProgram();
     input_regs = scan.inputs;
     Layout();
-    PlanHoist();
-    EmitSecondary();
 
     e.skip_invalid = true;
     end_label = NewLabel();
     e.Phas(true);
     e.Nop();
     Prologue();
-    OpenContext(req.main_offset, req.code_size);
+    // Main emits what its walk passes, from its entry on, and may jump back into code before it: a
+    // binary several programs share keeps common tails there, and an entry's own code may end in a
+    // jump past the others'. Then main's range is the whole program, the code before the entry
+    // first, behind a branch to it.
+    const bool before_entry =
+        std::find(main_walk.begin(), main_walk.begin() + req.main_offset, true) !=
+        main_walk.begin() + req.main_offset;
+    OpenContext(before_entry ? 0 : req.main_offset, req.code_size, req.main_offset, true);
+    if (before_entry) {
+        Branch(Pred::None, LabelAt(req.main_offset));
+        EmitRange(0, req.main_offset);
+    }
     EmitRange(req.main_offset, req.code_size);
     for (const auto& [at, label] : contexts.back().labels) {
         if (!Bound(label)) {
@@ -2301,20 +1785,11 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
         }
     }
     contexts.pop_back();
-    // The hoist takes SA quads past the prefetch as it emits (fresh homes, section
-    // "hoist"), and the header's secondary register count decides what the hardware
-    // allocates: Layout's count left them undeclared, which Vita3K did not mind and the
-    // console answered with black screens (2026-09-08).
-    gxp.secondary_reg_count = sa_top;
+    // The prefetched uniforms reach their SAs through the SA image the secondary PDS program
+    // DMAs: no secondary USSE program. Loads of its own are not complete when a draw's first
+    // vertices read them (docs/sgxd/pds.md).
     for (const uint8_t n : prefetch) {
         gxp.prefetched_uniforms.emplace_back(static_cast<uint32_t>(uniform_sa[n]), n);
-    }
-    if (sec.Count() != 0) {
-        sec.EndSecondary();
-        if (hoisted_count != 0 && std::getenv("USSE_IR_DUMP") != nullptr) {
-            std::fprintf(stderr, "hoisted %u instructions into the secondary program\n",
-                         hoisted_count);
-        }
     }
     const std::size_t epilogue_at = e.Count();
     Bind(end_label);
@@ -2333,11 +1808,6 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
     Encoder primary;
     const Ir::LowerResult lowered = e.Lower(primary, level);
     primary.FinishNosched();
-    Encoder secondary;
-    if (sec.Count() != 0) {
-        sec.Lower(secondary);
-        secondary.FinishNosched();
-    }
 
     gxp.vertex = true;
     gxp.per_instance = per_instance;
@@ -2360,7 +1830,6 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
         gxp.literals.push_back(0u);
     }
     gxp.primary = primary.Words();
-    gxp.secondary = secondary.Words();
     return gxp;
 }
 
