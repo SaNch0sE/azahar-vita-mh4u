@@ -297,6 +297,37 @@ out:
     return ret;
 }
 
+// SceShell draws on IFTU plane b and blanks it when idle; taken with a picture up, it sleeps
+// before the blank and the display mixes the app's range into the picture. The plane's
+// registers tell (the kernel's frame buffer record keeps the last picture through a blank).
+// Only the primary head's IFTU is sure to be clocked. For a caller that knows the display is
+// on: the block is mapped for the read as SceIftu maps it, a device page, and given back.
+#define SHELL_IFTU0B_PA 0xE5021000u
+#define SHELL_IFTU1B_PA 0xE5031000u
+
+int azaharShellPlaneShown(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    SceKernelAllocMemBlockKernelOpt opt = {0};
+    opt.size = sizeof(opt);
+    opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_PADDR;
+    opt.paddr = ksceDisplayGetPrimaryHead() == 0 ? SHELL_IFTU0B_PA : SHELL_IFTU1B_PA;
+    int ret = ksceKernelAllocMemBlock("AzaharIftu", 0x20100806, 0x1000, &opt);
+    if (ret >= 0) {
+        const SceUID block = ret;
+        void *base = NULL;
+        ret = ksceKernelGetMemBlockBase(block, &base);
+        if (ret >= 0) {
+            const volatile uint32_t *plane = base;
+            const uint32_t bank = (plane[0x04 / 4] >> 1 & 1) + 2; // the one scanned out
+            ret = plane[(bank << 8 | 0x4C) / 4] == 0;             // its blank flag
+        }
+        ksceKernelFreeMemBlock(block);
+    }
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
 int azaharVolumeKeys(void) {
     uint32_t state;
     ENTER_SYSCALL(state);

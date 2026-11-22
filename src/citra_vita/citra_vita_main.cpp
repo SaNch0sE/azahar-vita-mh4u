@@ -38,7 +38,6 @@
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
 #include <psp2/shellutil.h>
-#include <psp2/touch.h>
 #include <psp2/vshbridge.h>
 #include <taihen.h>
 #include "citra_vita/adhoc.h"
@@ -161,6 +160,7 @@ int _vita_net_init(void);
 // 75: the shell's CDRAM moves faster at a suspend, its resume and the exit (nothing to call).
 // 76: and faster again (its kernel alias normal non-cacheable).
 // 93: firmware 3.73 known (a 3.73 console that ran an older build still has its module).
+// 95: the shell's display plane kept off while its CDRAM is the app's (a notification's bands).
 // The app runs with its own version only: another one loaded stops the start (LoadAzaharNative).
 
 namespace {
@@ -1245,6 +1245,11 @@ void RestoreStateAtStart(Core::System& system, u32 slot) {
  * A suspend while sgxd holds the GPU (docs/sgxd/takeover.md). The title is paused, the GPU's
  * queue stopped and waited for, and the GPU given back (SuspendGpu); every thread's sgxd call
  * waits from then on. A standby asks for it and waits (StandbyThread); the power callback asks
+ * too, for a display turned off with no standby after it. A retail console turns its display
+ * off first (the bit the SDK names APP_SUSPEND), also after a while without input; the display
+ * coming on again is APP_RESUMING. From the suspend to the resume the GPU is the system's (the
+ * lock screen draws with it); it is taken again once SceAppMgr no longer reports the system's
+ * UI over the app (PowerThread).
  */
 std::atomic<bool> power_suspended{false}, power_resumed{false};
 /// The window whose pause menu a suspend opens over a running title (EmulatorMain's).
@@ -1302,20 +1307,20 @@ int OnPower(int, int, int arg, void*) {
 }
 
 // The frontend's loop waits at sgxd's gate from the suspend to the take after it: the stall
-// watch is told it lives (it would take the wait for a hang and end the process). The take
-// waits for a press of the game's buttons or the screen begun after the resume: as the power
-// button turned the display on, before the lock screen took the input, the pad data was not
-// empty (its power bit, held still), and taken then, the GPU left the lock screen undrawn.
-constexpr u32 PressButtons = 0x0000FFFF;
-
+// watch is told it lives (it would take the wait for a hang and end the process).
+//
+// After the resume the take waits until SceAppMgr no longer reports the system's UI over the app
+// (isSystemUiOverlaid: its impose state or power save mode). In power
+// save mode SceAppMgr gives the pad and the touch panel to the system and leaves the app's display
+// plane without an owner; SceShell turns the mode on as the display goes off and off once its lock
+// screen is gone. SCE_APPMGR_SYSTEMEVENT_ON_RESUME is no sign of either.
+// The flag clears a little before the shell blanks its display plane, whose memory would show
+// the app's data: so the take waits for that plane as well.
 int PowerThread(SceSize, void*) {
     const SceUID callback = sceKernelCreateCallback("AzaharPower", 0, OnPower, nullptr);
     ASSERT_MSG(callback >= 0 && scePowerRegisterCallback(callback) >= 0,
                "the power callback was not registered");
-    // What was held at the last look: everything until the resume, so only a press begun
-    // after it counts.
-    u32 held = PressButtons;
-    bool touched = true;
+    bool plane_waited = false;
     for (;;) {
         sceKernelDelayThreadCB(100 * 1000);
 #ifdef VITA_DIAGNOSTICS
@@ -1353,36 +1358,26 @@ int PowerThread(SceSize, void*) {
             VitaFrontend::CrashReport::StallWatchBeat();
         }
         if (!power_resumed) {
-            held = PressButtons;
-            touched = true;
             continue;
         }
-        SceCtrlData pad{};
-        SceTouchData touch{};
-        const int peeked = sceCtrlPeekBufferPositive(0, &pad, 1);
-        const u32 buttons = peeked > 0 ? pad.buttons & PressButtons : 0;
-        const bool touching =
-            sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0 && touch.reportNum > 0;
-        const bool pressed = (buttons & ~held) != 0 || (touching && !touched);
-#ifdef VITA_DIAGNOSTICS
-        // What the wait for the press sees, as it changes.
-        static int last_peeked = 0x7fffffff;
-        static u32 last_buttons = ~0u;
-        if (peeked != last_peeked || pad.buttons != last_buttons) {
-            sceClibPrintf("[azahar] after the resume: pad %08x buttons %08x (held %08x), touch "
-                          "%d\n",
-                          static_cast<unsigned>(peeked), static_cast<unsigned>(pad.buttons),
-                          static_cast<unsigned>(held), touching ? 1 : 0);
-            last_peeked = peeked;
-            last_buttons = pad.buttons;
-        }
-#endif
-        held = buttons;
-        touched = touching;
-        if (!pressed) {
+        SceAppMgrAppState state{};
+        const int got = _sceAppMgrGetAppState(&state, sizeof(state), 0);
+        ASSERT_MSG(got == 0, "SceAppMgr's app state was not read after the resume ({:#010x})",
+                   static_cast<u32>(got));
+        if (state.isSystemUiOverlaid) {
             continue;
         }
-        sceClibPrintf("[azahar] after the resume: a press, the GPU taken again\n");
+        if (VitaFrontend::ShellPlaneShown()) {
+            if (!plane_waited) {
+                sceClibPrintf("[azahar] after the resume: the system's UI off the app, its plane "
+                              "still up\n");
+                plane_waited = true;
+            }
+            continue;
+        }
+        plane_waited = false;
+        sceClibPrintf("[azahar] after the resume: the system's UI off the app, the GPU taken "
+                      "again\n");
         std::scoped_lock lk{PowerLock()};
         std::string error;
         const bool resumed = VitaFrontend::SgxdPresent::Resume(&error);
@@ -2896,6 +2891,19 @@ int EmulatorMain() {
                "Azahar.\n\nUse them now if you need them, then press X to continue."),
             Tr("You can turn this screen off in Settings > System > Startup notice."),
             Tr("Continue"));
+    }
+    // Nor is the GPU taken from under the system's UI: the quick menu, opened during the start with
+    // the notice off, or a notification's popup. SceAppMgr has no event for either; the take after
+    // a resume waits the same way (PowerThread). A popup the take found up stayed, its plane
+    // showing the app's data in the shell's CDRAM; frame buffers the shell hands the display after
+    // the take are kept off by the module.
+    if (VitaFrontend::SystemUiOverlaid() || VitaFrontend::ShellPlaneShown()) {
+        sceClibPrintf("[azahar] the system's UI or its plane over the app: the GPU taken once "
+                      "they are gone\n");
+        while (VitaFrontend::SystemUiOverlaid() || VitaFrontend::ShellPlaneShown()) {
+            sceKernelDelayThread(100 * 1000);
+        }
+        sceClibPrintf("[azahar] the system's UI and its plane gone\n");
     }
 
     // The GPU is sgxd's from here to the end of the session (docs/sgxd/takeover.md). No GXM call

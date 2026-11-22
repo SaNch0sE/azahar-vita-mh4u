@@ -45,6 +45,15 @@ class EmuWindowVita;
 void ShowGxmNotice(const char* title, const std::string& text, const std::string& hint,
                    const char* button);
 
+/// Whether SceAppMgr has the system's UI over this app (isSystemUiOverlaid): its impose state,
+/// which the quick menu (a long press of the PS button) sets, or the display's power save.
+bool SystemUiOverlaid();
+
+/// Whether the shell's display plane shows a picture (azaharShellPlaneShown). It stays up a little
+/// past SystemUiOverlaid, and the GPU is not taken until it is gone. Reads the display's registers,
+/// so only with the display on, and where the system's UI has been seen: not at every start.
+bool ShellPlaneShown();
+
 /**
  * The on-screen interface: a game list before anything is running and a pause menu over a
  * running title, drawn with Dear ImGui through sgxd (imgui_impl_sgxd). One menu owns the loop

@@ -267,6 +267,63 @@ static void shellcdram_move(int to_copy) {
 // Set while a suspend has given the shell its contents back and the copy holds the app's.
 static int shellcdram_suspended;
 
+// SceShell's display plane (b of each head's IFTU) scans its frame buffer by physical address:
+// while the range is the app's, a shell popup would show the app's data as bands. So
+// SceDisplay's b-plane frame buffers inside the range go to SceLowio as the plane off (format
+// word 0). SceLowio's planes: IFTU0A, IFTU0B, IFTU1A, IFTU1B, IFTU2, so the b planes are 1 and 3.
+// SceDisplay calls with interrupts off and its spinlock held: a few loads and a copy, nothing else.
+#define SHELLCDRAM_IFTU_PARAMS 0x54u
+static SceUID shellcdram_iftu_uid = -1;
+static tai_hook_ref_t shellcdram_iftu_ref;
+static volatile int shellcdram_iftu_in_hook; // callers inside the hook, for its release
+static volatile uint32_t shellcdram_iftu_kept_off; // frame buffers turned into the plane off
+
+static int shellcdram_iftu_hook(int plane, const uint32_t *params, int arg3, int sync) {
+    __atomic_add_fetch(&shellcdram_iftu_in_hook, 1, __ATOMIC_SEQ_CST);
+    int ret;
+    const int apps = *(volatile SceUID *)&shellcdram_pid >= 0 &&
+                     !*(volatile int *)&shellcdram_suspended;
+    if (apps && (plane == 1 || plane == 3) && params && params[0] != 0 &&
+        params[5] - SHELLCDRAM_PA < SHELLCDRAM_SIZE) {
+        uint32_t off[SHELLCDRAM_IFTU_PARAMS / 4];
+        memcpy(off, params, sizeof(off));
+        off[0] = 0;
+        shellcdram_iftu_kept_off++;
+        ret = TAI_CONTINUE(int, shellcdram_iftu_ref, plane, off, arg3, sync);
+    } else {
+        ret = TAI_CONTINUE(int, shellcdram_iftu_ref, plane, params, arg3, sync);
+    }
+    __atomic_sub_fetch(&shellcdram_iftu_in_hook, 1, __ATOMIC_SEQ_CST);
+    return ret;
+}
+
+// At the first take; it stays until module_stop. Without it a notification shows the bands.
+static void shellcdram_iftu_hook_once(void) {
+    if (shellcdram_iftu_uid >= 0) {
+        return;
+    }
+    const SceUID uid = taiHookFunctionImportForKernel(AZAHAR_KERNEL_PID, &shellcdram_iftu_ref,
+                                                      "SceDisplay", TAI_ANY_LIBRARY, 0x7CE0C4DAu,
+                                                      shellcdram_iftu_hook);
+    SGXD_LOG("shell CDRAM: the shell's plane kept off while the range is the app's (hook %08x)\n",
+             (uint32_t)uid);
+    if (uid >= 0) {
+        shellcdram_iftu_uid = uid;
+    }
+}
+
+static void shellcdram_iftu_release(void) {
+    if (shellcdram_iftu_uid < 0) {
+        return;
+    }
+    taiHookReleaseForKernel(shellcdram_iftu_uid, shellcdram_iftu_ref);
+    shellcdram_iftu_uid = -1;
+    // A caller already past the hook's entry finishes on our code.
+    while (__atomic_load_n(&shellcdram_iftu_in_hook, __ATOMIC_SEQ_CST) != 0) {
+        ksceKernelDelayThread(1000);
+    }
+}
+
 // A suspend while the app has the range: the shell's contents back in it and the app's in the
 // copy, the shell's window back on the range. The app's view and every block stay for the take
 // after the resume (shellcdram_resume); the app makes no call meanwhile (sgxd's gate). sgxd's
@@ -360,8 +417,10 @@ static void shellcdram_give_back(void) {
              differ[7]);
     shellcdram_move(0);
     shellcdram_shell_restore();
-    SGXD_LOG("shell CDRAM given back to the shell (process %08x's view gone)\n",
-             (uint32_t)shellcdram_pid);
+    SGXD_LOG("shell CDRAM given back to the shell (process %08x's view gone); its plane was "
+             "kept off %u time(s)\n",
+             (uint32_t)shellcdram_pid, (uint32_t)shellcdram_iftu_kept_off);
+    shellcdram_iftu_kept_off = 0;
     shellcdram_free(1);
 }
 
@@ -490,6 +549,7 @@ int azaharShellCdram(uint32_t *user_va) {
         }
         shellcdram_pid = pid;
         shellcdram_user_va = uva;
+        shellcdram_iftu_hook_once();
     }
     if (user_va) {
         ksceKernelCopyToUser(user_va, &shellcdram_user_va, sizeof(shellcdram_user_va));

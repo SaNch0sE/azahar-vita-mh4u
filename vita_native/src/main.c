@@ -7,6 +7,7 @@
 // is the emulator half. One translation unit: the taken core avoids calls into other objects.
 // docs/native-execution.md describes how the whole thing works.
 
+#include <psp2kern/display.h>
 #include <psp2kern/io/fcntl.h>
 #include <taihen.h>
 #include <psp2kern/kernel/modulemgr.h>
@@ -413,6 +414,7 @@ int module_stop(SceSize argc, const void *args) {
     }
     uvc_release();
     caps_release();
+    shellcdram_iftu_release();
     sgxd_unmap();
     const SceUID blocks[] = {coresample_dbg_uid, reback_moved_uid};
     for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {

@@ -63,6 +63,7 @@ target_link_libraries(azaharnative PRIVATE
     SceKernelSuspendForDriver_stub
     SceIntrmgrForDriver_stub
     SceCtrlForDriver_stub
+    SceDisplayForDriver_stub
     SceRegMgrForDriver_stub
     SceSysconForDriver_stub
     SceUdcdForDriver_stub

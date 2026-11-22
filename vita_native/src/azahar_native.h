@@ -423,6 +423,10 @@ typedef struct AzaharVaReport {
     uint32_t view_last_core;
 } AzaharVaReport;
 int azaharVaReport(uint32_t va, AzaharVaReport *out);
+/// Whether SceShell's display plane shows a picture (shell.c, version 88): 1 while the shell has
+/// one up, 0 once it has blanked the plane, negative when the plane could not be read. Only with
+/// the display on.
+int azaharShellPlaneShown(void);
 /// What a core runs (coresample.c), for a stall report: its debug block's PC samples and the
 /// thread SceKernelThreadMgr's per-CPU block names, read from outside the core. Version 54; the
 /// module of the first PC, version 55.
@@ -493,7 +497,7 @@ int azaharBusErrorWatch(AzaharBusErrorCatch *out);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.
-#define AZAHAR_NATIVE_VERSION 87
+#define AZAHAR_NATIVE_VERSION 93
 #define AZAHAR_NATIVE_UNLOADABLE 67
 int azaharVersion();
 /// This module as a UID of the calling process, for taiStopUnloadKernelModule: taiHEN stops and

@@ -65,4 +65,5 @@ azaharnative:
         - azaharUnlockCores: 0x3C1A7E40
         - azaharKernelPlugins: 0x3C1A7E41
         - azaharVaReport: 0x3C1A7E42
+        - azaharShellPlaneShown: 0x3C1A7E43
         - sgxdResetAll: 0x3C1A7E44

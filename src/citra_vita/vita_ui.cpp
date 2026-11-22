@@ -15,6 +15,7 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include <imgui_vita2d/imgui.h>
 #include <imgui_vita2d/imgui_internal.h>
+#include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
 #include <psp2/io/devctl.h>
 #include <psp2/io/stat.h>
@@ -23,6 +24,7 @@
 #include <psp2/power.h>
 #include <psp2/rtc.h>
 #include <psp2/touch.h>
+#include "azahar_native.h"
 
 #include "citra_vita/gxm_present.h"
 #include "citra_vita/imgui_impl_gxm.h"
@@ -1146,7 +1148,39 @@ void ShowGxmNotice(const char* title, const std::string& text, const std::string
     constexpr float HintGap = 28.0f;
     // A press of cross counts from up to down: one still held from the launch does not pass it.
     bool cross_was_down = true;
+    // The quick menu is drawn over the app, and its presses and touches reach the app's pad and
+    // panel reads too: a cross there would close the notice and take the GPU from under the
+    // quick menu. So the pad and the panel count only while no system UI is over the app, and
+    // after one only from a frame with neither cross nor the panel held: the press that closed
+    // the quick menu does not pass.
+    bool held_off = true;
+    bool was_overlaid = false;
+    bool fading = false; // since the system's UI left, until the shell blanks its display plane
     for (bool done = false; !done;) {
+        const bool overlaid = SystemUiOverlaid();
+        if (overlaid != was_overlaid) {
+            sceClibPrintf("[azahar] notice: the system's UI %s the app\n",
+                          overlaid ? "over" : "off");
+            was_overlaid = overlaid;
+        }
+        if (overlaid) {
+            fading = true;
+        } else if (fading) {
+            fading = ShellPlaneShown();
+        }
+        if (overlaid || fading) {
+            held_off = true;
+        } else if (held_off) {
+            SceCtrlData pad{};
+            SceTouchData touch{};
+            const bool cross = sceCtrlPeekBufferPositive(0, &pad, 1) > 0 &&
+                               (pad.buttons & SCE_CTRL_CROSS) != 0;
+            const bool panel =
+                sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0 && touch.reportNum > 0;
+            held_off = cross || panel;
+        }
+        ImGui_ImplVita_GamepadUsage(!held_off);
+        ImGui_ImplVita_TouchUsage(!held_off);
         ImGui_ImplVita_NewFrame();
         // Read before the frame ends, which clears ImGui's pad inputs.
         const bool cross_down = ImGui::GetIO().NavInputs[ImGuiNavInput_Activate] > 0.0f;
@@ -1170,7 +1204,8 @@ void ShowGxmNotice(const char* title, const std::string& text, const std::string
         EndBackdrop();
         ImGui::Render();
 
-        done = touched || (cross_down && !cross_was_down);
+        // A release over the button as the input is held off is no press of it.
+        done = !held_off && (touched || (cross_down && !cross_was_down));
         cross_was_down = cross_down;
         // No clear: the backdrop covers every pixel.
         GxmPresent::BeginFrame();
@@ -1182,6 +1217,20 @@ void ShowGxmNotice(const char* title, const std::string& text, const std::string
     ImGui_ImplGxm_Shutdown();
     ImGui::DestroyContext();
     GxmPresent::Shutdown();
+}
+
+bool ShellPlaneShown() {
+    const int shown = azaharShellPlaneShown();
+    ASSERT_MSG(shown >= 0, "the shell's display plane was not read ({:#010x})",
+               static_cast<u32>(shown));
+    return shown != 0;
+}
+
+bool SystemUiOverlaid() {
+    SceAppMgrAppState state{};
+    const int got = _sceAppMgrGetAppState(&state, sizeof(state), 0);
+    ASSERT_MSG(got == 0, "SceAppMgr's app state was not read ({:#010x})", static_cast<u32>(got));
+    return state.isSystemUiOverlaid;
 }
 
 Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{window_} {
