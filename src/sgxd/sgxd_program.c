@@ -148,7 +148,7 @@ int sgxd_program_pixel_pds(uint32_t kick0, const uint32_t *iterators, const unsi
 #define USSE_COPY(d, n) ((uint64_t)(0x50a10009u | ((n) - 1u) << 12) << 32 | (0xa0000000u | (d) << 21 | (d) << 7))
 // The colour iterator (V0, four F32 lanes) and the texture issue at TC0 (sgxd_recipe.c's
 // imgui_prim, SGXD_IMGUI_TEXEL).
-#define BLIT_DOUTI_COLOUR 0x0ed0a00fu
+#define BLIT_DOUTI_COLOUR SGXD_PROGRAM_BLIT_DOUTI_COLOUR
 #define BLIT_DOUTI_TEX 0x0000f900u
 // The merge's issues: TC0 (USEISSUE none, TEXPROJ RHW, TEXISSUE TC0), then TC1 with
 // TEXLASTISSUE.
@@ -244,6 +244,12 @@ int sgxd_program_raw64_pixel_pds(uint32_t kick0, const uint32_t tex[4], SgxdPdsP
 unsigned sgxd_program_raw64_fragment(uint64_t words[2]) {
     words[0] = USSE_PHAS_LAST;
     words[1] = 0x3884054183000000ull;   // vmov.f32 o0.xy, pa0.xy (END)
+    return 2;
+}
+
+unsigned sgxd_program_keep_fragment(uint64_t words[2]) {
+    words[0] = USSE_PHAS_LAST;
+    words[1] = USSE_NOP_END;
     return 2;
 }
 

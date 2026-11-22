@@ -1271,6 +1271,8 @@ void SgxdBackend::TradeParked() {
     std::swap(programs, parked.programs);
     std::swap(draw_count, parked.draw_count);
     std::swap(cached, parked.cached);
+    std::swap(pass_alpha_pending, parked.alpha_pending);
+    std::swap(pass_flushes, parked.flushes);
 #ifdef VITA_DIAGNOSTICS
     std::swap(pass_note, parked.note);
 #endif
@@ -1861,6 +1863,11 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     data_sites = {};
     draw_count = 0;
     cached.clear();
+    // The background object is opaque over every pixel: an opaque draw hides it, and its program's
+    // o0 then holds nothing written in the tile. A pass starts with its alpha
+    // pending.
+    pass_alpha_pending = true;
+    pass_flushes = 0;
     in_pass = true;
 }
 
@@ -2114,6 +2121,46 @@ void SgxdBackend::Draw(const SgxdRecipeDraw& draw, const SgxdRecipeDrawPrograms&
     draws[draw_count] = draw;
     draws[draw_count].programs = &programs[draw_count];
     draw_count++;
+    // An opaque or punch-through object (PASSTYPE 0 or 4) writing tags with DCMP not NEVER: the
+    // alpha is pending until a translucent object covers it (OpaqueKeepingAlpha).
+    const u32 type = draw.isp >> 25 & 7u;
+    if ((type == 0 || type == 4) && (draw.isp & 1u << 21) == 0 && (draw.isp >> 22 & 7u) != 0) {
+        pass_alpha_pending = true;
+    }
+}
+
+void SgxdBackend::DrawKeepingAlpha(const SgxdRecipeDraw& draw,
+                                   const SgxdRecipeDrawPrograms& program) {
+    const bool pending = pass_alpha_pending;
+    Draw(draw, program);
+    pass_alpha_pending = pending;
+}
+
+bool SgxdBackend::OpaqueKeepingAlpha(u32 budget) {
+    DEBUG_ASSERT(in_pass);
+    if (!pass_alpha_pending) {
+        return true;
+    }
+    if (pass_flushes >= budget) {
+        return false;
+    }
+    const Recipe& r = *current;
+    SgxdRecipeDrawPrograms p =
+        BlitPrograms(Data{nullptr, pass_target.lo}, r.width, r.height, false, r.width);
+    const u32 colour = SGXD_PROGRAM_BLIT_DOUTI_COLOUR;
+    const u32 words = 4;
+    const auto fprim = PixelPds(keep_fragment, &colour, &words, 1);
+    DEBUG_ASSERT(fprim.va != 0);
+    p.fprim = fprim.va;
+    p.fprim_units = fprim.units;
+    // Depth: compare ALWAYS, no write; stencil: its own ISP C, compare ALWAYS, every op KEEP.
+    Draw(SgxdRecipeDraw{0, 6, SGXD_RECIPE_ISP_TRANS | SGXD_RECIPE_ISP_CPRES, SGXD_R_FPRIM, 0, 0,
+                        nullptr, SGXD_RECIPE_ISP_C},
+         p);
+    pass_alpha_pending = false;
+    pass_flushes++;
+    alpha_flushes++;
+    return true;
 }
 
 void SgxdBackend::DrawHang() {
@@ -2699,6 +2746,8 @@ void SgxdBackend::PlaceFixedPrograms() {
     merge_fragment = sgxd_program_doutu0(HeapCodeBase(1), PlaceCode(1, merge), 0);
     raw64_fragment = sgxd_program_doutu0(
         HeapCodeBase(1), PlaceCode(1, {words, sgxd_program_raw64_fragment(words)}), 0);
+    keep_fragment = sgxd_program_doutu0(
+        HeapCodeBase(1), PlaceCode(1, {words, sgxd_program_keep_fragment(words)}), 0);
     blit_ready = true;
 }
 

@@ -478,6 +478,21 @@ public:
     /// A quad over the open pass's whole target that the ISP rejects (DCMP NEVER): every tile
     /// holds an object, so none stays EMPTY and skips its ZLS load and store.
     void TouchAllTiles();
+    /// Whether an opaque draw that keeps what is under it (colour mask without alpha, no blend)
+    /// can go in as opaque: the ISP removes hidden opaque objects before shading, and a hidden
+    /// object that writes the pixel would not write the bytes this draw keeps. True with no such
+    /// object pending, or after a flush object (a translucent full-target quad that keeps the
+    /// pixel, so every tile shades what is pending), at most `budget` a pass.
+    [[nodiscard]] bool OpaqueKeepingAlpha(u32 budget);
+    /// hang_test's draw: a translucent quad over the whole target whose pixel program branches
+    /// to itself, so the pass's 3D never ends and the microkernel's wait for it runs out.
+    void DrawHang();
+    /// Draw for such a draw: an object that writes no alpha, so it leaves the pending state as
+    /// it was.
+    void DrawKeepingAlpha(const SgxdRecipeDraw& draw, const SgxdRecipeDrawPrograms& program);
+    [[nodiscard]] u32 TakeAlphaFlushes() {
+        return std::exchange(alpha_flushes, 0);
+    }
     /// The open pass's target outside [x0, x1) x [y0, y1) masked from here on: mask updates
     /// clear the mask there (SGXD_RECIPE_ISP_MASK_UPDATE), so the ISP rejects every later draw's
     /// samples there before any shading, and they keep what the pass loaded or cleared.
@@ -1025,6 +1040,8 @@ private:
         std::vector<SgxdRecipeDrawPrograms> programs;
         u32 draw_count{};
         std::vector<CachedRange> cached;
+        bool alpha_pending{};
+        u32 flushes{};
 #ifdef VITA_DIAGNOSTICS
         std::string note;
 #endif
@@ -1058,7 +1075,13 @@ private:
 
     bool blit_ready{};
     u32 blit_vertex{}, blit_fragment{}, untile_fragment{}, merge_vertex{}, merge_fragment{};
-    u32 raw64_fragment{};
+    u32 raw64_fragment{}, keep_fragment{};
+    /// The open pass holds an opaque object that writes the pixel (alpha included) and that
+    /// no flush object has had shaded yet (OpaqueKeepingAlpha), the background object from the
+    /// pass's start; the flushes made in the pass.
+    bool pass_alpha_pending{};
+    u32 pass_flushes{};
+    u32 alpha_flushes{};
     std::vector<SgxdRecipeDraw> untile_draws;
     std::vector<SgxdRecipeDrawPrograms> untile_programs;
     // StreamOut's target: one tile, which the render never writes.

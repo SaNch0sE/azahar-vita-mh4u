@@ -127,6 +127,13 @@ int sgxd_program_raw64_pixel_pds(uint32_t doutu0, const uint32_t tex[4], SgxdPds
 // vmov.f32 o0.xy, pa0.xy (END).
 unsigned sgxd_program_raw64_fragment(uint64_t words[2]);
 
+// A translucent object's pixel that stays as it is (azahar's flush object, which makes the ISP
+// shade what is pending under it in every tile): the blit's vertices, its colour iterated into
+// pa0..pa3 (the iterator the task waits for), and a program that writes no output register: o0
+// holds the pixel under it, as a translucent program reads it. Two words.
+#define SGXD_PROGRAM_BLIT_DOUTI_COLOUR 0x0ed0a00fu
+unsigned sgxd_program_keep_fragment(uint64_t words[2]);
+
 // Two textures joined per pixel (azahar's ETC1A4 untile): the blit's vertex with a second
 // texture coordinate after the first, twelve words (the position, a colour, TC0, TC1;
 // OUTSELECTS VTXSIZE 12, TEXSIZE TC0 and TC1 two-dimensional), and a pixel primary that reads

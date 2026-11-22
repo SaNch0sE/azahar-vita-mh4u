@@ -82,9 +82,6 @@ namespace SgxdRenderer {
  *             fixed-point iterator of it (what that iterator delivers; a pack fewer)
  *   smpskip   a probe: skip-invalid on the texture reads that are point sampled from one level
  *             (the lighting's tables, a shadow's taps), which run in uncovered instances too
- *   keepalpha_opaque  a probe: a draw with no blend that keeps the destination's alpha
- *             (colour mask RGB) is opaque, not translucent (pictures may be wrong: a hidden
- *             opaque draw's alpha is lost)
  *   fsonly=N  fswhite and fscut on the program whose key's low 32 bits are N alone
  *             (drawkeys logs each draw's fs key; the word repeated names more)
  *   fscut=N   a single-phase fragment program cut to its first N instructions, then the white

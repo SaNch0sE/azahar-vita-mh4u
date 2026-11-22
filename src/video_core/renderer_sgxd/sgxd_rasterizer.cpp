@@ -6762,19 +6762,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         }
         epilogue.mask = mask;
     }
-    // A fragment that keeps some of what is under it reads o0, as one reading its own pixel
-    // does: the pass type is translucent, so the ISP neither removes what it covers nor runs
-    // it out of order.
-    bool translucent = shadow || blend || mask != 0xf || draw_own_pixel != 0;
-#ifdef VITA_DIAGNOSTICS
-    // sgxd_flags keepalpha_opaque (a probe, pictures may be wrong): a draw with no blend that
-    // keeps the destination's alpha (colour mask RGB) as opaque, so the ISP hides its covered
-    // fragments; exact only when no opaque draw that writes alpha lies hidden under it.
-    static const bool keepalpha_opaque = SgxdFlag("keepalpha_opaque");
-    if (keepalpha_opaque && !shadow && !blend && mask == 0x7 && draw_own_pixel == 0) {
-        translucent = false;
-    }
-#endif
+    // A fragment that keeps some of what is under it reads o0: the pass type is translucent, so the
+    // ISP neither removes what it covers nor runs it out of order. A draw with no blend that keeps only
+    // the alpha stays opaque when no opaque alpha-writing object is pending under it, or after a flush
+    // object (SgxdBackend::OpaqueKeepingAlpha).
+    const bool keeps_alpha = !shadow && !blend && mask == 0x7 && draw_own_pixel == 0;
+    bool translucent = shadow || blend || (mask != 0xf && !keeps_alpha) || draw_own_pixel != 0;
     // The test runs only when enabled, the write whenever enabled and allowed, and neither
     // (nor the stencil) with no depth buffer (address 0).
     const bool has_depth = fb.GetDepthBufferPhysicalAddress() != 0;
@@ -6926,12 +6919,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             EndPass("the pass's data for a draw");
         }
     }
-    // A pass holds SgxdBackend::MaxDraws draws (its arrays, its recipe's layout). From here a
-    // draw adds at most four to the open pass: the viewport's mask, every tile touched for guest
-    // memory's depth, the margin's mask (each once a pass) and its own. A pass with fewer left
-    // ends, and the draw goes on in the next pass over the same target, loaded. a game
-    // Chronicles 3D draws 1048-1061 into its top screen in later scenes.
-    constexpr u32 DrawAddsAtMost = 4;
+    // A pass holds SgxdBackend::MaxDraws draws. A draw adds at most five: the viewport's mask, every
+    // tile touched for guest memory's depth, the margin's mask, a flush object before an alpha-keeping
+    // draw, and its own. A pass with fewer left ends, and the draw goes on in the next, loaded.
+    constexpr u32 DrawAddsAtMost = 5;
     if (backend.InPass() && backend.PassDraws() + DrawAddsAtMost > SgxdBackend::MaxDraws) {
         EndPass("a pass full of draws");
     }
@@ -7291,6 +7282,14 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // --- the fragment program and its SA block ---
     const FragmentProgram& fp = FragmentProgramFor(epilogue);
     const Usse::Program& fg = fp.usse;
+    // An alpha-keeping draw opaque: not with a kill (opaque punch-through untried), nor past the
+    // flushes a pass may take.
+    const bool keep_alpha_opaque = keeps_alpha && !fg.uses_discard &&
+                                   backend.OpaqueKeepingAlpha(KeepAlphaFlushes);
+    if (keeps_alpha) {
+        translucent = !keep_alpha_opaque;
+        (keep_alpha_opaque ? keep_alpha_opaques : keep_alpha_translucents)++;
+    }
 #ifdef VITA_DIAGNOSTICS
     // A recorded frame's draw (vprof) and its fragment program's dumpusse key.
     if (vprof_draw_noted) {
@@ -7640,7 +7639,11 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                             (static_cast<u32>(PassEdge(pass_part.y1)) - 1) / 32);
     const SgxdRecipeDraw draw{0, stage.count, isp, SGXD_R_FPRIM,
                               CullMode(regs.rasterizer.cull_mode), clip, nullptr, ispc, mte};
-    backend.Draw(draw, p);
+    if (keep_alpha_opaque) {
+        backend.DrawKeepingAlpha(draw, p);
+    } else {
+        backend.Draw(draw, p);
+    }
     if (const auto [lo, hi] = DrawnRows(); lo < hi) {
         const bool first = pass_drawn_lo >= pass_drawn_hi;
         pass_drawn_lo = first ? lo : std::min(pass_drawn_lo, lo);
