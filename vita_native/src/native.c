@@ -2089,6 +2089,87 @@ out:
     return ret;
 }
 
+// A guest small page's descriptor with the access a hold leaves the guest (AZAHAR_HOLD_*), in
+// AP[2:1] (AFE = 1): NONE 01 (PL0 read-write), WRITES 11 (read-only), ALL 10 (PL1 read-only,
+// nothing at PL0). The rest of it, the memory attributes and XN included, stays.
+static uint32_t azahar_hold_desc(uint32_t d, uint32_t hold) {
+    d &= ~((1u << 9) | (1u << 5));
+    switch (hold) {
+        case AZAHAR_HOLD_NONE: return d | (1u << 5);
+        case AZAHAR_HOLD_WRITES: return d | (1u << 9) | (1u << 5);
+        default: return d | (1u << 9);
+    }
+}
+
+static AzaharHoldRun azahar_hold_runs[AZAHAR_HOLD_MAX_RUNS];
+
+int azaharHold(const AzaharHoldRun *user_runs, uint32_t count) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = 0;
+    int locked = 0;
+    if (azahar_state != ST_MAPPED) {
+        ret = AZAHAR_ERR_STATE;
+        goto out;
+    }
+    if (count == 0 || count > AZAHAR_HOLD_MAX_RUNS) {
+        ret = AZAHAR_ERR_ARG;
+        goto out;
+    }
+    // The windows, the descriptors and the maintenance after them, as azaharEdit's.
+    ksceKernelLockMutex(azahar_edit_mutex, 1, NULL);
+    locked = 1;
+    if (ksceKernelCopyFromUser(azahar_hold_runs, user_runs, count * sizeof(AzaharHoldRun)) < 0) {
+        ret = AZAHAR_ERR_ARG;
+        goto out;
+    }
+    unsigned changed = 0;
+    for (uint32_t r = 0; r < count; r++) {
+        const AzaharHoldRun *h = &azahar_hold_runs[r];
+        const uint64_t lo = h->user_va, hi = lo + h->size;
+        if ((h->user_va & 0xFFFu) || (h->size & 0xFFFu) || h->size == 0 ||
+            h->hold > AZAHAR_HOLD_ALL || hi > 0x100000000ull) {
+            ret = AZAHAR_ERR_ARG;
+            goto out;
+        }
+        // Every window that shows a page of the run: the same page at each guest address.
+        for (unsigned w = 0; w < azahar_windows.count; w++) {
+            const AzaharWindow *win = &azahar_windows.w[w];
+            const uint64_t a = lo > win->uva ? lo : win->uva;
+            const uint64_t b = hi < (uint64_t)win->uva + win->size ? hi : (uint64_t)win->uva + win->size;
+            for (uint64_t uva = a; uva < b; uva += 0x1000) {
+                const uint32_t gva = win->va + (uint32_t)(uva - win->uva);
+                const int t = l2_for(gva >> 20, 0);
+                if (t < 0) {
+                    continue;
+                }
+                uint32_t *const d = &azahar_l2[(unsigned)t * 256u + ((gva >> 12) & 0xFFu)];
+                if ((*d & 2u) == 0) {
+                    continue;
+                }
+                const uint32_t nd = azahar_hold_desc(*d, h->hold);
+                if (nd != *d) {
+                    *d = nd;
+                    changed++;
+                }
+            }
+        }
+    }
+    if (changed) {
+        // The walker reads the tables coherently (azaharEdit); the TLB goes at the next slice,
+        // or now on a core inside one.
+        tables_changed(0);
+    }
+    ret = (int)changed;
+
+out:
+    if (locked) {
+        ksceKernelUnlockMutex(azahar_edit_mutex, 1);
+    }
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
 int azaharRelease(void) {
     uint32_t state;
     ENTER_SYSCALL(state);

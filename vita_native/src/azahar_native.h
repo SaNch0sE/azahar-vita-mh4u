@@ -117,6 +117,24 @@ typedef struct AzaharEditRequest {
     AzaharRange range;     // user_va is ignored for UNMAP; perm is ignored for UNMAP
 } AzaharEditRequest;
 
+// Holds on the guest's view of the app's pages, named by the app's address: every guest
+// descriptor whose window shows a page of [user_va, user_va + size) gets the access `hold`
+// leaves the guest, at every guest address the page appears at; its memory attributes and XN
+// stay. A page no window shows is skipped. The emulator's GPU page holds
+// (SgxdRenderer::PageHolds): a page queued GPU work reads takes WRITES, one it writes
+// takes ALL, and a guest access the hold refuses leaves as AZAHAR_EXIT_DABT (a permission
+// fault) until the emulator lets go. Every guest window is mapped read-write, which NONE gives
+// back. Like azaharEdit, between slices, or on a core inside one with two attached. Version 25.
+#define AZAHAR_HOLD_NONE 0u   // the guest reads and writes the page
+#define AZAHAR_HOLD_WRITES 1u // the guest reads it; a write aborts
+#define AZAHAR_HOLD_ALL 2u    // any guest access aborts
+#define AZAHAR_HOLD_MAX_RUNS 64u
+typedef struct AzaharHoldRun {
+    uint32_t user_va; // page aligned
+    uint32_t size;    // page aligned, not 0
+    uint32_t hold;    // AZAHAR_HOLD_*
+} AzaharHoldRun;
+
 // Moving pages of the app's memory onto other physical pages of its own (reback.c). First
 // azaharAdopt takes a block of the app's (1 MiB aligned, at most 256 MiB, all of it the app's
 // writable memory) under translation tables of the module's: the same pages and attributes.
@@ -164,6 +182,9 @@ int azaharMap(const AzaharMapRequest *req);
 int azaharRun(AzaharRunRequest *req);
 int azaharRelease(void);
 int azaharEdit(const AzaharEditRequest *req);
+/// See AzaharHoldRun: `count` runs, 1 to AZAHAR_HOLD_MAX_RUNS. Returns the guest descriptors it
+/// changed. Version 25.
+int azaharHold(const AzaharHoldRun *runs, uint32_t count);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.

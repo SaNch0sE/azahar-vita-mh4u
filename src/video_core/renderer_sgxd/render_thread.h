@@ -17,6 +17,7 @@
 #include "common/thread.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_sgxd/page_holds.h"
 
 namespace Memory {
 class MemorySystem;
@@ -39,13 +40,9 @@ class RendererSgxd;
  * attributes). The thread applies the state to its own PicaCore, which the GXM rasterizer was
  * made with, and makes the call there, in order.
  *
- * Interrupts: a GPU interrupt is a ticket (InterruptFence). The thread takes the rasterizer's
- * fence for it when it reaches the ticket's record, polls it, and publishes the tickets whose
- * work is done (InterruptPoll reads that, any thread). While tickets wait it sleeps until sgxd
- * wakes it for the oldest one's fence (InterruptArm, sgxdWaker): a timed poll every 100 us
- * would cost a third of its CPU time in sceKernelWaitLwCond. A GPU
- * that completes nothing for sgxd_chain_stall_us while a ticket waits gets the backend's blocking
- * wait, which stops the emulator with its post-mortem, as sgxd's own waits do.
+ * Tickets: each GPU interrupt and vblank takes one (InterruptFence) for the work queued before it;
+ * the interrupt goes to the guest at once. The pages that work touches stay held until the ticket
+ * is reached. While tickets wait the thread sleeps until sgxd wakes it for the oldest one's fence.
  *
  * Every producer holds the GPU's lock (VideoCore::GPU::Lock): the state records read the
  * emulation side's PICA, and the ring has one writer at a time.
@@ -105,12 +102,57 @@ public:
     void FlushImmediate() override;
     void NotifyP3D() override;
     void GpuIdle() override;
-    /// A ticket for the work queued so far.
+    /// A ticket for the work queued so far (the page holds made since the last one are its).
     u64 InterruptFence() override;
     /// Whether the ticket's work is done. Any thread, without a lock.
     bool InterruptPoll(u64 ticket) override;
     /// Waits until it is; without the GPU's lock unless this thread is the render side.
     void InterruptWait(u64 ticket) override;
+    void WaitForGpuWrites() override;
+
+    /// The page holds, emulation side, under the GPU's lock. On from the guest table's install.
+    void EnablePageHolds();
+    /// Waits for the GPU writes queued to the FCRAM pages of [addr, addr + size) (a page move's
+    /// copy, GuestGpuMemory::MoveHooks).
+    void WaitGpuWrites(PAddr addr, u32 size);
+    /// The guest's view gets the holds the work queued since made, at the end of each GPU operation and
+    /// vblank.
+    void ApplyPageHolds();
+    /// Lets go of the holds whose work is done. Between slices.
+    void ReleasePageHolds();
+    /// A guest access aborted on the page of `host`: whether a hold refused it. If so, the work it
+    /// waited for is done and the page open, and the guest runs the access again.
+    bool PageFault(const u8* host, bool write, u32 guest_pc, u32 guest_va);
+    /// The HLE reads or writes [host, host + size) of guest memory through its own view: it
+    /// waits for the queued GPU work the guest would wait for (Memory's host guard).
+    void HostAccess(const u8* host, u32 size, bool write);
+    /// T12: [addr, addr + size) written by the HLE through a pointer the page holds do not see:
+    /// each watched page's textures untiled again at their next draw, the page unwatched.
+    void InvalidateWritten(PAddr addr, u32 size);
+    /// A guest window was mapped over [host, host + size): its descriptors take the holds.
+    void HostRemapped(const u8* host, u32 size);
+#ifdef VITA_DIAGNOSTICS
+    /// Since the last call (`perflog`): T12's texture pages written by the guest (aborts) and
+    /// the texture pages the HLE wrote (InvalidateWritten).
+    std::pair<u32, u32> TakeTextureWrites();
+#endif
+    /// A byte a page of FCRAM then VRAM, nonzero where the guest's view is held.
+    [[nodiscard]] const u8* PageHeldMap() const {
+        return page_holds.HeldMap();
+    }
+#ifdef VITA_DIAGNOSTICS
+    struct HoldStats {
+        PageHolds::Stats holds;
+        u32 faults, fault_waits;
+        u32 geometry_moves;   ///< geometry pages moved to CDRAM after a write waited on them
+        u64 fault_wait_us;
+        u32 host_waits;
+        u64 host_wait_us;
+        std::array<u32, PageHolds::Kinds> fault_kinds;
+        std::array<u64, PageHolds::Kinds> fault_kind_us;
+    };
+    HoldStats TakeHoldStats();
+#endif
     std::vector<std::pair<PAddr, u32>> TakeCachedReads() override;
     void LoadDefaultDiskResources(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) override;
@@ -262,6 +304,59 @@ private:
     std::deque<Pending> pending;
     u32 tickets{};                  ///< the last ticket handed out (GPU's lock)
     std::atomic<u32> reached{};     ///< the last ticket whose work is done
+
+    PageHolds page_holds;
+    bool page_holds_on{};
+    u32 last_write_ticket{}; ///< the last ticket whose work writes guest memory
+    /// A draw's colour write and depth read holds, made once a ticket and frame (the draws of a list
+    /// hold the same buffers).
+    struct BufferHold {
+        PAddr addr;
+        u32 bytes;
+        u32 ticket;
+    };
+    BufferHold held_colour{};
+    BufferHold held_depth{};
+    [[nodiscard]] u32 HoldTicket() const {
+        return tickets + 1;
+    }
+    void HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind);
+    void HoldWrite(PAddr addr, u32 bytes, PageHolds::Kind kind);
+    void HoldDraw(const DrawTextures& textures, u32 count, bool vertices, bool is_indexed);
+    /// A geometry draw's indices into a record of their own (Op::GsIndices), before its Draw.
+    void PutGsIndices();
+    void HoldVertices(bool is_indexed);
+    /// The scan's memo of 16-bit index lists' ranges, valid while their pages' write stamps stand.
+    struct IndexMemo {
+        PAddr addr;
+        u32 count;
+        u32 stamp;
+        u16 lo, hi;
+    };
+    std::array<IndexMemo, 4096> index_memo{};
+    /// A draw's 16-bit indices' range as HoldVertices scanned it (scanned 0: not), sent with the draw
+    /// so the render thread does not scan them again.
+    struct DrawIndexRange {
+        u16 lo;
+        u16 hi;
+        u32 scanned;
+    };
+    DrawIndexRange draw_indices{};
+    /// Waits for the work a guest access to the page waits for, the open holds' ticket fenced first.
+    void WaitHeldPage(u32 page, bool write);
+    /// A texture page the HLE wrote: the render side marks the textures over it written
+    /// (RasterizerSgxd::TexturesWritten), in order with the work.
+    void TextureWritten(u32 page);
+#ifdef VITA_DIAGNOSTICS
+    u32 texture_write_faults{}, texture_write_hle{};
+#endif
+#ifdef VITA_DIAGNOSTICS
+    u32 faults{}, fault_waits{}, host_waits{}, vblank_waits{};
+    u32 geometry_moves{};
+    u64 fault_wait_us{}, host_wait_us{};
+    std::array<u32, PageHolds::Kinds> fault_kinds{};
+    std::array<u64, PageHolds::Kinds> fault_kind_us{};
+#endif
 
     /// The thread's state (a hold, the end) is under `work`. It sleeps on `wake_flag`, an event
     /// flag set for records (Commit sees `sleeping`), a hold or the end, and by sgxd when the GPU

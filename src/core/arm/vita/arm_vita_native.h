@@ -65,6 +65,7 @@ public:
     static constexpr u32 GuestEnd = 0x40000000;
 
     std::string Describe(VAddr addr) const;
+    const u8* HostAt(VAddr addr) const;
 
     /// App memory mapped into the guest's table read and execute beside the process's mappings (the
     /// thunks, below the process image). Kept across page table changes.

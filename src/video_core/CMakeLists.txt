@@ -115,6 +115,8 @@ if (ENABLE_GXM)
             renderer_gxm/guest_gpu_memory.cpp
             renderer_gxm/guest_gpu_memory.h
             renderer_gxm/key_index.h
+            renderer_gxm/page_holds.cpp
+            renderer_gxm/page_holds.h
             renderer_gxm/usse/fs_usse_gen.cpp
             renderer_gxm/usse/fs_usse_gen.h
             renderer_gxm/usse/usse_encoder.cpp

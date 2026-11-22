@@ -342,6 +342,7 @@ static uint32_t active_cpu_mask(void) {
 // 23: sgxd 12, KICK2 again (EVENT_KICK started no run of the microkernel).
 // 24: sgxd 13, the microkernel alone: no ring, no IRQ 52 list running; sgxdQueue,
 //     sgxdSubmitAsync and sgxdMicrokernel gone, sgxdEvents the microkernel's interrupt set-up.
+// 25: azaharHold, the emulator's GPU page holds on the guest's view, by the app's address.
 // 27: azaharAttach and azaharDetach gone, and the cross-core maintenance with them: one
 //     emulation thread, one attached core.
 int azaharVersion() {

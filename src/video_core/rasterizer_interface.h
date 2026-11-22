@@ -106,9 +106,8 @@ public:
     /// A GSP operation or a present has run: GPU work held back for the next one starts.
     virtual void GpuIdle() {}
 
-    /// A guest interrupt raised when the GPU has done its work (VideoCore::GPU::Signal): a
-    /// fence over everything sent so far, whether that work has completed (without waiting),
-    /// and a wait for it.
+    /// A ticket for the GPU work sent so far (VideoCore::GPU::Signal, each guest interrupt and
+    /// vblank): whether that work has completed (without waiting), and a wait for it.
     virtual u64 InterruptFence() {
         return 0;
     }
@@ -116,6 +115,10 @@ public:
         return true;
     }
     virtual void InterruptWait([[maybe_unused]] u64 fence) {}
+
+    /// The CPU is about to read guest memory for the PICA (PicaCore::LoadVertices): the GPU
+    /// work queued that writes guest memory completes first.
+    virtual void WaitForGpuWrites() {}
 
     /// The time spent waiting for the GPU so far, in microseconds (diagnostics builds; 0
     /// otherwise).

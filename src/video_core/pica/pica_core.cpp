@@ -179,7 +179,8 @@ struct PicaCore::Dispatch {
         if (any_byte_match(p.regs.internal.reg_array[id], p.regs.internal.irq_compare))
             [[likely]] {
             p.rasterizer->NotifyP3D();
-            p.signal_interrupt(Service::GSP::InterruptId::P3D, 0);
+            p.signal_interrupt(Service::GSP::InterruptId::P3D,
+                               p.delay_generator.CalculateAndResetDelay());
             if (p.regs.internal.irq_autostop) [[likely]] {
                 stop_requested = true;
             }
@@ -213,6 +214,7 @@ struct PicaCore::Dispatch {
         const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
         const PAddr addr = p.regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
         const u32 size = p.regs.internal.pipeline.command_buffer.GetSize(index);
+        p.memory.GuardPhysicalRead(addr, size);
         const u8* head = p.memory.GetPhysicalPointer(addr);
         GxmRenderer::Vprof::Memory(GxmRenderer::Vprof::Mem::CmdList, addr, size);
         p.cmd_list.Reset(addr, head, size);
@@ -647,10 +649,14 @@ static_assert(sizeof(RegImplInfo) == sizeof(u16), "the loop reads the flags as h
 void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     if (ignore_list) {
         rasterizer->NotifyP3D();
-        signal_interrupt(Service::GSP::InterruptId::P3D, 0);
+        signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
         return;
     }
 
+    // A list, or a buffer it jumps to, a queued DMA still writes waits for it (a game Triple
+    // Deluxe's lists jump into VRAM its DMAs fill each frame: a stale buffer there ended the
+    // list before its P3D, and the game waited for that P3D for good).
+    memory.GuardPhysicalRead(list, size);
     const u8* head = memory.GetPhysicalPointer(list);
     GxmRenderer::Vprof::Memory(GxmRenderer::Vprof::Mem::CmdList, list, size);
     cmd_list.Reset(list, head, size);
@@ -704,6 +710,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
                         reinterpret_cast<u8*>(dirty_regs.qwords.data()), &run);
                 }
                 if (run > 0) {
+                    delay_generator.AddCommands(run);
                     cmd_list.current_index = index;
                     if (index + 1 >= cmd_list.length) {
                         continue;
@@ -735,6 +742,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
 
                 // Process the commands that we have read so far (up to 4).
                 if (run > 0) {
+                    delay_generator.AddCommands(run);
                     for (u32 i = 0; i < run; ++i) {
                         const u32 id = ids[i];
                         const u32 write_mask = ExpandBitsToBytes[masks[i]];
@@ -841,6 +849,7 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
         return;
     }
 
+    delay_generator.AddCommands(count);
     if (immediate_open && !IsImmediateData(id)) {
         FlushImmediate();
     }
@@ -898,6 +907,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         const u32 batch_count =
             std::min<u32>(reg_impl_flags_lut[reg].RegsUntilSpecial(), count - offset);
         if (batch_count > 0) {
+            delay_generator.AddCommands(batch_count);
 
             // Allows the compiler to auto-vectorize thanks to the __restrict keywords.
             // Verified in MSVC that vectorization is happening.
@@ -953,6 +963,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
         return;
     }
 
+    delay_generator.AddCommands(1);
 
     if (immediate_open && !IsImmediateData(id)) {
         FlushImmediate();
@@ -1162,6 +1173,8 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }();
 
     // Add vertices to the delay generator.
+    delay_generator.AddVertices(regs.internal.pipeline.num_vertices,
+                                regs.internal.pipeline.triangle_topology);
 
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
@@ -1176,6 +1189,9 @@ void PicaCore::DrawArrays(bool is_indexed) {
 }
 
 void PicaCore::LoadVertices(bool is_indexed) {
+    // The CPU reads the vertices: GPU work queued before that writes guest memory (a DMA,
+    // a transfer) completes first.
+    rasterizer->WaitForGpuWrites();
     // Read and validate vertex information from the loaders
     const auto& pipeline = regs.internal.pipeline;
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
@@ -1258,6 +1274,7 @@ void PicaCore::LoadVertices(bool is_indexed) {
 
 PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u32 size) {
     // Initialize command list tracking.
+    memory.GuardPhysicalRead(list, size);
     const u8* head = memory.GetPhysicalPointer(list);
     cmd_list.Reset(list, head, size);
 
@@ -1284,6 +1301,7 @@ PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u
                 static_cast<u32>(cmd_id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
             const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
             const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
+            memory.GuardPhysicalRead(addr, size);
             const u8* head = memory.GetPhysicalPointer(addr);
             cmd_list.Reset(addr, head, size);
             break;

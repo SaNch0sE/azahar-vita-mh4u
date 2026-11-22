@@ -108,40 +108,24 @@ public:
 
     void ApplyPerProgramSettings(u64 program_ID);
 
-    /// Raises the held interrupts (Signal) whose GPU work has completed, in order, without
-    /// waiting: the emulation loop's, between slices.
+    /// The emulation loop's, between slices: lets go of the page holds whose GPU work has
+    /// completed (SgxdRenderer::PageHolds).
     void DeliverInterrupts();
-    /// The guest has nothing to run: waits for the oldest held interrupt's GPU work and raises
-    /// what has completed. False when none is held (core timing may idle ahead then).
-    bool WaitInterrupt();
-    /// Parallel cores: WaitInterrupt's wait alone, without the HLE lock; the next
-    /// DeliverInterrupts raises what completed. False when none is held.
-    bool WaitHeldInterrupt();
+
+    /// The guest's table is installed (the native core's first slice): from now on the GPU's
+    /// work holds the guest pages it reads and writes until it is done, and the HLE's own
+    /// accesses to them wait as the guest's do (Memory::MemorySystem::SetHostGuard).
+    void EnablePageHolds();
+    /// A guest access aborted on the page at host address `host`: whether a page hold refused
+    /// it. If so, the GPU work it waited for is done and the guest may run the access again.
+    /// `guest_pc` and `guest_va` are the abort's instruction and address (for `holdlog`).
+    bool GuestAbort(const u8* host, bool write, u32 guest_pc, u32 guest_va);
 
     /**
-     * The emulation side's lock over the GPU: the PICA (command lists, registers, shader setups),
-     * the interrupts held, and the render thread's queue, which every entry point writes to.
-     * Taken recursively. With parallel cores the work of GSP's command queue runs under it
-     * without the HLE lock (GSP_GPU::TriggerCmdReqQueue). Lock order: the HLE lock, then this
-     * one; never the other way. The render thread itself never takes it.
-     */
-    std::recursive_mutex& Lock() const {
-        return lock;
-    }
-    /// Whether any interrupt is held, read without the lock.
-    [[nodiscard]] bool HasHeldInterrupts() const {
-        return held_count.load(std::memory_order_acquire) != 0;
-    }
-    /// Whether DeliverInterrupts has one to raise now, read without the lock (parallel cores: a
-    /// boundary that takes no lock while nothing is due, System::QuietBoundary).
-    [[nodiscard]] bool HasDueInterrupts() const;
-
-    /**
-     * The GPU's lock, and with the GXM renderer its render thread held (RenderThread::Hold):
-     * for the guard's life the rasterizer, the renderer and sgxd are the caller's, with
-     * everything queued before done. For the work that cannot run on the render thread or
-     * beside it: FCRAM page moves (the guest stopped), the frontend's presents and settings,
-     * savestates, `perflog`'s counters.
+     * With the sgxd renderer, its render thread held (RenderThread::Hold): for the guard's life the
+     * rasterizer, the renderer and sgxd are the caller's, with everything queued before done. For
+     * the work that cannot run on the render thread or beside it: FCRAM page moves (the guest
+     * stopped), the frontend's presents and settings, savestates, `perflog`'s counters.
      */
     class RenderHold {
     public:
@@ -196,8 +180,8 @@ public:
 private:
     void SubmitCmdList(u32 index);
 
-    /// Runs fill unit `index` if triggered and raises `interrupt` when it is done (none: GSP's
-    /// command raises one for both of its fills).
+    /// Runs fill unit `index` if triggered and raises `interrupt` for it (none: GSP's command
+    /// raises one for both of its fills).
     void MemoryFill(u32 index, std::optional<Service::GSP::InterruptId> interrupt);
 
     void MemoryTransfer();
@@ -218,8 +202,8 @@ private:
     /// GSP's DMA of size bytes from src to dst (the current process's addresses) as physical
     /// runs. Memory outside guest FCRAM and VRAM stops the emulator.
     std::vector<DmaRun> DmaRuns(VAddr src, VAddr dst, u32 size);
-    /// A DMA's runs, queued to the PTLA; the DMA interrupt after delay.
-    void RunDma(const std::vector<DmaRun>& runs);
+    /// A DMA's runs, queued to the PTLA; the DMA interrupt with upstream's delay for it.
+    void RunDma(const std::vector<DmaRun>& runs, u64 delay_ns);
 
     /// Runs op, a GSP command's or a register trigger's work (vprof numbers it, perflog times
     /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).
@@ -227,13 +211,12 @@ private:
     /// A write of [addr, addr + size): one into a framebuffer the LCD shows has the next vblank
     /// present (VBlankCallback).
     void ScreensWritten(PAddr addr, u32 size);
-    /// Raises a GSP interrupt: a vblank at once; any other once the GPU has done the work sent
-    /// before it (held, with the rasterizer's ticket for that work, until DeliverInterrupts or
-    /// WaitInterrupt sees it done), never here: this may run without the HLE lock. No modelled
-    /// delay: upstream's timing model is gone. None while vprof's replay runs.
-    void Signal(Service::GSP::InterruptId id);
-    /// Updates held_count and held_front, under the lock.
-    void CountHeld();
+    /// Raises a GSP interrupt as upstream does: when its work is submitted, with upstream's
+    /// modelled delay, which GSP applies or drops (simulate_3ds_gpu_timings). Any but a vblank
+    /// first takes the rasterizer's ticket for the work before it, which the page holds made
+    /// for that work wait for (SgxdRenderer::PageHolds): the guest hears of the work before the
+    /// SGX has done it, and a guest access to its pages waits. None while vprof's replay runs.
+    void Signal(Service::GSP::InterruptId id, u64 delay_ns);
 #ifdef ENABLE_GXM
     /// vprof's capture records its frame with the render thread held, so that the frame's ops
     /// and the draws they make interleave as they run: on from the vblank the frame starts at
@@ -252,10 +235,6 @@ private:
     friend class RightEyeDisabler;
     struct Impl;
     std::unique_ptr<Impl> impl;
-
-    mutable std::recursive_mutex lock;
-    std::atomic<u32> held_count{0}; ///< held_interrupts' size
-    std::atomic<u64> held_front{0}; ///< the oldest held interrupt's ticket
 
     PAddr VirtualToPhysicalAddress(VAddr addr);
 };

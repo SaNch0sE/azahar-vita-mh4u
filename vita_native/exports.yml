@@ -34,5 +34,6 @@ azaharnative:
         - azaharCycleCounter: 0x3C1A7E22
         - sgxdKick: 0x3C1A7E24
         - sgxdWaker: 0x3C1A7E25
+        - azaharHold: 0x3C1A7E26
         - azaharModuleUid: 0x3C1A7E35
         - sgxdResetAll: 0x3C1A7E44

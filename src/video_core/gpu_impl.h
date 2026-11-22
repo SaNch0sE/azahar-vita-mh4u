@@ -59,14 +59,9 @@ struct GPU::Impl {
 #endif
     /// vprof's replay runs: GPU::Signal drops the interrupts.
     bool interrupts_muted{};
-    /// An interrupt GPU::Signal holds until the GPU has done the work before it: the
-    /// rasterizer's ticket for that work.
-    struct HeldInterrupt {
-        Service::GSP::InterruptId id;
-        u64 ticket;
-    };
-    /// Oldest first (GPU::DeliverInterrupts).
-    std::deque<HeldInterrupt> held_interrupts;
+    /// The rasterizer's ticket for the work queued before the last vblank: the next vblank
+    /// waits for it (GPU::VBlankCallback).
+    u64 vblank_ticket{};
 #ifdef ENABLE_GXM
     /// Whether the guest's screens may show something new since the last present a vblank
     /// sent: a buffer swap, a write into a framebuffer the LCD shows (GPU::ScreensWritten), a

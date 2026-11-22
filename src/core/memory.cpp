@@ -190,6 +190,29 @@ public:
 
     MappingObserver* mapping_observer{};
     bool rasterizer_marking_enabled = true;
+    HostGuard host_guard;
+
+    /// HostGuard's check of [host, host + size), within one guest page.
+    void Guard(const u8* host, std::size_t size, bool write) {
+        if (host_guard.held == nullptr) {
+            return;
+        }
+        const uintptr_t h = reinterpret_cast<uintptr_t>(host);
+        const uintptr_t f = h - reinterpret_cast<uintptr_t>(fcram.Data());
+        u32 page;
+        if (f < fcram.Size()) {
+            page = static_cast<u32>(f >> CITRA_PAGE_BITS);
+        } else {
+            const uintptr_t v = h - reinterpret_cast<uintptr_t>(vram.Data());
+            if (v >= vram.Size()) {
+                return;
+            }
+            page = static_cast<u32>((fcram.Size() + v) >> CITRA_PAGE_BITS);
+        }
+        if (host_guard.held[page] != 0) {
+            host_guard.access(host, static_cast<u32>(size), write);
+        }
+    }
 
     Core::System& system;
     std::shared_ptr<PageTable> current_page_table = nullptr;
@@ -290,6 +313,7 @@ public:
                 DEBUG_ASSERT(page_table.pointers[page_index]);
 
                 const u8* src_ptr = page_table.pointers[page_index] + page_offset;
+                Guard(src_ptr, copy_amount, false);
                 std::memcpy(dest_buffer, src_ptr, copy_amount);
                 break;
             }
@@ -348,6 +372,7 @@ public:
                 DEBUG_ASSERT(page_table.pointers[page_index]);
 
                 u8* dest_ptr = page_table.pointers[page_index] + page_offset;
+                Guard(dest_ptr, copy_amount, true);
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
                 break;
             }
@@ -529,6 +554,29 @@ std::shared_ptr<PageTable> MemorySystem::GetCurrentPageTable() const {
 
 void MemorySystem::RasterizerFlushVirtualRegion(VAddr start, u32 size, FlushMode mode) {
     impl->RasterizerFlushVirtualRegion(start, size, mode);
+}
+
+void MemorySystem::SetHostGuard(HostGuard guard) {
+    impl->host_guard = std::move(guard);
+}
+
+void MemorySystem::HostRemapped(const u8* host, u32 size) {
+    if (impl->host_guard.remapped) {
+        impl->host_guard.remapped(host, size);
+    }
+}
+
+void MemorySystem::GuardPhysicalRead(PAddr address, u32 size) {
+    if (impl->host_guard.held == nullptr) {
+        return;
+    }
+    const PAddr end = address + size;
+    for (PAddr at = address; at < end;) {
+        const PAddr page_end = (at & ~CITRA_PAGE_MASK) + CITRA_PAGE_SIZE;
+        const u32 bytes = std::min(end, page_end) - at;
+        impl->Guard(GetPhysicalPointer(at), bytes, false);
+        at += bytes;
+    }
 }
 
 PAddr& Memory::MemorySystem::Plugin3GXFramebufferAddress() {
@@ -1370,6 +1418,7 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
             DEBUG_ASSERT(page_table.pointers[page_index]);
 
             u8* dest_ptr = page_table.pointers[page_index] + page_offset;
+            impl->Guard(dest_ptr, copy_amount, true);
             std::memset(dest_ptr, 0, copy_amount);
             break;
         }
@@ -1429,6 +1478,7 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
         case PageType::Memory: {
             DEBUG_ASSERT(page_table.pointers[page_index]);
             const u8* src_ptr = page_table.pointers[page_index] + page_offset;
+            impl->Guard(src_ptr, copy_amount, false);
             WriteBlock(dest_process, dest_addr, src_ptr, copy_amount);
             break;
         }

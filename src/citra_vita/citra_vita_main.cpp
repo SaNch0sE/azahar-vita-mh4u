@@ -517,6 +517,37 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              t.emu_timeouts[W::EmuSpace], t.emu_wait_us[W::EmuSync] / 1e3,
                              t.emu_waits[W::EmuSync], t.emu_sleeps[W::EmuSync],
                              t.emu_timeouts[W::EmuSync]);
+                    // The GPU's page holds (page_holds.h): the module's calls and the pages
+                    // they held and let go of, the guest's aborts on held pages (those that
+                    // waited for GPU work, and how long), the HLE's waits, and the vblank's
+                    // waits for the last vblank's work.
+                    const auto [tex_faults, tex_hle] =
+                        system.GPU().GetRenderThread().TakeTextureWrites();
+                    LOG_INFO(Frontend,
+                             "perf: texture tracking: {} texture pages written by the guest, {} "
+                             "by the HLE",
+                             tex_faults, tex_hle);
+                    const auto hs = system.GPU().GetRenderThread().TakeHoldStats();
+                    LOG_INFO(Frontend,
+                             "perf: page holds: azaharHold {} calls, {} runs, {} descriptors; "
+                             "{} pages held, {} let go; guest aborts {} ({} waited, {:.1f} ms), "
+                             "HLE waits {} ({:.1f} ms), vblank waits {} ({:.1f} ms)",
+                             hs.holds.calls, hs.holds.runs, hs.holds.descriptors,
+                             hs.holds.held_pages, hs.holds.released_pages, hs.faults,
+                             hs.fault_waits, hs.fault_wait_us / 1e3, hs.host_waits,
+                             hs.host_wait_us / 1e3, hs.vblank_waits, hs.vblank_wait_us / 1e3);
+                    std::string by_kind;
+                    for (u32 k = 0; k < SgxdRenderer::PageHolds::Kinds; k++) {
+                        if (hs.fault_kinds[k] != 0) {
+                            fmt::format_to(std::back_inserter(by_kind), "{}{} {} ({:.1f} ms)",
+                                           by_kind.empty() ? "" : ", ",
+                                           SgxdRenderer::PageHolds::KindName(
+                                               static_cast<SgxdRenderer::PageHolds::Kind>(k)),
+                                           hs.fault_kinds[k], hs.fault_kind_us[k] / 1e3);
+                        }
+                    }
+                    LOG_INFO(Frontend, "perf: aborts that waited by hold: {}",
+                             by_kind.empty() ? "none" : by_kind);
                     const auto& p = render_counters.present;
                     LOG_INFO(Frontend,
                              "perf: present ui update {:.1f} ms, screens {:.1f} ms, ui draw "

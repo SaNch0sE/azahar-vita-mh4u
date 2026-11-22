@@ -3913,6 +3913,20 @@ std::array<u32, RasterizerSgxd::VertexLayout::ProgramKeyWords> RasterizerSgxd::V
     return key;
 }
 
+namespace {
+void WidenIndices(u16* out, const u8* in, u32 count) {
+    u32 n = 0;
+    for (; n + 16 <= count; n += 16) {
+        const uint8x16_t bytes = vld1q_u8(in + n);
+        vst1q_u16(out + n, vmovl_u8(vget_low_u8(bytes)));
+        vst1q_u16(out + n + 8, vmovl_u8(vget_high_u8(bytes)));
+    }
+    for (; n < count; n++) {
+        out[n] = in[n];
+    }
+}
+} // Anonymous namespace
+
 RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, const float* immediate,
                                                          u32 count, Usse::VsMode mode,
                                                          const Describe& describe) {
@@ -4070,16 +4084,21 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
                 vertex_min = lo;
                 vertex_max = hi;
             }
+            // Widened here, into the pass data: a side render for it would make the pass's TA wait.
             if (mode == Usse::VsMode::Draw) {
-                // Widened to 16 bits on the GPU before the pass (SgxdBackend::WidenIndices),
-                // which reads the guest's bytes: cleaned first where they are cached.
-                if (indices_uncached) {
-                    SgxdCacheSkipped(CacheSite::Vertices, index_bytes);
-                } else {
-                    backend.ReadsCached(index_cpu, index_bytes);
-                    CachedRead(index_address, index_bytes);
-                }
-                indices_gpu = backend.WidenIndices(index_address, count, index_cpu);
+#ifdef VITA_DIAGNOSTICS
+                const u32 c0 = azaharCyclesStart();
+#endif
+                const SgxdBackend::Data wide = backend.AllocData(count * 2, 16);
+                WidenIndices(reinterpret_cast<u16*>(wide.cpu), index_scan, count);
+                indices_gpu = wide.gpu;
+#ifdef VITA_DIAGNOSTICS
+                widen_stats.cycles += azaharCycles() - c0;
+                const bool vram =
+                    index_address >= Memory::VRAM_PADDR && index_address < Memory::VRAM_PADDR_END;
+                widen_stats.bytes[vram ? 0 : indices_uncached ? 1 : 2] += count;
+                widen_stats.lists++;
+#endif
             }
         }
     }

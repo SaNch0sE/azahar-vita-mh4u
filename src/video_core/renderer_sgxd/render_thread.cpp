@@ -11,6 +11,7 @@
 #include "common/assert.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
+#include "common/math_util.h"
 #include "common/named_thread.h"
 #include "core/memory.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
@@ -190,7 +191,7 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
                            RendererGxm& renderer_, RasterizerGxm& rasterizer_,
                            Memory::MemorySystem& memory_)
     : pica{pica_}, render_pica{render_pica_}, renderer{renderer_}, rasterizer{rasterizer_},
-      memory{memory_}, gpu_lock{gpu_lock_}, ring{std::make_unique<u8[]>(RingSize)} {
+      memory{memory_}, ring{std::make_unique<u8[]>(RingSize)}, page_holds{memory_} {
     static_assert(std::has_single_bit(RingSize), "positions wrap at 2^32");
     static_assert(sizeof(Head) == 8, "records stay 8-byte aligned");
     // The render side's state starts as the emulation side's: the first records carry all of
@@ -676,29 +677,74 @@ void RenderThread::DrawMerged(const u16* vertices, u32 count) {
 }
 
 void RenderThread::DrawTriangles() {
+    // The vertices were loaded on this thread (PicaCore::LoadVertices).
+    DrawTextures textures;
+    const u32 count = TextureRanges(pica.regs.internal, textures);
+    HoldDraw(textures, count, false, false);
     SyncState();
     Put(Op::DrawTriangles);
 }
 
 bool RenderThread::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+    HoldRead(config.GetPhysicalInputAddress(),
+             config.input_width * config.input_height * Pica::BytesPerPixel(config.input_format),
+             PageHolds::TransferIn);
+    HoldWrite(config.GetPhysicalOutputAddress(),
+              config.output_width * config.output_height *
+                  Pica::BytesPerPixel(config.output_format),
+              PageHolds::TransferOut);
     SyncState();
     Put(Op::DisplayTransfer, config);
     return true;
 }
 
+namespace {
+
+/// The bytes a texture copy's lines span on one side: whole lines of `width` bytes, `gap`
+/// apart (16-byte units), or the size itself with no width.
+u32 CopySpan(u32 size, u32 width, u32 gap) {
+    if (width == 0) {
+        return size;
+    }
+    const u32 w = width * 16;
+    return (size + w - 1) / w * (w + gap * 16);
+}
+
+} // namespace
+
 bool RenderThread::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
+    const auto& tc = config.texture_copy;
+    HoldRead(config.GetPhysicalInputAddress(), CopySpan(tc.size, tc.input_width, tc.input_gap),
+             PageHolds::TransferIn);
+    HoldWrite(config.GetPhysicalOutputAddress(), CopySpan(tc.size, tc.output_width, tc.output_gap),
+              PageHolds::TransferOut);
     SyncState();
     Put(Op::TextureCopy, config);
     return true;
 }
 
 bool RenderThread::AccelerateFill(const Pica::MemoryFillConfig& config) {
+#ifdef VITA_DIAGNOSTICS
+    static u32 logged = 0;
+    if (late_skip && LatelogNow() && logged++ < 400) {
+        LOG_INFO(Render, "latelog: frame {}: fill {:#x}-{:#x} in a late frame", screenlog_frame,
+                 config.GetStartAddress(), config.GetEndAddress());
+    }
+    if (screenlog_on) {
+        screenlog_transfers +=
+            fmt::format(" fill {:#x}-{:#x}", config.GetStartAddress(), config.GetEndAddress());
+    }
+#endif
+    HoldWrite(config.GetStartAddress(), config.GetEndAddress() - config.GetStartAddress(),
+              PageHolds::FillOut);
     SyncState();
     Put(Op::Fill, config);
     return true;
 }
 
 bool RenderThread::AccelerateDma(PAddr src, PAddr dst, u32 size) {
+    HoldRead(src, size, PageHolds::DmaIn);
+    HoldWrite(dst, size, PageHolds::DmaOut);
     SyncState();
     const u8* const bytes = check ? memory.GetPhysicalPointer(src) : nullptr;
     Put(Op::Dma, DmaRecord{src, dst, size, bytes ? Common::ComputeHash64(bytes, size) : 0});
@@ -771,8 +817,141 @@ void RenderThread::KeepTargetUncached(const DrawTextures& textures, u32 count) {
     Release();
 }
 
+void RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
+    if (page_holds_on) {
+        page_holds.Read(addr, bytes, HoldTicket(), kind);
+    }
+}
+
+void RenderThread::HoldWrite(PAddr addr, u32 bytes, PageHolds::Kind kind) {
+    last_write_ticket = HoldTicket();
+    if (page_holds_on) {
+        page_holds.Write(addr, bytes, HoldTicket(), kind);
+    }
+}
+
+void RenderThread::HoldDraw(const DrawTextures& textures, u32 count, bool vertices,
+                            bool is_indexed) {
+    if (!page_holds_on) {
+        return;
+    }
+    const auto& regs = pica.regs.internal;
+    for (u32 i = 0; i < count; i++) {
+        HoldRead(textures[i].addr, textures[i].bytes, PageHolds::Texture);
+        // Watched until the guest writes them, which marks the textures over them.
+        page_holds.Watch(textures[i].addr, textures[i].bytes);
+    }
+    const auto& fb = regs.framebuffer.framebuffer;
+    const auto& om = regs.framebuffer.output_merger;
+    const u32 pixels = fb.GetWidth() * fb.GetHeight();
+    const auto once = [&](BufferHold& held, PAddr addr, u32 bytes) {
+        if (held.addr == addr && held.bytes == bytes && held.ticket == HoldTicket()) {
+            return false;
+        }
+        held = {addr, bytes, HoldTicket()};
+        return true;
+    };
+    const PAddr colour = fb.GetColorBufferPhysicalAddress();
+    const u32 colour_bytes = pixels * Pica::FramebufferRegs::BytesPerColorPixel(fb.color_format);
+    if (once(held_colour, colour, colour_bytes)) {
+        HoldWrite(colour, colour_bytes, PageHolds::Colour);
+    }
+    // Depth is loaded from the guest's buffer when a pass starts from it there, and stored in
+    // the rasterizer's own depth stores, never into guest memory.
+    if (om.depth_test_enable || (fb.allow_depth_stencil_write && om.depth_write_enable) ||
+        om.stencil_test.enable) {
+        const PAddr depth = fb.GetDepthBufferPhysicalAddress();
+        const u32 depth_bytes = pixels * Pica::FramebufferRegs::BytesPerDepthPixel(fb.depth_format);
+        if (once(held_depth, depth, depth_bytes)) {
+            HoldRead(depth, depth_bytes, PageHolds::Depth);
+        }
+    }
+    if (vertices) {
+        HoldVertices(is_indexed);
+    }
+}
+
+void RenderThread::HoldVertices(bool is_indexed) {
+    const auto& pipeline = pica.regs.internal.pipeline;
+    const auto& va = pipeline.vertex_attributes;
+    const u32 count = pipeline.num_vertices;
+    if (count == 0) {
+        return;
+    }
+    const PAddr base = va.GetPhysicalBaseAddress();
+    u32 lo = pipeline.vertex_offset;
+    u32 hi = lo + count - 1;
+    draw_indices = {};
+    if (is_indexed) {
+        const PAddr index_address = base + pipeline.index_array.offset;
+        const bool index_u16 = pipeline.index_array.format != 0;
+        HoldRead(index_address, count * (index_u16 ? 2 : 1), PageHolds::Index);
+        // Every vertex an index can reach, but where a 16-bit index reaches into FCRAM: there the indices
+        // are scanned. VRAM is held for reads whole.
+        lo = 0;
+        hi = index_u16 ? 0xffffu : 0xffu;
+        bool fcram = false;
+        for (const auto& loader : va.attribute_loaders) {
+            const PAddr at = base + loader.data_offset;
+            fcram |= loader.component_count != 0 && at >= Memory::FCRAM_PADDR &&
+                     at < Memory::FCRAM_PADDR_END;
+        }
+        if (index_u16 && fcram) {
+            u32 first, pages;
+            const bool in_fcram = page_holds_on &&
+                                  page_holds.PageRange(index_address, count * 2, first, pages);
+            const bool memoable = in_fcram && page_holds.IndexMemoable(first, pages);
+            IndexMemo& memo = index_memo[((index_address >> 1) ^ (count * 0x9E3779B1u)) %
+                                         index_memo.size()];
+            u16 a, b;
+            if (memoable && memo.addr == index_address && memo.count == count &&
+                memo.stamp == page_holds.IndexStamp(first, pages)) {
+                a = memo.lo;
+                b = memo.hi;
+#ifdef VITA_DIAGNOSTICS
+                index_memo_hits.fetch_add(1, std::memory_order_relaxed);
+#endif
+            } else {
+                memory.GuardPhysicalRead(index_address, count * 2);
+                const u8* const indices = memory.GetPhysicalPointer(index_address);
+                DEBUG_ASSERT_MSG(indices != nullptr && (index_address & 1) == 0,
+                                 "render thread: 16-bit indices at {:#x}", index_address);
+#ifdef VITA_DIAGNOSTICS
+                const auto scan_start = Clock::now();
+#endif
+                std::tie(a, b) = Common::FindMinMax(
+                    std::span<const u16>{reinterpret_cast<const u16*>(indices), count});
+#ifdef VITA_DIAGNOSTICS
+                index_scan_us.fetch_add(Since(scan_start), std::memory_order_relaxed);
+                index_scans.fetch_add(1, std::memory_order_relaxed);
+                index_scan_indices.fetch_add(count, std::memory_order_relaxed);
+#endif
+                if (memoable) {
+                    page_holds.WatchIndices(first, pages);
+                    memo = {index_address, count, page_holds.IndexStamp(first, pages), a, b};
+                }
+            }
+            lo = a;
+            hi = b;
+            draw_indices = {a, b, 1};
+        }
+    }
+    for (const auto& loader : va.attribute_loaders) {
+        if (loader.component_count == 0 || loader.byte_count == 0) {
+            continue;
+        }
+        const u32 stride = loader.byte_count;
+        HoldRead(base + loader.data_offset + lo * stride, (hi - lo + 1) * stride,
+                 PageHolds::Vertex);
+    }
+}
+
 bool RenderThread::AccelerateDrawBatch(bool is_indexed) {
-    KeepTargetUncached();
+    // The textures' pages are held here; the render thread moves them to CDRAM at the untile.
+    DrawTextures textures;
+    const u32 count = TextureRanges(pica.regs.internal, textures);
+    const PublishTogether together{*this};
+    HoldDraw(textures, count, true, is_indexed);
     SyncState();
     if (check) {
         PutCheck();
@@ -820,6 +999,8 @@ void RenderThread::FlushImmediate() {
     DrawTextures textures;
     const u32 count = TextureRanges(pica.regs.internal, textures);
     const PublishTogether together{*this};
+    // The vertices are in the record (the immediate batch).
+    HoldDraw(textures, count, false, false);
     SyncState();
     if (check) {
         PutCheck();
@@ -838,6 +1019,7 @@ void RenderThread::GpuIdle() {
 
 u64 RenderThread::InterruptFence() {
     const u32 ticket = ++tickets;
+    page_holds.Close(ticket);
     Put(Op::Fence, ticket);
     return ticket;
 }
@@ -900,6 +1082,252 @@ void RenderThread::InterruptWait(u64 ticket) {
         ticket_wait.store(false, std::memory_order_relaxed);
     }
 }
+
+void RenderThread::WaitForGpuWrites() {
+    if (last_write_ticket != 0 && !InterruptPoll(last_write_ticket)) {
+        if (last_write_ticket == HoldTicket()) {
+            InterruptFence();
+        }
+        InterruptWait(last_write_ticket);
+    }
+}
+
+void RenderThread::WaitGpuWrites(PAddr addr, u32 size) {
+    // A page move's copy (GuestGpuMemory): the GPU's writes queued to the pages land first.
+    // Before the native core turns the holds on there is no page's ticket: the last write's.
+    if (!page_holds_on) {
+        WaitForGpuWrites();
+        return;
+    }
+    for (PAddr at = addr & ~0xfffu; at < addr + size; at += 0x1000) {
+        const u32 page = page_holds.PageOf(memory.GetPhysicalPointer(at));
+        if (page == PageHolds::NoPage) {
+            continue;
+        }
+        const u32 ticket = page_holds.WriteTicket(page);
+        if (InterruptPoll(ticket)) {
+            continue;
+        }
+        // A write hold made since the last fence has no ticket yet: it gets one now.
+        if (ticket == HoldTicket()) {
+            InterruptFence();
+        }
+        InterruptWait(ticket);
+    }
+}
+
+void RenderThread::EnablePageHolds() {
+    page_holds_on = true;
+}
+
+void RenderThread::ApplyPageHolds() {
+    page_holds.Apply();
+}
+
+void RenderThread::ReleasePageHolds() {
+    page_holds.Release(reached.load(std::memory_order_acquire));
+}
+
+void RenderThread::WaitHeldPage(u32 page, bool write) {
+    const u32 ticket = page_holds.WaitFor(page, write, reached.load(std::memory_order_acquire));
+    if (ticket == 0) {
+        return;
+    }
+    // The holds made since the last fence have no ticket yet: they get one now.
+    if (ticket == HoldTicket()) {
+        ASSERT_MSG(sceKernelGetThreadId() == producer,
+                   "render thread: a fence for a held page queued off the emulation thread; {}",
+                   Common::DescribeWaiters(wake_flag));
+        InterruptFence();
+    }
+    InterruptWait(ticket);
+}
+
+bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 guest_pc,
+                             [[maybe_unused]] u32 guest_va) {
+    if (!page_holds_on) {
+        return false;
+    }
+    const u32 page = page_holds.PageOf(host);
+    if (page == PageHolds::NoPage) {
+        return false;
+    }
+    // A hold refuses writes to a page the GPU reads, and any access to one it writes.
+    const PageHolds::Access access = page_holds.Applied(page);
+    if (access == PageHolds::Unheld || (access == PageHolds::ReadOnly && !write)) {
+        return false;
+    }
+    // A write to a page whose index lists the scan's memo holds (HoldVertices): the memo's
+    // ranges there are stale, and the page opens as its other holds allow.
+    if (write && page_holds.IndexWatched(page)) {
+        page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
+        if (page_holds.Applied(page) == PageHolds::Unheld) {
+            return true;
+        }
+    }
+    // A write to a cached FCRAM page that only queued draws' geometry reads holds (a buffer the guest
+    // refills while the GPU still draws it): the page moves to CDRAM after this wait, so the next write
+    // takes a version instead.
+    const bool move_after = write && !GeometryStaysCached() && address >= Memory::FCRAM_PADDR &&
+                            address < Memory::FCRAM_PADDR_END &&
+                            page_holds.GeometryReadOnly(page, reached.load(std::memory_order_acquire)) &&
+                            renderer.WouldMakeUncached(address, 0x1000);
+#ifdef VITA_DIAGNOSTICS
+    faults++;
+    const auto start = Clock::now();
+    const u32 before = reached.load(std::memory_order_acquire);
+    const u32 waited = page_holds.WaitFor(page, write, before);
+    const PageHolds::Kind kind = page_holds.WaitKind(page, write, before);
+#endif
+    WaitHeldPage(page, write);
+#ifdef VITA_DIAGNOSTICS
+    if (waited != 0) {
+        const u64 us = Since(start);
+        fault_waits++;
+        fault_wait_us += us;
+        fault_kinds[kind]++;
+        fault_kind_us[kind] += us;
+        // gxm_flags `holdlog`: the first aborts that waited, with where the guest was.
+        static const bool holdlog = GxmFlag("holdlog");
+        static u32 logged = 0;
+        if (holdlog && logged++ < 200) {
+            LOG_INFO(Render,
+                     "holdlog: guest {} at {:#010x} (pc {:#010x}) on {:#010x}: {} hold, ticket "
+                     "{} with {} reached and {} queued, waited {} us",
+                     write ? "write" : "read", guest_va, guest_pc, page_holds.AddressOf(page),
+                     PageHolds::KindName(kind), waited, before, tickets, us);
+        }
+    }
+#endif
+    page_holds.Reopen(page, reached.load(std::memory_order_acquire));
+    [[maybe_unused]] const PageHolds::Access reopened = page_holds.Applied(page);
+    if (move_after) {
+        Hold();
+        renderer.MakeUncached(address, 0x1000, false);
+        Release();
+#ifdef VITA_DIAGNOSTICS
+        geometry_moves++;
+#endif
+    }
+    DEBUG_ASSERT_MSG(page_holds.Applied(page) == PageHolds::Unheld ||
+                         (page_holds.Applied(page) == PageHolds::ReadOnly && !write),
+                     "render thread: page {} ({:#010x}) still held after its work ({} access): "
+                     "{} after the reopen, {} after the move{}; texture watch {}, index watch "
+                     "{}; {}; {}",
+                     page, address, write ? "a write" : "a read", static_cast<u32>(reopened),
+                     static_cast<u32>(after_move), move_after ? " (moved)" : "",
+                     page_holds.Watched(page), page_holds.IndexWatched(page),
+                     page_holds.HoldState(page, reached.load(std::memory_order_acquire)),
+                     page_holds.DisplayState(page, reached.load(std::memory_order_acquire)));
+    return true;
+}
+
+void RenderThread::HostAccess(const u8* host, u32 size, bool write) {
+    const u8* const end = host + size;
+    for (const u8* p = host; p < end;
+         p = reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1)) {
+        const u32 page = page_holds.PageOf(p);
+        if (page == PageHolds::NoPage || page_holds.Applied(page) == PageHolds::Unheld) {
+            continue;
+        }
+#ifdef VITA_DIAGNOSTICS
+        const auto start = Clock::now();
+        const u32 before = reached.load(std::memory_order_acquire);
+        const u32 waited = page_holds.WaitFor(page, write, before);
+        const auto [writer, writer_range] = page_holds.WriterOf(page);
+#endif
+        WaitHeldPage(page, write);
+#ifdef VITA_DIAGNOSTICS
+        if (reached.load(std::memory_order_acquire) != before) {
+            const u64 us = Since(start);
+            host_waits++;
+            host_wait_us += us;
+            static const bool holdlog = SgxdFlag("holdlog") || SgxdFlagValue("holdlog") != 0;
+            static const u64 holdlog_from_us = u64{SgxdFlagValue("holdlog")} * 1000000;
+            static u32 logged = 0;
+            if (holdlog &&
+                static_cast<u64>(Clock::now().time_since_epoch().count()) >= holdlog_from_us &&
+                logged++ < 200) {
+                const u8* const page_end =
+                    reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1);
+                LOG_INFO(Render,
+                         "holdlog: HLE {} of {:#010x}+{:#x}: {} write of {:#010x}+{:#x}, ticket "
+                         "{} with {} reached and {} queued, waited {} us",
+                         write ? "write" : "read",
+                         page_holds.AddressOf(page) + (reinterpret_cast<uintptr_t>(p) & 0xfff),
+                         std::min(end, page_end) - p, PageHolds::KindName(writer),
+                         writer_range.first, writer_range.second, waited, before, tickets, us);
+            }
+        }
+#endif
+    }
+}
+
+void RenderThread::InvalidateWritten(PAddr addr, u32 size) {
+    if (!page_holds_on || size == 0) {
+        return;
+    }
+    // Y2R writes its picture through GetPointer after this (a game's Grand Prix preview video):
+    // without it the textures over those pages kept their first frame, and the video went
+    // back and forth between it and the next one.
+    const u8* const host = memory.GetPhysicalPointer(addr);
+    if (host == nullptr) {
+        return;
+    }
+    const u8* const end = host + size;
+    for (const u8* p = host; p < end;
+         p = reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1)) {
+        const u32 page = page_holds.PageOf(p);
+        if (page != PageHolds::NoPage && page < Memory::FCRAM_SIZE >> 12) {
+            // Watched or not: Y2R writes without a fault. A watched texture page opens as its
+            // other holds allow; the range's record below marks its textures (T12).
+            page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
+            TextureWritten(page);
+#ifdef VITA_DIAGNOSTICS
+            texture_write_hle++;
+#endif
+        }
+    }
+}
+
+void RenderThread::TextureWritten(u32 page) {
+    ASSERT_MSG(sceKernelGetThreadId() == producer,
+               "render thread: a texture's page written off the emulation thread; {}",
+               Common::DescribeWaiters(wake_flag));
+    // Closed, not published: the texture's next use is a later record, whose publish takes this along
+    // (publishing would wake a sleeping render thread each time).
+    const u32 address = static_cast<u32>(page_holds.AddressOf(page));
+    std::memcpy(Begin(Op::GuestWrote, sizeof(address)), &address, sizeof(address));
+    write += open_record;
+}
+
+#ifdef VITA_DIAGNOSTICS
+std::pair<u32, u32> RenderThread::TakeTextureWrites() {
+    return {std::exchange(texture_write_faults, 0), std::exchange(texture_write_hle, 0)};
+}
+#endif
+
+void RenderThread::HostRemapped(const u8* host, u32 size) {
+    if (page_holds_on) {
+        page_holds.Resend(host, size);
+    }
+}
+
+#ifdef VITA_DIAGNOSTICS
+RenderThread::HoldStats RenderThread::TakeHoldStats() {
+    HoldStats h{};
+    h.holds = page_holds.TakeStats();
+    h.faults = std::exchange(faults, 0);
+    h.fault_waits = std::exchange(fault_waits, 0);
+    h.fault_wait_us = std::exchange(fault_wait_us, 0);
+    h.host_waits = std::exchange(host_waits, 0);
+    h.host_wait_us = std::exchange(host_wait_us, 0);
+    h.geometry_moves = std::exchange(geometry_moves, 0);
+    h.fault_kinds = std::exchange(fault_kinds, {});
+    h.fault_kind_us = std::exchange(fault_kind_us, {});
+    return h;
+}
+#endif
 
 std::vector<std::pair<PAddr, u32>> RenderThread::TakeCachedReads() {
     // RasterizerSgxd's list has its own lock.
@@ -976,6 +1404,12 @@ void RenderThread::CountEmuWait(EmuWait kind, Clock::time_point start) {
 
 void RenderThread::Present(const std::array<Pica::FramebufferConfig, 2>& fb,
                            const std::array<Pica::ColorFill, 2>& fill) {
+    // The present reads the screens the LCD shows (its picture is drawn from them on the GPU).
+    for (u32 i = 0; i < 2; i++) {
+        const Pica::FramebufferConfig& f = fb[i];
+        HoldRead(f.second_fb_active ? f.address_left2 : f.address_left1,
+                 f.stride * (i == 0 ? 400u : 320u), PageHolds::Present);
+    }
     const PresentRecord record{fb, fill};
     std::memcpy(Begin(Op::Present, sizeof(record)), &record, sizeof(record));
     // The record's position, before it is published.

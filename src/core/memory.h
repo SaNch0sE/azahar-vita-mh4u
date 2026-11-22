@@ -5,11 +5,12 @@
 #pragma once
 #include <array>
 #include <cstddef>
+#include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/map.hpp>
-#include <map>
 #include <boost/serialization/vector.hpp>
 #include "common/common_types.h"
 #include "common/memory_ref.h"
@@ -319,10 +320,37 @@ public:
     virtual void OnPageTableChanged() = 0;
 };
 
+/**
+ * The GPU's page holds (video_core renderer_sgxd/page_holds.h) over the emulator's own view of
+ * guest memory. The holds close the guest's view of the pages queued GPU work still reads or
+ * writes; the HLE reaches guest memory through this one instead, which they do not close. The
+ * block functions (ReadBlock, WriteBlock, ZeroBlock, CopyBlock) check each FCRAM or VRAM page
+ * they touch against `held` and hand a held one to `access`, which waits for that work, as the
+ * guest's access would. Read8-64 and Write8-64, and pointers from GetPointer, are not checked.
+ */
+struct HostGuard {
+    /// A byte a page of FCRAM, then of VRAM: nonzero where the guest's view is held.
+    const u8* held = nullptr;
+    std::function<void(const u8* host, u32 size, bool write)> access;
+    /// A guest window was mapped over [host, host + size): its holds go to it too.
+    std::function<void(const u8* host, u32 size)> remapped;
+};
+
 class MemorySystem {
 public:
     explicit MemorySystem(Core::System& system);
     ~MemorySystem();
+
+    /// See HostGuard. Once, when the guest's table is installed.
+    void SetHostGuard(HostGuard guard);
+    /// The native backend mapped a guest window over [host, host + size) (HostGuard::remapped).
+    void HostRemapped(const u8* host, u32 size);
+    /**
+     * The host reads [address, address + size), physical, through GetPhysicalPointer: each held
+     * page waits for its GPU work first, as the block reads do (HostGuard). The PICA's command
+     * list parser reads this way what a queued DMA may still be writing.
+     */
+    void GuardPhysicalRead(PAddr address, u32 size);
 
     /**
      * Registers the observer notified of mapping changes to the active page table. Only one

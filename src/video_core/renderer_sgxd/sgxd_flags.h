@@ -130,6 +130,8 @@ namespace GxmRenderer {
  *             decode (ETC1's, and a split ETC1A4's colour and alpha, decoded back through the
  *             texture unit), once its batch is sent; the log counts the levels that differ
  *             (with dumptex, a "want" file too)
+ *   gpuwiden  8-bit index lists widened on the GPU, a pass's in one side render whose 3D the
+ *             pass's TA waits for (SgxdBackend::WidenIndices), not by the render thread
  *   widencheck  every 8-bit index list's GPU widening (SgxdBackend::WidenIndices) against its
  *             guest bytes, once its render is done
  *

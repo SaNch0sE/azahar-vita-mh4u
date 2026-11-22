@@ -44,6 +44,65 @@ namespace VideoCore {
 constexpr VAddr VADDR_LCD = 0x1ED02000;
 constexpr VAddr VADDR_GPU = 0x1EF00000;
 
+// Upstream's: how long the 3DS's transfer engines take, which GSP adds to their
+// interrupts when simulate_3ds_gpu_timings is on.
+class DelayGenerator {
+private:
+    DelayGenerator() = default;
+
+    // Average transfer speed based on measurements taken from real
+    // hardware. 4 different modes have been taken into consideration:
+    // RAM -> RAM, RAM -> VRAM, VRAM -> RAM and VRAM -> VRAM.
+    // Furthermore, measurements are split into DMA transfers and tex
+    // copies. For simplicity, we will assume fills are as fast as
+    // texture copies.
+
+    static constexpr double mibps_to_ns_per_byte(double mib_per_sec) {
+        return 1'000'000'000.0 / (mib_per_sec * 1024.0 * 1024.0);
+    }
+
+    static constexpr std::array<std::array<double, 4>, 2> speed_mibps = {
+        {{
+             190.0, // DMA RAMTORAM
+             310.0, // DMA RAMTOVRAM
+             380.0, // DMA VRAMTORAM
+             380.0, // DMA VRAMTOVRAM
+         },
+         {
+             450.0,  // TEX RAMTORAM
+             3100.0, // TEX RAMTOVRAM
+             5400.0, // TEX VRAMTORAM
+             5400.0, // TEX VRAMTOVRAM
+         }}};
+
+public:
+    enum class CopyMode {
+        RAMTORAM,
+        RAMTOVRAM,
+        VRAMTORAM,
+        VRAMTOVRAM,
+    };
+
+    static CopyMode GetCopyMode(bool input_vram, bool output_vram) {
+        if (!input_vram && !output_vram) {
+            return CopyMode::RAMTORAM;
+        } else if (!input_vram && output_vram) {
+            return CopyMode::RAMTOVRAM;
+        } else if (input_vram && !output_vram) {
+            return CopyMode::VRAMTORAM;
+        } else {
+            return CopyMode::VRAMTOVRAM;
+        }
+    }
+
+    static u64 CalculateDelayNanoseconds(CopyMode mode, bool is_textre, size_t size) {
+        double base_ns_per_byte =
+            mibps_to_ns_per_byte(speed_mibps[is_textre][static_cast<u32>(mode)]);
+
+        return static_cast<u64>(size * base_ns_per_byte);
+    }
+};
+
 MICROPROFILE_DEFINE(GPU_DisplayTransfer, "GPU", "DisplayTransfer", MP_RGB(100, 100, 255));
 MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(100, 255, 100));
 
@@ -56,11 +115,10 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
         [this](uintptr_t user_data, s64 cycles_late) { VBlankCallback(user_data, cycles_late); });
     impl->timing.ScheduleEvent(FRAME_TICKS, impl->vblank_event);
 
-    // The PICA raises P3D from inside a command list, when the list's IRQ request comes; Signal
-    // holds it until the GPU has run the list's work.
-    Service::GSP::InterruptHandler pica_interrupt = [this](Service::GSP::InterruptId id, u64) {
-        Signal(id);
-    };
+    // The PICA raises P3D from inside a command list, when the list's IRQ request comes, with
+    // its delay generator's estimate of the list.
+    Service::GSP::InterruptHandler pica_interrupt = [this](Service::GSP::InterruptId id,
+                                                           u64 delay_ns) { Signal(id, delay_ns); };
     impl->pica.SetInterruptHandler(pica_interrupt);
 #ifdef ENABLE_GXM
     // The renderer's rasterizer runs on the render thread, from its copy of the PICA's state;
@@ -135,84 +193,54 @@ void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op
 #endif
     // GPU work the op held back starts now (the last pass's 3D, when a transfer waits on it).
     impl->rasterizer->GpuIdle();
+#ifdef ENABLE_GXM
+    // The pages the op's work reads and writes, held before the guest runs again.
+    impl->render->ApplyPageHolds();
+#endif
 }
 
-void GPU::Signal(Service::GSP::InterruptId id) {
+void GPU::Signal(Service::GSP::InterruptId id, u64 delay_ns) {
     using Service::GSP::InterruptId;
     if (impl->interrupts_muted) {
         return;
     }
-    // The vblanks keep core timing's cadence (VBlankCallback, an event under the HLE lock).
-    if (id == InterruptId::PDC0 || id == InterruptId::PDC1) {
-        GPU_TRACE("irq", static_cast<unsigned>(id));
-        impl->signal_interrupt(id, 0);
-        return;
+    // Any but a vblank (core timing's cadence, VBlankCallback): the work before it gets a
+    // ticket, which ends the page holds that work made (SgxdRenderer::PageHolds).
+    if (id != InterruptId::PDC0 && id != InterruptId::PDC1) {
+        impl->rasterizer->InterruptFence();
     }
-    // Every other interrupt comes when the GPU has done the work sent before it, as the PICA's
-    // units raise theirs: no modelled delay, and not while the render thread or the SGX still
-    // runs it. Always held: GSP's command work runs without the HLE lock (parallel cores), and
-    // raising one touches kernel state.
-    const u64 ticket = impl->rasterizer->InterruptFence();
-    GPU_TRACE("irq_held", static_cast<unsigned>(id));
-    impl->held_interrupts.push_back({id, ticket});
-    CountHeld();
-}
-
-void GPU::CountHeld() {
-    const auto& held = impl->held_interrupts;
-    held_front.store(held.empty() ? 0 : held.front().ticket, std::memory_order_release);
-    held_count.store(static_cast<u32>(held.size()), std::memory_order_release);
-}
-
-bool GPU::HasDueInterrupts() const {
-    if (held_count.load(std::memory_order_acquire) == 0) {
-        return false;
-    }
-#ifdef ENABLE_GXM
-    // A hold polls the fences only in DeliverInterrupts.
-    if (impl->render->Inline()) {
-        return true;
-    }
-#endif
-    return impl->rasterizer->InterruptPoll(held_front.load(std::memory_order_acquire));
+    GPU_TRACE("irq", static_cast<unsigned>(id));
+    impl->signal_interrupt(id, delay_ns);
 }
 
 void GPU::DeliverInterrupts() {
 #ifdef ENABLE_GXM
     impl->render->PollHeld();
+    impl->render->ReleasePageHolds();
 #endif
-    // The tickets grow with the work sent, so the interrupts complete in the order raised.
-    auto& held = impl->held_interrupts;
-    while (!held.empty() && impl->rasterizer->InterruptPoll(held.front().ticket)) {
-        const Impl::HeldInterrupt h = held.front();
-        held.pop_front();
-        GPU_TRACE("irq", static_cast<unsigned>(h.id));
-        impl->signal_interrupt(h.id, 0);
-    }
-    CountHeld();
 }
 
-bool GPU::WaitHeldInterrupt() {
-    u64 ticket;
-    {
-        Common::MulticoreLock gpu_lock{lock};
-        if (impl->held_interrupts.empty()) {
-            return false;
-        }
-        ticket = impl->held_interrupts.front().ticket;
-    }
-    // Without the lock: the render thread completes tickets without it, and the other
-    // emulation thread may queue GPU work meanwhile.
-    impl->rasterizer->InterruptWait(ticket);
-    return true;
+void GPU::EnablePageHolds() {
+#ifdef ENABLE_GXM
+    auto& render = *impl->render;
+    render.EnablePageHolds();
+    impl->memory.SetHostGuard({
+        render.PageHeldMap(),
+        [this](const u8* host, u32 size, bool write) {
+            impl->render->HostAccess(host, size, write);
+        },
+        [this](const u8* host, u32 size) { impl->render->HostRemapped(host, size); },
+    });
+#endif
 }
 
-bool GPU::WaitInterrupt() {
-    if (!WaitHeldInterrupt()) {
-        return false;
-    }
-    DeliverInterrupts();
-    return true;
+bool GPU::GuestAbort([[maybe_unused]] const u8* host, [[maybe_unused]] bool write,
+                     [[maybe_unused]] u32 guest_pc, [[maybe_unused]] u32 guest_va) {
+#ifdef ENABLE_GXM
+    return impl->render->PageFault(host, write, guest_pc, guest_va);
+#else
+    return false;
+#endif
 }
 
 void GPU::RunOnRenderThread(const std::function<void()>& fn) {
@@ -334,7 +362,14 @@ void GPU::Execute(const Service::GSP::Command& command) {
         auto runs = DmaRuns(command.dma_request.source_address, command.dma_request.dest_address,
                             command.dma_request.size);
 
-        RunDma(runs);
+        auto is_vram = [&](u32 addr) {
+            return addr >= Memory::VRAM_VADDR && addr <= Memory::VRAM_VADDR_END;
+        };
+        const u64 delay = DelayGenerator::CalculateDelayNanoseconds(
+            DelayGenerator::GetCopyMode(is_vram(command.dma_request.source_address),
+                                        is_vram(command.dma_request.dest_address)),
+            false, command.dma_request.size);
+        RunDma(runs, delay);
         break;
     }
     case CommandId::SubmitCmdList: {
@@ -631,7 +666,11 @@ void GPU::MemoryFill(u32 index, std::optional<Service::GSP::InterruptId> interru
     });
 
     if (interrupt) {
-        Signal(*interrupt);
+        // Treat fill as texture transfer from VRAM (upstream).
+        const u64 delay = DelayGenerator::CalculateDelayNanoseconds(
+            DelayGenerator::GetCopyMode(true, config.IsVRAM()), true,
+            config.GetEndAddress() - config.GetStartAddress());
+        Signal(*interrupt, delay);
     }
 
     // Reset "trigger" flag and set the "finish" flag
@@ -669,12 +708,20 @@ void GPU::MemoryTransfer() {
                  RunMemoryTransfer(config, allow_display_transfer);
              });
 
-    // Complete transfer.
+    // Complete transfer, with upstream's delay for it.
+    const u64 delay =
+        config.is_texture_copy
+            ? DelayGenerator::CalculateDelayNanoseconds(
+                  DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
+                  config.texture_copy.size)
+            : DelayGenerator::CalculateDelayNanoseconds(
+                  DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
+                  config.input_width * config.input_height * BytesPerPixel(config.input_format));
     config.trigger.Assign(0);
-    Signal(Service::GSP::InterruptId::PPF);
+    Signal(Service::GSP::InterruptId::PPF, delay);
 }
 
-void GPU::RunDma(const std::vector<DmaRun>& runs) {
+void GPU::RunDma(const std::vector<DmaRun>& runs, u64 delay_ns) {
 #ifdef VITA_DIAGNOSTICS
     if (SgxdRenderer::Vprof::Recording()) {
         std::vector<u32> words;
@@ -696,7 +743,7 @@ void GPU::RunDma(const std::vector<DmaRun>& runs) {
             }
         }
     });
-    Signal(Service::GSP::InterruptId::DMA);
+    Signal(Service::GSP::InterruptId::DMA, delay_ns);
 }
 
 #ifdef VITA_DIAGNOSTICS
@@ -726,7 +773,7 @@ void GPU::VprofReplay(const std::string& capture, const std::string& first) {
             for (std::size_t i = 0; i + 2 < triples.size(); i += 3) {
                 runs.push_back({triples[i], triples[i + 1], triples[i + 2]});
             }
-            RunDma(runs);
+            RunDma(runs, 0);
         },
         [this](std::function<void()> fn) { RunGpuOp(OpKind::RegWrite, fn); },
         [](std::function<void()> fn) { fn(); },
@@ -834,8 +881,8 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         });
     }
     // Signal to GSP that GPU interrupt has occurred
-    Signal(Service::GSP::InterruptId::PDC0);
-    Signal(Service::GSP::InterruptId::PDC1);
+    Signal(Service::GSP::InterruptId::PDC0, 0);
+    Signal(Service::GSP::InterruptId::PDC1, 0);
 
     // Moved pages the GPU has not used for a while go back to cached FCRAM first, so that the
     // moves below can reuse their pool pages. Rare, as a move is: the render thread held.
@@ -883,6 +930,27 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         impl->presented_fb = fb;
         impl->presented_fill = fill;
     }
+    impl->render->ApplyPageHolds();
+    // The guest hears of the GPU's work when it is submitted, so nothing else keeps the GPU
+    // near the guest: each vblank waits for the work queued before the last one (the present
+    // above included), so the GPU runs at most a frame behind. gxm_flags `novblankwait`: no
+    // wait, the GPU as far behind as the render ring and the page holds let it fall.
+    static const bool no_wait = GxmRenderer::GxmFlag("novblankwait");
+    const u64 ticket = impl->rasterizer->InterruptFence();
+    if (!no_wait && impl->vblank_ticket != 0 &&
+        !impl->rasterizer->InterruptPoll(impl->vblank_ticket)) {
+#ifdef VITA_DIAGNOSTICS
+        const auto start = Common::ProcessClock::now();
+#endif
+        impl->rasterizer->InterruptWait(impl->vblank_ticket);
+#ifdef VITA_DIAGNOSTICS
+        impl->render->CountVblankWait(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                 Common::ProcessClock::now() - start)
+                                 .count()));
+#endif
+    }
+    impl->vblank_ticket = ticket;
 #else
     // A present has no guest-visible effect: well past the display's rate it is dropped. 12 ms,
     // not a frame's 16.7: at 100% the guest's VBlanks jitter around the frame, and a frame's cap

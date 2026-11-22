@@ -294,7 +294,24 @@ void VitaGuestMap::OnMapped(VAddr base, u32 size, MemoryRef target) {
     live_mappings.emplace(base, wanted);
     if (installed) {
         Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(host), base, size, MapPerm(host));
+        // The window is mapped open: the GPU's page holds cover it too.
+        memory.HostRemapped(host, size);
     }
+}
+
+const u8* VitaGuestMap::HostAt(VAddr addr) const {
+    if (extra.size != 0 && addr - extra_base < extra.size) {
+        return extra.host + (addr - extra_base);
+    }
+    auto it = live_mappings.upper_bound(addr);
+    if (it == live_mappings.begin()) {
+        return nullptr;
+    }
+    --it;
+    if (addr - it->first >= it->second.size) {
+        return nullptr;
+    }
+    return it->second.host + (addr - it->first);
 }
 
 std::string VitaGuestMap::Describe(VAddr addr) const {
@@ -525,22 +542,8 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                          "Vita native backend is not usable");
         return false;
     }
-    if (GetID() == 0 || !system.IsParallel()) {
-        if (!map->IsInstalled() && !map->Install()) {
-            system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
-                             "Vita native backend could not install the guest table");
-            usable = false;
-            return false;
-        }
-    } else if (!attached) {
-        // Parallel cores: this core's emulation thread joins the table core 0 installed
-        // once it is there.
-        if (!map->IsInstalled()) {
-            return false;
-        }
-        const int version = azaharVersion();
-        const int ret = version >= 15 ? azaharAttach() : version;
-        if (ret < 0 || version < 15) {
+    if (!map->IsInstalled()) {
+        if (!map->Install()) {
             system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
                              "Vita native backend could not install the guest table");
             usable = false;
@@ -624,7 +627,20 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     case AZAHAR_EXIT_TIMER:
         return false;
 
-    case AZAHAR_EXIT_DABT:
+    case AZAHAR_EXIT_DABT: {
+        // A small-page permission fault (DFSR FS 0b01111) may be a GPU page hold: the GPU waits for the
+        // work, opens the page, and the access runs again.
+        const u32 status = (run.fsr & 0xFu) | ((run.fsr >> 6) & 0x10u);
+        const bool write = (run.fsr & (1u << 11)) != 0;
+        if (status == 0xFu) {
+            const u8* const host = map->HostAt(run.far);
+            if (host != nullptr && system.GPU().GuestAbort(host, write, context.r[15], run.far)) {
+                return !break_flag && !stop_requested;
+            }
+        }
+        ReportFault(run);
+        return false;
+    }
     case AZAHAR_EXIT_UND:
     case AZAHAR_EXIT_PABT:
     default:
