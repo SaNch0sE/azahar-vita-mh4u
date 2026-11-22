@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include "citra_vita/screen_layout.h"
 #include "common/common_types.h"
 
 struct SgxdRecipeDraw;
@@ -78,28 +79,29 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b);
 /// The frame being built; valid between BeginFrame and EndFrame.
 [[nodiscard]] Batch& CurrentBatch();
 
+/// A screen's place on the display: its corners in display pixels (a parallelogram, the screen
+/// layout's transformation of the picture's unit square).
+using ScreenQuad = ScreenLayouts::Quad;
+
 /// Up to two guest screens a frame, drawn in the frame being built under the draws after them.
-/// The framebuffer at GPU address va (its PICA physical
-/// address: guest memory is mapped there) holds `columns` columns of 240 pixels, stride bytes
-/// apart, in the PICA's pixel format pica_format (a Pica::PixelFormat's value); the texture unit
-/// reads it as it is, and the quad turns it upright over the display rectangle (x, y, w, h). cpu,
-/// the same bytes as the CPU sees them, is cleaned from its cache first; nullptr for memory the CPU
-/// reaches uncached. Returns false, drawing nothing, for a format, stride or third screen it
-/// does not take. Below an opacity of 1 it is blended over what the frame drew before it (a
-/// screen overlaid on the other), its alpha that opacity.
-bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_format, u32 x,
-                     u32 y, u32 w, u32 h, float opacity = 1.0f);
+/// The framebuffer at GPU address va (its PICA physical address) holds `columns` columns of 240
+/// pixels, stride bytes apart, in pica_format (a Pica::PixelFormat's value); the quad turns it
+/// upright onto `quad`. cpu, the same bytes as the CPU sees them, is cleaned from its cache
+/// first; nullptr for memory the CPU reaches uncached. Returns false, drawing nothing, for a
+/// format, stride or third screen it does not take. Below an opacity of 1 it is blended over
+/// what the frame drew before it, its alpha that opacity.
+bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_format,
+                     const ScreenQuad& quad, float opacity = 1.0f);
 /// The upscaled top screen (SgxdRenderer::RasterizerSgxd::TopScreenPicture): a LINEAR U8888
 /// picture of width x height at va (width a multiple of 8), the screen's transpose (x along the
 /// LCD buffer's rows, y across its columns) at quarters / 4 of its pixels, its columns from
 /// (row + margin) * quarters / 4 the screen's 400 rows and its first 60 * quarters rows the
-/// screen's 240 columns, filtered upright over the display rectangle (x, y, w, h). The
-/// widescreen picture's margin rows each side of the 400 (its first column the screen's row
-/// -margin) show as far as the rectangle is wider than 5:3. flip: the screen's rows run to lower
-/// columns from (row + margin) * quarters / 4 (a flipped transfer's picture). opacity as
-/// DrawGuestScreen's.
+/// screen's 240 columns, filtered upright onto `quad`. The widescreen picture's margin rows each
+/// side of the 400 (its first column the screen's row -margin) show as far as the quad is wider
+/// than 5:3. flip: the screen's rows run to lower columns from (row + margin) * quarters / 4 (a
+/// flipped transfer's picture). opacity as DrawGuestScreen's.
 bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32 margin,
-                       bool flip, u32 x, u32 y, u32 w, u32 h, float opacity = 1.0f);
+                       bool flip, const ScreenQuad& quad, float opacity = 1.0f);
 /// Renders the batch, waits for the GPU, and queues the frame for the next vblank.
 void EndFrame();
 /// The BeginFrames since the last call that waited for a vblank to free a display buffer.

@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <cstring>
@@ -994,15 +995,54 @@ Batch& CurrentBatch() {
     return g.batch;
 }
 
-bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_format, u32 x,
-                     u32 y, u32 w, u32 h, float opacity) {
+namespace {
+
+/// The quad's two triangles (top-left, top-right, bottom-left; top-right, bottom-right,
+/// bottom-left) into the slot's vertices: clip space x and y, z, w, a white colour (unused) with
+/// the opacity as its alpha, then each corner's u and v (by corner: top-left, top-right,
+/// bottom-left, bottom-right).
+void PutScreenVertices(u32 slot, const ScreenQuad& quad, float opacity, const float (&uv)[4][2]) {
+    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    constexpr u32 Triangles[6] = {0, 1, 2, 1, 3, 2};
+    // The corners into clip space, the four at once: 2 x / width - 1, 2 y / height - 1.
+    float clip_x[4], clip_y[4];
+    vst1q_f32(clip_x, vmlaq_n_f32(vdupq_n_f32(-1.0f), vld1q_f32(quad.x), 2.0f / DisplayWidth));
+    vst1q_f32(clip_y, vmlaq_n_f32(vdupq_n_f32(-1.0f), vld1q_f32(quad.y), 2.0f / DisplayHeight));
+    float* v = reinterpret_cast<float*>(g.memory + g.screen_offset + ScreenVertices + slot * 0x100);
+    for (u32 n = 0; n < 6; n++) {
+        const u32 c = Triangles[n];
+        const float words[N] = {clip_x[c],
+                                clip_y[c],
+                                0.5f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                opacity,
+                                uv[c][0],
+                                uv[c][1]};
+        std::memcpy(v + n * N, words, sizeof(words));
+    }
+}
+
+std::pair<float, float> QuadSize(const ScreenQuad& quad) {
+    return {std::hypot(quad.x[1] - quad.x[0], quad.y[1] - quad.y[0]),
+            std::hypot(quad.x[2] - quad.x[0], quad.y[2] - quad.y[0])};
+}
+
+} // namespace
+
+bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_format,
+                     const ScreenQuad& quad, float opacity) {
     u32 code, swizzle, bytes;
     Batch& b = g.batch;
+    const auto [w, h] = QuadSize(quad);
     // A linear texture's rows are its width rounded up to 8 texels: the framebuffer's stride is the
     // texture's width, 240 texels or more, and u covers the first 240.
     if (!g.in_frame || g.screens_in_frame >= ScreenSlots || b.draw_count >= b.max_draws ||
         !ScreenFormat(pica_format, code, swizzle, bytes) || stride % bytes != 0 ||
-        stride / bytes < 240 || (stride / bytes) % 8 != 0 || w == 0 || h == 0 || columns == 0) {
+        stride / bytes < 240 || (stride / bytes) % 8 != 0 || w < 1.0f || h < 1.0f ||
+        columns == 0) {
         return false;
     }
     const u32 texels = stride / bytes;
@@ -1019,21 +1059,10 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
     }
 
     // Texel (u, v): u along a column, 240 pixels from the bottom of the upright picture to its
-    // top; v across the columns, left to right. So display x follows v and display y follows u
-    // reversed. Two triangles; x, y in clip space, z, w, a white colour (unused), u, v.
-    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
-    const float x0 = 2.0f * x / DisplayWidth - 1, x1 = 2.0f * (x + w) / DisplayWidth - 1;
-    const float y0 = 2.0f * y / DisplayHeight - 1, y1 = 2.0f * (y + h) / DisplayHeight - 1;
-    const float corner[6][4] = {
-        {x0, y0, 1, 0}, {x1, y0, 1, 1}, {x0, y1, 0, 0},
-        {x1, y0, 1, 1}, {x1, y1, 0, 1}, {x0, y1, 0, 0},
-    };
-    float* v = reinterpret_cast<float*>(g.memory + g.screen_offset + ScreenVertices + slot * 0x100);
-    for (u32 n = 0; n < 6; n++) {
-        const float words[N] = {corner[n][0], corner[n][1], 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, opacity,
-                                corner[n][2] * u_end, corner[n][3]};
-        std::memcpy(v + n * N, words, sizeof(words));
-    }
+    // top; v across the columns, left to right. So the picture's x follows v and its y follows u
+    // reversed.
+    const float uv[4][2] = {{u_end, 0.0f}, {u_end, 1.0f}, {0.0f, 0.0f}, {0.0f, 1.0f}};
+    PutScreenVertices(slot, quad, opacity, uv);
 
     // Point sampled: each display pixel shows the framebuffer pixel under its centre. A
     // translucent screen (the overlay, drawn smaller than the 3DS's) is filtered, and reads its
@@ -1053,44 +1082,34 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
 }
 
 bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32 margin,
-                       bool flip, u32 x, u32 y, u32 w, u32 h, float opacity) {
+                       bool flip, const ScreenQuad& quad, float opacity) {
     Batch& b = g.batch;
+    const auto [w, h] = QuadSize(quad);
     if (!g.in_frame || g.screens_in_frame >= ScreenSlots || b.draw_count >= b.max_draws ||
-        width % 8 != 0 || width == 0 || height == 0 || w == 0 || h == 0) {
+        width % 8 != 0 || width == 0 || height == 0 || w < 1.0f || h < 1.0f) {
         return false;
     }
     const u32 slot = g.screens_in_frame++;
     g.touches[slot * 2] = va;
     g.touches[slot * 2 + 1] = va + width * height * 4;
     SgxdRenderer::SgxdCacheSkipped(SgxdRenderer::CacheSite::Screens, width * height * 4);
-    // Texel (u, v): u along a picture row, the LCD buffer's rows, left to right on the display;
-    // v across them, the buffer's columns, from the bottom of the upright picture to its top.
-    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
-    const float x0 = 2.0f * x / DisplayWidth - 1, x1 = 2.0f * (x + w) / DisplayWidth - 1;
-    const float y0 = 2.0f * y / DisplayHeight - 1, y1 = 2.0f * (y + h) / DisplayHeight - 1;
+    // Texel (u, v): u along a picture row, the LCD buffer's rows, left to right on the upright
+    // picture; v across them, the buffer's columns, from the bottom of the upright picture to its
+    // top.
     // The widescreen picture's margins (margin of the screen's rows each side, the picture's
-    // first column the screen's row -margin): as much of them as the rectangle is wider than
-    // the screen's 5:3, none in a 5:3 one.
+    // first column the screen's row -margin): as much of them as the quad is wider than the
+    // screen's 5:3, none in a 5:3 one.
     const float scale = static_cast<float>(quarters) / 4.0f;
-    const float shown = std::clamp((static_cast<float>(w) * 240.0f / static_cast<float>(h) -
-                                    400.0f) / 2.0f,
-                                   0.0f, static_cast<float>(margin));
+    const float shown =
+        std::clamp((w * 240.0f / h - 400.0f) / 2.0f, 0.0f, static_cast<float>(margin));
     // Flipped, the display's left edge is the picture's column row + margin plus the margin
     // shown, and the columns go down to its right edge.
     const float first = static_cast<float>(row + margin) + (flip ? shown : -shown);
     const float last = flip ? first - 400 - 2 * shown : first + 400 + 2 * shown;
     const float u0 = scale * first / width, u1 = scale * last / width;
     const float v1 = scale * 240 / height;
-    const float corner[6][4] = {
-        {x0, y0, u0, v1}, {x1, y0, u1, v1}, {x0, y1, u0, 0},
-        {x1, y0, u1, v1}, {x1, y1, u1, 0},  {x0, y1, u0, 0},
-    };
-    float* v = reinterpret_cast<float*>(g.memory + g.screen_offset + ScreenVertices + slot * 0x100);
-    for (u32 n = 0; n < 6; n++) {
-        const float words[N] = {corner[n][0], corner[n][1], 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, opacity,
-                                corner[n][2], corner[n][3]};
-        std::memcpy(v + n * N, words, sizeof(words));
-    }
+    const float uv[4][2] = {{u0, v1}, {u1, v1}, {u0, 0.0f}, {u1, 0.0f}};
+    PutScreenVertices(slot, quad, opacity, uv);
     // Bilinear: the scaled picture scaled again to the layout's rectangle. U8888 as the pass's tile held
     // it (SGXD_RECIPE_PACK_U8888), so unmirrored; translucent, its alpha read as one (1BGR).
     const bool blend = opacity < 1.0f;

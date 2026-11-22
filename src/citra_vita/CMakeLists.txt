@@ -82,6 +82,8 @@ set(CITRA_VITA_SOURCES
     multiplayer.h
     rom_check.cpp
     rom_check.h
+    screen_layout.cpp
+    screen_layout.h
     secondary_dns.cpp
     sgxd_present.cpp
     sgxd_present.h

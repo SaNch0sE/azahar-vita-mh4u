@@ -701,6 +701,29 @@ void PrintReentSlots() {
 /// `heap`, the newlib heap's use (a title quit and launched again leaves what it did not free)
 /// and the largest block it can still give (what scattered leftovers cut it into), and the
 /// system's free memory beside it.
+/// `layout N` (the screen layout's value: the menu's choices, Config::Layout's), `swap 0|1` and
+/// `wide 0|1|2` (off, the hack, stretched): pinned as the launch arguments pin them, and the
+/// screens placed again at the window's next poll.
+bool RunLayoutCommand(VitaFrontend::EmuWindowVita& window, const std::string& command) {
+    char name[8] = {};
+    int value = 0;
+    if (std::sscanf(command.c_str(), "%7s %d", name, &value) != 2) {
+        return false;
+    }
+    const std::string_view word{name};
+    const Option option = word == "layout" ? Option::ScreenLayout
+                          : word == "swap" ? Option::SwapScreens
+                          : word == "wide" ? Option::Widescreen
+                                           : Option::Count;
+    if (option == Option::Count) {
+        return false;
+    }
+    Config::Pin(option, value);
+    window.RequestLayoutUpdate();
+    sceClibPrintf("[azahar] %s %d (command)\n", name, Config::Effective(option));
+    return true;
+}
+
 bool RunSettingCommand(const std::string& command) {
     if (command == "suspend") {
         // The power button's short press, for a console with none to press remotely; its
@@ -1902,7 +1925,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     sceClibPrintf("[azahar] crashtest guest (command)\n");
                     title_crashed = true;
                     break;
-                } else if (RunSettingCommand(command) ||
+                } else if (RunLayoutCommand(window, command) || RunSettingCommand(command) ||
                            VitaFrontend::Multiplayer::RunCommand(system, command) ||
                            VitaFrontend::Adhoc::RunCommand(system, command)) {
                 } else {

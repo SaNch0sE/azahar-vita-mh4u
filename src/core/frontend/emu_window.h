@@ -377,6 +377,11 @@ protected:
         framebuffer_layout = layout;
     }
 
+    /// Holds the touch screen pressed at (x, y), each from 0 to 1 across its width and height (x
+    /// right, y down): for a frontend that maps its input onto the screen itself, not through the
+    /// layout's rectangles (TouchPressed). TouchReleased lets go.
+    void TouchPressedAt(float x, float y);
+
     bool is_secondary{};
     bool strict_context_required{};
     WindowSystemInfo window_info;

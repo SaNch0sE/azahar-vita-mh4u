@@ -192,6 +192,13 @@ bool EmuWindow::TouchPressed(unsigned framebuffer_x, unsigned framebuffer_y) {
     return true;
 }
 
+void EmuWindow::TouchPressedAt(float x, float y) {
+    std::scoped_lock guard{touch_state->mutex};
+    touch_state->touch_x = x;
+    touch_state->touch_y = y;
+    touch_state->touch_pressed = true;
+}
+
 void EmuWindow::TouchReleased() {
     std::scoped_lock guard{touch_state->mutex};
     touch_state->touch_pressed = false;

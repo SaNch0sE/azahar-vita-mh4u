@@ -55,6 +55,8 @@ const std::vector<const char*> Toggle{"off", "on"};
 const std::vector<const char*> WidescreenWords{"off", "on", "stretch"};
 const std::vector<const char*> Layouts{"default", "single", "large",  "side",
                                       "hybrid",  "overlay", "largeoverlay"};
+/// The file's word for a custom screen layout: this, then its name.
+constexpr char CustomLayoutWord[] = "custom:";
 const std::vector<const char*> Scales{"1x", "1.25x", "1.5x", "1.75x", "2x"};
 const std::vector<const char*> Skips{"0", "1", "2", "3", "4", "none"};
 const std::vector<const char*> Regions{"auto",      "japan", "usa",   "europe",
@@ -114,8 +116,8 @@ const std::array<Definition, Count> definitions{{
     {"language", false, true, 0, 1, 0, Languages},
 }};
 
-/// The screen layouts' choices as the emulator's layout options; the overlay is the single
-/// screen with EmuWindowVita's overlay on.
+/// The screen layouts' choices as the emulator's layout options, for its settings' log (the window
+/// places the screens itself, EmuWindowVita::SetLayout); the overlays are single screen ones.
 constexpr std::array<Settings::LayoutOption, static_cast<std::size_t>(Layout::Count)> layouts{
     Settings::LayoutOption::Default,      Settings::LayoutOption::SingleScreen,
     Settings::LayoutOption::LargeScreen,  Settings::LayoutOption::SideScreen,
@@ -158,8 +160,15 @@ const Definition& Of(Option option) {
     return definitions[static_cast<std::size_t>(option)];
 }
 
+/// The option's last value: the screen layout's after the built-in ones, its custom layouts'.
+int MaximumOf(Option option) {
+    const int custom =
+        option == Option::ScreenLayout ? static_cast<int>(ScreenLayouts::Count()) : 0;
+    return Of(option).maximum + custom;
+}
+
 int Clamp(Option option, int value) {
-    return std::clamp(value, Of(option).minimum, Of(option).maximum);
+    return std::clamp(value, Of(option).minimum, MaximumOf(option));
 }
 
 /// A title's options it does not set yet, set to all games' values. Whether any was.
@@ -206,10 +215,15 @@ void ApplyLocked(Option option) {
                                                             std::memory_order_relaxed);
     switch (option) {
     case Option::ScreenLayout:
-        Settings::values.layout_option = layouts[static_cast<std::size_t>(value)];
-        EmuWindowVita::SetOverlay(value == static_cast<int>(Layout::Overlay)        ? 3
-                                  : value == static_cast<int>(Layout::LargeOverlay) ? 5
-                                                                                    : 0);
+        if (const auto custom = CustomLayoutIndex(value)) {
+            // Its transformations as the file has them now (a value past the last is clamped
+            // before it gets here).
+            Settings::values.layout_option = Settings::LayoutOption::CustomLayout;
+            EmuWindowVita::SetLayout(*ScreenLayouts::Get(*custom));
+        } else {
+            Settings::values.layout_option = layouts[static_cast<std::size_t>(value)];
+            EmuWindowVita::SetLayout(static_cast<Layout>(value));
+        }
         break;
     case Option::SwapScreens:
         Settings::values.swap_screen = value != 0;
@@ -312,6 +326,11 @@ void ApplyAllLocked() {
 /// A file's value for the option: a word of its list, or a number in its range.
 std::optional<int> ParseValue(Option option, const std::string& text) {
     const Definition& d = Of(option);
+    // A custom screen layout by its name.
+    if (option == Option::ScreenLayout && text.starts_with(CustomLayoutWord)) {
+        const auto index = ScreenLayouts::Find(text.substr(std::strlen(CustomLayoutWord)));
+        return index ? std::optional<int>{CustomLayoutValue(*index)} : std::nullopt;
+    }
     if (!d.words.empty()) {
         for (std::size_t i = 0; i < d.words.size(); i++) {
             if (text == d.words[i]) {
@@ -330,6 +349,9 @@ std::optional<int> ParseValue(Option option, const std::string& text) {
 
 std::string FormatValue(Option option, int value) {
     const Definition& d = Of(option);
+    if (const auto custom = CustomLayoutIndex(value); custom && option == Option::ScreenLayout) {
+        return CustomLayoutWord + ScreenLayouts::Get(*custom)->name;
+    }
     if (!d.words.empty()) {
         return d.words[static_cast<std::size_t>(value)];
     }
@@ -399,7 +421,7 @@ int Minimum(Option option) {
 }
 
 int Maximum(Option option) {
-    return Of(option).maximum;
+    return MaximumOf(option);
 }
 
 int Default(Option option) {
@@ -408,6 +430,8 @@ int Default(Option option) {
 
 void Load() {
     std::scoped_lock lock{mutex};
+    // The custom layouts first: the file names those it chooses.
+    ScreenLayouts::Load();
     for (std::size_t i = 0; i < Count; i++) {
         const Definition& d = definitions[i];
         ASSERT_MSG(d.words.empty() || static_cast<int>(d.words.size()) == d.maximum + 1,
@@ -492,8 +516,9 @@ void Load() {
     ApplyAllLocked();
 }
 
-void Save() {
-    std::scoped_lock lock{mutex};
+namespace {
+
+void SaveLocked() {
     if (!dirty) {
         return;
     }
@@ -530,6 +555,45 @@ void Save() {
     std::fclose(f);
     dirty = false;
     LOG_INFO(Frontend, "Settings written to {}", SettingsPath);
+}
+
+} // namespace
+
+void Save() {
+    std::scoped_lock lock{mutex};
+    SaveLocked();
+}
+
+std::size_t SaveScreenLayout(std::optional<std::size_t> index, ScreenLayouts::ScreenLayout layout) {
+    std::scoped_lock lock{mutex};
+    const std::size_t at = ScreenLayouts::Put(index, std::move(layout));
+    // A new name is written where the settings choose it.
+    dirty = true;
+    ApplyLocked(Option::ScreenLayout);
+    SaveLocked();
+    return at;
+}
+
+void DeleteScreenLayout(std::size_t index) {
+    std::scoped_lock lock{mutex};
+    ScreenLayouts::Remove(index);
+    const int gone = CustomLayoutValue(index);
+    const auto follow = [gone](int value) {
+        return value == gone ? static_cast<int>(Layout::Default) : value > gone ? value - 1 : value;
+    };
+    constexpr std::size_t i = static_cast<std::size_t>(Option::ScreenLayout);
+    global_values[i] = follow(global_values[i]);
+    for (auto& [title, values] : title_values) {
+        if (values[i]) {
+            values[i] = follow(*values[i]);
+        }
+    }
+    if (pins[i]) {
+        pins[i] = follow(*pins[i]);
+    }
+    dirty = true;
+    ApplyLocked(Option::ScreenLayout);
+    SaveLocked();
 }
 
 std::string TitleKeyOf(const std::string& path) {
@@ -710,6 +774,9 @@ std::size_t WriteApplied(char* out, std::size_t size) {
         }
         if (value >= 0 && static_cast<std::size_t>(value) < d.words.size()) {
             add(" %s=%s%s", d.key, d.words[static_cast<std::size_t>(value)], mark);
+        } else if (const auto custom = CustomLayoutIndex(value);
+                   custom && static_cast<Option>(i) == Option::ScreenLayout) {
+            add(" %s=custom%u%s", d.key, static_cast<unsigned>(*custom), mark);
         } else {
             add(" %s=%d%s", d.key, value, mark);
         }

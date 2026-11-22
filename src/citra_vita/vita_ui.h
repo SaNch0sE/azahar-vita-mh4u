@@ -4,8 +4,11 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -15,6 +18,7 @@
 #include "citra_vita/config.h"
 #include "citra_vita/multiplayer.h"
 #include "citra_vita/rom_check.h"
+#include "citra_vita/screen_layout.h"
 #include "common/common_types.h"
 #include "common/math_util.h"
 #include "common/named_thread.h"
@@ -173,6 +177,7 @@ private:
         Savestates,
         Multiplayer,
         InstallPicker,
+        LayoutEditor,
     };
 
     /// The settings screen's groups, its tabs. Patches, Cheats, Installed and File hold no rows: a
@@ -421,12 +426,64 @@ private:
     int focused_rom_folder = -1;
     int armed_rom_folder = -1;
     void DrawFileRow();
+    /// The Display tab's last row: the layout editor, opened on the screen layout the tab shows.
+    /// Its info beside the list while it has the focus (focused_row LayoutEditorRow).
+    void DrawLayoutEditorRow();
+    void DrawLayoutEditorInfo();
+    static constexpr int LayoutEditorRow = -3;
+
+    /**
+     * The layout editor: the whole display is its preview, each screen where the layout being made
+     * places it (EmuWindowVita::PreviewLayout): a running game's own screens, or in the game list a
+     * card for each. The pad and touch move, size and turn the selected screen; a panel of tools
+     * holds the rest of its options, and the save panel the layout's name. Opened from the settings
+     * screen, which it goes back to; saving makes the layout the one those settings choose.
+     */
+    Action DrawLayoutEditor();
+    void OpenLayoutEditor();
+    void CloseLayoutEditor();
+    void EditLayout();
+    void DrawLayoutPreview();
+    void DrawLayoutBars();
+    void DrawLayoutTools();
+    void DrawLayoutSave();
+    /// Saves the layout under the save panel's name: over the custom layout opened, or as a new
+    /// one; the settings edited choose it, and the editor closes.
+    void SaveEditedLayout(bool as_new);
+    enum class EditorPanel { None, Tools, Save };
+    struct LayoutEditor {
+        ScreenLayouts::ScreenLayout layout;
+        std::optional<std::size_t> index;
+        std::string name;
+        ScreenLayouts::Screen selected{ScreenLayouts::Screen::Top};
+        EditorPanel panel{EditorPanel::None};
+        bool changed{};
+        bool dirty{};
+        /// The pad's buttons last frame, and how long each repeating one (the d-pad's four, L, R)
+        /// has been held.
+        u32 pad{};
+        std::array<float, 6> held_for{};
+        /// The fingers on the front panel last frame (two at most), whether that touch is the
+        /// preview's (it began on neither bar nor under a panel), and whether it drags a screen.
+        int touches{};
+        std::array<ScreenLayouts::Point, 2> touch{};
+        bool preview_touch{};
+        bool dragging{};
+        /// The header and the footer go while an edit runs on (a drag, a stick held) and come back
+        /// once it rests: how long it has run and rested.
+        float busy{};
+        float idle{};
+        bool bars_hidden{};
+    };
+    LayoutEditor editor;
     void DrawFileInfo();
 
     /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none; 0-3 the room's
-    /// address, port, nickname and password, KeyboardConsoleName the console name).
+    /// address, port, nickname and password, KeyboardConsoleName the console name,
+    /// KeyboardLayoutName the layout editor's name field).
     Multiplayer::Fields room_fields{};
     static constexpr int KeyboardConsoleName = 4;
+    static constexpr int KeyboardLayoutName = 5;
     int editing_field = -1;
     std::string edit_text;
     bool keyboard_shift{};

@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "citra_vita/screen_layout.h"
 #include "common/common_types.h"
 
 /**
@@ -96,19 +97,28 @@ enum class Option : u32 {
     Count,
 };
 
-/// The screen layouts' choices, in the menu's order (ScreenLayout's values).
-enum class Layout : int {
-    Default,
-    SingleScreen,
-    LargeScreen,
-    SideBySide,
-    Hybrid,
-    /// The single screen with the other one small in a corner (EmuWindowVita::SetOverlay).
-    Overlay,
-    /// The overlay with the other screen larger: 5/4 of its size, not 3/4.
-    LargeOverlay,
-    Count,
-};
+/// The built-in screen layouts, ScreenLayout's first values in the menu's order. The custom ones
+/// (ScreenLayouts) follow: custom layout N is Layout::Count + N.
+using Layout = ScreenLayouts::Builtin;
+
+/// ScreenLayout's value for custom layout `index`, and the custom layout a value is, if it is one.
+[[nodiscard]] constexpr int CustomLayoutValue(std::size_t index) {
+    return static_cast<int>(Layout::Count) + static_cast<int>(index);
+}
+[[nodiscard]] constexpr std::optional<std::size_t> CustomLayoutIndex(int value) {
+    return value >= static_cast<int>(Layout::Count)
+               ? std::optional<std::size_t>{static_cast<std::size_t>(value) -
+                                            static_cast<std::size_t>(Layout::Count)}
+               : std::nullopt;
+}
+
+/// Saves a custom screen layout (ScreenLayouts::Put): as custom layout `index`'s new self, or
+/// (nullopt) as a new one. Its index. The settings that choose it apply it again, and the settings
+/// file, which names the custom layouts it chooses, is written again.
+std::size_t SaveScreenLayout(std::optional<std::size_t> index, ScreenLayouts::ScreenLayout layout);
+/// Deletes custom layout `index`: the settings that chose it choose Default, and those that chose
+/// one after it follow it down.
+void DeleteScreenLayout(std::size_t index);
 
 /// FrameSkipLimit's value for no limit.
 constexpr int NoFrameSkipLimit = 5;
@@ -153,7 +163,8 @@ enum class RightStickMode : int {
 /// Whether a change takes effect under a running title. The region and the system language are
 /// read as a title loads.
 [[nodiscard]] bool Runtime(Option option);
-/// The option's range: 0 and 1 for a toggle, 0 and the last index for a choice.
+/// The option's range: 0 and 1 for a toggle, 0 and the last index for a choice (the screen layout's
+/// last custom layout's).
 [[nodiscard]] int Minimum(Option option);
 [[nodiscard]] int Maximum(Option option);
 [[nodiscard]] int Default(Option option);

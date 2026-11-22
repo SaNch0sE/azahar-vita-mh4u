@@ -8,6 +8,8 @@
 #include <atomic>
 #include <optional>
 
+#include "citra_vita/screen_layout.h"
+#include "citra_vita/sgxd_present.h"
 #include "common/common_types.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -167,20 +169,31 @@ public:
         loading.store(on, std::memory_order_relaxed);
     }
 
-    /// The shared layout for the display, with the Vita's own options over it: the widescreen
-    /// top screen filling the display in the single screen layout, and the overlay layout's
-    /// other screen at the bottom, translucent (SetOverlay).
+    /// Applies the screen layout (SetLayout's, with Swap screens and widescreen; the layout editor's
+    /// while it previews one; the game list's banner over it): each screen's corners on the
+    /// display, which every present draws it between, and the bottom screen's inverse, which takes
+    /// every touch onto the touch screen. Once, when the layout changes.
     void UpdateCurrentFramebufferLayout();
 
-    /// Widescreen: the top screen drawn wider than the 3DS's (RasterizerSgxd::SetWidescreen),
-    /// filling the display in the single screen layouts; elsewhere it shows at 5:3 as before.
-    static void SetWidescreen(bool on);
-    [[nodiscard]] static bool Widescreen();
-    /// The overlay layouts: the single screen layout with the other screen at quarters/4 of its
-    /// size in the display's bottom right corner (3, or 5 for the large overlay; 0 for none),
-    /// opacity percent opaque, and touchable there.
-    static void SetOverlay(u32 quarters);
-    [[nodiscard]] static bool Overlay();
+    /// The layout the settings choose (Config::Option::ScreenLayout): a built-in one, or a custom
+    /// one's transformations. Any thread; the next UpdateCurrentFramebufferLayout applies it.
+    static void SetLayout(ScreenLayouts::Builtin builtin);
+    static void SetLayout(const ScreenLayouts::ScreenLayout& custom);
+    /// The screens placed again at the next poll (PollEvents), for a layout's setting changed on
+    /// another thread than the presenting one.
+    void RequestLayoutUpdate() {
+        layout_update.store(true, std::memory_order_release);
+    }
+    /// The layout editor's: the screens placed as `layout` places them from now on, as it is (no
+    /// swap), until nullopt gives the chosen layout back. Applied at once. The presenting thread's.
+    void PreviewLayout(std::optional<ScreenLayouts::ScreenLayout> layout);
+
+    /// Widescreen, the top screen in the single screen layouts: Off at 5:3; Hack fills the
+    /// display, the scene drawn wider (RasterizerSgxd::SetWidescreen), as in any custom layout that
+    /// places it wider than 5:3; Stretch fills it with the 5:3 picture stretched.
+    enum class Wide : u8 { Off, Hack, Stretch };
+    static void SetWidescreen(Wide mode);
+    [[nodiscard]] static Wide Widescreen();
     static void SetOverlayOpacity(u32 percent);
     [[nodiscard]] static u32 OverlayOpacity();
     /// The widescreen picture's extra rows on each side of the top screen's 400: the display's
@@ -224,7 +237,11 @@ private:
     std::atomic<bool> loading{};
     std::atomic<bool> quit_requested{};
     std::atomic<bool> overlay_changed{};
+    std::atomic<bool> layout_update{};
+    /// A finger on the front panel (the polling thread's), and whether it came down on the bottom
+    /// screen, which it then holds wherever it slides: one that comes down off it touches nothing.
     bool touch_down{};
+    bool touch_on_screen{};
     /// The rear panel's middle in its own coordinates (its active area's), splitting its halves.
     int rear_middle{};
     /// The volume key held (the polling thread's), and when it steps again.
@@ -235,6 +252,18 @@ private:
     GuestScreen screens[2]{};
     bool have_screens{};
     std::optional<Common::Rectangle<u32>> menu_banner;
+    std::optional<ScreenLayouts::ScreenLayout> preview_layout;
+    /// The layout as UpdateCurrentFramebufferLayout applied it, for the presents and the touches
+    /// (the presenting thread's): each screen's corners on the display, by ScreenLayouts::Screen;
+    /// the order they are drawn in, the one in front last; the bottom screen's inverse.
+    struct PlacedScreen {
+        bool shown{};
+        float opacity{1.0f};
+        SgxdPresent::ScreenQuad quad{};
+    };
+    std::array<PlacedScreen, 2> placed{};
+    std::array<u32, 2> draw_order{0, 1};
+    ScreenLayouts::Affine touch_from_display{};
     /// PaceFrame: the display's vblank count the next guest frame waits for, and whether the
     /// cadence runs (a frame paced the last time). 16 bits, as sceDisplayGetVcount counts.
     u16 pace_target{};

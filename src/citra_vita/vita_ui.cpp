@@ -619,6 +619,7 @@ enum class Glyph {
     Triangle,
     LeftRight,
     Shoulders,
+    Start,
 };
 
 /// A pad button's glyph centred at `c`, `r` its radius: the face buttons in their own colours on
@@ -672,11 +673,22 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float r) {
         }
         break;
     }
+    case Glyph::Start: {
+        // START on a pill.
+        const ImVec2 size = ImGui::CalcTextSize("START");
+        const ImVec2 half(size.x * 0.5f + 0.5f * r, 0.7f * r);
+        dl->AddRectFilled(c - half, c + half, disc, 0.5f * r);
+        dl->AddText(ImVec2(c.x - size.x * 0.5f, c.y - size.y * 0.5f), mark, "START");
+        break;
+    }
     }
 }
 
-/// What a glyph's width is beside its radius (the shoulders' two pills are wider).
+/// What a glyph's width is beside its radius (the shoulders' two pills and START are wider).
 float GlyphWidth(Glyph glyph, float r) {
+    if (glyph == Glyph::Start) {
+        return ImGui::CalcTextSize("START").x + r;
+    }
     return glyph == Glyph::Shoulders ? 4.0f * r : 2.0f * r;
 }
 
@@ -1493,8 +1505,11 @@ void Ui::BuildRows() {
     using Config::Option;
     using Kind = Row::Kind;
     const auto add = [this](Row row) {
-        ASSERT_MSG(row.kind != Kind::Choice ||
-                       static_cast<int>(row.choices.size()) == Config::Maximum(row.option) + 1,
+        // The screen layout's custom layouts follow its built-in choices (ValueText).
+        const int choices = row.option == Option::ScreenLayout
+                                ? static_cast<int>(Config::Layout::Count)
+                                : Config::Maximum(row.option) + 1;
+        ASSERT_MSG(row.kind != Kind::Choice || static_cast<int>(row.choices.size()) == choices,
                    "settings: {}'s choices do not match its option", row.title);
         rows.push_back(std::move(row));
     };
@@ -1506,7 +1521,8 @@ void Ui::BuildRows() {
          Translatable("Screen layout"),
          Translatable("How the two screens are arranged. Overlay: one screen fills the display and "
                       "the other sits small and see-through in the bottom-right corner, where you "
-                      "can still touch it. Large overlay: the same with a bigger corner screen."),
+                      "can still touch it. Large overlay: the same with a bigger corner screen. "
+                      "Your own layouts, made in the Layout editor below, follow these."),
          {Translatable("Default"), Translatable("Single screen"), Translatable("Large screen"),
           Translatable("Side by side"), Translatable("Hybrid"), Translatable("Overlay"),
           Translatable("Large overlay")},
@@ -1935,7 +1951,10 @@ void Ui::StepRow(const Row& row, int delta) {
         SetRowValue(row, value != 0 ? 0 : 1);
         break;
     case Row::Kind::Choice: {
-        const int count = static_cast<int>(row.choices.size());
+        // The screen layout's custom layouts after its built-in choices.
+        const int count = row.option == Config::Option::ScreenLayout
+                              ? Config::Maximum(row.option) + 1
+                              : static_cast<int>(row.choices.size());
         SetRowValue(row, ((value + delta) % count + count) % count);
         break;
     }
@@ -1967,6 +1986,11 @@ std::string Ui::ValueText(const Row& row, int value) const {
     case Row::Kind::Toggle:
         return value != 0 ? Tr("On") : Tr("Off");
     case Row::Kind::Choice:
+        if (const auto custom = Config::CustomLayoutIndex(value);
+            custom && row.option == Config::Option::ScreenLayout) {
+            const auto layout = ScreenLayouts::Get(*custom);
+            return layout ? layout->name : std::string{};
+        }
         return Tr(row.choices[static_cast<std::size_t>(value)]);
     case Row::Kind::Slider:
         if (value == 0 && row.zero != nullptr) {
@@ -2005,6 +2029,11 @@ void Ui::DrawRow(const Row& row, std::size_t index) {
         value_width = 0.0f;
         for (const char* choice : row.choices) {
             value_width = std::max(value_width, ImGui::CalcTextSize(Tr(choice)).x);
+        }
+        if (row.option == Config::Option::ScreenLayout) {
+            for (const std::string& name : ScreenLayouts::Names()) {
+                value_width = std::max(value_width, ImGui::CalcTextSize(name.c_str()).x);
+            }
         }
         value_width += 2.0f * (Arrow + 14.0f);
     } else if (row.kind == Row::Kind::Slider) {
@@ -2529,6 +2558,10 @@ void Ui::DrawRowInfo() {
         DrawRomFolderInfo();
         return;
     }
+    if (focused_row == LayoutEditorRow) {
+        DrawLayoutEditorInfo();
+        return;
+    }
     if (focused_row < 0) {
         return;
     }
@@ -2698,6 +2731,9 @@ Ui::Action Ui::DrawSettings() {
         if (category == Category::System && !for_title) {
             DrawConsoleNameRow();
             DrawRomFolderRows();
+        }
+        if (category == Category::Display) {
+            DrawLayoutEditorRow();
         }
     }
     back |= BackPressed();
@@ -3896,11 +3932,14 @@ Ui::Action Ui::DrawMultiplayer() {
 void Ui::DrawKeyboard() {
     static constexpr const char* key_rows[] = {"1234567890", "qwertyuiop", "asdfghjkl.",
                                                "zxcvbnm-_:"};
-    static constexpr const char* titles[] = {Translatable("Address"), Translatable("Port"),
+    static constexpr const char* titles[] = {Translatable("Address"),  Translatable("Port"),
                                              Translatable("Nickname"), Translatable("Password"),
-                                             Translatable("Console name")};
-    const std::size_t limit =
-        editing_field == KeyboardConsoleName ? Config::MaxConsoleName : std::size_t{64};
+                                             Translatable("Console name"),
+                                             Translatable("Layout name")};
+    const std::size_t limit = editing_field == KeyboardConsoleName ? Config::MaxConsoleName
+                              : editing_field == KeyboardLayoutName
+                                  ? ScreenLayouts::MaxNameLength
+                                  : std::size_t{64};
     // Ten keys of 56 a row and their spacing.
     BeginCentered("##keyboard", 700.0f, 420.0f);
     ImGui::Text("%s", Tr(titles[editing_field]));
@@ -3962,6 +4001,9 @@ void Ui::DrawKeyboard() {
             break;
         case KeyboardConsoleName:
             Config::SetConsoleName(edit_text);
+            break;
+        case KeyboardLayoutName:
+            editor.name = edit_text;
             break;
         default:
             room_fields.password = edit_text;
@@ -4068,6 +4110,693 @@ Ui::Action Ui::DrawUsbPrompt() {
     return Action::LaunchGame;
 }
 
+namespace {
+
+/// The editor's limits on a screen: each side of its bounds at least this long, and at most twice
+/// the display's width.
+constexpr float MinScreenSide = 24.0f;
+constexpr float MaxScreenSide = 2.0f * ScreenWidth;
+
+ScreenLayouts::Screen OtherScreen(ScreenLayouts::Screen screen) {
+    return screen == ScreenLayouts::Screen::Top ? ScreenLayouts::Screen::Bottom
+                                                : ScreenLayouts::Screen::Top;
+}
+
+const char* ScreenName(ScreenLayouts::Screen screen) {
+    return screen == ScreenLayouts::Screen::Top ? Tr("Top screen") : Tr("Bottom screen");
+}
+
+/// A name for a new layout that no other has: Layout 1, Layout 2, ... (ASCII, as the keyboard
+/// types).
+std::string FreeLayoutName() {
+    for (int n = 1;; n++) {
+        std::string name = fmt::format("Layout {}", n);
+        if (!ScreenLayouts::Find(name)) {
+            return name;
+        }
+    }
+}
+
+std::string TrimName(const std::string& text) {
+    const std::size_t first = text.find_first_not_of(' ');
+    return first == std::string::npos
+               ? std::string{}
+               : text.substr(first, text.find_last_not_of(' ') - first + 1);
+}
+
+/// Whether the display point is on the screen where the transformation places it.
+bool OnScreen(const ScreenLayouts::Affine& transform, ScreenLayouts::Point p) {
+    const ScreenLayouts::Point q = transform.Inverse().Apply(p);
+    return q.x >= 0.0f && q.x < 1.0f && q.y >= 0.0f && q.y < 1.0f;
+}
+
+/// A held button's steps: its press, then one every 50 ms once it has been held 0.35 s.
+/// `held_for` is its time held, kept by the caller.
+bool Repeats(u32 held, u32 button, float& held_for, float dt) {
+    if ((held & button) == 0) {
+        held_for = 0.0f;
+        return false;
+    }
+    const float before = held_for;
+    held_for += dt;
+    if (before == 0.0f) {
+        return true;
+    }
+    constexpr float Delay = 0.35f, Every = 0.05f;
+    const auto steps = [](float t) {
+        return t < Delay ? -1 : static_cast<int>((t - Delay) / Every);
+    };
+    return steps(held_for) != steps(before);
+}
+
+/// A stick's axis byte as -1 to 1, 0 within its dead zone and full past 0.9 of its reach.
+float StickAxis(u8 raw) {
+    constexpr float DeadZone = 0.2f, Full = 0.9f;
+    const float v = (static_cast<float>(raw) - 128.0f) / 128.0f;
+    if (std::abs(v) < DeadZone) {
+        return 0.0f;
+    }
+    return std::copysign(std::min((std::abs(v) - DeadZone) / (Full - DeadZone), 1.0f), v);
+}
+
+/// The transformation's screen kept within the editor's limits: each side of its bounds between
+/// MinScreenSide and MaxScreenSide, its middle on the display.
+ScreenLayouts::Affine Limited(ScreenLayouts::Affine transform) {
+    using ScreenLayouts::Affine;
+    const std::array<float, 4> b = ScreenLayouts::Bounds(ScreenLayouts::Corners(transform));
+    const float w = b[2] - b[0], h = b[3] - b[1];
+    const float sx = std::clamp(w, MinScreenSide, MaxScreenSide) / w;
+    const float sy = std::clamp(h, MinScreenSide, MaxScreenSide) / h;
+    if (sx != 1.0f || sy != 1.0f) {
+        transform = ScreenLayouts::AboutCentre(transform, Affine::Scale(sx, sy));
+    }
+    const ScreenLayouts::Point c = transform.Apply({0.5f, 0.5f});
+    return ScreenLayouts::CentredAt(
+        transform, {std::clamp(c.x, 0.0f, ScreenWidth), std::clamp(c.y, 0.0f, ScreenHeight)});
+}
+
+ImVec2 ToImVec(ScreenLayouts::Point p) {
+    return ImVec2(p.x, p.y);
+}
+
+void DashedQuad(ImDrawList* dl, const ScreenLayouts::Quad& q, ImU32 colour, float thickness) {
+    constexpr float Dash = 9.0f, Gap = 7.0f;
+    // Round the outline: top-left, top-right, bottom-right, bottom-left.
+    const int order[5] = {0, 1, 3, 2, 0};
+    for (int i = 0; i < 4; i++) {
+        const ImVec2 a(q.x[order[i]], q.y[order[i]]), b(q.x[order[i + 1]], q.y[order[i + 1]]);
+        const ImVec2 d = b - a;
+        const float length = std::sqrt(d.x * d.x + d.y * d.y);
+        for (float at = 0.0f; at < length; at += Dash + Gap) {
+            const float end = std::min(at + Dash, length);
+            dl->AddLine(a + d * (at / length), a + d * (end / length), colour, thickness);
+        }
+    }
+}
+
+} // namespace
+
+void Ui::DrawLayoutEditorRow() {
+    constexpr float Pad = 18.0f;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const Card card = CardItem("##layout_editor", ImVec2(width, RowHeight));
+    if (ImGui::GetFocusID() == card.id) {
+        focused_row = LayoutEditorRow;
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float y = card.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
+        dl->AddText(ImVec2(card.bb.Min.x + Pad, y), Colour(palette->Text), Tr("Layout editor"));
+        // The layout it opens on: a custom one by its name, or a new one.
+        const int value = settings_title.empty()
+                              ? Config::Global(Config::Option::ScreenLayout)
+                              : Config::ForTitle(settings_title, Config::Option::ScreenLayout);
+        const auto custom = Config::CustomLayoutIndex(value);
+        const auto layout = custom ? ScreenLayouts::Get(*custom) : std::nullopt;
+        const std::string shown =
+            Fit(layout ? layout->name : std::string{Tr("New layout")}, width * 0.5f);
+        const float shown_width = ImGui::CalcTextSize(shown.c_str()).x;
+        dl->AddText(ImVec2(card.bb.Max.x - Pad - shown_width, y),
+                    Colour(layout ? palette->Text : palette->TextDim), shown.c_str());
+    }
+    if (card.pressed) {
+        OpenLayoutEditor();
+    }
+}
+
+void Ui::DrawLayoutEditorInfo() {
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", Tr("Layout editor"));
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", Tr("Place the two screens yourself: move, size and turn each one and "
+                                "see it on the display as you go, then save it under a name. It "
+                                "opens on the Screen layout above: a layout of your own is "
+                                "changed, a built-in one is the start of a new one. Your layouts "
+                                "follow the built-in ones in Screen layout."));
+    ImGui::Spacing();
+    if (!game_key.empty()) {
+        Note(palette->Accent, Tr("The game's own screens show in the editor."));
+    }
+}
+
+void Ui::OpenLayoutEditor() {
+    const auto value_of = [this](Config::Option option) {
+        return settings_title.empty() ? Config::Global(option)
+                                      : Config::ForTitle(settings_title, option);
+    };
+    const int value = value_of(Config::Option::ScreenLayout);
+    editor = {};
+    if (const auto custom = Config::CustomLayoutIndex(value)) {
+        std::optional<ScreenLayouts::ScreenLayout> layout = ScreenLayouts::Get(*custom);
+        ASSERT_MSG(layout, "layout editor: the settings choose custom layout {}, of {}", *custom,
+                   ScreenLayouts::Count());
+        editor.layout = std::move(*layout);
+        editor.index = custom;
+        editor.name = editor.layout.name;
+    } else {
+        // The built-in layout as these settings show it, without the swap: the editor places the
+        // top and the bottom screen, and Swap screens trades them as it does any layout's.
+        editor.layout = ScreenLayouts::MakeBuiltin(
+            static_cast<Config::Layout>(value), false, value_of(Config::Option::Widescreen) != 0,
+            static_cast<float>(value_of(Config::Option::OverlayOpacity)) / 100.0f);
+        editor.name = FreeLayoutName();
+    }
+    // What is held now, the cross that opened it, is not the editor's.
+    SceCtrlData pad{};
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    editor.pad = pad.buttons;
+    editor.touches = 2; // a finger already down is not the preview's
+    state = State::LayoutEditor;
+    overlay_focused = false;
+    window.PreviewLayout(editor.layout);
+    LOG_INFO(Frontend, "layout editor: open on {}", editor.index ? editor.name : "a new layout");
+}
+
+void Ui::CloseLayoutEditor() {
+    window.PreviewLayout(std::nullopt);
+    editor.panel = EditorPanel::None;
+    state = State::Settings;
+    overlay_focused = false;
+    focus_first_row = true;
+    LOG_INFO(Frontend, "layout editor: closed");
+}
+
+void Ui::EditLayout() {
+    using ScreenLayouts::Affine;
+    using ScreenLayouts::Point;
+    using ScreenLayouts::Screen;
+    const float dt = std::min(ImGui::GetIO().DeltaTime, 0.1f);
+    SceCtrlData pad{};
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    const u32 held = pad.buttons;
+    const u32 pressed = held & ~editor.pad;
+    editor.pad = held;
+    bool edited = false;
+
+    if (pressed & SCE_CTRL_CIRCLE) {
+        // Back to the settings, asked first where there is something to lose.
+        if (editor.changed) {
+            question = Question::DiscardLayout;
+        } else {
+            CloseLayoutEditor();
+        }
+        return;
+    }
+    if (pressed & (SCE_CTRL_START | SCE_CTRL_CROSS)) {
+        editor.panel = pressed & SCE_CTRL_START ? EditorPanel::Save : EditorPanel::Tools;
+        focus_first_row = true;
+        return;
+    }
+    if (pressed & SCE_CTRL_TRIANGLE) {
+        editor.selected = OtherScreen(editor.selected);
+    }
+    ScreenLayouts::Placement& selected = editor.layout[editor.selected];
+    Affine& m = selected.transform;
+    const auto change = [&](const Affine& next) {
+        m = next;
+        edited = true;
+    };
+    if (pressed & SCE_CTRL_SQUARE) {
+        change(ScreenLayouts::AboutCentre(m, Affine::Rotate(1)));
+    }
+    if (pressed & SCE_CTRL_SELECT) {
+        selected.shown = !selected.shown;
+        edited = true;
+    }
+    // The d-pad: a pixel a press, and on while held.
+    static constexpr struct {
+        u32 button;
+        float dx, dy;
+    } Moves[] = {{SCE_CTRL_UP, 0.0f, -1.0f},
+                 {SCE_CTRL_DOWN, 0.0f, 1.0f},
+                 {SCE_CTRL_LEFT, -1.0f, 0.0f},
+                 {SCE_CTRL_RIGHT, 1.0f, 0.0f}};
+    for (std::size_t i = 0; i < 4; i++) {
+        if (Repeats(held, Moves[i].button, editor.held_for[i], dt)) {
+            change(Affine::Translate(Moves[i].dx, Moves[i].dy) * m);
+        }
+    }
+    // L and R: smaller or larger in proportion, two pixels along its longer side a step.
+    for (std::size_t i = 0; i < 2; i++) {
+        if (Repeats(held, i == 0 ? SCE_CTRL_LTRIGGER : SCE_CTRL_RTRIGGER, editor.held_for[4 + i],
+                    dt)) {
+            const std::array<float, 4> b = ScreenLayouts::Bounds(ScreenLayouts::Corners(m));
+            const float longer = std::max(b[2] - b[0], b[3] - b[1]);
+            change(ScreenLayouts::AboutCentre(
+                m, Affine::Scale((longer + (i == 0 ? -2.0f : 2.0f)) / longer)));
+        }
+    }
+    // The left stick moves it, up to 480 pixels a second; the right one stretches it, right
+    // wider and up taller, up to its size again a second. Squared, for slow fine moves.
+    constexpr float Speed = 480.0f;
+    const float lx = StickAxis(pad.lx), ly = StickAxis(pad.ly);
+    if (lx != 0.0f || ly != 0.0f) {
+        change(Affine::Translate(lx * std::abs(lx) * Speed * dt, ly * std::abs(ly) * Speed * dt) *
+               m);
+    }
+    const float rx = StickAxis(pad.rx), ry = -StickAxis(pad.ry);
+    if (rx != 0.0f || ry != 0.0f) {
+        change(ScreenLayouts::AboutCentre(
+            m, Affine::Scale(1.0f + rx * std::abs(rx) * dt, 1.0f + ry * std::abs(ry) * dt)));
+    }
+
+    // Touch: a finger on a screen selects it and drags it, two pinch the selected one.
+    SceTouchData touch{};
+    const int fingers = sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0
+                            ? std::min(static_cast<int>(touch.reportNum), 2)
+                            : 0;
+    std::array<Point, 2> now{};
+    for (int i = 0; i < fingers; i++) {
+        // The panel's coordinates are twice the display's.
+        now[i] = {static_cast<float>(touch.report[i].x) * 0.5f,
+                  static_cast<float>(touch.report[i].y) * 0.5f};
+    }
+    if (fingers > 0 && editor.touches == 0) {
+        // A touch's start: on a bar, the bar's (its buttons); else the preview's, and the screen
+        // under it, the one in front first, is selected.
+        const bool on_bars = !editor.bars_hidden && (now[0].y < HeaderHeight ||
+                                                     now[0].y >= ScreenHeight - FooterHeight);
+        editor.preview_touch = !on_bars;
+        editor.dragging = false;
+        if (editor.preview_touch) {
+            for (const Screen s : {editor.layout.front, OtherScreen(editor.layout.front)}) {
+                if (OnScreen(editor.layout[s].transform, now[0])) {
+                    editor.selected = s;
+                    editor.dragging = true;
+                    break;
+                }
+            }
+        }
+    } else if (fingers > 0 && editor.preview_touch) {
+        Affine& t = editor.layout[editor.selected].transform;
+        const std::array<Point, 2>& was = editor.touch;
+        if (fingers == 2 && editor.touches == 2) {
+            // Scaled about the fingers' middle by how far apart they moved, and moved with it.
+            const auto middle = [](const std::array<Point, 2>& p) {
+                return Point{(p[0].x + p[1].x) * 0.5f, (p[0].y + p[1].y) * 0.5f};
+            };
+            const auto apart = [](const std::array<Point, 2>& p) {
+                return std::hypot(p[1].x - p[0].x, p[1].y - p[0].y);
+            };
+            const Point from = middle(was), to = middle(now);
+            if (const float before = apart(was); before > 8.0f) {
+                t = Affine::Translate(to.x, to.y) * Affine::Scale(apart(now) / before) *
+                    Affine::Translate(-from.x, -from.y) * t;
+                edited = true;
+            }
+        } else if (fingers == 1 && editor.touches == 1 && editor.dragging) {
+            t = Affine::Translate(now[0].x - was[0].x, now[0].y - was[0].y) * t;
+            edited = true;
+        }
+    }
+    editor.touches = fingers;
+    editor.touch = now;
+
+    if (edited) {
+        for (ScreenLayouts::Placement& p : editor.layout.screens) {
+            p.transform = Limited(p.transform);
+        }
+        editor.changed = editor.dirty = true;
+        editor.busy += dt;
+        editor.idle = 0.0f;
+        editor.bars_hidden |= editor.busy > 0.2f;
+    } else {
+        editor.busy = 0.0f;
+        editor.idle += dt;
+        editor.bars_hidden &= editor.idle < 0.5f;
+    }
+}
+
+void Ui::DrawLayoutPreview() {
+    using ScreenLayouts::Screen;
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(ScreenWidth, ScreenHeight));
+    ImGui::Begin("##layout_preview", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    // Under the bars and the panels, whichever was made first.
+    ImGui::BringWindowToDisplayBack(ImGui::GetCurrentWindow());
+    ImDrawList* const dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, ScreenHeight), false);
+    // A running game's screens are drawn under the interface where the layout places them; in the
+    // game list each is a card of its own colour.
+    const bool game = !game_key.empty();
+    for (const Screen s : {OtherScreen(editor.layout.front), editor.layout.front}) {
+        const ScreenLayouts::Placement& p = editor.layout[s];
+        const ScreenLayouts::Quad q = ScreenLayouts::Corners(p.transform);
+        const ImVec2 tl(q.x[0], q.y[0]), tr(q.x[1], q.y[1]), bl(q.x[2], q.y[2]),
+            br(q.x[3], q.y[3]);
+        const bool selected = s == editor.selected;
+        if (!game && p.shown) {
+            const ImVec4& tint = s == Screen::Top ? palette->Icon : palette->Own;
+            dl->AddQuadFilled(tl, tr, br, bl, Colour(palette->Panel));
+            dl->AddQuadFilled(tl, tr, br, bl, Colour(tint, 0.45f * p.opacity));
+        }
+        const ImU32 line = Colour(selected ? palette->Accent : palette->Text, selected ? 1.0f : 0.7f);
+        const float thickness = selected ? 3.0f : 1.5f;
+        if (p.shown) {
+            dl->AddQuad(tl, tr, br, bl, line, thickness);
+        } else {
+            DashedQuad(dl, q, line, thickness);
+        }
+        // Its top: an arrow inside the middle of the edge the picture's top is on.
+        const ImVec2 across = tr - tl, down = bl - tl;
+        const float across_length = std::sqrt(across.x * across.x + across.y * across.y);
+        const float down_length = std::sqrt(down.x * down.x + down.y * down.y);
+        if (across_length > 1.0f && down_length > 1.0f) {
+            const ImVec2 ex = across * (1.0f / across_length), ey = down * (1.0f / down_length);
+            const ImVec2 top = tl + across * 0.5f;
+            dl->AddTriangleFilled(top + ey * 6.0f, top + ey * 20.0f - ex * 9.0f,
+                                  top + ey * 20.0f + ex * 9.0f, line);
+        }
+        const std::string label = p.shown ? std::string{ScreenName(s)}
+                                          : TrFormat("{} (hidden)", ScreenName(s));
+        const ImVec2 size = ImGui::CalcTextSize(label.c_str());
+        const ImVec2 centre = ToImVec(p.transform.Apply({0.5f, 0.5f}));
+        const ImVec2 at = centre - size * 0.5f;
+        dl->AddRectFilled(at - ImVec2(10.0f, 4.0f), at + size + ImVec2(10.0f, 4.0f),
+                          Colour(palette->Panel, 0.85f), size.y * 0.5f + 4.0f);
+        dl->AddText(at, Colour(selected ? palette->Accent : palette->Text), label.c_str());
+    }
+    dl->PopClipRect();
+    ImGui::End();
+}
+
+void Ui::DrawLayoutBars() {
+    using ScreenLayouts::Affine;
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(ScreenWidth, ScreenHeight));
+    ImGui::Begin("##layout_bars", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImDrawList* const dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, ScreenHeight), false);
+    const ImU32 panel = Colour(palette->Panel, 0.9f / palette->Panel.w);
+    const float footer = ScreenHeight - FooterHeight;
+    dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, HeaderHeight), panel);
+    dl->AddRectFilled(ImVec2(0.0f, footer), ImVec2(ScreenWidth, ScreenHeight), panel);
+    DrawIcon(dl, Icon::Screens, ImVec2(Margin + 16.0f, HeaderHeight * 0.5f), 30.0f,
+             Colour(palette->Accent), panel);
+    const float title_x = Margin + 44.0f;
+    const std::string title = Fit(editor.name, 260.0f);
+    dl->AddText(ImGui::GetFont(), TitleSize, ImVec2(title_x, (HeaderHeight - TitleSize) * 0.5f),
+                Colour(palette->Text), title.c_str());
+    const ScreenLayouts::Placement& p = editor.layout[editor.selected];
+    const std::array<float, 4> b = ScreenLayouts::Bounds(ScreenLayouts::Corners(p.transform));
+    const std::string place =
+        TrFormat("{}: {}x{} at {}, {}, turned {} degrees, {}% opaque{}", ScreenName(editor.selected),
+                 std::lround(b[2] - b[0]), std::lround(b[3] - b[1]), std::lround(b[0]),
+                 std::lround(b[1]), ScreenLayouts::TurnDegrees(p.transform),
+                 std::lround(p.opacity * 100.0f), p.shown ? "" : Tr(", hidden"));
+    const char* const hint =
+        Tr("Move: d-pad, left stick or drag. Size: L, R or pinch. Stretch: right stick.");
+    const float text_x = title_x + 280.0f;
+    const float line = ImGui::GetFontSize();
+    dl->AddText(ImVec2(text_x, HeaderHeight * 0.5f - line - 2.0f), Colour(palette->Text),
+                Fit(place, ScreenWidth - Margin - text_x).c_str());
+    dl->AddText(ImVec2(text_x, HeaderHeight * 0.5f + 2.0f), Colour(palette->TextDim),
+                Fit(hint, ScreenWidth - Margin - text_x).c_str());
+    dl->PopClipRect();
+
+    // The pad's buttons, each a touch target for the same.
+    ImGui::SetCursorScreenPos(ImVec2(Margin, footer + (FooterHeight - FooterButtonHeight) * 0.5f));
+    if (FooterButton(Glyph::Circle, Tr("Back"))) {
+        if (editor.changed) {
+            question = Question::DiscardLayout;
+        } else {
+            CloseLayoutEditor();
+        }
+    }
+    if (FooterButton(Glyph::Cross, Tr("Tools"))) {
+        editor.panel = EditorPanel::Tools;
+        focus_first_row = true;
+    }
+    if (FooterButton(Glyph::Triangle, Tr("Other screen"))) {
+        editor.selected = OtherScreen(editor.selected);
+    }
+    if (FooterButton(Glyph::Square, Tr("Turn"))) {
+        Affine& t = editor.layout[editor.selected].transform;
+        t = ScreenLayouts::AboutCentre(t, Affine::Rotate(1));
+        editor.changed = editor.dirty = true;
+    }
+    FooterButton(Glyph::Shoulders, Tr("Size"));
+    if (FooterButton(Glyph::Start, Tr("Save"))) {
+        editor.panel = EditorPanel::Save;
+        focus_first_row = true;
+    }
+    ImGui::End();
+}
+
+void Ui::DrawLayoutTools() {
+    using ScreenLayouts::Affine;
+    constexpr float Pad = 18.0f;
+    constexpr float Width = 560.0f;
+    const bool deletable = editor.index.has_value();
+    const int rows = deletable ? 8 : 7;
+    // Kept focused, as the lists are, unless a touch holds an item.
+    if (!ImGui::GetIO().MouseDown[0] && ImGui::GetActiveID() == 0) {
+        ImGui::SetNextWindowFocus();
+    }
+    BeginCentered("##layout_tools", Width,
+                  32.0f + TitleSize + 14.0f + static_cast<float>(rows) * (RowHeight + 6.0f));
+    ScreenLayouts::Placement& p = editor.layout[editor.selected];
+    Affine& t = p.transform;
+    ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), TitleSize, ImGui::GetCursorScreenPos(),
+                                        Colour(palette->Text), ScreenName(editor.selected));
+    ImGui::Dummy(ImVec2(0.0f, TitleSize + 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 6.0f));
+    const float width = ImGui::GetContentRegionAvail().x;
+    bool edited = false;
+    const auto row = [&](const char* id, const char* label, const std::string& value) {
+        const Card card = CardItem(id, ImVec2(width, RowHeight));
+        if (focus_first_row) {
+            focus_first_row = false;
+            FocusLastItem();
+        }
+        if (card.visible) {
+            ImDrawList* const dl = ImGui::GetWindowDrawList();
+            const float y = card.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
+            dl->AddText(ImVec2(card.bb.Min.x + Pad, y), Colour(palette->Text), label);
+            const float value_width = ImGui::CalcTextSize(value.c_str()).x;
+            dl->AddText(ImVec2(card.bb.Max.x - Pad - value_width, y), Colour(palette->TextDim),
+                        value.c_str());
+        }
+        return card;
+    };
+    const Card shown = row("##shown", Tr("Show this screen"), p.shown ? Tr("On") : Tr("Off"));
+    if (shown.pressed) {
+        p.shown = !p.shown;
+        edited = true;
+    }
+    // The opacity's steps: the pad's left and right, or a tap on either half.
+    const Card opacity = row("##opacity", Tr("Opacity"),
+                             fmt::format("< {}% >", std::lround(p.opacity * 100.0f)));
+    int step = 0;
+    if (opacity.focused && ImGui::IsNavInputTest(ImGuiNavInput_DpadLeft, ImGuiInputReadMode_Repeat)) {
+        step = -1;
+    } else if (opacity.focused &&
+               ImGui::IsNavInputTest(ImGuiNavInput_DpadRight, ImGuiInputReadMode_Repeat)) {
+        step = 1;
+    } else if (opacity.pressed && !opacity.by_pad) {
+        step = ImGui::GetIO().MousePos.x < opacity.bb.GetCenter().x ? -1 : 1;
+    }
+    if (step != 0) {
+        p.opacity = std::clamp(std::round(p.opacity * 20.0f + static_cast<float>(step)) / 20.0f,
+                               0.1f, 1.0f);
+        edited = true;
+    }
+    const bool in_front = editor.layout.front == editor.selected;
+    if (row("##front", Tr("Bring to front"), in_front ? Tr("In front") : "").pressed) {
+        editor.layout.front = editor.selected;
+        edited = true;
+    }
+    const ScreenLayouts::Size display{ScreenWidth, ScreenHeight};
+    const ScreenLayouts::Point middle{ScreenWidth * 0.5f, ScreenHeight * 0.5f};
+    if (row("##fill", Tr("Fill the display"), "").pressed) {
+        t = ScreenLayouts::CentredAt(ScreenLayouts::Fitted(t, display, false), middle);
+        edited = true;
+    }
+    if (row("##stretch", Tr("Stretch over the display"), "").pressed) {
+        t = ScreenLayouts::CentredAt(ScreenLayouts::Fitted(t, display, true), middle);
+        edited = true;
+    }
+    if (row("##native", Tr("3DS size"), "").pressed) {
+        // The screen's own pixels, one a display pixel, turned as it is.
+        ScreenLayouts::Size native = editor.selected == ScreenLayouts::Screen::Top
+                                         ? ScreenLayouts::TopScreenSize
+                                         : ScreenLayouts::BottomScreenSize;
+        if (ScreenLayouts::TurnDegrees(t) % 180 != 0) {
+            std::swap(native.w, native.h);
+        }
+        t = ScreenLayouts::Fitted(t, native, true);
+        edited = true;
+    }
+    if (row("##centre", Tr("Centre on the display"), "").pressed) {
+        t = ScreenLayouts::CentredAt(t, middle);
+        edited = true;
+    }
+    if (deletable && row("##delete", Tr("Delete this layout"), "").pressed) {
+        question = Question::DeleteLayout;
+    }
+    ImGui::PopStyleVar();
+    const bool back = BackPressed();
+    overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGui::End();
+    if (edited) {
+        t = Limited(t);
+        editor.changed = editor.dirty = true;
+    }
+    if (back) {
+        editor.panel = EditorPanel::None;
+        overlay_focused = false;
+    }
+}
+
+void Ui::DrawLayoutSave() {
+    constexpr float Padding = 28.0f;
+    constexpr float Width = 640.0f;
+    const std::string name = TrimName(editor.name);
+    const std::optional<std::size_t> named = ScreenLayouts::Find(name);
+    // Save keeps the layout opened under the name, Save as new adds one: neither takes another
+    // layout's name.
+    const bool save_ok = !name.empty() && (!named || named == editor.index);
+    const bool new_ok = !name.empty() && !named;
+    const std::string uses = settings_title.empty()
+                                 ? std::string{Tr("All games then use it.")}
+                                 : TrFormat("{} then uses it.", settings_name);
+    const char* const problem = name.empty() ? Tr("Give the layout a name.")
+                                : !save_ok   ? Tr("Another layout has this name.")
+                                             : nullptr;
+    if (!ImGui::GetIO().MouseDown[0] && ImGui::GetActiveID() == 0) {
+        ImGui::SetNextWindowFocus();
+    }
+    BeginCentered("##layout_save", Width, 2.0f * Padding + TitleSize + 3.0f * RowHeight + 40.0f);
+    ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), TitleSize, ImGui::GetCursorScreenPos(),
+                                        Colour(palette->Text), Tr("Save layout"));
+    ImGui::Dummy(ImVec2(0.0f, TitleSize + 6.0f));
+    // The name's field: cross or a tap types it on the keyboard.
+    const float width = ImGui::GetContentRegionAvail().x;
+    const Card field = CardItem("##layout_name", ImVec2(width, RowHeight));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    if (field.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float y = field.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
+        dl->AddText(ImVec2(field.bb.Min.x + 18.0f, y), Colour(palette->Text), Tr("Name"));
+        const std::string value = Fit(editor.name, width - 160.0f);
+        const float value_width = ImGui::CalcTextSize(value.c_str()).x;
+        dl->AddText(ImVec2(field.bb.Max.x - 18.0f - value_width, y), Colour(palette->Text),
+                    value.c_str());
+    }
+    if (field.pressed) {
+        editing_field = KeyboardLayoutName;
+        edit_text = editor.name;
+        keyboard_shift = false;
+    }
+    Note(problem ? palette->Own : palette->TextDim, problem ? std::string{problem} : uses);
+    ImGui::Spacing();
+    const ImVec2 button(editor.index ? 180.0f : 200.0f, 48.0f);
+    const auto action = [&](const char* label, bool enabled) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, enabled ? 1.0f : 0.4f);
+        const bool pressed = ImGui::Button(label, button);
+        ImGui::PopStyleVar();
+        ImGui::SameLine(0.0f, 16.0f);
+        return pressed && enabled;
+    };
+    const bool save = action(Tr("Save"), save_ok);
+    const bool save_new = editor.index && action(Tr("Save as new"), new_ok);
+    const bool cancel = action(Tr("Cancel"), true) || BackPressed();
+    overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGui::End();
+    if (save || save_new) {
+        editor.name = name;
+        SaveEditedLayout(save_new);
+    } else if (cancel) {
+        editor.panel = EditorPanel::None;
+        overlay_focused = false;
+    }
+}
+
+void Ui::SaveEditedLayout(bool as_new) {
+    editor.layout.name = editor.name;
+    const std::size_t index =
+        Config::SaveScreenLayout(as_new ? std::nullopt : editor.index, editor.layout);
+    const int value = Config::CustomLayoutValue(index);
+    if (settings_title.empty()) {
+        Config::SetGlobal(Config::Option::ScreenLayout, value);
+    } else {
+        Config::SetTitleValue(settings_title, Config::Option::ScreenLayout, value);
+    }
+    Config::Save();
+    LOG_INFO(Frontend, "layout editor: {} saved as custom layout {}", editor.name, index);
+    CloseLayoutEditor();
+}
+
+Ui::Action Ui::DrawLayoutEditor() {
+    const bool covered =
+        editor.panel != EditorPanel::None || editing_field >= 0 || question != Question::None;
+    if (!covered) {
+        EditLayout();
+        if (state != State::LayoutEditor) {
+            return Action::None;
+        }
+    } else {
+        // Under a panel the pad and the touch are its: a press or a finger still down as it
+        // closes is not the editor's.
+        SceCtrlData pad{};
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        editor.pad = pad.buttons;
+        editor.touches = 2;
+        editor.preview_touch = false;
+        editor.bars_hidden = false;
+    }
+    DrawLayoutPreview();
+    if (editor.panel == EditorPanel::None && editing_field < 0) {
+        if (!editor.bars_hidden) {
+            DrawLayoutBars();
+        }
+    } else if (editing_field >= 0) {
+        DrawKeyboard();
+    } else if (editor.panel == EditorPanel::Tools) {
+        DrawLayoutTools();
+    } else {
+        DrawLayoutSave();
+    }
+    // Applied once a change, not each frame: the window places the screens and inverts the
+    // bottom one's for the touches when it is given the layout.
+    if (state == State::LayoutEditor && std::exchange(editor.dirty, false)) {
+        window.PreviewLayout(editor.layout);
+    }
+    return Action::None;
+}
+
 Ui::Action Ui::Update() {
     // In game: the stats overlay, which needs no ImGui frame (Draw).
     imgui_frame = !status_message.empty() || state != State::InGame;
@@ -4105,6 +4834,9 @@ Ui::Action Ui::Update() {
             break;
         case State::InstallPicker:
             action = DrawInstallPicker();
+            break;
+        case State::LayoutEditor:
+            action = DrawLayoutEditor();
             break;
         }
     }
