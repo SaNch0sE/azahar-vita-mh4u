@@ -2579,23 +2579,152 @@ void Ui::DrawEngineRow(std::size_t index) {
     ImGui::PopID();
 }
 
+void Ui::DrawEngineValueRow(std::size_t index) {
+    constexpr float Pad = 18.0f;
+    constexpr float Arrow = 10.0f;
+
+    ImGui::PushID(static_cast<int>(1000 + index));
+    const Loader::EngineValue& value = Loader::EngineValues()[index];
+    std::size_t choices = 0;
+    float value_width = 0.0f;
+    while (choices < value.labels.size() && value.labels[choices] != nullptr) {
+        value_width = std::max(value_width, ImGui::CalcTextSize(Tr(value.labels[choices])).x);
+        choices++;
+    }
+    value_width += 2.0f * (Arrow + 14.0f);
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float label_width = width - value_width - 3.0f * Pad;
+    const char* const name = Tr(value.name);
+    const ImVec2 label = ImGui::CalcTextSize(name, nullptr, false, label_width);
+    const Card card = CardItem("##engine", ImVec2(width, std::max(RowHeight, label.y + 28.0f)));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    const bool focused = ImGui::GetFocusID() == card.id;
+    if (focused) {
+        focused_engine = static_cast<int>(Loader::EngineSettingCount + index);
+        focused_patch = -1;
+    }
+    const ImRect value_bb(card.bb.Max.x - Pad - value_width, card.bb.Min.y, card.bb.Max.x - Pad,
+                          card.bb.Max.y);
+    int delta = 0;
+    if (focused && ImGui::IsNavInputTest(ImGuiNavInput_DpadLeft, ImGuiInputReadMode_Repeat)) {
+        delta = -1;
+    } else if (focused &&
+               ImGui::IsNavInputTest(ImGuiNavInput_DpadRight, ImGuiInputReadMode_Repeat)) {
+        delta = 1;
+    } else if (card.pressed) {
+        const float x = ImGui::GetIO().MousePos.x;
+        delta = !card.by_pad && x >= value_bb.Min.x && x < value_bb.GetCenter().x ? -1 : 1;
+    }
+    const std::size_t choice = settings_engine.value[index];
+    if (delta != 0) {
+        const std::size_t next =
+            delta > 0 ? (choice + 1) % choices : (choice + choices - 1) % choices;
+        Loader::SetEngineValue(settings_program_id, index, static_cast<u8>(next));
+        settings_engine = Loader::EngineChoicesOf(settings_program_id);
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float mid = card.bb.GetCenter().y;
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text), name,
+                    nullptr, label_width);
+        const ImU32 arrows = Colour(focused ? palette->Accent : palette->TextDim);
+        dl->AddTriangleFilled(ImVec2(value_bb.Min.x, mid),
+                              ImVec2(value_bb.Min.x + Arrow, mid - Arrow),
+                              ImVec2(value_bb.Min.x + Arrow, mid + Arrow), arrows);
+        dl->AddTriangleFilled(ImVec2(value_bb.Max.x, mid),
+                              ImVec2(value_bb.Max.x - Arrow, mid - Arrow),
+                              ImVec2(value_bb.Max.x - Arrow, mid + Arrow), arrows);
+        const char* const text = Tr(value.labels[settings_engine.value[index]]);
+        const ImVec2 size = ImGui::CalcTextSize(text);
+        dl->AddText(ImVec2(value_bb.GetCenter().x - size.x * 0.5f, mid - size.y * 0.5f),
+                    Colour(palette->Text), text);
+    }
+    ImGui::PopID();
+}
+
+void Ui::DrawEngineFilterRow(std::size_t index) {
+    constexpr float Pad = 18.0f;
+
+    ImGui::PushID(static_cast<int>(2000 + index));
+    const Loader::EngineFilter& filter = Loader::EngineFilters()[index];
+    const bool on = ((settings_engine.filters_off >> index) & 1) == 0;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float label_width = width - 56.0f - 3.0f * Pad;
+    const char* const name = Tr(filter.name);
+    const ImVec2 label = ImGui::CalcTextSize(name, nullptr, false, label_width);
+    const Card card = CardItem("##engine", ImVec2(width, std::max(RowHeight, label.y + 28.0f)));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    const bool focused = ImGui::GetFocusID() == card.id;
+    if (focused) {
+        focused_engine =
+            static_cast<int>(Loader::EngineSettingCount + Loader::EngineValueCount + index);
+        focused_patch = -1;
+    }
+    if (card.pressed ||
+        (focused && (ImGui::IsNavInputTest(ImGuiNavInput_DpadLeft, ImGuiInputReadMode_Pressed) ||
+                     ImGui::IsNavInputTest(ImGuiNavInput_DpadRight, ImGuiInputReadMode_Pressed)))) {
+        Loader::SetEngineFilterOff(settings_program_id, index, on);
+        settings_engine = Loader::EngineChoicesOf(settings_program_id);
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float mid = card.bb.GetCenter().y;
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text), name,
+                    nullptr, label_width);
+        DrawSwitch(dl, card.bb.Max.x - Pad, mid, ((settings_engine.filters_off >> index) & 1) == 0,
+                   1.0f);
+    }
+    ImGui::PopID();
+}
+
 void Ui::DrawEngineInfo() {
     const std::size_t index = static_cast<std::size_t>(focused_engine);
-    const Loader::EngineSetting& setting = Loader::EngineSettings()[index];
+    const bool bit = index < Loader::EngineSettingCount;
+    const bool value = !bit && index < Loader::EngineSettingCount + Loader::EngineValueCount;
+    const char* name;
+    const char* description;
+    if (bit) {
+        name = Loader::EngineSettings()[index].name;
+        description = Loader::EngineSettings()[index].description;
+    } else if (value) {
+        const Loader::EngineValue& v = Loader::EngineValues()[index - Loader::EngineSettingCount];
+        name = v.name;
+        description = v.description;
+    } else {
+        const Loader::EngineFilter& f =
+            Loader::EngineFilters()[index - Loader::EngineSettingCount - Loader::EngineValueCount];
+        name = f.name;
+        description = f.description;
+    }
 
     ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
-    ImGui::TextWrapped("%s", Tr(setting.name));
+    ImGui::TextWrapped("%s", Tr(name));
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Spacing();
-    ImGui::TextWrapped("%s", Tr(setting.description));
+    ImGui::TextWrapped("%s", Tr(description));
     ImGui::Spacing();
 
-    const bool own = ((settings_engine.defaults >> settings_engine.bits[index]) & 1) != 0;
-    Note(palette->TextDim, own ? Tr("The game's own: on.") : Tr("The game's own: off."));
-    if (setting.azahar == Loader::EngineDefault::Off) {
-        Note(palette->TextDim, Tr("Azahar turns it off unless you turn it on."));
-    } else if (setting.azahar == Loader::EngineDefault::On) {
-        Note(palette->TextDim, Tr("Azahar turns it on unless you turn it off."));
+    if (bit) {
+        const Loader::EngineSetting& setting = Loader::EngineSettings()[index];
+        const bool own = ((settings_engine.defaults >> settings_engine.bits[index]) & 1) != 0;
+        Note(palette->TextDim, own ? Tr("The game's own: on.") : Tr("The game's own: off."));
+        if (setting.azahar == Loader::EngineDefault::Off) {
+            Note(palette->TextDim, Tr("Azahar turns it off unless you turn it on."));
+        } else if (setting.azahar == Loader::EngineDefault::On) {
+            Note(palette->TextDim, Tr("Azahar turns it on unless you turn it off."));
+        }
+    } else if (value) {
+        Note(palette->TextDim, Tr("Game default: the game sets it itself."));
+    } else {
+        Note(palette->TextDim, Tr("Off, the game skips drawing this effect, which is faster."));
     }
     const bool running = !settings_title.empty() && settings_title == game_key;
     Note(running ? palette->Accent : palette->TextDim,
@@ -3361,6 +3490,16 @@ Ui::Action Ui::DrawSettings() {
         for (std::size_t i = 0; settings_engine.found && i < Loader::EngineSettings().size(); i++) {
             if (settings_engine.bits[i] >= 0) {
                 DrawEngineRow(i);
+            }
+        }
+        for (std::size_t i = 0; settings_engine.found && i < Loader::EngineValues().size(); i++) {
+            if ((settings_engine.values >> i) & 1) {
+                DrawEngineValueRow(i);
+            }
+        }
+        for (std::size_t i = 0; settings_engine.found && i < Loader::EngineFilters().size(); i++) {
+            if ((settings_engine.filters >> i) & 1) {
+                DrawEngineFilterRow(i);
             }
         }
     } else if (category == Category::Cheats) {

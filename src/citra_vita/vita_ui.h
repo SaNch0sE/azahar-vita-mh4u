@@ -366,6 +366,8 @@ private:
     /// switch, which cross, a touch or the pad's left and right flips; kept at once, applied at the
     /// title's next start.
     void DrawEngineRow(std::size_t index);
+    void DrawEngineValueRow(std::size_t index);
+    void DrawEngineFilterRow(std::size_t index);
     void DrawEngineInfo();
     /// The Patches tab's first opening for a title never started: its code searched for engine
     /// settings on a worker (AppLoader::ScanEngine), under a panel, once.
@@ -429,7 +431,8 @@ private:
     std::vector<bool> settings_patches_in;
     int focused_patch = -1;
     /// The title's engine settings (found: its code has the render config, known once it ran), and
-    /// the selected one (-1: none, or a patch).
+    /// the selected one (-1: none, or a patch): a bit setting's index, then the value settings',
+    /// then the filters'.
     Loader::EngineChoices settings_engine;
     int focused_engine = -1;
     /// What the description panel shows (the tab and each list's selection): a change scrolls it

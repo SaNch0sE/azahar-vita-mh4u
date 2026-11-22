@@ -293,13 +293,8 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
                    config.constructors == 0) {
             NoteEngineAbsent(program_id);
         } else {
-            NoteEngineFound(program_id, config.defaults.empty() ? 0 : config.defaults.front().value,
-                            config.bits);
-            if (!config.defaults.empty()) {
-                const EngineGuardBits bits = GuardBitsOf(EngineChoicesOf(program_id));
-                SetEngineGuardTarget(
-                    {config.global, config.defaults.front().value, bits.on, bits.off});
-            }
+            NoteEngineFound(program_id, config);
+            SetEngineGuardTarget(EngineGuardTargetOf(config, EngineChoicesOf(program_id)));
         }
         const auto& code = product_info.product_code;
         const auto code_end = std::find(code.begin(), code.end(), u8{0});
@@ -454,8 +449,7 @@ void AppLoader_NCCH::ScanEngine() {
     if (config.constructors == 0) {
         NoteEngineAbsent(program_id);
     } else {
-        NoteEngineFound(program_id, config.defaults.empty() ? 0 : config.defaults.front().value,
-                        config.bits);
+        NoteEngineFound(program_id, config);
     }
 }
 

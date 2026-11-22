@@ -318,13 +318,14 @@ private:
     void PatchUpcallThumb(u32 pc);
     /// A BKPT whose condition failed becomes a conditional BL to an unconditional trap.
     void PatchBkpt(u32 pc, u32 insn);
-    /// The engine guard (Loader::EngineGuardTarget): the MT Framework render config word checked
-    /// a frame at a time, put back to the player's bits, its page held against stores while
-    /// something changes it, and each store that does made a trap that stores with the bits set.
-    /// Host 0, between slices.
+    /// The engine guard (Loader::EngineGuardTarget): the MT Framework render config words and the
+    /// value fields checked a frame at a time and put back to the player's choices, each one's
+    /// page held against stores while something changes it, each store that does made a trap that
+    /// stores the kept word; and the filters left out made to return at once. Host 0, between
+    /// slices.
     void GuardTick();
-    /// A store's abort on the guarded page: made past the hold, the word put back; false when the
-    /// page is not the guard's.
+    /// A store's abort on a guarded page: made past the hold, the page's words put back; false
+    /// when the page is not the guard's.
     bool GuardStore(u32 va, bool write, u32 pc);
     /// A guard trap's PABT: its store run with the bits set; false when the PC is no trap.
     bool GuardTrap();

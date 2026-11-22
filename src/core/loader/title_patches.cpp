@@ -407,10 +407,11 @@ private:
         const u32* data;
     };
 
-    /// The window from word `i` on (a scan's next words; a jump back starts it a little before).
+    /// The window from word `i` on (a scan's next words), from 4 KiB before it: a literal an
+    /// instruction loads from behind it (ldr rd, [pc, #-imm]) is inside too.
     void Fill(u32 i) {
         DEBUG_ASSERT_MSG(i < words, "code reader: word {} of {}", i, words);
-        window_first = i >= 64 ? i - 64 : 0;
+        window_first = i >= 1026 ? i - 1026 : 0;
         window_words = std::min(WindowWords, words - window_first);
         u32 done = 0;
         auto piece = std::upper_bound(pieces.begin(), pieces.end(), window_first,
@@ -665,61 +666,104 @@ constexpr std::array<EngineSetting, EngineSettingCount> engine_settings{{
     {{"mFSAA_2D"},
      10,
      EngineDefault::Off,
-     Translatable("2D anti-aliasing"),
-     Translatable("The game draws its 3D scene twice a frame, half a pixel apart, and blends the "
-                  "two: smoother edges for far less speed (FSAA_2D).")},
+     Translatable("Anti-aliasing"),
+     Translatable("Draws the 3D scene twice a frame and blends the two for smoother edges. It "
+                  "costs a lot of speed.")},
     {{"mULCDEnableEdit", "mULCDEnable"},
      6,
      EngineDefault::Off,
      Translatable("Right eye render"),
-     Translatable("The scene drawn a second time for the right eye, which the 3D slider shows. "
-                  "Off, the scene is drawn once (mULCDEnable).")},
+     Translatable("Draws the scene a second time for the right eye of the 3D effect. Off, the "
+                  "scene is drawn once, which is faster.")},
     {{"FSAA2X"},
      -1,
      EngineDefault::Off,
-     Translatable("2x anti-aliasing"),
-     Translatable("The top screen drawn at twice its pixels and scaled down to the screen: "
-                  "smoother edges for more drawing (FSAA2X).")},
+     Translatable("Top screen 2x anti-aliasing"),
+     Translatable("Draws the top screen at twice its resolution and scales it down for smoother "
+                  "edges. Slower.")},
     {{"FSAA4X"},
      -1,
      EngineDefault::Off,
-     Translatable("4x anti-aliasing"),
-     Translatable("The top screen drawn at four times its pixels and scaled down to the screen: "
-                  "smoother edges for more drawing (FSAA4X).")},
+     Translatable("Top screen 4x anti-aliasing"),
+     Translatable("Draws the top screen at four times its resolution and scales it down for "
+                  "smoother edges. Much slower.")},
     {{"NoAADisplay1"},
      -1,
      EngineDefault::On,
-     Translatable("No bottom screen anti-aliasing"),
-     Translatable("Leaves out the bottom screen's anti-aliasing (NoAADisplay1).")},
+     Translatable("Skip bottom screen anti-aliasing"),
+     Translatable("Leaves out the bottom screen's anti-aliasing, which is faster.")},
     {{"FSAA2XDisplay1"},
      -1,
      EngineDefault::Off,
      Translatable("Bottom screen 2x anti-aliasing"),
-     Translatable("The bottom screen drawn at twice its pixels and scaled down to the screen "
-                  "(FSAA2XDisplay1).")},
+     Translatable("Draws the bottom screen at twice its resolution and scales it down for "
+                  "smoother edges. Slower.")},
     {{"FSAA4XDisplay1"},
      -1,
      EngineDefault::Off,
      Translatable("Bottom screen 4x anti-aliasing"),
-     Translatable("The bottom screen drawn at four times its pixels and scaled down to the screen "
-                  "(FSAA4XDisplay1).")},
+     Translatable("Draws the bottom screen at four times its resolution and scales it down for "
+                  "smoother edges. Much slower.")},
     {{"mVSyncEdit", "mVsyncEdit", "mVSync"},
      0,
      EngineDefault::Game,
      Translatable("Vertical sync"),
-     Translatable("The engine waits for the screen's refresh before it shows a new frame "
-                  "(mVSync).")},
+     Translatable("The game waits for the screen to refresh before it shows a new frame.")},
     {{"mTripleBufferRenderWaitEdit", "mTripleBufferRenderWait"},
      2,
      EngineDefault::Game,
      Translatable("Triple buffer wait"),
-     Translatable("The engine's wait for a frame when it draws with three frame buffers "
-                  "(mTripleBufferRenderWait).")},
+     Translatable("The game waits for a frame to finish when it draws with three frame buffers.")},
     {{"mRenderSkipEdit", "mRenderSkip"},
      -1,
      EngineDefault::Game,
-     Translatable("Render skip"),
-     Translatable("The engine leaves frames undrawn when it falls behind (mRenderSkip).")},
+     Translatable("Skip frames when slow"),
+     Translatable("The game leaves frames undrawn when it falls behind, to keep up its speed.")},
+}};
+
+constexpr std::array<EngineValue, EngineValueCount> engine_values{{
+    {"mMaxFps",
+     12,
+     {0, 0x41F00000, 0x42700000},
+     {Translatable("Game default"), "30", "60"},
+     Translatable("Frame rate limit"),
+     Translatable("The most frames a second the game runs. At 60, a game made for 30 runs at 60 "
+                  "when the emulator keeps up, and slower when it can't.")},
+    {"mGlobalSpeed",
+     12,
+     {0, 0x3F000000, 0x3FC00000, 0x40000000},
+     {Translatable("Game default"), "0.5x", "1.5x", "2x"},
+     Translatable("Game speed"),
+     Translatable("How fast the game's time runs: 1.5x and 2x make everything move faster, 0.5x "
+                  "slower.")},
+    {"mDisplaySkip",
+     6,
+     {0, 1, 2, 3},
+     {Translatable("Game default"), Translatable("1 in 2"), Translatable("1 in 3"),
+      Translatable("1 in 4")},
+     Translatable("Show fewer frames"),
+     Translatable("The game shows only one of every two, three or four frames it makes, which can "
+                  "let it run faster.")},
+}};
+
+constexpr std::array<EngineFilter, EngineFilterCount> engine_filters{{
+    {"uBloomFilter", Translatable("Bloom"),
+     Translatable("The glow around bright lights and surfaces.")},
+    {"uDOFFilter", Translatable("Depth of field"),
+     Translatable("The blur on what is far from where the camera focuses.")},
+    {"uBokehFilter", Translatable("Bokeh"),
+     Translatable("The shapes of out-of-focus lights in the depth of field blur.")},
+    {"uColorCorrectFilter", Translatable("Colour correction"),
+     Translatable("The game's colour grading: its tones, brightness and contrast.")},
+    {"uRadialBlurFilter", Translatable("Radial blur"),
+     Translatable("The blur streaking out from a point, for impacts and roars.")},
+    {"uMotionBlurFilter", Translatable("Motion blur"),
+     Translatable("The blur of the scene when the camera moves fast.")},
+    {"uOutlineFilter", Translatable("Outlines"),
+     Translatable("The outlines drawn around characters and objects.")},
+    {"uHazeFilter", Translatable("Heat haze"), Translatable("The shimmer over heat and fire.")},
+    {"uTVNoiseFilter", Translatable("Screen noise"),
+     Translatable("The noise and lines laid over the screen in some scenes.")},
 }};
 
 /// Whether the code holds `name` at word `i`, ended by a NUL: where the compiler puts the engine's
@@ -805,7 +849,7 @@ std::optional<AccessorBit> DecodeAccessor(CodeReader& code, VAddr a) {
 /// words its registers hold from literals and tables, to the next call of the function that
 /// inserts a property (the one it calls most); the words that step loads, read as accessors. A
 /// setter's bit, else a getter's; nothing where they disagree.
-std::optional<u32> RegisteredBit(Image& image, u32 ref) {
+std::optional<u32> RegisteredBit(Image& image, u32 ref, u32& function) {
     CodeReader& code = image.code;
     constexpr u32 FunctionWords = 0x2000;
     constexpr u32 StepWords = 64;
@@ -816,6 +860,7 @@ std::optional<u32> RegisteredBit(Image& image, u32 ref) {
     if ((code[f] & 0xFFFF4000) != 0xE92D4000) {
         return std::nullopt;
     }
+    function = f;
     const u32 last = std::min(code.Words(), ref + StepWords);
     std::vector<std::pair<VAddr, u32>> called;
     for (u32 i = f; i < last; i++) {
@@ -973,20 +1018,740 @@ std::optional<u32> RegisteredBit(Image& image, u32 ref) {
 }
 
 /// The bit of the property named at word `name`: the first of its registrations, the `add rd, pc,
-/// #imm` pointing at it within 64 KiB before it, that gives one.
-std::optional<u32> NamedBit(Image& image, u32 name) {
+/// #imm` pointing at it within 64 KiB before it, that gives one; `function` its registering
+/// function's first word.
+std::optional<u32> NamedBit(Image& image, u32 name, u32& function) {
     CodeReader& code = image.code;
     constexpr u32 ReachWords = 0x4000;
     const VAddr at = code.Base() + name * 4;
     for (u32 i = name > ReachWords ? name - ReachWords : 0; i < name; i++) {
         const u32 x = code[i];
         if ((x & 0xFFFF0000) == 0xE28F0000 && code.Base() + i * 4 + 8 + RotImm(x & 0xfff) == at) {
-            if (const std::optional<u32> bit = RegisteredBit(image, i)) {
+            if (const std::optional<u32> bit = RegisteredBit(image, i, function)) {
                 return bit;
             }
         }
     }
     return std::nullopt;
+}
+
+/// A register's or a word's value in a simulation: a number, or an address relative to the stack
+/// pointer at the function's entry or to `this`.
+struct Sym {
+    enum Kind : u8 { None, Const, Sp, This } kind = None;
+    u32 v = 0;
+    bool operator==(const Sym&) const = default;
+};
+
+/// Whether the ARM instruction writes its rd: a data-processing one other than a test, or a load.
+bool WritesRd(u32 x) {
+    return ((x & 0x0C000000) == 0 && (x & 0x01900000) != 0x01000000) ||
+           (x & 0x0C100000) == 0x04100000;
+}
+
+/// A property registration run forward from its function's entry (r0 `this`), over its registers
+/// and the words it stores at stack and `this` offsets, into the functions it calls (one level:
+/// the typed helpers that fill a property's record), to the call whose r1 is the record naming
+/// the property: +0 its name, +4 its type, +12 its field's address.
+class FieldSim {
+public:
+    explicit FieldSim(Image& image_) : image{image_}, code{image_.code} {}
+
+    struct Record {
+        u32 type;
+        Sym field;
+    };
+
+    /// The record of the property named at `name`, inserted by the function at word `from` before
+    /// the word `end`.
+    std::optional<Record> Run(u32 from, u32 end, VAddr name) {
+        Regs r{};
+        r[0] = {Sym::This, 0};
+        r[13] = {Sym::Sp, 0};
+        Mem m;
+        std::optional<Record> out;
+        Walk(from, end, r, m, 0, name, 4000, out);
+        return out;
+    }
+
+private:
+    using Regs = std::array<Sym, 16>;
+    using Key = std::pair<Sym::Kind, u32>;
+    using Mem = std::map<Key, Sym>;
+
+    static std::optional<Key> Addr(const Regs& r, u32 rn, u32 off) {
+        if (r[rn].kind != Sym::Sp && r[rn].kind != Sym::This) {
+            return std::nullopt;
+        }
+        return Key{r[rn].kind, r[rn].v + off};
+    }
+    static Sym Get(const Mem& m, std::optional<Key> a) {
+        if (!a) {
+            return {};
+        }
+        const auto it = m.find(*a);
+        return it != m.end() ? it->second : Sym{};
+    }
+    static void Put(Mem& m, std::optional<Key> a, const Sym& v) {
+        if (!a) {
+            return;
+        }
+        if (v.kind != Sym::None) {
+            m[*a] = v;
+        } else {
+            m.erase(*a);
+        }
+    }
+
+    void Walk(u32 i, std::optional<u32> end, Regs& r, Mem& m, u32 depth, VAddr stop, u32 limit,
+              std::optional<Record>& out) {
+        for (u32 steps = 0; (!end || i < *end) && steps < limit && i < code.Words(); steps++) {
+            const u32 x = code[i];
+            const u32 rd = (x >> 12) & 15;
+            const bool pop = (x & 0x0FFF8000) == 0x08BD8000;
+            if (!end && (x == 0xE12FFF1E || pop)) {
+                if (pop) {
+                    Step(0xE0000000 | (x & 0x0FFFFFFF), i, r, m);
+                }
+                return;
+            }
+            if ((x >> 28) != 0xE) {
+                // A conditional instruction: what it writes is no longer known.
+                if ((x & 0x0E000090) == 0x00000090 && (x & 0x60) != 0) {
+                    if ((x & 0x00100000) || ((x >> 5) & 3) == 2) {
+                        r[rd] = {};
+                        r[(rd + 1) & 15] = {};
+                    }
+                } else if (WritesRd(x)) {
+                    r[rd] = {};
+                }
+                i++;
+                continue;
+            }
+            if ((x & 0xFF000000) == 0xEA000000) {
+                // b: over a literal pool; one back ends the run.
+                const u32 t = i + 2 + static_cast<u32>(static_cast<s32>(x << 8) >> 8);
+                if (t <= i) {
+                    return;
+                }
+                i = t;
+                continue;
+            }
+            const VAddr to = BlTarget(x, code.Base() + i * 4);
+            if (to != 0 || (x & 0x0FFFFFF0) == 0x012FFF30) {
+                const Sym rec = r[1];
+                if (stop != 0 && rec.kind == Sym::Sp &&
+                    Get(m, Key{Sym::Sp, rec.v}) == Sym{Sym::Const, stop}) {
+                    const Sym type = Get(m, Key{Sym::Sp, rec.v + 4});
+                    out = Record{type.kind == Sym::Const ? (type.v & 0xffff) : 0u,
+                                 Get(m, Key{Sym::Sp, rec.v + 12})};
+                    return;
+                }
+                if (depth == 0 && rec.kind == Sym::Sp &&
+                    Get(m, Key{Sym::Sp, rec.v}).kind == Sym::Const) {
+                    // Another property's insert: its record is the next one's to fill.
+                    m.erase(m.lower_bound(Key{Sym::Sp, rec.v}),
+                            m.lower_bound(Key{Sym::Sp, rec.v + 64}));
+                }
+                Sym r0{};
+                if (to != 0 && depth < 1 && to >= code.Base() &&
+                    (to - code.Base()) / 4 < code.Words()) {
+                    Regs h{};
+                    for (const u32 k : {0u, 1u, 2u, 3u, 13u}) {
+                        h[k] = r[k];
+                    }
+                    Walk((to - code.Base()) / 4, std::nullopt, h, m, depth + 1, 0, 200, out);
+                    r0 = h[0];
+                }
+                for (const u32 k : {0u, 1u, 2u, 3u, 12u, 14u}) {
+                    r[k] = {};
+                }
+                r[0] = r0;
+                i++;
+                continue;
+            }
+            Step(x, i, r, m);
+            i++;
+        }
+    }
+
+    void Step(u32 x, u32 i, Regs& r, Mem& m) {
+        const u32 rd = (x >> 12) & 15;
+        const u32 rn = (x >> 16) & 15;
+        const u32 imm = x & 0xfff;
+        const bool up = (x & 0x00800000) != 0;
+        const bool load = (x & 0x00100000) != 0;
+        const VAddr pc = code.Base() + i * 4 + 8;
+        if ((x & 0x0FE00000) == 0x02800000 || (x & 0x0FE00000) == 0x02400000) {
+            // add / sub rd, rn, #imm
+            const Sym v = rn == 15 ? Sym{Sym::Const, pc} : r[rn];
+            const u32 k = RotImm(imm);
+            r[rd] = v.kind == Sym::None
+                        ? Sym{}
+                        : Sym{v.kind, (x & 0x0FE00000) == 0x02800000 ? v.v + k : v.v - k};
+        } else if ((x & 0x0FFF0FF0) == 0x01A00000) { // mov rd, rm
+            r[rd] = r[x & 15];
+        } else if ((x & 0x0FFF0000) == 0x03A00000) { // mov rd, #imm
+            r[rd] = {Sym::Const, RotImm(imm)};
+        } else if ((x & 0x0FFF0000) == 0x03E00000) { // mvn rd, #imm
+            r[rd] = {Sym::Const, ~RotImm(imm)};
+        } else if ((x & 0x0F7F0000) == 0x051F0000) { // ldr rd, [pc, #+-imm]
+            const std::optional<u32> v = image.Word(up ? pc + imm : pc - imm);
+            r[rd] = v ? Sym{Sym::Const, *v} : Sym{};
+        } else if ((x & 0x0E000000) == 0x04000000) { // ldr / str (b) rd, [rn, #+-imm]
+            const bool pre = (x & 0x01000000) != 0;
+            const u32 off = up ? imm : 0u - imm;
+            const std::optional<Key> a = Addr(r, rn, pre ? off : 0);
+            if (load) {
+                r[rd] = Get(m, a);
+            } else {
+                Put(m, a, r[rd]);
+            }
+            if ((x & 0x00200000) || !pre) {
+                if (const std::optional<Key> moved = Addr(r, rn, off)) {
+                    r[rn] = {moved->first, moved->second};
+                }
+            }
+        } else if ((x & 0x0E000090) == 0x00000090 && (x & 0x60) != 0) {
+            // strh / ldrh / ldrsb / ldrsh / ldrd / strd
+            const u32 imm8 = ((x >> 4) & 0xF0) | (x & 0xF);
+            const u32 off = up ? imm8 : 0u - imm8;
+            const bool immediate = (x & 0x00400000) != 0;
+            const std::optional<Key> a =
+                immediate ? Addr(r, rn, (x & 0x01000000) ? off : 0) : std::nullopt;
+            const auto next = [&](u32 k) {
+                return a ? std::optional<Key>{Key{a->first, a->second + 4 * k}} : std::nullopt;
+            };
+            const u32 sh = (x >> 5) & 3;
+            if (!load && sh == 2) { // ldrd
+                r[rd] = Get(m, next(0));
+                r[(rd + 1) & 15] = Get(m, next(1));
+            } else if (!load && sh == 3) { // strd
+                Put(m, next(0), r[rd]);
+                Put(m, next(1), r[(rd + 1) & 15]);
+            } else if (load) {
+                r[rd] = {};
+            } else {
+                Put(m, a, r[rd]);
+            }
+            if ((x & 0x00200000) || !(x & 0x01000000)) {
+                const std::optional<Key> moved = immediate ? Addr(r, rn, off) : std::nullopt;
+                r[rn] = moved ? Sym{moved->first, moved->second} : Sym{};
+            }
+        } else if ((x & 0x0E000000) == 0x08000000) { // ldm / stm
+            const Sym b = r[rn];
+            const u32 n = static_cast<u32>(std::popcount(x & 0xffff));
+            if (b.kind == Sym::Sp || b.kind == Sym::This) {
+                const bool pre = (x & 0x01000000) != 0;
+                u32 at = up ? b.v + (pre ? 4 : 0) : b.v - 4 * n + (pre ? 0 : 4);
+                for (u32 k = 0; k < 16; k++) {
+                    if (!(x >> k & 1)) {
+                        continue;
+                    }
+                    if (load) {
+                        if (k != 15) {
+                            r[k] = Get(m, Key{b.kind, at});
+                        }
+                    } else {
+                        Put(m, Key{b.kind, at}, r[k]);
+                    }
+                    at += 4;
+                }
+                if (x & 0x00200000) {
+                    r[rn] = {b.kind, up ? b.v + 4 * n : b.v - 4 * n};
+                }
+            } else if (load) {
+                for (u32 k = 0; k < 16; k++) {
+                    if (x >> k & 1) {
+                        r[k] = {};
+                    }
+                }
+            }
+        } else if (WritesRd(x)) {
+            r[rd] = {};
+        }
+    }
+
+    Image& image;
+    CodeReader& code;
+};
+
+/// The first word of the function holding the word `at` (its push {..., lr}), at most `reach`
+/// words before it, or nothing.
+std::optional<u32> FunctionOf(CodeReader& code, u32 at, u32 reach) {
+    u32 f = at;
+    while (f > 0 && at - f < reach && (code[f] & 0xFFFF4000) != 0xE92D4000) {
+        f--;
+    }
+    if ((code[f] & 0xFFFF4000) != 0xE92D4000) {
+        return std::nullopt;
+    }
+    return f;
+}
+
+/// A property's field as its registration names it: its MT Framework type, its offset in the
+/// registering object, and the registering function's first word.
+struct FieldRecord {
+    u32 type;
+    u32 offset;
+    u32 function;
+};
+
+/// The field of the property named at word `name`: the first of its registrations (an `add rd,
+/// pc, #imm` pointing at it within 64 KiB before it) whose record names a field of `this`.
+std::optional<FieldRecord> RegisteredField(Image& image, u32 name) {
+    CodeReader& code = image.code;
+    constexpr u32 ReachWords = 0x4000;
+    const VAddr at = code.Base() + name * 4;
+    FieldSim sim{image};
+    for (u32 i = name > ReachWords ? name - ReachWords : 0; i < name; i++) {
+        const u32 x = code[i];
+        if ((x & 0xFFFF0000) != 0xE28F0000 || code.Base() + i * 4 + 8 + RotImm(x & 0xfff) != at) {
+            continue;
+        }
+        const std::optional<u32> f = FunctionOf(code, i, 0x2000);
+        if (!f) {
+            continue;
+        }
+        const auto record = sim.Run(*f, std::min(code.Words(), i + 256), at);
+        if (record && record->field.kind == Sym::This) {
+            return FieldRecord{record->type, record->field.v, *f};
+        }
+    }
+    return std::nullopt;
+}
+
+/// Calls `visit(address, word)` for each word of the read-only data and the data that is an
+/// address in the code (a vtable's entry, say).
+template <typename F>
+void EachDataWord(Image& image, F&& visit) {
+    const VAddr code_begin = image.code.Base();
+    const VAddr code_end = code_begin + image.code.Words() * 4;
+    for (CodeReader* r : {&image.ro, &image.data}) {
+        for (u32 i = 0; i < r->Words(); i++) {
+            const u32 w = (*r)[i];
+            if (w >= code_begin && w < code_end) {
+                visit(r->Base() + i * 4, w);
+            }
+        }
+    }
+}
+
+/// The globals a constructor stores its object's address in: the function holding the word `at`
+/// run forward from its entry (r0 `this`, which the functions it calls hand back in r0, as
+/// constructors and memcpy do), each `str rT, [rG, #imm]` of `this` into a literal's address plus
+/// `imm` at or past `data_base`.
+std::vector<VAddr> ConstructorGlobals(Image& image, u32 at, VAddr data_base) {
+    CodeReader& code = image.code;
+    std::vector<VAddr> globals;
+    const std::optional<u32> f = FunctionOf(code, at, 0x800);
+    if (!f) {
+        return globals;
+    }
+    std::array<Sym, 16> r{};
+    r[0] = {Sym::This, 0};
+    for (u32 i = *f + 1, steps = 0; i < code.Words() && steps < 1024; steps++) {
+        const u32 x = code[i];
+        const u32 rd = (x >> 12) & 15;
+        const u32 rn = (x >> 16) & 15;
+        const VAddr pc = code.Base() + i * 4 + 8;
+        if ((x >> 28) == 0xE && ((x & 0x0FFF8000) == 0x08BD8000 || x == 0xE12FFF1E)) {
+            break;
+        }
+        if ((x & 0xFE000000) == 0xFA000000) { // blx #imm
+            for (const u32 k : {1u, 2u, 3u, 12u, 14u}) {
+                r[k] = {};
+            }
+        } else if ((x >> 28) != 0xE) {
+            if (WritesRd(x)) {
+                r[rd] = {};
+            }
+        } else if ((x & 0xFF000000) == 0xEA000000) {
+            const u32 t = i + 2 + static_cast<u32>(static_cast<s32>(x << 8) >> 8);
+            if (t <= i) {
+                break;
+            }
+            i = t;
+            continue;
+        } else if (BlTarget(x, pc - 8) != 0 || (x & 0x0FFFFFF0) == 0x012FFF30) {
+            for (const u32 k : {1u, 2u, 3u, 12u, 14u}) {
+                r[k] = {};
+            }
+        } else if ((x & 0x0F7F0000) == 0x051F0000) {
+            const u32 imm = x & 0xfff;
+            const std::optional<u32> v = image.Word((x & 0x00800000) ? pc + imm : pc - imm);
+            r[rd] = v ? Sym{Sym::Const, *v} : Sym{};
+        } else if ((x & 0x0FE00000) == 0x02800000 || (x & 0x0FE00000) == 0x02400000) {
+            const Sym v = r[rn];
+            const u32 k = RotImm(x & 0xfff);
+            r[rd] = v.kind == Sym::None || rn == 15
+                        ? Sym{}
+                        : Sym{v.kind, (x & 0x0FE00000) == 0x02800000 ? v.v + k : v.v - k};
+        } else if ((x & 0x0FFF0FF0) == 0x01A00000) {
+            r[rd] = r[x & 15];
+        } else if ((x & 0x0FF00000) == 0x05800000) { // str rd, [rn, #+imm]
+            if (r[rd] == Sym{Sym::This, 0} && r[rn].kind == Sym::Const &&
+                r[rn].v + (x & 0xfff) >= data_base) {
+                globals.push_back(r[rn].v + (x & 0xfff));
+            }
+        } else if ((x & 0x0E000000) == 0x04000000 && (x & 0x00200000 || !(x & 0x01000000))) {
+            // A load or store with write-back: the base moves.
+            const u32 imm = x & 0xfff;
+            const Sym b = r[rn];
+            if (x & 0x00100000) {
+                r[rd] = {};
+            }
+            r[rn] =
+                b.kind == Sym::None ? Sym{} : Sym{b.kind, (x & 0x00800000) ? b.v + imm : b.v - imm};
+        } else if ((x & 0x0E100000) == 0x08100000) { // ldm
+            for (u32 k = 0; k < 16; k++) {
+                if (x >> k & 1) {
+                    r[k] = {};
+                }
+            }
+        } else if (WritesRd(x)) {
+            r[rd] = {};
+        }
+        i++;
+    }
+    return globals;
+}
+
+/// A literal a few words before the word `at` loads into `reg` (ldr reg, [pc, #+-imm]), with no
+/// call between, or nothing.
+std::optional<u32> LiteralBefore(Image& image, u32 at, u32 reg, u32 reach) {
+    CodeReader& code = image.code;
+    for (u32 i = at; i > 0 && at - i < reach; i--) {
+        const u32 x = code[i - 1];
+        if (BlTarget(x, code.Base() + (i - 1) * 4) != 0) {
+            return std::nullopt;
+        }
+        if ((x & 0xFF7FF000) == (0xE51F0000 | reg << 12)) {
+            const VAddr pc = code.Base() + (i - 1) * 4 + 8;
+            const u32 imm = x & 0xfff;
+            return image.Word((x & 0x00800000) ? pc + imm : pc - imm);
+        }
+    }
+    return std::nullopt;
+}
+
+/// What the value and filter searches need from the code, gathered in the main scan's pass over
+/// it: the vtables stored (ldr rV, =vtable; within four words str rV, [rT]: the vtable, the load's
+/// word), the calls a few words after an `add r1, pc, #imm` (a name in r1, as the runtime type's
+/// constructor takes: the call's word, its target), and the functions returning a literal (ldr r0,
+/// =v; bx lr: v, the function; getDTI among them), by v.
+struct CodeFacts {
+    std::vector<std::pair<u32, u32>> vtable_loads;
+    std::vector<std::pair<u32, VAddr>> named_calls;
+    std::vector<std::pair<u32, VAddr>> returning;
+
+    void See(CodeReader& code, u32 i, u32 x) {
+        if ((x & 0xFFFFF000) == 0xE28F1000) {
+            last_name = i + 1;
+        } else if (last_name != 0 && i - (last_name - 1) <= 8) {
+            if (const VAddr to = BlTarget(x, code.Base() + i * 4)) {
+                named_calls.emplace_back(i, to);
+                last_name = 0;
+            }
+        }
+        if ((x & 0xFF7F0000) != 0xE51F0000 || i + 4 >= code.Words()) { // ldr rd, [pc, #+-imm]
+            return;
+        }
+        // The literal read only for the two shapes wanted (the most of these loads are neither).
+        const u32 rd = (x >> 12) & 15;
+        bool returns = rd == 0 && (x & 0x00800000) && code[i + 1] == 0xE12FFF1E;
+        bool stored = false;
+        for (u32 k = i + 1; !returns && !stored && k <= i + 4; k++) {
+            // str rV, [rT] or str rV, [rT], #imm
+            const u32 y = code[k];
+            stored = ((y & 0x0FF0F000) == (0x05800000 | rd << 12) && (y & 0xfff) == 0) ||
+                     (y & 0x0FF0F000) == (0x04800000 | rd << 12);
+        }
+        if (!returns && !stored) {
+            return;
+        }
+        const u32 imm = x & 0xfff;
+        const VAddr pc = code.Base() + i * 4 + 8;
+        const VAddr a = (x & 0x00800000) ? pc + imm : pc - imm;
+        if (a % 4 != 0 || a < code.Base() || (a - code.Base()) / 4 >= code.Words()) {
+            return;
+        }
+        const u32 v = code[(a - code.Base()) / 4];
+        if (returns) {
+            returning.emplace_back(v, code.Base() + i * 4);
+        } else {
+            vtable_loads.emplace_back(v, i);
+        }
+    }
+
+private:
+    u32 last_name = 0; ///< the last `add r1, pc, #imm`'s word + 1, 0 when a call followed it
+};
+
+/// The value settings' search before the pass over the code: each property's registered field;
+/// a field registered with the render config's bits (`bit_functions`) is the config object's
+/// (`config_global`), any other the object of a class whose createProperty (the vtable's fifth
+/// entry) its registering function is: those vtables.
+struct ValueSearch {
+    std::array<std::optional<FieldRecord>, EngineValueCount> records{};
+    std::array<RenderConfig::Field, EngineValueCount> fields{};
+    std::vector<VAddr> vtables;
+    std::vector<std::size_t> vtable_value;
+};
+
+ValueSearch PrepareValues(Image& image, std::span<const std::pair<std::size_t, u32>> named,
+                          std::span<const u32> bit_functions, VAddr config_global, u64 program_id) {
+    CodeReader& code = image.code;
+    ValueSearch s;
+    for (const auto& [value, word] : named) {
+        if (s.records[value]) {
+            continue;
+        }
+        const std::optional<FieldRecord> record = RegisteredField(image, word);
+        if (!record) {
+            continue;
+        }
+        if (record->type != engine_values[value].type) {
+            LOG_WARNING(Loader, "title {:016X}: the engine's {} has type {}, not {}: left out",
+                        program_id, engine_values[value].property, record->type,
+                        engine_values[value].type);
+            continue;
+        }
+        s.records[value] = record;
+        s.fields[value].offset = record->offset;
+        if (config_global != 0 && std::find(bit_functions.begin(), bit_functions.end(),
+                                            record->function) != bit_functions.end()) {
+            s.fields[value].globals.push_back(config_global);
+        }
+    }
+    EachDataWord(image, [&](VAddr a, u32 w) {
+        for (std::size_t v = 0; v < EngineValueCount; v++) {
+            if (s.records[v] && s.fields[v].globals.empty() &&
+                w == code.Base() + s.records[v]->function * 4) {
+                s.vtables.push_back(a - 16);
+                s.vtable_value.push_back(v);
+            }
+        }
+    });
+    return s;
+}
+
+/// The globals the constructors (the functions loading a class's vtable) store their objects
+/// in, and the search's log line.
+std::array<RenderConfig::Field, EngineValueCount> FinishValues(Image& image, ValueSearch& s,
+                                                               const CodeFacts& facts,
+                                                               u64 program_id) {
+    for (const auto& [vtable, word] : facts.vtable_loads) {
+        for (std::size_t k = 0; k < s.vtables.size(); k++) {
+            if (s.vtables[k] != vtable) {
+                continue;
+            }
+            auto& globals = s.fields[s.vtable_value[k]].globals;
+            for (const VAddr g : ConstructorGlobals(image, word, image.data.Base())) {
+                if (std::find(globals.begin(), globals.end(), g) == globals.end()) {
+                    globals.push_back(g);
+                }
+            }
+        }
+    }
+    std::string found;
+    for (std::size_t v = 0; v < EngineValueCount; v++) {
+        found += fmt::format(" {}", engine_values[v].property);
+        if (!s.records[v]) {
+            found += " none;";
+            continue;
+        }
+        found += fmt::format(" +{:#x} of", s.fields[v].offset);
+        for (const VAddr g : s.fields[v].globals) {
+            found += fmt::format(" [{:#010x}]", g);
+        }
+        found += s.fields[v].globals.empty() ? " no object;" : ";";
+    }
+    LOG_INFO(Loader, "title {:016X}: engine values:{}", program_id, found);
+    return s.fields;
+}
+
+/// The filters' search before the pass over the code: each filter class's runtime type (MtDTI),
+/// the one its name's registration constructs (r0; r2 the parent's), and the type's constructor.
+struct FilterSearch {
+    std::array<VAddr, EngineFilterCount> own{};
+    VAddr ctor = 0;
+};
+
+FilterSearch PrepareFilters(Image& image, std::span<const std::pair<std::size_t, u32>> named) {
+    CodeReader& code = image.code;
+    FilterSearch s;
+    std::map<VAddr, u32> ctors;
+    for (const auto& [filter, word] : named) {
+        if (s.own[filter] != 0) {
+            continue;
+        }
+        const VAddr at = code.Base() + word * 4;
+        for (u32 i = word > 0x400 ? word - 0x400 : 0; i < word && s.own[filter] == 0; i++) {
+            const u32 x = code[i];
+            if ((x & 0xFFFFF000) != 0xE28F1000 ||
+                code.Base() + i * 4 + 8 + RotImm(x & 0xfff) != at) {
+                continue;
+            }
+            const std::optional<u32> dti = LiteralBefore(image, i, 0, 12);
+            for (u32 k = i + 1; dti && k < std::min(code.Words(), i + 12); k++) {
+                if (const VAddr to = BlTarget(code[k], code.Base() + k * 4)) {
+                    s.own[filter] = *dti;
+                    ctors[to]++;
+                    break;
+                }
+            }
+        }
+    }
+    if (!ctors.empty()) {
+        s.ctor = std::max_element(ctors.begin(), ctors.end(), [](const auto& a, const auto& b) {
+                     return a.second < b.second;
+                 })->first;
+    }
+    return s;
+}
+
+/// Each filter's render functions with their first words (RenderConfig::filters): the classes
+/// derived from its class are the types whose parent it is, transitively; a class's vtable is
+/// the one whose sixth entry returns its type (getDTI); the render is the first entry past
+/// MtObject's six that every filter class has its own of. A render a class outside the family
+/// shares (a base's) is left out.
+std::array<std::vector<RenderConfig::Word>, EngineFilterCount> FinishFilters(Image& image,
+                                                                             const FilterSearch& s,
+                                                                             const CodeFacts& facts,
+                                                                             u64 program_id) {
+    CodeReader& code = image.code;
+    std::array<std::vector<RenderConfig::Word>, EngineFilterCount> renders{};
+    if (s.ctor == 0) {
+        return renders;
+    }
+    std::multimap<VAddr, VAddr> children;
+    for (const auto& [call, to] : facts.named_calls) {
+        if (to != s.ctor) {
+            continue;
+        }
+        const std::optional<u32> dti = LiteralBefore(image, call, 0, 16);
+        const std::optional<u32> parent = LiteralBefore(image, call, 2, 16);
+        if (dti && parent) {
+            children.emplace(*parent, *dti);
+        }
+    }
+    const auto getters_of = [&](VAddr dti) {
+        return std::equal_range(facts.returning.begin(), facts.returning.end(),
+                                std::pair<u32, VAddr>{dti, 0},
+                                [](const auto& a, const auto& b) { return a.first < b.first; });
+    };
+    std::array<std::vector<VAddr>, EngineFilterCount> family{};
+    std::map<VAddr, std::vector<std::size_t>> getter_of; // getDTI -> the filters it belongs to
+    for (std::size_t f = 0; f < EngineFilterCount; f++) {
+        if (s.own[f] == 0) {
+            continue;
+        }
+        family[f].push_back(s.own[f]);
+        for (std::size_t k = 0; k < family[f].size() && family[f].size() < 64; k++) {
+            const auto [lo, hi] = children.equal_range(family[f][k]);
+            for (auto it = lo; it != hi; ++it) {
+                if (std::find(family[f].begin(), family[f].end(), it->second) == family[f].end()) {
+                    family[f].push_back(it->second);
+                }
+            }
+        }
+        for (const VAddr dti : family[f]) {
+            const auto [lo, hi] = getters_of(dti);
+            for (auto it = lo; it != hi; ++it) {
+                getter_of[it->second].push_back(f);
+            }
+        }
+    }
+    struct Vtable {
+        std::size_t filter;
+        bool own; ///< the filter's own class's, not a derived one's
+        VAddr at;
+    };
+    std::vector<Vtable> vtables;
+    EachDataWord(image, [&](VAddr a, u32 w) {
+        const auto it = getter_of.find(w);
+        if (it == getter_of.end()) {
+            return;
+        }
+        for (const std::size_t f : it->second) {
+            const auto [lo, hi] = getters_of(s.own[f]);
+            const bool is_own =
+                std::any_of(lo, hi, [&](const std::pair<u32, VAddr>& g) { return g.second == w; });
+            vtables.push_back({f, is_own, a - 20});
+        }
+    });
+    std::vector<VAddr> owns;
+    for (const Vtable& v : vtables) {
+        if (v.own && std::none_of(owns.begin(), owns.end(), [&](VAddr o) {
+                return image.Word(o + 20) == image.Word(v.at + 20);
+            })) {
+            owns.push_back(v.at);
+        }
+    }
+    const auto in_code = [&](u32 w) {
+        return w % 4 == 0 && w >= code.Base() && (w - code.Base()) / 4 < code.Words();
+    };
+    std::optional<u32> entry;
+    for (u32 e = 6; owns.size() >= 3 && e < 24 && !entry; e++) {
+        std::vector<u32> fns;
+        for (const VAddr o : owns) {
+            const std::optional<u32> w = image.Word(o + 4 * e);
+            if (!w || !in_code(*w) || std::find(fns.begin(), fns.end(), *w) != fns.end()) {
+                break;
+            }
+            fns.push_back(*w);
+        }
+        if (fns.size() == owns.size()) {
+            entry = e;
+        }
+    }
+    if (!entry) {
+        LOG_WARNING(Loader, "title {:016X}: no filter render entry ({} filter classes' vtables)",
+                    program_id, owns.size());
+        return renders;
+    }
+    std::map<u32, std::vector<VAddr>> in_family; // function -> the vtables holding it
+    for (const Vtable& v : vtables) {
+        const std::optional<u32> fn = image.Word(v.at + 4 * *entry);
+        if (!fn || !in_code(*fn)) {
+            continue;
+        }
+        auto& list = renders[v.filter];
+        if (std::none_of(list.begin(), list.end(),
+                         [&](const RenderConfig::Word& w) { return w.addr == *fn; })) {
+            list.push_back({*fn, code[(*fn - code.Base()) / 4]});
+        }
+        auto& holders = in_family[*fn];
+        if (std::find(holders.begin(), holders.end(), v.at) == holders.end()) {
+            holders.push_back(v.at);
+        }
+    }
+    std::map<u32, u32> anywhere;
+    EachDataWord(image, [&](VAddr, u32 w) {
+        if (in_family.contains(w)) {
+            anywhere[w]++;
+        }
+    });
+    for (auto& list : renders) {
+        std::erase_if(list, [&](const RenderConfig::Word& w) {
+            return w.value == 0xE12FFF1E || anywhere[w.addr] != in_family[w.addr].size();
+        });
+    }
+    std::string found;
+    for (std::size_t f = 0; f < EngineFilterCount; f++) {
+        if (s.own[f] == 0) {
+            continue;
+        }
+        found += fmt::format(" {} ({} classes):", engine_filters[f].class_name, family[f].size());
+        for (const RenderConfig::Word& w : renders[f]) {
+            found += fmt::format(" {:#010x}", w.addr);
+        }
+        found += ";";
+    }
+    LOG_INFO(Loader, "title {:016X}: filter renders (vtable entry {}):{}", program_id, *entry,
+             found);
+    return renders;
 }
 
 } // namespace
@@ -1049,32 +1814,44 @@ RenderConfig FindRenderConfigIn(CodeReader& code, CodeReader& ro, CodeReader& da
         return 0;
     };
     std::vector<Read> reads;
-    // The settings' property names: their first words, and where the code has them.
+    // The settings' property names (and the filters' class names): their first words, and where
+    // the code has them.
+    enum class Kind : u8 { Bit, Value, Filter };
     struct Name {
+        Kind kind;
         std::size_t setting;
         std::string_view name;
         u32 head;
     };
     std::vector<Name> names;
     std::bitset<256> name_starts;
+    const auto add_name = [&](Kind kind, std::size_t s, std::string_view name) {
+        DEBUG_ASSERT(name.size() >= 4);
+        u32 head = 0;
+        for (u32 k = 0; k < 4; k++) {
+            head |= static_cast<u32>(static_cast<u8>(name[k])) << (k * 8);
+        }
+        names.push_back({kind, s, name, head});
+        name_starts.set(head & 0xff);
+    };
     for (std::size_t s = 0; s < engine_settings.size(); s++) {
         for (const char* property : engine_settings[s].properties) {
-            if (property == nullptr) {
-                continue;
+            if (property != nullptr) {
+                add_name(Kind::Bit, s, property);
             }
-            const std::string_view name = property;
-            DEBUG_ASSERT(name.size() >= 4);
-            u32 head = 0;
-            for (u32 k = 0; k < 4; k++) {
-                head |= static_cast<u32>(static_cast<u8>(name[k])) << (k * 8);
-            }
-            names.push_back({s, name, head});
-            name_starts.set(head & 0xff);
         }
     }
+    for (std::size_t s = 0; s < engine_values.size(); s++) {
+        add_name(Kind::Value, s, engine_values[s].property);
+    }
+    for (std::size_t s = 0; s < engine_filters.size(); s++) {
+        add_name(Kind::Filter, s, engine_filters[s].class_name);
+    }
     std::vector<std::pair<std::size_t, u32>> named; // (names' index, word)
+    CodeFacts facts;
     for (u32 f = 0; f + 8 <= code.Words(); f++) {
         const u32 w0 = code[f];
+        facts.See(code, f, w0);
         for (std::size_t n = 0; name_starts.test(w0 & 0xff) && n < names.size(); n++) {
             if (w0 == names[n].head && NameAt(code, f, names[n].name)) {
                 named.emplace_back(n, f);
@@ -1245,18 +2022,23 @@ RenderConfig FindRenderConfigIn(CodeReader& code, CodeReader& ro, CodeReader& da
     // Each setting's bit: its first property name whose registration gives one, else its fixed bit;
     // a bit two settings got goes to the first, a resolved one before a fixed one.
     std::string how;
+    std::vector<u32> bit_functions;
+    auto resolved = std::chrono::steady_clock::now();
+    auto prepared = resolved;
     if (!ctors.empty()) {
         Image image{code, ro, data};
         std::array<const char*, EngineSettingCount> by{};
         for (std::size_t n = 0; n < names.size(); n++) {
             const std::size_t s = names[n].setting;
             for (const auto& [index, word] : named) {
-                if (index != n || config.bits[s] >= 0) {
+                if (index != n || names[n].kind != Kind::Bit || config.bits[s] >= 0) {
                     continue;
                 }
-                if (const std::optional<u32> bit = NamedBit(image, word)) {
+                u32 function = 0;
+                if (const std::optional<u32> bit = NamedBit(image, word, function)) {
                     config.bits[s] = static_cast<s8>(*bit);
                     by[s] = names[n].name.data();
+                    bit_functions.push_back(function);
                 }
             }
         }
@@ -1292,6 +2074,22 @@ RenderConfig FindRenderConfigIn(CodeReader& code, CodeReader& ro, CodeReader& da
                                : by[s] != nullptr ? fmt::format(" ({})", by[s])
                                                   : " (fixed)");
         }
+        std::vector<std::pair<std::size_t, u32>> value_names, filter_names;
+        for (const auto& [index, word] : named) {
+            if (names[index].kind == Kind::Value) {
+                value_names.emplace_back(names[index].setting, word);
+            } else if (names[index].kind == Kind::Filter) {
+                filter_names.emplace_back(names[index].setting, word);
+            }
+        }
+        resolved = std::chrono::steady_clock::now();
+        ValueSearch values =
+            PrepareValues(image, value_names, bit_functions, config.global, program_id);
+        const FilterSearch filters = PrepareFilters(image, filter_names);
+        prepared = std::chrono::steady_clock::now();
+        std::sort(facts.returning.begin(), facts.returning.end());
+        config.fields = FinishValues(image, values, facts, program_id);
+        config.filters = FinishFilters(image, filters, facts, program_id);
     }
     const auto done = std::chrono::steady_clock::now();
     std::string found;
@@ -1308,9 +2106,10 @@ RenderConfig FindRenderConfigIn(CodeReader& code, CodeReader& ro, CodeReader& da
     }
     LOG_INFO(Loader,
              "title {:016X}: {}: {} render config constructors ({} ms: the stamp {}, scan {}, "
-             "calls {}, literals {})",
+             "calls {}, literals and bits {}, values and filters {} + {})",
              program_id, stamp, ctors.size(), ms(started, done), ms(started, stamped),
-             ms(stamped, scanned), ms(scanned, called), ms(called, done));
+             ms(stamped, scanned), ms(scanned, called), ms(called, resolved),
+             ms(resolved, prepared), ms(prepared, done));
     if (!found.empty()) {
         LOG_INFO(Loader, "title {:016X}:{}", program_id, found);
     }
@@ -1348,7 +2147,7 @@ namespace {
 
 /// FindRenderConfig's version: a title it searched before a change of what it finds is searched
 /// again (its record keeps the player's choices).
-constexpr unsigned FinderVersion = 4;
+constexpr unsigned FinderVersion = 5;
 
 std::mutex engine_mutex;
 bool engine_read = false;
@@ -1393,6 +2192,37 @@ void ReadEngineLocked() {
             c.scanned = false;
             c.bits = NoEngineBits;
         }
+        // The value settings and filters the title has, and the player's choices of them.
+        const auto field = [&](const char* key) -> const char* {
+            const char* at = std::strstr(line, key);
+            return at != nullptr ? at + std::strlen(key) : nullptr;
+        };
+        if (const char* at = field(" values ")) {
+            c.values = static_cast<u32>(std::strtoul(at, nullptr, 16));
+        }
+        if (const char* at = field(" filters ")) {
+            c.filters = static_cast<u32>(std::strtoul(at, nullptr, 16));
+        }
+        if (const char* at = field(" filtersoff ")) {
+            c.filters_off = static_cast<u32>(std::strtoul(at, nullptr, 16));
+        }
+        if (const char* at = field(" choices ")) {
+            for (std::size_t v = 0; v < EngineValueCount && *at != 0 && *at != '\n'; v++) {
+                const unsigned long choice = std::strtoul(at, nullptr, 10);
+                c.value[v] = static_cast<u8>(choice < engine_values[v].choices.size() &&
+                                                     engine_values[v].labels[choice] != nullptr
+                                                 ? choice
+                                                 : 0);
+                at = std::strchr(at, ',');
+                if (at == nullptr) {
+                    break;
+                }
+                at++;
+            }
+        }
+        if (!c.scanned) {
+            c.values = c.filters = 0;
+        }
     }
     std::fclose(f);
 }
@@ -1405,16 +2235,23 @@ void WriteEngineLocked() {
     }
     std::fprintf(f, "# Azahar's MT Framework render settings by title ID: the search that looked, "
                     "whether its code has\n# the render config, the bits it starts with, the "
-                    "player's (bits set, bits cleared), and\n# each setting's bit in its engine "
-                    "(-: none).\n");
+                    "player's (bits set, bits cleared), each\n# setting's bit in its engine (-: "
+                    "none), the value settings and filters it has (a bit each),\n# the player's "
+                    "choice of each value (0: the game's own) and the filters left out.\n");
     for (const auto& [id, c] : engine_titles) {
-        std::string bits;
+        std::string bits, choices;
         for (const s8 bit : c.bits) {
             bits += (bits.empty() ? "" : ",") + (bit >= 0 ? std::to_string(bit) : "-");
         }
-        std::fprintf(f, "%016llX finder %u found %u defaults %#010x on %#010x off %#010x bits %s\n",
+        for (const u8 choice : c.value) {
+            choices += (choices.empty() ? "" : ",") + std::to_string(choice);
+        }
+        std::fprintf(f,
+                     "%016llX finder %u found %u defaults %#010x on %#010x off %#010x bits %s "
+                     "values %x filters %x choices %s filtersoff %x\n",
                      static_cast<unsigned long long>(id), c.scanned ? FinderVersion : 0u,
-                     c.found ? 1u : 0u, c.defaults, c.on, c.off, bits.c_str());
+                     c.found ? 1u : 0u, c.defaults, c.on, c.off, bits.c_str(), c.values, c.filters,
+                     choices.c_str(), c.filters_off);
     }
     std::fclose(f);
 }
@@ -1435,6 +2272,44 @@ const EngineGuardTarget& EngineGuardTargetNow() {
 
 std::span<const EngineSetting> EngineSettings() {
     return engine_settings;
+}
+
+std::span<const EngineValue> EngineValues() {
+    return engine_values;
+}
+
+std::span<const EngineFilter> EngineFilters() {
+    return engine_filters;
+}
+
+EngineGuardTarget EngineGuardTargetOf(const RenderConfig& config, const EngineChoices& choices) {
+    EngineGuardTarget target;
+    if (!config.defaults.empty()) {
+        const EngineGuardBits bits = GuardBitsOf(choices);
+        target.global = config.global;
+        target.initial = config.defaults.front().value;
+        target.on = bits.on;
+        target.off = bits.off;
+    }
+    for (std::size_t v = 0; v < EngineValueCount; v++) {
+        const u8 choice = choices.value[v];
+        if (choice != 0 && !config.fields[v].globals.empty()) {
+            target.values.push_back({config.fields[v].globals, config.fields[v].offset,
+                                     engine_values[v].choices[choice]});
+        }
+    }
+    for (std::size_t f = 0; f < EngineFilterCount; f++) {
+        if (((choices.filters_off >> f) & 1) == 0) {
+            continue;
+        }
+        for (const RenderConfig::Word& w : config.filters[f]) {
+            if (std::none_of(target.returns.begin(), target.returns.end(),
+                             [&](const RenderConfig::Word& r) { return r.addr == w.addr; })) {
+                target.returns.push_back(w);
+            }
+        }
+    }
+    return target;
 }
 
 bool EngineSettingOn(const EngineChoices& choices, std::size_t setting) {
@@ -1490,17 +2365,47 @@ void SetEngineChoice(u64 title_id, u32 bit, bool on) {
     WriteEngineLocked();
 }
 
-void NoteEngineFound(u64 title_id, u32 defaults, const std::array<s8, EngineSettingCount>& bits) {
+void SetEngineValue(u64 title_id, std::size_t value, u8 choice) {
+    ASSERT(value < EngineValueCount && choice < engine_values[value].choices.size() &&
+           engine_values[value].labels[choice] != nullptr);
+    std::scoped_lock lock{engine_mutex};
+    ReadEngineLocked();
+    engine_titles[title_id].value[value] = choice;
+    WriteEngineLocked();
+}
+
+void SetEngineFilterOff(u64 title_id, std::size_t filter, bool off) {
+    ASSERT(filter < EngineFilterCount);
     std::scoped_lock lock{engine_mutex};
     ReadEngineLocked();
     EngineChoices& c = engine_titles[title_id];
-    if (c.scanned && c.found && c.defaults == defaults && c.bits == bits) {
+    c.filters_off = off ? c.filters_off | (1u << filter) : c.filters_off & ~(1u << filter);
+    WriteEngineLocked();
+}
+
+void NoteEngineFound(u64 title_id, const RenderConfig& config) {
+    const u32 defaults = config.defaults.empty() ? 0 : config.defaults.front().value;
+    u32 values = 0;
+    u32 filters = 0;
+    for (std::size_t v = 0; v < EngineValueCount; v++) {
+        values |= config.fields[v].globals.empty() ? 0 : 1u << v;
+    }
+    for (std::size_t f = 0; f < EngineFilterCount; f++) {
+        filters |= config.filters[f].empty() ? 0 : 1u << f;
+    }
+    std::scoped_lock lock{engine_mutex};
+    ReadEngineLocked();
+    EngineChoices& c = engine_titles[title_id];
+    if (c.scanned && c.found && c.defaults == defaults && c.bits == config.bits &&
+        c.values == values && c.filters == filters) {
         return;
     }
     c.scanned = true;
     c.found = true;
     c.defaults = defaults;
-    c.bits = bits;
+    c.bits = config.bits;
+    c.values = values;
+    c.filters = filters;
     WriteEngineLocked();
 }
 

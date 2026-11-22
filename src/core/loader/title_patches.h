@@ -74,6 +74,36 @@ constexpr std::size_t EngineSettingCount = 10;
 /// The settings, in the order the Patches tab lists them.
 [[nodiscard]] std::span<const EngineSetting> EngineSettings();
 
+/// An engine setting that keeps a field of one of the engine's systems at a value the player
+/// chose: the field the title's code registers under `property` (the frame rate cap, the game's
+/// speed), in the object its class's constructor stores in a global (or the render config's, for
+/// a field registered with the config's bits).
+struct EngineValue {
+    const char* property;
+    u8 type; ///< its MT Framework property type: 6 a u32, 12 an f32
+    /// The choices' words (a float's bits); the first is the game's own, which the guard leaves.
+    std::array<u32, 4> choices;
+    std::array<const char*, 4> labels; ///< in English, which a menu translates; null past the last
+    const char* name;
+    const char* description;
+};
+
+constexpr std::size_t EngineValueCount = 3;
+
+[[nodiscard]] std::span<const EngineValue> EngineValues();
+
+/// An effect the player can leave out: an engine filter class, and every class derived from it,
+/// whose render returns at once.
+struct EngineFilter {
+    const char* class_name;
+    const char* name;
+    const char* description;
+};
+
+constexpr std::size_t EngineFilterCount = 9;
+
+[[nodiscard]] std::span<const EngineFilter> EngineFilters();
+
 constexpr std::array<s8, EngineSettingCount> NoEngineBits = [] {
     std::array<s8, EngineSettingCount> bits{};
     bits.fill(-1);
@@ -91,6 +121,10 @@ struct EngineChoices {
     std::array<s8, EngineSettingCount> bits = NoEngineBits; ///< -1: the title has no such setting
     u32 on = 0;
     u32 off = 0;
+    u32 values = 0;                           ///< the EngineValues the title has, a bit each
+    u32 filters = 0;                          ///< the EngineFilters the title has, a bit each
+    std::array<u8, EngineValueCount> value{}; ///< the player's choice of each (0: the game's own)
+    u32 filters_off = 0;                      ///< the filters the player left out
 };
 
 /// Whether the setting (EngineSettings' index) is on for the title.
@@ -108,6 +142,10 @@ struct EngineGuardBits {
 [[nodiscard]] EngineChoices EngineChoicesOf(u64 title_id);
 /// The player's choice for `bit` of the title's settings, kept in the file.
 void SetEngineChoice(u64 title_id, u32 bit, bool on);
+/// The player's choice of the title's value setting (EngineValues' index), kept in the file.
+void SetEngineValue(u64 title_id, std::size_t value, u8 choice);
+/// Whether the player left out the title's filter (EngineFilters' index), kept in the file.
+void SetEngineFilterOff(u64 title_id, std::size_t filter, bool off);
 
 /// The render config in a title's code: the defaults its constructor's call sites pass (literal
 /// words, the high byte the constructor masks off clear: the game's own bits), and where the word
@@ -117,6 +155,7 @@ struct RenderConfig {
     struct Word {
         VAddr addr;
         u32 value;
+        bool operator==(const Word&) const = default;
     };
     u32 constructors = 0;
     std::vector<Word> defaults;
@@ -129,6 +168,16 @@ struct RenderConfig {
     VAddr global = 0;
     /// Each setting's (EngineSettings') bit in this title, -1 for none.
     std::array<s8, EngineSettingCount> bits = NoEngineBits;
+    /// Each value setting's field: the globals its object's constructors store it in (none: the
+    /// title has no such field) and its offset in the object.
+    struct Field {
+        std::vector<VAddr> globals;
+        u32 offset = 0;
+    };
+    std::array<Field, EngineValueCount> fields{};
+    /// Each filter's render functions (its class's and the classes' derived from it), their first
+    /// words.
+    std::array<std::vector<Word>, EngineFilterCount> filters{};
 };
 [[nodiscard]] RenderConfig FindRenderConfig(Kernel::Process& process);
 /// The same in a code image: the text at `text_addr`, the read-only data at `ro_addr`, the data
@@ -138,23 +187,36 @@ struct RenderConfig {
                                             std::span<const u8> ro, VAddr data_addr,
                                             std::span<const u8> data);
 
-/// The render config words the emulator keeps at the player's bits while the title runs (the native
-/// core's engine guard): the global holding the config object's address (0: none), the default
-/// its constructor stores in two words in a row (the engine's request and current setting, found
-/// in the object by it), the bits set and cleared. Set at each title's load.
+/// What the emulator keeps while the title runs (the native core's engine guard), set at each
+/// title's load: the render config words at the player's bits (the global holding the config
+/// object's address, 0: none; the default its constructor stores in two words in a row, the
+/// engine's request and current setting, found in the object by it; the bits set and cleared),
+/// the fields at the player's values (in each object a global holds) and the functions that
+/// return at once (the filters left out).
 struct EngineGuardTarget {
     VAddr global = 0;
     u32 initial = 0;
     u32 on = 0;
     u32 off = 0;
+    struct Value {
+        std::vector<VAddr> globals;
+        u32 offset = 0;
+        u32 value = 0;
+        bool operator==(const Value&) const = default;
+    };
+    std::vector<Value> values;
+    std::vector<RenderConfig::Word> returns;
     bool operator==(const EngineGuardTarget&) const = default;
 };
 void SetEngineGuardTarget(const EngineGuardTarget& target);
 [[nodiscard]] const EngineGuardTarget& EngineGuardTargetNow();
+/// The target for a title's render config and the player's choices.
+[[nodiscard]] EngineGuardTarget EngineGuardTargetOf(const RenderConfig& config,
+                                                    const EngineChoices& choices);
 
-/// Records that the title's code has the render config, starting with `defaults`, and the settings
-/// its engine has, for the Patches tab.
-void NoteEngineFound(u64 title_id, u32 defaults, const std::array<s8, EngineSettingCount>& bits);
+/// Records that the title's code has the render config and the settings its engine has, for the
+/// Patches tab.
+void NoteEngineFound(u64 title_id, const RenderConfig& config);
 /// Records that the title's code has none: its later loads search it no more (a search reads the
 /// whole code, ~30 ns a byte through the guest memory's mapping).
 void NoteEngineAbsent(u64 title_id);

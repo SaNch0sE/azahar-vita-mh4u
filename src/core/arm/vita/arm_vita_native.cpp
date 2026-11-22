@@ -539,16 +539,35 @@ std::unordered_map<u32, u32> bkpt_traps;
 struct EngineGuard {
     std::mutex lock;
     Loader::EngineGuardTarget target{};
+    /// The config word and its twin after it (the engine's request and its current setting: a
+    /// display update may toggle the current one toward the request), 0 until the object is made.
     VAddr word = 0;
-    const u8* page_host = nullptr;
-    bool armed = false;
-    bool changed = false;               ///< a store changed the bits since the last check
+    /// A word kept: its bits in `mask` at `value`'s.
+    struct Held {
+        VAddr addr;
+        u32 mask;
+        u32 value;
+    };
+    std::vector<Held> held; ///< the config pair's, and each value's in the objects its globals hold
+    /// A held word's page: held against stores while something changes its words.
+    struct Page {
+        VAddr page;
+        const u8* host;
+        bool armed;
+        bool changed; ///< a store changed its words since the last check
+    };
+    std::vector<Page> pages;
     std::vector<u32> writers;           ///< those stores, made traps at the next check (host 0)
     std::unordered_map<u32, u32> traps; ///< trap site -> the store it stands for
+    std::vector<u32> returns_refused;   ///< functions to return at once whose code is another's
     u64 checked_us = 0;
     u32 put_back = 0; ///< words put back, for the log
-    bool not_found_logged = false;
+    /// The made config object's searches that found no words (a frame apart; MissedSearches end
+    /// them).
+    u32 missed = 0;
 };
+/// A second of frames.
+constexpr u32 MissedSearches = 60;
 /// How far into the config object the guard looks for its words.
 constexpr u32 ObjectSearchBytes = 0x8000;
 EngineGuard engine_guard;
@@ -857,10 +876,13 @@ void ForgetThunks(const VitaGuestMap* map) {
         // The guest's tables went with azaharRelease, the guard's hold in them too.
         {
             std::scoped_lock lk{engine_guard.lock};
-            engine_guard.armed = engine_guard.changed = false;
             engine_guard.word = 0;
+            engine_guard.missed = 0;
+            engine_guard.held.clear();
+            engine_guard.pages.clear();
             engine_guard.writers.clear();
             engine_guard.traps.clear();
+            engine_guard.returns_refused.clear();
         }
         vfp_thunks.clear();
         svc_thunks.clear();
@@ -2651,13 +2673,17 @@ void GuardHold(const u8* page, u32 hold) {
 void ARM_VitaNative::GuardTick() {
     const Loader::EngineGuardTarget& t = Loader::EngineGuardTargetNow();
     EngineGuard& g = engine_guard;
-    if (t.global == 0 && g.target.global == 0) {
+    const auto idle = [](const Loader::EngineGuardTarget& x) {
+        return x.global == 0 && x.values.empty() && x.returns.empty();
+    };
+    // The holds need the guest's tables in the module (after a state's load, its next slice).
+    if ((idle(t) && idle(g.target)) || !map->IsInstalled()) {
         return;
     }
     std::scoped_lock lk{g.lock};
-    // Until the word is found, every slice: the views the engine builds copy its bits. Then a
-    // frame at a time, the clock (a syscall) read every 64th slice.
-    if (g.word != 0 && g.target == t) {
+    // Until the config object is made, every slice: the views the engine builds copy its bits
+    // right after. Then a frame at a time, the clock (a syscall) read every 64th slice.
+    if ((t.global == 0 || g.word != 0 || g.missed != 0) && g.target == t) {
         static u32 slices = 0;
         if (++slices % 64 != 0) {
             return;
@@ -2669,113 +2695,192 @@ void ARM_VitaNative::GuardTick() {
         g.checked_us = now;
     }
     if (!(g.target == t)) {
-        if (g.armed) {
-            GuardHold(g.page_host, AZAHAR_HOLD_NONE);
+        for (const EngineGuard::Page& page : g.pages) {
+            if (page.armed) {
+                GuardHold(page.host, AZAHAR_HOLD_NONE);
+            }
         }
-        g.armed = false;
+        g.pages.clear();
+        g.held.clear();
         g.word = 0;
-        g.not_found_logged = false;
+        g.missed = 0;
+        g.returns_refused.clear();
         g.target = t;
-        if (t.global == 0) {
+        if (idle(t)) {
             return;
         }
     }
-    if (g.word == 0) {
+    if (t.global != 0 && g.word == 0 && g.missed < MissedSearches) {
         // The object from the global the engine keeps it in: null until it is made. The words:
-        // the two in a row its constructor stored the default in.
-        const u32 object = memory.Read32(t.global);
-        if (object == 0) {
-            return;
-        }
-        VAddr word = 0;
-        for (u32 off = 0; off + 8 <= ObjectSearchBytes && word == 0; off += 4) {
-            if (memory.Read32(object + off) == t.initial &&
-                memory.Read32(object + off + 4) == t.initial) {
-                word = object + off;
+        // the two in a row its constructor stored the default in, but for the bits kept and the
+        // high byte the constructor clears (a state's words: kept bits changed, the engine's own
+        // flags up there).
+        const u32 same = ~(t.on | t.off) & 0x00FFFFFFu;
+        if (const u32 object = memory.Read32(t.global); object != 0) {
+            for (u32 off = 0; off + 8 <= ObjectSearchBytes && g.word == 0; off += 4) {
+                if ((memory.Read32(object + off) & same) == (t.initial & same) &&
+                    (memory.Read32(object + off + 4) & same) == (t.initial & same)) {
+                    g.word = object + off;
+                }
             }
-        }
-        if (word == 0) {
-            if (!std::exchange(g.not_found_logged, true)) {
+            if (g.word != 0) {
+                LOG_INFO(Core_ARM11,
+                         "engine guard: the render config words at {:#010x}: {:#010x} {:#010x}",
+                         g.word, memory.Read32(g.word), memory.Read32(g.word + 4));
+            } else if (++g.missed == MissedSearches) {
                 LOG_WARNING(Core_ARM11,
                             "engine guard: the config object {:#010x} holds no two words of its "
-                            "default {:#010x} yet",
+                            "default {:#010x}: its bits are left as they are",
                             object, t.initial);
             }
-            return;
         }
-        g.page_host = map->HostAt(word & ~0xFFFu);
-        ASSERT_MSG(g.page_host != nullptr && map->HostAt(word + 4) != nullptr,
-                   "engine guard: the render config word {:#010x} is in no mapped page", word);
-        g.word = word;
-        LOG_INFO(Core_ARM11, "engine guard: the render config words at {:#010x}: {:#010x} {:#010x}",
-                 word, memory.Read32(word), memory.Read32(word + 4));
     }
-    // The stores that changed the bits since the last check: traps from now on.
+    // The words to keep: the config pair, and each value's field in the objects its globals hold
+    // now (null before the object is made and after it goes).
+    std::vector<EngineGuard::Held> held;
+    if (g.word != 0 && (t.on | t.off) != 0) {
+        held.push_back({g.word, t.on | t.off, t.on});
+        held.push_back({g.word + 4, t.on | t.off, t.on});
+    }
+    for (const Loader::EngineGuardTarget::Value& v : t.values) {
+        for (const VAddr global : v.globals) {
+            const u32 object = memory.Read32(global);
+            if (object == 0) {
+                continue;
+            }
+            const VAddr at = object + v.offset;
+            if (std::any_of(held.begin(), held.end(),
+                            [at](const EngineGuard::Held& h) { return h.addr == at; })) {
+                continue;
+            }
+            if (std::none_of(g.held.begin(), g.held.end(),
+                             [at](const EngineGuard::Held& h) { return h.addr == at; })) {
+                LOG_INFO(Core_ARM11,
+                         "engine guard: the field {:#010x} ([{:#010x}] {:#010x} + {:#x}): "
+                         "{:#010x}, kept at {:#010x}",
+                         at, global, object, v.offset, memory.Read32(at), v.value);
+            }
+            held.push_back({at, ~0u, v.value});
+        }
+    }
+    std::vector<EngineGuard::Page> pages;
+    for (const EngineGuard::Held& h : held) {
+        const VAddr page = h.addr & ~0xFFFu;
+        if (std::any_of(pages.begin(), pages.end(),
+                        [page](const EngineGuard::Page& p) { return p.page == page; })) {
+            continue;
+        }
+        const auto old =
+            std::find_if(g.pages.begin(), g.pages.end(),
+                         [page](const EngineGuard::Page& p) { return p.page == page; });
+        if (old != g.pages.end()) {
+            pages.push_back(*old);
+            continue;
+        }
+        const u8* const host = map->HostAt(page);
+        ASSERT_MSG(host != nullptr, "engine guard: the word {:#010x} is in no mapped page", h.addr);
+        pages.push_back({page, host, false, false});
+    }
+    for (const EngineGuard::Page& old : g.pages) {
+        if (old.armed && std::none_of(pages.begin(), pages.end(), [&](const EngineGuard::Page& p) {
+                return p.page == old.page;
+            })) {
+            GuardHold(old.host, AZAHAR_HOLD_NONE);
+        }
+    }
+    g.held = std::move(held);
+    g.pages = std::move(pages);
+    // The stores that changed the words since the last check: traps from now on.
     for (const u32 pc : g.writers) {
         GuardPatch(pc);
     }
     g.writers.clear();
-    bool wrong = false;
-    for (const VAddr at : {g.word, g.word + 4}) {
-        const u32 v = memory.Read32(at);
-        const u32 want = (v & ~t.off) | t.on;
-        if (v != want) {
-            memory.Write32(at, want);
-            wrong = true;
-            if (g.put_back++ < 16) {
-                LOG_INFO(Core_ARM11,
-                         "engine guard: the render config word {:#010x}: {:#010x} -> "
-                         "{:#010x}",
-                         at, v, want);
-            }
+    for (const EngineGuard::Held& h : g.held) {
+        const u32 v = memory.Read32(h.addr);
+        const u32 want = (v & ~h.mask) | (h.value & h.mask);
+        if (v == want) {
+            continue;
+        }
+        memory.Write32(h.addr, want);
+        for (EngineGuard::Page& page : g.pages) {
+            page.changed |= page.page == (h.addr & ~0xFFFu);
+        }
+        if (g.put_back++ < 16) {
+            LOG_INFO(Core_ARM11, "engine guard: the word {:#010x}: {:#010x} -> {:#010x}", h.addr, v,
+                     want);
         }
     }
-    // Held while something changes the bits; a frame with no such store lets the page go.
-    const bool hold = wrong || g.changed;
-    g.changed = false;
-#ifdef VITA_DIAGNOSTICS
-    if (Core::EngineWatch::Watches(g.word)) {
-        return;
+    // A page is held while something changes its words; a frame with no such store lets it go.
+    for (EngineGuard::Page& page : g.pages) {
+        const bool hold = std::exchange(page.changed, false);
+        if (hold != page.armed) {
+            GuardHold(page.host, hold ? AZAHAR_HOLD_WRITES : AZAHAR_HOLD_NONE);
+            page.armed = hold;
+        }
     }
-#endif
-    if (hold != g.armed) {
-        GuardHold(g.page_host, hold ? AZAHAR_HOLD_WRITES : AZAHAR_HOLD_NONE);
-        g.armed = hold;
+    // The filters left out: their renders return at once (put back for a savestate with the
+    // other patched sites, made again after it).
+    for (const Loader::RenderConfig::Word& w : t.returns) {
+        if (patched_sites.contains(w.addr) ||
+            std::find(g.returns_refused.begin(), g.returns_refused.end(), w.addr) !=
+                g.returns_refused.end()) {
+            continue;
+        }
+        const u32 insn = memory.Read32(w.addr);
+        if (insn != w.value || InThunkArea(w.addr)) {
+            g.returns_refused.push_back(w.addr);
+            LOG_WARNING(Core_ARM11,
+                        "engine guard: the filter render {:#010x} holds {:#010x}, not {:#010x}: "
+                        "left as it is",
+                        w.addr, insn, w.value);
+            continue;
+        }
+        memory.Write32(w.addr, 0xE12FFF1Eu); // bx lr
+        map->SyncCode(w.addr, 4);
+        patched_sites[w.addr] = PatchedSite{insn, false};
+        LOG_INFO(Core_ARM11, "engine guard: the filter render {:#010x} returns at once", w.addr);
     }
 }
 
 bool ARM_VitaNative::GuardStore(u32 va, bool write, u32 pc) {
     EngineGuard& g = engine_guard;
     std::scoped_lock lk{g.lock};
-    if (!g.armed || !write || (va & ~0xFFFu) != (g.word & ~0xFFFu)) {
+    const auto page =
+        std::find_if(g.pages.begin(), g.pages.end(), [va](const EngineGuard::Page& p) {
+            return p.armed && p.page == (va & ~0xFFFu);
+        });
+    if (!write || page == g.pages.end()) {
         return false;
     }
     refused_va = 0;
-    // An access the core cannot make past the hold: the page let go, the store runs again.
+    // An access the core cannot make past the hold: the page let go, the store runs again; the
+    // next check holds it again only where a kept word is wrong.
     if (!AccessPastHolds(pc, write)) {
-        GuardHold(g.page_host, AZAHAR_HOLD_NONE);
-        g.armed = false;
-        g.changed = true;
-        LOG_WARNING(Core_ARM11, "engine guard: the store at {:#010x} not made past the hold", pc);
+        GuardHold(page->host, AZAHAR_HOLD_NONE);
+        page->armed = false;
+        LOG_DEBUG(Core_ARM11, "engine guard: the store at {:#010x} not made past the hold", pc);
         return true;
     }
     bool wrong = false;
-    for (const VAddr at : {g.word, g.word + 4}) {
-        const u32 v = memory.Read32(at);
-        const u32 want = (v & ~g.target.off) | g.target.on;
+    for (const EngineGuard::Held& h : g.held) {
+        if ((h.addr & ~0xFFFu) != page->page) {
+            continue;
+        }
+        const u32 v = memory.Read32(h.addr);
+        const u32 want = (v & ~h.mask) | (h.value & h.mask);
         if (v != want) {
-            memory.Write32(at, want);
+            memory.Write32(h.addr, want);
             wrong = true;
         }
     }
     if (wrong) {
-        g.changed = true;
+        page->changed = true;
         if ((run.ctx.cpsr & 0x20u) != 0) {
             if (!g.traps.contains(pc)) {
                 g.traps.emplace(pc, 0);
                 LOG_WARNING(Core_ARM11,
-                            "engine guard: a Thumb store at {:#010x} changes the render config's "
-                            "bits: put back a frame at a time",
+                            "engine guard: a Thumb store at {:#010x} changes a kept word: put "
+                            "back a frame at a time",
                             pc);
             }
         } else if (std::find(g.writers.begin(), g.writers.end(), pc) == g.writers.end()) {
@@ -2785,17 +2890,31 @@ bool ARM_VitaNative::GuardStore(u32 va, bool write, u32 pc) {
     return true;
 }
 
+namespace {
+
+/// A store the guard traps: str rT, [rN, #+-imm] or vstr sD, [rN, #+-imm * 4], no write-back,
+/// rT not the PC.
+bool GuardTrappable(u32 insn) {
+    if ((insn >> 28) == 0xF) {
+        return false;
+    }
+    return ((insn & 0x0F700000u) == 0x05000000u && ((insn >> 12) & 15) != 15) ||
+           (insn & 0x0F300F00u) == 0x0D000A00u;
+}
+
+} // namespace
+
 void ARM_VitaNative::GuardPatch(u32 pc) {
     EngineGuard& g = engine_guard;
     if (g.traps.contains(pc) || patched_sites.contains(pc) || InThunkArea(pc)) {
         return;
     }
-    // str rT, [rN, #+-imm], no write-back, rT not the PC: a trap that stores with the bits set.
+    // A trap that makes the store with the kept words' bits.
     const u32 insn = memory.Read32(pc);
-    if ((insn >> 28) == 0xF || (insn & 0x0F700000u) != 0x05000000u || ((insn >> 12) & 15) == 15) {
+    if (!GuardTrappable(insn)) {
         LOG_WARNING(Core_ARM11,
-                    "engine guard: the store at {:#010x} ({:#010x}) changes the render config's "
-                    "bits and is no str rT, [rN, #imm]: put back a frame at a time",
+                    "engine guard: the store at {:#010x} ({:#010x}) changes a kept word and is no "
+                    "str rT, [rN, #imm] or vstr: put back a frame at a time",
                     pc, insn);
         g.traps.emplace(pc, 0);
         return;
@@ -2805,9 +2924,8 @@ void ARM_VitaNative::GuardPatch(u32 pc) {
     patched_sites[pc] = PatchedSite{insn, false};
     g.traps.emplace(pc, insn);
     LOG_INFO(Core_ARM11,
-             "engine guard: the store at {:#010x} ({:#010x}) changes the render "
-             "config's bits: a trap",
-             pc, insn);
+             "engine guard: the store at {:#010x} ({:#010x}) changes a kept word: a trap", pc,
+             insn);
 }
 
 bool ARM_VitaNative::GuardTrap() {
@@ -2822,11 +2940,22 @@ bool ARM_VitaNative::GuardTrap() {
     if (ConditionPasses(insn >> 28, run.ctx.cpsr)) {
         const u32 rn = (insn >> 16) & 15;
         const u32 base = rn == 15 ? pc + 8 : run.ctx.r[rn];
-        const u32 imm = insn & 0xFFF;
-        const VAddr addr = (insn & 0x00800000u) ? base + imm : base - imm;
-        u32 value = run.ctx.r[(insn >> 12) & 15];
-        if (addr == g.word || addr == g.word + 4) {
-            value = (value & ~g.target.off) | g.target.on;
+        const bool up = (insn & 0x00800000u) != 0;
+        VAddr addr;
+        u32 value;
+        if ((insn & 0x0F300F00u) == 0x0D000A00u) {
+            const u32 off = (insn & 0xFF) * 4;
+            addr = up ? base + off : base - off;
+            value = run.ctx.fpregs[((insn >> 12) & 15) << 1 | ((insn >> 22) & 1)];
+        } else {
+            const u32 off = insn & 0xFFF;
+            addr = up ? base + off : base - off;
+            value = run.ctx.r[(insn >> 12) & 15];
+        }
+        for (const EngineGuard::Held& h : g.held) {
+            if (h.addr == addr) {
+                value = (value & ~h.mask) | (h.value & h.mask);
+            }
         }
         memory.Write32(addr, value);
     }
@@ -2837,14 +2966,18 @@ bool ARM_VitaNative::GuardTrap() {
 void ARM_VitaNative::GuardReset() {
     EngineGuard& g = engine_guard;
     std::scoped_lock lk{g.lock};
-    if (g.armed) {
-        GuardHold(g.page_host, AZAHAR_HOLD_NONE);
+    for (const EngineGuard::Page& page : g.pages) {
+        if (page.armed) {
+            GuardHold(page.host, AZAHAR_HOLD_NONE);
+        }
     }
-    g.armed = false;
-    g.changed = false;
+    g.pages.clear();
+    g.held.clear();
     g.word = 0;
+    g.missed = 0;
     g.writers.clear();
     g.traps.clear();
+    g.returns_refused.clear();
 }
 
 void ARM_VitaNative::PatchBkpt(u32 pc, u32 insn) {
