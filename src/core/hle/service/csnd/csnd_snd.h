@@ -7,6 +7,7 @@
 #include <memory>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/shared_ptr.hpp>
+#include <boost/serialization/version.hpp>
 #include "common/archives.h"
 #include "core/hle/kernel/mutex.h"
 #include "core/hle/kernel/shared_memory.h"
@@ -279,4 +280,5 @@ void InstallInterfaces(Core::System& system);
 } // namespace Service::CSND
 
 BOOST_CLASS_EXPORT_KEY(Service::CSND::CSND_SND)
+BOOST_CLASS_VERSION(Service::CSND::CSND_SND, 1)
 SERVICE_CONSTRUCT(Service::CSND::CSND_SND)

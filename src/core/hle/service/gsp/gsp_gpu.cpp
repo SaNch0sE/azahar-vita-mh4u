@@ -246,7 +246,7 @@ private:
     ThreadCallback() : system(Core::Global<Core::System>()) {}
 
     template <class Archive>
-    void serialize(Archive& ar, const unsigned int) {
+    void serialize(Archive& ar, const unsigned int file_version) {
         ar& boost::serialization::base_object<Kernel::HLERequestContext::WakeupCallback>(*this);
         ar & name;
         ar & type;
@@ -1035,7 +1035,7 @@ SessionData* GSP_GPU::FindRegisteredThreadData(u32 thread_id) {
 }
 
 template <class Archive>
-void GSP_GPU::serialize(Archive& ar, const unsigned int) {
+void GSP_GPU::serialize(Archive& ar, const unsigned int file_version) {
     DEBUG_SERIALIZATION_POINT;
     ar& boost::serialization::base_object<Kernel::SessionRequestHandler>(*this);
     ar & shared_memory;

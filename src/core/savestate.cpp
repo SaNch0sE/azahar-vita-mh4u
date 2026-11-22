@@ -34,6 +34,9 @@ class ZstdFileOStreamBuf final : public std::streambuf {
 public:
     explicit ZstdFileOStreamBuf(FileUtil::IOFile& file_) : file{file_} {
         cctx = ZSTD_createCCtx();
+        // The fastest regular level: at the default level 3 a Vita spends most of a save
+        // compressing.
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 1);
         in_buffer.resize(ZSTD_CStreamInSize());
         out_buffer.resize(ZSTD_CStreamOutSize());
         setp(reinterpret_cast<char*>(in_buffer.data()),
@@ -146,8 +149,9 @@ struct CSTHeader {
     u32_le zero{};                   /// Should be zero, just in case.
     std::array<u8, 20> build_version{}; /// Latest build version, used as compatibility.
     u32_le zero_2{};                    /// Should be zero, just in case.
+    u32_le format{};                    /// SaveStateFormat when saved; 0 before it was written
 
-    std::array<u8, 168> reserved{}; /// Make heading 256 bytes so it has consistent size
+    std::array<u8, 164> reserved{}; /// Make heading 256 bytes so it has consistent size
 };
 static_assert(sizeof(CSTHeader) == 256, "CSTHeader should be 256 bytes");
 #pragma pack(pop)
@@ -190,7 +194,8 @@ static bool ValidateSaveState(const CSTHeader& header, SaveStateInfo& info, u64 
         info.build_name = build_name;
         info.build_version = build_version;
 
-        info.status = Common::g_build_version == info.build_version
+        // Another build's state is loaded where its serialized layout is this build's.
+        info.status = header.format == SaveStateFormat
                           ? SaveStateInfo::ValidationStatus::RevisionMismatch
                           : SaveStateInfo::ValidationStatus::BuildMismatch;
     }
@@ -274,28 +279,67 @@ void System::SaveState(u32 slot) const {
         throw std::runtime_error("Could not create path " + path);
     }
 
-    FileUtil::IOFile file(path, "wb");
+    // Written beside the slot and renamed over it once whole: a save cut off (a crash, a flat
+    // battery, the app closed) leaves the slot's last state, where writing the slot in place left
+    // part of one, whose load asserted in the kernel's memory regions.
+    const auto part = path + ".part";
+    FileUtil::IOFile file(part, "wb");
     if (!file) {
-        throw std::runtime_error("Could not open file " + path);
+        throw std::runtime_error("Could not open file " + part);
     }
+    const auto write = [&] {
+        CSTHeader header{};
+        header.filetype = header_magic_bytes;
+        header.program_id = title_id;
+        std::string rev_bytes;
+        CryptoPP::StringSource ss(Common::g_scm_rev, true,
+                                  new CryptoPP::HexDecoder(new CryptoPP::StringSink(rev_bytes)));
+        std::memcpy(header.revision.data(), rev_bytes.data(), sizeof(header.revision));
+        header.time = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+        const std::string build_fullname = Common::g_build_fullname;
+        std::memset(header.build_name.data(), 0, sizeof(header.build_name));
+        std::memcpy(header.build_name.data(), build_fullname.c_str(),
+                    std::min(build_fullname.length(), sizeof(header.build_name) - 1));
+        header.format = SaveStateFormat;
 
-    CSTHeader header{};
-    header.filetype = header_magic_bytes;
-    header.program_id = title_id;
-    std::string rev_bytes;
-    CryptoPP::StringSource ss(Common::g_scm_rev, true,
-                              new CryptoPP::HexDecoder(new CryptoPP::StringSink(rev_bytes)));
-    std::memcpy(header.revision.data(), rev_bytes.data(), sizeof(header.revision));
-    header.time = std::chrono::duration_cast<std::chrono::seconds>(
-                      std::chrono::system_clock::now().time_since_epoch())
-                      .count();
-    const std::string build_fullname = Common::g_build_fullname;
-    std::memset(header.build_name.data(), 0, sizeof(header.build_name));
-    std::memcpy(header.build_name.data(), build_fullname.c_str(),
-                std::min(build_fullname.length(), sizeof(header.build_name) - 1));
+        if (file.WriteBytes(&header, sizeof(header)) != sizeof(header)) {
+            throw std::runtime_error("Could not write to file " + part);
+        }
 
-    if (file.WriteBytes(&header, sizeof(header)) != sizeof(header)) {
-        throw std::runtime_error("Could not write to file " + path);
+        // A backend that rewrote guest code (the Vita's VFP thunks) puts the guest's own back: the
+        // state holds the title's code, and a load patches it again as it traps.
+        for (const auto& cpu_core : cpu_cores) {
+            cpu_core->PrepareSaveState();
+        }
+
+        // Serialize straight through the compressor into the file. The memory blocks are nearly all
+        // of it: the progress counts the bytes against them and a few megabytes of the rest.
+        const u64 expected = Memory::VRAM_SIZE + Memory::FCRAM_SIZE + Memory::DSP_RAM_SIZE +
+                             (IsNew3ds() ? Memory::N3DS_EXTRA_RAM_SIZE : 0u) + (4u << 20);
+        ZstdFileOStreamBuf zstd_buf{
+            file, [this, expected](u64 bytes) {
+                ReportStateProgress(
+                    StatePhase::Saving,
+                    std::min(0.99f, static_cast<float>(bytes) / static_cast<float>(expected)));
+            }};
+        std::ostream stream{&zstd_buf};
+        {
+            oarchive oa{stream};
+            oa&* this;
+        }
+        stream.flush();
+        if (!zstd_buf.Finish()) {
+            throw std::runtime_error("Could not write to file " + part);
+        }
+    };
+    try {
+        write();
+    } catch (...) {
+        file.Close();
+        FileUtil::Delete(part);
+        throw;
     }
 
     // A backend that rewrote guest code (the Vita's VFP thunks) puts the guest's own back: the
@@ -328,18 +372,11 @@ void System::SaveState(u32 slot) const {
 void System::AfterStateLoaded() {
     memory->RefreshMappingObserver();
 
-    for (u32 core_id = 0; core_id < static_cast<u32>(cpu_cores.size()); core_id++) {
-        auto& cpu_core = *cpu_cores[core_id];
-        cpu_core.ClearInstructionCache();
-
-        // Deserialization restores each thread's saved context but never puts the running one back
-        // into the CPU, because that normally happens on a context switch and a load is not one.
-        // Left alone the core keeps the register file it had before the load while the memory
-        // under it has been replaced wholesale, which a backend executing guest code directly does
-        // not survive.
-        if (Kernel::Thread* thread = kernel->GetThreadManager(core_id).GetCurrentThread()) {
-            cpu_core.LoadContext(thread->context);
-        }
+    // The running thread's registers come back with the core's own archive (ARM_Interface::load):
+    // its Thread::context is the one it was switched in with, older than the memory the state
+    // holds, and putting that back rewinds it. Upstream takes the core's registers too.
+    for (auto& cpu_core : cpu_cores) {
+        cpu_core->ClearInstructionCache();
     }
 }
 
@@ -392,7 +429,12 @@ void System::LoadState(u32 slot) {
         std::istream stream{&zstd_buf};
         iarchive ia{stream};
         LOG_INFO(Core, "savestate: archive open");
-        ia&* this;
+        try {
+            ia&* this;
+        } catch (...) {
+            state_load_partial = true;
+            throw;
+        }
     }
     LOG_INFO(Core, "savestate: deserialized");
 
@@ -429,6 +471,7 @@ std::vector<u8> System::SaveStateBuffer() const {
     std::memset(header.build_version.data(), 0, sizeof(header.build_version));
     std::memcpy(header.build_version.data(), build_version.c_str(),
                 std::min(build_version.length(), sizeof(header.build_version) - 1));
+    header.format = SaveStateFormat;
 
     std::vector<u8> result((u8*)&header, (u8*)&header + sizeof(header));
     std::copy(buffer.begin(), buffer.end(), std::back_inserter(result));

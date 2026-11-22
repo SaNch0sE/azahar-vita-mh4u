@@ -13,6 +13,7 @@
 #include <string>
 #include <boost/optional/optional.hpp>
 #include <boost/serialization/export.hpp>
+#include <boost/serialization/version.hpp>
 #include "common/bit_field.h"
 #include "common/common_types.h"
 #include "common/host_shared_memory.h"
@@ -654,3 +655,5 @@ BOOST_CLASS_EXPORT_KEY(Service::GSP::SessionData)
 BOOST_CLASS_EXPORT_KEY(Service::GSP::GSP_GPU)
 SERVICE_CONSTRUCT(Service::GSP::GSP_GPU)
 BOOST_CLASS_EXPORT_KEY(Service::GSP::GSP_GPU::ThreadCallback)
+BOOST_CLASS_VERSION(Service::GSP::GSP_GPU, 1)
+BOOST_CLASS_VERSION(Service::GSP::GSP_GPU::ThreadCallback, 1)

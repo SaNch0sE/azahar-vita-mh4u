@@ -397,6 +397,12 @@ public:
         load_state_any_build = accept;
     }
 
+    /// A load that failed partway through the archive: the state is part the old one, part the
+    /// file's, and the title cannot run on.
+    bool IsStateLoadPartial() const {
+        return state_load_partial;
+    }
+
     void SaveState(u32 slot) const;
 
     void LoadState(u32 slot);
@@ -541,6 +547,7 @@ private:
     SaveStateStatus save_state_status = SaveStateStatus::NONE;
     SaveStateStatus save_state_request_status = SaveStateStatus::NONE;
     bool load_state_any_build = false;
+    bool state_load_partial = false;
     u32 save_state_slot = 0;
     std::chrono::steady_clock::time_point save_state_request_time{};
 

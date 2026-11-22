@@ -645,6 +645,28 @@ if (VITA)
         IMPORTED_LOCATION "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub_weak.a"
         AZAHAR_NATIVE_MODULE "${VITA_NATIVE_MODULE}")
     target_link_libraries(citra_core PUBLIC azaharnative_stub)
+
+    # A savestate loads into any build of its format (savestate.h's SaveStateFormat): a change to
+    # the code that serializes the state stops the build until the format is raised or the change
+    # is recorded as compatible (tools/savestate_check.py).
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(SAVESTATE_CHECK_STAMP "${CMAKE_CURRENT_BINARY_DIR}/savestate_check.stamp")
+    file(GLOB_RECURSE SAVESTATE_CHECK_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/src/core/*.h" "${CMAKE_SOURCE_DIR}/src/core/*.cpp"
+        "${CMAKE_SOURCE_DIR}/src/core/*.inc" "${CMAKE_SOURCE_DIR}/src/video_core/*.h"
+        "${CMAKE_SOURCE_DIR}/src/video_core/*.cpp" "${CMAKE_SOURCE_DIR}/src/audio_core/*.h"
+        "${CMAKE_SOURCE_DIR}/src/audio_core/*.cpp" "${CMAKE_SOURCE_DIR}/src/common/*.h"
+        "${CMAKE_SOURCE_DIR}/src/common/*.hpp" "${CMAKE_SOURCE_DIR}/src/common/*.cpp"
+        "${CMAKE_SOURCE_DIR}/src/network/*.h" "${CMAKE_SOURCE_DIR}/src/network/*.cpp")
+    add_custom_command(
+        OUTPUT "${SAVESTATE_CHECK_STAMP}"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/savestate_check.py"
+            "${CMAKE_SOURCE_DIR}/src"
+        COMMAND ${CMAKE_COMMAND} -E touch "${SAVESTATE_CHECK_STAMP}"
+        DEPENDS ${SAVESTATE_CHECK_SOURCES} "${CMAKE_SOURCE_DIR}/tools/savestate_check.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/savestate_layout.txt"
+        COMMENT "Checking the savestate format against the serialized state")
+    target_sources(citra_core PRIVATE "${SAVESTATE_CHECK_STAMP}")
 endif()
 
 if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)

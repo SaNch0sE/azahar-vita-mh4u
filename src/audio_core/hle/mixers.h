@@ -6,6 +6,7 @@
 
 #include <array>
 #include <boost/serialization/array.hpp>
+#include <boost/serialization/version.hpp>
 #include "audio_core/audio_types.h"
 #include "audio_core/hle/shared_memory.h"
 
@@ -44,7 +45,7 @@ private:
         OutputFormat output_format = OutputFormat::Stereo;
 
         template <class Archive>
-        void serialize(Archive& ar, const unsigned int) {
+        void serialize(Archive& ar, const unsigned int file_version) {
             ar & intermediate_mixer_volume;
             ar & aux_bus_enable;
             ar & intermediate_mix_buffer;
@@ -80,3 +81,5 @@ private:
 };
 
 } // namespace AudioCore::HLE
+
+BOOST_CLASS_VERSION(AudioCore::HLE::Mixers::MixerState, 1)

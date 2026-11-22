@@ -10,6 +10,7 @@
 #include <boost/serialization/deque.hpp>
 #include <boost/serialization/priority_queue.hpp>
 #include <boost/serialization/vector.hpp>
+#include <boost/serialization/version.hpp>
 #include <queue>
 #include "audio_core/audio_types.h"
 #include "audio_core/codec.h"
@@ -170,7 +171,7 @@ private:
 
     private:
         template <class Archive>
-        void serialize(Archive& ar, const unsigned int) {
+        void serialize(Archive& ar, const unsigned int file_version) {
             ar & enabled;
             ar & sync_count;
             ar & gain;
@@ -217,3 +218,5 @@ private:
 };
 
 } // namespace AudioCore::HLE
+
+BOOST_CLASS_VERSION(AudioCore::HLE::Source::SourceState, 1)

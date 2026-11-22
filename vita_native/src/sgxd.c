@@ -1187,8 +1187,11 @@ int sgxdMapTables(uint32_t gpu_va) {
         goto out;
     }
     if ((ret = sgxd_owned_call()) == 0) {
-        if (!sgxd_mmu || sgxd_tables_va || (gpu_va & 0xfffu) ||
-            gpu_va + (SGXD_MMU_SIZE - 1) < gpu_va) {
+        if (sgxd_tables_va != 0 && sgxd_tables_va == gpu_va) {
+            // Mapped there already in this session: the app made its GPU again (a savestate's
+            // load tears the emulator's GPU down and builds it anew), the tables stay.
+        } else if (!sgxd_mmu || sgxd_tables_va || (gpu_va & 0xfffu) ||
+                   gpu_va + (SGXD_MMU_SIZE - 1) < gpu_va) {
             ret = AZAHAR_ERR_ARG;
         } else {
             unsigned need = 0;

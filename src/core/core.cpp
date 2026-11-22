@@ -551,6 +551,7 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
                                   Frontend::EmuWindow* secondary_window,
                                   Kernel::MemoryMode memory_mode, u32 num_cores) {
     LOG_DEBUG(HW_Memory, "initialized OK");
+    state_load_partial = false;
 
     memory = std::make_unique<Memory::MemorySystem>(*this);
 
@@ -1080,6 +1081,11 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     if (Archive::is_loading::value) {
         u32 cheats_pid;
         ar & cheats_pid;
+        // A state saved with the engine connected to no process (cheats were off on the Vita
+        // build) names none: the running title's, as the boot connects it.
+        if (!kernel->GetProcessById(cheats_pid) && kernel->GetCurrentProcess()) {
+            cheats_pid = kernel->GetCurrentProcess()->process_id;
+        }
         timing->UnlockEventQueue();
         cheat_engine.Connect(cheats_pid);
 

@@ -290,6 +290,117 @@ bool TakeRenderCounters(Core::System& system, RenderCounters& out) {
 
 /// Runs one title to completion. Returns false when the user wants the application to close
 /// rather than to return to the game list.
+/**
+ */
+struct StateArguments {
+    int load = -1;
+    int save = -1;
+    SceUInt64 save_after_us = 0;
+    /// `commands`: host0:azahar-commands.txt is read once a second (CommandFile).
+    bool commands = false;
+};
+
+StateArguments TakeStateArguments() {
+    static bool taken = false;
+    StateArguments a;
+    if (taken) {
+        return a;
+    }
+    taken = true;
+    for (std::size_t i = 1; i < g_arguments.size(); i++) {
+        const std::string& argument = g_arguments[i];
+        if (argument.starts_with("load=")) {
+            a.load = std::atoi(argument.c_str() + 5);
+        } else if (argument == "commands") {
+            a.commands = true;
+        } else if (argument.starts_with("save=")) {
+            a.save = std::atoi(argument.c_str() + 5);
+            if (const std::size_t at = argument.find('@'); at != std::string::npos) {
+                a.save_after_us = std::strtoull(argument.c_str() + at + 1, nullptr, 10) * 1000000;
+            }
+        } else {
+            sceClibPrintf("[azahar] launch argument %s not known\n", argument.c_str());
+        }
+    }
+    return a;
+}
+
+/**
+ * The command channel (the `commands` launch argument): host0:azahar-commands.txt,
+ */
+class CommandFile {
+public:
+    std::string Poll() {
+        const SceUInt64 now = sceKernelGetProcessTimeWide();
+        if (now - last_read_us < 1000000) {
+            return {};
+        }
+        last_read_us = now;
+        FILE* f = std::fopen("host0:azahar-commands.txt", "rb");
+        if (f == nullptr) {
+            return {};
+        }
+        char line[128];
+        std::string due;
+        while (due.empty() && std::fgets(line, sizeof(line), f) != nullptr) {
+            char* rest = nullptr;
+            const unsigned long seq = std::strtoul(line, &rest, 10);
+            if (rest == line || seq <= last_seq) {
+                continue;
+            }
+            last_seq = seq;
+            due = rest;
+            due.erase(0, due.find_first_not_of(' '));
+            due.erase(due.find_last_not_of(" \r\n") + 1);
+        }
+        std::fclose(f);
+        return due;
+    }
+
+private:
+    SceUInt64 last_read_us = 0;
+    unsigned long last_seq = 0;
+};
+
+/**
+ * Restores a savestate slot before the title runs. The signal executes at a quiescent point
+ * inside RunLoop, so it gets a few slices. A state from another build is taken: the archive
+ * layout is what has to match, not the revision (a scene saved once is loaded into the builds
+ * after it).
+ */
+void RestoreStateAtStart(Core::System& system, u32 slot) {
+    system.SetLoadStateAnyBuild(true);
+    if (!system.SendSignal(Core::System::Signal::Load, slot)) {
+        sceClibPrintf("[azahar] savestate: could not queue a load of slot %u\n", slot);
+        return;
+    }
+    sceClibPrintf("[azahar] savestate: restoring slot %u\n", slot);
+    // The load runs inside RunLoop once the kernel has no asynchronous HLE request in flight; at
+    // this point in the boot that is immediate. Requests run inline while the load is pending so a
+    // title that streams from its ROM cannot keep one in flight, and a failed load is reported
+    // rather than played over.
+    const bool async_before = Settings::values.deterministic_async_operations.GetValue();
+    Settings::values.deterministic_async_operations = true;
+    // The signal becomes a pending request inside the first RunLoop, so the loop always runs
+    // at least once.
+    for (int i = 0; i < 200000; i++) {
+        const auto status = system.RunLoop();
+        if (status != Core::System::ResultStatus::Success) {
+            sceClibPrintf("[azahar] savestate: load of slot %u failed: %d (%s)\n", slot,
+                          static_cast<int>(status), system.GetStatusDetails().c_str());
+            break;
+        }
+        if (!system.IsSaveStateRequestPending()) {
+            sceClibPrintf("[azahar] savestate: slot %u restored\n", slot);
+            break;
+        }
+    }
+    Settings::values.deterministic_async_operations = async_before;
+    if (system.IsSaveStateRequestPending()) {
+        sceClibPrintf("[azahar] savestate: slot %u never became loadable\n", slot);
+    }
+}
+
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
               const std::string& path) {
     window.UpdateCurrentFramebufferLayout();
@@ -312,6 +423,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         return true;
     }
     ui.ClearStatusMessage();
+    StateArguments state_arguments = TakeStateArguments();
 
 #ifdef VITA_DIAGNOSTICS
     SgxdRenderer::Vprof::Info("rom", path.c_str());
@@ -319,48 +431,30 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         SgxdRenderer::Vprof::Info("guest_name", process->codeset->GetName().c_str());
     }
 
-    // ux0:data/azahar/autoload.txt names a savestate slot to restore before the title runs.
-    // The signal executes at a quiescent point inside RunLoop, so it gets a few slices.
-    // States are the same boost archive on every 32-bit build, so a state the pi5 harness
-    // saved in a fight, a results screen or a level lands here without the menus.
-    if (FILE* f = std::fopen("ux0:data/azahar/autoload.txt", "rb")) {
-        char buf[16]{};
-        std::fread(buf, 1, sizeof(buf) - 1, f);
-        std::fclose(f);
-        const int slot = std::atoi(buf);
-        // The states come from the pi5 harness, saved at whatever commit it was built from;
-        // the archive layout is what has to match, not the revision.
-        system.SetLoadStateAnyBuild(true);
-        if (slot >= 0 && system.SendSignal(Core::System::Signal::Load, static_cast<u32>(slot))) {
-            LOG_INFO(Frontend, "autoload.txt: restoring savestate slot {}", slot);
-            // The load runs inside RunLoop once the kernel has no asynchronous HLE request in
-            // flight; at this point in the boot that is immediate. Requests are run inline
-            // while the load is pending so a title that streams from its ROM (Smash) cannot
-            // keep one in flight, and a failed load is reported rather than played over.
-            const bool async_before = Settings::values.deterministic_async_operations.GetValue();
-            Settings::values.deterministic_async_operations = true;
-            // The signal becomes a pending request inside the first RunLoop, so the loop
-            // always runs at least once (a pending-only condition ran zero times).
-            for (int i = 0; i < 200000; i++) {
-                const auto status = system.RunLoop();
-                if (status != Core::System::ResultStatus::Success) {
-                    LOG_ERROR(Frontend, "autoload.txt: load of slot {} failed: {} ({})", slot,
-                              static_cast<int>(status), system.GetStatusDetails());
-                    break;
-                }
-                if (!system.IsSaveStateRequestPending()) {
-                    break;
-                }
-            }
-            Settings::values.deterministic_async_operations = async_before;
-            if (system.IsSaveStateRequestPending()) {
-                LOG_WARNING(Frontend, "autoload.txt: slot {} never became loadable", slot);
-            }
-        } else {
-            LOG_WARNING(Frontend, "autoload.txt: could not queue a load of slot {}", slot);
+    // ux0:data/azahar/autoload.txt names a savestate slot to restore before the title runs,
+    // when the launch arguments name none.
+    if (state_arguments.load < 0) {
+        if (FILE* f = std::fopen("ux0:data/azahar/autoload.txt", "rb")) {
+            char buf[16]{};
+            std::fread(buf, 1, sizeof(buf) - 1, f);
+            std::fclose(f);
+            state_arguments.load = std::atoi(buf);
         }
     }
 #endif
+    if (state_arguments.load >= 0) {
+        RestoreStateAtStart(system, static_cast<u32>(state_arguments.load));
+        if (system.IsStateLoadPartial()) {
+            sceClibPrintf("[azahar] savestate: the load stopped partway; the title is stopped\n");
+            window.RequestQuit(false);
+        }
+    }
+    // `save=N@T`: once the title has run T seconds (real time, from here).
+    const SceUInt64 title_start_us = sceKernelGetProcessTimeWide();
+    bool state_save_sent = false;
+    // A save or load sent (the argument's or the menu's) whose result is still to print.
+    bool state_watch = false;
+    CommandFile commands;
 
     ui.EnterGame();
     window.SetUi(&ui);
@@ -381,17 +475,59 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             ShutdownSystem(system);
             return action == VitaFrontend::Ui::Action::QuitGame;
         case VitaFrontend::Ui::Action::SaveState:
-            system.SendSignal(Core::System::Signal::Save, ui.SelectedSlot());
+            state_watch = system.SendSignal(Core::System::Signal::Save, ui.SelectedSlot());
+            sceClibPrintf("[azahar] savestate: saving slot %u from the menu\n", ui.SelectedSlot());
             break;
         case VitaFrontend::Ui::Action::LoadState:
-            system.SendSignal(Core::System::Signal::Load, ui.SelectedSlot());
+            state_watch = system.SendSignal(Core::System::Signal::Load, ui.SelectedSlot());
+            sceClibPrintf("[azahar] savestate: loading slot %u from the menu\n", ui.SelectedSlot());
             break;
         default:
             break;
         }
 
+        if (state_arguments.save >= 0 && !state_save_sent &&
+            sceKernelGetProcessTimeWide() - title_start_us >= state_arguments.save_after_us) {
+            state_save_sent = true;
+            state_watch = system.SendSignal(Core::System::Signal::Save,
+                                            static_cast<u32>(state_arguments.save));
+            sceClibPrintf("[azahar] savestate: saving slot %d %s\n", state_arguments.save,
+                          state_watch ? "queued" : "refused");
+        }
+        if (state_arguments.commands) {
+            if (const std::string command = commands.Poll(); !command.empty()) {
+                int slot = -1;
+                const bool save = std::sscanf(command.c_str(), "save %d", &slot) == 1;
+                const bool load = !save && std::sscanf(command.c_str(), "load %d", &slot) == 1;
+                if ((save || load) && slot >= 0) {
+                    system.SetLoadStateAnyBuild(true);
+                    state_watch = system.SendSignal(save ? Core::System::Signal::Save
+                                                         : Core::System::Signal::Load,
+                                                    static_cast<u32>(slot));
+                    sceClibPrintf("[azahar] savestate: %s slot %d (command) %s\n",
+                                  save ? "saving" : "loading", slot,
+                                  state_watch ? "queued" : "refused");
+                } else {
+                    sceClibPrintf("[azahar] command \"%s\" not known\n", command.c_str());
+                }
+            }
+        }
         const auto status = system.RunLoop();
-        if (status == Core::System::ResultStatus::ErrorSavestate) {
+        // The signal becomes a request inside RunLoop, which runs it once no HLE request is
+        // in flight: the same call or a later one.
+        if (state_watch && !system.IsSaveStateRequestPending()) {
+            state_watch = false;
+            const bool ok = status == Core::System::ResultStatus::Success;
+            sceClibPrintf("[azahar] savestate: %s%s\n",
+                          ok ? "done" : "failed: ", ok ? "" : system.GetStatusDetails().c_str());
+        }
+        if (status == Core::System::ResultStatus::ErrorSavestate && system.IsStateLoadPartial()) {
+            // A load that failed partway through the file left a state the title cannot run on
+            // (part the old one, part the file's): back to the game list.
+            sceClibPrintf("[azahar] savestate: the load stopped partway; the title is stopped\n");
+            LOG_CRITICAL(Frontend, "Savestate load stopped partway: {}", system.GetStatusDetails());
+            window.RequestQuit(false);
+        } else if (status == Core::System::ResultStatus::ErrorSavestate) {
             // A refused save or load is not fatal; the title keeps running.
             LOG_ERROR(Frontend, "Savestate operation failed");
         } else if (status != Core::System::ResultStatus::Success) {
@@ -865,19 +1001,26 @@ bool module_installed(const std::string& name) {
     return _vshKernelSearchModuleByName(name.c_str(), search_unk) >= 0;
 }
 
+int AppMgrOptionValues(std::string_view option);
+
 /**
- * Finds the marker LoadAzaharNative's restart carries. The argument after it, when there is
- * one, is the launch parameter the first process was started with, which the restart would
- * otherwise lose. The scan starts at argv[0] because nothing says whether the restarted
- * process gets its own path there.
+ * Finds the marker LoadAzaharNative's restart carries. The arguments after it, when there are
+ * any, are the launch parameter the first process was started with and the ones after it
+ * (load=N, save=N@T), which the restart would otherwise lose; SceAppMgr's options among them
+ * are skipped as main does. The scan starts at argv[0] because nothing says whether the
+ * restarted process gets its own path there.
  */
 bool TakeRelaunchArguments(int argc, char* argv[]) {
     for (int i = 0; i < argc; ++i) {
         if (argv[i] == nullptr || std::strcmp(argv[i], RelaunchArgument) != 0) {
             continue;
         }
-        if (i + 1 < argc && argv[i + 1] != nullptr && argv[i + 1][0] != '\0') {
-            g_arguments.emplace_back(argv[i + 1]);
+        for (int j = i + 1; j < argc && argv[j] != nullptr && argv[j][0] != '\0'; ++j) {
+            if (argv[j][0] == '-') {
+                j += AppMgrOptionValues(argv[j]);
+                continue;
+            }
+            g_arguments.emplace_back(argv[j]);
         }
         return true;
     }
@@ -965,10 +1108,20 @@ std::string LoadAzaharNative(bool relaunched) {
         return "azaharnative.skprx was loaded twice without the restarted app seeing it.";
     }
 
+    // The restart carries the launch parameter and the arguments after it (load=N, save=N@T).
     std::string marker{RelaunchArgument};
-    std::string launch = LaunchParameter();
-    char* const args[] = {marker.data(), launch.empty() ? nullptr : launch.data(), nullptr};
-    const int exec = sceAppMgrLoadExec("app0:eboot.bin", args, nullptr);
+    std::vector<std::string> carried = g_arguments;
+    if (carried.empty()) {
+        if (std::string launch = LaunchParameter(); !launch.empty()) {
+            carried.push_back(std::move(launch));
+        }
+    }
+    std::vector<char*> args{marker.data()};
+    for (std::string& argument : carried) {
+        args.push_back(argument.data());
+    }
+    args.push_back(nullptr);
+    const int exec = sceAppMgrLoadExec("app0:eboot.bin", args.data(), nullptr);
     if (exec >= 0) {
         // The call returns once the restart is queued, and the system ends this process soon
         // after. Wait for that rather than start an emulator whose calls are not bound.

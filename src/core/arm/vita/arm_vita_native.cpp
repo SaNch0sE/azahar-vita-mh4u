@@ -511,9 +511,9 @@ void FinishVfpThunk(Memory::MemorySystem& memory, AzaharContext& c) {
 VitaGuestMap::VitaGuestMap(Memory::MemorySystem& memory_) : memory{memory_} {}
 
 VitaGuestMap::~VitaGuestMap() {
-    if (installed) {
-        azaharRelease();
-    }
+    // The module takes a release from a core taken but never mapped (a state loaded before the
+    // guest's first slice).
+    azaharRelease();
     ForgetVfpPatches(this);
 }
 
