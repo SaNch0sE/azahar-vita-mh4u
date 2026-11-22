@@ -15,6 +15,7 @@
 #include "utility"
 
 #include "artic_base_common.h"
+#include "common/mutex.h"
 #include "network/socket_manager.h"
 
 #ifdef _WIN32
@@ -103,14 +104,14 @@ public:
         std::array<u8, 16> serv_sockaddr_in{};
         bool ready = false;
 
-        std::mutex current_buffer_mutex;
+        Common::Mutex current_buffer_mutex;
         std::vector<u8> current_buffer;
 
         SocketHolder main_socket = -1;
 
         std::thread handle_thread;
-        std::condition_variable thread_cv;
-        std::mutex thread_cv_mutex;
+        Common::ConditionVariable thread_cv;
+        Common::Mutex thread_cv_mutex;
         std::atomic<bool> thread_run = true;
     };
     friend class UDPStream;
@@ -187,14 +188,14 @@ private:
 
     size_t max_server_work_ram = 0;
     size_t max_parameter_count = 0;
-    std::mutex send_mutex;
+    Common::Mutex send_mutex;
 
     std::atomic<bool> stopped = false;
 
     std::atomic<std::chrono::time_point<std::chrono::steady_clock>> last_sent_request;
     std::thread ping_thread;
-    std::condition_variable ping_cv;
-    std::mutex ping_cv_mutex;
+    Common::ConditionVariable ping_cv;
+    Common::Mutex ping_cv_mutex;
     std::atomic<bool> ping_run = true;
     bool ping_enabled = true;
 
@@ -352,15 +353,15 @@ private:
         friend class Client;
         friend class Client::Handler;
         PendingResponse(const Request& req) : request(req) {}
-        std::condition_variable cv;
-        std::mutex cv_mutex;
+        Common::ConditionVariable cv;
+        Common::Mutex cv_mutex;
 
         const Request& request;
 
         Response response{};
     };
 
-    std::mutex recv_map_mutex;
+    Common::Mutex recv_map_mutex;
     std::map<u32, PendingResponse*> pending_responses;
 
     std::vector<Handler*> handlers;

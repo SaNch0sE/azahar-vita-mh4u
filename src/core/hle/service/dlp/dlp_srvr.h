@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "common/mutex.h"
 #include "common/timer.h"
 #include "core/hle/service/service.h"
 #include "dlp_base.h"
@@ -37,7 +38,7 @@ public:
 private:
     std::shared_ptr<FS::FS_USER> GetFS();
 
-    std::recursive_mutex srvr_state_mutex;
+    Common::RecursiveMutex srvr_state_mutex;
     DLP_Srvr_State srvr_state = DLP_Srvr_State::NotInitialized;
     u8 max_clients;
     std::vector<u8> distribution_content;
@@ -46,7 +47,7 @@ private:
     constexpr static inline u32 dlp_poll_rate_distribute = 1;
     const u16 broadcast_node_id = 0xFFFF;
     bool is_broadcasting;
-    std::mutex broadcast_mutex;
+    Common::Mutex broadcast_mutex;
     const std::array<u8, 3> default_resp_id{};
     Network::MacAddress host_mac_address;
 
@@ -150,7 +151,7 @@ private:
     };
 
     std::vector<ClientState> client_states;
-    std::recursive_mutex client_states_mutex;
+    Common::RecursiveMutex client_states_mutex;
 
     ClientState* GetClState(u8 node_id, bool should_error = true);
 

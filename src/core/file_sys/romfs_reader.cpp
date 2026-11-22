@@ -8,6 +8,11 @@
 #include <cryptopp/modes.h>
 #include "common/archives.h"
 #include "common/logging/log.h"
+#include "common/mutex.h"
+#include "common/process_clock.h"
+#ifdef VITA_DIAGNOSTICS
+#include <atomic>
+#endif
 #include "core/file_sys/archive_artic.h"
 #include "core/file_sys/archive_backend.h"
 #include "core/file_sys/romfs_reader.h"
@@ -114,7 +119,7 @@ bool DirectRomFSReader::CacheReady(std::size_t file_offset, std::size_t length) 
         // data being in cache to prevent the need of a lock, and only read data
         // asynchronously if it is too big to use the cache.
         /*
-        std::shared_lock<std::shared_mutex> read_guard(cache_mutex);
+        std::shared_lock<Common::SharedMutex> read_guard(cache_mutex);
         for (auto it = segments.begin(); it != segments.end(); it++) {
             if (!cache.contains(OffsetToPage(it->first)))
                 return false;

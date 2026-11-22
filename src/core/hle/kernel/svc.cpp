@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <iterator>
+#include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 #include "common/archives.h"
 #include "common/logging/log.h"
@@ -766,6 +768,14 @@ private:
     friend class boost::serialization::access;
 };
 
+/// A wait's wakeup callback. It holds nothing but whether to write the signalled index, so the
+/// waits share two instead of allocating one each (an allocation and a free per wait).
+static std::shared_ptr<SVC_SyncCallback> SyncCallback(bool do_output) {
+    static const auto with_output = std::make_shared<SVC_SyncCallback>(true);
+    static const auto without_output = std::make_shared<SVC_SyncCallback>(false);
+    return do_output ? with_output : without_output;
+}
+
 class SVC_IPCCallback : public Kernel::WakeupCallback {
 public:
     explicit SVC_IPCCallback(Core::System& system_) : system(system_) {}
@@ -818,7 +828,7 @@ Result SVC::WaitSynchronization1(Handle handle, s64 nano_seconds) {
         // Create an event to wake the thread up after the specified nanosecond delay has passed
         thread->WakeAfterDelay(nano_seconds);
 
-        thread->wakeup_callback = std::make_shared<SVC_SyncCallback>(false);
+        thread->wakeup_callback = SyncCallback(false);
 
         system.PrepareReschedule();
 
@@ -846,8 +856,10 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
     // Check if 'handle_count' is invalid
     R_UNLESS(handle_count >= 0, ResultOutOfRange);
 
+    // On the stack for the usual few handles: most calls find an object ready and never wait, and
+    // a wait moves the objects into the thread's own list, whose capacity stays between waits.
     using ObjectPtr = std::shared_ptr<WaitObject>;
-    std::vector<ObjectPtr> objects(handle_count);
+    boost::container::small_vector<ObjectPtr, 8> objects(handle_count);
 
     for (int i = 0; i < handle_count; ++i) {
         Handle handle = memory.Read32(handles_address + i * sizeof(Handle));
@@ -883,12 +895,13 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
             object->AddWaitingThread(SharedFrom(thread));
         }
 
-        thread->wait_objects = std::move(objects);
+        thread->wait_objects.assign(std::make_move_iterator(objects.begin()),
+                                    std::make_move_iterator(objects.end()));
 
         // Create an event to wake the thread up after the specified nanosecond delay has passed
         thread->WakeAfterDelay(nano_seconds);
 
-        thread->wakeup_callback = std::make_shared<SVC_SyncCallback>(false);
+        thread->wakeup_callback = SyncCallback(false);
 
         system.PrepareReschedule();
 
@@ -926,7 +939,8 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
             object->AddWaitingThread(SharedFrom(thread));
         }
 
-        thread->wait_objects = std::move(objects);
+        thread->wait_objects.assign(std::make_move_iterator(objects.begin()),
+                                    std::make_move_iterator(objects.end()));
 
         // Note: If no handles and no timeout were given, then the thread will deadlock, this is
         // consistent with hardware behavior.
@@ -934,7 +948,7 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
         // Create an event to wake the thread up after the specified nanosecond delay has passed
         thread->WakeAfterDelay(nano_seconds);
 
-        thread->wakeup_callback = std::make_shared<SVC_SyncCallback>(true);
+        thread->wakeup_callback = SyncCallback(true);
 
         system.PrepareReschedule();
 

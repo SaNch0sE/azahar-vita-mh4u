@@ -5,6 +5,7 @@
 #include "artic_base_client.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/mutex.h"
 #include "common/thread.h"
 
 #include "algorithm"
@@ -652,7 +653,7 @@ std::optional<ArticBaseCommon::DataPacket> Client::SendRequestPacket(
     const ArticBaseCommon::RequestPacket& req, bool expect_response,
     const std::vector<ArticBaseCommon::RequestParameter>& params,
     const std::chrono::nanoseconds& read_timeout) {
-    std::scoped_lock<std::mutex> l(send_mutex);
+    std::scoped_lock<Common::Mutex> l(send_mutex);
 
     if (main_socket == static_cast<SocketHolder>(-1)) {
         return std::nullopt;
@@ -847,7 +848,7 @@ void Client::Handler::RunLoop() {
         }
 
         {
-            std::scoped_lock<std::mutex> lk(pending_response->cv_mutex);
+            std::scoped_lock<Common::Mutex> lk(pending_response->cv_mutex);
             pending_response->is_done = true;
             pending_response->cv.notify_one();
         }

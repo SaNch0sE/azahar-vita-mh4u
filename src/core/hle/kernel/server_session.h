@@ -22,6 +22,7 @@ class ClientSession;
 class ClientPort;
 class ServerSession;
 class Session;
+class HLERequestContext;
 class SessionRequestHandler;
 class Thread;
 
@@ -91,6 +92,10 @@ public:
 
     /// A temporary list holding mapped buffer info from IPC request, used for during IPC reply
     std::vector<MappedBufferContext> mapped_buffer_context;
+
+    /// The last HLE request's context, kept for the next when nothing else held it (an allocation
+    /// of the context and its buffers per request otherwise). Parked: no session, no thread.
+    std::shared_ptr<HLERequestContext> spare_context;
 
 private:
     /**

@@ -8,6 +8,7 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include "common/mutex.h"
 #include "common/settings.h"
 #include "common/threadsafe_queue.h"
 #include "input_common/sdl/sdl_joystick.h"
@@ -62,7 +63,7 @@ private:
     // This vector keeps a list of all joysticks, ignoring guid
     std::shared_ptr<std::vector<std::shared_ptr<SDLJoystick>>> joystick_vector =
         std::make_shared<std::vector<std::shared_ptr<SDLJoystick>>>();
-    std::mutex joystick_map_mutex;
+    Common::Mutex joystick_map_mutex;
 
     std::shared_ptr<SDLTouchFactory> touch_factory;
     std::shared_ptr<SDLButtonFactory> button_factory;

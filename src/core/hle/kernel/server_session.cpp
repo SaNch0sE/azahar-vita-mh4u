@@ -90,8 +90,13 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
         kernel.memory.ReadBlock(*current_process, thread->GetCommandBufferAddress(), cmd_buf.data(),
                                 cmd_buf.size() * sizeof(u32));
 
-        auto context =
-            std::make_shared<Kernel::HLERequestContext>(kernel, SharedFrom(this), thread);
+        std::shared_ptr<Kernel::HLERequestContext> context;
+        if (spare_context != nullptr) {
+            context = std::move(spare_context);
+            context->Reset(SharedFrom(this), thread);
+        } else {
+            context = std::make_shared<Kernel::HLERequestContext>(kernel, SharedFrom(this), thread);
+        }
         context->PopulateFromIncomingCommandBuffer(cmd_buf.data(), current_process);
 
         hle_handler->HandleSyncRequest(*context);
@@ -105,6 +110,11 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
             context->WriteToOutgoingCommandBuffer(cmd_buf.data(), *current_process);
             kernel.memory.WriteBlock(*current_process, thread->GetCommandBufferAddress(),
                                      cmd_buf.data(), cmd_buf.size() * sizeof(u32));
+        }
+        // A sleeping thread's wakeup callback holds the context until it answers.
+        if (context.use_count() == 1) {
+            context->Reset(nullptr, nullptr);
+            spare_context = std::move(context);
         }
     }
 

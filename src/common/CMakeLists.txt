@@ -62,6 +62,8 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     named_thread.h
     memory_detect.h
     memory_ref.h
+    mutex.cpp
+    mutex.h
     memory_ref.cpp
     microprofile.cpp
     microprofile.h

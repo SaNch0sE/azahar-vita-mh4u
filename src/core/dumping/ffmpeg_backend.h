@@ -14,6 +14,7 @@
 #include <vector>
 #include "common/common_types.h"
 #include "common/dynamic_library/ffmpeg.h"
+#include "common/mutex.h"
 #include "common/thread.h"
 #include "common/threadsafe_queue.h"
 #include "core/dumping/backend.h"
@@ -63,7 +64,7 @@ protected:
     };
 
     AVFormatContext* format_context{};
-    std::mutex* format_context_mutex{};
+    Common::Mutex* format_context_mutex{};
     std::unique_ptr<AVCodecContext, AVCodecContextDeleter> codec_context{};
     AVStream* stream{};
 };
@@ -174,7 +175,7 @@ private:
     FFmpegAudioStream audio_stream{};
     FFmpegVideoStream video_stream{};
     std::unique_ptr<AVFormatContext, AVFormatContextDeleter> format_context{};
-    std::mutex format_context_mutex;
+    Common::Mutex format_context_mutex;
 
     friend class FFmpegStream;
 };

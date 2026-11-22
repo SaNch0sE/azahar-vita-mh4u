@@ -34,6 +34,7 @@
 #include <boost/serialization/wrapper.hpp>
 #include "common/common_types.h"
 #ifdef _MSC_VER
+#include "common/mutex.h"
 #include "common/string_util.h"
 #endif
 #if defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
@@ -657,7 +658,7 @@ private:
     // concurrent fread/fwrite. Libretro VFS has no pread equivalent, so
     // ReadAtImpl emulates it with seek+read+seek, which would corrupt the
     // file position for concurrent Read/Write operations.
-    mutable std::mutex m_file_pos_mutex;
+    mutable Common::Mutex m_file_pos_mutex;
 #endif
 
     std::string filename;

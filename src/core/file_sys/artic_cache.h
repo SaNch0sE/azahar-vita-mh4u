@@ -13,6 +13,7 @@
 #include <boost/serialization/export.hpp>
 #include "common/alignment.h"
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "common/static_lru_cache.h"
 #include "core/file_sys/archive_backend.h"
 #include "core/hle/result.h"
@@ -58,7 +59,7 @@ private:
     static constexpr std::size_t very_big_cache_lines = 24;
 
     Common::StaticLRUCache<std::size_t, std::array<u8, cache_line_size>, cache_line_count> cache;
-    std::shared_mutex cache_mutex;
+    Common::SharedMutex cache_mutex;
 
     struct NoInitChar {
         u8 value;
@@ -70,11 +71,11 @@ private:
     Common::StaticLRUCache<std::pair<std::size_t, std::size_t>, std::vector<NoInitChar>,
                            big_cache_lines>
         big_cache;
-    std::shared_mutex big_cache_mutex;
+    Common::SharedMutex big_cache_mutex;
     Common::StaticLRUCache<std::pair<std::size_t, std::size_t>, std::vector<NoInitChar>,
                            very_big_cache_lines>
         very_big_cache;
-    std::shared_mutex very_big_cache_mutex;
+    Common::SharedMutex very_big_cache_mutex;
 
     ResultVal<std::size_t> ReadFromArtic(s32 file_handle, u8* buffer, size_t len, size_t offset);
 

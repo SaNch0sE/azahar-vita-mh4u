@@ -11,6 +11,7 @@
 #include <mutex>
 #include "common/bit_field.h"
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "common/process_clock.h"
 #include "common/thread.h"
 
@@ -127,7 +128,7 @@ public:
     static bool game_frames_updated;
 
 private:
-    mutable std::mutex object_mutex;
+    mutable Common::Mutex object_mutex;
 
     /// Title ID for the game that is running. 0 if there is no game running yet
     u64 title_id{0};

@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 #include "common/common_types.h"
+#include "common/mutex.h"
 
 namespace Kernel {
 class ClientSession;
@@ -123,7 +124,7 @@ private:
     std::atomic_bool enabled{false};
 
     std::set<CallbackHandle> callbacks;
-    mutable std::shared_mutex callback_mutex;
+    mutable Common::SharedMutex callback_mutex;
 };
 
 } // namespace IPCDebugger

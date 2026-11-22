@@ -8,6 +8,7 @@
 #include <thread>
 #include <tuple>
 #include "common/math_util.h"
+#include "common/mutex.h"
 #include "common/quaternion.h"
 #include "common/thread.h"
 #include "common/vector_math.h"
@@ -69,7 +70,7 @@ private:
 
     Common::Vec2<int> mouse_origin;
 
-    std::mutex tilt_mutex;
+    Common::Mutex tilt_mutex;
     Common::Vec2<float> tilt_direction;
     float tilt_angle = 0;
     float tilt_clamp = 90;
@@ -79,7 +80,7 @@ private:
     Common::Event shutdown_event;
 
     std::tuple<Common::Vec3<float>, Common::Vec3<float>> status;
-    std::mutex status_mutex;
+    Common::Mutex status_mutex;
 
     // Note: always keep the thread declaration at the end so that other objects are initialized
     // before this!

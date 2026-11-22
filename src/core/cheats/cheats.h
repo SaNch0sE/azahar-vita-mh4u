@@ -10,6 +10,7 @@
 #include <span>
 #include <vector>
 #include "common/common_types.h"
+#include "common/mutex.h"
 
 namespace Core {
 class System;
@@ -64,6 +65,6 @@ private:
     std::optional<u64> loaded_title_id;
     u32 process_id = 0xFFFFFFFF;
     std::vector<std::shared_ptr<CheatBase>> cheats_list;
-    mutable std::shared_mutex cheats_list_mutex;
+    mutable Common::SharedMutex cheats_list_mutex;
 };
 } // namespace Cheats

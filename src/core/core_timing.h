@@ -94,7 +94,26 @@ constexpr s64 nsToCycles(int ns) {
     return BASE_CLOCK_RATE_ARM11 * static_cast<s64>(ns) / 1000000000;
 }
 
+/// nsToCycles for 0 <= ns < 2^32 (4.29 s) without a division: a 64-bit one is a library call on
+/// ARM32 (__aeabi_ldivmod), and each HLE SleepThread converts its delay. The 32.32 reciprocal
+/// comes out at most one short of BASE_CLOCK_RATE_ARM11 * ns / 1e9, which the remainder settles:
+/// the same cycles as the division.
+constexpr s64 nsToCyclesBelow2p32(u64 ns) {
+    constexpr u64 CyclesPerNsQ32 = (BASE_CLOCK_RATE_ARM11 << 32) / 1000000000;
+    u64 cycles = (ns * CyclesPerNsQ32) >> 32;
+    if (BASE_CLOCK_RATE_ARM11 * ns - cycles * 1000000000 >= 1000000000) {
+        cycles++;
+    }
+    return static_cast<s64>(cycles);
+}
+static_assert(nsToCyclesBelow2p32(999'999'999) == BASE_CLOCK_RATE_ARM11 * 999'999'999 / 1000000000);
+static_assert(nsToCyclesBelow2p32(0xFFFFFFFF) ==
+              BASE_CLOCK_RATE_ARM11 * 0xFFFFFFFFull / 1000000000);
+
 inline s64 nsToCycles(s64 ns) {
+    if (ns >= 0 && ns <= 0xFFFFFFFF) {
+        return nsToCyclesBelow2p32(static_cast<u64>(ns));
+    }
     if (ns / 1000000000 > static_cast<s64>(MAX_VALUE_TO_MULTIPLY)) {
         LOG_ERROR(Core_Timing, "Integer overflow, use max value");
         return std::numeric_limits<s64>::max();
@@ -107,6 +126,9 @@ inline s64 nsToCycles(s64 ns) {
 }
 
 inline s64 nsToCycles(u64 ns) {
+    if (ns <= 0xFFFFFFFF) {
+        return nsToCyclesBelow2p32(ns);
+    }
     if (ns / 1000000000 > MAX_VALUE_TO_MULTIPLY) {
         LOG_ERROR(Core_Timing, "Integer overflow, use max value");
         return std::numeric_limits<s64>::max();
@@ -272,6 +294,15 @@ public:
             ar & downcount;
             ar & executed_ticks;
             ar & idled_cycles;
+            if (Archive::is_loading::value) {
+                // Saved between slices, mid-slice: its time includes the slice's run part
+                // (GetTicks). A new timer counts as sane, which left that part out until the
+                // next Advance, and RunLoop's catch-up of the cores counted it twice. The second
+                // emulation thread's idle core 1 is caught up in one slice of everything core 0
+                // ran (Chibi-Robo's ~80e9 ticks), so after a load core 1 was that far ahead: the
+                // speed read 0% (the most advanced timer's) until core 0 had run it again.
+                is_timer_sane = false;
+            }
         }
         friend class boost::serialization::access;
     };
@@ -327,6 +358,9 @@ private:
 
     std::vector<std::shared_ptr<Timer>> timers;
     Timer* current_timer = nullptr;
+    /// The CPU clock in percent (UpdateClockSpeed): a state's timers are new ones, at 100% until
+    /// it is applied to them again.
+    u32 clock_percentage = 100;
 
     // When true, the event queue can't be modified. Used while deserializing to workaround
     // destructor side effects.
@@ -339,6 +373,7 @@ private:
         ar & current_timer;
         if (Archive::is_loading::value) {
             event_queue_locked = true;
+            UpdateClockSpeed(clock_percentage);
         }
     }
     friend class boost::serialization::access;

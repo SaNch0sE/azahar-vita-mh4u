@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "common/polyfill_thread.h"
 
 namespace Common {
@@ -62,8 +63,8 @@ public:
     }
 
 private:
-    std::condition_variable condvar;
-    std::mutex mutex;
+    Common::ConditionVariable condvar;
+    Common::Mutex mutex;
     std::atomic_bool is_set{false};
 };
 
@@ -95,8 +96,8 @@ private:
     alignas(8) std::array<u8, 0x20> lw_mutex{}; ///< SceKernelLwMutexWork
     alignas(8) std::array<u8, 0x10> lw_cond{};  ///< SceKernelLwCondWork
 #else
-    std::mutex mutex;
-    std::condition_variable condvar;
+    Common::Mutex mutex;
+    Common::ConditionVariable condvar;
 #endif
 };
 
@@ -127,8 +128,8 @@ public:
     }
 
 private:
-    std::condition_variable_any condvar;
-    std::mutex mutex;
+    Common::ConditionVariable condvar;
+    Common::Mutex mutex;
     std::size_t count;
     std::size_t waiting = 0;
     std::size_t generation = 0; // Incremented once each time the barrier is used

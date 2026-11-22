@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <mutex>
+#include "common/mutex.h"
 #include "common/settings.h"
 #include "core/3ds.h"
 #include "core/frontend/emu_window.h"
@@ -22,7 +23,7 @@ public:
         return std::make_unique<Device>(shared_from_this());
     }
 
-    std::mutex mutex;
+    Common::Mutex mutex;
 
     bool touch_pressed = false; ///< True if touchpad area is currently pressed, otherwise false
     float touch_x = 0.0f;       ///< Touchpad X-position

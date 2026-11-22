@@ -135,6 +135,18 @@ HLERequestContext::HLERequestContext(KernelSystem& kernel, std::shared_ptr<Serve
 
 HLERequestContext::~HLERequestContext() = default;
 
+void HLERequestContext::Reset(std::shared_ptr<ServerSession> session_,
+                              std::shared_ptr<Thread> thread_) {
+    cmd_buf[0] = 0;
+    session = std::move(session_);
+    thread = std::move(thread_);
+    request_handles.clear();
+    for (auto& buffer : static_buffers) {
+        buffer.clear();
+    }
+    request_mapped_buffers.clear();
+}
+
 std::shared_ptr<Object> HLERequestContext::GetIncomingHandle(u32 id_from_cmdbuf) const {
     ASSERT(id_from_cmdbuf < request_handles.size());
     return request_handles[id_from_cmdbuf];
@@ -208,11 +220,10 @@ Result HLERequestContext::PopulateFromIncomingCommandBuffer(const u32_le* src_cm
             VAddr source_address = src_cmdbuf[i];
             IPC::StaticBufferDescInfo buffer_info{descriptor};
 
-            // Copy the input buffer into our own vector and store it.
-            std::vector<u8> data(buffer_info.size);
+            // Copy the input buffer into our own vector (a kept context's, its capacity reused).
+            auto& data = static_buffers[buffer_info.buffer_id];
+            data.resize(buffer_info.size);
             kernel.memory.ReadBlock(src_process, source_address, data.data(), data.size());
-
-            AddStaticBuffer(buffer_info.buffer_id, std::move(data));
             cmd_buf[i++] = source_address;
             break;
         }

@@ -82,6 +82,9 @@ void Thread::serialize(Archive& ar, const unsigned int file_version) {
     }
     ar & wakeup_callback;
     ar & unschedule_mode;
+    if (Archive::is_loading::value) {
+        wakeup_queued = true; // the event queue came back with whatever it held
+    }
 }
 SERIALIZE_IMPL(Thread)
 
@@ -108,7 +111,7 @@ Thread* ThreadManager::GetCurrentThread() const {
 
 void Thread::Stop() {
     // Cancel any outstanding wakeup events for this thread
-    thread_manager.kernel.timing.UnscheduleEvent(thread_manager.ThreadWakeupEventType, thread_id);
+    CancelWakeup();
     thread_manager.wakeup_callback_table.erase(thread_id);
 
     // Clean up thread from ready queue
@@ -170,7 +173,7 @@ void ThreadManager::SwitchContext(Thread* new_thread) {
                    "Thread must be ready to become running.");
 
         // Cancel any outstanding wakeup events for this thread
-        timing.UnscheduleEvent(ThreadWakeupEventType, new_thread->thread_id);
+        new_thread->CancelWakeup();
 
         current_thread = SharedFrom(new_thread);
 
@@ -282,6 +285,7 @@ void ThreadManager::ThreadWakeupCallback(u64 thread_id, s64 cycles_late) {
         LOG_CRITICAL(Kernel, "Callback fired for invalid thread {:08X}", thread_id);
         return;
     }
+    thread->wakeup_queued = false;
 
     if (thread->status == ThreadStatus::WaitSynchAny ||
         thread->status == ThreadStatus::WaitSynchAll || thread->status == ThreadStatus::WaitArb ||
@@ -309,6 +313,19 @@ void Thread::WakeAfterDelay(s64 nanoseconds, bool thread_safe_mode) {
     thread_manager.kernel.timing.ScheduleEvent(nsToCycles(nanoseconds),
                                                thread_manager.ThreadWakeupEventType, thread_id,
                                                core, thread_safe_mode);
+    wakeup_queued = true;
+}
+
+void Thread::CancelWakeup() {
+    if (!wakeup_queued) {
+        DEBUG_ASSERT_MSG(thread_manager.cpu == nullptr ||
+                             thread_manager.cpu->GetTimer().EventTime(
+                                 thread_manager.ThreadWakeupEventType, thread_id) < 0,
+                         "thread {} has a wakeup queued but no mark of it", thread_id);
+        return;
+    }
+    thread_manager.kernel.timing.UnscheduleEvent(thread_manager.ThreadWakeupEventType, thread_id);
+    wakeup_queued = false;
 }
 
 void Thread::ResumeFromWait() {
@@ -582,7 +599,7 @@ void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& be
         }
         const bool same_sleep = was.state == 2 && is.state == 2 && was.wake == is.wake;
         if (was.state == 2 && !same_sleep) {
-            timing.UnscheduleEvent(ThreadWakeupEventType, t->thread_id);
+            t->CancelWakeup();
         }
         // A wait at the arbiter the module left alone keeps its place (a new wait takes the
         // list's next order); any other leaves the list and its timeout.
@@ -591,7 +608,7 @@ void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& be
             ASSERT(arbiter != nullptr);
             arbiter->RemoveNativeWaiter(t);
             if (was.wake != ~0ull) {
-                timing.UnscheduleEvent(ThreadWakeupEventType, t->thread_id);
+                t->CancelWakeup();
             }
             t->wakeup_callback = nullptr;
         }
@@ -605,6 +622,7 @@ void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& be
             if (!same_sleep) {
                 timing.ScheduleEvent(is.wake > now ? static_cast<s64>(is.wake - now) : 0,
                                      ThreadWakeupEventType, t->thread_id);
+                t->wakeup_queued = true;
             }
             break;
         case 4:
@@ -647,6 +665,7 @@ void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& be
         if (timed) {
             timing.ScheduleEvent(e->wake > now ? static_cast<s64>(e->wake - now) : 0,
                                  ThreadWakeupEventType, e->thread->thread_id);
+            e->thread->wakeup_queued = true;
         }
     }
     current_thread = current >= 0 ? SharedFrom(after[current].thread) : nullptr;
@@ -671,7 +690,7 @@ Thread* ThreadManager::SwitchForNative() {
         cur->status = ThreadStatus::Ready;
     }
     ASSERT_MSG(next->status == ThreadStatus::Ready, "Thread must be ready to become running.");
-    kernel.timing.UnscheduleEvent(ThreadWakeupEventType, next->thread_id);
+    next->CancelWakeup();
     current_thread = SharedFrom(next);
     ready_queue.remove(next->current_priority, next);
     next->status = ThreadStatus::Running;

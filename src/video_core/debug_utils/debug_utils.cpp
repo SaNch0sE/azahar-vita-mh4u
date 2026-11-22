@@ -11,6 +11,7 @@
 #include <nihstro/shader_binary.h>
 #include "common/assert.h"
 #include "common/bit_field.h"
+#include "common/mutex.h"
 #include "common/vector_math.h"
 #include "core/core.h"
 #include "video_core/debug_utils/debug_utils.h"
@@ -257,7 +258,7 @@ void DumpShader(const std::string& filename, const ShaderRegs& config, const Sha
 }
 
 static std::unique_ptr<PicaTrace> pica_trace;
-static std::mutex pica_trace_mutex;
+static Common::Mutex pica_trace_mutex;
 bool g_is_pica_tracing = false;
 
 void StartPicaTracing() {

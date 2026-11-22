@@ -329,6 +329,11 @@ public:
      */
     void WakeAfterDelay(s64 nanoseconds, bool thread_safe_mode = false);
 
+    /// Unschedules this thread's wakeup event, if one is queued. A scan of every core's event queue
+    /// otherwise: each switch to a thread cancels its wakeup, and a thread its own wakeup woke has
+    /// none left.
+    void CancelWakeup();
+
     /**
      * Sets the result after the thread awakens (from either WaitSynchronization SVC)
      * @param result Value to set to the returned result
@@ -399,6 +404,9 @@ public:
     u32 current_priority; ///< Current thread priority, can be temporarily changed
 
     u64 last_running_ticks; ///< CPU tick when thread was last running
+    /// Whether a wakeup event of this thread's may be queued: set where one is scheduled, cleared
+    /// when it fires or is cancelled; true after a savestate load (not saved).
+    bool wakeup_queued = false;
 
     s32 processor_id;
 

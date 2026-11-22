@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <vector>
+#include "common/mutex.h"
 #include "video_core/custom_textures/custom_format.h"
 
 namespace Frontend {
@@ -58,7 +59,7 @@ public:
     u32 width;
     u32 height;
     std::vector<u64> hashes;
-    std::mutex decode_mutex;
+    Common::Mutex decode_mutex;
     CustomPixelFormat format;
     CustomFileFormat file_format;
     std::vector<u8> data;

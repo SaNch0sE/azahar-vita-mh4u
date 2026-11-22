@@ -12,6 +12,7 @@
 #include <thread>
 #include <tuple>
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "common/thread.h"
 #include "common/vector_math.h"
 
@@ -29,7 +30,7 @@ struct Version;
 } // namespace Response
 
 struct DeviceStatus {
-    std::mutex update_mutex;
+    Common::Mutex update_mutex;
     std::tuple<Common::Vec3<float>, Common::Vec3<float>> motion_status;
     std::tuple<float, float, bool> touch_status;
 

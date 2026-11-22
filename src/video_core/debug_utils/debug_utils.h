@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "video_core/pica/regs_rasterizer.h"
 
 namespace CiTrace {
@@ -161,10 +162,10 @@ private:
     DebugContext() = default;
 
     /// Mutex protecting current breakpoint state and the observer list.
-    std::mutex breakpoint_mutex;
+    Common::Mutex breakpoint_mutex;
 
     /// Used by OnEvent to wait for resumption.
-    std::condition_variable resume_from_breakpoint;
+    Common::ConditionVariable resume_from_breakpoint;
 
     /// List of registered observers
     std::list<BreakPointObserver*> breakpoint_observers;

@@ -6,6 +6,7 @@
 
 #include <condition_variable>
 #include <functional>
+#include "common/mutex.h"
 
 namespace Common {
 
@@ -32,8 +33,8 @@ public:
 private:
     static DetachedTasks* instance;
 
-    std::condition_variable cv;
-    std::mutex mutex;
+    Common::ConditionVariable cv;
+    Common::Mutex mutex;
     int count = 0;
 };
 

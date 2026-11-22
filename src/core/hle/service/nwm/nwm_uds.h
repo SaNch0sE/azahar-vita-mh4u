@@ -17,6 +17,7 @@
 #include <boost/optional.hpp>
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "common/swap.h"
 #include "core/hle/service/nwm/uds_common.h"
 #include "core/hle/service/service.h"
@@ -632,13 +633,13 @@ private:
 
     // Mutex to synchronize access to the connection status between the emulation thread and the
     // network thread.
-    std::recursive_mutex connection_status_mutex;
+    Common::RecursiveMutex connection_status_mutex;
 
     std::shared_ptr<Kernel::Event> connection_event;
 
     // Mutex to synchronize access to the list of received beacons between the emulation thread and
     // the network thread.
-    std::mutex beacon_mutex;
+    Common::Mutex beacon_mutex;
 
     // List of the last <MaxBeaconFrames> beacons received from the network.
     std::list<Network::WifiPacket> received_beacons;

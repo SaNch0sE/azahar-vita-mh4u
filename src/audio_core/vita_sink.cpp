@@ -11,6 +11,7 @@
 #include "audio_core/audio_types.h"
 #include "audio_core/vita_sink.h"
 #include "common/logging/log.h"
+#include "common/mutex.h"
 #include "common/named_thread.h"
 #include "common/thread.h"
 
@@ -28,7 +29,7 @@ struct VitaSink::Impl {
 
     int port = -1;
     std::function<void(s16*, std::size_t)> cb;
-    std::mutex cb_mutex;
+    Common::Mutex cb_mutex;
     Common::NamedThread thread;
 
     // The resampler's state: `input` holds frames pulled from the callback, `pos` the

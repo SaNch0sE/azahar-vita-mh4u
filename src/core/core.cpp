@@ -58,6 +58,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/hw/aes/key.h"
 #include "core/loader/loader.h"
+#include "core/memory.h"
 #include "core/movie.h"
 #include "core/savestate.h"
 #ifdef ENABLE_SCRIPTING
@@ -922,6 +923,42 @@ void System::Reset() {
     if (result == ResultStatus::Success && reset_callback) {
         reset_callback();
     }
+}
+
+System::CodeSyncBatch::CodeSyncBatch(System& system_) : system{system_} {
+    ASSERT_MSG(system.code_sync_batch == nullptr && ThisHost() == 0,
+               "a code sync batch inside another, or off host 0");
+    system.code_sync_batch = this;
+}
+
+System::CodeSyncBatch::~CodeSyncBatch() {
+    system.code_sync_batch = nullptr;
+    std::sort(runs.begin(), runs.end());
+    for (std::size_t i = 0; i < runs.size();) {
+        const u32 first = runs[i].first;
+        u32 end = runs[i].second;
+        for (++i; i < runs.size() && runs[i].first <= end; ++i) {
+            end = std::max(end, runs[i].second);
+        }
+        system.InvalidateCacheRange(first << Memory::CITRA_PAGE_BITS,
+                                    static_cast<std::size_t>(end - first) << Memory::CITRA_PAGE_BITS);
+    }
+}
+
+void System::CodeSyncBatch::Add(u32 start_address, std::size_t length) {
+    if (length == 0) {
+        return;
+    }
+    const u32 first = start_address >> Memory::CITRA_PAGE_BITS;
+    const u32 end =
+        static_cast<u32>((u64{start_address} + length - 1) >> Memory::CITRA_PAGE_BITS) + 1;
+    // Relocations come in a segment's order: most extend the last run.
+    if (!runs.empty() && first <= runs.back().second && end >= runs.back().first) {
+        runs.back().first = std::min(runs.back().first, first);
+        runs.back().second = std::max(runs.back().second, end);
+        return;
+    }
+    runs.emplace_back(first, end);
 }
 
 void System::ApplySettings() {

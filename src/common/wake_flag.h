@@ -9,6 +9,7 @@
 #include <mutex>
 #else
 #include <cstdint>
+#include "common/mutex.h"
 #endif
 
 namespace Common {
@@ -52,8 +53,8 @@ private:
 #ifdef __vita__
     std::int32_t evid;
 #else
-    std::mutex mutex;
-    std::condition_variable condvar;
+    Common::Mutex mutex;
+    Common::ConditionVariable condvar;
     bool raised{false};
 #endif
 };

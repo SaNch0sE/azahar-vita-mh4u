@@ -9,6 +9,7 @@
 #pragma once
 
 #include <version>
+#include "common/mutex.h"
 
 #ifdef __cpp_lib_jthread
 
@@ -27,8 +28,8 @@ void CondvarWait(Condvar& cv, Lock& lock, std::stop_token token, Pred&& pred) {
 
 template <typename Rep, typename Period>
 bool StoppableTimedWait(std::stop_token token, const std::chrono::duration<Rep, Period>& rel_time) {
-    std::condition_variable_any cv;
-    std::mutex m;
+    Common::ConditionVariable cv;
+    Common::Mutex m;
 
     // Perform the timed wait.
     std::unique_lock lk{m};
@@ -355,8 +356,8 @@ bool StoppableTimedWait(std::stop_token token, const std::chrono::duration<Rep, 
     }
 
     bool stop_requested = false;
-    std::condition_variable cv;
-    std::mutex m;
+    Common::ConditionVariable cv;
+    Common::Mutex m;
 
     std::stop_callback cb(token, [&] {
         // Wake up the waiting thread.

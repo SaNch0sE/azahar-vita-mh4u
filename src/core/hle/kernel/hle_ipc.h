@@ -199,6 +199,11 @@ public:
                       std::shared_ptr<Thread> thread);
     ~HLERequestContext();
 
+    /// A context a session kept from an earlier request, ready for a new one as a new context
+    /// would be (no handles, buffers or command), its buffers' capacity kept. Null session and
+    /// thread park it.
+    void Reset(std::shared_ptr<ServerSession> session, std::shared_ptr<Thread> thread);
+
     /// Returns a pointer to the IPC command buffer for this request.
     u32* CommandBuffer() {
         return cmd_buf.data();

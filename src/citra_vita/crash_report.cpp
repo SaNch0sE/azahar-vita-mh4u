@@ -351,6 +351,12 @@ int __wrap_sceClibPrintf(const char* format, ...) {
     return printed;
 }
 
+// The reent the wrappers below give the allocator. newlib's malloc, calloc, realloc and free look
+// up the calling thread's (__getreent, a costly TLS lookup through SceLibKernel) only to pass it
+// on, and the allocator uses it for its lock,
+// which ignores it (upcall_tls.cpp), and for errno after a failure, which lands in the global one.
+#define MALLOC_REENT _global_impure_ptr
+
 void __wrap___assert_func(const char* file, int line, const char* func, const char* expr) {
     std::snprintf(assert_text, sizeof(assert_text), "%s:%d %s: assertion \"%s\" failed",
                   file != nullptr ? file : "?", line, func != nullptr ? func : "?",
@@ -359,7 +365,7 @@ void __wrap___assert_func(const char* file, int line, const char* func, const ch
 }
 
 void* __wrap_malloc(size_t size) {
-    void* const p = __real_malloc(size);
+    void* const p = __real__malloc_r(MALLOC_REENT, size);
     if (p == nullptr && size != 0) {
         failed_malloc_size = size;
     }

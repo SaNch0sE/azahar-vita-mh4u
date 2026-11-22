@@ -14,6 +14,7 @@
 #include "common/file_derived.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
+#include "common/mutex.h"
 #include "common/scm_rev.h"
 
 namespace FileUtil {
@@ -840,7 +841,7 @@ struct Z3DSReadIOFile::Z3DSReadIOFileImpl {
     ZSTD_seekable* seekable = nullptr;
     bool m_good = true;
     IOFileBase* curr_file = nullptr;
-    std::mutex read_mutex;
+    Common::Mutex read_mutex;
     u64 uncompressed_pos = 0;
     Z3DSMetadata metadata;
 };

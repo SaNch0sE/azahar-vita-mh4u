@@ -15,6 +15,7 @@
 #include <queue>
 
 #include "common/logging/log.h"
+#include "common/mutex.h"
 #include "common/named_thread.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -156,7 +157,7 @@ public:
 
 private:
     std::queue<Task> requests;
-    std::mutex queue_mutex;
+    Common::Mutex queue_mutex;
     /// Raised by QueueWork, waited on by idle workers.
     WakeFlag work_available;
     /// Raised whenever a task finishes or a worker goes idle or stops; WaitForRequests waits

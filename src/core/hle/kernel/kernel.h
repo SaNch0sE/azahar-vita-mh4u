@@ -19,6 +19,7 @@
 #include <vector>
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "core/hle/kernel/memory.h"
 #include "core/hle/result.h"
 #include "core/memory.h"
@@ -376,7 +377,7 @@ public:
         return running_804MHz;
     }
 
-    std::recursive_mutex& GetHLELock() {
+    Common::RecursiveMutex& GetHLELock() {
         return hle_lock;
     }
 
@@ -470,7 +471,7 @@ private:
      * writes to the emulated memory is not protected by this mutex, and should be avoided in any
      * threads other than the CPU thread.
      */
-    std::recursive_mutex hle_lock;
+    Common::RecursiveMutex hle_lock;
 
     /*
      * Flags non system module main threads to wait a bit before running. On real hardware,

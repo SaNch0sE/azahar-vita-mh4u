@@ -13,11 +13,12 @@
 #include <string>
 #include <vector>
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "common/named_thread.h"
 #include "common/wake_flag.h"
+#include "video_core/pica/shader_setup.h"
 #include "video_core/renderer_gxm/usse/usse_program.h"
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
-#include "video_core/pica/shader_setup.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 
 namespace SgxdRenderer {
@@ -64,7 +65,7 @@ private:
     };
     void Loop(std::stop_token stop);
 
-    std::mutex mutex;
+    Common::Mutex mutex;
     /// unique_ptr: a vertex job's request points into the job's own arrays.
     std::deque<std::unique_ptr<Job>> jobs;
     std::vector<Result> results;

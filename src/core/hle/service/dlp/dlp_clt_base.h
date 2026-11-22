@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "common/mutex.h"
 #include "core/hle/kernel/event.h"
 #include "core/hle/kernel/shared_memory.h"
 #include "dlp_base.h"
@@ -79,9 +80,9 @@ protected:
 
     Core::TimingEventType* beacon_scan_event;
 
-    std::mutex beacon_mutex;
-    std::recursive_mutex title_info_mutex;
-    std::recursive_mutex clt_state_mutex;
+    Common::Mutex beacon_mutex;
+    Common::RecursiveMutex title_info_mutex;
+    Common::RecursiveMutex clt_state_mutex;
 
     std::thread client_connection_worker;
 

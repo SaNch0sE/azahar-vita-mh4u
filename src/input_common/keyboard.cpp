@@ -7,6 +7,7 @@
 #include <list>
 #include <mutex>
 #include <utility>
+#include "common/mutex.h"
 #include "input_common/keyboard.h"
 
 namespace InputCommon {
@@ -62,7 +63,7 @@ public:
     }
 
 private:
-    std::mutex mutex;
+    Common::Mutex mutex;
     std::list<KeyButtonPair> list;
 };
 

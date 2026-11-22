@@ -37,6 +37,7 @@
 #include "common/logging/log.h"
 #include "common/logging/log_entry.h"
 #include "common/logging/text_formatter.h"
+#include "common/mutex.h"
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "common/thread.h"
@@ -566,7 +567,7 @@ private:
 #endif
 #endif // __vita__
 
-    std::mutex writing_mutex;
+    Common::Mutex writing_mutex;
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
 
 #ifdef CITRA_LINUX_GCC_BACKTRACE

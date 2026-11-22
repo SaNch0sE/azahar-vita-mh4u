@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "common/mutex.h"
 #include "video_core/pica/regs_texturing.h"
 #include "video_core/rasterizer_accelerated.h"
 #include "video_core/renderer_gxm/guest_gpu_memory.h"
@@ -218,7 +219,7 @@ public:
 private:
     /// A vertex or index range a draw cleaned: its pages move to CDRAM at vblank (TakeCachedReads).
     void CachedRead(PAddr addr, u32 size);
-    std::mutex cached_reads_mutex;
+    Common::Mutex cached_reads_mutex;
     std::vector<std::pair<PAddr, u32>> cached_reads;
 
     /// A range a fill wrote, with its value: a pass over it starts from the clear value with nothing

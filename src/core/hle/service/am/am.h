@@ -15,6 +15,7 @@
 #include <boost/serialization/shared_ptr.hpp>
 #include "common/common_types.h"
 #include "common/construct.h"
+#include "common/mutex.h"
 #include "common/swap.h"
 #include "common/thread_worker.h"
 #include "core/file_sys/cia_container.h"
@@ -1133,7 +1134,7 @@ private:
     /// load there). A worker thread that is joined while alive is the
     /// pattern the FS service drains without trouble.
     std::unique_ptr<Common::ThreadWorker> scan_worker;
-    std::mutex am_lists_mutex;
+    Common::Mutex am_lists_mutex;
     std::array<std::vector<u64_le>, 3> am_title_list;
     std::multimap<u64, u64> am_ticket_list;
 

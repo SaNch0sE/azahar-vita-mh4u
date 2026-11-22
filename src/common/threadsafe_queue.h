@@ -13,6 +13,7 @@
 #include <mutex>
 #include <utility>
 
+#include "common/mutex.h"
 #include "common/polyfill_thread.h"
 
 namespace Common {
@@ -133,8 +134,8 @@ private:
     ElementPtr* write_ptr;
     ElementPtr* read_ptr;
     std::atomic_size_t size{0};
-    std::mutex cv_mutex;
-    std::conditional_t<with_stop_token, std::condition_variable_any, std::condition_variable> cv;
+    Common::Mutex cv_mutex;
+    Common::ConditionVariable cv;
 };
 
 // a simple thread-safe,
@@ -184,6 +185,6 @@ public:
 
 private:
     SPSCQueue<T, with_stop_token> spsc_queue;
-    std::mutex write_lock;
+    Common::Mutex write_lock;
 };
 } // namespace Common

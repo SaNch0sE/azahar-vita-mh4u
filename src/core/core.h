@@ -13,6 +13,7 @@
 #include <boost/optional.hpp>
 #include <boost/serialization/version.hpp>
 #include "common/common_types.h"
+#include "common/mutex.h"
 #include "common/vector_math.h"
 #include "core/arm/arm_interface.h"
 #include "core/cheats/cheats.h"
@@ -235,10 +236,30 @@ public:
     }
 
     void InvalidateCacheRange(u32 start_address, std::size_t length) {
+        if (code_sync_batch) {
+            code_sync_batch->Add(start_address, length);
+            return;
+        }
         for (const auto& cpu : cpu_cores) {
             cpu->InvalidateCacheRange(start_address, length);
         }
     }
+
+    /// The InvalidateCacheRange calls made while it lives, done at its end one run of pages each:
+    /// an LDR:RO command's relocations each sync a word.
+    class CodeSyncBatch {
+    public:
+        explicit CodeSyncBatch(System& system);
+        ~CodeSyncBatch();
+        CodeSyncBatch(const CodeSyncBatch&) = delete;
+        CodeSyncBatch& operator=(const CodeSyncBatch&) = delete;
+        void Add(u32 start_address, std::size_t length);
+
+    private:
+        System& system;
+        /// [first page, end page)
+        std::vector<std::pair<u32, u32>> runs;
+    };
 
     /// Drops every core's instruction cache. Needed when guest code has been rewritten somewhere
     /// this side cannot name a range for - CRO linking patches call sites across every module that
@@ -511,6 +532,7 @@ private:
     /// ARM11 CPU core
     std::vector<std::shared_ptr<ARM_Interface>> cpu_cores;
     ARM_Interface* running_core = nullptr;
+    CodeSyncBatch* code_sync_batch = nullptr;
 
     /// DSP core
     std::unique_ptr<AudioCore::DspInterface> dsp_core;
@@ -577,7 +599,7 @@ private:
     std::optional<u8> m_mem_mode;
     u64 title_id;
 
-    std::mutex signal_mutex;
+    Common::Mutex signal_mutex;
     Signal current_signal;
     u32 signal_param;
 
