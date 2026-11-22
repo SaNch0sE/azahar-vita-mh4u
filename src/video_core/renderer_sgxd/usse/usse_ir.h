@@ -126,12 +126,6 @@ struct RegClass {
     bool inputs = false;
 };
 
-/// The second tier's passes a bisection leaves out (sgxd_flags `tier2skip=MASK`, diagnostics):
-/// bit 0 dead stores, 1 global hoist, 2 load hoist, 3 output coalescing, 4 internal-register
-/// reloads, 5 two-wide chains, 6 direct two-wide ops, 7 load sources, 8 results into internal
-/// registers, 9 internal registers placed again, 10 internal-register dead writes. Set once,
-/// before any program is lowered.
-void SetTier2Skip(uint32_t mask);
 
 struct LowerResult {
     uint32_t temp_count = 0; ///< temporaries used, r0 up

@@ -59,8 +59,9 @@ enum class RenderThread::Op : u16 {
     GpuIdle,
     Fence,
     Present,
-    FrameEnd,   ///< a guest frame's end, each vblank: RasterizerGxm::EndFrame
-    GuestWrote, ///< T12: a watched texture page's address, written by the guest or the HLE
+    FrameEnd,    ///< a guest frame's end, each vblank: RasterizerGxm::EndFrame
+    GuestWrote,  ///< T12: a watched texture page's address, written by the guest or the HLE
+    LateDropped, ///< The late skip: a dropped draw's colour buffer and viewport (RasterizerGxm::LateDropped)
     Call,
     Check,     ///< rendercheck: CheckRecord
     PageRemap, ///< extra: the count; PageHolds::Remap each: the GPU's MMU onto pages' slots
@@ -1833,6 +1834,7 @@ void RenderThread::EndFrame() {
             t.dropped = false;
         }
     }
+    late_reported = {};
     for (u32 i = 0; i < 2; i++) {
         screen_cost[i] = screen_cost[i] - screen_cost[i] / 8 + frame_cost[i];
     }
@@ -2019,6 +2021,18 @@ bool RenderThread::LateDraw() {
 #endif
     if (lcd_screen >= 0) {
         NoteLcdWrite(lcd_screen, lcd, dropped);
+    }
+    // The rasterizer told of a dropped draw, once for each buffer and viewport a frame: a game's
+    // double render (RasterizerGxm::DoubleRender) whose blend back a late frame drops ends there.
+    if (dropped) {
+        const auto& rs = pica.regs.internal.rasterizer;
+        const std::array<u32, 3> report{
+            addr, static_cast<u32>(Pica::f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2),
+            static_cast<u32>(Pica::f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2)};
+        if (report != late_reported) {
+            late_reported = report;
+            Put(Op::LateDropped, report);
+        }
     }
     if (!dropped) {
 #ifdef VITA_DIAGNOSTICS
@@ -2530,6 +2544,12 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         u32 addr;
         take(addr);
         rasterizer.GuestWrote(addr);
+        break;
+    }
+    case Op::LateDropped: {
+        std::array<u32, 3> dropped;
+        take(dropped);
+        rasterizer.LateDropped(dropped[0], dropped[1], dropped[2]);
         break;
     }
     case Op::Check:

@@ -136,6 +136,8 @@ constexpr uint8_t TmpHalf = 36;       ///< lighting: the normalised half vector 
 constexpr uint8_t TmpLight = 40;      ///< lighting: the normalised light vector (3)
 constexpr uint8_t TmpMisc = 44;       ///< lighting: dot product, clamp_highlights, distance,
                                       ///< the squared half vector length (4)
+constexpr uint8_t TmpParked = 44;     ///< a stage's colour while its alpha's three arguments
+                                      ///< load (4), in TmpMisc's home: lighting is done by then
 constexpr uint8_t TmpNormal = 48;     ///< lighting: the surface normal in view space (3)
 constexpr uint8_t TmpView = 52;       ///< lighting: the normalised view vector (3)
 constexpr uint8_t TmpDiffuse = 56;    ///< lighting: diffuse_sum, primary_fragment_color (4)
@@ -183,6 +185,15 @@ constexpr uint8_t TmpU8Scratch = 207;
 // The U8 combiners' inputs with one channel in every byte (U8Broadcast), one register each.
 constexpr uint8_t TmpU8Broadcast = 236;
 constexpr uint32_t U8BroadcastMax = 8;
+/// A moved channel of a register U8Inputs does not broadcast (a stage's output, a constant, an
+/// own-pixel texel), made where an argument reads it (U8LaneBroadcast): argument k's colour at
+/// 248 + k, its alpha at 252 + k.
+constexpr uint8_t TmpU8LaneColour = 248;
+constexpr uint8_t TmpU8LaneAlpha = 252;
+/// Even copies of U8 registers a VPCK unpacks (U8Even), in the proctex batch quads the combiners
+/// leave alone.
+constexpr uint8_t TmpU8EvenA = 188;
+constexpr uint8_t TmpU8EvenB = 190;
 constexpr uint8_t TmpLightAcc = 20;   ///< lighting: the spot direction, then the reflection
                                       ///< vector, then the specular accumulator, in
                                       ///< next_combiner_buffer's home (3). Nothing lighting
@@ -339,16 +350,20 @@ private:
     void ColorOp(Operation op, uint8_t mask);
     /// The alpha test on the F32 combiner output (TmpOutput.w), or on the U8 one's alpha byte
     /// when `u8` is a register.
-    void AlphaTest(const Reg* u8 = nullptr);
+    void AlphaTest(Reg* u8 = nullptr);
     /// The U8 combiners (u8_tev): whether every stage has a U8 form; the inputs packed to U8; a
     /// source's U8 register; an argument built (its register: the source itself when it needs
     /// no modifier); an operation into `dst`; a stage; and what follows the last stage.
     bool U8TevSupported() const;
     bool StageReads(Source source) const;
     void U8Inputs();
+    /// The combiner output in an even register (the alpha test's and the pack's unpacks).
+    Reg U8EvenFinal();
     Reg U8Source(Source source, u32 stage_index, bool alpha) const;
+    /// `need_colour` / `need_alpha`: whether an operation reads the argument's colour / alpha
+    /// (the other lanes are left as they come).
     Reg U8Arg(uint8_t k, u32 stage_index, Source csrc, ColorModifier cmod, Source asrc,
-              AlphaModifier amod);
+              AlphaModifier amod, bool need_colour = true, bool need_alpha = true);
     /// Calls f(stage index, colour source, colour modifier, alpha source, alpha modifier) for
     /// each argument a U8 stage reads, the sources as ColorSource and AlphaSource give them.
     template <typename F>
@@ -359,6 +374,19 @@ private:
     /// input packed again with each byte from that lane (U8Inputs, PackSelBroadcast).
     Reg U8Broadcast(Source source, int lane) const;
     void U8Op(Operation op, Reg dst, const std::array<Reg, 3>& args);
+    /// r, or its copy in the even register `even` (r odd, or an odd secondary attribute): what
+    /// a U8 unpack reads.
+    Reg U8Even(Reg r, uint8_t even);
+    /// Byte `lane` of the U8 register `src` in every byte of dst, through i0.
+    Reg U8LaneBroadcast(Reg src, int lane, Reg dst);
+    /// Dot3: (a - 0.5) . (b - 0.5) * 4 over the colour bytes, in every byte of dst.
+    void U8Dot3(Reg dst, Reg a, Reg b);
+    /// The same with b the stage's constant colour, its side of the product in the F32
+    /// uniform at `sa` (UniformKind::Dot3Const).
+    void U8Dot3Const(Reg dst, Reg a, uint32_t sa);
+    /// Which colour argument of a Dot3 stage is its constant colour unmodified (0 or 1), or
+    /// -1 for neither.
+    static int Dot3ConstArg(const TevStageConfig& stage, u32 index);
     void U8TevStage(u32 index);
     void U8Output();
     /// The nop a kill needs, then the phase marker that starts the next phase.
@@ -456,6 +484,9 @@ private:
     }
     std::array<Reg, 6> u8_out{};     ///< each stage's output, U8
     Reg u8_prev = Reg::V(TmpU8Zero); ///< the combiner output so far, U8
+    /// The lighting's sums packed to TmpU8Diffuse and TmpU8Specular where Lighting ends, not by
+    /// U8Inputs.
+    bool u8_lighting_packed = false;
     /// U8Broadcast's registers by BroadcastInput and lane; 0 for none.
     std::array<std::array<uint8_t, 3>, 7> u8_bcast{};
     Program program;
@@ -479,8 +510,8 @@ private:
     uint8_t scissor_pa = 0;               ///< scratch PA holding the scissor test's value
                                           ///< until the alpha test folds it into its kill
     bool fold_scissor = false;            ///< the scissor test kills with the alpha test
-    uint8_t normquat_pa = 0;              ///< PA base of TEXCOORD4/5 (two float4s)
-    uint8_t view_pa = 0;                  ///< PA base of TEXCOORD6 (float3)
+    uint8_t normquat_pa = 0;              ///< PA of TEXCOORD4 (the quaternion, half4)
+    uint8_t view_pa = 0;                  ///< PA base of TEXCOORD5 (the view, float3)
     bool buffer_used = false;
     /// Where a stage's PreviousBuffer colour / alpha comes from: -2 zero (stage 0), -1 the
     /// tev_combiner_buffer_color uniform, else the stage whose output it is.
@@ -499,6 +530,7 @@ private:
     uint32_t uniform_floats = 0;
     uint32_t sa_alpha_ref = 0;
     uint32_t sa_const_color = 0;
+    std::array<uint32_t, 6> sa_dot3_const{}; ///< a stage's Dot3Const
     uint32_t sa_buffer_color = 0;
     uint32_t sa_scissor = 0;
     uint32_t sa_fog_offset = 0;
@@ -765,11 +797,11 @@ void FragmentEmitter::PlanInputs() {
         position_pa = pa;
         pa += 4;
     }
+    // The quaternion alone: the flat copy's sign does not change the rotation.
     if (uses_lighting) {
         program.inputs.push_back({FragmentInput::TexCoord4, 4, true});
-        program.inputs.push_back({FragmentInput::TexCoord5, 4, true});
         normquat_pa = pa;
-        pa += 4;
+        pa += 2;
     }
     // A plain 2D read at an untouched coordinate is the PDS's to issue before the program
     // starts (a non-dependent read): no SMP, no wait, no thread waiting on the texture unit
@@ -838,7 +870,7 @@ void FragmentEmitter::PlanInputs() {
     if (uses_lighting) {
         // Declared four wide, as psp2cgc declares a half3 varying: the console allocates by
         // the declaration.
-        program.inputs.push_back({FragmentInput::TexCoord6, 4, true});
+        program.inputs.push_back({FragmentInput::TexCoord5, 4, true});
         view_pa = pa;
         pa += 2;
     }
@@ -956,6 +988,15 @@ void FragmentEmitter::PlanUniforms() {
     if (const_stages != 0) {
         sa_const_color = u8_tev ? AllocateUniformU8(UniformKind::ConstColor, 4, const_stages)
                                 : AllocateUniform(UniformKind::ConstColor, 4, const_stages);
+    }
+    if (u8_tev) {
+        for (u32 i = 0; i < tex.tev_stages.size(); i++) {
+            const TevStageConfig stage = tex.tev_stages[i];
+            if (!IsPassThroughTevStage(stage) && Dot3ConstArg(stage, i) >= 0) {
+                sa_dot3_const[i] =
+                    AllocateUniform(UniformKind::Dot3Const, 4, 1, static_cast<uint8_t>(i));
+            }
+        }
     }
     if (buffer_used) {
         sa_buffer_color = u8_tev ? AllocateUniformU8(UniformKind::BufferColor, 4, 1)
@@ -1553,11 +1594,14 @@ void FragmentEmitter::ProcTexColour(bool mipmapped) {
     // lut_coord * (width - 1) [+ 0.5 for nearest], the level's offset; the level's width is
     // lut_width >> level (the table is halved per level).
     if (mipmapped) {
-        // width_level - 1 = lut_width * 2^-level - 1; offset from the per-level table.
+        // width_level - 1 = floor(lut_width * 2^-level) - 1, also for a width not a power of two;
+        // offset from the per-level table.
         e.Vec(VecOp::Mul, {I1, 0x1}, {ConstOne.reg, XXXX, Mod::Neg}, {uv_home.Pair(1), XXXX},
               Pred::None, true);
         e.Comp(CompOp::Exp, {I1, 0x1}, {I1}, 0, Pred::None, true);
         e.Vec(VecOp::Mul, {I1, 0x1}, {I1, XYZW}, Lit(LitProcWidth), Pred::None, true);
+        e.Vec(VecOp::Frc, {I1, 0x2}, {I1, XXXX}, {I1, XXXX}, Pred::None, true);
+        e.Vec(VecOp::Add, {I1, 0x1}, {I1, YYYY, Mod::Neg}, {I1, XXXX}, Pred::None, true);
         e.Vec(VecOp::Add, {I1, 0x1}, {ConstOne.reg, XXXX, Mod::Neg}, {I1, XYZW}, Pred::None, true);
         e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, {I1, XXXX}, Pred::None, true);
         // offset = offsets[level]: walk the table.
@@ -1890,7 +1934,6 @@ void FragmentEmitter::LightingLutRowFetch(Sampler sampler, bool abs_input) {
 void FragmentEmitter::Lighting() {
     const auto& lighting = config.lighting;
     const Vec4Loc normquat{Bank::PrimAttr, normquat_pa, true};
-    const Vec4Loc normquat_flat{Bank::PrimAttr, static_cast<uint8_t>(normquat_pa + 2), true};
     const Vec4Loc view{Bank::PrimAttr, view_pa, true};
     const Vec4Loc diffuse_sum{Bank::Virtual, TmpDiffuse};
     const Vec4Loc specular_sum{Bank::Virtual, TmpSpecular};
@@ -1987,10 +2030,6 @@ void FragmentEmitter::Lighting() {
 
     // quat = normalize(dot(normquat, normquat_flat) < 0 ? -normquat : normquat)
     LoadVec4(I0, normquat);
-    LoadVec4(I1, normquat_flat);
-    e.Dot({I2, 0x1}, {I0, XYZW}, {I1, XYZW}, true, Pred::None, true);
-    e.Test(Cond::Lt, 0, {I2}, 0, ConstZero, false);
-    e.Vec(VecOp::Mul, {I0, 0xf}, {I0, XYZW, Mod::Neg}, ConstOne, Pred::P0, true);
     e.Dot({I2, 0x1}, {I0, XYZW}, {I0, XYZW}, true, Pred::None, true);
     e.Comp(CompOp::Rsq, {I2, 0x1}, {I2}, 0, Pred::None, true);
     e.Vec(VecOp::Mul, {I0, 0xf}, {I0, XYZW}, {I2, XXXX}, Pred::None, true);
@@ -2431,18 +2470,39 @@ void FragmentEmitter::Lighting() {
                   shadow_alpha);
         }
     }
-    // diffuse_sum.rgb += global ambient; both clamped in place.
+    // diffuse_sum.rgb += global ambient; both clamped in place. For the U8 combiners they are
+    // packed here instead, the pack saturating as the clamp does, unless a moved channel of
+    // one is packed again from its F32 lanes (U8Inputs' broadcasts).
+    bool lanes_moved = false;
+    if (u8_tev) {
+        ForEachU8Arg([&](u32, Source csrc, ColorModifier cmod, Source asrc, AlphaModifier amod) {
+            const auto lit = [](Source s) {
+                return s == Source::PrimaryFragmentColor || s == Source::SecondaryFragmentColor;
+            };
+            lanes_moved = lanes_moved || (lit(csrc) && MovedLane(cmod) >= 0) ||
+                          (lit(asrc) && MovedLane(amod) >= 0);
+        });
+    }
+    u8_lighting_packed = u8_tev && !lanes_moved;
     if (uses_primary_color) {
         LoadVec4(I0, diffuse_sum);
         LoadVec4(I1, {Bank::SecAttr, static_cast<uint8_t>(sa_global_ambient)});
         e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
-        Clamp01(I0);
-        StoreVec4(diffuse_sum, I0);
+        if (u8_lighting_packed) {
+            e.PackU8(Reg::V(TmpU8Diffuse), I0, I0);
+        } else {
+            Clamp01(I0);
+            StoreVec4(diffuse_sum, I0);
+        }
     }
     if (uses_secondary_color) {
-        LoadVec4(I0, specular_sum);
-        Clamp01(I0);
-        StoreVec4(specular_sum, I0);
+        if (u8_lighting_packed) {
+            e.PackU8(Reg::V(TmpU8Specular), specular_sum.Pair(0), specular_sum.Pair(1));
+        } else {
+            LoadVec4(I0, specular_sum);
+            Clamp01(I0);
+            StoreVec4(specular_sum, I0);
+        }
     }
 }
 
@@ -2700,15 +2760,18 @@ void FragmentEmitter::TevStage(u32 index) {
         ColorOp(stage.color_op, same_op || dot3_alpha ? 0xf : 0x7);
         if (separate_alpha) {
             if (alpha_three) {
-                // i2's colour result must survive: park it, load the alphas, restore (its
-                // w was never written: a game).
-                StoreVec4({Bank::Virtual, TmpOutput}, I2, 0x7);
+                // i2's colour result must survive: park it, load the alphas, restore. Not in
+                // TmpOutput, which an alpha argument's Previous with a colour channel
+                // (SourceRed..Blue) still reads. Its w is written, as every lane read back is: the
+                // alpha replaces it below.
+                e.Vec(VecOp::Add, {Reg::V(TmpParked + 2), 0x2}, ConstZero, ConstZero);
+                StoreVec4({Bank::Virtual, TmpParked}, I2, 0x7);
                 load(0, 0x8);
                 load(1, 0x8);
                 load(2, 0x8);
                 ColorOp(stage.alpha_op, 0x8);
                 e.MoveInternal({I0, 0xf}, {I2, XYZW}, Pred::None, true);
-                LoadVec4(I2, {Bank::Virtual, TmpOutput});
+                LoadVec4(I2, {Bank::Virtual, TmpParked});
                 e.MoveInternal({I2, 0x8}, {I0, XYZW}, Pred::None, true);
             } else {
                 if (!alpha_early) {
@@ -2791,9 +2854,15 @@ bool FragmentEmitter::U8TevSupported() const {
             return false;
         }
     };
+    // Dot3 too, in F32 between unpacks (U8Dot3); a Dot3_RGBA stage's alpha operation is not
+    // read.
     for (u32 k = 0; k < config.texture.tev_stages.size(); k++) {
         const TevStageConfig stage = config.texture.tev_stages[k];
-        if (!IsPassThroughTevStage(stage) && (!op_ok(stage.color_op) || !op_ok(stage.alpha_op))) {
+        const bool dot3 =
+            stage.color_op == Operation::Dot3_RGB || stage.color_op == Operation::Dot3_RGBA;
+        if (!IsPassThroughTevStage(stage) &&
+            ((!op_ok(stage.color_op) && !dot3) ||
+             (!op_ok(stage.alpha_op) && stage.color_op != Operation::Dot3_RGBA))) {
             return false;
         }
     }
@@ -2811,13 +2880,13 @@ bool FragmentEmitter::U8TevSupported() const {
                 return;
             }
             const int input = BroadcastInput(src);
-            // An own-pixel unit has no lanes to pack from: the F32 path swizzles its texel.
+            // A stage's output, a constant or an own-pixel texel (which has no lanes to pack
+            // from) is broadcast where it is read (U8LaneBroadcast).
             const bool own = src >= Source::Texture0 && src <= Source::Texture2 &&
                              (config.texture.own_pixel >>
                                   (static_cast<u32>(src) - static_cast<u32>(Source::Texture0)) &
                               1);
             if (input < 0 || own) {
-                ok = false;
                 return;
             }
             moved |= 1u << (3 * input + lane);
@@ -2881,7 +2950,9 @@ void FragmentEmitter::U8Inputs() {
             e.Sop2(Reg::V(static_cast<uint8_t>(TmpU8Tex + unit)), Reg::O(0), Reg::O(0), s);
             continue;
         }
-        if (!unit_used[unit]) {
+        // A unit only the lighting reads (the shadow, a bump map) has no stage to pack for.
+        if (!unit_used[unit] ||
+            !StageReads(static_cast<Source>(static_cast<u32>(Source::Texture0) + unit))) {
             continue;
         }
         const Vec4Loc texel = texel_loc[unit];
@@ -2907,7 +2978,7 @@ void FragmentEmitter::U8Inputs() {
             e.PackU8(Reg::V(TmpU8Tex3), Reg::V(TmpTex3), Reg::V(TmpTex3 + 2));
         }
     }
-    if (uses_lighting) {
+    if (uses_lighting && !u8_lighting_packed) {
         e.PackU8(Reg::V(TmpU8Diffuse), Reg::V(TmpDiffuse), Reg::V(TmpDiffuse + 2));
         e.PackU8(Reg::V(TmpU8Specular), Reg::V(TmpSpecular), Reg::V(TmpSpecular + 2));
     }
@@ -2966,6 +3037,17 @@ void FragmentEmitter::U8Inputs() {
         broadcast(csrc, MovedLane(cmod));
         broadcast(asrc, MovedLane(amod));
     });
+}
+
+Reg FragmentEmitter::U8EvenFinal() {
+    if (!(u8_prev.n & 1)) {
+        return u8_prev;
+    }
+    // No stage wrote it (zero): an even register for the unpacks.
+    SopCtl s;
+    s.cmod1 = s.amod1 = true;
+    e.Sop2(Reg::V(TmpU8Final), u8_prev, u8_prev, s);
+    return Reg::V(TmpU8Final);
 }
 
 bool FragmentEmitter::U8InputPresent(Source source) const {
@@ -3034,7 +3116,7 @@ Reg FragmentEmitter::U8Source(Source source, u32 stage_index, bool alpha) const 
 }
 
 Reg FragmentEmitter::U8Arg(uint8_t k, u32 stage_index, Source csrc, ColorModifier cmod, Source asrc,
-                           AlphaModifier amod) {
+                           AlphaModifier amod, bool need_colour, bool need_alpha) {
     const TevStageConfig stage = config.texture.tev_stages[stage_index];
     const Source cs = ColorSource(stage, csrc, stage_index);
     const Source as = AlphaSource(stage, asrc, stage_index);
@@ -3042,12 +3124,37 @@ Reg FragmentEmitter::U8Arg(uint8_t k, u32 stage_index, Source csrc, ColorModifie
     // only its complement.
     const int clane = MovedLane(cmod);
     const int alane = MovedLane(amod);
-    const Reg c =
-        clane >= 0 ? U8Broadcast(cs, clane) : U8Source(cs, stage_index, ReadsAlphaLane(cmod));
-    const Reg a = alane >= 0 ? U8Broadcast(as, alane) : U8Source(as, stage_index, true);
-    const u32 cm = clane >= 0 ? static_cast<u32>(cmod) & 1 : static_cast<u32>(cmod);
-    const u32 am = alane >= 0 ? static_cast<u32>(amod) & 1 : static_cast<u32>(amod);
-    if (c.bank == a.bank && c.n == a.n && cm == 0 && am == 0) {
+    // Lanes no operation reads take the other's register as it is (an unread SA alpha takes
+    // white's, which a SOP3's source 0 can name without a copy).
+    Reg c = Reg::V(TmpU8White), a = Reg::V(TmpU8White);
+    u32 cm = 0, am = 0;
+    // A moved channel U8Inputs did not broadcast: made here from the source's colour.
+    const auto lazy = [&](Source src) {
+        return BroadcastInput(src) < 0 ||
+               (src >= Source::Texture0 && src <= Source::Texture2 &&
+                unit_own[static_cast<u32>(src) - static_cast<u32>(Source::Texture0)]);
+    };
+    if (need_colour) {
+        c = clane < 0  ? U8Source(cs, stage_index, ReadsAlphaLane(cmod))
+            : lazy(cs) ? U8LaneBroadcast(U8Source(cs, stage_index, false), clane,
+                                         Reg::V(static_cast<uint8_t>(TmpU8LaneColour + k)))
+                       : U8Broadcast(cs, clane);
+        cm = clane >= 0 ? static_cast<u32>(cmod) & 1 : static_cast<u32>(cmod);
+    }
+    if (need_alpha) {
+        a = alane < 0  ? U8Source(as, stage_index, true)
+            : lazy(as) ? U8LaneBroadcast(U8Source(as, stage_index, false), alane,
+                                         Reg::V(static_cast<uint8_t>(TmpU8LaneAlpha + k)))
+                       : U8Broadcast(as, alane);
+        am = alane >= 0 ? static_cast<u32>(amod) & 1 : static_cast<u32>(amod);
+    }
+    if (!need_colour) {
+        c = a;
+    }
+    if (!need_alpha) {
+        a = c.bank == Bank::SecAttr ? Reg::V(TmpU8White) : c;
+    }
+    if (cm == 0 && am == 0 && (!need_alpha || (c.bank == a.bank && c.n == a.n))) {
         return c;
     }
     // One SOP3 over white: colour = the colour source's colour or alpha, complemented or not,
@@ -3060,6 +3167,64 @@ Reg FragmentEmitter::U8Arg(uint8_t k, u32 stage_index, Source csrc, ColorModifie
     const Reg dst = Reg::V(static_cast<uint8_t>(TmpU8Arg + k));
     e.Sop3(dst, U8Src0(a), Reg::V(TmpU8White), c, s);
     return dst;
+}
+
+Reg FragmentEmitter::U8Even(Reg r, uint8_t even) {
+    if (!(r.n & 1) && (r.bank == Bank::Virtual || r.bank == Bank::SecAttr)) {
+        return r;
+    }
+    if (r.bank == Bank::SecAttr) {
+        e.Bitwise(BwOp::Or, Reg::V(even), IOp::R(r), IOp::Imm(0));
+    } else {
+        SopCtl s;
+        s.cmod1 = s.amod1 = true; // ONE * src1 + ZERO
+        e.Sop2(Reg::V(even), r, r, s);
+    }
+    return Reg::V(even);
+}
+
+Reg FragmentEmitter::U8LaneBroadcast(Reg src, int lane, Reg dst) {
+    e.UnpackU8({I0, 0xf}, U8Even(src, TmpU8EvenA));
+    e.PackU8(dst, I0, I0, PackSelBroadcast(static_cast<uint8_t>(lane)));
+    return dst;
+}
+
+void FragmentEmitter::U8Dot3(Reg dst, Reg a, Reg b) {
+    // As the F32 path's ColorOp, from the bytes as F32 (k / 255), packed back saturated and to
+    // nearest: the F32 path's clamp and floor(x * 255 + 0.5), x * 255 being a sum of products
+    // over 255 (odd), never a half.
+    e.UnpackU8({I0, 0x7}, U8Even(a, TmpU8EvenA));
+    e.UnpackU8({I1, 0x7}, U8Even(b, TmpU8EvenB));
+    e.Vec(VecOp::Add, {I0, 0x7}, {Reg::C(12), XXXX, Mod::Neg}, {I0, XYZW}, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x7}, {Reg::C(12), XXXX, Mod::Neg}, {I1, XYZW}, Pred::None, true);
+    e.Dot({I2, 0x1}, {I0, XYZW}, {I1, XYZW}, false, Pred::None, true);
+    // Every lane (the pack reads all four).
+    e.Vec(VecOp::Mul, {I2, 0xf}, {I2, XXXX}, Lit(LitFour), Pred::None, true);
+    e.PackU8(dst, I2, I2);
+}
+
+int FragmentEmitter::Dot3ConstArg(const TevStageConfig& stage, u32 index) {
+    if (stage.color_op != Operation::Dot3_RGB && stage.color_op != Operation::Dot3_RGBA) {
+        return -1;
+    }
+    const auto plain = [&](Source source, ColorModifier modifier) {
+        return ColorSource(stage, source, index) == Source::Constant &&
+               modifier == ColorModifier::SourceColor;
+    };
+    return plain(stage.color_source2, stage.color_modifier2)   ? 1
+           : plain(stage.color_source1, stage.color_modifier1) ? 0
+                                                               : -1;
+}
+
+void FragmentEmitter::U8Dot3Const(Reg dst, Reg a, uint32_t sa) {
+    // (a - 0.5) . (b - 0.5) * 4 = a . 4 (b - 0.5) - 2 sum(b - 0.5), the constant's two terms
+    // made once a draw. The sums differ from U8Dot3's by a few ulps and the pack's steps are
+    // 1 / 510 from every value (U8Dot3): the same bytes.
+    const Reg k = Reg::Sa(static_cast<uint8_t>(sa));
+    e.UnpackU8({I0, 0x7}, U8Even(a, TmpU8EvenA));
+    e.Dot({I2, 0x1}, {k, XYZW}, {I0, XYZW}, false, Pred::None, true);
+    e.Vec(VecOp::Add, {I2, 0xf}, {I2, XXXX}, SaScalar(sa + 3), Pred::None, true);
+    e.PackU8(dst, I2, I2);
 }
 
 Reg FragmentEmitter::U8Src0(Reg r) {
@@ -3153,44 +3318,186 @@ void FragmentEmitter::U8TevStage(u32 index) {
         return op == Operation::Lerp || op == Operation::MultiplyThenAdd ||
                op == Operation::AddThenMultiply;
     };
-    const bool two = stage.color_op != Operation::Replace || stage.alpha_op != Operation::Replace;
-    const bool need3 = three(stage.color_op) || three(stage.alpha_op);
-    std::array<Reg, 3> args{Reg::V(TmpU8Zero), Reg::V(TmpU8Zero), Reg::V(TmpU8Zero)};
-    args[0] = U8Arg(0, index, stage.color_source1, stage.color_modifier1, stage.alpha_source1,
-                    stage.alpha_modifier1);
-    if (two) {
-        args[1] = U8Arg(1, index, stage.color_source2, stage.color_modifier2, stage.alpha_source2,
-                        stage.alpha_modifier2);
-    }
-    if (need3) {
-        args[2] = U8Arg(2, index, stage.color_source3, stage.color_modifier3, stage.alpha_source3,
-                        stage.alpha_modifier3);
-    }
+    const Operation color_op = stage.color_op;
+    const bool two = color_op != Operation::Replace || stage.alpha_op != Operation::Replace;
+    const bool need3 = three(color_op) || three(stage.alpha_op);
+    const auto arity = [&](Operation op) {
+        return op == Operation::Replace ? 1u : three(op) ? 3u : 2u;
+    };
+    const bool dot3 =
+        stage.color_op == Operation::Dot3_RGB || stage.color_op == Operation::Dot3_RGBA;
+    const u32 colour_args = arity(color_op);
+    // Dot3_RGBA writes its alpha too: the alpha operation reads nothing.
+    const u32 alpha_args = stage.color_op == Operation::Dot3_RGBA ? 0u : arity(stage.alpha_op);
     const Reg out = Reg::V(static_cast<uint8_t>(TmpU8Stage + index * 2));
     const unsigned cscale = stage.GetColorMultiplier();
     const unsigned ascale = stage.GetAlphaMultiplier();
-    // A Replace of a register no later stage writes (not an argument's or a source 0 copy's,
-    // the constant's uniform included) is that register: no copy.
-    const auto stable = [](const Reg& r) {
-        return r.bank != Bank::Virtual ||
-               (!(r.n >= TmpU8Arg && r.n < TmpU8Arg + 3) && r.n != TmpU8Const);
+    // An operation SOP2 makes in one over (args[0], args[1]): its colour and alpha factors.
+    const auto single = [](Operation op) {
+        return op == Operation::Replace || op == Operation::Modulate || op == Operation::Add ||
+               op == Operation::Subtract;
     };
-    if (stage.color_op == Operation::Replace && stage.alpha_op == Operation::Replace &&
-        cscale == 1 && ascale == 1 && stable(args[0])) {
-        u8_out[index] = args[0];
-        u8_prev = args[0];
-        return;
-    }
-    if (stage.color_op == stage.alpha_op) {
-        U8Op(stage.color_op, out, args);
-    } else {
-        // Each operation over all four bytes, then the colour of one and the alpha of the other.
-        U8Op(stage.color_op, Reg::V(TmpU8Colour), args);
-        U8Op(stage.alpha_op, out, args);
-        SopCtl s;
-        s.cmod1 = true; // ONE * colour result
-        s.amod2 = true; // ONE * the alpha result's alpha
-        e.Sop2(out, Reg::V(TmpU8Colour), out, s);
+    const auto colour_factors = [&](SopCtl& c) {
+        // ONE * src1 (+ ZERO), src2 * src1, ONE * src1 + ONE * src2 or - ONE * src2, as U8Op
+        // makes each.
+        switch (color_op) {
+        case Operation::Replace:
+            c.cmod1 = true;
+            break;
+        case Operation::Modulate:
+            c.csel1 = 2;
+            break;
+        default:
+            c.cmod1 = c.cmod2 = true;
+            c.cop = color_op == Operation::Subtract ? 1 : 0;
+            break;
+        }
+    };
+    // Both operations one SOP2 straight over plain registers (no modifier, no moved channel),
+    // no argument built: the colour's arguments are src1 (and src2), the alpha's found among
+    // them, or put in src2 when the colour reads one argument.
+    const auto direct = [&]() {
+        const Source csrc[2] = {stage.color_source1, stage.color_source2};
+        const ColorModifier cmods[2] = {stage.color_modifier1, stage.color_modifier2};
+        const Source asrc[2] = {stage.alpha_source1, stage.alpha_source2};
+        const AlphaModifier amods[2] = {stage.alpha_modifier1, stage.alpha_modifier2};
+        std::array<Reg, 2> c{Reg::V(TmpU8Zero), Reg::V(TmpU8Zero)};
+        std::array<Reg, 2> a{Reg::V(TmpU8Zero), Reg::V(TmpU8Zero)};
+        for (u32 k = 0; k < colour_args; k++) {
+            if (cmods[k] != ColorModifier::SourceColor) {
+                return false;
+            }
+            c[k] = U8Source(ColorSource(stage, csrc[k], index), index, false);
+        }
+        for (u32 k = 0; k < alpha_args; k++) {
+            if (amods[k] != AlphaModifier::SourceAlpha) {
+                return false;
+            }
+            a[k] = U8Source(AlphaSource(stage, asrc[k], index), index, true);
+        }
+        const auto same = [](Reg x, Reg y) { return x.bank == y.bank && x.n == y.n; };
+        // A Replace of one register for both: the copy-free form below.
+        if (color_op == Operation::Replace && stage.alpha_op == Operation::Replace &&
+            same(c[0], a[0])) {
+            return false;
+        }
+        const bool free2 = colour_args < 2;
+        const Reg s1 = c[0];
+        Reg s2 = c[1];
+        SopCtl f;
+        colour_factors(f);
+        switch (stage.alpha_op) {
+        case Operation::Replace:
+            if (same(a[0], s1)) {
+                f.amod1 = true; // ONE * src1 alpha
+            } else if (free2 || same(a[0], s2)) {
+                s2 = a[0];
+                f.amod2 = true; // ZERO * src1 alpha + ONE * src2 alpha
+            } else {
+                return false;
+            }
+            break;
+        case Operation::Modulate:
+            if (same(a[0], s1) && (free2 || same(a[1], s2))) {
+                s2 = a[1];
+            } else if (same(a[1], s1) && (free2 || same(a[0], s2))) {
+                s2 = a[0];
+            } else {
+                return false;
+            }
+            f.asel1 = 2; // src2 alpha * src1 alpha
+            break;
+        default:
+            if (same(a[0], s1) && (free2 || same(a[1], s2))) {
+                s2 = a[1];
+            } else if (stage.alpha_op == Operation::Add && same(a[1], s1) &&
+                       (free2 || same(a[0], s2))) {
+                s2 = a[0];
+            } else {
+                return false;
+            }
+            f.amod1 = f.amod2 = true;
+            f.aop = stage.alpha_op == Operation::Subtract ? 1 : 0;
+            break;
+        }
+        e.Sop2(out, s1, s2, f);
+        return true;
+    };
+    if (dot3 || !single(color_op) || !single(stage.alpha_op) || !direct()) {
+        std::array<Reg, 3> args{Reg::V(TmpU8Zero), Reg::V(TmpU8Zero), Reg::V(TmpU8Zero)};
+        args[0] = U8Arg(0, index, stage.color_source1, stage.color_modifier1, stage.alpha_source1,
+                        stage.alpha_modifier1, true, alpha_args > 0);
+        if (two) {
+            args[1] =
+                U8Arg(1, index, stage.color_source2, stage.color_modifier2, stage.alpha_source2,
+                      stage.alpha_modifier2, colour_args > 1, alpha_args > 1);
+        }
+        if (need3) {
+            args[2] =
+                U8Arg(2, index, stage.color_source3, stage.color_modifier3, stage.alpha_source3,
+                      stage.alpha_modifier3, colour_args > 2, alpha_args > 2);
+        }
+        // A Replace of a register no later stage writes (not an argument's or a source 0 copy's,
+        // the constant's uniform included) is that register: no copy.
+        const auto stable = [](const Reg& r) {
+            return r.bank != Bank::Virtual ||
+                   (!(r.n >= TmpU8Arg && r.n < TmpU8Arg + 3) && r.n != TmpU8Const);
+        };
+        if (color_op == Operation::Replace && stage.alpha_op == Operation::Replace && cscale == 1 &&
+            ascale == 1 && stable(args[0])) {
+            u8_out[index] = args[0];
+            u8_prev = args[0];
+            return;
+        }
+        if (dot3) {
+            const int constant = Dot3ConstArg(stage, index);
+            const auto dot = [&](Reg dst) {
+                if (constant >= 0) {
+                    U8Dot3Const(dst, args[1 - constant], sa_dot3_const[index]);
+                } else {
+                    U8Dot3(dst, args[0], args[1]);
+                }
+            };
+            if (stage.color_op == Operation::Dot3_RGBA) {
+                dot(out);
+            } else {
+                dot(Reg::V(TmpU8Colour));
+                U8Op(stage.alpha_op, out, args);
+                SopCtl s;
+                s.cmod1 = true; // ONE * the dot
+                s.amod2 = true; // ONE * the alpha result's alpha
+                e.Sop2(out, Reg::V(TmpU8Colour), out, s);
+            }
+        } else if (stage.color_op == stage.alpha_op) {
+            U8Op(stage.alpha_op, out, args);
+        } else if (single(stage.color_op) && single(stage.alpha_op)) {
+            // Both in one SOP2, the colour's factors and the alpha's apart: ONE * src1 (+ ZERO),
+            // src2 * src1, ONE * src1 + ONE * src2 or - ONE * src2, as U8Op makes each.
+            SopCtl s;
+            colour_factors(s);
+            switch (stage.alpha_op) {
+            case Operation::Replace:
+                s.amod1 = true;
+                break;
+            case Operation::Modulate:
+                s.asel1 = 2;
+                break;
+            default:
+                s.amod1 = s.amod2 = true;
+                s.aop = stage.alpha_op == Operation::Subtract ? 1 : 0;
+                break;
+            }
+            e.Sop2(out, args[0], args[1], s);
+        } else {
+            // Each operation over all four bytes, then the colour of one and the alpha of the
+            // other.
+            U8Op(stage.color_op, Reg::V(TmpU8Colour), args);
+            U8Op(stage.alpha_op, out, args);
+            SopCtl s;
+            s.cmod1 = true; // ONE * colour result
+            s.amod2 = true; // ONE * the alpha result's alpha
+            e.Sop2(out, Reg::V(TmpU8Colour), out, s);
+        }
     }
     // The scale (x2, x4) as saturating adds of the result to itself, as the F32 path clamps.
     for (unsigned step = 2; step <= 4; step *= 2) {
@@ -3209,14 +3516,7 @@ void FragmentEmitter::U8TevStage(u32 index) {
 }
 
 void FragmentEmitter::U8Output() {
-    Reg final = u8_prev;
-    if (final.n & 1) {
-        // No stage wrote it (zero): an even register for the unpacks.
-        SopCtl s;
-        s.cmod1 = s.amod1 = true;
-        e.Sop2(Reg::V(TmpU8Final), final, final, s);
-        final = Reg::V(TmpU8Final);
-    }
+    Reg final = U8EvenFinal();
     AlphaTest(&final);
     if (uses_fog) {
         // colour * f + fog colour * (1 - f) on the colour, the alpha kept: the factor with
@@ -3244,7 +3544,7 @@ void FragmentEmitter::U8Output() {
     program.output_u8 = true;
 }
 
-void FragmentEmitter::AlphaTest(const Reg* u8) {
+void FragmentEmitter::AlphaTest(Reg* u8) {
     const auto func = config.framebuffer.alpha_test_func.Value();
     if (func == FramebufferRegs::CompareFunc::Always) {
         return;
@@ -3281,9 +3581,6 @@ void FragmentEmitter::AlphaTest(const Reg* u8) {
     default: break;
     }
     e.Test(cond, 1, alpha, 0, SaScalar(sa_alpha_ref), false);
-    if (uses_depth) {
-        WriteDepth();
-    }
     if (fold_scissor) {
         // p1 = p1 && the scissor test kept the pixel (Scissor left its minimum in the
         // scratch PA).
@@ -3291,6 +3588,25 @@ void FragmentEmitter::AlphaTest(const Reg* u8) {
                              Pica::RasterizerRegs::ScissorMode::Include;
         e.Test(include ? Cond::Ge : Cond::Lt, 1, {Reg::Pa(scissor_pa)}, 0, ConstZero, false,
                Pred::P1);
+    }
+    if (config.framebuffer.alpha_test_blends) {
+        // The blend leaves the target as it is under alpha 0 (RasterizerSgxd::FragmentConfig):
+        // the fragments the tests fail get it instead of a kill. The U8 word goes whole (its
+        // colour is multiplied by zero too).
+        if (u8) {
+            // A secondary attribute (a copy-free Replace of the constant or the buffer colour)
+            // is the draw's, not the pixel's: zeroed it would stay zero for the pixels after.
+            // The output goes to an even temporary of its own first.
+            if (u8->bank == Bank::SecAttr) {
+                e.Bitwise(BwOp::Or, Reg::V(TmpU8Final), IOp::R(*u8), IOp::Imm(0));
+                *u8 = Reg::V(TmpU8Final);
+            }
+            e.Bitwise(BwOp::And, *u8, IOp::R(*u8), IOp::Imm(0), Pred::NotP1);
+        } else {
+            e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x2}, ConstZero, ConstZero, Pred::NotP1,
+                  true);
+        }
+        return;
     }
     e.KillUnlessP1();
     NewPhaseAfterKill();
@@ -3317,8 +3633,9 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
         return {};
     }
     PlanUniforms();
-    uses_kill = config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always ||
-                uses_scissor;
+    uses_kill = (config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always ||
+                 uses_scissor) &&
+                !config.framebuffer.alpha_test_blends;
     if (uses_kill) {
         LitSa(LitKillControl); // the kill's operand pair, patched in after the code (PatchKills)
     }

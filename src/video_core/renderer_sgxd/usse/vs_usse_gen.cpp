@@ -131,10 +131,11 @@ constexpr uint32_t DataLiteralCount = DataSize - 1;
 // Output registers of the fragment interface, in the order the output selects lay them out
 // (OutSelects, TexSize): POSITION o0-o3, COLOR0 o4-o7, TEXCOORD0-2 two each from o8,
 // TEXCOORD3 o14-17 (the fog table's coordinate, Usse::TextureIssue::fog: clip z and w in its
-// first and fourth lanes; texcoord0's w in its second), TEXCOORD4 o18-21, TEXCOORD5 o22-25,
-// TEXCOORD6 o26-28, then a register for each user clip plane (VsRequest::clip_planes), as psp2cgc
-// puts CLP0 and CLP1 after the texture coordinates and sets the output selects' plane bits 0 and 1
-// (0a001800 -> 0c001803).
+// first and fourth lanes; texcoord0's w in its second), TEXCOORD4 o18-21 (the quaternion),
+// TEXCOORD5 o22-24 (the view), then a register for each user clip plane (VsRequest::clip_planes),
+// as psp2cgc puts CLP0 and CLP1 after the texture coordinates and sets the output selects' plane
+// bits 0 and 1 (0a001800 -> 0c001803). Upstream's flat copy of the quaternion is not written:
+// the fragment programs do not read it (FragmentEmitter::Lighting).
 constexpr uint8_t OutPosition = 0;
 constexpr uint8_t OutColor = 4;
 constexpr uint8_t OutTexcoord0 = 8;
@@ -143,11 +144,13 @@ constexpr uint8_t OutTexcoord2 = 12;
 constexpr uint8_t OutTexcoord3 = 14;   ///< TEXCOORD3's u (clip z) and v (texcoord0's w)
 constexpr uint8_t OutTexcoord3St = 16; ///< TEXCOORD3's s (zero) and t (clip w)
 constexpr uint8_t OutNormquat = 18;
-constexpr uint8_t OutNormquatFlat = 22;
-constexpr uint8_t OutView = 26;
-constexpr uint8_t OutClip0 = 29;
-constexpr uint32_t OutSelects = 0x1d001800; ///< 29 registers, position, colour
-constexpr uint32_t TexSize = 0xffe49;
+constexpr uint8_t OutView = 22;
+constexpr uint8_t OutClip0 = 25;
+constexpr uint32_t OutSelects = 0x19001800; ///< 25 registers, position, colour
+/// The texcoord widths, three bits a set: TC0-2 UV, TC3 UVST, TC4 UVST,
+/// TC5 UVS. The sets present are contiguous: with TC5 left out and TC6 kept the fragment programs
+/// read another set's data for TC6.
+constexpr uint32_t TexSize = 0x1fe49;
 
 // VSOutputAttributes::Semantic, as regs_rasterizer.h numbers them.
 enum Semantic : uint8_t {
@@ -1954,8 +1957,6 @@ void VertexEmitter::Epilogue() {
     GatherFour(I2, SemQuaternionX);
     e.MoveInternal({Reg::O(OutNormquat), 0x3}, {I2, XYZW});
     e.MoveInternal({Reg::O(OutNormquat + 2), 0x3}, {I2, ZWZW});
-    e.MoveInternal({Reg::O(OutNormquatFlat), 0x3}, {I2, XYZW});
-    e.MoveInternal({Reg::O(OutNormquatFlat + 2), 0x3}, {I2, ZWZW});
 
     OutputTexcoord(OutTexcoord0, SemTexcoord0U, SemTexcoord0V);
     OutputTexcoord(OutTexcoord1, SemTexcoord1U, SemTexcoord1V);

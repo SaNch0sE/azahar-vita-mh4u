@@ -68,6 +68,10 @@ struct FramebufferConfig {
         BitField<6, 4, Pica::FramebufferRegs::LogicOp> logic_op;
         BitField<10, 1, u32> shadow_rendering;
         BitField<11, 1, u32> alphablend_enable;
+        /// sgxd: the blend leaves the target as it is under a fragment of alpha 0 and nothing
+        /// else keeps a fragment (no depth or stencil write): the alpha test's failures get alpha
+        /// 0 instead of a kill (RasterizerSgxd::FragmentConfig).
+        BitField<12, 1, u32> alpha_test_blends;
     };
     BlendConfig requested_rgb_blend{};
     BlendConfig requested_alpha_blend{};
@@ -89,7 +93,7 @@ struct FramebufferConfig {
             // fields
             FIELD_HASH(alpha_test_func), FIELD_HASH(scissor_test_mode), FIELD_HASH(depthmap_enable),
             FIELD_HASH(logic_op), FIELD_HASH(shadow_rendering), FIELD_HASH(alphablend_enable),
-            FIELD_HASH(requested_rgb_blend), FIELD_HASH(requested_alpha_blend),
+            FIELD_HASH(alpha_test_blends), FIELD_HASH(requested_rgb_blend), FIELD_HASH(requested_alpha_blend),
             FIELD_HASH(requested_logic_op),
 
             // nested layout

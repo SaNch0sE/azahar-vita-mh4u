@@ -705,6 +705,8 @@ UniformField FragmentUniformField(const Usse::Uniform& u) {
         return {light + offsetof(L, dist_atten_bias), false};
     case K::LightDistAttenScale:
         return {light + offsetof(L, dist_atten_scale), false};
+    case K::Dot3Const:
+        return {offsetof(D, const_color) + u.index * sizeof(D::const_color[0]), false};
     default:
         UNREACHABLE_MSG("sgxd: the fragment uniform {} has no value", Usse::UniformName(u));
     }
@@ -3373,6 +3375,38 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
                         &config.framebuffer.requested_alpha_blend}) {
         if (blend->RequiresMinMaxEmulation()) {
             blend->SetMinMaxEmulationDisabled();
+        }
+    }
+    // sgxd_flags wbufz: W-buffering drawn as Z-buffering, the ISP's interpolated depth kept and
+    // none written by the program: what DEPTHFEEDBACK costs (the depths stored differ).
+    static const bool wbuf_as_z = SgxdFlag("wbufz");
+    if (wbuf_as_z) {
+        config.framebuffer.depthmap_enable.Assign(Pica::RasterizerRegs::DepthBuffering::ZBuffering);
+    }
+    // An alpha test whose failures the blend would leave as the target has them (alpha 0 takes zero
+    // of itself and all of the target, with no depth or stencil write): the program gives those
+    // fragments alpha 0 instead of killing them, and the draw is translucent instead of
+    // punch-through, whose shading waits for the ISP's feedback.
+    const auto& om = regs.framebuffer.output_merger;
+    const auto func = config.framebuffer.alpha_test_func.Value();
+    if (func != FramebufferRegs::CompareFunc::Always &&
+        func != FramebufferRegs::CompareFunc::Never && om.alphablend_enable &&
+        om.fragment_operation_mode == FramebufferRegs::FragmentOperationMode::Default) {
+        using Eq = FramebufferRegs::BlendEquation;
+        using F = FramebufferRegs::BlendFactor;
+        const auto keeps_target = [](Eq eq, F src, F dst, bool colour) {
+            const bool src_zero =
+                src == F::Zero || src == F::SourceAlpha || (colour && src == F::SourceAlphaSaturate);
+            const bool dst_one = dst == F::One || dst == F::OneMinusSourceAlpha;
+            return (eq == Eq::Add || eq == Eq::ReverseSubtract) && src_zero && dst_one;
+        };
+        const auto& ab = om.alpha_blending;
+        const auto& fb = regs.framebuffer.framebuffer;
+        const bool dwrite = fb.allow_depth_stencil_write != 0 && om.depth_write_enable;
+        if (keeps_target(ab.blend_equation_rgb, ab.factor_source_rgb, ab.factor_dest_rgb, true) &&
+            keeps_target(ab.blend_equation_a, ab.factor_source_a, ab.factor_dest_a, false) &&
+            !dwrite && !om.stencil_test.enable) {
+            config.framebuffer.alpha_test_blends.Assign(1);
         }
     }
     // An include box, [x1, x2 + 1) x [y1, y2 + 1), over the whole viewport (within the colour

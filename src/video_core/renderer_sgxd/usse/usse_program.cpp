@@ -50,6 +50,8 @@ std::string UniformName(const Uniform& uniform) {
         return "uniforms_f";
     case UniformKind::AlphaTestRef:
         return "alphatest_ref";
+    case UniformKind::Dot3Const:
+        return "dot3_const[" + std::to_string(uniform.index) + "]";
     case UniformKind::ConstColor:
         return "const_color";
     case UniformKind::BufferColor:

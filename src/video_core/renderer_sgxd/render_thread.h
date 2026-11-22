@@ -454,6 +454,8 @@ private:
     bool late_batch_open{};
     bool late_batch_skip{};
     bool late_triangles_open{};
+    /// The last dropped draw's colour buffer and viewport reported this frame (Op::LateDropped).
+    std::array<u32, 3> late_reported{};
     bool late_triangles_skip{};
     /// The colour buffers drawn lately (the newest 16), each with its segments: a segment is
     /// the draws into it up to a transfer from it. a game draws both screens into one colour

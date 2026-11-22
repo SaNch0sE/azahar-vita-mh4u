@@ -636,6 +636,7 @@ private:
     void HoistLoads(int max_group);
     void HoistLoadsGlobal();
     void CoalesceOutputs();
+    void FoldOutputCopy();
     void ResultsIntoInternal();
     void TwoWideChains();
     std::optional<Src> LoadedSourceOf(std::size_t at, const Src& src) const;
@@ -2753,6 +2754,16 @@ void ForEachRead(Inst& inst, std::vector<Ref>& refs, F&& f) {
     case Op::UnpackInt:
         f(inst.reg[1], 1);
         break;
+    case Op::PackU8:
+        if (inst.reg[1].bank == Bank::Internal && !inst.b[1]) {
+            uint8_t lanes = 0;
+            for (int b = 0; b < 4; b++) {
+                lanes |= static_cast<uint8_t>(1u << ((inst.u[0] >> (2 * b)) & 3));
+            }
+            f(inst.reg[1], lanes);
+            break;
+        }
+        [[fallthrough]];
     default:
         Refs(inst, refs);
         for (const Ref& r : refs) {
@@ -3642,6 +3653,70 @@ void Lowering::CoalesceOutputs() {
     insts.swap(kept);
 }
 
+void Lowering::FoldOutputCopy() {
+    // After the registers are placed: the U8 colour's last copy into pa0
+    // (FragmentEmitter::U8Output, a SOP2 of ONE x the colour + ZERO) goes, the instruction that
+    // made the colour writing pa0 itself and the reads between taking pa0, when nothing between
+    // touches pa0 and the colour is read by U8 operations alone.
+    if (insts.empty()) {
+        return;
+    }
+    const auto same = [](Reg a, Reg b) { return a.bank == b.bank && a.n == b.n; };
+    // A register a reference at r may touch from x's word: x itself, or a pair or quad whose
+    // base is below it (they are aligned).
+    const auto touches = [](Reg r, Reg x) {
+        return r.bank == x.bank && (r.n == x.n || r.n == (x.n & ~1) || r.n == (x.n & ~3));
+    };
+    const auto u8_op = [](Op op) { return op == Op::Sop2 || op == Op::Sop3 || op == Op::PackU8; };
+    SopCtl identity;
+    identity.cmod1 = identity.amod1 = true;
+    const std::size_t c = insts.size() - 1;
+    Inst& copy = insts[c];
+    const Reg pa0 = Reg::Pa(0);
+    if (copy.op != Op::Sop2 || copy.b[0] || copy.ctl != identity.Pack() ||
+        !same(Map(copy.reg[0]), pa0) || !same(Map(copy.reg[1]), Map(copy.xreg[0]))) {
+        return;
+    }
+    const Reg x = Map(copy.reg[1]);
+    if (x.bank == Bank::Internal || same(x, pa0)) {
+        return;
+    }
+    std::vector<Ref> refs;
+    std::size_t p = c;
+    for (std::size_t k = c; k-- > 0 && p == c;) {
+        Refs(insts[k], refs);
+        for (const Ref& r : refs) {
+            if (r.def && touches(Map(*r.reg), x)) {
+                p = k;
+            }
+        }
+    }
+    // Its maker writes the whole word: a SOP or a pack, into x exactly.
+    if (p == c || !u8_op(insts[p].op) || !same(Map(insts[p].reg[0]), x)) {
+        return;
+    }
+    for (std::size_t k = p + 1; k < c; k++) {
+        Refs(insts[k], refs);
+        for (const Ref& r : refs) {
+            const Reg m = Map(*r.reg);
+            if (touches(m, pa0) || (touches(m, x) && (r.def || !u8_op(insts[k].op) ||
+                                                      !same(m, x)))) {
+                return;
+            }
+        }
+    }
+    insts[p].reg[0] = pa0;
+    for (std::size_t k = p + 1; k < c; k++) {
+        Refs(insts[k], refs);
+        for (const Ref& r : refs) {
+            if (same(Map(*r.reg), x)) {
+                *r.reg = pa0;
+            }
+        }
+    }
+    insts.pop_back();
+}
+
 void Lowering::Allocate() {
     // Linear scan over the classes in order; a value that fits nowhere in a class moves
     // to the next (the spill). Each class is a set of quads.
@@ -4225,6 +4300,9 @@ LowerResult Lowering::Run(Encoder& e, int level) {
         } else {
             Liveness();
             Allocate();
+        }
+        if (level >= 2) {
+            FoldOutputCopy();
         }
     };
     if (level >= 2 && occupancy) {

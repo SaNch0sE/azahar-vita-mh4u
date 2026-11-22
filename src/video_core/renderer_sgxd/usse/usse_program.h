@@ -144,6 +144,9 @@ enum class UniformKind : uint8_t {
     /// A directional light's position normalised (its light vector), once a draw as the
     /// rasterizer fills the SAs instead of in every pixel.
     LightDirection,
+    /// Stage `index`'s constant colour as a U8 Dot3 reads it (FragmentEmitter::U8Dot3Const):
+    /// 4 (b - 0.5) in x, y and z and -2 sum(b - 0.5) in w, b its bytes over 255.
+    Dot3Const,
 };
 
 struct Uniform {

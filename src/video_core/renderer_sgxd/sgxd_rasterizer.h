@@ -90,6 +90,11 @@ public:
     void GuestWrote(PAddr page) {
         TexturesWritten(page, page + 0x1000);
     }
+    /// the late skip dropped a draw into `colour` with that viewport (RenderThread's LateDropped): a double
+    /// render being skipped over that buffer (or its copy) never sees its blend back, so the
+    /// skipping ends here. Before, it ran on into the next frame's first render, and MH
+    /// Generations' top screen showed its bottom screen.
+    void LateDropped(PAddr colour, u32 width, u32 height);
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
     bool AccelerateDma(PAddr src, PAddr dst, u32 size) override;
@@ -332,6 +337,8 @@ private:
         bool normalize; ///< the vec3 normalised as it is copied (UniformKind::LightDirection)
         bool u8;        ///< packed to a word of bytes an element (Usse::Uniform::u8)
         bool lut_row;   ///< a LUT offset as its row's centre (UniformKind::LightingLutRow)
+        /// A constant colour's two Dot3 terms (UniformKind::Dot3Const).
+        bool dot3_const;
     };
 
     /// What follows a fragment program's own code: the pack to the output, or the pack and the blend.
