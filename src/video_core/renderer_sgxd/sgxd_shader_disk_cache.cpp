@@ -39,7 +39,7 @@ constexpr std::size_t ReadBytes = 64 * 1024;
 /// A batch is written once it is this large or its oldest program has waited this long.
 constexpr std::size_t BatchBytes = 256 * 1024;
 constexpr u32 BatchUs = 10'000'000;
-constexpr const char* Directory = "ux0:data/azahar/shaders";
+constexpr const char* Directory = ShaderDiskCache::Root;
 #ifdef VITA_DIAGNOSTICS
 constexpr const char* BuildKind = "diag";
 #else
@@ -72,9 +72,7 @@ using Entry = ShaderDiskCache::Entry;
 /// The open version's file and the programs read from it, kept for the process.
 struct Shared {
     std::mutex mutex;
-    std::string directory;                 ///< written by Open only, before its loader starts
-    std::unordered_set<u64> keys[2];       ///< the whole files there, [vertex]
-    std::unordered_set<u64> writing[2];    ///< the files a Store is writing, [vertex]
+    std::string path;                         ///< written by Open before its loader starts, Forget
     std::unordered_map<u64, Entry> loaded[2]; ///< the programs read or stored, [vertex]
     std::vector<u8> pending;                  ///< the records stored and not written yet
     u64 pending_since = 0;                    ///< process time of the oldest one's Store
@@ -248,6 +246,22 @@ void ShaderDiskCache::Open(u64 title_id) {
                                        [](std::stop_token stop) { Load(stop); }};
     }
     ready.store(true, std::memory_order_release);
+}
+
+void ShaderDiskCache::Forget(u64 title_id) {
+    Shared& s = State();
+    if (!s.path.starts_with(fmt::format("{}/{:016x}.", Directory, title_id))) {
+        return;
+    }
+    s.loader = Common::NamedThread{};
+    std::scoped_lock lock{s.mutex};
+    s.path.clear();
+    for (int v = 0; v < 2; v++) {
+        s.loaded[v].clear();
+    }
+    s.pending.clear();
+    s.file_bytes = 0;
+    s.read = false;
 }
 
 std::optional<ShaderDiskCache::Entry> ShaderDiskCache::Find(u64 key, bool vertex) const {

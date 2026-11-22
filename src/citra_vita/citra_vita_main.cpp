@@ -3180,6 +3180,12 @@ int EmulatorMain() {
         case VitaFrontend::Ui::Action::CheckFile:
             check_selected();
             break;
+        case VitaFrontend::Ui::Action::ClearData: {
+            const std::string outcome = ui.ClearData(present_list);
+            sceClibPrintf("[azahar] clear: %s\n", outcome.c_str());
+            show_notice(outcome + "\n\n" + Tr("Press X or O to continue."));
+            break;
+        }
         default:
             break;
         }

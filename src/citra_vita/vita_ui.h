@@ -99,6 +99,7 @@ public:
         TogglePin,
         InstallTitle,
         CheckFile,
+        ClearData,
     };
 
     explicit Ui(Core::System& system, EmuWindowVita& window);
@@ -141,6 +142,11 @@ public:
     /// anyway. Otherwise the question is up (Launch anyway, Full check, Cancel) and the list
     /// shows it. Before a launch from the game list or a bubble.
     bool LaunchChecked(const std::string& path, const std::function<void()>& present);
+
+    /// Deletes the part of a game's data its Data tab's question was agreed to, its progress shown
+    /// through `present`, then reads the tab again: what happened, for a notice. After
+    /// Action::ClearData; no title running.
+    std::string ClearData(const std::function<void()>& present);
 
     /// Lists the titles again (at the start, after an install, the command channel's `rescan`),
     /// keeping the selected one selected.
@@ -187,9 +193,9 @@ private:
         ControlEditor,
     };
 
-    /// The settings screen's groups, its tabs. Patches, Cheats, Installed and File hold no rows: a
-    /// title's built-in patches, its cheat file's cheats, what of it is installed, and its file's
-    /// check.
+    /// The settings screen's groups, its tabs. Patches, Cheats, Installed, File and Data hold no
+    /// rows: a title's built-in patches, its cheat file's cheats, what of it is installed, its
+    /// file's check, and its save data and shader cache.
     enum class Category {
         Display,
         Speed,
@@ -200,6 +206,7 @@ private:
         Cheats,
         Installed,
         File,
+        Data,
         Count,
     };
 
@@ -443,6 +450,25 @@ private:
     int focused_rom_folder = -1;
     int armed_rom_folder = -1;
     void DrawFileRow();
+    /// The Data tab, a title's with a program ID: its save data (the save archive and the title's
+    /// extdata) and its shader cache, each with the folders deleting it removes and their size,
+    /// read when the tab is first shown (ScanData). Cross asks (Question::ClearData), from the
+    /// game list only: the running title has its files open.
+    enum class DataKind { SaveData, ShaderCache };
+    struct DataPart {
+        DataKind kind;
+        const char* name;
+        std::vector<std::string> folders;
+        u64 bytes{};
+        u32 files{};
+    };
+    std::vector<DataPart> settings_data;
+    bool data_scanned{};
+    int focused_data = -1;
+    int clear_data = -1; ///< the part the question asks about, for ClearData
+    void ScanData();
+    void DrawDataRow(std::size_t index);
+    void DrawDataInfo();
     /// The Display tab's last row: the layout editor, opened on the screen layout the tab shows.
     /// Its info beside the list while it has the focus (focused_row LayoutEditorRow).
     void DrawLayoutEditorRow();

@@ -112,6 +112,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"D-pad right", "十字键右"},
     {"D-pad up", "十字键上"},
     {"Dark", "深色"},
+    {"Data", "数据"},
     {"Decrypt this CIA, then install it again.", "请先解密此 CIA，然后重新安装。"},
     {"Decrypt this game, then install it again.", "请先解密此游戏，然后重新安装。"},
     {"Default", "默认"},
@@ -122,6 +123,12 @@ constexpr std::array table{std::to_array<Translation>({
     {"Delete the layout {}? The games that use it go back to Default.",
      "要删除布局 {} 吗？使用它的游戏将恢复为“默认”。"},
     {"Delete this layout", "删除此布局"},
+    {"Delete {}'s save data? The game starts over as new. This can't be undone.",
+     "要删除 {} 的存档吗？游戏将从头开始，且无法撤销。"},
+    {"Delete {}'s shader cache? The game stutters for a while as it makes its shaders again.",
+     "要删除 {} 的着色器缓存吗？游戏重新生成着色器时会卡顿一段时间。"},
+    {"Deleting {}'s save data...", "正在删除 {} 的存档…"},
+    {"Deleting {}'s shader cache...", "正在删除 {} 的着色器缓存…"},
     {"Display", "显示"},
     {"Down", "方向键下"},
     {"Download Play", "下载游玩"},
@@ -294,6 +301,7 @@ constexpr std::array table{std::to_array<Translation>({
      "未找到游戏。请将 .3ds 或 .cci 文件复制到 {} 或设置“系统”标签页中的 ROM 文件夹，或选择“安装 CIA”。"},
     {"None", "无"},
     {"Not in a room", "未加入房间"},
+    {"Nothing to delete.", "没有可删除的内容。"},
     {"Not in a room: {}", "未加入房间：{}"},
     {"Not on the ad hoc network", "未连接本地联机网络"},
     {"Not on the ad hoc network: {}", "未连接本地联机网络：{}"},
@@ -359,6 +367,7 @@ constexpr std::array table{std::to_array<Translation>({
      "即可看到。"},
     {"Puts the touch screen where the top screen would be.", "把触摸屏放到上屏的位置。"},
     {"Quit game", "退出游戏"},
+    {"Quit the game to delete it.", "退出游戏后才能删除。"},
     {"Quit {}? Progress since the game last saved is lost.",
      "要退出 {} 吗？游戏上次存档之后的进度将会丢失。"},
     {"Reads the whole file and compares every part with the checksums 3DS files carry, to find a "
@@ -390,6 +399,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Save", "保存"},
     {"Save as new", "另存为新布局"},
     {"Save control layout", "保存按键布局"},
+    {"Save data", "存档"},
     {"Save layout", "保存布局"},
     {"Save over slot {}? Its state from {} is replaced.",
      "要覆盖槽位 {} 吗？{} 保存的即时存档将被替换。"},
@@ -409,6 +419,7 @@ constexpr std::array table{std::to_array<Translation>({
      "已为此游戏单独设置，目前与所有游戏的设置相同。更改所有游戏的设置不会影响此游戏。"},
     {"Set for this game. All games: {}.", "已为此游戏单独设置。所有游戏：{}。"},
     {"Settings", "设置"},
+    {"Shader cache", "着色器缓存"},
     {"Show this screen", "显示此屏幕"},
     {"Shows a notice as Azahar starts, while the quick menu, notifications and plugin menus such "
      "as PSVshell's still work. Off: Azahar takes over the GPU at once.",
@@ -541,6 +552,11 @@ constexpr std::array table{std::to_array<Translation>({
     {"the room did not answer", "房间没有响应"},
     {"the room is full", "房间已满"},
     {"the room runs another version of the protocol", "房间使用的协议版本不同"},
+    {"The programs Azahar made for this game's graphics, by every version of Azahar that ran it, "
+     "kept so that the next start need not make them again. Deleting it frees their space; the "
+     "game stutters for a while as it makes them again.",
+     "Azahar 为此游戏的画面生成的程序（包括运行过此游戏的每个 Azahar 版本生成的），保存下来以免下次"
+     "启动时重新生成。删除后可释放空间；游戏重新生成这些程序时会卡顿一段时间。"},
     {"The title's bubble is off the LiveArea.", "已从 LiveArea 移除此游戏的图标。"},
     {"the update data", "更新数据"},
     {"The Vita input that presses the 3DS's A.", "对应 3DS A 键的 Vita 按键。"},
@@ -604,6 +620,10 @@ constexpr std::array table{std::to_array<Translation>({
      "the d-pad.",
      "右摇杆的作用：3DS 的 C 摇杆（New 3DS 的，以及支持扩展滑杆的游戏中扩展滑杆的摇杆）、L 和 R"
      "（左右推动，用于以 L、R 转动视角的游戏）或十字键。"},
+    {"What the game saved on the emulated SD card: its progress and its own options. Deleting it "
+     "starts the game over as new. Its savestates and extra data stay.",
+     "游戏保存在模拟 SD 卡上的数据：游戏进度和游戏自身的设置。删除后游戏将从头开始。即时存档和追加"
+     "数据会保留。"},
     {"When the GPU falls behind, the busier screen skips frames so the game keeps its speed. This "
      "sets how many frames in a row it may skip: higher keeps heavy games faster but less smooth. "
      "Off draws every frame and the game slows down instead.",
@@ -625,6 +645,9 @@ constexpr std::array table{std::to_array<Translation>({
     {"{} can't be read as a 3DS game.", "无法将 {} 作为 3DS 游戏读取。"},
     {"{} could not be loaded ({:#010x}). Reinstall the vpk.",
      "无法加载 {}（{:#010x}）。请重新安装 vpk。"},
+    {"{} files or folders could not be deleted. Restart the Vita, then delete them again.",
+     "有 {} 个文件或文件夹无法删除。请重启 Vita，然后再删除一次。"},
+    {"{} in {} files.", "{}，共 {} 个文件。"},
     {"{} is damaged in {}. Copy it again from your game.", "{} 的{}已损坏。请从你的游戏重新复制。"},
     {"{} is encrypted, so it can't be checked. Decrypt it first.",
      "{} 已加密，无法检查。请先解密。"},
@@ -643,6 +666,8 @@ constexpr std::array table{std::to_array<Translation>({
     {"{} title", "{} 个游戏"},
     {"{} to {}, in Game settings", "{}设为{}（游戏设置）"},
     {"{} to {}, in Settings", "{}设为{}（设置）"},
+    {"{}'s save data is deleted.", "{} 的存档已删除。"},
+    {"{}'s shader cache is deleted.", "{} 的着色器缓存已删除。"},
     {"{} titles", "{} 个游戏"},
     {"{}: its downloadable content is installed.", "{}：追加内容已安装。"},
     {"{}: its update is installed.", "{}：更新数据已安装。"},

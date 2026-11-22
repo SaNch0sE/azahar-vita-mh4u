@@ -8,9 +8,12 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include <imgui_vita2d/imgui.h>
@@ -18,6 +21,8 @@
 #include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
 #include <psp2/io/devctl.h>
+#include <psp2/io/dirent.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
@@ -54,6 +59,8 @@
 #include "core/cheats/cheat_base.h"
 #include "core/cheats/cheats.h"
 #include "core/core.h"
+#include "core/file_sys/archive_extsavedata.h"
+#include "core/file_sys/archive_source_sd_savedata.h"
 #include "core/file_sys/cia_container.h"
 #include "core/file_sys/title_metadata.h"
 #include "core/hle/service/am/am.h"
@@ -61,6 +68,7 @@
 #include "core/loader/smdh.h"
 #include "core/movie.h"
 #include "core/savestate.h"
+#include "video_core/renderer_sgxd/sgxd_shader_disk_cache.h"
 
 namespace VitaFrontend {
 
@@ -430,6 +438,7 @@ enum class Icon {
     Patch,
     Cheat,
     Pad,
+    Bin,
 };
 
 /// An icon of `size` pixels centred at `c`. `under`: the colour behind it, for the cut-outs.
@@ -476,6 +485,20 @@ void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float size, ImU32 colour, ImU
         dl->AddRect(ImVec2(c.x - 0.24f * s, c.y + 0.04f * s),
                     ImVec2(c.x + 0.24f * s, c.y + 0.38f * s), colour, 2.0f, ImDrawCornerFlags_All,
                     line);
+        break;
+    case Icon::Bin:
+        dl->AddLine(ImVec2(c.x - 0.38f * s, c.y - 0.26f * s),
+                    ImVec2(c.x + 0.38f * s, c.y - 0.26f * s), colour, line);
+        dl->AddRect(ImVec2(c.x - 0.12f * s, c.y - 0.4f * s),
+                    ImVec2(c.x + 0.12f * s, c.y - 0.26f * s), colour, 0.0f, ImDrawCornerFlags_All,
+                    line);
+        dl->AddQuad(ImVec2(c.x - 0.28f * s, c.y - 0.16f * s),
+                    ImVec2(c.x + 0.28f * s, c.y - 0.16f * s),
+                    ImVec2(c.x + 0.2f * s, c.y + 0.4f * s), ImVec2(c.x - 0.2f * s, c.y + 0.4f * s),
+                    colour, line);
+        for (const float x : {c.x - 0.08f * s, c.x + 0.08f * s}) {
+            dl->AddLine(ImVec2(x, c.y - 0.04f * s), ImVec2(x, c.y + 0.28f * s), colour, line);
+        }
         break;
     case Icon::People:
         for (const float x : {c.x - 0.17f * s, c.x + 0.17f * s}) {
@@ -1063,14 +1086,14 @@ const char* CategoryName(int category) {
                                             Translatable("Sound"),   Translatable("Controls"),
                                             Translatable("System"),  Translatable("Patches"),
                                             Translatable("Cheats"),  Translatable("Installed"),
-                                            Translatable("File")};
+                                            Translatable("File"),    Translatable("Data")};
     return names[category];
 }
 
 Icon CategoryIcon(int category) {
-    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge,     Icon::Speaker,
-                                     Icon::Pad,     Icon::Globe,     Icon::Patch,
-                                     Icon::Cheat,   Icon::Disk,      Icon::Cartridge};
+    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge,     Icon::Speaker, Icon::Pad,
+                                     Icon::Globe,   Icon::Patch,     Icon::Cheat,   Icon::Disk,
+                                     Icon::Cartridge, Icon::Bin};
     return icons[category];
 }
 
@@ -1080,6 +1103,96 @@ u64 TreeSize(const FileUtil::FSTEntry& entry) {
         size += child.isDirectory ? TreeSize(child) : child.size;
     }
     return size;
+}
+
+struct FolderEntry {
+    std::string name;
+    u64 size;
+    bool folder;
+};
+
+/// A folder's entries, with sceIoDread's stat (no call for each file); none when it does not open.
+std::optional<std::vector<FolderEntry>> ListFolder(const std::string& path) {
+    const SceUID d = sceIoDopen(path.c_str());
+    if (d < 0) {
+        return std::nullopt;
+    }
+    std::vector<FolderEntry> entries;
+    SceIoDirent entry{};
+    while (sceIoDread(d, &entry) > 0) {
+        const std::string_view name{entry.d_name};
+        if (name != "." && name != "..") {
+            entries.push_back({std::string{name}, static_cast<u64>(entry.d_stat.st_size),
+                               SCE_S_ISDIR(entry.d_stat.st_mode)});
+        }
+    }
+    sceIoDclose(d);
+    return entries;
+}
+
+void CountFolder(const std::string& path, u64& bytes, u32& files) {
+    for (const FolderEntry& entry : ListFolder(path).value_or(std::vector<FolderEntry>{})) {
+        if (entry.folder) {
+            CountFolder(path + "/" + entry.name, bytes, files);
+        } else {
+            bytes += entry.size;
+            files++;
+        }
+    }
+}
+
+/// Deletes a folder's files (`removed` after each), its folders, then the folder: how many of
+/// them stayed.
+u32 DeleteFolder(const std::string& path, const std::function<void()>& removed) {
+    u32 left = 0;
+    for (const FolderEntry& entry : ListFolder(path).value_or(std::vector<FolderEntry>{})) {
+        const std::string inner = path + "/" + entry.name;
+        if (entry.folder) {
+            left += DeleteFolder(inner, removed);
+        } else {
+            left += sceIoRemove(inner.c_str()) < 0 ? 1 : 0;
+            removed();
+        }
+    }
+    return left + (sceIoRmdir(path.c_str()) < 0 ? 1 : 0);
+}
+
+/// CountFolder and DeleteFolder through FileUtil, for the emulated SD card: its paths deeper than
+/// the Vita's ten components are folded into one name, which a plain listing does not show.
+void CountSdFolder(const std::string& path, u64& bytes, u32& files) {
+    FileUtil::ForeachDirectoryEntry(
+        nullptr, path, [&](u64*, const std::string& folder, const std::string& name) {
+            const std::string inner = folder + "/" + name;
+            if (FileUtil::IsDirectory(inner)) {
+                CountSdFolder(inner, bytes, files);
+            } else {
+                bytes += FileUtil::GetSize(inner);
+                files++;
+            }
+            return true;
+        });
+}
+
+u32 DeleteSdFolder(const std::string& path, const std::function<void()>& removed) {
+    u32 left = 0;
+    FileUtil::ForeachDirectoryEntry(
+        nullptr, path, [&](u64*, const std::string& folder, const std::string& name) {
+            const std::string inner = folder + "/" + name;
+            if (FileUtil::IsDirectory(inner)) {
+                left += DeleteSdFolder(inner, removed);
+            } else {
+                left += FileUtil::Delete(inner) ? 0 : 1;
+                removed();
+            }
+            return true;
+        });
+    return left + (FileUtil::DeleteDir(path) ? 0 : 1);
+}
+
+std::string SizeText(u64 bytes) {
+    constexpr u64 KiB = 1024, MiB = KiB * KiB;
+    return bytes < MiB ? fmt::format("{} KiB", (bytes + KiB - 1) / KiB)
+                       : fmt::format("{} MiB", (bytes + MiB - 1) / MiB);
 }
 
 /// The title's program ID, as its file names it; 0 for a file without one (a 3DSX).
@@ -1948,11 +2061,14 @@ void Ui::OpenSettings(std::string title, std::string name, State back, u64 progr
         settings_cheats.assign(cheats.begin(), cheats.end());
     }
     ScanInstalled();
+    settings_data.clear();
+    data_scanned = false;
     category = SettingsCategories().front();
     focused_row = -1;
     focused_patch = -1;
     focused_cheat = -1;
     focused_installed = armed_installed = -1;
+    focused_data = -1;
     focus_first_row = true;
     state = State::Settings;
     overlay_focused = false;
@@ -2015,6 +2131,7 @@ std::vector<Ui::Category> Ui::SettingsCategories() const {
             tab == Category::Patches  ? !settings_patches.empty()
             : tab == Category::Cheats ? settings_program_id != 0
             : tab == Category::Installed ? !settings_installed.empty()
+            : tab == Category::Data      ? settings_program_id != 0
             : tab == Category::File
                 ? !settings_path.empty()
                 : std::any_of(rows.begin(), rows.end(), [&](const Row& row) {
@@ -2571,6 +2688,169 @@ void Ui::DrawFileInfo() {
     }
 }
 
+void Ui::ScanData() {
+    data_scanned = true;
+    settings_data.clear();
+    // The save data: the save archive's folder (the archive and its metadata; the title's
+    // installed content beside it stays) and the title's extdata, where some games keep their
+    // saves. Both nest past ten components: folded (CountSdFolder).
+    DataPart saves{DataKind::SaveData, Translatable("Save data")};
+    const auto add_saves = [&saves](std::string folder) {
+        if (!FileUtil::IsDirectory(folder)) {
+            return;
+        }
+        // A folder the game left without a file in it reads as no save data.
+        const u32 before = saves.files;
+        CountSdFolder(folder, saves.bytes, saves.files);
+        if (saves.files != before) {
+            saves.folders.push_back(std::move(folder));
+        }
+    };
+    const std::string& sdmc = FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir);
+    const std::string archive =
+        FileSys::ArchiveSource_SDSaveData::GetSaveDataPathFor(sdmc, settings_program_id);
+    constexpr std::string_view ArchiveTail = "/00000001/";
+    ASSERT_MSG(archive.ends_with("/data/00000001/"), "settings: save data at {}", archive);
+    add_saves(archive.substr(0, archive.size() - ArchiveTail.size()));
+    u64 extdata_id = 0;
+    if (settings_path.empty()) {
+        ASSERT_MSG(settings_back == State::Pause, "settings: title {:016X} without its file",
+                   settings_program_id);
+        system.GetAppLoader().ReadExtdataId(extdata_id);
+    } else if (const std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(settings_path)) {
+        loader->ReadExtdataId(extdata_id);
+    }
+    if (extdata_id != 0) {
+        std::string extdata = FileSys::GetExtDataPathFromId(sdmc, extdata_id);
+        extdata.pop_back();
+        add_saves(std::move(extdata));
+    }
+    settings_data.push_back(std::move(saves));
+
+    const auto add = [](DataPart& part, std::string folder) {
+        if (ListFolder(folder)) {
+            CountFolder(folder, part.bytes, part.files);
+            part.folders.push_back(std::move(folder));
+        }
+    };
+
+    DataPart shaders{DataKind::ShaderCache, Translatable("Shader cache")};
+    const std::string prefix = fmt::format("{:016x}.", settings_program_id);
+    const std::string root = SgxdRenderer::ShaderDiskCache::Root;
+    for (const FolderEntry& entry : ListFolder(root).value_or(std::vector<FolderEntry>{})) {
+        if (entry.folder && entry.name.starts_with(prefix)) {
+            add(shaders, root + "/" + entry.name);
+        }
+    }
+    settings_data.push_back(std::move(shaders));
+}
+
+void Ui::DrawDataRow(std::size_t index) {
+    constexpr float Pad = 18.0f;
+
+    ImGui::PushID(static_cast<int>(index));
+    const DataPart& part = settings_data[index];
+    const std::string size_text =
+        part.folders.empty() ? std::string{Tr("Empty")} : SizeText(part.bytes);
+    const float width = ImGui::GetContentRegionAvail().x;
+    const Card card = CardItem("##data", ImVec2(width, RowHeight));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    if (ImGui::GetFocusID() == card.id) {
+        focused_data = static_cast<int>(index);
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float mid = card.bb.GetCenter().y;
+        const char* const name = Tr(part.name);
+        const ImVec2 label = ImGui::CalcTextSize(name);
+        const ImVec2 size = ImGui::CalcTextSize(size_text.c_str());
+        dl->AddText(ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text), name);
+        dl->AddText(ImVec2(card.bb.Max.x - Pad - size.x, mid - size.y * 0.5f),
+                    Colour(palette->TextDim), size_text.c_str());
+    }
+    ImGui::PopID();
+    if (card.pressed && settings_back == State::GameList && !part.folders.empty()) {
+        question = Question::ClearData;
+        clear_data = static_cast<int>(index);
+    }
+}
+
+void Ui::DrawDataInfo() {
+    if (focused_data < 0) {
+        return;
+    }
+    const DataPart& part = settings_data[static_cast<std::size_t>(focused_data)];
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", Tr(part.name));
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "%s", part.kind == DataKind::SaveData
+                  ? Tr("What the game saved on the emulated SD card: its progress and its own "
+                       "options. Deleting it starts the game over as new. Its savestates and extra "
+                       "data stay.")
+                  : Tr("The programs Azahar made for this game's graphics, by every version of "
+                       "Azahar that ran it, kept so that the next start need not make them again. "
+                       "Deleting it frees their space; the game stutters for a while as it makes "
+                       "them again."));
+    ImGui::Spacing();
+    if (part.folders.empty()) {
+        Note(palette->TextDim, Tr("Nothing to delete."));
+    } else {
+        Note(palette->TextDim, TrFormat("{} in {} files.", SizeText(part.bytes), part.files));
+    }
+    if (settings_back != State::GameList) {
+        Note(palette->Accent, Tr("Quit the game to delete it."));
+    }
+}
+
+std::string Ui::ClearData(const std::function<void()>& present) {
+    ASSERT_MSG(clear_data >= 0 && settings_back == State::GameList,
+               "settings: data {} cleared from screen {}", clear_data,
+               static_cast<int>(settings_back));
+    const DataPart part = settings_data[static_cast<std::size_t>(std::exchange(clear_data, -1))];
+    const bool saves = part.kind == DataKind::SaveData;
+    SetStatusMessage(saves ? TrFormat("Deleting {}'s save data...", settings_name)
+                           : TrFormat("Deleting {}'s shader cache...", settings_name));
+    SetProgress(0.0f);
+    present();
+    if (!saves) {
+        SgxdRenderer::ShaderDiskCache::Forget(settings_program_id);
+    }
+    const u64 start = sceKernelGetProcessTimeWide();
+    u64 shown = start;
+    u32 done = 0;
+    const auto removed = [&] {
+        done++;
+        const u64 now = sceKernelGetProcessTimeWide();
+        if (now - shown < 100'000) {
+            return;
+        }
+        shown = now;
+        SetProgress(static_cast<float>(done) / static_cast<float>(std::max(part.files, done)));
+        present();
+    };
+    u32 left = 0;
+    for (const std::string& folder : part.folders) {
+        left += saves ? DeleteSdFolder(folder, removed) : DeleteFolder(folder, removed);
+    }
+    LOG_INFO(Frontend, "Deleted {} of {:016X}: {} files, {} bytes, in {} ms; {} stayed", part.name,
+             settings_program_id, done, part.bytes, (sceKernelGetProcessTimeWide() - start) / 1000,
+             left);
+    ClearStatusMessage();
+    ScanData();
+    if (left != 0) {
+        return TrFormat("{} files or folders could not be deleted. Restart the Vita, then delete "
+                        "them again.",
+                        left);
+    }
+    return saves ? TrFormat("{}'s save data is deleted.", settings_name)
+                 : TrFormat("{}'s shader cache is deleted.", settings_name);
+}
+
 void Ui::DrawConsoleNameRow() {
     constexpr float Pad = 18.0f;
     const float width = ImGui::GetContentRegionAvail().x;
@@ -2785,7 +3065,8 @@ Ui::Action Ui::DrawSettings() {
     // The Patches tab changes nothing; the Cheats tab's rows are switches alone, the Installed
     // tab's are removed.
     const bool option_rows = category != Category::Patches && category != Category::Cheats &&
-                             category != Category::Installed && category != Category::File;
+                             category != Category::Installed && category != Category::File &&
+                             category != Category::Data;
     bool back = FooterButton(Glyph::Circle, Tr("Back"));
     if (option_rows) {
         FooterButton(Glyph::LeftRight, Tr("Change"));
@@ -2798,6 +3079,8 @@ Ui::Action Ui::DrawSettings() {
         FooterButton(Glyph::Cross, install_row ? Tr("Install") : Tr("Remove"));
     } else if (category == Category::File && FooterButton(Glyph::Cross, Tr("Check"))) {
         check_requested = true;
+    } else if (category == Category::Data && settings_back == State::GameList) {
+        FooterButton(Glyph::Cross, Tr("Delete"));
     }
     if (categories.size() > 1 && FooterButton(Glyph::Shoulders, Tr("Tab")) && !next_category) {
         const int at = static_cast<int>(current - categories.begin());
@@ -2844,6 +3127,7 @@ Ui::Action Ui::DrawSettings() {
         focused_cheat = -1;
         focused_installed = armed_installed = -1;
         focused_rom_folder = armed_rom_folder = -1;
+        focused_data = -1;
         focus_first_row = true;
     }
     if (category == Category::Patches) {
@@ -2869,6 +3153,13 @@ Ui::Action Ui::DrawSettings() {
         }
     } else if (category == Category::File) {
         DrawFileRow();
+    } else if (category == Category::Data) {
+        if (!data_scanned) {
+            ScanData();
+        }
+        for (std::size_t i = 0; i < settings_data.size(); i++) {
+            DrawDataRow(i);
+        }
     } else {
         for (std::size_t i = 0; i < rows.size(); i++) {
             const Row& row = rows[i];
@@ -2904,6 +3195,8 @@ Ui::Action Ui::DrawSettings() {
         DrawInstalledInfo();
     } else if (category == Category::File) {
         DrawFileInfo();
+    } else if (category == Category::Data) {
+        DrawDataInfo();
     } else {
         DrawRowInfo();
     }

@@ -48,6 +48,12 @@ public:
     /// second tier's workers, and its end.
     u32 WriteBatch(bool all = false);
 
+    /// The versions' directories, TITLE.KIND.VERSION each: TITLE the program id in 16 hex digits.
+    static constexpr const char* Root = "ux0:data/azahar/shaders";
+    /// No title running, its directories about to be deleted: the programs a run of the title
+    /// read or stored, kept for the process, dropped, so that its next Open reads the card again.
+    static void Forget(u64 title_id);
+
 private:
     bool opened = false;            ///< Open's own
     std::atomic<bool> ready{false}; ///< a version's directory open (Open's release)
