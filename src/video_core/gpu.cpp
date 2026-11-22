@@ -316,28 +316,49 @@ GPU::ScanRoom GPU::TakeScanRoom() {
 }
 #endif
 
-PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
-    if (addr == 0 || replay_physical) {
+constexpr Result ResultInvalidGpuBuffer(ErrorDescription::InvalidAddress, ErrorModule::GX,
+                                        ErrorSummary::InvalidArgument,
+                                        ErrorLevel::Usage); // 0xE0E02BF5
+constexpr Result ResultUnknownGxCommand(ErrorDescription::NotImplemented, ErrorModule::GX,
+                                        ErrorSummary::NotSupported,
+                                        ErrorLevel::Usage); // 0xE0C02BF4
+
+std::optional<PAddr> GPU::VirtualToPhysicalAddress(VAddr addr, u32 size) {
+    // A replay's commands carry physical addresses already (vprof).
+    if (replay_physical) {
         return addr;
     }
+    // Address translation of the GSP module.
+    // The linear heaps and the New 3DS extra memory must contain both the start,
+    // and the end of the buffer, VRAM only the start. The ends of the
+    // ranges are inclusive.
+    const VAddr end = addr + size;
+    const auto contains = [addr, end](VAddr range_start, VAddr range_end) {
+        return addr >= range_start && addr <= range_end && end >= range_start && end <= range_end;
+    };
 
+    if (contains(Memory::LINEAR_HEAP_VADDR, Memory::LINEAR_HEAP_VADDR_END)) {
+        return addr - Memory::LINEAR_HEAP_VADDR + Memory::FCRAM_PADDR;
+    }
+    if (contains(Memory::NEW_LINEAR_HEAP_VADDR, Memory::NEW_LINEAR_HEAP_VADDR_END)) {
+        return addr - Memory::NEW_LINEAR_HEAP_VADDR + Memory::FCRAM_PADDR;
+    }
     if (addr >= Memory::VRAM_VADDR && addr <= Memory::VRAM_VADDR_END) {
         return addr - Memory::VRAM_VADDR + Memory::VRAM_PADDR;
     }
-    if (addr >= Memory::LINEAR_HEAP_VADDR && addr <= Memory::LINEAR_HEAP_VADDR_END) {
-        return addr - Memory::LINEAR_HEAP_VADDR + Memory::FCRAM_PADDR;
+    if (contains(Memory::N3DS_EXTRA_RAM_VADDR, Memory::N3DS_EXTRA_RAM_VADDR_END)) {
+        return addr - Memory::N3DS_EXTRA_RAM_VADDR + Memory::N3DS_EXTRA_RAM_PADDR;
     }
-    if (addr >= Memory::NEW_LINEAR_HEAP_VADDR && addr <= Memory::NEW_LINEAR_HEAP_VADDR_END) {
-        return addr - Memory::NEW_LINEAR_HEAP_VADDR + Memory::FCRAM_PADDR;
-    }
+
+    // TODO(PabloMK7): Find a better way to handle this.
     PAddr plg_fb_addr;
-    if (addr >= Memory::PLUGIN_3GX_FB_VADDR && addr <= Memory::PLUGIN_3GX_FB_VADDR_END &&
+    if (contains(Memory::PLUGIN_3GX_FB_VADDR, Memory::PLUGIN_3GX_FB_VADDR_END) &&
         (plg_fb_addr = impl->system.Memory().Plugin3GXFramebufferAddress())) {
         return addr - Memory::PLUGIN_3GX_FB_VADDR + plg_fb_addr;
     }
 
-    LOG_ERROR(HW_Memory, "Unknown virtual address @ 0x{:08X}", addr);
-    return addr;
+    LOG_ERROR(HW_GPU, "Invalid GPU buffer address 0x{:08X} (size 0x{:X})", addr, size);
+    return std::nullopt;
 }
 
 void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
@@ -379,7 +400,7 @@ void GPU::ClearAll(bool flush) {
     impl->rasterizer->ClearAll(flush);
 }
 
-void GPU::Execute(const Service::GSP::Command& command) {
+Result GPU::Execute(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
 #ifdef VITA_DIAGNOSTICS
@@ -390,7 +411,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
         Service::GSP::Command p = command;
         const auto phys = [this](u32& a) {
             if (a != 0) {
-                a = VirtualToPhysicalAddress(a);
+                a = VirtualToPhysicalAddress(a, 1).value_or(0);
             }
         };
         switch (command.id) {
@@ -419,6 +440,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
         SgxdRenderer::Vprof::Gsp(words.data());
     }
 #endif
+    Result result = ResultSuccess;
 
     switch (command.id) {
     case CommandId::RequestDma: {
@@ -443,7 +465,8 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     case CommandId::SubmitCmdList: {
         auto& params = command.submit_gpu_cmdlist;
-        const PAddr address = VirtualToPhysicalAddress(params.address);
+        // The GSP module uses address 0 when the buffer is not in GPU visible memory.
+        const PAddr address = VirtualToPhysicalAddress(params.address, params.size).value_or(0);
         const u32 size = params.size;
         RunGpuOp(OpKind::CmdList, [this, &regs, address, size] {
             auto& cmdbuffer = regs.internal.pipeline.command_buffer;
@@ -471,17 +494,33 @@ void GPU::Execute(const Service::GSP::Command& command) {
         // with both buffers set it raises PSC0 alone (3dbrew GSP Shared Memory, command 2):
         // here behind the second fill.
         using Service::GSP::InterruptId;
+        const auto translate = [this](u32 start, u32 end) -> std::optional<PAddr> {
+            if (start >= end) {
+                return std::nullopt;
+            }
+            return VirtualToPhysicalAddress(start, end - start);
+        };
         const bool has_both_bufs = params.start1 != 0 && params.start2 != 0;
         if (params.start1 != 0) {
-            memfill[0].address_start = VirtualToPhysicalAddress(params.start1) >> 3;
-            memfill[0].address_end = VirtualToPhysicalAddress(params.end1) >> 3;
+            const auto start = translate(params.start1, params.end1);
+            if (!start) {
+                result = ResultInvalidGpuBuffer;
+                break;
+            }
+            memfill[0].address_start = *start >> 3;
+            memfill[0].address_end = (*start + params.end1 - params.start1) >> 3;
             memfill[0].value_32bit = params.value1;
             memfill[0].control = params.control1;
             MemoryFill(0, has_both_bufs ? std::nullopt : std::optional{InterruptId::PSC0});
         }
         if (params.start2 != 0) {
-            memfill[1].address_start = VirtualToPhysicalAddress(params.start2) >> 3;
-            memfill[1].address_end = VirtualToPhysicalAddress(params.end2) >> 3;
+            const auto start = translate(params.start2, params.end2);
+            if (!start) {
+                result = ResultInvalidGpuBuffer;
+                break;
+            }
+            memfill[1].address_start = *start >> 3;
+            memfill[1].address_end = (*start + params.end2 - params.start2) >> 3;
             memfill[1].value_32bit = params.value2;
             memfill[1].control = params.control2;
             MemoryFill(1, has_both_bufs ? InterruptId::PSC0 : InterruptId::PSC1);
@@ -493,8 +532,12 @@ void GPU::Execute(const Service::GSP::Command& command) {
         auto& display_transfer = regs.display_transfer_config;
 
         // Write to the transfer engine GPU registers.
-        display_transfer.input_address = VirtualToPhysicalAddress(params.in_buffer_address) >> 3;
-        display_transfer.output_address = VirtualToPhysicalAddress(params.out_buffer_address) >> 3;
+        // The GSP module uses address 0 when the buffer is not in GPU visible memory (only the
+        // first byte is checked).
+        display_transfer.input_address =
+            VirtualToPhysicalAddress(params.in_buffer_address, 1).value_or(0) >> 3;
+        display_transfer.output_address =
+            VirtualToPhysicalAddress(params.out_buffer_address, 1).value_or(0) >> 3;
         display_transfer.input_size = params.in_buffer_size;
         display_transfer.output_size = params.out_buffer_size;
         display_transfer.flags = params.flags;
@@ -509,8 +552,11 @@ void GPU::Execute(const Service::GSP::Command& command) {
         auto& texture_copy = regs.display_transfer_config;
 
         // Write to the transfer engine GPU registers.
-        texture_copy.input_address = VirtualToPhysicalAddress(params.in_buffer_address) >> 3;
-        texture_copy.output_address = VirtualToPhysicalAddress(params.out_buffer_address) >> 3;
+        // The GSP module uses address 0 when the buffer is not in GPU visible memory.
+        texture_copy.input_address =
+            VirtualToPhysicalAddress(params.in_buffer_address, params.size).value_or(0) >> 3;
+        texture_copy.output_address =
+            VirtualToPhysicalAddress(params.out_buffer_address, params.size).value_or(0) >> 3;
         texture_copy.texture_copy.size = params.size;
         texture_copy.texture_copy.input_size = params.in_width_gap;
         texture_copy.texture_copy.output_size = params.out_width_gap;
@@ -528,28 +574,45 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     default:
         LOG_ERROR(HW_GPU, "Unknown command {:#08X}", command.id.Value());
+        result = ResultUnknownGxCommand;
     }
 
     // Notify debugger that a GSP command was processed.
+    return result;
 }
 
 void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info) {
-    const PAddr phys_address_left = VirtualToPhysicalAddress(info.address_left);
-    const PAddr phys_address_right = VirtualToPhysicalAddress(info.address_right);
+    // The GSP module does not apply a framebuffer outside GPU visible memory. The right address
+    // is used only for the top screen in stereoscopic mode and when it is not zero.
+    // Otherwise the left address is used for both eyes.
+    const auto phys_address_left = VirtualToPhysicalAddress(info.address_left, info.stride);
+    if (!phys_address_left) {
+        return;
+    }
 
     // Update framebuffer properties.
     auto& framebuffer = impl->pica.regs.framebuffer_config[screen_id];
+    if (screen_id == 0) {
+        const bool stereoscopic = (info.format & 0x70) == 0x20;
+        const PAddr phys_address_right =
+            (!stereoscopic || info.address_right == 0)
+                ? *phys_address_left
+                : VirtualToPhysicalAddress(info.address_right, info.stride).value_or(0);
+        if (info.active_fb == 0) {
+            framebuffer.address_right1 = phys_address_right;
+        } else {
+            framebuffer.address_right2 = phys_address_right;
+        }
+    }
     if (info.active_fb == 0) {
-        framebuffer.address_left1 = phys_address_left;
-        framebuffer.address_right1 = phys_address_right;
+        framebuffer.address_left1 = *phys_address_left;
     } else {
-        framebuffer.address_left2 = phys_address_left;
-        framebuffer.address_right2 = phys_address_right;
+        framebuffer.address_left2 = *phys_address_left;
     }
 
     framebuffer.stride = info.stride;
-    framebuffer.format = info.format;
-    framebuffer.active_fb = info.shown_fb;
+    framebuffer.format = (framebuffer.format & 0xFFFF0000) | (info.format & 0xFFFF);
+    framebuffer.active_fb = info.shown_fb & 0xFF;
 #ifdef ENABLE_GXM
     // The guest's frame, even to the buffer already shown: written again.
     impl->screens_changed = true;
@@ -707,6 +770,17 @@ void GPU::SubmitCmdList(u32 index) {
     // Forward command list processing to the PICA core.
     const PAddr addr = config.GetPhysicalAddress(index);
     const u32 size = config.GetSize(index);
+
+    // Do not process the list if the memory range is not sane.
+    auto& memory = impl->system.Memory();
+    const u8* head = memory.GetPhysicalPointer(addr);
+    if (!head || (size != 0 && memory.GetPhysicalPointer(addr + size - 1) != head + size - 1)) {
+        LOG_ERROR(HW_GPU, "Invalid command list address 0x{:08X} (size 0x{:X})", addr, size);
+        impl->signal_interrupt(Service::GSP::InterruptId::P3D, 0);
+        config.trigger[index] = 0;
+        return;
+    }
+
     impl->pica.ProcessCmdList(addr, size,
                               !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
     config.trigger[index] = 0;

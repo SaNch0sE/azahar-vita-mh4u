@@ -16,6 +16,7 @@
 #include <vector>
 #include <boost/serialization/access.hpp>
 
+#include "core/hle/result.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -80,7 +81,7 @@ public:
     void ClearAll(bool flush);
 
     /// Executes the provided GSP command.
-    void Execute(const Service::GSP::Command& command);
+    Result Execute(const Service::GSP::Command& command);
 
     /// Updates GPU display framebuffer configuration using the specified parameters.
     void SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
@@ -269,7 +270,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 
-    PAddr VirtualToPhysicalAddress(VAddr addr);
+    /// Translates the address of a GPU buffer as the GSP module does, or returns std::nullopt when
+    /// the buffer is not in GPU visible memory.
+    std::optional<PAddr> VirtualToPhysicalAddress(VAddr addr, u32 size);
 };
 
 } // namespace VideoCore
