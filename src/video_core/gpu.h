@@ -154,25 +154,6 @@ public:
     /// opening later): the access runs again natively, and so do the guest's next ones there.
     bool GuestOpensHeldPage(const u8* host, u32 size, bool write);
 
-    /**
-     * With the sgxd renderer, its render thread held (RenderThread::Hold): for the guard's life the
-     * rasterizer, the renderer and sgxd are the caller's, with everything queued before done. For
-     * the work that cannot run on the render thread or beside it: FCRAM page moves (the guest
-     * stopped), the frontend's presents and settings, savestates, `perflog`'s counters.
-     */
-    class RenderHold {
-    public:
-        explicit RenderHold(GPU& gpu);
-        ~RenderHold();
-        RenderHold(const RenderHold&) = delete;
-        RenderHold& operator=(const RenderHold&) = delete;
-
-    private:
-        GPU& gpu;
-    };
-    [[nodiscard]] RenderHold HoldRender() {
-        return RenderHold{*this};
-    }
     /// The render thread, the rasterizer the PICA calls (renderer_sgxd/render_thread.h).
     [[nodiscard]] SgxdRenderer::RenderThread& GetRenderThread();
     /// The vblank's timer event (VBlankCallback): the frame's end, the presents and the page
@@ -234,8 +215,8 @@ public:
 private:
     void SubmitCmdList(u32 index);
 
-    /// With the render thread held and no title: the LCD's screens to the window as
-    /// VBlankCallback shows them, then the GPU idle (the replay's presents, HostFrame's).
+    /// The LCD's screens to the window as VBlankCallback shows them, then the GPU idle, on the
+    /// render thread after the work queued (the replay's presents, HostFrame's).
     void PresentScreensNow();
 
     /// Runs fill unit `index` if triggered and raises `interrupt` for it (none: GSP's command
@@ -272,11 +253,6 @@ private:
     /// for that work wait for (SgxdRenderer::PageHolds): the guest hears of the work before the
     /// SGX has done it, and a guest access to its pages waits. None while vprof's replay runs.
     void Signal(Service::GSP::InterruptId id, u64 delay_ns);
-    /// vprof's capture records its frame with the render thread held, so that the frame's ops
-    /// and the draws they make interleave as they run: on from the vblank the frame starts at
-    /// to the one it ends at.
-    void SyncCaptureHold();
-    bool capture_hold = false;
 
     friend class boost::serialization::access;
     template <class Archive>

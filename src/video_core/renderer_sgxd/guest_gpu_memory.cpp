@@ -312,7 +312,7 @@ u32 GuestGpuMemory::ReturnPages(const std::vector<std::pair<u32, u32>>& pages) {
         }
         // The GPU's writes queued to the pages land in their pool pages: done first, so that
         // the copy back takes them. Its reads go on from the pool pages until its remap.
-        hooks.wait_writes(Memory::FCRAM_PADDR + page * PageSize, run * PageSize);
+        hooks.wait_writes(Memory::FCRAM_PADDR + page * PageSize, run * PageSize, true);
         const int ret = azaharRebackReturn(
             static_cast<u32>(reinterpret_cast<uintptr_t>(fcram + page * PageSize)), run * PageSize);
         if (ret != static_cast<int>(run)) {
@@ -492,7 +492,7 @@ void GuestGpuMemory::MakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] 
     }
     // No idle GPU (the class's comment): the GPU's writes queued to the range land first, so
     // that the copy takes them; its reads go on from the old pages until its remap.
-    hooks.wait_writes(addr, size);
+    hooks.wait_writes(addr, size, false);
     const u32 start = azaharCyclesStart();
     const u32 offset = addr - Memory::FCRAM_PADDR;
     const u32 first = offset / PageSize;

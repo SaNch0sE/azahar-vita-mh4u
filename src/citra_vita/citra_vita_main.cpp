@@ -1792,9 +1792,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         }
     }
 #endif
-    // A savestate's save or load: a panel with its progress on black, ten times a second. This
-    // thread presents, with the render thread held (it may still be drawing the frames before a
-    // save); the load's restart has none. The share of each load phase is from a load of RE
+    // A savestate's save or load: a panel with its progress on black, ten times a second. The
+    // render thread presents it after the frames queued before (RunSync); in the load's restart,
+    // with none running, this thread does. The load phases' shares are a measured load's: the file
+    // read 3.0 s, the restart 1.9 s, the restore 3.4 s.
     u32 progress_slot = 0;
     u64 progress_shown = 0;
     system.SetStateProgressCallback([&](Core::System::StatePhase phase, float fraction) {
@@ -1821,12 +1822,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         ui.SetStatusMessage(phase == Phase::Saving ? TrFormat("Saving slot {}...", progress_slot)
                                                    : TrFormat("Loading slot {}...", progress_slot));
         ui.SetProgress(overall);
-        std::optional<VideoCore::GPU::RenderHold> hold;
-        if (phase != Phase::Restarting) {
-            hold.emplace(system.GPU());
+        // The present on the render thread, the GPU's owner, while a title runs (the save, a
+        // load's read and restore, its restart's end); between a load's shutdown and its start
+        // again there is none, and the present is this thread's, as the game list's.
+        const auto present = [&] {
+            ui.Update();
+            window.PresentInterfaceOnly(&ui);
+        };
+        if (system.IsPoweredOn()) {
+            system.GPU().GetRenderThread().RunSync(present);
+        } else {
+            present();
         }
-        ui.Update();
-        window.PresentInterfaceOnly(&ui);
     });
     // The callback holds this function's locals: gone with them, whichever way it returns.
     struct ProgressReset {
@@ -2228,14 +2235,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              "fill {}, "
                              "transfer {}, dma {}, present {}, other {}; present {} ({} "
                              "dropped behind, {} too soon; gaps to 20 ms {}, 37 {}, 54 {}, "
-                             "longer {}); holds {} waiting {:.1f} ms",
+                             "longer {})",
                              t.busy_us / 1e3, t.idle_us / 1e3, t.gpu_wakes, t.timeouts,
                              render_counters.gpu_wait_us / 1e3, t.records[K::State],
                              t.records[K::Draw], t.records[K::Fill], t.records[K::Transfer],
                              t.records[K::Dma], t.records[K::Present], t.records[K::Other],
                              t.presents, t.presents_behind, t.presents_soon, t.present_gaps[0],
-                             t.present_gaps[1], t.present_gaps[2], t.present_gaps[3], t.holds,
-                             t.hold_us / 1e3);
+                             t.present_gaps[1], t.present_gaps[2], t.present_gaps[3]);
                     LOG_INFO(
                         Frontend,
                         "perf: late skip: {} frames, {} draws dropped, "

@@ -70,14 +70,14 @@ public:
 
     /// From the emulation thread: whether [addr, addr + size) would rather be somewhere the CPU
     /// reaches uncached, because the GPU is about to write it (a display transfer's output) or
-    /// show it (a framebuffer the LCD names). The GPU then calls MakeUncached, the guest
-    /// stopped.
+    /// show it (a framebuffer the LCD names). The GPU then has the render thread call
+    /// MakeUncached, the guest stopped.
     bool WouldMakeUncached(PAddr addr, u32 size) const;
     /// See WouldMakeUncached. `overwritten`: the GPU is about to write the whole range.
     void MakeUncached(PAddr addr, u32 size, bool overwritten);
     /// From the emulation thread at vblank, with the guest stopped: a frame has ended. Whether
     /// memory MakeUncached moved should go back (unused long enough, or the pool short of free
-    /// pages), which ReturnUncached then does with the render thread held.
+    /// pages), which ReturnUncached then does on the render thread (RunSync).
     bool UncachedFrameEnded() {
         return guest_memory.EndFrame();
     }

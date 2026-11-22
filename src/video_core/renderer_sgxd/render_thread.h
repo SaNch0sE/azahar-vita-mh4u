@@ -50,18 +50,7 @@ class RendererSgxd;
  * the interrupt goes to the guest at once. The pages that work touches stay held until the ticket
  * is reached. While tickets wait the thread sleeps until sgxd wakes it for the oldest one's fence.
  *
- * Every producer holds the GPU's lock (VideoCore::GPU::Lock): the ring has one writer at a
- * time. The parsed ring has one, the parse thread.
- *
- * The window is this thread's too: each VBlank's present record polls its input and presents,
- * and with no present for WindowPollInterval the thread polls it on its own. The PS button's
- * pause menu runs inside such a poll (EmuWindowVita::PollEvents), on this thread, while the
- * emulation waits for it.
- *
- * Held: the work that must run off this thread (FCRAM page moves, which need the guest stopped;
- * vprof's capture and replay; savestates; settings) parks the thread with the ring drained
- * (Hold). Until Release, the holder's thread is the render side: each record runs as it is
- * written, and the interrupts' fences are polled there.
+ * Every producer holds the GPU's lock (VideoCore::GPU::Lock): the ring has one writer at a time.
  */
 class RenderThread final : public VideoCore::RasterizerInterface {
 public:
@@ -141,10 +130,8 @@ public:
     // The surfaces reach guest memory through the operations that write them there, the pictures
     // through the reads of their bytes (the page holds copy a picture's rows first).
     void FlushAll() override {}
-    /// A savestate, under the hold (System::serialize): the pictures guest memory is older
-    /// than go there first (RasterizerSgxd::FlushAll). A load makes the renderer again, so its
-    /// rasterizer has none.
-    void ClearAll(bool) override;
+    /// A savestate's save, on this thread: the pictures guest memory is older than go there first.
+    void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
@@ -167,9 +154,6 @@ public:
 
     /// The page holds, emulation side, under the GPU's lock. On from the guest table's install.
     void EnablePageHolds();
-    /// Waits for the GPU writes queued to the FCRAM pages of [addr, addr + size) (a page move's
-    /// copy, GuestGpuMemory::MoveHooks).
-    void WaitGpuWrites(PAddr addr, u32 size);
     /// The guest's view gets the holds the work queued since made, at the end of each GPU operation and
     /// vblank.
     void ApplyPageHolds();
@@ -277,25 +261,10 @@ public:
         return shown_frames.load(std::memory_order_relaxed);
     }
 
-    /// Parks the thread once it has run everything queued; nests. Under the GPU's lock, which
-    /// the caller may let go of and take again while the hold lasts.
-    void Hold();
-    void Release();
-    /// Whether a hold is on (the GPU's lock held). The holder may then use the rasterizer, the
-    /// renderer and sgxd directly.
-    [[nodiscard]] bool Held() const {
-        return hold_depth != 0;
-    }
-    /// Under a hold, on the holder's thread: polls the fences, which nothing else does then.
-    /// Otherwise nothing.
-    void PollHeld();
-
     RasterizerSgxd& Rasterizer() {
         return rasterizer;
     }
 
-    /// The emulation side's waits for the thread, by kind: an interrupt ticket's work, ring
-    /// space, a RunSync (a hold's park is apart: Stats::holds).
     enum EmuWait : u32 { EmuTicket, EmuSpace, EmuSync, EmuWaits };
 
 #ifdef VITA_DIAGNOSTICS
@@ -305,13 +274,6 @@ public:
     static constexpr u32 GpuAtCells = GpuAtStates * GpuAtStates;
     static constexpr u32 GpuLabels = 64;
 
-    /// Since the last call (`perflog`; diagnostics builds only, as every counter behind it):
-    /// the records the thread ran by kind, its time running them and waiting for work (us),
-    /// sgxd's wakes for a ticket's GPU work and the sleeps with tickets pending that timed out
-    /// instead, the presents, and the holds with their waits for the thread to drain and park
-    /// (us). Timed by batch, not by record. The emulation side's waits by EmuWait: the waits
-    /// that did not return at once, their time (us), and their sleeps on `done` with those that
-    /// ended at the 1 ms timeout rather than a wake.
     struct Stats {
         /// State: the lists' decisions and the register writes; Draw: the lists.
         enum Kind : u32 { State, Draw, Fill, Transfer, Dma, Present, Other, Count };
@@ -371,8 +333,6 @@ public:
         std::array<u32, GpuLabels> gpu_ta_by;
         std::array<u32, GpuLabels> jobs_by;
         std::array<u32, 4> present_gaps;
-        u32 holds;
-        u64 hold_us;
         std::array<u32, EmuWaits> emu_waits;
         std::array<u64, EmuWaits> emu_wait_us;
         std::array<u32, EmuWaits> emu_sleeps;
@@ -492,25 +452,29 @@ private:
     static constexpr u32 NoRecord = 0xFFFFFFFF;
     std::atomic<u32> running_op{NoRecord};
     std::atomic<s32> render_tid{-1};
-    /// RunAvailable is running: a Call's function that queues returns to it. One thread drives
-    /// the render side at a time (a hold takes it once this thread parked, outside RunAvailable),
-    /// so the flag is that thread's.
+    /// RunAvailable is running: a Call's function that queues returns to it.
     bool running_available = false;
     u32 tickets{};                  ///< the last ticket handed out (GPU's lock)
     std::atomic<u32> reached{};     ///< the last ticket whose work is done
 
     PageHolds page_holds;
-    /// An access of the guest's CPU or the HLE to [addr, addr + bytes) where a picture owns rows
-    /// (RasterizerSgxd::PictureOwns), on any thread: the render side copies them into guest
-    /// memory and waits for the GPU (RasterizerSgxd::ServeGuestAccess), with write marking the
-    /// range written, before this returns. The holder of a hold serves its own.
+    /// A guest or HLE access to [addr, addr + bytes) where a picture owns rows, from any thread: the
+    /// render side copies them into guest memory before this returns.
     void AskPictureCopy(PAddr addr, u32 bytes, bool write, bool wait = true, bool beside = false);
+    /// [addr, addr + bytes)'s FCRAM pages moved to CDRAM by the render side, this thread waiting.
+    void AskMove(PAddr addr, u32 bytes);
+    /// A request for the render side, served between its records; waited for unless AccessNoWait.
+    static constexpr u32 AccessWrite = 1;
+    static constexpr u32 AccessNoWait = 2;
+    static constexpr u32 AccessMove = 4;
+    static constexpr u32 AccessBeside = 8;
+    void Ask(PAddr addr, u32 bytes, u32 flags);
     void ServeGuestAccesses();
     /// After a copy for a read of [lo, hi): the rows it may have written back watched for the first
     /// write.
     void WatchCopiedRows(PAddr lo, PAddr hi);
     std::mutex access_lock;
-    std::vector<std::array<u32, 3>> access_requests; ///< address, bytes, write
+    std::vector<std::array<u32, 3>> access_requests; ///< address, bytes, Access flags
     std::atomic<u32> access_requested{0}; ///< requests made (under access_lock)
     std::atomic<u32> access_served{0};    ///< requests served
 #ifdef VITA_DIAGNOSTICS
@@ -528,6 +492,9 @@ private:
     };
     BufferHold held_colour{};
     BufferHold held_depth{};
+    /// On this thread, inside a RunSync call: `ticket`'s work done, the fences driven here.
+    void WaitTicketHere(u32 ticket);
+    void WaitGpuWritesHere(PAddr addr, u32 size);
     [[nodiscard]] u32 HoldTicket() const {
         return tickets + 1;
     }
@@ -728,10 +695,8 @@ private:
     std::unordered_map<u64, FaultSite> fault_sites; ///< by the guest's PC << 8 | the kind
 #endif
 
-    /// The thread's state (a hold, the end) is under `work`. It sleeps on `wake_flag`, an event
-    /// flag set for records (Commit sees `sleeping`), a hold or the end, and by sgxd when the GPU
-    /// has done the oldest pending ticket's work (sgxdWaker, from IRQ 52): no timed polls. A
-    /// hold's park waits on `work`; everyone else waits on `done`.
+    /// The thread's state is under `work`. It sleeps on `wake_flag`, set for records, the end, and by
+    /// sgxd when the GPU has done the oldest pending ticket's work: no timed polls. Others wait on `done`.
     Common::CoreCondition work;
     s32 wake_flag{-1};
     static constexpr u32 WakeBit = 1;
@@ -739,14 +704,7 @@ private:
     std::atomic<bool> sleeping{};
     std::atomic<u32> done_waiters{};
     std::atomic<bool> space_waiting{};
-    bool park_requested{};      ///< under `work`
-    std::atomic<bool> parked{}; ///< set under `work`, waited for on `done`
-    bool stopping{};            ///< under `work`
-    u32 hold_depth{};      ///< the GPU's lock
-    /// The holder's thread while a hold is on, else -1: only it may run the render side then.
-    /// HLE threads that wait for a ticket meanwhile (a page the GPU holds) sleep until it is
-    /// reached instead: the backend's waits take one waiter (sgxd's event flag).
-    std::atomic<s32> holder{-1};
+    bool stopping{}; ///< under `work`
     /// The thread that writes the ring (the emulation thread): HLE threads may wait, never queue.
     const s32 producer;
     Common::ProcessClock::time_point last_present{};
@@ -925,8 +883,6 @@ private:
 #endif
 
     void SleepDone(EmuWait kind);
-    /// Whether this thread holds (Hold): the render side's while the hold lasts.
-    [[nodiscard]] bool Holding() const;
 #ifdef VITA_DIAGNOSTICS
     std::array<std::atomic<u32>, Stats::Count> records{};
     std::atomic<u64> busy_us{};
@@ -972,8 +928,6 @@ private:
     std::atomic<u32> right_eye_transfers{};
     std::atomic<u32> late_partial{};
     std::array<std::atomic<u32>, 4> present_gaps{};
-    std::atomic<u32> holds{};
-    std::atomic<u64> hold_us{};
     struct EmuWaitCounters {
         std::atomic<u32> waits{};
         std::atomic<u64> us{};

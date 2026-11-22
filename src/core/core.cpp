@@ -1537,8 +1537,7 @@ void System::ApplySettings() {
 #endif
 
     if (gpu) {
-        // The renderer's: with the render thread held.
-        const auto hold = gpu->HoldRender();
+        // The renderer's, on the render thread (GPU::UpdateFramebufferLayout).
 #ifndef ANDROID
         gpu->UpdateFramebufferLayout();
 #endif
@@ -1660,12 +1659,11 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     }
 
     // Flush on save, don't flush on load: the state holds what guest memory holds (the render
-    // thread's passes ended and its pictures' rows copied into it, RenderThread::ClearAll);
-    // GPU-only content is redrawn or reloaded after a load.
+    // thread's passes ended and its pictures' rows copied into it, RenderThread::ClearAll, on
+    // that thread); GPU-only content is redrawn or reloaded after a load. The render thread runs
+    // on, the GPU its own: with this thread serializing, nothing reaches it but the state's own
+    // calls, each on it in turn (the PICA's handover, the title's settings).
     const bool should_flush = !Archive::is_loading::value;
-    // The render thread done with the GPU work queued, and held: guest memory and the PICA are
-    // the state's alone until it is saved or loaded.
-    const auto render_hold = gpu->HoldRender();
     gpu->ClearAll(should_flush);
     SavestateTrace("cleared");
     ar&* timing.get();

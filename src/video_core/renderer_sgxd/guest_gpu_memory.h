@@ -30,22 +30,14 @@ namespace SgxdRenderer {
  * kick reads it) at 0x20000000. The GPU must be idle when this is made and destroyed: sgxd
  * invalidates its MMU then.
  *
- * FCRAM the GPU writes and reads back - a display transfer's output, a framebuffer the LCD
- * shows, a texture - is moved onto CDRAM pages of a pool of ours (azaharReback): the same host,
- * guest and GPU addresses, but uncached for the CPU, so the GPU's passes over it need no cache
- * maintenance. The render thread moves what its work is about to read or write (a pass's
- * target, a texture at its untile), where the work's page holds keep the guest's writes off the
- * pages during the copy. Past its first 8 MiB the pool grows into uncached main memory when
- * CDRAM is full. The guest may reuse a moved page for anything, and every view of it still
- * agrees. The second emulation thread's guest runs during every move and return: the module
- * refuses its writes to the pages while their bytes move. Each GPU use of a moved page
- * (IsUncached) stamps it with the frame. At vblank, with the first emulation thread's guest
- * stopped and the render thread held (ReturnUnused), a page no use has stamped for
- * StaleFrames frames goes back to its FCRAM page, and with the pool short of free pages the
- * pages unused longest go back too (EvictPool), but none that page versions hold (PageHolds: the
- * guest's view of one may be on a slot of theirs); a move never puts pages back itself: on the
- * render thread the guest runs meanwhile, and a page going back is held by no work. A move
- * into a full pool grows it (GrowPool).
+ * FCRAM the GPU writes and reads back (a display transfer's output, a framebuffer, a texture)
+ * is moved onto CDRAM pages of a pool of ours (azaharReback): the same host, guest and GPU
+ * addresses, uncached for the CPU, so the GPU's passes need no cache maintenance. The render
+ * thread moves what its work is about to use, whose page holds keep the guest's writes off the
+ * pages during the copy (the module refuses the second emulation thread's). Past 8 MiB the pool
+ * grows into uncached main memory. At vblank (ReturnUnused) a page unused for StaleFrames frames
+ * goes back to FCRAM, and with the pool short the pages unused longest (EvictPool), but none
+ * that page versions hold; a move never puts pages back itself.
  *
  * Neither waits for the GPU to go idle: the CPU's views move at once, the GPU's mapping by its
  * own remap in queue order (MoveHooks::remap), so earlier work reads the old page, with the same
@@ -73,7 +65,9 @@ public:
     /// for it; whether page versions hold a moved FCRAM page (PageHolds::Versioned), which does not
     /// go back until they let it go.
     struct MoveHooks {
-        std::function<void(PAddr addr, u32 size)> wait_writes;
+        /// The GPU's queued writes to [addr, addr + size) landed: before a move's copy, or a
+        /// return's (`moved`: the pages are in the pool, where the GPU's passes write too).
+        std::function<void(PAddr addr, u32 size, bool moved)> wait_writes;
         std::function<u32(const u32* pte_va, const u32* pte, u32 count)> remap;
         std::function<bool(u32 fence)> reached;
         std::function<void(u32 fence)> wait;
@@ -101,9 +95,9 @@ public:
     /**
      * Moves the FCRAM pages of [addr, addr + size) onto CDRAM. `overwritten`: the GPU is about
      * to write the whole range, so only the pages it covers in part keep their contents; the
-     * others are not copied. On the render thread, from the work about to use the pages (its
-     * page holds keep the guest off them), or on the emulation thread with the guest stopped
-     * and the render thread held.
+     * others are not copied. On the render thread: from the work about to use the pages (its
+     * page holds keep the guest off them), or for the emulation side (GPU::KeepUncached) after
+     * the work queued, the guest stopped.
      */
     void MakeUncached(PAddr addr, u32 size, bool overwritten);
 

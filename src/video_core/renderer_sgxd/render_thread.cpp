@@ -313,19 +313,17 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& parse_pica_,
     rasterizer.guest_indices = [this](PAddr addr, u32 bytes) { return IndexBytes(addr, bytes); };
     live_render_thread.store(this, std::memory_order_release);
     renderer.SetMoveHooks({
-        [this](PAddr addr, u32 size) {
-            // On the render thread, the move is for its work about to use the pages: the GPU
-            // writes only moved pages and VRAM, so a page still cached has none queued but a
-            // DMA's, which the draw retired already (RasterizerSgxd::MoveWaits). vprof's replay
-            // player drives the render side from its own thread while it holds it.
-            bool render_side = sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed);
-#ifdef VITA_DIAGNOSTICS
-            render_side |= rasterizer.Replaying() && Holding();
-#endif
-            if (render_side) {
-                rasterizer.MoveWaits();
+        [this](PAddr addr, u32 size, bool moved) {
+            // On the render thread alone: a move is for its own work about to use the pages, or the emulation
+            // side's after the work queued before it. The GPU writes only moved pages and VRAM, so a cached
+            // page has nothing queued but a DMA's (retired already); a return's pages' writes are waited for.
+            ASSERT_MSG(sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed),
+                       "render thread: a page move of {:#010x}+{:#x} off the render thread", addr,
+                       size);
+            if (moved) {
+                WaitGpuWritesHere(addr, size);
             } else {
-                WaitGpuWrites(addr, size);
+                rasterizer.MoveWaits();
             }
         },
         [this](const u32* pte_va, const u32* pte, u32 count) {
@@ -401,11 +399,6 @@ void RenderThread::SampleGpu(std::stop_token stop) {
 
 RenderThread::~RenderThread() {
     live_render_thread.store(nullptr, std::memory_order_release);
-    {
-        while (hold_depth != 0) {
-            Release();
-        }
-    }
     {
         std::scoped_lock lk{work};
         stopping = true;
@@ -598,9 +591,6 @@ u8* RenderThread::Begin(Op op, u32 bytes, u16 extra) {
                      parse_read.load(std::memory_order_acquire));
     };
     if (RingSize - (write - oldest()) < skip + need) {
-        // The thread a whole ring behind: wait for it (a hold runs each record at once, so its
-        // ring is always empty), with the records closed so far published.
-        ASSERT(hold_depth == 0);
         const TraceSpan span{"emu_space", "emu_space_end"};
         if (published.load(std::memory_order_relaxed) != write) {
             Publish();
@@ -636,7 +626,7 @@ u8* RenderThread::Begin(Op op, u32 bytes, u16 extra) {
 
 void RenderThread::Commit() {
     write += open_record;
-    if (publish_together && hold_depth == 0) {
+    if (publish_together) {
         return;
     }
     Publish();
@@ -654,10 +644,6 @@ void RenderThread::Publish() {
         if (parse_sleeping.load()) {
             ParseWake();
         }
-    }
-    if (hold_depth != 0) {
-        RunAvailable();
-        return;
     }
     if (sleeping.load()) {
         Wake();
@@ -1160,9 +1146,11 @@ u32 TextureRanges(const Pica::RegsInternal& regs, RenderThread::DrawTextures& ou
 
 } // namespace
 
-void RenderThread::ClearAll(bool) {
-    if (Held()) {
-        rasterizer.FlushAll();
+void RenderThread::ClearAll(bool flush) {
+    // A savestate's save: the passes end and the pictures guest memory is older than go there, after
+    // the work queued, the caller waiting.
+    if (flush) {
+        RunSync([this] { rasterizer.FlushAll(); });
     }
 }
 
@@ -2241,6 +2229,9 @@ void RenderThread::InterruptWait(u64 ticket) {
     if (InterruptPoll(ticket)) {
         return;
     }
+    // The render thread reaches tickets itself (WaitTicketHere): here it would wait for itself.
+    ASSERT_MSG(!thread.IsCurrentThread(), "render thread: a wait for ticket {} on the render thread",
+               static_cast<u32>(ticket));
     // Records the producer closed and has not published are not the render thread's yet, and a ticket
     // among them would never be reached.
     if (sceKernelGetThreadId() == producer && published.load(std::memory_order_relaxed) != write) {
@@ -2257,28 +2248,7 @@ void RenderThread::InterruptWait(u64 ticket) {
 #endif
             return;
         }
-        {
-            // Held by this thread: nothing else polls; the fences are this thread's to wait for.
-            if (Holding()) {
-                while (!InterruptPoll(ticket)) {
-                    PollFences();
-                    if (InterruptPoll(ticket)) {
-                        break;
-                    }
-                    ASSERT_MSG(!pending.empty(), "render thread: ticket {} never queued",
-                               static_cast<u32>(ticket));
-                    rasterizer.InterruptWait(pending.front().fence);
-                }
-#ifdef VITA_DIAGNOSTICS
-                CountEmuWait(EmuTicket, start);
-#endif
-                return;
-            }
-        }
-        // Another thread's hold (an HLE thread's wait for a held page while the emulation thread
-        // holds): the holder's polls or, after its release, the render thread's reach the ticket.
-        // This thread drives nothing: sgxd's waits take one waiter, and the fences are the
-        // holder's (EVF_MULTI in a game).
+        // The render thread's polls reach the ticket: sgxd's waits take one waiter, the render thread.
         waited_ticket.store(static_cast<u32>(ticket), std::memory_order_relaxed);
         ticket_wait.store(true, std::memory_order_relaxed);
         std::scoped_lock lk{done};
@@ -2300,27 +2270,35 @@ void RenderThread::WaitForGpuWrites() {
     }
 }
 
-void RenderThread::WaitGpuWrites(PAddr addr, u32 size) {
-    // A page move's copy (GuestGpuMemory): the GPU's writes queued to the pages land first.
-    // Before the native core turns the holds on there is no page's ticket: the last write's.
+void RenderThread::WaitTicketHere(u32 ticket) {
+    // Every record before the caller's has run here: a ticket issued is pending or reached, and one
+    // not issued yet is covered by the rasterizer's fence now.
+    while (!InterruptPoll(ticket)) {
+        PollFences();
+        if (InterruptPoll(ticket)) {
+            return;
+        }
+        if (static_cast<s32>(ticket - tickets) > 0 || pending.empty()) {
+            rasterizer.InterruptWait(rasterizer.InterruptFence());
+            return;
+        }
+        rasterizer.InterruptWait(pending.front().fence);
+    }
+}
+
+void RenderThread::WaitGpuWritesHere(PAddr addr, u32 size) {
+    // A return's copy on this thread: the GPU's writes to the pages land first.
     if (!page_holds_on) {
-        WaitForGpuWrites();
+        if (last_write_ticket != 0) {
+            WaitTicketHere(last_write_ticket);
+        }
         return;
     }
     for (PAddr at = addr & ~0xfffu; at < addr + size; at += 0x1000) {
         const u32 page = page_holds.PageOf(memory.GetPhysicalPointer(at));
-        if (page == PageHolds::NoPage) {
-            continue;
+        if (page != PageHolds::NoPage) {
+            WaitTicketHere(page_holds.WriteTicket(page));
         }
-        const u32 ticket = page_holds.WriteTicket(page);
-        if (InterruptPoll(ticket)) {
-            continue;
-        }
-        // A write hold made since the last fence has no ticket yet: it gets one now.
-        if (ticket == HoldTicket()) {
-            InterruptFence();
-        }
-        InterruptWait(ticket);
     }
 }
 
@@ -2720,23 +2698,34 @@ void RenderThread::AskPictureCopy(PAddr addr, u32 bytes, bool write, bool wait, 
                  addr, bytes, write ? "a write" : "a read");
     }
 #endif
-    // The render side's own thread, or a hold's holder (the render side then): served here.
-    if (Holding() || sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed)) {
+    if (sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed)) {
         rasterizer.ServeGuestAccess(addr, addr + bytes, write, wait, beside);
         return;
     }
-    // Any other thread (the emulation threads' guests, the HLE): the render thread serves it
-    // between records (a hold's holder once it lets go), this thread waiting unless `wait` is
-    // false (its copies then count for PictureOwns until done).
+    // Any other thread: the render thread serves it between records, this thread waiting unless `wait`
+    // is false.
+    Ask(addr, bytes,
+        (write ? AccessWrite : 0u) | (wait ? 0u : AccessNoWait) | (beside ? AccessBeside : 0u));
+}
+
+void RenderThread::AskMove(PAddr addr, u32 bytes) {
+    // The page moves are the render side's, from any thread: served between records.
+    if (sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed)) {
+        renderer.MakeUncached(addr, bytes, false);
+        return;
+    }
+    Ask(addr, bytes, AccessMove);
+}
+
+void RenderThread::Ask(PAddr addr, u32 bytes, u32 flags) {
     u32 seq;
     {
         std::scoped_lock lock{access_lock};
-        access_requests.push_back(
-            {static_cast<u32>(addr), bytes, (write ? 1u : 0u) | (wait ? 0u : 2u)});
+        access_requests.push_back({static_cast<u32>(addr), bytes, flags});
         seq = access_requested.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
     Wake();
-    if (!wait) {
+    if ((flags & AccessNoWait) != 0) {
         return;
     }
     std::scoped_lock lk{done};
@@ -2773,7 +2762,12 @@ void RenderThread::ServeGuestAccesses() {
         seq = access_requested.load(std::memory_order_relaxed);
     }
     for (const auto& [addr, bytes, flags] : requests) {
-        rasterizer.ServeGuestAccess(addr, addr + bytes, (flags & 1u) != 0, (flags & 2u) == 0);
+        if ((flags & AccessMove) != 0) {
+            renderer.MakeUncached(addr, bytes, false);
+            continue;
+        }
+        rasterizer.ServeGuestAccess(addr, addr + bytes, (flags & AccessWrite) != 0,
+                                    (flags & AccessNoWait) == 0, (flags & AccessBeside) != 0);
     }
     access_served.store(seq, std::memory_order_release);
     if (done_waiters.load() != 0) {
@@ -2896,9 +2890,14 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
     page_holds.Reopen(page, reached.load(std::memory_order_acquire));
     [[maybe_unused]] const PageHolds::Access reopened = page_holds.Applied(page);
     if (move_after) {
-        Hold();
-        renderer.MakeUncached(address, 0x1000, false);
-        Release();
+#ifdef VITA_DIAGNOSTICS
+        GuestGpuMemory::WatchNote("a guest write to a page queued draws read as geometry", address,
+                                  0x1000,
+                                  fmt::format("guest pc {:08x}, address {:08x}", guest_pc, guest_va));
+#endif
+        // On the render thread, which owns the moves: the page's queued reads are done and no write is
+        // queued.
+        AskMove(address, 0x1000);
 #ifdef VITA_DIAGNOSTICS
         geometry_moves++;
 #endif
@@ -3657,63 +3656,6 @@ bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
     return true;
 }
 
-void RenderThread::Hold() {
-    if (hold_depth++ != 0) {
-        ASSERT_MSG(Holding(), "render thread: a hold taken on a second thread");
-        return;
-    }
-    const TraceSpan span{"hold", "hold_parked"};
-#ifdef VITA_DIAGNOSTICS
-    const auto start = Clock::now();
-#endif
-    {
-        std::scoped_lock lk{work};
-        park_requested = true;
-        work.NotifyAll();
-    }
-    Wake();
-    {
-        std::scoped_lock lk{done};
-        done_waiters.fetch_add(1);
-        while (!parked.load()) {
-            done.WaitFor(std::chrono::milliseconds(1));
-        }
-        done_waiters.fetch_sub(1);
-    }
-    holder.store(sceKernelGetThreadId(), std::memory_order_release);
-    // Waiters for tickets poll for themselves from now on.
-    NotifyDone();
-#ifdef VITA_DIAGNOSTICS
-    holds.fetch_add(1, std::memory_order_relaxed);
-    hold_us.fetch_add(Since(start), std::memory_order_relaxed);
-#endif
-}
-
-void RenderThread::Release() {
-    ASSERT(hold_depth != 0);
-    if (--hold_depth != 0) {
-        return;
-    }
-    SgxdTrace("release");
-    holder.store(-1, std::memory_order_release);
-    {
-        std::scoped_lock lk{work};
-        park_requested = false;
-        work.NotifyAll();
-    }
-    Wake();
-}
-
-void RenderThread::PollHeld() {
-    if (Holding()) {
-        PollFences();
-    }
-}
-
-bool RenderThread::Holding() const {
-    return holder.load(std::memory_order_acquire) == sceKernelGetThreadId();
-}
-
 #ifdef VITA_DIAGNOSTICS
 RenderThread::Stats RenderThread::TakeStats() {
     Stats s{};
@@ -3788,8 +3730,6 @@ RenderThread::Stats RenderThread::TakeStats() {
     for (u32 k = 0; k < s.present_gaps.size(); k++) {
         s.present_gaps[k] = present_gaps[k].exchange(0);
     }
-    s.holds = holds.exchange(0);
-    s.hold_us = hold_us.exchange(0);
     for (u32 k = 0; k < EmuWaits; k++) {
         auto& c = emu_wait_counters[k];
         s.emu_waits[k] = c.waits.exchange(0);
@@ -4305,8 +4245,8 @@ void RenderThread::DescribeLive(char* out, std::size_t size) {
         "loop passes %u; running record op %d; tickets issued %u, reached %u; the emulation "
         "waits for %u (%s); "
         "pending %u, the oldest ticket %u (fence: lists %u, PTLA ops %u); lists sent %u, done %u, "
-        "faulted %u; PTLA ops sent %u, done %u; a 3D pending %s; sleeping %s; hold depth %u, "
-        "holder %08x, park requested %s, parked %s; ring written %u, published %u, read %u",
+        "faulted %u; PTLA ops sent %u, done %u; a 3D pending %s; sleeping %s; ring written %u, "
+        "published %u, read %u",
         t->loop_passes.load(std::memory_order_relaxed),
         static_cast<int>(t->running_op.load(std::memory_order_relaxed)), t->tickets,
         t->reached.load(std::memory_order_relaxed),
@@ -4316,10 +4256,7 @@ void RenderThread::DescribeLive(char* out, std::size_t size) {
         t->pending_front_ticket.load(std::memory_order_relaxed), static_cast<u32>(front >> 32),
         static_cast<u32>(front), sgxd_chain_fence(), sgxd_chain_done(), sgxd_chain_faulted(),
         sgxd_ptla_fence(), sgxd_ptla_done(), sgxd_session_pending() != nullptr ? "yes" : "no",
-        t->sleeping.load(std::memory_order_relaxed) ? "yes" : "no", t->hold_depth,
-        static_cast<u32>(t->holder.load(std::memory_order_relaxed)),
-        t->park_requested ? "yes" : "no", t->parked.load(std::memory_order_relaxed) ? "yes" : "no",
-        t->write, t->published.load(std::memory_order_relaxed),
+        t->sleeping.load(std::memory_order_relaxed) ? "yes" : "no", t->write, t->published.load(std::memory_order_relaxed),
         t->read.load(std::memory_order_relaxed));
 }
 
@@ -4394,25 +4331,13 @@ void RenderThread::Loop() {
         const auto empty = [this] {
             return read.load(std::memory_order_relaxed) == published.load();
         };
-        if (park_requested && empty()) {
-            // A hold: its thread is the render side until it lets go.
-            parked.store(true);
-            NotifyDone();
-            while (park_requested) {
-                work.WaitFor(std::chrono::seconds(1));
-            }
-            parked.store(false);
-            continue;
-        }
         if (stopping && empty()) {
             break;
         }
         sleeping.store(true);
-        if (empty() && !park_requested && !stopping) {
-            // With tickets pending, sgxd wakes the thread once the oldest one's GPU work is done
-            // (or the lists before a held-back 3D are, for PollFences to send it), or the
-            // window's last present's when that comes first, for its flip (FlipDone). Records, a
-            // hold and the end wake it through Wake; the window's poll bounds the sleep.
+        if (empty() && !stopping) {
+            // With tickets pending, sgxd wakes the thread once the oldest one's work is done, or the window's
+            // last present's for its flip; records wake it through Wake, the window's poll bounds the sleep.
             u32 flip_fence;
             const bool flip =
                 renderer.FlipPending(&flip_fence) &&

@@ -129,14 +129,6 @@ GPU::~GPU() {
     impl->render.reset();
 }
 
-GPU::RenderHold::RenderHold(GPU& gpu_) : gpu{gpu_} {
-    gpu.impl->render->Hold();
-}
-
-GPU::RenderHold::~RenderHold() {
-    gpu.impl->render->Release();
-}
-
 SgxdRenderer::RenderThread& GPU::GetRenderThread() {
     return *impl->render;
 }
@@ -145,16 +137,6 @@ const Core::TimingEventType* GPU::VBlankEventType() const {
     return impl->vblank_event;
 }
 
-void GPU::SyncCaptureHold() {
-    const bool recording = SgxdRenderer::Vprof::Recording();
-    if (recording && !capture_hold) {
-        impl->render->Hold();
-        capture_hold = true;
-    } else if (!recording && capture_hold) {
-        impl->render->Release();
-        capture_hold = false;
-    }
-}
 
 void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op) {
 #ifndef VITA_DIAGNOSTICS
@@ -168,6 +150,12 @@ void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op
     GPU_TRACE("op", static_cast<unsigned>(kind));
     SgxdRenderer::Vprof::OpBegin(seq);
     op();
+    // A recorded or replayed op's work done on the render thread before the op ends: the render
+    // side's hooks (its draws, the memory they read, the passes' times) fall inside it, and the
+    // guest's next writes come after them.
+    if (seq != 0) {
+        impl->render->RunSync([] {});
+    }
     SgxdRenderer::Vprof::OpEnd(seq);
     GPU_TRACE("done");
     const auto end = Common::ProcessClock::now();
@@ -197,7 +185,6 @@ void GPU::Signal(Service::GSP::InterruptId id, u64 delay_ns) {
 }
 
 void GPU::DeliverInterrupts() {
-    impl->render->PollHeld();
     impl->render->ReleasePageHolds();
 }
 
@@ -674,7 +661,8 @@ SgxdRenderer::RendererSgxd& GPU::Renderer() {
 }
 
 void GPU::UpdateFramebufferLayout() {
-    impl->renderer->UpdateCurrentFramebufferLayout();
+    // The renderer is the render thread's: there, after the work queued, this thread waiting.
+    impl->render->RunSync([this] { impl->renderer->UpdateCurrentFramebufferLayout(); });
 }
 
 Pica::PicaCore& GPU::PicaCore() {
@@ -864,10 +852,9 @@ void GPU::RunDma(const std::vector<DmaRun>& runs, u64 delay_ns) {
 
 #ifdef VITA_DIAGNOSTICS
 void GPU::VprofReplay(const std::string& capture, const std::string& first) {
-    // The replay runs the GPU's work on this thread, the render thread held: its requests read
-    // the rasterizer between ops.
-    const auto hold = HoldRender();
-    // The guest sees none of the replay's interrupts.
+    // The replay queues the frame's GPU work from this thread, as the guest's is queued; each op
+    // ends once the render thread has run it (RunGpuOp), and the requests read the rasterizer
+    // there (`sync`). The guest sees none of the replay's interrupts.
     impl->interrupts_muted = true;
     auto& rasterizer = impl->render->Rasterizer();
     SgxdRenderer::Vprof::ReplayHost host{
@@ -892,7 +879,7 @@ void GPU::VprofReplay(const std::string& capture, const std::string& first) {
             RunDma(runs, 0);
         },
         [this](std::function<void()> fn) { RunGpuOp(OpKind::RegWrite, fn); },
-        [](std::function<void()> fn) { fn(); },
+        [this](std::function<void()> fn) { impl->render->RunSync(fn); },
         // The screens as VBlankCallback shows them.
         [this] {
             PresentScreensNow();
@@ -916,15 +903,19 @@ void GPU::PresentScreensNow() {
                                                     regs.framebuffer_config[1]};
     const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
                                               impl->pica.regs_lcd.color_fill_bottom};
-    // PresentFrame waits for the flip. RendererSgxd::EndFrame is left out: its frame limiter
-    // and PerfStats belong to a running guest, and there is none.
-    impl->renderer->PresentFrame(fb, fill);
-    impl->rasterizer->GpuIdle();
+    // On the render thread after the work queued, this thread waiting: PresentFrame waits for
+    // the flip, and the frame's GPU work goes out after it (RasterizerSgxd::GpuIdle).
+    // RendererSgxd::EndFrame is left out: its frame limiter and PerfStats belong to a running
+    // guest, and there is none.
+    impl->render->RunSync([&] {
+        impl->renderer->PresentFrame(fb, fill);
+        impl->render->Rasterizer().GpuIdle();
+    });
 }
 
 void GPU::HostFrame(const std::function<void()>& work) {
-    const auto hold = HoldRender();
-    // No guest hears of the host's work.
+    // No guest hears of the host's work. Its lists queue for the render thread as a title's do;
+    // the present runs there after them, and the frame's GPU work is done when it returns.
     impl->interrupts_muted = true;
     work();
     PresentScreensNow();
@@ -989,11 +980,11 @@ std::vector<GPU::DmaRun> GPU::DmaRuns(VAddr src, VAddr dst, u32 size) {
 
 void GPU::KeepUncached(PAddr addr, u32 size) {
     // Rare: a page moves once and stays until the GPU leaves it unused (ReturnUncached). The
-    // move runs here, the guest stopped, with the render thread held after the work queued
-    // before it; the GPU's mapping follows in its own order (GuestGpuMemory), without an idle.
+    // move runs on the render thread after the work queued before it, the guest stopped (this
+    // thread waits for it); the GPU's mapping follows in its own order (GuestGpuMemory), without
+    // an idle.
     if (impl->renderer->WouldMakeUncached(addr, size)) {
-        const auto hold = HoldRender();
-        impl->renderer->MakeUncached(addr, size, overwritten);
+        impl->render->RunSync([&] { impl->renderer->MakeUncached(addr, size, false); });
     }
 }
 
@@ -1017,18 +1008,17 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     GPU_TRACE("vblank");
     // vprof: a recorded frame starts with the PICA's state.
     const bool frame_starts = SgxdRenderer::Vprof::VBlank();
-    SyncCaptureHold();
     if (frame_starts) {
         RunGpuOp(OpKind::RegWrite, [this] {
-            // The capture records the lists' state, the render thread's (held here), with the
+            // The capture records the lists' state, the render thread's (RunSync), with the
             // geometry unit's setup as its own (FlushGsMirror).
             impl->render->GiveWholeState();
             impl->pica.FlushGsMirror();
             SgxdRenderer::Vprof::State(impl->pica);
 #ifdef VITA_DIAGNOSTICS
             // What the frame's passes can start from: the rasterizer's clears, surfaces and
-            // depth stores (RSTA). The render thread is held (SyncCaptureHold).
-            impl->render->Rasterizer().VprofFrameStart();
+            // depth stores (RSTA), on the render thread after the work queued.
+            impl->render->RunSync([this] { impl->render->Rasterizer().VprofFrameStart(); });
 #endif
         });
     }
@@ -1037,10 +1027,10 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     Signal(Service::GSP::InterruptId::PDC1, 0);
 
     // Moved pages the GPU has not used for a while go back to cached FCRAM first, so that the
-    // moves below can reuse their pool pages. Rare, as a move is: the render thread held.
+    // moves below can reuse their pool pages. Rare, as a move is: on the render thread, after
+    // the work queued, this thread waiting.
     if (impl->renderer->UncachedFrameEnded()) {
-        const auto hold = HoldRender();
-        impl->renderer->ReturnUncached();
+        impl->render->RunSync([this] { impl->renderer->ReturnUncached(); });
     }
     // Vertex and index buffers the GPU read from cached FCRAM since the last vblank move to
     // uncached memory once, so later draws from them need no clean.
