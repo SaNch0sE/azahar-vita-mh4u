@@ -591,6 +591,8 @@ private:
     /// as a packed U8888 word; else FogFactor's dependent read of the LUT.
     bool fog_issued = false;
     uint8_t fog_pa = 0;
+    /// With w_buffered, the F32 fog's TEXCOORD3 (u: the PICA's depth times w): its PA base.
+    uint8_t fog_coord_pa = 0;
     uint8_t scissor_pa = 0;               ///< scratch PA holding the scissor test's value
                                           ///< until the alpha test folds it into its kill
     bool fold_scissor = false;            ///< the scissor test kills with the alpha test
@@ -645,7 +647,8 @@ private:
     uint32_t light_mem_offset = 0;
     uint32_t light_mem_loaded = 0;
     bool light_mem_pending = false;
-    bool uses_depth = false;              ///< W-buffering: the fragment writes its depth
+    /// W-buffering (not shadow rendering): the fog's depth is the PICA's W depth, TEXCOORD3's u.
+    bool w_buffered = false;
     bool uses_shadow = false;             ///< lighting reads the shadow texture
     bool shadow_write = false;            ///< shadow rendering: ShadowWrite updates o0's word
     bool shadow_wbuffer = false;          ///< its depth is z / w (W-buffering)
@@ -833,7 +836,8 @@ void FragmentEmitter::PlanInputs() {
     shadow_write = config.framebuffer.shadow_rendering != 0;
     shadow_wbuffer = shadow_write && config.framebuffer.depthmap_enable ==
                                          Pica::RasterizerRegs::DepthBuffering::WBuffering;
-    uses_depth = !shadow_write && config.framebuffer.depthmap_enable ==
+    // W-buffering: the TA orders the draw by 1/w (WBUFFEN), and the program writes no depth.
+    w_buffered = !shadow_write && config.framebuffer.depthmap_enable ==
                                       Pica::RasterizerRegs::DepthBuffering::WBuffering;
     if (uses_lighting && lighting.enable_shadow) {
         const u32 unit = lighting.shadow_selector;
@@ -904,7 +908,7 @@ void FragmentEmitter::PlanInputs() {
     // float3 (which need not be followed by anything pair-aligned).
     program.inputs.push_back({FragmentInput::Color0, 4});
     uint8_t pa = 4;
-    if (uses_scissor || (uses_fog && !fog_issued) || uses_depth || shadow_write) {
+    if (uses_scissor || (uses_fog && !fog_issued && !w_buffered) || shadow_write) {
         program.inputs.push_back({FragmentInput::Position, 4});
         position_pa = pa;
         pa += 4;
@@ -984,12 +988,17 @@ void FragmentEmitter::PlanInputs() {
         view_pa = pa;
         pa += 2;
     }
-    if (unit_used[0] && (tex.texture0_type == TextureType::Projection2D ||
-                         tex.texture0_type == TextureType::TextureCube ||
-                         tex.texture0_type == TextureType::Shadow2D)) {
-        // texcoord0's w, TEXCOORD3's second lane (its first is the fog table's coordinate).
+    const bool texcoord0_w = unit_used[0] && (tex.texture0_type == TextureType::Projection2D ||
+                                              tex.texture0_type == TextureType::TextureCube ||
+                                              tex.texture0_type == TextureType::Shadow2D);
+    // The F32 fog's depth with W-buffering: the PICA's W depth, TEXCOORD3's u.
+    const bool fog_coord = uses_fog && !fog_issued && w_buffered;
+    if (texcoord0_w || fog_coord) {
+        // texcoord0's w, TEXCOORD3's second lane (its first is the fog's depth times w).
+        DEBUG_ASSERT(pa % 2 == 0);
         program.inputs.push_back({FragmentInput::TexCoord3, 2});
         texcoord0_w_pa = static_cast<uint8_t>(pa + 1);
+        fog_coord_pa = pa;
         pa += 2;
     }
     if (sched_probe.u8_colour && u8_tev && StageReads(Source::PrimaryColor)) {
@@ -2185,7 +2194,9 @@ void FragmentEmitter::Fog() {
 void FragmentEmitter::FogFactor() {
     // fog_index = depth * 128 (or (1 - depth) * 128 flipped); i = clamp(floor(index), 0,
     // 127); f = index - i; entry = lut_lf(i + fog_lut_offset); factor = clamp(r + g * f).
-    const Reg pos = Reg::Pa(position_pa + 2); // z, w
+    // The depth is WPOS's z; with W-buffering the PICA's W depth (z / w * scale + offset, times
+    // w), TEXCOORD3's u iterated perspective-correct.
+    const Reg pos = w_buffered ? Reg::Pa(fog_coord_pa) : Reg::Pa(position_pa + 2);
     if (config.texture.fog_flip) {
         e.Vec(VecOp::Add, {I0, 0x1}, {pos, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
         e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XYZW}, Lit(Lit128), Pred::None, true);

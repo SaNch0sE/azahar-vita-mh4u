@@ -2951,9 +2951,8 @@ void RasterizerSgxd::EndPass(const char* why) {
             }
         }
         d.valid = true;
-#ifdef VITA_DIAGNOSTICS
         d.ta_w = pass_ta_w;
-#endif
+        d.ta_map = pass_w_map;
     } else if (pass_depth_used) {
         DepthStoresWritten(pass_depth, pass_depth + s.width * s.height * pass_depth_bytes);
     }
@@ -3972,12 +3971,6 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
         if (blend->RequiresMinMaxEmulation()) {
             blend->SetMinMaxEmulationDisabled();
         }
-    }
-    // sgxd_flags wbufz: W-buffering drawn as Z-buffering, the ISP's interpolated depth kept and
-    // none written by the program: what DEPTHFEEDBACK costs (the depths stored differ).
-    static const bool wbuf_as_z = SgxdFlag("wbufz");
-    if (wbuf_as_z) {
-        config.framebuffer.depthmap_enable.Assign(Pica::RasterizerRegs::DepthBuffering::ZBuffering);
     }
     // An alpha test whose failures the blend would leave as the target has them (alpha 0 takes zero
     // of itself and all of the target, with no depth or stencil write): the program gives those
@@ -5415,13 +5408,13 @@ bool RasterizerSgxd::QuadVertices(bool is_indexed, const float* immediate, u32 c
         return r.ok;
     }
     r = QuadRun{draw_serial, is_indexed, immediate, count, false, {}};
-    r.ok = RunQuadVertices(is_indexed, immediate, count, r.out);
+    r.ok = RunVertices(is_indexed, immediate, count, std::span(r.out).first(count));
     out = r.out;
     return r.ok;
 }
 
-bool RasterizerSgxd::RunQuadVertices(bool is_indexed, const float* immediate, u32 count,
-                                    std::array<Pica::OutputVertex, 6>& out) {
+bool RasterizerSgxd::RunVertices(bool is_indexed, const float* immediate, u32 count,
+                                 std::span<Pica::OutputVertex> out) {
     const auto& pipeline = regs.pipeline;
     if (!cover_engine) {
         cover_engine = Pica::CreateEngine(false);
@@ -5458,211 +5451,223 @@ bool RasterizerSgxd::RunQuadVertices(bool is_indexed, const float* immediate, u3
     return true;
 }
 
-
-void RasterizerSgxd::LogWbufMix(bool w_ta, bool dwrite, u32 dcmp, bool is_indexed,
-                                const float* immediate, u32 count) {
-    static const bool on = SgxdFlag("wbufmix");
-    if (!on) {
+void RasterizerSgxd::FitWDepth(bool is_indexed, const float* immediate, u32 count, bool grows) {
+    [[maybe_unused]] const auto where = [&] {
+        return fmt::format("draw {} of the pass onto {:#x}", backend.PassDraws() + 1,
+                           pass_colour.addr);
+    };
+    // The vertex program's z against its w, from the two vertices furthest apart in w; a draw of one w
+    // leaves it to the next. A geometry program's positions are not the vertex program's.
+    if (regs.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes) {
         return;
     }
-    if (w_ta) {
-        pass_ta_w = pass_ta_w || dwrite;
+    const u32 n = std::min(count, 6u);
+    std::array<Pica::OutputVertex, 6> out;
+    if (n < 2 || !RunVertices(is_indexed, immediate, n, std::span(out).first(n))) {
         return;
     }
-    if (!pass_ta_w || dcmp == 7 ||
-        regs.rasterizer.depthmap_enable != Pica::RasterizerRegs::DepthBuffering::ZBuffering) {
+    u32 lo = 0, hi = 0;
+    for (u32 j = 1; j < n; j++) {
+        lo = out[j].pos.w.ToFloat32() < out[lo].pos.w.ToFloat32() ? j : lo;
+        hi = out[j].pos.w.ToFloat32() > out[hi].pos.w.ToFloat32() ? j : hi;
+    }
+    const float w0 = out[lo].pos.w.ToFloat32(), w1 = out[hi].pos.w.ToFloat32();
+    if (!(w1 - w0 > 1e-3f * std::max(std::abs(w0), std::abs(w1)))) {
         return;
     }
-    static u32 seen = 0;
-    if (seen++ >= 200) {
-        return;
+    const float z0 = out[lo].pos.z.ToFloat32(), z1 = out[hi].pos.z.ToFloat32();
+    const float a = (z1 - z0) / (w1 - w0);
+    const float b = z0 - a * w0;
+    for (u32 j = 0; j < n; j++) {
+        const float z = out[j].pos.z.ToFloat32(), w = out[j].pos.w.ToFloat32();
+        // f24 positions: 16 mantissa bits.
+        if (std::abs(z - (a * w + b)) > 1e-3f * (std::abs(z) + std::abs(w))) {
+            DEBUG_ASSERT_MSG(false,
+                             "sgxd: {}: a W-buffered draw's z is not a * w + b (vertex {}: z {} w "
+                             "{}, fitted {} * w + {}): no perspective projection",
+                             where(), j, z, w, a, b);
+            return;
+        }
     }
-    // The PICA's Z depth at each vertex: offset + scale * z / w. Against the W depths a constant
-    // 0 (a quad at z 0) compares alike in both (w > 1 either way); anything else does not.
-    float lo = std::numeric_limits<float>::infinity(), hi = -lo;
-    const bool positions = RunPositions(is_indexed, immediate, count);
-    for (u32 j = 0; positions && j < count; j++) {
-        const auto& v = clip_check_positions[j];
-        const float d = fs_data.depth_offset + fs_data.depth_scale * v[2] / v[3];
-        lo = std::min(lo, d);
-        hi = std::max(hi, d);
-    }
-    const std::string range = positions ? fmt::format("{:.6g}..{:.6g}", lo, hi)
-                                        : std::string("unknown (index list not in memory)");
-    LOG_INFO(Render,
-             "wbufmix {}: frame {} pass draw {}: a Z-buffered draw tests depth (ISP DCMP {}, write "
-             "{}) against the TA's W depths; {} vertices, vs code {:016x}, PICA depth {}",
-             seen, frames, backend.PassDraws() + 1, dcmp, dwrite ? 1 : 0, count,
-             pica.vs_setup.GetProgramCodeHash(), range);
+    const float alpha = fs_data.depth_scale * a + fs_data.depth_offset;
+    DEBUG_ASSERT_MSG((alpha > 0.0f) == grows,
+                     "sgxd: {}: the W depth {} * w + {} runs against the TA's depth ({})",
+                     where(), alpha, fs_data.depth_scale * b, grows ? "1 - 1/w" : "1/w");
+    pass_w_map = {true, grows, alpha, fs_data.depth_scale * b, ProjectionNearW(a, b)};
 }
 
-void RasterizerSgxd::ClipCheck(bool is_indexed, const float* immediate, u32 count) {
-    // From N s of the process's time on, the draws in the first 50 ms of each second (with
-    // clipcheckall, every draw): the clipper locks up on triangles it clips at its guard band
-    // whose vertices differ in w. The TA's
-    // near and far planes are the PICA's (z from -w to 0, the vertex program's z), but it has no
-    // w plane: where those planes meet at w 0, what is left of a triangle keeps vertices at w 0
-    // (the PICA's w >= epsilon plane cuts them off), whose x/w the TA's w clamp makes enormous.
-    // A second's totals when the next begins.
-    static const u64 at = u64{SgxdFlagValue("clipcheck")} * 1000000;
-    static const bool every_draw = SgxdFlag("clipcheckall");
-    if (at == 0) {
-        return;
-    }
-    const u64 now = sceKernelGetProcessTimeWide();
-    if (now < at) {
-        return;
-    }
-    static u64 second = ~u64{0};
-    static u32 draws, triangles, band, band_mixed, near, near_zero, non_finite, logged;
-    if ((now - at) / 1000000 != second) {
-        if (second != ~u64{0}) {
-            LOG_INFO(Render,
-                     "clipcheck: second {}: {} draws, {} triangles; {} clipped at the band ({} "
-                     "with w differing), {} crossing w 0 ({} left with w near 0 after the near "
-                     "and far planes), {} non-finite",
-                     second, draws, triangles, band, band_mixed, near, near_zero, non_finite);
-        }
-        second = (now - at) / 1000000;
-        draws = triangles = band = band_mixed = near = near_zero = non_finite = 0;
-    }
-    if (!every_draw && (now - at) % 1000000 >= 50000) {
-        return;
-    }
-    using Topology = Pica::PipelineRegs::TriangleTopology;
-    using V = std::array<float, 4>;
-    const auto& pipeline = regs.pipeline;
-    if (!RunPositions(is_indexed, immediate, count)) {
-        return;
-    }
-    const auto& pos = clip_check_positions;
-    // The band on the PICA's axes: the TA's x is the PICA's y (DrawViewport's transpose).
-    const float bx = 1.5f * draw_view.guard[1], by = 1.5f * draw_view.guard[0];
-    const auto outside = [bx, by](const V& v) {
-        return !(v[3] > 0.0f) || std::abs(v[0]) > bx * v[3] || std::abs(v[1]) > by * v[3];
+bool RasterizerSgxd::MapZOnW(bool is_indexed, const float* immediate, u32 count,
+                             float* viewport) {
+    [[maybe_unused]] const auto where = [&] {
+        return fmt::format("draw {} of the pass onto {:#x}", backend.PassDraws() + 1,
+                           pass_colour.addr);
     };
-    // A polygon clipped against plane d(v) >= 0 (Sutherland-Hodgman), in place.
-    const auto clip = [](std::array<V, 6>& poly, u32& n, auto d) {
-        std::array<V, 6> out;
-        u32 m = 0;
-        for (u32 i = 0; i < n; i++) {
-            const V& a = poly[i];
-            const V& b = poly[(i + 1) % n];
-            const float da = d(a), db = d(b);
-            if (da >= 0.0f && m < 6) {
-                out[m++] = a;
+    // The TA's depth is not linear in the PICA's (offset + scale * z / w), so only a draw of one depth
+    // has an exact TA depth: of what is drawn, each triangle clipped to the depth range and the buffer.
+    // A quad (run on the CPU) of one depth is exact; one whose visible depths lie in the far eighth
+    // gets their middle. A larger draw is taken for a layer behind the scene, at FarLayerDepth (a sky
+    // projected towards the far plane). Diagnostics builds check the larger draws now and then.
+    constexpr u32 CpuVertices = 6;
+    constexpr float FarLayerDepth = 1.0f - 1.0f / 4096.0f;
+    if (regs.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes) {
+        DEBUG_ASSERT_MSG(false,
+                         "sgxd: {}: a geometry program's Z-buffered draw tests depth against the "
+                         "TA's W depths",
+                         where());
+        return false;
+    }
+    // The visible depths of the CPU-run vertices, lowest and highest (lowest above highest when
+    // nothing is drawn). False when the vertices are not in memory.
+    auto& out = zw_vertices;
+    const auto visible_depths = [&](float& lo, float& hi) {
+        out.resize(count);
+        if (!RunVertices(is_indexed, immediate, count, out)) {
+            return false;
+        }
+        // The colour buffer in clip space: x / w and y / w within [l, h].
+        const auto& rr = regs.rasterizer;
+        const float hx = f24::FromRaw(rr.viewport_size_x).ToFloat32();
+        const float hy = f24::FromRaw(rr.viewport_size_y).ToFloat32();
+        const float xl = -static_cast<float>(rr.viewport_corner.x) / hx - 1.0f;
+        const float xh =
+            static_cast<float>(static_cast<s32>(regs.framebuffer.framebuffer.GetWidth()) -
+                               rr.viewport_corner.x) / hx - 1.0f;
+        const float yl = -static_cast<float>(rr.viewport_corner.y) / hy - 1.0f;
+        const float yh =
+            static_cast<float>(static_cast<s32>(draw_rows) - rr.viewport_corner.y) / hy - 1.0f;
+        using Clip = std::array<float, 4>; // x y z w
+        const auto planes = std::to_array<std::array<float, 4>>({
+            {1.0f, 0.0f, 0.0f, -xl}, {-1.0f, 0.0f, 0.0f, xh}, {0.0f, 1.0f, 0.0f, -yl},
+            {0.0f, -1.0f, 0.0f, yh}, {0.0f, 0.0f, -1.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 1.0f},
+        });
+        lo = std::numeric_limits<float>::max();
+        hi = -std::numeric_limits<float>::max();
+        const auto clip_triangle = [&](u32 i0, u32 i1, u32 i2) {
+            // Sutherland-Hodgman: three vertices and one more per plane at most.
+            std::array<Clip, 9> poly, next;
+            u32 n = 0;
+            for (const u32 i : {i0, i1, i2}) {
+                const auto& p = out[i].pos;
+                poly[n++] = {p.x.ToFloat32(), p.y.ToFloat32(), p.z.ToFloat32(), p.w.ToFloat32()};
             }
-            if ((da >= 0.0f) != (db >= 0.0f) && m < 6) {
-                const float t = da / (da - db);
-                V c;
-                for (u32 k = 0; k < 4; k++) {
-                    c[k] = a[k] + (b[k] - a[k]) * t;
+            for (const auto& pl : planes) {
+                const auto dist = [&](const Clip& v) {
+                    return pl[0] * v[0] + pl[1] * v[1] + pl[2] * v[2] + pl[3] * v[3];
+                };
+                u32 m = 0;
+                for (u32 k = 0; k < n; k++) {
+                    const Clip& a = poly[k];
+                    const Clip& b = poly[(k + 1) % n];
+                    const float da = dist(a), db = dist(b);
+                    if (da >= 0.0f) {
+                        next[m++] = a;
+                    }
+                    if ((da >= 0.0f) != (db >= 0.0f)) {
+                        const float t = da / (da - db);
+                        next[m++] = {a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]),
+                                     a[2] + t * (b[2] - a[2]), a[3] + t * (b[3] - a[3])};
+                    }
                 }
-                out[m++] = c;
-            }
-        }
-        poly = out;
-        n = m;
-    };
-    u32 d_tris = 0, d_band = 0, d_mixed = 0, d_near = 0, d_zero = 0, d_bad = 0;
-    s32 example = -1;
-    float example_w = 0.0f;
-    const auto triangle = [&](u32 i0, u32 i1, u32 i2, u32 first) {
-        std::array<V, 6> poly{pos[i0], pos[i1], pos[i2]};
-        u32 n = 3;
-        d_tris++;
-        u32 positive = 0;
-        for (u32 i = 0; i < 3; i++) {
-            for (const float c : poly[i]) {
-                if (!std::isfinite(c)) {
-                    d_bad++;
+                poly = next;
+                n = m;
+                if (n < 3) {
                     return;
                 }
             }
-            positive += poly[i][3] > 0.0f ? 1 : 0;
-        }
-        d_near += positive != 0 && positive != 3 ? 1 : 0;
-        // The TA's near and far planes: z <= 0, z >= -w.
-        clip(poly, n, [](const V& v) { return -v[2]; });
-        clip(poly, n, [](const V& v) { return v[2] + v[3]; });
-        if (n < 3) {
-            return;
-        }
-        float w0 = 1e30f, w1 = -1e30f;
-        bool any_outside = false;
-        for (u32 i = 0; i < n; i++) {
-            w0 = std::min(w0, poly[i][3]), w1 = std::max(w1, poly[i][3]);
-            any_outside |= outside(poly[i]);
-        }
-        if (w0 < 1e-3f * w1) {
-            // Left at w 0: off the screen or not, the TA clamps w and clips what that makes.
-            d_zero++;
-            if (example < 0) {
-                example = static_cast<s32>(first);
-                example_w = w0;
+            for (u32 k = 0; k < n; k++) {
+                if (poly[k][3] > 0.0f) {
+                    const float d =
+                        fs_data.depth_offset + fs_data.depth_scale * poly[k][2] / poly[k][3];
+                    lo = std::min(lo, d);
+                    hi = std::max(hi, d);
+                }
             }
-            return;
+        };
+        switch (regs.pipeline.triangle_topology) {
+        case Pica::PipelineRegs::TriangleTopology::List:
+        case Pica::PipelineRegs::TriangleTopology::Shader: // a list, as the primitive assembler
+            for (u32 j = 0; j + 2 < count; j += 3) {
+                clip_triangle(j, j + 1, j + 2);
+            }
+            break;
+        case Pica::PipelineRegs::TriangleTopology::Strip:
+            for (u32 j = 0; j + 2 < count; j++) {
+                clip_triangle(j, j + 1, j + 2);
+            }
+            break;
+        case Pica::PipelineRegs::TriangleTopology::Fan:
+            for (u32 j = 1; j + 1 < count; j++) {
+                clip_triangle(0, j, j + 1);
+            }
+            break;
         }
-        if (!any_outside) {
-            return;
-        }
-        // Off the screen whole: the TA drops it before clipping.
-        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
-        for (u32 i = 0; i < n; i++) {
-            const float x = poly[i][0] / poly[i][3], y = poly[i][1] / poly[i][3];
-            x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
-        }
-        if (x1 < -1.0f || x0 > 1.0f || y1 < -1.0f || y0 > 1.0f) {
-            return;
-        }
-        d_band++;
-        if (w1 - w0 > 1e-4f * w1) {
-            d_mixed++;
-        }
+        return true;
     };
-    switch (pipeline.triangle_topology) {
-    case Topology::Strip:
-        for (u32 i = 0; i + 2 < count; i++) {
-            triangle(i, i + 1, i + 2, i);
+    [[maybe_unused]] const auto describe = [&](float lo, float hi) {
+        std::string list;
+        for (u32 j = 0; j < count; j++) {
+            const auto& p = out[j].pos;
+            list += fmt::format(" ({} {} {} {})", p.x.ToFloat32(), p.y.ToFloat32(),
+                                p.z.ToFloat32(), p.w.ToFloat32());
         }
-        break;
-    case Topology::Fan:
-        for (u32 i = 1; i + 1 < count; i++) {
-            triangle(0, i, i + 1, i);
+        return fmt::format(
+            "{}: a Z-buffered draw of {} vertices, visible depths {} to {}, tests depth against "
+            "the TA's W depths: only a quad of one depth, or a layer in the far eighth of the "
+            "depth range, is mapped (depth {} + {} * z / w, compare {}, write {}; x y z w:{})",
+            where(), count, lo, hi, fs_data.depth_offset, fs_data.depth_scale,
+            static_cast<u32>(regs.framebuffer.output_merger.depth_test_func.Value()),
+            regs.framebuffer.output_merger.depth_write_enable.Value(), list);
+    };
+    float d = FarLayerDepth;
+    if (count <= CpuVertices) {
+        float lo, hi;
+        if (count == 0 || !visible_depths(lo, hi)) {
+            DEBUG_ASSERT_MSG(false,
+                             "sgxd: {}: a Z-buffered draw of {} vertices tests depth against the "
+                             "TA's W depths, and its vertices are not in memory",
+                             where(), count);
+            return false;
         }
-        break;
-    default:
-        for (u32 i = 0; i + 2 < count; i += 3) {
-            triangle(i, i + 1, i + 2, i);
+        if (lo > hi) {
+            // Nothing of it is drawn: any depth will do.
+            lo = hi = fs_data.depth_offset + fs_data.depth_scale * out[0].pos.z.ToFloat32() /
+                                                 out[0].pos.w.ToFloat32();
         }
-        break;
+        d = (lo + hi) / 2.0f;
+        if (hi - lo > 1e-6f * std::max(1.0f, std::abs(d)) && lo < 7.0f / 8.0f) {
+            DEBUG_ASSERT_MSG(false, "sgxd: {}", describe(lo, hi));
+            return false;
+        }
+    } else {
+#ifdef VITA_DIAGNOSTICS
+        // One in 32, so a diagnostics build keeps its speed.
+        static u32 checked = 0;
+        if (float lo, hi; checked++ % 32 == 0 && visible_depths(lo, hi) && lo <= hi) {
+            DEBUG_ASSERT_MSG(lo >= 7.0f / 8.0f, "sgxd: {}", describe(lo, hi));
+        }
+#endif
     }
-    draws++;
-    triangles += d_tris, band += d_band, band_mixed += d_mixed, near += d_near;
-    near_zero += d_zero, non_finite += d_bad;
-    if ((d_zero != 0 || d_bad != 0) && logged < 600) {
-        logged++;
-        const auto& fb = regs.framebuffer.framebuffer;
-        std::string worst;
-        if (example >= 0) {
-            const u32 e = static_cast<u32>(example);
-            const bool fan = pipeline.triangle_topology == Topology::Fan;
-            for (const u32 k : {fan ? 0u : e, fan ? e : e + 1, fan ? e + 1 : e + 2}) {
-                worst += fmt::format(" ({:.4g} {:.4g} {:.4g} {:.4g})", pos[k][0], pos[k][1],
-                                     pos[k][2], pos[k][3]);
-            }
-        }
-        LOG_INFO(Render,
-                 "clipcheck: draw {} on {:#x} {}x{}, topology {}, {} vertices, vs {:#x} code "
-                 "{:016x}: {} triangles; {} clipped at the band ({} with w differing), {} crossing "
-                 "w 0, {} left with w near 0 ({:.3g}), {} non-finite; band {:.2f} x {:.2f}; "
-                 "first{}",
-                 draw_serial, fb.GetColorBufferPhysicalAddress(), fb.GetWidth(), fb.GetHeight(),
-                 TopologyName(pipeline.triangle_topology), count, regs.vs.main_offset.Value(),
-                 pica.vs_setup.GetProgramCodeHash(), d_tris, d_band, d_mixed, d_near, d_zero,
-                 example_w, d_bad, bx, by, worst);
+    const WDepthMap& m = pass_w_map;
+    if (!m.fitted) {
+        DEBUG_ASSERT_MSG(false,
+                         "sgxd: {}: a Z-buffered draw tests depth against the TA's W depths, "
+                         "but no W-buffered draw of theirs was fitted (FitWDepth)",
+                         where());
+        return false;
     }
+    // Where the PICA's W depth equals d. Nearer than every visible w, it is before all of them.
+    const float w_at = (d - m.beta) / m.alpha;
+    float t;
+    if (!(w_at > 0.0f)) {
+        t = m.grows ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
+    } else {
+        t = m.grows ? 1.0f - w_depth_k / w_at : w_depth_k / w_at;
+    }
+    viewport[4] = t;
+    viewport[5] = 0.0f;
+    return true;
 }
+
 u32 RasterizerSgxd::OwnPixelUnits(bool is_indexed, const float* immediate, u32 count) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
@@ -6091,9 +6096,7 @@ bool RasterizerSgxd::FillsClearQuad(bool is_indexed, const float* immediate, u32
         }
         d.pending = p;
         d.valid = true;
-#ifdef VITA_DIAGNOSTICS
         d.ta_w = false;
-#endif
     }
     const auto filled_what = [&] {
         return fmt::format("{:#x} ({}x{}, part {}..{} x {}..{}): colour {:#x}{}{}", target.addr,
@@ -6587,9 +6590,8 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         pass_depth_covered = false;
         pass_depth_part = false;
         pass_depth_guest = false;
-#ifdef VITA_DIAGNOSTICS
         pass_ta_w = false;
-#endif
+        pass_w_map = {};
         float bg_depth = 1.0f;
         u32 bg_stencil = 0;
         if (TakeClear(depth, depth + width * height * pass_depth_bytes, depth_clear)) {
@@ -6724,9 +6726,8 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         });
         pass_depth_load = true;
         pass_depth_guest = it == depth_stores.end() || !it->valid;
-#ifdef VITA_DIAGNOSTICS
         pass_ta_w = !pass_depth_guest && it->ta_w;
-#endif
+        pass_w_map = pass_ta_w ? it->ta_map : WDepthMap{};
         if (pass_depth_guest && (pass_quarters != 4 || pass_margin != 0)) {
             // A scaled or widescreen pass with no such depth to load (the buffer just turned
             // scaled; a game never clears its depth, every pass loads the last one's): its store
@@ -7105,7 +7106,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             if (issue.fog) {
                 FogTableWords(regs.texturing.fog_flip != 0, issues[i].tex);
                 issues[i].raw = 1u;
-                issues[i].proj_t = 1u;
+                // TEXCOORD3's u (depth times w) over t (w): the PICA's Z depth; W-buffered, u alone.
+                issues[i].proj_t = regs.rasterizer.depthmap_enable ==
+                                           Pica::RasterizerRegs::DepthBuffering::WBuffering &&
+                                       !regs.framebuffer.IsShadowRendering()
+                                   ? 0u
+                                   : 1u;
             } else if (issue.proctex) {
                 ProcTexTableWords(issues[i].tex);
             } else if (issue.alpha) {
@@ -7152,6 +7158,45 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     p.viewport[3] = half_w * vs;
     p.viewport[4] = fs_data.depth_offset - fs_data.depth_scale / 2.0f;
     p.viewport[5] = -fs_data.depth_scale / 2.0f;
+    if (Usse::z_flip) {
+        // z written as 2z + w: z / w * depth_scale / 2 + depth_offset - depth_scale / 2.
+        p.viewport[5] = fs_data.depth_scale / 2.0f;
+    }
+    // W-buffering: the TA's WBUFFEN gives the ISP the viewport's z mapping of 1/w (docs/sgxd/ta.md),
+    // linear on the screen and in the PICA's depth order: 1 - 1/w where the PICA's depth grows with w,
+    // else 1/w. The depths stored are these, and a pass's Z-buffered draws do not compare with them as
+    // the PICA's would.
+    u32 mte = 0;
+    if (regs.rasterizer.depthmap_enable == Pica::RasterizerRegs::DepthBuffering::WBuffering &&
+        !regs.framebuffer.IsShadowRendering()) {
+        const bool grows = fs_data.depth_offset - fs_data.depth_scale > 0.0f;
+        if (dwrite) {
+            pass_ta_w = true;
+            if (!pass_w_map.fitted) {
+                FitWDepth(is_indexed, immediate, count, grows);
+            }
+        }
+        // K at or below the draw's near plane, from its position rows or the pass's fit. Depths stored
+        // before a change compare against the new ones from the next clear on.
+        const float near_w = std::fmin(draw_near_w, pass_w_map.fitted
+                                                        ? pass_w_map.near_w
+                                                        : std::numeric_limits<float>::quiet_NaN());
+        if (near_w < w_depth_k) {
+            const float k = std::exp2(std::floor(std::log2(near_w)));
+            LOG_INFO(Render, "sgxd: W-buffered depth 1 - K / w: K {} -> {} for a near plane at w {}",
+                     w_depth_k, k, near_w);
+            w_depth_k = k;
+        }
+        p.viewport[4] = grows ? 1.0f : 0.0f;
+        p.viewport[5] = grows ? -w_depth_k : w_depth_k;
+        mte = SGXD_RECIPE_MTE_WBUFFEN;
+    } else if (pass_ta_w && dcmp != 7 &&
+               regs.rasterizer.depthmap_enable ==
+                   Pica::RasterizerRegs::DepthBuffering::ZBuffering &&
+               !regs.framebuffer.IsShadowRendering()) {
+        // A Z-buffered draw testing against them (the PICA takes the depth mode per draw).
+        [[maybe_unused]] const bool mapped = MapZOnW(is_indexed, immediate, count, p.viewport);
+    }
     p.primitive = primitive;
 
     // ISP A: PASSTYPE, DCMP, DWRITEDIS, BPRES. Translucent (1) with a blend or a write mask, else opaque
@@ -7179,7 +7224,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                             (static_cast<u32>(PassX(pass_part.x1)) - 1) / 32,
                                             (static_cast<u32>(PassEdge(pass_part.y1)) - 1) / 32);
     const SgxdRecipeDraw draw{0, stage.count, isp, SGXD_R_FPRIM,
-                              CullMode(regs.rasterizer.cull_mode), 0, nullptr, ispc};
+                              CullMode(regs.rasterizer.cull_mode), clip, nullptr, ispc, mte};
     backend.Draw(draw, p);
     if (const auto [lo, hi] = DrawnRows(); lo < hi) {
         const bool first = pass_drawn_lo >= pass_drawn_hi;

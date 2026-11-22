@@ -5,11 +5,13 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 #include "common/mutex.h"
@@ -495,8 +497,8 @@ private:
     /// its index list is not in memory. Once a draw.
     bool QuadVertices(bool is_indexed, const float* immediate, u32 count,
                       std::array<Pica::OutputVertex, 6>& out);
-    bool RunQuadVertices(bool is_indexed, const float* immediate, u32 count,
-                         std::array<Pica::OutputVertex, 6>& out);
+    bool RunVertices(bool is_indexed, const float* immediate, u32 count,
+                     std::span<Pica::OutputVertex> out);
 #ifdef VITA_DIAGNOSTICS
     /// sgxd_flags dumptex: each level's guest bytes and host copy to host0, named by its guest address
     /// (sgxd_dump.cpp). `bits`: the guest format's bits a texel.
@@ -510,13 +512,6 @@ private:
     std::vector<u64> tex_dumped;
     u32 tex_dump_transfers = 0;
     bool tex_dumping = false;
-    /// sgxd_flags wbufmix: a Z-buffered draw that tests depth against the TA's W depths (a
-    /// W-buffered draw of the pass wrote them, or the pass loaded a store holding them) is
-    /// logged with its PICA depth range: there the PICA compared W depths, sgxd 1 - 1/w.
-    /// `w_ta`: this draw is W-buffered through WBUFFEN.
-    void LogWbufMix(bool w_ta, bool dwrite, u32 dcmp, bool is_indexed, const float* immediate,
-                    u32 count);
-    bool pass_ta_w{}; ///< the pass's depth holds the TA's W depths (wbufmix)
 #endif
     u32 draw_serial = 0; ///< counts Draw's calls: QuadVertices' result holds for one
     struct QuadRun {
@@ -537,6 +532,11 @@ private:
     DrawView draw_view{};
     /// The vertex program's SA block: its uniforms from `setup`, its literals and buffer
     /// pointer; `vsec_sa` its words.
+    float draw_near_w = 0.0f;
+    /// The W-buffered draws' TA depth 1 - K / w (K / w where the PICA's depth falls with w): K starts
+    /// at 1 and only comes down, to the power of two at or below a W-buffered draw's near plane, so no
+    /// depth lies below 0, where the ISP clamps it. A smaller K costs depth resolution far away.
+    float w_depth_k = 1.0f;
     SgxdBackend::Data VertexSa(const VertexProgram& vp, const Pica::ShaderSetup& setup,
                                u32& vsec_sa, const Describe& describe);
     /// For each VS input register, the attribute whose default value it reads, -1 for none; made again
@@ -1052,6 +1052,26 @@ private:
     bool pass_depth_guest{};    // or from guest memory's, untiled into the store
     u32 guest_depth_loads{};
     u32 window_misses{}; ///< draws reaching before the top screen's window (TopWindowFor), logged
+    /// A W-buffered draw's depth through WBUFFEN is c0 + c1 / w: 1 - 1/w where the PICA's W depth
+    /// grows with w, else 1/w. That depth is alpha * w + beta for a perspective projection, fitted
+    /// from a draw's vertices (FitWDepth), for MapZOnW.
+    struct WDepthMap {
+        bool fitted = false;
+        bool grows = true;
+        float alpha = 0.0f, beta = 0.0f;
+        /// The least w the PICA's planes leave of the fitted projection (w_depth_k), or NaN.
+        float near_w = std::numeric_limits<float>::quiet_NaN();
+    };
+    bool pass_ta_w{};        ///< the pass's depth holds the TA's W depths
+    WDepthMap pass_w_map{};  ///< ... and their map, once a W-buffered draw was fitted
+    /// The first W-buffered draw of a pass that writes depth (and the next, until one fits): up to six
+    /// vertices on the CPU, z against w, into pass_w_map.
+    void FitWDepth(bool is_indexed, const float* immediate, u32 count, bool grows);
+    /// A Z-buffered draw testing depth against the TA's W depths: its depth for the ISP is the TA's
+    /// depth of the w where the two are equal, set in `viewport` (state words 16, 17). Built for a quad
+    /// of one depth and for layers behind the scene; false, asserted, for anything else.
+    bool MapZOnW(bool is_indexed, const float* immediate, u32 count, float* viewport);
+    std::vector<Pica::OutputVertex> zw_vertices; ///< MapZOnW's draw on the CPU
     /// Depth buffers kept across passes (EndPass stores a pass's depth, the next pass without a clear
     /// loads it).
     struct DepthStore {
@@ -1072,10 +1092,9 @@ private:
             bool has_z, has_stencil;
         };
         std::optional<PendingClear> pending{};
-#ifdef VITA_DIAGNOSTICS
-        /// sgxd_flags wbufmix: the last pass stored the TA's W depths (WBUFFEN's 1 - 1/w)
+        /// The last pass on the buffer stored the TA's W depths (WBUFFEN), and their map.
         bool ta_w = false;
-#endif
+        WDepthMap ta_map{};
     };
     std::vector<DepthStore> depth_stores;
     DepthStore& DepthStoreFor(PAddr addr, u32 width, u32 height, u32 format, u32 quarters = 4,

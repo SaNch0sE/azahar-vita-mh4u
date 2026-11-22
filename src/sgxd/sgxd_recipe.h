@@ -102,7 +102,12 @@ typedef struct SgxdRecipeDraw {
     // SOP2 21..19 depth fail, SOP3 18..16 pass, SCMPMASK 15..8, SWMASK 7..0), for both faces;
     // the reference is ISP A's SREF (7..0). 0 means SGXD_RECIPE_ISP_C.
     uint32_t ispc;
+    // MTE control bits ORed into state word 21 beside WCLAMPEN: SGXD_RECIPE_MTE_WBUFFEN.
+    uint32_t mte;
 } SgxdRecipeDraw;
+// WBUFFEN, bit 14 on the SGX543: the TA's depth is the viewport's z mapping of 1/w
+// instead of z/w; clipping is unchanged.
+#define SGXD_RECIPE_MTE_WBUFFEN (1u << 14)
 // ISP C with no stencil: SCMP ALWAYS, every op KEEP, both masks 0.
 #define SGXD_RECIPE_ISP_C 0x0e000000u
 // ISP A's CPRES: the object carries its ISP C word.

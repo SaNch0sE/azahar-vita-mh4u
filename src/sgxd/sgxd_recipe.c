@@ -1168,7 +1168,7 @@ static void write_draw(const SgxdRecipe *r, uint8_t *memory, unsigned n, const S
         pixel_size_word(r, fprim) | msbs(r, SGXD_R_FSEC, fprim), ptr(r, fprim),
         clip_x(r, clip), clip_y(r, clip),
         fbits(W / 2.0f), fbits(W / 2.0f), fbits(H / 2.0f), fbits(H / 2.0f), fbits(0.5f),
-        fbits(0.5f), 0, outselects(r), 0x3727c5ac, 0x8000 | d->cull,
+        fbits(0.5f), 0, outselects(r), 0x3727c5ac, 0x8000 | d->mte | d->cull,
         imgui_uv(r) ? 1u : 0u, 0,
     };
     if (g) {
