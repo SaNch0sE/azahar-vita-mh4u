@@ -61,6 +61,17 @@ struct SgxdCacheTimes {
 SgxdCacheTimes SgxdTakeCacheTimes();
 #endif
 
+/// How a picture holds its pixels: stored through the PBE's pack, bpp bytes a pixel, read back
+/// through the texture unit's code and swizzle, converted or raw. The default is U8888 read raw
+/// (an RGBA8 buffer's); other formats keep the buffer's own (RasterizerSgxd::PictureFormatFor).
+struct SgxdPictureFormat {
+    u32 pack = SGXD_RECIPE_PACK_U8888;
+    u32 code = 0x0c;
+    u32 swizzle = 0;
+    u32 bpp = 4;
+    bool converted = false;
+};
+
 /**
  * The rasterizer's GPU memory and passes through sgxd (docs/sgxd/README.md). Each
  * target size has its own recipe, made at its first pass, in a block of its own that also holds
@@ -177,13 +188,13 @@ public:
         return data_opens;
     }
 
-    /// Memory for width x height 32-bit samples (a depth store), rows width apart; the first
-    /// fit of what FreeSurface gave back. `upscaled`: the upscaled top screen's, from the
-    /// textures pool (AllocTexture).
-    Data AllocSurface(u32 width, u32 height, bool upscaled = false);
+    /// Memory for width x height samples of bpp bytes (32-bit: a depth store), rows width apart;
+    /// the first fit of what FreeSurface gave back. `upscaled`: a picture's, from the textures
+    /// pool (AllocTexture), where a surface the block has no room left for comes from as well.
+    Data AllocSurface(u32 width, u32 height, bool upscaled = false, u32 bpp = 4);
     /// Memory AllocSurface gave, no longer used (a depth buffer the guest reshaped), after its
-    /// last read.
-    void FreeSurface(const Data& surface, u32 width, u32 height);
+    /// last read: the same sizes.
+    void FreeSurface(const Data& surface, u32 width, u32 height, u32 bpp = 4);
     /// The LUT texture's rows, in the shared block: Pica::Shader::LUT_LF_ROWS rows of 256 F32F32
     /// texels, the rasterizer's to manage.
     [[nodiscard]] Data LutRows() const;
@@ -194,6 +205,8 @@ public:
     /// The LF rows' lighting values as F16, Pica::Shader::LUT_LF_ROWS rows of 256, row for row
     /// (the lighting's filtered LUT reads).
     [[nodiscard]] Data LutLfHalfRows() const;
+
+    using PictureFormat = SgxdPictureFormat;
 
     /**
      * A guest colour buffer a pass renders into, where it is: width x height pixels of bpp bytes at its PICA address, in
@@ -209,18 +222,17 @@ public:
         u32 bpp;
         // The part of the transpose stored (SgxdPicaStore's x0..x1, y0..y1); x1 0 for all of it.
         u32 x0{}, x1{}, y0{}, y1{};
-        // Drawn scaled by picture_quarters / 4 (4 to 6: the upscaled or widescreen top screen):
-        // the pass is height x width scaled, each tile stored whole into picture, LINEAR U8888
-        // rows picture_stride pixels apart (sgxd_recipe_pica_eot_scaled), the guest's buffer left
-        // to DownscalePicture; picture 0 for none. Widescreen, the pass and the picture are
-        // picture_margin of the buffer's rows (its transpose's columns) wider on each side, the
-        // buffer's first row at the picture's picture_margin (scaled); with picture_widen the
-        // part's columns grow by the margin each side too (a viewport as wide as the screen).
+        // Drawn into a picture at picture_quarters / 4 (4 to 8): the pass is height x width
+        // scaled, each tile stored whole into picture as LINEAR rows of picture_format,
+        // picture_stride pixels apart; the guest's buffer is left to DownscalePicture. 0 for none.
+        // Widescreen: the pass and picture are picture_margin rows wider each side; picture_widen
+        // grows the part's columns by the margin too.
         u32 picture{}, picture_stride{}, picture_quarters{}, picture_margin{};
         bool picture_widen{};
         // With a picture: its pass's samples a pixel, 1 or 2 (2x MSAA, sgxd_recipe_samples): a
         // 2x pass's tiles store each pixel's samples averaged into the picture.
         u32 picture_samples{1};
+        PictureFormat picture_format{};
     };
     /// Opens a pass on target. The background is clear (A8B8G8R8) at depth, what a fill left
     /// pending in guest memory. before: as BeginPassLoaded's.
@@ -439,21 +451,26 @@ public:
     /// magnified to the scale (nearest).
     void BeginPassLoadedScaled(const PicaTarget& target, float depth, const UntileSource& guest,
                                bool magnified, const std::function<void()>& before = {});
-    /// One pass storing a scaled pass's picture (target.picture) into target's guest buffer (its
-    /// part, or all of it) at 1x: at 2x each pixel the average of its 2x2 block, at the other
-    /// scales a bilinear read at the pixel's centre. nearest: each pixel the texel its centre
-    /// falls in instead, for words that do not average (a depth buffer's).
-    /// quad_to_part: the quad covers the target's part alone (its other tiles stay EMPTY and
-    /// skip their store), not the whole target. rows: the picture's rows a pixel row scaled (2
-    /// for a 2x store's words, a row a sample). format: the picture's texels (U8888, or 0x09
-    /// U16 for a D16 buffer's values), read unconverted.
+    /// In a pass BeginPassLoadedScaled opened from its picture: rows (the guest's whole strips
+    /// of the buffer from its row first_row on) drawn over the load from guest memory, each
+    /// texel magnified to the scale (nearest): the picture's rows older than guest memory. The
+    /// pass's footprint is the guest's bytes then (the first call's, the later ones' joined).
+    void LoadGuestRowsScaled(const PicaTarget& target, const UntileSource& rows, u32 first_row,
+                             bool first);
+    /// One pass storing a scaled pass's picture into target's guest buffer (its part, or all) at
+    /// 1x: at 2x each pixel averages its 2x2 block, at other scales a bilinear read at the pixel's
+    /// centre; nearest: the texel the centre falls in (depth words). quad_to_part: the quad covers
+    /// the part alone, the other tiles stay EMPTY. rows: picture rows a pixel row (2 for a 2x
+    /// store's words). Texels read as target.picture_format says.
     void DownscalePicture(const PicaTarget& target, bool nearest = false,
-                          bool quad_to_part = false, u32 rows = 1, u32 format = 0x0c);
-    /// One pass copying width x height pixels of a LINEAR U8888 picture (rows stride apart),
-    /// from its column source_x on, into dest, LINEAR U8888 rows width apart: a scaled picture
-    /// kept for the present.
-    void CopyPicture(u32 dest_gpu, u32 source_gpu, u32 width, u32 height, u32 stride,
-                     u32 source_x = 0);
+                          bool quad_to_part = false, u32 rows = 1);
+    /// One pass copying width x height pixels of a LINEAR picture in format (rows stride
+    /// apart), from its column source_x on, into dest, LINEAR rows width apart stored through
+    /// dest_pack: a screen picture kept for the present. scale_x, scale_y (1 or 2): each pixel
+    /// the average of that many of the source's along and across its rows (BlitPrograms').
+    void CopyPicture(u32 dest_gpu, u32 dest_pack, u32 source_gpu, u32 width, u32 height,
+                     u32 stride, const PictureFormat& format, u32 source_x = 0, u32 scale_x = 1,
+                     u32 scale_y = 1);
     /// Opens a pass whose first draw writes every pixel: no clear and no load.
     void BeginPassOver(const PicaTarget& target, float depth,
                        const std::function<void()>& before = {});
@@ -565,6 +582,12 @@ public:
      */
     void Untile(const UntileSource& source, u32 dest_gpu, u32 dest_stride, bool swizzled = false,
                 bool transposed = false);
+    /// A guest depth buffer's words (D24S8's or D24's, w x h) untiled into the depth store of a
+    /// scaled, widescreen or 2x pass, for DepthLoad::Guest: Untile's transpose magnified,
+    /// quarters / 4 a side, margin columns of the far plane either side. Each sample takes the
+    /// word of the pixel its centre falls in, so DepthToGuest writes back each pixel's own word.
+    void UntileDepthScaled(const UntileSource& source, const DepthStore& store, u32 quarters,
+                           u32 margin, u32 samples);
     /**
      * A 2D texture's levels untiled as the texture unit's LINEAR chain at dest_gpu: level l is
      * w_l x h_l A8B8G8R8 texels in rows of w_l, the levels back to back from level 0
@@ -630,31 +653,43 @@ public:
     void StreamOut(const SgxdRecipeDrawPrograms& programs, u32 count, StreamStage stage, bool wait);
     void FlushStreamOut(bool wait);
 
-    /// mirror: the texel is read converted with its lanes mirrored (A, B, G, R) and packed
-    /// again, for a pack that stores the channels in the other order (A4R4G4B4 as RGBA4).
+    /// The blit's draw programs: one quad sampling source (A8B8G8R8, width x height) texel for
+    /// pixel into a target of that size, point sampled (TouchAllTiles).
     /// source_stride: the source's rows apart in texels, 0 for width.
-    /// scale_x, scale_y (1 to 2): the source has width * scale_x columns and height * scale_y
-    /// rows (whole), read bilinear at each output pixel's centre: at 2, the average of 2x2
-    /// texels (the display transfer's ScaleX and ScaleXY).
-    /// nearest: scaled, the texel the centre falls in instead of the bilinear read.
-    /// rect: the two triangles over that part of the target alone, each pixel reading what it
-    /// reads in the whole one.
-    /// format: the source's texel format code (sgxd_recipe_texture_words_format), U8888 or one
-    /// read as raw the same way (0x09 U16).
+    /// scale_x, scale_y (1 to 2): the source is width * scale_x x height * scale_y, read bilinear
+    /// at each pixel's centre (the display transfer's ScaleX and ScaleXY); nearest: the texel the
+    /// centre falls in.
+    /// rect: the triangles over that part of the target alone.
+    /// format: the source's texels (PictureFormat): U8888 or 0x09 U16 raw, or converted by the
+    /// screen program.
     SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height,
-                                        bool mirror = false, u32 source_stride = 0,
-                                        float scale_x = 1, float scale_y = 1, u32 source_x = 0,
+                                        u32 source_stride = 0, float scale_x = 1,
+                                        float scale_y = 1, u32 source_x = 0,
                                         bool nearest = false, const PassRect* rect = nullptr,
-                                        u32 format = 0x0c);
+                                        const PictureFormat& format = {});
     /// A display transfer from a PICA-tiled picture in guest memory: one pass whose draws read
     /// it a band of tile rows at a time (DrawTiled), into dest_gpu as width x height pixels of
     /// pack (an SGXD_RECIPE_PACK_*), rows width apart, the source's top-left width * scale_x x
-    /// height * scale_y, averaged as BlitPrograms' scale. Mirrored (BlitPrograms' mirror), the
-    /// picture is untiled into the pass's data first and blitted from there. flip: the output's
-    /// rows in the other order (the transfer's flip_vertically; not with mirror).
+    /// height * scale_y, averaged as BlitPrograms' scale. flip: the output's rows in the other
+    /// order (the transfer's flip_vertically).
     void TransferFromGuest(const UntileSource& source, u32 dest_gpu, u32 width, u32 height,
-                           u32 pack, bool mirror, u32* ta_us = nullptr, u32* d3_us = nullptr,
-                           u32 scale_x = 1, u32 scale_y = 1, bool flip = false);
+                           u32 pack, u32* ta_us = nullptr, u32* d3_us = nullptr, u32 scale_x = 1,
+                           u32 scale_y = 1, bool flip = false);
+    /// A display transfer from a pass's picture (PicaTarget::picture: the buffer's transpose at
+    /// quarters / 4, LINEAR rows in format stride pixels apart, margin rows past each side) instead
+    /// of the guest's bytes: as TransferFromGuest, from the buffer's row first_row on. Each output
+    /// pixel reads the picture at its centre (one texel at 1x, bilinear scaled).
+    void TransferFromPicture(u32 picture, u32 stride, u32 rows, u32 quarters, u32 margin,
+                             u32 first_row, u32 dest_gpu, u32 width, u32 height, u32 pack,
+                             u32 scale_x, u32 scale_y, bool flip, const PictureFormat& format,
+                             u32* ta_us = nullptr, u32* d3_us = nullptr);
+    /// A texture's copy from a picture (TransferFromPicture's source): a side render of the
+    /// buffer's width x height texels from row first_row on, at the picture's scale, into LINEAR
+    /// U8888 rows dest_stride texels apart at dest_gpu, point sampled: a scaled pass's colour stays
+    /// at its scale, and depth words do not average.
+    void TextureFromPicture(u32 picture, u32 stride, u32 rows, u32 quarters, u32 margin,
+                            u32 first_row, u32 dest_gpu, u32 dest_stride, u32 width, u32 height,
+                            const PictureFormat& format);
     /// The same into a PICA-tiled picture: one pass on target as a PICA colour buffer (as
     /// BeginPassLoaded opens it), the source read as its load reads, scaled.
     /// A PICA-tiled picture into one magnify_x x magnify_y times its size, each texel repeated

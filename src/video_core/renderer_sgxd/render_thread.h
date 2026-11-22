@@ -130,19 +130,13 @@ public:
     void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                      const Pica::OutputVertex& v2) override;
     void DrawTriangles() override;
-    // RasterizerSgxd's are empty: its surfaces reach guest memory only through the operations
-    // that write them there. An invalidate is the HLE about to write the range (Y2R's conversion,
-    // a DMA): T12's textures over it are untiled again (InvalidateWritten), as for a write the
-    // page holds catch.
+    // The surfaces reach guest memory through the operations that write them there, the pictures
+    // through the reads of their bytes (the page holds copy a picture's rows first).
     void FlushAll() override {}
-    void FlushRegion(PAddr, u32) override {}
-    void InvalidateRegion(PAddr addr, u32 size) override {
-        InvalidateWritten(addr, size);
-    }
-    void FlushAndInvalidateRegion(PAddr addr, u32 size) override {
-        InvalidateWritten(addr, size);
-    }
-    void ClearAll(bool) override {}
+    /// A savestate, under the hold (System::serialize): the pictures guest memory is older
+    /// than go there first (RasterizerSgxd::FlushAll). A load makes the renderer again, so its
+    /// rasterizer has none.
+    void ClearAll(bool) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
@@ -485,6 +479,23 @@ private:
     std::atomic<u32> reached{};     ///< the last ticket whose work is done
 
     PageHolds page_holds;
+    /// An access of the guest's CPU or the HLE to [addr, addr + bytes) where a picture owns rows
+    /// (RasterizerSgxd::PictureOwns), on any thread: the render side copies them into guest
+    /// memory and waits for the GPU (RasterizerSgxd::ServeGuestAccess), with write marking the
+    /// range written, before this returns. The holder of a hold serves its own.
+    void AskPictureCopy(PAddr addr, u32 bytes, bool write, bool wait = true, bool beside = false);
+    void ServeGuestAccesses();
+    /// After a copy for a read of [lo, hi): the rows it may have written back watched for the first
+    /// write.
+    void WatchCopiedRows(PAddr lo, PAddr hi);
+    std::mutex access_lock;
+    std::vector<std::array<u32, 3>> access_requests; ///< address, bytes, write
+    std::atomic<u32> access_requested{0}; ///< requests made (under access_lock)
+    std::atomic<u32> access_served{0};    ///< requests served
+#ifdef VITA_DIAGNOSTICS
+    std::atomic<u32> picture_faults{0};        ///< guest aborts that copied a picture's rows
+    std::atomic<u32> picture_host_accesses{0}; ///< HLE accesses that did
+#endif
     bool page_holds_on{};
     u32 last_write_ticket{}; ///< the last ticket whose work writes guest memory
     /// A draw's colour write and depth read holds, made once a ticket and frame (the draws of a list

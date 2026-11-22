@@ -125,11 +125,11 @@ constexpr std::array table{std::to_array<Translation>({
     {"Down", "方向键下"},
     {"Download Play", "下载游玩"},
     {"Downloadable content", "追加内容"},
-    {"Draws the top screen at a higher resolution: sharper in the Single screen and Large screen "
-     "layouts, but much more GPU work (about 2.25 times at 1.5x), so slow games get slower. Can "
+    {"Draws both screens at a higher resolution: sharper wherever a screen is shown larger than on "
+     "the 3DS, but much more GPU work (about 2.25 times at 1.5x), so slow games get slower. Can "
      "crash games that use a lot of video memory.",
-     "以更高分辨率绘制上屏：在“单屏”和“大屏”布局下更清晰，但 GPU 负担大幅增加（1.5x 时约为 2.25 "
-     "倍），本来就慢的游戏会更慢。占用显存较多的游戏可能会崩溃。"},
+     "以更高分辨率绘制上下两屏：画面显示得比 3DS 上大时更清晰，但 GPU 负担大幅增加（1.5x 时约为 "
+     "2.25 倍），本来就慢的游戏会更慢。占用显存较多的游戏可能会崩溃。"},
     {"Dump frame", "转储画面"},
     {"Dutch", "荷兰语"},
     {"Empty", "空"},
@@ -205,6 +205,7 @@ constexpr std::array table{std::to_array<Translation>({
      "data.",
      "从此文件将游戏安装到模拟的 SD 卡，与安装它的 CIA 相同。安装后的游戏会显示在列表中此文件的旁边，两者共用同一份存档。"},
     {"it is encrypted. Decrypt it, then try again.", "文件已加密。请解密后重试。"},
+    {"Internal resolution", "内部分辨率"},
     {"Italian", "意大利语"},
     {"Japan", "日本"},
     {"Japanese", "日语"},
@@ -433,10 +434,10 @@ constexpr std::array table{std::to_array<Translation>({
      "无法读取槽位 {}。请重新保存到该槽位，或读取其他槽位。"},
     {"Slot {} was not saved. Make sure the memory card has free space, then save again.",
      "槽位 {} 未能保存。请确认存储卡有可用空间，然后重新保存。"},
-    {"Smooths jagged edges on the top screen. It costs GPU time, so slow games get slower, and the"
-     " top screen stays at Native resolution while it is on. Can crash games that use a lot of "
-     "video memory.",
-     "平滑上屏的锯齿边缘。会占用 GPU 时间，本来就慢的游戏会更慢；开启时上屏保持原生分辨率。占用显"
+    {"Smooths jagged edges on the top screen. It costs GPU time, so slow games get slower, and "
+     "Internal resolution stays at Native while it is on. Can crash games that use a lot of video "
+     "memory.",
+     "平滑上屏的锯齿边缘。会占用 GPU 时间，本来就慢的游戏会更慢；开启时内部分辨率保持原生。占用显"
      "存较多的游戏可能会崩溃。"},
     {"Sound", "声音"},
     {"Space", "空格"},
@@ -568,7 +569,6 @@ constexpr std::array table{std::to_array<Translation>({
     {"To report it, send this file:", "如需报告，请发送此文件："},
     {"Tools", "工具"},
     {"Top screen", "上屏"},
-    {"Top screen resolution", "上屏分辨率"},
     {"Traditional Chinese", "繁体中文"},
     {"Triangle", "△ 按钮"},
     {"Turn", "旋转"},

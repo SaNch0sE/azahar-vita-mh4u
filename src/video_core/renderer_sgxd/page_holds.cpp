@@ -39,7 +39,8 @@ PageHolds::PageHolds(Memory::MemorySystem& memory)
       read_lo(fcram_pages), read_hi(fcram_pages), geometry_read(fcram_pages),
       move_ticket(fcram_pages), write_ticket(pages),
       write_lo(pages), write_hi(pages), display_ticket(fcram_pages), other_ticket(fcram_pages),
-      display_lo(fcram_pages), display_hi(fcram_pages), applied(pages), watched(fcram_pages),
+      display_lo(fcram_pages), display_hi(fcram_pages), applied(pages), picture_watch(pages),
+      watched(fcram_pages),
       watch_lo(fcram_pages), watch_hi(fcram_pages), watch_ticket(fcram_pages), parse_held(pages),
       index_watch(fcram_pages), index_stamp(fcram_pages),
       index_write_frame(fcram_pages) {
@@ -314,8 +315,14 @@ void PageHolds::Close(u32 ticket) {
 }
 
 PageHolds::Access PageHolds::Wanted(u32 page, u32 reached) const {
+    // Rows a picture owns: closed whole until copied (RenderThread::AskPictureCopy).
+    if (picture_owned && picture_owned(AddressOf(page), PageSize)) {
+        return NoAccess;
+    }
     const Access holds = HoldsWant(page, reached);
-    return (Watched(page) || parse_held[page] != 0 || IndexWatched(page)) && holds < ReadOnly
+    return (Watched(page) || parse_held[page] != 0 || IndexWatched(page) ||
+            picture_watch[page] != 0) &&
+                   holds < ReadOnly
                ? ReadOnly
                : holds;
 }
@@ -619,7 +626,7 @@ void PageHolds::Reopen(u32 page, u32 reached) {
     Access wanted = Wanted(page, reached);
     // A VRAM page the guest writes opens until the next GPU read of VRAM holds it again.
     if (page >= fcram_pages && wanted == ReadOnly && !Live(vram_read, reached) &&
-        parse_held[page] == 0) {
+        parse_held[page] == 0 && picture_watch[page] == 0) {
         wanted = Unheld;
         vram_opened.push_back(page);
     }

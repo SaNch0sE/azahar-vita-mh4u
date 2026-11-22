@@ -1567,10 +1567,10 @@ void Ui::BuildRows() {
     add({Option::TopScale,
          Category::Display,
          Kind::Choice,
-         Translatable("Top screen resolution"),
+         Translatable("Internal resolution"),
          Translatable(
-             "Draws the top screen at a higher resolution: sharper in the Single screen and Large "
-             "screen layouts, but much more GPU work (about 2.25 times at 1.5x), so slow games get "
+             "Draws both screens at a higher resolution: sharper wherever a screen is shown larger "
+             "than on the 3DS, but much more GPU work (about 2.25 times at 1.5x), so slow games get "
              "slower. Can crash games that use a lot of video memory."),
          {Translatable("Native"), "1.25x", "1.5x", "1.75x", "2x"},
          0,
@@ -1581,8 +1581,8 @@ void Ui::BuildRows() {
          Kind::Toggle,
          Translatable("Anti-aliasing (2x MSAA)"),
          Translatable("Smooths jagged edges on the top screen. It costs GPU time, so slow games "
-                      "get slower, and the top screen stays at Native resolution while it is on. "
-                      "Can crash games that use a lot of video memory."),
+                      "get slower, and Internal resolution stays at Native while it is on. Can "
+                      "crash games that use a lot of video memory."),
          {},
          0,
          nullptr,

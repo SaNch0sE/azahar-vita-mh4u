@@ -92,16 +92,19 @@ using ScreenQuad = ScreenLayouts::Quad;
 /// what the frame drew before it, its alpha that opacity.
 bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_format,
                      const ScreenQuad& quad, float opacity = 1.0f);
-/// The upscaled top screen (SgxdRenderer::RasterizerSgxd::TopScreenPicture): a LINEAR U8888
-/// picture of width x height at va (width a multiple of 8), the screen's transpose (x along the
+/// A screen's picture (SgxdRenderer::RasterizerSgxd::ScreenPictureOf): a LINEAR picture of
+/// width x height at va (width a multiple of 8), U8888 as a pass's tile holds it for an 8-bit
+/// pica_format (the transfer's output: RGBA8, RGB8), else in pica_format as the LCD holds it
+/// (RGB565, RGB5A1, RGBA4, as DrawGuestScreen reads them), the screen's transpose (x along the
 /// LCD buffer's rows, y across its columns) at quarters / 4 of its pixels, its columns from
-/// (row + margin) * quarters / 4 the screen's 400 rows and its first 60 * quarters rows the
-/// screen's 240 columns, filtered upright onto `quad`. The widescreen picture's margin rows each
-/// side of the 400 (its first column the screen's row -margin) show as far as the quad is wider
-/// than 5:3. flip: the screen's rows run to lower columns from (row + margin) * quarters / 4 (a
-/// flipped transfer's picture). opacity as DrawGuestScreen's.
-bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32 margin,
-                       bool flip, const ScreenQuad& quad, float opacity = 1.0f);
+/// (row + margin) * quarters / 4 the screen's `rows` rows (400 or 320) and its first
+/// 60 * quarters rows the screen's 240 columns, filtered upright onto `quad`. The widescreen
+/// picture's margin rows each side of the rows (its first column the screen's row -margin) show
+/// as far as the quad is wider than the screen. flip: the screen's rows run to lower columns from
+/// (row + margin) * quarters / 4 (a flipped transfer's picture). opacity as DrawGuestScreen's.
+bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 pica_format, u32 row, u32 quarters,
+                       u32 margin, bool flip, u32 rows, const ScreenQuad& quad,
+                       float opacity = 1.0f);
 /// Renders the batch, waits for the GPU, and queues the frame for the next vblank.
 void EndFrame();
 /// The BeginFrames since the last call that waited for a vblank to free a display buffer.

@@ -6,6 +6,7 @@
 
 #include <array>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -172,6 +173,19 @@ public:
     /// closed (a watch, a list's parse, a version the GPU is not on): OpenPastDisplay's page,
     /// before the bytes.
     [[nodiscard]] bool DisplayOnly(u32 page, u32 reached) const;
+    /// Whether a picture of the rasterizer's owns guest rows of [addr, addr + bytes) (its passes'
+    /// colour newer than guest memory; RasterizerSgxd::PictureOwns): such a page stays closed to
+    /// the guest; an access onto the rows asks for the copy first, one beside them goes past
+    /// (RenderThread::StoreMissesHolds, ReadMissesWrites).
+    std::function<bool(PAddr, u32)> picture_owned;
+    /// A page a picture's rows were copied into for a guest read: open to reads, closed to
+    /// writes, so that the guest's first write marks the picture's rows there outdated.
+    [[nodiscard]] bool PictureWatched(u32 page) const {
+        return picture_watch[page] != 0;
+    }
+    void SetPictureWatch(u32 page, bool on) {
+        picture_watch[page] = on ? 1 : 0;
+    }
     [[nodiscard]] PAddr AddressOf(u32 page) const;
     [[nodiscard]] Access Applied(u32 page) const {
         return static_cast<Access>(applied[page]);
@@ -361,6 +375,7 @@ private:
     /// a free one, else the nearer one; two grown into each other become one.
     static void AddRange(std::array<u16, 2>& lo, std::array<u16, 2>& hi, u16 l, u16 h);
     std::vector<u8> applied;       ///< Access, as the guest's view has it (after Apply)
+    std::vector<u8> picture_watch; ///< every page: PictureWatched
     std::vector<u8> watched;       ///< T12: FCRAM pages of a texture or a depth buffer (Watch)
     /// T12: a watched page's textures' bytes, as up to two ranges [lo, hi) (hi 0: none), and
     /// a count of the times it was watched anew (the stores beside them: StoreMisses).

@@ -295,7 +295,7 @@ void RemoveRomFolder(std::size_t index);
 std::size_t WriteApplied(char* out, std::size_t size);
 
 /// The running title's applied values that are not their options' defaults, among the options a
-/// game runs differently with (widescreen, the top screen's resolution, anti-aliasing, vsync, the
+/// game runs differently with (widescreen, the internal resolution, anti-aliasing, vsync, the
 /// speed limit, the frame skip limit and Wait for GPU results), as their file keys separated by
 /// commas in `out`: a crash's notice asks the player to try the defaults first. Nothing with no
 /// title running. Takes no lock and allocates nothing (CrashReport::Recover hands it to the

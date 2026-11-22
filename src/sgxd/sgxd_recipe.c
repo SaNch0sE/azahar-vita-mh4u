@@ -1028,9 +1028,14 @@ unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint6
     return n;
 }
 
+// The end of tile of a target drawn scaled (sgxd_recipe_pica_eot_scaled): the tile into the scaled
+// picture, LINEAR in the picture's pack, clipped to the part scaled (absolute pixels,
+// TILERELATIVE: the base is the picture's), with the sizes the linear recipe gives its target. The
+// guest's 1x copy is a pass of its own: SCALE_AA strips before this emit in one tile hang the GPU
+// (docs/sgxd/pbe.md, the averaged stores).
 unsigned sgxd_recipe_pica_eot_scaled(const SgxdRecipe *r, const SgxdPicaStore *s,
                                      unsigned quarters, uint32_t picture, uint32_t picture_stride,
-                                     uint64_t *out) {
+                                     uint32_t picture_pack, uint64_t *out) {
     // The guest's transpose at 1x, as sgxd_recipe_pica_eot takes it; the render is that scaled.
     if (quarters < 4 || quarters > 8 || r->width * 4 % quarters || r->height * 4 % quarters) {
         return 0;
@@ -1046,7 +1051,7 @@ unsigned sgxd_recipe_pica_eot_scaled(const SgxdRecipe *r, const SgxdPicaStore *s
     unsigned n = 0;
 #define PUT(w) (out[n++] = (w))
     PUT(PHAS_LAST);
-    PUT(usse_limm(0, SGXD_RECIPE_PACK_U8888));
+    PUT(usse_limm(0, picture_pack));
     PUT(usse_limm(1, picture));
     PUT(usse_limm(2, (picture_stride - 1) >> 1));
     PUT(usse_limm(3, 0));

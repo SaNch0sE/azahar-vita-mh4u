@@ -799,19 +799,27 @@ void EmuWindowVita::DrawGuestScreens() {
                      place.quad.x[2], place.quad.y[2], place.quad.x[3], place.quad.y[3]);
         }
         if (!s.fill && s.address != 0) {
+            // The stream reads the LCD buffer with the CPU: a screen picture's bytes go there
+            // first.
+            if (UvcStream::Streams(i)) {
+                SgxdRenderer::RasterizerSgxd::ScreenToGuest(s.address, s.stride * s.columns);
+            }
             UvcStream::Offer(i, s.pixels, s.stride, s.columns, s.format);
         }
         if (!place.shown || s.fill || s.address == 0 || s.pixels == nullptr) {
             continue;
         }
-        // The upscaled or widescreen top screen's picture, when the buffer's transfer copied one.
+        // The screen's picture, which the last display transfer into the buffer made from its
+        // source's picture, while it holds the buffer's bytes; else guest memory's.
         u32 picture = 0, picture_w = 0, picture_h = 0, picture_row = 0, quarters = 4, margin = 0;
+        u32 picture_format = 0;
         bool flip = false;
-        if (i == 0 &&
-            SgxdRenderer::RasterizerSgxd::TopScreenPicture(s.address, picture, picture_w, picture_h,
-                                                         picture_row, quarters, margin, flip) &&
-            SgxdPresent::DrawPictureScreen(picture, picture_w, picture_h, picture_row, quarters,
-                                           margin, flip, place.quad, place.opacity)) {
+        if (SgxdRenderer::RasterizerSgxd::ScreenPictureOf(s.address, s.columns, picture, picture_w,
+                                                         picture_h, picture_row, quarters, margin,
+                                                         flip, picture_format) &&
+            SgxdPresent::DrawPictureScreen(picture, picture_w, picture_h, picture_format,
+                                           picture_row, quarters, margin, flip, s.columns,
+                                           place.quad, place.opacity)) {
             continue;
         }
         if (!SgxdPresent::DrawGuestScreen(s.address, s.uncached ? nullptr : s.pixels, s.stride,

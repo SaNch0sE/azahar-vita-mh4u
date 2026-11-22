@@ -1081,40 +1081,50 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
     return true;
 }
 
-bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32 margin,
-                       bool flip, const ScreenQuad& quad, float opacity) {
+bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 pica_format, u32 row, u32 quarters,
+                       u32 margin, bool flip, u32 rows, const ScreenQuad& quad, float opacity) {
     Batch& b = g.batch;
     const auto [w, h] = QuadSize(quad);
+    // An 8-bit output's picture: U8888 as the pass's tile held it (SGXD_RECIPE_PACK_U8888), so
+    // unmirrored. A 16-bit one's: the LCD's format, read as DrawGuestScreen reads it.
+    u32 code = 0x0c, swizzle = 0, bytes = 4;
+    const bool own_format = pica_format != 0 && pica_format != 1;
     if (!g.in_frame || g.screens_in_frame >= ScreenSlots || b.draw_count >= b.max_draws ||
-        width % 8 != 0 || width == 0 || height == 0 || w < 1.0f || h < 1.0f) {
+        width % 8 != 0 || width == 0 || height == 0 || w < 1.0f || h < 1.0f ||
+        (own_format && !ScreenFormat(pica_format, code, swizzle, bytes))) {
         return false;
     }
     const u32 slot = g.screens_in_frame++;
     g.touches[slot * 2] = va;
-    g.touches[slot * 2 + 1] = va + width * height * 4;
-    SgxdRenderer::SgxdCacheSkipped(SgxdRenderer::CacheSite::Screens, width * height * 4);
+    g.touches[slot * 2 + 1] = va + width * height * bytes;
+    SgxdRenderer::SgxdCacheSkipped(SgxdRenderer::CacheSite::Screens, width * height * bytes);
     // Texel (u, v): u along a picture row, the LCD buffer's rows, left to right on the upright
     // picture; v across them, the buffer's columns, from the bottom of the upright picture to its
     // top.
     // The widescreen picture's margins (margin of the screen's rows each side, the picture's
     // first column the screen's row -margin): as much of them as the quad is wider than the
-    // screen's 5:3, none in a 5:3 one.
+    // screen, none in one of its shape.
     const float scale = static_cast<float>(quarters) / 4.0f;
+    const float screen_rows = static_cast<float>(rows);
     const float shown =
-        std::clamp((w * 240.0f / h - 400.0f) / 2.0f, 0.0f, static_cast<float>(margin));
+        std::clamp((w * 240.0f / h - screen_rows) / 2.0f, 0.0f, static_cast<float>(margin));
     // Flipped, the display's left edge is the picture's column row + margin plus the margin
     // shown, and the columns go down to its right edge.
     const float first = static_cast<float>(row + margin) + (flip ? shown : -shown);
-    const float last = flip ? first - 400 - 2 * shown : first + 400 + 2 * shown;
+    const float last = flip ? first - screen_rows - 2 * shown : first + screen_rows + 2 * shown;
     const float u0 = scale * first / width, u1 = scale * last / width;
     const float v1 = scale * 240 / height;
     const float uv[4][2] = {{u0, v1}, {u1, v1}, {u0, 0.0f}, {u1, 0.0f}};
     PutScreenVertices(slot, quad, opacity, uv);
-    // Bilinear: the scaled picture scaled again to the layout's rectangle. U8888 as the pass's tile held
-    // it (SGXD_RECIPE_PACK_U8888), so unmirrored; translucent, its alpha read as one (1BGR).
+    // Bilinear: the scaled picture scaled again to the layout's rectangle. Translucent, its
+    // alpha read as one: U8888's 1BGR, RGBA's RGB1 (RGB565 has none).
     const bool blend = opacity < 1.0f;
     u32 tex[4];
-    sgxd_recipe_texture_words_format(va, width, height, 1, 0x0c, blend ? 4 : 0, tex);
+    sgxd_recipe_texture_words_format(va, width, height, 1, code,
+                                     !blend ? swizzle
+                                     : own_format ? (swizzle == 2 ? 6 : swizzle)
+                                                  : 4,
+                                     tex);
     const State::PixelEntry& e = PixelEntryFor(tex, blend);
     SgxdRecipeDrawPrograms& p = g.screen_programs[slot];
     p.fprim = e.va;

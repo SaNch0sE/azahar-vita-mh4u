@@ -81,21 +81,21 @@ public:
                      const Pica::OutputVertex& v2) override;
     void DrawTriangles() override;
     void FlushAll() override;
+    /// After guest memory was loaded whole: the pictures and screen pictures go.
+    void ForgetPictures();
     void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
-    /// The upscaled top screen (SetTopScale) for the LCD buffer at lcd: the scaled copy the last
-    /// display transfer over it made of its source's picture, LINEAR U8888 width x height (width
-    /// the rows apart), the transfer output's transpose (x along its rows, y along its columns),
-    /// quarters / 4 picture pixels to the output's: lcd's first row is picture column
-    /// row * quarters / 4 (the LCD may point into the output), its 400 rows 100 * quarters
-    /// picture columns from there and its 240 columns 60 * quarters picture rows. False when the
-    /// buffer holds the 1x picture alone. On the render thread, as the present is.
-    /// Widescreen, margin of the screen's rows each side past its 400 (the picture's first
-    /// column is the screen's row -margin, scaled), 0 without. flip (the transfer's
-    /// flip_vertically): the screen's rows run the other way through the picture, its first
-    /// row's left edge at picture column (row + margin) * quarters / 4 and the 400 lower.
-    static bool TopScreenPicture(PAddr lcd, u32& gpu, u32& width, u32& height, u32& row,
-                                 u32& quarters, u32& margin, bool& flip);
+    /// The screen picture of the LCD buffer at lcd: the copy the last display transfer into it made of
+    /// its source's picture, at the source's scale, LINEAR U8888 width x height, the output's transpose.
+    /// lcd's first row is picture column row * quarters / 4; its `rows` rows are rows * quarters / 4
+    /// picture columns and its 240 columns 60 * quarters picture rows. `margin`: widescreen rows each
+    /// side; `flip`: the rows run the other way; `format`: the output's Pica::PixelFormat (an 8-bit
+    /// one's picture is U8888, a 16-bit one's its own). False when guest memory holds the screen. On
+    /// the render thread.
+    static bool ScreenPictureOf(PAddr lcd, u32 rows, u32& gpu, u32& width, u32& height, u32& row,
+                                u32& quarters, u32& margin, bool& flip, u32& format);
+    /// The LCD buffer [lcd, lcd + bytes) into guest memory if a screen picture owns it, waited for.
+    static void ScreenToGuest(PAddr lcd, u32 bytes);
     /// The internal resolution in quarters (4 native, 5 1.25x, 6 1.5x), read at each pass on a buffer.
     /// TopScale answers 4 while TopMsaa is on. Any thread.
     static void SetTopScale(u32 quarters);
@@ -116,6 +116,17 @@ public:
     /// The guest wrote a watched page, or the HLE wrote [address, address + size): the textures over it
     /// are untiled again, and a depth store whose buffer's whole pages it reaches is no longer newer.
     void GuestWrote(PAddr address, u32 size);
+    /// Whether a picture owns guest rows of [lo, hi), or copies them back still (any thread): a guest
+    /// or HLE access there asks for the copy first.
+    [[nodiscard]] bool PictureOwns(PAddr lo, PAddr hi) const;
+    /// Whether a picture owns guest rows of [lo, hi) that no copy is taking back yet (any thread).
+    [[nodiscard]] bool PictureOwnsRows(PAddr lo, PAddr hi) const;
+    /// The render side of a guest or HLE access to [lo, hi): the rows pictures own there copied into
+    /// guest memory, waited for unless `drain` is false; with write, the pictures and textures over the
+    /// range marked written. `beside`: the guest keeps accessing a page of the range beside the rows.
+    void ServeGuestAccess(PAddr lo, PAddr hi, bool write, bool drain = true, bool beside = false);
+    /// The render side: the copies whose GPU work is done no longer count for PictureOwns.
+    void RetirePictureCopies();
     /// the late skip dropped a draw into `colour` with that viewport (RenderThread's LateDropped): a double
     /// render being skipped over that buffer (or its copy) never sees its blend back, so the
     /// skipping ends here. Before, it ran on into the next frame's first render, and MH
@@ -935,25 +946,75 @@ private:
     bool proctex_table_dirty{true};
     KeyIndex<u32> proctex_tables_by_contents;
 
-    /// The upscaled top screen (TopScale): the colour buffers display
-    /// transfers took to the top LCD are drawn scaled, each tile stored into the buffer's
-    /// picture and the guest's buffer drawn from it at 1x after the pass (DownscalePicture); a
-    /// transfer to the LCD copies the picture for the present (ScreenPicture), which shows it in
-    /// place of the LCD buffer.
+    /// A colour buffer's picture: scaled, every buffer a render takes whole is drawn into one at the
+    /// internal resolution (the top screen's with its margins and MSAA), in the buffer's own format. The
+    /// guest's buffer gets it at 1x once something other than its passes reads or writes the bytes
+    /// (WriteColourBack); a transfer reads the picture itself, a texture over it is copied from it, and
+    /// a transfer to the LCD copies it for the present (ScreenPicture).
     struct Upscaled {
         PAddr addr;
         u32 width, height, bytes; ///< the guest buffer's
         u32 quarters;              ///< its scale (TopScale when it was made)
         u32 margin;                ///< its widescreen margin (Widescreen when it was made)
         u32 samples;               ///< its passes' samples a pixel (2 with TopMsaa, at 1x)
-        SgxdBackend::Data picture; ///< height x width scaled (the pass's transpose), LINEAR U8888
+        SgxdBackend::Data picture; ///< height x width scaled (the pass's transpose), LINEAR
         u32 stride;                ///< its rows apart, in pixels (a multiple of 8)
-        bool valid = false; ///< it holds the buffer's picture: only its scaled passes wrote since
+        /// The rows where the picture is older than guest memory or another picture: whole strips, sorted,
+        /// apart. A pass that loads the buffer loads those from guest memory and stores all of it.
+        std::vector<std::pair<PAddr, PAddr>> outdated;
+        /// The guest bytes whose newest colour is this picture's: whole strips, sorted, apart. A byte has
+        /// one owner at most (guest memory none).
+        std::vector<std::pair<PAddr, PAddr>> owned;
+        SgxdBackend::PicaTarget copy_target{};
+        Pica::FramebufferRegs::ColorFormat format{}; ///< the guest buffer's
+        SgxdBackend::PictureFormat picture_format{};
+        u32 last_pass{}; ///< `passes` when a pass last drew it (UpscaledFor's eviction)
     };
+    /// The rows pictures own and their copies still on the GPU, for PictureOwns on any thread (built
+    /// again whenever either changes, PublishOwned).
+    mutable std::mutex owned_lock;
+    std::vector<std::pair<PAddr, PAddr>> owned_published;
+    std::vector<std::pair<PAddr, PAddr>> rows_published;
+    std::atomic<bool> owned_any{false};
+    struct CopyInFlight {
+        PAddr lo, hi;
+        u64 fence;
+    };
+    std::vector<CopyInFlight> copies_in_flight;
+    void PublishOwned();
+    /// The pictures' bytes at most (UpscaledFor), in the textures' pool.
+    static constexpr u32 PicturesBytes = 16u << 20;
+    /// Whether a buffer is drawn into a picture (only one that scales whole), its scale, margin and
+    /// samples a pixel.
+    struct PictureShape {
+        bool drawn;
+        bool scaled;
+        u32 quarters;
+        u32 margin;
+        u32 samples;
+    };
+    /// `depth`: the pass's depth buffer, 0 for none. A pass with a depth buffer a top-screen pass drew
+    /// takes the top screen's shape too (they share the depth store).
+    [[nodiscard]] PictureShape PictureShapeFor(const ColourBuffer& target, PAddr depth) const;
+    /// Whether opening a pass on target copies picture rows first. Such a pass is not opened beside a
+    /// parked one.
+    [[nodiscard]] bool PassOpenCopies(const ColourBuffer& target, PAddr depth, PAddr depth_end,
+                                      bool uses_depth) const;
+    /// The picture a texture is copied from instead of untiled: one level of its whole rows from
+    /// first_row, none outdated, in its buffer's format and width; null for none.
+    [[nodiscard]] const Upscaled* PictureForTexture(PAddr addr, u32 width, u32 height, u32 format,
+                                                    u32 levels, bool cube, u32 parts,
+                                                    u32& first_row) const;
     std::vector<PAddr> top_sources; ///< the colour buffers transferred to the top LCD lately
-    std::vector<Upscaled> upscaled;
+    /// The depth buffers passes drew lately with the top screen's margins or MSAA.
+    std::vector<PAddr> top_depths;
+    void NoteTopDepth(PAddr depth);
+    /// A list: a pass's picture stays in place while the pass beside makes or drops another.
+    std::list<Upscaled> upscaled;
     Upscaled* pass_upscaled = nullptr;           ///< the open pass's buffer, drawn scaled
     SgxdBackend::PicaTarget pass_scaled_target{}; ///< its target, for DownscalePicture after it
+    /// Its target's part before a load of outdated rows made it all of the buffer.
+    SgxdBackend::PicaTarget pass_drawn_target{};
     u32 pass_quarters = 4;                       ///< the pass's pixels to the guest's, in quarters
     static constexpr u32 TopScreenRows = 400;
     u32 pass_margin = 0;  ///< its widescreen margin, in the buffer's rows (Upscaled::margin)
@@ -983,9 +1044,8 @@ private:
     const char* pass_opened = ""; ///< passlog: clear, covered, load
 #endif
     const Upscaled* upscaled_writing = nullptr; ///< its pass end's own TexturesWritten
-    /// The buffer's picture when it is the top screen's and the pass stores it whole; null
-    /// for 1x.
-    Upscaled* UpscaledFor(const ColourBuffer& target);
+    /// The buffer's picture in PictureShapeFor's shape; null for a buffer not drawn into one.
+    Upscaled* UpscaledFor(const ColourBuffer& target, PAddr depth);
     /// A scaled pass's side at most: the size a recipe's block holds.
     static constexpr u32 ScaledSideMax = 1024;
     /// Whether target can be drawn at quarters / 4 with margin rows each side (UpscaledFor).
@@ -1003,14 +1063,38 @@ private:
         u32 quarters;
         u32 margin; ///< the picture's widescreen margin, in the screen's rows
         bool flip;  ///< the transfer's flip_vertically: the output's rows the other way round
-        bool valid;
+        bool valid; ///< it holds the output's bytes: no write since but its transfer's
+        /// The output's guest bytes are older than the picture: they go there when something reads them.
+        bool owned = false;
+        /// Owned, and the output's guest bytes hold it too (a GPU read had them copied): still the screen's
+        /// picture, its output closed to the guest, whose first access lets it go.
+        bool copied = false;
+        u32 pack = 0;                   ///< the output's format, as the PBE packs it
+        u32 format = 0;                 ///< the output's format (a Pica::PixelFormat)
+        /// The picture's texels: an 8-bit output's U8888, a 16-bit one's in the output's format.
+        SgxdBackend::PictureFormat picture_format{};
+        u32 out_width = 0, out_height = 0; ///< the output's columns and rows
+        u32 last_used = 0;              ///< display_transfers at its last transfer (eviction)
     };
     std::vector<ScreenPicture> screen_pictures;
-    /// A display transfer of input into a top-screen-sized output (out_width x out_height of
-    /// bpp bytes, its rows in the other order with flip): the source noted, and its scaled
-    /// picture's part the transfer takes copied for the present when it holds the buffer's.
-    void NoteTopTransfer(PAddr input, PAddr output, u32 out_width, u32 out_height, u32 bpp,
-                         bool flip);
+    /// Display outputs whose first or last page holds other data the guest keeps accessing: a screen
+    /// picture owning the output would close that page from each transfer, and nearly every access
+    /// would abort. A transfer into one from a picture of the guest's own size goes into guest memory.
+    std::vector<PAddr> outputs_beside;
+    static constexpr u32 OutputsBesideMax = 8;
+    /// The screen pictures at most: past that the oldest is copied into guest memory if it owns its
+    /// bytes, and let go.
+    static constexpr u32 ScreenPicturesMax = 8;
+    u32 display_transfers{};
+    /// A display transfer of input into a top-screen-sized output: the input is the top screen's source.
+    void NoteTopSource(PAddr input);
+    /// A display transfer of out_width x out_height into output from u's picture (from its memory row
+    /// first_row, scale_x x scale_y averaged): the output's
+    /// screen picture takes it at u's scale, owns the output's bytes, and is what the present shows.
+    void ScreenTransfer(const Upscaled& u, u32 first_row, PAddr output, u32 out_width,
+                        u32 out_height, u32 bpp, u32 pack, u32 format,
+                        const SgxdBackend::PictureFormat& picture_format, u32 scale_x,
+                        u32 scale_y, bool flip);
     static RasterizerSgxd* upscale_instance;
 
     /// A colour buffer a display transfer averages down (ScaleX, ScaleXY): the game's
@@ -1139,6 +1223,7 @@ private:
     bool pass_depth_part{};     // ... of the part it stores, the rest kept in its store
     bool pass_depth_guest{};    // or from guest memory's, untiled into the store
     u32 guest_depth_loads{};
+    u32 scaled_depth_loads{}; ///< of guest_depth_loads, the magnified ones (UntileDepthScaled)
     u32 window_misses{}; ///< draws reaching before the top screen's window (TopWindowFor), logged
     /// A W-buffered draw's depth through WBUFFEN is c0 + c1 / w: 1 - 1/w where the PICA's W depth
     /// grows with w, else 1/w. That depth is alpha * w + beta for a perspective projection, fitted
@@ -1171,6 +1256,7 @@ private:
         WDepthMap w_map{};
         Upscaled* upscaled = nullptr;
         SgxdBackend::PicaTarget scaled_target{};
+        SgxdBackend::PicaTarget drawn_target{};
         u32 quarters = 4, margin = 0, samples = 1;
         bool widened{};
         PAddr drawn_lo = 0, drawn_hi = 0;
@@ -1186,10 +1272,9 @@ private:
     /// beside it, or traded for the parked one when that is the draw's, else both ended.
     void SwitchPass(const ColourBuffer& target, PAddr depth, u32 depth_bytes, bool uses_depth,
                     bool geometry);
-    /// Whether a pass on target may be parked, or drawn beside a parked one: drawn at 1x, one
-    /// sample a pixel and no widescreen margin, into its 1x picture or the buffer itself, and not
-    /// through a narrow buffer's scratch.
-    [[nodiscard]] bool ParksAt1x(const ColourBuffer& target) const;
+    /// Whether a pass on target may be parked or drawn beside a parked one: at 1x, one sample, no
+    /// margin, into the buffer itself.
+    [[nodiscard]] bool ParksAt1x(const ColourBuffer& target, PAddr depth) const;
 #ifdef VITA_DIAGNOSTICS
     u32 pass_parks{}; ///< perflog: passes parked beside another
     u32 pass_trades{}; ///< perflog: draws that traded the open pass for the parked one
@@ -1306,6 +1391,24 @@ private:
     /// newer must be closed before the pass's holds let its pages go.
     void DepthGuardsChanged();
     [[nodiscard]] bool DepthBackDue(PAddr start, PAddr end) const;
+    /// A GPU read of [start, end): the rows pictures own there go into the guest's buffer first, at 1x
+    /// (but except's). Any pass open ends once a copy is due. A screen picture's output is copied once
+    /// and stays its; for_guest, the access is the guest's or the HLE's and the picture lets it go.
+    void WriteColourBack(PAddr start, PAddr end, const char* why,
+                         const Upscaled* except = nullptr, bool for_guest = false);
+    [[nodiscard]] static std::pair<PAddr, PAddr> StoredBytes(const Upscaled& u,
+                                                             const SgxdBackend::PicaTarget& t);
+    /// A GPU write into [start, end) other than a pass on the buffer: a stale picture it covers whole
+    /// is guest memory's again, one it covers in part goes into the guest's buffer first.
+    void ColourWritesDue(PAddr start, PAddr end, const char* why);
+    u32 colour_writebacks{};      ///< WriteColourBack's copies, for the log's first few
+    u32 colour_writebacks_mark{}; ///< colour_writebacks at perflog's last second
+    u32 picture_transfers{};      ///< display transfers read from a picture (TransferFromPicture)
+    u32 picture_transfers_mark{}; ///< picture_transfers at perflog's last second
+    u32 picture_textures{};       ///< textures copied from a picture (TextureFromPicture)
+    u32 scaled_wraps{}; ///< diagnostics: scaled copies read with repeat or mirror (TextureWords)
+    u32 depth_word_renders{}; ///< WriteDepthWords' renders, for the log's first few
+    u32 picture_textures_mark{};  ///< picture_textures at perflog's last second
     u32 depth_writebacks{};      ///< WriteDepthBack's, for the log's first few
     u32 depth_edge_writes{};     ///< DepthEdgesWritten's finds, for the log's first few
     u32 depth_writeback_kinds{}; ///< the kinds logged (D16, 2x, scaled: a bit each combination)
@@ -1388,6 +1491,7 @@ private:
         u32 passes_mark{};    ///< passes at the second's start: the textures draws took since
         u64 evictions_mark{}; ///< evictions at the second's start
         std::vector<std::pair<const char*, u32>> pass_ends;
+        std::vector<std::pair<const char*, u32>> writeback_reasons; ///< WriteColourBack's copies by why
     } texture_stats;
     struct EmitStats {
         std::array<u32, 3> programs{};

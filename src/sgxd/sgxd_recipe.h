@@ -416,14 +416,15 @@ typedef struct SgxdPicaStore {
 unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out);
 // The end of tile of a target r draws at quarters / 4 times the size of s's buffer (4 to 8: 1x
 // to 2x; 1x for a widescreen picture, whose buffer is the picture's columns at 1x and whose part
-// is in them): s's part (or all of it) scaled into picture, LINEAR U8888 rows picture_stride pixels
-// apart; s's buffer is left as it is. A part's edge at x lands on the first pixel whose centre is
-// at or past x * quarters / 4. A 2x recipe's emit averages each pixel's samples (SCALE_AA).
-// Returns the count, or 0 for r not a whole buffer's size scaled, a part outside it, or a stride
-// under r's width or odd.
+// is in them): s's part (or all of it) scaled into picture, LINEAR rows picture_stride pixels
+// apart in picture_pack (an SGXD_RECIPE_PACK_*: U8888 as the tile holds it, or the buffer's own
+// format, s->pack); s's buffer is left as it is. A part's edge at x lands on the first pixel whose
+// centre is at or past x * quarters / 4. A 2x recipe's emit averages each pixel's samples
+// (SCALE_AA). Returns the count, or 0 for r not a whole buffer's size scaled, a part outside it,
+// or a stride under r's width or odd.
 unsigned sgxd_recipe_pica_eot_scaled(const SgxdRecipe *r, const SgxdPicaStore *s,
                                      unsigned quarters, uint32_t picture, uint32_t picture_stride,
-                                     uint64_t *out);
+                                     uint32_t picture_pack, uint64_t *out);
 // The pixel event program for it: the recipe's, with IR0 DOUTAed into the end-of-tile task's pa0
 // first (three times: a DOUTA is repeated), and the end of tile at eot_index (DOUTU's
 // instruction index from code base 1) with 16 temporaries. Four data units; the 3D kick takes it

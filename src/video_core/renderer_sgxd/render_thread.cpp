@@ -306,6 +306,9 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& parse_pica_,
     ASSERT_MSG(parse_wake_flag >= 0, "render thread: the parse thread's event flag {:#010x}",
                static_cast<u32>(parse_wake_flag));
     rasterizer.InterruptWaker(wake_flag, WakeBit);
+    page_holds.picture_owned = [this](PAddr addr, u32 bytes) {
+        return rasterizer.PictureOwns(addr, addr + bytes);
+    };
     live_render_thread.store(this, std::memory_order_release);
     renderer.SetMoveHooks({
         [this](PAddr addr, u32 size) {
@@ -1155,6 +1158,12 @@ u32 TextureRanges(const Pica::RegsInternal& regs, RenderThread::DrawTextures& ou
 
 } // namespace
 
+void RenderThread::ClearAll(bool) {
+    if (Held()) {
+        rasterizer.FlushAll();
+    }
+}
+
 void RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
     if (FrameBuffer* const b = InFrameBuffer(addr, bytes)) {
         b->read_ticket = HoldTicket();
@@ -1632,12 +1641,12 @@ void RenderThread::TakeWholeState() {
     // A loaded state's memory: no index range of the memo holds.
     index_memo.fill({});
     frame_buffers.clear();
-    // Once the parse thread has read everything queued: it takes the lists after this with
-    // the new state, all of it marked changed for the render side's PicaCore (its next
-    // records).
+    // Once the parse thread has read everything queued: it takes the lists after this with the new
+    // state, all of it marked changed. The pictures go: guest memory holds every buffer's colour now.
     RunSync([this] {
         WaitParseIdle();
         CopyListState(pica, parse_pica);
+        rasterizer.ForgetPictures();
     });
 }
 
@@ -2417,7 +2426,11 @@ bool RenderThread::ReadMissesWrites(const u8* host, u32 size, u32& write_ticket)
         return false;
     }
     write_ticket = page_holds.WriteTicket(page);
-    return !page_holds.TouchesWrite(host, size);
+    // The bytes a picture owns: the fault's path copies them first; a load beside them (a game's
+    // command lists past its scene's colour buffer, in its last page) reads guest memory's own.
+    const PAddr at = page_holds.AddressOf(page) +
+                     static_cast<u32>(reinterpret_cast<uintptr_t>(host) & 0xFFF);
+    return !page_holds.TouchesWrite(host, size) && !rasterizer.PictureOwns(at, at + size);
 }
 
 bool RenderThread::StoreMissesHolds(const u8* host, u32 size, u32& ticket) {
@@ -2428,6 +2441,25 @@ bool RenderThread::StoreMissesHolds(const u8* host, u32 size, u32& ticket) {
     if (page == PageHolds::NoPage || page_holds.PageOf(host + size - 1) != page ||
         page_holds.Applied(page) == PageHolds::Unheld) {
         return false;
+    }
+    // A page watched for the guest's first write after a picture's rows were copied there, or a
+    // store onto bytes a picture owns: the fault's path (PageFault) marks or copies them first.
+    // A store beside a picture's rows goes through the app's view with the page closed still,
+    // once no queued work holds the page (TakeHeldWrite could open it).
+    const PAddr page_addr = page_holds.AddressOf(page);
+    if (page_holds.PictureWatched(page)) {
+        return false;
+    }
+    if (rasterizer.PictureOwns(page_addr, page_addr + 0x1000)) {
+        const PAddr at = page_addr + static_cast<u32>(reinterpret_cast<uintptr_t>(host) & 0xFFF);
+        if (rasterizer.PictureOwns(at, at + size) ||
+            page_holds.WaitFor(page, true, reached.load(std::memory_order_acquire)) != 0) {
+            return false;
+        }
+        // Counted against the page's last write as a load is (the caller's budget, past which
+        // the fault's path copies the rows and opens the page).
+        ticket = page_holds.WriteTicket(page);
+        return true;
     }
     // Made through the app's view past the holds (ticket the page's last live hold's, for the
     // budget), or onto the page its own effects or a version opened (ticket 0).
@@ -2446,6 +2478,12 @@ bool RenderThread::OpensDisplayPage(const u8* host, bool write, u32 reach) {
     if (access == PageHolds::Unheld || (access == PageHolds::ReadOnly && !write)) {
         return false;
     }
+    // Tried before every access past the holds: the record's checks first.
+    const u32 now = reached.load(std::memory_order_acquire);
+    if (!page_holds.DisplayOnly(page, now) || page_holds.PictureWatched(page) ||
+        rasterizer.PictureOwns(page_holds.AddressOf(page), page_holds.AddressOf(page) + 0x1000)) {
+        return false;
+    }
     return page_holds.OpenPastDisplay(host, now, reach);
 }
 
@@ -2461,6 +2499,76 @@ bool RenderThread::AccessOpenAfterFlush(const u8* host, bool write) {
     page_holds.Apply();
     const PageHolds::Access access = page_holds.Applied(page);
     return access == PageHolds::Unheld || (access == PageHolds::ReadOnly && !write);
+}
+
+void RenderThread::AskPictureCopy(PAddr addr, u32 bytes, bool write, bool wait, bool beside) {
+#ifdef VITA_DIAGNOSTICS
+    static std::atomic<u32> asked{0};
+    if (const u32 n = asked.fetch_add(1, std::memory_order_relaxed) + 1; std::has_single_bit(n)) {
+        LOG_INFO(Render, "render thread: picture rows asked for {} times, the last {:#x}+{:#x} ({})", n,
+                 addr, bytes, write ? "a write" : "a read");
+    }
+#endif
+    // The render side's own thread, or a hold's holder (the render side then): served here.
+    if (Holding() || sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed)) {
+        rasterizer.ServeGuestAccess(addr, addr + bytes, write, wait, beside);
+        return;
+    }
+    // Any other thread (the emulation threads' guests, the HLE): the render thread serves it
+    // between records (a hold's holder once it lets go), this thread waiting unless `wait` is
+    // false (its copies then count for PictureOwns until done).
+    u32 seq;
+    {
+        std::scoped_lock lock{access_lock};
+        access_requests.push_back(
+            {static_cast<u32>(addr), bytes, (write ? 1u : 0u) | (wait ? 0u : 2u)});
+        seq = access_requested.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+    Wake();
+    if (!wait) {
+        return;
+    }
+    std::scoped_lock lk{done};
+    done_waiters.fetch_add(1);
+    while (static_cast<s32>(access_served.load(std::memory_order_acquire) - seq) < 0) {
+        done.WaitFor(std::chrono::milliseconds(1));
+    }
+    done_waiters.fetch_sub(1);
+}
+
+void RenderThread::WatchCopiedRows(PAddr lo, PAddr hi) {
+    const auto [from, to] = rasterizer.PictureCopyExtent(lo, hi);
+    u32 first, count;
+    if (from >= to || !page_holds.PageRange(from, to - from, first, count)) {
+        return;
+    }
+    for (u32 page = first; page < first + count; page++) {
+        const PAddr page_addr = page_holds.AddressOf(page);
+        page_holds.WatchPictureRows(page, std::max(from, page_addr) - page_addr,
+                                    std::min(to, page_addr + 0x1000) - page_addr);
+    }
+}
+
+void RenderThread::ServeGuestAccesses() {
+    if (access_served.load(std::memory_order_relaxed) ==
+        access_requested.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<std::array<u32, 3>> requests;
+    u32 seq;
+    {
+        std::scoped_lock lock{access_lock};
+        requests.swap(access_requests);
+        seq = access_requested.load(std::memory_order_relaxed);
+    }
+    for (const auto& [addr, bytes, flags] : requests) {
+        rasterizer.ServeGuestAccess(addr, addr + bytes, (flags & 1u) != 0, (flags & 2u) == 0);
+    }
+    access_served.store(seq, std::memory_order_release);
+    if (done_waiters.load() != 0) {
+        std::scoped_lock lk{done};
+        done.NotifyAll();
+    }
 }
 
 bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 guest_pc,
@@ -2484,10 +2592,16 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
         }
         return false;
     }
+    // A picture's rows on the page, or a page watched for the guest's first write after their copy: no
+    // way past the holds.
+    const PAddr page_addr = page_holds.AddressOf(page);
+    const bool picture_watched = page_holds.PictureWatched(page);
+    const bool pictured = rasterizer.PictureOwns(page_addr, page_addr + 0x1000);
     // A write: where on the page is not known here (a store the decoder knew the bytes of took this
     // way already).
     u32 past_ticket;
-    if (write && TakeHeldWrite(page, host, 0, true, past_ticket) == HeldWrite::Open) {
+    if (write && !pictured && !picture_watched &&
+        TakeHeldWrite(page, host, 0, true, past_ticket) == HeldWrite::Open) {
         return true;
     }
     const PAddr address = page_holds.AddressOf(page);
@@ -2537,6 +2651,16 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
         }
     }
 #endif
+    // With the page's work done, its rows a picture owns go into guest memory first; a write marks
+    // them written, a read leaves the page watched for the first write.
+    if (pictured || (write && picture_watched) ||
+        rasterizer.PictureOwns(page_addr, page_addr + 0x1000)) {
+        AskPictureCopy(page_addr, 0x1000, write);
+        page_holds.SetPictureWatch(page, !write);
+#ifdef VITA_DIAGNOSTICS
+        picture_faults.fetch_add(1, std::memory_order_relaxed);
+#endif
+    }
     page_holds.Reopen(page, reached.load(std::memory_order_acquire));
     [[maybe_unused]] const PageHolds::Access reopened = page_holds.Applied(page);
     if (move_after) {
@@ -2582,6 +2706,19 @@ void RenderThread::HostAccess(const u8* host, u32 size, bool write) {
         const u8* const page_end =
             reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1);
         const u32 bytes = static_cast<u32>(std::min(end, page_end) - p);
+        // A picture's rows there: copied into guest memory first (a write marks them written);
+        // the guest's view stays as it is.
+        const PAddr at = page_holds.AddressOf(page) +
+                         static_cast<u32>(reinterpret_cast<uintptr_t>(p) & 0xFFF);
+        if (rasterizer.PictureOwns(at, at + bytes) || (write && page_holds.PictureWatched(page))) {
+            AskPictureCopy(at, bytes, write);
+            if (write) {
+                page_holds.SetPictureWatch(page, false);
+            }
+#ifdef VITA_DIAGNOSTICS
+            picture_host_accesses.fetch_add(1, std::memory_order_relaxed);
+#endif
+        }
         // A write (a file read, the DSP) goes as the guest's does: past the holds, onto a
         // version, or after the page's work. Written in place on a versioned page, it would
         // land in the slot queued work reads. A read clear of the bytes the queued GPU writes
@@ -3465,6 +3602,11 @@ void RenderThread::RunAvailable() {
         if (space_waiting.load()) {
             NotifyDone();
         }
+        // An access of the guest's waiting for a picture's rows, between records.
+        if (access_requested.load(std::memory_order_relaxed) !=
+            access_served.load(std::memory_order_relaxed)) {
+            ServeGuestAccesses();
+        }
         if (!pending.empty()) {
             PollFences();
         }
@@ -3921,6 +4063,7 @@ void RenderThread::DescribeLive(char* out, std::size_t size) {
 }
 
 void RenderThread::PollFences() {
+    rasterizer.RetirePictureCopies();
     bool advanced = false;
     while (!pending.empty() && rasterizer.InterruptPoll(pending.front().fence)) {
         reached.store(pending.front().ticket, std::memory_order_release);
@@ -3939,6 +4082,7 @@ void RenderThread::Loop() {
     u32 progress = 0;
     auto progress_at = Clock::now();
     for (;;) {
+        ServeGuestAccesses();
         RunAvailable();
         PollFences();
         loop_passes.fetch_add(1, std::memory_order_relaxed);

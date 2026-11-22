@@ -1439,8 +1439,8 @@ void GiveFree(std::vector<Range>& free, Range range) {
 
 } // namespace
 
-SgxdBackend::Data SgxdBackend::AllocSurface(u32 width, u32 height, bool upscaled) {
-    const u32 bytes = AlignUp(width * height * 4, 0x1000);
+SgxdBackend::Data SgxdBackend::AllocSurface(u32 width, u32 height, bool upscaled, u32 bpp) {
+    const u32 bytes = AlignUp(width * height * bpp, 0x1000);
     u32 at = 0;
     if (upscaled) {
         // From the textures pool, as a texture: room made by dropping textures, past it the
@@ -1473,11 +1473,11 @@ SgxdBackend::Data SgxdBackend::AllocSurface(u32 width, u32 height, bool upscaled
     return d;
 }
 
-void SgxdBackend::FreeSurface(const Data& surface, u32 width, u32 height) {
+void SgxdBackend::FreeSurface(const Data& surface, u32 width, u32 height, u32 bpp) {
     // The next surface there is cleared or loaded by the GPU behind the lists reading this one; the
     // pending 3D's finish goes ahead of them.
     FinishPending(FinishWhy::FreeSurface);
-    const u32 bytes = AlignUp(width * height * 4, 0x1000);
+    const u32 bytes = AlignUp(width * height * bpp, 0x1000);
     if (surface.gpu - SurfacesVa >= surfaces_size) {
         GiveTexture(surface, bytes);
         return;
@@ -1835,7 +1835,8 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
         u64 eot[SGXD_RECIPE_PICA_EOT_MAX];
         const unsigned words =
             pica->picture ? sgxd_recipe_pica_eot_scaled(&r.recipe, &store, q, pica->picture,
-                                                        pica->picture_stride, eot)
+                                                        pica->picture_stride,
+                                                        pica->picture_format.pack, eot)
                           : sgxd_recipe_pica_eot(&r.recipe, &store, eot);
         ASSERT_MSG(!pica->picture || words != 0,
                    "sgxd: a {}x{} colour buffer at {:#010x} drawn at {}/4x: its part {}..{} x "
@@ -1919,15 +1920,27 @@ void SgxdBackend::BeginPassLoadedScaled(const PicaTarget& target, float depth,
         return;
     }
     const Recipe& r = *current;
-    pass_source = {target.picture, target.picture + target.picture_stride * r.height * 4};
-    const SgxdRecipeDrawPrograms p = BlitPrograms(Data{nullptr, target.picture}, r.width,
-                                                  r.height, false, target.picture_stride);
+    pass_source = {target.picture, target.picture + target.picture_stride * r.height *
+                                                        target.picture_format.bpp};
+    const SgxdRecipeDrawPrograms p =
+        BlitPrograms(Data{nullptr, target.picture}, r.width, r.height, target.picture_stride, 1,
+                     1, 0, false, nullptr, target.picture_format);
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
     Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
 }
 
+void SgxdBackend::LoadGuestRowsScaled(const PicaTarget& target, const UntileSource& rows,
+                                      u32 first_row, bool first) {
+    DEBUG_ASSERT(in_pass && target.picture != 0);
+    const u32 lo = rows.gpu, hi = rows.gpu + rows.width * rows.height * rows.bits / 8;
+    pass_source = first ? Footprint{lo, hi}
+                        : Footprint{std::min(pass_source.lo, lo), std::max(pass_source.hi, hi)};
+    DrawTiled(rows, true, 1, 1, target.picture_quarters,
+              (target.picture_margin + first_row) * target.picture_quarters / 4);
+}
+
 void SgxdBackend::DownscalePicture(const PicaTarget& target, bool nearest, bool quad_to_part,
-                                   u32 rows, u32 format) {
+                                   u32 rows) {
     DEBUG_ASSERT(!parked_open);
     DEBUG_ASSERT(target.picture != 0);
     PicaTarget t = target;
@@ -1935,29 +1948,32 @@ void SgxdBackend::DownscalePicture(const PicaTarget& target, bool nearest, bool 
     OpenPass(t.gpu, t.height, t.width, t.pack, 0, 1.0f, &t);
     const Recipe& r = *current;
     const u32 q = target.picture_quarters;
-    pass_source = {target.picture,
-                   target.picture + target.picture_stride * (r.height * q * rows / 4) * 4};
+    pass_source = {target.picture, target.picture + target.picture_stride *
+                                                        (r.height * q * rows / 4) *
+                                                        target.picture_format.bpp};
     // Pixel (x, y) reads the picture at its centre scaled: the two nearest texels a side, weighed
     // by distance, or the texel the centre falls in. Past the widescreen margin.
     const float s = static_cast<float>(q) / 4.0f;
     const PassRect part{target.x0, target.x1, target.y0, target.y1};
     const SgxdRecipeDrawPrograms p =
-        BlitPrograms(Data{nullptr, target.picture}, r.width, r.height, false,
-                     target.picture_stride, s, s * static_cast<float>(rows),
+        BlitPrograms(Data{nullptr, target.picture}, r.width, r.height, target.picture_stride, s,
+                     s * static_cast<float>(rows),
                      target.picture_margin * q / 4, nearest,
-                     quad_to_part && target.x1 != 0 ? &part : nullptr, format);
+                     quad_to_part && target.x1 != 0 ? &part : nullptr, target.picture_format);
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
     Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
     EndPass();
 }
 
-void SgxdBackend::CopyPicture(u32 dest_gpu, u32 source_gpu, u32 width, u32 height, u32 stride,
-                              u32 source_x) {
+void SgxdBackend::CopyPicture(u32 dest_gpu, u32 dest_pack, u32 source_gpu, u32 width,
+                              u32 height, u32 stride, const PictureFormat& format, u32 source_x,
+                              u32 scale_x, u32 scale_y) {
     DEBUG_ASSERT(!parked_open);
-    OpenPass(dest_gpu, width, height, SGXD_RECIPE_PACK_U8888, 0, 1.0f);
-    pass_source = {source_gpu, source_gpu + stride * height * 4};
+    OpenPass(dest_gpu, width, height, dest_pack, 0, 1.0f);
+    pass_source = {source_gpu, source_gpu + stride * height * scale_y * format.bpp};
     const SgxdRecipeDrawPrograms p =
-        BlitPrograms(Data{nullptr, source_gpu}, width, height, false, stride, 1, 1, source_x);
+        BlitPrograms(Data{nullptr, source_gpu}, width, height, stride, static_cast<float>(scale_x),
+                     static_cast<float>(scale_y), source_x, false, nullptr, format);
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
     Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
     EndPass();
@@ -2059,7 +2075,8 @@ void SgxdBackend::DepthToGuest(const DepthStore& store, const Data& words, const
     copy.picture_stride = store.width;
     copy.picture_quarters = quarters;
     copy.picture_margin = margin;
-    DownscalePicture(copy, true, true, pixel_samples, d16 ? 0x09 : 0x0c);
+    copy.picture_format = {SGXD_RECIPE_PACK_U8888, d16 ? 0x09u : 0x0cu, 0, d16 ? 2u : 4u, false};
+    DownscalePicture(copy, true, true, pixel_samples);
 }
 
 void SgxdBackend::DepthToWords(const DepthStore& store, const Data& words) {
@@ -2078,7 +2095,7 @@ void SgxdBackend::TouchTiles(const PassRect* rect) {
     DEBUG_ASSERT(in_pass);
     const Recipe& r = *current;
     const SgxdRecipeDrawPrograms p = BlitPrograms(Data{nullptr, pass_target.lo}, r.width, r.height,
-                                                  false, r.width, 1, 1, 0, false, rect);
+                                                  r.width, 1, 1, 0, false, rect);
     Draw(SgxdRecipeDraw{0, 6, SGXD_RECIPE_ISP_NEVER, SGXD_R_FPRIM, 0, 0, nullptr}, p);
 }
 
@@ -2109,7 +2126,7 @@ void SgxdBackend::MaskOutside(u32 x0, u32 x1, u32 y0, u32 y1, bool part_tiles) {
     // The blit's programs; corners on pixel edges, so a pixel is masked when its centre is in the
     // margin.
     SgxdRecipeDrawPrograms p =
-        BlitPrograms(Data{nullptr, pass_target.lo}, r.width, r.height, false, r.width);
+        BlitPrograms(Data{nullptr, pass_target.lo}, r.width, r.height, r.width);
     constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
     const Data vertices = AllocData(n * 6 * N * 4);
     float* v = reinterpret_cast<float*>(vertices.cpu);
@@ -2209,7 +2226,7 @@ bool SgxdBackend::OpaqueKeepingAlpha(u32 budget) {
     }
     const Recipe& r = *current;
     SgxdRecipeDrawPrograms p =
-        BlitPrograms(Data{nullptr, pass_target.lo}, r.width, r.height, false, r.width);
+        BlitPrograms(Data{nullptr, pass_target.lo}, r.width, r.height, r.width);
     const u32 colour = SGXD_PROGRAM_BLIT_DOUTI_COLOUR;
     const u32 words = 4;
     const auto fprim = PixelPds(keep_fragment, &colour, &words, 1);
@@ -2815,9 +2832,10 @@ void SgxdBackend::PlaceFixedPrograms() {
 }
 
 SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, u32 height,
-                                                 bool mirror, u32 source_stride, float scale_x,
+                                                 u32 source_stride, float scale_x,
                                                  float scale_y, u32 source_x, bool nearest,
-                                                 const PassRect* rect, u32 format) {
+                                                 const PassRect* rect,
+                                                 const PictureFormat& format) {
     const u32 source_rows = static_cast<u32>(std::lround(height * scale_y));
     DEBUG_ASSERT(scale_x >= 1 && scale_x <= 2 && scale_y >= 1 && scale_y <= 2 &&
                  static_cast<float>(source_rows) == height * scale_y);
@@ -2862,16 +2880,15 @@ SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, 
     DEBUG_ASSERT(fsec.va != 0);
     p.fsec = fsec.va;
     p.fsec_units = fsec.units;
-    // The texel comes back unconverted (FCONV 0), the surface's word as it is (a U16's in the
-    // low half); mirrored, the screen program converts it (U8U8U8U8 under swizzle 2) and packs
-    // U8888 again.
-    DEBUG_ASSERT(format == 0x0c || (format == 0x09 && !mirror));
+    // The texel unconverted (FCONV 0), the surface's word as is (a U16's in the low half); a
+    // picture in its buffer's own format is converted by the screen program.
+    DEBUG_ASSERT(format.converted || format.code == 0x0c || format.code == 0x09);
     u32 tex[4];
     sgxd_recipe_texture_words_format(source.gpu, stride, source_rows,
-                                     !nearest && (scale_x != 1 || scale_y != 1), format,
-                                     mirror ? 2 : 0, tex);
-    const PdsRef fprim =
-        mirror ? ScreenPixelPds(untile_fragment, tex) : BlitPixelPds(blit_fragment, tex);
+                                     !nearest && (scale_x != 1 || scale_y != 1), format.code,
+                                     format.swizzle, tex);
+    const PdsRef fprim = format.converted ? ScreenPixelPds(untile_fragment, tex)
+                                          : BlitPixelPds(blit_fragment, tex);
     DEBUG_ASSERT(fprim.va != 0);
     p.fprim = fprim.va;
     p.fprim_units = fprim.units;
@@ -2964,29 +2981,74 @@ void SgxdBackend::MagnifyTiled(const PicaTarget& target, const UntileSource& sou
 }
 
 void SgxdBackend::TransferFromGuest(const UntileSource& source, u32 dest_gpu, u32 width,
-                                    u32 height, u32 pack, bool mirror, u32* ta_us, u32* d3_us,
-                                    u32 scale_x, u32 scale_y, bool flip) {
+                                    u32 height, u32 pack, u32* ta_us, u32* d3_us, u32 scale_x,
+                                    u32 scale_y, bool flip) {
     DEBUG_ASSERT(!parked_open);
     OpenPass(dest_gpu, width, height, pack, 0, 1.0f);
-    if (!mirror) {
-        pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
-        DrawTiled(source, false, scale_x, scale_y, 4, 0, 0, flip);
-        EndPass(ta_us, d3_us);
-        return;
-    }
-    DEBUG_ASSERT_MSG(!flip, "sgxd: a flipped display transfer into a mirrored pack is not built");
-    // The untile writes whole 32x32 tiles (UntileTargetFor), rows a multiple of 32 apart; the
-    // picture is the pass's data until its render completes.
-    const u32 stride = AlignUp(source.width, 32);
-    const u32 bytes = stride * AlignUp(source.height, 32) * 4;
-    DEBUG_ASSERT_MSG(bytes <= DataSize / 2,
-                     "sgxd: a {}x{} display transfer from guest memory: more than the pass's data",
-                     source.width, source.height);
-    const Data picture = AllocData(bytes, 0x1000);
-    Untile(source, picture.gpu, stride);
-    pass_source = {picture.gpu, picture.gpu + stride * height * scale_y * 4};
-    const SgxdRecipeDrawPrograms p =
-        BlitPrograms(picture, width, height, mirror, stride, scale_x, scale_y);
+    pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
+    DrawTiled(source, false, scale_x, scale_y, 4, 0, 0, flip);
+    EndPass(ta_us, d3_us);
+}
+
+void SgxdBackend::TransferFromPicture(u32 picture, u32 stride, u32 rows, u32 quarters, u32 margin,
+                                      u32 first_row, u32 dest_gpu, u32 width, u32 height,
+                                      u32 pack, u32 scale_x, u32 scale_y, bool flip,
+                                      const PictureFormat& format, u32* ta_us, u32* d3_us) {
+    DEBUG_ASSERT(!parked_open);
+    DEBUG_ASSERT(quarters * scale_x <= 8 && quarters * scale_y <= 8);
+    OpenPass(dest_gpu, width, height, pack, 0, 1.0f);
+    pass_source = {picture, picture + stride * rows * format.bpp};
+    PlaceFixedPrograms();
+    // The picture is the buffer's transpose: pixel (x, y) takes input column x * scale_x and memory
+    // row first_row + y * scale_y (flipped, counted back from the last row).
+    const float q = static_cast<float>(quarters) / 4.0f;
+    const float m = static_cast<float>(margin) * q;
+    const float u_first = (m + static_cast<float>(first_row) * q) / static_cast<float>(stride);
+    const float u_last =
+        (m + static_cast<float>(first_row + height * scale_y) * q) / static_cast<float>(stride);
+    const float v_end = static_cast<float>(width * scale_x) * q / static_cast<float>(rows);
+    const float u0 = flip ? u_last : u_first, u1 = flip ? u_first : u_last;
+    // PutQuad's corners x0y0, x1y0, x0y1, x1y1, x the output's columns: u follows y, v x.
+    const float uv[4][2] = {{u0, 0}, {u0, v_end}, {u1, 0}, {u1, v_end}};
+    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    const Data vertices = AllocData(QuadVertexWords * 4);
+    PutQuad(reinterpret_cast<float*>(vertices.cpu), width, height, 0, 0,
+            static_cast<float>(width), static_cast<float>(height), uv);
+
+    SgxdRecipeDrawPrograms p{};
+    const SgxdVertexFetch fetch{vertices.gpu, N * 4, N, 0};
+    const auto vspds = VertexPds(&fetch, 1, blit_vertex, false);
+    DEBUG_ASSERT(vspds.va != 0);
+    p.vspds = vspds.va;
+    p.vspds_units = vspds.units;
+    const auto vsec = SecondaryPds(0, 0, sgxd_program_doutu0(0, 0, 0));
+    DEBUG_ASSERT(vsec.va != 0);
+    p.vsec = vsec.va;
+    p.vsec_units = vsec.units;
+    p.vsec_sa = 0;
+    const auto fsec = SecondaryPds(0, 0, sgxd_program_doutu0(1, 0, 0));
+    DEBUG_ASSERT(fsec.va != 0);
+    p.fsec = fsec.va;
+    p.fsec_units = fsec.units;
+    sgxd_program_vertex_dms(N, 0, 0, N, &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
+    p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
+    p.outselects = SGXD_PROGRAM_BLIT_OUTSELECTS;
+    p.texsize = SGXD_PROGRAM_BLIT_TEXSIZE;
+    const float viewport[6] = {width / 2.0f, width / 2.0f, height / 2.0f, height / 2.0f, 0.0f,
+                               1.0f};
+    std::memcpy(p.viewport, viewport, sizeof(viewport));
+    p.indices = 0;
+    p.primitive = SGXD_PROGRAM_TRIANGLES;
+    // own format), packed as a pass's colour (DownscalePicture's).
+    u32 tex[4];
+    sgxd_recipe_texture_words_format(picture, stride, rows,
+                                     quarters * scale_x != 4 || quarters * scale_y != 4,
+                                     format.code, format.swizzle, tex);
+    const PdsRef fprim = format.converted ? ScreenPixelPds(untile_fragment, tex)
+                                          : BlitPixelPds(blit_fragment, tex);
+    DEBUG_ASSERT(fprim.va != 0);
+    p.fprim = fprim.va;
+    p.fprim_units = fprim.units;
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
     Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
     EndPass(ta_us, d3_us);
@@ -3342,6 +3404,102 @@ void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride,
         list[b].count = band.rows * quads * 6;
     }
     SideRender(g.vertices, list, dest_gpu, t.stride, t.width, t.height, false, t.twiddled);
+}
+
+void SgxdBackend::UntileDepthScaled(const UntileSource& src, const DepthStore& store,
+                                    u32 quarters, u32 margin, u32 samples) {
+    const u32 w = src.width, h = src.height;
+    const u32 cols = (h + 2 * margin) * quarters / 4, rows = w * quarters / 4 * samples;
+    DEBUG_ASSERT_MSG(w % 8 == 0 && h % 8 == 0 && (8 * quarters) % 4 == 0 &&
+                         (margin * quarters) % 4 == 0 && (samples == 1 || quarters == 4) &&
+                         cols <= store.width && rows <= store.height && cols <= UntileSide &&
+                         rows <= UntileSide,
+                     "sgxd: a {}x{} depth buffer into a {}x{} store at {}/4x, margin {}, {} "
+                     "samples: the untile takes whole tiles, whole samples, sides up to {}",
+                     w, h, store.width, store.height, quarters, margin, samples, UntileSide);
+    if (margin != 0) {
+        // The far plane under all of it, the untile's quads over the buffer's part after it (one
+        // queue: a fill runs once the renders before it have, a render once the fill has).
+        RenderBefore(store.memory.gpu, store.memory.gpu + store.width * rows * 4,
+                     "a depth store's margins");
+        char failed[160];
+        const SgxdPtlaFill far{store.memory.gpu, SGXD_PTLA_8888, store.width * 4, store.width,
+                               rows, 0, 0x00ffffffu};
+        [[maybe_unused]] const int filled = sgxd_ptla_fill(&far, nullptr, failed, sizeof(failed));
+        DEBUG_ASSERT_MSG(filled == 0, "sgxd: a {}x{} depth store's margins' fill stopped: {}",
+                         store.width, store.height, failed);
+    }
+    // Untile's transposed quads magnified: columns from (margin + 8ty) * quarters / 4, every row
+    // times the scale and samples. Point sampled: a sample at x reads texel floor((x + 0.5) /
+    // scale).
+    const float s = static_cast<float>(quarters) / 4.0f;
+    const u32 tile_rows = h / 8;
+    const Geometry& g = GeometryFor(
+        GeometryKey(8, w, h, quarters | margin << 4 | samples << 12, false, false),
+        SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4, [&](float* v, Geometry& geometry) {
+            u32 vertex_count = 0;
+            geometry.bands = TileBands(w, tile_rows, 1, vertex_count);
+            for (const Band& band : geometry.bands) {
+                const u32 band_texels = std::bit_ceil(band.rows * w);
+                for (u32 row = 0; row < band.rows && v; row++) {
+                    const u32 ty = band.first_row + row;
+                    const float v0 = static_cast<float>(row * w) / band_texels;
+                    const float v1 = static_cast<float>((row + 1) * w) / band_texels;
+                    const float uv[4][2] = {{0, v0}, {1, v0}, {0, v1}, {1, v1}};
+                    PutQuad(v + (band.first_vertex + row * 6) * SGXD_PROGRAM_BLIT_VERTEX_WORDS,
+                            cols, rows, static_cast<float>(margin + 8 * ty) * s, 0,
+                            static_cast<float>(margin + 8 * ty + 8) * s,
+                            static_cast<float>(rows), uv);
+                }
+            }
+            return vertex_count;
+        });
+    std::vector<SideDraw> list(g.bands.size());
+    for (std::size_t b = 0; b < g.bands.size(); b++) {
+        const Band& band = g.bands[b];
+        SideTextureWords(0, src.code, src.swizzle, 8, std::bit_ceil(band.rows * w),
+                         src.gpu + band.first_row * 8 * w * src.bits / 8, list[b].tex,
+                         src.palette);
+        list[b].converted = true;
+        list[b].first = band.first_vertex;
+        list[b].count = band.rows * 6;
+    }
+    SideRender(g.vertices, list, store.memory.gpu, store.width, cols, rows, false, false);
+}
+
+void SgxdBackend::TextureFromPicture(u32 picture, u32 stride, u32 rows, u32 quarters,
+                                     u32 margin, u32 first_row, u32 dest_gpu, u32 dest_stride,
+                                     u32 width, u32 height, const PictureFormat& format) {
+    // TransferFromPicture's quad: texel (x, y) is the picture's row x, texel margin + first_row +
+    // y, scaled. Its vertices outlive the pass's data (cached by sizes, start and scale). Start and
+    // sides are whole picture texels.
+    const u32 offset = margin + first_row;
+    DEBUG_ASSERT(rows == width * quarters / 4 && (offset + height) * quarters / 4 <= stride &&
+                 stride < 2048 && offset < 2048 && (offset * quarters) % 4 == 0 &&
+                 (width * quarters) % 4 == 0 && (height * quarters) % 4 == 0);
+    const u32 w = width * quarters / 4;
+    const u32 h = height * quarters / 4;
+    const u64 key = u64{21} << 56 | u64{width} << 42 | u64{height} << 28 | u64{stride} << 17 |
+                    u64{offset} << 6 | quarters;
+    bool fresh = false;
+    const Data vertices = GeometryVertices(key, QuadVertexWords * 4, fresh);
+    if (fresh) {
+        const float q = static_cast<float>(quarters) / 4.0f;
+        const float u0 = static_cast<float>(offset) * q / static_cast<float>(stride);
+        const float u1 = static_cast<float>(offset + height) * q / static_cast<float>(stride);
+        const float v1 = static_cast<float>(width) * q / static_cast<float>(rows);
+        const float uv[4][2] = {{u0, 0}, {u0, v1}, {u1, 0}, {u1, v1}};
+        PutQuad(reinterpret_cast<float*>(vertices.cpu), w, h, 0, 0, static_cast<float>(w),
+                static_cast<float>(h), uv);
+    }
+    SideDraw d{};
+    sgxd_recipe_texture_words_format(picture, stride, rows, false, format.code, format.swizzle,
+                                     d.tex);
+    d.converted = format.converted;
+    d.first = 0;
+    d.count = 6;
+    SideRender(vertices, {&d, 1}, dest_gpu, dest_stride, w, h, false, false,
+               SGXD_RECIPE_PACK_U8888);
 }
 
 u32 SgxdBackend::ChainBytes(u32 width, u32 height, u32 levels, u32 bytes) {

@@ -40,5 +40,7 @@ void AllowTakeover();
 /// `stride` bytes apart, in PICA format `format`, at `pixels`. The streamed one, while a host
 /// watches, goes to the stream's thread; the others are ignored.
 void Offer(u32 index, const u8* pixels, u32 stride, u32 columns, u32 format);
+/// Whether screen `index` is the one streamed to a watching host (its pixels read by the CPU).
+[[nodiscard]] bool Streams(u32 index);
 
 } // namespace VitaFrontend::UvcStream

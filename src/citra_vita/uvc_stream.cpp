@@ -280,6 +280,11 @@ const char* Problem() {
     return problem.load(std::memory_order_acquire);
 }
 
+bool Streams(u32 index) {
+    const int screen = streamed.load(std::memory_order_relaxed);
+    return screen != 0 && static_cast<u32>(screen - 1) == index && azaharUvcStreaming();
+}
+
 void Offer(u32 index, const u8* pixels, u32 stride, u32 columns, u32 format) {
     const int screen = streamed.load(std::memory_order_relaxed);
     if (screen == 0 || static_cast<u32>(screen - 1) != index || pixels == nullptr || format > 4 ||
