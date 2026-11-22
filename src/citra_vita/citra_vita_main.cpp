@@ -2872,7 +2872,20 @@ int EmulatorMain() {
 #endif
     if (const std::string launch = LaunchParameter(); !launch.empty()) {
         LOG_INFO(Frontend, "launch parameter names {}", launch);
-        running = RunTitle(system, window, ui, launch);
+        // A bubble's game checked as the list's is (a launch by path is scripted): a
+        // damaged one leaves the game list showing its question.
+        const auto present_start = [&] {
+            window.PollEvents();
+            ui.Update();
+            window.Present(&ui);
+        };
+        if (g_launched_by_path || ui.LaunchChecked(launch, present_start)) {
+            running = RunTitle(system, window, ui, launch);
+            // As run_title's: what the title installed or removed itself.
+            if (running) {
+                ui.ScanGames();
+            }
+        }
     }
     if (running) {
         banner.Start(VitaFrontend::Ui::BannerRect());
@@ -2939,7 +2952,11 @@ int EmulatorMain() {
 
         switch (action) {
         case VitaFrontend::Ui::Action::LaunchGame: {
-            running = run_title(ui.SelectedGamePath());
+            // A damaged file raises a question instead (Launch anyway, Full check, Cancel).
+            const std::string path = ui.SelectedGamePath();
+            if (ui.LaunchChecked(path, present_list)) {
+                running = run_title(path);
+            }
             break;
         }
         case VitaFrontend::Ui::Action::ExitApplication:

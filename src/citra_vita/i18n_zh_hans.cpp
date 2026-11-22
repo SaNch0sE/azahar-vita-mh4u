@@ -138,6 +138,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Free {} MiB on the memory card, then install it again.",
      "请在存储卡上腾出 {} MiB 空间，然后重新安装。"},
     {"From {}.", "来自 {}。"},
+    {"Full check", "完整检查"},
     {"Game settings", "游戏设置"},
     {"Games made for 3D draw each picture twice, once for each eye, and the Vita shows one. On "
      "leaves the right eye's picture undrawn, which is faster. Turn it off for a game whose top "
@@ -191,6 +192,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Language", "语言"},
     {"Large overlay", "大号叠加"},
     {"Large screen", "大屏"},
+    {"Launch anyway", "仍然启动"},
     {"Leave", "离开"},
     {"Left", "方向键左"},
     {"Left eye only", "仅绘制左眼"},
@@ -482,6 +484,11 @@ constexpr std::array table{std::to_array<Translation>({
      "{} 不完整：文件提前结束。请从你的游戏重新复制。"},
     {"{} is installed.", "{} 已安装。"},
     {"{} is intact: every part matches its checksum.", "{} 完好：每个部分都与校验值一致。"},
+    {"{} might be corrupted: the file ends early. It can crash or misbehave. Launch it anyway?",
+     "{} 可能已损坏：文件提前结束。运行时可能崩溃或出错。仍要启动吗？"},
+    {"{} might be corrupted: {} doesn't match its checksum. It can crash or misbehave. Launch it "
+     "anyway?",
+     "{} 可能已损坏：{}与校验值不符。运行时可能崩溃或出错。仍要启动吗？"},
     {"{} sets its own: {}. Change it in Game settings.",
      "{} 有单独的设置：{}。可在“游戏设置”中更改。"},
     {"{} title", "{} 个游戏"},

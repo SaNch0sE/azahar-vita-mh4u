@@ -516,6 +516,13 @@ Loader::ResultStatus NCCHContainer::LoadSectionExeFS(const char* name, std::vect
             exefs_file->Seek(section_offset, SEEK_SET);
 
             size_t section_size = is_proto ? Common::AlignUp(section.size, 0x10) : section.size;
+            // A damaged header's section past the ExeFS's end is not read (nor its size
+            // allocated).
+            if (static_cast<u64>(section_offset) + section_size > exefs_file->GetSize()) {
+                LOG_ERROR(Service_FS, "ExeFS section {} at {:#x}+{:#x} is past the ExeFS's end",
+                          name, section_offset, section_size);
+                return Loader::ResultStatus::ErrorInvalidFormat;
+            }
 
             if (strcmp(section.name, ".code") == 0 && is_compressed) {
                 // Section is compressed, read compressed .code section...

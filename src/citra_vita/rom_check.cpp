@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -17,6 +19,8 @@
 #include "common/file_derived.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
+#include "common/named_thread.h"
+#include "common/thread.h"
 #include "core/file_sys/cia_container.h"
 #include "core/file_sys/ncch_container.h"
 #include "core/file_sys/title_metadata.h"
@@ -49,14 +53,137 @@ const char* PartName(u32 index) {
     }
 }
 
+/// A chunk's blocks hashed and compared on four cores: three workers (cores 0, 1 and 3, idle while
+/// the game list shows) and the caller, which reads the next chunk meanwhile. One core hashes
+/// slower than the memory card reads.
+class BlockHasher {
+public:
+    BlockHasher() {
+        for (int i = 0; i < 3; i++) {
+            workers.emplace_back(
+                Common::ThreadCfg{"file check", 32 * 1024, 1 << 0 | 1 << 1 | 1 << 3},
+                [this] { Run(); });
+        }
+    }
+
+    ~BlockHasher() {
+        {
+            std::scoped_lock lock{gate};
+            stop = true;
+            gate.NotifyAll();
+        }
+        workers.clear();
+    }
+
+    /// Starts on `count` blocks of `block` bytes at `data`, each against its digest in
+    /// `expected`. The caller keeps both until Wait returns.
+    void Start(const u8* data, u64 block, u64 count, const u8* expected) {
+        std::scoped_lock lock{gate};
+        job = {data, block, count, expected};
+        next.store(0, std::memory_order_relaxed);
+        finished = 0;
+        first_bad = -1;
+        generation++;
+        gate.NotifyAll();
+    }
+
+    /// Hashes beside the workers until the chunk is done: the first block that differs, or -1.
+    s64 Wait() {
+        Job taken;
+        {
+            std::scoped_lock lock{gate};
+            taken = job;
+            active++;
+        }
+        Help(taken);
+        std::scoped_lock lock{gate};
+        while (finished < job.count || active != 0) {
+            gate.Wait();
+        }
+        return first_bad;
+    }
+
+private:
+    struct Job {
+        const u8* data = nullptr;
+        u64 block = 0;
+        u64 count = 0;
+        const u8* expected = nullptr;
+    };
+
+    void Run() {
+        u64 seen = 0;
+        for (;;) {
+            Job taken;
+            {
+                std::scoped_lock lock{gate};
+                while (generation == seen && !stop) {
+                    gate.Wait();
+                }
+                if (stop) {
+                    return;
+                }
+                seen = generation;
+                // A chunk already done (this worker woke after the caller's Wait): taking it would
+                // take the next chunk's first index once Start resets the count.
+                if (finished >= job.count) {
+                    continue;
+                }
+                taken = job;
+                active++;
+            }
+            Help(taken);
+        }
+    }
+
+    /// Blocks of `taken` until none is left; leaves the job (active) when done.
+    void Help(const Job& taken) {
+        u64 done = 0;
+        s64 bad = -1;
+        for (u64 i; (i = next.fetch_add(1, std::memory_order_relaxed)) < taken.count;) {
+            Digest digest;
+            CryptoPP::SHA256().CalculateDigest(digest.data(), taken.data + i * taken.block,
+                                               static_cast<std::size_t>(taken.block));
+            if (std::memcmp(digest.data(), taken.expected + i * 32, 32) != 0 &&
+                (bad < 0 || static_cast<s64>(i) < bad)) {
+                bad = static_cast<s64>(i);
+            }
+            done++;
+        }
+        std::scoped_lock lock{gate};
+        finished += done;
+        if (bad >= 0 && (first_bad < 0 || bad < first_bad)) {
+            first_bad = bad;
+        }
+        active--;
+        gate.NotifyAll();
+    }
+
+    Common::CoreCondition gate;
+    Job job;
+    std::atomic<u64> next{0};
+    u64 finished = 0;
+    s64 first_bad = -1;
+    u64 generation = 0;
+    int active = 0;
+    bool stop = false;
+    std::vector<Common::NamedThread> workers;
+};
+
 /// The file being checked, its read buffer, and the progress.
 class Checker {
 public:
-    Checker(FileUtil::IOFileBase& file_, const std::function<void(float)>& progress_)
-        : file{file_}, size{file_.GetSize()}, progress{progress_} {}
+    Checker(FileUtil::IOFileBase& file_, const std::function<void(float)>& progress_, bool quick_)
+        : file{file_}, size{file_.GetSize()}, progress{progress_}, quick{quick_} {}
 
     u64 Size() const {
         return size;
+    }
+
+    /// QuickCheck's: the headers, the game's ExeFS and its RomFS's top hash level, and every
+    /// part's place in the file; not the data blocks.
+    bool Quick() const {
+        return quick;
     }
 
     void SetTotal(u64 bytes) {
@@ -95,27 +222,44 @@ public:
                              const std::function<bool(u64 first, u64 count, u8* out)>& parents) {
         const u64 blocks = (length + block - 1) / block;
         const u64 per_chunk = std::max<u64>(1, ChunkSize / block);
-        std::vector<u8> digests;
+        if (!hasher) {
+            hasher.emplace();
+        }
+        // A chunk read and its digests fetched while the one before is hashed.
+        std::array<std::vector<u8>, 2> chunks, digests;
+        std::optional<u64> started;
+        u64 started_bytes = 0;
+        const auto finish = [&]() -> std::optional<s64> {
+            if (started) {
+                if (const s64 bad = hasher->Wait(); bad >= 0) {
+                    return static_cast<s64>(*started) + bad;
+                }
+                Advance(started_bytes);
+                started.reset();
+            }
+            return std::nullopt;
+        };
+        int cur = 0;
         for (u64 b = 0; b < blocks; b += per_chunk) {
             const u64 count = std::min(per_chunk, blocks - b);
             const u64 bytes = std::min(count * block, length - b * block);
-            buffer.assign(static_cast<std::size_t>(count * block), 0);
-            digests.resize(static_cast<std::size_t>(count * 32));
-            if (!Read(offset + b * block, static_cast<std::size_t>(bytes), buffer.data()) ||
-                !parents(b, count, digests.data())) {
+            chunks[cur].assign(static_cast<std::size_t>(count * block), 0);
+            digests[cur].resize(static_cast<std::size_t>(count * 32));
+            const bool read =
+                Read(offset + b * block, static_cast<std::size_t>(bytes), chunks[cur].data()) &&
+                parents(b, count, digests[cur].data());
+            if (const auto bad = finish()) {
+                return bad;
+            }
+            if (!read) {
                 return -1;
             }
-            for (u64 k = 0; k < count; k++) {
-                Digest digest;
-                CryptoPP::SHA256().CalculateDigest(digest.data(), buffer.data() + k * block,
-                                                   static_cast<std::size_t>(block));
-                if (std::memcmp(digest.data(), digests.data() + k * 32, 32) != 0) {
-                    return static_cast<s64>(b + k);
-                }
-            }
-            Advance(bytes);
+            hasher->Start(chunks[cur].data(), block, count, digests[cur].data());
+            started = b;
+            started_bytes = bytes;
+            cur ^= 1;
         }
-        return std::nullopt;
+        return finish();
     }
 
 private:
@@ -131,7 +275,9 @@ private:
     FileUtil::IOFileBase& file;
     const u64 size;
     const std::function<void(float)>& progress;
+    const bool quick;
     std::vector<u8> buffer;
+    std::optional<BlockHasher> hasher;
     u64 total = 1;
     u64 done = 0;
     u64 shown_us = 0;
@@ -181,7 +327,7 @@ std::optional<Result> CheckIvfc(Checker& c, u64 romfs, const char* part) {
     if (!c.Read(romfs + 0x60, master.size(), master.data())) {
         return CutShort(part, "the RomFS master hashes");
     }
-    for (std::size_t i = 0; i < 3; i++) {
+    for (std::size_t i = 0; i < (c.Quick() ? 1 : 3); i++) {
         const auto parents = [&](u64 first, u64 count, u8* out) {
             if (i == 0) {
                 if ((first + count) * 32 > master.size()) {
@@ -306,6 +452,10 @@ Result CheckNcsd(Checker& c) {
                             fmt::format("partition {} ends at {:#x}, the file at {:#x}", i,
                                         u64{p.offset + p.size} * MediaUnit, c.Size()));
         }
+        // Quick: the game's partition alone beyond its place in the file.
+        if (c.Quick() && i != 0) {
+            continue;
+        }
         bool encrypted = false;
         if (auto bad = CheckNcch(c, u64{p.offset} * MediaUnit, PartName(i), encrypted)) {
             return *bad;
@@ -336,6 +486,12 @@ Result CheckCia(Checker& c, FileUtil::IOFileBase& file) {
             continue; // left out of this CIA
         }
         const char* const part = PartName(tmd.GetContentIndexByIndex(i));
+        if (cia.GetContentOffset(i) + length > c.Size()) {
+            return CutShort(part, fmt::format("content {}", i));
+        }
+        if (c.Quick()) {
+            continue;
+        }
         if (tmd.GetContentTypeByIndex(i) & 1) {
             return {Outcome::Encrypted};
         }
@@ -362,9 +518,7 @@ bool HasExtension(const std::string& path, std::initializer_list<const char*> ex
                        [&](const char* e) { return extension == e; });
 }
 
-} // Anonymous namespace
-
-Result Check(const std::string& path, const std::function<void(float)>& progress) {
+Result Run(const std::string& path, const std::function<void(float)>& progress, bool quick) {
     const u64 start = sceKernelGetProcessTimeWide();
     Result result{Outcome::Unreadable};
     if (HasExtension(path, {".3dsx", ".z3dsx", ".elf", ".axf"})) {
@@ -376,7 +530,7 @@ Result Check(const std::string& path, const std::function<void(float)>& progress
             file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(file));
         }
         if (file->IsOpen()) {
-            Checker c{*file, progress};
+            Checker c{*file, progress, quick};
             result = CheckCia(c, *file);
         }
     } else {
@@ -385,7 +539,7 @@ Result Check(const std::string& path, const std::function<void(float)>& progress
             FileSys::NCCHContainer::AutoOpenNCCHNCSD(path);
         u32 magic = 0;
         if (file && file->IsOpen() && file->ReadAtBytes(&magic, 4, 0x100) == 4) {
-            Checker c{*file, progress};
+            Checker c{*file, progress, quick};
             if (magic == FileUtil::MakeMagic('N', 'C', 'S', 'D')) {
                 result = CheckNcsd(c);
             } else if (magic == FileUtil::MakeMagic('N', 'C', 'C', 'H')) {
@@ -399,13 +553,23 @@ Result Check(const std::string& path, const std::function<void(float)>& progress
             }
         }
     }
-    LOG_INFO(Frontend, "File check of {}: outcome {}{}{} in {} ms", path,
-             static_cast<int>(result.outcome), result.part ? ", " : "",
+    LOG_INFO(Frontend, "{} of {}: outcome {}{}{} in {} ms", quick ? "Quick check" : "File check",
+             path, static_cast<int>(result.outcome), result.part ? ", " : "",
              result.part ? result.part : "", (sceKernelGetProcessTimeWide() - start) / 1000);
     if (!result.detail.empty()) {
         LOG_INFO(Frontend, "File check of {}: {}", path, result.detail);
     }
     return result;
+}
+
+} // Anonymous namespace
+
+Result Check(const std::string& path, const std::function<void(float)>& progress) {
+    return Run(path, progress, false);
+}
+
+Result QuickCheck(const std::string& path) {
+    return Run(path, [](float) {}, true);
 }
 
 } // namespace VitaFrontend::RomCheck

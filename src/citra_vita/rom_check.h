@@ -41,4 +41,9 @@ struct Result {
 /// second or so, on the calling thread.
 Result Check(const std::string& path, const std::function<void(float)>& progress);
 
+/// What is cheap of Check, for a launch: every part's place in the file (a copy cut short), the
+/// game's headers, extended header and ExeFS (its code, icon and banner), and its RomFS's header
+/// and top hash level; not the RomFS's data. About a second.
+Result QuickCheck(const std::string& path);
+
 } // namespace VitaFrontend::RomCheck

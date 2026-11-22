@@ -18,6 +18,7 @@
 #include <psp2/ctrl.h>
 #include <psp2/io/devctl.h>
 #include <psp2/io/stat.h>
+#include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 #include <psp2/rtc.h>
@@ -129,6 +130,10 @@ std::string LocalTimeText(u64 seconds) {
     return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}", local.year, local.month, local.day,
                        local.hour, local.minute);
 }
+
+/// The full checks' outcomes (Ui::RememberCheck), a line a file: its size, the outcome, the part,
+/// the path, tab-separated.
+constexpr char CheckRecordFile[] = "ux0:data/azahar/checks.txt";
 
 /// Where Ui keeps the titles' names between runs (Ui::title_cache): a line a file, its size, path,
 /// name, publisher and whether its icon is cached, tab-separated.
@@ -3221,7 +3226,97 @@ std::string Ui::CheckSelected(const std::function<void()>& present) {
         break;
     }
     check_results[path] = text;
+    RememberCheck(path, result);
     return text;
+}
+
+const Ui::CheckRecord* Ui::RememberedCheck(const std::string& path) {
+    if (!check_records_loaded) {
+        check_records_loaded = true;
+        if (std::FILE* const f = std::fopen(CheckRecordFile, "rb")) {
+            char line[1024];
+            while (std::fgets(line, sizeof(line), f) != nullptr) {
+                // size, outcome, part, path; tab-separated.
+                std::string text{line};
+                if (!text.empty() && text.back() == '\n') {
+                    text.pop_back();
+                }
+                const auto t1 = text.find('\t');
+                const auto t2 = t1 == std::string::npos ? t1 : text.find('\t', t1 + 1);
+                const auto t3 = t2 == std::string::npos ? t2 : text.find('\t', t2 + 1);
+                if (t3 == std::string::npos) {
+                    continue;
+                }
+                check_records[text.substr(t3 + 1)] = {
+                    std::strtoull(text.c_str(), nullptr, 10),
+                    static_cast<RomCheck::Outcome>(std::atoi(text.c_str() + t1 + 1)),
+                    text.substr(t2 + 1, t3 - t2 - 1)};
+            }
+            std::fclose(f);
+        }
+    }
+    const auto found = check_records.find(path);
+    // A file changed since (another copy over it) has no check of its own yet.
+    return found != check_records.end() && found->second.size == FileUtil::GetSize(path)
+               ? &found->second
+               : nullptr;
+}
+
+void Ui::RememberCheck(const std::string& path, const RomCheck::Result& result) {
+    RememberedCheck(path); // the file's records read first
+    check_records[path] = {FileUtil::GetSize(path), result.outcome,
+                           result.part != nullptr ? result.part : ""};
+    std::FILE* const f = std::fopen(CheckRecordFile, "wb");
+    if (f == nullptr) {
+        LOG_WARNING(Frontend, "Could not write {}", CheckRecordFile);
+        return;
+    }
+    for (const auto& [file, record] : check_records) {
+        std::fprintf(f, "%llu\t%d\t%s\t%s\n", static_cast<unsigned long long>(record.size),
+                     static_cast<int>(record.outcome), record.part.c_str(), file.c_str());
+    }
+    std::fclose(f);
+}
+
+bool Ui::LaunchChecked(const std::string& path, const std::function<void()>& present) {
+    if (std::exchange(launch_anyway, false)) {
+        return true;
+    }
+    const auto listed = std::find_if(games.begin(), games.end(),
+                                     [&](const GameEntry& game) { return game.path == path; });
+    const std::string name =
+        listed != games.end() ? listed->name : std::string{FileUtil::GetFilename(path)};
+    SetStatusMessage(TrFormat("Checking {}...", name));
+    present();
+    RomCheck::Result result = RomCheck::QuickCheck(path);
+    ClearStatusMessage();
+    // A full check found what the quick one does not read (the RomFS's data).
+    if (const CheckRecord* record = RememberedCheck(path);
+        record != nullptr && result.outcome == RomCheck::Outcome::Intact &&
+        (record->outcome == RomCheck::Outcome::Damaged ||
+         record->outcome == RomCheck::Outcome::CutShort)) {
+        result.outcome = record->outcome;
+        result.part = record->part.c_str();
+    }
+    if (result.outcome != RomCheck::Outcome::Damaged &&
+        result.outcome != RomCheck::Outcome::CutShort) {
+        return true;
+    }
+    sceClibPrintf("[azahar] launch check of %s: %s %s\n", path.c_str(),
+                  result.outcome == RomCheck::Outcome::Damaged ? "damaged in" : "cut short",
+                  result.part != nullptr ? result.part : "");
+    selected_game_path = path;
+    question = Question::Damaged;
+    question_game = name;
+    damaged_text =
+        result.outcome == RomCheck::Outcome::Damaged
+            ? TrFormat("{} might be corrupted: {} doesn't match its checksum. It can crash or "
+                       "misbehave. Launch it anyway?",
+                       name, Tr(result.part))
+            : TrFormat("{} might be corrupted: the file ends early. It can crash or misbehave. "
+                       "Launch it anyway?",
+                       name);
+    return false;
 }
 
 Ui::Action Ui::DrawPauseMenu() {
@@ -3775,7 +3870,6 @@ void Ui::DrawStatusMessage() {
 Ui::Action Ui::DrawUsbPrompt() {
     constexpr float Padding = 28.0f;
     constexpr float Width = 640.0f;
-    const ImVec2 button(200.0f, 48.0f);
     const char* const text =
         "Another plugin is using the USB port, such as one that streams the screen "
         "(vitastream). Take it over for USB video? That plugin stops working until you reboot.";
@@ -3785,9 +3879,15 @@ Ui::Action Ui::DrawUsbPrompt() {
     ImGui::PushTextWrapPos(Width - Padding);
     ImGui::TextUnformatted(text);
     ImGui::PopTextWrapPos();
-    ImGui::SetCursorPos(ImVec2(Width * 0.5f - button.x - 10.0f, 2.0f * Padding + size.y));
+    const float buttons = three ? 3.0f * button.x + 2.0f * 16.0f : 2.0f * button.x + 20.0f;
+    ImGui::SetCursorPos(ImVec2((Width - buttons) * 0.5f, 2.0f * Padding + size.y));
     const bool take = ImGui::Button("Take over", button);
-    ImGui::SameLine(0.0f, 20.0f);
+    bool middle = false;
+    if (three) {
+        ImGui::SameLine(0.0f, 16.0f);
+        middle = ImGui::Button(damaged ? Tr("Full check") : Tr("Play without"), button);
+    }
+    ImGui::SameLine(0.0f, three ? 16.0f : 20.0f);
     const bool cancel = ImGui::Button(Tr("Cancel"), button) || BackPressed();
     if (ImGui::IsWindowAppearing()) {
         ImGui::SetItemDefaultFocus(); // Cancel
@@ -3800,6 +3900,15 @@ Ui::Action Ui::DrawUsbPrompt() {
     const UsbPrompt asked = usb_prompt;
     usb_prompt = UsbPrompt::None;
     overlay_focused = false;
+    if (asked == Question::Damaged) {
+        if (middle) {
+            check_path = selected_game_path;
+            check_name = question_game;
+            return Action::CheckFile;
+        }
+        launch_anyway = agreed;
+        return agreed ? Action::LaunchGame : Action::None;
+    }
     if (take) {
         UvcStream::AllowTakeover();
     }

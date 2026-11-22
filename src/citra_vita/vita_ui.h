@@ -14,6 +14,7 @@
 #include "citra_vita/adhoc.h"
 #include "citra_vita/config.h"
 #include "citra_vita/multiplayer.h"
+#include "citra_vita/rom_check.h"
 #include "common/common_types.h"
 #include "common/math_util.h"
 #include "common/named_thread.h"
@@ -114,6 +115,13 @@ public:
     /// its format carries (RomCheck), its progress shown through `present`: what it found, for a
     /// notice. After Action::CheckFile, or the command channel's `check`.
     std::string CheckSelected(const std::function<void()>& present);
+
+    /// Whether to launch `path` now: its quick check (RomCheck::QuickCheck, about a second, its
+    /// status shown through `present`) and a full check remembered for the same file found
+    /// nothing wrong, or the player answered the question a damaged file raises with Launch
+    /// anyway. Otherwise the question is up (Launch anyway, Full check, Cancel) and the list
+    /// shows it. Before a launch from the game list or a bubble.
+    bool LaunchChecked(const std::string& path, const std::function<void()>& present);
 
     /// Lists the titles again (at the start, after an install, the command channel's `rescan`),
     /// keeping the selected one selected.
@@ -371,6 +379,21 @@ private:
     std::string check_name;
     bool check_requested{};
     std::unordered_map<std::string, std::string> check_results;
+    /// The damaged file's question's text, and its answer Launch anyway (LaunchChecked's next
+    /// call launches).
+    std::string damaged_text;
+    bool launch_anyway{};
+    /// A full check's outcome, kept on the memory card for the launches after (CheckRecordFile):
+    /// the file's size then, the outcome, the part (English).
+    struct CheckRecord {
+        u64 size;
+        RomCheck::Outcome outcome;
+        std::string part;
+    };
+    std::unordered_map<std::string, CheckRecord> check_records;
+    bool check_records_loaded{};
+    const CheckRecord* RememberedCheck(const std::string& path);
+    void RememberCheck(const std::string& path, const RomCheck::Result& result);
     /// The System tab's rows after it, all games' only: each ROM folder the player added
     /// (Config::RomFolders), which cross pressed twice takes off, then the row whose cross opens
     /// the folder picker to add one (picker_folders). Their info beside the list (focused_row
