@@ -40,12 +40,16 @@ void RendererBase::UpdateCurrentFramebufferLayout(bool is_portrait_mode) {
     }
 }
 
+void RendererBase::PollWindowEvents() {
+    render_window.PollEvents();
+}
+
 void RendererBase::EndFrame() {
     current_frame++;
 
     system.perf_stats->EndSystemFrame();
 
-    render_window.PollEvents();
+    PollWindowEvents();
 
     system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
     system.perf_stats->BeginSystemFrame();

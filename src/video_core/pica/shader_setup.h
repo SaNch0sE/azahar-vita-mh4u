@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <optional>
 #include "common/vector_math.h"
 #include "video_core/pica/packed_attribute.h"
@@ -99,6 +101,7 @@ public:
         if ((offset + 1) > biggest_program_size) {
             biggest_program_size = offset + 1;
         }
+        CodeChanged(static_cast<u32>(offset), static_cast<u32>(offset) + 1);
     }
 
     void UpdateProgramCodeRange(size_t offset, const u32* __restrict values, u32 count);
@@ -107,6 +110,7 @@ public:
         program_code = other;
         biggest_program_size = std::max(biggest_program_size, other_size);
         MakeProgramCodeDirty();
+        CodeChanged(0, MAX_PROGRAM_CODE_LENGTH);
     }
 
     inline void UpdateSwizzleData(size_t offset, u32 value) {
@@ -123,6 +127,7 @@ public:
         if ((offset + 1) > biggest_swizzle_size) {
             biggest_swizzle_size = offset + 1;
         }
+        SwizzleChanged(static_cast<u32>(offset), static_cast<u32>(offset) + 1);
     }
 
     void UpdateSwizzleDataRange(size_t offset, const u32* __restrict values, u32 count);
@@ -131,6 +136,7 @@ public:
         swizzle_data = other;
         biggest_swizzle_size = std::max(biggest_swizzle_size, other_size);
         MakeSwizzleDataDirty();
+        SwizzleChanged(0, MAX_SWIZZLE_DATA_LENGTH);
     }
 
     const ProgramCode& GetProgramCode() const {
@@ -154,6 +160,44 @@ public:
         // requires_fixup = _requires_fixup;
     }
 
+    /**
+     * What changed since the sgxd render thread's copy of this setup last took it
+     * (SgxdRenderer::RenderThread): the float uniforms by index, the bool and int uniforms, and
+     * the program and swizzle words in [lo, hi). The writes above set them. uniforms_dirty
+     * with none of the uniform marks set (an assignment, as vprof's replay makes) stands for
+     * every uniform.
+     */
+    std::array<u32, 3> f_changed{};
+    bool bi_changed{};
+    u32 code_lo = MAX_PROGRAM_CODE_LENGTH;
+    u32 code_hi = 0;
+    u32 swizzle_lo = MAX_SWIZZLE_DATA_LENGTH;
+    u32 swizzle_hi = 0;
+
+    /// The VS's float uniform copied into the GS's (PicaCore: the GS mirrors the VS), marked as
+    /// a write is.
+    void MirrorFloatUniform(u32 index, const Common::Vec4<f24>& value) {
+        if (uniforms.f[index] != value) {
+            uniforms.f[index] = value;
+            FloatChanged(index);
+        }
+    }
+
+    /// Everything as changed, for the render thread's copy to take whole.
+    void MarkAllChanged() {
+        f_version++;
+        uniforms_dirty = true;
+        f_changed.fill(~0u);
+        bi_changed = true;
+        CodeChanged(0, MAX_PROGRAM_CODE_LENGTH);
+        SwizzleChanged(0, MAX_SWIZZLE_DATA_LENGTH);
+    }
+
+    /// The render thread's copy: words [lo, lo + count) of the program or the swizzle data, and
+    /// the biggest size, as the emulation side's setup has them.
+    void TakeProgramCode(u32 lo, const u32* words, u32 count, u32 biggest);
+    void TakeSwizzleData(u32 lo, const u32* words, u32 count, u32 biggest);
+
 public:
     Uniforms uniforms;
     PackedAttribute uniform_queue;
@@ -174,6 +218,15 @@ public:
     // bool has_fixup = false;
 
 private:
+    void CodeChanged(u32 lo, u32 hi) {
+        code_lo = std::min(code_lo, lo);
+        code_hi = std::max(code_hi, hi);
+    }
+    void SwizzleChanged(u32 lo, u32 hi) {
+        swizzle_lo = std::min(swizzle_lo, lo);
+        swizzle_hi = std::max(swizzle_hi, hi);
+    }
+
     ProgramCode program_code{};
     SwizzleData swizzle_data{};
     bool program_code_hash_dirty{true};
@@ -205,7 +258,7 @@ private:
         // ar & requires_fixup;
         // ar & has_fixup;
         if (Archive::is_loading::value) {
-            uniforms_dirty = true;
+            MarkAllChanged();
         }
     }
 };

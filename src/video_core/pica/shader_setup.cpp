@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <bit>
+#include <cstring>
 #include <utility>
 #include "common/assert.h"
 #include "common/bit_set.h"
@@ -34,16 +35,21 @@ ShaderSetup::~ShaderSetup() = default;
 
 void ShaderSetup::WriteUniformBoolReg(u32 value) {
     const auto bits = BitSet32(value);
+    bool changed = false;
     for (u32 i = 0; i < uniforms.b.size(); ++i) {
         const bool prev = std::exchange(uniforms.b[i], bits[i]);
-        uniforms_dirty |= prev != bits[i];
+        changed |= prev != bits[i];
     }
+    uniforms_dirty |= changed;
+    bi_changed |= changed;
 }
 
 void ShaderSetup::WriteUniformIntReg(u32 index, const Common::Vec4<u8> values) {
     ASSERT(index < uniforms.i.size());
     const auto prev = std::exchange(uniforms.i[index], values);
-    uniforms_dirty |= prev != values;
+    const bool changed = prev != values;
+    uniforms_dirty |= changed;
+    bi_changed |= changed;
 }
 
 std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 value) {
@@ -62,7 +68,9 @@ std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 val
 
     const u32 index = uniform_setup.index.Value();
     const auto prev = std::exchange(uniforms.f[index], uniform);
-    uniforms_dirty |= prev != uniform;
+    if (prev != uniform) {
+        FloatChanged(index);
+    }
     uniform_setup.index.Assign(index + 1);
     return index;
 }
@@ -145,7 +153,9 @@ std::optional<ShaderSetup::UniformWriteRange> ShaderSetup::WriteUniformFloatRegR
 
         const u32 index = uniform_setup.index.Value();
         const auto prev = std::exchange(uniforms.f[index], uniform);
-        uniforms_dirty |= prev != uniform;
+        if (prev != uniform) {
+            FloatChanged(index);
+        }
         uniform_setup.index.Assign(index + 1);
 
         if (!first_index) {
@@ -206,27 +216,8 @@ void ShaderSetup::UpdateProgramCodeRange(size_t offset, const u32* __restrict va
     if (!program_code_hash_dirty) {
         MakeProgramCodeDirty();
     }
-#endif
-
-    // Scalar remainder (and whole loop when SIMD is not available).
-    DISABLE_VECTORIZE
-    for (; i < count; ++i) {
-        u32& inst = dst[i];
-        const u32 value = values[i];
-        if (inst != value) {
-            inst = value;
-            any_changed = true;
-            last_changed_offset = offset + i;
-        }
-    }
-
-    if (any_changed) {
-        if (!program_code_hash_dirty) {
-            MakeProgramCodeDirty();
-        }
-        if ((last_changed_offset + 1) > biggest_program_size) {
-            biggest_program_size = last_changed_offset + 1;
-        }
+    if ((last_changed_offset + 1) > biggest_program_size) {
+        biggest_program_size = last_changed_offset + 1;
     }
     CodeChanged(static_cast<u32>(offset), static_cast<u32>(last_changed_offset) + 1);
 }
@@ -245,29 +236,22 @@ void ShaderSetup::UpdateSwizzleDataRange(size_t offset, const u32* __restrict va
     if (!swizzle_data_hash_dirty) {
         MakeSwizzleDataDirty();
     }
-#endif
-
-    // Scalar remainder (and whole loop when SIMD is not available).
-    DISABLE_VECTORIZE
-    for (; i < count; ++i) {
-        u32& inst = dst[i];
-        const u32 value = values[i];
-        if (inst != value) {
-            inst = value;
-            any_changed = true;
-            last_changed_offset = offset + i;
-        }
-    }
-
-    if (any_changed) {
-        if (!swizzle_data_hash_dirty) {
-            MakeSwizzleDataDirty();
-        }
-        if ((last_changed_offset + 1) > biggest_swizzle_size) {
-            biggest_swizzle_size = last_changed_offset + 1;
-        }
+    if ((last_changed_offset + 1) > biggest_swizzle_size) {
+        biggest_swizzle_size = last_changed_offset + 1;
     }
     SwizzleChanged(static_cast<u32>(offset), static_cast<u32>(last_changed_offset) + 1);
+}
+
+void ShaderSetup::TakeProgramCode(u32 lo, const u32* words, u32 count, u32 biggest) {
+    std::memcpy(program_code.data() + lo, words, count * sizeof(u32));
+    biggest_program_size = biggest;
+    MakeProgramCodeDirty();
+}
+
+void ShaderSetup::TakeSwizzleData(u32 lo, const u32* words, u32 count, u32 biggest) {
+    std::memcpy(swizzle_data.data() + lo, words, count * sizeof(u32));
+    biggest_swizzle_size = biggest;
+    MakeSwizzleDataDirty();
 }
 
 void ShaderSetup::DoProgramCodeFixup() {

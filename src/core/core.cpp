@@ -566,13 +566,13 @@ void System::Reschedule() {
 #ifdef VITA_MULTICORE
 bool System::QuietBoundary(ARM_Interface& core, bool main_thread) {
     // Nothing for the HLE side at this boundary: no reschedule asked for, the thread that ran
-    // goes on (and is no time limiter's to stop), no GPU interrupt to deliver, no event due.
+    // goes on (and is no time limiter's to stop), no GPU interrupt due, no event due.
     const u32 id = core.GetID();
     if (reschedule_pending[id].load()) {
         return false;
     }
 #ifdef ENABLE_GXM
-    if (main_thread && gpu->HasHeldInterrupts()) {
+    if (main_thread && gpu->HasDueInterrupts()) {
         return false;
     }
 #endif
@@ -1109,6 +1109,8 @@ void System::ApplySettings() {
 #endif
 
     if (gpu) {
+        // The renderer's: with the render thread held.
+        const auto hold = gpu->HoldRender();
 #ifndef ANDROID
         gpu->Renderer().UpdateCurrentFramebufferLayout();
 #endif
@@ -1235,6 +1237,9 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     // then holds what guest memory holds; GPU-only content is redrawn or reloaded after a
     // load, as it is after any invalidation.
     const bool should_flush = !Archive::is_loading::value && memory->RasterizerCacheMarkingEnabled();
+    // The render thread done with the GPU work queued, and held: guest memory and the PICA are
+    // the state's alone until it is saved or loaded.
+    const auto render_hold = gpu->HoldRender();
     gpu->ClearAll(should_flush);
     SavestateTrace("cleared");
     ar&* timing.get();
@@ -1293,7 +1298,7 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
                 const std::shared_ptr<Kernel::Process> process = thread->owner_process.lock();
                 if (process) {
                     gpu->ApplyPerProgramSettings(process->codeset->program_id);
-                    gpu->Renderer().Rasterizer()->SwitchDiskResources(process->codeset->program_id);
+                    gpu->SwitchDiskResources(process->codeset->program_id);
                 }
             }
         }

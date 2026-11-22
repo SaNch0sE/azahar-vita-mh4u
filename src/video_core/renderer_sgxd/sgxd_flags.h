@@ -19,9 +19,9 @@ namespace GxmRenderer {
   *   parallel  emulated core 1 on a second emulation thread on Vita core 1, at the same time as
  *             core 0.
  *             Multicore builds only (ENABLE_VITA_MULTICORE); elsewhere it does nothing
- *   parallel_slice=N, parallel_skew=N  with parallel, the longest slice and how far a core may
- *             run past the slowest other, in microseconds (default 4270 each, one slice): a
- *             shorter slice bounds how long a thread woken on a core in the guest waits
+  *   rendercheck  before each draw the emulation side sends its whole PICA state and the render
+ *             thread compares its copy with it, logging each register, uniform and table that
+ *             differs (once each): a gap in the state the render thread is sent
  *   nolimit   no frame limit: the core runs as fast as it goes
  *   novsync   the sgxd present does not wait for the frame before it to be on screen (tears)
  *   holdlog   with perflog, the first 200 page-hold aborts that waited (holdlog=N: from N
@@ -89,9 +89,6 @@ namespace GxmRenderer {
  *             those left with w near 0 by the near and far planes (the TA has no w plane), and
  *             non-finite positions; a line for each draw with the last two (600 at most) and
  *             each second's totals
- *   vsprobe=N draws N to N + 3 also run their vertex stage as a stream-out and log each
- *             loader and vertex; attrprobe the same for the first four draws with BYTE or
- *             SHORT attributes (UnpackInt's lanes)
  *
  * Checking guest memory against the CPU:
  *   untilecheck  every RGBA8, RGB8, ETC1 and ETC1A4 untile's level 0 against upstream's CPU

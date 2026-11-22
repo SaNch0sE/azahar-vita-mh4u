@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -93,6 +94,10 @@ private:
     Ctrl* ctrl = nullptr;
     std::stop_source ssource;
 };
+
+/// The calling thread's name and the named threads waiting on kernel object `uid`: who else waits
+/// when a single-waiter event flag refuses a wait (SCE_KERNEL_ERROR_EVF_MULTI).
+std::string DescribeWaiters(std::int32_t uid);
 
 #else
 

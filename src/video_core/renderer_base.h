@@ -100,6 +100,10 @@ public:
     /// Ends the current frame
     void EndFrame();
 
+    /// The window's events, which EndFrame polls. The GXM renderer's render thread polls them
+    /// with each present instead: the window is that thread's.
+    virtual void PollWindowEvents();
+
     f32 GetCurrentFPS() const {
         return current_fps;
     }

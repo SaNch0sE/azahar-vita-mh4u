@@ -8,6 +8,7 @@
 #include <atomic>
 
 #include "common/common_types.h"
+#include "common/thread.h"
 #include "core/frontend/emu_window.h"
 #include "video_core/renderer_base.h"
 
@@ -22,19 +23,23 @@ class Ui;
 /**
  * The Vita's window, such as it is: a fixed 960x544 display with no window system above it.
  *
- * Every present happens on the emulation thread. A finished frame is presented from
- * SwapBuffers, which the renderer calls at the end of each guest frame.
+ * While a title runs the window is the sgxd render thread's (SgxdRenderer::RenderThread): each
+ * VBlank's present record polls the input (PollEvents) and presents the guest's screens
+ * (PresentGuestScreens), and the thread polls on its own between them when it has nothing to
+ * run. Before and after a title the emulation thread does both.
  *
- * The interface is drawn there too: ImGui's frame is built and rendered inside that same call,
- * and the menu's decision is published for the run loop to read. While a menu is up emulation
- * is paused and no frames arrive, so the run loop presents directly.
+ * The interface is the same thread's. The stats overlay is built and drawn in each present. The
+ * PS button opens the pause menu (SetPauseMenu): the polling thread runs it to the end, while
+ * the run loop waits at WaitWhilePaused, and leaves what only the emulation thread can do
+ * (savestates, quitting) for TakeUiAction.
  */
 class EmuWindowVita final : public Frontend::EmuWindow {
 public:
     explicit EmuWindowVita(Core::System& system);
     ~EmuWindowVita() override;
 
-    /// Reads the pad and the touchscreen. Called on the emulation thread once per iteration.
+    /// Reads the pad and the touchscreen, on the thread that presents. A PS button press with
+    /// a pause menu set runs the menu here, until it closes.
     void PollEvents() override;
 
     void SwapBuffers() override;
@@ -47,8 +52,9 @@ public:
     void ForgetGuestScreens() override;
 
     /// Draws the guest's screens, if the renderer has sent any, and whatever the UI wants, and
-    /// presents. `ui` may be null, in which case only the screens are drawn.
-    void Present(Ui* ui);
+    /// presents. `ui` may be null, in which case only the screens are drawn. The interface
+    /// SetUi attached is built first unless `update` is false (the caller built it).
+    void Present(Ui* ui, bool update = true);
 
     /// Hands the interface to SwapBuffers, which builds and draws it from then on. Null
     /// detaches it again.
@@ -56,8 +62,16 @@ public:
         render_ui.store(ui, std::memory_order_release);
     }
 
-    /// The last decision the interface reached inside SwapBuffers, taken by the run loop and
-    /// cleared.
+    /// While a title runs: the interface the PS button opens the pause menu of, on the thread
+    /// that polls. Null before the title shuts down.
+    void SetPauseMenu(Ui* ui) {
+        pause_ui.store(ui, std::memory_order_release);
+    }
+
+    void WaitWhilePaused();
+
+    /// What the pause menu left for the run loop (a Ui::Action: savestates, quitting), taken
+    /// and cleared.
     [[nodiscard]] int TakeUiAction();
 
     /// True once the user has asked to leave.
@@ -85,13 +99,22 @@ public:
     void UpdateCurrentFramebufferLayout();
 
 private:
+    void ReadPad();
     void UpdateTouch();
     void DrawGuestScreens();
+    /// The pause menu, run on the polling thread until it closes; the run loop waits meanwhile.
+    void RunPauseMenu(Ui& ui);
 
     Core::System& system;
 
     std::atomic<Ui*> render_ui{nullptr};
     std::atomic<int> pending_ui_action{0};
+    std::atomic<Ui*> pause_ui{nullptr};
+    /// The PS button as of the last poll, for its press's edge (the polling thread's).
+    bool ps_held{};
+    /// The pause menu is open (under `pause_gate`): the run loop waits on it.
+    Common::CoreCondition pause_gate;
+    bool paused{};
 
     std::atomic<u32> buttons_held{};
     std::atomic<s32> stick_x{}, stick_y{};

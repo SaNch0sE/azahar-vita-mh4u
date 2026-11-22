@@ -17,9 +17,13 @@
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_lcd.h"
 #include "video_core/renderer_base.h"
-#include "video_core/renderer_gxm/vprof.h"
+#ifdef ENABLE_GXM
+#include "video_core/renderer_sgxd/vprof.h"
+#include "video_core/renderer_sgxd/sgxd_rasterizer.h"
+#include "video_core/renderer_sgxd/render_thread.h"
+#include "video_core/renderer_sgxd/renderer_sgxd.h"
+#endif
 #ifdef VITA_DIAGNOSTICS
-#include "video_core/renderer_gxm/gxm_rasterizer.h"
 #include "video_core/renderer_sgxd/vprof_replay.h"
 #endif
 #include "video_core/right_eye_disabler.h"
@@ -55,30 +59,70 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
     };
     impl->pica.SetInterruptHandler(pica_interrupt);
 #ifdef ENABLE_GXM
+    // The renderer's rasterizer runs on the render thread, from its copy of the PICA's state;
+    // the PICA here calls the thread, which queues.
+    auto* const gxm = dynamic_cast<GxmRenderer::RendererGxm*>(impl->renderer.get());
+    ASSERT_MSG(gxm != nullptr, "GPU: the render thread needs the GXM renderer");
+    impl->render = std::make_unique<SgxdRenderer::RenderThread>(
+        impl->pica, impl->render_pica, *gxm,
+        *static_cast<GxmRenderer::RasterizerGxm*>(gxm->Rasterizer()), impl->memory);
+    impl->rasterizer = impl->render.get();
 #endif
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
 }
 
-GPU::~GPU() = default;
+GPU::~GPU() {
+#ifdef ENABLE_GXM
+    // Before the lock it uses goes, and the renderer it runs.
+    impl->render.reset();
+#endif
+}
+
+GPU::RenderHold::RenderHold(GPU& gpu_) : gpu{gpu_} {
+#ifdef ENABLE_GXM
+    gpu.impl->render->Hold();
+#endif
+}
+
+GPU::RenderHold::~RenderHold() {
+#ifdef ENABLE_GXM
+    gpu.impl->render->Release();
+#endif
+}
+
+#ifdef ENABLE_GXM
+SgxdRenderer::RenderThread& GPU::GetRenderThread() {
+    return *impl->render;
+}
+
+void GPU::SyncCaptureHold() {
+    const bool recording = SgxdRenderer::Vprof::Recording();
+    if (recording && !capture_hold) {
+        impl->render->Hold();
+        capture_hold = true;
+    } else if (!recording && capture_hold) {
+        impl->render->Release();
+        capture_hold = false;
+    }
+}
+#endif
 
 void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op) {
 #ifndef VITA_DIAGNOSTICS
     op();
 #else
-    // The time by kind is `perflog`'s, in the diagnostics build only.
+    // The time by kind is `perflog`'s, in the diagnostics build only: the emulation side's
+    // (the PICA's parse and the queueing), the render thread's work is its own line.
     // vprof: the op's number in the recorded frame, 0 outside it.
     const u32 seq = SgxdRenderer::Vprof::OpQueued(static_cast<u32>(kind));
     const auto start = std::chrono::steady_clock::now();
-    const u64 waited = impl->rasterizer->GpuWaitUs();
     GPU_TRACE("op", static_cast<unsigned>(kind));
     SgxdRenderer::Vprof::OpBegin(seq);
     op();
     SgxdRenderer::Vprof::OpEnd(seq);
-    const u64 wait = impl->rasterizer->GpuWaitUs() - waited;
-    GPU_TRACE("done", static_cast<unsigned>(wait));
-    impl->kind_wait_us[k].fetch_add(wait, std::memory_order_relaxed);
+    GPU_TRACE("done");
     impl->kind_us[k].fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - start)
                                    .count()),
@@ -93,83 +137,75 @@ void GPU::Signal(Service::GSP::InterruptId id) {
     if (impl->interrupts_muted) {
         return;
     }
-    if (defer_interrupts) {
-        // Work running without the HLE lock (BeginUnlockedWork): raised by
-        // FlushDeferredInterrupts, as it would have been here, once the lock is back.
-        deferred_interrupts.emplace_back(id, delay);
-        CountHeld();
-        return;
-    }
-    // The vblanks keep core timing's cadence. Every other interrupt comes when the GPU has
-    // done the work sent before it, as the PICA's units raise theirs: no modelled delay, and
-    // not at once while the SGX still runs it.
-    if (id == InterruptId::PDC0 || id == InterruptId::PDC1 || impl->interrupts_now) {
-        GPU_TRACE("irq", static_cast<unsigned>(id));
-        impl->signal_interrupt(id, impl->interrupts_now ? delay : 0);
-        return;
-    }
-    const u64 fence = impl->rasterizer->InterruptFence();
-    if (impl->held_interrupts.empty() && impl->rasterizer->InterruptPoll(fence)) {
+    // The vblanks keep core timing's cadence (VBlankCallback, an event under the HLE lock).
+    if (id == InterruptId::PDC0 || id == InterruptId::PDC1) {
         GPU_TRACE("irq", static_cast<unsigned>(id));
         impl->signal_interrupt(id, 0);
         return;
     }
+    // Every other interrupt comes when the GPU has done the work sent before it, as the PICA's
+    // units raise theirs: no modelled delay, and not while the render thread or the SGX still
+    // runs it. Always held: GSP's command work runs without the HLE lock (parallel cores), and
+    // raising one touches kernel state.
+    const u64 ticket = impl->rasterizer->InterruptFence();
     GPU_TRACE("irq_held", static_cast<unsigned>(id));
-    impl->held_interrupts.emplace_back(id, fence);
-    CountHeld();
-}
-
-void GPU::BeginUnlockedWork() {
-    std::scoped_lock gpu_lock{lock};
-    defer_interrupts = true;
-}
-
-void GPU::EndUnlockedWork() {
-    std::scoped_lock gpu_lock{lock};
-    defer_interrupts = false;
-}
-
-void GPU::FlushDeferredInterrupts() {
-    std::scoped_lock gpu_lock{lock};
-    auto deferred = std::exchange(deferred_interrupts, {});
-    for (const auto& [id, delay] : deferred) {
-        Signal(id, delay);
-    }
+    impl->held_interrupts.push_back({id, ticket});
     CountHeld();
 }
 
 void GPU::CountHeld() {
-    held_count.store(static_cast<u32>(impl->held_interrupts.size() + deferred_interrupts.size()),
-                     std::memory_order_release);
+    const auto& held = impl->held_interrupts;
+    held_front.store(held.empty() ? 0 : held.front().ticket, std::memory_order_release);
+    held_count.store(static_cast<u32>(held.size()), std::memory_order_release);
+}
+
+bool GPU::HasDueInterrupts() const {
+    if (held_count.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+#ifdef ENABLE_GXM
+    // A hold polls the fences only in DeliverInterrupts.
+    if (impl->render->Inline()) {
+        return true;
+    }
+#endif
+    return impl->rasterizer->InterruptPoll(held_front.load(std::memory_order_acquire));
 }
 
 void GPU::DeliverInterrupts() {
-    // The fences grow with the work sent, so the interrupts complete in the order raised.
+#ifdef ENABLE_GXM
+    impl->render->PollHeld();
+#endif
+    // The tickets grow with the work sent, so the interrupts complete in the order raised.
     auto& held = impl->held_interrupts;
-    while (!held.empty() && impl->rasterizer->InterruptPoll(held.front().second)) {
-        const Service::GSP::InterruptId id = held.front().first;
+    while (!held.empty() && impl->rasterizer->InterruptPoll(held.front().ticket)) {
+        const Impl::HeldInterrupt h = held.front();
         held.pop_front();
-        GPU_TRACE("irq", static_cast<unsigned>(id));
-        impl->signal_interrupt(id, 0);
+        GPU_TRACE("irq", static_cast<unsigned>(h.id));
+        impl->signal_interrupt(h.id, 0);
     }
     CountHeld();
 }
 
 bool GPU::WaitHeldInterrupt() {
-    std::scoped_lock gpu_lock{lock};
-    if (impl->held_interrupts.empty()) {
-        return false;
+    u64 ticket;
+    {
+        Common::MulticoreLock gpu_lock{lock};
+        if (impl->held_interrupts.empty()) {
+            return false;
+        }
+        ticket = impl->held_interrupts.front().ticket;
     }
-    impl->rasterizer->InterruptWait(impl->held_interrupts.front().second);
+    // Without the lock: the render thread completes tickets without it, and the other
+    // emulation thread may queue GPU work meanwhile.
+    impl->rasterizer->InterruptWait(ticket);
     return true;
 }
 
 bool GPU::WaitInterrupt() {
-    std::scoped_lock gpu_lock{lock};
-    if (impl->held_interrupts.empty()) {
+    if (!WaitHeldInterrupt()) {
         return false;
     }
-    impl->rasterizer->InterruptWait(impl->held_interrupts.front().second);
     DeliverInterrupts();
     return true;
 }
@@ -212,6 +248,14 @@ void GPU::FlushRegion(PAddr addr, u32 size) {
 
 void GPU::InvalidateRegion(PAddr addr, u32 size) {
     impl->rasterizer->InvalidateRegion(addr, size);
+}
+
+void GPU::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    impl->rasterizer->FlushAndInvalidateRegion(addr, size);
+}
+
+void GPU::SwitchDiskResources(u64 title_id) {
+    impl->rasterizer->SwitchDiskResources(title_id);
 }
 
 void GPU::ClearAll(bool flush) {
@@ -448,6 +492,8 @@ void GPU::WriteReg(VAddr addr, u32 data) {
             // An op like the GSP's commands, numbered with them in a vprof recording.
             RunGpuOp(OpKind::RegWrite, [this, index, data] {
                 impl->pica.regs.reg_array[index] = data;
+                // As a command list's write marks it: the render thread's copy takes it.
+                impl->pica.dirty_regs.Set(index - static_cast<u32>(GPU_REG_INDEX(internal)));
                 if (index == GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[0])) {
                     SubmitCmdList(0);
                 } else if (index == GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[1])) {
@@ -512,7 +558,11 @@ void GPU::ApplyPerProgramSettings(u64 program_ID) {
             break;
         }
     }
+#ifdef ENABLE_GXM
+    impl->render->SetRendererAccurateMul(use_accurate_mul);
+#else
     impl->rasterizer->SetAccurateMul(use_accurate_mul);
+#endif
 }
 
 void GPU::SubmitCmdList(u32 index) {
@@ -615,10 +665,12 @@ void GPU::RunDma(const std::vector<DmaRun>& runs) {
 
 #ifdef VITA_DIAGNOSTICS
 void GPU::VprofReplay(const std::string& capture, const std::string& first) {
-    std::scoped_lock gpu_lock{lock};
+    // The replay runs the GPU's work on this thread, the render thread held: its requests read
+    // the rasterizer between ops.
+    const auto hold = HoldRender();
     // The guest sees none of the replay's interrupts.
     impl->interrupts_muted = true;
-    auto& rasterizer = *static_cast<GxmRenderer::RasterizerGxm*>(impl->rasterizer);
+    auto& rasterizer = impl->render->Rasterizer();
     SgxdRenderer::Vprof::ReplayHost host{
         impl->pica,
         impl->memory,
@@ -702,8 +754,10 @@ std::vector<GPU::DmaRun> GPU::DmaRuns(VAddr src, VAddr dst, u32 size) {
 
 void GPU::KeepUncached(PAddr addr, u32 size, bool overwritten) {
     // Rare: a page moves once and stays until the GPU leaves it unused (ReturnUncached). The
-    // move waits for the GPU's work first, so the GPU is idle under it.
+    // move runs here, the guest stopped, with the render thread held after the work queued
+    // before it; the GPU's mapping follows in its own order (GuestGpuMemory), without an idle.
     if (impl->renderer->WouldMakeUncached(addr, size)) {
+        const auto hold = HoldRender();
         impl->renderer->MakeUncached(addr, size, overwritten);
     }
 }
@@ -727,15 +781,19 @@ void GPU::RunMemoryTransfer(const Pica::DisplayTransferConfig& config,
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     GPU_TRACE("vblank");
     // vprof: a recorded frame starts with the PICA's state.
-    if (GxmRenderer::Vprof::VBlank()) {
+    const bool frame_starts = SgxdRenderer::Vprof::VBlank();
+#ifdef ENABLE_GXM
+    SyncCaptureHold();
+#endif
+    if (frame_starts) {
         RunGpuOp(OpKind::RegWrite, [this] {
             // The capture records the geometry unit's setup as its own (FlushGsMirror).
             impl->pica.FlushGsMirror();
             SgxdRenderer::Vprof::State(impl->pica);
 #ifdef VITA_DIAGNOSTICS
             // What the frame's passes can start from: the rasterizer's clears, surfaces and
-            // depth stores (RSTA).
-            static_cast<GxmRenderer::RasterizerGxm*>(impl->rasterizer)->VprofFrameStart();
+            // depth stores (RSTA). The render thread is held (SyncCaptureHold).
+            impl->render->Rasterizer().VprofFrameStart();
 #endif
         });
     }
@@ -744,8 +802,9 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     Signal(Service::GSP::InterruptId::PDC1);
 
     // Moved pages the GPU has not used for a while go back to cached FCRAM first, so that the
-    // moves below can reuse their pool pages. Rare, as a move is: the GPU idle.
+    // moves below can reuse their pool pages. Rare, as a move is: the render thread held.
     if (impl->renderer->UncachedFrameEnded()) {
+        const auto hold = HoldRender();
         impl->renderer->ReturnUncached();
     }
     // Vertex and index buffers the GPU read from cached FCRAM since the last vblank move to
@@ -769,80 +828,30 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                      f.stride * (i == 0 ? 400u : 320u), false);
     }
 
-    // Present renderered frame.
+    // Present renderered frame, as the LCD's registers are now.
+    const std::array<Pica::FramebufferConfig, 2> fb{regs.framebuffer_config[0],
+                                                    regs.framebuffer_config[1]};
+    const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
+                                              impl->pica.regs_lcd.color_fill_bottom};
+#ifdef ENABLE_GXM
+    // On the render thread, after the work before it; it drops one too soon after the last.
+    impl->render->Present(fb, fill);
+#else
     // A present has no guest-visible effect: well past the display's rate it is dropped. 12 ms,
     // not a frame's 16.7: at 100% the guest's VBlanks jitter around the frame, and a frame's cap
     // dropped a quarter of them.
     const auto now = std::chrono::steady_clock::now();
     if (now - impl->last_present >= std::chrono::microseconds(12000)) {
         impl->last_present = now;
-        const std::array<Pica::FramebufferConfig, 2> fb{regs.framebuffer_config[0],
-                                                        regs.framebuffer_config[1]};
-        const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
-                                                  impl->pica.regs_lcd.color_fill_bottom};
-        GPU_TRACE("present");
         impl->renderer->PresentFrame(fb, fill);
-        GPU_TRACE("presented");
         impl->rasterizer->GpuIdle();
-#ifdef VITA_DIAGNOSTICS
-        impl->present_us.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                       std::chrono::steady_clock::now() - now)
-                                       .count()),
-                                   std::memory_order_relaxed);
-        impl->presents.fetch_add(1, std::memory_order_relaxed);
-#endif
-    } else {
-        impl->presents_dropped.fetch_add(1, std::memory_order_relaxed);
     }
+#endif
+    // The frame limiter and the window's events stay on this thread.
     impl->renderer->EndFrame();
 
     // Reschedule recurrent event
     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
-}
-
-void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {
-    std::scoped_lock gpu_lock{lock};
-    // Reset the renderer (this will destroy OpenGL resources)
-    impl->renderer.reset();
-
-    // Create a new renderer
-    impl->renderer =
-        VideoCore::CreateRenderer(emu_window, secondary_window, impl->pica, impl->system);
-    impl->rasterizer = impl->renderer->Rasterizer();
-
-    // Rebind the rasterizer to the PICA GPU
-    impl->pica.BindRasterizer(impl->rasterizer);
-
-    // Re-apply per-game configuration and reload disk shader cache
-    u64 program_id{};
-    impl->system.GetAppLoader().ReadProgramId(program_id);
-    ApplyPerProgramSettings(program_id);
-    if (Settings::values.use_disk_shader_cache) {
-        impl->renderer->Rasterizer()->LoadDefaultDiskResources(false, nullptr);
-    }
-
-    // Mark ALL GPU registers as dirty so current state gets uploaded to new renderer
-    impl->pica.dirty_regs.SetAllDirty();
-
-    // Also mark shader setups as dirty so uniforms get re-uploaded and
-    // stale pointers to the old rasterizer's JIT cache are cleared.
-    impl->pica.vs_setup.uniforms_dirty = true;
-    impl->pica.vs_setup.cached_shader = nullptr;
-    impl->pica.gs_setup.uniforms_dirty = true;
-    impl->pica.gs_setup.cached_shader = nullptr;
-
-    // Mark all cached LUT/table state in pica as dirty
-    impl->pica.lighting.lut_dirty = impl->pica.lighting.LutAllDirty;
-    impl->pica.fog.lut_dirty = true;
-    impl->pica.proctex.table_dirty = impl->pica.proctex.TableAllDirty;
-}
-
-void GPU::ReleaseRenderer() {
-    std::scoped_lock gpu_lock{lock};
-    // Just reset the renderer to release OpenGL resources
-    // Don't null out rasterizer pointer as it will become dangling
-    impl->renderer.reset();
-    LOG_INFO(HW_GPU, "Renderer released for context destroy");
 }
 
 template <class Archive>

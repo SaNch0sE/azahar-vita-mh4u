@@ -37,6 +37,10 @@ namespace Frontend {
 class EmuWindow;
 }
 
+namespace SgxdRenderer {
+class RenderThread;
+}
+
 namespace VideoCore {
 
 /// Measured on hardware to be 2240568 timer cycles or 4481136 ARM11 cycles
@@ -63,6 +67,9 @@ public:
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
     void InvalidateRegion(PAddr addr, u32 size);
+
+    /// Both, in one call
+    void FlushAndInvalidateRegion(PAddr addr, u32 size);
 
     /// Flushes and invalidates all memory in the rasterizer cache and removes any leftover state.
     void ClearAll(bool flush);
@@ -106,46 +113,60 @@ public:
     /// The guest has nothing to run: waits for the oldest held interrupt's GPU work and raises
     /// what has completed. False when none is held (core timing may idle ahead then).
     bool WaitInterrupt();
-    /// Parallel cores: WaitInterrupt's wait alone, under this lock only, so the HLE lock can be
-    /// let go meanwhile; the next DeliverInterrupts raises what completed. False when none is
-    /// held.
+    /// Parallel cores: WaitInterrupt's wait alone, without the HLE lock; the next
+    /// DeliverInterrupts raises what completed. False when none is held.
     bool WaitHeldInterrupt();
 
     /**
-     * The GPU's own lock. Every entry point takes it (recursively), as do memory's rasterizer
-     * flushes and the frontend's presents, so that with parallel cores the work of GSP's command
-     * queue can run without the HLE lock (GSP_GPU::TriggerCmdReqQueue) while the other core's
-     * svcs go on. Lock order: the HLE lock, then this one; never the other way.
+     * The emulation side's lock over the GPU: the PICA (command lists, registers, shader setups),
+     * the interrupts held, and the render thread's queue, which every entry point writes to.
+     * Taken recursively. With parallel cores the work of GSP's command queue runs under it
+     * without the HLE lock (GSP_GPU::TriggerCmdReqQueue). Lock order: the HLE lock, then this
+     * one; never the other way. The render thread itself never takes it.
      */
     std::recursive_mutex& Lock() const {
         return lock;
     }
-    /// Between these (under Lock, without the HLE lock) the interrupts the work raises are kept;
-    /// FlushDeferredInterrupts raises them, in order, once the HLE lock is held again: raising
-    /// one touches kernel state.
-    void BeginUnlockedWork();
-    void EndUnlockedWork();
-    void FlushDeferredInterrupts();
-    /// Whether DeliverInterrupts has anything to deliver, read without the lock (parallel cores:
-    /// a boundary that takes no lock while nothing is due, System::QuietBoundary).
+    /// Whether any interrupt is held, read without the lock.
     [[nodiscard]] bool HasHeldInterrupts() const {
         return held_count.load(std::memory_order_acquire) != 0;
     }
+    /// Whether DeliverInterrupts has one to raise now, read without the lock (parallel cores: a
+    /// boundary that takes no lock while nothing is due, System::QuietBoundary).
+    [[nodiscard]] bool HasDueInterrupts() const;
+
+    /**
+     * The GPU's lock, and with the GXM renderer its render thread held (RenderThread::Hold):
+     * for the guard's life the rasterizer, the renderer and sgxd are the caller's, with
+     * everything queued before done. For the work that cannot run on the render thread or
+     * beside it: FCRAM page moves (the guest stopped), the frontend's presents and settings,
+     * savestates, `perflog`'s counters.
+     */
+    class RenderHold {
+    public:
+        explicit RenderHold(GPU& gpu);
+        ~RenderHold();
+        RenderHold(const RenderHold&) = delete;
+        RenderHold& operator=(const RenderHold&) = delete;
+
+    private:
+        GPU& gpu;
+    };
+    [[nodiscard]] RenderHold HoldRender() {
+        return RenderHold{*this};
+    }
+#ifdef ENABLE_GXM
+    /// The render thread, the rasterizer the PICA calls (renderer_sgxd/render_thread.h).
+    [[nodiscard]] SgxdRenderer::RenderThread& GetRenderThread();
+#endif
+
+    /// Switches the rasterizer's disk shader cache to the title's, in order with the GPU's work.
+    void SwitchDiskResources(u64 title_id);
 
     /// What a GPU operation is, for `perflog`'s split of the GPU's work and vprof's numbering.
     enum class OpKind : u32 { CmdList, RegWrite, Fill, Transfer, Dma, Count };
 
-    /// Since the last call (diagnostics: `perflog`): the GPU operations' time by kind, the part
-    /// of it spent waiting for the GPU, and the presents' time; presents dropped in any build.
-    struct OpStats {
-        u64 kind_us[static_cast<std::size_t>(OpKind::Count)];
-        u32 kind_ops[static_cast<std::size_t>(OpKind::Count)];
-        u64 kind_wait_us[static_cast<std::size_t>(OpKind::Count)];
-        u64 present_us;
-        u32 presents;
-        u32 presents_dropped;
-    };
-    OpStats TakeOpStats();
+#ifdef VITA_DIAGNOSTICS
     /// The guest goes idle (every core waiting: its clock jumps to the next event). Each command
     /// list's scan since the last call is held against the emulation thread's time between the
     /// scan's end and this idle: what a scan off the emulation thread could hide, if the guest
@@ -202,9 +223,19 @@ private:
     /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).
     void RunGpuOp(OpKind kind, const std::function<void()>& op);
     /// Raises a GSP interrupt: a vblank at once; any other once the GPU has done the work sent
-    /// before it (held until DeliverInterrupts or WaitInterrupt sees it done), or at once after
-    /// delay with gxm_flags `irqnow`, as upstream. None while vprof's replay runs.
-    void Signal(Service::GSP::InterruptId id, u64 delay);
+    /// before it (held, with the rasterizer's ticket for that work, until DeliverInterrupts or
+    /// WaitInterrupt sees it done), never here: this may run without the HLE lock. No modelled
+    /// delay: upstream's timing model is gone. None while vprof's replay runs.
+    void Signal(Service::GSP::InterruptId id);
+    /// Updates held_count and held_front, under the lock.
+    void CountHeld();
+#ifdef ENABLE_GXM
+    /// vprof's capture records its frame with the render thread held, so that the frame's ops
+    /// and the draws they make interleave as they run: on from the vblank the frame starts at
+    /// to the one it ends at.
+    void SyncCaptureHold();
+    bool capture_hold = false;
+#endif
 
     friend class boost::serialization::access;
     template <class Archive>
@@ -218,13 +249,10 @@ private:
     std::unique_ptr<Impl> impl;
 
     mutable std::recursive_mutex lock;
-    std::atomic<u32> held_count{0}; ///< held_interrupts' size plus the deferred ones
-    bool defer_interrupts = false;
-    std::vector<std::pair<Service::GSP::InterruptId, u64>> deferred_interrupts;
+    std::atomic<u32> held_count{0}; ///< held_interrupts' size
+    std::atomic<u64> held_front{0}; ///< the oldest held interrupt's ticket
 
     PAddr VirtualToPhysicalAddress(VAddr addr);
-    /// Updates held_count, under the lock.
-    void CountHeld();
 };
 
 } // namespace VideoCore

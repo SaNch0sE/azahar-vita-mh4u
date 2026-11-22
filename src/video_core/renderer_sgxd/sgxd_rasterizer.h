@@ -162,6 +162,7 @@ public:
     u64 InterruptFence() override;
     bool InterruptPoll(u64 fence) override;
     void InterruptWait(u64 fence) override;
+    void InterruptKick(u64 fence);
     u64 GpuWaitUs() const override;
 #endif
     std::vector<std::pair<PAddr, u32>> TakeCachedReads() override;
@@ -353,10 +354,6 @@ private:
     /// through two stream-out renders, then the triangles as the draw's vertices (the SGX has no
     /// geometry stage, so the geometry program runs as a vertex program that stores what it emits).
     VertexStage GeometryStage(bool is_indexed, const Describe& describe);
-    /// gxm_flags vsprobe=N: draw N's vertex program run with StoreOutputs and upstream's
-    /// interpreter run on the CPU for the same vertices (up to 64), every output component
-    /// that differs logged. A draw without a geometry shader or immediate vertices.
-    void VsProbe(bool is_indexed, u32 count, const Describe& describe);
     /// Whether a draw writes every pixel of a width x height target whatever was there: two
     /// triangles (4 or 6 vertices, positions from upstream's interpreter) covering it whole,
     /// neither culled nor clipped, and an output merger that takes nothing from the target

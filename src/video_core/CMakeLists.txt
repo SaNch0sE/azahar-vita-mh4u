@@ -126,6 +126,8 @@ if (ENABLE_GXM)
             renderer_gxm/usse/usse_ir.h
             renderer_gxm/usse/vs_usse_gen.cpp
             renderer_gxm/usse/vs_usse_gen.h
+            renderer_gxm/render_thread.cpp
+            renderer_gxm/render_thread.h
             renderer_gxm/renderer_gxm.cpp
             renderer_gxm/renderer_gxm.h
             renderer_gxm/sgxd_backend.cpp

@@ -297,6 +297,8 @@ struct PicaCore::Dispatch {
     static void VsOutputMask(PicaCore& p, u32, u32 value, bool&) {
         if (GsMirrorsVs(p)) {
             p.regs.internal.gs.output_mask.Assign(value);
+            // The rasterizer reads it, through the sgxd render thread's copy.
+            p.dirty_regs.Set(PICA_REG_INDEX(gs.output_mask));
         }
     }
 
@@ -322,8 +324,9 @@ struct PicaCore::Dispatch {
         const bool mirror = MirrorsVsWrite(p);
         const auto index = p.vs_setup.WriteUniformFloatReg(p.regs.internal.vs, value);
         p.dirty_regs.Set(PICA_REG_INDEX(vs.uniform_setup));
-        if (GsMirrorsVs(p) && index) {
-            p.gs_setup.uniforms.f[index.value()] = p.vs_setup.uniforms.f[index.value()];
+        if (mirror && index) {
+            LogWords(p.gs_mirror.f, *index, 1);
+            p.gs_mirror.pending = true;
         }
     }
 
@@ -331,11 +334,9 @@ struct PicaCore::Dispatch {
         const bool mirror = MirrorsVsWrite(p);
         const auto range = p.vs_setup.WriteUniformFloatRegRange(p.regs.internal.vs, values, count);
         p.dirty_regs.Set(PICA_REG_INDEX(vs.uniform_setup));
-        if (range && GsMirrorsVs(p)) {
-            for (u32 i = 0; i < range->count; ++i) {
-                const u32 idx = range->first_index + i;
-                p.gs_setup.uniforms.f[idx] = p.vs_setup.uniforms.f[idx];
-            }
+        if (range && mirror) {
+            LogWords(p.gs_mirror.f, range->first_index, range->count);
+            p.gs_mirror.pending = true;
         }
     }
 
@@ -981,7 +982,12 @@ void PicaCore::SubmitImmediate(u32 value) {
     // Retrieve the attribute and place it in the default attribute buffer.
     const auto attribute = immediate.queue.Get();
     if (setup.index < IMMEDIATE_MODE_INDEX) {
-        input_default_attributes[setup.index] = attribute;
+        // Most rewrites hold the value already, and a change sends the whole array to the render
+        // thread with the next draw.
+        if (input_default_attributes[setup.index] != attribute) {
+            input_default_attributes[setup.index] = attribute;
+            default_attributes_changed = true;
+        }
         setup.index++;
         dirty_regs.Set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index));
         return;

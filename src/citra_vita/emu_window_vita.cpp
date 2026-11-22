@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <psp2/ctrl.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/touch.h>
 
 #include "citra_vita/emu_window_vita.h"
@@ -210,6 +211,72 @@ double ScriptElapsed() {
 } // Anonymous namespace
 
 void EmuWindowVita::PollEvents() {
+    ReadPad();
+    UpdateTouch();
+    // The PS button, edge triggered, opens the pause menu over a running title. No guest
+    // binding reads it, so the title never sees the press.
+    const bool ps = (buttons_held.load(std::memory_order_relaxed) & SCE_CTRL_PSBUTTON) != 0;
+    const bool pressed = ps && !ps_held;
+    ps_held = ps;
+    if (pressed) {
+        if (Ui* const ui = pause_ui.load(std::memory_order_acquire)) {
+            RunPauseMenu(*ui);
+        }
+    }
+}
+
+void EmuWindowVita::RunPauseMenu(Ui& ui) {
+    {
+        std::scoped_lock lk{pause_gate};
+        paused = true;
+    }
+    ui.OpenPauseMenu();
+    LOG_INFO(Frontend, "pause menu: open");
+    Ui::Action action = Ui::Action::None;
+    while (action == Ui::Action::None && !IsQuitRequested()) {
+        ReadPad();
+        UpdateTouch();
+        ps_held = (buttons_held.load(std::memory_order_relaxed) & SCE_CTRL_PSBUTTON) != 0;
+        // A frame a refresh: the present waits for the frame before it to be on screen, and is
+        // dropped while that one still renders, so wait for it here instead.
+        while (SgxdPresent::Busy()) {
+            sceKernelDelayThread(1000);
+        }
+        action = ui.Update();
+        Present(&ui, false);
+    }
+    LOG_INFO(Frontend, "pause menu: closed, action {}", static_cast<int>(action));
+    switch (action) {
+    case Ui::Action::SaveState:
+    case Ui::Action::LoadState:
+        ui.EnterGame();
+        pending_ui_action.store(static_cast<int>(action), std::memory_order_release);
+        break;
+    case Ui::Action::QuitGame:
+    case Ui::Action::ExitApplication:
+        // The run loop shuts the title down: no menu opens again, and the presents until then
+        // draw no interface (Update has left the pause menu for the game list).
+        pause_ui.store(nullptr, std::memory_order_release);
+        render_ui.store(nullptr, std::memory_order_release);
+        pending_ui_action.store(static_cast<int>(action), std::memory_order_release);
+        break;
+    default:
+        // Resume: Update has gone back to the game.
+        break;
+    }
+    std::scoped_lock lk{pause_gate};
+    paused = false;
+    pause_gate.NotifyAll();
+}
+
+void EmuWindowVita::WaitWhilePaused() {
+    std::scoped_lock lk{pause_gate};
+    while (paused) {
+        pause_gate.WaitFor(std::chrono::milliseconds(100));
+    }
+}
+
+void EmuWindowVita::ReadPad() {
     SceCtrlData pad{};
     if (sceCtrlPeekBufferPositive(0, &pad, 1) > 0) {
         if (!input_script.Loaded()) {
@@ -231,7 +298,6 @@ void EmuWindowVita::PollEvents() {
         stick_x.store(pad.lx, std::memory_order_relaxed);
         stick_y.store(pad.ly, std::memory_order_relaxed);
     }
-    UpdateTouch();
 }
 
 void EmuWindowVita::UpdateTouch() {
@@ -341,19 +407,17 @@ int EmuWindowVita::TakeUiAction() {
     return pending_ui_action.exchange(0, std::memory_order_acq_rel);
 }
 
-void EmuWindowVita::Present(Ui* ui) {
+void EmuWindowVita::Present(Ui* ui, bool update) {
     const auto mark = [&t](u32 part) {
         present_us[part].fetch_add(Since(t), std::memory_order_relaxed);
     };
 #else
     const auto mark = [](u32) {};
 #endif
-    // The decision the interface reaches is published for the run loop.
-    if (ui != nullptr && render_ui.load(std::memory_order_acquire) == ui) {
-        const auto action = ui->Update();
-        if (action != Ui::Action::None) {
-            pending_ui_action.store(static_cast<int>(action), std::memory_order_release);
-        }
+    // The attached interface over a running title is the stats overlay, which asks for
+    // nothing: the pause menu runs in RunPauseMenu.
+    if (update && ui != nullptr && render_ui.load(std::memory_order_acquire) == ui) {
+        [[maybe_unused]] const auto action = ui->Update();
     }
     mark(0);
     // The frame before still rendering: this one is dropped, nothing waits for the GPU.

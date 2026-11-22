@@ -27,7 +27,11 @@ class EmuWindowVita;
  * pre-launch and in-game paths with the in-game one showing only what can be changed while a
  * title runs, and gamepad navigation as the primary input with touch alongside it.
  *
- * Every method here runs on the emulation thread, which is the thread that presents.
+ * While a title runs the interface is the sgxd render thread's (SgxdRenderer::RenderThread), as
+ * the window is: it builds and draws the stats overlay in each present, and runs the pause menu
+ * the PS button opens (EmuWindowVita::PollEvents). The run loop reads only SelectedSlot, after
+ * the menu has closed. Before and after a title, every method runs on the emulation thread,
+ * which then presents.
  */
 class Ui {
 public:
@@ -51,11 +55,6 @@ public:
 
     /// Issues the built frame's draw commands. Must be called inside an SgxdPresent frame.
     void Draw();
-
-    /// True while a menu owns the input and the emulation should not advance.
-    [[nodiscard]] bool MenuOpen() const {
-        return state != State::InGame;
-    }
 
     /// The game the user chose, valid after Action::LaunchGame.
     [[nodiscard]] const std::string& SelectedGamePath() const {

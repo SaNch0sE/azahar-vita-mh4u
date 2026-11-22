@@ -955,6 +955,7 @@ void RasterizerSgxd::GpuIdle() {
     backend.RenderFinish();
 }
 
+
 u64 RasterizerSgxd::InterruptFence() {
     const SgxdBackend::InterruptFence f = backend.InterruptFenceNow();
     return u64{f.render} << 32 | f.ptla;
@@ -962,6 +963,10 @@ u64 RasterizerSgxd::InterruptFence() {
 
 bool RasterizerSgxd::InterruptPoll(u64 fence) {
     return backend.InterruptPoll({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
+}
+
+void RasterizerSgxd::InterruptKick(u64 fence) {
+    backend.InterruptKick({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
 }
 
 void RasterizerSgxd::InterruptWait(u64 fence) {
@@ -3687,6 +3692,11 @@ void RasterizerSgxd::FlushImmediate() {
 
 bool RasterizerSgxd::AccelerateDrawBatch(bool is_indexed) {
     FlushImmediate();
+#ifdef VITA_DIAGNOSTICS
+    {
+        const auto& fb = regs.framebuffer.framebuffer;
+    }
+#endif
     return Draw(is_indexed, nullptr, 0);
 }
 
@@ -4462,6 +4472,90 @@ bool RasterizerSgxd::CoversTarget(bool is_indexed, const float* immediate, u32 c
     return (left_out[0] ^ left_out[1]) == 3;
 }
 
+#ifdef VITA_DIAGNOSTICS
+void RasterizerGxm::VsCpuCheck(bool is_indexed, const Describe& describe) {
+    static u32 checked = 0, reported = 0;
+    if (reported >= 8) {
+        return;
+    }
+    const auto info = AnalyzeVertexArray(is_indexed);
+    const auto engine = Pica::CreateEngine(false);
+    Pica::ShaderUnit unit;
+    engine->SetupBatch(pica.vs_setup, regs.vs.main_offset);
+    const Pica::VertexLoader loader(memory, regs.pipeline);
+    const auto& va = regs.pipeline.vertex_attributes;
+    const PAddr base = va.GetPhysicalBaseAddress();
+    const u32 outputs = static_cast<u32>(std::popcount(regs.vs.output_mask.Value()));
+    checked++;
+    for (u32 v = info.vs_input_index_min; v <= info.vs_input_index_max; v++) {
+        Pica::AttributeBuffer input{}, out{};
+        loader.LoadVertex(base, v - info.vs_input_index_min, v, input,
+                          pica.input_default_attributes);
+        unit.LoadInput(regs.vs, input);
+        engine->Run(pica.vs_setup, unit);
+        unit.WriteOutput(regs.vs, out);
+        u32 bad = ~0u;
+        for (u32 k = 0; k < outputs * 4 && bad == ~0u; k++) {
+            if (!std::isfinite(out[k / 4][k % 4].ToFloat32())) {
+                bad = k;
+            }
+        }
+        if (bad == ~0u) {
+            continue;
+        }
+        reported++;
+        LOG_WARNING(Render, "vscpu: draw {} ({}): {}: vertex {} of {}-{}: output {} lane {} is {} "
+                            "on the CPU's interpreter",
+                    draws + 1, checked, describe(), v, info.vs_input_index_min,
+                    info.vs_input_index_max, bad / 4, "xyzw"[bad % 4],
+                    out[bad / 4][bad % 4].ToFloat32());
+        std::string in;
+        for (u32 a = 0; a <= va.max_attribute_index && a < 16; a++) {
+            in += fmt::format(" a{}{}->v{}=({} {} {} {})", a,
+                              va.IsDefaultAttribute(a) ? "(default)" : "",
+                              regs.vs.GetRegisterForAttribute(a), input[a][0].ToFloat32(),
+                              input[a][1].ToFloat32(), input[a][2].ToFloat32(),
+                              input[a][3].ToFloat32());
+        }
+        LOG_WARNING(Render, "vscpu: draw {}: inputs{}", draws + 1, in);
+        for (u32 l = 0; l < 12; l++) {
+            const auto& ld = va.attribute_loaders[l];
+            if (ld.component_count == 0 || ld.byte_count == 0) {
+                continue;
+            }
+            const PAddr at = base + ld.data_offset + v * ld.byte_count;
+            const u8* const bytes = memory.GetPhysicalPointer(at);
+            std::string raw;
+            for (u32 n = 0; bytes && n < std::min<u32>(ld.byte_count, 48); n++) {
+                raw += fmt::format("{:02x}", bytes[n]);
+            }
+            LOG_WARNING(Render, "vscpu: draw {}: loader {} at {:#x} stride {}: {}", draws + 1, l,
+                        at, static_cast<u32>(ld.byte_count), raw);
+        }
+        std::string uf;
+        for (u32 i = 0; i < pica.vs_setup.uniforms.f.size(); i++) {
+            const auto& f = pica.vs_setup.uniforms.f[i];
+            if (!std::isfinite(f[0].ToFloat32()) || !std::isfinite(f[1].ToFloat32()) ||
+                !std::isfinite(f[2].ToFloat32()) || !std::isfinite(f[3].ToFloat32())) {
+                uf += fmt::format(" c{}=({} {} {} {})", i, f[0].ToFloat32(), f[1].ToFloat32(),
+                                  f[2].ToFloat32(), f[3].ToFloat32());
+            }
+        }
+        LOG_WARNING(Render, "vscpu: draw {}: non-finite float uniforms:{}; main {:#x}, "
+                            "bools {:#x}, ints {} {} {} {}",
+                    draws + 1, uf.empty() ? " none" : uf, regs.vs.main_offset.Value(),
+                    regs.vs.bool_uniforms.Value(), pica.vs_setup.uniforms.i[0].x,
+                    pica.vs_setup.uniforms.i[1].x, pica.vs_setup.uniforms.i[2].x,
+                    pica.vs_setup.uniforms.i[3].x);
+        return;
+    }
+    if (checked <= 4) {
+        LOG_INFO(Render, "vscpu: draw {} ({}): {}: vertices {}-{} all finite on the CPU", draws + 1,
+                 checked, describe(), info.vs_input_index_min, info.vs_input_index_max);
+    }
+}
+#endif
+
 void RasterizerGxm::VsProbe(bool is_indexed, u32 count, const Describe& describe) {
     const u32 outputs = static_cast<u32>(std::popcount(regs.vs.output_mask.Value()));
     VertexStage a0 =
@@ -4504,7 +4598,7 @@ void RasterizerGxm::VsProbe(bool is_indexed, u32 count, const Describe& describe
 
     // The loaders: each attribute's register, format, elements and offset, and the first
     // vertex's bytes, to tell an unpack's error from the program's.
-    {
+    const auto log_loaders = [&] {
         const auto& va = regs.pipeline.vertex_attributes;
         for (u32 l = 0; l < 12; l++) {
             const auto& loader = va.attribute_loaders[l];
@@ -4529,7 +4623,8 @@ void RasterizerGxm::VsProbe(bool is_indexed, u32 count, const Describe& describe
             LOG_INFO(Render, "vsprobe {}: loader {} at {:#x} stride {}:{}; vertex {}: {}", draws + 1,
                      l, at, static_cast<u32>(loader.byte_count), line, a0.vertex_min, raw);
         }
-    }
+    };
+    log_loaders();
     // Upstream's interpreter over the same vertices.
     const auto engine = Pica::CreateEngine(false);
     Pica::ShaderUnit unit;
@@ -4537,6 +4632,18 @@ void RasterizerGxm::VsProbe(bool is_indexed, u32 count, const Describe& describe
     const Pica::VertexLoader loader(memory, regs.pipeline);
     const PAddr base = regs.pipeline.vertex_attributes.GetPhysicalBaseAddress();
     u32 wrong = 0, compared = 0;
+    // Every vertex's outputs on the GPU, for a non-finite one past the 64 compared.
+    for (u32 j = 0; j < vertices; j++) {
+        const float* got = reinterpret_cast<const float*>(vs_out.cpu + j * vsize);
+        for (u32 k = 0; k < outputs * 4; k++) {
+            if (!std::isfinite(got[k])) {
+                LOG_INFO(Render, "vsprobe {}: {}: vertex {} output {} lane {} is {} on the GPU",
+                         draws + 1, describe(), a0.vertex_min + j, k / 4, "xyzw"[k % 4], got[k]);
+                j = vertices;
+                break;
+            }
+        }
+    }
     for (u32 j = 0; j < std::min(vertices, 64u); j++) {
         Pica::AttributeBuffer input{}, want{};
         loader.LoadVertex(base, j, a0.vertex_min + j, input, pica.input_default_attributes);
@@ -4994,26 +5101,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     }
     pass_depth_used |= uses_depth;
 
-    static const u32 vs_probe = GxmFlagValue("vsprobe");
-    // attrprobe: the first four draws with BYTE or SHORT attributes, for UnpackInt's lanes.
-    const auto signed_attributes = [&] {
-        const auto& va = pipeline.vertex_attributes;
-        for (u32 a = 0; a <= va.max_attribute_index; a++) {
-            const auto f = va.GetFormat(a);
-            if (va.GetNumElements(a) != 0 &&
-                (f == Pica::PipelineRegs::VertexAttributeFormat::BYTE ||
-                 f == Pica::PipelineRegs::VertexAttributeFormat::SHORT)) {
-                return true;
-            }
-        }
-        return false;
-    };
-    static const bool attr_probe = GxmFlag("attrprobe");
-    if (!immediate && pipeline.use_gs == Pica::PipelineRegs::UseGS::No &&
-        ((vs_probe != 0 && draws + 1 >= vs_probe && draws + 1 < vs_probe + 4) ||
-         (attr_probe && attr_probes < 4 && signed_attributes() && ++attr_probes))) {
-        VsProbe(is_indexed, count, describe);
-    }
     // --- the vertex stage: the loaders' attributes into the vertex program, or with a
     // geometry shader, the triangles its passes stored ---
     const VertexStage stage = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes
@@ -5025,69 +5112,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     }
     const VertexProgram& vp = *stage.vp;
     const Usse::GxpProgram& vg = vp.gxp;
-#ifdef VITA_DIAGNOSTICS
-    // drawring: the last draws, printed when a render stops (SgxdBackend::fault_hook).
-    static const bool draw_ring_on = GxmFlag("drawring");
-    if (draw_ring_on) {
-        // Before the hook already there (sgxd_present's), which PrintDrawRing calls after.
-        if (SgxdBackend::fault_hook != PrintDrawRing) {
-            draw_ring_chained = SgxdBackend::fault_hook;
-            SgxdBackend::fault_hook = PrintDrawRing;
-        }
-        // The draw's PICA programs, each kept once for the fault's azahar-sgxd-programs.bin,
-        // and the integer and bool uniforms a loop's count and a branch come from.
-        std::string units;
-        for (Pica::ShaderSetup* setup : {&pica.vs_setup, &pica.gs_setup}) {
-            if (setup == &pica.gs_setup && pipeline.use_gs != Pica::PipelineRegs::UseGS::Yes) {
-                break;
-            }
-            const u64 hash = setup->GetProgramCodeHash();
-            if (!ring_programs.contains(hash)) {
-                std::vector<u32>& keep = ring_programs[hash];
-                keep.push_back(setup->entry_point);
-                keep.insert(keep.end(), setup->GetProgramCode().begin(),
-                            setup->GetProgramCode().end());
-                keep.insert(keep.end(), setup->GetSwizzleData().begin(),
-                            setup->GetSwizzleData().end());
-            }
-            const auto& u = setup->uniforms;
-            u32 b = 0;
-            for (u32 k = 0; k < 16; k++) {
-                b |= (u.b[k] ? 1u : 0u) << k;
-            }
-            units += fmt::format("; {} {:016x} entry {:#x} b {:04x} i", setup == &pica.vs_setup ? "VS" : "GS",
-                                 hash, setup->entry_point, b);
-            for (const auto& i : u.i) {
-                units += fmt::format(" {},{},{}", i.x, i.y, i.z);
-            }
-        }
-        draw_ring[draw_ring_next++ % draw_ring.size()] =
-            fmt::format("pass {} draw {}: {}; VS {:016x}{} doutu {:#010x}, {} temps, secondary "
-                        "{:#010x}{}",
-                        passes, backend.PassDraws() + 1, describe(),
-                        const_cast<Pica::ShaderSetup*>(stage.setup)->GetProgramCodeHash(),
-                        pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes ? " (GS)" : "",
-                        vp.primary_doutu0, vg.temp_count, vp.secondary_doutu0, units);
-    }
-#endif
-
-#ifdef VITA_DIAGNOSTICS
-    // skipfrom=N / skipto=M: a pass's draws N..M (from 1) are left out, a hang's bisection.
-    // Counted per pass with the draws left out (PassDraws counts only those drawn).
-    static const u32 skip_from = GxmFlagValue("skipfrom");
-    static const u32 skip_to = GxmFlagValue("skipto");
-    static u32 skip_pass = ~0u, skip_n = 0;
-    if (skip_from != 0) {
-        if (skip_pass != passes) {
-            skip_pass = passes;
-            skip_n = 0;
-        }
-        skip_n++;
-        if (skip_n >= skip_from && (skip_to == 0 || skip_n <= skip_to)) {
-            return true;
-        }
-    }
-#endif
 
     // --- the vertex program's SA block and uniform buffer ---
     // The image covers the containers, the prefetched uniforms after them and the SAs the

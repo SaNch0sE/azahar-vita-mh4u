@@ -13,6 +13,7 @@
 #include <iterator>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/named_thread.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
 #include "video_core/renderer_gxm/vprof.h"
@@ -318,6 +319,12 @@ bool SgxdBackend::InterruptPoll(const InterruptFence& fence) {
     TraceStamps();
     RetireReached();
     return true;
+}
+
+void SgxdBackend::InterruptKick(const InterruptFence& fence) {
+    if (static_cast<s32>(fence.render - sgxd_chain_fence()) > 0 && sgxd_session_pending()) {
+        FinishPending(FinishWhy::Kick);
+    }
 }
 
 void SgxdBackend::InterruptWait(const InterruptFence& fence) {

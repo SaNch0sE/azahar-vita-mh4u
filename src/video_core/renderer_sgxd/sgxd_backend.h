@@ -178,6 +178,9 @@ public:
     [[nodiscard]] bool InterruptPoll(const InterruptFence& fence);
     /// Waits for the fence's work; a failed render stops the process as RenderIdle does.
     void InterruptWait(const InterruptFence& fence);
+    /// The guest waits for the fence's work: a pending 3D it takes gets its finishing list now,
+    /// behind the lists queued, as InterruptWait sends it, without waiting.
+    void InterruptKick(const InterruptFence& fence);
     [[nodiscard]] const SgxdEvents& Events() const {
         return events;
     }

@@ -316,6 +316,8 @@ public:
     /// The rasterizer holds immediate-mode vertices: every register write goes through
     /// WriteInternalReg, which flushes them first (the fast command loop is skipped).
     bool immediate_open{};
+    /// input_default_attributes changed since the sgxd render thread's copy took them.
+    bool default_attributes_changed{true};
 
     ArchivedDelayCounts delay_counts{};
 
@@ -329,6 +331,20 @@ public:
     /// The vertex unit's writes made while the geometry unit mirrored it, into gs_setup: the
     /// geometry unit's state as each mirrored write would have left it.
     void FlushGsMirror();
+
+    /// The whole state as changed (registers, shader setups, LUTs, default attributes), for the
+    /// sgxd render thread's copy to take whole: a loaded savestate, vprof's replay. Both setups
+    /// were set whole, so the mirror's log goes.
+    void MarkAllChanged() {
+        gs_mirror = {};
+        dirty_regs.SetAllDirty();
+        vs_setup.MarkAllChanged();
+        gs_setup.MarkAllChanged();
+        lighting.lut_dirty = Lighting::LutAllDirty;
+        fog.lut_dirty = true;
+        proctex.table_dirty = ProcTex::TableAllDirty;
+        default_attributes_changed = true;
+    }
 
 private:
     friend class boost::serialization::access;
@@ -352,7 +368,7 @@ private:
         ar & primitive_assembler;
         ar & cmd_list;
         if (Archive::is_loading::value) {
-            dirty_regs.SetAllDirty();
+            MarkAllChanged();
         }
     }
 

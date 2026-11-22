@@ -49,6 +49,10 @@ void RendererSgxd::PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb
     render_window.PresentGuestScreens(screens);
 }
 
+void RendererSgxd::PollWindow() {
+    render_window.PollEvents();
+}
+
 bool RendererSgxd::WouldMakeUncached(PAddr addr, u32 size) const {
     return guest_memory.WouldMove(addr, size);
 }

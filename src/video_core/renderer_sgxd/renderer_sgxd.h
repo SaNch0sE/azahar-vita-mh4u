@@ -14,10 +14,11 @@ class PicaCore;
 
 namespace GxmRenderer {
 
-/// The renderer the Vita frontend presents through. Its operations run on the GPU's render
-/// thread, which owns the GPU (sgxd) while a title runs; each VBlank's present hands the guest's
-/// screens to the frontend through the window's PresentGuestScreens, on that thread, and the
-/// frontend draws them from guest memory.
+/// The renderer the Vita frontend presents through. Its rasterizer and presents run on the
+/// render thread (RenderThread), which owns the GPU (sgxd) and the window while a title runs;
+/// each VBlank's present hands the guest's screens to the frontend through the window's
+/// PresentGuestScreens, on that thread, and the frontend draws them from guest memory
+/// (EmuWindowVita::DrawGuestScreens).
 class RendererGxm : public VideoCore::RendererBase {
 public:
     explicit RendererGxm(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window);
@@ -32,6 +33,10 @@ public:
 
     void PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb,
                       const std::array<Pica::ColorFill, 2>& fill) override;
+    /// The render thread polls the window (PollWindow) with each VBlank's present and between
+    /// presents; the frame's end on the emulation thread leaves it alone.
+    void PollWindowEvents() override {}
+    void PollWindow();
     bool WouldMakeUncached(PAddr addr, u32 size) const override;
     void MakeUncached(PAddr addr, u32 size, bool overwritten) override;
     bool UncachedFrameEnded() override {

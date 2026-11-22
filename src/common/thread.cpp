@@ -219,12 +219,10 @@ void SetCurrentThreadName(const char*) {
  * On the console the guest also executes on the emulation thread's core since vaprobe's
  * folded mode (2026-09-09): vanRun turns the calling core into the guest's for one slice and
  * back, so the emulation thread and the guest share core 2 and no core is held. The render
- * thread has core 1 to itself: under GXM it is where the whole rasterizer cache, the state
- * translation and the GXM submission live, and it is the side that cannot keep up; core 0
- * is left to libgxm's display queue thread, which runs there at the render thread's
- * priority. Everything else - the software rasterizer's worker, which the GXM build does
- * not run at all, and the miscellaneous threads - goes to core 3 with whatever the system
- * keeps there.
+ * thread (GxmRenderer::RenderThread: the rasterizer, sgxd and the presents) has core 1, with
+ * the tier-2 shader compiler below it in priority, and the HLE DSP's thread core 0. Everything else - the
+ * software rasterizer's worker, which the GXM build does not run at all, and the miscellaneous
+ * threads - goes to core 3 with whatever the system keeps there.
  */
 constexpr int RoleCore(ThreadRole role, std::size_t index) {
     (void)index;
@@ -234,9 +232,6 @@ constexpr int RoleCore(ThreadRole role, std::size_t index) {
         // slice at a time inside vanRun (vaprobe folded mode), so this core is the guest's
         // too and nothing else of ours goes there.
         return 2;
-    case ThreadRole::Render:
-        // Off core 0, where libgxm's display queue thread lives at the same priority.
-        return 1;
     case ThreadRole::ShaderCompiler:
         return 0;
     case ThreadRole::RasterWorker:
@@ -254,9 +249,12 @@ constexpr int PriorityCore(ThreadRole role) {
     case ThreadRole::Emulation:
     case ThreadRole::Render:
     case ThreadRole::RasterWorker:
-    case ThreadRole::ShaderCompiler:
     case ThreadRole::AudioSink:
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH;
+    case ThreadRole::ShaderCompiler:
+        // Shares core 1 with the render thread, which must not wait behind a compile: the
+        // kernel runs the higher priority (the lower number) first.
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
     case ThreadRole::Other:
         return SCE_KERNEL_PROCESS_PRIORITY_USER_DEFAULT;
     }

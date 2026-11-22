@@ -58,6 +58,7 @@
 #include "core/movie.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
+#include "video_core/renderer_gxm/render_thread.h"
 #include "video_core/renderer_gxm/renderer_gxm.h"
 
 // The default heap is nowhere near enough for a 3DS: FCRAM alone is 128 MB, and the caches and
@@ -226,6 +227,35 @@ void ShutdownSystem(Core::System& system) {
     system.Shutdown();
 }
 
+#ifdef VITA_DIAGNOSTICS
+/// `perflog`'s counters of the render side: the render thread's, sgxd's waits and cache
+/// operations, the presents' parts and the page moves. Like every counter behind perflog, the
+/// diagnostics build's only.
+struct RenderCounters {
+    SgxdRenderer::RenderThread::Stats thread;
+    u64 gpu_wait_us;
+    VitaFrontend::PresentTimes present;
+    SgxdRenderer::SgxdCacheTimes cache;
+    SgxdRenderer::GuestGpuMemory::MoveStats moves;
+};
+
+/// Taken on the render thread: sgxd's and the window's counters are plain, written there.
+RenderCounters TakeRenderCounters(Core::System& system) {
+    auto& gpu = system.GPU();
+    RenderCounters c{};
+    gpu.GetRenderThread().RunSync([&] {
+        c.thread = gpu.GetRenderThread().TakeStats();
+        c.gpu_wait_us = sgxd_wait_us_take();
+        c.present = VitaFrontend::TakePresentTimes();
+        c.cache = GxmRenderer::SgxdTakeCacheTimes();
+        if (auto* gxm = dynamic_cast<GxmRenderer::RendererGxm*>(&gpu.Renderer())) {
+            c.moves = gxm->TakeMoveStats();
+        }
+    });
+    return c;
+}
+#endif
+
 /// Runs one title to completion. Returns false when the user wants the application to close
 /// rather than to return to the game list.
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
@@ -302,54 +332,29 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     ui.EnterGame();
     window.SetUi(&ui);
 
-    bool keep_running = true;
-    bool combo_held = false;
+    // The pause menu is the render thread's: it polls the pad, opens the menu on the PS button
+    // and runs it, while this loop waits at the top. What only this thread can do (savestates,
+    // quitting) the menu leaves here.
+    window.SetPauseMenu(&ui);
     while (!window.IsQuitRequested()) {
-        window.PollEvents();
-
-        // Edge triggered, and the guest must not see the frame in which the combination is
-        // pressed - it holds two buttons a title may well be reading. The PS button, locked
-        // away from the shell below, arrives as an ordinary pad bit that nothing binds for
-        // the guest; it is the same button DSVita pauses on.
-        const u32 buttons = window.ButtonsHeld();
-        const bool combo_now = (buttons & SCE_CTRL_PSBUTTON) != 0;
-        if (combo_now && !combo_held && !ui.MenuOpen()) {
-            ui.OpenPauseMenu();
-        }
-        combo_held = combo_now;
-
-        if (ui.MenuOpen()) {
-            // Emulation does not advance while a menu is up, so no frames arrive to carry a
-            // present: make one here. Under the GPU's lock: with parallel cores the other
-            // emulation thread can be in GPU work.
-            {
-                std::scoped_lock gpu_lock{system.GPU().Lock()};
-                window.Present(&ui);
-            }
-            const auto action = static_cast<VitaFrontend::Ui::Action>(window.TakeUiAction());
-            switch (action) {
-            case VitaFrontend::Ui::Action::QuitGame:
-                keep_running = true;
-                window.SetInputToGuest(true);
-                window.SetUi(nullptr);
-                ShutdownSystem(system);
-                return keep_running;
-            case VitaFrontend::Ui::Action::ExitApplication:
-                window.SetUi(nullptr);
-                ShutdownSystem(system);
-                return false;
-            case VitaFrontend::Ui::Action::SaveState:
-                system.SendSignal(Core::System::Signal::Save, ui.SelectedSlot());
-                ui.EnterGame();
-                break;
-            case VitaFrontend::Ui::Action::LoadState:
-                system.SendSignal(Core::System::Signal::Load, ui.SelectedSlot());
-                ui.EnterGame();
-                break;
-            default:
-                break;
-            }
-            continue;
+        window.WaitWhilePaused();
+        const auto action = static_cast<VitaFrontend::Ui::Action>(window.TakeUiAction());
+        switch (action) {
+        case VitaFrontend::Ui::Action::QuitGame:
+        case VitaFrontend::Ui::Action::ExitApplication:
+            window.SetPauseMenu(nullptr);
+            window.SetInputToGuest(true);
+            window.SetUi(nullptr);
+            ShutdownSystem(system);
+            return action == VitaFrontend::Ui::Action::QuitGame;
+        case VitaFrontend::Ui::Action::SaveState:
+            system.SendSignal(Core::System::Signal::Save, ui.SelectedSlot());
+            break;
+        case VitaFrontend::Ui::Action::LoadState:
+            system.SendSignal(Core::System::Signal::Load, ui.SelectedSlot());
+            break;
+        default:
+            break;
         }
 
         const auto status = system.RunLoop();
@@ -379,16 +384,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 #ifdef VITA_DIAGNOSTICS
                 static const bool perflog = SgxdRenderer::SgxdFlag("perflog");
                 if (perflog) {
-                    // With parallel cores the second emulation thread writes these counters
-                    // (the censuses, the GPU's and sgxd's) under the HLE lock; they are taken
-                    // under it too.
-                    Common::MulticoreLock perf_lock{system.Kernel().GetHLELock(),
-                                                    system.GPU().Lock()};
-                    // A wait for the lock while this prints is charged to it (perflog's own
-                    // cost), not to the site that held the lock last.
-                    static const char perflog_key = 0;
-                    const auto perflog_start = Core::HleCensus::Clock::now();
-                    Core::hle_holder.store(&perflog_key, std::memory_order_relaxed);
+                    // The render thread's counters (sgxd's, the presents', the page moves'),
+                    // before the HLE lock: the call waits for the work queued.
+                    const auto render_counters = TakeRenderCounters(system);
                     // The vblank interval split as core/perf_stats.h measures it, in ms.
                     LOG_INFO(Frontend,
                              "perf: speed {:.1f}% game {:.1f} fps shown {:.1f} fps; vblank "
@@ -464,28 +462,59 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              "wait {} passing, {} blocking; {} other",
                              n.arb_signal_idle, n.arb_signal_wake, n.arb_wait_pass,
                              n.arb_wait_block, n.arb_other);
-                    // The GPU's operations and presents in the second (ms).
+                    // The GPU's operations in the second (ms): the emulation side's parse and
+                    // queueing by kind, then the render thread's work.
                     const auto r = system.GPU().TakeOpStats();
                     LOG_INFO(Frontend,
-                             "perf: present {:.1f} ms in {} ({} dropped); GPU waits {:.1f} ms",
-                             r.present_us / 1e3, r.presents, r.presents_dropped,
-                             sgxd_wait_us_take() / 1e3);
-                    LOG_INFO(Frontend,
-                             "perf: cmdlist {:.1f} ms in {}, regwrite {:.1f} ms in {}, fill "
-                             "{:.1f} ms in {}, transfer {:.1f} ms in {}, dma {:.1f} ms in {}; of "
-                             "which GPU waits {:.1f}, {:.1f}, {:.1f}, {:.1f}, {:.1f} ms",
+                             "perf: queued cmdlist {:.1f} ms in {}, regwrite {:.1f} ms in {}, "
+                             "fill {:.1f} ms in {}, transfer {:.1f} ms in {}, dma {:.1f} ms in {}",
                              r.kind_us[0] / 1e3, r.kind_ops[0], r.kind_us[1] / 1e3, r.kind_ops[1],
                              r.kind_us[2] / 1e3, r.kind_ops[2], r.kind_us[3] / 1e3, r.kind_ops[3],
-                             r.kind_us[4] / 1e3, r.kind_ops[4], r.kind_wait_us[0] / 1e3,
-                             r.kind_wait_us[1] / 1e3, r.kind_wait_us[2] / 1e3,
-                             r.kind_wait_us[3] / 1e3, r.kind_wait_us[4] / 1e3);
-                    const auto p = VitaFrontend::TakePresentTimes();
+                             r.kind_us[4] / 1e3, r.kind_ops[4]);
+                    const auto& t = render_counters.thread;
+                    using K = SgxdRenderer::RenderThread::Stats;
+                    LOG_INFO(Frontend,
+                             "perf: render thread busy {:.1f} ms, idle {:.1f} ms ({} fence "
+                             "polls), GPU waits {:.1f} ms; records: state {}, draw {}, fill {}, "
+                             "transfer {}, dma {}, present {}, other {}; present {} ({} "
+                             "dropped); holds {} waiting {:.1f} ms",
+                             t.busy_us / 1e3, t.idle_us / 1e3, t.poll_wakes,
+                             render_counters.gpu_wait_us / 1e3,
+                             t.records[K::State], t.records[K::Draw], t.records[K::Fill],
+                             t.records[K::Transfer], t.records[K::Dma], t.records[K::Present],
+                             t.records[K::Other], t.presents, t.presents_dropped, t.holds,
+                             t.hold_us / 1e3);
+                    // This thread, the emulation thread: its run time by the kernel's count
+                    // over the interval, and its waits for the render thread by kind (sleeps,
+                    // the 1 ms timeouts among them). The holds are above, the DSP's waits below.
+                    SceKernelThreadInfo emu_info{};
+                    emu_info.size = sizeof(emu_info);
+                    const int info_result =
+                        sceKernelGetThreadInfo(sceKernelGetThreadId(), &emu_info);
+                    ASSERT_MSG(info_result >= 0, "perflog: thread info {:#010x}",
+                               static_cast<u32>(info_result));
+                    using W = SgxdRenderer::RenderThread;
+                    static SceKernelSysClock last_run = 0;
+                    const SceKernelSysClock run_us = emu_info.runClocks - last_run;
+                    last_run = emu_info.runClocks;
+                    LOG_INFO(Frontend,
+                             "perf: emulation thread ran {:.1f} ms of {:.1f}; waits for the "
+                             "render thread: tickets {:.1f} ms in {} ({} sleeps, {} timed out), "
+                             "ring space {:.1f} ms in {} ({}, {}), sync {:.1f} ms in {} ({}, {})",
+                             run_us / 1e3, interval_us / 1e3, t.emu_wait_us[W::EmuTicket] / 1e3,
+                             t.emu_waits[W::EmuTicket], t.emu_sleeps[W::EmuTicket],
+                             t.emu_timeouts[W::EmuTicket], t.emu_wait_us[W::EmuSpace] / 1e3,
+                             t.emu_waits[W::EmuSpace], t.emu_sleeps[W::EmuSpace],
+                             t.emu_timeouts[W::EmuSpace], t.emu_wait_us[W::EmuSync] / 1e3,
+                             t.emu_waits[W::EmuSync], t.emu_sleeps[W::EmuSync],
+                             t.emu_timeouts[W::EmuSync]);
+                    const auto& p = render_counters.present;
                     LOG_INFO(Frontend,
                              "perf: present ui update {:.1f} ms, screens {:.1f} ms, ui draw "
                              "{:.1f} ms, end frame {:.1f} ms",
                              p.ui_update / 1e3, p.screens / 1e3, p.ui_draw / 1e3,
                              p.end_frame / 1e3);
-                    const auto c = GxmRenderer::SgxdTakeCacheTimes();
+                    const auto& c = render_counters.cache;
                     LOG_INFO(Frontend, "perf: cache ops {:.1f} ms in {} for {} KiB", c.us / 1e3,
                              c.calls, c.bytes / 1024);
                     // By site: done (time, calls, KiB), and not needed because the range is
@@ -505,15 +534,12 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                              s.skipped_bytes / 1024);
                     }
                     LOG_INFO(Frontend, "perf: cache sites: {}", sites.empty() ? "none" : sites);
-                    if (auto* gxm = dynamic_cast<GxmRenderer::RendererGxm*>(
-                            &system.GPU().Renderer())) {
-                        const auto m = gxm->TakeMoveStats();
-                        LOG_INFO(Frontend,
-                                 "perf: FCRAM to CDRAM: {} move(s), {} page(s), {} copied; {} "
-                                 "return(s), {} page(s); {:.1f} ms; pool {} of {} pages",
-                                 m.calls, m.pages, m.copied_pages, m.returns, m.returned_pages,
-                                 m.us / 1e3, m.pool_pages_used, m.pool_pages);
-                    }
+                    const auto& m = render_counters.moves;
+                    LOG_INFO(Frontend,
+                             "perf: FCRAM to CDRAM: {} move(s), {} page(s), {} copied; {} "
+                             "return(s), {} page(s); {:.1f} ms; pool {} of {} pages",
+                             m.calls, m.pages, m.copied_pages, m.returns, m.returned_pages,
+                             m.us / 1e3, m.pool_pages_used, m.pool_pages);
                 }
 #endif
             }
@@ -522,9 +548,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         // RunLoop (EmuWindowVita::SwapBuffers).
     }
 
+    window.SetPauseMenu(nullptr);
     window.SetUi(nullptr);
     ShutdownSystem(system);
-    return keep_running;
+    return true;
 }
 
 #ifdef VITA_DIAGNOSTICS

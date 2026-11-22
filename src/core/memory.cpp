@@ -407,25 +407,22 @@ public:
                 return;
             }
 
-            // The renderer's state: under the GPU's lock, which GSP's command work holds without
-            // the HLE lock when cores run in parallel.
-            std::scoped_lock gpu_lock{system.GPU().Lock()};
-            auto& renderer = system.GPU().Renderer();
+            // Through the GPU: the rasterizer it calls may be the render thread's queue (sgxd).
+            auto& gpu = system.GPU();
             VAddr overlap_start = std::max(start, region_start);
             VAddr overlap_end = std::min(end, region_end);
             PAddr physical_start = paddr_region_start + (overlap_start - region_start);
             u32 overlap_size = overlap_end - overlap_start;
 
-            auto* rasterizer = renderer.Rasterizer();
             switch (mode) {
             case FlushMode::Flush:
-                rasterizer->FlushRegion(physical_start, overlap_size);
+                gpu.FlushRegion(physical_start, overlap_size);
                 break;
             case FlushMode::Invalidate:
-                rasterizer->InvalidateRegion(physical_start, overlap_size);
+                gpu.InvalidateRegion(physical_start, overlap_size);
                 break;
             case FlushMode::FlushAndInvalidate:
-                rasterizer->FlushAndInvalidateRegion(physical_start, overlap_size);
+                gpu.FlushAndInvalidateRegion(physical_start, overlap_size);
                 break;
             }
         };

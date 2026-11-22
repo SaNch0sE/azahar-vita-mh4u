@@ -5,6 +5,7 @@
 #ifdef __vita__
 
 #include <cstdlib>
+#include <string>
 
 #include <psp2/kernel/threadmgr.h>
 #include <vitasdk/utils.h>
@@ -123,6 +124,33 @@ void NamedThread::detach() {
 
 bool NamedThread::IsCurrentThread() const noexcept {
     return uid >= 0 && sceKernelGetThreadId() == uid;
+}
+
+std::string DescribeWaiters(std::int32_t uid) {
+    const auto name_of = [](SceUID id) {
+        SceKernelThreadInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetThreadInfo(id, &info) < 0) {
+            return std::string("?");
+        }
+        info.name[sizeof(info.name) - 1] = '\0';
+        return std::string(info.name);
+    };
+    const SceUID self = sceKernelGetThreadId();
+    std::string out = "this thread " + name_of(self) + "; the named threads waiting on it:";
+    std::int32_t ids[64];
+    const std::size_t n = RunningNamedThreadIds(ids, std::size(ids));
+    bool any = false;
+    for (std::size_t i = 0; i < n; i++) {
+        SceKernelThreadInfo info{};
+        info.size = sizeof(info);
+        if (ids[i] != self && sceKernelGetThreadInfo(ids[i], &info) >= 0 && info.waitId == uid) {
+            info.name[sizeof(info.name) - 1] = '\0';
+            out += std::string(any ? ", " : " ") + info.name;
+            any = true;
+        }
+    }
+    return any ? out : out + " none";
 }
 
 } // namespace Common
