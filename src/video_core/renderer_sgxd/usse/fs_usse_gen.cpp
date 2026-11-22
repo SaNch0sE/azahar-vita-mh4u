@@ -75,7 +75,6 @@ int BroadcastInput(Source s) {
     }
 }
 
-// The generator's notion of a stage that changes nothing.
 bool IsPassThroughTevStage(const TevStageConfig& stage) {
     return (stage.color_op == Operation::Replace && stage.alpha_op == Operation::Replace &&
             stage.color_source1 == Source::Previous && stage.alpha_source1 == Source::Previous &&
@@ -108,11 +107,8 @@ Source AlphaSource(const TevStageConfig& stage, Source source, u32 index) {
 }
 
 /**
- * The register plan: everything long-lived in the unified store,
- * the three internal registers only inside one pass, with nosched set for as long as one
- * of them holds a value.
- *
- * Primary attributes: pa0-3 COLOR0, then the inputs a configuration needs.
+ * Long-lived values live in the unified store, the internal registers only inside one pass,
+ * with nosched set while one of them holds a value.
  * Temporaries (32-bit each), fixed homes:
  */
 constexpr uint8_t TmpOutput = 0;      ///< combiner_output, the running result (4)
@@ -222,7 +218,7 @@ constexpr uint8_t TmpLightAcc = 20;   ///< lighting: the spot direction, then th
 
 // The hardware constant bank as the disassembly names it: c<n>.x is table entry n and .y
 // entry n + 1 (the bank is not pair-addressed). Entry 0 is 0, entries 2-3 are 1, entry 4
-// is 2, entry 12 is 0.5 (Vita3K's usse_constant_table.h; confirmed by psp2shaderperf).
+// is 2, entry 12 is 0.5.
 const Src ConstZero{Reg::C(0), XXXX};
 const Src ConstOne{Reg::C(2), XXXX};
 const Src ConstHalf{Reg::C(12), XXXX};
@@ -420,7 +416,6 @@ private:
     void ProcSample(Reg dst, Reg coord, uint8_t sampler_sa);
     void ProcWdf();
     void ProcTexLookupFinish(uint8_t slot);
-    /// The combiner of u and v (TmpProcUv) into i0.x.
     void ProcTexCombine(Pica::TexturingRegs::ProcTexCombiner combiner);
     /// uv (TmpProcUv) += amplitude * the noise coefficient at uv, then |uv|.
     void ProcTexNoise();
@@ -429,7 +424,6 @@ private:
                       Src coord);
     /// The clamp of the lanes of i0 in `mask` (x u, y v), in place, through i1.
     void ProcTexClamp(Pica::TexturingRegs::ProcTexClamp mode, uint8_t mask);
-    /// floor(i0.<lane>) in place, through i1.
     void FloorLane(uint8_t lane);
     void TevStage(u32 index);
     /// Loads stage argument `arg_index` into i<arg_index>, the lanes in `lanes` (0x7 colour,
@@ -437,7 +431,6 @@ private:
     void LoadArg(uint8_t arg_index, const TevStageConfig& stage, u32 stage_index, Source csrc,
                  ColorModifier cmod, Source asrc, AlphaModifier amod, uint8_t lanes);
     Vec4Loc SourceLocation(Source source, u32 stage_index, bool alpha) const;
-    /// Works out which stage output each PreviousBuffer read sees.
     void PlanCombinerBuffer();
     void ColorOp(Operation op, uint8_t mask);
     /// The alpha test on the F32 combiner output (TmpOutput.w), or on the U8 one's alpha byte
@@ -507,11 +500,9 @@ private:
     void CopyVec4(Vec4Loc to, Vec4Loc from, uint8_t mask = 0xf);
     /// Normalises the float3 at `from` into internal register `into` (xyz), through `scratch`.
     void Normalize3(Reg into, Vec4Loc from, Reg scratch);
-    /// A scalar secondary attribute as a broadcast source.
     static Src SaScalar(uint32_t sa) {
         return {Reg::Sa(static_cast<uint8_t>(sa & ~1u)), (sa & 1) ? YYYY : XXXX};
     }
-    /// A scalar anywhere in the unified store as a broadcast source.
     static Src Scalar(Bank bank, uint32_t reg) {
         return {Reg{bank, static_cast<uint8_t>(reg & ~1u)}, (reg & 1) ? YYYY : XXXX};
     }
@@ -602,7 +593,6 @@ private:
     /// A SOP3's source 0, which is a temporary or a primary attribute: a secondary attribute
     /// copied into TmpU8Const first.
     Reg U8Src0(Reg r);
-    /// The LUT sampler's index among the declared samplers.
     uint32_t LutSamplerIndex() const;
     bool LightingLutEnabled(const Pica::Shader::LutConfig& lut, Sampler sampler) const;
 
@@ -2850,7 +2840,6 @@ void FragmentEmitter::Lighting() {
     }
     bool diffuse_empty = true;
     bool specular_empty = true;
-    // The three colour lanes of an internal register into a quad.
     const auto store3 = [&](Vec4Loc to, Reg internal) {
         e.MoveInternal({to.Pair(0), 0x3}, {internal, XYZW}, Pred::None, true);
         e.MoveInternal({to.Pair(1), 0x1}, {internal, ZWZW}, Pred::None, true);
@@ -2981,8 +2970,7 @@ void FragmentEmitter::Lighting() {
     if (default_normal_only) {
         // rotate(q, (0, 0, 1)) = (2(xz + yw), 2(yz - xw), 1 - 2(x^2 + y^2)), with i0 = q:
         // P = (x^2, y^2, xz, yz) doubled, Q = (yw, xw, yw, xw), then n.xy = (2, -2) * Q.zw
-        // + 2P.zw and n.z = 1 - (2P.x + 2P.y). Six instructions for the general rotation's
-        // twenty-two.
+        // + 2P.zw and n.z = 1 - (2P.x + 2P.y).
         constexpr Swizzle XYZZ{Ch::X, Ch::Y, Ch::Z, Ch::Z};
         constexpr Swizzle XYXY{Ch::X, Ch::Y, Ch::X, Ch::Y};
         constexpr Swizzle YXYX{Ch::Y, Ch::X, Ch::Y, Ch::X};
@@ -3969,14 +3957,12 @@ void FragmentEmitter::LoadArg(uint8_t arg_index, const TevStageConfig& stage, u3
     const bool want_c = lanes & 0x7;
     const bool want_a = lanes & 0x8;
 
-    // A component of a float4 in the unified store: which pair, and which half.
     const auto channel = [](int comp) {
         return std::pair<int, Ch>{comp >> 1, (comp & 1) ? Ch::Y : Ch::X};
     };
     const auto same = [](const Vec4Loc& x, const Vec4Loc& y) {
         return x.bank == y.bank && x.base == y.base;
     };
-    // dst.<mask> = one component of `from` broadcast.
     const auto lane = [&](uint8_t mask, const Vec4Loc& from, int comp) {
         if (from.bank == Bank::Const) {
             e.MoveInternal({dst, mask}, {Reg::C(0), XXXX}, Pred::None, true);

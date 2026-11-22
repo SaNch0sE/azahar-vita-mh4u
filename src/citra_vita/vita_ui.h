@@ -87,7 +87,6 @@ public:
     /// the command channel's `select`. False when no title does.
     bool SelectTitle(const std::string& text);
 
-    /// What the UI is asking the frontend to do, returned from Update.
     enum class Action {
         None,
         LaunchGame,
@@ -113,7 +112,6 @@ public:
     /// In game the frame is the stats overlay (StatsHud), drawn with no ImGui frame.
     void Draw();
 
-    /// The game the user chose, valid after Action::LaunchGame.
     [[nodiscard]] const std::string& SelectedGamePath() const {
         return selected_game_path;
     }
@@ -157,7 +155,6 @@ public:
     [[nodiscard]] std::string SettingTitle(Config::Option option) const;
     [[nodiscard]] std::string SettingDefault(Config::Option option) const;
 
-    /// The savestate slot the user chose, valid after Action::SaveState / Action::LoadState.
     [[nodiscard]] u32 SelectedSlot() const {
         return selected_slot;
     }
@@ -165,7 +162,6 @@ public:
     /// The title a launch has loaded, for the pause menu's game settings: its settings' key
     /// (Config::RunningTitle) and its file's name, as the game list shows it. Before EnterGame.
     void SetGame(const std::string& path);
-    /// Switches to the in-game state, where nothing is drawn over the title.
     void EnterGame();
     /// Back to the game list, where the pause menu's "Quit game" leaves the interface: after a
     /// quit that did not come through the menu (the command channel).

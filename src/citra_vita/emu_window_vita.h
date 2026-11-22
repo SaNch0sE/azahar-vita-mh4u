@@ -145,7 +145,6 @@ public:
         quit_requested = true;
     }
 
-    /// Pad state as of the last PollEvents, as a mask of SCE_CTRL_* bits.
     [[nodiscard]] u32 ButtonsHeld() const {
         return buttons_held.load(std::memory_order_relaxed);
     }
@@ -178,7 +177,6 @@ public:
     /// thread's, which polls.
     void DrawOnScreenButtons();
 
-    /// Left stick, each axis in [-1, 1] with y positive upwards.
     [[nodiscard]] std::pair<float, float> LeftStick() const;
     /// Right stick, as LeftStick: the guest's C-stick (the Circle Pad Pro's, the New 3DS's).
     [[nodiscard]] std::pair<float, float> RightStick() const;

@@ -241,7 +241,8 @@ inline u32 Etc1Squares(u32 width, u32 height, u32 levels) {
 }
 
 /// The pixel at index i of the PBE's TWIDDLED layout for a target whose smaller side is its
-/// height, `side`: Morton over side x side squares with y in bit 0, the squares along x.
+/// height, `side`: Morton over side x side squares with y in bit 0, the squares along x
+/// (the PICA tile store's 16-row strips have the column's bits above the square's).
 inline std::pair<u32, u32> TwiddledPixel(u32 i, u32 side) {
     const u32 square = side * side, low = i % square;
     u32 x = 0, y = 0;

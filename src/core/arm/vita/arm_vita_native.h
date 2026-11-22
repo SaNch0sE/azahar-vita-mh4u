@@ -62,7 +62,6 @@ public:
     /// SyncCode for app memory another core's view maps at `guest`: whole pages.
     void SyncViewCode(const u8* host, VAddr guest, u32 size) const;
 
-    /// Highest guest address the module's table can hold, exclusive.
     static constexpr u32 GuestEnd = 0x40000000;
 
     std::string Describe(VAddr addr) const;

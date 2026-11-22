@@ -983,7 +983,7 @@ static unsigned pica_eot_part(const SgxdRecipe* r, const SgxdPicaStore* s, uint6
     return n;
 }
 
-// tools/sgx_pica_eot_probe.py prod_program, word for word.
+// The end of tile that stores PICA tiles (docs/sgxd/pbe.md).
 unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out) {
     const uint32_t width = r->width, height = r->height;
     // A 2x tile is 32x16 pixels, which the strips below do not cover: a 2x pass stores its

@@ -174,7 +174,6 @@ const Reg I0 = Reg::I(0);
 const Reg I1 = Reg::I(1);
 const Reg I2 = Reg::I(2);
 
-/// A float4 in the unified store: four consecutive registers from a pair-aligned base.
 struct Quad {
     Bank bank;
     uint8_t base;
@@ -186,7 +185,6 @@ struct Quad {
     }
 };
 
-/// A source operand: a quad with the instruction's swizzle and negation applied.
 struct Operand {
     Quad quad;
     Swizzle swz;
@@ -238,7 +236,6 @@ uint8_t DestMask(const SwizzlePattern& p) {
     return mask;
 }
 
-/// Whether a four-wide swizzle is one the V32NMAD/VMAD source tables hold.
 bool InVec4Table(const Swizzle& s) {
     static constexpr Swizzle table[] = {
         {Ch::X, Ch::X, Ch::X, Ch::X},   {Ch::Y, Ch::Y, Ch::Y, Ch::Y}, {Ch::Z, Ch::Z, Ch::Z, Ch::Z},
@@ -272,7 +269,6 @@ public:
     int level = 1;
 
 private:
-    // --- analysis ---
     struct Scan {
         uint16_t inputs = 0;                 ///< input registers read
         uint16_t temps = 0;                  ///< temporaries touched
@@ -297,11 +293,9 @@ private:
     void NoteSource(const SourceRegister& reg, uint32_t addr, const Swizzle& swz);
     void NoteDest(const DestRegister& reg, uint8_t mask);
 
-    // --- layout ---
     void Layout();
     Quad AllocateQuad();
 
-    // --- emission ---
     void Prologue();
     void Epilogue();
     /// In main's context, the instructions main's walk does not pass (main_walk) are left out.
@@ -312,7 +306,6 @@ private:
 
     Operand Source(const SourceRegister& reg, uint32_t addr, const Swizzle& swz, bool negate);
     std::optional<Quad> Dest(const DestRegister& reg);
-    /// The operand read four wide into `internal` with its swizzle and sign applied.
     Src Materialize(Reg internal, const Operand& op);
     /// The operand as a four-wide source straight from the unified store (V32NMAD's and
     /// VDP's first source take any swizzle).
@@ -325,7 +318,6 @@ private:
         return {op.quad.Pair(static_cast<int>(ch) / 2), (static_cast<int>(ch) & 1) ? YYYY : XXXX,
                 op.mod};
     }
-    /// i2's lanes into the destination quad under the mask.
     void Store(const Quad& dst, uint8_t mask, Reg internal);
     Src Data(DataSlot slot) const {
         return {Reg::Sa(static_cast<uint8_t>(data_base + slot)), XXXX};
@@ -334,7 +326,6 @@ private:
         return Reg::Sa(static_cast<uint8_t>(data_base + slot));
     }
 
-    // Control flow.
     int NewLabel();
     int LabelAt(uint32_t offset);
     void OpenContext(uint32_t begin, uint32_t end, uint32_t entry, bool precise);
@@ -351,7 +342,6 @@ private:
         return std::nullopt;
     }
 
-    // Epilogue helpers.
     /// The pair and lane a fragment-interface semantic comes from, or nothing for 1.0.
     std::optional<Src> SemanticSrc(Semantic s) const;
     void GatherFour(Reg internal, Semantic first);
@@ -367,7 +357,6 @@ private:
     Ir::Builder e;   ///< the primary program
     Program program;
 
-    // Where things landed.
     std::array<int, 16> input_pa{};   ///< input register -> PA base, or -1
     std::array<int, 16> input_raw_pa{}; ///< a U8 input register -> its fetched word's PA, or -1
     std::array<int, 16> default_sa{}; ///< input register -> SA base, or -1
@@ -443,9 +432,6 @@ private:
     void StoreQuad(Reg base, uint32_t word, const Quad& q);
     void EpilogueStreamOut();
 };
-
-// ---------------------------------------------------------------------------------------
-// Analysis
 
 void VertexEmitter::NoteSource(const SourceRegister& reg, uint32_t addr, const Swizzle& swz) {
     const uint32_t index = static_cast<uint32_t>(reg.GetIndex());
@@ -707,9 +693,6 @@ void VertexEmitter::ScanProgram() {
     }
 }
 
-// ---------------------------------------------------------------------------------------
-// Layout
-
 Quad VertexEmitter::AllocateQuad() {
     if (next_virtual + 4 > VirtualLimit) {
         Refuse("virtual register budget");
@@ -783,7 +766,6 @@ void VertexEmitter::Layout() {
         pa_inputs = static_cast<uint8_t>(pa_inputs + 2);
     }
 
-    // Resident uniforms: the depth mapping, the input defaults, the integer uniforms.
     program.uniforms.push_back({UniformKind::PositionScale, 0, SaPositionScale, 2, 1});
     program.uniforms.push_back({UniformKind::DepthScale, 0, SaDepthScale, 1, 1});
     program.uniforms.push_back({UniformKind::DepthOffset, 0, SaDepthOffset, 1, 1});
@@ -806,7 +788,6 @@ void VertexEmitter::Layout() {
 
     data_base = resident;
     sa_top = data_base + DataSize + ExtraLiterals();
-    // Most used first, as many as fit.
     std::vector<uint8_t> order;
     for (uint32_t n = 0; n < 128; n++) {
         const bool row = req.mode == VsMode::Geometry && req.gs_rows_uniform &&
@@ -849,7 +830,6 @@ void VertexEmitter::Layout() {
     // quads read as black screens.
     program.secondary_reg_count = sa_top;
 
-    // Output attributes, then the temporaries.
     for (uint32_t k = 0; k < req.num_outputs && k < 16; k++) {
         attr_quad[k] = AllocateQuad();
     }
@@ -973,9 +953,6 @@ std::optional<Operand> VertexEmitter::GsTableRead(uint32_t index, uint32_t addr,
     return Operand{{Bank::Virtual, TmpLoad}, swz, mod};
 }
 
-// ---------------------------------------------------------------------------------------
-// Operands
-
 Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Swizzle& swz,
                               bool negate) {
     constexpr uint8_t load_quad = TmpLoad;
@@ -1007,7 +984,6 @@ Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Sw
             if (uniform_sa[index & 127] >= 0) {
                 return {{Bank::SecAttr, static_cast<uint8_t>(uniform_sa[index & 127])}, swz, mod};
             }
-            // Not prefetched: loaded here.
             const uint32_t n = index & 127;
             if (n <= 31) {
                 e.Lda32(dst, ptr, nullptr, static_cast<uint8_t>(n * 4), 4, 0);
@@ -1075,9 +1051,6 @@ void VertexEmitter::Store(const Quad& dst, uint8_t mask, Reg internal) {
         e.MoveInternal({dst.Pair(1), static_cast<uint8_t>(mask >> 2)}, {internal, ZWZW});
     }
 }
-
-// ---------------------------------------------------------------------------------------
-// Control flow
 
 int VertexEmitter::NewLabel() {
     const int label = e.NewLabel();
@@ -1218,9 +1191,6 @@ void VertexEmitter::CondBranch(Instruction::FlowControlType flow, int target, bo
         Refuse("unknown condition");
     }
 }
-
-// ---------------------------------------------------------------------------------------
-// Instructions
 
 uint32_t VertexEmitter::EmitRange(uint32_t begin, uint32_t end) {
     uint32_t pc = begin;
@@ -1487,8 +1457,6 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
         };
         const Cond cx = cond(instr.common.compare_op.x.Value());
         const Cond cy = cond(instr.common.compare_op.y.Value());
-        // Both operands first: one may be a uniform read (a load and a wait), and no
-        // internal register may be live across that wait.
         const Operand a = src1();
         const Operand b = src2();
         Materialize(I0, a);
@@ -1902,9 +1870,6 @@ void VertexEmitter::EpilogueStreamOut() {
     e.MoveInternal({Reg::O(OutPosition + 2), 0x3}, ConstZeroOne);
 }
 
-// ---------------------------------------------------------------------------------------
-// Prologue and epilogue
-
 void VertexEmitter::Prologue() {
     // The components a loader does not supply: (0, 0, 0, 1), as the PICA fills them.
     for (uint32_t i = 0; i < 16; i++) {
@@ -2141,7 +2106,6 @@ void VertexEmitter::Epilogue() {
     e.MoveInternal({Reg::O(OutTexcoord3St), 0x1}, ConstZero);
     e.MoveInternal({Reg::O(OutTexcoord3St), 0x2}, {I0, WWWW});
 
-    // Colour: min(abs(c), 1).
     GatherFour(I1, SemColorR);
     e.Vec(VecOp::Min, {Reg::O(OutColor), 0x3}, {I1, XYZW, Mod::Abs}, ConstOne);
     e.Vec(VecOp::Min, {Reg::O(OutColor + 2), 0x3}, {I1, ZWZW, Mod::Abs}, ConstOne);
@@ -2157,8 +2121,6 @@ void VertexEmitter::Epilogue() {
     OutputPair(OutView, SemViewX, static_cast<Semantic>(SemViewX + 1));
     OutputLane(OutView + 2, 0, static_cast<Semantic>(SemViewX + 2));
 }
-
-// ---------------------------------------------------------------------------------------
 
 std::optional<Program> VertexEmitter::Emit(uint32_t& input_regs) {
     if (req.code.size() < req.code_size || req.main_offset >= req.code_size) {

@@ -217,8 +217,8 @@ std::pair<float, float> EmuWindowVita::RightStick() const {
 namespace {
 
 /**
- * Scripted pad input, for driving a title where nobody holds the console (Vita3K under
- * Xvfb, an unattended console): ux0:data/azahar/autoinput.txt, one press per line,
+ * Scripted pad input, for driving a title where nobody holds the console:
+ * ux0:data/azahar/autoinput.txt, one press per line,
  * `<seconds since the title started> <button> [hold seconds]` with the Vita's button
  * names (cross circle square triangle start select up down left right l r), or
  * `<seconds> stick <x> <y> [hold]` with x and y in -1..1, or `<seconds> touch <x> <y>
@@ -287,7 +287,6 @@ public:
 #endif
     }
 
-    /// Applies the presses due now. `elapsed` is seconds since the title started.
     void Apply(double elapsed, u32& buttons, u8& lx, u8& ly) const {
         for (const ScriptedPress& press : presses) {
             if (elapsed < press.at || elapsed >= press.until) {
@@ -301,7 +300,6 @@ public:
         }
     }
 
-    /// The scripted touch due now, in bottom-screen pixels, if any.
     std::optional<std::pair<float, float>> Touch(double elapsed) const {
         for (const ScriptedPress& press : presses) {
             if (press.touch && elapsed >= press.at && elapsed < press.until) {

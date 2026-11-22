@@ -27,9 +27,6 @@
 // Everything the resident thread does after the detach avoids kernel calls: the scheduler is no
 // longer managing it, and a blocking call there is a way to never come back. It talks to the
 // syscall side through volatiles, and every wait on it is bounded.
-//
-// Not here yet: a preemption timer (a guest that never takes an exception holds the core until
-// reboot), the HLE bridge, and the guest scheduler. One guest thread, run to its next exception.
 
 #include <psp2kern/kernel/proc_event.h>
 #include <psp2kern/kernel/sysmem/data_transfers.h>
@@ -82,14 +79,13 @@
 // ---------------------------------------------------------------------------- log
 //
 // emit() writes to out_fd. The calls here keep a file of their own open from the first call
-// to the release — the emulator
-// makes thousands of these calls a second, and an open per call would cost more than the
-// guest work between them — and point out_fd at it for the duration of each call. Lines are
-// still synced as written; azaharRun writes none on the success path for the same reason.
+// to the release, as an open per call would cost more than the guest work between them, and
+// point out_fd at it for each call. Lines are still synced as written; azaharRun writes none
+// on the success path for the same reason.
 static SceUID azahar_fd = -1;
 
 // Logging is opt-in: ux0:data/azahar/log present means native.txt and the kernel printf
-// mirror as before; absent (the default) means no file, no printf, and emit() returns at
+// mirror; absent (the default) means no file, no printf, and emit() returns at
 // once. Checked once per take.
 // static int azahar_log_checked, azahar_log_wanted;
 static int azahar_log_enabled(void) {
@@ -690,8 +686,8 @@ static void core2_install(unsigned n) {
     // besides what this module touches, so its handlers are not there to chain to.
     azahar_seal_flag = 1;
 
-    // The private timer: enable its PPI at this core's banked GIC enable register (measured
-    // disabled on every core), and start it free-running with no interrupt so its clock can be
+    // The private timer: enable its PPI at this core's banked GIC enable register (disabled on
+    // every core), and start it free-running with no interrupt so its clock can be
     // measured against the system clock from the idle loop's samples.
     if (pmr) {
         volatile uint32_t *const isen = (volatile uint32_t *)(gic_va + GICD_ISENABLER0);
@@ -1065,8 +1061,7 @@ static int core2_entry(SceSize args, void *argp) {
             default: azahar_cmd_status = 1; break;
         }
         // Publish the results before the done flag: without the barrier the other core can
-        // observe done set while the status (and the exit context) are still the old values,
-        // which read as a failed command once in a while.
+        // observe done set while the status (and the exit context) are still the old values.
         asm volatile("dsb" ::: "memory");
         azahar_cmd_done = 1;
     }
@@ -1095,8 +1090,8 @@ static int core2_command(uint32_t cmd, unsigned steps) {
     azahar_cmd_status = 0xFFFFFFFFu;
     asm volatile("dsb" ::: "memory");
     azahar_cmd = cmd;
-    // A guest exit is microseconds away most of the time — an svc round trip measured ~1.5 us
-    // — and the emulator waits here on every one of them, so the wait spins first and only
+    // A guest exit is microseconds away most of the time (an svc round trip is ~1.5 us), and the
+    // emulator waits here on every one, so the wait spins first and only
     // sleeps once it is clear the guest is running for real. Sleeping in 1 ms steps after that
     // keeps a preemption quantum's worth of latency bounded.
     int ret = AZAHAR_ERR_TIMEOUT;
@@ -2143,7 +2138,6 @@ static int build_table(const AzaharMapRequest *req) {
          azahar_core2_vbar, azahar_vec_va, (uint32_t)azahar_vec_pa, azahar_vec[0x40 / 4], azahar_vec[0x44 / 4],
          azahar_vec[0x48 / 4], azahar_vec[0x4C / 4], azahar_vec[0x50 / 4]);
 
-    // The guest windows.
     azahar_l2_used = 0;
     azahar_windows.count = 0;
     for (unsigned i = 0; i < AZAHAR_L2_COUNT * 256; i++) {
@@ -2311,8 +2305,7 @@ int azaharMap(const AzaharMapRequest *user_req) {
          target->sv_isenabler_timer ? "enabled" : "disabled", target->sv_cpacr, target->sv_fpexc);
 
     // The private timer's clock, from the idle loop's samples of the free-running counter
-    // against the system clock. A device-tree claim of a fixed 144 MHz against the A9
-    // ratio exists; this is the number the quantum is actually converted with.
+    // against the system clock: the number the quantum is converted with.
     target->timer_hz = 0;
     if (gic_va) {
         const uint32_t s0 = azahar_timer_sample, t0 = ksceKernelGetSystemTimeLow();

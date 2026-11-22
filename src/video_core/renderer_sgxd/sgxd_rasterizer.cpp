@@ -1918,8 +1918,7 @@ void RasterizerSgxd::CopyLines(u32 src, u32 dst, u32 line_bytes, u32 lines, u32 
 }
 
 SgxdBackend::PicaTarget RasterizerSgxd::PicaTargetFor(const ColourBuffer& c, const char* what) {
-    // The PBE's pack for each colour format: the
-    // PICA's bytes from the A8B8G8R8 a pass's fragments leave on chip.
+    // The PBE's pack for each colour format: the PICA's bytes from the A8B8G8R8 a pass leaves on chip.
     using CF = FramebufferRegs::ColorFormat;
     u32 pack = 0;
     switch (c.format) {
@@ -4405,71 +4404,6 @@ void RasterizerSgxd::PrefetchVertex(const Pica::RegsInternal& parse_regs,
     tier1->QueueVertex(key, request, parse_vs_code);
 }
 
-namespace {
-
-/// With gxm_flags dumpusse, an emitted program on host0 as azahar-KIND-KEY.json;
-/// `kind` is vs or fs (vs2, fs2: the second tier's), `key` the program cache's.
-void DumpProgram(const char* kind, u64 key, const Usse::Program& program) {
-    if (!SgxdFlag("dumpusse")) {
-        return;
-    }
-    const std::string json = Usse::ProgramJson(program);
-    const std::string path = fmt::format("host0:azahar-{}-{:016x}.json", kind, key);
-    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
-        std::fwrite(json.data(), 1, json.size(), f);
-        std::fclose(f);
-        LOG_INFO(Render, "{} program {:016x}: written to {}", kind, key, path);
-    }
-}
-
-/// With sgxd_flags dumpusse, bytes to host0:azahar-NAME.
-void DumpBytes(const std::string& name, const void* data, std::size_t size) {
-    const std::string path = fmt::format("host0:azahar-{}", name);
-    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
-        std::fwrite(data, 1, size, f);
-        std::fclose(f);
-    }
-}
-
-/// With sgxd_flags dumpusse, the 3DS side of a fragment program: its PICA configuration's bytes
-/// (azahar-fs-KEY.fsconfig) and upstream's GLSL for it (azahar-fs-KEY.glsl), for glsl2cg and
-/// psp2cgc to compile the same program as Sony's compiler would.
-void DumpPicaFragment(u64 key, const Pica::Shader::FSConfig& config) {
-    if (!SgxdFlag("dumpusse")) {
-        return;
-    }
-    DumpBytes(fmt::format("fs-{:016x}.fsconfig", key), &config, sizeof(config));
-    const std::string glsl = Pica::Shader::Generator::GLSL::GenerateFragmentShader(
-        config, Pica::Shader::UserConfig{}, Pica::Shader::Profile{});
-    DumpBytes(fmt::format("fs-{:016x}.glsl", key), glsl.data(), glsl.size());
-}
-
-/// With sgxd_flags dumpusse, the 3DS side of a vertex program: its PicaVSConfig's bytes, then
-/// the PICA program code and swizzle data (4096 words each) as azahar-vs-KEY.pica, and
-/// upstream's GLSL for it (azahar-vs-KEY.glsl).
-void DumpPicaVertex(u64 key, const Pica::Shader::Generator::PicaVSConfig& config,
-                    const Pica::ShaderSetup& setup) {
-    if (!SgxdFlag("dumpusse")) {
-        return;
-    }
-    std::vector<u8> bytes(sizeof(config));
-    std::memcpy(bytes.data(), &config, sizeof(config));
-    const auto code = setup.GetProgramCode();
-    const auto swizzle = setup.GetSwizzleData();
-    const auto append = [&](const auto& words) {
-        const auto* p = reinterpret_cast<const u8*>(words.data());
-        bytes.insert(bytes.end(), p, p + words.size() * sizeof(words[0]));
-    };
-    append(code);
-    append(swizzle);
-    DumpBytes(fmt::format("vs-{:016x}.pica", key), bytes.data(), bytes.size());
-    const std::string glsl = Pica::Shader::Generator::GLSL::GenerateVertexShader(
-        setup, config, Pica::Shader::Generator::ExtraVSConfig{});
-    DumpBytes(fmt::format("vs-{:016x}.glsl", key), glsl.data(), glsl.size());
-}
-
-} // namespace
-
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     u16 default_regs, const std::array<u8, 16>& reg_components, u16 u8_regs, u16 s8_regs,
     u16 s16_regs, Usse::VsMode mode) {
@@ -4549,7 +4483,6 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     v.usse = std::move(*emitted);
     ResolveVertexProgram(v);
     DumpProgram("vs", key, v.usse);
-    DumpPicaVertex(key, config, pica.vs_setup);
     PlaceVertexCode(v);
     LOG_DEBUG(Render,
               "vertex program {:016x}: {} + {} words, {} PAs, {} temps, {} SAs, {} uniforms{}, "

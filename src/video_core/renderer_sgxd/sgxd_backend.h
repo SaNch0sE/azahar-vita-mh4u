@@ -209,11 +209,12 @@ public:
     using PictureFormat = SgxdPictureFormat;
 
     /**
-     * A guest colour buffer a pass renders into, where it is: width x height pixels of bpp bytes at its PICA address, in
-     * the PICA's 8x8 tiles, the format as the PBE's pack (SGXD_RECIPE_PACK_*). The pass draws
-     * its transpose, height x width under the recipe for that size: x is the guest's row, y its
-     * column. Its end of tile (sgxd_recipe_pica_eot) stores every tile it renders into the guest
-     * buffer as the PICA lays it out; a tile no draw touches keeps the guest's bytes.
+     * A guest colour buffer a pass renders into, where it is (docs/sgxd/pbe.md): width x height
+     * pixels of bpp bytes at its PICA address, in the PICA's 8x8 tiles, the format as the PBE's
+     * pack (SGXD_RECIPE_PACK_*). The pass draws its transpose, height x width under the recipe for
+     * that size: x is the guest's row, y its column. Its end of tile (sgxd_recipe_pica_eot) stores
+     * every tile it renders into the guest buffer as the PICA lays it out, or with a picture
+     * (below) into the picture; a tile no draw touches keeps the bytes it had.
      */
     struct PicaTarget {
         u32 gpu;

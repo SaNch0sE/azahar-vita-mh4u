@@ -193,14 +193,12 @@ public:
     /// read or branch, after which no internal register survives).
     bool InternalKept(std::size_t from, uint8_t reg) const;
 
-    // --- control flow ---
     int NewLabel();
     void Bind(int label);
     void Br(Pred pred, int label);
     /// The next instruction starts a new phase (the fragment programs' second phase).
     void PhaseStart();
 
-    // --- the Encoder's builders ---
     void Phas(bool wait_all);
     void Nop();
     void NopAfterKill();
@@ -280,7 +278,6 @@ public:
     /// register) or 4 S16 (select a half, 0-3 over the pair).
     void UnpackInt(Reg dst, Reg src, uint8_t select, uint8_t format = 0);
 
-    // --- lowering ---
     /// Where virtual quads may live, in spill order. Without a call, the temporaries.
     void AddClass(RegClass cls);
     /// Runs the passes (level 2 adds the optimising ones), allocates, and encodes into `e`

@@ -34,7 +34,6 @@ uint32_t QuadOf(Reg r) {
     return r.n / 4;
 }
 
-/// A register the instruction reads or writes.
 struct Ref {
     Reg* reg;
     bool def;
@@ -267,8 +266,6 @@ std::string SrcName(const Src& s) {
     return mods[static_cast<int>(s.mod) & 3] + out;
 }
 
-/// One line per instruction, for refusal messages, tests and the dump: every field the
-/// simulator needs.
 std::string Describe(Inst& i) {
     RefList refs;
     Refs(i, refs);
@@ -323,7 +320,6 @@ bool IsBarrier(const Inst& i) {
     }
 }
 
-/// Modifier `outer` applied to a value already carrying `inner`.
 Mod Compose(Mod outer, Mod inner) {
     const bool outer_abs = outer == Mod::Abs || outer == Mod::NegAbs;
     const bool outer_neg = outer == Mod::Neg || outer == Mod::NegAbs;
@@ -336,9 +332,6 @@ Mod Compose(Mod outer, Mod inner) {
 }
 
 } // Anonymous namespace
-
-// ---------------------------------------------------------------------------------------
-// Builders
 
 Inst& Builder::Push(Op op) {
     insts.push_back(Inst{op});
@@ -696,9 +689,6 @@ void Builder::AddClass(RegClass cls) {
     classes.push_back(cls);
 }
 
-// ---------------------------------------------------------------------------------------
-// Lowering
-
 namespace {
 
 /// A lane set of every virtual quad, one plane a lane: bit q of lane[l] is lane l of quad q.
@@ -798,7 +788,7 @@ private:
     /// (host tests).
     void Dump(const char* stage) const;
     /// Refuses the program when an internal register is live across a barrier: the
-    /// hardware would read stale lanes there, and Vita3K would not notice.
+    /// hardware would read stale lanes there.
     void CheckInternals() const;
     void CheckTemps() const;
     void Encode(Encoder& e, LowerResult& result);
@@ -1041,7 +1031,6 @@ void Lowering::Liveness(bool precise) {
             label_at[label] = i;
         }
     }
-    // Successors: the fallthrough unless an unconditional branch, plus a branch target.
     const auto successors = [&](std::size_t i, std::size_t out[2]) -> int {
         int count = 0;
         const Inst& inst = insts[i];
@@ -1328,7 +1317,6 @@ void Lowering::DeadStores() {
 }
 
 void Lowering::Reloads() {
-    // What each internal register holds: the load that filled it.
     std::optional<Inst> held[3];
     RefList refs;
     std::vector<Inst> kept;
@@ -1487,7 +1475,6 @@ std::optional<Src> HalfSource(const Src& src, int h, bool second) {
         }
         return std::nullopt;
     }
-    // Unified store: both channels from one pair, moved down to that pair's lanes.
     const bool k0 = c0 <= Ch::W, k1 = c1 <= Ch::W;
     int pair = -1;
     if (k0) {
@@ -1521,7 +1508,6 @@ std::optional<Src> HalfSource(const Src& src, int h, bool second) {
 
 namespace {
 
-/// The registers an instruction writes, as (bank, register) pairs at lane granularity.
 void WrittenRegs(Inst& inst, std::vector<std::pair<Bank, int>>& out) {
     out.clear();
     RefList refs;
@@ -1606,7 +1592,6 @@ void Lowering::HoistLoadsGlobal() {
     if (sites.size() < 2) {
         return;
     }
-    // Per address register: the last write, and whether every site comes after it.
     std::map<std::pair<Bank, int>, std::size_t> last_write;
     std::vector<std::pair<Bank, int>> written;
     for (std::size_t i = 0; i < insts.size(); i++) {
@@ -1636,7 +1621,6 @@ void Lowering::HoistLoadsGlobal() {
         if (lw == last_write.end() || lw->second >= sa.start || lw->second >= entry_end) {
             continue; // written after (or inside) a use, or under control flow
         }
-        // Every site with this address register (and pointer): same treatment.
         std::vector<std::size_t> members;
         for (std::size_t b = a; b < sites.size(); b++) {
             const Site& sb = sites[b];
@@ -1819,7 +1803,6 @@ void Lowering::HoistLoads(int max_group) {
     if (seqs.size() < 2) {
         return;
     }
-    // Chains of the emitter's indexed form, for sharing and for reuse.
     struct ChainInfo {
         bool indexed = false;
         Reg areg{}, ones{}, ptr{};
@@ -1936,7 +1919,6 @@ void Lowering::HoistLoads(int max_group) {
         if (done[a]) {
             continue;
         }
-        // Extend the group while the gap holds no barrier and writes nothing a later
         // chain reads.
         std::size_t b = a;
         std::vector<std::pair<Bank, int>> gap_writes;
@@ -1967,7 +1949,6 @@ void Lowering::HoistLoads(int max_group) {
             }
             b++;
         }
-        // Copy everything before the group unchanged.
         for (; next < seqs[a].start; next++) {
             emit(insts[next]);
         }
@@ -1977,7 +1958,6 @@ void Lowering::HoistLoads(int max_group) {
             b = a;
         }
         if (b == a) {
-            // A single read: reused when known, else its own quad so a later read can
             // reuse it.
             const Sequence& sq = seqs[a];
             const Reg* have = find_known(chain_of[a]);
@@ -2060,7 +2040,6 @@ void Lowering::HoistLoads(int max_group) {
                 }
             }
         }
-        // The chains and loads, then one wait.
         bool any_load = false;
         for (std::size_t k = a; k <= b; k++) {
             if (reused[k - a]) {
@@ -2270,13 +2249,11 @@ void Lowering::TwoWideChains() {
     };
     RefList rr;
     std::vector<bool> drop(insts.size(), false);
-    // Replacement ops keyed by the original instruction they stand at.
     std::vector<std::vector<Inst>> replace(insts.size());
     for (std::size_t i = 0; i < insts.size(); i++) {
         if (drop[i] || !candidate(insts[i])) {
             continue;
         }
-        // Follow the result.
         std::vector<std::size_t> links{i};
         std::vector<std::size_t> moves;
         uint8_t cur = insts[i].dst.reg.n;
@@ -2622,7 +2599,6 @@ void Lowering::DirectTwoWide() {
                                         insts[j].src[0].mod == Mod::None &&
                                         insts[j].src[0].reg.bank != Bank::Const) {
                                         loaded = insts[j].src[0];
-                                        // The quad must not be written between.
                                         for (std::size_t k = j + 1; k < i && loaded; k++) {
                                             Refs(insts[k], rr);
                                             for (const Ref& r : rr) {
@@ -2639,7 +2615,6 @@ void Lowering::DirectTwoWide() {
                             if (!loaded) {
                                 return std::nullopt;
                             }
-                            // Compose the read's channels through the load.
                             Swizzle swz;
                             for (int l = 0; l < 4; l++) {
                                 const Ch ch = src.swz[l];
@@ -3103,7 +3078,6 @@ void Lowering::LoadSources() {
                 if (d.op == Op::Test) {
                     ok = FoldTest(d, k, loaded, lanes_read);
                 } else if (d.op == Op::PackS16) {
-                    // Reads one lane of a register: the load's source lane.
                     const Ch c = loaded.swz[d.u[0] & 3];
                     ok = loaded.mod == Mod::None && c <= Ch::W && loaded.reg.bank != Bank::Const;
                     if (ok) {
@@ -3446,7 +3420,6 @@ void Lowering::InternalRegisters() {
         uint32_t stored_quad[3] = {0, 0, 0};
         for (const std::size_t ri : order) {
             Range& range = ranges[ri];
-            // Advance the versions to the range's start.
             for (; cursor < range.start; cursor++) {
                 Inst& passed = insts[cursor];
                 Refs(passed, refs);
@@ -3498,7 +3471,6 @@ void Lowering::InternalRegisters() {
                 h = Held{std::nullopt, 0, range.last, true};
                 continue;
             }
-            // A register already holding the operand, unchanged since it was loaded.
             int phys = -1;
             if (range.value) {
                 for (int p = 0; p < 3; p++) {
@@ -3517,7 +3489,6 @@ void Lowering::InternalRegisters() {
                 h.busy_until = std::max(h.busy_until, range.last);
                 continue;
             }
-            // Otherwise a free register, the one whose held operand is wanted last.
             std::size_t best_next = 0;
             for (int p = 0; p < 3; p++) {
                 if (state[p].busy) {
@@ -3665,7 +3636,6 @@ void Lowering::CheckInternals() const {
             stale[0] = stale[1] = stale[2] = 0xf;
             continue;
         }
-        // Reads.
         const auto check = [&](const Reg& r, uint8_t lanes) {
             if (r.bank != Bank::Internal || (lanes & stale[r.n]) == 0) {
                 return;
@@ -3679,7 +3649,6 @@ void Lowering::CheckInternals() const {
                  context);
         };
         ForEachRead(inst, refs, check);
-        // Writes: unpredicated ones make their lanes fresh.
         if (inst.pred == Pred::None) {
             Refs(inst, refs);
             for (const Ref& r : refs) {
@@ -3740,7 +3709,6 @@ void Lowering::ResultsIntoInternal() {
             if (!ok || !touches_q) {
                 continue;
             }
-            // A single-lane writer of a not yet covered lane.
             const bool single_lane_dot = inst.op == Op::Dot && inst.pred == Pred::None &&
                                          (inst.dst.mask == 1 || inst.dst.mask == 2);
             const bool single_lane_move = inst.op == Op::MoveInternal && inst.pred == Pred::None &&
@@ -3766,7 +3734,6 @@ void Lowering::ResultsIntoInternal() {
         if (!ok || covered != 0xf) {
             continue;
         }
-        // Between the first writer and the load nothing else may touch the register.
         for (std::size_t i = first; i < m && ok; i++) {
             Refs(insts[i], refs);
             for (const Ref& r : refs) {
@@ -3907,7 +3874,6 @@ void Lowering::CoalesceOutputs() {
                 }
             }
         }
-        // The move is now o <- o.
         drop[m] = true;
         coalesced_outputs.insert(o / 4);
     }
@@ -4533,7 +4499,6 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             break;
         }
         case Op::Br:
-            // A branch to the label that follows it is a fall-through.
             if (n + 1 < insts.size() && insts[n + 1].op == Op::Label &&
                 insts[n + 1].label == i.label) {
                 break;

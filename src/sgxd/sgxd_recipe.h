@@ -380,7 +380,8 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory, uint32_t fb_va, uint32_
 // A1R5G5B5 SWIZ 2: R in bits 15:11, G 10:6, B 5:1, A 0, the PICA's RGB5A1 (SWIZ 0 stores A B G R
 // from bit 15, 1 A R G B, 3 B G R A; channels truncated, alpha its top bit).
 #define SGXD_RECIPE_PACK_A1R5G5B5_RGBA 0x40210000u
-// A4R4G4B4 SWIZ 2: R in bits 15:12, A in 3:0, the PICA's RGBA4 from an A8B8G8R8 source.
+// A4R4G4B4 SWIZ 2: R in bits 15:12, A in 3:0, the PICA's RGBA4 from an A8B8G8R8 source (the
+// swizzle A1R5G5B5 takes for the same order).
 #define SGXD_RECIPE_PACK_A4R4G4B4_RGBA 0x50210000u
 // F32F32 SWIZ 1: a two-word pixel (DOUBLE_PIXEL_PARTITIONS 1, sgxd_recipe_set_double_pixels)
 // stored word 1 first.
@@ -391,7 +392,7 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory, uint32_t fb_va, uint32_
 #define SGXD_RECIPE_PACK_U16_RAW 0xf0010000u
 void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory, uint32_t pbe0);
 
-// Route 1: a pass renders the guest's picture
+// PICA tiles (docs/sgxd/pbe.md): a pass renders the guest's picture
 // transposed, the recipe's x a guest row and its y a guest column, and its end of tile stores
 // each tile into the guest's colour buffer as the PICA lays it out: 8x8 tiles row after row,
 // Morton order inside, x first. The tile's eight 8x16 strips are TWIDDLED emits 16 rows high,
