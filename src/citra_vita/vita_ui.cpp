@@ -1725,6 +1725,23 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::SwapShortcut,
+         Category::Controls,
+         Kind::Choice,
+         Translatable("Swap screens shortcut"),
+         Translatable("Swaps the screens while you play. With PS: hold the PS button and press the "
+                      "other; the game sees neither, and the PS button alone still opens this "
+                      "menu as you let go of it. A rear touch half also presses the 3DS button it "
+                      "is mapped to."),
+         {Translatable("PS + Circle"), Translatable("PS + Cross"), Translatable("PS + Triangle"),
+          Translatable("PS + Square"), Translatable("PS + Up"), Translatable("PS + Down"),
+          Translatable("PS + Left"), Translatable("PS + Right"), Translatable("PS + L"),
+          Translatable("PS + R"), Translatable("PS + Start"), Translatable("PS + Select"),
+          Translatable("Rear touch, left half"), Translatable("Rear touch, right half"),
+          Translatable("None")},
+         0,
+         nullptr,
+         nullptr});
     add({Option::Motion,
          Category::Controls,
          Kind::Toggle,
@@ -5020,8 +5037,8 @@ std::string FreeControlName() {
 std::optional<ControlLayouts::Button> NextOnScreen(const ControlLayouts::ControlLayout& layout,
                                                    std::optional<ControlLayouts::Button> from) {
     const std::size_t start = from ? static_cast<std::size_t>(*from) + 1 : 0;
-    for (std::size_t k = 0; k < ControlLayouts::ButtonCount; k++) {
-        const std::size_t i = (start + k) % ControlLayouts::ButtonCount;
+    for (std::size_t k = 0; k < ControlLayouts::SpotCount; k++) {
+        const std::size_t i = (start + k) % ControlLayouts::SpotCount;
         if (layout.on_screen[i]) {
             return static_cast<ControlLayouts::Button>(i);
         }
@@ -5063,7 +5080,7 @@ void DrawOnScreenButton(ImDrawList* dl, ControlLayouts::Button button,
         arrow(1.0f, 0.0f);
         break;
     default: {
-        const char* const label = ControlLayouts::Label(button);
+        const char* const label = ControlLayouts::DiscLabel(button);
         const ImVec2 size = ImGui::CalcTextSize(label);
         const float scale =
             std::min({2.0f, p.size * 0.7f / size.x, p.size * 0.45f / ImGui::GetFontSize()});
@@ -5312,7 +5329,7 @@ void Ui::DrawControlPreview() {
                         Colour(palette->TextDim), name);
         }
     }
-    for (std::size_t i = 0; i < ControlLayouts::ButtonCount; i++) {
+    for (std::size_t i = 0; i < ControlLayouts::SpotCount; i++) {
         if (const auto& p = ed.layout.on_screen[i]) {
             const auto button = static_cast<ControlLayouts::Button>(i);
             DrawOnScreenButton(dl, button, *p, ed.layout.opacity, ed.selected == button);
@@ -5413,8 +5430,10 @@ void Ui::DrawControlButtons() {
         }
         return 0;
     };
-    for (std::size_t i = 0; i < ControlLayouts::ButtonCount; i++) {
+    // The 3DS buttons, then Swap screens: on the screen or not, with no Vita input of its own.
+    for (std::size_t i = 0; i < ControlLayouts::SpotCount; i++) {
         const auto button = static_cast<ControlLayouts::Button>(i);
+        const bool mapped = i < ControlLayouts::ButtonCount;
         ImGui::PushID(static_cast<int>(i));
         const Card card = CardItem("##button", ImVec2(width, RowHeight));
         if (focus_first_row) {
@@ -5426,27 +5445,31 @@ void Ui::DrawControlButtons() {
         if (card.visible) {
             ImDrawList* const dl = ImGui::GetWindowDrawList();
             const float y = card.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
-            dl->AddText(ImVec2(card.bb.Min.x + Pad, y), Colour(palette->Text),
-                        Tr(ControlLayouts::Label(button)));
+            const char* const label = Tr(ControlLayouts::Label(button));
+            dl->AddText(ImVec2(card.bb.Min.x + Pad, y), Colour(palette->Text), label);
             if (on_screen) {
                 const char* const tag = Tr("On screen");
                 const ImVec2 size = ImGui::CalcTextSize(tag);
-                const ImVec2 at(card.bb.Min.x + Pad + 90.0f, y);
+                const ImVec2 at(
+                    card.bb.Min.x + Pad + std::max(90.0f, ImGui::CalcTextSize(label).x + 16.0f), y);
                 dl->AddRectFilled(at - ImVec2(8.0f, 3.0f), at + size + ImVec2(8.0f, 3.0f),
                                   Colour(palette->Accent), size.y * 0.5f + 3.0f);
                 dl->AddText(at, Colour(palette->Backdrop), tag);
             }
-            const std::string value =
-                fmt::format("< {} >", Tr(InputNames[static_cast<std::size_t>(ed.layout.inputs[i])]));
-            const float value_width = ImGui::CalcTextSize(value.c_str()).x;
-            dl->AddText(ImVec2(card.bb.Max.x - Pad - value_width, y), Colour(palette->TextDim),
-                        value.c_str());
+            if (mapped) {
+                const std::string value = fmt::format(
+                    "< {} >", Tr(InputNames[static_cast<std::size_t>(ed.layout.inputs[i])]));
+                const float value_width = ImGui::CalcTextSize(value.c_str()).x;
+                dl->AddText(ImVec2(card.bb.Max.x - Pad - value_width, y), Colour(palette->TextDim),
+                            value.c_str());
+            }
         }
-        if (const int step = step_of(card, value_left); step != 0) {
+        if (const int step = mapped ? step_of(card, value_left) : 0; step != 0) {
             constexpr int Inputs = static_cast<int>(Config::ControlInput::Count);
             ed.layout.inputs[i] = ((ed.layout.inputs[i] + step) % Inputs + Inputs) % Inputs;
             ed.changed = true;
-        } else if (card.pressed && (card.by_pad || ImGui::GetIO().MousePos.x < value_left)) {
+        } else if (card.pressed &&
+                   (card.by_pad || !mapped || ImGui::GetIO().MousePos.x < value_left)) {
             if (on_screen) {
                 on_screen.reset();
                 if (ed.selected == button) {

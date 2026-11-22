@@ -1865,6 +1865,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             window.SetLoading(false);
             window.SetUi(nullptr);
             ShutdownSystem(system, threads_before);
+            window.ForgetSwapToggle();
             Config::SetRunningTitle({});
             VitaFrontend::CrashReport::NoteCheats(nullptr);
             VitaFrontend::CrashReport::NoteGame({}, 0, {});
@@ -2601,6 +2602,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     window.SetLoading(false);
     window.SetUi(nullptr);
     ShutdownSystem(system, threads_before);
+    window.ForgetSwapToggle();
     Config::SetRunningTitle({});
     VitaFrontend::CrashReport::NoteCheats(nullptr);
     VitaFrontend::CrashReport::NoteGame({}, 0, {});

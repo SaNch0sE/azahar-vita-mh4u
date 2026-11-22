@@ -70,6 +70,10 @@ const std::vector<const char*> UsbVideoScreens{"off", "top", "bottom"};
 const std::vector<const char*> Languages{"english", "chinese_simplified"};
 const std::vector<const char*> ControlLayoutWords{"default"};
 const std::vector<const char*> RightStickWords{"cstick", "lr", "dpad"};
+const std::vector<const char*> ShortcutWords{"ps_circle", "ps_cross",   "ps_triangle", "ps_square",
+                                             "ps_up",     "ps_down",    "ps_left",     "ps_right",
+                                             "ps_l",      "ps_r",       "ps_start",    "ps_select",
+                                             "rear_left", "rear_right", "none"};
 const std::vector<const char*> Inputs{"circle", "cross",  "triangle",  "square",     "up",
                                       "down",   "left",   "right",     "l",          "r",
                                       "start",  "select", "rear_left", "rear_right", "none"};
@@ -108,6 +112,8 @@ const std::array<Definition, Count> definitions{{
     {"control_layout", true, true, 0, 0, 0, ControlLayoutWords},
     {"motion", true, true, 0, 1, 1, Toggle},
     {"right_stick", true, true, 0, static_cast<int>(RightStickMode::Count) - 1, 0, RightStickWords},
+    // PS + cross.
+    {"swap_shortcut", true, true, 0, static_cast<int>(Shortcut::Count) - 1, 1, ShortcutWords},
     {"region", false, false, 0, 7, 0, Regions},
     // English, the config save's own on a new card.
     {"system_language", false, false, 0, 11, 1, SystemLanguages},
@@ -319,6 +325,13 @@ void ApplyLocked(Option option) {
     case Option::RightStick:
         SetRightStick(static_cast<RightStickMode>(value));
         break;
+    case Option::SwapShortcut: {
+        const auto shortcut = static_cast<Shortcut>(value);
+        EmuWindowVita::SetSwapShortcut(
+            shortcut == Shortcut::None ? 0u : InputMask(static_cast<ControlInput>(value)),
+            shortcut < Shortcut::RearLeft);
+        break;
+    }
     case Option::Region:
         // Index 0 is the automatic choice, Settings' -1.
         Settings::values.region_value = value - 1;
@@ -790,6 +803,12 @@ void Pin(Option option, int value) {
 std::optional<int> PinOf(Option option) {
     std::scoped_lock lock{mutex};
     return pins[static_cast<std::size_t>(option)];
+}
+
+void Unpin(Option option) {
+    std::scoped_lock lock{mutex};
+    pins[static_cast<std::size_t>(option)].reset();
+    ApplyLocked(option);
 }
 
 std::string ConsoleName() {

@@ -81,6 +81,9 @@ enum class Option : u32 {
     /// (both read zero).
     Motion,
     RightStick,
+    /// What swaps the screens while a title runs (Shortcut): a button pressed with PS held, a rear
+    /// panel half, or nothing.
+    SwapShortcut,
     Region,
     /// The 3DS's system language (Service::CFG::SystemLanguage's order: Japanese, English, French,
     /// German, Italian, Spanish, Simplified Chinese, Korean, Dutch, Portuguese, Russian,
@@ -179,6 +182,28 @@ enum class RightStickMode : int {
     Count,
 };
 
+/// A shortcut's input (the SwapShortcut option's values): one of the pad's buttons pressed while
+/// the PS button is held (ControlInput's order, Circle to Select), a rear panel half pressed alone
+/// (it presses what it is mapped to as well), or none. The values are ControlInput's.
+enum class Shortcut : int {
+    PsCircle,
+    PsCross,
+    PsTriangle,
+    PsSquare,
+    PsUp,
+    PsDown,
+    PsLeft,
+    PsRight,
+    PsL,
+    PsR,
+    PsStart,
+    PsSelect,
+    RearLeft,
+    RearRight,
+    None,
+    Count,
+};
+
 /// An input's word in the files (settings.txt's map_ keys, control_layouts.txt), and the input a
 /// word names.
 [[nodiscard]] const char* InputWord(ControlInput input);
@@ -240,6 +265,7 @@ void ClearTitleValues(const std::string& title);
 /// option takes the pin away: what the player chose last is what runs.
 void Pin(Option option, int value);
 [[nodiscard]] std::optional<int> PinOf(Option option);
+void Unpin(Option option);
 
 /// The 3DS's user name the games read (CFG's username: a greeting, a save's owner), which a title
 /// gets as it starts; empty for the console's own (AZAHAR on a new one). At most MaxConsoleName

@@ -150,7 +150,8 @@ public:
 
     /// The pad as the guest sees it: without the buttons still held from closing the pause menu.
     [[nodiscard]] u32 GuestButtons() const {
-        return buttons_held.load(std::memory_order_relaxed) &
+        // Acquire: a sample's buttons come with the menu_held bits ReadPad set before it.
+        return buttons_held.load(std::memory_order_acquire) &
                ~menu_held.load(std::memory_order_relaxed);
     }
 
@@ -161,6 +162,16 @@ public:
     /// The control layout's on-screen buttons the settings choose (Config::Option::ControlLayout;
     /// nullopt or a layout without any: none). Any thread; the next poll takes them.
     static void SetOnScreenButtons(std::optional<ControlLayouts::ControlLayout> layout);
+    /// The Swap screens shortcut (Config::Option::SwapShortcut): its pad bits (0 for none), and
+    /// whether they count only with the PS button held. Any thread; the next poll takes it.
+    static void SetSwapShortcut(u32 buttons, bool with_ps);
+    /// The screens swapped, or swapped back, for the rest of the session as the settings' Swap
+    /// screens would (Config::Pin: a menu's change takes it away): the shortcut's and the on-screen
+    /// Swap screens button's. The polling thread's.
+    void ToggleSwapScreens();
+    /// As a title ends: the shortcut's swap taken away (Config::Unpin), so that the next title
+    /// starts as its settings say. The run loop's.
+    void ForgetSwapToggle();
     /// The on-screen buttons into the frame being built, in game (Ui::Draw). The presenting
     /// thread's, which polls.
     void DrawOnScreenButtons();
@@ -228,8 +239,13 @@ private:
     std::atomic<Ui*> render_ui{nullptr};
     std::atomic<int> pending_ui_action{0};
     std::atomic<Ui*> pause_ui{nullptr};
-    /// The PS button as of the last poll, for its press's edge (the polling thread's).
+    /// The PS button as of the last poll, for its release's edge, and whether a shortcut was
+    /// taken while it was held (no pause menu at the release); the pad as of the last poll, for
+    /// the shortcuts' presses. The polling thread's.
     bool ps_held{};
+    bool ps_shortcut_taken{};
+    std::atomic<bool> swap_toggled{};
+    u32 pad_before{};
     /// ScriptPauseMenu's: the menu to open at the next poll, and the action it closes with.
     std::atomic<bool> script_menu_open{};
     std::atomic<int> script_menu_action{};

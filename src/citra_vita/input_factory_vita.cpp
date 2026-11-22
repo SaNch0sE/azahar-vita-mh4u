@@ -234,6 +234,12 @@ void SetRightStick(Config::RightStickMode mode) {
     right_stick.store(mode, std::memory_order_relaxed);
 }
 
+u32 InputMask(Config::ControlInput input) {
+    ASSERT_MSG(input >= Config::ControlInput{} && input < Config::ControlInput::Count,
+               "controls: input {}", static_cast<int>(input));
+    return InputMasks[static_cast<std::size_t>(input)];
+}
+
 void InitInput(EmuWindowVita& window) {
     g_window = &window;
     Input::RegisterFactory<Input::ButtonDevice>(EngineName, std::make_shared<VitaButtonFactory>());

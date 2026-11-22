@@ -31,4 +31,8 @@ void SetMotion(bool on);
 /// What the right stick drives (Config's RightStick option). At once; any thread.
 void SetRightStick(Config::RightStickMode mode);
 
+/// The pad bits of a Vita input (EmuWindowVita's pad word: the rear panel's halves included), 0
+/// for None.
+[[nodiscard]] u32 InputMask(Config::ControlInput input);
+
 } // namespace VitaFrontend

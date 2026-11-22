@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <psp2/ctrl.h>
@@ -74,6 +75,9 @@ std::atomic<u32> overlay_percent{60};
 Common::Mutex on_screen_mutex;
 std::optional<ControlLayouts::ControlLayout> on_screen_chosen;
 std::atomic<u32> on_screen_generation_set{};
+/// SetSwapShortcut's: PS + cross until the settings are applied.
+std::atomic<u32> swap_shortcut_buttons{SCE_CTRL_CROSS};
+std::atomic<bool> swap_shortcut_ps{true};
 Common::Mutex chosen_mutex;
 ScreenLayouts::Builtin chosen_builtin{ScreenLayouts::Builtin::Default};
 std::optional<ScreenLayouts::ScreenLayout> chosen_custom;
@@ -360,12 +364,28 @@ void EmuWindowVita::PollEvents() {
     }
     ReadPad();
     UpdateTouch();
-    // The PS button, edge triggered, opens the pause menu over a running title. No guest
-    // binding reads it, so the title never sees the press.
-    const bool ps = (buttons_held.load(std::memory_order_relaxed) & SCE_CTRL_PSBUTTON) != 0;
-    const bool pressed = ps && !ps_held;
+    // The PS button: held, a layer of shortcuts (the Swap screens shortcut's button pressed with
+    // it swaps the screens), the game seeing none of the buttons pressed with it (ReadPad's
+    // menu_held keeps each from the guest until it is let go, as after the pause menu); let go
+    // with no shortcut taken, it opens the pause menu over a running title. No guest binding
+    // reads it, so the title never sees it.
+    const u32 held = buttons_held.load(std::memory_order_relaxed);
+    const u32 pressed = held & ~pad_before;
+    pad_before = held;
+    const bool ps = (held & SCE_CTRL_PSBUTTON) != 0;
+    const u32 shortcut = swap_shortcut_buttons.load(std::memory_order_relaxed);
+    const bool shortcut_with_ps = swap_shortcut_ps.load(std::memory_order_relaxed);
+    if ((pressed & shortcut) != 0 && (ps || !shortcut_with_ps) &&
+        pause_ui.load(std::memory_order_acquire) != nullptr) {
+        ToggleSwapScreens();
+        ps_shortcut_taken |= ps;
+    }
+    const bool released = !ps && ps_held;
     ps_held = ps;
-    if (pressed || script_menu_open.exchange(false, std::memory_order_acq_rel)) {
+    // A scripted open taken at every poll: one asked for as a PS release opens the menu is that
+    // menu's, not a second one's after it.
+    const bool scripted = script_menu_open.exchange(false, std::memory_order_acq_rel);
+    if ((released && !std::exchange(ps_shortcut_taken, false)) || scripted) {
         if (Ui* const ui = pause_ui.load(std::memory_order_acquire)) {
             RunPauseMenu(*ui);
         }
@@ -406,6 +426,10 @@ void EmuWindowVita::RunPauseMenu(Ui& ui) {
     preview_layout.reset();
     UpdateCurrentFramebufferLayout();
     menu_held.store(buttons_held.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    // A PS button held as the menu closes opens nothing when it is let go, and the buttons held
+    // now press no shortcut.
+    pad_before = buttons_held.load(std::memory_order_relaxed);
+    ps_shortcut_taken = ps_held;
     switch (action) {
     case Ui::Action::SaveState:
     case Ui::Action::LoadState:
@@ -490,8 +514,13 @@ void EmuWindowVita::ReadPad() {
                 pad.buttons |= rear.report[i].x < rear_middle ? RearLeftButton : RearRightButton;
             }
         }
-        buttons_held.store(pad.buttons, std::memory_order_relaxed);
         menu_held.fetch_and(pad.buttons, std::memory_order_relaxed);
+        // A button held with the PS button is the shortcuts' (PollEvents): kept from the guest
+        // from the first sample it shows in, before that sample is published (GuestButtons).
+        if ((pad.buttons & SCE_CTRL_PSBUTTON) != 0) {
+            menu_held.fetch_or(pad.buttons & ~SCE_CTRL_PSBUTTON, std::memory_order_relaxed);
+        }
+        buttons_held.store(pad.buttons, std::memory_order_release);
         stick_x.store(pad.lx, std::memory_order_relaxed);
         stick_y.store(pad.ly, std::memory_order_relaxed);
         right_x.store(pad.rx, std::memory_order_relaxed);
@@ -625,7 +654,15 @@ void EmuWindowVita::UpdateTouch() {
     }
     button_fingers = fingers_now;
     button_finger_count = fingers_now_count;
+    const u32 held_before = on_screen_held.load(std::memory_order_relaxed);
     hold(held);
+    // Swap screens as a finger comes down on it (it holds no 3DS button), in a title alone as the
+    // PS shortcut: on the game list or the settings an all-games layout's spot would pin the
+    // next title's screens unseen.
+    if (((held & ~held_before) >> ControlLayouts::SwapScreensBit & 1) != 0 &&
+        pause_ui.load(std::memory_order_acquire) != nullptr) {
+        ToggleSwapScreens();
+    }
     if (!touch_at) {
         release();
         return;
@@ -647,6 +684,26 @@ void EmuWindowVita::SetOnScreenButtons(std::optional<ControlLayouts::ControlLayo
     std::scoped_lock lk{on_screen_mutex};
     on_screen_chosen = layout && layout->HasOnScreen() ? std::move(layout) : std::nullopt;
     on_screen_generation_set.fetch_add(1, std::memory_order_release);
+}
+
+void EmuWindowVita::SetSwapShortcut(u32 buttons, bool with_ps) {
+    swap_shortcut_buttons.store(buttons, std::memory_order_relaxed);
+    swap_shortcut_ps.store(with_ps, std::memory_order_relaxed);
+}
+
+void EmuWindowVita::ToggleSwapScreens() {
+    using Config::Option;
+    const int swapped = Config::Effective(Option::SwapScreens) != 0 ? 0 : 1;
+    Config::Pin(Option::SwapScreens, swapped);
+    swap_toggled.store(true, std::memory_order_relaxed);
+    UpdateCurrentFramebufferLayout();
+    LOG_INFO(Frontend, "swap screens: {}", swapped != 0 ? "on" : "off");
+}
+
+void EmuWindowVita::ForgetSwapToggle() {
+    if (swap_toggled.exchange(false, std::memory_order_relaxed)) {
+        Config::Unpin(Config::Option::SwapScreens);
+    }
 }
 
 void EmuWindowVita::DrawOnScreenButtons() {

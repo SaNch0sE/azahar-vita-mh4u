@@ -29,32 +29,35 @@ namespace {
 constexpr float DisplayWidth = 960.0f;
 constexpr float DisplayHeight = 544.0f;
 
-/// By Button: its label, its key in the file, its NativeButton.
+/// By Button: its label, the text on its on-screen button, its key in the file, its bit in the
+/// on-screen buttons' word (a NativeButton's).
 constexpr struct {
     const char* label;
+    const char* disc;
     const char* key;
-    Settings::NativeButton::Values native;
-} Buttons[ButtonCount] = {
-    {"A", "a", Settings::NativeButton::A},
-    {"B", "b", Settings::NativeButton::B},
-    {"X", "x", Settings::NativeButton::X},
-    {"Y", "y", Settings::NativeButton::Y},
-    {"Up", "up", Settings::NativeButton::Up},
-    {"Down", "down", Settings::NativeButton::Down},
-    {"Left", "left", Settings::NativeButton::Left},
-    {"Right", "right", Settings::NativeButton::Right},
-    {"L", "l", Settings::NativeButton::L},
-    {"R", "r", Settings::NativeButton::R},
-    {"ZL", "zl", Settings::NativeButton::ZL},
-    {"ZR", "zr", Settings::NativeButton::ZR},
-    {"Start", "start", Settings::NativeButton::Start},
-    {"Select", "select", Settings::NativeButton::Select},
+    u32 bit;
+} Buttons[SpotCount] = {
+    {"A", "A", "a", Settings::NativeButton::A},
+    {"B", "B", "b", Settings::NativeButton::B},
+    {"X", "X", "x", Settings::NativeButton::X},
+    {"Y", "Y", "y", Settings::NativeButton::Y},
+    {"Up", "Up", "up", Settings::NativeButton::Up},
+    {"Down", "Down", "down", Settings::NativeButton::Down},
+    {"Left", "Left", "left", Settings::NativeButton::Left},
+    {"Right", "Right", "right", Settings::NativeButton::Right},
+    {"L", "L", "l", Settings::NativeButton::L},
+    {"R", "R", "r", Settings::NativeButton::R},
+    {"ZL", "ZL", "zl", Settings::NativeButton::ZL},
+    {"ZR", "ZR", "zr", Settings::NativeButton::ZR},
+    {"Start", "Start", "start", Settings::NativeButton::Start},
+    {"Select", "Select", "select", Settings::NativeButton::Select},
+    {"Swap screens", "Swap", "swap_screens", SwapScreensBit},
 };
 
-/// By Button: a new on-screen button's place. The shoulders high on the sides (ZR clear of the stats
-/// overlay's box in the top right corner), the d-pad's and the face buttons' crosses low on the left
-/// and the right, Select and Start under the middle.
-constexpr OnScreen Defaults[ButtonCount] = {
+/// By Button: a new on-screen button's place. The shoulders high on the sides (ZR clear of the
+/// stats overlay's box in the top right corner), the d-pad's and the face buttons' crosses low on
+/// the left and the right, Select and Start under the middle, Swap screens in the top left corner.
+constexpr OnScreen Defaults[SpotCount] = {
     {910.0f, 420.0f, 64.0f}, // A
     {850.0f, 480.0f, 64.0f}, // B
     {850.0f, 360.0f, 64.0f}, // X
@@ -69,6 +72,7 @@ constexpr OnScreen Defaults[ButtonCount] = {
     {900.0f, 150.0f, 88.0f}, // ZR
     {540.0f, 514.0f, 56.0f}, // Start
     {420.0f, 514.0f, 56.0f}, // Select
+    {40.0f, 40.0f, 64.0f},   // Swap screens
 };
 
 constexpr char LayoutsPath[] = "ux0:data/azahar/control_layouts.txt";
@@ -122,9 +126,12 @@ void WriteLocked() {
     for (const ControlLayout& layout : layouts) {
         std::fprintf(f, "\n[%s]\nopacity = %ld\n", layout.name.c_str(),
                      std::lround(layout.opacity * 100.0f));
-        for (std::size_t i = 0; i < ButtonCount; i++) {
-            std::fprintf(f, "%s = %s\n", Buttons[i].key,
-                         Config::InputWord(static_cast<Config::ControlInput>(layout.inputs[i])));
+        for (std::size_t i = 0; i < SpotCount; i++) {
+            if (i < ButtonCount) {
+                std::fprintf(
+                    f, "%s = %s\n", Buttons[i].key,
+                    Config::InputWord(static_cast<Config::ControlInput>(layout.inputs[i])));
+            }
             if (const auto& p = layout.on_screen[i]) {
                 std::fprintf(f, "%s",
                              fmt::format("{}_on_screen = {} {} {}\n", Buttons[i].key,
@@ -154,7 +161,7 @@ float glyph_height;
 std::vector<u32> hud_vertices;
 std::vector<u16> hud_indices;
 std::string hud_for_name;
-std::array<std::optional<OnScreen>, ButtonCount> hud_for_places{};
+std::array<std::optional<OnScreen>, SpotCount> hud_for_places{};
 float hud_for_opacity = -1.0f;
 u32 hud_for_held = ~0u;
 
@@ -243,7 +250,7 @@ void MakeHud(const ControlLayout& layout, u32 held) {
     hud_vertices.clear();
     hud_indices.clear();
     const float alpha = layout.opacity;
-    for (std::size_t i = 0; i < ButtonCount; i++) {
+    for (std::size_t i = 0; i < SpotCount; i++) {
         const auto& p = layout.on_screen[i];
         if (!p) {
             continue;
@@ -271,7 +278,7 @@ void MakeHud(const ControlLayout& layout, u32 held) {
             break;
         default: {
             // The label as large as fits across the button, at most twice the font's size.
-            const char* const label = Buttons[i].label;
+            const char* const label = Buttons[i].disc;
             float width = 0.0f;
             for (const char* c = label; *c != '\0'; c++) {
                 width += glyphs[static_cast<u8>(*c) & 0x7f].advance;
@@ -291,8 +298,12 @@ const char* Label(Button button) {
     return Buttons[static_cast<std::size_t>(button)].label;
 }
 
+const char* DiscLabel(Button button) {
+    return Buttons[static_cast<std::size_t>(button)].disc;
+}
+
 u32 NativeButtonOf(Button button) {
-    return Buttons[static_cast<std::size_t>(button)].native;
+    return Buttons[static_cast<std::size_t>(button)].bit;
 }
 
 bool ControlLayout::HasOnScreen() const {
@@ -313,7 +324,7 @@ OnScreen Limited(OnScreen place) {
 }
 
 std::optional<Button> Hit(const ControlLayout& layout, float x, float y) {
-    for (std::size_t i = ButtonCount; i-- > 0;) {
+    for (std::size_t i = SpotCount; i-- > 0;) {
         if (const auto& p = layout.on_screen[i]) {
             const float r = p->size * 0.5f;
             if ((x - p->x) * (x - p->x) + (y - p->y) * (y - p->y) <= r * r) {
@@ -370,9 +381,9 @@ void Load() {
         const std::string value = equals == std::string::npos ? "" : Trim(line.substr(equals + 1));
         bool understood = false;
         if (layout && equals != std::string::npos) {
-            for (std::size_t i = 0; i < ButtonCount; i++) {
+            for (std::size_t i = 0; i < SpotCount; i++) {
                 const std::string button = Buttons[i].key;
-                if (key == button) {
+                if (key == button && i < ButtonCount) {
                     if (const auto input = Config::InputFromWord(value)) {
                         layout->inputs[i] = static_cast<int>(*input);
                         mapped[i] = understood = true;
@@ -455,8 +466,8 @@ void Remove(std::size_t index) {
 void InitHud() {
     const ImGuiIO& io = ImGui::GetIO();
     const ImFont* font = io.Fonts->Fonts[0];
-    for (std::size_t i = 0; i < ButtonCount; i++) {
-        for (const char* c = Buttons[i].label; *c != '\0'; c++) {
+    for (std::size_t i = 0; i < SpotCount; i++) {
+        for (const char* c = Buttons[i].disc; *c != '\0'; c++) {
             const ImFontGlyph* g = font->FindGlyph(static_cast<ImWchar>(*c));
             ASSERT_MSG(g != nullptr && g->Codepoint == static_cast<u32>(*c),
                        "on-screen buttons: the font has no glyph for {:?}", *c);

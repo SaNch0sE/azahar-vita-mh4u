@@ -12,17 +12,16 @@
 #include "common/common_types.h"
 
 /**
- * The player's own control layouts, as the custom screen layouts are theirs: each a name, the Vita
- * input every 3DS button answers to (the Controls tab's mapping), and for any button a round
- * button of its own on the front panel, drawn over the game. A finger that comes down on an
- * on-screen button holds it for as long as it stays on the panel, whichever on-screen button it
- * slides onto; any other finger is the 3DS touch screen's as before. That gives buttons a player
- * would rather not reach elsewhere (ZL and ZR, the rear panel's halves by default) a place on the
- * display. Kept in ux0:data/azahar/control_layouts.txt; made in the control layout editor.
+ * The player's own control layouts: each a name, the Vita input every 3DS button answers to,
+ * and for any button a round button of its own on the front panel, drawn over the game. A
+ * finger that comes down on an on-screen button holds it while it stays on the panel, whichever
+ * on-screen button it slides onto; any other finger is the 3DS touch screen's. Kept in
+ * ux0:data/azahar/control_layouts.txt.
  */
 namespace VitaFrontend::ControlLayouts {
 
-/// The 3DS buttons a layout maps, in the menus' order (Config::Option::MapA's onwards).
+/// The 3DS buttons a layout maps, in the menus' order (Config::Option::MapA's onwards), then the
+/// frontend's own on-screen button.
 enum class Button : u8 {
     A,
     B,
@@ -38,14 +37,23 @@ enum class Button : u8 {
     ZR,
     Start,
     Select,
+    /// Swaps the screens (EmuWindowVita::ToggleSwapScreens): on screen only, no Vita input.
+    SwapScreens,
     Count,
 };
-inline constexpr std::size_t ButtonCount = static_cast<std::size_t>(Button::Count);
+/// The 3DS buttons, the ones a layout maps to Vita inputs.
+inline constexpr std::size_t ButtonCount = static_cast<std::size_t>(Button::SwapScreens);
+/// The buttons a layout can put on the screen: the 3DS's and Swap screens.
+inline constexpr std::size_t SpotCount = static_cast<std::size_t>(Button::Count);
+/// Swap screens' bit in the on-screen buttons' word, past every NativeButton's.
+inline constexpr u32 SwapScreensBit = 31;
 
-/// The button's name in the menus and on its on-screen button ("A", "ZL", "Start"; the d-pad's
-/// are drawn as arrows on screen).
+/// The button's name in the menus ("A", "ZL", "Start", "Swap screens").
 [[nodiscard]] const char* Label(Button button);
-/// Its Settings::NativeButton: the bit the on-screen buttons' word holds it at.
+/// The text on its on-screen button ("A", "Swap"; the d-pad's are drawn as arrows).
+[[nodiscard]] const char* DiscLabel(Button button);
+/// Its Settings::NativeButton (SwapScreensBit for Swap screens): the bit the on-screen buttons'
+/// word holds it at.
 [[nodiscard]] u32 NativeButtonOf(Button button);
 
 /// An on-screen button's limits, its diameter in display pixels.
@@ -63,7 +71,7 @@ struct ControlLayout {
     /// By Button: the Vita input it answers to, a Config::ControlInput.
     std::array<int, ButtonCount> inputs{};
     /// By Button: its on-screen button, if it has one (as well as its input).
-    std::array<std::optional<OnScreen>, ButtonCount> on_screen{};
+    std::array<std::optional<OnScreen>, SpotCount> on_screen{};
     /// How solid the on-screen buttons are drawn, 0.1 to 1.
     float opacity = 0.5f;
 
