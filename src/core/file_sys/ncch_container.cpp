@@ -42,6 +42,9 @@ u64 GetModId(u64 program_id) {
  * @return Size of decompressed buffer
  */
 static std::size_t LZSS_GetDecompressedSize(std::span<const u8> buffer) {
+    if (buffer.size() < sizeof(u32)) {
+        return buffer.size();
+    }
     u32 offset_size;
     std::memcpy(&offset_size, buffer.data() + buffer.size() - sizeof(u32), sizeof(u32));
     return offset_size + buffer.size();
@@ -82,13 +85,22 @@ struct ImagePiecesView {
 template <typename Buffer>
 static bool LZSS_DecompressInPlace(Buffer& buffer, std::size_t buffer_size,
                                    std::size_t compressed_size) {
+    if (compressed_size < 8 || buffer_size < compressed_size) {
+        return false;
+    }
     const u32 buffer_top_and_bottom =
         buffer[compressed_size - 8] | (buffer[compressed_size - 7] << 8) |
         (buffer[compressed_size - 6] << 16) | (static_cast<u32>(buffer[compressed_size - 5]) << 24);
 
+    const std::size_t top = (buffer_top_and_bottom >> 24) & 0xFF;
+    const std::size_t bottom = buffer_top_and_bottom & 0xFFFFFF;
+    if (top > compressed_size || bottom > compressed_size) {
+        return false;
+    }
+
     std::size_t out = buffer_size;
-    std::size_t index = compressed_size - ((buffer_top_and_bottom >> 24) & 0xFF);
-    std::size_t stop_index = compressed_size - (buffer_top_and_bottom & 0xFFFFFF);
+    std::size_t index = compressed_size - top;
+    std::size_t stop_index = compressed_size - bottom;
 
     while (index > stop_index) {
         u8 control = buffer[--index];
@@ -143,6 +155,9 @@ static bool LZSS_DecompressInPlace(Buffer& buffer, std::size_t buffer_size,
  * @return True on success, otherwise false
  */
 static bool LZSS_Decompress(std::span<const u8> compressed, std::span<u8> decompressed) {
+    if (decompressed.size() < compressed.size()) {
+        return false;
+    }
     std::memset(decompressed.data(), 0, decompressed.size());
     std::memcpy(decompressed.data(), compressed.data(), compressed.size());
     return LZSS_DecompressInPlace(decompressed, decompressed.size(), compressed.size());

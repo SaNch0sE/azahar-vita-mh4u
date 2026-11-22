@@ -31,6 +31,9 @@ Loader::ResultStatus TitleMetadata::Load(const std::string& file_path) {
 }
 
 Loader::ResultStatus TitleMetadata::Load(std::span<const u8> file_data, std::size_t offset) {
+    if (offset > file_data.size()) {
+        return Loader::ResultStatus::Error;
+    }
     std::size_t total_size = static_cast<std::size_t>(file_data.size() - offset);
     if (total_size < sizeof(u32_be)) {
         return Loader::ResultStatus::Error;
@@ -65,6 +68,7 @@ Loader::ResultStatus TitleMetadata::Load(std::span<const u8> file_data, std::siz
         return Loader::ResultStatus::ErrorInvalidFormat;
     }
 
+    tmd_chunks.clear();
     for (u16 i = 0; i < tmd_body.content_count; i++) {
         ContentChunk chunk;
 
@@ -257,7 +261,7 @@ void TitleMetadata::Print() const {
         LOG_DEBUG(Service_FS, "Content chunks for content info index {}:", i);
         for (u16 j = index; j < index + count; j++) {
             // Don't attempt to print content we don't have
-            if (j > tmd_body.content_count)
+            if (j >= tmd_chunks.size())
                 break;
 
             const ContentChunk& chunk = tmd_chunks[j];
