@@ -101,6 +101,13 @@ public:
     /// and cleared.
     [[nodiscard]] int TakeUiAction();
 
+    /// A quit (back to the game list) or an exit the command channel asks for, left for
+    /// TakeUiAction as the pause menu leaves one: the interface detached first.
+    void RequestQuit(bool exit_application);
+    /// The command channel: the pause menu opens as the PS button opens it, stays a
+    /// second, and closes with `action` (a Ui::Action) as if chosen in it.
+    void ScriptPauseMenu(int action);
+
     /// True once the user has asked to leave.
     [[nodiscard]] bool IsQuitRequested() const {
         return quit_requested;
@@ -169,6 +176,9 @@ private:
     std::atomic<Ui*> pause_ui{nullptr};
     /// The PS button as of the last poll, for its press's edge (the polling thread's).
     bool ps_held{};
+    /// ScriptPauseMenu's: the menu to open at the next poll, and the action it closes with.
+    std::atomic<bool> script_menu_open{};
+    std::atomic<int> script_menu_action{};
     /// The pause menu is open (under `pause_gate`): the run loop waits on it.
     Common::CoreCondition pause_gate;
     bool paused{};

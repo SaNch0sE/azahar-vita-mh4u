@@ -945,6 +945,17 @@ bool RenderThread::AccelerateDma(PAddr src, PAddr dst, u32 size) {
     HoldRead(src, size, PageHolds::DmaIn);
     HoldWrite(dst, size, PageHolds::DmaOut);
     ForgetDroppedOutputs(dst, dst + size);
+    // A DMA into an LCD buffer writes that screen, as a transfer does.
+    PAddr lcd = 0;
+    const int screen = LcdScreenOf(dst, size, &lcd);
+    if (screen >= 0) {
+        NoteLcdWrite(screen, lcd, false);
+    }
+#ifdef VITA_DIAGNOSTICS
+    if (screenlog_on) {
+        screenlog_transfers += fmt::format(" dma {:#x}+{:#x}->{:#x}(s{})", src, size, dst, screen);
+    }
+#endif
     SyncState();
     const u8* const bytes = check ? memory.GetPhysicalPointer(src) : nullptr;
     Put(Op::Dma, DmaRecord{src, dst, size, bytes ? Common::ComputeHash64(bytes, size) : 0});

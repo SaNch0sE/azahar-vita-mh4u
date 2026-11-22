@@ -184,9 +184,8 @@ struct VitaNativeCensus {
 VitaNativeCensus TakeVitaNativeCensus();
 #endif
 
-/// In-kernel scheduling (azaharnative 34), on by default: the module switches the guest's
-/// threads on a SleepThread itself.
-void SetVitaInKernelScheduling(bool on);
+/// How the kernel module's tables map `va` on each core, for a fault's report and `tables`.
+std::vector<std::string> ModuleTablesAt(u32 va);
 
 class ARM_VitaNative final : public ARM_Interface {
 public:

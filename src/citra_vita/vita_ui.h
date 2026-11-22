@@ -69,6 +69,9 @@ public:
 
     /// Switches to the in-game state, where nothing is drawn over the title.
     void EnterGame();
+    /// Back to the game list, where the pause menu's "Quit game" leaves the interface: after a
+    /// quit that did not come through the menu (the command channel).
+    void LeaveGame();
 
     /// Opens the pause menu over a running title.
     void OpenPauseMenu();

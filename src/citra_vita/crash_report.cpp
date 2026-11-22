@@ -9,18 +9,24 @@
 // "terminate called after throwing" in a build without our terminate handler. The link wraps
 // raise, __assert_func and malloc with these (CMakeLists.txt): the text, the size of the last
 // allocation refused and the return addresses found on the thread's stack go to the debug channel
-// and to ux0:data/azahar/crash.txt, which the next start prints (PrintLast).
+// and to ux0:data/azahar/crash.txt, which the next start prints (PrintLast). malloc, calloc,
+// realloc and free keep the heap's large blocks with where they were allocated (PrintHeapSites).
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <string_view>
 
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
+#include <unwind.h>
 
 #include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
@@ -37,7 +43,14 @@ extern const char __build_id_end[];
 
 int __real_raise(int sig);
 void __real___assert_func(const char* file, int line, const char* func, const char* expr);
-void* __real_malloc(size_t size);
+void* __real__malloc_r(struct _reent* r, size_t size);
+void __real__free_r(struct _reent* r, void* p);
+void __malloc_lock(struct _reent*);
+void __malloc_unlock(struct _reent*);
+// newlib's malloc (mallocr.c): where its arena starts, and its bins (the third is the top chunk).
+extern char* __malloc_sbrk_base;
+extern void* __malloc_av_[];
+extern unsigned int _newlib_heap_size_user;
 }
 
 namespace {
@@ -79,9 +92,323 @@ bool IsReturnAddress(uintptr_t value) {
            (insn & 0x0FFFFFF0) == 0x012FFF30;
 }
 
+/// Where a scan for return addresses from `sp` stops: the thread's stack's top, at most `limit`
+/// bytes on; an upcall's SP (its own stack, not the thread's) gets 16 KiB.
+uintptr_t StackScanEnd(const SceKernelThreadInfo& info, uintptr_t sp, uintptr_t limit) {
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(info.stack);
+    const uintptr_t end = begin + info.stackSize;
+    if (sp < begin || sp >= end) {
+        return sp + 0x4000;
+    }
+    return std::min(end, sp + limit);
+}
+
+/// The heap's large blocks, live: their size and the return addresses on the allocating thread's
+/// stack (heapsites, and a crash's report). Kept under malloc's own lock.
+constexpr size_t SiteThreshold = 512 * 1024;
+struct Site {
+    const void* p;
+    uint32_t size;
+    uint32_t ra[10];
+};
+Site sites[96];
+uint32_t sites_dropped;
+
+/// A chunk's size from newlib's header before it (mallocr.c).
+size_t ChunkSize(const void* p) {
+    return *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(p) - 4) & ~3u;
+}
+
+void TrackSite(const void* p, size_t size) {
+    // The scan starts past these locals: the site it fills and the thread's entry point (a code
+    // address) would be found on the stack too.
+    struct {
+        SceKernelThreadInfo info;
+        Site site;
+    } l{};
+    l.site = {p, static_cast<uint32_t>(size), {}};
+    l.info.size = sizeof(l.info);
+    sceKernelGetThreadInfo(sceKernelGetThreadId(), &l.info);
+    const uintptr_t from = reinterpret_cast<uintptr_t>(&l + 1);
+    const uintptr_t end = StackScanEnd(l.info, from, 0x8000);
+    uint32_t n = 0;
+    for (uintptr_t a = (from + 3) & ~uintptr_t{3}; a + 4 <= end && n < 10; a += 4) {
+        uintptr_t value;
+        std::memcpy(&value, reinterpret_cast<const void*>(a), sizeof(value));
+        if (IsReturnAddress(value)) {
+            l.site.ra[n++] = static_cast<uint32_t>(value);
+        }
+    }
+    __malloc_lock(_REENT);
+    Site* const slot = std::find_if(std::begin(sites), std::end(sites),
+                                    [](const Site& s) { return s.p == nullptr; });
+    if (slot != std::end(sites)) {
+        *slot = l.site;
+    } else {
+        sites_dropped++;
+    }
+    __malloc_unlock(_REENT);
+}
+
+void UntrackSite(const void* p) {
+    __malloc_lock(_REENT);
+    for (Site& s : sites) {
+        if (s.p == p) {
+            s.p = nullptr;
+            break;
+        }
+    }
+    __malloc_unlock(_REENT);
+}
+
+#ifdef VITA_DIAGNOSTICS
+/// `leaktrack`: every heap block's allocation site from then on, to name what a quit leaves behind
+/// (`leaks`). The sites are call chains (unwound, so slow: a diagnostic), each kept once; every 8
+/// bytes of the heap hold the site of the block that starts there. The tables are a memory block of
+/// their own, outside the heap they watch. Under malloc's own lock.
+constexpr uint32_t LeakDepth = 10;
+constexpr uint32_t LeakSites = 16384;
+constexpr uint32_t LeakBuckets = 32768;
+struct LeakSite {
+    uint32_t ra[LeakDepth];
+};
+struct LeakTables {
+    uint16_t buckets[LeakBuckets];
+    LeakSite sites[LeakSites];
+    uint32_t counts[LeakSites];
+    uint32_t bytes[LeakSites];
+    uint16_t ids[1]; ///< one per 8 bytes of the heap
+};
+LeakTables* leak;
+uintptr_t leak_base, leak_end;
+uint32_t leak_sites_used = 1;
+uint32_t leak_full;
+
+struct StackBounds {
+    SceUID thread;
+    uintptr_t lo, hi;
+};
+StackBounds stack_bounds[64];
+uint32_t stack_bounds_next;
+
+/// Where a scan from `from` (on the calling thread's stack) stops: 1 KiB on, within the stack; an
+/// upcall's SP (its own stack) gets 512 bytes.
+uintptr_t LeakScanEnd(uintptr_t from) {
+    const SceUID self = sceKernelGetThreadId();
+    for (const StackBounds& b : stack_bounds) {
+        if (b.thread == self && from >= b.lo && from < b.hi) {
+            return std::min(b.hi, from + 1024);
+        }
+    }
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    if (sceKernelGetThreadInfo(self, &info) >= 0) {
+        const uintptr_t lo = reinterpret_cast<uintptr_t>(info.stack);
+        const uintptr_t hi = lo + info.stackSize;
+        stack_bounds[stack_bounds_next++ % std::size(stack_bounds)] = {self, lo, hi};
+        if (from >= lo && from < hi) {
+            return std::min(hi, from + 1024);
+        }
+    }
+    return from + 512;
+}
+
+void LeakRecord(const void* p) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(p);
+    if (at < leak_base || at >= leak_end) {
+        return;
+    }
+    // The chain as the unwinder walks it (the EHABI tables: exact, through every C++ frame);
+    // where it stops early (a C frame without a table: newlib, pthread-embedded), the rest from
+    // the stack's scan, after a 1 (the scan starts past this local, which it fills).
+    struct {
+        LeakSite site;
+        uint32_t n;
+    } l{};
+    __malloc_lock(_REENT);
+    _Unwind_Backtrace(
+        [](_Unwind_Context* context, void* arg) {
+            auto* const out = static_cast<decltype(l)*>(arg);
+            if (out->n == LeakDepth) {
+                return _URC_END_OF_STACK;
+            }
+            out->site.ra[out->n++] = static_cast<uint32_t>(_Unwind_GetIP(context));
+            return _URC_NO_REASON;
+        },
+        &l);
+    uint32_t n = l.n;
+    if (n < 4) {
+        l.site.ra[n++] = 1;
+        const uintptr_t from = reinterpret_cast<uintptr_t>(&l + 1);
+        const uintptr_t end = LeakScanEnd(from);
+        for (uintptr_t a = (from + 3) & ~uintptr_t{3}; a + 4 <= end && n < LeakDepth; a += 4) {
+            uintptr_t value;
+            std::memcpy(&value, reinterpret_cast<const void*>(a), sizeof(value));
+            if (IsReturnAddress(value)) {
+                l.site.ra[n++] = static_cast<uint32_t>(value);
+            }
+        }
+    }
+    uint32_t hash = 2166136261u;
+    for (const uint32_t ra : l.site.ra) {
+        hash = (hash ^ ra) * 16777619u;
+    }
+    uint16_t id = 0;
+    for (uint32_t probe = 0; probe < 64; probe++) {
+        uint16_t& bucket = leak->buckets[(hash + probe) % LeakBuckets];
+        if (bucket == 0) {
+            if (leak_sites_used < LeakSites) {
+                id = static_cast<uint16_t>(leak_sites_used++);
+                leak->sites[id] = l.site;
+                bucket = id;
+            }
+            break;
+        }
+        if (std::memcmp(&leak->sites[bucket], &l.site, sizeof(l.site)) == 0) {
+            id = bucket;
+            break;
+        }
+    }
+    leak_full += id == 0 ? 1 : 0;
+    leak->ids[(at - leak_base) >> 3] = id;
+    __malloc_unlock(_REENT);
+}
+
+/// A block freed: its site goes, so that one the C library allocates there itself (its own calls
+/// pass the wrap by) shows as unrecorded, not as the block before it.
+void LeakForget(const void* p) {
+    const uintptr_t at = reinterpret_cast<uintptr_t>(p);
+    if (at >= leak_base && at < leak_end) {
+        leak->ids[(at - leak_base) >> 3] = 0;
+    }
+}
+#endif
+
 } // Anonymous namespace
 
 namespace VitaFrontend::CrashReport {
+
+#ifdef VITA_DIAGNOSTICS
+void StartLeakTracking() {
+    if (leak != nullptr) {
+        sceClibPrintf("[azahar] leaktrack: on since before\n");
+        return;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(__malloc_sbrk_base);
+    const size_t size = offsetof(LeakTables, ids) + (_newlib_heap_size_user >> 3) * 2;
+    const size_t block = (size + 0xFFFFF) & ~size_t{0xFFFFF};
+    const SceUID uid = sceKernelAllocMemBlock("azahar-leaktrack", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+                                              static_cast<SceSize>(block), nullptr);
+    void* tables = nullptr;
+    if (uid < 0 || sceKernelGetMemBlockBase(uid, &tables) < 0) {
+        sceClibPrintf("[azahar] leaktrack: no %u KiB block (%08x)\n",
+                      static_cast<unsigned>(block >> 10), static_cast<unsigned>(uid));
+        return;
+    }
+    std::memset(tables, 0, block);
+    __malloc_lock(_REENT);
+    leak_base = base;
+    leak_end = base + _newlib_heap_size_user;
+    leak = static_cast<LeakTables*>(tables);
+    __malloc_unlock(_REENT);
+    sceClibPrintf("[azahar] leaktrack: on, %u KiB of tables\n", static_cast<unsigned>(block >> 10));
+}
+
+void PrintLeaks(bool every_chunk) {
+    if (leak == nullptr) {
+        sceClibPrintf("[azahar] leaks: leaktrack is off\n");
+        return;
+    }
+    __malloc_lock(_REENT);
+    std::memset(leak->counts, 0, sizeof(leak->counts));
+    std::memset(leak->bytes, 0, sizeof(leak->bytes));
+    const uintptr_t base = (leak_base + 7) & ~uintptr_t{7};
+    const uintptr_t top = reinterpret_cast<uintptr_t>(__malloc_av_[2]);
+    uint32_t chunks = 0;
+    for (uintptr_t p = base; p < top;) {
+        const uint32_t size = *reinterpret_cast<const uint32_t*>(p + 4) & ~3u;
+        if (size < 16 || p + size > top) {
+            break;
+        }
+        if ((*reinterpret_cast<const uint32_t*>(p + size + 4) & 1u) != 0) {
+            const uint16_t id = leak->ids[(p + 8 - leak_base) >> 3];
+            leak->counts[id]++;
+            leak->bytes[id] += size;
+            chunks++;
+            if (every_chunk && id != 0) {
+                const uint32_t* const words = reinterpret_cast<const uint32_t*>(p + 8);
+                const LeakSite& site = leak->sites[id];
+                sceClibPrintf("[azahar] leaks: +%08x %u bytes: %08x %08x site %u: %08x %08x %08x "
+                              "%08x %08x %08x %08x %08x %08x %08x\n",
+                              static_cast<unsigned>(p - base), size, words[0], words[1], id,
+                              site.ra[0], site.ra[1], site.ra[2], site.ra[3], site.ra[4],
+                              site.ra[5], site.ra[6], site.ra[7], site.ra[8], site.ra[9]);
+            }
+        }
+        p += size;
+    }
+    const uint32_t used = leak_sites_used;
+    __malloc_unlock(_REENT);
+    sceClibPrintf("[azahar] leaks: %u chunks in use, %u of them unrecorded (from before leaktrack, or "
+                  "the C library's own: %u KiB); "
+                  "%u sites, %u allocations unrecorded\n",
+                  chunks, leak->counts[0], leak->bytes[0] >> 10, used - 1, leak_full);
+    for (uint32_t shown = 0; shown < 48; shown++) {
+        uint32_t best = 0;
+        for (uint32_t id = 1; id < used; id++) {
+            if (leak->counts[id] > leak->counts[best] || best == 0) {
+                best = leak->counts[id] != 0 ? id : best;
+            }
+        }
+        if (best == 0 || leak->counts[best] == 0) {
+            break;
+        }
+        const LeakSite& site = leak->sites[best];
+        sceClibPrintf("[azahar] leaks: %u chunks, %u bytes: %08x %08x %08x %08x %08x %08x %08x "
+                      "%08x %08x %08x\n",
+                      leak->counts[best], leak->bytes[best], site.ra[0], site.ra[1], site.ra[2],
+                      site.ra[3], site.ra[4], site.ra[5], site.ra[6], site.ra[7], site.ra[8],
+                      site.ra[9]);
+        leak->counts[best] = 0;
+    }
+}
+#endif
+
+void PrintHeapSites(bool to_report) {
+    static Site copy[std::size(sites)];
+    __malloc_lock(_REENT);
+    std::memcpy(copy, sites, sizeof(sites));
+    const uint32_t dropped = sites_dropped;
+    __malloc_unlock(_REENT);
+    uint32_t count = 0, total = 0;
+    for (const Site& s : copy) {
+        if (s.p != nullptr) {
+            count++;
+            total += s.size;
+        }
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "[azahar] heapsites: %u blocks of 512 KiB or more, %u KiB (%u not kept)\n",
+                  count, total >> 10, dropped);
+    to_report ? Write(line) : static_cast<void>(sceClibPrintf("%s", line));
+    const uintptr_t base = reinterpret_cast<uintptr_t>(__malloc_sbrk_base);
+    for (const Site& s : copy) {
+        if (s.p == nullptr) {
+            continue;
+        }
+        int at = std::snprintf(line, sizeof(line), "[azahar] heapsites: %u KiB at +%08x:",
+                               s.size >> 10,
+                               static_cast<unsigned>(reinterpret_cast<uintptr_t>(s.p) - base));
+        for (const uint32_t ra : s.ra) {
+            if (ra != 0 && at < static_cast<int>(sizeof(line)) - 12) {
+                at += std::snprintf(line + at, sizeof(line) - at, " %08x", ra);
+            }
+        }
+        std::snprintf(line + at, sizeof(line) - at, "\n");
+        to_report ? Write(line) : static_cast<void>(sceClibPrintf("%s", line));
+    }
+}
 
 namespace {
 
@@ -124,20 +451,22 @@ void WriteCallChain(uintptr_t stack_begin, uintptr_t stack_end) {
 
 void WriteStackReport(const char* reason) {
     static char report[2048];
+    static SceKernelThreadInfo info;
     reported = true;
-    SceKernelThreadInfo info{};
     info.size = sizeof(info);
     const SceUID self = sceKernelGetThreadId();
     sceKernelGetThreadInfo(self, &info);
     uintptr_t sp;
     asm volatile("mov %0, sp" : "=r"(sp));
-    const uintptr_t stack_end = reinterpret_cast<uintptr_t>(info.stack) + info.stackSize;
+    const uintptr_t stack_end = StackScanEnd(info, sp, 0x40000);
     int at = std::snprintf(report, sizeof(report),
                            "[azahar] crash: %s\n[azahar] crash: thread %08x \"%s\" (stack "
                            "%08x-%08x, sp %08x)",
                            reason, static_cast<unsigned>(self), info.name,
                            static_cast<unsigned>(reinterpret_cast<uintptr_t>(info.stack)),
-                           static_cast<unsigned>(stack_end), static_cast<unsigned>(sp));
+                           static_cast<unsigned>(reinterpret_cast<uintptr_t>(info.stack) +
+                                                 info.stackSize),
+                           static_cast<unsigned>(sp));
     if (failed_malloc_size != 0) {
         at += std::snprintf(report + at, sizeof(report) - at,
                             "; the last allocation refused: %u bytes",
@@ -164,6 +493,9 @@ void WriteStackReport(const char* reason) {
     Write(report);
     WriteCallChain(reinterpret_cast<uintptr_t>(info.stack),
                    reinterpret_cast<uintptr_t>(info.stack) + info.stackSize);
+    if (failed_malloc_size != 0) {
+        PrintHeapSites(true);
+    }
 }
 
 void NoteSystem(int version, int cores) {
@@ -368,8 +700,86 @@ void* __wrap_malloc(size_t size) {
     void* const p = __real__malloc_r(MALLOC_REENT, size);
     if (p == nullptr && size != 0) {
         failed_malloc_size = size;
+    } else if (size >= SiteThreshold) {
+        TrackSite(p, size);
     }
+#ifdef VITA_DIAGNOSTICS
+    if (leak != nullptr && p != nullptr) {
+        LeakRecord(p);
+    }
+#endif
     return p;
+}
+
+void* __wrap_calloc(size_t count, size_t size) {
+    void* const p = _calloc_r(MALLOC_REENT, count, size);
+    if (p == nullptr && count * size != 0) {
+        failed_malloc_size = count * size;
+    } else if (count * size >= SiteThreshold) {
+        TrackSite(p, count * size);
+    }
+#ifdef VITA_DIAGNOSTICS
+    if (leak != nullptr && p != nullptr) {
+        LeakRecord(p);
+    }
+#endif
+    return p;
+}
+
+void* __wrap_realloc(void* old, size_t size) {
+    if (old != nullptr && ChunkSize(old) >= SiteThreshold) {
+        UntrackSite(old);
+    }
+#ifdef VITA_DIAGNOSTICS
+    if (leak != nullptr && old != nullptr) {
+        LeakForget(old);
+    }
+#endif
+    void* const p = _realloc_r(MALLOC_REENT, old, size);
+    if (p == nullptr && size != 0) {
+        failed_malloc_size = size;
+    } else if (size >= SiteThreshold) {
+        TrackSite(p, size);
+    }
+#ifdef VITA_DIAGNOSTICS
+    if (leak != nullptr && p != nullptr) {
+        LeakRecord(p);
+    }
+#endif
+    return p;
+}
+
+void __wrap_free(void* p) {
+    if (p != nullptr && ChunkSize(p) >= SiteThreshold) {
+        UntrackSite(p);
+    }
+#ifdef VITA_DIAGNOSTICS
+    if (leak != nullptr && p != nullptr) {
+        LeakForget(p);
+    }
+#endif
+    __real__free_r(MALLOC_REENT, p);
+}
+
+// The C library's own entry points, which its stdio and the like call without malloc: blocks it
+// allocates for itself are recorded too while leaktrack is on.
+void* __wrap__malloc_r(struct _reent* r, size_t size) {
+    void* const p = __real__malloc_r(r, size);
+#ifdef VITA_DIAGNOSTICS
+    if (leak != nullptr && p != nullptr) {
+        LeakRecord(p);
+    }
+#endif
+    return p;
+}
+
+void __wrap__free_r(struct _reent* r, void* p) {
+#ifdef VITA_DIAGNOSTICS
+    if (leak != nullptr && p != nullptr) {
+        LeakForget(p);
+    }
+#endif
+    __real__free_r(r, p);
 }
 
 int __wrap_raise(int sig) {

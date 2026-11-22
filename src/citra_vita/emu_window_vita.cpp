@@ -310,7 +310,7 @@ void EmuWindowVita::PollEvents() {
     const bool ps = (buttons_held.load(std::memory_order_relaxed) & SCE_CTRL_PSBUTTON) != 0;
     const bool pressed = ps && !ps_held;
     ps_held = ps;
-    if (pressed) {
+    if (pressed || script_menu_open.exchange(false, std::memory_order_acq_rel)) {
         if (Ui* const ui = pause_ui.load(std::memory_order_acquire)) {
             RunPauseMenu(*ui);
         }
@@ -325,6 +325,7 @@ void EmuWindowVita::RunPauseMenu(Ui& ui) {
     ui.OpenPauseMenu();
     LOG_INFO(Frontend, "pause menu: open");
     Ui::Action action = Ui::Action::None;
+    u32 frames = 0;
     while (action == Ui::Action::None && !IsQuitRequested()) {
         ReadPad();
         UpdateTouch();
@@ -333,6 +334,12 @@ void EmuWindowVita::RunPauseMenu(Ui& ui) {
         // before still renders, so wait for both here instead (each asleep until its event).
         SgxdPresent::WaitDrawn();
         action = ui.Update();
+        // A scripted choice (ScriptPauseMenu), a second after the menu opened.
+        if (action == Ui::Action::None && ++frames >= 60) {
+            if (const int scripted = script_menu_action.exchange(0); scripted != 0) {
+                action = static_cast<Ui::Action>(scripted);
+            }
+        }
         Present(&ui, false);
         sceDisplayWaitVblankStart();
     }
@@ -611,6 +618,18 @@ void EmuWindowVita::DrawGuestScreens() {
 
 int EmuWindowVita::TakeUiAction() {
     return pending_ui_action.exchange(0, std::memory_order_acq_rel);
+}
+
+void EmuWindowVita::ScriptPauseMenu(int action) {
+    script_menu_action.store(action, std::memory_order_relaxed);
+    script_menu_open.store(true, std::memory_order_release);
+}
+
+void EmuWindowVita::RequestQuit(bool exit_application) {
+    const auto action = exit_application ? Ui::Action::ExitApplication : Ui::Action::QuitGame;
+    pause_ui.store(nullptr, std::memory_order_release);
+    render_ui.store(nullptr, std::memory_order_release);
+    pending_ui_action.store(static_cast<int>(action), std::memory_order_release);
 }
 
 namespace {

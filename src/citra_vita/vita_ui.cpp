@@ -30,8 +30,14 @@ constexpr float ScreenWidth = 960.0f;
 constexpr float ScreenHeight = 544.0f;
 
 /// Where titles are looked for. One directory, no recursion: a console file manager is enough
-/// work to use that a deep tree is worse than a flat one.
+/// host0 does not open and adds nothing.
 constexpr char GameDirectory[] = "ux0:/data/azahar/roms";
+#ifdef VITA_DIAGNOSTICS
+constexpr char HostGameDirectory[] = "host0:roms";
+constexpr char ListedDirectories[] = "ux0:/data/azahar/roms and host0:roms";
+#else
+constexpr const char* ListedDirectories = GameDirectory;
+#endif
 
 bool HasRomExtension(const std::string& name) {
     static constexpr const char* extensions[] = {".3ds", ".3dsx", ".cci", ".cxi",
@@ -103,20 +109,26 @@ Ui::~Ui() {
 
 void Ui::ScanGames() {
     games.clear();
-    FileUtil::FSTEntry root;
-    if (!FileUtil::ScanDirectoryTree(GameDirectory, root)) {
-        LOG_WARNING(Frontend, "No game directory at {}", GameDirectory);
-        return;
-    }
-    for (const auto& entry : root.children) {
-        if (entry.isDirectory || !HasRomExtension(entry.virtualName)) {
-            continue;
+    const auto scan = [this](const char* directory, const char* suffix) {
+        FileUtil::FSTEntry root;
+        if (!FileUtil::ScanDirectoryTree(directory, root)) {
+            LOG_WARNING(Frontend, "No game directory at {}", directory);
+            return;
         }
-        games.push_back({entry.physicalName, entry.virtualName});
-    }
+        for (const auto& entry : root.children) {
+            if (entry.isDirectory || !HasRomExtension(entry.virtualName)) {
+                continue;
+            }
+            games.push_back({entry.physicalName, entry.virtualName + suffix});
+        }
+    };
+    scan(GameDirectory, "");
+#ifdef VITA_DIAGNOSTICS
+    scan(HostGameDirectory, " (host0)");
+#endif
     std::sort(games.begin(), games.end(),
               [](const GameEntry& a, const GameEntry& b) { return a.name < b.name; });
-    LOG_INFO(Frontend, "Found {} titles in {}", games.size(), GameDirectory);
+    LOG_INFO(Frontend, "Found {} titles", games.size());
 }
 
 void Ui::BuildSettings() {
@@ -262,6 +274,11 @@ void Ui::EnterGame() {
     window.SetInputToGuest(true);
 }
 
+void Ui::LeaveGame() {
+    state = State::GameList;
+    overlay_focused = false;
+}
+
 void Ui::OpenPauseMenu() {
     state = State::Pause;
     window.SetInputToGuest(false);
@@ -336,7 +353,7 @@ Ui::Action Ui::DrawGameList() {
     // no argument - and the %s that follows then reads the count instead of the string. With an
     // empty list that count is zero and the formatter walks into strlen(nullptr).
     ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "  %u titles in %s",
-                       static_cast<unsigned>(games.size()), GameDirectory);
+                       static_cast<unsigned>(games.size()), ListedDirectories);
     ImGui::Separator();
 
     if (games.empty()) {

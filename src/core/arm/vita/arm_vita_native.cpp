@@ -49,9 +49,6 @@ VitaNativeCensus census;
 std::unordered_map<u32, std::pair<u32, u32>> hold_page_accesses;
 #endif
 
-/// In-kernel scheduling (azaharnative 34): the module switches the guest's threads on a
-/// SleepThread itself (AzaharSchedThread). On unless the frontend turned it off.
-bool in_kernel_scheduling = true;
 // The module loads a thread from its AzaharContext in place; fpexc follows it.
 using ThreadContext = ARM_Interface::ThreadContext;
 static_assert(std::is_standard_layout_v<ThreadContext>);
@@ -1344,10 +1341,6 @@ ARM_VitaNative::ARM_VitaNative(Core::System& system_, Memory::MemorySystem& memo
     usable = map != nullptr;
     run.ctx.cpsr = 0x10;
     upcall_system = &system;
-#ifdef VITA_UPCALLS
-    // Every svc an upcall (the module built with AZAHAR_SEAL=0); gxm_flags noupcalls turns it off.
-    upcall_all = !GxmRenderer::GxmFlag("noupcalls");
-#endif
 }
 
 ARM_VitaNative::~ARM_VitaNative() {
@@ -3191,10 +3184,6 @@ VitaNativeCensus TakeVitaNativeCensus() {
 }
 #endif
 
-void SetVitaInKernelScheduling(bool on) {
-    in_kernel_scheduling = on;
-}
-
 bool ARM_VitaNative::TakeHeldPage(u32 va, bool write, u32 pc) {
     // A page held for the display alone opens; otherwise an access clear of the bytes the holds
     // protect is made here, the page held still.
@@ -3838,6 +3827,28 @@ u32 ARM_VitaNative::AccessReach(u32 pc) const {
     }
 }
 
+std::vector<std::string> ModuleTablesAt(u32 va) {
+    AzaharVaReport t{};
+    azaharVaReport(va, &t);
+    std::string cores;
+    for (u32 n = 0; n < 4; n++) {
+        cores += fmt::format("; core {}: attached {}, view {:08X}/{:08X}, {} overrides", n,
+                             t.attached[n], t.view_l1[n], t.view_l2[n], t.view_overrides[n]);
+    }
+    std::string overrides;
+    for (u32 i = 0; i < t.view_overrides[t.core & 3] && i < AZAHAR_ATTACH_OVERRIDES; i++) {
+        const AzaharRange& r = t.overrides[i];
+        overrides +=
+            fmt::format(" {:08X}+{:X} <- {:08X} ({:X})", r.guest_va, r.size, r.user_va, r.perm);
+    }
+    return {fmt::format("tables at {:08X} from core {} (azaharMap's {}): shared {:08X}/{:08X}{}; "
+                        "failed view builds {} (the last {:08X} on core {})",
+                        va, t.core, t.map_core, t.shared_l1, t.shared_l2, cores, t.view_failures,
+                        static_cast<u32>(t.view_last_error), t.view_last_core),
+            fmt::format("core {}'s view overrides:{}", t.core,
+                        overrides.empty() ? std::string{" none"} : overrides)};
+}
+
 void ARM_VitaNative::ReportFault() {
     std::string registers;
     for (int i = 0; i < 16; i++) {
@@ -3877,33 +3888,12 @@ void ARM_VitaNative::ReportFault() {
                        : std::string("none"));
     }
     // How the module's tables map the PC and the fault address on each core.
-    if (azaharVersion() >= 87) {
-        const auto tables = [](u32 va) {
-            AzaharVaReport t{};
-            azaharVaReport(va, &t);
-            std::string cores;
-            for (u32 n = 0; n < 4; n++) {
-                cores += fmt::format("; core {}: attached {}, view {:08X}/{:08X}, {} overrides", n,
-                                     t.attached[n], t.view_l1[n], t.view_l2[n],
-                                     t.view_overrides[n]);
-            }
-            LOG_CRITICAL(Core_ARM11,
-                         "tables at {:08X} from core {} (azaharMap's {}): shared {:08X}/{:08X}{}; "
-                         "failed view builds {} (the last {:08X} on core {})",
-                         va, t.core, t.map_core, t.shared_l1, t.shared_l2, cores, t.view_failures,
-                         static_cast<u32>(t.view_last_error), t.view_last_core);
-            std::string overrides;
-            for (u32 i = 0; i < t.view_overrides[t.core & 3] && i < AZAHAR_ATTACH_OVERRIDES; i++) {
-                const AzaharRange& r = t.overrides[i];
-                overrides += fmt::format(" {:08X}+{:X} <- {:08X} ({:X})", r.guest_va, r.size,
-                                         r.user_va, r.perm);
-            }
-            LOG_CRITICAL(Core_ARM11, "core {}'s view overrides:{}", t.core,
-                         overrides.empty() ? std::string{" none"} : overrides);
-        };
-        tables(run.ctx.r[15]);
-        if (run.far != run.ctx.r[15]) {
-            tables(run.far);
+    for (const std::string& line : ModuleTablesAt(run.ctx.r[15])) {
+        LOG_CRITICAL(Core_ARM11, "{}", line);
+    }
+    if (run.far != run.ctx.r[15]) {
+        for (const std::string& line : ModuleTablesAt(run.far)) {
+            LOG_CRITICAL(Core_ARM11, "{}", line);
         }
     }
     // Where the guest came from: the code before LR and the stack from SP.

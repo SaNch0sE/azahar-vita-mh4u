@@ -66,7 +66,9 @@ function(citra_vita_executable target titleid)
     # (crash_report.cpp), which keeps the console's last text too.
     target_link_options(${target} PRIVATE
         "LINKER:--wrap=sceKernelGetTLSAddr,--wrap=__malloc_lock,--wrap=__malloc_unlock"
-        "LINKER:--wrap=raise,--wrap=__assert_func,--wrap=malloc")
+        "LINKER:--wrap=raise,--wrap=__assert_func,--wrap=malloc,--wrap=calloc,--wrap=realloc"
+        "LINKER:--wrap=free,--wrap=_malloc_r,--wrap=_free_r"
+        "LINKER:--wrap=sceClibPrintf")
     # The ID the crash report names the build by: a commit does not tell a dirty build's ELF.
     target_link_options(${target} PRIVATE "LINKER:--build-id=sha1")
 

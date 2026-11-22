@@ -63,4 +63,17 @@ void WriteStackReport(const char* reason);
 /// Allocates nothing.
 void WriteProcessState();
 
+/// The heap's live blocks of 512 KiB or more, each with the return addresses on its allocating
+/// thread's stack: on the debug channel, and with `to_report` in the crash report too.
+void PrintHeapSites(bool to_report);
+
+/// From now on, every heap block's allocation site is kept (`leaktrack`), in tables of their own
+/// outside the heap; PrintLeaks groups the blocks in use by the site that allocated them (`leaks`):
+/// what quits leave behind, and where it came from; with `every_chunk` each such block as well
+/// (`leaks all`). Diagnostics builds only.
+#ifdef VITA_DIAGNOSTICS
+void StartLeakTracking();
+void PrintLeaks(bool every_chunk);
+#endif
+
 } // namespace VitaFrontend::CrashReport
