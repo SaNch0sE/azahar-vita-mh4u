@@ -114,6 +114,7 @@ public:
     void SetTitleVersion(u16 version);
     void SetSystemVersion(u64 version);
     void AddContentChunk(const ContentChunk& chunk);
+    void SetContentHashByIndex(std::size_t index, const std::array<u8, 0x20>& hash);
 
     void Print() const;
 

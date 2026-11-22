@@ -124,6 +124,11 @@ public:
     /// status message. After Action::InstallTitle.
     std::string InstallSelected(const std::function<void()>& present);
 
+    /// Installs the CCI a game's Installed tab asked for as a CIA of it would be installed
+    /// (Service::AM::InstallCCI), its progress shown through `present`, then reads the tab
+    /// again: what happened, for the status message. Through InstallSelected.
+    std::string InstallRom(const std::function<void()>& present);
+
     /// Checks the file a game's File tab chose, else the selected title's, against the checksums
     /// its format carries (RomCheck), its progress shown through `present`: what it found, for a
     /// notice. After Action::CheckFile, or the command channel's `check`.
@@ -319,6 +324,7 @@ private:
     void DrawCheatInfo();
     void DrawInstalledRow(std::size_t index);
     void DrawInstalledInfo();
+    void ScanInstalled();
 
     /// True when the user pressed cancel and this overlay was the thing focused, which is what
     /// separates "close the menu" from "leave the child the cancel already left" - ImGui has
@@ -377,14 +383,23 @@ private:
     std::vector<std::shared_ptr<Cheats::CheatBase>> settings_cheats;
     int focused_cheat = -1;
     /// What of the title is installed on the emulated SD card (its game, update, DLC), read when
-    /// the screen opens from the game list; the selected part, and the one a first cross armed
-    /// for removal (-1: none).
+    /// the screen opens from the game list (ScanInstalled), after the row that installs the
+    /// title's CCI when its game is not installed; the selected part, and the one a first cross
+    /// armed for removal (-1: none).
     struct InstalledPart {
         const char* kind;
         u64 title_id;
         u64 size;
+        u16 version;
+        bool install;
+        /// The install row's CCI is NCCH-encrypted (the install refuses it).
+        bool encrypted;
     };
     std::vector<InstalledPart> settings_installed;
+    std::optional<u16> settings_rom_version;
+    std::string install_rom_path;
+    std::string install_rom_name;
+    bool install_requested{};
     int focused_installed = -1;
     int armed_installed = -1;
     /// The File tab: the title's file (OpenSettings' path), the check it asked for (CheckSelected

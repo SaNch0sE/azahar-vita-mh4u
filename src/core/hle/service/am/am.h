@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -417,6 +418,31 @@ private:
  * @returns bool whether the install was successful
  */
 InstallStatus InstallCIA(const std::string& path,
+                         std::function<ProgressCallback>&& update_callback = nullptr);
+
+/// What installing a CCI (.3ds/.cci, plain or Z3DS-compressed) as a CIA would install.
+struct CCIInstallInfo {
+    u64 title_id;
+    /// The game's revision (its extended header's remaster version), the installed TMD's version.
+    u16 version;
+    /// The bytes of its contents: the game, manual and download play partitions.
+    u64 content_size;
+    /// A partition is NCCH-encrypted: InstallCCI refuses it (ErrorEncrypted).
+    bool encrypted;
+};
+
+/// The install `path` would make, if it is a CCI with a game partition; none otherwise.
+std::optional<CCIInstallInfo> ReadCCIInstallInfo(const std::string& path);
+
+/**
+ * Installs a CCI as the CIA a conversion of it makes: its game, manual and download play
+ * partitions as contents of the same index (the system update partitions left out), a ticket and
+ * TMD of its title ID and version, through the CIA installer. The installed TMD carries the
+ * contents' SHA-256s, taken as they are written.
+ * @param path file path of the CCI file to install
+ * @param update_callback called after each round with the content bytes done and the total
+ */
+InstallStatus InstallCCI(const std::string& path,
                          std::function<ProgressCallback>&& update_callback = nullptr);
 
 /**

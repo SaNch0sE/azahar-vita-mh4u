@@ -8,6 +8,7 @@
 #include <optional>
 #include <cryptopp/aes.h>
 #include <cryptopp/modes.h>
+#include <cryptopp/sha.h>
 #include <fmt/format.h>
 #include <openssl/rand.h>
 #include "common/alignment.h"
@@ -1273,6 +1274,334 @@ InstallStatus InstallCIA(const std::string& path,
 
     LOG_ERROR(Service_AM, "CIA file {} is invalid!", path);
     return InstallStatus::ErrorInvalid;
+}
+
+namespace {
+
+constexpr u64 CCI_MEDIA_UNIT = 0x200;
+
+/// A CCI's layout, as InstallCCI makes a CIA of it.
+struct CCILayout {
+    struct Partition {
+        u16 index;
+        u64 offset;
+        u64 size;
+        bool encrypted;
+    };
+    /// The game, manual and download play partitions present, in index order.
+    std::vector<Partition> partitions;
+    u64 title_id;
+    /// The game's revision (its extended header's remaster version; 0 when encrypted): the TMD's
+    /// title version. The NCCH header's own version field (0x112) is its format's, 2 on all.
+    u16 version;
+    /// The game partition's extended header (decrypted partitions only).
+    std::array<u8, 0x400> exheader;
+};
+
+std::unique_ptr<FileUtil::IOFileBase> OpenCCI(const std::string& path) {
+    std::unique_ptr<FileUtil::IOFileBase> file = std::make_unique<FileUtil::IOFile>(path, "rb");
+    if (!file->IsOpen()) {
+        return nullptr;
+    }
+    if (FileUtil::Z3DSReadIOFile::GetUnderlyingFileMagic(file.get()) != std::nullopt) {
+        file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(file));
+    }
+    return file;
+}
+
+template <typename T>
+bool ReadAt(FileUtil::IOFileBase& file, u64 offset, T* out, std::size_t size) {
+    return file.Seek(static_cast<s64>(offset), SEEK_SET) && file.ReadBytes(out, size) == size;
+}
+
+std::optional<CCILayout> ReadCCILayout(FileUtil::IOFileBase& file) {
+    std::array<u8, 0x200> ncsd;
+    if (!ReadAt(file, 0, ncsd.data(), ncsd.size()) || std::memcmp(&ncsd[0x100], "NCSD", 4) != 0) {
+        return std::nullopt;
+    }
+    // Partition flag 6: the media unit's size as 0x200 << n; every card has 0.
+    if (ncsd[0x188 + 6] != 0) {
+        LOG_ERROR(Service_AM, "CCI media unit 0x200 << {}", ncsd[0x188 + 6]);
+        return std::nullopt;
+    }
+    CCILayout layout{};
+    // Partitions 0-2 (game, manual, download play) become contents of the same index; 6 and 7
+    // hold system updates, which a CIA leaves out.
+    for (u16 index = 0; index < 3; index++) {
+        u32 offset, size;
+        std::memcpy(&offset, &ncsd[0x120 + index * 8], 4);
+        std::memcpy(&size, &ncsd[0x124 + index * 8], 4);
+        if (size == 0) {
+            continue;
+        }
+        std::array<u8, 0x200> ncch;
+        const u64 start = offset * CCI_MEDIA_UNIT;
+        if (!ReadAt(file, start, ncch.data(), ncch.size()) ||
+            std::memcmp(&ncch[0x100], "NCCH", 4) != 0) {
+            LOG_ERROR(Service_AM, "CCI partition {}: no NCCH header", index);
+            return std::nullopt;
+        }
+        // Flag 7 bit 2: NoCrypto.
+        const bool encrypted = (ncch[0x18F] & 0x4) == 0;
+        layout.partitions.push_back({index, start, size * CCI_MEDIA_UNIT, encrypted});
+        if (index == 0) {
+            std::memcpy(&layout.title_id, &ncch[0x118], 8);
+            if (!encrypted && !ReadAt(file, start + 0x200, layout.exheader.data(),
+                                      layout.exheader.size())) {
+                return std::nullopt;
+            }
+            std::memcpy(&layout.version, &layout.exheader[0x0E], 2);
+        }
+    }
+    if (layout.partitions.empty() || layout.partitions.front().index != 0) {
+        LOG_ERROR(Service_AM, "CCI without a game partition");
+        return std::nullopt;
+    }
+    return layout;
+}
+
+/// The game partition's ExeFS file `name` (an empty vector: none).
+std::vector<u8> ReadCCIExeFSFile(FileUtil::IOFileBase& file, const CCILayout::Partition& game,
+                                 std::string_view name) {
+    u32 exefs;
+    std::array<u8, 0x200> header;
+    if (!ReadAt(file, game.offset + 0x1A0, &exefs, sizeof(exefs)) ||
+        !ReadAt(file, game.offset + exefs * CCI_MEDIA_UNIT, header.data(), header.size())) {
+        return {};
+    }
+    for (std::size_t slot = 0; slot < 10; slot++) {
+        const u8* entry = &header[slot * 16];
+        const std::string_view entry_name(reinterpret_cast<const char*>(entry),
+                                          strnlen(reinterpret_cast<const char*>(entry), 8));
+        if (entry_name != name) {
+            continue;
+        }
+        u32 offset, size;
+        std::memcpy(&offset, entry + 8, 4);
+        std::memcpy(&size, entry + 12, 4);
+        std::vector<u8> data(size);
+        if (!ReadAt(file, game.offset + exefs * CCI_MEDIA_UNIT + 0x200 + offset, data.data(),
+                    size)) {
+            return {};
+        }
+        return data;
+    }
+    return {};
+}
+
+void PutBE(std::vector<u8>& out, std::size_t at, u64 value, std::size_t bytes) {
+    for (std::size_t i = 0; i < bytes; i++) {
+        out[at + i] = static_cast<u8>(value >> (8 * (bytes - 1 - i)));
+    }
+}
+
+/// An RSA-2048 signature block of zeros (the installer checks no signature) before `body`.
+std::vector<u8> Signed(const std::vector<u8>& body) {
+    constexpr std::size_t SigBlock = 4 + 0x100 + 0x3C;
+    std::vector<u8> out(SigBlock + body.size());
+    PutBE(out, 0, 0x00010004, 4);
+    std::memcpy(out.data() + SigBlock, body.data(), body.size());
+    return out;
+}
+
+std::vector<u8> CCITicket(u64 title_id, u16 version) {
+    std::vector<u8> body(0x164 + 0xAC);
+    constexpr std::string_view Issuer = "Root-CA00000003-XS0000000c";
+    std::memcpy(body.data(), Issuer.data(), Issuer.size());
+    body[0x7C] = 1; // version
+    PutBE(body, 0x9C, title_id, 8);
+    PutBE(body, 0xA6, version, 2);
+    // The content index every CIA tool writes: one rights field, all 1024 contents allowed.
+    u8* const index = body.data() + 0x164;
+    const auto put16 = [&](std::size_t at, u16 v) { index[at] = v >> 8, index[at + 1] = v & 0xFF; };
+    const auto put32 = [&](std::size_t at, u32 v) {
+        put16(at, static_cast<u16>(v >> 16));
+        put16(at + 2, static_cast<u16>(v));
+    };
+    put16(0, 1), put16(2, 0x14), put32(4, 0xAC), put32(8, 0x14), put16(12, 1), put16(14, 0x14);
+    put32(0x14, 0x28), put32(0x18, 1), put32(0x1C, 0x84), put32(0x20, 0x84), put16(0x24, 3);
+    std::memset(index + 0x2C, 0xFF, 0x80);
+    return Signed(body);
+}
+
+/// A TMD of the partitions as contents, their hashes zero (InstallCCI sets them afterwards).
+std::vector<u8> CCITitleMetadata(const CCILayout& layout) {
+    const std::size_t count = layout.partitions.size();
+    std::vector<u8> records(0x30 * count);
+    for (std::size_t i = 0; i < count; i++) {
+        const auto& p = layout.partitions[i];
+        PutBE(records, i * 0x30, p.index, 4);
+        PutBE(records, i * 0x30 + 4, p.index, 2);
+        PutBE(records, i * 0x30 + 8, p.size, 8);
+    }
+    std::vector<u8> info(0x24 * 64);
+    PutBE(info, 2, count, 2);
+    CryptoPP::SHA256().CalculateDigest(info.data() + 4, records.data(), records.size());
+    std::vector<u8> body(0xC4);
+    constexpr std::string_view Issuer = "Root-CA00000003-CP0000000b";
+    std::memcpy(body.data(), Issuer.data(), Issuer.size());
+    body[0x40] = 1; // version
+    u64 save_size;
+    std::memcpy(&save_size, &layout.exheader[0x1C0], 8);
+    PutBE(body, 0x4C, layout.title_id, 8);
+    PutBE(body, 0x54, 0x40, 4);
+    PutBE(body, 0x5A, std::min<u64>(save_size, 0xFFFFFFFF), 4);
+    PutBE(body, 0x9C, layout.version, 2);
+    PutBE(body, 0x9E, count, 2);
+    CryptoPP::SHA256().CalculateDigest(body.data() + 0xA4, info.data(), info.size());
+    body.insert(body.end(), info.begin(), info.end());
+    body.insert(body.end(), records.begin(), records.end());
+    return Signed(body);
+}
+
+} // namespace
+
+std::optional<CCIInstallInfo> ReadCCIInstallInfo(const std::string& path) {
+    const auto file = OpenCCI(path);
+    const auto layout = file ? ReadCCILayout(*file) : std::nullopt;
+    if (!layout) {
+        return std::nullopt;
+    }
+    CCIInstallInfo info{layout->title_id, layout->version, 0, false};
+    for (const auto& p : layout->partitions) {
+        info.content_size += p.size;
+        info.encrypted |= p.encrypted;
+    }
+    return info;
+}
+
+InstallStatus InstallCCI(const std::string& path,
+                         std::function<ProgressCallback>&& update_callback) {
+    LOG_INFO(Service_AM, "Installing {} as a CIA...", path);
+    if (!FileUtil::Exists(path)) {
+        LOG_ERROR(Service_AM, "File {} does not exist!", path);
+        return InstallStatus::ErrorFileNotFound;
+    }
+    const auto file = OpenCCI(path);
+    if (!file) {
+        return InstallStatus::ErrorFailedToOpenFile;
+    }
+    const auto layout = ReadCCILayout(*file);
+    if (!layout) {
+        LOG_ERROR(Service_AM, "{} is no CCI with a game partition", path);
+        return InstallStatus::ErrorInvalid;
+    }
+    for (const auto& p : layout->partitions) {
+        if (p.encrypted) {
+            LOG_ERROR(Service_AM, "{}: partition {} is encrypted", path, p.index);
+            return InstallStatus::ErrorEncrypted;
+        }
+    }
+
+    // The CIA's sections before the contents, each aligned to 0x40, then the contents, then the
+    // meta (dependency list, core version, icon).
+    const auto& game = layout->partitions.front();
+    std::vector<u8> meta(FileSys::CIA_METADATA_SIZE);
+    std::memcpy(meta.data(), &layout->exheader[0x40], 0x180);
+    std::memcpy(meta.data() + 0x300, &layout->exheader[0x208], 4);
+    const std::vector<u8> icon = ReadCCIExeFSFile(*file, game, "icon");
+    meta.insert(meta.end(), icon.begin(), icon.end());
+    const std::vector<u8> cert(0xA00);
+    const std::vector<u8> ticket = CCITicket(layout->title_id, layout->version);
+    const std::vector<u8> tmd = CCITitleMetadata(*layout);
+    u64 content_size = 0;
+    for (const auto& p : layout->partitions) {
+        content_size += p.size;
+    }
+    FileSys::CIAHeader header{};
+    header.header_size = FileSys::CIA_HEADER_SIZE;
+    header.cert_size = static_cast<u32>(cert.size());
+    header.tik_size = static_cast<u32>(ticket.size());
+    header.tmd_size = static_cast<u32>(tmd.size());
+    header.meta_size = static_cast<u32>(meta.size());
+    header.content_size = content_size;
+    for (const auto& p : layout->partitions) {
+        header.SetContentPresent(p.index);
+    }
+    std::vector<u8> head(sizeof(header));
+    std::memcpy(head.data(), &header, sizeof(header));
+    for (const std::vector<u8>* section : {&cert, &ticket, &tmd}) {
+        head.resize(Common::AlignUp(head.size(), 0x40));
+        head.insert(head.end(), section->begin(), section->end());
+    }
+    head.resize(Common::AlignUp(head.size(), 0x40));
+
+    CIAFile install_file(Core::System::GetInstance(), GetTitleMediaType(layout->title_id));
+    const auto aborted = [&](Result result) {
+        LOG_ERROR(Service_AM, "{}: install aborted with error code {:08x}", path, result.raw);
+        install_file.Close();
+        return InstallStatus::ErrorAborted;
+    };
+    u64 at = 0;
+    if (const auto written = install_file.Write(at, head.size(), true, false, head.data());
+        written.Failed()) {
+        return aborted(written.Code());
+    }
+    at += head.size();
+
+    // A round of 1 MiB as InstallCIA's; each content's SHA-256 taken on the way.
+    std::vector<u8> buffer(0x100000);
+    std::vector<std::array<u8, 0x20>> hashes(layout->partitions.size());
+    u64 done = 0;
+    for (std::size_t i = 0; i < layout->partitions.size(); i++) {
+        const auto& p = layout->partitions[i];
+        CryptoPP::SHA256 sha;
+        if (!file->Seek(static_cast<s64>(p.offset), SEEK_SET)) {
+            return aborted(ResultUnknown);
+        }
+        for (u64 left = p.size; left != 0;) {
+            const std::size_t n = static_cast<std::size_t>(std::min<u64>(left, buffer.size()));
+            if (file->ReadBytes(buffer.data(), n) != n) {
+                LOG_ERROR(Service_AM, "{}: partition {} ends early", path, p.index);
+                return aborted(ResultUnknown);
+            }
+            sha.Update(buffer.data(), n);
+            if (const auto written = install_file.Write(at, n, true, false, buffer.data());
+                written.Failed()) {
+                return aborted(written.Code());
+            }
+            at += n;
+            left -= n;
+            done += n;
+            if (update_callback) {
+                update_callback(done, content_size);
+            }
+        }
+        sha.Final(hashes[i].data());
+    }
+    std::vector<u8> tail(Common::AlignUp(content_size, 0x40) - content_size);
+    tail.insert(tail.end(), meta.begin(), meta.end());
+    if (const auto written = install_file.Write(at, tail.size(), true, false, tail.data());
+        written.Failed()) {
+        return aborted(written.Code());
+    }
+    install_file.Close();
+
+    std::string tmd_path;
+    for (const auto& result : install_file.GetInstallResults()) {
+        if (result.result.IsError()) {
+            LOG_ERROR(Service_AM, "{}: an install step failed with {:08x}", path,
+                      result.result.raw);
+            return InstallStatus::ErrorAborted;
+        }
+        if (result.type == CIAFile::InstallResult::Type::TMD) {
+            tmd_path = result.install_full_path;
+        }
+    }
+    // The installed TMD with the contents' hashes, as a CIA of the game carries them.
+    FileSys::TitleMetadata installed;
+    ASSERT_MSG(!tmd_path.empty() && installed.Load(tmd_path) == Loader::ResultStatus::Success &&
+                   installed.GetContentCount() == hashes.size(),
+               "CCI install of {}: no installed TMD of {} contents at '{}'", path, hashes.size(),
+               tmd_path);
+    for (std::size_t i = 0; i < hashes.size(); i++) {
+        installed.SetContentHashByIndex(i, hashes[i]);
+    }
+    ASSERT_MSG(installed.Save(tmd_path) == Loader::ResultStatus::Success,
+               "CCI install of {}: the TMD at {} not written", path, tmd_path);
+    LOG_INFO(Service_AM, "Installed {} as {:016X} v{}, {} contents, {} bytes", path,
+             layout->title_id, layout->version, hashes.size(), content_size);
+    return InstallStatus::Success;
 }
 
 InstallStatus CheckCIAToInstall(const std::string& path, bool& is_compressed,

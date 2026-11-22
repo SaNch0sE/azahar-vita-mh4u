@@ -240,6 +240,10 @@ void TitleMetadata::AddContentChunk(const ContentChunk& chunk) {
     tmd_chunks.push_back(chunk);
 }
 
+void TitleMetadata::SetContentHashByIndex(std::size_t index, const std::array<u8, 0x20>& hash) {
+    tmd_chunks[index].hash = hash;
+}
+
 void TitleMetadata::Print() const {
     LOG_DEBUG(Service_FS, "{} chunks", static_cast<u32>(tmd_body.content_count));
 

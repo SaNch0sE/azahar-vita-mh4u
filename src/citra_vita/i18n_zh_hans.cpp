@@ -108,6 +108,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"D-pad up", "十字键上"},
     {"Dark", "深色"},
     {"Decrypt this CIA, then install it again.", "请先解密此 CIA，然后重新安装。"},
+    {"Decrypt this game, then install it again.", "请先解密此游戏，然后重新安装。"},
     {"Default", "默认"},
     {"Delete", "删除"},
     {"Delete the layout {}? The games that use it go back to Default.",
@@ -182,6 +183,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"In the ad hoc room at {}", "已加入 {} 的本地联机房间"},
     {"Install", "安装"},
     {"Install CIA", "安装 CIA"},
+    {"Install to system", "安装到系统"},
     {"Installed", "已安装"},
     {"Installed from a CIA. Removing it takes the game back to its own version.",
      "从 CIA 安装。删除后游戏将恢复为未更新的版本。"},
@@ -191,6 +193,10 @@ constexpr std::array table{std::to_array<Translation>({
      "从 CIA 安装。删除后游戏中将不再有此内容。"},
     {"Installed game", "游戏本体"},
     {"Installing {}...", "正在安装 {}…"},
+    {"Installs the game onto the emulated SD card from this file, as installing a CIA of it "
+     "does. The installed game shows in the list beside this file, and both use the same save "
+     "data.",
+     "从此文件将游戏安装到模拟的 SD 卡，与安装它的 CIA 相同。安装后的游戏会显示在列表中此文件的旁边，两者共用同一份存档。"},
     {"it is encrypted. Decrypt it, then try again.", "文件已加密。请解密后重试。"},
     {"Italian", "意大利语"},
     {"Japan", "日本"},
@@ -241,6 +247,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Native", "原生"},
     {"Native while Anti-aliasing is on. Turn Anti-aliasing off to choose a resolution.",
      "开启抗锯齿时固定为原生分辨率。关闭抗锯齿后才能选择分辨率。"},
+    {"Needs {} MiB on the memory card.", "需要存储卡上 {} MiB 的空间。"},
     {"New layout", "新布局"},
     {"Nickname", "昵称"},
     {"No cheats", "没有金手指"},
@@ -329,6 +336,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Removing it from the list keeps its files.", "从列表中删除后，文件夹中的文件仍会保留。"},
     {"Removing it keeps the game's save data.", "删除后游戏存档仍会保留。"},
     {"Resume", "继续游戏"},
+    {"Revision {}.", "修订版 {}。"},
     {"Right", "方向键右"},
     {"Right stick", "右摇杆"},
     {"Runs every game as on a New 3DS. Games with New 3DS enhancements turn them on, which needs "
@@ -439,6 +447,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"The game draws its text and menus one small square at a time. Squares drawn one after "
      "another are joined into one draw.",
      "游戏逐个绘制文字和菜单的小方块。现在把连续绘制的方块合并为一次绘制。"},
+    {"The game file is revision {}.", "游戏文件为修订版 {}。"},
     {"The game rewrites a texture's settings every time it uses one. Now they are written only "
      "when they change, which saves work.",
      "游戏每次使用纹理时都会重写其设置。现在只在设置变化时写入，减少了工作量。"},
@@ -460,6 +469,7 @@ constexpr std::array table{std::to_array<Translation>({
      "烁、过时或缺失，以及特效错误。"},
     {"The game's own screens show in the editor.", "编辑器中显示的是游戏自己的画面。"},
     {"The install stopped. Install the CIA again.", "安装已中断。请重新安装 CIA。"},
+    {"The install stopped. Install the game again.", "安装已中断。请重新安装游戏。"},
     {"The language of Azahar's menus. A game keeps its own.",
      "Azahar 菜单使用的语言。不影响游戏内的语言。"},
     {"the MAC address is taken in that room", "该房间中已有相同的 MAC 地址"},
@@ -497,6 +507,12 @@ constexpr std::array table{std::to_array<Translation>({
      "无法读取此 CIA。请从你的游戏重新制作。"},
     {"This CIA is gone. Choose it again with Install CIA.",
      "此 CIA 已不存在。请通过“安装 CIA”重新选择。"},
+    {"This file is encrypted: decrypt it, then install it.", "此文件已加密：请先解密，然后安装。"},
+    {"This game does not use the default settings. Before you report the crash, set these back to "
+     "their defaults and try again: {}",
+     "此游戏未使用默认设置。报告崩溃之前，请将以下设置恢复为默认值后再试一次：{}"},
+    {"This game file cannot be read. Make it again from your game.", "无法读取此游戏文件。请从你的游戏重新制作。"},
+    {"This game file is gone.", "此游戏文件已不存在。"},
     {"Three command buffers", "三个命令缓冲区"},
     {"Title {:016X}.", "游戏 ID {:016X}。"},
     {"To report it, send these files:", "如需报告，请发送以下文件："},
@@ -516,6 +532,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"USA", "美国"},
     {"USB video", "USB 视频"},
     {"Use all games' setting", "使用所有游戏的设置"},
+    {"Version {}.", "版本 {}。"},
     {"Vsync", "垂直同步"},
     {"Wait for GPU results", "等待 GPU 结果"},
     {"What the right stick moves: the 3DS's C-stick (the New 3DS's, and the Circle Pad Pro's in "

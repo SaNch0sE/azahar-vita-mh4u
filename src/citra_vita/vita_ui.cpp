@@ -1872,25 +1872,7 @@ void Ui::OpenSettings(std::string title, std::string name, State back, u64 progr
         const auto cheats = engine.GetCheats();
         settings_cheats.assign(cheats.begin(), cheats.end());
     }
-    // What of it is installed: from the game list only, never under a running title.
-    settings_installed.clear();
-    if (back == State::GameList && settings_program_id != 0) {
-        const u64 low = settings_program_id & 0xFFFFFFFF;
-        const bool application = settings_program_id >> 32 == 0x00040000;
-        const std::pair<const char*, u64> parts[] = {
-            {Translatable("Installed game"), settings_program_id},
-            {Translatable("Update"), application ? 0x0004000Eull << 32 | low : 0},
-            {Translatable("Downloadable content"), application ? 0x0004008Cull << 32 | low : 0},
-        };
-        for (const auto& [kind, title_id] : parts) {
-            const std::string content =
-                Service::AM::GetTitlePath(Service::FS::MediaType::SDMC, title_id) + "content";
-            FileUtil::FSTEntry tree;
-            if (title_id != 0 && FileUtil::ScanDirectoryTree(content, tree, 2) != 0) {
-                settings_installed.push_back({kind, title_id, TreeSize(tree)});
-            }
-        }
-    }
+    ScanInstalled();
     category = SettingsCategories().front();
     focused_row = -1;
     focused_patch = -1;
@@ -1899,6 +1881,53 @@ void Ui::OpenSettings(std::string title, std::string name, State back, u64 progr
     focus_first_row = true;
     state = State::Settings;
     overlay_focused = false;
+}
+
+void Ui::ScanInstalled() {
+    // What of it is installed: from the game list only, never under a running title.
+    settings_installed.clear();
+    settings_rom_version.reset();
+    if (settings_back != State::GameList || settings_program_id == 0) {
+        return;
+    }
+    const u64 low = settings_program_id & 0xFFFFFFFF;
+    const bool application = settings_program_id >> 32 == 0x00040000;
+    const std::pair<const char*, u64> parts[] = {
+        {Translatable("Installed game"), settings_program_id},
+        {Translatable("Update"), application ? 0x0004000Eull << 32 | low : 0},
+        {Translatable("Downloadable content"), application ? 0x0004008Cull << 32 | low : 0},
+    };
+    bool game_installed = false;
+    for (const auto& [kind, title_id] : parts) {
+        const std::string content =
+            Service::AM::GetTitlePath(Service::FS::MediaType::SDMC, title_id) + "content";
+        FileUtil::FSTEntry tree;
+        if (title_id == 0 || FileUtil::ScanDirectoryTree(content, tree, 2) == 0) {
+            continue;
+        }
+        // A partial install (a crash mid-way) has contents but maybe no TMD: version 0.
+        FileSys::TitleMetadata tmd;
+        const u16 version =
+            tmd.Load(Service::AM::GetTitleMetadataPath(Service::FS::MediaType::SDMC, title_id)) ==
+                    Loader::ResultStatus::Success
+                ? tmd.GetTitleVersion()
+                : 0;
+        settings_installed.push_back({kind, title_id, TreeSize(tree), version, false, false});
+        game_installed |= title_id == settings_program_id;
+    }
+    // The title's CCI (an installed title's file is its content, no CCI): its version, and the
+    // row that installs it while its game is not installed.
+    const auto cci = settings_path.empty() ? std::nullopt
+                                           : Service::AM::ReadCCIInstallInfo(settings_path);
+    if (!cci || cci->title_id != settings_program_id) {
+        return;
+    }
+    settings_rom_version = cci->version;
+    if (!game_installed) {
+        settings_installed.insert(settings_installed.begin(),
+                                  {Translatable("Install to system"), cci->title_id,
+                                   cci->content_size, cci->version, true, cci->encrypted});
+    }
 }
 
 std::vector<Ui::Category> Ui::SettingsCategories() const {
@@ -2324,9 +2353,10 @@ void Ui::DrawInstalledRow(std::size_t index) {
     ImGui::PushID(static_cast<int>(index));
     const InstalledPart part = settings_installed[index];
     const bool armed = armed_installed == static_cast<int>(index);
-    const std::string size_text =
-        armed ? std::string{Tr("Cross again to remove")}
-              : fmt::format("{} MiB", (part.size + 1024 * 1024 - 1) / (1024 * 1024));
+    const u64 mib = (part.size + 1024 * 1024 - 1) / (1024 * 1024);
+    const std::string size_text = armed          ? std::string{Tr("Cross again to remove")}
+                                  : part.install ? fmt::format("r{}, {} MiB", part.version, mib)
+                                                 : fmt::format("v{}, {} MiB", part.version, mib);
     const float width = ImGui::GetContentRegionAvail().x;
     const Card card = CardItem("##installed", ImVec2(width, RowHeight));
     if (focus_first_row) {
@@ -2353,6 +2383,10 @@ void Ui::DrawInstalledRow(std::size_t index) {
     if (!card.pressed) {
         return;
     }
+    if (part.install) {
+        install_requested = true;
+        return;
+    }
     if (!armed) {
         armed_installed = static_cast<int>(index);
         return;
@@ -2360,7 +2394,6 @@ void Ui::DrawInstalledRow(std::size_t index) {
     const Result result =
         Service::AM::UninstallProgram(Service::FS::MediaType::SDMC, part.title_id);
     LOG_INFO(Frontend, "Removed {} {:016X}: {:08X}", part.kind, part.title_id, result.raw);
-    settings_installed.erase(settings_installed.begin() + static_cast<std::ptrdiff_t>(index));
     focused_installed = armed_installed = -1;
     focus_first_row = true;
     ScanGames();
@@ -2371,6 +2404,8 @@ void Ui::DrawInstalledRow(std::size_t index) {
         overlay_focused = false;
         return;
     }
+    // The game's removal from a CCI's screen brings the install row back.
+    ScanInstalled();
     if (settings_installed.empty()) {
         category = SettingsCategories().front();
     }
@@ -2385,6 +2420,21 @@ void Ui::DrawInstalledInfo() {
     ImGui::TextWrapped("%s", Tr(part.kind));
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Spacing();
+    if (part.install) {
+        ImGui::TextWrapped("%s", Tr("Installs the game onto the emulated SD card from this file, "
+                                    "as installing a CIA of it does. The installed game shows in "
+                                    "the list beside this file, and both use the same save data."));
+        ImGui::Spacing();
+        if (part.encrypted) {
+            Note(palette->Accent, Tr("This file is encrypted: decrypt it, then install it."));
+        }
+        Note(palette->TextDim,
+             TrFormat("Needs {} MiB on the memory card.",
+                      (part.size + 1024 * 1024 - 1) / (1024 * 1024)));
+        Note(palette->TextDim, TrFormat("Revision {}.", part.version));
+        Note(palette->TextDim, TrFormat("Title {:016X}.", part.title_id));
+        return;
+    }
     const u32 high = static_cast<u32>(part.title_id >> 32);
     ImGui::TextWrapped(
         "%s", high == 0x0004000E
@@ -2394,6 +2444,10 @@ void Ui::DrawInstalledInfo() {
                   : Tr("Installed from a CIA. Removing it takes the game off the list."));
     ImGui::Spacing();
     Note(palette->TextDim, Tr("Removing it keeps the game's save data."));
+    Note(palette->TextDim, TrFormat("Version {}.", part.version));
+    if (high == 0x0004000E && settings_rom_version) {
+        Note(palette->TextDim, TrFormat("The game file is revision {}.", *settings_rom_version));
+    }
     Note(palette->TextDim, TrFormat("Title {:016X}.", part.title_id));
 }
 
@@ -2647,7 +2701,10 @@ Ui::Action Ui::DrawSettings() {
     } else if (category == Category::Cheats && !settings_cheats.empty()) {
         FooterButton(Glyph::Cross, Tr("On or off"));
     } else if (category == Category::Installed) {
-        FooterButton(Glyph::Cross, Tr("Remove"));
+        const bool install_row =
+            focused_installed >= 0 &&
+            settings_installed[static_cast<std::size_t>(focused_installed)].install;
+        FooterButton(Glyph::Cross, install_row ? Tr("Install") : Tr("Remove"));
     } else if (category == Category::File && FooterButton(Glyph::Cross, Tr("Check"))) {
         check_requested = true;
     }
@@ -2769,6 +2826,11 @@ Ui::Action Ui::DrawSettings() {
         check_path = settings_path;
         check_name = settings_name;
         return Action::CheckFile;
+    }
+    if (std::exchange(install_requested, false) && !back) {
+        install_rom_path = settings_path;
+        install_rom_name = settings_name;
+        return Action::InstallTitle;
     }
     return Action::None;
 }
@@ -3258,7 +3320,85 @@ Ui::Action Ui::DrawGameList() {
     return action;
 }
 
+/// What to free on the memory card the emulated SD card is on for `needed` bytes to fit; none
+/// when they fit. A title that does not fit would stop partway, minutes in.
+static std::optional<std::string> MemoryCardShortOf(u64 needed, const std::string& what) {
+    const std::string sdmc = FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir);
+    const std::string device = sdmc.substr(0, sdmc.find(':') + 1);
+    struct {
+        u64 max_size;
+        u64 free_size;
+        u32 cluster_size;
+        u32 unknown;
+    } space{};
+    if (sceIoDevctl(device.c_str(), 0x3001, nullptr, 0, &space, sizeof(space)) < 0 ||
+        space.free_size >= needed) {
+        return std::nullopt;
+    }
+    LOG_ERROR(Frontend, "{} needs {} bytes on {}, {} are free", what, needed, device,
+              space.free_size);
+    constexpr u64 MiB = 1024 * 1024;
+    return TrFormat("Free {} MiB on the memory card, then install it again.",
+                    (needed - space.free_size + MiB - 1) / MiB);
+}
+
+std::string Ui::InstallRom(const std::function<void()>& present) {
+    const std::string path = std::exchange(install_rom_path, {});
+    const auto info = Service::AM::ReadCCIInstallInfo(path);
+    if (!info) {
+        LOG_ERROR(Frontend, "{} does not read as a CCI", path);
+        return Tr("This game file cannot be read. Make it again from your game.");
+    }
+    if (info->encrypted) {
+        return Tr("Decrypt this game, then install it again.");
+    }
+    if (auto short_of = MemoryCardShortOf(info->content_size, path)) {
+        return *std::move(short_of);
+    }
+    const std::string name = std::exchange(install_rom_name, {});
+    SetStatusMessage(TrFormat("Installing {}...", name));
+    SetProgress(0.0f);
+    present();
+    const u64 start = sceKernelGetProcessTimeWide();
+    u64 shown = start;
+    const Service::AM::InstallStatus status =
+        Service::AM::InstallCCI(path, [&](std::size_t done, std::size_t total) {
+            const u64 now = sceKernelGetProcessTimeWide();
+            if (now - shown < 100'000 || total == 0) {
+                return;
+            }
+            shown = now;
+            SetProgress(static_cast<float>(done) / static_cast<float>(total));
+            present();
+        });
+    LOG_INFO(Frontend, "Install of {} as {:016X} v{} ({} bytes): status {} after {} ms", path,
+             info->title_id, info->version, info->content_size, static_cast<u32>(status),
+             (sceKernelGetProcessTimeWide() - start) / 1000);
+    // A stopped install takes its contents back off: the tab reads again either way.
+    ScanGames();
+    if (state == State::Settings) {
+        ScanInstalled();
+        focused_installed = armed_installed = -1;
+        focus_first_row = true;
+    }
+    switch (status) {
+    case Service::AM::InstallStatus::Success:
+        return TrFormat("{} is installed.", name);
+    case Service::AM::InstallStatus::ErrorEncrypted:
+        return Tr("Decrypt this game, then install it again.");
+    case Service::AM::InstallStatus::ErrorAborted:
+        return Tr("The install stopped. Install the game again.");
+    case Service::AM::InstallStatus::ErrorInvalid:
+        return Tr("This game file cannot be read. Make it again from your game.");
+    default:
+        return Tr("This game file is gone.");
+    }
+}
+
 std::string Ui::InstallSelected(const std::function<void()>& present) {
+    if (!install_rom_path.empty()) {
+        return InstallRom(present);
+    }
     GameEntry entry;
     if (!picked_cia.empty()) {
         // The Install CIA screen's: its file's name until the CIA's SMDH names it.
@@ -3275,24 +3415,10 @@ std::string Ui::InstallSelected(const std::function<void()>& present) {
         return Tr("This CIA cannot be read. Make it again from your game.");
     }
     const u64 title_id = container.GetTitleMetadata().GetTitleID();
-    // The contents against the memory card's free space: a title that does not fit would stop
-    // partway, minutes in.
+    // The contents against the memory card's free space.
     const u64 needed = container.GetTitleMetadata().GetCombinedContentSize(container.GetHeader());
-    const std::string sdmc = FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir);
-    const std::string device = sdmc.substr(0, sdmc.find(':') + 1);
-    struct {
-        u64 max_size;
-        u64 free_size;
-        u32 cluster_size;
-        u32 unknown;
-    } space{};
-    if (sceIoDevctl(device.c_str(), 0x3001, nullptr, 0, &space, sizeof(space)) >= 0 &&
-        space.free_size < needed) {
-        LOG_ERROR(Frontend, "{} needs {} bytes on {}, {} are free", entry.path, needed, device,
-                  space.free_size);
-        constexpr u64 MiB = 1024 * 1024;
-        return TrFormat("Free {} MiB on the memory card, then install it again.",
-                        (needed - space.free_size + MiB - 1) / MiB);
+    if (auto short_of = MemoryCardShortOf(needed, entry.path)) {
+        return *std::move(short_of);
     }
 
     SetStatusMessage(TrFormat("Installing {}...", entry.name));
