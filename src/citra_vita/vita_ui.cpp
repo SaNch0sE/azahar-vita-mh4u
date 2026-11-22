@@ -36,6 +36,8 @@
 #include "common/file_util.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
+#include "core/cheats/cheat_base.h"
+#include "core/cheats/cheats.h"
 #include "core/core.h"
 #include "core/loader/loader.h"
 #include "core/loader/smdh.h"
@@ -368,6 +370,7 @@ enum class Icon {
     Globe,
     Refresh,
     Patch,
+    Cheat,
 };
 
 /// An icon of `size` pixels centred at `c`. `under`: the colour behind it, for the cut-outs.
@@ -508,7 +511,32 @@ void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float size, ImU32 colour, ImU
                     c - d * pad + n * pad, under, line * 0.75f);
         break;
     }
+    case Icon::Cheat: {
+        // A four-pointed sparkle, and a small one at its top right.
+        const auto sparkle = [&](ImVec2 at, float r) {
+            const float w = 0.28f * r;
+            for (const ImVec2 d : {ImVec2(0, -1), ImVec2(1, 0), ImVec2(0, 1), ImVec2(-1, 0)}) {
+                const ImVec2 n(-d.y, d.x);
+                dl->AddTriangleFilled(at + d * r, at + n * w, at - n * w, colour);
+            }
+        };
+        sparkle(c + ImVec2(-0.08f, 0.08f) * s, 0.36f * s);
+        sparkle(c + ImVec2(0.3f, -0.3f) * s, 0.14f * s);
+        break;
     }
+    }
+}
+
+/// A toggle's switch, its right end at `right` and centred on the row's `mid`: the accent
+/// colour when on, the knob at that end. Returns the knob's x.
+float DrawSwitch(ImDrawList* dl, float right, float mid, bool on, float alpha) {
+    constexpr float Width = 56.0f;
+    const ImVec2 min(right - Width, mid - 15.0f);
+    const ImVec2 max(right, mid + 15.0f);
+    dl->AddRectFilled(min, max, Colour(on ? palette->Accent : palette->SwitchOff, alpha), 15.0f);
+    const float knob = on ? max.x - 15.0f : min.x + 15.0f;
+    dl->AddCircleFilled(ImVec2(knob, mid), 11.0f, Colour(palette->Text, alpha), 16);
+    return knob;
 }
 
 enum class Glyph {
@@ -946,13 +974,14 @@ void Note(const ImVec4& dot, const std::string& text) {
 }
 
 const char* CategoryName(int category) {
-    static constexpr const char* names[] = {"Display", "Speed", "Sound", "System", "Patches"};
+    static constexpr const char* names[] = {"Display", "Speed",   "Sound",
+                                            "System",  "Patches", "Cheats"};
     return names[category];
 }
 
 Icon CategoryIcon(int category) {
-    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge, Icon::Speaker, Icon::Globe,
-                                     Icon::Patch};
+    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge, Icon::Speaker,
+                                     Icon::Globe,   Icon::Patch, Icon::Cheat};
     return icons[category];
 }
 
@@ -1427,9 +1456,20 @@ void Ui::OpenSettings(std::string title, std::string name, State back, u64 progr
                    "settings: {} patches built in for {:016X}, {} applied or left out",
                    settings_patches.size(), program_id, settings_patches_in.size());
     }
+    // The title's cheats, its file's as the cheat engine reads it: the running title's are the
+    // engine's already.
+    settings_program_id = settings_title.empty() ? 0 : program_id;
+    settings_cheats.clear();
+    if (settings_program_id != 0) {
+        Cheats::CheatEngine& engine = system.CheatEngine();
+        engine.LoadCheatFile(settings_program_id);
+        const auto cheats = engine.GetCheats();
+        settings_cheats.assign(cheats.begin(), cheats.end());
+    }
     category = SettingsCategories().front();
     focused_row = -1;
     focused_patch = -1;
+    focused_cheat = -1;
     focus_first_row = true;
     state = State::Settings;
     overlay_focused = false;
@@ -1439,13 +1479,16 @@ std::vector<Ui::Category> Ui::SettingsCategories() const {
     std::vector<Category> shown;
     for (int c = 0; c < static_cast<int>(Category::Count); c++) {
         const auto tab = static_cast<Category>(c);
+        // Patches and Cheats even with none: the engine settings are looked for when the tab
+        // opens, and the Cheats tab says where the title's cheat file goes.
         const bool has_rows =
-            tab == Category::Patches
-                ? !settings_patches.empty()
-                : std::any_of(rows.begin(), rows.end(), [&](const Row& row) {
-                      return row.category == tab &&
-                             (settings_title.empty() || Config::PerTitle(row.option));
-                  });
+            tab == Category::Patches  ? !settings_patches.empty()
+            : tab == Category::Cheats ? settings_program_id != 0
+                                      : std::any_of(rows.begin(), rows.end(), [&](const Row& row) {
+                                            return row.category == tab &&
+                                                   (settings_title.empty() ||
+                                                    Config::PerTitle(row.option));
+                                        });
         if (has_rows) {
             shown.push_back(tab);
         }
@@ -1620,12 +1663,7 @@ void Ui::DrawRow(const Row& row, std::size_t index) {
             Colour(for_title && marked ? palette->Own : palette->Text, alpha);
         switch (row.kind) {
         case Row::Kind::Toggle: {
-            const ImVec2 min(value_bb.Max.x - SwitchWidth, mid - 15.0f);
-            const ImVec2 max(value_bb.Max.x, mid + 15.0f);
-            dl->AddRectFilled(
-                min, max, Colour(value != 0 ? palette->Accent : palette->SwitchOff, alpha), 15.0f);
-            const float knob = value != 0 ? max.x - 15.0f : min.x + 15.0f;
-            dl->AddCircleFilled(ImVec2(knob, mid), 11.0f, Colour(palette->Text, alpha), 16);
+            const float knob = DrawSwitch(dl, value_bb.Max.x, mid, value != 0, alpha);
             if (for_title && marked) {
                 dl->AddCircle(ImVec2(knob, mid), 11.0f, Colour(palette->Own, alpha), 16, 2.0f);
             }
@@ -1742,6 +1780,88 @@ void Ui::DrawPatchInfo() {
              "Left out: your copy is a different version from the one it was made for.");
     }
     Note(palette->TextDim, "Built into Azahar for this game. It can't be turned off.");
+}
+
+void Ui::DrawCheatRow(std::size_t index) {
+    constexpr float Pad = 18.0f;
+    constexpr float SwitchWidth = 56.0f;
+
+    ImGui::PushID(static_cast<int>(index));
+    Cheats::CheatBase& cheat = *settings_cheats[index];
+    const std::string name = cheat.GetName();
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float label_width = width - SwitchWidth - 3.0f * Pad;
+    const ImVec2 label = ImGui::CalcTextSize(name.c_str(), nullptr, false, label_width);
+    const Card card = CardItem("##cheat", ImVec2(width, std::max(RowHeight, label.y + 28.0f)));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    const bool focused = ImGui::GetFocusID() == card.id;
+    if (focused) {
+        focused_cheat = static_cast<int>(index);
+    }
+    // The running title's engine reads the switch at its next run (the guest waits while the
+    // menu is open); the file keeps it for the title's next start.
+    if (card.pressed ||
+        (focused && (ImGui::IsNavInputTest(ImGuiNavInput_DpadLeft, ImGuiInputReadMode_Pressed) ||
+                     ImGui::IsNavInputTest(ImGuiNavInput_DpadRight, ImGuiInputReadMode_Pressed)))) {
+        cheat.SetEnabled(!cheat.IsEnabled());
+        system.CheatEngine().SaveCheatFile(settings_program_id);
+        if (!game_key.empty()) {
+            CrashReport::NoteCheats(&system.CheatEngine());
+        }
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float mid = card.bb.GetCenter().y;
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text),
+                    name.c_str(), nullptr, label_width);
+        DrawSwitch(dl, card.bb.Max.x - Pad, mid, cheat.IsEnabled(), 1.0f);
+    }
+    ImGui::PopID();
+}
+
+void Ui::DrawCheatInfo() {
+    const std::string file = fmt::format(
+        "{}{:016X}.txt", FileUtil::GetUserPath(FileUtil::UserPath::CheatsDir), settings_program_id);
+    if (settings_cheats.empty()) {
+        ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+        ImGui::TextWrapped("No cheats");
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::Spacing();
+        Note(palette->TextDim,
+             fmt::format("Put this game's Gateway codes in {}: a [name] line for each cheat, then "
+                         "its code lines. Reopen this screen to see them.",
+                         file));
+        return;
+    }
+    if (focused_cheat < 0) {
+        return;
+    }
+    const Cheats::CheatBase& cheat = *settings_cheats[static_cast<std::size_t>(focused_cheat)];
+
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", cheat.GetName().c_str());
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    if (const std::string notes = cheat.GetComments(); !notes.empty()) {
+        ImGui::TextWrapped("%s", notes.c_str());
+        ImGui::Spacing();
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, palette->TextDim);
+    ImGui::TextUnformatted(cheat.GetCode().c_str());
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    const bool running = !settings_title.empty() && settings_title == game_key;
+    if (cheat.IsEnabled()) {
+        Note(palette->Accent, running ? "On: active now." : "On: applied while the game runs.");
+    } else {
+        Note(palette->TextDim, "Off.");
+    }
+    Note(palette->TextDim, fmt::format("From {}.", file));
 }
 
 void Ui::DrawRomFolderRows() {
@@ -1893,17 +2013,19 @@ Ui::Action Ui::DrawSettings() {
     BeginBackdrop("##settings_backdrop", for_title ? Icon::Cartridge : Icon::Gear,
                   for_title ? "Game settings" : "Settings",
                   for_title ? settings_name : std::string{"All games"});
-    // The Patches tab changes nothing.
-    const bool patches = category == Category::Patches;
+    // The Patches tab changes nothing; the Cheats tab's rows are switches alone.
+    const bool option_rows = category != Category::Patches && category != Category::Cheats;
     bool back = FooterButton(Glyph::Circle, "Back");
-    if (!patches) {
+    if (option_rows) {
         FooterButton(Glyph::LeftRight, "Change");
+    } else if (category == Category::Cheats && !settings_cheats.empty()) {
+        FooterButton(Glyph::Cross, "On or off");
     }
     if (categories.size() > 1 && FooterButton(Glyph::Shoulders, "Tab") && !next_category) {
         const int at = static_cast<int>(current - categories.begin());
         next_category = categories[static_cast<std::size_t>(at + 1) % categories.size()];
     }
-    if (for_title && !patches && FooterButton(Glyph::Triangle, "Use all games' setting") &&
+    if (for_title && option_rows && FooterButton(Glyph::Triangle, "Use all games' setting") &&
         focused_row >= 0) {
         Config::SetTitleValue(settings_title, rows[static_cast<std::size_t>(focused_row)].option,
                               std::nullopt);
@@ -1941,6 +2063,7 @@ Ui::Action Ui::DrawSettings() {
         category = *next_category;
         focused_row = -1;
         focused_patch = -1;
+        focused_cheat = -1;
         focused_rom_folder = armed_rom_folder = -1;
         focus_first_row = true;
     }
@@ -1956,6 +2079,10 @@ Ui::Action Ui::DrawSettings() {
     if (category == Category::Patches) {
         for (std::size_t i = 0; i < settings_patches.size(); i++) {
             DrawPatchRow(i);
+        }
+    } else if (category == Category::Cheats) {
+        for (std::size_t i = 0; i < settings_cheats.size(); i++) {
+            DrawCheatRow(i);
         }
     } else {
         for (std::size_t i = 0; i < rows.size(); i++) {
@@ -1976,6 +2103,8 @@ Ui::Action Ui::DrawSettings() {
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav);
     if (category == Category::Patches) {
         DrawPatchInfo();
+    } else if (category == Category::Cheats) {
+        DrawCheatInfo();
     } else {
         DrawRowInfo();
     }

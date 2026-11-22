@@ -7,10 +7,9 @@
 #include <fstream>
 #include <functional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <boost/iostreams/device/file_descriptor.hpp>
-#include <boost/iostreams/stream.hpp>
 #include "common/file_util.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
@@ -30,6 +29,41 @@ struct State {
     std::size_t current_line_nr = 0;
     bool loop_flag = false;
 };
+
+// Luma3DS's physical alias (bit 31 of the address): the scalar accessors alone know it.
+constexpr VAddr LumaAliasBit = 0x80000000;
+
+template <typename T>
+static T ReadGuarded(Memory::MemorySystem& memory, const Kernel::Process& process, VAddr addr) {
+    if ((addr & LumaAliasBit) != 0) {
+        if constexpr (sizeof(T) == 1) {
+            return memory.Read8(process, addr);
+        } else if constexpr (sizeof(T) == 2) {
+            return memory.Read16(process, addr);
+        } else {
+            return memory.Read32(process, addr);
+        }
+    }
+    T value{};
+    memory.ReadBlock(process, addr, &value, sizeof(value));
+    return value;
+}
+
+template <typename T>
+static void WriteGuarded(Memory::MemorySystem& memory, const Kernel::Process& process, VAddr addr,
+                         T value) {
+    if ((addr & LumaAliasBit) != 0) {
+        if constexpr (sizeof(T) == 1) {
+            memory.Write8(process, addr, value);
+        } else if constexpr (sizeof(T) == 2) {
+            memory.Write16(process, addr, value);
+        } else {
+            memory.Write32(process, addr, value);
+        }
+        return;
+    }
+    memory.WriteBlock(process, addr, &value, sizeof(value));
+}
 
 template <typename T, typename ReadFunction, typename WriteFunction>
 static inline std::enable_if_t<std::is_integral_v<T>> WriteOp(const GatewayCheat::CheatLine& line,
@@ -59,7 +93,7 @@ static inline std::enable_if_t<std::is_integral_v<T>> CompOp(const GatewayCheat:
 static inline void LoadOffsetOp(Memory::MemorySystem& memory, const Kernel::Process& process,
                                 const GatewayCheat::CheatLine& line, State& state) {
     u32 addr = line.address + state.offset;
-    state.offset = memory.Read32(process, addr);
+    state.offset = ReadGuarded<u32>(memory, process, addr);
 }
 
 static inline void LoopOp(const GatewayCheat::CheatLine& line, State& state) {
@@ -167,7 +201,7 @@ static inline void PatchOp(const GatewayCheat::CheatLine& line, State& state, Co
             state.current_line_nr++;
         }
         first = !first;
-        system.Memory().Write32(process, addr, tmp);
+        WriteGuarded<u32>(system.Memory(), process, addr, tmp);
         addr += 4;
         num_bytes -= 4;
     }
@@ -175,7 +209,7 @@ static inline void PatchOp(const GatewayCheat::CheatLine& line, State& state, Co
         u32 tmp = (first ? cheat_lines[state.current_line_nr].first
                          : cheat_lines[state.current_line_nr].value) >>
                   bit_offset;
-        system.Memory().Write8(process, addr, static_cast<u8>(tmp));
+        WriteGuarded<u8>(system.Memory(), process, addr, static_cast<u8>(tmp));
         addr += 1;
         num_bytes -= 1;
         bit_offset += 8;
@@ -239,17 +273,25 @@ void GatewayCheat::Execute(Core::System& system, u32 process_id) const {
         return;
     }
 
-    auto Read8 = [&memory, &process](VAddr addr) { return memory.Read8(*process, addr); };
-    auto Read16 = [&memory, &process](VAddr addr) { return memory.Read16(*process, addr); };
-    auto Read32 = [&memory, &process](VAddr addr) { return memory.Read32(*process, addr); };
+    // Block reads and writes, as the HLE's: they wait out or go past the GPU's holds on the page
+    // (MemorySystem's host guard), where a plain Read32 or Write32 would not (ReadGuarded).
+    auto Read8 = [&memory, &process](VAddr addr) {
+        return ReadGuarded<u8>(memory, *process, addr);
+    };
+    auto Read16 = [&memory, &process](VAddr addr) {
+        return ReadGuarded<u16>(memory, *process, addr);
+    };
+    auto Read32 = [&memory, &process](VAddr addr) {
+        return ReadGuarded<u32>(memory, *process, addr);
+    };
     auto Write8 = [&memory, &process](VAddr addr, u8 value) {
-        memory.Write8(*process, addr, value);
+        WriteGuarded<u8>(memory, *process, addr, value);
     };
     auto Write16 = [&memory, &process](VAddr addr, u16 value) {
-        memory.Write16(*process, addr, value);
+        WriteGuarded<u16>(memory, *process, addr, value);
     };
     auto Write32 = [&memory, &process](VAddr addr, u32 value) {
-        memory.Write32(*process, addr, value);
+        WriteGuarded<u32>(memory, *process, addr, value);
     };
 
     for (state.current_line_nr = 0; state.current_line_nr < cheat_lines.size();
@@ -492,12 +534,13 @@ std::vector<std::shared_ptr<CheatBase>> GatewayCheat::LoadFile(const std::string
         return cheats;
     }
 
-    boost::iostreams::stream<boost::iostreams::file_descriptor_source> file;
-    FileUtil::OpenFStream<std::ios_base::in>(file, filepath);
-    if (!file.is_open()) {
+    // Read whole, then parsed: OpenFStream's dup of the descriptor fails on the Vita.
+    std::string text;
+    if (FileUtil::ReadFileToString(true, filepath, text) == 0 && FileUtil::GetSize(filepath) != 0) {
         LOG_INFO(Core_Cheats, "GatewayCheat::LoadFile failed, file failed to open: {}", filepath);
         return cheats;
     }
+    std::istringstream file{text};
 
     std::string comments;
     std::vector<CheatLine> cheat_lines;

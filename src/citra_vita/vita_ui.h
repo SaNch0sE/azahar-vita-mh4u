@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -19,6 +20,10 @@
 
 #include <imgui_vita2d/imgui.h>
 
+namespace Cheats {
+class CheatBase;
+}
+
 namespace Core {
 class System;
 }
@@ -33,11 +38,7 @@ class EmuWindowVita;
  * while it is open; the pad is the primary input, with touch alongside.
  *
  * The settings screen is shared between the game list and the pause menu, and edits either the
- * values for all games or one title's own (Config): the same rows, the title's showing which of
- * them it sets itself. A row is one line, its label and its value; the selected row's description
- * and state (why it is greyed out, whether a title sets its own) show in full beside the list,
- * so that nothing has to be cut to fit. A title with patches built in (Loader::TitlePatchesOf)
- * has a tab more that lists them, which nothing on the screen changes.
+ * values for all games or one title's own (Config).
  *
  * While a title runs the interface is the sgxd render thread's (SgxdRenderer::RenderThread), as
  * the window is: it builds and draws the stats overlay in each present, and runs the pause menu
@@ -122,13 +123,15 @@ private:
         Multiplayer,
     };
 
-    /// The settings screen's groups, its tabs. Patches holds no rows: a title's built-in patches.
+    /// The settings screen's groups, its tabs. Patches and Cheats hold no rows: a title's
+    /// built-in patches, and its cheat file's cheats.
     enum class Category {
         Display,
         Speed,
         Sound,
         System,
         Patches,
+        Cheats,
         Count,
     };
 
@@ -206,8 +209,9 @@ private:
     void DrawKeyboard();
     void DrawStatusMessage();
 
-    /// The tabs the settings screen shows: all of them but Patches for all games, those with
-    /// options a title can set itself for a title, and Patches when it has some.
+    /// The tabs the settings screen shows: all of them but Patches and Cheats for all games,
+    /// those with options a title can set itself for a title, Patches when it has some, and
+    /// Cheats for a title with a program ID.
     [[nodiscard]] std::vector<Category> SettingsCategories() const;
     void DrawRow(const Row& row, std::size_t index);
     void DrawRowInfo();
@@ -221,6 +225,8 @@ private:
     [[nodiscard]] std::string ValueText(const Row& row, int value) const;
     void DrawPatchRow(std::size_t index);
     void DrawPatchInfo();
+    void DrawCheatRow(std::size_t index);
+    void DrawCheatInfo();
 
     /// True when the user pressed cancel and this overlay was the thing focused, which is what
     /// separates "close the menu" from "leave the child the cancel already left" - ImGui has
@@ -273,6 +279,11 @@ private:
     std::vector<Loader::TitlePatchInfo> settings_patches;
     std::vector<bool> settings_patches_in;
     int focused_patch = -1;
+    /// The title's program ID (0: none, or all games), its cheats as the cheat engine holds them
+    /// (its file's, read when the screen opens), and the selected one (-1: none yet).
+    u64 settings_program_id{};
+    std::vector<std::shared_ptr<Cheats::CheatBase>> settings_cheats;
+    int focused_cheat = -1;
 
     /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none).
     Multiplayer::Fields room_fields{};

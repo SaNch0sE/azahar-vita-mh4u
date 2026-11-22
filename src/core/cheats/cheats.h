@@ -5,7 +5,6 @@
 #pragma once
 
 #include <memory>
-#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <vector>
@@ -62,7 +61,6 @@ private:
 private:
     Core::System& system;
     Core::TimingEventType* event;
-    std::optional<u64> loaded_title_id;
     u32 process_id = 0xFFFFFFFF;
     std::vector<std::shared_ptr<CheatBase>> cheats_list;
     mutable Common::SharedMutex cheats_list_mutex;

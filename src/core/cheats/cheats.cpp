@@ -30,7 +30,10 @@ void CheatEngine::Connect(u32 process_id) {
     event = system.CoreTiming().RegisterEvent(
         "CheatCore::run_event",
         [this](u64 thread_id, s64 cycle_late) { RunCallback(thread_id, cycle_late); });
-    system.CoreTiming().ScheduleEvent(run_interval_ticks, event);
+    // A savestate's queue may hold the event already (Connect runs again at its load): one
+    // runs at a time, on core 0's timer, the title's main core (host 0's), as the boot puts it.
+    system.CoreTiming().UnscheduleEvent(event, 0);
+    system.CoreTiming().ScheduleEvent(run_interval_ticks, event, 0, 0);
 }
 
 std::span<const std::shared_ptr<CheatBase>> CheatEngine::GetCheats() const {
@@ -79,13 +82,8 @@ void CheatEngine::SaveCheatFile(u64 title_id) const {
 }
 
 void CheatEngine::LoadCheatFile(u64 title_id) {
-    {
-        std::unique_lock lock{cheats_list_mutex};
-        if (loaded_title_id.has_value() && loaded_title_id == title_id) {
-            return;
-        }
-    }
-
+    // Read again each time, even for the title loaded: a file copied in while the frontend runs
+    // is the one that counts, and every change made here was saved to the file at once.
     const std::string cheat_dir = FileUtil::GetUserPath(FileUtil::UserPath::CheatsDir);
     const std::string filepath = fmt::format("{}{:016X}.txt", cheat_dir, title_id);
 
@@ -98,7 +96,6 @@ void CheatEngine::LoadCheatFile(u64 title_id) {
     auto gateway_cheats = GatewayCheat::LoadFile(filepath);
     {
         std::unique_lock lock{cheats_list_mutex};
-        loaded_title_id = title_id;
         cheats_list = std::move(gateway_cheats);
     }
 }

@@ -559,15 +559,10 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
                   static_cast<u32>(load_result));
     }
 
-#if defined(__vita__)
-    // Cheats are off on the Vita build: every cheat write goes through
-    // InvalidateCacheRange, which on the native core is a kernel round trip that cleans the
-    // page and drops core 2's icache, once a frame per cheat line.
-    LOG_INFO(Core, "cheats are disabled on this build");
-#else
+    // A cheat line writes only a value that differs from memory's, and the native core's
+    // InvalidateCacheRange syncs code only where the process can execute.
     cheat_engine.LoadCheatFile(title_id);
     cheat_engine.Connect(process->process_id);
-#endif
 
     perf_stats = std::make_unique<PerfStats>(title_id);
 
