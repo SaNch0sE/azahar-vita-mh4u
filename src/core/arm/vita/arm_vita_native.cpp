@@ -258,6 +258,11 @@ bool ConditionPasses(u32 cond, u32 cpsr) {
     return (cond & 1) ? !pass : pass;
 }
 
+/// Luma's alias of FCRAM: a physical address (0x2xxxxxxx) with bit 31 set.
+constexpr bool IsLumaAlias(u32 address) {
+    return address >> 28 == 0xAu;
+}
+
 /// An ARM VFP data-processing instruction (cond 1110 .... 101x ...0, cond not 0xF).
 bool IsVfpDataProcessing(u32 insn) {
     return (insn >> 28) != 0xF && (insn & 0x0F000E10) == 0x0E000A00;
@@ -3090,6 +3095,9 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         if (status == 0xFu && TakeHeldPage(run.far, write, run.ctx.r[15])) {
             return !break_flag && !stop_requested;
         }
+        if (LumaAliasAccess(write)) {
+            return !break_flag && !stop_requested;
+        }
         ReportFault();
         return false;
     }
@@ -3259,12 +3267,34 @@ bool ARM_VitaNative::TakeHoldBudget(u32 page, u32 ticket) {
     return true;
 }
 
+bool ARM_VitaNative::LumaAliasAccess(bool write) {
+    // Luma plugins access FCRAM through its physical address with bit 31 set, which native
+    // guest code cannot reach: served here, a fault each (rare enough not to map 128 MiB more).
+    if (!IsLumaAlias(run.far) || !AccessPastHolds(run.ctx.r[15], write)) {
+        return false;
+    }
+#ifdef VITA_DIAGNOSTICS
+    static u32 accesses;
+    if (std::has_single_bit(++accesses)) {
+        LOG_INFO(Core_ARM11, "Luma alias: access {}, {} {:08X}", accesses, write ? "to" : "from",
+                 run.far);
+    }
+#endif
+    return true;
+}
+
 bool ARM_VitaNative::AccessPastHolds(u32 pc, bool write) {
     const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
     const u32 next = pc + (thumb ? 2 : 4);
     // The app's view of the guest's page: the guest's slot, open to the app. A load needs the
     // GPU's writes missed, a store everything the queued work touches.
     const auto misses = [&](u32 address, u32 bytes) -> u8* {
+        if (IsLumaAlias(address)) {
+            // Physical memory: no slot of the guest's, and no hold counts it (LumaAliasAccess).
+            const PAddr physical = address & 0x7FFFFFFFu;
+            return memory.IsValidPhysicalAddress(physical) ? memory.GetPhysicalPointer(physical)
+                                                           : nullptr;
+        }
         const u8* const host = map->HostAt(address);
         u32 ticket = 0;
         if (host == nullptr ||

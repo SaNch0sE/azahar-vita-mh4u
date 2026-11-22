@@ -4,8 +4,13 @@
 
 #include <algorithm>
 #include <cstring>
+#include <boost/serialization/binary_object.hpp>
+#include <boost/serialization/deque.hpp>
 #include <boost/serialization/list.hpp>
 #include <boost/serialization/map.hpp>
+#include <boost/serialization/shared_ptr.hpp>
+#include <boost/serialization/unordered_map.hpp>
+#include <boost/serialization/vector.hpp>
 #include "common/vita_osrng.h"
 #include "common/archives.h"
 #include "common/common_types.h"
@@ -33,13 +38,33 @@ SERVICE_CONSTRUCT_IMPL(Service::NWM::NWM_UDS)
 namespace Service::NWM {
 
 template <class Archive>
-void NWM_UDS::serialize(Archive& ar, const unsigned int) {
+void NWM_UDS::serialize(Archive& ar, const unsigned int file_version) {
     DEBUG_SERIALIZATION_POINT;
     ar& boost::serialization::base_object<Kernel::SessionRequestHandler>(*this);
     ar & node_map;
     ar & connection_event;
     ar & received_beacons;
     // wifi_packet_received set in constructor
+    if (file_version < 1) {
+        // A state from before version 1 carries no session: a network the game hosted or joined
+        // is gone after the load, and the game's handle names an event this service never signals.
+        return;
+    }
+    ar & connection_status_event;
+    ar & recv_buffer_memory;
+    ar& boost::serialization::make_binary_object(&connection_status, sizeof(connection_status));
+    bool is_initialized = initialized;
+    ar & is_initialized;
+    initialized = is_initialized;
+    u32 nodes = static_cast<u32>(node_info.size());
+    ar & nodes;
+    node_info.resize(nodes);
+    ar& boost::serialization::make_binary_object(node_info.data(), nodes * sizeof(NodeInfo));
+    ar& boost::serialization::make_binary_object(&current_node, sizeof(current_node));
+    ar & conn_type;
+    ar & channel_data;
+    ar & network_channel;
+    ar& boost::serialization::make_binary_object(&network_info, sizeof(network_info));
 }
 
 namespace ErrCodes {

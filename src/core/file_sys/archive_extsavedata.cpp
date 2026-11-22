@@ -192,7 +192,7 @@ std::string GetExtSaveDataPath(std::string_view mount_point, const Path& path) {
 
 std::string GetExtDataContainerPath(std::string_view mount_point, bool shared) {
     if (shared) {
-        return fmt::format("{}data/{}/extdata/", mount_point, SYSTEM_ID);
+        return fmt::format("{}extdata/", GetNANDDataRoot(mount_point));
     }
     return fmt::format("{}extdata/", GetSDMCLayoutRoot(mount_point));
 }

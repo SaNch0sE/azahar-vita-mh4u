@@ -251,7 +251,9 @@ void SRV::PublishToSubscriber(Kernel::HLERequestContext& ctx) {
     // this piece of code should be removed, and handled by subscribing from NS instead.
     if (notification_id == 0x203) {
         system.RequestShutdown();
-    } else {
+    } else if (notification_id != last_stubbed_publish) {
+        // Once an ID in a row: some titles publish one about 85 times a second.
+        last_stubbed_publish = notification_id;
         LOG_WARNING(Service_SRV, "(STUBBED) called, notification_id=0x{:X}, flags={}",
                     notification_id, flags);
     }

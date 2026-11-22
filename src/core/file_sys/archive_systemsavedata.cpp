@@ -30,7 +30,7 @@ std::string GetSystemSaveDataPath(std::string_view mount_point, const Path& path
 }
 
 std::string GetSystemSaveDataContainerPath(std::string_view mount_point) {
-    return fmt::format("{}data/{}/sysdata/", mount_point, SYSTEM_ID);
+    return fmt::format("{}sysdata/", GetNANDDataRoot(mount_point));
 }
 
 Path ConstructSystemSaveDataBinaryPath(u32 high, u32 low) {

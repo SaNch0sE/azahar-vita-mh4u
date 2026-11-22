@@ -569,6 +569,16 @@ u64 GetSize(const std::string& filename) {
         LOG_ERROR(Common_Filesystem, "failed {}: is a directory", filename);
         return 0;
     }
+#ifdef __vita__
+    // newlib's st_size is a 32-bit off_t: a file of 2 GiB or more came back negative and
+    // sign-extended (crash reports' game sizes of 17592186042368 MiB). SceIoStat's is 64 bits.
+    SceIoStat st{};
+    if (const int r = sceIoGetstat(HostPath(filename).c_str(), &st); r < 0) {
+        LOG_ERROR(Common_Filesystem, "Stat failed {}: {:#010x}", filename, static_cast<u32>(r));
+        return 0;
+    }
+    return static_cast<u64>(st.st_size);
+#endif
 #ifndef _WIN32
     struct stat buf;
 #endif
@@ -1759,8 +1769,9 @@ int IOFile::GetFd() const {
 
 bool IOFile::Resize(u64 size) {
 #ifdef __vita__
-    // The kernel offers no truncate; growing is a write of zeros at the end, which is what
-    // savedata creation needs. Shrinking is refused and logged.
+    // Growing is a write of zeros at the end, which is what savedata creation needs; shrinking
+    // is the kernel's size change by descriptor (a title that opens a file "wb" over a longer
+    // one asks for size 0).
     if (!IsOpen()) {
         m_good = false;
         return false;
@@ -1770,10 +1781,21 @@ bool IOFile::Resize(u64 size) {
         return true;
     }
     if (size < current) {
-        LOG_ERROR(Common_Filesystem, "cannot shrink {} from {} to {} on this platform", filename,
-                  current, size);
-        m_good = false;
-        return false;
+        SceIoStat st{};
+        st.st_size = static_cast<SceOff>(size);
+        const int fd = m_fd;
+        int r = sceIoChstatByFd(fd, &st, SCE_CST_SIZE);
+        if (r < 0 && ReopenAfterStandby(fd, r)) {
+            r = sceIoChstatByFd(m_fd, &st, SCE_CST_SIZE);
+        }
+        const u64 now = r < 0 ? current : GetSize();
+        if (now != size) {
+            LOG_ERROR(Common_Filesystem, "{}: not shrunk from {} to {} ({}): {:#010x}", filename,
+                      current, size, now, static_cast<u32>(r));
+            m_good = false;
+            return false;
+        }
+        return true;
     }
     static const std::vector<u8> zeros(64 * 1024, 0);
     const SceOff pos = sceIoLseek(m_fd, 0, SEEK_CUR);

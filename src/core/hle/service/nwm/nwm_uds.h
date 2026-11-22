@@ -16,6 +16,7 @@
 #include <vector>
 #include <boost/optional.hpp>
 #include <boost/serialization/export.hpp>
+#include <boost/serialization/version.hpp>
 #include "common/common_types.h"
 #include "common/mutex.h"
 #include "common/swap.h"
@@ -596,6 +597,17 @@ private:
                              /// network node will be received.
         std::shared_ptr<Kernel::Event> event;         ///< Receive event for this bind node.
         std::deque<std::vector<u8>> received_packets; ///< List of packets received on this channel.
+
+    private:
+        template <class Archive>
+        void serialize(Archive& ar, const unsigned int) {
+            ar & bind_node_id;
+            ar & channel;
+            ar & network_node_id;
+            ar & event;
+            ar & received_packets;
+        }
+        friend class boost::serialization::access;
     };
 
     // Mapping of data channels to their internal data.
@@ -656,4 +668,5 @@ private:
 
 SERVICE_CONSTRUCT(Service::NWM::NWM_UDS)
 BOOST_CLASS_EXPORT_KEY(Service::NWM::NWM_UDS)
+BOOST_CLASS_VERSION(Service::NWM::NWM_UDS, 1)
 BOOST_CLASS_EXPORT_KEY(Service::NWM::NWM_UDS::ThreadCallback)

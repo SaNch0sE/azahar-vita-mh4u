@@ -36,6 +36,18 @@ inline std::string GetSDMCLayoutRoot(std::string_view sdmc_directory) {
 #endif
 }
 
+/// Where the NAND keeps system save data and shared extdata: `<nand>/data/<ID0>/`. The Vita
+/// build drops that segment too (the ten-level limit above): the CEC module's boxes,
+/// `<nand>/data/<ID0>/sysdata/00010026/00000000/CEC/<id>/InBox___`, are
+/// level 11 under `ux0:/data/azahar/nand`. Host layout only.
+inline std::string GetNANDDataRoot(std::string_view nand_directory) {
+#ifdef __vita__
+    return std::string(nand_directory);
+#else
+    return fmt::format("{}data/{}/", nand_directory, SYSTEM_ID);
+#endif
+}
+
 namespace Loader {
 class AppLoader;
 }

@@ -262,6 +262,28 @@ private:
     /// LDRSH and LDRD, STR, STRB, STRH and STRD with an immediate or register offset, LDM and
     /// STM (no user bank, no PC), VLDR, VSTR, VLDM and VSTM (IA, DB); whether it was one.
     bool AccessPastHolds(u32 pc, bool write);
+    /// A guest access to Luma's alias of FCRAM (bit 31 set), which the guest's table does not hold:
+    /// made here. Whether it was one.
+    bool LumaAliasAccess(bool write);
+    /// AccessPastHolds' exclusive monitor: an LDREX made here leaves its address, size and value for
+    /// one exit, and the STREX right after stores as a compare and swap against that value. A STREX
+    /// without it takes the fault's path and fails. A thread switch clears it.
+    struct Exclusive {
+        u32 address = 0;
+        u32 size = 0;
+        u64 value = 0;
+        bool valid = false;
+    };
+    Exclusive exclusive{}, exclusive_held{};
+    /// The pages the guest keeps accessing past their holds: every AccessesPerOpen-th access tries to
+    /// open the page without a wait, so the next ones run natively.
+    struct HotPage {
+        u32 page = ~0u;
+        u32 accesses = 0;
+    };
+    static constexpr u32 AccessesPerOpen = 32;
+    std::array<HotPage, 4> hot_pages{};
+    u32 hot_next{};
     struct HoldBudget {
         u32 page = ~0u;
         u32 ticket = 0;

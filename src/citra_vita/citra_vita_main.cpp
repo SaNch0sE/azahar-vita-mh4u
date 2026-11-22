@@ -19,6 +19,8 @@
 #include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
@@ -108,6 +110,22 @@ void SetupPaths() {
     // Must happen before anything asks for a path: the first request bootstraps the whole table
     // from whatever the platform default is, and on this console there is no such thing.
     FileUtil::SetUserPath(UserDirectory);
+}
+
+void MigrateNandLayout() {
+    // The NAND's system save data and shared extdata moved up from data/<ID0>/
+    // (Service::FS::GetNANDDataRoot, the ten-level limit): data kept there before comes along.
+    for (const char* dir : {"sysdata", "extdata"}) {
+        const std::string nand = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir);
+        const std::string from =
+            fmt::format("{}data/00000000000000000000000000000000/{}", nand, dir);
+        const std::string to = nand + dir;
+        SceIoStat st{};
+        if (sceIoGetstat(from.c_str(), &st) >= 0 && sceIoGetstat(to.c_str(), &st) < 0) {
+            const int moved = sceIoRename(from.c_str(), to.c_str());
+            LOG_INFO(Frontend, "{} moved to {}: {:#010x}", from, to, static_cast<u32>(moved));
+        }
+    }
 }
 
 /// Names the exception behind an abort, in every build: std::terminate goes to newlib's abort(),
@@ -1232,6 +1250,7 @@ int EmulatorMain() {
 
     SetupPaths();
     SetupLogging();
+    MigrateNandLayout();
     SetupNetwork();
 
     // What stops the start comes first, in the menus' language: before anything else is set up

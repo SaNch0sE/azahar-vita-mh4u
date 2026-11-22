@@ -172,6 +172,10 @@ u16 TitleMetadata::GetContentTypeByIndex(std::size_t index) const {
     return tmd_chunks[index].type;
 }
 
+const std::array<u8, 0x20>& TitleMetadata::GetContentHashByIndex(std::size_t index) const {
+    return tmd_chunks[index].hash;
+}
+
 u64 TitleMetadata::GetContentSizeByIndex(std::size_t index) const {
     return tmd_chunks[index].size;
 }
