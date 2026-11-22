@@ -304,6 +304,7 @@ typedef struct AzaharRebackRequest {
 #define AZAHAR_ERR_TIMEOUT AZAHAR_ERROR(1007)  // the core-2 thread did not complete a command in time
 #define AZAHAR_ERR_FULL AZAHAR_ERROR(1008)     // a queue has no room yet (the microkernel's jobs)
 #define AZAHAR_ERR_ROUTE AZAHAR_ERROR(1009)    // the sound goes where no system volume is (HDMI, USB)
+#define AZAHAR_ERR_TAKEN AZAHAR_ERROR(1010)    // the USB port is another driver's (a plugin's device)
 
 
 #ifdef __cplusplus
@@ -378,6 +379,20 @@ int azaharVolumeKeys(void);
 /// the file is written (minutes over host0). `path` (path_size bytes, may be NULL)
 /// gets the dump's path. Returns the dump's result (0 written), or a negative error. Version 77.
 int azaharCoredump(char *path, uint32_t path_size);
+/// One of the 3DS's screens as a USB webcam (uvc.c, version 82): a UVC device of one YUY2 format,
+/// `width` x `height` (even width, at most 400 x 240) at 60 frames a second. Starting it takes the
+/// USB port. A port another driver has (azaharUvcPortTaken) is taken only with `take`, which stops
+/// every driver on it; without it the call returns AZAHAR_ERR_TAKEN and touches nothing
+/// (version 83). A failed step of the start is its result.
+int azaharUvcStart(uint32_t width, uint32_t height, int take);
+/// 1 when another driver has the USB port: its device activated while none of the system's own
+/// functions is started, as a plugin that streams the screen leaves it; else 0 (version 83).
+int azaharUvcPortTaken(void);
+/// The next frame, `size` bytes of YUY2 (width x height x 2). Returns 1 queued, 0 when nobody is
+/// watching (the host has not committed a stream: the app need not convert), or an error.
+int azaharUvcFrame(const void *yuy2, uint32_t size);
+/// Whether a host is streaming now (no syscall cost beyond the call: a load).
+int azaharUvcStreaming(void);
 /// The kernel modules loaded from outside the firmware (plugins.c, version 86): taiHEN, HENkaku
 /// and the plugins a taiHEN config.txt loads, as "name path" lines in `out` (`size` bytes, ended
 /// in a NUL, cut where they do not fit). Returns the count listed, or AZAHAR_ERR_*.
@@ -471,7 +486,7 @@ int azaharBusErrorWatch(AzaharBusErrorCatch *out);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.
-#define AZAHAR_NATIVE_VERSION 81
+#define AZAHAR_NATIVE_VERSION 84
 #define AZAHAR_NATIVE_UNLOADABLE 67
 int azaharVersion();
 /// This module as a UID of the calling process, for taiStopUnloadKernelModule: taiHEN stops and

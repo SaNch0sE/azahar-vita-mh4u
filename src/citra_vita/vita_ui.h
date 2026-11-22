@@ -260,6 +260,10 @@ private:
     /// it while sgxd holds a title's state is too risky.
     void DrawKeyboard();
     void DrawStatusMessage();
+    Action DrawUsbPrompt();
+    enum class UsbPrompt { None, Setting, Launch };
+    UsbPrompt usb_prompt{UsbPrompt::None};
+    int usb_prompt_value{}; ///< the screen the setting was turned to
 
     /// The tabs the settings screen shows: all of them but Patches and Cheats for all games,
     /// those with options a title can set itself for a title, Patches when it has some, and

@@ -252,6 +252,11 @@ int RoleCores(ThreadRole role, std::size_t index) {
     case ThreadRole::Y2r:
         // A video's frames, converted while the guest decodes the next one: core 0 again.
         return 1 << 0;
+    case ThreadRole::UsbVideo:
+        // A frame a present, on whichever of the render thread's and the parse's cores is free
+        // first (on core 3 alone, behind the parse, the audio and the DSP, frames go out
+        // unevenly).
+        return 1 << 0 | 1 << 3;
     case ThreadRole::Render:
         // The PICA stays on the emulation thread; what it draws is built and sent here. Core 0:
         // the second emulation thread has core 1.
@@ -297,7 +302,10 @@ constexpr int PriorityCore(ThreadRole role) {
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 3;
     case ThreadRole::Parse:
     case ThreadRole::Y2r:
-        // Behind the render thread on core 0 (Y2R), before the rest on core 3 (the parse).
+    case ThreadRole::UsbVideo:
+        // Behind the render thread on core 0 (Y2R), before the rest on core 3 (the parse). A USB
+        // frame takes a millisecond or two: before the shader workers, whose jobs hold a core for
+        // tens of milliseconds, it is never a frame late.
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
     case ThreadRole::Other:
         return SCE_KERNEL_PROCESS_PRIORITY_USER_DEFAULT;

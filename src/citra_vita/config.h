@@ -82,6 +82,9 @@ enum class Option : u32 {
     /// The notice before sgxd takes the GPU at start (ShowGxmNotice): 1, or 0 to take it at once.
     /// The frontend's own, read as the app starts.
     StartupNotice,
+    /// One of the 3DS's screens as a USB webcam (UvcStream): 0 off, 1 the top screen, 2 the
+    /// bottom. The Vita keeps its own layout.
+    UsbVideo,
     Count,
 };
 

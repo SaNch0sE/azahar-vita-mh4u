@@ -37,6 +37,7 @@
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/sgxd_present.h"
 #include "citra_vita/stats_hud.h"
+#include "citra_vita/uvc_stream.h"
 #include "citra_vita/vita_ui.h"
 #include "common/assert.h"
 #include "common/file_derived.h"
@@ -1618,6 +1619,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::UsbVideo,
+         Category::System,
+         Kind::Choice,
+         "USB video",
+         "Sends one screen to a PC over the USB cable, as a 400x240 webcam named Azahar. The Vita "
+         "keeps its own layout: to see only the other screen, use Single screen (with Swap screens "
+         "if needed).",
+         {"Off", "Top screen", "Bottom screen"},
+         0,
+         nullptr,
+         nullptr});
 }
 
 bool Ui::BackPressed() const {
@@ -1756,6 +1768,13 @@ int Ui::RowValue(const Row& row) const {
 }
 
 void Ui::SetRowValue(const Row& row, int value) {
+    // USB video turned on while another plugin has the port: the player is asked first.
+    if (row.option == Config::Option::UsbVideo && value != 0 && RowValue(row) == 0 &&
+        !UvcStream::TakeoverAllowed() && UvcStream::PortTaken()) {
+        usb_prompt = UsbPrompt::Setting;
+        usb_prompt_value = value;
+        return;
+    }
     if (settings_title.empty()) {
         Config::SetGlobal(row.option, value);
     } else {
@@ -2298,6 +2317,10 @@ void Ui::DrawRowInfo() {
 
     if (const char* reason = DisabledReason(row)) {
         Note(palette->Accent, reason);
+    }
+    if (const char* problem = UvcStream::Problem();
+        problem && row.option == Config::Option::UsbVideo) {
+        Note(palette->Accent, problem);
     }
     const int all_games = Config::Global(row.option);
     if (for_title && own && *own != all_games) {
@@ -2933,7 +2956,12 @@ Ui::Action Ui::DrawGameList() {
         action = Action::TogglePin;
     } else if (start) {
         selected_game_path = game.path;
-        action = game.installer ? Action::InstallTitle : Action::LaunchGame;
+        if (!game.installer && Config::Global(Config::Option::UsbVideo) != 0 &&
+            !UvcStream::TakeoverAllowed() && UvcStream::PortTaken()) {
+            usb_prompt = UsbPrompt::Launch; // the answer starts the game
+        } else {
+            action = game.installer ? Action::InstallTitle : Action::LaunchGame;
+        }
     }
     return action;
 }
@@ -3550,6 +3578,53 @@ void Ui::DrawStatusMessage() {
     ImGui::End();
 }
 
+Ui::Action Ui::DrawUsbPrompt() {
+    constexpr float Padding = 28.0f;
+    constexpr float Width = 640.0f;
+    const ImVec2 button(200.0f, 48.0f);
+    const char* const text =
+        "Another plugin is using the USB port, such as one that streams the screen "
+        "(vitastream). Take it over for USB video? That plugin stops working until you reboot.";
+    const ImVec2 size = ImGui::CalcTextSize(text, nullptr, false, Width - 2.0f * Padding);
+    BeginCentered("##usb_prompt", Width, size.y + 3.0f * Padding + button.y);
+    ImGui::SetCursorPos(ImVec2(Padding, Padding));
+    ImGui::PushTextWrapPos(Width - Padding);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::SetCursorPos(ImVec2(Width * 0.5f - button.x - 10.0f, 2.0f * Padding + size.y));
+    const bool take = ImGui::Button("Take over", button);
+    ImGui::SameLine(0.0f, 20.0f);
+    const bool cancel = ImGui::Button("Cancel", button) || BackPressed();
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetItemDefaultFocus(); // Cancel
+    }
+    overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGui::End();
+    if (!take && !cancel) {
+        return Action::None;
+    }
+    const UsbPrompt asked = usb_prompt;
+    usb_prompt = UsbPrompt::None;
+    overlay_focused = false;
+    if (take) {
+        UvcStream::AllowTakeover();
+    }
+    if (asked == UsbPrompt::Setting) {
+        if (take) {
+            Config::SetGlobal(Config::Option::UsbVideo, usb_prompt_value);
+        }
+        return Action::None;
+    }
+    // The launch's: Cancel starts nothing.
+    if (cancel) {
+        return Action::None;
+    }
+    if (middle) {
+        Config::SetGlobal(Config::Option::UsbVideo, 0);
+    }
+    return Action::LaunchGame;
+}
+
 Ui::Action Ui::Update() {
     // In game: the stats overlay, which needs no ImGui frame (Draw).
     imgui_frame = !status_message.empty() || state != State::InGame;
@@ -3564,6 +3639,8 @@ Ui::Action Ui::Update() {
     Action action = Action::None;
     if (!status_message.empty()) {
         DrawStatusMessage();
+    } else if (usb_prompt != UsbPrompt::None) {
+        action = DrawUsbPrompt();
     } else {
         switch (state) {
         case State::GameList:

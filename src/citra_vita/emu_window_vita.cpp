@@ -24,6 +24,7 @@
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/sgxd_present.h"
+#include "citra_vita/uvc_stream.h"
 #include "citra_vita/vita_ui.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -33,6 +34,7 @@
 #include "core/core.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
+#include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 
 namespace VitaFrontend {
@@ -653,6 +655,9 @@ void EmuWindowVita::DrawGuestScreens() {
                                           s.fill_b)
                             : std::string{},
                      r.GetWidth(), r.GetHeight(), r.left, r.top);
+        }
+        if (!s.fill && s.address != 0) {
+            UvcStream::Offer(i, s.pixels, s.stride, s.columns, s.format);
         }
         if (!enabled[i] || s.fill || s.address == 0 || s.pixels == nullptr) {
             continue;

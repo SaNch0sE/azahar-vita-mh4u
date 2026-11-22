@@ -51,6 +51,8 @@ set(CITRA_VITA_SOURCES
     stats_hud.cpp
     stats_hud.h
     upcall_tls.cpp
+    uvc_stream.cpp
+    uvc_stream.h
     vita_ui.cpp
     vita_ui.h
     "${GXM_SHADER_HEADER}"

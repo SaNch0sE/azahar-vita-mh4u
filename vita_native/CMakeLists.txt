@@ -65,6 +65,7 @@ target_link_libraries(azaharnative PRIVATE
     SceCtrlForDriver_stub
     SceRegMgrForDriver_stub
     SceSysconForDriver_stub
+    SceUdcdForDriver_stub
 )
 # Deliberately NOT linked: SceProcessmgrForKernel_stub and SceSysmemForKernel_stub. The
 # *ForKernel libraries are re-versioned every firmware - SceProcessmgrForKernel is library

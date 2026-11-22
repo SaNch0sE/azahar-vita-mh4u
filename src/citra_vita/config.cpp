@@ -17,6 +17,7 @@
 #include "citra_vita/config.h"
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/input_factory_vita.h"
+#include "citra_vita/uvc_stream.h"
 #include "common/assert.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
@@ -57,6 +58,7 @@ const std::vector<const char*> Skips{"0", "1", "2", "3", "4", "none"};
 const std::vector<const char*> Regions{"auto",      "japan", "usa",   "europe",
                                        "australia", "china", "korea", "taiwan"};
 const std::vector<const char*> Themes{"dark", "light"};
+const std::vector<const char*> UsbVideoScreens{"off", "top", "bottom"};
 const std::vector<const char*> RightStickWords{"cstick", "lr", "dpad"};
 const std::vector<const char*> Inputs{"circle", "cross",  "triangle",  "square",     "up",
                                       "down",   "left",   "right",     "l",          "r",
@@ -98,6 +100,7 @@ const std::array<Definition, Count> definitions{{
     {"force_new_3ds", true, false, 0, 1, 0, Toggle},
     {"theme", false, true, 0, 1, 0, Themes},
     {"startup_notice", false, true, 0, 1, 1, Toggle},
+    {"usb_video", false, true, 0, 2, 0, UsbVideoScreens},
 }};
 
 /// The screen layouts' choices as the emulator's layout options; the overlay is the single
@@ -257,6 +260,10 @@ void ApplyLocked(Option option) {
         break;
     case Option::StartupNotice:
         // Nothing of the emulator's: the start reads it (EmulatorMain).
+        break;
+    case Option::UsbVideo:
+        // The Vita keeps the player's layout: single screen and swap show the other screen alone.
+        UvcStream::SetScreen(value);
         break;
     case Option::Count:
         UNREACHABLE();

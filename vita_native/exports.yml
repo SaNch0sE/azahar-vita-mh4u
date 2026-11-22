@@ -58,6 +58,10 @@ azaharnative:
         - sgxdOwned: 0x3C1A7E39
         - sgxdQueue: 0x3C1A7E3A
         - sgxdStandby: 0x3C1A7E3B
+        - azaharUvcStart: 0x3C1A7E3C
+        - azaharUvcFrame: 0x3C1A7E3D
+        - azaharUvcStreaming: 0x3C1A7E3E
+        - azaharUvcPortTaken: 0x3C1A7E3F
         - azaharKernelPlugins: 0x3C1A7E41
         - azaharVaReport: 0x3C1A7E42
         - sgxdResetAll: 0x3C1A7E44

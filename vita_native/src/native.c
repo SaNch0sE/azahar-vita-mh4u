@@ -1282,12 +1282,14 @@ static int azahar_stop_resident(void) {
 
 static void sgxd_on_proc_gone(SceUID pid);   // sgxd.c
 static void reback_on_proc_gone(SceUID pid); // reback.c
+static void uvc_on_proc_gone(SceUID pid);    // uvc.c
 static uint32_t reback_attr_for(uint32_t pa); // reback.c
 
 // The client process is gone: same teardown as azaharRelease, which the two paths share below.
 static int azahar_on_proc_gone(SceUID pid) {
     sgxd_on_proc_gone(pid);
     reback_on_proc_gone(pid);
+    uvc_on_proc_gone(pid);
     if (pid != azahar_client_pid || azahar_state == ST_NONE) {
         return 0;
     }
