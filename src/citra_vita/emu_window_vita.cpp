@@ -29,7 +29,8 @@
 #include "core/3ds.h"
 #include "core/core.h"
 #include "core/frontend/framebuffer_layout.h"
-#include "video_core/renderer_gxm/gxm_rasterizer.h"
+#include "video_core/renderer_sgxd/sgxd_rasterizer.h"
+#include "video_core/renderer_sgxd/sgxd_backend.h"
 
 namespace VitaFrontend {
 
@@ -658,6 +659,9 @@ PresentTimes TakePresentTimes() {
 #endif
 
 void EmuWindowVita::Present(Ui* ui, bool update) {
+    SgxdRenderer::SgxdDrainKernelLog();
+#ifdef VITA_DIAGNOSTICS
+    auto t = std::chrono::steady_clock::now();
     const auto mark = [&t](u32 part) {
         present_us[part].fetch_add(Since(t), std::memory_order_relaxed);
     };

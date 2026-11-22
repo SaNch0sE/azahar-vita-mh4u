@@ -3192,12 +3192,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     ResolveVertexProgram(v);
     DumpProgram("vs", key, v.usse);
     DumpPicaVertex(key, config, pica.vs_setup);
-    v.primary_doutu0 =
-        sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.primary), v.gxp.temp_count);
-    v.secondary_doutu0 = v.gxp.secondary.empty()
-                             ? DummyVertexSecondary
-                             : sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
-                                                   backend.PlaceCode(0, v.usse.secondary), 0);
+    PlaceVertexCode(v);
     LOG_INFO(Render,
              "vertex program {:016x}: {} + {} words, {} PAs, {} temps, {} SAs, {} uniforms{}, "
              "emitted in {} us",
@@ -6510,69 +6505,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const Usse::Program& vg = vp.usse;
 
     // --- the vertex program's SA block and uniform buffer ---
-    // The image covers the containers, the prefetched uniforms after them and the SAs the
-    // secondary program writes; the secondary PDS program DMAs all of it.
-    const u32 vsa_words = vg.uniform_floats + Usse::DataHead(vg) + static_cast<u32>(vg.literals.size());
-    const u32 vsec_sa = std::max(vg.secondary_reg_count, vsa_words);
-    const SgxdBackend::Data vsa = backend.AllocData(vsec_sa * 4);
-    float* const vsa_f = reinterpret_cast<float*>(vsa.cpu);
-    std::memset(vsa.cpu, 0, vsec_sa * 4);
-    SgxdBackend::Data vbuf{};
-    if (vg.buffer_pointer) {
-        vbuf = backend.AllocData(vg.buffer_floats * 4);
-        std::memset(vbuf.cpu, 0, vg.buffer_floats * 4);
-        const u32 pointer = vbuf.gpu + static_cast<u32>(vg.ldst_base_value);
-        std::memcpy(vsa.cpu + vg.uniform_floats * 4, &pointer, 4);
-    }
-    for (size_t i = 0; i < vg.literals.size(); i++) {
-        std::memcpy(vsa.cpu + (vg.uniform_floats + Usse::DataHead(vg) + i) * 4, &vg.literals[i],
-                    4);
-    }
-    const auto& uniforms = pica.vs_setup.uniforms;
-    for (const Usse::GxpUniform& u : vg.uniforms) {
-        if (u.name == "uniforms_f") {
-            // The whole bank, f24 as float: rows past the 96 real uniforms read as ones, as the
-            // PICA reads them, and rows 0-3 again past 127 (the emitter's wrap mirror).
-            DEBUG_ASSERT(vg.buffer_pointer && u.sa_offset + u.array_size * 4 <= vg.buffer_floats);
-            float* const bank = reinterpret_cast<float*>(vbuf.cpu) + u.sa_offset;
-            for (u32 n = 0; n < u.array_size; n++) {
-                const u32 row = n < 128 ? n : n - 128;
-                for (u32 c = 0; c < 4; c++) {
-                    bank[n * 4 + c] = row < 96 ? uniforms.f[row][c].ToFloat32() : 1.0f;
-                }
-            }
-            continue;
-        }
-        DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <= vg.uniform_floats);
-        float* const out = vsa_f + u.sa_offset;
-        if (u.name == "flip_viewport") {
-            out[0] = vs_data.flip_viewport ? 1.0f : 0.0f;
-        } else if (u.name == "depth_scale") {
-            out[0] = fs_data.depth_scale;
-        } else if (u.name == "depth_offset") {
-            out[0] = fs_data.depth_offset;
-        } else if (u.name == "uniforms_i") {
-            for (u32 n = 0; n < 4 && n < u.array_size; n++) {
-                for (u32 c = 0; c < 4; c++) {
-                    out[n * 4 + c] = static_cast<float>(uniforms.i[n][c]);
-                }
-            }
-        } else if (u.name.starts_with("vs_in_reg")) {
-            const u32 reg = static_cast<u32>(std::stoul(u.name.substr(9)));
-            float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            for (u32 attr = 0; attr < 16; attr++) {
-                if (va.IsDefaultAttribute(attr) && regs.vs.GetRegisterForAttribute(attr) == reg) {
-                    for (u32 c = 0; c < 4; c++) {
-                        value[c] = pica.input_default_attributes[attr][c].ToFloat32();
-                    }
-                }
-            }
-            PutVec(out, value, u.components);
-        } else {
-            UNREACHABLE_MSG("GXM: {}: the vertex uniform {} has no value", describe(), u.name);
-        }
-    }
-    const u32 vsec_sa = std::max(vg.secondary_reg_count, vsa_words);
+    u32 vsec_sa = 0;
+    const SgxdBackend::Data vsa = VertexSa(vp, *stage.setup, vsec_sa, describe);
+    const float* const vsa_f = reinterpret_cast<const float*>(vsa.cpu);
+    const u32 vsa_words = vsec_sa;
 
     // --- the fragment program and its SA block ---
     const FragmentProgram& fp = FragmentProgramFor(epilogue);
@@ -6809,17 +6745,11 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
 
     // --- the PDS programs ---
     SgxdRecipeDrawPrograms p{};
-    p.vspds = backend.PlacePds(pds);
-    p.vspds_units = pds.units;
-    ASSERT(sgxd_program_secondary_pds(vsa.gpu, vsa_words, vp.secondary_doutu0, &pds) == 0);
-    p.vsec = backend.PlacePds(pds);
-    p.vsec_units = pds.units;
-    p.vsec_sa = vsec_sa;
-    [[maybe_unused]] const int fsec =
-        sgxd_program_secondary_pds(fsa.gpu, fsa_words, fp.secondary_doutu0, &pds);
-    DEBUG_ASSERT(fsec == 0);
-    p.fsec = backend.PlacePds(pds);
-    p.fsec_units = pds.units;
+    VertexPrograms(stage, vsa, vsec_sa, p, describe);
+    const auto fsec = backend.SecondaryPds(fsa.gpu, fsa_words, fp.secondary_doutu0);
+    DEBUG_ASSERT(fsec.va != 0);
+    p.fsec = fsec.va;
+    p.fsec_units = fsec.units;
     if (fg.issues.empty()) {
         const auto fprim = backend.PixelPds(fp.primary_doutu0, fp.iterators.data(),
                                             fp.iterator_words.data(), fp.iterator_count);
@@ -6854,15 +6784,11 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         p.fprim = fprim.va;
         p.fprim_units = fprim.units;
     }
-    sgxd_program_vertex_dms(vg.pa_count, vg.temp_count, vsec_sa, vg.vertex_outputs1 >> 24,
-                            &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
     if (fp.pixel_size_sa != fsa_words) {
         fp.pixel_size = sgxd_program_pixel_dms(fp.pixel_pa, fg.temp_count, fsa_words);
         fp.pixel_size_sa = fsa_words;
     }
     p.pixel_size = fp.pixel_size;
-    p.outselects = vg.vertex_outputs1;
-    p.texsize = vg.vertex_outputs2;
     // The target is the buffer transposed (SgxdBackend::PicaTarget): the vertex program
     // writes NDC y as clip x and NDC x as clip y, so pixel column x is memory row x and pixel
     // row y the PICA's x. The program writes z as -(2z + w), which the TA clips to the PICA's

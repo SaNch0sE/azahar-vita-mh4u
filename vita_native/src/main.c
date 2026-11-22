@@ -19,6 +19,7 @@
 #include <psp2kern/kernel/sysmem/address_space.h>
 #include <psp2kern/kernel/sysmem/memtype.h>
 #include <psp2kern/kernel/sysmem/uid_class.h>
+#include <psp2kern/kernel/sysmem/uid_guid.h>
 #include <psp2kern/kernel/sysroot.h>
 #include <psp2kern/kernel/sysmem/uid_puid.h>
 #include <psp2kern/kernel/threadmgr.h>
@@ -321,6 +322,7 @@ static uint32_t active_cpu_mask(void) {
 }
 
 // 2: the sgxd calls (sgxd.c). 3: SCE-style error codes (azahar_native.h, AZAHAR_ERROR).
+// 6: azaharKlogRead, the kernel's printf text (klog.c).
 // 7: azaharAdopt, azaharReback and azaharRebackRestore: guest FCRAM under tables of ours, and
 //    pages of it moved onto other physical pages (reback.c).
 // 8: azaharRebackReturn, moved pages back on their own.
@@ -339,18 +341,8 @@ static uint32_t active_cpu_mask(void) {
 // 20: sgxd 9, sgxdWaker: the app's event flag set when the GPU reaches the counts it sleeps until.
 // 21: sgxd 10, sgxdMicrokernel: the async lists run by the app's microkernel on the GPU, IRQ 52
 //     for its SW_EVENT only.
-// 22: sgxd 11, sgxdKick with sgxdMicrokernel writes core 0's EVENT_KICK, Sony's per-command kick.
-// 23: sgxd 12, KICK2 again (EVENT_KICK started no run of the microkernel).
-// 24: sgxd 13, the microkernel alone: no ring, no IRQ 52 list running; sgxdQueue,
-//     sgxdSubmitAsync and sgxdMicrokernel gone, sgxdEvents the microkernel's interrupt set-up.
-// 25: azaharHold, the emulator's GPU page holds on the guest's view, by the app's address.
-// 26: azaharFlip, page versions: the app's and the guest's views on another page, the GPU's kept.
-// 27: azaharAttach and azaharDetach gone, and the cross-core maintenance with them: one
-//     emulation thread, one attached core.
-// 29: azaharShellCdram, the shell's 16 MiB of CDRAM the app's while sgxd holds the GPU.
-// 30: VFP short vectors in the vector: azaharVfpPatch and svc AZAHAR_VFP_SVC (AZAHAR_FAST_VFP).
 int azaharVersion() {
-    return 5;
+    return 61;
 }
 
 // One read into `out`. Returns the call's own status; the caller decides what a failure means.
@@ -359,10 +351,13 @@ int azaharVersion() {
 
 #include "native.c"
 #include "sgxd.c"
+#include "klog.c"
 #include "reback.c"
 #include "cycles.c"
+#include "memreport.c"
 #include "shellcdram.c"
 #include "shell.c"
+#include "coresample.c"
 #include "plugins.c"
 
 // ---------------------------------------------------------------------------- module
@@ -399,6 +394,8 @@ int module_stop(SceSize argc, const void *args) {
                          sgxd_state);
         return SCE_KERNEL_STOP_CANCEL;
     }
+    klog_stop();
+    buswatch_release();
     if (azahar_proc_handler >= 0) {
         ksceKernelUnregisterProcEventHandler(azahar_proc_handler);
         azahar_proc_handler = -1;

@@ -16,6 +16,7 @@ azaharnative:
         - azaharRelease: 0x3C1A7E04
         - azaharEdit: 0x3C1A7E05
         - azaharVersion: 0x3C1A7E0A
+        - azaharKlogRead: 0x3C1A7E0B
         - azaharReback: 0x3C1A7E0C
         - azaharRebackRestore: 0x3C1A7E0D
         - azaharAdopt: 0x3C1A7E0E
@@ -38,10 +39,15 @@ azaharnative:
         - azaharFlip: 0x3C1A7E27
         - sgxdMapTables: 0x3C1A7E28
         - sgxdPte: 0x3C1A7E29
+        - azaharMemReport: 0x3C1A7E2A
         - azaharShellCdram: 0x3C1A7E2B
         - azaharVfpPatch: 0x3C1A7E2C
         - azaharSyncUpper: 0x3C1A7E2D
         - azaharSystemVolume: 0x3C1A7E2F
+        - azaharCoreSample: 0x3C1A7E30
+        - azaharBusError: 0x3C1A7E31
+        - azaharTableScan: 0x3C1A7E32
+        - azaharBusErrorWatch: 0x3C1A7E33
         - azaharVolumeKeys: 0x3C1A7E34
         - azaharModuleUid: 0x3C1A7E35
         - azaharKernelPlugins: 0x3C1A7E41

@@ -32,6 +32,7 @@
 #include <unwind.h>
 
 #include "audio_core/hle/hle.h"
+#include "azahar_native.h"
 #include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
 #include "common/assert.h"
@@ -846,6 +847,31 @@ void ProbeCores() {
                                                       sceKernelGetProcessTimeWide() - start));
         if (r >= 0) {
             sceKernelDeleteThread(t);
+            continue;
+        }
+        // A core that runs nothing of ours: what it runs instead, three times 50 ms apart.
+        for (int k = 0; k < 3; k++) {
+            AzaharCoreSample cs{};
+            const int got = azaharCoreSample(static_cast<uint32_t>(core), &cs);
+            if (got < 0) {
+                StallLine("[azahar] stall: core %d: no sample (%08x)\n", core,
+                          static_cast<unsigned>(got));
+                break;
+            }
+            cs.thread_name[sizeof(cs.thread_name) - 1] = '\0';
+            cs.module_name[sizeof(cs.module_name) - 1] = '\0';
+            StallLine("[azahar] stall: core %d runs pid %08x thread %08x \"%s\"%s; PC in %s+%x; "
+                      "PCs %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                      core, static_cast<unsigned>(cs.pid), static_cast<unsigned>(cs.thid),
+                      cs.thread_name, cs.idle ? " (the idle thread)" : "",
+                      cs.module_name[0] ? cs.module_name : "?",
+                      static_cast<unsigned>((cs.pcs[0] & ~1u) - cs.module_text),
+                      static_cast<unsigned>(cs.pcs[0]),
+                      static_cast<unsigned>(cs.pcs[1]), static_cast<unsigned>(cs.pcs[2]),
+                      static_cast<unsigned>(cs.pcs[3]), static_cast<unsigned>(cs.pcs[4]),
+                      static_cast<unsigned>(cs.pcs[5]), static_cast<unsigned>(cs.pcs[6]),
+                      static_cast<unsigned>(cs.pcs[7]));
+            sceKernelDelayThread(50 * 1000);
         }
     }
 }
@@ -894,6 +920,166 @@ void WriteProcessState() {
     sceKernelDeleteThread(t);
 }
 
+void PrintBusErrorDump(bool to_report) {
+    stall_to_report = to_report;
+    // The dump (azaharBusError): a header (its own size, the two sections' sizes), the first
+    // section, then the second: per interconnect a record (0x38 bytes: size, initiator and target
+    // agent counts, its register block, its error state) and one per agent (0x20 bytes: size, the
+    // agent's block, AGENT_STATUS, AGENT_ERROR_LOG, AGENT_ERROR_LOG_ADDR, each 64-bit; status bit
+    // 24 an error). Read from a stall's dump; printed: the header, the first section's non-zero
+    // rows, and the records that hold an error.
+    static u32 words[0xC00];
+    std::memset(words, 0, sizeof(words));
+    const int got = azaharBusError(words, sizeof(words));
+    StallLine("[azahar] bus error dump: %d bytes (%08x); header %08x %08x %08x %08x %08x %08x "
+              "%08x\n",
+              std::max(got, 0), static_cast<unsigned>(got), static_cast<unsigned>(words[0]),
+              static_cast<unsigned>(words[1]), static_cast<unsigned>(words[2]),
+              static_cast<unsigned>(words[3]), static_cast<unsigned>(words[4]),
+              static_cast<unsigned>(words[5]), static_cast<unsigned>(words[6]));
+    const u32 count = static_cast<u32>(std::max(got, 0)) / 4;
+    if (count < 7 || words[0] % 4 != 0 || words[2] % 4 != 0) {
+        return;
+    }
+    const u32 first = words[0] / 4, second = (words[0] + words[2]) / 4;
+    for (u32 i = first; i + 8 <= std::min(second, count); i += 8) {
+        const u32* const w = words + i;
+        if (std::all_of(w, w + 8, [](u32 v) { return v == 0; })) {
+            continue;
+        }
+        StallLine("[azahar] bus error dump +%04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                  i * 4, static_cast<unsigned>(w[0]), static_cast<unsigned>(w[1]),
+                  static_cast<unsigned>(w[2]), static_cast<unsigned>(w[3]),
+                  static_cast<unsigned>(w[4]), static_cast<unsigned>(w[5]),
+                  static_cast<unsigned>(w[6]), static_cast<unsigned>(w[7]));
+    }
+    u32 at = second + 2, agents = 0, printed = 0;
+    while (at < count) {
+        const u32* const w = words + at;
+        const u32 size = w[0];
+        if (size == 0x38 && at + 14 <= count) {
+            if (std::any_of(w + 4, w + 14, [](u32 v) { return v != 0; })) {
+                StallLine("[azahar] bus error: interconnect %08x (%u IA, %u TA): %08x %08x %08x "
+                          "%08x %08x %08x %08x %08x %08x %08x\n",
+                          static_cast<unsigned>(w[3]), static_cast<unsigned>(w[1]),
+                          static_cast<unsigned>(w[2]), static_cast<unsigned>(w[4]),
+                          static_cast<unsigned>(w[5]), static_cast<unsigned>(w[6]),
+                          static_cast<unsigned>(w[7]), static_cast<unsigned>(w[8]),
+                          static_cast<unsigned>(w[9]), static_cast<unsigned>(w[10]),
+                          static_cast<unsigned>(w[11]), static_cast<unsigned>(w[12]),
+                          static_cast<unsigned>(w[13]));
+                printed++;
+            }
+        } else if (size == 0x20 && at + 8 <= count) {
+            agents++;
+            if ((w[2] & 0x01000000u) != 0 || std::any_of(w + 3, w + 8, [](u32 v) { return v; })) {
+                StallLine("[azahar] bus error: agent %08x status %08x %08x, log %08x %08x, "
+                          "address %08x %08x\n",
+                          static_cast<unsigned>(w[1]), static_cast<unsigned>(w[2]),
+                          static_cast<unsigned>(w[3]), static_cast<unsigned>(w[4]),
+                          static_cast<unsigned>(w[5]), static_cast<unsigned>(w[6]),
+                          static_cast<unsigned>(w[7]));
+                printed++;
+            }
+        } else {
+            StallLine("[azahar] bus error dump: a record of %08x bytes at +%04x, read no further\n",
+                      static_cast<unsigned>(size), at * 4);
+            break;
+        }
+        at += size / 4;
+        if (printed >= 64) {
+            break;
+        }
+    }
+    StallLine("[azahar] bus error dump: %u agents read, %u records with an error\n", agents,
+              printed);
+    AzaharBusErrorCatch c{};
+    const int r = azaharBusErrorWatch(&c);
+    StallLine("[azahar] bus error caught: %08x, %u interrupt(s), the first on core %u\n",
+              static_cast<unsigned>(r), static_cast<unsigned>(c.count),
+              static_cast<unsigned>(c.core));
+    if (c.count == 0) {
+        return;
+    }
+    for (u32 core = 0; core < 4; core++) {
+        const u32* const p = c.pcs[core];
+        c.module_name[core][sizeof(c.module_name[core]) - 1] = '\0';
+        StallLine("[azahar] bus error caught: core %u pid %08x thread %08x, PC in %s+%x; PCs %08x "
+                  "%08x %08x %08x %08x %08x %08x %08x\n",
+                  static_cast<unsigned>(core), static_cast<unsigned>(c.pid[core]),
+                  static_cast<unsigned>(c.thid[core]),
+                  c.module_name[core][0] ? c.module_name[core] : "?",
+                  static_cast<unsigned>((p[0] & ~1u) - c.module_text[core]),
+                  static_cast<unsigned>(p[0]), static_cast<unsigned>(p[1]),
+                  static_cast<unsigned>(p[2]), static_cast<unsigned>(p[3]),
+                  static_cast<unsigned>(p[4]), static_cast<unsigned>(p[5]),
+                  static_cast<unsigned>(p[6]), static_cast<unsigned>(p[7]));
+        StallLine("[azahar] bus error caught: core %u PCs %08x %08x %08x %08x %08x %08x %08x "
+                  "%08x\n",
+                  static_cast<unsigned>(core), static_cast<unsigned>(p[8]),
+                  static_cast<unsigned>(p[9]), static_cast<unsigned>(p[10]),
+                  static_cast<unsigned>(p[11]), static_cast<unsigned>(p[12]),
+                  static_cast<unsigned>(p[13]), static_cast<unsigned>(p[14]),
+                  static_cast<unsigned>(p[15]));
+    }
+}
+
+void WatchBusErrors() {
+    const int r = azaharBusErrorWatch(nullptr);
+    sceClibPrintf("[azahar] bus error watch: %08x\n", static_cast<unsigned>(r));
+}
+
+void PrintTableScan(bool to_report) {
+    stall_to_report = to_report;
+    AzaharTableScan t{};
+    const int r = azaharTableScan(&t);
+    StallLine("[azahar] tables: %08x; the guest's upper copy: %u stale, %u missing; our tables: "
+              "%u descriptor(s) outside memory\n",
+              static_cast<unsigned>(r), static_cast<unsigned>(t.stale),
+              static_cast<unsigned>(t.missing), static_cast<unsigned>(t.ours_wild));
+    for (u32 k = 0; k < std::min<u32>(t.stale, AZAHAR_TABLESCAN_N); k++) {
+        StallLine("[azahar] tables: stale %08x: guest %08x, process %08x; its table: %u outside "
+                  "memory (%08x)\n",
+                  static_cast<unsigned>(t.stale_va[k]), static_cast<unsigned>(t.stale_guest[k]),
+                  static_cast<unsigned>(t.stale_process[k]),
+                  static_cast<unsigned>(t.stale_wild[k]),
+                  static_cast<unsigned>(t.stale_wild_desc[k]));
+    }
+    StallLine("[azahar] tables: the guest's copy of the kernel's low entries: %u stale\n",
+              static_cast<unsigned>(t.kstale));
+    for (u32 k = 0; k < std::min<u32>(t.kstale, AZAHAR_TABLESCAN_N); k++) {
+        StallLine("[azahar] tables: kernel stale %08x: guest %08x, kernel %08x; its table: %u "
+                  "outside memory (%08x)\n",
+                  static_cast<unsigned>(t.kstale_va[k]), static_cast<unsigned>(t.kstale_guest[k]),
+                  static_cast<unsigned>(t.kstale_kernel[k]),
+                  static_cast<unsigned>(t.kstale_wild[k]),
+                  static_cast<unsigned>(t.kstale_wild_desc[k]));
+    }
+    StallLine("[azahar] tables: by domain (DACR %08x in the syscall): valid level-1 entries, "
+              "the first, outside memory\n",
+              static_cast<unsigned>(t.dacr));
+    for (u32 d = 0; d < 16; d++) {
+        if (t.dom_valid[d] == 0) {
+            continue;
+        }
+        StallLine("[azahar] tables: domain %2u (%s): %u, first %08x = %08x; %u outside memory "
+                  "(%08x)\n",
+                  static_cast<unsigned>(d), ((t.dacr >> (2 * d)) & 3u) ? "open" : "No-access",
+                  static_cast<unsigned>(t.dom_valid[d]), static_cast<unsigned>(t.dom_first_va[d]),
+                  static_cast<unsigned>(t.dom_first_desc[d]), static_cast<unsigned>(t.dom_wild[d]),
+                  static_cast<unsigned>(t.dom_wild_desc[d]));
+    }
+    StallLine("[azahar] tables: page fffff000: guest level-1 %08x (the process's %08x), "
+              "level-2 %08x\n",
+              static_cast<unsigned>(t.top_l1), static_cast<unsigned>(t.top_process),
+              static_cast<unsigned>(t.top_l2));
+    for (u32 k = 0; k < std::min<u32>(t.ours_wild, AZAHAR_TABLESCAN_N); k++) {
+        StallLine("[azahar] tables: ours at pa %08x: %08x\n",
+                  static_cast<unsigned>(t.ours_wild_at[k]),
+                  static_cast<unsigned>(t.ours_wild_desc[k]));
+    }
+}
+
 void StartStallWatch() {
     main_thread = sceKernelGetThreadId();
     stall_flag = sceKernelCreateEventFlag("azahar stall watch", 0, 0, nullptr);
@@ -923,6 +1109,8 @@ void StartStallWatch() {
                 Common::Log::RenewCrashReport();
                 PrintThreadStates(reason, true);
                 ProbeCores();
+                PrintBusErrorDump(true);
+                PrintTableScan(true);
                 MoveRenderThread();
                 Common::Log::AppendCrashReport(
                     "[azahar] stall: the frontend's loop stopped; faulting for the core dump\n");

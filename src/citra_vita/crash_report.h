@@ -94,4 +94,17 @@ void StallWatchBeat();
 /// only.
 void PrintThreadStates(const char* reason, bool to_report = false);
 
+/// SceKernelBusError's dump of the bus's error registers (azaharBusError): its handler parks the
+/// core that took a bus error for good, and the threads pinned there never run again. On the debug
+/// channel, or with `to_report` in the crash report.
+void PrintBusErrorDump(bool to_report);
+
+/// SceKernelBusError's handler hooked (azaharBusErrorWatch): the first bus error's moment, every
+/// core's PC and thread, is kept for PrintBusErrorDump. Once, at start.
+void WatchBusErrors();
+
+/// The guest's translation tables (azaharTableScan): stale copies of the app's level-1 entries
+/// and descriptors that name no memory, a candidate for that bus error's read.
+void PrintTableScan(bool to_report);
+
 } // namespace VitaFrontend::CrashReport

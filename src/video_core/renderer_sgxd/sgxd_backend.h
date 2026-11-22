@@ -22,6 +22,45 @@
 
 namespace SgxdRenderer {
 
+/// Prints the kernel's printf text (sgxd's, azaharnative's, Sony's modules') to the app's TTY. The
+/// first call starts the capture; no-op off the Vita.
+void SgxdDrainKernelLog();
+
+enum class CacheSite : u32 {
+    Vertices,       ///< guest vertices in FCRAM, cleaned before the TA fetches them
+    Screens,        ///< a guest framebuffer in FCRAM, cleaned before the present samples it
+    DmaSource,      ///< a DMA's source in FCRAM, cleaned before the PTLA reads it
+    DmaDest,        ///< a DMA's destination in FCRAM, before and after the PTLA writes it
+    Textures,       ///< a guest texture in FCRAM, cleaned before the untile reads it
+    Other,
+    Count,
+};
+
+/// sgxdCacheRange, timed for `perflog`; every CPU cache operation of the renderer goes here.
+int SgxdCacheRange(const void* cpu, u32 bytes, u32 op, CacheSite site);
+/// An operation not needed because the range is uncached for the CPU (guest VRAM, or FCRAM
+/// pages moved to CDRAM): counted for `perflog`, next to the ones done.
+void SgxdCacheSkipped(CacheSite site, u32 bytes);
+/// Sleeps until the GPU's interrupt brings the async chain to `fence` (the live backend's
+/// RenderWait, on the render thread).
+void SgxdWaitChain(u32 fence);
+#ifdef VITA_DIAGNOSTICS
+struct SgxdCacheTimes {
+    u64 us;
+    u64 bytes;
+    u32 calls;
+    struct Site {
+        u64 us;
+        u64 bytes;
+        u32 calls;
+        u64 skipped_bytes;
+        u32 skipped_calls;
+    };
+    Site sites[static_cast<u32>(CacheSite::Count)];
+};
+SgxdCacheTimes SgxdTakeCacheTimes();
+#endif
+
 /**
  * The rasterizer's GPU memory and passes through sgxd (docs/sgxd/README.md). Each
  * target size has its own recipe, made at its first pass, in a block of its own that also holds

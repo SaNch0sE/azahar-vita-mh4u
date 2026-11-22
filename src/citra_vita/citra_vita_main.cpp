@@ -76,9 +76,10 @@
 #include "core/hle/service/service.h"
 #include "core/movie.h"
 #include "video_core/gpu.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
-#include "video_core/renderer_gxm/render_thread.h"
-#include "video_core/renderer_gxm/renderer_gxm.h"
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#include "video_core/renderer_sgxd/render_thread.h"
+#include "video_core/renderer_sgxd/renderer_sgxd.h"
+#include "video_core/renderer_sgxd/sgxd_backend.h"
 
 // The default heap is nowhere near enough for a 3DS: FCRAM alone is 128 MB, and the caches and
 // the surface storage sit on top of it. Newlib reads this at startup.
@@ -102,7 +103,34 @@ int _vita_net_init(void);
 }
 
 // 5: AZAHAR_PERM_APP_ATTR, guest VRAM in CDRAM mapped with the app's attributes.
-constexpr int MinAzaharNativeVersion = 5;
+// 7: azaharAdopt and azaharReback, guest framebuffers moved to CDRAM.
+// 8: azaharRebackReturn, pages the GPU no longer uses back in FCRAM.
+// 14: AzaharRunRequest's fast svcs and guest ticks.
+// 17: azaharCycleCounter, the cycle counter sgxd's spins time out on.
+// 18: sgxd 8, the async queue as a ring in the app's memory (sgxdQueue, sgxdKick).
+// 19: AzaharProfSample's syscall frame (vprof's SYSF).
+// 20: sgxd 9, sgxdWaker: the render thread woken when the GPU has done its ticket's work.
+// 21: sgxd 10, sgxdMicrokernel (sgxd_flags `microkernel`).
+// 22: sgxd 11, the microkernel's kick as Sony's (EVENT_KICK after the kicker word).
+// 23: sgxd 12, KICK2 again.
+// 24: sgxd 13, the microkernel alone (sgxdEvents its interrupt set-up; no ring).
+// 28: azaharMemReport (perflog's CDRAM map).
+// 29: azaharShellCdram, the shell's CDRAM for the recipes.
+// 30: azaharVfpPatch, VFP short vectors run in the vector (AZAHAR_FAST_VFP).
+// 39: AZAHAR_TLS_SVC, the upcalls run with the emulation thread's TPIDRURO.
+// 40: AZAHAR_CLOCK_SVC, the upcalls idle the guest without an exit.
+// 41: AzaharRunRequest.phase_cycles, azaharRun's time by phase (perflog).
+// 42: AzaharRunRequest.upcall_rearm_us, quantums inside upcalls started again in the vector.
+// 44: azaharSyncUpper, the app's later megabytes for its upcalls.
+// 45: AzaharRunRequest.kernel_cycles.
+// 46: AzaharRunRequest.pmu_* and tlb_probe (diagnostics).
+// 47: azaharUpperDrift (diagnostics: the guest's copy of the app's level-1 entries).
+// 48: azaharRun's request read and written in place.
+// 49: the volume keys the app's, not SceShell's, while sgxd owns the GPU.
+// 50: azaharSystemVolume; SceAppMgr's shell watchdog fed while sgxd owns the GPU.
+// 52: AzaharRunRequest.pmu_* and tlb_probe gone.
+// 53: page moves leave the GPU's mapping to the emulator, which remaps it in the GPU's order.
+constexpr int MinAzaharNativeVersion = 53;
 
 namespace {
 /// The process's own arguments, kept for LaunchParameter.
@@ -747,6 +775,27 @@ bool RunSettingCommand(const std::string& command) {
         sceAudioOutOutput(port, nullptr);
         sceAudioOutReleasePort(port);
         sceClibPrintf("[azahar] tone: done (command)\n");
+        return true;
+    }
+    if (command == "cores") {
+        // What each core runs now (azaharCoreSample, the stall report's for a stopped core).
+        for (u32 core = 0; core < 4; core++) {
+            AzaharCoreSample cs{};
+            const int got = azaharCoreSample(core, &cs);
+            cs.thread_name[sizeof(cs.thread_name) - 1] = '\0';
+            cs.module_name[sizeof(cs.module_name) - 1] = '\0';
+            sceClibPrintf("[azahar] cores: core %u: %08x, pid %08x thread %08x \"%s\"%s, PC in "
+                          "%s+%x, PCs %08x %08x %08x %08x (command)\n",
+                          static_cast<unsigned>(core), static_cast<unsigned>(got),
+                          static_cast<unsigned>(cs.pid), static_cast<unsigned>(cs.thid),
+                          cs.thread_name, cs.idle ? " (idle)" : "",
+                          cs.module_name[0] ? cs.module_name : "?",
+                          static_cast<unsigned>((cs.pcs[0] & ~1u) - cs.module_text),
+                          static_cast<unsigned>(cs.pcs[0]), static_cast<unsigned>(cs.pcs[1]),
+                          static_cast<unsigned>(cs.pcs[2]), static_cast<unsigned>(cs.pcs[3]));
+        }
+        VitaFrontend::CrashReport::PrintBusErrorDump(false);
+        VitaFrontend::CrashReport::PrintTableScan(false);
         return true;
     }
 #endif
@@ -1846,12 +1895,6 @@ std::string LoadAzaharNative(bool relaunched) {
             }
             return {};
         }
-        // sgxd's spins time out on the calling thread's cycle counter (azaharCycles): every
-        // thread of this process may read it, those that exist now and those created later.
-        if (const int cycles = azaharCycleCounter(); cycles < 0) {
-            return fmt::format("azaharCycleCounter failed ({:#010x}).", static_cast<u32>(cycles));
-        }
-        return {};
     }
     const SceUID module = taiLoadStartKernelModule(AzaharNativePath, 0, nullptr, 0);
     if (module < 0) {
@@ -2122,6 +2165,9 @@ int main(int argc, char* argv[]) {
     }
     // Before anything is brought up, because the first start after a boot restarts from here.
     g_native_error = LoadAzaharNative(relaunched);
+    if (g_native_error.empty()) {
+        VitaFrontend::CrashReport::WatchBusErrors();
+    }
     // Without the module (g_native_error) its calls are not bound: the report lists no plugins.
     VitaFrontend::CrashReport::NoteSystem(g_native_error ? 0 : azaharVersion(), g_cores_unlocked);
     Common::SetCurrentThreadRole(Common::ThreadRole::Other);

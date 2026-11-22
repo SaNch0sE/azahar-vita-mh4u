@@ -346,6 +346,10 @@ int azaharHold(const AzaharHoldRun *runs, uint32_t count);
 /// See AzaharFlipRun: `count` runs, 1 to AZAHAR_FLIP_MAX_RUNS. Returns the guest descriptors it
 /// retargeted. Version 26.
 int azaharFlip(const AzaharFlipRun *runs, uint32_t count);
+/// Prints the CDRAM partitions of the caller's address space and every memblock of 64 KiB or
+/// more in the system (owner, name, type, base, size) to the kernel console, once per call
+/// (memreport.c). Read-only. Version 28.
+int azaharMemReport(void);
 /// SceShell's 16 MiB of CDRAM (ScePhyMemPartShellCdram, 0x27000000) for the caller, which must
 /// hold the GPU (sgxdTake): the shell's contents go to main memory, and sgxd's release copies
 /// them back before SceGpu has the GPU again. `*user_va` gets the range's address in the app.
@@ -361,6 +365,96 @@ int azaharSystemVolume(int step);
 /// (sgxdTake), read from Syscon every 20 ms (shell.c): out of SceShell's pad data then, they are
 /// in no app's either. Version 63.
 int azaharVolumeKeys(void);
+/// The kernel modules loaded from outside the firmware (plugins.c, version 86): taiHEN, HENkaku
+/// and the plugins a taiHEN config.txt loads, as "name path" lines in `out` (`size` bytes, ended
+/// in a NUL, cut where they do not fit). Returns the count listed, or AZAHAR_ERR_*.
+int azaharKernelPlugins(char *out, uint32_t size);
+/// How the module's tables map `va` (native.c, version 87), for a guest fault's report: the shared
+/// table's level-1 and level-2 entries (0: none of the module's), and per core whether it is
+/// attached and its own view's entries (a view's first megabyte is its own; 0 without a view),
+/// the overrides of the calling core's view, and how many view builds failed (the last one's
+/// error and core: a failed rebuild keeps the megabyte as it was). Read without the lock.
+typedef struct AzaharVaReport {
+    uint32_t va;
+    uint32_t core;     ///< the calling thread's core
+    uint32_t map_core; ///< azaharMap's core, which runs in the shared table
+    uint32_t shared_l1, shared_l2;
+    uint32_t attached[4];
+    uint32_t view_l1[4], view_l2[4];
+    uint32_t view_overrides[4];
+    AzaharRange overrides[AZAHAR_ATTACH_OVERRIDES]; ///< the calling core's view's
+    uint32_t view_failures;
+    int32_t view_last_error;
+    uint32_t view_last_core;
+} AzaharVaReport;
+int azaharVaReport(uint32_t va, AzaharVaReport *out);
+/// What a core runs (coresample.c), for a stall report: its debug block's PC samples and the
+/// thread SceKernelThreadMgr's per-CPU block names, read from outside the core. Version 54; the
+/// module of the first PC, version 55.
+#define AZAHAR_CORESAMPLE_PCS 8
+typedef struct AzaharCoreSample {
+    uint32_t pid;  ///< the running thread's process
+    uint32_t thid; ///< the running thread
+    uint32_t idle; ///< the core's idle thread runs
+    char thread_name[32];
+    uint32_t pcs[AZAHAR_CORESAMPLE_PCS]; ///< 0xFFFFFFFF: the core could not be sampled
+    char module_name[28];  ///< of the listed kernel modules, the one whose text the first PC follows
+    uint32_t module_text;  ///< that module's text base (0: none below it)
+} AzaharCoreSample;
+int azaharCoreSample(uint32_t core, AzaharCoreSample *out);
+/// SceKernelBusError's dump of the bus's error registers (coresample.c), up to `size` bytes: the
+/// count, AZAHAR_ERR_RESOLVE without the module. Its handler parks the core that took the bus
+/// error for good; the dump says which master and address. Version 56.
+int azaharBusError(void *out, uint32_t size);
+/// The guest's translation tables at a stall (coresample.c): the guest's copy of the process's
+/// level-1 entries from 0x40000000 up against the process's own (stale: it maps otherwise now;
+/// missing: the copy lacks it), a stale coarse entry's table read for descriptors outside main
+/// memory (0x80000000 up), and our own tables' descriptors outside it. Version 57.
+#define AZAHAR_TABLESCAN_N 4
+typedef struct AzaharTableScan {
+    uint32_t stale, missing;
+    uint32_t stale_va[AZAHAR_TABLESCAN_N];
+    uint32_t stale_guest[AZAHAR_TABLESCAN_N];   ///< the copy's entry
+    uint32_t stale_process[AZAHAR_TABLESCAN_N]; ///< the process's
+    uint32_t stale_wild[AZAHAR_TABLESCAN_N];    ///< a coarse copy's table: descriptors outside memory
+    uint32_t stale_wild_desc[AZAHAR_TABLESCAN_N];
+    uint32_t ours_wild;                         ///< our tables' descriptors outside memory
+    uint32_t ours_wild_at[AZAHAR_TABLESCAN_N];  ///< the descriptor's physical address
+    uint32_t ours_wild_desc[AZAHAR_TABLESCAN_N];
+    /// Page 0xFFFFF000 in the guest's world (version 59): the guest's level-1 entry for its
+    /// megabyte, the process's own, and the level-2 descriptor a coarse guest entry gives it.
+    uint32_t top_l1, top_process, top_l2;
+    /// The lower gigabyte's copy of the kernel's own entries against the kernel's table now
+    /// (version 60): stale ones, and a stale coarse copy's table read as above.
+    uint32_t kstale;
+    uint32_t kstale_va[AZAHAR_TABLESCAN_N];
+    uint32_t kstale_guest[AZAHAR_TABLESCAN_N];
+    uint32_t kstale_kernel[AZAHAR_TABLESCAN_N];
+    uint32_t kstale_wild[AZAHAR_TABLESCAN_N];
+    uint32_t kstale_wild_desc[AZAHAR_TABLESCAN_N];
+    /// The guest's level-1 entries by domain (version 61): valid entries, the first one, and,
+    /// for a domain the syscall's DACR holds at No-access (the ones the guest's slice grants
+    /// Client), sections and level-2 descriptors outside main memory. Sony's own DACRs keep
+    /// domains 10 and 15 No-access in user mode as well (user 0x15455551, kernel 0x15450000).
+    uint32_t dacr;
+    uint32_t dom_valid[16], dom_first_va[16], dom_first_desc[16];
+    uint32_t dom_wild[16], dom_wild_desc[16];
+} AzaharTableScan;
+int azaharTableScan(AzaharTableScan *out);
+/// The moment of a bus error (coresample.c): the first call hooks SceKernelBusError's handler,
+/// which from then on samples every core's PC and running thread before it parks its core; each
+/// call copies what the first bus error caught (count 0: none yet) to `out` (may be NULL), with
+/// the kernel module of each core's first PC. Version 58.
+#define AZAHAR_BUSWATCH_PCS 16
+typedef struct AzaharBusErrorCatch {
+    uint32_t count; ///< bus error interrupts taken
+    uint32_t core;  ///< the core that took the first
+    uint32_t pid[4], thid[4];
+    uint32_t pcs[4][AZAHAR_BUSWATCH_PCS]; ///< per core, the cores interleaved in time
+    char module_name[4][28];
+    uint32_t module_text[4];
+} AzaharBusErrorCatch;
+int azaharBusErrorWatch(AzaharBusErrorCatch *out);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.
@@ -371,6 +465,9 @@ int azaharVersion();
 /// unloads a kernel module only by the UID its load gave the loading process, and an update's
 /// process is not that one. Version 67.
 int azaharModuleUid(void);
+/// Kernel printf text (every module's), oldest first, up to `size` bytes, no NUL: the count, or
+/// 0 when there is none. The first call starts the capture (klog.c). Version 6.
+int azaharKlogRead(char *buf, uint32_t size);
 /// See AzaharRebackRequest. Version 7.
 int azaharAdopt(uint32_t user_va, uint32_t size);
 int azaharReback(const AzaharRebackRequest *req);

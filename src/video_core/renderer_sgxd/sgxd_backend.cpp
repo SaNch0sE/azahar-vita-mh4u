@@ -25,8 +25,10 @@
 #include "video_core/renderer_sgxd/usse/usse_encoder.h"
 #include "video_core/shader/generator/profile.h"
 
+#include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
+#include "azahar_native.h"
 #include "sgxd.h"
 #include "sgxd_mkq.h"
 #include "sgxd_ptla.h"
@@ -36,6 +38,84 @@ namespace SgxdRenderer {
 
 using namespace UntileGeometry;
 static_assert(SgxdBackend::UntileSide == UntileGeometry::UntileSide);
+
+#ifdef VITA_DIAGNOSTICS
+namespace {
+struct SiteCounters {
+    std::atomic<u64> us{0}, bytes{0}, skipped_bytes{0};
+    std::atomic<u32> calls{0}, skipped_calls{0};
+};
+SiteCounters cache_sites[static_cast<u32>(CacheSite::Count)];
+} // namespace
+static u32 stream_draws_sent, stream_renders_sent;
+#endif
+struct SentRender {
+    u32 job, width, height, kind, draws;
+    const char* what;
+};
+static std::array<SentRender, 64> sent_renders;
+static u32 sent_renders_next;
+static void NoteSent(const char* what, u32 draws) {
+    if (sent_renders_next != 0) {
+        SentRender& sr = sent_renders[(sent_renders_next - 1) % sent_renders.size()];
+        sr.what = what;
+        sr.draws = draws;
+    }
+}
+
+int SgxdCacheRange(const void* cpu, u32 bytes, u32 op, [[maybe_unused]] CacheSite site) {
+#ifndef VITA_DIAGNOSTICS
+    return sgxdCacheRange(cpu, bytes, op);
+#else
+    const auto start = Common::ProcessClock::now();
+    const int ret = sgxdCacheRange(cpu, bytes, op);
+    SiteCounters& c = cache_sites[static_cast<u32>(site)];
+    c.us.fetch_add(static_cast<u64>((Common::ProcessClock::now() - start).count()),
+                   std::memory_order_relaxed);
+    c.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    c.calls.fetch_add(1, std::memory_order_relaxed);
+    return ret;
+#endif
+}
+
+void SgxdCacheSkipped([[maybe_unused]] CacheSite site, [[maybe_unused]] u32 bytes) {
+#ifdef VITA_DIAGNOSTICS
+    SiteCounters& c = cache_sites[static_cast<u32>(site)];
+    c.skipped_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    c.skipped_calls.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+#ifdef VITA_DIAGNOSTICS
+SgxdCacheTimes SgxdTakeCacheTimes() {
+    SgxdCacheTimes t{};
+    for (u32 i = 0; i < static_cast<u32>(CacheSite::Count); i++) {
+        SiteCounters& c = cache_sites[i];
+        SgxdCacheTimes::Site& s = t.sites[i];
+        s.us = c.us.exchange(0);
+        s.bytes = c.bytes.exchange(0);
+        s.calls = c.calls.exchange(0);
+        s.skipped_bytes = c.skipped_bytes.exchange(0);
+        s.skipped_calls = c.skipped_calls.exchange(0);
+        t.us += s.us;
+        t.bytes += s.bytes;
+        t.calls += s.calls;
+    }
+    return t;
+}
+#endif
+
+void SgxdDrainKernelLog() {
+    static char text[0x1000];
+    for (int round = 0; round < 32; round++) {
+        const int n = azaharKlogRead(text, sizeof(text) - 1);
+        if (n <= 0) {
+            break;
+        }
+        text[n] = '\0';
+        sceClibPrintf("%s", text);
+    }
+}
 
 namespace {
 
@@ -1635,9 +1715,6 @@ void SgxdBackend::Draw(const SgxdRecipeDraw& draw, const SgxdRecipeDrawPrograms&
     programs[draw_count] = program;
     draws[draw_count] = draw;
     draws[draw_count].programs = &programs[draw_count];
-    if (GxmFlag("sgxd_pass_recipe_draw")) {
-        draws[draw_count] = {0, 3, draw.isp, SGXD_R_FPRIM, 0, 0, nullptr};
-    }
     draw_count++;
 }
 
@@ -1724,82 +1801,34 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
         give_back();
         return;
     }
-    const bool ok =
-        sgxd_session_phase(&r.recipe, sgxd_session_slc_inval, "slc", failed, sizeof(failed)) ==
-            0 &&
-        sgxd_session_render(&r.recipe, &render, failed, sizeof(failed)) == 0;
-    if (!ok) {
-        static u32 dump[SGXD_DUMP_WORDS];
-        const int dumped = sgxdDump(dump, SGXD_DUMP_WORDS);
-        if (std::FILE* f = std::fopen("host0:azahar-sgxd-dump.bin", "wb")) {
-            std::fwrite(dump, 4, dumped > 0 ? SGXD_DUMP_WORDS : 0, f);
-            std::fclose(f);
-        }
-        if (std::FILE* f = std::fopen("host0:azahar-sgxd-block.bin", "wb")) {
-            std::fwrite(r.memory, 1, r.size, f);
-            std::fclose(f);
-        }
-        if (std::FILE* f = std::fopen("host0:azahar-sgxd-shared.bin", "wb")) {
-            std::fwrite(shared, 1, shared_size, f);
-            std::fclose(f);
-        }
-        LOG_CRITICAL(Render,
-                     "sgxd: dump {:#x}; the {}x{} recipe's block {} KiB at GPU {:#010x} and the "
-                     "shared block {} KiB at GPU {:#010x} written to host0",
-                     static_cast<u32>(dumped), r.width, r.height, r.size >> 10, r.va,
-                     shared_size >> 10, BlockVa);
-        // The kernel's own snapshot from the moment the poll gave up (sgxdFaultDump), and what
-        // the GPU's MMU makes of the addresses a hang is usually about: each BIF bank's fault
-        // address, and each draw's programs and index list.
-        const int faulted = sgxdFaultDump(dump, SGXD_DUMP_WORDS);
-        if (std::FILE* f = std::fopen("host0:azahar-sgxd-fault.bin", "wb")) {
-            std::fwrite(dump, 4, faulted > 0 ? SGXD_DUMP_WORDS : 0, f);
-            std::fclose(f);
-        }
-        std::FILE* f = std::fopen("host0:azahar-sgxd-fault.txt", "w");
-        const auto translate = [f](const char* what, u32 va) {
-            u32 out[2]{};
-            const int ret = sgxdTranslate(va, out);
-            LOG_CRITICAL(Render, "sgxd: {} {:#010x}: pde {:08x} pte {:08x} ({:#x})", what, va,
-                         out[0], out[1], static_cast<u32>(ret));
-            if (f) {
-                std::fprintf(f, "%s %08x pde %08x pte %08x ret %08x\n", what,
-                             static_cast<unsigned>(va), static_cast<unsigned>(out[0]),
-                             static_cast<unsigned>(out[1]), static_cast<unsigned>(ret));
-            }
-        };
-        static constexpr u32 FaultBanks[] = {0x0000, 0x4000, 0x8000, 0xc000, 0x10000, 0x14000};
-        for (const u32 bank : FaultBanks) {
-            u32 bif[2]{};   // BIF_INT_STAT, BIF_FAULT
-            sgxdReadRegs(bank + 0x0c04, 2, bif);
-            LOG_CRITICAL(Render, "sgxd: bank {:#07x} bif int {:08x} fault {:08x}", bank, bif[0],
-                         bif[1]);
-            if (f) {
-                std::fprintf(f, "bank %05x bif_int %08x bif_fault %08x\n",
-                             static_cast<unsigned>(bank), static_cast<unsigned>(bif[0]),
-                             static_cast<unsigned>(bif[1]));
-            }
-            if (bif[1] & ~0xfffu) {
-                translate("fault", bif[1] & ~0xfffu);
-            }
-        }
-        for (u32 n = 0; n < draw_count; n++) {
-            const SgxdRecipeDrawPrograms& p = programs[n];
-            translate("vspds", p.vspds);
-            translate("vsec", p.vsec);
-            translate("fprim", p.fprim);
-            if (p.indices) {
-                translate("indices", p.indices);
-            }
-        }
-        if (f) {
-            std::fprintf(f, "fault dump %d\n", faulted);
-            std::fclose(f);
+#endif
+    // The TA overlaps the pending 3D; this list waits for that 3D before its own 3D kick.
+    sgxd_session_render_overlap_result(&render);
+    const u32 touches[6] = {pass_target.lo, pass_target.hi, pass_source.lo,
+                            pass_source.hi, pass_zls.lo,    pass_zls.hi};
+#ifdef VITA_DIAGNOSTICS
+    sgxd_mkq_label_next = sgxd_mkq_label("pass", pass_target.lo);
+#endif
+    RenderAsync(r, touches);
+    CloseData(pass_fences[passes % PassFences] = r.fence);
+    give_back();
+    NoteSent("pass", draw_count);
+#ifdef VITA_DIAGNOSTICS
+    if (SgxdFlag("perflog")) {
+        TargetTimes(r.width, r.height, render.ta_us, render.d3_us);
+        const u32 used = data_used - data_begin;
+        if (used >= data_peak + (256u << 10)) {
+            data_peak = used;
+            LOG_INFO(Render, "sgxd: pass data peak {} KiB ({} draws, {}x{})", used >> 10, draw_count,
+                     r.width, r.height);
         }
     }
-    for (const Store& store : stores) {
-        SgxdCacheRange(store.cpu, store.bytes, SGXD_CACHE_CLEAN_INVALIDATE,
-                       CacheSite::TransferAfter);
+#endif
+    if (ta_us) {
+        *ta_us = render.ta_us;
+    }
+    if (d3_us) {
+        *d3_us = render.d3_us;
     }
 }
 
@@ -1919,7 +1948,7 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
         std::string line;
         u32 blocks = 0;
         for (uint64_t a = 0x00010000; a < 0x100000000ull;) {
-            if (a == 0x60000000) {
+            if (a >= 0x60000000 && a < 0x68000000) {
                 a = 0x68000000;
                 continue;
             }
@@ -1941,6 +1970,7 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
             a = std::max(a + (256u << 10), base + info.mappedSize);
         }
         LOG_INFO(Render, "perf: blocks outside the CDRAM window:{} ({} in all)", line, blocks);
+        LOG_INFO(Render, "perf: azaharMemReport {:#010x}", static_cast<u32>(azaharMemReport()));
     }
     LOG_INFO(Render,
              "perf: microkernel {} shapes ({} instructions), {} flips, {} jobs, {} SW_EVENT "
