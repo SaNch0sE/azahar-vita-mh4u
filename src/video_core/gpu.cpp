@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <boost/serialization/vector.hpp>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
@@ -292,6 +293,19 @@ constexpr Result ResultInvalidGpuBuffer(ErrorDescription::InvalidAddress, ErrorM
 constexpr Result ResultUnknownGxCommand(ErrorDescription::NotImplemented, ErrorModule::GX,
                                         ErrorSummary::NotSupported,
                                         ErrorLevel::Usage); // 0xE0C02BF4
+
+void GPU::WatchResource(VAddr addr, u32 size) {
+    const std::optional<PAddr> paddr = VirtualToPhysicalAddress(addr, size);
+    if (paddr) {
+        impl->render->WatchResource(*paddr, size);
+    }
+}
+
+void GPU::WatchFrameBuffer(VAddr addr, u32 size) {
+    const std::optional<PAddr> paddr = VirtualToPhysicalAddress(addr, size);
+    ASSERT_MSG(paddr.has_value(), "a frame buffer outside GPU memory: {:#010x}+{:#x}", addr, size);
+    impl->render->WatchFrameBuffer(*paddr, size);
+}
 
 std::optional<PAddr> GPU::VirtualToPhysicalAddress(VAddr addr, u32 size) {
     // A replay's commands carry physical addresses already (vprof).
@@ -1100,6 +1114,17 @@ void GPU::serialize(Archive& ar, const u32 file_version) {
     ar & impl->pica;
     if constexpr (Archive::is_loading::value) {
         impl->render->TakeWholeState();
+    }
+    // The resource files the watchers named (version 1): three words each.
+    std::vector<u32> resources;
+    if constexpr (Archive::is_saving::value) {
+        resources = impl->render->ResourceRanges();
+    }
+    if (file_version >= 1) {
+        ar & resources;
+    }
+    if constexpr (Archive::is_loading::value) {
+        impl->render->SetResourceRanges(resources);
     }
     // A loaded state's screens are in the memory it loaded.
     impl->screens_changed = true;

@@ -11,8 +11,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "common/common_types.h"
 #include "common/named_thread.h"
 #include "common/process_clock.h"
@@ -97,6 +99,14 @@ public:
     void RegWrite(u32 id, u32 value);
     void TakeWholeState();
     void GiveWholeState();
+    /// A resource file the game's watchers named: the textures, indices and vertices a draw reads inside
+    /// it are loaded data the game does not write again, and hold no page.
+    void WatchResource(PAddr addr, u32 size);
+    /// A buffer of the game's per-frame command lists and vertices: the GPU's reads inside it hold no
+    /// page, and the guest waits at its turn for the work that read it last.
+    void WatchFrameBuffer(PAddr addr, u32 size);
+    [[nodiscard]] std::vector<u32> ResourceRanges() const;
+    void SetResourceRanges(std::span<const u32> words);
 
     // What the two sides of a split list call (Pica::PicaCore::BindSplit): the scan on the emulation
     // side, the parse on this thread.
@@ -336,6 +346,14 @@ public:
         u64 index_scan_indices;
         u64 index_scan_us;
         u32 index_memo_hits;
+        u32 resource_named;
+        u32 resource_gone;
+        u32 resources;
+        u64 resource_bytes;
+        std::array<u32, 3> resource_skips;
+        u32 frame_buffer_reads;
+        u32 frame_buffer_waits;
+        u64 frame_buffer_wait_us;
         u32 publishes;
         u32 render_wakes;
         u32 parse_wakes;
@@ -489,6 +507,35 @@ private:
     void HoldWrite(PAddr addr, u32 bytes, PageHolds::Kind kind);
     void HoldDraw(const DrawTextures& textures, u32 count, bool vertices, bool is_indexed);
     void HoldVertices(bool is_indexed);
+    /// A resource file's range and its first 16 bytes as named: a file the game freed goes at the next
+    /// read inside it.
+    struct ResourceRange {
+        PAddr lo;
+        PAddr hi;
+        std::array<u32, 4> header;
+        u32 checked;
+        const u8* host;
+    };
+    /// By address, none overlapping another.
+    std::vector<ResourceRange> resources;
+    /// The file the last read found inside: a draw's reads are mostly one model's.
+    std::size_t last_resource{};
+    struct FrameBuffer {
+        PAddr lo;
+        PAddr hi;
+        u32 read_ticket;
+    };
+    std::vector<FrameBuffer> frame_buffers;
+    [[nodiscard]] FrameBuffer* InFrameBuffer(PAddr addr, u32 bytes);
+    [[nodiscard]] bool InResource(PAddr addr, u32 bytes);
+#ifdef VITA_DIAGNOSTICS
+    std::atomic<u32> resource_named{};
+    std::atomic<u32> resource_gone{};
+    std::array<std::atomic<u32>, 3> resource_skips{};
+    std::atomic<u32> frame_buffer_reads{};
+    std::atomic<u32> frame_buffer_waits{};
+    std::atomic<u64> frame_buffer_wait_us{};
+#endif
     /// The scan's memo of 16-bit index lists' ranges, valid while their pages' write stamps stand.
     struct IndexMemo {
         PAddr addr;

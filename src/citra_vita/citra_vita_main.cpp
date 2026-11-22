@@ -1566,6 +1566,17 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              t.scan_us / 1e3, t.index_scans, t.index_scan_indices,
                              t.index_scan_us / 1e3, t.index_memo_hits);
                     LOG_INFO(Frontend,
+                             "perf: resource files: {} named, {} gone, {} known ({:.1f} MiB); "
+                             "reads inside them not held: textures {}, indices {}, vertices {}",
+                             t.resource_named, t.resource_gone, t.resources,
+                             t.resource_bytes / 1048576.0, t.resource_skips[0],
+                             t.resource_skips[1], t.resource_skips[2]);
+                    LOG_INFO(Frontend,
+                             "perf: frame buffers: {} reads not held; {} turns waited for the "
+                             "GPU, {:.1f} ms",
+                             t.frame_buffer_reads, t.frame_buffer_waits,
+                             t.frame_buffer_wait_us / 1e3);
+                    LOG_INFO(Frontend,
                              "perf: ring: {} publishes; wakes of the render thread {}, of the "
                              "parse thread {} ({:.1f} ms in the syscalls)",
                              t.publishes, t.render_wakes, t.parse_wakes, t.wake_us / 1e3);

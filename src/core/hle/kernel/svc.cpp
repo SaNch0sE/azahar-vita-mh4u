@@ -47,6 +47,7 @@
 #include "core/hle/kernel/wait_object.h"
 #include "core/hle/result.h"
 #include "core/hle/service/plgldr/plgldr.h"
+#include "video_core/gpu.h"
 
 namespace Kernel {
 
@@ -411,6 +412,10 @@ public:
     SVC(Core::System& system);
     void CallSVC(u32 immediate);
     void CallSVCForUpcall(u32 immediate);
+    /// The svc of code a title patch put in (loader/title_patches.cpp), outside the 3DS's: a
+    /// watcher telling the emulator of an event of the game's, r0 its kind.
+    static constexpr u32 WatchSvc = 0xF0;
+    void Watch();
     bool LocalToSecondHost(u32 immediate);
     void CallSVCLocal(u32 immediate);
 
@@ -2441,6 +2446,21 @@ const std::array<SVC::FunctionDef, 180> SVC::SVC_Table{{
     {0xB3, &SVC::Wrap<&SVC::ControlProcess, 0xB3>, "ControlProcess", 1000},
 }};
 
+void SVC::Watch() {
+    const u32 event = GetReg(0);
+    switch (event) {
+    case 1: // A resource file at r1, r2 bytes.
+        system.GPU().WatchResource(GetReg(1), GetReg(2));
+        break;
+    case 2: // The frame's buffer at r1, r2 bytes, written from now on.
+        system.GPU().WatchFrameBuffer(GetReg(1), GetReg(2));
+        break;
+    default:
+        ASSERT_MSG(false, "svc 0xF0: a watcher's event {} (r1 {:08x}, r2 {:08x})", event,
+                   GetReg(1), GetReg(2));
+    }
+}
+
 const SVC::FunctionDef* SVC::GetSVCInfo(u32 func_num) {
     if (func_num >= SVC_Table.size()) {
         LOG_ERROR(Kernel_SVC, "unknown svc=0x{:02X}", func_num);
@@ -2482,6 +2502,10 @@ MICROPROFILE_DEFINE(Kernel_SVC, "Kernel", "SVC", MP_RGB(70, 200, 70));
 
 void SVC::CallSVCForUpcall(u32 immediate) {
     std::scoped_lock lock{kernel.GetHLELock()};
+    if (immediate == WatchSvc) {
+        Watch();
+        return;
+    }
     const FunctionDef* info = GetSVCInfo(immediate);
     if (info && info->func) {
         system.GetRunningCore().GetTimer().AddTicks(info->cycles);
@@ -2540,6 +2564,11 @@ void SVC::CallSVC(u32 immediate) {
     DEBUG_ASSERT_MSG(kernel.GetCurrentProcess()->status == ProcessStatus::Running,
                      "Running threads from exiting processes is unimplemented");
 
+    if (immediate == WatchSvc) {
+        Watch();
+        system.perf_stats->EndSVCProcessing();
+        return;
+    }
     const FunctionDef* info = GetSVCInfo(immediate);
 #ifdef VITA_DIAGNOSTICS
     if (!info) {

@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 #include <boost/serialization/access.hpp>
+#include <boost/serialization/version.hpp>
 
 #include "core/hle/result.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
@@ -79,6 +80,18 @@ public:
 
     /// Flushes and invalidates all memory in the rasterizer cache and removes any leftover state.
     void ClearAll(bool flush);
+
+    /// A watcher of the game's (svc 0xF0, a title patch's): an engine's resource file at
+    /// [addr, addr + size), whose textures, indices and vertices the game does not write once
+    /// loaded. The lists' scan holds no page for the GPU's reads inside it (RenderThread::
+    /// WatchResource); outside GPU memory it is not the GPU's.
+    void WatchResource(VAddr addr, u32 size);
+
+    /// A watcher of the game's: a buffer [addr, addr + size) of the game's own per-frame command
+    /// lists and vertices, which it writes from now on, and which the GPU read frames ago. The
+    /// emulator holds no page for the GPU's reads inside it, and waits here for the work that
+    /// read it last (RenderThread::WatchFrameBuffer).
+    void WatchFrameBuffer(VAddr addr, u32 size);
 
     /// Executes the provided GSP command.
     Result Execute(const Service::GSP::Command& command);
@@ -282,3 +295,5 @@ private:
 };
 
 } // namespace VideoCore
+
+BOOST_CLASS_VERSION(VideoCore::GPU, 1)

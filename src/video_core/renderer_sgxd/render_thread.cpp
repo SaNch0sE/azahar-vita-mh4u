@@ -1133,6 +1133,13 @@ u32 TextureRanges(const Pica::RegsInternal& regs, RenderThread::DrawTextures& ou
 } // namespace
 
 void RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
+    if (FrameBuffer* const b = InFrameBuffer(addr, bytes)) {
+        b->read_ticket = HoldTicket();
+#ifdef VITA_DIAGNOSTICS
+        frame_buffer_reads.fetch_add(1, std::memory_order_relaxed);
+#endif
+        return;
+    }
     if (page_holds_on) {
         page_holds.Read(addr, bytes, HoldTicket(), kind);
         PutPageRemaps();
@@ -1168,6 +1175,118 @@ void RenderThread::StartFramePageHolds() {
     }
 }
 
+void RenderThread::WatchResource(PAddr addr, u32 size) {
+    DEBUG_ASSERT_MSG(size >= 16, "render thread: a resource file of {} bytes at {:#x}", size, addr);
+    ResourceRange r{addr, addr + size, {}, 0, memory.GetPhysicalPointer(addr)};
+    std::memcpy(r.header.data(), r.host, sizeof(r.header));
+    // A file over one named before: that one's memory went to this one.
+    std::erase_if(resources, [&](const ResourceRange& o) { return o.lo < r.hi && r.lo < o.hi; });
+    resources.insert(std::upper_bound(resources.begin(), resources.end(), r.lo,
+                                      [](PAddr a, const ResourceRange& o) { return a < o.lo; }),
+                     r);
+#ifdef VITA_DIAGNOSTICS
+    if (resource_named.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_INFO(Render, "resource file at {:#x}, {} bytes: {:08x} {:08x} {:08x} {:08x}", addr,
+                 size, r.header[0], r.header[1], r.header[2], r.header[3]);
+    }
+#endif
+}
+
+void RenderThread::WatchFrameBuffer(PAddr addr, u32 size) {
+    // The work that read the buffer (or one it overlaps) last, done before the game writes it; its
+    // ticket is closed (the list's fence).
+    u32 ticket = 0;
+    bool known = false;
+    for (auto it = frame_buffers.begin(); it != frame_buffers.end();) {
+        if (it->lo >= addr + size || addr >= it->hi) {
+            ++it;
+            continue;
+        }
+        if (it->read_ticket != 0 &&
+            (ticket == 0 || static_cast<s32>(it->read_ticket - ticket) > 0)) {
+            ticket = it->read_ticket;
+        }
+        if (it->lo == addr && it->hi == addr + size) {
+            known = true;
+            it->read_ticket = 0;
+            ++it;
+        } else {
+            it = frame_buffers.erase(it);
+        }
+    }
+    if (!known) {
+        frame_buffers.push_back({addr, addr + size, 0});
+    }
+    if (ticket == 0) {
+        return;
+    }
+    DEBUG_ASSERT_MSG(ticket != HoldTicket(), "render thread: a frame buffer turned while read");
+    if (!InterruptPoll(ticket)) {
+#ifdef VITA_DIAGNOSTICS
+        const auto start = Clock::now();
+#endif
+        InterruptWait(ticket);
+#ifdef VITA_DIAGNOSTICS
+        frame_buffer_waits.fetch_add(1, std::memory_order_relaxed);
+        frame_buffer_wait_us.fetch_add(Since(start), std::memory_order_relaxed);
+#endif
+    }
+}
+
+RenderThread::FrameBuffer* RenderThread::InFrameBuffer(PAddr addr, u32 bytes) {
+    for (FrameBuffer& b : frame_buffers) {
+        if (addr >= b.lo && u64{addr} + bytes <= b.hi) {
+            return &b;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<u32> RenderThread::ResourceRanges() const {
+    std::vector<u32> words;
+    words.reserve(resources.size() * 3);
+    for (const ResourceRange& r : resources) {
+        words.insert(words.end(), {r.lo, r.hi, 0});
+    }
+    return words;
+}
+
+void RenderThread::SetResourceRanges(std::span<const u32> words) {
+    resources.clear();
+    for (std::size_t i = 0; i + 3 <= words.size(); i += 3) {
+        WatchResource(words[i], words[i + 1] - words[i]);
+    }
+}
+
+bool RenderThread::InResource(PAddr addr, u32 bytes) {
+    auto it = resources.begin() + std::min(last_resource, resources.size());
+    if (it == resources.end() || addr < it->lo || addr >= it->hi) {
+        it = std::upper_bound(resources.begin(), resources.end(), addr,
+                              [](PAddr a, const ResourceRange& o) { return a < o.lo; });
+        if (it == resources.begin()) {
+            return false;
+        }
+        --it;
+        last_resource = static_cast<std::size_t>(it - resources.begin());
+    }
+    if (u64{addr} + bytes > it->hi) {
+        return false;
+    }
+    if (it->checked != HoldTicket()) {
+        std::array<u32, 4> header;
+        std::memcpy(header.data(), it->host, sizeof(header));
+        if (header != it->header) {
+            resources.erase(it);
+#ifdef VITA_DIAGNOSTICS
+            resource_gone.fetch_add(1, std::memory_order_relaxed);
+#endif
+            return false;
+        }
+        it->checked = HoldTicket();
+    }
+    return true;
+}
+
 void RenderThread::HoldDraw(const DrawTextures& textures, u32 count, bool vertices,
                             bool is_indexed) {
     if (!page_holds_on) {
@@ -1175,6 +1294,12 @@ void RenderThread::HoldDraw(const DrawTextures& textures, u32 count, bool vertic
     }
     const auto& regs = pica.regs.internal;
     for (u32 i = 0; i < count; i++) {
+        if (InResource(textures[i].addr, textures[i].bytes)) {
+#ifdef VITA_DIAGNOSTICS
+            resource_skips[0].fetch_add(1, std::memory_order_relaxed);
+#endif
+            continue;
+        }
         HoldRead(textures[i].addr, textures[i].bytes, PageHolds::Texture);
         // Watched until the guest writes them, which marks the textures over them.
         page_holds.Watch(textures[i].addr, textures[i].bytes);
@@ -1220,10 +1345,50 @@ void RenderThread::HoldVertices(bool is_indexed) {
     u32 lo = pipeline.vertex_offset;
     u32 hi = lo + count - 1;
     draw_indices = {};
+    // Vertices in one of the game's frame buffers or resource files lie there whole: no hold for them,
+    // nor the scan for their range. The index list is held as any other read.
+    for (const auto& loader : va.attribute_loaders) {
+        if (loader.component_count == 0 || loader.byte_count == 0) {
+            continue;
+        }
+        const PAddr first = base + loader.data_offset + lo * loader.byte_count;
+        FrameBuffer* const buffer = InFrameBuffer(first, 1);
+        if (buffer == nullptr && !InResource(first, 1)) {
+            break;
+        }
+        if (buffer != nullptr) {
+            buffer->read_ticket = HoldTicket();
+        }
+#ifdef VITA_DIAGNOSTICS
+        resource_skips[2].fetch_add(1, std::memory_order_relaxed);
+#endif
+        if (is_indexed) {
+            const PAddr index_address = base + pipeline.index_array.offset;
+            const u32 index_bytes = count * (pipeline.index_array.format != 0 ? 2 : 1);
+            if (!InResource(index_address, index_bytes)) {
+                HoldRead(index_address, index_bytes, PageHolds::Index);
+#ifdef VITA_DIAGNOSTICS
+                NoteIndexHold(index_address, index_bytes, pipeline.index_array.format != 0,
+                              pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes);
+#endif
+            }
+        }
+        return;
+    }
     if (is_indexed) {
         const PAddr index_address = base + pipeline.index_array.offset;
         const bool index_u16 = pipeline.index_array.format != 0;
-        HoldRead(index_address, count * (index_u16 ? 2 : 1), PageHolds::Index);
+        if (InResource(index_address, count * (index_u16 ? 2 : 1))) {
+#ifdef VITA_DIAGNOSTICS
+            resource_skips[1].fetch_add(1, std::memory_order_relaxed);
+#endif
+        } else {
+            HoldRead(index_address, count * (index_u16 ? 2 : 1), PageHolds::Index);
+#ifdef VITA_DIAGNOSTICS
+            NoteIndexHold(index_address, count * (index_u16 ? 2 : 1), index_u16,
+                          pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes);
+#endif
+        }
         // Every vertex an index can reach, but where a 16-bit index reaches into FCRAM: there the indices
         // are scanned. VRAM is held for reads whole.
         lo = 0;
@@ -1279,8 +1444,14 @@ void RenderThread::HoldVertices(bool is_indexed) {
             continue;
         }
         const u32 stride = loader.byte_count;
-        HoldRead(base + loader.data_offset + lo * stride, (hi - lo + 1) * stride,
-                 PageHolds::Vertex);
+        const PAddr at = base + loader.data_offset + lo * stride;
+        if (InResource(at, (hi - lo + 1) * stride)) {
+#ifdef VITA_DIAGNOSTICS
+            resource_skips[2].fetch_add(1, std::memory_order_relaxed);
+#endif
+            continue;
+        }
+        HoldRead(at, (hi - lo + 1) * stride, PageHolds::Vertex);
     }
 }
 
@@ -1348,6 +1519,13 @@ void RenderThread::SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::ve
         std::vector<GuestRange> held;
         held.reserve(scan_lists.size());
         for (std::size_t i = 0; i < scan_lists.size(); i++) {
+            if (FrameBuffer* const b = InFrameBuffer(scan_lists[i].addr, scan_lists[i].bytes)) {
+                b->read_ticket = HoldTicket();
+#ifdef VITA_DIAGNOSTICS
+                frame_buffer_reads.fetch_add(1, std::memory_order_relaxed);
+#endif
+                continue;
+            }
             if (scan_offsets[i] == NotCopied) {
                 page_holds.HoldParse(scan_lists[i].addr, scan_lists[i].bytes);
                 held.push_back(scan_lists[i]);
@@ -1407,6 +1585,7 @@ void CopyListState(Pica::PicaCore& from, Pica::PicaCore& to) {
 void RenderThread::TakeWholeState() {
     // A loaded state's memory: no index range of the memo holds.
     index_memo.fill({});
+    frame_buffers.clear();
     // Once the parse thread has read everything queued: it takes the lists after this with
     // the new state, all of it marked changed for the render side's PicaCore (its next
     // records).
@@ -3079,6 +3258,19 @@ RenderThread::Stats RenderThread::TakeStats() {
     s.list_parsed_max = list_parsed_max.exchange(0);
     s.list_draws = list_draws.exchange(0);
     s.scan_us = scan_us.exchange(0);
+    s.resource_named = resource_named.exchange(0);
+    s.resource_gone = resource_gone.exchange(0);
+    for (u32 k = 0; k < 3; k++) {
+        s.resource_skips[k] = resource_skips[k].exchange(0);
+    }
+    s.frame_buffer_reads = frame_buffer_reads.exchange(0);
+    s.frame_buffer_waits = frame_buffer_waits.exchange(0);
+    s.frame_buffer_wait_us = frame_buffer_wait_us.exchange(0);
+    s.resources = static_cast<u32>(resources.size());
+    s.resource_bytes = 0;
+    for (const ResourceRange& r : resources) {
+        s.resource_bytes += r.hi - r.lo;
+    }
     s.index_scans = index_scans.exchange(0);
     s.index_scan_indices = index_scan_indices.exchange(0);
     s.index_scan_us = index_scan_us.exchange(0);
