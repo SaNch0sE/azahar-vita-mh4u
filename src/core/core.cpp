@@ -90,54 +90,6 @@ System::System() : movie{*this}, cheat_engine{*this} {}
 
 System::~System() = default;
 
-namespace {
-
-/**
- * Holds the GL context on the calling thread for the duration of a serialization.
- *
- * Serializing touches the renderer on both sides: a load rebuilds the whole System, and with it
- * the renderer, whose constructor queries the driver strings; a save flushes every cached
- * surface back to guest RAM, which reads them back off the GPU. The render thread owns the
- * context, so unless it is stopped and the context taken here, those calls run with no context
- * current - the queries return null and crash, and the readbacks return uninitialized memory
- * that lands in guest RAM. No-op under the software renderer, which has no context.
- *
- * The debug port's syncsave/syncload do the same handover for the same reason.
- */
-class ScopedRenderContext {
-public:
-    explicit ScopedRenderContext(VideoCore::GPU& gpu_, Frontend::EmuWindow* window_)
-        : gpu{gpu_}, window{window_}, was_running{gpu_.RenderThreadRunning()} {
-        // Take the context unconditionally. The render thread owning it is only one of the
-        // ways it can be absent here: with the render thread stopped nobody holds it at all,
-        // which is just as fatal, and is the case --loadstate hits before the thread starts.
-        if (was_running) {
-            gpu.StopRenderThread();
-        }
-        if (window != nullptr) {
-            window->MakeCurrent();
-        }
-    }
-
-    ~ScopedRenderContext() {
-        // Only give it back if it was taken from the render thread; otherwise the calling
-        // thread is its natural owner and releasing it would strand the next caller.
-        if (was_running) {
-            if (window != nullptr) {
-                window->DoneCurrent();
-            }
-            gpu.StartRenderThread();
-        }
-    }
-
-private:
-    VideoCore::GPU& gpu;
-    Frontend::EmuWindow* window;
-    bool was_running;
-};
-
-} // namespace
-
 System::ResultStatus System::RunLoop(bool tight_loop) {
     status = ResultStatus::Success;
     if (!IsPoweredOn()) {
@@ -178,11 +130,6 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     case Signal::Shutdown:
         return ResultStatus::ShutdownRequested;
     case Signal::Load: {
-        if (gpu != nullptr && gpu->RenderThreadRunning()) {
-            LOG_ERROR(Core, "Save states are not supported while the GPU render thread is active");
-            status_details = "Save states are unavailable with the GPU thread";
-            return ResultStatus::ErrorSavestate;
-        }
         if (save_state_request_status != SaveStateStatus::NONE) {
             LOG_ERROR(Core, "A pending save state operation has not finished yet");
             status_details = "A pending save state operation has not finished yet";
@@ -209,11 +156,6 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         break;
     }
     case Signal::Save: {
-        if (gpu != nullptr && gpu->RenderThreadRunning()) {
-            LOG_ERROR(Core, "Save states are not supported while the GPU render thread is active");
-            status_details = "Save states are unavailable with the GPU thread";
-            return ResultStatus::ErrorSavestate;
-        }
         if (save_state_request_status != SaveStateStatus::NONE) {
             LOG_ERROR(Core, "A pending save state operation has not finished yet");
             status_details = "A pending save state operation has not finished yet";
@@ -234,9 +176,6 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         save_state_request_status = SaveStateStatus::NONE;
         LOG_INFO(Core, "Begin load of slot {}", slot);
         try {
-            // Loading destroys and rebuilds the renderer, so GPU() names a different object
-            // afterwards; the guard restarts the render thread on whichever one is current.
-            ScopedRenderContext context{GPU(), m_emu_window};
             System::LoadState(slot);
             LOG_INFO(Core, "Load completed");
         } catch (const std::exception& e) {
@@ -252,7 +191,6 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         const u32 slot = save_state_slot;
         LOG_INFO(Core, "Begin save to slot {}", slot);
         try {
-            ScopedRenderContext context{GPU(), m_emu_window};
             System::SaveState(slot);
             LOG_INFO(Core, "Save completed");
         } catch (const std::exception& e) {
@@ -1129,7 +1067,7 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
                 const std::shared_ptr<Kernel::Process> process = thread->owner_process.lock();
                 if (process) {
                     gpu->ApplyPerProgramSettings(process->codeset->program_id);
-                    gpu->SwitchDiskResources(process->codeset->program_id);
+                    gpu->Renderer().Rasterizer()->SwitchDiskResources(process->codeset->program_id);
                 }
             }
         }

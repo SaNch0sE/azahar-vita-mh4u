@@ -13,18 +13,13 @@
 #include <psp2/display.h>
 #include <psp2/gxm.h>
 #include <psp2/kernel/clib.h>
-#include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
-#include <psp2/razor_capture.h>
-#include <psp2/sysmodule.h>
 
 #include "citra_vita/gxm_present.h"
 #include "citra_vita/gxm_shaders.gen.h"
 #include "common/logging/log.h"
 #include "video_core/pica/regs_external.h"
-#include "video_core/renderer_gxm/gxm_device.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
 
 namespace VitaFrontend::GxmPresent {
 
@@ -214,9 +209,6 @@ struct State {
 
 State g;
 
-bool razor_loaded = false;
-u32 razor_captures = 0;
-
 // Every kernel memblock this file takes, with the running total per type, so a console log
 // shows the partition being spent: retail units have ~365 MB in all and refuse a boot
 // that asks for more, and the newlib heap (citra_vita_main.cpp) is the other big taker.
@@ -276,28 +268,6 @@ void WriteDisplayPpm(const char* path) {
         std::fwrite(row.data(), 1, row.size(), f);
     }
     std::fclose(f);
-}
-
-/// The Razor GPU capture module, the way vitaGL loads it: the system modules on a devkit,
-/// the user-installed suprx otherwise; whichever succeeds. Must precede sceGxmInitialize.
-void LoadRazor() {
-    if (!GxmRenderer::GxmFlag("razor")) {
-        return;
-    }
-    const int hud = sceSysmoduleLoadModule(SCE_SYSMODULE_RAZOR_HUD);
-    const int cap = sceSysmoduleLoadModule(SCE_SYSMODULE_RAZOR_CAPTURE);
-    SceUID mod = -1;
-    if (cap < 0) {
-        mod = sceKernelLoadStartModule("ur0:data/librazorcapture_es4.suprx", 0, nullptr, 0, nullptr,
-                                       nullptr);
-    }
-    razor_loaded = cap >= 0 || mod >= 0;
-    LOG_WARNING(Frontend, "Razor: hud {:#x} capture {:#x} suprx {:#x} -> {}", static_cast<u32>(hud),
-                static_cast<u32>(cap), static_cast<u32>(mod),
-                razor_loaded ? "loaded" : "unavailable");
-    if (razor_loaded) {
-        sceRazorGpuCaptureEnableSalvage("ux0:data/azahar/gpucrash.sgx");
-    }
 }
 
 struct DisplayData {
@@ -372,9 +342,9 @@ void* GpuAlloc(SceKernelMemBlockType type, u32 size, SceGxmMemoryAttribFlags att
     return addr;
 }
 
-/// One 32-bit slot from libgxm's notification region, handed out in order so the renderer
-/// (through GxmDevice::alloc_notification) cannot land on a slot this file is using. The
-/// region holds SCE_GXM_NOTIFICATION_COUNT of them and we need a handful.
+/// One 32-bit slot from libgxm's notification region, handed out in order so no two users
+/// land on the same one. The region holds SCE_GXM_NOTIFICATION_COUNT of them and we need a
+/// handful.
 volatile u32* AllocNotification() {
     constexpr u32 NotificationCount = 512;
     if (g.notifications_taken >= NotificationCount) {
@@ -780,8 +750,6 @@ bool Initialize() {
         return true;
     }
 
-    LoadRazor();
-
     SceGxmInitializeParams init{};
     init.flags = 0;
     display_buffers = MaxDisplayBuffers;
@@ -917,19 +885,6 @@ bool Initialize() {
     }
 
     g.initialized = true;
-    // The renderer draws through the same context and patcher.
-    GxmRenderer::SetDevice(GxmRenderer::GxmDevice{
-        .context = g.context,
-        .patcher = g.patcher,
-        .alloc_mapped = AllocMapped,
-        .alloc_mapped_cached = AllocMappedCached,
-        .alloc_cdram = AllocCdram,
-        .largest_free = LargestFree,
-        .frame_alloc = FrameAlloc,
-        .free_block = FreeBlock,
-        .alloc_notification = AllocNotification,
-        .razor = razor_loaded,
-    });
     LOG_INFO(Frontend, "GXM presentation layer up: {} display buffers, {} KiB frame arenas",
              display_buffers, FrameArenaSize / 1024);
     return true;
@@ -940,7 +895,6 @@ bool IsInitialized() {
 }
 
 void Shutdown() {
-    GxmRenderer::SetDevice(GxmRenderer::GxmDevice{});
     if (g.context != nullptr) {
         sceGxmDisplayQueueFinish();
         sceGxmFinish(g.context);
@@ -1091,22 +1045,6 @@ void FreeBlock(void* block) {
     }
 }
 
-bool HasRazor() {
-    return razor_loaded;
-}
-
-void CaptureNextFrame() {
-    if (!razor_loaded) {
-        LOG_WARNING(Frontend,
-                    "GPU capture asked for, but Razor is not loaded (gxm_flags.txt: razor)");
-        return;
-    }
-    static char path[64];
-    std::snprintf(path, sizeof(path), "ux0:data/azahar/capture_%u.sgx", razor_captures++);
-    sceRazorGpuCaptureSetTriggerNextFrame(path);
-    LOG_WARNING(Frontend, "Razor: capturing the next frame to {}", path);
-}
-
 void DumpNextFrame() {
     dump_requested = true;
 }
@@ -1235,66 +1173,6 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
             return;
         }
     }
-    // Bring-up switch: the guest framebuffer as it stands in memory, before this quad samples
-    // it. A picture that is already wrong here was drawn wrong; one that is right here and
-    // wrong on screen is sampled wrong. Header: width, height, stride in bytes, bytes per
-    // pixel, then the rows exactly as the guest wrote them.
-    static const bool dump_frames_fb = GxmRenderer::GxmFlag("dumpframe");
-    if (dump_frames_fb) {
-        const bool top = screen.height >= 400;
-        static u64 last_fb_us[2]{};
-        u64& last = last_fb_us[top ? 0 : 1];
-        const u64 now_us = sceKernelGetProcessTimeWide();
-        if (now_us - last >= 5000000ull) {
-            last = now_us;
-            // Whatever the quad is about to sample, which is the renderer's own surface when
-            // it has one and the guest's framebuffer otherwise.
-            const void* pixels = sceGxmTextureGetData(&texture);
-            const u32 tex_width = sceGxmTextureGetWidth(&texture);
-            const u32 tex_height = sceGxmTextureGetHeight(&texture);
-            const u32 tex_stride =
-                screen.texture != nullptr ? ((tex_width + 7u) & ~7u) * bpp : screen.stride_bytes;
-            char path[64];
-            std::snprintf(path, sizeof(path), "ux0:data/azahar/fb_%s.raw", top ? "top" : "bot");
-            if (FILE* f = std::fopen(path, "wb")) {
-                const u32 header[4] = {tex_width, tex_height, tex_stride, bpp};
-                std::fwrite(header, sizeof(header), 1, f);
-                std::fwrite(pixels, tex_stride, tex_height, f);
-                std::fclose(f);
-            }
-            // And the guest's own memory for the same screen, whatever the quad samples.
-            if (screen.pixels != nullptr) {
-                std::snprintf(path, sizeof(path), "ux0:data/azahar/fb_%s_mem.raw",
-                              top ? "top" : "bot");
-                if (FILE* f = std::fopen(path, "wb")) {
-                    const u32 header[4] = {240, screen.height, screen.stride_bytes, bpp};
-                    std::fwrite(header, sizeof(header), 1, f);
-                    std::fwrite(screen.pixels, screen.stride_bytes, screen.height, f);
-                    std::fclose(f);
-                }
-            }
-        }
-    }
-
-    // Bring-up switch: what the screen quad actually samples. A texture whose stride is not
-    // its width, or whose size is not the framebuffer's, shears the picture across the quad,
-    // which is what a wrong one looks like on screen.
-    static const bool log_quad = GxmRenderer::GxmFlag("logdraw");
-    if (log_quad) {
-        static u32 logged = 0;
-        if (logged++ % 600 == 0) {
-            LOG_INFO(Render,
-                     "screen quad: {} texture {}x{}, type {}, stride {}, format {:#x}; guest "
-                     "stride {} bytes, height {}, bpp {}",
-                     screen.texture != nullptr ? "renderer" : "guest memory",
-                     sceGxmTextureGetWidth(&texture), sceGxmTextureGetHeight(&texture),
-                     static_cast<u32>(sceGxmTextureGetType(&texture)),
-                     sceGxmTextureGetStride(&texture),
-                     static_cast<u32>(sceGxmTextureGetFormat(&texture)), screen.stride_bytes,
-                     screen.height, bpp);
-        }
-    }
-
     sceGxmTextureSetMagFilter(&texture, SCE_GXM_TEXTURE_FILTER_LINEAR);
     // A strided texture has no minification filter to set - GXM refuses the call - so a
     // framebuffer whose stride is not the implicit pitch is point-sampled when it shrinks.
@@ -1345,35 +1223,19 @@ void EndFrame() {
     sceGxmEndScene(g.context, nullptr, &done);
     g.in_scene = false;
 
-    // Bring-up switch: every five seconds, the frame just drawn as a PPM under
-    // ux0:data/azahar, so what the GPU produced can be looked at off the console. Costs a
-    // full GPU wait and a 1.5 MB write each time, which is why it is a switch.
-    static const bool dump_frames = GxmRenderer::GxmFlag("dumpframe");
-    static u64 last_dump_us = 0;
+    // The pause menu's "Dump frame": the frame just drawn as a PPM under ux0:data/azahar, so
+    // what the GPU produced can be looked at off the console. Costs a full GPU wait.
     static u32 dump_index = 0;
-    const u64 now_us = sceKernelGetProcessTimeWide();
-    if (dump_requested || (dump_frames && now_us - last_dump_us >= 5000000ull)) {
+    if (dump_requested) {
         dump_requested = false;
-        last_dump_us = now_us;
         char path[64];
         std::snprintf(path, sizeof(path), "ux0:data/azahar/frame_%02u.ppm", dump_index++ % 20);
         WriteDisplayPpm(path);
         LOG_INFO(Frontend, "wrote {}", path);
     }
-    // The surface dump the button (or the dumpsurfaces flag) asked for: here, after the
-    // frame is done, whether or not the emulation is running.
-    if (GxmRenderer::SurfaceDumpPending()) {
-        sceGxmFinish(g.context);
-        GxmRenderer::RunSurfaceDumpIfRequested();
-    }
 
     const u32 front = (g.frame_index + display_buffers - 1) % display_buffers;
     DisplayData data{g.display_mem[g.back]};
-    // Razor's frame marker, as vitaGL sends it before every flip: what the capture library
-    // and the HUD use to know a frame's end and which surface the HUD is drawn over.
-    if (razor_loaded) {
-        sceGxmPadHeartbeat(&g.display_surface[g.back], g.sync[g.back]);
-    }
     sceGxmDisplayQueueAddEntry(g.sync[front], g.sync[g.back], &data);
     g.frame_index++;
 }

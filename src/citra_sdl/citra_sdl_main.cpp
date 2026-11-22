@@ -23,28 +23,28 @@
 #include "core/arm/native/arm_native.h"
 #include "core/arm/native/native_mirror.h"
 #endif
-#include "common/pipeline_stats.h"
 #include "common/logging/backend.h"
 #include "common/logging/filter.h"
 #include "common/logging/log.h"
+#include "common/pipeline_stats.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
-#include "core/hle/service/gsp/gsp_gpu.h"
-#include "video_core/pica/pica_core.h"
-#include "video_core/shader/generator/cg_fs_shader_gen.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/image_interface.h"
+#include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/hle/service/service.h"
 #include "core/loader/loader.h"
 #include "core/movie.h"
 #include "video_core/gpu.h"
+#include "video_core/pica/pica_core.h"
+#include "video_core/shader/generator/cg_fs_shader_gen.h"
 #ifdef ENABLE_GXM_STUB
 #include "video_core/renderer_gxm/gxm_stub/gxm_stub.h"
 #endif
+#include "input_common/main.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
-#include "input_common/main.h"
 
 namespace {
 
@@ -233,8 +233,8 @@ int main(int argc, char** argv) {
 
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
-    Common::Log::Filter filter;
-    filter.ParseFilterString(options.log_filter);
+    Common::Log::Filter filter(Common::Log::Level::Trace);
+    // filter.ParseFilterString(options.log_filter);
     Common::Log::SetGlobalFilter(filter);
 
     auto& system = Core::System::GetInstance();
@@ -394,17 +394,6 @@ int main(int argc, char** argv) {
     if (!options.deterministic) {
         system.GPU().StartRenderThread();
     }
-    // The software renderer ran in lockstep for as long as its freeze was unexplained. The
-    // cause turned out to be the torn physical-region lookup cache, is
-    // fixed, and free-running has survived every drive that used to freeze it - so concurrency
-    // is the default. Replays still pace the render thread, so a movie cannot diverge on how
-    // fast the host draws.
-    if (options.deterministic || !options.playback_path.empty()) {
-        system.GPU().SetRenderThreadLockstep(true);
-    }
-    if (options.unlimited) {
-        system.GPU().SetUnlimitedSpeed(true);
-    }
 
     if (!options.record_path.empty()) {
         movie.StartRecording(options.record_path, "citra_sdl");
@@ -467,9 +456,11 @@ int main(int argc, char** argv) {
                 const u32 snaps = Common::PipelineStats::display_snapshots.exchange(0);
                 const auto wt = system.Memory().WriteTracker().TakeStats();
                 LOG_INFO(Frontend,
-                         "PIPE speed {:.0f}% game {:.1f} fps shown {} fps present {} ms snap {} read {}/{} KiB stale {} xfer {}/{} copy {}/{} wt f{} a{} c{} h{} | draws {} targets {} | gpu {} ops busy {} ms swap {} ms "
+                         "PIPE speed {:.0f}% game {:.1f} fps shown {} fps present {} ms snap {} "
+                         "read {}/{} KiB stale {} xfer {}/{} copy {}/{} wt f{} a{} c{} h{} | draws "
+                         "{} targets {} | gpu {} ops busy {} ms swap {} ms "
                          "brake {} | emu drain {} ms ({}) | barrier {} ms ({}) | irq {}/s lag "
-                         "{:.2f} ms avg | queue {} | {:.1f} Mfrag/s {:.1f} ns/frag",
+                         "{:.2f} ms avg | {:.1f} Mfrag/s {:.1f} ns/frag",
                          perf.emulation_speed * 100.0, perf.game_fps, shown, present_ms, snaps,
                          Common::PipelineStats::cache_downloads.exchange(0),
                          Common::PipelineStats::cache_download_kb.exchange(0),
@@ -477,14 +468,12 @@ int main(int argc, char** argv) {
                          Common::PipelineStats::xfer_accel.exchange(0),
                          Common::PipelineStats::xfer_soft.exchange(0),
                          Common::PipelineStats::copy_accel.exchange(0),
-                         Common::PipelineStats::copy_soft.exchange(0), wt.faults,
-                         wt.arms, wt.consumed_pages, wt.hot_skips,
+                         Common::PipelineStats::copy_soft.exchange(0), wt.faults, wt.arms,
+                         wt.consumed_pages, wt.hot_skips,
                          Common::PipelineStats::fb_binds.exchange(0),
-                         Common::PipelineStats::fb_switches.exchange(0), ops,
-                         busy_ms, swap_ms, brakes, drain_ms, drains, barrier_ms, barriers, irqs,
-                         irqs ? static_cast<double>(irq_us) / irqs / 1000.0 : 0.0,
-                         system.GPU().RenderQueueDepth(),
-                         frags / 1e6,
+                         Common::PipelineStats::fb_switches.exchange(0), ops, busy_ms, swap_ms,
+                         brakes, drain_ms, drains, barrier_ms, barriers, irqs,
+                         irqs ? static_cast<double>(irq_us) / irqs / 1000.0 : 0.0, frags / 1e6,
                          frags > 0 ? static_cast<double>(busy_ms) * 1e6 / frags : 0.0);
             }
         }
@@ -496,23 +485,11 @@ int main(int argc, char** argv) {
             const double elapsed_s =
                 std::chrono::duration_cast<std::chrono::milliseconds>(so_far).count() / 1000.0;
             char status[160];
-            std::snprintf(status, sizeof(status),
-                          "running frames=%ld elapsed=%.1fs rate=%.1f/s presented=%llu skipped=%llu cmdlists=%llu overrun=%llu",
-                          frames, elapsed_s, elapsed_s > 0.0 ? frames / elapsed_s : 0.0,
-                          static_cast<unsigned long long>(system.GPU().PresentedFrames()),
-                          static_cast<unsigned long long>(system.GPU().SkippedFrames()),
-                          static_cast<unsigned long long>(
-                              Service::GSP::g_gx_cmdlists.load(std::memory_order_relaxed)),
-                          static_cast<unsigned long long>(
-                              Pica::g_cmdlist_overrun.load(std::memory_order_relaxed)));
+            std::snprintf(status, sizeof(status), "running frames=%ld elapsed=%.1fs rate=%.1f/s",
+                          frames, elapsed_s, elapsed_s > 0.0 ? frames / elapsed_s : 0.0);
             input_port.SetStatus(status);
         }
 
-        if (options.frame_limit >= 0 &&
-            static_cast<long>(system.GPU().PresentedFrames()) >= options.frame_limit) {
-            LOG_INFO(Frontend, "Reached the {} presented-frame limit", options.frame_limit);
-            break;
-        }
         if (options.seconds_limit >= 0) {
             const auto elapsed = std::chrono::steady_clock::now() - started;
             if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >=

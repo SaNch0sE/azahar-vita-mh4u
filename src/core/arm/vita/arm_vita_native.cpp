@@ -3,7 +3,6 @@
 // Refer to the license.txt file included.
 
 #include "core/arm/vita/arm_vita_native.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
 
 #include <algorithm>
 #include <cstring>
@@ -76,38 +75,6 @@ VitaGuestMap::~VitaGuestMap() {
     if (installed) {
         azaharRelease();
     }
-}
-
-void VitaGuestMap::ProtectHostRange(const u8* host, std::size_t size, bool read_only) {
-    if (!installed) {
-        return;
-    }
-    const u32 perm = read_only ? (AZAHAR_PERM_R | AZAHAR_PERM_X) : GuestPerm;
-    for (const auto& [base, mapping] : live_mappings) {
-        const u8* lo = std::max<const u8*>(mapping.host, host);
-        const u8* hi = std::min<const u8*>(mapping.host + mapping.size, host + size);
-        if (lo >= hi) {
-            continue;
-        }
-        Edit(AZAHAR_EDIT_PROTECT, 0, base + static_cast<u32>(lo - mapping.host),
-             static_cast<u32>(hi - lo), perm);
-    }
-}
-
-void VitaGuestMap::ProtectGuestPage(VAddr guest_page, bool read_only) {
-    Edit(AZAHAR_EDIT_PROTECT, 0, guest_page, 4096, read_only ? (AZAHAR_PERM_R | AZAHAR_PERM_X) : GuestPerm);
-}
-
-const u8* VitaGuestMap::HostPageOf(VAddr guest) const {
-    auto it = live_mappings.upper_bound(guest);
-    if (it == live_mappings.begin()) {
-        return nullptr;
-    }
-    --it;
-    if (guest >= it->first + it->second.size) {
-        return nullptr;
-    }
-    return it->second.host + ((guest - it->first) & ~VAddr{4095});
 }
 
 bool VitaGuestMap::Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) const {
@@ -220,17 +187,6 @@ bool VitaGuestMap::Install() {
         return false;
     }
     installed = true;
-    // Guest write tracking (core/guest_write_tracker.h) over AZAHAR_EDIT_PROTECT, armed between
-    // slices. `nowritetrack` in gxm_flags.txt turns it off.
-    {
-        auto& tracker = memory.WriteTracker();
-        tracker.SetProtect([this](const u8* host, std::size_t size, bool read_only) {
-            ProtectHostRange(host, size, read_only);
-        });
-        tracker.SetDeferred(true);
-        tracker.SetHotPages(!GxmRenderer::GxmFlag("nohotpages"));
-        tracker.SetEnabled(!GxmRenderer::GxmFlag("nowritetrack"));
-    }
     unsigned added = 0;
     for (const auto& [base, mapping] : live_mappings) {
         if (Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(mapping.host), base, mapping.size,
@@ -356,10 +312,6 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         return false;
     }
 
-    // Pages the surface cache wants armed since the last slice: protected now, while the
-    // guest is stopped, so the claim and the protection take effect together at this entry.
-    memory.WriteTracker().ApplyPending();
-
     AzaharRunRequest run{};
     run.ctx = context;
     run.ctx.tpidruro = cp15[CP15_THREAD_URO];
@@ -387,31 +339,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     case AZAHAR_EXIT_TIMER:
         return false;
 
-    case AZAHAR_EXIT_DABT: {
-        // A store into a page the surface cache armed: mark it, make it writable again and
-        // resume at the store (r15 is the faulting instruction). A fault on any other page
-        // is the guest's own.
-        auto& tracker = memory.WriteTracker();
-        const u8* host = tracker.Enabled() ? map->HostPageOf(run.far) : nullptr;
-        if (host != nullptr) {
-            struct Unprotect {
-                VitaGuestMap* map;
-                u32 guest_page;
-            } ctx{map.get(), run.far & ~u32{4095}};
-            const bool ours = tracker.OnFault(
-                host,
-                [](void* raw) {
-                    auto* u = static_cast<Unprotect*>(raw);
-                    u->map->ProtectGuestPage(u->guest_page, false);
-                },
-                &ctx);
-            if (ours) {
-                return !break_flag && !stop_requested;
-            }
-        }
-        ReportFault(run);
-        return false;
-    }
+    case AZAHAR_EXIT_DABT:
     case AZAHAR_EXIT_UND:
     case AZAHAR_EXIT_PABT:
     default:
@@ -448,9 +376,7 @@ void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
     for (u32 a = context.r[15] - 16; a <= context.r[15] + 12; a += 4) {
         code += fmt::format("{}{:08X}", a == context.r[15] ? " *" : " ", memory.Read32(a));
     }
-    LOG_CRITICAL(Core_ARM11, "code around PC:{}\nrender-thread writes:\n{}", code,
-                 system.GPU().DescribeRecentWrites(std::span<const u32>(context.r),
-                                                   run.far));
+    LOG_CRITICAL(Core_ARM11, "code around PC:{}", code);
     system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised, message.c_str());
 }
 

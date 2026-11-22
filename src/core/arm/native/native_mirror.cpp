@@ -119,7 +119,6 @@ void NativeAddressSpaceMirror::OnMapped(VAddr base, u32 size, MemoryRef target) 
     // entries describing them are stale. Only what they held outside the range is still real.
     ForgetRange(base, size, false);
     live_mappings.emplace(base, wanted);
-    SetPageMap(base, size, block->Data() + offset);
 }
 
 void NativeAddressSpaceMirror::OnUnmapped(VAddr base, u32 size) {
@@ -128,45 +127,6 @@ void NativeAddressSpaceMirror::OnUnmapped(VAddr base, u32 size) {
     }
     std::scoped_lock lock{mappings_mutex};
     ForgetRange(base, size, true);
-    SetPageMap(base, size, nullptr);
-}
-
-void NativeAddressSpaceMirror::SetPageMap(VAddr base, u32 size, const u8* host) {
-    if (page_to_host.empty()) {
-        page_to_host = std::vector<std::atomic<const u8*>>((GuestEnd - GuestBase) / 4096);
-    }
-    const VAddr first = base & ~VAddr{4095};
-    for (VAddr page = first; page < base + size; page += 4096) {
-        const std::size_t index = (page - GuestBase) / 4096;
-        if (index < page_to_host.size()) {
-            page_to_host[index].store(host != nullptr ? host + (page - first) : nullptr,
-                                      std::memory_order_release);
-        }
-    }
-}
-
-const u8* NativeAddressSpaceMirror::HostPageOf(VAddr guest) const {
-    if (guest < GuestBase || guest >= GuestEnd || page_to_host.empty()) {
-        return nullptr;
-    }
-    return page_to_host[(guest - GuestBase) / 4096].load(std::memory_order_acquire);
-}
-
-void NativeAddressSpaceMirror::ProtectHostRange(const u8* host, std::size_t size, bool read_only) {
-    std::scoped_lock lock{mappings_mutex};
-    const int prot = read_only ? (PROT_READ | PROT_EXEC) : (PROT_READ | PROT_WRITE | PROT_EXEC);
-    for (const auto& [base, mapping] : live_mappings) {
-        const u8* mapped = mapping.block->Data() + mapping.offset;
-        const u8* lo = std::max(mapped, host);
-        const u8* hi = std::min(mapped + mapping.size, host + size);
-        if (lo >= hi) {
-            continue;
-        }
-        void* guest = reinterpret_cast<void*>(base + static_cast<u32>(lo - mapped));
-        if (mprotect(guest, static_cast<std::size_t>(hi - lo), prot) != 0) {
-            LOG_ERROR(Core_ARM11, "Native backend: mprotect of {} failed", guest);
-        }
-    }
 }
 
 void NativeAddressSpaceMirror::ForgetRange(VAddr base, u32 size, bool unmap) {
@@ -227,7 +187,6 @@ void NativeAddressSpaceMirror::FlushInstructionCache() const {
 
 void NativeAddressSpaceMirror::UnmapAll() {
     std::scoped_lock lock{mappings_mutex};
-    SetPageMap(GuestBase, GuestEnd - GuestBase, nullptr);
     for (const auto& [base, mapping] : live_mappings) {
         Common::HostSharedMemory::UnmapAt(reinterpret_cast<void*>(base), mapping.size);
     }

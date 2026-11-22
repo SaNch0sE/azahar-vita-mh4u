@@ -59,14 +59,6 @@ public:
     void SyncCode(VAddr base, u32 size);
     void SyncAllCode();
 
-    /// The guest write tracker's primitive: every guest alias of the app's pages [host, host +
-    /// size) gets read-only or read-write (AZAHAR_EDIT_PROTECT; the taken core drops its TLB at
-    /// the next azaharRun). Emulation thread, between slices.
-    void ProtectHostRange(const u8* host, std::size_t size, bool read_only);
-    /// The app's page the guest page holding `guest` is mapped from, or null.
-    [[nodiscard]] const u8* HostPageOf(VAddr guest) const;
-    void ProtectGuestPage(VAddr guest_page, bool read_only);
-
     /// Highest guest address the module's table can hold, exclusive.
     static constexpr u32 GuestEnd = 0x40000000;
 

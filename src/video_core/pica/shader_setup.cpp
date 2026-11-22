@@ -37,7 +37,6 @@ ShaderSetup::ShaderSetup() = default;
 ShaderSetup::~ShaderSetup() = default;
 
 void ShaderSetup::WriteUniformBoolReg(u32 value) {
-    uniforms_sync_dirty = true;
     const auto bits = BitSet32(value);
     for (u32 i = 0; i < uniforms.b.size(); ++i) {
         const bool prev = std::exchange(uniforms.b[i], bits[i]);
@@ -46,14 +45,12 @@ void ShaderSetup::WriteUniformBoolReg(u32 value) {
 }
 
 void ShaderSetup::WriteUniformIntReg(u32 index, const Common::Vec4<u8> values) {
-    uniforms_sync_dirty = true;
     ASSERT(index < uniforms.i.size());
     const auto prev = std::exchange(uniforms.i[index], values);
     uniforms_dirty |= prev != values;
 }
 
 std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 value) {
-    uniforms_sync_dirty = true;
     auto& uniform_setup = config.uniform_setup;
     const bool is_float32 = uniform_setup.IsFloat32();
     if (!uniform_queue.Push(value, is_float32)) {
@@ -70,14 +67,12 @@ std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 val
     const u32 index = uniform_setup.index.Value();
     const auto prev = std::exchange(uniforms.f[index], uniform);
     uniforms_dirty |= prev != uniform;
-    WidenFloatSyncWindow(index, index + 1);
     uniform_setup.index.Assign(index + 1);
     return index;
 }
 
 std::optional<ShaderSetup::UniformWriteRange> ShaderSetup::WriteUniformFloatRegRange(
     ShaderRegs& config, const u32* values, u32 count) {
-    uniforms_sync_dirty = true;
 
     if (count == 0) [[unlikely]] {
         return std::nullopt;
@@ -115,7 +110,6 @@ std::optional<ShaderSetup::UniformWriteRange> ShaderSetup::WriteUniformFloatRegR
     if (written == 0) {
         return std::nullopt;
     }
-    WidenFloatSyncWindow(*first_index, *first_index + written);
     return UniformWriteRange{*first_index, written};
 }
 
@@ -225,10 +219,6 @@ static inline u32 ProcessBlockNEON(u32* dst, const u32* values) {
 #endif
 
 void ShaderSetup::UpdateProgramCodeRange(size_t offset, const u32* __restrict values, u32 count) {
-    // Mirror-sync must fire on every actual write, independent of the hash flag: with shading
-    // on the render thread nothing on this thread consumes the hash, so the hash-dirty edge
-    // never re-arms. (Learned from the mirror silently running stale shader programs.)
-    code_sync_dirty = true;
     if (count == 0) [[unlikely]] {
         return;
     }
@@ -276,10 +266,6 @@ void ShaderSetup::UpdateProgramCodeRange(size_t offset, const u32* __restrict va
 }
 
 void ShaderSetup::UpdateSwizzleDataRange(size_t offset, const u32* __restrict values, u32 count) {
-    // Mirror-sync must fire on every actual write, independent of the hash flag: with shading
-    // on the render thread nothing on this thread consumes the hash, so the hash-dirty edge
-    // never re-arms. (Learned from the mirror silently running stale shader programs.)
-    code_sync_dirty = true;
     if (count == 0) [[unlikely]] {
         return;
     }

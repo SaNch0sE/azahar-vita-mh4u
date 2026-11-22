@@ -100,14 +100,3 @@ void NativeClearStopRequest();
 void NativeFlushInstructionCache(void* start, std::size_t length);
 
 } // namespace Core
-
-namespace Memory {
-class GuestWriteTracker;
-}
-namespace Core {
-class NativeAddressSpaceMirror;
-/// Routes guest stores into armed pages to the write tracker instead of treating them as
-/// data aborts. Null pointers turn it off.
-void NativeSetWriteTracking(const NativeAddressSpaceMirror* mirror,
-                            Memory::GuestWriteTracker* tracker);
-} // namespace Core

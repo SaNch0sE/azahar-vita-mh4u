@@ -41,9 +41,8 @@ struct GuestScreen {
     u8 fill_r, fill_g, fill_b;
 };
 
-/// Frame lifecycle. All of these run on whichever single thread presents (the render thread
-/// in-game, the main thread in the menus) - never two at once, which is the same discipline
-/// GXM's immediate context demands.
+/// Frame lifecycle. All of these run on the one thread that presents, which is the
+/// discipline GXM's immediate context demands.
 void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b);
 void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float h);
 void DrawSolidRect(float x, float y, float w, float h, u8 r, u8 g, u8 b, u8 a);
@@ -69,11 +68,8 @@ void FreeBlock(void* block);
 /// Draws any GXM texture unrotated into a display rectangle (the renderer's debug overlay).
 void DrawTexture(const SceGxmTexture* texture, float x, float y, float w, float h);
 
-/// True when the Razor modules loaded at Initialize, so the host tool can see this process.
-[[nodiscard]] bool HasRazor();
-
 /// The next EndFrame writes its picture to ux0:data/azahar/frame_NN.ppm (the pause menu's
-/// "Dump frame"; the dumpframe flag does the same every five seconds). DumpPending is true
+/// "Dump frame"). DumpPending is true
 /// until that frame is written, so the caller can leave the overlay out of it.
 void DumpNextFrame();
 [[nodiscard]] bool DumpPending();

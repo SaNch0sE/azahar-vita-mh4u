@@ -45,10 +45,9 @@ void RendererBase::EndFrame() {
 
     system.perf_stats->EndSystemFrame();
 
-    if (!threaded_presentation) {
-        render_window.PollEvents();
-        system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
-    }
+    render_window.PollEvents();
+
+    system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
     system.perf_stats->BeginSystemFrame();
 }
 

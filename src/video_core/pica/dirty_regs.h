@@ -47,16 +47,6 @@ union DirtyRegs {
         qwords[last_word] |= last_mask;
     }
 
-    void Clear() {
-        qwords.fill(0);
-    }
-
-    void Or(const DirtyRegs& other) {
-        for (std::size_t i = 0; i < qwords.size(); i++) {
-            qwords[i] |= other.qwords[i];
-        }
-    }
-
     void SetAllDirty() {
         qwords.fill(UINT64_MAX);
     }

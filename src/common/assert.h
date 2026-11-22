@@ -5,6 +5,12 @@
 #pragma once
 
 #include <cstdlib>
+#include <iostream>
+#ifdef CITRA_LINUX_GCC_BACKTRACE
+#define BOOST_STACKTRACE_USE_BACKTRACE
+#include <boost/stacktrace.hpp>
+#undef BOOST_STACKTRACE_USE_BACKTRACE
+#endif
 #include "common/common_funcs.h"
 #include "common/logging/backend.h"
 #include "common/logging/log.h"
@@ -61,5 +67,16 @@
 #define DEBUG_ASSERT_MSG(_a_, _desc_, ...)
 #endif
 
+#ifdef CITRA_LINUX_GCC_BACKTRACE
+#define UNIMPLEMENTED()                                                                            \
+    ([]() CITRA_NO_INLINE CITRA_NO_RETURN {                                                        \
+        LOG_CRITICAL(Debug, "Unimplemented code!");                                                \
+        Common::Log::Stop();                                                                       \
+        std::cerr << boost::stacktrace::stacktrace();                                              \
+        Crash();                                                                                   \
+        exit(1);                                                                                   \
+    }())
+#else
 #define UNIMPLEMENTED() LOG_CRITICAL(Debug, "Unimplemented code!")
+#endif
 #define UNIMPLEMENTED_MSG(_a_, ...) LOG_CRITICAL(Debug, _a_, __VA_ARGS__)

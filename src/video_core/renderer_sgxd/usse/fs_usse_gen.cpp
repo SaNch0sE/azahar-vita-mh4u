@@ -8,7 +8,6 @@
 #include <stdexcept>
 #include <string>
 #include <fmt/format.h>
-#include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 #include "video_core/renderer_gxm/usse/usse_encoder.h"

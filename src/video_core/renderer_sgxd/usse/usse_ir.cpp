@@ -10,7 +10,6 @@
 #include <set>
 #include <stdexcept>
 #include <string>
-#include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/usse/usse_ir.h"
 
 namespace GxmRenderer::Usse::Ir {
@@ -1215,9 +1214,8 @@ void Lowering::HoistLoads(int max_group) {
         }
         out.push_back(inst);
     };
-    static const bool no_cse = GxmFlag("usse_nocse");
     const auto find_known = [&](const ChainInfo& c) -> const Reg* {
-        if (!c.indexed || no_cse) {
+        if (!c.indexed) {
             return nullptr;
         }
         for (const Known& kn : known) {
@@ -1564,10 +1562,6 @@ void Lowering::TwoWideChains() {
     // writing the pairs the moves went to. Smash's skinning program: 11 instructions per
     // bone group to 8, and the loads that fed the internal registers die. A single op
     // followed by its moves is DirectTwoWide's case and is left to it.
-    static const bool no_chains = GxmFlag("usse_nochains");
-    if (no_chains) {
-        return;
-    }
     const auto candidate = [](const Inst& inst) {
         const bool is_mad = inst.op == Op::Mad && inst.b[0];
         const bool is_vec = inst.op == Op::Vec &&
@@ -1842,8 +1836,7 @@ void Lowering::DirectTwoWide() {
     std::size_t i = 0;
     while (i < insts.size()) {
         const Inst& inst = insts[i];
-        static const bool no_mad_fold = GxmFlag("usse_nomadfold");
-        const bool is_mad = !no_mad_fold && inst.op == Op::Mad && inst.b[0];
+        const bool is_mad = inst.op == Op::Mad && inst.b[0];
         const bool candidate =
             (is_mad || (inst.op == Op::Vec &&
                         (static_cast<VecOp>(inst.u[0]) == VecOp::Add ||
@@ -3277,11 +3270,9 @@ LowerResult Lowering::Run(Encoder& e, int level) {
         if (level >= 2) {
             Liveness();
             DeadStores();
-            static const bool no_hoist = GxmFlag("usse_nohoist");
             Dump("input");
-            if (hoist >= 2 && !no_hoist) {
-                static const bool no_global = GxmFlag("usse_noglobalhoist");
-                if (hoist == 3 && !no_global) {
+            if (hoist >= 2) {
+                if (hoist == 3) {
                     HoistLoadsGlobal();
                     Dump("hoist global");
                 }

@@ -75,11 +75,10 @@ void PageTable::Pointers::SetRef(std::size_t idx, MemoryRef value) {
                 runs.emplace(start, Run{before, covering.ref});
             }
             if (after) {
-                runs.emplace(page + 1,
-                             Run{after, MemoryRef(covering.ref.GetBackingMem(),
-                                                  covering.ref.GetOffset() +
-                                                      static_cast<u64>(before + 1) *
-                                                          CITRA_PAGE_SIZE)});
+                runs.emplace(page + 1, Run{after, MemoryRef(covering.ref.GetBackingMem(),
+                                                            covering.ref.GetOffset() +
+                                                                static_cast<u64>(before + 1) *
+                                                                    CITRA_PAGE_SIZE)});
             }
         }
     }
@@ -87,7 +86,8 @@ void PageTable::Pointers::SetRef(std::size_t idx, MemoryRef value) {
         return;
     }
     const auto same_block = [&](const MemoryRef& a, const MemoryRef& b, u64 a_to_b_bytes) {
-        return a.GetBackingMem() == b.GetBackingMem() && a.GetOffset() + a_to_b_bytes == b.GetOffset();
+        return a.GetBackingMem() == b.GetBackingMem() &&
+               a.GetOffset() + a_to_b_bytes == b.GetOffset();
     };
     auto succ = runs.find(page + 1);
     const bool join_succ =
@@ -399,15 +399,13 @@ public:
                 return;
             }
 
+            auto& renderer = system.GPU().Renderer();
             VAddr overlap_start = std::max(start, region_start);
             VAddr overlap_end = std::min(end, region_end);
             PAddr physical_start = paddr_region_start + (overlap_start - region_start);
             u32 overlap_size = overlap_end - overlap_start;
 
-            // Through the threaded facade: the raw GL rasterizer's caches may only be touched
-            // on the render thread, and these flushes arrive from the emulation thread (DMA,
-            // y2r, applet captures) and even filesystem worker threads.
-            auto* rasterizer = system.GPU().CacheRasterizer();
+            auto* rasterizer = renderer.Rasterizer();
             switch (mode) {
             case FlushMode::Flush:
                 rasterizer->FlushRegion(physical_start, overlap_size);
@@ -492,11 +490,7 @@ MemorySystem::Impl::Impl(Core::System& system_)
       n3ds_extra_ram_mem(std::make_shared<BackingMemImpl<Region::N3DS>>(*this)),
       dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {}
 
-MemorySystem::MemorySystem(Core::System& system)
-    : impl(std::make_unique<Impl>(system)), write_tracker(std::make_unique<GuestWriteTracker>()) {
-    write_tracker->RegisterBlock(impl->fcram.Data(), impl->fcram.Size(), FCRAM_PADDR);
-    write_tracker->RegisterBlock(impl->vram.Data(), impl->vram.Size(), VRAM_PADDR);
-}
+MemorySystem::MemorySystem(Core::System& system) : impl(std::make_unique<Impl>(system)) {}
 MemorySystem::~MemorySystem() = default;
 
 template <class Archive>
@@ -507,8 +501,9 @@ void MemorySystem::serialize(Archive& ar, const unsigned int file_version) {
 SERIALIZE_IMPL(MemorySystem)
 
 void MemorySystem::SetCurrentPageTable(const std::shared_ptr<PageTable>& page_table) {
-    // Called on every guest thread switch, almost always with the table already in force. Rebuilding
-    // the observer's view of a million pages each time would cost far more than the emulation.
+    // Called on every guest thread switch, almost always with the table already in force.
+    // Rebuilding the observer's view of a million pages each time would cost far more than the
+    // emulation.
     const bool changed = impl->current_page_table != page_table;
     impl->current_page_table = page_table;
 
@@ -714,7 +709,6 @@ void MemorySystem::SetMappingObserver(MappingObserver* observer) {
         NotifyMappingObserver(*impl->current_page_table, 0, PAGE_TABLE_NUM_ENTRIES);
     }
 }
-
 
 void MemorySystem::MapMemoryRegion(PageTable& page_table, VAddr base, u32 size, MemoryRef target) {
     ASSERT_MSG((size & CITRA_PAGE_MASK) == 0, "non-page aligned size: {:08X}", size);
@@ -1072,8 +1066,8 @@ std::string MemorySystem::ReadCString(VAddr vaddr, std::size_t max_length) {
 }
 
 MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address) {
-    // This lookup runs concurrently on the emulation thread and the render thread. It used to go
-    // through a shared single-entry cache, which one thread could rewrite while the other was
+    // This lookup runs concurrently on the emulation thread and a render thread. A shared
+    // single-entry cache in front of it could be rewritten by one thread while the other was
     // mid-read; the torn result paired one region's backing memory with another region's start,
     // yielding a well-formed pointer into the wrong part of guest RAM. The command-list parser
     // reading one chain segment through such a pointer walked stale bytes, never saw the list's
@@ -1460,8 +1454,7 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
 }
 
 u32 MemorySystem::GetFCRAMOffset(const u8* pointer) const {
-    ASSERT(pointer >= impl->fcram.Data() &&
-           pointer <= impl->fcram.Data() + impl->fcram.Size());
+    ASSERT(pointer >= impl->fcram.Data() && pointer <= impl->fcram.Data() + impl->fcram.Size());
     return static_cast<u32>(pointer - impl->fcram.Data());
 }
 

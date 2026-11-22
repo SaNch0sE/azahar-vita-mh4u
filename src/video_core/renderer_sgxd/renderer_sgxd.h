@@ -7,18 +7,14 @@
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_gxm/gxm_rasterizer.h"
 
-namespace Core {
-class System;
+namespace Pica {
+class PicaCore;
 }
 
 namespace GxmRenderer {
 
-/**
- * The GXM renderer. Presentation is the frontend's: the Vita samples the guest
- * framebuffers in place through its own GXM layer, and asks this renderer where they are.
- * From P4 the answer is the cached surface the display transfer wrote, as a texture, and
- * guest memory only when the cache holds nothing for that framebuffer.
- */
+/// The renderer the Vita frontend presents through. The frontend owns the GXM context and the
+/// display queue; a finished frame is handed to it through the window's SwapBuffers.
 class RendererGxm : public VideoCore::RendererBase {
 public:
     explicit RendererGxm(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window);
@@ -31,14 +27,8 @@ public:
     void SwapBuffers() override;
     void TryPresent(int timeout_ms, bool is_secondary) override {}
 
-    [[nodiscard]] std::optional<VideoCore::GuestFramebuffer> GetGuestFramebuffer(
-        int screen) override;
-
 private:
-    Memory::MemorySystem& memory;
-    Pica::PicaCore& pica;
     RasterizerGxm rasterizer;
-    VideoCore::GuestFramebufferPicker picker;
 };
 
 } // namespace GxmRenderer

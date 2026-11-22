@@ -184,11 +184,9 @@ std::string DescribeLoadError(Core::System::ResultStatus status) {
     }
 }
 
-/// Stops the render thread, releases the GPU's view of guest memory, and shuts the system
-/// down - in that order, because the unmap must run while guest RAM is still allocated and
-/// while no other thread is inside the GXM context.
+/// Releases the GPU's view of guest memory and shuts the system down - in that order, because
+/// the unmap must run while guest RAM is still allocated.
 void ShutdownSystem(Core::System& system) {
-    system.GPU().StopRenderThread();
     VitaFrontend::GxmPresent::UnmapAllGuestMemory();
     system.Shutdown();
 }
@@ -218,9 +216,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     ui.ClearStatusMessage();
 
 #ifdef VITA_DIAGNOSTICS
-    // ux0:data/azahar/autoload.txt names a savestate slot to restore before the render thread
-    // starts, the one moment a load is accepted (saves and loads are refused once the thread
-    // runs). The signal executes at a quiescent point inside RunLoop, so it gets a few slices.
+    // ux0:data/azahar/autoload.txt names a savestate slot to restore before the title runs.
+    // The signal executes at a quiescent point inside RunLoop, so it gets a few slices.
     // States are the same boost archive on every 32-bit build, so a state the pi5 harness
     // saved in a fight, a results screen or a level lands here without the menus.
     if (FILE* f = std::fopen("ux0:data/azahar/autoload.txt", "rb")) {
@@ -240,8 +237,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             const bool async_before = Settings::values.deterministic_async_operations.GetValue();
             Settings::values.deterministic_async_operations = true;
             // The signal becomes a pending request inside the first RunLoop, so the loop
-            // always runs at least once (a pending-only condition ran zero times, and the
-            // load was then refused under the render thread).
+            // always runs at least once (a pending-only condition ran zero times).
             for (int i = 0; i < 200000; i++) {
                 const auto status = system.RunLoop();
                 if (status != Core::System::ResultStatus::Success) {
@@ -263,10 +259,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     }
 #endif
 
-    system.GPU().StartRenderThread();
     ui.EnterGame();
-    // From here the GXM presentation layer belongs to the render thread, which draws the
-    // interface along with the frame it has just finished.
     window.SetUi(&ui);
 
     bool keep_running = true;
@@ -287,16 +280,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 
         if (ui.MenuOpen()) {
             // Emulation does not advance while a menu is up, so no frames arrive to carry a
-            // present: ask the render thread, which owns presentation, for one of its own. Waiting
-            // for it costs nothing here, because nothing is running to be held up.
-            system.GPU().RunOnRenderThread([&] { window.Present(&ui); });
+            // present: make one here.
+            window.Present(&ui);
             const auto action = static_cast<VitaFrontend::Ui::Action>(window.TakeUiAction());
             switch (action) {
             case VitaFrontend::Ui::Action::QuitGame:
                 keep_running = true;
                 window.SetInputToGuest(true);
-                // The render thread is about to stop; take the interface back first, so nothing
-                // there reaches for it while it goes.
                 window.SetUi(nullptr);
                 ShutdownSystem(system);
                 return keep_running;
@@ -327,7 +317,6 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             break;
         }
 
-        // Once a second, the figures the stats window shows. It reads them on the render thread.
         {
             static SceUInt64 last_perf_us = 0;
             const SceUInt64 now_us = sceKernelGetProcessTimeWide();
@@ -354,13 +343,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              perf.time_vblank_interval * 1e3, perf.time_hle_svc * 1e3,
                              perf.time_hle_ipc * 1e3, perf.time_gpu * 1e3, perf.time_swap * 1e3,
                              perf.time_remaining * 1e3);
-                    // The render thread's second, and the core's idle waits for it (ms).
-                    const auto r = system.GPU().TakeRenderStats();
+                    // The GPU's operations and presents in the second (ms).
+                    const auto r = system.GPU().TakeOpStats();
                     LOG_INFO(Frontend,
                              "perf: render work {:.1f} ms in {} ops, present {:.1f} ms in {} "
-                             "({} dropped); idle wait {:.1f} ms in {}",
+                             "({} dropped); waits {} spun into an op, {} slept",
                              r.work_us / 1e3, r.work_ops, r.present_us / 1e3, r.presents,
-                             r.presents_dropped, r.idle_wait_us / 1e3, r.idle_waits);
+                             r.presents_dropped, r.spin_hits, r.spin_misses);
                     LOG_INFO(Frontend,
                              "perf: cmdlist {:.1f} ms in {}, regwrite {:.1f} ms in {}, fill "
                              "{:.1f} ms in {}, transfer {:.1f} ms in {}",
@@ -379,8 +368,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 #endif
             }
         }
-        // Nothing to present from here: a finished frame is presented by the render thread
-        // where it arrives (EmuWindowVita::SwapBuffers), so this thread never waits on one.
+        // Nothing to present from here: the renderer presents each frame it finishes, inside
+        // RunLoop (EmuWindowVita::SwapBuffers).
     }
 
     window.SetUi(nullptr);
@@ -552,7 +541,7 @@ void show_error_dialog(const std::string& message) {
 /// The emulator proper. Runs on a thread of its own; see main.
 int EmulatorMain() {
     // This thread drives the guest (which itself runs on the detached core 2, outside the
-    // system scheduler) and feeds the render thread; RoleCore in common/thread.cpp lays out
+    // system scheduler) and runs the GPU; RoleCore in common/thread.cpp lays out
     // which of the three schedulable cores each host thread gets.
     Common::SetCurrentThreadRole(Common::ThreadRole::Emulation);
 
@@ -565,6 +554,22 @@ int EmulatorMain() {
     if (!VitaFrontend::GxmPresent::Initialize()) {
         LOG_CRITICAL(Frontend, "Could not bring up GXM");
         return -1;
+    }
+
+    SceGxmNotification notification{};
+    notification.address = sceGxmGetNotificationRegion();
+    notification.value = 0;
+    u32 test[1024] = {0};
+    u32 color = 0xdeadbeef;
+    int ret = sceGxmTransferFill(color, SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR, test, 0, 0, 1024, 1,
+                                 1024 * 4, nullptr, 0, &notification);
+    if (ret != SCE_OK) {
+        sceClibPrintf("Couldn't start sceGxmTransferFill %x\n", ret);
+    } else {
+        sceGxmNotificationWait(&notification);
+        for (int i = 0; i < 1024; ++i) {
+            sceClibPrintf("transfer fill %d %x\n", i, test[i]);
+        }
     }
 
     {
@@ -616,6 +621,9 @@ int EmulatorMain() {
         Settings::values.lle_modules.emplace(service_module.name, false);
     }
     Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
+    // Vertex shading happens on the GPU or not at all: with this off, the PICA code would send
+    // every draw down its CPU vertex path, which the sgxd rasterizer does not have.
+    Settings::values.use_hw_shader = true;
     Settings::values.disable_right_eye_render = true;
     Frontend::RegisterDefaultApplets(system);
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());

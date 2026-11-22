@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -46,13 +45,6 @@ public:
     /// fetch, across every range currently mirrored.
     void FlushInstructionCache() const;
 
-    /// Flips the protection of every guest alias of the emulator's host pages [host, host +
-    /// size): the guest write tracker's primitive. Any thread.
-    void ProtectHostRange(const u8* host, std::size_t size, bool read_only);
-    /// The emulator's host page the guest page holding `guest` is mirrored onto, or null.
-    /// Lock-free, for the fault handler.
-    [[nodiscard]] const u8* HostPageOf(VAddr guest) const;
-
     /// Lowest guest address, matching PROCESS_IMAGE_VADDR. Starting here rather than at page zero
     /// keeps the reservation clear of wherever the host loaded this process, and leaves guest null
     /// dereferences faulting.
@@ -89,13 +81,8 @@ private:
     bool usable{};
     /// Guest ranges currently mirrored, keyed by guest base address, and kept disjoint.
     std::map<VAddr, Mapping> live_mappings;
-    /// Guards live_mappings between the emulation thread (mapping changes) and whoever arms
-    /// pages (the render thread, through ProtectHostRange).
+    /// Guards live_mappings.
     mutable std::recursive_mutex mappings_mutex;
-    /// One entry per guest page of the reservation: the emulator's host page it mirrors, or
-    /// null. Kept alongside live_mappings so the fault handler can look up without a lock.
-    std::vector<std::atomic<const u8*>> page_to_host;
-    void SetPageMap(VAddr base, u32 size, const u8* host);
 };
 
 /**

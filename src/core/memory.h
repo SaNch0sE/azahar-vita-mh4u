@@ -12,7 +12,6 @@
 #include <map>
 #include <boost/serialization/vector.hpp>
 #include "common/common_types.h"
-#include "core/guest_write_tracker.h"
 #include "common/memory_ref.h"
 #include "common/swap.h"
 
@@ -324,12 +323,6 @@ class MemorySystem {
 public:
     explicit MemorySystem(Core::System& system);
     ~MemorySystem();
-
-    /// Which pages the guest's CPU has written since the surface cache last looked; see
-    /// guest_write_tracker.h. Present on every build, tracking only where a platform arms it.
-    [[nodiscard]] GuestWriteTracker& WriteTracker() {
-        return *write_tracker;
-    }
 
     /**
      * Registers the observer notified of mapping changes to the active page table. Only one
@@ -854,7 +847,6 @@ private:
 private:
     class Impl;
     std::unique_ptr<Impl> impl;
-    std::unique_ptr<GuestWriteTracker> write_tracker;
 
     friend class boost::serialization::access;
     template <class Archive>

@@ -431,32 +431,6 @@ std::string InputDebugPort::Execute(const std::string& line, EmuWindow_SDL2& win
         return status;
     }
 
-    if (command == "unlimited") {
-        // Runtime speed toggle: "unlimited" or "unlimited off". Lets a run navigate menus at a
-        // usable pace and then measure with the guest uncapped.
-        std::string arg;
-        stream >> arg;
-        const bool on = arg != "off";
-        Core::System::GetInstance().GPU().SetUnlimitedSpeed(on);
-        return on ? "ok unlimited" : "ok paced";
-    }
-
-    if (command == "skip") {
-        std::string arg;
-        stream >> arg;
-        const bool on = arg != "off";
-        Core::System::GetInstance().GPU().SetFrameskipAllowed(on);
-        return on ? "ok skip allowed" : "ok skip off";
-    }
-
-    if (command == "asyncflush") {
-        std::string arg;
-        stream >> arg;
-        const bool on = arg != "off";
-        Core::System::GetInstance().GPU().SetUnsafeAsyncFlush(on);
-        return on ? "ok asyncflush" : "ok syncflush";
-    }
-
 #ifdef CITRA_HAS_NATIVE_ARM
     if (command == "svcring") {
         // svcring [n]: the last n guest system calls (default 64), oldest first. Read on the
@@ -554,22 +528,6 @@ std::string InputDebugPort::Execute(const std::string& line, EmuWindow_SDL2& win
     }
 #endif
 
-    if (command == "lists") {
-        // Last 48 command-list parses, oldest first: address/size, where the parse ended,
-        // and whether the list wrote irq_request, raised P3D, chained, or autostopped.
-        std::ostringstream out;
-        const u32 head = Pica::g_list_ring_head.load(std::memory_order_relaxed);
-        const u32 n = std::min<u32>({head, 48u, static_cast<u32>(Pica::g_list_ring.size())});
-        for (u32 i = 0; i < n; ++i) {
-            const auto& r = Pica::g_list_ring[(head - n + i) % Pica::g_list_ring.size()];
-            out << std::hex << r.addr << "+" << r.size << std::dec << " end=" << r.end_index
-                << "/" << r.end_length << " irqw=" << r.irqw << " p3d=" << r.p3d
-                << " chain=" << r.chains << " stop=" << r.stopped << " lc=" << std::hex
-                << r.last_chain_addr << "+" << r.last_chain_size << std::dec << "\n";
-        }
-        return out.str();
-    }
-
     if (command == "gsp") {
         // Snapshot of the guest/GSP handshake state, for reading at a wedge. The port is polled
         // on the emulation thread, the same thread every GSP shared-page access runs on, so the
@@ -604,20 +562,6 @@ std::string InputDebugPort::Execute(const std::string& line, EmuWindow_SDL2& win
                 out << "]";
             }
         }
-        out << " pica[cl=" << Pica::g_pica_probe[0].load()
-            << " irqw=" << Pica::g_pica_probe[1].load()
-            << " p3d=" << Pica::g_pica_probe[2].load()
-            << " nomatch=" << Pica::g_pica_probe[3].load()
-            << " chain=" << Pica::g_pica_probe[4].load()
-            << " stop=" << Pica::g_pica_probe[5].load() << "]";
-        out << " probe[pdc=" << Service::GSP::g_gsp_probe[0].load()
-            << " ign=" << Service::GSP::g_gsp_probe[1].load()
-            << " pq=" << Service::GSP::g_gsp_probe[2].load()
-            << " miss=" << Service::GSP::g_gsp_probe[3].load()
-            << " oq=" << Service::GSP::g_gsp_probe[4].load()
-            << " nosess=" << Service::GSP::g_gsp_probe[5].load()
-            << " noevt=" << Service::GSP::g_gsp_probe[6].load()
-            << " full=" << Service::GSP::g_gsp_probe[7].load() << "]";
         for (u32 core = 0; core < system.GetNumCores(); ++core) {
             for (const auto& t : system.Kernel().GetThreadManager(core).GetThreadList()) {
                 out << "\nT" << t->thread_id << " core" << core << " prio" << t->current_priority

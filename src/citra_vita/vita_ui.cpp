@@ -17,7 +17,6 @@
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/core.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
 
 namespace VitaFrontend {
 
@@ -348,10 +347,8 @@ Ui::Action Ui::DrawPauseMenu() {
     }
 #ifdef VITA_DIAGNOSTICS
     if (ImGui::Button("Dump frame", button_size)) {
-        // The next presented frame, screens only, to ux0:data/azahar/frame_NN.ppm, and every
-        // surface the cache holds at that frame's end to ux0:data/azahar/dump/.
+        // The next presented frame, without the menu, to ux0:data/azahar/frame_NN.ppm.
         GxmPresent::DumpNextFrame();
-        GxmRenderer::RequestSurfaceDump();
     }
 #endif
     if (ImGui::Button("Quit game", button_size)) {
@@ -435,9 +432,8 @@ void Ui::DrawStatusMessage() {
 
 void Ui::DrawStatsHud() {
     // Top right, every frame while a title runs. A few text lines of ImGui, so a few hundred
-    // vertices; `nostats` hides it.
-    static const bool off = GxmRenderer::GxmFlag("nostats");
-    if (off || !HudStats::valid.load(std::memory_order_acquire)) {
+    // vertices.
+    if (!HudStats::valid.load(std::memory_order_acquire)) {
         return;
     }
     using namespace HudStats;

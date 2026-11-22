@@ -9,9 +9,8 @@
 #include "common/common_types.h"
 
 /**
- * The numbers the on-screen stats window shows, published once a second by the emulation
- * thread from the core's perf stats, read by the render thread when it draws the interface.
- * Plain atomics, so neither side waits on the other.
+ * The numbers the on-screen stats window shows, published once a second by the run loop
+ * from the core's perf stats and read when the interface is drawn.
  */
 namespace VitaFrontend::HudStats {
 

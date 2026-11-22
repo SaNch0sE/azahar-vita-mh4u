@@ -2,14 +2,21 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
-#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <psp2/gxm.h>
-#include "video_core/renderer_gxm/gxm_device.h"
-#include "video_core/renderer_gxm/gxm_stub/gxm_stub.h"
+
+/**
+ * A libgxm with no GPU behind it, for profiling the GXM renderer's CPU work off the console
+ * (ENABLE_GXM_STUB). Every sceGxm* call the renderer makes is here: state
+ * setters and draws do nothing, scenes complete the moment they end (the notification is
+ * written in sceGxmEndScene), and programs are real GXP blobs from the USSE emitters whose
+ * parameter tables are parsed for real. The render thread runs
+ * every line it runs on the Vita except the ones inside libgxm, so a profiler on the host
+ * sees the state translation, the caches, the uniform packing and the emitters with symbols.
+ * Nothing is presented.
+ */
 
 namespace {
 
@@ -82,65 +89,6 @@ void* ReserveUniforms() {
     return slot;
 }
 
-// Device memory: malloc, 4 KiB aligned like the console's memblocks. A generous frame arena
-// wraps; with no GPU reading behind the CPU, wrapping over an older frame is harmless.
-constexpr uint32_t FrameArenaBytes = 64u << 20;
-uint8_t* frame_arena = nullptr;
-uint32_t frame_arena_used = 0;
-std::mutex device_mutex;
-
-void* AllocBlock(uint32_t size) {
-    void* block = nullptr;
-    if (posix_memalign(&block, 4096, size == 0 ? 4096 : size) != 0) {
-        return nullptr;
-    }
-    return block;
-}
-
-void* FrameAlloc(uint32_t size, uint32_t align) {
-    std::scoped_lock lock{device_mutex};
-    if (frame_arena == nullptr) {
-        frame_arena = static_cast<uint8_t*>(AllocBlock(FrameArenaBytes));
-    }
-    const uint32_t a = align == 0 ? 16 : align;
-    uint32_t at = (frame_arena_used + a - 1) & ~(a - 1);
-    if (at + size > FrameArenaBytes) {
-        at = 0;
-    }
-    frame_arena_used = at + size;
-    return frame_arena + at;
-}
-
-uint32_t LargestFree(bool) {
-    // No pool to ask, and malloc rarely refuses. Report the console's CDRAM pool so the
-    // default surface trim (headroom under 12 MB) does not run every frame here: with 0
-    // it trimmed the Smash title's textures each frame and the stub reloaded 352 KiB a
-    // frame that the console never would (2026-09-07). `smallcache` still forces it.
-    return 64u * 1024u * 1024u;
-}
-
-void FreeBlock(void* block) {
-    std::free(block);
-}
-
-volatile uint32_t notifications[512];
-std::atomic<uint32_t> notifications_used{0};
-
-volatile uint32_t* AllocNotification() {
-    const uint32_t i = notifications_used.fetch_add(1);
-    return i < 512 ? &notifications[i] : nullptr;
-}
-
-// The opaque objects. libgxm's are private; ours only need to be distinct non-null pointers.
-struct StubContext {
-    int unused;
-};
-struct StubPatcher {
-    int unused;
-};
-StubContext stub_context;
-StubPatcher stub_patcher;
-
 struct StubVertexProgram {
     const SceGxmProgram* program;
 };
@@ -152,25 +100,6 @@ struct StubRenderTarget {
 };
 
 } // namespace
-
-namespace GxmStub {
-
-void InstallDevice() {
-    GxmRenderer::SetDevice(GxmRenderer::GxmDevice{
-        .context = reinterpret_cast<SceGxmContext*>(&stub_context),
-        .patcher = reinterpret_cast<SceGxmShaderPatcher*>(&stub_patcher),
-        .alloc_mapped = AllocBlock,
-        .alloc_mapped_cached = AllocBlock,
-        .alloc_cdram = AllocBlock,
-        .largest_free = LargestFree,
-        .frame_alloc = FrameAlloc,
-        .free_block = FreeBlock,
-        .alloc_notification = AllocNotification,
-        .razor = false,
-    });
-}
-
-} // namespace GxmStub
 
 extern "C" {
 

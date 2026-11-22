@@ -2,7 +2,6 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -50,38 +49,6 @@ const std::vector<std::string>& Flags() {
 #endif
 
 } // Anonymous namespace
-
-namespace {
-std::atomic<bool> surface_dump_requested{false};
-}
-
-void RequestSurfaceDump() {
-    surface_dump_requested.store(true, std::memory_order_relaxed);
-}
-
-bool SurfaceDumpPending() {
-    return surface_dump_requested.load(std::memory_order_relaxed);
-}
-
-bool TakeSurfaceDumpRequest() {
-    return surface_dump_requested.exchange(false, std::memory_order_relaxed);
-}
-
-namespace {
-void (*surface_dump_hook)(void*) = nullptr;
-void* surface_dump_user = nullptr;
-} // namespace
-
-void SetSurfaceDumpHook(void (*hook)(void*), void* user) {
-    surface_dump_hook = hook;
-    surface_dump_user = user;
-}
-
-void RunSurfaceDumpIfRequested() {
-    if (surface_dump_hook != nullptr && TakeSurfaceDumpRequest()) {
-        surface_dump_hook(surface_dump_user);
-    }
-}
 
 bool GxmFlag(const char* name) {
 #ifdef VITA_DIAGNOSTICS

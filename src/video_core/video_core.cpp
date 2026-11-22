@@ -25,10 +25,6 @@
 
 namespace VideoCore {
 
-void (*surface_dump_hook)(void* user, const char* dir) = nullptr;
-void* surface_dump_user = nullptr;
-
-
 std::unique_ptr<RendererBase> CreateRenderer(Frontend::EmuWindow& emu_window,
                                              Frontend::EmuWindow* secondary_window,
                                              Pica::PicaCore& pica, Core::System& system) {

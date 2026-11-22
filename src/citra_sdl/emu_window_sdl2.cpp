@@ -656,8 +656,8 @@ void EmuWindow_SDL2::ReleaseTouch() {
 }
 
 void EmuWindow_SDL2::Present() {
-    // The render thread owns the presentation target under both renderers and presents after
-    // each SwapBuffers op; there is nothing left for the main loop to do here.
+    // The emulation thread presents in each SwapBuffers, at the GPU's VBlank; there is nothing
+    // left for the main loop to do here.
 }
 
 bool EmuWindow_SDL2::SaveScreenshot(const std::string& path) {
@@ -666,16 +666,10 @@ bool EmuWindow_SDL2::SaveScreenshot(const std::string& path) {
         if (!system.IsPoweredOn()) {
             return false;
         }
-        // The renderer's screen buffers belong to the render thread, which rewrites them (and
-        // reallocates them - ScreenInfo::pixels is resized per frame) inside every present.
-        // Composing them from this thread reads a vector mid-reallocation: the frame comes out
-        // sheared, with one screen's rows carrying the other screen's pixels. Compose where the
-        // buffers live instead.
+        // Called between RunLoop slices, on the thread that presents: the renderer's screen
+        // buffers are not being rewritten under it.
         std::vector<u8> canvas;
-        bool composed = false;
-        system.GPU().RunOnRenderThread(
-            [&] { composed = ComposeSoftwareFrame(system, canvas); });
-        if (!composed) {
+        if (!ComposeSoftwareFrame(system, canvas)) {
             return false;
         }
         std::FILE* file = std::fopen(path.c_str(), "wb");

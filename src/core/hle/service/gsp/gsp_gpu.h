@@ -5,7 +5,6 @@
 #pragma once
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -32,12 +31,6 @@ class SharedMemory;
 } // namespace Kernel
 
 namespace Service::GSP {
-
-/// Submitted command lists; the status line reports it so a wedge is visible without screenshots.
-extern std::atomic<u64> g_gx_cmdlists;
-
-/// Interrupt-delivery branch counters, see ProcessPendingInterruptImpl.
-extern std::array<std::atomic<u64>, 8> g_gsp_probe;
 
 struct FrameBufferInfo {
     static constexpr u32 PIXEL_FORMAT_MASK = 0x7;

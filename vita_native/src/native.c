@@ -559,8 +559,7 @@ static void core2_run(void) {
         // instructions through its own view and this core may have executed different code at
         // the address before. PROTECT and SYNC_CODE came later and the blanket was never
         // narrowed. A permission change moves no memory and rewrites no instruction, so the
-        // instruction cache and the branch predictor are still correct for it, and the guest
-        // write tracker makes one of those edits per armed run of pages.
+        // instruction cache and the branch predictor are still correct for it.
         asm volatile("dsb                       \n"
                      "mcr p15, 0, %0, c8, c7, 0 \n" // TLBIALL
                      :
@@ -1721,7 +1720,7 @@ int azaharEdit(const AzaharEditRequest *user_req) {
     }
     const AzaharRange *rg = &azahar_edit_req.range;
     const uint32_t op = azahar_edit_req.op;
-    /* PROTECT comes per armed page from the guest write tracker: logged only when it fails */
+    /* SYNC_CODE and PROTECT can come many times a second: logged only when they fail */
     quiet = op == AZAHAR_EDIT_SYNC_CODE || op == AZAHAR_EDIT_PROTECT;
     if (!quiet)
         emit("== azaharEdit %s guest %08x user %08x size %08x\n",
@@ -1802,9 +1801,8 @@ int azaharEdit(const AzaharEditRequest *user_req) {
         // memory and our TTBR0 keeps Sony's own walk attributes (core2_install takes the low
         // fourteen bits of the kernel's), so the table walker reads them coherently, the way
         // the kernel's own tables are read: it edits those constantly and cleans nothing.
-        // This used to clean the whole array on every call, 256 KB of descriptors plus 16 KB
-        // of the top level, whatever the edit had touched, and the guest write tracker makes
-        // one call per armed run of pages, hundreds of times a second.
+        // Cleaning the whole array on every call would be 256 KB of descriptors plus 16 KB of
+        // the top level, whatever the edit had touched.
         asm volatile("dsb" ::: "memory");
         azahar_tlb_dirty = 1;
         if (op != AZAHAR_EDIT_PROTECT) {

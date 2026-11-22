@@ -2,7 +2,6 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
-#include "common/math_util.h"
 #include <array>
 #include <cmath>
 #include "video_core/renderer_software/sw_proctex.h"
@@ -94,7 +93,7 @@ void ClampCoord(float& coord, ProcTexClamp mode) {
         coord = std::min(coord, 1.0f);
         break;
     case ProcTexClamp::SymmetricalRepeat:
-        coord = coord - Common::FastFloor(coord);
+        coord = coord - std::floor(coord);
         break;
     case ProcTexClamp::MirroredRepeat: {
         int integer = static_cast<int>(coord);

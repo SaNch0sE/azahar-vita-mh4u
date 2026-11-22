@@ -3,8 +3,6 @@
 // Refer to the license.txt file included.
 
 #include "core/arm/native/native_executor.h"
-#include "core/arm/native/native_mirror.h"
-#include "core/guest_write_tracker.h"
 
 #include <algorithm>
 #include <atomic>
@@ -158,28 +156,8 @@ void HandleSigsys(int, siginfo_t*, void* ucv) {
     ExitGuest(uc, NativeExitReason::Svc);
 }
 
-/// The guest write tracker and the mirror it looks up guest pages through; set by
-/// NativeSetWriteTracking, read by the fault handler.
-Memory::GuestWriteTracker* g_write_tracker = nullptr;
-const NativeAddressSpaceMirror* g_write_mirror = nullptr;
-
-void UnprotectGuestPage(void* ctx) {
-    const auto page = reinterpret_cast<std::uintptr_t>(ctx) & ~std::uintptr_t{4095};
-    mprotect(reinterpret_cast<void*>(page), 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
-}
-
 void HandleFault(int sig, siginfo_t* info, void* ucv) {
     auto* uc = static_cast<ucontext_t*>(ucv);
-    if (sig == SIGSEGV && t_state.in_guest && g_write_tracker != nullptr &&
-        g_write_mirror != nullptr) {
-        // A store into a page the surface cache armed: record it, make the page writable and
-        // let the store retry. Not a guest exception.
-        const auto guest = reinterpret_cast<std::uintptr_t>(info->si_addr);
-        const u8* host = g_write_mirror->HostPageOf(static_cast<VAddr>(guest));
-        if (host != nullptr && g_write_tracker->OnFault(host, UnprotectGuestPage, info->si_addr)) {
-            return;
-        }
-    }
     if (!t_state.in_guest || !InterruptedInGuest(uc)) {
         // Not the guest's fault: restore the default action and let it crash normally, so the
         // backtrace points at the real culprit instead of at us.
@@ -209,16 +187,6 @@ void HandlePreemption(int, siginfo_t*, void* ucv) {
                       ? NativeExitReason::Interrupted
                       : NativeExitReason::Preempted);
 }
-
-} // namespace
-
-void NativeSetWriteTracking(const NativeAddressSpaceMirror* mirror,
-                            Memory::GuestWriteTracker* tracker) {
-    g_write_mirror = mirror;
-    g_write_tracker = tracker;
-}
-
-namespace {
 
 bool InstallSignalHandlers() {
     // Guest code runs with a guest stack pointer, so signal frames must not be pushed onto it.

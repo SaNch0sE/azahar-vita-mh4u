@@ -85,23 +85,6 @@ ARM_Native::ARM_Native(Core::System& system_, Memory::MemorySystem& memory_, u32
     // timeslices them onto a single host thread. Every core can therefore execute natively against
     // the one mirror.
     usable = mirror != nullptr && mirror->IsUsable();
-    // Guest write tracking (core/guest_write_tracker.h): pages the surface cache arms fault on
-    // the guest's first store. Opt-in while it is being proven: AZAHAR_WRITE_TRACK=1.
-    static const bool track_writes = std::getenv("AZAHAR_WRITE_TRACK") != nullptr;
-    if (usable && track_writes) {
-        auto& tracker = memory.WriteTracker();
-        std::shared_ptr<NativeAddressSpaceMirror> mirror_ref = mirror;
-        tracker.SetProtect([mirror_ref](const u8* host, std::size_t size, bool read_only) {
-            mirror_ref->ProtectHostRange(host, size, read_only);
-        });
-        NativeSetWriteTracking(mirror.get(), &tracker);
-        // AZAHAR_WRITE_TRACK_HOT=0 keeps faulting on pages written every frame (A/B).
-        if (const char* hot = std::getenv("AZAHAR_WRITE_TRACK_HOT"); hot != nullptr) {
-            tracker.SetHotPages(hot[0] != '0');
-        }
-        tracker.SetEnabled(true);
-        LOG_INFO(Core_ARM11, "Native backend: guest write tracking on");
-    }
 }
 
 ARM_Native::~ARM_Native() {
