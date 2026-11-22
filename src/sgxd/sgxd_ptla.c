@@ -274,12 +274,12 @@ static unsigned copy_blit(SgxdOp *ops, const SgxdPtlaCopy *c, uint32_t x, uint32
         W(EVENT_HOST_CLEAR, TWOD_COMPLETE),
         W(PTLA_CMD, surf(SRC_SURF, c->format, c->stride)),
         W(PTLA_CMD, c->src),
-        W(PTLA_CMD, SRCOFF | xy(x, y)),
+        W(PTLA_CMD, SRCOFF | xy(c->src_x + x, y)),
         W(PTLA_CMD, xy(w, h)),
         W(PTLA_CMD, surf(DST_SURF, c->format, c->dst_stride ? c->dst_stride : c->stride)),
         W(PTLA_CMD, c->dst),
         W(PTLA_CMD, BLIT),
-        W(PTLA_CMD, xy(x, y)),
+        W(PTLA_CMD, xy(c->dst_x + x, y)),
         W(PTLA_CMD, xy(w, h)),
         W(PTLA_CMD, FLUSH),
         P(EVENT_STATUS, TWOD_COMPLETE, TWOD_COMPLETE, TWOD_POLL_US),
@@ -383,6 +383,7 @@ int sgxd_ptla_fill(const SgxdPtlaFill *f, uint32_t *elapsed_us, char *failed,
 int sgxd_ptla_copy(const SgxdPtlaCopy *c, uint32_t *elapsed_us, char *failed,
                    unsigned failed_size) {
     if (c->width == 0 || c->width > SGXD_PTLA_MAX_EXTENT || c->rows > SGXD_PTLA_MAX_EXTENT ||
+        c->src_x + c->width > SGXD_PTLA_MAX_EXTENT || c->dst_x + c->width > SGXD_PTLA_MAX_EXTENT ||
         c->tail >= c->width || c->stride == 0 || c->stride > 0xffffu || c->dst_stride > 0xffffu ||
         (c->rows == 0 && c->tail == 0)) {
         snprintf(failed, failed_size,

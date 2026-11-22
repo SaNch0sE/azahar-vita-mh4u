@@ -13,7 +13,6 @@
 #include <limits>
 #include <span>
 #include <string>
-#include <string_view>
 #include <fmt/ranges.h>
 #include <nihstro/shader_bytecode.h>
 #include "common/alignment.h"
@@ -562,62 +561,80 @@ void PutVec(float* out, const float* values, u32 count) {
     std::memcpy(out, values, count * sizeof(float));
 }
 
-/// Where the fragment uniform `name` (fs_usse_gen's PlanUniforms names) is in FSUniformData:
-/// its byte offset and whether it holds ints, which the program reads as floats.
+/// A fragment uniform's byte offset in FSUniformData, and whether it holds ints.
 struct UniformField {
     std::size_t offset;
     bool is_int;
 };
 
-UniformField FragmentUniformField(const std::string& n) {
+UniformField FragmentUniformField(const Usse::GxpUniform& u) {
     using D = Pica::Shader::Generator::FSUniformData;
     using L = Pica::Shader::Generator::LightSrc;
-#define FIELD(name, is_int)                                                                        \
-    if (n == #name) {                                                                              \
-        return {offsetof(D, name), is_int};                                                        \
+    using K = Usse::UniformKind;
+    DEBUG_ASSERT(u.index < 8);
+    const std::size_t light = offsetof(D, light_src) + u.index * sizeof(L);
+    switch (u.kind) {
+    case K::AlphaTestRef:
+        return {offsetof(D, alphatest_ref), true};
+    case K::ConstColor:
+        return {offsetof(D, const_color), false};
+    case K::BufferColor:
+        return {offsetof(D, tev_combiner_buffer_color), false};
+    case K::ScissorX1:
+        return {offsetof(D, scissor_x1), true};
+    case K::ScissorY1:
+        return {offsetof(D, scissor_y1), true};
+    case K::ScissorX2:
+        return {offsetof(D, scissor_x2), true};
+    case K::ScissorY2:
+        return {offsetof(D, scissor_y2), true};
+    case K::FogLutOffset:
+        return {offsetof(D, fog_lut_offset), true};
+    case K::FogColor:
+        return {offsetof(D, fog_color), false};
+    case K::TexBorderColor:
+        return {offsetof(D, tex_border_color), false};
+    case K::ProctexLutOffset:
+        return {offsetof(D, proctex_lut_offset), true};
+    case K::ProctexDiffLutOffset:
+        return {offsetof(D, proctex_diff_lut_offset), true};
+    case K::ProctexColorMapOffset:
+        return {offsetof(D, proctex_color_map_offset), true};
+    case K::ProctexAlphaMapOffset:
+        return {offsetof(D, proctex_alpha_map_offset), true};
+    case K::ProctexBias:
+        return {offsetof(D, proctex_bias), false};
+    case K::ProctexNoiseLutOffset:
+        return {offsetof(D, proctex_noise_lut_offset), true};
+    case K::ProctexNoiseF:
+        return {offsetof(D, proctex_noise_f), false};
+    case K::ProctexNoiseA:
+        return {offsetof(D, proctex_noise_a), false};
+    case K::ProctexNoiseP:
+        return {offsetof(D, proctex_noise_p), false};
+    case K::LightingLutOffset:
+        return {offsetof(D, lighting_lut_offset), true};
+    case K::LightingGlobalAmbient:
+        return {offsetof(D, lighting_global_ambient), false};
+    case K::LightSpecular0:
+        return {light + offsetof(L, specular_0), false};
+    case K::LightSpecular1:
+        return {light + offsetof(L, specular_1), false};
+    case K::LightDiffuse:
+        return {light + offsetof(L, diffuse), false};
+    case K::LightAmbient:
+        return {light + offsetof(L, ambient), false};
+    case K::LightPosition:
+        return {light + offsetof(L, position), false};
+    case K::LightSpotDirection:
+        return {light + offsetof(L, spot_direction), false};
+    case K::LightDistAttenBias:
+        return {light + offsetof(L, dist_atten_bias), false};
+    case K::LightDistAttenScale:
+        return {light + offsetof(L, dist_atten_scale), false};
+    default:
+        UNREACHABLE_MSG("sgxd: the fragment uniform {} has no value", Usse::UniformName(u));
     }
-    FIELD(alphatest_ref, true)
-    FIELD(const_color, false)
-    FIELD(tev_combiner_buffer_color, false)
-    FIELD(scissor_x1, true)
-    FIELD(scissor_y1, true)
-    FIELD(scissor_x2, true)
-    FIELD(scissor_y2, true)
-    FIELD(fog_lut_offset, true)
-    FIELD(fog_color, false)
-    FIELD(tex_border_color, false)
-    FIELD(proctex_lut_offset, true)
-    FIELD(proctex_diff_lut_offset, true)
-    FIELD(proctex_color_map_offset, true)
-    FIELD(proctex_alpha_map_offset, true)
-    FIELD(proctex_bias, false)
-    FIELD(proctex_noise_lut_offset, true)
-    FIELD(proctex_noise_f, false)
-    FIELD(proctex_noise_a, false)
-    FIELD(proctex_noise_p, false)
-    FIELD(lighting_lut_offset, true)
-    FIELD(lighting_global_ambient, false)
-#undef FIELD
-    unsigned light = 0;
-    char member[32] = "";
-    if (std::sscanf(n.c_str(), "light_src[%u].%31s", &light, member) == 2 && light < 8) {
-        const std::size_t base = offsetof(D, light_src) + light * sizeof(L);
-        const std::string_view m = member;
-#define MEMBER(name)                                                                               \
-    if (m == #name) {                                                                              \
-        return {base + offsetof(L, name), false};                                                  \
-    }
-        MEMBER(specular_0)
-        MEMBER(specular_1)
-        MEMBER(diffuse)
-        MEMBER(ambient)
-        MEMBER(position)
-        MEMBER(spot_direction)
-        MEMBER(dist_atten_bias)
-        MEMBER(dist_atten_scale)
-#undef MEMBER
-    }
-    UNREACHABLE_MSG("GXM: the fragment uniform {} has no value", n);
 }
 
 } // Anonymous namespace
@@ -722,7 +739,15 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
 #endif
     using Pica::PixelFormat;
     const PAddr input = config.GetPhysicalInputAddress();
-    const PAddr output = config.GetPhysicalOutputAddress();
+    // Flipped and cropped, the PICA places the output's last row as if its rows were input_width
+    // apart: the output starts that much later, and games aim before their buffer for it.
+    const bool skewed = config.flip_vertically && config.crop_input_lines &&
+                        config.input_width > config.output_width;
+    const PAddr output =
+        config.GetPhysicalOutputAddress() +
+        (skewed ? (config.input_width - config.output_width) * (config.output_height - 1) *
+                      Pica::BytesPerPixel(config.output_format)
+                : 0);
     // ScaleX halves the output's width, ScaleXY its height too (each output pixel the average of 2
     // or 2 x 2); output_width/height count the input's pixels.
     const u32 scale_x = config.scaling != config.NoScale ? 2 : 1;
@@ -810,19 +835,44 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
                      "of whole tiles",
                      describe(), in_width, in_height);
 
-    // The surface's row y is the PICA's row y. The PICA's RGB8 is B, G, R in memory, gxm's
-    // U8U8U8_RGB store. Guest memory is mapped for the GPU at its PICA address; VRAM, and
-    // FCRAM moved to CDRAM (GuestGpuMemory), is uncached and needs no cache work.
+    // The output: guest memory mapped for the GPU at its PICA address (VRAM, and FCRAM moved to
+    // CDRAM before the op), uncached.
     u8* const out = memory.GetPhysicalPointer(output);
-    const bool cached = fcram && !guest_memory.IsUncached(output, bytes);
-    if (fcram && !cached) {
-        SgxdCacheSkipped(CacheSite::TransferBefore, bytes);
-        SgxdCacheSkipped(CacheSite::TransferAfter, bytes);
-    }
-    const SgxdBackend::Store store{output, cached ? out : nullptr, cached ? bytes : 0,
-                                   SGXD_RECIPE_PACK_U888_RGB};
+    ASSERT_MSG(!fcram || guest_memory.IsUncached(output, bytes),
+               "sgxd: AccelerateDisplayTransfer {}: the output {:#x}-{:#x} is FCRAM the CPU "
+               "caches; moving it to CDRAM before the transfer is not built",
+               describe(), output, output + bytes);
     u32 ta_us = 0, d3_us = 0;
-    backend.Blit(source->memory, width, height, store, &ta_us, &d3_us);
+    if (!guest_memory.IsUncached(input, in_bytes)) {
+        SgxdCacheRange(memory.GetPhysicalPointer(input), in_bytes, SGXD_CACHE_CLEAN,
+                       CacheSite::Textures);
+    }
+    if (tiled_out || linear_in) {
+        if (backend.InPass()) {
+            EndPass("a tiled display transfer");
+        }
+        const ColourBuffer target{output, width, height,
+                                  static_cast<FramebufferRegs::ColorFormat>(
+                                      static_cast<u32>(config.output_format.Value())),
+                                  out_format.bytes};
+        const SgxdBackend::UntileSource source{input,  in_width, in_height, f.bits,
+                                               f.code, f.swizzle, 0};
+        if (linear_in) {
+            backend.TransferLinearToTiled(PicaTargetFor(target, "a linear display transfer"),
+                                          source, config.flip_vertically != 0, &ta_us, &d3_us);
+        } else {
+            backend.TransferTiledFromGuest(PicaTargetFor(target, "a tiled display transfer"),
+                                           source, scale_x, scale_y, &ta_us, &d3_us);
+        }
+    } else {
+        backend.TransferFromGuest({input, in_width, in_height, f.bits, f.code, f.swizzle, 0},
+                                  output, width, height, out_format.pack, out_format.mirror, &ta_us,
+                                  &d3_us, scale_x, scale_y);
+    }
+#ifdef VITA_DIAGNOSTICS
+    PerflogTransfer(input, in_width, in_height, output, width, height, scale_x, scale_y, ta_us,
+                    d3_us);
+#endif
     TexturesWritten(output, output + bytes);
     DepthStoresWritten(output, output + bytes);
     // The blit's 3D stays pending, as a pass's does: the next list finishes it. Whatever waits on the
@@ -1046,11 +1096,14 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     };
     const bool src_fcram = inside(src, size, Memory::FCRAM_PADDR, Memory::FCRAM_SIZE);
     const bool dst_fcram = inside(dst, dst_size, Memory::FCRAM_PADDR, Memory::FCRAM_SIZE);
-    ASSERT_MSG(src % 4 == 0 && dst % 4 == 0 && size > 0 &&
-                   (!strided || (line % 4 == 0 && src_stride % 4 == 0 && dst_stride % 4 == 0 &&
-                                 line / 4 <= 4096)),
-               "sgxd: AccelerateDma {}: only word-aligned copies are built", describe());
-    const u32 tail = size % 4;
+    // The PTLA copies 8888 words exactly; a size that is no whole number of words has its last 1-3
+    // bytes copied by the CPU. A copy from or to an address no word starts at goes as U8 pixels.
+    const bool bytes = !strided && size > 0 && (src % 4 != 0 || dst % 4 != 0);
+    ASSERT_MSG(bytes || (src % 4 == 0 && dst % 4 == 0 && size > 0 &&
+                         (!strided || (line % 4 == 0 && src_stride % 4 == 0 &&
+                                       dst_stride % 4 == 0 && line / 4 <= 4096))),
+               "sgxd: AccelerateDma {}: only word-aligned lines are built", describe());
+    const u32 tail = bytes ? 0 : size % 4;
     // A range past guest FCRAM or VRAM reaches whatever the GPU has mapped after it.
     ASSERT_MSG((src_fcram || inside(src, size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)) &&
                    (dst_fcram || inside(dst, dst_size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)),
@@ -2579,8 +2632,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     }
     {
         const auto& ag = a0.vp->gxp;
-        const auto out = std::find_if(ag.attributes.begin(), ag.attributes.end(),
-                                      [](const auto& a) { return a.name == "vs_out_address"; });
+        const auto out = std::find_if(ag.attributes.begin(), ag.attributes.end(), [](const auto& a) {
+            return a.kind == Usse::AttributeKind::OutAddress;
+        });
         DEBUG_ASSERT(out != ag.attributes.end() && a0.fetch_count < a0.fetch.size());
         a0.fetch[a0.fetch_count++] = {a0_table.gpu, 4, 1, out->resource};
         a0.fresh = true;
@@ -2703,7 +2757,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     // Invocations [first, first + n) with program gp, padded to whole triangles with the last again.
     const auto run_invocations = [&](const VertexProgram& gp, u32 first, u32 n) {
         const auto in = std::find_if(gp.gxp.attributes.begin(), gp.gxp.attributes.end(),
-                                     [](const auto& a) { return a.name == "gs_in_rows"; });
+                                     [](const auto& a) {
+                                         return a.kind == Usse::AttributeKind::GsInRows;
+                                     });
         DEBUG_ASSERT(in != gp.gxp.attributes.end());
         VertexStage a1{};
         a1.vp = &gp;
@@ -3041,22 +3097,7 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
     const Usse::GxpProgram& g = f.gxp;
     // A second phase (a kill or a depth write) gets its address into the first phase's PHAS
     // where the code is placed (SgxdBackend::PlaceCodePhased), as libgxm's patcher relocates it.
-    // The texture units' samplers, the lighting and fog LUT's (SyncLutLf) and the proctex
-    // LUTs' are built.
-    for (const Usse::GxpSampler& sampler : g.samplers) {
-        if (sampler.name != "texture_buffer_lut_lf" && sampler.name != "texture_buffer_lut_rg" &&
-            sampler.name != "texture_buffer_lut_rgba" && sampler.name != "proctex_noise" &&
-            sampler.name != "tex0" && sampler.name != "tex1" && sampler.name != "tex2" &&
-            sampler.name != "tex0a" && sampler.name != "tex1a" && sampler.name != "tex2a") {
-            std::string names;
-            for (const Usse::GxpSampler& s : g.samplers) {
-                names += fmt::format(" {} (unit {})", s.name, s.unit);
-            }
-            UNREACHABLE_MSG("GXM: a fragment program with samplers:{}; only the textures and "
-                            "the LUTs are built",
-                            names);
-        }
-    }
+
     // SMP reads its four state words as two pairs: with memory uniforms the resident count is odd and
     // the buffer pointer makes it even.
     DEBUG_ASSERT(g.samplers.empty() ||
@@ -3068,7 +3109,7 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
         // Resident, or in the memory buffer (FragmentSa) at the same float index.
         DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <=
                      (g.buffer_pointer ? g.buffer_floats : g.uniform_floats));
-        const UniformField field = FragmentUniformField(u.name);
+        const UniformField field = FragmentUniformField(u);
         f.uniforms.push_back({u.sa_offset, static_cast<u16>(field.offset),
                               static_cast<u8>(u.components), static_cast<u8>(u.array_size), 16,
                               field.is_int});
@@ -5201,36 +5242,41 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         const Texture* unit_texture[3] = {};
         u32 unit_words[3][4];
         for (size_t i = 0; i < fg.samplers.size(); i++) {
-            const std::string& name = fg.samplers[i].name;
+            const Usse::GxpSampler& sampler = fg.samplers[i];
             u32 words[4];
-            if (name == "tex0" || name == "tex1" || name == "tex2") {
-                const u32 unit = fg.samplers[i].unit;
-                unit_texture[unit] = &TextureWords(unit, words);
-                std::memcpy(unit_words[unit], words, sizeof(words));
-            } else if (name == "tex0a" || name == "tex1a" || name == "tex2a") {
+            switch (sampler.kind) {
+            case Usse::SamplerKind::Texture:
+                unit_texture[sampler.index] = &TextureWords(sampler.index, words);
+                std::memcpy(unit_words[sampler.index], words, sizeof(words));
+                break;
+            case Usse::SamplerKind::TextureAlpha:
                 // After the unit's own sampler (PlanInputs puts it last).
-                const u32 unit = fg.samplers[i].unit - 7;
-                DEBUG_ASSERT(unit_texture[unit] != nullptr);
-                AlphaTextureWords(*unit_texture[unit], unit_words[unit], words);
-            } else if (name == "texture_buffer_lut_rg") {
+                DEBUG_ASSERT(unit_texture[sampler.index] != nullptr);
+                AlphaTextureWords(*unit_texture[sampler.index], unit_words[sampler.index], words);
+                break;
+            case Usse::SamplerKind::LutRg:
                 sgxd_recipe_texture_words_format(backend.LutRgRows().gpu,
                                                  Pica::Shader::LUT_TEX_WIDTH,
                                                  Pica::Shader::LUT_RG_ROWS, 0, LutFormatF32F32, 0,
                                                  words);
-            } else if (name == "proctex_noise") {
+                break;
+            case Usse::SamplerKind::ProctexNoise:
                 // F16x4, bilinear: NoiseTable's texels.
                 sgxd_recipe_texture_words_format(NoiseTable(), 256, 256, 1, LutFormatF16x4, 0,
                                                  words);
-            } else if (name == "texture_buffer_lut_rgba") {
+                break;
+            case Usse::SamplerKind::LutRgba:
                 sgxd_recipe_texture_words_format(backend.LutRgbaRows().gpu,
                                                  Pica::Shader::LUT_TEX_WIDTH,
                                                  Pica::Shader::LUT_RGBA_ROWS, 0, LutFormatF16x4, 0,
                                                  words);
-            } else {
+                break;
+            case Usse::SamplerKind::LutLf:
                 sgxd_recipe_texture_words_format(backend.LutRows().gpu,
                                                  Pica::Shader::LUT_TEX_WIDTH,
                                                  Pica::Shader::LUT_LF_ROWS, 0, LutFormatF32F32, 0,
                                                  words);
+                break;
             }
             std::memcpy(fsa.cpu + Usse::SamplerSaOffset(head,
                                                         static_cast<u32>(fg.literals.size()),

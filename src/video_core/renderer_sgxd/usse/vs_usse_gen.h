@@ -16,18 +16,15 @@ namespace GxmRenderer::Usse {
 
 /**
  * The PICA vertex emitter: a GXP vertex program for a PICA vertex program, written directly
- * as USSE instructions. The counterpart of cg_vs_shader_gen.cpp with the same interface:
- * the same attribute names (vs_in_attrN), the same uniforms (uniforms_f, uniforms_i,
- * flip_viewport, depth_scale, depth_offset, vs_in_regN), and the same fragment interface
- * by semantic (POSITION, COLOR0, TEXCOORD0-6), so the rasterizer's binding and uniform
- * upload are unchanged and every generated fragment program links against it. Where
- * SceShaccCg took seconds to tens of seconds per program on the console, this takes
- * microseconds.
+ * as USSE instructions. Its attributes (AttributeKind) and uniforms (UniformKind) say what
+ * they carry, which the rasterizer binds and fills them by; its fragment interface is by
+ * semantic (POSITION, COLOR0, TEXCOORD0-6), so every generated fragment program links
+ * against it.
  *
- * Returns the container, or empty (with `refusal` set) for a program it cannot express:
+ * Returns the program, or empty (with `refusal` set) for a program it cannot express:
  * an instruction outside the set below, a bool uniform not baked in, a jump out of its
  * subroutine, deeper loop nesting than two, more live registers than the unified store
- * holds. The caller then falls back to the Cg path.
+ * holds.
  */
 
 /// Where a fragment-interface semantic comes from: an output attribute's component, or the
@@ -115,7 +112,5 @@ struct VsRequest {
                                                       uint32_t& input_regs,
                                                       std::string* refusal = nullptr,
                                                       int level = 1);
-[[nodiscard]] std::vector<uint8_t> EmitVertexProgram(const VsRequest& request, uint32_t& input_regs,
-                                                     std::string* refusal = nullptr, int level = 1);
 
 } // namespace GxmRenderer::Usse

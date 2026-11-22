@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -195,8 +196,9 @@ public:
 private:
     void SubmitCmdList(u32 index);
 
-    // Interrupt index must be 0 or 1 to signal the relative PSC interrupt.
-    void MemoryFill(u32 index, u32 intr_index);
+    /// Runs fill unit `index` if triggered and raises `interrupt` when it is done (none: GSP's
+    /// command raises one for both of its fills).
+    void MemoryFill(u32 index, std::optional<Service::GSP::InterruptId> interrupt);
 
     void MemoryTransfer();
     void RunMemoryTransfer(const Pica::DisplayTransferConfig& config, bool allow_display_transfer);

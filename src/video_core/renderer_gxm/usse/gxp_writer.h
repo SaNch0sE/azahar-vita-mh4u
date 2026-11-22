@@ -70,22 +70,90 @@ struct GxpInput {
     uint8_t components; ///< 1-4, each one PA register (f32)
 };
 
+/// What a uniform holds. The rasterizer fills it by its kind and index; only the GXP writer
+/// names it (UniformName), after the Cg sources the emitters replaced.
+enum class UniformKind : uint8_t {
+    // Vertex programs.
+    FlipViewport, ///< flip_viewport
+    DepthScale,   ///< depth_scale
+    DepthOffset,  ///< depth_offset
+    DefaultInput, ///< vs_in_reg{index}: input register `index`'s fixed value
+    IntUniforms,  ///< uniforms_i
+    FloatBank,    ///< uniforms_f: the float bank, read through the buffer pointer
+    // Fragment programs: FSUniformData's fields.
+    AlphaTestRef,
+    ConstColor,
+    BufferColor, ///< tev_combiner_buffer_color
+    ScissorX1,
+    ScissorY1,
+    ScissorX2,
+    ScissorY2,
+    FogLutOffset,
+    FogColor,
+    TexBorderColor,
+    ProctexLutOffset,
+    ProctexDiffLutOffset,
+    ProctexColorMapOffset,
+    ProctexAlphaMapOffset,
+    ProctexBias,
+    ProctexNoiseLutOffset,
+    ProctexNoiseF,
+    ProctexNoiseA,
+    ProctexNoiseP,
+    LightingLutOffset,
+    LightingGlobalAmbient,
+    // Light `index`'s members (light_src[index]).
+    LightSpecular0,
+    LightSpecular1,
+    LightDiffuse,
+    LightAmbient,
+    LightPosition,
+    LightSpotDirection,
+    LightDistAttenBias,
+    LightDistAttenScale,
+};
+
 struct GxpUniform {
-    std::string name;
+    UniformKind kind;
+    uint8_t index;       ///< DefaultInput's register, a light member's light; 0 otherwise
     uint32_t sa_offset;  ///< first SA register, in the default uniform buffer
     uint8_t components;  ///< 1-4
     uint32_t array_size; ///< 1 for a scalar or vector
 };
 
+/// What a sampler reads, as UniformKind.
+enum class SamplerKind : uint8_t {
+    Texture,      ///< tex{index}: PICA texture unit `index`
+    TextureAlpha, ///< tex{index}a: a split ETC1A4 unit's alpha (TEXUNIT 7 + index)
+    LutLf,        ///< texture_buffer_lut_lf: the lighting and fog LUTs
+    LutRg,        ///< texture_buffer_lut_rg: the proctex maps
+    LutRgba,      ///< texture_buffer_lut_rgba: the proctex colours
+    ProctexNoise, ///< proctex_noise
+};
+
 struct GxpSampler {
-    std::string name;
+    SamplerKind kind;
+    uint8_t index; ///< Texture's and TextureAlpha's PICA unit; 0 otherwise
     uint32_t unit; ///< TEXUNITn, 0-15
 };
 
+/// What a vertex attribute carries, as UniformKind.
+enum class AttributeKind : uint8_t {
+    Input,      ///< vs_in_attr{index}: input register `index`
+    OutAddress, ///< vs_out_address: where a store-outputs program writes its vertex
+    GsInRows,   ///< gs_in_rows: the geometry program's row
+};
+
 struct GxpAttribute {
-    std::string name;
+    AttributeKind kind;
+    uint8_t index;     ///< Input's register; 0 otherwise
     uint32_t resource; ///< the first of its four primary attribute registers
 };
+
+/// The parameter names the GXP writer gives them, for gxm_flags dumpgxp's readers.
+[[nodiscard]] std::string UniformName(const GxpUniform& uniform);
+[[nodiscard]] std::string SamplerName(const GxpSampler& sampler);
+[[nodiscard]] std::string AttributeName(const GxpAttribute& attribute);
 
 struct GxpProgram {
     /// In PA order: the first input starts at pa0, each takes `components` registers.

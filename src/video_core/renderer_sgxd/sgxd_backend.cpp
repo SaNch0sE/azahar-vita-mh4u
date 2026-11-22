@@ -1074,7 +1074,6 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     data_sites = {};
     draw_count = 0;
     cached.clear();
-    stores.clear();
     in_pass = true;
 }
 
@@ -1215,61 +1214,7 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
     for (const CachedRange& range : cached) {
         SgxdCacheRange(range.cpu, range.bytes, SGXD_CACHE_CLEAN, CacheSite::Vertices);
     }
-    // A store's lines leave the cache before the GPU writes under them, and again after, so
-    // the CPU reads what the GPU wrote (the second is an invalidate of clean lines).
-    for (const Store& store : stores) {
-        SgxdCacheRange(store.cpu, store.bytes, SGXD_CACHE_CLEAN_INVALIDATE,
-                       CacheSite::TransferBefore);
-    }
     SgxdSessionRender render{};
-    // A store into cached memory needs the CPU's lines dropped after the GPU wrote: those
-    // passes stay synchronous.
-    if (stores.empty()) {
-#ifdef VITA_DIAGNOSTICS
-        if (passes % 60 < 2 && GxmFlag("gpucycles")) {
-            static constexpr u32 offsets[] = {0x144, 0xe80, 0xe84, 0xe88, 0xe8c, 0xe90, 0xe94,
-                                              0xe98, 0xeb4, 0xeb8, 0xebc, 0xec0, 0xec4, 0xec8};
-            // The master's bank (0x4000; bank 0 reads the same) and the four cores' (0x8000 up).
-            std::array<SgxdOp, 5 * std::size(offsets)> ops{};
-            for (u32 b = 0; b < 5; b++) {
-                for (u32 k = 0; k < std::size(offsets); k++) {
-                    ops[b * std::size(offsets) + k] = {SGXD_OP_READ, (b + 1) * 0x4000 + offsets[k],
-                                                       0, 0, 0};
-                }
-            }
-            ASSERT_MSG(sgxd_chain_idle() == 0 && sgxd_gpu_idle() == 0 &&
-                           sgxdSubmit(ops.data(), static_cast<uint32_t>(ops.size())) ==
-                               static_cast<int>(ops.size()),
-                       "sgxd: gpucycles reads failed");
-            std::string line;
-            for (const SgxdOp& op : ops) {
-                line += fmt::format(" {:05x}={:08x}", op.reg, op.value);
-            }
-            LOG_INFO(Render, "gpucycles pass {}:{}", passes, line);
-        }
-#endif
-        // The TA runs while the pending 3D does; this list waits for that 3D before its own 3D
-        // kick, and ends there.
-        if (sgxd_chain_idle() != 0) {
-            sgxd_session_render_async_failed(failed, sizeof(failed));
-            Recipe* const p = Pending();
-            Fault(p ? *p : r, failed);
-        }
-        TraceStamps();
-        sgxd_session_render_overlap_result(&render);
-        const u32 touches[4] = {pass_target.lo, pass_target.hi, pass_source.lo, pass_source.hi};
-        if (sgxd_session_render_overlap(&r.recipe, touches, failed, sizeof(failed)) != 0) {
-            Fault(r, failed);
-        }
-        if (ta_us) {
-            *ta_us = render.ta_us;
-        }
-        if (d3_us) {
-            *d3_us = render.d3_us;
-        }
-        return;
-    }
-#endif
 #ifdef VITA_DIAGNOSTICS
     static const bool sync_passes = SgxdFlag("syncpasses");
     if (sync_passes || replay_sync || Vprof::FrameSync()) {
@@ -1781,33 +1726,75 @@ void SgxdBackend::TransferTiledFromGuest(const PicaTarget& target, const UntileS
     EndPass(ta_us, d3_us);
 }
 
-void SgxdBackend::Blit(const Data& source, u32 width, u32 height, const Store& dest, u32* ta_us,
-                       u32* d3_us) {
-    OpenPass(dest.gpu, width, height, dest.pack, 0, 1.0f);
-    // Uncached memory (VRAM) comes without a CPU range and needs no cache work.
-    if (dest.bytes != 0) {
-        stores.push_back(dest);
-    }
-    const u32 stride = source_stride != 0 ? source_stride : width * scale_x;
-    pass_source = {source.gpu, source.gpu + stride * height * scale_y * 4};
-    const SgxdRecipeDrawPrograms p =
-        BlitPrograms(source, width, height, mirror, stride, scale_x, scale_y);
-    // ISP A: opaque, DCMP ALWAYS, DWRITEDIS, BPRES; no culling.
+void SgxdBackend::TransferLinearToTiled(const PicaTarget& target, const UntileSource& source,
+                                        bool flip, u32* ta_us, u32* d3_us) {
+    OpenPass(target.gpu, target.height, target.width, target.pack, 0, 1.0f, &target);
+    pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
+    PlaceFixedPrograms();
+    const Recipe& r = *current;
+    // The target is transposed: its x is the picture's row, its y the column. Flipped, input row y
+    // is output row rows - 1 - y.
+    const u32 rows = r.width, columns = r.height;
+    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    const Data vertices = AllocData(QuadVertexWords * 4);
+    const float u1 = static_cast<float>(columns) / static_cast<float>(source.width);
+    const float v_end = static_cast<float>(rows) / static_cast<float>(source.height);
+    const float v0 = flip ? v_end : 0, v1 = flip ? 0 : v_end;
+    const float uv[4][2] = {{0, v0}, {0, v1}, {u1, v0}, {u1, v1}};
+    PutQuad(reinterpret_cast<float*>(vertices.cpu), r.width, r.height, 0, 0,
+            static_cast<float>(rows), static_cast<float>(columns), uv);
+
+    SgxdRecipeDrawPrograms p{};
+    const SgxdVertexFetch fetch{vertices.gpu, N * 4, N, 0};
+    const auto vspds = VertexPds(&fetch, 1, blit_vertex, false);
+    DEBUG_ASSERT(vspds.va != 0);
+    p.vspds = vspds.va;
+    p.vspds_units = vspds.units;
+    const auto vsec = SecondaryPds(0, 0, sgxd_program_doutu0(0, 0, 0));
+    DEBUG_ASSERT(vsec.va != 0);
+    p.vsec = vsec.va;
+    p.vsec_units = vsec.units;
+    p.vsec_sa = 0;
+    const auto fsec = SecondaryPds(0, 0, sgxd_program_doutu0(1, 0, 0));
+    DEBUG_ASSERT(fsec.va != 0);
+    p.fsec = fsec.va;
+    p.fsec_units = fsec.units;
+    sgxd_program_vertex_dms(N, 0, 0, N, &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
+    p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
+    p.outselects = SGXD_PROGRAM_BLIT_OUTSELECTS;
+    p.texsize = SGXD_PROGRAM_BLIT_TEXSIZE;
+    const float viewport[6] = {r.width / 2.0f, r.width / 2.0f, r.height / 2.0f, r.height / 2.0f,
+                               0.0f, 1.0f};
+    std::memcpy(p.viewport, viewport, sizeof(viewport));
+    p.indices = 0;
+    p.primitive = SGXD_PROGRAM_TRIANGLES;
+    // The texel as the untile reads the format (its code and swizzle), point sampled; the
+    // screen program converts it (half4) and packs U8888 for the target's pack.
+    u32 tex[4];
+    sgxd_recipe_texture_words_format(source.gpu, source.width, source.height, 0, source.code,
+                                     source.swizzle, tex);
+    const PdsRef fprim = ScreenPixelPds(untile_fragment, tex);
+    DEBUG_ASSERT(fprim.va != 0);
+    p.fprim = fprim.va;
+    p.fprim_units = fprim.units;
+    // ISP A: opaque, DCMP ALWAYS, DWRITEDIS, BPRES; no culling (DrawTiled's).
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
-    Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
+    const u32 clip = SGXD_RECIPE_CLIP(0, 0, (r.width + 31) / 32 - 1, (r.height + 31) / 32 - 1);
+    Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, clip, nullptr}, p);
     EndPass(ta_us, d3_us);
 }
 
 void SgxdBackend::TransferFromGuest(const UntileSource& source, u32 dest_gpu, u32 width,
                                     u32 height, u32 pack, bool mirror, u32* ta_us, u32* d3_us,
-                                    u32 scale_x, u32 scale_y) {
+                                    u32 scale_x, u32 scale_y, bool flip) {
     OpenPass(dest_gpu, width, height, pack, 0, 1.0f);
     if (!mirror) {
         pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
-        DrawTiled(source, false, scale_x, scale_y);
+        DrawTiled(source, false, scale_x, scale_y, 4, 0, 0, flip);
         EndPass(ta_us, d3_us);
         return;
     }
+    DEBUG_ASSERT_MSG(!flip, "sgxd: a flipped display transfer into a mirrored pack is not built");
     // The untile writes whole 32x32 tiles (UntileTargetFor), rows a multiple of 32 apart; the
     // picture is the pass's data until its render completes.
     const u32 stride = AlignUp(source.width, 32);
@@ -2709,6 +2696,7 @@ void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_
                      "sgxd: a {}x{} tiled picture (format {:#x}, scale {}x{}) read into a pass is "
                      "not built",
                      w, h, src.code, scale_x, scale_y);
+    DEBUG_ASSERT_MSG(!flip || !transposed, "sgxd: a flipped transposed tiled picture is not built");
     PlaceFixedPrograms();
     const Recipe& r = *current;
     // The tile rows the target shows: a transposed target's width is the picture's rows, a

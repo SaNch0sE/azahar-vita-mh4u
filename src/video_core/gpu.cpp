@@ -343,22 +343,24 @@ void GPU::Execute(const Service::GSP::Command& command) {
         auto& params = command.memory_fill;
         auto& memfill = regs.memory_fill_config;
 
-        // Write to the memory fill GPU registers.
-        // If both buffers are set GSP dispatches PSC0 only.
+        // Write to the memory fill GPU registers. GSP skips a buffer whose start is 0, and
+        // with both buffers set it raises PSC0 alone (3dbrew GSP Shared Memory, command 2):
+        // here behind the second fill.
+        using Service::GSP::InterruptId;
         const bool has_both_bufs = params.start1 != 0 && params.start2 != 0;
         if (params.start1 != 0) {
             memfill[0].address_start = VirtualToPhysicalAddress(params.start1) >> 3;
             memfill[0].address_end = VirtualToPhysicalAddress(params.end1) >> 3;
             memfill[0].value_32bit = params.value1;
             memfill[0].control = params.control1;
-            MemoryFill(0, has_both_bufs ? std::numeric_limits<u32>::max() : 0);
+            MemoryFill(0, has_both_bufs ? std::nullopt : std::optional{InterruptId::PSC0});
         }
         if (params.start2 != 0) {
             memfill[1].address_start = VirtualToPhysicalAddress(params.start2) >> 3;
             memfill[1].address_end = VirtualToPhysicalAddress(params.end2) >> 3;
             memfill[1].value_32bit = params.value2;
             memfill[1].control = params.control2;
-            MemoryFill(1, has_both_bufs ? 0 : 1);
+            MemoryFill(1, has_both_bufs ? InterruptId::PSC0 : InterruptId::PSC1);
         }
         break;
     }
@@ -507,10 +509,10 @@ void GPU::WriteReg(VAddr addr, u32 data) {
         // Handle registers that trigger GPU actions
         switch (index) {
         case GPU_REG_INDEX(memory_fill_config[0].trigger):
-            MemoryFill(0, 0);
+            MemoryFill(0, Service::GSP::InterruptId::PSC0);
             break;
         case GPU_REG_INDEX(memory_fill_config[1].trigger):
-            MemoryFill(1, 1);
+            MemoryFill(1, Service::GSP::InterruptId::PSC1);
             break;
         case GPU_REG_INDEX(display_transfer_config.trigger):
             MemoryTransfer();
@@ -583,12 +585,17 @@ void GPU::SubmitCmdList(u32 index) {
     impl->pica.dirty_regs.Set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + index);
 }
 
-void GPU::MemoryFill(u32 index, u32 intr_index) {
+void GPU::MemoryFill(u32 index, std::optional<Service::GSP::InterruptId> interrupt) {
     // Check if a memory fill was triggered.
     auto& config = impl->pica.regs.memory_fill_config[index];
     if (!config.trigger) {
         return;
     }
+    // Upstream raised no interrupt for a fill from address 0, untested on hardware; the fill
+    // unit raises its interrupt whenever it finishes (3dbrew GPU/External Registers). A fill
+    // from 0 is not VRAM, so it is a fault to look at, not a case to handle.
+    DEBUG_ASSERT_MSG(config.GetStartAddress() != 0, "GPU: memory fill {} from address 0 to {:#x}",
+                     index, config.GetEndAddress());
 
     // Perform memory fill: the PTLA's, queued behind the renders before it.
     RunGpuOp(OpKind::Fill, [this, &config] {
@@ -598,18 +605,11 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
         }
     });
 
-    // It seems that it won't signal interrupt if "address_start" is zero.
-    // TODO: hwtest this
-    if (config.GetStartAddress() != 0) {
-        if (intr_index == 0) {
-            Signal(Service::GSP::InterruptId::PSC0);
-        } else if (intr_index == 1) {
-            Signal(Service::GSP::InterruptId::PSC1);
-        }
+    if (interrupt) {
+        Signal(*interrupt);
     }
 
     // Reset "trigger" flag and set the "finish" flag
-    // This was confirmed to happen on hardware even if "address_start" is zero.
     config.trigger.Assign(0);
     config.finished.Assign(1);
 }

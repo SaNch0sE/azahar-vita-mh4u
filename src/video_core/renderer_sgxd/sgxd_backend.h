@@ -240,19 +240,10 @@ public:
     void Draw(const SgxdRecipeDraw& draw, const SgxdRecipeDrawPrograms& programs);
     /// A range of cached guest memory the pass reads, cleaned from the CPU's cache at EndPass.
     void ReadsCached(const u8* cpu, u32 bytes);
-    /// Renders the pass: waits for it when synchronous, returns once the TA is kicked when
-    /// async. Returns the TA's and the 3D's microseconds, the render before's when async.
+    /// Renders the pass as an async list: returns once the TA is kicked, with the TA's and the
+    /// 3D's microseconds of the render before.
     void EndPass(u32* ta_us = nullptr, u32* d3_us = nullptr);
 
-    /// A store into guest memory: gpu holds width x height pixels of pack (an
-    /// SGXD_RECIPE_PACK_*), rows width apart, cpu its cached view of bytes bytes (null and 0
-    /// for uncached memory).
-    struct Store {
-        u32 gpu;
-        u8* cpu;
-        u32 bytes;
-        u32 pack;
-    };
     /// Guest textures' host copies (RasterizerSgxd's texture cache), from a block of their own:
     /// bytes at a 4 KiB multiple, the first fit of what FreeTexture gave back.
     Data AllocTexture(u32 bytes);
@@ -436,12 +427,25 @@ public:
     SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height,
                                         bool mirror = false, u32 source_stride = 0,
                                         u32 scale_x = 1, u32 scale_y = 1);
-    void Blit(const Data& source, u32 width, u32 height, const Store& dest, u32* ta_us = nullptr,
-              u32* d3_us = nullptr);
+    /// A display transfer from a PICA-tiled picture in guest memory: one pass whose draws read
+    /// it a band of tile rows at a time (DrawTiled), into dest_gpu as width x height pixels of
+    /// pack (an SGXD_RECIPE_PACK_*), rows width apart, the source's top-left width * scale_x x
+    /// height * scale_y, averaged as BlitPrograms' scale. Mirrored (BlitPrograms' mirror), the
+    /// picture is untiled into the pass's data first and blitted from there. flip: the output's
+    /// rows in the other order (the transfer's flip_vertically; not with mirror).
+    void TransferFromGuest(const UntileSource& source, u32 dest_gpu, u32 width, u32 height,
+                           u32 pack, bool mirror, u32* ta_us = nullptr, u32* d3_us = nullptr,
+                           u32 scale_x = 1, u32 scale_y = 1, bool flip = false);
     /// The same into a PICA-tiled picture: one pass on target as a PICA colour buffer (as
     /// BeginPassLoaded opens it), the source read as its load reads, scaled.
     void TransferTiledFromGuest(const PicaTarget& target, const UntileSource& source, u32 scale_x,
                                 u32 scale_y, u32* ta_us = nullptr, u32* d3_us = nullptr);
+    /// A display transfer from a linear picture into a PICA-tiled one (input_linear): one pass
+    /// on target as a PICA colour buffer, one quad reading source as a LINEAR texture of its
+    /// format (rows source.width texels apart) texel for pixel, converted by the screen program.
+    /// flip (the transfer's flip_vertically): the source's first row is the target's last.
+    void TransferLinearToTiled(const PicaTarget& target, const UntileSource& source, bool flip,
+                               u32* ta_us = nullptr, u32* d3_us = nullptr);
 
 private:
     /// One target size's recipe and its block: the layout, the background colour word, then
@@ -713,7 +717,6 @@ private:
         u32 bytes;
     };
     std::vector<CachedRange> cached;
-    std::vector<Store> stores;   // guest memory the open pass writes
     u32 passes{};
     /// gxm_flags perflog: each target's passes, draws and GPU time over a second. A list's TA is
     /// known when the next pass ends, the 3D it waited for one pass before that.

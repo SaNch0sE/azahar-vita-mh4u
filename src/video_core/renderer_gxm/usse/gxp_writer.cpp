@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include "common/assert.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 
 namespace GxmRenderer::Usse {
@@ -153,6 +154,115 @@ uint32_t VaryingDescriptor(const GxpProgram& program, size_t index) {
         info |= 0x02000000;
     }
     return info;
+}
+
+std::string UniformName(const GxpUniform& uniform) {
+    const auto light = [&](const char* member) {
+        return "light_src[" + std::to_string(uniform.index) + "]." + member;
+    };
+    switch (uniform.kind) {
+    case UniformKind::FlipViewport:
+        return "flip_viewport";
+    case UniformKind::DepthScale:
+        return "depth_scale";
+    case UniformKind::DepthOffset:
+        return "depth_offset";
+    case UniformKind::DefaultInput:
+        return "vs_in_reg" + std::to_string(uniform.index);
+    case UniformKind::IntUniforms:
+        return "uniforms_i";
+    case UniformKind::FloatBank:
+        return "uniforms_f";
+    case UniformKind::AlphaTestRef:
+        return "alphatest_ref";
+    case UniformKind::ConstColor:
+        return "const_color";
+    case UniformKind::BufferColor:
+        return "tev_combiner_buffer_color";
+    case UniformKind::ScissorX1:
+        return "scissor_x1";
+    case UniformKind::ScissorY1:
+        return "scissor_y1";
+    case UniformKind::ScissorX2:
+        return "scissor_x2";
+    case UniformKind::ScissorY2:
+        return "scissor_y2";
+    case UniformKind::FogLutOffset:
+        return "fog_lut_offset";
+    case UniformKind::FogColor:
+        return "fog_color";
+    case UniformKind::TexBorderColor:
+        return "tex_border_color";
+    case UniformKind::ProctexLutOffset:
+        return "proctex_lut_offset";
+    case UniformKind::ProctexDiffLutOffset:
+        return "proctex_diff_lut_offset";
+    case UniformKind::ProctexColorMapOffset:
+        return "proctex_color_map_offset";
+    case UniformKind::ProctexAlphaMapOffset:
+        return "proctex_alpha_map_offset";
+    case UniformKind::ProctexBias:
+        return "proctex_bias";
+    case UniformKind::ProctexNoiseLutOffset:
+        return "proctex_noise_lut_offset";
+    case UniformKind::ProctexNoiseF:
+        return "proctex_noise_f";
+    case UniformKind::ProctexNoiseA:
+        return "proctex_noise_a";
+    case UniformKind::ProctexNoiseP:
+        return "proctex_noise_p";
+    case UniformKind::LightingLutOffset:
+        return "lighting_lut_offset";
+    case UniformKind::LightingGlobalAmbient:
+        return "lighting_global_ambient";
+    case UniformKind::LightSpecular0:
+        return light("specular_0");
+    case UniformKind::LightSpecular1:
+        return light("specular_1");
+    case UniformKind::LightDiffuse:
+        return light("diffuse");
+    case UniformKind::LightAmbient:
+        return light("ambient");
+    case UniformKind::LightPosition:
+        return light("position");
+    case UniformKind::LightSpotDirection:
+        return light("spot_direction");
+    case UniformKind::LightDistAttenBias:
+        return light("dist_atten_bias");
+    case UniformKind::LightDistAttenScale:
+        return light("dist_atten_scale");
+    }
+    UNREACHABLE();
+}
+
+std::string SamplerName(const GxpSampler& sampler) {
+    switch (sampler.kind) {
+    case SamplerKind::Texture:
+        return "tex" + std::to_string(sampler.index);
+    case SamplerKind::TextureAlpha:
+        return "tex" + std::to_string(sampler.index) + "a";
+    case SamplerKind::LutLf:
+        return "texture_buffer_lut_lf";
+    case SamplerKind::LutRg:
+        return "texture_buffer_lut_rg";
+    case SamplerKind::LutRgba:
+        return "texture_buffer_lut_rgba";
+    case SamplerKind::ProctexNoise:
+        return "proctex_noise";
+    }
+    UNREACHABLE();
+}
+
+std::string AttributeName(const GxpAttribute& attribute) {
+    switch (attribute.kind) {
+    case AttributeKind::Input:
+        return "vs_in_attr" + std::to_string(attribute.index);
+    case AttributeKind::OutAddress:
+        return "vs_out_address";
+    case AttributeKind::GsInRows:
+        return "gs_in_rows";
+    }
+    UNREACHABLE();
 }
 
 std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
@@ -362,13 +472,13 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
         w.U8(0);
     };
     for (const auto& a : program.attributes) {
-        put_name(a.name);
+        put_name(AttributeName(a));
     }
     for (const auto& u : program.uniforms) {
-        put_name(u.name);
+        put_name(UniformName(u));
     }
     for (const auto& s : program.samplers) {
-        put_name(s.name);
+        put_name(SamplerName(s));
     }
 
     // Without a buffer info table the offset points where the compiler points it.

@@ -294,14 +294,15 @@ private:
     /// A uniform in the memory part of the default uniform buffer: `components` floats at
     /// a float offset past the resident part (the light parameters of lights past the SA
     /// budget); returns the offset.
-    uint32_t AllocateMemoryUniform(const std::string& name, uint8_t components);
+    uint32_t AllocateMemoryUniform(UniformKind kind, uint8_t index, uint8_t components);
     /// A light's parameters: the SA quad set for a resident light, else loaded into
     /// TmpLightMem here (three loads and a wait).
     Vec4Loc LightParams(uint32_t num);
     void WriteDepth();
     /// A uniform's place: `components` floats (or array_size float4s) at a pair-aligned
     /// offset.
-    uint32_t AllocateUniform(const std::string& name, uint8_t components, uint32_t array_size);
+    uint32_t AllocateUniform(UniformKind kind, uint8_t components, uint32_t array_size,
+                             uint8_t index = 0);
     /// The LUT sampler's index among the declared samplers.
     uint32_t LutSamplerIndex() const;
     bool LightingLutEnabled(const Pica::Shader::LutConfig& lut, Sampler sampler) const;
@@ -349,7 +350,8 @@ private:
     uint32_t data_head = 0;               ///< 1 when the data container starts with the pointer
     uint32_t memory_floats = 0;           ///< floats in the memory part of the uniform buffer
     struct MemoryUniform {
-        std::string name;
+        UniformKind kind;
+        uint8_t index;
         uint32_t offset;
         uint8_t components;
     };
@@ -651,36 +653,35 @@ void FragmentEmitter::PlanInputs() {
     gxp.pa_count = pa;
     for (u32 unit = 0; unit < 3; unit++) {
         if (unit_used[unit]) {
-            const char* names[3] = {"tex0", "tex1", "tex2"};
-            gxp.samplers.push_back({names[unit], unit});
+            gxp.samplers.push_back({SamplerKind::Texture, static_cast<uint8_t>(unit), unit});
         }
     }
     if (lut_used) {
-        gxp.samplers.push_back({"texture_buffer_lut_lf", 3});
+        gxp.samplers.push_back({SamplerKind::LutLf, 0, 3});
     }
     if (uses_proctex && !proctex_tabled) {
         sampler_rg = static_cast<uint32_t>(gxp.samplers.size());
-        gxp.samplers.push_back({"texture_buffer_lut_rg", 4});
+        gxp.samplers.push_back({SamplerKind::LutRg, 0, 4});
         sampler_rgba = static_cast<uint32_t>(gxp.samplers.size());
-        gxp.samplers.push_back({"texture_buffer_lut_rgba", 5});
+        gxp.samplers.push_back({SamplerKind::LutRgba, 0, 5});
         if (config.proctex.noise_enable) {
             sampler_noise = static_cast<uint32_t>(gxp.samplers.size());
-            gxp.samplers.push_back({"proctex_noise", 6});
+            gxp.samplers.push_back({SamplerKind::ProctexNoise, 0, 6});
         }
     }
     // A split unit's alpha texture (TEXUNIT 7 + unit), after everything else so the other
     // samplers keep their indices.
     for (u32 unit = 0; unit < 3; unit++) {
         if (unit_used[unit] && (config.texture.alpha_split >> unit & 1)) {
-            const char* names[3] = {"tex0a", "tex1a", "tex2a"};
             sampler_alpha[unit] = static_cast<uint32_t>(gxp.samplers.size());
-            gxp.samplers.push_back({names[unit], 7 + unit});
+            gxp.samplers.push_back(
+                {SamplerKind::TextureAlpha, static_cast<uint8_t>(unit), 7 + unit});
         }
     }
 }
 
-uint32_t FragmentEmitter::AllocateUniform(const std::string& name, uint8_t components,
-                                          uint32_t array_size) {
+uint32_t FragmentEmitter::AllocateUniform(UniformKind kind, uint8_t components,
+                                          uint32_t array_size, uint8_t index) {
     // Vectors and arrays start on a pair (array elements are four floats apart, as
     // sceGxmSetUniformDataF lays a float4 array out); scalars pack, so consecutive scalars
     // such as the scissor bounds form pairs the program reads as one operand.
@@ -688,7 +689,7 @@ uint32_t FragmentEmitter::AllocateUniform(const std::string& name, uint8_t compo
         uniform_floats++;
     }
     const uint32_t at = uniform_floats;
-    gxp.uniforms.push_back({name, at, components, array_size});
+    gxp.uniforms.push_back({kind, index, at, components, array_size});
     uniform_floats += array_size > 1 ? array_size * 4 : components;
     return at;
 }
@@ -698,7 +699,7 @@ void FragmentEmitter::PlanUniforms() {
     const auto& lighting = config.lighting;
     if (config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always &&
         config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Never) {
-        sa_alpha_ref = AllocateUniform("alphatest_ref", 1, 1);
+        sa_alpha_ref = AllocateUniform(UniformKind::AlphaTestRef, 1, 1);
     }
     // The constant colours as a prefix up to the last stage that reads one: the rasterizer
     // writes all six and sceGxmSetUniformDataF clips to the parameter's size.
@@ -720,37 +721,37 @@ void FragmentEmitter::PlanUniforms() {
         }
     }
     if (const_stages != 0) {
-        sa_const_color = AllocateUniform("const_color", 4, const_stages);
+        sa_const_color = AllocateUniform(UniformKind::ConstColor, 4, const_stages);
     }
     if (buffer_used) {
-        sa_buffer_color = AllocateUniform("tev_combiner_buffer_color", 4, 1);
+        sa_buffer_color = AllocateUniform(UniformKind::BufferColor, 4, 1);
     }
     if (uses_scissor) {
         // Four scalars the program reads as two pairs: they start on a pair.
         uniform_floats += uniform_floats & 1;
-        sa_scissor = AllocateUniform("scissor_x1", 1, 1);
-        AllocateUniform("scissor_y1", 1, 1);
-        AllocateUniform("scissor_x2", 1, 1);
-        AllocateUniform("scissor_y2", 1, 1);
+        sa_scissor = AllocateUniform(UniformKind::ScissorX1, 1, 1);
+        AllocateUniform(UniformKind::ScissorY1, 1, 1);
+        AllocateUniform(UniformKind::ScissorX2, 1, 1);
+        AllocateUniform(UniformKind::ScissorY2, 1, 1);
     }
     if (uses_fog) {
-        sa_fog_offset = AllocateUniform("fog_lut_offset", 1, 1);
-        sa_fog_color = AllocateUniform("fog_color", 3, 1);
+        sa_fog_offset = AllocateUniform(UniformKind::FogLutOffset, 1, 1);
+        sa_fog_color = AllocateUniform(UniformKind::FogColor, 3, 1);
     }
     if (uses_border) {
-        sa_border = AllocateUniform("tex_border_color", 4, 3);
+        sa_border = AllocateUniform(UniformKind::TexBorderColor, 4, 3);
     }
     if (uses_proctex && !proctex_tabled) {
-        sa_proctex = AllocateUniform("proctex_lut_offset", 1, 1);
-        AllocateUniform("proctex_diff_lut_offset", 1, 1);
-        AllocateUniform("proctex_color_map_offset", 1, 1);
-        AllocateUniform("proctex_alpha_map_offset", 1, 1);
-        AllocateUniform("proctex_bias", 1, 1);
+        sa_proctex = AllocateUniform(UniformKind::ProctexLutOffset, 1, 1);
+        AllocateUniform(UniformKind::ProctexDiffLutOffset, 1, 1);
+        AllocateUniform(UniformKind::ProctexColorMapOffset, 1, 1);
+        AllocateUniform(UniformKind::ProctexAlphaMapOffset, 1, 1);
+        AllocateUniform(UniformKind::ProctexBias, 1, 1);
         if (config.proctex.noise_enable) {
-            sa_noise_lut = AllocateUniform("proctex_noise_lut_offset", 1, 1);
-            sa_noise_f = AllocateUniform("proctex_noise_f", 2, 1);
-            sa_noise_a = AllocateUniform("proctex_noise_a", 2, 1);
-            sa_noise_p = AllocateUniform("proctex_noise_p", 2, 1);
+            sa_noise_lut = AllocateUniform(UniformKind::ProctexNoiseLutOffset, 1, 1);
+            sa_noise_f = AllocateUniform(UniformKind::ProctexNoiseF, 2, 1);
+            sa_noise_a = AllocateUniform(UniformKind::ProctexNoiseA, 2, 1);
+            sa_noise_p = AllocateUniform(UniformKind::ProctexNoiseP, 2, 1);
         }
     }
     light_memory.fill(-1);
@@ -776,29 +777,31 @@ void FragmentEmitter::PlanUniforms() {
             note(light.dist_atten_enable, 16 + light.num);
         }
         if (highest != 0) {
-            sa_lut_offset = AllocateUniform("lighting_lut_offset", 4, (highest + 3) / 4);
+            sa_lut_offset = AllocateUniform(UniformKind::LightingLutOffset, 4, (highest + 3) / 4);
         }
-        sa_global_ambient = AllocateUniform("lighting_global_ambient", 3, 1);
+        sa_global_ambient = AllocateUniform(UniformKind::LightingGlobalAmbient, 3, 1);
         // Lights are register-resident (24 SAs each) while the budget holds, counting the
         // literals, the sampler words and the pointer behind them; the rest live in the
         // memory part of the uniform buffer and are loaded when their turn comes.
         const uint32_t tail = LiteralCount + static_cast<uint32_t>(gxp.samplers.size()) * 4 + 1;
         for (u32 i = 0; i < lighting.src_num; i++) {
             const u32 num = lighting.lights[i].num;
-            const char* members[8] = {"specular_0", "dist_atten_bias", "specular_1",
-                                      "dist_atten_scale", "diffuse", "ambient", "position",
-                                      "spot_direction"};
+            const UniformKind members[8] = {
+                UniformKind::LightSpecular0, UniformKind::LightDistAttenBias,
+                UniformKind::LightSpecular1, UniformKind::LightDistAttenScale,
+                UniformKind::LightDiffuse,   UniformKind::LightAmbient,
+                UniformKind::LightPosition,  UniformKind::LightSpotDirection};
             const uint8_t sizes[8] = {3, 1, 3, 1, 3, 3, 3, 3};
             const bool resident_light = ((uniform_floats + 1) & ~1u) + 24 + tail <= 128;
             for (int m = 0; m < 8; m++) {
-                const std::string name = fmt::format("light_src[{}].{}", num, members[m]);
+                const uint8_t light = static_cast<uint8_t>(num);
                 if (resident_light) {
-                    const uint32_t at = AllocateUniform(name, sizes[m], 1);
+                    const uint32_t at = AllocateUniform(members[m], sizes[m], 1, light);
                     if (m == 0) {
                         sa_light[num] = at;
                     }
                 } else {
-                    const uint32_t at = AllocateMemoryUniform(name, sizes[m]);
+                    const uint32_t at = AllocateMemoryUniform(members[m], light, sizes[m]);
                     if (m == 0) {
                         light_memory[num] = static_cast<int32_t>(at);
                     }
@@ -815,7 +818,7 @@ void FragmentEmitter::PlanUniforms() {
         gxp.ldst_base_value = static_cast<int32_t>(uniform_floats * 4) - 4;
         gxp.buffer_floats = uniform_floats + memory_floats;
         for (const MemoryUniform& m : memory_uniforms) {
-            gxp.uniforms.push_back({m.name, uniform_floats + m.offset, m.components, 1});
+            gxp.uniforms.push_back({m.kind, m.index, uniform_floats + m.offset, m.components, 1});
         }
     } else if (uniform_floats & 1) {
         uniform_floats++;
@@ -823,14 +826,15 @@ void FragmentEmitter::PlanUniforms() {
     gxp.uniform_floats = uniform_floats;
 }
 
-uint32_t FragmentEmitter::AllocateMemoryUniform(const std::string& name, uint8_t components) {
+uint32_t FragmentEmitter::AllocateMemoryUniform(UniformKind kind, uint8_t index,
+                                                uint8_t components) {
     // The SA layout, so the code addressing a light does not care where it lives: every
     // member starts on a pair, a float3 takes four floats with its scalar partner.
     if (components > 1 && (memory_floats & 1)) {
         memory_floats++;
     }
     const uint32_t at = memory_floats;
-    memory_uniforms.push_back({name, at, components});
+    memory_uniforms.push_back({kind, index, at, components});
     memory_floats += components;
     return at;
 }
@@ -2607,11 +2611,6 @@ std::optional<GxpProgram> EmitFragmentGxp(const FSConfig& config, std::string* r
         }
         return std::nullopt;
     }
-}
-
-std::vector<uint8_t> EmitFragmentProgram(const FSConfig& config, std::string* refusal, int level) {
-    const std::optional<GxpProgram> program = EmitFragmentGxp(config, refusal, level);
-    return program ? WriteGxp(*program) : std::vector<uint8_t>{};
 }
 
 } // namespace GxmRenderer::Usse

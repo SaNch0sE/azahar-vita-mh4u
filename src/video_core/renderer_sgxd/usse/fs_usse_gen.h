@@ -15,14 +15,13 @@ namespace GxmRenderer::Usse {
 
 /**
  * The PICA fragment emitter: a GXP program for a fragment configuration, written directly
- * as USSE instructions. Mirrors cg_fs_shader_gen.cpp
- * pass for pass and names its uniforms the same, so the rasterizer's uniform upload and
- * texture binding are unchanged; what the compiler took seconds for takes microseconds.
+ * as USSE instructions. Mirrors cg_fs_shader_gen.cpp pass for pass. Its uniforms
+ * (UniformKind: FSUniformData's fields) and samplers (SamplerKind) say what they hold, which
+ * the rasterizer fills and binds them by.
  *
- * Returns the container, or empty when the configuration is outside what is implemented
- * so far (the caller compiles the Cg instead): lighting, fog, procedural textures,
- * scissor, projection/cube/shadow textures, border colours, shadow rendering, W-buffer
- * depth, min/max blend emulation, bitwise logic ops.
+ * Returns the program, or empty when the configuration is one it does not express
+ * (FragmentEmitter::Unsupported), an operand form the encoder cannot express, or more
+ * secondary attributes than there are.
  */
 /// `refusal`, when given, receives why an empty result came back. `level` 2 runs the IR's
 /// optimising passes (the second tier).
@@ -30,9 +29,6 @@ namespace GxmRenderer::Usse {
 [[nodiscard]] std::optional<GxpProgram> EmitFragmentGxp(const Pica::Shader::FSConfig& config,
                                                         std::string* refusal = nullptr,
                                                         int level = 1);
-[[nodiscard]] std::vector<uint8_t> EmitFragmentProgram(const Pica::Shader::FSConfig& config,
-                                                       std::string* refusal = nullptr,
-                                                       int level = 1);
 
 /// The lighting's diagnostics switch (sgxd_flags light16why), set before any program is
 /// emitted.

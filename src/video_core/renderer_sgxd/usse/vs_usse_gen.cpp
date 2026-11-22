@@ -603,7 +603,7 @@ void VertexEmitter::Layout() {
         if (words + 2 > PaLimit) {
             Refuse("more geometry input rows than primary attributes");
         }
-        gxp.attributes.push_back({"gs_in_rows", 0});
+        gxp.attributes.push_back({AttributeKind::GsInRows, 0, 0});
         gxp.attrib_pa_regs = (1ull << words) - 1;
         pa_inputs = static_cast<uint8_t>((words + 1) & ~1u);
     }
@@ -615,7 +615,7 @@ void VertexEmitter::Layout() {
         }
         input_pa[i] = pa_inputs;
         if ((req.u8_regs & (1u << i)) == 0) {
-            gxp.attributes.push_back({"vs_in_attr" + std::to_string(i), pa_inputs});
+            gxp.attributes.push_back({AttributeKind::Input, static_cast<uint8_t>(i), pa_inputs});
             uint32_t comps = req.reg_components[i];
             if (comps == 0 || comps > 4) {
                 comps = 4;
@@ -633,33 +633,34 @@ void VertexEmitter::Layout() {
             continue;
         }
         input_raw_pa[i] = pa_inputs;
-        gxp.attributes.push_back({"vs_in_attr" + std::to_string(i), pa_inputs});
+        gxp.attributes.push_back({AttributeKind::Input, static_cast<uint8_t>(i), pa_inputs});
         const uint32_t words = RawWords(req, i);
         gxp.attrib_pa_regs |= ((1ull << words) - 1) << pa_inputs;
         pa_inputs = static_cast<uint8_t>(pa_inputs + (words > 2 ? 4 : 2));
     }
     if (req.mode == VsMode::StoreOutputs) {
         out_address_pa = pa_inputs;
-        gxp.attributes.push_back({"vs_out_address", pa_inputs});
+        gxp.attributes.push_back({AttributeKind::OutAddress, 0, pa_inputs});
         gxp.attrib_pa_regs |= 1ull << pa_inputs;
         pa_inputs = static_cast<uint8_t>(pa_inputs + 2);
     }
 
     // Resident uniforms: the depth mapping, the input defaults, the integer uniforms.
-    gxp.uniforms.push_back({"flip_viewport", SaFlipViewport, 1, 1});
-    gxp.uniforms.push_back({"depth_scale", SaDepthScale, 1, 1});
-    gxp.uniforms.push_back({"depth_offset", SaDepthOffset, 1, 1});
+    gxp.uniforms.push_back({UniformKind::FlipViewport, 0, SaFlipViewport, 1, 1});
+    gxp.uniforms.push_back({UniformKind::DepthScale, 0, SaDepthScale, 1, 1});
+    gxp.uniforms.push_back({UniformKind::DepthOffset, 0, SaDepthOffset, 1, 1});
     resident = SaResidentHead;
     for (uint32_t i = 0; i < 16 && req.mode != VsMode::Geometry; i++) {
         if ((scan.inputs & (1u << i)) != 0 && (req.default_regs & (1u << i)) != 0) {
             default_sa[i] = static_cast<int>(resident);
-            gxp.uniforms.push_back({"vs_in_reg" + std::to_string(i), resident, 4, 1});
+            gxp.uniforms.push_back(
+                {UniformKind::DefaultInput, static_cast<uint8_t>(i), resident, 4, 1});
             resident += 4;
         }
     }
     if (scan.ints != 0) {
         int_sa = static_cast<int>(resident);
-        gxp.uniforms.push_back({"uniforms_i", resident, 4, 4});
+        gxp.uniforms.push_back({UniformKind::IntUniforms, 0, resident, 4, 4});
         resident += 16;
     }
     gxp.uniform_floats = resident;
@@ -672,7 +673,8 @@ void VertexEmitter::Layout() {
         // 128 entries plus a mirror of the first four: an indexed read whose index wraps
         // at 128 (Smash reads with a0 = -2) may be issued at an immediate offset from a
         // neighbouring row's address, and the offset runs into the mirror.
-        gxp.uniforms.push_back({"uniforms_f", resident, 4, 128 + Ir::UniformMirrorRows});
+        gxp.uniforms.push_back(
+            {UniformKind::FloatBank, 0, resident, 4, 128 + Ir::UniformMirrorRows});
         gxp.buffer_pointer = true;
         gxp.ldst_base_value = static_cast<int32_t>(resident * 4) - 4;
         gxp.buffer_floats = resident + 512 + Ir::UniformMirrorRows * 4;
@@ -2152,12 +2154,6 @@ std::optional<GxpProgram> EmitVertexGxp(const VsRequest& request, uint32_t& inpu
         }
     }
     return std::nullopt;
-}
-
-std::vector<uint8_t> EmitVertexProgram(const VsRequest& request, uint32_t& input_regs,
-                                       std::string* refusal, int level) {
-    const std::optional<GxpProgram> program = EmitVertexGxp(request, input_regs, refusal, level);
-    return program ? WriteGxp(*program) : std::vector<uint8_t>{};
 }
 
 } // namespace GxmRenderer::Usse
