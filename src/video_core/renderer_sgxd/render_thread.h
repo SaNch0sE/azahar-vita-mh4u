@@ -426,6 +426,9 @@ private:
     void ParsedPut(Op op, const T& payload, u16 extra = 0);
     void ParsedPut(Op op);
     void SyncParsedState();
+    void PrefetchFragment();
+    bool parse_fragment_dirty = true;
+    void PrefetchVertex();
     /// Render side: list `seq`'s parsed records run as they come, to its end.
     void RunParsed(u32 seq);
     class ParsedOutput;

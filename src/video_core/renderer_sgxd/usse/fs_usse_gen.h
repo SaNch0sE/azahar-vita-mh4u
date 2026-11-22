@@ -26,9 +26,10 @@ namespace SgxdRenderer::Usse {
  * secondary attributes than there are.
  */
 /// `refusal`, when given, receives why an empty result came back. `level` 2 runs the IR's
-/// optimising passes (the second tier).
+/// optimising passes (the second tier). `scratch`: the calling thread.
 /// The program itself, for sgxd, which places the code and builds the PDS programs.
 [[nodiscard]] std::optional<Program> EmitFragmentProgram(const Pica::Shader::FSConfig& config,
+                                                        Scratch scratch,
                                                         std::string* refusal = nullptr,
                                                         int level = 1);
 

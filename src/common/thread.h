@@ -166,7 +166,11 @@ enum class ThreadRole {
     SecondEmulation,
     Render,
     RasterWorker,
+    /// The second tier's shader workers (SgxdRenderer::ShaderTier2).
     ShaderCompiler,
+    /// The first tier's background shader worker (SgxdRenderer::ShaderTier1): fragment and
+    /// geometry programs ahead of their draws.
+    ShaderTier1,
     AudioSink,
     /// The HLE DSP's frames (AudioCore::DspHle), beside the emulation thread as the 3DS's DSP
     /// runs beside its ARM11.

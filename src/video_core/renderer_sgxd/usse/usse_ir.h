@@ -6,9 +6,11 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 #include "video_core/renderer_sgxd/usse/usse_encoder.h"
+#include "video_core/renderer_sgxd/usse/usse_program.h"
 
 namespace SgxdRenderer::Usse::Ir {
 
@@ -162,6 +164,7 @@ struct LowerResult {
 
 class Builder {
 public:
+    std::optional<Scratch> scratch;
     bool skip_invalid = true;
     /// skipinv as psp2cgc places it: on every instruction but those whose results reach the
     /// coordinates of a read with the hardware's own level (its LOD comes from the 2x2 quad's

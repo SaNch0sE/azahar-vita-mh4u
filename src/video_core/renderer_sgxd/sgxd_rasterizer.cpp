@@ -767,6 +767,10 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
     }
+    tier1 = std::make_unique<ShaderTier1>(&disk_cache);
+    if (!SgxdFlag("notier2")) {
+        tier2 = std::make_unique<ShaderTier2>(&disk_cache, *tier1);
+    }
     backend.SetTextureEvictor([this] { return EvictTexture(); });
     backend.SetRoomTaken([this](u32 begin, u32 end) { KeepGsRows(begin, end); });
 }
@@ -2553,6 +2557,10 @@ void RasterizerSgxd::DropTexture(Texture& texture) {
 }
 
 bool RasterizerSgxd::SplitAlpha(u32 unit) const {
+    return SplitAlphaIn(regs, unit);
+}
+
+bool RasterizerSgxd::SplitAlphaIn(const Pica::RegsInternal& regs, u32 unit) {
     const auto t = regs.texturing.GetTextures()[unit];
     return t.enabled && t.format == Pica::TexturingRegs::TextureFormat::ETC1A4 &&
            !(unit == 0 && t.config.type == Pica::TexturingRegs::TextureConfig::TextureCube) &&
@@ -3099,6 +3107,102 @@ void RasterizerSgxd::LogTextureStats() {
 }
 #endif
 
+u64 RasterizerSgxd::VertexKeyOf(const Pica::Shader::Generator::PicaVSConfig& config,
+                                const VertexInputs& in) {
+    return Common::HashCombine(
+        config.Hash(),
+        static_cast<u64>(in.mode) << 32 | static_cast<u64>(in.u8_regs) << 16 | in.default_regs,
+        static_cast<u64>(in.bools) << 16 | in.used_bools |
+            (static_cast<u64>(in.s8_regs) << 32 | static_cast<u64>(in.s16_regs) << 48),
+        Common::ComputeHash64(in.reg_components.data(), in.reg_components.size()));
+}
+
+Usse::VsRequest RasterizerSgxd::VertexRequestOf(const Pica::Shader::Generator::PicaVSConfig& config,
+                                                const Pica::ShaderSetup& setup,
+                                                const VertexInputs& in) {
+    const auto& state = config.state;
+    Usse::VsRequest request{};
+    request.code = setup.GetProgramCode();
+    request.swizzle = setup.GetSwizzleData();
+    request.code_size =
+        std::min<u32>(setup.GetBiggestProgramSize(), Pica::MAX_PROGRAM_CODE_LENGTH);
+    request.main_offset = state.main_offset;
+    request.num_outputs = state.num_outputs;
+    request.output_map = state.output_map;
+    const auto maps = state.gs_state.GetSemanticMaps();
+    for (u32 i = 0; i < maps.size(); i++) {
+        request.semantics[i] = {static_cast<u8>(std::min<u32>(maps[i].attribute_index, 255)),
+                                static_cast<u8>(maps[i].component_index & 3)};
+    }
+    request.default_regs = in.default_regs;
+    request.bools = in.bools;
+    request.bool_mask = in.used_bools;
+    request.reg_components = in.reg_components;
+    request.u8_regs = in.u8_regs;
+    request.s8_regs = in.s8_regs;
+    request.s16_regs = in.s16_regs;
+    request.mode = in.mode;
+    return request;
+}
+
+namespace {
+u16 BoolUniforms(const Pica::ShaderSetup& setup) {
+    u16 bools = 0;
+    for (u32 n = 0; n < 16; n++) {
+        bools |= static_cast<u16>((setup.uniforms.b[n] ? 1u : 0u) << n);
+    }
+    return bools;
+}
+} // Anonymous namespace
+
+void RasterizerSgxd::PrefetchVertex(const Pica::RegsInternal& parse_regs,
+                                    Pica::ShaderSetup& parse_setup) {
+    if (parse_regs.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes) {
+        return;
+    }
+    // The words VertexStageFor reuses a layout's program by: unchanged, the same program.
+    const auto words = VertexProgramKey(parse_regs, parse_setup, Usse::VsMode::Draw);
+    const u64 layout_hash = StateRegs::Hash(StateRegs::Layout, parse_regs.reg_array);
+    if (words == parse_vertex_words && layout_hash == parse_layout_hash) {
+        return;
+    }
+    parse_vertex_words = words;
+    parse_layout_hash = layout_hash;
+    const Pica::Shader::Generator::PicaVSConfig config{parse_regs, parse_setup};
+    u16* used = parse_used_bools.Find(config.state.program_hash);
+    if (!used) {
+        used = &parse_used_bools.Emplace(config.state.program_hash, UsedBoolUniforms(parse_setup));
+    }
+    const VertexLayout layout = DecodeVertexLayout(parse_regs);
+    const VertexInputs in{static_cast<u16>(~layout.enabled_regs),
+                          layout.u8_regs,
+                          layout.s8_regs,
+                          layout.s16_regs,
+                          layout.reg_components,
+                          Usse::VsMode::Draw,
+                          static_cast<u16>(BoolUniforms(parse_setup) & *used),
+                          *used};
+    const u64 key = VertexKeyOf(config, in);
+    if (!tier1->WantsVertex(key)) {
+        return;
+    }
+    // One copy of a program's code for its variants' jobs.
+    const u64 code_hash = parse_setup.GetProgramCodeHash();
+    const u64 swizzle_hash = parse_setup.GetSwizzleDataHash();
+    if (!parse_vs_code || code_hash != parse_vs_code_hash || swizzle_hash != parse_vs_swizzle_hash) {
+        auto code = std::make_shared<ShaderTier1::VertexCode>();
+        code->code = parse_setup.GetProgramCode();
+        code->swizzle = parse_setup.GetSwizzleData();
+        parse_vs_code = std::move(code);
+        parse_vs_code_hash = code_hash;
+        parse_vs_swizzle_hash = swizzle_hash;
+    }
+    Usse::VsRequest request = VertexRequestOf(config, parse_setup, in);
+    request.code = std::span<const u32>{parse_vs_code->code.data(), request.code.size()};
+    request.swizzle = std::span<const u32>{parse_vs_code->swizzle.data(), request.swizzle.size()};
+    tier1->QueueVertex(key, request, parse_vs_code);
+}
+
 namespace {
 
 /// With gxm_flags dumpusse, an emitted program on host0 as azahar-KIND-KEY.json;
@@ -3174,59 +3278,42 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     if (!used) {
         used = &used_bools.Emplace(state.program_hash, UsedBoolUniforms(pica.vs_setup));
     }
-    u16 bools = 0;
-    for (u32 n = 0; n < 16; n++) {
-        bools |= static_cast<u16>((pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n);
-    }
-    bools &= *used;
-    const u64 key = Common::HashCombine(
-        config.Hash(),
-        static_cast<u64>(mode) << 32 | static_cast<u64>(u8_regs) << 16 | default_regs,
-        static_cast<u64>(bools) << 16 | *used |
-            (static_cast<u64>(s8_regs) << 32 | static_cast<u64>(s16_regs) << 48),
-        Common::ComputeHash64(reg_components.data(), reg_components.size()));
-    const auto make_request = [&] {
-        Usse::VsRequest request{};
-        request.code = pica.vs_setup.GetProgramCode();
-        request.swizzle = pica.vs_setup.GetSwizzleData();
-        request.code_size =
-            std::min<u32>(pica.vs_setup.GetBiggestProgramSize(), Pica::MAX_PROGRAM_CODE_LENGTH);
-        request.main_offset = state.main_offset;
-        request.num_outputs = state.num_outputs;
-        request.output_map = state.output_map;
-        const auto maps = state.gs_state.GetSemanticMaps();
-        for (u32 i = 0; i < maps.size(); i++) {
-            request.semantics[i] = {static_cast<u8>(std::min<u32>(maps[i].attribute_index, 255)),
-                                    static_cast<u8>(maps[i].component_index & 3)};
-        }
-        request.default_regs = default_regs;
-        request.bools = bools;
-        request.bool_mask = *used;
-        request.reg_components = reg_components;
-        request.u8_regs = u8_regs;
-        request.s8_regs = s8_regs;
-        request.s16_regs = s16_regs;
-        request.mode = mode;
-        return request;
-    };
+    const VertexInputs in{default_regs,
+                          u8_regs,
+                          s8_regs,
+                          s16_regs,
+                          reg_components,
+                          mode,
+                          static_cast<u16>(BoolUniforms(pica.vs_setup) & *used),
+                          *used};
+    const u64 key = VertexKeyOf(config, in);
     if (VertexProgram* const found = vertex_programs.Find(key)) {
         VertexProgram& v = *found;
         if (!v.tier2_queued && ++v.draws >= Tier2Draws) {
             v.tier2_queued = true;
             if (tier2) {
-                tier2->QueueVertex(key, make_request());
+                tier2->QueueVertex(key, VertexRequestOf(config, pica.vs_setup, in));
             }
         }
         return v;
     }
 
-    const Usse::VsRequest request = make_request();
+    const Usse::VsRequest request = VertexRequestOf(config, pica.vs_setup, in);
     VertexProgram v{};
     std::string refusal;
-    const u32 emit_start = azaharCyclesStart();
-    auto emitted = Usse::EmitVertexProgram(request, v.input_regs, &refusal);
-    const u64 emit_us = Common::CyclesToUs(azaharCycles() - emit_start);
-    NoteEmit(0, emit_us);
+    std::optional<Usse::Program> emitted;
+    u64 emit_us = 0;
+    if (taken) {
+        emitted = std::move(taken->program);
+        v.input_regs = taken->input_regs;
+        refusal = std::move(taken->refusal);
+        emit_us = taken->took_us;
+    } else {
+        const u32 emit_start = azaharCyclesStart();
+        emitted = Usse::EmitVertexProgram(request, v.input_regs, Usse::Scratch::Render, &refusal);
+        emit_us = Common::CyclesToUs(azaharCycles() - emit_start);
+        NoteEmit(0, emit_us);
+    }
     // The PICA side before the assert: a program the emitter refuses is the one to look at.
     DumpPicaVertex(key, config, pica.vs_setup, request);
     ASSERT_MSG(emitted.has_value(),
@@ -3239,10 +3326,14 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     PlaceVertexCode(v);
     LOG_INFO(Render,
              "vertex program {:016x}: {} + {} words, {} PAs, {} temps, {} SAs, {} uniforms{}, "
-             "emitted in {} us",
+             "emitted in {} us{}",
              state.program_hash, v.usse.primary.size(), v.usse.secondary.size(), v.usse.pa_count,
              v.usse.temp_count, v.usse.secondary_reg_count, v.usse.uniforms.size(),
-             v.usse.per_instance ? ", per instance" : "", emit_us);
+             v.usse.per_instance ? ", per instance" : "", emit_us, taken ? " (worker)" : "");
+    if (tier2 && v.usse.primary.size() >= Tier2Words) {
+        v.tier2_queued = true;
+        tier2->QueueVertex(key, request);
+    }
     return vertex_programs.Emplace(key, std::move(v));
 }
 
@@ -3327,21 +3418,21 @@ RasterizerSgxd::VertexProgram RasterizerSgxd::PlaceVertexProgram(Usse::Program u
     return v;
 }
 
-const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
-    u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform, u16 input_rows,
-    u32 max_triangles, bool serial, const Describe& describe) {
+RasterizerSgxd::GeometryKey RasterizerSgxd::GeometryKeyFor(u32 rows, bool rows_uniform,
+                                                           bool rows_table, u32 first_uniform,
+                                                           u16 input_rows, u32 max_triangles,
+                                                           bool serial) {
     Pica::ShaderSetup& setup = pica.gs_setup;
     setup.DoProgramCodeFixup();
     const u64 program_hash = setup.GetProgramCodeHash();
-    u16* used = used_bools.Find(program_hash);
-    if (!used) {
-        used = &used_bools.Emplace(program_hash, UsedBoolUniforms(setup));
-    }
+    const u16* found_used = used_bools.Find(program_hash);
+    const u16 used =
+        found_used ? *found_used : used_bools.Emplace(program_hash, UsedBoolUniforms(setup));
     u16 bools = 0;
     for (u32 n = 0; n < 16; n++) {
         bools |= static_cast<u16>((setup.uniforms.b[n] ? 1u : 0u) << n);
     }
-    bools &= *used;
+    bools &= used;
     const bool uniform_table = GsUniformTable(rows_uniform, rows_table);
     const u32 output_mask = regs.gs.output_mask;
     // Every field through a combine: a bit XORed onto the result's top bit would undo a bool at the
@@ -3349,23 +3440,18 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
     const u64 key = Common::HashCombine(
         Common::HashCombine(program_hash, setup.GetSwizzleDataHash()),
         static_cast<u64>(regs.gs.main_offset.Value()) << 16 | output_mask,
-        static_cast<u64>(bools) << 48 | static_cast<u64>(*used) << 32 |
+        static_cast<u64>(bools) << 48 | static_cast<u64>(used) << 32 |
             static_cast<u64>(max_triangles) << 16 | (rows_table ? 0x8000u : 0u) |
             first_uniform << 8 | (rows_uniform ? 0x80u : 0u) | rows,
-        static_cast<u64>(input_rows) << 1 | (serial ? 1u : 0u));
-    const VertexProgram* const found = vertex_programs.Find(key);
-    const VertexProgram& program =
-        found ? *found
-              : MakeGeometryProgram(key, bools, *used, rows, rows_uniform, rows_table,
-                                    first_uniform, input_rows, max_triangles, serial, describe);
-    return program;
+        (uniform_table ? 1ull << 17 : 0ull) | static_cast<u64>(input_rows) << 1 |
+            (serial ? 1u : 0u));
+    return {key, bools, used, uniform_table};
 }
 
-const RasterizerSgxd::VertexProgram& RasterizerSgxd::MakeGeometryProgram(
-    u64 key, u16 bools, u16 used, u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
-    u16 input_rows, u32 max_triangles, bool serial, const Describe& describe) {
-    Pica::ShaderSetup& setup = pica.gs_setup;
-    const u64 program_hash = setup.GetProgramCodeHash();
+Usse::VsRequest RasterizerSgxd::GeometryRequest(const GeometryKey& k, u32 rows, bool rows_uniform,
+                                                bool rows_table, u32 first_uniform, u16 input_rows,
+                                                u32 max_triangles, bool serial) const {
+    const Pica::ShaderSetup& setup = pica.gs_setup;
     const u32 output_mask = regs.gs.output_mask;
     Usse::VsRequest request{};
     request.code = setup.GetProgramCode();
@@ -3378,8 +3464,8 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::MakeGeometryProgram(
             request.output_map[reg] = request.num_outputs++;
         }
     }
-    request.bools = bools;
-    request.bool_mask = used;
+    request.bools = k.bools;
+    request.bool_mask = k.used;
     request.mode = Usse::VsMode::Geometry;
     request.gs_rows = rows;
     request.gs_rows_uniform = rows_uniform;
@@ -3389,17 +3475,87 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::MakeGeometryProgram(
     request.gs_input_rows = input_rows;
     request.gs_max_triangles = max_triangles;
     request.gs_serial = serial;
+    return request;
+}
+
+const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
+    u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform, u16 input_rows,
+    u32 max_triangles, bool serial, const Describe& describe) {
+    const GeometryKey k = GeometryKeyFor(rows, rows_uniform, rows_table, first_uniform, input_rows,
+                                         max_triangles, serial);
+    const VertexProgram* const found = vertex_programs.Find(k.key);
+    return found ? *found
+                 : MakeGeometryProgram(k, rows, rows_uniform, rows_table, first_uniform, input_rows,
+                                       max_triangles, serial, describe);
+}
+
+void RasterizerSgxd::QueueGeometryPair(u32 rows, bool rows_uniform, bool rows_table,
+                                       u32 first_uniform, u16 input_rows, u32 max_triangles,
+                                       bool serial, bool b15) {
+    Pica::ShaderSetup& setup = pica.gs_setup;
+    setup.uniforms.b[15] = b15;
+    const GeometryKey first = GeometryKeyFor(rows, rows_uniform, rows_table, first_uniform,
+                                             input_rows, max_triangles, serial);
+    setup.uniforms.b[15] = true;
+    const GeometryKey rest = GeometryKeyFor(rows, rows_uniform, rows_table, first_uniform,
+                                            input_rows, max_triangles, serial);
+    disk_cache.Open(title_id);
+    if (first.key == rest.key || vertex_programs.Find(first.key) != nullptr ||
+        vertex_programs.Find(rest.key) != nullptr || disk_cache.Contains(first.key, true) ||
+        disk_cache.Contains(rest.key, true)) {
+        return;
+    }
+    tier1->QueueGeometry(rest.key,
+                         GeometryRequest(rest, rows, rows_uniform, rows_table, first_uniform,
+                                         input_rows, max_triangles, serial));
+}
+
+const RasterizerSgxd::VertexProgram& RasterizerSgxd::MakeGeometryProgram(
+    const GeometryKey& k, u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
+    u16 input_rows, u32 max_triangles, bool serial, const Describe& describe) {
+    const u64 key = k.key;
+    const Usse::VsRequest request = GeometryRequest(
+        k, rows, rows_uniform, rows_table, first_uniform, input_rows, max_triangles, serial);
+    // The second of a new draw's pair from the first tier's worker: taken first, so its slot is free.
+    std::optional<ShaderTier1::Taken> taken = tier1->TakeGeometry(key);
+    disk_cache.Open(title_id);
+    if (!taken) {
+        if (auto cached = disk_cache.Find(key, true)) {
+            // A run before emitted its second tier: that one.
+            VertexProgram v = PlaceVertexProgram(std::move(cached->program),
+                                                 "geometry program from the disk", key);
+            v.input_regs = cached->input_regs;
+            v.tier2_queued = true;
+            return vertex_programs.Emplace(key, std::move(v));
+        }
+    }
     u32 input_regs = 0;
     std::string refusal;
-    const u64 emit_start = sceKernelGetProcessTimeWide();
-    auto emitted = Usse::EmitVertexProgram(request, input_regs, &refusal);
-    const u64 emit_us = sceKernelGetProcessTimeWide() - emit_start;
-    NoteEmit(1, emit_us);
-    DEBUG_ASSERT_MSG(emitted.has_value(),
-                     "sgxd: {}: geometry program {:016x}: the emitter has no program for it: {}",
-                     describe(), program_hash, refusal);
-    VertexProgram v = PlaceVertexProgram(std::move(*emitted), "geometry program", key, emit_us);
+    std::optional<Usse::Program> emitted;
+    u64 emit_us = 0;
+    if (taken) {
+        emitted = std::move(taken->program);
+        input_regs = taken->input_regs;
+        refusal = std::move(taken->refusal);
+        emit_us = taken->took_us;
+        NoteTier1(1, *taken);
+    } else {
+        const u32 emit_start = azaharCyclesStart();
+        emitted = Usse::EmitVertexProgram(request, input_regs, Usse::Scratch::Render, &refusal);
+        emit_us = Common::CyclesToUs(azaharCycles() - emit_start);
+        NoteEmit(1, emit_us);
+    }
+    ASSERT_MSG(emitted.has_value(),
+               "sgxd: {}: geometry program {:016x}: the emitter has no program for it: {}",
+               describe(), pica.gs_setup.GetProgramCodeHash(), refusal);
+    VertexProgram v =
+        PlaceVertexProgram(std::move(*emitted),
+                           taken ? "geometry program (worker)" : "geometry program", key, emit_us);
     v.input_regs = input_regs;
+    if (tier2 && v.usse.primary.size() >= Tier2Words) {
+        v.tier2_queued = true;
+        tier2->QueueVertex(key, request);
+    }
     return vertex_programs.Emplace(key, std::move(v));
 }
 
@@ -3459,7 +3615,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
     request.default_regs = static_cast<u16>(~((1u << request.num_outputs) - 1));
     u32 input_regs = 0;
     std::string refusal;
-    auto emitted = Usse::EmitVertexProgram(request, input_regs, &refusal);
+    auto emitted = Usse::EmitVertexProgram(request, input_regs, Usse::Scratch::Render, &refusal);
     ASSERT_MSG(emitted.has_value(), "sgxd: the geometry passthrough program: {}", refusal);
     ASSERT(request.num_outputs == outputs);
     VertexProgram v = PlaceVertexProgram(std::move(*emitted), "geometry passthrough", key);
@@ -3669,6 +3825,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     // temporaries kept from each to the next and from the draw before, as the PICA's unit keeps them.
     bool serial = false;
     const auto programs = [&] {
+        // A new draw's two programs at once: the second on the first tier's worker.
+        QueueGeometryPair(rows, rows_uniform, rows_table, first_uniform, input_rows, cap, serial,
+                          b15);
         pica.gs_setup.uniforms.b[15] = b15;
         first_program = &GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform,
                                             input_rows, cap, serial, describe);
@@ -3960,6 +4119,15 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
 }
 
 Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
+    return FragmentConfigFor(regs, draw_own_pixel, draw_kills_viewport);
+}
+
+void RasterizerSgxd::PrefetchFragment(const Pica::RegsInternal& parse_regs) {
+    tier1->QueueFragment(FragmentConfigFor(parse_regs, 0, false));
+}
+
+Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInternal& regs,
+                                                         u32 own_pixel, bool kills_viewport) {
     Pica::Shader::FSConfig config{regs};
     // The SGX's samplers have no border colour: a border mode clamps (AddressMode) and the fragment
     // program puts the border colour past the texture.
@@ -4004,7 +4172,7 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
     const auto& sc = rs.scissor_test;
     // A draw writing depth past its part into a store that keeps all of it keeps its fragments by the
     // scissor's kill (the viewport's box); a viewport off the tile grid is the ISP's mask instead.
-    if (draw_kills_viewport) {
+    if (kills_viewport) {
         DEBUG_ASSERT_MSG(config.framebuffer.scissor_test_mode !=
                              Pica::RasterizerRegs::ScissorMode::Exclude,
                          "sgxd: an excluding scissor with a viewport kept by the kill: not built");
@@ -4029,10 +4197,10 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
     }
     u32 alpha_split = 0;
     for (u32 unit = 0; unit < 3; unit++) {
-        alpha_split |= SplitAlpha(unit) ? 1u << unit : 0u;
+        alpha_split |= SplitAlphaIn(regs, unit) ? 1u << unit : 0u;
     }
     config.texture.alpha_split.Assign(alpha_split);
-    config.texture.own_pixel.Assign(draw_own_pixel);
+    config.texture.own_pixel.Assign(own_pixel);
     // A shadow unit 0 that is off reads zeros, as the software renderer leaves its colour: the null
     // texture, read as a plain 2D unit's.
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
@@ -4091,15 +4259,24 @@ const RasterizerSgxd::FragmentProgram& RasterizerSgxd::FragmentProgramFor(const 
             const Pica::Shader::FSConfig config = FragmentConfig();
             const u64 key = Common::HashCombine(config.Hash(), epilogue_key);
             FragmentProgram* program = fragment_programs.Find(key);
+            std::optional<ShaderTier1::Taken> taken;
             if (!program) {
-                // The first tier: registers placed, no optimising passes; microseconds, and
-                // the draw waits for it. The second tier replaces it once it has drawn
-                // Tier2Draws times.
+                // The first tier: registers placed, no optimising passes, and the draw waits for it (a
+                // worker's if one began it, else emitted here). The second tier replaces it after
+                // Tier2Draws draws.
                 std::string refusal;
-                const u64 emit_start = sceKernelGetProcessTimeWide();
-                auto emitted = Usse::EmitFragmentProgram(config, &refusal);
-                const u64 emit_us = sceKernelGetProcessTimeWide() - emit_start;
-                NoteEmit(2, emit_us);
+                std::optional<Usse::Program> emitted;
+                u64 emit_us = 0;
+                if (taken) {
+                    emitted = std::move(taken->program);
+                    refusal = std::move(taken->refusal);
+                    emit_us = taken->took_us;
+                } else {
+                    const u32 emit_start = azaharCyclesStart();
+                    emitted = Usse::EmitFragmentProgram(config, Usse::Scratch::Render, &refusal);
+                    emit_us = Common::CyclesToUs(azaharCycles() - emit_start);
+                    NoteEmit(2, emit_us);
+                }
                 ASSERT_MSG(emitted.has_value(),
                            "sgxd: the emitter has no fragment program for this state: {}",
                            refusal);
@@ -4107,6 +4284,10 @@ const RasterizerSgxd::FragmentProgram& RasterizerSgxd::FragmentProgramFor(const 
                 DumpPicaFragment(key, config);
                 program = &fragment_programs.Emplace(
                     key, PlaceFragmentProgram(std::move(*emitted), epilogue, key, emit_us));
+                if (tier2 && program->usse.primary.size() >= Tier2Words) {
+                    program->tier2_queued = true;
+                    QueueFragmentTier2(key, config);
+                }
             }
             if (fragment_states.Size() >= MaxFragmentStates) {
                 fragment_states.Clear();
@@ -4839,13 +5020,13 @@ RasterizerSgxd::VertexLayout& RasterizerSgxd::VertexLayoutFor() {
             if (vertex_layouts.Size() >= MaxVertexLayouts) {
                 vertex_layouts.Clear();
             }
-            last_layout = &vertex_layouts.Emplace(layout_regs_hash, DecodeVertexLayout());
+            last_layout = &vertex_layouts.Emplace(layout_regs_hash, DecodeVertexLayout(regs));
         }
     }
     return *last_layout;
 }
 
-RasterizerSgxd::VertexLayout RasterizerSgxd::DecodeVertexLayout() const {
+RasterizerSgxd::VertexLayout RasterizerSgxd::DecodeVertexLayout(const Pica::RegsInternal& regs) {
     const auto& va = regs.pipeline.vertex_attributes;
     VertexLayout layout{};
     for (u32 loader_index = 0; loader_index < 12; loader_index++) {
@@ -4903,12 +5084,12 @@ RasterizerSgxd::VertexLayout RasterizerSgxd::DecodeVertexLayout() const {
 }
 
 std::array<u32, RasterizerSgxd::VertexLayout::ProgramKeyWords> RasterizerSgxd::VertexProgramKey(
-    Usse::VsMode mode) {
+    const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, Usse::VsMode mode) {
     // What PicaVSConfig and VertexProgramFor read past the layout: the code and swizzles (hashed only
     // when they change), the entry, lighting, the output mask and attributes, the mode and the bools.
     const auto& reg_array = regs.reg_array;
-    const u64 code = pica.vs_setup.GetProgramCodeHash();
-    const u64 swizzles = pica.vs_setup.GetSwizzleDataHash();
+    const u64 code = setup.GetProgramCodeHash();
+    const u64 swizzles = setup.GetSwizzleDataHash();
     std::array<u32, VertexLayout::ProgramKeyWords> key;
     key[0] = static_cast<u32>(code);
     key[1] = static_cast<u32>(code >> 32);
@@ -4923,7 +5104,7 @@ std::array<u32, RasterizerSgxd::VertexLayout::ProgramKeyWords> RasterizerSgxd::V
     }
     u32 bools = 0;
     for (u32 n = 0; n < 16; n++) {
-        bools |= (pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n;
+        bools |= (setup.uniforms.b[n] ? 1u : 0u) << n;
     }
     key[15] = static_cast<u32>(mode);
     key[16] = bools;
@@ -5067,7 +5248,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
     const VertexProgram* program = nullptr;
     std::array<u32, VertexLayout::ProgramKeyWords> program_key{};
     if (layout) {
-        program_key = VertexProgramKey(mode);
+        program_key = VertexProgramKey(regs, pica.vs_setup, mode);
         if (layout->program && layout->program->tier2_queued && layout->program_key == program_key) {
             program = layout->program;
         }

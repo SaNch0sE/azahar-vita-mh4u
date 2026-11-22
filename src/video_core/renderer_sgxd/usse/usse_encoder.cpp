@@ -16,32 +16,84 @@ namespace SgxdRenderer::Usse {
 
 namespace {
 
+/// A pattern's fields, worked out at compile time: its fixed ones and each run of a letter.
+struct Layout {
+    struct Run {
+        char letter;
+        uint8_t shift;
+        uint8_t width;
+    };
+    uint64_t ones = 0;
+    std::array<Run, 64> runs{};
+    uint8_t count = 0;
+};
+
+constexpr Layout MakeLayout(const char* pattern) {
+    Layout layout{};
+    int i = 0;
+    while (i < 64) {
+        const char c = pattern[i];
+        int j = i;
+        while (j < 64 && pattern[j] == c) {
+            j++;
+        }
+        const int width = j - i;
+        const int shift = 64 - j;
+        if (c == '1') {
+            layout.ones |= ((1ull << width) - 1) << shift;
+        } else if (c != '0' && c != '-') {
+            layout.runs[layout.count++] = {c, static_cast<uint8_t>(shift),
+                                           static_cast<uint8_t>(width)};
+        }
+        i = j;
+    }
+    return layout;
+}
+
 // Vita3K's decoder patterns, verbatim: 64 characters, MSB first; a run of one letter is
 // one field, '0'/'1' are fixed bits, '-' is don't care (written as 0).
-constexpr const char* PatV32Nmad = "00001pppsrrydcbawwwwneeeemmoiittkkllffffffzzzzzzzggghhhhhhjjjjjj";
-constexpr const char* PatV16Nmad = "00010pppsrrydcbawwwwneeeemmoiittkkllffffffzzzzzzzggghhhhhhjjjjjj";
-constexpr const char* PatVmad2 = "00000dpps-ry-cbawwwineeeemmookttffgghhhhhhzzjjllllllqqqqqquuuuuu";
+constexpr Layout PatV32Nmad =
+    MakeLayout("00001pppsrrydcbawwwwneeeemmoiittkkllffffffzzzzzzzggghhhhhhjjjjjj");
+constexpr Layout PatV16Nmad =
+    MakeLayout("00010pppsrrydcbawwwwneeeemmoiittkkllffffffzzzzzzzggghhhhhhjjjjjj");
+constexpr Layout PatVmad2 =
+    MakeLayout("00000dpps-ry-cbawwwineeeemmookttffgghhhhhhzzjjllllllqqqqqquuuuuu");
 // VECMAD has no 3-bit predicate: USE1 bit 26 is its F16 flag and bits 25..24 the 2-bit short
 // predicate (SGXVEC_USE1_VECMAD_F16, SGXVEC_USE1_VECMAD_SVPRED_SHIFT).
-constexpr const char* PatVmad = "000110ppsg1oderaaittnwwwwcbfhzkkjjllmmmmmmqqqquuuuvvxyAAAABBBBBB";
-constexpr const char* PatVdp = "00011pppsc0oderaagttnwwwwbflllkkhhiijjjjjjzzzzmmmqqqyyyxxxuuuuuu";
-constexpr const char* PatVcomp = "00110pppsddyenr-aaaaobbccmmff-ttkk--ggggggg-------hhhhhhh---wwww";
-constexpr const char* PatVmov = "00111pppstrydecbmmaanoooiwwwwkllffgghhhhjjjjjjqqqqqquuuuuuvvvvvv";
-constexpr const char* PatVpck = "01000pppsnuydercaaaaffftttmmmmbbkkllgggggggoohiijjqqqqqqvwwwwwwx";
+constexpr Layout PatVmad =
+    MakeLayout("000110ppsg1oderaaittnwwwwcbfhzkkjjllmmmmmmqqqquuuuvvxyAAAABBBBBB");
+constexpr Layout PatVdp =
+    MakeLayout("00011pppsc0oderaagttnwwwwbflllkkhhiijjjjjjzzzzmmmqqqyyyxxxuuuuuu");
+constexpr Layout PatVcomp =
+    MakeLayout("00110pppsddyenr-aaaaobbccmmff-ttkk--ggggggg-------hhhhhhh---wwww");
+constexpr Layout PatVmov =
+    MakeLayout("00111pppstrydecbmmaanoooiwwwwkllffgghhhhjjjjjjqqqqqquuuuuuvvvvvv");
+constexpr Layout PatVpck =
+    MakeLayout("01000pppsnuydercaaaaffftttmmmmbbkkllgggggggoohiijjqqqqqqvwwwwwwx");
 // SOP2 and SOP3 (Vita3K's layouts).
-constexpr const char* PatSop2 = "10000ppcsnaaderbmooofllggghhhittkkjjqqqqqqquvvwwxyzzzzzzzAAAAAAA";
-constexpr const char* PatSop3 = "10001ppcsnooderbmallfgghhhiiikttjjqquuuuuuuvvvvvvvwwwwwwwxxxxxxx";
+constexpr Layout PatSop2 =
+    MakeLayout("10000ppcsnaaderbmooofllggghhhittkkjjqqqqqqquvvwwxyzzzzzzzAAAAAAA");
+constexpr Layout PatSop3 =
+    MakeLayout("10001ppcsnooderbmallfgghhhiiikttjjqquuuuuuuvvvvvvvwwwwwwwxxxxxxx");
 // Bit 54 ('-' in Vita3K's pattern) is the compare's nosched bit, where VPCK and SMP have
 // theirs; exposed as 'K'. (It looked like "set on every compare except the one feeding a
 // kill" until the liveness rule explained it.)
-constexpr const char* PatVtst = "01001pppsKoydrceavttiizzmhhhnnbbkkffgggggggwlluuuujjjjjjjqqqqqqq";
-constexpr const char* PatSmp = "11100pppsn-ymrceffaaddlltbbggkhhiijjoooooooqqqqqqquuuuuuuvvvvvvv";
-constexpr const char* PatVldst = "111oopppsnmycrbakkkkddeetgffihjlqquuvvvvvvvwwwwwwwxxxxxxxzzzzzzz";
-constexpr const char* PatVbw = "01ooopppsnrydecxaaaaittttthhbwkkffggjjjjjjjlllllllmmmmmmmqqqqqqq";
-constexpr const char* PatI16Mad = "10100ppasnredbck-tttmmffoolhhgiijjqquuuuuuuvvvvvvvwwwwwwwxxxxxxx";
-constexpr const char* PatI32Mad = "10101pps-nrcdeba0tttif00yy000kgghhjjlllllllmmmmmmmoooooooqqqqqqq";
-constexpr const char* PatDepthf = "11111011s-11recb----npp---tffa--kkddggggggghhhhhhhiiiiiiijjjjjjj";
-constexpr const char* PatBr = "11111ppps000e-----wynba00r----------------iloooooooooooooooooooo";
+constexpr Layout PatVtst =
+    MakeLayout("01001pppsKoydrceavttiizzmhhhnnbbkkffgggggggwlluuuujjjjjjjqqqqqqq");
+constexpr Layout PatSmp =
+    MakeLayout("11100pppsn-ymrceffaaddlltbbggkhhiijjoooooooqqqqqqquuuuuuuvvvvvvv");
+constexpr Layout PatVldst =
+    MakeLayout("111oopppsnmycrbakkkkddeetgffihjlqquuvvvvvvvwwwwwwwxxxxxxxzzzzzzz");
+constexpr Layout PatVbw =
+    MakeLayout("01ooopppsnrydecxaaaaittttthhbwkkffggjjjjjjjlllllllmmmmmmmqqqqqqq");
+constexpr Layout PatI16Mad =
+    MakeLayout("10100ppasnredbck-tttmmffoolhhgiijjqquuuuuuuvvvvvvvwwwwwwwxxxxxxx");
+constexpr Layout PatI32Mad =
+    MakeLayout("10101pps-nrcdeba0tttif00yy000kgghhjjlllllllmmmmmmmoooooooqqqqqqq");
+constexpr Layout PatDepthf =
+    MakeLayout("11111011s-11recb----npp---tffa--kkddggggggghhhhhhhiiiiiiijjjjjjj");
+constexpr Layout PatBr =
+    MakeLayout("11111ppps000e-----wynba00r----------------iloooooooooooooooooooo");
 
 struct Field {
     char letter;
@@ -52,41 +104,36 @@ struct Field {
     throw std::logic_error(what);
 }
 
-uint64_t Pack(const char* pattern, std::initializer_list<Field> fields) {
-    uint64_t word = 0;
-    int i = 0;
-    while (i < 64) {
-        const char c = pattern[i];
-        int j = i;
-        while (j < 64 && pattern[j] == c) {
-            j++;
+uint64_t Pack(const Layout& layout, std::initializer_list<Field> fields) {
+    // Each letter's field, the first supplied: the patterns' letters are 'A' to 'z'.
+    std::array<uint8_t, 'z' - 'A' + 1> at;
+    at.fill(0xff);
+    uint8_t k = 0;
+    for (const Field& f : fields) {
+        if (f.letter < 'A' || f.letter > 'z') {
+            Fail("usse: pattern field letter out of range");
         }
-        const int width = j - i;
-        const int shift = 64 - j;
-        uint64_t value = 0;
-        if (c == '1') {
-            value = (1ull << width) - 1;
-        } else if (c != '0' && c != '-') {
-            bool found = false;
-            for (const Field& f : fields) {
-                if (f.letter == c) {
-                    value = f.value;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                Fail("usse: pattern field not supplied");
-            }
-            if (width < 64 && value >> width) {
-                const std::string what = std::string("usse: field value does not fit: '") + c +
-                                         "' = " + std::to_string(value) + " in " +
-                                         std::to_string(width) + " bits";
-                Fail(what.c_str());
-            }
+        uint8_t& slot = at[f.letter - 'A'];
+        if (slot == 0xff) {
+            slot = k;
         }
-        word |= value << shift;
-        i = j;
+        k++;
+    }
+    uint64_t word = layout.ones;
+    for (uint8_t r = 0; r < layout.count; r++) {
+        const Layout::Run& run = layout.runs[r];
+        const uint8_t index = at[run.letter - 'A'];
+        if (index == 0xff) {
+            Fail("usse: pattern field not supplied");
+        }
+        const uint64_t value = fields.begin()[index].value;
+        if (run.width < 64 && value >> run.width) {
+            const std::string what = std::string("usse: field value does not fit: '") + run.letter +
+                                     "' = " + std::to_string(value) + " in " +
+                                     std::to_string(run.width) + " bits";
+            Fail(what.c_str());
+        }
+        word |= value << run.shift;
     }
     return word;
 }

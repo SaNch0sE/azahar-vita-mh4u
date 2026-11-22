@@ -203,6 +203,9 @@ constexpr uint8_t TmpU8EvenB = 190;
 /// lighting: a LUT read at N.V, the same for every light (.x D0, .y D1), read once before them;
 /// N.V itself in .z.
 constexpr uint8_t TmpLutShared = 244;
+/// lighting: a memory light's base past the load offset's reach (LightParams): the uniform
+/// buffer's pointer moved on to the light's quad, in TmpLutShared's unused .w.
+constexpr uint8_t TmpLightBase = TmpLutShared + 3;
 /// lighting: a light's D0 (.x) and D1 (.y), and its spot factor while the distance attenuation
 /// is read (.z), in the last proctex batch read's home (the procedural texture is done before
 /// the lights).
@@ -640,10 +643,11 @@ private:
     };
     std::vector<MemoryUniform> memory_uniforms;
     std::array<int32_t, 8> light_memory{}; ///< per light number: float offset, or -1 (resident)
-    /// The light being lit when it lives in memory (LightParams): its float offset, its quads
-    /// loaded into TmpLightMem so far (bit q: floats 4q..4q+3), and whether a load still
-    /// waits for its WDF.
+    /// The light being lit when it lives in memory (LightParams): its float offset (from
+    /// TmpLightBase with light_mem_far), its quads loaded into TmpLightMem so far (bit q:
+    /// floats 4q..4q+3), and whether a load still waits for its WDF.
     bool light_mem = false;
+    bool light_mem_far = false;
     uint32_t light_mem_offset = 0;
     uint32_t light_mem_loaded = 0;
     bool light_mem_pending = false;
@@ -1371,12 +1375,18 @@ Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
     // own: one sixteen-float load filled sixteen registers from the first quad's home (past
     // the program's temps), while the three quads after it read registers nothing loaded
     // (a game's speckled drivers). The immediate offset is in floats and seven
-    // bits wide; the fourth light past the budget still fits.
+    // bits wide, which the fifth light past the budget passes (a game: seven lights
+    // in memory, the sixth's at float 120): from there the light's quads load from a base the
+    // pointer plus its quad, as psp2cgc moves a far uniform's (`or`, then `mad.i32` by 16 and
+    // the pointer; the vertex programs' far uniforms).
     const uint32_t off = static_cast<uint32_t>(light_memory[num]);
-    if (off + 20 > 127) {
-        throw std::runtime_error("light parameters past the load offset's reach");
+    light_mem_far = off + 20 > 127;
+    if (light_mem_far) {
+        const Reg base = Reg::V(TmpLightBase);
+        e.Bitwise(BwOp::Or, base, IOp::Imm(static_cast<uint8_t>(off / 4)), IOp::Imm(0));
+        e.MadI32(base, base, 16, Reg::Sa(static_cast<uint8_t>(uniform_floats)));
     }
-    light_mem_offset = off;
+    light_mem_offset = light_mem_far ? off % 4 : off;
     light_mem_loaded = 0;
     light_mem_pending = false;
     return {Bank::Virtual, TmpLightMem};
@@ -1389,7 +1399,9 @@ void FragmentEmitter::LightQuads(uint32_t mask, bool wait) {
     if (!light_mem) {
         return;
     }
-    const Reg ptr = Reg::Sa(static_cast<uint8_t>(uniform_floats)); // the data block's head
+    // The data block's head, or the far light's base.
+    const Reg ptr =
+        light_mem_far ? Reg::V(TmpLightBase) : Reg::Sa(static_cast<uint8_t>(uniform_floats));
     for (uint32_t q = 0; q < 6; q++) {
         if ((mask >> q & 1) != 0 && (light_mem_loaded >> q & 1) == 0) {
             e.Lda32(Reg::V(static_cast<uint8_t>(TmpLightMem + 4 * q)), ptr, nullptr,
@@ -4628,13 +4640,13 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
 } // Anonymous namespace
 
 uint32_t SampledTextureUnits(const FSConfig& config) {
-    FragmentEmitter emitter{config, 1};
+    FragmentEmitter emitter{config, 1, std::nullopt};
     return emitter.SampledUnits();
 }
 
-std::optional<Program> EmitFragmentProgram(const FSConfig& config, std::string* refusal,
-                                          int level) {
-    FragmentEmitter emitter{config, level};
+std::optional<Program> EmitFragmentProgram(const FSConfig& config, Scratch scratch,
+                                          std::string* refusal, int level) {
+    FragmentEmitter emitter{config, level, scratch};
     std::optional<FragmentEmitter> exact;
     try {
         std::optional<Program> emitted = emitter.Emit(refusal);
@@ -4649,7 +4661,7 @@ std::optional<Program> EmitFragmentProgram(const FSConfig& config, std::string* 
         std::string why;
         std::optional<Program> resident;
         while (true) {
-            exact.emplace(config, level, reserve);
+            exact.emplace(config, level, scratch, reserve);
             try {
                 resident = exact->Emit(&why);
             } catch (const std::exception&) {

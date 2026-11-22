@@ -123,8 +123,9 @@ public:
         return cb + 2;
     }
 
-    /// The code heap's size: the programs PlaceCode places share it.
-    static constexpr u32 CodeBytes = 1u << 20;
+    /// The code heap's size: the shared block's CDRAM holds its first megabyte or more, uncached
+    /// main memory mapped after it the rest (DOUTU reaches 8 MiB from the code base).
+    static constexpr u32 CodeBytes = 4u << 20;
     /// USSE code: its offset from code base HeapCodeBase(cb) (cb 0 vertex, 1 pixel).
     u32 PlaceCode(unsigned cb, std::span<const u64> words);
     /// The code heap's bytes free now: its free ranges and its unused end, once the code given
@@ -796,7 +797,12 @@ private:
     std::vector<SgxdRecipeDraw> init_draws;
 
     u32 code_begin{}; // the code heap in the shared block (code bases 2 and 3)
+    u32 code_cdram{}; // its bytes there, to the block's end
+    u8* code_main{};  // the rest, in main memory, at GPU BlockVa + shared_size
+    int code_main_block{-1};
     u32 code_used{};  // its bytes
+    /// Copies code to heap offset `at`, across the CDRAM part's end into main memory.
+    void CopyCode(u32 at, const void* words, u32 bytes);
     /// Code FreeCode gave back: waiting for the passes begun before (mark, PassMark's), and
     /// free (by offset, neighbours merged), which AllocateCode takes first.
     struct CodeRange {

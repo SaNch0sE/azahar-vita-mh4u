@@ -113,9 +113,9 @@ inline constexpr uint32_t GsStateQuads = 16 + 3 * 16;
 /// register (VsRequest::gs_uniform_table).
 [[nodiscard]] bool GsIndexesUniforms(std::span<const uint32_t> code, uint32_t code_size);
 
-/// `level` 2 runs the IR's optimising passes (the second tier).
+/// `level` 2 runs the IR's optimising passes (the second tier). `scratch`: the calling thread.
 [[nodiscard]] std::optional<Program> EmitVertexProgram(const VsRequest& request,
-                                                      uint32_t& input_regs,
+                                                      uint32_t& input_regs, Scratch scratch,
                                                       std::string* refusal = nullptr,
                                                       int level = 1);
 

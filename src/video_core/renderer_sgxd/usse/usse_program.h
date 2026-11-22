@@ -11,6 +11,11 @@
 
 namespace SgxdRenderer::Usse {
 
+/// The threads that emit programs, one at a time each: each has its own of the lowering's buffers,
+/// kept from one program to the next (no thread_local: the emitter names its thread).
+enum class Scratch : uint32_t { Render, Tier1, Tier2, Tier2b };
+constexpr uint32_t ScratchCount = 4;
+
 /**
  * An emitted USSE program, as sgxd runs it: the code words, the register counts the PDS
  * programs and the pass state take, and the program's secondary attribute (SA) layout, which

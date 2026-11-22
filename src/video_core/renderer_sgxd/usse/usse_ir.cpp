@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -39,9 +40,41 @@ struct Ref {
     bool def;
 };
 
+class RefList {
+public:
+    void clear() {
+        count = 0;
+    }
+    void push_back(const Ref& r) {
+        if (count == items.size()) {
+            Fail("more than four registers in an instruction");
+        }
+        items[count++] = r;
+    }
+    [[nodiscard]] std::size_t size() const {
+        return count;
+    }
+    [[nodiscard]] bool empty() const {
+        return count == 0;
+    }
+    const Ref& operator[](std::size_t k) const {
+        return items[k];
+    }
+    const Ref* begin() const {
+        return items.data();
+    }
+    const Ref* end() const {
+        return items.data() + count;
+    }
+
+private:
+    std::array<Ref, 4> items{};
+    std::size_t count = 0;
+};
+
 /// The registers an instruction touches, in a fixed order; `hi` of a four-wide move is
 /// unused when `lo` is internal, and a load or sample defines a whole quad.
-void Refs(Inst& i, std::vector<Ref>& out) {
+void Refs(Inst& i, RefList& out) {
     out.clear();
     switch (i.op) {
     case Op::Vec:
@@ -232,7 +265,7 @@ std::string SrcName(const Src& s) {
 /// One line per instruction, for refusal messages, tests and the dump: every field the
 /// simulator needs.
 std::string Describe(Inst& i) {
-    std::vector<Ref> refs;
+    RefList refs;
     Refs(i, refs);
     std::string out = OpName(i.op);
     if (i.op == Op::Br || i.op == Op::Label) {
@@ -617,10 +650,57 @@ void Builder::AddClass(RegClass cls) {
 
 namespace {
 
+/// A lane set of every virtual quad, one plane a lane: bit q of lane[l] is lane l of quad q.
+/// A virtual register's number is eight bits, so the quads fit one plane.
+struct QuadLanes {
+    std::array<uint64_t, 4> lane{};
+
+    void Add(uint32_t q, unsigned lanes) {
+        for (unsigned l = 0; l < 4; l++) {
+            lane[l] |= static_cast<uint64_t>((lanes >> l) & 1) << q;
+        }
+    }
+    uint8_t Of(uint32_t q) const {
+        return static_cast<uint8_t>((lane[0] >> q & 1) | (lane[1] >> q & 1) << 1 |
+                                    (lane[2] >> q & 1) << 2 | (lane[3] >> q & 1) << 3);
+    }
+    bool operator==(const QuadLanes&) const = default;
+};
+
+struct Interval {
+    std::size_t start = SIZE_MAX;
+    std::size_t end = 0;
+    bool used = false;
+    bool temp_or_pa = false; ///< a load, sample or integer op names it: not an output register
+    bool temp_only = false;  ///< depthf reads it: a temporary (Encoder::DepthF)
+    std::optional<Reg> home;
+    /// Bit i set when the quad is live at instruction i (defined, used, or carried
+    /// across): the allocator fits quads into the holes, not the hull.
+    std::vector<uint64_t> active;
+
+    void Reset(std::size_t words) {
+        start = SIZE_MAX;
+        end = 0;
+        used = temp_or_pa = temp_only = false;
+        home.reset();
+        active.assign(words, 0);
+    }
+};
+
+struct LoweringScratch {
+    std::vector<QuadLanes> live, uses, defs, live_in;
+    std::vector<Interval> intervals;
+    std::vector<bool> split;
+    std::vector<std::array<Interval, 2>> halves;
+    std::atomic<bool> busy{false};
+};
+std::array<LoweringScratch, ScratchCount> scratches;
+
 class Lowering {
 public:
-    Lowering(std::vector<Inst>& insts_, const std::vector<RegClass>& classes_)
-        : insts{insts_}, classes{classes_} {}
+    Lowering(std::vector<Inst>& insts_, const std::vector<RegClass>& classes_, LoweringScratch& s)
+        : insts{insts_}, classes{classes_}, live{s.live}, uses{s.uses}, defs{s.defs},
+          live_in{s.live_in}, intervals{s.intervals}, split{s.split}, halves{s.halves} {}
 
     LowerResult Run(Encoder& e, int level);
     bool skip_auto = false;
@@ -636,6 +716,10 @@ private:
     /// from the register named; with split_pairs, `split` and `halves` too. Only for the
     /// allocation: the passes keep the coarser reads they were written against.
     void Liveness(bool precise = false);
+    /// The first tier's `intervals` without Liveness: each quad's hull (whole quads, with
+    /// split_pairs too).
+    void Hulls();
+    void MarkBanks();
     void DeadStores();
     void Reloads();
     void HoistLoads(int max_group);
@@ -671,25 +755,16 @@ private:
     std::vector<Inst>& insts;
     const std::vector<RegClass>& classes;
     uint32_t quad_count = 0;
-    /// live[i][q]: the lanes of virtual quad q live after instruction i has executed.
-    std::vector<std::vector<uint8_t>> live;
-    /// The interval each quad occupies, in instruction indices.
-    struct Interval {
-        std::size_t start = SIZE_MAX;
-        std::size_t end = 0;
-        bool used = false;
-        bool temp_or_pa = false; ///< a load, sample or integer op names it: not an output register
-        bool temp_only = false;  ///< depthf reads it: a temporary (Encoder::DepthF)
-        std::optional<Reg> home;
-        /// Bit i set when the quad is live at instruction i (defined, used, or carried
-        /// across): the allocator fits quads into the holes, not the hull.
-        std::vector<uint64_t> active;
-    };
-    std::vector<Interval> intervals;
+    /// live[i].Of(q): the lanes of virtual quad q live after instruction i has executed.
+    std::vector<QuadLanes>& live;
+    std::vector<QuadLanes>& uses;
+    std::vector<QuadLanes>& defs;
+    std::vector<QuadLanes>& live_in;
+    std::vector<Interval>& intervals;
     /// split_pairs: whether a quad's two pairs live apart (no operand reaches across its
     /// middle), and each pair's interval (lanes 0-1, 2-3).
-    std::vector<bool> split;
-    std::vector<std::array<Interval, 2>> halves;
+    std::vector<bool>& split;
+    std::vector<std::array<Interval, 2>>& halves;
     std::set<uint32_t> coalesced_outputs; ///< output quads written in place: no spills there
     uint32_t spilled = 0;
     uint32_t temp_count = 0;
@@ -749,7 +824,7 @@ uint8_t SwizzleRegs(const Src& src, uint8_t mask) {
 /// what their operands name (a pair, a U8 or integer word, a swizzle's channels); any other
 /// is taken to read four registers from the one named.
 template <typename F>
-void PreciseReads(Inst& inst, std::vector<Ref>& refs, F&& f) {
+void PreciseReads(Inst& inst, RefList& refs, F&& f) {
     switch (inst.op) {
     case Op::Vec:
         f(inst.src[0].reg, SwizzleRegs(inst.src[0], inst.dst.mask));
@@ -858,11 +933,18 @@ uint8_t InternalWriteLanes(const Inst& inst) {
 
 void Lowering::Liveness(bool precise) {
     const std::size_t n = insts.size();
-    std::vector<Ref> refs;
-    std::map<int, std::size_t> label_at;
+    if (quad_count > 64) {
+        Fail("more than 64 virtual quads");
+    }
+    RefList refs;
+    std::vector<std::size_t> label_at;
     for (std::size_t i = 0; i < n; i++) {
         if (insts[i].op == Op::Label) {
-            label_at[insts[i].label] = i;
+            const auto label = static_cast<std::size_t>(insts[i].label);
+            if (label >= label_at.size()) {
+                label_at.resize(label + 1, SIZE_MAX);
+            }
+            label_at[label] = i;
         }
     }
     // Successors: the fallthrough unless an unconditional branch, plus a branch target.
@@ -870,11 +952,11 @@ void Lowering::Liveness(bool precise) {
         int count = 0;
         const Inst& inst = insts[i];
         if (inst.op == Op::Br) {
-            const auto it = label_at.find(inst.label);
-            if (it == label_at.end()) {
+            const auto label = static_cast<std::size_t>(inst.label);
+            if (label >= label_at.size() || label_at[label] == SIZE_MAX) {
                 Fail("branch to an unbound label");
             }
-            out[count++] = it->second;
+            out[count++] = label_at[label];
             if (inst.pred == Pred::None) {
                 return count;
             }
@@ -887,8 +969,8 @@ void Lowering::Liveness(bool precise) {
 
     // Per instruction and quad: the lanes read and the lanes written outright. A
     // predicated write keeps the old lanes alive, so it reads them and defines nothing.
-    std::vector<std::vector<uint8_t>> uses(n, std::vector<uint8_t>(quad_count, 0));
-    std::vector<std::vector<uint8_t>> defs(n, std::vector<uint8_t>(quad_count, 0));
+    uses.assign(n, {});
+    defs.assign(n, {});
     // split_pairs: a quad stays whole when an operand reaches across its middle or past it.
     const bool pairs = precise && split_pairs;
     split.assign(pairs ? quad_count : 0, true);
@@ -921,9 +1003,9 @@ void Lowering::Liveness(bool precise) {
             const uint32_t q = QuadOf(*r.reg);
             const uint8_t lanes = WriteLanes(inst, *r.reg);
             if (inst.pred == Pred::None) {
-                defs[i][q] |= lanes;
+                defs[i].Add(q, lanes);
             } else {
-                uses[i][q] |= lanes;
+                uses[i].Add(q, lanes);
             }
             if (pairs) {
                 // WriteLanes' mask before it is cut to the quad: a four-lane load or read
@@ -939,57 +1021,61 @@ void Lowering::Liveness(bool precise) {
                     return;
                 }
                 const unsigned lanes = static_cast<unsigned>(regs) << (r.n & 3);
-                uses[i][QuadOf(r)] |= static_cast<uint8_t>(lanes & 0xf);
+                uses[i].Add(QuadOf(r), lanes & 0xf);
                 if ((lanes >> 4) != 0 && QuadOf(r) + 1 < quad_count) {
-                    uses[i][QuadOf(r) + 1] |= static_cast<uint8_t>(lanes >> 4);
+                    uses[i].Add(QuadOf(r) + 1, lanes >> 4);
                 }
                 if (pairs) {
                     touch(r, regs);
                 }
             });
         } else {
-            Refs(inst, refs);
             for (const Ref& r : refs) {
                 if (IsVirtual(*r.reg) && !r.def) {
-                    uses[i][QuadOf(*r.reg)] |= ReadLanes(*r.reg);
+                    uses[i].Add(QuadOf(*r.reg), ReadLanes(*r.reg));
                 }
             }
         }
     }
 
-    live.assign(n, std::vector<uint8_t>(quad_count, 0));
-    std::vector<std::vector<uint8_t>> in(n, std::vector<uint8_t>(quad_count, 0));
+    live.assign(n, {});
+    live_in.assign(n, {});
     bool changed = true;
     while (changed) {
         changed = false;
         for (std::size_t i = n; i-- > 0;) {
             std::size_t succ[2];
             const int count = successors(i, succ);
-            for (uint32_t q = 0; q < quad_count; q++) {
-                uint8_t out = 0;
-                for (int s = 0; s < count; s++) {
-                    out |= in[succ[s]][q];
+            QuadLanes out;
+            for (int s = 0; s < count; s++) {
+                for (int l = 0; l < 4; l++) {
+                    out.lane[l] |= live_in[succ[s]].lane[l];
                 }
-                if (out != live[i][q]) {
-                    live[i][q] = out;
-                    changed = true;
-                }
-                const uint8_t new_in = static_cast<uint8_t>(uses[i][q] | (out & ~defs[i][q]));
-                if (new_in != in[i][q]) {
-                    in[i][q] = new_in;
-                    changed = true;
-                }
+            }
+            if (out != live[i]) {
+                live[i] = out;
+                changed = true;
+            }
+            QuadLanes in;
+            for (int l = 0; l < 4; l++) {
+                in.lane[l] = uses[i].lane[l] | (out.lane[l] & ~defs[i].lane[l]);
+            }
+            if (in != live_in[i]) {
+                live_in[i] = in;
+                changed = true;
             }
         }
     }
 
-    intervals.assign(quad_count, {});
-    halves.assign(pairs ? quad_count : 0, {});
+    intervals.resize(quad_count);
+    halves.resize(pairs ? quad_count : 0);
+    uint64_t split_quads = 0;
     for (uint32_t q = 0; q < quad_count; q++) {
-        intervals[q].active.assign((n + 63) / 64, 0);
+        intervals[q].Reset((n + 63) / 64);
         if (pairs) {
-            halves[q][0].active.assign((n + 63) / 64, 0);
-            halves[q][1].active.assign((n + 63) / 64, 0);
+            halves[q][0].Reset((n + 63) / 64);
+            halves[q][1].Reset((n + 63) / 64);
+            split_quads |= static_cast<uint64_t>(split[q]) << q;
         }
     }
     const auto mark = [](Interval& iv, std::size_t i, bool used) {
@@ -999,23 +1085,31 @@ void Lowering::Liveness(bool precise) {
         iv.active[i / 64] |= 1ull << (i % 64);
     };
     for (std::size_t i = 0; i < n; i++) {
-        for (uint32_t q = 0; q < quad_count; q++) {
-            const uint8_t lanes = uses[i][q] | defs[i][q] | in[i][q] | live[i][q];
-            if (lanes != 0) {
-                mark(intervals[q], i, uses[i][q] != 0);
-                if (pairs && split[q]) {
-                    for (int h = 0; h < 2; h++) {
-                        const uint8_t m = static_cast<uint8_t>(0x3 << (2 * h));
-                        if (lanes & m) {
-                            mark(halves[q][h], i, (uses[i][q] & m) != 0);
-                        }
-                    }
-                }
+        std::array<uint64_t, 4> lanes;
+        for (int l = 0; l < 4; l++) {
+            lanes[l] = uses[i].lane[l] | defs[i].lane[l] | live_in[i].lane[l] | live[i].lane[l];
+        }
+        const std::array<uint64_t, 4>& used = uses[i].lane;
+        const uint64_t any = lanes[0] | lanes[1] | lanes[2] | lanes[3];
+        const uint64_t any_used = used[0] | used[1] | used[2] | used[3];
+        for (uint64_t bits = any; bits != 0; bits &= bits - 1) {
+            const auto q = static_cast<uint32_t>(std::countr_zero(bits));
+            mark(intervals[q], i, (any_used >> q & 1) != 0);
+        }
+        for (int h = 0; h < 2; h++) {
+            const uint64_t half = (lanes[2 * h] | lanes[2 * h + 1]) & split_quads;
+            const uint64_t half_used = used[2 * h] | used[2 * h + 1];
+            for (uint64_t bits = half; bits != 0; bits &= bits - 1) {
+                const auto q = static_cast<uint32_t>(std::countr_zero(bits));
+                mark(halves[q][h], i, (half_used >> q & 1) != 0);
             }
         }
     }
-    for (std::size_t i = 0; i < n; i++) {
-        const Inst& inst = insts[i];
+    MarkBanks();
+}
+
+void Lowering::MarkBanks() {
+    for (const Inst& inst : insts) {
         if (inst.op == Op::Lda32 || inst.op == Op::Sample2D || inst.op == Op::MadI16 ||
             inst.op == Op::MadI32 || inst.op == Op::DepthF || inst.op == Op::UnpackInt ||
             inst.op == Op::Sta32) {
@@ -1041,8 +1135,83 @@ void Lowering::Liveness(bool precise) {
     }
 }
 
+void Lowering::Hulls() {
+    // A quad from its first reference to its last, and over every loop its range meets: a loop
+    // may carry its value round, and Liveness's dataflow costs the first tier half its time.
+    const std::size_t n = insts.size();
+    if (quad_count > 64) {
+        Fail("more than 64 virtual quads");
+    }
+    const std::size_t words = (n + 63) / 64;
+    intervals.resize(quad_count);
+    for (Interval& iv : intervals) {
+        iv.Reset(words);
+    }
+    // No quad split: AllocatePairs takes whole quads, and reads no half.
+    split.assign(split_pairs ? quad_count : 0, false);
+    halves.clear();
+    std::vector<std::size_t> label_at;
+    RefList refs;
+    for (std::size_t i = 0; i < n; i++) {
+        Inst& inst = insts[i];
+        if (inst.op == Op::Label) {
+            const auto label = static_cast<std::size_t>(inst.label);
+            if (label >= label_at.size()) {
+                label_at.resize(label + 1, SIZE_MAX);
+            }
+            label_at[label] = i;
+        }
+        Refs(inst, refs);
+        for (const Ref& r : refs) {
+            if (IsVirtual(*r.reg)) {
+                Interval& iv = intervals[QuadOf(*r.reg)];
+                iv.start = std::min(iv.start, i);
+                iv.end = std::max(iv.end, i);
+                iv.used = iv.used || !r.def;
+            }
+        }
+    }
+    std::vector<std::pair<std::size_t, std::size_t>> loops;
+    for (std::size_t i = 0; i < n; i++) {
+        if (insts[i].op != Op::Br) {
+            continue;
+        }
+        const auto label = static_cast<std::size_t>(insts[i].label);
+        if (label >= label_at.size() || label_at[label] == SIZE_MAX) {
+            Fail("branch to an unbound label");
+        }
+        if (label_at[label] <= i) {
+            loops.emplace_back(label_at[label], i);
+        }
+    }
+    // A range a loop widened can meet a loop it did not: again until none grows.
+    for (bool grew = !loops.empty(); grew;) {
+        grew = false;
+        for (const auto& [head, tail] : loops) {
+            for (Interval& iv : intervals) {
+                if (iv.start <= tail && iv.end >= head && (iv.start > head || iv.end < tail)) {
+                    iv.start = std::min(iv.start, head);
+                    iv.end = std::max(iv.end, tail);
+                    grew = true;
+                }
+            }
+        }
+    }
+    for (Interval& iv : intervals) {
+        if (iv.start == SIZE_MAX) {
+            continue;
+        }
+        for (std::size_t w = iv.start / 64; w <= iv.end / 64; w++) {
+            const std::size_t lo = std::max(iv.start, w * 64) - w * 64;
+            const std::size_t hi = std::min(iv.end, w * 64 + 63) - w * 64;
+            iv.active[w] = (hi == 63 ? ~0ull : (1ull << (hi + 1)) - 1) & ~((1ull << lo) - 1);
+        }
+    }
+    MarkBanks();
+}
+
 void Lowering::DeadStores() {
-    std::vector<Ref> refs;
+    RefList refs;
     std::vector<Inst> kept;
     kept.reserve(insts.size());
     for (std::size_t i = 0; i < insts.size(); i++) {
@@ -1053,7 +1222,7 @@ void Lowering::DeadStores() {
             for (const Ref& r : refs) {
                 if (r.def) {
                     dead = IsVirtual(*r.reg) &&
-                           (live[i][QuadOf(*r.reg)] & WriteLanes(inst, *r.reg)) == 0;
+                           (live[i].Of(QuadOf(*r.reg)) & WriteLanes(inst, *r.reg)) == 0;
                 }
             }
         }
@@ -1067,7 +1236,7 @@ void Lowering::DeadStores() {
 void Lowering::Reloads() {
     // What each internal register holds: the load that filled it.
     std::optional<Inst> held[3];
-    std::vector<Ref> refs;
+    RefList refs;
     std::vector<Inst> kept;
     kept.reserve(insts.size());
     for (Inst& inst : insts) {
@@ -1108,7 +1277,7 @@ void Lowering::Reloads() {
 }
 
 bool Lowering::InternalRead(std::size_t from, uint8_t reg, uint8_t lanes) {
-    std::vector<Ref> refs;
+    RefList refs;
     for (std::size_t i = from; i < insts.size() && lanes != 0; i++) {
         Inst& inst = insts[i];
         if (IsBarrier(inst)) {
@@ -1136,7 +1305,7 @@ bool Lowering::InternalRead(std::size_t from, uint8_t reg, uint8_t lanes) {
 }
 
 void Lowering::InternalDeadWrites() {
-    std::vector<Ref> refs;
+    RefList refs;
     std::vector<Inst> kept;
     kept.reserve(insts.size());
     for (std::size_t i = 0; i < insts.size(); i++) {
@@ -1261,7 +1430,7 @@ namespace {
 /// The registers an instruction writes, as (bank, register) pairs at lane granularity.
 void WrittenRegs(Inst& inst, std::vector<std::pair<Bank, int>>& out) {
     out.clear();
-    std::vector<Ref> refs;
+    RefList refs;
     Refs(inst, refs);
     for (const Ref& r : refs) {
         if (!r.def) {
@@ -1309,7 +1478,7 @@ void Lowering::HoistLoadsGlobal() {
     // (the MOVA at the top of a skinning program) are read once, right after that last
     // write, and every later read of the same index is that quad: the compiler keeps
     // the bone matrix in three temporaries for the whole program.
-    std::vector<Ref> refs;
+    RefList refs;
     struct Site {
         std::size_t start, load, wait;
         Reg addr, dst, areg, ones, ptr;
@@ -1500,7 +1669,7 @@ void Lowering::HoistLoads(int max_group) {
         std::vector<std::pair<Bank, int>> inputs; // registers the chain and load read
     };
     std::vector<Sequence> seqs;
-    std::vector<Ref> refs;
+    RefList refs;
     // A load whose quad is written by no other instruction is one already hoisted (its
     // readers may sit in other blocks): left alone.
     std::map<uint32_t, int> quad_defs;
@@ -1868,7 +2037,7 @@ std::optional<Src> Lowering::LoadedSourceOf(std::size_t at, const Src& src) cons
         return src;
     }
     std::optional<Src> loaded;
-    std::vector<Ref> rr;
+    RefList rr;
     for (std::size_t j = at; j-- > 0;) {
         if (IsBarrier(insts[j])) {
             break;
@@ -1922,7 +2091,7 @@ std::optional<Src> Lowering::CopiedSourceOf(std::size_t at, const Src& half) con
         return std::nullopt;
     }
     const uint8_t pair = half.reg.n & ~1u;
-    std::vector<Ref> rr;
+    RefList rr;
     for (std::size_t j = at; j-- > 0;) {
         if (IsBarrier(insts[j])) {
             return std::nullopt;
@@ -1987,7 +2156,7 @@ void Lowering::TwoWideChains() {
                inst.dst.reg.bank == Bank::Internal && inst.dst.mask == 0xf &&
                inst.pred == Pred::None;
     };
-    const auto reads_reg = [](Inst& inst, uint8_t k, std::vector<Ref>& rr) {
+    const auto reads_reg = [](Inst& inst, uint8_t k, RefList& rr) {
         Refs(inst, rr);
         for (const Ref& r : rr) {
             if (!r.def && r.reg->bank == Bank::Internal && r.reg->n == k) {
@@ -1996,7 +2165,7 @@ void Lowering::TwoWideChains() {
         }
         return false;
     };
-    const auto writes_reg = [](Inst& inst, uint8_t k, std::vector<Ref>& rr) {
+    const auto writes_reg = [](Inst& inst, uint8_t k, RefList& rr) {
         Refs(inst, rr);
         for (const Ref& r : rr) {
             if (r.def && r.reg->bank == Bank::Internal && r.reg->n == k) {
@@ -2005,7 +2174,7 @@ void Lowering::TwoWideChains() {
         }
         return false;
     };
-    std::vector<Ref> rr;
+    RefList rr;
     std::vector<bool> drop(insts.size(), false);
     // Replacement ops keyed by the original instruction they stand at.
     std::vector<std::vector<Inst>> replace(insts.size());
@@ -2344,7 +2513,7 @@ void Lowering::DirectTwoWide() {
                                 if (IsBarrier(insts[j])) {
                                     break;
                                 }
-                                std::vector<Ref> rr;
+                                RefList rr;
                                 Refs(insts[j], rr);
                                 bool writes_reg = false;
                                 for (const Ref& r : rr) {
@@ -2716,7 +2885,7 @@ uint8_t LanesRead(const Inst& inst, const Src& src, uint8_t mask) {
 /// f(register, lanes) for each register an instruction reads, with the lanes it reads where
 /// the shape is lane-selective (0xf otherwise). `refs` is scratch.
 template <typename F>
-void ForEachRead(Inst& inst, std::vector<Ref>& refs, F&& f) {
+void ForEachRead(Inst& inst, RefList& refs, F&& f) {
     switch (inst.op) {
     case Op::Vec:
     case Op::Vec16:
@@ -2783,7 +2952,7 @@ void Lowering::LoadSources() {
     // readers read the source, the load goes. The reader's own two-wide encoding is what the
     // compiler writes for such ops (`mul.f32 o0.xy, pa0.xy, sa12.xy`). A load is the unit multiply,
     // or a four-wide move of a unified-store quad (LoadVec4).
-    std::vector<Ref> refs;
+    RefList refs;
     std::vector<bool> drop(insts.size(), false);
     const auto quad_load = [](const Inst& inst) {
         return inst.op == Op::MoveF32x4 && !inst.b[0] && inst.dst.reg.bank == Bank::Internal &&
@@ -2802,7 +2971,7 @@ void Lowering::LoadSources() {
         bool ok = true;
         std::set<int> clobbered; // registers of the source's bank written since the load
         std::vector<int> lanes_read;
-        std::vector<Ref> read_refs;
+        RefList read_refs;
         uint8_t fresh = 0; // lanes of the register written since the load
         uint8_t maybe = 0; // lanes a predicated write since the load may have written
         for (std::size_t j = i + 1; j < insts.size() && ok; j++) {
@@ -3053,7 +3222,7 @@ void Lowering::InternalRegisters() {
         int phys = -1;
         bool drop_load = false;
     };
-    std::vector<Ref> refs;
+    RefList refs;
     const std::size_t n = insts.size();
 
     // Blocks, and the registers some block reads before writing (live across a barrier:
@@ -3327,7 +3496,7 @@ void Lowering::CheckTemps() const {
     // Each operand reaches registers from the one it names, at that register's home: they are
     // the program's own (below temp_count, or other instances' tasks own them), and a split
     // quad's operand stays inside its half's pair (the other half has a home of its own).
-    std::vector<Ref> refs;
+    RefList refs;
     for (std::size_t i = 0; i < insts.size(); i++) {
         Inst& inst = const_cast<Inst&>(insts[i]);
         const auto check = [&](const Reg& r, unsigned regs, const char* what) {
@@ -3389,7 +3558,7 @@ void Lowering::CheckTemps() const {
 }
 
 void Lowering::CheckInternals() const {
-    std::vector<Ref> refs;
+    RefList refs;
     // stale[k]: lanes of i<k> no instruction has written since the last barrier (or the
     // start); a read of one is a read of another instance's register on the hardware.
     uint8_t stale[3] = {0xf, 0xf, 0xf};
@@ -3432,7 +3601,7 @@ void Lowering::ResultsIntoInternal() {
     // The register must be untouched between the first lane and the load, and no
     // barrier may lie between.
     Liveness();
-    std::vector<Ref> refs;
+    RefList refs;
     std::vector<bool> drop(insts.size(), false);
     for (std::size_t m = 0; m < insts.size(); m++) {
         const Inst& load = insts[m];
@@ -3443,7 +3612,7 @@ void Lowering::ResultsIntoInternal() {
         }
         const uint32_t q = QuadOf(load.src[0].reg);
         const uint8_t k = load.dst.reg.n;
-        if (live[m][q] != 0) {
+        if (live[m].Of(q) != 0) {
             continue; // the quad lives on
         }
         // Walk back: the last writer of each lane, nothing else touching the quad or
@@ -3543,7 +3712,7 @@ void Lowering::CoalesceOutputs() {
     // pair dead afterwards and nothing reading the quad across the pair boundary, is a
     // rename: the pair is the output pair throughout, the move goes, and every write
     // lands in place (the compiler's `mad.f32 o8.xy, pa4.xy, sa36.xy, sa38.xy`).
-    std::vector<Ref> refs;
+    RefList refs;
     std::vector<bool> drop(insts.size(), false);
     for (std::size_t m = 0; m < insts.size(); m++) {
         const Inst& move = insts[m];
@@ -3682,7 +3851,7 @@ void Lowering::FoldOutputCopy() {
     if (x.bank == Bank::Internal || same(x, pa0)) {
         return;
     }
-    std::vector<Ref> refs;
+    RefList refs;
     std::size_t p = c;
     for (std::size_t k = c; k-- > 0 && p == c;) {
         Refs(insts[k], refs);
@@ -3806,7 +3975,7 @@ void Lowering::AllocatePairs() {
     std::array<std::size_t, 128> pa_last;
     pa_last.fill(SIZE_MAX);
     {
-        std::vector<Ref> refs;
+        RefList refs;
         for (std::size_t i = 0; i < insts.size(); i++) {
             Refs(insts[i], refs);
             for (const Ref& r : refs) {
@@ -3963,7 +4132,7 @@ std::vector<bool> Lowering::SkipInvalid() const {
     // instance too (predicates are not tracked apart).
     std::vector<bool> skip(insts.size(), true);
     std::set<std::pair<int, int>> needed; // (bank, register); internal: (bank, 4 * n + lane)
-    std::vector<Ref> refs;
+    RefList refs;
     bool predicates = false;
     const auto regs_of = [](const Reg& r, uint8_t mask, std::vector<std::pair<int, int>>& out) {
         out.clear();
@@ -4056,7 +4225,7 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
     const auto S = [&](const Src& s) { return Src{Map(s.reg), s.swz, s.mod}; };
     const auto D = [&](const Dst& d) { return Dst{Map(d.reg), d.mask}; };
     const auto I = [&](const IOp& o) { return o.imm ? o : IOp::R(Map(o.reg)); };
-    std::vector<Ref> refs;
+    RefList refs;
     for (std::size_t n = 0; n < insts.size(); n++) {
         const Inst& i = insts[n];
         if (skip_auto) {
@@ -4226,7 +4395,7 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
 }
 
 LowerResult Lowering::Run(Encoder& e, int level) {
-    std::vector<Ref> refs;
+    RefList refs;
     for (Inst& i : insts) {
         Refs(i, refs);
         for (const Ref& r : refs) {
@@ -4242,16 +4411,16 @@ LowerResult Lowering::Run(Encoder& e, int level) {
     // the program the draw waits for. The second tier, off the drawing thread for programs
     // that draw a lot, runs the optimising passes first. Hoisting loads lengthens live
     // ranges; when the registers then do not fit, the program is lowered again without
-    // it.
-    const std::vector<Inst> original = insts;
+    // it. The first tier places registers by each quad's hull (Hulls): no dataflow.
+    std::vector<Inst> original;
+    if (level >= 2) {
+        original = insts;
+    }
     const uint32_t original_quads = quad_count;
+    // The intervals and sets stay: Liveness makes them again in place.
     const auto reset = [&] {
         insts = original;
         quad_count = original_quads;
-        intervals.clear();
-        split.clear();
-        halves.clear();
-        live.clear();
         coalesced_outputs.clear();
         spilled = temp_count = pa_count = peak_live = peak_at = 0;
     };
@@ -4295,11 +4464,14 @@ LowerResult Lowering::Run(Encoder& e, int level) {
             DeadStores();
             Dump("final");
         }
+        if (level < 2) {
+            Hulls();
+        } else {
+            Liveness(split_pairs);
+        }
         if (split_pairs) {
-            Liveness(true);
             AllocatePairs();
         } else {
-            Liveness();
             Allocate();
         }
         if (level >= 2) {
@@ -4396,7 +4568,25 @@ LowerResult Builder::Lower(Encoder& e, int level) {
     if (cls.empty()) {
         cls.push_back({Bank::Temp, 0, 64});
     }
-    Lowering lowering{insts, cls};
+    // A program error, not a refusal: the emitters catch Fail's exception.
+    const auto abort_with = [](const char* why) {
+        std::fprintf(stderr, "usse ir: %s\n", why);
+        std::abort();
+    };
+    if (!scratch) {
+        abort_with("a lowering without its emitting thread's scratch");
+    }
+    LoweringScratch& s = scratches[static_cast<uint32_t>(*scratch)];
+    if (s.busy.exchange(true, std::memory_order_acquire)) {
+        abort_with("two threads lowering in one scratch");
+    }
+    struct Release {
+        LoweringScratch& s;
+        ~Release() {
+            s.busy.store(false, std::memory_order_release);
+        }
+    } release{s};
+    Lowering lowering{insts, cls, s};
     lowering.skip_auto = skip_invalid_auto;
     lowering.split_pairs = split_pairs;
     lowering.occupancy = occupancy;

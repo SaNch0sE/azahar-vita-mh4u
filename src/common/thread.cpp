@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/settings.h"
 #include "common/thread.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -220,12 +221,13 @@ void SetCurrentThreadName(const char*) {
  * guest's for one slice and back (docs/native-execution.md), so the emulation thread and the guest
  * share core 2, and nothing else of ours goes there. The second
  * emulation thread (the emulated cores other than core 0) has core 1 the same way, with the HLE
- * DSP's thread beside it (and on core 3 when core 1 is taken); the render thread (SgxdRenderer::RenderThread: the rasterizer, sgxd and
- * the presents) has core 0 with Y2R. Everything else - the command lists' parse, the
- * tier-2 shader compiler and the miscellaneous threads - goes to core 3 with whatever the system
- * keeps there.
+ * DSP's thread beside it (and on core 3 when core 1 is taken); the render thread
+ * (SgxdRenderer::RenderThread: the rasterizer, sgxd and the presents) has core 0 with Y2R.
+ * Everything else - the command lists' parse and the miscellaneous threads - goes to
+ * core 3 with whatever the system keeps there; the shader workers take what cores 0 and 3
+ * leave, and core 1 where the multicore setting is off.
  */
-constexpr int RoleCores(ThreadRole role, std::size_t index) {
+int RoleCores(ThreadRole role, std::size_t index) {
     (void)index;
     switch (role) {
     case ThreadRole::Emulation:
@@ -254,8 +256,14 @@ constexpr int RoleCores(ThreadRole role, std::size_t index) {
         // The PICA stays on the emulation thread; what it draws is built and sent here. Core 0:
         // the second emulation thread has core 1.
         return 1 << 0;
-    case ThreadRole::RasterWorker:
     case ThreadRole::ShaderCompiler:
+    case ThreadRole::ShaderTier1:
+        // The shader workers, behind every other role on their cores (PriorityCore): the render
+        // thread's core 0 and the parse's core 3, where the parse stays first. Core 1 is the
+        // second emulation thread's and the DSP's; with the multicore setting off no second
+        // emulation thread runs, and the workers have it behind the DSP.
+        return 1 << 0 | 1 << 3 | (Settings::values.multicore.GetValue() ? 0 : 1 << 1);
+    case ThreadRole::RasterWorker:
     case ThreadRole::AudioSink:
     case ThreadRole::Other:
         return 1 << 3;
@@ -278,10 +286,15 @@ constexpr int PriorityCore(ThreadRole role) {
         // (RoleCores), and the emulated cores' jobs the main thread waits for go on (a game's
         // wait for core 2's job: the DSP on core 1 for 46% of it at the same priority).
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
+    case ThreadRole::ShaderTier1:
+        // Behind the parse and Y2R, which share its cores (a geometry program takes tens of
+        // milliseconds, and at their priority it could hold either that long), before the second
+        // tier: the render thread may be waiting for its program.
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 2;
     case ThreadRole::ShaderCompiler:
-        // On core 3 with the miscellaneous threads, before them (CapUnlocker gives
-        // applications core 3).
-        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
+        // Behind the first tier's worker; a job runs for up to hundreds of milliseconds. Before
+        // the miscellaneous threads (CapUnlocker gives applications core 3).
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 3;
     case ThreadRole::Parse:
     case ThreadRole::Y2r:
         // Behind the render thread on core 0 (Y2R), before the rest on core 3 (the parse).

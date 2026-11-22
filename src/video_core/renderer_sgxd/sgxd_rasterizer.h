@@ -27,6 +27,10 @@
 #include "video_core/shader/generator/pica_fs_config.h"
 #include "video_core/shader/generator/profile.h"
 
+namespace Pica::Shader::Generator {
+struct PicaVSConfig;
+}
+
 namespace Pica {
 class ShaderEngine;
 }
@@ -227,6 +231,12 @@ public:
     [[nodiscard]] bool FlipArm(u32 fence) {
         return backend.FlipArm(fence);
     }
+    /// Parse thread, at a draw whose fragment registers changed: its program queued for the first
+    /// tier's worker.
+    void PrefetchFragment(const Pica::RegsInternal& parse_regs);
+    /// Parse thread, at a draw without a geometry shader: its vertex program queued for the first
+    /// tier's workers.
+    void PrefetchVertex(const Pica::RegsInternal& parse_regs, Pica::ShaderSetup& parse_setup);
     void SetFlipHook(std::function<bool(u32*)> pending, std::function<s64()> due_in,
                      std::function<void()> flip) {
         backend.SetFlipHook(std::move(pending), std::move(due_in), std::move(flip));
@@ -407,6 +417,8 @@ private:
     };
     /// Draws after which a program is emitted again with the optimising passes.
     static constexpr u32 Tier2Draws = 100;
+    /// A first-tier program of this many words goes to the second tier at once.
+    static constexpr u32 Tier2Words = 256;
 
     void RecordClear(const ClearedRange& range);
     void ForgetClears(PAddr start, PAddr end);
@@ -551,6 +563,18 @@ private:
     void VertexPrograms(const VertexStage& stage, const SgxdBackend::Data& vsa, u32 vsec_sa,
                         SgxdRecipeDrawPrograms& p, const Describe& describe);
 
+    /// A vertex program's inputs past its PicaVSConfig: the layout's registers, the mode and the
+    /// bools its flow control reads.
+    struct VertexInputs {
+        u16 default_regs, u8_regs, s8_regs, s16_regs;
+        std::array<u8, 16> reg_components;
+        Usse::VsMode mode;
+        u16 bools, used_bools;
+    };
+    static u64 VertexKeyOf(const Pica::Shader::Generator::PicaVSConfig& config,
+                           const VertexInputs& in);
+    static Usse::VsRequest VertexRequestOf(const Pica::Shader::Generator::PicaVSConfig& config,
+                                           const Pica::ShaderSetup& setup, const VertexInputs& in);
     /// `u8_regs`: the input registers an integer loader feeds.
     const VertexProgram& VertexProgramFor(u16 default_regs,
                                           const std::array<u8, 16>& reg_components, u16 u8_regs,
@@ -563,9 +587,25 @@ private:
     const VertexProgram& GeometryProgramFor(u32 rows, bool rows_uniform, bool rows_table,
                                             u32 first_uniform, u16 input_rows, u32 max_triangles,
                                             bool serial, const Describe& describe);
-    const VertexProgram& MakeGeometryProgram(u64 key, u16 bools, u16 used, u32 rows,
-                                             bool rows_uniform, bool rows_table, u32 first_uniform,
-                                             u16 input_rows, u32 max_triangles, bool serial,
+    /// A geometry program's key, and the bool registers it reads with their values (setup's).
+    struct GeometryKey {
+        u64 key;
+        u16 bools;
+        u16 used;
+        bool uniform_table; ///< Usse::VsRequest::gs_uniform_table
+    };
+    GeometryKey GeometryKeyFor(u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
+                               u16 input_rows, u32 max_triangles, bool serial);
+    Usse::VsRequest GeometryRequest(const GeometryKey& k, u32 rows, bool rows_uniform,
+                                    bool rows_table, u32 first_uniform, u16 input_rows,
+                                    u32 max_triangles, bool serial) const;
+    /// A new geometry draw's second program (b15 true) on the first tier's worker while this thread
+    /// emits the first, when neither is placed or cached and they differ.
+    void QueueGeometryPair(u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
+                           u16 input_rows, u32 max_triangles, bool serial, bool b15);
+    const VertexProgram& MakeGeometryProgram(const GeometryKey& k, u32 rows, bool rows_uniform,
+                                             bool rows_table, u32 first_uniform, u16 input_rows,
+                                             u32 max_triangles, bool serial,
                                              const Describe& describe);
     /// The vertex program that draws a geometry program's stored triangles: input k is output k.
     const VertexProgram& PassthroughProgramFor(u32 outputs);
@@ -598,6 +638,20 @@ private:
         emit_stats.us[kind] += us;
 #endif
     }
+    /// A program of that kind taken from the first tier's workers, emitted or read from the disk.
+    void NoteTier1([[maybe_unused]] int kind, [[maybe_unused]] const ShaderTier1::Taken& t) {
+#ifdef VITA_DIAGNOSTICS
+        if (t.from_disk) {
+            emit_stats.from_disk[kind]++;
+            emit_stats.disk_us += t.took_us;
+        } else {
+            emit_stats.taken[kind]++;
+            emit_stats.taken_us += t.took_us;
+        }
+        emit_stats.waited_us += t.waited_us;
+        emit_stats.helped += t.helped ? 1 : 0;
+#endif
+    }
     u32 flush_mark = ~0u; ///< the backend's PassMark at the last flush
     /// Where a texture unit's texels are in guest memory: a 2D chain or six cube faces, `bytes` each.
     struct TextureExtent {
@@ -624,6 +678,7 @@ private:
     [[nodiscard]] bool TexturesReadPassColour() const;
     /// Whether the unit holds an ETC1A4 texture split into compressed colour and an A8 alpha texture.
     bool SplitAlpha(u32 unit) const;
+    static bool SplitAlphaIn(const Pica::RegsInternal& regs, u32 unit);
     /// The alpha texture's words of a split unit from its colour's, over its A8 chain (swizzle R000).
     static void AlphaTextureWords(const Texture& tex, const u32 colour[4], u32 words[4]);
     /// Frees the least recently used texture no open pass reads; false when there is none.
@@ -729,9 +784,10 @@ private:
     VertexLayout* last_layout = nullptr;
     u64 last_layout_regs = 0;
     VertexLayout& VertexLayoutFor();
-    VertexLayout DecodeVertexLayout() const;
+    static VertexLayout DecodeVertexLayout(const Pica::RegsInternal& regs);
     /// The raw words VertexProgramFor's program depends on past the layout.
-    std::array<u32, VertexLayout::ProgramKeyWords> VertexProgramKey(Usse::VsMode mode);
+    static std::array<u32, VertexLayout::ProgramKeyWords> VertexProgramKey(
+        const Pica::RegsInternal& regs, Pica::ShaderSetup& setup, Usse::VsMode mode);
     /// What a pass on target stores for the draw (its viewport's part, or all of it off the grid).
     StorePart StorePartFor(const ColourBuffer& target) const;
     StorePart ViewportPart(const ColourBuffer& target) const;
@@ -752,6 +808,13 @@ private:
     /// The program of `key` to the config's second tier: queued once a config, or taken now.
     void QueueFragmentTier2(u64 key, const Pica::Shader::FSConfig& config);
     void InstallFragmentTier2(u64 key, const Usse::Program& program);
+    /// PrefetchVertex's, the parse thread's: the last draw's words and layout, the bools each
+    /// program reads, and the code copy its jobs share.
+    std::array<u32, VertexLayout::ProgramKeyWords> parse_vertex_words{};
+    u64 parse_layout_hash = 0;
+    KeyIndex<u16> parse_used_bools;
+    std::shared_ptr<const ShaderTier1::VertexCode> parse_vs_code;
+    u64 parse_vs_code_hash = 0, parse_vs_swizzle_hash = 0;
     /// What each geometry program's code says, by its code's hash and entry: its
     /// Usse::GsTriangleBound (0: none), and Usse::GsIndexesUniforms.
     struct GsCodeFacts {
@@ -799,6 +862,9 @@ private:
     bool draw_depth_stencil = false;
     /// FSConfig from the registers, with the sgxd_flags' changes and the units' alpha split.
     Pica::Shader::FSConfig FragmentConfig() const;
+    /// FragmentConfig of any registers (the parse thread's too).
+    static Pica::Shader::FSConfig FragmentConfigFor(const Pica::RegsInternal& regs, u32 own_pixel,
+                                                    bool kills_viewport);
     /// The hashes of StateRegs' sets, and whether a set's registers changed since.
     u64 fragment_regs_hash = 0;
     u64 layout_regs_hash = 0;
@@ -807,6 +873,8 @@ private:
     std::optional<std::pair<u32, u32>> scanned_indices;
     std::vector<u8> gs_indices;
     bool gs_indices_set = false;
+    /// The first tier's worker. Before tier2, whose workers emit its jobs too.
+    std::unique_ptr<ShaderTier1> tier1;
     std::unique_ptr<ShaderTier2> tier2;
 
     // Immediate-mode vertices not drawn yet, four floats an attribute. One ImmDraw block is one draw.
@@ -1185,6 +1253,12 @@ private:
         std::array<u32, 3> programs{};
         std::array<u64, 3> us{};
         u32 flushes_mark{};
+        std::array<u32, 3> taken{}; ///< from the first tier's workers (NoteTier1)
+        u64 taken_us{};
+        std::array<u32, 3> from_disk{}; ///< read from the disk by them
+        u64 disk_us{};
+        u64 waited_us{};
+        u32 helped{};
     } emit_stats;
     /// The last writes' ranges: whether a texture a check found written was, or only shares a page.
     std::array<std::pair<PAddr, PAddr>, 256> write_ring{};

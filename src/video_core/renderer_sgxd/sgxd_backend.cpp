@@ -147,8 +147,7 @@ constexpr u32 UpscaleSize = 11u << 20;
 constexpr u32 MicrokernelVa = 0x00400000;
 constexpr u32 Pages = 418;
 constexpr u32 MaxIndices = SGXD_RECIPE_MAX_INDICES;
-// The code heap follows each layout. It must stay within DOUTU's reach of CV and CF (EXE, 20
-// bits of 8 bytes: 8 MiB). The PDS arena and the pass data make the shared block.
+// The code heap follows each layout, within DOUTU's reach of CV and CF (20 bits of 8 bytes: 8 MiB).
 constexpr u32 CodeSize = SgxdBackend::CodeBytes;
 // The PDS arena: two halves, each draw's programs placed in the current one. A pass start past half
 // of it flips to the other once no render reads it (FlipPdsHalf). No program is kept for good: a
@@ -232,8 +231,27 @@ SgxdBackend::SgxdBackend() {
     data_end = data_begin + DataSize;
     lut_begin = data_begin + DataSlots * DataSize;
     code_begin = AlignUp(lut_begin + LutSize, 0x1000);
-    shared_size = AlignUp(code_begin + CodeSize, 1u << 20);
+    shared_size = AlignUp(code_begin + (1u << 20), 1u << 20);
+    code_cdram = shared_size - code_begin;
     shared = MapBlock("azahar-sgxd-shared", BlockVa, shared_size, shared_block);
+    // The code heap's rest in uncached main memory, mapped right after the block so the heap stays
+    // one range from the code base.
+    static_assert(CodeSize <= (8u << 20) && CodeSize > (2u << 20));
+    const u32 code_main_size = CodeSize - code_cdram;
+    code_main_block = sceKernelAllocMemBlock(
+        "azahar-sgxd-code", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, code_main_size, nullptr);
+    {
+        void* base = nullptr;
+        const int got = code_main_block >= 0 ? sceKernelGetMemBlockBase(code_main_block, &base)
+                                             : code_main_block;
+        ASSERT_MSG(got >= 0, "sgxd: no {} KiB of main memory for the code heap ({:#010x})",
+                   code_main_size >> 10, static_cast<u32>(got));
+        code_main = static_cast<u8*>(base);
+        const int mapped = sgxdMap(BlockVa + shared_size, code_main, code_main_size, 0);
+        ASSERT_MSG(mapped == 0,
+                   "sgxd: the code heap's main memory not mapped at GPU {:#010x}: {:#010x}",
+                   BlockVa + shared_size, static_cast<u32>(mapped));
+    }
     for (u32 w = 0; w < PdsWindows; w++) {
         const int mapped = sgxdMap(PdsWindowVa + w * PdsHalfSize,
                                    shared + pds_begin + (w & 1) * PdsHalfSize, PdsHalfSize, 0);
@@ -242,7 +260,7 @@ SgxdBackend::SgxdBackend() {
     }
     // Each slot of the shell's CDRAM at a GPU address of its own, mapped once: a recipe made in a
     // slot maps nothing. The recipes past the slots take blocks of the game's CDRAM.
-    shell_slots_va = BlockVa + shared_size;
+    shell_slots_va = AlignUp(BlockVa + code_begin + CodeSize, 1u << 20);
     for (u32 slot = 0; slot < ShellSlots; slot++) {
         const int mapped =
             sgxdMap(ShellSlotVa(slot), shell_cdram + slot * RecipeBlockSize, RecipeBlockSize, 0);
@@ -561,6 +579,7 @@ SgxdBackend::~SgxdBackend() {
     }
     sgxdUnmap(PdsWindowVa, PdsWindows * PdsHalfSize);
     FreeBlock(shared, BlockVa, shared_size, shared_block);
+    FreeBlock(code_main, BlockVa + shared_size, CodeSize - code_cdram, code_main_block);
     FreeBlock(surfaces, SurfacesVa, surfaces_size, surfaces_block);
     FreeBlock(textures, TexturesVa, TexturesSize, textures_block);
     FreeBlock(upscale, UpscaleVa, UpscaleSize, upscale_block);
@@ -744,10 +763,24 @@ void SgxdBackend::FreeCode(u32 offset, u32 bytes) {
     }
 }
 
+void SgxdBackend::CopyCode(u32 at, const void* words, u32 bytes) {
+    const u8* from = static_cast<const u8*>(words);
+    if (at < code_cdram) {
+        const u32 n = std::min(bytes, code_cdram - at);
+        std::memcpy(shared + code_begin + at, from, n);
+        at += n;
+        from += n;
+        bytes -= n;
+    }
+    if (bytes != 0) {
+        std::memcpy(code_main + (at - code_cdram), from, bytes);
+    }
+}
+
 u32 SgxdBackend::PlaceCode(unsigned cb, std::span<const u64> words) {
     const u32 bytes = static_cast<u32>(words.size_bytes());
     const u32 at = AllocateCode(bytes);
-    std::memcpy(shared + code_begin + at, words.data(), bytes);
+    CopyCode(at, words.data(), bytes);
 #ifdef VITA_DIAGNOSTICS
     placed_code.push_back({cb, at, bytes, at});
 #endif
@@ -767,7 +800,7 @@ u32 SgxdBackend::PlaceCodePhased(unsigned cb, std::vector<u64> words,
         DEBUG_ASSERT(exe < (1u << 20));
         phas = (phas & ~(0xffull << 32 | 0xfffffull)) | u64{(temps + 3) / 4} << 32 | exe;
     }
-    std::memcpy(shared + code_begin + offset, words.data(), words.size() * sizeof(u64));
+    CopyCode(offset, words.data(), static_cast<u32>(words.size() * sizeof(u64)));
 #ifdef VITA_DIAGNOSTICS
     placed_code.push_back({cb, offset, static_cast<u32>(words.size() * sizeof(u64)), offset});
 #endif
@@ -2162,7 +2195,10 @@ void SgxdBackend::WriteCode() {
         const u32 head[4] = {0x45535355, 1, static_cast<u32>(placed_code.size()), code_used};
         std::fwrite(head, 4, 4, f);
         std::fwrite(placed_code.data(), sizeof(PlacedCode), placed_code.size(), f);
-        std::fwrite(shared + code_begin, 1, code_used, f);
+        std::fwrite(shared + code_begin, 1, std::min(code_used, code_cdram), f);
+        if (code_used > code_cdram) {
+            std::fwrite(code_main, 1, code_used - code_cdram, f);
+        }
         std::fclose(f);
         LOG_CRITICAL(Render, "sgxd: {} USSE programs ({} KiB of code) written to host0",
                      placed_code.size(), code_used >> 10);

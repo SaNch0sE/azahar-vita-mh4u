@@ -18,10 +18,11 @@
 #include "common/math_util.h"
 #include "common/named_thread.h"
 #include "core/memory.h"
-#include "video_core/renderer_sgxd/sgxd_flags.h"
-#include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/renderer_sgxd.h"
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#include "video_core/renderer_sgxd/sgxd_rasterizer.h"
+#include "video_core/renderer_sgxd/state_regs.h"
 #include "video_core/right_eye_disabler.h"
 
 #if defined(__ARM_NEON)
@@ -236,6 +237,8 @@ public:
         t.FlushRun();
         const bool runs = t.RunsDraw(is_indexed);
         t.SyncParsedState();
+        t.PrefetchFragment();
+        t.PrefetchVertex();
         if (t.parse_gs_bytes != 0) {
             std::memcpy(t.ParsedBegin(Op::GsIndices, t.parse_gs_bytes, t.parse_gs_u16 ? 1 : 0),
                         t.parse_gs, t.parse_gs_bytes);
@@ -269,6 +272,7 @@ public:
     }
     void FlushImmediate() override {
         t.SyncParsedState();
+        t.PrefetchFragment();
         t.ParsedPut(Op::FlushImmediate);
         t.PublishParsed();
     }
@@ -434,6 +438,17 @@ u32 CountDirty(const Pica::DirtyRegs& dirty) {
 }
 } // namespace
 
+void RenderThread::PrefetchFragment() {
+    if (parse_fragment_dirty) {
+        parse_fragment_dirty = false;
+        rasterizer.PrefetchFragment(parse_pica.regs.internal);
+    }
+}
+
+void RenderThread::PrefetchVertex() {
+    rasterizer.PrefetchVertex(parse_pica.regs.internal, parse_pica.vs_setup);
+}
+
 void RenderThread::SyncParsedState() {
     auto& dirty = parse_pica.dirty_regs;
     const u32 count = CountDirty(dirty);
@@ -442,6 +457,7 @@ void RenderThread::SyncParsedState() {
         std::memcpy(p, dirty.qwords.data(), sizeof(dirty.qwords));
         u32* values = reinterpret_cast<u32*>(p + sizeof(dirty.qwords));
         // In 32-bit words: ARMv7 finds a word's lowest bit in two instructions.
+        parse_fragment_dirty |= StateRegs::AnyDirty(StateRegs::FragmentMask, dirty.qwords);
         const u32* const regs = parse_pica.regs.internal.reg_array.data();
         u32 halves[sizeof(dirty.qwords) / sizeof(u32)];
         std::memcpy(halves, dirty.qwords.data(), sizeof(halves));

@@ -263,8 +263,10 @@ bool InVec4Table(const Swizzle& s) {
 
 class VertexEmitter {
 public:
-    VertexEmitter(const VsRequest& request_, int level_, bool dynamic_emit_)
-        : req{request_}, level{level_}, dynamic_emit{dynamic_emit_} {}
+    VertexEmitter(const VsRequest& request_, int level_, bool dynamic_emit_, Scratch scratch)
+        : req{request_}, level{level_}, dynamic_emit{dynamic_emit_} {
+        e.scratch = scratch;
+    }
 
     std::optional<Program> Emit(uint32_t& input_regs);
     int level = 1;
@@ -2287,12 +2289,12 @@ bool GsIndexesUniforms(std::span<const uint32_t> code, uint32_t code_size) {
 }
 
 std::optional<Program> EmitVertexProgram(const VsRequest& request, uint32_t& input_regs,
-                                        std::string* refusal, int level) {
+                                        Scratch scratch, std::string* refusal, int level) {
     // A geometry program with an EMIT that different SETEMITs reach (a join between) keeps
     // its emit state in registers too (VertexEmitter::dynamic_emit).
     for (const bool dynamic_emit : {false, true}) {
         try {
-            VertexEmitter emitter{request, level, dynamic_emit};
+            VertexEmitter emitter{request, level, dynamic_emit, scratch};
             return emitter.Emit(input_regs);
         } catch (const std::exception& ex) {
             if (!dynamic_emit && request.mode == VsMode::Geometry &&
