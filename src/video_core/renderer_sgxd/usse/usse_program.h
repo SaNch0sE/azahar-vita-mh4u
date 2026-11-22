@@ -86,7 +86,8 @@ struct TextureIssue {
     bool f16 = false;    ///< four F16 in two words (FCONV F16), for the U8 combiners
     /// The fog factor table (RasterizerSgxd::FogTableWords), not a unit: its packed U8888 word
     /// (FCONV raw, one word) read at TEXCOORD3 projected (TEXPROJ T), whose u and t the vertex
-    /// program writes as clip z and w: u / t is the PICA depth, linear in screen space.
+    /// program writes as the PICA depth times w and w: u / t is the PICA depth, linear in screen
+    /// space.
     bool fog = false;
     /// The unit's split alpha texture (RasterizerSgxd::AlphaTextureWords, A8 with its byte in
     /// .w), read at the unit's coordinate in the texel's form, f16 or F32.

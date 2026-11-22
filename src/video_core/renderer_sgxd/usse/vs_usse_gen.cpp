@@ -130,16 +130,16 @@ constexpr uint32_t DataLiteralCount = DataSize - 1;
 
 // Output registers of the fragment interface, in the order the output selects lay them out
 // (OutSelects, TexSize): POSITION o0-o3, COLOR0 o4-o7, TEXCOORD0-2 two each from o8,
-// TEXCOORD3 o14-17 (the fog table's coordinate, Usse::TextureIssue::fog: clip z and w in its
-// first and fourth lanes; texcoord0's w in its second), TEXCOORD4 o18-21 (the quaternion),
-// TEXCOORD5 o22-24 (the view). Upstream's flat copy of the quaternion is not written: the
-// fragment programs do not read it (FragmentEmitter::Lighting).
+// TEXCOORD3 o14-17 (the fog table's coordinate, Usse::TextureIssue::fog: the PICA depth times
+// w, and w, in its first and fourth lanes; texcoord0's w in its second), TEXCOORD4 o18-21 (the
+// quaternion), TEXCOORD5 o22-24 (the view). Upstream's flat copy of the quaternion is not written:
+// the fragment programs do not read it (FragmentEmitter::Lighting).
 constexpr uint8_t OutPosition = 0;
 constexpr uint8_t OutColor = 4;
 constexpr uint8_t OutTexcoord0 = 8;
 constexpr uint8_t OutTexcoord1 = 10;
 constexpr uint8_t OutTexcoord2 = 12;
-constexpr uint8_t OutTexcoord3 = 14;   ///< TEXCOORD3's u (clip z) and v (texcoord0's w)
+constexpr uint8_t OutTexcoord3 = 14;   ///< TEXCOORD3's u (depth times w) and v (texcoord0's w)
 constexpr uint8_t OutTexcoord3St = 16; ///< TEXCOORD3's s (zero) and t (clip w)
 constexpr uint8_t OutNormquat = 18;
 constexpr uint8_t OutView = 22;
@@ -1985,8 +1985,11 @@ void VertexEmitter::OutputTexcoord(uint8_t out, Semantic su, Semantic sv) {
 }
 
 void VertexEmitter::Epilogue() {
-    // Position: the PICA depth into clip z so the interpolated depth is the PICA depth,
-    // after the wrappers' nudge of a z barely past a clip boundary and the viewport flip.
+    // Position: after the wrappers' nudge of a z barely past a clip boundary and the viewport
+    // flip, clip z for the TA's clipping, which keeps -w <= z <= w (MTE_CTRL's OPENGL): the
+    // PICA's own planes, -w <= z <= 0, are that range for +-(2z + w), and the viewport maps it
+    // back to the PICA depth (RasterizerSgxd::Draw). No division by w: a vertex in the eye's
+    // plane has w = 0.
     GatherFour(I0, SemPositionX);
     e.Comp(CompOp::Rcp, {I1, 0x1}, {I0}, 3);              // 1/w
     e.Vec(VecOp::Mul, {I1, 0x2}, {I0, ZZZZ}, {I1, XXXX}); // ndc z
@@ -1998,21 +2001,39 @@ void VertexEmitter::Epilogue() {
     e.Vec(VecOp::Mul, {I0, 0x4}, {I0, WWWW, Mod::Neg}, ConstOne, Pred::P2); // z = -w
     e.Test(Cond::Gt, 2, {Reg::Sa(SaFlipViewport)}, 0, ConstHalf, false);
     e.Vec(VecOp::Mul, {I0, 0x2}, {I0, YYYY, Mod::Neg}, ConstOne, Pred::P2); // y = -y
-    e.Vec(VecOp::Mul, {I1, 0x2}, {I0, ZZZZ}, {I1, XXXX});                   // z / w again
-    e.Vec(VecOp::Mul, {I1, 0x2}, {I1, YYYY}, {Reg::Sa(0), YYYY});           // * depth_scale (sa1)
-    e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY}, {Reg::Sa(2), XXXX});           // + depth_offset (sa2)
-    e.Vec(VecOp::Mul, {I0, 0x4}, {I1, YYYY}, {I0, WWWW});                   // z = depth * w
+    e.Vec(VecOp::Mul, {I1, 0x2}, {I0, ZZZZ}, {Reg::Sa(0), YYYY});           // z * depth_scale (sa1)
+    e.Vec(VecOp::Mul, {I1, 0x1}, {I0, WWWW}, {Reg::Sa(2), XXXX}); // w * depth_offset (sa2)
+    e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY}, {I1, XXXX});         // depth * w
+    if (far_user_plane && req.mode == VsMode::Draw) {
+        // The probe's far plane: the PICA's (z + w >= 0) as user clip plane 0, and the TA's 0..w
+        // range given -z / 1024, so that its own far plane lies 1024 times past the PICA's (the
+        // scale is exact; the viewport takes it back).
+        e.Vec(VecOp::Add, {I1, 0x1}, {I0, ZZZZ}, {I0, WWWW});
+        e.MoveInternal({I2, 0x1}, ConstOne);
+        e.DotClip({Reg::O(25 & ~1), 0x2}, {I1, XXXX}, {I2, XXXX}, 0);
+        e.Vec(VecOp::Mul, {I0, 0x4}, {I0, ZZZZ, Mod::Neg}, {DataReg(DataEpsilon), YYYY});
+    } else if (d3d_clip_range) {
+        e.Vec(VecOp::Mul, {I0, 0x4}, {I0, ZZZZ, Mod::Neg}, ConstOne); // z = -z, for 0 <= z <= w
+    } else {
+        e.Vec(VecOp::Add, {I1, 0x1}, {I0, ZZZZ}, {I0, ZZZZ});         // 2z
+        e.Vec(VecOp::Add, {I1, 0x1}, {I1, XXXX}, {I0, WWWW});         // 2z + w
+        if (z_flip) { // the probe's other orientation: the same planes, near and far swapped
+            e.Vec(VecOp::Mul, {I0, 0x4}, {I1, XXXX}, ConstOne);       // z = 2z + w
+        } else {
+            e.Vec(VecOp::Mul, {I0, 0x4}, {I1, XXXX, Mod::Neg}, ConstOne); // z = -(2z + w)
+        }
+    }
     // The draws render the guest's colour buffer transposed (SgxdBackend::PicaTarget, route 1):
     // clip x takes y and clip y takes x, and the viewport maps them (RasterizerGxm::Draw). The
     // standard swizzles have no YX pair: a lane each, as OutputLane writes them.
     e.MoveInternal({Reg::O(OutPosition), 0x1}, {I0, YYYY});
     e.MoveInternal({Reg::O(OutPosition), 0x2}, {I0, XXXX});
     e.MoveInternal({Reg::O(OutPosition + 2), 0x3}, {I0, ZWZW});
-    // The fog table's coordinate (Usse::TextureIssue::fog): TEXCOORD3's u and t are clip z
-    // and w, which the PDS divides (TEXPROJ T) after iterating them perspective-correct: z / w
-    // linear in screen space, WPOS's z, the PICA depth. The clipper's new vertices take them
-    // exactly, both being linear in clip space.
-    e.MoveInternal({Reg::O(OutTexcoord3), 0x1}, {I0, ZZZZ});
+    // The fog table's coordinate (Usse::TextureIssue::fog): TEXCOORD3's u and t are the PICA
+    // depth times w and w, which the PDS divides (TEXPROJ T) after iterating them
+    // perspective-correct: the depth, WPOS's z. The clipper's new vertices take them exactly,
+    // both being linear in clip space.
+    e.MoveInternal({Reg::O(OutTexcoord3), 0x1}, {I1, YYYY});
     e.MoveInternal({Reg::O(OutTexcoord3St), 0x1}, ConstZero);
     e.MoveInternal({Reg::O(OutTexcoord3St), 0x2}, {I0, WWWW});
 

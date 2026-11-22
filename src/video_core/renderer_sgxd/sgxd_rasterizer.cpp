@@ -6469,7 +6469,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     p.texsize = vg.vertex_outputs2;
     // The target is the buffer transposed (SgxdBackend::PicaTarget): the vertex program
     // writes NDC y as clip x and NDC x as clip y, so pixel column x is memory row x and pixel
-    // row y the PICA's x. z is as the program wrote it (depth times w).
+    // row y the PICA's x. The program writes z as -(2z + w), which the TA clips to the PICA's
+    // planes (VertexEmitter::Epilogue); the viewport's z maps it to the PICA depth,
+    // z / w * depth_scale + depth_offset.
     const float half_w = f24::FromRaw(regs.rasterizer.viewport_size_x).ToFloat32();
     const float half_h = f24::FromRaw(regs.rasterizer.viewport_size_y).ToFloat32();
     // The PICA's window y runs up from the target's last memory row: the corner is mirrored as upstream's y-down Vulkan path
@@ -6481,8 +6483,8 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     p.viewport[1] = -half_h;
     p.viewport[2] = static_cast<float>(regs.rasterizer.viewport_corner.x) + half_w;
     p.viewport[3] = half_w;
-    p.viewport[4] = 0.0f;
-    p.viewport[5] = 1.0f;
+    p.viewport[4] = fs_data.depth_offset - fs_data.depth_scale / 2.0f;
+    p.viewport[5] = -fs_data.depth_scale / 2.0f;
     p.primitive = primitive;
 
     // ISP A: PASSTYPE, DCMP, DWRITEDIS, BPRES. Translucent (1) with a blend or a write mask, else opaque
