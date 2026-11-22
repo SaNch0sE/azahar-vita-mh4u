@@ -367,7 +367,8 @@ private:
     const char* Unsupported() const;
     void PlanInputs();
     void PlanUniforms();
-    void SampleTextures();
+    /// `units`: the texture units read here (bit n unit n).
+    void SampleTextures(uint32_t units = 7);
     void RoundPrimary();
     void Lighting();
     /// The LUT's value at `input` into `into` (one temp lane): a filtered read of the LUT's F16
@@ -426,7 +427,14 @@ private:
     /// no modifier); an operation into `dst`; a stage; and what follows the last stage.
     bool U8TevSupported() const;
     bool StageReads(Source source) const;
-    void U8Inputs();
+    /// `parts`: bit 0 the inputs the alpha test's first phase reads (the constants, the vertex
+    /// colour, early_units' texels), bit 1 the others. Both when the test comes last.
+    void U8Inputs(uint32_t parts = 3);
+    /// Whether the alpha test runs in a first phase of its own, before the lighting: the
+    /// stages (early_stages) and units (early_units) the tested alpha comes from.
+    bool PlanEarlyAlpha();
+    /// A stage's alpha alone, as U8TevStage makes it (the colour bytes are not the stage's).
+    void U8AlphaStage(u32 index);
     /// The combiner output in an even register (the alpha test's and the pack's unpacks).
     Reg U8EvenFinal();
     Reg U8Source(Source source, u32 stage_index, bool alpha) const;
@@ -589,6 +597,12 @@ private:
     bool u8_lighting_packed = false;
     /// U8Broadcast's registers by BroadcastInput and lane; 0 for none.
     std::array<std::array<uint8_t, 3>, 7> u8_bcast{};
+    uint32_t u8_bcast_count = 0;
+    /// The alpha test first (PlanEarlyAlpha): a lit program whose tested alpha no light
+    /// reaches tests it in a first phase, and lights only the pixels the test keeps.
+    bool early_alpha = false;
+    uint32_t early_stages = 0; ///< bit k: stage k's alpha reaches the test
+    uint32_t early_units = 0;  ///< bit n: unit n's texel does
     Program program;
     std::array<bool, 3> unit_used{};
     /// The units whose texel is the pixel's own colour (FSConfig own_pixel): the tile's colour
@@ -2355,7 +2369,7 @@ void FragmentEmitter::FogFactor() {
     e.MoveInternal({I0, 0xf}, {I0, XXXX}, Pred::None, true);
 }
 
-void FragmentEmitter::SampleTextures() {
+void FragmentEmitter::SampleTextures(uint32_t units) {
     // Every SMP on counter 0, one wait for all before the first use. The vertex program wrote
     // TEXCOORD0..2 as (s, 1 - t): the host copy keeps the PICA's rows in memory order, t = 1 at row
     // 0 (an ETC1 block cannot be flipped by moving it). REPEAT, MIRROR, CLAMP and the border test
@@ -2366,6 +2380,10 @@ void FragmentEmitter::SampleTextures() {
     Reg coords[3] = {Reg::Pa(0), Reg::Pa(0), Reg::Pa(0)};
     for (u32 unit = 0; unit < 3; unit++) {
         if (!unit_used[unit]) {
+            continue;
+        }
+        if (!(units >> unit & 1)) {
+            sampler_index += unit_issued[unit] ? 0 : 1; // the other call's read
             continue;
         }
         const int coord = (unit == 2 && tex.texture2_use_coord1) ? 1 : static_cast<int>(unit);
@@ -2429,7 +2447,7 @@ void FragmentEmitter::SampleTextures() {
         e.Wdf(0);
     }
     for (u32 unit = 0; unit < 3; unit++) {
-        if (unit_used[unit] && (config.texture.alpha_split >> unit & 1)) {
+        if (unit_used[unit] && (units >> unit & 1) && (config.texture.alpha_split >> unit & 1)) {
             const Vec4Loc texel = texel_loc[unit];
             if (texel.f16) {
                 continue; // U8Inputs merges the issued F16 alpha in U8
@@ -2450,7 +2468,7 @@ void FragmentEmitter::SampleTextures() {
     for (u32 unit = 0; unit < 3; unit++) {
         const auto& border = tex.texture_border_color[unit];
         // A shadow read is lit (1) past its texture's edge instead (ShadowTexture).
-        if (!unit_used[unit] || !(border.enable_s || border.enable_t) ||
+        if (!unit_used[unit] || !(units >> unit & 1) || !(border.enable_s || border.enable_t) ||
             (unit == 0 && shadow_texture)) {
             continue;
         }
@@ -2478,7 +2496,7 @@ void FragmentEmitter::SampleTextures() {
             e.MoveInternal({texel.Pair(1), 0x3}, {colour.Pair(1), XYZW}, Pred::NotP1, true);
         }
     }
-    if (uses_shadow) {
+    if (uses_shadow && (units >> config.lighting.shadow_selector & 1)) {
         // shadow = tex, or 1 - tex when inverted.
         const auto& lighting = config.lighting;
         const Vec4Loc texel = texel_loc[lighting.shadow_selector];
@@ -3907,30 +3925,42 @@ bool FragmentEmitter::StageReads(Source source) const {
     return false;
 }
 
-void FragmentEmitter::U8Inputs() {
-    // White and AddSigned's half from their literal words through a VBW, so no SOP reads a
-    // secondary attribute (the colour format control's C10 reading of a high register number
-    // is not measured); zero from white.
-    e.Bitwise(BwOp::Or, Reg::V(TmpU8White),
-              IOp::R(Reg::Sa(static_cast<uint8_t>(LitSa(LitU8White)))), IOp::Imm(0));
-    e.Bitwise(BwOp::And, Reg::V(TmpU8Zero), IOp::R(Reg::V(TmpU8White)), IOp::Imm(0));
-    bool half = false;
-    for (u32 k = 0; k < config.texture.tev_stages.size(); k++) {
-        const TevStageConfig stage = config.texture.tev_stages[k];
-        half = half || (!IsPassThroughTevStage(stage) && (stage.color_op == Operation::AddSigned ||
-                                                          stage.alpha_op == Operation::AddSigned));
-    }
-    if (half) {
-        e.Bitwise(BwOp::Or, Reg::V(TmpU8Half),
-                  IOp::R(Reg::Sa(static_cast<uint8_t>(LitSa(LitU8Half)))), IOp::Imm(0));
-    }
-    // The inputs, packed to nearest as the F32 path's byte rounding has them (the vertex
-    // colour); the texels and the lighting's colours are rounded here, where the F32 path
-    // carried them unrounded into the first stage reading them.
-    if (StageReads(Source::PrimaryColor)) {
-        e.PackU8(Reg::V(TmpU8Primary), Reg::Pa(0), Reg::Pa(2));
+void FragmentEmitter::U8Inputs(uint32_t parts) {
+    // With the alpha test first, an input is its first phase's (bit 0 of `parts`) when the
+    // tested alpha can come from it: the constants, the vertex colour and early_units' texels.
+    const bool first = (parts & 1) != 0, second = (parts & 2) != 0;
+    const auto unit_now = [&](u32 unit) {
+        return early_alpha && (early_units >> unit & 1) ? first : second;
+    };
+    if (first) {
+        // White and AddSigned's half from their literal words through a VBW, so no SOP reads a
+        // secondary attribute (the colour format control's C10 reading of a high register
+        // number is not measured); zero from white.
+        e.Bitwise(BwOp::Or, Reg::V(TmpU8White),
+                  IOp::R(Reg::Sa(static_cast<uint8_t>(LitSa(LitU8White)))), IOp::Imm(0));
+        e.Bitwise(BwOp::And, Reg::V(TmpU8Zero), IOp::R(Reg::V(TmpU8White)), IOp::Imm(0));
+        bool half = false;
+        for (u32 k = 0; k < config.texture.tev_stages.size(); k++) {
+            const TevStageConfig stage = config.texture.tev_stages[k];
+            half = half ||
+                   (!IsPassThroughTevStage(stage) && (stage.color_op == Operation::AddSigned ||
+                                                      stage.alpha_op == Operation::AddSigned));
+        }
+        if (half) {
+            e.Bitwise(BwOp::Or, Reg::V(TmpU8Half),
+                      IOp::R(Reg::Sa(static_cast<uint8_t>(LitSa(LitU8Half)))), IOp::Imm(0));
+        }
+        // The inputs, packed to nearest as the F32 path's byte rounding has them (the vertex
+        // colour); the texels and the lighting's colours are rounded here, where the F32 path
+        // carried them unrounded into the first stage reading them.
+        if (StageReads(Source::PrimaryColor) && colour_u8_pa < 0) {
+            e.PackU8(Reg::V(TmpU8Primary), Reg::Pa(0), Reg::Pa(2));
+        }
     }
     for (u32 unit = 0; unit < 3; unit++) {
+        if (!unit_now(unit)) {
+            continue;
+        }
         if (unit_own[unit]) {
             // The tile's colour as the program finds it: the pixel's own texel.
             SopCtl s;
@@ -3959,22 +3989,25 @@ void FragmentEmitter::U8Inputs() {
             e.Sop2(dst, dst, Reg::V(TmpU8Scratch), s);
         }
     }
-    if (uses_proctex) {
+    if (second && uses_proctex) {
         if (proctex_tabled) {
             e.PackU8F16(Reg::V(TmpU8Tex3), proctex_loc.Pair(0));
         } else {
             e.PackU8(Reg::V(TmpU8Tex3), Reg::V(TmpTex3), Reg::V(TmpTex3 + 2));
         }
     }
-    if (uses_lighting && !u8_lighting_packed) {
+    if (second && uses_lighting && !u8_lighting_packed) {
         e.PackU8(Reg::V(TmpU8Diffuse), Reg::V(TmpDiffuse), Reg::V(TmpDiffuse + 2));
         e.PackU8(Reg::V(TmpU8Specular), Reg::V(TmpSpecular), Reg::V(TmpSpecular + 2));
     }
     // A channel a modifier moves (alpha = primary.r, colour = texel.ggg): the input packed
     // again from the same lanes, that channel into every byte, so the argument reads it as the
     // colour or the alpha itself.
-    u8_bcast = {};
-    uint32_t next = 0;
+    if (first) {
+        u8_bcast = {};
+        u8_bcast_count = 0;
+    }
+    uint32_t& next = u8_bcast_count;
     const auto broadcast = [&](Source src, int lane) {
         if (lane < 0 || !U8InputPresent(src)) {
             return;
@@ -3983,7 +4016,14 @@ void FragmentEmitter::U8Inputs() {
         if (input < 0) {
             throw std::runtime_error("usse: a moved U8 channel U8TevSupported did not admit");
         }
-        if (u8_bcast[input][lane] != 0) {
+        // The part the input itself is packed in.
+        const bool now =
+            src == Source::PrimaryColor
+                ? first
+                : src >= Source::Texture0 && src <= Source::Texture2
+                      ? unit_now(static_cast<u32>(src) - static_cast<u32>(Source::Texture0))
+                      : second;
+        if (!now || u8_bcast[input][lane] != 0) {
             return;
         }
         if (next >= U8BroadcastMax) {
@@ -4516,9 +4556,144 @@ void FragmentEmitter::U8TevStage(u32 index) {
     u8_prev = out;
 }
 
+bool FragmentEmitter::PlanEarlyAlpha() {
+    // A program that kills runs its first phase, up to the kill, for every pixel the ISP hands it;
+    // with the test after the last stage that is the shadow, the lights and the combiners, for
+    // pixels the test then drops too. Where the tested alpha comes from texels, the vertex colour
+    // and constants alone, the first phase is those stages' alpha and the test, and the lighting
+    // and the stages follow the kill.
+    const auto func = config.framebuffer.alpha_test_func.Value();
+    if (!u8_tev || !uses_lighting || !uses_kill || shadow_write ||
+        func == FramebufferRegs::CompareFunc::Always ||
+        func == FramebufferRegs::CompareFunc::Never) {
+        return false;
+    }
+    const auto& stages = config.texture.tev_stages;
+    // The stage whose output a Previous read at stage k sees, or -1 (zero).
+    const auto before = [&](int k) {
+        for (int j = k - 1; j >= 0; j--) {
+            if (!IsPassThroughTevStage(stages[j])) {
+                return j;
+            }
+        }
+        return -1;
+    };
+    const int last = before(static_cast<int>(stages.size()));
+    if (last < 0) {
+        return false;
+    }
+    uint32_t need = 1u << last, units = 0;
+    for (int k = last; k >= 0; k--) {
+        if (!(need >> k & 1)) {
+            continue;
+        }
+        const TevStageConfig stage = stages[k];
+        if (stage.color_op == Operation::Dot3_RGBA) {
+            return false; // its alpha is the colours' dot product
+        }
+        const Operation op = stage.alpha_op;
+        const u32 args = op == Operation::Replace ? 1u
+                         : (op == Operation::Lerp || op == Operation::MultiplyThenAdd ||
+                            op == Operation::AddThenMultiply)
+                               ? 3u
+                               : 2u;
+        const Source srcs[3] = {stage.alpha_source1, stage.alpha_source2, stage.alpha_source3};
+        const AlphaModifier mods[3] = {stage.alpha_modifier1, stage.alpha_modifier2,
+                                       stage.alpha_modifier3};
+        for (u32 a = 0; a < args; a++) {
+            const Source src = AlphaSource(stage, srcs[a], static_cast<u32>(k));
+            const bool moved = MovedLane(mods[a]) >= 0;
+            switch (src) {
+            case Source::PrimaryColor:
+            case Source::Constant:
+                break;
+            case Source::Texture0:
+            case Source::Texture1:
+            case Source::Texture2: {
+                const u32 unit = static_cast<u32>(src) - static_cast<u32>(Source::Texture0);
+                if (unit_own[unit]) {
+                    return false;
+                }
+                units |= unit_used[unit] ? 1u << unit : 0;
+                break;
+            }
+            case Source::Previous: {
+                // A colour channel of a stage's output is the colour stages'.
+                if (moved) {
+                    return false;
+                }
+                const int from = before(k);
+                need |= from >= 0 ? 1u << from : 0;
+                break;
+            }
+            case Source::PreviousBuffer: {
+                if (moved) {
+                    return false;
+                }
+                int from = buffer_alpha_from[k];
+                if (from >= 0 && IsPassThroughTevStage(stages[from])) {
+                    from = before(from);
+                }
+                need |= from >= 0 ? 1u << from : 0;
+                break;
+            }
+            default:
+                return false; // the lighting's colours, the procedural texture
+            }
+        }
+    }
+    early_stages = need;
+    early_units = units;
+    return true;
+}
+
+void FragmentEmitter::U8AlphaStage(u32 index) {
+    // The alpha bytes U8TevStage makes, by the instructions it makes them with: each argument's
+    // alpha (U8Arg, the colour not read), the alpha operation over them (in every form of a
+    // stage the alpha is U8Op's, or a SOP2 with U8Op's alpha factors), the scale.
+    const TevStageConfig stage = config.texture.tev_stages[index];
+    const Operation op = stage.alpha_op;
+    const u32 count = op == Operation::Replace ? 1u
+                      : (op == Operation::Lerp || op == Operation::MultiplyThenAdd ||
+                         op == Operation::AddThenMultiply)
+                            ? 3u
+                            : 2u;
+    const Source csrcs[3] = {stage.color_source1, stage.color_source2, stage.color_source3};
+    const ColorModifier cmods[3] = {stage.color_modifier1, stage.color_modifier2,
+                                    stage.color_modifier3};
+    const Source asrcs[3] = {stage.alpha_source1, stage.alpha_source2, stage.alpha_source3};
+    const AlphaModifier amods[3] = {stage.alpha_modifier1, stage.alpha_modifier2,
+                                    stage.alpha_modifier3};
+    std::array<Reg, 3> args{Reg::V(TmpU8Zero), Reg::V(TmpU8Zero), Reg::V(TmpU8Zero)};
+    for (u32 k = 0; k < count; k++) {
+        args[k] = U8Arg(static_cast<uint8_t>(k), index, csrcs[k], cmods[k], asrcs[k], amods[k],
+                        false, true);
+    }
+    const unsigned scale = stage.GetAlphaMultiplier();
+    const bool scratch = args[0].bank == Bank::Virtual &&
+                         ((args[0].n >= TmpU8Arg && args[0].n < TmpU8Arg + 3) ||
+                          args[0].n == TmpU8Const);
+    if (op == Operation::Replace && scale == 1 && !scratch) {
+        u8_out[index] = args[0];
+        u8_prev = args[0];
+        return;
+    }
+    const Reg out = Reg::V(static_cast<uint8_t>(TmpU8Stage + index * 2));
+    U8Op(op, out, args);
+    for (unsigned step = 2; step <= scale; step *= 2) {
+        SopCtl s;
+        s.cmod1 = s.amod1 = s.cmod2 = s.amod2 = true; // the result added to itself, saturating
+        e.Sop2(out, out, out, s);
+    }
+    u8_out[index] = out;
+    u8_prev = out;
+}
+
 void FragmentEmitter::U8Output() {
     Reg final = U8EvenFinal();
-    AlphaTest(&final);
+    if (!early_alpha) {
+        AlphaTest(&final);
+    }
     if (shadow_write) {
         ShadowWrite(&final);
         return;
@@ -4733,7 +4908,26 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     e.Phas(!uses_kill);
     e.Nop();
     Scissor();
-    SampleTextures();
+    PlanCombinerBuffer();
+    early_alpha = PlanEarlyAlpha();
+    if (early_alpha) {
+        // The first phase: the texels the tested alpha reads, those stages' alpha, the test and
+        // its kill. Every register it wrote stays for the second.
+        SampleTextures(early_units);
+        U8Inputs(1);
+        for (u32 i = 0; i < config.texture.tev_stages.size(); i++) {
+            if (IsPassThroughTevStage(config.texture.tev_stages[i])) {
+                u8_out[i] = u8_prev;
+            } else if (early_stages >> i & 1) {
+                U8AlphaStage(i);
+            }
+        }
+        Reg tested = U8EvenFinal();
+        AlphaTest(&tested);
+        SampleTextures(~early_units & 7);
+    } else {
+        SampleTextures();
+    }
     // An own-pixel unit's texel is the tile's colour, as F32 (the U8 combiners copy it in
     // U8Inputs).
     if (!u8_tev) {
@@ -4760,10 +4954,9 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     if (uses_lighting) {
         Lighting();
     }
-    PlanCombinerBuffer();
     if (u8_tev) {
         // combiner_output starts at zero, in U8.
-        U8Inputs();
+        U8Inputs(early_alpha ? 2 : 3);
         u8_prev = Reg::V(TmpU8Zero);
         for (u32 i = 0; i < config.texture.tev_stages.size(); i++) {
             U8TevStage(i);
