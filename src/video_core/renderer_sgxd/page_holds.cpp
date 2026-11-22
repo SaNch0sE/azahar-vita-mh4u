@@ -36,10 +36,12 @@ PageHolds::PageHolds(Memory::MemorySystem& memory)
       vram_host{memory.GetPhysicalPointer(Memory::VRAM_PADDR)},
       fcram_pages{Memory::FCRAM_SIZE >> PageBits},
       pages{fcram_pages + (Memory::VRAM_SIZE >> PageBits)}, read_ticket(fcram_pages),
-      read_lo(fcram_pages), read_hi(fcram_pages), geometry_read(fcram_pages),
-      write_ticket(pages), write_lo(pages), write_hi(pages), display_ticket(fcram_pages),
-      other_ticket(fcram_pages), display_lo(fcram_pages), display_hi(fcram_pages), applied(pages),
-      watched(fcram_pages) {
+      read_lo(fcram_pages), read_hi(fcram_pages), geometry_read(fcram_pages), write_ticket(pages),
+      write_lo(pages), write_hi(pages), display_ticket(fcram_pages), other_ticket(fcram_pages),
+      display_lo(fcram_pages), display_hi(fcram_pages), applied(pages), watched(fcram_pages),
+      watch_lo(fcram_pages), watch_hi(fcram_pages), watch_ticket(fcram_pages), parse_held(pages),
+      permit_slot(fcram_pages), index_watch(fcram_pages), index_stamp(fcram_pages),
+      index_write_frame(fcram_pages) {
 #ifdef VITA_DIAGNOSTICS
     kinds.resize(pages);
     ranges.resize(pages);
@@ -281,7 +283,53 @@ void PageHolds::Close(u32 ticket) {
 
 PageHolds::Access PageHolds::Wanted(u32 page, u32 reached) const {
     const Access holds = HoldsWant(page, reached);
-    return Watched(page) && holds < ReadOnly ? ReadOnly : holds;
+    return (Watched(page) || parse_held[page] != 0 || IndexWatched(page)) && holds < ReadOnly
+               ? ReadOnly
+               : holds;
+}
+
+void PageHolds::HoldParse(PAddr addr, u32 bytes) {
+    u32 first, count;
+    if (!PagesOf(addr, bytes, first, count)) {
+        return;
+    }
+    for (u32 p = first; p < first + count; p++) {
+        VoidPermit(p);
+        DEBUG_ASSERT_MSG(parse_held[p] != 0xffff, "page holds: page {:#010x} in 65535 lists",
+                         AddressOf(p));
+        if (parse_held[p]++ == 0 && applied[p] < ReadOnly) {
+            Change(p, ReadOnly);
+        }
+    }
+}
+
+void PageHolds::ReleaseParse(PAddr addr, u32 bytes, const std::vector<u32>& released) {
+    u32 first, count;
+    if (!PagesOf(addr, bytes, first, count)) {
+        return;
+    }
+    for (u32 p = first; p < first + count; p++) {
+        if (std::find(released.begin(), released.end(), p) == released.end()) {
+            ReleaseParsePage(p, 1);
+        }
+    }
+}
+
+void PageHolds::ReleaseParsePage(u32 page, u32 count) {
+    DEBUG_ASSERT_MSG(parse_held[page] >= count, "page holds: page {:#010x}: {} parse holds let go of {}",
+                     AddressOf(page), count, parse_held[page]);
+    parse_held[page] = static_cast<u16>(parse_held[page] - count);
+    if (parse_held[page] == 0) {
+        const Access wanted = Wanted(page, last_reached);
+        if (wanted < applied[page]) {
+            Change(page, wanted);
+        }
+    }
+}
+
+const u8* PageHolds::HostOf(u32 page) const {
+    return page < fcram_pages ? fcram_host + (static_cast<uintptr_t>(page) << PageBits)
+                              : vram_host + (static_cast<uintptr_t>(page - fcram_pages) << PageBits);
 }
 
 void PageHolds::Watch(PAddr addr, u32 bytes) {
@@ -447,7 +495,8 @@ void PageHolds::NoteDisplay(u32 p, PAddr addr, u32 bytes, u32 ticket, bool displ
 
 bool PageHolds::DisplayOnly(u32 page, u32 reached) const {
     if (page == NoPage || page >= fcram_pages || !Live(display_ticket[page], reached) ||
-        Live(other_ticket[page], reached) || watched[page] != 0) {
+        Live(other_ticket[page], reached) || watched[page] != 0 || parse_held[page] != 0 ||
+        index_watch[page] != 0) {
         return false;
     }
     const PageVersion& v = versions[page];
@@ -495,7 +544,8 @@ void PageHolds::Reopen(u32 page, u32 reached) {
     Release(reached);
     Access wanted = Wanted(page, reached);
     // A VRAM page the guest writes opens until the next GPU read of VRAM holds it again.
-    if (page >= fcram_pages && wanted == ReadOnly && !Live(vram_read, reached)) {
+    if (page >= fcram_pages && wanted == ReadOnly && !Live(vram_read, reached) &&
+        parse_held[page] == 0) {
         wanted = Unheld;
         vram_opened.push_back(page);
     }
@@ -736,10 +786,10 @@ bool PageHolds::TouchesWrite(const u8* host, u32 bytes) const {
 
 bool PageHolds::StoreMisses(const u8* host, u32 bytes, u32 reached, u32& ticket) const {
     const u32 page = PageOf(host);
-    // FCRAM pages the ordinary holds alone close: a texture's watched page, a versioned one and
-    // a display page have their own paths (PageFault, OpenPastDisplay).
-    if (page == NoPage || page >= fcram_pages || watched[page] != 0 || versions[page].on ||
-        Live(display_ticket[page], reached)) {
+    // FCRAM pages the ordinary holds or a texture's watch close: a versioned one, a display page
+    // and a handed-over list's have their own paths (PageFault, OpenPastDisplay).
+    if (page == NoPage || page >= fcram_pages || versions[page].on ||
+        Live(display_ticket[page], reached) || parse_held[page] != 0) {
         return false;
     }
     const u32 at = static_cast<u32>(host - fcram_host) & (PageSize - 1);

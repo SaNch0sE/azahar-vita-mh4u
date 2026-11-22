@@ -31,23 +31,21 @@ class RasterizerSgxd;
 class RendererSgxd;
 
 /**
- * The render thread, on Vita core 1. The
- * emulation thread owns the PICA: it parses the command lists, keeps the registers, the shader
- * setups and the LUTs, and raises the interrupts. This thread owns everything behind the rasterizer
- * interface: the GXM rasterizer, sgxd, the guest's GPU memory map and the presents.
+ * The render thread (Vita core 0) owns everything behind the rasterizer interface: the sgxd
+ * rasterizer, sgxd, the guest's GPU memory map, the window and the presents (docs/threads.md).
  *
- * To the emulation side's PicaCore and GPU this class is the rasterizer. Each call it gets is
- * a record in a ring, behind a record of the PICA state that changed since the last one
- * (registers by the dirty table, uniforms, program and swizzle words, LUTs, default
- * attributes). The thread applies the state to its own PicaCore, which the GXM rasterizer was
- * made with, and makes the call there, in order.
+ * Each list is split between PicaCores (Pica::PicaCore::BindSplit). The emulation side scans it at
+ * submission (late skip, page holds, index ranges, interrupt requests) and queues it as a record;
+ * the parse thread parses it ahead of this thread into a second ring, which this thread runs at the
+ * list's record (RunParsed). Until the parse has copied the list, its pages are held against the
+ * guest's writes (PageHolds::HoldParse).
  *
  * Tickets: each GPU interrupt and vblank takes one (InterruptFence) for the work queued before it;
  * the interrupt goes to the guest at once. The pages that work touches stay held until the ticket
  * is reached. While tickets wait the thread sleeps until sgxd wakes it for the oldest one's fence.
  *
- * Every producer holds the GPU's lock (VideoCore::GPU::Lock): the state records read the
- * emulation side's PICA, and the ring has one writer at a time.
+ * Every producer holds the GPU's lock (VideoCore::GPU::Lock): the ring has one writer at a
+ * time. The parsed ring has one, the parse thread.
  *
  * The window is this thread's too: each VBlank's present record polls its input and presents,
  * and with no present for WindowPollInterval the thread polls it on its own. The PS button's
@@ -61,7 +59,8 @@ class RendererSgxd;
  */
 class RenderThread final : public VideoCore::RasterizerInterface {
 public:
-    RenderThread(Pica::PicaCore& pica, Pica::PicaCore& render_pica, RendererGxm& renderer,
+    RenderThread(Pica::PicaCore& pica, Pica::PicaCore& parse_pica, Pica::PicaCore& render_pica,
+                 RendererGxm& renderer,
                  RasterizerGxm& rasterizer, Memory::MemorySystem& memory);
     ~RenderThread() override;
 
@@ -84,8 +83,33 @@ public:
     };
     using DrawTextures = std::array<GuestRange, 8>;
 
-    // The rasterizer interface, for the emulation side. Each call queues; the Accelerate ones
-    // answer true, as RasterizerSgxd's always do (it stops the emulator on what it cannot do).
+    /// A command list the guest submitted (GPU::SubmitCmdList), its interrupt requests' delays
+    /// into `irqs`, for P3D once it is queued. ignore_list: the right eye's, its P3D alone.
+    void SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::vector<u64>& irqs);
+    /// A PICA register the guest wrote outside a list, in order with the lists. Only the parse thread
+    /// reads it, so the next list's publish takes it along.
+    void RegWrite(u32 id, u32 value);
+    void TakeWholeState();
+    void GiveWholeState();
+
+    // What the two sides of a split list call (Pica::PicaCore::BindSplit): the scan on the emulation
+    // side, the parse on this thread.
+    /// Scan: a list, or a buffer it jumps to, as it is submitted: its words.
+    const u8* ScanList(PAddr addr, u32 size);
+    void ScanDraw(bool is_indexed);
+    void ScanImmediateBatch();
+    void ScanImmediateFlush();
+    /// Scan: an immediate-mode vertex the geometry unit takes (drawn on the CPU).
+    void ScanImmediateVertex();
+    /// Scan: an interrupt request, raised once the list is handed over.
+    void ScanIrq(u64 delay_ns);
+    const u8* RenderList(PAddr addr, u32 size);
+    /// Render: whether to draw the next of the scan's draws, in the scan's order.
+    bool RenderDraw();
+    void RenderFogLut();
+
+    // The rasterizer interface, for the emulation side. Each call queues; the Accelerate ones answer
+    // true (RasterizerSgxd stops the emulator on what it cannot do). The draws are the lists'.
     void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                      const Pica::OutputVertex& v2) override;
     void DrawTriangles() override;
@@ -184,6 +208,9 @@ public:
         u32 faults, fault_waits;
         u32 versioned_faults; ///< of the aborts, those a page version took
         u32 geometry_moves;   ///< geometry pages moved to CDRAM after a write waited on them
+        /// Writes to a handed-over list's page: copies taken for the parse, and waits for a parse.
+        u32 parse_copies, parse_waits;
+        u64 parse_wait_us;
         u64 fault_wait_us;
         u32 host_waits;
         u64 host_wait_us;
@@ -255,6 +282,7 @@ public:
     /// that did not return at once, their time (us), and their sleeps on `done` with those that
     /// ended at the 1 ms timeout rather than a wake.
     struct Stats {
+        /// State: the lists' decisions and the register writes; Draw: the lists.
         enum Kind : u32 { State, Draw, Fill, Transfer, Dma, Present, Other, Count };
         std::array<u32, Count> records;
         u64 busy_us;
@@ -279,6 +307,24 @@ public:
         u32 gpu_samples;
         u32 gpu_busy;
         u32 gpu_held;
+        u64 parse_busy_us;
+        u32 parsed_waits;
+        u64 parsed_wait_us;
+        u32 lists;
+        u64 list_bytes;
+        u64 list_parsed_bytes;
+        u32 list_ranges;
+        u32 list_parsed_max;
+        u32 list_draws;
+        u64 scan_us;
+        u32 index_scans;
+        u64 index_scan_indices;
+        u64 index_scan_us;
+        u32 index_memo_hits;
+        u32 publishes;
+        u32 render_wakes;
+        u32 parse_wakes;
+        u64 wake_us;
         std::array<u32, GpuAtCells> gpu_at;
         std::array<u32, GpuLabels> gpu_3d_by;
         std::array<u32, GpuLabels> gpu_ta_by;
@@ -302,15 +348,6 @@ private:
         u64 fence;
     };
 
-    /// Writes the PICA state that changed since the last call as records. Before every call
-    /// record that may read it.
-    void SyncState();
-    /// gxm_flags `rendercheck`: before each draw the emulation side's whole PICA state, which the
-    /// render side compares with its copy, logging each register, uniform and table that
-    /// differs once.
-    void PutCheck();
-    void RunCheck(const u8* payload);
-    bool check{};
     /// A record of `bytes` payload bytes; the returned pointer is where they go.
     u8* Begin(Op op, u32 bytes, u16 extra = 0);
     void Commit();
@@ -338,6 +375,44 @@ private:
 
     void RunAvailable();
     void RunRecord(const Head& head, const u8* payload);
+
+    /// The parse thread (core 3): lists parsed ahead of the render side. It reads the ring behind the
+    /// emulation side's writes, applies each list's decisions and register writes to parse_pica, and
+    /// writes the state changes and draws as records of its own (`parsed`), which the render side runs
+    /// at the list's Op::CmdList.
+    void ParseLoop();
+    void ParseRecord(const Head& head, const u8* payload);
+    bool ParseSleep(std::chrono::microseconds timeout);
+    void ParseWake();
+    /// Waits until the parse thread has read every record published (a whole-state copy).
+    void WaitParseIdle();
+    u8* ParsedBegin(Op op, u32 bytes, u16 extra = 0);
+    void ParsedCommit();
+    void PublishParsed();
+    template <typename T>
+    void ParsedPut(Op op, const T& payload, u16 extra = 0);
+    void ParsedPut(Op op);
+    void SyncParsedState();
+    /// Render side: list `seq`'s parsed records run as they come, to its end.
+    void RunParsed(u32 seq);
+    class ParsedOutput;
+    std::unique_ptr<ParsedOutput> parsed_output;
+    /// The parse thread's place in the ring: the producer's room ends here or at `read`.
+    std::atomic<u32> parse_read{};
+    s32 parse_wake_flag{-1};
+    std::atomic<bool> parse_sleeping{};
+    /// A list's record committed since the parse thread was woken: only a list needs it awake (each
+    /// wake a syscall and an IPI).
+    bool parse_wake_due{};
+    std::atomic<bool> parse_stopping{};
+    /// The parsed ring; positions wrap at 2^32.
+    static constexpr u32 ParsedSize = 1024 * 1024;
+    std::unique_ptr<u8[]> parsed;
+    u32 parsed_write{};
+    u32 parsed_open{};
+    std::atomic<u32> parsed_published{};
+    std::atomic<u32> parsed_read{};
+    std::atomic<bool> parsed_space_waiting{};
 #ifdef VITA_DIAGNOSTICS
     static Stats::Kind KindOf(Op op);
 #endif
@@ -350,6 +425,7 @@ private:
     void Wake();
 
     Pica::PicaCore& pica;
+    Pica::PicaCore& parse_pica;
     Pica::PicaCore& render_pica;
     RendererSgxd& renderer;
     RasterizerSgxd& rasterizer;
@@ -397,8 +473,6 @@ private:
     void HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind);
     void HoldWrite(PAddr addr, u32 bytes, PageHolds::Kind kind);
     void HoldDraw(const DrawTextures& textures, u32 count, bool vertices, bool is_indexed);
-    /// A geometry draw's indices into a record of their own (Op::GsIndices), before its Draw.
-    void PutGsIndices();
     void HoldVertices(bool is_indexed);
     /// The scan's memo of 16-bit index lists' ranges, valid while their pages' write stamps stand.
     struct IndexMemo {
@@ -416,6 +490,88 @@ private:
         u32 scanned;
     };
     DrawIndexRange draw_indices{};
+    DrawIndexRange parse_indices{};
+    const u8* parse_gs{};
+    u32 parse_gs_bytes{};
+    bool parse_gs_u16{};
+    /// Geometry draws the parse holds back: point-mode draws with no indices whose state is the run's
+    /// first one's but its first vertex, sent as one MergedDraw of their vertices' numbers.
+    struct HeldRun {
+        u32 draws = 0;
+        DrawIndexRange first_indices{}; ///< sent as its own Draw when the run is that one
+        std::vector<u16> vertices;
+        decltype(Pica::RegsInternal::reg_array) regs{}; ///< as the run's first draw left them
+    };
+    static constexpr u32 MaxRunVertices = 256;
+    HeldRun held;
+    bool held_flushing{};
+    bool RunsDraw(bool is_indexed) const;
+    bool MergeDraw(bool is_indexed);
+    void FlushRun();
+    void DrawMerged(const u16* vertices, u32 count);
+
+    /// The scan's decision on a list's draw, in the scan's order: whether it is dropped (late skip,
+    /// right eye), the report to the rasterizer, its indices' range, and a geometry draw's indices as
+    /// the guest had them at the scan (gs_bytes after it: the guest may have rewritten them since).
+    struct alignas(8) ListDraw {
+        u8 dropped;
+        u8 report;
+        u8 gs_u16;
+        u8 pad;
+        DrawIndexRange indices;
+        u32 gs_bytes;
+        std::array<u32, 3> late_report;
+    };
+    std::vector<u8> scan_draws;
+    u32 scan_draw_count{};
+    std::vector<GuestRange> scan_lists;
+    /// Each range's words in scan_words (an 8-byte offset), or NotCopied. A range in guest VRAM
+    /// is copied as the scan meets it, the scan reads the copy, and the list's record carries it
+    /// to the parse: guest VRAM is uncached CDRAM, where the scan's word-at-a-time reads cost
+    /// ~110 ns a word (a game, a game jump into such buffers tens of thousands of times a second),
+    /// and holding their pages for the parse flipped their protection for each list. A range in
+    /// FCRAM is read in place and held until the parse has copied it (HoldParse).
+    std::vector<u32> scan_offsets;
+    std::unique_ptr<u8[]> scan_words;
+    u32 scan_words_size{};
+    u32 scan_words_cap{};
+    static constexpr u32 NotCopied = 0xFFFFFFFF;
+    std::vector<u64>* scan_irqs{};
+    void PutScanDraw(const ListDraw& d, const u8* gs);
+    void FlushScanDraws();
+    std::vector<u8> parse_draws;
+    std::size_t parse_draw_at{};
+    std::vector<u8> parse_words;
+    std::vector<std::array<u32, 3>> parse_ranges;
+    std::size_t parse_range_at{};
+    void CopyListWords(u32 seq, const GuestRange* ranges, const u32* offsets, const u8* words,
+                       u32 count);
+
+    /// The lists handed over, the one this thread copies or last copied, and the last copied whole (its
+    /// holds can go).
+    u32 list_seq{};
+    std::atomic<u32> parsing_seq{};
+    std::atomic<u32> copied_seq{};
+    struct ParseHold {
+        u32 seq;
+        std::vector<GuestRange> ranges;
+        std::vector<u32> released;
+    };
+    std::deque<ParseHold> parse_holds;
+    void ReleaseParsed();
+    /// A write to a page a handed-over list's parse reads: each such list not copied yet reads a copy
+    /// of the page, its hold let go; one being copied now ends its copy first.
+    bool ParseFault(u32 page);
+    /// The copies, by list and page, and how many (none, as a rule). Under snapshot_mutex, but the count.
+    struct Snapshot {
+        u32 seq;
+        u32 page;
+        std::shared_ptr<std::array<u8, 0x1000>> bytes;
+    };
+    std::mutex snapshot_mutex;
+    std::vector<Snapshot> snapshots;
+    std::atomic<u32> snapshot_count{};
+    std::atomic<bool> parse_waiting{};
     /// The GPU remaps the last holds asked for, as records before the work's.
     void PutPageRemaps();
     /// Waits for the work a guest access to the page waits for, the open holds' ticket fenced first.
@@ -428,7 +584,8 @@ private:
 #endif
 #ifdef VITA_DIAGNOSTICS
     u32 faults{}, fault_waits{}, host_waits{}, versioned_faults{};
-    u32 geometry_moves{};
+    u32 geometry_moves{}, parse_copies{}, parse_waits{};
+    u64 parse_wait_us{};
     u64 fault_wait_us{}, host_wait_us{};
     std::array<u32, PageHolds::Kinds> fault_kinds{};
     std::array<u64, PageHolds::Kinds> fault_kind_us{};
@@ -496,7 +653,6 @@ private:
     bool late_triangles_open{};
     /// The last dropped draw's colour buffer and viewport reported this frame (Op::LateDropped).
     std::array<u32, 3> late_reported{};
-    bool late_triangles_skip{};
     /// The colour buffers drawn lately (the newest 16), each with its segments: a segment is
     /// the draws into it up to a transfer from it. a game draws both screens into one colour
     /// buffer (skiplog: the top screen's draws, its transfer, the bottom screen's draws, its
@@ -574,10 +730,9 @@ private:
     /// A draw's own TA cost in vertices (measured: ~2.2 us a draw, 72 ns a vertex).
     static constexpr u32 LateDrawCost = 32;
     [[nodiscard]] int LcdScreenOf(PAddr addr, u32 bytes, PAddr* buffer = nullptr) const;
-    /// A draw (a batch's first vertex, the first CPU-path triangle): its screen (its colour
-    /// buffer's segment's) counted, and whether the late skip drops it. Emulation side, before
-    /// the draw is recorded.
-    [[nodiscard]] bool LateDraw();
+    /// A draw of `vertices` (0 in immediate mode): its screen's cost counted, and whether the late
+    /// skip drops it. Emulation side.
+    bool LateDraw(ListDraw& d, u32 vertices);
     /// A display transfer or texture copy: the segment it ends gets its screen, and whether the late
     /// skip drops it. Emulation side.
     [[nodiscard]] bool LateTransfer(const Pica::DisplayTransferConfig& config, bool display);
@@ -604,6 +759,24 @@ private:
     std::atomic<u64> busy_us{};
     std::atomic<u64> idle_us{};
     std::atomic<u32> timeouts{};
+    std::atomic<u64> parse_busy_us{};
+    std::atomic<u32> parsed_waits{};
+    std::atomic<u64> parsed_wait_us{};
+    std::atomic<u32> lists{};
+    std::atomic<u64> list_bytes{};
+    std::atomic<u64> list_parsed_bytes{};
+    std::atomic<u32> list_ranges{};
+    std::atomic<u32> list_parsed_max{};
+    std::atomic<u32> list_draws{};
+    std::atomic<u64> scan_us{};
+    std::atomic<u32> index_scans{};
+    std::atomic<u64> index_scan_indices{};
+    std::atomic<u64> index_scan_us{};
+    std::atomic<u32> index_memo_hits{};
+    std::atomic<u32> publishes{};
+    std::atomic<u32> render_wakes{};
+    std::atomic<u32> parse_wakes{};
+    std::atomic<u64> wake_us{};
     u32 gpu_wakes_mark{};
     std::atomic<u32> presents{};
     std::atomic<u32> presents_behind{};
@@ -637,6 +810,7 @@ private:
 #endif
 
     Common::NamedThread thread;
+    Common::NamedThread parse_thread;
 };
 
 } // namespace SgxdRenderer

@@ -480,6 +480,14 @@ SgxdBackend::InterruptFence SgxdBackend::InterruptFenceNow() const {
             sgxd_ptla_fence()};
 }
 
+bool SgxdBackend::InterruptReached(const InterruptFence& fence) {
+    if (!sgxd_chain_reached(fence.render) || !sgxd_ptla_reached(fence.ptla)) {
+        return false;
+    }
+    RetireReached();
+    return true;
+}
+
 bool SgxdBackend::InterruptPoll(const InterruptFence& fence) {
     // The pending 3D finishes in the list after the last one sent: with the chain free, that list
     // goes.

@@ -16,6 +16,7 @@
 #include "video_core/pica/vertex_loader.h"
 #include "video_core/pica/words_differ.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/vprof.h"
 #include "video_core/shader/shader.h"
 
@@ -74,6 +75,7 @@ PicaCore::PicaCore(Memory::MemorySystem& memory_)
       shader_engine{CreateEngine(Settings::values.use_shader_jit.GetValue())} {
     InitializeRegs();
     dirty_regs.SetAllDirty();
+    SetSplit(CmdListMode::Whole, nullptr);
 
     const auto submit_vertex = [this](const AttributeBuffer& buffer) {
         const auto add_triangle = [this](const OutputVertex& v0, const OutputVertex& v1,
@@ -178,9 +180,17 @@ struct PicaCore::Dispatch {
         // https://problemkaputt.de/gbatek-3ds-gpu-internal-registers-finalize-interrupt-registers.htm
         if (any_byte_match(p.regs.internal.reg_array[id], p.regs.internal.irq_compare))
             [[likely]] {
-            p.rasterizer->NotifyP3D();
-            p.signal_interrupt(Service::GSP::InterruptId::P3D,
-                               p.delay_generator.CalculateAndResetDelay());
+            // Split, the scan raises P3D once the list is handed over, and the render side's
+            // rasterizer ends the list's work where the request is.
+            if (p.mode == CmdListMode::Scan) {
+                p.split->ScanIrq(p.delay_generator.CalculateAndResetDelay());
+            } else {
+                p.rasterizer->NotifyP3D();
+                if (p.mode == CmdListMode::Whole) {
+                    p.signal_interrupt(Service::GSP::InterruptId::P3D,
+                                       p.delay_generator.CalculateAndResetDelay());
+                }
+            }
             if (p.regs.internal.irq_autostop) [[likely]] {
                 stop_requested = true;
             }
@@ -214,10 +224,7 @@ struct PicaCore::Dispatch {
         const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
         const PAddr addr = p.regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
         const u32 size = p.regs.internal.pipeline.command_buffer.GetSize(index);
-        p.memory.GuardPhysicalRead(addr, size);
-        const u8* head = p.memory.GetPhysicalPointer(addr);
-        GxmRenderer::Vprof::Memory(GxmRenderer::Vprof::Mem::CmdList, addr, size);
-        p.cmd_list.Reset(addr, head, size);
+        p.cmd_list.Reset(addr, p.ListWords(addr, size), size);
     }
 
     // It seems like these trigger vertex rendering
@@ -448,9 +455,15 @@ struct PicaCore::Dispatch {
 
     static void FogLutDataBatch(PicaCore& p, const u32* values, u32 count) {
         auto& offset = p.regs.internal.texturing.fog_lut_offset;
+        bool changed = false;
         for (u32 i = 0; i < count; i++) {
             const u32 prev = std::exchange(p.fog.lut[(offset + i) % 128].raw, values[i]);
-            p.fog.lut_dirty |= prev != values[i];
+            changed |= prev != values[i];
+        }
+        p.fog.lut_dirty |= changed;
+        // The rasterizer's fog table follows the LUT (RasterizerSgxd::FogLutChanged).
+        if (changed && p.mode == CmdListMode::Render) {
+            p.split->RenderFogLut();
         }
         offset.Assign(offset + count);
         p.dirty_regs.Set(PICA_REG_INDEX(texturing.fog_lut_offset));
@@ -545,12 +558,47 @@ struct PicaCore::Dispatch {
         set(PICA_REG_INDEX(texturing.proctex_lut_data[0]), 8, &ProcTexLutDataBatch);
         return table;
     }
+
+    // The scan's (CmdListMode::Scan): what must happen at submission. The interrupt request,
+    // the jumps, the draws, and the default attributes, which form the immediate-mode vertices.
+    // The uploads (uniforms, programs, swizzles, LUTs) are plain registers here: the render side
+    // takes them. So are the primitive assembler's: the scan never assembles.
+    static consteval std::array<SpecialFn, RegsInternal::NUM_REGS> BuildScanSpecialLUT() {
+        std::array<SpecialFn, RegsInternal::NUM_REGS> table{};
+        const auto set = [&table](u32 base, u32 n, SpecialFn fn) {
+            for (u32 i = 0; i < n; ++i) {
+                table[base + i] = fn;
+            }
+        };
+        set(PICA_REG_INDEX(irq_request), 1, &IrqRequest);
+        set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index), 1,
+            &DefaultAttributesIndex);
+        set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]), 3,
+            &DefaultAttributesValue);
+        set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]), 2, &CommandBufferTrigger);
+        set(PICA_REG_INDEX(pipeline.trigger_draw), 1, &TriggerDraw);
+        set(PICA_REG_INDEX(pipeline.trigger_draw_indexed), 1, &TriggerDraw);
+        return table;
+    }
+
+    static consteval std::array<BatchFn, RegsInternal::NUM_REGS> BuildScanBatchLUT() {
+        std::array<BatchFn, RegsInternal::NUM_REGS> table{};
+        for (u32 i = 0; i < 3; ++i) {
+            table[PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]) + i] =
+                &DefaultAttributesValueBatch;
+        }
+        return table;
+    }
 };
 
 static constexpr std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS> special_lut =
     PicaCore::Dispatch::BuildSpecialLUT();
 static constexpr std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> batch_lut =
     PicaCore::Dispatch::BuildBatchLUT();
+static constexpr std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS> scan_special_lut =
+    PicaCore::Dispatch::BuildScanSpecialLUT();
+static constexpr std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> scan_batch_lut =
+    PicaCore::Dispatch::BuildScanBatchLUT();
 
 // With assembler_idle, the primitive topology and restart registers are plain: their handlers only
 // reset the primitive assembler (and take the topology), which changes nothing while it holds no
@@ -558,17 +606,19 @@ static constexpr std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> batch_lut
 // before anything uses the assembler. With hardware draws it is always idle, and games write those
 // two registers hundreds of times a frame.
 static consteval std::array<RegImplInfo, RegsInternal::NUM_REGS> BuildRegImplFlagsLUT(
-    bool assembler_idle) {
+    bool assembler_idle,
+    const std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS>& specials = special_lut,
+    const std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS>& batches = batch_lut) {
     std::array<RegImplInfo, RegsInternal::NUM_REGS> table{};
 
     // Special and batch registers are the ones with a dispatch handler.
     for (u32 i = 0; i < RegsInternal::NUM_REGS; ++i) {
         const bool plain_when_idle = i == PICA_REG_INDEX(pipeline.triangle_topology) ||
                                      i == PICA_REG_INDEX(pipeline.restart_primitive);
-        if (special_lut[i] != nullptr && !(assembler_idle && plain_when_idle)) {
+        if (specials[i] != nullptr && !(assembler_idle && plain_when_idle)) {
             table[i].SetNeedsSpecialHandling();
         }
-        if (batch_lut[i] != nullptr) {
+        if (batches[i] != nullptr) {
             table[i].SetSupportsBatch();
         }
     }
@@ -592,6 +642,18 @@ static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> reg_impl_flags_
     BuildRegImplFlagsLUT(false);
 static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> reg_impl_flags_lut_idle =
     BuildRegImplFlagsLUT(true);
+static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> scan_flags_lut =
+    BuildRegImplFlagsLUT(true, scan_special_lut, scan_batch_lut);
+
+void PicaCore::SetSplit(CmdListMode mode_, CmdListSplit* split_) {
+    mode = mode_;
+    split = split_;
+    const bool scan = mode == CmdListMode::Scan;
+    specials = scan ? scan_special_lut.data() : special_lut.data();
+    batches = scan ? scan_batch_lut.data() : batch_lut.data();
+    flags = scan ? scan_flags_lut.data() : reg_impl_flags_lut.data();
+    flags_idle = scan ? scan_flags_lut.data() : reg_impl_flags_lut_idle.data();
+}
 
 // Expand a 4-bit mask to 4-byte mask, e.g. 0b0101 -> 0x00FF00FF
 static constexpr std::array<u32, 16> ExpandBitsToBytes = {
@@ -653,13 +715,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         return;
     }
 
-    // A list, or a buffer it jumps to, a queued DMA still writes waits for it (a game Triple
-    // Deluxe's lists jump into VRAM its DMAs fill each frame: a stale buffer there ended the
-    // list before its P3D, and the game waited for that P3D for good).
-    memory.GuardPhysicalRead(list, size);
-    const u8* head = memory.GetPhysicalPointer(list);
-    GxmRenderer::Vprof::Memory(GxmRenderer::Vprof::Mem::CmdList, list, size);
-    cmd_list.Reset(list, head, size);
+    cmd_list.Reset(list, ListWords(list, size), size);
 
     bool stop_requested = false;
     bool skip_fast_path = false;
@@ -679,84 +735,36 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         // auto-vectorize this part with SSE4.2, due to the LUT read, instead it just
         // unrolls the loop. Other ISAs and/or compilers may be able to do it,
         // that's why it was decided to keep the structure like this.
-        if (!debug_context) [[likely]] {
-            if (!skip_fast_path && !immediate_open) {
-                // Chosen at each entry: only a slow-path command (a draw) can fill the
-                // assembler.
-                const auto& flags_lut =
-                    primitive_assembler.IsIdle() ? reg_impl_flags_lut_idle : reg_impl_flags_lut;
+        if (!skip_fast_path && !immediate_open) {
+            // Chosen at each entry: only a slow-path command (a draw) can fill the
+            // assembler.
+            const RegImplInfo* const flags_lut = primitive_assembler.IsIdle() ? flags_idle : flags;
 #if CITRA_ARCH(arm32)
-                // Hand-written Thumb-2 loop (pica_cmdlist_a32.S): applies plain register
-                // writes, group writes of plain registers among them, until list end or a
-                // special command, which falls through to the slow path below with
-                // current_index already advanced past the batch. `run` counts the writes.
-                // Not called for a command it would hand straight back (a special register,
-                // an id past the file, a same-register batch): 497 of the 1311 slow-path
-                // commands of a game's race-start frame come right after another.
-                u32 run = 0;
-                u32 index = cmd_list.current_index;
-                const CommandHeader next{index + 1 < cmd_list.length ? cmd_list.head[index + 1]
-                                                                     : 0u};
-                const bool slow_next =
-                    index + 1 < cmd_list.length &&
-                    (next.cmd_id >= RegsInternal::NUM_REGS ||
-                     (next.extra_data_length != 0 ? !next.group_commands
-                                                  : flags_lut[next.cmd_id].NeedsSpecialHandling()));
-                if (!slow_next) {
-                    index = PicaCmdListFastLoop(
-                        cmd_list.head, cmd_list.current_index, cmd_list.length,
-                        reinterpret_cast<const u16*>(flags_lut.data()), ExpandBitsToBytes.data(),
-                        regs.internal.reg_array.data(),
-                        reinterpret_cast<u8*>(dirty_regs.qwords.data()), &run);
-                }
-                if (run > 0) {
-                    delay_generator.AddCommands(run);
-                    cmd_list.current_index = index;
-                    if (index + 1 >= cmd_list.length) {
-                        continue;
-                    }
-                }
-#else
-                constexpr u32 batch_size = 4;
-                u32 index = cmd_list.current_index;
-                u32 ids[batch_size], values[batch_size], masks[batch_size];
-                u32 run = 0;
-
-                while (run < batch_size && index + 1 < cmd_list.length) {
-                    const u32 value = cmd_list.head[index];
-                    const CommandHeader header{cmd_list.head[index + 1]};
-
-                    // If extra handling is needed stop and fallback to slower path.
-                    if (header.extra_data_length != 0 || header.cmd_id >= RegsInternal::NUM_REGS ||
-                        flags_lut[header.cmd_id].NeedsSpecialHandling()) {
-                        skip_fast_path = true;
-                        break;
-                    }
-
-                    ids[run] = header.cmd_id;
-                    values[run] = value;
-                    masks[run] = header.parameter_mask;
-                    ++run;
-                    index += 2;
-                }
-
-                // Process the commands that we have read so far (up to 4).
-                if (run > 0) {
-                    delay_generator.AddCommands(run);
-                    for (u32 i = 0; i < run; ++i) {
-                        const u32 id = ids[i];
-                        const u32 write_mask = ExpandBitsToBytes[masks[i]];
-                        const u32 old_value = regs.internal.reg_array[id];
-                        const u32 new_value = (old_value & ~write_mask) | (values[i] & write_mask);
-                        regs.internal.reg_array[id] = new_value;
-                        // Marked only when it changes (as pica_cmdlist_a32.S).
-                        if (new_value != old_value) {
-                            dirty_regs.Set(id);
-                        }
-                    }
-                    cmd_list.current_index = index;
-
-                    // Continue from the while loop in case we reached the end of the list.
+            // Hand-written Thumb-2 loop (pica_cmdlist_a32.S): applies plain register writes, group
+            // writes of plain registers among them, until list end or a special command, which
+            // falls through to the slow path below with current_index already advanced past the
+            // batch. `run` counts the writes. Not called for a command it would hand straight back
+            // (a special register, an id past the file, a same-register batch): such commands often
+            // come in a row.
+            u32 run = 0;
+            u32 index = cmd_list.current_index;
+            const CommandHeader next{index + 1 < cmd_list.length ? cmd_list.head[index + 1] : 0u};
+            const bool slow_next =
+                index + 1 < cmd_list.length &&
+                (next.cmd_id >= RegsInternal::NUM_REGS ||
+                 (next.extra_data_length != 0 ? !next.group_commands
+                                              : flags_lut[next.cmd_id].NeedsSpecialHandling()));
+            if (!slow_next) {
+                index =
+                    PicaCmdListFastLoop(cmd_list.head, cmd_list.current_index, cmd_list.length,
+                                        reinterpret_cast<const u16*>(flags_lut),
+                                        ExpandBitsToBytes.data(), regs.internal.reg_array.data(),
+                                        reinterpret_cast<u8*>(dirty_regs.qwords.data()), &run);
+            }
+            if (run > 0) {
+                delay_generator.AddCommands(run);
+                cmd_list.current_index = index;
+                if (index + 1 >= cmd_list.length) {
                     continue;
                 }
             }
@@ -837,6 +845,28 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     }
 }
 
+const u8* PicaCore::ListWords(PAddr addr, u32 size) {
+    switch (mode) {
+    case CmdListMode::Scan: {
+        const u8* const words = split->ScanList(addr, size);
+        // A capture's load of the list, in the GSP command's op, as the guest submitted it: the
+        // parse thread's PicaCore runs outside the op.
+        SgxdRenderer::Vprof::Memory(SgxdRenderer::Vprof::Mem::CmdList, addr, size);
+        return words;
+    }
+    case CmdListMode::Render:
+        return split->RenderList(addr, size);
+    case CmdListMode::Whole:
+        break;
+    }
+    // A list, or a buffer it jumps to, a queued DMA still writes waits for it (a game Triple
+    // Deluxe's lists jump into VRAM its DMAs fill each frame: a stale buffer there ended the
+    // list before its P3D, and the game waited for that P3D for good).
+    memory.GuardPhysicalRead(addr, size);
+    SgxdRenderer::Vprof::Memory(SgxdRenderer::Vprof::Mem::CmdList, addr, size);
+    return memory.GetPhysicalPointer(addr);
+}
+
 // Handle batch register writes
 void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                      bool& stop_requested) {
@@ -860,14 +890,14 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
         (regs.internal.reg_array[id] & ~write_mask) | (values[count - 1] & write_mask);
     dirty_regs.Set(id);
 
-    if (reg_impl_flags_lut[id].SupportsBatch()) {
+    if (flags[id].SupportsBatch()) {
         // If the register supports batch then call the handler.
-        batch_lut[id](*this, values, count);
-    } else if (reg_impl_flags_lut[id].NeedsSpecialHandling()) [[unlikely]] {
+        batches[id](*this, values, count);
+    } else if (flags[id].NeedsSpecialHandling()) [[unlikely]] {
         // Unlikely as all special regs that make sense to use batch mode already
         // support batch handling.
         for (u32 i = 0; i < count && !stop_requested; ++i) {
-            special_lut[id](*this, id, values[i], stop_requested);
+            specials[id](*this, id, values[i], stop_requested);
         }
     }
 }
@@ -905,7 +935,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         // Distance to the next special register, capped by how many writes
         // are actually left in this write. If this register is special this is 0.
         const u32 batch_count =
-            std::min<u32>(reg_impl_flags_lut[reg].RegsUntilSpecial(), count - offset);
+            std::min<u32>(flags[reg].RegsUntilSpecial(), count - offset);
         if (batch_count > 0) {
             delay_generator.AddCommands(batch_count);
 
@@ -926,7 +956,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
             break;
         }
         const u32 special = id + offset;
-        const BatchFn batch = batch_lut[special];
+        const BatchFn batch = batches[special];
         if (!batch) {
             WriteInternalReg(special, values[offset], mask, stop_requested);
             ++offset;
@@ -936,7 +966,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         // attribute's three) are one stream into the port, as WriteInternalReg would feed it a word
         // at a time: the port's batch handler takes them at once.
         u32 run = 1;
-        while (offset + run < count && batch_lut[special + run] == batch) {
+        while (offset + run < count && batches[special + run] == batch) {
             ++run;
         }
         delay_generator.AddCommands(run);
@@ -978,7 +1008,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     // rewrite most of them with the values they hold); a special one at every write, before its
     // handler, which may draw (the render thread's copy takes it with that draw). The registers
     // a handler advances (the upload indexes and offsets) the handler marks.
-    if (const SpecialFn handler = special_lut[id]) {
+    if (const SpecialFn handler = specials[id]) {
         dirty_regs.Set(id);
         handler(*this, id, value, stop_requested);
     } else if (regs.internal.reg_array[id] != old_value) {
@@ -1097,15 +1127,39 @@ void PicaCore::SyncAssemblerTopology() {
 }
 
 void PicaCore::DrawImmediate() {
+    const bool gs = regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes;
+    if (mode == CmdListMode::Scan) {
+        // A batch's decision at its first vertex; a vertex the geometry unit takes is drawn
+        // alone, on the render side's CPU.
+        if (!gs) {
+            if (!immediate_open) {
+                split->ScanImmediateBatch();
+            }
+            immediate_open = true;
+        } else {
+            split->ScanImmediateVertex();
+        }
+        immediate.current_attribute = 0;
+        return;
+    }
     SyncAssemblerTopology();
     if (!GsMirrorsVs()) {
         FlushGsMirror();
     }
     // The rasterizer runs the vertex program on the GPU: it keeps the raw attributes and draws
-    // them as one batch at the next register write that is not immediate data.
-    if (regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No &&
-        rasterizer->AccelerateImmediateVertex(immediate.input_vertex)) {
-        immediate_open = true;
+    // them as one batch at the next register write that is not immediate data. A batch the scan
+    // dropped keeps none.
+    if (!gs) {
+        if (mode == CmdListMode::Render && !immediate_open) {
+            immediate_drop = !split->RenderDraw();
+        }
+        if (immediate_drop || rasterizer->AccelerateImmediateVertex(immediate.input_vertex)) {
+            immediate_open = true;
+            immediate.current_attribute = 0;
+            return;
+        }
+    }
+    if (mode == CmdListMode::Render && !split->RenderDraw()) {
         immediate.current_attribute = 0;
         return;
     }
@@ -1139,14 +1193,33 @@ void PicaCore::DrawImmediate() {
 
 void PicaCore::FlushImmediate() {
     immediate_open = false;
+    if (mode == CmdListMode::Scan) {
+        split->ScanImmediateFlush();
+        return;
+    }
+    if (std::exchange(immediate_drop, false)) {
+        return;
+    }
     rasterizer->FlushImmediate();
 }
 
 void PicaCore::DrawArrays(bool is_indexed) {
+    if (mode == CmdListMode::Scan) {
+        // The draw's holds and decision; the render side draws it.
+        delay_generator.AddVertices(regs.internal.pipeline.num_vertices,
+                                    regs.internal.pipeline.triangle_topology);
+        split->ScanDraw(is_indexed);
+        return;
+    }
     MICROPROFILE_SCOPE(GPU_Drawing);
     SyncAssemblerTopology();
     if (!GsMirrorsVs()) {
         FlushGsMirror();
+    }
+    // A draw the scan dropped (the late skip, the right eye): its state stays, as the GPU's
+    // would.
+    if (mode == CmdListMode::Render && !split->RenderDraw()) {
+        return;
     }
 
     const bool accelerate_draw = [this] {
@@ -1178,6 +1251,14 @@ void PicaCore::DrawArrays(bool is_indexed) {
 
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
+        // Split, the render side's geometry passes ran the geometry shader: every draw with
+        // vertices runs at least one invocation, which leaves the uniform b15 true until the
+        // game writes the bool register again (upstream GeometryPipeline::SubmitVertex).
+        if (mode == CmdListMode::Render &&
+            regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes &&
+            regs.internal.pipeline.num_vertices != 0) {
+            gs_setup.uniforms.b[15] = true;
+        }
         return;
     }
 

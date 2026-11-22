@@ -1577,12 +1577,14 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     LOG_INFO(Frontend,
                              "perf: page holds: azaharHold {} calls, {} runs, {} descriptors; "
                              "{} pages held, {} let go; guest aborts {} ({} versioned, {} "
-                             "waited, {:.1f} ms; {} geometry pages moved), HLE waits {} ({:.1f} "
-                             "ms), vblank waits {} ({:.1f} ms)",
+                             "waited, {:.1f} ms; {} geometry pages moved; {} list pages copied "
+                             "for the parse thread, {} waits for a parse ({:.1f} ms)), "
+                             "HLE waits {} ({:.1f} ms), vblank waits {} ({:.1f} ms)",
                              hs.holds.calls, hs.holds.runs, hs.holds.descriptors,
                              hs.holds.held_pages, hs.holds.released_pages, hs.faults,
                              hs.versioned_faults, hs.fault_waits, hs.fault_wait_us / 1e3,
-                             hs.geometry_moves,
+                             hs.geometry_moves, hs.parse_copies, hs.parse_waits,
+                             hs.parse_wait_us / 1e3,
                              hs.host_waits, hs.host_wait_us / 1e3, hs.vblank_waits,
                              hs.vblank_wait_us / 1e3);
                     // Page versions: azaharFlip's calls, the pages that got a second slot,

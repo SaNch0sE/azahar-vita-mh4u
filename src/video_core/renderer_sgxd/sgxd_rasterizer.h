@@ -208,6 +208,7 @@ public:
     void GpuIdle() override;
     u64 InterruptFence() override;
     bool InterruptPoll(u64 fence) override;
+    [[nodiscard]] bool InterruptReached(u64 fence);
     void InterruptWait(u64 fence) override;
     void InterruptKick(u64 fence);
     /// The render thread's sleep until the fence's work (SgxdBackend::InterruptArm).

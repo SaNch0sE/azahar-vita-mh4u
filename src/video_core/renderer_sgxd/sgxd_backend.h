@@ -296,6 +296,9 @@ public:
     /// Whether the fence's work has completed, without waiting. A pending 3D the fence takes
     /// gets its finishing list here once the list before it has ended.
     [[nodiscard]] bool InterruptPoll(const InterruptFence& fence);
+    /// As InterruptPoll, without sending a pending 3D: whether the fence's work is done (the
+    /// render thread inside a list, where the pass may still go on).
+    [[nodiscard]] bool InterruptReached(const InterruptFence& fence);
     /// Waits for the fence's work; a failed render stops the process as RenderIdle does.
     void InterruptWait(const InterruptFence& fence);
     /// The guest waits for the fence's work: a pending 3D it takes gets its finishing list now,

@@ -168,6 +168,8 @@ enum class ThreadRole {
     /// The HLE DSP's frames (AudioCore::DspHle), beside the emulation thread as the 3DS's DSP
     /// runs beside its ARM11.
     Dsp,
+    /// The sgxd render thread's command list parse (SgxdRenderer::RenderThread::ParseLoop).
+    Parse,
 };
 
 /**

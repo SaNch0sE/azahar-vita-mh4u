@@ -1242,6 +1242,10 @@ bool RasterizerSgxd::InterruptPoll(u64 fence) {
     return backend.InterruptPoll({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
 }
 
+bool RasterizerSgxd::InterruptReached(u64 fence) {
+    return backend.InterruptReached({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
+}
+
 void RasterizerSgxd::InterruptKick(u64 fence) {
     backend.InterruptKick({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
 }

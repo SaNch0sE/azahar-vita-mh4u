@@ -6,9 +6,11 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#include "common/archives.h"
 #include "common/assert.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
@@ -35,7 +37,12 @@ namespace SgxdRenderer {
 enum class RenderThread::Op : u16 {
     /// The rest of the ring is unused: the next record is at its start.
     Wrap,
-    // The PICA state, applied to the render side's PicaCore.
+    // The emulation side's, for the parse thread (ParseRecord).
+    ListDraws, ///< scan decisions of the next list's draws (RenderThread::ListDraw each)
+    CmdList,   ///< CmdListRecord: the list to parse, its decisions in the ListDraws before it
+    RegWrite,  ///< a register id and value the guest wrote outside a list
+    // The parse thread's: the PICA state applied to the render side's PicaCore, and the rasterizer's
+    // draw calls.
     Regs,     ///< the dirty table's 12 words, then each dirty register's value, in order
     Uniforms, ///< extra: the setup (0 VS, 1 GS); UniformsHead, then the values it names
     Code,     ///< extra: the setup; RangeHead, then the words
@@ -44,14 +51,16 @@ enum class RenderThread::Op : u16 {
     Fog,      ///< the 128 words
     ProcTex,  ///< the dirty mask, then the five tables
     DefaultAttributes,
-    // The rasterizer's calls.
-    Draw,      ///< extra: indexed
-    GsIndices, ///< extra: 16-bit; a geometry draw's indices as the guest had them at the draw
+    Draw,       ///< extra: indexed
+    GsIndices,  ///< extra: 16-bit; a geometry draw's indices as the scan read them
     MergedDraw, ///< MergedDrawHead, then its vertices' numbers (u16): RenderThread::MergeDraw
     ImmediateVertex,
     FlushImmediate,
     AddTriangle,
     DrawTriangles,
+    LateDropped, ///< the late skip: a dropped draw's colour buffer and viewport
+                 ///< (RasterizerSgxd::LateDropped)
+    ListEnd,     ///< the list's parsed records end (RunParsed)
     P3D,
     Fill,
     DisplayTransfer,
@@ -64,7 +73,6 @@ enum class RenderThread::Op : u16 {
     GuestWrote,  ///< T12: a watched texture page's address, written by the guest or the HLE
     LateDropped, ///< The late skip: a dropped draw's colour buffer and viewport (RasterizerGxm::LateDropped)
     Call,
-    Check,     ///< rendercheck: CheckRecord
     PageRemap, ///< extra: the count; PageHolds::Remap each: the GPU's MMU onto pages' slots
 };
 
@@ -79,6 +87,15 @@ namespace {
 constexpr u32 Align8(u32 n) {
     return (n + 7) & ~7u;
 }
+
+struct CmdListRecord {
+    PAddr addr;
+    u32 size;
+    u32 seq;    ///< the emulation side's count of the lists handed over
+    u32 draws;  ///< its scan's decisions (ListDraws), for the parse's check
+    u32 ranges; ///< the list's words and the buffers it jumps to, RenderThread::GuestRange each
+                ///< after this
+};
 
 struct UniformsHead {
     u32 entry_point;
@@ -96,7 +113,6 @@ struct DmaRecord {
     PAddr src;
     PAddr dst;
     u32 size;
-    u64 src_hash; ///< rendercheck: the source's bytes as the DMA was asked for
 };
 
 struct TriangleRecord {
@@ -114,25 +130,12 @@ struct CallRecord {
     std::atomic<bool> finished{};
 };
 
-/// gxm_flags `rendercheck`: the emulation side's PICA state at a draw.
-struct CheckRecord {
-    std::array<u32, Pica::RegsInternal::NUM_REGS> regs;
-    std::array<Pica::Uniforms, 2> uniforms;
-    std::array<u64, 2> code_hash;
-    std::array<u64, 2> swizzle_hash;
-    Pica::AttributeBuffer defaults;
-    std::array<std::array<u32, 256>, 24> lighting;
-    std::array<u32, 128> fog;
-    std::array<u32, 128 * 3 + 256 * 2> proctex;
-};
-
-static_assert(std::is_trivially_copyable_v<CheckRecord>);
 static_assert(std::is_trivially_copyable_v<Pica::OutputVertex>);
 static_assert(std::is_trivially_copyable_v<Pica::AttributeBuffer>);
+static_assert(std::is_trivially_copyable_v<Pica::Uniforms>);
 static_assert(std::is_trivially_copyable_v<Pica::MemoryFillConfig>);
 static_assert(std::is_trivially_copyable_v<Pica::DisplayTransferConfig>);
 static_assert(std::is_trivially_copyable_v<PresentRecord>);
-static_assert(std::is_trivially_copyable_v<Pica::Uniforms>);
 
 constexpr u32 LightingTableBytes = 256 * sizeof(u32);
 
@@ -211,13 +214,19 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
     : pica{pica_}, render_pica{render_pica_}, renderer{renderer_}, rasterizer{rasterizer_},
       memory{memory_}, ring{std::make_unique<u8[]>(RingSize)}, page_holds{memory_} {
     static_assert(std::has_single_bit(RingSize), "positions wrap at 2^32");
+    static_assert(std::has_single_bit(ParsedSize), "positions wrap at 2^32");
     static_assert(sizeof(Head) == 8, "records stay 8-byte aligned");
-    // The render side's state starts as the emulation side's: the first records carry all of
-    // it (the dirty table and the LUT marks start full, and PicaCore::MarkAllChanged covers the
-    // rest).
-    pica.MarkAllChanged();
+    parsed = std::make_unique<u8[]>(ParsedSize);
+    parsed_output = std::make_unique<ParsedOutput>(*this);
+    pica.SetSplit(Pica::CmdListMode::Scan, this);
+    parse_pica.SetSplit(Pica::CmdListMode::Render, this);
+    parse_pica.BindRasterizer(parsed_output.get());
+    render_pica.BindRasterizer(&rasterizer);
     wake_flag = sceKernelCreateEventFlag("render wake", SCE_EVENT_WAITSINGLE, 0, nullptr);
     ASSERT_MSG(wake_flag >= 0, "render thread: event flag {:#010x}", static_cast<u32>(wake_flag));
+    parse_wake_flag = sceKernelCreateEventFlag("parse wake", SCE_EVENT_WAITSINGLE, 0, nullptr);
+    ASSERT_MSG(parse_wake_flag >= 0, "render thread: the parse thread's event flag {:#010x}",
+               static_cast<u32>(parse_wake_flag));
     rasterizer.InterruptWaker(wake_flag, WakeBit);
     live_render_thread.store(this, std::memory_order_release);
     renderer.SetMoveHooks({
@@ -243,9 +252,10 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
 #endif
     constexpr std::size_t StackSize = 2 * 1024 * 1024;
     thread = Common::NamedThread{Common::ThreadCfg{"render", StackSize}, [this] { Loop(); }};
+    parse_thread =
+        Common::NamedThread{Common::ThreadCfg{"cmdlist parse", 256 * 1024}, [this] { ParseLoop(); }};
     LOG_INFO(Render, "render thread: on Vita core 1, woken by sgxd when a ticket's GPU work is "
-                     "done");
-    check = GxmFlag("rendercheck");
+                     "done; the command lists parsed on core 0");
 #ifdef VITA_DIAGNOSTICS
     if (SgxdFlag("perflog")) {
         gpu_sampler = Common::NamedThread{Common::ThreadCfg{"gpu sampler", 16 * 1024},
@@ -315,6 +325,12 @@ RenderThread::~RenderThread() {
     }
     Wake();
     thread.join();
+    parse_stopping.store(true);
+    ParseWake();
+    parse_thread.join();
+    sceKernelDeleteEventFlag(parse_wake_flag);
+    pica.SetSplit(Pica::CmdListMode::Whole, nullptr);
+    parse_pica.SetSplit(Pica::CmdListMode::Whole, nullptr);
     // The backend may have given sgxd's interrupt back already, and the waker with it.
     rasterizer.InterruptWaker(-1, 0);
     sceKernelDeleteEventFlag(wake_flag);
@@ -342,15 +358,15 @@ u32 CountDirty(const Pica::DirtyRegs& dirty) {
 }
 } // namespace
 
-void RenderThread::SyncState() {
-    auto& dirty = pica.dirty_regs;
+void RenderThread::SyncParsedState() {
+    auto& dirty = parse_pica.dirty_regs;
     const u32 count = CountDirty(dirty);
     if (count != 0) {
-        u8* p = Begin(Op::Regs, sizeof(dirty.qwords) + count * sizeof(u32));
+        u8* p = ParsedBegin(Op::Regs, sizeof(dirty.qwords) + count * sizeof(u32));
         std::memcpy(p, dirty.qwords.data(), sizeof(dirty.qwords));
         u32* values = reinterpret_cast<u32*>(p + sizeof(dirty.qwords));
         // In 32-bit words: ARMv7 finds a word's lowest bit in two instructions.
-        const u32* const regs = pica.regs.internal.reg_array.data();
+        const u32* const regs = parse_pica.regs.internal.reg_array.data();
         u32 halves[sizeof(dirty.qwords) / sizeof(u32)];
         std::memcpy(halves, dirty.qwords.data(), sizeof(halves));
         for (u32 w = 0; w < std::size(halves); w++) {
@@ -358,12 +374,12 @@ void RenderThread::SyncState() {
                 *values++ = regs[w * 32 + static_cast<u32>(std::countr_zero(h))];
             }
         }
-        Commit();
+        ParsedCommit();
         dirty.Reset();
     }
 
     for (u16 unit = 0; unit < 2; unit++) {
-        Pica::ShaderSetup& setup = unit == 0 ? pica.vs_setup : pica.gs_setup;
+        Pica::ShaderSetup& setup = unit == 0 ? parse_pica.vs_setup : parse_pica.gs_setup;
         if (setup.uniforms_dirty) {
             UniformsHead h{setup.entry_point, setup.f_changed, setup.bi_changed};
             // Dirty with nothing marked (assigned directly, vprof's replay): all of them.
@@ -374,7 +390,7 @@ void RenderThread::SyncState() {
             const u32 floats = static_cast<u32>(std::popcount(h.f[0]) + std::popcount(h.f[1]) +
                                                 std::popcount(h.f[2]));
             const u32 tail = h.bool_int ? sizeof(setup.uniforms.b) + sizeof(setup.uniforms.i) : 0;
-            u8* p = Begin(Op::Uniforms,
+            u8* p = ParsedBegin(Op::Uniforms,
                           sizeof(h) + floats * sizeof(setup.uniforms.f[0]) + tail, unit);
             std::memcpy(p, &h, sizeof(h));
             p += sizeof(h);
@@ -390,7 +406,7 @@ void RenderThread::SyncState() {
                 std::memcpy(p + sizeof(setup.uniforms.b), setup.uniforms.i.data(),
                             sizeof(setup.uniforms.i));
             }
-            Commit();
+            ParsedCommit();
             setup.uniforms_dirty = false;
             setup.f_changed = {};
             setup.bi_changed = false;
@@ -398,51 +414,51 @@ void RenderThread::SyncState() {
         if (setup.code_hi > setup.code_lo) {
             const RangeHead h{setup.code_lo, setup.code_hi - setup.code_lo,
                               setup.GetBiggestProgramSize()};
-            u8* p = Begin(Op::Code, sizeof(h) + h.count * sizeof(u32), unit);
+            u8* p = ParsedBegin(Op::Code, sizeof(h) + h.count * sizeof(u32), unit);
             std::memcpy(p, &h, sizeof(h));
             std::memcpy(p + sizeof(h), setup.GetProgramCode().data() + h.lo, h.count * sizeof(u32));
-            Commit();
+            ParsedCommit();
             setup.code_lo = Pica::MAX_PROGRAM_CODE_LENGTH;
             setup.code_hi = 0;
         }
         if (setup.swizzle_hi > setup.swizzle_lo) {
             const RangeHead h{setup.swizzle_lo, setup.swizzle_hi - setup.swizzle_lo,
                               setup.GetBiggestSwizzleSize()};
-            u8* p = Begin(Op::Swizzle, sizeof(h) + h.count * sizeof(u32), unit);
+            u8* p = ParsedBegin(Op::Swizzle, sizeof(h) + h.count * sizeof(u32), unit);
             std::memcpy(p, &h, sizeof(h));
             std::memcpy(p + sizeof(h), setup.GetSwizzleData().data() + h.lo,
                         h.count * sizeof(u32));
-            Commit();
+            ParsedCommit();
             setup.swizzle_lo = Pica::MAX_SWIZZLE_DATA_LENGTH;
             setup.swizzle_hi = 0;
         }
     }
 
-    if (const u32 mask = pica.lighting.lut_dirty & Pica::PicaCore::Lighting::LutAllDirty) {
+    if (const u32 mask = parse_pica.lighting.lut_dirty & Pica::PicaCore::Lighting::LutAllDirty) {
         const u32 tables = static_cast<u32>(std::popcount(mask));
-        u8* p = Begin(Op::Lighting, sizeof(u32) + tables * LightingTableBytes);
+        u8* p = ParsedBegin(Op::Lighting, sizeof(u32) + tables * LightingTableBytes);
         std::memcpy(p, &mask, sizeof(mask));
         p += sizeof(mask);
         for (u32 bits = mask; bits != 0; bits &= bits - 1) {
             const u32 t = static_cast<u32>(std::countr_zero(bits));
-            std::memcpy(p, pica.lighting.luts[t].data(), LightingTableBytes);
+            std::memcpy(p, parse_pica.lighting.luts[t].data(), LightingTableBytes);
             p += LightingTableBytes;
         }
-        Commit();
-        pica.lighting.lut_dirty = 0;
+        ParsedCommit();
+        parse_pica.lighting.lut_dirty = 0;
     }
-    if (pica.fog.lut_dirty) {
-        u8* p = Begin(Op::Fog, sizeof(pica.fog.lut));
-        std::memcpy(p, pica.fog.lut.data(), sizeof(pica.fog.lut));
-        Commit();
-        pica.fog.lut_dirty = false;
+    if (parse_pica.fog.lut_dirty) {
+        u8* p = ParsedBegin(Op::Fog, sizeof(parse_pica.fog.lut));
+        std::memcpy(p, parse_pica.fog.lut.data(), sizeof(parse_pica.fog.lut));
+        ParsedCommit();
+        parse_pica.fog.lut_dirty = false;
     }
-    if (const u8 mask = pica.proctex.table_dirty) {
-        const auto& t = pica.proctex;
+    if (const u8 mask = parse_pica.proctex.table_dirty) {
+        const auto& t = parse_pica.proctex;
         const u32 tables = sizeof(t.noise_table) + sizeof(t.color_map_table) +
                            sizeof(t.alpha_map_table) + sizeof(t.color_table) +
                            sizeof(t.color_diff_table);
-        u8* p = Begin(Op::ProcTex, sizeof(u32) + tables);
+        u8* p = ParsedBegin(Op::ProcTex, sizeof(u32) + tables);
         const u32 m = mask;
         std::memcpy(p, &m, sizeof(m));
         p += sizeof(m);
@@ -455,22 +471,33 @@ void RenderThread::SyncState() {
             std::memcpy(p, data, bytes);
             p += bytes;
         }
-        Commit();
-        pica.proctex.table_dirty = 0;
+        ParsedCommit();
+        parse_pica.proctex.table_dirty = 0;
     }
-    if (pica.default_attributes_changed) {
-        Put(Op::DefaultAttributes, pica.input_default_attributes);
-        pica.default_attributes_changed = false;
+    if (parse_pica.default_attributes_changed) {
+        ParsedPut(Op::DefaultAttributes, parse_pica.input_default_attributes);
+        parse_pica.default_attributes_changed = false;
     }
 }
+
+namespace {
+u32 Older(u32 a, u32 b) {
+    return static_cast<s32>(a - b) < 0 ? a : b;
+}
+} // namespace
 
 u8* RenderThread::Begin(Op op, u32 bytes, u16 extra) {
     const u32 need = static_cast<u32>(sizeof(Head)) + Align8(bytes);
     ASSERT_MSG(need <= RingSize / 4, "render thread: a {}-byte record", need);
     u32 at = write % RingSize;
-    // A record never wraps: the rest of the ring goes to a Wrap record.
+    // A record never wraps: the rest of the ring goes to a Wrap record. The room ends at the record the
+    // render side or the parse thread reads next, whichever is older.
     const u32 skip = RingSize - at < need ? RingSize - at : 0;
-    if (RingSize - (write - read.load(std::memory_order_acquire)) < skip + need) {
+    const auto oldest = [this] {
+        return Older(read.load(std::memory_order_acquire),
+                     parse_read.load(std::memory_order_acquire));
+    };
+    if (RingSize - (write - oldest()) < skip + need) {
         // The thread a whole ring behind: wait for it (a hold runs each record at once, so its
         // ring is always empty), with the records closed so far published.
         ASSERT(hold_depth == 0);
@@ -478,13 +505,15 @@ u8* RenderThread::Begin(Op op, u32 bytes, u16 extra) {
         if (published.load(std::memory_order_relaxed) != write) {
             Publish();
         }
+        // The parse thread may sleep on records no list needed it for yet.
+        ParseWake();
 #ifdef VITA_DIAGNOSTICS
         const auto start = Clock::now();
 #endif
         std::scoped_lock lk{done};
         done_waiters.fetch_add(1);
         space_waiting.store(true);
-        while (RingSize - (write - read.load(std::memory_order_acquire)) < skip + need) {
+        while (RingSize - (write - oldest()) < skip + need) {
             SleepDone(EmuSpace);
         }
         space_waiting.store(false);
@@ -514,9 +543,18 @@ void RenderThread::Commit() {
 }
 
 void RenderThread::Publish() {
-    // Sequentially consistent against the thread's `sleeping`: either it sees this record
-    // before it sleeps, or this sees it sleeping and wakes it.
+    // Sequentially consistent against `sleeping` and `parse_sleeping`: either the thread sees this
+    // record before it sleeps, or this sees it sleeping and wakes it.
     published.store(write);
+#ifdef VITA_DIAGNOSTICS
+    publishes.fetch_add(1, std::memory_order_relaxed);
+#endif
+    if (parse_wake_due) {
+        parse_wake_due = false;
+        if (parse_sleeping.load()) {
+            ParseWake();
+        }
+    }
     if (hold_depth != 0) {
         RunAvailable();
         return;
@@ -594,6 +632,60 @@ void RenderThread::FlushRun() {
     PublishParsed();
 }
 
+u8* RenderThread::ParsedBegin(Op op, u32 bytes, u16 extra) {
+    if (held.draws != 0 && !held_flushing) {
+        FlushRun();
+    }
+    const u32 need = static_cast<u32>(sizeof(Head)) + Align8(bytes);
+    ASSERT_MSG(need <= ParsedSize / 4, "render thread: a {}-byte parsed record", need);
+    u32 at = parsed_write % ParsedSize;
+    const u32 skip = ParsedSize - at < need ? ParsedSize - at : 0;
+    if (ParsedSize - (parsed_write - parsed_read.load(std::memory_order_acquire)) < skip + need) {
+        // The render side a whole ring behind: the records so far go out, and this waits.
+        if (parsed_published.load(std::memory_order_relaxed) != parsed_write) {
+            parsed_published.store(parsed_write);
+            if (sleeping.load()) {
+                Wake();
+            }
+            if (done_waiters.load() != 0) {
+                NotifyDone();
+            }
+        }
+        parsed_space_waiting.store(true);
+        while (ParsedSize - (parsed_write - parsed_read.load()) < skip + need) {
+            ParseSleep(std::chrono::milliseconds(1));
+        }
+        parsed_space_waiting.store(false);
+    }
+    if (skip != 0) {
+        const Head wrap{Op::Wrap, 0, skip};
+        std::memcpy(parsed.get() + at, &wrap, sizeof(wrap));
+        parsed_write += skip;
+        at = 0;
+    }
+    const Head head{op, extra, need};
+    std::memcpy(parsed.get() + at, &head, sizeof(head));
+    parsed_open = need;
+    return parsed.get() + at + sizeof(Head);
+}
+
+void RenderThread::ParsedCommit() {
+    // Published a draw at a time and at the list's end: the render side runs records as they come.
+    parsed_write += parsed_open;
+}
+
+template <typename T>
+void RenderThread::ParsedPut(Op op, const T& payload, u16 extra) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    std::memcpy(ParsedBegin(op, sizeof(T), extra), &payload, sizeof(T));
+    ParsedCommit();
+}
+
+void RenderThread::ParsedPut(Op op) {
+    ParsedBegin(op, 0);
+    ParsedCommit();
+}
+
 template <typename T>
 void RenderThread::Put(Op op, const T& payload, u16 extra) {
     static_assert(std::is_trivially_copyable_v<T>);
@@ -606,111 +698,14 @@ void RenderThread::Put(Op op) {
     Commit();
 }
 
-void RenderThread::PutCheck() {
-    CheckRecord r;
-    r.regs = pica.regs.internal.reg_array;
-    r.uniforms = {pica.vs_setup.uniforms, pica.gs_setup.uniforms};
-    r.code_hash = {pica.vs_setup.GetProgramCodeHash(), pica.gs_setup.GetProgramCodeHash()};
-    r.swizzle_hash = {pica.vs_setup.GetSwizzleDataHash(), pica.gs_setup.GetSwizzleDataHash()};
-    r.defaults = pica.input_default_attributes;
-    std::memcpy(r.lighting.data(), pica.lighting.luts.data(), sizeof(r.lighting));
-    std::memcpy(r.fog.data(), pica.fog.lut.data(), sizeof(r.fog));
-    const auto& t = pica.proctex;
-    u8* q = reinterpret_cast<u8*>(r.proctex.data());
-    for (const auto [data, bytes] :
-         {std::pair<const void*, u32>{t.noise_table.data(), sizeof(t.noise_table)},
-          {t.color_map_table.data(), sizeof(t.color_map_table)},
-          {t.alpha_map_table.data(), sizeof(t.alpha_map_table)},
-          {t.color_table.data(), sizeof(t.color_table)},
-          {t.color_diff_table.data(), sizeof(t.color_diff_table)}}) {
-        std::memcpy(q, data, bytes);
-        q += bytes;
-    }
-    Put(Op::Check, r);
+// The draws are the lists' (SubmitCmdList): this thread's PicaCore makes them on the rasterizer.
+void RenderThread::AddTriangle(const Pica::OutputVertex&, const Pica::OutputVertex&,
+                               const Pica::OutputVertex&) {
+    UNREACHABLE_MSG("render thread: a triangle outside a list's parse");
 }
 
-void RenderThread::RunCheck(const u8* payload) {
-    static CheckRecord r;
-    std::memcpy(&r, payload, sizeof(r));
-    // Each difference is logged once: registers by index, the rest by what it is.
-    static std::array<bool, Pica::RegsInternal::NUM_REGS> reg_seen{};
-    static std::array<std::array<bool, 96>, 2> f_seen{};
-    static u32 other_reports = 0;
-    static u32 checks = 0;
-    checks++;
-    const auto& regs = render_pica.regs.internal.reg_array;
-    for (u32 i = 0; i < regs.size(); i++) {
-        if (regs[i] != r.regs[i] && !reg_seen[i]) {
-            reg_seen[i] = true;
-            LOG_ERROR(Render, "rendercheck: draw check {}: register {:#05x} is {:#010x}, the "
-                              "emulation side's {:#010x}",
-                      checks, i, regs[i], r.regs[i]);
-        }
-    }
-    const auto other = [&](const char* what, u32 unit) {
-        if (other_reports++ < 64) {
-            LOG_ERROR(Render, "rendercheck: draw check {}: {} of the {} differs", checks, what,
-                      unit == 0 ? "VS" : "GS");
-        }
-    };
-    for (u32 unit = 0; unit < 2; unit++) {
-        Pica::ShaderSetup& setup = unit == 0 ? render_pica.vs_setup : render_pica.gs_setup;
-        for (u32 i = 0; i < setup.uniforms.f.size(); i++) {
-            if (setup.uniforms.f[i] != r.uniforms[unit].f[i] && !f_seen[unit][i]) {
-                f_seen[unit][i] = true;
-                LOG_ERROR(Render, "rendercheck: draw check {}: float uniform {} of the {} differs",
-                          checks, i, unit == 0 ? "VS" : "GS");
-            }
-        }
-        if (setup.uniforms.b != r.uniforms[unit].b) {
-            other("the bool uniforms", unit);
-        }
-        if (setup.uniforms.i != r.uniforms[unit].i) {
-            other("the int uniforms", unit);
-        }
-        if (setup.GetProgramCodeHash() != r.code_hash[unit]) {
-            other("the program", unit);
-        }
-        if (setup.GetSwizzleDataHash() != r.swizzle_hash[unit]) {
-            other("the swizzle data", unit);
-        }
-    }
-    const auto table = [&](const char* what, const void* mine, const void* theirs, u32 bytes) {
-        if (std::memcmp(mine, theirs, bytes) != 0 && other_reports++ < 64) {
-            LOG_ERROR(Render, "rendercheck: draw check {}: {} differs", checks, what);
-        }
-    };
-    table("the default attributes", render_pica.input_default_attributes.data(),
-          r.defaults.data(), sizeof(r.defaults));
-    table("the lighting LUTs", render_pica.lighting.luts.data(), r.lighting.data(),
-          sizeof(r.lighting));
-    table("the fog LUT", render_pica.fog.lut.data(), r.fog.data(), sizeof(r.fog));
-    const auto& t = render_pica.proctex;
-    const u8* q = reinterpret_cast<const u8*>(r.proctex.data());
-    for (const auto [data, bytes] :
-         {std::pair<const void*, u32>{t.noise_table.data(), sizeof(t.noise_table)},
-          {t.color_map_table.data(), sizeof(t.color_map_table)},
-          {t.alpha_map_table.data(), sizeof(t.alpha_map_table)},
-          {t.color_table.data(), sizeof(t.color_table)},
-          {t.color_diff_table.data(), sizeof(t.color_diff_table)}}) {
-        table("a proctex table", data, q, bytes);
-        q += bytes;
-    }
-}
-
-void RenderThread::AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
-                               const Pica::OutputVertex& v2) {
-    // The triangles up to the next DrawTriangles keep the decision the first found.
-    if (!late_triangles_open) {
-        late_triangles_open = true;
-        late_triangles_skip = LateDraw();
-    }
-    if (late_triangles_skip) {
-        return;
-    }
-    // RasterizerGxm stops the emulator on it, with the draw's description.
-    SyncState();
-    Put(Op::AddTriangle, TriangleRecord{{v0, v1, v2}});
+void RenderThread::DrawTriangles() {
+    UNREACHABLE_MSG("render thread: a draw outside a list's parse");
 }
 
 namespace {
@@ -776,20 +771,6 @@ void RenderThread::ForgetDroppedOutputs(PAddr lo, PAddr hi) {
         }
     }
     std::erase_if(dropped_outputs, [](const DroppedOutput& o) { return o.lo >= o.hi; });
-}
-
-void RenderThread::DrawTriangles() {
-    const bool skip = late_triangles_open && late_triangles_skip;
-    late_triangles_open = false;
-    if (skip) {
-        return;
-    }
-    // The vertices were loaded on this thread (PicaCore::LoadVertices).
-    DrawTextures textures;
-    const u32 count = TextureRanges(pica.regs.internal, textures);
-    HoldDraw(textures, count, false, false);
-    SyncState();
-    Put(Op::DrawTriangles);
 }
 
 bool RenderThread::LateTransfer(const Pica::DisplayTransferConfig& config, bool display) {
@@ -906,7 +887,6 @@ bool RenderThread::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& 
     HoldWrite(output, config.OutputBytes(),
               LcdScreenOf(output, config.OutputBytes()) >= 0 ? PageHolds::DisplayOut
                                                              : PageHolds::TransferOut);
-    SyncState();
     Put(Op::DisplayTransfer, config);
     return true;
 }
@@ -934,7 +914,6 @@ bool RenderThread::AccelerateTextureCopy(const Pica::DisplayTransferConfig& conf
              PageHolds::TransferIn);
     HoldWrite(config.GetPhysicalOutputAddress(), CopySpan(tc.size, tc.output_width, tc.output_gap),
               PageHolds::TransferOut);
-    SyncState();
     Put(Op::TextureCopy, config);
     return true;
 }
@@ -954,7 +933,6 @@ bool RenderThread::AccelerateFill(const Pica::MemoryFillConfig& config) {
     ForgetDroppedOutputs(config.GetStartAddress(), config.GetEndAddress());
     HoldWrite(config.GetStartAddress(), config.GetEndAddress() - config.GetStartAddress(),
               PageHolds::FillOut);
-    SyncState();
     Put(Op::Fill, config);
     return true;
 }
@@ -974,9 +952,7 @@ bool RenderThread::AccelerateDma(PAddr src, PAddr dst, u32 size) {
         screenlog_transfers += fmt::format(" dma {:#x}+{:#x}->{:#x}(s{})", src, size, dst, screen);
     }
 #endif
-    SyncState();
-    const u8* const bytes = check ? memory.GetPhysicalPointer(src) : nullptr;
-    Put(Op::Dma, DmaRecord{src, dst, size, bytes ? Common::ComputeHash64(bytes, size) : 0});
+    Put(Op::Dma, DmaRecord{src, dst, size});
     return true;
 }
 
@@ -1025,26 +1001,6 @@ u32 TextureRanges(const Pica::RegsInternal& regs, RenderThread::DrawTextures& ou
 }
 
 } // namespace
-
-void RenderThread::KeepTargetUncached(const DrawTextures& textures, u32 count) {
-    const auto& fb = pica.regs.internal.framebuffer.framebuffer;
-    const GuestRange colour{fb.GetColorBufferPhysicalAddress(),
-                            fb.GetWidth() * fb.GetHeight() *
-                                Pica::FramebufferRegs::BytesPerColorPixel(fb.color_format)};
-    bool move = renderer.WouldMakeUncached(colour.addr, colour.bytes);
-    for (u32 i = 0; i < count && !move; i++) {
-        move = renderer.WouldMakeUncached(textures[i].addr, textures[i].bytes);
-    }
-    if (!move) {
-        return;
-    }
-    Hold();
-    for (u32 i = 0; i < count; i++) {
-        renderer.MakeUncached(textures[i].addr, textures[i].bytes, false);
-    }
-    renderer.MakeUncached(colour.addr, colour.bytes, false);
-    Release();
-}
 
 void RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
     if (page_holds_on) {
@@ -1198,68 +1154,208 @@ void RenderThread::HoldVertices(bool is_indexed) {
     }
 }
 
-bool RenderThread::AccelerateDrawBatch(bool is_indexed) {
-    // The late skip: a late frame's dropped draw is not recorded (its state goes with the next one).
-    if (LateDraw()) {
-        return true;
+bool RenderThread::AccelerateDrawBatch(bool) {
+    UNREACHABLE_MSG("render thread: a draw outside a list's parse");
+}
+
+bool RenderThread::AccelerateImmediateVertex(const Pica::AttributeBuffer&) {
+    UNREACHABLE_MSG("render thread: an immediate vertex outside a list's parse");
+}
+
+void RenderThread::FlushImmediate() {
+    UNREACHABLE_MSG("render thread: an immediate batch outside a list's parse");
+}
+
+void RenderThread::NotifyP3D() {
+    Put(Op::P3D);
+}
+
+void RenderThread::SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::vector<u64>& irqs) {
+    if (ignore_list) {
+        pica.ProcessCmdList(addr, size, true);
+        return;
+    }
+    // The scan's records (its holds' remaps, the decisions) and the list go out together.
+    const PublishTogether together{*this};
+    const TraceSpan span{"scan", "scan_end"};
+    scan_draws.clear();
+    scan_draw_count = 0;
+    scan_lists.clear();
+    scan_offsets.clear();
+    scan_words_size = 0;
+    scan_irqs = &irqs;
+#ifdef VITA_DIAGNOSTICS
+    const auto scan_start = Clock::now();
+#endif
+    pica.ProcessCmdList(addr, size, false);
+    scan_irqs = nullptr;
+    FlushScanDraws();
+#ifdef VITA_DIAGNOSTICS
+    {
+        scan_us.fetch_add(Since(scan_start), std::memory_order_relaxed);
+        u32 parsed = 0;
+        for (const GuestRange& r : scan_lists) {
+            parsed += r.bytes;
+        }
+        lists.fetch_add(1, std::memory_order_relaxed);
+        list_bytes.fetch_add(size, std::memory_order_relaxed);
+        list_parsed_bytes.fetch_add(parsed, std::memory_order_relaxed);
+        list_ranges.fetch_add(static_cast<u32>(scan_lists.size()), std::memory_order_relaxed);
+        list_draws.fetch_add(scan_draw_count, std::memory_order_relaxed);
+        if (parsed > list_parsed_max.load(std::memory_order_relaxed)) {
+            list_parsed_max.store(parsed, std::memory_order_relaxed);
+        }
+    }
+#endif
+    const u32 seq = ++list_seq;
+    // The words the parse reads in place: until it has copied them, a guest write to their pages takes
+    // a copy for it (ParseFault).
+    if (page_holds_on) {
+        std::vector<GuestRange> held;
+        held.reserve(scan_lists.size());
+        for (std::size_t i = 0; i < scan_lists.size(); i++) {
+            if (scan_offsets[i] == NotCopied) {
+                page_holds.HoldParse(scan_lists[i].addr, scan_lists[i].bytes);
+                held.push_back(scan_lists[i]);
+            }
+        }
+        parse_holds.push_back({seq, std::move(held), {}});
+    }
+    const CmdListRecord record{addr, size, seq, scan_draw_count,
+                               static_cast<u32>(scan_lists.size())};
+    const u32 ranges_bytes = static_cast<u32>(scan_lists.size() * sizeof(GuestRange));
+    const u32 offsets_bytes = Align8(static_cast<u32>(scan_offsets.size() * sizeof(u32)));
+    u8* const out = Begin(Op::CmdList, static_cast<u32>(sizeof(record)) + ranges_bytes +
+                                           offsets_bytes + scan_words_size);
+    std::memcpy(out, &record, sizeof(record));
+    std::memcpy(out + sizeof(record), scan_lists.data(), ranges_bytes);
+    std::memcpy(out + sizeof(record) + ranges_bytes, scan_offsets.data(),
+                scan_offsets.size() * sizeof(u32));
+    std::memcpy(out + sizeof(record) + ranges_bytes + offsets_bytes, scan_words.get(),
+                scan_words_size);
+    parse_wake_due = true;
+    Commit();
+}
+
+void RenderThread::RegWrite(u32 id, u32 value) {
+    const std::array<u32, 2> w{id, value};
+    std::memcpy(Begin(Op::RegWrite, sizeof(w)), &w, sizeof(w));
+    // Closed, not published: the next record's publish takes it along.
+    write += open_record;
+}
+
+namespace {
+
+/// A PicaCore's list state from one to the other through its savestate form; `to` keeps its LCD and
+/// external registers and its delay generator.
+void CopyListState(Pica::PicaCore& from, Pica::PicaCore& to) {
+    const Pica::RegsLcd lcd = to.regs_lcd;
+    constexpr std::size_t External = GPU_REG_INDEX(internal);
+    std::array<u32, External> external;
+    std::copy_n(to.regs.reg_array.begin(), External, external.begin());
+    const Pica::DelayGenerator delay = to.delay_generator;
+    std::stringstream stream;
+    {
+        oarchive out{stream};
+        out & from;
+    }
+    {
+        iarchive in{stream};
+        in & to;
+    }
+    to.regs_lcd = lcd;
+    std::copy_n(external.begin(), External, to.regs.reg_array.begin());
+    to.delay_generator = delay;
+}
+
+} // namespace
+
+void RenderThread::TakeWholeState() {
+    // A loaded state's memory: no index range of the memo holds.
+    index_memo.fill({});
+    // Once the parse thread has read everything queued: it takes the lists after this with
+    // the new state, all of it marked changed for the render side's PicaCore (its next
+    // records).
+    RunSync([this] {
+        WaitParseIdle();
+        CopyListState(pica, parse_pica);
+    });
+}
+
+void RenderThread::GiveWholeState() {
+    RunSync([this] {
+        WaitParseIdle();
+        CopyListState(parse_pica, pica);
+    });
+}
+
+const u8* RenderThread::ScanList(PAddr addr, u32 size) {
+    // A list, or a buffer it jumps to, a queued DMA still writes waits for it (a game Triple
+    // Deluxe's lists jump into VRAM its DMAs fill each frame: a stale buffer there ended the
+    // list before its P3D, and the game waited for that P3D for good).
+    memory.GuardPhysicalRead(addr, size);
+    scan_lists.push_back({addr, size});
+    const u8* const guest = memory.GetPhysicalPointer(addr);
+    if (addr < Memory::VRAM_PADDR || addr >= Memory::VRAM_PADDR_END) {
+        scan_offsets.push_back(NotCopied);
+        return guest;
+    }
+    const u32 at = scan_words_size;
+    const u32 end = at + Align8(size);
+    if (end > scan_words_cap) {
+        const u32 cap = std::max(end, scan_words_cap * 2);
+        std::unique_ptr<u8[]> grown(new u8[cap]);
+        std::memcpy(grown.get(), scan_words.get(), at);
+        scan_words = std::move(grown);
+        scan_words_cap = cap;
+    }
+    std::memcpy(scan_words.get() + at, guest, size);
+#ifdef VITA_DIAGNOSTICS
+    if (static const bool listdiff = SgxdFlag("listdiff"); listdiff) {
+        ListDiff(addr, scan_words.get() + at, size);
+    }
+#endif
+    scan_words_size = end;
+    scan_offsets.push_back(at);
+    return scan_words.get() + at;
+}
+
+void RenderThread::ScanDraw(bool is_indexed) {
+    ListDraw d{};
+    if (LateDraw(d, pica.regs.internal.pipeline.num_vertices)) {
+        PutScanDraw(d, nullptr);
+        return;
     }
     // The textures' pages are held here; the render thread moves them to CDRAM at the untile.
     DrawTextures textures;
     const u32 count = TextureRanges(pica.regs.internal, textures);
-    const PublishTogether together{*this};
     HoldDraw(textures, count, true, is_indexed);
-    SyncState();
-    if (check) {
-        PutCheck();
-    }
-    if (is_indexed && pica.regs.internal.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes) {
-        PutGsIndices();
-    }
-    // Whether it is indexed, in the head's extra field; the indices' range if HoldVertices
-    // scanned them.
-    Put(Op::Draw, draw_indices, is_indexed ? 1 : 0);
-    draw_indices = {};
-    // A geometry-shader draw's invocations leave b15 true (upstream GeometryPipeline::
-    // SubmitVertex), here as on the render thread (Op::Draw); a late-dropped draw ran none.
-    GsInvoked(pica);
-    return true;
-}
-
-void RenderThread::PutGsIndices() {
-    // The geometry stage reads a draw's indices on the CPU (each invocation's rows), as late as
-    // the render thread runs behind: by then the guest may have written the next frame's, while
-    // the vertex range went with the draw from these (a game' particles: rows outside
-    // the vertices A0 stored, long triangles and lines for a frame while the GPU lagged).
+    d.indices = std::exchange(draw_indices, DrawIndexRange{});
     const auto& pipeline = pica.regs.internal.pipeline;
+    if (!is_indexed || pipeline.use_gs != Pica::PipelineRegs::UseGS::Yes) {
+        PutScanDraw(d, nullptr);
+        return;
+    }
     const bool index_u16 = pipeline.index_array.format != 0;
-    const u32 bytes = pipeline.num_vertices * (index_u16 ? 2u : 1u);
     const PAddr at =
         pipeline.vertex_attributes.GetPhysicalBaseAddress() + pipeline.index_array.offset;
-    memory.GuardPhysicalRead(at, bytes);
+    d.gs_bytes = pipeline.num_vertices * (index_u16 ? 2u : 1u);
+    d.gs_u16 = index_u16 ? 1 : 0;
+    memory.GuardPhysicalRead(at, d.gs_bytes);
     const u8* const indices = memory.GetPhysicalPointer(at);
     DEBUG_ASSERT_MSG(indices != nullptr, "render thread: geometry draw indices at {:#x}", at);
-    std::memcpy(Begin(Op::GsIndices, bytes, index_u16 ? 1 : 0), indices, bytes);
-    Commit();
+    PutScanDraw(d, indices);
 }
 
-bool RenderThread::AccelerateImmediateVertex(const Pica::AttributeBuffer& input) {
-    // A batch keeps the decision its first vertex found.
-    if (!late_batch_open) {
-        late_batch_open = true;
-        late_batch_skip = LateDraw();
-    }
-    if (late_batch_skip) {
-        return true;
-    }
-    SyncState();
-    if (check) {
-        PutCheck();
-    }
-    Put(Op::ImmediateVertex, input);
-    return true;
+void RenderThread::ScanImmediateBatch() {
+    // A batch keeps the decision its first vertex found; its holds come at its end.
+    ListDraw d{};
+    late_batch_skip = LateDraw(d, 0);
+    late_batch_open = true;
+    PutScanDraw(d, nullptr);
 }
 
-void RenderThread::FlushImmediate() {
+void RenderThread::ScanImmediateFlush() {
     const bool skip = late_batch_open && late_batch_skip;
     late_batch_open = false;
     if (skip) {
@@ -1267,19 +1363,434 @@ void RenderThread::FlushImmediate() {
     }
     DrawTextures textures;
     const u32 count = TextureRanges(pica.regs.internal, textures);
-    const PublishTogether together{*this};
-    // The vertices are in the record (the immediate batch).
     HoldDraw(textures, count, false, false);
-    SyncState();
-    if (check) {
-        PutCheck();
-    }
-    Put(Op::FlushImmediate);
 }
 
-void RenderThread::NotifyP3D() {
-    SyncState();
-    Put(Op::P3D);
+void RenderThread::ScanImmediateVertex() {
+    // RasterizerSgxd stops the emulator on the CPU path, with the draw's description.
+    ListDraw d{};
+    if (!LateDraw(d, 0)) {
+        DrawTextures textures;
+        const u32 count = TextureRanges(pica.regs.internal, textures);
+        HoldDraw(textures, count, false, false);
+    }
+    PutScanDraw(d, nullptr);
+}
+
+void RenderThread::ScanIrq(u64 delay_ns) {
+    DEBUG_ASSERT_MSG(scan_irqs != nullptr, "render thread: an interrupt request outside a scan");
+    scan_irqs->push_back(delay_ns);
+}
+
+void RenderThread::PutScanDraw(const ListDraw& d, const u8* gs) {
+    const std::size_t at = scan_draws.size();
+    const u32 gs_room = (d.gs_bytes + 7) & ~7u;
+    scan_draws.resize(at + sizeof(d) + gs_room);
+    std::memcpy(scan_draws.data() + at, &d, sizeof(d));
+    if (d.gs_bytes != 0) {
+        std::memcpy(scan_draws.data() + at + sizeof(d), gs, d.gs_bytes);
+    }
+    scan_draw_count++;
+    // A record at most a quarter of the ring (Begin): a list's draws in parts.
+    if (scan_draws.size() >= RingSize / 16) {
+        FlushScanDraws();
+    }
+}
+
+void RenderThread::FlushScanDraws() {
+    if (scan_draws.empty()) {
+        return;
+    }
+    std::memcpy(Begin(Op::ListDraws, static_cast<u32>(scan_draws.size())), scan_draws.data(),
+                scan_draws.size());
+    Commit();
+    scan_draws.clear();
+}
+
+void RenderThread::ReleaseParsed() {
+    const u32 copied = copied_seq.load(std::memory_order_acquire);
+    while (!parse_holds.empty() && static_cast<s32>(parse_holds.front().seq - copied) <= 0) {
+        const ParseHold& h = parse_holds.front();
+        for (const GuestRange& r : h.ranges) {
+            page_holds.ReleaseParse(r.addr, r.bytes, h.released);
+        }
+        parse_holds.pop_front();
+    }
+}
+
+bool RenderThread::ParseFault(u32 page) {
+    ReleaseParsed();
+    if (!page_holds.ParseHeld(page)) {
+        return false;
+    }
+    // Each unparsed list that reads the page reads a copy of it as handed over, and lets it go.
+    std::shared_ptr<std::array<u8, 0x1000>> copy;
+    bool parsing_reads = false;
+    const u32 parsing = parsing_seq.load();
+    for (ParseHold& h : parse_holds) {
+        if (std::find(h.released.begin(), h.released.end(), page) != h.released.end()) {
+            continue;
+        }
+        // A list and the buffers it jumped to may share the page: each held it.
+        u32 covers = 0;
+        for (const GuestRange& r : h.ranges) {
+            u32 first, count;
+            covers += page_holds.PageRange(r.addr, r.bytes, first, count) && page >= first &&
+                      page < first + count;
+        }
+        if (covers == 0) {
+            continue;
+        }
+        if (!copy) {
+            copy = std::make_shared<std::array<u8, 0x1000>>();
+            std::memcpy(copy->data(), page_holds.HostOf(page), copy->size());
+#ifdef VITA_DIAGNOSTICS
+            parse_copies++;
+#endif
+        }
+        {
+            std::scoped_lock lk{snapshot_mutex};
+            snapshots.push_back({h.seq, page, copy});
+        }
+        snapshot_count.fetch_add(1);
+        h.released.push_back(page);
+        page_holds.ReleaseParsePage(page, covers);
+        parsing_reads |= h.seq == parsing;
+    }
+    // The render side may be copying one of them from the guest's page now: the write waits. Seq-cst
+    // against CopyListWords: this side adds a copy then reads `parsing_seq`, the render side stores
+    // it then reads `snapshot_count`, so one of the two sees the other.
+    const u32 now_parsing = parsing_seq.load();
+    if (now_parsing != parsing) {
+        parsing_reads = std::any_of(parse_holds.begin(), parse_holds.end(),
+                                    [&](const ParseHold& h) {
+                                        return h.seq == now_parsing &&
+                                               std::find(h.released.begin(), h.released.end(),
+                                                         page) != h.released.end();
+                                    });
+    }
+    if (parsing_reads) {
+#ifdef VITA_DIAGNOSTICS
+        const auto start = Clock::now();
+#endif
+        std::scoped_lock lk{done};
+        done_waiters.fetch_add(1);
+        parse_waiting.store(true);
+        while (static_cast<s32>(now_parsing - copied_seq.load()) > 0) {
+            SleepDone(EmuSync);
+        }
+        parse_waiting.store(false);
+        done_waiters.fetch_sub(1);
+#ifdef VITA_DIAGNOSTICS
+        parse_waits++;
+        parse_wait_us += Since(start);
+#endif
+    }
+    page_holds.Apply();
+    return true;
+}
+
+void RenderThread::CopyListWords(u32 seq, const GuestRange* ranges, const u32* offsets,
+                                 const u8* words, u32 count) {
+    parse_ranges.clear();
+    parse_words.clear();
+    const bool copies = snapshot_count.load() != 0;
+    std::unique_lock lk{snapshot_mutex, std::defer_lock};
+    if (copies) {
+        lk.lock();
+    }
+    const auto copy_of = [&](u32 page) -> const u8* {
+        for (const Snapshot& s : snapshots) {
+            if (s.seq == seq && s.page == page) {
+                return s.bytes->data();
+            }
+        }
+        return nullptr;
+    };
+    for (u32 i = 0; i < count; i++) {
+        const GuestRange& r = ranges[i];
+        const u32 at = static_cast<u32>(parse_words.size());
+        parse_ranges.push_back({r.addr, r.bytes, at});
+        parse_words.resize(at + r.bytes);
+        if (offsets[i] != NotCopied) {
+            std::memcpy(parse_words.data() + at, words + offsets[i], r.bytes);
+            continue;
+        }
+        const u8* const guest = memory.GetPhysicalPointer(r.addr);
+        if (!copies) {
+            std::memcpy(parse_words.data() + at, guest, r.bytes);
+            continue;
+        }
+        for (u32 done = 0; done < r.bytes;) {
+            const u8* const p = guest + done;
+            const u32 in_page = 0x1000 - static_cast<u32>(reinterpret_cast<uintptr_t>(p) & 0xFFF);
+            const u32 n = std::min(in_page, r.bytes - done);
+            const u8* const page_copy = copy_of(page_holds.PageOf(p));
+            std::memcpy(parse_words.data() + at + done,
+                        page_copy ? page_copy + (reinterpret_cast<uintptr_t>(p) & 0xFFF) : p, n);
+            done += n;
+        }
+    }
+    if (copies) {
+        const auto done_with = [&](const Snapshot& s) {
+            return static_cast<s32>(s.seq - seq) <= 0;
+        };
+        const u32 dropped =
+            static_cast<u32>(std::count_if(snapshots.begin(), snapshots.end(), done_with));
+        std::erase_if(snapshots, done_with);
+        snapshot_count.fetch_sub(dropped);
+    }
+}
+
+const u8* RenderThread::RenderList(PAddr addr, u32 size) {
+    DEBUG_ASSERT_MSG(parse_range_at < parse_ranges.size() &&
+                         parse_ranges[parse_range_at][0] == addr &&
+                         parse_ranges[parse_range_at][1] == size,
+                     "render thread: list {}: the parse reads {:#010x}+{:#x}, the scan's range {} "
+                     "of {} differs",
+                     parsing_seq.load(std::memory_order_relaxed), addr, size, parse_range_at,
+                     parse_ranges.size());
+    return parse_words.data() + parse_ranges[parse_range_at++][2];
+}
+
+void RenderThread::RenderFogLut() {
+    // The parsed Op::Fog record (SyncParsedState) tells the rasterizer, at its draw.
+}
+
+bool RenderThread::RenderDraw() {
+    DEBUG_ASSERT_MSG(parse_draw_at + sizeof(ListDraw) <= parse_draws.size(),
+                     "render thread: list {}: a draw the scan did not see",
+                     parsing_seq.load(std::memory_order_relaxed));
+    ListDraw d;
+    std::memcpy(&d, parse_draws.data() + parse_draw_at, sizeof(d));
+    const u8* const gs = parse_draws.data() + parse_draw_at + sizeof(d);
+    parse_draw_at += sizeof(d) + ((d.gs_bytes + 7) & ~7u);
+    if (d.report != 0) {
+        ParsedPut(Op::LateDropped, d.late_report);
+    }
+    if (d.dropped != 0) {
+        return false;
+    }
+    parse_indices = d.indices;
+    parse_gs = d.gs_bytes != 0 ? gs : nullptr;
+    parse_gs_bytes = d.gs_bytes;
+    parse_gs_u16 = d.gs_u16 != 0;
+    return true;
+}
+
+void RenderThread::PublishParsed() {
+    // Sequentially consistent against the render side's `sleeping` and `done_waiters`.
+    parsed_published.store(parsed_write);
+    if (sleeping.load()) {
+        Wake();
+    }
+    if (done_waiters.load() != 0) {
+        NotifyDone();
+    }
+}
+
+void RenderThread::ParseRecord(const Head& head, const u8* p) {
+    switch (head.op) {
+    case Op::ListDraws:
+        parse_draws.insert(parse_draws.end(), p, p + (head.bytes - sizeof(Head)));
+        break;
+    case Op::RegWrite: {
+        std::array<u32, 2> w;
+        std::memcpy(&w, p, sizeof(w));
+        parse_pica.regs.internal.reg_array[w[0]] = w[1];
+        parse_pica.dirty_regs.Set(w[0]);
+        break;
+    }
+    case Op::CmdList: {
+        const TraceSpan span{"parse", "parse_end"};
+        CmdListRecord c;
+        std::memcpy(&c, p, sizeof(c));
+        // The words first, whole (CopyListWords, ParseFault); then the list's holds can go, and a guest
+        // write never waits for the parse.
+        parsing_seq.store(c.seq);
+        static_assert(sizeof(CmdListRecord) % alignof(GuestRange) == 0);
+        const u32 ranges_bytes = c.ranges * static_cast<u32>(sizeof(GuestRange));
+        const u8* const offsets = p + sizeof(c) + ranges_bytes;
+        CopyListWords(c.seq, reinterpret_cast<const GuestRange*>(p + sizeof(c)),
+                      reinterpret_cast<const u32*>(offsets),
+                      offsets + Align8(c.ranges * static_cast<u32>(sizeof(u32))), c.ranges);
+        // Seq-cst against ParseFault's wait: either it sees the count, or this sees it waiting.
+        copied_seq.store(c.seq);
+        if (parse_waiting.load()) {
+            NotifyDone();
+        }
+        parse_draw_at = 0;
+        parse_range_at = 0;
+        parse_pica.ProcessCmdList(c.addr, c.size, false);
+        DEBUG_ASSERT_MSG(parse_draw_at == parse_draws.size(),
+                         "render thread: list {} at {:#010x}: {} bytes of the scan's {} draw "
+                         "decisions left after its parse",
+                         c.seq, c.addr, parse_draws.size() - parse_draw_at, c.draws);
+        DEBUG_ASSERT_MSG(parse_range_at == parse_ranges.size(),
+                         "render thread: list {} at {:#010x}: the parse read {} of the scan's {} "
+                         "ranges",
+                         c.seq, c.addr, parse_range_at, parse_ranges.size());
+        parse_draws.clear();
+        // The state the list left (its last draws' and after) goes with its end.
+        SyncParsedState();
+        ParsedPut(Op::ListEnd, c.seq);
+        PublishParsed();
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void RenderThread::ParseLoop() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Parse);
+    for (;;) {
+        u32 r = parse_read.load(std::memory_order_relaxed);
+        if (r == published.load()) {
+            if (parse_stopping.load()) {
+                return;
+            }
+            if (done_waiters.load() != 0) {
+                NotifyDone(); // WaitParseIdle
+            }
+            // Seq-cst against Publish: it sees this sleeping, or this sees its record.
+            parse_sleeping.store(true);
+            if (r == published.load() && !parse_stopping.load()) {
+                ParseSleep(std::chrono::milliseconds(100));
+            }
+            parse_sleeping.store(false);
+            continue;
+        }
+        const u32 end = published.load(std::memory_order_acquire);
+#ifdef VITA_DIAGNOSTICS
+        const auto start = Clock::now();
+#endif
+        while (r != end) {
+            Head head;
+            const u8* const p = ring.get() + r % RingSize;
+            std::memcpy(&head, p, sizeof(head));
+            if (head.op != Op::Wrap) {
+                ParseRecord(head, p + sizeof(Head));
+            }
+            r += head.bytes;
+            parse_read.store(r, std::memory_order_release);
+            if (space_waiting.load()) {
+                NotifyDone();
+            }
+        }
+#ifdef VITA_DIAGNOSTICS
+        parse_busy_us.fetch_add(Since(start), std::memory_order_relaxed);
+#endif
+    }
+}
+
+bool RenderThread::ParseSleep(std::chrono::microseconds timeout) {
+    SceUInt32 us = static_cast<SceUInt32>(timeout.count());
+    return sceKernelWaitEventFlag(parse_wake_flag, WakeBit,
+                                  SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, nullptr, &us) >= 0;
+}
+
+void RenderThread::ParseWake() {
+#ifdef VITA_DIAGNOSTICS
+    const auto start = Clock::now();
+#endif
+    sceKernelSetEventFlag(parse_wake_flag, WakeBit);
+#ifdef VITA_DIAGNOSTICS
+    parse_wakes.fetch_add(1, std::memory_order_relaxed);
+    wake_us.fetch_add(Since(start), std::memory_order_relaxed);
+#endif
+}
+
+void RenderThread::WaitParseIdle() {
+    std::scoped_lock lk{done};
+    done_waiters.fetch_add(1);
+    while (parse_read.load() != published.load()) {
+        ParseWake();
+        done.WaitFor(std::chrono::milliseconds(1));
+    }
+    done_waiters.fetch_sub(1);
+}
+
+void RenderThread::RunParsed(u32 seq) {
+    const TraceSpan span{"list_run", "list_run_end"};
+    // On this thread, or a hold's: the parse thread runs either way.
+    const bool render_side = sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed);
+    u32 since_poll = 0;
+    for (;;) {
+        u32 r = parsed_read.load(std::memory_order_relaxed);
+        if (r == parsed_published.load()) {
+#ifdef VITA_DIAGNOSTICS
+            const auto start = Clock::now();
+            parsed_waits.fetch_add(1, std::memory_order_relaxed);
+#endif
+            if (render_side) {
+                const TraceSpan wait_span{"parsed_wait", "parsed_wait_end"};
+                // Sequentially consistent against PublishParsed.
+                sleeping.store(true);
+                if (r == parsed_published.load()) {
+                    Sleep(std::chrono::milliseconds(100));
+                }
+                sleeping.store(false);
+            } else {
+                std::scoped_lock lk{done};
+                done_waiters.fetch_add(1);
+                if (r == parsed_published.load()) {
+                    done.WaitFor(std::chrono::milliseconds(1));
+                }
+                done_waiters.fetch_sub(1);
+            }
+#ifdef VITA_DIAGNOSTICS
+            parsed_wait_us.fetch_add(Since(start), std::memory_order_relaxed);
+#endif
+            continue;
+        }
+        Head head;
+        const u8* const p = parsed.get() + r % ParsedSize;
+        std::memcpy(&head, p, sizeof(head));
+        bool end = false;
+        if (head.op == Op::ListEnd) {
+            u32 ended;
+            std::memcpy(&ended, p + sizeof(Head), sizeof(ended));
+            DEBUG_ASSERT_MSG(ended == seq, "render thread: list {}'s parsed records end list {}",
+                             seq, ended);
+            end = true;
+        } else if (head.op != Op::Wrap) {
+            RunRecord(head, p + sizeof(Head));
+#ifdef VITA_DIAGNOSTICS
+            records[KindOf(head.op)].fetch_add(1, std::memory_order_relaxed);
+#endif
+        }
+        parsed_read.store(r + head.bytes, std::memory_order_release);
+        if (parsed_space_waiting.load()) {
+            ParseWake();
+        }
+        if (end) {
+            return;
+        }
+        // The loop's work between records, inside a list too (a list's records can run tens of ms, the
+        // tickets its GPU work finished meanwhile unpublished). Every 16 records, without sending a
+        // pending 3D: the pass may still go on.
+        if ((++since_poll & 15) == 0 && !pending.empty()) {
+            bool advanced = false;
+            while (!pending.empty() && rasterizer.InterruptReached(pending.front().fence)) {
+                reached.store(pending.front().ticket, std::memory_order_release);
+                SgxdTrace("reached", static_cast<unsigned>(pending.front().ticket));
+                pending.pop_front();
+                advanced = true;
+            }
+            if (advanced) {
+                NotifyDone();
+            }
+        }
+        if (render_side) {
+            if ((since_poll & 63) == 0) {
+                renderer.FlipDone();
+            }
+            if (present_pending && (since_poll & 255) == 0) {
+                ShowDuePresent();
+            }
+        }
+    }
 }
 
 void RenderThread::GpuIdle() {
@@ -1394,6 +1905,7 @@ void RenderThread::ApplyPageHolds() {
 }
 
 void RenderThread::ReleasePageHolds() {
+    ReleaseParsed();
     page_holds.Release(reached.load(std::memory_order_acquire));
 }
 
@@ -1496,6 +2008,11 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
         if (page_holds.Applied(page) == PageHolds::Unheld) {
             return true;
         }
+    }
+    // A write to a page a handed-over list's parse reads: that parse reads a copy of it
+    // (ParseFault), and the page opens as its other holds allow.
+    if (write && ParseFault(page) && page_holds.Applied(page) == PageHolds::Unheld) {
+        return true;
     }
     // T12: a write to a texture's page: the textures over it are untiled again at their next
     // use, the page open to writes as its holds allow.
@@ -1604,6 +2121,17 @@ void RenderThread::HostAccess(const u8* host, u32 size, bool write) {
          p = reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1)) {
         const u32 page = page_holds.PageOf(p);
         if (page == PageHolds::NoPage || page_holds.Applied(page) == PageHolds::Unheld) {
+            continue;
+        }
+        // The HLE writes a page of the memo's index lists, or one a handed-over list's parse
+        // reads: as a guest write does.
+        if (write && page_holds.IndexWatched(page)) {
+            page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
+            if (page_holds.Applied(page) == PageHolds::Unheld) {
+                continue;
+            }
+        }
+        if (write && ParseFault(page) && page_holds.Applied(page) == PageHolds::Unheld) {
             continue;
         }
         // T12: the HLE writes a texture's page (a file read, the DSP): as a guest write does.
@@ -1716,6 +2244,9 @@ RenderThread::HoldStats RenderThread::TakeHoldStats() {
     h.host_wait_us = std::exchange(host_wait_us, 0);
     h.versioned_faults = std::exchange(versioned_faults, 0);
     h.geometry_moves = std::exchange(geometry_moves, 0);
+    h.parse_copies = std::exchange(parse_copies, 0);
+    h.parse_waits = std::exchange(parse_waits, 0);
+    h.parse_wait_us = std::exchange(parse_wait_us, 0);
     h.fault_kinds = std::exchange(fault_kinds, {});
     h.fault_kind_us = std::exchange(fault_kind_us, {});
     std::vector<std::pair<u64, FaultSite>> sites(fault_sites.begin(), fault_sites.end());
@@ -2054,7 +2585,7 @@ RenderThread::SegmentTarget& RenderThread::SegmentTargetFor(PAddr addr, u32 byte
         SegmentTarget{addr, bytes, 0, false, false, {-1, -1, -1, -1}, 0, 0});
 }
 
-bool RenderThread::LateDraw() {
+bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
     const auto& fb = pica.regs.internal.framebuffer.framebuffer;
     const PAddr addr = fb.GetColorBufferPhysicalAddress();
     const u32 bytes =
@@ -2249,6 +2780,24 @@ RenderThread::Stats RenderThread::TakeStats() {
     s.merged_draws = merged_draws.exchange(0);
     s.merged_runs = merged_runs.exchange(0);
     s.late_partial = late_partial.exchange(0);
+    s.parse_busy_us = parse_busy_us.exchange(0);
+    s.parsed_waits = parsed_waits.exchange(0);
+    s.parsed_wait_us = parsed_wait_us.exchange(0);
+    s.lists = lists.exchange(0);
+    s.list_bytes = list_bytes.exchange(0);
+    s.list_parsed_bytes = list_parsed_bytes.exchange(0);
+    s.list_ranges = list_ranges.exchange(0);
+    s.list_parsed_max = list_parsed_max.exchange(0);
+    s.list_draws = list_draws.exchange(0);
+    s.scan_us = scan_us.exchange(0);
+    s.index_scans = index_scans.exchange(0);
+    s.index_scan_indices = index_scan_indices.exchange(0);
+    s.index_scan_us = index_scan_us.exchange(0);
+    s.index_memo_hits = index_memo_hits.exchange(0);
+    s.publishes = publishes.exchange(0);
+    s.render_wakes = render_wakes.exchange(0);
+    s.parse_wakes = parse_wakes.exchange(0);
+    s.wake_us = wake_us.exchange(0);
     s.gpu_samples = gpu_samples.exchange(0);
     s.gpu_busy = gpu_busy.exchange(0);
     s.gpu_held = gpu_held.exchange(0);
@@ -2287,7 +2836,14 @@ bool RenderThread::Sleep(std::chrono::microseconds timeout) {
 }
 
 void RenderThread::Wake() {
+#ifdef VITA_DIAGNOSTICS
+    const auto start = Clock::now();
+#endif
     sceKernelSetEventFlag(wake_flag, WakeBit);
+#ifdef VITA_DIAGNOSTICS
+    render_wakes.fetch_add(1, std::memory_order_relaxed);
+    wake_us.fetch_add(Since(start), std::memory_order_relaxed);
+#endif
 }
 
 void RenderThread::NotifyDone() {
@@ -2308,7 +2864,9 @@ void RenderThread::RunAvailable() {
     }
     running_available = true;
 #ifdef VITA_DIAGNOSTICS
-    const auto start = Clock::now();
+    // Counted as it goes, or a loop that never runs dry would show no time in perflog.
+    auto start = Clock::now();
+    u32 since_busy = 0;
 #endif
     // A pending present goes once its interval is up, between records: the clock is read every 64
     // records only (a syscall), the window's present every 8.
@@ -2340,6 +2898,16 @@ void RenderThread::RunAvailable() {
         if (present_pending && (++since_check & 63) == 0) {
             ShowDuePresent();
         }
+#ifdef VITA_DIAGNOSTICS
+        if ((++since_busy & 255) == 0) {
+            const auto now = Clock::now();
+            busy_us.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   now - start)
+                                                   .count()),
+                              std::memory_order_relaxed);
+            start = now;
+        }
+#endif
     }
 #ifdef VITA_DIAGNOSTICS
     busy_us.fetch_add(Since(start), std::memory_order_relaxed);
@@ -2424,6 +2992,16 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     switch (head.op) {
     case Op::Wrap:
         break;
+    case Op::ListDraws:
+    case Op::RegWrite:
+        // The parse thread's (ParseRecord).
+        break;
+    case Op::CmdList: {
+        CmdListRecord c;
+        take(c);
+        RunParsed(c.seq);
+        break;
+    }
     case Op::Regs: {
         std::array<u64, 12> dirty;
         std::memcpy(dirty.data(), p, sizeof(dirty));
@@ -2557,6 +3135,12 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     case Op::DrawTriangles:
         rasterizer.DrawTriangles();
         break;
+    case Op::LateDropped: {
+        std::array<u32, 3> dropped;
+        take(dropped);
+        rasterizer.LateDropped(dropped[0], dropped[1], dropped[2]);
+        break;
+    }
     case Op::P3D:
         rasterizer.NotifyP3D();
         break;
@@ -2582,15 +3166,6 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     case Op::Dma: {
         DmaRecord d;
         take(d);
-        if (d.src_hash != 0) {
-            const u8* const bytes = memory.GetPhysicalPointer(d.src);
-            static u32 changed = 0;
-            if (Common::ComputeHash64(bytes, d.size) != d.src_hash && changed++ < 32) {
-                LOG_ERROR(Render, "rendercheck: the DMA {:#010x} to {:#010x}, {} bytes: the guest "
-                                  "rewrote its source before the copy ({} so far)",
-                          d.src, d.dst, d.size, changed);
-            }
-        }
         rasterizer.AccelerateDma(d.src, d.dst, d.size);
         break;
     }

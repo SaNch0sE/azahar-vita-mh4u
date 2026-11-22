@@ -24,9 +24,14 @@ namespace VideoCore {
 class RasterizerInterface;
 }
 
+namespace SgxdRenderer {
+class RenderThread;
+}
+
 namespace Pica {
 
 class ShaderEngine;
+class RegImplInfo;
 
 /// Upstream's: how long the PICA takes for a command list, from its commands and
 /// triangles, which GSP adds to P3D.
@@ -110,6 +115,17 @@ private:
     }
 };
 
+/// How a PicaCore takes the command lists. With the sgxd render thread two of them split each
+/// list (SgxdRenderer::RenderThread): the emulation side's scans it as it is submitted, for
+/// what must happen then (each draw's holds and late-skip decision, the interrupts), taking
+/// uniform, program and LUT uploads as plain register writes; the parse thread's parses it whole
+/// for the render thread's draws.
+enum class CmdListMode : u8 {
+    Whole, ///< one PicaCore does everything
+    Scan,
+    Render,
+};
+
 class PicaCore {
 public:
     explicit PicaCore(Memory::MemorySystem& memory);
@@ -118,6 +134,9 @@ public:
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
     void SetInterruptHandler(Service::GSP::InterruptHandler& signal_interrupt);
+
+    /// The lists split (Scan or Render, through `split`) or taken whole.
+    void SetSplit(CmdListMode mode, CmdListSplit* split);
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
@@ -149,6 +168,9 @@ private:
         return id >= PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]) &&
                id <= PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[2]);
     }
+
+    /// A list's words at addr: the split's, or guest memory's once queued DMAs into it are done.
+    const u8* ListWords(PAddr addr, u32 size);
 
     void DrawArrays(bool is_indexed);
     /// The primitive assembler's topology from the register, before the assembler is used.
@@ -385,6 +407,8 @@ public:
     /// The rasterizer holds immediate-mode vertices: every register write goes through
     /// WriteInternalReg, which flushes them first (the fast command loop is skipped).
     bool immediate_open{};
+    /// Render side: the open immediate batch is one the scan dropped (RenderThread::RenderDraw).
+    bool immediate_drop{};
     /// input_default_attributes changed since the sgxd render thread's copy took them.
     bool default_attributes_changed{true};
 
@@ -459,6 +483,13 @@ private:
     PrimitiveAssembler primitive_assembler;
     CommandList cmd_list;
     std::unique_ptr<ShaderEngine> shader_engine;
+    CmdListMode mode{CmdListMode::Whole};
+    SgxdRenderer::RenderThread* split{};
+    /// The special-register tables of the mode (pica_core.cpp's, or the scan's).
+    const SpecialFn* specials;
+    const BatchFn* batches;
+    const RegImplInfo* flags;
+    const RegImplInfo* flags_idle;
 
     /// What the vertex unit wrote while the geometry unit mirrored it, not yet in gs_setup
     /// (FlushGsMirror): float uniforms, int uniforms and bools by index, code and swizzle words by

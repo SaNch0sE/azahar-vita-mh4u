@@ -246,6 +246,10 @@ constexpr int RoleCores(ThreadRole role, std::size_t index) {
     case ThreadRole::Dsp:
         // The DSP's frames take a fifth of the emulation thread's time in a game's race.
         return 0;
+    case ThreadRole::Parse:
+        // The command lists' parse, ahead of the render thread, on a core of its own (on core 0 the
+        // render thread waited for it). Core 3, with the mostly idle rest.
+        return 1 << 3;
     case ThreadRole::Render:
         // The PICA stays on the emulation thread; what it draws is built and sent here. Core 1
         // is otherwise idle.
@@ -277,6 +281,9 @@ constexpr int PriorityCore(ThreadRole role) {
     case ThreadRole::ShaderCompiler:
         // On core 3 with the miscellaneous threads, before them (CapUnlocker gives
         // applications core 3).
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
+    case ThreadRole::Parse:
+        // Behind the render thread on core 0 (Y2R), before the rest on core 3 (the parse).
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
     case ThreadRole::Other:
         return SCE_KERNEL_PROCESS_PRIORITY_USER_DEFAULT;

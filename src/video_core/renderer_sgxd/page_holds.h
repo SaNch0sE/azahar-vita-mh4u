@@ -170,6 +170,22 @@ public:
     /// sent to the module again, which holds every window of them.
     void Resend(const u8* host, u32 size);
 
+    /// A command list handed over to the render thread (RenderThread::SubmitCmdList), or a buffer
+    /// it jumps to, [addr, addr + bytes): closed to the guest's writes on top of the holds until
+    /// the render thread has parsed it (ReleaseParse), or until a write takes a copy of a page
+    /// for that parse (ReleaseParsePage). Counted by page: lists share pages.
+    void HoldParse(PAddr addr, u32 bytes);
+    void ReleaseParse(PAddr addr, u32 bytes, const std::vector<u32>& released);
+    /// `count` of the page's parse holds let go: a write took a copy for their parses.
+    void ReleaseParsePage(u32 page, u32 count);
+    [[nodiscard]] bool ParseHeld(u32 page) const {
+        return parse_held[page] != 0;
+    }
+    [[nodiscard]] bool PageRange(PAddr addr, u32 bytes, u32& first, u32& count) const {
+        return PagesOf(addr, bytes, first, count);
+    }
+    [[nodiscard]] const u8* HostOf(u32 page) const;
+
     /// T12, texture write tracking: the FCRAM pages a texture is taken
     /// from are watched, closed to the guest's writes on top of the holds, until the guest or
     /// the HLE writes one (the caller marks the textures over it written, then Unwatch opens it
@@ -349,6 +365,7 @@ private:
     /// a slot with the count still current needs no walk of the range's pages.
     std::array<std::array<u32, 3>, 256> watch_seen{};
     u32 unwatches{};
+    std::vector<u16> parse_held;   ///< every page: the handed-over lists that read it (HoldParse)
     std::vector<u8> index_watch;
     std::vector<u32> index_stamp, index_write_frame;
 

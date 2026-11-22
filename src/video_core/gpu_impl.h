@@ -35,6 +35,8 @@ struct GPU::Impl {
     /// The PICA, the emulation side's: command lists, registers, shader setups, interrupts.
     Pica::PicaCore pica;
 #ifdef ENABLE_GXM
+    /// The parse thread's, which parses the lists (SgxdRenderer::RenderThread::ParseLoop).
+    Pica::PicaCore parse_pica;
     /// The render thread's copy of its state, as of the work that thread has run: the sgxd
     /// rasterizer reads this one (SgxdRenderer::RenderThread).
     Pica::PicaCore render_pica;
@@ -78,9 +80,8 @@ struct GPU::Impl {
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)
         : timing{system.CoreTiming()}, system{system}, memory{system.Memory()},
-          debug_context{Pica::g_debug_context}, pica{memory, debug_context},
 #ifdef ENABLE_GXM
-          render_pica{memory, nullptr},
+          pica{memory}, parse_pica{memory}, render_pica{memory},
           renderer{VideoCore::CreateRenderer(emu_window, secondary_window, render_pica, system)},
 #else
           renderer{VideoCore::CreateRenderer(emu_window, secondary_window, pica, system)},

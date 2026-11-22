@@ -126,7 +126,7 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
     auto* const gxm = dynamic_cast<GxmRenderer::RendererGxm*>(impl->renderer.get());
     ASSERT_MSG(gxm != nullptr, "GPU: the render thread needs the GXM renderer");
     impl->render = std::make_unique<SgxdRenderer::RenderThread>(
-        impl->pica, impl->render_pica, *gxm,
+        impl->pica, impl->parse_pica, impl->render_pica, *gxm,
         *static_cast<GxmRenderer::RasterizerGxm*>(gxm->Rasterizer()), impl->memory);
     impl->rasterizer = impl->render.get();
 #endif
@@ -475,11 +475,14 @@ Result GPU::Execute(const Service::GSP::Command& command) {
             cmdbuffer.addr[0].Assign(address >> 3);
             cmdbuffer.size[0].Assign(size >> 3);
             cmdbuffer.trigger[0] = 1;
-            // As a command list's writes mark them: the render thread's copy takes them.
-            auto& dirty = impl->pica.dirty_regs;
-            dirty.Set(PICA_REG_INDEX(pipeline.command_buffer.addr[0]));
-            dirty.Set(PICA_REG_INDEX(pipeline.command_buffer.size[0]));
-            dirty.Set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
+#ifdef ENABLE_GXM
+            // The render thread's PicaCore takes them too, in order with the lists.
+            for (const u32 id : {PICA_REG_INDEX(pipeline.command_buffer.addr[0]),
+                                 PICA_REG_INDEX(pipeline.command_buffer.size[0]),
+                                 PICA_REG_INDEX(pipeline.command_buffer.trigger[0])}) {
+                impl->render->RegWrite(id, regs.internal.reg_array[id]);
+            }
+#endif
 
             // Trigger processing of the command list
             SubmitCmdList(0);
@@ -685,8 +688,10 @@ void GPU::WriteReg(VAddr addr, u32 data) {
             // An op like the GSP's commands, numbered with them in a vprof recording.
             RunGpuOp(OpKind::RegWrite, [this, index, data] {
                 impl->pica.regs.reg_array[index] = data;
-                // As a command list's write marks it: the render thread's copy takes it.
-                impl->pica.dirty_regs.Set(index - static_cast<u32>(GPU_REG_INDEX(internal)));
+#ifdef ENABLE_GXM
+                // The render thread's PicaCore takes it too, in order with the lists.
+                impl->render->RegWrite(index - static_cast<u32>(GPU_REG_INDEX(internal)), data);
+#endif
                 if (index == GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[0])) {
                     SubmitCmdList(0);
                 } else if (index == GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[1])) {
@@ -781,10 +786,23 @@ void GPU::SubmitCmdList(u32 index) {
         return;
     }
 
-    impl->pica.ProcessCmdList(addr, size,
-                              !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size));
+    const bool ignore = !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size);
+#ifdef ENABLE_GXM
+    // Scanned here, parsed on the render thread (RenderThread::SubmitCmdList); P3D once the list
+    // is queued, so its fence's ticket covers the list's work.
+    std::vector<u64> irqs;
+    impl->render->SubmitCmdList(addr, size, ignore, irqs);
+    for (const u64 delay_ns : irqs) {
+        Signal(Service::GSP::InterruptId::P3D, delay_ns);
+    }
+#else
+    impl->pica.ProcessCmdList(addr, size, ignore);
+#endif
     config.trigger[index] = 0;
-    impl->pica.dirty_regs.Set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + index);
+#ifdef ENABLE_GXM
+    const u32 trigger = PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + index;
+    impl->render->RegWrite(trigger, impl->pica.regs.internal.reg_array[trigger]);
+#endif
 }
 
 void GPU::MemoryFill(u32 index, std::optional<Service::GSP::InterruptId> interrupt) {
@@ -935,6 +953,7 @@ void GPU::VprofReplay(const std::string& capture, const std::string& first) {
             impl->rasterizer->GpuIdle();
         },
         [this] { right_eye_disabler->ReportEndFrame(); },
+        [this] { impl->render->TakeWholeState(); },
     };
     SgxdRenderer::Vprof::Serve(host, capture, first);
     impl->interrupts_muted = false;
@@ -1010,7 +1029,9 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 #endif
     if (frame_starts) {
         RunGpuOp(OpKind::RegWrite, [this] {
-            // The capture records the geometry unit's setup as its own (FlushGsMirror).
+            // The capture records the lists' state, the render thread's (held here), with the
+            // geometry unit's setup as its own (FlushGsMirror).
+            impl->render->GiveWholeState();
             impl->pica.FlushGsMirror();
             SgxdRenderer::Vprof::State(impl->pica);
 #ifdef VITA_DIAGNOSTICS
@@ -1113,8 +1134,18 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 
 template <class Archive>
 void GPU::serialize(Archive& ar, const u32 file_version) {
+#ifdef ENABLE_GXM
+    // The lists' state is the render thread's PicaCore's (RenderThread::SubmitCmdList): saved
+    // from it, loaded into it.
+    if constexpr (Archive::is_saving::value) {
+        impl->render->GiveWholeState();
+    }
+#endif
     ar & impl->pica;
 #ifdef ENABLE_GXM
+    if constexpr (Archive::is_loading::value) {
+        impl->render->TakeWholeState();
+    }
     // A loaded state's screens are in the memory it loaded.
     impl->screens_changed = true;
 #endif
