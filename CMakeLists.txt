@@ -97,14 +97,6 @@ else()
     set(DEFAULT_ENABLE_LTO OFF)
 endif()
 
-# Disable OpenGL by default on Linux aarch64.
-# Some aarch64 devices running Linux don't support OpenGL, and users may encounter issues.
-if (LINUX AND CMAKE_SYSTEM_PROCESSOR STREQUAL aarch64)
-    set(DEFAULT_ENABLE_OPENGL OFF)
-else()
-    set(DEFAULT_ENABLE_OPENGL ON)
-endif()
-
 # The PS Vita is a fixed four-core ARMv7 console with no window system, no OpenGL driver worth
 # using, and no desktop audio stack; everything below is either absent on it or replaced by the
 # Vita frontend's own implementation. VITA is set by the vitasdk toolchain file.
@@ -112,7 +104,7 @@ if (VITA)
     set(_VITA_UNSUPPORTED_OPTIONS
         ENABLE_SDL2 ENABLE_QT ENABLE_WEB_SERVICE ENABLE_SCRIPTING ENABLE_GDBSTUB
         ENABLE_OPENAL ENABLE_ROOM_STANDALONE ENABLE_CUBEB ENABLE_LIBUSB
-        ENABLE_OPENGL ENABLE_VULKAN ENABLE_TESTS ENABLE_LIBRETRO ENABLE_DISCORD_RPC
+        ENABLE_TESTS ENABLE_LIBRETRO ENABLE_DISCORD_RPC
         ENABLE_QT_TRANSLATION ENABLE_QT_UPDATE_CHECKER ENABLE_DSP_LLE ENABLE_ARTIC)
     foreach(_opt IN LISTS _VITA_UNSUPPORTED_OPTIONS)
         set(${_opt} OFF CACHE BOOL "Unsupported on the PS Vita" FORCE)
@@ -120,12 +112,6 @@ if (VITA)
     # The multiplayer rooms' client (the guest's local wireless carried to other emulators in a
     # room); hosting stays with the desktop builds and the standalone room server.
     set(ENABLE_ROOM ON CACHE BOOL "The multiplayer rooms" FORCE)
-    # The Vita renders through GXM and nothing else (GXM_PLAN.md). The software renderer is
-    # too slow on a 444 MHz A9 to be worth carrying, so it is not built; ENABLE_GXM is not an
-    # option because no other platform can use it - it is a fact of the target.
-    set(ENABLE_SOFTWARE_RENDERER OFF CACHE BOOL "Not built for the Vita: GXM is the renderer" FORCE)
-    set(ENABLE_GXM ON)
-    set(DEFAULT_ENABLE_OPENGL OFF)
     # newlib hides asprintf and friends behind __GNU_VISIBLE, and several vendored libraries
     # written against glibc expect them without asking. SOMAXCONN is simply absent from the
     # console's socket headers; it is only ever the "you choose" listen backlog, and nothing in
@@ -196,11 +182,6 @@ CMAKE_DEPENDENT_OPTION(ENABLE_CUBEB "Enables the cubeb audio backend" ON "NOT IO
 option(ENABLE_OPENAL "Enables the OpenAL audio backend" ON)
 
 CMAKE_DEPENDENT_OPTION(ENABLE_LIBUSB "Enable libusb for GameCube Adapter support" ON "NOT IOS" OFF)
-
-CMAKE_DEPENDENT_OPTION(ENABLE_SOFTWARE_RENDERER "Enables the software renderer" ON "NOT ANDROID" OFF)
-CMAKE_DEPENDENT_OPTION(ENABLE_OPENGL "Enables the OpenGL renderer" ${DEFAULT_ENABLE_OPENGL} "NOT APPLE" OFF)
-# NetBSD doesn't support Vulkan yet, remove this check when it does.
-CMAKE_DEPENDENT_OPTION(ENABLE_VULKAN "Enables the Vulkan renderer" ON "NOT (BSD MATCHES \"NetBSD\")" OFF)
 
 option(ENABLE_DISCORD_RPC "Enables Discord Rich Presence" OFF)
 
@@ -502,22 +483,6 @@ if (APPLE)
     find_library(IOSURFACE_LIBRARY IOSurface REQUIRED)
     set(PLATFORM_LIBRARIES ${COCOA_LIBRARY} ${AVFOUNDATION_LIBRARY} ${IOSURFACE_LIBRARY})
 
-    if (ENABLE_VULKAN AND NOT ENABLE_LIBRETRO)
-        if (USE_SYSTEM_MOLTENVK)
-            find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)
-        else()
-            download_moltenvk()
-            if (IOS)
-                set(MOLTENVK_RELATIVE_LIBPATH "static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a")
-            else()
-                set(MOLTENVK_RELATIVE_LIBPATH "dynamic/dylib/macOS/libMoltenVK.dylib")
-            endif()
-            set(MOLTENVK_LIBRARY "${CMAKE_BINARY_DIR}/externals/MoltenVK/MoltenVK/${MOLTENVK_RELATIVE_LIBPATH}")
-        endif()
-
-        message(STATUS "Using MoltenVK at ${MOLTENVK_LIBRARY}.")
-        set(PLATFORM_LIBRARIES ${PLATFORM_LIBRARIES} ${MOLTENVK_LIBRARY})
-    endif()
 elseif (WIN32)
     set(PLATFORM_LIBRARIES winmm ws2_32)
     if (MINGW)

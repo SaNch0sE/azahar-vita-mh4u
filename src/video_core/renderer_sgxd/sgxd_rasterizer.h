@@ -37,7 +37,7 @@ namespace Memory {
 class MemorySystem;
 }
 
-namespace GxmRenderer {
+namespace SgxdRenderer {
 
 /// The fixed palettes that expand a 4-bit format's index for the untile (P4 and P8).
 enum class TexturePalette : u32 { None, A4, I4, IA4 };
@@ -69,7 +69,7 @@ class RasterizerSgxd : public VideoCore::RasterizerAccelerated {
 public:
     explicit RasterizerSgxd(Pica::PicaCore& pica, Memory::MemorySystem& memory,
                            GuestGpuMemory& guest_memory);
-    ~RasterizerGxm() override;
+    ~RasterizerSgxd() override;
 
     void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                      const Pica::OutputVertex& v2) override;
@@ -158,9 +158,6 @@ public:
     }
     void ReplayStop() {
         replay_limit = -2;
-    }
-    [[nodiscard]] u32 ReplayDraws() const {
-        return replay_draw_index;
     }
     void ReplayEndPass();
     /// The colour buffer at `addr` as a pass last drew it, as A8B8G8R8 rows; false when none did.
@@ -874,10 +871,6 @@ private:
     static constexpr u32 TopScreenRows = 400;
     u32 pass_margin = 0;  ///< its widescreen margin, in the buffer's rows (Upscaled::margin)
     bool pass_widened{};  ///< its part as wide as the screen: the margins beside it drawn too
-    /// A guest size in the pass's pixels: exact for the upscaled buffers' sizes (UpscaledFor).
-    [[nodiscard]] u32 PassSize(u32 v) const {
-        return v * pass_quarters / 4;
-    }
     /// A guest pixel edge in the pass's pixels: the first pixel whose centre is at or past it.
     [[nodiscard]] s32 PassEdge(s32 v) const {
         return (2 * v * static_cast<s32>(pass_quarters) + 3 + (v < 0 ? -7 : 0)) / 8;
@@ -1182,4 +1175,4 @@ private:
 #endif
 };
 
-} // namespace GxmRenderer
+} // namespace SgxdRenderer

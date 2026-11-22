@@ -10,9 +10,9 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <utility>
-#include "video_core/renderer_gxm/usse/usse_encoder.h"
+#include "video_core/renderer_sgxd/usse/usse_encoder.h"
 
-namespace GxmRenderer::Usse {
+namespace SgxdRenderer::Usse {
 
 namespace {
 
@@ -1329,4 +1329,4 @@ void Encoder::Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const
          54, static_cast<uint16_t>(ReadsAll(coord) | (lod ? ReadsAll(*lod) : 0)), 0);
 }
 
-} // namespace GxmRenderer::Usse
+} // namespace SgxdRenderer::Usse

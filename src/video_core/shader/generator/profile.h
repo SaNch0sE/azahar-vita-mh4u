@@ -30,7 +30,7 @@ struct VKFormatTraits {
  */
 constexpr u32 LUT_TEX_WIDTH = 256;
 constexpr u32 LUT_LF_ROWS = 512;   ///< lighting refreshes up to 25 rows (24 LUTs plus fog); the
-                                   ///< GXM backend recycles the ring in halves, each of which
+                                   ///< sgxd backend recycles the ring in halves, each of which
                                    ///< must outlive the scenes that sampled it (1 MiB at 8 B)
 constexpr u32 LUT_RG_ROWS = 32;
 constexpr u32 LUT_RGBA_ROWS = 32;  ///< proctex refreshes up to 5

@@ -61,7 +61,6 @@ class Backend;
 }
 
 namespace VideoCore {
-class CustomTexManager;
 class GPU;
 } // namespace VideoCore
 
@@ -325,12 +324,6 @@ public:
     /// Gets a const reference to the cheat engine
     [[nodiscard]] const Cheats::CheatEngine& CheatEngine() const;
 
-    /// Gets a reference to the custom texture cache system
-    [[nodiscard]] VideoCore::CustomTexManager& CustomTexManager();
-
-    /// Gets a const reference to the custom texture cache system
-    [[nodiscard]] const VideoCore::CustomTexManager& CustomTexManager() const;
-
     /// Gets a reference to the movie recorder
     [[nodiscard]] Core::Movie& Movie();
 
@@ -567,7 +560,6 @@ private:
     std::shared_ptr<VideoDumper::Backend> video_dumper;
 
     /// Custom texture cache system
-    std::unique_ptr<VideoCore::CustomTexManager> custom_tex_manager;
 
     /// Image interface
     std::shared_ptr<Frontend::ImageInterface> registered_image_interface;

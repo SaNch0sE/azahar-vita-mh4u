@@ -33,9 +33,7 @@
 #include "core/cheats/cheats.h"
 #include "core/core.h"
 #include "core/core_timing.h"
-#ifdef ENABLE_GXM
 #include "video_core/renderer_sgxd/sgxd_flags.h"
-#endif
 #include "core/dumping/backend.h"
 #include "core/frontend/emu_window.h"
 #include "core/file_sys/ncch_container.h"
@@ -68,9 +66,7 @@
 #include "core/rpc/server.h"
 #endif
 #include "network/network.h"
-#include "video_core/custom_textures/custom_tex_manager.h"
 #include "video_core/gpu.h"
-#include "video_core/renderer_base.h"
 
 namespace Core {
 
@@ -215,12 +211,10 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         return ResultStatus::ErrorSavestate;
     }
 
-#ifdef ENABLE_GXM
     // The GSP interrupts go to the guest as upstream raises them, when the work is submitted
     // (VideoCore::GPU::Signal); the guest pages that work still reads or writes are held until
     // it is done. The holds whose work is done go between slices.
     gpu->DeliverInterrupts();
-#endif
     const auto idle = [](ARM_Interface& core) { core.GetTimer().Idle(); };
 
     // All cores should have executed the same amount of ticks. If this is not the case an event was
@@ -259,10 +253,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         }
         if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
             LOG_TRACE(Core_ARM11, "Core {} idling", current_core_to_execute->GetID());
-#ifdef ENABLE_GXM
             SgxdRenderer::SgxdTrace("idle", static_cast<unsigned>(
                                               current_core_to_execute->GetTimer().GetDowncount()));
-#endif
             idle(*current_core_to_execute);
             PrepareReschedule();
         } else {
@@ -308,10 +300,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             // instead advance to the next event and try to yield to the next thread
             if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
                 LOG_TRACE(Core_ARM11, "Core {} idling", cpu_core->GetID());
-#ifdef ENABLE_GXM
                 SgxdRenderer::SgxdTrace("idle",
                                       static_cast<unsigned>(cpu_core->GetTimer().GetDowncount()));
-#endif
                 idle(*cpu_core);
                 PrepareReschedule();
             } else {
@@ -529,13 +519,6 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
 
     perf_stats = std::make_unique<PerfStats>(title_id);
 
-    if (Settings::values.dump_textures) {
-        custom_tex_manager->PrepareDumping(title_id);
-    }
-    if (Settings::values.custom_textures) {
-        custom_tex_manager->FindCustomTextures();
-    }
-
     status = ResultStatus::Success;
     m_emu_window = &emu_window;
     m_secondary_window = secondary_window;
@@ -697,8 +680,6 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
         registered_image_interface = std::make_shared<Frontend::ImageInterface>();
     }
 
-    custom_tex_manager = std::make_unique<VideoCore::CustomTexManager>(*this);
-
     auto gsp = service_manager->GetService<Service::GSP::GSP_GPU>("gsp::Gpu");
     // Free the old one first. Assigning over it constructs the replacement while it is still
     // alive, so both renderers hold their GL resources at once - two vertex rings, two texture
@@ -801,14 +782,6 @@ void System::RegisterVideoDumper(std::shared_ptr<VideoDumper::Backend> dumper) {
     video_dumper = std::move(dumper);
 }
 
-VideoCore::CustomTexManager& System::CustomTexManager() {
-    return *custom_tex_manager;
-}
-
-const VideoCore::CustomTexManager& System::CustomTexManager() const {
-    return *custom_tex_manager;
-}
-
 Core::Movie& System::Movie() {
     return movie;
 }
@@ -851,10 +824,6 @@ void System::Shutdown(bool is_deserializing) {
 #endif
         perf_stats.reset();
         app_loader.reset();
-    }
-    custom_tex_manager.reset();
-    if (is_deserializing) {
-        SavestateTrace("custom textures down");
     }
 #ifdef ENABLE_SCRIPTING
     rpc_server.reset();
@@ -989,11 +958,8 @@ void System::ApplySettings() {
         // The renderer's: with the render thread held.
         const auto hold = gpu->HoldRender();
 #ifndef ANDROID
-        gpu->Renderer().UpdateCurrentFramebufferLayout();
+        gpu->UpdateFramebufferLayout();
 #endif
-        auto& settings = gpu->Renderer().Settings();
-        settings.bg_color_update_requested = true;
-        settings.shader_update_requested = true;
     }
 
     if (IsPoweredOn()) {
@@ -1158,10 +1124,6 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
         }
         timing->UnlockEventQueue();
         cheat_engine.Connect(cheats_pid);
-
-        if (Settings::values.custom_textures) {
-            custom_tex_manager->FindCustomTextures();
-        }
 
         // Re-register gpu callback, because gsp service changed after service_manager got
         // serialized

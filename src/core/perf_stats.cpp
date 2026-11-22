@@ -16,9 +16,7 @@
 #include "core/core_timing.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
-#ifdef ENABLE_GXM
 #include "video_core/renderer_sgxd/sgxd_flags.h"
-#endif
 
 using namespace std::chrono_literals;
 using DoubleSecs = std::chrono::duration<double, std::chrono::seconds::period>;
@@ -248,10 +246,8 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
         std::clamp(frame_limiting_delta_err, -max_lag_time_us, max_lag_time_us);
 
     if (frame_limiting_delta_err > microseconds::zero()) {
-#ifdef ENABLE_GXM
         // tracelog: the limiter's sleep, microseconds.
         SgxdRenderer::SgxdTrace("limit", static_cast<unsigned>(frame_limiting_delta_err.count()));
-#endif
         std::this_thread::sleep_for(frame_limiting_delta_err);
         auto now_after_sleep = Clock::now();
         frame_limiting_delta_err -= duration_cast<microseconds>(now_after_sleep - now);

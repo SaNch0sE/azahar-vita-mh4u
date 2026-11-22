@@ -20,12 +20,9 @@
 #include "video_core/gpu_impl.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_lcd.h"
-#include "video_core/renderer_base.h"
 #include "video_core/right_eye_disabler.h"
-#include "video_core/video_core.h"
-#ifdef ENABLE_GXM
-#include "video_core/renderer_gxm/render_thread.h"
-#endif
+#include "video_core/renderer_sgxd/render_thread.h"
+#include "video_core/renderer_sgxd/renderer_sgxd.h"
 
 namespace VideoCore {
 struct GPU::Impl {
@@ -34,18 +31,16 @@ struct GPU::Impl {
     Memory::MemorySystem& memory;
     /// The PICA, the emulation side's: command lists, registers, shader setups, interrupts.
     Pica::PicaCore pica;
-#ifdef ENABLE_GXM
     /// The parse thread's, which parses the lists (SgxdRenderer::RenderThread::ParseLoop).
     Pica::PicaCore parse_pica;
     /// The render thread's copy of its state, as of the work that thread has run: the sgxd
     /// rasterizer reads this one (SgxdRenderer::RenderThread).
     Pica::PicaCore render_pica;
-#endif
     GraphicsDebugger gpu_debugger;
-    std::unique_ptr<RendererBase> renderer;
-    /// What the PICA and this GPU call: with GXM the render thread, which queues to the
-    /// renderer's own rasterizer.
-    RasterizerInterface* rasterizer;
+    std::unique_ptr<SgxdRenderer::RendererSgxd> renderer;
+    /// What the PICA and this GPU call: the render thread, which queues to the renderer's own
+    /// rasterizer (GPU::GPU binds it).
+    SgxdRenderer::RenderThread* rasterizer{};
     Core::TimingEventType* vblank_event;
     Service::GSP::InterruptHandler signal_interrupt;
 
@@ -55,16 +50,11 @@ struct GPU::Impl {
     std::vector<std::pair<u64, u32>> scans_pending;
     GPU::ScanRoom scan_room{};
 #endif
-#ifndef ENABLE_GXM
-    /// The last present's time: VBlankCallback drops one that comes too soon after it.
-    std::chrono::steady_clock::time_point last_present{};
-#endif
     /// vprof's replay runs: GPU::Signal drops the interrupts.
     bool interrupts_muted{};
     /// The rasterizer's ticket for the work queued before the last vblank: the next vblank
     /// waits for it (GPU::VBlankCallback).
     u64 vblank_ticket{};
-#ifdef ENABLE_GXM
     /// Whether the guest's screens may show something new since the last present a vblank
     /// sent: a buffer swap, a write into a framebuffer the LCD shows (GPU::ScreensWritten), a
     /// loaded state. The LCD's registers and fill are compared with the last present's too. A
@@ -75,18 +65,12 @@ struct GPU::Impl {
     std::array<Pica::ColorFill, 2> presented_fill{};
     /// Last: it stops before anything it runs goes (GPU::~GPU stops it first).
     std::unique_ptr<SgxdRenderer::RenderThread> render;
-#endif
 
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
-                  Frontend::EmuWindow* secondary_window)
+                  [[maybe_unused]] Frontend::EmuWindow* secondary_window)
         : timing{system.CoreTiming()}, system{system}, memory{system.Memory()},
-#ifdef ENABLE_GXM
           pica{memory}, parse_pica{memory}, render_pica{memory},
-          renderer{VideoCore::CreateRenderer(emu_window, secondary_window, render_pica, system)},
-#else
-          renderer{VideoCore::CreateRenderer(emu_window, secondary_window, pica, system)},
-#endif
-          rasterizer{renderer->Rasterizer()} {
+          renderer{std::make_unique<SgxdRenderer::RendererSgxd>(system, render_pica, emu_window)} {
     }
     ~Impl() = default;
 };

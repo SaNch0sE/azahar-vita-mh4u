@@ -6,7 +6,7 @@
 
 #include <vector>
 
-namespace GxmRenderer {
+namespace SgxdRenderer {
 
 /**
  * Bring-up switches read once from ux0:data/azahar/sgxd_flags.txt (and host0:sgxd_flags.txt):
@@ -134,7 +134,7 @@ namespace GxmRenderer {
  *             in 7:0, busy bit 16), list_run/list_run_end (the render thread on a list's parsed
  *             records), parse/parse_end (the parse thread on a list)
  */
-[[nodiscard]] bool GxmFlag(const char* name);
+[[nodiscard]] bool SgxdFlag(const char* name);
 /// A flag written `name=N`: N, or 0 when the flag is not given (always 0 in the release build).
 [[nodiscard]] unsigned SgxdFlagValue(const char* name);
 /// Every `name=N` given, in the file's order (none in the release build).
@@ -161,4 +161,4 @@ struct TraceSpan {
     const char* end;
 };
 
-} // namespace GxmRenderer
+} // namespace SgxdRenderer

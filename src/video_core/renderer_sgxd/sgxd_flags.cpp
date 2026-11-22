@@ -14,7 +14,7 @@
 #include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/vprof.h"
 
-namespace GxmRenderer {
+namespace SgxdRenderer {
 
 namespace {
 
@@ -45,7 +45,7 @@ const std::vector<std::string>& Flags() {
             for (const auto& w : out) {
                 joined += w + ' ';
             }
-            LOG_WARNING(Render, "gxm_flags.txt: {}", joined);
+            LOG_WARNING(Render, "sgxd_flags.txt: {}", joined);
         }
         return out;
     }();
@@ -55,7 +55,7 @@ const std::vector<std::string>& Flags() {
 
 } // Anonymous namespace
 
-bool GxmFlag(const char* name) {
+bool SgxdFlag(const char* name) {
 #ifdef VITA_DIAGNOSTICS
     for (const auto& flag : Flags()) {
         if (flag == name) {
@@ -64,7 +64,7 @@ bool GxmFlag(const char* name) {
     }
 #else
     // The release build has no bring-up switches. Nothing reads the file, nothing reads the
-    // environment, and every GxmFlag call site folds away to the default behaviour.
+    // environment, and every SgxdFlag call site folds away to the default behaviour.
     (void)name;
 #endif
     return false;
@@ -166,4 +166,4 @@ void SgxdTrace(const char* tag, unsigned arg) {
 }
 #endif
 
-} // namespace GxmRenderer
+} // namespace SgxdRenderer

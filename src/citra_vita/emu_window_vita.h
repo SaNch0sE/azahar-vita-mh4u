@@ -10,7 +10,6 @@
 #include "common/common_types.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
-#include "video_core/renderer_base.h"
 
 namespace Core {
 class System;

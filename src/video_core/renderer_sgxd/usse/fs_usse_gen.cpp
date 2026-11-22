@@ -14,7 +14,7 @@
 #include "video_core/renderer_sgxd/usse/usse_ir.h"
 #include "video_core/renderer_sgxd/usse/usse_program.h"
 
-namespace GxmRenderer::Usse {
+namespace SgxdRenderer::Usse {
 
 namespace {
 
@@ -4671,4 +4671,4 @@ std::optional<Program> EmitFragmentProgram(const FSConfig& config, std::string* 
     }
 }
 
-} // namespace GxmRenderer::Usse
+} // namespace SgxdRenderer::Usse

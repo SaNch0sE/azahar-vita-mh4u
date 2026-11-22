@@ -48,7 +48,7 @@
  * are branches, END branches to the epilogue. A branch on per-vertex data puts the
  * program in per-instance mode (Program::per_instance), as the compiler does.
  */
-namespace GxmRenderer::Usse {
+namespace SgxdRenderer::Usse {
 
 bool z_flip = false;
 
@@ -2308,4 +2308,4 @@ std::optional<Program> EmitVertexProgram(const VsRequest& request, uint32_t& inp
     return std::nullopt;
 }
 
-} // namespace GxmRenderer::Usse
+} // namespace SgxdRenderer::Usse

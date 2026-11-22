@@ -4,38 +4,60 @@
 
 #pragma once
 
-#include "video_core/renderer_base.h"
+#include <array>
+#include "common/common_types.h"
+#include "video_core/pica/regs_external.h"
+#include "video_core/pica/regs_lcd.h"
 #include "video_core/renderer_sgxd/guest_gpu_memory.h"
 #include "video_core/renderer_sgxd/sgxd_rasterizer.h"
+
+namespace Core {
+class System;
+}
+
+namespace Frontend {
+class EmuWindow;
+}
 
 namespace Pica {
 class PicaCore;
 }
 
-namespace GxmRenderer {
+namespace SgxdRenderer {
 
 /// The renderer the Vita frontend presents through. Its rasterizer and presents run on the
 /// render thread (RenderThread), which owns the GPU (sgxd) and the window while a title runs;
 /// each VBlank's present hands the guest's screens to the frontend through the window's
 /// PresentGuestScreens, on that thread, and the frontend draws them from guest memory
 /// (EmuWindowVita::DrawGuestScreens).
-class RendererGxm : public VideoCore::RendererBase {
+class RendererSgxd {
 public:
-    explicit RendererGxm(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window);
-    ~RendererGxm() override;
+    explicit RendererSgxd(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window);
+    ~RendererSgxd();
 
-    [[nodiscard]] VideoCore::RasterizerInterface* Rasterizer() override {
-        return &rasterizer;
+    RendererSgxd(const RendererSgxd&) = delete;
+    RendererSgxd& operator=(const RendererSgxd&) = delete;
+
+    [[nodiscard]] RasterizerSgxd& Rasterizer() {
+        return rasterizer;
     }
 
-    void SwapBuffers() override;
-    void TryPresent(int timeout_ms, bool is_secondary) override {}
-
+    /// Shows the latest frame at a VBlank, with the guest's screens as the VBlank found them:
+    /// both framebuffer configurations and LCD fills (top, bottom).
     void PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb,
-                      const std::array<Pica::ColorFill, 2>& fill) override;
-    /// The render thread polls the window (PollWindow) with each VBlank's present and between
-    /// presents; the frame's end on the emulation thread leaves it alone.
-    void PollWindowEvents() override {}
+                      const std::array<Pica::ColorFill, 2>& fill);
+    /// The frame's end on the emulation thread: the frame count, the performance counters and
+    /// the pacing (the window's PaceFrame, else the frame limiter). The window's events are the
+    /// render thread's (PollWindow).
+    void EndFrame();
+    /// The window's framebuffer layout made again from its size.
+    void UpdateCurrentFramebufferLayout(bool is_portrait_mode = {});
+
+    [[nodiscard]] Frontend::EmuWindow& GetRenderWindow() {
+        return render_window;
+    }
+
+    /// The render thread polls the window with each VBlank's present and between presents.
     void PollWindow();
     /// The window's last present still being drawn: a present now would be dropped.
     bool PresentBusy();
@@ -45,12 +67,21 @@ public:
     void FlipDone();
     [[nodiscard]] bool FlipPending(u32* fence);
     [[nodiscard]] s64 FlipDueIn();
-    bool WouldMakeUncached(PAddr addr, u32 size) const override;
-    void MakeUncached(PAddr addr, u32 size, bool overwritten) override;
-    bool UncachedFrameEnded() override {
+
+    /// From the emulation thread: whether [addr, addr + size) would rather be somewhere the CPU
+    /// reaches uncached, because the GPU is about to write it (a display transfer's output) or
+    /// show it (a framebuffer the LCD names). The GPU then calls MakeUncached, the guest
+    /// stopped.
+    bool WouldMakeUncached(PAddr addr, u32 size) const;
+    /// See WouldMakeUncached. `overwritten`: the GPU is about to write the whole range.
+    void MakeUncached(PAddr addr, u32 size, bool overwritten);
+    /// From the emulation thread at vblank, with the guest stopped: a frame has ended. Whether
+    /// memory MakeUncached moved should go back (unused long enough, or the pool short of free
+    /// pages), which ReturnUncached then does with the render thread held.
+    bool UncachedFrameEnded() {
         return guest_memory.EndFrame();
     }
-    void ReturnUncached() override {
+    void ReturnUncached() {
         guest_memory.ReturnUnused();
     }
     /// The render side's part in the page moves (GuestGpuMemory::MoveHooks; RenderThread).
@@ -70,9 +101,11 @@ public:
 #endif
 
 private:
+    Core::System& system;
+    Frontend::EmuWindow& render_window;
     Memory::MemorySystem& memory;
     GuestGpuMemory guest_memory;
-    RasterizerGxm rasterizer;
+    RasterizerSgxd rasterizer;
 };
 
-} // namespace GxmRenderer
+} // namespace SgxdRenderer

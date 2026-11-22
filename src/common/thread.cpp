@@ -216,24 +216,14 @@ void SetCurrentThreadName(const char*) {
 /**
  * The cores each role may run on (one bit per core), indexed by ThreadRole.
  *
- * Core 2 is not in this table at all: the native backend detaches it from the system scheduler
- * (vanTakeCore) and the guest's ARM11 code runs on it directly. No host thread may be pinned
- * there - a thread whose affinity mask names a detached core is a thread the scheduler can no
- * longer place. The emulation thread is the host-side driver of that core: it spends its slices
- * inside vanRun waiting for the guest to exit, and that wait spins, so it keeps its own core
- * busy and deserves one to itself.
- *
- * Off-console core 2 is left empty rather than used: the Linux tier exists to rehearse this
- * design, and a partition that differs from the console's would measure something else. There
- * the guest executes on the emulation thread itself, so its core carries both halves.
- *
- * On the console the guest also executes on the emulation thread's core since vaprobe's
- * folded mode (2026-09-09): vanRun turns the calling core into the guest's for one slice and
- * back, so the emulation thread and the guest share core 2 and no core is held. The render
- * thread (SgxdRenderer::RenderThread: the rasterizer, sgxd and the presents) has core 1 and the
- * HLE DSP's thread core 0. Everything else - the tier-2 shader compiler, the software rasterizer's worker,
- * which the GXM build does not run at all, and the miscellaneous threads - goes to core 3 with
- * whatever the system keeps there.
+ * The guest executes on the emulation thread's core: azaharRun turns the calling core into the
+ * guest's for one slice and back (docs/native-execution.md), so the emulation thread and the guest
+ * share core 2, and nothing else of ours goes there. The second
+ * emulation thread (the emulated cores other than core 0) has core 1 the same way, with the HLE
+ * DSP's thread beside it (and on core 3 when core 1 is taken); the render thread (SgxdRenderer::RenderThread: the rasterizer, sgxd and
+ * the presents) has core 0 with Y2R. Everything else - the command lists' parse, the
+ * tier-2 shader compiler and the miscellaneous threads - goes to core 3 with whatever the system
+ * keeps there.
  */
 constexpr int RoleCores(ThreadRole role, std::size_t index) {
     (void)index;

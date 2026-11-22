@@ -12,7 +12,7 @@
 #include <vector>
 #include "video_core/renderer_sgxd/usse/usse_program.h"
 
-namespace GxmRenderer::Usse {
+namespace SgxdRenderer::Usse {
 
 /**
  * The PICA vertex emitter: a USSE vertex program for a PICA vertex program. Its fragment
@@ -119,4 +119,7 @@ inline constexpr uint32_t GsStateQuads = 16 + 3 * 16;
                                                       std::string* refusal = nullptr,
                                                       int level = 1);
 
-} // namespace GxmRenderer::Usse
+/// Probe zflip (diagnostics): clip z = 2z + w, the TA's near and far planes swapped.
+extern bool z_flip;
+
+} // namespace SgxdRenderer::Usse

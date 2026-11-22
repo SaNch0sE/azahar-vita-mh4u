@@ -23,7 +23,7 @@ enum class GraphicsAPI {
     Software = 0,
     OpenGL = 1,
     Vulkan = 2,
-    Gxm = 3, ///< the PS Vita's libgxm
+    Sgxd = 3, ///< sgxd: the Vita's SGX driven directly
 };
 
 enum class InitClock : u32 {
@@ -513,21 +513,8 @@ struct Values {
     // Renderer
     // clang-format off
     SwitchableSetting<GraphicsAPI, true> graphics_api{
-#if defined(ANDROID) && defined(ENABLE_VULKAN) // Prefer Vulkan on Android, OpenGL on everything else
-        GraphicsAPI::Vulkan,
-#elif defined(ENABLE_OPENGL)
-        GraphicsAPI::OpenGL,
-#elif defined(ENABLE_VULKAN)
-        GraphicsAPI::Vulkan,
-#elif defined(ENABLE_GXM)
-        GraphicsAPI::Gxm,
-#elif defined(ENABLE_SOFTWARE_RENDERER)
-        GraphicsAPI::Software,
-#else
-// TODO: Add a null renderer backend for this, perhaps.
-#error "At least one renderer must be enabled."
-#endif
-        GraphicsAPI::Software, GraphicsAPI::Gxm, Keys::graphics_api};
+        GraphicsAPI::Sgxd,
+        GraphicsAPI::Software, GraphicsAPI::Sgxd, Keys::graphics_api};
     // clang-format on
     SwitchableSetting<u32> physical_device{0, Keys::physical_device};
     Setting<bool> use_gles{false, Keys::use_gles};

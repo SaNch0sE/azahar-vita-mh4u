@@ -6,16 +6,6 @@ generate_build_info()
 # The variable SRC_DIR must be passed into the script (since it uses the current build directory for all values of CMAKE_*_DIR)
 set(VIDEO_CORE "${CMAKE_SOURCE_DIR}/src/video_core")
 set(HASH_FILES
-    "${VIDEO_CORE}/renderer_opengl/gl_shader_disk_cache.cpp"
-    "${VIDEO_CORE}/renderer_opengl/gl_shader_disk_cache.h"
-    "${VIDEO_CORE}/renderer_opengl/gl_shader_util.cpp"
-    "${VIDEO_CORE}/renderer_opengl/gl_shader_util.h"
-    "${VIDEO_CORE}/renderer_vulkan/vk_shader_util.cpp"
-    "${VIDEO_CORE}/renderer_vulkan/vk_shader_util.h"
-    "${VIDEO_CORE}/renderer_vulkan/vk_shader_disk_cache.cpp"
-    "${VIDEO_CORE}/renderer_vulkan/vk_shader_disk_cache.h"
-    "${VIDEO_CORE}/renderer_vulkan/vk_pipeline_cache.cpp"
-    "${VIDEO_CORE}/renderer_vulkan/vk_pipeline_cache.h"
     "${VIDEO_CORE}/shader/generator/glsl_fs_shader_gen.cpp"
     "${VIDEO_CORE}/shader/generator/glsl_fs_shader_gen.h"
     "${VIDEO_CORE}/shader/generator/glsl_shader_decompiler.cpp"
@@ -29,8 +19,6 @@ set(HASH_FILES
     "${VIDEO_CORE}/shader/generator/shader_gen.h"
     "${VIDEO_CORE}/shader/generator/shader_uniforms.cpp"
     "${VIDEO_CORE}/shader/generator/shader_uniforms.h"
-    "${VIDEO_CORE}/shader/generator/spv_fs_shader_gen.cpp"
-    "${VIDEO_CORE}/shader/generator/spv_fs_shader_gen.h"
     "${VIDEO_CORE}/shader/shader.cpp"
     "${VIDEO_CORE}/shader/shader.h"
     "${VIDEO_CORE}/pica/regs_framebuffer.h"

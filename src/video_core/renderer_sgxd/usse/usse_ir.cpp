@@ -14,9 +14,9 @@
 #include <utility>
 #include <stdexcept>
 #include <string>
-#include "video_core/renderer_gxm/usse/usse_ir.h"
+#include "video_core/renderer_sgxd/usse/usse_ir.h"
 
-namespace GxmRenderer::Usse::Ir {
+namespace SgxdRenderer::Usse::Ir {
 
 namespace {
 
@@ -4403,4 +4403,4 @@ LowerResult Builder::Lower(Encoder& e, int level) {
     return lowering.Run(e, level);
 }
 
-} // namespace GxmRenderer::Usse::Ir
+} // namespace SgxdRenderer::Usse::Ir

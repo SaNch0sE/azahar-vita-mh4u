@@ -55,7 +55,7 @@
 #include "sgxd_ptla.h"
 #include "sgxd_session.h"
 
-namespace GxmRenderer {
+namespace SgxdRenderer {
 
 namespace {
 
@@ -961,7 +961,7 @@ void RasterizerSgxd::AddTriangle(const Pica::OutputVertex&, const Pica::OutputVe
                     pipeline.vs_default_attributes_setup.index == 0xF ? "yes" : "no");
 }
 
-void RasterizerGxm::DrawTriangles() {
+void RasterizerSgxd::DrawTriangles() {
     // Reached at the end of every CPU-path draw, even one with no triangle.
     const auto& pipeline = regs.pipeline;
     UNREACHABLE_MSG("sgxd: DrawTriangles, a draw on the CPU vertex path: geometry shader {}, "
@@ -1003,7 +1003,7 @@ Pica::TexturingRegs::TextureFormat TextureFormatOf(Pica::PixelFormat format) {
 }
 } // namespace
 
-bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+bool RasterizerSgxd::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     FlushImmediate();
 #ifdef VITA_DIAGNOSTICS
     // sgxd_flags `texdump=N`: every texture the draws take over a frame of both screens from N s.
@@ -1275,7 +1275,7 @@ u64 RasterizerSgxd::GpuWaitUs() const {
 }
 #endif
 
-bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
+bool RasterizerSgxd::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     // Lines of input_width bytes input_gap apart into lines of output_width output_gap apart (16-byte
     // units); alike on both sides, or with no gaps, one contiguous copy.
     const auto& tc = config.texture_copy;
@@ -1314,7 +1314,7 @@ bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
                      tc.size / in_width);
 }
 
-bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
+bool RasterizerSgxd::AccelerateFill(const Pica::MemoryFillConfig& config) {
     FlushImmediate();
     const PAddr start = config.GetStartAddress();
     const PAddr end = config.GetEndAddress();
@@ -7203,4 +7203,4 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     return true;
 }
 
-} // namespace GxmRenderer
+} // namespace SgxdRenderer

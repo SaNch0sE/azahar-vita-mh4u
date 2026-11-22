@@ -11,7 +11,6 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     announce_multiplayer_room.h
     arch.h
     archives.h
-    async_handle.h
     assert.h
     atomic_ops.h
     detached_tasks.cpp

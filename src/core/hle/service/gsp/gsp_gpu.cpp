@@ -24,7 +24,6 @@
 #include "video_core/gpu_debugger.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_lcd.h"
-#include "video_core/renderer_base.h"
 #include "video_core/right_eye_disabler.h"
 
 SERIALIZE_EXPORT_IMPL(Service::GSP::SessionData)

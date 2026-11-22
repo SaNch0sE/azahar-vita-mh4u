@@ -324,9 +324,7 @@ bool TakeRenderCounters(Core::System& system, RenderCounters& out) {
             c.gpu_wait_us = sgxd_wait_us_take();
             c.present = VitaFrontend::TakePresentTimes();
             c.cache = SgxdRenderer::SgxdTakeCacheTimes();
-            if (auto* gxm = dynamic_cast<GxmRenderer::RendererGxm*>(&gpu.Renderer())) {
-                c.moves = gxm->TakeMoveStats();
-            }
+            c.moves = gpu.Renderer().TakeMoveStats();
             render_counters_state.store(2, std::memory_order_release);
         });
     }
@@ -2024,13 +2022,12 @@ int EmulatorMain() {
 
     auto& system = Core::System::GetInstance();
 
-    // The Vita has neither the memory nor the drivers for the LLE service modules. GXM is the
-    // only renderer in this build: the software renderer was too slow on this
-    // CPU to be worth carrying and is no longer compiled for the console.
+    // The Vita has neither the memory nor the drivers for the LLE service modules; sgxd is the
+    // only renderer.
     for (const auto& service_module : Service::service_module_map) {
         Settings::values.lle_modules.emplace(service_module.name, false);
     }
-    Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
+    Settings::values.graphics_api = Settings::GraphicsAPI::Sgxd;
     // Vertex shading happens on the GPU or not at all: with this off, the PICA code would send
     // every draw down its CPU vertex path, which the sgxd rasterizer does not have.
     Settings::values.use_hw_shader = true;

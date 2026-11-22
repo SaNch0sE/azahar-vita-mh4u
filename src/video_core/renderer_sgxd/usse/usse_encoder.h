@@ -9,7 +9,7 @@
 #include <optional>
 #include <vector>
 
-namespace GxmRenderer::Usse {
+namespace SgxdRenderer::Usse {
 
 /**
  * The USSE instruction encoder: one builder per instruction form the fragment emitter
@@ -325,4 +325,4 @@ private:
     std::vector<std::size_t> kill_indices;
 };
 
-} // namespace GxmRenderer::Usse
+} // namespace SgxdRenderer::Usse

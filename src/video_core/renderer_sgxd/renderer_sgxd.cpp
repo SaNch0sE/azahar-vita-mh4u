@@ -7,15 +7,17 @@
 #include "common/heap_check.h"
 #include "common/host_clock.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/frontend/emu_window.h"
 #include "core/loader/loader.h"
 #include "core/memory.h"
-#include "video_core/renderer_gxm/renderer_gxm.h"
+#include "core/perf_stats.h"
+#include "video_core/renderer_sgxd/renderer_sgxd.h"
 
-namespace GxmRenderer {
+namespace SgxdRenderer {
 
 RendererSgxd::RendererSgxd(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window)
-    : VideoCore::RendererBase{system, window, nullptr}, memory{system.Memory()},
+    : system{system}, render_window{window}, memory{system.Memory()},
       guest_memory{system.Memory()}, rasterizer{pica, system.Memory(), guest_memory} {
     rasterizer.SetFlipHook([this](u32* fence) { return FlipPending(fence); },
                            [this] { return FlipDueIn(); }, [this] { FlipDone(); });
@@ -57,6 +59,21 @@ void RendererSgxd::PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb
     render_window.PresentGuestScreens(screens);
 }
 
+void RendererSgxd::EndFrame() {
+    Common::HeapCheck::Check("a guest frame's end");
+    system.perf_stats->EndSystemFrame();
+    if (!render_window.PaceFrame()) {
+        system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
+    }
+    Common::SetHostClockMhz(static_cast<u32>(std::max(1, scePowerGetArmClockFrequency())));
+    system.perf_stats->BeginSystemFrame();
+}
+
+void RendererSgxd::UpdateCurrentFramebufferLayout(bool is_portrait_mode) {
+    const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
+    render_window.UpdateCurrentFramebufferLayout(layout.width, layout.height, is_portrait_mode);
+}
+
 void RendererSgxd::PollWindow() {
     render_window.PollEvents();
 }
@@ -85,8 +102,4 @@ void RendererSgxd::MakeUncached(PAddr addr, u32 size, bool overwritten) {
     guest_memory.MakeUncached(addr, size, overwritten);
 }
 
-void RendererGxm::SwapBuffers() {
-    // Nothing calls it: the GPU presents through PresentFrame at each VBlank.
-}
-
-} // namespace GxmRenderer
+} // namespace SgxdRenderer

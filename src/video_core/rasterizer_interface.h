@@ -139,19 +139,11 @@ public:
 
     virtual void SwitchDiskResources([[maybe_unused]] u64 title_id) {}
 
-    static void SetSwitchDiskResourcesCallback(const DiskResourceLoadCallback& callback) {
-        switch_disk_resources_callback = callback;
-    }
-
     void SetAccurateMul(bool accurate_mul_) {
         accurate_mul = accurate_mul_;
     }
 
 protected:
     bool accurate_mul = false;
-
-    // Rasterizer gets destroyed on reboot, so make the callback
-    // static until a better solution is found.
-    static DiskResourceLoadCallback switch_disk_resources_callback;
 };
 } // namespace VideoCore

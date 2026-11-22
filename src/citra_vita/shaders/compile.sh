@@ -5,9 +5,8 @@
 # container. Its output is committed, which is why the console needs no runtime compiler
 # (libshacccg.suprx) to present - see the note at the top of gxm_present.cpp.
 #
-# Usage: shaders/compile.sh [directory]   (needs docker and ~/psvita_sdk)
-# The directory defaults to this one; src/video_core/renderer_gxm/shaders holds the
-# fragment ubershader, compiled the same way.
+# Usage: shaders/compile.sh [directory]   (needs docker, and the Vita SDK in $PSVITA_SDK).
+# The directory defaults to this one.
 set -euo pipefail
 cd "${1:-$(dirname "$0")}"
 IMAGE=psp2cgc

@@ -11,7 +11,7 @@
 #include "video_core/renderer_sgxd/usse/usse_program.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 
-namespace GxmRenderer::Usse {
+namespace SgxdRenderer::Usse {
 
 /**
  * The PICA fragment emitter: a USSE fragment program (Program) for a fragment
@@ -45,4 +45,4 @@ inline LightingSwitches lighting_switches;
 /// the bump map and the shadow texture, as the emitter plans them.
 [[nodiscard]] uint32_t SampledTextureUnits(const Pica::Shader::FSConfig& config);
 
-} // namespace GxmRenderer::Usse
+} // namespace SgxdRenderer::Usse

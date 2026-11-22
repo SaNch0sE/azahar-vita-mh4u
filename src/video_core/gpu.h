@@ -45,6 +45,7 @@ class EmuWindow;
 
 namespace SgxdRenderer {
 class RenderThread;
+class RendererSgxd;
 }
 
 namespace VideoCore {
@@ -53,7 +54,6 @@ namespace VideoCore {
 constexpr u64 FRAME_TICKS = 4481136ull;
 
 class GraphicsDebugger;
-class RendererBase;
 class RightEyeDisabler;
 
 /**
@@ -96,7 +96,10 @@ public:
     void WriteReg(VAddr addr, u32 data);
 
     /// Returns a mutable reference to the renderer.
-    [[nodiscard]] VideoCore::RendererBase& Renderer();
+    [[nodiscard]] SgxdRenderer::RendererSgxd& Renderer();
+
+    /// The window's framebuffer layout made again from its size (the settings changed).
+    void UpdateFramebufferLayout();
 
     /// Returns a mutable reference to the PICA GPU.
     [[nodiscard]] Pica::PicaCore& PicaCore();
@@ -171,10 +174,8 @@ public:
     [[nodiscard]] RenderHold HoldRender() {
         return RenderHold{*this};
     }
-#ifdef ENABLE_GXM
     /// The render thread, the rasterizer the PICA calls (renderer_sgxd/render_thread.h).
     [[nodiscard]] SgxdRenderer::RenderThread& GetRenderThread();
-#endif
     /// The vblank's timer event (VBlankCallback): the frame's end, the presents and the page
     /// holds' remaps.
     [[nodiscard]] const Core::TimingEventType* VBlankEventType() const;
@@ -224,7 +225,7 @@ private:
     void VBlankCallback(uintptr_t user_data, s64 cycles_late);
 
     /// Has the renderer keep [addr, addr + size) where the CPU reaches it uncached, if it would
-    /// (RendererBase::WouldMakeUncached), before the GPU writes or shows it.
+    /// (RendererSgxd::WouldMakeUncached), before the GPU writes or shows it.
     void KeepUncached(PAddr addr, u32 size);
 
     /// A DMA's piece that is contiguous in physical memory on both sides.
@@ -251,13 +252,11 @@ private:
     /// for that work wait for (SgxdRenderer::PageHolds): the guest hears of the work before the
     /// SGX has done it, and a guest access to its pages waits. None while vprof's replay runs.
     void Signal(Service::GSP::InterruptId id, u64 delay_ns);
-#ifdef ENABLE_GXM
     /// vprof's capture records its frame with the render thread held, so that the frame's ops
     /// and the draws they make interleave as they run: on from the vblank the frame starts at
     /// to the one it ends at.
     void SyncCaptureHold();
     bool capture_hold = false;
-#endif
 
     friend class boost::serialization::access;
     template <class Archive>

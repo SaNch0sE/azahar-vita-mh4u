@@ -14,9 +14,7 @@
 #include "core/hle/kernel/process.h"
 #include "core/hle/service/cam/y2r_u.h"
 #include "core/hw/y2r.h"
-#ifdef ENABLE_GXM
 #include "video_core/renderer_sgxd/sgxd_flags.h"
-#endif
 
 SERVICE_CONSTRUCT_IMPL(Service::Y2R::Y2R_U)
 SERIALIZE_EXPORT_IMPL(Service::Y2R::Y2R_U)
@@ -771,12 +769,10 @@ void Y2R_U::WorkerLoop() {
         converting = true;
         worker_lock.unlock();
         {
-#ifdef ENABLE_GXM
             // tracelog: the conversion on this thread, its pixels.
             const SgxdRenderer::TraceSpan span{
                 "y2r_convert", "y2r_convert_end",
                 static_cast<unsigned>(cvt.input_line_width * cvt.input_lines)};
-#endif
             conversion.Run();
         }
         worker_lock.lock();
@@ -802,10 +798,8 @@ void Y2R_U::WaitConversion() {
     if (!job && !converting) {
         return;
     }
-#ifdef ENABLE_GXM
     // tracelog: the guest's thread held until the worker's conversion ends.
     const SgxdRenderer::TraceSpan span{"y2r_wait", "y2r_wait_end"};
-#endif
     // The guest waits for the conversion: this thread takes its strips beside the worker, once.
     // Then, or for a conversion that runs whole, it waits for the worker.
     const HW::Y2R::Conversion* helped = nullptr;

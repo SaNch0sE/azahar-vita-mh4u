@@ -226,7 +226,6 @@ public:
     /// PTLA ops complete through sgxd's microkernel (sgxd_ptla_events). PtlaFence is the last
     /// op's completion point.
     [[nodiscard]] u32 PtlaFence() const;
-    [[nodiscard]] bool PtlaReached(u32 fence) const;
     /// Renders run as one async list each (sgxd_session_render_overlap): EndPass returns once
     /// the TA is kicked; RenderTaReached when its TA has read the vertices. A pass's TA runs
     /// while the pass before's 3D does: its list ends at its own 3D kick, and the next list, or

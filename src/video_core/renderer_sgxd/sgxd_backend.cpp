@@ -545,10 +545,6 @@ u32 SgxdBackend::PtlaFence() const {
     return sgxd_ptla_fence();
 }
 
-bool SgxdBackend::PtlaReached(u32 fence) const {
-    return sgxd_ptla_reached(fence) != 0;
-}
-
 SgxdBackend::~SgxdBackend() {
     RenderIdle("the backend's end");
     // The lists kept for this backend's recipes: the next backend makes its own at their addresses.

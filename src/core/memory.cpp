@@ -27,7 +27,6 @@
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
-#include "video_core/renderer_base.h"
 
 SERIALIZE_EXPORT_IMPL(Memory::MemorySystem::BackingMemImpl<Memory::Region::FCRAM>)
 SERIALIZE_EXPORT_IMPL(Memory::MemorySystem::BackingMemImpl<Memory::Region::VRAM>)

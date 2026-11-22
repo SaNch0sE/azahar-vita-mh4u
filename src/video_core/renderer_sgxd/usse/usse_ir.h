@@ -8,9 +8,9 @@
 #include <functional>
 #include <string>
 #include <vector>
-#include "video_core/renderer_gxm/usse/usse_encoder.h"
+#include "video_core/renderer_sgxd/usse/usse_encoder.h"
 
-namespace GxmRenderer::Usse::Ir {
+namespace SgxdRenderer::Usse::Ir {
 
 /**
  * The instruction list between the emitters and the encoder. An emitter writes it through
@@ -276,4 +276,4 @@ private:
     int label_count = 0;
 };
 
-} // namespace GxmRenderer::Usse::Ir
+} // namespace SgxdRenderer::Usse::Ir

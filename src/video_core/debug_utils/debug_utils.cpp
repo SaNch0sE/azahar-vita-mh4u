@@ -18,7 +18,7 @@
 #include "video_core/gpu.h"
 #include "video_core/pica/regs_shader.h"
 #include "video_core/pica/shader_setup.h"
-#include "video_core/renderer_base.h"
+#include "video_core/renderer_sgxd/renderer_sgxd.h"
 
 using nihstro::DVLBHeader;
 using nihstro::DVLEHeader;
@@ -32,7 +32,7 @@ void DebugContext::DoOnEvent(Event event, const void* data) {
 
         // Commit the rasterizer's caches so framebuffers, render targets, etc. will show on debug
         // widgets
-        Core::System::GetInstance().GPU().Renderer().Rasterizer()->FlushAll();
+        Core::System::GetInstance().GPU().Renderer().Rasterizer().FlushAll();
 
         // TODO: Should stop the CPU thread here once we multithread emulation.
 

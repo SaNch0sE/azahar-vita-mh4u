@@ -10,8 +10,6 @@
 
 namespace VideoCore {
 
-DiskResourceLoadCallback RasterizerInterface::switch_disk_resources_callback{};
-
 using Pica::f24;
 
 static Common::Vec4f ColorRGBA8(const u32 color) {

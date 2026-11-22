@@ -20,24 +20,16 @@
 #include "video_core/gpu_impl.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_lcd.h"
-#include "video_core/renderer_base.h"
-#ifdef ENABLE_GXM
 #include "video_core/renderer_sgxd/vprof.h"
 #include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/renderer_sgxd.h"
-#endif
 #ifdef VITA_DIAGNOSTICS
 #include "video_core/renderer_sgxd/vprof_replay.h"
 #endif
 #include "video_core/right_eye_disabler.h"
-#include "video_core/video_core.h"
-#ifdef ENABLE_GXM
 #include "video_core/renderer_sgxd/sgxd_flags.h"
 #define GPU_TRACE(...) SgxdRenderer::SgxdTrace(__VA_ARGS__)
-#else
-#define GPU_TRACE(...) ((void)0)
-#endif
 
 namespace VideoCore {
 
@@ -120,41 +112,30 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
     Service::GSP::InterruptHandler pica_interrupt = [this](Service::GSP::InterruptId id,
                                                            u64 delay_ns) { Signal(id, delay_ns); };
     impl->pica.SetInterruptHandler(pica_interrupt);
-#ifdef ENABLE_GXM
     // The renderer's rasterizer runs on the render thread, from its copy of the PICA's state;
     // the PICA here calls the thread, which queues.
-    auto* const gxm = dynamic_cast<GxmRenderer::RendererGxm*>(impl->renderer.get());
-    ASSERT_MSG(gxm != nullptr, "GPU: the render thread needs the GXM renderer");
     impl->render = std::make_unique<SgxdRenderer::RenderThread>(
         impl->pica, impl->parse_pica, impl->render_pica, *gxm,
         *static_cast<GxmRenderer::RasterizerGxm*>(gxm->Rasterizer()), impl->memory);
     impl->rasterizer = impl->render.get();
-#endif
 
     // Bind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
 }
 
 GPU::~GPU() {
-#ifdef ENABLE_GXM
     // Before the lock it uses goes, and the renderer it runs.
     impl->render.reset();
-#endif
 }
 
 GPU::RenderHold::RenderHold(GPU& gpu_) : gpu{gpu_} {
-#ifdef ENABLE_GXM
     gpu.impl->render->Hold();
-#endif
 }
 
 GPU::RenderHold::~RenderHold() {
-#ifdef ENABLE_GXM
     gpu.impl->render->Release();
-#endif
 }
 
-#ifdef ENABLE_GXM
 SgxdRenderer::RenderThread& GPU::GetRenderThread() {
     return *impl->render;
 }
@@ -173,7 +154,6 @@ void GPU::SyncCaptureHold() {
         capture_hold = false;
     }
 }
-#endif
 
 void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op) {
 #ifndef VITA_DIAGNOSTICS
@@ -197,10 +177,8 @@ void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op
 #endif
     // GPU work the op held back starts now (the last pass's 3D, when a transfer waits on it).
     impl->rasterizer->GpuIdle();
-#ifdef ENABLE_GXM
     // The pages the op's work reads and writes, held before the guest runs again.
     impl->render->ApplyPageHolds();
-#endif
 }
 
 void GPU::Signal(Service::GSP::InterruptId id, u64 delay_ns) {
@@ -218,14 +196,11 @@ void GPU::Signal(Service::GSP::InterruptId id, u64 delay_ns) {
 }
 
 void GPU::DeliverInterrupts() {
-#ifdef ENABLE_GXM
     impl->render->PollHeld();
     impl->render->ReleasePageHolds();
-#endif
 }
 
 void GPU::EnablePageHolds() {
-#ifdef ENABLE_GXM
     auto& render = *impl->render;
     render.EnablePageHolds();
     impl->memory.SetHostGuard({
@@ -235,16 +210,11 @@ void GPU::EnablePageHolds() {
         },
         [this](const u8* host, u32 size) { impl->render->HostRemapped(host, size); },
     });
-#endif
 }
 
 bool GPU::GuestStoreMissesHolds([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
                                 [[maybe_unused]] u32& ticket) {
-#ifdef ENABLE_GXM
     return impl->render->StoreMissesHolds(host, size, ticket);
-#else
-    return false;
-#endif
 }
 
 void GPU::GuestStoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi,
@@ -262,11 +232,7 @@ const u32* GPU::PageHoldsGeneration() const {
 
 bool GPU::GuestReadMissesWrites([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
                                 [[maybe_unused]] u32& write_ticket) {
-#ifdef ENABLE_GXM
     return impl->render->ReadMissesWrites(host, size, write_ticket);
-#else
-    return false;
-#endif
 }
 
 bool GPU::GuestOpensHeldPage([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
@@ -276,20 +242,12 @@ bool GPU::GuestOpensHeldPage([[maybe_unused]] const u8* host, [[maybe_unused]] u
 
 bool GPU::GuestOpensDisplayPage([[maybe_unused]] const u8* host, [[maybe_unused]] bool write,
                                 [[maybe_unused]] u32 reach) {
-#ifdef ENABLE_GXM
     return impl->render->OpensDisplayPage(host, write, reach);
-#else
-    return false;
-#endif
 }
 
 bool GPU::GuestAbort([[maybe_unused]] const u8* host, [[maybe_unused]] bool write,
                      [[maybe_unused]] u32 guest_pc, [[maybe_unused]] u32 guest_va) {
-#ifdef ENABLE_GXM
     return impl->render->PageFault(host, write, guest_pc, guest_va);
-#else
-    return false;
-#endif
 }
 
 #ifdef VITA_DIAGNOSTICS
@@ -380,7 +338,6 @@ void GPU::FlushAndInvalidateRegion(PAddr addr, u32 size) {
 }
 
 void GPU::ScreensWritten([[maybe_unused]] PAddr addr, [[maybe_unused]] u32 size) {
-#ifdef ENABLE_GXM
     // The LCD scans 400 columns on the top screen, 320 on the bottom (as VBlankCallback).
     for (u32 i = 0; i < 2; i++) {
         const Pica::FramebufferConfig& f = impl->pica.regs.framebuffer_config[i];
@@ -389,7 +346,6 @@ void GPU::ScreensWritten([[maybe_unused]] PAddr addr, [[maybe_unused]] u32 size)
             impl->screens_changed = true;
         }
     }
-#endif
 }
 
 void GPU::SwitchDiskResources(u64 title_id) {
@@ -475,14 +431,12 @@ Result GPU::Execute(const Service::GSP::Command& command) {
             cmdbuffer.addr[0].Assign(address >> 3);
             cmdbuffer.size[0].Assign(size >> 3);
             cmdbuffer.trigger[0] = 1;
-#ifdef ENABLE_GXM
             // The render thread's PicaCore takes them too, in order with the lists.
             for (const u32 id : {PICA_REG_INDEX(pipeline.command_buffer.addr[0]),
                                  PICA_REG_INDEX(pipeline.command_buffer.size[0]),
                                  PICA_REG_INDEX(pipeline.command_buffer.trigger[0])}) {
                 impl->render->RegWrite(id, regs.internal.reg_array[id]);
             }
-#endif
 
             // Trigger processing of the command list
             SubmitCmdList(0);
@@ -616,10 +570,8 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     framebuffer.stride = info.stride;
     framebuffer.format = (framebuffer.format & 0xFFFF0000) | (info.format & 0xFFFF);
     framebuffer.active_fb = info.shown_fb & 0xFF;
-#ifdef ENABLE_GXM
     // The guest's frame, even to the buffer already shown: written again.
     impl->screens_changed = true;
-#endif
     // vprof: the swap as the register writes it is.
     if (SgxdRenderer::Vprof::Recording()) {
         const u32 first = GPU_REG_INDEX(framebuffer_config[0]) +
@@ -688,10 +640,8 @@ void GPU::WriteReg(VAddr addr, u32 data) {
             // An op like the GSP's commands, numbered with them in a vprof recording.
             RunGpuOp(OpKind::RegWrite, [this, index, data] {
                 impl->pica.regs.reg_array[index] = data;
-#ifdef ENABLE_GXM
                 // The render thread's PicaCore takes it too, in order with the lists.
                 impl->render->RegWrite(index - static_cast<u32>(GPU_REG_INDEX(internal)), data);
-#endif
                 if (index == GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[0])) {
                     SubmitCmdList(0);
                 } else if (index == GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[1])) {
@@ -723,8 +673,12 @@ void GPU::WriteReg(VAddr addr, u32 data) {
     }
 }
 
-VideoCore::RendererBase& GPU::Renderer() {
+SgxdRenderer::RendererSgxd& GPU::Renderer() {
     return *impl->renderer;
+}
+
+void GPU::UpdateFramebufferLayout() {
+    impl->renderer->UpdateCurrentFramebufferLayout();
 }
 
 Pica::PicaCore& GPU::PicaCore() {
@@ -756,11 +710,7 @@ void GPU::ApplyPerProgramSettings(u64 program_ID) {
             break;
         }
     }
-#ifdef ENABLE_GXM
     impl->render->SetRendererAccurateMul(use_accurate_mul);
-#else
-    impl->rasterizer->SetAccurateMul(use_accurate_mul);
-#endif
 }
 
 void GPU::SubmitCmdList(u32 index) {
@@ -787,7 +737,6 @@ void GPU::SubmitCmdList(u32 index) {
     }
 
     const bool ignore = !right_eye_disabler->ShouldAllowCmdQueueTrigger(addr, size);
-#ifdef ENABLE_GXM
     // Scanned here, parsed on the render thread (RenderThread::SubmitCmdList); P3D once the list
     // is queued, so its fence's ticket covers the list's work.
     std::vector<u64> irqs;
@@ -795,14 +744,9 @@ void GPU::SubmitCmdList(u32 index) {
     for (const u64 delay_ns : irqs) {
         Signal(Service::GSP::InterruptId::P3D, delay_ns);
     }
-#else
-    impl->pica.ProcessCmdList(addr, size, ignore);
-#endif
     config.trigger[index] = 0;
-#ifdef ENABLE_GXM
     const u32 trigger = PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + index;
     impl->render->RegWrite(trigger, impl->pica.regs.internal.reg_array[trigger]);
-#endif
 }
 
 void GPU::MemoryFill(u32 index, std::optional<Service::GSP::InterruptId> interrupt) {
@@ -947,7 +891,7 @@ void GPU::VprofReplay(const std::string& capture, const std::string& first) {
                                                             regs.framebuffer_config[1]};
             const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
                                                       impl->pica.regs_lcd.color_fill_bottom};
-            // PresentFrame waits for the flip. RendererBase::EndFrame is left out: its frame
+            // PresentFrame waits for the flip. RendererSgxd::EndFrame is left out: its frame
             // limiter and PerfStats belong to a running guest, and the player has neither.
             impl->renderer->PresentFrame(fb, fill);
             impl->rasterizer->GpuIdle();
@@ -1024,9 +968,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     GPU_TRACE("vblank");
     // vprof: a recorded frame starts with the PICA's state.
     const bool frame_starts = SgxdRenderer::Vprof::VBlank();
-#ifdef ENABLE_GXM
     SyncCaptureHold();
-#endif
     if (frame_starts) {
         RunGpuOp(OpKind::RegWrite, [this] {
             // The capture records the lists' state, the render thread's (held here), with the
@@ -1085,7 +1027,6 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                                                     regs.framebuffer_config[1]};
     const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
                                               impl->pica.regs_lcd.color_fill_bottom};
-#ifdef ENABLE_GXM
     // On the render thread, after the work before it; it drops one too soon after the last.
     // The rasterizer's frame ends here whether or not the present is shown. Nothing new on the
     // guest's screens and none in the window's overlay: no present (Impl::screens_changed).
@@ -1114,17 +1055,6 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         impl->render->InterruptWait(impl->vblank_ticket);
     }
 #endif
-#else
-    // A present has no guest-visible effect: well past the display's rate it is dropped. 12 ms,
-    // not a frame's 16.7: at 100% the guest's VBlanks jitter around the frame, and a frame's cap
-    // dropped a quarter of them.
-    const auto now = std::chrono::steady_clock::now();
-    if (now - impl->last_present >= std::chrono::microseconds(12000)) {
-        impl->last_present = now;
-        impl->renderer->PresentFrame(fb, fill);
-        impl->rasterizer->GpuIdle();
-    }
-#endif
     // The frame limiter and the window's events stay on this thread.
     impl->renderer->EndFrame();
 
@@ -1134,21 +1064,17 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 
 template <class Archive>
 void GPU::serialize(Archive& ar, const u32 file_version) {
-#ifdef ENABLE_GXM
     // The lists' state is the render thread's PicaCore's (RenderThread::SubmitCmdList): saved
     // from it, loaded into it.
     if constexpr (Archive::is_saving::value) {
         impl->render->GiveWholeState();
     }
-#endif
     ar & impl->pica;
-#ifdef ENABLE_GXM
     if constexpr (Archive::is_loading::value) {
         impl->render->TakeWholeState();
     }
     // A loaded state's screens are in the memory it loaded.
     impl->screens_changed = true;
-#endif
 }
 
 SERIALIZE_IMPL(GPU)
