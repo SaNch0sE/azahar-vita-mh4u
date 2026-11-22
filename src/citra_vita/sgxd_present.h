@@ -45,6 +45,9 @@ struct Batch {
     u32 max_vertices, max_indices, max_draws;
 };
 
+/// Whether the last frame's render is still on the GPU: the caller drops this frame rather
+/// than wait for it (BeginFrame would).
+[[nodiscard]] bool Busy();
 void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b);
 /// The frame being built; valid between BeginFrame and EndFrame.
 [[nodiscard]] Batch& CurrentBatch();

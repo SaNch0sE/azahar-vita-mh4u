@@ -9,10 +9,7 @@
 #include <utility>
 #include <vector>
 #include "common/common_types.h"
-
-namespace Pica {
-struct OutputVertex;
-}
+#include "video_core/pica/output_vertex.h"
 
 namespace Pica {
 struct DisplayTransferConfig;
@@ -73,18 +70,69 @@ public:
         return false;
     }
 
+    /// Copies size bytes from src to dst, both physically contiguous, on the GPU (GSP's
+    /// RequestDma, split into physical runs)
+    virtual bool AccelerateDma([[maybe_unused]] PAddr src, [[maybe_unused]] PAddr dst,
+                               [[maybe_unused]] u32 size) {
+        return false;
+    }
+
     /// Attempt to draw using hardware shaders
     virtual bool AccelerateDrawBatch([[maybe_unused]] bool is_indexed) {
         return false;
     }
 
+    /// Immediate mode: one vertex's input attributes, as the PICA formed them. Returning true
+    /// takes the vertex off the CPU vertex path; the rasterizer draws the vertices it collected
+    /// at FlushImmediate.
+    virtual bool AccelerateImmediateVertex([[maybe_unused]] const Pica::AttributeBuffer& input) {
+        return false;
+    }
+
+    /// Draws the immediate-mode vertices collected since the last flush. The PICA calls it
+    /// before any register write that is not immediate-mode data.
+    virtual void FlushImmediate() {}
+
     /// The PICA is about to raise P3D. From then on the guest may overwrite the vertex and
     /// index buffers of the draws before it.
     virtual void NotifyP3D() {}
 
-    /// From the emulation thread: the guest ranges the GPU read from memory the CPU caches
-    /// since the last call (vertex and index buffers), as (address, size). The GPU hands them
-    /// to KeepUncached, so that a buffer drawn from each frame is not cleaned each frame.
+    /// A point in the GPU work the rasterizer submitted, which a posted interrupt waits for
+    /// (GPU::PostToEmulation). Counts compare with wrap-around; a false flag skips its count.
+    struct GpuFence {
+        bool twod{};      // the PTLA ops (fills, DMA) up to twod_count
+        bool ta{};        // the renders up to render_count, their TA only (vertices read)
+        bool render{};    // the renders up to render_count, complete
+        u32 twod_count{};
+        u32 render_count{};
+
+        [[nodiscard]] bool Any() const {
+            return twod || ta || render;
+        }
+    };
+    /// Everything submitted so far. The GPU runs it after the call returns.
+    virtual GpuFence GpuFenceAll() const {
+        return {};
+    }
+    /// The renders submitted so far up to their TA: after it, the guest may overwrite their
+    /// vertex and index buffers (P3D).
+    virtual GpuFence GpuFenceVertices() const {
+        return {};
+    }
+    /// A display transfer's completion (PPF): GpuFenceAll, or less where the renderer knows the
+    /// guest will not touch the output before it is written.
+    virtual GpuFence GpuFenceTransfer() const {
+        return GpuFenceAll();
+    }
+    /// The render thread's time spent waiting for the GPU so far, in microseconds (diagnostics
+    /// builds; 0 otherwise).
+    virtual u64 GpuWaitUs() const {
+        return 0;
+    }
+
+    /// The guest ranges the GPU read from memory the CPU caches since the last call (vertex
+    /// and index buffers), as (address, size). The GPU hands them to KeepUncached, so that a
+    /// buffer drawn from each frame is not cleaned each frame.
     virtual std::vector<std::pair<PAddr, u32>> TakeCachedReads() {
         return {};
     }

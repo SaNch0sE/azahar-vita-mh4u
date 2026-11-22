@@ -57,7 +57,6 @@ struct Options {
     bool deterministic = false;
     bool unlimited = false;
     bool software = false;
-    bool gxm = false;
     int loadstate_slot = -1;
     std::string log_filter = "*:Info";
 };
@@ -72,10 +71,6 @@ void PrintUsage(const char* program) {
         "      --interpreter       Run guest code on the dyncom interpreter\n"
         "      --no-shader-jit     Interpret PICA vertex shaders instead of JITing them\n"
         "      --no-hw-shader      Run GL's vertex shaders on the CPU, not the host GPU\n"
-#ifdef ENABLE_GXM_STUB
-        "      --gxm               The Vita's GXM renderer on a stub libgxm: no picture, for\n"
-        "                          profiling its CPU work (AZAHAR_GXM_FLAGS holds gxm_flags)\n"
-#endif
         "  -o, --screenshot PATH   Write the final frame to PATH as a PPM image\n"
         "  -l, --log-filter SPEC   Logging filter, e.g. \"*:Debug\" (default \"*:Info\")\n"
         "  -p, --input-port PORT   Listen on 127.0.0.1:PORT for input commands\n"
@@ -162,8 +157,6 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.no_hw_shader = true;
         } else if (argument == "--software") {
             options.software = true;
-        } else if (argument == "--gxm") {
-            options.gxm = true;
         } else if (argument == "--loadstate") {
             const char* value = next("--loadstate");
             if (value == nullptr) {
@@ -274,16 +267,8 @@ int main(int argc, char** argv) {
         Settings::values.use_hw_shader = false;
         LOG_INFO(Frontend, "GL vertex shaders: software (hw shaders disabled)");
     }
-    EmuWindow_SDL2 window(system, options.software || options.gxm);
-    if (options.gxm) {
-#ifdef ENABLE_GXM_STUB
-        Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
-        LOG_INFO(Frontend, "Using the GXM renderer on the stub libgxm: nothing is presented");
-#else
-        LOG_CRITICAL(Frontend, "--gxm needs a build with ENABLE_GXM_STUB");
-        return 1;
-#endif
-    } else if (options.software) {
+    EmuWindow_SDL2 window(system, options.software);
+    if (options.software) {
         Settings::values.graphics_api = Settings::GraphicsAPI::Software;
         LOG_INFO(Frontend, "Using the software renderer");
     } else if (window.UsingOpenGL()) {

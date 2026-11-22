@@ -127,7 +127,7 @@ if (ENABLE_GXM)
             renderer_gxm/renderer_gxm.h
             renderer_gxm/sgxd_backend.cpp
             renderer_gxm/sgxd_backend.h
-            # sgxd's plain C pieces the rasterizer builds its passes with (the host build too).
+            # sgxd's plain C pieces the rasterizer builds its passes with.
             ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_program.c
             ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_recipe.c
     )
@@ -141,33 +141,14 @@ if (ENABLE_GXM)
         ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_recipe.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON
         COMPILE_OPTIONS "-Wno-error")
     # libgxm only: every program comes from the USSE emitters, nothing compiles on the console.
-    if (ENABLE_GXM_STUB)
-        if (NOT DEFINED ENV{VITASDK})
-            set(ENV{VITASDK} /usr/local/vitasdk)
-        endif ()
-        target_sources(video_core PRIVATE
-                renderer_gxm/gxm_stub/gxm_stub.cpp
-        )
-        # Only gxm.h and what it includes: the vitasdk's include root also carries newlib's
-        # libc headers, which shadow the host's. Staged into the build tree at configure time.
-        set(_gxm_hdr_root ${CMAKE_CURRENT_BINARY_DIR}/vitasdk-gxm-headers)
-        foreach (_hdr IN ITEMS psp2/gxm.h psp2/types.h psp2common/types.h vitasdk/build_utils.h)
-            configure_file($ENV{VITASDK}/arm-vita-eabi/include/${_hdr} ${_gxm_hdr_root}/${_hdr} COPYONLY)
-        endforeach ()
-        target_include_directories(video_core PUBLIC ${_gxm_hdr_root})
-        target_compile_definitions(video_core PUBLIC ENABLE_GXM ENABLE_GXM_STUB)
-        # vitasdk's gxm.h ORs enums of different types in its own constants.
-        target_compile_options(video_core PUBLIC -Wno-deprecated-enum-enum-conversion)
-    else ()
-        target_include_directories(video_core PRIVATE $ENV{VITASDK}/arm-vita-eabi/include)
-        target_link_libraries(video_core PRIVATE SceGxm_stub)
-        # sgxd's user-side pieces that submit: the PTLA and the session (the frontend's
-        # presenter uses the session and the recipe from here too).
-        target_sources(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
-                                          ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c)
-        set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
-            ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
-    endif ()
+    target_include_directories(video_core PRIVATE $ENV{VITASDK}/arm-vita-eabi/include)
+    target_link_libraries(video_core PRIVATE SceGxm_stub)
+    # sgxd's user-side pieces that submit: the PTLA and the session (the frontend's
+    # presenter uses the session and the recipe from here too).
+    target_sources(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
+                                      ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c)
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
+        ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif ()
 
 if (ENABLE_SOFTWARE_RENDERER)

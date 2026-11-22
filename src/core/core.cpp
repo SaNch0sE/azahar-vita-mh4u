@@ -245,6 +245,10 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         }
         if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
             LOG_TRACE(Core_ARM11, "Core {} idling", current_core_to_execute->GetID());
+#ifdef ENABLE_GXM
+            SgxdRenderer::SgxdTrace("idle", static_cast<unsigned>(
+                                              current_core_to_execute->GetTimer().GetDowncount()));
+#endif
             current_core_to_execute->GetTimer().Idle();
             PrepareReschedule();
         } else {
@@ -279,6 +283,10 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             // instead advance to the next event and try to yield to the next thread
             if (kernel->GetCurrentThreadManager().GetCurrentThread() == nullptr) {
                 LOG_TRACE(Core_ARM11, "Core {} idling", cpu_core->GetID());
+#ifdef ENABLE_GXM
+                SgxdRenderer::SgxdTrace("idle",
+                                      static_cast<unsigned>(cpu_core->GetTimer().GetDowncount()));
+#endif
                 cpu_core->GetTimer().Idle();
                 PrepareReschedule();
             } else {

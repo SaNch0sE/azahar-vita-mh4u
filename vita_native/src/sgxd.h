@@ -52,8 +52,27 @@ typedef struct SgxdOp {
 #define SGXD_OP_DELAY 2u
 #define SGXD_OP_WRITE 3u
 #define SGXD_OP_POLL 4u   // until (reg & mask) == value; a timeout stops the list there
+// Until SgxdEvents.twod has reached value (sgxdEvents): the ISR's count of PTLA completions.
+// timeout_us at most 1 s; a timeout stops the list there, value then the count last read.
+#define SGXD_OP_WAIT_TWOD 5u
+// sgxdSubmitAsync only. WAIT_EVENT: until MASTER_EVENT_STATUS has a bit of mask (TA_FINISHED
+// 0x2000 or PIXELBE_END_RENDER 0x40000); the list parks there with the bit enabled in
+// MASTER_EVENT_HOST_ENABLE, IRQ 52 runs the rest, and the bit is cleared through 0x4134.
+// WAIT_TWOD parks the same way until the PTLA count reaches value. SIGNAL counts in the events
+// page (value SGXD_SIGNAL_*); STAMP stores the system time in stamp[value & 3] and logs it,
+// with value, in stamp_log (version 6).
+#define SGXD_OP_WAIT_EVENT 6u
+#define SGXD_OP_SIGNAL 7u
+#define SGXD_OP_STAMP 8u
+#define SGXD_SIGNAL_TA 0u      // SgxdEvents.chain_ta: the render's vertices are read
+#define SGXD_SIGNAL_DONE 1u    // SgxdEvents.chains: the list is complete
 #define SGXD_MAX_OPS 256u
+#define SGXD_MAX_CHAIN_OPS 1024u
+// sgxdSubmitAsync's queue (version 6): lists of up to SGXD_MAX_CHAIN_OPS ops, this many in all.
+#define SGXD_CHAIN_RING 8192u
 #define SGXD_MAX_POLL_US 1000000u
+// SgxdEvents.stamp_log's entries: the last STAMP ops, so queued lists do not lose each other's.
+#define SGXD_STAMP_LOG 64u
 
 // sgxdMap: the app's pages into the GPU's address space, 4 KiB pages, one directory for every
 // requestor. A GPU address's PTE is the page's physical address | flags | VALID. sgxdMap and
@@ -80,7 +99,33 @@ typedef struct SgxdOp {
 #define SGXD_DUMP_BANK_REGS 266u
 #define SGXD_DUMP_CORE_REGS 399u
 
-#define SGXD_VERSION 3
+#define SGXD_VERSION 6
+
+// sgxdEvents (version 4): the SGX's host interrupt (GIC 0x34, SceGpu's "SceGpuLisr" otherwise)
+// is sgxd's while the app has registered this page; the ISR updates it, so any thread of the
+// app sees a GPU completion with a plain load. Only TWOD_COMPLETE is enabled
+// (MASTER_EVENT_HOST_ENABLE bit 27): for each, the ISR clears it, writes the SLC back and
+// empties it (as a PTLA op's own list did), then counts it.
+typedef struct SgxdEvents {
+    volatile uint32_t twod;          // TWOD_COMPLETE interrupts handled, the SLC done
+    volatile uint32_t irqs;          // interrupts taken
+    volatile uint32_t unexpected;    // MASTER_EVENT_STATUS bits seen in an interrupt that was not ours
+    volatile uint32_t slc_timeouts;  // SLC write-backs or invalidates in the ISR that gave up
+    volatile uint32_t slc_us_max;    // the longest SLC write-back and invalidate in the ISR
+    volatile uint32_t slc_us_total;
+    volatile uint32_t ta;            // TA_FINISHED interrupts (master bit 13)
+    volatile uint32_t d3;            // PIXELBE_END_RENDER interrupts (master bit 18)
+    volatile uint32_t chain_ta;      // SGXD_SIGNAL_TA ops run (sgxdSubmitAsync)
+    volatile uint32_t chains;        // SGXD_SIGNAL_DONE ops run
+    volatile uint32_t chain_fault;   // 0, or 1 + the index of the op an async list stopped at
+    volatile uint32_t chain_value;   // the last READ's value, or the stopped poll's last read
+    volatile uint32_t stamp[4];      // STAMP ops' system times (microseconds)
+    volatile uint32_t chain_isr_us_max;  // the longest stretch of an async list run by the ISR
+    // Version 6: STAMP ops run; the op numbered n (from 0) is stamp_log[n % SGXD_STAMP_LOG],
+    // {system time, value}, written before the count moves past it.
+    volatile uint32_t stamps;
+    volatile uint32_t stamp_log[SGXD_STAMP_LOG][2];
+} SgxdEvents;
 
 // sgxdFaultDump: header word 2 of the dump sgxdSubmit takes itself when a poll times out.
 #define SGXD_DUMP_FAULT 0x544c5546u   // "FULT"
@@ -119,6 +164,18 @@ int sgxdFaultDump(uint32_t *words, uint32_t count);
 // sgxdReadRegs: count consecutive registers from reg (4-byte aligned, the master bank and the
 // four cores' banks, below 0x18000), at most SGXD_MAX_READ_REGS. Returns count.
 int sgxdReadRegs(uint32_t reg, uint32_t count, uint32_t *words);
+// sgxdEvents (version 4): events is the app's own SgxdEvents, zeroed; NULL gives the interrupt
+// back to SceGpu's handler (so does the release, a suspend or the owner's exit).
+int sgxdEvents(SgxdEvents *events);
+// sgxdSubmitAsync (version 6): queues ops behind the lists queued before (SGXD_CHAIN_RING ops
+// in all) and returns the index of its first op in the queue's free-running count (31 bits), or
+// AZAHAR_ERR_FULL while there is no room. A list runs when the one before has ended: as
+// sgxdSubmit does until a WAIT_EVENT or WAIT_TWOD that is not met yet, then from IRQ 52.
+// Needs sgxdEvents. sgxdSubmit refuses while the queue runs. A POLL that times out stops the
+// queue (chain_fault is 1 + the op's index, and the fault dump sgxdFaultDump returns);
+// sgxdSubmitAsync then refuses with AZAHAR_ERR_STATE. NULL stops the queue where it waits, takes
+// the fault dump there, drops what is queued, and returns 1 + the op's index (0: none ran).
+int sgxdSubmitAsync(const SgxdOp *ops, uint32_t count);
 // sgxdTranslate: the GPU's view of gpu_va: out[0] its directory entry, out[1] its page table
 // entry (0 where no page table covers it). A PTE is the page's physical address | flags | VALID.
 int sgxdTranslate(uint32_t gpu_va, uint32_t out[2]);

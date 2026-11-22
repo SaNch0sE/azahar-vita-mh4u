@@ -611,6 +611,23 @@ void Encoder::PackS16(Reg dst, Reg src, uint8_t comp, Pred pred) {
     }), 54, ReadsOne(src, comp), 0);
 }
 
+void Encoder::UnpackU8(Reg dst, Reg src, uint8_t byte) {
+    dst = Map(dst);
+    src = Map(src);
+    if (byte > 3 || (src.n & 1) || src.bank == Bank::Internal || src.bank == Bank::Const) {
+        Fail("usse: a U8 unpack reads bytes 0-3 of an even unified-store register");
+    }
+    const auto [db, dext] = DestBank(dst.bank);
+    const auto [sb, sext] = Src12Bank(src.bank);
+    Push(Pack(PatVpck, {
+        {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'u', 0}, {'y', 0}, {'d', dext},
+        {'e', 0}, {'r', sext}, {'c', 0}, {'a', 0}, {'f', 0}, {'t', 6}, {'m', 1}, {'b', db},
+        {'k', sb}, {'l', 0}, {'g', SingleNum(dst, 7)}, {'o', 3}, {'h', 0}, {'i', 1}, {'j', 2},
+        {'q', DoubledNum(src, 7)}, {'v', 0}, {'w', static_cast<uint64_t>(byte >> 1)},
+        {'x', static_cast<uint64_t>(byte & 1)},
+    }), 54, 0, 0);
+}
+
 void Encoder::Phas(bool wait_all) {
     Push(wait_all ? 0xfa44070000000000ull : 0xfa44010000000000ull, 0, 0, 0);
 }

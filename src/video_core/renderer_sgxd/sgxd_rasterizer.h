@@ -12,6 +12,7 @@
 #include "video_core/renderer_gxm/guest_gpu_memory.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
+#include "video_core/shader/generator/profile.h"
 
 namespace Pica {
 class PicaCore;
@@ -34,6 +35,10 @@ namespace GxmRenderer {
  * again after it), something needs the picture (the display transfer) or another target is
  * drawn to. A pass starts from what a memory fill left pending on
  * its colour and depth buffers; loading a buffer's earlier picture is not built.
+ *
+ * Immediate-mode vertices reach the GPU too: the PICA hands over each vertex's raw attributes
+ * (AccelerateImmediateVertex) and the batch is drawn with the USSE vertex program at the next
+ * register write that is not immediate data, or before any other operation.
  */
 class RasterizerSgxd : public VideoCore::RasterizerAccelerated {
 public:
@@ -52,6 +57,7 @@ public:
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
+    bool AccelerateDma(PAddr src, PAddr dst, u32 size) override;
     /// The GPU's MMU onto the pages a page move or return put under the CPU's views. Returns the fence
     /// the work queued with it is done by.
     u32 RemapMoved(const u32* pte_va, const u32* pte, u32 count);
@@ -64,7 +70,15 @@ public:
         backend.RenderWait(fence, "a moved page's pool page");
     }
     bool AccelerateDrawBatch(bool is_indexed) override;
+    bool AccelerateImmediateVertex(const Pica::AttributeBuffer& input) override;
+    void FlushImmediate() override;
     void NotifyP3D() override;
+    GpuFence GpuFenceAll() const override;
+    GpuFence GpuFenceVertices() const override;
+    GpuFence GpuFenceTransfer() const override;
+    bool GpuFenceReached(const GpuFence& fence) const override;
+    u64 GpuWaitUs() const override;
+#endif
     std::vector<std::pair<PAddr, u32>> TakeCachedReads() override;
 
 private:
@@ -100,9 +114,21 @@ private:
         u32 secondary_doutu0;
     };
 
+    /// Where a fragment uniform's value is in FSUniformData: `count` elements of `components` values,
+    /// `stride` bytes apart, into the SA block at `sa` (elements four floats apart).
+    struct UniformSource {
+        u32 sa;
+        u16 offset;
+        u8 components;
+        u8 count;
+        u8 stride;
+        bool is_int;
+    };
+
     /// A fragment program with its blend, placed, and its pixel primary PDS (which holds no
     /// address but the code's, so one serves every draw).
     struct FragmentProgram {
+        std::vector<UniformSource> uniforms;
         Usse::GxpProgram gxp;
         u32 primary_doutu0;
         u32 secondary_doutu0;
@@ -116,11 +142,16 @@ private:
     bool TakeClear(PAddr start, PAddr end, ClearedRange& out);
     Surface& SurfaceFor(PAddr addr, u32 width, u32 height);
     void EndPass(const char* why);
+    /// A draw of the loaders' vertices, or of the immediate-mode batch (`count` vertices of
+    /// `immediate_attributes` x 4 floats).
+    bool Draw(bool is_indexed, const float* immediate, u32 count);
 
     /// `u8_regs`: the input registers an UNSIGNED_BYTE loader feeds.
     const VertexProgram& VertexProgramFor(u16 default_regs,
                                           const std::array<u8, 16>& reg_components, u16 u8_regs);
     const FragmentProgram& FragmentProgramFor(u64 blend);
+    /// The lighting and fog LUTs the guest changed into fresh rows, fs_data's offsets pointed at them.
+    void SyncLutLf();
     /// The same for the proctex colour map, alpha map, colour and colour-difference tables.
     void SyncLutProcTex();
 
@@ -139,11 +170,31 @@ private:
     std::unordered_map<u64, u16> used_bools;
     std::unordered_map<u64, FragmentProgram> fragment_programs;
 
+    // Immediate-mode vertices not drawn yet, four floats an attribute. One ImmDraw block is one draw.
+    std::vector<float> immediate_vertices;
+    u32 immediate_attributes{};
+
+    // The LUT rows: a ring, each row stamped with the pass that wrote it (a pass samples at its end,
+    // so a row is never rewritten in its own pass).
+    u32 lut_row{};
+    std::array<u32, Pica::Shader::LUT_LF_ROWS> lut_row_pass{};
+    bool lut_rows_ready{};
+    // The proctex rows (LutRgRows, LutRgbaRows), two rings kept the same way.
+    u32 lut_rg_row{};
+    u32 lut_rgba_row{};
+    std::array<u32, Pica::Shader::LUT_RG_ROWS> lut_rg_row_pass{};
+    std::array<u32, Pica::Shader::LUT_RGBA_ROWS> lut_rgba_row_pass{};
+    /// The LUT rings' halves in use, and each half's pass mark when it was left.
+    u32 lut_half{}, proctex_half{};
+    std::array<u32, 2> lut_half_mark{}, proctex_half_mark{};
+
     std::size_t pass_surface{}; // into surfaces, while the backend is in a pass
     PAddr pass_depth{};
     bool pass_depth_cleared{};
+    u32 pass_depth_bytes{4}; // 2, 3 or 4, the depth format's
 
     u32 fills{};
+    u32 dmas{};
     u32 draws{};
     u32 gs_draws{};
     u32 passes{};

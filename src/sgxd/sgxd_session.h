@@ -69,6 +69,21 @@ typedef struct SgxdSessionRender {
 // One render of the recipe as it is staged: the TA kick, wait and done, then the 3D's. The 3D's
 // done phase flushes the SLC, so the frame is in memory when it returns (the display reads
 // memory, not the SLC).
+// Renders sgxd_session_render has completed since the app started.
+uint32_t sgxd_session_renders(void);
+
+// sgxd_session_render as one async list (sgxd_chain_submit, needs sgxd_ptla_events): the SLC
+// invalidate, the TA kick, then from IRQ 52 the TA's done phase, the 3D kick and done. It is
+// queued in the kernel behind the lists and PTLA ops sent so far, and returns at once. The
+// list's fence is sgxd_chain_fence() afterwards: sgxd_chain_ta_reached(fence) when the TA has
+// read the vertices, sgxd_chain_reached(fence) when the frame is in memory.
+int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
+                              unsigned failed_size);
+// After the last async render completed: its TA and 3D times (the ISR's stamps) and pages.
+void sgxd_session_render_async_result(SgxdSessionRender *render);
+// After a chain wait failed: stops the queue and describes the op it stopped at.
+void sgxd_session_render_async_failed(char *failed, unsigned failed_size);
+
 int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *failed,
                         unsigned failed_size);
 

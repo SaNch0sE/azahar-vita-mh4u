@@ -152,12 +152,6 @@ if (VITA)
     # (it includes a <sys/termios.h> the sysroot does not ship). Asio has a switch for exactly
     # this rather than needing a terminal API invented for it.
     add_compile_definitions(BOOST_ASIO_DISABLE_SERIAL_PORT)
-else()
-    # ENABLE_GXM_STUB: build the GXM renderer against a libgxm with no GPU behind it
-    # (renderer_gxm/gxm_stub), so its CPU work can be profiled on a Linux host with symbols.
-    # Needs the vitasdk headers (VITASDK, default /usr/local/vitasdk). Nothing is presented.
-    option(ENABLE_GXM_STUB "GXM renderer on a stub libgxm, for profiling off the console" OFF)
-    set(ENABLE_GXM ${ENABLE_GXM_STUB})
 endif()
 
 # Track which options were explicitly set by the user (for libretro conflict detection)

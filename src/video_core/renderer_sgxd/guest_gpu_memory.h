@@ -25,10 +25,10 @@ namespace SgxdRenderer {
 
 /**
  * Guest memory in the GPU's address space at its PICA physical address, so that a PICA address
- * is a GPU address and the draw path translates nothing. Guest VRAM
- * (CDRAM, uncached for the CPU) at 0x18000000, guest FCRAM (cached: cleaned before a kick
- * reads it) at 0x20000000. The GPU must be idle when this is made and
- * destroyed: sgxd invalidates its MMU then. Nothing on host builds.
+ * is a GPU address and the draw path translates nothing (docs/sgxd/memory.md).
+ * Guest VRAM (CDRAM, uncached for the CPU) at 0x18000000, guest FCRAM (cached: cleaned before a
+ * kick reads it) at 0x20000000. The GPU must be idle when this is made and destroyed: sgxd
+ * invalidates its MMU then.
  *
  * FCRAM the GPU writes and reads back - a display transfer's output, a framebuffer the LCD
  * shows, a texture - is moved onto CDRAM pages of a pool of ours (azaharReback): the same host,

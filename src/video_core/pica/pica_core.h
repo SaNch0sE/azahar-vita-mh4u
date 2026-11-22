@@ -138,6 +138,13 @@ private:
     void SubmitImmediate(u32 data);
 
     void DrawImmediate();
+    /// Draws the immediate-mode vertices the rasterizer collected (AccelerateImmediateVertex).
+    void FlushImmediate();
+    /// True for the registers that carry immediate-mode data, which do not end a batch.
+    static constexpr bool IsImmediateData(u32 id) {
+        return id >= PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]) &&
+               id <= PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[2]);
+    }
 
     void DrawArrays(bool is_indexed);
 
@@ -366,6 +373,9 @@ public:
     Fog fog{};
     AttributeBuffer input_default_attributes{};
     ImmediateModeState immediate{};
+    /// The rasterizer holds immediate-mode vertices: every register write goes through
+    /// WriteInternalReg, which flushes them first (the fast command loop is skipped).
+    bool immediate_open{};
 
     DelayGenerator delay_generator{};
 

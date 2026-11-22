@@ -333,6 +333,7 @@ static uint32_t active_cpu_mask(void) {
 // 7: azaharAdopt, azaharReback and azaharRebackRestore: guest FCRAM under tables of ours, and
 //    pages of it moved onto other physical pages (reback.c).
 // 8: azaharRebackReturn, moved pages back on their own.
+// 13: sgxdSubmitAsync queues lists (SGXD_CHAIN_RING) and returns the first op's index.
 int azaharVersion() {
     return 5;
 }

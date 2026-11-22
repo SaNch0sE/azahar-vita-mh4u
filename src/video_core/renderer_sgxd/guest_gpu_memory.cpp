@@ -14,9 +14,12 @@
 #include "video_core/renderer_sgxd/guest_gpu_memory.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
 
-#ifdef __vita__
 #include "azahar_native.h"
 #include "sgxd.h"
+#include "sgxd_ptla.h"
+#ifdef VITA_DIAGNOSTICS
+#include <psp2/kernel/clib.h>
+#include <psp2/kernel/threadmgr.h>
 #endif
 
 namespace SgxdRenderer {
@@ -35,7 +38,6 @@ constexpr u32 MaxPagesPerMove = 256;
 } // namespace
 
 GuestGpuMemory::GuestGpuMemory([[maybe_unused]] Memory::MemorySystem& memory) {
-#ifdef __vita__
     const u8* host = memory.GetPhysicalPointer(Memory::VRAM_PADDR);
     // CDRAM is uncached for the CPU and the GPU does not snoop it: no CACHECONSISTENT.
     const int ret = sgxdMap(Memory::VRAM_PADDR, host, Memory::VRAM_SIZE, 0);
@@ -76,15 +78,33 @@ GuestGpuMemory::GuestGpuMemory([[maybe_unused]] Memory::MemorySystem& memory) {
     if (adopt < 0) {
         SgxdDrainKernelLog();
     }
-    LOG_INFO(Render, "sgxd: FCRAM the GPU writes and shows moves to CDRAM: {}",
-             enabled ? fmt::format("{} KiB pool at {}", PoolSize >> 10,
-                                   fmt::ptr(pool->Data()))
-                     : std::string{"off"});
-#endif
+    ASSERT_MSG(adopt >= 0, "sgxd: guest FCRAM not adopted ({:#010x})", static_cast<u32>(adopt));
+    adopted = true;
+    LOG_INFO(Render, "sgxd: FCRAM the GPU writes and shows moves to CDRAM: {} KiB pool at {}",
+             PoolSize >> 10, fmt::ptr(pool[0]->Data()));
+}
+
+u8* GuestGpuMemory::PoolPage(u32 slot) const {
+    const auto at = std::upper_bound(pool_starts.begin(), pool_starts.end(), slot) - 1;
+    return pool[at - pool_starts.begin()]->Data() + (slot - *at) * PageSize;
+}
+
+bool GuestGpuMemory::GrowPool() {
+    const u32 pages = static_cast<u32>(pool_owner.size());
+    if (pages * PageSize + GrowSize > MaxPoolSize) {
+        return false;
+    }
+    pool.push_back(std::make_unique<Common::HostSharedMemory>(
+        GrowSize, "azahar-fcram-cdram", Common::HostSharedMemory::Placement::GpuLocalOrUncached));
+    pool_starts.push_back(pages);
+    pool_owner.resize(pages + GrowSize / PageSize, NoPage);
+    pool_pages.store(pages + GrowSize / PageSize, std::memory_order_release);
+    pool_fence.resize(pages + GrowSize / PageSize, 0);
+    LOG_INFO(Render, "sgxd: the CDRAM pool grows to {} KiB", (pages * PageSize + GrowSize) >> 10);
+    return true;
 }
 
 GuestGpuMemory::~GuestGpuMemory() {
-#ifdef __vita__
     // Sony's descriptors go back before the pool's block and FCRAM's do.
     if (adopted) {
         const int ret = azaharRebackRestore();
@@ -105,7 +125,6 @@ GuestGpuMemory::~GuestGpuMemory() {
             LOG_ERROR(Render, "sgxd: guest FCRAM unmap failed: {:#010x}", static_cast<u32>(ret));
         }
     }
-#endif
 }
 
 bool GuestGpuMemory::IsUncached(PAddr addr, u32 size) const {
@@ -408,10 +427,12 @@ bool GuestGpuMemory::WouldMove(PAddr addr, u32 size) const {
 
 void GuestGpuMemory::MakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] u32 size,
                                   [[maybe_unused]] bool overwritten) {
-#ifdef __vita__
     if (!WouldMove(addr, size)) {
         return;
     }
+    // No idle GPU (the class's comment): the GPU's writes queued to the range land first, so
+    // that the copy takes them; its reads go on from the old pages until its remap.
+    hooks.wait_writes(addr, size);
     const auto start = std::chrono::steady_clock::now();
     const u32 offset = addr - Memory::FCRAM_PADDR;
     const u32 first = offset / PageSize;
@@ -491,7 +512,6 @@ void GuestGpuMemory::MakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] 
              "{} of {} pages",
              addr, size, overwritten ? " (the GPU overwrites it)" : "", moved_pages, copied_pages,
              us, pool_used.load(), pool_owner.size());
-#endif
 }
 
 #ifdef VITA_DIAGNOSTICS

@@ -122,6 +122,7 @@ typedef struct AzaharRebackRequest {
 #define AZAHAR_ERR_TABLE AZAHAR_ERROR(1005)    // the table could not be built (kernel L1 not found, gap)
 #define AZAHAR_ERR_PAGE AZAHAR_ERROR(1006)     // a user page did not translate
 #define AZAHAR_ERR_TIMEOUT AZAHAR_ERROR(1007)  // the core-2 thread did not complete a command in time
+#define AZAHAR_ERR_FULL AZAHAR_ERROR(1008)     // a queue has no room yet (sgxdSubmitAsync)
 
 #ifdef __cplusplus
 extern "C" {

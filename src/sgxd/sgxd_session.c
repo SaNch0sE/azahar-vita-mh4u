@@ -5,6 +5,7 @@
 // (sgxd_session.h).
 
 #include "sgxd_session.h"
+#include "sgxd_ptla.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -15,9 +16,14 @@
 #define P(r, m, v, t) {SGXD_OP_POLL, (r), (v), (m), (t)}
 #define R(r) {SGXD_OP_READ, (r), 0, 0, 0}
 
-// The ops through sgxdSubmit; on a stop, the op it stopped at goes into failed.
+// The ops through sgxdSubmit, after any PTLA op still running (sgxd_ptla_idle); on a stop,
+// the op it stopped at goes into failed.
 static int submit(SgxdOp *ops, unsigned count, int overflow, const char *what, char *failed,
                   unsigned failed_size) {
+    if (sgxd_gpu_idle() < 0) {
+        snprintf(failed, failed_size, "%s: a PTLA op before it never completed", what);
+        return -1;
+    }
     const int done = overflow ? -1 : sgxdSubmit(ops, count);
     if (done != (int)count) {
         const SgxdOp *at = done >= 0 && done < (int)count ? &ops[done] : NULL;
@@ -123,34 +129,153 @@ void sgxd_session_slc_inval(const SgxdRecipe *r, SgxdOpList *list) {
     sgxd_recipe_slc(list, 1);
 }
 
+static uint32_t renders;
+
+uint32_t sgxd_session_renders(void) {
+    return renders;
+}
+
+#ifdef VITA_DIAGNOSTICS
+// The diagnostics build times the TA and the 3D: it spins on core 0's EVENT_STATUS until bit
+// is set (or a second passed) and returns the time of that read; the kernel's poll sleeps
+// ~220 us after 100 us, which would time every small pass the same.
+static uint64_t spin_until(uint32_t bit) {
+    const uint64_t t0 = sceKernelGetProcessTimeWide();
+    SgxdOp status = R(0x812c);
+    uint64_t t;
+    do {
+        t = sceKernelGetProcessTimeWide();
+        if (sgxdSubmit(&status, 1) != 1) {
+            break;
+        }
+    } while (!(status.value & bit) && t - t0 < SGXD_SESSION_POLL_US);
+    return t;
+}
+#endif
+
 int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *failed,
                         unsigned failed_size) {
     if (sgxd_session_phase(r, sgxd_recipe_ta_kick, "ta kick", failed, failed_size) < 0) {
         return -1;
     }
+#ifdef VITA_DIAGNOSTICS
     const uint64_t t0 = sceKernelGetProcessTimeWide();
+    const uint64_t t1 = spin_until(0x2000);
+#endif
     if (sgxd_session_phase(r, sgxd_session_ta_wait, "ta wait", failed, failed_size) < 0) {
         return -1;
     }
-    const uint64_t t1 = sceKernelGetProcessTimeWide();
     if (render->read_pages) {
         // The pages the pass took, counted since the free-list load (PAGE_STATUS's high half).
         SgxdOp page_status = R(0x0724);
-        render->pages = sgxdSubmit(&page_status, 1) == 1 ? page_status.value >> 16 : 0;
+        render->pages = sgxd_gpu_idle() == 0 && sgxdSubmit(&page_status, 1) == 1
+                            ? page_status.value >> 16
+                            : 0;
     }
     if (sgxd_session_phase(r, sgxd_recipe_ta_done, "ta done", failed, failed_size) < 0 ||
         sgxd_session_phase(r, sgxd_recipe_3d_kick, "3d kick", failed, failed_size) < 0) {
         return -1;
     }
+#ifdef VITA_DIAGNOSTICS
     const uint64_t t2 = sceKernelGetProcessTimeWide();
+    const uint64_t t3 = spin_until(0x40000);
+#endif
     if (sgxd_session_phase(r, sgxd_session_3d_wait, "3d wait", failed, failed_size) < 0) {
         return -1;
     }
-    const uint64_t t3 = sceKernelGetProcessTimeWide();
     if (sgxd_session_phase(r, sgxd_recipe_3d_done, "3d done", failed, failed_size) < 0) {
         return -1;
     }
+    renders++;
+    // The waits' times are the diagnostics build's; 0 otherwise.
+#ifdef VITA_DIAGNOSTICS
     render->ta_us = (uint32_t)(t1 - t0);
     render->d3_us = (uint32_t)(t3 - t2);
+    sgxd_wait_us_add(render->ta_us + render->d3_us);
+#else
+    render->ta_us = 0;
+    render->d3_us = 0;
+#endif
     return 0;
+}
+
+// ---------------------------------------------------------------------------- async
+
+static SgxdOp chain_ops[SGXD_MAX_CHAIN_OPS];
+
+static void add(SgxdOpList *l, uint32_t kind, uint32_t reg, uint32_t value, uint32_t mask) {
+    if (l->count >= l->max) {
+        l->overflow = 1;
+        return;
+    }
+    l->ops[l->count++] = (SgxdOp){kind, reg, value, mask, 0};
+}
+
+#define TA_FINISHED 0x00002000u
+#define PIXELBE_END_RENDER 0x00040000u
+// The core-0 waits after the master's event: already met.
+#define AFTER_EVENT_POLL_US 1000u
+
+int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
+                              unsigned failed_size) {
+    // Queued behind the lists before it, which the kernel runs first.
+    SgxdOpList l = {chain_ops, 0, SGXD_MAX_CHAIN_OPS, 0};
+    add(&l, SGXD_OP_WAIT_TWOD, 0, sgxd_ptla_fence(), 0);
+    sgxd_recipe_slc(&l, 1);
+    sgxd_recipe_ta_kick(r, &l);
+    add(&l, SGXD_OP_STAMP, 0, 0, 0);
+    add(&l, SGXD_OP_WAIT_EVENT, 0, 0, TA_FINISHED);
+    add(&l, SGXD_OP_STAMP, 0, 1, 0);
+    sgxd_recipe_ta_wait(&l, AFTER_EVENT_POLL_US);
+    if (read_pages) {
+        add(&l, SGXD_OP_READ, 0x0724, 0, 0);   // PAGE_STATUS
+    }
+    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
+    sgxd_recipe_ta_done(r, &l);
+    sgxd_recipe_3d_kick(r, &l);
+    add(&l, SGXD_OP_STAMP, 0, 2, 0);
+    add(&l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
+    add(&l, SGXD_OP_STAMP, 0, 3, 0);
+    sgxd_recipe_3d_wait(&l, AFTER_EVENT_POLL_US);
+    sgxd_recipe_3d_done(r, &l);
+    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
+    if (l.overflow) {
+        snprintf(failed, failed_size, "async render: more than %u ops", SGXD_MAX_CHAIN_OPS);
+        return -1;
+    }
+    const int ret = sgxd_chain_submit(chain_ops, l.count);
+    if (ret < 0) {
+        snprintf(failed, failed_size, "async render: sgxdSubmitAsync %08x", (unsigned)ret);
+        return -1;
+    }
+    renders++;
+    return 0;
+}
+
+void sgxd_session_render_async_result(SgxdSessionRender *render) {
+    const volatile SgxdEvents *ev = sgxd_ptla_page();
+    render->ta_us = ev ? ev->stamp[1] - ev->stamp[0] : 0;
+    render->d3_us = ev ? ev->stamp[3] - ev->stamp[2] : 0;
+    render->pages = render->read_pages && ev ? ev->chain_value >> 16 : 0;
+}
+
+void sgxd_session_render_async_failed(char *failed, unsigned failed_size) {
+    const volatile SgxdEvents *ev = sgxd_ptla_page();
+    const uint32_t fault = ev ? ev->chain_fault : 0;
+    const int stopped = sgxdSubmitAsync(NULL, 0);
+    if (stopped <= 0 && !fault) {
+        snprintf(failed, failed_size, "async lists: none stopped, %u of %u done",
+                 ev ? ev->chains : 0, sgxd_chain_fence());
+        return;
+    }
+    const uint32_t at = (stopped > 0 ? (uint32_t)stopped : fault) - 1u;
+    uint32_t behind = 0;
+    const SgxdOp *op = sgxd_chain_op(at & 0x7fffffffu, &behind);
+    snprintf(failed, failed_size,
+             "async queue op %u, %u from the end (%s, %u of %u lists done): kind %u reg 0x%05x "
+             "value 0x%08x mask 0x%08x, last read 0x%08x",
+             (unsigned)(at & 0x7fffffffu), (unsigned)behind,
+             fault ? "a poll timed out" : "no interrupt", ev ? ev->chains : 0,
+             sgxd_chain_fence(), op ? op->op : 0, op ? op->reg : 0, op ? op->value : 0,
+             op ? op->mask : 0, ev ? ev->chain_value : 0);
 }

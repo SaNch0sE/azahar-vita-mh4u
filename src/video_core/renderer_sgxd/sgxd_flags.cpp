@@ -5,7 +5,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -21,10 +20,6 @@ const std::vector<std::string>& Flags() {
     static const std::vector<std::string> flags = [] {
         std::vector<std::string> out;
         std::string text;
-        if (const char* env = std::getenv("AZAHAR_GXM_FLAGS")) {
-            // Off the console (the stub libgxm build) the flags come from the environment.
-            text = env;
-        }
         // The development build reads them from the host PC as well, so a run changes them without an
         // install.
         for (const char* path : {"ux0:data/azahar/sgxd_flags.txt", "host0:sgxd_flags.txt"}) {

@@ -342,6 +342,12 @@ int EmuWindowVita::TakeUiAction() {
 }
 
 void EmuWindowVita::Present(Ui* ui) {
+    const auto mark = [&t](u32 part) {
+        present_us[part].fetch_add(Since(t), std::memory_order_relaxed);
+    };
+#else
+    const auto mark = [](u32) {};
+#endif
     // The decision the interface reaches is published for the run loop.
     if (ui != nullptr && render_ui.load(std::memory_order_acquire) == ui) {
         const auto action = ui->Update();
@@ -349,19 +355,27 @@ void EmuWindowVita::Present(Ui* ui) {
             pending_ui_action.store(static_cast<int>(action), std::memory_order_release);
         }
     }
-    present_us[0].fetch_add(Since(t), std::memory_order_relaxed);
+    mark(0);
+    // The frame before still rendering: this one is dropped, nothing waits for the GPU.
+    if (SgxdPresent::Busy()) {
+        if (presents_busy++ % 600 == 0) {
+            LOG_INFO(Frontend, "present dropped, the last frame still rendering ({} times)",
+                     presents_busy);
+        }
+        return;
+    }
     SgxdPresent::BeginFrame(0, 0, 0);
     if (have_screens) {
         DrawGuestScreens();
     }
-    present_us[1].fetch_add(Since(t), std::memory_order_relaxed);
+    mark(1);
     // A frame being dumped leaves the menu out.
     if (ui != nullptr && !SgxdPresent::DumpPending()) {
         ui->Draw();
     }
-    present_us[2].fetch_add(Since(t), std::memory_order_relaxed);
+    mark(2);
     SgxdPresent::EndFrame();
-    present_us[3].fetch_add(Since(t), std::memory_order_relaxed);
+    mark(3);
 }
 
 } // namespace VitaFrontend

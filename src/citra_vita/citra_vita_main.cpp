@@ -31,6 +31,7 @@
 #include "citra_vita/input_factory_vita.h"
 
 #include "azahar_native.h"
+#include "sgxd_ptla.h"
 #include "common/named_thread.h"
 
 #include <cstdio>
@@ -341,15 +342,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     // The GPU's operations and presents in the second (ms).
                     const auto r = system.GPU().TakeOpStats();
                     LOG_INFO(Frontend,
-                             "perf: render work {:.1f} ms in {} ops, present {:.1f} ms in {} "
-                             "({} dropped); waits {} spun into an op, {} slept",
-                             r.work_us / 1e3, r.work_ops, r.present_us / 1e3, r.presents,
-                             r.presents_dropped, r.spin_hits, r.spin_misses);
+                             "perf: present {:.1f} ms in {} ({} dropped); GPU waits {:.1f} ms",
+                             r.present_us / 1e3, r.presents, r.presents_dropped,
+                             sgxd_wait_us_take() / 1e3);
                     LOG_INFO(Frontend,
                              "perf: cmdlist {:.1f} ms in {}, regwrite {:.1f} ms in {}, fill "
-                             "{:.1f} ms in {}, transfer {:.1f} ms in {}",
+                             "{:.1f} ms in {}, transfer {:.1f} ms in {}, dma {:.1f} ms in {}; of "
+                             "which GPU waits {:.1f}, {:.1f}, {:.1f}, {:.1f}, {:.1f} ms",
                              r.kind_us[0] / 1e3, r.kind_ops[0], r.kind_us[1] / 1e3, r.kind_ops[1],
-                             r.kind_us[2] / 1e3, r.kind_ops[2], r.kind_us[3] / 1e3, r.kind_ops[3]);
+                             r.kind_us[2] / 1e3, r.kind_ops[2], r.kind_us[3] / 1e3, r.kind_ops[3],
+                             r.kind_us[4] / 1e3, r.kind_ops[4], r.kind_wait_us[0] / 1e3,
+                             r.kind_wait_us[1] / 1e3, r.kind_wait_us[2] / 1e3,
+                             r.kind_wait_us[3] / 1e3, r.kind_wait_us[4] / 1e3);
                     const auto p = VitaFrontend::TakePresentTimes();
                     LOG_INFO(Frontend,
                              "perf: present ui update {:.1f} ms, screens {:.1f} ms, ui draw "
@@ -362,7 +366,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     // By site: done (time, calls, KiB), and not needed because the range is
                     // uncached (calls, KiB).
                     static constexpr const char* site_names[] = {
-                        "vertices", "transfer before", "transfer after", "screens", "other"};
+                        "vertices",   "transfer before", "transfer after", "screens",
+                        "dma source", "dma destination", "other"};
                     std::string sites;
                     for (u32 i = 0; i < static_cast<u32>(SgxdRenderer::CacheSite::Count); i++) {
                         const auto& s = c.sites[i];

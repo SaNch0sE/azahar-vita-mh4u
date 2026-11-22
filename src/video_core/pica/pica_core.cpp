@@ -292,7 +292,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         // unrolls the loop. Other ISAs and/or compilers may be able to do it,
         // that's why it was decided to keep the structure like this.
         if (!debug_context) [[likely]] {
-            if (!skip_fast_path) {
+            if (!skip_fast_path && !immediate_open) {
 #if CITRA_ARCH(arm32)
                 // Hand-written Thumb-2 loop (pica_cmdlist_a32.S): applies plain register
                 // writes until list end or a special command, which falls through to the
@@ -894,6 +894,9 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
     }
 
     delay_generator.AddCommands(count);
+    if (immediate_open && !IsImmediateData(id)) {
+        FlushImmediate();
+    }
     const u32 write_mask = ExpandBitsToBytes[mask];
     // Only write the last value to the register array.
     // Batch handlers should take this in mind.
@@ -927,6 +930,9 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         } else {
             count = RegsInternal::NUM_REGS - id;
         }
+    }
+    if (immediate_open && !(IsImmediateData(id) && IsImmediateData(id + count - 1))) {
+        FlushImmediate();
     }
     const u32 write_mask = ExpandBitsToBytes[mask];
     u32* __restrict dst = &regs.internal.reg_array[id];
@@ -979,6 +985,10 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     }
 
     delay_generator.AddCommands(1);
+
+    if (immediate_open && !IsImmediateData(id)) {
+        FlushImmediate();
+    }
 
     // TODO: Figure out how register masking acts on e.g. vs.uniform_setup.set_value
     const u32 old_value = regs.internal.reg_array[id];
@@ -1039,6 +1049,15 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    // The rasterizer runs the vertex program on the GPU: it keeps the raw attributes and draws
+    // them as one batch at the next register write that is not immediate data.
+    if (regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No &&
+        rasterizer->AccelerateImmediateVertex(immediate.input_vertex)) {
+        immediate_open = true;
+        immediate.current_attribute = 0;
+        return;
+    }
+
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
 
@@ -1074,6 +1093,11 @@ void PicaCore::DrawImmediate() {
     if (debug_context) {
         debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
     }
+}
+
+void PicaCore::FlushImmediate() {
+    immediate_open = false;
+    rasterizer->FlushImmediate();
 }
 
 void PicaCore::DrawArrays(bool is_indexed) {

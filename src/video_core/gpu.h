@@ -7,9 +7,11 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <vector>
 #include <boost/serialization/access.hpp>
 
 #include "core/hle/service/gsp/gsp_interrupt.h"
+#include "video_core/rasterizer_interface.h"
 
 namespace Service::GSP {
 struct Command;
@@ -101,9 +103,8 @@ public:
     /// Releases the renderer (for GL context destroy in libretro)
     void ReleaseRenderer();
 
-    /// Runs fn on the render thread, after every operation queued before it, and waits for it.
-    /// For the frontend's own presents while a title is loaded (the pause menu).
-    void RunOnRenderThread(const std::function<void()>& fn);
+    /// What a GPU operation is, for `perflog`'s split of the GPU's work and vprof's numbering.
+    enum class OpKind : u32 { CmdList, RegWrite, Fill, Transfer, Dma, Count };
 
     /// Since the last call (diagnostics: `perflog`): the GPU operations' time by kind, the part
     /// of it spent waiting for the GPU, and the presents' time; presents dropped in any build.
@@ -114,12 +115,6 @@ public:
         u64 present_us;
         u32 presents;
         u32 presents_dropped;
-        /// Empty-queue waits a spin ended with an op, and those that slept.
-        u32 spin_hits;
-        u32 spin_misses;
-        /// The work ops' time by OpKind.
-        u64 kind_us[4];
-        u32 kind_ops[4];
     };
     OpStats TakeOpStats();
     /// The guest goes idle (every core waiting: its clock jumps to the next event). Each command
@@ -152,14 +147,22 @@ private:
     /// (RendererBase::WouldMakeUncached), before the GPU writes or shows it.
     void KeepUncached(PAddr addr, u32 size, bool overwritten);
 
-    /// Queues op on the render thread.
-    /// What a render thread op is, for `perflog`'s split of the render thread's work.
-    enum class OpKind : u32 { CmdList, RegWrite, Fill, Transfer, Count };
-    void RunGpuOp(OpKind kind, std::function<void()> op);
-    /// Runs fn on the emulation thread: from the render thread through a core timing event,
-    /// in order, at the emulation thread's current time.
-    void PostToEmulation(std::function<void()> fn);
-    void PostedEventCallback(uintptr_t user_data, s64 cycles_late);
+    /// A DMA's piece that is contiguous in physical memory on both sides.
+    struct DmaRun {
+        PAddr src;
+        PAddr dst;
+        u32 size;
+    };
+    /// GSP's DMA of size bytes from src to dst (the current process's addresses) as physical
+    /// runs. Memory outside guest FCRAM and VRAM stops the emulator.
+    std::vector<DmaRun> DmaRuns(VAddr src, VAddr dst, u32 size);
+
+    /// Runs op, a GSP command's or a register trigger's work (vprof numbers it, perflog times
+    /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).
+    void RunGpuOp(OpKind kind, const std::function<void()>& op);
+    /// Raises a GSP interrupt after delay nanoseconds of guest time, as upstream; none while
+    /// vprof's replay runs.
+    void Signal(Service::GSP::InterruptId id, u64 delay);
 
     friend class boost::serialization::access;
     template <class Archive>

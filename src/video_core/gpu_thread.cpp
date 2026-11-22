@@ -178,6 +178,8 @@ void GpuThread::Loop(std::function<void()> on_start) {
             ops.pop_front();
             queued.store(static_cast<u32>(ops.size()), std::memory_order_relaxed);
         }
+#ifdef VITA_DIAGNOSTICS
+        // The time is `perflog`'s, in the diagnostics build only.
         const auto start = std::chrono::steady_clock::now();
         op.fn();
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -186,6 +188,9 @@ void GpuThread::Loop(std::function<void()> on_start) {
         const auto k = static_cast<std::size_t>(op.kind);
         busy_us[k].fetch_add(static_cast<u64>(us), std::memory_order_relaxed);
         op_count[k].fetch_add(1, std::memory_order_relaxed);
+#else
+        op.fn();
+#endif
     }
 }
 

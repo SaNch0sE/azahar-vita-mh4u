@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
@@ -17,7 +18,6 @@
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_lcd.h"
 #include "video_core/renderer_base.h"
-#include "video_core/renderer_software/sw_blitter.h"
 #include "video_core/right_eye_disabler.h"
 #include "video_core/video_core.h"
 #ifdef ENABLE_GXM
@@ -31,63 +31,6 @@ namespace VideoCore {
 
 constexpr VAddr VADDR_LCD = 0x1ED02000;
 constexpr VAddr VADDR_GPU = 0x1EF00000;
-
-class DelayGenerator {
-private:
-    DelayGenerator() = default;
-
-    // Average transfer speed based on measurements taken from real
-    // hardware. 4 different modes have been taken into consideration:
-    // RAM -> RAM, RAM -> VRAM, VRAM -> RAM and VRAM -> VRAM.
-    // Furthermore, measurements are split into DMA transfers and tex
-    // copies. For simplicity, we will assume fills are as fast as
-    // texture copies.
-
-    static constexpr double mibps_to_ns_per_byte(double mib_per_sec) {
-        return 1'000'000'000.0 / (mib_per_sec * 1024.0 * 1024.0);
-    }
-
-    static constexpr std::array<std::array<double, 4>, 2> speed_mibps = {
-        {{
-             190.0, // DMA RAMTORAM
-             310.0, // DMA RAMTOVRAM
-             380.0, // DMA VRAMTORAM
-             380.0, // DMA VRAMTOVRAM
-         },
-         {
-             450.0,  // TEX RAMTORAM
-             3100.0, // TEX RAMTOVRAM
-             5400.0, // TEX VRAMTORAM
-             5400.0, // TEX VRAMTOVRAM
-         }}};
-
-public:
-    enum class CopyMode {
-        RAMTORAM,
-        RAMTOVRAM,
-        VRAMTORAM,
-        VRAMTOVRAM,
-    };
-
-    static CopyMode GetCopyMode(bool input_vram, bool output_vram) {
-        if (!input_vram && !output_vram) {
-            return CopyMode::RAMTORAM;
-        } else if (!input_vram && output_vram) {
-            return CopyMode::RAMTOVRAM;
-        } else if (input_vram && !output_vram) {
-            return CopyMode::VRAMTORAM;
-        } else {
-            return CopyMode::VRAMTOVRAM;
-        }
-    }
-
-    static u64 CalculateDelayNanoseconds(CopyMode mode, bool is_textre, size_t size) {
-        double base_ns_per_byte =
-            mibps_to_ns_per_byte(speed_mibps[is_textre][static_cast<u32>(mode)]);
-
-        return static_cast<u64>(size * base_ns_per_byte);
-    }
-};
 
 class DelayGenerator {
 private:
@@ -166,7 +109,15 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
     // PICA from then on.
     Service::GSP::InterruptHandler post_interrupt = [this](Service::GSP::InterruptId id,
                                                            u64 delay) {
-        PostToEmulation([this, id, delay] { impl->signal_interrupt(id, delay); });
+        // P3D once the renders before it have read their vertices.
+        GPU_TRACE("post", static_cast<unsigned>(id));
+        PostToEmulation([this, id, delay] {
+                            GPU_TRACE("irq", static_cast<unsigned>(id));
+                            impl->signal_interrupt(id, delay);
+                        },
+                        id == Service::GSP::InterruptId::P3D
+                            ? impl->rasterizer->GpuFenceVertices()
+                            : impl->rasterizer->GpuFenceAll());
     };
     impl->pica.SetInterruptHandler(post_interrupt);
     impl->render_thread = std::make_unique<GpuThread>(
@@ -176,13 +127,20 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 
 GPU::~GPU() = default;
 
-void GPU::RunGpuOp(OpKind kind, std::function<void()> op) {
+void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op) {
+#ifndef VITA_DIAGNOSTICS
+    op();
+#else
+    // The time by kind is `perflog`'s, in the diagnostics build only.
     impl->render_thread->Push([this, kind, op = std::move(op)] {
         const auto start = std::chrono::steady_clock::now();
+        const u64 waited = impl->rasterizer->GpuWaitUs();
         GPU_TRACE("op", static_cast<unsigned>(kind));
         op();
         GPU_TRACE("done", static_cast<unsigned>(impl->rasterizer->GpuWaitUs() - waited));
         const auto k = static_cast<std::size_t>(kind);
+        impl->kind_wait_us[k].fetch_add(impl->rasterizer->GpuWaitUs() - waited,
+                                        std::memory_order_relaxed);
         impl->kind_us[k].fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                        std::chrono::steady_clock::now() - start)
                                        .count()),
@@ -190,12 +148,16 @@ void GPU::RunGpuOp(OpKind kind, std::function<void()> op) {
         impl->kind_ops[k].fetch_add(1, std::memory_order_relaxed);
         impl->ops_in_flight.fetch_sub(1, std::memory_order_release);
     });
+#endif
 }
 
-void GPU::PostToEmulation(std::function<void()> fn) {
+void GPU::PostToEmulation(std::function<void()> fn, RasterizerInterface::GpuFence fence) {
     {
         std::scoped_lock lock{impl->posted_mutex};
-        impl->posted.push_back(std::move(fn));
+        impl->posted.push_back({fence, std::move(fn)});
+        if (fence.Any()) {
+            impl->fenced.store(true, std::memory_order_release);
+        }
     }
     // No delay of its own: the work is done now, and the interrupt's modelled delay travels
     // inside fn to GSP.
@@ -203,18 +165,40 @@ void GPU::PostToEmulation(std::function<void()> fn) {
 }
 
 void GPU::PostedEventCallback(uintptr_t, s64) {
-    std::function<void()> fn;
-    {
-        std::scoped_lock lock{impl->posted_mutex};
-        if (impl->posted.empty()) {
-            return;
-        }
-        fn = std::move(impl->posted.front());
-        impl->posted.pop_front();
+    DrainPosted();
+}
+
+void GPU::PollPosted() {
+    if (impl->fenced.load(std::memory_order_acquire)) {
+        DrainPosted();
+    }
+}
+
+bool GPU::WaitPostedIdle() {
+    const auto start = std::chrono::steady_clock::now();
+    const u64 waited = impl->rasterizer->GpuWaitUs();
+    GPU_TRACE("op", static_cast<unsigned>(kind));
+    SgxdRenderer::Vprof::OpBegin(seq);
+    op();
+    SgxdRenderer::Vprof::OpEnd(seq);
+    const u64 wait = impl->rasterizer->GpuWaitUs() - waited;
+    GPU_TRACE("done", static_cast<unsigned>(wait));
+    impl->kind_wait_us[k].fetch_add(wait, std::memory_order_relaxed);
+    impl->kind_us[k].fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count()),
+                               std::memory_order_relaxed);
+#endif
+    // GPU work the op held back starts now (the last pass's 3D, when a transfer waits on it).
+    impl->rasterizer->GpuIdle();
+}
+
+void GPU::Signal(Service::GSP::InterruptId id, [[maybe_unused]] u64 delay) {
+    if (impl->interrupts_muted) {
+        return;
     }
     GPU_TRACE("irq", static_cast<unsigned>(id));
     impl->signal_interrupt(id, delay);
-    fn();
 }
 
 void GPU::RunOnRenderThread(const std::function<void()>& fn) {
@@ -272,23 +256,19 @@ void GPU::Execute(const Service::GSP::Command& command) {
         impl->system.Memory().RasterizerFlushVirtualRegion(command.dma_request.dest_address,
                                                            command.dma_request.size,
                                                            Memory::FlushMode::Invalidate);
-
-        // TODO(Subv): These memory accesses should not go through the application's memory mapping.
-        // They should go through the GSP module's memory mapping.
-        const auto process = impl->system.Kernel().GetCurrentProcess();
-        impl->memory.CopyBlock(*process, command.dma_request.dest_address,
-                               command.dma_request.source_address, command.dma_request.size);
-
-        auto is_vram = [&](u32 addr) {
-            return addr >= Memory::VRAM_VADDR && addr <= Memory::VRAM_VADDR_END;
-        };
-
-        u64 delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(is_vram(command.dma_request.source_address),
-                                        is_vram(command.dma_request.dest_address)),
-            false, command.dma_request.size);
-
-        impl->signal_interrupt(Service::GSP::InterruptId::DMA, delay);
+        // The PTLA copies it, run by run.
+        auto runs = DmaRuns(command.dma_request.source_address, command.dma_request.dest_address,
+                            command.dma_request.size);
+        RunGpuOp(OpKind::Dma, [this, runs = std::move(runs)] {
+            for (const DmaRun& run : runs) {
+                if (!impl->rasterizer->AccelerateDma(run.src, run.dst, run.size)) {
+                    UNREACHABLE_MSG("GPU: DMA {:#x} to {:#x}, {} bytes: not done on the GPU",
+                                    run.src, run.dst, run.size);
+                }
+            }
+            PostToEmulation([this] { impl->signal_interrupt(Service::GSP::InterruptId::DMA, 0); },
+                            impl->rasterizer->GpuFenceAll());
+        });
         break;
     }
     case CommandId::SubmitCmdList: {
@@ -548,33 +528,29 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
         return;
     }
 
-    RunGpuOp(OpKind::Fill, [this, config, index, intr_index] {
-        // Perform memory fill.
+    // Perform memory fill: the PTLA's, queued behind the renders before it.
+    RunGpuOp(OpKind::Fill, [this, &config] {
         if (!impl->rasterizer->AccelerateFill(config)) {
-            impl->sw_blitter->MemoryFill(config);
+            UNREACHABLE_MSG("GPU: the fill of {:#x}-{:#x} was not done on the GPU",
+                            config.GetStartAddress(), config.GetEndAddress());
         }
 
-        // Treat fill as texture transfer from VRAM
-        u64 delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(true, config.IsVRAM()), true,
-            config.GetEndAddress() - config.GetStartAddress());
-
-        PostToEmulation([this, index, intr_index, delay, start = config.GetStartAddress()] {
+        PostToEmulation([this, index, intr_index, start = config.GetStartAddress()] {
             // It seems that it won't signal interrupt if "address_start" is zero.
             // TODO: hwtest this
             if (start != 0) {
                 GPU_TRACE("irq fill", intr_index);
                 if (intr_index == 0) {
-                    impl->signal_interrupt(Service::GSP::InterruptId::PSC0, delay);
+                    impl->signal_interrupt(Service::GSP::InterruptId::PSC0, 0);
                 } else if (intr_index == 1) {
-                    impl->signal_interrupt(Service::GSP::InterruptId::PSC1, delay);
+                    impl->signal_interrupt(Service::GSP::InterruptId::PSC1, 0);
                 }
             }
 
             // Set the "finish" flag once the fill is done (the trigger was reset above).
             // This was confirmed to happen on hardware even if "address_start" is zero.
             impl->pica.regs.memory_fill_config[index].finished.Assign(1);
-        });
+        }, impl->rasterizer->GpuFenceAll());
     });
 
     // Treat fill as texture transfer from VRAM
@@ -635,6 +611,40 @@ void GPU::MemoryTransfer() {
     Signal(Service::GSP::InterruptId::PPF, delay);
 }
 
+std::vector<GPU::DmaRun> GPU::DmaRuns(VAddr src, VAddr dst, u32 size) {
+    // GSP copies through the process's mapping, the PTLA through the GPU's, where guest FCRAM
+    // and VRAM sit at their PICA physical addresses.
+    const u8* const fcram = impl->memory.GetFCRAMPointer(0);
+    const u8* const vram = impl->memory.GetPhysicalPointer(Memory::VRAM_PADDR);
+    const auto physical = [&](VAddr vaddr) -> PAddr {
+        const u8* const host = impl->memory.GetPointer(vaddr);
+        if (host >= fcram && host < fcram + Memory::FCRAM_SIZE) {
+            return Memory::FCRAM_PADDR + static_cast<u32>(host - fcram);
+        }
+        if (host >= vram && host < vram + Memory::VRAM_SIZE) {
+            return Memory::VRAM_PADDR + static_cast<u32>(host - vram);
+        }
+        UNREACHABLE_MSG("GPU: DMA from {:#x} to {:#x}: {:#x} is not guest FCRAM or VRAM", src, dst,
+                        vaddr);
+    };
+    std::vector<DmaRun> runs;
+    for (u32 done = 0; done < size;) {
+        const VAddr s = src + done, d = dst + done;
+        const u32 chunk =
+            std::min({size - done, Memory::CITRA_PAGE_SIZE - (s & Memory::CITRA_PAGE_MASK),
+                      Memory::CITRA_PAGE_SIZE - (d & Memory::CITRA_PAGE_MASK)});
+        const PAddr ps = physical(s), pd = physical(d);
+        if (!runs.empty() && runs.back().src + runs.back().size == ps &&
+            runs.back().dst + runs.back().size == pd) {
+            runs.back().size += chunk;
+        } else {
+            runs.push_back({ps, pd, chunk});
+        }
+        done += chunk;
+    }
+    return runs;
+}
+
 void GPU::KeepUncached(PAddr addr, u32 size, bool overwritten) {
     // Rare: a page moves once and stays until the GPU leaves it unused (ReturnUncached). The
     // move waits for the GPU's work first, so the GPU is idle under it.
@@ -652,29 +662,14 @@ void GPU::RunMemoryTransfer(const Pica::DisplayTransferConfig& config,
         impl->debug_context->OnEvent(Pica::DebugContext::Event::IncomingDisplayTransfer, nullptr);
     }
 
-    u64 delay{};
     // Perform memory transfer
     if (config.is_texture_copy) {
         if (!impl->rasterizer->AccelerateTextureCopy(config)) {
-            impl->sw_blitter->TextureCopy(config);
+            UNREACHABLE_MSG("GPU: the texture copy {} was not done on the GPU", config.DebugName());
         }
-        delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
-            config.texture_copy.size);
-    } else {
-        if (allow_display_transfer) {
-            if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
-                impl->sw_blitter->DisplayTransfer(config);
-            }
-        }
-        delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
-            config.input_width * config.input_height * BytesPerPixel(config.input_format));
+    } else if (allow_display_transfer && !impl->rasterizer->AccelerateDisplayTransfer(config)) {
+        UNREACHABLE_MSG("GPU: the display transfer {} was not done on the GPU", config.DebugName());
     }
-
-    // Complete transfer.
-    PostToEmulation(
-        [this, delay] { impl->signal_interrupt(Service::GSP::InterruptId::PPF, delay); });
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
@@ -752,9 +747,6 @@ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow*
     // Rebind the rasterizer to the PICA GPU
     impl->pica.BindRasterizer(impl->rasterizer);
 
-    // Update the sw_blitter with the new rasterizer
-    impl->sw_blitter = std::make_unique<SwRenderer::SwBlitter>(impl->memory, impl->rasterizer);
-
     // Re-apply per-game configuration and reload disk shader cache
     u64 program_id{};
     impl->system.GetAppLoader().ReadProgramId(program_id);
@@ -783,7 +775,6 @@ void GPU::ReleaseRenderer() {
     // Just reset the renderer to release OpenGL resources
     // Don't null out rasterizer pointer as it will become dangling
     impl->renderer.reset();
-    impl->sw_blitter.reset();
     LOG_INFO(HW_GPU, "Renderer released for context destroy");
 }
 

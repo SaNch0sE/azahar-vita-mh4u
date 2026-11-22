@@ -26,6 +26,8 @@
 // The renders themselves are the app's op lists (src/sgxd, sgxd_session); the kernel only checks
 // their registers and runs them.
 
+#include <psp2kern/kernel/cpu/spinlock.h>
+#include <psp2kern/kernel/intrmgr.h>
 #include <psp2kern/kernel/suspend.h>
 #include <psp2kern/kernel/threadmgr/mutex.h>
 #include "sgxd.h"
@@ -56,6 +58,12 @@ int ksceKernelUnregisterSysEventHandler(SceUID uid);
 #define SGX_BIF_BANK0 0x0c78u
 #define SGX_BIF_DIR_LIST_BASE0 0x0c84u
 #define SGX_MASTER_CORE_CONFIG 0x4000u
+#define SGX_MASTER_EVENT_STATUS 0x412cu
+#define SGX_MASTER_EVENT_HOST_ENABLE 0x4130u
+#define SGX_MASTER_EVENT_HOST_CLEAR 0x4134u
+#define SGX_TWOD_COMPLETE 0x08000000u
+#define SGX_TA_FINISHED 0x00002000u
+#define SGX_PIXELBE_END_RENDER 0x00040000u
 #define SGX_MASTER_BIF_INT_STAT 0x4c04u
 #define SGX_MASTER_BIF_FAULT 0x4c08u
 #define SGX_MASTER_SLC_EVENT_STATUS 0x4d10u
@@ -84,6 +92,12 @@ int ksceKernelUnregisterSysEventHandler(SceUID uid);
 
 // SceLowio's ScePervasiveForDriver: the GPU domain on and off (SMC 0x110, bus 0), the calls
 // SceGpu's device power callbacks make. Not in the SDK's stubs, so resolved at runtime.
+// SceGpu's host interrupt: registered as "SceGpuLisr" for interrupt 0x34 with its
+// device, priority 0x50, every core.
+#define SGXD_GPU_LISR 0x715Au         // text, Thumb
+#define SGXD_GPU_INTR_CODE 0x41C8u    // data
+#define SGXD_GPU_DEVICE 0x41E0u       // data
+#define SGXD_INTR 0x34
 #define SGXD_LOWIO_PERVASIVE 0xE692C727u
 #define SGXD_GPU_POWER_ON 0x84EAB5BCu
 #define SGXD_GPU_POWER_OFF 0xE8656ADFu
@@ -113,6 +127,13 @@ static sgxd_void_fn sgxd_power_on, sgxd_power_off;
 static const uint32_t *sgxd_core_list, *sgxd_bank_list;
 static const uint32_t *sgxd_debug_ids;
 static uint32_t sgxd_module_nid;
+static SceKernelIntrHandler sgxd_gpu_lisr;
+static const uint32_t *sgxd_gpu_device;   // SceGpu's device pointer, its handler's context
+
+// sgxdEvents: the app's page, mapped for the ISR, and whether our handler is registered.
+static SceUID sgxd_events_uid = -1;
+static SgxdEvents *sgxd_events;
+static int sgxd_isr_ours;
 
 static SceUID sgxd_reg_uid = -1;
 static volatile uint32_t *sgxd_reg;
@@ -130,6 +151,15 @@ static AzaharWindows sgxd_ranges = {sgxd_range_list, 0, SGXD_RANGES};
 static uint32_t sgxd_mmu_pages;            // pages mapped
 
 static SgxdOp sgxd_ops[SGXD_MAX_OPS];
+// sgxdSubmitAsync's lists, queued in a ring: each runs when the one before has ended. The syscall
+// runs the queue until a wait that is not met when it found it idle, the ISR the rest; both
+// hold sgxd_chain_lock with this CPU's interrupts off. pos and end are free-running op counts
+// (the next op to run, the end of the last list queued); busy stays set after a failed poll
+// (chain_fault) until the app stops the queue. One thread of the app submits.
+static SgxdOp sgxd_chain[SGXD_CHAIN_RING];
+static uint32_t sgxd_chain_pos, sgxd_chain_end;
+static int sgxd_chain_busy;
+static SceKernelSpinlock sgxd_chain_lock;
 static uint32_t sgxd_dump_words[SGXD_DUMP_WORDS];
 // The dump sgxdSubmit took when a poll last timed out (sgxdFaultDump); [0] 0 when none.
 static uint32_t sgxd_fault_words[SGXD_DUMP_WORDS];
@@ -217,6 +247,13 @@ static int sgxd_identify(SgxdInfo *info) {
     sgxd_debug_ids = (const uint32_t *)(data + SGXD_GPU_DEBUG_IDS);
     sgxd_module_nid = tai.module_nid;
     sgxd_gpu_sysevent = (sgxd_sysevent_fn)(text + SGXD_GPU_SYSEVENT + 1);
+    if (*(const uint32_t *)(data + SGXD_GPU_INTR_CODE) == SGXD_INTR) {
+        sgxd_gpu_lisr = (SceKernelIntrHandler)(text + SGXD_GPU_LISR + 1);
+        sgxd_gpu_device = (const uint32_t *)(data + SGXD_GPU_DEVICE);
+    } else {
+        SGXD_LOG("SceGpu's interrupt code is %08x, not 0x34: no sgxdEvents\n",
+                 *(const uint32_t *)(data + SGXD_GPU_INTR_CODE));
+    }
     return 0;
 }
 
@@ -303,9 +340,190 @@ static int sgxd_slc_op(uint32_t ctrl, uint32_t value, uint32_t event) {
     return 0;
 }
 
+// The ISR's SLC op: no sleeping here, so a spin, at most SGXD_ISR_SLC_US.
+#define SGXD_ISR_SLC_US 2000u
+static int sgxd_isr_slc(uint32_t ctrl, uint32_t value, uint32_t event) {
+    sgxd_write(ctrl, value);
+    const uint32_t t0 = ksceKernelGetSystemTimeLow();
+    while (!(sgxd_read(SGX_MASTER_SLC_EVENT_STATUS) & event)) {
+        if (ksceKernelGetSystemTimeLow() - t0 > SGXD_ISR_SLC_US) {
+            return -1;
+        }
+    }
+    sgxd_write(SGX_MASTER_SLC_EVENT_CLEAR, event);
+    return 0;
+}
+
+// A PTLA completion: cleared, the SLC written back and emptied, counted.
+static void sgxd_isr_twod(SgxdEvents *ev) {
+    sgxd_write(SGX_MASTER_EVENT_HOST_CLEAR, SGX_TWOD_COMPLETE);
+    // The bytes into memory and the SLC empty before anyone is told, as a PTLA list's own
+    // closing flush and invalidate did.
+    const uint32_t t0 = ksceKernelGetSystemTimeLow();
+    const int flush = sgxd_isr_slc(SGX_MASTER_SLC_CTRL_FLUSH, SGX_SLC_FLUSH_ALL, SGX_SLC_EVENT_FLUSH);
+    const int inval = sgxd_isr_slc(SGX_MASTER_SLC_CTRL_INVAL, SGX_SLC_INVAL_ALL, SGX_SLC_EVENT_INVAL);
+    const uint32_t us = ksceKernelGetSystemTimeLow() - t0;
+    if (flush || inval) {
+        ev->slc_timeouts++;
+    }
+    ev->slc_us_total += us;
+    if (us > ev->slc_us_max) {
+        ev->slc_us_max = us;
+    }
+    asm volatile("dmb" ::: "memory");
+    ev->twod++;
+    asm volatile("dsb" ::: "memory");
+}
+
+// Runs the queue from sgxd_chain_pos until a wait that is not met, a failed poll or its end,
+// and returns the master event bits to enable for the wait (0 otherwise). With
+// sgxd_chain_lock held.
+static uint32_t sgxd_chain_run(SgxdEvents *ev) {
+    while (sgxd_chain_pos != sgxd_chain_end) {
+        SgxdOp *op = &sgxd_chain[sgxd_chain_pos & (SGXD_CHAIN_RING - 1u)];
+        if (op->op == SGXD_OP_READ) {
+            ev->chain_value = sgxd_read(op->reg);
+        } else if (op->op == SGXD_OP_WRITE) {
+            sgxd_write(op->reg, op->value);
+        } else if (op->op == SGXD_OP_POLL) {
+            const uint32_t t0 = ksceKernelGetSystemTimeLow();
+            uint32_t v, waited;
+            do {
+                waited = ksceKernelGetSystemTimeLow() - t0;
+                v = sgxd_read(op->reg);
+            } while ((v & op->mask) != op->value && waited <= op->timeout_us);
+            if ((v & op->mask) != op->value) {
+                ev->chain_value = v;
+                ev->chain_fault = sgxd_chain_pos + 1;
+                return 0;
+            }
+        } else if (op->op == SGXD_OP_WAIT_EVENT) {
+            if (!(sgxd_read(SGX_MASTER_EVENT_STATUS) & op->mask)) {
+                return op->mask;
+            }
+            sgxd_write(SGX_MASTER_EVENT_HOST_CLEAR, op->mask);
+        } else if (op->op == SGXD_OP_WAIT_TWOD) {
+            if ((int32_t)(ev->twod - op->value) < 0) {
+                return 0;   // the TWOD interrupt runs it on
+            }
+        } else if (op->op == SGXD_OP_SIGNAL) {
+            asm volatile("dmb" ::: "memory");
+            if (op->value == SGXD_SIGNAL_TA) {
+                ev->chain_ta++;
+            } else {
+                ev->chains++;
+            }
+            asm volatile("dsb" ::: "memory");
+        } else if (op->op == SGXD_OP_STAMP) {
+            const uint32_t now = ksceKernelGetSystemTimeLow();
+            volatile uint32_t *const log = ev->stamp_log[ev->stamps % SGXD_STAMP_LOG];
+            ev->stamp[op->value & 3u] = now;
+            log[0] = now;
+            log[1] = op->value;
+            asm volatile("dmb" ::: "memory");
+            ev->stamps++;
+        }
+        sgxd_chain_pos++;
+    }
+    sgxd_chain_busy = 0;
+    return 0;
+}
+
+static int sgxd_isr(int unk, void *ctx) {
+    (void)unk;
+    (void)ctx;
+    SgxdEvents *const ev = sgxd_events;
+    if (!ev || !sgxd_reg) {
+        return -1;
+    }
+    ksceKernelSpinlockLowLock(&sgxd_chain_lock);
+    ev->irqs++;
+    const uint32_t status = sgxd_read(SGX_MASTER_EVENT_STATUS);
+    const uint32_t mine = status & sgxd_read(SGX_MASTER_EVENT_HOST_ENABLE);
+    if (!mine) {
+        ev->unexpected |= status;
+    } else {
+        if (mine & SGX_TA_FINISHED) {
+            ev->ta++;
+        }
+        if (mine & SGX_PIXELBE_END_RENDER) {
+            ev->d3++;
+        }
+        if (mine & SGX_TWOD_COMPLETE) {
+            sgxd_isr_twod(ev);
+        }
+        // An async list waiting on one of these runs on; its wait bit is enabled only while
+        // it waits.
+        uint32_t wait = 0;
+        if (sgxd_chain_busy && !ev->chain_fault) {
+            const uint32_t t0 = ksceKernelGetSystemTimeLow();
+            wait = sgxd_chain_run(ev);
+            const uint32_t us = ksceKernelGetSystemTimeLow() - t0;
+            if (us > ev->chain_isr_us_max) {
+                ev->chain_isr_us_max = us;
+            }
+        }
+        sgxd_write(SGX_MASTER_EVENT_HOST_ENABLE, SGX_TWOD_COMPLETE | wait);
+    }
+    ksceKernelSpinlockLowUnlock(&sgxd_chain_lock);
+    return -1;
+}
+
+
+// SceGpu's handler out, ours in; the interrupt enabled. SceGpu's suspend left it disabled.
+static int sgxd_isr_take(void) {
+    if (sgxd_isr_ours) {
+        return 0;
+    }
+    ksceKernelDisableIntr(SGXD_INTR);
+    int r = ksceKernelReleaseIntrHandler(SGXD_INTR);
+    if (r < 0) {
+        SGXD_LOG("release of SceGpuLisr: %08x\n", (uint32_t)r);
+        return r;
+    }
+    r = ksceKernelRegisterIntrHandler(SGXD_INTR, "SceSgxdLisr", 0, sgxd_isr, NULL, 0x50, 0xf, NULL);
+    if (r < 0) {
+        SGXD_LOG("register of SceSgxdLisr: %08x\n", (uint32_t)r);
+        ksceKernelRegisterIntrHandler(SGXD_INTR, "SceGpuLisr", 0, sgxd_gpu_lisr,
+                                      (void *)*sgxd_gpu_device, 0x50, 0xf, NULL);
+        return r;
+    }
+    sgxd_isr_ours = 1;
+    ksceKernelEnableIntr(SGXD_INTR);
+    return 0;
+}
+
+// The interrupt back to SceGpu's handler, disabled, as its suspend left it (its resume enables
+// it); the app's page unmapped.
+static void sgxd_isr_give_back(void) {
+    const SceKernelIntrStatus st = ksceKernelSpinlockLowLockCpuSuspendIntr(&sgxd_chain_lock);
+    sgxd_chain_busy = 0;
+    sgxd_chain_pos = sgxd_chain_end;
+    if (sgxd_reg) {
+        sgxd_write(SGX_MASTER_EVENT_HOST_ENABLE, 0);
+    }
+    ksceKernelSpinlockLowUnlockCpuResumeIntr(&sgxd_chain_lock, st);
+    if (sgxd_isr_ours) {
+        ksceKernelDisableIntr(SGXD_INTR);
+        ksceKernelReleaseIntrHandler(SGXD_INTR);
+        const int r = ksceKernelRegisterIntrHandler(SGXD_INTR, "SceGpuLisr", 0, sgxd_gpu_lisr,
+                                                    (void *)*sgxd_gpu_device, 0x50, 0xf, NULL);
+        if (r < 0) {
+            SGXD_LOG("SceGpuLisr back: %08x\n", (uint32_t)r);
+        }
+        sgxd_isr_ours = 0;
+    }
+    sgxd_events = NULL;
+    if (sgxd_events_uid >= 0) {
+        ksceKernelUserUnmap(sgxd_events_uid);
+        sgxd_events_uid = -1;
+    }
+}
+
 // Our side down: the SLC written back and emptied, the cores reset, the block unmapped, the
-// domain off. Sony's side is not touched.
+// domain off. SceGpu's interrupt handler goes back first.
 static void sgxd_hw_down(void) {
+    sgxd_isr_give_back();
     if (sgxd_reg) {
         const int flush = sgxd_slc_op(SGX_MASTER_SLC_CTRL_FLUSH, SGX_SLC_FLUSH_ALL, SGX_SLC_EVENT_FLUSH);
         const int inval = sgxd_slc_op(SGX_MASTER_SLC_CTRL_INVAL, SGX_SLC_INVAL_ALL, SGX_SLC_EVENT_INVAL);
@@ -831,6 +1049,8 @@ int sgxdSubmit(SgxdOp *user_ops, uint32_t count) {
         ret = SGXD_ERR_OWNER;
     } else if (sgxd_state == SGXD_LOST) {
         ret = SGXD_ERR_LOST;
+    } else if (sgxd_chain_busy_locked()) {
+        ret = AZAHAR_ERR_STATE;
     } else if (count > SGXD_MAX_OPS ||
                ksceKernelCopyFromUser(sgxd_ops, user_ops, count * sizeof(SgxdOp)) < 0) {
         ret = AZAHAR_ERR_ARG;
@@ -867,6 +1087,25 @@ int sgxdSubmit(SgxdOp *user_ops, uint32_t count) {
                     sgxd_fault_snapshot(i, op, wanted, waited);
                     break;
                 }
+            } else if (op->op == SGXD_OP_WAIT_TWOD && sgxd_events &&
+                       op->timeout_us <= SGXD_MAX_POLL_US) {
+                // A spin: the waits it serves are a PTLA blit of one row.
+                const uint32_t t0 = ksceKernelGetSystemTimeLow();
+                uint32_t v, waited;
+                for (;;) {
+                    waited = ksceKernelGetSystemTimeLow() - t0;
+                    v = sgxd_events->twod;
+                    if ((int32_t)(v - op->value) >= 0 || waited > op->timeout_us) {
+                        break;
+                    }
+                }
+                const int met = (int32_t)(v - op->value) >= 0;
+                const uint32_t wanted = op->value;
+                op->value = v;
+                if (!met) {
+                    sgxd_fault_snapshot(i, op, wanted, waited);
+                    break;
+                }
             } else if (op->op == SGXD_OP_DELAY && op->value <= 1000000u) {
                 ksceKernelDelayThread(op->value);
             } else {
@@ -876,6 +1115,150 @@ int sgxdSubmit(SgxdOp *user_ops, uint32_t count) {
         ret = ksceKernelCopyToUser(user_ops, sgxd_ops, count * sizeof(SgxdOp)) < 0
                   ? AZAHAR_ERR_ARG : (int)i;
     }
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+// What an async list may hold: the ISR runs it, so no DELAY, and polls of 100 ms at most.
+static int sgxd_chain_valid(const SgxdOp *op) {
+    switch (op->op) {
+    case SGXD_OP_READ:
+        return !(op->reg & 3u) && op->reg < SGXD_REG_SIZE;
+    case SGXD_OP_WRITE:
+        return sgxd_writable(op->reg);
+    case SGXD_OP_POLL:
+        return !(op->reg & 3u) && op->reg < SGXD_REG_SIZE && op->timeout_us <= 100000u;
+    case SGXD_OP_WAIT_EVENT:
+        return op->mask == SGX_TA_FINISHED || op->mask == SGX_PIXELBE_END_RENDER;
+    case SGXD_OP_WAIT_TWOD:
+    case SGXD_OP_SIGNAL:
+    case SGXD_OP_STAMP:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int sgxdSubmitAsync(const SgxdOp *user_ops, uint32_t count) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    SgxdEvents *const ev = sgxd_events;
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (sgxd_state == SGXD_LOST) {
+        ret = SGXD_ERR_LOST;
+    } else if (!ev) {
+        ret = AZAHAR_ERR_STATE;
+    } else if (!user_ops) {
+        // Stop: the queue as it stands, for the app's post-mortem; what is queued is dropped.
+        const SceKernelIntrStatus st = ksceKernelSpinlockLowLockCpuSuspendIntr(&sgxd_chain_lock);
+        const int busy = sgxd_chain_busy;
+        const uint32_t pos = sgxd_chain_pos;
+        const int queued = pos != sgxd_chain_end;
+        sgxd_chain_busy = 0;
+        sgxd_chain_pos = sgxd_chain_end;
+        sgxd_write(SGX_MASTER_EVENT_HOST_ENABLE, SGX_TWOD_COMPLETE);
+        ksceKernelSpinlockLowUnlockCpuResumeIntr(&sgxd_chain_lock, st);
+        ret = 0;
+        if (busy && queued) {
+            SgxdOp *op = &sgxd_chain[pos & (SGXD_CHAIN_RING - 1u)];
+            const uint32_t wanted = op->value;
+            op->value = sgxd_read(op->op == SGXD_OP_WAIT_EVENT ? SGX_MASTER_EVENT_STATUS : op->reg);
+            sgxd_fault_snapshot(pos, op, wanted, 0);
+            ret = (int)((pos & 0x7fffffffu) + 1u);
+        }
+    } else if (count == 0 || count > SGXD_MAX_CHAIN_OPS) {
+        ret = AZAHAR_ERR_ARG;
+    } else {
+        // The ISR only moves pos on, so the room found here only grows; the ops go in past the
+        // queue's end, where the ISR does not read, and count once end moves.
+        const SceKernelIntrStatus st0 = ksceKernelSpinlockLowLockCpuSuspendIntr(&sgxd_chain_lock);
+        const uint32_t pos = sgxd_chain_pos;
+        const uint32_t end = sgxd_chain_end;
+        const uint32_t fault = ev->chain_fault;
+        ksceKernelSpinlockLowUnlockCpuResumeIntr(&sgxd_chain_lock, st0);
+        const uint32_t at = end & (SGXD_CHAIN_RING - 1u);
+        const uint32_t first = count < SGXD_CHAIN_RING - at ? count : SGXD_CHAIN_RING - at;
+        if (fault) {
+            ret = AZAHAR_ERR_STATE;
+        } else if (SGXD_CHAIN_RING - (end - pos) < count) {
+            ret = AZAHAR_ERR_FULL;
+        } else if (ksceKernelCopyFromUser(&sgxd_chain[at], user_ops, first * sizeof(SgxdOp)) < 0 ||
+                   (first < count &&
+                    ksceKernelCopyFromUser(sgxd_chain, user_ops + first,
+                                           (count - first) * sizeof(SgxdOp)) < 0)) {
+            ret = AZAHAR_ERR_ARG;
+        } else {
+            uint32_t i = 0;
+            while (i < count && sgxd_chain_valid(&sgxd_chain[(end + i) & (SGXD_CHAIN_RING - 1u)])) {
+                i++;
+            }
+            if (i < count) {
+                ret = AZAHAR_ERR_ARG;
+            } else {
+                const SceKernelIntrStatus st =
+                    ksceKernelSpinlockLowLockCpuSuspendIntr(&sgxd_chain_lock);
+                sgxd_chain_end = end + count;
+                if (!sgxd_chain_busy) {
+                    // The queue had run out: this list starts here, the ISR runs the rest.
+                    sgxd_chain_busy = 1;
+                    const uint32_t wait = sgxd_chain_run(ev);
+                    sgxd_write(SGX_MASTER_EVENT_HOST_ENABLE, SGX_TWOD_COMPLETE | wait);
+                }
+                ksceKernelSpinlockLowUnlockCpuResumeIntr(&sgxd_chain_lock, st);
+                ret = (int)(end & 0x7fffffffu);
+            }
+        }
+    }
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdEvents(SgxdEvents *user_events) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (sgxd_state == SGXD_LOST) {
+        ret = SGXD_ERR_LOST;
+    } else if (!user_events) {
+        sgxd_isr_give_back();
+        ret = 0;
+    } else if (!sgxd_gpu_lisr || sgxd_events_uid >= 0) {
+        ret = !sgxd_gpu_lisr ? SGXD_ERR_FIRMWARE : AZAHAR_ERR_STATE;
+    } else {
+        void *page = NULL;
+        SceSize size = 0;
+        SceUInt32 offset = 0;
+        const SceUID uid = ksceKernelUserMap("SceSgxdEvents", 3, user_events, sizeof(SgxdEvents),
+                                             &page, &size, &offset);
+        if (uid < 0) {
+            ret = uid;
+        } else {
+            sgxd_events_uid = uid;
+            sgxd_events = (SgxdEvents *)((uintptr_t)page + offset);
+            sgxd_write(SGX_MASTER_EVENT_HOST_CLEAR, SGX_TWOD_COMPLETE);
+            ret = sgxd_isr_take();
+            if (ret == 0) {
+                sgxd_write(SGX_MASTER_EVENT_HOST_ENABLE, SGX_TWOD_COMPLETE);
+            } else {
+                sgxd_isr_give_back();
+            }
+        }
+    }
+    SGXD_LOG("events %p -> %08x\n", user_events, (uint32_t)ret);
     sgxd_leave();
 out:
     EXIT_SYSCALL(state);

@@ -30,5 +30,7 @@ azaharnative:
         - sgxdFaultDump: 0x3C1A7E17
         - sgxdReadRegs: 0x3C1A7E18
         - sgxdTranslate: 0x3C1A7E19
+        - sgxdEvents: 0x3C1A7E1A
+        - sgxdSubmitAsync: 0x3C1A7E1B
         - azaharModuleUid: 0x3C1A7E35
         - sgxdResetAll: 0x3C1A7E44

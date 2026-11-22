@@ -169,6 +169,9 @@ public:
     void MadI32(Reg dst, Reg src0, uint8_t imm, Reg src2);
     /// dst (one 32-bit register) = (int16) src.<comp>, truncating, from an f32.
     void PackS16(Reg dst, Reg src, uint8_t comp, Pred pred = Pred::None);
+    /// VPCK U8 to F32, unscaled, mask x: byte `byte` (0-3) of `src` (an even register) into dst,
+    /// the one register the unscaled form writes.
+    void UnpackU8(Reg dst, Reg src, uint8_t byte);
     void Nop();
     /// The nop the compiler places right after a kill (a different word from Nop's).
     void NopAfterKill();

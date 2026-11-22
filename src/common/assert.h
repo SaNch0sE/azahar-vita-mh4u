@@ -59,7 +59,9 @@
         exit(1);                                                                                   \
     }())
 
-#ifdef _DEBUG
+// On in debug builds and in the Vita's diagnostics build; the Vita's release build leaves them
+// out.
+#if defined(_DEBUG) || defined(VITA_DIAGNOSTICS)
 #define DEBUG_ASSERT(_a_) ASSERT(_a_)
 #define DEBUG_ASSERT_MSG(_a_, ...) ASSERT_MSG(_a_, __VA_ARGS__)
 #else // not debug

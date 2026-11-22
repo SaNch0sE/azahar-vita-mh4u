@@ -113,6 +113,7 @@ void Refs(Inst& i, std::vector<Ref>& out) {
         out.push_back({&i.src[0].reg, false});
         break;
     case Op::PackS16:
+    case Op::UnpackU8:
         out.push_back({&i.reg[0], true});
         out.push_back({&i.reg[1], false});
         break;
@@ -141,6 +142,7 @@ bool PureWrite(const Inst& i) {
     case Op::MadI16:
     case Op::MadI32:
     case Op::PackS16:
+    case Op::UnpackU8:
         return true;
     default:
         return false; // loads and samples have waits paired with them; tests write predicates
@@ -468,6 +470,13 @@ void Builder::PackS16(Reg dst, Reg src, uint8_t comp, Pred pred) {
     i.pred = pred;
 }
 
+void Builder::UnpackU8(Reg dst, Reg src, uint8_t byte) {
+    Inst& i = Push(Op::UnpackU8);
+    i.reg[0] = dst;
+    i.reg[1] = src;
+    i.u[0] = byte;
+}
+
 void Builder::AddClass(RegClass cls) {
     classes.push_back(cls);
 }
@@ -555,6 +564,9 @@ uint8_t WriteLanes(const Inst& inst, const Reg& r) {
     case Op::MadI16:
     case Op::MadI32:
     case Op::PackS16:
+        mask = 1;
+        break;
+    case Op::UnpackU8:
         mask = 1;
         break;
     default:
@@ -686,7 +698,7 @@ void Lowering::Liveness() {
     for (std::size_t i = 0; i < n; i++) {
         const Inst& inst = insts[i];
         if (inst.op == Op::Lda32 || inst.op == Op::Sample2D || inst.op == Op::MadI16 ||
-            inst.op == Op::MadI32 || inst.op == Op::DepthF) {
+            inst.op == Op::MadI32 || inst.op == Op::DepthF || inst.op == Op::UnpackU8) {
             for (const Reg r : {inst.reg[0], inst.reg[1]}) {
                 if (IsVirtual(r)) {
                     intervals[QuadOf(r)].temp_or_pa = true;
@@ -903,6 +915,9 @@ void WrittenRegs(Inst& inst, std::vector<std::pair<Bank, int>>& out) {
         case Op::MadI16:
         case Op::MadI32:
         case Op::PackS16:
+            mask = 1;
+            break;
+        case Op::UnpackU8:
             mask = 1;
             break;
         default:
@@ -2786,6 +2801,9 @@ void Lowering::CheckInternals() const {
         case Op::PackS16:
             check(inst.reg[1], static_cast<uint8_t>(1u << (inst.u[0] & 3)));
             break;
+        case Op::UnpackU8:
+            check(inst.reg[1], 1);
+            break;
         default:
             Refs(inst, refs);
             for (const Ref& r : refs) {
@@ -3335,6 +3353,9 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             break;
         case Op::PackS16:
             e.PackS16(Map(i.reg[0]), Map(i.reg[1]), i.u[0], i.pred);
+            break;
+        case Op::UnpackU8:
+            e.UnpackU8(Map(i.reg[0]), Map(i.reg[1]), i.u[0]);
             break;
         }
     }

@@ -30,6 +30,13 @@ namespace GxmRenderer {
  *   latelog   the late skip's late frames: each kept draw reading a colour buffer whose draws
  *             the same frame dropped, the transfers (dropped or not) and the fills (400 lines
  *             each); latelog_at=S from S seconds of the process's time on
+ *   ptlapoll  fills and DMAs are polled on the render thread, as before sgxd's interrupt
+ *             (sgxd_ptla_events): the comparison for the asynchronous default, where the render
+ *             thread does not wait for them and the emulation thread raises their GSP
+ *             interrupts once the ISR has counted them; also makes renders synchronous
+ *   renderpoll renders run as the render thread's six syscalls, waiting for the TA and the 3D,
+ *             instead of one async list the ISR finishes (sgxd_session_render_async), where
+ *             P3D waits for the TA and PPF for the render on the emulation thread
  *   grid2     sgxd targets below 960x544 are a 2x2 grid of macrotiles, as Sony's kernel makes
  *             them (4x4 at every size otherwise): the cores' balance
  *   fsload    every fragment program's code from host0:fsload.gxp (a GXP's primary
