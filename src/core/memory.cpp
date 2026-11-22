@@ -182,9 +182,9 @@ public:
     // renders into it, and the CPU sees what it wrote with no cache maintenance.
     Common::HostSharedMemory vram{Memory::VRAM_SIZE, "azahar-vram",
                                   Common::HostSharedMemory::Placement::GpuLocal};
-    // Only a New 3DS has this, and only an Old 3DS is emulated, so it is never allocated. The
-    // block stays declared because the physical-address paths still name the region.
-    Common::HostSharedMemory n3ds_extra_ram{0, "azahar-n3ds-ram"};
+    // Only a New 3DS has this: allocated for a New 3DS title (Core::System::IsNew3ds), empty for
+    // every other one.
+    Common::HostSharedMemory n3ds_extra_ram;
     Common::HostSharedMemory dsp_ram{Memory::DSP_RAM_SIZE, "azahar-dsp-ram"};
 
     MappingObserver* mapping_observer{};
@@ -463,14 +463,18 @@ private:
     friend class boost::serialization::access;
     template <class Archive>
     void serialize(Archive& ar, const unsigned int file_version) {
-        // Kept in the stream so the savestate layout does not move; always false now.
-        bool save_n3ds_ram = false;
+        // Whether the state has the New 3DS's extra RAM (a New 3DS title's); FCRAM is 128 MB
+        // either way.
+        bool save_n3ds_ram = n3ds_extra_ram.Size() != 0;
         ar & save_n3ds_ram;
+        ASSERT_MSG(save_n3ds_ram == (n3ds_extra_ram.Size() != 0),
+                   "savestate: {} New 3DS extra RAM, the running title {}",
+                   save_n3ds_ram ? "with" : "without",
+                   n3ds_extra_ram.Size() != 0 ? "has it" : "does not");
         ar& boost::serialization::make_binary_object(vram.Data(), Memory::VRAM_SIZE);
-        ar& boost::serialization::make_binary_object(
-            fcram.Data(), save_n3ds_ram ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE);
-        ar& boost::serialization::make_binary_object(
-            n3ds_extra_ram.Data(), save_n3ds_ram ? Memory::N3DS_EXTRA_RAM_SIZE : 0);
+        ar& boost::serialization::make_binary_object(fcram.Data(), Memory::FCRAM_SIZE);
+        ar& boost::serialization::make_binary_object(n3ds_extra_ram.Data(),
+                                                     n3ds_extra_ram.Size());
         ar& boost::serialization::make_binary_object(dsp_ram.Data(), Memory::DSP_RAM_SIZE);
         ar & cache_marker;
         ar & page_table_list;
@@ -517,7 +521,8 @@ private:
 };
 
 MemorySystem::Impl::Impl(Core::System& system_)
-    : system{system_}, fcram_mem(std::make_shared<BackingMemImpl<Region::FCRAM>>(*this)),
+    : n3ds_extra_ram{system_.IsNew3ds() ? Memory::N3DS_EXTRA_RAM_SIZE : 0u, "azahar-n3ds-ram"},
+      system{system_}, fcram_mem(std::make_shared<BackingMemImpl<Region::FCRAM>>(*this)),
       vram_mem(std::make_shared<BackingMemImpl<Region::VRAM>>(*this)),
       n3ds_extra_ram_mem(std::make_shared<BackingMemImpl<Region::N3DS>>(*this)),
       dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {}

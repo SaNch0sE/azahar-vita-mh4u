@@ -415,8 +415,19 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     ASSERT(n3ds_hw_caps.first);
     app_n3ds_hw_capabilities = n3ds_hw_caps.first.value();
 
-    if (app_loader->IsN3DSExclusive()) {
-        return ResultStatus::ErrorN3DSApplication;
+    // A New 3DS title runs as on a New 3DS, and with Settings' is_new_3ds every title: the New
+    // 3DS's Prod memory mode within the Old 3DS's 128 MB of FCRAM (Kernel::MemoryInit), its extra
+    // RAM, and a third core for the threads it puts on core 2 (core 3 is the system's). Every
+    // other title runs as on an Old 3DS. An Old 3DS title there (Legacy) keeps its Old 3DS
+    // memory limit (the loader's commit limit, KernelSystem::UpdateReportedMemory).
+    new_3ds = Settings::values.is_new_3ds.GetValue() || app_loader->IsN3DSExclusive();
+    if (new_3ds) {
+        const Kernel::New3dsMemoryMode n3ds_mode = app_n3ds_hw_capabilities.memory_mode;
+        ASSERT_MSG(n3ds_mode == Kernel::New3dsMemoryMode::NewProd ||
+                       n3ds_mode == Kernel::New3dsMemoryMode::Legacy,
+                   "a title in New 3DS memory mode {}: only Prod's 124 MB fits in FCRAM",
+                   static_cast<u32>(n3ds_mode));
+        system_mem_mode = Kernel::MemoryMode::NewProd;
     }
 
     // If the default mem mode has been used, we do not come from a FIRM launch. On real HW
@@ -441,8 +452,8 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
         }
     }
 
-    // The Old 3DS has two application cores; the New 3DS's four are not emulated.
-    const u32 num_cores = 2;
+    // The Old 3DS has two application cores; a New 3DS title gets core 2 as well.
+    const u32 num_cores = new_3ds ? 3 : 2;
     ResultStatus init_result{Init(emu_window, secondary_window, system_mem_mode, num_cores)};
     if (init_result != ResultStatus::Success) {
         LOG_CRITICAL(Core, "Failed to initialize system (Error {})!",
@@ -1065,6 +1076,9 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
         // Shutdown, but persist a few things between loads...
         SavestateTrace("shutting down for the load");
         Shutdown(true);
+        // The console the state was saved on, whatever the title was loaded as.
+        new_3ds =
+            mem_mode == Kernel::MemoryMode::NewProd || mem_mode == Kernel::MemoryMode::NewDev1;
         SavestateTrace("re-initialising");
 
         [[maybe_unused]] const System::ResultStatus result =

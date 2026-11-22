@@ -36,8 +36,11 @@ static const u32 memory_region_sizes[8][3] = {
     {0x04800000, 0x02400000, 0x01400000}, // 4
     {0x02000000, 0x04C00000, 0x01400000}, // 5
 
-    // New 3DS layouts
-    {0x07C00000, 0x06400000, 0x02000000}, // 6
+    // New 3DS layouts. FCRAM stays the Old 3DS's 128 MB: Prod's application region whole (124
+    // MB; a New 3DS gives SYSTEM 100 MB and BASE 32 MB more), SYSTEM what the HLE puts there (the
+    // shared font's 3272 KB, applets' blocks), BASE the services' shared pages and TLS. Dev1's
+    // 178 MB cannot fit.
+    {0x07C00000, 0x00380000, 0x00080000}, // 6
     {0x0B200000, 0x02E00000, 0x02000000}, // 7
 };
 
@@ -144,9 +147,9 @@ void KernelSystem::HandleSpecialMapping(VMManager& address_space, const AddressM
         return;
     }
 
-    if (area->paddr_base == N3DS_EXTRA_RAM_PADDR) {
-        // Only a New 3DS has this memory, and only an Old 3DS is emulated: it was never
-        // allocated, and mapping it would hand the process a window onto nothing.
+    if (area->paddr_base == N3DS_EXTRA_RAM_PADDR && !Core::System::GetInstance().IsNew3ds()) {
+        // Only a New 3DS has this memory, allocated for a New 3DS title alone: mapping it for an
+        // Old 3DS one would hand the process a window onto nothing.
         LOG_ERROR(Loader,
                   "Title asked for the New 3DS extra RAM: address=0x{:08X} size=0x{:X}",
                   mapping.address, mapping.size);

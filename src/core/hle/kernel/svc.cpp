@@ -1876,7 +1876,7 @@ Result SVC::GetSystemInfo(s64* out, u32 type, s32 param) {
             *out = kernel.GetMemoryRegion(MemoryRegion::APPLICATION)->size;
             break;
         case SystemInfoLumaCFWInformation::IS_N3DS:
-            *out = 0; // only the Old 3DS is emulated
+            *out = system.IsNew3ds() ? 1 : 0;
             break;
         default:
             LOG_ERROR(Kernel_SVC, "unknown GetSystemInfo type=0x10000 region: param={}", param);

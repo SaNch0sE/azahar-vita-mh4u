@@ -1282,7 +1282,7 @@ ResultVal<Service::FS::MediaType> AppletManager::Unknown54(u32 in_param) {
 }
 
 TargetPlatform AppletManager::GetTargetPlatform() {
-    return TargetPlatform::Old3ds;
+    return system.IsNew3ds() ? TargetPlatform::New3ds : TargetPlatform::Old3ds;
 }
 
 ApplicationRunningMode AppletManager::GetApplicationRunningMode() {
@@ -1556,8 +1556,9 @@ Result AppletManager::PrepareToStartNewestHomeMenu() {
     }
 
     bool is_standard;
-    // Memory layout is standard if it is Prod (64MB); only the Old 3DS is emulated.
-    is_standard = system.Kernel().GetMemoryMode() == Kernel::MemoryMode::Prod;
+    // Memory layout is standard if it is Prod (64MB), or NewProd (124MB) for a New 3DS title.
+    is_standard = system.Kernel().GetMemoryMode() ==
+                  (system.IsNew3ds() ? Kernel::MemoryMode::NewProd : Kernel::MemoryMode::Prod);
 
     if (is_standard) {
         return Result{ErrorDescription::AlreadyExists, ErrorModule::Applet,

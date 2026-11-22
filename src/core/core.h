@@ -181,6 +181,13 @@ public:
         return is_powered_on;
     }
 
+    /// Whether the title runs as on a New 3DS: a New 3DS title does, and every title with
+    /// Settings' is_new_3ds (Load); every other one runs as on an Old 3DS. A loaded state runs
+    /// as it was saved.
+    [[nodiscard]] bool IsNew3ds() const {
+        return new_3ds;
+    }
+
     /// Prepare the core emulation for a reschedule
     void PrepareReschedule();
 
@@ -534,6 +541,9 @@ private:
     std::vector<std::shared_ptr<ARM_Interface>> cpu_cores;
     ARM_Interface* running_core = nullptr;
     CodeSyncBatch* code_sync_batch = nullptr;
+
+    /// IsNew3ds, set by Load before the system's parts are made.
+    bool new_3ds = false;
 
     /// DSP core
     std::unique_ptr<AudioCore::DspInterface> dsp_core;

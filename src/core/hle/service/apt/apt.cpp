@@ -1511,7 +1511,7 @@ void Module::APTInterface::CheckNew3DS(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_APT, "called");
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
-    PTM::CheckNew3DS(rb);
+    PTM::CheckNew3DS(rb, apt->system.IsNew3ds());
 }
 
 void Module::APTInterface::GetApplicationRunningMode(Kernel::HLERequestContext& ctx) {
@@ -1530,8 +1530,9 @@ void Module::APTInterface::IsStandardMemoryLayout(Kernel::HLERequestContext& ctx
     LOG_DEBUG(Service_APT, "called");
 
     bool is_standard;
-    // Memory layout is standard if it is Prod (64MB); only the Old 3DS is emulated.
-    is_standard = apt->system.Kernel().GetMemoryMode() == Kernel::MemoryMode::Prod;
+    // Memory layout is standard if it is Prod (64MB), or NewProd (124MB) for a New 3DS title.
+    is_standard = apt->system.Kernel().GetMemoryMode() ==
+                  (apt->system.IsNew3ds() ? Kernel::MemoryMode::NewProd : Kernel::MemoryMode::Prod);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);

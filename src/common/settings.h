@@ -486,6 +486,9 @@ struct Values {
     // Core
     Setting<bool> use_cpu_jit{true, Keys::use_cpu_jit};
     SwitchableSetting<s32, true> cpu_clock_percentage{100, 5, 400, Keys::cpu_clock_percentage};
+    /// Every title runs as on a New 3DS; off, only the New 3DS's own titles do. Read as a title
+    /// loads (Core::System::Load).
+    Setting<bool> is_new_3ds{false, Keys::is_new_3ds};
     SwitchableSetting<bool> lle_applets{true, Keys::lle_applets};
     SwitchableSetting<bool> deterministic_async_operations{false,
                                                            Keys::deterministic_async_operations};

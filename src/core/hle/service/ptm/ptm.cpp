@@ -118,9 +118,7 @@ void Module::Interface::GetSoftwareClosedFlag(Kernel::HLERequestContext& ctx) {
     LOG_WARNING(Service_PTM, "(STUBBED) called");
 }
 
-void CheckNew3DS(IPC::RequestBuilder& rb) {
-    const bool is_new_3ds = false; // only the Old 3DS is emulated
-
+void CheckNew3DS(IPC::RequestBuilder& rb, bool is_new_3ds) {
     rb.Push(ResultSuccess);
     rb.Push(is_new_3ds);
 
@@ -131,7 +129,7 @@ void Module::Interface::CheckNew3DS(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
-    Service::PTM::CheckNew3DS(rb);
+    Service::PTM::CheckNew3DS(rb, ptm->system.IsNew3ds());
 }
 
 void Module::Interface::SetInfoLEDPattern(Kernel::HLERequestContext& ctx) {

@@ -218,7 +218,7 @@ ResultStatus Apploader_Artic::LoadExecImpl(std::shared_ptr<Kernel::Process>& pro
     auto& ncch_caps = exheader.arm11_system_local_caps;
     const auto o3ds_mode = *LoadKernelMemoryMode().first;
     const auto n3ds_mode = static_cast<Kernel::New3dsMemoryMode>(ncch_caps.n3ds_mode);
-    constexpr bool is_new_3ds = false; // only the Old 3DS is emulated
+    const bool is_new_3ds = system.IsNew3ds();
     if (is_new_3ds && n3ds_mode == Kernel::New3dsMemoryMode::Legacy &&
         category == Kernel::ResourceLimitCategory::Application) {
         u64 new_limit = 0;

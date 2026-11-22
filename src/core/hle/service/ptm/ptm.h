@@ -43,7 +43,8 @@ struct GameCoin {
     u8 day;
 };
 
-void CheckNew3DS(IPC::RequestBuilder& rb);
+/// Answers a CheckNew3DS request: whether the title runs as on a New 3DS.
+void CheckNew3DS(IPC::RequestBuilder& rb, bool is_new_3ds);
 
 class Module final {
 public:

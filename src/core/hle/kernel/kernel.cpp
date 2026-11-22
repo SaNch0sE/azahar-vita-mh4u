@@ -8,6 +8,7 @@
 #include "common/archives.h"
 #include "common/serialization/atomic.h"
 #include "common/settings.h"
+#include "core/core.h"
 #include "core/hle/kernel/client_port.h"
 #include "core/hle/kernel/config_mem.h"
 #include "core/hle/kernel/handle_table.h"
@@ -196,6 +197,9 @@ void KernelSystem::UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
     if (tid_high != TID_HIGH_APPLET && tid_high != TID_HIGH_SYSMODULE) {
         UpdateReportedMemory(memory_mode, n3ds_hw_cap.memory_mode);
     }
+    // A New 3DS title's 804 MHz clock, as APT reports it (GetApplicationRunningMode); the
+    // emulation's pace is the same either way.
+    SetRunning804MHz(Core::System::GetInstance().IsNew3ds() && n3ds_hw_cap.enable_804MHz_cpu);
 }
 
 void KernelSystem::RestoreMemoryState(u64 title_id) {

@@ -578,10 +578,13 @@ void Module::Interface::GetSystemModel(Kernel::HLERequestContext& ctx) {
                                 reinterpret_cast<u8*>(&data)));
     ConsoleModelInfo model;
     std::memcpy(&model, &data, 4);
-    // Only the Old 3DS is emulated, so a New 3DS model in the config block is reported as its
-    // Old 3DS equivalent.
-    if (model.model == NEW_NINTENDO_3DS || model.model == NEW_NINTENDO_3DS_XL ||
-        model.model == NEW_NINTENDO_2DS_XL) {
+    // The model the title runs as: a New 3DS model in the config block reported as its Old 3DS
+    // equivalent for an Old 3DS title, an Old 3DS one as the New 3DS XL for a New 3DS title.
+    const bool new_model = model.model == NEW_NINTENDO_3DS || model.model == NEW_NINTENDO_3DS_XL ||
+                           model.model == NEW_NINTENDO_2DS_XL;
+    if (cfg->system.IsNew3ds() && !new_model) {
+        model.model = NEW_NINTENDO_3DS_XL;
+    } else if (!cfg->system.IsNew3ds() && new_model) {
         model.model = NINTENDO_3DS_XL;
     }
     std::memcpy(&data, &model, 4);
