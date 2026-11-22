@@ -140,12 +140,12 @@ target_sources(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
                                   ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c
                                   ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_mkq.c
                                   ${CMAKE_SOURCE_DIR}/vita_native/src/sgxd_mk.c
-                                  ${CMAKE_SOURCE_DIR}/vita_native/src/sgxd_usse.c)
+                                  ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_usse.c)
 set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
     ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_mkq.c
     PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 set_source_files_properties(${CMAKE_SOURCE_DIR}/vita_native/src/sgxd_mk.c
-    ${CMAKE_SOURCE_DIR}/vita_native/src/sgxd_usse.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+    ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_usse.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON
     COMPILE_OPTIONS "-Wno-error")
 
 create_target_directory_groups(video_core)

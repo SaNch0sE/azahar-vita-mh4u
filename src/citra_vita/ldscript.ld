@@ -130,13 +130,9 @@ SECTIONS
   /* Adjust the address for the data segment.  We want to adjust up to
      the same address within the page on the next page up.  */
   . = ALIGN(CONSTANT (MAXPAGESIZE)) + (. & (CONSTANT (MAXPAGESIZE) - 1));
-  /* [2] vita-elf-create appends the SCE module information into the address-space gap between
-     the end of the text segment and the start of the data segment. The align below leaves
-     anywhere from nothing to a full page of gap depending on where the text happens to end, so
-     a change in code size can make the packaging step fail with "Cannot allocate N bytes for
-     SCE data at end of segment 0". Reserving 16K first guarantees the gap, and the align after
-     it still lands the data segment on a 64K boundary. A hole in the address space only: it
-     costs nothing in the file and nothing at load. */
+  /* [2] vita-elf-create puts the SCE module information into the gap between the text and
+     data segments; the align alone may leave no gap ("Cannot allocate N bytes for SCE data at
+     end of segment 0"). Reserving 16K guarantees it; an address-space hole only. */
   . = . + 0x4000;
   /* Hacky hackity hack. Need this because otherwise data segment is not aligned enough. */
   . = ALIGN(0x10000);

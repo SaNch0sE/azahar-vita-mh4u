@@ -11,6 +11,7 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <utility>
+#include "sgxd_usse_enc.h"
 #include "video_core/renderer_sgxd/usse/usse_encoder.h"
 
 namespace SgxdRenderer::Usse {
@@ -76,25 +77,10 @@ constexpr Layout PatSop2 =
     MakeLayout("10000ppcsnaaderbmooofllggghhhittkkjjqqqqqqquvvwwxyzzzzzzzAAAAAAA");
 constexpr Layout PatSop3 =
     MakeLayout("10001ppcsnooderbmallfgghhhiiikttjjqquuuuuuuvvvvvvvwwwwwwwxxxxxxx");
-// Bit 54 ('-' in Vita3K's pattern) is the compare's nosched bit, where VPCK and SMP have
-// theirs; exposed as 'K'. (It looked like "set on every compare except the one feeding a
-// kill" until the liveness rule explained it.)
-constexpr Layout PatVtst =
-    MakeLayout("01001pppsKoydrceavttiizzmhhhnnbbkkffgggggggwlluuuujjjjjjjqqqqqqq");
 constexpr Layout PatSmp =
     MakeLayout("11100pppsn-ymrceffaaddlltbbggkhhiijjoooooooqqqqqqquuuuuuuvvvvvvv");
-constexpr Layout PatVldst =
-    MakeLayout("111oopppsnmycrbakkkkddeetgffihjlqquuvvvvvvvwwwwwwwxxxxxxxzzzzzzz");
-constexpr Layout PatVbw =
-    MakeLayout("01ooopppsnrydecxaaaaittttthhbwkkffggjjjjjjjlllllllmmmmmmmqqqqqqq");
-constexpr Layout PatI16Mad =
-    MakeLayout("10100ppasnredbck-tttmmffoolhhgiijjqquuuuuuuvvvvvvvwwwwwwwxxxxxxx");
-constexpr Layout PatI32Mad =
-    MakeLayout("10101pps-nrcdeba0tttif00yy000kgghhjjlllllllmmmmmmmoooooooqqqqqqq");
 constexpr Layout PatDepthf =
     MakeLayout("11111011s-11recb----npp---tffa--kkddggggggghhhhhhhiiiiiiijjjjjjj");
-constexpr Layout PatBr =
-    MakeLayout("11111ppps000e-----wynba00r----------------iloooooooooooooooooooo");
 
 struct Field {
     char letter;
@@ -103,6 +89,14 @@ struct Field {
 
 [[noreturn]] void Fail(const char* what) {
     throw std::logic_error(what);
+}
+
+/// A shared builder's word (sgxd_usse_enc.h), or the failure when a field did not fit.
+uint64_t Checked(uint64_t word, int bad, const char* form) {
+    if (bad) {
+        Fail((std::string("usse: a field does not fit in ") + form).c_str());
+    }
+    return word;
 }
 
 uint64_t Pack(const Layout& layout, std::initializer_list<Field> fields) {
@@ -486,28 +480,31 @@ void Encoder::FinishNosched() {
 }
 
 void Encoder::EndVertex() {
-    Push(0xfb275000a0200000ull, 0, 0, 0);
+    Push(SGXD_USSE_EMITVTX_END, 0, 0, 0);
 }
 
 void Encoder::EndSecondary() {
-    Push(0xf804014000000000ull, 0, 0, 0);
+    int bad = 0;
+    Push(Checked(sgxd_usse_nop(0, 1, &bad), bad, "NOP"), 0, 0, 0);
 }
 
 void Encoder::WdfVertex(uint8_t drc) {
     // Bit 43 is the wait's nosched bit (psp2cgc's `f9200800...` form before an internal
     // register write): without it the boundary after the instruction that follows the wait is
     // unguarded, and every dynamic uniform read is corrupted.
-    Push(drc ? 0xf920000100000000ull : 0xf920000000000000ull, 43, 0, 0);
+    int bad = 0;
+    Push(Checked(sgxd_usse_wdf(drc ? 1 : 0, 0, &bad), bad, "WDF"), 43, 0, 0);
 }
 
 std::size_t Encoder::Br(Pred pred) {
     const std::size_t index = words.size();
-    // Letters as Vita3K's pattern names them: s syncend, e exception, w pwait, y sync_ext,
-    // n nosched, b br_monitor, a save_link, r br_type, i any_inst, l all_inst.
-    Push(Pack(PatBr, {
-        {'p', ExtPred(pred)}, {'s', 0}, {'e', 0}, {'w', 0}, {'y', 0}, {'n', 0}, {'b', 0},
-        {'a', 0}, {'r', 1}, {'i', 0}, {'l', 0}, {'o', 0},
-    }), 43, 0, 0);
+    int bad = 0;
+    // A relative branch; PatchBr writes its offset.
+    Push(Checked(sgxd_usse_br(sgxd_usse_br_fields{.pred = static_cast<uint32_t>(ExtPred(pred)),
+                                                  .br_type = 1},
+                              &bad),
+                 bad, "BR"),
+         43, 0, 0);
     return index;
 }
 
@@ -566,13 +563,26 @@ void Encoder::Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_
         s1ext = e;
         s1n = SingleNum(r, 7);
     }
-    Push(Pack(PatVldst, {
-        {'o', 1}, {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'m', 0}, {'y', 0}, {'c', 0},
-        {'r', bext}, {'b', s1ext}, {'a', 1}, {'k', static_cast<uint64_t>(count - 1)}, {'d', 0},
-        {'e', 0}, {'t', dest_pa}, {'g', 0}, {'f', 0}, {'i', 0}, {'h', bb}, {'j', 0}, {'l', drc},
-        {'q', s1b}, {'u', 2}, {'v', SingleNum(dst, 7)}, {'w', SingleNum(base_sa, 7)},
-        {'x', s1n}, {'z', 0},
-    }), 54, 0, 0);
+    int bad = 0;
+    const uint64_t word = sgxd_usse_vldst(
+        sgxd_usse_vldst_fields{
+            .op = 1,
+            .skipinv = skip_invalid ? 1u : 0u,
+            .src0_bank_ext = static_cast<uint32_t>(bext),
+            .src1_bank_ext = static_cast<uint32_t>(s1ext),
+            .src2_bank_ext = 1,
+            .mask_count = static_cast<uint32_t>(count - 1),
+            .dest_bank_primattr = static_cast<uint32_t>(dest_pa),
+            .src0_bank = static_cast<uint32_t>(bb),
+            .drc_sel = drc,
+            .src1_bank = static_cast<uint32_t>(s1b),
+            .src2_bank = 2,
+            .dest_n = static_cast<uint32_t>(SingleNum(dst, 7)),
+            .src0_n = static_cast<uint32_t>(SingleNum(base_sa, 7)),
+            .src1_n = static_cast<uint32_t>(s1n),
+        },
+        &bad);
+    Push(Checked(word, bad, "VLDST"), 54, 0, 0);
 }
 
 void Encoder::Sta32(Reg base, uint8_t offset_words, Reg value, uint8_t drc) {
@@ -585,16 +595,31 @@ void Encoder::Sta32(Reg base, uint8_t offset_words, Reg value, uint8_t drc) {
     const auto [vb, vext] = IntSrc12Bank(value.bank);
     // op 2 (store), one word; moe_expand and the L1/L2 bypass set as in the firmware's word
     // f022000280004282.
-    Push(Pack(PatVldst, {
-        {'o', 2}, {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'m', 1}, {'y', 0}, {'c', 0},
-        {'r', bext}, {'b', 1}, {'a', vext}, {'k', 0}, {'d', 0}, {'e', 0}, {'t', 0}, {'g', 0},
-        {'f', 0}, {'i', 0}, {'h', bb}, {'j', 1}, {'l', drc}, {'q', 2}, {'u', vb}, {'v', 0},
-        {'w', SingleNum(base, 7)}, {'x', offset_words}, {'z', SingleNum(value, 7)},
-    }), 54, 0, 0);
+    int bad = 0;
+    const uint64_t word = sgxd_usse_vldst(
+        sgxd_usse_vldst_fields{
+            .op = 2,
+            .skipinv = skip_invalid ? 1u : 0u,
+            .moe_expand = 1,
+            .src0_bank_ext = static_cast<uint32_t>(bext),
+            .src1_bank_ext = 1,
+            .src2_bank_ext = static_cast<uint32_t>(vext),
+            .src0_bank = static_cast<uint32_t>(bb),
+            .cache_by_pass12 = 1,
+            .drc_sel = drc,
+            .src1_bank = 2,
+            .src2_bank = static_cast<uint32_t>(vb),
+            .src0_n = static_cast<uint32_t>(SingleNum(base, 7)),
+            .src1_n = offset_words,
+            .src2_n = static_cast<uint32_t>(SingleNum(value, 7)),
+        },
+        &bad);
+    Push(Checked(word, bad, "VLDST"), 54, 0, 0);
 }
 
 void Encoder::Idf(uint8_t drc) {
-    Push(drc ? 0xf820000100000000ull : 0xf820000000000000ull, 0, 0, 0);
+    int bad = 0;
+    Push(Checked(sgxd_usse_idf(drc ? 1 : 0, &bad), bad, "IDF"), 0, 0, 0);
 }
 
 void Encoder::Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred) {
@@ -619,12 +644,25 @@ void Encoder::Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred) {
     case BwOp::Or: op1 = 2; op2 = 1; break;
     case BwOp::Xor: op1 = 3; op2 = 0; break;
     }
-    Push(Pack(PatVbw, {
-        {'o', op1}, {'p', ExtPred(pred)}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'r', 0}, {'y', 0},
-        {'d', dext}, {'e', 0}, {'c', s1[1]}, {'x', s2[1]}, {'a', 0}, {'i', 0}, {'t', 0}, {'h', 0},
-        {'b', op2}, {'w', 0}, {'k', db}, {'f', s1[0]}, {'g', s2[0]}, {'j', SingleNum(dst, 7)},
-        {'l', 0}, {'m', s1[2]}, {'q', s2[2]},
-    }), 54, 0, 0);
+    int bad = 0;
+    const uint64_t word = sgxd_usse_vbw(
+        sgxd_usse_vbw_fields{
+            .op1 = static_cast<uint32_t>(op1),
+            .pred = static_cast<uint32_t>(ExtPred(pred)),
+            .skipinv = skip_invalid ? 1u : 0u,
+            .dest_ext = static_cast<uint32_t>(dext),
+            .src1_ext = static_cast<uint32_t>(s1[1]),
+            .src2_ext = static_cast<uint32_t>(s2[1]),
+            .op2 = static_cast<uint32_t>(op2),
+            .dest_bank = static_cast<uint32_t>(db),
+            .src1_bank = static_cast<uint32_t>(s1[0]),
+            .src2_bank = static_cast<uint32_t>(s2[0]),
+            .dest_n = static_cast<uint32_t>(SingleNum(dst, 7)),
+            .src1_n = static_cast<uint32_t>(s1[2]),
+            .src2_n = static_cast<uint32_t>(s2[2]),
+        },
+        &bad);
+    Push(Checked(word, bad, "VBW"), 54, 0, 0);
 }
 
 void Encoder::MadI16(Reg dst, Reg src0, Reg src1, IOp src2) {
@@ -648,12 +686,26 @@ void Encoder::MadI16(Reg dst, Reg src0, Reg src1, IOp src2) {
         s2n = SingleNum(r, 7);
         s2fmt = 0;
     }
-    Push(Pack(PatI16Mad, {
-        {'p', 0}, {'a', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'r', 0}, {'e', 0}, {'d', dext},
-        {'b', 0}, {'c', s1ext}, {'k', s2ext}, {'t', 0}, {'m', 2}, {'f', s2fmt}, {'o', 0}, {'l', 0},
-        {'h', 0}, {'g', s0b}, {'i', db}, {'j', s1b}, {'q', s2b}, {'u', SingleNum(dst, 7)},
-        {'v', SingleNum(src0, 7)}, {'w', SingleNum(src1, 7)}, {'x', s2n},
-    }), 54, 0, 0);
+    int bad = 0;
+    const uint64_t word = sgxd_usse_i16mad(
+        sgxd_usse_i16mad_fields{
+            .skipinv = skip_invalid ? 1u : 0u,
+            .dest_bank_ext = static_cast<uint32_t>(dext),
+            .src1_bank_ext = static_cast<uint32_t>(s1ext),
+            .src2_bank_ext = static_cast<uint32_t>(s2ext),
+            .mode = 2,
+            .src2_format = static_cast<uint32_t>(s2fmt),
+            .src0_bank = static_cast<uint32_t>(s0b),
+            .dest_bank = static_cast<uint32_t>(db),
+            .src1_bank = static_cast<uint32_t>(s1b),
+            .src2_bank = static_cast<uint32_t>(s2b),
+            .dest_n = static_cast<uint32_t>(SingleNum(dst, 7)),
+            .src0_n = static_cast<uint32_t>(SingleNum(src0, 7)),
+            .src1_n = static_cast<uint32_t>(SingleNum(src1, 7)),
+            .src2_n = static_cast<uint32_t>(s2n),
+        },
+        &bad);
+    Push(Checked(word, bad, "I16MAD"), 54, 0, 0);
 }
 
 void Encoder::MadI32(Reg dst, Reg src0, uint8_t imm, Reg src2) {
@@ -673,14 +725,27 @@ void Encoder::MadI32(Reg dst, Reg src0, uint8_t imm, Reg src2) {
         Fail("usse: mad.i32's immediate is a signed 7 bits");
     }
     const auto [s2b, s2ext] = IntSrc12Bank(src2.bank);
-    // The compiler's words have bit 55 set and bit 56 clear, where Vita3K's pattern puts
-    // skipinv at 56 and a don't-care at 55; written as the compiler writes them.
-    Push(Pack(PatI32Mad, {
-        {'p', 0}, {'s', 0}, {'n', 0}, {'r', 0}, {'c', 0}, {'d', 0}, {'e', dext},
-        {'b', 1}, {'a', s2ext}, {'t', 0}, {'i', 1}, {'f', 0}, {'y', 2}, {'k', s0b}, {'g', db},
-        {'h', 2}, {'j', s2b}, {'l', SingleNum(dst, 7)}, {'m', SingleNum(src0, 7)}, {'o', imm},
-        {'q', SingleNum(src2, 7)},
-    }) | (1ull << 55), 54, 0, 0);
+    // The compiler's words have bit 55 set, a don't-care in Vita3K's pattern. dext goes in the
+    // bit Vita3K names end: 0 for every destination mad.i32 is given.
+    int bad = 0;
+    const uint64_t word = sgxd_usse_i32mad(
+        sgxd_usse_i32mad_fields{
+            .end = static_cast<uint32_t>(dext),
+            .src1_bank_ext = 1,
+            .src2_bank_ext = static_cast<uint32_t>(s2ext),
+            .is_signed = 1,
+            .src2_type = 2,
+            .src0_bank = static_cast<uint32_t>(s0b),
+            .dest_bank = static_cast<uint32_t>(db),
+            .src1_bank = 2,
+            .src2_bank = static_cast<uint32_t>(s2b),
+            .dest_n = static_cast<uint32_t>(SingleNum(dst, 7)),
+            .src0_n = static_cast<uint32_t>(SingleNum(src0, 7)),
+            .src1_n = imm,
+            .src2_n = static_cast<uint32_t>(SingleNum(src2, 7)),
+        },
+        &bad);
+    Push(Checked(word, bad, "I32MAD") | (1ull << 55), 54, 0, 0);
 }
 
 void Encoder::PackS16(Reg dst, Reg src, uint8_t comp, Pred pred) {
@@ -725,20 +790,27 @@ void Encoder::UnpackInt(Reg dst, Reg src, uint8_t select, uint8_t format) {
 }
 
 void Encoder::Phas(bool wait_all) {
-    Push(wait_all ? 0xfa44070000000000ull : 0xfa44010000000000ull, 0, 0, 0);
+    int bad = 0;
+    Push(Checked(sgxd_usse_phas(sgxd_usse_phas_fields{.imm = 1, .wait_cond = wait_all ? 7u : 1u},
+                                &bad),
+                 bad, "PHAS"),
+         0, 0, 0);
 }
 
 void Encoder::Nop() {
-    Push(0xf800094000000000ull, 0, 0, 0);
+    int bad = 0;
+    Push(Checked(sgxd_usse_nop(1, 0, &bad), bad, "NOP"), 0, 0, 0);
 }
 
 void Encoder::NopAfterKill() {
-    Push(0xf804014000000000ull, 0, 0, 0);
+    int bad = 0;
+    Push(Checked(sgxd_usse_nop(0, 1, &bad), bad, "NOP"), 0, 0, 0);
 }
 
 void Encoder::Wdf(uint8_t drc) {
     // Bit 43 (nosched) is placed by FinishNosched, as for every other instruction.
-    Push(drc ? 0xf920000100000000ull : 0xf920000000000000ull, 43, 0, 0);
+    int bad = 0;
+    Push(Checked(sgxd_usse_wdf(drc ? 1 : 0, 0, &bad), bad, "WDF"), 43, 0, 0);
 }
 
 void Encoder::KillUnlessP1() {
@@ -1393,14 +1465,32 @@ void Encoder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2,
     case Cond::Eq: sign = 0; zero = 1; andc = 1; break; // psp2cgc's cmp.eq.f32
     case Cond::Ne: sign = 0; zero = 2; andc = 1; break;
     }
-    Push(Pack(PatVtst, {
-        {'p', ExtPred(pred)}, {'s', skip_invalid ? 1u : 0u}, {'K', 0}, {'o', 0}, {'y', 0}, {'d', 1},
-        {'r', (src1.mod == Mod::Neg) ? 1u : 0u}, {'c', s1ext}, {'e', s2ext}, {'a', 1},
-        {'v', src2_scalar ? 1u : 0u}, {'t', 0}, {'i', sign}, {'z', zero}, {'m', andc},
-        {'h', chan}, {'n', pred_n}, {'b', 1}, {'k', s1b}, {'f', s2b}, {'g', 0}, {'w', 0},
-        {'l', 0}, {'u', alu == TestAlu::Mul ? 13u : 14u}, {'j', DoubledNum(src1.reg, 8)},
-        {'q', DoubledNum(src2.reg, 8)},
-    }), 54, ReadsOne(src1.reg, chan) | ReadsOne(src2.reg, src2_scalar ? 0 : chan), 0);
+    int bad = 0;
+    const uint64_t word = sgxd_usse_vtst(
+        sgxd_usse_vtst_fields{
+            .pred = static_cast<uint32_t>(ExtPred(pred)),
+            .skipinv = skip_invalid ? 1u : 0u,
+            .dest_ext = 1,
+            .src1_neg = (src1.mod == Mod::Neg) ? 1u : 0u,
+            .src1_ext = static_cast<uint32_t>(s1ext),
+            .src2_ext = static_cast<uint32_t>(s2ext),
+            .prec = 1,
+            .src2_vscomp = src2_scalar ? 1u : 0u,
+            .sign_test = static_cast<uint32_t>(sign),
+            .zero_test = static_cast<uint32_t>(zero),
+            .test_crcomb_and = static_cast<uint32_t>(andc),
+            .chan_cc = chan,
+            .pdst_n = pred_n,
+            .dest_bank = 1,
+            .src1_bank = static_cast<uint32_t>(s1b),
+            .src2_bank = static_cast<uint32_t>(s2b),
+            .alu_op = alu == TestAlu::Mul ? 13u : 14u,
+            .src1_n = static_cast<uint32_t>(DoubledNum(src1.reg, 8)),
+            .src2_n = static_cast<uint32_t>(DoubledNum(src2.reg, 8)),
+        },
+        &bad);
+    Push(Checked(word, bad, "VTST"), 54,
+         ReadsOne(src1.reg, chan) | ReadsOne(src2.reg, src2_scalar ? 0 : chan), 0);
 }
 
 namespace {

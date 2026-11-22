@@ -36,8 +36,6 @@ int vsnprintf(char *s, size_t n, const char *fmt, va_list ap);
 
 // ---------------------------------------------------------------------------- cp15
 
-// ---------------------------------------------------------------------------- cp15
-
 #define CP15_READ(name, cn, op1, crm, op2)                                       \
     static inline uint32_t rd_##name(void) {                                     \
         uint32_t v;                                                              \
@@ -99,7 +97,6 @@ static inline uint32_t par_large_page(uint32_t va, uint32_t par, uint32_t base_p
 }
 
 
-// The affinity mask bit for one core, as SceKernelThreadOptParam wants it.
 #define CPU_AFFINITY(n) (0x10000 << (n))
 
 
@@ -111,10 +108,8 @@ static int buf_len;
 static SceUID out_fd = -1;
 static int total_written;
 
-// When set, every emitted line is written and synced to the media before anything else runs.
-// That is the whole debugging strategy for a boot-path fault: the probe runs from
-// module_start, so a fault there bootloops the console and the only evidence is whatever
-// reached the memory card. Buffered output would be lost on the hard power-off that follows.
+// When set, every line is synced to the media before anything else runs: a module_start fault
+// bootloops the console and only what reached the card survives.
 static int log_sync;
 
 static void flush_buf(void) {
@@ -157,10 +152,6 @@ static void emit(const char *fmt, ...) {
         n = room - 1;
     }
 
-    // Mirror to the kernel's own printf, which is visible live rather than only after the run.
-    // The file stays the record — it survives a hang and a hard reset — but on a retail console
-    // with no UART and no usable LED, this is the only channel that says "still working" while
-    // the app is blocked inside the syscall. kubridge logs the same way.
     ksceKernelPrintf("[azaharnative] %s", buf + buf_len);
 
     buf_len += n;
@@ -169,17 +160,9 @@ static void emit(const char *fmt, ...) {
     }
 }
 
-// Searches the whole 32-bit space for a VA that translates to `pa`. It has to be the whole
-// space and not just the low quarter: the low quarter is the kernel's shared table, but a
-// device alias like the private peripheral block is just as likely to sit in per-process
-// TTBR1 space, and a search that misses it silently costs the entire routing section — the
-// one measurement that most depends on it.
-//
-// A megabyte whose L1 entry is absent (FS 0x05) cannot contain the alias, so it is skipped
-// whole. That reduces a 1M-page sweep to 4096 probes plus 256 per claimed megabyte.
-//
-// VA 0 doubles as "not found" and is never returned; page 0 is unmapped in every context
-// measured so far, and a guest null dereference must fault there anyway.
+// Searches the whole 32-bit space for a VA that translates to `pa`: device aliases may sit in
+// per-process TTBR1 space. Megabytes with no L1 entry (FS 0x05) are skipped whole.
+// VA 0 means "not found"; page 0 is unmapped in every context.
 static uint32_t find_va_for_pa(uint32_t pa) {
     for (uint32_t mb = 0; mb < 0x1000; mb++) {
         uint32_t base = mb << 20;
@@ -206,9 +189,7 @@ static uint32_t find_va_for_pa(uint32_t pa) {
 static uint32_t gic_va;       // VA alias of PERIPHBASE, 0 if not found
 static int gic_has_dist;      // the second page maps too, so the distributor is reachable
 
-// CBAR gives PERIPHBASE as a physical address and nothing hands out a virtual alias for it, so
-// the alias is searched for. The GIC CPU interface is what masks interrupts on the taken core,
-// and the distributor page is what enables the private timer there, so both matter.
+// CBAR gives PERIPHBASE physically only, so its virtual alias is searched for.
 static void gic_locate(void) {
     uint32_t periphbase = rd_cbar() & 0xFFFFE000u;
     if (!periphbase) {
@@ -224,18 +205,14 @@ static void gic_locate(void) {
 
 // ---------------------------------------------------------------------------- kernel exports
 
-// [SceProcessmgrForKernel, ver=1]" — which costs every other stage as well. So they are
-// resolved at runtime through taiHEN's exporter, tried against both firmware generations, and
-// a failure disables this stage alone.
+// Resolved at runtime through taiHEN's exporter; a failure disables only this stage.
 extern int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid,
                                   uint32_t funcnid, uintptr_t *func);
 
 #define AZAHAR_KERNEL_PID 0x10005
 
 
-// SceKernelSystemInfo lives in the user headers (psp2/kernel/threadmgr/thread.h) and a kernel
-// plugin only has psp2kern, so the layout is restated here. It is asserted at 0x48 bytes
-// upstream: 4 + 4 + 4 * (8 + 4 + 4) = 72.
+// SceKernelSystemInfo, restated: psp2kern lacks it. 0x48 bytes.
 typedef struct AzaharSystemInfo {
     SceSize size;
     SceUInt32 activeCpuMask;
@@ -283,29 +260,15 @@ static int sysinfo_ready(void) {
     return 1;
 }
 
-// The mask getter that is documented as not existing.
-//
-// That section records: "A companion sceKernelGetActiveCpuMask (0x0C3CBB8B) existed at 1.69 but
-// is gone by 3.60; read activeCpuMask through sceKernelGetSystemInfo instead." True of the named
-// export, and it sent both detach stages down the GetSystemInfo path — which then failed from
-// kernel context and left the mask assumed for three runs.
-//
-// The henkaku wiki lists SceThreadmgrForDriver_86DAE59B, unnamed, described only as "Get global
-// CPU affinity mask", guessed name sceKernelGetAllowedCpuAffinityMaskForDriver, prototype
-// `int f(void)`. That is allowCpuMask, returned directly: no struct, no size field, and no
-// copy-out semantics to get wrong. It is the right primary for the one value the detach stages
-// cannot proceed without.
-//
-// Both are kept. Reading the same quantity two independent ways is worth the few bytes, and a
-// disagreement between them is itself a finding.
+// SceThreadmgrForDriver_86DAE59B returns allowCpuMask directly (sceKernelGetActiveCpuMask is
+// gone by 3.60). GetSystemInfo reads the same mask a second way.
 #define ACTIVEMASK_NID 0x86DAE59Bu
 
 typedef int (*fn_get_active_mask)(void);
 static fn_get_active_mask p_GetActiveCpuMask;
 static int activemask_resolved;
 
-// Returns the mask, or 0 when unavailable — 0 is never a valid answer, since it would name a
-// console with no cores at all.
+// 0 when unavailable.
 static uint32_t active_cpu_mask(void) {
     if (!activemask_resolved) {
         activemask_resolved = 1;
@@ -325,8 +288,6 @@ static uint32_t active_cpu_mask(void) {
 int azaharVersion() {
     return AZAHAR_NATIVE_VERSION;
 }
-
-// One read into `out`. Returns the call's own status; the caller decides what a failure means.
 
 // ---------------------------------------------------------------------------- the emulator
 
@@ -361,9 +322,7 @@ int azaharModuleUid(void) {
 int module_start(SceSize argc, const void *args) {
     (void)argc;
     (void)args;
-    // Nothing runs at load. The module waits for the emulator's syscalls, which is deliberate:
-    // code on the boot path that faults bootloops the console, and the only evidence is
-    // whatever reached the memory card first.
+    // Nothing runs at load: a fault on the boot path bootloops the console.
     return SCE_KERNEL_START_SUCCESS;
 }
 

@@ -12,11 +12,9 @@
 namespace SgxdRenderer::Usse {
 
 /**
- * The USSE instruction encoder: one builder per instruction form the fragment emitter
- * uses, each producing the 64-bit word the SDK compiler would have produced for the same
- * operation. The bit layouts are Vita3K's decoder
- * patterns (usse_translator_entry.cpp), one field per letter run; the field values come
- * from psp2cgc's output for the same operation, kept as the tests in usse_encoder_test.
+ * The USSE instruction encoder: one builder per instruction form the emitters use, each
+ * producing the word psp2cgc produces for the same operation (kept as the tests in
+ * usse_encoder_test). Bit layouts follow Vita3K's decoder patterns, a field per letter run.
  *
  * Register model, as the SDK's disassembly names things:
  *   pa<n>  primary attributes: interpolants and scratch (64 of them)
@@ -25,10 +23,8 @@ namespace SgxdRenderer::Usse {
  *   i0-i2  the three 128-bit internal registers: the only operands a 4-wide f32 operation
  *          can read and write in one instruction; not preserved across a thread switch
  *   c<n>   the hardware constant bank (0, 1, 0.5, 2, ...)
- * A "register" of the unified store is 32 bits, so a float2 is two of them and an f32
- * vector operation on the unified store touches two components at most; the i registers
- * are what four-wide f32 arithmetic goes through, which is why the emitter's register
- * plan keeps vectors in them for as short a span as possible.
+ * A "register" of the unified store is 32 bits, so an f32 vector operation on the unified store
+ * touches two components at most; four-wide f32 arithmetic goes through the i registers.
  */
 
 /// Virtual: a register of the IR's virtual unified store (usse_ir.h), never encoded.
@@ -161,10 +157,8 @@ struct DualOp {
 
 class Encoder {
 public:
-    /// The "skip invalid instances" bit every arithmetic instruction carries. The compiler
-    /// sets it on some instructions and not others (clear on most of a long program, and
-    /// on every instruction of the ubershader); the emitter chooses per program, and it is
-    /// left settable so a compiler program can be reproduced exactly.
+    /// The "skip invalid instances" bit every arithmetic instruction carries; the emitter
+    /// chooses per program, and it is settable so a compiler program can be reproduced exactly.
     bool skip_invalid = true;
     /// Encoding a secondary program: the secondary attributes are addressed with the primary
     /// attribute bank codes there (the compiler's secondary programs, all forms), since a

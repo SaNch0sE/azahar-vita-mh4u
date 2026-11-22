@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "sgxd_pds.h"
+#include "sgxd_usse_enc.h"
 
 const char *const sgxd_recipe_names[SGXD_R_COUNT] = {
     "PT", "PAGES", "RGN0", "RGN1", "RGN2", "RGN3", "EXTZ", "TPC0", "TPC1", "TPC2", "TPC3",
@@ -46,27 +47,76 @@ static unsigned floor_log2(uint32_t v) {
 
 // ---------------------------------------------------------------------------- USSE
 
-#define PHAS_LAST 0xfa44070000000000ull
-#define NOP 0xf800094000000000ull
-#define NOP_END 0xf804014000000000ull
-#define PHAS_END 0xfa4c070000000000ull
-#define END_VERTEX 0xfb275000a0200000ull
 #define EMITMTE 0xfb2f4000a0200000ull
 #define EMITPIX_EOT 0xfb24000001200082ull
 #define EMITPIX_EOR 0xfb26000081200000ull
-#define SKIPINV (0x00800000ull << 32)
-#define LIMM_O (1ull << 32)   // LIMM destination bank o
 #define CF_EOT_OFFSET 0x100u  // the end-of-tile program in CF
 
-static const uint64_t brn[4] = {
-    0xf800094000000000ull, 0x48830280a00c0000ull, 0xe9833084a0000000ull, 0xf920000000000000ull,
-};
+// The fixed words of the programs below; their fields always fit.
+static uint64_t phas_last(void) {
+    int bad = 0;
+    return sgxd_usse_phas((struct sgxd_usse_phas_fields){.imm = 1, .wait_cond = 7}, &bad);
+}
+static uint64_t phas_end(void) {
+    int bad = 0;
+    return sgxd_usse_phas((struct sgxd_usse_phas_fields){.end = 1, .imm = 1, .wait_cond = 7}, &bad);
+}
+static uint64_t nop_nosched(void) {
+    int bad = 0;
+    return sgxd_usse_nop(1, 0, &bad);
+}
+static uint64_t nop_end(void) {
+    int bad = 0;
+    return sgxd_usse_nop(0, 1, &bad);
+}
 
-// limm rDEST, value.
+// The four words after a phase's start: a nop, a test of #0, a load into pa, a wait.
+static uint64_t brn(unsigned i) {
+    int bad = 0;
+    switch (i) {
+    case 0:
+        return nop_nosched();
+    case 1:
+        return sgxd_usse_vtst((struct sgxd_usse_vtst_fields){
+            .skipinv = 1, .src1_ext = 1, .src2_ext = 1, .zero_test = 2, .test_crcomb_and = 1,
+            .src1_bank = 2, .src2_bank = 2, .alu_sel = 3}, &bad);
+    case 2:
+        return sgxd_usse_vldst((struct sgxd_usse_vldst_fields){
+            .op = 1, .pred = 1, .skipinv = 1, .src1_bank_ext = 1, .src2_bank_ext = 1,
+            .mask_count = 3, .dest_bank_primattr = 1, .src0_bank = 1, .src1_bank = 2,
+            .src2_bank = 2}, &bad);
+    default:
+        return sgxd_usse_wdf(0, 0, &bad);
+    }
+}
+
+// limm dest, value: dest_bank 0 a temporary, 1 o.
+static uint64_t usse_limm_bank(unsigned dest_bank, unsigned dest, uint32_t value,
+                               unsigned skipinv) {
+    int bad = 0;
+    return sgxd_usse_limm((struct sgxd_usse_limm_fields){
+        .skipinv = skipinv, .dest_bank = dest_bank, .dest_n = dest & 0x7fu, .value = value}, &bad);
+}
 static uint64_t usse_limm(unsigned dest, uint32_t value) {
-    const uint32_t hi = 0xfc200000u | ((value >> 21) & 0x1fu) << 4 | ((value >> 26) & 0x3fu) << 12;
-    const uint32_t lo = (dest & 0x7fu) << 21 | (value & 0x1fffffu);
-    return (uint64_t)hi << 32 | lo;
+    return usse_limm_bank(0, dest, value, 0);
+}
+
+// A VBW with source 2 the immediate imm (op1 2: AND, OR with op2; 3: XOR; 4: SHL; 5: SHR):
+// dest_bank 0 a temporary, 1 o; src1_bank 0 a temporary, 2 pa, 3 sa; repeat_count + 1 registers
+// with repeat_sel.
+static uint64_t usse_bw(unsigned op1, unsigned op2, unsigned dest_bank, unsigned dest,
+                        unsigned src1_bank, unsigned src1, uint32_t imm, unsigned skipinv,
+                        unsigned repeat_sel, unsigned repeat_count) {
+    int bad = 0;
+    return sgxd_usse_vbw((struct sgxd_usse_vbw_fields){
+        .op1 = op1, .skipinv = skipinv, .repeat_sel = repeat_sel, .src2_ext = 1,
+        .repeat_count = repeat_count, .src2_exth = (imm >> 14) & 3u, .op2 = op2,
+        .dest_bank = dest_bank, .src1_bank = src1_bank, .src2_bank = 2, .dest_n = dest,
+        .src2_sel = (imm >> 7) & 0x7fu, .src1_n = src1, .src2_n = imm & 0x7fu}, &bad);
+}
+// or dest, src1, #0 over repeat_count + 1 registers, o from a, as the recipe copies.
+static uint64_t usse_copy(unsigned dest, unsigned src1_bank, unsigned src1, unsigned repeat_count) {
+    return usse_bw(2, 1, 1, dest, src1_bank, src1, 0, 1, 1, repeat_count);
 }
 
 typedef struct Code {
@@ -83,13 +133,13 @@ static void code_add(Code *c, uint64_t word) {
 static void copyprog(Code *c, uint32_t offset, unsigned n) {
     c->offset = offset;
     c->count = 0;
-    code_add(c, PHAS_LAST);
+    code_add(c, phas_last());
     for (unsigned i = 0; i < 4; i++) {
-        code_add(c, brn[i]);
+        code_add(c, brn(i));
     }
     for (unsigned d = 0; d < n; d += 16) {
         const unsigned r = n - d < 16 ? n - d : 16;
-        code_add(c, (uint64_t)(0x50a10009u | (r - 1) << 12) << 32 | (0xa0000000u | d << 21 | d << 7));
+        code_add(c, usse_copy(d, 2, d, r - 1));
     }
     code_add(c, EMITMTE);
 }
@@ -97,9 +147,9 @@ static void copyprog(Code *c, uint32_t offset, unsigned n) {
 static void colour_fs(Code *c, uint32_t offset, uint32_t colour) {
     c->offset = offset;
     c->count = 0;
-    code_add(c, PHAS_LAST);
-    code_add(c, usse_limm(0, colour) | LIMM_O | SKIPINV);
-    code_add(c, NOP_END);
+    code_add(c, phas_last());
+    code_add(c, usse_limm_bank(1, 0, colour, 1));
+    code_add(c, nop_end());
 }
 
 enum { CV_DUMMY_VS, CV_COPY_STATE, CV_COPY_TERM, CV_VS, CV_COUNT };
@@ -121,14 +171,14 @@ static const uint64_t imgui_vs[] = {
 };
 // SGXD_IMGUI_COLOUR_UV (sgxd_test 07) also copies the UV to o8, o9, the recipe's own copy form
 // (copyprog's OR with a repeat), as TC0.
-#define IMGUI_VS_UV 0x50a11009a1000100ull   // or o8..o9, pa2..pa3 (repeat 2)
+#define IMGUI_VS_UV usse_copy(8, 2, 2, 1)   // or o8..o9, pa2..pa3 (repeat 2)
 // Its fragment program there: r and g of the iterated colour (pa0, pa1) and the iterated u and v
 // (pa4, pa5) as four unorm bytes into o0, one scaled VPCK F32 to U8 (its rounding and saturation
 // in docs/sgxd/usse.md), then the end.
 #define IMGUI_FS_UV 0x40800c3da01d8004ull   // pack.u8.f32.scl o0, pa0.xy pa4.xy
 // SGXD_IMGUI_UV_RAW + n: or o0, pa n, #0, the copy form with one word. SGXD_IMGUI_TEXEL copies
 // the texel from pa4 so.
-#define IMGUI_FS_RAW(n) (0x50a10009a0000000ull | (uint64_t)(n) << 7)
+#define IMGUI_FS_RAW(n) usse_copy(0, 2, (n), 0)
 // SGXD_IMGUI_TEXEL's texture issue: USEISSUE NONE, TEXISSUE TC0, TEXPROJ RHW, TEXLASTISSUE
 // (issues fill the PA words in PDS order, docs/sgxd/pds.md).
 #define IMGUI_DOUTI_TEX 0x0000f900u
@@ -176,38 +226,38 @@ static const uint64_t imgui_fs_modulate[] = {
 static void make_cv(const SgxdRecipe *r, Code cv[CV_COUNT]) {
     memset(cv, 0, sizeof(Code) * CV_COUNT);
     cv[CV_DUMMY_VS].offset = 0x00;
-    code_add(&cv[CV_DUMMY_VS], PHAS_END);
+    code_add(&cv[CV_DUMMY_VS], phas_end());
     copyprog(&cv[CV_COPY_STATE], 0x40, 24);
     copyprog(&cv[CV_COPY_TERM], 0x80, 2);
     cv[CV_VS].offset = 0xc0;
     if (r->imgui) {
-        code_add(&cv[CV_VS], PHAS_LAST);
-        code_add(&cv[CV_VS], NOP);
+        code_add(&cv[CV_VS], phas_last());
+        code_add(&cv[CV_VS], nop_nosched());
         for (unsigned i = 0; i < sizeof(imgui_vs) / sizeof(imgui_vs[0]); i++) {
             code_add(&cv[CV_VS], imgui_vs[i]);
         }
         if (imgui_uv(r)) {
             code_add(&cv[CV_VS], IMGUI_VS_UV);
         }
-        code_add(&cv[CV_VS], END_VERTEX);
+        code_add(&cv[CV_VS], SGXD_USSE_EMITVTX_END);
         return;
     }
     if (r->copy_vs) {
         // A caller's scene: o[n] = pa[n] for every vertex word, 16 to an instruction.
-        code_add(&cv[CV_VS], PHAS_LAST);
-        code_add(&cv[CV_VS], NOP);
+        code_add(&cv[CV_VS], phas_last());
+        code_add(&cv[CV_VS], nop_nosched());
         for (unsigned d = 0; d < NV; d += 16) {
             const unsigned n = NV - d < 16 ? NV - d : 16;
             code_add(&cv[CV_VS],
                      (uint64_t)(0x50a10009u | (n - 1) << 12) << 32 | (0xa0000000u | d << 21 | d << 7));
         }
-        code_add(&cv[CV_VS], END_VERTEX);
+        code_add(&cv[CV_VS], SGXD_USSE_EMITVTX_END);
         return;
     }
     // o0..o2 = pa0..pa2, o3 = c2 = 1.0, vertex end (a pass-through).
-    static const uint64_t vs[] = {
-        PHAS_LAST, NOP, 0x0881008190000002ull, 0x0885010190248002ull, 0x0881008190400042ull,
-        0x0883010150400082ull, END_VERTEX,
+    const uint64_t vs[] = {
+        phas_last(),           nop_nosched(),         0x0881008190000002ull, 0x0885010190248002ull,
+        0x0881008190400042ull, 0x0883010150400082ull, SGXD_USSE_EMITVTX_END,
     };
     for (unsigned i = 0; i < sizeof(vs) / sizeof(vs[0]); i++) {
         code_add(&cv[CV_VS], vs[i]);
@@ -225,31 +275,31 @@ static uint32_t copy_offset(const SgxdRecipe *r, unsigned n) {
 static void make_cf(const SgxdRecipe *r, Code cf[CF_COUNT]) {
     memset(cf, 0, sizeof(Code) * CF_COUNT);
     cf[CF_DUMMY_FS].offset = 0x00;
-    code_add(&cf[CF_DUMMY_FS], PHAS_LAST);
+    code_add(&cf[CF_DUMMY_FS], phas_last());
     for (unsigned i = 0; i < 4; i++) {
-        code_add(&cf[CF_DUMMY_FS], brn[i]);
+        code_add(&cf[CF_DUMMY_FS], brn(i));
     }
-    code_add(&cf[CF_DUMMY_FS], NOP_END);
+    code_add(&cf[CF_DUMMY_FS], nop_end());
     // Each colour is its own shader: a pixel task's PAs are per instance, and without SKIPINV a
     // quad's uncovered instances would write o0 too.
     colour_fs(&cf[CF_BG_FS], 0x40, SGXD_RECIPE_BG);
     cf[CF_EOR].offset = 0x80;
-    code_add(&cf[CF_EOR], PHAS_LAST);
+    code_add(&cf[CF_EOR], phas_last());
     code_add(&cf[CF_EOR], 0xfca0000000000000ull);
     code_add(&cf[CF_EOR], 0xfca0000000200000ull);
     code_add(&cf[CF_EOR], EMITPIX_EOR);
     cf[CF_PTOFF].offset = 0xc0;
-    code_add(&cf[CF_PTOFF], PHAS_END);
+    code_add(&cf[CF_PTOFF], phas_end());
     // End of tile: r0..r5 = the PBE words, EMITPIX.
     cf[CF_EOT].offset = CF_EOT_OFFSET;
-    code_add(&cf[CF_EOT], PHAS_LAST);
+    code_add(&cf[CF_EOT], phas_last());
     for (unsigned i = 0; i < 6; i++) {
-        code_add(&cf[CF_EOT], usse_limm(i, r->pbe[i]) | SKIPINV);
+        code_add(&cf[CF_EOT], usse_limm_bank(0, i, r->pbe[i], 1));
     }
     code_add(&cf[CF_EOT], EMITPIX_EOT);
     if (r->imgui) {
         cf[CF_TRI_FS].offset = 0x140;
-        code_add(&cf[CF_TRI_FS], PHAS_LAST);
+        code_add(&cf[CF_TRI_FS], phas_last());
         if (r->imgui_fs == SGXD_IMGUI_MODULATE) {
             for (unsigned i = 0; i < sizeof(imgui_fs_modulate) / sizeof(imgui_fs_modulate[0]);
                  i++) {
@@ -261,8 +311,8 @@ static void make_cf(const SgxdRecipe *r, Code cf[CF_COUNT]) {
             code_add(&cf[CF_TRI_FS], (r->imgui_fs == SGXD_IMGUI_TEXEL ? IMGUI_FS_RAW(4) :
                                       r->imgui_fs >= SGXD_IMGUI_UV_RAW ?
                                       IMGUI_FS_RAW(r->imgui_fs - SGXD_IMGUI_UV_RAW) :
-                                      IMGUI_FS_UV) | SKIPINV);
-            code_add(&cf[CF_TRI_FS], NOP_END);
+                                      IMGUI_FS_UV));
+            code_add(&cf[CF_TRI_FS], nop_end());
             return;
         }
         if (r->imgui_fs == SGXD_IMGUI_BLEND) {
@@ -801,7 +851,7 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory_, uint32_t fb_va, uint32
     // The end-of-tile program's LIMMs of words 1 and 2, after its PHAS.
     uint64_t *eot = (uint64_t *)(memory + r->offset[SGXD_R_CF] + CF_EOT_OFFSET);
     for (unsigned i = 1; i <= 2; i++) {
-        eot[1 + i] = usse_limm(i, r->pbe[i]) | SKIPINV;
+        eot[1 + i] = usse_limm_bank(0, i, r->pbe[i], 1);
     }
 }
 
@@ -809,7 +859,7 @@ void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory_, uint32_t pbe0) {
     uint8_t *memory = memory_;
     r->pbe[0] = pbe0;
     uint64_t *eot = (uint64_t *)(memory + r->offset[SGXD_R_CF] + CF_EOT_OFFSET);
-    eot[1] = usse_limm(0, r->pbe[0]) | SKIPINV;
+    eot[1] = usse_limm_bank(0, 0, r->pbe[0], 1);
 }
 
 // ---------------------------------------------------------------------------- route 1
@@ -818,17 +868,15 @@ void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory_, uint32_t pbe0) {
 // bit 35 the pair's second operation, source 1 a temporary or with pa a PA register.
 enum { BW_AND, BW_OR, BW_XOR, BW_SHL, BW_SHR };
 static uint64_t usse_bitwise_imm(unsigned op, unsigned dest, unsigned src1, uint32_t imm, int pa) {
-    static const uint32_t op1[] = {0x0a, 0x0a, 0x0b, 0x0c, 0x0d};
-    const uint32_t hi = op1[op] << 27 | (op == BW_OR ? 1u : 0u) << 3 | 1u << 16 |
-                        ((imm >> 14) & 3u) << 4;
-    const uint32_t lo = dest << 21 | src1 << 7 | (pa ? 2u << 30 : 0u) | 2u << 28 | (imm & 0x7fu) |
-                        ((imm >> 7) & 0x7fu) << 14;
-    return (uint64_t)hi << 32 | lo;
+    static const uint8_t op1[] = {2, 2, 3, 4, 5};
+    return usse_bw(op1[op], op == BW_OR, 0, dest, pa ? 2u : 0u, src1, imm, 0, 0, 0);
 }
 // IMA32 step 1: dest = src0 * lo16(src1) + src2, temporaries,
 // unsigned, the sum wrapping at 32 bits.
 static uint64_t usse_ima32(unsigned dest, unsigned src0, unsigned src1, unsigned src2) {
-    return (uint64_t)0xd0000000u << 32 | dest << 21 | src0 << 14 | src1 << 7 | src2;
+    int bad = 0;
+    return sgxd_usse_i32mad2((struct sgxd_usse_i32mad2_fields){
+        .dest_n = dest, .src0_n = src0, .src1_n = src1, .src2_n = src2}, &bad);
 }
 #define EMIT_FREEP 0x00200000ull
 #define USE1_END (0x00040000ull << 32)
@@ -864,7 +912,7 @@ static unsigned pica_eot_part(const SgxdRecipe* r, const SgxdPicaStore* s, uint6
     }
     unsigned n = 0;
 #define PUT(w) (out[n++] = (w))
-    PUT(PHAS_LAST);
+    PUT(phas_last());
     PUT(usse_bitwise_imm(BW_OR, 8, 0, 0, 1));     // r8 = pa0 (IR0)
     PUT(usse_bitwise_imm(BW_AND, 9, 8, 0xff, 0)); // r9 = X
     PUT(usse_bitwise_imm(BW_SHR, 10, 8, 8, 0));
@@ -959,7 +1007,7 @@ unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint6
     const uint32_t xrem = width - 16 * xlast, yrem = height - 16 * ylast;
     unsigned n = 0;
 #define PUT(w) (out[n++] = (w))
-    PUT(PHAS_LAST);
+    PUT(phas_last());
     PUT(usse_bitwise_imm(BW_OR, 8, 0, 0, 1));          // r8 = pa0 (IR0)
     PUT(usse_bitwise_imm(BW_AND, 9, 8, 0xff, 0));      // r9 = X
     PUT(usse_bitwise_imm(BW_SHR, 10, 8, 8, 0));
@@ -1050,7 +1098,7 @@ unsigned sgxd_recipe_pica_eot_scaled(const SgxdRecipe *r, const SgxdPicaStore *s
 #define EDGE(v) ((2 * (v) * quarters + 3) / 8)
     unsigned n = 0;
 #define PUT(w) (out[n++] = (w))
-    PUT(PHAS_LAST);
+    PUT(phas_last());
     PUT(usse_limm(0, picture_pack));
     PUT(usse_limm(1, picture));
     PUT(usse_limm(2, (picture_stride - 1) >> 1));
@@ -1301,7 +1349,7 @@ int sgxd_recipe_set_size(SgxdRecipe *r, void *memory_, uint32_t width, uint32_t 
     pbe_size(r, width, height);
     uint64_t *eot = (uint64_t *)(memory + L[SGXD_R_CF] + CF_EOT_OFFSET);
     for (unsigned i = 4; i <= 5; i++) {
-        eot[1 + i] = usse_limm(i, r->pbe[i]) | SKIPINV;
+        eot[1 + i] = usse_limm_bank(0, i, r->pbe[i], 1);
     }
     put_bgrec(r, memory);
     // EXTZ and the tail pointer caches stay as sgxd_recipe_write zeroed them and the renders since
@@ -1385,16 +1433,14 @@ void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
 
 // or o0, sa0, #0 (SKIPINV): the recipe's o0 = pa0 with source bank 3, SA.
 static void put_sa_shader(const SgxdRecipe *r, uint8_t *memory) {
-    const uint64_t shader[3] = {PHAS_LAST, 0x50a10009e0000000ull | SKIPINV, NOP_END};
+    const uint64_t shader[3] = {phas_last(), usse_copy(0, 3, 0, 0), nop_end()};
     memcpy(memory + r->offset[SGXD_R_CF] + SA_BG_FS, shader, sizeof(shader));
 }
 
 // xor o0, sa0, #imm: the or above as opcode 11 (OP2 bit 35 clear), the
 // immediate in bits 6..0, 20..14 and 37..36.
 void sgxd_recipe_sa_xor(const SgxdRecipe *r, void *memory, uint32_t imm) {
-    const uint64_t xor = 0x58a10001e0000000ull | SKIPINV | (imm & 0x7fu) |
-                         (uint64_t)(imm >> 7 & 0x7fu) << 14 | (uint64_t)(imm >> 14 & 3u) << 36;
-    const uint64_t shader[3] = {PHAS_LAST, xor, NOP_END};
+    const uint64_t shader[3] = {phas_last(), usse_bw(3, 0, 1, 0, 3, 0, imm, 1, 1, 0), nop_end()};
     memcpy((uint8_t *)memory + r->offset[SGXD_R_CF] + SA_BG_FS, shader, sizeof(shader));
 }
 
