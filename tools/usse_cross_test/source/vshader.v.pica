@@ -1,0 +1,35 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; usse_cross_test: the half cross product, a dp3 of another vector with itself, then a dp3 with
+; the product; the results out as the colour: (dot(d, a.yzx * b.zxy) / 2, dot(c, c), 1, 1)
+; (`misc.zx` is misc.zxxx: z and w both take misc.x).
+; a = (1, 2, 3), b = (4, 5, 6), c = (0.3, 0.4, 0.5), d = (0.1, 0.05, 0.02): (0.95, 0.5, 1, 1).
+.fvec projection[4]
+.constf misc(1.0, 0.5, 0.0, 0.0)
+.out outpos position
+.out outclr color
+.alias inpos v0
+.alias va v1
+.alias vb v2
+.alias vc v3
+.alias vd v4
+.proc main
+	mov r0.xyz, inpos
+	mov r0.w, misc.x
+	dp4 outpos.x, projection[0], r0
+	dp4 outpos.y, projection[1], r0
+	dp4 outpos.z, projection[2], r0
+	dp4 outpos.w, projection[3], r0
+	mov r7, va
+	mov r8, vb
+	mov r3, vc
+	mul r2, r7.yzxw, r8.zxyw
+	dp3 r4, r3, r3
+	dp3 r5.x, vd, r2
+	mul r9.x, misc.y, r5.x
+	mov r9.y, r4.x
+	mov r9.zw, misc.zx
+	mov outclr, r9
+	end
+.end

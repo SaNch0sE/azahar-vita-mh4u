@@ -1,0 +1,45 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; gs_index_test B: reads through a0 that leave the rows: pal[a0.x] is c10, a shared uniform, and
+; pal[a0.y] with a0.y = -7 is c1, the first vertex's colour, a row reached from outside the rows.
+; The corners at constant indexes.
+.gsh fixed c8 c0 4
+.fvec pal[4]
+.constf idx(2.0, -7.0, 0.0, 0.0)
+.constf one(1.0, 1.0, 1.0, 1.0)
+.out outpos position
+.out outclr color
+.alias rows c0
+.entry gmain
+.proc gmain
+	mova a0.xy, idx
+	mov r4, pal[a0.x]
+	add r4, pal[a0.y], r4
+	mov r4.w, one
+	setemit 0
+	mov outpos, rows[0]
+	mov outclr, r4
+	emit
+	setemit 1
+	mov outpos, rows[2]
+	mov outclr, r4
+	emit
+	setemit 2, prim
+	mov outpos, rows[4]
+	mov outclr, r4
+	emit
+	setemit 0
+	mov outpos, rows[2]
+	mov outclr, r4
+	emit
+	setemit 1
+	mov outpos, rows[6]
+	mov outclr, r4
+	emit
+	setemit 2, prim
+	mov outpos, rows[4]
+	mov outclr, r4
+	emit
+	end
+.end

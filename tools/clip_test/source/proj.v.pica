@@ -1,0 +1,32 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; clip_test mode 28's vertex shader: the position from eye space through the projection (its
+; rows as uniforms, as a game's), the colour and three texture coordinates through.
+
+.fvec projection[4]
+
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.out outtc1 texcoord1
+.out outtc2 texcoord2
+
+.alias inpos v0
+.alias inclr v1
+.alias intc0 v2
+.alias intc1 v3
+.alias intc2 v4
+
+.entry vmain
+.proc vmain
+	dp4 outpos.x, projection[0], inpos
+	dp4 outpos.y, projection[1], inpos
+	dp4 outpos.z, projection[2], inpos
+	dp4 outpos.w, projection[3], inpos
+	mov outclr, inclr
+	mov outtc0, intc0
+	mov outtc1, intc1
+	mov outtc2, intc2
+	end
+.end

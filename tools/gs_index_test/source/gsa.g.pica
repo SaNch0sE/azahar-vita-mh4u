@@ -1,0 +1,48 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; gs_index_test A: the fixed-primitive mode, four vertices of position and colour in c0..c7.
+; The colour is the four vertices' colours summed in a LOOP read at aL + 1; the two triangles'
+; corners are read at constant indexes and through a0.
+.gsh fixed c8 c0 4
+.consti loopi(3, 0, 2, 0)
+.constf zero(0.0, 0.0, 0.0, 0.0)
+.constf idx(2.0, 4.0, 0.0, 0.0)
+.constf one(1.0, 1.0, 1.0, 1.0)
+.out outpos position
+.out outclr color
+.alias rows c0
+.entry gmain
+.proc gmain
+	mov r4, zero
+	for loopi
+		add r4, rows[aL+1], r4
+	.end
+	mov r4.w, one
+	mova a0.xy, idx
+	setemit 0
+	mov outpos, rows[0]
+	mov outclr, r4
+	emit
+	setemit 1
+	mov outpos, rows[a0.x]
+	mov outclr, r4
+	emit
+	setemit 2, prim
+	mov outpos, rows[a0.y]
+	mov outclr, r4
+	emit
+	setemit 0
+	mov outpos, rows[a0.x]
+	mov outclr, r4
+	emit
+	setemit 1
+	mov outpos, rows[a0.x+4]
+	mov outclr, r4
+	emit
+	setemit 2, prim
+	mov outpos, rows[a0.y]
+	mov outclr, r4
+	emit
+	end
+.end

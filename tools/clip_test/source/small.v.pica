@@ -1,0 +1,17 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; clip_test mode 12's vertex shader: the position and the colour only.
+
+.out outpos position
+.out outclr color
+
+.alias inpos v0
+.alias inclr v1
+
+.entry vmain
+.proc vmain
+	mov outpos, inpos
+	mov outclr, inclr
+	end
+.end

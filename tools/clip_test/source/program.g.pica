@@ -1,0 +1,46 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; clip_test's geometry shader (mode 5): a triangle of three vertices in, emitted only when its
+; first vertex's red is above one half, so about half the invocations emit nothing and leave
+; their slot of the stream-out empty, as a game's bounded geometry shader does.
+
+.gsh point c0
+
+.constf myconst(0.0, 1.0, -1.0, 0.5)
+.alias half myconst.wwww
+
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.out outtc1 texcoord1
+.out outtc2 texcoord2
+
+.entry gmain
+.proc gmain
+	cmp half, lt, lt, v1
+	ifc cmp.x
+		setemit 0
+		mov outpos, v0
+		mov outclr, v1
+		mov outtc0, v2
+		mov outtc1, v3
+		mov outtc2, v4
+		emit
+		setemit 1
+		mov outpos, v5
+		mov outclr, v6
+		mov outtc0, v7
+		mov outtc1, v8
+		mov outtc2, v9
+		emit
+		setemit 2, prim
+		mov outpos, v10
+		mov outclr, v11
+		mov outtc0, v12
+		mov outtc1, v13
+		mov outtc2, v14
+		emit
+	.end
+	end
+.end

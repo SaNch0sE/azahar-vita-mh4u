@@ -1,0 +1,17 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; cube_test's vertex program: position (w 1) and a cube direction, unit 0's (u, v) and w.
+.constf ones(1.0, 1.0, 1.0, 1.0)
+.out outpos position
+.out outtc0 texcoord0
+.out outtc0w texcoord0w
+.alias inpos v0
+.alias indir v1
+.proc main
+	mov outpos.xyz, inpos
+	mov outpos.w, ones
+	mov outtc0, indir
+	mov outtc0w, indir.zzzz
+	end
+.end
