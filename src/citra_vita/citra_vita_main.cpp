@@ -87,6 +87,12 @@
 #include "video_core/renderer_sgxd/sgxd_backend.h"
 #include "video_core/right_eye_disabler.h"
 
+#ifdef AZAHAR_PGO_GENERATE
+// LLVM's profile runtime (tools/pgo): the profile serialised into a buffer of the caller's.
+extern "C" uint64_t __llvm_profile_get_size_for_buffer(void);
+extern "C" int __llvm_profile_write_buffer(char* buffer);
+#endif
+
 // The default heap is nowhere near enough for a 3DS: FCRAM alone is 128 MB, and the caches and
 // the surface storage sit on top of it. Newlib reads this at startup.
 extern "C" {
@@ -762,6 +768,48 @@ bool RunSettingCommand(const std::string& command) {
                       ok ? "done" : "failed");
         return true;
     }
+#ifdef AZAHAR_PGO_GENERATE
+    if (command.rfind("pgo ", 0) == 0) {
+        // `pgo PATH`: the profile's counts so far (AZAHAR_PGO=GENERATE) written to PATH, a .profraw
+        // for llvm-profdata; the counting goes on. The runtime serialises it into a memory block of
+        // its own (megabytes: not the heap's), written out in 1 MiB pieces, each checked.
+        const std::string path = command.substr(4);
+        const u64 size = __llvm_profile_get_size_for_buffer();
+        const SceUID block = sceKernelAllocMemBlock(
+            "azahar-pgo", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+            static_cast<SceSize>((size + 0xfff) & ~u64{0xfff}), nullptr);
+        void* base = nullptr;
+        if (block < 0 || sceKernelGetMemBlockBase(block, &base) < 0 ||
+            __llvm_profile_write_buffer(static_cast<char*>(base)) != 0) {
+            sceClibPrintf("[azahar] pgo: %llu bytes not serialised (block %08x) (command)\n",
+                          static_cast<unsigned long long>(size), static_cast<unsigned>(block));
+            if (block >= 0) {
+                sceKernelFreeMemBlock(block);
+            }
+            return true;
+        }
+        const SceUID fd = sceIoOpen(path.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+        u64 written = 0;
+        while (fd >= 0 && written < size) {
+            const SceSize piece = static_cast<SceSize>(std::min<u64>(size - written, 1u << 20));
+            const int put = sceIoWrite(fd, static_cast<const u8*>(base) + written, piece);
+            if (put <= 0) {
+                sceClibPrintf("[azahar] pgo: a write at %llu failed: %08x (command)\n",
+                              static_cast<unsigned long long>(written), static_cast<unsigned>(put));
+                break;
+            }
+            written += static_cast<u64>(put);
+        }
+        if (fd >= 0) {
+            sceIoClose(fd);
+        }
+        sceKernelFreeMemBlock(block);
+        sceClibPrintf("[azahar] pgo: %s, %llu of %llu bytes (command)\n", path.c_str(),
+                      static_cast<unsigned long long>(written),
+                      static_cast<unsigned long long>(size));
+        return true;
+    }
+#endif
     if (command.rfind("copy ", 0) == 0) {
         // `copy SRC DST`: a file copied on the console, in 1 MiB pieces (a ROM from host0 onto
         // the memory card, so that its title's reads do not cross the debug link).

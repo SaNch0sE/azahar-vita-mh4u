@@ -216,6 +216,50 @@ if (ENABLE_VITA_DIAGNOSTICS)
     endif()
 endif()
 
+# Profile-guided optimisation with clang on the Vita (tools/pgo). GENERATE puts counters into
+# every C and C++ file but the kernel module's (vita_native clears what it inherits) and links
+# LLVM's profile runtime built for the console (tools/pgo/build-profile-rt.sh: AZAHAR_PGO_RUNTIME);
+# the app writes the counts on the command channel's `pgo PATH`. USE optimises with
+# AZAHAR_PGO_PROFILE, the counts merged by llvm-profdata, or when that is empty with the profile
+# checked in (src/citra_vita/pgo/azahar.profdata.tar.xz). AUTO, the default, is USE for a release
+# build without the development tools or diagnostics, OFF for the others.
+set(AZAHAR_PGO "AUTO" CACHE STRING "Profile-guided optimisation on the Vita: AUTO, OFF, GENERATE or USE")
+set_property(CACHE AZAHAR_PGO PROPERTY STRINGS AUTO OFF GENERATE USE)
+set(AZAHAR_PGO_RUNTIME "" CACHE FILEPATH "GENERATE: the Vita's profile runtime archive")
+set(AZAHAR_PGO_PROFILE "" CACHE FILEPATH "USE: the merged .profdata")
+if (VITA AND AZAHAR_PGO_MODE STREQUAL "GENERATE")
+    if (NOT EXISTS "${AZAHAR_PGO_RUNTIME}")
+        message(FATAL_ERROR "AZAHAR_PGO=GENERATE needs AZAHAR_PGO_RUNTIME (tools/pgo/build-profile-rt.sh)")
+    endif()
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate>)
+    add_compile_definitions(AZAHAR_PGO_GENERATE)
+elseif (VITA AND AZAHAR_PGO_MODE STREQUAL "USE")
+    set(pgo_profile "${AZAHAR_PGO_PROFILE}")
+    if (pgo_profile STREQUAL "")
+        # Unpacked under the archive's hash: a new profile is new compile flags, so everything is
+        # built again with it (the compiler does not list the profile as an input).
+        set(pgo_archive "${PROJECT_SOURCE_DIR}/src/citra_vita/pgo/azahar.profdata.tar.xz")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${pgo_archive}")
+        file(SHA256 "${pgo_archive}" pgo_hash)
+        string(SUBSTRING "${pgo_hash}" 0 16 pgo_hash)
+        set(pgo_profile "${CMAKE_BINARY_DIR}/pgo/${pgo_hash}/azahar.profdata")
+        if (NOT EXISTS "${pgo_profile}")
+            file(ARCHIVE_EXTRACT INPUT "${pgo_archive}" DESTINATION "${CMAKE_BINARY_DIR}/pgo/${pgo_hash}")
+        endif()
+    endif()
+    if (NOT EXISTS "${pgo_profile}")
+        message(FATAL_ERROR "AZAHAR_PGO=USE needs a .profdata: ${pgo_profile} does not exist")
+    endif()
+    if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS 21)
+        message(FATAL_ERROR "The PGO profile is LLVM 21's: build with clang 21 or newer, or AZAHAR_PGO=OFF")
+    endif()
+    # Code the profile has no counts for, or counts from an older source, is not an error.
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-use=${pgo_profile}>
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-unprofiled>
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-out-of-date>
+                        $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-missing>)
+endif()
+
 # Handle incompatible options for libretro builds
 if(ENABLE_LIBRETRO)
     # Check for explicitly-set conflicting options

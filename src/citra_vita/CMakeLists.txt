@@ -81,6 +81,9 @@ function(citra_vita_executable target titleid)
 
     target_link_libraries(${target} PRIVATE citra_common citra_core input_common network
                                             video_core cryptopp lodepng)
+    if (AZAHAR_PGO_MODE STREQUAL "GENERATE")
+        target_link_libraries(${target} PRIVATE "${AZAHAR_PGO_RUNTIME}")
+    endif()
     # The upcall experiment's TLS lookup and malloc lock (upcall_tls.cpp), and the abort report
     # (crash_report.cpp), which keeps the console's last text too.
     target_link_options(${target} PRIVATE
