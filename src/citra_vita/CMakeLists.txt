@@ -190,7 +190,7 @@ set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(VITA_TITLEID "AZAHARPSV")
 set(VITA_APP_NAME "Azahar")
-set(VITA_VERSION "00.10")
+set(VITA_VERSION "26.01")
 
 # The vpk carries the kernel module and the app loads it at startup (LoadAzaharNative in
 # citra_vita_main.cpp).
