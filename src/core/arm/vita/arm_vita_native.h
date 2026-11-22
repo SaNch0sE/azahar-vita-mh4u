@@ -128,8 +128,6 @@ struct VitaNativeCensus {
     u32 svc_thunks{};
     u32 hold_loads{}, hold_stores{}, hold_opens{};
     u32 hold_thumb{};
-    /// Accesses past the budget (TakeHoldBudget), left to wait.
-    u32 hold_load_waits{};
     u32 hold_pages{};
     std::array<std::array<u32, 3>, 6> hold_top{};
     u32 idle_waits{}, idle_skips{};
@@ -267,12 +265,10 @@ private:
     /// an access clear of the holds' bytes is made here, else the GPU takes it (GPU::GuestAbort) and
     /// it runs again. False when no hold closed the page.
     bool TakeHeldPage(u32 va, bool write, u32 pc);
-    /// A permission fault of an ARM load clear of the bytes the GPU's queued work writes on its
-    /// held page (GPU::GuestReadMissesWrites), or of an ARM store clear of the bytes its queued
-    /// work reads and writes there (GPU::GuestStoreMissesHolds): made here through the app's
-    /// view, the guest resuming after it and the page staying held. LDR, LDRB, LDRH, LDRSB,
-    /// LDRSH and LDRD, STR, STRB, STRH and STRD with an immediate or register offset, LDM and
-    /// STM (no user bank, no PC), VLDR, VSTR, VLDM and VSTM (IA, DB); whether it was one.
+    /// A load or store clear of the bytes a held page's queued GPU work uses, on one page or across a
+    /// boundary: made here through the app's view, the page staying held. ARM's loads and stores
+    /// (immediate and register offsets, LDRD/STRD, LDM/STM, LDREX/STREX forms, VLDR/VSTR/VLDM/VSTM)
+    /// and Thumb's; not the LDRT/STRT forms or the unpredictable ones. Whether it was one.
     bool AccessPastHolds(u32 pc, bool write);
     /// A guest access to Luma's alias of FCRAM (bit 31 set), which the guest's table does not hold:
     /// made here. Whether it was one.
@@ -298,17 +294,8 @@ private:
     u32 hot_next{};
     /// The part of the access a page's holds refused (AccessPastHolds), 0 for none.
     u32 refused_va{};
-    struct HoldBudget {
-        u32 page = ~0u;
-        u32 ticket = 0;
-        u32 accesses = 0;
-    };
-    static constexpr u32 AccessesPerHold = 32;
-    std::array<HoldBudget, 4> hold_budgets{};
-    u32 hold_budget_next{};
     /// The access TakeForwardedHeldPage let run again after a raced release.
     u32 raced_far{}, raced_pc{};
-    bool TakeHoldBudget(u32 page, u32 ticket);
     /// The most bytes the instruction at `pc` may touch from its faulting address on: 8 for a single
     /// access, 128 for a block.
     u32 AccessReach(u32 pc) const;

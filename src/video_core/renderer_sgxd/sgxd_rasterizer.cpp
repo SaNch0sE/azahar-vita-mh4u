@@ -4045,15 +4045,18 @@ void RasterizerSgxd::ColourWritesDue(PAddr start, PAddr end, const char* why) {
 
 void RasterizerSgxd::PublishOwned() {
     Ranges all;
+    std::vector<std::array<u32, 3>> footprints;
     for (const Upscaled& u : upscaled) {
         for (const auto& [lo, hi] : u.owned) {
             RangesAdd(all, lo, hi);
         }
+        footprints.push_back({u.addr, u.addr + u.bytes, u.bytes / u.height * 8});
     }
     for (const ScreenPicture& p : screen_pictures) {
         if (p.owned) {
             RangesAdd(all, p.output, p.output + p.bytes);
         }
+        footprints.push_back({p.output, p.output + p.bytes, 0});
     }
     // The pictures' rows alone: a page the guest keeps accessing beside them has them copied.
     Ranges rows = all;
@@ -4080,6 +4083,7 @@ void RasterizerSgxd::PublishOwned() {
     std::scoped_lock lock{owned_lock};
     owned_published = std::move(all);
     rows_published = std::move(rows);
+    footprint_published = std::move(footprints);
     owned_any.store(!owned_published.empty(), std::memory_order_release);
 }
 
@@ -4109,6 +4113,22 @@ bool RasterizerSgxd::PictureOwns(PAddr lo, PAddr hi) const {
     }
     std::scoped_lock lock{owned_lock};
     return RangesMeet(owned_published, lo, hi);
+}
+
+std::pair<PAddr, PAddr> RasterizerSgxd::PictureCopyExtent(PAddr lo, PAddr hi) const {
+    std::scoped_lock lock{owned_lock};
+    PAddr from = hi, to = lo;
+    for (const auto& [l, h, strip] : footprint_published) {
+        if (l < hi && lo < h) {
+            // A screen picture is invalid once written back.
+            if (strip == 0) {
+                continue;
+            }
+            from = std::min(from, l + (std::max(l, lo) - l) / strip * strip);
+            to = std::max(to, std::min(h, l + (std::min(h, hi) - l + strip - 1) / strip * strip));
+        }
+    }
+    return from < to ? std::pair<PAddr, PAddr>{from, to} : std::pair<PAddr, PAddr>{0, 0};
 }
 
 bool RasterizerSgxd::PictureOwnsRows(PAddr lo, PAddr hi) const {
@@ -6664,8 +6684,12 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
             return VertexStage{};
         }
         const u8* const index_cpu = memory.GetPhysicalPointer(index_address);
-        // What the CPU reads of them: a geometry draw's copy (GsIndices), else guest memory.
-        const u8* const index_scan = gs_indices_set ? gs_indices.data() : index_cpu;
+        // What the CPU reads of them: a geometry draw's copy, an 8-bit list as the render thread read it
+        // for the draw, else guest memory.
+        const u8* const index_scan = gs_indices_set ? gs_indices.data()
+                                     : !index_u16 && guest_indices
+                                         ? guest_indices(index_address, index_bytes)
+                                         : index_cpu;
         const bool indices_uncached = guest_memory.IsUncached(index_address, index_bytes);
         const u32 reach = index_u16 ? 0xffffu : 0xffu; // the highest index there can be
         if (mode == Usse::VsMode::Draw && indices_uncached) {
@@ -7081,7 +7105,11 @@ bool RasterizerSgxd::RunVertices(bool is_indexed, const float* immediate, u32 co
     Pica::ShaderUnit unit;
     const Pica::VertexLoader loader(memory, pipeline);
     const PAddr base = pipeline.vertex_attributes.GetPhysicalBaseAddress();
-    const u8* const indices = memory.GetPhysicalPointer(base + pipeline.index_array.offset);
+    const PAddr index_address = base + pipeline.index_array.offset;
+    const u8* const indices = !is_indexed || immediate ? nullptr
+                              : pipeline.index_array.format == 0 && guest_indices
+                                  ? guest_indices(index_address, count)
+                                  : memory.GetPhysicalPointer(index_address);
     const u32 attributes = regs.vs.max_input_attribute_index + 1;
     for (u32 j = 0; j < count; j++) {
         Pica::AttributeBuffer input{}, output{};

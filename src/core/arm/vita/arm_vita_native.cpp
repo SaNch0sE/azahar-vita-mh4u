@@ -3826,31 +3826,6 @@ bool ARM_VitaNative::TakeHeldPage(u32 va, bool write, u32 pc) {
     return refused != nullptr && system.GPU().GuestAbort(refused, write, pc, at);
 }
 
-bool ARM_VitaNative::TakeHoldBudget(u32 page, u32 ticket) {
-    HoldBudget* entry = nullptr;
-    for (HoldBudget& b : hold_budgets) {
-        if (b.page == page) {
-            entry = &b;
-            break;
-        }
-    }
-    if (entry == nullptr) {
-        entry = &hold_budgets[hold_budget_next++ % hold_budgets.size()];
-        *entry = {page, ticket, 0};
-    } else if (entry->ticket != ticket) {
-        entry->ticket = ticket;
-        entry->accesses = 0;
-    }
-    if (entry->accesses == AccessesPerHold) {
-#ifdef VITA_DIAGNOSTICS
-        census.hold_load_waits++;
-#endif
-        return false;
-    }
-    entry->accesses++;
-    return true;
-}
-
 bool ARM_VitaNative::LumaAliasAccess(bool write) {
     // Luma plugins access FCRAM through its physical address with bit 31 set, which native
     // guest code cannot reach: served here, a fault each (rare enough not to map 128 MiB more).
@@ -3870,26 +3845,11 @@ bool ARM_VitaNative::LumaAliasAccess(bool write) {
 bool ARM_VitaNative::AccessPastHolds(u32 pc, bool write) {
     const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
     const u32 next = pc + (thumb ? 2 : 4);
-    // The app's view of the guest's page: the guest's slot, open to the app. A load needs the
-    // GPU's writes missed. A store goes as every write onto a held page does: past the holds,
-    // missing everything the queued work touches, or onto the page its own effects or a version
-    // opened (ticket 0: no hold to count it against).
-    const auto misses = [&](u32 address, u32 bytes) -> u8* {
-        if (IsLumaAlias(address)) {
-            // Physical memory: no slot of the guest's, and no hold counts it (LumaAliasAccess).
-            const PAddr physical = address & 0x7FFFFFFFu;
-            return memory.IsValidPhysicalAddress(physical) ? memory.GetPhysicalPointer(physical)
-                                                           : nullptr;
-        }
-        const u8* const host = map->HostAt(address);
-        u32 ticket = 0;
-        if (host == nullptr ||
-            !(write ? system.GPU().GuestStoreMissesHolds(host, bytes, ticket)
-                    : system.GPU().GuestReadMissesWrites(host, bytes, ticket)) ||
-            (ticket != 0 && !TakeHoldBudget(address >> 12, ticket))) {
-            return nullptr;
-        }
-        return const_cast<u8*>(host);
+    // The access's part on each page it touches (two across a boundary), each open to it or clear of
+    // the bytes its holds protect (GPU::GuestAccessMisses), through the app's view.
+    struct Span {
+        std::array<u8*, 2> host{};
+        u32 split = 0;
     };
     const auto span = [&](u32 address, u32 bytes, bool store, Span& s) {
         if (bytes == 0 || run.far - address >= bytes) {

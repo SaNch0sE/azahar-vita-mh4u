@@ -217,14 +217,9 @@ void GPU::EnablePageHolds() {
     });
 }
 
-bool GPU::GuestStoreMissesHolds([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
-                                [[maybe_unused]] u32& ticket) {
-    return impl->render->StoreMissesHolds(host, size, ticket);
-}
-
-bool GPU::GuestReadMissesWrites([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
-                                [[maybe_unused]] u32& write_ticket) {
-    return impl->render->ReadMissesWrites(host, size, write_ticket);
+bool GPU::GuestAccessMisses([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
+                            [[maybe_unused]] bool write) {
+    return impl->render->AccessMisses(host, size, write);
 }
 
 bool GPU::GuestOpensHeldPage([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,

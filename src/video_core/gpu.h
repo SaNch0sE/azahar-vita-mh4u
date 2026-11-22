@@ -142,15 +142,12 @@ public:
     /// the `reach` bytes its instruction may touch from host on being clear of the display's
     /// bytes (renderer_sgxd's PageHolds::OpenPastDisplay).
     bool GuestOpensDisplayPage(const u8* host, bool write, u32 reach);
-    /// Whether an aborted guest read of [host, host + size), on one page, misses the bytes the
-    /// GPU's queued work writes there, so it can be made at once with the page still held;
-    /// write_ticket names that work (the page's last write hold).
-    bool GuestReadMissesWrites(const u8* host, u32 size, u32& write_ticket);
-    /// Whether an aborted guest store to [host, host + size), on one page, misses the bytes
-    /// the GPU's queued work reads and writes there, so it can be made at once with the page
-    /// still held; ticket names the page's last live hold (renderer_sgxd's
-    /// PageHolds::StoreMisses).
-    bool GuestStoreMissesHolds(const u8* host, u32 size, u32& ticket);
+    /// Whether an aborted guest access to [host, host + size), on one page (a part of an access
+    /// across a boundary may be on a page open to it), can be made at once through the app's
+    /// view: a read clear of the bytes the GPU's queued work writes there, a store clear of the
+    /// bytes it reads and writes (renderer_sgxd's RenderThread::AccessMisses). The page stays
+    /// held.
+    bool GuestAccessMisses(const u8* host, u32 size, bool write);
     /// Whether an aborted guest access of up to [host, host + size), on one page the guest keeps
     /// accessing past its holds, opened that page without a wait (renderer_sgxd's
     /// RenderThread::OpensHeldPage: a store's version; a picture's rows written back, the page

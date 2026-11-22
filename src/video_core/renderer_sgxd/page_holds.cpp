@@ -36,12 +36,14 @@ PageHolds::PageHolds(Memory::MemorySystem& memory)
       vram_host{memory.GetPhysicalPointer(Memory::VRAM_PADDR)},
       fcram_pages{Memory::FCRAM_SIZE >> PageBits},
       pages{fcram_pages + (Memory::VRAM_SIZE >> PageBits)}, read_ticket(fcram_pages),
+      copy_ticket(fcram_pages), copy_lo(fcram_pages), copy_hi(fcram_pages), copy_from(fcram_pages),
       read_lo(fcram_pages), read_hi(fcram_pages), geometry_read(fcram_pages),
-      move_ticket(fcram_pages), write_ticket(pages),
+      move_ticket(fcram_pages), write_ticket(pages), write_run(pages),
       write_lo(pages), write_hi(pages), display_ticket(fcram_pages), other_ticket(fcram_pages),
       display_lo(fcram_pages), display_hi(fcram_pages), applied(pages), picture_watch(pages),
+      picture_watch_lo(pages), picture_watch_hi(pages),
       watched(fcram_pages),
-      watch_lo(fcram_pages), watch_hi(fcram_pages), watch_ticket(fcram_pages), parse_held(pages),
+      watch_lo(fcram_pages), watch_hi(fcram_pages), parse_held(pages),
       index_watch(fcram_pages), index_stamp(fcram_pages),
       index_write_frame(fcram_pages) {
 #ifdef VITA_DIAGNOSTICS
@@ -159,7 +161,9 @@ void PageHolds::Read(PAddr addr, u32 bytes, u32 ticket, Kind kind) {
         return;
     }
     if (first >= fcram_pages) {
-        // VRAM is held for reads as a whole (the class comment).
+        // VRAM is held for reads as a whole (the class comment), the bytes each read covers
+        // kept while it is live (StoreMisses).
+        NoteVramRead(addr, bytes, ticket);
         vram_read = ticket;
 #ifdef VITA_DIAGNOSTICS
         vram_read_kind = kind;
@@ -221,7 +225,60 @@ void PageHolds::Read(PAddr addr, u32 bytes, u32 ticket, Kind kind) {
             Change(p, ReadOnly);
         }
     }
-    open_runs.push_back({first, count});
+}
+
+void PageHolds::CopyRead(PAddr addr, u32 bytes, u32 ticket, Kind kind) {
+    u32 first, count;
+    if (!PagesOf(addr, bytes, first, count)) {
+        return;
+    }
+    if (first + count > fcram_pages) {
+        Read(addr, bytes, ticket, kind);
+        return;
+    }
+    DEBUG_ASSERT_MSG(open_ticket == 0 || open_ticket == ticket,
+                     "page holds: ticket {} while {}'s are open", ticket, open_ticket);
+    open_ticket = ticket;
+    if (Seen(addr, bytes, 3)) {
+        return;
+    }
+    const u32 done = Processed();
+    for (u32 p = first; p < first + count; p++) {
+        // The bytes it reads on the page, with the page's other live copy reads' (StoreMisses).
+        const PAddr page_addr = AddressOf(p);
+        const u16 lo = static_cast<u16>(std::max(addr, page_addr) - page_addr);
+        const u16 hi = static_cast<u16>(
+            std::min<u64>(u64{addr} + bytes, u64{page_addr} + PageSize) - page_addr);
+        if (Live(copy_ticket[p], done)) {
+            AddRange(copy_lo[p], copy_hi[p], lo, hi);
+        } else {
+            copy_lo[p] = {lo, 0};
+            copy_hi[p] = {hi, 0};
+        }
+        copy_ticket[p] = ticket;
+#ifdef VITA_DIAGNOSTICS
+        kinds[p] = kind;
+        ranges[p] = {addr, bytes};
+#endif
+        if (applied[p] < ReadOnly) {
+            Change(p, ReadOnly);
+        }
+    }
+}
+
+PageHolds::CopyTaken PageHolds::TakeCopy(u32 page, u32 reached) {
+    // Live at CopyHeld; the render thread may have run its ticket since (Processed moves on).
+    DEBUG_ASSERT(page < fcram_pages && copy_ticket[page] != 0);
+    const CopyTaken t{copy_from[page], copy_ticket[page], copy_lo[page], copy_hi[page]};
+    copy_from[page] = copy_ticket[page];
+    copy_ticket[page] = 0;
+    copy_lo[page] = {};
+    copy_hi[page] = {};
+    const Access wanted = Wanted(page, reached);
+    if (wanted < applied[page]) {
+        Change(page, wanted);
+    }
+    return t;
 }
 
 void PageHolds::Write(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind kind) {
@@ -267,6 +324,7 @@ void PageHolds::Write(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind k
             write_hi[p] = {hi, 0};
         }
         write_ticket[p] = ticket;
+        write_run[p] = first << 16 | count;
         if (p < fcram_pages) {
             index_stamp[p]++;
             index_watch[p] = 0;
@@ -281,7 +339,6 @@ void PageHolds::Write(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind k
             Change(p, NoAccess);
         }
     }
-    open_runs.push_back({first, count});
 }
 
 void PageHolds::Moves(PAddr addr, u32 bytes, u32 ticket) {
@@ -307,10 +364,6 @@ void PageHolds::Close(u32 ticket) {
     }
     DEBUG_ASSERT_MSG(open_ticket == ticket, "page holds: ticket {} closes {}'s holds", ticket,
                      open_ticket);
-    if (!open_runs.empty()) {
-        groups.push_back({ticket, std::move(open_runs)});
-        open_runs.clear();
-    }
     open_ticket = 0;
 }
 
@@ -392,7 +445,6 @@ void PageHolds::Watch(PAddr addr, u32 bytes) {
             watched[p] = 1;
             watch_lo[p] = {lo, 0};
             watch_hi[p] = {hi, 0};
-            watch_ticket[p]++;
             if (applied[p] < ReadOnly) {
                 Change(p, ReadOnly);
             }
@@ -486,6 +538,11 @@ PageHolds::Access PageHolds::HoldsWant(u32 page, u32 reached) const {
     if (page >= fcram_pages) {
         return vram_held ? ReadOnly : Unheld;
     }
+    // The render thread's CPU reads (CopyRead), a versioned page's too: a version moves the
+    // guest's view, which they read.
+    if (CopyLive(page)) {
+        return ReadOnly;
+    }
     if (versions[page].on) {
         // Protected by the frame: closed to writes while the frame's arming lasts.
         return versions[page].armed ? ReadOnly : Unheld;
@@ -559,8 +616,8 @@ void PageHolds::NoteDisplay(u32 p, PAddr addr, u32 bytes, u32 ticket, bool displ
 
 bool PageHolds::DisplayOnly(u32 page, u32 reached) const {
     if (page == NoPage || page >= fcram_pages || !Live(display_ticket[page], reached) ||
-        Live(other_ticket[page], reached) || watched[page] != 0 || parse_held[page] != 0 ||
-        index_watch[page] != 0) {
+        Live(other_ticket[page], reached) || CopyLive(page) || watched[page] != 0 ||
+        parse_held[page] != 0 || index_watch[page] != 0) {
         return false;
     }
     const PageVersion& v = versions[page];
@@ -590,39 +647,40 @@ bool PageHolds::OpenPastDisplay(const u8* host, u32 reached, u32 reach) {
 
 void PageHolds::Release(u32 reached) {
     last_reached = reached;
-    while (!groups.empty() && !Live(groups.front().ticket, reached)) {
-        for (const Run& run : groups.front().runs) {
-            for (u32 p = run.first; p < run.first + run.count; p++) {
-                // Nothing to change (below): an FCRAM page, not versioned, closed to writes or
-                // open (a live write would have closed it whole), or a VRAM page the GPU wrote.
-                // Most of a frame's pages: the loop was ~1.25% of a game's emulation thread.
-                if (p < fcram_pages ? applied[p] <= ReadOnly && !versions[p].on
-                                    : applied[p] == NoAccess) {
-                    continue;
-                }
-                Access wanted = Wanted(p, reached);
-                // Lazily, as the next frame holds the same pages again: each let go of and held
-                // again was two descriptor changes a page (a game's fight, ~17500 pages each
-                // way a second, azaharHold ~2.4% of its emulation thread). A VRAM page the GPU
-                // wrote stays closed (the next frame's passes write the same render targets, the
-                // guest's CPU rarely touches VRAM); an FCRAM page whose work is all done stays
-                // closed to writes, reads going on. An access opens either as any abort on a page
-                // with no live hold (PageFault, Reopen).
-                if (wanted == Unheld && p < fcram_pages && !versions[p].on) {
-                    wanted = ReadOnly;
-                }
-                if (wanted < applied[p]) {
-                    Change(p, wanted);
-                }
-            }
-        }
-        groups.pop_front();
-    }
     Flush();
 }
 
+void PageHolds::LetGo(u32 first, u32 count, u32 reached) {
+    for (u32 p = first; p < first + count; p++) {
+        // Nothing to change: an FCRAM page, not versioned, closed to writes or open (a live
+        // write would have closed it whole), or a VRAM page the GPU did not write.
+        if (p < fcram_pages ? applied[p] <= ReadOnly && !versions[p].on
+                            : applied[p] != NoAccess) {
+            continue;
+        }
+        Access wanted = Wanted(p, reached);
+        // Letting go and holding again costs two descriptor changes a page: an FCRAM page whose
+        // work is all done stays closed to writes, reads going on, and a VRAM page the GPU wrote
+        // likewise (the next frame's passes write the same render targets). A write opens either as
+        // any abort on a page with no live hold (Reopen).
+        if (wanted == Unheld && p < fcram_pages && !versions[p].on) {
+            wanted = ReadOnly;
+        }
+        if (wanted < applied[p]) {
+            Change(p, wanted);
+        }
+    }
+}
+
 void PageHolds::Reopen(u32 page, u32 reached) {
-    Release(reached);
+    last_reached = reached;
+    // The page's last write hold done: its other pages go with it, as its ticket's release
+    // would have let go of them, so the guest's next accesses there do not fault one by one.
+    const u32 run = write_run[page];
+    if (run != 0 && !Live(write_ticket[page], reached)) {
+        LetGo(run >> 16, run & 0xffff, reached);
+        write_run[page] = 0;
+    }
     Access wanted = Wanted(page, reached);
     // A VRAM page the guest writes opens until the next GPU read of VRAM holds it again.
     if (page >= fcram_pages && wanted == ReadOnly && !Live(vram_read, reached) &&
@@ -685,7 +743,10 @@ bool PageHolds::Version(u32 page, u32 reached) {
     DEBUG_ASSERT(page < fcram_pages);
     PageVersion& v = versions[page];
     // A GPU write queued: the guest's write waits for it (WaitFor, whatever Wait for GPU says).
-    if (Live(write_ticket[page], reached)) {
+    // A live CopyRead: the render thread reads the guest's view, which a version moves, and a
+    // version opens the page for the frame, the held bytes too (the caller takes their copy
+    // first: RenderThread::CopyFault).
+    if (Live(write_ticket[page], reached) || CopyLive(page)) {
         return false;
     }
     u8* const host = fcram_host + (page << PageBits);
@@ -880,45 +941,63 @@ bool PageHolds::TouchesWrite(const u8* host, u32 bytes) const {
     return (at < hi[0] && at + bytes > lo[0]) || (hi[1] != 0 && at < hi[1] && at + bytes > lo[1]);
 }
 
-bool PageHolds::StoreMisses(const u8* host, u32 bytes, u32 reached, u32& ticket) const {
+bool PageHolds::StoreMisses(const u8* host, u32 bytes, u32 reached, bool closed) const {
     const u32 page = PageOf(host);
-    if (page == NoPage || page >= fcram_pages ||
-        (versions[page].on && (Changed(page) || !Live(write_ticket[page], reached))) ||
-        Live(display_ticket[page], reached) || parse_held[page] != 0) {
+    // A handed-over list's page has its own path (ParseFault copies first), and so does a
+    // versioned one (Version) unless a GPU write is queued to it: then guest and GPU share the
+    // guest's slot, so a store beside a render target waits only on its bytes.
+    // A closed page's guest slot is the one its live reads read, or none of them is (Changed, until
+    // a read remaps it): its bytes decide.
+    if (page == NoPage || parse_held[page] != 0) {
         return false;
     }
-    const u32 at = static_cast<u32>(host - fcram_host) & (PageSize - 1);
+    const bool fcram = page < fcram_pages;
+    if (fcram && !closed && versions[page].on &&
+        (Changed(page) || !Live(write_ticket[page], reached))) {
+        return false;
+    }
+    const u32 at = static_cast<u32>(host - (fcram ? fcram_host : vram_host)) & (PageSize - 1);
     DEBUG_ASSERT(at + bytes <= PageSize);
     const auto overlaps = [](const std::array<u16, 2>& lo, const std::array<u16, 2>& hi, u32 l,
                              u32 h) {
         return (hi[0] != 0 && l < hi[0] && h > lo[0]) || (hi[1] != 0 && l < hi[1] && h > lo[1]);
     };
+    // The render thread's CPU reads (CopyRead): their bytes take a copy for it first
+    // (RenderThread::CopyFault).
+    const bool copying = CopyLive(page);
+    if (copying && overlaps(copy_lo[page], copy_hi[page], at, at + bytes)) {
+        return false;
+    }
     // A store into a watched texture's bytes marks it written (the caller unwatches the page
     // first, RenderThread::TakeHeldWrite); one beside them leaves it as it was (TouchesWatch).
-    const bool watching = watched[page] != 0;
+    const bool watching = fcram && watched[page] != 0;
     if (watching && overlaps(watch_lo[page], watch_hi[page], at, at + bytes)) {
         return false;
     }
-    const bool reading = Live(read_ticket[page], reached);
-    const bool writing = Live(write_ticket[page], reached);
-    if (reading && overlaps(read_lo[page], read_hi[page], at, at + bytes)) {
-        return false;
+    // The GPU's reads: an FCRAM page's bytes; VRAM's, held as a whole, by the ranges its live
+    // reads cover.
+    bool reading;
+    if (fcram) {
+        reading = Live(read_ticket[page], reached);
+        if (reading && overlaps(read_lo[page], read_hi[page], at, at + bytes)) {
+            return false;
+        }
+    } else {
+        reading = Live(vram_read, reached);
+        const PAddr address = AddressOf(page) + at;
+        if (reading && VramReadMeets(address, address + bytes, reached)) {
+            return false;
+        }
     }
     // Clear of the GPU's writes by whole cache lines: a line the store dirties that holds bytes
     // the GPU writes would be written back over them.
     constexpr u32 Line = 64;
+    const bool writing = Live(write_ticket[page], reached);
     if (writing && overlaps(write_lo[page], write_hi[page], at & ~(Line - 1),
                             (at + bytes + Line - 1) & ~(Line - 1))) {
         return false;
     }
-    // The later of the live tickets; a page the watch alone closes, its watch's.
-    const u32 w = write_ticket[page], r = read_ticket[page];
-    ticket = !reading && !writing          ? watch_ticket[page]
-             : !writing                    ? r
-             : !reading                    ? w
-             : static_cast<s32>(w - r) > 0 ? w
-                                           : r;
-    return reading || writing || watching || closed;
+    return reading || writing || watching || closed || copying;
 }
 
 [[gnu::noinline]] void PageHolds::NoteVramRead(PAddr addr, u32 bytes, u32 ticket) {
@@ -939,6 +1018,16 @@ bool PageHolds::StoreMisses(const u8* host, u32 bytes, u32 reached, u32& ticket)
     }
     vram_reads[(vram_reads_head + vram_reads_count) % VramReads] = {addr, addr + bytes, ticket};
     vram_reads_count++;
+}
+
+bool PageHolds::VramReadMeets(PAddr lo, PAddr hi, u32 reached) const {
+    for (u32 i = 0; i < vram_reads_count; i++) {
+        const auto& r = vram_reads[(vram_reads_head + i) % VramReads];
+        if (Live(r[2], reached) && lo < r[1] && r[0] < hi) {
+            return true;
+        }
+    }
+    return false;
 }
 
 PAddr PageHolds::AddressOf(u32 page) const {
@@ -990,9 +1079,12 @@ std::string PageHolds::HoldState(u32 page, u32 reached) const {
                                 Live(write_ticket[page], reached) ? "live" : "done");
     if (page < fcram_pages) {
         const PageVersion& v = versions[page];
-        s += fmt::format(", read {} {}, watch {}, version on {} armed {} guest {} gpu {}, {} flips "
-                         "queued, {} changed queued",
+        s += fmt::format(", read {} {}, copy {} {} {:#x}-{:#x} {:#x}-{:#x} (render thread at {}), "
+                         "watch {}, version on {} armed {} guest {} gpu {}, {} flips queued, {} "
+                         "changed queued",
                          read_ticket[page], Live(read_ticket[page], reached) ? "live" : "done",
+                         copy_ticket[page], CopyLive(page) ? "live" : "done", copy_lo[page][0],
+                         copy_hi[page][0], copy_lo[page][1], copy_hi[page][1], Processed(),
                          index_watch[page], v.on, v.armed, v.guest, v.gpu, flips.size(),
                          changed.size());
     }

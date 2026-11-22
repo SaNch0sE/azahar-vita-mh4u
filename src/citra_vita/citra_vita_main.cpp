@@ -2115,38 +2115,29 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     LOG_INFO(
                         Frontend,
                         "perf: guest {:.1f} ms, azaharRun {:.1f} ms, {} slices: svc {}, "
-                        "timer {}, faults {} (VFP short vectors {} in {}, loads past held "
-                        "bytes {}, stores {} (of both, Thumb {}), {} past the budget left to wait; sites "
-                        "patched to "
-                        "a thunk {}, to the svc {}; conditional BKPTs skipped {}, their sites "
-                        "patched {}); svc sites "
-                        "patched to a thunk {}; "
-                        "upcall sites {} (Thumb {}) runs {} redirected {} rescheduled {} "
-                        "switched {} idled {} ({} events, {} exits, {} for core 1, {} for the "
-                        "vblank), exits for the slice's end {} and no next thread {} "
-                        "syscalls {} "
-                        "preempted {} ({} in the vector), app megabytes taken {}, upcall "
-                        "stack {} bytes, the app's level-1 entries the guest's table lacks "
-                        "{} and holds stale {}; svcs "
-                        "answered in the guest: "
-                        "tick {}, cache {}, thread id {}, process id {}, VFP {}",
+                        "timer {}, faults {} (loads past held bytes {}, stores {} (of both, "
+                        "Thumb {}), busy pages opened {}; VFP sites patched to a thunk {}, to "
+                        "the svc {}); svc sites patched to a thunk {}; upcall sites {} (Thumb "
+                        "{}) runs {} redirected {} rescheduled {} switched {} idled {} ({} "
+                        "events, {} exits, {} for core 1, {} for the vblank), exits for the "
+                        "slice's end {} and no next thread {} syscalls {} preempted {} ({} in "
+                        "the vector), app megabytes taken {}, upcall stack {} bytes; svcs "
+                        "answered in the guest: tick {}, cache {}, thread id {}, process id {}, "
+                        "VFP {}",
                         n.guest_ticks / tick_ms,
                         n.kernel_cycles / (scePowerGetArmClockFrequency() * 1e3), n.slices,
                         n.reasons[AZAHAR_EXIT_SVC], n.reasons[AZAHAR_EXIT_TIMER],
                         n.slices - n.reasons[AZAHAR_EXIT_SVC] - n.reasons[AZAHAR_EXIT_TIMER],
-                        n.vfp_insns, n.vfp_exits, n.hold_loads, n.hold_stores, n.hold_thumb,
-                        n.hold_load_waits, n.vfp_thunks, n.vfp_svcs, n.bkpt_skips, n.bkpt_sites,
-                        n.svc_thunks,
-                        n.upcall_sites, n.upcall_thumb_sites, n.upcall_runs, n.upcall_redirects,
-                        n.upcall_reschedules, n.upcall_switches, n.upcall_idles,
-                        n.upcall_idle_events, n.upcall_idle_exits, n.upcall_idle_exits_other_busy,
-                        n.upcall_idle_exits_vblank, n.upcall_exits_slice_up,
-                        n.upcall_exits_no_next, n.upcall_syscalls, n.upcall_preempted,
-                        n.upcall_rearms, n.upcall_synced, n.upcall_stack_used,
-                        n.upcall_drift < 0 ? n.upcall_drift : n.upcall_drift & 0xFFFF,
-                        n.upcall_drift < 0 ? 0 : n.upcall_drift >> 16, n.fast[AZAHAR_FAST_TICK],
-                        n.fast[AZAHAR_FAST_CACHE], n.fast[AZAHAR_FAST_THREAD_ID],
-                        n.fast[AZAHAR_FAST_PROCESS_ID], n.fast[AZAHAR_FAST_VFP]);
+                        n.hold_loads, n.hold_stores, n.hold_thumb, n.hold_opens, n.vfp_thunks,
+                        n.vfp_svcs, n.svc_thunks, n.upcall_sites, n.upcall_thumb_sites,
+                        n.upcall_runs, n.upcall_redirects, n.upcall_reschedules, n.upcall_switches,
+                        n.upcall_idles, n.upcall_idle_events, n.upcall_idle_exits,
+                        n.upcall_idle_exits_other_busy, n.upcall_idle_exits_vblank,
+                        n.upcall_exits_slice_up, n.upcall_exits_no_next, n.upcall_syscalls,
+                        n.upcall_preempted, n.upcall_rearms, n.upcall_synced, n.upcall_stack_used,
+                        n.fast[AZAHAR_FAST_TICK], n.fast[AZAHAR_FAST_CACHE],
+                        n.fast[AZAHAR_FAST_THREAD_ID], n.fast[AZAHAR_FAST_PROCESS_ID],
+                        n.fast[AZAHAR_FAST_VFP]);
                     LOG_INFO(Frontend,
                              "perf: idle loops: {} callers sent to the skip; {} skips, {:.1f} ms "
                              "of guest time skipped",
@@ -2380,14 +2371,14 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              "perf: page holds: azaharHold {} calls, {} runs, {} descriptors; "
                              "{} pages held, {} let go; guest aborts {} ({} versioned, {} "
                              "waited, {:.1f} ms; {} geometry pages moved; {} list pages copied "
-                             "for the parse thread, {} waits for a parse ({:.1f} ms)), "
-                             "HLE waits {} ({:.1f} ms), HLE writes past the holds {}, onto a "
-                             "version {}",
+                             "for the parse thread, {} waits for a parse ({:.1f} ms), {} copies "
+                             "for the render thread's CPU reads ({} bytes)), HLE waits {} "
+                             "({:.1f} ms), HLE writes past the holds {}, onto a version {}",
                              hs.holds.calls, hs.holds.runs, hs.holds.descriptors,
                              hs.holds.held_pages, hs.holds.released_pages, hs.faults,
                              hs.versioned_faults, hs.fault_waits, hs.fault_wait_us / 1e3,
                              hs.geometry_moves, hs.parse_copies, hs.parse_waits,
-                             hs.parse_wait_us / 1e3,
+                             hs.parse_wait_us / 1e3, hs.copy_faults, hs.copy_bytes,
                              hs.host_waits, hs.host_wait_us / 1e3, hs.host_past,
                              hs.host_versions);
                     // Page versions: azaharFlip's calls, the pages that got a second slot,

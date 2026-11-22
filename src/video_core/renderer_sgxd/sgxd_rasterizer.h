@@ -121,6 +121,9 @@ public:
     [[nodiscard]] bool PictureOwns(PAddr lo, PAddr hi) const;
     /// Whether a picture owns guest rows of [lo, hi) that no copy is taking back yet (any thread).
     [[nodiscard]] bool PictureOwnsRows(PAddr lo, PAddr hi) const;
+    /// The rows a copy of [lo, hi) for an access may write back: the pictures' strips that meet it,
+    /// which may reach past it ({0, 0}: none). Any thread.
+    [[nodiscard]] std::pair<PAddr, PAddr> PictureCopyExtent(PAddr lo, PAddr hi) const;
     /// The render side of a guest or HLE access to [lo, hi): the rows pictures own there copied into
     /// guest memory, waited for unless `drain` is false; with write, the pictures and textures over the
     /// range marked written. `beside`: the guest keeps accessing a page of the range beside the rows.
@@ -250,6 +253,8 @@ public:
     /// Parse thread, at a draw without a geometry shader: its vertex program queued for the first
     /// tier's workers.
     void PrefetchVertex(const Pica::RegsInternal& parse_regs, Pica::ShaderSetup& parse_setup);
+    /// The bytes of an 8-bit index list as the queued draws read it. Unset: guest memory.
+    std::function<const u8*(PAddr, u32)> guest_indices;
     void SetFlipHook(std::function<bool(u32*)> pending, std::function<s64()> due_in,
                      std::function<void()> flip) {
         backend.SetFlipHook(std::move(pending), std::move(due_in), std::move(flip));
@@ -975,6 +980,8 @@ private:
     mutable std::mutex owned_lock;
     std::vector<std::pair<PAddr, PAddr>> owned_published;
     std::vector<std::pair<PAddr, PAddr>> rows_published;
+    /// The pictures' buffers with them: [lo, hi) and a strip's bytes (0: a screen picture).
+    std::vector<std::array<u32, 3>> footprint_published;
     std::atomic<bool> owned_any{false};
     struct CopyInFlight {
         PAddr lo, hi;

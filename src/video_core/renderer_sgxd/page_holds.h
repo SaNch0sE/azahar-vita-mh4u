@@ -4,8 +4,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
-#include <deque>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -28,13 +29,10 @@ namespace SgxdRenderer {
  * reads is closed to the guest's writes, a page it writes to any guest access, until the work is
  * done. That lets the GPU's interrupts reach the guest at submission while the SGX still runs it.
  *
- * Holds are by ticket, the render thread's numbers for points in its queue: a hold made for
- * ticket T lasts until the GPU has done the work queued before T's fence. Each page keeps the
- * last ticket that reads it and the last that writes it; each ticket keeps the pages it held,
- * so that Release lets go of a ticket's pages once it is reached, and only those no later
- * ticket holds. The guest's view of a page changes through azaharHold (vita_native), by the
- * app's address: every guest alias of the page at once. The holds are not write tracking:
- * nothing is kept about a page once its work is done.
+ * Holds are by ticket (the render thread's points in its queue): a hold for ticket T lasts until
+ * the GPU has done the work queued before T's fence. Nothing is let go of when a ticket is
+ * reached: a guest fault on a page whose work is done opens it (Reopen). The guest's view changes
+ * through azaharHold, by the app's address: every guest alias of the page at once.
  *
  * Guest VRAM is held for reads as a whole and for writes page by page; a write clear of the bytes
  * VRAM's live reads cover (vram_reads) goes past the holds.
@@ -92,6 +90,35 @@ public:
     /// guest's [addr, addr + bytes). Addresses outside guest FCRAM and VRAM hold nothing.
     void Read(PAddr addr, u32 bytes, u32 ticket, Kind kind);
     void Write(PAddr addr, u32 bytes, u32 ticket, Kind kind);
+    /// Queued work up to `ticket` has the render thread read [addr, addr + bytes) on the CPU as it
+    /// runs the work, and the GPU never: an 8-bit index list it widens into its own pass data.
+    /// Closed to the guest's writes until the render thread has run that work (Processed), or until
+    /// a write takes a copy of the bytes for it (TakeCopy): held to the GPU's fence, a page
+    /// refilled each frame would never open. A versioned page is closed too and takes no version
+    /// while the bytes are not copied: the render thread reads the guest's view, which a version
+    /// moves. A VRAM range holds as Read.
+    void CopyRead(PAddr addr, u32 bytes, u32 ticket, Kind kind);
+    /// A write onto an FCRAM page a live CopyRead holds (CopyHeld): the render thread reads a
+    /// copy of the held bytes instead (RenderThread::CopyFault), the CopyRead lets go of the
+    /// page and it opens as its other holds allow. The copy serves the work after `from` up to
+    /// `ticket`, the page's bytes [lo, hi) (up to two ranges, hi 0: none). The render thread may
+    /// run that work between CopyHeld and here: the copy is then never read.
+    struct CopyTaken {
+        u32 from, ticket;
+        std::array<u16, 2> lo, hi;
+    };
+    CopyTaken TakeCopy(u32 page, u32 reached);
+    [[nodiscard]] bool CopyHeld(u32 page) const {
+        return CopyLive(page);
+    }
+    /// The render thread's progress for CopyRead: the last ticket whose records it has run.
+    /// Set before the first hold.
+    void SetProcessed(const std::atomic<u32>* counter) {
+        processed = counter;
+    }
+    [[nodiscard]] u32 CopyTicket(u32 page) const {
+        return CopyLive(page) ? copy_ticket[page] : 0;
+    }
     /// Queued work up to `ticket` has the render thread move [addr, addr + bytes)'s FCRAM pages
     /// still cached to CDRAM: a tiled display transfer's output here, a draw's textures and colour
     /// buffer at their holds. The move copies a page through the app's view while the work's holds
@@ -118,8 +145,8 @@ public:
     /// emulation thread's waits for host 0 to serve it, after the batch too.
     void BeginBatch();
     void EndBatch();
-    /// Lets go of the pages whose tickets are all reached: the tickets up to `reached` let go
-    /// of their pages, and the guest's view follows (azaharHold).
+    /// The tickets up to `reached` are done (their pages are let go of at the guest's next
+    /// fault on one, Reopen), and the guest's view gets the changes made since (azaharHold).
     void Release(u32 reached);
 
     [[nodiscard]] u32 PageOf(const u8* host) const;
@@ -144,15 +171,17 @@ public:
     /// colour buffer, in its last page).
     [[nodiscard]] bool TouchesWrite(const u8* host, u32 bytes) const;
     /// Whether a store of [host, host + bytes) (the guest's, or the HLE's through the app's view),
-    /// inside one FCRAM page held by plain holds or watched (not the display's, nor versioned
-    /// unless a GPU write is queued to it), misses the page's queued GPU work and
-    /// its watched textures: clear of the bytes its live reads and its textures cover, and by
-    /// whole cache lines of those its live writes cover. It can then be made through the app's
-    /// view with the page still held and watched; ticket names the page's last live hold, or
-    /// its watch. a game X and Y keep a flag 0x55 bytes before a 512 KiB DMA
-    /// buffer, on its first page, and set it while the buffer's DMAs are queued: each store
-    /// would wait for them (a scene change's hitches).
-    [[nodiscard]] bool StoreMisses(const u8* host, u32 bytes, u32 reached, u32& ticket) const;
+    /// inside one page held or watched, misses the page's queued GPU work and its watched textures:
+    /// clear of the bytes its live reads and its textures cover, and by whole cache lines of those
+    /// its live writes cover. It can then be made through the app's view with the page still held
+    /// and watched (a flag beside a queued DMA buffer). A display page's holds are plain ones,
+    /// judged by their bytes as any (NoteDisplay marks them for OpenPastDisplay, which opens the
+    /// page first where it can). A VRAM page by its live writes' bytes and the bytes VRAM's live
+    /// reads cover (vram_reads). A versioned page has its own path (Version), unless a GPU write is
+    /// queued to it or the page is `closed`: a picture's rows on it, or rows a read copied back
+    /// watched there, which take no version (RenderThread::TakeHeldWrite); such a page is judged by
+    /// its holds' bytes on the guest's slot, and with nothing live the store misses all.
+    [[nodiscard]] bool StoreMisses(const u8* host, u32 bytes, u32 reached, bool closed) const;
     [[nodiscard]] u32 WriteTicket(u32 page) const {
         return write_ticket[page];
     }
@@ -178,19 +207,40 @@ public:
     /// the guest; an access onto the rows asks for the copy first, one beside them goes past
     /// (RenderThread::StoreMissesHolds, ReadMissesWrites).
     std::function<bool(PAddr, u32)> picture_owned;
-    /// A page a picture's rows were copied into for a guest read: open to reads, closed to
-    /// writes, so that the guest's first write marks the picture's rows there outdated.
+    /// A page a picture's rows were copied into for a read (the guest's or the HLE's): open to
+    /// reads, closed to writes, so that the guest's first write into those rows marks the picture's
+    /// rows there outdated. The rows' bytes on the page, [lo, hi) (offsets): a write beside them
+    /// leaves them as they are (RenderThread::StoreMissesHolds).
     [[nodiscard]] bool PictureWatched(u32 page) const {
         return picture_watch[page] != 0;
     }
-    void SetPictureWatch(u32 page, bool on) {
-        picture_watch[page] = on ? 1 : 0;
+    [[nodiscard]] bool PictureWatchMeets(u32 page, u32 lo, u32 hi) const {
+        return picture_watch[page] != 0 && lo < picture_watch_hi[page] &&
+               picture_watch_lo[page] < hi;
+    }
+    [[nodiscard]] std::pair<u32, u32> PictureWatchRange(u32 page) const {
+        return {picture_watch_lo[page], picture_watch_hi[page]};
+    }
+    /// Rows [lo, hi) (offsets) copied for a read: watched, with the page's rows watched already.
+    void WatchPictureRows(u32 page, u32 lo, u32 hi) {
+        if (picture_watch[page] == 0) {
+            picture_watch_lo[page] = static_cast<u16>(lo);
+            picture_watch_hi[page] = static_cast<u16>(hi);
+        } else {
+            picture_watch_lo[page] = static_cast<u16>(std::min<u32>(picture_watch_lo[page], lo));
+            picture_watch_hi[page] = static_cast<u16>(std::max<u32>(picture_watch_hi[page], hi));
+        }
+        picture_watch[page] = 1;
+    }
+    void ClearPictureWatch(u32 page) {
+        picture_watch[page] = 0;
     }
     [[nodiscard]] PAddr AddressOf(u32 page) const;
     [[nodiscard]] Access Applied(u32 page) const {
         return static_cast<Access>(applied[page]);
     }
-    /// The page's view opened at once, its work done (WaitFor): an abort on it can resume.
+    /// The page's view opened at once, its work done (WaitFor): an abort on it can resume. The
+    /// rest of its last write hold's pages are let go of with it (LetGo).
     void Reopen(u32 page, u32 reached);
     /// A guest window now shows [host, host + size), mapped open: the held pages of it are
     /// sent to the module again, which holds every window of them.
@@ -308,20 +358,12 @@ public:
 #endif
 
 private:
-    /// A run of pages, [first, first + count).
-    struct Run {
-        u32 first;
-        u32 count;
-    };
-    /// A ticket's pages, for Release.
-    struct Group {
-        u32 ticket;
-        std::vector<Run> runs;
-    };
-
     [[nodiscard]] bool Live(u32 ticket, u32 reached) const {
         return ticket != 0 && static_cast<s32>(ticket - reached) > 0;
     }
+    /// Lets go of [first, first + count) for Reopen, as a ticket's release would: each page as
+    /// far as its own holds allow, an FCRAM page that is not versioned closed to writes still.
+    void LetGo(u32 first, u32 count, u32 reached);
     [[nodiscard]] Access Wanted(u32 page, u32 reached) const;
     [[nodiscard]] Access HoldsWant(u32 page, u32 reached) const;
     [[nodiscard]] bool PagesOf(PAddr addr, u32 bytes, u32& first, u32& count) const;
@@ -349,6 +391,19 @@ private:
     u32 pages;
 
     std::vector<u32> read_ticket;  ///< FCRAM pages only (VRAM's reads: vram_read)
+    /// FCRAM pages: the last ticket whose CopyRead holds the page, and the bytes those cover,
+    /// merged while it is live, as read_lo and read_hi (StoreMisses). Version refuses a page
+    /// with a live one: the caller takes its copy first (TakeCopy).
+    std::vector<u32> copy_ticket;
+    std::vector<std::array<u16, 2>> copy_lo, copy_hi;
+    std::vector<u32> copy_from;
+    const std::atomic<u32>* processed{};
+    [[nodiscard]] u32 Processed() const {
+        return processed->load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool CopyLive(u32 page) const {
+        return page < fcram_pages && Live(copy_ticket[page], Processed());
+    }
     /// FCRAM pages: the bytes its GPU reads cover, as write_lo and write_hi for the writes,
     /// merged while its last read ticket is live (StoreMisses).
     std::vector<std::array<u16, 2>> read_lo, read_hi;
@@ -360,6 +415,8 @@ private:
     }
     std::array<std::array<u32, 3>, 64> moves_seen{};
     std::vector<u32> write_ticket; ///< every page
+    /// Every page: its last write hold's pages, first << 16 | count (0: none), for Reopen.
+    std::vector<u32> write_run;
     /// Every page: the bytes its GPU writes cover, as up to two ranges [lo, hi) (hi 0: none),
     /// merged while its last write ticket is live (TouchesWrite).
     std::vector<std::array<u16, 2>> write_lo, write_hi;
@@ -376,11 +433,9 @@ private:
     static void AddRange(std::array<u16, 2>& lo, std::array<u16, 2>& hi, u16 l, u16 h);
     std::vector<u8> applied;       ///< Access, as the guest's view has it (after Apply)
     std::vector<u8> picture_watch; ///< every page: PictureWatched
+    std::vector<u16> picture_watch_lo, picture_watch_hi;
     std::vector<u8> watched;       ///< T12: FCRAM pages of a texture or a depth buffer (Watch)
-    /// T12: a watched page's textures' bytes, as up to two ranges [lo, hi) (hi 0: none), and
-    /// a count of the times it was watched anew (the stores beside them: StoreMisses).
     std::vector<std::array<u16, 2>> watch_lo, watch_hi;
-    std::vector<u32> watch_ticket;
     /// Watch's ranges watched whole, direct-mapped: a texture's range comes back with every draw
     /// that reads it, and its pages stay watched until Unwatch, which counts `unwatches`;
     /// a slot with the count still current needs no walk of the range's pages.
@@ -390,10 +445,7 @@ private:
     std::vector<u8> index_watch;
     std::vector<u32> index_stamp, index_write_frame;
 
-    /// The holds made for the next ticket, and the tickets' groups not yet released.
     u32 open_ticket{};
-    std::vector<Run> open_runs;
-    std::deque<Group> groups;
     /// Seen's ranges, direct-mapped: 256 slots, as a draw-heavy list's textures and vertex ranges
     /// evicted each other from 64.
     std::array<std::array<u32, 4>, 256> seen{};
@@ -403,6 +455,15 @@ private:
     u32 vram_read{};
     bool vram_held{};
     std::vector<u32> vram_opened;
+    /// The ranges VRAM's live reads cover, [lo, hi) with their ticket, in ticket order (Read), a
+    /// ring of VramReads (full: the newest grows over the range, as one): a store beside them goes
+    /// past VRAM's whole-page holds (StoreMisses). Out of Read's own code (NoteVramRead), which
+    /// every draw's textures and vertices take.
+    static constexpr u32 VramReads = 512;
+    std::array<std::array<u32, 3>, VramReads> vram_reads{};
+    u32 vram_reads_head{}, vram_reads_count{};
+    void NoteVramRead(PAddr addr, u32 bytes, u32 ticket);
+    [[nodiscard]] bool VramReadMeets(PAddr lo, PAddr hi, u32 reached) const;
 
     std::vector<u32> changed;
     bool batch{};

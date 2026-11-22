@@ -173,7 +173,8 @@ public:
     /// The guest's view gets the holds the work queued since made, at the end of each GPU operation and
     /// vblank.
     void ApplyPageHolds();
-    /// Lets go of the holds whose work is done. Between slices.
+    /// The tickets reached so far to the holds (their pages let go of at the guest's next fault on
+    /// one). Between slices.
     void ReleasePageHolds();
     /// A guest access aborted on the page of `host`: whether a hold refused it. If so, the work it
     /// waited for is done and the page open, and the guest runs the access again.
@@ -185,14 +186,18 @@ public:
     /// before its page's change reached the descriptor (host 1's) may run again.
     bool AccessOpenAfterFlush(const u8* host, bool write);
     bool OpensDisplayPage(const u8* host, bool write, u32 reach);
-    /// GPU::GuestReadMissesWrites: a page held for a GPU write (the guest's view closed), the
-    /// read clear of that write's bytes (PageHolds::TouchesWrite), as the HLE's reads go on;
-    /// write_ticket the page's last write's.
-    bool ReadMissesWrites(const u8* host, u32 size, u32& write_ticket);
-    /// GPU::GuestStoreMissesHolds: a guest store of [host, host + size) on a held page, which
-    /// the caller makes through the app's view when this answers true (TakeHeldWrite): past the
-    /// holds (ticket the page's last live hold's), or onto the page opened (ticket 0).
-    bool StoreMissesHolds(const u8* host, u32 size, u32& ticket);
+    /// Whether an aborted guest access to [host, host + size), on one page, can be made at once through
+    /// the app's view: the page open to it, or the access clear of the bytes its holds protect.
+    bool AccessMisses(const u8* host, u32 size, bool write);
+    /// A guest access on a held page the guest keeps accessing past its holds opens it without a wait
+    /// if it can: a store by a version of a moved FCRAM page, or the page its own effects open. A page
+    /// a picture's rows close has them written back and marked outdated; the access itself goes past
+    /// the holds (false).
+    bool OpensHeldPage(const u8* host, u32 size, bool write);
+    bool ReadMissesWrites(const u8* host, u32 size);
+    /// A guest store of [host, host + size) on a held page, made by the caller through the app's view
+    /// when true: past the holds, or onto the page opened.
+    bool StoreMissesHolds(const u8* host, u32 size);
     /// The HLE reads or writes [host, host + size) through its own view: it waits for the queued GPU
     /// work the guest would wait for.
     void HostAccess(const u8* host, u32 size, bool write);
@@ -224,10 +229,14 @@ public:
         PageHolds::Stats holds;
         u32 faults, fault_waits;
         u32 versioned_faults; ///< of the aborts, those a page version took
-        u32 geometry_moves;   ///< geometry pages moved to CDRAM after a write waited on them
+        /// Geometry pages moved to CDRAM for a write.
+        u32 geometry_moves;
         /// Writes to a handed-over list's page: copies taken for the parse, and waits for a parse.
         u32 parse_copies, parse_waits;
         u64 parse_wait_us;
+        /// Writes onto pages this thread was still to read on the CPU: the copies they took.
+        u32 copy_faults;
+        u32 copy_bytes;
         u64 fault_wait_us;
         u32 host_waits;
         u64 host_wait_us;
@@ -662,26 +671,44 @@ private:
     void PutPageRemaps();
     /// Waits for the work a guest access to the page waits for, the open holds' ticket fenced first.
     void WaitHeldPage(u32 page, bool write);
-    /// A write onto a held page (PageHolds' index), by the guest (a store that aborted:
-    /// PageFault) or by the HLE before it writes through the app's view (HostAccess): every
-    /// writer's one way past the holds. [host, host + bytes) is what it writes, within the page
-    /// (bytes 0: not known). First the write's own effects: the memo's index lists over the
-    /// page are stale, a handed-over list's parse reads a copy of the page, T12's textures on it
-    /// are untiled again. Then the first that applies: the page open to the write (Open); for a
-    /// known range, clear of the bytes the page's queued work uses, the write made with the page
-    /// still held (PastHolds; ticket the page's last live hold's); a version of a moved FCRAM
-    /// page, the writer's view onto a slot no queued work reads (Open); else the caller waits for
-    /// the page's work (Wait, WaitHeldPage). An open page that queued work may be moving to CDRAM
-    /// opens once the move is done.
+    /// A write onto a held page, by the guest (PageFault) or the HLE (HostAccess): the one way past the
+    /// holds. [host, host + bytes) is what it writes (bytes 0: not known). First its own effects (stale
+    /// index memos, parse copies, textures untiled again), then the first that applies: the page open
+    /// (Open); a known range clear of the queued work's bytes, the page still held (PastHolds); a
+    /// version of a moved FCRAM page (Open); else the caller waits (Wait). `closed`: a picture's rows
+    /// or watched rows on the page: it stays closed and takes no version.
     enum class HeldWrite { Open, PastHolds, Wait };
     std::vector<u32> later_pages;
     std::function<void()> later_done;
-    HeldWrite TakeHeldWrite(u32 page, const u8* host, u32 bytes, bool guest, u32& ticket);
+    HeldWrite TakeHeldWrite(u32 page, const u8* host, u32 bytes, bool guest, bool closed,
+                            bool past = true);
     bool host_range = false;
     std::vector<std::pair<PAddr, PAddr>> host_textures;
     /// Waits until the GPU has reached `ticket` (0: nothing to wait for), the open holds'
     /// ticket fenced first.
     void WaitTicket(u32 ticket);
+    /// The last ticket whose records this thread has run: what the work before it read on the CPU is
+    /// read.
+    std::atomic<u32> processed{};
+    /// Holds [addr, addr + bytes) for a read this thread makes on the CPU when it runs the work.
+    void HoldCopyRead(PAddr addr, u32 bytes, PageHolds::Kind kind);
+    /// A write onto a page a live CopyRead holds: the held bytes are copied for this thread, which reads
+    /// the copy, and the CopyRead lets go of the page. Whether the page was so held.
+    bool CopyFault(u32 page);
+    /// The copies CopyFault took: page, tickets served, bytes [lo, hi) and the bytes. Under copy_mutex,
+    /// but the count; dropped once their work has run.
+    struct CopiedBytes {
+        u32 page, from, to;
+        std::array<u16, 2> lo, hi;
+        std::vector<u8> bytes;
+    };
+    std::mutex copy_mutex;
+    std::vector<CopiedBytes> copied;
+    std::atomic<u32> copied_count{};
+    /// This thread's read of [addr, addr + bytes) for the records it runs now: guest memory, or an
+    /// assembled copy (valid until the next call).
+    const u8* IndexBytes(PAddr addr, u32 bytes);
+    std::vector<u8> index_bytes;
     /// Guest FCRAM written (a watched texture page, or the HLE's write): the render side marks the
     /// textures over it written, in order with the work.
     void TexturesWritten(PAddr address, u32 size);
@@ -693,6 +720,8 @@ private:
     u32 host_past{}, host_versions{};
     u32 geometry_moves{}, parse_copies{}, parse_waits{};
     u64 parse_wait_us{};
+    u32 copy_faults{};
+    u32 copy_bytes{};
     u64 fault_wait_us{}, host_wait_us{};
     std::array<u32, PageHolds::Kinds> fault_kinds{};
     std::array<u64, PageHolds::Kinds> fault_kind_us{};
