@@ -274,6 +274,8 @@ SgxdBackend::SgxdBackend() {
     sgxd_recipe_code_heap = BlockVa + code_begin;
     draws.resize(MaxDraws);
     programs.resize(MaxDraws);
+    parked.draws.resize(MaxDraws);
+    parked.programs.resize(MaxDraws);
     identity.resize(MaxIndices);
     for (u32 n = 0; n < MaxIndices; n++) {
         identity[n] = static_cast<u16>(n);
@@ -600,15 +602,16 @@ void SgxdBackend::FreeRecipeBlock(const Recipe& r) {
 }
 
 SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u32 samples) {
-    // A recipe block is its render's until that 3D completes (its fence): an instance the GPU
-    // is done with, else a new one, else the one done first. The pending 3D's is never free.
+    // A recipe block is its render's until that 3D completes: an instance the GPU is done with,
+    // else a new one, else the one done first. Never the pending 3D's or the parked pass's.
     const Recipe* const pending = Pending();
+    const Recipe* const parked_recipe = parked_open ? parked.recipe : nullptr;
     u32 instances = 0;
     Recipe* oldest = nullptr;
     for (const auto& r : recipes) {
         if (r->width == width && r->height == height && r->kind == kind && r->samples == samples) {
             instances++;
-            if (r.get() == pending) {
+            if (r.get() == pending || r.get() == parked_recipe) {
                 continue;
             }
             if (sgxd_chain_reached(r->fence)) {
@@ -647,7 +650,7 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         auto victim = recipes.end();
         for (auto it = recipes.begin(); it < recipes.end(); ++it) {
             const Recipe& s = **it;
-            if (&s != pending && &s != current &&
+            if (&s != pending && &s != current && &s != parked_recipe &&
                 (victim == recipes.end() || static_cast<s32>(s.fence - (*victim)->fence) < 0)) {
                 victim = it;
             }
@@ -1220,12 +1223,76 @@ void SgxdBackend::ResetCores(const char* why) {
 }
 
 void SgxdBackend::CloseData(u32 fence) {
+    if (parked_open) {
+        // The parked pass is sent next: this room waits for its fence.
+        held_data = {data_begin, data_used, data_placed};
+        data_held = true;
+        return;
+    }
     // A pass without data leaves no span: an empty one guards nothing, and would stop OpenPass's
     // loop before the spans after it.
-    if (data_used != data_begin) {
-        data_spans.push_back({data_begin, data_used, fence});
+    const auto push = [this](const DataSpan& span) {
+        if (span.end != span.begin) {
+            data_spans.push_back(span);
+        }
+    };
+    if (!data_held) {
+        push({data_begin, data_used, fence});
+        data_next = data_used;
+        return;
     }
-    data_next = data_used;
+    // Two passes ended together: both rooms close with the second's fence in the ring's order, and
+    // the next room starts after the one placed last.
+    data_held = false;
+    pass_fences[(passes - 1) % PassFences] = fence;
+    const DataSpan held{held_data.begin, held_data.end, fence};
+    const DataSpan own{data_begin, data_used, fence};
+    const bool held_first = held_data.placed < data_placed;
+    push(held_first ? held : own);
+    push(held_first ? own : held);
+    data_next = held_first ? data_used : held_data.end;
+}
+
+bool SgxdBackend::CanPark() const {
+    return pds_used - (pds_begin + pds_half * PdsHalfSize) <= PdsHalfSize / 2;
+}
+
+void SgxdBackend::TradeParked() {
+    std::swap(current, parked.recipe);
+    std::swap(pass_target, parked.target);
+    std::swap(pass_source, parked.source);
+    std::swap(pass_zls, parked.zls);
+    std::swap(data_begin, parked.data_begin);
+    std::swap(data_used, parked.data_used);
+    std::swap(data_end, parked.data_end);
+    std::swap(data_placed, parked.data_placed);
+    std::swap(data_sites, parked.data_sites);
+    std::swap(draws, parked.draws);
+    std::swap(programs, parked.programs);
+    std::swap(draw_count, parked.draw_count);
+    std::swap(cached, parked.cached);
+#ifdef VITA_DIAGNOSTICS
+    std::swap(pass_note, parked.note);
+#endif
+}
+
+void SgxdBackend::ParkPass() {
+    DEBUG_ASSERT(in_pass && !parked_open && !data_held && CanPark());
+    TradeParked();
+    parked_open = true;
+    in_pass = false;
+}
+
+void SgxdBackend::SwapParked() {
+    DEBUG_ASSERT(in_pass && parked_open && CanPark());
+    TradeParked();
+}
+
+void SgxdBackend::ResumeParked() {
+    DEBUG_ASSERT(!in_pass && parked_open);
+    TradeParked();
+    parked_open = false;
+    in_pass = true;
 }
 
 const u8* SgxdBackend::SharedAt(u32 gpu) const {
@@ -1686,11 +1753,11 @@ void SgxdBackend::GiveTexture(const Data& texture, u32 bytes) {
 
 void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 clear,
                            float depth, const PicaTarget* pica) {
-    DEBUG_ASSERT(!in_pass);
-    // The recipe instance and the pass data slot are the GPU's until their last render's 3D
-    // completes: RecipeFor and the slot's fence wait only when the GPU is that far behind.
-    // Past half of the current PDS half: the next pass starts in the other one.
-    if (pds_used - (pds_begin + pds_half * PdsHalfSize) > PdsHalfSize / 2) {
+    DEBUG_ASSERT(!in_pass && !data_held);
+    // The recipe instance and the data slot are the GPU's until their last render's 3D completes.
+    // Past half of the current PDS half the next pass starts in the other one, not beside a parked
+    // pass.
+    if (!parked_open && !CanPark()) {
         FlipPdsHalf();
     }
     const u32 q = pica && pica->picture ? pica->picture_quarters : 4;
@@ -1707,18 +1774,21 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     pass_target = pica ? Footprint{pica->gpu, pica->gpu + pica->width * pica->height * pica->bpp}
                        : Footprint{target_gpu, target_gpu + width * height * 4};
     pass_source = {};
-    // The pass data's room in the ring (DataSpan): the sent passes it overlaps, and on a wrap
-    // those in the tail it skips (older than the ones at the ring's start), finish first.
+    // The pass data's room in the ring: the sent passes it overlaps (on a wrap, those in the tail
+    // it skips) finish first. Beside a parked pass, past its whole room.
     const u32 ring_end = pds_end + DataSlots * DataSize;
-    u32 at = AlignUp(data_next, 16);
+    const u32 from = parked_open ? parked.data_end : data_next;
+    u32 at = AlignUp(from, 16);
     const bool wrap = at + DataSize > ring_end;
     if (wrap) {
         at = pds_end;
     }
+    DEBUG_ASSERT_MSG(!parked_open || at >= parked.data_end || at + DataSize <= parked.data_begin,
+                     "sgxd: a pass's data room over the parked pass's");
     while (!data_spans.empty()) {
         const DataSpan& span = data_spans.front();
         const bool in_room = span.begin < at + DataSize && at < span.end;
-        const bool in_tail = wrap && span.begin >= data_next;
+        const bool in_tail = wrap && span.begin >= from;
         if (!in_room && !in_tail) {
             break;
         }
@@ -1736,9 +1806,13 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
             }
             ASSERT_MSG(false,
                        "sgxd: a pass's data room {:#x}..{:#x} (wrap {}, data_next {:#x}) over a sent "
-                       "pass's data {:#x}..{:#x} (fence {}, reached {}); the spans:{}",
+                       "pass's data {:#x}..{:#x} (fence {}, reached {}){}; the spans:{}",
                        at, at + DataSize, wrap, data_next, span.begin, span.end, span.fence,
-                       sgxd_chain_reached(span.fence) != 0, spans);
+                       sgxd_chain_reached(span.fence) != 0,
+                       parked_open ? fmt::format(", beside the parked pass's room {:#x}..{:#x}",
+                                                 parked.data_begin, parked.data_end)
+                                   : std::string{},
+                       spans);
         }
     }
 #endif
@@ -1783,7 +1857,7 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     sgxd_recipe_set_zls(&r.recipe, 0, 0, 0, 0);
     pass_zls = {};
     data_used = data_begin;
-    data_opens++;
+    data_placed = ++data_opens;
     data_sites = {};
     draw_count = 0;
     cached.clear();
@@ -1846,6 +1920,7 @@ void SgxdBackend::BeginPassLoadedScaled(const PicaTarget& target, float depth,
 }
 
 void SgxdBackend::DownscalePicture(const PicaTarget& target) {
+    DEBUG_ASSERT(!parked_open);
     DEBUG_ASSERT(target.picture != 0);
     PicaTarget t = target;
     t.picture = t.picture_stride = 0;
@@ -1868,6 +1943,7 @@ void SgxdBackend::DownscalePicture(const PicaTarget& target) {
 
 void SgxdBackend::CopyPicture(u32 dest_gpu, u32 source_gpu, u32 width, u32 height, u32 stride,
                               u32 source_x) {
+    DEBUG_ASSERT(!parked_open);
     OpenPass(dest_gpu, width, height, SGXD_RECIPE_PACK_U8888, 0, 1.0f);
     pass_source = {source_gpu, source_gpu + stride * height * 4};
     const SgxdRecipeDrawPrograms p =
@@ -2076,9 +2152,12 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
     }
     in_pass = false;
     passes++;
-    // The copies the pass may sample, freed while it was open (FreeTextureAfterPass), go back
-    // once its render is sent: whatever takes them is written behind its 3D.
+    // Copies freed while the pass was open (FreeTextureAfterPass) go back once its render is sent,
+    // or the parked pass's: their next owner is written behind that 3D.
     const auto give_back = [this] {
+        if (parked_open) {
+            return;
+        }
         for (const auto& [texture, bytes] : pass_frees) {
             GiveTexture(texture, bytes);
         }
@@ -2687,6 +2766,7 @@ SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, 
 
 void SgxdBackend::TransferTiledFromGuest(const PicaTarget& target, const UntileSource& source,
                                          u32 scale_x, u32 scale_y, u32* ta_us, u32* d3_us) {
+    DEBUG_ASSERT(!parked_open);
     OpenPass(target.gpu, target.height, target.width, target.pack, 0, 1.0f, &target);
     pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
     DrawTiled(source, true, scale_x, scale_y);
@@ -2695,6 +2775,7 @@ void SgxdBackend::TransferTiledFromGuest(const PicaTarget& target, const UntileS
 
 void SgxdBackend::TransferLinearToTiled(const PicaTarget& target, const UntileSource& source,
                                         bool flip, u32* ta_us, u32* d3_us) {
+    DEBUG_ASSERT(!parked_open);
     OpenPass(target.gpu, target.height, target.width, target.pack, 0, 1.0f, &target);
     pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
     PlaceFixedPrograms();
@@ -2762,6 +2843,7 @@ void SgxdBackend::MagnifyTiled(const PicaTarget& target, const UntileSource& sou
 void SgxdBackend::TransferFromGuest(const UntileSource& source, u32 dest_gpu, u32 width,
                                     u32 height, u32 pack, bool mirror, u32* ta_us, u32* d3_us,
                                     u32 scale_x, u32 scale_y, bool flip) {
+    DEBUG_ASSERT(!parked_open);
     OpenPass(dest_gpu, width, height, pack, 0, 1.0f);
     if (!mirror) {
         pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};

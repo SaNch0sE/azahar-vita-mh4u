@@ -170,7 +170,9 @@ public:
         const u32 at = (data_used + 15) & ~15u;
         return at < data_end ? data_end - at : 0;
     }
-    /// Counts the passes opened: an AllocData block holds while it stays the same.
+    /// Counts the passes opened: an AllocData block holds while it stays the same. A pass
+    /// parked and the one beside it share it: either takes the other's blocks, and both rooms
+    /// are sent with the later of the two fences (CloseData).
     [[nodiscard]] u32 DataOpens() const {
         return data_opens;
     }
@@ -227,6 +229,21 @@ public:
     [[nodiscard]] bool InPass() const {
         return in_pass;
     }
+    /// A pass parked beside the open one: its recipe instance, data room and draws kept unsent
+    /// while the open pass draws, so draws switching between two targets make a pass a target,
+    /// not a pass a switch. ParkPass parks the open pass, SwapParked trades the two, and
+    /// ResumeParked reopens the parked one for EndPass to send after the one it sent. The
+    /// rasterizer ends both together.
+    [[nodiscard]] bool HasParked() const {
+        return parked_open;
+    }
+    /// Whether the open pass may be parked or traded for the parked one: the PDS arena's half
+    /// not past its middle, where the next OpenPass flips it (no pass may span a flip: the
+    /// programs of the half left are dropped).
+    [[nodiscard]] bool CanPark() const;
+    void ParkPass();
+    void SwapParked();
+    void ResumeParked();
 
     /// PTLA ops complete through sgxd's microkernel (sgxd_ptla_events). PtlaFence is the last
     /// op's completion point.
@@ -262,11 +279,11 @@ public:
     /// It sleeps on the waker's flag until the GPU's interrupt (sgxd_chain_sleep): the render
     /// thread's own, or the emulation thread's under a hold, while the render thread is parked.
     void RenderWait(u32 fence, const char* why);
-    /// A mark covering every pass so far, the open one included once it ends; WaitPassMark
-    /// waits for its passes' 3Ds (the LUT rows they sample). Marks of passes long gone wait
-    /// for the oldest pass still known, which ended later.
+    /// A mark covering every pass so far, the open one (and the parked one) included once it
+    /// ends; WaitPassMark waits for its passes' 3Ds (the LUT rows they sample). Marks of passes
+    /// long gone wait for the oldest pass still known, which ended later.
     [[nodiscard]] u32 PassMark() const {
-        return passes + (in_pass ? 1 : 0);
+        return passes + (in_pass ? 1 : 0) + (parked_open ? 1 : 0);
     }
     void WaitPassMark(u32 mark, const char* why);
     /// CPU work on what the GPU writes (a DMA's cached destination): run once every list sent
@@ -863,6 +880,7 @@ private:
     void ResetCores(const char* why);
     void FlipPdsHalf();
     u32 data_begin{}, data_used{}, data_end{};
+    u32 data_placed{}; ///< the open pass's room's place among the rooms (data_opens at its open)
     u32 data_peak{}; ///< perflog: the largest pass data logged
     struct DataSite {
         uintptr_t caller;
@@ -997,6 +1015,31 @@ private:
     };
     std::vector<CachedRange> cached;
     u32 passes{};
+    /// The parked pass (ParkPass): the open pass's members above, traded by TradeParked.
+    struct ParkedPass {
+        Recipe* recipe{};
+        Footprint target{}, source{}, zls{};
+        u32 data_begin{}, data_used{}, data_end{}, data_placed{};
+        std::array<DataSite, 32> data_sites{};
+        std::vector<SgxdRecipeDraw> draws;
+        std::vector<SgxdRecipeDrawPrograms> programs;
+        u32 draw_count{};
+        std::vector<CachedRange> cached;
+#ifdef VITA_DIAGNOSTICS
+        std::string note;
+#endif
+    };
+    ParkedPass parked;
+    bool parked_open{};
+    void TradeParked();
+    /// The first of two passes ended together: its data's room, which CloseData closes with
+    /// the second's fence (either pass's draws may take the other's copies: the caches by
+    /// DataOpens).
+    struct HeldData {
+        u32 begin, end, placed;
+    };
+    HeldData held_data{};
+    bool data_held{};
 #ifdef VITA_DIAGNOSTICS
     struct TargetTime {
         u32 passes, draws;

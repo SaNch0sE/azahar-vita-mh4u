@@ -1505,7 +1505,7 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     if (backend.InPass() && PassOverlaps(dst, end)) {
         EndPass("a DMA over its buffers");
     }
-    if (backend.InPass() && src < pass_colour.End() && pass_colour.addr < src + size) {
+    if (backend.InPass() && PassColourOverlaps(src, src + size)) {
         EndPass("a DMA from its colour buffer");
     }
     // A supersampled buffer's live 1x picture is read in the game's layout (SupersampledSource).
@@ -1927,9 +1927,114 @@ SgxdBackend::PicaTarget RasterizerSgxd::PicaTargetFor(const ColourBuffer& c, con
 }
 
 bool RasterizerSgxd::PassOverlaps(PAddr start, PAddr end) const {
-    const PAddr depth_end = pass_depth + pass_colour.width * pass_colour.height * pass_depth_bytes;
+    const auto overlaps = [start, end](const ColourBuffer& c, PAddr depth, u32 depth_bytes,
+                                       bool depth_kept) {
+        const PAddr depth_end = depth + c.width * c.height * depth_bytes;
+        return (start < c.End() && c.addr < end) ||
+               (depth_kept && start < depth_end && depth < end);
+    };
+    const ParkedPassState& p = parked_pass;
+    return overlaps(pass_colour, pass_depth, pass_depth_bytes,
+                    pass_depth_cleared || pass_depth_used) ||
+           (backend.HasParked() &&
+            overlaps(p.colour, p.depth, p.depth_bytes, p.depth_cleared || p.depth_used));
+}
+
+bool RasterizerSgxd::PassColourOverlaps(PAddr start, PAddr end) const {
     return (start < pass_colour.End() && pass_colour.addr < end) ||
-           ((pass_depth_cleared || pass_depth_used) && start < depth_end && pass_depth < end);
+           (backend.HasParked() && start < parked_pass.colour.End() &&
+            parked_pass.colour.addr < end);
+}
+
+void RasterizerSgxd::TradePassState() {
+    ParkedPassState& p = parked_pass;
+    std::swap(pass_colour, p.colour);
+    std::swap(pass_part, p.part);
+    std::swap(pass_mask, p.mask);
+    std::swap(pass_margin_masked, p.margin_masked);
+    std::swap(pass_narrow, p.narrow);
+    std::swap(pass_open_draws, p.open_draws);
+    std::swap(pass_depth, p.depth);
+    std::swap(pass_depth_cleared, p.depth_cleared);
+    std::swap(pass_depth_bytes, p.depth_bytes);
+    std::swap(pass_depth_format, p.depth_format);
+    std::swap(pass_bg_depth, p.bg_depth);
+    std::swap(pass_bg_stencil, p.bg_stencil);
+    std::swap(pass_depth_used, p.depth_used);
+    std::swap(pass_depth_written, p.depth_written);
+    std::swap(pass_depth_load, p.depth_load);
+    std::swap(pass_depth_covered, p.depth_covered);
+    std::swap(pass_depth_part, p.depth_part);
+    std::swap(pass_depth_guest, p.depth_guest);
+    std::swap(pass_ta_w, p.ta_w);
+    std::swap(pass_w_map, p.w_map);
+    std::swap(pass_upscaled, p.upscaled);
+    std::swap(pass_scaled_target, p.scaled_target);
+    std::swap(pass_quarters, p.quarters);
+    std::swap(pass_margin, p.margin);
+    std::swap(pass_samples, p.samples);
+    std::swap(pass_widened, p.widened);
+    std::swap(pass_drawn_lo, p.drawn_lo);
+    std::swap(pass_drawn_hi, p.drawn_hi);
+    std::swap(pass_clear_site, p.clear_site);
+    std::swap(pass_guest_draws, p.guest_draws);
+#ifdef VITA_DIAGNOSTICS
+    std::swap(pass_opened, p.opened);
+#endif
+}
+
+bool RasterizerSgxd::ParksAt1x(const ColourBuffer& target) const {
+    return target.width >= 32 &&
+           !(TopPictures() && std::any_of(top_sources.begin(), top_sources.end(), [&](PAddr s) {
+                 return s >= target.addr && s < target.End();
+             }));
+}
+
+void RasterizerSgxd::SwitchPass(const ColourBuffer& target, PAddr depth, u32 depth_bytes,
+                                bool uses_depth, bool geometry) {
+    // Two passes open together keep a pass a buffer for a title that draws into two buffers in turn,
+    // a draw or two each: the open one parked and the draw's opened beside it, traded at each switch.
+    // A geometry draw's unit state runs through the draws in order, so it parks nothing.
+    const ParkedPassState& p = parked_pass;
+    if (backend.HasParked() && p.colour.addr == target.addr && p.colour.width == target.width &&
+        p.colour.height == target.height && p.colour.format == target.format &&
+        (!uses_depth || p.depth == depth)) {
+        if (geometry || !backend.CanPark()) {
+            EndPass("a draw to the parked pass's buffers (geometry, or the PDS half's middle)");
+            return;
+        }
+        backend.SwapParked();
+        TradePassState();
+#ifdef VITA_DIAGNOSTICS
+        pass_trades++;
+#endif
+        return;
+    }
+    if (backend.HasParked()) {
+        EndPass("a draw to a third pair of buffers");
+        return;
+    }
+    const auto meets = [](PAddr lo0, PAddr hi0, PAddr lo1, PAddr hi1) {
+        return lo0 < hi1 && lo1 < hi0;
+    };
+    const PAddr open_depth_end =
+        pass_depth + pass_colour.width * pass_colour.height * pass_depth_bytes;
+    const PAddr depth_end = depth + target.width * target.height * depth_bytes;
+    const bool apart =
+        !meets(pass_colour.addr, pass_colour.End(), target.addr, target.End()) &&
+        !meets(pass_colour.addr, pass_colour.End(), depth, depth_end) &&
+        !meets(pass_depth, open_depth_end, target.addr, target.End()) &&
+        !meets(pass_depth, open_depth_end, depth, depth_end);
+    if (geometry || !apart || !backend.CanPark() || pass_upscaled || pass_narrow ||
+        !ParksAt1x(target)) {
+        EndPass("a draw to other buffers");
+        return;
+    }
+    backend.ParkPass();
+    TradePassState();
+#ifdef VITA_DIAGNOSTICS
+    pass_parks++;
+#endif
 }
 
 namespace {
@@ -2110,8 +2215,10 @@ RasterizerSgxd::TextureExtent RasterizerSgxd::TextureExtentFor(u32 unit) const {
 
 bool RasterizerSgxd::UnitReadsDrawn(u32 unit) const {
     const UnitRead& r = unit_reads[unit];
+    const bool parked = backend.HasParked();
     for (u32 k = 0; k < r.parts; k++) {
-        if (r.lo[k] < pass_drawn_hi && pass_drawn_lo < r.hi[k]) {
+        if ((r.lo[k] < pass_drawn_hi && pass_drawn_lo < r.hi[k]) ||
+            (parked && r.lo[k] < parked_pass.drawn_hi && parked_pass.drawn_lo < r.hi[k])) {
             return true;
         }
     }
@@ -2892,6 +2999,16 @@ void RasterizerSgxd::DepthStoresWritten(PAddr start, PAddr end) {
 }
 
 void RasterizerSgxd::EndPass(const char* why) {
+    EndOnePass(why);
+    if (backend.HasParked()) {
+        backend.ResumeParked();
+        TradePassState();
+        parked_pass = {};
+        EndOnePass(why);
+    }
+}
+
+void RasterizerSgxd::EndOnePass(const char* why) {
     const ColourBuffer& s = pass_colour;
     const u32 pass_draws = backend.PassDraws();
 #ifdef VITA_DIAGNOSTICS
@@ -3101,8 +3218,11 @@ void RasterizerSgxd::LogTextureStats() {
     for (const auto& [why, n] : t.pass_ends) {
         ends += fmt::format("{}{} {}", ends.empty() ? "" : "; ", why, n);
     }
-    LOG_INFO(Render, "perf: passes ended by: {}; kept, a narrower viewport masked: {}", ends,
-             std::exchange(viewport_masks, 0));
+    LOG_INFO(Render,
+             "perf: passes ended by: {}; kept, a narrower viewport masked: {}; parked beside "
+             "another: {}, traded for the parked one: {}",
+             ends, std::exchange(viewport_masks, 0), std::exchange(pass_parks, 0),
+             std::exchange(pass_trades, 0));
     t.pass_ends.clear();
     t = TextureStats{};
     t.tiny_logged = tiny_logged;
@@ -6725,11 +6845,16 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     if (backend.InPass() && TexturesReadPassColour()) {
         EndPass("a draw reading its own colour buffer");
     }
+    const bool geometry = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes;
     if (backend.InPass() &&
         (pass_colour.addr != colour || pass_colour.width != width ||
          pass_colour.height != height || pass_colour.format != fb.color_format ||
          (uses_depth && pass_depth != depth))) {
-        EndPass("a draw to other buffers");
+        SwitchPass(target, depth, FramebufferRegs::BytesPerDepthPixel(fb.depth_format),
+                   uses_depth, geometry);
+    }
+    if (geometry && backend.HasParked()) {
+        EndPass("a geometry draw beside a parked pass");
     }
     // A pass stores its draws' viewport's part of the buffer: a draw with another viewport starts the
     // next pass, so no draw stores past its own.
@@ -6832,6 +6957,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                                   depth, dwrite, stencil, alone)) {
             if (alone) {
                 filled_site = site;
+                // The draw is a fill: a pass parked for it is the open one again.
+                if (backend.HasParked()) {
+                    backend.ResumeParked();
+                    TradePassState();
+                    parked_pass = {};
+                }
                 return true;
             }
             if (site < 0) {

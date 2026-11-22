@@ -431,10 +431,13 @@ private:
     /// The PBE's form of a colour buffer (route 1 takes widths of 32 to 1024 in 16s and heights of 8
     /// to 1024 in 8s).
     SgxdBackend::PicaTarget PicaTargetFor(const ColourBuffer& c, const char* what);
-    /// Whether [start, end) overlaps the open pass's colour buffer, or its depth buffer when a
-    /// draw uses it.
+    /// Whether [start, end) overlaps the open or parked pass's colour buffer, or its depth buffer when
+    /// a draw uses it.
     bool PassOverlaps(PAddr start, PAddr end) const;
+    /// Whether [start, end) overlaps the open or the parked pass's colour buffer.
+    bool PassColourOverlaps(PAddr start, PAddr end) const;
     void EndPass(const char* why);
+    void EndOnePass(const char* why);
     /// A draw of the loaders' vertices, or of the immediate-mode batch (`count` vertices of
     /// `immediate_attributes` x 4 floats).
     bool Draw(bool is_indexed, const float* immediate, u32 count);
@@ -686,7 +689,6 @@ private:
         std::array<PAddr, 6> hi{};
     };
     void TextureReads(bool is_indexed, const float* immediate, u32 count);
-    /// Whether unit `unit`'s read (unit_reads) meets what the open pass drew (pass_drawn_*).
     [[nodiscard]] bool UnitReadsDrawn(u32 unit) const;
     /// The colour buffer tile rows the draw can write, as guest bytes; empty when none.
     [[nodiscard]] std::pair<PAddr, PAddr> DrawnRows() const;
@@ -1149,6 +1151,48 @@ private:
     };
     bool pass_ta_w{};        ///< the pass's depth holds the TA's W depths
     WDepthMap pass_w_map{};  ///< ... and their map, once a W-buffered draw was fitted
+    /// The parked pass's pass_ members, traded by TradePassState.
+    struct ParkedPassState {
+        ColourBuffer colour{};
+        StorePart part{}, mask{};
+        bool margin_masked{};
+        const NarrowScratch* narrow = nullptr;
+        u32 open_draws = 0;
+        PAddr depth{};
+        bool depth_cleared{};
+        u32 depth_bytes{4};
+        u32 depth_format{};
+        float bg_depth{1.0f};
+        u32 bg_stencil{};
+        bool depth_used{}, depth_written{}, depth_load{}, depth_covered{}, depth_part{},
+            depth_guest{};
+        bool ta_w{};
+        WDepthMap w_map{};
+        Upscaled* upscaled = nullptr;
+        SgxdBackend::PicaTarget scaled_target{};
+        u32 quarters = 4, margin = 0, samples = 1;
+        bool widened{};
+        PAddr drawn_lo = 0, drawn_hi = 0;
+        s32 clear_site = -1;
+        u32 guest_draws = 0;
+#ifdef VITA_DIAGNOSTICS
+        const char* opened = "";
+#endif
+    };
+    ParkedPassState parked_pass{};
+    void TradePassState();
+    /// A draw onto other buffers than the open pass's: the open pass parked and the draw's opened
+    /// beside it, or traded for the parked one when that is the draw's, else both ended.
+    void SwitchPass(const ColourBuffer& target, PAddr depth, u32 depth_bytes, bool uses_depth,
+                    bool geometry);
+    /// Whether a pass on target may be parked, or drawn beside a parked one: drawn at 1x, one
+    /// sample a pixel and no widescreen margin, into its 1x picture or the buffer itself, and not
+    /// through a narrow buffer's scratch.
+    [[nodiscard]] bool ParksAt1x(const ColourBuffer& target) const;
+#ifdef VITA_DIAGNOSTICS
+    u32 pass_parks{}; ///< perflog: passes parked beside another
+    u32 pass_trades{}; ///< perflog: draws that traded the open pass for the parked one
+#endif
     /// The first W-buffered draw of a pass that writes depth (and the next, until one fits): up to six
     /// vertices on the CPU, z against w, into pass_w_map.
     void FitWDepth(bool is_indexed, const float* immediate, u32 count, bool grows);
