@@ -52,9 +52,9 @@ GeometryShaderUnit::~GeometryShaderUnit() = default;
 
 void GeometryShaderUnit::SetVertexHandlers(VertexHandler vertex_handler,
                                            WindingSetter winding_setter) {
-    emitter.handlers = new Handlers;
-    emitter.handlers->vertex_handler = vertex_handler;
-    emitter.handlers->winding_setter = winding_setter;
+    handlers.vertex_handler = std::move(vertex_handler);
+    handlers.winding_setter = std::move(winding_setter);
+    emitter.handlers = &handlers;
 }
 
 void GeometryShaderUnit::ConfigOutput(const ShaderRegs& config) {

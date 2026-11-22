@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -32,6 +33,24 @@ class MemorySystem;
 }
 
 namespace Kernel {
+
+#ifdef __vita__
+/**
+ * Runs an async section (HLERequestContext::RunAsync) on a thread kept for them: one waiting is
+ * taken, else one is made, and it waits for the next section once done, until the title's end
+ * joins them (JoinAsyncSections). A section never waits for another (as each of std::async's
+ * own threads), and no thread is made a request: on the Vita each std::thread's start left a
+ * record on the heap that nothing freed, scattered across it request by request, until a large
+ * allocation found no room (MH Generations' code, a few launches in). The future is ready once
+ * the section has run.
+ */
+std::future<void> RunAsyncSection(std::function<void()> section);
+/// The async sections queued or running.
+std::size_t AsyncSectionsInFlight();
+/// At a title's end, before its shutdown: the sections queued or running finish, and the threads
+/// that ran them join.
+void JoinAsyncSections();
+#endif
 
 class HandleTable;
 class Process;
@@ -274,6 +293,14 @@ private:
             future = std::move(fut);
         }
 
+        /// The section done before what it uses goes: std::async's future waits so itself, a
+        /// thread kept for sections does not.
+        ~AsyncWakeUpCallback() override {
+            if (future.valid()) {
+                future.wait();
+            }
+        }
+
         void WakeUp(std::shared_ptr<Kernel::Thread> thread, Kernel::HLERequestContext& ctx,
                     Kernel::ThreadWakeupReason reason) override {
             functor(ctx);
@@ -315,7 +342,11 @@ public:
                 "RunAsync", std::chrono::nanoseconds(-1),
                 std::make_shared<AsyncWakeUpCallback<ResultFunctor>>(
                     kernel, result_function,
+#ifdef __vita__
+                    RunAsyncSection([this, async_section] {
+#else
                     std::move(std::async(std::launch::async, [this, async_section] {
+#endif
                         s64 sleep_for = 0;
                         try {
                             sleep_for = async_section(*this);
@@ -331,7 +362,11 @@ public:
                         // WakeAfterDelay treats -1 as "schedule nothing", which here would
                         // also mean sleeping forever.
                         this->thread->WakeAfterDelay(std::max<s64>(sleep_for, 0), true);
+#ifdef __vita__
+                    })));
+#else
                     }))));
+#endif
 
         } else {
             s64 sleep_for = async_section(*this);

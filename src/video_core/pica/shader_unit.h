@@ -134,6 +134,9 @@ struct GeometryShaderUnit : public ShaderUnit {
     void ConfigOutput(const ShaderRegs& config);
 
     GeometryEmitter emitter;
+    /// The emitter's handlers (emitter.handlers points here), the unit's own: a `new` was never
+    /// freed, a pair of blocks left on the heap with every PicaCore.
+    Handlers handlers;
 
 private:
     friend class boost::serialization::access;

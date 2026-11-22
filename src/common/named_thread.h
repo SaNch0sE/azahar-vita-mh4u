@@ -95,6 +95,10 @@ private:
     std::stop_source ssource;
 };
 
+/// The NamedThreads started whose callables have not returned yet: what a title started is back
+/// to what ran before it once the title has shut down.
+std::size_t RunningNamedThreads();
+
 /// The calling thread's name and the named threads waiting on kernel object `uid`: who else waits
 /// when a single-waiter event flag refuses a wait (SCE_KERNEL_ERROR_EVF_MULTI).
 std::string DescribeWaiters(std::int32_t uid);

@@ -185,8 +185,10 @@ struct RoleThread {
     int id;
     int cores;
 };
-/// The threads placed so far (a gone one's slot until another takes it): perflog's run times.
+/// The threads placed and still running: perflog's run times.
 std::vector<RoleThread> RoleThreads();
+/// The calling thread's placement forgotten, as it ends (NamedThread's last step).
+void ForgetCurrentThreadRole();
 #endif
 
 } // namespace Common

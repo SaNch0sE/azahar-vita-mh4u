@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <deque>
 #include <vector>
 #include <boost/serialization/assume_abstract.hpp>
 #include <boost/serialization/shared_ptr.hpp>
@@ -11,6 +12,8 @@
 #include "common/archives.h"
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/named_thread.h"
+#include "common/thread.h"
 #include "core/core.h"
 #include "core/hle/kernel/event.h"
 #include "core/hle/kernel/handle_table.h"
@@ -26,6 +29,103 @@ SERIALIZE_EXPORT_IMPL(Kernel::HLERequestContext)
 SERIALIZE_EXPORT_IMPL(Kernel::HLERequestContext::ThreadCallback)
 
 namespace Kernel {
+
+#ifdef __vita__
+namespace {
+
+class AsyncSectionThreads {
+public:
+    std::future<void> Run(std::function<void()> section) {
+        auto task = std::make_shared<std::packaged_task<void()>>(std::move(section));
+        std::future<void> future = task->get_future();
+        std::scoped_lock lk{gate};
+        queue.emplace_back([task] { (*task)(); });
+        // A thread for each section queued: one waiting each, or a new one.
+        if (queue.size() > waiting) {
+            threads.emplace_back(Common::ThreadCfg{"HLE async"}, [this] { Loop(); });
+        } else {
+            gate.NotifyAll();
+        }
+        return future;
+    }
+
+private:
+    void Loop() {
+        std::scoped_lock lk{gate};
+        for (;;) {
+            while (queue.empty() && !stopping) {
+                waiting++;
+                gate.Wait();
+                waiting--;
+            }
+            // Joining: the queue run dry first.
+            if (queue.empty()) {
+                return;
+            }
+            const std::function<void()> section = std::move(queue.front());
+            queue.pop_front();
+            running++;
+            gate.unlock();
+            section();
+            gate.lock();
+            running--;
+        }
+    }
+
+public:
+    /// Sections queued or running.
+    std::size_t InFlight() {
+        std::scoped_lock lk{gate};
+        return queue.size() + running;
+    }
+
+    /// Every section queued runs to its end and every thread joins: none outlives the title. The
+    /// next section makes a thread again. The emulation thread's, with the guest stopped (no
+    /// section is queued meanwhile).
+    void Join() {
+        {
+            std::scoped_lock lk{gate};
+            stopping = true;
+            gate.NotifyAll();
+        }
+        for (Common::NamedThread& thread : threads) {
+            thread.join();
+        }
+        std::scoped_lock lk{gate};
+        threads.clear();
+        stopping = false;
+    }
+
+private:
+
+    Common::CoreCondition gate;
+    std::deque<std::function<void()>> queue;
+    std::size_t waiting = 0;
+    std::size_t running = 0;
+    bool stopping = false;
+    std::deque<Common::NamedThread> threads;
+};
+
+} // Anonymous namespace
+
+AsyncSectionThreads& SectionThreads() {
+    // The process's; its threads are a title's (Join at the title's end).
+    static auto* const threads = new AsyncSectionThreads;
+    return *threads;
+}
+
+std::future<void> RunAsyncSection(std::function<void()> section) {
+    return SectionThreads().Run(std::move(section));
+}
+
+std::size_t AsyncSectionsInFlight() {
+    return SectionThreads().InFlight();
+}
+
+void JoinAsyncSections() {
+    SectionThreads().Join();
+}
+#endif
 
 class HLERequestContext::ThreadCallback : public Kernel::WakeupCallback {
 

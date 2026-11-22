@@ -46,6 +46,8 @@
 #include "common/heap_check.h"
 #include "common/named_thread.h"
 #include "core/arm/vita/arm_vita_native.h"
+#include "core/file_sys/romfs_reader.h"
+#include "core/hle/kernel/hle_ipc.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
 #include "core/hle/kernel/thread.h"
@@ -220,13 +222,32 @@ std::string DescribeLoadError(Core::System::ResultStatus status) {
 }
 
 /// Releases the GPU's view of guest memory and shuts the system down - in that order, because
-/// the unmap must run while guest RAM is still allocated.
-void ShutdownSystem(Core::System& system) {
+/// the unmap must run while guest RAM is still allocated. `threads_before`: the threads running
+/// before the title (RunningNamedThreads), all that may be left after it.
+void ShutdownSystem(Core::System& system, std::size_t threads_before) {
+    // A title's process alive after its shutdown keeps its kernel objects and its page table
+    // (5 MiB) on the heap for good. Reported with the HLE async sections in flight.
+    const std::weak_ptr<Kernel::Process> process = system.Kernel().GetCurrentProcess();
+    const std::size_t in_flight = Kernel::AsyncSectionsInFlight();
+    // Every thread of the title ends before the title does: the HLE requests' background work
+    // finishes and its threads join here, while everything it may touch is still there; the
+    // shutdown joins the rest (the render thread, the DSP's, the services' workers).
+    Kernel::JoinAsyncSections();
     VitaFrontend::GxmPresent::UnmapAllGuestMemory();
     system.Shutdown();
     // The title's GPU session is over: nothing of it is left for the next one (the game list's
     // banner) to wait on.
     VitaFrontend::SgxdPresent::SessionEnded();
+    if (const std::shared_ptr<Kernel::Process> alive = process.lock()) {
+        sceClibPrintf("[azahar] shutdown: the title's process outlived it (%ld references); HLE "
+                      "async sections in flight: %u at the quit, %u now\n",
+                      static_cast<long>(alive.use_count() - 1), static_cast<unsigned>(in_flight),
+                      static_cast<unsigned>(Kernel::AsyncSectionsInFlight()));
+    }
+    if (const std::size_t running = Common::RunningNamedThreads(); running != threads_before) {
+        sceClibPrintf("[azahar] shutdown: %u threads running, %u before the title\n",
+                      static_cast<unsigned>(running), static_cast<unsigned>(threads_before));
+    }
 }
 
 #ifdef VITA_DIAGNOSTICS
@@ -582,13 +603,14 @@ bool RunSettingCommand(const std::string& command) {
         free.size = sizeof(free);
         sceKernelGetFreeMemorySize(&free);
         sceClibPrintf("[azahar] heap: %u KiB in use, %u KiB free inside the %u KiB taken, of %u KiB; "
-                      "largest block %u KiB; free memory %u KiB, CDRAM %u KiB, phycont %u KiB "
-                      "(command)\n",
+                      "largest block %u KiB; free memory %u KiB, CDRAM %u KiB, phycont %u KiB; "
+                      "%u threads (command)\n",
                       static_cast<unsigned>(m.uordblks >> 10), static_cast<unsigned>(m.fordblks >> 10),
                       static_cast<unsigned>(m.arena >> 10), _newlib_heap_size_user >> 10, low >> 10,
                       static_cast<unsigned>(free.size_user) >> 10,
                       static_cast<unsigned>(free.size_cdram) >> 10,
-                      static_cast<unsigned>(free.size_phycont) >> 10);
+                      static_cast<unsigned>(free.size_phycont) >> 10,
+                      static_cast<unsigned>(Common::RunningNamedThreads()));
         return true;
     }
     if (command == "heapmap") {
@@ -983,6 +1005,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     ui.Update();
     window.Present(&ui);
 
+    const std::size_t threads_before = Common::RunningNamedThreads();
     window.SetLoading(true);
     const auto load_result = system.Load(window, path);
     window.SetLoading(false);
@@ -1052,7 +1075,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             window.SetInputToGuest(true);
             window.SetLoading(false);
             window.SetUi(nullptr);
-            ShutdownSystem(system);
+            ShutdownSystem(system, threads_before);
             // The menu's quit has left the interface on the game list already; the command
             // channel's has not, and the render thread that drew the title is gone by now.
             ui.LeaveGame();
@@ -1628,7 +1651,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     window.SetPauseMenu(nullptr);
     window.SetLoading(false);
     window.SetUi(nullptr);
-    ShutdownSystem(system);
+    ShutdownSystem(system, threads_before);
     return true;
 }
 

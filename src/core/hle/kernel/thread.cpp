@@ -110,6 +110,14 @@ Thread* ThreadManager::GetCurrentThread() const {
 }
 
 void Thread::Stop() {
+    // The callback that would have woken the thread goes first. An HLE async section's waits for
+    // its section to end (which then schedules this thread's wakeup, cancelled below), and holds
+    // what the request captured: a mapped buffer holds its process, whose handle table holds this
+    // thread. Kept, the thread, the process and its handle table held each other past the
+    // kernel's end, a title's whole process left on the heap with its 5 MiB page table (a quit
+    // with a request in flight).
+    wakeup_callback = nullptr;
+
     // Cancel any outstanding wakeup events for this thread
     CancelWakeup();
     thread_manager.wakeup_callback_table.erase(thread_id);

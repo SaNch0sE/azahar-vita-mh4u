@@ -286,32 +286,40 @@ constexpr int PriorityCore(ThreadRole role) {
 
 namespace {
 /// The threads SetCurrentThreadRole placed, for RoleThreads: the role plus one above the kernel ID
-/// in one word (0: none), a slot a thread, taken again once its thread is gone.
-std::array<std::atomic<u64>, 32> placed{};
+/// in one word (0: none), a slot a thread, given back as its thread ends (ForgetCurrentThreadRole).
+std::array<std::atomic<u64>, 64> placed{};
 
 void NotePlaced(ThreadRole role, int thread_id) {
     const u64 word = u64{static_cast<u32>(role) + 1} << 32 | static_cast<u32>(thread_id);
-    for (int pass = 0; pass < 2; pass++) {
-        for (auto& p : placed) {
-            u64 seen = p.load(std::memory_order_relaxed);
-            if (seen != 0 && pass == 1) {
-                // Full: a slot whose thread is gone.
-                SceKernelThreadInfo info{};
-                info.size = sizeof(info);
-                if (sceKernelGetThreadInfo(static_cast<SceUID>(static_cast<u32>(seen)), &info) >=
-                    0) {
-                    continue;
-                }
-            } else if (seen != 0) {
-                continue;
-            }
-            if (p.compare_exchange_strong(seen, word, std::memory_order_relaxed)) {
-                return;
-            }
+    // A thread placed again keeps its slot. No other thread is looked up: sceKernelGetThreadInfo
+    // of another thread's ID is a critical error that debug-suspends the caller
+    // (~15 ms).
+    for (auto& p : placed) {
+        if (static_cast<u32>(p.load(std::memory_order_relaxed)) == static_cast<u32>(thread_id)) {
+            p.store(word, std::memory_order_relaxed);
+            return;
+        }
+    }
+    for (auto& p : placed) {
+        u64 expected = 0;
+        if (p.compare_exchange_strong(expected, word, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+    ASSERT_MSG(false, "SetCurrentThreadRole: more than {} threads placed at once", placed.size());
+}
+} // namespace
+
+void ForgetCurrentThreadRole() {
+    const u32 self = static_cast<u32>(sceKernelGetThreadId());
+    for (auto& p : placed) {
+        u64 seen = p.load(std::memory_order_relaxed);
+        if (seen != 0 && static_cast<u32>(seen) == self) {
+            p.compare_exchange_strong(seen, 0, std::memory_order_relaxed);
+            return;
         }
     }
 }
-} // namespace
 
 std::vector<RoleThread> RoleThreads() {
     std::vector<RoleThread> out;
