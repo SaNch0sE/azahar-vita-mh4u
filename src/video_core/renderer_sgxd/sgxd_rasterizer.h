@@ -81,9 +81,6 @@ public:
                      const Pica::OutputVertex& v2) override;
     void DrawTriangles() override;
     void FlushAll() override;
-    void FlushRegion(PAddr addr, u32 size) override;
-    void InvalidateRegion(PAddr addr, u32 size) override;
-    void FlushAndInvalidateRegion(PAddr addr, u32 size) override;
     void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     /// The upscaled top screen (SetTopScale) for the LCD buffer at lcd: the scaled copy the last
@@ -165,6 +162,9 @@ public:
     }
     void ReplayStop() {
         replay_limit = -2;
+    }
+    [[nodiscard]] bool Replaying() const {
+        return replay_limit != -2;
     }
     void ReplayEndPass();
     /// The colour buffer at `addr` as a pass last drew it, as A8B8G8R8 rows; false when none did.

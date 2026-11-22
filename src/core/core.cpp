@@ -1664,14 +1664,10 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
         ReportStateProgress(StatePhase::Restarting, 1.0f);
     }
 
-    // Flush on save, don't flush on load - but only where the cache knows what the guest has
-    // written since. With page marking off (the render thread runs; the native CPU traps no
-    // stores) a dirty region can be a render target the guest has long since reused for its
-    // own data, and writing those pixels back over it crashes a game the instant after "Save
-    // completed" (a null pointer read out of a written-back surface). The state
-    // then holds what guest memory holds; GPU-only content is redrawn or reloaded after a
-    // load, as it is after any invalidation.
-    const bool should_flush = !Archive::is_loading::value && memory->RasterizerCacheMarkingEnabled();
+    // Flush on save, don't flush on load: the state holds what guest memory holds (the render
+    // thread's passes ended and its pictures' rows copied into it, RenderThread::ClearAll);
+    // GPU-only content is redrawn or reloaded after a load.
+    const bool should_flush = !Archive::is_loading::value;
     // The render thread done with the GPU work queued, and held: guest memory and the PICA are
     // the state's alone until it is saved or loaded.
     const auto render_hold = gpu->HoldRender();

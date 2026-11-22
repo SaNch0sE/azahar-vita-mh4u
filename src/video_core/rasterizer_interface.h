@@ -42,16 +42,6 @@ public:
     /// Notify rasterizer that all caches should be flushed to 3DS memory
     virtual void FlushAll() = 0;
 
-    /// Notify rasterizer that any caches of the specified region should be flushed to 3DS memory
-    virtual void FlushRegion(PAddr addr, u32 size) = 0;
-
-    /// Notify rasterizer that any caches of the specified region should be invalidated
-    virtual void InvalidateRegion(PAddr addr, u32 size) = 0;
-
-    /// Notify rasterizer that any caches of the specified region should be flushed to 3DS memory
-    /// and invalidated
-    virtual void FlushAndInvalidateRegion(PAddr addr, u32 size) = 0;
-
     /// Removes as much state as possible from the rasterizer in preparation for a save/load state
     virtual void ClearAll(bool flush) = 0;
 

@@ -187,31 +187,19 @@ public:
     /// read clear of that write's bytes (PageHolds::TouchesWrite), as the HLE's reads go on;
     /// write_ticket the page's last write's.
     bool ReadMissesWrites(const u8* host, u32 size, u32& write_ticket);
-    /// GPU::GuestStoreMissesHolds: a held page, the store clear of its queued GPU work's bytes
-    /// (PageHolds::StoreMisses); ticket the page's last live hold's.
+    /// GPU::GuestStoreMissesHolds: a guest store of [host, host + size) on a held page, which
+    /// the caller makes through the app's view when this answers true (TakeHeldWrite): past the
+    /// holds (ticket the page's last live hold's), or onto the page opened (ticket 0).
     bool StoreMissesHolds(const u8* host, u32 size, u32& ticket);
-    /// GPU::GuestStoreForbidden: PageHolds::StoreForbidden, the page StoreMissesHolds passed,
-    /// for the permit at `slot` (PageHolds::PermitGranted).
-    void StoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi, u32 slot);
-    /// GPU::SetStorePermits: PageHolds::SetStorePermits.
-    void SetStorePermits(AzaharStorePermits* table) {
-        page_holds.SetStorePermits(table);
-    }
-    /// GPU::PageHoldsGeneration: PageHolds::Generation.
-    [[nodiscard]] const u32* PageHoldsGeneration() const {
-        return page_holds.Generation();
-    }
-    /// The HLE reads or writes [host, host + size) of guest memory through its own view: it
-    /// waits for the queued GPU work the guest would wait for (Memory's host guard).
+    /// The HLE reads or writes [host, host + size) through its own view: it waits for the queued GPU
+    /// work the guest would wait for.
     void HostAccess(const u8* host, u32 size, bool write);
-    /// T12: [addr, addr + size) written by the HLE through a pointer the page holds do not see:
-    /// each watched page's textures untiled again at their next draw, the page unwatched.
-    void InvalidateWritten(PAddr addr, u32 size);
+    /// The HLE writes these pages later through its own pointers (Y2R's worker); `done` waits until it
+    /// has. A version of one of them runs it first. One writer at a time.
+    void HostWritesLater(const std::vector<const u8*>& pages, std::function<void()> done);
     /// A guest window was mapped over [host, host + size): its descriptors take the holds.
     void HostRemapped(const u8* host, u32 size);
 #ifdef VITA_DIAGNOSTICS
-    /// Since the last call (`perflog`): T12's texture pages written by the guest (aborts) and
-    /// the texture pages the HLE wrote (InvalidateWritten).
     std::pair<u32, u32> TakeTextureWrites();
     /// No page held less than the module still holds it (`where`).
     void CheckHoldsSent(const char* where);
@@ -241,6 +229,7 @@ public:
         u64 fault_wait_us;
         u32 host_waits;
         u64 host_wait_us;
+        u32 host_past, host_versions;
         std::array<u32, PageHolds::Kinds> fault_kinds;
         std::array<u64, PageHolds::Kinds> fault_kind_us;
         struct Site {
@@ -512,6 +501,7 @@ private:
     }
     void HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind);
     void HoldWrite(PAddr addr, u32 bytes, PageHolds::Kind kind);
+    void HoldMoves(PAddr addr, u32 bytes);
     void HoldDraw(const DrawTextures& textures, u32 count, bool vertices, bool is_indexed);
     void HoldVertices(bool is_indexed);
     /// A resource file's range and its first 16 bytes as named: a file the game freed goes at the next
@@ -645,6 +635,23 @@ private:
     void PutPageRemaps();
     /// Waits for the work a guest access to the page waits for, the open holds' ticket fenced first.
     void WaitHeldPage(u32 page, bool write);
+    /// A write onto a held page (PageHolds' index), by the guest (a store that aborted:
+    /// PageFault) or by the HLE before it writes through the app's view (HostAccess): every
+    /// writer's one way past the holds. [host, host + bytes) is what it writes, within the page
+    /// (bytes 0: not known). First the write's own effects: the memo's index lists over the
+    /// page are stale, a handed-over list's parse reads a copy of the page, T12's textures on it
+    /// are untiled again. Then the first that applies: the page open to the write (Open); for a
+    /// known range, clear of the bytes the page's queued work uses, the write made with the page
+    /// still held (PastHolds; ticket the page's last live hold's); a version of a moved FCRAM
+    /// page, the writer's view onto a slot no queued work reads (Open); else the caller waits for
+    /// the page's work (Wait, WaitHeldPage). An open page that queued work may be moving to CDRAM
+    /// opens once the move is done.
+    enum class HeldWrite { Open, PastHolds, Wait };
+    std::vector<u32> later_pages;
+    std::function<void()> later_done;
+    HeldWrite TakeHeldWrite(u32 page, const u8* host, u32 bytes, bool guest, u32& ticket);
+    bool host_range = false;
+    std::vector<std::pair<PAddr, PAddr>> host_textures;
     /// Waits until the GPU has reached `ticket` (0: nothing to wait for), the open holds'
     /// ticket fenced first.
     void WaitTicket(u32 ticket);
@@ -656,6 +663,7 @@ private:
 #endif
 #ifdef VITA_DIAGNOSTICS
     u32 faults{}, fault_waits{}, host_waits{}, versioned_faults{};
+    u32 host_past{}, host_versions{};
     u32 geometry_moves{}, parse_copies{}, parse_waits{};
     u64 parse_wait_us{};
     u64 fault_wait_us{}, host_wait_us{};

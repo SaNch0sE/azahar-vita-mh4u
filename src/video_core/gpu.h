@@ -21,8 +21,6 @@
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/rasterizer_interface.h"
 
-struct AzaharStorePermits;
-
 namespace Service::GSP {
 struct Command;
 struct FrameBufferInfo;
@@ -69,14 +67,10 @@ public:
     /// Sets the function to call for signalling GSP interrupts.
     void SetInterruptHandler(Service::GSP::InterruptHandler handler);
 
-    /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
-    void FlushRegion(PAddr addr, u32 size);
-
-    /// Notify rasterizer that any caches of the specified region should be invalidated
-    void InvalidateRegion(PAddr addr, u32 size);
-
-    /// Both, in one call
-    void FlushAndInvalidateRegion(PAddr addr, u32 size);
+    /// A write of [addr, addr + size) the GPU did not make (the HLE's, through
+    /// Memory::MemorySystem::HleAccess; a DMA's): one into a framebuffer the LCD shows has the
+    /// next vblank present (VBlankCallback).
+    void ScreensWritten(PAddr addr, u32 size);
 
     /// Flushes and invalidates all memory in the rasterizer cache and removes any leftover state.
     void ClearAll(bool flush);
@@ -162,14 +156,6 @@ public:
     /// RenderThread::OpensHeldPage: a store's version; a picture's rows written back, the page
     /// opening later): the access runs again natively, and so do the guest's next ones there.
     bool GuestOpensHeldPage(const u8* host, u32 size, bool write);
-    /// The bytes of the page a store GuestStoreMissesHolds passed must miss, as six [lo, hi) page
-    /// offsets (hi 0 for none), for the native core's store permit at `slot`; the permits' table,
-    /// whose permits a page's next hold voids one by one, and their generation (renderer_sgxd's
-    /// PageHolds::StoreForbidden, PermitGranted, SetStorePermits, Generation).
-    void GuestStoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi,
-                             u32 slot);
-    void SetStorePermits(AzaharStorePermits* table);
-    const u32* PageHoldsGeneration() const;
 
     /**
      * With the sgxd renderer, its render thread held (RenderThread::Hold): for the guard's life the
@@ -283,9 +269,6 @@ private:
     /// Runs op, a GSP command's or a register trigger's work (vprof numbers it, perflog times
     /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).
     void RunGpuOp(OpKind kind, const std::function<void()>& op);
-    /// A write of [addr, addr + size): one into a framebuffer the LCD shows has the next vblank
-    /// present (VBlankCallback).
-    void ScreensWritten(PAddr addr, u32 size);
     /// Raises a GSP interrupt as upstream does: when its work is submitted, after the delay
     /// generators' estimate of that work, which GSP adds. Any but a vblank
     /// first takes the rasterizer's ticket for the work before it, which the page holds made

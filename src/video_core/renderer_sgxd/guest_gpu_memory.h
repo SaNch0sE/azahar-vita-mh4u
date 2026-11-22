@@ -37,8 +37,10 @@ namespace SgxdRenderer {
  * target, a texture at its untile), where the work's page holds keep the guest's writes off the
  * pages during the copy. Past its first 8 MiB the pool grows into uncached main memory when
  * CDRAM is full. The guest may reuse a moved page for anything, and every view of it still
- * agrees. Each GPU use of a moved page (IsUncached) stamps it with the frame. At vblank, with
- * the guest stopped and the render thread held (ReturnUnused), a page no use has stamped for
+ * agrees. The second emulation thread's guest runs during every move and return: the module
+ * refuses its writes to the pages while their bytes move. Each GPU use of a moved page
+ * (IsUncached) stamps it with the frame. At vblank, with the first emulation thread's guest
+ * stopped and the render thread held (ReturnUnused), a page no use has stamped for
  * StaleFrames frames goes back to its FCRAM page, and with the pool short of free pages the
  * pages unused longest go back too (EvictPool), but none that page versions hold (PageHolds: the
  * guest's view of one may be on a slot of theirs); a move never puts pages back itself: on the
@@ -65,11 +67,11 @@ public:
     static constexpr u32 StaleFrames = 1000;
 
     /// What a move needs of the render side (RenderThread sets them; a move runs on the render
-    /// thread, or with it held as every return does, its side on the caller's): waiting for the
-    /// GPU writes queued to a range; the GPU's own remap of PTE words (sgxdPte pairs) in its queue's
-    /// order, returning a fence the work queued with it is done by; that fence reached, and a
-    /// wait for it; whether page versions hold a moved FCRAM page (PageHolds::Versioned), which
-    /// does not go back until they let it go.
+    /// thread, or with it held as every return does, its side on the caller's): waiting for the GPU
+    /// writes queued to a range; the GPU's own remap of PTE words (sgxdPte pairs) in its queue's
+    /// order, returning a fence the work queued with it is done by; that fence reached, and a wait
+    /// for it; whether page versions hold a moved FCRAM page (PageHolds::Versioned), which does not
+    /// go back until they let it go.
     struct MoveHooks {
         std::function<void(PAddr addr, u32 size)> wait_writes;
         std::function<u32(const u32* pte_va, const u32* pte, u32 count)> remap;

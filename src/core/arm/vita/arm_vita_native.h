@@ -130,9 +130,6 @@ struct VitaNativeCensus {
     u32 svc_thunks{};
     u32 hold_loads{}, hold_stores{}, hold_opens{};
     u32 hold_thumb{};
-    /// The store permits AccessPastHolds gave, and the stores the module made by them
-    /// (AzaharStorePermits), no exit.
-    u32 store_permits{}, permitted_stores{};
     /// Accesses past the budget (TakeHoldBudget), left to wait.
     u32 hold_load_waits{};
     u32 hold_pages{};
@@ -141,16 +138,6 @@ struct VitaNativeCensus {
     u64 idle_skip_ticks{};
     u32 upcall_sites{}, upcall_runs{}, upcall_preempted{};
     std::array<u32, 256> upcall_svcs{};
-    /// The store permits AccessPastHolds made, by what the page's slot held before: none (voided
-    /// or never made), another page's, the page's with its stores used up, the page's still live
-    /// (a store the module left to the app: its form, or past the permit's bytes).
-    u32 permits_after_none{}, permits_after_other{}, permits_after_used{}, permits_after_live{};
-    std::array<std::array<u32, 3>, 8> permits_live_sites{};
-    /// The pages the module made the most permitted stores on since the last census: the guest
-    /// page (VA >> 12) and the stores (the permits' `left` read and reset each census).
-    std::array<std::array<u32, 2>, 8> permitted_store_pages{};
-    /// Times every permit went at once (ClearStorePermits: the guest's mappings changed).
-    u32 permit_clears{};
     u32 upcall_reschedules{};
     u32 upcall_exits_slice_up{}, upcall_exits_no_next{};
     u32 upcall_thumb_sites{}, upcall_redirects{};
@@ -188,10 +175,6 @@ std::vector<std::string> ModuleTablesAt(u32 va);
 
 class ARM_VitaNative final : public ARM_Interface {
 public:
-    /// A store permit's stores (AzaharStorePermit::left): the module makes them in its vector, no
-    /// exit each, so AccessesPerHold's reason is not theirs (at 32, a game's battle made ~400
-    /// permits a second again for stores used up).
-    static constexpr u32 PermitStores = 1u << 16;
     explicit ARM_VitaNative(Core::System& system, Memory::MemorySystem& memory, u32 id,
                             std::shared_ptr<Core::Timing::Timer> timer,
                             std::shared_ptr<VitaGuestMap> map);
@@ -272,8 +255,7 @@ private:
     /// stop for now.
     bool RunSlice(u64 quantum_ns);
     bool RunSliceOnce(u64 quantum_ns);
-    /// RunSliceOnce on the second emulation thread: no upcalls, store permits or in-kernel
-    /// scheduling, nothing patched; svcs to System::SecondHostSvc.
+    /// RunSliceOnce on the second emulation thread: no upcalls, nothing patched.
     bool RunSliceSecond(u64 quantum_ns);
     /// Host 1 ran into one of its thunks it has not built yet: built from host 0's claim.
     void BuildHost1Thunk();
@@ -316,6 +298,8 @@ private:
     static constexpr u32 AccessesPerOpen = 32;
     std::array<HotPage, 4> hot_pages{};
     u32 hot_next{};
+    /// The part of the access a page's holds refused (AccessPastHolds), 0 for none.
+    u32 refused_va{};
     struct HoldBudget {
         u32 page = ~0u;
         u32 ticket = 0;

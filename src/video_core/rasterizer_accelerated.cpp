@@ -108,10 +108,6 @@ RasterizerAccelerated::VertexArrayInfo RasterizerAccelerated::AnalyzeVertexArray
         vertex_min = 0xFFFF;
         vertex_max = 0;
         const u32 count = regs.pipeline.num_vertices;
-        const u32 index_size = index_u16 ? 2 : 1;
-        const u32 size = count * index_size;
-        FlushRegion(address, size);
-
         if (index_u16) {
             const auto res = Common::FindMinMax({index_address_16, static_cast<size_t>(count)});
             vertex_min = static_cast<u32>(res.first);

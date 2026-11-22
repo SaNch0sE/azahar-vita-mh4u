@@ -772,19 +772,8 @@ void ThreadIdsCleared() {
     }
 }
 
-alignas(64) AzaharStorePermits store_permits{};
-void ClearStorePermits() {
-    for (AzaharStorePermit& p : store_permits.permit) {
-        p.page = 0;
-    }
-#ifdef VITA_DIAGNOSTICS
-    census.permit_clears++;
-#endif
-}
-
 /// The guest that map held is gone, and its patches with it.
 void ForgetThunks(const VitaGuestMap* map) {
-    ClearStorePermits();
     if (thunk_area_map == map) {
         ResetLeases();
         patched_sites.clear();
@@ -1201,7 +1190,6 @@ VitaGuestMap::~VitaGuestMap() {
 }
 
 bool VitaGuestMap::Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) const {
-    ClearStorePermits();
     // The guest's memory svcs run on host 0.
     DEBUG_ASSERT_MSG(op == AZAHAR_EDIT_SYNC_CODE || Core::ThisHost() == 0,
                      "azaharEdit op {} of {:#010x}+{:#x} on the second emulation thread", op,
@@ -3110,19 +3098,6 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
     run.upcall_switch = &upcall_switch;
     EnsureUpcallBody();
     run.upcall_redirect = &upcall_redirect;
-    // The module writes a permitted store through the app's view, which the guest's world maps
-    // with the upcalls.
-    if (UpcallsOn()) {
-        const u32* const gen = system.GPU().PageHoldsGeneration();
-        if (store_permits.gen != gen) {
-            ClearStorePermits();
-            store_permits.gen = gen;
-            system.GPU().SetStorePermits(&store_permits);
-        }
-        run.store_permits = &store_permits;
-    } else {
-        run.store_permits = nullptr;
-    }
 #ifdef VITA_DIAGNOSTICS
     // A held upcall's C++ may stand halfway through a change of the holds: checked when it is back.
     if (!upcall_held) {
@@ -3575,7 +3550,6 @@ bool ARM_VitaNative::RunSliceSecond(u64 quantum_ns) {
     run.upcall_rearm_us = run.upcall_rearm_max = 0;
     run.upcall_switch = nullptr;
     run.upcall_redirect = nullptr;
-    run.store_permits = nullptr;
 
     const int ret = azaharRun(&run);
     if (ret < 0) {
@@ -3674,29 +3648,6 @@ VitaNativeCensus TakeVitaNativeCensus() {
         DEBUG_ASSERT_MSG(untouched > 1024, "upcall: the stack's deepest use left {} bytes of {}",
                          untouched, upcall_stack.size());
     }
-    census.permitted_stores = std::exchange(store_permits.made, 0u);
-    // Each live permit's stores since the last census: its `left` against the last census's, one
-    // made since from whole (at least: made again for the same page, it may have gone below the
-    // last census's). `left` stays as it is: made whole each second, diagnostics' permits never ran
-    // out where release's do.
-    static std::array<std::array<u32, 2>, AZAHAR_STORE_PERMITS> seen{};
-    for (u32 s = 0; s < AZAHAR_STORE_PERMITS; s++) {
-        const AzaharStorePermit& permit = store_permits.permit[s];
-        const auto [seen_page, seen_left] = seen[s];
-        seen[s] = {permit.page, permit.left};
-        if (permit.page == 0) {
-            continue;
-        }
-        const u32 stores = permit.page == seen_page && permit.left <= seen_left
-                               ? seen_left - permit.left
-                               : ARM_VitaNative::PermitStores - permit.left;
-        auto& top = census.permitted_store_pages;
-        auto least = std::min_element(top.begin(), top.end(),
-                                      [](const auto& a, const auto& b) { return a[1] < b[1]; });
-        if (stores > (*least)[1]) {
-            *least = {permit.page, stores};
-        }
-    }
     census.hold_pages = static_cast<u32>(hold_page_accesses.size());
     std::vector<std::array<u32, 3>> pages;
     for (const auto& [page, access] : hold_page_accesses) {
@@ -3744,6 +3695,7 @@ bool ARM_VitaNative::TakeHeldPage(u32 va, bool write, u32 pc) {
     // Before the access: a load into the PC may change the state.
     const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
 #endif
+    refused_va = 0;
     if (AccessPastHolds(pc, write)) {
         hot->accesses++;
 #ifdef VITA_DIAGNOSTICS
@@ -3755,7 +3707,10 @@ bool ARM_VitaNative::TakeHeldPage(u32 va, bool write, u32 pc) {
 #endif
         return true;
     }
-    return host != nullptr && system.GPU().GuestAbort(host, write, pc, va);
+    // The A9 reports a multi-word store's first address even when a later word's page faulted.
+    const u32 at = refused_va != 0 ? refused_va : va;
+    const u8* const refused = map->HostAt(at);
+    return refused != nullptr && system.GPU().GuestAbort(refused, write, pc, at);
 }
 
 bool ARM_VitaNative::TakeHoldBudget(u32 page, u32 ticket) {
@@ -3803,7 +3758,9 @@ bool ARM_VitaNative::AccessPastHolds(u32 pc, bool write) {
     const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
     const u32 next = pc + (thumb ? 2 : 4);
     // The app's view of the guest's page: the guest's slot, open to the app. A load needs the
-    // GPU's writes missed, a store everything the queued work touches.
+    // GPU's writes missed. A store goes as every write onto a held page does: past the holds,
+    // missing everything the queued work touches, or onto the page its own effects or a version
+    // opened (ticket 0: no hold to count it against).
     const auto misses = [&](u32 address, u32 bytes) -> u8* {
         if (IsLumaAlias(address)) {
             // Physical memory: no slot of the guest's, and no hold counts it (LumaAliasAccess).
@@ -3816,44 +3773,8 @@ bool ARM_VitaNative::AccessPastHolds(u32 pc, bool write) {
         if (host == nullptr ||
             !(write ? system.GPU().GuestStoreMissesHolds(host, bytes, ticket)
                     : system.GPU().GuestReadMissesWrites(host, bytes, ticket)) ||
-            !TakeHoldBudget(address >> 12, ticket)) {
+            (ticket != 0 && !TakeHoldBudget(address >> 12, ticket))) {
             return nullptr;
-        }
-        // The page's next stores clear of its queued work are the module's (AzaharStorePermits),
-        // as many as a hold's budget.
-        if (write && run.store_permits != nullptr) {
-            const u32 page = address >> 12;
-            AzaharStorePermit& permit = store_permits.permit[page % AZAHAR_STORE_PERMITS];
-#ifdef VITA_DIAGNOSTICS
-            if (permit.page == 0) {
-                census.permits_after_none++;
-            } else if (permit.page != page) {
-                census.permits_after_other++;
-            } else if (permit.left == 0) {
-                census.permits_after_used++;
-            } else {
-                census.permits_after_live++;
-                // The sites of the stores the module left to the app on a live permit: the
-                // guest's PC, its instruction, how many (8 sites at most).
-                for (auto& site : census.permits_live_sites) {
-                    if (site[2] == 0 || site[0] == pc) {
-                        site = {pc, insn, site[2] + 1};
-                        break;
-                    }
-                }
-            }
-#endif
-            std::array<u16, AZAHAR_STORE_RANGES> lo, hi;
-            system.GPU().GuestStoreForbidden(host, lo, hi, page % AZAHAR_STORE_PERMITS);
-            permit.page = page;
-            permit.gen = *store_permits.gen;
-            permit.host = HostAddress(host - (address & 0xFFFu));
-            permit.left = PermitStores;
-            std::copy(lo.begin(), lo.end(), permit.lo);
-            std::copy(hi.begin(), hi.end(), permit.hi);
-#ifdef VITA_DIAGNOSTICS
-            census.store_permits++;
-#endif
         }
         return const_cast<u8*>(host);
     };
@@ -3878,6 +3799,7 @@ bool ARM_VitaNative::AccessPastHolds(u32 pc, bool write) {
             }
             const u8* const host = map->HostAt(at);
             if (host == nullptr || !system.GPU().GuestAccessMisses(host, n, store)) {
+                refused_va = host != nullptr ? at : 0;
                 return false;
             }
             s.host[k] = const_cast<u8*>(host);

@@ -953,7 +953,9 @@ static void CopyFrameBuffer(Core::System& system, VAddr dst, VAddr src, u32 dst_
         return;
     }
 
-    system.Memory().RasterizerFlushVirtualRegion(src, src_stride * lines, Memory::FlushMode::Flush);
+    // Through pointers: the GPU's held pages are guarded first, as a block copy's are.
+    system.Memory().HleAccess(src, src_stride * lines, false);
+    system.Memory().HleAccess(dst, dst_stride * lines, true);
 
     const u32 copy_bytes_per_line = std::min(src_stride, dst_stride);
     for (u32 y = 0; y < lines; ++y) {
@@ -961,9 +963,6 @@ static void CopyFrameBuffer(Core::System& system, VAddr dst, VAddr src, u32 dst_
         src_ptr += src_stride;
         dst_ptr += dst_stride;
     }
-
-    system.Memory().RasterizerFlushVirtualRegion(dst, dst_stride * lines,
-                                                 Memory::FlushMode::Invalidate);
 }
 
 static void ClearFramebuffer(Core::System& system, VAddr dst, u32 dst_stride, u32 lines) {
@@ -975,14 +974,12 @@ static void ClearFramebuffer(Core::System& system, VAddr dst, u32 dst_stride, u3
         return;
     }
 
+    system.Memory().HleAccess(dst, dst_stride * lines, true);
     const u32 set_bytes_per_line = dst_stride;
     for (u32 y = 0; y < lines; ++y) {
         std::memset(dst_ptr, 0, set_bytes_per_line);
         dst_ptr += dst_stride;
     }
-
-    system.Memory().RasterizerFlushVirtualRegion(dst, dst_stride * lines,
-                                                 Memory::FlushMode::Invalidate);
 }
 
 void GSP_GPU::SaveVramSysArea(Kernel::HLERequestContext& ctx) {
@@ -1467,9 +1464,7 @@ void VramBackupHandler::SaveVRAMBank(size_t bank_id) {
 
     VAddr bank_vaddr = Memory::VRAM_VADDR + bank_id * VRAM_BACKUP_BANK_SIZE;
 
-    system.Memory().RasterizerFlushVirtualRegion(bank_vaddr, VRAM_BACKUP_BANK_SIZE,
-                                                 Memory::FlushMode::Flush);
-
+    system.Memory().HleAccess(bank_vaddr, VRAM_BACKUP_BANK_SIZE, false);
     u8* data = system.Memory().GetPointer(bank_vaddr);
     memcpy(Bank(bank_id), data, VRAM_BACKUP_BANK_SIZE);
 }
@@ -1479,12 +1474,10 @@ void VramBackupHandler::RestoreVRAMBank(size_t bank_id) {
 
     VAddr bank_vaddr = Memory::VRAM_VADDR + bank_id * VRAM_BACKUP_BANK_SIZE;
 
+    system.Memory().HleAccess(bank_vaddr, VRAM_BACKUP_BANK_SIZE, true);
     u8* data = system.Memory().GetPointer(bank_vaddr);
     // Never saved: zeros, as a bank made up front held.
     memcpy(data, Bank(bank_id), VRAM_BACKUP_BANK_SIZE);
-
-    system.Memory().RasterizerFlushVirtualRegion(bank_vaddr, VRAM_BACKUP_BANK_SIZE,
-                                                 Memory::FlushMode::Invalidate);
 }
 } // namespace Service::GSP
 

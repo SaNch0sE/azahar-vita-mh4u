@@ -211,25 +211,15 @@ void GPU::EnablePageHolds() {
         },
         [this](const u8* host, u32 size) { impl->render->HostRemapped(host, size); },
         [this](const u8* host, u32 size) { impl->render->GpuRead(host, size); },
+        [this](const std::vector<const u8*>& pages, std::function<void()> done) {
+            impl->render->HostWritesLater(pages, std::move(done));
+        },
     });
 }
 
 bool GPU::GuestStoreMissesHolds([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
                                 [[maybe_unused]] u32& ticket) {
     return impl->render->StoreMissesHolds(host, size, ticket);
-}
-
-void GPU::GuestStoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi,
-                              u32 slot) {
-    impl->render->StoreForbidden(host, lo, hi, slot);
-}
-
-void GPU::SetStorePermits(AzaharStorePermits* table) {
-    impl->render->SetStorePermits(table);
-}
-
-const u32* GPU::PageHoldsGeneration() const {
-    return impl->render->PageHoldsGeneration();
 }
 
 bool GPU::GuestReadMissesWrites([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
@@ -350,20 +340,6 @@ void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
     impl->signal_interrupt = handler;
 }
 
-void GPU::FlushRegion(PAddr addr, u32 size) {
-    impl->rasterizer->FlushRegion(addr, size);
-}
-
-void GPU::InvalidateRegion(PAddr addr, u32 size) {
-    ScreensWritten(addr, size);
-    impl->rasterizer->InvalidateRegion(addr, size);
-}
-
-void GPU::FlushAndInvalidateRegion(PAddr addr, u32 size) {
-    ScreensWritten(addr, size);
-    impl->rasterizer->FlushAndInvalidateRegion(addr, size);
-}
-
 void GPU::ScreensWritten([[maybe_unused]] PAddr addr, [[maybe_unused]] u32 size) {
     // The LCD scans 400 columns on the top screen, 320 on the bottom (as VBlankCallback).
     for (u32 i = 0; i < 2; i++) {
@@ -427,12 +403,10 @@ Result GPU::Execute(const Service::GSP::Command& command) {
 
     switch (command.id) {
     case CommandId::RequestDma: {
-        impl->system.Memory().RasterizerFlushVirtualRegion(
-            command.dma_request.source_address, command.dma_request.size, Memory::FlushMode::Flush);
-        impl->system.Memory().RasterizerFlushVirtualRegion(command.dma_request.dest_address,
-                                                           command.dma_request.size,
-                                                           Memory::FlushMode::Invalidate);
-        // The PTLA copies it, run by run.
+        // The PTLA copies it, run by run, after the GPU work before it: its record reads the
+        // pictures and depth stores over the source and marks the textures over the
+        // destination written (RasterizerSgxd::CopyLines), as the page holds make the guest's
+        // accesses to both wait for it.
         auto runs = DmaRuns(command.dma_request.source_address, command.dma_request.dest_address,
                             command.dma_request.size);
 

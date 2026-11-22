@@ -332,11 +332,11 @@ typedef struct AzaharFast {
     uint32_t rearm_ticks, rearm_left;
     uint32_t accrued_lo, accrued_hi;
     uint32_t rearms;
-    // Version 68, this core's: its user page (the kernel's address) and the app's switch,
-    // redirect and permits for this slice (AzaharRunRequest). Two cores in slices at once read
-    // their own here; they were module globals.
-    uint32_t user_kva, switch_va, redirect_va, store_va;
-    uint32_t spare;       // keeps the stacks after the block 8-byte aligned
+    // This core's user page (the kernel's address) and the app's switch and
+    // redirect for this slice (AzaharRunRequest). Two cores in slices at once read their own
+    // here.
+    uint32_t user_kva, switch_va, redirect_va;
+    uint32_t spare[2];    // keeps the stacks after the block 8-byte aligned
 } AzaharFast;
 _Static_assert(__builtin_offsetof(AzaharFast, mult_int) == 0x0c, "entry.S FAST_MULT_INT");
 _Static_assert(__builtin_offsetof(AzaharFast, base_lo) == 0x14, "entry.S FAST_BASE_LO");
@@ -347,7 +347,6 @@ _Static_assert(__builtin_offsetof(AzaharFast, rearm_ticks) == 0x48, "entry.S FAS
 _Static_assert(__builtin_offsetof(AzaharFast, accrued_lo) == 0x50, "entry.S FAST_ACCRUED_LO");
 _Static_assert(__builtin_offsetof(AzaharFast, rearms) == 0x58, "entry.S FAST_REARMS");
 _Static_assert(__builtin_offsetof(AzaharFast, user_kva) == 0x5c, "entry.S FAST_USER_KVA");
-_Static_assert(__builtin_offsetof(AzaharFast, store_va) == 0x68, "entry.S FAST_STORE_VA");
 _Static_assert(sizeof(AzaharFast) == 0x70, "AzaharCpu's stacks after it");
 
 // One block per Vita core (MPIDR & 3): a slice on a core reads and writes its own only. This is
@@ -433,14 +432,13 @@ static AzaharCore azahar_core[AZAHAR_CORES];
 // The page AZAHAR_USER_PAGE_VA shows the guest, one per core, each core's
 // view showing its own there): the page-aligned ones inside this array, so that the guest sees
 // nothing else of the module's whatever alignment the loader gave the data segment. Written
-// before each entry into the guest (core2_run), sealed. Each core's switch, redirect and permits
-// are in its AzaharFast.
+// before each entry into the guest (core2_run), sealed. Each core's switch and redirect are in
+// its AzaharFast.
 static uint8_t azahar_user_area[(AZAHAR_CORES + 1) * 4096];
 static inline AzaharUserPage *azahar_user(unsigned n) {
     return (AzaharUserPage *)((((uintptr_t)azahar_user_area + 0xFFFu) & ~(uintptr_t)0xFFFu) +
                               n * 4096u);
 }
-uint32_t azahar_store_fast(AzaharContext *ctx, uint32_t pc);
 
 // The core this runs on. Not ksceKernelCpuId: nothing of Sony's kernel is mapped once a core is
 // sealed (a call to it there takes a prefetch abort).
@@ -1713,9 +1711,7 @@ static int build_table(const AzaharMapRequest *req) {
                 (uint32_t)(uintptr_t)&azahar_get_banked_sp, (uint32_t)(uintptr_t)&core2_entry,
                 (uint32_t)(uintptr_t)&core2_run,         (uint32_t)(uintptr_t)&core2_install,
                 (uint32_t)(uintptr_t)&core2_uninstall,   (uint32_t)(uintptr_t)&translate,
-                (uint32_t)(uintptr_t)&sched_fold_run,    (uint32_t)(uintptr_t)&sched_sleep,
-                (uint32_t)(uintptr_t)&sched_reschedule, (uint32_t)(uintptr_t)&sched_arbitrate,
-                (uint32_t)(uintptr_t)&sched_block,      (uint32_t)(uintptr_t)&azahar_store_fast,
+                (uint32_t)(uintptr_t)&fold_run,
             };
             const uint32_t data_syms[] = {
                 (uint32_t)(uintptr_t)&azahar_cpu[0],    (uint32_t)(uintptr_t)azahar_cpu[3].guard,
@@ -2311,7 +2307,6 @@ int azaharRun(AzaharRunRequest *user_req) {
     // This core's, read by its vector (two cores may run at once).
     fast->switch_va = (uint32_t)(uintptr_t)req->upcall_switch;
     fast->redirect_va = (uint32_t)(uintptr_t)req->upcall_redirect;
-    fast->store_va = (uint32_t)(uintptr_t)req->store_permits;
     if (azahar_verbose) {
         emit("== azaharRun  cpu%u pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u "
              "ticks\n",
@@ -2667,122 +2662,6 @@ void azahar_vfp_reset(void) {
     for (uint32_t i = 0; i < AZAHAR_VFP_TABLE; i++) {
         azahar_vfp_table[i].pc = 0;
     }
-}
-
-// ---------------------------------------------------------------------------- stores past holds
-// azahar_store_fast, which entry.S's data abort stub calls with a guest active (version 65):
-// Abort mode, IRQs masked, the core's VFP stack, the guest's user registers saved in ctx and its
-// VFP bank live (integer code only). `pc` is the aborted instruction. Makes a store the app
-// permits (AzaharStorePermits) through the app's view of the page and writes the base back into
-// ctx: 1; else 0, the ordinary exit. Sealed: nothing of Sony's.
-
-uint32_t azahar_store_fast(AzaharContext *ctx, uint32_t pc) {
-    // ctx is the core's AzaharCpu (its first member): this core's permits.
-    const AzaharStorePermits *const t =
-        (const AzaharStorePermits *)(uintptr_t)((const AzaharCpu *)ctx)->fast.store_va;
-    uint32_t dfsr, far, spsr;
-    asm volatile("mrc p15, 0, %0, c5, c0, 0" : "=r"(dfsr));
-    asm volatile("mrc p15, 0, %0, c6, c0, 0" : "=r"(far));
-    asm volatile("mrs %0, spsr" : "=r"(spsr));
-    // A write's permission fault, section or page (FS 0b01101, 0b01111; WnR), in ARM state.
-    const uint32_t fs = (dfsr & 0xFu) | ((dfsr >> 6) & 0x10u);
-    if ((dfsr & (1u << 11)) == 0 || (fs != 0xDu && fs != 0xFu) || (spsr & 0x20u) != 0) {
-        return 0;
-    }
-    const uint32_t page = far >> 12;
-    AzaharStorePermit *const p =
-        (AzaharStorePermit *)&t->permit[page & (AZAHAR_STORE_PERMITS - 1u)];
-    if (p->page != page || p->gen != *t->gen || p->left == 0) {
-        return 0;
-    }
-    // The aborted instruction made an access, so its condition passed.
-    const uint32_t insn = *(const volatile uint32_t *)(uintptr_t)pc;
-    const uint32_t n = (insn >> 16) & 0xFu, rt = (insn >> 12) & 0xFu, m = insn & 0xFu;
-    const uint32_t pre = (insn >> 24) & 1u, up = (insn >> 23) & 1u, w = (insn >> 21) & 1u;
-    uint32_t offset, size, pair = 0;
-    if ((insn & 0x0E100000u) == 0x04000000u) {
-        // STR, STRB immediate: cond 010P UBW0 Rn Rt imm12
-        size = ((insn >> 22) & 1u) ? 1u : 4u;
-        offset = insn & 0xFFFu;
-    } else if ((insn & 0x0E100010u) == 0x06000000u) {
-        // STR, STRB register: cond 011P UBW0 Rn Rt imm5 type 0 Rm (RRX not built)
-        const uint32_t amount = (insn >> 7) & 0x1Fu, type = (insn >> 5) & 3u, rm = ctx->r[m];
-        if (m == 15 || (type == 3 && amount == 0)) {
-            return 0;
-        }
-        switch (type) {
-        case 0: offset = rm << amount; break;
-        case 1: offset = amount == 0 ? 0 : rm >> amount; break;
-        case 2: offset = (uint32_t)((int32_t)rm >> (amount == 0 ? 31 : amount)); break;
-        default: offset = (rm >> amount) | (rm << (32 - amount)); break;
-        }
-        size = ((insn >> 22) & 1u) ? 1u : 4u;
-    } else if ((insn & 0x0E1000B0u) == 0x000000B0u) {
-        // STRH (op2 01) and STRD (op2 11): cond 000P U1W0 Rn Rt imm4H 1 op2 1 imm4L, or
-        // cond 000P U0W0 Rn Rt 0000 1 op2 1 Rm
-        pair = (insn & 0x40u) != 0;
-        size = pair ? 8u : 2u;
-        if ((insn >> 22) & 1u) {
-            offset = ((insn >> 4) & 0xF0u) | (insn & 0xFu);
-        } else if ((insn & 0xF00u) != 0 || m == 15) {
-            return 0;
-        } else {
-            offset = ctx->r[m];
-        }
-    } else {
-        return 0;
-    }
-    if ((!pre && w) || rt == 15 || (pair && ((rt & 1u) != 0 || rt == 14))) {
-        return 0; // the T forms; Rt PC, or STRD's odd pair
-    }
-    const uint32_t base = n == 15 ? pc + 8 : ctx->r[n];
-    const uint32_t indexed = up ? base + offset : base - offset;
-    const uint32_t writeback = !pre || w;
-    if ((pre ? indexed : base) != far ||
-        (writeback && (n == 15 || n == rt || (pair && n == rt + 1)))) {
-        return 0;
-    }
-    const uint32_t at = far & 0xFFFu, end = at + size;
-    if (end > 0x1000u) {
-        return 0;
-    }
-    for (uint32_t k = 0; k < AZAHAR_STORE_RANGES; k++) {
-        if (at < p->hi[k] && p->lo[k] < end) {
-            return 0;
-        }
-    }
-    // The app's view, written at PL1 only where the guest's world maps it so (ATS1CPW).
-    const uint32_t host = p->host + at;
-    uint32_t par;
-    asm volatile("mcr p15, 0, %1, c7, c8, 1\n\tisb\n\tmrc p15, 0, %0, c7, c4, 0"
-                 : "=r"(par)
-                 : "r"(host)
-                 : "memory");
-    if (par & 1u) {
-        return 0;
-    }
-    volatile uint8_t *const h = (volatile uint8_t *)(uintptr_t)host;
-    const uint32_t lo_word = ctx->r[rt], hi_word = pair ? ctx->r[rt + 1] : 0;
-    if (size == 1) {
-        h[0] = (uint8_t)lo_word;
-    } else if ((host & (size == 2 ? 1u : 3u)) != 0) {
-        for (uint32_t i = 0; i < size; i++) {
-            h[i] = (uint8_t)((i < 4 ? lo_word : hi_word) >> ((i & 3u) * 8u));
-        }
-    } else if (size == 2) {
-        *(volatile uint16_t *)h = (uint16_t)lo_word;
-    } else {
-        ((volatile uint32_t *)h)[0] = lo_word;
-        if (pair) {
-            ((volatile uint32_t *)h)[1] = hi_word;
-        }
-    }
-    if (writeback) {
-        ctx->r[n] = indexed;
-    }
-    p->left--;
-    ((AzaharStorePermits *)t)->made++;
-    return 1;
 }
 
 int azaharSyncUpper(uint32_t user_va) {

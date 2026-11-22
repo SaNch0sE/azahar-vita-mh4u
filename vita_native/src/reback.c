@@ -219,10 +219,58 @@ static void reback_restore_locked(void) {
     reback_owner = -1;
 }
 
-// Every guest descriptor (our L2 pool) naming an old page of this move names its new one, with
-// its attributes; permissions stay. The descriptors are the ones the guest's windows put the
-// page's app address under (native.c's azahar_windows), a guest address can alias it more than
-// once; each must still name the old page.
+// The guest descriptors reback_close_guest closed, opened again by reback_retarget_guest.
+#define REBACK_MAX_CLOSED (REBACK_BATCH * 4u)
+static uint32_t *reback_closed[REBACK_MAX_CLOSED];
+static unsigned reback_closed_count;
+
+// The guest descriptor (our L2 pool) at the guest address window `win` puts app address `uva`
+// under, or NULL: none there, or the window does not show it.
+static uint32_t *reback_guest_desc(const AzaharWindow *win, uint32_t uva) {
+    if (uva - win->uva >= win->size) {
+        return NULL;
+    }
+    const uint32_t gva = win->va + (uva - win->uva);
+    const int t = l2_for(gva >> 20, 0);
+    return t < 0 ? NULL : &azahar_l2[(unsigned)t * 256u + ((gva >> 12) & 0xFFu)];
+}
+
+// The guest's writes off this batch's old pages while their bytes move: the second emulation
+// thread runs guest code meanwhile. Each descriptor naming an old page that takes writes is
+// closed (AP[2], as a WRITES hold); a store aborts as on a held page and runs again once open.
+// Under azahar_edit_mutex until the retarget opens them. Loads go on.
+static int reback_close_guest(void) {
+    reback_closed_count = 0;
+    if (azahar_state != ST_MAPPED) {
+        return 0;
+    }
+    for (unsigned n = 0; n < reback_pair_count; n++) {
+        const RebackPair *p = &reback_pairs[n];
+        for (unsigned w = 0; w < azahar_windows.count; w++) {
+            uint32_t *const d = reback_guest_desc(&azahar_windows.w[w], p->uva);
+            if (d == NULL || !(*d & 2u) || (*d & 0xFFFFF000u) != p->old_pa || (*d & (1u << 9))) {
+                continue;
+            }
+            if (reback_closed_count == REBACK_MAX_CLOSED) {
+                for (unsigned i = 0; i < reback_closed_count; i++) {
+                    *reback_closed[i] &= ~(1u << 9);
+                }
+                reback_closed_count = 0;
+                return AZAHAR_ERR_ALLOC;
+            }
+            *d |= 1u << 9;
+            reback_closed[reback_closed_count++] = d;
+        }
+    }
+    if (reback_closed_count) {
+        tables_changed(0);
+    }
+    return 0;
+}
+
+// Every guest descriptor naming an old page of this move names its new one, with its
+// attributes; permissions stay. A guest address can alias a page more than once. Those
+// reback_close_guest closed open again.
 static unsigned reback_retarget_guest(int code) {
     if (azahar_state != ST_MAPPED) {
         return 0;
@@ -231,27 +279,38 @@ static unsigned reback_retarget_guest(int code) {
     for (unsigned n = 0; n < reback_pair_count; n++) {
         const RebackPair *p = &reback_pairs[n];
         for (unsigned w = 0; w < azahar_windows.count; w++) {
-            const AzaharWindow *win = &azahar_windows.w[w];
-            if (p->uva - win->uva >= win->size) {
-                continue;
-            }
-            const uint32_t gva = win->va + (p->uva - win->uva);
-            const int t = l2_for(gva >> 20, 0);
-            if (t < 0) {
-                continue;
-            }
-            uint32_t *const d = &azahar_l2[(unsigned)t * 256u + ((gva >> 12) & 0xFFu)];
-            if ((*d & 2u) && (*d & 0xFFFFF000u) == p->old_pa) {
+            uint32_t *const d = reback_guest_desc(&azahar_windows.w[w], p->uva);
+            if (d != NULL && (*d & 2u) && (*d & 0xFFFFF000u) == p->old_pa) {
                 *d = p->new_pa | (*d & 0xFFFu & ~AZAHAR_ATTR_MASK) | p->attr;
                 changed++;
             }
         }
     }
-    if (changed) {
+    for (unsigned i = 0; i < reback_closed_count; i++) {
+        *reback_closed[i] &= ~(1u << 9);
+    }
+    if (changed || reback_closed_count) {
         // A moved page can hold code.
         tables_changed(code);
     }
+    reback_closed_count = 0;
     return changed;
+}
+
+// azahar_edit_mutex for a move, a return or a flip: the guest descriptors they close, retarget
+// and open are the edits it serialises. The mutex taken (unlock it), or -1 before it exists.
+static SceUID reback_edit_lock(void) {
+    const SceUID m = azahar_edit_mutex;
+    if (m >= 0) {
+        ksceKernelLockMutex(m, 1, NULL);
+    }
+    return m;
+}
+
+static void reback_edit_unlock(SceUID m) {
+    if (m >= 0) {
+        ksceKernelUnlockMutex(m, 1);
+    }
 }
 
 static void reback_moved_insert(uint32_t new_pa, uint32_t attr, uint32_t old_pa,
@@ -400,6 +459,7 @@ int azaharReback(const AzaharRebackRequest *user_req) {
         EXIT_SYSCALL(state);
         return ret;
     }
+    const SceUID edit = reback_edit_lock();
     unsigned moved = 0;
     if (reback_owner != ksceKernelGetProcessId() || req.user_va < reback_base ||
         req.user_va - reback_base + (uint64_t)req.size > (uint64_t)reback_mbs << 20) {
@@ -429,12 +489,19 @@ int azaharReback(const AzaharRebackRequest *user_req) {
             goto out_log;
         }
         reback_pairs[i].uva = req.user_va + i * 0x1000u;
+        reback_pairs[i].old_pa =
+            reback_l2[(req.user_va - reback_base) / 0x1000u + i] & 0xFFFFF000u;
         reback_pairs[i].new_pa = PAR_PA(par);
         reback_pairs[i].attr = attr;
     }
     // The old contents go first, while the app's addresses still reach them: through the cache,
-    // so what a core holds dirty comes along.
+    // so what a core holds dirty comes along. The guest writes neither page meanwhile.
     if (req.flags & AZAHAR_REBACK_COPY) {
+        reback_pair_count = pages;
+        ret = reback_close_guest();
+        if (ret) {
+            goto out_log;
+        }
         for (uint32_t i = 0; i < pages; i++) {
             if (ksceKernelCopyFromUser(reback_copy_buf,
                                        (const void *)(uintptr_t)(req.user_va + i * 0x1000u),
@@ -443,6 +510,9 @@ int azaharReback(const AzaharRebackRequest *user_req) {
                                      reback_copy_buf, 0x1000) < 0) {
                 emit("  reback: copy of user %08x failed\n", req.user_va + i * 0x1000u);
                 ret = AZAHAR_ERR_PAGE;
+                // Nothing moved: the closed descriptors open again.
+                reback_pair_count = 0;
+                reback_retarget_guest(0);
                 goto out_log;
             }
         }
@@ -450,7 +520,6 @@ int azaharReback(const AzaharRebackRequest *user_req) {
     // Our descriptors for the app's pages. The walk sees them after the invalidation below.
     for (uint32_t i = 0; i < pages; i++) {
         uint32_t *d = &reback_l2[(req.user_va - reback_base) / 0x1000u + i];
-        reback_pairs[i].old_pa = *d & 0xFFFFF000u;
         const uint32_t old_attr = *d & AZAHAR_ATTR_MASK;
         *d = reback_host_page(reback_pairs[i].new_pa, reback_pairs[i].attr);
         reback_moved_insert(reback_pairs[i].new_pa, reback_pairs[i].attr, reback_pairs[i].old_pa,
@@ -470,6 +539,7 @@ int azaharReback(const AzaharRebackRequest *user_req) {
 out_log:
     log_close();
 out:
+    reback_edit_unlock(edit);
     reback_unlock();
     EXIT_SYSCALL(state);
     return ret < 0 ? ret : (int)moved;
@@ -488,6 +558,7 @@ int azaharRebackReturn(uint32_t user_va, uint32_t size) {
         EXIT_SYSCALL(state);
         return ret;
     }
+    const SceUID edit = reback_edit_lock();
     unsigned returned = 0;
     if (reback_owner != ksceKernelGetProcessId() || user_va < reback_base ||
         user_va - reback_base + (uint64_t)size > (uint64_t)reback_mbs << 20) {
@@ -509,6 +580,14 @@ int azaharRebackReturn(uint32_t user_va, uint32_t size) {
             ret = AZAHAR_ERR_PAGE;
             goto out_log;
         }
+        reback_pairs[i].uva = user_va + i * 0x1000u;
+        reback_pairs[i].old_pa = d & 0xFFFFF000u;
+    }
+    // The guest writes none of the pool pages until it shows the old pages again.
+    reback_pair_count = pages;
+    ret = reback_close_guest();
+    if (ret) {
+        goto out_log;
     }
 // Page by page: the contents out of the pool page through the app's address, the address
 // back on its old page, the contents in through the cache (overwriting stale lines whole).
@@ -549,6 +628,7 @@ int azaharRebackReturn(uint32_t user_va, uint32_t size) {
 out_log:
     log_close();
 out:
+    reback_edit_unlock(edit);
     reback_unlock();
     EXIT_SYSCALL(state);
     return ret < 0 ? ret : (int)returned;
@@ -568,18 +648,42 @@ int azaharFlip(const AzaharFlipRun *user_runs, uint32_t count) {
         EXIT_SYSCALL(state);
         return ret;
     }
+    const SceUID edit = reback_edit_lock();
     unsigned flipped = 0;
     if (reback_owner != ksceKernelGetProcessId()) {
         ret = AZAHAR_ERR_STATE;
         goto out;
     }
     request_copy(reback_flip_runs, user_runs, count * sizeof(AzaharFlipRun));
+    // The pages whose bytes go along: the guest writes none of them until it shows the new page.
+    reback_pair_count = 0;
+    for (uint32_t r = 0; r < count; r++) {
+        const uint32_t uva = reback_flip_runs[r].user_va & ~0xFFFu;
+        if ((reback_flip_runs[r].user_va & AZAHAR_FLIP_COPY) && uva >= reback_base &&
+            uva - reback_base < reback_mbs << 20) {
+            reback_pairs[reback_pair_count].uva = uva;
+            reback_pairs[reback_pair_count].old_pa =
+                reback_l2[(uva - reback_base) / 0x1000u] & 0xFFFFF000u;
+            reback_pair_count++;
+        }
+    }
+    ret = reback_close_guest();
+    if (ret) {
+        goto out;
+    }
     for (uint32_t r = 0; r < count; r++) {
         const AzaharFlipRun *run = &reback_flip_runs[r];
-        const uint32_t uva = run->user_va;
-        if (((uva | run->version_va) & 0xFFFu) || uva < reback_base ||
-            uva - reback_base >= reback_mbs << 20) {
+        const uint32_t uva = run->user_va & ~0xFFFu;
+        const int copy = (run->user_va & AZAHAR_FLIP_COPY) != 0;
+        if ((((run->user_va & ~AZAHAR_FLIP_COPY) | run->version_va) & 0xFFFu) ||
+            uva < reback_base || uva - reback_base >= reback_mbs << 20) {
             ret = AZAHAR_ERR_ARG;
+            break;
+        }
+        // The bytes out while the app's address shows the page they are on.
+        if (copy && ksceKernelCopyFromUser(reback_copy_buf, (const void *)(uintptr_t)uva,
+                                           0x1000) < 0) {
+            ret = AZAHAR_ERR_PAGE;
             break;
         }
         uint32_t *const d = &reback_l2[(uva - reback_base) / 0x1000u];
@@ -625,13 +729,24 @@ int azaharFlip(const AzaharFlipRun *user_runs, uint32_t count) {
             reback_flipped[f] = reback_flipped[--reback_flipped_count];
         }
         *d = reback_host_page(new_pa, attr);
+        // And in, through the app's address on the new page.
+        if (copy) {
+            reback_tlb_flush_all();
+            if (ksceKernelCopyToUser((void *)(uintptr_t)uva, reback_copy_buf, 0x1000) < 0) {
+                // The page shows the new one already; its bytes are lost.
+                ret = AZAHAR_ERR_PAGE;
+            }
+        }
         reback_pairs[flipped].uva = uva;
         reback_pairs[flipped].old_pa = cur_pa;
         reback_pairs[flipped].new_pa = new_pa;
         reback_pairs[flipped].attr = attr;
         flipped++;
+        if (ret < 0) {
+            break;
+        }
     }
-    if (flipped) {
+    if (flipped || reback_closed_count) {
         reback_tlb_flush_all();
         // The guest's view follows; the GPU's keeps its pages.
         reback_pair_count = flipped;
@@ -642,6 +757,7 @@ int azaharFlip(const AzaharFlipRun *user_runs, uint32_t count) {
     }
 
 out:
+    reback_edit_unlock(edit);
     reback_unlock();
     EXIT_SYSCALL(state);
     return ret;

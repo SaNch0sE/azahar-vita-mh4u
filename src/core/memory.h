@@ -39,20 +39,16 @@ constexpr u32 CITRA_PAGE_MASK = CITRA_PAGE_SIZE - 1;
 constexpr int CITRA_PAGE_BITS = 12;
 constexpr std::size_t PAGE_TABLE_NUM_ENTRIES = 1 << (32 - CITRA_PAGE_BITS);
 
+/// Numbered as savestates store them (PageTable::attributes): 2 and 4 were upstream's rasterizer
+/// cached pages, which nothing marks here (the GPU's holds guard guest memory, HostGuard).
 enum class PageType : u8 {
     /// Page is unmapped and should cause an access error.
-    Unmapped,
+    Unmapped = 0,
     /// Page is mapped to regular memory. This is the only type you can get pointers to.
-    Memory,
-    /// Page is mapped to regular memory, but also needs to check for rasterizer cache flushing and
-    /// invalidation
-    RasterizerCachedMemory,
+    Memory = 1,
     /// Page is mapped to regular memory. Furthermore a debug watchpoint is set to an address within
     /// the page.
-    MemoryWatchpoint,
-    /// Page is mapped to regular memory, but also needs to check for rasterizer cache flushing and
-    /// invalidation. Furthermore a debug watchpoint is set to an address within the page.
-    RasterizerCachedMemoryWatchpoint,
+    MemoryWatchpoint = 3,
 };
 
 /**
@@ -290,14 +286,6 @@ enum : VAddr {
     PLUGIN_3GX_FB_VADDR_END = PLUGIN_3GX_FB_VADDR + PLUGIN_3GX_FB_SIZE
 };
 
-enum class FlushMode {
-    /// Write back modified surfaces to RAM
-    Flush,
-    /// Remove region from the cache
-    Invalidate,
-    /// Write back modified surfaces to RAM, and also remove them from the cache
-    FlushAndInvalidate,
-};
 
 /**
  * Notified whenever the emulated process's mappings change.
@@ -341,6 +329,10 @@ struct HostGuard {
     /// A read by the GPU's own side (GuardPhysicalRead), within one page: it waits for the queued
     /// GPU writes over those bytes whatever the guest's view of the page.
     std::function<void(const u8* host, u32 size)> gpu_read;
+    /// The HLE writes these pages (each page's address in the emulator's view) later, through
+    /// pointers of its own (GuardAsyncWrite); `done` waits until it has.
+    std::function<void(const std::vector<const u8*>& pages, std::function<void()> done)>
+        async_write;
 };
 
 class MemorySystem {
@@ -359,6 +351,24 @@ public:
      * DMA may still be writing.
      */
     void GuardPhysicalRead(PAddr address, u32 size);
+    /**
+     * The HLE is about to write [addr, addr + size) of the current process's memory through
+     * pointers of its own, later or from another thread (Y2R's worker): each held page is handed
+     * to HostGuard::access as a write now, as WriteBlock's are before it writes, and the pages
+     * to HostGuard::async_write with `done`, which waits for those writes: a page the holds
+     * would copy elsewhere meanwhile (a page version) runs it first. A framebuffer an LCD shows
+     * there has the next vblank present it (GPU::ScreensWritten).
+     */
+    void GuardAsyncWrite(VAddr addr, u32 size, std::function<void()> done);
+    /**
+     * The HLE reads (or with write, writes) [addr, addr + size) of the current process's memory
+     * through pointers of its own (GetPointer), right after this, on this thread: each held page
+     * is handed to HostGuard::access first, as ReadBlock's and WriteBlock's are, so that the
+     * access waits for the GPU's queued work there, takes a page version or gets a picture's rows
+     * first, and a write marks the textures over it written; a write into a framebuffer an LCD
+     * shows has the next vblank present it (GPU::ScreensWritten).
+     */
+    void HleAccess(VAddr addr, u32 size, bool write);
 
     /**
      * Registers the observer notified of mapping changes to the active page table. Only one
@@ -765,30 +775,6 @@ public:
     void CopyBlock(const Kernel::Process& dest_process, const Kernel::Process& src_process,
                    VAddr dest_addr, VAddr src_addr, std::size_t size);
 
-    /**
-     * Marks each page within the specified address range as cached or uncached.
-     *
-     * @param vaddr  The virtual address indicating the start of the address range.
-     * @param size   The size of the address range in bytes.
-     * @param cached Whether or not any pages within the address range should be
-     *               marked as cached or uncached.
-     */
-    void RasterizerMarkRegionCached(PAddr start, u32 size, bool cached);
-
-    /**
-     * Disables RasterizerMarkRegionCached. With rendering on its own thread the cache would be
-     * flipping page attributes that the emulation thread and the native mirror are reading
-     * concurrently — and under the native CPU backend the interception it buys never fires for
-     * guest writes anyway.
-     */
-    void SetRasterizerCacheMarkingEnabled(bool enabled);
-
-    /// Whether a guest CPU write into a cached page still reaches the rasterizer cache.
-    [[nodiscard]] bool RasterizerCacheMarkingEnabled() const;
-
-    /// For a rasterizer-accessible PAddr, gets a list of all possible VAddr
-    std::vector<VAddr> PhysicalToVirtualAddressForRasterizer(PAddr addr);
-
     /// Gets a pointer to the memory region beginning at the specified physical address.
     u8* GetPhysicalPointer(PAddr address);
 
@@ -813,16 +799,13 @@ public:
     /// Gets a serializable ref to FCRAM with the given offset
     MemoryRef GetFCRAMRef(std::size_t offset) const;
 
-    /// Registers page table for rasterizer cache marking
+    /// The processes' page tables, in a list the savestate stores (upstream's rasterizer cache
+    /// marked their pages through it).
     void RegisterPageTable(std::shared_ptr<PageTable> page_table);
-
-    /// Unregisters page table for rasterizer cache marking
     void UnregisterPageTable(std::shared_ptr<PageTable> page_table);
 
     /// Gets pointer to DSP shared memory with given offset
     u8* GetDspMemory(std::size_t offset) const;
-
-    void RasterizerFlushVirtualRegion(VAddr start, u32 size, FlushMode mode);
 
     /// Returns a reference to the framebuffer address of the currently loaded 3GX plugin.
     PAddr& Plugin3GXFramebufferAddress();
@@ -843,14 +826,6 @@ private:
 
     template <typename T>
     bool WriteExclusive(const VAddr vaddr, const T data, const T expected);
-
-    /**
-     * Gets the pointer for virtual memory where the page is marked as RasterizerCachedMemory.
-     * This is used to access the memory where the page pointer is nullptr due to rasterizer cache.
-     * Since the cache only happens on linear heap or VRAM, we know the exact physical address and
-     * pointer of such virtual address
-     */
-    MemoryRef GetPointerForRasterizerCache(VAddr addr) const;
 
 public:
     class PhysMemRegionInfo {

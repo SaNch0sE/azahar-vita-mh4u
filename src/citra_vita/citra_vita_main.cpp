@@ -1645,36 +1645,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     // the slices ended, the svcs answered in the guest, and the svcs that left
                     // it, most frequent first.
                     const auto n = Core::TakeVitaNativeCensus();
-                    // The store permits made by what their slot held before, and the sites of
-                    // stores the module left to the app on a live permit (pc:instruction count).
-                    std::string live_sites;
-                    for (const auto& site : n.permits_live_sites) {
-                        if (site[2] != 0) {
-                            fmt::format_to(std::back_inserter(live_sites), " {:08x}:{:08x} {}",
-                                           site[0], site[1], site[2]);
-                        }
-                    }
-                    auto store_pages = n.permitted_store_pages;
-                    std::sort(store_pages.begin(), store_pages.end(),
-                              [](const auto& a, const auto& b) { return a[1] > b[1]; });
-                    for (const auto& page : store_pages) {
-                        if (page[1] != 0) {
-                            fmt::format_to(std::back_inserter(live_sites), " page {:#010x} {}",
-                                           page[0] << 12, page[1]);
-                        }
-                    }
-                    LOG_INFO(Frontend,
-                             "perf: store permits made after none {}, another page's {}, the "
-                             "page's used up {}, the page's live {}; all cleared {} times;{}",
-                             n.permits_after_none, n.permits_after_other, n.permits_after_used,
-                             n.permits_after_live, n.permit_clears, live_sites);
                     const double tick_ms = BASE_CLOCK_RATE_ARM11 / 1e3;
                     LOG_INFO(
                         Frontend,
                         "perf: guest {:.1f} ms, azaharRun {:.1f} ms, {} slices: svc {}, "
                         "timer {}, faults {} (VFP short vectors {} in {}, loads past held "
-                        "bytes {}, stores {} (permits {}, {} stores made by them in the "
-                        "vector), {} past the budget left to wait; sites patched to "
+                        "bytes {}, stores {} (of both, Thumb {}), {} past the budget left to wait; sites "
+                        "patched to "
                         "a thunk {}, to the svc {}); svc sites patched to a thunk {}; "
                         "upcall sites {} (Thumb {}) runs {} redirected {} rescheduled {} "
                         "switched {} idled {} ({} events, {} exits, {} for core 1, {} for the "
@@ -1690,7 +1667,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         n.reasons[AZAHAR_EXIT_SVC], n.reasons[AZAHAR_EXIT_TIMER],
                         n.slices - n.reasons[AZAHAR_EXIT_SVC] - n.reasons[AZAHAR_EXIT_TIMER],
                         n.vfp_insns, n.vfp_exits, n.hold_loads, n.hold_stores, n.hold_thumb,
-                        n.store_permits, n.permitted_stores, n.hold_load_waits, n.vfp_thunks, n.vfp_svcs,
+                        n.hold_load_waits, n.vfp_thunks, n.vfp_svcs,
                         n.svc_thunks,
                         n.upcall_sites, n.upcall_thumb_sites, n.upcall_runs, n.upcall_redirects,
                         n.upcall_reschedules, n.upcall_switches, n.upcall_idles,
@@ -1936,14 +1913,15 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              "{} pages held, {} let go; guest aborts {} ({} versioned, {} "
                              "waited, {:.1f} ms; {} geometry pages moved; {} list pages copied "
                              "for the parse thread, {} waits for a parse ({:.1f} ms)), "
-                             "HLE waits {} ({:.1f} ms), vblank waits {} ({:.1f} ms)",
+                             "HLE waits {} ({:.1f} ms), HLE writes past the holds {}, onto a "
+                             "version {}",
                              hs.holds.calls, hs.holds.runs, hs.holds.descriptors,
                              hs.holds.held_pages, hs.holds.released_pages, hs.faults,
                              hs.versioned_faults, hs.fault_waits, hs.fault_wait_us / 1e3,
                              hs.geometry_moves, hs.parse_copies, hs.parse_waits,
                              hs.parse_wait_us / 1e3,
-                             hs.host_waits, hs.host_wait_us / 1e3, hs.vblank_waits,
-                             hs.vblank_wait_us / 1e3);
+                             hs.host_waits, hs.host_wait_us / 1e3, hs.host_past,
+                             hs.host_versions);
                     // Page versions: azaharFlip's calls, the pages that got a second slot,
                     // the swaps, the writes in place (with queued work reading the guest's slot,
                     // and with none), the remaps at frame starts and before a same-frame use,

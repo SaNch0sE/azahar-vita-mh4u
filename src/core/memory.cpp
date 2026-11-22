@@ -119,38 +119,10 @@ void PageTable::Clear() {
     attributes.fill(PageType::Unmapped);
 }
 
-class RasterizerCacheMarker {
-public:
-    void Mark(VAddr addr, bool cached) {
-        bool* p = At(addr);
-        if (p)
-            *p = cached;
-    }
-
-    bool IsCached(VAddr addr) {
-        bool* p = At(addr);
-        if (p)
-            return *p;
-        return false;
-    }
-
-private:
-    bool* At(VAddr addr) {
-        if (addr >= VRAM_VADDR && addr < VRAM_VADDR_END) {
-            return &vram[(addr - VRAM_VADDR) / CITRA_PAGE_SIZE];
-        }
-        if (addr >= LINEAR_HEAP_VADDR && addr < LINEAR_HEAP_VADDR_END) {
-            return &linear_heap[(addr - LINEAR_HEAP_VADDR) / CITRA_PAGE_SIZE];
-        }
-        if (addr >= NEW_LINEAR_HEAP_VADDR && addr < NEW_LINEAR_HEAP_VADDR_END) {
-            return &new_linear_heap[(addr - NEW_LINEAR_HEAP_VADDR) / CITRA_PAGE_SIZE];
-        }
-        if (addr >= PLUGIN_3GX_FB_VADDR && addr < PLUGIN_3GX_FB_VADDR_END) {
-            return &plugin_fb[(addr - PLUGIN_3GX_FB_VADDR) / CITRA_PAGE_SIZE];
-        }
-        return nullptr;
-    }
-
+/// Upstream's rasterizer cache marks (a page of VRAM or a linear heap the cache held, its CPU
+/// accesses sent to the rasterizer): no page is ever marked here, the GPU's holds guard guest
+/// memory instead (HostGuard). Kept, all clear, for the savestate format, which has them.
+class OldCacheMarks {
     std::array<bool, VRAM_SIZE / CITRA_PAGE_SIZE> vram{};
     std::array<bool, LINEAR_HEAP_SIZE / CITRA_PAGE_SIZE> linear_heap{};
     std::array<bool, NEW_LINEAR_HEAP_SIZE / CITRA_PAGE_SIZE> new_linear_heap{};
@@ -188,14 +160,10 @@ public:
     Common::HostSharedMemory dsp_ram{Memory::DSP_RAM_SIZE, "azahar-dsp-ram"};
 
     MappingObserver* mapping_observer{};
-    bool rasterizer_marking_enabled = true;
     HostGuard host_guard;
 
-    /// HostGuard's check of [host, host + size), within one guest page.
-    void Guard(const u8* host, std::size_t size, bool write) {
-        if (host_guard.held == nullptr) {
-            return;
-        }
+    /// Whether the guest's view of the page at host (FCRAM's or VRAM's) is held (HostGuard::held).
+    bool Held(const u8* host) const {
         const uintptr_t h = reinterpret_cast<uintptr_t>(host);
         const uintptr_t f = h - reinterpret_cast<uintptr_t>(fcram.Data());
         u32 page;
@@ -204,18 +172,68 @@ public:
         } else {
             const uintptr_t v = h - reinterpret_cast<uintptr_t>(vram.Data());
             if (v >= vram.Size()) {
-                return;
+                return false;
             }
             page = static_cast<u32>((fcram.Size() + v) >> CITRA_PAGE_BITS);
         }
-        if (host_guard.held[page] != 0) {
+        return host_guard.held[page] != 0;
+    }
+
+    /// HostGuard's check of [host, host + size), within one guest page.
+    void Guard(const u8* host, std::size_t size, bool write) {
+        if (host_guard.held != nullptr && Held(host)) {
             host_guard.access(host, static_cast<u32>(size), write);
         }
     }
 
+    /// The current process's [addr, addr + size) to HostGuard::access, a call a run of pages
+    /// contiguous in the emulator's view (a linear heap's, VRAM's) where any of them is held: the
+    /// GPU side takes the run's pages in one go (one azaharHold for their guest view's changes).
+    /// Each page's emulator pointer goes to `each` too.
+    template <typename Each>
+    void GuardRuns(VAddr addr, u32 size, bool write, Each&& each) {
+        if (host_guard.held == nullptr) {
+            return;
+        }
+        auto& page_table = *current_page_table;
+        const u8* run = nullptr;
+        u32 run_bytes = 0;
+        bool run_held = false;
+        const auto send = [&] {
+            if (run_held) {
+                host_guard.access(run, run_bytes, write);
+            }
+            run = nullptr;
+            run_bytes = 0;
+            run_held = false;
+        };
+        const VAddr end = addr + size;
+        for (VAddr at = addr; at < end;) {
+            const VAddr page_end = (at & ~CITRA_PAGE_MASK) + CITRA_PAGE_SIZE;
+            const u32 bytes = std::min(end, page_end) - at;
+            const std::size_t index = at >> CITRA_PAGE_BITS;
+            if (page_table.attributes[index] == PageType::Memory) {
+                const u8* const host = page_table.pointers[index] + (at & CITRA_PAGE_MASK);
+                if (run != nullptr && run + run_bytes != host) {
+                    send();
+                }
+                if (run == nullptr) {
+                    run = host;
+                }
+                run_bytes += bytes;
+                run_held = run_held || Held(host);
+                each(page_table.pointers[index]);
+            } else {
+                send();
+            }
+            at += bytes;
+        }
+        send();
+    }
+
     Core::System& system;
     std::shared_ptr<PageTable> current_page_table = nullptr;
-    RasterizerCacheMarker cache_marker;
+    OldCacheMarks old_cache_marks;
     std::vector<std::shared_ptr<PageTable>> page_table_list;
 
     std::shared_ptr<BackingMem> fcram_mem;
@@ -284,7 +302,6 @@ public:
         return system.IsPoweredOn() ? system.GetRunningCore().GetPC() : 0;
     }
 
-    template <bool UNSAFE>
     void ReadBlockImpl(const Kernel::Process& process, const VAddr src_addr, void* dest_buffer,
                        const std::size_t size) {
         auto& page_table = *process.vm_manager.page_table;
@@ -325,15 +342,6 @@ public:
                 std::memcpy(dest_buffer, src_ptr, copy_amount);
                 break;
             }
-            case PageType::RasterizerCachedMemory:
-            case PageType::RasterizerCachedMemoryWatchpoint: {
-                if constexpr (!UNSAFE) {
-                    RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
-                                                 FlushMode::Flush);
-                }
-                std::memcpy(dest_buffer, GetPointerForRasterizerCache(current_vaddr), copy_amount);
-                break;
-            }
             default:
                 UNREACHABLE();
             }
@@ -345,7 +353,6 @@ public:
         }
     }
 
-    template <bool UNSAFE>
     void WriteBlockImpl(const Kernel::Process& process, const VAddr dest_addr,
                         const void* src_buffer, const std::size_t size) {
         auto& page_table = *process.vm_manager.page_table;
@@ -384,15 +391,6 @@ public:
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
                 break;
             }
-            case PageType::RasterizerCachedMemory:
-            case PageType::RasterizerCachedMemoryWatchpoint: {
-                if constexpr (!UNSAFE) {
-                    RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
-                                                 FlushMode::Invalidate);
-                }
-                std::memcpy(GetPointerForRasterizerCache(current_vaddr), src_buffer, copy_amount);
-                break;
-            }
             default:
                 UNREACHABLE();
             }
@@ -404,58 +402,24 @@ public:
         }
     }
 
-    MemoryRef GetPointerForRasterizerCache(VAddr addr) const {
-        if (addr >= LINEAR_HEAP_VADDR && addr < LINEAR_HEAP_VADDR_END) {
-            return {fcram_mem, addr - LINEAR_HEAP_VADDR};
-        }
-        if (addr >= NEW_LINEAR_HEAP_VADDR && addr < NEW_LINEAR_HEAP_VADDR_END) {
-            return {fcram_mem, addr - NEW_LINEAR_HEAP_VADDR};
-        }
-        if (addr >= VRAM_VADDR && addr < VRAM_VADDR_END) {
-            return {vram_mem, addr - VRAM_VADDR};
-        }
-        if (addr >= PLUGIN_3GX_FB_VADDR && addr < PLUGIN_3GX_FB_VADDR_END && plugin_fb_address) {
-            return {fcram_mem, addr - PLUGIN_3GX_FB_VADDR + plugin_fb_address - FCRAM_PADDR};
-        }
-
-        UNREACHABLE();
-        return MemoryRef{};
-    }
-
-    void RasterizerFlushVirtualRegion(VAddr start, u32 size, FlushMode mode) {
+    /// The HLE wrote [start, start + size) of the guest's memory: a framebuffer an LCD shows
+    /// there has the next vblank present it (GPU::ScreensWritten), the GPU doing nothing new.
+    void ScreensWritten(VAddr start, u32 size) {
         const VAddr end = start + size;
-
-        auto CheckRegion = [&](VAddr region_start, VAddr region_end, PAddr paddr_region_start) {
+        const auto check = [&](VAddr region_start, VAddr region_end, PAddr paddr_region_start) {
             if (start >= region_end || end <= region_start) {
-                // No overlap with region
                 return;
             }
-
-            // Through the GPU: the rasterizer it calls may be the render thread's queue (sgxd).
-            auto& gpu = system.GPU();
-            VAddr overlap_start = std::max(start, region_start);
-            VAddr overlap_end = std::min(end, region_end);
-            PAddr physical_start = paddr_region_start + (overlap_start - region_start);
-            u32 overlap_size = overlap_end - overlap_start;
-
-            switch (mode) {
-            case FlushMode::Flush:
-                gpu.FlushRegion(physical_start, overlap_size);
-                break;
-            case FlushMode::Invalidate:
-                gpu.InvalidateRegion(physical_start, overlap_size);
-                break;
-            case FlushMode::FlushAndInvalidate:
-                gpu.FlushAndInvalidateRegion(physical_start, overlap_size);
-                break;
-            }
+            const VAddr overlap_start = std::max(start, region_start);
+            const VAddr overlap_end = std::min(end, region_end);
+            system.GPU().ScreensWritten(paddr_region_start + (overlap_start - region_start),
+                                        overlap_end - overlap_start);
         };
-
-        CheckRegion(LINEAR_HEAP_VADDR, LINEAR_HEAP_VADDR_END, FCRAM_PADDR);
-        CheckRegion(NEW_LINEAR_HEAP_VADDR, NEW_LINEAR_HEAP_VADDR_END, FCRAM_PADDR);
-        CheckRegion(VRAM_VADDR, VRAM_VADDR_END, VRAM_PADDR);
+        check(LINEAR_HEAP_VADDR, LINEAR_HEAP_VADDR_END, FCRAM_PADDR);
+        check(NEW_LINEAR_HEAP_VADDR, NEW_LINEAR_HEAP_VADDR_END, FCRAM_PADDR);
+        check(VRAM_VADDR, VRAM_VADDR_END, VRAM_PADDR);
         if (plugin_fb_address) {
-            CheckRegion(PLUGIN_3GX_FB_VADDR, PLUGIN_3GX_FB_VADDR_END, plugin_fb_address);
+            check(PLUGIN_3GX_FB_VADDR, PLUGIN_3GX_FB_VADDR_END, plugin_fb_address);
         }
     }
 
@@ -476,7 +440,7 @@ private:
         ar& boost::serialization::make_binary_object(n3ds_extra_ram.Data(),
                                                      n3ds_extra_ram.Size());
         ar& boost::serialization::make_binary_object(dsp_ram.Data(), Memory::DSP_RAM_SIZE);
-        ar & cache_marker;
+        ar & old_cache_marks;
         ar & page_table_list;
         // dsp is set from Core::System at startup
         ar & current_page_table;
@@ -557,8 +521,11 @@ std::shared_ptr<PageTable> MemorySystem::GetCurrentPageTable() const {
     return impl->current_page_table;
 }
 
-void MemorySystem::RasterizerFlushVirtualRegion(VAddr start, u32 size, FlushMode mode) {
-    impl->RasterizerFlushVirtualRegion(start, size, mode);
+void MemorySystem::HleAccess(VAddr addr, u32 size, bool write) {
+    impl->GuardRuns(addr, size, write, [](const u8*) {});
+    if (write) {
+        impl->ScreensWritten(addr, size);
+    }
 }
 
 void MemorySystem::SetHostGuard(HostGuard guard) {
@@ -569,6 +536,16 @@ void MemorySystem::HostRemapped(const u8* host, u32 size) {
     if (impl->host_guard.remapped) {
         impl->host_guard.remapped(host, size);
     }
+}
+
+void MemorySystem::GuardAsyncWrite(VAddr addr, u32 size, std::function<void()> done) {
+    if (!impl->host_guard.async_write) {
+        return;
+    }
+    std::vector<const u8*> pages;
+    impl->GuardRuns(addr, size, true, [&](const u8* page) { pages.push_back(page); });
+    impl->ScreensWritten(addr, size);
+    impl->host_guard.async_write(pages, std::move(done));
 }
 
 void MemorySystem::GuardPhysicalRead(PAddr address, u32 size) {
@@ -614,10 +591,6 @@ void MemorySystem::RegisterWatchpoint(const Kernel::Process& process, VAddr addr
                 type = PageType::MemoryWatchpoint;
                 page_table.pointers[page_index] = nullptr;
                 break;
-            case PageType::RasterizerCachedMemory:
-                mem = GetPointerForRasterizerCache(page_base);
-                type = PageType::RasterizerCachedMemoryWatchpoint;
-                break;
             default:
                 LOG_ERROR(HW_Memory, "Cannot get pointer to register watchpoint for page 0x{:08X}",
                           page_base);
@@ -654,9 +627,6 @@ void MemorySystem::UnregisterWatchpoint(const Kernel::Process& process, VAddr ad
                     type = PageType::Memory;
                     page_table.pointers[page_index] = it->second.memory;
                     break;
-                case PageType::RasterizerCachedMemoryWatchpoint:
-                    type = PageType::RasterizerCachedMemory;
-                    break;
                 default:
                     LOG_ERROR(HW_Memory, "Invalid watchpoint page type for page 0x{:08X}: {}",
                               page_base, static_cast<u8>(type));
@@ -677,11 +647,6 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
     LOG_DEBUG(HW_Memory, "Mapping {} onto {:08X}-{:08X}", (void*)memory.GetPtr(),
               base * CITRA_PAGE_SIZE, (base + size) * CITRA_PAGE_SIZE);
 
-    if (impl->system.IsPoweredOn()) {
-        RasterizerFlushVirtualRegion(base << CITRA_PAGE_BITS, size * CITRA_PAGE_SIZE,
-                                     FlushMode::FlushAndInvalidate);
-    }
-
     const u32 first = base;
     u32 end = base + size;
     while (base != end) {
@@ -689,12 +654,6 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
 
         page_table.attributes[base] = type;
         page_table.pointers[base] = memory;
-
-        // If the memory to map is already rasterizer-cached, mark the page
-        if (type == PageType::Memory && impl->cache_marker.IsCached(base * CITRA_PAGE_SIZE)) {
-            page_table.attributes[base] = PageType::RasterizerCachedMemory;
-            page_table.pointers[base] = nullptr;
-        }
 
         base += 1;
         if (memory != nullptr && memory.GetSize() > CITRA_PAGE_SIZE)
@@ -789,9 +748,6 @@ void MemorySystem::UnmapRegion(PageTable& page_table, VAddr base, u32 size) {
              PageType::Unmapped);
 }
 
-MemoryRef MemorySystem::GetPointerForRasterizerCache(VAddr addr) const {
-    return impl->GetPointerForRasterizerCache(addr);
-}
 
 void MemorySystem::RegisterPageTable(std::shared_ptr<PageTable> page_table) {
     impl->page_table_list.push_back(page_table);
@@ -890,27 +846,6 @@ T MemorySystem::Read(const std::shared_ptr<PageTable>& page_table, const VAddr v
 
         return value;
     }
-    [[likely]] case PageType::RasterizerCachedMemory: {
-        RasterizerFlushVirtualRegion(vaddr, read_size, FlushMode::Flush);
-
-        ReadType value;
-        std::memcpy(&value, GetPointerForRasterizerCache(vaddr), read_size);
-        return value;
-    }
-    case PageType::RasterizerCachedMemoryWatchpoint: {
-        RasterizerFlushVirtualRegion(vaddr, read_size, FlushMode::Flush);
-
-        ReadType value;
-        std::memcpy(&value, GetPointerForRasterizerCache(vaddr), read_size);
-
-#ifdef ENABLE_GDBSTUB
-        if (GDBStub::CheckBreakpoint(vaddr, read_size, GDBStub::BreakpointType::Read)) {
-            GDBStub::Break(SIGTRAP);
-        }
-#endif
-
-        return value;
-    }
     default:
         UNREACHABLE();
     }
@@ -978,23 +913,6 @@ void MemorySystem::Write(const std::shared_ptr<PageTable>& page_table, const VAd
 
         break;
     }
-    [[likely]] case PageType::RasterizerCachedMemory: {
-        RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
-        std::memcpy(GetPointerForRasterizerCache(vaddr), &data, sizeof(T));
-        break;
-    }
-    case PageType::RasterizerCachedMemoryWatchpoint: {
-        RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
-        std::memcpy(GetPointerForRasterizerCache(vaddr), &data, sizeof(T));
-
-#ifdef ENABLE_GDBSTUB
-        if (GDBStub::CheckBreakpoint(vaddr, sizeof(T), GDBStub::BreakpointType::Write)) {
-            GDBStub::Break(SIGTRAP);
-        }
-#endif
-
-        break;
-    }
     default:
         UNREACHABLE();
     }
@@ -1036,25 +954,6 @@ bool MemorySystem::WriteExclusive(const VAddr vaddr, const T data, const T expec
 
         return ret;
     }
-    [[likely]] case PageType::RasterizerCachedMemory: {
-        RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
-        const auto volatile_pointer =
-            reinterpret_cast<volatile T*>(GetPointerForRasterizerCache(vaddr).GetPtr());
-        return Common::AtomicCompareAndSwap(volatile_pointer, data, expected);
-    }
-    case PageType::RasterizerCachedMemoryWatchpoint: {
-        RasterizerFlushVirtualRegion(vaddr, sizeof(T), FlushMode::Invalidate);
-        const auto volatile_pointer =
-            reinterpret_cast<volatile T*>(GetPointerForRasterizerCache(vaddr).GetPtr());
-
-#ifdef ENABLE_GDBSTUB
-        if (GDBStub::CheckBreakpoint(vaddr, sizeof(T), GDBStub::BreakpointType::Write)) {
-            GDBStub::Break(SIGTRAP);
-        }
-#endif
-
-        return Common::AtomicCompareAndSwap(volatile_pointer, data, expected);
-    }
     default:
         UNREACHABLE();
     }
@@ -1086,13 +985,6 @@ u8* MemorySystem::GetPointer(const VAddr vaddr) {
         return page_pointer + (vaddr & CITRA_PAGE_MASK);
     }
 
-    if (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
-            PageType::RasterizerCachedMemory ||
-        impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
-            PageType::RasterizerCachedMemoryWatchpoint) {
-        return GetPointerForRasterizerCache(vaddr);
-    }
-
     LOG_ERROR(HW_Memory, "unknown GetPointer @ 0x{:08x} at PC 0x{:08X}", vaddr, impl->GetPC());
     return nullptr;
 }
@@ -1101,13 +993,6 @@ const u8* MemorySystem::GetPointer(const VAddr vaddr) const {
     const u8* page_pointer = impl->current_page_table->pointers[vaddr >> CITRA_PAGE_BITS];
     if (page_pointer) {
         return page_pointer + (vaddr & CITRA_PAGE_MASK);
-    }
-
-    if (impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
-            PageType::RasterizerCachedMemory ||
-        impl->current_page_table->attributes[vaddr >> CITRA_PAGE_BITS] ==
-            PageType::RasterizerCachedMemoryWatchpoint) {
-        return GetPointerForRasterizerCache(vaddr);
     }
 
     LOG_ERROR(HW_Memory, "unknown GetPointer @ 0x{:08x}", vaddr);
@@ -1199,98 +1084,6 @@ MemoryRef MemorySystem::GetPhysicalRef(PAddr address) {
     return {*target_mem.backing_mem, offset_into_region};
 }
 
-std::vector<VAddr> MemorySystem::PhysicalToVirtualAddressForRasterizer(PAddr addr) {
-    if (addr >= VRAM_PADDR && addr < VRAM_PADDR_END) {
-        return {addr - VRAM_PADDR + VRAM_VADDR};
-    }
-    // NOTE: Order matters here.
-    PAddr plg_fb_addr = Plugin3GXFramebufferAddress();
-    if (plg_fb_addr && addr >= plg_fb_addr && addr < plg_fb_addr + PLUGIN_3GX_FB_SIZE) {
-        return {addr - plg_fb_addr + PLUGIN_3GX_FB_VADDR};
-    }
-    if (addr >= FCRAM_PADDR && addr < FCRAM_PADDR_END) {
-        return {addr - FCRAM_PADDR + LINEAR_HEAP_VADDR, addr - FCRAM_PADDR + NEW_LINEAR_HEAP_VADDR};
-    }
-    if (addr >= FCRAM_PADDR_END && addr < FCRAM_N3DS_PADDR_END) {
-        return {addr - FCRAM_PADDR + NEW_LINEAR_HEAP_VADDR};
-    }
-    // While the physical <-> virtual mapping is 1:1 for the regions supported by the cache,
-    // some games (like Pokemon Super Mystery Dungeon) will try to use textures that go beyond
-    // the end address of VRAM, causing the Virtual->Physical translation to fail when flushing
-    // parts of the texture.
-    LOG_ERROR(HW_Memory,
-              "Trying to use invalid physical address for rasterizer: {:08X} at PC 0x{:08X}", addr,
-              impl->GetPC());
-    return {};
-}
-
-void MemorySystem::SetRasterizerCacheMarkingEnabled(bool enabled) {
-    impl->rasterizer_marking_enabled = enabled;
-}
-
-bool MemorySystem::RasterizerCacheMarkingEnabled() const {
-    return impl->rasterizer_marking_enabled;
-}
-
-void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached) {
-    if (start == 0 || !impl->rasterizer_marking_enabled) {
-        return;
-    }
-
-    u32 num_pages = ((start + size - 1) >> CITRA_PAGE_BITS) - (start >> CITRA_PAGE_BITS) + 1;
-    PAddr paddr = start;
-
-    for (unsigned i = 0; i < num_pages; ++i, paddr += CITRA_PAGE_SIZE) {
-        for (VAddr vaddr : PhysicalToVirtualAddressForRasterizer(paddr)) {
-            impl->cache_marker.Mark(vaddr, cached);
-            for (auto& page_table : impl->page_table_list) {
-                PageType& page_type = page_table->attributes[vaddr >> CITRA_PAGE_BITS];
-
-                if (cached) {
-                    // Switch page type to cached if now cached
-                    switch (page_type) {
-                    case PageType::Unmapped:
-                        // It is not necessary for a process to have this region mapped into its
-                        // address space, for example, a system module need not have a VRAM mapping.
-                        break;
-                    case PageType::Memory:
-                    case PageType::MemoryWatchpoint:
-                        page_type = (page_type == PageType::Memory)
-                                        ? PageType::RasterizerCachedMemory
-                                        : PageType::RasterizerCachedMemoryWatchpoint;
-                        page_table->pointers[vaddr >> CITRA_PAGE_BITS] = nullptr;
-                        break;
-                    default:
-                        UNREACHABLE();
-                    }
-                } else {
-                    // Switch page type to uncached if now uncached
-                    switch (page_type) {
-                    case PageType::Unmapped:
-                        // It is not necessary for a process to have this region mapped into its
-                        // address space, for example, a system module need not have a VRAM mapping.
-                        break;
-                    case PageType::RasterizerCachedMemory:
-                    case PageType::RasterizerCachedMemoryWatchpoint: {
-                        page_type = (page_type == PageType::RasterizerCachedMemory)
-                                        ? PageType::Memory
-                                        : PageType::MemoryWatchpoint;
-
-                        if (page_type == PageType::Memory) {
-                            page_table->pointers[vaddr >> CITRA_PAGE_BITS] =
-                                GetPointerForRasterizerCache(vaddr & ~CITRA_PAGE_MASK);
-                        }
-                        break;
-                    }
-                    default:
-                        UNREACHABLE();
-                    }
-                }
-            }
-        }
-    }
-}
-
 u8 MemorySystem::Read8(const VAddr addr) {
     return Read<u8>(impl->current_page_table, addr);
 }
@@ -1333,12 +1126,12 @@ std::optional<u32> MemorySystem::Read32OrNullopt(const Kernel::Process& process,
 
 void MemorySystem::ReadBlock(const Kernel::Process& process, const VAddr src_addr,
                              void* dest_buffer, const std::size_t size) {
-    return impl->ReadBlockImpl<false>(process, src_addr, dest_buffer, size);
+    return impl->ReadBlockImpl(process, src_addr, dest_buffer, size);
 }
 
 void MemorySystem::ReadBlock(VAddr src_addr, void* dest_buffer, std::size_t size) {
     const auto& process = *impl->system.Kernel().GetCurrentProcess();
-    return impl->ReadBlockImpl<false>(process, src_addr, dest_buffer, size);
+    return impl->ReadBlockImpl(process, src_addr, dest_buffer, size);
 }
 
 void MemorySystem::Write8(const VAddr addr, const u8 data) {
@@ -1391,13 +1184,13 @@ bool MemorySystem::WriteExclusive64(const VAddr addr, const u64 data, const u64 
 
 void MemorySystem::WriteBlock(const Kernel::Process& process, const VAddr dest_addr,
                               const void* src_buffer, const std::size_t size) {
-    return impl->WriteBlockImpl<false>(process, dest_addr, src_buffer, size);
+    return impl->WriteBlockImpl(process, dest_addr, src_buffer, size);
 }
 
 void MemorySystem::WriteBlock(const VAddr dest_addr, const void* src_buffer,
                               const std::size_t size) {
     auto& process = *impl->system.Kernel().GetCurrentProcess();
-    return impl->WriteBlockImpl<false>(process, dest_addr, src_buffer, size);
+    return impl->WriteBlockImpl(process, dest_addr, src_buffer, size);
 }
 
 void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_addr,
@@ -1435,13 +1228,6 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
 
             u8* dest_ptr = it->second.memory.GetPtr() + page_offset;
             std::memset(dest_ptr, 0, copy_amount);
-            break;
-        }
-        case PageType::RasterizerCachedMemory:
-        case PageType::RasterizerCachedMemoryWatchpoint: {
-            RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
-                                         FlushMode::Invalidate);
-            std::memset(GetPointerForRasterizerCache(current_vaddr), 0, copy_amount);
             break;
         }
         default:
@@ -1495,14 +1281,6 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
 
             const u8* src_ptr = it->second.memory.GetPtr() + page_offset;
             WriteBlock(dest_process, dest_addr, src_ptr, copy_amount);
-            break;
-        }
-        case PageType::RasterizerCachedMemory:
-        case PageType::RasterizerCachedMemoryWatchpoint: {
-            RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
-                                         FlushMode::Flush);
-            WriteBlock(dest_process, dest_addr, GetPointerForRasterizerCache(current_vaddr),
-                       copy_amount);
             break;
         }
         default:

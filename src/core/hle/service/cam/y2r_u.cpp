@@ -528,12 +528,15 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
     // dst_image_size would seem to be perfect for this, but it doesn't include the gap :(
     u32 total_output_size =
         conversion.input_lines * (conversion.dst.transfer_unit + conversion.dst.gap);
-    system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
-                                                 Memory::FlushMode::FlushAndInvalidate);
 
     // On the worker, its buffers resolved here, where the page table is the guest's; one still
     // running finishes first (the unit converts one at a time).
     WaitConversion();
+    // The output written as the HLE's write onto the GPU's held pages (each takes a page version
+    // or waits for the queued GPU work that reads it, as a file read's would), and until the
+    // worker is done, no version of a page of it is taken before its writes.
+    system.Memory().GuardAsyncWrite(conversion.dst.address, total_output_size,
+                                    [this] { WaitConversion(); });
     QueueConversion(conversion, HW::Y2R::ResolveBuffers(system.Memory(), conversion));
 
     if (is_busy_conversion) {

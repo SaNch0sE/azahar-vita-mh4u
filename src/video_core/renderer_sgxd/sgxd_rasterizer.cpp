@@ -998,12 +998,6 @@ void RasterizerSgxd::DrawTriangles() {
 
 void RasterizerSgxd::FlushAll() {}
 
-void RasterizerSgxd::FlushRegion(PAddr, u32) {}
-
-void RasterizerSgxd::InvalidateRegion(PAddr, u32) {}
-
-void RasterizerSgxd::FlushAndInvalidateRegion(PAddr, u32) {}
-
 void RasterizerSgxd::ClearAll(bool) {}
 
 namespace {

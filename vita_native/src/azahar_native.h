@@ -139,21 +139,6 @@ typedef struct AzaharRedirect {
 // the slice again from there.
 #define AZAHAR_CLOCK_SVC 0xFBu
 
-#define AZAHAR_STORE_PERMITS 1024u
-#define AZAHAR_STORE_RANGES 6u
-typedef struct AzaharStorePermit {
-    uint32_t page; // the guest VA >> 12; 0 for none
-    uint32_t gen;
-    uint32_t host; // the page's address in the app
-    uint32_t left;
-    uint16_t lo[AZAHAR_STORE_RANGES], hi[AZAHAR_STORE_RANGES];
-} AzaharStorePermit;
-typedef struct AzaharStorePermits {
-    const volatile uint32_t *gen;
-    uint32_t made;
-    AzaharStorePermit permit[AZAHAR_STORE_PERMITS];
-} AzaharStorePermits;
-
 typedef struct AzaharUserPage {
     uint32_t gen;        // changed at every entry into the guest
     uint32_t on;         // 1 << AZAHAR_FAST_* for each answer below that holds; TICK only with a timer
@@ -206,7 +191,6 @@ typedef struct AzaharRunRequest {
     uint32_t upcall_rearm_us;  // in
     uint32_t upcall_rearm_max; // in
     uint32_t upcall_rearms;    // out: the quantums started again this call
-    AzaharStorePermits *store_permits; // in: the app's permits, or 0 (version 65)
 } AzaharRunRequest;
 
 // VFP short vectors (version 30). The Cortex-A9 has none: with the guest's FPSCR LEN or STRIDE
@@ -274,12 +258,15 @@ typedef struct AzaharHoldRun {
 // that mapping's attributes, while the GPU's mapping keeps the page it names (the page's home).
 // version_va 0 puts the page back on its home with the home's attributes. The first flip of a
 // page cleans and invalidates its home's lines through the app's address first: from then on
-// only the GPU writes the home until the page goes back. Contents do not move (the emulator
-// copies them), and the guest's descriptors keep their access (azaharHold). A page moved
-// (azaharReback) or returned while flipped is refused. Version 26.
+// only the GPU writes the home until the page goes back. Contents do not move unless the run
+// asks (AZAHAR_FLIP_COPY: the bytes the page shows go onto the new page before the guest's
+// descriptors follow, the guest's writes refused meanwhile, as at a move), and the guest's
+// descriptors keep their access (azaharHold). A page moved (azaharReback) or returned while
+// flipped is refused. Version 26.
 #define AZAHAR_FLIP_MAX_RUNS 64u
+#define AZAHAR_FLIP_COPY 1u  // in user_va's low bits (version 71)
 typedef struct AzaharFlipRun {
-    uint32_t user_va;    // page aligned, in the adopted block
+    uint32_t user_va;    // page aligned, in the adopted block, with AZAHAR_FLIP_COPY or not
     uint32_t version_va; // page aligned app memory, or 0: back home
 } AzaharFlipRun;
 
@@ -292,6 +279,8 @@ typedef struct AzaharFlipRun {
 // queue's order, so the GPU need not be idle (version 53). For guest framebuffers in CDRAM: the
 // GPU writes and reads them with no cache maintenance. Page aligned, at most 256 pages a call;
 // the pool pages must stay the app's for as long as the move holds. Returns the pages moved.
+// A move with its copy, and a return, refuse the guest's writes to the pages until the guest's
+// windows follow (version 71): a store meanwhile aborts as on a held page (azaharHold).
 // Version 7.
 #define AZAHAR_REBACK_COPY 1u   // the old contents go along; without it the new pages keep theirs
 typedef struct AzaharRebackRequest {
@@ -334,7 +323,7 @@ int azaharRelease(void);
 /// core it runs on, runs slices there from now on, as azaharMap's caller does on its own. Each
 /// attached core runs its slices at the same time as the others'; a table edit reaches a core
 /// inside a slice (the inner-shareable maintenance). In-kernel scheduling stays on azaharMap's
-/// core, and so do each core's switch, redirect and permits as its own run request gives them.
+/// core, and so do each core's switch and redirect as its own run request gives them.
 /// An attached core has its own view of the guest's first megabyte, which the guest never maps
 /// (the module's pages and the app's thunks): the mapping core's, its own user page at
 /// AZAHAR_USER_PAGE_VA, and each of `overrides` there instead (app memory, page aligned, at

@@ -225,9 +225,6 @@ public:
         t.ParsedPut(Op::DrawTriangles);
     }
     void FlushAll() override {}
-    void FlushRegion(PAddr, u32) override {}
-    void InvalidateRegion(PAddr, u32) override {}
-    void FlushAndInvalidateRegion(PAddr, u32) override {}
     void ClearAll(bool) override {}
     bool AccelerateDrawBatch(bool is_indexed) override {
         // A geometry draw whose state is the held run's joins it; another draw sends the run first.
@@ -313,8 +310,13 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& parse_pica_,
         [this](PAddr addr, u32 size) {
             // On the render thread, the move is for its work about to use the pages: the GPU
             // writes only moved pages and VRAM, so a page still cached has none queued but a
-            // DMA's, which the draw retired already (RasterizerSgxd::MoveWaits).
-            if (sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed)) {
+            // DMA's, which the draw retired already (RasterizerSgxd::MoveWaits). vprof's replay
+            // player drives the render side from its own thread while it holds it.
+            bool render_side = sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed);
+#ifdef VITA_DIAGNOSTICS
+            render_side |= rasterizer.Replaying() && Holding();
+#endif
+            if (render_side) {
                 rasterizer.MoveWaits();
             } else {
                 WaitGpuWrites(addr, size);
@@ -1047,6 +1049,10 @@ bool RenderThread::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& 
     HoldWrite(output, config.OutputBytes(),
               LcdScreenOf(output, config.OutputBytes()) >= 0 ? PageHolds::DisplayOut
                                                              : PageHolds::TransferOut);
+    // A tiled output is drawn as a colour buffer (RasterizerSgxd::AccelerateDisplayTransfer).
+    if (!config.input_linear && config.dont_swizzle) {
+        HoldMoves(output, config.OutputBytes());
+    }
     Put(Op::DisplayTransfer, config);
     return true;
 }
@@ -1154,6 +1160,10 @@ void RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
 #ifdef VITA_DIAGNOSTICS
         frame_buffer_reads.fetch_add(1, std::memory_order_relaxed);
 #endif
+        // Held by its turns, not its pages: a texture's untile still moves them.
+        if (kind == PageHolds::Texture) {
+            HoldMoves(addr, bytes);
+        }
         return;
     }
     if (page_holds_on) {
@@ -1167,6 +1177,12 @@ void RenderThread::HoldWrite(PAddr addr, u32 bytes, PageHolds::Kind kind) {
     if (page_holds_on) {
         page_holds.Write(addr, bytes, HoldTicket(), kind);
         PutPageRemaps();
+    }
+}
+
+void RenderThread::HoldMoves(PAddr addr, u32 bytes) {
+    if (page_holds_on) {
+        page_holds.Moves(addr, bytes, HoldTicket());
     }
 }
 
@@ -1236,12 +1252,12 @@ void RenderThread::WatchFrameBuffer(PAddr addr, u32 size) {
     if (ticket == 0) {
         return;
     }
-    DEBUG_ASSERT_MSG(ticket != HoldTicket(), "render thread: a frame buffer turned while read");
     if (!InterruptPoll(ticket)) {
 #ifdef VITA_DIAGNOSTICS
         const auto start = Clock::now();
 #endif
-        InterruptWait(ticket);
+        // A read held since the last fence has no ticket yet: WaitTicket fences it first.
+        WaitTicket(ticket);
 #ifdef VITA_DIAGNOSTICS
         frame_buffer_waits.fetch_add(1, std::memory_order_relaxed);
         frame_buffer_wait_us.fetch_add(Since(start), std::memory_order_relaxed);
@@ -1314,6 +1330,8 @@ void RenderThread::HoldDraw(const DrawTextures& textures, u32 count, bool vertic
 #ifdef VITA_DIAGNOSTICS
             resource_skips[0].fetch_add(1, std::memory_order_relaxed);
 #endif
+            // Not held (the watchers see the game's writes), but its untile moves its pages to CDRAM.
+            HoldMoves(textures[i].addr, textures[i].bytes);
             continue;
         }
         HoldRead(textures[i].addr, textures[i].bytes, PageHolds::Texture);
@@ -2245,6 +2263,103 @@ void RenderThread::WaitHeldPage(u32 page, bool write) {
     WaitTicket(page_holds.WaitFor(page, write, reached.load(std::memory_order_acquire)));
 }
 
+RenderThread::HeldWrite RenderThread::TakeHeldWrite(u32 page, const u8* host, u32 bytes,
+                                                    bool guest, u32& ticket) {
+    ticket = 0;
+    const PAddr address = page_holds.AddressOf(page);
+    const bool fcram = address >= Memory::FCRAM_PADDR && address < Memory::FCRAM_PADDR_END;
+    // The page opened by the write's own effects, after the move of a page queued work moves to CDRAM
+    // while still cached (a write through the app's view would land on the page the copy leaves).
+    const auto opened = [&] {
+        if (fcram && page_holds.MayMove(page, reached.load(std::memory_order_acquire)) &&
+            renderer.WouldMakeUncached(address, 0x1000)) {
+            WaitTicket(page_holds.MoveTicket(page));
+        }
+        return HeldWrite::Open;
+    };
+    // The memo's index lists over the page: their ranges there are stale.
+    if (page_holds.IndexWatched(page)) {
+        page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
+        if (page_holds.Applied(page) == PageHolds::Unheld) {
+            return opened();
+        }
+    }
+    // A handed-over list's parse of the page reads a copy of it. Whatever it answers, it lets go of
+    // the parsed lists' pages first, and this one may be open after that though no parse holds it.
+    ParseFault(page);
+    if (page_holds.Applied(page) == PageHolds::Unheld) {
+        return opened();
+    }
+    // The textures over the page are untiled again at their next use, and its watch goes.
+    const auto textures_written = [&] {
+        if (host_range) {
+            // HostAccess records the range's runs at its end.
+            if (!host_textures.empty() && host_textures.back().second == address) {
+                host_textures.back().second = address + 0x1000;
+            } else {
+                host_textures.push_back({address, address + 0x1000});
+            }
+        } else {
+            TexturesWritten(address, 0x1000);
+        }
+        page_holds.Unwatch(page, reached.load(std::memory_order_acquire));
+#ifdef VITA_DIAGNOSTICS
+        (guest ? texture_write_faults : texture_write_hle)++;
+#endif
+    };
+    if (page_holds.Watched(page) && (bytes == 0 || page_holds.TouchesWatch(host, bytes))) {
+        // On a closed page, marking the textures written would drop a picture's rows there unwritten: the
+        // caller copies them back first.
+        if (closed) {
+            return HeldWrite::Wait;
+        }
+        textures_written();
+        if (page_holds.Applied(page) == PageHolds::Unheld) {
+            return opened();
+        }
+    }
+    const u32 now = reached.load(std::memory_order_acquire);
+    // Clear of the queued work's bytes, the page held on; not on a page that may be in a move.
+    if (bytes != 0 &&
+        !(fcram && page_holds.MayMove(page, now) && renderer.WouldMakeUncached(address, 0x1000)) &&
+        page_holds.StoreMisses(host, bytes, now, ticket)) {
+#ifdef VITA_DIAGNOSTICS
+        host_past += guest ? 0 : 1;
+#endif
+        return HeldWrite::PastHolds;
+    }
+    ticket = 0;
+    // An FCRAM page the GPU still reads takes a version (moved pages only), and the writer goes on at
+    // once; the HLE's writes still due to the page are made first.
+    const bool versionable = fcram && !renderer.WouldMakeUncached(address, 0x1000);
+    // A version opens the whole page for the frame, a watched texture's bytes with it, so the guest's
+    // writes there would go unseen: the textures count as written now.
+    if (versionable && page_holds.Watched(page)) {
+        textures_written();
+        if (page_holds.Applied(page) == PageHolds::Unheld) {
+            return opened();
+        }
+    }
+    if (versionable && later_done &&
+        std::find(later_pages.begin(), later_pages.end(), page) != later_pages.end()) {
+        const std::function<void()> done = std::exchange(later_done, {});
+        later_pages.clear();
+        done();
+    }
+    if (versionable && page_holds.Version(page, now)) {
+#ifdef VITA_DIAGNOSTICS
+        if (guest) {
+            faults++;
+            versioned_faults++;
+        } else {
+            host_versions++;
+        }
+#endif
+        return HeldWrite::Open;
+    }
+    return HeldWrite::Wait;
+}
+
 void RenderThread::GpuRead(const u8* host, u32 size) {
     if (!page_holds_on) {
         return;
@@ -2302,23 +2417,9 @@ bool RenderThread::StoreMissesHolds(const u8* host, u32 size, u32& ticket) {
         page_holds.Applied(page) == PageHolds::Unheld) {
         return false;
     }
-    // A store to a page of the memo's index lists: a write, as PageFault takes it; past the holds
-    // then as any store. Closed by the watch alone, the page is PageFault's to open: opened here,
-    // PageFault would find no hold over it and take the abort for the guest's own (a game's
-    // command-buffer page).
-    if (page_holds.IndexWatched(page)) {
-        if (page_holds.ClosedByIndexWatchAlone(page, reached.load(std::memory_order_acquire))) {
-            return false;
-        }
-        page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
-    }
-    return page_holds.StoreMisses(host, size, reached.load(std::memory_order_acquire), ticket);
-}
-
-void RenderThread::StoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi,
-                                  u32 slot) {
-    page_holds.StoreForbidden(host, reached.load(std::memory_order_acquire), lo, hi);
-    page_holds.PermitGranted(host, slot);
+    // Made through the app's view past the holds (ticket the page's last live hold's, for the
+    // budget), or onto the page its own effects or a version opened (ticket 0).
+    return TakeHeldWrite(page, host, size, true, ticket) != HeldWrite::Wait;
 }
 
 bool RenderThread::OpensDisplayPage(const u8* host, bool write, u32 reach) {
@@ -2362,46 +2463,22 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
     // A hold refuses writes to a page the GPU reads, and any access to one it writes.
     const PageHolds::Access access = page_holds.Applied(page);
     if (access == PageHolds::Unheld || (access == PageHolds::ReadOnly && !write)) {
+        // A store to a page no hold covers while queued work may move it to CDRAM: the module refuses the
+        // guest's writes while the render thread copies the page. The store runs again once the move is
+        // done; a fault of the guest's own aborts again, with no move left.
+        if (write && page_holds.MayMove(page, reached.load(std::memory_order_acquire))) {
+            WaitTicket(page_holds.MoveTicket(page));
+            return true;
+        }
         return false;
     }
-    // A write to a page whose index lists the scan's memo holds (HoldVertices): the memo's
-    // ranges there are stale, and the page opens as its other holds allow.
-    if (write && page_holds.IndexWatched(page)) {
-        page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
-        if (page_holds.Applied(page) == PageHolds::Unheld) {
-            return true;
-        }
-    }
-    // A write to a page a handed-over list's parse reads: that parse reads a copy of it
-    // (ParseFault), and the page opens as its other holds allow.
-    if (write && ParseFault(page) && page_holds.Applied(page) == PageHolds::Unheld) {
+    // A write: where on the page is not known here (a store the decoder knew the bytes of took this
+    // way already).
+    u32 past_ticket;
+    if (write && TakeHeldWrite(page, host, 0, true, past_ticket) == HeldWrite::Open) {
         return true;
     }
-    // T12: a write to a texture's page: the textures over it are untiled again at their next
-    // use, the page open to writes as its holds allow.
-    if (write && page_holds.Watched(page)) {
-        TexturesWritten(page_holds.AddressOf(page), 0x1000);
-        page_holds.Unwatch(page, reached.load(std::memory_order_acquire));
-#ifdef VITA_DIAGNOSTICS
-        texture_write_faults++;
-#endif
-        if (page_holds.Applied(page) == PageHolds::Unheld) {
-            return true;
-        }
-    }
-    // A write to an FCRAM page the GPU still reads takes a version of it (moved pages only:
-    // their home in CDRAM needs no cache work), and the guest goes on at once.
     const PAddr address = page_holds.AddressOf(page);
-    if (write && address >= Memory::FCRAM_PADDR && address < Memory::FCRAM_PADDR_END &&
-        !renderer.WouldMakeUncached(address, 0x1000)) {
-        if (page_holds.Version(page, reached.load(std::memory_order_acquire))) {
-#ifdef VITA_DIAGNOSTICS
-            faults++;
-            versioned_faults++;
-#endif
-            return true;
-        }
-    }
     // A write to a cached FCRAM page that only queued draws' geometry reads holds (a buffer the guest
     // refills while the GPU still draws it): the page moves to CDRAM after this wait, so the next write
     // takes a version instead.
@@ -2479,6 +2556,10 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
 }
 
 void RenderThread::HostAccess(const u8* host, u32 size, bool write) {
+    // A range of pages (the HLE's) in one go: the view's changes in one azaharHold, the textures over
+    // the written pages in a record a run, after the loop.
+    host_range = true;
+    page_holds.BeginBatch();
     const u8* const end = host + size;
     for (const u8* p = host; p < end;
          p = reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1)) {
@@ -2486,32 +2567,17 @@ void RenderThread::HostAccess(const u8* host, u32 size, bool write) {
         if (page == PageHolds::NoPage || page_holds.Applied(page) == PageHolds::Unheld) {
             continue;
         }
-        // The HLE writes a page of the memo's index lists, or one a handed-over list's parse
-        // reads: as a guest write does.
-        if (write && page_holds.IndexWatched(page)) {
-            page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
-            if (page_holds.Applied(page) == PageHolds::Unheld) {
-                continue;
-            }
-        }
-        if (write && ParseFault(page) && page_holds.Applied(page) == PageHolds::Unheld) {
-            continue;
-        }
-        // T12: the HLE writes a texture's page (a file read, the DSP): as a guest write does.
-        if (write && page_holds.Watched(page)) {
-            TexturesWritten(page_holds.AddressOf(page), 0x1000);
-            page_holds.Unwatch(page, reached.load(std::memory_order_acquire));
-#ifdef VITA_DIAGNOSTICS
-            texture_write_hle++;
-#endif
-        }
-        // A read clear of the bytes the queued GPU writes cover goes on: the page shares them
-        // with other data (PageHolds::TouchesWrite). The HLE's reads do not change the guest's
-        // view, which stays held.
         const u8* const page_end =
             reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1);
         const u32 bytes = static_cast<u32>(std::min(end, page_end) - p);
-        if (!write && !page_holds.TouchesWrite(p, bytes)) {
+        // A write (a file read, the DSP) goes as the guest's does: past the holds, onto a
+        // version, or after the page's work. Written in place on a versioned page, it would
+        // land in the slot queued work reads. A read clear of the bytes the queued GPU writes
+        // cover goes on: the page shares them with other data (PageHolds::TouchesWrite). The
+        // HLE's reads do not change the guest's view, which stays held.
+        u32 past_ticket;
+        if (write ? TakeHeldWrite(page, p, bytes, false, past_ticket) != HeldWrite::Wait
+                  : !page_holds.TouchesWrite(p, bytes)) {
             continue;
         }
 #ifdef VITA_DIAGNOSTICS
@@ -2543,46 +2609,28 @@ void RenderThread::HostAccess(const u8* host, u32 size, bool write) {
         }
 #endif
     }
+    page_holds.EndBatch();
+    host_range = false;
+    for (const auto& [lo, hi] : host_textures) {
+        TexturesWritten(lo, hi - lo);
+    }
+    host_textures.clear();
 }
 
-void RenderThread::InvalidateWritten(PAddr addr, u32 size) {
-    if (!page_holds_on || size == 0) {
+void RenderThread::HostWritesLater(const std::vector<const u8*>& pages,
+                                   std::function<void()> done) {
+    later_pages.clear();
+    later_done = {};
+    if (!page_holds_on) {
         return;
     }
-    // Y2R writes its picture through GetPointer after this (a game's Grand Prix preview video):
-    // without it the textures over those pages kept their first frame, and the video went
-    // back and forth between it and the next one.
-    const u8* const host = memory.GetPhysicalPointer(addr);
-    if (host == nullptr) {
-        return;
-    }
-    const u8* const end = host + size;
-    // The range's FCRAM pages, first and one past the last.
-    u32 first = PageHolds::NoPage, last = 0;
-    for (const u8* p = host; p < end;
-         p = reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1)) {
-        const u32 page = page_holds.PageOf(p);
-        if (page != PageHolds::NoPage && page < Memory::FCRAM_SIZE >> 12) {
-            // Watched or not: Y2R writes without a fault. A watched texture page opens as its
-            // other holds allow; the range's record below marks its textures (T12).
-            page_holds.IndexWrittenUnsent(page, reached.load(std::memory_order_acquire));
-            if (page_holds.Watched(page)) {
-                page_holds.UnwatchUnsent(page, reached.load(std::memory_order_acquire));
-            }
-            first = std::min(first, page);
-            last = std::max(last, page + 1);
-#ifdef VITA_DIAGNOSTICS
-            texture_write_hle++;
-#endif
+    for (const u8* const host : pages) {
+        const u32 page = page_holds.PageOf(host);
+        if (page != PageHolds::NoPage) {
+            later_pages.push_back(page);
         }
     }
-    if (first != PageHolds::NoPage) {
-        TexturesWritten(page_holds.AddressOf(first), (last - first) << 12);
-    }
-    // The guest's view of the range in one azaharHold. Sent page by page, each was a syscall
-    // forwarded out of the upcall (Y2R's StartConversion): MH Generations' opening movie, ~70
-    // pages a conversion, made ~2000 a second at ~25000 cycles each.
-    page_holds.Apply();
+    later_done = std::move(done);
 }
 
 void RenderThread::TexturesWritten(PAddr address, u32 size) {
@@ -2643,6 +2691,8 @@ RenderThread::HoldStats RenderThread::TakeHoldStats() {
     h.fault_wait_us = std::exchange(fault_wait_us, 0);
     h.host_waits = std::exchange(host_waits, 0);
     h.host_wait_us = std::exchange(host_wait_us, 0);
+    h.host_past = std::exchange(host_past, 0);
+    h.host_versions = std::exchange(host_versions, 0);
     h.versioned_faults = std::exchange(versioned_faults, 0);
     h.geometry_moves = std::exchange(geometry_moves, 0);
     h.parse_copies = std::exchange(parse_copies, 0);

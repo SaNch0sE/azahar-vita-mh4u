@@ -12,8 +12,6 @@
 #include <vector>
 #include "common/common_types.h"
 
-struct AzaharStorePermits;
-
 namespace Common {
 class HostSharedMemory;
 }
@@ -56,8 +54,9 @@ namespace SgxdRenderer {
  * page no GPU work has used for ConvergeFrames frames goes home and gives its slot back. Only
  * pages already moved to CDRAM are versioned (GuestGpuMemory): no slot then needs cache work.
  *
- * Emulation side only, under the GPU's lock: the pages change while the guest is stopped (in
- * a GSP command, a register write, a vblank or an exit), before it runs again (Apply).
+ * Emulation side only, under the GPU's lock, while the first emulation thread's guest is stopped
+ * (Apply). The second emulation thread's guest runs on: a page whose bytes move has them moved by
+ * the module (azaharFlip's copy), the guest's writes refused meanwhile.
  */
 class PageHolds {
 public:
@@ -92,10 +91,32 @@ public:
     /// guest's [addr, addr + bytes). Addresses outside guest FCRAM and VRAM hold nothing.
     void Read(PAddr addr, u32 bytes, u32 ticket, Kind kind);
     void Write(PAddr addr, u32 bytes, u32 ticket, Kind kind);
+    /// Queued work up to `ticket` has the render thread move [addr, addr + bytes)'s FCRAM pages
+    /// still cached to CDRAM: a tiled display transfer's output here, a draw's textures and colour
+    /// buffer at their holds. The move copies a page through the app's view while the work's holds
+    /// keep the guest's writes off it; a store past the holds meanwhile would land on the page the
+    /// copy has left, so while such work is live no store goes past a cached page's holds
+    /// (RenderThread::StoreMissesHolds).
+    void Moves(PAddr addr, u32 bytes, u32 ticket);
+    /// Whether queued work may still move the FCRAM page (Moves), and the ticket it is moved
+    /// by, which a write onto the page while it may be in the copy waits for.
+    [[nodiscard]] bool MayMove(u32 page, u32 reached) const {
+        return page < fcram_pages && Live(move_ticket[page], reached);
+    }
+    [[nodiscard]] u32 MoveTicket(u32 page) const {
+        return move_ticket[page];
+    }
     /// A fence took `ticket`: the holds made for it are complete.
     void Close(u32 ticket);
     /// The guest's view gets the holds made since the last call. Before the guest runs again.
     void Apply();
+    /// Until EndBatch, nothing goes to the module: the guest view's changes and flips made
+    /// meanwhile go in one azaharHold (and one azaharFlip) at its end. For a range of the HLE's
+    /// pages (RenderThread::HostAccess), which it reads and writes through the app's view after the
+    /// guard: not a syscall a page. The guest runs again after the batch; an abort of the second
+    /// emulation thread's waits for host 0 to serve it, after the batch too.
+    void BeginBatch();
+    void EndBatch();
     /// Lets go of the pages whose tickets are all reached: the tickets up to `reached` let go
     /// of their pages, and the guest's view follows (azaharHold).
     void Release(u32 reached);
@@ -121,8 +142,9 @@ public:
     /// buffer's first and last pages are shared with what lies beside it (command buffers past a
     /// colour buffer, in its last page).
     [[nodiscard]] bool TouchesWrite(const u8* host, u32 bytes) const;
-    /// Whether a guest store of [host, host + bytes), inside one FCRAM page held by plain
-    /// holds or watched (not versioned or the display's), misses the page's queued GPU work and
+    /// Whether a store of [host, host + bytes) (the guest's, or the HLE's through the app's view),
+    /// inside one FCRAM page held by plain holds or watched (not the display's, nor versioned
+    /// unless a GPU write is queued to it), misses the page's queued GPU work and
     /// its watched textures: clear of the bytes its live reads and its textures cover, and by
     /// whole cache lines of those its live writes cover. It can then be made through the app's
     /// view with the page still held and watched; ticket names the page's last live hold, or
@@ -130,27 +152,6 @@ public:
     /// buffer, on its first page, and set it while the buffer's DMAs are queued: each store
     /// would wait for them (a scene change's hitches).
     [[nodiscard]] bool StoreMisses(const u8* host, u32 bytes, u32 reached, u32& ticket) const;
-    /// The bytes of the FCRAM page at host a guest store must miss, as StoreMisses tests them:
-    /// its watched textures', its live reads' and its live writes' by whole cache lines, as six
-    /// [lo, hi) page offsets (hi 0 for none). For the module's store permits (AzaharStorePermits).
-    void StoreForbidden(const u8* host, u32 reached, std::array<u16, 6>& lo,
-                        std::array<u16, 6>& hi) const;
-    /// The module's store permits (the native core's table), and the permit at `slot` made for
-    /// the page at host (from StoreForbidden's bytes). A hold that takes more of a page (a GPU
-    /// read or write, a watch that grows) takes the new bytes into that page's permit
-    /// (RefreshPermit), and one no store past the holds may go by (a parse hold, a version, the
-    /// display's) voids it. One generation voided every permit at each such hold, and a void of
-    /// the page's alone still left a game's battle ~1300 permits a second to make again: the
-    /// game writes on in buffers whose earlier bytes each new draw reads.
-    void SetStorePermits(AzaharStorePermits* table) {
-        permits = table;
-    }
-    void PermitGranted(const u8* host, u32 slot);
-    /// The permits' generation: the module's check against each permit's, constant (permits go
-    /// one by one, VoidPermit).
-    [[nodiscard]] const u32* Generation() const {
-        return &generation;
-    }
     [[nodiscard]] u32 WriteTicket(u32 page) const {
         return write_ticket[page];
     }
@@ -206,17 +207,16 @@ public:
         return page < fcram_pages && watched[page] != 0;
     }
     void Unwatch(u32 page, u32 reached);
-    /// Unwatch with the page's change left for the caller's Apply (a range of pages in one
-    /// azaharHold, RenderThread::InvalidateWritten).
-    void UnwatchUnsent(u32 page, u32 reached);
+    /// Whether [host, host + bytes), inside one watched page, reaches the bytes of its textures: a
+    /// write beside them leaves them as they are.
+    [[nodiscard]] bool TouchesWatch(const u8* host, u32 bytes) const;
 
     /// Index lists' write tracking, for the scan's memo of their ranges
     /// (RenderThread::HoldVertices): the FCRAM pages of a list scanned once are watched, closed to
-    /// the guest's writes on top of the holds, their store permits void, until a write (the
-    /// guest's, a store past the holds, the HLE's, a GPU write hold, a version) moves their stamp
-    /// on and opens them. A
-    /// page written in the last IndexQuietFrames frames, or versioned, is not watched: a buffer
-    /// the game fills each frame would trap at every draw.
+    /// the guest's writes on top of the holds, until a write (the guest's, a store past the holds,
+    /// the HLE's, a GPU write hold, a version) moves their stamp on and opens them. A page written
+    /// in the last IndexQuietFrames frames, or versioned, is not watched: a buffer the game fills
+    /// each frame would trap at every draw.
     [[nodiscard]] bool IndexMemoable(u32 first, u32 count) const;
     /// The sum of the pages' stamps: a write to any of them changes it.
     [[nodiscard]] u32 IndexStamp(u32 first, u32 count) const;
@@ -226,19 +226,13 @@ public:
     }
     /// A write to the page (or one may have been made): its stamp moves on, the watch goes.
     void IndexWritten(u32 page, u32 reached);
-    /// IndexWritten with the guest's view left to the caller's Apply, for a range of pages
-    /// written at once: one azaharHold for all of them.
-    void IndexWrittenUnsent(u32 page, u32 reached);
-    /// Whether the page is closed to writes by the index watch alone (Wanted without it: open).
-    [[nodiscard]] bool ClosedByIndexWatchAlone(u32 page, u32 reached) const {
-        return IndexWatched(page) && HoldsWant(page, reached) == Unheld && !Watched(page) &&
-               parse_held[page] == 0;
-    }
     static constexpr u32 IndexQuietFrames = 30;
 
-    /// A guest write aborted on FCRAM page `page`, moved to CDRAM (the caller checks): whether
-    /// the page is open to the write now, swapped onto a free slot or written in place. Not
-    /// taken, the ordinary holds decide (a GPU write queued, or a page no queued work reads).
+    /// A write onto FCRAM page `page`, moved to CDRAM (the caller checks): the guest's that
+    /// aborted, or the HLE's before it writes through the app's view (which the swap moves with the
+    /// guest's windows). Whether the page is open to the write now, swapped onto a free slot or
+    /// written in place. Not taken, the ordinary holds decide (a GPU write queued, or a page no
+    /// queued work reads).
     bool Version(u32 page, u32 reached);
     /// A remap of the GPU's MMU the holds asked for: the GPU address of the page's PTE in
     /// sgxd's mapped tables and the PTE word naming the guest's page (sgxdPte), for the GPU to
@@ -318,27 +312,12 @@ private:
     /// Whether this ticket held the range already (a small cache of the ranges held for it).
     bool Seen(PAddr addr, u32 bytes, u32 kind);
     void Change(u32 page, Access access);
-    /// A hold no store past the holds may go by took the FCRAM page: its store permit, if any,
-    /// is void.
-    void VoidPermit(u32 page) {
-        if (page < fcram_pages && permit_slot[page] != 0) {
-            VoidPermitSlot(page);
-        }
-    }
-    void VoidPermitSlot(u32 page);
-    /// A hold took more of the FCRAM page (its ranges recorded): its permit, if any, misses the
-    /// new bytes too (StoreForbidden), or is void where StoreMisses would refuse every store.
-    void RefreshPermit(u32 page) {
-        if (page < fcram_pages && permit_slot[page] != 0) {
-            RefreshPermitSlot(page);
-        }
-    }
-    void RefreshPermitSlot(u32 page);
     /// Sends the changed pages to the module, the flips before the holds.
     void Flush();
     /// The page's app view and guest windows on slot `slot`'s page, or home (NoSlot), at the
-    /// next Flush.
-    void Flip(u32 page, u16 slot);
+    /// next Flush; with `copy`, the bytes the page shows go along (the module copies them before
+    /// the guest's windows follow, the guest's writes refused meanwhile).
+    void Flip(u32 page, u16 slot, bool copy = false);
     [[nodiscard]] u16 AllocSlot();
     [[nodiscard]] u8* SlotHost(u16 slot) const;
     /// The GPU's MMU onto the guest's slot of `page` before the work of `ticket` (a Remap); the
@@ -359,6 +338,11 @@ private:
     std::vector<std::array<u16, 2>> read_lo, read_hi;
     /// FCRAM pages: whether the last read hold was a vertex or index read (GeometryReadOnly).
     std::vector<u8> geometry_read;
+    std::vector<u32> move_ticket;
+    void NoteMove(u32 p, u32 ticket) {
+        move_ticket[p] = ticket;
+    }
+    std::array<std::array<u32, 3>, 64> moves_seen{};
     std::vector<u32> write_ticket; ///< every page
     /// Every page: the bytes its GPU writes cover, as up to two ranges [lo, hi) (hi 0: none),
     /// merged while its last write ticket is live (TouchesWrite).
@@ -381,7 +365,7 @@ private:
     std::vector<std::array<u16, 2>> watch_lo, watch_hi;
     std::vector<u32> watch_ticket;
     /// Watch's ranges watched whole, direct-mapped: a texture's range comes back with every draw
-    /// that reads it, and its pages stay watched until UnwatchUnsent, which counts `unwatches`;
+    /// that reads it, and its pages stay watched until Unwatch, which counts `unwatches`;
     /// a slot with the count still current needs no walk of the range's pages.
     std::array<std::array<u32, 3>, 256> watch_seen{};
     u32 unwatches{};
@@ -391,10 +375,6 @@ private:
 
     /// The holds made for the next ticket, and the tickets' groups not yet released.
     u32 open_ticket{};
-    u32 generation{};
-    /// The module's store permits, and each FCRAM page's permit slot + 1 (0: none made).
-    AzaharStorePermits* permits{};
-    std::vector<u16> permit_slot;
     std::vector<Run> open_runs;
     std::deque<Group> groups;
     /// Seen's ranges, direct-mapped: 256 slots, as a draw-heavy list's textures and vertex ranges
@@ -408,6 +388,7 @@ private:
     std::vector<u32> vram_opened;
 
     std::vector<u32> changed;
+    bool batch{};
     std::vector<std::array<u32, 3>> calls_runs;
 
     /// A page's versions: its slots (0 the home, the rest pages of the pool, NoSlot until used),
@@ -438,7 +419,8 @@ private:
     std::vector<u32> versioned;
     std::vector<u16> free_slots;
     std::vector<Remap> remaps;
-    /// azaharFlip's runs for the next Flush: (app address, version's app address or 0).
+    /// azaharFlip's runs for the next Flush: (app address with AZAHAR_FLIP_COPY or not,
+    /// version's app address or 0).
     std::vector<std::array<u32, 2>> flips;
     u32 frame{};
 

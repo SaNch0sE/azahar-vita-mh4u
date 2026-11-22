@@ -1640,8 +1640,7 @@ static void CaptureFrameBuffer(Core::System& system, u32 capture_offset, std::sp
         return;
     }
 
-    system.Memory().RasterizerFlushVirtualRegion(src, GSP::FRAMEBUFFER_WIDTH * height * bpp,
-                                                 Memory::FlushMode::Flush);
+    system.Memory().HleAccess(src, GSP::FRAMEBUFFER_WIDTH * height * bpp, false);
 
     // APT captures the framebuffer to a copy on its own bss.
     u8* dst_ptr = dst.data() + capture_offset;
@@ -1686,10 +1685,8 @@ void AppletManager::TransferCapturedFramebuffers() {
     const VAddr dst_vaddr = Memory::VRAM_VADDR + VRAM_TRANSFER_OFFSET;
     auto dst_ptr = system.Memory().GetPointer(dst_vaddr);
 
+    system.Memory().HleAccess(dst_vaddr, static_cast<u32>(framebuffer_backup.size()), true);
     memcpy(dst_ptr, framebuffer_backup.data(), framebuffer_backup.size());
-
-    system.Memory().RasterizerFlushVirtualRegion(dst_vaddr, framebuffer_backup.size(),
-                                                 Memory::FlushMode::Invalidate);
 }
 
 void AppletManager::LoadInputDevices() {
