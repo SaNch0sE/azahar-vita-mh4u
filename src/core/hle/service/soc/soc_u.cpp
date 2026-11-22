@@ -1675,7 +1675,9 @@ static std::vector<u8> HostEntToHostByNameData(struct hostent* result) {
     hbn_data.addr_len = result->h_length;
     std::strncpy(hbn_data.h_name.data(), result->h_name, 255);
     u16 count;
-    for (count = 0; count < HostByNameData::max_entries; count++) {
+    // The Vita's newlib (gethostbyname, gethostbyaddr) leaves h_aliases null for no aliases,
+    // where POSIX has an empty list.
+    for (count = 0; result->h_aliases != nullptr && count < HostByNameData::max_entries; count++) {
         char* curr = result->h_aliases[count];
         if (!curr) {
             break;
@@ -1683,6 +1685,8 @@ static std::vector<u8> HostEntToHostByNameData(struct hostent* result) {
         std::strncpy(hbn_data.aliases[count].data(), curr, 255);
     }
     hbn_data.alias_count = count;
+    ASSERT_MSG(result->h_addr_list != nullptr, "SOC: a host entry for {} without an address list",
+               result->h_name);
     for (count = 0; count < HostByNameData::max_entries; count++) {
         char* curr = result->h_addr_list[count];
         if (!curr) {
@@ -1697,16 +1701,18 @@ static std::vector<u8> HostEntToHostByNameData(struct hostent* result) {
 
 void SOC_U::GetHostByAddr(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
-    [[maybe_unused]] int addr_len = static_cast<int>(rp.Pop<u32>());
+    const u32 addr_len = rp.Pop<u32>();
     int type = static_cast<int>(SocketDomainToPlatform(rp.Pop<u32>()));
     [[maybe_unused]] u32 out_buf_len = rp.Pop<u32>();
     auto addr = rp.PopStaticBuffer();
 
-    auto [platform_addr, platform_addr_len] =
-        CTRSockAddr::ToPlatform(*reinterpret_cast<CTRSockAddr*>(addr.data()));
-
-    struct hostent* result =
-        ::gethostbyaddr(reinterpret_cast<char*>(&platform_addr), platform_addr_len, type);
+    // The address itself (an in_addr's 4 bytes for AF_INET), as POSIX's gethostbyaddr takes it
+    // and libctru's sends it (3dbrew SOCU:GetHostByAddr), not a sockaddr.
+    ASSERT_MSG(addr_len <= addr.size(),
+               "SOC: GetHostByAddr's address of {} bytes in a {}-byte buffer", addr_len,
+               addr.size());
+    struct hostent* result = ::gethostbyaddr(reinterpret_cast<char*>(addr.data()),
+                                             static_cast<socklen_t>(addr_len), type);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
     rb.Push(ResultSuccess);

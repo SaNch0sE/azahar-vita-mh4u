@@ -82,6 +82,7 @@ set(CITRA_VITA_SOURCES
     multiplayer.h
     rom_check.cpp
     rom_check.h
+    secondary_dns.cpp
     sgxd_present.cpp
     sgxd_present.h
     stats_hud.cpp
@@ -107,6 +108,8 @@ set_source_files_properties(../vita_compat/src/vita_libc_shims.c PROPERTIES
 set_source_files_properties(upcall_tls.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 # And for the abort report's wraps of raise and __assert_func (crash_report.cpp).
 set_source_files_properties(crash_report.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
+# And for the lookups' wrap of gethostbyname (secondary_dns.cpp).
+set_source_files_properties(secondary_dns.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 
 # The emulator's executable, and the replay player's below: the same frontend, told its title ID.
 # The kernel opens the module by its installed path rather than through app0:, so the app is
@@ -123,12 +126,13 @@ function(citra_vita_executable target titleid)
         target_link_libraries(${target} PRIVATE "${AZAHAR_PGO_RUNTIME}")
     endif()
     # The upcall experiment's TLS lookup and malloc lock (upcall_tls.cpp), and the abort report
-    # (crash_report.cpp), which keeps the console's last text too.
+    # (crash_report.cpp), which keeps the console's last text too, and the lookups' secondary DNS
+    # server (secondary_dns.cpp).
     target_link_options(${target} PRIVATE
         "LINKER:--wrap=sceKernelGetTLSAddr,--wrap=__malloc_lock,--wrap=__malloc_unlock"
         "LINKER:--wrap=raise,--wrap=__assert_func,--wrap=malloc,--wrap=calloc,--wrap=realloc"
         "LINKER:--wrap=free,--wrap=_malloc_r,--wrap=_free_r"
-        "LINKER:--wrap=sceClibPrintf")
+        "LINKER:--wrap=sceClibPrintf,--wrap=gethostbyname")
     # The ID the crash report names the build by: a commit does not tell a dirty build's ELF.
     target_link_options(${target} PRIVATE "LINKER:--build-id=sha1")
 
