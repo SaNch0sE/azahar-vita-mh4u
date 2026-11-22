@@ -16,6 +16,9 @@ namespace GxmRenderer {
  *   perflog   log a second's `perf:` lines: speed and frame rates, the presents, the command
  *             lists, fills and transfers, the cache operations by site, the FCRAM pages moved
  *             to CDRAM
+ *   leakcheck the native core logs guest registers, and IPC reply words, that hold an
+ *             address near the emulation thread's stack (24 hits at most): an emulator
+ *             address handed to the guest
  *   nolimit   no frame limit: the core runs as fast as it goes
  *   novsync   the sgxd present does not wait for the frame before it to be on screen (tears)
  *   holdlog   with perflog, the first 200 page-hold aborts that waited (holdlog=N: from N

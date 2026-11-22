@@ -32,6 +32,7 @@
 
 #include "azahar_native.h"
 #include "sgxd_ptla.h"
+#include "core/arm/vita/arm_vita_native.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
 #include "video_core/renderer_sgxd/vprof.h"
@@ -347,6 +348,73 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              perf.time_vblank_interval * 1e3, perf.time_hle_svc * 1e3,
                              perf.time_hle_ipc * 1e3, perf.time_gpu * 1e3, perf.time_swap * 1e3,
                              perf.time_remaining * 1e3);
+                    // The native core's slices: time in the guest and in azaharRun (ms), how
+                    // the slices ended, the svcs answered in the guest, and the svcs that left
+                    // it, most frequent first.
+                    const auto n = Core::TakeVitaNativeCensus();
+                    // The store permits made by what their slot held before, and the sites of
+                    // stores the module left to the app on a live permit (pc:instruction count).
+                    std::string live_sites;
+                    for (const auto& site : n.permits_live_sites) {
+                        if (site[2] != 0) {
+                            fmt::format_to(std::back_inserter(live_sites), " {:08x}:{:08x} {}",
+                                           site[0], site[1], site[2]);
+                        }
+                    }
+                    auto store_pages = n.permitted_store_pages;
+                    std::sort(store_pages.begin(), store_pages.end(),
+                              [](const auto& a, const auto& b) { return a[1] > b[1]; });
+                    for (const auto& page : store_pages) {
+                        if (page[1] != 0) {
+                            fmt::format_to(std::back_inserter(live_sites), " page {:#010x} {}",
+                                           page[0] << 12, page[1]);
+                        }
+                    }
+                    LOG_INFO(Frontend,
+                             "perf: store permits made after none {}, another page's {}, the "
+                             "page's used up {}, the page's live {}; all cleared {} times;{}",
+                             n.permits_after_none, n.permits_after_other, n.permits_after_used,
+                             n.permits_after_live, n.permit_clears, live_sites);
+                    const double tick_ms = BASE_CLOCK_RATE_ARM11 / 1e3;
+                    LOG_INFO(Frontend,
+                             "perf: guest {:.1f} ms, azaharRun {:.1f} ms, {} slices: svc {}, "
+                             "timer {}, faults {}; svcs answered in the guest: tick {}, cache "
+                             "{}, thread id {}, process id {}",
+                             n.guest_ticks / tick_ms, n.kernel_us / 1e3, n.slices,
+                             n.reasons[AZAHAR_EXIT_SVC], n.reasons[AZAHAR_EXIT_TIMER],
+                             n.slices - n.reasons[AZAHAR_EXIT_SVC] - n.reasons[AZAHAR_EXIT_TIMER],
+                             n.fast[AZAHAR_FAST_TICK], n.fast[AZAHAR_FAST_CACHE],
+                             n.fast[AZAHAR_FAST_THREAD_ID], n.fast[AZAHAR_FAST_PROCESS_ID]);
+                    std::vector<u32> order;
+                    for (u32 i = 0; i < n.svcs.size(); i++) {
+                        if (n.svcs[i] != 0) {
+                            order.push_back(i);
+                        }
+                    }
+                    std::sort(order.begin(), order.end(),
+                              [&n](u32 a, u32 b) { return n.svcs[a] > n.svcs[b]; });
+                    std::string svcs;
+                    for (const u32 i : order) {
+                        svcs += fmt::format("{}{:02x} {}", svcs.empty() ? "" : ", ", i, n.svcs[i]);
+                    }
+                    LOG_INFO(Frontend, "perf: svc exits: {}", svcs.empty() ? "none" : svcs);
+                    std::string sleeps;
+                    for (const auto& s : n.sleeps) {
+                        if (s.count != 0) {
+                            sleeps += fmt::format("{}{:08x} thread {} ({} ns) {}",
+                                                  sleeps.empty() ? "" : ", ", s.lr, s.thread, s.ns,
+                                                  s.count);
+                        }
+                    }
+                    if (!sleeps.empty()) {
+                        LOG_INFO(Frontend, "perf: SleepThread exits by caller: {}; {} more", sleeps,
+                                 n.sleep_other);
+                    }
+                    LOG_INFO(Frontend,
+                             "perf: ArbitrateAddress exits: signal {} with no waiter, {} waking; "
+                             "wait {} passing, {} blocking; {} other",
+                             n.arb_signal_idle, n.arb_signal_wake, n.arb_wait_pass,
+                             n.arb_wait_block, n.arb_other);
                     // The GPU's operations and presents in the second (ms).
                     const auto r = system.GPU().TakeOpStats();
                     LOG_INFO(Frontend,

@@ -17,7 +17,9 @@
 //                 N=0, STAGE_L2, 2026-08-29)
 //   azaharRun        enter the guest in user mode with a register file, leave it on the first
 //                 exception (svc, undefined, prefetch or data abort), return the register file
-//                 and the reason (entry.S; new)
+//                 and the reason (entry.S). The svcs the module can answer from what it
+//                 has (AZAHAR_FAST_*: the guest clock, the cache svcs, the current IDs) are
+//                 answered in the vector, and the guest runs on
 //   azaharRelease    put Sony's registers back on core 2, end the resident thread, and hand the
 //                 core back to the scheduler. The order is what makes the hand-back safe:
 //                 restoring the mask while the thread still occupied the core left the core
@@ -327,6 +329,35 @@ static uint32_t azahar_host[4] __attribute__((aligned(8)));
 static volatile uint32_t azahar_run_reason, azahar_run_svc, azahar_run_fsr, azahar_run_far, azahar_run_spsr,
     azahar_run_rawlr, azahar_run_pmr_before, azahar_run_pmr_after;
 
+// The svcs answered in the guest's own world (azahar_native.h, AZAHAR_FAST_*): entry.S's
+// azahar_svc_fast reads this and counts in it; azaharRun fills it for each slice. The offsets are
+// entry.S's FAST_* and are checked below.
+typedef struct AzaharFast {
+    uint32_t on;          // AZAHAR_FAST_* bits allowed this slice
+    uint32_t timer;       // the private timer's counter register, 0 when the slice has no timer
+    uint32_t quantum;     // the counter's start
+    uint32_t mult_int;    // guest ticks per private-timer tick, whole part
+    uint32_t mult_frac;   // and fraction, in 1/2^32
+    uint32_t base_lo, base_hi;        // the guest clock at entry
+    uint32_t thread_id, process_id;   // the running guest thread's and its process's IDs
+    uint32_t count[AZAHAR_FAST_KINDS]; // answered this slice
+    uint32_t save[4];     // the guest's r4-r7 while the vector works
+} AzaharFast;
+AzaharFast azahar_fast __attribute__((aligned(8)));
+_Static_assert(__builtin_offsetof(AzaharFast, mult_int) == 0x0c, "entry.S FAST_MULT_INT");
+_Static_assert(__builtin_offsetof(AzaharFast, base_lo) == 0x14, "entry.S FAST_BASE_LO");
+_Static_assert(__builtin_offsetof(AzaharFast, process_id) == 0x20, "entry.S FAST_PROCESS_ID");
+_Static_assert(__builtin_offsetof(AzaharFast, count) == 0x24, "entry.S FAST_COUNT");
+_Static_assert(__builtin_offsetof(AzaharFast, save) == 0x34, "entry.S FAST_SAVE");
+// The guest clock rate and timer clock mult_int/mult_frac were made for.
+static uint64_t azahar_fast_tick_hz;
+static uint32_t azahar_fast_timer_hz;
+
+// Private-timer ticks as guest ticks, as azahar_svc_fast computes them: monotonic in `spent`.
+static uint64_t fast_guest_ticks(uint32_t spent) {
+    return (uint64_t)spent * azahar_fast.mult_int + (((uint64_t)spent * azahar_fast.mult_frac) >> 32);
+}
+
 extern int azahar_enter(AzaharContext *ctx, uint32_t *host);
 extern uint32_t azahar_get_banked_sp(uint32_t mode);
 extern void azahar_set_banked_sp(uint32_t mode, uint32_t sp);
@@ -613,6 +644,15 @@ static void core2_run(void) {
     azahar_progress = 2;
     wr_tpidruro(azahar_ctx.tpidruro);
     wr_tpidrurw(azahar_ctx.tpidrurw);
+    // IRQs off at the CPU from the timer's start until the guest runs: azahar_enter returns
+    // from exception into it with the guest's CPSR, which lets a timer that has already
+    // expired in as an ordinary preemption. With IRQs open here, a quantum that ran out before
+    // azahar_enter masked them took the IRQ stub with
+    // azahar_guest_active set: it saved this host code's System-mode registers as the guest's,
+    // and the next slice entered user mode at an address in this module and took a prefetch
+    // abort. Restored once the timer is stopped below.
+    uint32_t irq_was;
+    asm volatile("mrs %0, cpsr \n cpsid i" : "=r"(irq_was)::"memory");
     if (pmr && azahar_run_quantum_ticks) {
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
         *(volatile uint32_t *)(gic_va + PTIMER_STATUS) = 1;
@@ -635,6 +675,10 @@ static void core2_run(void) {
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
         *(volatile uint32_t *)(gic_va + PTIMER_STATUS) = 1;
         asm volatile("dsb \n isb" ::: "memory");
+    }
+    if (!(irq_was & 0x80u)) {
+        // A timer IRQ still pending from the slice goes to the stray path, which ends it.
+        asm volatile("cpsie i" ::: "memory");
     }
     azahar_ctx.tpidruro = rd_tpidruro();
     azahar_ctx.tpidrurw = rd_tpidrurw();
@@ -1331,7 +1375,7 @@ static int build_table(const AzaharMapRequest *req) {
                 (uint32_t)(uintptr_t)&gic_va,        (uint32_t)(uintptr_t)&sv_ttbcr,
                 (uint32_t)(uintptr_t)&azahar_l1_pa,     (uint32_t)(uintptr_t)&azahar_run_reason,
                 (uint32_t)(uintptr_t)azahar_sony,       (uint32_t)(uintptr_t)&azahar_state,
-                (uint32_t)(uintptr_t)azahar_irq_stack_top,
+                (uint32_t)(uintptr_t)azahar_irq_stack_top, (uint32_t)(uintptr_t)&azahar_fast,
             };
             uint32_t bases[2] = {0, 0};
             for (unsigned seg = 0; seg < 2; seg++) {
@@ -1415,6 +1459,7 @@ static int build_table(const AzaharMapRequest *req) {
             (uint32_t)(uintptr_t)&gic_va,          (uint32_t)(uintptr_t)&sv_ttbcr,
             (uint32_t)(uintptr_t)&azahar_l1_pa,       (uint32_t)(uintptr_t)&azahar_run_reason,
             (uint32_t)(uintptr_t)azahar_sony,         (uint32_t)(uintptr_t)&azahar_state,
+            (uint32_t)(uintptr_t)&azahar_fast,
         };
         for (unsigned i = 0; i < sizeof(spot) / sizeof(spot[0]); i++) {
             keep[nkeep].addr = spot[i];
@@ -1699,6 +1744,7 @@ static AzaharRunRequest azahar_run_req;
 int azaharRun(AzaharRunRequest *user_req) {
     uint32_t state;
     ENTER_SYSCALL(state);
+    const uint32_t start_us = ksceKernelGetSystemTimeLow();
     log_open();
     int ret = 0;
 
@@ -1727,6 +1773,30 @@ int azaharRun(AzaharRunRequest *user_req) {
         }
     }
     azahar_run_timer_left = 0;
+    // What azahar_svc_fast may answer this slice. GetSystemTick needs the slice's timer, and the
+    // conversion to guest ticks, made again only when one of the two clocks changes.
+    azahar_fast.on = azahar_run_req.fast & AZAHAR_FAST_ALL;
+    azahar_fast.timer = 0;
+    const int timed = azahar_run_quantum_ticks && azahar_run_req.tick_hz;
+    if (timed) {
+        if (azahar_run_req.tick_hz != azahar_fast_tick_hz || azahar_timer_hz != azahar_fast_timer_hz) {
+            azahar_fast_tick_hz = azahar_run_req.tick_hz;
+            azahar_fast_timer_hz = azahar_timer_hz;
+            azahar_fast.mult_int = (uint32_t)(azahar_fast_tick_hz / azahar_timer_hz);
+            azahar_fast.mult_frac = (uint32_t)(((azahar_fast_tick_hz % azahar_timer_hz) << 32) / azahar_timer_hz);
+        }
+        if (gic_va) {
+            azahar_fast.timer = gic_va + PTIMER_COUNTER;
+        }
+    }
+    azahar_fast.quantum = azahar_run_quantum_ticks;
+    azahar_fast.base_lo = (uint32_t)azahar_run_req.tick_base;
+    azahar_fast.base_hi = (uint32_t)(azahar_run_req.tick_base >> 32);
+    azahar_fast.thread_id = azahar_run_req.thread_id;
+    azahar_fast.process_id = azahar_run_req.process_id;
+    for (unsigned i = 0; i < AZAHAR_FAST_KINDS; i++) {
+        azahar_fast.count[i] = 0;
+    }
     if (azahar_verbose) {
         emit("== azaharRun  pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u ticks\n",
              azahar_ctx.r[15], azahar_ctx.cpsr, azahar_ctx.r[13], azahar_ctx.r[0], azahar_ctx.r[1],
@@ -1769,6 +1839,14 @@ int azaharRun(AzaharRunRequest *user_req) {
     azahar_run_req.raw_lr = azahar_run_rawlr;
     azahar_run_req.timer_hz = azahar_timer_hz;
     azahar_run_req.timer_left = azahar_run_timer_left;
+    // The counter read at the exit is below every one azahar_svc_fast read, so no GetSystemTick
+    // it answered is ahead of tick_base + guest_ticks.
+    azahar_run_req.guest_ticks =
+        timed ? fast_guest_ticks(azahar_run_quantum_ticks - azahar_run_timer_left) : 0;
+    for (unsigned i = 0; i < AZAHAR_FAST_KINDS; i++) {
+        azahar_run_req.fast_count[i] = azahar_fast.count[i];
+    }
+    azahar_run_req.kernel_us = ksceKernelGetSystemTimeLow() - start_us;
     azahar_run_count++;
     if (azahar_verbose || (azahar_run_reason > AZAHAR_EXIT_SVC && azahar_run_reason != AZAHAR_EXIT_TIMER)) {
         // Faults are rare enough to record. svc exits are the common case, and a guest that

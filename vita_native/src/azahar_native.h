@@ -62,6 +62,19 @@ typedef struct AzaharContext {
 #define AZAHAR_EXIT_DABT 4u
 #define AZAHAR_EXIT_TIMER 5u   // the preemption quantum expired; r[15] is the next instruction
 
+// The svcs the module answers in the guest's own world, without an exit (entry.S's
+// azahar_svc_fast): the guest resumes at the next instruction with the result in its registers,
+// and the slice goes on. AzaharRunRequest.fast says which; anything else, or the same svc with
+// another handle, exits as AZAHAR_EXIT_SVC. Since version 14.
+#define AZAHAR_FAST_TICK 0u       // 0x28 GetSystemTick: tick_base plus the slice's time so far
+#define AZAHAR_FAST_CACHE 1u      // 0x52-0x54 Invalidate/Store/FlushProcessDataCache on the
+                                  // current process (0xFFFF8001): success, as the HLE kernel
+                                  // answers them
+#define AZAHAR_FAST_THREAD_ID 2u  // 0x37 GetThreadId on the current thread (0xFFFF8000)
+#define AZAHAR_FAST_PROCESS_ID 3u // 0x35 GetProcessId on the current process (0xFFFF8001)
+#define AZAHAR_FAST_KINDS 4u
+#define AZAHAR_FAST_ALL ((1u << AZAHAR_FAST_KINDS) - 1u)
+
 typedef struct AzaharRunRequest {
     AzaharContext ctx;       // in: the state to enter with; out: the state at exit
     uint32_t reason;      // out: AZAHAR_EXIT_*
@@ -73,6 +86,18 @@ typedef struct AzaharRunRequest {
     uint32_t quantum_us;  // in: preemption quantum; 0 runs without a timer (the guest must trap)
     uint32_t timer_hz;    // out: the private timer's measured clock
     uint32_t timer_left;  // out: timer counter at exit (ticks not yet spent)
+    // Since version 14.
+    uint32_t fast;        // in: 1 << AZAHAR_FAST_* for each svc the module may answer itself
+    uint32_t thread_id;   // in: the running guest thread's ID (AZAHAR_FAST_THREAD_ID)
+    uint32_t process_id;  // in: its process's ID (AZAHAR_FAST_PROCESS_ID)
+    uint32_t reserved;
+    uint64_t tick_hz;     // in: the guest clock's rate, in ticks a second (AZAHAR_FAST_TICK)
+    uint64_t tick_base;   // in: the guest clock at entry
+    uint64_t guest_ticks; // out: the slice's length on the guest clock, timed by the private
+                          // timer. No AZAHAR_FAST_TICK answer exceeds tick_base + guest_ticks
+    uint32_t fast_count[AZAHAR_FAST_KINDS]; // out: the svcs answered in the guest, by kind
+    uint32_t kernel_us;   // out: azaharRun's own time, the guest's included
+    uint32_t reserved2;
 } AzaharRunRequest;
 
 // Runtime edits to the guest's mapping, for svcControlMemory / svcMapMemoryBlock and friends.

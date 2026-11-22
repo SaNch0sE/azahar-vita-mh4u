@@ -88,6 +88,10 @@ public:
     /// Clears the exclusive monitor's state.
     virtual void ClearExclusiveState() = 0;
 
+    /// Called before a savestate is written, between slices: a backend that rewrote guest code
+    /// puts the guest's own code back.
+    virtual void PrepareSaveState() {}
+
     /// Notify CPU emulation that page tables have changed
     virtual void SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) = 0;
 

@@ -67,6 +67,8 @@ private:
     /// Resume one thread found to be waiting on the address under this address arbiter and return
     /// the resumed thread.
     bool ResumeHighestPriorityThread(VAddr address);
+    /// Wakes a waiter a signal released, with a success result.
+    static void ResumeSignaled(Thread& thread);
 
     /// Threads waiting for the address arbiter to be signaled.
     std::vector<std::shared_ptr<Thread>> waiting_threads;

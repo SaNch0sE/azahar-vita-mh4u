@@ -298,6 +298,12 @@ void System::SaveState(u32 slot) const {
         throw std::runtime_error("Could not write to file " + path);
     }
 
+    // A backend that rewrote guest code (the Vita's VFP thunks) puts the guest's own back: the
+    // state holds the title's code, and a load patches it again as it traps.
+    for (const auto& cpu_core : cpu_cores) {
+        cpu_core->PrepareSaveState();
+    }
+
     // Serialize straight through the compressor into the file.
     ZstdFileOStreamBuf zstd_buf{file};
     std::ostream stream{&zstd_buf};

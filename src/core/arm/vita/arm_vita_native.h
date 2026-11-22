@@ -4,9 +4,11 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 #include "core/arm/arm_interface.h"
 #include "azahar_native.h"
@@ -62,6 +64,12 @@ public:
     /// Highest guest address the module's table can hold, exclusive.
     static constexpr u32 GuestEnd = 0x40000000;
 
+    std::string Describe(VAddr addr) const;
+
+    /// App memory mapped into the guest's table read and execute beside the process's mappings (the
+    /// thunks, below the process image). Kept across page table changes.
+    void MapExtra(VAddr base, u32 size, u8* host);
+
 private:
     struct Mapping {
         u32 size;
@@ -83,6 +91,8 @@ private:
     const void* mirrored{};
     /// Guest ranges currently mapped (or recorded for the install), keyed by guest base, disjoint.
     std::map<VAddr, Mapping> live_mappings;
+    VAddr extra_base{};
+    Mapping extra{};
 };
 
 /**
@@ -95,8 +105,25 @@ private:
  * owns the core's translation table (VitaGuestMap keeps it in step) and the guest runs at PL0
  * under vectors the module installed. See DEVELOPMENT.md.
  *
+ * The svcs the module can answer from what each slice hands it - GetSystemTick, the cache
+ * svcs on the current process, the current thread's and process's IDs (AZAHAR_FAST_*) - never
+ * leave the guest: its vector answers them and the slice runs on.
+ *
  * Both emulated cores share the one taken core and the one host thread, as on Linux.
  */
+#ifdef VITA_DIAGNOSTICS
+/// The native core's slices since the last TakeVitaNativeCensus (sgxd_flags `perflog`).
+struct VitaNativeCensus {
+    u32 slices{};
+    std::array<u32, AZAHAR_EXIT_TIMER + 1> reasons{}; ///< By AZAHAR_EXIT_*.
+    std::array<u32, 256> svcs{};                      ///< The svc exits, by immediate.
+    std::array<u32, AZAHAR_FAST_KINDS> fast{};        ///< By AZAHAR_FAST_*.
+    u64 guest_ticks{}; ///< The slices' time in the guest, on the guest clock.
+    u64 kernel_us{};   ///< azaharRun's own time, the guest's included.
+};
+VitaNativeCensus TakeVitaNativeCensus();
+#endif
+
 class ARM_VitaNative final : public ARM_Interface {
 public:
     explicit ARM_VitaNative(Core::System& system, Memory::MemorySystem& memory, u32 id,
@@ -135,6 +162,10 @@ public:
     void SaveContext(ThreadContext& ctx) override;
     void LoadContext(const ThreadContext& ctx) override;
     void PrepareReschedule() override;
+    /// Puts back every VFP instruction PatchVfp replaced, after finishing or undoing the thunk
+    /// any thread stands in: the state holds the guest's own code, and each site is patched again
+    /// at its next trap.
+    void PrepareSaveState() override;
 
     bool HasSingleInstructionBreakAccuracy() override {
         return false;
@@ -146,8 +177,9 @@ protected:
 private:
     /// One trip into the guest. Returns false if the core should stop running for now.
     bool RunSlice(u64 quantum_ns);
-    void CreditTime(const AzaharRunRequest& run, u64 quantum_ns);
     void ReportFault(const AzaharRunRequest& run);
+    bool PatchVfpThunk(u32 pc, u32 insn, bool thumb);
+    u32 FetchCode(u32 pc, bool thumb) const;
 
     Core::System& system;
     Memory::MemorySystem& memory;

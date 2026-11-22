@@ -181,6 +181,10 @@ void Timing::Timer::AddTicks(u64 ticks) {
     downcount -= static_cast<u64>(ticks * cpu_clock_scale);
 }
 
+void Timing::Timer::AddScaledTicks(u64 ticks) {
+    downcount -= static_cast<s64>(ticks);
+}
+
 u64 Timing::Timer::GetIdleTicks() const {
     return static_cast<u64>(idled_cycles);
 }

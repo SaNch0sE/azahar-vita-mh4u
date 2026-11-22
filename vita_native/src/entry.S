@@ -7,7 +7,8 @@
 @ exception into user mode at ctx.r15 with ctx.cpsr. It "returns" only when the guest takes an
 @ exception — svc, undefined instruction, prefetch abort or data abort — through one of the four
 @ vector stubs below, which save the user registers back into ctx, record why, and unwind to the
-@ C caller as if azahar_enter had returned. The return value is the reason.
+@ C caller as if azahar_enter had returned. The return value is the reason. The svcs
+@ azahar_svc_fast answers are the exception: the guest gets its result and runs on.
 @
 @ Layout of AzaharContext: r0..r15 at 0x00..0x3c, cpsr at 0x40, tpidruro at 0x44.
 @ Layout of the host block: 0x00 host cpsr, 0x04 host sp, 0x08 original SP_svc, 0x0c ctx address.
@@ -34,6 +35,9 @@ azahar_enter:
     str     r3, [r2]
     mrs     r2, cpsr
     str     r2, [r1, #0x00]         @ host cpsr: mode and interrupt bits to come back to
+    @ Masked before azahar_guest_active is set: an IRQ between the two would find a guest
+    @ "active" and save this host code's registers as the guest's.
+    cpsid   if
     str     sp, [r1, #0x04]         @ host sp, in the host's mode
     str     r0, [r1, #0x0c]         @ ctx, for the exception stubs
     ldr     r3, =azahar_host_ptr
@@ -62,8 +66,8 @@ azahar_enter:
     @ no-op honest. A spurious strex failure is architecturally permitted and every lock loop
     @ retries, so clearing on every entry costs nothing but the instruction.
     clrex
-    cpsid   if                      @ nothing may interrupt the banked-register dance
-    cps     #0x13                   @ Supervisor
+    cps     #0x13                   @ Supervisor (IRQs masked above: nothing may interrupt
+                                    @ the banked-register dance)
     str     sp, [r1, #0x08]         @ Sony's SP_svc, put back on exit
     ldr     r2, =azahar_progress
     mov     r3, #11
@@ -83,7 +87,8 @@ azahar_enter:
 @ else ran on this core while our vectors were installed — record it once, put this mode's SP
 @ back, and chain to Sony's handler for that vector through a {sp, pc} pair C filled in at
 @ install. The 2026-08-29 run without this took a prefetch abort between install and the first
-@ run and looped through the stubs storing to a null ctx pointer.
+@ run and looped through the stubs storing to a null ctx pointer. The svc stub with a guest
+@ active goes to azahar_svc_fast first, which answers some svcs without leaving.
     .macro AZAHAR_STUB name, reason
     .global azahar_vec_\name
     .type azahar_vec_\name, %function
@@ -94,12 +99,16 @@ azahar_vec_\name:
     ldr     sp, [sp]
     cmp     sp, #0
     beq     9f
+    .if \reason == 1
+    b       azahar_svc_fast
+    .else
     ldr     sp, =azahar_ctx_ptr
     ldr     sp, [sp]
     stmia   sp, {r0-r14}^
     nop
     mov     r0, #\reason
     b       azahar_exit_common
+    .endif
 9:  ldr     sp, =azahar_stray_stack_top
     push    {r0-r3}
     ldr     r0, =azahar_stray
@@ -154,6 +163,130 @@ azahar_vec_\name:
     AZAHAR_STUB svc, 1
     AZAHAR_STUB pabt, 3
     AZAHAR_STUB dabt, 4
+
+@ ---------------------------------------------------------------------------- svc fast path
+@ The svcs answered without leaving the guest (azahar_native.h, AZAHAR_FAST_*). Reached from the
+@ svc stub with a guest active: Supervisor mode, IRQs masked, LR_svc the instruction after the
+@ svc, SPSR_svc the guest's CPSR. The guest's r4-r7 go to azahar_fast's save words while this
+@ works, and an answer goes straight back to the guest with `movs pc, lr`: nothing is stored
+@ to ctx, the table, vectors and VFP bank stay, and the slice and its timer run on. Any other
+@ svc - or one of these with another handle, or one azaharRun did not allow - takes the
+@ ordinary exit with every register as the guest left it. Touches only what the guest's table
+@ maps: the svc instruction (guest code is readable at PL1), azahar_fast (this module's data)
+@ and the private timer (the GIC window); and no VFP register, since the bank is the guest's.
+@ Layout of azahar_fast (native.c, AzaharFast): on 0x00, timer 0x04, quantum 0x08, mult_int
+@ 0x0c, mult_frac 0x10, base 0x14 (low) and 0x18, thread_id 0x1c, process_id 0x20, count[4]
+@ 0x24, save[4] 0x34.
+    .equ FAST_ON, 0x00
+    .equ FAST_TIMER, 0x04
+    .equ FAST_QUANTUM, 0x08
+    .equ FAST_MULT_INT, 0x0c
+    .equ FAST_MULT_FRAC, 0x10
+    .equ FAST_BASE_LO, 0x14
+    .equ FAST_BASE_HI, 0x18
+    .equ FAST_THREAD_ID, 0x1c
+    .equ FAST_PROCESS_ID, 0x20
+    .equ FAST_COUNT, 0x24
+    .equ FAST_SAVE, 0x34
+
+azahar_svc_fast:
+    ldr     sp, =azahar_fast
+    add     sp, sp, #FAST_SAVE
+    stmia   sp, {r4-r7}
+    sub     r6, sp, #FAST_SAVE          @ r6 = azahar_fast from here on
+    ldr     r7, [r6, #FAST_ON]
+    cmp     r7, #0
+    beq     8f
+    mrs     r4, spsr
+    tst     r4, #0x20                   @ Thumb: a 16-bit svc, 8-bit immediate
+    ldrhne  r5, [lr, #-2]
+    andne   r5, r5, #0xff
+    ldreq   r5, [lr, #-4]
+    biceq   r5, r5, #0xff000000
+    cmp     r5, #0x28
+    beq     1f
+    cmp     r5, #0x37
+    beq     3f
+    cmp     r5, #0x35
+    beq     4f
+    sub     r4, r5, #0x52
+    cmp     r4, #2
+    bls     2f
+    b       8f
+
+1:  @ GetSystemTick: r1:r0 = base + spent * mult, spent the timer ticks since entry. native.c
+    @ computes guest_ticks at the exit the same way, from a smaller counter, so no answer here
+    @ is ever ahead of the clock the app keeps.
+    tst     r7, #(1 << 0)
+    beq     8f
+    ldr     r4, [r6, #FAST_TIMER]
+    cmp     r4, #0
+    beq     8f
+    ldr     r4, [r4]                    @ the counter, down from the quantum (0 once expired)
+    ldr     r5, [r6, #FAST_QUANTUM]
+    sub     r5, r5, r4                  @ spent
+    ldr     r4, [r6, #FAST_MULT_FRAC]
+    umull   r0, r1, r5, r4              @ r1 = spent * frac >> 32
+    ldr     r4, [r6, #FAST_MULT_INT]
+    umull   r0, r7, r5, r4              @ r7:r0 = spent * int
+    adds    r0, r0, r1
+    adc     r7, r7, #0
+    ldr     r4, [r6, #FAST_BASE_LO]
+    ldr     r5, [r6, #FAST_BASE_HI]
+    adds    r0, r0, r4
+    adc     r1, r7, r5
+    mov     r4, #(FAST_COUNT + 0 * 4)
+    b       7f
+
+2:  @ Invalidate/Store/FlushProcessDataCache on the current process: success
+    tst     r7, #(1 << 1)
+    beq     8f
+    ldr     r4, =0xffff8001
+    cmp     r0, r4
+    bne     8f
+    mov     r0, #0
+    mov     r4, #(FAST_COUNT + 1 * 4)
+    b       7f
+
+3:  @ GetThreadId on the current thread: r0 = 0, r1 = the ID
+    tst     r7, #(1 << 2)
+    beq     8f
+    ldr     r4, =0xffff8000
+    cmp     r1, r4
+    bne     8f
+    mov     r0, #0
+    ldr     r1, [r6, #FAST_THREAD_ID]
+    mov     r4, #(FAST_COUNT + 2 * 4)
+    b       7f
+
+4:  @ GetProcessId on the current process: r0 = 0, r1 = the ID
+    tst     r7, #(1 << 3)
+    beq     8f
+    ldr     r4, =0xffff8001
+    cmp     r1, r4
+    bne     8f
+    mov     r0, #0
+    ldr     r1, [r6, #FAST_PROCESS_ID]
+    mov     r4, #(FAST_COUNT + 3 * 4)
+    b       7f
+
+7:  @ answered: count it, put r4-r7 back, resume the guest after its svc
+    ldr     r5, [r6, r4]
+    add     r5, r5, #1
+    str     r5, [r6, r4]
+    add     sp, r6, #FAST_SAVE
+    ldmia   sp, {r4-r7}
+    movs    pc, lr
+
+8:  @ not answered here: the ordinary svc exit
+    add     sp, r6, #FAST_SAVE
+    ldmia   sp, {r4-r7}
+    ldr     sp, =azahar_ctx_ptr
+    ldr     sp, [sp]
+    stmia   sp, {r0-r14}^
+    nop
+    mov     r0, #1
+    b       azahar_exit_common
 
 @ IRQ. With ICCPMR at 0x10 the only interrupt that reaches this core is our private timer (PPI
 @ 29, banked priority 00), so this is the preemption tick. With a guest active: save the user

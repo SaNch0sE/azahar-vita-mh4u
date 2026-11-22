@@ -212,6 +212,13 @@ public:
         u64 GetIdleTicks() const;
 
         void AddTicks(u64 ticks);
+        /// Advances GetTicks by exactly `ticks`, the clock scale already applied: for the Vita's
+        /// native core, which times the guest on a host timer and has to land where the guest's
+        /// own reads of the clock (answered in its kernel module) left it.
+        void AddScaledTicks(u64 ticks);
+        double GetClockScale() const {
+            return cpu_clock_scale;
+        }
 
         s64 GetDowncount() const;
 

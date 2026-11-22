@@ -28,6 +28,14 @@ void AddressArbiter::WaitThread(std::shared_ptr<Thread> thread, VAddr wait_addre
     waiting_threads.emplace_back(std::move(thread));
 }
 
+void AddressArbiter::ResumeSignaled(Thread& thread) {
+    // The timeout types answered the waiter ResultTimeout when it went to sleep (ArbitrateAddress,
+    // below); a signal before the timeout is a success. Without this libctru's LightEvent_WaitTimeout,
+    // which loops until the timeout result, took every signal for a timeout.
+    thread.SetWaitSynchronizationResult(ResultSuccess);
+    thread.ResumeFromWait();
+}
+
 u64 AddressArbiter::ResumeAllThreads(VAddr address) {
     // Determine which threads are waiting on this address, those should be woken up.
     auto itr = std::stable_partition(waiting_threads.begin(), waiting_threads.end(),
@@ -39,7 +47,7 @@ u64 AddressArbiter::ResumeAllThreads(VAddr address) {
 
     // Wake up all the found threads
     const u64 num_threads = std::distance(itr, waiting_threads.end());
-    std::for_each(itr, waiting_threads.end(), [](auto& thread) { thread->ResumeFromWait(); });
+    std::for_each(itr, waiting_threads.end(), [](auto& thread) { ResumeSignaled(*thread); });
 
     // Remove the woken up threads from the wait list.
     waiting_threads.erase(itr, waiting_threads.end());
@@ -68,7 +76,7 @@ bool AddressArbiter::ResumeHighestPriorityThread(VAddr address) {
     }
 
     auto thread = *itr;
-    thread->ResumeFromWait();
+    ResumeSignaled(*thread);
     waiting_threads.erase(itr);
 
     return true;

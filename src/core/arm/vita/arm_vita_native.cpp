@@ -7,8 +7,13 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <optional>
+#include <string_view>
+#include <utility>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
 #include "common/assert.h"
+#include "common/host_shared_memory.h"
 #include "common/logging/log.h"
 #include "core/core.h"
 #include "video_core/gpu.h"
@@ -18,11 +23,15 @@
 #include "core/hle/kernel/vm_manager.h"
 #include "core/hle/kernel/thread.h"
 #include "core/memory.h"
+#include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/vprof.h"
 
 namespace Core {
 
 namespace {
+
+/// TakeVitaNativeCensus's counts since the last call.
+VitaNativeCensus census;
 
 /// Never hand the guest a slice longer than this, so a runaway guest cannot stall the frontend.
 constexpr u64 MaxQuantumNs = 16'000'000;
@@ -34,10 +43,6 @@ u64 TicksToNanoseconds(s64 ticks) {
         return 0;
     }
     return static_cast<u64>(ticks) * 1'000'000'000ull / BASE_CLOCK_RATE_ARM11;
-}
-
-u64 NanosecondsToTicks(u64 nanoseconds) {
-    return nanoseconds * BASE_CLOCK_RATE_ARM11 / 1'000'000'000ull;
 }
 
 /// Every guest page is mapped read, write and execute. The emulated process's own permissions
@@ -66,6 +71,164 @@ const char* ReasonName(u32 reason) {
     }
 }
 
+// ---------------------------------------------------------------------------- VFP thunks
+// A trapping VFP site becomes a branch (ARM B<cond>, Thumb B.W) to a guest-code thunk:
+//   push {r0-r2}; mrs r1, apsr; vmrs r2, fpscr; and r2, r2, #LEN|STRIDE; cmp r2, #vector; bne miss
+//   LEN and STRIDE cleared; the elements as scalars; FPSCR and APSR back; pop {r0-r2}; b site+4
+// miss: msr apsr_nzcvq, r1; pop {r0-r2}; the original instruction; b site+4
+
+/// The thunk area, below PROCESS_IMAGE_VADDR: ARM sites below ~0x020C0000 reach it, Thumb sites
+/// below ~0x010C0000; farther ones take the svc.
+constexpr VAddr VfpAreaBase = 0x000C0000;
+constexpr u32 VfpAreaSize = 0x40000;
+/// The largest thunk: ARM 19 words and eight elements, Thumb about as many bytes.
+constexpr u32 VfpThunkMax = 128;
+
+bool InVfpArea(u32 addr) {
+    return addr - VfpAreaBase < VfpAreaSize;
+}
+
+/// A patched site: the original instruction (Thumb's halfwords high first, as fetched).
+struct VfpSite {
+    u32 insn;
+    bool thumb;
+};
+
+/// A thunk's instructions by address, for a thread stopped inside it (FinishVfpThunk).
+struct VfpThunk {
+    u32 site;
+    bool thumb;
+    u32 mrs;      ///< mrs r1: past it r1 holds the guest's flags
+    u32 elements; ///< the first element: from here LEN and STRIDE are cleared
+    u32 restore;  ///< the vmrs after the last element
+    u32 back;     ///< the hit's branch back
+    u32 miss;     ///< the miss's msr
+    u32 miss_original;
+    u32 miss_back;
+    u32 end;
+};
+
+/// The guest's patched sites and thunks (one guest, whichever core runs it), the area, and the
+/// map it is mapped into.
+std::unordered_map<u32, VfpSite> vfp_patched;
+std::map<u32, VfpThunk> vfp_thunks;
+std::unique_ptr<Common::HostSharedMemory> vfp_area;
+const VitaGuestMap* vfp_area_map{};
+u32 vfp_area_used{};
+
+/// The guest that map held is gone, and its patches with it.
+void ForgetVfpPatches(const VitaGuestMap* map) {
+    if (vfp_area_map == map) {
+        vfp_patched.clear();
+        vfp_thunks.clear();
+        vfp_area_used = 0;
+        vfp_area_map = nullptr;
+    }
+}
+
+/// ARM B<cond> at `from` to `to`, if in reach.
+std::optional<u32> ArmBranch(u32 cond, u32 from, u32 to) {
+    const s32 off = static_cast<s32>(to - (from + 8));
+    if ((off & 3) != 0 || off < -(1 << 25) || off >= (1 << 25)) {
+        return std::nullopt;
+    }
+    return cond << 28 | 0x0A000000u | ((static_cast<u32>(off) >> 2) & 0x00FFFFFFu);
+}
+
+/// Thumb-2 B.W (T4) at `from` to `to`, its halfwords, if in reach.
+std::optional<std::array<u16, 2>> ThumbBranchW(u32 from, u32 to) {
+    const s32 off = static_cast<s32>(to - (from + 4));
+    if ((off & 1) != 0 || off < -(1 << 24) || off >= (1 << 24)) {
+        return std::nullopt;
+    }
+    const u32 u = static_cast<u32>(off);
+    const u32 sign = u >> 31 & 1, i1 = u >> 23 & 1, i2 = u >> 22 & 1;
+    const u32 j1 = ~(i1 ^ sign) & 1, j2 = ~(i2 ^ sign) & 1;
+    return std::array<u16, 2>{static_cast<u16>(0xF000u | sign << 10 | (u >> 12 & 0x3FFu)),
+                              static_cast<u16>(0x9000u | j1 << 13 | j2 << 11 | (u >> 1 & 0x7FFu))};
+}
+
+/// Thumb-2's modified immediate (i:imm3:imm8) for v, if it has one.
+std::optional<u32> ThumbModifiedImm(u32 v) {
+    if (v < 256) {
+        return v;
+    }
+    for (u32 rot = 8; rot < 32; rot++) {
+        const u32 x = v << rot | v >> (32 - rot); // v is x rotated right by rot
+        if (x < 256 && (x & 0x80) != 0) {
+            return rot << 7 | (x & 0x7F);
+        }
+    }
+    return std::nullopt;
+}
+
+/// Thumb-2 data processing with a modified immediate: hw1 holds the op and Rn, hw2 Rd.
+std::array<u16, 2> ThumbImmOp(u16 hw1, u32 rd, u32 imm) {
+    const auto enc = ThumbModifiedImm(imm);
+    ASSERT_MSG(enc.has_value(), "Thumb-2 immediate {:#x}", imm);
+    return {static_cast<u16>(hw1 | (*enc >> 11 & 1) << 10),
+            static_cast<u16>((*enc >> 8 & 7) << 12 | rd << 8 | (*enc & 0xFF))};
+}
+
+/// A thread stopped inside a thunk leaves it as the thunk would have or as if it had not begun:
+/// before the elements it stands at the site again, past the first it runs the rest here.
+void FinishVfpThunk(Memory::MemorySystem& memory, AzaharContext& c) {
+    const u32 pc = c.r[15];
+    auto it = vfp_thunks.upper_bound(pc);
+    ASSERT_MSG(it != vfp_thunks.begin(), "a thread at {:08X} in no VFP thunk", pc);
+    const VfpThunk& t = (--it)->second;
+    ASSERT_MSG(pc < t.end, "a thread at {:08X} past its VFP thunk", pc);
+    const auto pop = [&] {
+        c.r[0] = memory.Read32(c.r[13]);
+        c.r[1] = memory.Read32(c.r[13] + 4);
+        c.r[2] = memory.Read32(c.r[13] + 8);
+        c.r[13] += 12;
+    };
+    const auto flags = [&] { c.cpsr = (c.cpsr & ~0xF8000000u) | (c.r[1] & 0xF8000000u); };
+    const u32 base = it->first;
+    if (pc == base) {
+        c.r[15] = t.site;
+        return;
+    }
+    if (pc < t.elements) {
+        if (pc > t.mrs) {
+            flags();
+        }
+        pop();
+        c.r[15] = t.site;
+        return;
+    }
+    if (pc < t.back) {
+        for (u32 a = std::max(pc, t.elements); a < t.restore; a += 4) {
+            const u8* const p = vfp_area->Data() + (a - VfpAreaBase);
+            u32 e;
+            if (t.thumb) {
+                u16 hw[2];
+                std::memcpy(hw, p, 4);
+                e = u32{hw[0]} << 16 | hw[1];
+            } else {
+                std::memcpy(&e, p, 4);
+            }
+            [[maybe_unused]] const bool ran = RunVfpVector(c, e);
+            DEBUG_ASSERT_MSG(ran, "a VFP thunk's element {:08X} at {:08X}", e, a);
+        }
+        c.fpscr |= c.r[2] & FpscrVectorBits;
+        flags();
+        pop();
+        c.r[15] = t.site + 4;
+        return;
+    }
+    if (pc == t.back || pc == t.miss_back) {
+        c.r[15] = t.site + 4;
+        return;
+    }
+    if (pc < t.miss_original) {
+        flags();
+        pop();
+    }
+    c.r[15] = t.site; // the miss path before its original ran
+}
+
 } // Anonymous namespace
 
 // ---------------------------------------------------------------------------- VitaGuestMap
@@ -76,6 +239,7 @@ VitaGuestMap::~VitaGuestMap() {
     if (installed) {
         azaharRelease();
     }
+    ForgetVfpPatches(this);
 }
 
 bool VitaGuestMap::Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) const {
@@ -101,6 +265,9 @@ void VitaGuestMap::OnMapped(VAddr base, u32 size, MemoryRef target) {
     if (base + size > GuestEnd || base + size < base) {
         return;
     }
+    DEBUG_ASSERT_MSG(extra.size == 0 || base + size <= extra_base ||
+                         base >= extra_base + extra.size,
+                     "a guest mapping {:#010x}+{:#x} over the VFP thunk area", base, size);
     u8* host = target.GetPtr();
     if (host == nullptr) {
         OnUnmapped(base, size);
@@ -126,6 +293,19 @@ void VitaGuestMap::OnMapped(VAddr base, u32 size, MemoryRef target) {
     if (installed) {
         Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(host), base, size, MapPerm(host));
     }
+}
+
+std::string VitaGuestMap::Describe(VAddr addr) const {
+    auto it = live_mappings.upper_bound(addr);
+    if (it == live_mappings.begin()) {
+        return "no window";
+    }
+    --it;
+    if (addr - it->first >= it->second.size) {
+        return "no window";
+    }
+    return fmt::format("window {:08X}+{:X} host {}", it->first, it->second.size,
+                       fmt::ptr(it->second.host + (addr - it->first)));
 }
 
 void VitaGuestMap::OnUnmapped(VAddr base, u32 size) {
@@ -201,6 +381,12 @@ bool VitaGuestMap::Install() {
             added++;
         }
     }
+    if (extra.size != 0) {
+        const bool mapped = Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(extra.host), extra_base,
+                                 extra.size, AZAHAR_PERM_R | AZAHAR_PERM_X);
+        ASSERT_MSG(mapped, "the VFP thunk area {:#010x}+{:#x} was not mapped", extra_base,
+                   extra.size);
+    }
     LOG_INFO(Core_ARM11, "Guest table installed on the taken core with {} range(s)", added);
     return true;
 }
@@ -225,6 +411,31 @@ void VitaGuestMap::SyncCode(VAddr base, u32 size) {
             Edit(AZAHAR_EDIT_SYNC_CODE, reinterpret_cast<u32>(it->second.host + (lo - it->first)),
                  lo, hi - lo, 0);
         }
+    }
+    if (extra.size != 0) {
+        const VAddr lo = std::max(extra_base, start);
+        const VAddr hi = std::min(extra_base + extra.size, end);
+        if (lo < hi) {
+            Edit(AZAHAR_EDIT_SYNC_CODE, reinterpret_cast<u32>(extra.host + (lo - extra_base)), lo,
+                 hi - lo, 0);
+        }
+    }
+}
+
+void VitaGuestMap::MapExtra(VAddr base, u32 size, u8* host) {
+    ASSERT_MSG(extra.size == 0 && size != 0 && ((base | size) & 0xFFFu) == 0 &&
+                   (reinterpret_cast<uintptr_t>(host) & 0xFFFu) == 0 &&
+                   base + size <= Memory::PROCESS_IMAGE_VADDR,
+               "an extra guest mapping {:#010x}+{:#x} at {}", base, size, fmt::ptr(host));
+    const auto next = live_mappings.lower_bound(base);
+    ASSERT_MSG(next == live_mappings.end() || next->first >= base + size,
+               "an extra guest mapping {:#010x}+{:#x} over a guest one", base, size);
+    extra_base = base;
+    extra = Mapping{size, host};
+    if (installed) {
+        const bool mapped = Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(host), base, size,
+                                 AZAHAR_PERM_R | AZAHAR_PERM_X);
+        ASSERT_MSG(mapped, "the extra guest mapping {:#010x}+{:#x} was not mapped", base, size);
     }
 }
 
@@ -324,6 +535,21 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     run.ctx.tpidruro = cp15[CP15_THREAD_URO];
     run.ctx.tpidrurw = cp15[CP15_THREAD_UPRW];
     run.quantum_us = static_cast<u32>(quantum_ns / 1000);
+    // The svcs the module answers without an exit (none of their answers change before one).
+    run.fast = AZAHAR_FAST_ALL;
+    auto& kernel = system.Kernel();
+    if (const auto* thread = kernel.GetCurrentThreadManager().GetCurrentThread()) {
+        run.thread_id = thread->GetThreadId();
+    } else {
+        run.fast &= ~(1u << AZAHAR_FAST_THREAD_ID);
+    }
+    if (const auto process = kernel.GetCurrentProcess()) {
+        run.process_id = process->process_id;
+    } else {
+        run.fast &= ~(1u << AZAHAR_FAST_PROCESS_ID);
+    }
+    run.tick_hz = static_cast<u64>(BASE_CLOCK_RATE_ARM11 * timer->GetClockScale() + 0.5);
+    run.tick_base = timer->GetTicks();
 
     const int ret = azaharRun(&run);
     if (ret < 0) {
@@ -335,7 +561,38 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
 
     context = run.ctx;
     cp15[CP15_THREAD_UPRW] = run.ctx.tpidrurw;
-    CreditTime(run, quantum_ns);
+    // The guest ticks the module counted, converted as its GetSystemTick answers were: the clock ends
+    // at or past every value the guest read in the slice.
+    timer->AddScaledTicks(run.guest_ticks);
+
+    census.slices++;
+    census.reasons[run.reason < census.reasons.size() ? run.reason : 0]++;
+    for (u32 i = 0; i < AZAHAR_FAST_KINDS; i++) {
+        census.fast[i] += run.fast_count[i];
+    }
+    census.guest_ticks += run.guest_ticks;
+    census.kernel_us += run.kernel_us;
+    if (run.reason == AZAHAR_EXIT_SVC) {
+        census.svcs[run.svc_number < census.svcs.size() ? run.svc_number : 0]++;
+        static const bool perflog = SgxdRenderer::SgxdFlag("perflog");
+        if (perflog && run.svc_number == 0x22) {
+            CountArbitration();
+        }
+        if (perflog && run.svc_number == 0x0A) {
+            const auto* thread = system.Kernel().GetCurrentThreadManager().GetCurrentThread();
+            const u32 id = thread ? thread->GetThreadId() : 0;
+            const s64 ns = static_cast<s64>(u64{context.r[1]} << 32 | context.r[0]);
+            auto it = std::find_if(census.sleeps.begin(), census.sleeps.end(), [&](const auto& s) {
+                return s.count == 0 || (s.lr == context.r[14] && s.thread == id);
+            });
+            if (it == census.sleeps.end()) {
+                census.sleep_other++;
+            } else {
+                *it = {context.r[14], id, it->count + 1, ns};
+            }
+        }
+    }
+#endif
 
     switch (run.reason) {
     case AZAHAR_EXIT_SVC:
@@ -355,20 +612,81 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     }
 }
 
-void ARM_VitaNative::CreditTime(const AzaharRunRequest& run, u64 quantum_ns) {
-    // The core's private timer counted the slice down; what it has left is what the guest did not
-    // use. Native execution has no instruction count, so guest time is real time.
-    u64 elapsed_ns = quantum_ns;
-    if (run.timer_hz != 0) {
-        const u64 quantum_ticks = quantum_ns / 1000 * run.timer_hz / 1'000'000ull;
-        const u64 spent = quantum_ticks > run.timer_left ? quantum_ticks - run.timer_left : 0;
-        elapsed_ns = spent * 1'000'000'000ull / run.timer_hz;
+#ifdef VITA_DIAGNOSTICS
+void ARM_VitaNative::CheckHostLeak(const char* where, u32 svc) {
+    // gxm_flags `leakcheck`: a guest register or IPC word within 64 KiB of this thread's own
+    // stack is an emulator address the guest was handed. The first hits are logged, with where they were seen.
+    static const bool on = GxmRenderer::GxmFlag("leakcheck");
+    static u32 hits = 0;
+    if (!on || hits >= 24) {
+        return;
     }
-    const u64 ticks = NanosecondsToTicks(elapsed_ns);
-    if (ticks > 0) {
-        timer->AddTicks(ticks);
+    const u32 stack = static_cast<u32>(reinterpret_cast<uintptr_t>(&where));
+    const auto near_stack = [stack](u32 value) { return value - (stack - 0x10000u) < 0x20000u; };
+    for (int i = 0; i < 15 && hits < 24; i++) {
+        if (near_stack(context.r[i])) {
+            LOG_WARNING(Core_ARM11,
+                        "leakcheck: r{} = {:08X} near the host stack {:08X}, after the {} "
+                        "(svc {:02X}), pc {:08X} lr {:08X}",
+                        i, context.r[i], stack, where, svc, context.r[15], context.r[14]);
+            hits++;
+        }
+    }
+    // After an IPC request: the reply in the thread's command buffer (TLS + 0x80).
+    if (std::string_view{where} == "svc" && svc == 0x32 && cp15[CP15_THREAD_URO] != 0) {
+        const VAddr cmdbuf = cp15[CP15_THREAD_URO] + 0x80;
+        for (u32 w = 0; w < 64 && hits < 24; w++) {
+            const u32 value = memory.Read32(cmdbuf + w * 4);
+            if (near_stack(value)) {
+                LOG_WARNING(Core_ARM11,
+                            "leakcheck: IPC reply word {} = {:08X} near the host stack {:08X} "
+                            "(header {:08X}), pc {:08X}",
+                            w, value, stack, memory.Read32(cmdbuf), context.r[15]);
+                hits++;
+            }
+        }
     }
 }
+
+void ARM_VitaNative::CountArbitration() {
+    // ArbitrateAddress(handle r0, address r1, type r2, value r3, ns r4:r5): would it wake a thread or
+    // block this one?
+    const VAddr address = context.r[1];
+    const u32 type = context.r[2];
+    const s32 value = static_cast<s32>(context.r[3]);
+    auto& kernel = system.Kernel();
+    switch (type) {
+    case 0: { // Signal
+        bool waiter = false;
+        for (u32 core = 0; core < system.GetNumCores() && !waiter; core++) {
+            for (const auto& thread : kernel.GetThreadManager(core).GetThreadList()) {
+                if (thread->status == Kernel::ThreadStatus::WaitArb &&
+                    thread->wait_address == address) {
+                    waiter = true;
+                    break;
+                }
+            }
+        }
+        (waiter ? census.arb_signal_wake : census.arb_signal_idle)++;
+        break;
+    }
+    case 1: // WaitIfLessThan
+    case 2: // DecrementAndWaitIfLessThan
+    case 3: // WaitIfLessThanWithTimeout
+    case 4: // DecrementAndWaitIfLessThanWithTimeout
+        (static_cast<s32>(memory.Read32(address)) < value ? census.arb_wait_block
+                                                          : census.arb_wait_pass)++;
+        break;
+    default:
+        census.arb_other++;
+        break;
+    }
+}
+
+VitaNativeCensus TakeVitaNativeCensus() {
+    return std::exchange(census, VitaNativeCensus{});
+}
+#endif
 
 void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
     std::string registers;
@@ -384,6 +702,40 @@ void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
         code += fmt::format("{}{:08X}", a == context.r[15] ? " *" : " ", memory.Read32(a));
     }
     LOG_CRITICAL(Core_ARM11, "code around PC:{}", code);
+    if (InThunkArea(run.ctx.r[15])) {
+        const ThunkClaim* const c = Host1ClaimAt(run.ctx.r[15]);
+        std::string host0;
+        for (u32 a = run.ctx.r[15] - 16; a <= run.ctx.r[15] + 12; a += 4) {
+            u32 w = 0;
+            if (thunk_area && InThunkArea(a)) {
+                std::memcpy(&w, thunk_area->Data() + (a - ThunkAreaBase), 4);
+            }
+            host0 += fmt::format("{}{:08X}", a == run.ctx.r[15] ? " *" : " ", w);
+        }
+        LOG_CRITICAL(Core_ARM11, "host 0's thunk area around PC:{}; upcall body {:08X}, tail {:08X}",
+                     host0, upcall_body, upcall_after_svc);
+        LOG_CRITICAL(Core_ARM11,
+                     "thunk area: host 1's stale {}, used {}; {} claims; the claim at PC: {}",
+                     host1_area_stale, host1_area_used, thunk_claims.load(std::memory_order_relaxed),
+                     c ? fmt::format("entry {:08X} for site {:08X} ({}, kind {})", c->entry,
+                                     c->site, c->thumb ? "Thumb" : "ARM",
+                                     static_cast<int>(c->kind))
+                       : std::string("none"));
+    }
+    // Where the guest came from: the code before LR and the stack from SP.
+    const u32 lr = context.r[14] & ~1u;
+    std::string call;
+    for (u32 a = lr - 16; a < lr + 8; a += 4) {
+        call += fmt::format("{}{:08X}", a == (lr & ~3u) ? " *" : " ", memory.Read32(a));
+    }
+    LOG_CRITICAL(Core_ARM11, "code around LR {:08X}:{}", context.r[14], call);
+    for (u32 row = 0; row < 8; row++) {
+        std::string words;
+        for (u32 w = 0; w < 8; w++) {
+            words += fmt::format(" {:08X}", memory.Read32(context.r[13] + (row * 8 + w) * 4));
+        }
+        LOG_CRITICAL(Core_ARM11, "stack {:08X}:{}", context.r[13] + row * 32, words);
+    }
     system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised, message.c_str());
 }
 

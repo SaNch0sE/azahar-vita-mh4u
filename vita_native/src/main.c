@@ -338,6 +338,8 @@ static uint32_t active_cpu_mask(void) {
 // 11: the samples carry the running thread (thid for cid), azaharProfThreadName.
 // 12: azaharProfKernelModule, the kernel's module segments.
 // 13: sgxdSubmitAsync queues lists (SGXD_CHAIN_RING) and returns the first op's index.
+// 14: azaharRun answers some svcs in the guest's own world (AZAHAR_FAST_*), and reports the
+//     slice's guest ticks and its own time.
 // 19: AzaharProfSample's syscall (svc, user PC, LR and SP) from the thread's SVC frame.
 int azaharVersion() {
     return 5;
