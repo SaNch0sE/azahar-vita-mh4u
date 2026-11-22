@@ -176,7 +176,8 @@ public:
     }
 
     /// Memory for width x height 32-bit samples (a depth store), rows width apart; the first
-    /// fit of what FreeSurface gave back. `upscaled`: in the upscaled top screen's block.
+    /// fit of what FreeSurface gave back. `upscaled`: the upscaled top screen's, from the
+    /// textures pool (AllocTexture).
     Data AllocSurface(u32 width, u32 height, bool upscaled = false);
     /// Memory AllocSurface gave, no longer used (a depth buffer the guest reshaped), after its
     /// last read.
@@ -356,13 +357,23 @@ public:
     /// 3D's microseconds of the render before.
     void EndPass(u32* ta_us = nullptr, u32* d3_us = nullptr);
 
-    /// Guest textures' host copies (RasterizerSgxd's texture cache), from a block of their own:
-    /// bytes at a 4 KiB multiple, the first fit of what FreeTexture gave back.
-    Data AllocTexture(u32 bytes);
-    /// What AllocTexture calls while the pool has no room: frees a texture and returns true, or
-    /// returns false when none can go (the rasterizer's cached textures, least recently used).
-    void SetTextureEvictor(std::function<bool()> evictor) {
-        texture_evictor = std::move(evictor);
+    /// Guest textures' host copies (RasterizerSgxd's texture cache): 4 KiB multiples, the smallest
+    /// free range that fits; MakeRoom drops textures for room, else the overflow. GPU writes to
+    /// the range follow its earlier users in queue order; a CPU write waits for `ready` first (the
+    /// fence of everything sent before the range was given back, 0 for none).
+    Data AllocTexture(u32 bytes, u32* ready = nullptr);
+    /// A host copy the texture cache may drop to make room: its range, and the key that names
+    /// its texture to the drop (a texture with an alpha copy lists both ranges under one key).
+    struct Droppable {
+        u32 gpu, bytes;
+        const void* key;
+    };
+    /// The rasterizer's cache for MakeRoom: `list` gives the copies it may drop (none the open
+    /// pass reads), `drop` drops a texture by its key and gives its ranges back at once.
+    void SetTextureDropper(std::function<void(std::vector<Droppable>&)> list,
+                           std::function<void(const void*)> drop) {
+        droppable_list = std::move(list);
+        droppable_drop = std::move(drop);
     }
     /// What OpenPass calls as a pass takes the room [begin, end) of AllocData's ring (GPU
     /// addresses), the passes that wrote there done, before the pass writes over it: the
@@ -711,6 +722,10 @@ private:
     /// ranges only side renders write next, whose lists finish that 3D before their own 3D
     /// kick (sgxd_session_render_overlap).
     void GiveTexture(const Data& texture, u32 bytes);
+    /// The textures pool past its block: CDRAM while the game's has room, then uncached main
+    /// memory. Chunks of OverflowChunkSize or more, mapped one after another on first need and
+    /// kept until the backend's end; each is shared out on its own (their CPU sides are apart).
+    Data AllocOverflow(u32 bytes, u32* ready);
     /// The ETC1 render's pixel primary: the texel's two words raw into pa0 and pa1.
     PdsRef Raw64PixelPds(u32 doutu0, const u32 tex[4]);
     void UntileEtc1Blocks(const UntileSource& source, u32 dest_gpu, u32 dest_stride,
@@ -755,11 +770,10 @@ private:
     u32 surfaces_spilled{}; ///< surfaces the block had no room for (AllocSurface), for its log
     u32 surfaces_used{};
     int surfaces_block{-1};
-    u8* upscale{};     // the upscaled top screen's surfaces, from the first scaled pass
-    u32 upscale_used{};
-    int upscale_block{-1};
     u8* textures{};    // the guest textures' host copies
     u32 textures_used{};
+    /// The most `textures_used` has been: below it a range may have held a texture.
+    u32 textures_peak{};
     /// AllocTextureFixed's lowest byte: its blocks run down from the pool's end.
     u32 textures_fixed{};
     int textures_block{-1};
@@ -770,8 +784,21 @@ private:
         u32 fence = 0;
     };
     std::vector<FreeRange> textures_free;
+    u32 textures_top_fence{};
+    struct OverflowChunk {
+        u8* cpu;
+        u32 gpu;
+        u32 size;
+        int uid;
+        u32 used; ///< its room handed out from the front, as textures_used
+        std::vector<FreeRange> free;
+        u32 top_fence = 0; ///< as textures_top_fence, above `used`
+    };
+    std::vector<OverflowChunk> overflow;
+    u32 overflow_mapped{}; ///< the chunks' bytes, from the overflow's GPU address
+    u32 overflow_logs{};
+    u32 make_room_logs{};
     std::vector<FreeRange> surfaces_free;
-    std::vector<FreeRange> upscale_free;
     /// An untile's vertices by its geometry (GeometryKey): a texture of a size seen before reuses
     /// them. In the textures pool: ETC1 uploads inside a pass filled the pass data.
     std::unordered_map<u64, Data> geometry_vertices;
@@ -865,7 +892,13 @@ private:
         u32 lo, hi;
     };
     Footprint pass_target{}, pass_source{}, pass_zls{};
-    std::function<bool()> texture_evictor;
+    std::function<void(std::vector<Droppable>&)> droppable_list;
+    std::function<void(const void*)> droppable_drop;
+    /// With no free range of `bytes`: of the pool's runs of free ranges and droppable copies, the
+    /// stretch that holds `bytes` dropping the fewest bytes, its copies dropped (every copy can be
+    /// untiled again). False when no run is that long (the open pass's copies and the fixed blocks
+    /// are in the way).
+    bool MakeRoom(u32 bytes);
     std::function<void(u32, u32)> room_taken;
     /// Our recipe whose 3D is pending, or null (none, or the present's).
     [[nodiscard]] Recipe* Pending() const;

@@ -681,8 +681,6 @@ private:
     static bool SplitAlphaIn(const Pica::RegsInternal& regs, u32 unit);
     /// The alpha texture's words of a split unit from its colour's, over its A8 chain (swizzle R000).
     static void AlphaTextureWords(const Texture& tex, const u32 colour[4], u32 words[4]);
-    /// Frees the least recently used texture no open pass reads; false when there is none.
-    bool EvictTexture();
     /// The GPU address of a fixed palette for a 4-bit format (0 for none), written at the first use.
     u32 PaletteFor(TexturePalette palette);
     /// The sampler's four state words for the unit's texture, which it returns (NullTexture when off).

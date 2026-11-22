@@ -40,15 +40,22 @@ namespace {
 // the display buffers at 1 GiB, the texture at 60 MiB.
 constexpr u32 RecipeVa = 0x01000000;
 constexpr u32 TextureVa = 0x03c00000;
-// The parameter buffer every recipe shares (sgxd_recipe_pb), Sony's model: its page table at
-// 32 MiB, the pages 256 KiB on. Page numbers count from the DPM requestor base, this block's
-// address, so every recipe block lies within 256 MiB of it. 1536 pages: the TA context stalls at
-// 1246 (ZLS_PAGE_THRESHOLD), a TA started beside binned scenes is sure of 734
-// (SGXD_RECIPE_PASS_PAGES), so the scenes waiting for their 3D may hold 512 when the next TA
-// starts (a game had 30-140 allocated, 349 at most).
+// The parameter buffer every recipe shares (sgxd_recipe_pb), Sony's model: its page table at 32
+// MiB, the pages 256 KiB on. Page numbers count from the DPM requestor base, this block's address,
+// so every recipe block lies within 256 MiB of it. A TA that runs out of pages while scenes wait
+// for their 3D stops the GPU: those 3Ds wait for it (docs/sgxd/ta.md). So the buffer is large
+// enough that no pass comes near: 7104 pages, the TA context stalls at 6814 (ZLS_PAGE_THRESHOLD), a
+// TA started beside binned scenes is sure of 3000 (SGXD_RECIPE_PASS_PAGES), and the scenes waiting
+// for their 3D may hold 3814 when the next TA starts. The first 1536 pages are CDRAM, the rest main
+// memory mapped after them (PbExtVa), up to the texture. A 3D gives its pages back at the free
+// list's tail, so once the list has turned over the TA takes every page in turn.
 constexpr u32 PbVa = 0x02000000;
-constexpr u32 PbPages = 1536;
-constexpr u32 PbSize = 0x40000 + PbPages * 0x1000;
+constexpr u32 PbCdramPages = 1536;
+constexpr u32 PbExtPages = 5568;
+constexpr u32 PbPages = PbCdramPages + PbExtPages;
+constexpr u32 PbSize = 0x40000 + PbCdramPages * 0x1000;
+constexpr u32 PbExtVa = PbVa + PbSize;
+constexpr u32 PbExtSize = PbExtPages * 0x1000;
 constexpr u32 DisplayVa = 0x40000000;
 constexpr u32 DisplayBuffers = 3;
 constexpr u32 DisplayBufferSize = 0x200000; // 960 * 544 * 4 rounded up to CDRAM's 256 KiB
@@ -87,9 +94,10 @@ constexpr u32 ScreenSlots = 2;
 
 struct State {
     bool initialized = false;
-    SceUID block = -1, cdram = -1, texture = -1, black = -1, pb = -1;
+    SceUID block = -1, cdram = -1, texture = -1, black = -1, pb = -1, pb_ext = -1;
     u8* memory = nullptr;
     u8* pb_memory = nullptr;
+    u8* pb_ext_memory = nullptr;
     u8* buffers = nullptr;
     u32 size = 0, texture_size = 0;
     u8* texture_base = nullptr;
@@ -182,7 +190,10 @@ void FreeBlocks() {
     if (g.pb >= 0) {
         sceKernelFreeMemBlock(g.pb);
     }
-    g.texture = g.cdram = g.block = g.pb = -1;
+    if (g.pb_ext >= 0) {
+        sceKernelFreeMemBlock(g.pb_ext);
+    }
+    g.texture = g.cdram = g.block = g.pb = g.pb_ext = -1;
     g.memory = g.buffers = g.pb_memory = nullptr;
     g.texture_base = nullptr;
     g.texture_width = g.texture_height = 0;
@@ -397,6 +408,15 @@ bool Initialize(std::string* error) {
     ASSERT_MSG(g.pb >= 0 && sceKernelGetMemBlockBase(g.pb, &pb) >= 0,
                "sgxd: no CDRAM for the parameter buffer ({:#010x})", static_cast<u32>(g.pb));
     g.pb_memory = static_cast<u8*>(pb);
+    // The pages past CDRAM's: main memory, uncached (only the GPU touches them).
+    g.pb_ext = sceKernelAllocMemBlock("sgxd_parameter_buffer_ext",
+                                      SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, PbExtSize, nullptr);
+    void* pb_ext = nullptr;
+    ASSERT_MSG(g.pb_ext >= 0 && sceKernelGetMemBlockBase(g.pb_ext, &pb_ext) >= 0,
+               "sgxd: no memory for the parameter buffer's main-memory pages ({:#010x})",
+               static_cast<u32>(g.pb_ext));
+    g.pb_ext_memory = static_cast<u8*>(pb_ext);
+    static_assert(PbExtVa + PbExtSize <= TextureVa, "the parameter buffer runs into the texture");
     const u32 first = (PbVa + 0x40000 - RecipeVa) / 0x1000;
     sgxd_recipe_pb = SgxdRecipePb{RecipeVa, PbVa, first, first + PbPages - 1};
     sgxd_recipe_pb_write(g.pb_memory);
@@ -474,6 +494,11 @@ bool Initialize(std::string* error) {
     const int mapped_pb = g.pb >= 0 ? sgxdMap(PbVa, g.pb_memory, PbSize, 0) : 0;
     ASSERT_MSG(mapped_pb == 0, "sgxd: the parameter buffer not mapped at GPU {:#010x}: {:#010x}",
                PbVa, static_cast<u32>(mapped_pb));
+    const int mapped_pb_ext = g.pb_ext >= 0 ? sgxdMap(PbExtVa, g.pb_ext_memory, PbExtSize, 0) : 0;
+    ASSERT_MSG(mapped_pb_ext == 0,
+               "sgxd: the parameter buffer's main-memory pages not mapped at GPU {:#010x}: "
+               "{:#010x}",
+               PbExtVa, static_cast<u32>(mapped_pb_ext));
 #ifdef VITA_DIAGNOSTICS
     // A fault's post-mortem: the present's block (its region arrays, DPMSLOT) and the parameter
     // buffer (the page table, the pages).
@@ -510,6 +535,9 @@ bool Initialize(std::string* error) {
         if (g.pb >= 0) {
             sgxdUnmap(PbVa, PbSize);
         }
+        if (g.pb_ext >= 0) {
+            sgxdUnmap(PbExtVa, PbExtSize);
+        }
         sgxdRelease();
         FreeBlocks();
         return false;
@@ -517,8 +545,10 @@ bool Initialize(std::string* error) {
     Report("sgxd: {} KiB at {:#010x}, {} display buffers at {:#010x}", g.size / 1024, RecipeVa,
            DisplayBuffers, DisplayVa);
     if (g.pb >= 0) {
-        Report("sgxd: one parameter buffer, pages {:#x}-{:#x} at {:#010x}, requestor base {:#010x}",
-               sgxd_recipe_pb.first, sgxd_recipe_pb.last, PbVa + 0x40000, RecipeVa);
+        Report("sgxd: one parameter buffer, pages {:#x}-{:#x} at {:#010x} ({} in CDRAM, {} in main "
+               "memory at {:#010x}), requestor base {:#010x}",
+               sgxd_recipe_pb.first, sgxd_recipe_pb.last, PbVa + 0x40000, PbCdramPages, PbExtPages,
+               PbExtVa, RecipeVa);
     }
     g.initialized = true;
     display_thread = Common::NamedThread{Common::ThreadCfg{"SgxdDisplay"}, [] { DisplayLoop(); }};
@@ -605,6 +635,9 @@ void Shutdown() {
     const int unmapped = sgxdUnmap(RecipeVa, g.size);
     if (g.pb >= 0) {
         sgxdUnmap(PbVa, PbSize);
+    }
+    if (g.pb_ext >= 0) {
+        sgxdUnmap(PbExtVa, PbExtSize);
     }
     const int released = sgxdRelease();
     Report("sgxd: unmap {:#x}, {:#x}; release {:#x} after {} frames", static_cast<u32>(unmapped),

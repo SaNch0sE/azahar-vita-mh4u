@@ -133,17 +133,14 @@ constexpr u32 BlockVa = 0x04000000;
 constexpr u32 RecipesEnd = 0x11000000;
 constexpr u32 SurfacesVa = 0x48000000;
 constexpr u32 SurfacesSize = 8u << 20;
-// The guest textures' host copies, after the surfaces. They are U8888, 8 times an ETC1
-// texture's bytes: a game's open pass read 42 textures in 14 MiB.
+// Host copies are U8888: 8 times an ETC1 texture's bytes. The fixed part grows down from the top.
 constexpr u32 TexturesVa = SurfacesVa + SurfacesSize;
 constexpr u32 TexturesSize = 40u << 20;
-// The upscaled top screen's surfaces (AllocSurface's `upscaled`): its scaled picture, its scaled
-// depth store and the screens' copies of the picture, mapped at the first scaled pass, so without
-// upscaling it takes no CDRAM. Sized when 2x was the largest scale: a game's 416x256 target took
-// 7 MiB of it then (in the surfaces' 8 MiB, its second 2x pass found no room), about 4 MiB at
-// 1.5x by the scale's square; every game measured had 11 MiB of CDRAM free.
-constexpr u32 UpscaleVa = TexturesVa + TexturesSize;
-constexpr u32 UpscaleSize = 11u << 20;
+// The textures pool's overflow, up to the PDS windows: CDRAM while the game's has room, then
+// uncached main memory.
+constexpr u32 OverflowVa = 0x4C000000;
+constexpr u32 OverflowSize = 64u << 20;
+constexpr u32 OverflowChunkSize = 4u << 20;
 constexpr u32 MicrokernelVa = 0x00400000;
 constexpr u32 Pages = 418;
 constexpr u32 MaxIndices = SGXD_RECIPE_MAX_INDICES;
@@ -582,7 +579,10 @@ SgxdBackend::~SgxdBackend() {
     FreeBlock(code_main, BlockVa + shared_size, CodeSize - code_cdram, code_main_block);
     FreeBlock(surfaces, SurfacesVa, surfaces_size, surfaces_block);
     FreeBlock(textures, TexturesVa, TexturesSize, textures_block);
-    FreeBlock(upscale, UpscaleVa, UpscaleSize, upscale_block);
+    for (const OverflowChunk& c : overflow) {
+        sgxdUnmap(c.gpu, c.size);
+        sceKernelFreeMemBlock(c.uid);
+    }
 }
 
 void SgxdBackend::FreeRecipeBlock(const Recipe& r) {
@@ -618,19 +618,59 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
         RenderWait(oldest->fence, "a recipe instance");
         return *oldest;
     }
-    // CDRAM bounds the instances in all, not only each size's MaxInstances: a game had 14 blocks
-    // by 41 s, and a 15th found no CDRAM once its FCRAM textures were untiled every frame.
-    // With less free than a block and a margin, and an
-    // instance of the size in flight, that one's render is waited for, as at MaxInstances. The
-    // first instance of a size is made, or MapBlock stops the emulator.
-    if (oldest) {
+    // CDRAM bounds the instances in all: with less free than a block and a margin, and an instance
+    // of the size in flight, that one's render is waited for.
+    const auto cdram_short = [this] {
+        if (shell_slots_used != (u64{1} << ShellSlots) - 1) {
+            return false;
+        }
         SceKernelFreeMemorySizeInfo free{};
         free.size = sizeof(free);
         sceKernelGetFreeMemorySize(&free);
-        if (static_cast<u32>(free.size_cdram) < RecipeBlockSize + RecipeCdramMargin) {
-            RenderWait(oldest->fence, "a recipe instance (CDRAM)");
-            return *oldest;
+        return static_cast<u32>(free.size_cdram) < RecipeBlockSize + RecipeCdramMargin;
+    };
+    if (oldest && cdram_short()) {
+        RenderWait(oldest->fence, "a recipe instance (CDRAM)");
+        return *oldest;
+    }
+    // A size's first instance, or one beside its pending render's, with little CDRAM free: the
+    // recipes are a cache, and the one used longest ago gives its block back once its render is
+    // done. Never the open pass's or the pending render's.
+    u32 va = next_va;
+    u32 va_end = RecipesEnd;
+    if (!recipes.empty() && cdram_short()) {
+        auto victim = recipes.end();
+        for (auto it = recipes.begin(); it < recipes.end(); ++it) {
+            const Recipe& s = **it;
+            if (&s != pending && &s != current &&
+                (victim == recipes.end() || static_cast<s32>(s.fence - (*victim)->fence) < 0)) {
+                victim = it;
+            }
         }
+        if (victim == recipes.end() && instances != 0) {
+            // Only this size's pending render holds one: its 3D finishes now.
+            sgxd_gpu_idle();
+            for (const auto& r : recipes) {
+                if (r->width == width && r->height == height && r->kind == kind &&
+                    sgxd_chain_reached(r->fence)) {
+                    return *r;
+                }
+            }
+        }
+        ASSERT_MSG(victim != recipes.end(),
+                   "sgxd: no CDRAM for a {}x{} recipe, and no recipe to take back", width, height);
+        Recipe& s = **victim;
+        RenderWait(s.fence, "a recipe's block (CDRAM)");
+        LOG_INFO(Render, "sgxd: the {}x{} recipe {} at GPU {:#010x} gives its block back", s.width,
+                 s.height, s.instance, s.va);
+        if (s.shell_slot < 0) {
+            va = s.va;
+            va_end = AlignUp(s.va + s.size, 1u << 20);
+        }
+        FreeRecipeBlock(s);
+        // Its kept lists go with it: the next recipe is often made at its address.
+        sgxd_session_forget(&s.recipe);
+        recipes.erase(victim);
     }
     int slot = -1;
     for (u32 k = 0; k < ShellSlots && slot < 0; k++) {
@@ -648,7 +688,7 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     r.height = height;
     r.kind = kind;
     r.instance = instances;
-    r.va = next_va;
+    r.va = va;
     // Every pass renders to a surface or guest memory: the recipe's own FB and DEPTH, and its
     // pages, take no CDRAM.
     sgxd_recipe_external_fb = 1;
@@ -661,10 +701,18 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     r.size = AlignUp(r.bg_offset + 0x1000, 256u << 10);
     DEBUG_ASSERT_MSG(r.size <= RecipeBlockSize, "sgxd: a {}x{} recipe takes {} KiB, past {}", width,
                      height, r.size >> 10, RecipeBlockSize >> 10);
-    DEBUG_ASSERT_MSG(r.va + r.size <= RecipesEnd, "sgxd: no GPU space for a {}x{} recipe",
-                     width, height);
-    r.memory = MapRecipeBlock(r);
-    next_va = AlignUp(r.va + r.size, 1u << 20);
+    ASSERT_MSG(r.va + r.size <= va_end, "sgxd: no GPU space for a {}x{} recipe at {:#010x}", width,
+               height, r.va);
+    if (slot >= 0) {
+        shell_slots_used |= u64{1} << slot;
+        r.shell_slot = slot;
+        r.memory = shell_cdram + static_cast<u32>(slot) * RecipeBlockSize;
+    } else {
+        r.memory = MapBlock("azahar-sgxd-recipe", r.va, r.size, r.block);
+        if (r.va == next_va) {
+            next_va = AlignUp(r.va + r.size, 1u << 20);
+        }
+    }
 
     sgxd_recipe_write(&r.recipe, r.memory);
     // The arrays go with the recipe: only the indices are read again.
@@ -1270,6 +1318,29 @@ bool TakeFree(std::vector<Range>& free, u32 bytes, u32& at, u32* fence = nullptr
 }
 
 template <typename Range>
+bool TakeBestFit(std::vector<Range>& free, u32 bytes, u32& at, u32* fence = nullptr) {
+    auto best = free.end();
+    for (auto it = free.begin(); it != free.end(); ++it) {
+        if (it->bytes >= bytes && (best == free.end() || it->bytes < best->bytes)) {
+            best = it;
+        }
+    }
+    if (best == free.end()) {
+        return false;
+    }
+    at = best->offset;
+    if (fence) {
+        *fence = best->fence;
+    }
+    best->offset += bytes;
+    best->bytes -= bytes;
+    if (best->bytes == 0) {
+        free.erase(best);
+    }
+    return true;
+}
+
+template <typename Range>
 void GiveFree(std::vector<Range>& free, Range range) {
     auto it = std::lower_bound(free.begin(), free.end(), range.offset,
                                [](const Range& f, u32 offset) { return f.offset < offset; });
@@ -1294,19 +1365,13 @@ SgxdBackend::Data SgxdBackend::AllocSurface(u32 width, u32 height, bool upscaled
     const u32 bytes = AlignUp(width * height * 4, 0x1000);
     u32 at = 0;
     if (upscaled) {
-        if (upscale == nullptr) {
-            upscale = MapBlock("azahar-sgxd-upscale", UpscaleVa, UpscaleSize, upscale_block);
-        }
-        if (!TakeFree(upscale_free, bytes, at)) {
-            ASSERT_MSG(upscale_used + bytes <= UpscaleSize,
-                       "sgxd: no room for a {}x{} upscaled surface ({} KiB used, {} ranges free)",
-                       width, height, upscale_used >> 10, upscale_free.size());
-            at = upscale_used;
-            upscale_used += bytes;
-        }
-        LOG_INFO(Render, "sgxd: a {}x{} upscaled surface at GPU {:#010x} ({} KiB of {} used)",
-                 width, height, UpscaleVa + at, upscale_used >> 10, UpscaleSize >> 10);
-        return {upscale + at, UpscaleVa + at};
+        // From the textures pool, as a texture: room made by dropping textures, past it the
+        // overflow. The GPU work over the range's last owner completes before the passes write it.
+        u32 ready = 0;
+        const Data d = AllocTexture(bytes, &ready);
+        RenderWait(ready, "an upscaled surface's range");
+        LOG_INFO(Render, "sgxd: a {}x{} upscaled surface at GPU {:#010x}", width, height, d.gpu);
+        return d;
     }
     if (TakeFree(surfaces_free, bytes, at)) {
         return {surfaces + at, SurfacesVa + at};
@@ -1335,8 +1400,8 @@ void SgxdBackend::FreeSurface(const Data& surface, u32 width, u32 height) {
     // pending 3D's finish goes ahead of them.
     FinishPending(FinishWhy::FreeSurface);
     const u32 bytes = AlignUp(width * height * 4, 0x1000);
-    if (surface.gpu >= UpscaleVa) {
-        GiveFree(upscale_free, FreeRange{surface.gpu - UpscaleVa, bytes});
+    if (surface.gpu - SurfacesVa >= surfaces_size) {
+        GiveTexture(surface, bytes);
         return;
     }
     GiveFree(surfaces_free, FreeRange{surface.gpu - SurfacesVa, bytes});
@@ -1357,38 +1422,150 @@ u32 SgxdBackend::TexturePoolLive() const {
     return textures_used - free_bytes + (TexturesSize - textures_fixed);
 }
 
+bool SgxdBackend::MakeRoom(u32 bytes) {
+    if (!droppable_list) {
+        return false;
+    }
+    std::vector<Droppable> copies;
+    droppable_list(copies);
+    struct Segment {
+        u32 begin, end, dropped;
+        const void* key;
+    };
+    std::vector<Segment> segments;
+    segments.reserve(textures_free.size() + copies.size() + 1);
+    for (const FreeRange& f : textures_free) {
+        segments.push_back({f.offset, f.offset + f.bytes, 0, nullptr});
+    }
+    if (textures_used < textures_fixed) {
+        segments.push_back({textures_used, textures_fixed, 0, nullptr});
+    }
+    for (const Droppable& d : copies) {
+        if (d.gpu >= TexturesVa && d.gpu - TexturesVa < TexturesSize) {
+            const u32 size = AlignUp(d.bytes, 0x1000);
+            segments.push_back({d.gpu - TexturesVa, d.gpu - TexturesVa + size, size, d.key});
+        }
+    }
+    std::sort(segments.begin(), segments.end(),
+              [](const Segment& a, const Segment& b) { return a.begin < b.begin; });
+    std::size_t best_first = 0, best_last = 0;
+    u64 best = ~u64{0};
+    for (std::size_t first = 0, last = 0; last < segments.size(); last++) {
+        if (last > 0 && segments[last].begin != segments[last - 1].end) {
+            first = last;
+        }
+        while (first < last && segments[last].end - segments[first + 1].begin >= bytes) {
+            first++;
+        }
+        if (segments[last].end - segments[first].begin < bytes) {
+            continue;
+        }
+        u64 dropped = 0;
+        for (std::size_t k = first; k <= last; k++) {
+            dropped += segments[k].dropped;
+        }
+        if (dropped < best) {
+            best = dropped;
+            best_first = first;
+            best_last = last;
+        }
+    }
+    if (best == ~u64{0}) {
+        if (make_room_logs < 8) {
+            make_room_logs++;
+            LOG_INFO(Render, "sgxd: no stretch of {} KiB in the textures pool past the open pass's "
+                             "copies and the fixed blocks ({} droppable)",
+                     bytes >> 10, copies.size());
+        }
+        return false;
+    }
+    std::vector<const void*> keys;
+    for (std::size_t k = best_first; k <= best_last; k++) {
+        if (segments[k].key && std::find(keys.begin(), keys.end(), segments[k].key) == keys.end()) {
+            keys.push_back(segments[k].key);
+        }
+    }
+    if (make_room_logs < 8) {
+        make_room_logs++;
+        LOG_INFO(Render, "sgxd: room for {} KiB at {:#010x}: {} textures dropped, {} KiB",
+                 bytes >> 10, TexturesVa + segments[best_first].begin, keys.size(), best >> 10);
+    }
+    for (const void* key : keys) {
+        droppable_drop(key);
+    }
+    return true;
+}
+
 SgxdBackend::Data SgxdBackend::AllocTexture(u32 bytes, u32* ready) {
     bytes = AlignUp(bytes, 0x1000);
-    // Textures, untiles' temporaries and vertices alike make room by evicting textures.
-    while (!TextureFits(bytes) && texture_evictor && texture_evictor()) {
+    if (!TextureFits(bytes)) {
+        MakeRoom(bytes);
     }
     u32 at = 0;
-    if (TakeFree(textures_free, bytes, at)) {
+    u32 fence = 0;
+    if (TakeBestFit(textures_free, bytes, at, &fence)) {
+        if (ready) {
+            *ready = fence;
+        }
         return {textures + at, TexturesVa + at};
     }
-    DEBUG_ASSERT_MSG(textures_used + bytes <= textures_fixed,
-                     "sgxd: no room for a {} KiB texture ({} KiB used, {} KiB fixed; free{})",
-                     bytes >> 10, textures_used >> 10, (TexturesSize - textures_fixed) >> 10, [&] {
+    // Past the fixed room the allocation would overlap the fixed tables: it goes to the overflow.
+    if (textures_used + bytes > textures_fixed) {
+        if (overflow_logs < 8) {
+            overflow_logs++;
+            LOG_INFO(Render,
+                     "sgxd: a {} KiB texture past the pool ({} KiB used, {} KiB fixed; free{}; "
+                     "{} copies the open pass samples, {} KiB, go back at its end): the overflow",
+                     bytes >> 10, textures_used >> 10, (TexturesSize - textures_fixed) >> 10,
+                     [&] {
                          std::string f;
                          for (const FreeRange& r : textures_free) {
                              f += fmt::format(" {:#x}+{}K", r.offset, r.bytes >> 10);
                          }
                          return f;
+                     }(),
+                     pass_frees.size(), [&] {
+                         u64 b = 0;
+                         for (const auto& [texture, size] : pass_frees) {
+                             b += size;
+                         }
+                         return b >> 10;
                      }());
+        }
+        return AllocOverflow(bytes, ready);
+    }
+    if (ready) {
+        *ready = textures_top_fence;
+    }
     const Data d{textures + textures_used, TexturesVa + textures_used};
     textures_used += bytes;
+    textures_peak = std::max(textures_peak, textures_used);
     return d;
 }
 
 SgxdBackend::Data SgxdBackend::AllocTextureFixed(u32 bytes) {
     bytes = AlignUp(bytes, 0x1000);
-    while (textures_used + bytes > textures_fixed && texture_evictor && texture_evictor()) {
+    // The fixed blocks run down from the pool's end while the textures' room reaches that far; past
+    // it a block takes a free range as a texture does, never given back.
+    if (!TextureFits(bytes)) {
+        MakeRoom(bytes);
     }
-    DEBUG_ASSERT_MSG(textures_used + bytes <= textures_fixed,
-                     "sgxd: no room for {} KiB of fixed texture memory ({} KiB used)", bytes >> 10,
-                     textures_used >> 10);
-    textures_fixed -= bytes;
-    return {textures + textures_fixed, TexturesVa + textures_fixed};
+    u32 at = 0;
+    if (textures_used + bytes <= textures_fixed) {
+        textures_fixed -= bytes;
+        at = textures_fixed;
+    } else if (!TakeBestFit(textures_free, bytes, at)) {
+        // From the overflow, maybe where a texture was: its queued GPU work completes first.
+        const Data d = AllocOverflow(bytes, nullptr);
+        RenderWait(FenceAll(), "a fixed block in the textures pool's overflow");
+        return d;
+    }
+    // The CPU writes the block at once: GPU work queued over the range's last texture (its untile)
+    // completes first.
+    if (at < textures_peak) {
+        RenderWait(FenceAll(), "a fixed block where a texture was");
+    }
+    return {textures + at, TexturesVa + at};
 }
 
 void SgxdBackend::FreeTexture(const Data& texture, u32 bytes) {
@@ -1415,7 +1592,79 @@ void SgxdBackend::FreeTextureAfterPass(const Data& texture, u32 bytes) {
     pass_frees.emplace_back(texture, bytes);
 }
 
+SgxdBackend::Data SgxdBackend::AllocOverflow(u32 bytes, u32* ready) {
+    for (OverflowChunk& c : overflow) {
+        u32 at = 0;
+        u32 fence = 0;
+        if (TakeFree(c.free, bytes, at, &fence)) {
+            if (ready) {
+                *ready = fence;
+            }
+            return {c.cpu + at, c.gpu + at};
+        }
+        if (c.used + bytes <= c.size) {
+            if (ready) {
+                *ready = c.top_fence;
+            }
+            at = c.used;
+            c.used += bytes;
+            return {c.cpu + at, c.gpu + at};
+        }
+    }
+    if (ready) {
+        *ready = 0; // a new chunk: nothing has used it
+    }
+    const u32 size = AlignUp(std::max(bytes, OverflowChunkSize), OverflowChunkSize);
+    ASSERT_MSG(overflow_mapped + size <= OverflowSize,
+               "sgxd: no room for a {} KiB texture in the pool's {} KiB of overflow either",
+               bytes >> 10, overflow_mapped >> 10);
+    OverflowChunk c{};
+    // CDRAM first: the kernel's free figure is not a block's worth, so the block is asked for.
+    c.uid = sceKernelAllocMemBlock("azahar-sgxd-texture-overflow",
+                                   SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, size, nullptr);
+    const bool cdram = c.uid >= 0;
+    if (!cdram) {
+        c.uid = sceKernelAllocMemBlock("azahar-sgxd-texture-overflow",
+                                       SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, size, nullptr);
+    }
+    void* base = nullptr;
+    const int got = c.uid >= 0 ? sceKernelGetMemBlockBase(c.uid, &base) : c.uid;
+    ASSERT_MSG(got >= 0,
+               "sgxd: no {} KiB of CDRAM or uncached main memory for the textures pool ({:#010x})",
+               size >> 10, static_cast<u32>(got));
+    c.cpu = static_cast<u8*>(base);
+    c.gpu = OverflowVa + overflow_mapped;
+    c.size = size;
+    c.used = bytes;
+    // As MapBlock: the GPU's MMU takes the chunk with no PTLA op in flight.
+    sgxd_gpu_idle();
+    const int mapped = sgxdMap(c.gpu, base, size, 0);
+    ASSERT_MSG(mapped == 0, "sgxd: the textures pool's overflow not mapped at GPU {:#010x}: {:#010x}",
+               c.gpu, static_cast<u32>(mapped));
+    overflow_mapped += size;
+    LOG_INFO(Render, "sgxd: the textures pool spills into {}: {} KiB at GPU {:#010x}, {} KiB in all",
+             cdram ? "CDRAM" : "uncached main memory", size >> 10, c.gpu, overflow_mapped >> 10);
+    overflow.push_back(std::move(c));
+    return {overflow.back().cpu, overflow.back().gpu};
+}
+
 void SgxdBackend::GiveTexture(const Data& texture, u32 bytes) {
+    if (texture.gpu >= OverflowVa) {
+        for (OverflowChunk& c : overflow) {
+            if (texture.gpu - c.gpu < c.size) {
+                GiveFree(c.free,
+                         FreeRange{texture.gpu - c.gpu, AlignUp(bytes, 0x1000), FenceAll()});
+                if (!c.free.empty() && c.free.back().offset + c.free.back().bytes == c.used) {
+                    c.used = c.free.back().offset;
+                    c.top_fence = NewerFence(c.top_fence, c.free.back().fence);
+                    c.free.pop_back();
+                }
+                return;
+            }
+        }
+        UNREACHABLE_MSG("sgxd: a texture at GPU {:#010x} given back, past every overflow chunk",
+                        texture.gpu);
+    }
     GiveFree(textures_free,
              FreeRange{texture.gpu - TexturesVa, AlignUp(bytes, 0x1000), FenceAll()});
     if (!textures_free.empty() &&
@@ -1994,6 +2243,9 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
             const char* name = base == surfaces   ? "surfaces"
                                : base == textures ? "textures"
                                : base == shared   ? "shared"
+                               : std::any_of(overflow.begin(), overflow.end(),
+                                             [base](const auto& c) { return c.cpu == base; })
+                                   ? "overflow"
                                : std::any_of(recipes.begin(), recipes.end(),
                                              [base](const auto& r) { return r->memory == base; })
                                    ? "recipe"

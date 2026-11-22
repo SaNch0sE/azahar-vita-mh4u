@@ -771,7 +771,27 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>(&disk_cache, *tier1);
     }
-    backend.SetTextureEvictor([this] { return EvictTexture(); });
+    // The pool's room (SgxdBackend::MakeRoom): every copy but the open pass's may go.
+    backend.SetTextureDropper(
+        [this](std::vector<SgxdBackend::Droppable>& out) {
+            for (const Texture& t : textures) {
+                if (t.last_used >= passes) {
+                    continue;
+                }
+                if (t.bytes != 0) {
+                    out.push_back({t.memory.gpu, t.bytes, &t});
+                }
+                if (t.alpha_bytes != 0) {
+                    out.push_back({t.alpha.gpu, t.alpha_bytes, &t});
+                }
+            }
+        },
+        [this](const void* key) {
+            Texture& t = *const_cast<Texture*>(static_cast<const Texture*>(key));
+            DEBUG_ASSERT(t.last_used < passes);
+            DropTexture(t);
+            evictions++;
+        });
     backend.SetRoomTaken([this](u32 begin, u32 end) { KeepGsRows(begin, end); });
 }
 
@@ -2007,30 +2027,6 @@ void RasterizerSgxd::KeepGsRows(u32 begin, u32 end) {
     }
 }
 
-bool RasterizerSgxd::EvictTexture() {
-    // Full pool (SgxdBackend::AllocTexture): the textures no draw has taken for longest go
-    // first, never one the open pass reads (last_used == passes); a pending render's are freed
-    // after it completes (FreeTexture). Retail games stream more textures than the pool holds
-    // (a game: 16 MiB at 69 s), and the untiles' temporaries come from it too.
-    const auto victim =
-        std::min_element(textures.begin(), textures.end(), [](const Texture& a, const Texture& b) {
-            return a.last_used < b.last_used;
-        });
-    if (victim == textures.end() || victim->last_used >= passes) {
-        u32 kib = 0;
-        for (const Texture& t : textures) {
-            kib += (t.bytes + t.alpha_bytes) >> 10;
-        }
-        LOG_CRITICAL(Render,
-                     "sgxd: texture eviction: {} textures left ({} KiB), the open pass reads them",
-                     textures.size(), kib);
-        return false;
-    }
-    DropTexture(*victim);
-    evictions++;
-    return true;
-}
-
 const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     const auto& at = TextureUnitWords[unit];
     const u32* const r = regs.reg_array.data();
@@ -3078,9 +3074,8 @@ void RasterizerSgxd::LogTextureStats() {
              w.lists, w.bytes[0] / 1024, w.bytes[1] / 1024, w.bytes[2] / 1024,
              w.cycles / (1000.0 * scePowerGetArmClockFrequency()));
     widen_stats = {};
-    // The pool is a cache that evicts only when full (EvictTexture), so how full it is says
-    // nothing of what a title needs: the copies cached, those a draw took this second, the
-    // evictions, and the pool's bytes in use (the untiles' temporaries and fixed part too).
+    // The pool drops textures only when full, so how full it is says nothing of a title's needs: the
+    // copies cached, those a draw took this second, the evictions, and the bytes in use.
     u64 cached = 0, taken = 0;
     for (const Texture& tex : textures) {
         const u64 bytes = u64{tex.bytes} + tex.alpha_bytes;
