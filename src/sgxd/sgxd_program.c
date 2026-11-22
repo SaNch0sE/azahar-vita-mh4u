@@ -267,6 +267,51 @@ int sgxd_program_merge_pixel_pds(uint32_t kick0, const uint32_t tex0[4], const u
     return finish(&p, out);
 }
 
+// A texture issue's DOUTI: TEXISSUE the coordinate set, USEISSUE none and TEXPROJ RHW, as the
+// merge's MERGE_DOUTI_TC0 and TC1 (0x0000f100 | TCn), with TEXLASTISSUE (0x800) on the last.
+#define PICA_DOUTI_TEX(coord, last) (0x0000f100u | (coord) | ((last) ? 0x800u : 0u))
+#define PICA_TEXEL_WORDS 4u
+#define PICA_FCONV_F32 3u
+
+int sgxd_program_pica_pixel_pds(uint32_t kick0, const uint32_t *iterators, const unsigned *words,
+                                unsigned count, const SgxdTextureIssue *issues,
+                                unsigned issue_count, SgxdPdsProgram *out) {
+    if (count > 12 || issue_count > 3) {
+        return -1;
+    }
+    Pds p;
+    pds_init(&p);
+    const unsigned kick =
+        pds_pair(&p, 0, kick0,
+                 DOUTU1_SDSOFT | (count ? DOUTU1_ITERATORSDEPENDENCY : 0) |
+                     (issue_count ? DOUTU1_TEXTUREDEPENDENCY : 0));
+    pds_word(&p, 1, 0);   // DOUTU word 2
+    pds_emit(&p, doutu(kick, 0));
+    unsigned issued = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (words[i] == 0 || words[i] > 4) {
+            return -1;
+        }
+        pds_emit(&p, douti(pds_word(&p, 1, iterators[i]), words[i]));
+        for (unsigned k = 0; k < issue_count; k++) {
+            if (issues[k].after != i) {
+                continue;
+            }
+            const unsigned last = ++issued == issue_count;
+            const unsigned issue = pds_word(&p, 1, PICA_DOUTI_TEX(issues[k].coord, last));
+            const unsigned quad = pds_quad(&p, issues[k].tex);
+            // The DOUTI's TAGSIZE (MOVS bits 7..6) is one less than the texel's words.
+            pds_emit(&p, douti(issue, 1) | (PICA_TEXEL_WORDS - 1u) << 6);
+            pds_emit(&p, doutt(quad, PICA_FCONV_F32));
+        }
+    }
+    if (issued != issue_count) {
+        return -1;   // an issue after an iterator that is not there
+    }
+    pds_emit(&p, HALT);
+    return finish(&p, out);
+}
+
 uint32_t sgxd_program_pixel_dms(unsigned pa, unsigned temps, unsigned sa) {
     return pixel_dms(pa, temps, sa);
 }

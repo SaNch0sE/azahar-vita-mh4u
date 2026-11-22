@@ -113,6 +113,10 @@ public:
     PdsRef MergePixelPds(u32 doutu0, const u32 tex0[4], const u32 tex1[4]);
     /// sgxd_program_pixel_pds: a PICA fragment program's iterators, no texture reads issued.
     PdsRef PixelPds(u32 doutu0, const u32* iterators, const u32* words, u32 count);
+    /// sgxd_program_pica_pixel_pds: a PICA fragment program's iterators and the texture reads
+    /// its PDS issues.
+    PdsRef PicaPixelPds(u32 doutu0, const u32* iterators, const u32* words, u32 count,
+                        const SgxdTextureIssue* issues, u32 issue_count);
 
     struct Data {
         u8* cpu;

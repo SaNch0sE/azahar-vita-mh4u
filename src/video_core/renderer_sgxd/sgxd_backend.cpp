@@ -685,6 +685,7 @@ enum PdsTag : u32 {
     TagMergePixel,
     TagRaw64Pixel,
     TagTerm,
+    TagPicaPixel,
     TagPixel,
     TagVertexShape,
     TagSecondaryShape,
@@ -824,6 +825,35 @@ SgxdBackend::PdsRef SgxdBackend::PixelPds(u32 doutu0, const u32* iterators, cons
         static_assert(sizeof(unsigned) == sizeof(u32));
         return sgxd_program_pixel_pds(doutu0, iterators, reinterpret_cast<const unsigned*>(words),
                                       count, &pds);
+    });
+}
+
+SgxdBackend::PdsRef SgxdBackend::PicaPixelPds(u32 doutu0, const u32* iterators, const u32* words,
+                                              u32 count, const SgxdTextureIssue* issues,
+                                              u32 issue_count) {
+    DEBUG_ASSERT(count <= 12 && issue_count <= 3);
+    std::array<u32, 4 + 2 * 12 + 6 * 3> key;
+    u32 n = 0;
+    key[n++] = TagPicaPixel;
+    key[n++] = doutu0;
+    key[n++] = count;
+    key[n++] = issue_count;
+    for (u32 i = 0; i < count; i++) {
+        key[n++] = iterators[i];
+        key[n++] = words[i];
+    }
+    for (u32 i = 0; i < issue_count; i++) {
+        key[n++] = issues[i].coord | issues[i].after << 8;
+        key[n++] = issues[i].tex[0];
+        key[n++] = issues[i].tex[1];
+        key[n++] = issues[i].tex[2];
+        key[n++] = issues[i].tex[3];
+    }
+    return KeyedPds(key.data(), n, [&](SgxdPdsProgram& pds) {
+        static_assert(sizeof(unsigned) == sizeof(u32));
+        return sgxd_program_pica_pixel_pds(doutu0, iterators,
+                                           reinterpret_cast<const unsigned*>(words), count, issues,
+                                           issue_count, &pds);
     });
 }
 

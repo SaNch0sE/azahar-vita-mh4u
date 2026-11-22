@@ -30,11 +30,19 @@ namespace SgxdRenderer::StateRegs {
 #define STATE_LIGHT_REGS(n) PICA_REG_INDEX(lighting.light[n].config)
 
 /// The registers FSConfig's constructor and RasterizerSgxd::SplitAlpha read, whole words (a
-/// field's neighbours in its word come along). Not the TEV constant colours, the lights' colours
-/// and positions or the scissor box: uniforms, not the program.
-inline constexpr std::array<u16, 61> Fragment{
+/// field's neighbours in its word come along). Not the TEV constant colours or the lights'
+/// colours and positions: uniforms, not the program. The scissor box, the viewport and the colour
+/// buffer's size are, as far as RasterizerSgxd::FragmentConfig drops a box that covers the
+/// viewport.
+inline constexpr std::array<u16, 67> Fragment{
     // FramebufferConfig
     PICA_REG_INDEX(rasterizer.scissor_test.mode),
+    PICA_REG_INDEX(rasterizer.scissor_test.x1),
+    PICA_REG_INDEX(rasterizer.scissor_test.x2),
+    PICA_REG_INDEX(rasterizer.viewport_size_x),
+    PICA_REG_INDEX(rasterizer.viewport_size_y),
+    PICA_REG_INDEX(rasterizer.viewport_corner),
+    PICA_REG_INDEX(framebuffer.framebuffer.width),
     PICA_REG_INDEX(rasterizer.depthmap_enable),
     PICA_REG_INDEX(framebuffer.output_merger.fragment_operation_mode),
     PICA_REG_INDEX(framebuffer.output_merger.alpha_blending),

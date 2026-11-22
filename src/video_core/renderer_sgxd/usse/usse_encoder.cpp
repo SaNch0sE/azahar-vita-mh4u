@@ -931,7 +931,7 @@ void Encoder::Mad2(Dst dst, Src src0, Src src1, Src src2, Pred pred, bool nosche
          Writes(dst, pred));
 }
 
-void Encoder::Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred, bool nosched) {
+void Encoder::Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred, bool nosched, uint8_t clip) {
     dst.reg = Map(dst.reg);
     src1.reg = Map(src1.reg);
 
@@ -947,10 +947,12 @@ void Encoder::Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred, bool nosche
     const auto neg = [](Mod m) { return (m == Mod::Neg || m == Mod::NegAbs) ? 1u : 0u; };
     const auto abs = [](Mod m) { return (m == Mod::Abs || m == Mod::NegAbs) ? 1u : 0u; };
     Push(Pack(PatVdp, {
-        {'p', ExtVecPred(pred)}, {'s', skip_invalid ? 1u : 0u}, {'c', 0}, {'o', vec4 ? 1u : 0u}, {'d', dext},
+        {'p', ExtVecPred(pred)}, {'s', skip_invalid ? 1u : 0u}, {'c', clip != 0 ? 1u : 0u},
+        {'o', vec4 ? 1u : 0u}, {'d', dext},
         {'e', 0}, {'r', s1ext}, {'a', 3}, {'g', abs(gpi0.mod)}, {'t', 0},
         {'n', 0}, {'w', dst.mask}, {'b', neg(src1.mod)}, {'f', abs(src1.mod)},
-        {'l', 0}, {'k', db}, {'h', s1b}, {'i', gpi0.reg.n}, {'j', DoubledNum(dst.reg, 7)},
+        {'l', clip != 0 ? clip - 1u : 0u}, {'k', db}, {'h', s1b}, {'i', gpi0.reg.n},
+        {'j', DoubledNum(dst.reg, 7)},
         {'z', sw0}, {'m', static_cast<uint64_t>(src1.swz[3])},
         {'q', static_cast<uint64_t>(src1.swz[2])}, {'y', static_cast<uint64_t>(src1.swz[1])},
         {'x', static_cast<uint64_t>(src1.swz[0])}, {'u', DoubledNum(src1.reg, 7)},
@@ -972,11 +974,13 @@ void Encoder::Comp(CompOp op, Dst dst, Src src, uint8_t src_comp, Pred pred, boo
 }
 
 namespace {
-uint64_t PackMove(uint64_t dest_fmt, Dst dst, Reg lo, Reg hi, bool skip_invalid) {
+// VPCK from F32 (source format 6), or from F16 (5) with the four halves in the one pair at `lo`.
+uint64_t PackMove(uint64_t dest_fmt, Dst dst, Reg lo, Reg hi, bool skip_invalid,
+                  uint64_t src_fmt = 6) {
     const auto [db, dext] = DestBank(dst.reg.bank);
     const auto [lb, lext] = Src12Bank(lo.bank);
     uint64_t hb = 0, hext = 0, hn = 0;
-    if (lo.bank == Bank::Internal) {
+    if (lo.bank == Bank::Internal || src_fmt == 5) {
         // An internal register is a whole 128 bits; the second source is marked absent.
         hb = 2;
         hext = 1;
@@ -989,13 +993,24 @@ uint64_t PackMove(uint64_t dest_fmt, Dst dst, Reg lo, Reg hi, bool skip_invalid)
     }
     return Pack(PatVpck, {
         {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'u', 0}, {'y', 0}, {'d', dext},
-        {'e', 0}, {'r', lext}, {'c', hext}, {'a', 0}, {'f', 6}, {'t', dest_fmt},
+        {'e', 0}, {'r', lext}, {'c', hext}, {'a', 0}, {'f', src_fmt}, {'t', dest_fmt},
         {'m', dst.mask}, {'b', db}, {'k', lb}, {'l', hb}, {'g', SingleNum(dst.reg, 7)},
         {'o', 3}, {'h', 0}, {'i', 1}, {'j', 2}, {'q', DoubledNum(lo, 7)}, {'v', 0},
         {'w', hn}, {'x', 0},
     });
 }
 } // Anonymous namespace
+
+void Encoder::UnpackF16x4(Dst dst, Reg src) {
+    dst.reg = Map(dst.reg);
+    src = Map(src);
+    // psp2cgc's pack.f32.f16 i0.xyzw, pa0.xyzw is 40c10bbcaf998000: source format F16, the
+    // second source absent as for an internal one.
+    if (src.n & 1) {
+        Fail("usse: four F16 lanes are read from an even register");
+    }
+    Push(PackMove(6, dst, src, src, skip_invalid, 5), 54, ReadsAll(src), Writes(dst, Pred::None));
+}
 
 void Encoder::MoveF32x4(Dst dst, Reg lo, Reg hi, bool nosched) {
     dst.reg = Map(dst.reg);

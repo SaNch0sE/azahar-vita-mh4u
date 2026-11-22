@@ -324,6 +324,8 @@ private:
         u8 count;
         u8 stride;
         bool is_int;
+        bool normalize; ///< the vec3 normalised as it is copied (UniformKind::LightDirection)
+        bool lut_row;   ///< a LUT offset as its row's centre (UniformKind::LightingLutRow)
     };
 
     /// What follows a fragment program's own code: the pack to the output, or the pack and the blend.
@@ -346,9 +348,11 @@ private:
         Usse::Program usse;
         u32 primary_doutu0;
         u32 secondary_doutu0;
-        u32 fprim;
-        u32 fprim_units;
         u32 pixel_pa;
+        /// The pixel PDS's iterators (DOUTI words and sizes); the draw places the program in the PDS arena.
+        std::array<u32, 12> iterators;
+        std::array<u32, 12> iterator_words;
+        u32 iterator_count;
         Epilogue epilogue; ///< what its code ends with
         u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
         bool tier2_queued; ///< sent to the second tier (or never to be)
@@ -620,6 +624,8 @@ private:
     VertexLayout DecodeVertexLayout() const;
     /// The raw words VertexProgramFor's program depends on past the layout.
     std::array<u32, VertexLayout::ProgramKeyWords> VertexProgramKey(Usse::VsMode mode);
+    /// Usse::VsRequest::clip_planes for the draw: the viewport's edges inside the colour buffer.
+    u8 ClipPlanes(Usse::VsMode mode) const;
     KeyIndex<u16> used_bools;
     /// The second tier by fragment config (ShaderTier1::ConfigKey): the program is the config's
     /// under every epilogue, so one job a config. The programs waiting for it, and once done the

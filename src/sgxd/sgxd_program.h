@@ -70,6 +70,24 @@ int sgxd_program_secondary_pds_at(uint32_t sa_address, unsigned sa_words, uint32
 int sgxd_program_pixel_pds(uint32_t doutu0, const uint32_t *iterators, const unsigned *words,
                            unsigned count, SgxdPdsProgram *out);
 
+// A texture read the pixel primary issues (a non-dependent read): the unit's four state words
+// (DOUTT0-3), its coordinate set TCn, and the iterator whose DOUTI it follows.
+typedef struct SgxdTextureIssue {
+    uint32_t tex[4];
+    unsigned coord;
+    unsigned after;
+} SgxdTextureIssue;
+
+// sgxd_program_pixel_pds with texture issues: after iterator `after`'s DOUTI, each issue's own
+// DOUTI (TEXISSUE its TCn, no USE issue, as the merge's TC0 and TC1; TEXLASTISSUE on the last;
+// TAGSIZE four words) and DOUTT of its words converted to F32 (FCONV 3), so its texel lands as
+// four F32 words at the PA the DOUTIs before it leave (issues fill the PAs in PDS order,
+// docs/sgxd/pds.md). DOUTU TEXTUREDEPENDENCY with any issue. -1 for more than 12
+// iterators or 3 issues.
+int sgxd_program_pica_pixel_pds(uint32_t doutu0, const uint32_t *iterators, const unsigned *words,
+                                unsigned count, const SgxdTextureIssue *issues,
+                                unsigned issue_count, SgxdPdsProgram *out);
+
 // The display transfer's blit (docs/sgxd/ptla.md): a textured quad, exact. A vertex
 // is ten words, the clip-space position, a colour and the texture coordinate; the vertex program
 // copies them to o0..o9 (OUTSELECTS: the position, the base colour and TC0; TEXSIZE 1), the pixel

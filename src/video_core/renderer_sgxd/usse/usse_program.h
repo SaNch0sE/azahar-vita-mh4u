@@ -20,8 +20,8 @@ namespace SgxdRenderer::Usse {
  *  - the resident uniforms: the first `uniform_floats` SAs, each uniform at its `sa_offset`
  *    (a float4 array's elements four floats apart);
  *  - the data block: the uniform buffer pointer when the program reads uniforms from memory
- *    (`buffer_pointer`, DataHead), then the literals, then four SAs of state words per sampler
- *    (LiteralSaOffset, SamplerSaOffset);
+ *    (`buffer_pointer`, DataHead), then four SAs of state words per sampler, then the literals
+ *    (SamplerSaOffset, LiteralSaOffset);
  *  - past them, up to `secondary_reg_count`: the prefetched uniforms (vertex programs) and
  *    what the secondary program writes.
  *
@@ -31,13 +31,15 @@ namespace SgxdRenderer::Usse {
  * count from; see usse_encoder Lda32).
  */
 
-/// Where literal `index` and sampler `index`'s four state words sit, from `literals_at`: the
-/// SA past the resident uniforms and the buffer pointer (uniform_floats + DataHead).
-inline uint32_t LiteralSaOffset(uint32_t literals_at, uint32_t index) {
-    return literals_at + index;
+/// Where sampler `index`'s four state words and literal `index` sit, from `data_at`: the SA past
+/// the resident uniforms and the buffer pointer (uniform_floats + DataHead). The samplers come
+/// first: their count is known before a program's code is, its literals only after (a fragment
+/// program keeps the ones its code reads).
+inline uint32_t SamplerSaOffset(uint32_t data_at, uint32_t index) {
+    return data_at + index * 4;
 }
-inline uint32_t SamplerSaOffset(uint32_t literals_at, uint32_t literal_count, uint32_t index) {
-    return literals_at + literal_count + index * 4;
+inline uint32_t LiteralSaOffset(uint32_t data_at, uint32_t sampler_count, uint32_t index) {
+    return data_at + sampler_count * 4 + index;
 }
 
 /// An interpolated input as the hardware names it: the id in the iterator word's bits 12-15.
@@ -61,7 +63,30 @@ enum class FragmentInput : uint32_t {
 struct Varying {
     FragmentInput input;
     uint8_t components; ///< 1-4, each one PA register (f32)
+    /// Iterated as F16 (DOUTI USEFORMAT F16, psp2cgc's `half` varyings): two components a
+    /// register, read with pack.f32.f16.
+    bool half = false;
+    /// A colour iterated in fixed point (DOUTI without the colour's float bit): its four
+    /// bytes in one register.
+    bool fixed = false;
 };
+inline uint8_t VaryingWords(const Varying& v) {
+    return v.fixed ? 1 : v.half ? static_cast<uint8_t>((v.components + 1) / 2) : v.components;
+}
+
+/// A texture read the pixel PDS program issues before the program starts (a non-dependent
+/// read): its own DOUTI (TEXISSUE the coordinate set, no USE issue) and DOUTT of the unit's
+/// state words, after the DOUTI of inputs[after_input]. The texel lands as four F32 words at
+/// `pa` (FCONV F32): issues fill the PAs in PDS order (docs/sgxd/pds.md).
+struct TextureIssue {
+    uint8_t unit;        ///< the PICA texture unit whose state words the DOUTT carries
+    uint8_t coord;       ///< TEXISSUE: the coordinate set, TCn
+    uint8_t pa;          ///< the texel's first PA register
+    uint8_t after_input; ///< issued after this input's DOUTI
+};
+inline constexpr uint8_t IssueTexelWords = 4;
+/// The issues a pixel PDS program takes (sgxd_program_pica_pixel_pds).
+inline constexpr uint32_t MaxTextureIssues = 7;
 
 /// What a uniform holds: the rasterizer fills it by its kind and index (UniformName names it
 /// for messages and the program dump).
@@ -94,6 +119,8 @@ enum class UniformKind : uint8_t {
     ProctexNoiseA,
     ProctexNoiseP,
     LightingLutOffset,
+    LightingLutRow, ///< each lighting LUT's row centre in the lf texture: (offset / 256 + 0.5) /
+                    ///< LUT_LF_ROWS
     LightingGlobalAmbient,
     // Light `index`'s members (light_src[index]).
     LightSpecular0,
@@ -104,6 +131,9 @@ enum class UniformKind : uint8_t {
     LightSpotDirection,
     LightDistAttenBias,
     LightDistAttenScale,
+    /// A directional light's position normalised (its light vector), once a draw as the
+    /// rasterizer fills the SAs instead of in every pixel.
+    LightDirection,
 };
 
 struct Uniform {
@@ -149,8 +179,10 @@ struct Attribute {
 [[nodiscard]] std::string AttributeName(const Attribute& attribute);
 
 struct Program {
-    /// In PA order: the first input starts at pa0, each takes `components` registers.
+    /// In PA order: the first input starts at pa0, each takes `components` registers, and
+    /// the issued textures' texels (`issues`) after the input each follows.
     std::vector<Varying> inputs;
+    std::vector<TextureIssue> issues;
     std::vector<Uniform> uniforms;
     std::vector<Sampler> samplers;
     uint32_t pa_count = 0;   ///< primary attribute registers the program touches

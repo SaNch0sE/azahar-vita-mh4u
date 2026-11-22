@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 #include "video_core/renderer_gxm/usse/usse_encoder.h"
@@ -165,10 +166,15 @@ public:
     void Mad(Dst dst, Src src1, Src gpi0, Src gpi1, bool vec4, Pred pred = Pred::None,
              bool nosched = false);
     void Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred = Pred::None, bool nosched = false);
+    /// A four-wide dot product that is also user clip plane `plane`'s test: the TA clips at the plane by the result's sign.
+    void DotClip(Dst dst, Src src1, Src gpi0, uint8_t plane);
     void Mad2(Dst dst, Src src0, Src src1, Src src2, Pred pred = Pred::None);
     void Comp(CompOp op, Dst dst, Src src, uint8_t src_comp, Pred pred = Pred::None,
               bool nosched = false);
     void MoveF32x4(Dst dst, Reg lo, Reg hi, bool nosched = false);
+    /// Four F16 lanes of the register pair at `src` as four F32 lanes (pack.f32.f16): a
+    /// MoveF32x4 that reads the one pair, so every pass treats it as one.
+    void UnpackF16x4(Dst dst, Reg src);
     void PackF16(Dst dst, Reg lo, Reg hi, bool nosched = false);
     void MoveInternal(Dst dst, Src src, Pred pred = Pred::None, bool nosched = false);
     void CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched = false);
@@ -202,6 +208,12 @@ public:
     /// (the caller then patches kills and places the nosched bits). Throws
     /// std::runtime_error when the values do not fit.
     LowerResult Lower(Encoder& e, int level = 1);
+    /// With the optimising passes: the instances a placement lets run at once, from its
+    /// temporaries and the primary attributes it spilled to. Set, every hoisting level is
+    /// lowered and the one with the most instances kept (the most hoisting among equals):
+    /// hoisted loads wait together but live longer, and the registers decide how many tasks
+    /// hide the waits that are left. Unset, the most hoisting that fits.
+    std::function<uint32_t(uint32_t temps, uint32_t pa)> occupancy;
 
 private:
     Inst& Push(Op op);

@@ -215,13 +215,18 @@ public:
     /// Whether a two-wide source's first two channels are a vmad2 swizzle (xx, yy, xy).
     static bool Mad2Swizzle(const Swizzle& s, uint64_t& code);
     /// dst.<one component> = dot(src1, i<gpi0>), three- or four-wide.
-    void Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred = Pred::None, bool nosched = false);
+    /// `clip`, plane + 1: the dot is user clip plane `clip - 1`'s test (psp2cgc's
+    /// 18d188811140003c for CLP0 into o10.x: VDP with bit 54 set and the plane in bits 36..34).
+    void Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred = Pred::None, bool nosched = false,
+             uint8_t clip = 0);
     /// dst.<mask> = op(src.<comp>): rcp, rsq, log2, exp2 on one component.
     void Comp(CompOp op, Dst dst, Src src, uint8_t src_comp, Pred pred = Pred::None,
               bool nosched = false);
     /// Four-wide f32 move src -> dst through the pack unit: reads two consecutive
     /// 64-bit halves (lo = src, hi = the register after it).
     void MoveF32x4(Dst dst, Reg lo, Reg hi, bool nosched = false);
+    /// pack.f32.f16 dst.xyzw, src: the four F16 lanes of the pair at `src` as F32.
+    void UnpackF16x4(Dst dst, Reg src);
     /// Four f32 in (lo, hi) packed to half4 at dst.
     void PackF16(Dst dst, Reg lo, Reg hi, bool nosched = false);
     /// Four-wide f32 move between internal registers with a swizzle.

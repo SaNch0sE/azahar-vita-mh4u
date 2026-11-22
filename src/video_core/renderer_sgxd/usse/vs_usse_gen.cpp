@@ -130,7 +130,9 @@ constexpr uint32_t DataLiteralCount = DataSize - 1;
 
 // Output registers of the fragment interface, in the order the output selects lay them out
 // (OutSelects, TexSize): POSITION o0-o3, COLOR0 o4-o7, TEXCOORD0-2 two each from o8,
-// TEXCOORD3 o14, TEXCOORD4 o16-19, TEXCOORD5 o20-23, TEXCOORD6 o24-26.
+// TEXCOORD3 o14, TEXCOORD4 o16-19, TEXCOORD5 o20-23, TEXCOORD6 o24-26, then a register for each
+// user clip plane (VsRequest::clip_planes), as psp2cgc puts CLP0 and CLP1 after the texture
+// coordinates and sets the output selects' plane bits 0 and 1 (0a001800 -> 0c001803).
 constexpr uint8_t OutPosition = 0;
 constexpr uint8_t OutColor = 4;
 constexpr uint8_t OutTexcoord0 = 8;
@@ -140,6 +142,7 @@ constexpr uint8_t OutTexcoord0W = 14;
 constexpr uint8_t OutNormquat = 16;
 constexpr uint8_t OutNormquatFlat = 20;
 constexpr uint8_t OutView = 24;
+constexpr uint8_t OutClip0 = 27;
 constexpr uint32_t OutSelects = 0x1b001800; ///< 27 registers, position, colour
 constexpr uint32_t TexSize = 0xff249;        ///< the texcoord widths
 
@@ -345,6 +348,7 @@ private:
     std::optional<Src> SemanticSrc(Semantic s) const;
     void GatherFour(Reg internal, Semantic first);
     void OutputPair(uint8_t out, Semantic s0, Semantic s1);
+    void OutputTexcoord(uint8_t out, Semantic su, Semantic sv);
     void OutputLane(uint8_t out, int lane, Semantic s);
 
     const VsRequest& req;
@@ -1874,10 +1878,42 @@ void VertexEmitter::OutputPair(uint8_t out, Semantic s0, Semantic s1) {
     OutputLane(out, 1, s1);
 }
 
+void VertexEmitter::OutputTexcoord(uint8_t out, Semantic su, Semantic sv) {
+    // (s, 1 - t): the host copies keep the PICA's rows in memory order, t = 1 at row 0
+    // (SgxdBackend::Untile), so a fragment program reads there; written flipped, a plain read
+    // takes the coordinate as it arrives and the pixel PDS program can issue it
+    // (FragmentEmitter::SampleTextures).
+    OutputLane(out, 0, su);
+    if (const auto v = SemanticSrc(sv)) {
+        e.Vec(VecOp::Add, {Reg::O(out), 0x2}, Src{v->reg, v->swz, Mod::Neg}, ConstOne);
+    } else {
+        e.MoveInternal({Reg::O(out), 0x2}, ConstZero); // 1 - 1.0, the fill
+    }
+}
+
 void VertexEmitter::Epilogue() {
     // Position: the PICA depth into clip z so the interpolated depth is the PICA depth,
     // after the wrappers' nudge of a z barely past a clip boundary and the viewport flip.
     GatherFour(I0, SemPositionX);
+    // The clip planes from the PICA's own position (w - x, w - y, w + x, w + y), before
+    // anything below changes it, as psp2cgc computes a CLPn output: the distance into i1.x and
+    // a dot with clip (DotClip) of it and one into the plane's register, whose sign the TA
+    // clips by. A plain write of the distance left the clip flags unset: triangles all over the
+    // grid frame went missing.
+    uint8_t plane = 0;
+    for (uint8_t bit = 0; bit < 4; bit++) {
+        if ((req.clip_planes >> bit & 1) == 0) {
+            continue;
+        }
+        const uint8_t out = static_cast<uint8_t>(OutClip0 + plane);
+        e.Vec(VecOp::Add, {I1, 0x1}, {I0, (bit & 1) ? YYYY : XXXX, bit < 2 ? Mod::Neg : Mod::None},
+              {I0, WWWW});
+        e.MoveInternal({I2, 0x1}, ConstOne);
+        e.DotClip(
+            {Reg::O(static_cast<uint8_t>(out & ~1)), static_cast<uint8_t>((out & 1) ? 0x2 : 0x1)},
+            {I1, XXXX}, {I2, XXXX}, plane);
+        plane++;
+    }
     e.Comp(CompOp::Rcp, {I1, 0x1}, {I0}, 3);              // 1/w
     e.Vec(VecOp::Mul, {I1, 0x2}, {I0, ZZZZ}, {I1, XXXX}); // ndc z
     e.Test(Cond::Gt, 2, {I1}, 1, ConstZero, true);
@@ -1911,9 +1947,9 @@ void VertexEmitter::Epilogue() {
     e.MoveInternal({Reg::O(OutNormquatFlat), 0x3}, {I2, XYZW});
     e.MoveInternal({Reg::O(OutNormquatFlat + 2), 0x3}, {I2, ZWZW});
 
-    OutputPair(OutTexcoord0, SemTexcoord0U, SemTexcoord0V);
-    OutputPair(OutTexcoord1, SemTexcoord1U, SemTexcoord1V);
-    OutputPair(OutTexcoord2, SemTexcoord2U, SemTexcoord2V);
+    OutputTexcoord(OutTexcoord0, SemTexcoord0U, SemTexcoord0V);
+    OutputTexcoord(OutTexcoord1, SemTexcoord1U, SemTexcoord1V);
+    OutputTexcoord(OutTexcoord2, SemTexcoord2U, SemTexcoord2V);
     OutputLane(OutTexcoord0W, 0, SemTexcoord0W);
     OutputPair(OutView, SemViewX, static_cast<Semantic>(SemViewX + 1));
     OutputLane(OutView + 2, 0, static_cast<Semantic>(SemViewX + 2));
@@ -1983,7 +2019,9 @@ std::optional<Program> VertexEmitter::Emit(uint32_t& input_regs) {
 
     program.vertex = true;
     program.per_instance = per_instance;
-    program.outselects = OutSelects;
+    const uint32_t planes =
+        req.mode == VsMode::Draw ? static_cast<uint32_t>(std::popcount(req.clip_planes)) : 0u;
+    program.outselects = OutSelects + (planes << 24) | ((1u << planes) - 1);
     program.texsize = TexSize;
     program.pa_count = std::max<uint32_t>({static_cast<uint32_t>(pa_inputs), lowered.pa_count, 4u});
     program.temp_count = lowered.temp_count;

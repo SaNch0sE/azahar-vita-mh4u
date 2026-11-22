@@ -15,7 +15,12 @@ uint32_t VaryingDescriptor(const Program& program, size_t index) {
     // colour iterator is otherwise fixed-point); bit 25 on the last descriptor.
     uint32_t info = 0x0c00000f | (static_cast<uint32_t>(input.input) << 12) |
                     (static_cast<uint32_t>(input.components - 1) << 22);
-    if (input.input == FragmentInput::Color0 || input.input == FragmentInput::Color1) {
+    if (input.half) {
+        // USEFORMAT F16 (bits 29..28 = 2), a colour too: psp2cgc's `half4 TEXCOORD4` is
+        // 2ec0400f and its `half4 COLOR0` 2cc0a00f.
+        info |= 0x20000000;
+    } else if (!input.fixed &&
+               (input.input == FragmentInput::Color0 || input.input == FragmentInput::Color1)) {
         info |= 0x00100000;
     }
     if (index + 1 == program.inputs.size()) {
@@ -83,6 +88,8 @@ std::string UniformName(const Uniform& uniform) {
         return "proctex_noise_p";
     case UniformKind::LightingLutOffset:
         return "lighting_lut_offset";
+    case UniformKind::LightingLutRow:
+        return "lighting_lut_row";
     case UniformKind::LightingGlobalAmbient:
         return "lighting_global_ambient";
     case UniformKind::LightSpecular0:
@@ -95,6 +102,8 @@ std::string UniformName(const Uniform& uniform) {
         return light("ambient");
     case UniformKind::LightPosition:
         return light("position");
+    case UniformKind::LightDirection:
+        return "normalize(" + light("position") + ")";
     case UniformKind::LightSpotDirection:
         return light("spot_direction");
     case UniformKind::LightDistAttenBias:
@@ -166,8 +175,9 @@ std::string ProgramJson(const Program& p) {
     list("secondary", p.secondary.size(),
          [&](std::size_t i) { fmt::format_to(it, R"("{:016x}")", p.secondary[i]); });
     list("inputs", p.inputs.size(), [&](std::size_t i) {
-        fmt::format_to(it, R"({{"input":{},"components":{}}})",
-                       static_cast<uint32_t>(p.inputs[i].input), p.inputs[i].components);
+        fmt::format_to(it, R"({{"input":{},"components":{},"half":{}}})",
+                       static_cast<uint32_t>(p.inputs[i].input), p.inputs[i].components,
+                       p.inputs[i].half ? "true" : "false");
     });
     list("uniforms", p.uniforms.size(), [&](std::size_t i) {
         const Uniform& u = p.uniforms[i];

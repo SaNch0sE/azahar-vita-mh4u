@@ -365,6 +365,11 @@ void Builder::Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred, bool) {
     i.pred = pred;
 }
 
+void Builder::DotClip(Dst dst, Src src1, Src gpi0, uint8_t plane) {
+    Dot(dst, src1, gpi0, true);
+    insts.back().u[2] = static_cast<uint8_t>(plane + 1);
+}
+
 void Builder::Comp(CompOp op, Dst dst, Src src, uint8_t src_comp, Pred pred, bool) {
     Inst& i = Push(Op::Comp);
     i.u[0] = static_cast<uint8_t>(op);
@@ -379,6 +384,14 @@ void Builder::MoveF32x4(Dst dst, Reg lo, Reg hi, bool) {
     i.dst = dst;
     i.reg[0] = lo;
     i.reg[1] = hi;
+}
+
+void Builder::UnpackF16x4(Dst dst, Reg src) {
+    if (dst.reg.bank != Bank::Internal || IsVirtual(src)) {
+        Fail("an F16 unpack goes from a fixed register pair into an internal register");
+    }
+    MoveF32x4(dst, src, src);
+    insts.back().b[0] = true;
 }
 
 void Builder::PackF16(Dst dst, Reg lo, Reg hi, bool) {
@@ -526,6 +539,7 @@ public:
 
     LowerResult Run(Encoder& e, int level);
     bool skip_auto = false;
+    std::function<uint32_t(uint32_t, uint32_t)> occupancy; ///< Builder::occupancy
 
 private:
     std::vector<bool> SkipInvalid() const;
@@ -2253,6 +2267,43 @@ bool ReadsInternal(const Src& s, uint8_t k) {
     return s.reg.bank == Bank::Internal && s.reg.n == k;
 }
 
+/// A four-wide F32 op's second source in the unified store gives one register pair, F32 lanes x
+/// and y: psp2cgc reads z or w there through the next pair (`sa14.xxxx` for sa12's z). The
+/// channels the written lanes read must sit in one pair; one past the first, the read moves to it
+/// (z, w as x, y). False when they span both.
+bool PairSecondSource(Reg& reg, Swizzle& swz, uint8_t mask) {
+    bool low = false, high = false;
+    for (int l = 0; l < 4; l++) {
+        if ((mask >> l & 1) && swz[l] <= Ch::W) {
+            (swz[l] >= Ch::Z ? high : low) = true;
+        }
+    }
+    if (low && high) {
+        return false;
+    }
+    if (high) {
+        reg.n = static_cast<uint8_t>(reg.n + 2);
+        for (Ch& c : swz) {
+            if (c <= Ch::W) {
+                c = c >= Ch::Z ? static_cast<Ch>(static_cast<int>(c) - 2) : Ch::X;
+            }
+        }
+    }
+    return true;
+}
+
+bool SecondSourceInPair(const Src& s, uint8_t mask) {
+    if (s.reg.bank == Bank::Internal || s.reg.bank == Bank::Const) {
+        return true;
+    }
+    for (int l = 0; l < 4; l++) {
+        if ((mask >> l & 1) && (s.swz[l] == Ch::Z || s.swz[l] == Ch::W)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// A compare operand as the single register it reads: bank and absolute index (an
 /// internal register's lanes count as four registers), or a constant kept as written.
 struct TestOperand {
@@ -2368,24 +2419,101 @@ bool FoldTest(Inst& d, uint8_t k, const Src& loaded, std::vector<int>& lanes_rea
     return false;
 }
 
+/// The lanes of `src` an instruction reads, from its swizzle under the destination mask
+/// (a lane the mask skips is not read); 0xf where the shape is not lane-selective.
+uint8_t LanesRead(const Inst& inst, const Src& src, uint8_t mask) {
+    uint8_t lanes = 0;
+    for (int l = 0; l < 4; l++) {
+        if ((mask >> l) & 1 && src.swz[l] <= Ch::W) {
+            lanes |= static_cast<uint8_t>(1u << static_cast<int>(src.swz[l]));
+        }
+    }
+    (void)inst;
+    return lanes;
+}
+
+/// f(register, lanes) for each register an instruction reads, with the lanes it reads where
+/// the shape is lane-selective (0xf otherwise). `refs` is scratch.
+template <typename F>
+void ForEachRead(Inst& inst, std::vector<Ref>& refs, F&& f) {
+    switch (inst.op) {
+    case Op::Vec:
+    case Op::Vec16:
+        f(inst.src[0].reg, LanesRead(inst, inst.src[0], inst.dst.mask));
+        f(inst.src[1].reg, LanesRead(inst, inst.src[1], inst.dst.mask));
+        break;
+    case Op::Mad: // component-wise: the destination mask selects the lanes read
+        for (int k = 0; k < 3; k++) {
+            f(inst.src[k].reg,
+              LanesRead(inst, inst.src[k], inst.dst.mask & (inst.b[0] ? 0xf : 0x7)));
+        }
+        break;
+    case Op::Dot:
+        f(inst.src[0].reg, LanesRead(inst, inst.src[0], inst.b[0] ? 0xf : 0x7));
+        f(inst.src[1].reg, LanesRead(inst, inst.src[1], inst.b[0] ? 0xf : 0x7));
+        break;
+    case Op::Comp:
+        f(inst.src[0].reg, static_cast<uint8_t>(1u << (inst.u[1] & 3)));
+        break;
+    case Op::MoveInternal:
+        f(inst.src[0].reg, LanesRead(inst, inst.src[0], inst.dst.mask));
+        break;
+    case Op::CondMove:
+    case Op::Mad2:
+        for (int k = 0; k < 3; k++) {
+            f(inst.src[k].reg, LanesRead(inst, inst.src[k], inst.dst.mask));
+        }
+        break;
+    case Op::Test:
+        f(inst.src[0].reg, static_cast<uint8_t>(1u << (inst.u[2] & 3)));
+        f(inst.src[1].reg, static_cast<uint8_t>(1u << (inst.b[0] ? 0 : (inst.u[2] & 3))));
+        break;
+    case Op::PackS16:
+        f(inst.reg[1], static_cast<uint8_t>(1u << (inst.u[0] & 3)));
+        break;
+    case Op::UnpackInt:
+        f(inst.reg[1], 1);
+        break;
+    default:
+        Refs(inst, refs);
+        for (const Ref& r : refs) {
+            if (!r.def) {
+                f(*r.reg, 0xf);
+            }
+        }
+        break;
+    }
+}
+
 } // Anonymous namespace
 
 void Lowering::LoadSources() {
-    // A load whose every reader is a two-wide op reading lanes one pair of the source
-    // holds: the readers read the source, the load goes. The reader's own two-wide
-    // encoding is what the compiler writes for such ops (`mul.f32 o0.xy, pa0.xy, sa12.xy`).
+    // A load whose every reader is a two-wide op reading lanes one pair of the source holds: the
+    // readers read the source, the load goes. The reader's own two-wide encoding is what the
+    // compiler writes for such ops (`mul.f32 o0.xy, pa0.xy, sa12.xy`). A load is the unit multiply,
+    // or a four-wide move of a unified-store quad (LoadVec4).
     std::vector<Ref> refs;
     std::vector<bool> drop(insts.size(), false);
+    const auto quad_load = [](const Inst& inst) {
+        return inst.op == Op::MoveF32x4 && !inst.b[0] && inst.dst.reg.bank == Bank::Internal &&
+               inst.dst.mask == 0xf && inst.reg[0].bank != Bank::Internal &&
+               inst.reg[0].bank != Bank::Const && inst.reg[1].bank == inst.reg[0].bank &&
+               inst.reg[1].n == inst.reg[0].n + 2 && (inst.reg[0].n & 1) == 0;
+    };
     for (std::size_t i = 0; i < insts.size(); i++) {
-        if (!IsInternalLoad(insts[i])) {
+        const bool quad = quad_load(insts[i]);
+        if (!IsInternalLoad(insts[i]) && !quad) {
             continue;
         }
         const uint8_t k = insts[i].dst.reg.n;
-        const Src loaded = insts[i].src[0];
+        const Src loaded = quad ? Src{insts[i].reg[0], XYZW, Mod::None} : insts[i].src[0];
         std::vector<std::pair<std::size_t, Inst>> rewrites;
         bool ok = true;
         std::set<int> clobbered; // registers of the source's bank written since the load
         std::vector<int> lanes_read;
+        std::vector<Ref> read_refs;
+        uint8_t fresh = 0; // lanes of the register written since the load
+        uint8_t maybe = 0; // lanes a predicated write since the load may have written
         for (std::size_t j = i + 1; j < insts.size() && ok; j++) {
             Inst& inst = insts[j];
             if (IsBarrier(inst)) {
@@ -2396,6 +2524,23 @@ void Lowering::LoadSources() {
             for (const Ref& r : refs) {
                 if (r.reg->bank == Bank::Internal && r.reg->n == k) {
                     (r.def ? writes : reads) = true;
+                }
+            }
+            // A read of only lanes written since the load is not the load's, and one of
+            // only the load's lanes reads the source instead; a read that mixes them, or
+            // of a lane a predicated write may have changed, keeps the load.
+            uint8_t read_lanes = 0;
+            if (reads) {
+                ForEachRead(inst, read_refs, [&](const Reg& r, uint8_t lanes) {
+                    if (r.bank == Bank::Internal && r.n == k) {
+                        read_lanes |= lanes;
+                    }
+                });
+                if ((read_lanes & ~fresh) == 0) {
+                    reads = false;
+                } else if ((read_lanes & (fresh | maybe)) != 0) {
+                    ok = false;
+                    break;
                 }
             }
             if (reads) {
@@ -2437,12 +2582,42 @@ void Lowering::LoadSources() {
                             d.src[s] = *through;
                         }
                     }
-                } else if (d.op == Op::Vec && d.dst.mask == 0xf && !IsInternalLoad(d)) {
-                    // A four-wide vector op reads any unified-store bank in either source
-                    // (the compiler's `mul.f32 i0.xyzw, sa64.xyzw, sa46.yyyy`): the load's
+                } else if (d.op == Op::Dot) {
+                    // A dot's first source reads any bank, its second an internal register:
+                    // the load's source goes first, swapped there when the second read it and
+                    // the first is an internal register on the standard table.
+                    const bool r0 = ReadsInternal(d.src[0], k);
+                    const bool r1 = ReadsInternal(d.src[1], k);
+                    ok = !(r0 && r1) && loaded.reg.bank != Bank::Const;
+                    if (ok && r1) {
+                        ok = d.src[0].reg.bank == Bank::Internal && d.src[0].swz == XYZW &&
+                             d.src[0].mod == Mod::None;
+                        if (ok) {
+                            std::swap(d.src[0], d.src[1]);
+                        }
+                    }
+                    if (ok) {
+                        Swizzle swz;
+                        for (int l = 0; l < 4; l++) {
+                            const Ch ch = d.src[0].swz[l];
+                            swz[l] = ch <= Ch::W ? loaded.swz[static_cast<int>(ch)] : ch;
+                        }
+                        d.src[0] = Src{loaded.reg, swz, Compose(d.src[0].mod, loaded.mod)};
+                        for (int l = 0; l < (d.b[0] ? 4 : 3); l++) {
+                            if (swz[l] <= Ch::W) {
+                                lanes_read.push_back(loaded.reg.n + static_cast<int>(swz[l]));
+                            }
+                        }
+                    }
+                } else if (d.op == Op::Vec && d.dst.reg.bank == Bank::Internal &&
+                           !IsInternalLoad(d)) {
+                    // A four-wide vector op (an internal destination, any lanes of it) reads any
+                    // unified-store bank in either source (the compiler's `mul.f32 i0.xyzw,
+                    // sa64.xyzw, sa46.yyyy` and `mul.f32 i1.xyz, pa16.xyz, pa14.xxx`): the load's
                     // source with the channels composed, where the swizzle is in the op's
                     // table - both tables for the first source, the standard one for the
-                    // second - and the source is not a constant.
+                    // second, whose lanes come from one pair (PairSecondSource) - and the
+                    // source is not a constant.
                     ok = true;
                     for (int sidx = 0; sidx < 2 && ok; sidx++) {
                         if (!ReadsInternal(d.src[sidx], k)) {
@@ -2454,11 +2629,14 @@ void Lowering::LoadSources() {
                             swz[l] = ch <= Ch::W ? loaded.swz[static_cast<int>(ch)] : ch;
                         }
                         const Mod mod = Compose(d.src[sidx].mod, loaded.mod);
-                        const bool table = sidx == 0 || InVec4StdTable(swz);
+                        Reg reg = loaded.reg;
+                        Swizzle read = swz;
+                        const bool table = sidx == 0 || (PairSecondSource(reg, read, d.dst.mask) &&
+                                                         InVec4StdTable(read));
                         ok = loaded.reg.bank != Bank::Const && table &&
                              (sidx == 0 || (mod != Mod::Neg && mod != Mod::NegAbs));
                         if (ok) {
-                            d.src[sidx] = Src{loaded.reg, swz, mod};
+                            d.src[sidx] = Src{reg, read, mod};
                             for (int l = 0; l < 4; l++) {
                                 if (swz[l] <= Ch::W) {
                                     lanes_read.push_back(loaded.reg.n + static_cast<int>(swz[l]));
@@ -2524,7 +2702,19 @@ void Lowering::LoadSources() {
                 }
             }
             if (writes) {
-                break;
+                // The scan ends once every lane is written again; until then the lanes left
+                // may still be read from the load (above). A predicated write's lanes may
+                // be either.
+                const uint8_t lanes = InternalWriteLanes(inst);
+                if (inst.pred != Pred::None) {
+                    maybe |= static_cast<uint8_t>(lanes & ~fresh);
+                } else {
+                    fresh |= lanes;
+                    maybe &= static_cast<uint8_t>(~lanes);
+                }
+                if (fresh == 0xf) {
+                    break;
+                }
             }
             for (const Ref& r : refs) {
                 if (r.def && r.reg->bank == loaded.reg.bank) {
@@ -2831,23 +3021,6 @@ void Lowering::InternalRegisters() {
     insts.swap(kept);
 }
 
-namespace {
-
-/// The lanes of `src` an instruction reads, from its swizzle under the destination mask
-/// (a lane the mask skips is not read); 0xf where the shape is not lane-selective.
-uint8_t LanesRead(const Inst& inst, const Src& src, uint8_t mask) {
-    uint8_t lanes = 0;
-    for (int l = 0; l < 4; l++) {
-        if ((mask >> l) & 1 && src.swz[l] <= Ch::W) {
-            lanes |= static_cast<uint8_t>(1u << static_cast<int>(src.swz[l]));
-        }
-    }
-    (void)inst;
-    return lanes;
-}
-
-} // Anonymous namespace
-
 void Lowering::Dump(const char* stage) const {
     static const bool enabled = std::getenv("USSE_IR_DUMP") != nullptr;
     if (!enabled) {
@@ -2883,53 +3056,7 @@ void Lowering::CheckInternals() const {
                  " read across a wait, load or branch at instruction " + std::to_string(i) +
                  context);
         };
-        switch (inst.op) {
-        case Op::Vec:
-        case Op::Vec16:
-            check(inst.src[0].reg, LanesRead(inst, inst.src[0], inst.dst.mask));
-            check(inst.src[1].reg, LanesRead(inst, inst.src[1], inst.dst.mask));
-            break;
-        case Op::Mad: // component-wise: the destination mask selects the lanes read
-            for (int k = 0; k < 3; k++) {
-                check(inst.src[k].reg,
-                      LanesRead(inst, inst.src[k], inst.dst.mask & (inst.b[0] ? 0xf : 0x7)));
-            }
-            break;
-        case Op::Dot:
-            check(inst.src[0].reg, LanesRead(inst, inst.src[0], inst.b[0] ? 0xf : 0x7));
-            check(inst.src[1].reg, LanesRead(inst, inst.src[1], inst.b[0] ? 0xf : 0x7));
-            break;
-        case Op::Comp:
-            check(inst.src[0].reg, static_cast<uint8_t>(1u << (inst.u[1] & 3)));
-            break;
-        case Op::MoveInternal:
-            check(inst.src[0].reg, LanesRead(inst, inst.src[0], inst.dst.mask));
-            break;
-        case Op::CondMove:
-        case Op::Mad2:
-            for (int k = 0; k < 3; k++) {
-                check(inst.src[k].reg, LanesRead(inst, inst.src[k], inst.dst.mask));
-            }
-            break;
-        case Op::Test:
-            check(inst.src[0].reg, static_cast<uint8_t>(1u << (inst.u[2] & 3)));
-            check(inst.src[1].reg, static_cast<uint8_t>(1u << (inst.b[0] ? 0 : (inst.u[2] & 3))));
-            break;
-        case Op::PackS16:
-            check(inst.reg[1], static_cast<uint8_t>(1u << (inst.u[0] & 3)));
-            break;
-        case Op::UnpackInt:
-            check(inst.reg[1], 1);
-            break;
-        default:
-            Refs(inst, refs);
-            for (const Ref& r : refs) {
-                if (!r.def) {
-                    check(*r.reg, 0xf);
-                }
-            }
-            break;
-        }
+        ForEachRead(inst, refs, check);
         // Writes: unpredicated ones make their lanes fresh.
         if (inst.pred == Pred::None) {
             Refs(inst, refs);
@@ -3416,6 +3543,10 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             result.phase_starts.push_back(static_cast<uint32_t>(e.Count()));
             break;
         case Op::Vec:
+            if (!SecondSourceInPair(S(i.src[1]), i.dst.mask)) {
+                Fail("a vector op's second source reads z or w of a unified-store register: " +
+                     Describe(const_cast<Inst&>(i)));
+            }
             e.Vec(static_cast<VecOp>(i.u[0]), D(i.dst), S(i.src[0]), S(i.src[1]), i.pred);
             break;
         case Op::Vec16:
@@ -3425,7 +3556,7 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             e.Mad(D(i.dst), S(i.src[0]), S(i.src[1]), S(i.src[2]), i.b[0], i.pred);
             break;
         case Op::Dot:
-            e.Dot(D(i.dst), S(i.src[0]), S(i.src[1]), i.b[0], i.pred);
+            e.Dot(D(i.dst), S(i.src[0]), S(i.src[1]), i.b[0], i.pred, false, i.u[2]);
             break;
         case Op::Mad2:
             e.Mad2(D(i.dst), S(i.src[0]), S(i.src[1]), S(i.src[2]), i.pred);
@@ -3434,7 +3565,11 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             e.Comp(static_cast<CompOp>(i.u[0]), D(i.dst), S(i.src[0]), i.u[1], i.pred);
             break;
         case Op::MoveF32x4:
-            e.MoveF32x4(D(i.dst), Map(i.reg[0]), Map(i.reg[1]));
+            if (i.b[0]) {
+                e.UnpackF16x4(D(i.dst), Map(i.reg[0]));
+            } else {
+                e.MoveF32x4(D(i.dst), Map(i.reg[0]), Map(i.reg[1]));
+            }
             break;
         case Op::PackF16:
             e.PackF16(D(i.dst), Map(i.reg[0]), Map(i.reg[1]));
@@ -3515,8 +3650,17 @@ LowerResult Lowering::Run(Encoder& e, int level) {
     // it.
     const std::vector<Inst> original = insts;
     const uint32_t original_quads = quad_count;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        const int hoist = 3 - attempt; // groups of three, then two, then none
+    const auto reset = [&] {
+        insts = original;
+        quad_count = original_quads;
+        intervals.clear();
+        live.clear();
+        coalesced_outputs.clear();
+        spilled = temp_count = pa_count = peak_live = peak_at = 0;
+    };
+    // One lowering with loads hoisted in groups of three (and the global pass), two, or not
+    // at all (1); throws when the registers do not fit.
+    const auto lower = [&](int hoist) {
         if (level >= 2) {
             Liveness();
             DeadStores();
@@ -3553,21 +3697,75 @@ LowerResult Lowering::Run(Encoder& e, int level) {
             Dump("final");
         }
         Liveness();
-        try {
-            Allocate();
-        } catch (const std::exception&) {
-            if (level >= 2 && hoist >= 2) {
-                insts = original;
-                quad_count = original_quads;
-                intervals.clear();
-                live.clear();
-                coalesced_outputs.clear();
-                spilled = temp_count = pa_count = 0;
+        Allocate();
+    };
+    if (level >= 2 && occupancy) {
+        // The lowering with the most instances is kept as it ended, and encoded from that.
+        struct Kept {
+            std::vector<Inst> insts;
+            uint32_t quad_count = 0;
+            std::vector<QuadLanes> live, uses, defs, live_in;
+            std::vector<Interval> intervals;
+            std::vector<bool> split;
+            std::vector<std::array<Interval, 2>> halves;
+            std::set<uint32_t> coalesced_outputs;
+            uint32_t spilled = 0, temp_count = 0, pa_count = 0, peak_live = 0, peak_at = 0;
+            std::vector<uint16_t> peak_regs;
+        };
+        const auto swap_state = [this](Kept& k) {
+            std::swap(insts, k.insts);
+            std::swap(quad_count, k.quad_count);
+            std::swap(live, k.live);
+            std::swap(uses, k.uses);
+            std::swap(defs, k.defs);
+            std::swap(live_in, k.live_in);
+            std::swap(intervals, k.intervals);
+            std::swap(split, k.split);
+            std::swap(halves, k.halves);
+            std::swap(coalesced_outputs, k.coalesced_outputs);
+            std::swap(spilled, k.spilled);
+            std::swap(temp_count, k.temp_count);
+            std::swap(pa_count, k.pa_count);
+            std::swap(peak_live, k.peak_live);
+            std::swap(peak_at, k.peak_at);
+            std::swap(peak_regs, k.peak_regs);
+        };
+        std::optional<Kept> kept;
+        uint32_t best = 0;
+        for (const int hoist : {3, 2, 1}) {
+            try {
+                lower(hoist);
+            } catch (const std::exception&) {
+                reset();
                 continue;
             }
-            throw;
+            const uint32_t instances = occupancy(temp_count, pa_count);
+            if (instances > best) {
+                best = instances;
+                kept.emplace();
+                swap_state(*kept);
+            }
+            reset();
         }
-        break;
+        if (kept) {
+            swap_state(*kept);
+        } else {
+            // None kept (each threw, or none had an instance): the plain lowering.
+            lower(1);
+        }
+    } else {
+        for (int hoist = 3;; hoist--) {
+            try {
+                lower(hoist);
+            } catch (const std::exception&) {
+                if (level >= 2 && hoist >= 2) {
+                    reset();
+                    continue;
+                }
+                throw;
+            }
+            break;
+        }
     }
     CheckInternals();
     LowerResult result;
@@ -3590,6 +3788,7 @@ LowerResult Builder::Lower(Encoder& e, int level) {
     }
     Lowering lowering{insts, cls};
     lowering.skip_auto = skip_invalid_auto;
+    lowering.occupancy = occupancy;
     return lowering.Run(e, level);
 }
 

@@ -8,12 +8,16 @@
 #include <stdexcept>
 #include <string>
 #include <fmt/format.h>
+#include "sgxd_program.h"
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
-#include "video_core/renderer_gxm/usse/usse_program.h"
 #include "video_core/renderer_gxm/usse/usse_encoder.h"
 #include "video_core/renderer_gxm/usse/usse_ir.h"
+#include "video_core/renderer_gxm/usse/usse_program.h"
 
 namespace GxmRenderer::Usse {
+
+namespace {
+} // namespace
 
 namespace {
 
@@ -106,7 +110,8 @@ constexpr uint8_t TmpTangent = 16;    ///< lighting: the tangent (Config7 only) 
                                       ///< combiner buffer's home, which is filled afterwards
 constexpr uint8_t TmpLightAtten = 0;  ///< lighting: per-light attenuation (.x) and geometric
                                       ///< factor (.y), in combiner_output's home (2)
-constexpr uint8_t TmpShadow = 64;     ///< lighting: the shadow texture's colour (4)
+constexpr uint8_t TmpShadow = 64;     ///< lighting: the shadow texture's colour (4; .x
+                                      ///< alone for a Shadow2D unit's, shadow_scalar)
 constexpr uint8_t TmpLightMem = 68;   ///< lighting: a light's parameters loaded from the
                                       ///< uniform buffer (24: the SA layout, six quads)
 constexpr uint8_t TmpProj = 92;       ///< unit 0's projected coordinate (2), its cube
@@ -193,10 +198,17 @@ enum Lit : uint8_t {
 };
 static_assert(LiteralCount % 2 == 0);
 
+/// Whether a light's vector comes normalised in its uniform (UniformKind::LightDirection): a
+/// directional light's, unless its distance attenuation reads the position's length.
+bool LightPreNormalised(const auto& light) {
+    return light.directional && !light.dist_atten_enable;
+}
+
 // A float4 somewhere in the unified store: two 64-bit pairs at base and base + 2.
 struct Vec4Loc {
     Bank bank;
     uint8_t base;
+    bool f16 = false; ///< four F16 lanes in the one pair at `base` (an F16 varying)
     Reg Pair(int which) const {
         return {bank, static_cast<uint8_t>(base + which * 2)};
     }
@@ -222,6 +234,10 @@ private:
     void RoundPrimary();
     void Lighting();
     void LightingLutLookup(Sampler sampler, bool abs_input, bool two_sided);
+    /// LightingLutLookup's second half, from TmpLutDelta (x the fraction, y the negated
+    /// index): the wrap, the texel and the interpolation, into i0.x. A LUT at the input the
+    /// last lookup indexed goes on here from the same TmpLutDelta.
+    void LightingLutRowFetch(Sampler sampler, bool abs_input);
     void LutLfFetch();
     /// A LUT texel fetch: i1.y holds the index, `sampler_index` names the LUT texture (256
     /// texels a row, `inv_rows` its row count's inverse); the entry lands in TmpLutEntry.
@@ -282,22 +298,43 @@ private:
     static Src Scalar(Bank bank, uint32_t reg) {
         return {Reg{bank, static_cast<uint8_t>(reg & ~1u)}, (reg & 1) ? YYYY : XXXX};
     }
-    /// The data block starts after the resident uniforms; its first SA is the uniform buffer
-    /// pointer when the program reads uniforms from memory (data_head).
+    /// The data block starts after the resident uniforms (its first SA the uniform buffer pointer
+    /// with data_head), the samplers' words, then the literals the code reads: a literal's pair
+    /// gets the next free pair the first time either is read, so a draw's SA image carries a few
+    /// literals, not all 44 (each tile a draw touches sets its state up again).
     Src Lit(uint8_t index) const {
-        return SaScalar(LiteralSaOffset(uniform_floats + data_head, index));
+        return SaScalar(LitSa(index));
+    }
+    uint32_t LitSa(uint8_t index) const {
+        int8_t& slot = lit_pair_slot[index / 2];
+        if (slot < 0) {
+            slot = static_cast<int8_t>(lit_pairs++);
+        }
+        return LiteralSaOffset(uniform_floats + data_head,
+                               static_cast<uint32_t>(program.samplers.size()),
+                               static_cast<uint32_t>(slot) * 2 + index % 2);
     }
     uint8_t SamplerSa(uint32_t sampler_index) const {
-        return static_cast<uint8_t>(
-            SamplerSaOffset(uniform_floats + data_head, LiteralCount, sampler_index));
+        return static_cast<uint8_t>(SamplerSaOffset(uniform_floats + data_head, sampler_index));
     }
+    /// Per pair of the literal table: its pair in the program's literals (Lit), or -1.
+    mutable std::array<int8_t, LiteralCount / 2> lit_pair_slot = [] {
+        std::array<int8_t, LiteralCount / 2> slots;
+        slots.fill(-1);
+        return slots;
+    }();
+    mutable uint32_t lit_pairs = 0;
     /// A uniform in the memory part of the default uniform buffer: `components` floats at
     /// a float offset past the resident part (the light parameters of lights past the SA
     /// budget); returns the offset.
     uint32_t AllocateMemoryUniform(UniformKind kind, uint8_t index, uint8_t components);
-    /// A light's parameters: the SA quad set for a resident light, else loaded into
-    /// TmpLightMem here (six loads and a wait).
+    /// A light's parameters: the SA quad set for a resident light, else TmpLightMem, which
+    /// LightQuads fills quad by quad.
     Vec4Loc LightParams(uint32_t num);
+    /// A memory light's parameter quads in `mask` loaded into TmpLightMem unless they are
+    /// already; with `wait` waited for too, else a LUT fetch's WDF that follows covers them
+    /// (no internal register may hold a value across either). Nothing for a resident light.
+    void LightQuads(uint32_t mask, bool wait);
     void WriteDepth();
     /// A uniform's place: `components` floats (or array_size float4s) at a pair-aligned
     /// offset.
@@ -314,6 +351,11 @@ private:
     /// The units whose texel is the pixel's own colour (FSConfig own_pixel): the tile's colour
     /// in o0, no sampler (unit_used is false for them).
     std::array<bool, 3> unit_own{};
+    /// The units whose read the pixel PDS program issues (Program::issues): plain 2D at an
+    /// untouched coordinate. Their texels are PAs, the others' the SMPs' temporaries.
+    std::array<bool, 3> unit_issued{};
+    std::array<Vec4Loc, 3> texel_loc{
+        {{Bank::Virtual, TmpTex0}, {Bank::Virtual, TmpTex0 + 4}, {Bank::Virtual, TmpTex0 + 8}}};
     std::array<uint8_t, 3> texcoord_pa{}; ///< PA base of TEXCOORD0..2, when declared
     uint8_t position_pa = 0;              ///< PA base of WPOS (x, y, z, w), when declared
     uint8_t texcoord0_w_pa = 0;           ///< PA of TEXCOORD3 (unit 0's projective w)
@@ -357,6 +399,13 @@ private:
     };
     std::vector<MemoryUniform> memory_uniforms;
     std::array<int32_t, 8> light_memory{}; ///< per light number: float offset, or -1 (resident)
+    /// The light being lit when it lives in memory (LightParams): its float offset, its quads
+    /// loaded into TmpLightMem so far (bit q: floats 4q..4q+3), and whether a load still
+    /// waits for its WDF.
+    bool light_mem = false;
+    uint32_t light_mem_offset = 0;
+    uint32_t light_mem_loaded = 0;
+    bool light_mem_pending = false;
     bool uses_depth = false;              ///< W-buffering: the fragment writes its depth
     bool uses_shadow = false;             ///< lighting reads the shadow texture
     bool uses_border = false;             ///< a unit clamps to its border colour
@@ -557,6 +606,7 @@ void FragmentEmitter::PlanInputs() {
         unit_own[unit] = true;
         unit_used[unit] = false;
     }
+    shadow_scalar = uses_shadow && shadow_texture && lighting.shadow_selector == 0;
     for (u32 unit = 0; unit < 3; unit++) {
         const auto& border = tex.texture_border_color[unit];
         if (unit_used[unit] && (border.enable_s || border.enable_t)) {
@@ -583,8 +633,13 @@ void FragmentEmitter::PlanInputs() {
     }
     lut_used = lut_used || uses_fog;
 
-    // pa0-3 is the vertex colour; the four-wide inputs follow, then the pairs, then the
-    // one float3 (which need not be followed by anything pair-aligned).
+    // pa0-3 is the vertex colour. The quaternions and the view arrive as psp2cgc's `half4`
+    // varyings (two lanes a register; the GPU User's Guide's fragment input advice), read once
+    // into an internal register with pack.f32.f16 (LoadVec4). The colour, the position and the
+    // texture coordinates stay F32: an F16 colour moved 1% of a game's grid frame by up to 9/255
+    // after the byte rounding, and depth and a repeating texture's
+    // coordinates need the bits. The four-wide inputs follow, then the pairs, then the one
+    // float3 (which need not be followed by anything pair-aligned).
     program.inputs.push_back({FragmentInput::Color0, 4});
     uint8_t pa = 4;
     if (uses_scissor || uses_fog || uses_depth) {
@@ -593,10 +648,21 @@ void FragmentEmitter::PlanInputs() {
         pa += 4;
     }
     if (uses_lighting) {
-        program.inputs.push_back({FragmentInput::TexCoord4, 4});
-        program.inputs.push_back({FragmentInput::TexCoord5, 4});
+        program.inputs.push_back({FragmentInput::TexCoord4, 4, true});
+        program.inputs.push_back({FragmentInput::TexCoord5, 4, true});
         normquat_pa = pa;
-        pa += 8;
+        pa += 4;
+    }
+    // A plain 2D read at an untouched coordinate is the PDS's to issue before the program
+    // starts (a non-dependent read): no SMP, no wait, no thread waiting on the texture unit
+    // (Sony's USSE Performance tutorial, "Dependent vs. Non-dependent Texture Reads"). The
+    // vertex program writes TEXCOORD0..2 as (s, 1 - t), the rows the host copies keep, so the
+    // coordinate needs no arithmetic here, and the program iterates it only for the border test
+    // or a split unit's alpha read.
+    const u32 unit_coord[3] = {0, 1, tex.texture2_use_coord1 ? 1u : 2u};
+    for (u32 unit = 0; unit < 3; unit++) {
+        unit_issued[unit] =
+            unit_used[unit] && (unit != 0 || tex.texture0_type == TextureType::Texture2D);
     }
     u32 unit_issues = fog_issued ? 1 : 0;
     for (u32 unit = 0; unit < 3; unit++) {
@@ -606,10 +672,14 @@ void FragmentEmitter::PlanInputs() {
         uses_proctex && ProcTexTabled(config.proctex) && unit_issues < MaxTextureIssues;
     const u32 proc_coord =
         uses_proctex && !proctex_tabled ? std::min<u32>(config.proctex.coord, 2) : 3;
-    const bool coord_needed[3] = {
-        unit_used[0] || proc_coord == 0,
-        unit_used[1] || (unit_used[2] && tex.texture2_use_coord1) || proc_coord == 1,
-        (unit_used[2] && !tex.texture2_use_coord1) || proc_coord == 2};
+    bool coord_needed[3] = {proc_coord == 0, proc_coord == 1, proc_coord == 2};
+    for (u32 unit = 0; unit < 3; unit++) {
+        const auto& border = tex.texture_border_color[unit];
+        if (unit_used[unit] && (!unit_issued[unit] || border.enable_s || border.enable_t ||
+                                (tex.alpha_split >> unit & 1))) {
+            coord_needed[unit_coord[unit]] = true;
+        }
+    }
     const FragmentInput coord_inputs[3] = {FragmentInput::TexCoord0, FragmentInput::TexCoord1,
                                            FragmentInput::TexCoord2};
     for (int c = 0; c < 3; c++) {
@@ -618,6 +688,17 @@ void FragmentEmitter::PlanInputs() {
             texcoord_pa[c] = pa;
             pa += 2;
         }
+    }
+    // The texels follow the iterated inputs so far, in PDS order, pair-aligned.
+    for (u32 unit = 0; unit < 3; unit++) {
+        if (!unit_issued[unit]) {
+            continue;
+        }
+        texel_loc[unit] = {Bank::PrimAttr, pa};
+        program.issues.push_back({static_cast<uint8_t>(unit),
+                                  static_cast<uint8_t>(unit_coord[unit]), pa,
+                                  static_cast<uint8_t>(program.inputs.size() - 1)});
+        pa += IssueTexelWords;
     }
     if (proctex_tabled) {
         proctex_loc = {Bank::PrimAttr, pa, u8_tev};
@@ -628,11 +709,11 @@ void FragmentEmitter::PlanInputs() {
         pa += u8_tev ? IssueTexelWordsF16 : IssueTexelWords;
     }
     if (uses_lighting) {
-        // Declared four wide, as psp2cgc declares a float3 varying (descriptor components
-        // 4, four registers): the console, unlike Vita3K, allocates by the declaration.
-        program.inputs.push_back({FragmentInput::TexCoord6, 4});
+        // Declared four wide, as psp2cgc declares a half3 varying: the console allocates by
+        // the declaration.
+        program.inputs.push_back({FragmentInput::TexCoord6, 4, true});
         view_pa = pa;
-        pa += 4;
+        pa += 2;
     }
     if (unit_used[0] && (tex.texture0_type == TextureType::Projection2D ||
                          tex.texture0_type == TextureType::TextureCube)) {
@@ -651,8 +732,9 @@ void FragmentEmitter::PlanInputs() {
         pa += 2;
     }
     program.pa_count = pa;
+    // An issued unit's words go to the pixel PDS per draw, not to the SAs: no SMP reads them.
     for (u32 unit = 0; unit < 3; unit++) {
-        if (unit_used[unit]) {
+        if (unit_used[unit] && !unit_issued[unit]) {
             program.samplers.push_back({SamplerKind::Texture, static_cast<uint8_t>(unit), unit});
         }
     }
@@ -777,7 +859,7 @@ void FragmentEmitter::PlanUniforms() {
             note(light.dist_atten_enable, 16 + light.num);
         }
         if (highest != 0) {
-            sa_lut_offset = AllocateUniform(UniformKind::LightingLutOffset, 4, (highest + 3) / 4);
+            sa_lut_offset = AllocateUniform(UniformKind::LightingLutRow, 4, (highest + 3) / 4);
         }
         sa_global_ambient = AllocateUniform(UniformKind::LightingGlobalAmbient, 3, 1);
         // Lights are register-resident (24 SAs each) while the budget holds, counting the
@@ -786,11 +868,20 @@ void FragmentEmitter::PlanUniforms() {
         const uint32_t tail = LiteralCount + static_cast<uint32_t>(program.samplers.size()) * 4 + 1;
         for (u32 i = 0; i < lighting.src_num; i++) {
             const u32 num = lighting.lights[i].num;
-            const UniformKind members[8] = {
-                UniformKind::LightSpecular0, UniformKind::LightDistAttenBias,
-                UniformKind::LightSpecular1, UniformKind::LightDistAttenScale,
-                UniformKind::LightDiffuse,   UniformKind::LightAmbient,
-                UniformKind::LightPosition,  UniformKind::LightSpotDirection};
+            // A directional light's vector is its position normalised, the same for the
+            // whole draw: the rasterizer normalises it (LightDirection), unless the distance
+            // attenuation wants the position's length.
+            const UniformKind position = LightPreNormalised(lighting.lights[i])
+                                             ? UniformKind::LightDirection
+                                             : UniformKind::LightPosition;
+            const UniformKind members[8] = {UniformKind::LightSpecular0,
+                                            UniformKind::LightDistAttenBias,
+                                            UniformKind::LightSpecular1,
+                                            UniformKind::LightDistAttenScale,
+                                            UniformKind::LightDiffuse,
+                                            UniformKind::LightAmbient,
+                                            position,
+                                            UniformKind::LightSpotDirection};
             const uint8_t sizes[8] = {3, 1, 3, 1, 3, 3, 3, 3};
             const bool resident_light = ((uniform_floats + 1) & ~1u) + 24 + tail <= 128;
             for (int m = 0; m < 8; m++) {
@@ -841,7 +932,8 @@ uint32_t FragmentEmitter::AllocateMemoryUniform(UniformKind kind, uint8_t index,
 }
 
 Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
-    if (light_memory[num] < 0) {
+    light_mem = light_memory[num] >= 0;
+    if (!light_mem) {
         return {Bank::SecAttr, static_cast<uint8_t>(sa_light[num])};
     }
     // 24 floats from the buffer, a load per quad. The allocator places each quad on its
@@ -853,30 +945,38 @@ Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
     if (off + 20 > 127) {
         throw std::runtime_error("light parameters past the load offset's reach");
     }
-    const Reg ptr = Reg::Sa(static_cast<uint8_t>(uniform_floats)); // the data block's head
-    for (uint32_t q = 0; q < 24; q += 4) {
-        e.Lda32(Reg::V(static_cast<uint8_t>(TmpLightMem + q)), ptr, nullptr,
-                static_cast<uint8_t>(off + q), 4, 0);
-    }
-    e.WdfVertex(0);
+    light_mem_offset = off;
+    light_mem_loaded = 0;
+    light_mem_pending = false;
     return {Bank::Virtual, TmpLightMem};
 }
 
-void FragmentEmitter::WriteDepth() {
-    // W-buffering: the fragment's depth is z / w of its window position (the vertex program
-    // put the PICA depth mapping on z). Written with depthf, which ends the phase as a kill
-    // does; the caller opens the next one.
-    const Reg zw = Reg::Pa(static_cast<uint8_t>(position_pa + 2));
-    e.Comp(CompOp::Rcp, {I0, 0x1}, {zw}, 1, Pred::None, true);
-    e.Vec(VecOp::Mul, {Reg::V(TmpProj), 0x1}, {zw, XYZW}, {I0, XXXX}, Pred::None, true);
-    e.DepthF(Reg::V(TmpProj), static_cast<uint8_t>(LiteralSaOffset(uniform_floats + data_head,
-                                                                    LitKillControl)));
+void FragmentEmitter::LightQuads(uint32_t mask, bool wait) {
+    // Each quad is loaded just before the code that reads it, not all six at the light's
+    // start: the six quads (24 temporaries) were live across every LUT fetch of the light, and
+    // the programs with a light in memory were the ones at 60-64 temporaries.
+    if (!light_mem) {
+        return;
+    }
+    const Reg ptr = Reg::Sa(static_cast<uint8_t>(uniform_floats)); // the data block's head
+    for (uint32_t q = 0; q < 6; q++) {
+        if ((mask >> q & 1) != 0 && (light_mem_loaded >> q & 1) == 0) {
+            e.Lda32(Reg::V(static_cast<uint8_t>(TmpLightMem + 4 * q)), ptr, nullptr,
+                    static_cast<uint8_t>(light_mem_offset + 4 * q), 4, 0);
+            light_mem_loaded |= 1u << q;
+            light_mem_pending = true;
+        }
+    }
+    if (wait && light_mem_pending) {
+        e.WdfVertex(0);
+        light_mem_pending = false;
+    }
 }
 
 uint32_t FragmentEmitter::LutSamplerIndex() const {
     uint32_t index = 0;
     for (u32 u = 0; u < 3; u++) {
-        index += unit_used[u] ? 1 : 0;
+        index += unit_used[u] && !unit_issued[u] ? 1 : 0;
     }
     return index;
 }
@@ -926,6 +1026,7 @@ void FragmentEmitter::LutFetch(uint32_t sampler_index, uint8_t scale_lit, uint8_
     LutCoordInto(Reg::V(TmpLutCoord), scale_lit, bias_lit, negated);
     e.Sample2DPoint(Reg::V(TmpLutEntry), Reg::V(TmpLutCoord), SamplerSa(sampler_index), 0);
     e.Wdf(0);
+    light_mem_pending = false; // the wait is for every read on the counter
 }
 
 void FragmentEmitter::LutCoordInto(Reg coord, uint8_t scale_lit, uint8_t bias_lit, bool negated) {
@@ -1201,8 +1302,10 @@ void FragmentEmitter::ProcTex() {
     const Vec4Loc uv_home{Bank::Virtual, TmpProcUv};
     const Reg uv = uv_home.Pair(0);
     const Reg tc = Reg::Pa(texcoord_pa[std::min<u32>(pt.coord, 2)]);
-    // uv = |texcoord|
-    e.Vec(VecOp::Add, {uv, 0x3}, {tc, XYZW, Mod::Abs}, ConstZero, Pred::None, true);
+    // uv = |texcoord|, the coordinate as the PICA has it: the vertex program wrote (s, 1 - t).
+    e.Vec(VecOp::Add, {uv, 0x1}, {tc, XYZW, Mod::Abs}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {uv, 0x2}, {tc, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
+    e.Vec(VecOp::Add, {uv, 0x2}, {uv, XYZW, Mod::Abs}, ConstZero, Pred::None, true);
 
     // The level, for the mipmapped filters: log2(|lut_width * bias| * (|duv.x| + |duv.y|))
     // clamped to the configuration's range, zero at a zero bias. The nearest level serves
@@ -1388,7 +1491,10 @@ void FragmentEmitter::Fog() {
 }
 
 void FragmentEmitter::SampleTextures() {
-    // Every read on counter 0, one wait for all of them before the first use.
+    // Every SMP on counter 0, one wait for all before the first use. The vertex program wrote
+    // TEXCOORD0..2 as (s, 1 - t): the host copy keeps the PICA's rows in memory order, t = 1 at row
+    // 0 (an ETC1 block cannot be flipped by moving it). REPEAT, MIRROR, CLAMP and the border test
+    // are symmetric under it. The issued units' texels are already in their PAs.
     const auto& tex = config.texture;
     bool any = false;
     uint32_t sampler_index = 0;
@@ -1398,17 +1504,16 @@ void FragmentEmitter::SampleTextures() {
             continue;
         }
         const int coord = (unit == 2 && tex.texture2_use_coord1) ? 1 : static_cast<int>(unit);
-        coords[unit] = Reg::Pa(texcoord_pa[coord]);
+        coords[unit] = Reg::Pa(texcoord_pa[coord]); // not iterated for an issued unit alone
         if (unit == 0 && tex.texture0_type == TextureType::TextureCube) {
-            // The direction (u, v, w) of texcoord0 and texcoord0_w. The SGX's cube takes a
-            // face's (s, t) as the PICA does (docs/sgxd/tsp.md), and the
-            // faces keep the PICA's rows with t = 1 at row 0 as every host copy does. Reading
-            // at (u, -v, w) flips t on every face, with the +Y and -Y faces swapped in the host
-            // cube (RasterizerGxm::TextureFor).
+            // The direction (u, v, w) of texcoord0 and texcoord0_w. The SGX's cube takes a face's
+            // (s, t) as the PICA does, and the faces keep t = 1 at row 0: reading at (u, -v, w)
+            // flips t on every face, with +Y and -Y swapped in the host cube
+            // (RasterizerSgxd::TextureFor). The PA holds 1 - v: -v is that less one.
             const Reg dir = Reg::V(TmpProj);
             e.Vec(VecOp::Add, {dir, 0x3}, {coords[0], XYZW}, ConstZero, Pred::None, true);
-            e.Vec(VecOp::Add, {dir, 0x2}, {coords[0], XYZW, Mod::Neg}, ConstZero, Pred::None,
-                  true);
+            e.Vec(VecOp::Add, {dir, 0x2}, {ConstOne.reg, XXXX, Mod::Neg}, {coords[0], XYZW},
+                  Pred::None, true);
             e.Vec(VecOp::Add, {Reg::V(TmpProj + 2), 0x1},
                   {Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u)),
                    (texcoord0_w_pa & 1) ? YYYY : XXXX},
@@ -1420,39 +1525,39 @@ void FragmentEmitter::SampleTextures() {
             continue;
         }
         if (unit == 0 && tex.texture0_type == TextureType::Projection2D) {
-            // texcoord0 / texcoord0_w
+            // texcoord0 / texcoord0_w, at (s, 1 - t) of the projected coordinate: back to t
+            // first, then projected, then flipped again.
+            const Reg proj = Reg::V(TmpProj);
+            e.Vec(VecOp::Add, {proj, 0x1}, {coords[0], XYZW}, ConstZero, Pred::None, true);
+            e.Vec(VecOp::Add, {proj, 0x2}, {coords[0], XYZW, Mod::Neg}, ConstOne, Pred::None, true);
             e.Comp(CompOp::Rcp, {I0, 0x1}, {Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u))},
                    static_cast<uint8_t>(texcoord0_w_pa & 1), Pred::None, true);
-            e.Vec(VecOp::Mul, {Reg::V(TmpProj), 0x3}, {coords[0], XYZW}, {I0, XXXX}, Pred::None,
-                  true);
-            coords[0] = Reg::V(TmpProj);
+            e.Vec(VecOp::Mul, {proj, 0x3}, {proj, XYZW}, {I0, XXXX}, Pred::None, true);
+            const Reg flipped = Reg::V(TmpTexFlip);
+            e.Vec(VecOp::Add, {flipped, 0x3}, {proj, XYZW}, ConstZero, Pred::None, true);
+            e.Vec(VecOp::Add, {flipped, 0x2}, {proj, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
+            coords[0] = flipped;
         }
-        // The host copy keeps the PICA's rows in memory order, t = 1 at row 0
-        // (SgxdBackend::Untile: an ETC1 block cannot be flipped by moving it), so the read is
-        // at (s, 1 - t). REPEAT, MIRROR and CLAMP, and the border test below, are symmetric
-        // under it. The combiner buffers' homes are free until the stages run.
-        const Reg flipped = Reg::V(static_cast<uint8_t>(TmpTexFlip + unit * 2));
-        e.Vec(VecOp::Add, {flipped, 0x3}, {coords[unit], XYZW}, ConstZero, Pred::None, true);
-        e.Vec(VecOp::Add, {flipped, 0x2}, {coords[unit], XYZW, Mod::Neg}, ConstOne, Pred::None,
-              true);
-        coords[unit] = flipped;
-        e.Sample2D(Reg::V(static_cast<uint8_t>(TmpTex0 + unit * 4)), coords[unit],
-                   SamplerSa(sampler_index), nullptr, 0);
-        sampler_index++;
+        if (!unit_issued[unit]) {
+            e.Sample2D(Reg::V(static_cast<uint8_t>(TmpTex0 + unit * 4)), coords[unit],
+                       SamplerSa(sampler_index), nullptr, 0);
+            sampler_index++;
+            any = true;
+        }
         if (config.texture.alpha_split >> unit & 1) {
             // The alpha from the unit's A8 texture, its byte in .w (swizzle R000): the colour
             // texture is ETC1 kept compressed (SgxdBackend::QueueUntile).
             e.Sample2D(Reg::V(static_cast<uint8_t>(TmpAlphaSplit + unit * 4)), coords[unit],
                        SamplerSa(sampler_alpha[unit]), nullptr, 0);
+            any = true;
         }
-        any = true;
     }
     if (any) {
         e.Wdf(0);
     }
     for (u32 unit = 0; unit < 3; unit++) {
         if (unit_used[unit] && (config.texture.alpha_split >> unit & 1)) {
-            const Vec4Loc texel{Bank::Virtual, static_cast<uint8_t>(TmpTex0 + unit * 4)};
+            const Vec4Loc texel = texel_loc[unit];
             const Vec4Loc alpha{Bank::Virtual, static_cast<uint8_t>(TmpAlphaSplit + unit * 4)};
             e.MoveInternal({texel.Pair(1), 0x2}, {alpha.Pair(1), XYZW}, Pred::None, true);
         }
@@ -1465,7 +1570,7 @@ void FragmentEmitter::SampleTextures() {
             continue;
         }
         const Vec4Loc colour{Bank::SecAttr, static_cast<uint8_t>(sa_border + unit * 4)};
-        const Vec4Loc texel{Bank::Virtual, static_cast<uint8_t>(TmpTex0 + unit * 4)};
+        const Vec4Loc texel = texel_loc[unit];
         const auto replace_when = [&](Cond cond, uint8_t chan, const Src& bound) {
             e.Test(cond, 2, {coords[unit]}, chan, bound, true);
             e.MoveInternal({texel.Pair(0), 0x3}, {colour.Pair(0), XYZW}, Pred::P2, true);
@@ -1481,9 +1586,16 @@ void FragmentEmitter::SampleTextures() {
     if (uses_shadow) {
         // shadow = tex, or 1 - tex when inverted.
         const auto& lighting = config.lighting;
-        const Vec4Loc texel{Bank::Virtual, static_cast<uint8_t>(TmpTex0 + lighting.shadow_selector * 4)};
+        const Vec4Loc texel = texel_loc[lighting.shadow_selector];
         const Vec4Loc shadow{Bank::Virtual, TmpShadow};
-        if (lighting.shadow_invert) {
+        if (shadow_scalar) {
+            if (lighting.shadow_invert) {
+                e.Vec(VecOp::Add, {shadow.Pair(0), 0x1}, {texel.Pair(0), XXXX, Mod::Neg},
+                      ConstOne);
+            } else {
+                e.Vec(VecOp::Add, {shadow.Pair(0), 0x1}, {texel.Pair(0), XXXX}, ConstZero);
+            }
+        } else if (lighting.shadow_invert) {
             for (int pair = 0; pair < 2; pair++) {
                 e.Vec(VecOp::Add, {shadow.Pair(pair), 0x3}, {texel.Pair(pair), XYZW, Mod::Neg},
                       ConstOne);
@@ -1497,6 +1609,10 @@ void FragmentEmitter::SampleTextures() {
 void FragmentEmitter::LoadVec4(Reg internal, Vec4Loc from) {
     if (from.bank == Bank::Const) {
         e.MoveInternal({internal, 0xf}, {Reg::C(0), XXXX}, Pred::None, true);
+        return;
+    }
+    if (from.f16) {
+        e.UnpackF16x4({internal, 0xf}, from.Pair(0));
         return;
     }
     e.MoveF32x4({internal, 0xf}, from.Pair(0), from.Pair(1), true);
@@ -1575,32 +1691,46 @@ void FragmentEmitter::LightingLutLookup(Sampler sampler, bool abs_input, bool tw
         e.Vec(VecOp::Max, {I1, 0x2}, {I1, XYZW}, Lit(LitNeg127), Pred::None, true);
         e.Vec(VecOp::Min, {I1, 0x2}, {I1, XYZW}, Lit(Lit128), Pred::None, true);
     }
-    // delta = position - index, then the index wrapped and offset to its row.
+    // delta = position - index (kept with the negated index for a LUT at the same input),
+    // then the index wrapped and offset to its row.
     e.Vec(VecOp::Add, {I1, 0x1}, {I1, YYYY}, {I0, XXXX}, Pred::None, true);
     e.MoveInternal({Reg::V(TmpLutDelta), 0x3}, {I1, XYZW}, Pred::None, true);
+    LightingLutRowFetch(sampler, abs_input);
+}
+
+void FragmentEmitter::LightingLutRowFetch(Sampler sampler, bool abs_input) {
     if (!abs_input) {
-        e.Test(Cond::Gt, 0, {I1}, 1, ConstZero, false);
-        e.Vec(VecOp::Add, {I1, 0x2}, {Lit(Lit256).reg, Lit(Lit256).swz, Mod::Neg}, {I1, YYYY},
+        e.Test(Cond::Gt, 0, {delta}, 1, ConstZero, false);
+        e.Vec(VecOp::Add, {delta, 0x2}, {Lit(Lit256).reg, Lit(Lit256).swz, Mod::Neg}, {delta, YYYY},
               Pred::P0, true);
     }
+    // The LUT is one whole row of the lf texture (lighting_lut_offset is row * 256): the row's
+    // v comes from the CPU (UniformKind::LightingLutRow).
     const uint32_t sampler_index = static_cast<uint32_t>(sampler);
-    const Src offset = SaScalar(sa_lut_offset + sampler_index);
-    e.Vec(VecOp::Add, {I1, 0x2}, {offset.reg, offset.swz, Mod::Neg}, {I1, YYYY}, Pred::None,
+    const Reg coord = Reg::V(TmpLutCoord);
+    e.Mad2({coord, 0x1}, {delta, YYYY, Mod::Abs}, Lit(LitInv256), Lit(LitHalfInv256));
+    e.Vec(VecOp::Add, {coord, 0x2}, SaScalar(sa_lut_offset + sampler_index), ConstZero, Pred::None,
           true);
-    LutLfFetch();
+    e.Sample2DPoint(Reg::V(TmpLutEntry), coord, SamplerSa(LutSamplerIndex()), 0);
+    e.Wdf(0);
+    light_mem_pending = false; // the wait is for every read on the counter
+    // entry.r + entry.g * delta in i0.x (vmad2 does not write the internal registers).
+    e.Vec(VecOp::Mul, {I0, 0x1}, {Reg::V(TmpLutEntry), YYYY}, {delta, XXXX}, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, {Reg::V(TmpLutEntry), XXXX}, Pred::None, true);
 }
 
 void FragmentEmitter::Lighting() {
     const auto& lighting = config.lighting;
-    const Vec4Loc normquat{Bank::PrimAttr, normquat_pa};
-    const Vec4Loc normquat_flat{Bank::PrimAttr, static_cast<uint8_t>(normquat_pa + 4)};
-    const Vec4Loc view{Bank::PrimAttr, view_pa};
+    const Vec4Loc normquat{Bank::PrimAttr, normquat_pa, true};
+    const Vec4Loc normquat_flat{Bank::PrimAttr, static_cast<uint8_t>(normquat_pa + 2), true};
+    const Vec4Loc view{Bank::PrimAttr, view_pa, true};
     const Vec4Loc diffuse_sum{Bank::Virtual, TmpDiffuse};
     const Vec4Loc specular_sum{Bank::Virtual, TmpSpecular};
     const Vec4Loc normal{Bank::Virtual, TmpNormal};
     const Vec4Loc tangent{Bank::Virtual, TmpTangent};
     const Vec4Loc nview{Bank::Virtual, TmpView};
-    const Vec4Loc light_vector{Bank::Virtual, TmpLight};
+    // The light's vector: TmpLight, or a pre-normalised light's own uniform (set per light).
+    Vec4Loc light_vector{Bank::Virtual, TmpLight};
     const Vec4Loc half_vector{Bank::Virtual, TmpHalf};
     const Reg dot_product = Reg::V(TmpMisc);   // .x; .y the squared half vector length
     const Reg misc_hi = Reg::V(TmpMisc + 2);   // .x clamp_highlights, .y light distance
@@ -1632,7 +1762,7 @@ void FragmentEmitter::Lighting() {
     // defaults.
     const auto perturbation = [&](Reg into) {
         // 2 * tex.rgb - 1
-        const Vec4Loc tex{Bank::Virtual, static_cast<uint8_t>(TmpTex0 + lighting.bump_selector * 4)};
+        const Vec4Loc tex = texel_loc[lighting.bump_selector];
         LoadVec4(into, tex);
         e.Vec(VecOp::Mul, {into, 0x7}, {into, XYZW}, Lit(LitTwo), Pred::None, true);
         e.Vec(VecOp::Add, {into, 0x7}, {ConstOne.reg, XXXX, Mod::Neg}, {into, XYZW}, Pred::None,
@@ -1834,11 +1964,26 @@ void FragmentEmitter::Lighting() {
             break;
         }
     };
-    // scale * LUT(input) into i0.x, for an enabled LUT.
+    // scale * LUT(input) into i0.x, for an enabled LUT. Within a light the vectors stay put, so
+    // a LUT read at the input the previous one indexed (a game's D0 and D1 both at N.V) takes its
+    // index from that lookup: no dot product and no index arithmetic again.
+    struct LutIndexKey {
+        LutInput input;
+        bool abs_input;
+        bool two_sided;
+        bool operator==(const LutIndexKey&) const = default;
+    };
+    std::optional<LutIndexKey> last_lut_index;
     const auto lut_value = [&](const Pica::Shader::LutConfig& lut, Sampler sampler,
                                bool two_sided) {
-        lut_input(lut.type.Value());
-        LightingLutLookup(sampler, lut.abs_input, two_sided);
+        const LutIndexKey key{lut.type.Value(), static_cast<bool>(lut.abs_input), two_sided};
+        if (last_lut_index == key) {
+            LightingLutRowFetch(sampler, key.abs_input); // TmpLutDelta holds its index
+        } else {
+            lut_input(key.input);
+            LightingLutLookup(sampler, key.abs_input, two_sided);
+            last_lut_index = key;
+        }
         const float scale = lut.GetScale();
         if (scale != 1.0f) {
             // Scales are powers of two between 0.25 and 8: made from the constant bank.
@@ -1860,6 +2005,7 @@ void FragmentEmitter::Lighting() {
 
     for (u32 light_index = 0; light_index < lighting.src_num; light_index++) {
         const auto& light = lighting.lights[light_index];
+        last_lut_index.reset(); // another light's vectors
         const Vec4Loc params = LightParams(light.num);
         const Bank pb = params.bank;
         const uint32_t sa = params.base;
@@ -1874,6 +2020,9 @@ void FragmentEmitter::Lighting() {
         const bool shadow_secondary =
             uses_shadow && lighting.shadow_secondary && light.shadow_enable;
         const Vec4Loc shadow{Bank::Virtual, TmpShadow};
+        // A memory light's quads: 0 specular_0 (and the distance bias in .w), 1 specular_1
+        // (the distance scale), 2 diffuse, 3 ambient, 4 position, 5 the spot direction.
+        LightQuads(0x30, true);
 
         // light_vector = position (+ view unless directional); distance; normalised.
         // Normalising a directional light's direction once per draw in a secondary program
@@ -1881,18 +2030,23 @@ void FragmentEmitter::Lighting() {
         // console, 2026-09-06: the tiles of one fragment job do not all see the same
         // secondary attributes once the secondary program has written them.
         LoadVec4(I0, position);
-        if (!light.directional) {
-            LoadVec4(I1, view);
-            e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
+        if (LightPreNormalised(light)) {
+            light_vector = position;
+        } else {
+            if (!light.directional) {
+                LoadVec4(I1, view);
+                e.Vec(VecOp::Add, {I0, 0x7}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
+            }
+            e.Dot({I1, 0x1}, {I0, XYZW}, {I0, XYZW}, false, Pred::None, true);
+            e.Comp(CompOp::Rsq, {I1, 0x2}, {I1}, 0, Pred::None, true);
+            if (light.dist_atten_enable) {
+                e.Vec(VecOp::Mul, {I1, 0x1}, {I1, XYZW}, {I1, YYYY}, Pred::None, true); // length
+                e.MoveInternal({misc_hi, 0x2}, {I1, XXXX}, Pred::None, true); // .y = distance
+            }
+            e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {I1, YYYY}, Pred::None, true);
+            light_vector = {Bank::Virtual, TmpLight};
+            StoreVec4(light_vector, I0);
         }
-        e.Dot({I1, 0x1}, {I0, XYZW}, {I0, XYZW}, false, Pred::None, true);
-        e.Comp(CompOp::Rsq, {I1, 0x2}, {I1}, 0, Pred::None, true);
-        if (light.dist_atten_enable) {
-            e.Vec(VecOp::Mul, {I1, 0x1}, {I1, XYZW}, {I1, YYYY}, Pred::None, true); // length
-            e.MoveInternal({misc_hi, 0x2}, {I1, XXXX}, Pred::None, true);           // .y = distance
-        }
-        e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {I1, YYYY}, Pred::None, true);
-        StoreVec4(light_vector, I0);
         CopyVec4({Bank::Virtual, TmpLightAcc}, spot, 0x7);
         // half_vector = normalize(nview + light_vector); its squared length kept for the
         // geometric factor.
@@ -1949,11 +2103,14 @@ void FragmentEmitter::Lighting() {
             e.Vec(VecOp::Mul, {atten, 0x1}, {atten, XYZW}, {I0, XXXX}, Pred::None, true);
         }
         if (light.dist_atten_enable) {
-            // index = clamp(scale * distance + bias, 0, 1), unsigned lookup
+            // index = clamp(scale * distance + bias, 0, 1), unsigned lookup (the bias and
+            // scale are the .w of quads 0 and 1; a load takes four words).
+            LightQuads(0x3, true);
             e.Vec(VecOp::Mul, {I0, 0x1}, {misc_hi, YYYY}, Scalar(pb, sa + 7), Pred::None, true);
             e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, Scalar(pb, sa + 3), Pred::None, true);
             Clamp01(I0, 0x1);
             LightingLutLookup(LightingRegs::DistanceAttenuationSampler(light.num), true, false);
+            last_lut_index.reset(); // TmpLutDelta holds the distance's index now
             e.Vec(VecOp::Mul, {atten, 0x1}, {atten, XYZW}, {I0, XXXX}, Pred::None, true);
         }
 
@@ -1992,7 +2149,11 @@ void FragmentEmitter::Lighting() {
         }
         // specular_1 = d1 * refl * light.specular_1 (each factor only when it is not 1),
         // into i2; parked in the accumulator's home when the d0 lookup runs next (it
-        // needs the internal registers).
+        // needs the internal registers). A memory light's quads load with the LUT fetch
+        // before their use: specular_1's now, with specular_0's and the diffuse ones unless
+        // the d0 fetch comes (i2 holds a value until then, so no wait of their own after it).
+        const uint32_t diffuse_quads = uses_primary_color ? 0xcu : 0u;
+        LightQuads(1u << 1 | (d0_on ? 0u : 1u | diffuse_quads), !d1_on);
         if (d1_on) {
             lut_value(lighting.lut_d1, Sampler::Distribution1, two_sided);
             LoadVec4(I2, specular_1);
@@ -2012,6 +2173,7 @@ void FragmentEmitter::Lighting() {
         }
         // specular_0 = d0 * light.specular_0 (d0 from its LUT or 1), added on.
         if (d0_on) {
+            LightQuads(1u | diffuse_quads, false);
             lut_value(lighting.lut_d0, Sampler::Distribution0, two_sided);
             LoadVec4(I1, specular_0);
             e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {I0, XXXX}, Pred::None, true);
@@ -2032,7 +2194,9 @@ void FragmentEmitter::Lighting() {
         if (atten_on) {
             e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {atten, XXXX}, Pred::None, true);
         }
-        if (shadow_secondary) {
+        if (shadow_secondary && shadow_scalar) {
+            e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {shadow.Pair(0), XXXX}, Pred::None, true);
+        } else if (shadow_secondary) {
             LoadVec4(I2, shadow);
             e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {I2, XYZW}, Pred::None, true);
         }
@@ -2047,10 +2211,13 @@ void FragmentEmitter::Lighting() {
         } // uses_secondary_color
         if (uses_primary_color) {
         // diffuse_sum += (diffuse * dot_product + ambient) * atten
+        LightQuads(0xc, true);
         LoadVec4(I0, diffuse);
         LoadVec4(I1, ambient);
         e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {dot_product, XXXX}, Pred::None, true);
-        if (shadow_primary) {
+        if (shadow_primary && shadow_scalar) {
+            e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {shadow.Pair(0), XXXX}, Pred::None, true);
+        } else if (shadow_primary) {
             LoadVec4(I2, shadow);
             e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {I2, XYZW}, Pred::None, true);
         }
@@ -2085,13 +2252,15 @@ void FragmentEmitter::Lighting() {
 
     if (uses_shadow && lighting.shadow_alpha) {
         const Vec4Loc shadow{Bank::Virtual, TmpShadow};
+        const Src shadow_alpha =
+            shadow_scalar ? Src{shadow.Pair(0), XXXX} : Src{shadow.Pair(1), YYYY};
         if (lighting.enable_primary_alpha && uses_primary_color) {
             e.Vec(VecOp::Mul, {diffuse_sum.Pair(1), 0x2}, {diffuse_sum.Pair(1), XYZW},
-                  {shadow.Pair(1), YYYY});
+                  shadow_alpha);
         }
         if (lighting.enable_secondary_alpha && uses_secondary_color) {
             e.Vec(VecOp::Mul, {specular_sum.Pair(1), 0x2}, {specular_sum.Pair(1), XYZW},
-                  {shadow.Pair(1), YYYY});
+                  shadow_alpha);
         }
     }
     // diffuse_sum.rgb += global ambient; both clamped in place.
@@ -2169,11 +2338,11 @@ Vec4Loc FragmentEmitter::SourceLocation(Source source, u32 stage_index, bool alp
     case Source::SecondaryFragmentColor:
         return uses_lighting ? Vec4Loc{Bank::Virtual, TmpSpecular} : Vec4Loc{Bank::Const, 0};
     case Source::Texture0:
-        return {Bank::Virtual, TmpTex0};
+        return texel_loc[0];
     case Source::Texture1:
-        return {Bank::Virtual, TmpTex0 + 4};
+        return texel_loc[1];
     case Source::Texture2:
-        return {Bank::Virtual, TmpTex0 + 8};
+        return texel_loc[2];
     case Source::PreviousBuffer: {
         const int from = alpha ? buffer_alpha_from[stage_index] : buffer_color_from[stage_index];
         if (from == -2) {
@@ -2472,52 +2641,58 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     PlanUniforms();
     uses_kill = config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always ||
                 uses_scissor;
+    if (uses_kill) {
+        LitSa(LitKillControl); // the kill's operand pair, patched in after the code (PatchKills)
+    }
 
-    program.literals = {0xE000u, // the kill's control word, as every compiler program has it
-                    0u,
-                    std::bit_cast<uint32_t>(255.0f),
-                    std::bit_cast<uint32_t>(1.0f / 255.0f),
-                    std::bit_cast<uint32_t>(2.0f),
-                    std::bit_cast<uint32_t>(4.0f),
-                    std::bit_cast<uint32_t>(128.0f),
-                    std::bit_cast<uint32_t>(127.0f),
-                    std::bit_cast<uint32_t>(1.0f / 256.0f),
-                    std::bit_cast<uint32_t>(1.0f / static_cast<float>(Pica::Shader::LUT_LF_ROWS)),
-                    std::bit_cast<uint32_t>(0.5f / 256.0f),
-                    std::bit_cast<uint32_t>(256.0f),
-                    std::bit_cast<uint32_t>(255.0f),
-                    std::bit_cast<uint32_t>(-128.0f),
-                    std::bit_cast<uint32_t>(1.0f / static_cast<float>(Pica::Shader::LUT_RG_ROWS)),
-                    std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_width)),
-                    std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_width - 1)),
-                    std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_offset0)),
-                    std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_offset1)),
-                    std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_offset2)),
-                    std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_offset3)),
-                    std::bit_cast<uint32_t>(240.0f),
-                    std::bit_cast<uint32_t>(248.0f),
-                    std::bit_cast<uint32_t>(252.0f),
-                    std::bit_cast<uint32_t>(254.0f),
-                    std::bit_cast<uint32_t>(std::max(0.0f, static_cast<float>(config.proctex.lod_min))),
-                    std::bit_cast<uint32_t>(std::min(7.0f, static_cast<float>(config.proctex.lod_max))),
-                    0u,
-                    std::bit_cast<uint32_t>(2.0f),
-                    std::bit_cast<uint32_t>(-2.0f),
-                    std::bit_cast<uint32_t>(1.0f),
-                    std::bit_cast<uint32_t>(1.0f / static_cast<float>(Pica::Shader::LUT_LF_ROWS)),
-                    std::bit_cast<uint32_t>(0.5f / 256.0f),
-                    std::bit_cast<uint32_t>(0.5f / static_cast<float>(Pica::Shader::LUT_LF_ROWS)),
-                    std::bit_cast<uint32_t>(1.0f),
-                    std::bit_cast<uint32_t>(1.0f / static_cast<float>(Pica::Shader::LUT_RG_ROWS)),
-                    std::bit_cast<uint32_t>(0.5f / 256.0f),
-                    std::bit_cast<uint32_t>(0.5f / static_cast<float>(Pica::Shader::LUT_RG_ROWS)),
-                    std::bit_cast<uint32_t>(-127.0f),
-                    std::bit_cast<uint32_t>(-255.0f),
-                    std::bit_cast<uint32_t>(9.0f),
-                    std::bit_cast<uint32_t>(144.0f),
-                    std::bit_cast<uint32_t>(1.0f / 144.0f),
-                    0u};
+    // The table; program.literals gets the pairs the code reads (Lit).
+    const auto literal_table = std::to_array<uint32_t>({
+        0xE000u, // the kill's control word, as every compiler program has it
+        0u,
+        std::bit_cast<uint32_t>(255.0f),
+        std::bit_cast<uint32_t>(1.0f / 255.0f),
+        std::bit_cast<uint32_t>(2.0f),
+        std::bit_cast<uint32_t>(4.0f),
+        std::bit_cast<uint32_t>(128.0f),
+        std::bit_cast<uint32_t>(127.0f),
+        std::bit_cast<uint32_t>(1.0f / 256.0f),
+        std::bit_cast<uint32_t>(1.0f / static_cast<float>(Pica::Shader::LUT_LF_ROWS)),
+        std::bit_cast<uint32_t>(0.5f / 256.0f),
+        std::bit_cast<uint32_t>(256.0f),
+        std::bit_cast<uint32_t>(255.0f),
+        std::bit_cast<uint32_t>(-128.0f),
+        std::bit_cast<uint32_t>(1.0f / static_cast<float>(Pica::Shader::LUT_RG_ROWS)),
+        std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_width)),
+        std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_width - 1)),
+        std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_offset0)),
+        std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_offset1)),
+        std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_offset2)),
+        std::bit_cast<uint32_t>(static_cast<float>(config.proctex.lut_offset3)),
+        std::bit_cast<uint32_t>(240.0f),
+        std::bit_cast<uint32_t>(248.0f),
+        std::bit_cast<uint32_t>(252.0f),
+        std::bit_cast<uint32_t>(254.0f),
+        std::bit_cast<uint32_t>(std::max(0.0f, static_cast<float>(config.proctex.lod_min))),
+        std::bit_cast<uint32_t>(std::min(7.0f, static_cast<float>(config.proctex.lod_max))),
+        0u,
+        std::bit_cast<uint32_t>(2.0f),
+        std::bit_cast<uint32_t>(-2.0f),
+        std::bit_cast<uint32_t>(1.0f),
+        std::bit_cast<uint32_t>(1.0f / static_cast<float>(Pica::Shader::LUT_LF_ROWS)),
+        std::bit_cast<uint32_t>(0.5f / 256.0f),
+        std::bit_cast<uint32_t>(0.5f / static_cast<float>(Pica::Shader::LUT_LF_ROWS)),
+        std::bit_cast<uint32_t>(1.0f),
+        std::bit_cast<uint32_t>(1.0f / static_cast<float>(Pica::Shader::LUT_RG_ROWS)),
+        std::bit_cast<uint32_t>(0.5f / 256.0f),
+        std::bit_cast<uint32_t>(0.5f / static_cast<float>(Pica::Shader::LUT_RG_ROWS)),
+        std::bit_cast<uint32_t>(-127.0f),
+        0u,
+        std::bit_cast<uint32_t>(9.0f),
+        std::bit_cast<uint32_t>(144.0f),
+        std::bit_cast<uint32_t>(1.0f / 144.0f),
+        0u};
     static_assert(LiteralCount == 44);
+    static_assert(std::tuple_size_v<decltype(literal_table)> == LiteralCount);
     static_assert(Pica::Shader::LUT_RG_ROWS == Pica::Shader::LUT_RGBA_ROWS);
     program.uses_discard = uses_kill;
     if (uniform_floats + LiteralCount + program.samplers.size() * 4 > 128) {
@@ -2588,10 +2763,35 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     // The quads go to the temporaries, then to primary attributes past the interpolants.
     e.AddClass({Bank::Temp, 0, 64});
     e.AddClass({Bank::PrimAttr, static_cast<uint8_t>((program.pa_count + 3) & ~3u), 64});
+    // The second tier keeps the hoisting whose registers let the most pixel tasks run at once
+    // (the PDS's count in the draw's sgxd_program_pixel_dms word, 16 written as 0), then the
+    // most USE instances: the LUT reads wait one by one, and only other tasks hide that.
+    const uint32_t sa_words = uniform_floats + data_head + lit_pairs * 2 +
+                              static_cast<uint32_t>(program.samplers.size()) * 4;
+    e.occupancy = [&](uint32_t temps, uint32_t pa) {
+        const uint32_t dms =
+            sgxd_program_pixel_dms(std::max<uint32_t>({program.pa_count, pa, 2u}), temps, sa_words);
+        const uint32_t tasks = (dms >> 22 & 15) != 0 ? (dms >> 22 & 15) : 16;
+        return tasks << 4 | ((dms >> 15 & 3) + 1);
+    };
     Encoder encoder;
     const Ir::LowerResult lowered = e.Lower(encoder, level);
-    encoder.PatchKills(LiteralSaOffset(uniform_floats + data_head, LitKillControl));
+    if (uses_kill) {
+        encoder.PatchKills(LitSa(LitKillControl));
+    }
+    // Every fragment program has had SAs to DMA: one pair at least, rather than a pixel task
+    // without a secondary DMA, which the console has not run.
+    if (uniform_floats + data_head + lit_pairs * 2 + program.samplers.size() * 4 == 0) {
+        LitSa(LitKillControl);
+    }
     encoder.FinishNosched();
+    program.literals.assign(lit_pairs * 2, 0u);
+    for (uint32_t pair = 0; pair < LiteralCount / 2; pair++) {
+        if (lit_pair_slot[pair] >= 0) {
+            program.literals[lit_pair_slot[pair] * 2] = literal_table[pair * 2];
+            program.literals[lit_pair_slot[pair] * 2 + 1] = literal_table[pair * 2 + 1];
+        }
+    }
     program.temp_count = lowered.temp_count;
     program.peak_live = lowered.peak_live;
     program.peak_at = lowered.peak_at;

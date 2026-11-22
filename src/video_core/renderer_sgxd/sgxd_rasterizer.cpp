@@ -638,6 +638,7 @@ UniformField FragmentUniformField(const Usse::Uniform& u) {
     case K::ProctexNoiseP:
         return {offsetof(D, proctex_noise_p), false};
     case K::LightingLutOffset:
+    case K::LightingLutRow:
         return {offsetof(D, lighting_lut_offset), true};
     case K::LightingGlobalAmbient:
         return {offsetof(D, lighting_global_ambient), false};
@@ -650,6 +651,7 @@ UniformField FragmentUniformField(const Usse::Uniform& u) {
     case K::LightAmbient:
         return {light + offsetof(L, ambient), false};
     case K::LightPosition:
+    case K::LightDirection:
         return {light + offsetof(L, position), false};
     case K::LightSpotDirection:
         return {light + offsetof(L, spot_direction), false};
@@ -676,6 +678,7 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
 #ifdef VITA_DIAGNOSTICS
     Usse::Encoder::probe_skip_point_reads = SgxdFlag("smpskip");
 #endif
+    // f32tev: before the second tier starts emitting.
     Usse::Ir::SetTier2Skip(GxmFlagValue("tier2skip"));
 #ifdef VITA_DIAGNOSTICS
     // sgxd_flags eotmixpbe=N: EUR_CR_PIXELBE for every 3D kick built (the eotmix probes).
@@ -2404,9 +2407,11 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         bools |= static_cast<u16>((pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n);
     }
     bools &= *used;
+    const u8 clip_planes = ClipPlanes(mode);
     const u64 key = Common::HashCombine(
         config.Hash(),
-        static_cast<u64>(mode) << 32 | static_cast<u64>(u8_regs) << 16 | default_regs,
+        static_cast<u64>(clip_planes) << 40 | static_cast<u64>(mode) << 32 |
+            static_cast<u64>(u8_regs) << 16 | default_regs,
         static_cast<u64>(bools) << 16 | *used |
             (static_cast<u64>(s8_regs) << 32 | static_cast<u64>(s16_regs) << 48),
         Common::ComputeHash64(reg_components.data(), reg_components.size()));
@@ -2432,6 +2437,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         request.s8_regs = s8_regs;
         request.s16_regs = s16_regs;
         request.mode = mode;
+        request.clip_planes = clip_planes;
         return request;
     };
     if (VertexProgram* const found = vertex_programs.Find(key)) {
@@ -2639,7 +2645,9 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
                                                                             u32 output_mask) {
     const Pica::Shader::Generator::PicaFixedGSConfig gs_config{regs};
     const auto maps = gs_config.state.GetSemanticMaps();
-    u64 key = Common::HashCombine(0x6770617373ull /* "gpass" */, output_mask);
+    const u8 clip_planes = ClipPlanes(Usse::VsMode::Draw);
+    u64 key = Common::HashCombine(0x6770617373ull /* "gpass" */,
+                                  static_cast<u64>(clip_planes) << 32 | output_mask);
     for (const auto& m : maps) {
         key = Common::HashCombine(key, static_cast<u64>(m.attribute_index) << 8 | m.component_index);
     }
@@ -2648,6 +2656,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
     }
     std::vector<u32> code;
     Usse::VsRequest request{};
+    request.clip_planes = clip_planes;
     request.output_map.fill(16);
     for (u32 reg = 0; reg < 16; reg++) {
         if ((output_mask >> reg) & 1) {
@@ -3181,6 +3190,31 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
             blend->SetMinMaxEmulationDisabled();
         }
     }
+    // An include box, [x1, x2 + 1) x [y1, y2 + 1), over the whole viewport (within the colour
+    // buffer) keeps every fragment, as the viewport clips x and y: the test goes, and with it
+    // the kill that made the draw punch-through, so the ISP removes what the draw hides before
+    // the shading. a game sets (0, 0)-(239, 399) with its 240x400 viewport on a 256x416 buffer
+    // for every draw.
+    const auto& rs = regs.rasterizer;
+    const auto& sc = rs.scissor_test;
+    if (config.framebuffer.scissor_test_mode == Pica::RasterizerRegs::ScissorMode::Include) {
+        const auto& fb = regs.framebuffer.framebuffer;
+        const s32 vx0 = std::max<s32>(rs.viewport_corner.x, 0);
+        const s32 vy0 = std::max<s32>(rs.viewport_corner.y, 0);
+        const s32 vx1 =
+            std::min<s32>(rs.viewport_corner.x +
+                              static_cast<s32>(f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2),
+                          static_cast<s32>(fb.GetWidth()));
+        const s32 vy1 =
+            std::min<s32>(rs.viewport_corner.y +
+                              static_cast<s32>(f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2),
+                          static_cast<s32>(fb.GetHeight()));
+        if (static_cast<s32>(sc.x1) <= vx0 && static_cast<s32>(sc.y1) <= vy0 &&
+            static_cast<s32>(sc.x2) + 1 >= vx1 && static_cast<s32>(sc.y2) + 1 >= vy1) {
+            config.framebuffer.scissor_test_mode.Assign(
+                Pica::RasterizerRegs::ScissorMode::Disabled);
+        }
+    }
     u32 alpha_split = 0;
     for (u32 unit = 0; unit < 3; unit++) {
         alpha_split |= SplitAlpha(unit) ? 1u << unit : 0u;
@@ -3355,10 +3389,7 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
     // SMP reads its four state words as two pairs: with memory uniforms the resident count is odd and
     // the buffer pointer makes it even.
     DEBUG_ASSERT(g.samplers.empty() ||
-                 Usse::SamplerSaOffset(g.uniform_floats + Usse::DataHead(g),
-                                       static_cast<u32>(g.literals.size()), 0) %
-                         2 ==
-                     0);
+                 Usse::SamplerSaOffset(g.uniform_floats + Usse::DataHead(g), 0) % 2 == 0);
     for (const Usse::Uniform& u : g.uniforms) {
         // Resident, or in the memory buffer (FragmentSa) at the same float index.
         DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <=
@@ -3366,7 +3397,7 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
         const UniformField field = FragmentUniformField(u);
         f.uniforms.push_back({u.sa_offset, static_cast<u16>(field.offset),
                               static_cast<u8>(u.components), static_cast<u8>(u.array_size), 16,
-                              field.is_int});
+                              field.is_int, u.kind == Usse::UniformKind::LightDirection});
     }
 
     std::vector<u64> code = g.primary;
@@ -3433,23 +3464,26 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
                                                    backend.PlaceCode(1, g.secondary), 0);
     f.primary_doutu0 = doutu0;
 
-    std::array<u32, 12> iterators{};
-    std::array<unsigned, 12> words{};
-    DEBUG_ASSERT(g.inputs.size() <= iterators.size());
+    ASSERT_MSG(g.inputs.size() <= f.iterators.size(),
+               "sgxd: fragment program {:016x} has {} inputs (input:components):{}, {} at most",
+               hash, g.inputs.size(),
+               [&] {
+                   std::string list;
+                   for (const Usse::Varying& in : g.inputs) {
+                       list += fmt::format(" {:x}:{}{}", static_cast<u32>(in.input),
+                                           in.components, in.half ? "h" : "");
+                   }
+                   return list;
+               }(),
+               f.iterators.size());
     u32 iterated = 0;
     for (size_t i = 0; i < g.inputs.size(); i++) {
-        iterators[i] = Usse::VaryingDescriptor(g, i);
-        words[i] = g.inputs[i].components;
-        iterated += g.inputs[i].components;
+        f.iterators[i] = Usse::VaryingDescriptor(g, i);
+        f.iterator_words[i] = Usse::VaryingWords(g.inputs[i]);
+        iterated += Usse::VaryingWords(g.inputs[i]);
     }
-    SgxdPdsProgram pds{};
-    [[maybe_unused]] const int fprim = sgxd_program_pixel_pds(
-        doutu0, iterators.data(), words.data(), static_cast<unsigned>(g.inputs.size()), &pds);
-    DEBUG_ASSERT(fprim == 0);
-    f.fprim = backend.PlaceFixedPds(pds); // kept with the program
-    f.fprim_units = pds.units;
-    // The pack reads pa0 and pa1 (four F16), the iterators write from pa0.
-    // The split blend's scratch: pa1 and pa2.
+    f.iterator_count = static_cast<u32>(g.inputs.size());
+    // The pack reads pa0 and pa1 (four F16); the split blend's scratch is pa1 and pa2.
     f.pixel_pa = std::max<u32>({g.pa_count, iterated, epilogue.split_alpha ? 3u : 2u});
     LOG_INFO(Render,
              "fragment program {:016x}, blend {:016x}: {} words, {} inputs, {} PAs, {} temps, "
@@ -3942,9 +3976,34 @@ std::array<u32, RasterizerSgxd::VertexLayout::ProgramKeyWords> RasterizerSgxd::V
     for (u32 n = 0; n < 16; n++) {
         bools |= (pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n;
     }
-    key[15] = static_cast<u32>(mode);
+    key[15] = static_cast<u32>(mode) | static_cast<u32>(ClipPlanes(mode)) << 8;
     key[16] = bools;
     return key;
+}
+
+u8 RasterizerGxm::ClipPlanes(Usse::VsMode mode) const {
+    // The PICA clips x and y at the viewport (its frustum); the SGX clips at a guard band and
+    // keeps what lies on the target, so a viewport smaller than its colour buffer needs planes
+    // at its inner edges, or a draw writes the buffer's margin.
+    if (mode != Usse::VsMode::Draw) {
+        return 0;
+    }
+#ifdef VITA_DIAGNOSTICS
+    // gxm_flags noclipplanes: none, to tell whether the TA's lockups come with the clipping the planes ask for.
+    static const bool no_clip_planes = GxmFlag("noclipplanes");
+    if (no_clip_planes) {
+        return 0;
+    }
+#endif
+    const auto& rs = regs.rasterizer;
+    const auto& fb = regs.framebuffer.framebuffer;
+    const s32 x0 = rs.viewport_corner.x;
+    const s32 y0 = rs.viewport_corner.y;
+    const s32 x1 = x0 + static_cast<s32>(f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2);
+    const s32 y1 = y0 + static_cast<s32>(f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2);
+    return static_cast<u8>((x1 < static_cast<s32>(fb.GetWidth()) ? 1u : 0u) |
+                           (y1 < static_cast<s32>(fb.GetHeight()) ? 2u : 0u) | (x0 > 0 ? 4u : 0u) |
+                           (y0 > 0 ? 8u : 0u));
 }
 
 namespace {
@@ -5366,6 +5425,13 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const u32 fsa_words = head + static_cast<u32>(fg.literals.size()) +
                           static_cast<u32>(fg.samplers.size()) * 4;
     SgxdBackend::Data fsa{};
+    u32 unit_words[3][4]; // each texture unit's words, for its sampler and a PDS issue
+    // A unit's texture and words, for its alpha sampler. The units the pixel PDS reads have no
+    // sampler: their words here.
+    const Texture* unit_texture[3] = {};
+    for (const Usse::TextureIssue& issue : fg.issues) {
+        unit_texture[issue.unit] = &TextureWords(issue.unit, unit_words[issue.unit]);
+    }
     if (fsa_words != 0) {
         // Made in cached memory and copied out once (the pass data is uncached); the buffer's pointer goes
         // in once the buffer is placed.
@@ -5384,7 +5450,14 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                                   : reinterpret_cast<float*>(fbuf_cpu) + u.sa;
             for (u32 e = 0; e < u.count; e++, src += u.stride, dst += 4) {
                 for (u32 c = 0; c < u.components; c++) {
-                    if (u.is_int) {
+                    if (u.lut_row) {
+                        // The row's centre, v = (offset / 256 + 0.5) / LUT_LF_ROWS, for
+                        // FragmentEmitter::LightingLutRowFetch.
+                        s32 value;
+                        std::memcpy(&value, src + c * 4, 4);
+                        dst[c] = (static_cast<float>(value / 256) + 0.5f) /
+                                 static_cast<float>(Pica::Shader::LUT_LF_ROWS);
+                    } else if (u.is_int) {
                         s32 value;
                         std::memcpy(&value, src + c * 4, 4);
                         dst[c] = static_cast<float>(value);
@@ -5392,17 +5465,24 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                         std::memcpy(dst + c, src + c * 4, 4);
                     }
                 }
+                if (u.normalize) {
+                    // As the program would: x * rsq(dot(x, x)).
+                    const float scale =
+                        1.0f / std::sqrt(dst[0] * dst[0] + dst[1] * dst[1] + dst[2] * dst[2]);
+                    dst[0] *= scale;
+                    dst[1] *= scale;
+                    dst[2] *= scale;
+                }
             }
         }
         for (size_t i = 0; i < fg.literals.size(); i++) {
-            std::memcpy(fsa.cpu + Usse::LiteralSaOffset(head, static_cast<u32>(i)) * 4,
+            std::memcpy(fsa_cpu + Usse::LiteralSaOffset(head, static_cast<u32>(fg.samplers.size()),
+                                                        static_cast<u32>(i)) *
+                                      4,
                         &fg.literals[i], 4);
         }
         // The LUT textures, linear and point sampled (the program computes texel centres): F32F32 (value,
         // delta) for lighting, fog and the proctex maps, F16x4 for its colours, read by the float4 query.
-        // A unit's texture and words, for its alpha sampler (a split ETC1A4).
-        const Texture* unit_texture[3] = {};
-        u32 unit_words[3][4];
         for (size_t i = 0; i < fg.samplers.size(); i++) {
             const Usse::Sampler& sampler = fg.samplers[i];
             u32 words[4];
@@ -5440,11 +5520,8 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                                  words);
                 break;
             }
-            std::memcpy(fsa.cpu + Usse::SamplerSaOffset(head,
-                                                        static_cast<u32>(fg.literals.size()),
-                                                        static_cast<u32>(i)) *
-                                      4,
-                        words, sizeof(words));
+            std::memcpy(fsa_cpu + Usse::SamplerSaOffset(head, static_cast<u32>(i)) * 4, words,
+                        sizeof(words));
         }
         // Placed in the pass data, or the program's last copies in this pass again when they are the same.
         const u32 pass = backend.DataOpens();
@@ -5484,8 +5561,27 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     DEBUG_ASSERT(fsec == 0);
     p.fsec = backend.PlacePds(pds);
     p.fsec_units = pds.units;
-    p.fprim = fp.fprim;
-    p.fprim_units = fp.fprim_units;
+    if (fg.issues.empty()) {
+        const auto fprim = backend.PixelPds(fp.primary_doutu0, fp.iterators.data(),
+                                            fp.iterator_words.data(), fp.iterator_count);
+        DEBUG_ASSERT_MSG(fprim.va != 0, "sgxd: pixel PDS with {} iterators", fp.iterator_count);
+        p.fprim = fprim.va;
+        p.fprim_units = fprim.units;
+    } else {
+        std::array<SgxdTextureIssue, 3> issues;
+        for (size_t i = 0; i < fg.issues.size(); i++) {
+            const Usse::TextureIssue& issue = fg.issues[i];
+            std::memcpy(issues[i].tex, unit_words[issue.unit], sizeof(issues[i].tex));
+            issues[i].coord = issue.coord;
+            issues[i].after = issue.after_input;
+        }
+        const auto fprim = backend.PicaPixelPds(fp.primary_doutu0, fp.iterators.data(),
+                                                fp.iterator_words.data(), fp.iterator_count,
+                                                issues.data(), static_cast<u32>(fg.issues.size()));
+        DEBUG_ASSERT_MSG(fprim.va != 0, "sgxd: pixel PDS with {} texture issues", fg.issues.size());
+        p.fprim = fprim.va;
+        p.fprim_units = fprim.units;
+    }
     sgxd_program_vertex_dms(vg.pa_count, vg.temp_count, vsec_sa, vg.vertex_outputs1 >> 24,
                             &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
     if (fp.pixel_size_sa != fsa_words) {
