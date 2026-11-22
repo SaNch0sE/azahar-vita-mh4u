@@ -413,6 +413,7 @@ enum class Icon {
     Install,
     Patch,
     Cheat,
+    Pad,
 };
 
 /// An icon of `size` pixels centred at `c`. `under`: the colour behind it, for the cut-outs.
@@ -516,6 +517,20 @@ void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float size, ImU32 colour, ImU
             dl->PathStroke(colour, false, 0.07f * s);
         }
         break;
+    case Icon::Pad: {
+        // A handheld's body, its d-pad left and two buttons right, cut out of it.
+        dl->AddRectFilled(ImVec2(c.x - 0.44f * s, c.y - 0.24f * s),
+                          ImVec2(c.x + 0.44f * s, c.y + 0.24f * s), colour, 0.18f * s);
+        const float t = 0.05f * s;
+        const ImVec2 d(c.x - 0.22f * s, c.y);
+        dl->AddRectFilled(ImVec2(d.x - 0.12f * s, d.y - t), ImVec2(d.x + 0.12f * s, d.y + t),
+                          under);
+        dl->AddRectFilled(ImVec2(d.x - t, d.y - 0.12f * s), ImVec2(d.x + t, d.y + 0.12f * s),
+                          under);
+        dl->AddCircleFilled(ImVec2(c.x + 0.16f * s, c.y + 0.06f * s), 0.06f * s, under, 10);
+        dl->AddCircleFilled(ImVec2(c.x + 0.28f * s, c.y - 0.06f * s), 0.06f * s, under, 10);
+        break;
+    }
     case Icon::Globe:
         dl->AddCircle(c, 0.4f * s, colour, 24, line);
         for (int i = 0; i < 24; i++) {
@@ -1016,14 +1031,14 @@ void Note(const ImVec4& dot, const std::string& text) {
 }
 
 const char* CategoryName(int category) {
-    static constexpr const char* names[] = {"Display", "Speed",  "Sound",    "System",
-                                            "Patches", "Cheats", "Installed"};
+    static constexpr const char* names[] = {"Display", "Speed",   "Sound",  "Controls",
+                                            "System",  "Patches", "Cheats", "Installed"};
     return names[category];
 }
 
 Icon CategoryIcon(int category) {
-    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge, Icon::Speaker, Icon::Globe,
-                                     Icon::Patch,   Icon::Cheat, Icon::Disk};
+    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge, Icon::Speaker, Icon::Pad,
+                                     Icon::Globe,   Icon::Patch, Icon::Cheat,   Icon::Disk};
     return icons[category];
 }
 
@@ -1534,6 +1549,45 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+
+    // Controls: the Vita input each 3DS button answers to.
+    const std::vector<const char*> inputs{"Circle",
+                                          "Cross",
+                                          "Triangle",
+                                          "Square",
+                                          "Up",
+                                          "Down",
+                                          "Left",
+                                          "Right",
+                                          "L",
+                                          "R",
+                                          "Start",
+                                          "Select",
+                                          "Rear touch, left half",
+                                          "Rear touch, right half",
+                                          "None"};
+    const auto control = [&](Option option, const char* title, const char* description) {
+        add({option, Category::Controls, Kind::Choice, title, description, inputs, 0, nullptr,
+             nullptr});
+    };
+    control(Option::MapA, "A", "The Vita input that presses the 3DS's A.");
+    control(Option::MapB, "B", "The Vita input that presses the 3DS's B.");
+    control(Option::MapX, "X", "The Vita input that presses the 3DS's X.");
+    control(Option::MapY, "Y", "The Vita input that presses the 3DS's Y.");
+    control(Option::MapUp, "D-pad up", "The Vita input that presses the 3DS's d-pad up.");
+    control(Option::MapDown, "D-pad down", "The Vita input that presses the 3DS's d-pad down.");
+    control(Option::MapLeft, "D-pad left", "The Vita input that presses the 3DS's d-pad left.");
+    control(Option::MapRight, "D-pad right", "The Vita input that presses the 3DS's d-pad right.");
+    control(Option::MapL, "L", "The Vita input that presses the 3DS's L.");
+    control(Option::MapR, "R", "The Vita input that presses the 3DS's R.");
+    control(Option::MapZL, "ZL",
+            "The Vita input that presses the New 3DS's ZL (and the Circle Pad Pro's). A rear touch "
+            "half is held while a finger is anywhere on it.");
+    control(Option::MapZR, "ZR",
+            "The Vita input that presses the New 3DS's ZR (and the Circle Pad Pro's). A rear touch "
+            "half is held while a finger is anywhere on it.");
+    control(Option::MapStart, "Start", "The Vita input that presses the 3DS's Start.");
+    control(Option::MapSelect, "Select", "The Vita input that presses the 3DS's Select.");
 
     // System: the console and the menus.
     add({Option::Theme,

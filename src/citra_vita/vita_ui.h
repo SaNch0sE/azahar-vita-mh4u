@@ -157,6 +157,7 @@ private:
         Display,
         Speed,
         Sound,
+        Controls,
         System,
         Patches,
         Cheats,

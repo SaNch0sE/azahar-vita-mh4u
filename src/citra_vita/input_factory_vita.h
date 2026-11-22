@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "citra_vita/config.h"
+
 namespace VitaFrontend {
 
 class EmuWindowVita;
@@ -17,6 +19,10 @@ class EmuWindowVita;
  */
 void InitInput(EmuWindowVita& window);
 void ShutdownInput();
+
+/// The Vita input 3DS button `control` answers to (Config's Map* options, MapA's index 0): at
+/// once, the guest reading its buttons from it on. Any thread.
+void SetControl(int control, Config::ControlInput input);
 
 /// What the right stick drives (Config's RightStick option). At once; any thread.
 void SetRightStick(Config::RightStickMode mode);

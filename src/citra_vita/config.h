@@ -55,6 +55,22 @@ enum class Option : u32 {
     /// A stereo title's right eye left undrawn: 1, or 0 to draw both eyes.
     SkipRightEye,
     StretchAudio,
+    // The controls: the Vita input each 3DS button answers to (ControlInput's order), the
+    // NativeButton order without the debug pad's, Home and Power.
+    MapA,
+    MapB,
+    MapX,
+    MapY,
+    MapUp,
+    MapDown,
+    MapLeft,
+    MapRight,
+    MapL,
+    MapR,
+    MapZL,
+    MapZR,
+    MapStart,
+    MapSelect,
     RightStick,
     Region,
     /// Every title as on a New 3DS (Settings' is_new_3ds): 1, or 0 for the New 3DS's own titles
@@ -86,10 +102,42 @@ enum class Layout : int {
 /// FrameSkipLimit's value for no limit.
 constexpr int NoFrameSkipLimit = 5;
 
-/// Whether a title can have its own value. The options for the screens and the speed are: what
-/// suits one title (a top screen it needs whole, a scale its GPU work allows, vsync where its
-/// frame rate is uneven) does not suit the next. The sound, the region, the menus' theme and the
-/// start-up notice are the player's or the console's, the same whatever runs.
+/// The Vita inputs a 3DS button can answer to (the Map* options' values), in the menu's order.
+/// The rear panel's halves are pad bits of their own (EmuWindowVita::ReadPad).
+enum class ControlInput : int {
+    Circle,
+    Cross,
+    Triangle,
+    Square,
+    Up,
+    Down,
+    Left,
+    Right,
+    L,
+    R,
+    Start,
+    Select,
+    RearLeft,
+    RearRight,
+    None,
+    Count,
+};
+/// What the right stick drives (the RightStick option's values): the 3DS's C-stick (the New 3DS's,
+/// and the Circle Pad Pro's in a game made for it), L and R (the stick left and right past half
+/// way: games that turn their camera with them), or the d-pad (its four directions past half way).
+enum class RightStickMode : int {
+    CStick,
+    ShoulderButtons,
+    DPad,
+    Count,
+};
+
+
+/// Whether a title can have its own value. The options for the screens, the speed and the
+/// controls are: what suits one title (a top screen it needs whole, a scale its GPU work allows,
+/// vsync where its frame rate is uneven, ZL on a button it leaves free) does not suit the next. The
+/// sound, the region, the menus' theme and the start-up notice are the player's or the console's,
+/// the same whatever runs.
 [[nodiscard]] bool PerTitle(Option option);
 /// Whether a change takes effect under a running title. The region is read as a title loads.
 [[nodiscard]] bool Runtime(Option option);

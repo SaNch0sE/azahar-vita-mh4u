@@ -25,13 +25,14 @@
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/sgxd_present.h"
 #include "citra_vita/vita_ui.h"
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/3ds.h"
 #include "core/core.h"
 #include "core/frontend/framebuffer_layout.h"
-#include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
+#include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 
 namespace VitaFrontend {
 
@@ -47,6 +48,11 @@ constexpr int TouchPanelHeight = 1088;
 EmuWindowVita::EmuWindowVita(Core::System& system_) : system{system_} {
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
+    SceTouchPanelInfo rear{};
+    const int rear_info = sceTouchGetPanelInfo(SCE_TOUCH_PORT_BACK, &rear);
+    ASSERT_MSG(rear_info >= 0, "the rear panel's info: {:#010x}", static_cast<u32>(rear_info));
+    rear_middle = (rear.minAaX + rear.maxAaX) / 2;
 
     // The display never resizes and never rotates, so the layout is computed once. Touch input is
     // resolved against it, so it has to exist before the first frame.
@@ -55,6 +61,7 @@ EmuWindowVita::EmuWindowVita(Core::System& system_) : system{system_} {
 
 EmuWindowVita::~EmuWindowVita() {
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_STOP);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_STOP);
 }
 
 namespace {
@@ -414,6 +421,14 @@ void EmuWindowVita::ReadPad() {
             input_script.Apply(elapsed, pad.buttons, lx, ly);
             pad.lx = lx;
             pad.ly = ly;
+        }
+        // The rear panel's halves as two more buttons, which the controls give ZL and ZR by
+        // default (input_factory_vita): a finger anywhere on a half holds it.
+        SceTouchData rear{};
+        if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &rear, 1) > 0) {
+            for (u32 i = 0; i < rear.reportNum; i++) {
+                pad.buttons |= rear.report[i].x < rear_middle ? RearLeftButton : RearRightButton;
+            }
         }
         buttons_held.store(pad.buttons, std::memory_order_relaxed);
         menu_held.fetch_and(pad.buttons, std::memory_order_relaxed);

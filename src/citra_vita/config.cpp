@@ -16,6 +16,7 @@
 
 #include "citra_vita/config.h"
 #include "citra_vita/emu_window_vita.h"
+#include "citra_vita/input_factory_vita.h"
 #include "common/assert.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
@@ -56,6 +57,10 @@ const std::vector<const char*> Skips{"0", "1", "2", "3", "4", "none"};
 const std::vector<const char*> Regions{"auto",      "japan", "usa",   "europe",
                                        "australia", "china", "korea", "taiwan"};
 const std::vector<const char*> Themes{"dark", "light"};
+const std::vector<const char*> RightStickWords{"cstick", "lr", "dpad"};
+const std::vector<const char*> Inputs{"circle", "cross",  "triangle",  "square",     "up",
+                                      "down",   "left",   "right",     "l",          "r",
+                                      "start",  "select", "rear_left", "rear_right", "none"};
 
 /// In Option's order (checked at Load).
 const std::array<Definition, Count> definitions{{
@@ -72,6 +77,22 @@ const std::array<Definition, Count> definitions{{
     {"wait_for_gpu", true, true, 0, 1, 1, Toggle},
     {"skip_right_eye", true, true, 0, 1, 1, Toggle},
     {"stretch_audio", false, true, 0, 1, 1, Toggle},
+    // The 3DS's layout by position (its A where the Vita's circle is), ZL and ZR on the rear
+    // panel's halves.
+    {"map_a", true, true, 0, 14, 0, Inputs},
+    {"map_b", true, true, 0, 14, 1, Inputs},
+    {"map_x", true, true, 0, 14, 2, Inputs},
+    {"map_y", true, true, 0, 14, 3, Inputs},
+    {"map_up", true, true, 0, 14, 4, Inputs},
+    {"map_down", true, true, 0, 14, 5, Inputs},
+    {"map_left", true, true, 0, 14, 6, Inputs},
+    {"map_right", true, true, 0, 14, 7, Inputs},
+    {"map_l", true, true, 0, 14, 8, Inputs},
+    {"map_r", true, true, 0, 14, 9, Inputs},
+    {"map_zl", true, true, 0, 14, 12, Inputs},
+    {"map_zr", true, true, 0, 14, 13, Inputs},
+    {"map_start", true, true, 0, 14, 10, Inputs},
+    {"map_select", true, true, 0, 14, 11, Inputs},
     {"right_stick", true, true, 0, static_cast<int>(RightStickMode::Count) - 1, 0, RightStickWords},
     {"region", false, false, 0, 7, 0, Regions},
     {"force_new_3ds", true, false, 0, 1, 0, Toggle},
@@ -202,6 +223,23 @@ void ApplyLocked(Option option) {
         break;
     case Option::StretchAudio:
         Settings::values.enable_audio_stretching = value != 0;
+        break;
+    case Option::MapA:
+    case Option::MapB:
+    case Option::MapX:
+    case Option::MapY:
+    case Option::MapUp:
+    case Option::MapDown:
+    case Option::MapLeft:
+    case Option::MapRight:
+    case Option::MapL:
+    case Option::MapR:
+    case Option::MapZL:
+    case Option::MapZR:
+    case Option::MapStart:
+    case Option::MapSelect:
+        SetControl(static_cast<int>(option) - static_cast<int>(Option::MapA),
+                   static_cast<ControlInput>(value));
         break;
     case Option::RightStick:
         SetRightStick(static_cast<RightStickMode>(value));

@@ -44,6 +44,11 @@ PresentTimes TakePresentTimes();
 
 class EmuWindowVita final : public Frontend::EmuWindow {
 public:
+    /// The rear panel's left and right halves in the pad word (ReadPad): bits the pad read never
+    /// sets, L1 and R1 coming only through SceCtrl's Ext2 reads.
+    static constexpr u32 RearLeftButton = 0x00000400;
+    static constexpr u32 RearRightButton = 0x00000800;
+
     explicit EmuWindowVita(Core::System& system);
     ~EmuWindowVita() override;
 
@@ -213,6 +218,8 @@ private:
     std::atomic<bool> quit_requested{};
     std::atomic<bool> overlay_changed{};
     bool touch_down{};
+    /// The rear panel's middle in its own coordinates (its active area's), splitting its halves.
+    int rear_middle{};
     /// The volume key held (the polling thread's), and when it steps again.
     u32 volume_keys{};
     u64 volume_repeat_us{};
