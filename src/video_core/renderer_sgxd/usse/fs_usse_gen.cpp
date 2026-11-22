@@ -39,6 +39,20 @@ bool IsPassThroughTevStage(const TevStageConfig& stage) {
             stage.GetColorMultiplier() == 1 && stage.GetAlphaMultiplier() == 1);
 }
 
+// A procedural texture of u alone that an address mode reproduces (MIRROR_CLAMP of the iterated
+// u is min(|u|, 1)): a table the pixel PDS reads (TextureIssue::proctex).
+bool ProcTexTabled(const Pica::Shader::ProcTexConfig& pt) {
+    using Clamp = TexturingRegs::ProcTexClamp;
+    using Combiner = TexturingRegs::ProcTexCombiner;
+    using Filter = TexturingRegs::ProcTexFilter;
+    using Shift = TexturingRegs::ProcTexShift;
+    const auto of_u = [](Combiner c) { return c == Combiner::U || c == Combiner::U2; };
+    return !pt.noise_enable && pt.u_shift != Shift::Odd && pt.u_shift != Shift::Even &&
+           (pt.lut_filter == Filter::Linear || pt.lut_filter == Filter::Nearest) &&
+           (pt.u_clamp == Clamp::ToEdge || pt.u_clamp == Clamp::MirroredRepeat) &&
+           of_u(pt.color_combiner) && (!pt.separate_alpha || of_u(pt.alpha_combiner));
+}
+
 // The generator's stage-0 quirk: Previous on the first stage reads that stage's source 3.
 Source ColorSource(const TevStageConfig& stage, Source source, u32 index) {
     return (index == 0 && source == Source::Previous) ? stage.color_source3.Value() : source;
@@ -93,6 +107,8 @@ constexpr uint8_t TmpBatch = 128;     ///< reads issued together before one WDF:
                                       ///< coordinate (2) and interpolation weight (.z) at
                                       ///< 128 + 4k, k < 8
 constexpr uint8_t TmpBatchTexel = 160; ///< read k's texel (4) at 160 + 4k
+constexpr uint8_t TmpNoise = 120;     ///< proctex noise: the grid point mod 144 (2); the
+                                      ///< fraction (2); the noise LUT at it (2)
 constexpr uint8_t TmpLightAcc = 20;   ///< lighting: the spot direction, then the reflection
                                       ///< vector, then the specular accumulator, in
                                       ///< next_combiner_buffer's home (3). Nothing lighting
@@ -157,6 +173,10 @@ enum Lit : uint8_t {
     LitRgBiasY,
     LitNeg127,    ///< the clamp bounds of a negated LUT index
     LitNeg255,
+    LitNine,      ///< proctex noise: the grid's 9, the hash's period 144 and its inverse
+    Lit144,
+    LitInv144,
+    LitNoisePad,
     LiteralCount, // even, so the sampler words stay pair-aligned
 };
 static_assert(LiteralCount % 2 == 0);
@@ -208,11 +228,13 @@ private:
     void ProcTexLookupFinish(uint8_t slot);
     /// The combiner of u and v (TmpProcUv) into i0.x.
     void ProcTexCombine(Pica::TexturingRegs::ProcTexCombiner combiner);
+    /// uv (TmpProcUv) += amplitude * the noise coefficient at uv, then |uv|.
+    void ProcTexNoise();
     /// The shift term for one axis from the other's coordinate, into i2.x.
     void ProcTexShift(Pica::TexturingRegs::ProcTexShift mode, Pica::TexturingRegs::ProcTexClamp clamp,
                       Src coord);
-    /// One axis' clamp, in place on i0.x.
-    void ProcTexClamp(Pica::TexturingRegs::ProcTexClamp mode);
+    /// The clamp of the lanes of i0 in `mask` (x u, y v), in place, through i1.
+    void ProcTexClamp(Pica::TexturingRegs::ProcTexClamp mode, uint8_t mask);
     /// floor(i0.<lane>) in place, through i1.
     void FloorLane(uint8_t lane);
     void TevStage(u32 index);
@@ -320,10 +342,19 @@ private:
     bool uses_proctex = false;
     bool proctex_rgb_read = false;   ///< a stage reads Texture3's red, green or blue
     bool proctex_alpha_read = false; ///< a stage reads Texture3's alpha
+    /// The procedural texture as a table the pixel PDS reads (TextureIssue::proctex,
+    /// ProcTexTabled), its texel in proctex_loc: no program of its own.
+    bool proctex_tabled = false;
+    Vec4Loc proctex_loc{};
     uint32_t sampler_rg = 0;              ///< the rg and rgba LUT samplers' indices
     uint32_t sampler_rgba = 0;
+    uint32_t sampler_noise = 0;           ///< the noise hash table's (RasterizerSgxd)
     uint32_t sa_proctex = 0;              ///< lut_offset, diff_lut_offset, color_map_offset,
                                           ///< alpha_map_offset, bias (scalars, in that order)
+    uint32_t sa_noise_lut = 0;            ///< proctex_noise_lut_offset
+    uint32_t sa_noise_f = 0;              ///< proctex_noise_f, _a, _p (pairs)
+    uint32_t sa_noise_a = 0;
+    uint32_t sa_noise_p = 0;
     std::array<uint32_t, 8> sa_light{}; ///< per PICA light number; per light: specular_0
                                         ///< +0, dist_atten_bias +3, specular_1 +4,
                                         ///< dist_atten_scale +7, diffuse +8, ambient +12,
@@ -334,9 +365,6 @@ const char* FragmentEmitter::Unsupported() const {
     const auto& fb = config.framebuffer;
     const auto& tex = config.texture;
     const auto& lighting = config.lighting;
-    if (config.proctex.enable && config.proctex.noise_enable) {
-        return "proctex noise";
-    }
     if (tex.fog_mode == TexturingRegs::FogMode::Gas) {
         return "gas";
     }
@@ -529,7 +557,14 @@ void FragmentEmitter::PlanInputs() {
         normquat_pa = pa;
         pa += 8;
     }
-    const u32 proc_coord = uses_proctex ? std::min<u32>(config.proctex.coord, 2) : 3;
+    u32 unit_issues = fog_issued ? 1 : 0;
+    for (u32 unit = 0; unit < 3; unit++) {
+        unit_issues += unit_issued[unit] ? (AlphaIssued(unit) ? 2 : 1) : 0;
+    }
+    proctex_tabled =
+        uses_proctex && ProcTexTabled(config.proctex) && unit_issues < MaxTextureIssues;
+    const u32 proc_coord =
+        uses_proctex && !proctex_tabled ? std::min<u32>(config.proctex.coord, 2) : 3;
     const bool coord_needed[3] = {
         unit_used[0] || proc_coord == 0,
         unit_used[1] || (unit_used[2] && tex.texture2_use_coord1) || proc_coord == 1,
@@ -542,6 +577,14 @@ void FragmentEmitter::PlanInputs() {
             texcoord_pa[c] = pa;
             pa += 2;
         }
+    }
+    if (proctex_tabled) {
+        proctex_loc = {Bank::PrimAttr, pa, u8_tev};
+        TextureIssue issue{0, static_cast<uint8_t>(std::min<u32>(config.proctex.coord, 2)), pa,
+                           IssueAfter(), u8_tev};
+        issue.proctex = true;
+        program.issues.push_back(issue);
+        pa += u8_tev ? IssueTexelWordsF16 : IssueTexelWords;
     }
     if (uses_lighting) {
         // Declared four wide, as psp2cgc declares a float3 varying (descriptor components
@@ -576,11 +619,15 @@ void FragmentEmitter::PlanInputs() {
     if (lut_used) {
         gxp.samplers.push_back({"texture_buffer_lut_lf", 3});
     }
-    if (uses_proctex) {
+    if (uses_proctex && !proctex_tabled) {
         sampler_rg = static_cast<uint32_t>(gxp.samplers.size());
         gxp.samplers.push_back({"texture_buffer_lut_rg", 4});
         sampler_rgba = static_cast<uint32_t>(gxp.samplers.size());
         gxp.samplers.push_back({"texture_buffer_lut_rgba", 5});
+        if (config.proctex.noise_enable) {
+            sampler_noise = static_cast<uint32_t>(gxp.samplers.size());
+            gxp.samplers.push_back({"proctex_noise", 6});
+        }
     }
 }
 
@@ -645,12 +692,18 @@ void FragmentEmitter::PlanUniforms() {
     if (uses_border) {
         sa_border = AllocateUniform("tex_border_color", 4, 3);
     }
-    if (uses_proctex) {
+    if (uses_proctex && !proctex_tabled) {
         sa_proctex = AllocateUniform("proctex_lut_offset", 1, 1);
         AllocateUniform("proctex_diff_lut_offset", 1, 1);
         AllocateUniform("proctex_color_map_offset", 1, 1);
         AllocateUniform("proctex_alpha_map_offset", 1, 1);
         AllocateUniform("proctex_bias", 1, 1);
+        if (config.proctex.noise_enable) {
+            sa_noise_lut = AllocateUniform("proctex_noise_lut_offset", 1, 1);
+            sa_noise_f = AllocateUniform("proctex_noise_f", 2, 1);
+            sa_noise_a = AllocateUniform("proctex_noise_a", 2, 1);
+            sa_noise_p = AllocateUniform("proctex_noise_p", 2, 1);
+        }
     }
     light_memory.fill(-1);
     if (uses_lighting) {
@@ -872,6 +925,8 @@ void FragmentEmitter::ProcTexLookupSample(uint8_t slot) {
 }
 
 void FragmentEmitter::ProcSample(Reg dst, Reg coord, uint8_t sampler_sa) {
+    // One level, no computed LOD: the LUTs point sampled, the noise table bilinear in both
+    // filters, so no derivative decides what either returns.
     e.Sample2DPoint(dst, coord, sampler_sa, 0);
 }
 
@@ -975,41 +1030,113 @@ void FragmentEmitter::ProcTexShift(TexturingRegs::ProcTexShift mode,
     }
 }
 
-void FragmentEmitter::ProcTexClamp(TexturingRegs::ProcTexClamp mode) {
+void FragmentEmitter::ProcTexClamp(TexturingRegs::ProcTexClamp mode, uint8_t mask) {
     using Clamp = TexturingRegs::ProcTexClamp;
     switch (mode) {
     case Clamp::ToZero:
-        e.Test(Cond::Gt, 2, {I0}, 0, ConstOne, true);
-        e.MoveInternal({I0, 0x1}, ConstZero, Pred::P2, true);
+        for (uint8_t lane = 0; lane < 2; lane++) {
+            if (mask & (1u << lane)) {
+                e.Test(Cond::Gt, 2, {I0}, lane, ConstOne, true);
+                e.MoveInternal({I0, static_cast<uint8_t>(1u << lane)}, ConstZero, Pred::P2, true);
+            }
+        }
         break;
     case Clamp::SymmetricalRepeat:
-        e.Vec(VecOp::Frc, {I0, 0x1}, {I0, XXXX}, {I0, XXXX}, Pred::None, true);
+        e.Vec(VecOp::Frc, {I0, mask}, {I0, XYZW}, {I0, XYZW}, Pred::None, true);
         break;
-    case Clamp::MirroredRepeat: {
-        // frac(c) for an even floor(c), 1 - frac(c) for an odd one: f + p * (1 - 2 f) with
-        // p the parity.
-        e.Vec(VecOp::Frc, {I1, 0x1}, {I0, XXXX}, {I0, XXXX}, Pred::None, true);       // f
-        e.Vec(VecOp::Add, {I1, 0x2}, {I1, XXXX, Mod::Neg}, {I0, XXXX}, Pred::None, true); // floor
-        e.Vec(VecOp::Mul, {I1, 0x2}, {I1, YYYY}, ConstHalf, Pred::None, true);
-        e.Vec(VecOp::Frc, {I1, 0x2}, {I1, YYYY}, {I1, YYYY}, Pred::None, true);
-        e.Vec(VecOp::Mul, {I1, 0x2}, {I1, YYYY}, Lit(LitTwo), Pred::None, true);       // p
-        e.Vec(VecOp::Mul, {I2, 0x1}, {Lit(LitTwo).reg, Lit(LitTwo).swz, Mod::Neg}, {I1, YYYY},
-              Pred::None, true);                                                        // -2p
-        e.Vec(VecOp::Add, {I2, 0x1}, {I2, XYZW}, ConstOne, Pred::None, true);           // 1 - 2p
-        e.Vec(VecOp::Mul, {I2, 0x1}, {I2, XXXX}, {I1, XXXX}, Pred::None, true);
-        e.Vec(VecOp::Add, {I0, 0x1}, {I2, XXXX}, {I1, YYYY}, Pred::None, true);
+    case Clamp::MirroredRepeat:
+        // frac(c) for an even floor(c), 1 - frac(c) for an odd one: the triangle wave
+        // 1 - 2 |frac(c / 2) - 1/2| (c is never negative here).
+        e.Vec(VecOp::Mul, {I1, mask}, {I0, XYZW}, ConstHalf, Pred::None, true);
+        e.Vec(VecOp::Frc, {I1, mask}, {I1, XYZW}, {I1, XYZW}, Pred::None, true);
+        e.Vec(VecOp::Add, {I1, mask}, {ConstHalf.reg, ConstHalf.swz, Mod::Neg}, {I1, XYZW},
+              Pred::None, true);
+        e.Vec(VecOp::Mul, {I1, mask}, {I1, XYZW, Mod::Abs}, Lit(LitTwo), Pred::None, true);
+        e.Vec(VecOp::Add, {I0, mask}, {I1, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
         break;
-    }
     case Clamp::Pulse:
-        e.Test(Cond::Gt, 2, {I0}, 0, ConstHalf, true);
-        e.MoveInternal({I0, 0x1}, ConstZero, Pred::None, true);
-        e.MoveInternal({I0, 0x1}, ConstOne, Pred::P2, true);
+        for (uint8_t lane = 0; lane < 2; lane++) {
+            if (mask & (1u << lane)) {
+                const uint8_t m = static_cast<uint8_t>(1u << lane);
+                e.Test(Cond::Gt, 2, {I0}, lane, ConstHalf, true);
+                e.MoveInternal({I0, m}, ConstZero, Pred::None, true);
+                e.MoveInternal({I0, m}, ConstOne, Pred::P2, true);
+            }
+        }
         break;
     case Clamp::ToEdge:
     default:
-        e.Vec(VecOp::Min, {I0, 0x1}, {I0, XYZW}, ConstOne, Pred::None, true);
+        e.Vec(VecOp::Min, {I0, mask}, {I0, XYZW}, ConstOne, Pred::None, true);
         break;
     }
+}
+
+void FragmentEmitter::ProcTexNoise() {
+    // NoiseCoef at uv: grid = 9 f |uv + p|, point = floor(grid), frac = grid - point; corner i's
+    // hash h_i (period 144) times s - k_i, s = frac.x + frac.y, k = 0, 1, 1, 2, mixed
+    // bilinearly at (xn, yn) = the noise LUT at frac.x and frac.y.
+    // The texture unit mixes. RasterizerSgxd's F16x4 table holds h * (x odd), h * (y odd) and h
+    // at (x, y) (NoiseTable), read bilinear at (point + (xn, yn) + 0.5) / 256. Mixing is
+    // linear, so with B = mix(h * (x odd)), C = mix(h * (y odd)) and A = mix(h):
+    //   coef = s A - Sx - Sy,  Sx = mix(h * dx) = B for an even point.x, A - B for an odd one
+    // (the corners with dx = 1 are the odd columns, or the even ones; 144 is even), Sy alike
+    // with C. The filter's weights are 6 bits, truncated (docs/sgxd/tsp.md): the mix is at xn and
+    // yn truncated to 1/64.
+    const Reg uv = Reg::V(TmpProcUv);
+    const Reg point = Reg::V(TmpNoise);
+    const Reg frac = Reg::V(TmpNoise + 2);
+    const Reg fade = Reg::V(TmpNoise + 4); ///< xn, yn
+    e.Vec(VecOp::Add, {I0, 0x3}, {uv, XYZW}, {Reg::Sa(static_cast<uint8_t>(sa_noise_p)), XYZW},
+          Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW, Mod::Abs},
+          {Reg::Sa(static_cast<uint8_t>(sa_noise_f)), XYZW}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW}, Lit(LitNine), Pred::None, true);
+    e.Vec(VecOp::Frc, {I1, 0x3}, {I0, XYZW}, {I0, XYZW}, Pred::None, true);
+    e.MoveInternal({frac, 0x3}, {I1, XYZW}, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x3}, {I1, XYZW, Mod::Neg}, {I0, XYZW}, Pred::None, true); // floor
+    e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW}, Lit(LitInv144), Pred::None, true);
+    e.Vec(VecOp::Frc, {I0, 0x3}, {I0, XYZW}, {I0, XYZW}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW}, Lit(Lit144), Pred::None, true);
+    e.MoveInternal({point, 0x3}, {I0, XYZW}, Pred::None, true);
+    // The noise LUT at frac.x and frac.y: both reads, one WDF.
+    e.MoveInternal({I0, 0x1}, {frac, XXXX}, Pred::None, true);
+    ProcTexLookupCoord(SaScalar(sa_noise_lut), 0);
+    e.MoveInternal({I0, 0x1}, {frac, YYYY}, Pred::None, true);
+    ProcTexLookupCoord(SaScalar(sa_noise_lut), 1);
+    ProcTexLookupSample(0);
+    ProcTexLookupSample(1);
+    ProcWdf();
+    ProcTexLookupFinish(0);
+    e.MoveInternal({fade, 0x1}, {I0, XXXX}, Pred::None, true);
+    ProcTexLookupFinish(1);
+    e.MoveInternal({fade, 0x2}, {I0, XXXX}, Pred::None, true);
+    // The table at (point + fade + 0.5) / 256.
+    const Reg coord = Reg::V(TmpBatch);
+    const Reg texel = Reg::V(TmpBatchTexel); ///< B, C; then A at the next pair
+    e.Vec(VecOp::Add, {I0, 0x3}, {point, XYZW}, {fade, XYZW}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW}, Lit(LitInv256), Pred::None, true);
+    e.Vec(VecOp::Add, {coord, 0x3}, {I0, XYZW}, Lit(LitHalfInv256), Pred::None, true);
+    ProcSample(texel, coord, SamplerSa(sampler_noise));
+    ProcWdf();
+    const Src a{Reg::V(TmpBatchTexel + 2), XXXX};
+    // The parities p = 2 frac(point / 2), then S = B + p (A - 2 B), for x and y at once.
+    e.Vec(VecOp::Mul, {I0, 0x3}, {point, XYZW}, ConstHalf, Pred::None, true);
+    e.Vec(VecOp::Frc, {I0, 0x3}, {I0, XYZW}, {I0, XYZW}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW}, Lit(LitTwo), Pred::None, true);
+    e.Vec(VecOp::Mul, {I1, 0x3}, {texel, XYZW}, Lit(LitTwo), Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x3}, {I1, XYZW, Mod::Neg}, a, Pred::None, true);
+    e.Vec(VecOp::Mul, {I1, 0x3}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x3}, {I1, XYZW}, {texel, XYZW}, Pred::None, true);
+    // coef = (frac.x + frac.y) A - (Sx + Sy)
+    e.Vec(VecOp::Add, {I1, 0x1}, {I1, XXXX}, {I1, YYYY}, Pred::None, true);
+    e.Vec(VecOp::Add, {I2, 0x1}, {frac, XXXX}, {frac, YYYY}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I2, 0x1}, {I2, XXXX}, a, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x1}, {I1, XXXX, Mod::Neg}, {I2, XXXX}, Pred::None, true);
+    // uv = |uv + a * coef|
+    e.Vec(VecOp::Mul, {I1, 0x3}, {Reg::Sa(static_cast<uint8_t>(sa_noise_a)), XYZW}, {I0, XXXX},
+          Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x3}, {uv, XYZW}, {I1, XYZW}, Pred::None, true);
+    e.Vec(VecOp::Add, {uv, 0x3}, {I1, XYZW, Mod::Abs}, ConstZero, Pred::None, true);
 }
 
 void FragmentEmitter::ProcTex() {
@@ -1048,18 +1175,46 @@ void FragmentEmitter::ProcTex() {
         e.MoveInternal({uv_home.Pair(1), 0x1}, {I0, XXXX}, Pred::None, true); // .z = level
     }
 
-    // u = uv.x + u_shift(uv.y), v = uv.y + v_shift(uv.x), each clamped its way.
-    ProcTexShift(pt.u_shift, pt.u_clamp, {uv, YYYY});
-    e.Vec(VecOp::Add, {I0, 0x1}, {uv, XXXX}, {I2, XXXX}, Pred::None, true);
-    ProcTexClamp(pt.u_clamp);
-    e.MoveInternal({I2, 0x2}, {I0, XXXX}, Pred::None, true); // u parked in i2.y
-    ProcTexShift(pt.v_shift, pt.v_clamp, {uv, YYYY});
-    e.MoveInternal({I1, 0x4}, {I2, YYYY}, Pred::None, true); // u parked in i1.z (ProcTexShift uses i2.x, i1.xy)
-    e.Vec(VecOp::Add, {I0, 0x1}, {uv, YYYY}, {I2, XXXX}, Pred::None, true);
-    e.MoveInternal({I2, 0x2}, {I1, ZZZZ}, Pred::None, true);
-    ProcTexClamp(pt.v_clamp);
-    e.MoveInternal({uv, 0x2}, {I0, XXXX}, Pred::None, true);
-    e.MoveInternal({uv, 0x1}, {I2, YYYY}, Pred::None, true);
+    // u = uv.x + u_shift(uv.y), v = uv.y + v_shift(uv.x), each clamped its way; the shifts from the
+    // coordinates before the noise, parked in TmpTex3 (free until the colour lands there). A None
+    // shift is left out. u goes home before v is computed: v reads uv.y and its parked shift only.
+    const Reg parked = Reg::V(TmpTex3);
+    const auto shifts = [](TexturingRegs::ProcTexShift mode) {
+        return mode == TexturingRegs::ProcTexShift::Odd ||
+               mode == TexturingRegs::ProcTexShift::Even;
+    };
+    const bool u_shifts = shifts(pt.u_shift);
+    const bool v_shifts = shifts(pt.v_shift);
+    if (u_shifts) {
+        ProcTexShift(pt.u_shift, pt.u_clamp, {uv, YYYY});
+        e.MoveInternal({parked, 0x1}, {I2, XXXX}, Pred::None, true);
+    }
+    if (v_shifts) {
+        ProcTexShift(pt.v_shift, pt.v_clamp, {uv, XXXX});
+        e.MoveInternal({parked, 0x2}, {I2, XXXX}, Pred::None, true);
+    }
+    const bool noise = pt.noise_enable;
+    const bool colour = !pt.separate_alpha || proctex_rgb_read;
+    if (noise) {
+        ProcTexNoise();
+    }
+    // u and v into i0.xy with their shifts, clamped as a vec2 where both clamp alike.
+    if (u_shifts && v_shifts) {
+        e.Vec(VecOp::Add, {I0, 0x3}, {uv, XYZW}, {parked, XYZW}, Pred::None, true);
+    } else {
+        e.MoveInternal({I0, 0x3}, {uv, XYZW}, Pred::None, true);
+        if (u_shifts || v_shifts) {
+            e.Vec(VecOp::Add, {I0, static_cast<uint8_t>(u_shifts ? 0x1 : 0x2)}, {I0, XYZW},
+                  {parked, XYZW}, Pred::None, true);
+        }
+    }
+    if (pt.u_clamp == pt.v_clamp) {
+        ProcTexClamp(pt.u_clamp, 0x3);
+    } else {
+        ProcTexClamp(pt.u_clamp, 0x1);
+        ProcTexClamp(pt.v_clamp, 0x2);
+    }
+    e.MoveInternal({uv, 0x3}, {I0, XYZW}, Pred::None, true);
 
     // The colour LUT coordinate, then the colour; with a separate alpha that no stage's
     // colour reads, none: its alpha is replaced and its rgb never read.
@@ -1957,7 +2112,9 @@ Vec4Loc FragmentEmitter::SourceLocation(Source source, u32 stage_index, bool alp
         return {Bank::Virtual, static_cast<uint8_t>(TmpSnap + from * 4)};
     }
     case Source::Texture3:
-        return uses_proctex ? Vec4Loc{Bank::Virtual, TmpTex3} : Vec4Loc{Bank::Const, 0};
+        return proctex_tabled ? proctex_loc
+               : uses_proctex ? Vec4Loc{Bank::Virtual, TmpTex3}
+                              : Vec4Loc{Bank::Const, 0};
     case Source::Constant:
         return {Bank::SecAttr, static_cast<uint8_t>(sa_const_color + stage_index * 4)};
     case Source::Previous:
@@ -2269,8 +2426,12 @@ std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
                     std::bit_cast<uint32_t>(0.5f / 256.0f),
                     std::bit_cast<uint32_t>(0.5f / static_cast<float>(Pica::Shader::LUT_RG_ROWS)),
                     std::bit_cast<uint32_t>(-127.0f),
-                    std::bit_cast<uint32_t>(-255.0f)};
-    static_assert(LiteralCount == 40);
+                    std::bit_cast<uint32_t>(-255.0f),
+                    std::bit_cast<uint32_t>(9.0f),
+                    std::bit_cast<uint32_t>(144.0f),
+                    std::bit_cast<uint32_t>(1.0f / 144.0f),
+                    0u};
+    static_assert(LiteralCount == 44);
     static_assert(Pica::Shader::LUT_RG_ROWS == Pica::Shader::LUT_RGBA_ROWS);
     gxp.uses_discard = uses_kill;
     gxp.writes_depth = uses_depth;
@@ -2303,7 +2464,7 @@ std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
     e.Nop();
     Scissor();
     SampleTextures();
-    if (uses_proctex) {
+    if (uses_proctex && !proctex_tabled) {
         ProcTex();
     }
     RoundPrimary();

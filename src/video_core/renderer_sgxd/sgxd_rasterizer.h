@@ -270,6 +270,9 @@ private:
     void SyncLutLf();
     /// The same for the proctex colour map, alpha map, colour and colour-difference tables.
     void SyncLutProcTex();
+    /// The procedural texture's table (Usse::TextureIssue::proctex) for the tables and registers
+    /// now, made again when either changed.
+    void ProcTexTableWords(u32 words[4]);
 
     GuestGpuMemory& guest_memory;
     /// [addr, addr + size) in FCRAM moves to CDRAM where it is not yet, for the work about to use it:
@@ -284,6 +287,10 @@ private:
     std::vector<Surface> surfaces;
     std::vector<Texture> textures;
     SgxdBackend::Data palettes{};
+    /// The proctex noise NoiseRand2D(x, y) = h for x, y < 256 as F16x4 texels h * (x odd),
+    /// h * (y odd), h, 0.
+    SgxdBackend::Data noise_table{};
+    u32 NoiseTable();
     std::unordered_map<u64, VertexProgram> vertex_programs;
     std::unordered_map<u64, u16> used_bools;
     std::unordered_map<u64, FragmentProgram> fragment_programs;
@@ -308,6 +315,16 @@ private:
     /// The LUT rings' halves in use, and each half's pass mark when it was left.
     u32 lut_half{}, proctex_half{};
     std::array<u32, 2> lut_half_mark{}, proctex_half_mark{};
+    /// The procedural textures' tables, kept as the fog tables: the current half's by the guest
+    /// tables' contents and the registers the table is made from (proctex_table_regs).
+    SgxdBackend::Data proctex_tables{};
+    u32 proctex_table_next{}, proctex_table_half{};
+    std::array<u32, 2> proctex_table_half_mark{};
+    std::array<u32, 16> proctex_table_pass{};
+    std::array<u32, 4> proctex_table_words{};
+    std::array<u32, 3> proctex_table_regs{};
+    bool proctex_table_dirty{true};
+    KeyIndex<u32> proctex_tables_by_contents;
 
     std::size_t pass_surface{}; // into surfaces, while the backend is in a pass
     /// The rows KeepGsRows copied out of a room a pass took, a 16-byte row a register.

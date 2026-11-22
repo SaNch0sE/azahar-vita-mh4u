@@ -286,6 +286,10 @@ UniformField FragmentUniformField(const std::string& n) {
     FIELD(proctex_color_map_offset, true)
     FIELD(proctex_alpha_map_offset, true)
     FIELD(proctex_bias, false)
+    FIELD(proctex_noise_lut_offset, true)
+    FIELD(proctex_noise_f, false)
+    FIELD(proctex_noise_a, false)
+    FIELD(proctex_noise_p, false)
     FIELD(lighting_lut_offset, true)
     FIELD(lighting_global_ambient, false)
 #undef FIELD
@@ -2217,7 +2221,8 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
     // LUTs' are built.
     for (const Usse::GxpSampler& sampler : g.samplers) {
         if (sampler.name != "texture_buffer_lut_lf" && sampler.name != "texture_buffer_lut_rg" &&
-            sampler.name != "texture_buffer_lut_rgba" && sampler.name != "tex0" &&
+            sampler.name != "texture_buffer_lut_rgba" && sampler.name != "proctex_noise" &&
+            sampler.name != "tex0" &&
             sampler.name != "tex1" && sampler.name != "tex2") {
             std::string names;
             for (const Usse::GxpSampler& s : g.samplers) {
@@ -2362,14 +2367,153 @@ u16 ToF16(float value) {
 
 } // namespace
 
+namespace {
+
+// The procedural texture's table: ProcTexTableTexels x 1 U8888 texels, u the coordinate after its
+// clamp: texel j is u = (j + 0.5) / ProcTexTableTexels, bilinear between texels.
+constexpr u32 ProcTexTableTexels = 1024;
+constexpr u32 ProcTexTableBytes = ProcTexTableTexels * 4;
+constexpr u32 ProcTexTableSlots = 16;
+
+} // namespace
+
+void RasterizerSgxd::ProcTexTableWords(u32 words[4]) {
+    using Clamp = Pica::TexturingRegs::ProcTexClamp;
+    using Combiner = Pica::TexturingRegs::ProcTexCombiner;
+    using Filter = Pica::TexturingRegs::ProcTexFilter;
+    static_assert(std::tuple_size_v<decltype(proctex_table_pass)> == ProcTexTableSlots);
+    const Pica::Shader::ProcTexConfig pt{regs.texturing};
+    const std::array<u32, 3> table_regs{pt.raw, static_cast<u32>(pt.lut_width),
+                                        static_cast<u32>(pt.lut_offset0)};
+    if (proctex_table_dirty || table_regs != proctex_table_regs) {
+        proctex_table_dirty = false;
+        proctex_table_regs = table_regs;
+        const auto& t = pica.proctex;
+        u64 contents = Common::ComputeHash64(table_regs.data(), sizeof(table_regs));
+        for (const auto [data, bytes] : {std::pair<const void*, std::size_t>{
+                                             t.color_map_table.data(), sizeof(t.color_map_table)},
+                                         {t.alpha_map_table.data(), sizeof(t.alpha_map_table)},
+                                         {t.color_table.data(), sizeof(t.color_table)},
+                                         {t.color_diff_table.data(), sizeof(t.color_diff_table)}}) {
+            contents = Common::HashCombine(contents, Common::ComputeHash64(data, bytes));
+        }
+        if (!proctex_tables.cpu) {
+            proctex_tables = backend.AllocTextureFixed(ProcTexTableSlots * ProcTexTableBytes);
+            proctex_table_pass.fill(~0u);
+        }
+        u32 slot;
+        if (const u32* const held = proctex_tables_by_contents.Find(contents)) {
+            slot = *held;
+        } else {
+            // As SyncLutLf's ring.
+            constexpr u32 Half = ProcTexTableSlots / 2;
+            if (proctex_table_next == (proctex_table_half + 1) * Half) {
+                proctex_table_half_mark[proctex_table_half] = backend.PassMark();
+                proctex_table_half ^= 1;
+                backend.WaitPassMark(proctex_table_half_mark[proctex_table_half],
+                                     "a proctex table ring's half");
+                proctex_table_next = proctex_table_half * Half;
+                proctex_tables_by_contents.Clear();
+            }
+            slot = proctex_table_next++;
+            DEBUG_ASSERT_MSG(proctex_table_pass[slot] != passes,
+                             "sgxd: pass {} changed the proctex tables {} times: the table ring "
+                             "would overwrite a table its own draws read",
+                             passes, Half);
+            proctex_table_pass[slot] = passes;
+            // The shader generator's ProcTex() at a clamped u: the combiner, the map's entry
+            // interpolated by its slope, the colour table's entry at that (level 0).
+            const auto map = [](const auto& table, Combiner combiner, float u) {
+                const float coord = (combiner == Combiner::U2 ? u * u : u) * 128.0f;
+                const u32 entry = std::min<u32>(static_cast<u32>(coord), 127);
+                return std::clamp(table[entry].ToFloat() + table[entry].DiffToFloat() *
+                                                               (coord - static_cast<float>(entry)),
+                                  0.0f, 1.0f);
+            };
+            const bool linear = pt.lut_filter == Filter::Linear;
+            u32* const texels =
+                reinterpret_cast<u32*>(proctex_tables.cpu + slot * ProcTexTableBytes);
+            for (u32 j = 0; j < ProcTexTableTexels; j++) {
+                const float u = (static_cast<float>(j) + 0.5f) / ProcTexTableTexels;
+                const float coord = map(t.color_map_table, pt.color_combiner, u) *
+                                    static_cast<float>(pt.lut_width - 1);
+                const float at = linear ? std::floor(coord) : std::round(coord);
+                const u32 entry =
+                    static_cast<u32>(std::clamp(static_cast<s32>(at) + pt.lut_offset0, 0, 255));
+                const auto colour = t.color_table[entry].ToVector();
+                const auto slope = t.color_diff_table[entry].ToVector();
+                std::array<float, 4> value;
+                for (u32 c = 0; c < 4; c++) {
+                    value[c] = (static_cast<float>(colour[c]) +
+                                (linear ? (coord - at) * static_cast<float>(slope[c]) : 0.0f)) /
+                               255.0f;
+                }
+                if (pt.separate_alpha) {
+                    value[3] = map(t.alpha_map_table, pt.alpha_combiner, u);
+                }
+                u32 texel = 0;
+                for (u32 c = 0; c < 4; c++) {
+                    texel |=
+                        static_cast<u32>(std::lround(std::clamp(value[c], 0.0f, 1.0f) * 255.0f))
+                        << (c * 8);
+                }
+                texels[j] = texel;
+            }
+            proctex_tables_by_contents.Emplace(contents, u32{slot});
+        }
+        sgxd_recipe_texture_words_format(proctex_tables.gpu + slot * ProcTexTableBytes,
+                                         ProcTexTableTexels, 1, 1, FogTableFormatU8888, 0,
+                                         proctex_table_words.data());
+        // u's address mode: MIRROR_CLAMP reads min(|u|, 1), MIRROR the mirrored repeat.
+        proctex_table_words[0] =
+            (proctex_table_words[0] & ~(7u << 6)) | (pt.u_clamp == Clamp::ToEdge ? 3u : 1u) << 6;
+    }
+    std::memcpy(words, proctex_table_words.data(), sizeof(proctex_table_words));
+}
+
+u32 RasterizerSgxd::NoiseTable() {
+    if (!noise_table.cpu) {
+        // NoiseRand1D and NoiseRand2D: NoiseRand1D's period is 144, so x, y < 256 cover the
+        // point mod 144 and the next.
+        const auto rand1d = [](u32 v) {
+            static constexpr u32 table[16] = {0, 4, 10, 8, 4, 9, 7, 12, 5, 15, 13, 14, 11, 15, 2, 11};
+            return ((v % 9 + 2) * 3 & 0xF) ^ table[(v / 9) & 0xF];
+        };
+        static constexpr u32 table2[16] = {10, 2, 15, 8, 0, 7, 4, 5, 5, 13, 2, 6, 13, 9, 3, 14};
+        // F16x4 texels, R first: h * (x odd), h * (y odd), h, 0, for the program's bilinear read.
+        noise_table = backend.AllocTexture(256 * 256 * 8);
+        u16* const texels = reinterpret_cast<u16*>(noise_table.cpu);
+        for (u32 y = 0; y < 256; y++) {
+            for (u32 x = 0; x < 256; x++) {
+                const u32 u2 = rand1d(x);
+                u32 v2 = rand1d(y);
+                v2 += (u2 & 3) == 1 ? 4 : 0;
+                v2 ^= (u2 & 1) * 6;
+                v2 += 10 + u2;
+                v2 &= 0xF;
+                v2 ^= table2[u2];
+                const float h = -1.0f + static_cast<float>(v2) * 2.0f / 15.0f;
+                u16* const t = texels + (y * 256 + x) * 4;
+                t[0] = ToF16((x & 1) ? h : 0.0f);
+                t[1] = ToF16((y & 1) ? h : 0.0f);
+                t[2] = ToF16(h);
+                t[3] = 0;
+            }
+        }
+    }
+    return noise_table.gpu;
+}
+
 void RasterizerSgxd::SyncLutProcTex() {
     auto& proctex = pica.proctex;
     if (!proctex.table_dirty) {
         return;
     }
-    // As SyncLutLf, and upstream's SyncAndUploadLUTs: a wrap of either ring starts both again
-    // with every table. The noise table is not sampled (the emitter has no noise yet).
-    const u32 rg_needed = (proctex.color_map_dirty ? 1u : 0u) + (proctex.alpha_map_dirty ? 1u : 0u);
+    // As SyncLutLf: both rings in halves, and a move of either moves both.
+    constexpr u32 RgHalf = Pica::Shader::LUT_RG_ROWS / 2;
+    constexpr u32 RgbaHalf = Pica::Shader::LUT_RGBA_ROWS / 2;
+    const u32 rg_needed = (proctex.noise_lut_dirty ? 1u : 0u) +
+                          (proctex.color_map_dirty ? 1u : 0u) + (proctex.alpha_map_dirty ? 1u : 0u);
     const u32 rgba_needed = (proctex.lut_dirty ? 1u : 0u) + (proctex.diff_lut_dirty ? 1u : 0u);
     if (lut_rg_row + rg_needed > (proctex_half + 1) * RgHalf ||
         lut_rgba_row + rgba_needed > (proctex_half + 1) * RgbaHalf) {
@@ -2398,6 +2542,9 @@ void RasterizerSgxd::SyncLutProcTex() {
         }
         offset = static_cast<int>(row * Pica::Shader::LUT_TEX_WIDTH);
     };
+    if (proctex.noise_lut_dirty) {
+        sync_value(proctex.noise_table, fs_data.proctex_noise_lut_offset);
+    }
     if (proctex.color_map_dirty) {
         sync_value(proctex.color_map_table, fs_data.proctex_color_map_offset);
     }
@@ -3122,6 +3269,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                 sgxd_recipe_texture_words_format(backend.LutRgRows().gpu,
                                                  Pica::Shader::LUT_TEX_WIDTH,
                                                  Pica::Shader::LUT_RG_ROWS, 0, LutFormatF32F32, 0,
+                                                 words);
+            } else if (name == "proctex_noise") {
+                // F16x4, bilinear: NoiseTable's texels.
+                sgxd_recipe_texture_words_format(NoiseTable(), 256, 256, 1, LutFormatF16x4, 0,
                                                  words);
             } else if (name == "texture_buffer_lut_rgba") {
                 sgxd_recipe_texture_words_format(backend.LutRgbaRows().gpu,
