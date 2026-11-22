@@ -75,6 +75,7 @@
 #include "core/frontend/image_interface.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/hle/service/service.h"
+#include "core/loader/loader.h"
 #include "core/movie.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
@@ -1086,6 +1087,29 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         return true;
     }
     ui.ClearStatusMessage();
+    // A game Azahar has speed patches for, in a copy they do not fit: the copy they are made for,
+    // until the player closes it. A launch by path (a scripted launch) has it on the TTY alone.
+    if (const std::string warning = system.GetAppLoader().TitlePatchesWarning();
+        !warning.empty()) {
+        sceClibPrintf("[azahar] %s\n", warning.c_str());
+        if (!g_launched_by_path) {
+            ui.SetStatusMessage(warning + "\n\nPress X or O to go on.");
+            // The buttons let go, one pressed, let go again.
+            for (int phase = 0; phase < 3;) {
+                window.PollEvents();
+                ui.Update();
+                window.Present(&ui);
+                sceDisplayWaitVblankStart();
+                SceCtrlData pad{};
+                const bool held = sceCtrlPeekBufferPositive(0, &pad, 1) > 0 &&
+                                  (pad.buttons & (SCE_CTRL_CROSS | SCE_CTRL_CIRCLE)) != 0;
+                if (held == (phase == 1)) {
+                    phase++;
+                }
+            }
+            ui.ClearStatusMessage();
+        }
+    }
     // nwm::UDS signals its events directly only on this thread; the room's thread queues them.
     system.RegisterCoreLoopThreadId();
     StateArguments state_arguments = TakeStateArguments();

@@ -290,6 +290,22 @@ public:
         return false;
     }
 
+    /// Puts the code patches (a patch file's bytes, the built-in title patches) back into the
+    /// title's code after a save state's load, which restores the code the state was saved with.
+    virtual void ReapplyCodePatch() {}
+
+    /// Whether each patch built in for the loaded title (TitlePatchesOf) is in its code, as the
+    /// load or the last state's load left it; empty for a title with none.
+    [[nodiscard]] virtual std::vector<bool> TitlePatchesIn() const {
+        return {};
+    }
+
+    /// At the load: what the player can do when the patches built in for the game do not run on
+    /// this copy (TitlePatchesWarning); empty when they run or it has none.
+    [[nodiscard]] virtual std::string TitlePatchesWarning() const {
+        return {};
+    }
+
     /// The loaded code's product code and remaster version, and whether an installed update's code
     /// replaced the cartridge's ("CTR-P-AVZE, version 3, an update's"): which copy a crash report's
     /// game is. Empty for a loader without them.

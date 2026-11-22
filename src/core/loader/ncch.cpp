@@ -27,6 +27,7 @@
 #include "core/hw/unique_data.h"
 #include "core/loader/ncch.h"
 #include "core/loader/smdh.h"
+#include "core/loader/title_patches.h"
 #include "core/memory.h"
 #include "core/system_titles.h"
 #include "network/network.h"
@@ -142,6 +143,7 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
             (const char*)overlay_ncch->exheader_header.codeset_info.name, 8);
 
         std::shared_ptr<CodeSet> codeset = system.Kernel().CreateCodeSet(process_name, program_id);
+        loaded_program_id = program_id;
 
         codeset->CodeSegment().offset = 0;
         codeset->CodeSegment().addr = overlay_ncch->exheader_header.codeset_info.text.address;
@@ -173,10 +175,18 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
 
         // Apply patches now that the entire codeset (including .bss) has been allocated
         if (!in_place) {
+            // The read-only segments as the title has them: what a patch changes there is put
+            // back after a save state's load (ReapplyCodePatch).
+            const std::vector<u8> original(
+                code.begin(),
+                code.begin() + std::min<std::size_t>(codeset->DataSegment().offset, code.size()));
             const ResultStatus patch_result = overlay_ncch->ApplyCodePatch(code);
             if (patch_result != ResultStatus::Success &&
                 patch_result != ResultStatus::ErrorNotUsed)
                 return patch_result;
+            if (patch_result == ResultStatus::Success) {
+                NoteCodePatch(original, code, codeset->CodeSegment().addr);
+            }
         }
 
         codeset->entrypoint = codeset->CodeSegment().addr;
@@ -269,6 +279,20 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
         if (code_result != ResultStatus::Success) {
             return code_result;
         }
+        title_patches_in = ApplyTitlePatches(system, *process);
+        const auto& code = product_info.product_code;
+        const auto code_end = std::find(code.begin(), code.end(), u8{0});
+        product_summary = fmt::format(
+            "{}, version {}{}",
+            std::string_view{reinterpret_cast<const char*>(code.data()),
+                             static_cast<std::size_t>(code_end - code.begin())},
+            static_cast<u16>(product_info.remaster_version),
+            overlay_ncch == &update_ncch ? ", an update's" : "");
+        title_patches_warning = Loader::TitlePatchesWarning(
+            process->codeset->program_id,
+            std::string_view{reinterpret_cast<const char*>(code.data()),
+                             static_cast<std::size_t>(code_end - code.begin())},
+            static_cast<u16>(product_info.remaster_version), title_patches_in);
         if (gba_virtual_console) {
             LOG_ERROR(Loader, "Encountered unsupported GBA Virtual Console code section.");
             return ResultStatus::ErrorGbaTitle;
@@ -313,6 +337,49 @@ bool AppLoader_NCCH::IsGbaVirtualConsole(std::span<const u8> code) {
     u32 gbaVcHeader[2];
     std::memcpy(gbaVcHeader, code.data() + code.size() - 0x10, sizeof(gbaVcHeader));
     return gbaVcHeader[0] == FileUtil::MakeMagic('.', 'C', 'A', 'A') && gbaVcHeader[1] == 1;
+}
+
+void AppLoader_NCCH::NoteCodePatch(std::span<const u8> original, std::span<const u8> patched,
+                                   VAddr base) {
+    code_patch_runs.clear();
+    std::size_t bytes = 0;
+    for (std::size_t i = 0; i < original.size();) {
+        if (original[i] == patched[i]) {
+            ++i;
+            continue;
+        }
+        std::size_t end = i;
+        while (end < original.size() && original[end] != patched[end]) {
+            ++end;
+        }
+        code_patch_runs.push_back(
+            {static_cast<u32>(i), std::vector<u8>(patched.begin() + i, patched.begin() + end)});
+        bytes += end - i;
+        i = end;
+    }
+    code_patch_base = base;
+    LOG_INFO(Loader, "code patch: {} bytes in {} runs of the read-only segments", bytes,
+             code_patch_runs.size());
+}
+
+void AppLoader_NCCH::ReapplyCodePatch() {
+    for (const auto& process : system.Kernel().GetProcessList()) {
+        if (process->codeset == nullptr || process->codeset->program_id != loaded_program_id) {
+            continue;
+        }
+        for (const CodePatchRun& run : code_patch_runs) {
+            system.Memory().WriteBlock(*process, code_patch_base + run.offset, run.bytes.data(),
+                                       run.bytes.size());
+        }
+        if (!code_patch_runs.empty()) {
+            LOG_INFO(Loader, "code patch: {} runs put back after the state load",
+                     code_patch_runs.size());
+        }
+        title_patches_in = ApplyTitlePatches(system, *process);
+        return;
+    }
+    ASSERT_MSG(false, "code patch: no process of title {:016X} after the state load",
+               loaded_program_id);
 }
 
 ResultStatus AppLoader_NCCH::Load(std::shared_ptr<Kernel::Process>& process) {

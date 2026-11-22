@@ -75,6 +75,15 @@ bool BeginCentered(const char* id, float width, float height) {
                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 }
+
+/// The title's program ID, as its file names it; 0 for a file without one (a 3DSX).
+u64 ProgramIdOf(const std::string& path) {
+    u64 program_id = 0;
+    if (const std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(path)) {
+        loader->ReadProgramId(program_id);
+    }
+    return program_id;
+}
 } // Anonymous namespace
 
 Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{window_} {
@@ -334,6 +343,85 @@ void Ui::DrawSetting(Setting& setting, std::size_t index) {
 
     ImGui::Separator();
     ImGui::PopID();
+}
+
+void Ui::DrawPatchRow(std::size_t index) {
+    constexpr float Pad = 18.0f;
+
+    ImGui::PushID(static_cast<int>(index));
+    const Loader::TitlePatchInfo& patch = settings_patches[index];
+    // The running title's say whether each went in; a listed title's are built in.
+    const char* state = "Built in";
+    ImVec4 state_colour = palette->Text;
+    if (!settings_patches_in.empty()) {
+        const bool in = settings_patches_in[index];
+        state = in ? "Applied" : "Left out";
+        state_colour = in ? palette->Accent : palette->TextDim;
+    }
+    const float width = ImGui::GetContentRegionAvail().x;
+    const ImVec2 state_size = ImGui::CalcTextSize(state);
+    const float label_width = width - state_size.x - 3.0f * Pad;
+    const ImVec2 label = ImGui::CalcTextSize(patch.name, nullptr, false, label_width);
+    const Card card = CardItem("##patch", ImVec2(width, std::max(RowHeight, label.y + 28.0f)));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    if (ImGui::GetFocusID() == card.id) {
+        focused_patch = static_cast<int>(index);
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float mid = card.bb.GetCenter().y;
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text),
+                    patch.name, nullptr, label_width);
+        dl->AddText(ImVec2(card.bb.Max.x - Pad - state_size.x, mid - state_size.y * 0.5f),
+                    Colour(state_colour), state);
+    }
+    ImGui::PopID();
+}
+
+void Ui::DrawPatchInfo() {
+    if (engine_search.joinable()) {
+        return;
+    }
+    if (settings_patches.empty() && !settings_engine.found) {
+        ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+        ImGui::TextWrapped("%s", Tr("No patches"));
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::Spacing();
+        // Code that is not the ExeFS's own (an override, a patch) is searched at the start.
+        Note(palette->TextDim,
+             settings_engine.scanned
+                 ? Tr("Azahar has no patches or engine settings for this game.")
+                 : Tr("Azahar has no patches for this game. Its engine settings, if it has any, "
+                      "show here once it has started."));
+        return;
+    }
+    if (focused_patch < 0) {
+        return;
+    }
+    const auto index = static_cast<std::size_t>(focused_patch);
+    const Loader::TitlePatchInfo& patch = settings_patches[index];
+
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", patch.name);
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", patch.description);
+    ImGui::Spacing();
+
+    if (settings_patches_in.empty()) {
+        Note(palette->TextDim, "Applied when the game starts, if this copy is the version the "
+                               "patch was made for.");
+    } else if (settings_patches_in[index]) {
+        Note(palette->Accent, "Applied to the running game.");
+    } else {
+        Note(palette->TextDim, "Left out: this copy of the game is a different version from the "
+                               "one the patch was made for.");
+    }
+    Note(palette->TextDim, "Built into Azahar for this game. It can't be turned off.");
 }
 
 void Ui::DrawSettingsBody(bool runtime_only) {

@@ -139,6 +139,8 @@ private:
     /// Draws the settings body, showing only runtime-changeable rows when asked.
     void DrawSettingsBody(bool runtime_only);
     void DrawSetting(Setting& setting, std::size_t index);
+    void DrawPatchRow(std::size_t index);
+    void DrawPatchInfo();
 
     /// True when the user pressed cancel and this overlay was the thing focused, which is what
     /// separates "close the menu" from "leave the combo box the cancel already closed" - ImGui

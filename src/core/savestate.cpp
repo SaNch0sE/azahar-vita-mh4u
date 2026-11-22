@@ -372,6 +372,11 @@ void System::SaveState(u32 slot) const {
 void System::AfterStateLoaded() {
     memory->RefreshMappingObserver();
 
+    // The state holds the code it was saved with: a code patch's bytes go back over it.
+    if (app_loader) {
+        app_loader->ReapplyCodePatch();
+    }
+
     // The running thread's registers come back with the core's own archive (ARM_Interface::load):
     // its Thread::context is the one it was switched in with, older than the memory the state
     // holds, and putting that back rewinds it. Upstream takes the core's registers too.

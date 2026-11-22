@@ -39,6 +39,16 @@ public:
 
     ResultStatus Load(std::shared_ptr<Kernel::Process>& process) override;
 
+    void ReapplyCodePatch() override;
+
+    [[nodiscard]] std::vector<bool> TitlePatchesIn() const override {
+        return title_patches_in;
+    }
+
+    [[nodiscard]] std::string TitlePatchesWarning() const override {
+        return title_patches_warning;
+    }
+
     [[nodiscard]] std::string ProductSummary() const override {
         return product_summary;
     }
@@ -103,6 +113,23 @@ private:
 
     /// Detects whether the NCCH contains GBA Virtual Console.
     bool IsGbaVirtualConsole(std::span<const u8> code);
+
+    /// Keeps the runs of bytes a code patch changed in .code's read-only segments.
+    void NoteCodePatch(std::span<const u8> original, std::span<const u8> patched, VAddr base);
+
+    /// A run of bytes a code patch changed, from the text segment's address.
+    struct CodePatchRun {
+        u32 offset;
+        std::vector<u8> bytes;
+    };
+    std::vector<CodePatchRun> code_patch_runs;
+    VAddr code_patch_base = 0;
+    /// The loaded title's (ReapplyCodePatch finds its process by it).
+    u64 loaded_program_id = 0;
+    /// ApplyTitlePatches's, at the load or the last state's load.
+    std::vector<bool> title_patches_in;
+    std::string title_patches_warning;
+    std::string product_summary;
 
     FileSys::NCCHContainer base_ncch;
     FileSys::NCCHContainer update_ncch;

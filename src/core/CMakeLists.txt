@@ -466,6 +466,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     loader/ncch.h
     loader/smdh.cpp
     loader/smdh.h
+    loader/title_patches.cpp
+    loader/title_patches.h
     memory.cpp
     memory.h
     movie.cpp
