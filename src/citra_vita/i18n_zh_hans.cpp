@@ -77,6 +77,8 @@ constexpr std::array table{std::to_array<Translation>({
     {"Buttons below", "下方的按键"},
     {"C-stick", "C 摇杆"},
     {"Cancel", "取消"},
+    {"{} seems to be stuck. Turn off Multicore in the game's settings, then restart the game.",
+     "{} 似乎卡住了。请在游戏设置中关闭“多核”，然后重新启动游戏。"},
     {"Centre on the display", "在显示屏上居中"},
     {"Change", "更改"},
     {"Changing the LiveArea...", "正在更改 LiveArea…"},
@@ -171,6 +173,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"French", "法语"},
     {"From {}.", "来自 {}。"},
     {"Full check", "完整检查"},
+    {"Dismiss", "关闭"},
     {"Game settings", "游戏设置"},
     {"Games made for 3D draw each picture twice, once for each eye, and the Vita shows one. On "
      "leaves the right eye's picture undrawn, which is faster. Turn it off for a game whose top "
@@ -275,6 +278,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Move: d-pad, left stick or drag. Size: L, R or pinch.", "移动：方向键、左摇杆或拖动。大小：L、R 或双指缩放。"},
     {"Move: d-pad, left stick or drag. Size: L, R or pinch. Stretch: right stick.",
      "移动：方向键、左摇杆或拖动。缩放：L、R 或双指捏合。拉伸：右摇杆。"},
+    {"Multicore", "多核"},
     {"Multiplayer", "多人游戏"},
     {"Multiplayer is not available", "多人游戏不可用"},
     {"Name", "名称"},
@@ -397,6 +401,10 @@ constexpr std::array table{std::to_array<Translation>({
      "让所有游戏都像在 New 3DS 上一样运行。带有 New 3DS 增强功能的游戏会启用这些功能，这需要更多的 "
      "Vita CPU 和内存，因此可能变慢。关闭时，只有 New 3DS 专用游戏会以该模式运行。即时存档会保留保存"
      "时的模式。"},
+    {"Runs the 3DS's CPU cores on two of the Vita's cores at once, which is faster in most games. "
+     "Turn it off for a game that freezes or misbehaves with it on.",
+     "在 Vita 的两个核心上同时运行 3DS 的 CPU 核心，大多数游戏会更快。如果某个游戏开启后卡死或运行异"
+     "常，请为它关闭此选项。"},
     {"Russian", "俄语"},
     {"Save", "保存"},
     {"Save as new", "另存为新布局"},

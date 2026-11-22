@@ -128,6 +128,9 @@ public:
     /// The command channel: the pause menu opens as the PS button opens it, stays a
     /// second, and closes with `action` (a Ui::Action) as if chosen in it.
     void ScriptPauseMenu(int action);
+    /// The pause menu opens at the next poll over the running title, as the PS button opens it
+    /// (one open already stays).
+    void OpenPauseMenuSoon();
     /// A suspend's (the power callback's, before the GPU goes back): the pause menu opens over a
     /// running title as the PS button opens it, unless it is open, and this waits until the run
     /// loop is parked at WaitWhilePaused, `timeout` at most. The title then sleeps and wakes in

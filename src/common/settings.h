@@ -486,6 +486,9 @@ struct Values {
     // Core
     Setting<bool> use_cpu_jit{true, Keys::use_cpu_jit};
     SwitchableSetting<s32, true> cpu_clock_percentage{100, 5, 400, Keys::cpu_clock_percentage};
+    /// The Vita's second emulation thread; off, one thread runs every 3DS core in turns. Read as
+    /// a title loads (Core::System::Load).
+    Setting<bool> multicore{true, Keys::multicore};
     /// Every title runs as on a New 3DS; off, only the New 3DS's own titles do. Read as a title
     /// loads (Core::System::Load).
     Setting<bool> is_new_3ds{false, Keys::is_new_3ds};

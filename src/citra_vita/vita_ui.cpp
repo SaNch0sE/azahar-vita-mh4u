@@ -1856,6 +1856,17 @@ void Ui::BuildRows() {
          5,
          "%",
          nullptr});
+    add({Option::Multicore,
+         Category::Speed,
+         Kind::Toggle,
+         Translatable("Multicore"),
+         Translatable("Runs the 3DS's CPU cores on two of the Vita's cores at once, which is "
+                      "faster in most games. Turn it off for a game that freezes or misbehaves "
+                      "with it on."),
+         {},
+         0,
+         nullptr,
+         nullptr});
 
     // Sound.
     add({Option::StretchAudio,
@@ -2083,6 +2094,13 @@ void Ui::OpenPauseMenu() {
     state = State::Pause;
     focus_first_row = true;
     window.SetInputToGuest(false);
+    if (stuck_ask.exchange(false, std::memory_order_acquire)) {
+        question = Question::Stuck;
+    }
+}
+
+void Ui::AskStuck() {
+    stuck_ask.store(true, std::memory_order_release);
 }
 
 void Ui::SetStatusMessage(std::string message) {
@@ -5071,6 +5089,12 @@ Ui::Action Ui::DrawQuestion() {
         yes = Tr("Delete");
         break;
     }
+    case Question::Stuck:
+        text = TrFormat("{} seems to be stuck. Turn off Multicore in the game's settings, then "
+                        "restart the game.",
+                        game_name);
+        yes = nullptr; // Dismiss alone
+        break;
     case Question::ClearData:
         text = settings_data[static_cast<std::size_t>(clear_data)].kind == DataKind::SaveData
                    ? TrFormat("Delete {}'s save data? The game starts over as new. This can't be "
@@ -5103,16 +5127,22 @@ Ui::Action Ui::DrawQuestion() {
     ImGui::PushTextWrapPos(Width - Padding);
     ImGui::TextUnformatted(text.c_str());
     ImGui::PopTextWrapPos();
-    const float buttons = three ? 3.0f * button.x + 2.0f * 16.0f : 2.0f * button.x + 20.0f;
+    const float buttons = yes == nullptr ? button.x
+                          : three        ? 3.0f * button.x + 2.0f * 16.0f
+                                         : 2.0f * button.x + 20.0f;
     ImGui::SetCursorPos(ImVec2((Width - buttons) * 0.5f, 2.0f * Padding + size.y));
-    const bool agreed = ImGui::Button(yes, button);
+    bool agreed = false;
+    if (yes != nullptr) {
+        agreed = ImGui::Button(yes, button);
+        ImGui::SameLine(0.0f, three ? 16.0f : 20.0f);
+    }
     bool middle = false;
     if (three) {
-        ImGui::SameLine(0.0f, 16.0f);
         middle = ImGui::Button(damaged ? Tr("Full check") : Tr("Play without"), button);
+        ImGui::SameLine(0.0f, 16.0f);
     }
-    ImGui::SameLine(0.0f, three ? 16.0f : 20.0f);
-    const bool cancel = ImGui::Button(Tr("Cancel"), button) || BackPressed();
+    const bool cancel =
+        ImGui::Button(yes == nullptr ? Tr("Dismiss") : Tr("Cancel"), button) || BackPressed();
     if (ImGui::IsWindowAppearing()) {
         ImGui::SetItemDefaultFocus(); // Cancel
     }
@@ -5135,6 +5165,9 @@ Ui::Action Ui::DrawQuestion() {
     }
     if (asked == Question::Pin) {
         return agreed ? Action::TogglePin : Action::None;
+    }
+    if (asked == Question::Stuck) {
+        return Action::ResumeGame; // dismissed: back to the game
     }
     if (asked == Question::DiscardText) {
         if (agreed) {

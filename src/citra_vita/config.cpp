@@ -96,6 +96,7 @@ const std::array<Definition, Count> definitions{{
     {"skip_right_eye", true, true, 0, 1, 1, Toggle},
     {"simulate_3ds_gpu_timings", true, true, 0, 1, 0, Toggle},
     {"cpu_clock_percentage", true, false, 5, 400, 100, {}},
+    {"multicore", true, false, 0, 1, 1, Toggle},
     {"stretch_audio", false, true, 0, 1, 1, Toggle},
     // The 3DS's layout by position (its A where the Vita's circle is), ZL and ZR on the rear
     // panel's halves.
@@ -198,18 +199,22 @@ bool FillFromGlobal(Values& values) {
     return filled;
 }
 
-int EffectiveLocked(Option option) {
+/// What runs for `title` (empty: no title): the pin, else its own value, else all games'.
+int EffectiveForLocked(const std::string& title, Option option) {
     const std::size_t i = static_cast<std::size_t>(option);
     if (pins[i]) {
         return *pins[i];
     }
-    if (!running_title.empty()) {
-        if (const auto it = title_values.find(running_title);
-            it != title_values.end() && it->second[i]) {
+    if (!title.empty()) {
+        if (const auto it = title_values.find(title); it != title_values.end() && it->second[i]) {
             return *it->second[i];
         }
     }
     return global_values[i];
+}
+
+int EffectiveLocked(Option option) {
+    return EffectiveForLocked(running_title, option);
 }
 
 Source SourceLocked(Option option) {
@@ -286,6 +291,10 @@ void ApplyLocked(Option option) {
     case Option::CpuClock:
         // Into the timing as a title starts (RunTitle), and a reset's new one.
         Settings::values.cpu_clock_percentage = value;
+        break;
+    case Option::Multicore:
+        // Read by a title's load (ApplyForLoad before it), and a reset's.
+        Settings::values.multicore = value != 0;
         break;
     case Option::SkipRightEye:
         Settings::values.disable_right_eye_render = value != 0;
@@ -728,6 +737,12 @@ void SetRunningTitle(const std::string& title) {
              title.empty() ? std::string{"all games'"} : fmt::format("{}'s own", title));
 }
 
+void ApplyForLoad(const std::string& title) {
+    std::scoped_lock lock{mutex};
+    Settings::values.multicore = EffectiveForLocked(title, Option::Multicore) != 0;
+    Settings::values.is_new_3ds = EffectiveForLocked(title, Option::ForceNew3ds) != 0;
+}
+
 std::string RunningTitle() {
     std::scoped_lock lock{mutex};
     return running_title;
@@ -914,7 +929,8 @@ constexpr std::array crash_options{Option::Widescreen,   Option::TopScale,
                                    Option::Msaa,         Option::Vsync,
                                    Option::SpeedLimit,   Option::FrameSkipLimit,
                                    Option::WaitForGpu,   Option::SkipRightEye,
-                                   Option::SimulateGpuTimings, Option::CpuClock};
+                                   Option::SimulateGpuTimings, Option::CpuClock,
+                                   Option::Multicore,    Option::ForceNew3ds};
 
 std::size_t WriteChangedFromDefaults(char* out, std::size_t size) {
     if (size == 0) {

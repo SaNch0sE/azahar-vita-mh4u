@@ -403,6 +403,9 @@ std::optional<Config::Layout> LayoutArgument(const std::string& argument) {
 /// Launch argument statslog=1: the stats overlay's numbers on the console once a second,
 /// release builds too.
 bool stats_log = false;
+/// Launch argument stuck=0: no Multicore stuck question (RunTitle), for test homebrews that put
+/// no frame on the screen; release builds too.
+bool stuck_check = true;
 
 StateArguments TakeStateArguments() {
     static bool taken = false;
@@ -442,6 +445,8 @@ StateArguments TakeStateArguments() {
             Config::Pin(Option::StatsOverlay, std::atoi(argument.c_str() + 6) != 0 ? 1 : 0);
         } else if (argument.starts_with("statslog=")) {
             stats_log = std::atoi(argument.c_str() + 9) != 0;
+        } else if (argument == "stuck=0") {
+            stuck_check = false;
         } else if (argument.starts_with("log=")) {
             // A log filter rule on top of SetupLogging's: log=Service.FS:Debug, the ROM's reads.
             log_filter.ParseFilterString(argument.substr(4));
@@ -477,6 +482,8 @@ StateArguments TakeStateArguments() {
         } else if (argument.starts_with("gputimings=")) {
             Config::Pin(Option::SimulateGpuTimings,
                         std::atoi(argument.c_str() + 11) != 0 ? 1 : 0);
+        } else if (argument.starts_with("multicore=")) {
+            Config::Pin(Option::Multicore, std::atoi(argument.c_str() + 10) != 0 ? 1 : 0);
         } else if (argument.starts_with("new3ds=")) {
             Config::Pin(Option::ForceNew3ds, std::atoi(argument.c_str() + 7) != 0 ? 1 : 0);
         } else if (argument == "diskcache=0") {
@@ -1714,6 +1721,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 
     const std::size_t threads_before = Common::RunningNamedThreads();
     window.SetLoading(true);
+    Config::ApplyForLoad(Config::TitleKeyOf(path));
     const auto load_result = system.Load(window, path);
     window.SetLoading(false);
     if (load_result != Core::System::ResultStatus::Success) {
@@ -1878,6 +1886,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     bool state_watch_is_load = false;
     // An exception in the title's code, or its read of memory it has not mapped.
     bool title_crashed = false;
+    // With Multicore on at the launch: the seconds in a row the game has run without a new
+    // frame, and whether the pause menu asked about Multicore (once a run).
+#ifdef VITA_DEBUG_TOOLS
+    const bool stuck_watch = system.MulticoreAtLoad() && stuck_check;
+#else
+    const bool stuck_watch = system.MulticoreAtLoad();
+#endif
+    u32 stuck_seconds = 0;
+    bool stuck_asked = false;
+    // The render thread's presents at the last stats second: its count starts over with each
+    // title's GPU.
+    u32 last_shown = system.GPU().GetRenderThread().ShownFrames();
 
     ui.EnterGame();
     window.SetUi(&ui);
@@ -2026,7 +2046,6 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                  std::memory_order_relaxed);
                 // The frames the render thread presented, not the vblanks (perf.system_fps):
                 // dropped presents and skipped frames show nothing new.
-                static u32 last_shown = 0;
                 const u32 shown = system.GPU().GetRenderThread().ShownFrames();
                 shown_fps.store(shown - last_shown, std::memory_order_relaxed);
 #ifdef VITA_DEBUG_TOOLS
@@ -2039,6 +2058,22 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 #endif
                 last_shown = shown;
                 valid.store(true, std::memory_order_release);
+                // Launched with Multicore on only: a game that runs on (its clock at half speed
+                // or more) and shows no new frame for StuckSeconds. Code shared across the cores
+                // with no barriers, which the 3DS's in-order cores never needed, can spin
+                // forever on the Vita's. The pause menu says so, once.
+                constexpr u32 StuckSeconds = 20;
+                if (stuck_watch && !stuck_asked) {
+                    const bool still = perf.game_fps < 0.5 && perf.emulation_speed > 0.5;
+                    stuck_seconds = still ? stuck_seconds + 1 : 0;
+                    if (stuck_seconds == StuckSeconds) {
+                        stuck_asked = true;
+                        LOG_WARNING(Frontend, "no new frame for {} s with Multicore on: asking",
+                                    StuckSeconds);
+                        ui.AskStuck();
+                        window.OpenPauseMenuSoon();
+                    }
+                }
                 // Presented with the guest's screens unchanged too (GPU's vblank).
                 window.MarkOverlayChanged();
 #ifdef VITA_DIAGNOSTICS

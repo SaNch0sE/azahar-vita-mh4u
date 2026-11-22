@@ -65,6 +65,9 @@ enum class Option : u32 {
     /// Upstream's cpu_clock_percentage: the emulated CPU's clock in percent, 5 to 400. Applied
     /// as a title starts: the second emulation thread reads the timers' scale unlocked.
     CpuClock,
+    /// The second emulation thread (Settings' multicore): 1, or 0 for one thread running every
+    /// 3DS core in turns. Read as a title loads.
+    Multicore,
     StretchAudio,
     // The controls: the Vita input each 3DS button answers to (ControlInput's order), the
     // NativeButton order without the debug pad's, Home and Power.
@@ -224,8 +227,8 @@ enum class Shortcut : int {
 /// sound, the region, the system language, the menus' theme and language and the start-up notice are the player's or
 /// the console's, the same whatever runs.
 [[nodiscard]] bool PerTitle(Option option);
-/// Whether a change takes effect under a running title. The region, the system language and the
-/// CPU clock are read as a title starts.
+/// Whether a change takes effect under a running title. The region, the system language, the
+/// CPU clock, multicore and New 3DS mode are read as a title starts.
 [[nodiscard]] bool Runtime(Option option);
 /// The option's range: 0 and 1 for a toggle, 0 and the last index for a choice (the screen layout's
 /// last custom layout's).
@@ -246,6 +249,10 @@ void Save();
 /// Makes `title`'s own values the effective ones (an empty key: none, the values for all games),
 /// and applies them. At a title's launch and after its end.
 void SetRunningTitle(const std::string& title);
+/// The options a title's load reads itself (multicore, New 3DS mode), set as `title` will run
+/// with them:
+/// before its load, which comes before SetRunningTitle.
+void ApplyForLoad(const std::string& title);
 [[nodiscard]] std::string RunningTitle();
 
 [[nodiscard]] int Global(Option option);
@@ -306,10 +313,10 @@ std::size_t WriteApplied(char* out, std::size_t size);
 /// The running title's applied values that are not their options' defaults, among the options a
 /// game runs differently with (widescreen, the internal resolution, anti-aliasing, vsync, the
 /// speed limit, the frame skip limit, Wait for GPU results, skipping the right eye, the 3DS's
-/// GPU timings and its CPU clock), as their file keys separated by commas in `out`, a key marked *
-/// where the value is the game's own: a crash's notice asks the player to try the defaults first.
-/// Nothing with no title running. Takes no lock and allocates nothing (CrashReport::Recover hands
-/// it to the restart). Returns the length written.
+/// GPU timings, its CPU clock, multicore and New 3DS mode), as their file keys separated by
+/// commas in `out`, a key marked * where the value is the game's own: a crash's notice asks the
+/// player to try the defaults first. Nothing with no title running. Takes no lock and allocates
+/// nothing (CrashReport::Recover hands it to the restart). Returns the length written.
 std::size_t WriteChangedFromDefaults(char* out, std::size_t size);
 
 /// An option WriteChangedFromDefaults named; `own` where the value was the game's own.

@@ -172,6 +172,9 @@ public:
     void LeaveGame();
 
     void OpenPauseMenu();
+    /// From the emulation thread: the next pause menu opens with a question that the running
+    /// game may be stuck, and that turning Multicore off may help (Question::Stuck).
+    void AskStuck();
 
     /// Shows a full-screen message instead of a menu, for the stretches where the frontend is
     /// busy and the display would otherwise sit on a stale frame.
@@ -340,8 +343,10 @@ private:
         DiscardControls,
         DeleteControls,
         ClearData,
+        Stuck,
     };
     Question question{Question::None};
+    std::atomic<bool> stuck_ask{false};
     std::string question_game;  ///< Pin: the game's name
     bool question_pinned{};     ///< Pin: its bubble is there now (the question takes it off)
     int usb_prompt_value{};     ///< UsbSetting: the screen the setting was turned to

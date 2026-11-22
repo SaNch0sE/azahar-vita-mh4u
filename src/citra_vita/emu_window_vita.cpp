@@ -844,6 +844,10 @@ void EmuWindowVita::ScriptPauseMenu(int action) {
     script_menu_open.store(true, std::memory_order_release);
 }
 
+void EmuWindowVita::OpenPauseMenuSoon() {
+    script_menu_open.store(true, std::memory_order_release);
+}
+
 void EmuWindowVita::RequestQuit(bool exit_application) {
     const auto action = exit_application ? Ui::Action::ExitApplication : Ui::Action::QuitGame;
     pause_ui.store(nullptr, std::memory_order_release);

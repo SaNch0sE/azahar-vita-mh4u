@@ -224,9 +224,10 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     }
 
     // The second emulation thread takes the other cores once the guest's table is in (its view
-    // of the guest is made from it); it stops before a savestate (above) and at the end. From
-    // then on this loop runs core 0, takes the second thread's messages and its svcs.
-    if (!second_host && cpu_cores.size() > 1 && SecondHostCanStart()) {
+    // of the guest is made from it), unless the multicore setting was off at the load; it stops
+    // before a savestate (above) and at the end. From then on this loop runs core 0, takes the
+    // second thread's messages and its svcs.
+    if (!second_host && second_host_allowed && cpu_cores.size() > 1 && SecondHostCanStart()) {
         StartSecondHost();
     }
     const bool multi = multi_host.load(std::memory_order_relaxed);
@@ -492,6 +493,8 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
             system_mem_mode = Kernel::MemoryMode::NewDev1;
         }
     }
+
+    second_host_allowed = Settings::values.multicore.GetValue();
 
     // The Old 3DS has two application cores; a New 3DS title gets core 2 as well.
     const u32 num_cores = new_3ds ? 3 : 2;

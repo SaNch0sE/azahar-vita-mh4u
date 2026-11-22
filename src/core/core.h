@@ -380,6 +380,10 @@ public:
      */
     void StartSecondHost();
     void StopSecondHost();
+    /// Settings' multicore as the title's load found it (whether the second thread starts).
+    [[nodiscard]] bool MulticoreAtLoad() const {
+        return second_host_allowed;
+    }
     /// An svc of core `core_id` on the second thread: answered there (LocalToSecondHost), else
     /// by host 0 while the second thread waits (ServeForward).
     void SecondHostSvc(u32 core_id, Kernel::SVCContext& svc, u32 immediate);
@@ -640,6 +644,8 @@ private:
 
     /// IsNew3ds, set by Load before the system's parts are made.
     bool new_3ds = false;
+    /// Settings' multicore as Load found it: whether the second emulation thread starts.
+    bool second_host_allowed = true;
 
     /// DSP core
     std::unique_ptr<AudioCore::DspInterface> dsp_core;

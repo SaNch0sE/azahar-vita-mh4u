@@ -10,6 +10,7 @@ foreach(KEY IN ITEMS
     "enable_gamemode"
     "use_cpu_jit"
     "cpu_clock_percentage"
+    "multicore"
     "is_new_3ds"
     "lle_applets"
     "deterministic_async_operations"
