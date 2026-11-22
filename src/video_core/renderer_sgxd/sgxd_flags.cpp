@@ -23,12 +23,17 @@ const std::vector<std::string>& Flags() {
             // Off the console (the stub libgxm build) the flags come from the environment.
             text = env;
         }
-        if (FILE* f = std::fopen("ux0:data/azahar/gxm_flags.txt", "rb")) {
-            char buf[256];
-            while (std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
-                text.append(buf, n);
+        // The development build reads them from the host PC as well, so a run changes them without an
+        // install.
+        for (const char* path : {"ux0:data/azahar/sgxd_flags.txt", "host0:sgxd_flags.txt"}) {
+            if (FILE* f = std::fopen(path, "rb")) {
+                char buf[256];
+                while (std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
+                    text.append(buf, n);
+                }
+                text += ' ';
+                std::fclose(f);
             }
-            std::fclose(f);
         }
         {
             std::istringstream in(text);

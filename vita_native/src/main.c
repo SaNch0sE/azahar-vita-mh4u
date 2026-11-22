@@ -321,7 +321,7 @@ static uint32_t active_cpu_mask(void) {
 
 // 2: the sgxd calls (sgxd.c). 3: SCE-style error codes (azahar_native.h, AZAHAR_ERROR).
 int azaharVersion() {
-    return 3;
+    return 4;
 }
 
 // One read into `out`. Returns the call's own status; the caller decides what a failure means.

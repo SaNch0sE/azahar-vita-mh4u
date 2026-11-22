@@ -20,4 +20,11 @@ azaharnative:
         - sgxdRelease: 0x3C1A7E11
         - sgxdSubmit: 0x3C1A7E12
         - sgxdDump: 0x3C1A7E13
+        - sgxdMap: 0x3C1A7E14
+        - sgxdUnmap: 0x3C1A7E15
+        - sgxdCacheRange: 0x3C1A7E16
+        - sgxdFaultDump: 0x3C1A7E17
+        - sgxdReadRegs: 0x3C1A7E18
+        - sgxdTranslate: 0x3C1A7E19
         - azaharModuleUid: 0x3C1A7E35
+        - sgxdResetAll: 0x3C1A7E44

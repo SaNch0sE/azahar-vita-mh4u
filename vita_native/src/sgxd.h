@@ -36,18 +36,37 @@ typedef struct SgxdInfo {
 #define SGXD_STEP_VERIFY 7     // CORE_ID and CORE_REVISION
 #define SGXD_STEP_DONE 8
 
-// One step of an sgxdSubmit list. B1 has reads and delays only; writes and polls arrive with
-// the register allowlist.
+// One step of an sgxdSubmit list. Registers are offsets from 0xE8400000, 4-byte aligned, below
+// 0x18000 (the master bank and the four cores' banks). Writes skip the BIF directory, bank and
+// MMU-invalidate registers, which sgxd owns (sgxdMap).
 typedef struct SgxdOp {
-    uint32_t op;      // SGXD_OP_*
-    uint32_t reg;     // register offset from 0xE8400000, 4-byte aligned, below 0x20000
-    uint32_t value;   // READ: out; DELAY: microseconds
-    uint32_t mask;    // unused in B1
+    uint32_t op;          // SGXD_OP_*
+    uint32_t reg;         // register offset
+    uint32_t value;       // READ: out; WRITE: in; POLL: the wanted value in, the last read out;
+                          // DELAY: microseconds
+    uint32_t mask;        // POLL: the bits compared
+    uint32_t timeout_us;  // POLL: at most 1 s
 } SgxdOp;
 
 #define SGXD_OP_READ 1u
 #define SGXD_OP_DELAY 2u
+#define SGXD_OP_WRITE 3u
+#define SGXD_OP_POLL 4u   // until (reg & mask) == value; a timeout stops the list there
 #define SGXD_MAX_OPS 256u
+#define SGXD_MAX_POLL_US 1000000u
+
+// sgxdMap: the app's pages into the GPU's address space, 4 KiB pages, one directory for every
+// requestor. A GPU address's PTE is the page's physical address | flags | VALID. sgxdMap and
+// sgxdUnmap run the MMU invalidate themselves: call them with the GPU idle.
+#define SGXD_MAP_READONLY 0x4u         // PTE READONLY
+#define SGXD_MAP_CACHECONSISTENT 0x8u  // PTE CACHECONSISTENT (sgxd_test 02 looks)
+#define SGXD_MAP_FLAGS (SGXD_MAP_READONLY | SGXD_MAP_CACHECONSISTENT)
+#define SGXD_MAP_TABLES 255u  // page tables: 4 MiB of GPU addresses each, 1020 MiB in all
+
+// sgxdCacheRange: the CPU's data cache over the app's own range, by the app's addresses.
+#define SGXD_CACHE_CLEAN 1u       // before the GPU reads what the CPU wrote
+#define SGXD_CACHE_INVALIDATE 2u  // before the CPU reads what the GPU wrote; 64-byte lines only
+#define SGXD_CACHE_CLEAN_INVALIDATE 3u
 
 // sgxdDump's layout follows SceGpuEs4's own register dump (SGXDumpDebugState):
 // reading Sony's three lists out of SceGpuEs4's data segment:
@@ -61,7 +80,12 @@ typedef struct SgxdOp {
 #define SGXD_DUMP_BANK_REGS 266u
 #define SGXD_DUMP_CORE_REGS 399u
 
-#define SGXD_VERSION 1
+#define SGXD_VERSION 3
+
+// sgxdFaultDump: header word 2 of the dump sgxdSubmit takes itself when a poll times out.
+#define SGXD_DUMP_FAULT 0x544c5546u   // "FULT"
+// sgxdReadRegs: registers a call at most.
+#define SGXD_MAX_READ_REGS 4096u
 
 // Errors, beyond azahar_native.h's own and the kernel's; SCE-style like those (AZAHAR_ERROR).
 #define SGXD_ERR_FIRMWARE AZAHAR_ERROR(1100)  // SceGpuEs4 is not the build sgxd knows (3.65)
@@ -69,6 +93,8 @@ typedef struct SgxdOp {
 #define SGXD_ERR_LOST AZAHAR_ERROR(1102)      // the system suspended while owned; take again
 #define SGXD_ERR_HW AZAHAR_ERROR(1103)        // the GPU did not answer with its IDs after the power-up
 #define SGXD_ERR_OWNER AZAHAR_ERROR(1104)     // another process holds the GPU
+#define SGXD_ERR_MAPPED AZAHAR_ERROR(1105)    // sgxdMap over a mapped page, or sgxdUnmap of an unmapped one
+#define SGXD_ERR_TABLES AZAHAR_ERROR(1106)    // out of GPU page tables
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,6 +104,30 @@ int sgxdTake(SgxdInfo *info);
 int sgxdRelease(void);
 int sgxdSubmit(SgxdOp *ops, uint32_t count);
 int sgxdDump(uint32_t *words, uint32_t count);
+int sgxdMap(uint32_t gpu_va, const void *user_va, uint32_t size, uint32_t flags);
+int sgxdUnmap(uint32_t gpu_va, uint32_t size);
+int sgxdCacheRange(const void *user_va, uint32_t size, uint32_t op);
+
+// Debugging (version 3).
+// sgxdFaultDump: the dump sgxdSubmit took itself the moment a poll timed out, before the app
+// could do anything else, in sgxdDump's layout with header words [2] SGXD_DUMP_FAULT, [3] the
+// op's index, [4] its register, [5] the value it wanted, [6] its mask, [7] the last read, [8]
+// the microseconds waited, [9] the system time's low word. The status registers a hang is read
+// by go to the kernel console at the same moment. Returns SGXD_DUMP_WORDS, or 0 when no poll
+// has timed out since the module loaded; the next timeout replaces it.
+int sgxdFaultDump(uint32_t *words, uint32_t count);
+// sgxdReadRegs: count consecutive registers from reg (4-byte aligned, the master bank and the
+// four cores' banks, below 0x18000), at most SGXD_MAX_READ_REGS. Returns count.
+int sgxdReadRegs(uint32_t reg, uint32_t count, uint32_t *words);
+// sgxdTranslate: the GPU's view of gpu_va: out[0] its directory entry, out[1] its page table
+// entry (0 where no page table covers it). A PTE is the page's physical address | flags | VALID.
+int sgxdTranslate(uint32_t gpu_va, uint32_t out[2]);
+// Every unit of the GPU reset as the take leaves it, without its power cycle (version 92): the
+// start sequence again (its MASTER_SOFT_RESET pulse resets the four cores and the master's DPM,
+// VDM, SLC, BIF, MCI and PTLA), every core's caches, and the MMU's banks and directory, which the
+// BIF reset cleared. For a backend's start: the GPU idle, no events page registered (the
+// microkernel stopped); AZAHAR_ERR_STATE otherwise. The DPM's lists are empty after it.
+int sgxdResetAll(void);
 
 #ifdef __cplusplus
 }

@@ -15,10 +15,16 @@
 //                SceGpu's resume writes before its first read, a per-core cache reset, the IDs.
 //   sgxdRelease  the reverse: cache reset, unmap, power-off, then (1, 0x10005), which is how the
 //                system resumes SceGpu: power state 0, its microkernel reloaded, the gate open.
-//   sgxdSubmit   an op list against the registers (B1: reads and delays).
+//   sgxdSubmit   an op list against the registers: reads, writes, polls and delays.
+//   sgxdSubmitAsync  a list queued behind the ones before it, run on from IRQ 52 (sgxdEvents
+//                takes the interrupt from SceGpu's handler while we own the GPU).
 //   sgxdDump     Sony's own register lists, read out of SceGpuEs4's data segment.
+//   sgxdMap      the app's pages into the GPU's address space: one directory and its page
+//                tables in a kernel block, the same directory for every requestor.
+//   sgxdCacheRange  the CPU's data cache over the app's range.
 //
-// Step B1 of the plan: no GPU memory and no rendering yet.
+// The renders themselves are the app's op lists (src/sgxd, sgxd_session); the kernel only checks
+// their registers and runs them.
 
 #include <psp2kern/kernel/suspend.h>
 #include <psp2kern/kernel/threadmgr/mutex.h>
@@ -38,9 +44,19 @@ int ksceKernelUnregisterSysEventHandler(SceUID uid);
 #define SGX_CORE_REVISION 0x0024u
 #define SGX_SOFT_RESET 0x0080u
 #define SGX_SOFT_RESET_CACHES 0x000c8d00u
+#define SGX_EVENT_STATUS2 0x0118u
+#define SGX_EVENT_STATUS 0x012cu
+#define SGX_BIF_CTRL 0x0c00u
 #define SGX_BIF_INT_STAT 0x0c04u
 #define SGX_BIF_FAULT 0x0c08u
+#define SGX_BIF_CTRL_INVAL 0x0c34u
+#define SGX_BIF_INVAL_ALL 0x8u
+#define SGX_BIF_DIR_LIST_BASE7 0x0c50u
+#define SGX_BIF_BANK_SET 0x0c74u
+#define SGX_BIF_BANK0 0x0c78u
+#define SGX_BIF_DIR_LIST_BASE0 0x0c84u
 #define SGX_MASTER_CORE_CONFIG 0x4000u
+#define SGX_MASTER_BIF_INT_STAT 0x4c04u
 #define SGX_MASTER_BIF_FAULT 0x4c08u
 #define SGX_MASTER_SLC_EVENT_STATUS 0x4d10u
 #define SGX_MASTER_SLC_EVENT_CLEAR 0x4d14u
@@ -72,6 +88,13 @@ int ksceKernelUnregisterSysEventHandler(SceUID uid);
 #define SGXD_GPU_POWER_ON 0x84EAB5BCu
 #define SGXD_GPU_POWER_OFF 0xE8656ADFu
 
+// The registers ops may name: the master bank and the four cores' banks.
+#define SGXD_OP_REG_LIMIT 0x18000u
+
+// The GPU's page directory and its page tables, in one physically contiguous uncached block.
+#define SGXD_MMU_SIZE ((1u + SGXD_MAP_TABLES) * 0x1000u)
+#define SGXD_PTE_VALID 0x1u
+
 #define SGXD_BUSY 0x804C0006u    // SceGpu's own answer to (0, 0x402) while a call is inside
 #define SGXD_QUIESCE_TRIES 2000u // 1 ms apart
 #define SGXD_POLL_US 100000u     // SLC flush and invalidate
@@ -94,8 +117,18 @@ static uint32_t sgxd_module_nid;
 static SceUID sgxd_reg_uid = -1;
 static volatile uint32_t *sgxd_reg;
 
+static SceUID sgxd_mmu_uid = -1;
+static volatile uint32_t *sgxd_mmu;        // [0, 1024) the directory, then the page tables
+static uint32_t sgxd_mmu_pa;
+static uint8_t sgxd_mmu_table[1024];       // directory index -> page table 1..255, 0 = none
+static unsigned sgxd_mmu_tables;           // page tables handed out
+static uint32_t sgxd_mmu_pages;            // pages mapped
+
 static SgxdOp sgxd_ops[SGXD_MAX_OPS];
 static uint32_t sgxd_dump_words[SGXD_DUMP_WORDS];
+// The dump sgxdSubmit took when a poll last timed out (sgxdFaultDump); [0] 0 when none.
+static uint32_t sgxd_fault_words[SGXD_DUMP_WORDS];
+static uint32_t sgxd_read_words[SGXD_MAX_READ_REGS];
 
 static uint32_t sgxd_fingerprint(const uint8_t *data, unsigned size) {
     uint32_t hash = 2166136261u;
@@ -287,6 +320,195 @@ static void sgxd_hand_back(void) {
     sgxd_gpu_sysevent(1, 0x10005, NULL, NULL);
 }
 
+// One directory for the whole address space, 4 KiB pages: PDE = page table | VALID, PTE = page
+// | flags | VALID (docs/sgxd/memory.md). The
+// block is uncached, so the GPU reads what the CPU wrote once a DSB has drained it.
+
+static int sgxd_mmu_alloc(void) {
+    SceKernelAllocMemBlockKernelOpt opt = {0};
+    opt.size = sizeof(opt);
+    opt.attr = 0x4;   // alignment given
+    opt.alignment = 0x1000;
+    sgxd_mmu_uid = ksceKernelAllocMemBlock("SceSgxdMmu", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW,
+                                           SGXD_MMU_SIZE, &opt);
+    if (sgxd_mmu_uid < 0) {
+        return sgxd_mmu_uid;
+    }
+    void *base = NULL;
+    uintptr_t pa = 0;
+    int r = ksceKernelGetMemBlockBase(sgxd_mmu_uid, &base);
+    if (r >= 0) {
+        r = ksceKernelVAtoPA(base, &pa);
+    }
+    if (r < 0) {
+        ksceKernelFreeMemBlock(sgxd_mmu_uid);
+        sgxd_mmu_uid = -1;
+        return r;
+    }
+    sgxd_mmu = base;
+    sgxd_mmu_pa = (uint32_t)pa;
+    for (uint32_t i = 0; i < 1024; i++) {
+        sgxd_mmu[i] = 0;
+    }
+    asm volatile("dsb" ::: "memory");
+    __builtin_memset(sgxd_mmu_table, 0, sizeof(sgxd_mmu_table));
+    sgxd_mmu_tables = 0;
+    sgxd_mmu_pages = 0;
+    return 0;
+}
+
+static void sgxd_mmu_free(void) {
+    if (sgxd_mmu_uid >= 0) {
+        ksceKernelFreeMemBlock(sgxd_mmu_uid);
+    }
+    sgxd_mmu_uid = -1;
+    sgxd_mmu = NULL;
+    sgxd_mmu_pa = 0;
+}
+
+// The master bank and every core's, with cores 2 and 3 written directly.
+static const uint32_t sgxd_bif_banks[] = {0x0000u, 0x4000u, 0x8000u, 0xc000u, 0x10000u, 0x14000u};
+#define SGXD_BIF_BANKS (sizeof(sgxd_bif_banks) / sizeof(sgxd_bif_banks[0]))
+
+static void sgxd_mmu_invalidate(void) {
+    for (unsigned b = 0; b < SGXD_BIF_BANKS; b++) {
+        sgxd_write(sgxd_bif_banks[b] + SGX_BIF_CTRL_INVAL, 0);
+        sgxd_write(sgxd_bif_banks[b] + SGX_BIF_CTRL_INVAL, SGX_BIF_INVAL_ALL);
+    }
+}
+
+// SceGpu's init script clears the BIF set-up and points bank 0 at directory 7; the event data
+// master reads through it, everything else through directory 0. Both are ours, in every bank.
+static void sgxd_mmu_program(void) {
+    sgxd_write(SGX_BIF_CTRL, 0);
+    sgxd_write(SGX_BIF_BANK_SET, 0);
+    sgxd_write(SGX_BIF_BANK0, 7);
+    for (unsigned b = 0; b < SGXD_BIF_BANKS; b++) {
+        sgxd_write(sgxd_bif_banks[b] + SGX_BIF_DIR_LIST_BASE0, sgxd_mmu_pa);
+        sgxd_write(sgxd_bif_banks[b] + SGX_BIF_DIR_LIST_BASE7, sgxd_mmu_pa);
+    }
+    sgxd_mmu_invalidate();
+}
+
+static volatile uint32_t *sgxd_mmu_pt(unsigned table) {
+    return sgxd_mmu + table * 1024u;
+}
+
+static volatile uint32_t *sgxd_mmu_pte(uint32_t gpu_va) {
+    const unsigned table = sgxd_mmu_table[gpu_va >> 22];
+    return table ? &sgxd_mmu_pt(table)[(gpu_va >> 12) & 1023u] : NULL;
+}
+
+// A page of the app's memory as the app itself reaches it: a user-mode translation (ATS1CUR, or
+// ATS1CUW for a writable GPU mapping) under the same one-page domain grant as azahar_user_page,
+// so a kernel page, or a read-only one mapped writable, faults here and is refused. Then the page
+// is cleaned to memory, as azahar_user_page does. ksceKernelFindProcMemBlockByAddr was not enough:
+// it accepts kernel address 0x00100000.
+static uint32_t sgxd_user_par(uint32_t uva) {
+    SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
+    const uint32_t d = rd_dacr();
+    wr_dacr(dacr_grant_all(d));
+    asm volatile("mcr p15, 0, %0, c7, c8, 2 \n isb" ::"r"(uva) : "memory");
+    const uint32_t par = rd_par();
+    wr_dacr(d);
+    ksceKernelCpuResumeIntr(st);
+    return par;
+}
+
+static int sgxd_user_page(uint32_t uva, int write, uint32_t *pa, uint32_t *par_out) {
+    SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
+    const uint32_t d = rd_dacr();
+    wr_dacr(dacr_grant_all(d));
+    if (write) {
+        asm volatile("mcr p15, 0, %0, c7, c8, 3 \n isb" ::"r"(uva) : "memory");   // ATS1CUW
+    } else {
+        asm volatile("mcr p15, 0, %0, c7, c8, 2 \n isb" ::"r"(uva) : "memory");   // ATS1CUR
+    }
+    const uint32_t par = rd_par();
+    if (!PAR_FAULTED(par)) {
+        ksceKernelDcacheCleanRange((void *)(uintptr_t)uva, 0x1000);
+    }
+    wr_dacr(d);
+    ksceKernelCpuResumeIntr(st);
+    *par_out = par;
+    *pa = PAR_PA(par);
+    return PAR_FAULTED(par) ? AZAHAR_ERR_PAGE : 0;
+}
+
+static int sgxd_map_locked(uint32_t gpu_va, uint32_t uva, uint32_t size, uint32_t flags) {
+    if ((gpu_va | uva | size) & 0xfffu || !size || gpu_va + (size - 1) < gpu_va ||
+        uva + (size - 1) < uva || (flags & ~SGXD_MAP_FLAGS)) {
+        return AZAHAR_ERR_ARG;
+    }
+    unsigned need = 0;
+    for (uint32_t pde = gpu_va >> 22; pde <= (gpu_va + (size - 1)) >> 22; pde++) {
+        need += !sgxd_mmu_table[pde];
+    }
+    if (sgxd_mmu_tables + need > SGXD_MAP_TABLES) {
+        return SGXD_ERR_TABLES;
+    }
+    for (uint32_t off = 0; off < size; off += 0x1000) {
+        const volatile uint32_t *pte = sgxd_mmu_pte(gpu_va + off);
+        if (pte && (*pte & SGXD_PTE_VALID)) {
+            return SGXD_ERR_MAPPED;
+        }
+    }
+    for (uint32_t pde = gpu_va >> 22; pde <= (gpu_va + (size - 1)) >> 22; pde++) {
+        if (!sgxd_mmu_table[pde]) {
+            const unsigned table = ++sgxd_mmu_tables;
+            volatile uint32_t *pt = sgxd_mmu_pt(table);
+            for (unsigned i = 0; i < 1024; i++) {
+                pt[i] = 0;
+            }
+            sgxd_mmu_table[pde] = (uint8_t)table;
+            sgxd_mmu[pde] = (sgxd_mmu_pa + table * 0x1000u) | SGXD_PTE_VALID;
+        }
+    }
+    for (uint32_t off = 0; off < size; off += 0x1000) {
+        uint32_t pa = 0, par = 0;
+        if (sgxd_user_page(uva + off, !(flags & SGXD_MAP_READONLY), &pa, &par) != 0) {
+            SGXD_LOG("map: user %08x does not translate (par %08x)\n", uva + off, par);
+            for (uint32_t undo = 0; undo < off; undo += 0x1000) {
+                *sgxd_mmu_pte(gpu_va + undo) = 0;
+            }
+            sgxd_mmu_pages -= off / 0x1000;
+            asm volatile("dsb" ::: "memory");
+            return AZAHAR_ERR_PAGE;
+        }
+        *sgxd_mmu_pte(gpu_va + off) = pa | flags | SGXD_PTE_VALID;
+        sgxd_mmu_pages++;
+    }
+    asm volatile("dsb" ::: "memory");
+    sgxd_mmu_invalidate();
+    return 0;
+}
+
+static int sgxd_unmap_locked(uint32_t gpu_va, uint32_t size) {
+    if ((gpu_va | size) & 0xfffu || !size || gpu_va + (size - 1) < gpu_va) {
+        return AZAHAR_ERR_ARG;
+    }
+    for (uint32_t off = 0; off < size; off += 0x1000) {
+        const volatile uint32_t *pte = sgxd_mmu_pte(gpu_va + off);
+        if (!pte || !(*pte & SGXD_PTE_VALID)) {
+            return SGXD_ERR_MAPPED;
+        }
+    }
+    for (uint32_t off = 0; off < size; off += 0x1000) {
+        *sgxd_mmu_pte(gpu_va + off) = 0;
+    }
+    sgxd_mmu_pages -= size / 0x1000;
+    asm volatile("dsb" ::: "memory");
+    sgxd_mmu_invalidate();
+    return 0;
+}
+
+// A write sgxd allows: not the BIF directory, bank and MMU-invalidate registers of any bank.
+static int sgxd_writable(uint32_t reg) {
+    const uint32_t r = reg & 0x3fffu;
+    return !(reg & 3u) && reg < SGXD_OP_REG_LIMIT && r != SGX_BIF_CTRL &&
+           !(r >= SGX_BIF_CTRL_INVAL && r <= SGX_BIF_DIR_LIST_BASE0);
+}
+
 // Registered once, after SceGpu's "SceGpu", so it runs after SceGpu's in every phase
 // (ksceKernelSysEventDispatch walks the list in order). SceGpu's own suspend meets the state
 // the take left: its gate already armed, power state 3 already (a no-op). Ours then takes our
@@ -346,6 +568,13 @@ static int sgxd_take_locked(SgxdInfo *info) {
     if (azahar_proc_handler < 0) {
         azahar_proc_handler = ksceKernelRegisterProcEventHandler("azaharnative", &azahar_proc_events, 0);
     }
+    // A first take starts with no GPU mappings. A take after a suspend (LOST) keeps them: the
+    // directory and the pages stayed in RAM, and the start sequence programs the directory
+    // again (docs/sgxd/takeover.md). Freed at release.
+    if (sgxd_mmu_uid < 0 && (r = sgxd_mmu_alloc()) < 0) {
+        info->step_status = r;
+        return AZAHAR_ERR_ALLOC;
+    }
 
     info->step = SGXD_STEP_GATE;
     info->step_status = sgxd_gpu_sysevent(0, 0x400, NULL, NULL);
@@ -378,6 +607,7 @@ static int sgxd_take_locked(SgxdInfo *info) {
     info->step = SGXD_STEP_START;
     sgxd_start_sequence();
     sgxd_reset_cores();
+    sgxd_mmu_program();
 
     info->step = SGXD_STEP_VERIFY;
     info->core_id = sgxd_read(SGX_CORE_ID);
@@ -415,6 +645,7 @@ int sgxdTake(SgxdInfo *user_info) {
             sgxd_state = SGXD_OWNED;
             sgxd_owner = pid;
         } else {
+            sgxd_mmu_free();
             sgxd_state = SGXD_NONE;
             sgxd_owner = -1;
         }
@@ -445,9 +676,12 @@ static int sgxd_release_locked(void) {
     }
     // LOST: the system's resume already gave SceGpu its GPU back.
     const int was = sgxd_state;
+    const uint32_t pages = sgxd_mmu_pages;
+    sgxd_mmu_free();
     sgxd_state = SGXD_NONE;
     sgxd_owner = -1;
-    SGXD_LOG("release (%s)\n", was == SGXD_OWNED ? "handed back" : "was lost");
+    SGXD_LOG("release (%s), %u GPU page(s) were mapped\n", was == SGXD_OWNED ? "handed back" : "was lost",
+             pages);
     return 0;
 }
 
@@ -476,7 +710,89 @@ static void sgxd_on_proc_gone(SceUID pid) {
     ksceKernelUnlockMutex(sgxd_mutex, 1);
 }
 
-// Returns the number of ops done, or a negative error; a bad op stops the list there.
+// sgxdDump's layout: SceGpuEs4's two register lists, read now. Header words 2-9 are the
+// caller's (the fault snapshot's).
+static void sgxd_fill_dump(uint32_t *w) {
+    for (uint32_t i = 0; i < SGXD_DUMP_WORDS; i++) {
+        w[i] = 0;
+    }
+    w[0] = SGXD_DUMP_MAGIC;
+    w[1] = SGXD_VERSION;
+    w[10] = (sgxd_read(SGX_MASTER_CORE_CONFIG) & 3u) + 1u;
+    w[11] = SGXD_DUMP_BANK_REGS;
+    w[12] = SGXD_DUMP_CORE_REGS;
+    for (uint32_t i = 0; i < SGXD_DUMP_BANK_REGS; i++) {
+        const uint32_t reg = sgxd_bank_list[i];
+        w[14 + i * 2] = reg;
+        w[15 + i * 2] = reg < SGXD_REG_SIZE && !(reg & 3u) ? sgxd_read(reg) : 0xdeadbeefu;
+    }
+    for (uint32_t i = 0; i < SGXD_DUMP_CORE_REGS; i++) {
+        const uint32_t reg = sgxd_core_list[i];
+        w[546 + i * 5] = reg;
+        for (uint32_t core = 0; core < w[10] && core < SGXD_CORES; core++) {
+            w[547 + i * 5 + core] = reg < 0x4000u && !(reg & 3u)
+                                        ? sgxd_read(SGXD_CORE_BANK(core) + reg) : 0xdeadbeefu;
+        }
+    }
+    // The debug bus, as SGXDumpDebugState reads it: each core's 0x78 set to 1, each ID
+    // selected through 0x90 and 0x94 and its word read at 0x70; the three put back after.
+    const uint32_t cores = w[10] < SGXD_CORES ? w[10] : SGXD_CORES;
+    uint32_t saved[SGXD_CORES][3];
+    for (uint32_t core = 0; core < cores; core++) {
+        const uint32_t bank = SGXD_CORE_BANK(core);
+        saved[core][0] = sgxd_read(bank + 0x78u);
+        saved[core][1] = sgxd_read(bank + 0x90u);
+        saved[core][2] = sgxd_read(bank + 0x94u);
+        sgxd_write(bank + 0x78u, 1);
+    }
+    for (uint32_t i = 0; i < SGXD_DUMP_DEBUG_IDS; i++) {
+        const uint32_t id = sgxd_debug_ids[i] & 0xffu, sel = id | id << 16;
+        w[SGXD_DUMP_DEBUG_AT + i * 5] = id;
+        for (uint32_t core = 0; core < cores; core++) {
+            const uint32_t bank = SGXD_CORE_BANK(core);
+            sgxd_write(bank + 0x90u, sel | 0x08000000u);
+            sgxd_write(bank + 0x94u, sel | 0x18001000u);
+            w[SGXD_DUMP_DEBUG_AT + 1 + i * 5 + core] = sgxd_read(bank + 0x70u);
+        }
+    }
+    for (uint32_t core = 0; core < cores; core++) {
+        const uint32_t bank = SGXD_CORE_BANK(core);
+        sgxd_write(bank + 0x90u, saved[core][1]);
+        sgxd_write(bank + 0x94u, saved[core][2]);
+        sgxd_write(bank + 0x78u, saved[core][0]);
+    }
+}
+
+// A poll gave up: the whole dump at once, before anything else touches the GPU, and the
+// status registers a hang is read by on the console, which outlives the app.
+static void sgxd_fault_snapshot(uint32_t index, const SgxdOp *op, uint32_t wanted,
+                                uint32_t waited) {
+    uint32_t *w = sgxd_fault_words;
+    sgxd_fill_dump(w);
+    w[2] = SGXD_DUMP_FAULT;
+    w[3] = index;
+    w[4] = op->reg;
+    w[5] = wanted;
+    w[6] = op->mask;
+    w[7] = op->value;
+    w[8] = waited;
+    w[9] = ksceKernelGetSystemTimeLow();
+    SGXD_LOG("poll timeout: op %u reg %05x want %08x mask %08x last %08x after %u us; "
+             "fault dump taken\n", index, op->reg, wanted, op->mask, op->value, waited);
+    for (uint32_t core = 0; core < SGXD_CORES; core++) {
+        const uint32_t b = SGXD_CORE_BANK(core);
+        SGXD_LOG("core %u: event status %08x/%08x, bif int %08x fault %08x\n", core,
+                 sgxd_read(b + SGX_EVENT_STATUS), sgxd_read(b + SGX_EVENT_STATUS2),
+                 sgxd_read(b + SGX_BIF_INT_STAT), sgxd_read(b + SGX_BIF_FAULT));
+    }
+    SGXD_LOG("bank 0: event status %08x/%08x, bif int %08x fault %08x; master bif int %08x "
+             "fault %08x\n", sgxd_read(SGX_EVENT_STATUS), sgxd_read(SGX_EVENT_STATUS2),
+             sgxd_read(SGX_BIF_INT_STAT), sgxd_read(SGX_BIF_FAULT),
+             sgxd_read(SGX_MASTER_BIF_INT_STAT), sgxd_read(SGX_MASTER_BIF_FAULT));
+}
+
+// Returns the number of ops done, or a negative error. A bad op, or a poll that timed out, stops
+// the list there: the return is its index, and a poll's value is the register's last read.
 int sgxdSubmit(SgxdOp *user_ops, uint32_t count) {
     uint32_t state;
     ENTER_SYSCALL(state);
@@ -497,6 +813,29 @@ int sgxdSubmit(SgxdOp *user_ops, uint32_t count) {
             SgxdOp *op = &sgxd_ops[i];
             if (op->op == SGXD_OP_READ && !(op->reg & 3u) && op->reg < SGXD_REG_SIZE) {
                 op->value = sgxd_read(op->reg);
+            } else if (op->op == SGXD_OP_WRITE && sgxd_writable(op->reg)) {
+                sgxd_write(op->reg, op->value);
+            } else if (op->op == SGXD_OP_POLL && !(op->reg & 3u) && op->reg < SGXD_REG_SIZE &&
+                       op->timeout_us <= SGXD_MAX_POLL_US) {
+                // Spins for the first 100 us, the TA and 3D kicks' own scale, then sleeps.
+                const uint32_t t0 = ksceKernelGetSystemTimeLow();
+                uint32_t v, waited;
+                while (((v = sgxd_read(op->reg)) & op->mask) != op->value) {
+                    waited = ksceKernelGetSystemTimeLow() - t0;
+                    if (waited > op->timeout_us) {
+                        break;
+                    }
+                    if (waited > 100u) {
+                        ksceKernelDelayThread(20);
+                    }
+                }
+                const int met = (v & op->mask) == op->value;
+                const uint32_t wanted = op->value;
+                op->value = v;
+                if (!met) {
+                    sgxd_fault_snapshot(i, op, wanted, waited);
+                    break;
+                }
             } else if (op->op == SGXD_OP_DELAY && op->value <= 1000000u) {
                 ksceKernelDelayThread(op->value);
             } else {
@@ -526,33 +865,169 @@ int sgxdDump(uint32_t *user_words, uint32_t count) {
     } else if (count < SGXD_DUMP_WORDS) {
         ret = AZAHAR_ERR_ARG;
     } else {
-        uint32_t *w = sgxd_dump_words;
-        for (uint32_t i = 0; i < SGXD_DUMP_WORDS; i++) {
-            w[i] = 0;
-        }
-        w[0] = SGXD_DUMP_MAGIC;
-        w[1] = SGXD_VERSION;
-        w[10] = (sgxd_read(SGX_MASTER_CORE_CONFIG) & 3u) + 1u;
-        w[11] = SGXD_DUMP_BANK_REGS;
-        w[12] = SGXD_DUMP_CORE_REGS;
-        for (uint32_t i = 0; i < SGXD_DUMP_BANK_REGS; i++) {
-            const uint32_t reg = sgxd_bank_list[i];
-            w[14 + i * 2] = reg;
-            w[15 + i * 2] = reg < SGXD_REG_SIZE && !(reg & 3u) ? sgxd_read(reg) : 0xdeadbeefu;
-        }
-        for (uint32_t i = 0; i < SGXD_DUMP_CORE_REGS; i++) {
-            const uint32_t reg = sgxd_core_list[i];
-            w[546 + i * 5] = reg;
-            for (uint32_t core = 0; core < w[10] && core < SGXD_CORES; core++) {
-                w[547 + i * 5 + core] = reg < 0x4000u && !(reg & 3u)
-                                            ? sgxd_read(SGXD_CORE_BANK(core) + reg) : 0xdeadbeefu;
-            }
-        }
-        ret = ksceKernelCopyToUser(user_words, w, SGXD_DUMP_WORDS * 4) < 0 ? AZAHAR_ERR_ARG
-                                                                           : (int)SGXD_DUMP_WORDS;
+        sgxd_fill_dump(sgxd_dump_words);
+        ret = ksceKernelCopyToUser(user_words, sgxd_dump_words, SGXD_DUMP_WORDS * 4) < 0
+                  ? AZAHAR_ERR_ARG : (int)SGXD_DUMP_WORDS;
     }
     sgxd_leave();
 out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdFaultDump(uint32_t *user_words, uint32_t count) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (count < SGXD_DUMP_WORDS) {
+        ret = AZAHAR_ERR_ARG;
+    } else if (sgxd_fault_words[0] != SGXD_DUMP_MAGIC) {
+        ret = 0;
+    } else {
+        ret = ksceKernelCopyToUser(user_words, sgxd_fault_words, SGXD_DUMP_WORDS * 4) < 0
+                  ? AZAHAR_ERR_ARG : (int)SGXD_DUMP_WORDS;
+    }
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdReadRegs(uint32_t reg, uint32_t count, uint32_t *user_words) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (sgxd_state == SGXD_LOST) {
+        ret = SGXD_ERR_LOST;
+    } else if ((reg & 3u) || !count || count > SGXD_MAX_READ_REGS || reg >= SGXD_OP_REG_LIMIT ||
+               count > (SGXD_OP_REG_LIMIT - reg) / 4u) {
+        ret = AZAHAR_ERR_ARG;
+    } else {
+        for (uint32_t i = 0; i < count; i++) {
+            sgxd_read_words[i] = sgxd_read(reg + i * 4u);
+        }
+        ret = ksceKernelCopyToUser(user_words, sgxd_read_words, count * 4u) < 0 ? AZAHAR_ERR_ARG
+                                                                               : (int)count;
+    }
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdTranslate(uint32_t gpu_va, uint32_t user_out[2]) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret < 0) {
+        goto out;
+    }
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        ret = SGXD_ERR_OWNER;
+    } else if (!sgxd_mmu) {
+        ret = AZAHAR_ERR_ARG;
+    } else {
+        const volatile uint32_t *pte = sgxd_mmu_pte(gpu_va);
+        const uint32_t out[2] = {sgxd_mmu[gpu_va >> 22], pte ? *pte : 0};
+        ret = ksceKernelCopyToUser(user_out, out, sizeof(out)) < 0 ? AZAHAR_ERR_ARG : 0;
+    }
+    sgxd_leave();
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+static int sgxd_owned_call(void) {
+    if (sgxd_owner != ksceKernelGetProcessId()) {
+        return SGXD_ERR_OWNER;
+    }
+    return sgxd_state == SGXD_LOST ? SGXD_ERR_LOST : 0;
+}
+
+int sgxdMap(uint32_t gpu_va, const void *user_va, uint32_t size, uint32_t flags) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret == 0) {
+        ret = sgxd_owned_call();
+        if (ret == 0) {
+            ret = sgxd_map_locked(gpu_va, (uint32_t)(uintptr_t)user_va, size, flags);
+        }
+        SGXD_LOG("map gpu %08x <- user %08x, %08x bytes, flags %x -> %08x (%u tables, %u pages)\n",
+                 gpu_va, (uint32_t)(uintptr_t)user_va, size, flags, (uint32_t)ret,
+                 sgxd_mmu_tables, sgxd_mmu_pages);
+        sgxd_leave();
+    }
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int sgxdUnmap(uint32_t gpu_va, uint32_t size) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = sgxd_enter();
+    if (ret == 0) {
+        ret = sgxd_owned_call();
+        if (ret == 0) {
+            ret = sgxd_unmap_locked(gpu_va, size);
+        }
+        sgxd_leave();
+    }
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+// By the app's addresses, under the same one-page domain grant as azahar_user_page: the app's
+// pages are No-access to the kernel inside a syscall. 16 KiB at a time with interrupts off.
+int sgxdCacheRange(const void *user_va, uint32_t size, uint32_t op) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    const uint32_t uva = (uint32_t)(uintptr_t)user_va;
+    int ret = 0;
+    // An invalidate takes whole 64-byte lines only: a partial one would drop the rest of its line.
+    if (!size || uva + (size - 1) < uva || op < SGXD_CACHE_CLEAN || op > SGXD_CACHE_CLEAN_INVALIDATE ||
+        (op == SGXD_CACHE_INVALIDATE && ((uva | size) & 63u))) {
+        ret = AZAHAR_ERR_ARG;
+    } else {
+        // Only memory the app reads itself (sgxd_user_page's check): an invalidate of a kernel
+        // line would drop the kernel's data.
+        for (uint32_t page = uva & ~0xfffu; page - (uva & ~0xfffu) < size + (uva & 0xfffu); page += 0x1000) {
+            if (PAR_FAULTED(sgxd_user_par(page))) {
+                ret = AZAHAR_ERR_PAGE;
+                break;
+            }
+        }
+    }
+    if (ret == 0) {
+        uint32_t at = uva & ~63u;
+        const uint32_t end = uva + size;
+        while (at < end) {
+            const uint32_t n = end - at < 0x4000u ? ((end - at) + 63u) & ~63u : 0x4000u;
+            SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
+            const uint32_t d = rd_dacr();
+            wr_dacr(dacr_grant_all(d));
+            if (op == SGXD_CACHE_CLEAN) {
+                ksceKernelDcacheCleanRange((void *)(uintptr_t)at, n);
+            } else if (op == SGXD_CACHE_INVALIDATE) {
+                ksceKernelDcacheInvalidateRange((void *)(uintptr_t)at, n);
+            } else {
+                ksceKernelDcacheCleanInvalidateRange((void *)(uintptr_t)at, n);
+            }
+            wr_dacr(d);
+            ksceKernelCpuResumeIntr(st);
+            at += n;
+        }
+    }
     EXIT_SYSCALL(state);
     return ret;
 }

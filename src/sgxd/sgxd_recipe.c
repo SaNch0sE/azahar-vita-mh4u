@@ -1,0 +1,923 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// sgxd_recipe — see sgxd_recipe.h.
+
+#include "sgxd_recipe.h"
+
+#include <string.h>
+
+const char *const sgxd_recipe_names[SGXD_R_COUNT] = {
+    "PT", "PAGES", "RGN0", "RGN1", "RGN2", "RGN3", "EXTZ", "TPC0", "TPC1", "TPC2", "TPC3",
+    "BGREC", "FB", "DEPTH", "STREAM", "STATE", "VERTS", "INDICES", "PDS", "COPY", "VSPDS",
+    "VSEC", "TERM", "FSEC", "FPRIM", "BGSEC", "BGPRIM", "PIXEV", "IDLE", "COPY1", "COPY2",
+    "COPY3", "COPY4", "COPY5", "COPY6", "COPY7", "CV", "CF", "END",
+};
+
+// ---------------------------------------------------------------------------- the scene
+
+// The one triangle in clip space (x, y, z, w), indices 0, 1, 2.
+#define NV 4u
+static const float triangle_verts[3 * NV] = {
+    -0.5f, -0.5f, 0.25f, 1.0f, 0.5f, -0.5f, 0.5f, 1.0f, 0.0f, 0.5f, 0.75f, 1.0f,
+};
+static const uint16_t triangle_indices[3] = {0, 1, 2};
+static const SgxdRecipeDraw triangle_draw = {0, 3, SGXD_RECIPE_ISP_A, SGXD_R_FPRIM, 0, 0};
+
+#define OUTSELECTS (4u << 24 | 0x1000u)
+
+static uint32_t fbits(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    return bits;
+}
+
+static unsigned floor_log2(uint32_t v) {
+    unsigned n = 0;
+    while (v >>= 1) {
+        n++;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------- USSE
+
+#define PHAS_LAST 0xfa44070000000000ull
+#define NOP 0xf800094000000000ull
+#define NOP_END 0xf804014000000000ull
+#define PHAS_END 0xfa4c070000000000ull
+#define END_VERTEX 0xfb275000a0200000ull
+#define EMITMTE 0xfb2f4000a0200000ull
+#define EMITPIX_EOT 0xfb24000001200082ull
+#define EMITPIX_EOR 0xfb26000081200000ull
+#define SKIPINV (0x00800000ull << 32)
+#define LIMM_O (1ull << 32)   // LIMM destination bank o
+#define CF_EOT_OFFSET 0x100u  // the end-of-tile program in CF
+
+static const uint64_t brn[4] = {
+    0xf800094000000000ull, 0x48830280a00c0000ull, 0xe9833084a0000000ull, 0xf920000000000000ull,
+};
+
+// limm rDEST, value.
+static uint64_t usse_limm(unsigned dest, uint32_t value) {
+    const uint32_t hi = 0xfc200000u | ((value >> 21) & 0x1fu) << 4 | ((value >> 26) & 0x3fu) << 12;
+    const uint32_t lo = (dest & 0x7fu) << 21 | (value & 0x1fffffu);
+    return (uint64_t)hi << 32 | lo;
+}
+
+typedef struct Code {
+    uint32_t offset;   // from the window
+    unsigned count;
+    uint64_t words[16];
+} Code;
+
+static void code_add(Code *c, uint64_t word) {
+    c->words[c->count++] = word;
+}
+
+// The state copy: o[d..] = pa[d..], 16 to an instruction, then EMITMTE.
+static void copyprog(Code *c, uint32_t offset, unsigned n) {
+    c->offset = offset;
+    c->count = 0;
+    code_add(c, PHAS_LAST);
+    for (unsigned i = 0; i < 4; i++) {
+        code_add(c, brn[i]);
+    }
+    for (unsigned d = 0; d < n; d += 16) {
+        const unsigned r = n - d < 16 ? n - d : 16;
+        code_add(c, (uint64_t)(0x50a10009u | (r - 1) << 12) << 32 | (0xa0000000u | d << 21 | d << 7));
+    }
+    code_add(c, EMITMTE);
+}
+
+static void colour_fs(Code *c, uint32_t offset, uint32_t colour) {
+    c->offset = offset;
+    c->count = 0;
+    code_add(c, PHAS_LAST);
+    code_add(c, usse_limm(0, colour) | LIMM_O | SKIPINV);
+    code_add(c, NOP_END);
+}
+
+enum { CV_DUMMY_VS, CV_COPY_STATE, CV_COPY_TERM, CV_VS, CV_COUNT };
+enum { CF_DUMMY_FS, CF_BG_FS, CF_EOR, CF_PTOFF, CF_EOT, CF_TRI_FS, CF_COUNT };
+
+static void make_cv(const SgxdRecipe *r, Code cv[CV_COUNT]) {
+    memset(cv, 0, sizeof(Code) * CV_COUNT);
+    cv[CV_DUMMY_VS].offset = 0x00;
+    code_add(&cv[CV_DUMMY_VS], PHAS_END);
+    copyprog(&cv[CV_COPY_STATE], 0x40, 24);
+    copyprog(&cv[CV_COPY_TERM], 0x80, 2);
+    cv[CV_VS].offset = 0xc0;
+    if (r->copy_vs) {
+        // A caller's scene: o[n] = pa[n] for every vertex word, 16 to an instruction.
+        code_add(&cv[CV_VS], PHAS_LAST);
+        code_add(&cv[CV_VS], NOP);
+        for (unsigned d = 0; d < NV; d += 16) {
+            const unsigned n = NV - d < 16 ? NV - d : 16;
+            code_add(&cv[CV_VS],
+                     (uint64_t)(0x50a10009u | (n - 1) << 12) << 32 | (0xa0000000u | d << 21 | d << 7));
+        }
+        code_add(&cv[CV_VS], END_VERTEX);
+        return;
+    }
+    // o0..o2 = pa0..pa2, o3 = c2 = 1.0, vertex end (a pass-through).
+    static const uint64_t vs[] = {
+        PHAS_LAST, NOP, 0x0881008190000002ull, 0x0885010190248002ull, 0x0881008190400042ull,
+        0x0883010150400082ull, END_VERTEX,
+    };
+    for (unsigned i = 0; i < sizeof(vs) / sizeof(vs[0]); i++) {
+        code_add(&cv[CV_VS], vs[i]);
+    }
+}
+
+// Draw n's state copy: COPY for the first, COPY1.. for the others.
+static unsigned copy_part(unsigned n) { return n ? SGXD_R_COPY1 + n - 1 : SGXD_R_COPY; }
+// Its offset: COPY1.. are consecutive, and the draws past COPY7 follow it.
+static uint32_t copy_offset(const SgxdRecipe *r, unsigned n) {
+    return n ? r->offset[SGXD_R_COPY1] + (n - 1) * 0x40 : r->offset[SGXD_R_COPY];
+}
+
+
+static void make_cf(const SgxdRecipe *r, Code cf[CF_COUNT]) {
+    memset(cf, 0, sizeof(Code) * CF_COUNT);
+    cf[CF_DUMMY_FS].offset = 0x00;
+    code_add(&cf[CF_DUMMY_FS], PHAS_LAST);
+    for (unsigned i = 0; i < 4; i++) {
+        code_add(&cf[CF_DUMMY_FS], brn[i]);
+    }
+    code_add(&cf[CF_DUMMY_FS], NOP_END);
+    // Each colour is its own shader: a pixel task's PAs are per instance, and without SKIPINV a
+    // quad's uncovered instances would write o0 too.
+    colour_fs(&cf[CF_BG_FS], 0x40, SGXD_RECIPE_BG);
+    cf[CF_EOR].offset = 0x80;
+    code_add(&cf[CF_EOR], PHAS_LAST);
+    code_add(&cf[CF_EOR], 0xfca0000000000000ull);
+    code_add(&cf[CF_EOR], 0xfca0000000200000ull);
+    code_add(&cf[CF_EOR], EMITPIX_EOR);
+    cf[CF_PTOFF].offset = 0xc0;
+    code_add(&cf[CF_PTOFF], PHAS_END);
+    // End of tile: r0..r5 = the PBE words, EMITPIX.
+    cf[CF_EOT].offset = CF_EOT_OFFSET;
+    code_add(&cf[CF_EOT], PHAS_LAST);
+    for (unsigned i = 0; i < 6; i++) {
+        code_add(&cf[CF_EOT], usse_limm(i, r->pbe[i]) | SKIPINV);
+    }
+    code_add(&cf[CF_EOT], EMITPIX_EOT);
+    colour_fs(&cf[CF_TRI_FS], 0x140, SGXD_RECIPE_TRI);
+}
+
+#define VI(cv, n) ((cv)[n].offset >> 3)
+#define FI(cf, n) ((cf)[n].offset >> 3)
+
+// ---------------------------------------------------------------------------- PDS
+
+#define S1L 0u
+#define S1H 1u
+#define S2L 2u
+#define S2H 3u
+#define HALT 0xaf000000u
+
+static uint32_t movs(unsigned dest, unsigned s1sel, unsigned s1, unsigned s2sel, unsigned s2,
+                     unsigned w0, unsigned w1, unsigned w2, unsigned w3) {
+    return 7u << 24 | s1sel << 23 | (s1 & 0x1fu) << 18 | s2sel << 17 | (s2 & 0x1fu) << 12 |
+           w0 << 10 | w1 << 8 | w2 << 6 | w3 << 4 | dest;
+}
+static uint32_t doutd(unsigned p) { return movs(3, 0, p, 0, 24, S1L, S1H, S1L, S1H); }
+static uint32_t douta(unsigned p) { return movs(6, 0, p, 0, 24, S1L, S1H, S2L, S2L); }
+static uint32_t doutu(unsigned p, unsigned w2) {
+    const unsigned s = w2 & 1 ? S2H : S2L;
+    return movs(5, 0, p, 0, w2 / 2, S1L, S1H, s, s);
+}
+static uint32_t cc(uint32_t i, unsigned c) { return (i & ~(7u << 24)) | c << 24; }
+static uint32_t movsa(uint32_t i) { return i | 5u << 27; }
+static uint32_t mul(unsigned s1reg, unsigned s1, unsigned s2, unsigned d1, unsigned d) {
+    return 1u << 30 | 4u << 27 | 7u << 24 | s1reg << 23 | s1 << 16 | s2 << 8 | d1 << 6 | d;
+}
+static uint32_t doutu0(unsigned cb, unsigned idx, unsigned tu) { return cb | idx << 4 | tu << 24; }
+static uint32_t doutd1(unsigned pa, unsigned n) { return (n - 1) | pa << 8; }
+static uint32_t douta1(unsigned pa) { return pa << 8; }
+
+// A PDS program: two data segments of words, then code.
+typedef struct Pds {
+    uint32_t ds[2][16];
+    unsigned len[2];
+    uint32_t code[8];
+    unsigned ncode;
+} Pds;
+
+static unsigned pds_word(Pds *p, unsigned b, uint32_t v) {
+    p->ds[b][p->len[b]++] = v;
+    return p->len[b] - 1;
+}
+static unsigned pds_pair(Pds *p, unsigned b, uint32_t lo, uint32_t hi) {
+    if (p->len[b] & 1) {
+        p->ds[b][p->len[b]++] = 0;
+    }
+    p->ds[b][p->len[b]++] = lo;
+    p->ds[b][p->len[b]++] = hi;
+    return p->len[b] / 2 - 1;
+}
+static void pds_emit(Pds *p, uint32_t i) { p->code[p->ncode++] = i; }
+static unsigned pds_units(const Pds *p) {
+    const unsigned n = p->len[0] > p->len[1] ? p->len[0] : p->len[1];
+    return (n + 1) / 2;
+}
+// Data units (DS0 w0, w1, DS1 w0, w1), then the code. Returns the words written.
+static unsigned pds_words(const Pds *p, uint32_t *out) {
+    const unsigned u = pds_units(p);
+    memset(out, 0, u * 16);
+    for (unsigned n = 0; n < p->len[0]; n++) {
+        out[(n / 2) * 4 + n % 2] = p->ds[0][n];
+    }
+    for (unsigned n = 0; n < p->len[1]; n++) {
+        out[(n / 2) * 4 + 2 + n % 2] = p->ds[1][n];
+    }
+    memcpy(out + u * 4, p->code, p->ncode * 4);
+    return u * 4 + p->ncode;
+}
+
+static void secondary(Pds *p, uint32_t dw0) {
+    memset(p, 0, sizeof(*p));
+    const unsigned k = pds_pair(p, 0, dw0, 0);
+    pds_word(p, 1, 0);
+    pds_emit(p, doutu(k, 0));
+    pds_emit(p, HALT);
+}
+
+// DOUTU only, issued first. The unused first pair keeps the data
+// at two units, the size the TA state points at.
+static void colour_prim(Pds *p, unsigned idx) {
+    memset(p, 0, sizeof(*p));
+    pds_pair(p, 0, 0, 0);
+    const unsigned i = pds_pair(p, 0, doutu0(1, idx, 0), 2);
+    pds_word(p, 1, 0);
+    pds_emit(p, doutu(i, 0));
+    pds_emit(p, HALT);
+}
+
+// State words 10 and 11, the region clip: MODE OUTSIDE (2), left
+// and right tiles in the first, top and bottom in the second, inclusive; clip 0 is the target.
+static uint32_t clip_x(const SgxdRecipe *r, uint32_t clip) {
+    return 2u << 30 | (clip ? (clip >> 24 & 0x3f) << 16 | (clip >> 16 & 0x3f) : r->tx - 1);
+}
+static uint32_t clip_y(const SgxdRecipe *r, uint32_t clip) {
+    return clip ? (clip >> 8 & 0x3f) << 16 | (clip & 0x3f) : r->ty - 1;
+}
+
+// Draw n's state copy: DOUTD of its 24 state words, then the copy program.
+static void copy_pds(const SgxdRecipe *r, const Code *cv, unsigned n, Pds *p) {
+    memset(p, 0, sizeof(*p));
+    const unsigned k = pds_pair(p, 0, sgxd_recipe_va(r, SGXD_R_STATE) + n * 0x60, doutd1(0, 24));
+    const unsigned i = pds_pair(p, 0, doutu0(0, VI(cv, CV_COPY_STATE), 0), 0);
+    pds_word(p, 1, 0);
+    pds_emit(p, doutd(k));
+    pds_emit(p, doutu(i, 0));
+    pds_emit(p, HALT);
+}
+
+// The PDS programs COPY .. BGPRIM, by layout part.
+static void make_pds(const SgxdRecipe *r, const Code *cv, const Code *cf, Pds *pds) {
+    Pds *p;
+    // The state copies of the first eight draws (the rest are written with the scene).
+    for (unsigned n = 0; n < r->ndraws && n < 8; n++) {
+        copy_pds(r, cv, n, &pds[copy_part(n)]);
+    }
+    // The vertex fetch: ds1[50] = IR0L * 16, then a MOVSA DOUTD of the vertex and DOUTU (IF0).
+    p = &pds[SGXD_R_VSPDS];
+    memset(p, 0, sizeof(*p));
+    {
+        pds_word(p, 1, NV * 4);
+        pds_word(p, 1, 0);
+        const unsigned k = pds_pair(p, 0, sgxd_recipe_va(r, SGXD_R_VERTS), doutd1(0, NV));
+        const unsigned kick = pds_pair(p, 0, doutu0(0, VI(cv, CV_VS), 0), 0);
+        pds_emit(p, mul(1, 0, 0, 1, 50));
+        pds_emit(p, movsa(movs(3, 0, k, 0, 25, S1L, S1H, S2L, S2L)));
+        pds_emit(p, cc(doutu(kick, 1), 3));
+        pds_emit(p, HALT);
+    }
+    secondary(&pds[SGXD_R_VSEC], doutu0(0, VI(cv, CV_DUMMY_VS), 0));
+    // The terminate state: PA0 = 0x2000 (TERMINATE present), PA1..3 = TARNDCLIP.
+    p = &pds[SGXD_R_TERM];
+    memset(p, 0, sizeof(*p));
+    {
+        const uint32_t region = (r->tx - 1) << 16 | (r->ty - 1);
+        const unsigned k = pds_pair(p, 0, 0x2000, douta1(0));
+        const unsigned n = pds_pair(p, 0, region, douta1(1));
+        const unsigned i = pds_pair(p, 0, doutu0(0, VI(cv, CV_COPY_TERM), 0), 0);
+        pds_word(p, 1, 0);
+        pds_emit(p, douta(k));
+        pds_emit(p, douta(n));
+        pds_emit(p, douta(n));
+        pds_emit(p, douta(n));
+        pds_emit(p, doutu(i, 0));
+        pds_emit(p, HALT);
+    }
+    secondary(&pds[SGXD_R_FSEC], doutu0(1, FI(cf, CF_DUMMY_FS), 0));
+    colour_prim(&pds[SGXD_R_FPRIM], FI(cf, CF_TRI_FS));
+    secondary(&pds[SGXD_R_BGSEC], doutu0(1, FI(cf, CF_DUMMY_FS), 0));
+    colour_prim(&pds[SGXD_R_BGPRIM], FI(cf, CF_BG_FS));
+}
+
+// The pixel event (end of tile, end of render, PT off), and the idle core-0 event program.
+static unsigned make_pixev(const Code *cf, uint32_t *out) {
+    const uint32_t words[] = {
+        doutu0(1, FI(cf, CF_EOT), 2), 0, doutu0(1, FI(cf, CF_EOR), 1), 0,
+        doutu0(1, FI(cf, CF_PTOFF), 0), 0, 0, 0xfffeffffu, 0x100, 0x30000, 0x20000, 0,
+        0x93800003u, 0x07020185u, 0xaf000000u, 0x9480000bu, 0xcf088230u,
+        0x87600000u, 0xcf800630u, 0xc7600830u, 0x10000a60u, 0x07600b05u,
+        0xaf000000u, 0x07041185u, 0xaf000000u,
+    };
+    memcpy(out, words, sizeof(words));
+    return sizeof(words) / 4;
+}
+
+static unsigned make_idle(const Code *cv, uint32_t *out) {
+    const uint32_t words[] = {doutu0(0, VI(cv, CV_DUMMY_VS), 0), 1, 0, 0, 0x07000185u, 0xaf000000u};
+    memcpy(out, words, sizeof(words));
+    return sizeof(words) / 4;
+}
+
+// ---------------------------------------------------------------------------- layout
+
+// The vertex DMS: the VDM index list's words 2, 4 and 5.
+static void vertex_dms(unsigned pa, unsigned temps, unsigned sa, unsigned out, uint32_t *w2,
+                       uint32_t *w4, uint32_t *w5) {
+    unsigned size = pa + (temps + 1) / 2 * 2;
+    size = (size + 3) / 4 * 4;
+    if (size && size % 16 == 0) {
+        size += 4;
+    }
+    unsigned max_inst = 8;
+    if (size) {
+        int m = (int)(0x900 - 126 - (sa + 31) / 32 * 32) / 3 / (int)size;
+        max_inst = m < 1 ? 1 : (m > 8 ? 8 : (unsigned)m);
+    }
+    out = (out + 3) / 4 * 4;
+    unsigned part = out ? 128 / out : 16;
+    part = part < 16 ? part : 16;
+    part = part < max_inst ? part : max_inst;
+    const unsigned adv = (part < 4 ? part : 4) - 1;
+    *w2 = (max_inst - 1) << 28;
+    *w4 = (part - 1) << 28;
+    *w5 = (out >> 2) << 25 | adv << 23 | (size >> 2) << 9;
+}
+
+static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, uint32_t pages,
+                const float *verts, unsigned nverts, const uint16_t *indices, unsigned nindices,
+                const SgxdRecipeDraw *draws, unsigned ndraws, int copy_vs);
+
+int sgxd_recipe_init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
+                     uint32_t pages) {
+    return init(r, width, height, base, pages, triangle_verts, 3, triangle_indices, 3,
+                &triangle_draw, 1, 0);
+}
+
+int sgxd_recipe_init_scene(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
+                           uint32_t pages, const float *verts, unsigned nverts,
+                           const uint16_t *indices, unsigned nindices,
+                           const SgxdRecipeDraw *draws, unsigned ndraws) {
+    return init(r, width, height, base, pages, verts, nverts, indices, nindices, draws, ndraws, 1);
+}
+
+static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, uint32_t pages,
+                const float *verts, unsigned nverts, const uint16_t *indices, unsigned nindices,
+                const SgxdRecipeDraw *draws, unsigned ndraws, int copy_vs) {
+    if (width < 32 || height < 32 || width > 2048 || height > 2048 || (base & 0xfffffu) ||
+        pages < 64 || pages > 0x8000 || !nverts || nverts > 0xffff || !nindices ||
+        nindices > SGXD_RECIPE_MAX_INDICES || !ndraws || ndraws > SGXD_RECIPE_MAX_DRAWS) {
+        return -1;
+    }
+    for (unsigned n = 0; n < ndraws; n++) {
+        const SgxdRecipeDraw *d = &draws[n];
+        if ((d->first & 7) || d->first > nindices || !d->count || d->count > nindices - d->first ||
+            (d->fprim != SGXD_R_FPRIM && d->fprim != SGXD_R_BGPRIM) ||
+            d->cull > 2 || (d->clip && (d->clip & 0x40404040u))) {
+            return -1;
+        }
+    }
+    memset(r, 0, sizeof(*r));
+    r->draws = draws;
+    r->ndraws = ndraws;
+    r->copy_vs = copy_vs;
+    r->width = width;
+    r->height = height;
+    r->base = base;
+    r->pages = pages;
+    r->verts = verts;
+    r->nverts = nverts;
+    r->indices = indices;
+    r->nindices = nindices;
+    const uint32_t W = width, H = height;
+
+    r->tx = (W + 31) / 32;
+    r->ty = (H + 31) / 32;
+    r->count = W * H < 0x4b000 ? 2 : 4;
+    if (r->count == 2) {
+        r->mx = ((r->tx + 1) / 2 + 3) & ~3u;
+        r->my = ((r->ty + 1) / 2 + 3) & ~3u;
+        r->mtile1 = r->mx << 22 | r->mx << 12 | r->mx;
+        r->mtile2 = r->my << 22 | r->my << 12 | r->my;
+    } else {
+        // The 4x4 grid (960x544, Sony's display form).
+        r->mx = ((r->tx + 3) / 4 + 3) & ~3u;
+        r->my = ((r->ty + 3) / 4 + 3) & ~3u;
+        r->mtile1 = 1u << 31 | r->mx << 22 | 2 * r->mx << 12 | 3 * r->mx;
+        r->mtile2 = r->my << 22 | 2 * r->my << 12 | 3 * r->my;
+    }
+    r->stride = r->mx * r->my;
+    r->te_screen = (r->ty - 1) << 12 | (r->tx - 1);
+    r->mte_screen = (H - 1) << 12 | (W - 1);
+    r->rgn_size = (r->count * r->count * r->mx * r->my * 12 + 63) & ~63u;
+    uint32_t pp = 1;
+    const uint32_t cm = r->count * (r->mx > r->my ? r->mx : r->my);
+    while (pp < cm) {
+        pp *= 2;
+    }
+    r->tpc_size = (pp * pp * 8 + 63) & ~63u;
+
+    uint32_t *L = r->offset;
+    uint32_t o;
+    L[SGXD_R_PT] = 0;
+    L[SGXD_R_PAGES] = 0x40000;
+    o = 0x40000 + pages * 0x1000;
+    for (unsigned c = 0; c < 4; c++) {
+        L[SGXD_R_RGN0 + c] = o;
+        o += r->rgn_size;
+    }
+    L[SGXD_R_EXTZ] = o;
+    o += r->rgn_size;
+    for (unsigned c = 0; c < 4; c++) {
+        L[SGXD_R_TPC0 + c] = o;
+        o += r->tpc_size;
+    }
+    L[SGXD_R_BGREC] = o;
+    o += 128;
+    o = (o + 0xfff) & ~0xfffu;
+    L[SGXD_R_FB] = o;
+    o += W * H * 4;
+    L[SGXD_R_DEPTH] = o;
+    o += W * H * 4;
+    L[SGXD_R_STREAM] = o;
+    {
+        const uint32_t s = ((8 * ndraws + 5) * 4 + 0xff) & ~0xffu;
+        o += s > 0x200 ? s : 0x200;
+    }
+    L[SGXD_R_STATE] = o;
+    {
+        const uint32_t s = (ndraws * 0x60 + 0xff) & ~0xffu;
+        o += s > 0x100 ? s : 0x100;
+    }
+    uint32_t index_offset = (nverts * NV * 4 + 0x3f) & ~0x3fu;
+    index_offset = index_offset > 0x40 ? index_offset : 0x40;
+    L[SGXD_R_VERTS] = o;
+    L[SGXD_R_INDICES] = o + index_offset;
+    {
+        const uint32_t s = (index_offset + (nindices + 1) / 2 * 4 + 0xff) & ~0xffu;
+        o += s > 0x100 ? s : 0x100;
+    }
+    L[SGXD_R_PDS] = o;
+    for (unsigned s = SGXD_R_COPY; s <= SGXD_R_IDLE; s++) {
+        L[s] = o;
+        o += s == SGXD_R_TERM || s == SGXD_R_PIXEV ? 0x80 : 0x40;
+    }
+    // The other draws' state copies, consecutive; the unused parts of COPY1..COPY7 take no room.
+    for (unsigned n = 1; n < 8; n++) {
+        L[copy_part(n)] = o + (n < ndraws ? n - 1 : ndraws - 1) * 0x40;
+    }
+    o += (ndraws - 1) * 0x40;
+    o = (o + 0xfff) & ~0xfffu;
+    L[SGXD_R_CV] = o;
+    o += 0x400;
+    L[SGXD_R_CF] = o;
+    o += 0x400;
+    L[SGXD_R_END] = o;
+
+    const uint32_t req_base = base & ~0xfffffu;
+    r->first = (sgxd_recipe_va(r, SGXD_R_PAGES) - req_base) / 0x1000;
+    r->last = r->first + pages - 1;
+    r->ta_free_list = r->last << 16 | r->first;
+    r->ta_alloc = (r->last - 1) << 16;
+    r->ta_threshold = pages + 16;
+    const uint32_t gbl = pages - 34;
+    const uint32_t mn = r->ta_threshold < gbl ? r->ta_threshold : gbl;
+    r->pds_threshold = mn > 256 ? mn - 256 : 0;
+    r->global_list = 0x10000 | gbl;
+    r->bgobjtag = (((sgxd_recipe_va(r, SGXD_R_BGREC) - req_base) >> 4) & 0xffffffu) | 2u << 24;
+
+    r->pbe[0] = 256 << 8;
+    r->pbe[1] = sgxd_recipe_va(r, SGXD_R_FB);
+    r->pbe[2] = (W - 1) >> 1;
+    r->pbe[3] = 0;
+    r->pbe[4] = floor_log2((W + 15) / 16) << 24 | floor_log2((H + 15) / 16) << 28;
+    r->pbe[5] = (W - 1) | (H - 1) << 12;
+
+    Code cv[CV_COUNT], cf[CF_COUNT];
+    Pds pds[SGXD_R_COUNT];
+    make_cv(r, cv);
+    make_cf(r, cf);
+    make_pds(r, cv, cf, pds);
+    for (unsigned s = SGXD_R_COPY; s <= SGXD_R_BGPRIM; s++) {
+        r->units[s] = pds_units(&pds[s]);
+    }
+    for (unsigned n = 1; n < ndraws && n < 8; n++) {
+        r->units[copy_part(n)] = pds_units(&pds[copy_part(n)]);
+    }
+    vertex_dms(NV, 0, 0, NV, &r->vdm_w2, &r->vdm_w4, &r->vdm_w5);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------- memory
+
+// A PDS pointer word: units << 27 | va >> 4.
+static uint32_t ptr(const SgxdRecipe *r, unsigned part) {
+    return r->units[part] << 27 | ((sgxd_recipe_va(r, part) >> 4) & 0x07ffffffu);
+}
+static uint32_t msbs(const SgxdRecipe *r, unsigned sec, unsigned pri) {
+    return (sgxd_recipe_va(r, sec) & 0x80000000u ? 1u << 14 : 0) |
+           (sgxd_recipe_va(r, pri) & 0x80000000u ? 1u << 13 : 0);
+}
+
+static void put(uint8_t *memory, uint32_t offset, const uint32_t *words, unsigned count) {
+    memcpy(memory + offset, words, count * 4);
+}
+
+static void fill(uint8_t *memory, uint32_t offset, uint32_t value, uint32_t bytes) {
+    uint32_t *w = (uint32_t *)(memory + offset);
+    for (uint32_t n = 0; n < bytes / 4; n++) {
+        w[n] = value;
+    }
+}
+
+// The DPM page table's free list: page p links p - 1 and p + 1, 0xffff at both ends.
+static void put_page_list(const SgxdRecipe *r, uint8_t *memory) {
+    uint32_t *pt = (uint32_t *)(memory + r->offset[SGXD_R_PT]);
+    for (uint32_t p = r->first; p <= r->last; p++) {
+        const uint32_t prev = p != r->first ? p - 1 : 0xffff;
+        const uint32_t next = p != r->last ? p + 1 : 0xffff;
+        pt[p] = prev << 16 | next;
+    }
+}
+
+void sgxd_recipe_restage(const SgxdRecipe *r, void *memory_) {
+    uint8_t *memory = memory_;
+    const uint32_t *L = r->offset;
+    put_page_list(r, memory);
+    fill(memory, L[SGXD_R_RGN0], SGXD_RECIPE_SENTINEL, L[SGXD_R_EXTZ] - L[SGXD_R_RGN0]);
+    fill(memory, L[SGXD_R_EXTZ], 0, L[SGXD_R_BGREC] - L[SGXD_R_EXTZ]);
+    if (!r->fb_external) {
+        fill(memory, L[SGXD_R_FB], SGXD_RECIPE_SENTINEL, r->width * r->height * 4);
+        fill(memory, L[SGXD_R_DEPTH], SGXD_RECIPE_SENTINEL, r->width * r->height * 4);
+    }
+}
+
+void sgxd_recipe_write_scene(const SgxdRecipe *r, void *memory_) {
+    uint8_t *memory = memory_;
+    uint32_t *verts = (uint32_t *)(memory + r->offset[SGXD_R_VERTS]);
+    for (unsigned n = 0; n < r->nverts * NV; n++) {
+        verts[n] = fbits(r->verts[n]);
+    }
+    uint32_t *words = (uint32_t *)(memory + r->offset[SGXD_R_INDICES]);
+    for (unsigned n = 0; n < r->nindices; n += 2) {
+        words[n / 2] = r->indices[n] | (n + 1 < r->nindices ? (uint32_t)r->indices[n + 1] << 16 : 0);
+    }
+}
+
+void sgxd_recipe_set_target(SgxdRecipe *r, void *memory_, uint32_t fb_va, uint32_t stride_px) {
+    uint8_t *memory = memory_;
+    r->fb_external = 1;
+    r->pbe[1] = fb_va;
+    r->pbe[2] = (stride_px - 1) >> 1;
+    // The end-of-tile program's LIMMs of words 1 and 2, after its PHAS.
+    uint64_t *eot = (uint64_t *)(memory + r->offset[SGXD_R_CF] + CF_EOT_OFFSET);
+    for (unsigned i = 1; i <= 2; i++) {
+        eot[1 + i] = usse_limm(i, r->pbe[i]) | SKIPINV;
+    }
+}
+
+void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
+    uint8_t *memory = memory_;
+    const uint32_t *L = r->offset;
+    const uint32_t W = r->width, H = r->height;
+    memset(memory, 0, L[SGXD_R_END]);
+    fill(memory, L[SGXD_R_PAGES], SGXD_RECIPE_SENTINEL, r->pages * 0x1000);
+    sgxd_recipe_restage(r, memory);
+
+    Code cv[CV_COUNT], cf[CF_COUNT];
+    Pds pds[SGXD_R_COUNT];
+    make_cv(r, cv);
+    make_cf(r, cf);
+    make_pds(r, cv, cf, pds);
+
+    // Each draw's MTE state packet, and in the VDM control stream its state
+    // copy and index list; then the secondary and the terminate.
+    uint32_t *stream = (uint32_t *)(memory + L[SGXD_R_STREAM]);
+    for (unsigned n = 0; n < r->ndraws; n++) {
+        const SgxdRecipeDraw *d = &r->draws[n];
+        // Every copy program has COPY's shape and units.
+        const uint32_t copy_va = r->base + copy_offset(r, n);
+        const uint32_t clip = d->clip;
+        const uint32_t state[24] = {
+            0xdfff, d->isp, 0, 0x0e000000, d->isp, 0, 0x0e000000, ptr(r, SGXD_R_FSEC),
+            0x08018000u | msbs(r, SGXD_R_FSEC, d->fprim), ptr(r, d->fprim),
+            clip_x(r, clip), clip_y(r, clip),
+            fbits(W / 2.0f), fbits(W / 2.0f), fbits(H / 2.0f), fbits(H / 2.0f), fbits(0.5f),
+            fbits(0.5f), 0, OUTSELECTS, 0x3727c5ac, 0x8000 | d->cull, 0, 0,
+        };
+        put(memory, L[SGXD_R_STATE] + n * 0x60, state, 24);
+        const uint32_t words[8] = {
+            1u << 30 | sgxd_recipe_va(r, copy) >> 4,
+            r->units[copy] << 27 | 1u << 25 | 1u << 17 | (1u + n % 4) << 13 | 1u << 9 | 6,
+            2u << 30 | 0u << 26 | 7u << 22 | d->count, sgxd_recipe_va(r, SGXD_R_INDICES) + 2 * d->first,
+            r->vdm_w2, 0, r->vdm_w4 | ((sgxd_recipe_va(r, SGXD_R_VSPDS) >> 4) & 0x0fffffffu),
+            r->vdm_w5 | 0x100 | r->units[SGXD_R_VSPDS],
+        };
+        memcpy(stream + 8 * n, words, sizeof(words));
+    }
+    const uint32_t end[5] = {
+        1u << 30 | sgxd_recipe_va(r, SGXD_R_VSEC) >> 4, r->units[SGXD_R_VSEC] << 27 | 7u << 13 | 1u << 8,
+        1u << 30 | 1u << 29 | sgxd_recipe_va(r, SGXD_R_TERM) >> 4,
+        r->units[SGXD_R_TERM] << 27 | 1u << 25 | 1u << 17 | 1u << 13 | 1u << 9 | 1,
+        0xc0000000u,
+    };
+    memcpy(stream + 8 * r->ndraws, end, sizeof(end));
+
+    sgxd_recipe_write_scene(r, memory);
+
+    // The background object: its PDS pointers, then (0, 0), (W, 0), (0, H) as (x + 1024) * 16.
+    const uint32_t bg[17] = {
+        ptr(r, SGXD_R_BGSEC), 1u << 27 | 3u << 15 | msbs(r, SGXD_R_BGSEC, SGXD_R_BGPRIM),
+        ptr(r, SGXD_R_BGPRIM), 0, 0, fbits(1.0f), 0, 0, fbits(1.0f), 2, 0,
+        0x4000u << 16 | 0x4000, fbits(1.0f), ((W + 0x400) * 0x10) << 16 | 0x4000, fbits(1.0f),
+        0x4000u << 16 | (H + 0x400) * 0x10, fbits(1.0f),
+    };
+    put(memory, L[SGXD_R_BGREC], bg, 17);
+
+    uint32_t words[64];
+    for (unsigned s = SGXD_R_COPY; s <= SGXD_R_BGPRIM; s++) {
+        put(memory, L[s], words, pds_words(&pds[s], words));
+    }
+    for (unsigned n = 1; n < r->ndraws; n++) {
+        Pds copy;
+        copy_pds(r, cv, n, &copy);
+        put(memory, copy_offset(r, n), words, pds_words(&copy, words));
+    }
+    put(memory, L[SGXD_R_PIXEV], words, make_pixev(cf, words));
+    put(memory, L[SGXD_R_IDLE], words, make_idle(cv, words));
+    for (unsigned n = 0; n < CV_COUNT; n++) {
+        memcpy(memory + L[SGXD_R_CV] + cv[n].offset, cv[n].words, cv[n].count * 8);
+    }
+    for (unsigned n = 0; n < CF_COUNT; n++) {
+        memcpy(memory + L[SGXD_R_CF] + cf[n].offset, cf[n].words, cf[n].count * 8);
+    }
+}
+
+#define SA_BG_FS 0x180u   // CF offset of o0 = sa0
+
+void sgxd_recipe_sa_background(const SgxdRecipe *r, void *memory_, uint32_t colour_offset,
+                               uint32_t colour) {
+    uint8_t *memory = memory_;
+    const uint32_t *L = r->offset;
+    // or o0, sa0, #0 (SKIPINV): the recipe's o0 = pa0 with source bank 3, SA.
+    const uint64_t shader[3] = {PHAS_LAST, 0x50a10009e0000000ull | SKIPINV, NOP_END};
+    memcpy(memory + L[SGXD_R_CF] + SA_BG_FS, shader, sizeof(shader));
+    *(uint32_t *)(memory + colour_offset) = colour;
+    // DS0 pair 0 = DOUTD of one word to AO 0, DS1 pair 0 = DOUTU2 0, DS0 pair 1 = the dummy DOUTU.
+    const uint32_t secondary[11] = {
+        r->base + colour_offset, doutd1(0, 1), 0, 0, doutu0(1, 0, 0), 0, 0, 0,
+        doutd(0), doutu(1, 0), HALT,
+    };
+    put(memory, L[SGXD_R_BGSEC], secondary, 11);
+    uint32_t *bg = (uint32_t *)(memory + L[SGXD_R_BGREC]);
+    bg[0] = 2u << 27 | ((sgxd_recipe_va(r, SGXD_R_BGSEC) >> 4) & 0x07ffffffu);
+    bg[1] = (bg[1] & ~(0x1fu << 17)) | 1u << 17;   // SECATTRSIZE: one 32-dword chunk
+    ((uint32_t *)(memory + L[SGXD_R_BGPRIM]))[4] = doutu0(1, SA_BG_FS >> 3, 0);
+}
+
+// ---------------------------------------------------------------------------- registers
+
+static void op(SgxdOpList *l, uint32_t kind, uint32_t reg, uint32_t value, uint32_t mask,
+               uint32_t timeout_us) {
+    if (l->count >= l->max) {
+        l->overflow = 1;
+        return;
+    }
+    l->ops[l->count++] = (SgxdOp){kind, reg, value, mask, timeout_us};
+}
+static void wr(SgxdOpList *l, uint32_t reg, uint32_t value) { op(l, SGXD_OP_WRITE, reg, value, 0, 0); }
+static void poll(SgxdOpList *l, uint32_t reg, uint32_t mask, uint32_t value, uint32_t timeout_us) {
+    op(l, SGXD_OP_POLL, reg, value, mask, timeout_us);
+}
+
+#define CORE(c, reg) (0x8000u + (c) * 0x4000u + (reg))
+#define SETUP_POLL_US 100000u   // the probe's set-up waits gave 2 s; each completes in µs
+
+void sgxd_recipe_slc(SgxdOpList *l, int inval) {
+    wr(l, 0x4d2c, 0x10);
+    poll(l, 0x4d10, 2, 2, 1000);
+    wr(l, 0x4d14, 2);
+    if (inval) {
+        wr(l, 0x4d28, 1);
+        poll(l, 0x4d10, 1, 1, 1000);
+        wr(l, 0x4d14, 1);
+    }
+}
+
+// Core 0's event program: IDLE, one unit (T0.4; the master's events run it, recipe R1).
+static void idle_event(const SgxdRecipe *r, SgxdOpList *l) {
+    wr(l, CORE(0, 0x0a68), sgxd_recipe_va(r, SGXD_R_IDLE));
+    wr(l, CORE(0, 0x0a6c), 1);
+}
+
+void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
+    // T0.4-T0.8: the code bases, TA_CLK_GATE, the caches, the clocks and DMS_CTRL.
+    wr(l, 0x0a10, sgxd_recipe_va(r, SGXD_R_CF) >> 6 | 1u << 26);
+    wr(l, 0x0a0c, sgxd_recipe_va(r, SGXD_R_CV) >> 6);
+    for (unsigned c = 0; c < 4; c++) {
+        wr(l, CORE(c, 0x0310), 1);
+    }
+    static const uint32_t invalidates[] = {
+        0x0810, 0x0808, 0x0a08, 0x8810, 0x8808, 0x8a08, 0xc810, 0xc808, 0xca08,
+    };
+    for (unsigned n = 0; n < sizeof(invalidates) / 4; n++) {
+        wr(l, invalidates[n], 1);
+    }
+    wr(l, 0x043c, 1);
+    wr(l, 0x0ad0, 1);
+    wr(l, 0x0ad4, 1);
+    wr(l, 0x0ae0, 1);
+    poll(l, 0x0138, 7, 7, SETUP_POLL_US);
+    wr(l, 0x0140, 7);
+    wr(l, 0x0004, 0x0a8a4a6a);
+    wr(l, 0x0a74, 0x0e208200);
+
+    // T1: the requestor bases and the DPM's TA free list.
+    const uint32_t pt = sgxd_recipe_va(r, SGXD_R_PT);
+    const uint32_t t1[][2] = {
+        {0x0c90, r->base}, {0x0cac, r->base}, {0x0cb0, r->base},
+        {0x0618, pt}, {0x061c, r->ta_free_list}, {0x0648, r->ta_alloc}, {0x0638, 0},
+        {0x0620, r->ta_threshold}, {0x0614, r->pds_threshold}, {0x0624, r->pds_threshold},
+        {0x0628, r->global_list}, {0x480c, 0xffffffffu}, {0x0664, 3},
+    };
+    for (unsigned n = 0; n < sizeof(t1) / sizeof(t1[0]); n++) {
+        wr(l, t1[n][0], t1[n][1]);
+    }
+    wr(l, 0x0114, 1);
+    wr(l, 0x0684, 1);
+    poll(l, 0x0118, 1, 1, SETUP_POLL_US);
+    wr(l, 0x0114, 1);
+
+    // T2: TE and MTE, then each core's region array, tail pointer cache and TE_STATE.
+    const uint32_t t2[][2] = {
+        {0x0204, 0}, {0x0208, r->mtile1}, {0x020c, r->mtile2}, {0x0210, r->te_screen},
+        {0x0214, r->stride}, {0x0218, 0x00400000}, {0x023c, 0xa2}, {0x0240, 0x358637bd},
+        {0x0244, 0x358637bd}, {0x0248, r->mte_screen}, {0x0388, 0}, {0x0250, 0x88},
+        {0x0238, sgxd_recipe_va(r, SGXD_R_STREAM)},
+    };
+    for (unsigned n = 0; n < sizeof(t2) / sizeof(t2[0]); n++) {
+        wr(l, t2[n][0], t2[n][1]);
+    }
+    for (unsigned c = 0; c < 4; c++) {
+        wr(l, CORE(c, 0x021c), sgxd_recipe_va(r, SGXD_R_RGN0 + c));
+        wr(l, CORE(c, 0x0220), sgxd_recipe_va(r, SGXD_R_TPC0 + c));
+        wr(l, CORE(c, 0x0274), 0);
+    }
+    idle_event(r, l);
+
+    // T3: the scene reset.
+    if (sgxd_recipe_rgnwait) {
+        for (unsigned c = 1; c < 4; c++) {
+            wr(l, CORE(c, 0x0114), 0x20);
+        }
+    }
+    const uint32_t t3[][2] = {
+        {0x0630, 0}, {0x435c, 1}, {0x4368, 1}, {0x0380, 1}, {0x0630, 8}, {0x0694, 2},
+        {0x0698, 2}, {0x024c, 1},
+    };
+    for (unsigned n = 0; n < sizeof(t3) / sizeof(t3[0]); n++) {
+        wr(l, t3[n][0], t3[n][1]);
+    }
+    poll(l, 0x012c, 0x00100240, 0x00100240, SETUP_POLL_US);
+    wr(l, 0x0134, 0x00100240);
+    // Latches in every core; the probe waited on core 0 (test 03 read cores 1-3 still 0xa0).
+    // rgnwait: every core's, each cleared before the next T3 (diagnostics, runs44).
+    for (unsigned c = 0; c < (sgxd_recipe_rgnwait ? 4u : 1u); c++) {
+        poll(l, CORE(c, 0x0118), 0x20, 0x20, SETUP_POLL_US);
+        wr(l, CORE(c, 0x0114), 0x20);
+    }
+    wr(l, 0x0114, 0x20);
+    poll(l, 0x4360, 1, 1, SETUP_POLL_US);
+    poll(l, 0x436c, 1, 1, SETUP_POLL_US);
+    wr(l, 0x4370, 1);
+
+    // T4: start.
+    wr(l, 0x0750, 0);
+    wr(l, 0x0218, 0x01400000);
+    wr(l, 0x0134, 0x2000);
+    wr(l, 0x4134, 0x2000);
+    for (unsigned c = 0; c < 4; c++) {
+        wr(l, CORE(c, 0x0134), 0x2000);
+    }
+    idle_event(r, l);
+    wr(l, 0x0200, 1);
+}
+
+void sgxd_recipe_ta_wait(SgxdOpList *l, uint32_t timeout_us) {
+    poll(l, CORE(0, 0x012c), 0x2000, 0x2000, timeout_us);
+}
+
+void sgxd_recipe_ta_done(const SgxdRecipe *r, SgxdOpList *l) {
+    (void)r;
+    for (unsigned c = 0; c < 4; c++) {
+        poll(l, CORE(c, 0x0008), 0x00100048, 0, SETUP_POLL_US);
+    }
+    const uint32_t t5[][2] = {
+        {0x4320, 1}, {0x4320, 0}, {0x0320, 1}, {0x0320, 0}, {0x0134, 0x2000}, {0x4134, 0x2000},
+        {0x4800, 0x1fff}, {0x0224, 0x40000000},
+    };
+    for (unsigned n = 0; n < sizeof(t5) / sizeof(t5[0]); n++) {
+        wr(l, t5[n][0], t5[n][1]);
+    }
+    poll(l, 0x012c, 0x400, 0x400, SETUP_POLL_US);
+    wr(l, 0x0080, 0x40);
+    wr(l, 0x0080, 0);
+    wr(l, 0x0134, 0x400);
+    wr(l, 0x0004, 0x0a8a8aaa);
+    sgxd_recipe_slc(l, 1);
+}
+
+void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
+    // D1: the DPM's 3D free list, no deallocation, no partial render.
+    wr(l, 0x0630, 8);
+    wr(l, 0x0600, sgxd_recipe_va(r, SGXD_R_PT));
+    wr(l, 0x0604, r->ta_free_list);
+    wr(l, 0x064c, r->ta_alloc);
+    wr(l, 0x0660, 0);
+    wr(l, 0x0664, 5);
+    wr(l, 0x0114, 2);
+    wr(l, 0x0680, 1);
+    poll(l, 0x0118, 2, 2, SETUP_POLL_US);
+    wr(l, 0x0114, 2);
+    wr(l, 0x063c, 0);
+    wr(l, 0x0658, 0);
+    wr(l, 0x0004, 0x0a8a4a6a);
+
+    // Sony's pre-kick invalidate, bank 0: it reaches all four cores' code caches.
+    wr(l, 0x0114, 0x80);
+    wr(l, 0x0134, 0x04000000);
+    wr(l, 0x0810, 1);
+    wr(l, 0x0808, 1);
+    wr(l, 0x0a08, 1);
+    poll(l, 0x0118, 0x80, 0x80, SETUP_POLL_US);
+    poll(l, 0x012c, 0x04000000, 0x04000000, SETUP_POLL_US);
+    wr(l, 0x0114, 0x80);
+    wr(l, 0x0134, 0x04000000);
+
+    // D2: ISP, PBE and the pixel event.
+    const uint32_t d2[][2] = {
+        {0x04c0, 0}, {0x040c, 0}, {0x0410, 0}, {0x0400, 0x80}, {0x0404, 0},
+        {0x0408, sgxd_recipe_va(r, SGXD_R_RGN0)}, {0x4510, sgxd_recipe_va(r, SGXD_R_RGN1)},
+        {0x4514, sgxd_recipe_va(r, SGXD_R_RGN2)}, {0x4518, sgxd_recipe_va(r, SGXD_R_RGN3)},
+        {0x451c, r->rgn_size}, {0x0414, 0}, {0x0418, 1}, {0x041c, 0x1e3ce508},
+        {0x0420, 0x1e3ce508}, {0x050c, sgxd_recipe_va(r, SGXD_R_EXTZ)}, {0x0424, 0xe9},
+        {0x042c, 0}, {0x044c, 0}, {0x0480, 0}, {0x0484, 0}, {0x0488, 0}, {0x048c, 0},
+        {0x0490, 0}, {0x04b8, 0x3f800000}, {0x04bc, 0x300}, {0x04c4, r->bgobjtag},
+        {0x04c8, 0x88}, {0x04cc, 0x188}, {0x04dc, 8}, {0x0520, r->mtile1},
+        {0x0524, r->mtile2}, {0x0528, r->stride}, {0x0148, 0},
+        {0x0a5c, sgxd_recipe_va(r, SGXD_R_PIXEV)}, {0x0a60, 3}, {0x0a64, 0x4000}, {0x0ae8, 0},
+    };
+    for (unsigned n = 0; n < sizeof(d2) / sizeof(d2[0]); n++) {
+        wr(l, d2[n][0], d2[n][1]);
+    }
+    wr(l, 0x0140, 5);
+    wr(l, 0x043c, 1);
+    wr(l, 0x0ad4, 1);
+    wr(l, 0x0ae0, 1);
+    poll(l, 0x0138, 5, 5, SETUP_POLL_US);
+    wr(l, 0x0140, 5);
+
+    wr(l, 0x0134, 0x00040001);
+    wr(l, 0x4134, 0x00040001);
+    for (unsigned c = 0; c < 4; c++) {
+        wr(l, CORE(c, 0x0134), 0x00040001);
+    }
+    idle_event(r, l);
+    wr(l, 0x0428, 1);
+}
+
+void sgxd_recipe_3d_wait(SgxdOpList *l, uint32_t timeout_us) {
+    poll(l, CORE(0, 0x012c), 0x40000, 0x40000, timeout_us);
+}
+
+void sgxd_recipe_3d_done(const SgxdRecipe *r, SgxdOpList *l) {
+    (void)r;
+    for (unsigned c = 0; c < 4; c++) {
+        poll(l, CORE(c, 0x0008), 0x186, 0, SETUP_POLL_US);
+    }
+    wr(l, 0x0134, 0x00040001);
+    wr(l, 0x4134, 0x00040001);
+    for (unsigned c = 0; c < 4; c++) {
+        wr(l, CORE(c, 0x0134), 0x00040001);
+    }
+    wr(l, 0x0004, 0x0a8a8aaa);
+    sgxd_recipe_slc(l, 1);
+}
