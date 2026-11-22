@@ -50,11 +50,18 @@ uint32_t sgxd_program_doutu0(unsigned cb, uint32_t code_offset, unsigned temps);
 // more fetches or strides than it takes, or a stride of 64 KiB or more.
 int sgxd_program_vertex_pds(const SgxdVertexFetch *fetch, unsigned count, uint32_t doutu0,
                             int per_instance, SgxdPdsProgram *out);
+// The same, with address_at[i] the index in out->words of fetch i's address: the program for
+// other addresses is these words with those changed.
+int sgxd_program_vertex_pds_at(const SgxdVertexFetch *fetch, unsigned count, uint32_t doutu0,
+                               int per_instance, SgxdPdsProgram *out, unsigned *address_at);
 
 // A secondary: sa_words words from sa_address into sa0 (none for 0), then the USSE program of
 // doutu0 (a dummy, or the program's secondary). -1 for more than 256 words.
 int sgxd_program_secondary_pds(uint32_t sa_address, unsigned sa_words, uint32_t doutu0,
                                SgxdPdsProgram *out);
+// The same, with *address_at the index in out->words of sa_address (with sa_words nonzero).
+int sgxd_program_secondary_pds_at(uint32_t sa_address, unsigned sa_words, uint32_t doutu0,
+                                  SgxdPdsProgram *out, unsigned *address_at);
 
 // The pixel primary: DOUTU with SDSOFT (and ITERATORSDEPENDENCY with iterators), then one DOUTI
 // per iterator in order, which fills the PAs from pa0: iterator[i] is the GXP varying

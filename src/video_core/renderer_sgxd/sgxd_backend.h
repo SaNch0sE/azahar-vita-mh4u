@@ -80,10 +80,24 @@ public:
     /// DOUTU0 EXE field's instruction index from the code base, and the temps in fours.
     u32 PlaceCodePhased(unsigned cb, std::vector<u64> words, std::span<const u32> phase_starts,
                         u32 temps);
-    /// A PDS program's GPU address, the same for the same words while it lasts: fixed, for
-    /// good (a program whose address is kept); otherwise until the flipping half it is in is
-    /// reused, at a pass start (OpenPass).
-    u32 PlacePds(const SgxdPdsProgram& program, bool fixed = false);
+    /// A per-draw PDS program placed in the flipping half (until that half is reused, at a pass
+    /// start: OpenPass), found by its generator's inputs: built only when no program with the
+    /// same inputs is placed there yet. Each takes sgxd_program's generator's arguments.
+    struct PdsRef {
+        u32 va;
+        u32 units;
+    };
+    /// fresh: a fetch reads pass data allocated for this draw, so no program placed before has
+    /// these addresses (the geometry draws' stages): no lookup by them.
+    PdsRef VertexPds(const SgxdVertexFetch* fetch, u32 count, u32 doutu0, bool per_instance,
+                     bool fresh = false);
+    /// sa_address: pass data allocated for the draw (never looked up), or with sa_words 0 any.
+    PdsRef SecondaryPds(u32 sa_address, u32 sa_words, u32 doutu0);
+    PdsRef BlitPixelPds(u32 doutu0, const u32 tex[4]);
+    PdsRef ScreenPixelPds(u32 doutu0, const u32 tex[4]);
+    PdsRef MergePixelPds(u32 doutu0, const u32 tex0[4], const u32 tex1[4]);
+    /// sgxd_program_pixel_pds: a PICA fragment program's iterators, no texture reads issued.
+    PdsRef PixelPds(u32 doutu0, const u32* iterators, const u32* words, u32 count);
 
     struct Data {
         u8* cpu;
@@ -612,7 +626,8 @@ private:
     };
     std::vector<PlacedCode> placed_code;
     u32 pds_begin{}, pds_used{}, pds_end{};
-    u32 pds_fixed_used{}, pds_half{};
+    u32 pds_half{};
+    u32 pds_window{}; ///< the GPU window the current half's programs are placed under
     u64 pds_flips{};
     /// Each half's last reader: FenceAll when the arena flipped away from it (its programs
     /// are not reused after that).
@@ -676,6 +691,18 @@ private:
     void WriteCode();
 #endif
     std::unordered_map<std::string, u32> pds_by_words, pds_fixed_by_words;
+    /// A vertex or secondary PDS program as its generator built it once, and where its addresses
+    /// are in its words: the program for the same inputs at other addresses is these words with
+    /// those changed. Kept for good; the flips do not touch them.
+    struct PdsTemplate {
+        SgxdPdsProgram program;
+        std::array<unsigned, SGXD_PROGRAM_MAX_FETCH> at;
+    };
+    std::deque<PdsTemplate> pds_templates;
+    PdsIndex pds_shapes{256};
+    /// The template for a key without addresses, built by `build` on a miss; null if it fails.
+    template <typename Build>
+    PdsTemplate* TemplatePds(const u32* key, u32 words, Build&& build);
 
     bool in_pass{};
     std::vector<SgxdRecipeDraw> draws;

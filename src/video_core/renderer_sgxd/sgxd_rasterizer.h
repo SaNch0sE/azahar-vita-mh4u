@@ -289,6 +289,8 @@ private:
         Epilogue epilogue; ///< what its code ends with
         u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
         bool tier2_queued; ///< sent to the second tier (or never to be)
+        mutable u32 pixel_size = 0;
+        mutable u32 pixel_size_sa = ~0u;
     };
     /// Draws after which a program is emitted again with the optimising passes.
     static constexpr u32 Tier2Draws = 100;
@@ -331,6 +333,7 @@ private:
         u32 vertex_min{}; // the PICA vertices it reads
         u32 vertex_max{};
         const Pica::ShaderSetup* setup{}; // the unit whose uniforms the program reads
+        bool fresh{}; // a fetch reads pass data allocated for the draw (SgxdBackend::VertexPds)
     };
     /// The loaders' attributes into the PICA's vertex program. With StoreOutputs the fetch covers
     /// vertex_min to vertex_max densely and the caller adds the stores and the index list.
@@ -418,6 +421,9 @@ private:
                                              const Describe& describe);
     /// The vertex program that draws a geometry program's stored triangles: input k is output k.
     const VertexProgram& PassthroughProgramFor(u32 outputs);
+    const VertexProgram& PassthroughProgramLookup(u32 outputs, u32 output_mask);
+    const VertexProgram* last_passthrough = nullptr;
+    std::array<u32, 9> last_passthrough_regs{};
     const FragmentProgram& FragmentProgramFor(const Epilogue& epilogue);
     /// The program placed for sgxd: its code (with the blend's tail), secondary and PDS.
     FragmentProgram PlaceFragmentProgram(Usse::GxpProgram gxp, const Epilogue& epilogue,
@@ -481,6 +487,35 @@ private:
     SgxdBackend::Data noise_table{};
     u32 NoiseTable();
     std::unordered_map<u64, VertexProgram> vertex_programs;
+    /**
+     * VertexStageFor's decoded vertex formats, by the raw registers that describe one: the
+     * attribute formats, each loader's component list, stride and component count, the VS
+     * input count and input map (VertexLayoutKey). Not the addresses: the base and the
+     * loaders' offsets change mesh by mesh and are added per draw. Most recently used first.
+     * Each also keeps the vertex program it resolved to, by the program's own inputs
+     * (VertexProgramKey), once that program has drawn the draws before its second tier.
+     */
+    struct VertexLayout {
+        static constexpr u32 ProgramKeyWords = 4 + 4 + 7 + 2;
+        struct Attribute {
+            u8 reg, loader;
+            u32 offset; ///< from the loader's start of a vertex
+            u32 stride, words;
+        };
+        std::array<u32, KeyWords> key{};
+        std::array<Attribute, 16> attributes{};
+        u32 count = 0;
+        u16 enabled_regs = 0, u8_regs = 0, s8_regs = 0, s16_regs = 0;
+        std::array<u8, 16> reg_components{};
+        std::array<u32, ProgramKeyWords> program_key{};
+        const VertexProgram* program = nullptr;
+    };
+    std::array<VertexLayout, 8> vertex_layouts{};
+    u32 vertex_layout_count = 0;
+    /// The open draw's vertex format, decoded or found, at vertex_layouts[0].
+    VertexLayout& VertexLayoutFor();
+    /// The raw words VertexProgramFor's program depends on past the layout.
+    std::array<u32, VertexLayout::ProgramKeyWords> VertexProgramKey(Usse::VsMode mode);
     std::unordered_map<u64, u16> used_bools;
     std::unordered_map<u64, FragmentProgram> fragment_programs;
     std::optional<std::pair<u32, u32>> scanned_indices;
@@ -541,6 +576,9 @@ private:
     std::array<u32, 16> gs_last_rows{};
     /// The rows KeepGsRows copied out of a room a pass took, a 16-byte row a register.
     SgxdBackend::Data gs_kept_rows{};
+    /// Draw's fragment SA image and its memory buffer, made here and copied out whole.
+    std::vector<u32> fsa_scratch;
+    std::vector<u32> fbuf_scratch;
     u16 gs_rows_kept = 0;
     /// The geometry draw's outputs, triangles and tables are past a pass's data and take memory of
     /// their own, given back as the pass is sent.

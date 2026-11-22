@@ -13,9 +13,11 @@ namespace GxmRenderer {
  * answers false to every one of them and reads no file.
  *
  * Measuring:
- *   perflog   log a second's `perf:` lines: speed and frame rates, the presents, the command
- *             lists, fills and transfers, the cache operations by site, the FCRAM pages moved
- *             to CDRAM
+ *   perflog   log a second's `perf:` lines: speed and frame rates, the native core's slices
+ *             (guest time, how they ended, the svcs answered in the guest and the ones that
+ *             left it), the presents, the command lists, fills and transfers, the cache
+ *             operations by site, the FCRAM pages moved to CDRAM, the textures' untiles; each
+ *             PDS arena flip
   *   parallel  emulated core 1 on a second emulation thread on Vita core 1, at the same time as
  *             core 0.
  *             Multicore builds only (ENABLE_VITA_MULTICORE); elsewhere it does nothing

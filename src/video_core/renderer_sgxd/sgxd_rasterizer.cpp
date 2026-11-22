@@ -2342,6 +2342,23 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramFor(u32 outputs) {
     // mov o<reg>, v<k> for the k-th register of the output mask, then end.
     const u32 output_mask = regs.gs.output_mask;
+    // The registers the program follows from: unchanged since the last draw, the same program.
+    std::array<u32, 9> from;
+    from[0] = output_mask;
+    from[1] = regs.rasterizer.vs_output_total;
+    for (u32 i = 0; i < 7; i++) {
+        from[2 + i] = regs.rasterizer.vs_output_attributes[i].raw;
+    }
+    if (last_passthrough != nullptr && from == last_passthrough_regs) {
+        return *last_passthrough;
+    }
+    last_passthrough_regs = from;
+    last_passthrough = &PassthroughProgramLookup(outputs, output_mask);
+    return *last_passthrough;
+}
+
+const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u32 outputs,
+                                                                            u32 output_mask) {
     const Pica::Shader::Generator::PicaFixedGSConfig gs_config{regs};
     const auto maps = gs_config.state.GetSemanticMaps();
     u64 key = Common::HashCombine(0x6770617373ull /* "gpass" */, output_mask);
@@ -2566,6 +2583,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
                                       [](const auto& a) { return a.name == "vs_out_address"; });
         DEBUG_ASSERT(out != ag.attributes.end() && a0.fetch_count < a0.fetch.size());
         a0.fetch[a0.fetch_count++] = {a0_table.gpu, 4, 1, out->resource};
+        a0.fresh = true;
         a0.indices = a0_indices.gpu;
         a0.count = a0_count;
         u32 vsec_sa = 0;
@@ -2691,6 +2709,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         a1.vp = &gp;
         a1.fetch[0] = {gs_table.gpu, words * 4, words, in->resource};
         a1.fetch_count = 1;
+        a1.fresh = true; // the table or the serial entries
         a1.count = Common::AlignUp(n, 3u);
         const SgxdBackend::Data a1_indices = backend.AllocData(a1.count * 2, 4);
         u16* const list = reinterpret_cast<u16*>(a1_indices.cpu);
@@ -2842,6 +2861,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     const SgxdBackend::Data b_indices = backend.AllocData(static_cast<u32>(list.size()) * 2, 4);
     std::memcpy(b_indices.cpu, list.data(), list.size() * 2);
     b.vp = &pp;
+    b.fresh = true; // the stored triangles
     b.indices = b_indices.gpu;
     b.count = static_cast<u32>(list.size());
     b.setup = &pica.vs_setup;
@@ -3130,7 +3150,7 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
     [[maybe_unused]] const int fprim = sgxd_program_pixel_pds(
         doutu0, iterators.data(), words.data(), static_cast<unsigned>(g.inputs.size()), &pds);
     DEBUG_ASSERT(fprim == 0);
-    f.fprim = backend.PlacePds(pds, true); // kept with the program
+    f.fprim = backend.PlaceFixedPds(pds); // kept with the program
     f.fprim_units = pds.units;
     // The pack reads pa0 and pa1 (four F16), the iterators write from pa0.
     // The split blend's scratch: pa1 and pa2.
@@ -3480,6 +3500,119 @@ bool RasterizerSgxd::AccelerateDrawBatch(bool is_indexed) {
     return drawn;
 }
 
+RasterizerSgxd::VertexLayout& RasterizerSgxd::VertexLayoutFor() {
+    const auto& va = regs.pipeline.vertex_attributes;
+    const auto& reg_array = regs.reg_array;
+    // The format words: the attribute formats after the base, each loader's words 1 and 2 (its
+    // word 0 is the offset), the VS input count and input map.
+    constexpr u32 Va = PICA_REG_INDEX(pipeline.vertex_attributes);
+    std::array<u32, VertexLayout::KeyWords> key;
+    key[0] = reg_array[Va + 1];
+    key[1] = reg_array[Va + 2];
+    for (u32 l = 0; l < 12; l++) {
+        key[2 + 2 * l] = reg_array[Va + 3 + 3 * l + 1];
+        key[3 + 2 * l] = reg_array[Va + 3 + 3 * l + 2];
+    }
+    key[26] = reg_array[PICA_REG_INDEX(vs.input_buffer_config)];
+    key[27] = reg_array[PICA_REG_INDEX(vs.input_attribute_to_register_map_low)];
+    key[28] = reg_array[PICA_REG_INDEX(vs.input_attribute_to_register_map_high)];
+    for (u32 i = 0; i < vertex_layout_count; i++) {
+        if (vertex_layouts[i].key == key) {
+            // To the front, the others in their order behind it.
+            std::rotate(vertex_layouts.begin(), vertex_layouts.begin() + i,
+                        vertex_layouts.begin() + i + 1);
+            return vertex_layouts[0];
+        }
+    }
+    // New: the least recently used goes.
+    vertex_layout_count = std::min<u32>(vertex_layout_count + 1, vertex_layouts.size());
+    std::rotate(vertex_layouts.begin(), vertex_layouts.begin() + vertex_layout_count - 1,
+                vertex_layouts.begin() + vertex_layout_count);
+    VertexLayout& layout = vertex_layouts[0];
+    layout = VertexLayout{};
+    layout.key = key;
+    for (u32 loader_index = 0; loader_index < 12; loader_index++) {
+        const auto& loader = va.attribute_loaders[loader_index];
+        if (loader.component_count == 0 || loader.byte_count == 0) {
+            continue;
+        }
+        u32 offset = 0;
+        for (u32 comp = 0; comp < loader.component_count && comp < 12; ++comp) {
+            const u32 attribute_index = loader.GetComponent(comp);
+            if (attribute_index >= 12) {
+                // Attribute ids 12, 13, 14 and 15 signify 4, 8, 12 and 16-byte paddings.
+                offset = Common::AlignUp(offset, 4);
+                offset += (attribute_index - 11) * 4;
+                continue;
+            }
+            const u32 elements = va.GetNumElements(attribute_index);
+            if (elements == 0) {
+                continue;
+            }
+            offset = Common::AlignUp(offset, va.GetElementSizeInBytes(attribute_index));
+            using AttributeFormat = Pica::PipelineRegs::VertexAttributeFormat;
+            const auto format = va.GetFormat(attribute_index);
+            // Integer attributes are unpacked by the program: fetched as the words they start. The DMA reads
+            // from any byte address at any stride.
+            const bool is_s8 = format == AttributeFormat::BYTE;
+            const bool is_s16 = format == AttributeFormat::SHORT;
+            const bool is_u8 = format == AttributeFormat::UBYTE || is_s8 || is_s16;
+            const u32 reg = regs.vs.GetRegisterForAttribute(attribute_index);
+            const VertexLayout::Attribute attribute{
+                static_cast<u8>(reg), static_cast<u8>(loader_index), offset,
+                static_cast<u32>(loader.byte_count),
+                is_s16 ? (elements + 1) / 2 : is_u8 ? 1u : elements};
+            const auto mark = [reg](u16& mask, bool on) {
+                mask = static_cast<u16>(on ? mask | 1u << reg : mask & ~(1u << reg));
+            };
+            mark(layout.u8_regs, is_u8);
+            mark(layout.s8_regs, is_s8);
+            mark(layout.s16_regs, is_s16);
+            // Two loaders feeding one register is a guest bug; the last wins, as in GL.
+            const auto same =
+                std::find_if(layout.attributes.begin(), layout.attributes.begin() + layout.count,
+                             [&](const VertexLayout::Attribute& a) { return a.reg == reg; });
+            if (same != layout.attributes.begin() + layout.count) {
+                *same = attribute;
+            } else {
+                layout.attributes[layout.count++] = attribute;
+            }
+            layout.enabled_regs |= static_cast<u16>(1u << reg);
+            layout.reg_components[reg] = static_cast<u8>(elements);
+            offset += va.GetStride(attribute_index);
+        }
+    }
+    return layout;
+}
+
+std::array<u32, RasterizerSgxd::VertexLayout::ProgramKeyWords> RasterizerSgxd::VertexProgramKey(
+    Usse::VsMode mode) {
+    // What PicaVSConfig and VertexProgramFor read past the layout: the code and swizzles (hashed only
+    // when they change), the entry, lighting, the output mask and attributes, the mode and the bools.
+    const auto& reg_array = regs.reg_array;
+    const u64 code = pica.vs_setup.GetProgramCodeHash();
+    const u64 swizzles = pica.vs_setup.GetSwizzleDataHash();
+    std::array<u32, VertexLayout::ProgramKeyWords> key;
+    key[0] = static_cast<u32>(code);
+    key[1] = static_cast<u32>(code >> 32);
+    key[2] = static_cast<u32>(swizzles);
+    key[3] = static_cast<u32>(swizzles >> 32);
+    key[4] = reg_array[PICA_REG_INDEX(vs.main_offset)];
+    key[5] = reg_array[PICA_REG_INDEX(lighting.disable)];
+    key[6] = reg_array[PICA_REG_INDEX(vs.output_mask)];
+    key[7] = reg_array[PICA_REG_INDEX(rasterizer.vs_output_total)];
+    for (u32 n = 0; n < 7; n++) {
+        key[8 + n] = reg_array[PICA_REG_INDEX(rasterizer.vs_output_attributes) + n];
+    }
+    u32 bools = 0;
+    for (u32 n = 0; n < 16; n++) {
+        bools |= (pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n;
+    }
+    key[15] = static_cast<u32>(mode);
+    key[16] = bools;
+    return key;
+}
+
 RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, const float* immediate,
                                                          u32 count, Usse::VsMode mode,
                                                          const Describe& describe) {
@@ -3510,62 +3643,41 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
             reg_components[reg] = 4;
         }
     }
-    for (u32 loader_index = 0; loader_index < 12 && !immediate; loader_index++) {
-        const auto& loader = va.attribute_loaders[loader_index];
-        if (loader.component_count == 0 || loader.byte_count == 0) {
-            continue;
+    // The format decoded once (VertexLayoutFor); the addresses added mesh by mesh.
+    VertexLayout* layout = nullptr;
+    if (!immediate) {
+        layout = &VertexLayoutFor();
+        for (u32 n = 0; n < layout->count; n++) {
+            const VertexLayout::Attribute& a = layout->attributes[n];
+            feeds[feed_count++] = {a.reg, base + va.attribute_loaders[a.loader].data_offset + a.offset,
+                                   a.stride, a.words};
         }
-        u32 offset = 0;
-        for (u32 comp = 0; comp < loader.component_count && comp < 12; ++comp) {
-            const u32 attribute_index = loader.GetComponent(comp);
-            if (attribute_index >= 12) {
-                // Attribute ids 12, 13, 14 and 15 signify 4, 8, 12 and 16-byte paddings.
-                offset = Common::AlignUp(offset, 4);
-                offset += (attribute_index - 11) * 4;
-                continue;
-            }
-            const u32 elements = va.GetNumElements(attribute_index);
-            if (elements == 0) {
-                continue;
-            }
-            offset = Common::AlignUp(offset, va.GetElementSizeInBytes(attribute_index));
-            using AttributeFormat = Pica::PipelineRegs::VertexAttributeFormat;
-            const auto format = va.GetFormat(attribute_index);
-            // Integer attributes are unpacked by the program (UnpackInt): fetched as the words
-            // they start, one for bytes, one or two for shorts. The DMA reads from any byte
-            // address at any stride.
-            const bool is_s8 = format == AttributeFormat::BYTE;
-            const bool is_s16 = format == AttributeFormat::SHORT;
-            const bool is_u8 = format == AttributeFormat::UBYTE || is_s8 || is_s16;
-            const u32 reg = regs.vs.GetRegisterForAttribute(attribute_index);
-            const PAddr address = base + loader.data_offset + offset;
-            const u32 stride = loader.byte_count;
-            // Two loaders feeding one register is a guest bug; the last wins, as in GL.
-            const auto same = std::find_if(feeds.begin(), feeds.begin() + feed_count,
-                                           [&](const Feed& f) { return f.reg == reg; });
-            const Feed feed{reg, address, stride,
-                            is_s16 ? (elements + 1) / 2 : is_u8 ? 1u : elements};
-            const auto mark = [reg](u16& mask, bool on) {
-                mask = static_cast<u16>(on ? mask | 1u << reg : mask & ~(1u << reg));
-            };
-            mark(u8_regs, is_u8);
-            mark(s8_regs, is_s8);
-            mark(s16_regs, is_s16);
-            if (same != feeds.begin() + feed_count) {
-                *same = feed;
-            } else {
-                feeds[feed_count++] = feed;
-            }
-            enabled_regs |= static_cast<u16>(1u << reg);
-            reg_components[reg] = static_cast<u8>(elements);
-            offset += va.GetStride(attribute_index);
-        }
+        enabled_regs = layout->enabled_regs;
+        u8_regs = layout->u8_regs;
+        s8_regs = layout->s8_regs;
+        s16_regs = layout->s16_regs;
+        reg_components = layout->reg_components;
     }
     // Every register no loader feeds is a uniform: the fixed default attribute where the guest set
     // one, (0, 0, 0, 1) otherwise.
     const u16 default_regs = static_cast<u16>(~enabled_regs);
-    const VertexProgram& vp =
-        VertexProgramFor(default_regs, reg_components, u8_regs, s8_regs, s16_regs, mode);
+    // The program the layout resolved to last, while its other inputs are the same.
+    const VertexProgram* program = nullptr;
+    std::array<u32, VertexLayout::ProgramKeyWords> program_key{};
+    if (layout) {
+        program_key = VertexProgramKey(mode);
+        if (layout->program && layout->program->tier2_queued && layout->program_key == program_key) {
+            program = layout->program;
+        }
+    }
+    if (!program) {
+        program = &VertexProgramFor(default_regs, reg_components, u8_regs, s8_regs, s16_regs, mode);
+        if (layout) {
+            layout->program_key = program_key;
+            layout->program = program;
+        }
+    }
+    const VertexProgram& vp = *program;
     const Usse::GxpProgram& vg = vp.gxp;
 
     // --- the index list ---
@@ -3812,19 +3924,16 @@ void RasterizerSgxd::VertexPrograms(const VertexStage& stage, const SgxdBackend:
                                    const Describe& describe) {
     const VertexProgram& vp = *stage.vp;
     const Usse::GxpProgram& vg = vp.gxp;
-    SgxdPdsProgram pds{};
-    [[maybe_unused]] const int vspds =
-        sgxd_program_vertex_pds(stage.fetch.data(), stage.fetch_count, vp.primary_doutu0,
-                                vg.per_instance ? 1 : 0, &pds);
-    DEBUG_ASSERT_MSG(vspds == 0, "GXM: {}: {} attributes the vertex PDS does not take", describe(),
-                     stage.fetch_count);
-    p.vspds = backend.PlacePds(pds);
-    p.vspds_units = pds.units;
-    [[maybe_unused]] const int vsec =
-        sgxd_program_secondary_pds(vsa.gpu, vsec_sa, vp.secondary_doutu0, &pds);
-    DEBUG_ASSERT(vsec == 0);
-    p.vsec = backend.PlacePds(pds);
-    p.vsec_units = pds.units;
+    const auto vspds = backend.VertexPds(stage.fetch.data(), stage.fetch_count,
+                                         vp.primary_doutu0, vg.per_instance, stage.fresh);
+    DEBUG_ASSERT_MSG(vspds.va != 0, "sgxd: {}: {} attributes the vertex PDS does not take",
+                     describe(), stage.fetch_count);
+    p.vspds = vspds.va;
+    p.vspds_units = vspds.units;
+    const auto vsec = backend.SecondaryPds(vsa.gpu, vsec_sa, vp.secondary_doutu0);
+    DEBUG_ASSERT(vsec.va != 0);
+    p.vsec = vsec.va;
+    p.vsec_units = vsec.units;
     p.vsec_sa = vsec_sa;
     sgxd_program_vertex_dms(vg.pa_count, vg.temp_count, vsec_sa, vg.vertex_outputs1 >> 24,
                             &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
@@ -5050,20 +5159,26 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     SgxdBackend::Data fsa{};
     if (fsa_words != 0) {
         fsa = backend.AllocData(fsa_words * 4);
-        std::memset(fsa.cpu, 0, fsa_words * 4);
-        float* const fsa_f = reinterpret_cast<float*>(fsa.cpu);
+        // Made in cached memory and copied out once, as VertexSa's image: the pass data is
+        // uncached, and the clear, the scattered stores and the normalisation's reads went to
+        // it.
+        fsa_scratch.assign(fsa_words, 0);
+        u8* const fsa_cpu = reinterpret_cast<u8*>(fsa_scratch.data());
+        float* const fsa_f = reinterpret_cast<float*>(fsa_cpu);
         SgxdBackend::Data fbuf{};
+        u8* fbuf_cpu = nullptr;
         if (fg.buffer_pointer) {
             fbuf = backend.AllocData(fg.buffer_floats * 4);
-            std::memset(fbuf.cpu, 0, fg.buffer_floats * 4);
+            fbuf_scratch.assign(fg.buffer_floats, 0);
+            fbuf_cpu = reinterpret_cast<u8*>(fbuf_scratch.data());
             const u32 pointer = fbuf.gpu + static_cast<u32>(fg.ldst_base_value);
-            std::memcpy(fsa.cpu + fg.uniform_floats * 4, &pointer, 4);
+            std::memcpy(fsa_cpu + fg.uniform_floats * 4, &pointer, 4);
         }
         const u8* const fs_bytes = reinterpret_cast<const u8*>(&fs_data);
         for (const UniformSource& u : fp.uniforms) {
             const u8* src = fs_bytes + u.offset;
             float* dst = u.sa < fg.uniform_floats ? fsa_f + u.sa
-                                                  : reinterpret_cast<float*>(fbuf.cpu) + u.sa;
+                                                  : reinterpret_cast<float*>(fbuf_cpu) + u.sa;
             for (u32 e = 0; e < u.count; e++, src += u.stride, dst += 4) {
                 for (u32 c = 0; c < u.components; c++) {
                     if (u.is_int) {
@@ -5123,6 +5238,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                       4,
                         words, sizeof(words));
         }
+        std::memcpy(fsa.cpu, fsa_cpu, fsa_words * 4);
+        if (fbuf_cpu != nullptr) {
+            std::memcpy(fbuf.cpu, fbuf_cpu, fg.buffer_floats * 4);
+        }
     }
 
     // --- the PDS programs ---
@@ -5142,7 +5261,11 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     p.fprim_units = fp.fprim_units;
     sgxd_program_vertex_dms(vg.pa_count, vg.temp_count, vsec_sa, vg.vertex_outputs1 >> 24,
                             &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
-    p.pixel_size = sgxd_program_pixel_dms(fp.pixel_pa, fg.temp_count, fsa_words);
+    if (fp.pixel_size_sa != fsa_words) {
+        fp.pixel_size = sgxd_program_pixel_dms(fp.pixel_pa, fg.temp_count, fsa_words);
+        fp.pixel_size_sa = fsa_words;
+    }
+    p.pixel_size = fp.pixel_size;
     p.outselects = vg.vertex_outputs1;
     p.texsize = vg.vertex_outputs2;
     // The target is the buffer transposed (SgxdBackend::PicaTarget): the vertex program

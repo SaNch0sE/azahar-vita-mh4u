@@ -35,6 +35,11 @@ uint32_t sgxd_program_doutu0(unsigned cb, uint32_t code_offset, unsigned temps) 
 
 int sgxd_program_vertex_pds(const SgxdVertexFetch *fetch, unsigned count, uint32_t kick0,
                             int per_instance, SgxdPdsProgram *out) {
+    return sgxd_program_vertex_pds_at(fetch, count, kick0, per_instance, out, NULL);
+}
+
+int sgxd_program_vertex_pds_at(const SgxdVertexFetch *fetch, unsigned count, uint32_t kick0,
+                               int per_instance, SgxdPdsProgram *out, unsigned *address_at) {
     uint16_t strides[SGXD_PROGRAM_MAX_STRIDES + 1] = {0};
     unsigned stride_of[SGXD_PROGRAM_MAX_FETCH], nstrides = 0;
     if (count > SGXD_PROGRAM_MAX_FETCH) {
@@ -67,6 +72,9 @@ int sgxd_program_vertex_pds(const SgxdVertexFetch *fetch, unsigned count, uint32
     unsigned pairs[SGXD_PROGRAM_MAX_FETCH];
     for (unsigned i = 0; i < count; i++) {
         pairs[i] = pds_pair(&p, 0, fetch[i].address, doutd1(fetch[i].pa, fetch[i].words));
+        if (address_at) {
+            address_at[i] = pairs[i] * 4;   // DS0's pair n: the first word of data unit n
+        }
     }
     const unsigned kick = pds_pair(&p, 0, kick0, per_instance ? DOUTU1_PERINSTANCE : 0);
     // The MUL's second source counts 16-bit halves of DS1: word 0's two, then word 2's on.
@@ -84,12 +92,20 @@ int sgxd_program_vertex_pds(const SgxdVertexFetch *fetch, unsigned count, uint32
 
 int sgxd_program_secondary_pds(uint32_t sa_address, unsigned sa_words, uint32_t kick0,
                                SgxdPdsProgram *out) {
+    return sgxd_program_secondary_pds_at(sa_address, sa_words, kick0, out, NULL);
+}
+
+int sgxd_program_secondary_pds_at(uint32_t sa_address, unsigned sa_words, uint32_t kick0,
+                                  SgxdPdsProgram *out, unsigned *address_at) {
     if (sa_words > 256) {
         return -1;
     }
     Pds p;
     memset(&p, 0, sizeof(p));
     const unsigned dma = sa_words ? pds_pair(&p, 0, sa_address, doutd1(0, sa_words)) : 0;
+    if (address_at) {
+        *address_at = dma * 4;
+    }
     const unsigned kick = pds_pair(&p, 0, kick0, 0);
     pds_word(&p, 1, 0);   // DOUTU word 2
     if (sa_words) {

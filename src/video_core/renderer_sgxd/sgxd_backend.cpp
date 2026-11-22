@@ -65,7 +65,12 @@ constexpr u32 CodeSize = 1u << 20;
 // the other, once no render reads it.
 constexpr u32 PdsFixedSize = 512u << 10;
 constexpr u32 PdsHalfSize = 768u << 10;
-constexpr u32 PdsSize = PdsFixedSize + 2 * PdsHalfSize;
+constexpr u32 PdsSize = 2 * PdsHalfSize;
+// The PDS keeps running a program at an address it has run, whatever is invalidated, so a half is
+// never written again at an address it ran under: each use of a half takes the next window, the
+// same memory mapped again. The GPU idles and the PDS resets only when the windows run out.
+constexpr u32 PdsWindowVa = 0x50000000;
+constexpr u32 PdsWindows = 64;
 constexpr u32 DataSize = SgxdBackend::PassDataBytes;
 // LUT_LF_ROWS rows of 256 F32F32 texels (1 MiB), then the proctex rows (F32F32 and F16x4).
 constexpr u32 LutLfSize = Pica::Shader::LUT_LF_ROWS * 256 * 8;
@@ -112,14 +117,19 @@ SgxdBackend::SgxdBackend() {
     textures = MapBlock("azahar-sgxd-textures", TexturesVa, TexturesSize, textures_block);
     textures_fixed = TexturesSize;
     pds_begin = 0;
-    pds_fixed_used = pds_begin;
-    pds_used = pds_begin + PdsFixedSize;
+    pds_used = pds_begin;
     pds_end = pds_begin + PdsSize;
     data_begin = data_used = pds_end;
     data_end = data_begin + DataSize;
     lut_begin = data_begin + DataSlots * DataSize;
     shared_size = AlignUp(lut_begin + LutSize, 1u << 20);
     shared = MapBlock("azahar-sgxd-shared", BlockVa, shared_size, shared_block);
+    for (u32 w = 0; w < PdsWindows; w++) {
+        const int mapped = sgxdMap(PdsWindowVa + w * PdsHalfSize,
+                                   shared + pds_begin + (w & 1) * PdsHalfSize, PdsHalfSize, 0);
+        ASSERT_MSG(mapped == 0, "sgxd: the PDS arena's window {} not mapped at GPU {:#010x}: {:#010x}",
+                   w, PdsWindowVa + w * PdsHalfSize, static_cast<u32>(mapped));
+    }
     next_va = BlockVa + shared_size;
     draws.resize(MaxDraws);
     programs.resize(MaxDraws);
@@ -359,6 +369,7 @@ SgxdBackend::~SgxdBackend() {
     for (const auto& r : recipes) {
         FreeBlock(r->memory, r->va, r->size, r->block);
     }
+    sgxdUnmap(PdsWindowVa, PdsWindows * PdsHalfSize);
     FreeBlock(shared, BlockVa, shared_size, shared_block);
     FreeBlock(surfaces, SurfacesVa, surfaces_size, surfaces_block);
     FreeBlock(textures, TexturesVa, TexturesSize, textures_block);
@@ -512,24 +523,279 @@ u32 SgxdBackend::PlacePds(const SgxdPdsProgram& program, bool fixed) {
     return va;
 }
 
+u32 SgxdBackend::AppendPds(const SgxdPdsProgram& program) {
+    const u32 bytes = program.count * 4;
+    const u32 end = pds_begin + (pds_half + 1) * PdsHalfSize;
+    const u32 at = AlignUp(pds_used, 32);
+    ASSERT_MSG(at + bytes <= end, "sgxd: the PDS arena's flipping half is full ({} KiB, {} programs)",
+               PdsHalfSize >> 10, pds_index_programs);
+    std::memcpy(shared + at, program.words, bytes);
+    pds_used = at + bytes;
+    pds_index_programs++;
+    return PdsWindowVa + pds_window * PdsHalfSize + (at - (pds_begin + pds_half * PdsHalfSize));
+}
+
+u32 SgxdBackend::PdsIndex::Hash(const u32* key, u32 words) {
+    // MurmurHash3's 32-bit mixing: words are few, and 32-bit multiplies are what the CPU has.
+    u32 h = 0x9e3779b9u ^ words;
+    for (u32 i = 0; i < words; i++) {
+        const u32 k = std::rotl(key[i] * 0xcc9e2d51u, 15) * 0x1b873593u;
+        h = std::rotl(h ^ k, 13) * 5 + 0xe6546b64u;
+    }
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    return h ^ (h >> 16);
+}
+
+const SgxdBackend::PdsRef* SgxdBackend::PdsIndex::Find(const u32* key, u32 words,
+                                                       u32 hash) const {
+    const u32 mask = static_cast<u32>(slots.size()) - 1;
+    for (u32 i = hash & mask;; i = (i + 1) & mask) {
+        const Slot& slot = slots[i];
+        if (slot.key_words == 0) {
+            return nullptr;
+        }
+        if (slot.hash == hash && slot.key_words == words &&
+            std::memcmp(keys.data() + slot.key_at, key, words * 4) == 0) {
+            return &slot.ref;
+        }
+    }
+}
+
+void SgxdBackend::PdsIndex::Insert(const u32* key, u32 words, u32 hash, PdsRef ref) {
+    if ((used + 1) * 2 > slots.size()) {
+        Grow();
+    }
+    const u32 mask = static_cast<u32>(slots.size()) - 1;
+    u32 i = hash & mask;
+    while (slots[i].key_words != 0) {
+        i = (i + 1) & mask;
+    }
+    slots[i] = Slot{hash, static_cast<u32>(keys.size()), words, ref};
+    keys.insert(keys.end(), key, key + words);
+    used++;
+}
+
+void SgxdBackend::PdsIndex::Grow() {
+    std::vector<Slot> old(slots.size() * 2);
+    old.swap(slots);
+    const u32 mask = static_cast<u32>(slots.size()) - 1;
+    for (const Slot& slot : old) {
+        if (slot.key_words == 0) {
+            continue;
+        }
+        u32 i = slot.hash & mask;
+        while (slots[i].key_words != 0) {
+            i = (i + 1) & mask;
+        }
+        slots[i] = slot;
+    }
+}
+
+void SgxdBackend::PdsIndex::Clear() {
+    std::fill(slots.begin(), slots.end(), Slot{});
+    keys.clear();
+    used = 0;
+}
+
+template <typename Build>
+SgxdBackend::PdsRef SgxdBackend::KeyedPds(const u32* key, u32 words, Build&& build) {
+    const u32 hash = PdsIndex::Hash(key, words);
+    if (const PdsRef* hit = pds_index.Find(key, words, hash)) {
+        return *hit;
+    }
+    SgxdPdsProgram pds{};
+    if (build(pds) != 0) {
+        return PdsRef{0, 0}; // the caller asserts, naming what it asked for
+    }
+    const PdsRef ref{AppendPds(pds), pds.units};
+    pds_index.Insert(key, words, hash, ref);
+    return ref;
+}
+
+template <typename Build>
+SgxdBackend::PdsTemplate* SgxdBackend::TemplatePds(const u32* key, u32 words, Build&& build) {
+    const u32 hash = PdsIndex::Hash(key, words);
+    if (const PdsRef* hit = pds_shapes.Find(key, words, hash)) {
+        return &pds_templates[hit->va];
+    }
+    PdsTemplate& t = pds_templates.emplace_back();
+    if (build(t) != 0) {
+        pds_templates.pop_back();
+        return nullptr;
+    }
+    pds_shapes.Insert(key, words, hash, PdsRef{static_cast<u32>(pds_templates.size() - 1), 0});
+    return &t;
+}
+
+namespace {
+enum PdsTag : u32 {
+    TagVertex = 1,
+    TagSecondary,
+    TagBlitPixel,
+    TagScreenPixel,
+    TagMergePixel,
+    TagRaw64Pixel,
+    TagTerm,
+    TagPixel,
+    TagVertexShape,
+    TagSecondaryShape,
+};
+} // namespace
+
+SgxdBackend::PdsRef SgxdBackend::VertexPds(const SgxdVertexFetch* fetch, u32 count, u32 doutu0,
+                                           bool per_instance, bool fresh) {
+    static_assert(sizeof(SgxdVertexFetch) == 4 * sizeof(u32));
+    std::array<u32, 4 + 4 * 32> key;
+    DEBUG_ASSERT_MSG(count <= 32, "sgxd: {} vertex fetches", count);
+    key[1] = doutu0;
+    key[2] = per_instance ? 1 : 0;
+    key[3] = count;
+    std::memcpy(key.data() + 4, fetch, count * sizeof(SgxdVertexFetch));
+    return KeyedPds(key.data(), 4 + 4 * count, [&](SgxdPdsProgram& pds) {
+        return sgxd_program_vertex_pds(fetch, count, doutu0, per_instance ? 1 : 0, &pds);
+    });
+    if (!t) {
+        return PdsRef{0, 0}; // the caller asserts, naming what it asked for
+    }
+    for (u32 n = 0; n < count; n++) {
+        t->program.words[t->at[n]] = fetch[n].address;
+    }
+    const PdsRef ref{AppendPds(t->program), t->program.units};
+    if (!fresh) {
+        key[0] = TagVertex;
+        for (u32 n = 0; n < count; n++) {
+            key[4 + 4 * n] = fetch[n].address;
+        }
+        pds_index.Insert(key.data(), words, hash, ref);
+    }
+    return ref;
+}
+
+SgxdBackend::PdsRef SgxdBackend::SecondaryPds(u32 sa_address, u32 sa_words, u32 doutu0) {
+    if (sa_words == 0) {
+        // No DMA: the address is not in the program.
+        const u32 key[4] = {TagSecondary, 0, 0, doutu0};
+        return KeyedPds(key, 4, [&](SgxdPdsProgram& pds) {
+            return sgxd_program_secondary_pds(0, 0, doutu0, &pds);
+        });
+    }
+    // Every SA image is pass data allocated for its draw (VertexSa, the fragment's), so no
+    // earlier program has its address: no lookup by it, the program for the same SA words at
+    // another address with this one written in (as VertexPds's).
+    const u32 shape[4] = {TagSecondaryShape, 0, sa_words, doutu0};
+    PdsTemplate* const t = TemplatePds(shape, 4, [&](PdsTemplate& built) {
+        return sgxd_program_secondary_pds_at(sa_address, sa_words, doutu0, &built.program,
+                                             built.at.data());
+    });
+    if (!t) {
+        return PdsRef{0, 0};
+    }
+    t->program.words[t->at[0]] = sa_address;
+    return PdsRef{AppendPds(t->program), t->program.units};
+}
+
+SgxdBackend::PdsRef SgxdBackend::BlitPixelPds(u32 doutu0, const u32 tex[4]) {
+    const u32 key[6] = {TagBlitPixel, doutu0, tex[0], tex[1], tex[2], tex[3]};
+    return KeyedPds(key, 6, [&](SgxdPdsProgram& pds) {
+        return sgxd_program_blit_pixel_pds(doutu0, tex, &pds);
+    });
+}
+
+SgxdBackend::PdsRef SgxdBackend::ScreenPixelPds(u32 doutu0, const u32 tex[4]) {
+    const u32 key[6] = {TagScreenPixel, doutu0, tex[0], tex[1], tex[2], tex[3]};
+    return KeyedPds(key, 6, [&](SgxdPdsProgram& pds) {
+        return sgxd_program_screen_pixel_pds(doutu0, tex, &pds);
+    });
+}
+
+SgxdBackend::PdsRef SgxdBackend::Raw64PixelPds(u32 doutu0, const u32 tex[4]) {
+    const u32 key[6] = {TagRaw64Pixel, doutu0, tex[0], tex[1], tex[2], tex[3]};
+    return KeyedPds(key, 6, [&](SgxdPdsProgram& pds) {
+        return sgxd_program_raw64_pixel_pds(doutu0, tex, &pds);
+    });
+}
+
+SgxdBackend::PdsRef SgxdBackend::TermPds(const SgxdRecipe& recipe) {
+    // Its words follow from the tiling and the layout's code offsets, which every instance shares.
+    const u32 key[5] = {TagTerm, recipe.tx, recipe.ty, recipe.layout_width, recipe.layout_height};
+    return KeyedPds(key, 5, [&](SgxdPdsProgram& pds) {
+        uint32_t units = 0;
+        pds.count = sgxd_recipe_term_pds(&recipe, pds.words, &units);
+        pds.units = units;
+        return pds.count != 0 ? 0 : -1;
+    });
+}
+
+SgxdBackend::PdsRef SgxdBackend::MergePixelPds(u32 doutu0, const u32 tex0[4], const u32 tex1[4]) {
+    const u32 key[10] = {TagMergePixel, doutu0,  tex0[0], tex0[1], tex0[2],
+                         tex0[3],       tex1[0], tex1[1], tex1[2], tex1[3]};
+    return KeyedPds(key, 10, [&](SgxdPdsProgram& pds) {
+        return sgxd_program_merge_pixel_pds(doutu0, tex0, tex1, &pds);
+    });
+}
+
+SgxdBackend::PdsRef SgxdBackend::PixelPds(u32 doutu0, const u32* iterators, const u32* words,
+                                          u32 count) {
+    DEBUG_ASSERT(count <= 12);
+    std::array<u32, 3 + 2 * 12> key;
+    u32 n = 0;
+    key[n++] = TagPixel;
+    key[n++] = doutu0;
+    key[n++] = count;
+    for (u32 i = 0; i < count; i++) {
+        key[n++] = iterators[i];
+        key[n++] = words[i];
+    }
+    return KeyedPds(key.data(), n, [&](SgxdPdsProgram& pds) {
+        static_assert(sizeof(unsigned) == sizeof(u32));
+        return sgxd_program_pixel_pds(doutu0, iterators, reinterpret_cast<const unsigned*>(words),
+                                      count, &pds);
+    });
+}
+
 void SgxdBackend::FlipPdsHalf() {
     const u32 other = pds_half ^ 1;
-    const u32 lo = BlockVa + pds_begin + PdsFixedSize + other * PdsHalfSize;
-    // The other half's addresses are written again, and the PDS keeps running a program at an
-    // address it has run, whatever the invalidates: a game's untiles wrote nothing after the second flip.
-    // So the GPU idles and core 0's SOFT_RESET bit 8 (the PDS) is pulsed, which keeps
-    // the code bases and the PDS, DMS and BIF settings.
-    RenderIdle("the PDS arena's flip");
-    [[maybe_unused]] const int idle = sgxd_gpu_idle();
-    DEBUG_ASSERT_MSG(idle == 0, "sgxd: the GPU never went idle for the PDS arena's flip");
-    std::array<SgxdOp, 2> reset{{{SGXD_OP_WRITE, 0x0080, 0x100, 0, 0},
-                                 {SGXD_OP_WRITE, 0x0080, 0, 0, 0}}};
-    [[maybe_unused]] const int pulsed = sgxdSubmit(reset.data(), 2);
-    DEBUG_ASSERT_MSG(pulsed == 2, "sgxd: the PDS reset for the arena's flip failed ({})", pulsed);
-    std::erase_if(pds_by_words, [&](const auto& e) { return e.second >= lo && e.second < hi; });
+    const u32 window = (pds_window + 1) % PdsWindows;
+    // No list after the last flip away from the other half reads it, so its fence is long reached
+    // as a rule. This half's are dropped now.
+    RenderWait(pds_fence[other], "the PDS arena's flip");
+    pds_fence[pds_half] = FenceAll();
+    pds_index.Clear();
+    pds_index_programs = 0;
+    pds_window = window;
     pds_half = other;
-    pds_used = lo - BlockVa;
+    pds_used = pds_begin + other * PdsHalfSize;
     pds_flips++;
+    if (window != 0) {
+        // A window the PDS has not run programs from: no idle, no reset.
+#ifdef VITA_DIAGNOSTICS
+        if (SgxdFlag("perflog")) {
+            LOG_INFO(Render, "sgxd: PDS arena flip {} to window {} ({:#010x})", pds_flips,
+                     window, PdsWindowVa + window * PdsHalfSize);
+        }
+#endif
+        return;
+    }
+    // The first window again: its addresses are written again, and the PDS keeps running a program
+    // at an address it has run (docs/sgxd/pds.md): the GPU idles and the cores are reset
+    // (ResetCores).
+    FinishPending(FinishWhy::PdsFlip);
+    const std::array<SgxdOp, 4> reset{{{SGXD_OP_WRITE, 0x0080, 0x000c8d00, 0, 0},
+                                       {SGXD_OP_WRITE, 0x0080, 0, 0, 0},
+                                       {SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0, 0},
+                                       {SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0, 0}}};
+    [[maybe_unused]] const int pulsed = sgxd_chain_submit(reset.data(), 4);
+    DEBUG_ASSERT_MSG(pulsed == 0, "sgxd: the PDS reset for the arena's flip was not queued ({:#x})",
+                     static_cast<u32>(pulsed));
+#ifdef VITA_DIAGNOSTICS
+    if (SgxdFlag("perflog")) {
+        LOG_INFO(Render, "sgxd: PDS arena flip {} to window 0, the GPU idled and reset ({} lists sent)",
+                 pds_flips, sgxd_chain_fence());
+    }
+#endif
 }
 
 void SgxdBackend::ResetCores(const char* why) {
@@ -774,7 +1040,7 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     // The recipe instance and the pass data slot are the GPU's until their last render's 3D
     // completes: RecipeFor and the slot's fence wait only when the GPU is that far behind.
     // Past half of the current PDS half: the next pass starts in the other one.
-    if (pds_used - (pds_begin + PdsFixedSize + pds_half * PdsHalfSize) > PdsHalfSize / 2) {
+    if (pds_used - (pds_begin + pds_half * PdsHalfSize) > PdsHalfSize / 2) {
         FlipPdsHalf();
     }
     Recipe& r = RecipeFor(width, height, pica ? Kind::Pica : Kind::Linear);
@@ -1470,35 +1736,31 @@ SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, 
     }
 
     SgxdRecipeDrawPrograms p{};
-    SgxdPdsProgram pds{};
     const SgxdVertexFetch fetch{vertices.gpu, N * 4, N, 0};
-    [[maybe_unused]] const int vspds = sgxd_program_vertex_pds(&fetch, 1, blit_vertex, 0, &pds);
-    DEBUG_ASSERT(vspds == 0);
-    p.vspds = PlacePds(pds);
-    p.vspds_units = pds.units;
+    const auto vspds = VertexPds(&fetch, 1, blit_vertex, false);
+    DEBUG_ASSERT(vspds.va != 0);
+    p.vspds = vspds.va;
+    p.vspds_units = vspds.units;
     // The dummy secondaries at the code bases (the recipe's CV_DUMMY_VS and CF_DUMMY_FS).
-    [[maybe_unused]] const int vsec =
-        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(0, 0, 0), &pds);
-    DEBUG_ASSERT(vsec == 0);
-    p.vsec = PlacePds(pds);
-    p.vsec_units = pds.units;
+    const auto vsec = SecondaryPds(0, 0, sgxd_program_doutu0(0, 0, 0));
+    DEBUG_ASSERT(vsec.va != 0);
+    p.vsec = vsec.va;
+    p.vsec_units = vsec.units;
     p.vsec_sa = 0;
-    [[maybe_unused]] const int fsec =
-        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(1, 0, 0), &pds);
-    DEBUG_ASSERT(fsec == 0);
-    p.fsec = PlacePds(pds);
-    p.fsec_units = pds.units;
+    const auto fsec = SecondaryPds(0, 0, sgxd_program_doutu0(1, 0, 0));
+    DEBUG_ASSERT(fsec.va != 0);
+    p.fsec = fsec.va;
+    p.fsec_units = fsec.units;
     // The texel comes back unconverted (FCONV 0), the surface's word as it is; mirrored, the
     // screen program converts it (U8U8U8U8 under swizzle 2) and packs U8888 again.
     u32 tex[4];
     sgxd_recipe_texture_words_format(source.gpu, stride, height * scale_y,
                                      scale_x != 1 || scale_y != 1, 0x0c, mirror ? 2 : 0, tex);
-    [[maybe_unused]] const int fprim =
-        mirror ? sgxd_program_screen_pixel_pds(untile_fragment, tex, &pds)
-               : sgxd_program_blit_pixel_pds(blit_fragment, tex, &pds);
-    DEBUG_ASSERT(fprim == 0);
-    p.fprim = PlacePds(pds);
-    p.fprim_units = pds.units;
+    const PdsRef fprim =
+        mirror ? ScreenPixelPds(untile_fragment, tex) : BlitPixelPds(blit_fragment, tex);
+    DEBUG_ASSERT(fprim.va != 0);
+    p.fprim = fprim.va;
+    p.fprim_units = fprim.units;
     sgxd_program_vertex_dms(N, 0, 0, N, &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
     p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
     p.outselects = SGXD_PROGRAM_BLIT_OUTSELECTS;
@@ -1666,24 +1928,15 @@ void SgxdBackend::SideRender(const Data& vertices, std::span<const SideDraw> lis
     const u32 N = merge ? SGXD_PROGRAM_MERGE_VERTEX_WORDS : SGXD_PROGRAM_BLIT_VERTEX_WORDS;
 
     SgxdRecipeDrawPrograms p{};
-    SgxdPdsProgram pds{};
-    const SgxdVertexFetch fetch{vertices.gpu, N * 4, N, 0};
-    [[maybe_unused]] const int vspds =
-        sgxd_program_vertex_pds(&fetch, 1, merge ? merge_vertex : blit_vertex, 0, &pds);
-    DEBUG_ASSERT(vspds == 0);
-    p.vspds = PlacePds(pds);
-    p.vspds_units = pds.units;
-    [[maybe_unused]] const int vsec =
-        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(0, 0, 0), &pds);
-    DEBUG_ASSERT(vsec == 0);
-    p.vsec = PlacePds(pds);
-    p.vsec_units = pds.units;
+    const auto vsec = SecondaryPds(0, 0, sgxd_program_doutu0(0, 0, 0));
+    DEBUG_ASSERT(vsec.va != 0);
+    p.vsec = vsec.va;
+    p.vsec_units = vsec.units;
     p.vsec_sa = 0;
-    [[maybe_unused]] const int fsec =
-        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(1, 0, 0), &pds);
-    DEBUG_ASSERT(fsec == 0);
-    p.fsec = PlacePds(pds);
-    p.fsec_units = pds.units;
+    const auto fsec = SecondaryPds(0, 0, sgxd_program_doutu0(1, 0, 0));
+    DEBUG_ASSERT(fsec.va != 0);
+    p.fsec = fsec.va;
+    p.fsec_units = fsec.units;
     sgxd_program_vertex_dms(N, 0, 0, N, &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
     p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
     p.outselects = merge ? SGXD_PROGRAM_MERGE_OUTSELECTS : SGXD_PROGRAM_BLIT_OUTSELECTS;
@@ -1721,13 +1974,13 @@ void SgxdBackend::SideRender(const Data& vertices, std::span<const SideDraw> lis
             std::memcpy(untile_programs[d].viewport, view, sizeof(view));
         }
         // the word unconverted.
-        [[maybe_unused]] const int fprim =
-            merge          ? sgxd_program_merge_pixel_pds(merge_fragment, sd.tex, sd.tex1, &pds)
-            : sd.converted ? sgxd_program_screen_pixel_pds(untile_fragment, sd.tex, &pds)
-                           : sgxd_program_blit_pixel_pds(blit_fragment, sd.tex, &pds);
-        DEBUG_ASSERT(fprim == 0);
-        untile_programs[d].fprim = PlacePds(pds);
-        untile_programs[d].fprim_units = pds.units;
+        const PdsRef fprim = merge          ? MergePixelPds(merge_fragment, sd.tex, sd.tex1)
+                             : sd.raw64     ? Raw64PixelPds(raw64_fragment, sd.tex)
+                             : sd.converted ? ScreenPixelPds(untile_fragment, sd.tex)
+                                            : BlitPixelPds(blit_fragment, sd.tex);
+        DEBUG_ASSERT(fprim.va != 0);
+        untile_programs[d].fprim = fprim.va;
+        untile_programs[d].fprim_units = fprim.units;
         untile_draws[d] =
             SgxdRecipeDraw{sd.first, sd.count, isp, SGXD_R_FPRIM, 0, clip, &untile_programs[d]};
     }
@@ -1808,22 +2061,16 @@ void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
     if (stream_target.cpu == nullptr) {
         stream_target = AllocSurface(32, 32);
     }
-    SgxdPdsProgram pds{};
-    [[maybe_unused]] const int fsec =
-        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(1, 0, 0), &pds);
-    DEBUG_ASSERT(fsec == 0);
-    p.fsec = PlacePds(pds);
-    p.fsec_units = pds.units;
+    const auto fsec = SecondaryPds(0, 0, sgxd_program_doutu0(1, 0, 0));
+    DEBUG_ASSERT(fsec.va != 0);
     const u32 tex[4] = {};
-    [[maybe_unused]] const int fprim = sgxd_program_blit_pixel_pds(blit_fragment, tex, &pds);
-    DEBUG_ASSERT(fprim == 0);
-    p.fprim = PlacePds(pds);
-    p.fprim_units = pds.units;
-    p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
+    const PdsRef fprim = BlitPixelPds(blit_fragment, tex);
+    DEBUG_ASSERT(fprim.va != 0);
     const float viewport[6] = {16.0f, 16.0f, 16.0f, 16.0f, 0.0f, 1.0f};
     constexpr u32 clip = SGXD_RECIPE_CLIP(0, 0, 0, 0);
     untile_programs.resize(queued.size());
     untile_draws.resize(queued.size());
+    const u32 pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
     for (std::size_t d = 0; d < queued.size(); d++) {
         SgxdRecipeDrawPrograms& p = untile_programs[d];
         p = queued[d].programs;
@@ -1831,7 +2078,7 @@ void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
         p.fsec_units = fsec.units;
         p.fprim = fprim.va;
         p.fprim_units = fprim.units;
-        p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
+        p.pixel_size = pixel_size;
         std::memcpy(p.viewport, viewport, sizeof(viewport));
         p.primitive = SGXD_PROGRAM_TRIANGLES;
         untile_draws[d] = {0, queued[d].count, SGXD_RECIPE_ISP_NEVER, SGXD_R_FPRIM, 0, clip, &p};
@@ -2480,23 +2727,20 @@ void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_
 
     constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
     SgxdRecipeDrawPrograms p{};
-    SgxdPdsProgram pds{};
     const SgxdVertexFetch fetch{vertices.gpu, N * 4, N, 0};
-    [[maybe_unused]] const int vspds = sgxd_program_vertex_pds(&fetch, 1, blit_vertex, 0, &pds);
-    DEBUG_ASSERT(vspds == 0);
-    p.vspds = PlacePds(pds);
-    p.vspds_units = pds.units;
-    [[maybe_unused]] const int vsec =
-        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(0, 0, 0), &pds);
-    DEBUG_ASSERT(vsec == 0);
-    p.vsec = PlacePds(pds);
-    p.vsec_units = pds.units;
+    const auto vspds = VertexPds(&fetch, 1, blit_vertex, false);
+    DEBUG_ASSERT(vspds.va != 0);
+    p.vspds = vspds.va;
+    p.vspds_units = vspds.units;
+    const auto vsec = SecondaryPds(0, 0, sgxd_program_doutu0(0, 0, 0));
+    DEBUG_ASSERT(vsec.va != 0);
+    p.vsec = vsec.va;
+    p.vsec_units = vsec.units;
     p.vsec_sa = 0;
-    [[maybe_unused]] const int fsec =
-        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(1, 0, 0), &pds);
-    DEBUG_ASSERT(fsec == 0);
-    p.fsec = PlacePds(pds);
-    p.fsec_units = pds.units;
+    const auto fsec = SecondaryPds(0, 0, sgxd_program_doutu0(1, 0, 0));
+    DEBUG_ASSERT(fsec.va != 0);
+    p.fsec = fsec.va;
+    p.fsec_units = fsec.units;
     sgxd_program_vertex_dms(N, 0, 0, N, &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
     p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
     p.outselects = SGXD_PROGRAM_BLIT_OUTSELECTS;
@@ -2537,10 +2781,10 @@ void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_
         if (scale_x != 1 || scale_y != 1) {
             tex[0] |= 1u << 12 | 1u << 10; // MAGFILTER, MINFILTER bilinear
         }
-        [[maybe_unused]] const int fprim = sgxd_program_screen_pixel_pds(untile_fragment, tex, &pds);
-        DEBUG_ASSERT(fprim == 0);
-        p.fprim = PlacePds(pds);
-        p.fprim_units = pds.units;
+        const PdsRef fprim = ScreenPixelPds(untile_fragment, tex);
+        DEBUG_ASSERT(fprim.va != 0);
+        p.fprim = fprim.va;
+        p.fprim_units = fprim.units;
         Draw(SgxdRecipeDraw{band.first_vertex, band.rows * 6, isp, SGXD_R_FPRIM, 0, clip, nullptr},
              p);
     }
