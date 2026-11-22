@@ -249,6 +249,18 @@ std::string HostPath(const std::string& path) {
     return Join(split, MaxDepth - 1) + '/' + Fold(split, split.parts.size());
 }
 
+// The kernel's open flags for a C open mode ("rb", "w+b", "ab", ...).
+int VitaOpenMode(const std::string& openmode) {
+    const bool plus = openmode.find('+') != std::string::npos;
+    if (openmode.find('w') != std::string::npos) {
+        return (plus ? SCE_O_RDWR : SCE_O_WRONLY) | SCE_O_CREAT | SCE_O_TRUNC;
+    }
+    if (openmode.find('a') != std::string::npos) {
+        return (plus ? SCE_O_RDWR : SCE_O_WRONLY) | SCE_O_CREAT | SCE_O_APPEND;
+    }
+    return plus ? SCE_O_RDWR : SCE_O_RDONLY;
+}
+
 // The names in a directory, folded ones cut to their next component.
 std::optional<std::vector<std::string>> ListFolded(const std::string& directory) {
     const SplitPath split = Split(directory);
@@ -1518,6 +1530,9 @@ void IOFile::Swap(IOFile& other) noexcept {
     std::swap(m_file, other.m_file);
     std::swap(m_fd, other.m_fd);
     std::swap(m_good, other.m_good);
+#ifdef __vita__
+    std::swap(m_pos, other.m_pos);
+#endif
     std::swap(filename, other.filename);
     std::swap(openmode, other.openmode);
     std::swap(flags, other.flags);
@@ -1644,17 +1659,9 @@ bool IOFile::Open() {
     // Straight to the kernel: newlib's stdio carries a 32-bit off_t, so through it a 2 GB
     // cartridge image has a negative size and no reachable second half. The kernel's SceOff
     // is 64 bits. m_fd holds the SceUID; m_file stays null on this platform.
-    int mode = 0;
-    const bool plus = openmode.find('+') != std::string::npos;
-    if (openmode.find('w') != std::string::npos) {
-        mode = (plus ? SCE_O_RDWR : SCE_O_WRONLY) | SCE_O_CREAT | SCE_O_TRUNC;
-    } else if (openmode.find('a') != std::string::npos) {
-        mode = (plus ? SCE_O_RDWR : SCE_O_WRONLY) | SCE_O_CREAT | SCE_O_APPEND;
-    } else {
-        mode = plus ? SCE_O_RDWR : SCE_O_RDONLY;
-    }
-    const SceUID fd = sceIoOpen(HostPath(filename).c_str(), mode, 0666);
+    const SceUID fd = sceIoOpen(HostPath(filename).c_str(), VitaOpenMode(openmode), 0666);
     m_fd = fd >= 0 ? static_cast<int>(fd) : -1;
+    m_pos = 0;
     m_good = m_fd >= 0;
 #else
     m_file = FOPEN(filename.c_str(), openmode.c_str());
@@ -1663,6 +1670,39 @@ bool IOFile::Open() {
 
     return m_good;
 }
+
+#ifdef __vita__
+namespace {
+constexpr int StandbyClosed = static_cast<int>(0x80010013u);
+std::mutex reopen_mutex;
+} // Anonymous namespace
+
+bool IOFile::ReopenAfterStandby(int fd, int error) {
+    std::scoped_lock lock{reopen_mutex};
+    if (m_fd != fd) {
+        return m_fd >= 0;
+    }
+    if (error != StandbyClosed) {
+        return false;
+    }
+    // As Open, but neither truncated nor created again: it is the same file.
+    const SceUID again =
+        sceIoOpen(HostPath(filename).c_str(), VitaOpenMode(openmode) & ~SCE_O_TRUNC, 0666);
+    if (again < 0) {
+        LOG_ERROR(Common_Filesystem, "{}: not open again after a standby: {:#010x}", filename,
+                  static_cast<u32>(again));
+        return false;
+    }
+    if (m_pos != 0) {
+        sceIoLseek(again, static_cast<SceOff>(m_pos), SEEK_SET);
+    }
+    sceIoClose(fd);
+    m_fd = static_cast<int>(again);
+    m_good = true;
+    LOG_INFO(Common_Filesystem, "{}: open again after a standby, at {:#x}", filename, m_pos);
+    return true;
+}
+#endif
 
 bool IOFile::Close() {
 #ifdef __vita__
@@ -1684,7 +1724,12 @@ u64 IOFile::GetSize() const {
     if (!IsOpen())
         return 0;
     SceIoStat st{};
-    if (sceIoGetstatByFd(m_fd, &st) < 0)
+    const int fd = m_fd;
+    int r = sceIoGetstatByFd(fd, &st);
+    if (r < 0 && const_cast<IOFile*>(this)->ReopenAfterStandby(fd, r)) {
+        r = sceIoGetstatByFd(m_fd, &st);
+    }
+    if (r < 0)
         return 0;
     return static_cast<u64>(st.st_size);
 #else
@@ -1697,8 +1742,20 @@ u64 IOFile::GetSize() const {
 
 bool IOFile::Seek(s64 off, int origin) {
 #ifdef __vita__
-    if (!IsOpen() || sceIoLseek(m_fd, static_cast<SceOff>(off), origin) < 0)
+    if (!IsOpen()) {
         m_good = false;
+        return m_good;
+    }
+    const int fd = m_fd;
+    SceOff at = sceIoLseek(fd, static_cast<SceOff>(off), origin);
+    if (at < 0 && ReopenAfterStandby(fd, static_cast<int>(at))) {
+        at = sceIoLseek(m_fd, static_cast<SceOff>(off), origin);
+    }
+    if (at < 0) {
+        m_good = false;
+    } else {
+        m_pos = at;
+    }
     return m_good;
 #else
     if (!IsOpen() || 0 != FSEEK(m_file, off, origin))
@@ -1710,9 +1767,14 @@ bool IOFile::Seek(s64 off, int origin) {
 
 u64 IOFile::Tell() const {
 #ifdef __vita__
-    if (IsOpen())
-        return static_cast<u64>(sceIoLseek(m_fd, 0, SEEK_CUR));
-    return std::numeric_limits<u64>::max();
+    if (!IsOpen())
+        return std::numeric_limits<u64>::max();
+    const int fd = m_fd;
+    SceOff at = sceIoLseek(fd, 0, SEEK_CUR);
+    if (at < 0 && const_cast<IOFile*>(this)->ReopenAfterStandby(fd, static_cast<int>(at))) {
+        at = sceIoLseek(m_fd, 0, SEEK_CUR);
+    }
+    return static_cast<u64>(at);
 #else
     if (IsOpen())
         return FTELL(m_file);
@@ -1723,7 +1785,16 @@ u64 IOFile::Tell() const {
 
 bool IOFile::Flush() {
 #ifdef __vita__
-    if (!IsOpen() || sceIoSyncByFd(m_fd, 0) < 0)
+    if (!IsOpen()) {
+        m_good = false;
+        return m_good;
+    }
+    const int fd = m_fd;
+    int r = sceIoSyncByFd(fd, 0);
+    if (r < 0 && ReopenAfterStandby(fd, r)) {
+        r = sceIoSyncByFd(m_fd, 0);
+    }
+    if (r < 0)
         m_good = false;
     return m_good;
 #else
@@ -1747,11 +1818,18 @@ std::size_t IOFile::ReadImpl(void* data, std::size_t length, std::size_t elem_si
     DEBUG_ASSERT(data != nullptr);
 
 #ifdef __vita__
-    const int got = sceIoRead(m_fd, data, static_cast<SceSize>(length * elem_size));
+    const int fd = m_fd;
+    int got = sceIoRead(fd, data, static_cast<SceSize>(length * elem_size));
+    if (got < 0 && ReopenAfterStandby(fd, got)) {
+        got = sceIoRead(m_fd, data, static_cast<SceSize>(length * elem_size));
+    }
     if (got < 0) {
+        LOG_ERROR(Common_Filesystem, "{}: a read of {} bytes failed: {:#010x}", filename,
+                  length * elem_size, static_cast<u32>(got));
         m_good = false;
         return 0;
     }
+    m_pos += got;
     const std::size_t read = static_cast<std::size_t>(got) / elem_size;
     return read;
 #else
@@ -1812,7 +1890,18 @@ std::size_t IOFile::ReadAtImpl(void* data, std::size_t byte_count, std::size_t o
     FSEEK(m_file, pos, RETRO_VFS_SEEK_POSITION_START);
     read = static_cast<std::size_t>(rv);
 #elif defined(__vita__)
-    read = static_cast<std::size_t>(sceIoPread(m_fd, data, byte_count, static_cast<SceOff>(offset)));
+    const int fd = m_fd;
+    int got = sceIoPread(fd, data, byte_count, static_cast<SceOff>(offset));
+    if (got < 0 && ReopenAfterStandby(fd, got)) {
+        got = sceIoPread(m_fd, data, byte_count, static_cast<SceOff>(offset));
+    }
+    if (got < 0) {
+        LOG_ERROR(Common_Filesystem, "{}: a read of {} bytes at {:#x} failed: {:#010x}", filename,
+                  byte_count, offset, static_cast<u32>(got));
+        m_good = false;
+        return 0;
+    }
+    read = static_cast<std::size_t>(got);
     if (read != byte_count) {
         m_good = false;
     }
@@ -1843,11 +1932,18 @@ std::size_t IOFile::WriteImpl(const void* data, std::size_t length, std::size_t 
 #if defined(HAVE_LIBRETRO_VFS)
     written = rfwrite(data, elem_size, length, m_file) / elem_size;
 #elif defined(__vita__)
-    const int put = sceIoWrite(m_fd, data, static_cast<SceSize>(length * elem_size));
+    const int fd = m_fd;
+    int put = sceIoWrite(fd, data, static_cast<SceSize>(length * elem_size));
+    if (put < 0 && ReopenAfterStandby(fd, put)) {
+        put = sceIoWrite(m_fd, data, static_cast<SceSize>(length * elem_size));
+    }
     if (put < 0) {
+        LOG_ERROR(Common_Filesystem, "{}: a write of {} bytes failed: {:#010x}", filename,
+                  length * elem_size, static_cast<u32>(put));
         m_good = false;
         return 0;
     }
+    m_pos += put;
     written = static_cast<std::size_t>(put) / elem_size;
     return written;
 #else
@@ -1986,19 +2082,20 @@ bool IOFile::Resize(u64 size) {
         return true;
     }
     static const std::vector<u8> zeros(64 * 1024, 0);
-    const SceOff pos = sceIoLseek(m_fd, 0, SEEK_CUR);
-    sceIoLseek(m_fd, static_cast<SceOff>(current), SEEK_SET);
+    const s64 pos = m_pos;
+    if (!Seek(static_cast<s64>(current), SEEK_SET)) {
+        return false;
+    }
     u64 left = size - current;
     while (left > 0) {
-        const SceSize chunk = static_cast<SceSize>(std::min<u64>(left, zeros.size()));
-        if (sceIoWrite(m_fd, zeros.data(), chunk) != static_cast<int>(chunk)) {
+        const std::size_t chunk = static_cast<std::size_t>(std::min<u64>(left, zeros.size()));
+        if (WriteImpl(zeros.data(), chunk, 1) != chunk) {
             m_good = false;
             return false;
         }
         left -= chunk;
     }
-    sceIoLseek(m_fd, pos, SEEK_SET);
-    return true;
+    return Seek(pos, SEEK_SET);
 #endif
     if (!IsOpen() || 0 !=
 #if defined(HAVE_LIBRETRO_VFS)

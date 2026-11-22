@@ -653,6 +653,15 @@ private:
     CORE_FILE* m_file = nullptr;
     int m_fd = -1;
     bool m_good = true;
+#ifdef __vita__
+    /// The position Read, Write and Seek leave: a standby closes every descriptor of the
+    /// console's devices, and the file opened again after it starts here.
+    s64 m_pos = 0;
+    /// After a call on `fd` failed with `error`: true when the call can be made again on m_fd,
+    /// because another call already opened the file again, or because the error is the one a
+    /// standby leaves on a descriptor and the file is open again now, at m_pos.
+    bool ReopenAfterStandby(int fd, int error);
+#endif
 #ifdef HAVE_LIBRETRO_VFS
     // pread() doesn't touch the file position, so it's safe alongside
     // concurrent fread/fwrite. Libretro VFS has no pread equivalent, so
