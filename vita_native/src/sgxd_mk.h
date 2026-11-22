@@ -44,6 +44,25 @@ enum {
     SGXD_MK_DATA,         // GPU: the running job's data slot
     SGXD_MK_SV_COUNT,     // GPU: the supervised writes the next call makes (SGXD_MK_SV_WORD)
     SGXD_MK_SV_LINK,      // GPU: the supervised call's link and p0..p3, kept across the call
+    // The 3D stream (the TA stream's are END, POS and RESUME above): its jobs published, its next
+    // job, where its run goes on; each stream's running job's data slot (DATA is the one running
+    // now, which a supervised call's return reads).
+    SGXD_MK_END3,
+    SGXD_MK_POS3,
+    SGXD_MK_RESUME3,
+    SGXD_MK_DATA_TA,
+    SGXD_MK_DATA3,
+    // GPU: a TA kicked and its TA side not done; the scenes binned (their TA side done) and the
+    // 3Ds kicked: TA_SCENES - D3_KICKS scenes wait for their 3D.
+    SGXD_MK_TA_BUSY,
+    SGXD_MK_TA_SCENES,
+    SGXD_MK_D3_KICKS,
+    // GPU: whether the scheduler's round got anywhere (a job taken, a wait met).
+    SGXD_MK_PROGRESS,
+    // Unused (always 0). The kernel module's suspend wait compares the two run counts.
+    SGXD_MK_TRACE_AT,
+    SGXD_MK_RUNS,
+    SGXD_MK_RUNS_ENDED,
     SGXD_MK_STATE_WORDS,
 };
 
@@ -55,12 +74,8 @@ enum {
 // The supervised writes of one call, {register index, value} pairs from state word SGXD_MK_SV_WORD
 // (after the state words, before the jobs): a run of a list's consecutive supervised writes is
 // one call (one phase switch), a bank-0 code base four pairs.
-#define SGXD_MK_SV_WORD 32u
+#define SGXD_MK_SV_WORD 64u
 #define SGXD_MK_SV_PAIRS 16u
-// SGXD_MK_SVCHECK: the caller's r0..r(SGXD_MK_SV_SAVED - 1) stored here before a supervised call
-// (between the jobs and the data slots), compared after it.
-#define SGXD_MK_SV_SAVE_WORD 0x180u
-#define SGXD_MK_SV_SAVED 26u
 // The registers an event task writes only in supervisor mode: SOFT_RESET and the USE code
 // bases, in any bank. An event task's own store of a code base takes no effect, and its
 // SOFT_RESET reaches cores 0 and 1 only (docs/sgxd/pds.md). sgxd_mk_compile writes them
@@ -73,22 +88,31 @@ static inline int sgxd_mk_supervised(uint32_t reg) {
 // help: a KICK2 event task's r36 and up hold nothing.
 #define SGXD_MK_TEMP_UNITS 8u
 
+// Two streams of jobs, each a ring: the TA stream's (jobs_va, data_va) and the 3D stream's
+// (jobs3_va, data3_va). A run is the scheduler's rounds: the 3D stream, then the TA stream, until
+// a round gets nowhere. A list's end starts the round again, so a ready 3D goes before the next TA.
 typedef struct SgxdMkLayout {
     uint32_t state_va;   // the state block, SGXD_MK_STATE_WORDS words
     uint32_t jobs_va;    // jobs words: each job's list, its first instruction's index
     uint32_t jobs;       // a power of two
     uint32_t data_va;    // jobs data slots of SGXD_MK_DATA_WORDS words, job n's at slot n % jobs
+    uint32_t jobs3_va;   // the 3D stream's jobs words and data slots, as jobs_va and data_va
+    uint32_t data3_va;
 } SgxdMkLayout;
 
 // The runtime's entry points (code base window indices).
 typedef struct SgxdMkRuntime {
     uint32_t start;  // core 0's event program's DOUTU
-    uint32_t next;   // a list's end: the next job
+    uint32_t next;   // a list's end (its RESUME 0): the round again
     uint32_t exit;   // a run's end, its stores fenced
     uint32_t wake;   // the wake check, a call
     uint32_t supervisor;  // the USE_SPRV vector: a register write in supervisor mode
     uint32_t supervised;  // a call: SV_COUNT supervised writes from SGXD_MK_SV_WORD, through the vector
+    uint32_t blocked[2];  // a wait not met (its stream's RESUME stored): the TA stream's, the 3D's
 } SgxdMkRuntime;
+
+#define SGXD_MK_STREAM_TA 0u
+#define SGXD_MK_STREAM_3D 1u
 
 // Assembles the runtime at code base window index `base`. Returns its length in instructions, or
 // a negative SGX_USSE_E*.
@@ -108,12 +132,18 @@ extern void (*sgxd_mk_wait_placed)(uint32_t at, const SgxdOp *op);
 int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLayout *layout,
                     const SgxdMkRuntime *rt, const SgxdOp *ops, uint32_t nops,
                     const uint8_t *variable, int (*writable)(uint32_t reg), uint32_t *refused);
+// The same for a stream (SGXD_MK_STREAM_*): its waits store its RESUME and go to its blocked
+// entry. sgxd_mk_compile is the TA stream's.
+int sgxd_mk_compile_stream(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLayout *layout,
+                           const SgxdMkRuntime *rt, const SgxdOp *ops, uint32_t nops,
+                           const uint8_t *variable, int (*writable)(uint32_t reg),
+                           uint32_t *refused, uint32_t stream);
 
 // Whether op n of a list takes its value from the data slot (sgxd_mk_compile's rule): a
 // WAIT_TWOD's and a STORE's always, a WRITE's when marked.
 static inline int sgxd_mk_is_variable(const SgxdOp *op, const uint8_t *variable, uint32_t n) {
-    return op->op == SGXD_OP_WAIT_TWOD || op->op == SGXD_OP_STORE ||
-           (op->op == SGXD_OP_WRITE && variable && variable[n]);
+    return op->op == SGXD_OP_WAIT_TWOD || op->op == SGXD_OP_WAIT_COUNT ||
+           op->op == SGXD_OP_STORE || (op->op == SGXD_OP_WRITE && variable && variable[n]);
 }
 
 // The data slot's words a variable op takes: a STORE its address, then its value.

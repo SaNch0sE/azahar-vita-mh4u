@@ -1527,6 +1527,82 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
              stream_draws_sent - stream_draws_mark, stream_renders_sent - stream_renders_mark);
     stream_draws_mark = stream_draws_sent;
     stream_renders_mark = stream_renders_sent;
+    static constexpr const char* finish_names[] = {
+        "idle", "wait", "remap",    "fenced",       "touch",
+        "poll", "kick", "PDS flip", "free surface", "free texture"};
+    static_assert(std::size(finish_names) == static_cast<std::size_t>(FinishWhy::Count));
+    static u32 finishes_mark;
+    std::string why_line;
+    u32 counted = 0;
+    for (std::size_t k = 0; k < finishes.size(); k++) {
+        counted += finishes[k];
+        if (finishes[k] != 0) {
+            why_line += fmt::format(", {} {}", finish_names[k], finishes[k]);
+        }
+    }
+    const u32 all = sgxd_session_finishes - finishes_mark;
+    LOG_INFO(Render, "perf: 3D finished alone {} (present {}{})", all, all - counted, why_line);
+    finishes_mark = sgxd_session_finishes;
+    finishes.fill(0);
+    SceKernelFreeMemorySizeInfo free{};
+    free.size = sizeof(free);
+    sceKernelGetFreeMemorySize(&free);
+    LOG_INFO(Render, "perf: CDRAM free {} KiB; {} recipe blocks, {} pass data slots of {} KiB",
+             free.size_cdram >> 10, recipes.size(), DataSlots, DataSize >> 10);
+    static u32 map_lines;
+    if (map_lines++ % 30 == 0) {
+        std::string map;
+        u32 total = 0;
+        for (uintptr_t a = 0x60000000; a < 0x68000000;) {
+            SceKernelMemBlockInfo info{};
+            info.size = sizeof(info);
+            if (sceKernelGetMemBlockInfoByAddr(reinterpret_cast<void*>(a), &info) < 0 ||
+                info.mappedSize == 0) {
+                a += 256u << 10;
+                continue;
+            }
+            const u8* const base = static_cast<const u8*>(info.mappedBase);
+            const char* name = base == surfaces   ? "surfaces"
+                               : base == textures ? "textures"
+                               : base == shared   ? "shared"
+                               : std::any_of(recipes.begin(), recipes.end(),
+                                             [base](const auto& r) { return r->memory == base; })
+                                   ? "recipe"
+                                   : "?";
+            map += fmt::format(" {:#010x}+{}K {}", reinterpret_cast<uintptr_t>(base),
+                               info.mappedSize >> 10, name);
+            total += info.mappedSize;
+            a = std::max(a + (256u << 10), reinterpret_cast<uintptr_t>(base) + info.mappedSize);
+        }
+        LOG_INFO(Render, "perf: CDRAM blocks {} KiB in all:{}", total >> 10, map);
+    }
+    if (map_lines == 1) {
+        std::string line;
+        u32 blocks = 0;
+        for (uint64_t a = 0x00010000; a < 0x100000000ull;) {
+            if (a == 0x60000000) {
+                a = 0x68000000;
+                continue;
+            }
+            SceKernelMemBlockInfo info{};
+            info.size = sizeof(info);
+            if (sceKernelGetMemBlockInfoByAddr(reinterpret_cast<void*>(static_cast<uintptr_t>(a)),
+                                               &info) < 0 ||
+                info.mappedSize == 0) {
+                a += 256u << 10;
+                continue;
+            }
+            const uint64_t base = reinterpret_cast<uintptr_t>(info.mappedBase);
+            line += fmt::format(" {:#010x}+{}K t{:08x} m{:x}", base, info.mappedSize >> 10,
+                                static_cast<u32>(info.type), info.memoryType);
+            if (++blocks % 16 == 0) {
+                LOG_INFO(Render, "perf: blocks outside the CDRAM window:{}", line);
+                line.clear();
+            }
+            a = std::max(a + (256u << 10), base + info.mappedSize);
+        }
+        LOG_INFO(Render, "perf: blocks outside the CDRAM window:{} ({} in all)", line, blocks);
+    }
     LOG_INFO(Render,
              "perf: microkernel {} shapes ({} instructions), {} flips, {} jobs, {} SW_EVENT "
              "interrupts, {} IRQ 52 in all",

@@ -211,16 +211,12 @@ public:
     /// space, a RunSync (a hold's park is apart: Stats::holds).
     enum EmuWait : u32 { EmuTicket, EmuSpace, EmuSync, EmuWaits };
 
-    /// perflog's GPU sampler cells (Stats::gpu_at): sgxd_mkq's job kinds and wait kinds
-    /// (SGXD_MKQ_KINDS, SGXD_MKQ_WAITS), each twice (a 3D's end latched or not), after idle and
-    /// a held 3D running or done.
-    static constexpr u32 GpuAtKinds = 5;
-    static constexpr u32 GpuAtWaits = 5;
-    static constexpr u32 GpuAtIdle = 0;
-    static constexpr u32 GpuAtHeldRunning = 1;
-    static constexpr u32 GpuAtHeldDone = 2;
-    static constexpr u32 GpuAtBusy = 3;
-    static constexpr u32 GpuAtCells = GpuAtBusy + GpuAtKinds * GpuAtWaits * 2;
+#ifdef VITA_DIAGNOSTICS
+    /// perflog's GPU sampler cells: each microkernel stream's state (no job, in a job's code, or at a
+    /// wait of sgxd_mkq's kinds), cell 3D * GpuAtStates + TA.
+    static constexpr u32 GpuAtStates = 9;
+    static constexpr u32 GpuAtCells = GpuAtStates * GpuAtStates;
+    static constexpr u32 GpuLabels = 64;
 
     /// Since the last call (`perflog`; diagnostics builds only, as every counter behind it):
     /// the records the thread ran by kind, its time running them and waiting for work (us),

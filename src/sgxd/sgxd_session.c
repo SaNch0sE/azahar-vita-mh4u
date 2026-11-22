@@ -220,9 +220,30 @@ static void add(SgxdOpList *l, uint32_t kind, uint32_t reg, uint32_t value, uint
 // The core-0 waits after the master's event: already met.
 #define AFTER_EVENT_POLL_US 1000u
 
-void sgxd_session_render_list(const SgxdRecipe *r, int read_pages, uint32_t ptla_fence,
-                              SgxdOpList *l) {
-    add(l, SGXD_OP_WAIT_TWOD, 0, ptla_fence, 0);
+// A render as the microkernel's two streams run it (sgxd_mk.h): the TA stream's part, then
+// SGXD_OP_STREAM_3D and the 3D stream's. The TA side runs ahead over any 3D in flight, as far as
+// the parameter buffer lets it (WAIT_PAGES). Each TA done stores its scene's DPM state, which
+// its 3D kick loads. The 3D side kicks, and runs its done phase, only with no TA in flight (as in
+// Sony's trace). The 3D waits for its own end, so nothing is pending when its job is complete.
+
+// The pages a TA may start with while a binned scene waits for its 3D: the threshold its context's
+// pages stall at (ZLS_PAGE_THRESHOLD, every binned scene's counted) less SGXD_RECIPE_PASS_PAGES,
+// which the TA can then take (a TA out of pages stops the GPU, docs/sgxd/ta.md). With no scene
+// waiting it starts whatever is allocated, as the TA over the one 3D in flight always has.
+static uint32_t page_budget(const SgxdRecipe *r) {
+    return r->pds_threshold > SGXD_RECIPE_PASS_PAGES ? r->pds_threshold - SGXD_RECIPE_PASS_PAGES
+                                                       : 0;
+}
+
+// The TA stream's part: ops[0] the PTLA wait and, with wait_3ds, ops[1] a wait for every earlier
+// submit's 3D (sgxd_session_ta_over_3d 0); their values the caller's.
+static void ta_part(const SgxdRecipe *r, int wait_3ds, int read_pages, SgxdOpList *l) {
+    add(l, SGXD_OP_WAIT_TWOD, 0, 0, 0);
+    if (wait_3ds) {
+        add(l, SGXD_OP_WAIT_COUNT, SGXD_MK_CHAINS, 0, 0);
+    }
+    add(l, SGXD_OP_WAIT_PAGES, 0, page_budget(r), 0);
+    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA_START, 0);
     // The TA kick makes Sony's SLC requests (sgxd_recipe_events_owned).
     sgxd_recipe_ta_kick(r, l);
     add(l, SGXD_OP_WAIT_EVENT, 0, 0, TA_FINISHED);
@@ -230,13 +251,30 @@ void sgxd_session_render_list(const SgxdRecipe *r, int read_pages, uint32_t ptla
     if (read_pages) {
         add(l, SGXD_OP_READ, 0x0724, 0, 0);   // PAGE_STATUS
     }
-    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
     sgxd_recipe_ta_done(r, l);
+    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA_SCENE, 0);
+}
+
+// The 3D stream's part, from the split on.
+static void d3_part(const SgxdRecipe *r, SgxdOpList *l) {
+    add(l, SGXD_OP_STREAM_3D, 0, 0, 0);
+    add(l, SGXD_OP_WAIT_TA_IDLE, 0, 0, 0);
+    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_D3_KICK, 0);
     sgxd_recipe_3d_kick(r, l);
     add(l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
+    add(l, SGXD_OP_WAIT_TA_IDLE, 0, 0, 0);
     sgxd_recipe_3d_wait(l, AFTER_EVENT_POLL_US);
     sgxd_recipe_3d_done(r, l);
-    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
+}
+
+void sgxd_session_render_list(const SgxdRecipe *r, int read_pages, uint32_t ptla_fence,
+                              SgxdOpList *l) {
+    const unsigned first = l->count;
+    ta_part(r, 0, read_pages, l);
+    if (!l->overflow) {
+        l->ops[first].value = ptla_fence;
+    }
+    d3_part(r, l);
 }
 
 int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
@@ -259,78 +297,42 @@ int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
 
 // ------------------------------------------------------------------ overlapped lists
 //
-// The TA of pass N runs while the 3D of pass N - 1 does. A list ends right after its own 3D kick; the next
-// list, or sgxd_session_finish_pending, waits for that 3D and runs its done phase.
-
-// The pending 3D: its recipe, what it touches, whether a fence waits on it.
-static const SgxdRecipe *pending;
-static uint32_t pending_touches[6];
-static int pending_fenced;
+// No 3D is left pending for a later list: the 3D stream's part waits for its own end. These stay
+// for their callers, with nothing to do.
 
 const SgxdRecipe *sgxd_session_pending(void) {
-    return pending;
+    return NULL;
 }
 
 int sgxd_session_pending_touches(uint32_t lo, uint32_t hi) {
-    if (!pending) {
-        return 0;
-    }
-    for (unsigned n = 0; n < 6; n += 2) {
-        if (lo < pending_touches[n + 1] && pending_touches[n] < hi) {
-            return 1;
-        }
-    }
+    (void)lo;
+    (void)hi;
     return 0;
 }
 
 void sgxd_session_pending_fence(void) {
-    if (pending) {
-        pending_fenced = 1;
-    }
 }
 
 int sgxd_session_pending_fenced(void) {
-    return pending && pending_fenced;
+    return 0;
 }
 
 int sgxd_session_ta_over_3d = 1;
 
-// The pending 3D's wait and done.
-static void finish_phase(SgxdOpList *l) {
-    add(l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
-    sgxd_recipe_3d_wait(l, AFTER_EVENT_POLL_US);
-    sgxd_recipe_3d_done(pending, l);
-}
-
-// An overlapped list, its first op the PTLA wait (its value the caller's).
-static void build_overlap(const SgxdRecipe *r, int finish_previous, SgxdOpList *l) {
-    add(l, SGXD_OP_WAIT_TWOD, 0, 0, 0);
-    if (finish_previous && !sgxd_session_ta_over_3d) {
-        finish_phase(l);
-    }
-    sgxd_recipe_ta_kick(r, l);
-    add(l, SGXD_OP_WAIT_EVENT, 0, 0, TA_FINISHED);
-    sgxd_recipe_ta_wait(l, AFTER_EVENT_POLL_US);
-    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
-    sgxd_recipe_ta_done(r, l);
-    if (finish_previous && sgxd_session_ta_over_3d) {
-        finish_phase(l);
-    }
-    sgxd_recipe_3d_kick(r, l);
-    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
+// A pass's list, its first op the PTLA wait and, without the TA over the 3D, its second the wait
+// for the earlier submits' 3Ds (their values the caller's).
+static void build_overlap(const SgxdRecipe *r, SgxdOpList *l) {
+    ta_part(r, !sgxd_session_ta_over_3d, 0, l);
+    d3_part(r, l);
 }
 
 // ------------------------------------------------------------------ kept lists
 //
-// An overlapped list is the same ops at every render on a recipe but for a few values: the PTLA
-// fence it waits for, and the SGXD_KEPT_* fields (a side render's size, a pass's background and
-// depth store). A list is kept with what it was built from: the recipe's other fields the kicks
-// read, the free lists' loads, and whether and where it finishes the pending 3D and that 3D's
-// recipe's buffer. A recipe has a list for each of those it meets (a side render's after a pass
-// and after another side render, a pass's after a widen render and not). A render whose key a
-// kept list has sends it with the values rewritten in place; any other builds one, in the slot
-// used longest ago. Building the ~230 ops of every list, and copying them,
-// was about 40% of a side render's CPU time in a game.
+// A pass's list is the same ops at every render on a recipe but for a few values: the PTLA fence,
+// the earlier submits it may wait for, and the SGXD_KEPT_* fields. A list is kept with what it was
+// built from (the recipe's other fields the kicks read, the free lists' loads, the TA's wait);
+// a render whose key a kept list has sends it with the values rewritten in place, any other
+// builds one in the slot used longest ago.
 //
 // A list is its recipe's while the recipe lives (sgxd_session_forget): a new recipe at a freed
 // one's address with the same layout would otherwise send the freed one's list.
@@ -338,7 +340,7 @@ static void build_overlap(const SgxdRecipe *r, int finish_previous, SgxdOpList *
 #define KEPT_LISTS 64
 #define KEPT_OPS 384
 #define KEPT_VALUES 32
-#define KEY_WORDS (SGXD_R_COUNT + 18)
+#define KEY_WORDS (SGXD_R_COUNT + 17)
 
 typedef struct KeptList {
     const SgxdRecipe *r;
@@ -359,7 +361,7 @@ static uint32_t kept_clock;
 uint32_t sgxd_session_kept_sent, sgxd_session_kept_built, sgxd_session_finishes;
 #endif
 
-static void kept_key(const SgxdRecipe *r, int finish_previous, uint32_t key[KEY_WORDS]) {
+static void kept_key(const SgxdRecipe *r, uint32_t key[KEY_WORDS]) {
     int ta = 0, d3 = 0;
     sgxd_recipe_pb_loaded(&ta, &d3);
     memcpy(key, r->offset, sizeof(r->offset));
@@ -379,7 +381,6 @@ static void kept_key(const SgxdRecipe *r, int finish_previous, uint32_t key[KEY_
     *k++ = r->pixev_attribute_size;
     *k++ = (uint32_t)ta;
     *k++ = (uint32_t)d3;
-    *k++ = (uint32_t)finish_previous;
     *k++ = (uint32_t)sgxd_session_ta_over_3d;
     *k++ = r->samples;
 }
@@ -390,14 +391,26 @@ void sgxd_session_forget(const SgxdRecipe *r) {
             kept_lists[n].r = NULL;
         }
     }
-    *k++ = finish_previous ? (uint32_t)pending->shared_pb : 0;
+}
+
+// The values a sent list's waits take: the PTLA count, and the earlier submits' count.
+static void set_waits(SgxdOp *ops) {
+    ops[0].value = sgxd_ptla_fence();
+    if (!sgxd_session_ta_over_3d) {
+        ops[1].value = sgxd_mkq_jobs_sent();
+    }
 }
 
 int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], char *failed,
                                 unsigned failed_size) {
-    const int finish_previous = pending != NULL;
+    (void)touches;
+    // Both streams' lists need the shared parameter buffer: Sony's DPM slots, a TA over a 3D.
+    if (!r->shared_pb) {
+        snprintf(failed, failed_size, "overlapped render: a recipe with its own parameter buffer");
+        return -1;
+    }
     uint32_t key[KEY_WORDS];
-    kept_key(r, finish_previous, key);
+    kept_key(r, key);
     KeptList *k = NULL, *oldest = &kept_lists[0];
     for (unsigned n = 0; n < KEPT_LISTS && !k; n++) {
         KeptList *const at = &kept_lists[n];
@@ -411,7 +424,7 @@ int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], 
     if (!kept) {
         k = oldest;
         SgxdOpList l = {k->ops, 0, KEPT_OPS, 0, k->kept, 0, KEPT_VALUES};
-        build_overlap(r, finish_previous, &l);
+        build_overlap(r, &l);
         if (l.overflow) {
             k->r = NULL;
             snprintf(failed, failed_size, "overlapped render: more than %u ops or %u kept values",
@@ -426,88 +439,37 @@ int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], 
         for (unsigned n = 0; n < k->nkept; n++) {
             k->variable[k->kept[n].op] = 1;
         }
-        k->code = (SgxdMkqCode){0, 0};
+        k->code = (SgxdMkqCode){0, 0, 0};
 #ifdef VITA_DIAGNOSTICS
         sgxd_session_kept_built++;
 #endif
     }
     k->used = ++kept_clock;
-    k->ops[0].value = sgxd_ptla_fence();
+    set_waits(k->ops);
     for (unsigned n = 0; n < k->nkept; n++) {
         k->ops[k->kept[n].op].value = sgxd_recipe_kept_value(r, k->kept[n].field);
     }
     if (kept) {
-#ifdef VITA_DIAGNOSTICS
-        // gxm_flags kickcheck: the kept list against one built now (which loads the free lists
-        // as the kept one does).
-        if (sgxd_session_kept_check) {
-            SgxdOpList l = {chain_ops, 0, SGXD_MAX_CHAIN_OPS, 0};
-            build_overlap(r, finish_previous, &l);
-            chain_ops[0].value = k->ops[0].value;
-            unsigned at = 0;
-            while (at < l.count && at < k->count &&
-                   memcmp(&chain_ops[at], &k->ops[at], sizeof(SgxdOp)) == 0) {
-                at++;
-            }
-            if (l.overflow || at != l.count || l.count != k->count) {
-                const SgxdOp *want = at < l.count ? &chain_ops[at] : NULL;
-                const SgxdOp *got = at < k->count ? &k->ops[at] : NULL;
-                snprintf(failed, failed_size,
-                         "kickcheck: the kept list (%u ops) differs from a built one (%u) at op "
-                         "%u: reg 0x%05x value 0x%08x kept, reg 0x%05x value 0x%08x built",
-                         k->count, l.count, at, got ? got->reg : 0, got ? got->value : 0,
-                         want ? want->reg : 0, want ? want->value : 0);
-                return -1;
-            }
-        } else
-#endif
-        {
-            sgxd_recipe_pb_kicked(r);
-        }
+        sgxd_recipe_pb_kicked(r);
 #ifdef VITA_DIAGNOSTICS
         sgxd_session_kept_sent++;
 #endif
     }
 #ifdef VITA_DIAGNOSTICS
-    sgxd_mkq_kind_next = finish_previous && sgxd_session_ta_over_3d ? SGXD_MKQ_KIND_RENDER_OVER
-                                                                    : SGXD_MKQ_KIND_RENDER;
+    sgxd_mkq_kind_next = SGXD_MKQ_KIND_RENDER;
 #endif
     const int ret = sgxd_chain_submit_vars(k->ops, k->count, k->variable, &k->code);
     if (ret < 0) {
         snprintf(failed, failed_size, "overlapped render: sgxd_chain_submit %08x", (unsigned)ret);
         return -1;
     }
-    pending = r;
-    pending_fenced = 0;
-    for (unsigned n = 0; n < 6; n++) {
-        pending_touches[n] = touches ? touches[n] : 0;
-    }
     renders++;
     return 0;
 }
 
 int sgxd_session_finish_pending(char *failed, unsigned failed_size) {
-    if (!pending) {
-        return 0;
-    }
-    SgxdOpList l = {chain_ops, 0, SGXD_MAX_CHAIN_OPS, 0};
-    // One TA signal and one DONE a list, so both counts stay the lists' count.
-    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
-    add(&l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
-    sgxd_recipe_3d_wait(&l, AFTER_EVENT_POLL_US);
-    sgxd_recipe_3d_done(pending, &l);
-    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
-#ifdef VITA_DIAGNOSTICS
-    sgxd_mkq_kind_next = SGXD_MKQ_KIND_FINISH;
-    sgxd_session_finishes++;
-#endif
-    const int ret = sgxd_chain_submit(chain_ops, l.count);
-    if (ret < 0) {
-        snprintf(failed, failed_size, "render finish: sgxd_chain_submit %08x", (unsigned)ret);
-        return -1;
-    }
-    pending = NULL;
-    pending_fenced = 0;
+    (void)failed;
+    (void)failed_size;
     return 0;
 }
 
@@ -543,6 +505,17 @@ void sgxd_session_render_async_failed(char *failed, unsigned failed_size) {
         snprintf(failed + used, failed_size - used, ", op %u of job %u (kind %u)",
                  (unsigned)(fault - 1u), (unsigned)(mk[SGXD_MK_POS] - 1u),
                  (unsigned)mk[SGXD_MK_FAULT_KIND]);
+    }
+    {
+        // The 3D stream, and the counts the streams wait on each other by.
+        const size_t used = strlen(failed);
+        snprintf(failed + used, failed_size - used,
+                 "; 3D stream: job %u of %u taken, resume at %u; TA jobs done %u, TA busy %u, "
+                 "scenes binned %u, 3Ds kicked %u",
+                 (unsigned)mk[SGXD_MK_POS3], (unsigned)mk[SGXD_MK_END3],
+                 (unsigned)mk[SGXD_MK_RESUME3], (unsigned)mk[SGXD_MK_CHAIN_TA],
+                 (unsigned)mk[SGXD_MK_TA_BUSY], (unsigned)mk[SGXD_MK_TA_SCENES],
+                 (unsigned)mk[SGXD_MK_D3_KICKS]);
     }
     {
         // The job's entry and data slot, and the code space's generation.

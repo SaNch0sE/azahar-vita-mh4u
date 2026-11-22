@@ -6,6 +6,7 @@
 #include "sgxd_ptla.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include <psp2/kernel/error.h>
 #include <psp2/kernel/processmgr.h>
@@ -55,7 +56,8 @@ static uint32_t cycles_per_us;
 // sgxd_ptla_events: the ISR's page, and the completions asked for so far (one a FLUSH).
 static const volatile SgxdEvents *events;
 static uint32_t twod_sent;
-// sgxd_chain_submit: the async lists sent, each ending in one SGXD_SIGNAL_DONE.
+// sgxd_chain_submit: the async lists sent, each counted once by its 3D stream job's
+// SGXD_SIGNAL_DONE (sgxd_mkq_submit).
 static uint32_t chains_sent;
 // The microkernel's state block, whose words hold the counts, the fault and the waker; set
 // with events.
@@ -212,9 +214,12 @@ int sgxd_remap_submit(const uint32_t* pte_va, const uint32_t* pte, unsigned coun
         snprintf(failed, failed_size, "remap of %u PTEs", count);
         return -1;
     }
-    SgxdOp ops[1 + SGXD_REMAP_MAX + 2 * 6 + 2];
+    SgxdOp ops[2 + SGXD_REMAP_MAX + 2 * 6];
     unsigned n = 0;
     ops[n++] = (SgxdOp){SGXD_OP_WAIT_TWOD, 0, twod_sent, 0, TWOD_POLL_US};
+    // Every earlier submit's 3D done: the microkernel's TA stream runs ahead of its 3D stream, and
+    // nothing may run beside the MMU invalidate. The TAs before it have, in the TA stream's order.
+    ops[n++] = (SgxdOp){SGXD_OP_WAIT_COUNT, SGXD_MK_CHAINS, sgxd_mkq_jobs_sent(), 0, 0};
     for (unsigned k = 0; k < count; k++) {
         ops[n++] = (SgxdOp){SGXD_OP_STORE, 0, pte[k], pte_va[k], 0};
     }
@@ -222,8 +227,6 @@ int sgxd_remap_submit(const uint32_t* pte_va, const uint32_t* pte, unsigned coun
         ops[n++] = (SgxdOp){SGXD_OP_WRITE, banks[b] + 0x0c34u, 0, 0, 0};
         ops[n++] = (SgxdOp){SGXD_OP_WRITE, banks[b] + 0x0c34u, 0x8u, 0, 0};
     }
-    ops[n++] = (SgxdOp){SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0, 0};
-    ops[n++] = (SgxdOp){SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0, 0};
     const int r = sgxd_chain_submit_vars(ops, n, NULL, NULL);
     if (r < 0) {
         snprintf(failed, failed_size, "remap of %u PTEs from %08x: sgxd_chain_submit %08x", count,
@@ -483,14 +486,12 @@ static unsigned copy_blit(SgxdOp *ops, const SgxdPtlaCopy *c, uint32_t x, uint32
 // the lists' count stays the fence. Returns at once.
 static int submit_queued(SgxdOp *ops, unsigned n, const char *what, char *failed,
                          unsigned failed_size) {
+    // First every earlier submit's 3D (the microkernel's TA stream runs ahead of its 3D stream):
+    // the op may read what a 3D stored or overwrite what one reads.
+    memmove(ops + 1, ops, n * sizeof(SgxdOp));
+    ops[0] = (SgxdOp){SGXD_OP_WAIT_COUNT, SGXD_MK_CHAINS, sgxd_mkq_jobs_sent(), 0, 0};
+    n++;
     ops[n++] = (SgxdOp){SGXD_OP_WAIT_TWOD, 0, twod_sent, 0, TWOD_POLL_US};
-    const SgxdOp tail[] = {
-        {SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0, 0},
-        {SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0, 0},
-    };
-    for (unsigned k = 0; k < sizeof(tail) / sizeof(tail[0]); k++) {
-        ops[n++] = tail[k];
-    }
     // The stream's words are the job's: one code a shape of fill or copy.
     uint8_t variable[64];
     for (unsigned k = 0; k < n; k++) {

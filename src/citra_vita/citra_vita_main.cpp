@@ -559,28 +559,19 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                  "the next list {:.0f}%",
                                  100.0 * t.gpu_busy / t.gpu_samples, t.gpu_samples,
                                  100.0 * t.gpu_held / t.gpu_samples);
-                        // Where: the running job's kind (sgxd_mkq's), the wait its run stopped
-                        // at (code: none, in its code), "+end" with a 3D's end latched (the 3D
-                        // unit idle).
+                        // Where the microkernel's streams are: no job, a job's code, or the
+                        // wait they stopped at (3D stream / TA stream).
                         using RT = SgxdRenderer::RenderThread;
-                        static constexpr const char* kinds[] = {"other", "render", "over", "finish",
-                                                                "ptla"};
-                        static constexpr const char* waits[] = {"code", "TA", "3D", "2D", "event"};
+                        static constexpr const char* states[] = {
+                            "idle", "code", "TA", "3D", "2D", "event", "count", "TA idle", "pages"};
+                        static_assert(std::size(states) == RT::GpuAtStates);
                         const auto pct = [&](u32 n) { return 100.0 * n / t.gpu_samples; };
-                        std::string at = fmt::format(
-                            "idle {:.1f}%, held 3D running {:.1f}%, held 3D done {:.1f}%",
-                            pct(t.gpu_at[RT::GpuAtIdle]), pct(t.gpu_at[RT::GpuAtHeldRunning]),
-                            pct(t.gpu_at[RT::GpuAtHeldDone]));
-                        for (u32 k = 0; k < RT::GpuAtKinds; k++) {
-                            for (u32 w = 0; w < RT::GpuAtWaits; w++) {
-                                for (u32 e = 0; e < 2; e++) {
-                                    const u32 n =
-                                        t.gpu_at[RT::GpuAtBusy + (k * RT::GpuAtWaits + w) * 2 + e];
-                                    if (n != 0) {
-                                        at += fmt::format(", {}:{}{} {:.1f}%", kinds[k], waits[w],
-                                                          e ? "+end" : "", pct(n));
-                                    }
-                                }
+                        std::string at;
+                        for (u32 c = 0; c < RT::GpuAtCells; c++) {
+                            if (t.gpu_at[c] * 200 >= t.gpu_samples) {
+                                at += fmt::format("{}3D {} / TA {} {:.1f}%", at.empty() ? "" : ", ",
+                                                  states[c / RT::GpuAtStates],
+                                                  states[c % RT::GpuAtStates], pct(t.gpu_at[c]));
                             }
                         }
                         LOG_INFO(Frontend, "perf: GPU at: {}", at);

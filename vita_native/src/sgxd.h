@@ -62,10 +62,25 @@ typedef struct SgxdOp {
 #define SGXD_OP_SIGNAL 7u
 #define SGXD_SIGNAL_TA 0u      // the render's vertices are read
 #define SGXD_SIGNAL_DONE 1u    // the list is complete
+// The two streams' (sgxd_mk.h): a TA kicked (TA_BUSY), a scene binned and its TA side done
+// (TA_BUSY cleared, TA_SCENES counted), a 3D kicked (D3_KICKS counted).
+#define SGXD_SIGNAL_TA_START 2u
+#define SGXD_SIGNAL_TA_SCENE 3u
+#define SGXD_SIGNAL_D3_KICK 4u
 // STORE (an async list's, version 14): the word `value` stored at GPU address `mask`, both from
 // the job's data slot, the store fenced. For a page table entry the GPU itself rewrites, in the
 // queue's order (sgxdMapTables, sgxdPte), before the MMU invalidate after it.
 #define SGXD_OP_STORE 8u
+// The two streams' waits (sgxd_mk.h): WAIT_COUNT until the microkernel's state word `reg` reaches
+// value (the job's, as WAIT_TWOD's); WAIT_TA_IDLE until no TA is in flight; WAIT_PAGES until the
+// TA context has at most `value` pages (PAGE_STATUS's high half), or no binned scene waits for
+// its 3D.
+// STREAM_3D splits a job's list: the TA stream runs the ops before it, the 3D stream the ops
+// after it.
+#define SGXD_OP_WAIT_COUNT 9u
+#define SGXD_OP_WAIT_TA_IDLE 10u
+#define SGXD_OP_WAIT_PAGES 11u
+#define SGXD_OP_STREAM_3D 12u
 #define SGXD_MAX_OPS 256u
 // An async list's ops at most (the app's rule).
 #define SGXD_MAX_CHAIN_OPS 1024u

@@ -31,7 +31,7 @@ extern "C" {
 // lookup and reads only the ops in value_op: value_op[s][k] is op n << 1 for its value, n << 1 | 1
 // for a STORE's address (its mask), or SGXD_MKQ_VALUE_JOB. Zeroed: none yet.
 typedef struct SgxdMkqCode {
-    uint32_t entry, generation;
+    uint32_t entry, generation, entry3;
     uint8_t values[2];
     uint16_t value_op[2][SGXD_MK_DATA_WORDS];
 } SgxdMkqCode;
@@ -45,8 +45,13 @@ int sgxd_mkq_start(uint32_t va, char *failed, unsigned failed_size);
 void sgxd_mkq_stop(void);
 // The state block (SGXD_MK_*), or NULL before the start.
 volatile uint32_t *sgxd_mkq_state(void);
-// A list as a job: its code (code's if current, else the shape's, compiled when new), its
-// variable values into the job's data slot, then END; with BUSY clear, BUSY set and a kick.
+// A list as two jobs, one for each of the microkernel's streams (sgxd_mk.h): the ops before an
+// SGXD_OP_STREAM_3D (all, without one) as the TA stream's job, ending in its SIGNAL_TA; the ops
+// after it as the 3D stream's, which waits for that TA job first and ends in its SIGNAL_DONE. So
+// CHAIN_TA and CHAINS each count the submits, and CHAINS in their order. A list may not carry
+// either signal itself (AZAHAR_ERR_ARG). Each job's code (code's if current, else the shape's,
+// compiled when new), its variable values into its data slot, then both ENDs; with BUSY clear,
+// BUSY set and a kick.
 // variable as sgxd_mk_compile's; code may be NULL. A full ring spins until the GPU has made room
 // (a second at most). Returns 0 or a negative error (AZAHAR_ERR_STATE after a fault or when a
 // flip found the GPU not idle within a second, which the console names; the compiler's
@@ -81,11 +86,14 @@ enum {
     SGXD_MKQ_KINDS,
 };
 enum {
-    SGXD_MKQ_WAIT_NONE,  // the run is in the list's code (or between runs)
-    SGXD_MKQ_WAIT_TA,    // TA_FINISHED
-    SGXD_MKQ_WAIT_3D,    // PIXELBE_END_RENDER
-    SGXD_MKQ_WAIT_TWOD,  // a PTLA count
-    SGXD_MKQ_WAIT_EVENT, // another event
+    SGXD_MKQ_WAIT_NONE,    // the run is in the list's code (or between runs)
+    SGXD_MKQ_WAIT_TA,      // TA_FINISHED
+    SGXD_MKQ_WAIT_3D,      // PIXELBE_END_RENDER
+    SGXD_MKQ_WAIT_TWOD,    // a PTLA count
+    SGXD_MKQ_WAIT_EVENT,   // another event
+    SGXD_MKQ_WAIT_COUNT,   // a count of the microkernel's (the other stream's jobs)
+    SGXD_MKQ_WAIT_TA_IDLE, // no TA in flight
+    SGXD_MKQ_WAIT_PAGES,   // the parameter buffer's budget
     SGXD_MKQ_WAITS,
 };
 extern uint8_t sgxd_mkq_kind_next;

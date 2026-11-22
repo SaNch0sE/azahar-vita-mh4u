@@ -90,9 +90,11 @@ int sgxd_mk_runtime(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
         return SGX_USSE_EINVAL;
     }
     sgx_usse_init(a, code, cap, base);
-    const int no_twod = sgx_usse_label(a), go = sgx_usse_label(a), next = sgx_usse_label(a);
+    const int no_twod = sgx_usse_label(a), next = sgx_usse_label(a), round = sgx_usse_label(a);
     const int idle = sgx_usse_label(a), exit = sgx_usse_label(a), quiet = sgx_usse_label(a);
-    const int wake = sgx_usse_label(a);
+    const int wake = sgx_usse_label(a), resume3 = sgx_usse_label(a), ta_part = sgx_usse_label(a);
+    const int resume_ta = sgx_usse_label(a), round_end = sgx_usse_label(a);
+    const int blocked3 = sgx_usse_label(a), blocked_ta = sgx_usse_label(a);
     const int supervisor = sgx_usse_label(a), supervised = sgx_usse_label(a);
     const int back = sgx_usse_label(a);
 
@@ -118,25 +120,60 @@ int sgxd_mk_runtime(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
     sgx_usse_wdf(a, 0);
     sgx_usse_call(a, AL, wake);
     sgx_usse_bind(a, no_twod);
-    // RESUME through the link register, the job's data slot with it; 0 is a new job.
-    sgx_usse_ld(a, AL, R(1), R(0), IMM(SGXD_MK_RESUME), 0);
-    sgx_usse_ld(a, AL, R(MK_DATA_REG), R(0), IMM(SGXD_MK_DATA), 0);
-    sgx_usse_wdf(a, 0);
-    sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_NONZERO, R(1), R(1));
-    sgx_usse_ba(a, SGX_USSE_P0, go);
 
-    // The next job: none after a fault (whose stores the fault fenced); none published, the
-    // queue idle; otherwise POS moves past it, its data slot goes into r20 and DATA, and its list
-    // runs.
-    sgx_usse_bind(a, next);
-    sgx_usse_ld(a, AL, R(1), R(0), IMM(SGXD_MK_POS), 0);
-    sgx_usse_ld(a, AL, R(2), R(0), IMM(SGXD_MK_END), 0);
+    // A round: the 3D stream, then the TA stream, each going on where it stopped (its RESUME)
+    // or taking its next job; a list's end starts the round again (next), a wait not met goes on
+    // to the other stream (blocked3) or ends the round (blocked_ta). Rounds go on while one gets
+    // anywhere: a job taken or a wait met sets PROGRESS. None after a fault (its stores fenced).
+    sgx_usse_bind(a, round);
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_PROGRESS), IMM(0));
     sgx_usse_ld(a, AL, R(9), R(0), IMM(SGXD_MK_FAULT), 0);
+    sgx_usse_ld(a, AL, R(1), R(0), IMM(SGXD_MK_RESUME3), 0);
     sgx_usse_wdf(a, 0);
     sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_NONZERO, R(9), R(9));
     sgx_usse_ba(a, SGX_USSE_P0, quiet);
+    sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_NONZERO, R(1), R(1));
+    sgx_usse_ba(a, SGX_USSE_P0, resume3);
+    // The 3D stream's next job: POS3 past it, its data slot into r20, DATA3 and DATA.
+    sgx_usse_ld(a, AL, R(1), R(0), IMM(SGXD_MK_POS3), 0);
+    sgx_usse_ld(a, AL, R(2), R(0), IMM(SGXD_MK_END3), 0);
+    sgx_usse_wdf(a, 0);
     sgx_usse_test(a, AL, 0, SGX_USSE_TST_XOR, SGX_USSE_ZERO, R(1), R(2));
-    sgx_usse_ba(a, SGX_USSE_P0, idle);
+    sgx_usse_ba(a, SGX_USSE_P0, ta_part);
+    sgx_usse_bitop(a, AL, SGX_USSE_AND, R(9), R(1), IMM(l->jobs - 1u), 0);
+    sgx_usse_limm(a, AL, R(10), l->jobs3_va);
+    sgx_usse_imad2(a, AL, R(3), R(9), IMM(4), R(10));
+    sgx_usse_ld(a, AL, R(4), R(3), IMM(0), 0);
+    sgx_usse_limm(a, AL, R(11), l->data3_va);
+    sgx_usse_limm(a, AL, R(12), SGXD_MK_DATA_WORDS * 4u);
+    sgx_usse_imad2(a, AL, R(MK_DATA_REG), R(9), R(12), R(11));
+    sgx_usse_imad2(a, AL, R(1), R(1), IMM(1), IMM(1));
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_POS3), R(1));
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_DATA3), R(MK_DATA_REG));
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_DATA), R(MK_DATA_REG));
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_PROGRESS), IMM(1));
+    sgx_usse_wdf(a, 0);
+    sgx_usse_setl(a, R(4));
+    sgx_usse_ret(a, AL);
+    sgx_usse_bind(a, resume3);
+    sgx_usse_ld(a, AL, R(MK_DATA_REG), R(0), IMM(SGXD_MK_DATA3), 0);
+    sgx_usse_wdf(a, 0);
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_DATA), R(MK_DATA_REG));
+    sgx_usse_setl(a, R(1));
+    sgx_usse_ret(a, AL);
+
+    // The TA stream, the same from its own words.
+    sgx_usse_bind(a, blocked3);
+    sgx_usse_bind(a, ta_part);
+    sgx_usse_ld(a, AL, R(1), R(0), IMM(SGXD_MK_RESUME), 0);
+    sgx_usse_wdf(a, 0);
+    sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_NONZERO, R(1), R(1));
+    sgx_usse_ba(a, SGX_USSE_P0, resume_ta);
+    sgx_usse_ld(a, AL, R(1), R(0), IMM(SGXD_MK_POS), 0);
+    sgx_usse_ld(a, AL, R(2), R(0), IMM(SGXD_MK_END), 0);
+    sgx_usse_wdf(a, 0);
+    sgx_usse_test(a, AL, 0, SGX_USSE_TST_XOR, SGX_USSE_ZERO, R(1), R(2));
+    sgx_usse_ba(a, SGX_USSE_P0, round_end);
     sgx_usse_bitop(a, AL, SGX_USSE_AND, R(9), R(1), IMM(l->jobs - 1u), 0);
     sgx_usse_limm(a, AL, R(10), l->jobs_va);
     sgx_usse_imad2(a, AL, R(3), R(9), IMM(4), R(10));
@@ -146,24 +183,58 @@ int sgxd_mk_runtime(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
     sgx_usse_imad2(a, AL, R(MK_DATA_REG), R(9), R(12), R(11));
     sgx_usse_imad2(a, AL, R(1), R(1), IMM(1), IMM(1));
     sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_POS), R(1));
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_DATA_TA), R(MK_DATA_REG));
     sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_DATA), R(MK_DATA_REG));
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_PROGRESS), IMM(1));
     sgx_usse_wdf(a, 0);
     sgx_usse_setl(a, R(4));
     sgx_usse_ret(a, AL);
+    sgx_usse_bind(a, resume_ta);
+    sgx_usse_ld(a, AL, R(MK_DATA_REG), R(0), IMM(SGXD_MK_DATA_TA), 0);
+    sgx_usse_wdf(a, 0);
+    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_DATA), R(MK_DATA_REG));
+    sgx_usse_setl(a, R(1));
+    sgx_usse_ret(a, AL);
 
-    // Out of jobs: BUSY cleared, then END read again (the host writes END, then reads BUSY). The
-    // BUSY store is the run's: no run ends at a store fence with nothing stored before it (the
-    // first run after the takeover never got past one, sgxd_test 21).
+    // A list's end: the round again, from the 3D stream.
+    sgx_usse_bind(a, next);
+    sgx_usse_ba(a, AL, round);
+
+    // The round's end: another round if it got anywhere; otherwise a stream stopped at a wait
+    // ends the run (an event or the other stream moves it), and with both out of jobs the queue
+    // idles.
+    sgx_usse_bind(a, blocked_ta);
+    sgx_usse_bind(a, round_end);
+    sgx_usse_ld(a, AL, R(9), R(0), IMM(SGXD_MK_PROGRESS), 0);
+    sgx_usse_wdf(a, 0);
+    sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_NONZERO, R(9), R(9));
+    sgx_usse_ba(a, SGX_USSE_P0, round);
+    sgx_usse_ld(a, AL, R(1), R(0), IMM(SGXD_MK_RESUME), 0);
+    sgx_usse_ld(a, AL, R(2), R(0), IMM(SGXD_MK_RESUME3), 0);
+    sgx_usse_wdf(a, 0);
+    sgx_usse_bitop(a, AL, SGX_USSE_OR, R(9), R(1), R(2), 0);
+    sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_NONZERO, R(9), R(9));
+    sgx_usse_ba(a, SGX_USSE_P0, exit);
+
+    // Out of jobs: BUSY cleared, then both ENDs read again (the host writes END, then reads BUSY).
+    // The BUSY store is the run's: no run ends at a store fence with nothing stored before it
+    // (the first run after the takeover never got past one).
     sgx_usse_bind(a, idle);
     sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_BUSY), IMM(0));
     sgx_usse_idf(a, 0);
     sgx_usse_wdf(a, 0);
+    sgx_usse_ld(a, AL, R(1), R(0), IMM(SGXD_MK_POS), 0);
     sgx_usse_ld(a, AL, R(2), R(0), IMM(SGXD_MK_END), 0);
+    sgx_usse_ld(a, AL, R(3), R(0), IMM(SGXD_MK_POS3), 0);
+    sgx_usse_ld(a, AL, R(4), R(0), IMM(SGXD_MK_END3), 0);
     sgx_usse_wdf(a, 0);
-    sgx_usse_test(a, AL, 0, SGX_USSE_TST_XOR, SGX_USSE_ZERO, R(1), R(2));
+    sgx_usse_bitop(a, AL, SGX_USSE_XOR, R(9), R(1), R(2), 0);
+    sgx_usse_bitop(a, AL, SGX_USSE_XOR, R(10), R(3), R(4), 0);
+    sgx_usse_bitop(a, AL, SGX_USSE_OR, R(9), R(9), R(10), 0);
+    sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_ZERO, R(9), R(9));
     sgx_usse_ba(a, SGX_USSE_P0, quiet);
     sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_BUSY), IMM(1));
-    sgx_usse_ba(a, AL, next);
+    sgx_usse_ba(a, AL, round);
 
     // A run's end: everything stored before the lock goes.
     sgx_usse_bind(a, exit);
@@ -173,9 +244,6 @@ int sgxd_mk_runtime(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
     sgx_usse_release(a, 7);
     sgx_usse_phas_end(a);
     sgx_usse_nop_end(a);
-    sgx_usse_bind(a, go);
-    sgx_usse_setl(a, R(1));
-    sgx_usse_ret(a, AL);
     sgx_usse_bind(a, wake);
     emit_wake(a);
     // Supervised writes: the link and p0..p3 into r29, `sprvv.end`, and the
@@ -238,6 +306,8 @@ int sgxd_mk_runtime(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
     rt->start = base;
     rt->next = sgx_usse_label_index(a, next);
     rt->exit = sgx_usse_label_index(a, exit);
+    rt->blocked[SGXD_MK_STREAM_TA] = sgx_usse_label_index(a, blocked_ta);
+    rt->blocked[SGXD_MK_STREAM_3D] = sgx_usse_label_index(a, blocked3);
     rt->wake = sgx_usse_label_index(a, wake);
     rt->supervisor = sgx_usse_label_index(a, supervisor);
     rt->supervised = sgx_usse_label_index(a, supervised);
@@ -377,10 +447,28 @@ static void emit_poll(struct sgx_usse_asm *a, const ValueCache *c, const SgxdOp 
 
 void (*sgxd_mk_wait_placed)(uint32_t at, const SgxdOp *op);
 
+// The ops a segment ends at: a run stops there until the wait is met.
+static int is_wait(uint32_t op) {
+    return op == SGXD_OP_WAIT_EVENT || op == SGXD_OP_WAIT_TWOD || op == SGXD_OP_WAIT_COUNT ||
+           op == SGXD_OP_WAIT_TA_IDLE || op == SGXD_OP_WAIT_PAGES;
+}
+
 int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLayout *l,
                     const SgxdMkRuntime *rt, const SgxdOp *ops, uint32_t nops,
                     const uint8_t *variable, int (*writable)(uint32_t reg), uint32_t *refused) {
+    return sgxd_mk_compile_stream(code, cap, base, l, rt, ops, nops, variable, writable, refused,
+                                  SGXD_MK_STREAM_TA);
+}
+
+int sgxd_mk_compile_stream(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLayout *l,
+                           const SgxdMkRuntime *rt, const SgxdOp *ops, uint32_t nops,
+                           const uint8_t *variable, int (*writable)(uint32_t reg),
+                           uint32_t *refused, uint32_t stream) {
     struct sgx_usse_asm as, *a = &as;
+    if (stream > SGXD_MK_STREAM_3D) {
+        return SGX_USSE_EINVAL;
+    }
+    const uint32_t resume_word = stream == SGXD_MK_STREAM_3D ? SGXD_MK_RESUME3 : SGXD_MK_RESUME;
     sgx_usse_init(a, code, cap, base);
     *refused = 0xffffffffu;
     uint32_t nvar = 0;
@@ -399,8 +487,7 @@ int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
     uint32_t var = 0;   // the next variable value's word in the data slot
     for (uint32_t n = 0; n < nops && !a->err;) {
         uint32_t seg_end = n, seg_vars = 0;
-        while (seg_end < nops && ops[seg_end].op != SGXD_OP_WAIT_EVENT &&
-               ops[seg_end].op != SGXD_OP_WAIT_TWOD) {
+        while (seg_end < nops && !is_wait(ops[seg_end].op)) {
             seg_vars += sgxd_mk_is_variable(&ops[seg_end], variable, seg_end)
                             ? sgxd_mk_var_words(&ops[seg_end])
                             : 0u;
@@ -552,11 +639,31 @@ int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
             case SGXD_OP_SIGNAL:
                 sgx_usse_idf(a, 0);
                 sgx_usse_wdf(a, 0);
-                count(a, op->value == SGXD_SIGNAL_TA ? SGXD_MK_CHAIN_TA : SGXD_MK_CHAINS);
+                switch (op->value) {
+                case SGXD_SIGNAL_TA:
+                    count(a, SGXD_MK_CHAIN_TA);
+                    break;
+                case SGXD_SIGNAL_DONE:
+                    count(a, SGXD_MK_CHAINS);
+                    break;
+                case SGXD_SIGNAL_TA_START:
+                    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_TA_BUSY), IMM(1));
+                    break;
+                case SGXD_SIGNAL_TA_SCENE:
+                    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_TA_BUSY), IMM(0));
+                    count(a, SGXD_MK_TA_SCENES);
+                    break;
+                case SGXD_SIGNAL_D3_KICK:
+                    count(a, SGXD_MK_D3_KICKS);
+                    break;
+                default:
+                    *refused = n;
+                    return SGX_USSE_EINVAL;
+                }
                 sgx_usse_idf(a, 0);
                 sgx_usse_wdf(a, 0);
                 // Only a list's end wakes the app (sgxdWaker's targets are chains and twod).
-                if (op->value != SGXD_SIGNAL_TA) {
+                if (op->value == SGXD_SIGNAL_DONE) {
                     sgx_usse_call_index(a, AL, rt->wake);
                 }
                 n++;
@@ -573,13 +680,41 @@ int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
             if (sgxd_mk_wait_placed) {
                 sgxd_mk_wait_placed(here, op);
             }
+            // Each leaves p0 set when the wait is not met.
+            uint32_t met_early = 0xffffffffu;
             if (op->op == SGXD_OP_WAIT_EVENT) {
                 sgx_usse_limm(a, AL, R(7), op->mask);
                 sgx_usse_ldr(a, R(10), MK_MASTER_EVENT_STATUS, 0);
                 sgx_usse_wdf(a, 0);
                 sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_ZERO, R(10), R(7));
+            } else if (op->op == SGXD_OP_WAIT_TA_IDLE) {
+                sgx_usse_ld(a, AL, R(10), R(0), IMM(SGXD_MK_TA_BUSY), 0);
+                sgx_usse_wdf(a, 0);
+                sgx_usse_test(a, AL, 0, SGX_USSE_TST_AND, SGX_USSE_NONZERO, R(10), R(10));
+            } else if (op->op == SGXD_OP_WAIT_PAGES) {
+                // Met with no binned scene waiting for its 3D (TA_SCENES == D3_KICKS), or with
+                // PAGE_STATUS's high half (the TA context's pages, what ZLS_PAGE_THRESHOLD
+                // compares) at most value.
+                sgx_usse_ld(a, AL, R(10), R(0), IMM(SGXD_MK_TA_SCENES), 0);
+                sgx_usse_ld(a, AL, R(11), R(0), IMM(SGXD_MK_D3_KICKS), 0);
+                sgx_usse_ldr(a, R(12), 0x0724u, 0);
+                sgx_usse_wdf(a, 0);
+                sgx_usse_test(a, AL, 0, SGX_USSE_TST_XOR, SGX_USSE_ZERO, R(10), R(11));
+                met_early = a->len;
+                sgx_usse_ba_index(a, SGX_USSE_P0, 0);
+                sgx_usse_bitop(a, AL, SGX_USSE_SHR, R(12), R(12), IMM(16), 0);
+                sgx_usse_limm(a, AL, R(14), op->value);
+                sub(a, R(11), R(14), R(12));
+                negative(a, R(11), R(13));
             } else {
-                sgx_usse_ld(a, AL, R(10), R(0), IMM(SGXD_MK_TWOD), 0);
+                // WAIT_TWOD (the PTLA count) or WAIT_COUNT (state word reg): the count from the
+                // job's data slot.
+                const uint32_t word = op->op == SGXD_OP_WAIT_TWOD ? SGXD_MK_TWOD : op->reg;
+                if (word >= SGXD_MK_STATE_WORDS) {
+                    *refused = n;
+                    return SGX_USSE_EINVAL;
+                }
+                sgx_usse_ld(a, AL, R(10), R(0), IMM(word), 0);
                 sgx_usse_ld(a, AL, R(6), R(MK_DATA_REG), IMM(var), 0);
                 sgx_usse_wdf(a, 0);
                 var++;
@@ -588,23 +723,27 @@ int sgxd_mk_compile(uint64_t *code, uint32_t cap, uint32_t base, const SgxdMkLay
             }
             const uint32_t met = a->len;
             sgx_usse_ba_index(a, SGX_USSE_NOT_P0, 0);
-            // Not met: the next event's run goes on here. A WAIT_TWOD leaves the count it waits
-            // for in VALUE, for a stop's post-mortem.
-            if (op->op == SGXD_OP_WAIT_TWOD) {
+            // Not met: the stream goes on here at a later round. A count wait leaves the count it
+            // waits for in VALUE, for a stop's post-mortem.
+            if (op->op == SGXD_OP_WAIT_TWOD || op->op == SGXD_OP_WAIT_COUNT) {
                 sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_VALUE), R(6));
             }
             sgx_usse_limm(a, AL, R(9), here);
-            sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_RESUME), R(9));
-            sgx_usse_ba_index(a, AL, rt->exit);
+            sgx_usse_st(a, AL, R(0), IMM(resume_word), R(9));
+            sgx_usse_ba_index(a, AL, rt->blocked[stream]);
             patch(a, met, sgx_usse_here(a));
+            if (met_early != 0xffffffffu) {
+                patch(a, met_early, sgx_usse_here(a));
+            }
+            sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_PROGRESS), IMM(1));
             if (op->op == SGXD_OP_WAIT_EVENT) {
                 sgx_usse_str(a, AL, MK_MASTER_EVENT_HOST_CLEAR, R(7));
             }
             n++;
         }
     }
-    // The list's end: the next job.
-    sgx_usse_st(a, AL, R(0), IMM(SGXD_MK_RESUME), IMM(0));
+    // The list's end: the round again.
+    sgx_usse_st(a, AL, R(0), IMM(resume_word), IMM(0));
     sgx_usse_ba_index(a, AL, rt->next);
     return a->err < 0 ? a->err : (int)a->len;
 }

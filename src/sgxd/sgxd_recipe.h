@@ -157,13 +157,17 @@ extern unsigned sgxd_recipe_grid;
 // EUR_CR_PIXELBE (0x0400) at the 3D kicks built after it is set: 0x80 (the alpha threshold) by
 // default; bit 10 is AA_EDGEOPT_OFF (the SCALE_AA probes, sgxd_recipe_pica_eot_mix).
 extern uint32_t sgxd_recipe_pixelbe;
-// One parameter buffer for every recipe inited after it is set, as Sony's microkernel runs:
-// the page table at pt, the pages first..last as
-// page numbers from req_base, which every such recipe's requestor bases take. Its TA and 3D free
-// lists are loaded once, at the first TA and the first 3D built after sgxd_recipe_pb_reset, and
-// every 3D deallocates its scene's pages back into them. The TA's DPM state slot (1) goes to the
-// recipe's DPMSLOT table after its TA and into the 3D's slot (0) before its render. last 0 (the
-// default): each recipe loads its own layout's PT and PAGES at every kick and never deallocates.
+// One parameter buffer for every recipe inited after it is set, as Sony's microkernel runs: the
+// page table at pt, the pages first..last as page numbers from req_base, which every such recipe's
+// requestor bases take. Its TA and 3D free lists are loaded once, at the first TA and the first 3D
+// built after sgxd_recipe_pb_reset, and every 3D deallocates its scene's pages back into them. The
+// TA's DPM state slot (1) goes to the recipe's DPMSLOT table after its TA and into the 3D's slot
+// (0) before its render. last 0 (the default): each recipe loads its own layout's PT and PAGES at
+// every kick and never deallocates.
+// The parameter pages a TA started beside binned scenes is sure of (sgxd_session.c's page budget):
+// far past any pass seen (up to 734), with azahar's 7104-page buffer.
+#define SGXD_RECIPE_PASS_PAGES 3000u
+
 typedef struct SgxdRecipePb {
     uint32_t req_base, pt, first, last;
 } SgxdRecipePb;

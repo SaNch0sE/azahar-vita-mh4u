@@ -651,6 +651,8 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     r->ta_threshold = pb_pages + 16;
     const uint32_t gbl = pb_pages - 34;
     const uint32_t mn = r->ta_threshold < gbl ? r->ta_threshold : gbl;
+    // ZLS_PAGE_THRESHOLD, where a TA stalls (OUT_OF_MEMORY_MT): it caps the TA context's pages
+    // since its free-list load, every binned scene's, not one pass's.
     r->pds_threshold = mn > 256 ? mn - 256 : 0;
     r->global_list = 0x10000 | gbl;
     r->bgobjtag = (((sgxd_recipe_va(r, SGXD_R_BGREC) - r->req_base) >> 4) & 0xffffffu) | 2u << 24;
@@ -1498,6 +1500,17 @@ void sgxd_recipe_ta_done(const SgxdRecipe *r, SgxdOpList *l) {
     } else {
         sgxd_recipe_slc(l, 1);
     }
+    // With the shared buffer, the TA's slot 1 into the scene's DPMSLOT table (DPM_STATE_STORE
+    // 0x10), as Sony's microkernel stores a scene's state before the next scene's TA: the next TA
+    // may run before this scene's 3D kick, which loads the table.
+    if (r->shared_pb) {
+        wr(l, 0x0630, 5);
+        wr(l, 0x062c, sgxd_recipe_va(r, SGXD_R_DPMSLOT));
+        wr(l, 0x0134, 0x10);
+        wr(l, 0x0694, 1);
+        poll(l, 0x012c, 0x10, 0x10, SETUP_POLL_US);
+        wr(l, 0x0134, 0x10);
+    }
 }
 
 void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
@@ -1510,21 +1523,17 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
     }
     wr(l, 0x0cac, r->req_base);
     wr(l, 0x0cb0, r->req_base);
-    // D1: the DPM. With the shared buffer, Sony's: the TA's slot 1 into the scene's DPMSLOT table and the table
-    // into the 3D's slot 0 (DPM_STATE_STORE 0x10 and LOAD 0x20 in EVENT_STATUS), the 3D free
-    // list once, and a deallocating render (DPM_3D_DEALLOCATE ENABLE and GLOBAL).
+    // D1: the DPM. With the shared buffer, Sony's (what Sony's microkernel does per scene): the
+    // scene's DPMSLOT table, which its TA done stored, into the
+    // 3D's slot 0 (DPM_STATE LOAD 0x20 in EVENT_STATUS), the 3D free list once, and a
+    // deallocating render (DPM_3D_DEALLOCATE ENABLE and GLOBAL).
     if (r->shared_pb) {
-        const uint32_t ta = 5, d3 = 4;
-        const uint32_t table = sgxd_recipe_va(r, SGXD_R_DPMSLOT);
-        const uint32_t task[2][3] = {{ta, 1, 0x10}, {d3, 4, 0x20}};
-        for (unsigned n = 0; n < 2; n++) {
-            wr(l, 0x0630, task[n][0]);
-            wr(l, 0x062c, table);
-            wr(l, 0x0134, task[n][2]);
-            wr(l, 0x0694, task[n][1]);
-            poll(l, 0x012c, task[n][2], task[n][2], SETUP_POLL_US);
-            wr(l, 0x0134, task[n][2]);
-        }
+        wr(l, 0x0630, 4);
+        wr(l, 0x062c, sgxd_recipe_va(r, SGXD_R_DPMSLOT));
+        wr(l, 0x0134, 0x20);
+        wr(l, 0x0694, 4);
+        poll(l, 0x012c, 0x20, 0x20, SETUP_POLL_US);
+        wr(l, 0x0134, 0x20);
     } else {
         wr(l, 0x0630, 8);
     }

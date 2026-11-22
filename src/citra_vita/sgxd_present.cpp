@@ -31,15 +31,17 @@ namespace VitaFrontend::SgxdPresent {
 namespace {
 
 // GPU addresses (docs/sgxd/memory.md; sgxd_test's): the recipe's block at 16 MiB,
-// the display buffers at 1 GiB, the texture at 48 MiB.
+// the display buffers at 1 GiB, the texture at 60 MiB.
 constexpr u32 RecipeVa = 0x01000000;
-constexpr u32 TextureVa = 0x03000000;
+constexpr u32 TextureVa = 0x03c00000;
 // The parameter buffer every recipe shares (sgxd_recipe_pb), Sony's model: its page table at
 // 32 MiB, the pages 256 KiB on. Page numbers count from the DPM requestor base, this block's
-// address, so every recipe block lies within 256 MiB of it. 1024 pages hold two scenes in
-// flight at the 418 a recipe had to itself.
+// address, so every recipe block lies within 256 MiB of it. 1536 pages: the TA context stalls at
+// 1246 (ZLS_PAGE_THRESHOLD), a TA started beside binned scenes is sure of 734
+// (SGXD_RECIPE_PASS_PAGES), so the scenes waiting for their 3D may hold 512 when the next TA
+// starts (a game had 30-140 allocated, 349 at most).
 constexpr u32 PbVa = 0x02000000;
-constexpr u32 PbPages = 1024;
+constexpr u32 PbPages = 1536;
 constexpr u32 PbSize = 0x40000 + PbPages * 0x1000;
 constexpr u32 DisplayVa = 0x40000000;
 constexpr u32 DisplayBuffers = 3;
@@ -774,7 +776,7 @@ void EndFrame() {
         }
         g.shown_pending = true;
         g.shown_buffer = buffer;
-        g.shown_fence = sgxd_chain_fence() + 1;
+        g.shown_fence = sgxd_chain_fence();
         // The presents' interval, for the flip's pacing: each one's from 4 to 100 ms.
         const SceUInt64 now_us = sceKernelGetProcessTimeWide();
         if (g.last_issue_us != 0) {

@@ -26,10 +26,13 @@
 #define CODE_OFFSET 0x1000u
 #define CODE_CAP ((CODE_BLOCK - CODE_OFFSET) / 8u)
 #define CODE_BASE_REG (0x0a0cu + 14u * 4u)
-// The state: the state words, the jobs, the data slots; CACHECONSISTENT.
+// The state: the state words and the supervised pairs (SGXD_MK_SV_WORD), each stream's jobs, each
+// stream's data slots; CACHECONSISTENT.
 #define STATE_BLOCK (256u << 10)
-#define JOBS_OFFSET 0x100u
+#define JOBS_OFFSET 0x200u
+#define JOBS3_OFFSET 0x600u
 #define DATA_OFFSET 0x1000u
+#define DATA3_OFFSET (DATA_OFFSET + SGXD_MKQ_JOBS * SGXD_MK_DATA_WORDS * 4u)
 #define USE_CACHE_INVAL 0x0a08u
 #define SLC_EVENT_STATUS 0x4d10u
 #define SLC_EVENT_CLEAR 0x4d14u
@@ -67,16 +70,17 @@ static void pds_douta_code(uint32_t code[PDS_DOUTA_WORDS]) {
 #define POOL_OPS 65536u
 typedef struct Shape {
     uint64_t hash;
-    uint32_t count, at, entry;
+    uint32_t count, at, entry, stream;
 } Shape;
 
 static SceUID code_uid = -1;
 static volatile uint64_t *code_mem;   // the code's first instruction (window index 0)
-static volatile uint32_t *state, *jobs, *data;
+static volatile uint32_t *state, *jobs, *data, *jobs3, *data3;
 static uint32_t code_va, state_va;
 static SgxdMkLayout layout;
 static SgxdMkRuntime rt;
 static uint32_t runtime_len, code_used;
+// Jobs sent: one to each stream a submit, so the 3D stream's END is the same count.
 static uint32_t job_end;
 static uint32_t sprv_before, base15_before;
 static uint32_t generation = 1, flips_done;
@@ -98,10 +102,13 @@ static uint8_t wait_kind[CODE_CAP];
 
 static void wait_placed(uint32_t at, const SgxdOp *op) {
     if (at < CODE_CAP) {
-        wait_kind[at] = op->op == SGXD_OP_WAIT_TWOD ? SGXD_MKQ_WAIT_TWOD
-                        : op->mask == 0x00002000u   ? SGXD_MKQ_WAIT_TA
-                        : op->mask == 0x00040000u   ? SGXD_MKQ_WAIT_3D
-                                                    : SGXD_MKQ_WAIT_EVENT;
+        wait_kind[at] = op->op == SGXD_OP_WAIT_TWOD      ? SGXD_MKQ_WAIT_TWOD
+                        : op->op == SGXD_OP_WAIT_COUNT   ? SGXD_MKQ_WAIT_COUNT
+                        : op->op == SGXD_OP_WAIT_TA_IDLE ? SGXD_MKQ_WAIT_TA_IDLE
+                        : op->op == SGXD_OP_WAIT_PAGES   ? SGXD_MKQ_WAIT_PAGES
+                        : op->mask == 0x00002000u        ? SGXD_MKQ_WAIT_TA
+                        : op->mask == 0x00040000u        ? SGXD_MKQ_WAIT_3D
+                                                         : SGXD_MKQ_WAIT_EVENT;
     }
 }
 
@@ -221,8 +228,14 @@ int sgxd_mkq_start(uint32_t va, char *failed, unsigned failed_size) {
         state = (volatile uint32_t *)state_base;
         jobs = (volatile uint32_t *)((uint8_t *)state_base + JOBS_OFFSET);
         data = (volatile uint32_t *)((uint8_t *)state_base + DATA_OFFSET);
-        layout = (SgxdMkLayout){state_va, state_va + JOBS_OFFSET, SGXD_MKQ_JOBS,
-                                state_va + DATA_OFFSET, mk_flags};
+        jobs3 = (volatile uint32_t *)((uint8_t *)state_base + JOBS3_OFFSET);
+        data3 = (volatile uint32_t *)((uint8_t *)state_base + DATA3_OFFSET);
+        layout = (SgxdMkLayout){state_va,
+                                state_va + JOBS_OFFSET,
+                                SGXD_MKQ_JOBS,
+                                state_va + DATA_OFFSET,
+                                state_va + JOBS3_OFFSET,
+                                state_va + DATA3_OFFSET};
         // The runtime at window index 0, written once: code is never rewritten at an address
         // that has run (docs/sgxd/pds.md).
         const int len = sgxd_mk_runtime(scratch, sizeof(scratch) / 8u, 0, &layout, &rt);
@@ -288,13 +301,13 @@ void sgxd_mkq_check_render(char *out, unsigned size) {
     if (!state) {
         return;
     }
-    // The last job taken whose list starts a 3D (ISP_START_RENDER, 0x0428).
-    const uint32_t pos = state[SGXD_MK_POS];
+    // The last 3D stream job taken whose list starts a 3D (ISP_START_RENDER, 0x0428).
+    const uint32_t pos = state[SGXD_MK_POS3];
     const Shape *s = NULL;
     uint32_t job = 0;
     for (uint32_t back = 1; back <= SGXD_MKQ_JOBS && back <= pos && !s; back++) {
         job = pos - back;
-        const uint32_t entry = jobs[job & (SGXD_MKQ_JOBS - 1u)];
+        const uint32_t entry = jobs3[job & (SGXD_MKQ_JOBS - 1u)];
         for (uint32_t n = 0; n < SHAPES && !s; n++) {
             if (shapes[n].entry == entry) {
                 for (uint32_t k = 0; k < shapes[n].count; k++) {
@@ -314,10 +327,11 @@ void sgxd_mkq_check_render(char *out, unsigned size) {
     // Each state register's last value in the list: the constant, or the job's data slot.
     static uint32_t reg[256], want[256];
     uint32_t nreg = 0, var = 0;
-    const volatile uint32_t *slot = data + (job & (SGXD_MKQ_JOBS - 1u)) * SGXD_MK_DATA_WORDS;
+    const volatile uint32_t *slot = data3 + (job & (SGXD_MKQ_JOBS - 1u)) * SGXD_MK_DATA_WORDS;
     for (uint32_t k = 0; k < s->count; k++) {
         const SgxdOp *op = &pool[s->at + k];
-        const int is_var = pool_var[s->at + k] || op->op == SGXD_OP_WAIT_TWOD;
+        const int is_var = pool_var[s->at + k] || op->op == SGXD_OP_WAIT_TWOD ||
+                           op->op == SGXD_OP_WAIT_COUNT;
         const uint32_t value = is_var ? slot[var + sgxd_mk_var_words(op) - 1u] : op->value;
         if (is_var) {
             var += sgxd_mk_var_words(op);
@@ -379,14 +393,15 @@ const volatile uint64_t *sgxd_mkq_code(uint32_t *instructions) {
 }
 
 const volatile uint32_t *sgxd_mkq_memory(uint32_t *words) {
-    *words = (DATA_OFFSET + SGXD_MKQ_JOBS * SGXD_MK_DATA_WORDS * 4u) / 4u;
+    *words = (DATA3_OFFSET + SGXD_MKQ_JOBS * SGXD_MK_DATA_WORDS * 4u) / 4u;
     return state;
 }
 
 // The shape's words: each op's kind, register, mask and timeout, its value unless the job
 // carries it, and its mark.
-static uint64_t shape_hash(const SgxdOp *ops, unsigned count, const uint8_t *variable) {
-    uint64_t h = 0xcbf29ce484222325ull;
+static uint64_t shape_hash(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                           uint32_t stream) {
+    uint64_t h = (0xcbf29ce484222325ull ^ stream) * 0x100000001b3ull;
     for (unsigned n = 0; n < count; n++) {
         const int var = sgxd_mk_is_variable(&ops[n], variable, n);
         // A STORE's address is a value too (the data slot's).
@@ -400,8 +415,9 @@ static uint64_t shape_hash(const SgxdOp *ops, unsigned count, const uint8_t *var
     return h ^ count;
 }
 
-static int shape_equal(const Shape *s, const SgxdOp *ops, unsigned count, const uint8_t *variable) {
-    if (s->count != count) {
+static int shape_equal(const Shape *s, const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                       uint32_t stream) {
+    if (s->count != count || s->stream != stream) {
         return 0;
     }
     for (unsigned n = 0; n < count; n++) {
@@ -419,7 +435,8 @@ static int shape_equal(const Shape *s, const SgxdOp *ops, unsigned count, const 
 
 int sgxd_mkq_idle(void) {
     const SceUInt64 t0 = sceKernelGetProcessTimeWide();
-    while (state[SGXD_MK_BUSY] || state[SGXD_MK_POS] != job_end) {
+    while (state[SGXD_MK_BUSY] || state[SGXD_MK_POS] != job_end ||
+           state[SGXD_MK_POS3] != job_end) {
         if (state[SGXD_MK_FAULT] || sceKernelGetProcessTimeWide() - t0 > 1000000u) {
             return -1;
         }
@@ -477,18 +494,19 @@ static uint32_t place(uint32_t used) {
     return (used + 2u * CODE_GAP - 1u) & ~(CODE_GAP - 1u);
 }
 
-static uint32_t shape_code(const SgxdOp *ops, unsigned count, const uint8_t *variable, int *err) {
-    const uint64_t hash = shape_hash(ops, count, variable);
+static uint32_t shape_code(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                           uint32_t stream, int *err) {
+    const uint64_t hash = shape_hash(ops, count, variable, stream);
     uint32_t slot = (uint32_t)hash & (SHAPES - 1u);
     for (; shapes[slot].entry; slot = (slot + 1u) & (SHAPES - 1u)) {
-        if (shapes[slot].hash == hash && shape_equal(&shapes[slot], ops, count, variable)) {
+        if (shapes[slot].hash == hash && shape_equal(&shapes[slot], ops, count, variable, stream)) {
             return shapes[slot].entry;
         }
     }
     uint32_t refused = 0;
     uint32_t base = place(code_used);
-    int len = sgxd_mk_compile(scratch, sizeof(scratch) / 8u, base, &layout, &rt, ops, count,
-                              variable, writable, &refused);
+    int len = sgxd_mk_compile_stream(scratch, sizeof(scratch) / 8u, base, &layout, &rt, ops, count,
+                                     variable, writable, &refused, stream);
     if (len < 0) {
         sgxd_mkq_refused = refused;
         sgxd_mkq_refused_kind = refused < count ? ops[refused].op : 0;
@@ -502,8 +520,8 @@ static uint32_t shape_code(const SgxdOp *ops, unsigned count, const uint8_t *var
             return 0;
         }
         base = place(code_used);
-        len = sgxd_mk_compile(scratch, sizeof(scratch) / 8u, base, &layout, &rt, ops, count,
-                              variable, writable, &refused);
+        len = sgxd_mk_compile_stream(scratch, sizeof(scratch) / 8u, base, &layout, &rt, ops,
+                                     count, variable, writable, &refused, stream);
         if (len < 0 || base + (uint32_t)len > CODE_CAP || count > POOL_OPS) {
             *err = len < 0 ? len : SGX_USSE_ENOSPC;
             return 0;
@@ -528,7 +546,7 @@ static uint32_t shape_code(const SgxdOp *ops, unsigned count, const uint8_t *var
         }
         pool_var[pool_used + n] = (uint8_t)var;
     }
-    shapes[slot] = (Shape){hash, count, pool_used, entry};
+    shapes[slot] = (Shape){hash, count, pool_used, entry, stream};
     pool_used += count;
     nshapes++;
 #ifdef VITA_DIAGNOSTICS
@@ -537,6 +555,12 @@ static uint32_t shape_code(const SgxdOp *ops, unsigned count, const uint8_t *var
 #endif
     return entry;
 }
+
+// A submit's two jobs, each stream's ops with their variable marks: the TA stream's (the ops
+// before STREAM_3D, then its SIGNAL_TA) and the 3D stream's (a wait for that TA job, the ops
+// after STREAM_3D, then its SIGNAL_DONE).
+static SgxdOp part_ops[2][SGXD_MAX_CHAIN_OPS + 2];
+static uint8_t part_var[2][SGXD_MAX_CHAIN_OPS + 2];
 
 // Where each stream's data slot words come from (SgxdMkqCode::value_op): the TA stream's part op n
 // is the list's op n, the 3D stream's part op 0 its wait for the TA job and part op n the list's
@@ -579,23 +603,74 @@ int sgxd_mkq_submit(const SgxdOp *ops, unsigned count, const uint8_t *variable, 
     if (state[SGXD_MK_FAULT]) {
         return AZAHAR_ERR_STATE;
     }
-    uint32_t entry = code && code->generation == generation ? code->entry : 0;
-    if (!entry) {
-        int err = 0;
-        entry = shape_code(ops, count, variable, &err);
-        if (!entry) {
-            return err;
+    // A kept list whose code is current: its shape is the one checked and compiled, and only its
+    // variable ops are read (plan_values).
+    const int kept = code && code->generation == generation && code->entry && code->entry3;
+    uint32_t entry = kept ? code->entry : 0;
+    uint32_t entry3 = kept ? code->entry3 : 0;
+    unsigned nta = 0, n3 = 0;
+    if (!kept) {
+        // The counts are the microkernel's: a list's own TA or DONE signal would count twice.
+        unsigned split = count;
+        for (unsigned n = 0; n < count; n++) {
+            if (ops[n].op == SGXD_OP_SIGNAL &&
+                (ops[n].value == SGXD_SIGNAL_TA || ops[n].value == SGXD_SIGNAL_DONE)) {
+                return AZAHAR_ERR_ARG;
+            }
+            if (ops[n].op == SGXD_OP_STREAM_3D) {
+                if (split != count) {
+                    return AZAHAR_ERR_ARG;
+                }
+                split = n;
+            }
         }
+        if (count > SGXD_MAX_CHAIN_OPS) {
+            return AZAHAR_ERR_ARG;
+        }
+        for (unsigned n = 0; n < split; n++) {
+            part_ops[0][nta] = ops[n];
+            part_var[0][nta++] = variable ? variable[n] : 0;
+        }
+        part_ops[0][nta] = (SgxdOp){SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0, 0};
+        part_var[0][nta++] = 0;
+        // The 3D job goes once its TA job has: CHAIN_TA counts the TA stream's jobs done.
+        part_ops[1][n3] = (SgxdOp){SGXD_OP_WAIT_COUNT, SGXD_MK_CHAIN_TA, job_end + 1u, 0, 0};
+        part_var[1][n3++] = 0;
+        for (unsigned n = split + 1; n < count; n++) {
+            part_ops[1][n3] = ops[n];
+            part_var[1][n3++] = variable ? variable[n] : 0;
+        }
+        part_ops[1][n3] = (SgxdOp){SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0, 0};
+        part_var[1][n3++] = 0;
+
+        // A flip while the second compiles drops the first: both again.
+        uint32_t before;
+        do {
+            before = generation;
+            int err = 0;
+            entry = shape_code(part_ops[0], nta, part_var[0], SGXD_MK_STREAM_TA, &err);
+            if (!entry) {
+                return err;
+            }
+            entry3 = shape_code(part_ops[1], n3, part_var[1], SGXD_MK_STREAM_3D, &err);
+            if (!entry3) {
+                return err;
+            }
+        } while (generation != before);
         if (code) {
             code->entry = entry;
+            code->entry3 = entry3;
             code->generation = generation;
             value_plan(nta, n3, split, code);
         }
     }
     // A job's slot is free once the job after it has been taken: the running one is POS - 1.
-    if (job_end - state[SGXD_MK_POS] >= SGXD_MKQ_JOBS - 1u) {
+    // The 3D stream's runs behind the TA stream's.
+    if (job_end - state[SGXD_MK_POS] >= SGXD_MKQ_JOBS - 1u ||
+        job_end - state[SGXD_MK_POS3] >= SGXD_MKQ_JOBS - 1u) {
         const SceUInt64 t0 = sceKernelGetProcessTimeWide();
-        while (job_end - state[SGXD_MK_POS] >= SGXD_MKQ_JOBS - 1u) {
+        while (job_end - state[SGXD_MK_POS] >= SGXD_MKQ_JOBS - 1u ||
+               job_end - state[SGXD_MK_POS3] >= SGXD_MKQ_JOBS - 1u) {
             if (state[SGXD_MK_FAULT]) {
                 return AZAHAR_ERR_STATE;
             }
@@ -605,8 +680,16 @@ int sgxd_mkq_submit(const SgxdOp *ops, unsigned count, const uint8_t *variable, 
         }
     }
     const uint32_t slot = job_end & (SGXD_MKQ_JOBS - 1u);
-    sgxd_mk_values(data + slot * SGXD_MK_DATA_WORDS, ops, count, variable);
+    if (code) {
+        plan_values(data + slot * SGXD_MK_DATA_WORDS, ops, code->value_op[0], code->values[0], 0);
+        plan_values(data3 + slot * SGXD_MK_DATA_WORDS, ops, code->value_op[1], code->values[1],
+                    job_end + 1u);
+    } else {
+        sgxd_mk_values(data + slot * SGXD_MK_DATA_WORDS, part_ops[0], nta, part_var[0]);
+        sgxd_mk_values(data3 + slot * SGXD_MK_DATA_WORDS, part_ops[1], n3, part_var[1]);
+    }
     jobs[slot] = entry;
+    jobs3[slot] = entry3;
 #ifdef VITA_DIAGNOSTICS
     job_kind[slot] = sgxd_mkq_kind_next;
     job_label[slot] = 0;
@@ -617,14 +700,23 @@ int sgxd_mkq_submit(const SgxdOp *ops, unsigned count, const uint8_t *variable, 
     }
     sgxd_mkq_kind_next = SGXD_MKQ_KIND_OTHER;
 #endif
-    // The job before the END that publishes it; END before the look at BUSY (the GPU clears
-    // BUSY, then reads END: one of the two sees the other's write).
+    // The jobs before the ENDs that publish them; the ENDs before the look at BUSY (the GPU
+    // clears BUSY, then reads both ENDs: one of the two sees the other's write).
     __asm__ volatile("dmb" ::: "memory");
-    state[SGXD_MK_END] = ++job_end;
+    ++job_end;
+    state[SGXD_MK_END] = job_end;
+    state[SGXD_MK_END3] = job_end;
     __asm__ volatile("dmb" ::: "memory");
-    if (!state[SGXD_MK_BUSY]) {
-        state[SGXD_MK_BUSY] = 1;
-        __asm__ volatile("dmb" ::: "memory");
+    // A kick with the queue idle (BUSY clear), and one with the TA stream out of jobs while the 3D
+    // stream waits for its 3D's end: that run ended with BUSY set, and the TA job would wait for
+    // the end instead of running over the 3D. A kick that finds the TA stream at work runs a round
+    // that gets nowhere.
+    const int idle = !state[SGXD_MK_BUSY];
+    if (idle || state[SGXD_MK_RESUME] == 0) {
+        if (idle) {
+            state[SGXD_MK_BUSY] = 1;
+            __asm__ volatile("dmb" ::: "memory");
+        }
 #ifdef VITA_DIAGNOSTICS
         sgxd_kicks++;
 #endif

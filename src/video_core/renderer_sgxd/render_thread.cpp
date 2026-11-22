@@ -239,34 +239,46 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
 #ifdef VITA_DIAGNOSTICS
 void RenderThread::SampleGpu(std::stop_token stop) {
     Common::SetCurrentThreadRole(Common::ThreadRole::Other);
-    static_assert(GpuAtKinds == SGXD_MKQ_KINDS && GpuAtWaits == SGXD_MKQ_WAITS);
-    // The master bank's EVENT_STATUS and its PIXELBE_END_RENDER: a 3D has ended and no list has
-    // taken the end yet (a finish phase clears it), so the 3D unit idles until the next kick.
-    constexpr u32 EventStatus = 0x412c;
-    constexpr u32 EndRender = 0x00040000;
+    static_assert(GpuAtStates == SGXD_MKQ_WAITS + 1);
+    static_assert(GpuLabels == SGXD_MKQ_LABELS);
+    // A stream's state: 0 no job; 1 a job's code (or between jobs); 1 + its wait's kind.
+    const auto state_of = [](u32 resume, u32 pos, u32 end) -> u32 {
+        if (resume != 0) {
+            const u32 kind = sgxd_mkq_wait_kind(resume);
+            return kind == SGXD_MKQ_WAIT_NONE ? 1 : 1 + kind;
+        }
+        return pos != end ? 1 : 0;
+    };
+    u32 last_gpu_state = ~0u;
     while (!stop.stop_requested()) {
         sceKernelDelayThread(1000);
-        // Busy: a list or a PTLA op sent and not completed. Held: none, but the last render's
-        // 3D waits for the list after it.
+        // Busy: a submit or a PTLA op sent and not completed.
         const bool busy =
             sgxd_chain_done() != sgxd_chain_fence() || sgxd_ptla_done() != sgxd_ptla_fence();
-        u32 status = 0;
-        const bool ended = sgxdReadRegs(EventStatus, 1, &status) == 1 && (status & EndRender);
         gpu_samples.fetch_add(1, std::memory_order_relaxed);
-        u32 cell = GpuAtIdle;
         if (busy) {
             gpu_busy.fetch_add(1, std::memory_order_relaxed);
-            // The running job (POS is the next) and the wait its run stopped at, if it did.
-            const volatile u32* const mk = sgxd_mkq_state();
-            const u32 resume = mk[SGXD_MK_RESUME];
-            const u32 kind = sgxd_mkq_job_kind(mk[SGXD_MK_POS] - 1);
-            const u32 wait = resume != 0 ? sgxd_mkq_wait_kind(resume) : SGXD_MKQ_WAIT_NONE;
-            cell = GpuAtBusy + (kind * GpuAtWaits + wait) * 2 + (ended ? 1 : 0);
-        } else if (sgxd_session_pending() != nullptr) {
-            gpu_held.fetch_add(1, std::memory_order_relaxed);
-            cell = ended ? GpuAtHeldDone : GpuAtHeldRunning;
         }
-        gpu_at[cell].fetch_add(1, std::memory_order_relaxed);
+        const volatile u32* const mk = sgxd_mkq_state();
+        const u32 ta = state_of(mk[SGXD_MK_RESUME], mk[SGXD_MK_POS], mk[SGXD_MK_END]);
+        const u32 d3 = state_of(mk[SGXD_MK_RESUME3], mk[SGXD_MK_POS3], mk[SGXD_MK_END3]);
+        gpu_at[d3 * GpuAtStates + ta].fetch_add(1, std::memory_order_relaxed);
+        // The running job is the one before POS; a stream at its job's TA or 3D wait has that on the
+        // hardware.
+        if (d3 == 1 + SGXD_MKQ_WAIT_3D) {
+            gpu_3d_by[sgxd_mkq_job_label(mk[SGXD_MK_POS3] - 1u)].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (ta == 1 + SGXD_MKQ_WAIT_TA) {
+            gpu_ta_by[sgxd_mkq_job_label(mk[SGXD_MK_POS] - 1u)].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        // tracelog: the streams' states when they change (3D bits 15:8, TA 7:0, busy 16), each millisecond.
+        const u32 state = (busy ? 1u << 16 : 0) | d3 << 8 | ta;
+        if (state != last_gpu_state) {
+            last_gpu_state = state;
+            SgxdTrace("gpu", state);
+        }
     }
 }
 #endif

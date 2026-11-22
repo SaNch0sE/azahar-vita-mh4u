@@ -724,9 +724,15 @@ private:
     };
     std::array<DataSite, 32> data_sites{};
     u32 data_opens{};
-    /// The pass data's slots, in turn, each with its last pass's fence. The guest waits for
-    /// P3D before its next command list, so only passes of one list follow each other unwaited.
-    static constexpr u32 DataSlots = 2;
+    /// The pass data's slots, in turn, each with its last pass's fence: a pass opens once the
+    /// one DataSlots before it has finished its 3D. A pass is sent whole at EndPass, so the
+    /// render thread's work on a pass overlaps the GPU's only on passes far enough back. a game
+    /// makes five passes a frame (the top screen's 3D and 2D, a display transfer, the bottom
+    /// screen, another transfer), so with two or four slots the next frame's 3D waited for
+    /// this frame's 3D, and the thread's ~9 ms on it left the GPU idle: 36 pictures a second
+    /// from ~16 ms of GPU a frame. Eight cover a frame and the late skip's passes in between,
+    /// so the thread fills the next 3D while the GPU draws this one.
+    static constexpr u32 DataSlots = 8;
     u32 data_slot{};
     std::array<u32, DataSlots> data_fence{};
     u32 lut_begin{};
