@@ -32,6 +32,8 @@ set(CITRA_VITA_SOURCES
     imgui_impl_vita.h
     input_factory_vita.cpp
     input_factory_vita.h
+    livearea.cpp
+    livearea.h
     multiplayer.cpp
     multiplayer.h
     sgxd_present.cpp
@@ -66,7 +68,7 @@ function(citra_vita_executable target titleid)
     create_target_directory_groups(${target})
 
     target_link_libraries(${target} PRIVATE citra_common citra_core input_common network
-                                            video_core)
+                                            video_core cryptopp lodepng)
     # The upcall experiment's TLS lookup and malloc lock (upcall_tls.cpp), and the abort report
     # (crash_report.cpp), which keeps the console's last text too.
     target_link_options(${target} PRIVATE
@@ -93,6 +95,8 @@ function(citra_vita_executable target titleid)
         SceAppMgr_stub
         SceAppUtil_stub
         SceRtc_stub
+        ScePromoterUtil_stub
+        SceSysmodule_stub
         SceKernelDmacMgr_stub
         SceKernelModulemgr_stub
         SceVshBridge_stub
@@ -126,6 +130,19 @@ set(VITA_VERSION "00.10")
 get_target_property(AZAHAR_NATIVE_MODULE azaharnative_stub AZAHAR_NATIVE_MODULE)
 citra_vita_executable(citra_vita ${VITA_TITLEID})
 
+# A pinned title's LiveArea bubble (livearea.cpp): an eboot of its own that starts this app with
+# the title's path. The vpk carries it as bubble/eboot.bin, and each bubble gets a copy. Made
+# before the authid below, which is the emulator's alone.
+add_executable(azahar_bubble bubble/main.c)
+target_link_libraries(azahar_bubble PRIVATE SceAppMgr_stub SceIofilemgr_stub SceLibKernel_stub)
+# The system loads it where it likes: lld's long-branch thunks must not hold absolute addresses
+# (as vita_native's module), and nothing here sets up a stack guard for -fstack-protector.
+target_compile_options(azahar_bubble PRIVATE -fno-stack-protector)
+target_link_options(azahar_bubble PRIVATE -Wl,--pic-veneer)
+target_compile_definitions(azahar_bubble PRIVATE AZAHAR_VITA_TITLEID="${VITA_TITLEID}")
+set_target_properties(azahar_bubble PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+vita_create_self(azahar_bubble.self azahar_bubble UNSAFE)
+
 # The SceShell authid grants the extra permissions the native backend needs (taking a core, the
 # kernel-module bridge), and -na disables ASLR so the guest range lands where the module expects.
 # -a goes through VITA_MAKE_FSELF_FLAGS (the macro has no keyword for it); NOASLR is -na.
@@ -152,13 +169,14 @@ vita_create_vpk(citra_vita.vpk ${VITA_TITLEID} citra_vita.self
     VERSION ${VITA_VERSION}
     NAME ${VITA_APP_NAME}
     FILE ${AZAHAR_NATIVE_MODULE} azaharnative.skprx
+        ${CMAKE_CURRENT_BINARY_DIR}/azahar_bubble.self bubble/eboot.bin
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png sce_sys/icon0.png
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
 )
-# The plugin is made in vita_native/: the vpk waits for it.
-add_dependencies(citra_vita.vpk-vpk azaharnative.skprx-self)
+# The plugin is made in vita_native/: the vpk waits for it, and for the bubble's eboot.
+add_dependencies(citra_vita.vpk-vpk azaharnative.skprx-self azahar_bubble.self-self)
 
 # The replay player (diagnostics builds, on request: "ninja citra_vita_player.vpk-vpk"): a
 # vprof capture's frame on sgxd with no title, as Razor replays a capture without the game

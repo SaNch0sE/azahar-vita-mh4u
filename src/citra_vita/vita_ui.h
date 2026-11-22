@@ -51,6 +51,7 @@ public:
         ExitApplication,
         SaveState,
         LoadState,
+        TogglePin,
     };
 
     explicit Ui(Core::System& system, EmuWindowVita& window);
@@ -68,6 +69,8 @@ public:
     [[nodiscard]] const std::string& SelectedGamePath() const {
         return selected_game_path;
     }
+
+    std::string TogglePin();
 
     /// The savestate slot the user chose, valid after Action::SaveState / Action::LoadState.
     [[nodiscard]] u32 SelectedSlot() const {
@@ -197,6 +200,10 @@ private:
 
     std::vector<GameEntry> games;
     int selected_game{};
+    /// Whether the selected game has a bubble (LiveArea::IsPinned), for the footer: asked again
+    /// when the selection changes.
+    std::string pin_checked_path;
+    bool pin_checked{};
     std::string game_key;
     std::string game_name;
 

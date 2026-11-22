@@ -2348,6 +2348,21 @@ int EmulatorMain() {
         case VitaFrontend::Ui::Action::ExitApplication:
             running = false;
             break;
+        case VitaFrontend::Ui::Action::TogglePin: {
+            ui.SetStatusMessage("Changing the LiveArea...");
+            ui.Update();
+            window.Present(&ui);
+            ui.SetStatusMessage(ui.TogglePin());
+            // The outcome for two seconds, as a load's failure.
+            for (int i = 0; i < 120; i++) {
+                window.PollEvents();
+                ui.Update();
+                window.Present(&ui);
+                sceDisplayWaitVblankStart();
+            }
+            ui.ClearStatusMessage();
+            break;
+        }
         default:
             break;
         }

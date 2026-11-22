@@ -20,6 +20,7 @@
 
 #include "citra_vita/imgui_impl_sgxd.h"
 #include "citra_vita/imgui_impl_vita.h"
+#include "citra_vita/livearea.h"
 
 #include <fmt/format.h>
 
@@ -388,6 +389,7 @@ void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float size, ImU32 colour, ImU
 enum class Glyph {
     Cross,
     Circle,
+    Square,
     Triangle,
     LeftRight,
     Shoulders,
@@ -411,6 +413,13 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float r) {
         dl->AddCircleFilled(c, r, disc, 20);
         dl->AddCircle(c, 0.45f * r, Colour(ImVec4(0.96f, 0.45f, 0.48f, 1.0f)), 16, line);
         break;
+    case Glyph::Square: {
+        dl->AddCircleFilled(c, r, disc, 20);
+        const float d = 0.38f * r;
+        dl->AddRect(c - ImVec2(d, d), c + ImVec2(d, d), Colour(ImVec4(0.93f, 0.55f, 0.84f, 1.0f)),
+                    0.0f, ImDrawCornerFlags_All, line);
+        break;
+    }
     case Glyph::Triangle:
         dl->AddCircleFilled(c, r, disc, 20);
         dl->AddTriangle(ImVec2(c.x, c.y - 0.48f * r), ImVec2(c.x - 0.46f * r, c.y + 0.32f * r),
@@ -775,6 +784,31 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     BuildRows();
     ScanGames();
     focus_first_row = true;
+}
+
+std::string Ui::TogglePin() {
+    const std::string& path = selected_game_path;
+    const bool pinned = LiveArea::IsPinned(path);
+    std::string failure;
+    if (pinned) {
+        failure = LiveArea::Unpin(path);
+    } else {
+        // The bubble takes the title's own name, else its file's.
+        const auto cached = title_cache.find(path);
+        const std::string name = cached != title_cache.end() && !cached->second.name.empty()
+                                     ? cached->second.name
+                                     : std::string(FileUtil::GetFilename(path));
+        const auto found = std::find_if(games.begin(), games.end(),
+                                        [&](const GameEntry& g) { return g.path == path; });
+        const bool icon = found != games.end() && found->has_icon;
+        failure = LiveArea::Pin(path, name, icon ? LoadIcon(path) : std::vector<u32>{});
+    }
+    pin_checked_path.clear();
+    if (!failure.empty()) {
+        return failure;
+    }
+    return pinned ? "The title's bubble is off the LiveArea."
+                  : "Pinned: its LiveArea bubble starts the game in Azahar.";
 }
 
 Ui::~Ui() {
@@ -1629,6 +1663,11 @@ Ui::Action Ui::DrawGameList() {
         ImGui::IsNavInputTest(ImGuiNavInput_Input, ImGuiInputReadMode_Pressed)) {
         game_settings = true;
     }
+    // Square: the selected game on the LiveArea, or off it.
+    if (focused && !games.empty() &&
+        ImGui::IsNavInputTest(ImGuiNavInput_Menu, ImGuiInputReadMode_Pressed)) {
+        pin = true;
+    }
     overlay_focused = focused;
     ImGui::End();
 
@@ -1639,6 +1678,9 @@ Ui::Action Ui::DrawGameList() {
     if (game_settings) {
         OpenSettings(Config::TitleKeyOf(game.path), game.name, State::GameList,
                      ProgramIdOf(game.path));
+    } else if (pin) {
+        selected_game_path = game.path;
+        action = Action::TogglePin;
     } else if (start) {
         selected_game_path = game.path;
         action = Action::LaunchGame;
