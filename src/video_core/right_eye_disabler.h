@@ -15,13 +15,32 @@ public:
 
     bool ShouldAllowCmdQueueTrigger(PAddr addr, u32 size);
     /// `size` the transfer's input rows, `output_rows` its output's.
-    bool ShouldAllowDisplayTransfer(PAddr src_address, size_t size, u32 output_rows);
+    bool ShouldAllowDisplayTransfer(PAddr src_address, size_t size, u32 output_rows,
+                                    bool to_right_eye);
 
     void ReportEndFrame();
 
     void SetEnabled(bool enable) {
         enabled = enable;
     }
+
+    /// Whether the right eye may be left undrawn: the setting on, and the title not one the hack
+    /// list disallows (GSP_GPU sets `enabled` per title). The sgxd render thread asks it for
+    /// titles whose eyes are both drawn before either is transferred.
+    [[nodiscard]] bool Allowed() const;
+
+#ifdef VITA_DIAGNOSTICS
+    /// Since the last call (`perflog`): the lists left out, the transfers left out, and the
+    /// frames whose top picture went to both eyes (both_eyes_transfered).
+    struct Counts {
+        u32 lists, transfers, both_eyes;
+    };
+    Counts TakeCounts() {
+        const Counts c = counts;
+        counts = {};
+        return c;
+    }
+#endif
 
 private:
     bool enabled = true;
@@ -32,11 +51,24 @@ private:
     bool top_screen_blocked = false;
     bool cmd_trigger_blocked = false;
     PAddr top_screen_buf = 0;
+    /// A list came after the top screen's last transfer.
+    bool list_after_top_transfer = false;
+    /// The top screen's picture went out twice with no list between: both eyes have it, and no
+    /// list after is the right eye's.
+    bool both_eyes_transfered = false;
+    /// The last picture drawn after the top screen's transfer went out as the bottom screen,
+    /// not as a right eye: the lists after the top screen's transfer are kept. Not a frame's.
+    bool bottom_after_top = false;
+    /// This frame's picture after the top screen's transfer went out (bottom_after_top is set).
+    bool second_picture_out = false;
 
     bool cmd_queue_trigger_happened = false;
     bool display_tranfer_happened = false;
     bool report_end_frame_pending = false;
 
     GPU& gpu;
+#ifdef VITA_DIAGNOSTICS
+    Counts counts{};
+#endif
 };
 } // namespace VideoCore

@@ -46,8 +46,6 @@ public:
     /// Installs the table on the taken core with everything recorded so far. Idempotent.
     bool Install();
 
-    /// Which PageTable the recorded mappings mirror. Cleared on OnPageTableChanged; the backend
-    /// compares against it to re-sync only when the kernel actually hands a core a new table.
     const void* MirroredTable() const {
         return mirrored;
     }
@@ -58,8 +56,8 @@ public:
         return installed;
     }
 
-    /// The app wrote instructions into [base, base+size) of guest memory through its own
-    /// pointers: clean them out to memory and have the taken core drop its instruction cache.
+    /// The app wrote instructions into [base, base+size): clean them to memory and drop the taken
+    /// core's instruction cache.
     void SyncCode(VAddr base, u32 size);
     void SyncAllCode();
 
@@ -80,9 +78,8 @@ private:
         bool operator==(const Mapping&) const = default;
     };
 
-    /// Drops [base, base+size) from the bookkeeping, trimming or splitting entries that reach
-    /// into it, so the map only ever describes disjoint ranges. With unmap set the guest side is
-    /// cleared too.
+    /// Drops [base, base+size) from the bookkeeping (trimming or splitting entries), and from the
+    /// guest's table with unmap.
     void ForgetRange(VAddr base, u32 size, bool unmap);
     bool Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) const;
     /// The permission a mapping of host is made with: guest VRAM, uncached in CDRAM, takes the app's
@@ -92,7 +89,7 @@ private:
     Memory::MemorySystem& memory;
     bool installed{};
     const void* mirrored{};
-    /// Guest ranges currently mapped (or recorded for the install), keyed by guest base, disjoint.
+    /// Guest ranges mapped (or recorded for the install), by guest base, disjoint.
     std::map<VAddr, Mapping> live_mappings;
     VAddr extra_base{};
     Mapping extra{};

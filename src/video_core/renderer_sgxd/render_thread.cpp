@@ -10,6 +10,7 @@
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#include <fmt/ranges.h>
 #include "common/archives.h"
 #include "common/assert.h"
 #include "common/hash.h"
@@ -21,6 +22,7 @@
 #include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/renderer_sgxd.h"
+#include "video_core/right_eye_disabler.h"
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -208,11 +210,85 @@ bool GeometryStaysCached() {
 }
 } // namespace
 
-RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
-                           RendererGxm& renderer_, RasterizerGxm& rasterizer_,
-                           Memory::MemorySystem& memory_)
-    : pica{pica_}, render_pica{render_pica_}, renderer{renderer_}, rasterizer{rasterizer_},
-      memory{memory_}, ring{std::make_unique<u8[]>(RingSize)}, page_holds{memory_} {
+class RenderThread::ParsedOutput final : public VideoCore::RasterizerInterface {
+public:
+    explicit ParsedOutput(RenderThread& t_) : t{t_} {}
+    void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
+                     const Pica::OutputVertex& v2) override {
+        // RasterizerSgxd stops the emulator on it, with the draw's description.
+        t.SyncParsedState();
+        t.ParsedPut(Op::AddTriangle, TriangleRecord{{v0, v1, v2}});
+    }
+    void DrawTriangles() override {
+        t.SyncParsedState();
+        t.ParsedPut(Op::DrawTriangles);
+    }
+    void FlushAll() override {}
+    void FlushRegion(PAddr, u32) override {}
+    void InvalidateRegion(PAddr, u32) override {}
+    void FlushAndInvalidateRegion(PAddr, u32) override {}
+    void ClearAll(bool) override {}
+    bool AccelerateDrawBatch(bool is_indexed) override {
+        // A geometry draw whose state is the held run's joins it; another draw sends the run first.
+        if (t.MergeDraw(is_indexed)) {
+            return true;
+        }
+        t.FlushRun();
+        const bool runs = t.RunsDraw(is_indexed);
+        t.SyncParsedState();
+        if (t.parse_gs_bytes != 0) {
+            std::memcpy(t.ParsedBegin(Op::GsIndices, t.parse_gs_bytes, t.parse_gs_u16 ? 1 : 0),
+                        t.parse_gs, t.parse_gs_bytes);
+            t.ParsedCommit();
+            t.parse_gs_bytes = 0;
+        }
+        if (runs) {
+            // Held, with the state it was drawn in: its record goes with the run.
+            const auto& pipeline = t.parse_pica.regs.internal.pipeline;
+            t.held.draws = 1;
+            t.held.first_indices = std::exchange(t.parse_indices, DrawIndexRange{});
+            t.held.vertices.clear();
+            for (u32 v = 0; v < pipeline.num_vertices; v++) {
+                t.held.vertices.push_back(static_cast<u16>(pipeline.vertex_offset + v));
+            }
+            t.held.regs = t.parse_pica.regs.internal.reg_array;
+            return true;
+        }
+        t.ParsedPut(Op::Draw, std::exchange(t.parse_indices, DrawIndexRange{}),
+                    is_indexed ? 1 : 0);
+        t.PublishParsed();
+        return true;
+    }
+    bool AcceleratesGeometryShaders() const override {
+        return true;
+    }
+    bool AccelerateImmediateVertex(const Pica::AttributeBuffer& input) override {
+        t.SyncParsedState();
+        t.ParsedPut(Op::ImmediateVertex, input);
+        return true;
+    }
+    void FlushImmediate() override {
+        t.SyncParsedState();
+        t.ParsedPut(Op::FlushImmediate);
+        t.PublishParsed();
+    }
+    void NotifyP3D() override {
+        t.SyncParsedState();
+        t.ParsedPut(Op::P3D);
+    }
+
+private:
+    RenderThread& t;
+};
+
+RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& parse_pica_,
+                           Pica::PicaCore& render_pica_, RendererSgxd& renderer_,
+                           RasterizerSgxd& rasterizer_, Memory::MemorySystem& memory_,
+                           const VideoCore::RightEyeDisabler& right_eye_)
+    : pica{pica_}, parse_pica{parse_pica_}, render_pica{render_pica_}, renderer{renderer_},
+      rasterizer{rasterizer_}, memory{memory_}, right_eye_disabler{right_eye_},
+      ring{std::make_unique<u8[]>(RingSize)}, page_holds{memory_},
+      producer{sceKernelGetThreadId()} {
     static_assert(std::has_single_bit(RingSize), "positions wrap at 2^32");
     static_assert(std::has_single_bit(ParsedSize), "positions wrap at 2^32");
     static_assert(sizeof(Head) == 8, "records stay 8-byte aligned");
@@ -751,6 +827,20 @@ void RenderThread::DrawMerged(const u16* vertices, u32 count) {
 #endif
 }
 
+namespace {
+
+/// The bytes a texture copy's lines span on one side: whole lines of `width` bytes `gap` apart (16-byte
+/// units), or the size itself with no width.
+u32 CopySpan(u32 size, u32 width, u32 gap) {
+    if (width == 0) {
+        return size;
+    }
+    const u32 w = width * 16;
+    return (size + w - 1) / w * (w + gap * 16);
+}
+
+} // namespace
+
 bool RenderThread::ReadsDroppedOutput(PAddr lo, PAddr hi) const {
     return std::any_of(dropped_outputs.begin(), dropped_outputs.end(),
                        [&](const DroppedOutput& o) { return lo < o.hi && o.lo < hi; });
@@ -778,11 +868,17 @@ bool RenderThread::LateTransfer(const Pica::DisplayTransferConfig& config, bool 
     PAddr lcd = 0;
     const int screen = LcdScreenOf(config.GetPhysicalOutputAddress(),
                                    display ? config.OutputBytes() : config.texture_copy.size, &lcd);
-    // A transfer from a colour buffer drawn lately ends its segment: the segment gets the
-    // transfer's screen, and the transfer is dropped when a draw of the segment was, in this
-    // frame or an earlier one (the buffer does not hold the picture). A late frame that dropped
-    // a top-screen segment's first draws and then a frame on time that kept its transfer showed
-    // MH Generations' bottom screen, under the top screen's last draws, on the top screen.
+    // A transfer from a colour buffer drawn lately ends its segment: the segment gets the transfer's
+    // screen, and the transfer is dropped when a draw of the segment was (the buffer does not hold
+    // the picture). A display transfer into a right-eye LCD buffer is left out, and its segment becomes
+    // the right eye's, whose draws LateDraw leaves out from the next frame on.
+    const bool right_eye =
+        display && RightEyeOutput(config.GetPhysicalOutputAddress(), config.OutputBytes());
+    // A top screen's picture into a buffer no screen shows: a right eye the LCD never shows, when a
+    // transfer of the same buffer's other bytes goes to a screen (both eyes in one buffer).
+    const bool hidden_right = display && !right_eye && screen < 0 &&
+                              right_eye_disabler.Allowed() && config.output_width == 240 &&
+                              config.output_height == 400;
     bool dropped = false;
     // The source: the colour buffer the transfer reads as the draws found it (by its address and the
     // size it reads, then its whole input's), else the newest drawn of the buffers holding its address
@@ -815,7 +911,34 @@ bool RenderThread::LateTransfer(const Pica::DisplayTransferConfig& config, bool 
         }
     }
     if (source) {
-        source->screens[std::min<u32>(source->segment, 3)] = static_cast<s8>(screen);
+        source->screens[std::min<u32>(source->segment, SegmentSlots - 1)] =
+            right_eye ? RightEyeScreen : static_cast<s8>(screen);
+        source->to_right_eye |= right_eye;
+        source->to_screen |= !right_eye && screen >= 0;
+        // The bytes the transfer reads from the buffer: output_height rows from the input, input_width
+        // apart; a texture copy to a screen the whole buffer.
+        const auto reach = [](u32& lo, u32& hi, u32 from, u32 to) {
+            lo = lo < hi ? std::min(lo, from) : from;
+            hi = std::max(hi, to);
+        };
+        const u32 row = config.input_width * Pica::BytesPerPixel(config.input_format);
+        const u32 from = in - source->addr;
+        const u32 to = std::min(source->bytes, from + config.output_height * row);
+        if (right_eye) {
+            reach(source->to_right_lo, source->to_right_hi, from, to);
+        } else if (screen >= 0) {
+            reach(source->to_screen_lo, source->to_screen_hi, display ? from : 0,
+                  display ? to : source->bytes);
+        } else if (segment_copies.size() < 32) {
+            if (hidden_right) {
+                reach(source->to_hidden_lo, source->to_hidden_hi, from, to);
+            }
+            const PAddr out = config.GetPhysicalOutputAddress();
+            const auto& tc = config.texture_copy;
+            const u32 out_bytes = display ? config.OutputBytes()
+                                          : CopySpan(tc.size, tc.output_width, tc.output_gap);
+            segment_copies.push_back({out, out + out_bytes, source->addr, source->bytes});
+        }
         dropped = source->dropped;
         source->segment++;
         source->dropped = false;
@@ -862,6 +985,27 @@ bool RenderThread::LateTransfer(const Pica::DisplayTransferConfig& config, bool 
             dropped_lcd.push_back(lcd);
         }
     }
+#ifdef VITA_DIAGNOSTICS
+    static u32 logged = 0;
+    if ((dropped || late_skip) && LatelogNow() && logged++ < 400) {
+        LOG_INFO(Render,
+                 "latelog: frame {}: {} {:#x}->{:#x} ({} bytes out), source {:#x}+{:#x} "
+                 "screen {}, LCD screen {}{}",
+                 screenlog_frame, display ? "display transfer" : "texture copy", in,
+                 config.GetPhysicalOutputAddress(),
+                 display ? config.OutputBytes() : static_cast<u32>(config.texture_copy.size),
+                 source ? source->addr : 0, source ? source->bytes : 0,
+                 source ? source->screens[std::min<u32>(source->segment - 1, SegmentSlots - 1)]
+                        : -1,
+                 screen, dropped ? ", dropped" : "");
+    }
+#endif
+    if (right_eye) {
+#ifdef VITA_DIAGNOSTICS
+        right_eye_transfers.fetch_add(1, std::memory_order_relaxed);
+#endif
+        return true;
+    }
     return dropped;
 }
 
@@ -890,20 +1034,6 @@ bool RenderThread::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& 
     Put(Op::DisplayTransfer, config);
     return true;
 }
-
-namespace {
-
-/// The bytes a texture copy's lines span on one side: whole lines of `width` bytes, `gap`
-/// apart (16-byte units), or the size itself with no width.
-u32 CopySpan(u32 size, u32 width, u32 gap) {
-    if (width == 0) {
-        return size;
-    }
-    const u32 w = width * 16;
-    return (size + w - 1) / w * (w + gap * 16);
-}
-
-} // namespace
 
 bool RenderThread::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
     if (LateTransfer(config, false)) {
@@ -1171,6 +1301,10 @@ void RenderThread::NotifyP3D() {
 }
 
 void RenderThread::SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::vector<u64>& irqs) {
+    // transfer, which looked like the right eye's: left out, its bottom screen was drawn into
+    // the top screen's height, offset in the buffer. Every right-eye list scanned with its draws
+    // dropped cost a game's race 195% -> 168%.
+    DEBUG_ASSERT(!ignore_list || pica.CmdListMayDraw(addr, size));
     if (ignore_list) {
         pica.ProcessCmdList(addr, size, true);
         return;
@@ -2358,6 +2492,13 @@ void RenderThread::Present(const std::array<Pica::FramebufferConfig, 2>& guest_f
     const auto forget = [this](std::vector<LcdBuffer>& known) {
         std::erase_if(known, [this](const LcdBuffer& b) { return presents_named - b.named > 8; });
     };
+    // The top screen's right-eye buffers apart from its left ones (a stereo title's).
+    for (const PAddr a :
+         {static_cast<PAddr>(fb[0].address_right1), static_cast<PAddr>(fb[0].address_right2)}) {
+        if (a != 0 && a != fb[0].address_left1 && a != fb[0].address_left2) {
+            note(right_eye_buffers, a);
+        }
+    }
     forget(right_eye_buffers);
     // Every buffer a screen has been shown from (a title may render into a third one the LCD's two
     // registers do not name yet).
@@ -2371,14 +2512,14 @@ void RenderThread::Present(const std::array<Pica::FramebufferConfig, 2>& guest_f
         forget(lcd_buffers[i]);
     }
     // The late skip: a screen whose selected LCD buffer holds a picture older than the one it last
-    // showed (a late frame's write into it dropped, or a buffer shown in its place rewritten
-    // since) shows the oldest picture no older than that instead.
+    // showed shows the oldest picture no older than that instead. A buffer the GPU never wrote is shown
+    // as it is (the CPU's picture, no stamp).
     for (u32 i = 0; i < 2; i++) {
         const PAddr selected = fb[i].second_fb_active ? fb[i].address_left2 : fb[i].address_left1;
         auto& buffers = lcd_buffers[i];
         const auto it = std::find_if(buffers.begin(), buffers.end(),
                                      [selected](const LcdBuffer& b) { return b.addr == selected; });
-        if (it == buffers.end() || it->stamp >= shown_stamp[i]) {
+        if (it == buffers.end() || it->stamp >= shown_stamp[i] || !it->gpu) {
 #ifdef VITA_DIAGNOSTICS
             if (screenlog_on) {
                 LOG_INFO(Render, "screenlog frame {}: screen {} shows selected {:#x} (stamp {}{})",
@@ -2445,8 +2586,12 @@ void RenderThread::EndFrame() {
                                    t.dropped);
         }
         for (const SegmentTarget& t : segment_targets) {
-            map += fmt::format(" {:#x}+{:#x}:s{}/{}/{}/{}", t.addr, t.bytes, t.screens[0],
-                               t.screens[1], t.screens[2], t.screens[3]);
+            u32 used = SegmentSlots;
+            while (used > 1 && t.screens[used - 1] < 0) {
+                used--;
+            }
+            map += fmt::format(" {:#x}+{:#x}:s{}", t.addr, t.bytes,
+                               fmt::join(t.screens.begin(), t.screens.begin() + used, "/"));
         }
         LOG_INFO(
             Render,
@@ -2480,7 +2625,28 @@ void RenderThread::EndFrame() {
             t.segment = 0;
             t.dropped = false;
         }
+        if (t.to_right_eye || t.to_screen) {
+            t.right_eye = t.to_right_eye && !t.to_screen && !t.feeds_reader;
+            // Both eyes in one buffer: the right eye's bytes, when no screen's transfer read any of them.
+            const bool apart = t.to_right_eye && t.to_screen &&
+                               (t.to_right_hi <= t.to_screen_lo || t.to_screen_hi <= t.to_right_lo);
+            const bool hidden_apart =
+                !apart && t.to_screen && !t.feeds_reader && t.to_hidden_lo < t.to_hidden_hi &&
+                (t.to_hidden_hi <= t.to_screen_lo || t.to_screen_hi <= t.to_hidden_lo);
+            t.feeds_reader = false;
+            t.right_lo = apart ? t.to_right_lo : hidden_apart ? t.to_hidden_lo : 0;
+            t.right_hi = apart ? t.to_right_hi : hidden_apart ? t.to_hidden_hi : 0;
+            t.to_right_eye = t.to_screen = false;
+            t.to_right_lo = t.to_right_hi = t.to_screen_lo = t.to_screen_hi = 0;
+        }
+        t.to_hidden_lo = t.to_hidden_hi = 0;
     }
+    segment_copies.clear();
+    std::erase_if(dropped_outputs, [](const DroppedOutput& o) { return o.earlier; });
+    for (DroppedOutput& o : dropped_outputs) {
+        o.earlier = true;
+    }
+    dropped_lcd.clear();
     late_reported = {};
     for (u32 i = 0; i < 2; i++) {
         screen_cost[i] = screen_cost[i] - screen_cost[i] / 8 + frame_cost[i];
@@ -2545,6 +2711,16 @@ void RenderThread::EndFrame() {
     Put(Op::FrameEnd);
 }
 
+bool RenderThread::RightEyeOutput(PAddr addr, u32 bytes) const {
+    if (!right_eye_disabler.Allowed()) {
+        return false;
+    }
+    const u32 size = lcd_fb[0].stride * 400u;
+    return std::any_of(right_eye_buffers.begin(), right_eye_buffers.end(), [&](const LcdBuffer& b) {
+        return addr < b.addr + size && b.addr < addr + bytes;
+    });
+}
+
 int RenderThread::LcdScreenOf(PAddr addr, u32 bytes, PAddr* buffer) const {
     for (u32 i = 0; i < 2; i++) {
         const u32 size = lcd_fb[i].stride * (i == 0 ? 400u : 320u);
@@ -2561,12 +2737,10 @@ int RenderThread::LcdScreenOf(PAddr addr, u32 bytes, PAddr* buffer) const {
 }
 
 void RenderThread::NoteLcdWrite(int screen, PAddr buffer, bool dropped) {
-    if (dropped) {
-        return;
-    }
     for (LcdBuffer& b : lcd_buffers[screen]) {
         if (b.addr == buffer) {
-            b.stamp = ++lcd_writes;
+            b.gpu = true;
+            b.stamp = dropped ? b.stamp : ++lcd_writes;
         }
     }
 }
@@ -2581,8 +2755,10 @@ RenderThread::SegmentTarget& RenderThread::SegmentTargetFor(PAddr addr, u32 byte
     if (segment_targets.size() == 16) {
         segment_targets.erase(segment_targets.begin());
     }
-    return segment_targets.emplace_back(
-        SegmentTarget{addr, bytes, 0, false, false, {-1, -1, -1, -1}, 0, 0});
+    SegmentTarget& t = segment_targets.emplace_back(
+        SegmentTarget{addr, bytes, 0, false, false, {}, 0, 0, false, false, false});
+    t.screens.fill(-1);
+    return t;
 }
 
 bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
@@ -2606,8 +2782,25 @@ bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
     SegmentTarget& t = segment_targets[late_cache.target];
     t.open = true;
     t.drawn = ++segment_draws;
-    const int screen = lcd_screen >= 0 ? lcd_screen : t.screens[std::min<u32>(t.segment, 3)];
-    if (screen >= 0) {
+    // In a buffer of both eyes, a draw whose viewport's rows lie within the right eye's bytes (rows
+    // y0..y1 are bytes from (height - y1) rows in to (height - y0)).
+    const auto in_right_eye = [&] {
+        if (t.right_lo >= t.right_hi) {
+            return false;
+        }
+        const auto rect = pica.regs.internal.rasterizer.GetViewportRect();
+        const u32 height = fb.GetHeight();
+        const u32 row = fb.GetWidth() * Pica::FramebufferRegs::BytesPerColorPixel(fb.color_format);
+        const u32 y0 = static_cast<u32>(std::clamp<s32>(rect.bottom, 0, static_cast<s32>(height)));
+        const u32 y1 = static_cast<u32>(std::clamp<s32>(rect.top, 0, static_cast<s32>(height)));
+        return y0 < y1 && (height - y1) * row >= t.right_lo && (height - y0) * row <= t.right_hi;
+    };
+    const bool right_part = lcd_screen < 0 && !t.right_eye && in_right_eye();
+    const u32 slot = std::min<u32>(t.segment, SegmentSlots - 1);
+    const int screen = lcd_screen >= 0              ? lcd_screen
+                       : t.right_eye || right_part ? RightEyeScreen
+                                                   : t.screens[slot];
+    if (screen >= 0 && screen != RightEyeScreen) {
         frame_cost[screen] += vertices + LateDrawCost;
     }
     // The screens whose draws sample a colour buffer, for one no transfer ends (an effect's chain of
@@ -2628,7 +2821,43 @@ bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
             }
         }
     }
-    const bool dropped = late_skip && (screen < 0 || screen != late_keep);
+    const bool right_eye = screen == RightEyeScreen;
+    // A buffer of no screen goes with the screens that sample it: dropped late unless the kept screen
+    // reads it.
+    const bool reader_kept = screen < 0 && late_keep >= 0 && ((t.readers >> late_keep) & 1) != 0;
+    const bool dropped =
+        right_eye || (late_skip && !reader_kept && (screen < 0 || screen != late_keep));
+    // A kept draw that samples a copy of another buffer: that buffer feeds it, whatever screen its own
+    // segment goes to (each eye's picture may be composited in the other eye's buffer).
+    if (!right_eye && !segment_copies.empty()) {
+        for (const auto& texture : pica.regs.internal.texturing.GetTextures()) {
+            if (!texture.enabled) {
+                continue;
+            }
+            const PAddr read = texture.config.GetPhysicalAddress();
+            for (const SegmentCopy& c : segment_copies) {
+                if (read < c.lo || read >= c.hi || (c.source == t.addr && c.source_bytes == t.bytes)) {
+                    continue;
+                }
+                for (SegmentTarget& s : segment_targets) {
+                    if (s.addr == c.source && s.bytes == c.source_bytes) {
+#ifdef VITA_DIAGNOSTICS
+                        static u32 marks = 0;
+                        if (!s.feeds_reader && marks < 200 && LatelogNow()) {
+                            marks++;
+                            LOG_INFO(Render,
+                                     "latelog: frame {}: a draw into {:#x}+{:#x} (screen {}) reads "
+                                     "{:#x}, a copy {:#x}-{:#x} of {:#x}+{:#x}: that one feeds it",
+                                     screenlog_frame, addr, bytes, screen, read, c.lo, c.hi,
+                                     s.addr, s.bytes);
+                        }
+#endif
+                        s.feeds_reader = true;
+                    }
+                }
+            }
+        }
+    }
 #ifdef VITA_DIAGNOSTICS
     static u32 hazards = 0;
     if (dropped) {
@@ -2647,7 +2876,7 @@ bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
                              "of {:#x}+{:#x} (screen {}), whose newest draws were dropped {} "
                              "frame(s) back (last kept {} back)",
                              screenlog_frame, addr, screen, read, s.addr, s.bytes,
-                             s.screens[std::min<u32>(s.segment, 3)],
+                             s.screens[std::min<u32>(s.segment, SegmentSlots - 1)],
                              screenlog_frame - s.dropped_frame, screenlog_frame - s.kept_frame);
                 }
             }
@@ -2690,9 +2919,12 @@ bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
         return false;
     }
 #ifdef VITA_DIAGNOSTICS
-    late_draws.fetch_add(1, std::memory_order_relaxed);
+    (right_eye ? right_eye_draws : late_draws).fetch_add(1, std::memory_order_relaxed);
 #endif
-    t.dropped = true;
+    // A draw of the right eye's bytes alone leaves what the buffer's other transfers read whole.
+    if (!right_part) {
+        t.dropped = true;
+    }
     return true;
 }
 
@@ -2779,6 +3011,8 @@ RenderThread::Stats RenderThread::TakeStats() {
     s.late_kept = late_kept.exchange(0);
     s.merged_draws = merged_draws.exchange(0);
     s.merged_runs = merged_runs.exchange(0);
+    s.right_eye_draws = right_eye_draws.exchange(0);
+    s.right_eye_transfers = right_eye_transfers.exchange(0);
     s.late_partial = late_partial.exchange(0);
     s.parse_busy_us = parse_busy_us.exchange(0);
     s.parsed_waits = parsed_waits.exchange(0);

@@ -115,8 +115,8 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
     // The renderer's rasterizer runs on the render thread, from its copy of the PICA's state;
     // the PICA here calls the thread, which queues.
     impl->render = std::make_unique<SgxdRenderer::RenderThread>(
-        impl->pica, impl->parse_pica, impl->render_pica, *gxm,
-        *static_cast<GxmRenderer::RasterizerGxm*>(gxm->Rasterizer()), impl->memory);
+        impl->pica, impl->parse_pica, impl->render_pica, *impl->renderer,
+        impl->renderer->Rasterizer(), impl->memory, *right_eye_disabler);
     impl->rasterizer = impl->render.get();
 
     // Bind the rasterizer to the PICA GPU
@@ -789,10 +789,26 @@ void GPU::MemoryTransfer() {
     if (!config.trigger.Value()) {
         return;
     }
+    // A 2D title names its left buffers in the right registers too.
+    const auto into_right_eye = [&] {
+        const Pica::FramebufferConfig& top = impl->pica.regs.framebuffer_config[0];
+        const PAddr out = config.GetPhysicalOutputAddress();
+        const u32 out_bytes = config.OutputBytes();
+        const u32 eye_bytes = top.stride * 400u;
+        for (const PAddr a : {static_cast<PAddr>(top.address_right1),
+                              static_cast<PAddr>(top.address_right2)}) {
+            if (a != 0 && a != top.address_left1 && a != top.address_left2 &&
+                out < a + eye_bytes && a < out + out_bytes) {
+                return true;
+            }
+        }
+        return false;
+    };
     const bool allow_display_transfer =
         config.is_texture_copy ||
         right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
-                                                       config.input_height, config.output_height);
+                                                       config.input_height, config.output_height,
+                                                       into_right_eye());
     // (The output's pages move to CDRAM once the transfer is known to run:
     // RenderThread::AccelerateDisplayTransfer.)
     if (!config.is_texture_copy && allow_display_transfer) {

@@ -475,6 +475,10 @@ public:
 
     RenderPropertiesGuess GuessCmdRenderProperties(PAddr list, u32 size);
 
+    /// Whether a list, with the lists it jumps to, can draw: a draw trigger or an immediate-mode
+    /// vertex in reach, or a jump it does not follow. The registers as they are now, before it.
+    bool CmdListMayDraw(PAddr list, u32 size);
+
 private:
     Memory::MemorySystem& memory;
     VideoCore::RasterizerInterface* rasterizer;

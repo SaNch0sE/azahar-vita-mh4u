@@ -80,6 +80,7 @@
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/renderer_sgxd.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
+#include "video_core/right_eye_disabler.h"
 
 // The default heap is nowhere near enough for a 3DS: FCRAM alone is 128 MB, and the caches and
 // the surface storage sit on top of it. Newlib reads this at startup.
@@ -1481,9 +1482,34 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         Frontend,
                         "perf: late skip: {} frames, {} draws dropped, "
                         "{} kept for the other screen; screens presented from another buffer {}; "
-                        "drawn whole with the GPU late {}, the vblank waiting {:.1f} ms",
+                        "drawn whole with the GPU late {}, the vblank waiting {:.1f} ms; right "
+                        "eye: {} draws, {} transfers left out",
                         t.late_frames, t.late_draws, t.late_kept, t.late_partial, t.late_waits,
-                        t.late_wait_us / 1e3);
+                        t.late_wait_us / 1e3, t.right_eye_draws, t.right_eye_transfers);
+                    LOG_INFO(Frontend,
+                             "perf: parse thread busy {:.1f} ms; the render thread waited for "
+                             "a list's parse {} times ({:.1f} ms of its busy time); geometry "
+                             "draws merged: {} vertices in {} runs",
+                             t.parse_busy_us / 1e3, t.parsed_waits, t.parsed_wait_us / 1e3,
+                             t.merged_draws, t.merged_runs);
+                    LOG_INFO(Frontend,
+                             "perf: command lists: {} ({:.1f} KiB; {:.1f} KiB parsed with the "
+                             "buffers they jump to, in {} ranges; {:.1f} KiB the most in one), "
+                             "{} draws; the emulation thread's scan {:.1f} ms; index scans {} "
+                             "({} indices, {:.1f} ms), {} ranges from the memo",
+                             t.lists, t.list_bytes / 1024.0, t.list_parsed_bytes / 1024.0,
+                             t.list_ranges, t.list_parsed_max / 1024.0, t.list_draws,
+                             t.scan_us / 1e3, t.index_scans, t.index_scan_indices,
+                             t.index_scan_us / 1e3, t.index_memo_hits);
+                    LOG_INFO(Frontend,
+                             "perf: ring: {} publishes; wakes of the render thread {}, of the "
+                             "parse thread {} ({:.1f} ms in the syscalls)",
+                             t.publishes, t.render_wakes, t.parse_wakes, t.wake_us / 1e3);
+                    const auto eye = system.GPU().GetRightEyeDisabler().TakeCounts();
+                    LOG_INFO(Frontend,
+                             "perf: right-eye guess: {} lists and {} transfers left out, {} "
+                             "frames with the top picture sent to both eyes",
+                             eye.lists, eye.transfers, eye.both_eyes);
                     if (t.lead_samples != 0) {
                         LOG_INFO(Frontend,
                                  "perf: frames queued ahead of the render thread at the vblanks: "
@@ -2031,7 +2057,6 @@ int EmulatorMain() {
     // Vertex shading happens on the GPU or not at all: with this off, the PICA code would send
     // every draw down its CPU vertex path, which the sgxd rasterizer does not have.
     Settings::values.use_hw_shader = true;
-    Settings::values.disable_right_eye_render = true;
     // Measurement builds (the -nl branches): no speed limit from the start, as the pause menu's
     // speed limit at 0, so that a release recording shows how far past full speed it runs.
     Settings::values.frame_limit = 0.0;

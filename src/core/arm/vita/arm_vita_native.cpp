@@ -87,13 +87,10 @@ u64 TicksToNanoseconds(s64 ticks) {
     return static_cast<u64>(ticks) * 1'000'000'000ull / BASE_CLOCK_RATE_ARM11;
 }
 
-/// Every guest page is mapped read, write and execute. The emulated process's own permissions
-/// are not reported through the mapping observer; W^X per section is a later refinement.
+/// Every guest page is mapped RWX; the process's own permissions are not tracked.
 constexpr u32 GuestPerm = AZAHAR_PERM_R | AZAHAR_PERM_W | AZAHAR_PERM_X;
 
-/// The core the module takes. The emulation thread must not be pinned there, or the detach
-/// leaves it with nowhere to run: it moves to core 0, where the rasterizer's first worker lives
-/// and where it mostly waits inside azaharRun anyway.
+/// The core the module takes; the emulation thread must not be pinned there.
 constexpr int TakenCore = 2;
 
 const char* ReasonName(u32 reason) {
@@ -1126,7 +1123,6 @@ void VitaGuestMap::OnMapped(VAddr base, u32 size, MemoryRef target) {
         return;
     }
 
-    // Whatever was there is replaced, on the guest side too when the table is live.
     ForgetRange(base, size, installed);
     live_mappings.emplace(base, wanted);
     if (installed) {
@@ -1307,11 +1303,8 @@ void VitaGuestMap::SyncAllCode() {
 // ---------------------------------------------------------------------------- ARM_VitaNative
 
 std::shared_ptr<VitaGuestMap> ARM_VitaNative::CreateMap(Memory::MemorySystem& memory) {
-    // The module holds a core only in its resident design, and a thread pinned to a held core
-    // never runs again - so this thread steps aside before the take, and steps back if the
-    // module answers that it folded the guest into its caller instead. Folded, the partition's
-    // choice is the one that matters: the slice runs on this thread's core, so the emulation
-    // thread belongs on the core the frontend gave it and the guest goes there with it.
+    // A thread pinned to a core the module holds never runs again: this thread steps aside before the
+    // take, and back if the module folded the guest into its caller.
     const SceUID self = sceKernelGetThreadId();
     const int affinity = sceKernelGetThreadCpuAffinityMask(self);
     if (affinity == (SCE_KERNEL_CPU_MASK_USER_0 << TakenCore) || affinity == 0) {
@@ -1353,8 +1346,7 @@ void ARM_VitaNative::Run() {
     if (break_flag) [[unlikely]] {
         return;
     }
-    // The scheduler asks for a stop immediately before handing out a new slice; that request is
-    // about the slice that just ended.
+    // The scheduler asks for a stop right before a new slice: that request was the last slice's.
     stop_requested = false;
 
     const u64 quantum =
@@ -3923,10 +3915,8 @@ void ARM_VitaNative::InvalidateCacheRange(u32 start_address, std::size_t length)
     if (!map) {
         return;
     }
-    // svcInvalidateInstructionCacheRange, which some titles issue every frame over a page
-    // of their data. A sync is a kernel round trip that cleans the page and drops core 2's
-    // icache, and it is only owed where something can execute: the process's own view of
-    // the range says whether it can.
+    // Some titles invalidate their data's icache every frame: a sync is only owed where the process's
+    // view of the range can execute.
     if (const auto process = system.Kernel().GetCurrentProcess()) {
         const auto& vm = process->vm_manager;
         bool executable = false;
@@ -3964,9 +3954,8 @@ void ARM_VitaNative::ClearExclusiveState() {
 
 void ARM_VitaNative::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
     current_page_table = page_table;
-    // The one call that reaches every core: the kernel updates the memory system's current
-    // table only for the core it considers running, so a table given to any other core would
-    // never reach the mapping observer at all - and the guest table would install empty.
+    // The kernel updates the current table only for the core it considers running, so the table is
+    // given here for every core.
     if (map && page_table && map->MirroredTable() != page_table.get()) {
         memory.SyncMappingObserver(*page_table);
         map->SetMirroredTable(page_table.get());

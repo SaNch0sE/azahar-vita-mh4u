@@ -21,6 +21,10 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_sgxd/page_holds.h"
 
+namespace VideoCore {
+class RightEyeDisabler;
+}
+
 namespace Memory {
 class MemorySystem;
 }
@@ -60,8 +64,9 @@ class RendererSgxd;
 class RenderThread final : public VideoCore::RasterizerInterface {
 public:
     RenderThread(Pica::PicaCore& pica, Pica::PicaCore& parse_pica, Pica::PicaCore& render_pica,
-                 RendererGxm& renderer,
-                 RasterizerGxm& rasterizer, Memory::MemorySystem& memory);
+                 RendererSgxd& renderer,
+                 RasterizerSgxd& rasterizer, Memory::MemorySystem& memory,
+                 const VideoCore::RightEyeDisabler& right_eye);
     ~RenderThread() override;
 
     /// The live render thread's state for the stall watch's report, into `out` without allocating (a
@@ -84,7 +89,8 @@ public:
     using DrawTextures = std::array<GuestRange, 8>;
 
     /// A command list the guest submitted (GPU::SubmitCmdList), its interrupt requests' delays
-    /// into `irqs`, for P3D once it is queued. ignore_list: the right eye's, its P3D alone.
+    /// into `irqs`, for P3D once it is queued. ignore_list: the right eye's, its P3D alone when
+    /// it can draw.
     void SubmitCmdList(PAddr addr, u32 size, bool ignore_list, std::vector<u64>& irqs);
     /// A PICA register the guest wrote outside a list, in order with the lists. Only the parse thread
     /// reads it, so the next list's publish takes it along.
@@ -303,6 +309,8 @@ public:
         u32 late_kept;
         u32 merged_draws; ///< the parse's merged runs' vertices (MergeDraw), and the runs
         u32 merged_runs;
+        u32 right_eye_draws;     ///< draws of the right eye left out
+        u32 right_eye_transfers; ///< transfers into a right-eye LCD buffer left out
         u32 late_partial;
         u32 gpu_samples;
         u32 gpu_busy;
@@ -653,31 +661,50 @@ private:
     bool late_triangles_open{};
     /// The last dropped draw's colour buffer and viewport reported this frame (Op::LateDropped).
     std::array<u32, 3> late_reported{};
-    /// The colour buffers drawn lately (the newest 16), each with its segments: a segment is
-    /// the draws into it up to a transfer from it. a game draws both screens into one colour
-    /// buffer (skiplog: the top screen's draws, its transfer, the bottom screen's draws, its
-    /// transfer). Per buffer: this frame's segment, whether a draw of it was dropped, whether
-    /// it is open (drawn since its last transfer), and each segment's screen as the transfer
-    /// that ended it last found it (-1: none, or no LCD). A segment open at a frame's end goes
-    /// on into the next frame with its number and its dropped draws: MH Generations' frames
-    /// sometimes draw the bottom screen and the top screen's first draws before a vblank and
-    /// the rest of the top screen after it.
+    /// The colour buffers drawn lately (the newest 16), each with its segments: a segment is the draws
+    /// into it up to a transfer from it. Per buffer: this frame's segment, a dropped draw, open (drawn
+    /// since its last transfer), and each segment's screen as the transfer that ended it last found it.
+    /// A segment open at a frame's end goes on into the next. Segments from the last slot on share it.
+    static constexpr u32 SegmentSlots = 16;
     struct SegmentTarget {
         PAddr addr;
         u32 bytes;
         u32 segment;
         bool dropped;
         bool open;
-        std::array<s8, 4> screens;
+        std::array<s8, SegmentSlots> screens;
         u8 readers;
         /// segment_draws at its last draw: of the buffers holding a transfer's source, the newest drawn.
         u32 drawn;
+        /// Every transfer from it into an LCD buffer in the last frame that had one went into a right-eye
+        /// buffer: every segment is the right eye's. One that also went to a screen keeps its segments'
+        /// screens. to_right_eye and to_screen: this frame's so far.
+        bool right_eye;
+        bool to_right_eye;
+        bool to_screen;
+        /// A kept draw into another buffer sampled a copy or transfer of it this frame: its picture goes on
+        /// into that draw's, so it is not the right eye's.
+        bool feeds_reader;
+        /// A buffer of both eyes: the bytes the right-eye transfers of the last frame read, when no
+        /// transfer to a screen read any of them; a draw within them is the right eye's. Empty when
+        /// lo >= hi; the to_ pairs are this frame's reach so far.
+        u32 right_lo, right_hi;
+        u32 to_right_lo, to_right_hi, to_screen_lo, to_screen_hi;
+        /// This frame's reach of its transfers of a right eye no screen shows, beside a screen's bytes alone
+        /// and while no kept draw samples its copies.
+        u32 to_hidden_lo, to_hidden_hi;
 #ifdef VITA_DIAGNOSTICS
         u32 dropped_frame; // screenlog_frame of its last dropped draw (latelog)
         u32 kept_frame;    // screenlog_frame of its last kept draw (latelog)
 #endif
     };
     std::vector<SegmentTarget> segment_targets;
+    struct SegmentCopy {
+        PAddr lo, hi;
+        PAddr source;
+        u32 source_bytes;
+    };
+    std::vector<SegmentCopy> segment_copies;
     /// This frame's and the last frame's outputs of dropped transfers and copies, until a kept write
     /// covers them: a picture never made. Not an LCD buffer's. A transfer or copy that reads one and no
     /// drawn colour buffer is dropped too; one into a drawn colour buffer counts as a dropped draw.
@@ -703,6 +730,23 @@ private:
     };
     LateTargetCache late_cache;
     u32 late_generation{};
+    /// A segment's screen when its transfer went into a right-eye LCD buffer of the top screen: its
+    /// draws and that transfer are left out from then on (the Vita shows the left eye only).
+    static constexpr s8 RightEyeScreen = 2;
+    const VideoCore::RightEyeDisabler& right_eye_disabler;
+    /// An LCD buffer a present named: its picture's stamp (LCD writes so far, 0: none seen) and the
+    /// present that last named it.
+    struct LcdBuffer {
+        PAddr addr;
+        u32 stamp;
+        u32 named;
+        /// The GPU has written it. One it never has holds what the CPU or a service wrote.
+        bool gpu;
+    };
+    u32 presents_named{};
+    /// The top screen's right-eye LCD buffers a present named apart from its left ones (newest four).
+    std::vector<LcdBuffer> right_eye_buffers;
+    [[nodiscard]] bool RightEyeOutput(PAddr addr, u32 bytes) const;
 #ifdef VITA_DIAGNOSTICS
     struct ScreenlogTarget {
         PAddr addr;
@@ -795,6 +839,8 @@ private:
     std::atomic<u32> late_kept{};
     std::atomic<u32> merged_draws{};
     std::atomic<u32> merged_runs{};
+    std::atomic<u32> right_eye_draws{};
+    std::atomic<u32> right_eye_transfers{};
     std::atomic<u32> late_partial{};
     std::array<std::atomic<u32>, 4> present_gaps{};
     std::atomic<u32> holds{};

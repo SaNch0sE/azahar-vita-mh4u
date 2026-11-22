@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 
 #include "common/arch.h"
 #include "common/archives.h"
@@ -1434,6 +1435,74 @@ PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u
     }
 
     return find_info;
+}
+
+bool PicaCore::CmdListMayDraw(PAddr list, u32 size) {
+    constexpr u32 draw = PICA_REG_INDEX(pipeline.trigger_draw);
+    constexpr u32 draw_indexed = PICA_REG_INDEX(pipeline.trigger_draw_indexed);
+    constexpr u32 attribute_index = PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index);
+    constexpr u32 attribute_value = PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]);
+    constexpr u32 channels = PICA_REG_INDEX(pipeline.command_buffer.size[0]);
+    constexpr u32 jump = PICA_REG_INDEX(pipeline.command_buffer.trigger[0]);
+    static_assert(draw < draw_indexed && draw_indexed < attribute_index &&
+                  attribute_index < attribute_value && attribute_value + 3 <= channels &&
+                  channels + 4 == jump);
+    // The channels' sizes and addresses and the default attribute index, as the list sets them.
+    std::array<u32, 4> channel;
+    std::copy_n(&regs.internal.reg_array[channels], 4, channel.begin());
+    u32 index = regs.internal.reg_array[attribute_index];
+    u32 attribute_words = 0;
+    for (u32 lists = 0; lists < 8; lists++) {
+        memory.GuardPhysicalRead(list, size);
+        const u32* const words = reinterpret_cast<const u32*>(memory.GetPhysicalPointer(list));
+        if (words == nullptr) {
+            return true;
+        }
+        const u32 length = size / 4;
+        std::optional<u32> next;
+        u32 i = 0;
+        while (i + 1 < length && !next) {
+            const CommandHeader header{words[i + 1]};
+            const u32 extra = header.extra_data_length;
+            const u32 first = header.cmd_id;
+            const u32 last = header.group_commands ? first + extra : first;
+            if (last >= draw && first <= jump + 1) {
+                const u32 mask = ExpandBitsToBytes[header.parameter_mask];
+                for (u32 k = 0; k <= extra && !next; k++) {
+                    if (k != 0 && i + 1 + k >= length) {
+                        break;
+                    }
+                    const u32 id = header.group_commands ? first + k : first;
+                    const u32 value = k == 0 ? words[i] : words[i + 1 + k];
+                    if (id == draw || id == draw_indexed) {
+                        return true;
+                    } else if (id == attribute_index) {
+                        index = (index & ~mask) | (value & mask);
+                        attribute_words = 0;
+                    } else if (id >= attribute_value && id < attribute_value + 3) {
+                        // An attribute at index 0xF is an immediate-mode vertex; each one below
+                        // steps the index, and up to two words may be queued from before.
+                        attribute_words++;
+                        if (index + (attribute_words + 2) / 3 > 0xF) {
+                            return true;
+                        }
+                    } else if (id >= channels && id < jump) {
+                        channel[id - channels] = (channel[id - channels] & ~mask) | (value & mask);
+                    } else if (id == jump || id == jump + 1) {
+                        next = id - jump;
+                    }
+                }
+            }
+            i += 2 + extra;
+            i += i & 1;
+        }
+        if (!next) {
+            return false;
+        }
+        size = 8 * (channel[*next] & 0xFFFFF);
+        list = 8 * (channel[2 + *next] & 0xFFFFFFF);
+    }
+    return true;
 }
 
 template <class Archive>
