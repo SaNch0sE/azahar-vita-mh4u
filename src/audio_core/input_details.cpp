@@ -18,6 +18,9 @@
 #ifdef HAVE_LIBRETRO
 #include "audio_core/libretro_input.h"
 #endif
+#ifdef __vita__
+#include "audio_core/vita_input.h"
+#endif
 #include "common/logging/log.h"
 #include "core/core.h"
 
@@ -25,6 +28,13 @@ namespace AudioCore {
 namespace {
 // input_details is ordered in terms of desirability, with the best choice at the top.
 constexpr std::array input_details = {
+#ifdef __vita__
+    InputDetails{InputType::Vita, "Real Device (Vita)", true,
+                 [](Core::System& system, std::string_view device_id) -> std::unique_ptr<Input> {
+                     return std::make_unique<VitaInput>();
+                 },
+                 &ListVitaInputDevices},
+#endif
 #ifdef HAVE_LIBRETRO
     InputDetails{InputType::LibRetro, "Real Device (LibRetro)", true,
                  [](Core::System& system, std::string_view device_id) -> std::unique_ptr<Input> {

@@ -43,7 +43,7 @@ add_library(audio_core STATIC EXCLUDE_FROM_ALL
     $<$<BOOL:${ENABLE_CUBEB}>:cubeb_sink.cpp cubeb_sink.h cubeb_input.cpp cubeb_input.h>
     $<$<BOOL:${ENABLE_LIBRETRO}>:libretro_sink.cpp libretro_sink.h libretro_input.cpp libretro_input.h>
     $<$<BOOL:${ENABLE_OPENAL}>:openal_input.cpp openal_input.h openal_sink.cpp openal_sink.h>
-    $<$<BOOL:${VITA}>:vita_sink.cpp vita_sink.h>
+    $<$<BOOL:${VITA}>:vita_input.cpp vita_input.h vita_sink.cpp vita_sink.h>
 )
 
 create_target_directory_groups(audio_core)
