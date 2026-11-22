@@ -65,6 +65,16 @@ public:
                  RasterizerGxm& rasterizer, Memory::MemorySystem& memory);
     ~RenderThread() override;
 
+    /// The live render thread's state for the stall watch's report, into `out` without allocating (a
+    /// frozen thread may hold the heap's lock). Read without locks: a snapshot.
+    static void DescribeLive(char* out, std::size_t size);
+    static s32 LiveThreadId();
+    /// The late skip's cap: how many frames in a row it may drop one screen's draws while the GPU lags
+    /// (0 none, NoScreenSkipLimit any number). Read at each frame's end; any thread.
+    static void SetMaxScreenSkips(u32 frames);
+    [[nodiscard]] static u32 MaxScreenSkips();
+    static constexpr u32 NoScreenSkipLimit = 0xFFFFFFFF;
+
     RenderThread(const RenderThread&) = delete;
     RenderThread& operator=(const RenderThread&) = delete;
 
@@ -355,6 +365,17 @@ private:
     std::atomic<u32> read{};
 
     std::deque<Pending> pending;
+    std::atomic<u32> loop_passes{};
+    std::atomic<u32> pending_size{};
+    std::atomic<u32> pending_front_ticket{};
+    std::atomic<u64> pending_front_fence{};
+    static constexpr u32 NoRecord = 0xFFFFFFFF;
+    std::atomic<u32> running_op{NoRecord};
+    std::atomic<s32> render_tid{-1};
+    /// RunAvailable is running: a Call's function that queues returns to it. One thread drives
+    /// the render side at a time (a hold takes it once this thread parked, outside RunAvailable),
+    /// so the flag is that thread's.
+    bool running_available = false;
     u32 tickets{};                  ///< the last ticket handed out (GPU's lock)
     std::atomic<u32> reached{};     ///< the last ticket whose work is done
 

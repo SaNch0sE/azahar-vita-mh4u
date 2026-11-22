@@ -3,6 +3,8 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/base_object.hpp>
@@ -97,6 +99,8 @@ private:
     // the thread first (Finish).
 public:
     void Finish();
+    /// DspHle::DescribeWorker's text.
+    void DescribeWorker(char* out, std::size_t size) const;
 #ifdef VITA_DIAGNOSTICS
     void NoteSemaphore();
     DspHle::Stats TakeStats();
@@ -148,6 +152,12 @@ private:
     u32 last_tick_key{~0u};
     Common::ProcessClock::time_point interrupt_at{};
 #endif
+    /// Where the worker's frame is, for DescribeWorker: a source's index, MixersAt, OutputAt,
+    /// or IdleAt between frames.
+    static constexpr u32 MixersAt = 100;
+    static constexpr u32 OutputAt = 200;
+    static constexpr u32 IdleAt = 255;
+    std::atomic<u32> worker_at{IdleAt};
     Common::NamedThread worker;
 
     std::unique_ptr<HLE::DecoderBase> aac_decoder{};
@@ -171,6 +181,11 @@ private:
     friend class boost::serialization::access;
 };
 
+namespace {
+/// The DSP running, for DescribeWorker (the stall watch's thread reads it).
+std::atomic<void*> live_dsp{};
+} // namespace
+
 DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& timing)
     : parent(parent_), core_timing(timing) {
     dsp_memory = reinterpret_cast<HLE::DspMemory*>(memory.GetDspMemory(0));
@@ -189,9 +204,11 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
                                                 [this](u64, s64) { this->InterruptCallback(); });
     core_timing.ScheduleEvent(audio_frame_ticks, tick_event);
     worker = Common::NamedThread{Common::ThreadCfg{"dsp", 256 * 1024}, [this] { Worker(); }};
+    live_dsp.store(this, std::memory_order_release);
 }
 
 DspHle::Impl::~Impl() {
+    live_dsp.store(nullptr, std::memory_order_release);
     core_timing.UnscheduleEvent(tick_event, 0);
     core_timing.UnscheduleEvent(interrupt_event, 0);
     {
@@ -220,7 +237,34 @@ void DspHle::Impl::Worker() {
 #ifdef VITA_DIAGNOSTICS
         const auto start = Common::ProcessClock::now();
 #endif
-        parent.OutputFrame(GenerateFrame(read));
+        Common::HeapCheck::Check("the DSP frame's start");
+        const StereoFrame16 frame = GenerateFrame(read);
+#ifdef VITA_DIAGNOSTICS
+        // A late frame's statuses went into the region the application is working in: the
+        // buffer changes they report are the ones it will not read.
+        u32 late_changes = 0;
+        if (late) {
+            const HLE::SharedMemory& write =
+                read != 0 ? dsp_memory->region_0 : dsp_memory->region_1;
+            std::string ids;
+            for (std::size_t i = 0; i < HLE::num_sources; i++) {
+                const auto& status = write.source_statuses.status[i];
+                if (status.current_buffer_id_dirty) {
+                    late_changes++;
+                    fmt::format_to(std::back_inserter(ids), " {}:{}", i,
+                                   static_cast<u16>(status.current_buffer_id));
+                }
+            }
+            if (late_changes != 0) {
+                LOG_INFO(Audio_DSP, "dsp: a late frame's buffer changes (source:buffer):{}", ids);
+            }
+        }
+#endif
+        Common::HeapCheck::Check("the DSP frame's sources and mixes");
+        worker_at.store(OutputAt, std::memory_order_relaxed);
+        parent.OutputFrame(frame);
+        Common::HeapCheck::Check("the DSP frame's output");
+        worker_at.store(IdleAt, std::memory_order_relaxed);
 #ifdef VITA_DIAGNOSTICS
         const auto us = (Common::ProcessClock::now() - start).count();
 #endif
@@ -568,6 +612,7 @@ StereoFrame16 DspHle::Impl::GenerateFrame(std::size_t read_index) {
 
     // Generate intermediate mixes
     for (std::size_t i = 0; i < HLE::num_sources; i++) {
+        worker_at.store(static_cast<u32>(i), std::memory_order_relaxed);
         write.source_statuses.status[i] =
             sources[i].Tick(read.source_configurations.config[i], read.adpcm_coefficients.coeff[i]);
         for (std::size_t mix = 0; mix < 3; mix++) {
@@ -576,6 +621,7 @@ StereoFrame16 DspHle::Impl::GenerateFrame(std::size_t read_index) {
     }
 
     // Generate final mix
+    worker_at.store(MixersAt, std::memory_order_relaxed);
     write.dsp_status = mixers.Tick(read.dsp_configuration, read.intermediate_mix_samples,
                                    write.intermediate_mix_samples, intermediate_mixes);
 
@@ -626,6 +672,31 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
 
     // Reschedule recurrent event
     core_timing.ScheduleEvent(frame_ticks - cycles_late, tick_event);
+}
+
+void DspHle::DescribeWorker(char* out, std::size_t size) {
+    const auto* const d = static_cast<const Impl*>(live_dsp.load(std::memory_order_acquire));
+    if (d == nullptr) {
+        std::snprintf(out, size, "no DSP thread");
+        return;
+    }
+    d->DescribeWorker(out, size);
+}
+
+void DspHle::Impl::DescribeWorker(char* out, std::size_t size) const {
+    const u32 at = worker_at.load(std::memory_order_relaxed);
+    const int used = std::snprintf(
+        out, size, "frames posted %u, done %u; at %s %u; source loop passes %u", frames_posted,
+        frames_done,
+        at < HLE::num_sources ? "source"
+        : at == MixersAt      ? "mixers"
+        : at == OutputAt      ? "output"
+                              : "idle",
+        at, HLE::source_loop_passes.load(std::memory_order_relaxed));
+    if (at < HLE::num_sources && used > 0 && static_cast<std::size_t>(used) + 3 < size) {
+        std::snprintf(out + used, size - used, "; ");
+        sources[at].Describe(out + used + 2, size - used - 2);
+    }
 }
 
 DspHle::DspHle(Core::System& system, Memory::MemorySystem& memory, Core::Timing& timing)

@@ -13,6 +13,7 @@
 // realloc and free keep the heap's large blocks with where they were allocated (PrintHeapSites).
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -21,16 +22,26 @@
 #include <string>
 #include <string_view>
 
+#include <psp2/display.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <unwind.h>
 
+#include "audio_core/hle/hle.h"
 #include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
+#include "common/assert.h"
 #include "common/logging/backend.h"
+#include "common/named_thread.h"
+#include "common/scm_rev.h"
+#include "core/cheats/cheat_base.h"
+#include "core/cheats/cheats.h"
+#include "video_core/renderer_sgxd/guest_gpu_memory.h"
+#include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
 
 extern "C" {
@@ -410,6 +421,10 @@ void PrintHeapSites(bool to_report) {
     }
 }
 
+void BlankDisplay() {
+    sceDisplaySetFrameBuf(nullptr, SCE_DISPLAY_SETBUF_NEXTFRAME);
+}
+
 namespace {
 
 /// The calling thread's call chain as the unwinder walks it (the EHABI tables): none of the scan's
@@ -450,6 +465,7 @@ void WriteCallChain(uintptr_t stack_begin, uintptr_t stack_end) {
 } // Anonymous namespace
 
 void WriteStackReport(const char* reason) {
+    BlankDisplay();
     static char report[2048];
     static SceKernelThreadInfo info;
     reported = true;
@@ -495,6 +511,432 @@ void WriteStackReport(const char* reason) {
                    reinterpret_cast<uintptr_t>(info.stack) + info.stackSize);
     if (failed_malloc_size != 0) {
         PrintHeapSites(true);
+    }
+}
+
+namespace {
+
+// SceLibKernel's, not in vitasdk's headers (the layouts are the SDK's).
+struct LwMutexInfo {
+    SceSize size;
+    SceUID uid;
+    char name[32];
+    SceUInt32 attr;
+    void* work;
+    SceInt32 init_count;
+    SceInt32 current_count;
+    SceUID current_owner;
+    SceUInt32 waiters;
+};
+struct LwCondInfo {
+    SceSize size;
+    SceUID uid;
+    char name[32];
+    SceUInt32 attr;
+    void* work;
+    void* lw_mutex;
+    SceUInt32 waiters;
+};
+extern "C" int sceKernelGetLwMutexInfoById(SceUID id, LwMutexInfo* info);
+extern "C" int sceKernelGetLwCondInfoById(SceUID id, LwCondInfo* info);
+extern "C" int sceKernelGetCondInfo(SceUID id, SceKernelCondInfo* info);
+
+/// Where the stall listing goes: the debug channel (`hostthreads`), or the crash report on the
+/// memory card only (the stall watch: the debug link may be what stopped, and a print
+/// would then wait on it for good, short of the fault after it).
+bool stall_to_report;
+
+void StallLine(const char* format, ...) {
+    char line[320];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    if (stall_to_report) {
+        Common::Log::AppendCrashReport(line);
+    } else {
+        sceClibPrintf("%s", line);
+    }
+}
+
+void ThreadName(SceUID id, char (&name)[32]) {
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    std::strcpy(name, "?");
+    if (sceKernelGetThreadInfo(id, &info) >= 0) {
+        std::memcpy(name, info.name, sizeof(name));
+        name[sizeof(name) - 1] = '\0';
+    }
+}
+
+/// What a thread waits on (its wait type, Sony's SDK's values): the object's kind and name, and
+/// for a lock its owner, for a thread's end that thread.
+void DescribeWait(const SceKernelThreadInfo& t, char* out, size_t size) {
+    const SceUInt32 type = t.waitType & 0x7FFFFFFFu;
+    const SceUID id = t.waitId;
+    const char* kind = "?";
+    char name[32] = "";
+    SceUID owner = 0;
+    // Only this process's objects are asked about: their IDs carry 0x40000000. Asking about a
+    // system object (SceAudio's event flag, 0x00010b81) is a critical usage error that stops the
+    // process.
+    const bool ours = (static_cast<SceUInt32>(id) & 0x40000000u) != 0;
+    switch (type == 0 || type == 0x1 || ours ? type : 0xFFFFFFFFu) {
+    case 0xFFFFFFFFu:
+        std::snprintf(out, size, "a system object %08x (type %08x)", static_cast<unsigned>(id),
+                      static_cast<unsigned>(t.waitType));
+        return;
+    case 0:
+        std::snprintf(out, size, "no wait");
+        return;
+    case 0x1:
+        std::snprintf(out, size, "a delay");
+        return;
+    case 0x2:
+        kind = "the end of thread";
+        ThreadName(id, name);
+        break;
+    case 0x10: {
+        kind = "event flag";
+        SceKernelEventFlagInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetEventFlagInfo(id, &info) >= 0) {
+            std::memcpy(name, info.name, sizeof(name));
+        }
+        break;
+    }
+    case 0x20: {
+        kind = "semaphore";
+        SceKernelSemaInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetSemaInfo(id, &info) >= 0) {
+            std::memcpy(name, info.name, sizeof(name));
+        }
+        break;
+    }
+    case 0x40: {
+        kind = "mutex";
+        SceKernelMutexInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetMutexInfo(id, &info) >= 0) {
+            std::memcpy(name, info.name, sizeof(name));
+            owner = info.currentOwnerId;
+        }
+        break;
+    }
+    case 0x100:
+    case 0x200: {
+        kind = "condition";
+        SceKernelCondInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetCondInfo(id, &info) >= 0) {
+            std::memcpy(name, info.name, sizeof(name));
+        }
+        break;
+    }
+    case 0x100000: {
+        kind = "lightweight mutex";
+        LwMutexInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetLwMutexInfoById(id, &info) >= 0) {
+            std::memcpy(name, info.name, sizeof(name));
+            owner = info.current_owner;
+        }
+        break;
+    }
+    case 0x200000:
+    case 0x400000: {
+        kind = "lightweight condition";
+        LwCondInfo info{};
+        info.size = sizeof(info);
+        if (sceKernelGetLwCondInfoById(id, &info) >= 0) {
+            std::memcpy(name, info.name, sizeof(name));
+        }
+        break;
+    }
+    case 0x10000:
+    case 0x20000:
+        kind = "event";
+        break;
+    case 0x40000:
+        kind = "message pipe";
+        break;
+    default:
+        break;
+    }
+    name[sizeof(name) - 1] = '\0';
+    int at = std::snprintf(out, size, "%s %08x \"%s\" (type %08x)", kind,
+                           static_cast<unsigned>(id), name, static_cast<unsigned>(t.waitType));
+    if (owner > 0 && (static_cast<SceUInt32>(owner) & 0x40000000u) != 0 && at > 0 &&
+        static_cast<size_t>(at) < size) {
+        char owner_name[32];
+        ThreadName(owner, owner_name);
+        std::snprintf(out + at, size - at, ", held by %08x \"%s\"", static_cast<unsigned>(owner),
+                      owner_name);
+    }
+}
+
+/// One thread's state, its wait and the return addresses on its stack from the top down (the
+/// outermost frames first; past its current depth, which the report cannot see, are older calls'
+/// leftovers): arm-vita-eabi-addr2line -f -e citra_vita.
+void PrintThreadState(SceUID id) {
+    SceKernelThreadInfo t{};
+    t.size = sizeof(t);
+    if (sceKernelGetThreadInfo(id, &t) < 0) {
+        return;
+    }
+    char wait[160];
+    DescribeWait(t, wait, sizeof(wait));
+    StallLine("[azahar] stall: thread %08x \"%s\" status %x, waits on %s\n",
+                  static_cast<unsigned>(id), t.name, static_cast<unsigned>(t.status), wait);
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(t.stack);
+    char line[256];
+    int at = 0;
+    int found = 0;
+    for (uintptr_t p = (begin + t.stackSize - 4) & ~uintptr_t{3}; p >= begin && found < 48; p -= 4) {
+        uintptr_t value;
+        std::memcpy(&value, reinterpret_cast<const void*>(p), sizeof(value));
+        if (!IsReturnAddress(value)) {
+            continue;
+        }
+        at += std::snprintf(line + at, sizeof(line) - at, " %08x", static_cast<unsigned>(value));
+        if (++found % 12 == 0) {
+            StallLine("[azahar] stall:   %s\n", line);
+            at = 0;
+        }
+    }
+    if (at != 0) {
+        StallLine("[azahar] stall:   %s\n", line);
+    }
+}
+
+SceUID stall_flag = -1;
+SceUID main_thread;
+
+} // Anonymous namespace
+
+void PrintThreadStates(const char* reason, bool to_report) {
+    stall_to_report = to_report;
+    StallLine("[azahar] stall: %s; the threads (the main thread, then the emulator's):\n", reason);
+    PrintThreadState(main_thread);
+    std::int32_t ids[64];
+    const size_t n = Common::RunningNamedThreadIds(ids, std::size(ids));
+    for (size_t i = 0; i < n; i++) {
+        PrintThreadState(ids[i]);
+    }
+    // The render thread's own view, twice: whether its loop still turns (a thread stuck in one
+    // call has the same passes) and what the emulation waits for.
+    static char state[1024];
+    for (int k = 0; k < 2; k++) {
+        if (k != 0) {
+            sceKernelDelayThread(200 * 1000);
+        }
+        const int at = std::snprintf(state, sizeof(state), "[azahar] stall: render%s: ",
+                                     k == 0 ? "" : " 200 ms on");
+        SgxdRenderer::RenderThread::DescribeLive(state + at, sizeof(state) - at - 1);
+        std::strcat(state, "\n");
+        if (stall_to_report) {
+            Common::Log::AppendCrashReport(state);
+        } else {
+            sceClibPrintf("%s", state);
+        }
+        // The DSP thread's (a frame it never ends holds the emulation thread at its interrupt).
+        const int dsp_at = std::snprintf(state, sizeof(state), "[azahar] stall: dsp%s: ",
+                                         k == 0 ? "" : " 200 ms on");
+        AudioCore::DspHle::DescribeWorker(state + dsp_at, sizeof(state) - dsp_at - 1);
+        std::strcat(state, "\n");
+        if (stall_to_report) {
+            Common::Log::AppendCrashReport(state);
+        } else {
+            sceClibPrintf("%s", state);
+        }
+    }
+}
+
+namespace {
+
+/// The memory left: the heap, the GPU's pool and the system's. The heap chunk by chunk as heapmap
+/// does, only ever inside its arena: a damaged chunk ends the walk, not the report. Last in the
+/// report, behind malloc's lock: a thread that holds it stopped costs this line alone.
+void WriteMemoryLine() {
+    __malloc_lock(_REENT);
+    const uintptr_t base = (reinterpret_cast<uintptr_t>(__malloc_sbrk_base) + 7) & ~uintptr_t{7};
+    const uintptr_t top = reinterpret_cast<uintptr_t>(__malloc_av_[2]);
+    const uintptr_t heap_end =
+        reinterpret_cast<uintptr_t>(__malloc_sbrk_base) + _newlib_heap_size_user;
+    u32 used = 0, largest_free = 0, free_run = 0, top_room = 0;
+    bool whole = top >= base && top < heap_end;
+    if (whole) {
+        for (uintptr_t p = base; p < top;) {
+            const u32 size = *reinterpret_cast<const u32*>(p + 4) & ~3u;
+            if (size < 16 || p + size > top) {
+                whole = false;
+                break;
+            }
+            if ((*reinterpret_cast<const u32*>(p + size + 4) & 1u) != 0) {
+                used += size;
+                largest_free = std::max(largest_free, free_run);
+                free_run = 0;
+            } else {
+                free_run += size;
+            }
+            p += size;
+        }
+        top_room = static_cast<u32>(heap_end - top);
+    }
+    __malloc_unlock(_REENT);
+    largest_free = std::max({largest_free, free_run, top_room});
+
+    char pool[64];
+    SgxdRenderer::GuestGpuMemory::DescribePool(pool, sizeof(pool));
+    SceKernelFreeMemorySizeInfo system_free{};
+    system_free.size = sizeof(system_free);
+    sceKernelGetFreeMemorySize(&system_free);
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "[azahar] memory: heap %u KiB in use of %u, largest free %u KiB%s; %s; system "
+                  "free: %u KiB user, %u CDRAM, %u phycont\n",
+                  used >> 10, _newlib_heap_size_user >> 10, largest_free >> 10,
+                  whole ? "" : " (the walk stopped at a damaged chunk)", pool,
+                  static_cast<unsigned>(system_free.size_user) >> 10,
+                  static_cast<unsigned>(system_free.size_cdram) >> 10,
+                  static_cast<unsigned>(system_free.size_phycont) >> 10);
+    Common::Log::AppendCrashReport(line);
+}
+
+/// The render and DSP threads' own views and the memory left: a core dump has every thread's
+/// registers and stack, but not the large heap blocks where these live.
+int ProcessStateEntry(SceSize, void*) {
+    static char state[1024];
+    int at = std::snprintf(state, sizeof(state), "[azahar] crash: render: ");
+    SgxdRenderer::RenderThread::DescribeLive(state + at, sizeof(state) - at - 1);
+    std::strcat(state, "\n");
+    Common::Log::AppendCrashReport(state);
+    at = std::snprintf(state, sizeof(state), "[azahar] crash: dsp: ");
+    AudioCore::DspHle::DescribeWorker(state + at, sizeof(state) - at - 1);
+    std::strcat(state, "\n");
+    Common::Log::AppendCrashReport(state);
+    WriteMemoryLine();
+    return 0;
+}
+
+int ProbeEntry(SceSize, void*) {
+    return 0;
+}
+
+/// Whether each core still runs a thread of ours: a probe pinned to it in turn, given 200 ms to
+/// run and end. A render thread ready to run that never runs leaves this open: its core stopped,
+/// or the thread did.
+void ProbeCores() {
+    for (int core = 0; core < 4; core++) {
+        const SceUID t = sceKernelCreateThread("stall probe", ProbeEntry,
+                                               SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH, 0x1000, 0,
+                                               SCE_KERNEL_CPU_MASK_USER_0 << core, nullptr);
+        if (t < 0) {
+            StallLine("[azahar] stall: core %d: no probe thread (%08x)\n", core,
+                      static_cast<unsigned>(t));
+            continue;
+        }
+        const SceUInt64 start = sceKernelGetProcessTimeWide();
+        sceKernelStartThread(t, 0, nullptr);
+        SceUInt timeout = 200 * 1000;
+        const int r = sceKernelWaitThreadEnd(t, nullptr, &timeout);
+        StallLine("[azahar] stall: core %d: a probe thread %s (%llu us)\n", core,
+                  r >= 0 ? "ran" : "did not run", static_cast<unsigned long long>(
+                                                      sceKernelGetProcessTimeWide() - start));
+        if (r >= 0) {
+            sceKernelDeleteThread(t);
+        }
+    }
+}
+
+/// The render thread moved to core 3, then its view 500 ms later: whether it runs again away
+/// from its core.
+void MoveRenderThread() {
+    const s32 tid = SgxdRenderer::RenderThread::LiveThreadId();
+    if (tid < 0) {
+        return;
+    }
+    const int r = sceKernelChangeThreadCpuAffinityMask(tid, SCE_KERNEL_CPU_MASK_USER_0 << 3);
+    StallLine("[azahar] stall: the render thread moved to core 3: %08x\n",
+              static_cast<unsigned>(r));
+    sceKernelDelayThread(500 * 1000);
+    static char state[1024];
+    const int at = std::snprintf(state, sizeof(state), "[azahar] stall: render 500 ms on core 3: ");
+    SgxdRenderer::RenderThread::DescribeLive(state + at, sizeof(state) - at - 1);
+    std::strcat(state, "\n");
+    if (stall_to_report) {
+        Common::Log::AppendCrashReport(state);
+    } else {
+        sceClibPrintf("%s", state);
+    }
+}
+
+} // namespace
+
+void WriteProcessState() {
+    // A thread of its own: the render thread's view reads that thread's state, and
+    // sceKernelGetThreadInfo on another thread's ID is a critical error that debug-suspends the
+    // caller, and the crash must not depend on its resume.
+    constexpr SceUInt WaitUs = 5 * 1000 * 1000;
+    const SceUID t = sceKernelCreateThread("crash report", ProcessStateEntry,
+                                           SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH, 64 * 1024, 0,
+                                           SCE_KERNEL_CPU_MASK_USER_ALL, nullptr);
+    if (t < 0 || sceKernelStartThread(t, 0, nullptr) < 0) {
+        Common::Log::AppendCrashReport("[azahar] crash: no thread to read the state with\n");
+        return;
+    }
+    SceUInt timeout = WaitUs;
+    if (sceKernelWaitThreadEnd(t, nullptr, &timeout) < 0) {
+        Common::Log::AppendCrashReport("[azahar] crash: reading the state did not end\n");
+        return;
+    }
+    sceKernelDeleteThread(t);
+}
+
+void StartStallWatch() {
+    main_thread = sceKernelGetThreadId();
+    stall_flag = sceKernelCreateEventFlag("azahar stall watch", 0, 0, nullptr);
+    ASSERT_MSG(stall_flag >= 0, "stall watch: sceKernelCreateEventFlag {:#010x}",
+               static_cast<u32>(stall_flag));
+    // For the process's life: never joined.
+    new Common::NamedThread(Common::ThreadCfg{"stall watch", 16 * 1024}, [] {
+        SceUInt64 last_beat = sceKernelGetProcessTimeWide();
+        bool reported = false;
+        for (;;) {
+            SceUInt timeout = 10 * 1000 * 1000;
+            unsigned int bits = 0;
+            if (sceKernelWaitEventFlag(stall_flag, 1, SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
+                                       &bits, &timeout) >= 0) {
+                last_beat = sceKernelGetProcessTimeWide();
+                reported = false;
+                continue;
+            }
+            const SceUInt64 quiet_s = (sceKernelGetProcessTimeWide() - last_beat) / 1000000;
+            if (!reported && quiet_s >= StallSeconds) {
+                char reason[64];
+                std::snprintf(reason, sizeof(reason), "the frontend's loop stopped for %u s",
+                              static_cast<unsigned>(quiet_s));
+                // To the memory card only: a link that stopped (a host0 answer
+                // lost) would hold a print here for good. The next start prints it. Its
+                // preamble as things are now.
+                Common::Log::RenewCrashReport();
+                PrintThreadStates(reason, true);
+                ProbeCores();
+                MoveRenderThread();
+                Common::Log::AppendCrashReport(
+                    "[azahar] stall: the frontend's loop stopped; faulting for the core dump\n");
+                BlankDisplay();
+                __builtin_trap();
+                reported = true;
+            }
+        }
+    });
+}
+
+void StallWatchBeat() {
+    if (stall_flag >= 0) {
+        sceKernelSetEventFlag(stall_flag, 1);
     }
 }
 
@@ -627,7 +1069,8 @@ void PrintLast() {
     if (fd < 0) {
         return;
     }
-    char text[2048];
+    // A stall's listing is a few KiB, the preamble's console up to 16.
+    static char text[64 * 1024];
     const int n = sceIoRead(fd, text, sizeof(text) - 1);
     sceIoClose(fd);
     text[n > 0 ? n : 0] = '\0';

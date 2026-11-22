@@ -58,5 +58,8 @@ void RenewCrashReport();
 /// The crash report is done with (packed into an archive): removed when `remove`, and the next
 /// report starts with its own preamble.
 void EndCrashReport(bool remove);
+/// Called by Stop, which every failed assertion calls before its fault: the frontend's last act
+/// (the Vita's blacks out its display).
+void SetStopHook(void (*hook)());
 #endif
 } // namespace Common::Log

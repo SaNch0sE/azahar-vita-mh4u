@@ -19,6 +19,7 @@
 #include <psp2/touch.h>
 
 #include "azahar_native.h"
+#include "citra_vita/crash_report.h"
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/sgxd_present.h"
@@ -371,6 +372,8 @@ void EmuWindowVita::WaitWhilePaused() {
     std::scoped_lock lk{pause_gate};
     while (paused) {
         pause_gate.WaitFor(std::chrono::milliseconds(100));
+        // Paused is not stalled (the stall watch).
+        CrashReport::StallWatchBeat();
     }
 }
 

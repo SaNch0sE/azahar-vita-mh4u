@@ -66,6 +66,12 @@ public:
     void LoadComponent(std::span<const u8> buffer) override;
     void UnloadComponent() override;
 
+    /// The live DSP thread's place for the stall watch's report, into `out` without allocating:
+    /// the frames posted and done, where the frame being made is (a source, the mixers, the
+    /// output) with that source's buffer state, and the sources' loop passes. Read without the
+    /// lock: a snapshot. "no DSP thread" when none runs.
+    static void DescribeWorker(char* out, std::size_t size);
+
 private:
     struct Impl;
     friend struct Impl;

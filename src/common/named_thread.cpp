@@ -4,6 +4,7 @@
 
 #ifdef __vita__
 
+#include <array>
 #include <cstdlib>
 #include <string>
 
@@ -46,6 +47,8 @@ enum : std::uint32_t {
 };
 
 std::atomic<std::size_t> running_threads{0};
+/// Their IDs, each in a slot of its own (0: free); a thread past the table is counted, not listed.
+std::array<std::atomic<std::int32_t>, 64> running_ids{};
 
 /// The calling thread's dtoa cache of powers of five, freed. newlib builds it in the thread's
 /// reentrancy state the first time the thread prints a float (pow5mult), and reclaiming that state
@@ -107,6 +110,13 @@ int NamedThread::Trampoline(unsigned int args, void* argp) {
     }
 
     ForgetCurrentThreadRole();
+    const std::int32_t self = sceKernelGetThreadId();
+    for (std::atomic<std::int32_t>& id : running_ids) {
+        std::int32_t expected = self;
+        if (id.compare_exchange_strong(expected, 0)) {
+            break;
+        }
+    }
     running_threads--;
     const bool detached = ctrl->state.exchange(StateFinished) == StateDetached;
     if (detached) {
@@ -127,6 +137,12 @@ void NamedThread::Launch(const ThreadCfg& cfg, std::function<void()> f) {
                cfg.name, static_cast<u32>(uid), cfg.stack_size >> 10);
     ctrl = c;
     running_threads++;
+    for (std::atomic<std::int32_t>& id : running_ids) {
+        std::int32_t expected = 0;
+        if (id.compare_exchange_strong(expected, uid)) {
+            break;
+        }
+    }
     sceKernelStartThread(uid, sizeof(c), &c);
 }
 
@@ -164,6 +180,16 @@ bool NamedThread::IsCurrentThread() const noexcept {
 
 std::size_t RunningNamedThreads() {
     return running_threads.load();
+}
+
+std::size_t RunningNamedThreadIds(std::int32_t* out, std::size_t max) {
+    std::size_t n = 0;
+    for (const std::atomic<std::int32_t>& id : running_ids) {
+        if (const std::int32_t value = id.load(); value != 0 && n < max) {
+            out[n++] = value;
+        }
+    }
+    return n;
 }
 
 std::string DescribeWaiters(std::int32_t uid) {

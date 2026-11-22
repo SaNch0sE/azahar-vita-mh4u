@@ -63,6 +63,11 @@ void WriteStackReport(const char* reason);
 /// Allocates nothing.
 void WriteProcessState();
 
+/// The display blacked out (WriteStackReport, the stall watch and, through Common::Log's stop
+/// hook, every failed assertion do it before the fault): a faulted process stays until its core
+/// dump is written, minutes over host0, and would hold its last picture on the OLED.
+void BlankDisplay();
+
 /// The heap's live blocks of 512 KiB or more, each with the return addresses on its allocating
 /// thread's stack: on the debug channel, and with `to_report` in the crash report too.
 void PrintHeapSites(bool to_report);
@@ -75,5 +80,18 @@ void PrintHeapSites(bool to_report);
 void StartLeakTracking();
 void PrintLeaks(bool every_chunk);
 #endif
+
+/// The stall watch (with the command channel): a thread that, once the frontend's loop has not
+/// beaten for StallSeconds (a frozen frontend: its loops read the command channel once a second
+/// and the pause's wait beats too; a title's load or a savestate's save stops them for less),
+/// prints every emulator thread's state, what it waits on and the return addresses on its stack
+/// (PrintThreadStates), then faults (an undefined instruction) so that the system keeps the
+/// process for a core dump. StallWatchBeat: the loop alive. From the main thread.
+constexpr unsigned StallSeconds = 40;
+void StartStallWatch();
+void StallWatchBeat();
+/// The listing: on the debug channel, or with `to_report` in the crash report on the memory card
+/// only.
+void PrintThreadStates(const char* reason, bool to_report = false);
 
 } // namespace VitaFrontend::CrashReport

@@ -589,7 +589,33 @@ void Initialize(std::string_view log_file) {
     Impl::Initialize(log_file.empty() ? LOG_FILE : log_file);
 }
 
+#ifdef __vita__
+namespace {
+void (*stop_hook)() = nullptr;
+void (*report_preamble)() = nullptr;
+std::atomic_flag report_begun = ATOMIC_FLAG_INIT;
+/// When the preamble was last written (process time, us), 0 for none.
+std::atomic<u64> report_preamble_us{0};
+/// A preamble older than this is another event's (RenewCrashReport): a crash's own lines come
+/// within seconds of each other.
+constexpr u64 RenewAfterUs = 10'000'000;
+}
+
+void SetCrashReportPreamble(void (*hook)()) {
+    report_preamble = hook;
+}
+
+void SetStopHook(void (*hook)()) {
+    stop_hook = hook;
+}
+#endif
+
 void Stop() {
+#ifdef __vita__
+    if (stop_hook != nullptr) {
+        stop_hook();
+    }
+#endif
     if (logging_initialized) {
         Impl::Stop();
     }

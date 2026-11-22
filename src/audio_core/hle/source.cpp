@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
@@ -464,6 +465,7 @@ void Source::GenerateFrame() {
 
     std::size_t frame_position = 0;
     while (frame_position < current_frame.size()) {
+        source_loop_passes.fetch_add(1, std::memory_order_relaxed);
         if (state.current_buffer.empty() && !DequeueBuffer()) {
             break;
         }
@@ -501,7 +503,26 @@ void Source::GenerateFrame() {
     frame_silent = IsSilent(current_frame);
 }
 
+std::atomic<u32> source_loop_passes{};
+
+void Source::Describe(char* out, std::size_t size) const {
+    std::snprintf(out, size,
+                  "source %u: enabled %d, queue %u, buffer %u samples at sample %u of %u, "
+                  "looping %d, format %d, %s, rate %d/1000, position %u",
+                  static_cast<unsigned>(source_id), state.enabled ? 1 : 0,
+                  static_cast<unsigned>(state.input_queue.size()),
+                  static_cast<unsigned>(state.current_buffer.size()),
+                  static_cast<unsigned>(state.current_sample_number),
+                  static_cast<unsigned>(state.current_buffer_length),
+                  state.current_buffer_is_looping ? 1 : 0,
+                  static_cast<int>(state.current_buffer_format),
+                  state.current_buffer_mono_or_stereo == MonoOrStereo::Stereo ? "stereo" : "mono",
+                  static_cast<int>(state.rate_multiplier * 1000.0f),
+                  static_cast<unsigned>(state.interp_state.fposition >> 24));
+}
+
 bool Source::DequeueBuffer() {
+    source_loop_passes.fetch_add(1, std::memory_order_relaxed);
     ASSERT_MSG(state.current_buffer.empty(),
                "Shouldn't dequeue; we still have data in current_buffer");
 

@@ -401,6 +401,7 @@ public:
             return {};
         }
         last_read_us = now;
+        VitaFrontend::CrashReport::StallWatchBeat();
         // `quiet N`: no host0 request for N seconds, the loop still beating the stall watch.
         if (now < quiet_until_us) {
             return {};
@@ -746,6 +747,19 @@ bool RunSettingCommand(const std::string& command) {
         sceAudioOutOutput(port, nullptr);
         sceAudioOutReleasePort(port);
         sceClibPrintf("[azahar] tone: done (command)\n");
+        return true;
+    }
+#endif
+    if (command == "stalltest") {
+        // The stall watch's whole path on purpose: the loop that reads this channel stops for a
+        // minute, past the watch's limit (its listing, its fault, the core dump).
+        sceClibPrintf("[azahar] stalltest: the frontend's loop stops for 60 s (command)\n");
+        sceKernelDelayThread(60 * 1000 * 1000);
+        return true;
+    }
+#ifdef VITA_DIAGNOSTICS
+    if (command == "hostthreads") {
+        VitaFrontend::CrashReport::PrintThreadStates("asked (command)");
         return true;
     }
     if (command == "reents") {
@@ -2101,7 +2115,11 @@ int main(int argc, char* argv[]) {
         g_arguments.emplace_back(argv[i]);
     }
     SetupTerminateHandler();
+    Common::Log::SetStopHook(VitaFrontend::CrashReport::BlankDisplay);
     VitaFrontend::CrashReport::PrintLast();
+    if (CommandChannel()) {
+        VitaFrontend::CrashReport::StartStallWatch();
+    }
     // Before anything is brought up, because the first start after a boot restarts from here.
     g_native_error = LoadAzaharNative(relaunched);
     // Without the module (g_native_error) its calls are not bound: the report lists no plugins.

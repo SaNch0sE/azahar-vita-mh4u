@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <vector>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/deque.hpp>
@@ -67,6 +68,10 @@ public:
      * @param intermediate_mix_id The id of the intermediate mix whose gains we are using.
      */
     void MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id);
+
+    /// This source's buffer state into `out` without allocating, for the stall watch's report
+    /// (read from another thread: a snapshot).
+    void Describe(char* out, std::size_t size) const;
 
 private:
     const std::size_t source_id;
@@ -228,6 +233,10 @@ private:
     }
     friend class boost::serialization::access;
 };
+
+/// Passes of every source's frame loop and buffer dequeues so far (relaxed), for the stall
+/// watch's report: a count that grows while a frame never ends is a loop that does not.
+extern std::atomic<u32> source_loop_passes;
 
 } // namespace AudioCore::HLE
 

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 #include <tuple>
@@ -189,6 +190,21 @@ std::string DescribeIndexHold(PAddr page_addr) {
 
 } // namespace
 
+namespace {
+std::atomic<RenderThread*> live_render_thread{};
+std::atomic<u32> max_screen_skips{2};
+
+/// sgxd_flags vbcached (GPU::VBlank's): geometry pages stay cached, a guest write to them too.
+bool GeometryStaysCached() {
+#ifdef VITA_DIAGNOSTICS
+    static const bool cached = SgxdFlag("vbcached");
+    return cached;
+#else
+    return false;
+#endif
+}
+} // namespace
+
 RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
                            RendererGxm& renderer_, RasterizerGxm& rasterizer_,
                            Memory::MemorySystem& memory_)
@@ -203,6 +219,7 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
     wake_flag = sceKernelCreateEventFlag("render wake", SCE_EVENT_WAITSINGLE, 0, nullptr);
     ASSERT_MSG(wake_flag >= 0, "render thread: event flag {:#010x}", static_cast<u32>(wake_flag));
     rasterizer.InterruptWaker(wake_flag, WakeBit);
+    live_render_thread.store(this, std::memory_order_release);
     renderer.SetMoveHooks({
         [this](PAddr addr, u32 size) {
             // On the render thread, the move is for its work about to use the pages: the GPU
@@ -285,6 +302,7 @@ void RenderThread::SampleGpu(std::stop_token stop) {
 #endif
 
 RenderThread::~RenderThread() {
+    live_render_thread.store(nullptr, std::memory_order_release);
     {
         while (hold_depth != 0) {
             Release();
@@ -2301,7 +2319,9 @@ void RenderThread::RunAvailable() {
         const u8* const p = ring.get() + r % RingSize;
         std::memcpy(&head, p, sizeof(head));
         if (head.op != Op::Wrap) {
+            running_op.store(static_cast<u32>(head.op), std::memory_order_relaxed);
             RunRecord(head, p + sizeof(Head));
+            running_op.store(NoRecord, std::memory_order_relaxed);
 #ifdef VITA_DIAGNOSTICS
             records[KindOf(head.op)].fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -2694,6 +2714,57 @@ u32 RenderThread::MaxScreenSkips() {
     return max_screen_skips.load(std::memory_order_relaxed);
 }
 
+s32 RenderThread::LiveThreadId() {
+    const RenderThread* const t = live_render_thread.load(std::memory_order_acquire);
+    return t != nullptr ? t->render_tid.load(std::memory_order_relaxed) : -1;
+}
+
+void RenderThread::DescribeLive(char* out, std::size_t size) {
+    const RenderThread* const t = live_render_thread.load(std::memory_order_acquire);
+    if (t == nullptr) {
+        std::snprintf(out, size, "no render thread");
+        return;
+    }
+    const u64 front = t->pending_front_fence.load(std::memory_order_relaxed);
+    // The thread's CPU time and core (it runs or it is starved) and sgxd's interrupts (a storm).
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    const s32 tid = t->render_tid.load(std::memory_order_relaxed);
+    const bool have_info = tid >= 0 && sceKernelGetThreadInfo(tid, &info) >= 0;
+    const volatile SgxdEvents* const ev = sgxd_ptla_page();
+    const int lead = std::snprintf(
+        out, size, "run time %llu us on core %d (last %d); interrupts %u (SW_EVENT %u, other %#x); ",
+        have_info ? static_cast<unsigned long long>(info.runClocks) : 0ull,
+        have_info ? static_cast<int>(info.currentCpuId) : -1,
+        have_info ? static_cast<int>(info.lastExecutedCpuId) : -1, ev ? ev->irqs : 0u,
+        ev ? ev->sw_events : 0u, ev ? ev->unexpected : 0u);
+    if (lead > 0 && static_cast<std::size_t>(lead) < size) {
+        out += lead;
+        size -= static_cast<std::size_t>(lead);
+    }
+    std::snprintf(
+        out, size,
+        "loop passes %u; running record op %d; tickets issued %u, reached %u; the emulation "
+        "waits for %u (%s); "
+        "pending %u, the oldest ticket %u (fence: lists %u, PTLA ops %u); lists sent %u, done %u, "
+        "faulted %u; PTLA ops sent %u, done %u; a 3D pending %s; sleeping %s; hold depth %u, "
+        "holder %08x, park requested %s, parked %s; ring written %u, published %u, read %u",
+        t->loop_passes.load(std::memory_order_relaxed),
+        static_cast<int>(t->running_op.load(std::memory_order_relaxed)), t->tickets,
+        t->reached.load(std::memory_order_relaxed),
+        t->waited_ticket.load(std::memory_order_relaxed),
+        t->ticket_wait.load(std::memory_order_relaxed) ? "waiting" : "not waiting",
+        t->pending_size.load(std::memory_order_relaxed),
+        t->pending_front_ticket.load(std::memory_order_relaxed), static_cast<u32>(front >> 32),
+        static_cast<u32>(front), sgxd_chain_fence(), sgxd_chain_done(), sgxd_chain_faulted(),
+        sgxd_ptla_fence(), sgxd_ptla_done(), sgxd_session_pending() != nullptr ? "yes" : "no",
+        t->sleeping.load(std::memory_order_relaxed) ? "yes" : "no", t->hold_depth,
+        static_cast<u32>(t->holder.load(std::memory_order_relaxed)),
+        t->park_requested ? "yes" : "no", t->parked.load(std::memory_order_relaxed) ? "yes" : "no",
+        t->write, t->published.load(std::memory_order_relaxed),
+        t->read.load(std::memory_order_relaxed));
+}
+
 void RenderThread::PollFences() {
     bool advanced = false;
     while (!pending.empty() && rasterizer.InterruptPoll(pending.front().fence)) {
@@ -2709,11 +2780,18 @@ void RenderThread::PollFences() {
 
 void RenderThread::Loop() {
     Common::SetCurrentThreadRole(Common::ThreadRole::Render);
+    render_tid.store(sceKernelGetThreadId(), std::memory_order_relaxed);
     u32 progress = 0;
     auto progress_at = Clock::now();
     for (;;) {
         RunAvailable();
         PollFences();
+        loop_passes.fetch_add(1, std::memory_order_relaxed);
+        pending_size.store(static_cast<u32>(pending.size()), std::memory_order_relaxed);
+        pending_front_ticket.store(pending.empty() ? 0 : pending.front().ticket,
+                                   std::memory_order_relaxed);
+        pending_front_fence.store(pending.empty() ? 0 : pending.front().fence,
+                                  std::memory_order_relaxed);
         renderer.FlipDone();
         ShowDuePresent();
         // The emulation side waits for a ticket: its work's pending 3D finishes now.

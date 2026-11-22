@@ -99,6 +99,9 @@ private:
 /// to what ran before it once the title has shut down.
 std::size_t RunningNamedThreads();
 
+/// Their kernel thread IDs, at most `max` into `out`: how many were written (a freeze's report).
+std::size_t RunningNamedThreadIds(std::int32_t* out, std::size_t max);
+
 /// The calling thread's name and the named threads waiting on kernel object `uid`: who else waits
 /// when a single-waiter event flag refuses a wait (SCE_KERNEL_ERROR_EVF_MULTI).
 std::string DescribeWaiters(std::int32_t uid);
