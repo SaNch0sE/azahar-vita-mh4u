@@ -645,6 +645,17 @@ enum class Glyph {
     Start,
 };
 
+/// The menus' confirm and back as the footer shows them (the system's enter button).
+Glyph ConfirmGlyph() {
+    return ImGui_ImplVita_ConfirmButton() == SCE_CTRL_CIRCLE ? Glyph::Circle : Glyph::Cross;
+}
+Glyph BackGlyph() {
+    return ImGui_ImplVita_BackButton() == SCE_CTRL_CIRCLE ? Glyph::Circle : Glyph::Cross;
+}
+const char* ConfirmName() {
+    return ImGui_ImplVita_ConfirmButton() == SCE_CTRL_CIRCLE ? Tr("Circle") : Tr("Cross");
+}
+
 /// A pad button's glyph centred at `c`, `r` its radius: the face buttons in their own colours on
 /// a dark disc, as the console's own menus show them.
 void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float r) {
@@ -715,13 +726,70 @@ float GlyphWidth(Glyph glyph, float r) {
     return glyph == Glyph::Shoulders ? 4.0f * r : 2.0f * r;
 }
 
+/// While an InputBlackout lives: the windows drawn take neither the focus nor the pad's navigation
+/// (BeginList, BeginCentered).
+bool blacked_out = false;
+
+/// The pad and touch hidden from what is drawn while it lives: the screen behind a question, drawn
+/// as it is but taking nothing. ImGui's widgets, and the screens' own drags, tab keys and back
+/// button, read them from the IO as they are drawn, so with them cleared nothing behind takes a
+/// press, a drag or a tab change; they are back for what is drawn after. The windows behind take
+/// no focus either: ImGui moves the pad's selection within the focused window.
+class InputBlackout {
+public:
+    InputBlackout() : io(ImGui::GetIO()), saved(io) {
+        blacked_out = true;
+        std::fill(std::begin(io.MouseDown), std::end(io.MouseDown), false);
+        std::fill(std::begin(io.MouseClicked), std::end(io.MouseClicked), false);
+        std::fill(std::begin(io.MouseDoubleClicked), std::end(io.MouseDoubleClicked), false);
+        std::fill(std::begin(io.MouseReleased), std::end(io.MouseReleased), false);
+        std::fill(std::begin(io.NavInputs), std::end(io.NavInputs), 0.0f);
+        std::fill(std::begin(io.NavInputsDownDuration), std::end(io.NavInputsDownDuration), -1.0f);
+        std::fill(std::begin(io.NavInputsDownDurationPrev), std::end(io.NavInputsDownDurationPrev),
+                  -1.0f);
+        io.MouseDelta = ImVec2(0.0f, 0.0f);
+        io.MouseWheel = io.MouseWheelH = 0.0f;
+    }
+    ~InputBlackout() {
+        io = saved;
+        blacked_out = false;
+    }
+    InputBlackout(const InputBlackout&) = delete;
+    InputBlackout& operator=(const InputBlackout&) = delete;
+
+private:
+    ImGuiIO& io;
+    const ImGuiIO saved;
+};
+
+/// The flags of a window the pad navigates, out of the navigation behind a question.
+ImGuiWindowFlags NavFlags() {
+    return blacked_out ? ImGuiWindowFlags_NoNavInputs | ImGuiWindowFlags_NoNavFocus : 0;
+}
+
+/// The screen behind dimmed: a layer over every window but the panel drawn after it.
+void DimScreen(const char* id) {
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(ScreenWidth, ScreenHeight));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.55f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin(id, nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
 /// A centred panel over whatever is behind it, for the pause menu.
 bool BeginCentered(const char* id, float width, float height) {
     ImGui::SetNextWindowPos(ImVec2((ScreenWidth - width) * 0.5f, (ScreenHeight - height) * 0.5f));
     ImGui::SetNextWindowSize(ImVec2(width, height));
     return ImGui::Begin(id, nullptr,
                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | NavFlags());
 }
 
 /// `text` shortened with "..." to fit `lines` lines of `width` at the current font (wrapped where
@@ -833,12 +901,12 @@ bool FooterButton(Glyph glyph, const char* label) {
  * footer: transparent, its items drawing their own rows. Kept focused, so that the pad never
  * lands in the backdrop or a side panel; not while a touch is held or an item is being pressed,
  * which would take the press from a button elsewhere (ImGui drops the active item of a window
- * that loses focus).
+ * that loses focus), nor behind a question (InputBlackout).
  */
 void BeginList(const char* id, ImVec2 min, ImVec2 max) {
     ImGui::SetNextWindowPos(min);
     ImGui::SetNextWindowSize(max - min);
-    if (!ImGui::GetIO().MouseDown[0] && ImGui::GetActiveID() == 0) {
+    if (!blacked_out && !ImGui::GetIO().MouseDown[0] && ImGui::GetActiveID() == 0) {
         ImGui::SetNextWindowFocus();
     }
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -847,7 +915,7 @@ void BeginList(const char* id, ImVec2 min, ImVec2 max) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 8.0f));
     ImGui::Begin(id, nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoCollapse);
+                     ImGuiWindowFlags_NoCollapse | NavFlags());
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor();
     // A touch drawn up or down from inside the list scrolls it, as the Vita's own lists do, and
@@ -1298,11 +1366,11 @@ void ShowGxmNotice(const char* title, const std::string& text, const std::string
         } else if (held_off) {
             SceCtrlData pad{};
             SceTouchData touch{};
-            const bool cross = sceCtrlPeekBufferPositive(0, &pad, 1) > 0 &&
-                               (pad.buttons & SCE_CTRL_CROSS) != 0;
+            const bool confirm = sceCtrlPeekBufferPositive(0, &pad, 1) > 0 &&
+                                 (pad.buttons & ImGui_ImplVita_ConfirmButton()) != 0;
             const bool panel =
                 sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) > 0 && touch.reportNum > 0;
-            held_off = cross || panel;
+            held_off = confirm || panel;
         }
         ImGui_ImplVita_GamepadUsage(!held_off);
         ImGui_ImplVita_TouchUsage(!held_off);
@@ -1310,7 +1378,7 @@ void ShowGxmNotice(const char* title, const std::string& text, const std::string
         // Read before the frame ends, which clears ImGui's pad inputs.
         const bool cross_down = ImGui::GetIO().NavInputs[ImGuiNavInput_Activate] > 0.0f;
         BeginBackdrop("##notice", Icon::Cartridge, title, "");
-        const bool touched = FooterButton(Glyph::Cross, button);
+        const bool touched = FooterButton(ConfirmGlyph(), button);
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         ImFont* const font = ImGui::GetFont();
         const float size = ImGui::GetFontSize();
@@ -2154,7 +2222,7 @@ void Ui::SetRowValue(const Row& row, int value) {
     // USB video turned on while another plugin has the port: the player is asked first.
     if (row.option == Config::Option::UsbVideo && value != 0 && RowValue(row) == 0 &&
         !UvcStream::TakeoverAllowed() && UvcStream::PortTaken()) {
-        usb_prompt = UsbPrompt::Setting;
+        question = Question::UsbSetting;
         usb_prompt_value = value;
         return;
     }
@@ -2558,7 +2626,7 @@ void Ui::DrawInstalledRow(std::size_t index) {
     const InstalledPart part = settings_installed[index];
     const bool armed = armed_installed == static_cast<int>(index);
     const u64 mib = (part.size + 1024 * 1024 - 1) / (1024 * 1024);
-    const std::string size_text = armed          ? std::string{Tr("Cross again to remove")}
+    const std::string size_text = armed          ? TrFormat("{} again to remove", ConfirmName())
                                   : part.install ? fmt::format("r{}, {} MiB", part.version, mib)
                                                  : fmt::format("v{}, {} MiB", part.version, mib);
     const float width = ImGui::GetContentRegionAvail().x;
@@ -2870,9 +2938,7 @@ void Ui::DrawConsoleNameRow() {
                     Colour(name.empty() ? palette->TextDim : palette->Text), value.c_str());
     }
     if (card.pressed) {
-        editing_field = KeyboardConsoleName;
-        edit_text = Config::ConsoleName();
-        keyboard_shift = false;
+        OpenKeyboard(KeyboardConsoleName, Config::ConsoleName());
     }
 }
 
@@ -2911,7 +2977,7 @@ void Ui::DrawRomFolderRows() {
             const char* const label = Tr("ROM folder");
             const float label_width = ImGui::CalcTextSize(label).x;
             dl->AddText(ImVec2(card.bb.Min.x + Pad, y), Colour(palette->Text), label);
-            const std::string value = armed ? std::string{Tr("Cross again to remove")}
+            const std::string value = armed ? TrFormat("{} again to remove", ConfirmName())
                                             : Fit(folders[i], width - 3.0f * Pad - label_width);
             const float value_width = ImGui::CalcTextSize(value.c_str()).x;
             dl->AddText(ImVec2(card.bb.Max.x - Pad - value_width, y),
@@ -3067,20 +3133,20 @@ Ui::Action Ui::DrawSettings() {
     const bool option_rows = category != Category::Patches && category != Category::Cheats &&
                              category != Category::Installed && category != Category::File &&
                              category != Category::Data;
-    bool back = FooterButton(Glyph::Circle, Tr("Back"));
+    bool back = FooterButton(BackGlyph(), Tr("Back"));
     if (option_rows) {
         FooterButton(Glyph::LeftRight, Tr("Change"));
     } else if (category == Category::Cheats && !settings_cheats.empty()) {
-        FooterButton(Glyph::Cross, Tr("On or off"));
+        FooterButton(ConfirmGlyph(), Tr("On or off"));
     } else if (category == Category::Installed) {
         const bool install_row =
             focused_installed >= 0 &&
             settings_installed[static_cast<std::size_t>(focused_installed)].install;
-        FooterButton(Glyph::Cross, install_row ? Tr("Install") : Tr("Remove"));
-    } else if (category == Category::File && FooterButton(Glyph::Cross, Tr("Check"))) {
+        FooterButton(ConfirmGlyph(), install_row ? Tr("Install") : Tr("Remove"));
+    } else if (category == Category::File && FooterButton(ConfirmGlyph(), Tr("Check"))) {
         check_requested = true;
     } else if (category == Category::Data && settings_back == State::GameList) {
-        FooterButton(Glyph::Cross, Tr("Delete"));
+        FooterButton(ConfirmGlyph(), Tr("Delete"));
     }
     if (categories.size() > 1 && FooterButton(Glyph::Shoulders, Tr("Tab")) && !next_category) {
         const int at = static_cast<int>(current - categories.begin());
@@ -3092,8 +3158,29 @@ Ui::Action Ui::DrawSettings() {
                               std::nullopt);
     }
 
-    // The tabs, under the header: the selected one filled with the accent colour.
+    // The tabs, under the header: the selected one filled with the accent colour. Where they don't
+    // fit across the screen, the others lose their icons, then their names (icons alone).
     {
+        enum class Fit { Whole, Names, Icons };
+        constexpr float Gap = 10.0f;
+        const auto tab_width = [this](Category c, Fit fit) {
+            const float text = ImGui::CalcTextSize(Tr(CategoryName(static_cast<int>(c)))).x;
+            if (c == category || fit == Fit::Whole) {
+                return text + 64.0f;
+            }
+            return fit == Fit::Names ? text + 32.0f : 48.0f;
+        };
+        Fit fit = Fit::Whole;
+        for (const Fit tried : {Fit::Whole, Fit::Names, Fit::Icons}) {
+            fit = tried;
+            float total = -Gap;
+            for (const Category c : categories) {
+                total += tab_width(c, fit) + Gap;
+            }
+            if (total <= ScreenWidth - 2.0f * Margin) {
+                break;
+            }
+        }
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         float x = Margin;
         const float y = HeaderHeight + 10.0f;
@@ -3101,7 +3188,7 @@ Ui::Action Ui::DrawSettings() {
             const int i = static_cast<int>(c);
             const char* name = Tr(CategoryName(i));
             const ImVec2 text = ImGui::CalcTextSize(name);
-            const ImVec2 size(text.x + 64.0f, TabsHeight);
+            const ImVec2 size(tab_width(c, fit), TabsHeight);
             ImGui::SetCursorScreenPos(ImVec2(x, y));
             ImGui::PushID(i);
             if (ImGui::InvisibleButton("##tab", size)) {
@@ -3109,13 +3196,21 @@ Ui::Action Ui::DrawSettings() {
             }
             ImGui::PopID();
             const bool selected = c == category;
+            const bool icon = selected || fit != Fit::Names;
+            const bool named = selected || fit != Fit::Icons;
             dl->AddRectFilled(ImVec2(x, y), ImVec2(x, y) + size,
                               Colour(selected ? palette->Accent : palette->Row), size.y * 0.5f);
             const ImU32 ink = Colour(selected ? palette->Backdrop : palette->Text);
-            DrawIcon(dl, CategoryIcon(i), ImVec2(x + 26.0f, y + size.y * 0.5f), 22.0f, ink,
-                     Colour(selected ? palette->Accent : palette->Row));
-            dl->AddText(ImVec2(x + 46.0f, y + (size.y - text.y) * 0.5f), ink, name);
-            x += size.x + 10.0f;
+            if (icon) {
+                DrawIcon(dl, CategoryIcon(i),
+                         ImVec2(x + (named ? 26.0f : size.x * 0.5f), y + size.y * 0.5f), 22.0f, ink,
+                         Colour(selected ? palette->Accent : palette->Row));
+            }
+            if (named) {
+                dl->AddText(ImVec2(x + (icon ? 46.0f : 16.0f), y + (size.y - text.y) * 0.5f), ink,
+                            name);
+            }
+            x += size.x + Gap;
         }
     }
     EndBackdrop();
@@ -3199,6 +3294,21 @@ Ui::Action Ui::DrawSettings() {
         DrawDataInfo();
     } else {
         DrawRowInfo();
+    }
+    // A description longer than the panel: the right stick scrolls it, from its top for each row.
+    const std::array<int, 8> shown{static_cast<int>(category),
+                                   focused_row,
+                                   focused_patch,
+                                   focused_engine,
+                                   focused_cheat,
+                                   focused_installed,
+                                   focused_rom_folder,
+                                   focused_data};
+    if (shown != info_shown) {
+        info_shown = shown;
+        ImGui::SetScrollY(0.0f);
+    } else if (const float stick = ImGui_ImplVita_RightStickY(); stick != 0.0f && !blacked_out) {
+        ImGui::SetScrollY(ImGui::GetScrollY() + stick * 600.0f * ImGui::GetIO().DeltaTime);
     }
     ImGui::End();
 
@@ -3387,7 +3497,7 @@ Ui::Action Ui::DrawGameList() {
     const bool installer =
         !games.empty() && games[static_cast<std::size_t>(selected_game)].installer;
     bool start =
-        !games.empty() && FooterButton(Glyph::Cross, installer ? Tr("Install") : Tr("Open"));
+        !games.empty() && FooterButton(ConfirmGlyph(), installer ? Tr("Install") : Tr("Open"));
     bool game_settings =
         !games.empty() && !installer && FooterButton(Glyph::Triangle, Tr("Game settings"));
     // A CIA's triangle checks its file: it has no settings of its own.
@@ -3693,13 +3803,16 @@ Ui::Action Ui::DrawGameList() {
         check_name = game.name;
         action = Action::CheckFile;
     } else if (pin) {
+        // Asked first: the square sits beside the buttons players press all the time.
         selected_game_path = game.path;
-        action = Action::TogglePin;
+        question = Question::Pin;
+        question_game = game.name;
+        question_pinned = LiveArea::IsPinned(game.path);
     } else if (start) {
         selected_game_path = game.path;
         if (!game.installer && Config::Global(Config::Option::UsbVideo) != 0 &&
             !UvcStream::TakeoverAllowed() && UvcStream::PortTaken()) {
-            usb_prompt = UsbPrompt::Launch; // the answer starts the game
+            question = Question::UsbLaunch; // the answer starts the game
         } else {
             action = game.installer ? Action::InstallTitle : Action::LaunchGame;
         }
@@ -4083,7 +4196,7 @@ Ui::Action Ui::DrawPauseMenu() {
 Ui::Action Ui::DrawSavestates() {
     Action action = Action::None;
     BeginBackdrop("##savestates_backdrop", Icon::Disk, Tr("Save states"), game_name);
-    bool back = FooterButton(Glyph::Circle, Tr("Back"));
+    bool back = FooterButton(BackGlyph(), Tr("Back"));
     EndBackdrop();
 
     BeginList("##slots", ImVec2(Margin - 4.0f, HeaderHeight + 8.0f),
@@ -4199,8 +4312,8 @@ Ui::Action Ui::DrawInstallPicker() {
     BeginBackdrop("##picker_backdrop", picker_folders ? Icon::Disk : Icon::Install,
                   picker_folders ? Tr("Add ROM folder") : Tr("Install CIA"),
                   picker_dir.empty() ? std::string{Tr("Memory devices")} : picker_dir);
-    bool back = FooterButton(Glyph::Circle, picker_dir.empty() ? Tr("Back") : Tr("Parent folder"));
-    const bool open = FooterButton(Glyph::Cross, Tr("Open"));
+    bool back = FooterButton(BackGlyph(), picker_dir.empty() ? Tr("Back") : Tr("Parent folder"));
+    const bool open = FooterButton(ConfirmGlyph(), Tr("Open"));
     // In a folder, triangle leaves at once: back only goes up a folder.
     bool close = !picker_dir.empty() && FooterButton(Glyph::Triangle, Tr("Close"));
     bool add =
@@ -4326,7 +4439,7 @@ Ui::Action Ui::DrawMultiplayer() {
         return Action::None;
     }
     BeginBackdrop("##multiplayer_backdrop", Icon::People, Tr("Multiplayer"), game_name);
-    bool back = FooterButton(Glyph::Circle, Tr("Back"));
+    bool back = FooterButton(BackGlyph(), Tr("Back"));
     EndBackdrop();
 
     // The room's fields and its buttons on the left, its state and members on the right, as the
@@ -4364,9 +4477,7 @@ Ui::Action Ui::DrawMultiplayer() {
                         Colour(empty ? palette->TextDim : palette->Text), value.c_str());
         }
         if (card.pressed) {
-            editing_field = i;
-            edit_text = i == 1 ? port : i == 3 ? room_fields.password : *fields[i].second;
-            keyboard_shift = false;
+            OpenKeyboard(i, i == 1 ? port : i == 3 ? room_fields.password : *fields[i].second);
         }
         ImGui::PopID();
     }
@@ -4442,6 +4553,21 @@ Ui::Action Ui::DrawMultiplayer() {
     return Action::None;
 }
 
+void Ui::OpenKeyboard(int field, std::string text) {
+    editing_field = field;
+    edit_text = text;
+    edit_original = std::move(text);
+    keyboard_error.clear();
+    keyboard_shift = false;
+}
+
+void Ui::CloseKeyboard() {
+    editing_field = -1;
+    keyboard_error.clear();
+    focus_first_row = true;
+    overlay_focused = false;
+}
+
 void Ui::DrawKeyboard() {
     static constexpr const char* key_rows[] = {"1234567890", "qwertyuiop", "asdfghjkl.",
                                                "zxcvbnm-_:"};
@@ -4456,6 +4582,10 @@ void Ui::DrawKeyboard() {
                               : editing_field == KeyboardControlName
                                   ? ControlLayouts::MaxNameLength
                                   : std::size_t{64};
+    if (std::exchange(keyboard_refocus, false)) {
+        ImGui::SetNextWindowFocus();
+    }
+    const std::string before = edit_text;
     // Ten keys of 56 a row and their spacing.
     BeginCentered("##keyboard", 700.0f, 420.0f);
     ImGui::Text("%s", Tr(titles[editing_field]));
@@ -4467,6 +4597,11 @@ void Ui::DrawKeyboard() {
         editing_field == KeyboardControlName) {
         ImGui::SameLine();
         ImGui::TextDisabled("%zu/%zu", edit_text.size(), limit);
+    }
+    if (!keyboard_error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, palette->Accent);
+        ImGui::TextUnformatted(keyboard_error.c_str());
+        ImGui::PopStyleColor();
     }
     ImGui::Spacing();
     const ImVec2 key{56.0f, 44.0f};
@@ -4485,7 +4620,16 @@ void Ui::DrawKeyboard() {
         }
     }
     bool done = false, cancel = false;
-    if (ImGui::Button(keyboard_shift ? "SHIFT" : "Shift", ImVec2(110.0f, 44.0f))) {
+    // On, the key in the accent colour: one label keeps its focus as it changes.
+    if (keyboard_shift) {
+        ImGui::PushStyleColor(ImGuiCol_Button, palette->Accent);
+        ImGui::PushStyleColor(ImGuiCol_Text, palette->Backdrop);
+    }
+    const bool shift = ImGui::Button(Tr("Shift"), ImVec2(110.0f, 44.0f));
+    if (keyboard_shift) {
+        ImGui::PopStyleColor(2);
+    }
+    if (shift) {
         keyboard_shift = !keyboard_shift;
     }
     ImGui::SameLine();
@@ -4494,24 +4638,39 @@ void Ui::DrawKeyboard() {
         edit_text.push_back(' ');
     }
     ImGui::SameLine();
-    if (ImGui::Button(Tr("Delete"), ImVec2(110.0f, 44.0f)) && !edit_text.empty()) {
+    if ((ImGui::Button(Tr("Delete"), ImVec2(110.0f, 44.0f)) ||
+         ImGui::IsNavInputTest(ImGuiNavInput_Menu, ImGuiInputReadMode_Repeat)) &&
+        !edit_text.empty()) {
         edit_text.pop_back();
     }
     ImGui::SameLine();
     cancel = ImGui::Button(Tr("Cancel"), ImVec2(110.0f, 44.0f)) || BackPressed();
     ImGui::SameLine();
     done = ImGui::Button(Tr("OK"), ImVec2(110.0f, 44.0f));
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", Tr("Square: delete"));
     overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
+    if (edit_text != before) {
+        keyboard_error.clear();
+    }
+    if (done && editing_field == 1) {
+        if (const int port = std::atoi(edit_text.c_str()); port <= 0 || port > 65535) {
+            keyboard_error = Tr("Enter a port from 1 to 65535.");
+            done = false;
+        }
+    }
+    if (cancel && edit_text != edit_original) {
+        question = Question::DiscardText;
+        return;
+    }
     if (done) {
         switch (editing_field) {
         case 0:
             room_fields.address = edit_text;
             break;
         case 1:
-            if (const int port = std::atoi(edit_text.c_str()); port > 0 && port <= 65535) {
-                room_fields.port = static_cast<u16>(port);
-            }
+            room_fields.port = static_cast<u16>(std::atoi(edit_text.c_str()));
             break;
         case 2:
             room_fields.nickname = edit_text;
@@ -4531,9 +4690,7 @@ void Ui::DrawKeyboard() {
         }
     }
     if (done || cancel) {
-        editing_field = -1;
-        focus_first_row = true;
-        overlay_focused = false;
+        CloseKeyboard();
     }
 }
 
@@ -4569,21 +4726,118 @@ void Ui::DrawStatusMessage() {
     ImGui::End();
 }
 
-Ui::Action Ui::DrawUsbPrompt() {
+Ui::Action Ui::DrawQuestion() {
     constexpr float Padding = 28.0f;
     constexpr float Width = 640.0f;
-    const char* const text =
-        "Another plugin is using the USB port, such as one that streams the screen "
-        "(vitastream). Take it over for USB video? That plugin stops working until you reboot.";
-    const ImVec2 size = ImGui::CalcTextSize(text, nullptr, false, Width - 2.0f * Padding);
-    BeginCentered("##usb_prompt", Width, size.y + 3.0f * Padding + button.y);
+    const bool damaged = question == Question::Damaged;
+    // A third answer between the two: a damaged file's full check, or the game started without
+    // USB video.
+    const bool three = damaged || question == Question::UsbLaunch;
+    const ImVec2 button(three ? 180.0f : 200.0f, 48.0f);
+    std::string text;
+    const char* yes;
+    switch (question) {
+    case Question::Damaged:
+        text = damaged_text;
+        yes = Tr("Launch anyway");
+        break;
+    case Question::Pin:
+        text = question_pinned
+                   ? TrFormat("Take {}'s bubble off the LiveArea?", question_game)
+                   : TrFormat("Pin {} to the LiveArea as a bubble of its own?", question_game);
+        yes = question_pinned ? Tr("Unpin") : Tr("Pin");
+        break;
+    case Question::QuitGame:
+        text = TrFormat("Quit {}? Progress since the game last saved is lost.", game_name);
+        yes = Tr("Quit game");
+        break;
+    case Question::ExitApplication:
+        text = TrFormat("Exit Azahar? {}'s progress since it last saved is lost.", game_name);
+        yes = Tr("Exit Azahar");
+        break;
+    case Question::SaveOver:
+    case Question::LoadSlot: {
+        const auto saved = std::find_if(
+            slot_states.begin(), slot_states.end(),
+            [this](const Core::SaveStateInfo& s) { return s.slot == selected_slot; });
+        ASSERT_MSG(saved != slot_states.end(), "savestates: slot {} asked about is empty",
+                   selected_slot);
+        const std::string when = LocalTimeText(saved->time);
+        if (question == Question::SaveOver) {
+            text = TrFormat("Save over slot {}? Its state from {} is replaced.", selected_slot,
+                            when);
+            yes = Tr("Save");
+        } else {
+            text = TrFormat("Load slot {}? The game goes back to {}, and the progress since then "
+                            "is lost.",
+                            selected_slot, when);
+            yes = Tr("Load");
+        }
+        break;
+    }
+    case Question::DiscardText:
+        text = Tr("Discard what you typed?");
+        yes = Tr("Discard");
+        break;
+    case Question::DiscardLayout:
+        text = Tr("Leave the layout editor? The changes are not saved.");
+        yes = Tr("Leave");
+        break;
+    case Question::DiscardControls:
+        text = Tr("Leave the control layout editor? The changes are not saved.");
+        yes = Tr("Leave");
+        break;
+    case Question::DeleteControls: {
+        const auto layout =
+            control_editor.index ? ControlLayouts::Get(*control_editor.index) : std::nullopt;
+        text = TrFormat("Delete the control layout {}? The games that use it go back to the "
+                        "buttons in the Controls tab.",
+                        layout ? layout->name : std::string{});
+        yes = Tr("Delete");
+        break;
+    }
+    case Question::DeleteLayout: {
+        const auto layout = editor.index ? ScreenLayouts::Get(*editor.index) : std::nullopt;
+        text = TrFormat("Delete the layout {}? The games that use it go back to Default.",
+                        layout ? layout->name : std::string{});
+        yes = Tr("Delete");
+        break;
+    }
+    case Question::ClearData:
+        text = settings_data[static_cast<std::size_t>(clear_data)].kind == DataKind::SaveData
+                   ? TrFormat("Delete {}'s save data? The game starts over as new. This can't be "
+                              "undone.",
+                              settings_name)
+                   : TrFormat("Delete {}'s shader cache? The game stutters for a while as it "
+                              "makes its shaders again.",
+                              settings_name);
+        yes = Tr("Delete");
+        break;
+    case Question::UsbLaunch:
+        text = Tr("Another plugin, such as vitastream, is using the USB port. Take it over for "
+                  "USB video? That plugin stops working until you reboot. Play without turns USB "
+                  "video off.");
+        yes = Tr("Take over");
+        break;
+    default:
+        text = Tr("Another plugin, such as vitastream, is using the USB port. Take it over for "
+                  "USB video? That plugin stops working until you reboot.");
+        yes = Tr("Take over");
+        break;
+    }
+
+    DimScreen("##question_dim");
+
+    const ImVec2 size = ImGui::CalcTextSize(text.c_str(), nullptr, false, Width - 2.0f * Padding);
+    ImGui::SetNextWindowFocus();
+    BeginCentered("##question", Width, size.y + 3.0f * Padding + button.y);
     ImGui::SetCursorPos(ImVec2(Padding, Padding));
     ImGui::PushTextWrapPos(Width - Padding);
-    ImGui::TextUnformatted(text);
+    ImGui::TextUnformatted(text.c_str());
     ImGui::PopTextWrapPos();
     const float buttons = three ? 3.0f * button.x + 2.0f * 16.0f : 2.0f * button.x + 20.0f;
     ImGui::SetCursorPos(ImVec2((Width - buttons) * 0.5f, 2.0f * Padding + size.y));
-    const bool take = ImGui::Button("Take over", button);
+    const bool agreed = ImGui::Button(yes, button);
     bool middle = false;
     if (three) {
         ImGui::SameLine(0.0f, 16.0f);
@@ -4596,11 +4850,11 @@ Ui::Action Ui::DrawUsbPrompt() {
     }
     overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
-    if (!take && !cancel) {
+    if (!agreed && !cancel && !middle) {
         return Action::None;
     }
-    const UsbPrompt asked = usb_prompt;
-    usb_prompt = UsbPrompt::None;
+    const Question asked = question;
+    question = Question::None;
     overlay_focused = false;
     if (asked == Question::Damaged) {
         if (middle) {
@@ -4611,11 +4865,56 @@ Ui::Action Ui::DrawUsbPrompt() {
         launch_anyway = agreed;
         return agreed ? Action::LaunchGame : Action::None;
     }
-    if (take) {
+    if (asked == Question::Pin) {
+        return agreed ? Action::TogglePin : Action::None;
+    }
+    if (asked == Question::DiscardText) {
+        if (agreed) {
+            CloseKeyboard();
+        } else {
+            keyboard_refocus = true;
+        }
+        return Action::None;
+    }
+    if (asked == Question::SaveOver || asked == Question::LoadSlot) {
+        return !agreed                      ? Action::None
+               : asked == Question::SaveOver ? Action::SaveState
+                                             : Action::LoadState;
+    }
+    if (asked == Question::QuitGame || asked == Question::ExitApplication) {
+        return !agreed                      ? Action::None
+               : asked == Question::QuitGame ? Action::QuitGame
+                                             : Action::ExitApplication;
+    }
+    if (asked == Question::ClearData) {
+        if (!agreed) {
+            clear_data = -1;
+        }
+        return agreed ? Action::ClearData : Action::None;
+    }
+    if (asked == Question::DiscardControls || asked == Question::DeleteControls) {
+        if (agreed && asked == Question::DeleteControls) {
+            Config::DeleteControlLayout(*control_editor.index);
+        }
+        if (agreed) {
+            CloseControlEditor();
+        }
+        return Action::None;
+    }
+    if (asked == Question::DiscardLayout || asked == Question::DeleteLayout) {
+        if (agreed && asked == Question::DeleteLayout) {
+            Config::DeleteScreenLayout(*editor.index);
+        }
+        if (agreed) {
+            CloseLayoutEditor();
+        }
+        return Action::None;
+    }
+    if (agreed) {
         UvcStream::AllowTakeover();
     }
-    if (asked == UsbPrompt::Setting) {
-        if (take) {
+    if (asked == Question::UsbSetting) {
+        if (agreed) {
             Config::SetGlobal(Config::Option::UsbVideo, usb_prompt_value);
         }
         return Action::None;
@@ -4845,7 +5144,7 @@ void Ui::EditLayout() {
     editor.pad = held;
     bool edited = false;
 
-    if (pressed & SCE_CTRL_CIRCLE) {
+    if (pressed & ImGui_ImplVita_BackButton()) {
         // Back to the settings, asked first where there is something to lose.
         if (editor.changed) {
             question = Question::DiscardLayout;
@@ -4854,7 +5153,7 @@ void Ui::EditLayout() {
         }
         return;
     }
-    if (pressed & (SCE_CTRL_START | SCE_CTRL_CROSS)) {
+    if (pressed & (SCE_CTRL_START | ImGui_ImplVita_ConfirmButton())) {
         editor.panel = pressed & SCE_CTRL_START ? EditorPanel::Save : EditorPanel::Tools;
         focus_first_row = true;
         return;
@@ -5076,14 +5375,14 @@ void Ui::DrawLayoutBars() {
 
     // The pad's buttons, each a touch target for the same.
     ImGui::SetCursorScreenPos(ImVec2(Margin, footer + (FooterHeight - FooterButtonHeight) * 0.5f));
-    if (FooterButton(Glyph::Circle, Tr("Back"))) {
+    if (FooterButton(BackGlyph(), Tr("Back"))) {
         if (editor.changed) {
             question = Question::DiscardLayout;
         } else {
             CloseLayoutEditor();
         }
     }
-    if (FooterButton(Glyph::Cross, Tr("Tools"))) {
+    if (FooterButton(ConfirmGlyph(), Tr("Tools"))) {
         editor.panel = EditorPanel::Tools;
         focus_first_row = true;
     }
@@ -5247,9 +5546,7 @@ void Ui::DrawLayoutSave() {
                     value.c_str());
     }
     if (field.pressed) {
-        editing_field = KeyboardLayoutName;
-        edit_text = editor.name;
-        keyboard_shift = false;
+        OpenKeyboard(KeyboardLayoutName, editor.name);
     }
     Note(problem ? palette->Own : palette->TextDim, problem ? std::string{problem} : uses);
     ImGui::Spacing();
@@ -5515,7 +5812,7 @@ void Ui::EditControls() {
     const u32 pressed = held & ~ed.pad;
     ed.pad = held;
 
-    if (pressed & SCE_CTRL_CIRCLE) {
+    if (pressed & ImGui_ImplVita_BackButton()) {
         if (ed.changed) {
             question = Question::DiscardControls;
         } else {
@@ -5523,7 +5820,7 @@ void Ui::EditControls() {
         }
         return;
     }
-    if (pressed & (SCE_CTRL_START | SCE_CTRL_CROSS)) {
+    if (pressed & (SCE_CTRL_START | ImGui_ImplVita_ConfirmButton())) {
         ed.panel = pressed & SCE_CTRL_START ? EditorPanel::Save : EditorPanel::Tools;
         focus_first_row = true;
         return;
@@ -5702,14 +5999,14 @@ void Ui::DrawControlBars() {
     dl->PopClipRect();
 
     ImGui::SetCursorScreenPos(ImVec2(Margin, footer + (FooterHeight - FooterButtonHeight) * 0.5f));
-    if (FooterButton(Glyph::Circle, Tr("Back"))) {
+    if (FooterButton(BackGlyph(), Tr("Back"))) {
         if (ed.changed) {
             question = Question::DiscardControls;
         } else {
             CloseControlEditor();
         }
     }
-    if (FooterButton(Glyph::Cross, Tr("Buttons"))) {
+    if (FooterButton(ConfirmGlyph(), Tr("Buttons"))) {
         ed.panel = EditorPanel::Tools;
         focus_first_row = true;
     }
@@ -5736,8 +6033,9 @@ void Ui::DrawControlButtons() {
     ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), TitleSize, ImGui::GetCursorScreenPos(),
                                         Colour(palette->Text), Tr("Buttons"));
     ImGui::Dummy(ImVec2(0.0f, TitleSize + 6.0f));
-    Note(palette->TextDim, Tr("Left and right: the Vita input that presses it. Cross: a button "
-                              "on the screen for it, or none."));
+    Note(palette->TextDim, TrFormat("Left and right: the Vita input that presses it. {}: a button "
+                                    "on the screen for it, or none.",
+                                    ConfirmName()));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 6.0f));
     const float width = ImGui::GetContentRegionAvail().x;
     // A row's step from the pad's left and right while it is focused, or a tap on its value.
@@ -5889,9 +6187,7 @@ void Ui::DrawControlSave() {
                     value.c_str());
     }
     if (field.pressed) {
-        editing_field = KeyboardControlName;
-        edit_text = ed.name;
-        keyboard_shift = false;
+        OpenKeyboard(KeyboardControlName, ed.name);
     }
     Note(problem ? palette->Own : palette->TextDim, problem ? std::string{problem} : uses);
     ImGui::Spacing();
@@ -5977,14 +6273,34 @@ Ui::Action Ui::Update() {
     ++frame;
     // A theme chosen in the settings shows from the frame after.
     UseTheme();
+    // The settings' right stick scrolls the description (DrawSettings), not the cursor.
+    ImGui_ImplVita_MouseStickUsage(state != State::Settings);
     ImGui_ImplVita_NewFrame();
 
     Action action = Action::None;
     if (!status_message.empty()) {
         DrawStatusMessage();
-    } else if (usb_prompt != UsbPrompt::None) {
-        action = DrawUsbPrompt();
     } else {
+        // A question goes over the screen it was asked from, which is drawn as it is but takes no
+        // input meanwhile.
+        const bool searching = engine_search.joinable();
+        const bool asking = question != Question::None || searching;
+        // The question's own focus at the end of the frame before (BackPressed's): the screen
+        // behind sets overlay_focused as it is drawn, unfocused while the question is up, and
+        // circle would then never cancel the question.
+        const bool question_focused = overlay_focused;
+        std::optional<InputBlackout> blackout;
+        if (asking) {
+            // An item behind still held, as the game's tile whose cross opened the question is,
+            // would never see the button let go (the blackout hides it) and would keep the pad's
+            // moves from the question: it is let go of here.
+            const ImGuiContext& g = *ImGui::GetCurrentContext();
+            if (g.ActiveId != 0 &&
+                (g.ActiveIdWindow == nullptr || std::strcmp(g.ActiveIdWindow->Name, "##question"))) {
+                ImGui::ClearActiveID();
+            }
+            blackout.emplace();
+        }
         switch (state) {
         case State::GameList:
             action = DrawGameList();
@@ -6012,6 +6328,15 @@ Ui::Action Ui::Update() {
         case State::ControlEditor:
             action = DrawControlEditor();
             break;
+        }
+        if (asking) {
+            blackout.reset();
+            overlay_focused = question_focused;
+            if (searching) {
+                DrawEngineSearch();
+            } else {
+                action = DrawQuestion();
+            }
         }
     }
 

@@ -7,14 +7,34 @@
 #include <cstring>
 
 #include <imgui_vita2d/imgui.h>
+#include <psp2/apputil.h>
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/system_param.h>
 #include <psp2/touch.h>
 
 #include "citra_vita/imgui_impl_vita.h"
 #include "citra_vita/sgxd_present.h"
+#include "common/logging/log.h"
 
 namespace {
+
+bool EnterIsCircle() {
+    static const bool circle = [] {
+        SceAppUtilInitParam init{};
+        SceAppUtilBootParam boot{};
+        // Already up is as good (the call refuses a second init).
+        sceAppUtilInit(&init, &boot);
+        int enter = SCE_SYSTEM_PARAM_ENTER_BUTTON_CROSS;
+        if (const int got = sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_ENTER_BUTTON, &enter);
+            got < 0) {
+            LOG_ERROR(Frontend, "The system's enter button did not read: {:#010x}",
+                      static_cast<u32>(got));
+        }
+        return enter == SCE_SYSTEM_PARAM_ENTER_BUTTON_CIRCLE;
+    }();
+    return circle;
+}
 
 using VitaFrontend::SgxdPresent::DisplayHeight;
 using VitaFrontend::SgxdPresent::DisplayWidth;
@@ -25,12 +45,28 @@ struct BackendState {
     bool mouse_stick_enabled{true};
     float cursor_x{DisplayWidth / 2.0f};
     float cursor_y{DisplayHeight / 2.0f};
+    /// The right stick's travel down this frame (ImGui_ImplVita_RightStickY).
+    float right_y{};
     u64 last_time{};
 };
+
+/// A stick's travel from -1 to 1, 0 inside its dead zone.
+float Axis(u8 raw) {
+    const float value = (raw - 128.0f) / 128.0f;
+    return std::abs(value) < 0.25f ? 0.0f : value;
+}
 
 BackendState s;
 
 } // Anonymous namespace
+
+unsigned ImGui_ImplVita_ConfirmButton() {
+    return EnterIsCircle() ? SCE_CTRL_CIRCLE : SCE_CTRL_CROSS;
+}
+
+unsigned ImGui_ImplVita_BackButton() {
+    return EnterIsCircle() ? SCE_CTRL_CROSS : SCE_CTRL_CIRCLE;
+}
 
 void ImGui_ImplVita_Init() {
     ImGuiIO& io = ImGui::GetIO();
@@ -51,6 +87,10 @@ void ImGui_ImplVita_MouseStickUsage(bool enabled) {
     s.mouse_stick_enabled = enabled;
 }
 
+float ImGui_ImplVita_RightStickY() {
+    return s.right_y;
+}
+
 void ImGui_ImplVita_NewFrame() {
     ImGuiIO& io = ImGui::GetIO();
 
@@ -58,6 +98,7 @@ void ImGui_ImplVita_NewFrame() {
     io.DeltaTime = s.last_time != 0 ? (now - s.last_time) / 1e6f : 1.0f / 60.0f;
     s.last_time = now;
 
+    s.right_y = 0.0f;
     if (s.gamepad_enabled) {
         SceCtrlData pad{};
         sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -67,8 +108,8 @@ void ImGui_ImplVita_NewFrame() {
                 io.NavInputs[input] = 1.0f;
             }
         };
-        nav(ImGuiNavInput_Activate, SCE_CTRL_CROSS);
-        nav(ImGuiNavInput_Cancel, SCE_CTRL_CIRCLE);
+        nav(ImGuiNavInput_Activate, ImGui_ImplVita_ConfirmButton());
+        nav(ImGuiNavInput_Cancel, ImGui_ImplVita_BackButton());
         nav(ImGuiNavInput_Menu, SCE_CTRL_SQUARE);
         nav(ImGuiNavInput_Input, SCE_CTRL_TRIANGLE);
         nav(ImGuiNavInput_DpadUp, SCE_CTRL_UP);
@@ -89,14 +130,11 @@ void ImGui_ImplVita_NewFrame() {
         stick(ImGuiNavInput_DpadUp, (128.0f - pad.ly) / 128.0f);
         stick(ImGuiNavInput_DpadDown, (pad.ly - 128.0f) / 128.0f);
 
+        s.right_y = Axis(pad.ry);
         if (s.mouse_stick_enabled) {
             // The right stick drives a cursor, for the odd widget navigation cannot reach.
-            const auto axis = [](u8 raw) {
-                const float value = (raw - 128.0f) / 128.0f;
-                return std::abs(value) < 0.25f ? 0.0f : value;
-            };
-            s.cursor_x += axis(pad.rx) * 700.0f * io.DeltaTime;
-            s.cursor_y += axis(pad.ry) * 700.0f * io.DeltaTime;
+            s.cursor_x += Axis(pad.rx) * 700.0f * io.DeltaTime;
+            s.cursor_y += s.right_y * 700.0f * io.DeltaTime;
             s.cursor_x = std::min(std::max(s.cursor_x, 0.0f), static_cast<float>(DisplayWidth));
             s.cursor_y = std::min(std::max(s.cursor_y, 0.0f), static_cast<float>(DisplayHeight));
         }

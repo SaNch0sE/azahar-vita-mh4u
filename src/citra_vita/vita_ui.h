@@ -305,13 +305,47 @@ private:
     /// The on-screen keyboard over the Multiplayer screen and the Settings screen's console name,
     /// editing `edit_text`. Not the system's
     /// keyboard dialog: it draws through GXM, and handing the GPU back to Sony's driver around
-    /// it while sgxd holds a title's state is too risky.
+    /// it while sgxd holds a title's state is too risky. Square deletes; back asks first where
+    /// the text changed (Question::DiscardText).
     void DrawKeyboard();
+    void OpenKeyboard(int field, std::string text);
+    void CloseKeyboard();
     void DrawStatusMessage();
-    Action DrawUsbPrompt();
-    enum class UsbPrompt { None, Setting, Launch };
-    UsbPrompt usb_prompt{UsbPrompt::None};
-    int usb_prompt_value{}; ///< the screen the setting was turned to
+    /// A question over the screen before something a press could do by accident, or that the
+    /// player has to agree to; Cancel has the focus first, and circle cancels too. Pin: the
+    /// selected game's bubble added to the LiveArea or taken off it (Action::TogglePin).
+    /// UsbSetting, UsbLaunch: USB video taking the port from another plugin
+    /// (UvcStream::PortTaken), asked when USB video is turned on or when a game starts with it on;
+    /// Take over lets the camera have the port (that plugin stops working until a reboot); at a
+    /// game's start Play without turns USB video off and starts it, Cancel starts nothing.
+    Action DrawQuestion();
+    /// Damaged: the file about to launch failed its check (LaunchChecked): Launch anyway, Full
+    /// check, Cancel. DiscardLayout: the layout editor left with changes not saved. DeleteLayout:
+    /// the custom layout the editor opened on deleted. ClearData: the Data tab's part deleted.
+    /// QuitGame, ExitApplication: the pause menu's, which end the running game. SaveOver,
+    /// LoadSlot: the Save states screen's save over a used slot (selected_slot) and load of one.
+    /// DiscardText: the keyboard left with its text changed.
+    enum class Question {
+        None,
+        Pin,
+        QuitGame,
+        ExitApplication,
+        SaveOver,
+        LoadSlot,
+        DiscardText,
+        UsbSetting,
+        UsbLaunch,
+        Damaged,
+        DiscardLayout,
+        DeleteLayout,
+        DiscardControls,
+        DeleteControls,
+        ClearData,
+    };
+    Question question{Question::None};
+    std::string question_game;  ///< Pin: the game's name
+    bool question_pinned{};     ///< Pin: its bubble is there now (the question takes it off)
+    int usb_prompt_value{};     ///< UsbSetting: the screen the setting was turned to
 
     /// The tabs the settings screen shows: all of them but Patches and Cheats for all games,
     /// those with options a title can set itself for a title, Patches when it has some, and
@@ -570,7 +604,10 @@ private:
     static constexpr int KeyboardControlName = 6;
     int editing_field = -1;
     std::string edit_text;
+    std::string edit_original;  ///< the text the keyboard opened on
+    std::string keyboard_error; ///< why OK did not take the text, under it
     bool keyboard_shift{};
+    bool keyboard_refocus{}; ///< back from DiscardText's Cancel: the keyboard takes the pad again
     bool overlay_focused{};
     /// Whether the last Update built an ImGui frame (a menu or the status message), which Draw
     /// then draws; in game it builds none and Draw draws the stats overlay.
