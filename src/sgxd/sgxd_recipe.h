@@ -140,6 +140,9 @@ typedef struct SgxdRecipe {
     unsigned imgui_fs;               // ImGui mode: SGXD_IMGUI_*
     int fb_external;                 // the target is not the block's FB (sgxd_recipe_set_target)
     int keep_code_caches;            // sgxd_test 11: the kicks skip the USE_CACHE invalidates
+    // Core 0's event program is someone else's (sgxd's microkernel; sgxd_test 03 mkevents=1):
+    // the kicks leave 0x8a68/0x8a6c alone instead of pointing them at the recipe's IDLE.
+    int events_owned;
     int programs;                    // sgxd_recipe_init_programs: draws bring programs
     uint32_t pixev_va, pixev_units, pixev_attribute_size;  // sgxd_recipe_set_pixel_event
     uint32_t layout_width, layout_height, layout_rgn_size, layout_tpc_size;
@@ -169,6 +172,10 @@ extern SgxdRecipePb sgxd_recipe_pb;
 // the layout gives the block's own FB and DEPTH no room. With sgxd_recipe_pb set, the page
 // table and pages take none either.
 extern int sgxd_recipe_external_fb;
+// Every recipe's kicks leave core 0's event program alone, as events_owned does, and their SLC
+// requests take Sony's form: one value to MASTER_SLC_CTRL_FLUSH and _INVAL together, both events
+// awaited at once (sgxd_recipe_slc). sgxd_ptla_events sets it, the events page's release clears it.
+extern int sgxd_recipe_events_owned;
 // sgxd_recipe_pb's page list into the CPU's view of its page table: page p links p - 1 and
 // p + 1, 0xffff at both ends. Before its first TA only; the DPM owns it afterwards.
 void sgxd_recipe_pb_write(void *pt_memory);
@@ -396,17 +403,19 @@ typedef struct SgxdOpList {
 void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *list);
 // TA_FINISHED in core 0's EVENT_STATUS (T5.1).
 void sgxd_recipe_ta_wait(SgxdOpList *list, uint32_t timeout_us);
-// The TA's end: the cores idle, the TPC flush, the SLC flush and invalidate (T5.2-T5.8).
+// The TA's end: the cores idle, the TPC flush, the SLC flush and invalidate (T5.2-T5.8; with
+// sgxd_recipe_events_owned the vertex data master's flush alone).
 void sgxd_recipe_ta_done(const SgxdRecipe *r, SgxdOpList *list);
 // The 3D: the DPM 3D free-list load, the code-cache invalidate, ISP, PBE and the pixel event,
 // then ISP_START_RENDER last (D1, D2).
 void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *list);
 // PIXELBE_END_RENDER in core 0's EVENT_STATUS (D3.1).
 void sgxd_recipe_3d_wait(SgxdOpList *list, uint32_t timeout_us);
-// The 3D's end: the cores idle, the event clears, the SLC flush and invalidate (D3.2-D3.5).
+// The 3D's end: the cores idle, the event clears, the SLC flush and invalidate (D3.2-D3.5; with
+// sgxd_recipe_events_owned the pixel data master's flush alone).
 void sgxd_recipe_3d_done(const SgxdRecipe *r, SgxdOpList *list);
 
-// The SLC flush, and with inval the invalidate (T0.1, T0.2). An invalidate only while idle.
+// The SLC flush of everything, and with inval the invalidate of everything (T0.1, T0.2).
 void sgxd_recipe_slc(SgxdOpList *list, int inval);
 
 #ifdef __cplusplus

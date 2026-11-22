@@ -147,7 +147,7 @@ public:
         return in_pass;
     }
 
-    /// PTLA ops complete through sgxd's interrupt (sgxd_ptla_events). PtlaFence is the last
+    /// PTLA ops complete through sgxd's microkernel (sgxd_ptla_events). PtlaFence is the last
     /// op's completion point.
     [[nodiscard]] u32 PtlaFence() const;
     [[nodiscard]] bool PtlaReached(u32 fence) const;
@@ -171,6 +171,10 @@ public:
     /// Waits for the last async render, 3D included, and stops the process with the
     /// post-mortem if it failed.
     void RenderIdle(const char* why);
+    // A send that failed (AZAHAR_ERR_STATE: a fault, or a flip that found the GPU busy): the
+    // microkernel's post-mortem and the dumps, whether or not the lists sent have finished;
+    // Fault's assert ends it.
+    void Stopped(const char* why);
     /// Every list sent so far, and the pending 3D's finish (sent by RenderWait if needed).
     [[nodiscard]] u32 FenceAll() const;
     /// Waits for a fence (RenderFence's, FenceAll's, or a list's count), sending the pending
@@ -215,6 +219,14 @@ public:
     /// The guest waits for the fence's work: a pending 3D it takes gets its finishing list now,
     /// behind the lists queued, as InterruptWait sends it, without waiting.
     void InterruptKick(const InterruptFence& fence);
+    /// The render thread's sleep until the fence's work is done (sgxd_wake_arm): false when it
+    /// is done already. With a 3D held back (the fence one past the lists sent), the wake comes
+    /// once the lists before it are done, for InterruptPoll to send it. Disarm after the sleep.
+    [[nodiscard]] bool InterruptArm(const InterruptFence& fence);
+    void InterruptDisarm();
+    /// sgxdWaker: the render thread's event flag, whose bits sgxd sets when an armed sleep's
+    /// work is done; a negative flag stops it.
+    void InterruptWaker(s32 flag, u32 bits);
     [[nodiscard]] const SgxdEvents& Events() const {
         return events;
     }
@@ -691,8 +703,6 @@ private:
     };
     /// Submits the pending 3D's finishing list once the list before has ended.
     void FinishPending(FinishWhy why);
-    /// gxm_flags tracelog: the ended lists' GPU stamps as events.
-    void TraceStamps();
     void Fault(const Recipe& r, const char* failed);
 #ifdef VITA_DIAGNOSTICS
     void WriteCode();
@@ -721,14 +731,12 @@ private:
     };
     std::vector<CachedRange> cached;
     u32 passes{};
-    /// gxm_flags perflog: each target's passes, draws and GPU time over a second. A list's TA is
-    /// known when the next pass ends, the 3D it waited for one pass before that.
+#ifdef VITA_DIAGNOSTICS
     struct TargetTime {
         u32 passes, draws;
         u64 ta_us, d3_us;
     };
     std::unordered_map<u64, TargetTime> target_times;
-    std::array<u64, 2> ended_targets{};
     std::string pass_note;
     int eot_mix_variant = -1; ///< ProbeMixedEot's, for OpenPass
 public:
@@ -736,7 +744,6 @@ public:
     /// variant V (the guest's 1x copy stored by the same end of tile), -1 for none.
     int eot_mix_real = -1;
 private:
-    std::array<std::string, 2> ended_notes;
     u32 slow_passes{};
     std::array<u32, static_cast<std::size_t>(FinishWhy::Count)> finishes{};
     u64 target_times_start{};

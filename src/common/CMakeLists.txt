@@ -72,6 +72,7 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     play_time_manager.cpp
     play_time_manager.h
     polyfill_thread.h
+    process_clock.h
     precompiled_headers.h
     quaternion.h
     ring_buffer.h

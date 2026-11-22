@@ -485,7 +485,7 @@ bool Busy() {
         sgxd_session_finish_pending(failed, sizeof(failed)) < 0) {
         ASSERT_MSG(false, "sgxd: the present's 3D did not finish: {}", failed);
     }
-    if (sgxd_ptla_page()->chain_fault) {
+    if (sgxd_chain_faulted()) {
         sgxd_session_render_async_failed(failed, sizeof(failed));
         ASSERT_MSG(false, "sgxd: the async present stopped: {}", failed);
     }

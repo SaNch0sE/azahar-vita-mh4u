@@ -877,16 +877,14 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     DepthStoresWritten(output, output + bytes);
     // The blit's 3D stays pending, as a pass's does: the next list finishes it. Whatever waits on the
     // blit (a page hold on its output, a ticket) finishes it then (InterruptPoll, RenderWait).
-    // Progress: a line every 30 transfers.
-    if (transfers > 0 && transfers % 30 == 0) {
+#ifdef VITA_DIAGNOSTICS
+    if (transfers > 0 && transfers % 30 == 0 && SgxdFlag("perflog")) {
         const SgxdEvents& ev = backend.Events();
         LOG_INFO(Render,
-                 "transfer {}: TA {} us, 3D {} us; PTLA interrupts {} ({} completions, SLC in the "
-                 "ISR {} us at most, {} us in all, {} timeouts, unexpected {:#x}); renders {}, "
-                 "async {} (TA interrupts {}, 3D {}; the ISR's longest list run {} us)",
-                 transfers + 1, ta_us, d3_us, ev.irqs, ev.twod, ev.slc_us_max, ev.slc_us_total,
-                 ev.slc_timeouts, ev.unexpected, sgxd_session_renders(), ev.chains, ev.ta, ev.d3,
-                 ev.chain_isr_us_max);
+                 "transfer {}: TA {} us, 3D {} us; PTLA ops done {}; renders {}, async {}; IRQ 52 "
+                 "{} (SW_EVENT {}, unexpected {:#x})",
+                 transfers + 1, ta_us, d3_us, sgxd_ptla_done(), sgxd_session_renders(),
+                 sgxd_chain_done(), ev.irqs, ev.sw_events, ev.unexpected);
     }
     transfers++;
     VprofTransferResult(output, width, height, static_cast<u32>(config.output_format.Value()),
@@ -927,6 +925,18 @@ bool RasterizerSgxd::InterruptPoll(u64 fence) {
 
 void RasterizerSgxd::InterruptKick(u64 fence) {
     backend.InterruptKick({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
+}
+
+bool RasterizerSgxd::InterruptArm(u64 fence) {
+    return backend.InterruptArm({static_cast<u32>(fence >> 32), static_cast<u32>(fence)});
+}
+
+void RasterizerSgxd::InterruptDisarm() {
+    backend.InterruptDisarm();
+}
+
+void RasterizerSgxd::InterruptWaker(s32 flag, u32 bits) {
+    backend.InterruptWaker(flag, bits);
 }
 
 void RasterizerSgxd::InterruptWait(u64 fence) {
@@ -1155,9 +1165,9 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
         pixels == 0 ? 0 : sgxd_ptla_copy(&copy, &elapsed_us, failed, sizeof(failed));
 #ifdef VITA_DIAGNOSTICS
     if (copied != 0) {
-        // A stopped list before the PTLA op: its post-mortem and the GPU dump.
+        // A stopped list before the PTLA op, or a flip that found the GPU busy: the post-mortem.
         LOG_CRITICAL(Render, "sgxd: AccelerateDma {}: {}", describe(), failed);
-        backend.RenderIdle("a failed copy");
+        backend.Stopped("a failed copy");
     }
 #endif
     DEBUG_ASSERT_MSG(copied == 0, "sgxd: AccelerateDma {}: {}", describe(), failed);

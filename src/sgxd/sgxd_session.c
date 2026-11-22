@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 
 #define W(r, v) {SGXD_OP_WRITE, (r), (v), 0, 0}
@@ -24,6 +25,9 @@ static int submit(SgxdOp *ops, unsigned count, int overflow, const char *what, c
         snprintf(failed, failed_size, "%s: a PTLA op before it never completed", what);
         return -1;
     }
+#ifdef VITA_DIAGNOSTICS
+    sgxd_sync_submits++;
+#endif
     const int done = overflow ? -1 : sgxdSubmit(ops, count);
     if (done != (int)count) {
         const SgxdOp *at = done >= 0 && done < (int)count ? &ops[done] : NULL;
@@ -216,36 +220,37 @@ static void add(SgxdOpList *l, uint32_t kind, uint32_t reg, uint32_t value, uint
 // The core-0 waits after the master's event: already met.
 #define AFTER_EVENT_POLL_US 1000u
 
+void sgxd_session_render_list(const SgxdRecipe *r, int read_pages, uint32_t ptla_fence,
+                              SgxdOpList *l) {
+    add(l, SGXD_OP_WAIT_TWOD, 0, ptla_fence, 0);
+    // The TA kick makes Sony's SLC requests (sgxd_recipe_events_owned).
+    sgxd_recipe_ta_kick(r, l);
+    add(l, SGXD_OP_WAIT_EVENT, 0, 0, TA_FINISHED);
+    sgxd_recipe_ta_wait(l, AFTER_EVENT_POLL_US);
+    if (read_pages) {
+        add(l, SGXD_OP_READ, 0x0724, 0, 0);   // PAGE_STATUS
+    }
+    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
+    sgxd_recipe_ta_done(r, l);
+    sgxd_recipe_3d_kick(r, l);
+    add(l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
+    sgxd_recipe_3d_wait(l, AFTER_EVENT_POLL_US);
+    sgxd_recipe_3d_done(r, l);
+    add(l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
+}
+
 int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
                               unsigned failed_size) {
     // Queued behind the lists before it, which the kernel runs first.
     SgxdOpList l = {chain_ops, 0, SGXD_MAX_CHAIN_OPS, 0};
-    add(&l, SGXD_OP_WAIT_TWOD, 0, sgxd_ptla_fence(), 0);
-    sgxd_recipe_slc(&l, 1);
-    sgxd_recipe_ta_kick(r, &l);
-    add(&l, SGXD_OP_STAMP, 0, 0, 0);
-    add(&l, SGXD_OP_WAIT_EVENT, 0, 0, TA_FINISHED);
-    add(&l, SGXD_OP_STAMP, 0, 1, 0);
-    sgxd_recipe_ta_wait(&l, AFTER_EVENT_POLL_US);
-    if (read_pages) {
-        add(&l, SGXD_OP_READ, 0x0724, 0, 0);   // PAGE_STATUS
-    }
-    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
-    sgxd_recipe_ta_done(r, &l);
-    sgxd_recipe_3d_kick(r, &l);
-    add(&l, SGXD_OP_STAMP, 0, 2, 0);
-    add(&l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
-    add(&l, SGXD_OP_STAMP, 0, 3, 0);
-    sgxd_recipe_3d_wait(&l, AFTER_EVENT_POLL_US);
-    sgxd_recipe_3d_done(r, &l);
-    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
+    sgxd_session_render_list(r, read_pages, sgxd_ptla_fence(), &l);
     if (l.overflow) {
         snprintf(failed, failed_size, "async render: more than %u ops", SGXD_MAX_CHAIN_OPS);
         return -1;
     }
     const int ret = sgxd_chain_submit(chain_ops, l.count);
     if (ret < 0) {
-        snprintf(failed, failed_size, "async render: sgxdSubmitAsync %08x", (unsigned)ret);
+        snprintf(failed, failed_size, "async render: sgxd_chain_submit %08x", (unsigned)ret);
         return -1;
     }
     renders++;
@@ -261,10 +266,6 @@ int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
 static const SgxdRecipe *pending;
 static uint32_t pending_touches[6];
 static int pending_fenced;
-// The pending 3D's kick, stamp 2, and whether the last overlapped list finished one: for the 3D
-// time sgxd_session_render_overlap_result reports.
-static uint32_t pending_kick_stamp;
-static int last_finished;
 
 const SgxdRecipe *sgxd_session_pending(void) {
     return pending;
@@ -297,7 +298,6 @@ int sgxd_session_ta_over_3d = 1;
 // The pending 3D's wait and done.
 static void finish_phase(SgxdOpList *l) {
     add(l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
-    add(l, SGXD_OP_STAMP, 0, 3, 0);
     sgxd_recipe_3d_wait(l, AFTER_EVENT_POLL_US);
     sgxd_recipe_3d_done(pending, l);
 }
@@ -330,10 +330,9 @@ int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], 
     }
     const int ret = sgxd_chain_submit(chain_ops, l.count);
     if (ret < 0) {
-        snprintf(failed, failed_size, "overlapped render: sgxdSubmitAsync %08x", (unsigned)ret);
+        snprintf(failed, failed_size, "overlapped render: sgxd_chain_submit %08x", (unsigned)ret);
         return -1;
     }
-    last_finished = finish_previous;
     pending = r;
     pending_fenced = 0;
     for (unsigned n = 0; n < 6; n++) {
@@ -351,7 +350,6 @@ int sgxd_session_finish_pending(char *failed, unsigned failed_size) {
     // One TA signal and one DONE a list, so both counts stay the lists' count.
     add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
     add(&l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
-    add(&l, SGXD_OP_STAMP, 0, 3, 0);
     sgxd_recipe_3d_wait(&l, AFTER_EVENT_POLL_US);
     sgxd_recipe_3d_done(pending, &l);
     add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
@@ -361,7 +359,7 @@ int sgxd_session_finish_pending(char *failed, unsigned failed_size) {
 #endif
     const int ret = sgxd_chain_submit(chain_ops, l.count);
     if (ret < 0) {
-        snprintf(failed, failed_size, "render finish: sgxdSubmitAsync %08x", (unsigned)ret);
+        snprintf(failed, failed_size, "render finish: sgxd_chain_submit %08x", (unsigned)ret);
         return -1;
     }
     pending = NULL;
@@ -370,23 +368,23 @@ int sgxd_session_finish_pending(char *failed, unsigned failed_size) {
 }
 
 void sgxd_session_render_overlap_result(SgxdSessionRender *render) {
-    const volatile SgxdEvents *ev = sgxd_ptla_page();
-    render->ta_us = ev ? ev->stamp[1] - ev->stamp[0] : 0;
-    render->d3_us = ev && last_finished ? ev->stamp[3] - pending_kick_stamp : 0;
-    if (ev) {
-        pending_kick_stamp = ev->stamp[2];
-    }
+    render->ta_us = 0;
+    render->d3_us = 0;
     render->pages = 0;
 }
 
 void sgxd_session_render_async_result(SgxdSessionRender *render) {
-    const volatile SgxdEvents *ev = sgxd_ptla_page();
-    render->ta_us = ev ? ev->stamp[1] - ev->stamp[0] : 0;
-    render->d3_us = ev ? ev->stamp[3] - ev->stamp[2] : 0;
-    render->pages = render->read_pages && ev ? ev->chain_value >> 16 : 0;
+    render->ta_us = 0;
+    render->d3_us = 0;
+    render->pages = render->read_pages ? sgxd_mkq_state()[SGXD_MK_VALUE] >> 16 : 0;
 }
 
 void sgxd_session_render_async_failed(char *failed, unsigned failed_size) {
+    const volatile uint32_t *mk = sgxd_mkq_state();
+    if (!mk) {
+        snprintf(failed, failed_size, "async lists: no microkernel");
+        return;
+    }
     const volatile SgxdEvents *ev = sgxd_ptla_page();
     const uint32_t fault = ev ? ev->chain_fault : 0;
     const int stopped = sgxdSubmitAsync(NULL, 0);

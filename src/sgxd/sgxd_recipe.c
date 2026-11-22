@@ -1269,8 +1269,25 @@ void sgxd_recipe_slc(SgxdOpList *l, int inval) {
     }
 }
 
+int sgxd_recipe_events_owned;
+
+// One of Sony's SLC requests (sgxd_recipe_events_owned): value to MASTER_SLC_CTRL_FLUSH, and with
+// an invalidate in it to _INVAL as well, then both events (FLUSH bit 1, INVAL bit 0) at once.
+static void slc_request(SgxdOpList *l, uint32_t value) {
+    const uint32_t events = (value & 0x0fu) ? 3u : 2u;
+    wr(l, 0x4d2c, value);
+    if (events == 3u) {
+        wr(l, 0x4d28, value);
+    }
+    poll(l, 0x4d10, events, events, 1000);
+    wr(l, 0x4d14, events);
+}
+
 // Core 0's event program: IDLE, one unit (T0.4; the master's events run it, recipe R1).
 static void idle_event(const SgxdRecipe *r, SgxdOpList *l) {
+    if (r->events_owned || sgxd_recipe_events_owned) {
+        return;
+    }
     wr(l, CORE(0, 0x0a68), sgxd_recipe_va(r, SGXD_R_IDLE));
     wr(l, CORE(0, 0x0a6c), 1);
 }
@@ -1297,6 +1314,10 @@ void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
     wr(l, 0x0ae0, 1);
     poll(l, 0x0138, 3, 3, SETUP_POLL_US);
     wr(l, 0x0140, 3);
+    if (sgxd_recipe_events_owned) {
+        slc_request(l, 0x22);
+        slc_request(l, 0x11);
+    }
     wr(l, 0x0004, 0x0a8a4a6a);
     wr(l, 0x0a74, 0x0e208200);
 
@@ -1398,7 +1419,11 @@ void sgxd_recipe_ta_done(const SgxdRecipe *r, SgxdOpList *l) {
     }
     poll(l, 0x012c, 0x400, 0x400, SETUP_POLL_US);
     wr(l, 0x0134, 0x400);
-    sgxd_recipe_slc(l, 1);
+    if (sgxd_recipe_events_owned) {
+        slc_request(l, 0x20);
+    } else {
+        sgxd_recipe_slc(l, 1);
+    }
 }
 
 void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
@@ -1454,6 +1479,9 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
     poll(l, 0x012c, 0x04000000, 0x04000000, SETUP_POLL_US);
     wr(l, 0x0114, 0x80);
     wr(l, 0x0134, 0x04000000);
+    if (sgxd_recipe_events_owned) {
+        slc_request(l, 0x44);
+    }
 
     // D2: ISP, PBE and the pixel event.
     const uint32_t d2[][2] = {
@@ -1472,6 +1500,9 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
     };
     for (unsigned n = 0; n < sizeof(d2) / sizeof(d2[0]); n++) {
         wr(l, d2[n][0], d2[n][1]);
+    }
+    if (sgxd_recipe_events_owned) {
+        slc_request(l, 0x44);
     }
     wr(l, 0x0140, 5);
     wr(l, 0x043c, 1);
@@ -1494,8 +1525,12 @@ void sgxd_recipe_3d_wait(SgxdOpList *l, uint32_t timeout_us) {
 }
 
 void sgxd_recipe_3d_done(const SgxdRecipe *r, SgxdOpList *l) {
+    // ISP2, TSP, PDS and PBE clocks idle (CLKGATESTATUS) in each core. With sgxd's microkernel not
+    // core 0's PDS: it runs the microkernel's own event tasks, this poll's included. Sony's
+    // microkernel polls none of them at a render's end.
     for (unsigned c = 0; c < 4; c++) {
-        poll(l, CORE(c, 0x0008), 0x186, 0, SETUP_POLL_US);
+        poll(l, CORE(c, 0x0008), c == 0 && sgxd_recipe_events_owned ? 0x106u : 0x186u, 0,
+             SETUP_POLL_US);
     }
     // A deallocating render's pages are back in the list at DPM_3D_MEM_FREE, after
     // PIXELBE_END_RENDER. Sony's 3D done acknowledges both; the next 3D kick's store and load
@@ -1509,7 +1544,11 @@ void sgxd_recipe_3d_done(const SgxdRecipe *r, SgxdOpList *l) {
         wr(l, CORE(c, 0x0134), 0x00040001);
     }
     wr(l, 0x0004, 0x0a8a8aaa);
-    sgxd_recipe_slc(l, 1);
+    if (sgxd_recipe_events_owned) {
+        slc_request(l, 0x40);
+    } else {
+        sgxd_recipe_slc(l, 1);
+    }
 }
 
 void sgxd_recipe_set_clip(const SgxdRecipe *r, void *memory, unsigned draw, uint32_t clip) {

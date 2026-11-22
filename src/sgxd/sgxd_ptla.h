@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "sgxd.h"
+#include "sgxd_mkq.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,15 +71,16 @@ int sgxd_ptla_fill(const SgxdPtlaFill *fill, uint32_t *elapsed_us, char *failed,
 int sgxd_ptla_copy(const SgxdPtlaCopy *copy, uint32_t *elapsed_us, char *failed,
                    unsigned failed_size);
 
-// Asynchronous PTLA ops (sgxdEvents). Once events, the app's zeroed page, is registered, a fill
-// or copy is a list in the async queue (sgxd_chain_submit) and returns at once: it runs once
-// the lists before it have, the kernel's ISR takes each TWOD_COMPLETE, writes the SLC back and
-// empties it, then counts it in events->twod. sgxd_ptla_fence() is the count the last op
-// completes at; the list's own end is a chain fence like a render's. Synchronous submissions
-// (the maps, the resets) wait for both first through sgxd_gpu_idle(). Returns 0, or
-// sgxdEvents's error (the ops stay synchronous). NULL waits for the last op and gives the
-// interrupt back.
-int sgxd_ptla_events(SgxdEvents *events);
+// The async path: events, the app's zeroed page, registered (sgxdEvents) and sgxd's microkernel
+// (sgxd_mkq.h) started at GPU address mk_va (SGXD_MKQ_SPACE), which runs the async lists from
+// then on: the recipes' kicks leave core 0's event program alone (sgxd_recipe_events_owned) until
+// the page goes. A fill or copy is then a list in the async queue (sgxd_chain_submit) and returns
+// at once: it runs once the lists before it have, and the microkernel counts its completion.
+// sgxd_ptla_fence() is the count the last op completes at; the list's own end is a chain fence
+// like a render's. Synchronous submissions (the maps, the resets) wait for both first through
+// sgxd_gpu_idle(). Returns 0, or -1 with failed filled (the ops stay synchronous). NULL waits for
+// the last op, stops the microkernel and gives the interrupt back.
+int sgxd_ptla_events(SgxdEvents *events, uint32_t mk_va, char *failed, unsigned failed_size);
 uint32_t sgxd_ptla_fence(void);
 // Whether the op that returned `fence` has completed (always, without events). Any thread.
 int sgxd_ptla_reached(uint32_t fence);
@@ -86,20 +88,45 @@ int sgxd_ptla_reached(uint32_t fence);
 int sgxd_ptla_idle(void);
 const volatile SgxdEvents *sgxd_ptla_page(void);
 
-// Async lists (sgxdSubmitAsync), queued in the kernel and run in order from IRQ 52: each ends
-// in one SGXD_SIGNAL_DONE (and one SGXD_SIGNAL_TA before it). The fence is the count of lists
-// sent; chain_ta_reached is for the same fence, the list's vertices read. A full queue spins
-// until the GPU has made room (a second at most).
+// Async lists, run in order by the microkernel (sgxd_mkq_submit): each ends in one
+// SGXD_SIGNAL_DONE (and one SGXD_SIGNAL_TA before it), at most SGXD_MAX_CHAIN_OPS ops. The fence
+// is the count of lists sent; chain_ta_reached is for the same fence, the list's vertices read.
+// A full job ring spins until the GPU has made room (a second at most). AZAHAR_ERR_STATE without
+// sgxd_ptla_events.
 int sgxd_chain_submit(const SgxdOp *ops, unsigned count);
+// The same with the variable marks (sgxd_mk_compile: WRITEs whose values change from send to
+// send) and the sender's kept code (sgxd_mkq_submit); either may be NULL.
+int sgxd_chain_submit_vars(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                           SgxdMkqCode *code);
+// The lists completed (the SGXD_SIGNAL_DONE count), the PTLA ops completed and the queue's
+// fault (0, or 1 + the op it stopped at): the microkernel's state words.
+uint32_t sgxd_chain_done(void);
+uint32_t sgxd_ptla_done(void);
+uint32_t sgxd_chain_faulted(void);
+// The waker (sgxdWaker): sets bits of the app's event flag once the GPU reaches the counts
+// sgxd_wake_arm gave (a render list fence, a PTLA fence): the microkernel's SW_EVENT. Arm before
+// a wait on the flag: 0 when the counts are reached already (no wait), 1 when armed. Disarm
+// after it, woken or not; a flag set after the disarm only ends the next wait early. wakes
+// counts the flags set.
+int sgxd_ptla_waker(int32_t flag, uint32_t bits);
+int sgxd_wake_arm(uint32_t chains, uint32_t twod);
+void sgxd_wake_disarm(void);
+uint32_t sgxd_wake_count(void);
 // The queued op at the kernel's queue position pos (31 bits, as sgxdSubmitAsync's stop returns
 // it less one), and how many ops from the queue's end it is; NULL once the queue has moved past
 // it by a whole ring.
 const SgxdOp *sgxd_chain_op(uint32_t pos, uint32_t *behind);
+#ifdef VITA_DIAGNOSTICS
+// The app's sgxd syscalls counted (perflog; diagnostics builds only): synchronous lists
+// (sgxdSubmit) and sgxdKick.
+extern uint32_t sgxd_sync_submits, sgxd_kicks;
+#endif
 uint32_t sgxd_chain_fence(void);
 int sgxd_chain_reached(uint32_t fence);
 int sgxd_chain_ta_reached(uint32_t fence);
 // Spins until the list that returned fence (the count after it) has completed. Returns 0, or -1
-// on a fault or after sgxd_chain_stall_us in which no list completed.
+// on a fault or after sgxd_chain_stall_us in which no list completed. The spins time out on the
+// calling thread's cycle counter (azaharCycles): azaharCycleCounter must have run for the process.
 int sgxd_chain_wait(uint32_t fence);
 extern const uint32_t sgxd_chain_stall_us;
 // Spins until the last list queued completed, as sgxd_chain_wait.

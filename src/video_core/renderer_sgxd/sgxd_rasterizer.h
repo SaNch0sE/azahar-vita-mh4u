@@ -182,6 +182,11 @@ public:
     bool InterruptPoll(u64 fence) override;
     void InterruptWait(u64 fence) override;
     void InterruptKick(u64 fence);
+    /// The render thread's sleep until the fence's work (SgxdBackend::InterruptArm).
+    [[nodiscard]] bool InterruptArm(u64 fence);
+    void InterruptDisarm();
+    void InterruptWaker(s32 flag, u32 bits);
+#ifdef VITA_DIAGNOSTICS
     u64 GpuWaitUs() const override;
 #endif
     std::vector<std::pair<PAddr, u32>> TakeCachedReads() override;

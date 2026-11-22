@@ -14,6 +14,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/named_thread.h"
+#include "common/process_clock.h"
 #include "core/memory.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
@@ -54,6 +55,7 @@ constexpr u32 SurfacesSize = 8u << 20;
 // texture's bytes: a game's open pass read 42 textures in 14 MiB.
 constexpr u32 TexturesVa = SurfacesVa + SurfacesSize;
 constexpr u32 TexturesSize = 40u << 20;
+constexpr u32 MicrokernelVa = 0x00400000;
 constexpr u32 Pages = 418;
 constexpr u32 MaxIndices = SGXD_RECIPE_MAX_INDICES;
 // The code heap follows each layout. It must stay within DOUTU's reach of CV and CF (EXE, 20
@@ -140,10 +142,29 @@ SgxdBackend::SgxdBackend() {
     // A layout only has to hold MaxDraws valid draws; each pass writes its own.
     init_draws.assign(MaxDraws, SgxdRecipeDraw{0, 3, SGXD_RECIPE_ISP_NEVER, SGXD_R_FPRIM, 0, 0,
                                                nullptr});
-    // frames a second against 230 polled. A render's TA done, 3D kick and
-    // 3D done run from IRQ 52 as well, as async lists, a pass's TA over the 3D before.
-    const int irq = sgxd_ptla_events(&events);
-    ASSERT_MSG(irq == 0, "sgxd: no PTLA completion interrupt ({:#010x})", static_cast<u32>(irq));
+    // The previous backend ran programs at these addresses and the PDS keeps running a program at
+    // an address it has run (docs/sgxd/pds.md): start from the wrap reset with every unit reset.
+    {
+        const int idle = sgxd_gpu_idle();
+        ASSERT_MSG(idle == 0, "sgxd: the GPU did not go idle for the backend's start");
+        const int reset = sgxdResetAll();
+        ASSERT_MSG(reset == 0, "sgxd: the GPU's reset at the backend's start failed ({:#010x})",
+                   static_cast<u32>(reset));
+        // The reset cleared what the take's init script set: it runs again, as Sony's driver's
+        // does.
+        char again[160] = "";
+        const int set_up = sgxd_session_reinit(again, sizeof(again));
+        ASSERT_MSG(set_up == 0, "sgxd: the GPU not set up again after its reset: {}", again);
+        sgxd_recipe_pb_rewrite();
+        LOG_INFO(Render, "sgxd: every unit of the GPU reset: the backend's start");
+    }
+    {
+        const int slc = sgxd_slc_invalidate();
+        ASSERT_MSG(slc == 0, "sgxd: the SLC not emptied at the backend's start");
+    }
+    char failed[160] = "";
+    const int started = sgxd_ptla_events(&events, MicrokernelVa, failed, sizeof(failed));
+    ASSERT_MSG(started == 0, "sgxd: {}", failed);
     // sgxd_gpu_idle (a block mapped or freed) completes the pending 3D first.
     drain_owner = this;
     sgxd_set_render_drain([] {
@@ -189,38 +210,19 @@ bool SgxdBackend::RenderTaReached(u32 fence) const {
     return sgxd_chain_ta_reached(fence) != 0;
 }
 
-void SgxdBackend::TraceStamps() {
-#ifdef VITA_DIAGNOSTICS
-    // tracelog: the lists' GPU stamps since the last call, from the kernel's log (the oldest
-    // lost when more than the log holds ran in between).
-    static constexpr const char* tags[4] = {"gpu_ta", "gpu_ta_end", "gpu_3d", "gpu_3d_end"};
-    static u32 traced;
-    const volatile SgxdEvents* ev = sgxd_ptla_page();
-    if (!ev) {
-        return;
-    }
-    const u32 stamps = ev->stamps;
-    std::atomic_thread_fence(std::memory_order_acquire);
-    if (stamps - traced > SGXD_STAMP_LOG) {
-        traced = stamps - SGXD_STAMP_LOG;
-    }
-    for (; traced != stamps; traced++) {
-        const volatile u32* entry = ev->stamp_log[traced % SGXD_STAMP_LOG];
-        GxmTrace(tags[entry[1] & 3], entry[0]);
-    }
-#endif
-}
-
 void SgxdBackend::RenderIdle(const char* why) {
     [[maybe_unused]] const u64 before = WaitMark();
     FinishPending(FinishWhy::Idle);
     if (sgxd_chain_idle() == 0) {
-        TraceStamps();
         WaitSite(why, before);
         RetireReached();
         return;
     }
-    char failed[200];
+    Stopped(why);
+}
+
+void SgxdBackend::Stopped(const char* why) {
+    char failed[8192];
     sgxd_session_render_async_failed(failed, sizeof(failed));
     LOG_CRITICAL(Render, "sgxd: the async render before {} stopped", why);
     Fault(*current, failed);
@@ -243,12 +245,11 @@ void SgxdBackend::RenderWait(u32 fence, const char* why) {
     }
     [[maybe_unused]] const u64 before = WaitMark();
     if (sgxd_chain_wait(fence) == 0) {
-        TraceStamps();
         WaitSite(why, before);
         RetireReached();
         return;
     }
-    char failed[200];
+    char failed[8192];
     sgxd_session_render_async_failed(failed, sizeof(failed));
     LOG_CRITICAL(Render, "sgxd: the async render before {} stopped", why);
     Fault(*current, failed);
@@ -334,7 +335,6 @@ bool SgxdBackend::InterruptPoll(const InterruptFence& fence) {
         return false;
     }
     // The CPU's part of the work (a DMA's cache lines) before the guest hears of it.
-    TraceStamps();
     RetireReached();
     return true;
 }
@@ -343,6 +343,23 @@ void SgxdBackend::InterruptKick(const InterruptFence& fence) {
     if (static_cast<s32>(fence.render - sgxd_chain_fence()) > 0 && sgxd_session_pending()) {
         FinishPending(FinishWhy::Kick);
     }
+}
+
+bool SgxdBackend::InterruptArm(const InterruptFence& fence) {
+    u32 render = fence.render;
+    if (static_cast<s32>(fence.render - sgxd_chain_fence()) > 0 && sgxd_session_pending()) {
+        render = sgxd_chain_fence();
+    }
+    return sgxd_wake_arm(render, fence.ptla) != 0;
+}
+
+void SgxdBackend::InterruptDisarm() {
+    sgxd_wake_disarm();
+}
+
+void SgxdBackend::InterruptWaker(s32 flag, u32 bits) {
+    const int r = sgxd_ptla_waker(flag, bits);
+    ASSERT_MSG(flag < 0 || r == 0, "sgxd: sgxdWaker {:#010x}", static_cast<u32>(r));
 }
 
 void SgxdBackend::InterruptWait(const InterruptFence& fence) {
@@ -364,8 +381,11 @@ bool SgxdBackend::PtlaReached(u32 fence) const {
 
 SgxdBackend::~SgxdBackend() {
     RenderIdle("the backend's end");
+    // The lists kept for this backend's recipes: the next backend makes its own at their addresses.
+    sgxd_session_forget(nullptr);
     sgxd_set_render_drain(nullptr);
-    sgxd_ptla_events(nullptr);
+    char failed[16];
+    sgxd_ptla_events(nullptr, 0, failed, sizeof(failed));
     for (const auto& r : recipes) {
         FreeBlock(r->memory, r->va, r->size, r->block);
     }
@@ -416,7 +436,9 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     DEBUG_ASSERT_MSG(init == 0, "sgxd: the recipe does not take a {}x{} target", width, height);
     r.bg_offset = AlignUp(r.recipe.offset[SGXD_R_END], 0x1000);
     r.code_begin = r.bg_offset + 0x1000;
-    r.size = AlignUp(r.code_begin + CodeSize, 1u << 20);
+    // The block in CDRAM's 256 KiB unit, its base on the 1 MiB boundary a recipe wants: a 1 MiB
+    // block left a game's 13th recipe no CDRAM beside the microkernel's.
+    r.size = AlignUp(r.code_begin + CodeSize, 256u << 10);
     DEBUG_ASSERT_MSG(r.code_begin + CodeSize - r.recipe.offset[SGXD_R_CV] <= (0xfffffu << 3),
                      "sgxd: the code heap is past DOUTU's reach of CV");
     // A program's DOUTU holds its distance from CV or CF, the same under every recipe only if
@@ -434,7 +456,7 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     DEBUG_ASSERT_MSG(r.va + r.size <= RecipesEnd, "sgxd: no GPU space for a {}x{} recipe",
                      width, height);
     r.memory = MapBlock("azahar-sgxd-recipe", r.va, r.size, r.block);
-    next_va = r.va + r.size;
+    next_va = AlignUp(r.va + r.size, 1u << 20);
 
     sgxd_recipe_write(&r.recipe, r.memory);
     // The arrays go with the recipe: only the indices are read again.
@@ -783,13 +805,8 @@ void SgxdBackend::FlipPdsHalf() {
     // at an address it has run (docs/sgxd/pds.md): the GPU idles and the cores are reset
     // (ResetCores).
     FinishPending(FinishWhy::PdsFlip);
-    const std::array<SgxdOp, 4> reset{{{SGXD_OP_WRITE, 0x0080, 0x000c8d00, 0, 0},
-                                       {SGXD_OP_WRITE, 0x0080, 0, 0, 0},
-                                       {SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0, 0},
-                                       {SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0, 0}}};
-    [[maybe_unused]] const int pulsed = sgxd_chain_submit(reset.data(), 4);
-    DEBUG_ASSERT_MSG(pulsed == 0, "sgxd: the PDS reset for the arena's flip was not queued ({:#x})",
-                     static_cast<u32>(pulsed));
+    RenderIdle("the PDS arena's flip");
+    ResetCores("the PDS arena's flip");
 #ifdef VITA_DIAGNOSTICS
     if (SgxdFlag("perflog")) {
         LOG_INFO(Render, "sgxd: PDS arena flip {} to window 0, the GPU idled and reset ({} lists sent)",
@@ -1225,6 +1242,11 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
         } else if (Vprof::FrameSync()) {
             Vprof::PassTimes(passes, render.ta_us, render.d3_us);
         }
+#ifdef VITA_DIAGNOSTICS
+        if (sync_passes && SgxdFlag("perflog")) {
+            TargetTimes(r.width, r.height, render.ta_us, render.d3_us);
+        }
+#endif
         if (ta_us) {
             *ta_us = render.ta_us;
         }
@@ -1319,22 +1341,12 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
     TargetTime& t = target_times[key];
     t.passes++;
     t.draws += draw_count;
-    // This list's TA is the next pass's to report; the one ended before is this call's.
-    if (ended_targets[0] != 0) {
-        target_times[ended_targets[0]].ta_us += ta_us;
+    t.ta_us += ta_us;
+    t.d3_us += d3_us;
+    if (d3_us > 8000 && slow_passes++ < 48) {
+        LOG_INFO(Render, "perf: slow pass: target {:#010x} {}x{}, 3D {:.1f} ms:{}", pass_target.lo,
+                 width, height, d3_us / 1000.0, pass_note);
     }
-    if (ended_targets[1] != 0) {
-        target_times[ended_targets[1]].d3_us += d3_us;
-        if (d3_us > 8000 && slow_passes++ < 48) {
-            LOG_INFO(Render, "perf: slow pass: target {:#010x} {}x{}, 3D {:.1f} ms:{}",
-                     static_cast<u32>(ended_targets[1] >> 32),
-                     static_cast<u32>(ended_targets[1] >> 16) & 0xffff,
-                     static_cast<u32>(ended_targets[1]) & 0xffff, d3_us / 1000.0, ended_notes[1]);
-        }
-    }
-    ended_targets = {key, ended_targets[0]};
-    ended_notes[1] = std::move(ended_notes[0]);
-    ended_notes[0] = std::move(pass_note);
     pass_note.clear();
     const u64 now = sceKernelGetProcessTimeWide();
     if (target_times_start == 0) {
@@ -1365,6 +1377,18 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
         LOG_INFO(Render, "perf: GPU waits by site: elsewhere {:.1f} ms{}",
                  (total - wait_sites_mark - sited) / 1000.0, line);
     }
+    sync_mark = sgxd_sync_submits;
+    kick_mark = sgxd_kicks;
+    static u32 stream_draws_mark, stream_renders_mark;
+    LOG_INFO(Render, "perf: stream-out {} draws in {} renders",
+             stream_draws_sent - stream_draws_mark, stream_renders_sent - stream_renders_mark);
+    stream_draws_mark = stream_draws_sent;
+    stream_renders_mark = stream_renders_sent;
+    LOG_INFO(Render,
+             "perf: microkernel {} shapes ({} instructions), {} flips, {} jobs, {} SW_EVENT "
+             "interrupts, {} IRQ 52 in all",
+             sgxd_mkq_compiles, sgxd_mkq_instructions, sgxd_mkq_flips, sgxd_mkq_jobs_sent(),
+             events.sw_events, events.irqs);
     wait_sites.clear();
     wait_sites_mark = total;
 }
@@ -1527,6 +1551,32 @@ void SgxdBackend::WriteCode() {
         std::fclose(f);
         LOG_CRITICAL(Render, "sgxd: {} USSE programs ({} KiB of code) written to host0",
                      placed_code.size(), code_used >> 10);
+    }
+    if (sgxd_mkq_state()) {
+        u32 instructions = 0;
+        const volatile u64* code = sgxd_mkq_code(&instructions);
+        u32 words = 0;
+        const volatile u32* memory = sgxd_mkq_memory(&words);
+        if (std::FILE* f = std::fopen("host0:azahar-sgxd-mk-state.bin", "wb")) {
+            for (u32 n = 0; n < words; n++) {
+                const u32 word = memory[n];
+                std::fwrite(&word, 4, 1, f);
+            }
+            std::fclose(f);
+        }
+        if (std::FILE* f = std::fopen("host0:azahar-sgxd-mk.bin", "wb")) {
+            for (u32 n = 0; n < SGXD_MK_STATE_WORDS; n++) {
+                const u32 word = sgxd_mkq_state()[n];
+                std::fwrite(&word, 4, 1, f);
+            }
+            for (u32 n = 0; n < instructions; n++) {
+                const u64 word = code[n];
+                std::fwrite(&word, 8, 1, f);
+            }
+            std::fclose(f);
+        }
+        LOG_CRITICAL(Render, "sgxd: the microkernel's state and {} instructions written to host0",
+                     instructions);
     }
 }
 #endif

@@ -13,6 +13,7 @@
 #include <mutex>
 #include "common/common_types.h"
 #include "common/named_thread.h"
+#include "common/process_clock.h"
 #include "common/thread.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/rasterizer_interface.h"
@@ -40,9 +41,11 @@ class RendererSgxd;
  *
  * Interrupts: a GPU interrupt is a ticket (InterruptFence). The thread takes the rasterizer's
  * fence for it when it reaches the ticket's record, polls it, and publishes the tickets whose
- * work is done (InterruptPoll reads that, any thread). A GPU that completes nothing for
- * sgxd_chain_stall_us while a ticket waits gets the backend's blocking wait, which stops the
- * emulator with its post-mortem, as sgxd's own waits do.
+ * work is done (InterruptPoll reads that, any thread). While tickets wait it sleeps until sgxd
+ * wakes it for the oldest one's fence (InterruptArm, sgxdWaker): a timed poll every 100 us
+ * would cost a third of its CPU time in sceKernelWaitLwCond. A GPU
+ * that completes nothing for sgxd_chain_stall_us while a ticket waits gets the backend's blocking
+ * wait, which stops the emulator with its post-mortem, as sgxd's own waits do.
  *
  * Every producer holds the GPU's lock (VideoCore::GPU::Lock): the state records read the
  * emulation side's PICA, and the ring has one writer at a time.
@@ -135,16 +138,35 @@ public:
         return rasterizer;
     }
 
-    /// Since the last call (`perflog`): the records the thread ran by kind, its time running
-    /// them and waiting for work (us), the waits a fence poll ended, the presents, and the
-    /// holds with their waits for the thread to drain and park (us). Timed by batch, not by
-    /// record: a clock read is a syscall.
+    /// The emulation side's waits for the thread, by kind: an interrupt ticket's work, ring
+    /// space, a RunSync (a hold's park is apart: Stats::holds).
+    enum EmuWait : u32 { EmuTicket, EmuSpace, EmuSync, EmuWaits };
+
+    /// perflog's GPU sampler cells (Stats::gpu_at): sgxd_mkq's job kinds and wait kinds
+    /// (SGXD_MKQ_KINDS, SGXD_MKQ_WAITS), each twice (a 3D's end latched or not), after idle and
+    /// a held 3D running or done.
+    static constexpr u32 GpuAtKinds = 5;
+    static constexpr u32 GpuAtWaits = 5;
+    static constexpr u32 GpuAtIdle = 0;
+    static constexpr u32 GpuAtHeldRunning = 1;
+    static constexpr u32 GpuAtHeldDone = 2;
+    static constexpr u32 GpuAtBusy = 3;
+    static constexpr u32 GpuAtCells = GpuAtBusy + GpuAtKinds * GpuAtWaits * 2;
+
+    /// Since the last call (`perflog`; diagnostics builds only, as every counter behind it):
+    /// the records the thread ran by kind, its time running them and waiting for work (us),
+    /// sgxd's wakes for a ticket's GPU work and the sleeps with tickets pending that timed out
+    /// instead, the presents, and the holds with their waits for the thread to drain and park
+    /// (us). Timed by batch, not by record. The emulation side's waits by EmuWait: the waits
+    /// that did not return at once, their time (us), and their sleeps on `done` with those that
+    /// ended at the 1 ms timeout rather than a wake.
     struct Stats {
         enum Kind : u32 { State, Draw, Fill, Transfer, Dma, Present, Other, Count };
         std::array<u32, Count> records;
         u64 busy_us;
         u64 idle_us;
-        u32 poll_wakes;
+        u32 gpu_wakes;
+        u32 timeouts;
         u32 presents;
         u32 presents_dropped;
         u32 holds;
@@ -214,6 +236,9 @@ private:
     void Loop();
 
     void NotifyDone();
+    /// The thread's sleep on `wake_flag`, at most `timeout`: false on the timeout. Wake sets it.
+    bool Sleep(std::chrono::microseconds timeout);
+    void Wake();
 
     Pica::PicaCore& pica;
     Pica::PicaCore& render_pica;
@@ -234,8 +259,13 @@ private:
     u32 tickets{};                  ///< the last ticket handed out (GPU's lock)
     std::atomic<u32> reached{};     ///< the last ticket whose work is done
 
-    /// The thread waits on `work` for records, a hold or the end; everyone else on `done`.
+    /// The thread's state (a hold, the end) is under `work`. It sleeps on `wake_flag`, an event
+    /// flag set for records (Commit sees `sleeping`), a hold or the end, and by sgxd when the GPU
+    /// has done the oldest pending ticket's work (sgxdWaker, from IRQ 52): no timed polls. A
+    /// hold's park waits on `work`; everyone else waits on `done`.
     Common::CoreCondition work;
+    s32 wake_flag{-1};
+    static constexpr u32 WakeBit = 1;
     Common::CoreCondition done;
     std::atomic<bool> sleeping{};
     std::atomic<u32> done_waiters{};
@@ -250,14 +280,10 @@ private:
     std::atomic<s32> holder{-1};
     /// The thread that writes the ring (the emulation thread): HLE threads may wait, never queue.
     const s32 producer;
-    /// How long the thread sleeps between fence polls, with tickets pending and no records:
-    /// the longest an interrupt waits past its work.
-    static constexpr std::chrono::microseconds poll_interval{100};
-
-    std::chrono::steady_clock::time_point last_present{};
+    Common::ProcessClock::time_point last_present{};
     /// The window's input at least this often while the thread runs, so the PS button answers.
     static constexpr std::chrono::milliseconds WindowPollInterval{16};
-    std::chrono::steady_clock::time_point last_window_poll{};
+    Common::ProcessClock::time_point last_window_poll{};
     /// The newest present record's position: one with a newer one queued behind it is dropped.
     std::atomic<u32> newest_present{};
 
@@ -272,7 +298,8 @@ private:
     std::array<std::atomic<u32>, Stats::Count> records{};
     std::atomic<u64> busy_us{};
     std::atomic<u64> idle_us{};
-    std::atomic<u32> poll_wakes{};
+    std::atomic<u32> timeouts{};
+    u32 gpu_wakes_mark{};
     std::atomic<u32> presents{};
     std::atomic<u32> presents_dropped{};
     std::atomic<u32> holds{};

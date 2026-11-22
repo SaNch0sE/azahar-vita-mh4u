@@ -475,11 +475,12 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const auto& t = render_counters.thread;
                     using K = SgxdRenderer::RenderThread::Stats;
                     LOG_INFO(Frontend,
-                             "perf: render thread busy {:.1f} ms, idle {:.1f} ms ({} fence "
-                             "polls), GPU waits {:.1f} ms; records: state {}, draw {}, fill {}, "
+                             "perf: render thread busy {:.1f} ms, idle {:.1f} ms ({} GPU wakes, "
+                             "{} timed out), GPU waits {:.1f} ms; records: state {}, draw {}, "
+                             "fill {}, "
                              "transfer {}, dma {}, present {}, other {}; present {} ({} "
                              "dropped); holds {} waiting {:.1f} ms",
-                             t.busy_us / 1e3, t.idle_us / 1e3, t.poll_wakes,
+                             t.busy_us / 1e3, t.idle_us / 1e3, t.gpu_wakes, t.timeouts,
                              render_counters.gpu_wait_us / 1e3,
                              t.records[K::State], t.records[K::Draw], t.records[K::Fill],
                              t.records[K::Transfer], t.records[K::Dma], t.records[K::Present],
@@ -719,6 +720,11 @@ std::string LoadAzaharNative(bool relaunched) {
                                    static_cast<u32>(cycles));
             }
             return {};
+        }
+        // sgxd's spins time out on the calling thread's cycle counter (azaharCycles): every
+        // thread of this process may read it, those that exist now and those created later.
+        if (const int cycles = azaharCycleCounter(); cycles < 0) {
+            return fmt::format("azaharCycleCounter failed ({:#010x}).", static_cast<u32>(cycles));
         }
         return {};
     }

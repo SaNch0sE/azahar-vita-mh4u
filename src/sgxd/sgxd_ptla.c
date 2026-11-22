@@ -8,8 +8,11 @@
 #include <stdio.h>
 
 #include <psp2/kernel/processmgr.h>
+#include <psp2/power.h>
 
 #include "sgxd.h"
+#include "sgxd_mkq.h"
+#include "sgxd_recipe.h"
 
 #define W(r, v) {SGXD_OP_WRITE, (r), (v), 0, 0}
 #define P(r, m, v, t) {SGXD_OP_POLL, (r), (v), (m), (t)}
@@ -22,6 +25,11 @@
 #define SLC_EVENT_CLEAR 0x4d14u
 #define SLC_CTRL_INVAL 0x4d28u
 #define SLC_CTRL_FLUSH 0x4d2cu
+// MASTER_CLKGATECTL2: the start sequence's 0x2a9 with the 2D clock (bits 8-9) on, 1, as Sony's
+// PTLA kick sets it before the command words; its completion puts it back to auto, 2 (sgxd's
+// microkernel runtime). Nothing else writes it.
+#define CLKGATECTL2 0x4020u
+#define CLKGATECTL2_2D_ON 0x1a9u
 
 #define SRCOFF 0x10000000u
 #define SRC_SURF 0x40000000u
@@ -37,6 +45,11 @@
 // sgxd_chain_wait's limit: no list completed in this long is a stopped GPU.
 const uint32_t sgxd_chain_stall_us = TWOD_POLL_US;
 
+// The spins count the calling thread's own cycles (azaharCycles; no syscall a turn). A thread's
+// cycles stop while it is not running, so a timeout can only come later than the wall clock's.
+// The ARM clock in MHz, read when the events page is registered.
+static uint32_t cycles_per_us;
+
 // sgxd_ptla_events: the ISR's page, and the completions asked for so far (one a FLUSH).
 static const volatile SgxdEvents *events;
 static uint32_t twod_sent;
@@ -45,6 +58,31 @@ static uint32_t twod_sent;
 static uint32_t chains_sent;
 static SgxdOp chain_mirror[SGXD_CHAIN_RING];
 static uint32_t chain_mirror_end;
+// The queue's ring (sgxdQueue): lists are written here and published through the events page's
+// queue_end, which only this side writes; the kernel copies each op out as it runs it, and a
+// list costs a syscall only when the queue had gone idle (sgxdKick).
+static SgxdOp *ring;
+static volatile uint32_t *queue_end;
+// The waker's fields of the events page (sgxd_wake_arm), which this side writes.
+static volatile SgxdEvents *wake_page;
+// sgxd_chain_microkernel: the microkernel's state block, whose counts, fault and waker words
+// stand for the events page's; NULL while IRQ 52's handler runs the lists.
+static volatile uint32_t *mk;
+
+static inline uint32_t twod_done(void) {
+    return mk[SGXD_MK_TWOD];
+}
+static inline uint32_t chains_done(void) {
+    return mk[SGXD_MK_CHAINS];
+}
+static inline uint32_t chain_fault(void) {
+    return mk[SGXD_MK_FAULT];
+}
+
+#ifdef VITA_DIAGNOSTICS
+// The app's sgxd syscalls counted (perflog): synchronous lists and kicks.
+uint32_t sgxd_sync_submits, sgxd_kicks;
+#endif
 
 int sgxd_ptla_idle(void);
 
@@ -70,19 +108,48 @@ uint32_t sgxd_wait_us_take(void) {
 }
 #endif
 
-int sgxd_ptla_events(SgxdEvents *page) {
+int sgxd_ptla_events(SgxdEvents *page, uint32_t mk_va, char *failed, unsigned failed_size) {
     if (!page) {
         sgxd_gpu_idle();
+        if (mk) {
+            sgxd_mkq_stop();
+        }
         events = NULL;
+        mk = NULL;
+        sgxd_recipe_events_owned = 0;
         return sgxdEvents(NULL);
     }
-    const int r = sgxdEvents(page);
-    if (r == 0) {
-        events = page;
-        twod_sent = page->twod;
-        chains_sent = page->chains;
+    // The spins' clock must run: a stopped cycle counter would make a stopped GPU a hang
+    // rather than a fault.
+    const uint32_t c0 = azaharCyclesStart();
+    for (volatile uint32_t i = 0; i < 1000; i++) {
     }
-    return r;
+    if (azaharCycles() == c0) {
+        snprintf(failed, failed_size, "this thread's cycle counter does not run");
+        return -1;
+    }
+    if (events || sgxd_gpu_idle() < 0) {
+        snprintf(failed, failed_size, events ? "the events page is registered already"
+                                             : "the GPU did not go idle");
+        return -1;
+    }
+    const int r = sgxdEvents(page);
+    if (r < 0) {
+        snprintf(failed, failed_size, "no GPU interrupt: sgxdEvents 0x%08x", (unsigned)r);
+        return -1;
+    }
+    if (sgxd_mkq_start(mk_va, failed, failed_size) < 0) {
+        sgxdEvents(NULL);
+        return -1;
+    }
+    cycles_per_us = (uint32_t)scePowerGetArmClockFrequency();
+    events = page;
+    mk = sgxd_mkq_state();
+    twod_sent = 0;
+    chains_sent = 0;
+    // The recipes' kicks leave core 0's event program on it, and their SLC requests are Sony's.
+    sgxd_recipe_events_owned = 1;
+    return 0;
 }
 
 const volatile SgxdEvents *sgxd_ptla_page(void) {
@@ -94,40 +161,74 @@ uint32_t sgxd_ptla_fence(void) {
 }
 
 int sgxd_ptla_reached(uint32_t fence) {
-    return !events || (int32_t)(events->twod - fence) >= 0;
+    return !events || (int32_t)(twod_done() - fence) >= 0;
+}
+
+uint32_t sgxd_chain_done(void) {
+    return events ? chains_done() : chains_sent;
+}
+
+uint32_t sgxd_ptla_done(void) {
+    return events ? twod_done() : twod_sent;
+}
+
+uint32_t sgxd_chain_faulted(void) {
+    return events ? chain_fault() : 0;
 }
 
 int sgxd_ptla_idle(void) {
     if (!events || sgxd_ptla_reached(twod_sent)) {
         return 0;
     }
-    const SceUInt64 start = sceKernelGetProcessTimeWide();
+    const uint32_t start = azaharCyclesStart();
+    const uint32_t limit = TWOD_POLL_US * cycles_per_us;
     while (!sgxd_ptla_reached(twod_sent)) {
-        if (sceKernelGetProcessTimeWide() - start > TWOD_POLL_US) {
+        if (azaharCycles() - start > limit) {
             return -1;
         }
     }
 #ifdef VITA_DIAGNOSTICS
-    sgxd_wait_us_add((uint32_t)(sceKernelGetProcessTimeWide() - start));
+    sgxd_wait_us_add((azaharCycles() - start) / cycles_per_us);
 #endif
     return 0;
 }
 
 int sgxd_chain_submit(const SgxdOp *ops, unsigned count) {
-    // The queue's room comes back as the GPU runs the lists before: a full queue is the GPU a
-    // whole queue behind.
-    int r = sgxdSubmitAsync(ops, count);
-    if (r == AZAHAR_ERR_FULL) {
-        const SceUInt64 start = sceKernelGetProcessTimeWide();
-        while (r == AZAHAR_ERR_FULL && sceKernelGetProcessTimeWide() - start <= TWOD_POLL_US) {
-            r = sgxdSubmitAsync(ops, count);
+    return sgxd_chain_submit_vars(ops, count, NULL, NULL);
+}
+
+int sgxd_chain_submit_vars(const SgxdOp *ops, unsigned count, const uint8_t *variable,
+                           SgxdMkqCode *code) {
+    if (count == 0 || count > SGXD_MAX_CHAIN_OPS) {
+        return AZAHAR_ERR_ARG;
+    }
+    if (!events) {
+        return AZAHAR_ERR_STATE;
+    }
+    const int r = sgxd_mkq_submit(ops, count, variable, code);
+    if (r == 0) {
+        chains_sent++;
+    }
+    // The ring's room comes back as the GPU runs the lists before: a full ring is the GPU a
+    // whole ring behind.
+    const uint32_t end = chain_end;
+    if (end + count - events->queue_pos > SGXD_CHAIN_RING) {
+        const uint32_t start = azaharCyclesStart();
+        const uint32_t limit = TWOD_POLL_US * cycles_per_us;
+        while (end + count - events->queue_pos > SGXD_CHAIN_RING) {
+            if (events->chain_fault) {
+                return AZAHAR_ERR_STATE;
+            }
+            if (azaharCycles() - start > limit) {
+                return AZAHAR_ERR_FULL;
+            }
         }
 #ifdef VITA_DIAGNOSTICS
-        sgxd_wait_us_add((uint32_t)(sceKernelGetProcessTimeWide() - start));
+        sgxd_wait_us_add((azaharCycles() - start) / cycles_per_us);
 #endif
     }
-    if (r < 0) {
-        return r;
+    for (unsigned i = 0; i < count; i++) {
+        ring[(end + i) & (SGXD_CHAIN_RING - 1u)] = ops[i];
     }
     for (unsigned n = 0; n < count; n++) {
         chain_mirror[((uint32_t)r + n) & (SGXD_CHAIN_RING - 1u)] = ops[n];
@@ -135,6 +236,33 @@ int sgxd_chain_submit(const SgxdOp *ops, unsigned count) {
     chain_mirror_end = ((uint32_t)r + count) & 0x7fffffffu;
     chains_sent++;
     return 0;
+}
+
+int sgxd_ptla_waker(int32_t flag, uint32_t bits) {
+    return sgxdWaker(flag, bits);
+}
+
+int sgxd_wake_arm(uint32_t chains, uint32_t twod) {
+    // The targets before WAKE_ARMED, which the microkernel's check reads first (sgxd_mk.h);
+    // WAKE_ARMED before the counts are read again (the GPU moves a count, then reads it).
+    mk[SGXD_MK_WAKE_CHAINS] = chains;
+    mk[SGXD_MK_WAKE_TWOD] = twod;
+    __asm__ volatile("dmb" ::: "memory");
+    mk[SGXD_MK_WAKE_ARMED] = 1;
+    __asm__ volatile("dmb" ::: "memory");
+    if ((int32_t)(mk[SGXD_MK_CHAINS] - chains) >= 0 && (int32_t)(mk[SGXD_MK_TWOD] - twod) >= 0) {
+        mk[SGXD_MK_WAKE_ARMED] = 0;
+        return 0;
+    }
+    return 1;
+}
+
+void sgxd_wake_disarm(void) {
+    mk[SGXD_MK_WAKE_ARMED] = 0;
+}
+
+uint32_t sgxd_wake_count(void) {
+    return mk ? mk[SGXD_MK_WAKES] : wake_page ? wake_page->wakes : 0;
 }
 
 const SgxdOp *sgxd_chain_op(uint32_t pos, uint32_t *behind) {
@@ -151,11 +279,11 @@ uint32_t sgxd_chain_fence(void) {
 }
 
 int sgxd_chain_reached(uint32_t fence) {
-    return !events || (int32_t)(events->chains - fence) >= 0;
+    return !events || (int32_t)(chains_done() - fence) >= 0;
 }
 
 int sgxd_chain_ta_reached(uint32_t fence) {
-    return !events || (int32_t)(events->chain_ta - fence) >= 0;
+    return !events || (int32_t)(mk[SGXD_MK_CHAIN_TA] - fence) >= 0;
 }
 
 int sgxd_chain_wait(uint32_t fence) {
@@ -163,22 +291,26 @@ int sgxd_chain_wait(uint32_t fence) {
         return 0;
     }
     // A second with no list completed (sgxd_chain_stall_us) is a stopped GPU; a deep queue takes
-    // as long as it takes.
-    const SceUInt64 start = sceKernelGetProcessTimeWide();
-    SceUInt64 progress = start;
-    uint32_t done = events->chains;
+    // as long as it takes. The cycles since the last completion add up in 64 bits.
+    const uint32_t start = azaharCyclesStart();
+    const uint64_t stall = (uint64_t)sgxd_chain_stall_us * cycles_per_us;
+    uint32_t last = start;
+    uint64_t since_progress = 0;
+    uint32_t done = chains_done();
     while (!sgxd_chain_reached(fence)) {
-        const SceUInt64 now = sceKernelGetProcessTimeWide();
-        if (events->chains != done) {
-            done = events->chains;
-            progress = now;
+        const uint32_t now = azaharCycles();
+        since_progress += now - last;
+        last = now;
+        if (chains_done() != done) {
+            done = chains_done();
+            since_progress = 0;
         }
-        if (events->chain_fault || now - progress > sgxd_chain_stall_us) {
+        if (chain_fault() || since_progress > stall) {
             return -1;
         }
     }
 #ifdef VITA_DIAGNOSTICS
-    sgxd_wait_us_add((uint32_t)(sceKernelGetProcessTimeWide() - start));
+    sgxd_wait_us_add((azaharCycles() - start) / cycles_per_us);
 #endif
     return 0;
 }
@@ -193,9 +325,11 @@ void sgxd_set_render_drain(int (*drain)(void)) {
     render_drain = drain;
 }
 
-// A PTLA op's start: the ops before it and the last list done, the last list's 3D maybe not.
+// A synchronous list's start: the ops before it and the last list done, the last list's 3D maybe
+// not, and the microkernel's last run out of jobs (a synchronous list may reset the USE).
 static int ptla_ready(void) {
-    return sgxd_ptla_idle() == 0 && sgxd_chain_idle() == 0 ? 0 : -1;
+    return sgxd_ptla_idle() == 0 && sgxd_chain_idle() == 0 && (!mk || sgxd_mkq_idle() == 0) ? 0
+                                                                                           : -1;
 }
 
 int sgxd_gpu_idle(void) {
@@ -216,7 +350,8 @@ static uint32_t xy(uint32_t x, uint32_t y) {
 static unsigned slc(SgxdOp *ops) {
     const SgxdOp list[] = {
         W(SLC_CTRL_FLUSH, 0x10), P(SLC_EVENT_STATUS, 2, 2, 1000), W(SLC_EVENT_CLEAR, 2),
-        W(SLC_CTRL_INVAL, 1),    P(SLC_EVENT_STATUS, 1, 1, 1000), W(SLC_EVENT_CLEAR, 1),
+        W(SLC_CTRL_INVAL, 1), P(SLC_EVENT_STATUS, 1, 1, 1000),
+        W(SLC_EVENT_CLEAR, 1),
     };
     for (unsigned n = 0; n < sizeof(list) / sizeof(list[0]); n++) {
         ops[n] = list[n];
@@ -224,8 +359,8 @@ static unsigned slc(SgxdOp *ops) {
     return sizeof(list) / sizeof(list[0]);
 }
 
-// A blit list's end, after FLUSH, with events: the ISR clears TWOD_COMPLETE and counts it, so
-// the leading clear and the poll go; a blit before the last waits for the ISR's count, the last
+// A blit list's end, after FLUSH, with events: the microkernel clears TWOD_COMPLETE and counts
+// it, so the leading clear and the poll go; a blit before the last waits for that count, the last
 // returns. Returns the list's length.
 static unsigned completion(SgxdOp *ops, unsigned n, int last) {
     if (!events) {
@@ -243,6 +378,20 @@ static unsigned completion(SgxdOp *ops, unsigned n, int last) {
     return n;
 }
 
+// A blit's list into ops: with the microkernel, the 2D clock on after its leading clear (Sony's
+// PTLA kick). Returns its length.
+static unsigned kick(SgxdOp *ops, const SgxdOp *list, unsigned count) {
+    unsigned n = 0;
+    for (unsigned k = 0; k < count; k++) {
+        ops[n++] = list[k];
+        if (k == 0 && events) {
+            ops[n++] = (SgxdOp)W(CLKGATECTL2, CLKGATECTL2_2D_ON);
+        }
+    }
+    return n;
+}
+
+// One fill blit of w x h pixels at (x, y) of the surface, then FLUSH and the completion.
 static unsigned blit(SgxdOp *ops, const SgxdPtlaFill *f, uint32_t x, uint32_t y, uint32_t w,
                      uint32_t h, int last) {
     // Sony's own fill stream names the destination as the source too.
@@ -260,10 +409,7 @@ static unsigned blit(SgxdOp *ops, const SgxdPtlaFill *f, uint32_t x, uint32_t y,
         P(EVENT_STATUS, TWOD_COMPLETE, TWOD_COMPLETE, TWOD_POLL_US),
         W(EVENT_HOST_CLEAR, TWOD_COMPLETE),
     };
-    for (unsigned n = 0; n < sizeof(list) / sizeof(list[0]); n++) {
-        ops[n] = list[n];
-    }
-    return completion(ops, sizeof(list) / sizeof(list[0]), last);
+    return completion(ops, kick(ops, list, sizeof(list) / sizeof(list[0])), last);
 }
 
 // One copy blit of w x h pixels from (x, y) of the source to (x, y) of the destination, then
@@ -285,28 +431,33 @@ static unsigned copy_blit(SgxdOp *ops, const SgxdPtlaCopy *c, uint32_t x, uint32
         P(EVENT_STATUS, TWOD_COMPLETE, TWOD_COMPLETE, TWOD_POLL_US),
         W(EVENT_HOST_CLEAR, TWOD_COMPLETE),
     };
-    for (unsigned n = 0; n < sizeof(list) / sizeof(list[0]); n++) {
-        ops[n] = list[n];
-    }
-    return completion(ops, sizeof(list) / sizeof(list[0]), last);
+    return completion(ops, kick(ops, list, sizeof(list) / sizeof(list[0])), last);
 }
 
 // With events: the ops as a list in the async queue, behind the lists before it, ending once
-// its last blit has completed (the ISR's TWOD count) with one TA signal and one DONE, so the
-// lists' count stays the fence. Returns at once.
+// its last blit has completed (the microkernel's TWOD count) with one TA signal and one DONE, so
+// the lists' count stays the fence. Returns at once.
 static int submit_queued(SgxdOp *ops, unsigned n, const char *what, char *failed,
                          unsigned failed_size) {
+    ops[n++] = (SgxdOp){SGXD_OP_WAIT_TWOD, 0, twod_sent, 0, TWOD_POLL_US};
     const SgxdOp tail[] = {
-        {SGXD_OP_WAIT_TWOD, 0, twod_sent, 0, TWOD_POLL_US},
         {SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0, 0},
         {SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0, 0},
     };
     for (unsigned k = 0; k < sizeof(tail) / sizeof(tail[0]); k++) {
         ops[n++] = tail[k];
     }
-    const int r = sgxd_chain_submit(ops, n);
+    // The stream's words are the job's: one code a shape of fill or copy.
+    uint8_t variable[64];
+    for (unsigned k = 0; k < n; k++) {
+        variable[k] = ops[k].op == SGXD_OP_WRITE && ops[k].reg == PTLA_CMD;
+    }
+#ifdef VITA_DIAGNOSTICS
+    sgxd_mkq_kind_next = SGXD_MKQ_KIND_PTLA;
+#endif
+    const int r = sgxd_chain_submit_vars(ops, n, variable, NULL);
     if (r < 0) {
-        snprintf(failed, failed_size, "PTLA %s: sgxdSubmitAsync %08x", what, (unsigned)r);
+        snprintf(failed, failed_size, "PTLA %s: sgxd_chain_submit %08x", what, (unsigned)r);
         return -1;
     }
     return 0;
@@ -358,9 +509,10 @@ int sgxd_ptla_fill(const SgxdPtlaFill *f, uint32_t *elapsed_us, char *failed,
         return -1;
     }
     // With events the tail goes first: its wait is one row's, and the list ends with the big
-    // blit's completion.
+    // blit's completion; and no SLC request, as Sony's 2D makes none: the PTLA goes through the
+    // SLC as the TA and the 3D do.
     SgxdOp ops[64];
-    unsigned n = slc(ops);
+    unsigned n = events ? 0 : slc(ops);
     if (f->tail && events) {
         n += blit(ops + n, f, 0, f->rows, f->tail, 1, !f->rows);
     }
@@ -397,7 +549,7 @@ int sgxd_ptla_copy(const SgxdPtlaCopy *c, uint32_t *elapsed_us, char *failed,
         return -1;
     }
     SgxdOp ops[64];
-    unsigned n = slc(ops);
+    unsigned n = events ? 0 : slc(ops);
     if (c->tail && events) {
         n += copy_blit(ops + n, c, 0, c->rows, c->tail, 1, !c->rows);
     }

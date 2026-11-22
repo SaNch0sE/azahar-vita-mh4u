@@ -16,12 +16,9 @@ namespace GxmRenderer {
  *   perflog   log a second's `perf:` lines: speed and frame rates, the native core's slices
  *             (guest time, how they ended, the svcs answered in the guest and the ones that
  *             left it), the presents, the command lists, fills and transfers, the cache
- *             operations by site, the FCRAM pages moved to CDRAM, the textures' untiles; each
- *             PDS arena flip
-  *   parallel  emulated core 1 on a second emulation thread on Vita core 1, at the same time as
- *             core 0.
- *             Multicore builds only (ENABLE_VITA_MULTICORE); elsewhere it does nothing
-  *   rendercheck  before each draw the emulation side sends its whole PICA state and the render
+ *             operations by site, the FCRAM pages moved to CDRAM, the textures' untiles, sgxd's
+ *             microkernel (shapes, flips, jobs, interrupts); each PDS arena flip
+ *   rendercheck  before each draw the emulation side sends its whole PICA state and the render
  *             thread compares its copy with it, logging each register, uniform and table that
  *             differs (once each): a gap in the state the render thread is sent
  *   nolimit   no frame limit: the core runs as fast as it goes
@@ -72,7 +69,50 @@ namespace GxmRenderer {
  *             loads cost, in syncpasses' or a replay's pass times (the pictures are wrong)
  *   noviewkill  a viewport off the end of tile's store grid (StorePartFor) keeps no kill: its
  *             margin is drawn over and stored (wrong), for what the punch-through kill costs
- *   syncpasses every pass runs whole, TA then 3D, before EndPass returns: exact pass times
+ *   syncpasses every pass runs whole, TA then 3D, before EndPass returns: exact pass times, in
+ *             perflog's per-target lines (async passes take no times)
+ *   syncside  with syncpasses or in a replay, the side renders (texture untiles and their
+ *             gathers) run whole too, their times summed: perflog's "side renders" line, and
+ *             in a replay one more pass after the frame's (a synchronous pass's times start
+ *             after what was queued, so a queued side render's time is in no pass's)
+ *   passlog=N  every pass ended in the second from N s of the process's time on: its target,
+ *             scale, draws, how it opened (clear, covered, load), times (with syncpasses) and
+ *             what ended it
+ *   gpucycles a probe: each core's 3D, TA and memory stall cycles (the GPU's own counters)
+ *             around the 60th to the 180th synchronous render (syncpasses, a replay)
+ *   gpuperf=G a probe: the SGX's performance counters (Razor's metric group G: 1 the USSE's
+ *             processing and texture read requests, 2 pixels before hidden surface removal
+ *             and pixels sent on to be shaded, 3 the ISP's parameter fetch) around the same
+ *             renders, each core's eight counters; gpuperfsum=MASK: those counters'
+ *             SUM_MUX bits set
+ *   maskview  a probe: the ISP's mask outside every viewport, also one on the store's grid
+ *             (what a pass shades in its target's margin, past the viewport, and never stores)
+ *   u8colour  a probe: the U8 combiners read the vertex colour's bytes from a second,
+ *             fixed-point iterator of it (what that iterator delivers; a pack fewer)
+ *   smpskip   a probe: skip-invalid on the texture reads that are point sampled from one level
+ *             (the lighting's tables, a shadow's taps), which run in uncovered instances too
+ *   keepalpha_opaque  a probe: a draw with no blend that keeps the destination's alpha
+ *             (colour mask RGB) is opaque, not translucent (pictures may be wrong: a hidden
+ *             opaque draw's alpha is lost)
+ *   shadowsmp  an orthographic Shadow2D unit read by the program's SMP at the iterated
+ *             coordinate, not issued by the PDS; fsextratemps=N: every fragment program declares
+ *             N more temporaries than it uses
+ *   eagercopy  an upscaled pass's 1x copy into the guest's buffer sent at the pass's end, not
+ *             held back until something may read the buffer (RasterizerGxm::DeferDownscale)
+ *   eotmix=V+1... eotmixset=S...  the SCALE_AA probe: at the 300th frame, an 832x512 render
+ *             with sgxd_recipe_pica_eot_mix's variant V over each tile set S in turn, for each V
+ *             (RasterizerSgxd::ProbeEotMix), each logged before and after; eotmixpbe=N writes
+ *             EUR_CR_PIXELBE as N in every 3D kick (bit 10 AA_EDGEOPT_OFF); eotmixsize=1 a
+ *             64x64 render, 2 a 128x128 one; eotmixgrid=N+1 the probe recipe's macrotile grid N;
+ *             eotmixdim=C*100+R (repeated) renders C tiles across and R down, each in turn;
+ *             eotmixreal=V+1: the game's 2x passes end their tiles with variant V, which stores
+ *             the guest's 1x copy too (no DownscalePicture), eotmixnozls with no depth stored,
+ *             eotmixnomask with no ISP mask over the part's margin; eotmixpart: the probe's 26x16 render
+ *             stores a game's part (x 16..416, y 0..240 of its transpose)
+ *   fsonly=N  fswhite and fscut on the program whose key's low 32 bits are N alone
+ *             (drawkeys logs each draw's fs key); fsonly2..fsonly4 name more
+ *   fscut=N   a single-phase fragment program cut to its first N instructions, then the white
+ *             write: bisecting which instruction a draw's time goes to
  *   fswhite=1 every fragment white, the program still run (kills included); fswhite=2 the
  *             program replaced by the white write alone: the vertex side and rasterisation;
  *             fswhite=4 as many NOPs as the program's words, then the white write (its time
@@ -103,10 +143,21 @@ namespace GxmRenderer {
  *             tracelog_len=S move and widen the window; 65536 events at most), written to host0 as
  *             azahar-trace.txt when the window closes: a line per event, microseconds from the
  *             first event, the tag, its argument and the kernel's system time (low 32 bits,
- *             microseconds). sgxd's async lists add their GPU stamps as events gpu_ta, gpu_ta_end,
- *             gpu_3d and gpu_3d_end whose argument is the stamp in that clock; synchronous
- *             renders (a store into cached memory) are sync/sync_end, the present
- *             sgx_present/sgx_present_end
+ *             microseconds). Synchronous renders (a store into cached memory) are
+ *             sync/sync_end, the present sgx_present/sgx_present_end; the async lists, which
+ *             sgxd's microkernel runs, carry no GPU stamps. Frame pacing: late (the next frame's
+ *             decision: 0 whole, 1 whole with the GPU late, 2 the top's draws dropped, 3 the
+ *             bottom's; +4 when the display's rate made it late), lead_wait/lead_wait_end,
+ *             present (1: the top screen's buffer differs from the last shown),
+ *             present_behind, present_pending, flip (1: its 3D was done before the flip);
+ *             emu_ticket, emu_space, emu_sync (the emulation thread's waits for the render
+ *             thread, each with an _end), idle (the guest has no thread to run: the ticks to
+ *             its next event). The GPU's side: frame_ticket (a vblank's ticket, the late
+ *             skip's), reached (a ticket's work done, as the render thread polls it), kick (a
+ *             render sent to the GPU: its width), finish (a pending render's 3D sent on its
+ *             own), gpu (perflog's sampled stream states when they change: 3D in bits 15:8, TA
+ *             in 7:0, busy bit 16), list_run/list_run_end (the render thread on a list's parsed
+ *             records), parse/parse_end (the parse thread on a list)
  */
 [[nodiscard]] bool GxmFlag(const char* name);
 

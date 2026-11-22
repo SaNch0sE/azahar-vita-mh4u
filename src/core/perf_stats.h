@@ -11,6 +11,7 @@
 #include <mutex>
 #include "common/bit_field.h"
 #include "common/common_types.h"
+#include "common/process_clock.h"
 #include "common/thread.h"
 
 namespace Core {
@@ -24,7 +25,9 @@ public:
     explicit PerfStats(u64 title_id);
     ~PerfStats();
 
-    using Clock = std::chrono::high_resolution_clock;
+    /// The time around every svc and IPC: not libstdc++'s clocks, which are a gettimeofday
+    /// syscall each on the Vita (common/process_clock.h).
+    using Clock = Common::ProcessClock;
 
     enum class PerfArticEventBits {
         NONE = 0,
@@ -179,7 +182,9 @@ private:
 
 class FrameLimiter {
 public:
-    using Clock = std::chrono::high_resolution_clock;
+    /// The time around every svc and IPC: not libstdc++'s clocks, which are a gettimeofday
+    /// syscall each on the Vita (common/process_clock.h).
+    using Clock = Common::ProcessClock;
 
     void DoFrameLimiting(std::chrono::microseconds current_system_time_us);
 

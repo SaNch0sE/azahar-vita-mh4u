@@ -158,11 +158,19 @@ if (ENABLE_GXM)
     target_include_directories(video_core PRIVATE $ENV{VITASDK}/arm-vita-eabi/include)
     target_link_libraries(video_core PRIVATE SceGxm_stub)
     # sgxd's user-side pieces that submit: the PTLA and the session (the frontend's
-    # presenter uses the session and the recipe from here too).
+    # presenter uses the session and the recipe from here too), and the microkernel that runs
+    # their lists with its compiler and assembler.
     target_sources(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
-                                      ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c)
+                                      ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c
+                                      ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_mkq.c
+                                      ${CMAKE_SOURCE_DIR}/vita_native/src/sgxd_mk.c
+                                      ${CMAKE_SOURCE_DIR}/vita_native/src/sgxd_usse.c)
     set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
-        ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+        ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_mkq.c
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/vita_native/src/sgxd_mk.c
+        ${CMAKE_SOURCE_DIR}/vita_native/src/sgxd_usse.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+        COMPILE_OPTIONS "-Wno-error")
 endif ()
 
 if (ENABLE_SOFTWARE_RENDERER)

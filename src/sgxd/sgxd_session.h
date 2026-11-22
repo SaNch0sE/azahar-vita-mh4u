@@ -1,10 +1,10 @@
-// sgxd_session — what every owner of the GPU through sgxd runs around the recipe: the init
-// script after the take, the SLC's flush and invalidate, and a render's phases (the TA, then the
-// 3D), each phase one sgxdSubmit, or the whole render one sgxdSubmitAsync list.
-// sgxd_test, the frontend and the rasterizer share it.
-//
-// Vita only: it calls sgxdSubmit and the kernel's clock. Every function returns 0, or -1 with
-// the op that stopped the list described in `failed` (the caller logs it).
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// sgxd_session: what every owner of the GPU through sgxd runs around the recipe: the init
+// script after the take, the SLC's flush and invalidate, and a render's phases, each one
+// sgxdSubmit, or the whole render one async list for sgxd's microkernel (docs/sgxd/README.md).
+// Vita only. Every function returns 0, or -1 with the op that stopped the list in `failed`.
 
 #ifndef SGXD_SESSION_H
 #define SGXD_SESSION_H
@@ -72,41 +72,43 @@ typedef struct SgxdSessionRender {
 // Renders sgxd_session_render has completed since the app started.
 uint32_t sgxd_session_renders(void);
 
-// sgxd_session_render as one async list (sgxd_chain_submit, needs sgxd_ptla_events): the SLC
-// invalidate, the TA kick, then from IRQ 52 the TA's done phase, the 3D kick and done. It is
-// queued in the kernel behind the lists and PTLA ops sent so far, and returns at once. The
+// sgxd_session_render as one async list (sgxd_chain_submit, needs sgxd_ptla_events): the TA kick
+// with Sony's SLC requests, then, run by the microkernel at the TA's end, the TA's done phase, the
+// 3D kick and done. It is queued behind the lists and PTLA ops sent so far, and returns at once. The
 // list's fence is sgxd_chain_fence() afterwards: sgxd_chain_ta_reached(fence) when the TA has
 // read the vertices, sgxd_chain_reached(fence) when the frame is in memory.
 int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
                               unsigned failed_size);
+// That list, appended to l (overflow set when it does not fit): the WAIT_TWOD for ptla_fence
+// first, the SIGNAL_DONE last. Built with sgxd_ptla_events registered (its kicks' SLC form).
+void sgxd_session_render_list(const SgxdRecipe *r, int read_pages, uint32_t ptla_fence,
+                              SgxdOpList *l);
 // 1 (default): the TA runs over a 3D in flight, as Sony's microkernel does. It needs the one
 // shared parameter buffer (sgxd_recipe_pb): with a buffer per recipe, the TA's free-list load
 // over another buffer's 3D stops the GPU.
 extern int sgxd_session_ta_over_3d;
 
-// sgxd_session_render_async with the pending 3D (the last overlapped list's) left running when
-// the list ends: the pending 3D's wait and done phase (after the TA's done phase with
-// sgxd_session_ta_over_3d), the SLC invalidate, the TA kick, from IRQ 52 the TA's done phase,
-// and this render's 3D kick. The list ends there and r's 3D becomes the pending
-// one: the next overlapped list, or sgxd_session_finish_pending, finishes it. `touches` is what
-// that 3D writes or samples outside r's block, as [lo, hi) GPU address pairs ({0, 0}: none).
-// The TA and 3D sides write only their own registers (sgxd_recipe.c); the pending 3D's recipe
-// block and data must be other memory than r's. Every user of the async chain goes through
-// these, so one list finishes each 3D.
+// sgxd_session_render_async as a kept list (values rewritten per render, sgxd_session.c) for a
+// recipe on the shared parameter buffer. Its 3D stream's part waits for its own end, so no 3D is
+// left pending; `touches` is unused.
 int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], char *failed,
                                 unsigned failed_size);
+// A recipe is no more (its block given back, a backend's end; NULL: every recipe): the lists kept
+// for it go, so a recipe made later at its address builds its own.
+void sgxd_session_forget(const SgxdRecipe *r);
 // No 3D is ever left pending: these keep their callers, with nothing to do.
 const SgxdRecipe *sgxd_session_pending(void);
 int sgxd_session_pending_touches(uint32_t lo, uint32_t hi);
 void sgxd_session_pending_fence(void);
 int sgxd_session_pending_fenced(void);
 int sgxd_session_finish_pending(char *failed, unsigned failed_size);
-// After an overlapped list ended: its TA time, and when it finished a pending 3D, that 3D from
-// its kick to the wait that saw it end (later than the end when the TA took longer).
+// After an overlapped list ended: no times (the microkernel takes none; sgxd_flags syncpasses
+// times passes synchronously) and no pages.
 void sgxd_session_render_overlap_result(SgxdSessionRender *render);
-// After the last async render completed: its TA and 3D times (the ISR's stamps) and pages.
+// After the last async render completed: its pages (read_pages), no times.
 void sgxd_session_render_async_result(SgxdSessionRender *render);
-// After a chain wait failed: stops the queue and describes the op it stopped at.
+// After a chain wait failed: where the microkernel stands, the event registers, each core's
+// state and the last render list's registers against its values.
 void sgxd_session_render_async_failed(char *failed, unsigned failed_size);
 
 int sgxd_session_render(const SgxdRecipe *r, SgxdSessionRender *render, char *failed,

@@ -19,6 +19,7 @@
 #include <psp2kern/kernel/sysmem/address_space.h>
 #include <psp2kern/kernel/sysmem/memtype.h>
 #include <psp2kern/kernel/sysmem/uid_class.h>
+#include <psp2kern/kernel/sysmem/uid_puid.h>
 #include <psp2kern/kernel/threadmgr.h>
 
 #include <stdarg.h>
@@ -330,7 +331,16 @@ static uint32_t active_cpu_mask(void) {
 // 14: azaharRun answers some svcs in the guest's own world (AZAHAR_FAST_*), and reports the
 //     slice's guest ticks and its own time.
 // 15: one world per Vita core, azaharAttach / azaharDetach: slices on several cores at once.
+// 17: azaharCycleCounter, the PMU cycle counter readable in user mode by the process's threads.
+// 18: sgxd 8, the async queue as a ring in the app's memory (sgxdQueue, sgxdKick): no copy in.
 // 19: AzaharProfSample's syscall (svc, user PC, LR and SP) from the thread's SVC frame.
+// 20: sgxd 9, sgxdWaker: the app's event flag set when the GPU reaches the counts it sleeps until.
+// 21: sgxd 10, sgxdMicrokernel: the async lists run by the app's microkernel on the GPU, IRQ 52
+//     for its SW_EVENT only.
+// 22: sgxd 11, sgxdKick with sgxdMicrokernel writes core 0's EVENT_KICK, Sony's per-command kick.
+// 23: sgxd 12, KICK2 again (EVENT_KICK started no run of the microkernel).
+// 24: sgxd 13, the microkernel alone: no ring, no IRQ 52 list running; sgxdQueue,
+//     sgxdSubmitAsync and sgxdMicrokernel gone, sgxdEvents the microkernel's interrupt set-up.
 // 27: azaharAttach and azaharDetach gone, and the cross-core maintenance with them: one
 //     emulation thread, one attached core.
 int azaharVersion() {
@@ -344,6 +354,7 @@ int azaharVersion() {
 #include "native.c"
 #include "sgxd.c"
 #include "reback.c"
+#include "cycles.c"
 
 // ---------------------------------------------------------------------------- module
 

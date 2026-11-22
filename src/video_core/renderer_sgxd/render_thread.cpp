@@ -18,6 +18,8 @@
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/renderer_sgxd.h"
 
+#include <psp2/kernel/error.h>
+#include <psp2/kernel/threadmgr.h>
 #include "sgxd.h"
 #include "sgxd_mkq.h"
 #include "sgxd_ptla.h"
@@ -125,7 +127,8 @@ static_assert(std::is_trivially_copyable_v<Pica::Uniforms>);
 
 constexpr u32 LightingTableBytes = 256 * sizeof(u32);
 
-using Clock = std::chrono::steady_clock;
+// Not libstdc++'s steady_clock, which is a gettimeofday syscall on the Vita.
+using Clock = Common::ProcessClock;
 
 #ifdef VITA_DIAGNOSTICS
 u64 Since(Clock::time_point start) {
@@ -189,44 +192,37 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& render_pica_,
     // it (the dirty table and the LUT marks start full, and PicaCore::MarkAllChanged covers the
     // rest).
     pica.MarkAllChanged();
+    wake_flag = sceKernelCreateEventFlag("render wake", SCE_EVENT_WAITSINGLE, 0, nullptr);
+    ASSERT_MSG(wake_flag >= 0, "render thread: event flag {:#010x}", static_cast<u32>(wake_flag));
+    rasterizer.InterruptWaker(wake_flag, WakeBit);
+    renderer.SetMoveHooks({
+        [this](PAddr addr, u32 size) {
+            // On the render thread, the move is for its work about to use the pages: the GPU
+            // writes only moved pages and VRAM, so a page still cached has none queued but a
+            // DMA's, which the draw retired already (RasterizerSgxd::MoveWaits).
+            if (sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed)) {
+                rasterizer.MoveWaits();
+            } else {
+                WaitGpuWrites(addr, size);
+            }
+        },
+        [this](const u32* pte_va, const u32* pte, u32 count) {
+            return rasterizer.RemapMoved(pte_va, pte, count);
+        },
+        [this](u32 fence) { return rasterizer.MovedFenceReached(fence); },
+        [this](u32 fence) { rasterizer.MovedFenceWait(fence); },
+        [this](u32 page) { return page_holds_on && page_holds.Versioned(page); },
+    });
+#ifdef VITA_DIAGNOSTICS
+    gpu_wakes_mark = sgxd_wake_count();
+#endif
     constexpr std::size_t StackSize = 2 * 1024 * 1024;
     thread = Common::NamedThread{Common::ThreadCfg{"render", StackSize}, [this] { Loop(); }};
-    LOG_INFO(Render, "render thread: on Vita core 0, fences polled every {} us while pending",
-             poll_interval.count());
+    LOG_INFO(Render, "render thread: on Vita core 1, woken by sgxd when a ticket's GPU work is "
+                     "done");
     check = GxmFlag("rendercheck");
 }
 #endif
-
-void RenderThread::Watch(std::stop_token stop) {
-    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
-    u32 last = records_run.load();
-    while (!stop.stop_requested()) {
-        for (int i = 0; i < 20 && !stop.stop_requested(); i++) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        const u32 now = records_run.load();
-        const Wait wait = emu_wait.load();
-        const u32 queued = published.load() - read.load();
-        if (now == last && (wait != Wait::None || queued != 0)) {
-            const u64 fence = front_fence.load();
-            const volatile SgxdEvents* const ev = sgxd_ptla_page();
-            LOG_WARNING(Render,
-                        "renderwatch: no record run in 2 s; running op {:#x}, {} bytes queued, "
-                        "emulation side waits {} (ticket {}), tickets {} reached {}, parked {}, "
-                        "pending fences {}, the oldest's render {} ptla {}; sgxd: lists sent {} "
-                        "done {} (TA {}), pending 3D {}, PTLA sent {} done {}, fault {}, TA irqs "
-                        "{}, 3D irqs {}",
-                        running_op.load(), queued, static_cast<u32>(wait), waited_ticket.load(),
-                        tickets, reached.load(), parked.load(), pending.size(),
-                        static_cast<u32>(fence >> 32), static_cast<u32>(fence), sgxd_chain_fence(),
-                        ev ? ev->chains : 0u, ev ? ev->chain_ta : 0u,
-                        sgxd_session_pending() != nullptr ? 1 : 0, sgxd_ptla_fence(),
-                        ev ? ev->twod : 0u, ev ? ev->chain_fault : 0u, ev ? ev->ta : 0u,
-                        ev ? ev->d3 : 0u);
-        }
-        last = now;
-    }
-}
 
 RenderThread::~RenderThread() {
     {
@@ -239,7 +235,11 @@ RenderThread::~RenderThread() {
         stopping = true;
         work.NotifyAll();
     }
+    Wake();
     thread.join();
+    // The backend may have given sgxd's interrupt back already, and the waker with it.
+    rasterizer.InterruptWaker(-1, 0);
+    sceKernelDeleteEventFlag(wake_flag);
 }
 
 void RenderThread::SyncState() {
@@ -426,8 +426,7 @@ void RenderThread::Publish() {
         return;
     }
     if (sleeping.load()) {
-        std::scoped_lock lk{work};
-        work.NotifyAll();
+        Wake();
     }
 }
 
@@ -936,6 +935,7 @@ void RenderThread::Hold() {
         park_requested = true;
         work.NotifyAll();
     }
+    Wake();
     {
         std::scoped_lock lk{done};
         done_waiters.fetch_add(1);
@@ -960,9 +960,12 @@ void RenderThread::Release() {
     }
     SgxdTrace("release");
     holder.store(-1, std::memory_order_release);
-    std::scoped_lock lk{work};
-    park_requested = false;
-    work.NotifyAll();
+    {
+        std::scoped_lock lk{work};
+        park_requested = false;
+        work.NotifyAll();
+    }
+    Wake();
 }
 
 void RenderThread::PollHeld() {
@@ -983,7 +986,10 @@ RenderThread::Stats RenderThread::TakeStats() {
     }
     s.busy_us = busy_us.exchange(0);
     s.idle_us = idle_us.exchange(0);
-    s.poll_wakes = poll_wakes.exchange(0);
+    const u32 gpu_wakes = sgxd_wake_count();
+    s.gpu_wakes = gpu_wakes - gpu_wakes_mark;
+    gpu_wakes_mark = gpu_wakes;
+    s.timeouts = timeouts.exchange(0);
     s.presents = presents.exchange(0);
     s.presents_dropped = presents_dropped.exchange(0);
     s.holds = holds.exchange(0);
@@ -998,6 +1004,20 @@ RenderThread::Stats RenderThread::TakeStats() {
     return s;
 }
 #endif
+
+bool RenderThread::Sleep(std::chrono::microseconds timeout) {
+    SceUInt us = static_cast<SceUInt>(timeout.count());
+    unsigned int bits = 0;
+    const int r = sceKernelWaitEventFlag(wake_flag, WakeBit,
+                                         SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, &bits, &us);
+    ASSERT_MSG(r == 0 || r == SCE_KERNEL_ERROR_WAIT_TIMEOUT, "render thread: wait {:#010x}; {}",
+               static_cast<u32>(r), Common::DescribeWaiters(wake_flag));
+    return r == 0;
+}
+
+void RenderThread::Wake() {
+    sceKernelSetEventFlag(wake_flag, WakeBit);
+}
 
 void RenderThread::NotifyDone() {
     if (done_waiters.load() != 0) {
@@ -1346,10 +1366,10 @@ void RenderThread::Loop() {
             }
             PollFences();
         }
+        // One clock read for the checks below (Clock::now() is a syscall).
+        auto now = Clock::now();
         if (!pending.empty()) {
-            const volatile SgxdEvents* const ev = sgxd_ptla_page();
-            const u32 now_progress = ev ? ev->chains + ev->twod : 0;
-            const auto now = Clock::now();
+            const u32 now_progress = sgxd_chain_done() + sgxd_ptla_done();
             if (now_progress != progress) {
                 progress = now_progress;
                 progress_at = now;
@@ -1361,13 +1381,15 @@ void RenderThread::Loop() {
                             sgxd_chain_stall_us / 1000, pending.front().ticket);
                 rasterizer.InterruptWait(pending.front().fence);
                 PollFences();
-                progress_at = Clock::now();
+                now = Clock::now();
+                progress_at = now;
             }
         }
         // The window between presents: a poll may run the pause menu, so it goes outside the work lock.
-        if (Clock::now() - last_window_poll >= WindowPollInterval) {
+        if (now - last_window_poll >= WindowPollInterval) {
             renderer.PollWindow();
-            last_window_poll = Clock::now();
+            now = Clock::now();
+            last_window_poll = now;
         }
         std::scoped_lock lk{work};
         const auto empty = [this] {
@@ -1388,16 +1410,29 @@ void RenderThread::Loop() {
         }
         sleeping.store(true);
         if (empty() && !park_requested && !stopping) {
-            // With tickets pending, sleep only until the next poll: the GPU's completions come
-            // to no one (sgxd's events page), so they are looked for.
-            const bool polling = !pending.empty();
-            const auto start = Clock::now();
-            const bool woken = work.WaitFor(
-                polling ? poll_interval
-                        : std::chrono::duration_cast<std::chrono::microseconds>(WindowPollInterval));
-            idle_us.fetch_add(Since(start), std::memory_order_relaxed);
-            if (polling && !woken) {
-                poll_wakes.fetch_add(1, std::memory_order_relaxed);
+            // With tickets pending, sgxd wakes the thread once the oldest one's GPU work is done
+            // (or the lists before a held-back 3D are, for PollFences to send it). Records, a
+            // hold and the end wake it through Wake; the window's poll bounds the sleep.
+            const bool waiting = !pending.empty();
+            if (!waiting || rasterizer.InterruptArm(pending.front().fence)) {
+#ifdef VITA_DIAGNOSTICS
+                const auto start = now;
+#endif
+                work.unlock();
+                [[maybe_unused]] const bool woken = Sleep(
+                    std::chrono::duration_cast<std::chrono::microseconds>(WindowPollInterval));
+                work.lock();
+                if (waiting) {
+                    rasterizer.InterruptDisarm();
+#ifdef VITA_DIAGNOSTICS
+                    if (!woken) {
+                        timeouts.fetch_add(1, std::memory_order_relaxed);
+                    }
+#endif
+                }
+#ifdef VITA_DIAGNOSTICS
+                idle_us.fetch_add(Since(start), std::memory_order_relaxed);
+#endif
             }
         }
         sleeping.store(false);

@@ -6,6 +6,7 @@
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
+#include "common/process_clock.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
@@ -117,16 +118,17 @@ void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op
     // (the PICA's parse and the queueing), the render thread's work is its own line.
     // vprof: the op's number in the recorded frame, 0 outside it.
     const u32 seq = SgxdRenderer::Vprof::OpQueued(static_cast<u32>(kind));
-    const auto start = std::chrono::steady_clock::now();
+    const auto start = Common::ProcessClock::now();
     GPU_TRACE("op", static_cast<unsigned>(kind));
     SgxdRenderer::Vprof::OpBegin(seq);
     op();
     SgxdRenderer::Vprof::OpEnd(seq);
     GPU_TRACE("done");
-    impl->kind_us[k].fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                   std::chrono::steady_clock::now() - start)
-                                   .count()),
-                               std::memory_order_relaxed);
+    const auto end = Common::ProcessClock::now();
+    if (kind == OpKind::CmdList) {
+        impl->scans_pending.emplace_back(static_cast<u64>(end.time_since_epoch().count()),
+                                         static_cast<u32>((end - start).count()));
+    }
 #endif
     // GPU work the op held back starts now (the last pass's 3D, when a transfer waits on it).
     impl->rasterizer->GpuIdle();

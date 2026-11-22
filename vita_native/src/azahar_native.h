@@ -147,7 +147,7 @@ typedef struct AzaharRebackRequest {
 #define AZAHAR_ERR_TABLE AZAHAR_ERROR(1005)    // the table could not be built (kernel L1 not found, gap)
 #define AZAHAR_ERR_PAGE AZAHAR_ERROR(1006)     // a user page did not translate
 #define AZAHAR_ERR_TIMEOUT AZAHAR_ERROR(1007)  // the core-2 thread did not complete a command in time
-#define AZAHAR_ERR_FULL AZAHAR_ERROR(1008)     // a queue has no room yet (sgxdSubmitAsync)
+#define AZAHAR_ERR_FULL AZAHAR_ERROR(1008)     // a queue has no room yet (the microkernel's jobs)
 
 
 #ifdef __cplusplus
@@ -187,6 +187,25 @@ int azaharRebackReturn(uint32_t user_va, uint32_t size);
 /// pages are its old ones again, with whatever they held before any move. Also done when the
 /// process ends. Version 7.
 int azaharRebackRestore(void);
+
+/// User-mode access to the PMU for every thread of the calling process, now and created later
+/// (cycles.c). ThreadMgr keeps the PMU per thread, so a thread's cycle counter counts that
+/// thread's cycles only: its user time and its syscalls, not interrupts or the time it is not
+/// running. Version 17.
+int azaharCycleCounter(void);
+
+/// The calling thread's cycle counter (azaharCycleCounter first): 32 bits, so take differences.
+static inline uint32_t azaharCycles(void) {
+    uint32_t c;
+    __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(c));
+    return c;
+}
+/// The same, with the cycle counter's enable (PMCNTENSET's C) set first: the enable is not kept
+/// with the thread and a resume clears it, so a measurement starts here.
+static inline uint32_t azaharCyclesStart(void) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 1" ::"r"(1u << 31));
+    return azaharCycles();
+}
 
 #ifdef __cplusplus
 }
