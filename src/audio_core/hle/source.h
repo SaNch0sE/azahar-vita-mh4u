@@ -146,6 +146,10 @@ private:
 
         u32 current_sample_number = 0;
         PAddr current_buffer_physical_address = 0;
+        u32 current_buffer_length = 0;
+        MonoOrStereo current_buffer_mono_or_stereo = MonoOrStereo::Mono;
+        Format current_buffer_format = Format::ADPCM;
+        bool current_buffer_is_looping = false;
         AudioInterp::StereoBuffer16 current_buffer = {};
 
         // buffer_id state
@@ -182,6 +186,14 @@ private:
             ar & format;
             ar & current_sample_number;
             ar & current_buffer_physical_address;
+            // Version 1: the current buffer's own length, layout and looping (live looping PCM). A
+            // state from before them plays its current buffer as then, until the next one.
+            if (file_version >= 1) {
+                ar & current_buffer_length;
+                ar & current_buffer_mono_or_stereo;
+                ar & current_buffer_format;
+                ar & current_buffer_is_looping;
+            }
             ar & current_buffer;
             ar & buffer_update;
             ar & current_buffer_id;
