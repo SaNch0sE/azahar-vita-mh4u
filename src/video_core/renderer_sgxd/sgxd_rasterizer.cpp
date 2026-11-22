@@ -432,6 +432,8 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     u32 ta_us = 0, d3_us = 0;
     backend.Blit(source->memory, width, height, store, &ta_us, &d3_us);
     TexturesWritten(output, output + bytes);
+    // The blit's 3D stays pending, as a pass's does: the next list finishes it. Whatever waits on the
+    // blit (a page hold on its output, a ticket) finishes it then (InterruptPoll, RenderWait).
     // Progress: a line every 30 transfers.
     if (transfers > 0 && transfers % 30 == 0) {
         const SgxdEvents& ev = backend.Events();
@@ -516,39 +518,10 @@ void RasterizerSgxd::NotifyP3D() {
     }
 }
 
-RasterizerGxm::GpuFence RasterizerGxm::GpuFenceAll() const {
-    GpuFence fence{};
-    fence.twod = true;
-    fence.twod_count = backend.PtlaFence();
-    fence.render = true;
-    fence.render_count = backend.RenderFence();
-    return fence;
-}
-
-// Passes sample only host memory in their 3D (surfaces, the LUT rows): after the TA the guest's
-// memory is free. A pass that samples guest textures will need the whole render here.
-RasterizerGxm::GpuFence RasterizerGxm::GpuFenceVertices() const {
-    GpuFence fence{};
-    fence.ta = true;
-    fence.render_count = backend.RenderFence();
-    return fence;
-}
-
-// gxm_flags earlyppf: PPF once the blit's TA has run, not its 3D, which then runs while the
-// guest builds its next frame. The guest must not touch the transfer's output on the CPU before
-// the 3D ends: the present, fills and DMAs over it wait for the 3D (SgxdBackend::RenderBefore),
-// the guest's own CPU does not.
-RasterizerGxm::GpuFence RasterizerGxm::GpuFenceTransfer() const {
-    static const bool early = GxmFlag("earlyppf");
-    if (!early) {
-        return GpuFenceAll();
-    }
-    GpuFence fence{};
-    fence.twod = true;
-    fence.twod_count = backend.PtlaFence();
-    fence.ta = backend.RenderAsync();
-    fence.render_count = backend.RenderTaFence();
-    return fence;
+// The last pass's 3D gets its finishing list here when something waits on it; otherwise it goes
+// with the next pass's list. An open pass stays open.
+void RasterizerSgxd::GpuIdle() {
+    backend.RenderFinish();
 }
 
 u64 RasterizerSgxd::GpuWaitUs() const {
@@ -616,11 +589,20 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     constexpr u32 RowPixels = 4096;
     const u32 pixels = (end - start) / bytes;
     const u32 format = bytes == 4 ? SGXD_PTLA_8888 : (bytes == 3 ? SGXD_PTLA_888 : SGXD_PTLA_U88);
+    // The pending 3D completes before the PTLA writes over it.
+    backend.RenderBefore(start, end, "a fill");
     const SgxdPtlaFill fill{start,           format,             RowPixels * bytes, RowPixels,
                             pixels / RowPixels, pixels % RowPixels, value};
     char failed[160];
     u32 elapsed_us = 0;
     [[maybe_unused]] const int filled = sgxd_ptla_fill(&fill, &elapsed_us, failed, sizeof(failed));
+#ifdef VITA_DIAGNOSTICS
+    if (filled != 0) {
+        // A stopped list before the PTLA op: its post-mortem and the GPU dump.
+        LOG_CRITICAL(Render, "sgxd: AccelerateFill {}: {}", describe(), failed);
+        backend.RenderIdle("a failed fill");
+    }
+#endif
     DEBUG_ASSERT_MSG(filled == 0, "sgxd: AccelerateFill {}: {}", describe(), failed);
     RecordClear({start, end, value, bytes, 0});
     TexturesWritten(start, end);
@@ -714,6 +696,9 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
         sync_reason = "dma source";
         SyncRange(src, src + size);
     }
+    // The pending 3D completes before the PTLA reads what it writes, or writes what it reads.
+    backend.RenderBefore(src, src + size, "a DMA's source");
+    backend.RenderBefore(dst, end, "a DMA's destination");
     ForgetClears(dst, end);
     TexturesWritten(dst, end);
 
@@ -745,6 +730,13 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     char failed[160];
     u32 elapsed_us = 0;
     [[maybe_unused]] const int copied = sgxd_ptla_copy(&copy, &elapsed_us, failed, sizeof(failed));
+#ifdef VITA_DIAGNOSTICS
+    if (copied != 0) {
+        // A stopped list before the PTLA op: its post-mortem and the GPU dump.
+        LOG_CRITICAL(Render, "sgxd: AccelerateDma {}: {}", describe(), failed);
+        backend.RenderIdle("a failed copy");
+    }
+#endif
     DEBUG_ASSERT_MSG(copied == 0, "sgxd: AccelerateDma {}: {}", describe(), failed);
     if (dst_cached) {
         // The CPU's lines over the destination go after the copy: an asynchronous one
@@ -2304,8 +2296,11 @@ void RasterizerSgxd::SyncLutLf() {
     // points at the half left behind; the passes reading the half moved to were sent long ago.
     constexpr u32 Half = Pica::Shader::LUT_LF_ROWS / 2;
     const u32 needed = static_cast<u32>(std::popcount(lighting.lut_dirty)) + (fog.lut_dirty ? 1 : 0);
-    if (lut_row + needed > Pica::Shader::LUT_LF_ROWS) {
-        lut_row = 0;
+    if (lut_row + needed > (lut_half + 1) * Half) {
+        lut_half_mark[lut_half] = backend.PassMark();
+        lut_half ^= 1;
+        backend.WaitPassMark(lut_half_mark[lut_half], "a LUT ring's half");
+        lut_row = lut_half * Half;
         lighting.lut_dirty = lighting.LutAllDirty;
         fog.lut_dirty = true;
     }
@@ -2376,10 +2371,13 @@ void RasterizerSgxd::SyncLutProcTex() {
     // with every table. The noise table is not sampled (the emitter has no noise yet).
     const u32 rg_needed = (proctex.color_map_dirty ? 1u : 0u) + (proctex.alpha_map_dirty ? 1u : 0u);
     const u32 rgba_needed = (proctex.lut_dirty ? 1u : 0u) + (proctex.diff_lut_dirty ? 1u : 0u);
-    if (lut_rg_row + rg_needed > Pica::Shader::LUT_RG_ROWS ||
-        lut_rgba_row + rgba_needed > Pica::Shader::LUT_RGBA_ROWS) {
-        lut_rg_row = 0;
-        lut_rgba_row = 0;
+    if (lut_rg_row + rg_needed > (proctex_half + 1) * RgHalf ||
+        lut_rgba_row + rgba_needed > (proctex_half + 1) * RgbaHalf) {
+        proctex_half_mark[proctex_half] = backend.PassMark();
+        proctex_half ^= 1;
+        backend.WaitPassMark(proctex_half_mark[proctex_half], "a proctex ring's half");
+        lut_rg_row = proctex_half * RgHalf;
+        lut_rgba_row = proctex_half * RgbaHalf;
         proctex.table_dirty = proctex.TableAllDirty;
     }
     const auto take_row = [&](u32& next, auto& row_pass) {

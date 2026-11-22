@@ -183,8 +183,22 @@ int sgxd_chain_idle(void) {
     return sgxd_chain_wait(chains_sent);
 }
 
-int sgxd_gpu_idle(void) {
+static int (*render_drain)(void);
+
+void sgxd_set_render_drain(int (*drain)(void)) {
+    render_drain = drain;
+}
+
+// A PTLA op's start: the ops before it and the last list done, the last list's 3D maybe not.
+static int ptla_ready(void) {
     return sgxd_ptla_idle() == 0 && sgxd_chain_idle() == 0 ? 0 : -1;
+}
+
+int sgxd_gpu_idle(void) {
+    if (render_drain && render_drain() < 0) {
+        return -1;
+    }
+    return ptla_ready();
 }
 
 static uint32_t surf(uint32_t block, uint32_t format, uint32_t stride) {
@@ -335,7 +349,7 @@ int sgxd_ptla_fill(const SgxdPtlaFill *f, uint32_t *elapsed_us, char *failed,
                  f->rows, f->width, f->tail, f->stride);
         return -1;
     }
-    if (sgxd_gpu_idle() < 0) {
+    if (!events && ptla_ready() < 0) {
         snprintf(failed, failed_size, "PTLA fill: the GPU's previous op never completed");
         return -1;
     }
@@ -373,7 +387,7 @@ int sgxd_ptla_copy(const SgxdPtlaCopy *c, uint32_t *elapsed_us, char *failed,
                  c->rows, c->width, c->tail, c->stride);
         return -1;
     }
-    if (sgxd_gpu_idle() < 0) {
+    if (!events && ptla_ready() < 0) {
         snprintf(failed, failed_size, "PTLA copy: the GPU's previous op never completed");
         return -1;
     }

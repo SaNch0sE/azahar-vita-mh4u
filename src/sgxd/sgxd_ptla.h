@@ -94,10 +94,17 @@ const SgxdOp *sgxd_chain_op(uint32_t pos, uint32_t *behind);
 uint32_t sgxd_chain_fence(void);
 int sgxd_chain_reached(uint32_t fence);
 int sgxd_chain_ta_reached(uint32_t fence);
-// Spins until the last list completed. Returns 0, or -1 on its fault or after a second.
+// Spins until the list that returned fence (the count after it) has completed. Returns 0, or -1
+// on a fault or after a second in which no list completed.
+int sgxd_chain_wait(uint32_t fence);
+// Spins until the last list queued completed, as sgxd_chain_wait.
 int sgxd_chain_idle(void);
-// sgxd_ptla_idle and sgxd_chain_idle: nothing of ours runs on the GPU.
+// The render drain, then sgxd_ptla_idle and sgxd_chain_idle: nothing of ours runs on the GPU.
 int sgxd_gpu_idle(void);
+// Who runs overlapped lists registers how to finish their last 3D (0, or -1 on a fault):
+// sgxd_gpu_idle calls it first. PTLA fills and copies do not: their caller queues that finish
+// first when the op touches the 3D's memory.
+void sgxd_set_render_drain(int (*drain)(void));
 
 #ifdef VITA_DIAGNOSTICS
 // The time the app's threads spun waiting for the GPU: the idle waits above and a synchronous

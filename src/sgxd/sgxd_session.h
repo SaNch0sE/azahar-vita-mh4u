@@ -79,6 +79,31 @@ uint32_t sgxd_session_renders(void);
 // read the vertices, sgxd_chain_reached(fence) when the frame is in memory.
 int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
                               unsigned failed_size);
+// 1 (default): the TA runs over a 3D in flight, as Sony's microkernel does. It needs the one
+// shared parameter buffer (sgxd_recipe_pb): with a buffer per recipe, the TA's free-list load
+// over another buffer's 3D stops the GPU.
+extern int sgxd_session_ta_over_3d;
+
+// sgxd_session_render_async with the pending 3D (the last overlapped list's) left running when
+// the list ends: the pending 3D's wait and done phase (after the TA's done phase with
+// sgxd_session_ta_over_3d), the SLC invalidate, the TA kick, from IRQ 52 the TA's done phase,
+// and this render's 3D kick. The list ends there and r's 3D becomes the pending
+// one: the next overlapped list, or sgxd_session_finish_pending, finishes it. `touches` is what
+// that 3D writes or samples outside r's block, as [lo, hi) GPU address pairs ({0, 0}: none).
+// The TA and 3D sides write only their own registers (sgxd_recipe.c); the pending 3D's recipe
+// block and data must be other memory than r's. Every user of the async chain goes through
+// these, so one list finishes each 3D.
+int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[4], char *failed,
+                                unsigned failed_size);
+// No 3D is ever left pending: these keep their callers, with nothing to do.
+const SgxdRecipe *sgxd_session_pending(void);
+int sgxd_session_pending_touches(uint32_t lo, uint32_t hi);
+void sgxd_session_pending_fence(void);
+int sgxd_session_pending_fenced(void);
+int sgxd_session_finish_pending(char *failed, unsigned failed_size);
+// After an overlapped list ended: its TA time, and when it finished a pending 3D, that 3D from
+// its kick to the wait that saw it end (later than the end when the TA took longer).
+void sgxd_session_render_overlap_result(SgxdSessionRender *render);
 // After the last async render completed: its TA and 3D times (the ISR's stamps) and pages.
 void sgxd_session_render_async_result(SgxdSessionRender *render);
 // After a chain wait failed: stops the queue and describes the op it stopped at.

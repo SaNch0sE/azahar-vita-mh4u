@@ -24,7 +24,8 @@ extern "C" {
 
 enum {
     SGXD_R_PT, SGXD_R_PAGES, SGXD_R_RGN0, SGXD_R_RGN1, SGXD_R_RGN2, SGXD_R_RGN3, SGXD_R_EXTZ,
-    SGXD_R_TPC0, SGXD_R_TPC1, SGXD_R_TPC2, SGXD_R_TPC3, SGXD_R_BGREC, SGXD_R_FB, SGXD_R_DEPTH,
+    SGXD_R_TPC0, SGXD_R_TPC1, SGXD_R_TPC2, SGXD_R_TPC3, SGXD_R_BGREC, SGXD_R_DPMSLOT, SGXD_R_FB,
+    SGXD_R_DEPTH,
     SGXD_R_STREAM, SGXD_R_STATE, SGXD_R_VERTS, SGXD_R_INDICES, SGXD_R_PDS, SGXD_R_COPY,
     SGXD_R_VSPDS, SGXD_R_VSEC, SGXD_R_TERM, SGXD_R_FSEC, SGXD_R_FPRIM, SGXD_R_BGSEC,
     SGXD_R_BGPRIM, SGXD_R_PIXEV, SGXD_R_IDLE, SGXD_R_COPY1, SGXD_R_COPY2, SGXD_R_COPY3,
@@ -104,7 +105,10 @@ typedef struct SgxdRecipeDraw {
 typedef struct SgxdRecipe {
     uint32_t width, height, base, pages;
     uint32_t offset[SGXD_R_COUNT];   // from base; offset[SGXD_R_END] is the footprint
-    uint32_t first, last;            // the parameter pages' numbers from base & ~0xfffff
+    uint32_t first, last;            // the parameter pages' numbers from req_base
+    uint32_t req_base;               // the DPM's requestor base (TA, 3D and ZLS)
+    uint32_t pt;                     // the DPM page table's GPU address
+    int shared_pb;                   // the pages are sgxd_recipe_pb's, not the layout's PAGES
     uint32_t tx, ty, mx, my, count, mtile1, mtile2, stride, te_screen, mte_screen;
     uint32_t rgn_size, tpc_size;
     uint32_t ta_free_list, ta_alloc, ta_threshold, pds_threshold, global_list;
@@ -133,15 +137,29 @@ typedef struct SgxdRecipe {
 // from 0x4b000 pixels (960x544), 2x2 below. 4 is 4x4 at every size: below 960x544 the 2x2 grid
 // leaves cores idle over much of the 3D time.
 extern unsigned sgxd_recipe_grid;
-
-// Diagnostics: TA-side writes Sony's microkernel never makes with a 3D in flight, left out of
-// every TA kick and TA done by bit: 1 each core's 0x0310; 2 the per-core cache invalidates (the
-// broadcast ones stay); 4 core 0's event program (0x0a68, 0x0a6c); 8 0x4134's and the cores'
-// 0x0134 event clears at the kick; 16 the TA done's SLC flush with Sony's mask (0x20) and no
-// invalidate; 32 0x0a0c when it holds the value already. 0 (default) writes them all.
-extern unsigned sgxd_recipe_tatrim;
-// Diagnostics: the TA kick waits for every core's TE_RGNHDR_INIT_COMPLETE, not only core 0's.
-extern unsigned sgxd_recipe_rgnwait;
+// EUR_CR_PIXELBE (0x0400) at the 3D kicks built after it is set: 0x80 (the alpha threshold) by
+// default; bit 10 is AA_EDGEOPT_OFF (the SCALE_AA probes, sgxd_recipe_pica_eot_mix).
+extern uint32_t sgxd_recipe_pixelbe;
+// One parameter buffer for every recipe inited after it is set, as Sony's microkernel runs:
+// the page table at pt, the pages first..last as
+// page numbers from req_base, which every such recipe's requestor bases take. Its TA and 3D free
+// lists are loaded once, at the first TA and the first 3D built after sgxd_recipe_pb_reset, and
+// every 3D deallocates its scene's pages back into them. The TA's DPM state slot (1) goes to the
+// recipe's DPMSLOT table after its TA and into the 3D's slot (0) before its render. last 0 (the
+// default): each recipe loads its own layout's PT and PAGES at every kick and never deallocates.
+typedef struct SgxdRecipePb {
+    uint32_t req_base, pt, first, last;
+} SgxdRecipePb;
+extern SgxdRecipePb sgxd_recipe_pb;
+// sgxd_recipe_pb's page list into the CPU's view of its page table: page p links p - 1 and
+// p + 1, 0xffff at both ends. Before its first TA only; the DPM owns it afterwards.
+void sgxd_recipe_pb_write(void *pt_memory);
+// The shared buffer's page table in memory, set where it is written first: sgxd_recipe_pb_rewrite
+// writes its list afresh (every page free) for a DPM reset with the GPU idle.
+extern void *sgxd_recipe_pb_memory;
+void sgxd_recipe_pb_rewrite(void);
+// The next TA and 3D built load the shared buffer's free lists again (at sgxd_recipe_pb_write).
+void sgxd_recipe_pb_reset(void);
 
 // A width x height (32 to 2048) target at GPU address base (1 MiB aligned), with pages parameter
 // pages, drawing the recipe's triangle. Returns 0, or -1 for sizes the layout does not cover.

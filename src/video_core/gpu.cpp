@@ -101,28 +101,14 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
         [this](uintptr_t user_data, s64 cycles_late) { VBlankCallback(user_data, cycles_late); });
     impl->timing.ScheduleEvent(FRAME_TICKS, impl->vblank_event);
 
-    impl->posted_event = impl->timing.RegisterEvent(
-        "GPU::PostedEvent",
-        [this](uintptr_t user_data, s64 cycles_late) { PostedEventCallback(user_data, cycles_late); });
-    // The PICA raises P3D from inside a command list, on the render thread: it goes back to the
-    // emulation thread like every other interrupt. Set before the thread starts, which owns the
-    // PICA from then on.
-    Service::GSP::InterruptHandler post_interrupt = [this](Service::GSP::InterruptId id,
-                                                           u64 delay) {
-        // P3D once the renders before it have read their vertices.
-        GPU_TRACE("post", static_cast<unsigned>(id));
-        PostToEmulation([this, id, delay] {
-                            GPU_TRACE("irq", static_cast<unsigned>(id));
-                            impl->signal_interrupt(id, delay);
-                        },
-                        id == Service::GSP::InterruptId::P3D
-                            ? impl->rasterizer->GpuFenceVertices()
-                            : impl->rasterizer->GpuFenceAll());
-    };
-    impl->pica.SetInterruptHandler(post_interrupt);
-    impl->render_thread = std::make_unique<GpuThread>(
-        [this] { impl->pica.BindRasterizer(impl->rasterizer); });
-    LOG_INFO(HW_GPU, "GPU operations run on the render thread");
+    // The PICA raises P3D from inside a command list, as upstream: with its modelled delay,
+    // when the list's IRQ request comes, whatever sgxd still has running from it.
+    Service::GSP::InterruptHandler pica_interrupt = [this](Service::GSP::InterruptId id,
+                                                           u64 delay) { Signal(id, delay); };
+    impl->pica.SetInterruptHandler(pica_interrupt);
+
+    // Bind the rasterizer to the PICA GPU
+    impl->pica.BindRasterizer(impl->rasterizer);
 }
 
 GPU::~GPU() = default;
@@ -267,7 +253,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
                 }
             }
             PostToEmulation([this] { impl->signal_interrupt(Service::GSP::InterruptId::DMA, 0); },
-                            impl->rasterizer->GpuFenceAll());
+                            impl->rasterizer->GpuFencePtla());
         });
         break;
     }
@@ -534,23 +520,6 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
             UNREACHABLE_MSG("GPU: the fill of {:#x}-{:#x} was not done on the GPU",
                             config.GetStartAddress(), config.GetEndAddress());
         }
-
-        PostToEmulation([this, index, intr_index, start = config.GetStartAddress()] {
-            // It seems that it won't signal interrupt if "address_start" is zero.
-            // TODO: hwtest this
-            if (start != 0) {
-                GPU_TRACE("irq fill", intr_index);
-                if (intr_index == 0) {
-                    impl->signal_interrupt(Service::GSP::InterruptId::PSC0, 0);
-                } else if (intr_index == 1) {
-                    impl->signal_interrupt(Service::GSP::InterruptId::PSC1, 0);
-                }
-            }
-
-            // Set the "finish" flag once the fill is done (the trigger was reset above).
-            // This was confirmed to happen on hardware even if "address_start" is zero.
-            impl->pica.regs.memory_fill_config[index].finished.Assign(1);
-        }, impl->rasterizer->GpuFenceAll());
     });
 
     // Treat fill as texture transfer from VRAM

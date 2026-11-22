@@ -19,6 +19,7 @@
 #include "common/logging/log.h"
 #include "sgxd.h"
 #include "sgxd_program.h"
+#include "sgxd_ptla.h"
 #include "sgxd_recipe.h"
 #include "sgxd_session.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
@@ -32,6 +33,13 @@ namespace {
 // the display buffers at 1 GiB, the texture at 48 MiB.
 constexpr u32 RecipeVa = 0x01000000;
 constexpr u32 TextureVa = 0x03000000;
+// The parameter buffer every recipe shares (sgxd_recipe_pb), Sony's model: its page table at
+// 32 MiB, the pages 256 KiB on. Page numbers count from the DPM requestor base, this block's
+// address, so every recipe block lies within 256 MiB of it. 1024 pages hold two scenes in
+// flight at the 418 a recipe had to itself.
+constexpr u32 PbVa = 0x02000000;
+constexpr u32 PbPages = 1024;
+constexpr u32 PbSize = 0x40000 + PbPages * 0x1000;
 constexpr u32 DisplayVa = 0x40000000;
 constexpr u32 DisplayBuffers = 3;
 constexpr u32 DisplayBufferSize = 0x200000; // 960 * 544 * 4 rounded up to CDRAM's 256 KiB
@@ -69,8 +77,9 @@ constexpr u32 ScreenSlots = 2;
 
 struct State {
     bool initialized = false;
-    SceUID block = -1, cdram = -1, texture = -1, black = -1;
+    SceUID block = -1, cdram = -1, texture = -1, black = -1, pb = -1;
     u8* memory = nullptr;
+    u8* pb_memory = nullptr;
     u8* buffers = nullptr;
     u32 size = 0, texture_size = 0;
     u32 kicker_offset = 0;
@@ -82,6 +91,12 @@ struct State {
     u32 clear = 0xff000000;
     bool in_frame = false;
     bool failed = false;
+    // The last present's buffer, shown once its 3D is done (an async one's at the next
+    // BeginFrame), and the chain count by which it is.
+    bool shown_pending = false;
+    u8* shown_buffer = nullptr;
+    u32 shown_fence = 0;
+    u32 touches[4]{}; // the guest screens this frame samples, [lo, hi) GPU address pairs
     char failed_text[160]{};
 
     u32 screen_offset = 0;
@@ -115,8 +130,11 @@ void FreeBlocks() {
     if (g.block >= 0) {
         sceKernelFreeMemBlock(g.block);
     }
-    g.texture = g.cdram = g.block = -1;
-    g.memory = g.buffers = nullptr;
+    if (g.pb >= 0) {
+        sceKernelFreeMemBlock(g.pb);
+    }
+    g.texture = g.cdram = g.block = g.pb = -1;
+    g.memory = g.buffers = g.pb_memory = nullptr;
 }
 
 // The clear: a quad over the whole target that covers no pixel (DCMP never), so every tile is
@@ -290,6 +308,17 @@ bool Initialize(std::string* error) {
     }
     g = State{};
 
+    g.pb = sceKernelAllocMemBlock("sgxd_parameter_buffer", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+                                  PbSize, nullptr);
+    void* pb = nullptr;
+    ASSERT_MSG(g.pb >= 0 && sceKernelGetMemBlockBase(g.pb, &pb) >= 0,
+               "sgxd: no CDRAM for the parameter buffer ({:#010x})", static_cast<u32>(g.pb));
+    g.pb_memory = static_cast<u8*>(pb);
+    const u32 first = (PbVa + 0x40000 - RecipeVa) / 0x1000;
+    sgxd_recipe_pb = SgxdRecipePb{RecipeVa, PbVa, first, first + PbPages - 1};
+    sgxd_recipe_pb_write(g.pb_memory);
+    sgxd_recipe_pb_memory = g.pb_memory;
+
     // The layout, sized for the capacities. The arrays only have to hold valid draws for
     // sgxd_recipe_write; every frame writes its own in place (Batch).
     std::vector<u32> init_vertices(MaxVertices * VertexWords, 0);
@@ -358,6 +387,25 @@ bool Initialize(std::string* error) {
     }
     const int mapped = sgxdMap(RecipeVa, g.memory, g.size, 0);
     const int mapped_fb = sgxdMap(DisplayVa, g.buffers, DisplayBuffers * DisplayBufferSize, 0);
+    const int mapped_pb = g.pb >= 0 ? sgxdMap(PbVa, g.pb_memory, PbSize, 0) : 0;
+    ASSERT_MSG(mapped_pb == 0, "sgxd: the parameter buffer not mapped at GPU {:#010x}: {:#010x}",
+               PbVa, static_cast<u32>(mapped_pb));
+#ifdef VITA_DIAGNOSTICS
+    // A fault's post-mortem: the present's block (its region arrays, DPMSLOT) and the parameter
+    // buffer (the page table, the pages).
+    SgxdRenderer::SgxdBackend::fault_hook = [] {
+        if (std::FILE* f = std::fopen("host0:azahar-sgxd-present.bin", "wb")) {
+            std::fwrite(g.memory, 1, g.size, f);
+            std::fclose(f);
+        }
+        if (g.pb_memory) {
+            if (std::FILE* f = std::fopen("host0:azahar-sgxd-pb.bin", "wb")) {
+                std::fwrite(g.pb_memory, 1, PbSize, f);
+                std::fclose(f);
+            }
+        }
+    };
+#endif
     char failed[160] = "";
     const int init_ok = mapped == 0 && mapped_fb == 0
                             ? sgxd_session_init(&r, RecipeVa + g.kicker_offset, failed,
@@ -375,12 +423,19 @@ bool Initialize(std::string* error) {
         if (mapped == 0) {
             sgxdUnmap(RecipeVa, g.size);
         }
+        if (g.pb >= 0) {
+            sgxdUnmap(PbVa, PbSize);
+        }
         sgxdRelease();
         FreeBlocks();
         return false;
     }
     Report("sgxd: {} KiB at {:#010x}, {} display buffers at {:#010x}", g.size / 1024, RecipeVa,
            DisplayBuffers, DisplayVa);
+    if (g.pb >= 0) {
+        Report("sgxd: one parameter buffer, pages {:#x}-{:#x} at {:#010x}, requestor base {:#010x}",
+               sgxd_recipe_pb.first, sgxd_recipe_pb.last, PbVa + 0x40000, RecipeVa);
+    }
     g.initialized = true;
     return true;
 }
@@ -389,16 +444,22 @@ bool IsInitialized() {
     return g.initialized;
 }
 
+void ShowLast();
+
 void Shutdown() {
     if (!g.initialized) {
         return;
     }
+    ShowLast();
     ShowBlackFrame();
     if (g.texture_size) {
         sgxdUnmap(TextureVa, g.texture_size);
     }
     const int unmapped_fb = sgxdUnmap(DisplayVa, DisplayBuffers * DisplayBufferSize);
     const int unmapped = sgxdUnmap(RecipeVa, g.size);
+    if (g.pb >= 0) {
+        sgxdUnmap(PbVa, PbSize);
+    }
     const int released = sgxdRelease();
     Report("sgxd: unmap {:#x}, {:#x}; release {:#x} after {} frames", static_cast<u32>(unmapped),
            static_cast<u32>(unmapped_fb), static_cast<u32>(released), g.frame_index);
@@ -406,6 +467,70 @@ void Shutdown() {
     const SceUID black = g.black;
     g = State{};
     g.black = black;   // still on screen; the process's exit frees it
+}
+
+// Presents run as async lists (sgxd_session_render_overlap) while the rasterizer's renders do:
+// once sgxd's interrupt page is set up (the backend's).
+bool Async() {
+    return sgxd_ptla_page() != nullptr;
+}
+
+bool Busy() {
+    if (!g.initialized || !Async() || !g.shown_pending || sgxd_chain_reached(g.shown_fence)) {
+        return false;
+    }
+    // Its 3D finishes in the list after it: with the queue run down to it, that list goes now.
+    char failed[200] = "";
+    if (sgxd_session_pending() == &g.recipe && sgxd_chain_reached(sgxd_chain_fence()) &&
+        sgxd_session_finish_pending(failed, sizeof(failed)) < 0) {
+        ASSERT_MSG(false, "sgxd: the present's 3D did not finish: {}", failed);
+    }
+    if (sgxd_ptla_page()->chain_fault) {
+        sgxd_session_render_async_failed(failed, sizeof(failed));
+        ASSERT_MSG(false, "sgxd: the async present stopped: {}", failed);
+    }
+    return !sgxd_chain_reached(g.shown_fence);
+}
+
+// The last async present's 3D completes, then its buffer goes on screen. Before the recipe block
+// or the texture is written again: its 3D reads them.
+void ShowLast() {
+    if (!g.shown_pending) {
+        return;
+    }
+    g.shown_pending = false;
+    char failed[200] = "";
+    SgxdRenderer::SgxdTrace("flip", sgxd_chain_reached(g.shown_fence) ? 1u : 0u);
+    if (!sgxd_chain_reached(g.shown_fence)) {
+        // No list after it has finished its 3D: one does now.
+        if (sgxd_session_pending() == &g.recipe &&
+            sgxd_session_finish_pending(failed, sizeof(failed)) < 0) {
+            ASSERT_MSG(false, "sgxd: the present's 3D did not finish: {}", failed);
+        }
+        if (sgxd_chain_idle() < 0) {
+            sgxd_session_render_async_failed(failed, sizeof(failed));
+            ASSERT_MSG(false, "sgxd: the async present stopped: {}", failed);
+        }
+    }
+    u8* const buffer = g.shown_buffer;
+    static u32 dump_index = 0;
+    if (dump_requested) {
+        dump_requested = false;
+        SgxdRenderer::SgxdCacheRange(buffer, DisplayWidth * DisplayHeight * 4, SGXD_CACHE_INVALIDATE,
+                                    SgxdRenderer::CacheSite::Other);
+        char path[64];
+        std::snprintf(path, sizeof(path), "ux0:data/azahar/frame_%02u.ppm", dump_index++ % 20);
+        WriteDisplayPpm(path, buffer);
+        LOG_INFO(Frontend, "wrote {}", path);
+    }
+    static const bool novsync = GxmRenderer::GxmFlag("novsync");
+    if (!novsync) {
+        sceDisplayWaitSetFrameBuf();
+    }
+    const int shown = ShowFrame(buffer);
+    if (shown < 0) {
+        LOG_ERROR(Frontend, "sgxd: sceDisplaySetFrameBuf {:#010x}", static_cast<u32>(shown));
+    }
 }
 
 bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
@@ -430,6 +555,7 @@ bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
         return false;
     }
     g.texture_size = size;
+    ShowLast();
     u32 words[4];
     sgxd_recipe_texture_words(TextureVa, width, height, bilinear ? 1 : 0, words);
     sgxd_recipe_set_texture(&g.recipe, g.memory, words);
@@ -440,7 +566,9 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
     if (!g.initialized) {
         return;
     }
+    ShowLast();
     g.back = g.frame_index % DisplayBuffers;
+    std::memset(g.touches, 0, sizeof(g.touches));
     g.clear = 0xff000000u | static_cast<u32>(clear_b) << 16 | static_cast<u32>(clear_g) << 8 |
               clear_r;
     Batch& b = g.batch;
@@ -473,6 +601,8 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
     const u32 texels = stride / bytes;
     const float u_end = 240.0f / static_cast<float>(texels);
     const u32 slot = g.screens_in_frame++;
+    g.touches[slot * 2] = va;
+    g.touches[slot * 2 + 1] = va + stride * columns;
     // A picture the CPU drew is in memory before the GPU reads it.
     if (cpu != nullptr) {
         SgxdRenderer::SgxdCacheRange(cpu, stride * columns, SGXD_CACHE_CLEAN,
@@ -542,8 +672,29 @@ void EndFrame() {
     }
 #endif
     sgxd_recipe_restage(&r, g.memory);
-    SgxdSessionRender render{};
     SgxdRenderer::SgxdTrace("sgx_present");
+    if (Async()) {
+        // After the display transfer's blit: this list's TA runs over its 3D, then waits for it
+        // (the guest screens are its output). The buffer goes on screen at the next BeginFrame,
+        // once this 3D is done; three buffers keep it apart from the shown and the queued one.
+        if (sgxd_session_render_overlap(&r, g.touches, failed, sizeof(failed)) < 0) {
+            std::snprintf(g.failed_text, sizeof(g.failed_text), "%s", failed);
+            g.failed = true;
+            Report("sgxd: frame {} stopped: {}", g.frame_index, failed);
+            return;
+        }
+        g.shown_pending = true;
+        g.shown_buffer = buffer;
+        g.shown_fence = sgxd_chain_fence() + 1;
+        SgxdRenderer::SgxdTrace("sgx_present_end");
+        if (g.frame_index % 600 == 0) {
+            Report("sgxd: frame {}: {} draws, {} vertices, {} indices (async)", g.frame_index,
+                   g.batch.draw_count, g.batch.vertex_count, g.batch.index_count);
+        }
+        g.frame_index++;
+        return;
+    }
+    SgxdSessionRender render{};
     if ((g.frame_index > 0 && sgxd_session_phase(&r, sgxd_session_slc_inval, "slc", failed,
                                                  sizeof(failed)) < 0) ||
         sgxd_session_render(&r, &render, failed, sizeof(failed)) < 0) {
@@ -555,29 +706,10 @@ void EndFrame() {
         return;
     }
     SgxdRenderer::SgxdTrace("sgx_present_end");
-
-    static u32 dump_index = 0;
-    if (dump_requested) {
-        dump_requested = false;
-        GxmRenderer::SgxdCacheRange(buffer, DisplayWidth * DisplayHeight * 4, SGXD_CACHE_INVALIDATE,
-                                    GxmRenderer::CacheSite::Other);
-        char path[64];
-        std::snprintf(path, sizeof(path), "ux0:data/azahar/frame_%02u.ppm", dump_index++ % 20);
-        WriteDisplayPpm(path, buffer);
-        LOG_INFO(Frontend, "wrote {}", path);
-    }
-
-    // The frame before must be on screen before this one is queued: with three buffers the one
-    // rendered next is then neither shown nor queued. `novsync` (diagnostics) skips the wait and
-    // may tear.
-    static const bool novsync = GxmRenderer::GxmFlag("novsync");
-    if (!novsync) {
-        sceDisplayWaitSetFrameBuf();
-    }
-    const int shown = ShowFrame(buffer);
-    if (shown < 0) {
-        LOG_ERROR(Frontend, "sgxd: sceDisplaySetFrameBuf {:#010x}", static_cast<u32>(shown));
-    }
+    g.shown_pending = true;
+    g.shown_buffer = buffer;
+    g.shown_fence = sgxd_chain_fence();
+    ShowLast();
     if (g.frame_index % 600 == 0) {
         Report("sgxd: frame {}: {} draws, {} vertices, {} indices; TA {} us, 3D {} us",
                g.frame_index, g.batch.draw_count, g.batch.vertex_count, g.batch.index_count,

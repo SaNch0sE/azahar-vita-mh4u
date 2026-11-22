@@ -95,10 +95,7 @@ public:
     bool AccelerateImmediateVertex(const Pica::AttributeBuffer& input) override;
     void FlushImmediate() override;
     void NotifyP3D() override;
-    GpuFence GpuFenceAll() const override;
-    GpuFence GpuFenceVertices() const override;
-    GpuFence GpuFenceTransfer() const override;
-    bool GpuFenceReached(const GpuFence& fence) const override;
+    void GpuIdle() override;
     u64 GpuWaitUs() const override;
 #endif
     std::vector<std::pair<PAddr, u32>> TakeCachedReads() override;

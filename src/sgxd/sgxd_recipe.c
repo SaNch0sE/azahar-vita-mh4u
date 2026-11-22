@@ -11,7 +11,7 @@
 
 const char *const sgxd_recipe_names[SGXD_R_COUNT] = {
     "PT", "PAGES", "RGN0", "RGN1", "RGN2", "RGN3", "EXTZ", "TPC0", "TPC1", "TPC2", "TPC3",
-    "BGREC", "FB", "DEPTH", "STREAM", "STATE", "VERTS", "INDICES", "PDS", "COPY", "VSPDS",
+    "BGREC", "DPMSLOT", "FB", "DEPTH", "STREAM", "STATE", "VERTS", "INDICES", "PDS", "COPY", "VSPDS",
     "VSEC", "TERM", "FSEC", "FPRIM", "BGSEC", "BGPRIM", "PIXEV", "IDLE", "COPY1", "COPY2",
     "COPY3", "COPY4", "COPY5", "COPY6", "COPY7", "CV", "CF", "END",
 };
@@ -566,6 +566,9 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     }
     L[SGXD_R_BGREC] = o;
     o += 128;
+    // DPM_STATE_TABLE_BASE: 16-byte aligned, the slot's 34 words.
+    L[SGXD_R_DPMSLOT] = o;
+    o += 256;
     o = (o + 0xfff) & ~0xfffu;
     L[SGXD_R_FB] = o;
     o += W * H * 4;
@@ -606,17 +609,31 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     o += 0x400;
     L[SGXD_R_END] = o;
 
-    const uint32_t req_base = base & ~0xfffffu;
-    r->first = (sgxd_recipe_va(r, SGXD_R_PAGES) - req_base) / 0x1000;
-    r->last = r->first + pages - 1;
+    r->shared_pb = sgxd_recipe_pb.last != 0;
+    if (r->shared_pb) {
+        r->req_base = sgxd_recipe_pb.req_base;
+        r->pt = sgxd_recipe_pb.pt;
+        r->first = sgxd_recipe_pb.first;
+        r->last = sgxd_recipe_pb.last;
+    } else {
+        r->req_base = base;
+        r->pt = sgxd_recipe_va(r, SGXD_R_PT);
+        r->first = (sgxd_recipe_va(r, SGXD_R_PAGES) - base) / 0x1000;
+        r->last = r->first + pages - 1;
+    }
+    // The BGREC tag is 24 bits of 16 bytes from the 3D's requestor base.
+    if (sgxd_recipe_va(r, SGXD_R_END) - r->req_base > 0x10000000u) {
+        return -1;
+    }
+    const uint32_t pb_pages = r->last - r->first + 1;
     r->ta_free_list = r->last << 16 | r->first;
     r->ta_alloc = (r->last - 1) << 16;
-    r->ta_threshold = pages + 16;
-    const uint32_t gbl = pages - 34;
+    r->ta_threshold = pb_pages + 16;
+    const uint32_t gbl = pb_pages - 34;
     const uint32_t mn = r->ta_threshold < gbl ? r->ta_threshold : gbl;
     r->pds_threshold = mn > 256 ? mn - 256 : 0;
     r->global_list = 0x10000 | gbl;
-    r->bgobjtag = (((sgxd_recipe_va(r, SGXD_R_BGREC) - req_base) >> 4) & 0xffffffu) | 2u << 24;
+    r->bgobjtag = (((sgxd_recipe_va(r, SGXD_R_BGREC) - r->req_base) >> 4) & 0xffffffu) | 2u << 24;
     r->bgobjdepth = fbits(1.0f);
 
     r->pbe[0] = SGXD_RECIPE_PACK_U8888;
@@ -670,13 +687,42 @@ static void fill(uint8_t *memory, uint32_t offset, uint32_t value, uint32_t byte
 }
 
 // The DPM page table's free list: page p links p - 1 and p + 1, 0xffff at both ends.
-static void put_page_list(const SgxdRecipe *r, uint8_t *memory) {
-    uint32_t *pt = (uint32_t *)(memory + r->offset[SGXD_R_PT]);
-    for (uint32_t p = r->first; p <= r->last; p++) {
-        const uint32_t prev = p != r->first ? p - 1 : 0xffff;
-        const uint32_t next = p != r->last ? p + 1 : 0xffff;
+static void page_list(uint32_t *pt, uint32_t first, uint32_t last) {
+    for (uint32_t p = first; p <= last; p++) {
+        const uint32_t prev = p != first ? p - 1 : 0xffff;
+        const uint32_t next = p != last ? p + 1 : 0xffff;
         pt[p] = prev << 16 | next;
     }
+}
+
+// A recipe's own page list, rewritten for every pass: without the shared buffer each TA loads
+// the whole list again. The shared buffer's is the DPM's once written.
+static void put_page_list(const SgxdRecipe *r, uint8_t *memory) {
+    if (!r->shared_pb) {
+        page_list((uint32_t *)(memory + r->offset[SGXD_R_PT]), r->first, r->last);
+    }
+}
+
+SgxdRecipePb sgxd_recipe_pb;
+// The shared buffer's free lists are loaded in the DPM: the TA's, the 3D's (build order).
+static int pb_ta_loaded, pb_3d_loaded;
+
+void sgxd_recipe_pb_write(void *pt_memory) {
+    page_list(pt_memory, sgxd_recipe_pb.first, sgxd_recipe_pb.last);
+    sgxd_recipe_pb_reset();
+}
+
+void *sgxd_recipe_pb_memory;
+
+void sgxd_recipe_pb_rewrite(void) {
+    if (sgxd_recipe_pb_memory && sgxd_recipe_pb.last != 0) {
+        sgxd_recipe_pb_write(sgxd_recipe_pb_memory);
+    }
+}
+
+void sgxd_recipe_pb_reset(void) {
+    pb_ta_loaded = 0;
+    pb_3d_loaded = 0;
 }
 
 void sgxd_recipe_restage(const SgxdRecipe *r, void *memory_) {
@@ -971,48 +1017,55 @@ static void idle_event(const SgxdRecipe *r, SgxdOpList *l) {
     wr(l, CORE(0, 0x0a6c), 1);
 }
 
+// The TA kick and TA done write only what the TA side uses: the next pass's TA runs while the
+// last pass's 3D does, and Sony's microkernel writes none of the 3D side's registers there
+// (they all come between one 3D's end and the next 3D's kick).
 void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
-    // T0.4-T0.8: the code bases, TA_CLK_GATE, the caches, the clocks and DMS_CTRL.
-    wr(l, 0x0a10, sgxd_recipe_va(r, SGXD_R_CF) >> 6 | 1u << 26);
+    // T0.4-T0.8: the vertex code base, TA_CLK_GATE, the caches, the clocks and DMS_CTRL.
     wr(l, 0x0a0c, sgxd_recipe_va(r, SGXD_R_CV) >> 6);
     for (unsigned c = 0; c < 4; c++) {
         wr(l, CORE(c, 0x0310), 1);
     }
-    static const uint32_t invalidates[] = {
-        0x0810, 0x0808, 0x0a08, 0x8810, 0x8808, 0x8a08, 0xc810, 0xc808, 0xca08,
-    };
-    for (unsigned n = 0; n < sizeof(invalidates) / 4; n++) {
-        if ((sgxd_recipe_tatrim & 2) && invalidates[n] >= 0x8000) {
-            continue;
-        }
-        if (!r->keep_code_caches || (invalidates[n] & 0x3fff) != 0x0a08) {
-            wr(l, invalidates[n], 1);
-        }
+    idle_event(r, l);
+    // The broadcast invalidates only, as Sony's: a core's own (0x8810, 0x8808, 0x8a08 and core
+    // 1's) with a 3D in flight stops that 3D.
+    wr(l, 0x0810, 1);
+    wr(l, 0x0808, 1);
+    if (!r->keep_code_caches) {
+        wr(l, 0x0a08, 1);
     }
-    wr(l, 0x043c, 1);
+    // PDS_INV0 and PDS_INV_CSC, as Sony's TA kick: their events are bits 1 and 0.
     wr(l, 0x0ad0, 1);
-    wr(l, 0x0ad4, 1);
     wr(l, 0x0ae0, 1);
-    poll(l, 0x0138, 7, 7, SETUP_POLL_US);
-    wr(l, 0x0140, 7);
+    poll(l, 0x0138, 3, 3, SETUP_POLL_US);
+    wr(l, 0x0140, 3);
     wr(l, 0x0004, 0x0a8a4a6a);
     wr(l, 0x0a74, 0x0e208200);
 
+    // The DPM's two state slots (DPM_STATE_CONTEXT_ID: LS bit 0, DALLOC bit 1, ALLOC bit 2,
+    // NCOP bit 3): slot 0 for both, or with the shared buffer Sony's (5, LS and ALLOC slot 1,
+    // DALLOC slot 0, then 0xd). Sony's microkernel writes only 0xa and 0xd (and 2 and 5 before
+    // them) with a 3D in flight: its TA never clears the 3D's slot.
+    const uint32_t dpm = r->shared_pb ? 5 : 0;
+    wr(l, 0x0630, dpm | 8);
     // T1: the requestor bases and the DPM's TA free list.
-    const uint32_t pt = sgxd_recipe_va(r, SGXD_R_PT);
+    // With the shared buffer, the free list once: Sony's TA writes none of it again.
+    wr(l, 0x0c90, r->req_base);
     const uint32_t t1[][2] = {
-        {0x0c90, r->base}, {0x0cac, r->base}, {0x0cb0, r->base},
-        {0x0618, pt}, {0x061c, r->ta_free_list}, {0x0648, r->ta_alloc}, {0x0638, 0},
+        {0x0618, r->pt}, {0x061c, r->ta_free_list}, {0x0648, r->ta_alloc}, {0x0638, 0},
         {0x0620, r->ta_threshold}, {0x0614, r->pds_threshold}, {0x0624, r->pds_threshold},
         {0x0628, r->global_list}, {0x480c, 0xffffffffu}, {0x0664, 3},
     };
-    for (unsigned n = 0; n < sizeof(t1) / sizeof(t1[0]); n++) {
-        wr(l, t1[n][0], t1[n][1]);
+    if (!r->shared_pb || !pb_ta_loaded) {
+        for (unsigned n = 0; n < sizeof(t1) / sizeof(t1[0]); n++) {
+            wr(l, t1[n][0], t1[n][1]);
+        }
+        wr(l, 0x0114, 1);
+        wr(l, 0x0684, 1);
+        poll(l, 0x0118, 1, 1, SETUP_POLL_US);
+        wr(l, 0x0114, 1);
+        pb_ta_loaded = r->shared_pb;
     }
-    wr(l, 0x0114, 1);
-    wr(l, 0x0684, 1);
-    poll(l, 0x0118, 1, 1, SETUP_POLL_US);
-    wr(l, 0x0114, 1);
 
     // T2: TE and MTE, then each core's region array, tail pointer cache and TE_STATE.
     const uint32_t t2[][2] = {
@@ -1032,13 +1085,12 @@ void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
     idle_event(r, l);
 
     // T3: the scene reset.
-    if (sgxd_recipe_rgnwait) {
-        for (unsigned c = 1; c < 4; c++) {
-            wr(l, CORE(c, 0x0114), 0x20);
-        }
+    // Cores 1-3's init events from the last scene, so the wait below sees this one's.
+    for (unsigned c = 1; c < 4; c++) {
+        wr(l, CORE(c, 0x0114), 0x20);
     }
     const uint32_t t3[][2] = {
-        {0x0630, 0}, {0x435c, 1}, {0x4368, 1}, {0x0380, 1}, {0x0630, 8}, {0x0694, 2},
+        {0x0630, dpm}, {0x435c, 1}, {0x4368, 1}, {0x0380, 1}, {0x0630, dpm | 8}, {0x0694, 2},
         {0x0698, 2}, {0x024c, 1},
     };
     for (unsigned n = 0; n < sizeof(t3) / sizeof(t3[0]); n++) {
@@ -1046,9 +1098,10 @@ void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
     }
     poll(l, 0x012c, 0x00100240, 0x00100240, SETUP_POLL_US);
     wr(l, 0x0134, 0x00100240);
-    // Latches in every core; the probe waited on core 0 (test 03 read cores 1-3 still 0xa0).
-    // rgnwait: every core's, each cleared before the next T3 (diagnostics, runs44).
-    for (unsigned c = 0; c < (sgxd_recipe_rgnwait ? 4u : 1u); c++) {
+    // Each core's TE initialises its own region array, and latches its own event: waiting on
+    // core 0's alone lets the kick start before cores 1-3 finish, and a header left with the
+    // sentinel sends the next 3D to page 0xeeee.
+    for (unsigned c = 0; c < 4; c++) {
         poll(l, CORE(c, 0x0118), 0x20, 0x20, SETUP_POLL_US);
         wr(l, CORE(c, 0x0114), 0x20);
     }
@@ -1086,26 +1139,48 @@ void sgxd_recipe_ta_done(const SgxdRecipe *r, SgxdOpList *l) {
         wr(l, t5[n][0], t5[n][1]);
     }
     poll(l, 0x012c, 0x400, 0x400, SETUP_POLL_US);
-    wr(l, 0x0080, 0x40);
-    wr(l, 0x0080, 0);
     wr(l, 0x0134, 0x400);
-    wr(l, 0x0004, 0x0a8a8aaa);
     sgxd_recipe_slc(l, 1);
 }
 
 void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
-    // D1: the DPM's 3D free list, no deallocation, no partial render.
-    wr(l, 0x0630, 8);
-    wr(l, 0x0600, sgxd_recipe_va(r, SGXD_R_PT));
-    wr(l, 0x0604, r->ta_free_list);
-    wr(l, 0x064c, r->ta_alloc);
-    wr(l, 0x0660, 0);
-    wr(l, 0x0664, 5);
-    wr(l, 0x0114, 2);
-    wr(l, 0x0680, 1);
-    poll(l, 0x0118, 2, 2, SETUP_POLL_US);
-    wr(l, 0x0114, 2);
-    wr(l, 0x063c, 0);
+    // D0: the 3D side's bases and SOFT_RESET bit 6's pulse, where Sony's microkernel has them.
+    wr(l, 0x0080, 0x40);
+    wr(l, 0x0080, 0);
+    wr(l, 0x0a10, sgxd_recipe_va(r, SGXD_R_CF) >> 6 | 1u << 26);
+    wr(l, 0x0cac, r->req_base);
+    wr(l, 0x0cb0, r->req_base);
+    // D1: the DPM. With the shared buffer, Sony's: the TA's slot 1 into the scene's DPMSLOT table and the table
+    // into the 3D's slot 0 (DPM_STATE_STORE 0x10 and LOAD 0x20 in EVENT_STATUS), the 3D free
+    // list once, and a deallocating render (DPM_3D_DEALLOCATE ENABLE and GLOBAL).
+    if (r->shared_pb) {
+        const uint32_t ta = 5, d3 = 4;
+        const uint32_t table = sgxd_recipe_va(r, SGXD_R_DPMSLOT);
+        const uint32_t task[2][3] = {{ta, 1, 0x10}, {d3, 4, 0x20}};
+        for (unsigned n = 0; n < 2; n++) {
+            wr(l, 0x0630, task[n][0]);
+            wr(l, 0x062c, table);
+            wr(l, 0x0134, task[n][2]);
+            wr(l, 0x0694, task[n][1]);
+            poll(l, 0x012c, task[n][2], task[n][2], SETUP_POLL_US);
+            wr(l, 0x0134, task[n][2]);
+        }
+    } else {
+        wr(l, 0x0630, 8);
+    }
+    if (!r->shared_pb || !pb_3d_loaded) {
+        wr(l, 0x0600, r->pt);
+        wr(l, 0x0604, r->ta_free_list);
+        wr(l, 0x064c, r->ta_alloc);
+        wr(l, 0x0660, 0);
+        wr(l, 0x0664, 5);
+        wr(l, 0x0114, 2);
+        wr(l, 0x0680, 1);
+        poll(l, 0x0118, 2, 2, SETUP_POLL_US);
+        wr(l, 0x0114, 2);
+        pb_3d_loaded = r->shared_pb;
+    }
+    wr(l, 0x063c, r->shared_pb ? 3 : 0);
     wr(l, 0x0658, 0);
     wr(l, 0x0004, 0x0a8a4a6a);
 
@@ -1159,9 +1234,14 @@ void sgxd_recipe_3d_wait(SgxdOpList *l, uint32_t timeout_us) {
 }
 
 void sgxd_recipe_3d_done(const SgxdRecipe *r, SgxdOpList *l) {
-    (void)r;
     for (unsigned c = 0; c < 4; c++) {
         poll(l, CORE(c, 0x0008), 0x186, 0, SETUP_POLL_US);
+    }
+    // A deallocating render's pages are back in the list at DPM_3D_MEM_FREE, after
+    // PIXELBE_END_RENDER. Sony's 3D done acknowledges both; the next 3D kick's store and load
+    // must not meet the DPM still deallocating (the master then reads page 0xeeee).
+    if (r->shared_pb) {
+        poll(l, 0x012c, 1, 1, SETUP_POLL_US);
     }
     wr(l, 0x0134, 0x00040001);
     wr(l, 0x4134, 0x00040001);

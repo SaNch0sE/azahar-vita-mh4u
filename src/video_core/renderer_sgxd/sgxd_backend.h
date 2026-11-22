@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
 #include <span>
 #include <string>
@@ -100,17 +101,17 @@ public:
     /// op's completion point.
     [[nodiscard]] u32 PtlaFence() const;
     [[nodiscard]] bool PtlaReached(u32 fence) const;
-    /// Renders run as one async list each (sgxd_session_render_async), unless gxm_flags
-    /// renderpoll or ptlapoll: EndPass returns once the TA is kicked. RenderFence is the last
-    /// pass's, 0 when synchronous; RenderTaReached when its TA has read the vertices.
-    [[nodiscard]] bool RenderAsync() const {
-        return render_async;
-    }
+    /// Renders run as one async list each (sgxd_session_render_overlap): EndPass returns once
+    /// the TA is kicked; RenderTaReached when its TA has read the vertices. A pass's TA runs
+    /// while the pass before's 3D does: its list ends at its own 3D kick, and the next list, or
+    /// RenderFinish's, waits for that 3D. RenderFence counts that list; RenderTaFence the
+    /// pass's own.
     [[nodiscard]] u32 RenderFence() const;
+    [[nodiscard]] u32 RenderTaFence() const;
     [[nodiscard]] bool RenderReached(u32 fence) const;
     [[nodiscard]] bool RenderTaReached(u32 fence) const;
-    /// Waits for the last async render, and stops the process with the post-mortem if it
-    /// failed.
+    /// Waits for the last async render, 3D included, and stops the process with the
+    /// post-mortem if it failed.
     void RenderIdle(const char* why);
     /// Every list sent so far, and the pending 3D's finish (sent by RenderWait if needed).
     [[nodiscard]] u32 FenceAll() const;
@@ -132,6 +133,13 @@ public:
     [[nodiscard]] bool RetirePending() const {
         return !retire.empty();
     }
+    /// Hands a pending 3D its finishing list without waiting for it, if something waits on it
+    /// (RenderFence): after each GPU op (RasterizerInterface::GpuIdle). Otherwise the next
+    /// pass's list finishes it.
+    void RenderFinish();
+    /// A PTLA fill or copy is about to touch GPU addresses [lo, hi): the pending 3D's finish
+    /// goes in the queue first if it writes or samples any of them. Nothing waits.
+    void RenderBefore(u32 lo, u32 hi, const char* why);
     [[nodiscard]] const SgxdEvents& Events() const {
         return events;
     }
@@ -264,6 +272,8 @@ private:
         u32 bg_offset{};  // the background colour word and its SA secondary, after the layout
         u32 code_begin{}; // the code heap's copy, from the block's start
         bool side{};      // the untile's, which no pass shares
+        u32 instance{};   // up to MaxInstances of each size, the pending pass's among them
+        u32 fence{};      // the list that completes its last render's 3D
     };
     /// A size's instances at most: a render's recipe is the GPU's until its 3D completes, and
     /// the CPU writes the next render's into another.
@@ -339,6 +349,11 @@ private:
     std::vector<PlacedCode> placed_code;
     u32 pds_begin{}, pds_used{}, pds_end{};
     u32 data_begin{}, data_used{}, data_end{};
+    /// The pass data's slots, in turn, each with its last pass's fence. The guest waits for
+    /// P3D before its next command list, so only passes of one list follow each other unwaited.
+    static constexpr u32 DataSlots = 2;
+    u32 data_slot{};
+    std::array<u32, DataSlots> data_fence{};
     u32 lut_begin{};
     /// The last passes' fences by number (passes % PassFences): WaitPassMark's.
     static constexpr u32 PassFences = 64;
@@ -346,8 +361,34 @@ private:
     std::vector<std::pair<u32, std::function<void()>>> retire;
     void RetireReached();
     SgxdEvents events{};
-    bool ptla_async{};
-    bool render_async{};
+    // The 3D kicked at its list's end and not known to be done is sgxd_session_pending's (ours or
+    // the present's). What the open pass's 3D writes and samples outside its recipe and the pass
+    // data (GPU addresses).
+    struct Footprint {
+        u32 lo, hi;
+    };
+    Footprint pass_target{}, pass_source{};
+    /// Our recipe whose 3D is pending, or null (none, or the present's).
+    [[nodiscard]] Recipe* Pending() const;
+    /// Why a pending 3D is finished by a list of its own rather than the next render list's
+    /// (perflog counts them: the next pass's TA then overlaps no 3D).
+    enum class FinishWhy : u8 {
+        Idle,
+        Wait,
+        Remap,
+        Fenced,
+        Touch,
+        Poll,
+        Kick,
+        PdsFlip,
+        FreeSurface,
+        FreeTexture,
+        Count,
+    };
+    /// Submits the pending 3D's finishing list once the list before has ended.
+    void FinishPending(FinishWhy why);
+    /// gxm_flags tracelog: the ended lists' GPU stamps as events.
+    void TraceStamps();
     void Fault(const Recipe& r, const char* failed);
     std::unordered_map<std::string, u32> pds_by_words;
 

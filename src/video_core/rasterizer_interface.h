@@ -103,35 +103,11 @@ public:
     /// index buffers of the draws before it.
     virtual void NotifyP3D() {}
 
-    /// A point in the GPU work the rasterizer submitted, which a posted interrupt waits for
-    /// (GPU::PostToEmulation). Counts compare with wrap-around; a false flag skips its count.
-    struct GpuFence {
-        bool twod{};      // the PTLA ops (fills, DMA) up to twod_count
-        bool ta{};        // the renders up to render_count, their TA only (vertices read)
-        bool render{};    // the renders up to render_count, complete
-        u32 twod_count{};
-        u32 render_count{};
+    /// A GSP operation or a present has run: GPU work held back for the next one starts.
+    virtual void GpuIdle() {}
 
-        [[nodiscard]] bool Any() const {
-            return twod || ta || render;
-        }
-    };
-    /// Everything submitted so far. The GPU runs it after the call returns.
-    virtual GpuFence GpuFenceAll() const {
-        return {};
-    }
-    /// The renders submitted so far up to their TA: after it, the guest may overwrite their
-    /// vertex and index buffers (P3D).
-    virtual GpuFence GpuFenceVertices() const {
-        return {};
-    }
-    /// A display transfer's completion (PPF): GpuFenceAll, or less where the renderer knows the
-    /// guest will not touch the output before it is written.
-    virtual GpuFence GpuFenceTransfer() const {
-        return GpuFenceAll();
-    }
-    /// The render thread's time spent waiting for the GPU so far, in microseconds (diagnostics
-    /// builds; 0 otherwise).
+    /// The time spent waiting for the GPU so far, in microseconds (diagnostics builds; 0
+    /// otherwise).
     virtual u64 GpuWaitUs() const {
         return 0;
     }

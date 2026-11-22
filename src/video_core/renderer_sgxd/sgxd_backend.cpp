@@ -38,7 +38,8 @@ u64 WaitMark() {
 
 // GPU address map: docs/sgxd/memory.md.
 constexpr u32 BlockVa = 0x04000000;
-constexpr u32 RecipesEnd = 0x18000000;
+// With the shared parameter buffer, every block within 256 MiB of the DPM requestor base.
+constexpr u32 RecipesEnd = 0x11000000;
 constexpr u32 SurfacesVa = 0x48000000;
 constexpr u32 SurfacesSize = 8u << 20;
 // The guest textures' host copies, after the surfaces. They are U8888, 8 times an ETC1
@@ -87,6 +88,8 @@ void FreeBlock(u8* cpu, u32 va, u32 size, int uid) {
     sceKernelFreeMemBlock(uid);
 }
 
+SgxdBackend* drain_owner;
+
 } // Anonymous namespace
 
 SgxdBackend::SgxdBackend() {
@@ -97,7 +100,7 @@ SgxdBackend::SgxdBackend() {
     pds_end = pds_begin + PdsSize;
     data_begin = data_used = pds_end;
     data_end = data_begin + DataSize;
-    lut_begin = data_end;
+    lut_begin = data_begin + DataSlots * DataSize;
     shared_size = AlignUp(lut_begin + LutSize, 1u << 20);
     shared = MapBlock("azahar-sgxd-shared", BlockVa, shared_size, shared_block);
     next_va = BlockVa + shared_size;
@@ -110,25 +113,41 @@ SgxdBackend::SgxdBackend() {
     // A layout only has to hold MaxDraws valid draws; each pass writes its own.
     init_draws.assign(MaxDraws, SgxdRecipeDraw{0, 3, SGXD_RECIPE_ISP_NEVER, SGXD_R_FPRIM, 0, 0,
                                                nullptr});
-    if (!GxmFlag("ptlapoll")) {
-        const int r = sgxd_ptla_events(&events);
-        ASSERT_MSG(r == 0, "sgxd: no PTLA completion interrupt ({:#010x})", static_cast<u32>(r));
-        ptla_async = true;
-    }
-    // A render's TA done, 3D kick and 3D done run from IRQ 52 as well; gxm_flags renderpoll
-    // keeps them in the render thread's syscalls.
-    render_async = ptla_async && !GxmFlag("renderpoll");
-    LOG_INFO(Render, "sgxd: renders {}", render_async ? "as async lists" : "synchronous");
+    // frames a second against 230 polled. A render's TA done, 3D kick and
+    // 3D done run from IRQ 52 as well, as async lists, a pass's TA over the 3D before.
+    const int irq = sgxd_ptla_events(&events);
+    ASSERT_MSG(irq == 0, "sgxd: no PTLA completion interrupt ({:#010x})", static_cast<u32>(irq));
+    // sgxd_gpu_idle (a block mapped or freed) completes the pending 3D first.
+    drain_owner = this;
+    sgxd_set_render_drain([] {
+        drain_owner->RenderIdle("sgxd_gpu_idle");
+        return 0;
+    });
     // Four macrotiles a side at every size: the cores' loads then follow the scene's quadrants.
     sgxd_recipe_grid = 4;
 #ifdef VITA_DIAGNOSTICS
-    if (GxmFlag("grid2")) {
-        sgxd_recipe_grid = 0;
-    }
 #endif
 }
 
 u32 SgxdBackend::RenderFence() const {
+    // The pending 3D completes in the list after the last one sent; RenderFinish sends that list if
+    // nothing else does.
+    const bool pending = sgxd_session_pending() != nullptr;
+    sgxd_session_pending_fence();
+    return sgxd_chain_fence() + (pending ? 1 : 0);
+}
+
+SgxdBackend::Recipe* SgxdBackend::Pending() const {
+    const SgxdRecipe* p = sgxd_session_pending();
+    for (const auto& r : recipes) {
+        if (&r->recipe == p) {
+            return r.get();
+        }
+    }
+    return nullptr;
+}
+
+u32 SgxdBackend::RenderTaFence() const {
     return sgxd_chain_fence();
 }
 
@@ -163,7 +182,11 @@ void SgxdBackend::TraceStamps() {
 }
 
 void SgxdBackend::RenderIdle(const char* why) {
-    if (!render_async || sgxd_chain_idle() == 0) {
+    [[maybe_unused]] const u64 before = WaitMark();
+    FinishPending(FinishWhy::Idle);
+    if (sgxd_chain_idle() == 0) {
+        TraceStamps();
+        WaitSite(why, before);
         RetireReached();
         return;
     }
@@ -232,6 +255,36 @@ void SgxdBackend::RetireAll(const char* why) {
     }
 }
 
+void SgxdBackend::FinishPending([[maybe_unused]] FinishWhy why) {
+    if (!sgxd_session_pending()) {
+        return;
+    }
+#ifdef VITA_DIAGNOSTICS
+    finishes[static_cast<std::size_t>(why)]++;
+#endif
+    Recipe* const r = Pending();
+    SgxdTrace("finish");
+    char failed[200] = "";
+    if (sgxd_session_finish_pending(failed, sizeof(failed)) != 0) {
+        LOG_CRITICAL(Render, "sgxd: the pending 3D's finish did not start");
+        Fault(r ? *r : *current, failed);
+    }
+}
+
+void SgxdBackend::RenderFinish() {
+    if (sgxd_session_pending_fenced()) {
+        FinishPending(FinishWhy::Fenced);
+    }
+}
+
+void SgxdBackend::RenderBefore(u32 lo, u32 hi, [[maybe_unused]] const char* why) {
+    FlushStreamOut(false);
+    // The op is queued behind the finish, which the kernel runs first.
+    if (sgxd_session_pending_touches(lo, hi)) {
+        FinishPending(FinishWhy::Touch);
+    }
+}
+
 u32 SgxdBackend::PtlaFence() const {
     return sgxd_ptla_fence();
 }
@@ -241,9 +294,9 @@ bool SgxdBackend::PtlaReached(u32 fence) const {
 }
 
 SgxdBackend::~SgxdBackend() {
-    if (ptla_async) {
-        sgxd_ptla_events(nullptr);
-    }
+    RenderIdle("the backend's end");
+    sgxd_set_render_drain(nullptr);
+    sgxd_ptla_events(nullptr);
     for (const auto& r : recipes) {
         FreeBlock(r->memory, r->va, r->size, r->block);
     }
@@ -253,17 +306,35 @@ SgxdBackend::~SgxdBackend() {
 }
 
 SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, bool side) {
+    // A recipe block is its render's until that 3D completes (its fence): an instance the GPU
+    // is done with, else a new one, else the one done first. The pending 3D's is never free.
+    const Recipe* const pending = Pending();
+    u32 instances = 0;
     Recipe* oldest = nullptr;
     for (const auto& r : recipes) {
         if (r->width == width && r->height == height && r->side == side) {
-            return *r;
+            instances++;
+            if (r.get() == pending) {
+                continue;
+            }
+            if (sgxd_chain_reached(r->fence)) {
+                return *r;
+            }
+            if (!oldest || static_cast<s32>(r->fence - oldest->fence) < 0) {
+                oldest = r.get();
+            }
         }
+    }
+    if (instances >= MaxInstances && oldest) {
+        RenderWait(oldest->fence, "a recipe instance");
+        return *oldest;
     }
     auto made = std::make_unique<Recipe>();
     Recipe& r = *made;
     r.width = width;
     r.height = height;
     r.side = side;
+    r.instance = instances;
     r.va = next_va;
     [[maybe_unused]] const int init = sgxd_recipe_init_programs(
         &r.recipe, width, height, r.va, Pages, identity.data(), MaxIndices, init_draws.data(),
@@ -300,10 +371,10 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, bool side) {
         std::memcpy(r.memory + r.code_begin, first.memory + first.code_begin, code_used);
     }
     LOG_INFO(Render,
-             "sgxd: the rasterizer's {}x{} recipe, {} KiB at GPU {:#010x}: layout {} KiB, code "
+             "sgxd: the rasterizer's {}x{} recipe {}, {} KiB at GPU {:#010x}: layout {} KiB, code "
              "heap copy at {:#x} ({} bytes); shared block at {:#010x}",
-             width, height, r.size >> 10, r.va, r.recipe.offset[SGXD_R_END] >> 10, r.code_begin,
-             code_used, BlockVa);
+             width, height, r.instance, r.size >> 10, r.va, r.recipe.offset[SGXD_R_END] >> 10,
+             r.code_begin, code_used, BlockVa);
     recipes.push_back(std::move(made));
     return r;
 }
@@ -408,6 +479,10 @@ SgxdBackend::Data SgxdBackend::AllocTexture(u32 bytes, u32* ready) {
 }
 
 void SgxdBackend::FreeTexture(const Data& texture, u32 bytes) {
+    // The range goes to the next texture, which an untile writes behind the lists that sample
+    // this one; the pending 3D may still, so its finish goes ahead of them. The CPU reads
+    // such a range (Scratch) only after waiting for its writer.
+    FinishPending(FinishWhy::FreeTexture);
     // Kept in address order, merged with its neighbours.
     FreeRange range{texture.gpu - TexturesVa, AlignUp(bytes, 0x1000)};
     auto it = std::lower_bound(textures_free.begin(), textures_free.end(), range.offset,
@@ -429,10 +504,23 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
                            float depth) {
     DEBUG_ASSERT(!in_pass);
     // The recipe blocks and the shared block's pass data are the running render's until it
-    // completes.
-    RenderIdle("a pass opened");
+    // completes. The last list's end is enough: its own 3D keeps the other recipe instance and
+    // data half, and the pass's before it is done.
+    [[maybe_unused]] const u64 before = sgxd_wait_us_total();
+    if (sgxd_chain_idle() != 0) {
+        char failed[200];
+        sgxd_session_render_async_failed(failed, sizeof(failed));
+        LOG_CRITICAL(Render, "sgxd: the async render before a pass opened stopped");
+        Fault(*current, failed);
+    }
     Recipe& r = RecipeFor(width, height);
     current = &r;
+    pass_target = {target_gpu, target_gpu + width * height * 4};
+    pass_source = {};
+    data_slot = (data_slot + 1) % DataSlots;
+    RenderWait(data_fence[data_slot], "a pass's data slot");
+    data_begin = pds_end + data_slot * DataSize;
+    data_end = data_begin + DataSize;
     sgxd_recipe_set_target(&r.recipe, r.memory, target_gpu, width);
     sgxd_recipe_set_target_pack(&r.recipe, r.memory, pack);
     *reinterpret_cast<volatile u32*>(r.memory + r.bg_offset) = clear;
@@ -448,6 +536,7 @@ void SgxdBackend::BeginPass(const Data& target, u32 width, u32 height, u32 clear
     // A tile no draw touches stays EMPTY and is skipped whole, background included, keeping the
     // target's bytes: the target starts
     // as the clear through the PTLA, and the background repeats it in the tiles that render.
+    RenderBefore(target.gpu, target.gpu + width * height * 4, "a pass's clear");
     const SgxdPtlaFill fill{target.gpu, SGXD_PTLA_8888, width * 4, width, height, 0, clear};
     char failed[160];
     [[maybe_unused]] const int filled = sgxd_ptla_fill(&fill, nullptr, failed, sizeof(failed));
@@ -549,8 +638,17 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
             LOG_INFO(Render, "gpucycles pass {}:{}", passes, line);
         }
 #endif
-        sgxd_session_render_async_result(&render);
-        if (sgxd_session_render_async(&r.recipe, 0, failed, sizeof(failed)) != 0) {
+        // The TA runs while the pending 3D does; this list waits for that 3D before its own 3D
+        // kick, and ends there.
+        if (sgxd_chain_idle() != 0) {
+            sgxd_session_render_async_failed(failed, sizeof(failed));
+            Recipe* const p = Pending();
+            Fault(p ? *p : r, failed);
+        }
+        TraceStamps();
+        sgxd_session_render_overlap_result(&render);
+        const u32 touches[4] = {pass_target.lo, pass_target.hi, pass_source.lo, pass_source.hi};
+        if (sgxd_session_render_overlap(&r.recipe, touches, failed, sizeof(failed)) != 0) {
             Fault(r, failed);
         }
         if (ta_us) {
@@ -653,6 +751,8 @@ void SgxdBackend::RenderAsync(Recipe& r, const u32 touches[6]) {
 }
 
 void SgxdBackend::RenderSync(Recipe& r, u32* ta_us, u32* d3_us) {
+    RenderIdle("a synchronous render");
+    SgxdTrace("sync");
     char failed[200] = "";
     SgxdSessionRender render{};
 #ifdef VITA_DIAGNOSTICS
@@ -789,6 +889,8 @@ void SgxdBackend::WriteCode() {
 #endif
 
 void SgxdBackend::Fault(const Recipe& r, const char* failed) {
+    // The reason before the dumps: their writes to host0 can outlast the run.
+    LOG_CRITICAL(Render, "sgxd: pass {} stopped: {}", passes, failed);
     for (u32 k = sent_renders_next > sent_renders.size() ? sent_renders_next - 64 : 0;
          k != sent_renders_next; k++) {
         const SentRender& sr = sent_renders[k % sent_renders.size()];
@@ -965,6 +1067,7 @@ SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, 
 void SgxdBackend::Blit(const Data& source, u32 width, u32 height, const Store& dest, u32* ta_us,
                        u32* d3_us) {
     OpenPass(dest.gpu, width, height, dest.pack, 0, 1.0f);
+    pass_source = {source.gpu, source.gpu + width * height * 4};
     // Uncached memory (VRAM) comes without a CPU range and needs no cache work.
     if (dest.bytes != 0) {
         stores.push_back(dest);

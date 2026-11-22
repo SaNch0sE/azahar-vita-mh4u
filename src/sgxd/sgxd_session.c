@@ -252,6 +252,133 @@ int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
     return 0;
 }
 
+// ------------------------------------------------------------------ overlapped lists
+//
+// The TA of pass N runs while the 3D of pass N - 1 does. A list ends right after its own 3D kick; the next
+// list, or sgxd_session_finish_pending, waits for that 3D and runs its done phase.
+
+// The pending 3D: its recipe, what it touches, whether a fence waits on it.
+static const SgxdRecipe *pending;
+static uint32_t pending_touches[4];
+static int pending_fenced;
+// The pending 3D's kick, stamp 2, and whether the last overlapped list finished one: for the 3D
+// time sgxd_session_render_overlap_result reports.
+static uint32_t pending_kick_stamp;
+static int last_finished;
+
+const SgxdRecipe *sgxd_session_pending(void) {
+    return pending;
+}
+
+int sgxd_session_pending_touches(uint32_t lo, uint32_t hi) {
+    if (!pending) {
+        return 0;
+    }
+    for (unsigned n = 0; n < 4; n += 2) {
+        if (lo < pending_touches[n + 1] && pending_touches[n] < hi) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void sgxd_session_pending_fence(void) {
+    if (pending) {
+        pending_fenced = 1;
+    }
+}
+
+int sgxd_session_pending_fenced(void) {
+    return pending && pending_fenced;
+}
+
+int sgxd_session_ta_over_3d = 1;
+
+// The pending 3D's wait and done.
+static void finish_phase(SgxdOpList *l) {
+    add(l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
+    add(l, SGXD_OP_STAMP, 0, 3, 0);
+    sgxd_recipe_3d_wait(l, AFTER_EVENT_POLL_US);
+    sgxd_recipe_3d_done(pending, l);
+}
+
+int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[4], char *failed,
+                                unsigned failed_size) {
+    const int finish_previous = pending != NULL;
+    SgxdOpList l = {chain_ops, 0, SGXD_MAX_CHAIN_OPS, 0};
+    add(&l, SGXD_OP_WAIT_TWOD, 0, sgxd_ptla_fence(), 0);
+    if (finish_previous && !sgxd_session_ta_over_3d) {
+        finish_phase(&l);
+    }
+    sgxd_recipe_slc(&l, 1);
+    sgxd_recipe_ta_kick(r, &l);
+    add(&l, SGXD_OP_STAMP, 0, 0, 0);
+    add(&l, SGXD_OP_WAIT_EVENT, 0, 0, TA_FINISHED);
+    add(&l, SGXD_OP_STAMP, 0, 1, 0);
+    sgxd_recipe_ta_wait(&l, AFTER_EVENT_POLL_US);
+    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
+    sgxd_recipe_ta_done(r, &l);
+    if (finish_previous && sgxd_session_ta_over_3d) {
+        finish_phase(&l);
+    }
+    sgxd_recipe_3d_kick(r, &l);
+    add(&l, SGXD_OP_STAMP, 0, 2, 0);
+    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
+    if (l.overflow) {
+        snprintf(failed, failed_size, "overlapped render: more than %u ops", SGXD_MAX_CHAIN_OPS);
+        return -1;
+    }
+    const int ret = sgxd_chain_submit(chain_ops, l.count);
+    if (ret < 0) {
+        snprintf(failed, failed_size, "overlapped render: sgxdSubmitAsync %08x", (unsigned)ret);
+        return -1;
+    }
+    last_finished = finish_previous;
+    pending = r;
+    pending_fenced = 0;
+    for (unsigned n = 0; n < 4; n++) {
+        pending_touches[n] = touches ? touches[n] : 0;
+    }
+    renders++;
+    return 0;
+}
+
+int sgxd_session_finish_pending(char *failed, unsigned failed_size) {
+    if (!pending) {
+        return 0;
+    }
+    SgxdOpList l = {chain_ops, 0, SGXD_MAX_CHAIN_OPS, 0};
+    // One TA signal and one DONE a list, so both counts stay the lists' count.
+    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_TA, 0);
+    add(&l, SGXD_OP_WAIT_EVENT, 0, 0, PIXELBE_END_RENDER);
+    add(&l, SGXD_OP_STAMP, 0, 3, 0);
+    sgxd_recipe_3d_wait(&l, AFTER_EVENT_POLL_US);
+    sgxd_recipe_3d_done(pending, &l);
+    add(&l, SGXD_OP_SIGNAL, 0, SGXD_SIGNAL_DONE, 0);
+#ifdef VITA_DIAGNOSTICS
+    sgxd_mkq_kind_next = SGXD_MKQ_KIND_FINISH;
+    sgxd_session_finishes++;
+#endif
+    const int ret = sgxd_chain_submit(chain_ops, l.count);
+    if (ret < 0) {
+        snprintf(failed, failed_size, "render finish: sgxdSubmitAsync %08x", (unsigned)ret);
+        return -1;
+    }
+    pending = NULL;
+    pending_fenced = 0;
+    return 0;
+}
+
+void sgxd_session_render_overlap_result(SgxdSessionRender *render) {
+    const volatile SgxdEvents *ev = sgxd_ptla_page();
+    render->ta_us = ev ? ev->stamp[1] - ev->stamp[0] : 0;
+    render->d3_us = ev && last_finished ? ev->stamp[3] - pending_kick_stamp : 0;
+    if (ev) {
+        pending_kick_stamp = ev->stamp[2];
+    }
+    render->pages = 0;
+}
+
 void sgxd_session_render_async_result(SgxdSessionRender *render) {
     const volatile SgxdEvents *ev = sgxd_ptla_page();
     render->ta_us = ev ? ev->stamp[1] - ev->stamp[0] : 0;

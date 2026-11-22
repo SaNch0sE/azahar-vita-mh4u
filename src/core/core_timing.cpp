@@ -9,6 +9,9 @@
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
+#ifdef ENABLE_GXM
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#endif
 
 namespace Core {
 
@@ -228,6 +231,12 @@ void Timing::Timer::Advance() {
         std::pop_heap(event_queue.begin(), event_queue.end(), std::greater<>());
         event_queue.pop_back();
         if (evt.type->callback != nullptr) {
+#ifdef ENABLE_GXM
+            // tracelog: which events wake the emulation thread (the names live as long as the
+            // event types).
+            SgxdRenderer::SgxdTrace(evt.type->name->c_str(),
+                                  static_cast<unsigned>(executed_ticks - evt.time));
+#endif
             evt.type->callback(evt.user_data, static_cast<int>(executed_ticks - evt.time));
         } else {
             LOG_ERROR(Core, "Event '{}' has no callback", *evt.type->name);
