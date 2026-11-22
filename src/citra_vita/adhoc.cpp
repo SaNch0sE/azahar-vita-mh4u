@@ -17,6 +17,7 @@
 #include <psp2/sysmodule.h>
 
 #include "citra_vita/adhoc.h"
+#include "citra_vita/i18n.h"
 #include "citra_vita/multiplayer.h"
 #include "common/named_thread.h"
 #include "core/core.h"
@@ -408,16 +409,17 @@ std::string Status() {
     std::scoped_lock lk{mutex};
     switch (role) {
     case Role::Connecting:
-        return "Joining the ad hoc network...";
+        return I18n::Tr("Joining the ad hoc network...");
     case Role::Finding:
-        return "Looking for an ad hoc room...";
+        return I18n::Tr("Looking for an ad hoc room...");
     case Role::Hosting:
-        return "Hosting an ad hoc room at " + AddressText(host_address);
+        return I18n::TrFormat("Hosting an ad hoc room at {}", AddressText(host_address));
     case Role::Joined:
-        return "In the ad hoc room at " + AddressText(host_address);
+        return I18n::TrFormat("In the ad hoc room at {}", AddressText(host_address));
     default:
-        return last_error.empty() ? "Not on the ad hoc network"
-                                  : "Not on the ad hoc network: " + last_error;
+        // The failure's reason (English) for the TTY alone: the screen shows no inactive state.
+        return last_error.empty() ? std::string{I18n::Tr("Not on the ad hoc network")}
+                                  : I18n::TrFormat("Not on the ad hoc network: {}", last_error);
     }
 }
 

@@ -16,6 +16,7 @@
 
 #include "citra_vita/config.h"
 #include "citra_vita/emu_window_vita.h"
+#include "citra_vita/i18n.h"
 #include "citra_vita/input_factory_vita.h"
 #include "citra_vita/uvc_stream.h"
 #include "common/assert.h"
@@ -59,6 +60,7 @@ const std::vector<const char*> Regions{"auto",      "japan", "usa",   "europe",
                                        "australia", "china", "korea", "taiwan"};
 const std::vector<const char*> Themes{"dark", "light"};
 const std::vector<const char*> UsbVideoScreens{"off", "top", "bottom"};
+const std::vector<const char*> Languages{"english", "chinese_simplified"};
 const std::vector<const char*> RightStickWords{"cstick", "lr", "dpad"};
 const std::vector<const char*> Inputs{"circle", "cross",  "triangle",  "square",     "up",
                                       "down",   "left",   "right",     "l",          "r",
@@ -101,6 +103,8 @@ const std::array<Definition, Count> definitions{{
     {"theme", false, true, 0, 1, 0, Themes},
     {"startup_notice", false, true, 0, 1, 1, Toggle},
     {"usb_video", false, true, 0, 2, 0, UsbVideoScreens},
+    // English here; Load starts from the console's language.
+    {"language", false, true, 0, 1, 0, Languages},
 }};
 
 /// The screen layouts' choices as the emulator's layout options; the overlay is the single
@@ -265,6 +269,9 @@ void ApplyLocked(Option option) {
         // The Vita keeps the player's layout: single screen and swap show the other screen alone.
         UvcStream::SetScreen(value);
         break;
+    case Option::Language:
+        I18n::SetLanguage(static_cast<I18n::Language>(value));
+        break;
     case Option::Count:
         UNREACHABLE();
     }
@@ -367,6 +374,9 @@ void Load() {
                    "settings: {}'s words do not match its range", d.key);
         global_values[i] = d.default_value;
     }
+    // The menus in the console's language until the player picks one.
+    global_values[static_cast<std::size_t>(Option::Language)] =
+        static_cast<int>(I18n::ConsoleLanguage());
     if (FILE* f = std::fopen(SettingsPath, "r")) {
         // A line is a section's name in brackets, `key = value` or a comment. A title's section is
         // named for its key, which a file's name makes anything but a newline: the name

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -67,6 +68,7 @@
 
 #include "audio_core/hle/hle.h"
 #include "citra_vita/hud_stats.h"
+#include "citra_vita/i18n.h"
 #include "citra_vita/vita_ui.h"
 #include "common/file_util.h"
 #include "common/logging/backend.h"
@@ -80,6 +82,7 @@
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/hle/service/service.h"
 #include "core/loader/loader.h"
+#include "core/loader/title_patches.h"
 #include "core/movie.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
@@ -157,6 +160,10 @@ int _vita_net_init(void);
 // The app runs with its own version only: another one loaded stops the start (LoadAzaharNative).
 
 namespace {
+
+using VitaFrontend::I18n::Tr;
+using VitaFrontend::I18n::Translatable;
+using VitaFrontend::I18n::TrFormat;
 /// The process's own arguments, kept for LaunchParameter.
 std::vector<std::string> g_arguments;
 /// Whether the process was launched by its SELF's path (LOADP, SceAppMgr's
@@ -168,8 +175,11 @@ bool g_launched_by_path = false;
 constexpr char AzaharNativePath[] = "ux0:app/" AZAHAR_VITA_TITLEID "/azaharnative.skprx";
 /// Marks the one restart that loading the module costs; see LoadAzaharNative.
 constexpr char RelaunchArgument[] = "--azaharnative-loaded";
-/// What LoadAzaharNative returned: empty, or the error EmulatorMain shows once it can.
-std::string g_native_error;
+/// What stops the start, composed when it is shown: by then the settings have chosen the menus'
+/// language, which they have not when the error is found.
+using StartError = std::function<std::string()>;
+/// What LoadAzaharNative returned: none, or the error EmulatorMain shows once it can.
+StartError g_native_error;
 /// A crash's notice for the game list to show, the player closing it: a restart's after
 /// CrashReport::Recover (crashed=PATH), or a title's that crashed (RunTitle).
 std::string g_crash_notice;
@@ -261,22 +271,22 @@ void SetupClocks() {
     scePowerSetGpuXbarClockFrequency(166);
 }
 
-std::string DescribeLoadError(Core::System::ResultStatus status) {
+const char* DescribeLoadError(Core::System::ResultStatus status) {
     switch (status) {
     case Core::System::ResultStatus::ErrorGetLoader:
-        return "unknown file type";
+        return Translatable("unknown file type");
     case Core::System::ResultStatus::ErrorSystemMode:
-        return "could not read the system mode";
+        return Translatable("could not read the system mode");
     case Core::System::ResultStatus::ErrorLoader_ErrorEncrypted:
-        return "it is encrypted. Decrypt it, then try again.";
+        return Translatable("it is encrypted. Decrypt it, then try again.");
     case Core::System::ResultStatus::ErrorLoader_ErrorInvalidFormat:
-        return "unsupported file format";
+        return Translatable("unsupported file format");
     case Core::System::ResultStatus::ErrorLoader_ErrorGbaTitle:
-        return "GBA titles are not supported";
+        return Translatable("GBA titles are not supported");
     case Core::System::ResultStatus::ErrorNotInitialized:
-        return "the CPU could not start: azaharnative could not take a core";
+        return Translatable("the CPU could not start: azaharnative could not take a core");
     default:
-        return "unknown error";
+        return Translatable("unknown error");
     }
 }
 
@@ -1401,13 +1411,15 @@ int StandbyThread(SceSize, void* arg) {
 /// A crash's notice (g_crash_notice): what happened, and the files a report wants.
 std::string CrashNotice(std::string_view what, std::string_view report, std::string_view dump) {
     std::string text{what};
-    text.append(dump.empty() ? "\n\nTo report it, send this file:\n"
-                             : "\n\nTo report it, send these files:\n")
+    text.append("\n\n")
+        .append(dump.empty() ? Tr("To report it, send this file:")
+                             : Tr("To report it, send these files:"))
+        .append("\n")
         .append(report);
     if (!dump.empty()) {
         text.append("\n").append(dump);
     }
-    return text.append("\n\nPress X or O to continue.");
+    return text.append("\n\n").append(Tr("Press X or O to continue."));
 }
 
 /// A crash's first line, and with the title's settings not all at their defaults
@@ -1559,7 +1571,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
               const std::string& path) {
     window.UpdateCurrentFramebufferLayout();
 
-    ui.SetStatusMessage("Loading...");
+    ui.SetStatusMessage(Tr("Loading..."));
     ui.Update();
     window.Present(&ui);
 
@@ -1569,7 +1581,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     window.SetLoading(false);
     if (load_result != Core::System::ResultStatus::Success) {
         LOG_CRITICAL(Frontend, "Could not load {}: {}", path, DescribeLoadError(load_result));
-        ui.SetStatusMessage("Could not load this title: " + DescribeLoadError(load_result));
+        ui.SetStatusMessage(
+            TrFormat("Could not load this title: {}", Tr(DescribeLoadError(load_result))));
         for (int i = 0; i < 240; i++) {
             window.PollEvents();
             ui.Update();
@@ -1586,7 +1599,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         !warning.empty()) {
         sceClibPrintf("[azahar] %s\n", warning.c_str());
         if (!g_launched_by_path) {
-            ui.SetStatusMessage(warning + "\n\nPress X or O to continue.");
+            ui.SetStatusMessage(warning + "\n\n" + Tr("Press X or O to continue."));
             // The buttons let go, one pressed, let go again.
             for (int phase = 0; phase < 3;) {
                 window.PollEvents();
@@ -1659,8 +1672,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             overall = 0.59f + 0.41f * fraction;
             break;
         }
-        ui.SetStatusMessage(fmt::format(
-            "{} slot {}...", phase == Phase::Saving ? "Saving" : "Loading", progress_slot));
+        ui.SetStatusMessage(phase == Phase::Saving ? TrFormat("Saving slot {}...", progress_slot)
+                                                   : TrFormat("Loading slot {}...", progress_slot));
         ui.SetProgress(overall);
         std::optional<VideoCore::GPU::RenderHold> hold;
         if (phase != Phase::Restarting) {
@@ -2393,13 +2406,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 build();
             }
         };
-        ui.SetStatusMessage("The game crashed. Saving a crash report...");
+        ui.SetStatusMessage(Tr("The game crashed. Saving a crash report..."));
         present();
         char dump[256] = {};
         const int dumped = VitaFrontend::CrashReport::Coredump(dump, sizeof(dump));
         sceClibPrintf("[azahar] the title crashed; core dump %08x, %s\n",
                       static_cast<unsigned>(dumped), dumped >= 0 ? dump : "none");
-        g_crash_notice = CrashNotice("The game crashed.", Common::Log::CrashReportPath,
+        g_crash_notice = CrashNotice(Tr("The game crashed."), Common::Log::CrashReportPath,
                                      dumped >= 0 ? dump : "");
         ui.ClearStatusMessage();
         // The title's settings still applied (SetRunningTitle below).
@@ -2563,7 +2576,7 @@ bool UnloadAzaharNative(int version) {
     return r >= 0 && !module_installed("azaharnative");
 }
 
-std::string LoadAzaharNative(bool relaunched) {
+StartError LoadAzaharNative(bool relaunched) {
     if (module_installed("azaharnative")) {
         // A module stays loaded until it is unloaded or the console reboots. One that can be
         // unloaded (AZAHAR_NATIVE_UNLOADABLE on) and is not this vpk's, an earlier or a later
@@ -2576,9 +2589,11 @@ std::string LoadAzaharNative(bool relaunched) {
                 // Version 1 is the first release's module, which taiHEN's config.txt loaded at
                 // boot; every later one comes with the vpk and is loaded here, at the launch.
                 if (loaded <= 1) {
-                    return "Remove the azaharnative.skprx line from your taiHEN config.txt "
-                           "(ux0:tai/config.txt or ur0:tai/config.txt), then reboot your "
-                           "console.";
+                    return [] {
+                        return std::string{Tr("Remove the azaharnative.skprx line from your taiHEN "
+                                              "config.txt (ux0:tai/config.txt or "
+                                              "ur0:tai/config.txt), then reboot your console.")};
+                    };
                 }
                 // Retail firmware keeps a module that exports calls to user mode (a syscall
                 // export, as this one's are) loaded outside development mode: SceKernelModulemgr's
@@ -2587,27 +2602,37 @@ std::string LoadAzaharNative(bool relaunched) {
                 sceClibPrintf("[azahar] azaharnative %d stays loaded, this vpk's is %d: a reboot "
                               "finishes the update\n",
                               loaded, AZAHAR_NATIVE_VERSION);
-                return "Azahar was updated. Reboot your console to finish the update.";
+                return [] {
+                    return std::string{
+                        Tr("Azahar was updated. Reboot your console to finish the update.")};
+                };
             }
             // The kernel's printf text from here on reaches this app's TTY (klog.c).
             SgxdRenderer::SgxdDrainKernelLog();
             // sgxd's spins time out on the calling thread's cycle counter (azaharCycles): every
             // thread of this process may read it, those that exist now and those created later.
             if (const int cycles = azaharCycleCounter(); cycles < 0) {
-                return fmt::format("azaharCycleCounter failed ({:#010x}).",
-                                   static_cast<u32>(cycles));
+                return [cycles] {
+                    return fmt::format("azaharCycleCounter failed ({:#010x}).",
+                                       static_cast<u32>(cycles));
+                };
             }
             return {};
         }
     }
     const SceUID module = taiLoadStartKernelModule(AzaharNativePath, 0, nullptr, 0);
     if (module < 0) {
-        return fmt::format("{} could not be loaded ({:#010x}). Reinstall the vpk.",
-                           AzaharNativePath, static_cast<u32>(module));
+        return [module] {
+            return TrFormat("{} could not be loaded ({:#010x}). Reinstall the vpk.",
+                            AzaharNativePath, static_cast<u32>(module));
+        };
     }
     // Restarting a second time would not bind anything the first restart did not.
     if (relaunched) {
-        return "azaharnative.skprx was loaded twice without the restarted app seeing it.";
+        return [] {
+            return std::string{
+                "azaharnative.skprx was loaded twice without the restarted app seeing it."};
+        };
     }
 
     // The restart carries the launch parameter and the arguments after it (load=N, save=N@T), and
@@ -2636,15 +2661,17 @@ std::string LoadAzaharNative(bool relaunched) {
             sceKernelDelayThread(100 * 1000);
         }
     }
-    return fmt::format(
-        "Azahar could not restart to use azaharnative.skprx ({:#010x}). Start Azahar again.",
-        static_cast<u32>(exec));
+    return [exec] {
+        return TrFormat(
+            "Azahar could not restart to use azaharnative.skprx ({:#010x}). Start Azahar again.",
+            static_cast<u32>(exec));
+    };
 }
 
 /// What stops the start, on the notice through GXM: only before sgxd has the GPU, or when it could
 /// not take it.
 void ShowStartError(const std::string& message) {
-    VitaFrontend::ShowGxmNotice("Azahar can't start", message, "", "Close");
+    VitaFrontend::ShowGxmNotice(Tr("Azahar can't start"), message, "", Tr("Close"));
 }
 
 /// The emulator proper. Runs on a thread of its own; see main.
@@ -2657,18 +2684,19 @@ int EmulatorMain() {
     SetupPaths();
     SetupLogging();
     // What the player chose, from the memory card: the values for all games until a title runs.
-    // Before the first screen, which takes its theme from them.
+    // Before the first screen, which takes its theme and language from them.
     Config::Load();
+    Loader::SetTitlePatchesTranslator(&Tr);
 
     // What stops the start comes first, in the menus' language: before anything else is set up
     // and before the startup notice. Closing it exits the app.
-    if (!g_native_error.empty()) {
-        ShowStartError(g_native_error);
+    if (g_native_error) {
+        ShowStartError(g_native_error());
         return -1;
     }
     if (!module_installed("CapUnlocker")) {
-        ShowStartError("Install CapUnlocker.skprx from https://github.com/GrapheneCt/CapUnlocker, "
-                       "then reboot your console.");
+        ShowStartError(Tr("Install CapUnlocker.skprx from "
+                          "https://github.com/GrapheneCt/CapUnlocker, then reboot your console."));
         return -1;
     }
 
@@ -2705,11 +2733,12 @@ int EmulatorMain() {
     if (Config::Global(Option::StartupNotice) != 0 && !crash_restart && !replay_player &&
         (!g_launched_by_path || asked)) {
         VitaFrontend::ShowGxmNotice(
-            "Before Azahar starts",
-            "Azahar is about to take over the GPU. Until you close it, notifications, the quick "
-            "menu and plugin menus such as PSVshell's won't show, and the PS button won't leave "
-            "Azahar.\n\nUse them now if you need them, then press X to continue.",
-            "You can turn this screen off in Settings > System > Startup notice.", "Continue");
+            Tr("Before Azahar starts"),
+            Tr("Azahar is about to take over the GPU. Until you close it, notifications, the quick "
+               "menu and plugin menus such as PSVshell's won't show, and the PS button won't leave "
+               "Azahar.\n\nUse them now if you need them, then press X to continue."),
+            Tr("You can turn this screen off in Settings > System > Startup notice."),
+            Tr("Continue"));
     }
 
     // The GPU is sgxd's from here to the end of the session (docs/sgxd/takeover.md). No GXM call
@@ -2800,7 +2829,7 @@ int EmulatorMain() {
     }
     for (const std::string& argument : g_arguments) {
         if (argument.starts_with("crashed=")) {
-            g_crash_notice = CrashNotice("Azahar crashed and started again.",
+            g_crash_notice = CrashNotice(Tr("Azahar crashed and started again."),
                                          VitaFrontend::CrashReport::LastReportPath,
                                          std::string_view{argument}.substr(8));
         } else if (argument.starts_with("seq=")) {
@@ -2907,7 +2936,7 @@ int EmulatorMain() {
             running = false;
             break;
         case VitaFrontend::Ui::Action::TogglePin: {
-            ui.SetStatusMessage("Changing the LiveArea...");
+            ui.SetStatusMessage(Tr("Changing the LiveArea..."));
             banner.Frame(ui.BannerTitle(), VitaFrontend::Ui::BannerBackdrop());
             ui.Update();
             window.Present(&ui);
@@ -3022,7 +3051,7 @@ int main(int argc, char* argv[]) {
     }
     // Before anything is brought up, because the first start after a boot restarts from here.
     g_native_error = LoadAzaharNative(relaunched);
-    if (g_native_error.empty()) {
+    if (!g_native_error) {
         VitaFrontend::CrashReport::WatchBusErrors();
     }
     // Without the module (g_native_error) its calls are not bound: the report lists no plugins.
@@ -3043,7 +3072,7 @@ int main(int argc, char* argv[]) {
     // GPU at the frontend's shutdown, the core and the moved pages at the title's end), so the
     // module stops, and the next launch loads it again. One that cannot be unloaded stays, and so
     // does this one if its stop finds anything still held (the process's exit takes that back).
-    if (g_native_error.empty() && azaharVersion() >= AZAHAR_NATIVE_UNLOADABLE) {
+    if (!g_native_error) {
         UnloadAzaharNative(azaharVersion());
     }
     return 0;

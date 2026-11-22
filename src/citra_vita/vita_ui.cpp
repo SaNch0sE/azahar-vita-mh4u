@@ -35,6 +35,9 @@
 #include "citra_vita/crash_report.h"
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/hud_stats.h"
+#include "citra_vita/i18n.h"
+#include "citra_vita/i18n_tables.h"
+#include "citra_vita/menu_glyphs.h"
 #include "citra_vita/sgxd_present.h"
 #include "citra_vita/stats_hud.h"
 #include "citra_vita/uvc_stream.h"
@@ -56,6 +59,10 @@
 #include "core/savestate.h"
 
 namespace VitaFrontend {
+
+using I18n::Tr;
+using I18n::Translatable;
+using I18n::TrFormat;
 
 namespace {
 constexpr float ScreenWidth = 960.0f;
@@ -1032,8 +1039,10 @@ void Note(const ImVec4& dot, const std::string& text) {
 }
 
 const char* CategoryName(int category) {
-    static constexpr const char* names[] = {"Display", "Speed",   "Sound",  "Controls",
-                                            "System",  "Patches", "Cheats", "Installed"};
+    static constexpr const char* names[] = {Translatable("Display"), Translatable("Speed"),
+                                            Translatable("Sound"),   Translatable("Controls"),
+                                            Translatable("System"),  Translatable("Patches"),
+                                            Translatable("Cheats"),  Translatable("Installed")};
     return names[category];
 }
 
@@ -1092,8 +1101,18 @@ void CreateMenuContext() {
     font.SizePixels = 26.0f;
     font.GlyphRanges = Latin1;
     io.FontDefault = io.Fonts->AddFontDefault(&font);
+    // The translations' characters past Latin-1 in the menus' font, from the console's own
+    // Chinese font: a 24-pixel square of them stands as high as the font's capitals and digits
+    // with their ascenders.
+    MenuGlyphs::Add(*io.Fonts, io.FontDefault, 24.0f);
     io.Fonts->Flags |= ImFontAtlasFlags_NoMouseCursors | ImFontAtlasFlags_NoPowerOfTwoHeight;
     io.FontGlobalScale = 0.75f;
+}
+
+/// The atlas built and the glyphs MenuGlyphs reserved drawn into it: once every rectangle of it
+/// is added, before a backend takes it.
+void BuildMenuAtlas() {
+    MenuGlyphs::Draw(*ImGui::GetIO().Fonts);
 }
 } // Anonymous namespace
 
@@ -1104,6 +1123,7 @@ void ShowGxmNotice(const char* title, const std::string& text, const std::string
         return;
     }
     CreateMenuContext();
+    BuildMenuAtlas();
     ImGui_ImplVita_Init();
     const bool drawable = ImGui_ImplGxm_Init();
     ASSERT_MSG(drawable, "the notice's GXM programs or font atlas failed");
@@ -1164,6 +1184,7 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     for (int i = 0; i < IconSlots; ++i) {
         icon_rects.push_back(io.Fonts->AddCustomRectRegular(IconSize, IconSize));
     }
+    BuildMenuAtlas();
 
     ImGui_ImplVita_Init();
     ImGui_ImplSgxd_Init();
@@ -1248,8 +1269,8 @@ std::string Ui::TogglePin() {
     if (!failure.empty()) {
         return failure;
     }
-    return pinned ? "The title's bubble is off the LiveArea."
-                  : "Pinned: its LiveArea bubble starts the game in Azahar.";
+    return pinned ? Tr("The title's bubble is off the LiveArea.")
+                  : Tr("Pinned: its LiveArea bubble starts the game in Azahar.");
 }
 
 Ui::~Ui() {
@@ -1425,20 +1446,21 @@ void Ui::BuildRows() {
     add({Option::ScreenLayout,
          Category::Display,
          Kind::Choice,
-         "Screen layout",
-         "How the two screens are arranged. Overlay: one screen fills the display and the other "
-         "sits small and see-through in the bottom-right corner, where you can still touch it. "
-         "Large overlay: the same with a bigger corner screen.",
-         {"Default", "Single screen", "Large screen", "Side by side", "Hybrid", "Overlay",
-          "Large overlay"},
+         Translatable("Screen layout"),
+         Translatable("How the two screens are arranged. Overlay: one screen fills the display and "
+                      "the other sits small and see-through in the bottom-right corner, where you "
+                      "can still touch it. Large overlay: the same with a bigger corner screen."),
+         {Translatable("Default"), Translatable("Single screen"), Translatable("Large screen"),
+          Translatable("Side by side"), Translatable("Hybrid"), Translatable("Overlay"),
+          Translatable("Large overlay")},
          0,
          nullptr,
          nullptr});
     add({Option::SwapScreens,
          Category::Display,
          Kind::Toggle,
-         "Swap screens",
-         "Puts the touch screen where the top screen would be.",
+         Translatable("Swap screens"),
+         Translatable("Puts the touch screen where the top screen would be."),
          {},
          0,
          nullptr,
@@ -1446,19 +1468,21 @@ void Ui::BuildRows() {
     add({Option::Widescreen,
          Category::Display,
          Kind::Choice,
-         "Widescreen",
-         "Shows more of the scene at the top screen's sides instead of stretching it, in the "
-         "Single screen and overlay layouts with Swap screens off. It can cause glitches: some "
-         "games leave the new edges empty or draw them wrong.",
-         {},
+         Translatable("Widescreen"),
+         Translatable("How the top screen fills the display in the Single screen and overlay "
+                      "layouts, with Swap screens off. Off: the 3DS's shape, with black bars at "
+                      "the sides. Widescreen hack: shows more of the scene at the sides; it can "
+                      "cause glitches, as some games leave the new edges empty or draw them "
+                      "wrong. Widescreen stretch: stretches the picture to the display's width."),
+         {Translatable("Off"), Translatable("Widescreen hack"), Translatable("Widescreen stretch")},
          0,
          nullptr,
          nullptr});
     add({Option::OverlayOpacity,
          Category::Display,
          Kind::Slider,
-         "Overlay opacity",
-         "How opaque the small screen of the overlay layouts is.",
+         Translatable("Overlay opacity"),
+         Translatable("How opaque the small screen of the overlay layouts is."),
          {},
          5,
          "%",
@@ -1466,21 +1490,22 @@ void Ui::BuildRows() {
     add({Option::TopScale,
          Category::Display,
          Kind::Choice,
-         "Top screen resolution",
-         "Draws the top screen at a higher resolution: sharper in the Single screen and Large "
-         "screen layouts, but much more GPU work (about 2.25 times at 1.5x), so slow games get "
-         "slower. Can crash games that use a lot of video memory.",
-         {"Native", "1.25x", "1.5x"},
+         Translatable("Top screen resolution"),
+         Translatable(
+             "Draws the top screen at a higher resolution: sharper in the Single screen and Large "
+             "screen layouts, but much more GPU work (about 2.25 times at 1.5x), so slow games get "
+             "slower. Can crash games that use a lot of video memory."),
+         {Translatable("Native"), "1.25x", "1.5x", "1.75x", "2x"},
          0,
          nullptr,
          nullptr});
     add({Option::Msaa,
          Category::Display,
          Kind::Toggle,
-         "Anti-aliasing (2x MSAA)",
-         "Smooths jagged edges on the top screen. It costs GPU time, so slow games get slower, and "
-         "the top screen stays at Native resolution while it is on. Can crash games that use a lot "
-         "of video memory.",
+         Translatable("Anti-aliasing (2x MSAA)"),
+         Translatable("Smooths jagged edges on the top screen. It costs GPU time, so slow games "
+                      "get slower, and the top screen stays at Native resolution while it is on. "
+                      "Can crash games that use a lot of video memory."),
          {},
          0,
          nullptr,
@@ -1490,9 +1515,10 @@ void Ui::BuildRows() {
     add({Option::Vsync,
          Category::Speed,
          Kind::Toggle,
-         "Vsync",
-         "Shows each picture whole at the display's refresh and holds the game to the display's "
-         "rate. Off: pictures show at once and may tear, and Speed limit sets the pace.",
+         Translatable("Vsync"),
+         Translatable("Shows each picture whole at the display's refresh and holds the game to the "
+                      "display's rate. Off: pictures show at once and may tear, and Speed limit "
+                      "sets the pace."),
          {},
          0,
          nullptr,
@@ -1500,30 +1526,33 @@ void Ui::BuildRows() {
     add({Option::SpeedLimit,
          Category::Speed,
          Kind::Slider,
-         "Speed limit",
-         "How fast the game may run, in percent of full speed. No limit runs it as fast as the "
-         "console can. Lower it to save battery.",
+         Translatable("Speed limit"),
+         Translatable("How fast the game may run, in percent of full speed. No limit runs it as "
+                      "fast as the console can. Lower it to save battery."),
          {},
          5,
          "%",
-         "No limit"});
+         Translatable("No limit")});
     add({Option::FrameSkipLimit,
          Category::Speed,
          Kind::Choice,
-         "Frame skip limit",
-         "When the GPU falls behind, the busier screen skips frames so the game keeps its speed. "
-         "This sets how many frames in a row it may skip: higher keeps heavy games faster but less "
-         "smooth. Off draws every frame and the game slows down instead.",
-         {"Off", "1 frame", "2 frames", "3 frames", "4 frames", "No limit"},
+         Translatable("Frame skip limit"),
+         Translatable(
+             "When the GPU falls behind, the busier screen skips frames so the game keeps its "
+             "speed. This sets how many frames in a row it may skip: higher keeps heavy games "
+             "faster but less smooth. Off draws every frame and the game slows down instead."),
+         {Translatable("Off"), Translatable("1 frame"), Translatable("2 frames"),
+          Translatable("3 frames"), Translatable("4 frames"), Translatable("No limit")},
          0,
          nullptr,
          nullptr});
     add({Option::WaitForGpu,
          Category::Speed,
          Kind::Toggle,
-         "Wait for GPU results",
-         "The game waits for the GPU to finish a picture before reading it, as on a 3DS. Off can "
-         "run faster, but may cause flickering, outdated or missing pictures and broken effects.",
+         Translatable("Wait for GPU results"),
+         Translatable("The game waits for the GPU to finish a picture before reading it, as on a "
+                      "3DS. Off can run faster, but may cause flickering, outdated or missing "
+                      "pictures and broken effects."),
          {},
          0,
          nullptr,
@@ -1544,77 +1573,98 @@ void Ui::BuildRows() {
     add({Option::StretchAudio,
          Category::Sound,
          Kind::Toggle,
-         "Stretch audio",
-         "Below full speed, slows the sound down with the game instead of letting it break up.",
+         Translatable("Stretch audio"),
+         Translatable("Below full speed, slows the sound down with the game instead of letting it "
+                      "break up."),
          {},
          0,
          nullptr,
          nullptr});
 
     // Controls: the Vita input each 3DS button answers to.
-    const std::vector<const char*> inputs{"Circle",
-                                          "Cross",
-                                          "Triangle",
-                                          "Square",
-                                          "Up",
-                                          "Down",
-                                          "Left",
-                                          "Right",
+    const std::vector<const char*> inputs{Translatable("Circle"),
+                                          Translatable("Cross"),
+                                          Translatable("Triangle"),
+                                          Translatable("Square"),
+                                          Translatable("Up"),
+                                          Translatable("Down"),
+                                          Translatable("Left"),
+                                          Translatable("Right"),
                                           "L",
                                           "R",
                                           "Start",
                                           "Select",
-                                          "Rear touch, left half",
-                                          "Rear touch, right half",
-                                          "None"};
+                                          Translatable("Rear touch, left half"),
+                                          Translatable("Rear touch, right half"),
+                                          Translatable("None")};
     const auto control = [&](Option option, const char* title, const char* description) {
         add({option, Category::Controls, Kind::Choice, title, description, inputs, 0, nullptr,
              nullptr});
     };
-    control(Option::MapA, "A", "The Vita input that presses the 3DS's A.");
-    control(Option::MapB, "B", "The Vita input that presses the 3DS's B.");
-    control(Option::MapX, "X", "The Vita input that presses the 3DS's X.");
-    control(Option::MapY, "Y", "The Vita input that presses the 3DS's Y.");
-    control(Option::MapUp, "D-pad up", "The Vita input that presses the 3DS's d-pad up.");
-    control(Option::MapDown, "D-pad down", "The Vita input that presses the 3DS's d-pad down.");
-    control(Option::MapLeft, "D-pad left", "The Vita input that presses the 3DS's d-pad left.");
-    control(Option::MapRight, "D-pad right", "The Vita input that presses the 3DS's d-pad right.");
-    control(Option::MapL, "L", "The Vita input that presses the 3DS's L.");
-    control(Option::MapR, "R", "The Vita input that presses the 3DS's R.");
+    control(Option::MapA, "A", Translatable("The Vita input that presses the 3DS's A."));
+    control(Option::MapB, "B", Translatable("The Vita input that presses the 3DS's B."));
+    control(Option::MapX, "X", Translatable("The Vita input that presses the 3DS's X."));
+    control(Option::MapY, "Y", Translatable("The Vita input that presses the 3DS's Y."));
+    control(Option::MapUp, Translatable("D-pad up"),
+            Translatable("The Vita input that presses the 3DS's d-pad up."));
+    control(Option::MapDown, Translatable("D-pad down"),
+            Translatable("The Vita input that presses the 3DS's d-pad down."));
+    control(Option::MapLeft, Translatable("D-pad left"),
+            Translatable("The Vita input that presses the 3DS's d-pad left."));
+    control(Option::MapRight, Translatable("D-pad right"),
+            Translatable("The Vita input that presses the 3DS's d-pad right."));
+    control(Option::MapL, "L", Translatable("The Vita input that presses the 3DS's L."));
+    control(Option::MapR, "R", Translatable("The Vita input that presses the 3DS's R."));
     control(Option::MapZL, "ZL",
-            "The Vita input that presses the New 3DS's ZL (and the Circle Pad Pro's). A rear touch "
-            "half is held while a finger is anywhere on it.");
+            Translatable("The Vita input that presses the New 3DS's ZL (and the Circle Pad Pro's). "
+                         "A rear touch half is held while a finger is anywhere on it."));
     control(Option::MapZR, "ZR",
-            "The Vita input that presses the New 3DS's ZR (and the Circle Pad Pro's). A rear touch "
-            "half is held while a finger is anywhere on it.");
-    control(Option::MapStart, "Start", "The Vita input that presses the 3DS's Start.");
-    control(Option::MapSelect, "Select", "The Vita input that presses the 3DS's Select.");
+            Translatable("The Vita input that presses the New 3DS's ZR (and the Circle Pad Pro's). "
+                         "A rear touch half is held while a finger is anywhere on it."));
+    control(Option::MapStart, "Start",
+            Translatable("The Vita input that presses the 3DS's Start."));
+    control(Option::MapSelect, "Select",
+            Translatable("The Vita input that presses the 3DS's Select."));
+    add({Option::RightStick,
+         Category::Controls,
+         Kind::Choice,
+         Translatable("Right stick"),
+         Translatable("What the right stick moves: the 3DS's C-stick (the New 3DS's, and the "
+                      "Circle Pad Pro's in games made for it), L and R (left and right, for games "
+                      "that turn the camera with them), or the d-pad."),
+         {Translatable("C-stick"), Translatable("L and R"), Translatable("D-pad")},
+         0,
+         nullptr,
+         nullptr});
 
     // System: the console and the menus.
     add({Option::Theme,
          Category::System,
          Kind::Choice,
-         "Menu theme",
-         "The menus' colours: dark grey, or the light grey of the 3DS HOME Menu.",
-         {"Dark", "Light"},
+         Translatable("Menu theme"),
+         Translatable("The menus' colours: dark grey, or the light grey of the 3DS HOME Menu."),
+         {Translatable("Dark"), Translatable("Light")},
          0,
          nullptr,
          nullptr});
     add({Option::Region,
          Category::System,
          Kind::Choice,
-         "Region",
-         "The console region reported to the game. Auto picks one the game accepts.",
-         {"Auto", "Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"},
+         Translatable("Region"),
+         Translatable("The console region reported to the game. Auto picks one the game accepts."),
+         {Translatable("Auto"), Translatable("Japan"), Translatable("USA"), Translatable("Europe"),
+          Translatable("Australia"), Translatable("China"), Translatable("Korea"),
+          Translatable("Taiwan")},
          0,
          nullptr,
          nullptr});
     add({Option::StartupNotice,
          Category::System,
          Kind::Toggle,
-         "Startup notice",
-         "Shows a notice as Azahar starts, while the quick menu, notifications and plugin menus "
-         "such as PSVshell's still work. Off: Azahar takes over the GPU at once.",
+         Translatable("Startup notice"),
+         Translatable(
+             "Shows a notice as Azahar starts, while the quick menu, notifications and plugin "
+             "menus such as PSVshell's still work. Off: Azahar takes over the GPU at once."),
          {},
          0,
          nullptr,
@@ -1622,11 +1672,22 @@ void Ui::BuildRows() {
     add({Option::UsbVideo,
          Category::System,
          Kind::Choice,
-         "USB video",
-         "Sends one screen to a PC over the USB cable, as a 400x240 webcam named Azahar. The Vita "
-         "keeps its own layout: to see only the other screen, use Single screen (with Swap screens "
-         "if needed).",
-         {"Off", "Top screen", "Bottom screen"},
+         Translatable("USB video"),
+         Translatable("Sends one screen to a PC over the USB cable, as a 400x240 webcam named "
+                      "Azahar. The Vita keeps its own layout: to see only the other screen, use "
+                      "Single screen (with Swap screens if needed)."),
+         {Translatable("Off"), Translatable("Top screen"), Translatable("Bottom screen")},
+         0,
+         nullptr,
+         nullptr});
+    // Each language's name in its own language: the one the player reads is there whichever the
+    // menus show.
+    add({Option::Language,
+         Category::System,
+         Kind::Choice,
+         Translatable("Language"),
+         Translatable("The language of Azahar's menus. A game keeps its own."),
+         {I18n::LanguageNames().begin(), I18n::LanguageNames().end()},
          0,
          nullptr,
          nullptr});
@@ -1717,9 +1778,9 @@ void Ui::OpenSettings(std::string title, std::string name, State back, u64 progr
         const u64 low = settings_program_id & 0xFFFFFFFF;
         const bool application = settings_program_id >> 32 == 0x00040000;
         const std::pair<const char*, u64> parts[] = {
-            {"Installed game", settings_program_id},
-            {"Update", application ? 0x0004000Eull << 32 | low : 0},
-            {"Downloadable content", application ? 0x0004008Cull << 32 | low : 0},
+            {Translatable("Installed game"), settings_program_id},
+            {Translatable("Update"), application ? 0x0004000Eull << 32 | low : 0},
+            {Translatable("Downloadable content"), application ? 0x0004008Cull << 32 | low : 0},
         };
         for (const auto& [kind, title_id] : parts) {
             const std::string content =
@@ -1807,10 +1868,11 @@ const char* Ui::DisabledReason(const Row& row) const {
                                       : Config::ForTitle(settings_title, option);
     };
     if (row.option == Config::Option::SpeedLimit && other(Config::Option::Vsync) != 0) {
-        return "Off while Vsync is on. Turn Vsync off to set a speed limit.";
+        return Tr("Off while Vsync is on. Turn Vsync off to set a speed limit.");
     }
     if (row.option == Config::Option::TopScale && other(Config::Option::Msaa) != 0) {
-        return "Native while Anti-aliasing is on. Turn Anti-aliasing off to choose a resolution.";
+        return Tr(
+            "Native while Anti-aliasing is on. Turn Anti-aliasing off to choose a resolution.");
     }
     return nullptr;
 }
@@ -1818,12 +1880,12 @@ const char* Ui::DisabledReason(const Row& row) const {
 std::string Ui::ValueText(const Row& row, int value) const {
     switch (row.kind) {
     case Row::Kind::Toggle:
-        return value != 0 ? "On" : "Off";
+        return value != 0 ? Tr("On") : Tr("Off");
     case Row::Kind::Choice:
-        return row.choices[static_cast<std::size_t>(value)];
+        return Tr(row.choices[static_cast<std::size_t>(value)]);
     case Row::Kind::Slider:
         if (value == 0 && row.zero != nullptr) {
-            return row.zero;
+            return Tr(row.zero);
         }
         return fmt::format("{}{}", value, row.unit);
     }
@@ -1857,7 +1919,7 @@ void Ui::DrawRow(const Row& row, std::size_t index) {
     if (row.kind == Row::Kind::Choice) {
         value_width = 0.0f;
         for (const char* choice : row.choices) {
-            value_width = std::max(value_width, ImGui::CalcTextSize(choice).x);
+            value_width = std::max(value_width, ImGui::CalcTextSize(Tr(choice)).x);
         }
         value_width += 2.0f * (Arrow + 14.0f);
     } else if (row.kind == Row::Kind::Slider) {
@@ -1865,13 +1927,14 @@ void Ui::DrawRow(const Row& row, std::size_t index) {
             ImGui::CalcTextSize(fmt::format("{}{}", Config::Maximum(row.option), row.unit).c_str())
                 .x;
         if (row.zero != nullptr) {
-            number_width = std::max(number_width, ImGui::CalcTextSize(row.zero).x);
+            number_width = std::max(number_width, ImGui::CalcTextSize(Tr(row.zero)).x);
         }
         value_width = BarWidth + 14.0f + number_width;
     }
     const float width = ImGui::GetContentRegionAvail().x;
     const float label_width = width - value_width - 3.0f * Pad;
-    const ImVec2 label = ImGui::CalcTextSize(row.title, nullptr, false, label_width);
+    const char* const title = Tr(row.title);
+    const ImVec2 label = ImGui::CalcTextSize(title, nullptr, false, label_width);
     const Card card = CardItem("##row", ImVec2(width, std::max(RowHeight, label.y + 28.0f)));
     if (focus_first_row) {
         focus_first_row = false;
@@ -1932,7 +1995,7 @@ void Ui::DrawRow(const Row& row, std::size_t index) {
         }
         dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
                     ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text, alpha),
-                    row.title, nullptr, label_width);
+                    title, nullptr, label_width);
         // On a title's screen its own value is amber where it is not all games', else plain.
         const ImU32 value_colour =
             Colour(for_title && marked ? palette->Own : palette->Text, alpha);
@@ -1984,17 +2047,18 @@ void Ui::DrawPatchRow(std::size_t index) {
     ImGui::PushID(static_cast<int>(index));
     const Loader::TitlePatchInfo& patch = settings_patches[index];
     // The running title's say whether each went in; a listed title's are built in.
-    const char* state = "Built in";
+    const char* state = Tr("Built in");
     ImVec4 state_colour = palette->Text;
     if (!settings_patches_in.empty()) {
         const bool in = settings_patches_in[index];
-        state = in ? "Applied" : "Left out";
+        state = in ? Tr("Applied") : Tr("Left out");
         state_colour = in ? palette->Accent : palette->TextDim;
     }
     const float width = ImGui::GetContentRegionAvail().x;
     const ImVec2 state_size = ImGui::CalcTextSize(state);
     const float label_width = width - state_size.x - 3.0f * Pad;
-    const ImVec2 label = ImGui::CalcTextSize(patch.name, nullptr, false, label_width);
+    const char* const name = Tr(patch.name);
+    const ImVec2 label = ImGui::CalcTextSize(name, nullptr, false, label_width);
     const Card card = CardItem("##patch", ImVec2(width, std::max(RowHeight, label.y + 28.0f)));
     if (focus_first_row) {
         focus_first_row = false;
@@ -2007,8 +2071,8 @@ void Ui::DrawPatchRow(std::size_t index) {
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         const float mid = card.bb.GetCenter().y;
         dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text),
-                    patch.name, nullptr, label_width);
+                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text), name,
+                    nullptr, label_width);
         dl->AddText(ImVec2(card.bb.Max.x - Pad - state_size.x, mid - state_size.y * 0.5f),
                     Colour(state_colour), state);
     }
@@ -2039,22 +2103,22 @@ void Ui::DrawPatchInfo() {
     const Loader::TitlePatchInfo& patch = settings_patches[index];
 
     ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
-    ImGui::TextWrapped("%s", patch.name);
+    ImGui::TextWrapped("%s", Tr(patch.name));
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Spacing();
-    ImGui::TextWrapped("%s", patch.description);
+    ImGui::TextWrapped("%s", Tr(patch.description));
     ImGui::Spacing();
 
     if (settings_patches_in.empty()) {
         Note(palette->TextDim,
-             "Applied when the game starts, if your copy is the version it was made for.");
+             Tr("Applied when the game starts, if your copy is the version it was made for."));
     } else if (settings_patches_in[index]) {
-        Note(palette->Accent, "Applied to the running game.");
+        Note(palette->Accent, Tr("Applied to the running game."));
     } else {
         Note(palette->TextDim,
-             "Left out: your copy is a different version from the one it was made for.");
+             Tr("Left out: your copy is a different version from the one it was made for."));
     }
-    Note(palette->TextDim, "Built into Azahar for this game. It can't be turned off.");
+    Note(palette->TextDim, Tr("Built into Azahar for this game. It can't be turned off."));
 }
 
 void Ui::DrawCheatRow(std::size_t index) {
@@ -2103,13 +2167,13 @@ void Ui::DrawCheatInfo() {
         "{}{:016X}.txt", FileUtil::GetUserPath(FileUtil::UserPath::CheatsDir), settings_program_id);
     if (settings_cheats.empty()) {
         ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
-        ImGui::TextWrapped("No cheats");
+        ImGui::TextWrapped("%s", Tr("No cheats"));
         ImGui::SetWindowFontScale(1.0f);
         ImGui::Spacing();
         Note(palette->TextDim,
-             fmt::format("Put this game's Gateway codes in {}: a [name] line for each cheat, then "
-                         "its code lines. Reopen this screen to see them.",
-                         file));
+             TrFormat("Put this game's Gateway codes in {}: a [name] line for each cheat, then its "
+                      "code lines. Reopen this screen to see them.",
+                      file));
         return;
     }
     if (focused_cheat < 0) {
@@ -2132,11 +2196,12 @@ void Ui::DrawCheatInfo() {
 
     const bool running = !settings_title.empty() && settings_title == game_key;
     if (cheat.IsEnabled()) {
-        Note(palette->Accent, running ? "On: active now." : "On: applied while the game runs.");
+        Note(palette->Accent,
+             running ? Tr("On: active now.") : Tr("On: applied while the game runs."));
     } else {
-        Note(palette->TextDim, "Off.");
+        Note(palette->TextDim, Tr("Off."));
     }
-    Note(palette->TextDim, fmt::format("From {}.", file));
+    Note(palette->TextDim, TrFormat("From {}.", file));
 }
 
 void Ui::DrawInstalledRow(std::size_t index) {
@@ -2146,7 +2211,7 @@ void Ui::DrawInstalledRow(std::size_t index) {
     const InstalledPart part = settings_installed[index];
     const bool armed = armed_installed == static_cast<int>(index);
     const std::string size_text =
-        armed ? std::string{"Cross again to remove"}
+        armed ? std::string{Tr("Cross again to remove")}
               : fmt::format("{} MiB", (part.size + 1024 * 1024 - 1) / (1024 * 1024));
     const float width = ImGui::GetContentRegionAvail().x;
     const Card card = CardItem("##installed", ImVec2(width, RowHeight));
@@ -2163,10 +2228,10 @@ void Ui::DrawInstalledRow(std::size_t index) {
     if (card.visible) {
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         const float mid = card.bb.GetCenter().y;
-        const ImVec2 label = ImGui::CalcTextSize(part.kind);
+        const char* const kind = Tr(part.kind);
+        const ImVec2 label = ImGui::CalcTextSize(kind);
         const ImVec2 size_size = ImGui::CalcTextSize(size_text.c_str());
-        dl->AddText(ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text),
-                    part.kind);
+        dl->AddText(ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text), kind);
         dl->AddText(ImVec2(card.bb.Max.x - Pad - size_size.x, mid - size_size.y * 0.5f),
                     Colour(armed ? palette->Accent : palette->TextDim), size_text.c_str());
     }
@@ -2203,19 +2268,19 @@ void Ui::DrawInstalledInfo() {
     }
     const InstalledPart& part = settings_installed[static_cast<std::size_t>(focused_installed)];
     ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
-    ImGui::TextWrapped("%s", part.kind);
+    ImGui::TextWrapped("%s", Tr(part.kind));
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Spacing();
     const u32 high = static_cast<u32>(part.title_id >> 32);
     ImGui::TextWrapped(
         "%s", high == 0x0004000E
-                  ? "Installed from a CIA. Removing it takes the game back to its own version."
+                  ? Tr("Installed from a CIA. Removing it takes the game back to its own version.")
               : high == 0x0004008C
-                  ? "Installed from a CIA. Removing it takes this content out of the game."
-                  : "Installed from a CIA. Removing it takes the game off the list.");
+                  ? Tr("Installed from a CIA. Removing it takes this content out of the game.")
+                  : Tr("Installed from a CIA. Removing it takes the game off the list."));
     ImGui::Spacing();
-    Note(palette->TextDim, "Removing it keeps the game's save data.");
-    Note(palette->TextDim, fmt::format("Title {:016X}.", part.title_id));
+    Note(palette->TextDim, Tr("Removing it keeps the game's save data."));
+    Note(palette->TextDim, TrFormat("Title {:016X}.", part.title_id));
 }
 
 void Ui::DrawRomFolderRows() {
@@ -2309,10 +2374,10 @@ void Ui::DrawRowInfo() {
         Config::TitleValue(for_title ? settings_title : game_key, row.option);
 
     ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
-    ImGui::TextWrapped("%s", row.title);
+    ImGui::TextWrapped("%s", Tr(row.title));
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Spacing();
-    ImGui::TextWrapped("%s", row.description);
+    ImGui::TextWrapped("%s", Tr(row.description));
     ImGui::Spacing();
 
     if (const char* reason = DisabledReason(row)) {
@@ -2320,28 +2385,28 @@ void Ui::DrawRowInfo() {
     }
     if (const char* problem = UvcStream::Problem();
         problem && row.option == Config::Option::UsbVideo) {
-        Note(palette->Accent, problem);
+        Note(palette->Accent, Tr(problem));
     }
     const int all_games = Config::Global(row.option);
     if (for_title && own && *own != all_games) {
         Note(palette->Own,
-             fmt::format("Set for this game. All games: {}.", ValueText(row, all_games)));
+             TrFormat("Set for this game. All games: {}.", ValueText(row, all_games)));
     } else if (for_title && own) {
-        Note(palette->TextDim, "Set for this game, the same as all games for now. Changing it for "
-                               "all games won't change it here.");
+        Note(palette->TextDim, Tr("Set for this game, the same as all games for now. Changing it "
+                                  "for all games won't change it here."));
     } else if (for_title) {
-        Note(palette->TextDim, "Follows the setting for all games.");
+        Note(palette->TextDim, Tr("Follows the setting for all games."));
     } else if (!game_key.empty() && own) {
         Note(*own != all_games ? palette->Own : palette->TextDim,
-             fmt::format("{} sets its own: {}. Change it in Game settings.", game_name,
-                         ValueText(row, *own)));
+             TrFormat("{} sets its own: {}. Change it in Game settings.", game_name,
+                      ValueText(row, *own)));
     }
     if (const std::optional<int> pin = Config::PinOf(row.option)) {
-        Note(palette->Accent, fmt::format("A launch argument holds this at {} until Azahar exits.",
-                                          ValueText(row, *pin)));
+        Note(palette->Accent, TrFormat("A launch argument holds this at {} until Azahar exits.",
+                                       ValueText(row, *pin)));
     }
     if (!Config::Runtime(row.option) && !game_key.empty()) {
-        Note(palette->Accent, "Takes effect when a game starts.");
+        Note(palette->Accent, Tr("Takes effect when a game starts."));
     }
 }
 
@@ -2369,25 +2434,25 @@ Ui::Action Ui::DrawSettings() {
     }
 
     BeginBackdrop("##settings_backdrop", for_title ? Icon::Cartridge : Icon::Gear,
-                  for_title ? "Game settings" : "Settings",
-                  for_title ? settings_name : std::string{"All games"});
+                  for_title ? Tr("Game settings") : Tr("Settings"),
+                  for_title ? settings_name : std::string{Tr("All games")});
     // The Patches tab changes nothing; the Cheats tab's rows are switches alone, the Installed
     // tab's are removed.
     const bool option_rows = category != Category::Patches && category != Category::Cheats &&
                              category != Category::Installed;
-    bool back = FooterButton(Glyph::Circle, "Back");
+    bool back = FooterButton(Glyph::Circle, Tr("Back"));
     if (option_rows) {
-        FooterButton(Glyph::LeftRight, "Change");
+        FooterButton(Glyph::LeftRight, Tr("Change"));
     } else if (category == Category::Cheats && !settings_cheats.empty()) {
-        FooterButton(Glyph::Cross, "On or off");
+        FooterButton(Glyph::Cross, Tr("On or off"));
     } else if (category == Category::Installed) {
-        FooterButton(Glyph::Cross, "Remove");
+        FooterButton(Glyph::Cross, Tr("Remove"));
     }
-    if (categories.size() > 1 && FooterButton(Glyph::Shoulders, "Tab") && !next_category) {
+    if (categories.size() > 1 && FooterButton(Glyph::Shoulders, Tr("Tab")) && !next_category) {
         const int at = static_cast<int>(current - categories.begin());
         next_category = categories[static_cast<std::size_t>(at + 1) % categories.size()];
     }
-    if (for_title && option_rows && FooterButton(Glyph::Triangle, "Use all games' setting") &&
+    if (for_title && option_rows && FooterButton(Glyph::Triangle, Tr("Use all games' setting")) &&
         focused_row >= 0) {
         Config::SetTitleValue(settings_title, rows[static_cast<std::size_t>(focused_row)].option,
                               std::nullopt);
@@ -2400,7 +2465,7 @@ Ui::Action Ui::DrawSettings() {
         const float y = HeaderHeight + 10.0f;
         for (const Category c : categories) {
             const int i = static_cast<int>(c);
-            const char* name = CategoryName(i);
+            const char* name = Tr(CategoryName(i));
             const ImVec2 text = ImGui::CalcTextSize(name);
             const ImVec2 size(text.x + 64.0f, TabsHeight);
             ImGui::SetCursorScreenPos(ImVec2(x, y));
@@ -2597,15 +2662,16 @@ Ui::Action Ui::DrawGameList() {
             dl->AddRectFilled(ImVec2(hole.Max.x, hole.Min.y), ImVec2(ScreenWidth, hole.Max.y), c);
         }
         DrawStatusBar(dl, StatusHeight,
-                      games.empty() ? std::string{}
-                                    : fmt::format("{} {}", games.size(),
-                                                  games.size() == 1 ? "title" : "titles"));
+                      games.empty()       ? std::string{}
+                      : games.size() == 1 ? TrFormat("{} title", games.size())
+                                          : TrFormat("{} titles", games.size()));
         dl->PopClipRect();
 
         if (games.empty()) {
-            const std::string text = fmt::format(
-                "No titles found. Copy .3ds or .cci files into {}, or choose Install CIA.",
-                GameDirectory);
+            const std::string text =
+                TrFormat("No titles found. Copy .3ds or .cci files into {} or a ROM folder of the "
+                         "settings' System tab, or choose Install CIA.",
+                         GameDirectory);
             const float width = ScreenWidth - 2.0f * (Margin + 24.0f);
             const ImVec2 size = ImGui::CalcTextSize(text.c_str(), nullptr, false, width);
             dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
@@ -2652,9 +2718,10 @@ Ui::Action Ui::DrawGameList() {
     // A CIA is installed rather than opened, and has no settings or bubble of its own.
     const bool installer =
         !games.empty() && games[static_cast<std::size_t>(selected_game)].installer;
-    bool start = !games.empty() && FooterButton(Glyph::Cross, installer ? "Install" : "Open");
+    bool start =
+        !games.empty() && FooterButton(Glyph::Cross, installer ? Tr("Install") : Tr("Open"));
     bool game_settings =
-        !games.empty() && !installer && FooterButton(Glyph::Triangle, "Game settings");
+        !games.empty() && !installer && FooterButton(Glyph::Triangle, Tr("Game settings"));
     bool pin = false;
     if (!games.empty() && !installer) {
         const std::string& path = games[static_cast<std::size_t>(selected_game)].path;
@@ -2662,15 +2729,15 @@ Ui::Action Ui::DrawGameList() {
             pin_checked_path = path;
             pin_checked = LiveArea::IsPinned(path);
         }
-        pin = FooterButton(Glyph::Square, pin_checked ? "Unpin" : "Pin to LiveArea");
+        pin = FooterButton(Glyph::Square, pin_checked ? Tr("Unpin") : Tr("Pin to LiveArea"));
     }
     ImGui::PopItemFlag();
 
     // The tools at the footer's right, which the pad reaches down from the grid's lower row.
     constexpr float ToolGap = 6.0f;
-    ImGui::SetCursorScreenPos(ImVec2(ScreenWidth - Margin - BarButtonWidth("Settings") -
-                                         BarButtonWidth("Install CIA") - BarButtonWidth("Exit") -
-                                         2.0f * ToolGap,
+    ImGui::SetCursorScreenPos(ImVec2(ScreenWidth - Margin - BarButtonWidth(Tr("Settings")) -
+                                         BarButtonWidth(Tr("Install CIA")) -
+                                         BarButtonWidth(Tr("Exit")) - 2.0f * ToolGap,
                                      bar_y));
     // The pad's selection on a tool, however it got there: a touch leaves ImGui's highlight off,
     // and IsItemFocused asks for that too.
@@ -2678,19 +2745,19 @@ Ui::Action Ui::DrawGameList() {
         return ImGui::GetFocusID() == ImGui::GetCurrentWindow()->DC.LastItemId;
     };
     bool on_tools = false;
-    if (BarButton("Settings", Icon::Gear)) {
+    if (BarButton(Tr("Settings"), Icon::Gear)) {
         OpenSettings({}, {}, State::GameList);
     }
     on_tools |= tool_selected();
     ImGui::SameLine(0.0f, ToolGap);
-    if (BarButton("Install CIA", Icon::Install)) {
+    if (BarButton(Tr("Install CIA"), Icon::Install)) {
         OpenPickerDir(picker_dir.empty() ? std::string{GameDirectory} : picker_dir);
         state = State::InstallPicker;
         focus_first_row = true;
     }
     on_tools |= tool_selected();
     ImGui::SameLine(0.0f, ToolGap);
-    if (BarButton("Exit", Icon::Power)) {
+    if (BarButton(Tr("Exit"), Icon::Power)) {
         action = Action::ExitApplication;
     }
     on_tools |= tool_selected();
@@ -2874,10 +2941,9 @@ Ui::Action Ui::DrawGameList() {
         const GameEntry& game = games[static_cast<std::size_t>(selected_game)];
         const float room = 560.0f;
         const std::string name = Fit(game.name, room);
-        const std::string publisher =
-            game.installer          ? Fit("CIA file: install it to play", room)
-            : game.publisher.empty() ? std::string{}
-                                     : Fit(game.publisher, room);
+        const std::string publisher = game.installer ? Fit(Tr("CIA file: install it to play"), room)
+                                      : game.publisher.empty() ? std::string{}
+                                                               : Fit(game.publisher, room);
         const ImVec2 name_size = ImGui::CalcTextSize(name.c_str());
         const ImVec2 publisher_size = ImGui::CalcTextSize(publisher.c_str());
         const float lines = publisher.empty() ? name_size.y : name_size.y + 4.0f + publisher_size.y;
@@ -2973,14 +3039,14 @@ std::string Ui::InstallSelected(const std::function<void()>& present) {
         entry.path = std::exchange(picked_cia, {});
         entry.name = std::string{FileUtil::GetFilename(entry.path)};
     } else if (games.empty() || !games[static_cast<std::size_t>(selected_game)].installer) {
-        return "Choose a CIA to install.";
+        return Tr("Choose a CIA to install.");
     } else {
         entry = games[static_cast<std::size_t>(selected_game)];
     }
     FileSys::CIAContainer container;
     if (!ReadCia(entry.path, container)) {
         LOG_ERROR(Frontend, "{} does not read as a CIA", entry.path);
-        return "This CIA cannot be read. Make it again from your game.";
+        return Tr("This CIA cannot be read. Make it again from your game.");
     }
     const u64 title_id = container.GetTitleMetadata().GetTitleID();
     // The contents against the memory card's free space: a title that does not fit would stop
@@ -2999,11 +3065,11 @@ std::string Ui::InstallSelected(const std::function<void()>& present) {
         LOG_ERROR(Frontend, "{} needs {} bytes on {}, {} are free", entry.path, needed, device,
                   space.free_size);
         constexpr u64 MiB = 1024 * 1024;
-        return fmt::format("Free {} MiB on the memory card, then install it again.",
-                           (needed - space.free_size + MiB - 1) / MiB);
+        return TrFormat("Free {} MiB on the memory card, then install it again.",
+                        (needed - space.free_size + MiB - 1) / MiB);
     }
 
-    SetStatusMessage(fmt::format("Installing {}...", entry.name));
+    SetStatusMessage(TrFormat("Installing {}...", entry.name));
     SetProgress(0.0f);
     present();
     const u64 start = sceKernelGetProcessTimeWide();
@@ -3025,13 +3091,13 @@ std::string Ui::InstallSelected(const std::function<void()>& present) {
     case Service::AM::InstallStatus::Success:
         break;
     case Service::AM::InstallStatus::ErrorEncrypted:
-        return "Decrypt this CIA, then install it again.";
+        return Tr("Decrypt this CIA, then install it again.");
     case Service::AM::InstallStatus::ErrorInvalid:
-        return "This CIA cannot be read. Make it again from your game.";
+        return Tr("This CIA cannot be read. Make it again from your game.");
     case Service::AM::InstallStatus::ErrorAborted:
-        return "The install stopped. Install the CIA again.";
+        return Tr("The install stopped. Install the CIA again.");
     default:
-        return "This CIA is gone. Choose it again with Install CIA.";
+        return Tr("This CIA is gone. Choose it again with Install CIA.");
     }
 
     // The installed title in the list, selected (an update or DLC adds none: its game uses it).
@@ -3047,11 +3113,11 @@ std::string Ui::InstallSelected(const std::function<void()>& present) {
     }
     switch (title_id >> 32) {
     case 0x0004000E:
-        return fmt::format("{}: its update is installed.", entry.name);
+        return TrFormat("{}: its update is installed.", entry.name);
     case 0x0004008C:
-        return fmt::format("{}: its downloadable content is installed.", entry.name);
+        return TrFormat("{}: its downloadable content is installed.", entry.name);
     default:
-        return fmt::format("{} is installed.", entry.name);
+        return TrFormat("{} is installed.", entry.name);
     }
 }
 
@@ -3070,7 +3136,7 @@ Ui::Action Ui::DrawPauseMenu() {
     {
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         const ImVec2 at = ImGui::GetCursorScreenPos();
-        dl->AddText(ImGui::GetFont(), TitleSize, at, Colour(palette->Text), "Paused");
+        dl->AddText(ImGui::GetFont(), TitleSize, at, Colour(palette->Text), Tr("Paused"));
         const float room = ImGui::GetContentRegionAvail().x - 130.0f;
         const std::string name = Fit(game_name, room);
         const ImVec2 size = ImGui::CalcTextSize(name.c_str());
@@ -3087,7 +3153,7 @@ Ui::Action Ui::DrawPauseMenu() {
         }
         return IconCard(label, icon, Tile);
     };
-    if (tile("Resume", Icon::Play)) {
+    if (tile(Tr("Resume"), Icon::Play)) {
         action = Action::ResumeGame;
     }
     // Opened, or back from one of its screens: Resume selected, so that the pad's first press
@@ -3096,13 +3162,13 @@ Ui::Action Ui::DrawPauseMenu() {
         focus_first_row = false;
         FocusLastItem();
     }
-    if (tile("Game settings", Icon::Cartridge)) {
+    if (tile(Tr("Game settings"), Icon::Cartridge)) {
         u64 program_id = 0;
         system.GetAppLoader().ReadProgramId(program_id);
         OpenSettings(game_key, game_name, State::Pause, program_id);
     }
     // The settings for all games are the game list's alone: in a game, its own.
-    if (tile("Save states", Icon::Disk)) {
+    if (tile(Tr("Save states"), Icon::Disk)) {
         // The slots as the card holds them now (a save since adds one).
         u64 program_id = 0;
         system.GetAppLoader().ReadProgramId(program_id);
@@ -3111,7 +3177,7 @@ Ui::Action Ui::DrawPauseMenu() {
         overlay_focused = false;
         focus_first_row = true;
     }
-    if (tile("Multiplayer", Icon::People)) {
+    if (tile(Tr("Multiplayer"), Icon::People)) {
         state = State::Multiplayer;
         room_fields = Multiplayer::CurrentFields();
         editing_field = -1;
@@ -3119,15 +3185,15 @@ Ui::Action Ui::DrawPauseMenu() {
         focus_first_row = true;
     }
 #ifdef VITA_DIAGNOSTICS
-    if (tile("Dump frame", Icon::Camera)) {
+    if (tile(Tr("Dump frame"), Icon::Camera)) {
         // The next presented frame, without the menu, to ux0:data/azahar/frame_NN.ppm.
         SgxdPresent::DumpNextFrame();
     }
 #endif
-    if (tile("Quit game", Icon::Home)) {
+    if (tile(Tr("Quit game"), Icon::Home)) {
         question = Question::QuitGame;
     }
-    if (tile("Exit Azahar", Icon::Power)) {
+    if (tile(Tr("Exit Azahar"), Icon::Power)) {
         question = Question::ExitApplication;
     }
 
@@ -3141,8 +3207,8 @@ Ui::Action Ui::DrawPauseMenu() {
 
 Ui::Action Ui::DrawSavestates() {
     Action action = Action::None;
-    BeginBackdrop("##savestates_backdrop", Icon::Disk, "Save states", game_name);
-    bool back = FooterButton(Glyph::Circle, "Back");
+    BeginBackdrop("##savestates_backdrop", Icon::Disk, Tr("Save states"), game_name);
+    bool back = FooterButton(Glyph::Circle, Tr("Back"));
     EndBackdrop();
 
     BeginList("##slots", ImVec2(Margin - 4.0f, HeaderHeight + 8.0f),
@@ -3159,22 +3225,23 @@ Ui::Action Ui::DrawSavestates() {
         const auto saved =
             std::find_if(slot_states.begin(), slot_states.end(),
                          [slot](const Core::SaveStateInfo& s) { return s.slot == slot; });
-        std::string info = "Empty";
+        std::string info = Tr("Empty");
         if (saved != slot_states.end()) {
             info = LocalTimeText(saved->time);
             if (saved->status == Core::SaveStateInfo::ValidationStatus::BuildMismatch) {
-                info += "  (another build's)";
+                info += "  ";
+                info += Tr("(another version's: can't be loaded)");
             }
         }
         const float text_y = at.y + (52.0f - ImGui::GetFontSize()) * 0.5f;
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         dl->AddText(ImVec2(at.x + 18.0f, text_y), Colour(palette->Text),
-                    fmt::format("Slot {}", slot).c_str());
+                    TrFormat("Slot {}", slot).c_str());
         dl->AddText(ImVec2(at.x + 110.0f, text_y),
                     Colour(saved != slot_states.end() ? palette->Text : palette->TextDim),
                     info.c_str());
         ImGui::SetCursorScreenPos(at + ImVec2(width - 2.0f * button.x - 16.0f, 6.0f));
-        if (ImGui::Button("Save", button)) {
+        if (ImGui::Button(Tr("Save"), button)) {
             selected_slot = slot;
             if (saved != slot_states.end()) {
                 question = Question::SaveOver;
@@ -3194,7 +3261,7 @@ Ui::Action Ui::DrawSavestates() {
         if (!loadable) {
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
         }
-        if (ImGui::Button("Load", button) && loadable) {
+        if (ImGui::Button(Tr("Load"), button) && loadable) {
             selected_slot = slot;
             question = Question::LoadSlot;
         }
@@ -3254,10 +3321,11 @@ void Ui::OpenPickerDir(std::string dir) {
 
 Ui::Action Ui::DrawInstallPicker() {
     Action action = Action::None;
-    BeginBackdrop("##picker_backdrop", Icon::Install, "Install CIA",
-                  picker_dir.empty() ? std::string{"Memory devices"} : picker_dir);
-    bool back = FooterButton(Glyph::Circle, picker_dir.empty() ? "Back" : "Parent folder");
-    const bool open = FooterButton(Glyph::Cross, "Open");
+    BeginBackdrop("##picker_backdrop", picker_folders ? Icon::Disk : Icon::Install,
+                  picker_folders ? Tr("Add ROM folder") : Tr("Install CIA"),
+                  picker_dir.empty() ? std::string{Tr("Memory devices")} : picker_dir);
+    bool back = FooterButton(Glyph::Circle, picker_dir.empty() ? Tr("Back") : Tr("Parent folder"));
+    const bool open = FooterButton(Glyph::Cross, Tr("Open"));
     // In a folder, triangle leaves at once: back only goes up a folder.
     bool close = !picker_dir.empty() && FooterButton(Glyph::Triangle, Tr("Close"));
     bool add =
@@ -3306,7 +3374,9 @@ Ui::Action Ui::DrawInstallPicker() {
         ImGui::PopID();
     }
     if (picker_entries.empty()) {
-        ImGui::TextColored(palette->TextDim, "No folders or CIA files here.");
+        ImGui::TextColored(palette->TextDim, "%s",
+                           picker_folders ? Tr("No folders or titles here.")
+                                          : Tr("No folders or CIA files here."));
     }
     back |= BackPressed();
     close |= !picker_dir.empty() && overlay_focused &&
@@ -3380,8 +3450,8 @@ Ui::Action Ui::DrawMultiplayer() {
         DrawKeyboard();
         return Action::None;
     }
-    BeginBackdrop("##multiplayer_backdrop", Icon::People, "Multiplayer", game_name);
-    bool back = FooterButton(Glyph::Circle, "Back");
+    BeginBackdrop("##multiplayer_backdrop", Icon::People, Tr("Multiplayer"), game_name);
+    bool back = FooterButton(Glyph::Circle, Tr("Back"));
     EndBackdrop();
 
     // The room's fields and its buttons on the left, its state and members on the right, as the
@@ -3394,10 +3464,10 @@ Ui::Action Ui::DrawMultiplayer() {
     const std::string port = std::to_string(room_fields.port);
     const std::string password(room_fields.password.size(), '*');
     const std::pair<const char*, const std::string*> fields[] = {
-        {"Address", &room_fields.address},
-        {"Port", &port},
-        {"Nickname", &room_fields.nickname},
-        {"Password", &password},
+        {Tr("Address"), &room_fields.address},
+        {Tr("Port"), &port},
+        {Tr("Nickname"), &room_fields.nickname},
+        {Tr("Password"), &password},
     };
     const float width = ImGui::GetContentRegionAvail().x;
     for (int i = 0; i < 4; i++) {
@@ -3412,7 +3482,8 @@ Ui::Action Ui::DrawMultiplayer() {
             const float y = card.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
             dl->AddText(ImVec2(card.bb.Min.x + 18.0f, y), Colour(palette->Text), fields[i].first);
             const bool empty = fields[i].second->empty();
-            const std::string value = Fit(empty ? "(none)" : *fields[i].second, width - 190.0f);
+            const std::string value =
+                Fit(empty ? std::string{Tr("(none)")} : *fields[i].second, width - 190.0f);
             const float value_width = ImGui::CalcTextSize(value.c_str()).x;
             dl->AddText(ImVec2(card.bb.Max.x - 18.0f - value_width, y),
                         Colour(empty ? palette->TextDim : palette->Text), value.c_str());
@@ -3427,12 +3498,13 @@ Ui::Action Ui::DrawMultiplayer() {
     ImGui::Spacing();
     const ImVec2 tool(180.0f, 48.0f);
     const bool can_join = !room_fields.address.empty() && !room_fields.nickname.empty();
-    if (IconCard(Multiplayer::InRoom() ? "Join again" : "Join", Icon::People, tool) && can_join) {
+    if (IconCard(Multiplayer::InRoom() ? Tr("Join again") : Tr("Join"), Icon::People, tool) &&
+        can_join) {
         Multiplayer::Join(system, room_fields);
     }
     if (Multiplayer::InRoom() || Adhoc::Active()) {
         ImGui::SameLine();
-        if (IconCard("Leave", Icon::Home, tool)) {
+        if (IconCard(Tr("Leave"), Icon::Home, tool)) {
             if (Adhoc::Active()) {
                 Adhoc::Leave();
             } else {
@@ -3442,11 +3514,11 @@ Ui::Action Ui::DrawMultiplayer() {
     }
     // Ad hoc play: no access point and no room elsewhere, one Vita hosts and the others join it.
     const bool can_adhoc = !room_fields.nickname.empty() && !Adhoc::Active();
-    if (IconCard("Host ad hoc", Icon::Globe, tool) && can_adhoc) {
+    if (IconCard(Tr("Host ad hoc"), Icon::Globe, tool) && can_adhoc) {
         Adhoc::Host(system, room_fields.nickname);
     }
     ImGui::SameLine();
-    if (IconCard("Join ad hoc", Icon::Globe, tool) && can_adhoc) {
+    if (IconCard(Tr("Join ad hoc"), Icon::Globe, tool) && can_adhoc) {
         Adhoc::Join(system, room_fields.nickname);
     }
     back |= BackPressed();
@@ -3459,7 +3531,7 @@ Ui::Action Ui::DrawMultiplayer() {
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav);
     ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
-    const char* const heading = Multiplayer::InRoom() ? "In a room" : "Not in a room";
+    const char* const heading = Multiplayer::InRoom() ? Tr("In a room") : Tr("Not in a room");
     ImGui::TextWrapped("%s", heading);
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Spacing();
@@ -3474,15 +3546,16 @@ Ui::Action Ui::DrawMultiplayer() {
     }
     const std::vector<std::string> members = Multiplayer::Members();
     if (members.empty()) {
-        ImGui::TextWrapped("Join a room hosted by Azahar on a PC (Multiplayer > Host Room) or a "
-                           "room server, or play ad hoc with Vitas nearby: one hosts, the others "
-                           "join. Then everyone plays the same game in its local wireless mode.");
+        ImGui::TextWrapped(
+            "%s", Tr("Join a room hosted by Azahar on a PC (Multiplayer > Host Room) or a room "
+                     "server, or play ad hoc with Vitas nearby: one hosts, the others join. Then "
+                     "everyone plays the same game in its local wireless mode."));
     }
     for (const std::string& member : members) {
         Note(palette->Accent, member);
     }
     if (!can_join) {
-        Note(palette->TextDim, "Enter an address and a nickname to join.");
+        Note(palette->TextDim, Tr("Enter an address and a nickname to join."));
     }
     ImGui::End();
 
@@ -3497,10 +3570,11 @@ Ui::Action Ui::DrawMultiplayer() {
 void Ui::DrawKeyboard() {
     static constexpr const char* key_rows[] = {"1234567890", "qwertyuiop", "asdfghjkl.",
                                                "zxcvbnm-_:"};
-    static constexpr const char* titles[] = {"Address", "Port", "Nickname", "Password"};
+    static constexpr const char* titles[] = {Translatable("Address"), Translatable("Port"),
+                                             Translatable("Nickname"), Translatable("Password")};
     // Ten keys of 56 a row and their spacing.
     BeginCentered("##keyboard", 700.0f, 420.0f);
-    ImGui::Text("%s", titles[editing_field]);
+    ImGui::Text("%s", Tr(titles[editing_field]));
     ImGui::Separator();
     ImGui::Text("%s_", editing_field == 3 ? std::string(edit_text.size(), '*').c_str()
                                           : edit_text.c_str());
@@ -3525,17 +3599,17 @@ void Ui::DrawKeyboard() {
         keyboard_shift = !keyboard_shift;
     }
     ImGui::SameLine();
-    if (ImGui::Button("Space", ImVec2(110.0f, 44.0f)) && editing_field != 1) {
+    if (ImGui::Button(Tr("Space"), ImVec2(110.0f, 44.0f)) && editing_field != 1) {
         edit_text.push_back(' ');
     }
     ImGui::SameLine();
-    if (ImGui::Button("Delete", ImVec2(110.0f, 44.0f)) && !edit_text.empty()) {
+    if (ImGui::Button(Tr("Delete"), ImVec2(110.0f, 44.0f)) && !edit_text.empty()) {
         edit_text.pop_back();
     }
     ImGui::SameLine();
-    cancel = ImGui::Button("Cancel", ImVec2(110.0f, 44.0f)) || BackPressed();
+    cancel = ImGui::Button(Tr("Cancel"), ImVec2(110.0f, 44.0f)) || BackPressed();
     ImGui::SameLine();
-    done = ImGui::Button("OK", ImVec2(110.0f, 44.0f));
+    done = ImGui::Button(Tr("OK"), ImVec2(110.0f, 44.0f));
     overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
     if (done) {
@@ -3611,7 +3685,7 @@ Ui::Action Ui::DrawUsbPrompt() {
     ImGui::SetCursorPos(ImVec2(Width * 0.5f - button.x - 10.0f, 2.0f * Padding + size.y));
     const bool take = ImGui::Button("Take over", button);
     ImGui::SameLine(0.0f, 20.0f);
-    const bool cancel = ImGui::Button("Cancel", button) || BackPressed();
+    const bool cancel = ImGui::Button(Tr("Cancel"), button) || BackPressed();
     if (ImGui::IsWindowAppearing()) {
         ImGui::SetItemDefaultFocus(); // Cancel
     }

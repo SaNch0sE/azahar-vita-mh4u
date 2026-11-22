@@ -15,6 +15,7 @@
 #include <psp2/promoterutil.h>
 #include <psp2/sysmodule.h>
 
+#include "citra_vita/i18n.h"
 #include "citra_vita/livearea.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
@@ -28,8 +29,8 @@ constexpr char StagingDirectory[] = "ux0:data/azahar/bubble";
 /// The file in the bubble its eboot reads the title's path from (bubble/main.c).
 constexpr char TitleFile[] = "title.txt";
 /// What the user is told when a bubble cannot be made from Azahar's own files.
-constexpr char ReinstallAdvice[] = "Could not pin this title. Install Azahar's vpk again with "
-                                   "VitaShell, then try again.";
+constexpr const char* ReinstallAdvice = I18n::Translatable(
+    "Could not pin this title. Install Azahar's vpk again with VitaShell, then try again.");
 
 /// A title's bubble ID: "AZB" and six hex digits of its path's hash (FNV-1a), nine characters as
 /// the system wants a title ID.
@@ -419,7 +420,7 @@ std::string Pin(const std::string& path, const std::string& name, const std::vec
     const auto fail = [&](std::string_view step) {
         LOG_ERROR(Frontend, "bubble {} for {}: {} failed", id, path, step);
         FileUtil::DeleteDirRecursively(dir);
-        return std::string{ReinstallAdvice};
+        return std::string{I18n::Tr(ReinstallAdvice)};
     };
     if (!FileUtil::CreateFullPath(dir + "/sce_sys/livearea/contents/") ||
         !FileUtil::CreateFullPath(dir + "/sce_sys/package/")) {
@@ -487,7 +488,7 @@ std::string Pin(const std::string& path, const std::string& name, const std::vec
         LOG_ERROR(Frontend, "bubble {} for {}: promote 0x{:08x}", id, path,
                   static_cast<u32>(result));
         FileUtil::DeleteDirRecursively(dir);
-        return "Could not pin this title. Restart the Vita, then try again.";
+        return I18n::Tr("Could not pin this title. Restart the Vita, then try again.");
     }
     LOG_INFO(Frontend, "bubble {} pins {}", id, path);
     return {};
@@ -499,7 +500,7 @@ std::string Unpin(const std::string& path) {
     if (result < 0) {
         LOG_ERROR(Frontend, "bubble {} for {}: delete 0x{:08x}", id, path,
                   static_cast<u32>(result));
-        return "Could not unpin this title. Restart the Vita, then try again.";
+        return I18n::Tr("Could not unpin this title. Restart the Vita, then try again.");
     }
     LOG_INFO(Frontend, "bubble {} for {} removed", id, path);
     return {};

@@ -10,11 +10,12 @@
 #include <type_traits>
 #include <arm_neon.h>
 #include <psp2/kernel/clib.h>
+#include "azahar_native.h"
+#include "citra_vita/i18n.h"
 #include "citra_vita/uvc_stream.h"
 #include "common/logging/log.h"
 #include "common/named_thread.h"
 #include "common/thread.h"
-#include "azahar_native.h"
 
 namespace VitaFrontend::UvcStream {
 namespace {
@@ -24,12 +25,13 @@ constexpr u32 ScreenRows = 240;
 std::atomic<int> streamed{0};
 /// 0 not started, 1 started, -1 refused (the port could not be had): once a session.
 std::atomic<int> started{0};
-/// Problem()'s text, set once a start fails.
+/// Problem()'s text (English, which the menus translate), set once a start fails.
 std::atomic<const char*> problem{nullptr};
 std::atomic<bool> takeover{false};
 
-constexpr char TakenText[] = "Not started: another plugin is using the USB port. Turn USB video "
-                             "off and on again to take it over.";
+constexpr const char* TakenText =
+    I18n::Translatable("Not started: another plugin is using the USB port. Turn USB video off and "
+                       "on again to take it over.");
 
 /// The latest frame offered, for the thread (under the condition's lock).
 struct Offered {
@@ -231,10 +233,12 @@ bool Start(int screen) {
              static_cast<u32>(r));
     if (r < 0) {
         sceClibPrintf("[azahar] usb video: not started (%08x)\n", static_cast<unsigned>(r));
-        problem.store(r == AZAHAR_ERR_TAKEN
-                          ? TakenText
-                          : "Not started: the USB port could not be set up. Reboot and try again.",
-                      std::memory_order_release);
+        problem.store(
+            r == AZAHAR_ERR_TAKEN
+                ? TakenText
+                : I18n::Translatable(
+                      "Not started: the USB port could not be set up. Reboot and try again."),
+            std::memory_order_release);
         return false;
     }
     Stream& s = TheStream();

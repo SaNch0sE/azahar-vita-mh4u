@@ -15,6 +15,21 @@ add_custom_command(
     DEPENDS ${GXM_SHADER_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/shaders/EmbedShaders.cmake"
     COMMENT "Embedding GXM shader programs")
 
+# The menus' translations against the text they translate (tools/i18n_check.py, i18n.h): a literal
+# shown through I18n::Tr with no translation, or a translation whose fmt fields differ from its
+# English's, stops the build. The built-in patches' texts in core are the menus' too.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(I18N_CHECK_STAMP "${CMAKE_CURRENT_BINARY_DIR}/i18n_check.stamp")
+set(I18N_CORE_SOURCES "${CMAKE_SOURCE_DIR}/src/core/loader/title_patches.cpp")
+file(GLOB I18N_FRONTEND_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/*.h")
+add_custom_command(
+    OUTPUT "${I18N_CHECK_STAMP}"
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/i18n_check.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}" ${I18N_CORE_SOURCES}
+    COMMAND ${CMAKE_COMMAND} -E touch "${I18N_CHECK_STAMP}"
+    DEPENDS ${I18N_FRONTEND_SOURCES} ${I18N_CORE_SOURCES} "${CMAKE_SOURCE_DIR}/tools/i18n_check.py"
+    COMMENT "Checking the menus' translations")
+
 # SceNetCtl's unnamed ad hoc exports (netctl_adhoc.yml), as an import stub of their own.
 set(NETCTL_ADHOC_STUB_DIR "${CMAKE_CURRENT_BINARY_DIR}/netctl_adhoc_stub")
 set(NETCTL_ADHOC_STUB "${NETCTL_ADHOC_STUB_DIR}/libSceLibNetCtl_stub.a")
@@ -47,6 +62,10 @@ set(CITRA_VITA_SOURCES
     emu_window_vita.h
     gxm_present.cpp
     gxm_present.h
+    i18n.cpp
+    i18n.h
+    i18n_tables.h
+    i18n_zh_hans.cpp
     imgui_impl_gxm.cpp
     imgui_impl_gxm.h
     imgui_impl_sgxd.cpp
@@ -57,6 +76,8 @@ set(CITRA_VITA_SOURCES
     input_factory_vita.h
     livearea.cpp
     livearea.h
+    menu_glyphs.cpp
+    menu_glyphs.h
     multiplayer.cpp
     multiplayer.h
     sgxd_present.cpp
@@ -69,6 +90,7 @@ set(CITRA_VITA_SOURCES
     vita_ui.cpp
     vita_ui.h
     "${GXM_SHADER_HEADER}"
+    "${I18N_CHECK_STAMP}"
 )
 
 # The shims must survive LTO. clang only emits the call to __aeabi_h2f during code generation,
@@ -130,6 +152,7 @@ function(citra_vita_executable target titleid)
         SceVshBridge_stub
         SceNetCtl_stub
         SceNpManager_stub
+        ScePvf_stub
         ${NETCTL_ADHOC_STUB}
         m
     )

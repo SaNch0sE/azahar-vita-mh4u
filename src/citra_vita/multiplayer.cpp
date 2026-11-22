@@ -9,6 +9,7 @@
 
 #include <psp2/kernel/clib.h>
 
+#include "citra_vita/i18n.h"
 #include "citra_vita/multiplayer.h"
 #include "common/named_thread.h"
 #include "core/core.h"
@@ -46,35 +47,36 @@ Network::RoomMember::CallbackHandle<Network::RoomInformation> on_room;
 Common::NamedThread join_thread;
 
 const char* ErrorText(Error error) {
+    using I18n::Translatable;
     switch (error) {
     case Error::LostConnection:
-        return "the connection to the room was lost";
+        return Translatable("the connection to the room was lost");
     case Error::HostKicked:
-        return "kicked by the room's host";
+        return Translatable("kicked by the room's host");
     case Error::UnknownError:
-        return "the network failed";
+        return Translatable("the network failed");
     case Error::NameCollision:
-        return "the nickname is taken in that room";
+        return Translatable("the nickname is taken in that room");
     case Error::MacCollision:
-        return "the MAC address is taken in that room";
+        return Translatable("the MAC address is taken in that room");
     case Error::ConsoleIdCollision:
-        return "a console with the same ID is in that room";
+        return Translatable("a console with the same ID is in that room");
     case Error::WrongVersion:
-        return "the room runs another version of the protocol";
+        return Translatable("the room runs another version of the protocol");
     case Error::WrongPassword:
-        return "wrong password";
+        return Translatable("wrong password");
     case Error::CouldNotConnect:
-        return "the room did not answer";
+        return Translatable("the room did not answer");
     case Error::RoomIsFull:
-        return "the room is full";
+        return Translatable("the room is full");
     case Error::HostBanned:
-        return "banned from that room";
+        return Translatable("banned from that room");
     case Error::PermissionDenied:
-        return "permission denied";
+        return Translatable("permission denied");
     case Error::NoSuchUser:
-        return "no such user";
+        return Translatable("no such user");
     }
-    return "an unknown error";
+    return Translatable("an unknown error");
 }
 
 const char* StateText(State state) {
@@ -224,18 +226,19 @@ void Leave() {
 std::string Status() {
     const auto member = Network::GetRoomMember().lock();
     if (!member) {
-        return "Multiplayer is not available";
+        return I18n::Tr("Multiplayer is not available");
     }
     std::scoped_lock lk{mutex};
     switch (member->GetState()) {
     case State::Joining:
-        return "Joining " + joining + "...";
+        return I18n::TrFormat("Joining {}...", joining);
     case State::Joined:
     case State::Moderator:
-        return "In room \"" + room_name + "\" (" + std::to_string(members.size()) + " of " +
-               std::to_string(room_slots) + ")";
+        return I18n::TrFormat("In room \"{}\" ({} of {})", room_name, members.size(), room_slots);
     default:
-        return last_error.empty() ? "Not in a room" : "Not in a room: " + last_error;
+        return last_error.empty()
+                   ? std::string{I18n::Tr("Not in a room")}
+                   : I18n::TrFormat("Not in a room: {}", I18n::Tr(last_error.c_str()));
     }
 }
 

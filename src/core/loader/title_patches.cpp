@@ -18,6 +18,18 @@ namespace Loader {
 
 namespace {
 
+const char* (*translator)(const char*) = nullptr;
+
+const char* Tr(const char* english) {
+    return translator != nullptr ? translator(english) : english;
+}
+
+/// A literal a menu translates where it shows it (the frontend's check of its translations finds
+/// these too).
+constexpr const char* Translatable(const char* english) {
+    return english;
+}
+
 struct PatchWord {
     VAddr addr;
     u32 original;
@@ -231,33 +243,33 @@ constexpr auto xenoblade_frame_buffer_watcher =
 constexpr u64 XenobladeUsa = 0x000400000F700100;
 
 constexpr std::array title_patches{
-    TitlePatch{XenobladeUsa, "Left eye only",
-               "The game draws its 3D scene twice, once per eye, even with 3D off. Only one "
-               "picture is shown, so only the left eye's is drawn.",
+    TitlePatch{XenobladeUsa, Translatable("Left eye only"),
+               Translatable("The game draws its 3D scene twice, once per eye, even with 3D off. "
+                            "Only one picture is shown, so only the left eye's is drawn."),
                xenoblade_left_eye},
-    TitlePatch{XenobladeUsa, "Joined 2D quads",
-               "The game draws its text and menus one small square at a time. Squares drawn one "
-               "after another are joined into one draw.",
+    TitlePatch{XenobladeUsa, Translatable("Joined 2D quads"),
+               Translatable("The game draws its text and menus one small square at a time. Squares "
+                            "drawn one after another are joined into one draw."),
                xenoblade_quads},
-    TitlePatch{XenobladeUsa, "Fewer texture writes",
-               "The game rewrites a texture's settings every time it uses one. Now they are "
-               "written only when they change, which saves work.",
+    TitlePatch{XenobladeUsa, Translatable("Fewer texture writes"),
+               Translatable("The game rewrites a texture's settings every time it uses one. Now "
+                            "they are written only when they change, which saves work."),
                xenoblade_texture_binds},
-    TitlePatch{XenobladeUsa, "Fewer model writes",
-               "The game rewrites each model's visibility every frame. Now it is written only when "
-               "it changes, which saves work.",
+    TitlePatch{XenobladeUsa, Translatable("Fewer model writes"),
+               Translatable("The game rewrites each model's visibility every frame. Now it is "
+                            "written only when it changes, which saves work."),
                xenoblade_mesh_visibility},
-    TitlePatch{XenobladeUsa, "Model files reported",
-               "The game tells Azahar where the model and texture files it loads are, so Azahar "
-               "has less to keep track of.",
+    TitlePatch{XenobladeUsa, Translatable("Model files reported"),
+               Translatable("The game tells Azahar where the model and texture files it loads are, "
+                            "so Azahar has less to keep track of."),
                xenoblade_resource_watcher},
-    TitlePatch{XenobladeUsa, "Three command buffers",
-               "The game takes turns between two buffers for each frame's GPU commands. With "
-               "three, it waits less for the GPU.",
+    TitlePatch{XenobladeUsa, Translatable("Three command buffers"),
+               Translatable("The game takes turns between two buffers for each frame's GPU "
+                            "commands. With three, it waits less for the GPU."),
                xenoblade_three_frame_buffers, XenobladeThreeFrameBuffersApplied},
-    TitlePatch{XenobladeUsa, "Command buffer reported",
-               "The game tells Azahar which command buffer each frame fills, so Azahar has less to "
-               "keep track of.",
+    TitlePatch{XenobladeUsa, Translatable("Command buffer reported"),
+               Translatable("The game tells Azahar which command buffer each frame fills, so "
+                            "Azahar has less to keep track of."),
                xenoblade_frame_buffer_watcher},
 };
 
@@ -273,31 +285,31 @@ struct PatchedTitle {
 };
 
 constexpr std::array patched_titles{
-    PatchedTitle{XenobladeUsa, "Xenoblade Chronicles 3D", "KTR-P-CAFE", "USA", 2},
+    PatchedTitle{XenobladeUsa, "Xenoblade Chronicles 3D", "KTR-P-CAFE", Translatable("USA"), 2},
 };
 
 /// The region a product code's last letter names.
 const char* RegionOf(std::string_view product_code) {
     if (product_code.empty()) {
-        return "another region";
+        return Translatable("another region");
     }
     switch (product_code.back()) {
     case 'E':
-        return "USA";
+        return Translatable("USA");
     case 'P':
-        return "Europe";
+        return Translatable("Europe");
     case 'J':
-        return "Japan";
+        return Translatable("Japan");
     case 'K':
-        return "Korea";
+        return Translatable("Korea");
     case 'C':
-        return "China";
+        return Translatable("China");
     case 'T':
-        return "Taiwan";
+        return Translatable("Taiwan");
     case 'U':
-        return "Australia";
+        return Translatable("Australia");
     default:
-        return "another region";
+        return Translatable("another region");
     }
 }
 
@@ -313,21 +325,27 @@ std::string TitlePatchesWarning(u64 title_id, std::string_view product_code, u16
             if (left_out == 0) {
                 return {};
             }
-            return fmt::format("For full speed, play {} from the {} copy ({}), revision {}, "
-                               "without an update. This copy is revision {} or has an update "
-                               "installed, so {} of its {} speed patches are left out.",
-                               t.name, t.region, t.product_code, t.remaster_version,
-                               remaster_version, left_out, in.size());
+            return fmt::format(
+                fmt::runtime(Tr("For full speed, play {} from the {} copy ({}), revision {}, "
+                                "without an update. This copy is revision {} or has an update "
+                                "installed, so {} of its {} speed patches are left out.")),
+                t.name, Tr(t.region), t.product_code, t.remaster_version, remaster_version,
+                left_out, in.size());
         }
         if (product_code.size() == wanted.size() && product_code.starts_with(stem)) {
             return fmt::format(
-                "For full speed, play {} from the {} copy ({}), revision {}, without an update. "
-                "This copy is from {} ({}), so it runs without Azahar's speed patches.",
-                t.name, t.region, t.product_code, t.remaster_version, RegionOf(product_code),
-                product_code);
+                fmt::runtime(Tr("For full speed, play {} from the {} copy ({}), revision {}, "
+                                "without an update. This copy is from {} ({}), so it runs without "
+                                "Azahar's speed patches.")),
+                t.name, Tr(t.region), t.product_code, t.remaster_version,
+                Tr(RegionOf(product_code)), product_code);
         }
     }
     return {};
+}
+
+void SetTitlePatchesTranslator(const char* (*translate)(const char* english)) {
+    translator = translate;
 }
 
 std::vector<TitlePatchInfo> TitlePatchesOf(u64 title_id) {

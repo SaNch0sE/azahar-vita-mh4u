@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 
 #include "citra_vita/crash_report.h"
+#include "citra_vita/i18n.h"
 #include "citra_vita/sgxd_present.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -483,9 +484,9 @@ bool Initialize(std::string* error) {
            info.take_us);
     CrashReport::NoteGpuDriver(info.module_nid);
     if (taken == SGXD_ERR_FIRMWARE) {
-        // sgxd knows the GPU drivers of firmware 3.60, 3.65 and 3.68. The firmware's version is no
-        // check: HENkaku spoofs it (3.70) for every caller, the kernel's included.
-        *error = "Azahar needs firmware 3.60, 3.65 or 3.68.";
+        // sgxd knows the GPU drivers of firmware 3.60, 3.65, 3.68 and 3.73. The firmware's version
+        // is no check: HENkaku spoofs it (3.70) for every caller, the kernel's included.
+        *error = I18n::Tr("Azahar needs firmware 3.60, 3.65, 3.68 or 3.73.");
         FreeBlocks();
         return false;
     }

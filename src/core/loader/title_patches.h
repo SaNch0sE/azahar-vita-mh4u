@@ -19,11 +19,15 @@ class Process;
 
 namespace Loader {
 
-/// A patch built in for a title, as a menu shows it.
+/// A patch built in for a title, as a menu shows it: in English, which a menu translates.
 struct TitlePatchInfo {
     const char* name;        ///< a few words
     const char* description; ///< what it changes, for the player
 };
+
+/// The player's language for TitlePatchesWarning: `translate` returns a text's translation, or the
+/// text itself where it has none. Without one, English.
+void SetTitlePatchesTranslator(const char* (*translate)(const char* english));
 
 /// The patches built in for the title, in the order they go in; empty for a title with none.
 [[nodiscard]] std::vector<TitlePatchInfo> TitlePatchesOf(u64 title_id);

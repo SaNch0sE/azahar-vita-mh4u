@@ -25,9 +25,9 @@
  * file) over the running title's own value over the one for all games.
  *
  * The values are the emulator's settings and the frontend's own switches (the layout's overlay,
- * widescreen, the top screen's scale, the menus' theme, the start-up notice); this is the only
- * place that writes them, so that what a menu shows is what runs. Any thread: the pause menu edits
- * on the render thread, the run loop applies a title's values on the emulation thread.
+ * widescreen, the top screen's scale, the menus' theme and language, the start-up notice); this is
+ * the only place that writes them, so that what a menu shows is what runs. Any thread: the pause
+ * menu edits on the render thread, the run loop applies a title's values on the emulation thread.
  */
 namespace VitaFrontend::Config {
 
@@ -85,6 +85,9 @@ enum class Option : u32 {
     /// One of the 3DS's screens as a USB webcam (UvcStream): 0 off, 1 the top screen, 2 the
     /// bottom. The Vita keeps its own layout.
     UsbVideo,
+    /// The menus' language (I18n::Language): 0 English, 1 Simplified Chinese. The frontend's own;
+    /// the menus show the next frame in it. Its default is the console's language.
+    Language,
     Count,
 };
 
@@ -139,8 +142,8 @@ enum class RightStickMode : int {
 /// Whether a title can have its own value. The options for the screens, the speed and the
 /// controls are: what suits one title (a top screen it needs whole, a scale its GPU work allows,
 /// vsync where its frame rate is uneven, ZL on a button it leaves free) does not suit the next. The
-/// sound, the region, the menus' theme and the start-up notice are the player's or the console's,
-/// the same whatever runs.
+/// sound, the region, the menus' theme and language and the start-up notice are the player's or
+/// the console's, the same whatever runs.
 [[nodiscard]] bool PerTitle(Option option);
 /// Whether a change takes effect under a running title. The region is read as a title loads.
 [[nodiscard]] bool Runtime(Option option);
