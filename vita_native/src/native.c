@@ -375,6 +375,8 @@ typedef struct AzaharCpu {
     uint32_t guard[2];            // both stacks' tops stay inside the block
     uint8_t vfp_stack[1024];      // azahar_vfp_svc's, from azahar_svc_fast
     uint32_t guard2[2];
+    uint32_t bail[11];            // azahar_bail_call's r4-r11, sp, lr, cpsr
+    volatile uint32_t bail_armed;
 } AzaharCpu;
 #define AZAHAR_CORES 4u
 extern AzaharCpu azahar_cpu[AZAHAR_CORES]; // entry.S's .bss
@@ -402,7 +404,10 @@ _Static_assert(__builtin_offsetof(AzaharContext, fpregs) == 0x50, "entry.S conte
 _Static_assert(__builtin_offsetof(AzaharCpu, stray_stack) + 64 == 0x2a0, "entry.S CPU_STRAY_STACK_TOP");
 _Static_assert(__builtin_offsetof(AzaharCpu, irq_stack) + 64 == 0x2e0, "entry.S CPU_IRQ_STACK_TOP");
 _Static_assert(__builtin_offsetof(AzaharCpu, vfp_stack) + 1024 == 0x6e8, "entry.S CPU_VFP_STACK_TOP");
-_Static_assert(sizeof(AzaharCpu) == 0x6f0, "entry.S CPU_SIZE");
+_Static_assert(__builtin_offsetof(AzaharCpu, bail) == 0x6f0, "entry.S CPU_BAIL");
+_Static_assert(__builtin_offsetof(AzaharCpu, bail_armed) == 0x71c, "entry.S CPU_BAIL_ARMED");
+_Static_assert(sizeof(AzaharCpu) == 0x720, "entry.S CPU_SIZE");
+int azahar_bail_call(AzaharCpu *cpu, void (*fn)(unsigned), unsigned arg); // entry.S
 
 // The rest of a core's state, C's alone: Sony's registers saved at install and put back at
 // uninstall, the private timer's clock, and the slice's figures.
@@ -807,6 +812,21 @@ static void core2_sgi_window(unsigned n) {
     azahar_sgi_windows++;
 }
 
+// azaharStrayTest's request for the next slice: 1 a stray data abort in it, 2 the same with the
+// slice's way out disarmed (the core parks).
+static volatile uint32_t azahar_stray_test;
+
+// A megabyte the core's table leaves unmapped, for the test's read.
+static uint32_t stray_test_va(unsigned n) {
+    const uint32_t *const l1 = azahar_view[n].l1 ? azahar_view[n].l1 : azahar_l1;
+    for (uint32_t i = 0x3FFu; i > 0; i--) {
+        if ((l1[i] & 3u) == 0) {
+            return i << 20;
+        }
+    }
+    return 0;
+}
+
 // One trip into the guest. Interrupts are masked at the GIC for its duration — the core is
 // owned, not shared, while guest code runs — and put back afterwards.
 static void core2_run(unsigned n) {
@@ -814,6 +834,16 @@ static void core2_run(unsigned n) {
     AzaharCore *const core = &azahar_core[n];
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
     cpu->progress = 1;
+    if (azahar_stray_test) {
+        const uint32_t test = __atomic_exchange_n(&azahar_stray_test, 0u, __ATOMIC_SEQ_CST);
+        const uint32_t va = stray_test_va(n);
+        if (test && va) {
+            if (test == 2) {
+                cpu->bail_armed = 0;
+            }
+            (void)*(volatile const uint32_t *)(uintptr_t)va;
+        }
+    }
     cpu->prog_und = cpu->prog_svc = cpu->prog_pabt = cpu->prog_dabt = cpu->prog_irq = 0;
     if (pmr) {
         core->run_pmr_before = *pmr & 0xFFu; // masked since install
@@ -936,12 +966,22 @@ static void core2_run(unsigned n) {
 // runs on this core in between; the moment the mask lifts, anything that pended (the tick,
 // a cross-core call) is delivered into Sony's own handler, which replaces the SGI window.
 // The syscall's kernel stack is the host stack azahar_enter saves and the vectors come back to.
-static void fold_run(unsigned n) {
+// Slices a stray exception ended (fold_run), since the module started.
+static volatile uint32_t azahar_strays_ended;
+
+static int fold_run(unsigned n) {
     core2_install(n);
-    core2_run(n);
-    t = phase_now();
-    azahar_phase[AZAHAR_PHASE_POST] += t - azahar_t_post[n];
+    const int stray = azahar_bail_call(&azahar_cpu[n], core2_run, n);
     core2_uninstall(n);
+    if (!stray) {
+        return 0;
+    }
+    // The interrupts as the call found them, once Sony's world is back.
+    const uint32_t cpsr = rd_cpsr();
+    asm volatile("msr cpsr_c, %0" ::"r"((cpsr & ~0xC0u) | (azahar_cpu[n].bail[10] & 0xC0u))
+                 : "memory");
+    azahar_strays_ended++;
+    return AZAHAR_ERR_STRAY;
 }
 
 // Folded mode's timer calibration: the private timer of this core, free-running against the
@@ -2442,8 +2482,9 @@ int azaharRun(AzaharRunRequest *user_req) {
     }
 
     if (azahar_folded) {
-        fold_run(n);
-        ret = 0;
+        if ((ret = fold_run(n)) != 0) {
+            goto out;
+        }
     } else if ((ret = core2_command(CMD_RUN, AZAHAR_RUN_WAIT_STEPS)) != 0) {
         emit("== azaharRun  pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u ticks\n",
              req->ctx.r[15], cpu->ctx.cpsr, cpu->ctx.r[13], cpu->ctx.r[0], cpu->ctx.r[1],

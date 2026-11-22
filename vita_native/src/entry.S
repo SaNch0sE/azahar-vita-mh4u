@@ -55,7 +55,9 @@
     .equ CPU_STRAY_STACK_TOP, 0x2a0 @ 64 bytes below each
     .equ CPU_IRQ_STACK_TOP, 0x2e0
     .equ CPU_VFP_STACK_TOP, 0x6e8   @ azahar_vfp_svc's stack (1 KiB below)
-    .equ CPU_SIZE, 0x6f0            @ the last 8 bytes keep the tops inside the block
+    .equ CPU_BAIL, 0x6f0            @ azahar_bail_call's r4-r11, sp, lr, cpsr
+    .equ CPU_BAIL_ARMED, 0x71c
+    .equ CPU_SIZE, 0x720
 @ AzaharFast, at CPU_FAST (native.c): on 0x00, timer 0x04, quantum 0x08, mult_int 0x0c,
 @ mult_frac 0x10, base 0x14 (low) and 0x18, thread_id 0x1c, process_id 0x20, count[5] 0x24,
 @ save[4] 0x38. AzaharCpu.fast_site is the word before it.
@@ -200,12 +202,11 @@ azahar_vec_\name\()_\core:
     cmp     sp, #0
     beq     7f
     .if \reason == 4
-    @ Sealed data aborts are retried a few times before parking. Kept as a generic guard:
+    @ Sealed data aborts are retried a few times first. Kept as a generic guard:
     @ re-executing the aborted store costs nothing, and a recoverable one-off (spurious
-    @ abort, transient walk hiccup) then survives instead of wedging the core. The counter
-    @ is cumulative per install and shown in the stray report; past the cap the stub parks
-    @ as before. (A wedge that looks like this can be a dropped relocation - see azahar_cpu
-    @ below - not a transient fault.)
+    @ abort, transient walk hiccup) then survives. The counter is cumulative per install and
+    @ shown in the stray report; past the cap the slice ends at 6. (A fault that looks like
+    @ this can be a dropped relocation - see azahar_cpu below - not a transient one.)
     ldr     sp, =azahar_cpu + \core * CPU_SIZE + CPU_STRAY_STACK_TOP
     push    {r0-r1}
     ldr     r0, =azahar_cpu + \core * CPU_SIZE + CPU_STRAY_RETRY
@@ -217,8 +218,15 @@ azahar_vec_\name\()_\core:
     bgt     6f
     subs    pc, lr, #8              @ back to the aborted store, mode and cpsr restored
     .endif
-6:  b       6b                      @ sealed: nothing of Sony's is mapped to chain to; the
-                                    @ record above is the report, the syscall side times out
+    @ Sealed: nothing of Sony's is mapped to chain to, and the faulting code cannot go on. The
+    @ slice's syscall ends with an error (azahar_bail_call); with no slice to end (the resident
+    @ thread's), the core parks with IRQs masked, and the record above is the report.
+6:  ldr     sp, =azahar_cpu + \core * CPU_SIZE
+    ldr     r0, [sp, #CPU_BAIL_ARMED]
+    cmp     r0, #0
+    movne   r0, sp
+    bne     azahar_bail_take
+5:  b       5b
 7:  ldr     sp, =azahar_cpu + \core * CPU_SIZE + \chain
     ldm     sp, {sp, pc}            @ this mode's SP as Sony left it, then Sony's handler
     .endm
@@ -736,6 +744,44 @@ azahar_set_banked_sp:
     msr     cpsr_c, r3
     mov     sp, r1
     msr     cpsr_c, r2
+    bx      lr
+
+@ azahar_bail_call(cpu, fn, arg): fn(arg), 0 when it returns. A sealed stray exception on this
+@ core meanwhile (a stub's label 6) returns 1 from here instead, through azahar_bail_take, with
+@ IRQs and FIQs masked: fn's frames are dropped, and our vectors and table are still in.
+    .global azahar_bail_call
+    .type azahar_bail_call, %function
+azahar_bail_call:
+    add     r3, r0, #CPU_BAIL
+    stmia   r3, {r4-r11}
+    str     sp, [r3, #32]
+    str     lr, [r3, #36]
+    mrs     ip, cpsr
+    str     ip, [r3, #40]
+    push    {r0, lr}
+    mov     ip, #1
+    str     ip, [r0, #CPU_BAIL_ARMED]
+    mov     r0, r2
+    blx     r1
+    pop     {r0, lr}
+    mov     r1, #0
+    str     r1, [r0, #CPU_BAIL_ARMED]
+    mov     r0, #0
+    bx      lr
+
+@ From a stub, in its exception mode: r0 = the core's block. Back to azahar_bail_call's caller in
+@ its own mode (cpsr_cxsf: its banked sp and lr), the interrupts left masked.
+azahar_bail_take:
+    mov     r1, #0
+    str     r1, [r0, #CPU_BAIL_ARMED]
+    add     r1, r0, #CPU_BAIL
+    ldr     r2, [r1, #40]
+    orr     r2, r2, #0xc0
+    msr     cpsr_cxsf, r2
+    ldmia   r1, {r4-r11}
+    ldr     sp, [r1, #32]
+    ldr     lr, [r1, #36]
+    mov     r0, #1
     bx      lr
 
     .ltorg

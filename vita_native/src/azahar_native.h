@@ -305,6 +305,7 @@ typedef struct AzaharRebackRequest {
 #define AZAHAR_ERR_FULL AZAHAR_ERROR(1008)     // a queue has no room yet (the microkernel's jobs)
 #define AZAHAR_ERR_ROUTE AZAHAR_ERROR(1009)    // the sound goes where no system volume is (HDMI, USB)
 #define AZAHAR_ERR_TAKEN AZAHAR_ERROR(1010)    // the USB port is another driver's (a plugin's device)
+#define AZAHAR_ERR_STRAY AZAHAR_ERROR(1011)    // the slice's own code took an exception (azaharStray)
 
 
 #ifdef __cplusplus
@@ -494,10 +495,29 @@ typedef struct AzaharBusErrorCatch {
     uint32_t module_text[4];
 } AzaharBusErrorCatch;
 int azaharBusErrorWatch(AzaharBusErrorCatch *out);
+/// A core's stray exceptions (coresample.c, version 97): taken while our vectors were in and no
+/// guest ran, by the module's own code in the slice. azaharRun returns AZAHAR_ERR_STRAY for a slice
+/// one ended; a core with no slice to end (the resident thread's) parks. Kept until the core's
+/// next slice.
+typedef struct AzaharStray {
+    uint32_t count;    ///< since the core's last slice started
+    uint32_t reason;   ///< the first one's: 1 svc, 2 undefined, 3 prefetch abort, 4 data abort
+    uint32_t lr;       ///< its exception LR (a data abort: the instruction + 8)
+    uint32_t spsr, dfsr, dfar, ifsr, ifar;
+    uint32_t retries;  ///< a data abort's retries of its access
+    uint32_t progress; ///< where the slice got to (1-3: before the guest's entry; 42-50: after)
+    uint32_t ended;    ///< slices a stray ended, since the module started
+    char module_name[28]; ///< of coresample's kernel modules, the one whose text lr follows
+    uint32_t module_text; ///< that module's text base (0: none below it)
+} AzaharStray;
+int azaharStray(uint32_t core, AzaharStray *out);
+/// The next slice on any core takes a stray data abort (a read of an unmapped megabyte): `mode`
+/// 1 ends it as any stray does, 2 parks its core. For the crash path's tests. Version 97.
+int azaharStrayTest(uint32_t mode);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.
-#define AZAHAR_NATIVE_VERSION 96
+#define AZAHAR_NATIVE_VERSION 99
 #define AZAHAR_NATIVE_UNLOADABLE 67
 int azaharVersion();
 /// This module as a UID of the calling process, for taiStopUnloadKernelModule: taiHEN stops and

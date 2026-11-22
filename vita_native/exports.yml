@@ -67,3 +67,5 @@ azaharnative:
         - azaharVaReport: 0x3C1A7E42
         - azaharShellPlaneShown: 0x3C1A7E43
         - sgxdResetAll: 0x3C1A7E44
+        - azaharStray: 0x3C1A7E45
+        - azaharStrayTest: 0x3C1A7E46

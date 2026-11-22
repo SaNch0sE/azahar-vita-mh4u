@@ -430,6 +430,39 @@ bool InThunkArea(u32 addr) {
     return addr - ThunkAreaBase < ThunkAreaSize;
 }
 
+/// What ended a slice with AZAHAR_ERR_STRAY: each core's first stray exception (azaharStray),
+/// the instruction that took it and, for an abort, the address.
+std::string StrayText() {
+    static constexpr const char* Names[] = {"exception", "svc", "undefined instruction",
+                                            "prefetch abort", "data abort"};
+    std::string text;
+    for (u32 core = 0; core < 4; core++) {
+        AzaharStray s{};
+        if (azaharStray(core, &s) < 0 || s.count == 0) {
+            continue;
+        }
+        s.module_name[sizeof(s.module_name) - 1] = '\0';
+        const bool thumb = (s.spsr & (1u << 5)) != 0;
+        const u32 at = s.lr - (s.reason == 4 ? 8u : (thumb && s.reason != 3) ? 2u : 4u);
+        const char* const name = s.reason < std::size(Names) ? Names[s.reason] : Names[0];
+        std::string where = s.module_text != 0
+                                ? fmt::format("{}+{:#x}", s.module_name, at - s.module_text)
+                                : fmt::format("{:#010x}", at);
+        std::string access;
+        if (s.reason == 4) {
+            access = fmt::format(", address {:#010x} (DFSR {:#010x})", s.dfar, s.dfsr);
+        } else if (s.reason == 3) {
+            access = fmt::format(", address {:#010x} (IFSR {:#010x})", s.ifar, s.ifsr);
+        }
+        text.append(text.empty() ? "" : "; ")
+            .append(fmt::format("azaharnative {} on core {} outside the guest's code at {} "
+                                "(LR {:#010x}, mode {:#04x}){}, {} retries, slice step {}, {} in all",
+                                name, core, where, s.lr, s.spsr & 0x1Fu, access, s.retries,
+                                s.progress, s.count));
+    }
+    return text.empty() ? "azaharnative stray exception, no record" : text;
+}
+
 /// A patched site: the original instruction (Thumb's halfwords high first, as fetched).
 struct PatchedSite {
     u32 insn;
@@ -3191,7 +3224,10 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
     const int ret = azaharRun(&run);
     if (ret < 0) {
         system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
-                         fmt::format("azaharRun failed: {}", ret).c_str());
+                         (ret == AZAHAR_ERR_STRAY
+                              ? fmt::format("azaharRun failed: {}", StrayText())
+                              : fmt::format("azaharRun failed: {:#010x}", static_cast<u32>(ret)))
+                             .c_str());
         usable = false;
         return false;
     }
@@ -3651,9 +3687,13 @@ bool ARM_VitaNative::RunSliceSecond(u64 quantum_ns) {
 
     const int ret = azaharRun(&run);
     if (ret < 0) {
-        system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
-                         fmt::format("azaharRun failed on the second emulation thread: {}", ret)
-                             .c_str());
+        system.SetStatus(
+            System::ResultStatus::ErrorCoreExceptionRaised,
+            (ret == AZAHAR_ERR_STRAY
+                 ? fmt::format("azaharRun failed on the second emulation thread: {}", StrayText())
+                 : fmt::format("azaharRun failed on the second emulation thread: {:#010x}",
+                               static_cast<u32>(ret)))
+                .c_str());
         usable = false;
         return false;
     }

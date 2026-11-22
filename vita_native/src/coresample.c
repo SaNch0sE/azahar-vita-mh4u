@@ -145,6 +145,47 @@ out:
     return ret;
 }
 
+int azaharStray(uint32_t core, AzaharStray *user_out) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = 0;
+    AzaharStray s;
+    memset(&s, 0, sizeof(s));
+    if (core >= AZAHAR_CORES || !user_out) {
+        ret = AZAHAR_ERR_ARG;
+        goto out;
+    }
+    const AzaharCpu *const cpu = &azahar_cpu[core];
+    s.count = cpu->stray[0];
+    s.reason = cpu->stray[1];
+    s.lr = cpu->stray[2];
+    s.spsr = cpu->stray[3];
+    s.dfsr = cpu->stray[4];
+    s.dfar = cpu->stray[5];
+    s.ifsr = cpu->stray[6];
+    s.ifar = cpu->stray[7];
+    s.retries = cpu->stray_retry;
+    s.progress = cpu->progress;
+    s.ended = azahar_strays_ended;
+    if (s.count) {
+        coresample_module(s.lr & ~1u, s.module_name, sizeof(s.module_name), &s.module_text);
+    }
+    if (ksceKernelCopyToUser(user_out, &s, sizeof(s)) < 0) {
+        ret = AZAHAR_ERR_ARG;
+    }
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int azaharStrayTest(uint32_t mode) {
+    if (mode > 2) {
+        return AZAHAR_ERR_ARG;
+    }
+    azahar_stray_test = mode;
+    return 0;
+}
+
 // SceKernelBusError takes interrupt 32 (non-secure bus error) on any core: SMC 0x10D dumps the
 // bus's error registers to the shared memory's +0x6000, then the core is parked for good (`b .`
 // at text +0xe8), interrupts masked. SceBusErrorForKernel_EBB1F135(dst, size) copies the dump

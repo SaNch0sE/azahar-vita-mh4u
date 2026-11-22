@@ -985,6 +985,13 @@ bool RunSettingCommand(const std::string& command) {
         system.GPU().GetRenderThread().Run([] { UNREACHABLE_MSG("crashtest render (command)"); });
         return true;
     }
+    if (command == "straytest" || command == "straytest park") {
+        // A data abort in the module's own code in the next slice (azaharStrayTest): the slice
+        // ends and the title with it; `park` parks its core instead, for the stall watch.
+        const int set = azaharStrayTest(command == "straytest" ? 1u : 2u);
+        sceClibPrintf("[azahar] %s: %08x (command)\n", command.c_str(), static_cast<unsigned>(set));
+        return true;
+    }
     if (command == "hangtest") {
         // A GPU hang on purpose with a title's frames on the GPU: the next pass's 3D never ends
         // (SgxdBackend::DrawHang), then the stop, the fault's report and the recovery from it.
