@@ -173,6 +173,10 @@ enum class UniformKind : uint8_t {
     ShadowBiasConstant,
     ShadowBiasLinear,
     ShadowTextureBias,
+    /// A Shadow2D unit 0's border colour as a tap's result reads it, made once a draw: its
+    /// depth negated, -(green + 256 blue + 65536 alpha), and its density (the red byte), each
+    /// byte floor(c * 255 + 0.5) as the program rounds a colour.
+    ShadowBorderDepth,
     /// Stage `index`'s constant colour as a U8 Dot3 reads it (FragmentEmitter::U8Dot3Const):
     /// 4 (b - 0.5) in x, y and z and -2 sum(b - 0.5) in w, b its bytes over 255.
     Dot3Const,

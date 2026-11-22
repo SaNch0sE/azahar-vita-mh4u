@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <fmt/format.h>
+#include "common/logging/log.h"
 #include "sgxd_program.h"
 #include "video_core/renderer_sgxd/usse/fs_usse_gen.h"
 #include "video_core/renderer_sgxd/usse/usse_encoder.h"
@@ -295,6 +296,19 @@ enum Lit : uint8_t {
     LitMinNormalPad,
     LitShadowInvWidth, ///< 1 / LitShadowWidth and 1 / LitShadowHeight: a texel's step, a pair
     LitShadowInvHeight,
+    // Unread F16 vector pairs: their slots keep the shadow literals' alignment and LiteralReserve.
+    LitF16Normal2,
+    LitF16Normal2Hi,
+    LitF16Z1,
+    LitF16Z1Hi,
+    LitF16W1,
+    LitF16W1Hi,
+    // A shadow texel's byte weights (R, G, B, A) = -(0, 1, 256, 65536), its depth's dot
+    // product with them (negated) a quad read in place (LitQuadSa).
+    LitByteWeightR,
+    LitByteWeightG,
+    LitByteWeightB,
+    LitByteWeightA,
     LitShadowNegInvWidth, ///< -1 / LitShadowWidth and -1 / LitShadowHeight, a pair
     LitShadowNegInvHeight,
     LitNegHalf, ///< -0.5: a Shadow2D read's texel-space offset
@@ -302,6 +316,9 @@ enum Lit : uint8_t {
     LiteralCount, // even, so the sampler words stay pair-aligned
 };
 static_assert(LiteralCount % 2 == 0);
+/// The literal words the light budget holds back before an emission has counted a program's: the
+/// table but the unread F16 vectors.
+constexpr uint32_t LiteralReserve = LitF16Normal2;
 
 /// A Shadow2D unit 0's side from FSConfig's log2 less 3.
 constexpr u32 ShadowSize(u32 log2_less_3) {
@@ -328,8 +345,12 @@ class FragmentEmitter {
 public:
     /// `literal_reserve`: the SA words the light budget keeps back for the literals (the whole
     /// table until an emission has counted the ones the program reads).
-    FragmentEmitter(const FSConfig& config_, int level_, uint32_t literal_reserve_ = LiteralCount)
-        : level{level_}, literal_reserve{literal_reserve_}, config{config_} {}
+    /// `scratch`: the emitting thread, none for an emitter that does not lower.
+    FragmentEmitter(const FSConfig& config_, int level_, std::optional<Scratch> scratch,
+                    uint32_t literal_reserve_ = LiteralReserve)
+        : level{level_}, literal_reserve{literal_reserve_}, config{config_} {
+        e.scratch = scratch;
+    }
 
     std::optional<Program> Emit(std::string* refusal);
     uint32_t SampledUnits() {
@@ -362,7 +383,7 @@ public:
     }
 
 private:
-    uint32_t literal_reserve = LiteralCount;
+    uint32_t literal_reserve = LiteralReserve;
     /// Null when the configuration can be emitted, else what stops it.
     const char* Unsupported() const;
     void PlanInputs();
@@ -510,6 +531,18 @@ private:
                                static_cast<uint32_t>(program.samplers.size()),
                                static_cast<uint32_t>(slot) * 2 + index % 2);
     }
+    /// A quad of the table (its two pairs from `index`, a multiple of four) in consecutive pairs,
+    /// for a four-wide read: its first word.
+    uint32_t LitQuadSa(uint8_t index) const {
+        int8_t& lo = lit_pair_slot[index / 2];
+        int8_t& hi = lit_pair_slot[index / 2 + 1];
+        if (lo < 0) {
+            lo = static_cast<int8_t>(lit_pairs++);
+            hi = static_cast<int8_t>(lit_pairs++);
+        }
+        DEBUG_ASSERT(hi == lo + 1);
+        return LitSa(index);
+    }
     uint8_t SamplerSa(uint32_t sampler_index) const {
         return static_cast<uint8_t>(SamplerSaOffset(uniform_floats + data_head, sampler_index));
     }
@@ -562,7 +595,8 @@ private:
     /// A U8 uniform's place (Uniform::u8): a word an element, anywhere.
     uint32_t AllocateUniformU8(UniformKind kind, uint8_t components, uint32_t array_size);
     /// An F16 float4 uniform's place (Uniform::f16): a pair an element, pair-aligned.
-    uint32_t AllocateUniformF16(UniformKind kind, uint32_t array_size);
+    uint32_t AllocateUniformF16(UniformKind kind, uint32_t array_size, uint8_t index = 0,
+                                uint8_t components = 4);
     /// A U8 word of element `index`'s component `lane` in every byte (Uniform::lane).
     uint32_t AllocateUniformU8Lane(UniformKind kind, uint8_t index, uint8_t lane);
     /// A SOP3's source 0, which is a temporary or a primary attribute: a secondary attribute
@@ -684,6 +718,7 @@ private:
     uint32_t sa_global_ambient = 0;
     uint32_t sa_border = 0;               ///< tex_border_color float4[3]: F32 texels
     uint32_t sa_border16 = 0;             ///< tex_border_color half4[3]: F16 texels
+    uint32_t sa_shadow_border = 0;        ///< shadow_border_depth: a Shadow2D unit 0's border
     uint32_t data_head = 0;               ///< 1 when the data block starts with the pointer
     uint32_t memory_floats = 0;           ///< floats in the memory part of the uniform buffer
     struct MemoryUniform {
@@ -895,7 +930,18 @@ void FragmentEmitter::PlanInputs() {
     // W-buffering: the TA orders the draw by 1/w (WBUFFEN), and the program writes no depth.
     w_buffered = !shadow_write && config.framebuffer.depthmap_enable ==
                                       Pica::RasterizerRegs::DepthBuffering::WBuffering;
-    if (uses_lighting && lighting.enable_shadow) {
+    // The shadow is read only where applied: to a light's term of a colour a stage reads, or to
+    // its alpha.
+    bool shadow_applied =
+        lighting.shadow_alpha && ((lighting.enable_primary_alpha && uses_primary_color) ||
+                                  (lighting.enable_secondary_alpha && uses_secondary_color));
+    for (u32 i = 0; i < lighting.src_num; i++) {
+        shadow_applied = shadow_applied ||
+                         (lighting.lights[i].shadow_enable &&
+                          ((lighting.shadow_primary && uses_primary_color) ||
+                           (lighting.shadow_secondary && uses_secondary_color)));
+    }
+    if (uses_lighting && lighting.enable_shadow && shadow_applied) {
         const u32 unit = lighting.shadow_selector;
         if (unit < 3 && (unit != 0 || tex.texture0_type != TextureType::Disabled)) {
             unit_used[unit] = true;
@@ -1162,12 +1208,14 @@ uint32_t FragmentEmitter::AllocateUniformU8Lane(UniformKind kind, uint8_t index,
     return at;
 }
 
-uint32_t FragmentEmitter::AllocateUniformF16(UniformKind kind, uint32_t array_size) {
+uint32_t FragmentEmitter::AllocateUniformF16(UniformKind kind, uint32_t array_size, uint8_t index,
+                                             uint8_t components) {
     if (uniform_floats & 1) {
         uniform_floats++;
     }
     const uint32_t at = uniform_floats;
-    program.uniforms.push_back({kind, 0, at, 4, array_size, false, true});
+    // A float3's fourth lane is zero (the rasterizer fills it so).
+    program.uniforms.push_back({kind, index, at, components, array_size, false, true});
     uniform_floats += array_size * 2;
     return at;
 }
@@ -1260,11 +1308,16 @@ void FragmentEmitter::PlanUniforms() {
     }
     if (uses_border) {
         // In the form of the texels it replaces (SampleTextures).
+        // A Shadow2D unit 0's as its taps' result reads it (ShadowTexture).
         bool f32 = false, f16 = false;
         for (u32 unit = 0; unit < 3; unit++) {
             const auto& border = tex.texture_border_color[unit];
             if (unit_used[unit] && (border.enable_s || border.enable_t)) {
-                (TexelF16(unit) ? f16 : f32) = true;
+                if (unit == 0 && shadow_texture) {
+                    sa_shadow_border = AllocateUniform(UniformKind::ShadowBorderDepth, 2, 1);
+                } else {
+                    (TexelF16(unit) ? f16 : f32) = true;
+                }
             }
         }
         if (f32) {
@@ -1373,10 +1426,10 @@ void FragmentEmitter::PlanUniforms() {
                                                       static_cast<uint8_t>(sampler));
             }
         }
-        sa_global_ambient = AllocateUniform(UniformKind::LightingGlobalAmbient, 3, 1);
         for (auto& quads : light_quad) {
             quads.fill(-1);
         }
+        sa_global_ambient = AllocateUniform(UniformKind::LightingGlobalAmbient, 3, 1);
         bool in_memory = false;
         for (u32 i = 0; i < lighting.src_num; i++) {
             const auto& config_light = lighting.lights[i];
@@ -1633,9 +1686,9 @@ void FragmentEmitter::ShadowTexture(Reg coord, uint32_t sampler_index) {
     const Reg tap0 = Reg::V(TmpProj), tap_k = Reg::V(TmpTexFlip), tap_m = Reg::V(TmpProj + 2);
     const Reg tap_coord[4] = {tap0, tap_k, tap_k, tap_m};
     e.Mad2({tap0, 0x3}, {fract, XYZW}, neg_inv_size, {uv, XYZW});
-    e.Vec(VecOp::Add, {taps_b, 0xf}, {I0, XYXY}, ConstZero, Pred::None, true);
-    e.Vec(VecOp::Add, {taps_b, 0x1}, {taps_b, XYZW}, {inv_size.reg, XXXX}, Pred::None, true);
-    e.Vec(VecOp::Add, {taps_b, 0x8}, {taps_b, XYZW}, {inv_size.reg, YYYY}, Pred::None, true);
+    // (1, 0) and (0, 1): the step's one lane and a constant zero, a first source's swizzle.
+    constexpr Swizzle X0{Ch::X, Ch::Zero, Ch::X, Ch::Zero};
+    constexpr Swizzle Y0{Ch::Zero, Ch::Y, Ch::Zero, Ch::Y};
     // Each tap's texel as four F16 lanes in two words (FCONV F16): with NORM off (TextureWords)
     // its bytes come back as whole numbers, which F16 holds exactly. A pair for each of the two.
     const Reg texel_of[4] = {Reg::V(TmpShadowTexel), Reg::V(TmpShadowTexel + 2),
@@ -1649,29 +1702,9 @@ void FragmentEmitter::ShadowTexture(Reg coord, uint32_t sampler_index) {
     const uint8_t result_lane[4] = {0x1, 0x4, 0x2, 0x8};
     const auto& border = tex.texture_border_color[0];
     const bool bordered = border.enable_s || border.enable_t;
-    // z itself (a test's second source is not negated); the weights (R, G, B, A) = (0, 1, 256,
-    // 65536); every result 0.
-    const Reg z = Reg::V(TmpShadowTap3);
-    e.Vec(VecOp::Add, {z, 0x1}, {weights, XXXX, Mod::Neg}, ConstZero, Pred::None, true);
-    e.Vec(VecOp::Add, {I2, 0x1}, ConstZero, ConstZero, Pred::None, true);
-    e.Vec(VecOp::Add, {I2, 0x2}, ConstOne, ConstZero, Pred::None, true);
-    e.Vec(VecOp::Add, {I2, 0x4}, Lit(Lit256), ConstZero, Pred::None, true);
-    e.Vec(VecOp::Add, {I2, 0x8}, Lit(Lit65536), ConstZero, Pred::None, true);
-    e.Vec(VecOp::Add, {results, 0xf}, ConstZero, ConstZero, Pred::None, true);
-    // A border tap's result depends on z alone: the border colour's, once, in border_result.x.
+    // The weights read where they lie (the dots' first source).
+    const Src byte_weights{Reg::Sa(static_cast<uint8_t>(LitQuadSa(LitByteWeightR))), XYZW};
     const Reg border_result = Reg::V(TmpShadowTap2);
-    if (bordered) {
-        LoadVec4(I1, {Bank::SecAttr, static_cast<uint8_t>(sa_border)});
-        // Its bytes: floor(c * 255 + 0.5), from -floor.
-        e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, Lit(LitTwoFiftyFive), Pred::None, true);
-        e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW}, ConstHalf, Pred::None, true);
-        e.Vec(VecOp::Frc, {I1, 0xf}, ConstZero, {I1, XYZW}, Pred::None, true);
-        e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW, Mod::Neg}, ConstZero, Pred::None, true);
-        e.Dot({I0, 0x1}, {I1, XYZW}, {I2, XYZW}, true, Pred::None, true);
-        e.Vec(VecOp::Add, {border_result, 0x1}, ConstZero, ConstZero, Pred::None, true);
-        e.Test(Cond::Ge, 2, {I0}, 0, {z, XXXX}, true);
-        e.Vec(VecOp::Add, {border_result, 0x1}, {I1, XXXX}, ConstZero, Pred::P2, true);
-    }
     for (int r = 0; r < 2; r++) {
         if (r == 0) {
             e.Vec(VecOp::Add, {tap_k, 0x3}, {inv_size.reg, X0}, {tap0, XYZW}, Pred::None, true);
@@ -1702,30 +1735,10 @@ void FragmentEmitter::ShadowTexture(Reg coord, uint32_t sampler_index) {
         }
         e.Wdf(0);
         for (int k = 2 * r; k < 2 * r + 2; k++) {
-        // A border side (ClampToBorder) reads the border colour past the texture: a tap whose
-        // point is outside [0, 1] on that axis. A tap's centre is never 0 or 1 ((i + 0.5) /
-        // size), so it is inside where (c - 1) c < 0: c - 1 for both axes, the test unit's
-        // product with c an axis, folded by AND into p1, and the border's result taken where
-        // not.
-        if (bordered) {
-            e.Vec(VecOp::Add, {I0, 0x3}, {ConstOne.reg, XXXX, Mod::Neg}, {tap_coord[k], XYZW},
-                  Pred::None, true);
-            bool tested = false;
-            for (uint8_t chan = 0; chan < 2; chan++) {
-                if (chan == 0 ? border.enable_s : border.enable_t) {
-                    e.Test(Cond::Lt, 1, {I0}, chan, {tap_coord[k], XYZW}, false,
-                           tested ? Pred::P1 : Pred::None, TestAlu::Mul);
-                    tested = true;
-                }
-            }
-        }
-        e.UnpackF16x4({I1, 0xf}, texel_of[k]);
-        e.Dot({I0, 0x1}, {I1, XYZW}, {I2, XYZW}, true, Pred::None, true);
-        e.Test(Cond::Ge, 2, {weights}, 0, {I0, XXXX}, true);
-        e.Vec(VecOp::Add, {results, result_lane[k]}, {I1, XXXX}, ConstZero, Pred::P2, true);
-        if (bordered) {
-            e.Vec(VecOp::Add, {results, result_lane[k]}, {border_result, XXXX}, ConstZero,
-                  Pred::NotP1, true);
+            e.UnpackF16x4({I1, 0xf}, texel_of[k]);
+            e.Dot({I0, 0x1}, byte_weights, {I1, XYZW}, true, Pred::None, true);
+            e.Test(Cond::Ge, 2, {weights}, 0, {I0, XXXX}, true);
+            e.Vec(VecOp::Add, {results, result_lane[k]}, {I1, XXXX}, ConstZero, Pred::P2, true);
         }
     }
     // A border side (ClampToBorder) reads the border colour past the texture: a tap whose point
@@ -2771,26 +2784,60 @@ void FragmentEmitter::Lighting() {
 
     const bool fresnel_read = lighting.src_num > 0 &&
                               LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel);
-    // One light on the U8 combiners: a sum is its light's term, packed from the internal
-    // register it ends in (no quad, no moves). The diffuse's ambient add makes its alpha lane
-    // 1 + 1, which packs to 0xff as 1.0 does (the pack saturates); the specular's alpha is set
-    // where it is read. Not when the fresnel read or the shadow writes a sum's alpha after it.
+    // One light on the U8 combiners, where the late sums (below) do not take it: a sum is its
+    // light's term, packed from the internal register it ends in (no quad, no moves). The diffuse's
+    // ambient add makes its alpha lane 1 + 1, which packs to 0xff as 1.0 does (the pack saturates);
+    // the specular's alpha is set where it is read. Not when the fresnel read or the shadow writes
+    // a sum's alpha after it.
     const bool shadow_alpha_written = uses_shadow && lighting.shadow_alpha;
-    const bool direct_primary =
+    const bool direct_primary_form =
         u8_lighting_packed && lighting.src_num == 1 && uses_primary_color &&
-        !(lighting.enable_primary_alpha && (fresnel_read || shadow_alpha_written));
-    const bool direct_secondary =
+        !(primary_alpha_read && lighting.enable_primary_alpha &&
+          (fresnel_read || shadow_alpha_written));
+    const bool direct_secondary_form =
         u8_lighting_packed && lighting.src_num == 1 && uses_secondary_color &&
-        !(lighting.enable_secondary_alpha && (fresnel_read || shadow_alpha_written));
+        !(secondary_alpha_read && lighting.enable_secondary_alpha &&
+          (fresnel_read || shadow_alpha_written));
+    // Late sums, for up to five lights in the constants with no attenuation and no specular term
+    // with a geometric factor or a green or blue reflection table: each light keeps its table
+    // values (.x, .y, .w in read order) and its L.N (.z) in a quad of its own (TmpLightMem's, which
+    // only lights in memory use), the fresnel's value the quad after them, and every term is made
+    // after the last read, with no wait between them: the sums add up in internal registers and are
+    // packed from there.
+    bool late = u8_lighting_packed && lighting.src_num >= 1 && lighting.src_num <= 5;
+    for (u32 i = 0; i < lighting.src_num && late; i++) {
+        const auto& light = lighting.lights[i];
+        const bool s0 = LightSpecular0(i);
+        const bool s1 = LightSpecular1(i);
+        const bool refl = s1 && (LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen) ||
+                                 LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue));
+        const bool spot = light.spot_atten_enable &&
+                          LightingLutEnabled(lighting.lut_sp, Sampler::SpotlightAttenuation);
+        late = light_memory[light.num] < 0 && !light.dist_atten_enable && !spot &&
+               !(light.geometric_factor_0 && s0) && !(light.geometric_factor_1 && s1) && !refl;
+    }
+    const bool direct_primary = direct_primary_form && !late;
+    const bool direct_secondary = direct_secondary_form && !late;
+    const auto late_home = [](u32 i) {
+        return Reg::V(static_cast<uint8_t>(TmpLightMem + 4 * i));
+    };
+    // A late light's k-th table value as the fetches read them (rr, d0, d1): .x in place,
+    // then .y and .w moved there.
+    const auto late_slot = [&](u32 i, u32 k) -> Dst {
+        const Reg home = late_home(i);
+        return k == 0   ? Dst{home, 0x1}
+               : k == 1 ? Dst{home, 0x2}
+                        : Dst{Reg::V(static_cast<uint8_t>(home.n + 2)), 0x2};
+    };
 
     // diffuse_sum = specular_sum = (0, 0, 0, 1): the alpha here, unless the last light's
     // fresnel read writes it or nothing reads it, the colour by the first light's store (or
     // zero below when there is none).
-    if (uses_primary_color && primary_alpha_read && !direct_primary &&
+    if (uses_primary_color && primary_alpha_read && !direct_primary && !late &&
         !(fresnel_read && lighting.enable_primary_alpha)) {
         e.Vec(VecOp::Add, {diffuse_sum.Pair(1), 0x2}, ConstZero, {Reg::C(1), XYZW});
     }
-    if (uses_secondary_color && secondary_alpha_read && !direct_secondary &&
+    if (uses_secondary_color && secondary_alpha_read && !direct_secondary && !late &&
         !(fresnel_read && lighting.enable_secondary_alpha)) {
         e.Vec(VecOp::Add, {specular_sum.Pair(1), 0x2}, ConstZero, {Reg::C(1), XYZW});
     }
@@ -2959,6 +3006,14 @@ void FragmentEmitter::Lighting() {
             rotate(tangent);
         }
     }
+    // The default normal as a dot's first source: i2 while it still holds it, so the normal's
+    // store has no reader where every dot comes before a wait (and goes), else the store.
+    const auto normal_src = [&]() -> Src {
+        if (normal_i2_from != SIZE_MAX && e.InternalKept(normal_i2_from, 2)) {
+            return {I2, XYZW};
+        }
+        return {normal.Pair(0), XYZW};
+    };
     // What the enabled LUTs read decides whether the view and half vectors are needed at
     // all: a light with the distribution LUT on the (light, normal) angle alone needs
     // neither.
@@ -3007,11 +3062,14 @@ void FragmentEmitter::Lighting() {
             input_of(lighting.lut_sp, Sampler::SpotlightAttenuation);
         }
     }
+    // Where i0 starts to hold the normalised view (stored too): SIZE_MAX for none.
+    std::size_t nview_i0_from = SIZE_MAX;
     if (needs_half || needs_view) {
         Normalize3(I0, view, I1);
         StoreVec4(nview, I0);
+        nview_i0_from = e.Count();
         if (reads_nv) {
-            e.Dot({Reg::V(TmpLutShared + 2), 0x1}, {normal.Pair(0), XYZW}, {I0, XYZW}, false,
+            e.Dot({Reg::V(TmpLutShared + 2), 0x1}, normal_src(), {I0, XYZW}, false,
                   Pred::None, true);
         }
     }
@@ -3020,7 +3078,13 @@ void FragmentEmitter::Lighting() {
     // read), set per light where its vectors are made.
     std::array<int8_t, 6> input_lane{};
     input_lane.fill(-1);
+    // Vectors first (below): a light's one input in its late quad's .w instead, which its
+    // values (.x, .y) leave alone.
+    int input_home = -1;
     const auto input_dst = [&](LutInput input) -> Dst {
+        if (input_home >= 0) {
+            return {Reg::V(static_cast<uint8_t>(input_home + 2)), 0x2};
+        }
         const int lane = input_lane[static_cast<u32>(input)];
         return {Reg::V(static_cast<uint8_t>(TmpLutInput + (lane & 2))),
                 static_cast<uint8_t>(1u << (lane & 1))};
@@ -3110,15 +3174,52 @@ void FragmentEmitter::Lighting() {
     const bool d0_shared = LutSharedAtNv(lighting.lut_d0, Sampler::Distribution0);
     const bool d1_shared = LutSharedAtNv(lighting.lut_d1, Sampler::Distribution1);
     const bool sides = lighting.src_num > 0 && lighting.lights[0].two_sided_diffuse;
-    if (d0_shared) {
-        // .y (D1's) is written after it
-        lut_value(lighting.lut_d0, Sampler::Distribution0, sides, {Reg::V(TmpLutShared), 0x1},
-                  true);
+    const auto shared_reads = [&] {
+        if (d0_shared) {
+            // .y (D1's) is written after it
+            lut_value(lighting.lut_d0, Sampler::Distribution0, sides,
+                      {Reg::V(TmpLutShared), 0x1}, true);
+        }
+        if (d1_shared) {
+            lut_value(lighting.lut_d1, Sampler::Distribution1, sides,
+                      {Reg::V(TmpLutShared), 0x2});
+        }
+    };
+    // Vectors first, with the late sums and the default normal where every light is a directional
+    // one read where its uniform lies, reads one input of its own at most and two tables of its own
+    // at most: every light's half vector, input and L.N in a first pass, with the normal kept in i2
+    // and the view in i0 (a light's half vector's length in i1.w), and its table reads in a second,
+    // so no read's wait between them takes the internal registers.
+    constexpr u32 own_inputs = 1u << static_cast<u32>(LutInput::NH) |
+                               1u << static_cast<u32>(LutInput::VH) |
+                               1u << static_cast<u32>(LutInput::LN);
+    bool vectors_first = late && normal_i2_from != SIZE_MAX;
+    for (u32 i = 0; i < lighting.src_num && vectors_first; i++) {
+        const u32 in = LightInputs(i);
+        const bool s0 = LightSpecular0(i), s1 = LightSpecular1(i);
+        const u32 reads_own =
+            (s1 && LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed) ? 1u : 0u) +
+            (s0 && !d0_shared && LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0)
+                 ? 1u
+                 : 0u) +
+            (s1 && !d1_shared && LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1)
+                 ? 1u
+                 : 0u);
+        vectors_first = LightPreNormalised(lighting.lights[i]) &&
+                        !(in >> static_cast<u32>(LutInput::CP) & 1) &&
+                        !(in >> static_cast<u32>(LutInput::SP) & 1) &&
+                        std::popcount(in & own_inputs) <= 1 && reads_own <= 2;
     }
-    if (d1_shared) {
-        lut_value(lighting.lut_d1, Sampler::Distribution1, sides, {Reg::V(TmpLutShared), 0x2});
+    if (!vectors_first) {
+        shared_reads();
     }
-
+    // Pass 0 the vectors, 1 the reads, 2 both (light by light).
+    for (u32 pass = vectors_first ? 0u : 2u; pass < (vectors_first ? 2u : 3u); pass++) {
+    if (pass == 1) {
+        shared_reads();
+    }
+    const bool do_vectors = pass != 1;
+    const bool do_reads = pass != 0;
     for (u32 light_index = 0; light_index < lighting.src_num; light_index++) {
         const auto& light = lighting.lights[light_index];
         last_lut_index.reset(); // another light's vectors
@@ -3161,6 +3262,9 @@ void FragmentEmitter::Lighting() {
                 input_lane[static_cast<u32>(input)] = lanes++;
             }
         }
+        input_home = vectors_first && (inputs & own_inputs) != 0
+                         ? static_cast<int>(late_home(light_index).n)
+                         : -1;
 
         const bool geo0 = light.geometric_factor_0 && spec0_on;
         const bool geo1 = light.geometric_factor_1 && spec1_on;
@@ -3177,6 +3281,9 @@ void FragmentEmitter::Lighting() {
         // The light vector in i0 = position (+ view unless directional); distance; normalised. A
         // directional light's comes normalised in its uniform (LightPreNormalised): normalised in a
         // secondary program it drew a 32-pixel tile pattern over lit surfaces.
+        const Reg geo_reg = Reg::V(TmpLightAtten);
+        const Reg atten = misc_hi;
+        if (do_vectors) {
         if (!light_in_sa) {
             LoadVec4(I0, position);
         }
@@ -3202,26 +3309,42 @@ void FragmentEmitter::Lighting() {
         if (halfway) {
             // light_in_sa: the length in i0 (free), so i2 keeps the normal.
             const Reg scratch = light_in_sa ? I0 : I2;
-            LoadVec4(I1, nview);
+            // light_in_sa with the view still in i0 (the first light, before any wait): the
+            // add reads it there, no load.
+            const bool view_in_i0 =
+                light_in_sa && nview_i0_from != SIZE_MAX && e.InternalKept(nview_i0_from, 0);
+            if (!view_in_i0) {
+                LoadVec4(I1, nview);
+            }
             if (light_in_sa) {
-                e.Vec(VecOp::Add, {I1, 0xf}, {position.Pair(0), XYZW}, {I1, XYZW}, Pred::None,
-                      true);
+                e.Vec(VecOp::Add, {I1, 0xf}, {position.Pair(0), XYZW},
+                      {view_in_i0 ? I0 : I1, XYZW}, Pred::None, true);
             } else {
                 e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
             }
+            if (vectors_first) {
+                // The squared length in a temporary, its rsq in i1.w: i0 keeps the view for the
+                // next light. A dot product into an internal register writes no lane w; the rsq
+                // does.
+                const Reg length = Reg::V(TmpLutEntry);
+                e.Dot({length, 0x1}, {I1, XYZW}, {I1, XYZW}, false, Pred::None, true);
+                e.Comp(CompOp::Rsq, {I1, 0x8}, {length}, 0, Pred::None, true);
+                e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {I1, WWWW}, Pred::None, true);
+            } else {
             e.Dot({scratch, 0x1}, {I1, XYZW}, {I1, XYZW}, false, Pred::None, true);
             if (geo) {
                 e.MoveInternal({dot_product, 0x2}, {scratch, XXXX}, Pred::None, true);
             }
             e.Comp(CompOp::Rsq, {scratch, 0x1}, {scratch}, 0, Pred::None, true);
             e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, {scratch, XXXX}, Pred::None, true);
+            }
             if (reads(LutInput::NH)) {
-                e.Dot(input_dst(LutInput::NH), {normal.Pair(0), XYZW}, {I1, XYZW}, false,
+                e.Dot(input_dst(LutInput::NH), normal_src(), {I1, XYZW}, false,
                       Pred::None, true);
             }
             if (reads(LutInput::VH)) {
-                e.Dot(input_dst(LutInput::VH), {nview.Pair(0), XYZW}, {I1, XYZW}, false, Pred::None,
-                      true);
+                e.Dot(input_dst(LutInput::VH), {vectors_first ? I0 : nview.Pair(0), XYZW},
+                      {I1, XYZW}, false, Pred::None, true);
             }
             if (reads(LutInput::CP)) {
                 StoreVec4(half_vector, I1);
@@ -3230,30 +3353,33 @@ void FragmentEmitter::Lighting() {
         // dot(l, n), the L.N input; the spot's input dot(l, spot_dir).
         // light_in_sa: the value into i0 (holding nothing now), so i2 keeps the normal for the
         // next light.
+        // Vectors first: into the light's .z, where its clamp lands (i0 keeps the view).
         const Dst ln =
-            reads(LutInput::LN) ? input_dst(LutInput::LN) : Dst{light_in_sa ? I0 : I2, 0x1};
+            reads(LutInput::LN) ? input_dst(LutInput::LN)
+            : vectors_first     ? Dst{Reg::V(static_cast<uint8_t>(late_home(light_index).n + 2)), 0x1}
+                                : Dst{light_in_sa ? I0 : I2, 0x1};
         if (light_in_sa) {
             e.Dot(ln, {position.Pair(0), XYZW}, {I2, XYZW}, false, Pred::None, true);
         } else {
-            e.Dot(ln, {normal.Pair(0), XYZW}, {I0, XYZW}, false, Pred::None, true);
+            e.Dot(ln, normal_src(), {I0, XYZW}, false, Pred::None, true);
         }
         if (reads(LutInput::SP)) {
             e.Dot(input_dst(LutInput::SP), {spot.Pair(0), XYZW}, {I0, XYZW}, false, Pred::None,
                   true);
         }
-        // dot_product = two_sided ? |dot(l, n)| : max(dot(l, n), 0)
-        const Src ln_value{ln.reg, ln.mask == 0x2 ? YYYY : XXXX};
+        // dot_product = two_sided ? |dot(l, n)| : max(dot(l, n), 0); late, in the light's .z.
+        const Src ln_value{ln.reg, ln.mask == 0x8 ? WWWW : ln.mask == 0x2 ? YYYY : XXXX};
+        const Reg dot_at = late ? Reg::V(static_cast<uint8_t>(late_home(light_index).n + 2))
+                                : dot_product;
         if (two_sided) {
-            e.Vec(VecOp::Add, {dot_product, 0x1}, {ln_value.reg, ln_value.swz, Mod::Abs}, ConstZero,
+            e.Vec(VecOp::Add, {dot_at, 0x1}, {ln_value.reg, ln_value.swz, Mod::Abs}, ConstZero,
                   Pred::None, true);
         } else {
-            e.Vec(VecOp::Max, {dot_product, 0x1}, ln_value, ConstZero, Pred::None, true);
+            e.Vec(VecOp::Max, {dot_at, 0x1}, ln_value, ConstZero, Pred::None, true);
         }
 
         // geo_factor = hh == 0 ? 0 : min(dot_product / hh, 1), in `geo_reg`.y. The attenuation is
         // misc_hi.x, beside the distance it is made from (a pair of its own costs a register).
-        const Reg geo_reg = Reg::V(TmpLightAtten);
-        const Reg atten = misc_hi;
         if ((geo0 || geo1) && uses_secondary_color) {
             e.Comp(CompOp::Rcp, {I0, 0x2}, {dot_product}, 1, Pred::None, true);
             e.Vec(VecOp::Mul, {I0, 0x2}, {I0, YYYY}, {dot_product, XXXX}, Pred::None, true);
@@ -3261,6 +3387,8 @@ void FragmentEmitter::Lighting() {
             e.Test(Cond::Gt, 0, {dot_product}, 1, ConstZero, false);
             e.MoveInternal({geo_reg, 0x2}, {Reg::C(0), XXXX}, Pred::NotP0, true);
         }
+        } // do_vectors
+        if (do_reads) {
         // Attenuation: spot and distance, multiplied into `atten`.x (no register at all when
         // neither is on). The distance's factor lands in `atten` itself, read after the
         // distance beside it (.y) is used; a spot factor before it waits in TmpLutValue.z,
@@ -3345,6 +3473,13 @@ void FragmentEmitter::Lighting() {
                 fetches[fetch_count++] = {
                     &lighting.lut_d1, Sampler::Distribution1, {values, 0x2}, false};
             }
+            if (late) {
+                // In the light's quad, kept to the end.
+                for (u32 k = 0; k < fetch_count; k++) {
+                    fetches[k].into = late_slot(light_index, k);
+                    fetches[k].pair_free = k == 0;
+                }
+            }
             const uint32_t specular_quads = (spec0_on ? 0x1u : 0u) | (spec1_on ? 0x2u : 0u);
             for (u32 i = 0; i < fetch_count; i++) {
                 if (i + 1 == fetch_count) {
@@ -3354,6 +3489,7 @@ void FragmentEmitter::Lighting() {
                           fetches[i].pair_free);
             }
             LightQuads(specular_quads, true);
+            if (!late) { // late: the term after the last read (below the lights)
             if (refl_on && !refl_scalar) {
                 if (!rr) {
                     e.MoveInternal({acc.Pair(0), 0x1}, {Reg::C(2), XXXX}, Pred::None, true);
@@ -3405,7 +3541,9 @@ void FragmentEmitter::Lighting() {
             e.Vec(VecOp::Add, {I1, 0x7}, {I1, XYZW}, {I2, XYZW}, Pred::None, true);
         }
         }
+            } // !late
         } // a term
+        if (!late) {
         // * clamp_highlights * atten, into specular_sum. clamp_highlights is sign(dot_product),
         // which is never negative: the term is zeroed where dot_product is not positive, the
         // predicate made here: the first light's term zeroed, a later one's accumulation
@@ -3447,8 +3585,9 @@ void FragmentEmitter::Lighting() {
         } else {
             accumulate3(specular_sum, I1, clamp_accumulate ? Pred::P0 : Pred::None);
         }
+        } // !late
         } // uses_secondary_color
-        if (uses_primary_color) {
+        if (uses_primary_color && !late) {
         // diffuse_sum += (diffuse * dot_product + ambient) * atten
         LightQuads(0xc, true);
         LoadVec4(I0, diffuse);
@@ -3482,34 +3621,215 @@ void FragmentEmitter::Lighting() {
         }
         } // uses_primary_color
 
-        // The fresnel term, on the last light, into the alphas asked for.
-        const bool fresnel_primary = uses_primary_color && lighting.enable_primary_alpha;
-        const bool fresnel_secondary = uses_secondary_color && lighting.enable_secondary_alpha;
+        // The fresnel term, on the last light, into the alphas asked for that an argument
+        // reads (a table read and its wait for no byte read, else).
+        const bool fresnel_primary =
+            uses_primary_color && lighting.enable_primary_alpha && primary_alpha_read;
+        const bool fresnel_secondary =
+            uses_secondary_color && lighting.enable_secondary_alpha && secondary_alpha_read;
         if (light_index + 1 == lighting.src_num && (fresnel_primary || fresnel_secondary) &&
             LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel)) {
             const Vec4Loc first = fresnel_primary ? diffuse_sum : specular_sum;
-            lut_value(lighting.lut_fr, Sampler::Fresnel, two_sided, {first.Pair(1), 0x2});
-            if (fresnel_primary && fresnel_secondary) {
+            if (late) {
+                lut_value(lighting.lut_fr, Sampler::Fresnel, two_sided,
+                          {late_home(lighting.src_num), 0x1}, true);
+            } else {
+                lut_value(lighting.lut_fr, Sampler::Fresnel, two_sided, {first.Pair(1), 0x2});
+            }
+            if (fresnel_primary && fresnel_secondary && !late) {
                 e.Vec(VecOp::Add, {specular_sum.Pair(1), 0x2}, {diffuse_sum.Pair(1), XYZW},
                       ConstZero);
             }
         }
+        } // do_reads
     }
+    } // pass
 
+    if (late) {
+        // The terms as at the lights (above), after every read: the specular sum in i1 (a
+        // light's term in i2 after the first, its specular_0 part in i0), then the diffuse sum
+        // in i0 (a light's term in i1 after the first, its ambient in i2), each packed from
+        // where it ends. An alpha no argument reads: its byte from lane z (lane w unwritten).
+        constexpr uint8_t xyzz = 0xA4;
+        const Src fresnel{late_home(lighting.src_num), XXXX};
+        // A shadowed term times the shadow (its scalar, or the colour loaded into `with`);
+        // the shadow's alpha into the alphas with the fresnel's or alone.
+        const Vec4Loc shadow{Bank::Virtual, TmpShadow};
+        const auto shadowed = [&](Reg term, Reg with) {
+            if (shadow_scalar) {
+                e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, {shadow.Pair(0), XXXX}, Pred::None,
+                      true);
+            } else {
+                LoadVec4(with, shadow);
+                e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, {with, XYZW}, Pred::None, true);
+            }
+        };
+        const bool shadow_alpha = uses_shadow && lighting.shadow_alpha;
+        const Src shadow_a = shadow_scalar ? Src{shadow.Pair(0), XXXX} : Src{shadow.Pair(1), YYYY};
+        const auto alpha = [&](Reg sum, bool with_fresnel, bool with_shadow) {
+            if (with_fresnel && with_shadow) {
+                e.Vec(VecOp::Mul, {sum, 0x8}, fresnel, shadow_a, Pred::None, true);
+            } else if (with_fresnel) {
+                e.Vec(VecOp::Add, {sum, 0x8}, fresnel, ConstZero, Pred::None, true);
+            } else if (with_shadow) {
+                e.Vec(VecOp::Add, {sum, 0x8}, shadow_a, ConstZero, Pred::None, true);
+            } else {
+                e.Vec(VecOp::Add, {sum, 0x8}, ConstZero, ConstOne, Pred::None, true);
+            }
+        };
+        const auto light_quad = [&](u32 i, u32 q) {
+            LightParams(lighting.lights[i].num);
+            return (LightQuadsRead(i) >> q & 1) != 0 ? LightQuad(q) : Vec4Loc{Bank::SecAttr, 0};
+        };
+        const auto dot_at = [&](u32 i) {
+            return Reg::V(static_cast<uint8_t>(late_home(i).n + 2));
+        };
+        if (uses_secondary_color) {
+            bool empty = true;
+            for (u32 i = 0; i < lighting.src_num; i++) {
+                const bool spec0_on = LightSpecular0(i);
+                const bool spec1_on = LightSpecular1(i);
+                if (!spec0_on && !spec1_on) {
+                    continue;
+                }
+                const bool d1_on =
+                    spec1_on && LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1);
+                const bool d0_on =
+                    spec0_on && LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
+                const bool rr_on =
+                    spec1_on && LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
+                // The values in the fetches' order (late_slot).
+                u32 slots = 0;
+                const auto next = [&] {
+                    const Dst at = late_slot(i, slots++);
+                    return Src{at.reg, at.mask == 0x1 ? XXXX : YYYY};
+                };
+                const Src rr = rr_on ? next() : Src{};
+                const Src d0 = d0_shared ? Src{Reg::V(TmpLutShared), XXXX}
+                               : d0_on   ? next()
+                                         : Src{};
+                const Src d1 = d1_shared ? Src{Reg::V(TmpLutShared), YYYY}
+                               : d1_on   ? next()
+                                         : Src{};
+                const Reg term = empty ? I1 : I2;
+                if (spec1_on) {
+                    LoadVec4(term, light_quad(i, 1));
+                    if (d1_on) {
+                        e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, d1, Pred::None, true);
+                    }
+                    if (rr_on) {
+                        e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, rr, Pred::None, true);
+                    }
+                }
+                if (spec0_on) {
+                    const Reg part = spec1_on ? I0 : term;
+                    LoadVec4(part, light_quad(i, 0));
+                    if (d0_on) {
+                        e.Vec(VecOp::Mul, {part, 0x7}, {part, XYZW}, d0, Pred::None, true);
+                    }
+                    if (spec1_on) {
+                        // The plain load first (only the first source folds a load).
+                        const bool part_first = d1_on || !d0_on;
+                        e.Vec(VecOp::Add, {term, 0x7}, {part_first ? part : term, XYZW},
+                              {part_first ? term : part, XYZW}, Pred::None, true);
+                    }
+                }
+                // (Zeroed after: the product with the shadow is zero all the same.)
+                if (uses_shadow && lighting.shadow_secondary && lighting.lights[i].shadow_enable) {
+                    shadowed(term, I0);
+                }
+                // clamp_highlights: the first term zeroed where L.N is not positive, a later
+                // one's add predicated on it.
+                if (lighting.clamp_highlights) {
+                    e.Test(Cond::Gt, 0, {dot_at(i)}, 0, ConstZero, false);
+                }
+                if (empty) {
+                    if (lighting.clamp_highlights) {
+                        e.MoveInternal({I1, 0x7}, {Reg::C(0), XXXX}, Pred::NotP0, true);
+                    }
+                    empty = false;
+                } else {
+                    e.Vec(VecOp::Add, {I1, 0x7}, {I2, XYZW}, {I1, XYZW},
+                          lighting.clamp_highlights ? Pred::P0 : Pred::None, true);
+                }
+            }
+            // No term and no colour lane read: every byte the alpha's, the fresnel's (times the
+            // shadow's, into the fresnel's .y) or the shadow's, packed from where it lies.
+            const bool with_fresnel = fresnel_read && lighting.enable_secondary_alpha;
+            const bool with_shadow = shadow_alpha && lighting.enable_secondary_alpha;
+            const bool alpha_only = empty && secondary_lanes == 0 && secondary_alpha_read;
+            const Reg fres_home = late_home(lighting.src_num);
+            if (alpha_only && with_fresnel) {
+                if (with_shadow) {
+                    e.Vec(VecOp::Mul, {fres_home, 0x2}, fresnel, shadow_a, Pred::None, true);
+                }
+                e.PackU8(Reg::V(TmpU8Specular), fres_home, fres_home,
+                         PackSelBroadcast(with_shadow ? 1 : 0));
+            } else if (alpha_only && with_shadow) {
+                e.PackU8(Reg::V(TmpU8Specular), shadow_a.reg, shadow_a.reg,
+                         PackSelBroadcast(shadow_scalar ? 0 : 1));
+            } else {
+                if (empty) {
+                    e.MoveInternal({I1, 0x7}, {Reg::C(0), XXXX}, Pred::None, true);
+                }
+                if (secondary_alpha_read) {
+                    alpha(I1, with_fresnel, with_shadow);
+                }
+                e.PackU8(Reg::V(TmpU8Specular), I1, I1,
+                         secondary_alpha_read ? PackSelIdentity : xyzz);
+            }
+        }
+        if (uses_primary_color) {
+            // A read alpha that is 1, made by the first light's global ambient add.
+            const bool alpha_one = primary_alpha_read &&
+                                   !(lighting.enable_primary_alpha && fresnel_read) &&
+                                   !(lighting.enable_primary_alpha && shadow_alpha);
+            for (u32 i = 0; i < lighting.src_num; i++) {
+                const Reg term = i == 0 ? I0 : I1;
+                const bool ambient_on = !lighting.lights[i].ambient_zero;
+                LoadVec4(term, light_quad(i, 2));
+                e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, {dot_at(i), XXXX}, Pred::None, true);
+                if (uses_shadow && lighting.shadow_primary && lighting.lights[i].shadow_enable) {
+                    shadowed(term, I2);
+                }
+                if (ambient_on) {
+                    LoadVec4(I2, light_quad(i, 3));
+                    e.Vec(VecOp::Add, {term, 0x7}, {I2, XYZW}, {term, XYZW}, Pred::None, true);
+                }
+                if (i == 0 && alpha_one) {
+                    // The alpha 1 + 1, which packs to 0xff as 1 does (the direct form's).
+                    constexpr Swizzle xyz1{Ch::X, Ch::Y, Ch::Z, Ch::One};
+                    e.Vec(VecOp::Add, {I0, 0xf}, {global_ambient, xyz1}, {I0, xyz1}, Pred::None,
+                          true);
+                } else if (i == 0) {
+                    e.Vec(VecOp::Add, {I0, 0x7}, {global_ambient, XYZW}, {I0, XYZW}, Pred::None,
+                          true);
+                } else {
+                    e.Vec(VecOp::Add, {I0, 0x7}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
+                }
+            }
+            if (primary_alpha_read && !alpha_one) {
+                alpha(I0, fresnel_read && lighting.enable_primary_alpha,
+                      shadow_alpha && lighting.enable_primary_alpha);
+            }
+            e.PackU8(Reg::V(TmpU8Diffuse), I0, I0, primary_alpha_read ? PackSelIdentity : xyzz);
+        }
+    }
     // Every light's specular term left out: the sum's colour is zero.
-    if (uses_secondary_color && specular_empty && lighting.src_num != 0) {
+    if (uses_secondary_color && specular_empty && lighting.src_num != 0 && !late) {
         e.Vec(VecOp::Add, {specular_sum.Pair(0), 0x3}, ConstZero, ConstZero);
         e.Vec(VecOp::Add, {specular_sum.Pair(1), 0x1}, ConstZero, ConstZero);
     }
-    if (uses_shadow && lighting.shadow_alpha) {
+    if (uses_shadow && lighting.shadow_alpha && !late) {
         const Vec4Loc shadow{Bank::Virtual, TmpShadow};
         const Src shadow_alpha =
             shadow_scalar ? Src{shadow.Pair(0), XXXX} : Src{shadow.Pair(1), YYYY};
-        if (lighting.enable_primary_alpha && uses_primary_color) {
+        // Where an argument reads the alpha (a direct sum's is not read).
+        if (lighting.enable_primary_alpha && uses_primary_color && primary_alpha_read) {
             e.Vec(VecOp::Mul, {diffuse_sum.Pair(1), 0x2}, {diffuse_sum.Pair(1), XYZW},
                   shadow_alpha);
         }
-        if (lighting.enable_secondary_alpha && uses_secondary_color) {
+        if (lighting.enable_secondary_alpha && uses_secondary_color && secondary_alpha_read) {
             e.Vec(VecOp::Mul, {specular_sum.Pair(1), 0x2}, {specular_sum.Pair(1), XYZW},
                   shadow_alpha);
         }
@@ -3518,7 +3838,7 @@ void FragmentEmitter::Lighting() {
     // clamped in place, or packed for the U8 combiners (unless packed at the light). For the U8
     // combiners with a moved lane the sums stay F32 for U8Inputs' packs, which saturate as the
     // clamp does: not clamped.
-    if (uses_primary_color && !direct_primary) {
+    if (uses_primary_color && !direct_primary && !late) {
         if (ambient_added && u8_lighting_packed) {
             e.PackU8(Reg::V(TmpU8Diffuse), diffuse_sum.Pair(0), diffuse_sum.Pair(1));
         } else if (!(ambient_added && u8_tev)) {
@@ -3536,7 +3856,7 @@ void FragmentEmitter::Lighting() {
             }
         }
     }
-    if (uses_secondary_color && !direct_secondary) {
+    if (uses_secondary_color && !direct_secondary && !late) {
         if (u8_lighting_packed) {
             e.PackU8(Reg::V(TmpU8Specular), specular_sum.Pair(0), specular_sum.Pair(1));
         } else if (!u8_tev) {
@@ -4530,6 +4850,17 @@ void FragmentEmitter::U8TevStage(u32 index) {
         e.Sop2(out, s1, s2, f);
         return true;
     };
+    // AddThenMultiply with a one-instruction operation on the other side: both in its two
+    // SOP2s (below), the multiplier read where it lies, its colour or alpha (complemented or
+    // not) the second's factor, with no argument built for it.
+    const bool atm_fused =
+        !dot3 && color_op != stage.alpha_op &&
+        ((color_op == Operation::AddThenMultiply && single(stage.alpha_op)) ||
+         (stage.alpha_op == Operation::AddThenMultiply && single(color_op)));
+    const bool atm_colour = color_op == Operation::AddThenMultiply;
+    const bool factor_raw =
+        atm_fused && (atm_colour ? MovedLane(stage.color_modifier3) < 0
+                                 : MovedLane(stage.alpha_modifier3) < 0);
     if (dot3 || !single(color_op) || !single(stage.alpha_op) || !direct()) {
         std::array<Reg, 3> args{Reg::V(TmpU8Zero), Reg::V(TmpU8Zero), Reg::V(TmpU8Zero)};
         args[0] = U8Arg(0, index, stage.color_source1, stage.color_modifier1, stage.alpha_source1,
@@ -4539,7 +4870,12 @@ void FragmentEmitter::U8TevStage(u32 index) {
                 U8Arg(1, index, stage.color_source2, stage.color_modifier2, stage.alpha_source2,
                       stage.alpha_modifier2, colour_args > 1, alpha_args > 1);
         }
-        if (need3) {
+        if (need3 && factor_raw) {
+            args[2] = atm_colour ? U8Source(ColorSource(stage, stage.color_source3, index), index,
+                                            ReadsAlphaLane(stage.color_modifier3))
+                                 : U8Source(AlphaSource(stage, stage.alpha_source3, index), index,
+                                            true);
+        } else if (need3) {
             args[2] =
                 U8Arg(2, index, stage.color_source3, stage.color_modifier3, stage.alpha_source3,
                       stage.alpha_modifier3, colour_args > 2, alpha_args > 2);
@@ -4595,6 +4931,47 @@ void FragmentEmitter::U8TevStage(u32 index) {
                 break;
             }
             e.Sop2(out, args[0], args[1], s);
+        } else if (atm_fused) {
+            // AddThenMultiply's two SOP2s carry the other operation: the first's other part
+            // makes it over (args[0], args[1]), the second passes that through (ONE * src1)
+            // while it multiplies by args[2], then the merge.
+            const bool colour_three = atm_colour;
+            SopCtl first;
+            if (colour_three) {
+                first.cmod1 = first.cmod2 = true; // ONE * src1 + ONE * src2
+                switch (stage.alpha_op) {
+                case Operation::Replace:
+                    first.amod1 = true;
+                    break;
+                case Operation::Modulate:
+                    first.asel1 = 2;
+                    break;
+                default:
+                    first.amod1 = first.amod2 = true;
+                    first.aop = stage.alpha_op == Operation::Subtract ? 1 : 0;
+                    break;
+                }
+            } else {
+                colour_factors(first);
+                first.amod1 = first.amod2 = true; // ONE * src1 alpha + ONE * src2 alpha
+            }
+            const Reg scratch = Reg::V(TmpU8Scratch);
+            e.Sop2(scratch, args[0], args[1], first);
+            // The factor: args[2] as built (its colour, its alpha), or the register itself with
+            // the modifier's alpha and complement as the selector.
+            SopCtl second;
+            if (colour_three) {
+                const u32 m = factor_raw ? static_cast<u32>(stage.color_modifier3.Value()) : 0;
+                second.csel1 = (m & 2) ? 4 : 2; // src2 alpha : src2, times src1
+                second.cmod1 = (m & 1) != 0;
+                second.amod1 = true; // ONE * src1 alpha
+            } else {
+                const u32 m = factor_raw ? static_cast<u32>(stage.alpha_modifier3.Value()) : 0;
+                second.cmod1 = true; // ONE * src1
+                second.asel1 = 2;    // src2 alpha * src1 alpha
+                second.amod1 = (m & 1) != 0;
+            }
+            e.Sop2(out, scratch, args[2], second);
         } else {
             // Each operation over all four bytes, then the colour of one and the alpha of the
             // other. A Replace side is argument 0 itself, read by the merge.
@@ -4953,13 +5330,28 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
         std::bit_cast<uint32_t>(1.0f /
                                 static_cast<float>(ShadowSize(config.texture.shadow_width_log2))),
         std::bit_cast<uint32_t>(1.0f /
-                                static_cast<float>(ShadowSize(config.texture.shadow_height_log2)))});
-    static_assert(LiteralCount == 58);
+                                static_cast<float>(ShadowSize(config.texture.shadow_height_log2))),
+        0xc0004000u, 0x0000c000u, // F16 2, -2 | -2, 0
+        0x00000000u, 0x00003c00u, // 0, 0 | 1, 0
+        0x00000000u, 0x3c000000u, // 0, 0 | 0, 1
+        0u, std::bit_cast<uint32_t>(-1.0f), std::bit_cast<uint32_t>(-256.0f),
+        std::bit_cast<uint32_t>(-65536.0f),
+        std::bit_cast<uint32_t>(-1.0f /
+                                static_cast<float>(ShadowSize(config.texture.shadow_width_log2))),
+        std::bit_cast<uint32_t>(-1.0f /
+                                static_cast<float>(ShadowSize(config.texture.shadow_height_log2))),
+        std::bit_cast<uint32_t>(-0.5f), 0u,
+    });
+    static_assert(LiteralCount == 72);
+    static_assert(LitShadowNegInvWidth % 2 == 0);
+    static_assert(LitByteWeightR % 4 == 0);
+    static_assert(LitF16Normal2 % 2 == 0 && LitF16Z1 % 2 == 0 && LitF16W1 % 2 == 0);
     static_assert(LitShadowWidth % 2 == 0 && LitShadowInvWidth % 2 == 0);
     static_assert(std::tuple_size_v<decltype(literal_table)> == LiteralCount);
     static_assert(Pica::Shader::LUT_RG_ROWS == Pica::Shader::LUT_RGBA_ROWS);
     program.uses_discard = uses_kill;
-    if (uniform_floats + literal_reserve + program.samplers.size() * 4 > 128) {
+    if (uniform_floats + std::max(literal_reserve, lit_pairs * 2) + program.samplers.size() * 4 >
+        128) {
         if (refusal) {
             *refusal = "secondary attribute budget";
         }

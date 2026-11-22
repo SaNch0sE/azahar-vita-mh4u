@@ -33,12 +33,6 @@ namespace SgxdRenderer::Usse {
                                                         std::string* refusal = nullptr,
                                                         int level = 1);
 
-/// The lighting's diagnostics switch (sgxd_flags light16why), set before any program is
-/// emitted.
-struct LightingSwitches {
-};
-inline LightingSwitches lighting_switches;
-
 /// The texture units 0-2 (a mask) the program for `config` samples: the TEV stages' sources,
 /// the bump map and the shadow texture, as the emitter plans them.
 [[nodiscard]] uint32_t SampledTextureUnits(const Pica::Shader::FSConfig& config);

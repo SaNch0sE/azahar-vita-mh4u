@@ -56,6 +56,8 @@ std::string UniformName(const Uniform& uniform) {
         return "shadow_bias_linear";
     case UniformKind::ShadowTextureBias:
         return "shadow_texture_bias";
+    case UniformKind::ShadowBorderDepth:
+        return "shadow_border_depth";
     case UniformKind::Dot3Const:
         return "dot3_const[" + std::to_string(uniform.index) + "]";
     case UniformKind::ConstColor:

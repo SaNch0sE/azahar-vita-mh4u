@@ -396,6 +396,8 @@ private:
         /// The distance attenuation's scale (1) or bias (2), in the LUT read's units (the bias plus half a
         /// texel). (::u8: the member u8 above hides the type.)
         ::u8 dist_atten;
+        /// A Shadow2D border colour's (-depth, density) (UniformKind::ShadowBorderDepth).
+        bool shadow_border;
         /// A constant colour's two Dot3 terms (UniformKind::Dot3Const).
         bool dot3_const;
     };

@@ -723,6 +723,8 @@ UniformField FragmentUniformField(const Usse::Uniform& u) {
         return {offsetof(D, shadow_bias_linear), false};
     case K::ShadowTextureBias:
         return {offsetof(D, shadow_texture_bias), true};
+    case K::ShadowBorderDepth:
+        return {offsetof(D, tex_border_color), false}; // unit 0's
     case K::Dot3Const:
         return {offsetof(D, const_color) + u.index * sizeof(D::const_color[0]), false};
     default:
@@ -742,9 +744,6 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
                              GuestGpuMemory& guest_memory_)
     : VideoCore::RasterizerAccelerated{memory_, pica_}, guest_memory{guest_memory_} {
     Vprof::Start(memory_);
-    Usse::sched_probe.lut_reads = SgxdFlagValue("fslut");
-    Usse::sched_probe.lut_kind = SgxdFlagValue("fslutkind");
-    Usse::sched_probe.nosched = static_cast<int>(SgxdFlagValue("fsnosched"));
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
     }
@@ -5845,7 +5844,7 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
                      (g.buffer_pointer ? g.buffer_floats : g.uniform_floats));
         const UniformField field = FragmentUniformField(u);
         DEBUG_ASSERT(!u.u8 || (!field.is_int && u.sa_offset + u.array_size <= g.uniform_floats));
-        DEBUG_ASSERT(!u.f16 || (!field.is_int && u.components == 4 &&
+        DEBUG_ASSERT(!u.f16 || (!field.is_int && (u.components == 3 || u.components == 4) &&
                                 u.sa_offset + 2 * u.array_size <= g.uniform_floats));
         f.uniforms.push_back(
             {u.sa_offset, static_cast<u16>(field.offset), static_cast<u8>(u.components),
@@ -5857,7 +5856,9 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
                                                                                  : 0),
              static_cast<u8>(u.kind == Usse::UniformKind::LightDistAttenScale  ? 1
                              : u.kind == Usse::UniformKind::LightDistAttenBias ? 2
-                                                                               : 0)});
+                                                                               : 0),
+             u.kind == Usse::UniformKind::ShadowBorderDepth,
+             u.kind == Usse::UniformKind::Dot3Const});
     }
 
     std::vector<u64> code = g.primary;
@@ -8858,13 +8859,21 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                 continue;
             }
             if (u.f16) {
-                // A pair an element, four F16 (Usse::Uniform::f16).
+                // A pair an element, four F16; a float3's fourth zero, a direction normalised.
                 for (u32 e = 0; e < u.count; e++, src += u.stride) {
+                    float value[4]{};
+                    std::memcpy(value, src, u.components * 4);
+                    if (u.normalize) {
+                        const float scale = 1.0f / std::sqrt(value[0] * value[0] +
+                                                             value[1] * value[1] +
+                                                             value[2] * value[2]);
+                        value[0] *= scale;
+                        value[1] *= scale;
+                        value[2] *= scale;
+                    }
                     u16 half[4];
                     for (u32 c = 0; c < 4; c++) {
-                        float value;
-                        std::memcpy(&value, src + c * 4, 4);
-                        half[c] = ToF16(value);
+                        half[c] = ToF16(value[c]);
                     }
                     std::memcpy(fsa_cpu + (u.sa + e * 2) * 4, half, sizeof(half));
                 }
@@ -8872,6 +8881,18 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             }
             float* dst = u.sa < fg.uniform_floats ? fsa_f + u.sa
                                                   : reinterpret_cast<float*>(fbuf_cpu) + u.sa;
+            if (u.shadow_border) {
+                // (-depth, density) of the border colour's bytes, floor(c * 255 + 0.5): exact.
+                float c[4];
+                std::memcpy(c, src, sizeof(c));
+                float b[4];
+                for (u32 k = 0; k < 4; k++) {
+                    b[k] = std::floor(c[k] * 255.0f + 0.5f);
+                }
+                dst[0] = -(b[1] + 256.0f * b[2] + 65536.0f * b[3]);
+                dst[1] = b[0];
+                continue;
+            }
             if (u.dot3_const) {
                 float c[3];
                 std::memcpy(c, src, sizeof(c));

@@ -884,12 +884,92 @@ void Encoder::VecWord(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nos
 }
 
 void Encoder::Vec16(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched) {
-    // An F16 pair holds all four lanes: no move to the second pair.
+    // An F16 pair holds all four lanes: no move to the second pair. The register mask as F16
+    // lanes: a register is two.
+    dst.mask = static_cast<uint8_t>(((dst.mask & 1) ? 0x3 : 0) | ((dst.mask & 2) ? 0xc : 0));
     VecWord(op, dst, src1, src2, pred, nosched);
     // Same fields, the opcode selects the f16 unit.
     uint64_t& word = words.back();
     word = (word & ~(0x1full << 59)) | (0b00010ull << 59);
     (void)PatV16Nmad;
+}
+
+void Encoder::Mad16(Dst dst, Src src0, Src src1, Src src2) {
+    dst.reg = Map(dst.reg);
+    src0.reg = Map(src0.reg);
+    src1.reg = Map(src1.reg);
+    src2.reg = Map(src2.reg);
+    uint64_t s0b = 0;
+    switch (src0.reg.bank) {
+    case Bank::Temp:
+        s0b = 0;
+        break;
+    case Bank::PrimAttr:
+        s0b = 1;
+        break;
+    default:
+        Fail("usse: vmad2's first source is a temporary or a primary attribute");
+    }
+    if (src0.mod != Mod::None || src1.mod != Mod::None || src2.mod != Mod::None) {
+        Fail("usse: an F16 vmad2 with a modifier");
+    }
+    // The tables' common entries (Vita3K's vmad2): 0-3 a lane broadcast, 4 xyzw; source 0's
+    // 7 is zwxy.
+    const auto code = [](const Swizzle& s, bool first, uint64_t& out) {
+        for (uint64_t k = 0; k < 4; k++) {
+            const Ch c = static_cast<Ch>(k);
+            if (s == Swizzle{c, c, c, c}) {
+                out = k;
+                return true;
+            }
+        }
+        if (s == XYZW) {
+            out = 4;
+            return true;
+        }
+        if (first && s == Swizzle{Ch::Z, Ch::W, Ch::X, Ch::Y}) {
+            out = 7;
+            return true;
+        }
+        return false;
+    };
+    uint64_t sw0, sw1, sw2;
+    if (!code(src0.swz, true, sw0) || !code(src1.swz, false, sw1) || !code(src2.swz, false, sw2)) {
+        Fail("usse: an F16 vmad2 swizzle not in its tables");
+    }
+    const auto [db, dext] = DestBank(dst.reg.bank);
+    if (dext) {
+        Fail("usse: vmad2 destination bank");
+    }
+    const auto [s1b, s1ext] = Src12Bank(src1.reg.bank);
+    const auto [s2b, s2ext] = Src12Bank(src2.reg.bank);
+    const uint64_t mask = ((dst.mask & 1) ? 0x3 : 0) | ((dst.mask & 2) ? 0xc : 0);
+    Push(Pack(PatVmad2, {
+        {'d', 1}, {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'r', sw0 >> 2}, {'y', 0},
+        {'c', 0}, {'b', s1ext}, {'a', s2ext}, {'w', sw2},
+        {'i', sw1 >> 2}, {'n', 0}, {'e', mask}, {'m', 0}, {'o', 0}, {'k', s0b}, {'t', db},
+        {'f', s1b}, {'g', s2b}, {'h', DoubledNum(dst.reg, 6)}, {'z', sw1 & 3}, {'j', sw0 & 3},
+        {'l', DoubledNum(src0.reg, 6)}, {'q', DoubledNum(src1.reg, 6)}, {'u', DoubledNum(src2.reg, 6)},
+    }), 43, 0, 0);
+}
+
+void Encoder::Comp16(CompOp op, Dst dst, Src src, uint8_t src_comp, bool f16_src, bool f16_dst) {
+    dst.reg = Map(dst.reg);
+    src.reg = Map(src.reg);
+    if (dst.reg.bank == Bank::Internal || src.reg.bank == Bank::Internal) {
+        Fail("usse: an F16 VECCOMPLEX on an internal register");
+    }
+    const auto [db, dext] = DestBank(dst.reg.bank);
+    const auto [sb, sext] = Src12Bank(src.reg.bank);
+    // An F16 result: the low half (mask x); an F32 one the
+    // register the mask names.
+    Push(Pack(PatVcomp, {
+        {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'d', f16_dst ? 1u : 0u}, {'y', 0}, {'e', dext},
+        {'n', 0}, {'r', sext}, {'a', 0}, {'o', 0}, {'b', static_cast<uint64_t>(op)},
+        {'c', f16_src ? 1u : 0u}, {'m', static_cast<uint64_t>(src.mod)}, {'f', src_comp & 3u},
+        {'t', db}, {'k', sb}, {'g', DoubledNum(dst.reg, 8)}, {'h', DoubledNum(src.reg, 8)},
+        {'w', 1},
+    }), 43, 0, 0);
 }
 
 void Encoder::Mad(Dst dst, Src src1, Src gpi0, Src gpi1, bool vec4, Pred pred, bool nosched) {
@@ -1242,12 +1322,12 @@ void Encoder::MoveF32x4(Dst dst, Reg lo, Reg hi, bool nosched) {
          Writes(dst, Pred::None));
 }
 
-void Encoder::PackF16(Dst dst, Reg lo, Reg hi, bool nosched) {
+void Encoder::PackF16(Dst dst, Reg lo, Reg hi, bool nosched, uint8_t sel) {
     dst.reg = Map(dst.reg);
     lo = Map(lo);
     hi = Map(hi);
 
-    Push(PackMove(5, dst, lo, hi, skip_invalid), 54, ReadsAll(lo) | ReadsAll(hi),
+    Push(PackMove(5, dst, lo, hi, skip_invalid, 6, 0, sel), 54, ReadsAll(lo) | ReadsAll(hi),
          Writes(dst, Pred::None));
 }
 

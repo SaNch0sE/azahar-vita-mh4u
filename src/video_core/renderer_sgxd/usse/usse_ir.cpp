@@ -85,6 +85,7 @@ void Refs(Inst& i, RefList& out) {
         break;
     case Op::Mad:
     case Op::Mad2:
+    case Op::Mad16:
     case Op::CondMove:
         out.push_back({&i.dst.reg, true});
         out.push_back({&i.src[0].reg, false});
@@ -97,6 +98,7 @@ void Refs(Inst& i, RefList& out) {
         out.push_back({&i.src[1].reg, false});
         break;
     case Op::Comp:
+    case Op::Comp16:
     case Op::MoveInternal:
         out.push_back({&i.dst.reg, true});
         out.push_back({&i.src[0].reg, false});
@@ -193,8 +195,10 @@ bool PureWrite(const Inst& i) {
     case Op::Vec16:
     case Op::Mad:
     case Op::Mad2:
+    case Op::Mad16:
     case Op::Dot:
     case Op::Comp:
+    case Op::Comp16:
     case Op::MoveF32x4:
     case Op::PackF16:
     case Op::MoveInternal:
@@ -241,6 +245,7 @@ const char* OpName(Op op) {
         "pack_s16", "mad2",         "unpack_u8",
         "sta32",    "idf",          "sop2",
         "sop3",     "pack_u8",      "unpack_u8n",
+        "mad16",    "comp16",
     };
     const auto n = static_cast<std::size_t>(op);
     return n < sizeof(names) / sizeof(names[0]) ? names[n] : "?";
@@ -398,12 +403,36 @@ void Builder::Vec(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool) {
 }
 
 void Builder::Vec16(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool) {
+    if ((dst.mask & ~3u) != 0) {
+        Fail("an F16 operation's mask names the pair's two registers");
+    }
     Inst& i = Push(Op::Vec16);
     i.u[0] = static_cast<uint8_t>(op);
     i.dst = dst;
     i.src[0] = src1;
     i.src[1] = src2;
     i.pred = pred;
+}
+
+void Builder::Mad16(Dst dst, Src src0, Src src1, Src src2) {
+    if ((dst.mask & ~3u) != 0) {
+        Fail("an F16 operation's mask names the pair's two registers");
+    }
+    Inst& i = Push(Op::Mad16);
+    i.dst = dst;
+    i.src[0] = src0;
+    i.src[1] = src1;
+    i.src[2] = src2;
+}
+
+void Builder::Comp16(CompOp op, Dst dst, Src src, uint8_t src_comp, bool f16_src, bool f16_dst) {
+    Inst& i = Push(Op::Comp16);
+    i.u[0] = static_cast<uint8_t>(op);
+    i.u[1] = src_comp;
+    i.b[0] = f16_src;
+    i.b[1] = f16_dst;
+    i.dst = dst;
+    i.src[0] = src;
 }
 
 void Builder::Mad(Dst dst, Src src1, Src gpi0, Src gpi1, bool vec4, Pred pred, bool) {
@@ -470,6 +499,11 @@ void Builder::PackF16(Dst dst, Reg lo, Reg hi, bool) {
     i.dst = dst;
     i.reg[0] = lo;
     i.reg[1] = hi;
+}
+
+void Builder::PackF16X(Dst dst, Reg src) {
+    PackF16(dst, src, src);
+    insts.back().b[1] = true;
 }
 
 void Builder::MoveInternal(Dst dst, Src src, Pred pred, bool) {
@@ -837,6 +871,18 @@ uint8_t SwizzleRegs(const Src& src, uint8_t mask) {
     return lanes;
 }
 
+/// The registers an F16 source's lanes name (lanes x and y the first, z and w the second) for
+/// the lanes the destination registers `regs` hold.
+uint8_t SwizzleRegs16(const Src& src, uint8_t regs) {
+    uint8_t out = 0;
+    for (int l = 0; l < 4; l++) {
+        if ((regs >> (l >> 1)) & 1 && src.swz[l] <= Ch::W) {
+            out |= static_cast<uint8_t>(1u << (static_cast<int>(src.swz[l]) >> 1));
+        }
+    }
+    return out;
+}
+
 /// f(register, registers) for each register an instruction reads: bit k of `registers` is
 /// register n + k, which may reach past the register's quad. The shapes known here read
 /// what their operands name (a pair, a U8 or integer word, a swizzle's channels); any other
@@ -847,6 +893,23 @@ void PreciseReads(Inst& inst, RefList& refs, F&& f) {
     case Op::Vec:
         f(inst.src[0].reg, SwizzleRegs(inst.src[0], inst.dst.mask));
         f(inst.src[1].reg, SwizzleRegs(inst.src[1], inst.dst.mask));
+        return;
+    case Op::Vec16: {
+        // A DP reads all four lanes whatever it writes.
+        const uint8_t lanes =
+            static_cast<VecOp>(inst.u[0]) == VecOp::Dp ? uint8_t{0x3} : inst.dst.mask;
+        f(inst.src[0].reg, SwizzleRegs16(inst.src[0], lanes));
+        f(inst.src[1].reg, SwizzleRegs16(inst.src[1], lanes));
+        return;
+    }
+    case Op::Mad16:
+        for (int k = 0; k < 3; k++) {
+            f(inst.src[k].reg, SwizzleRegs16(inst.src[k], inst.dst.mask));
+        }
+        return;
+    case Op::Comp16:
+        f(inst.src[0].reg, static_cast<uint8_t>(
+                               1u << (inst.b[0] ? (inst.u[1] & 3) >> 1 : inst.u[1] & 3)));
         return;
     case Op::Mad:
         for (int k = 0; k < 3; k++) {
@@ -875,7 +938,12 @@ void PreciseReads(Inst& inst, RefList& refs, F&& f) {
         return;
     case Op::MoveF32x4:
     case Op::PackF16:
-        // Pairs: (lo, hi), or the one pair of four F16 lanes; an internal source is whole.
+        // Pairs: (lo, hi), or the one pair of four F16 lanes; an internal source is whole. A
+        // PackF16X reads lo's first register alone.
+        if (inst.op == Op::PackF16 && inst.b[1] && inst.reg[0].bank != Bank::Internal) {
+            f(inst.reg[0], 0x1);
+            return;
+        }
         f(inst.reg[0], 0x3);
         if (inst.reg[0].bank != Bank::Internal && (inst.op == Op::PackF16 || !inst.b[0])) {
             f(inst.reg[1], 0x3);
@@ -3558,6 +3626,9 @@ void Lowering::CheckTemps() const {
         // The reads PreciseReads knows exactly; its other ops read a whole quad by default.
         switch (inst.op) {
         case Op::Vec:
+        case Op::Vec16:
+        case Op::Mad16:
+        case Op::Comp16:
         case Op::Mad:
         case Op::Dot:
         case Op::Comp:
@@ -4185,6 +4256,10 @@ std::vector<bool> Lowering::SkipInvalid() const {
         case Op::MoveInternal:
         case Op::CondMove:
             return inst.dst.mask;
+        case Op::Vec16:
+        case Op::Mad16:
+        case Op::Comp16:
+            return inst.dst.mask; // the registers (Builder::Vec16)
         case Op::Sample2D:
             return inst.dst.mask;
         case Op::Lda32:
@@ -4487,8 +4562,14 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
         case Op::Mad2:
             e.Mad2(D(i.dst), S(i.src[0]), S(i.src[1]), S(i.src[2]), i.pred);
             break;
+        case Op::Mad16:
+            e.Mad16(D(i.dst), S(i.src[0]), S(i.src[1]), S(i.src[2]));
+            break;
         case Op::Comp:
             e.Comp(static_cast<CompOp>(i.u[0]), D(i.dst), S(i.src[0]), i.u[1], i.pred);
+            break;
+        case Op::Comp16:
+            e.Comp16(static_cast<CompOp>(i.u[0]), D(i.dst), S(i.src[0]), i.u[1], i.b[0], i.b[1]);
             break;
         case Op::MoveF32x4:
             if (i.b[0]) {
@@ -4498,7 +4579,8 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             }
             break;
         case Op::PackF16:
-            e.PackF16(D(i.dst), Map(i.reg[0]), Map(i.reg[1]));
+            e.PackF16(D(i.dst), Map(i.reg[0]), Map(i.reg[1]), false,
+                      i.b[1] ? PackSelBroadcast(0) : PackSelIdentity);
             break;
         case Op::MoveInternal:
             e.MoveInternal(D(i.dst), S(i.src[0]), i.pred);

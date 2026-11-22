@@ -245,8 +245,15 @@ public:
     /// dst = op(src1, src2), f32, two components on the unified store or four on an
     /// internal register. src2 has no negate: swap the sources or negate src1.
     void Vec(VecOp op, Dst dst, Src src1, Src src2, Pred pred = Pred::None, bool nosched = false);
-    /// The f16 form of the same.
+    /// The f16 form of the same: `dst.mask` names the F16 pair's registers (bit 0 lanes x and
+    /// y, bit 1 z and w; Ir::Builder::Vec16), the swizzles its F16 lanes.
     void Vec16(VecOp op, Dst dst, Src src1, Src src2, Pred pred = Pred::None, bool nosched = false);
+    /// VMAD2 with its F16 bit: src0 * src1 + src2 on the F16 lanes of the registers `dst.mask`
+    /// names (as Vec16's); swizzles XYZW, XXXX-WWWW, and ZWXY for source 0.
+    void Mad16(Dst dst, Src src0, Src src1, Src src2);
+    /// VECCOMPLEX with F16 types: an F16 source's `src_comp` is its F16 lane; an F16 result
+    /// writes the destination register's low half.
+    void Comp16(CompOp op, Dst dst, Src src, uint8_t src_comp, bool f16_src, bool f16_dst);
     /// One F32 vector instruction on a unified-store destination's pair (or an internal one).
     void VecPair(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched);
     /// Vec's and Vec16's instruction word, as given.
@@ -276,8 +283,9 @@ public:
     void MoveF32x4(Dst dst, Reg lo, Reg hi, bool nosched = false);
     /// pack.f32.f16 dst.xyzw, src: the four F16 lanes of the pair at `src` as F32.
     void UnpackF16x4(Dst dst, Reg src);
-    /// Four f32 in (lo, hi) packed to half4 at dst.
-    void PackF16(Dst dst, Reg lo, Reg hi, bool nosched = false);
+    /// Four f32 in (lo, hi) packed to half4 at dst; `sel` the source lane of each (two bits a
+    /// lane from x up, as PackU8's).
+    void PackF16(Dst dst, Reg lo, Reg hi, bool nosched = false, uint8_t sel = PackSelIdentity);
     /// Four-wide f32 move between internal registers with a swizzle.
     void MoveInternal(Dst dst, Src src, Pred pred = Pred::None, bool nosched = false);
     /// dst = (src0 != 0) ? src1 : src2, per component, f32. src0 is tested with the identity

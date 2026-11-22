@@ -114,6 +114,8 @@ enum class Op : uint8_t {
     Sop3,
     PackU8,
     UnpackU8,
+    Mad16,
+    Comp16,
 };
 
 struct Inst {
@@ -209,7 +211,17 @@ public:
     void EndVertex();
     void EndSecondary();
     void Vec(VecOp op, Dst dst, Src src1, Src src2, Pred pred = Pred::None, bool nosched = false);
+    /// The F16 forms. An F16 vector's four lanes are a register
+    /// pair: `dst.mask` names the pair's registers (bit 0 the first, lanes x and y; bit 1 the
+    /// second, z and w), each written whole; the swizzles name F16 lanes. Vec16's DP is a dp4.
     void Vec16(VecOp op, Dst dst, Src src1, Src src2, Pred pred = Pred::None, bool nosched = false);
+    /// VMAD2 in F16, src0 * src1 + src2 over the lanes `dst.mask`'s registers hold; source 0
+    /// is a temporary or a primary attribute, the swizzles XYZW or a broadcast (ZWXY for
+    /// source 0 too).
+    void Mad16(Dst dst, Src src0, Src src1, Src src2);
+    /// VECCOMPLEX with F16 source and or destination types: `src_comp` is an F16 lane where
+    /// the source is F16; an F16 result goes into the destination register's low half alone.
+    void Comp16(CompOp op, Dst dst, Src src, uint8_t src_comp, bool f16_src, bool f16_dst);
     void Mad(Dst dst, Src src1, Src gpi0, Src gpi1, bool vec4, Pred pred = Pred::None,
              bool nosched = false);
     void Dot(Dst dst, Src src1, Src gpi0, bool vec4, Pred pred = Pred::None, bool nosched = false);
@@ -226,6 +238,9 @@ public:
     /// MoveF32x4 that reads the one pair, so every pass treats it as one.
     void UnpackF16x4(Dst dst, Reg src);
     void PackF16(Dst dst, Reg lo, Reg hi, bool nosched = false);
+    /// Every F16 lane from the F32 at `src`'s first register (pack.f16.f32 with the x select),
+    /// its neighbour not read.
+    void PackF16X(Dst dst, Reg src);
     void MoveInternal(Dst dst, Src src, Pred pred = Pred::None, bool nosched = false);
     void CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched = false);
     void Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, bool src2_scalar,
