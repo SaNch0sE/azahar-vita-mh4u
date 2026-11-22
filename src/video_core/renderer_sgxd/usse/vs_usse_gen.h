@@ -49,7 +49,8 @@ struct VsSemantic {
  *   `gs_in_rows` brings 2 + gs_rows words: where the invocation's first triangle goes, where
  *   the address past its last one goes, then each input row's address less 4 (a fetch reads
  *   from one word past its base, docs/sgxd/usse.md). Row r is input register
- *   v<r> (point mode) or float uniform c<gs_first_uniform + r> (the uniform modes). Each
+ *   v<r> (point mode) or float uniform c<gs_first_uniform + r> (the uniform modes), then in
+ *   the fixed-primitive mode one row for each register of gs_input_rows. Each
  *   triangle an EMIT completes is stored as its three vertices' output attributes, one after
  *   the other; at most gs_max_triangles are stored, the rest dropped. The position is as
  *   StoreOutputs'.
@@ -76,14 +77,20 @@ struct VsRequest {
     uint16_t bools;
     uint16_t bool_mask;
     std::array<uint8_t, 16> reg_components;
-    /// Input registers whose loader is UNSIGNED_BYTE: the fetch brings the raw word, and the
-    /// prologue unpacks its bytes to integer-valued floats, as the PICA's loader converts them.
+    /// Input registers whose loader is an integer format (UNSIGNED_BYTE, BYTE or SHORT): the
+    /// fetch brings the raw words, and the prologue unpacks them to integer-valued floats, as
+    /// the PICA's loader converts them. s8_regs and s16_regs mark the BYTE and SHORT ones.
     uint16_t u8_regs;
+    uint16_t s8_regs = 0;
+    uint16_t s16_regs = 0;
     VsMode mode = VsMode::Draw;
     uint32_t gs_rows = 0;
     bool gs_rows_uniform = false;
     bool gs_rows_table = false;
     uint32_t gs_first_uniform = 0;
+    /// The fixed-primitive mode's input registers that hold an earlier draw's rows: one row each
+    /// after the uniform rows, in register order, loaded by the prologue. The others read zero.
+    uint16_t gs_input_rows = 0;
     /// The fixed-primitive mode, for a program that reads a float uniform with an address
     /// register (GsIndexesUniforms): the entry ends in one more word, the address less 4 of the
     /// invocation's table of 128 + 3 words as gs_rows_table's, its rows at c<gs_first_uniform> on.

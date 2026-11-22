@@ -30,6 +30,15 @@ using TextureType = TexturingRegs::TextureConfig::TextureType;
 using Sampler = LightingRegs::LightingSampler;
 using LutInput = LightingRegs::LightingLutInput;
 
+// A PreviousBuffer source's alpha is the last alpha update's, its colour the last colour
+// update's.
+bool ReadsAlphaLane(ColorModifier m) {
+    return (static_cast<u32>(m) & ~1u) == 0x2; // SourceAlpha, OneMinusSourceAlpha
+}
+bool ReadsAlphaLane(AlphaModifier m) {
+    return ((static_cast<u32>(m) >> 1) & 3) == 0; // SourceAlpha, OneMinusSourceAlpha
+}
+
 // The generator's notion of a stage that changes nothing.
 bool IsPassThroughTevStage(const TevStageConfig& stage) {
     return (stage.color_op == Operation::Replace && stage.alpha_op == Operation::Replace &&
@@ -195,6 +204,10 @@ public:
     FragmentEmitter(const FSConfig& config_, int level_) : config{config_}, level{level_} {}
 
     std::optional<GxpProgram> Emit(std::string* refusal);
+    uint32_t SampledUnits() {
+        PlanInputs();
+        return (unit_used[0] ? 1u : 0u) | (unit_used[1] ? 2u : 0u) | (unit_used[2] ? 4u : 0u);
+    }
     int level = 1;
 
 private:
@@ -294,6 +307,9 @@ private:
     Ir::Builder e; ///< the program, in virtual quads; usse_ir places them
     GxpProgram gxp;
     std::array<bool, 3> unit_used{};
+    /// The units whose texel is the pixel's own colour (FSConfig own_pixel): the tile's colour
+    /// in o0, no sampler (unit_used is false for them).
+    std::array<bool, 3> unit_own{};
     std::array<uint8_t, 3> texcoord_pa{}; ///< PA base of TEXCOORD0..2, when declared
     uint8_t position_pa = 0;              ///< PA base of WPOS (x, y, z, w), when declared
     uint8_t texcoord0_w_pa = 0;           ///< PA of TEXCOORD3 (unit 0's projective w)
@@ -515,6 +531,22 @@ void FragmentEmitter::PlanInputs() {
             unit_used[unit] = true;
             uses_shadow = true;
         }
+    }
+    // A unit whose texel is the pixel's own colour reads the tile, not a sampler. The
+    // rasterizer (OwnPixelUnits) sets it only on a plain 2D unit the lighting does not read.
+    for (u32 unit = 0; unit < 3; unit++) {
+        if (!(tex.own_pixel >> unit & 1) || !unit_used[unit]) {
+            continue;
+        }
+        const bool lit =
+            (uses_shadow && lighting.shadow_selector == unit) ||
+            (uses_lighting && lighting.bump_mode != LightingRegs::LightingBumpMode::None &&
+             lighting.bump_selector == unit);
+        if (lit || (unit == 0 && tex.texture0_type != TextureType::Texture2D)) {
+            throw std::runtime_error("usse: an own-pixel unit the lighting reads or not 2D");
+        }
+        unit_own[unit] = true;
+        unit_used[unit] = false;
     }
     for (u32 unit = 0; unit < 3; unit++) {
         const auto& border = tex.texture_border_color[unit];
@@ -1569,13 +1601,15 @@ void FragmentEmitter::Lighting() {
         e.Vec(VecOp::Add, {into, 0x7}, {ConstOne.reg, XXXX, Mod::Neg}, {into, XYZW}, Pred::None,
               true);
     };
-    // i0 = surface normal, i1 = surface tangent (only when Config7 wants a tangent).
-    const auto default_normal = [&] { // (0, 0, 1)
-        e.MoveInternal({I0, 0x7}, {Reg::C(0), XXXX}, Pred::None, true);
+    // i0 = surface normal, i1 = surface tangent (only when Config7 wants a tangent). All four
+    // lanes: a parked vector is stored and reloaded whole, and an internal register's unwritten
+    // lanes are another instance's.
+    const auto default_normal = [&] { // (0, 0, 1, 0)
+        e.MoveInternal({I0, 0xf}, {Reg::C(0), XXXX}, Pred::None, true);
         e.Vec(VecOp::Add, {I0, 0x4}, ConstOne, ConstZero, Pred::None, true);
     };
-    const auto default_tangent = [&] { // (1, 0, 0)
-        e.MoveInternal({I1, 0x7}, {Reg::C(0), XXXX}, Pred::None, true);
+    const auto default_tangent = [&] { // (1, 0, 0, 0)
+        e.MoveInternal({I1, 0xf}, {Reg::C(0), XXXX}, Pred::None, true);
         e.Vec(VecOp::Add, {I1, 0x1}, ConstOne, ConstZero, Pred::None, true);
     };
     switch (lighting.bump_mode) {
@@ -2068,6 +2102,8 @@ void FragmentEmitter::PlanCombinerBuffer() {
         if (IsPassThroughTevStage(stage)) {
             continue;
         }
+        // The lane the modifier reads, not the argument's kind: a colour argument can read a
+        // buffered stage's alpha (SourceAlpha).
         const auto reads = [&](Source src, bool alpha) {
             if (src != Source::PreviousBuffer) {
                 return;
@@ -2077,12 +2113,12 @@ void FragmentEmitter::PlanCombinerBuffer() {
                 snapshot_lanes[from] |= alpha ? 0x8 : 0x7;
             }
         };
-        reads(ColorSource(stage, stage.color_source1, k), false);
-        reads(ColorSource(stage, stage.color_source2, k), false);
-        reads(ColorSource(stage, stage.color_source3, k), false);
-        reads(AlphaSource(stage, stage.alpha_source1, k), true);
-        reads(AlphaSource(stage, stage.alpha_source2, k), true);
-        reads(AlphaSource(stage, stage.alpha_source3, k), true);
+        reads(ColorSource(stage, stage.color_source1, k), ReadsAlphaLane(stage.color_modifier1));
+        reads(ColorSource(stage, stage.color_source2, k), ReadsAlphaLane(stage.color_modifier2));
+        reads(ColorSource(stage, stage.color_source3, k), ReadsAlphaLane(stage.color_modifier3));
+        reads(AlphaSource(stage, stage.alpha_source1, k), ReadsAlphaLane(stage.alpha_modifier1));
+        reads(AlphaSource(stage, stage.alpha_source2, k), ReadsAlphaLane(stage.alpha_modifier2));
+        reads(AlphaSource(stage, stage.alpha_source3, k), ReadsAlphaLane(stage.alpha_modifier3));
     }
 }
 
@@ -2131,8 +2167,10 @@ void FragmentEmitter::LoadArg(uint8_t arg_index, const TevStageConfig& stage, u3
     // differs, then one add for the inverted lanes. Assembling it in temporaries first cost
     // three copies and a load per argument.
     const Reg dst = Reg::I(arg_index);
-    const Vec4Loc c = SourceLocation(ColorSource(stage, csrc, stage_index), stage_index, false);
-    const Vec4Loc a = SourceLocation(AlphaSource(stage, asrc, stage_index), stage_index, true);
+    const Vec4Loc c =
+        SourceLocation(ColorSource(stage, csrc, stage_index), stage_index, ReadsAlphaLane(cmod));
+    const Vec4Loc a =
+        SourceLocation(AlphaSource(stage, asrc, stage_index), stage_index, ReadsAlphaLane(amod));
     const bool want_c = lanes & 0x7;
     const bool want_a = lanes & 0x8;
 
@@ -2464,6 +2502,19 @@ std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
     e.Nop();
     Scissor();
     SampleTextures();
+    // An own-pixel unit's texel is the tile's colour, as F32 (the U8 combiners copy it in
+    // U8Inputs).
+    if (!u8_tev) {
+        for (u32 unit = 0; unit < 3; unit++) {
+            if (unit_own[unit]) {
+                // Two pairs: an F32 unpack into unified-store registers writes two lanes.
+                const uint8_t at = static_cast<uint8_t>(TmpTex0 + 4 * unit);
+                e.UnpackU8({Reg::V(at), 0x3}, Reg::O(0));
+                e.UnpackU8({Reg::V(static_cast<uint8_t>(at + 2)), 0x3}, Reg::O(0), 0xEE);
+                texel_loc[unit] = {Bank::Virtual, at};
+            }
+        }
+    }
     if (uses_proctex && !proctex_tabled) {
         ProcTex();
     }
@@ -2506,6 +2557,11 @@ std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
 }
 
 } // Anonymous namespace
+
+uint32_t SampledTextureUnits(const FSConfig& config) {
+    FragmentEmitter emitter{config, 1};
+    return emitter.SampledUnits();
+}
 
 std::optional<GxpProgram> EmitFragmentGxp(const FSConfig& config, std::string* refusal,
                                           int level) {

@@ -633,20 +633,30 @@ void Encoder::PackS16(Reg dst, Reg src, uint8_t comp, Pred pred) {
     }), 54, ReadsOne(src, comp), 0);
 }
 
-void Encoder::UnpackU8(Reg dst, Reg src, uint8_t byte) {
+void Encoder::UnpackInt(Reg dst, Reg src, uint8_t select, uint8_t format) {
     dst = Map(dst);
     src = Map(src);
-    if (byte > 3 || (src.n & 1) || src.bank == Bank::Internal || src.bank == Bank::Const) {
-        Fail("usse: a U8 unpack reads bytes 0-3 of an even unified-store register");
+    if (select > 3 || (format != 0 && format != 1 && format != 4) || (src.n & 1) ||
+        src.bank == Bank::Internal || src.bank == Bank::Const) {
+        Fail("usse: an integer unpack reads lanes 0-3 of U8, S8 or S16 from an even "
+             "unified-store register");
     }
     const auto [db, dext] = DestBank(dst.bank);
     const auto [sb, sext] = Src12Bank(src.bank);
+    // The hardware's form (docs/sgxd/usse.md): lane x's select is lo bits 1..0, the low bit of the
+    // source 2 number, then x. Without the scale flag (h) a byte converts to its integer value, and
+    // only lane x is written: so one byte, mask x, one register. S8 and S16 (the PICA's BYTE and
+    // SHORT loaders) take the same form with their source format. A 16-bit lane is a half: lo bit 0
+    // picks it within a register and lo bit 7 the pair's register, as PackS16 picks an F32 lane
+    // (halves 2 and 3 through lo bit 1 read garbage).
+    const bool half = format == 4;
     Push(Pack(PatVpck, {
         {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'u', 0}, {'y', 0}, {'d', dext},
-        {'e', 0}, {'r', sext}, {'c', 0}, {'a', 0}, {'f', 0}, {'t', 6}, {'m', 1}, {'b', db},
+        {'e', 0}, {'r', sext}, {'c', 0}, {'a', 0}, {'f', format}, {'t', 6}, {'m', 1}, {'b', db},
         {'k', sb}, {'l', 0}, {'g', SingleNum(dst, 7)}, {'o', 3}, {'h', 0}, {'i', 1}, {'j', 2},
-        {'q', DoubledNum(src, 7)}, {'v', 0}, {'w', static_cast<uint64_t>(byte >> 1)},
-        {'x', static_cast<uint64_t>(byte & 1)},
+        {'q', DoubledNum(src, 7)}, {'v', half ? static_cast<uint64_t>(select >> 1) : 0u},
+        {'w', half ? 0u : static_cast<uint64_t>(select >> 1)},
+        {'x', static_cast<uint64_t>(select & 1)},
     }), 54, 0, 0);
 }
 

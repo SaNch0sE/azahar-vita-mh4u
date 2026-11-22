@@ -93,7 +93,7 @@ extern int sgxd_session_ta_over_3d;
 // The TA and 3D sides write only their own registers (sgxd_recipe.c); the pending 3D's recipe
 // block and data must be other memory than r's. Every user of the async chain goes through
 // these, so one list finishes each 3D.
-int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[4], char *failed,
+int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], char *failed,
                                 unsigned failed_size);
 // No 3D is ever left pending: these keep their callers, with nothing to do.
 const SgxdRecipe *sgxd_session_pending(void);

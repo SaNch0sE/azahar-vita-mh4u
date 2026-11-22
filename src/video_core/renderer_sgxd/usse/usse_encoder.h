@@ -177,9 +177,10 @@ public:
     /// dst (one 32-bit register) = (int16) src.<comp> from an f32, rounded to nearest (SGX543
     /// has no other rounding).
     void PackS16(Reg dst, Reg src, uint8_t comp, Pred pred = Pred::None);
-    /// VPCK U8 to F32, unscaled, mask x: byte `byte` (0-3) of `src` (an even register) into dst,
-    /// the one register the unscaled form writes.
-    void UnpackU8(Reg dst, Reg src, uint8_t byte);
+    /// VPCK to F32, unscaled, mask x: lane `select` of `src` (an even register, read as a 64-bit
+    /// pair) into dst, the one register the unscaled form writes. `format` is the source's
+    /// (VPCK's numbering: 0 U8, 1 S8, 4 S16).
+    void UnpackInt(Reg dst, Reg src, uint8_t select, uint8_t format = 0);
     void Nop();
     /// The nop the compiler places right after a kill (a different word from Nop's).
     void NopAfterKill();

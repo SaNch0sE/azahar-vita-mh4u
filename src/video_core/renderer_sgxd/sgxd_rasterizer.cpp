@@ -26,6 +26,9 @@
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_external.h"
 #include "video_core/pica/shader_setup.h"
+#include "video_core/pica/shader_unit.h"
+#include "video_core/pica/vertex_loader.h"
+#include "video_core/shader/shader.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/gxm_rasterizer.h"
 #include "video_core/texture/texture_decode.h"
@@ -45,6 +48,55 @@
 namespace GxmRenderer {
 
 namespace {
+
+/// How the untile reads a PICA texture format: the texture unit's format code and swizzle, its
+/// bits a texel, and the palette that expands a 4-bit index. Code 0xff: not built.
+struct UntileFormat {
+    u32 code;
+    u32 swizzle;
+    u32 bits;
+    TexturePalette palette = TexturePalette::None;
+};
+
+UntileFormat UntileFormatFor(Pica::TexturingRegs::TextureFormat format) {
+    using F = Pica::TexturingRegs::TextureFormat;
+    switch (format) {
+    case F::RGBA8: // bytes A, B, G, R: U8U8U8U8 mirrored (RGBA)
+        return {0x0c, 2, 32};
+    case F::RGB8: // bytes B, G, R: U8U8U8 with red and blue swapped
+        return {0x98, 1, 24};
+    case F::RGB5A1: // R 15:11, G 10:6, B 5:1, A 0: U1U5U5U5 mirrored
+        return {0x04, 2, 16};
+    case F::RGB565: // R 15:11, G 10:5, B 4:0: U5U6U5 with red and blue swapped
+        return {0x05, 1, 16};
+    case F::RGBA4: // R 15:12 .. A 3:0: U4U4U4U4 mirrored
+        return {0x02, 2, 16};
+    case F::IA8: // byte 0 alpha, byte 1 intensity: U8U8 as RGGG
+        return {0x07, 3, 16};
+    case F::RG8: // byte 0 green, byte 1 red: U8U8 as RG, blue and alpha 0 (the texture's
+                 // alpha_one reads alpha 1, as upstream's DecodeRG8)
+        return {0x07, 5, 16};
+    case F::I8: // U8 as 1RRR
+        return {0x00, 5, 8};
+    case F::A8: // U8 as R000
+        return {0x00, 6, 8};
+    // The 4-bit formats: a nibble a texel, the low one first; IA4 a byte, intensity in the high
+    // nibble.
+    case F::IA4:
+        return {0x95, 0, 8, TexturePalette::IA4};
+    case F::I4:
+        return {0x94, 0, 4, TexturePalette::I4};
+    case F::A4:
+        return {0x94, 0, 4, TexturePalette::A4};
+    case F::ETC1: // the texture unit's ETC1 once its blocks are reordered (Untile)
+        return {SgxdBackend::UntileEtc1, 0, 4};
+    case F::ETC1A4: // its colour as ETC1's, the alpha joined by a merge render (Untile)
+        return {SgxdBackend::UntileEtc1A4, 0, 8};
+    default:
+        return {0xff, 0, 0};
+    }
+}
+
 
 using Pica::f24;
 using FramebufferRegs = Pica::FramebufferRegs;
@@ -68,6 +120,17 @@ const char* TopologyName(Pica::PipelineRegs::TriangleTopology topology) {
 // output with END, or packed in place and blended over the output buffer's o0.
 constexpr u64 PackToOutput = 0x40a40a3da01d8000ull; // pack.u8.f16.scl o0, pa0 (end)
 constexpr u64 PackInPlace = 0x40a00a3ea01d8000ull;  // pack.u8.f16.scl pa0, pa0
+// VPCK's destination mask (bits 37:34, bit 34 R): an unwritten byte keeps what o0 held.
+constexpr u64 PackMask = 0xfull << 34;
+
+/// LIMM: a 32-bit immediate into register `num` of bank `bank` (0 r, 1 o, 2 pa), with the end bit.
+constexpr u64 Limm(u32 bank, u32 num, u32 value, bool end) {
+    return u64{0xfc} << 56 | u64{1} << 55 | u64{2} << 52 | u64{end} << 50 |
+           u64{(value >> 26) & 0x3f} << 44 | u64{(value >> 21) & 0x1f} << 36 | u64{bank} << 32 |
+           u64{num} << 21 | (value & 0x1fffff);
+}
+static_assert(Limm(1, 0, 0xffffffffu, true) == 0xfca7f1f1001fffffull);
+static_assert(Limm(2, 0, 0x80402010u, false) == 0xfca2002200002010ull);
 // The texture format code of F32F32, read by the float4 query.
 constexpr unsigned LutFormatF32F32 = 0x1e;
 // F16F16F16F16 (0x1b), the proctex colour rows.
@@ -183,6 +246,245 @@ static_assert(BlendWord(FramebufferRegs::BlendEquation::Add, FramebufferRegs::Bl
                         FramebufferRegs::BlendFactor::SourceAlpha,
                         FramebufferRegs::BlendFactor::OneMinusSourceAlpha) == BlendSourceAlpha);
 
+/// A PICA factor for the swapped SOP2, src1 the output buffer and src2 the fragment.
+/// SRC_ALPHA_SATURATE has none (7, 3).
+constexpr Sop2Factor ColourFactorSwapped(FramebufferRegs::BlendFactor f) {
+    using F = FramebufferRegs::BlendFactor;
+    switch (f) {
+    case F::Zero:
+        return {0, 0};
+    case F::One:
+        return {0, 1};
+    case F::SourceColor:
+        return {2, 0};
+    case F::OneMinusSourceColor:
+        return {2, 1};
+    case F::DestColor:
+        return {1, 0};
+    case F::OneMinusDestColor:
+        return {1, 1};
+    case F::SourceAlpha:
+        return {4, 0};
+    case F::OneMinusSourceAlpha:
+        return {4, 1};
+    case F::DestAlpha:
+        return {3, 0};
+    case F::OneMinusDestAlpha:
+        return {3, 1};
+    default:
+        return {7, 0};
+    }
+}
+
+constexpr Sop2Factor AlphaFactorSwapped(FramebufferRegs::BlendFactor f) {
+    const Sop2Factor a = AlphaFactor(f);
+    return {a.sel == 1 ? 2u : a.sel == 2 ? 1u : a.sel, a.complement};
+}
+
+/// ReverseSubtract as the SOP2's SUB with its operands swapped (`sop2 o0, o0, pa0`). Exact when
+/// neither equation is a plain Subtract and no colour factor is SRC_ALPHA_SATURATE; 0 otherwise.
+u64 BlendWordSwapped(FramebufferRegs::BlendEquation eq_rgb, FramebufferRegs::BlendEquation eq_a,
+                     FramebufferRegs::BlendFactor src_rgb, FramebufferRegs::BlendFactor dst_rgb,
+                     FramebufferRegs::BlendFactor src_a, FramebufferRegs::BlendFactor dst_a) {
+    using Eq = FramebufferRegs::BlendEquation;
+    const auto op = [](Eq eq) -> u32 {
+        switch (eq) {
+        case Eq::Add:
+            return 0;
+        case Eq::ReverseSubtract:
+            return 1;
+        case Eq::Min:
+            return 2;
+        case Eq::Max:
+            return 3;
+        default:
+            return 4;
+        }
+    };
+    const Sop2Factor c1 = ColourFactorSwapped(dst_rgb), c2 = ColourFactorSwapped(src_rgb);
+    const Sop2Factor a1 = AlphaFactorSwapped(dst_a), a2 = AlphaFactorSwapped(src_a);
+    const u32 cop = op(eq_rgb), aop = op(eq_a);
+    if (c1.sel == 7 || c2.sel == 7 || a1.sel == 3 || a2.sel == 3 || cop == 4 || aop == 4) {
+        return 0;
+    }
+    Usse::SopCtl s;
+    s.csel1 = static_cast<u8>(c1.sel);
+    s.cmod1 = c1.complement != 0;
+    s.csel2 = static_cast<u8>(c2.sel);
+    s.cmod2 = c2.complement != 0;
+    s.asel1 = static_cast<u8>(a1.sel);
+    s.amod1 = a1.complement != 0;
+    s.asel2 = static_cast<u8>(a2.sel);
+    s.amod2 = a2.complement != 0;
+    s.cop = static_cast<u8>(cop);
+    s.aop = static_cast<u8>(aop);
+    Usse::Encoder enc;
+    enc.Sop2(Usse::Reg::O(0), Usse::Reg::O(0), Usse::Reg::Pa(0), s, true);
+#ifdef VITA_DIAGNOSTICS
+    // The encoder's unswapped form of the same fields is BlendWord's.
+    static const bool checked = [] {
+        Usse::SopCtl f;
+        f.csel1 = 3, f.csel2 = 3, f.cmod2 = true, f.asel1 = 1, f.asel2 = 1, f.amod2 = true;
+        Usse::Encoder forward;
+        forward.Sop2(Usse::Reg::O(0), Usse::Reg::Pa(0), Usse::Reg::O(0), f, true);
+        DEBUG_ASSERT_MSG(forward.Words()[0] == BlendSourceAlpha,
+                         "sgxd: the encoder's blend SOP2 {:016x} is not BlendSourceAlpha {:016x}",
+                         forward.Words()[0], BlendSourceAlpha);
+        return true;
+    }();
+#endif
+    return enc.Words()[0];
+}
+
+/// A constant factor beside the fragment's own colour, which no one SOP2 does: with the constant
+/// in pa2, one SOP3 for the alpha into pa1 and one for the colour into o0, then a select takes
+/// pa1's alpha byte (BlendSplitSelect). MIN or MAX in alpha ignores the factors and runs as a
+/// SOP2, whose MIN and MAX are verified on the hardware (SOP3's are not). False for MIN, MAX or
+/// SRC_ALPHA_SATURATE in colour.
+bool BlendSplitWords(FramebufferRegs::BlendEquation eq_rgb, FramebufferRegs::BlendEquation eq_a,
+                     FramebufferRegs::BlendFactor src_rgb, FramebufferRegs::BlendFactor dst_rgb,
+                     FramebufferRegs::BlendFactor src_a, FramebufferRegs::BlendFactor dst_a,
+                     u64& alpha_word, u64& colour_word) {
+    using Eq = FramebufferRegs::BlendEquation;
+    using F = FramebufferRegs::BlendFactor;
+    const auto op = [](Eq eq, bool& swap) -> int {
+        swap = eq == Eq::ReverseSubtract;
+        return eq == Eq::Add ? 0 : eq == Eq::Subtract || eq == Eq::ReverseSubtract ? 1 : -1;
+    };
+    // A colour factor's CSEL (fragment and buffer as src1 and src2, or swapped); -1 for none.
+    const auto colour = [](F f, bool swap) -> std::pair<int, bool> {
+        const int frag = swap ? 6 : 2, buf = swap ? 2 : 6;
+        switch (f) {
+        case F::Zero:
+            return {0, false};
+        case F::One:
+            return {0, true};
+        case F::SourceColor:
+            return {frag, false};
+        case F::OneMinusSourceColor:
+            return {frag, true};
+        case F::DestColor:
+            return {buf, false};
+        case F::OneMinusDestColor:
+            return {buf, true};
+        case F::SourceAlpha:
+            return {frag + 1, false};
+        case F::OneMinusSourceAlpha:
+            return {frag + 1, true};
+        case F::DestAlpha:
+            return {buf + 1, false};
+        case F::OneMinusDestAlpha:
+            return {buf + 1, true};
+        case F::ConstantColor:
+            return {4, false};
+        case F::OneMinusConstantColor:
+            return {4, true};
+        case F::ConstantAlpha:
+            return {5, false};
+        case F::OneMinusConstantAlpha:
+            return {5, true};
+        default:
+            return {-1, false};
+        }
+    };
+    // An alpha factor: which alpha (0 zero/one, 1 the fragment's, 2 the buffer's, 3 the constant's)
+    // and whether complemented.
+    const auto alpha = [](F f) -> std::pair<int, bool> {
+        switch (f) {
+        case F::Zero:
+            return {0, false};
+        case F::One:
+        case F::SourceAlphaSaturate:
+            return {0, true};
+        case F::SourceColor:
+        case F::SourceAlpha:
+            return {1, false};
+        case F::OneMinusSourceColor:
+        case F::OneMinusSourceAlpha:
+            return {1, true};
+        case F::DestColor:
+        case F::DestAlpha:
+            return {2, false};
+        case F::OneMinusDestColor:
+        case F::OneMinusDestAlpha:
+            return {2, true};
+        case F::ConstantColor:
+        case F::ConstantAlpha:
+            return {3, false};
+        default:
+            return {3, true};
+        }
+    };
+    bool swap_rgb = false, swap_a = false;
+    const int cop = op(eq_rgb, swap_rgb), aop = op(eq_a, swap_a);
+    const auto c1 = colour(swap_rgb ? dst_rgb : src_rgb, swap_rgb);
+    const auto c2 = colour(swap_rgb ? src_rgb : dst_rgb, swap_rgb);
+    const bool alpha_min_max = eq_a == Eq::Min || eq_a == Eq::Max;
+    if (cop < 0 || (aop < 0 && !alpha_min_max) || c1.first < 0 || c2.first < 0) {
+        return false;
+    }
+    Usse::Encoder enc;
+    const Usse::Reg frag = Usse::Reg::Pa(0), buffer = Usse::Reg::O(0);
+    if (alpha_min_max) {
+        Usse::SopCtl sa;
+        sa.amod1 = true;
+        sa.amod2 = true;
+        sa.aop = eq_a == Eq::Min ? 2 : 3;
+        enc.Sop2(Usse::Reg::Pa(1), frag, buffer, sa);
+    } else {
+        // The alpha into pa1: ASEL1 (1 src0, 2 src1, 3 src2) and CSEL2's alpha (5 src0, 3 src1, 7 src2).
+        const auto a1 = alpha(swap_a ? dst_a : src_a), a2 = alpha(swap_a ? src_a : dst_a);
+        const auto which = [&](int k, bool first) -> u8 {
+            const int src = k == 3 ? 0 : (k == 1) != swap_a ? 1 : 2;
+            if (first) {
+                return static_cast<u8>(src == 0 ? 1 : src == 1 ? 2 : 3);
+            }
+            return static_cast<u8>(src == 0 ? 5 : src == 1 ? 3 : 7);
+        };
+        Usse::SopCtl sa;
+        sa.asel1 = a1.first == 0 ? 0 : which(a1.first, true);
+        sa.amod1 = a1.second;
+        sa.csel2 = a2.first == 0 ? 0 : which(a2.first, false);
+        sa.cmod2 = a2.second;
+        sa.aop = static_cast<u8>(aop);
+        enc.Sop3(Usse::Reg::Pa(1), Usse::Reg::Pa(2), swap_a ? buffer : frag,
+                 swap_a ? frag : buffer, sa);
+    }
+    Usse::SopCtl sc;
+    sc.csel1 = static_cast<u8>(c1.first);
+    sc.cmod1 = c1.second;
+    sc.csel2 = static_cast<u8>(c2.first);
+    sc.cmod2 = c2.second;
+    sc.cop = static_cast<u8>(cop);
+    enc.Sop3(buffer, Usse::Reg::Pa(2), swap_rgb ? buffer : frag, swap_rgb ? frag : buffer, sc);
+    alpha_word = enc.Words()[0];
+    colour_word = enc.Words()[1];
+    return true;
+}
+
+/// The split blend's end: `sop3 o0, pa2, pa1, o0` with pa2 0xff in the alpha byte only.
+u64 BlendSplitSelect() {
+    Usse::Encoder enc;
+    Usse::SopCtl s;
+    s.csel1 = 4;
+    s.csel2 = 4;
+    s.cmod2 = true;
+    s.asel1 = 1;
+    enc.Sop3(Usse::Reg::O(0), Usse::Reg::Pa(2), Usse::Reg::Pa(1), Usse::Reg::O(0), s, true);
+    return enc.Words()[0];
+}
+
+/// The epilogue's blend: into o0, or with R, G and B masked apart into pa0 and through the mask.
+void PushBlend(std::vector<u64>& code, u64 blend, u8 mask) {
+    if (mask == 0xf) {
+        code.push_back(blend);
+        return;
+    }
+    code.push_back(BlendIntoPa0(blend));
+    code.push_back(Limm(2, 1, U8ByteMask(mask), false));
+    code.push_back(U8OutputSelect());
+}
+
 // The dummy programs at the code bases: a secondary with no program of its own runs them.
 const u32 DummyVertexSecondary = sgxd_program_doutu0(0, 0, 0);
 const u32 DummyPixelSecondary = sgxd_program_doutu0(1, 0, 0);
@@ -211,13 +513,16 @@ u32 DepthCompare(FramebufferRegs::CompareFunc func) {
     UNREACHABLE();
 }
 
-/// The cull mode for the MTE (state word 21's CULLMODE), with the viewport's y scale positive.
+/// The cull mode for the MTE (state word 21's CULLMODE). The MTE culls by the winding in
+/// device space, and the draws' y scale is negative
+/// (NDC y +1 at the target's first row, Draw): a triangle's device winding is the reverse of
+/// its NDC one, so the PICA's modes map the other way round from a positive y scale's.
 u32 CullMode(Pica::RasterizerRegs::CullMode mode) {
     switch (mode) {
     case Pica::RasterizerRegs::CullMode::KeepClockWise:
-        return 1;
-    case Pica::RasterizerRegs::CullMode::KeepCounterClockWise:
         return 2;
+    case Pica::RasterizerRegs::CullMode::KeepCounterClockWise:
+        return 1;
     default:
         return 0;
     }
@@ -334,6 +639,8 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
     }
+    backend.SetTextureEvictor([this] { return EvictTexture(); });
+    backend.SetRoomTaken([this](u32 begin, u32 end) { KeepGsRows(begin, end); });
 }
 
 RasterizerGxm::~RasterizerGxm() = default;
@@ -372,6 +679,27 @@ void RasterizerSgxd::FlushAndInvalidateRegion(PAddr, u32) {}
 
 void RasterizerSgxd::ClearAll(bool) {}
 
+namespace {
+/// A transfer's pixel format as the texture format of the same layout (PixelFormat swaps RGB565
+/// and RGB5A1 against TextureFormat).
+Pica::TexturingRegs::TextureFormat TextureFormatOf(Pica::PixelFormat format) {
+    using TF = Pica::TexturingRegs::TextureFormat;
+    switch (format) {
+    case Pica::PixelFormat::RGBA8:
+        return TF::RGBA8;
+    case Pica::PixelFormat::RGB8:
+        return TF::RGB8;
+    case Pica::PixelFormat::RGB565:
+        return TF::RGB565;
+    case Pica::PixelFormat::RGB5A1:
+        return TF::RGB5A1;
+    case Pica::PixelFormat::RGBA4:
+        return TF::RGBA4;
+    }
+    UNREACHABLE_MSG("sgxd: pixel format {} is not a PICA transfer format", static_cast<u32>(format));
+}
+} // namespace
+
 bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
     FlushImmediate();
 #ifdef VITA_DIAGNOSTICS
@@ -387,25 +715,70 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     using Pica::PixelFormat;
     const PAddr input = config.GetPhysicalInputAddress();
     const PAddr output = config.GetPhysicalOutputAddress();
-    const u32 width = config.output_width, height = config.output_height;
+    // ScaleX halves the output's width, ScaleXY its height too (each output pixel the average of 2
+    // or 2 x 2); output_width/height count the input's pixels.
+    const u32 scale_x = config.scaling != config.NoScale ? 2 : 1;
+    const u32 scale_y = config.scaling == config.ScaleXY ? 2 : 1;
+    const u32 width = config.output_width / scale_x, height = config.output_height / scale_y;
     const auto describe = [&] {
         return fmt::format("{}, format {} to {}, flags {:#x}", config.DebugName(),
                            static_cast<u32>(config.input_format.Value()),
                            static_cast<u32>(config.output_format.Value()), config.flags);
     };
-    // simple_tri's transfer: a tiled RGBA8 buffer into a linear RGB8
-    // one of the same size, no flip, no scaling.
-    DEBUG_ASSERT_MSG(
-        !config.input_linear && !config.dont_swizzle && !config.flip_vertically &&
-            !config.crop_input_lines && config.scaling == config.NoScale &&
-            config.input_width == width && config.input_height == height,
-        "GXM: AccelerateDisplayTransfer {}: only a tiled-to-linear copy of one size is "
-        "built",
-        describe());
-    DEBUG_ASSERT_MSG(config.input_format == PixelFormat::RGBA8 &&
-                         config.output_format == PixelFormat::RGB8,
-                     "GXM: AccelerateDisplayTransfer {}: only RGBA8 to RGB8 is built", describe());
-    const u32 bytes = width * height * 3;
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags xferlog: every display transfer, texture copy and fill as it comes.
+    static const bool xfer_log = SgxdFlag("xferlog");
+    if (xfer_log) {
+        LOG_INFO(Render, "xferlog: display transfer {}", describe());
+    }
+#endif
+    // An address in no guest memory drops the transfer (a virtual address GSP could not convert
+    // comes through as it is).
+    if (!memory.IsValidPhysicalAddress(input) || !memory.IsValidPhysicalAddress(output)) {
+        LOG_ERROR(Render, "sgxd: AccelerateDisplayTransfer {}: dropped, not guest memory",
+                  describe());
+        return true;
+    }
+    EndDoubleRender(input, width | height << 16);
+    const u32 in_width = config.input_width, in_height = config.input_height;
+    // A tiled picture into a tiled one (dont_swizzle on a tiled input): a pass on the output as a PICA
+    // colour buffer.
+    const bool tiled_out = !config.input_linear && config.dont_swizzle;
+    DEBUG_ASSERT_MSG(!config.input_linear && !config.flip_vertically &&
+                         config.scaling <= config.ScaleXY && in_width >= width * scale_x &&
+                         in_height >= height * scale_y,
+                     "GXM: AccelerateDisplayTransfer {}: only a tiled input without flip is "
+                     "built",
+                     describe());
+    // The output format as the PBE's pack mode (docs/sgxd/pbe.md), from an A8B8G8R8 picture. The
+    // PBE truncates, as the PICA's conversions do.
+    struct Out {
+        u32 pack;
+        bool mirror;
+        u32 bytes;
+    };
+    Out out_format{};
+    switch (config.output_format) {
+    case PixelFormat::RGBA8:
+        out_format = {SGXD_RECIPE_PACK_U8888_RGBA, false, 4};
+        break;
+    case PixelFormat::RGB8: // B, G, R in memory: gxm's U8U8U8_RGB store
+        out_format = {SGXD_RECIPE_PACK_U888_RGB, false, 3};
+        break;
+    case PixelFormat::RGB565:
+        out_format = {SGXD_RECIPE_PACK_R5G6B5, false, 2};
+        break;
+    case PixelFormat::RGB5A1:
+        out_format = {SGXD_RECIPE_PACK_A1R5G5B5_RGBA, false, 2};
+        break;
+    case PixelFormat::RGBA4:
+        out_format = {SGXD_RECIPE_PACK_A4R4G4B4, true, 2};
+        break;
+    default:
+        UNREACHABLE_MSG("sgxd: AccelerateDisplayTransfer {}: that output format is not built",
+                        describe());
+    }
+    const u32 bytes = width * height * out_format.bytes;
     const bool fcram = output >= Memory::FCRAM_PADDR && output + bytes <= Memory::FCRAM_PADDR_END;
     DEBUG_ASSERT_MSG(
         fcram || (output >= Memory::VRAM_PADDR && output + bytes <= Memory::VRAM_PADDR_END),
@@ -414,13 +787,30 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     if (backend.InPass()) {
         EndPass("the display transfer");
     }
-    const auto source = std::find_if(surfaces.begin(), surfaces.end(),
-                                     [&](const Surface& s) { return s.addr == input; });
-    DEBUG_ASSERT_MSG(
-        source != surfaces.end() && source->width == width && source->height == height,
-        "GXM: AccelerateDisplayTransfer {}: no {}x{} surface at {:#x}; a picture the CPU "
-        "drew needs GPU untiling, which is not built",
-        describe(), width, height, input);
+    // The source: a surface a pass drew, from its first row or a whole tile row inside it (the
+    // guest's two screens in one buffer); otherwise the guest's own tiled picture.
+    // Of surfaces there in several shapes, the one a pass drew last.
+    auto source = surfaces.end();
+    for (auto it = surfaces.begin(); it != surfaces.end(); ++it) {
+        if (input >= it->addr && input < it->End() && it->passes > 0 && !it->guest_newer &&
+            (source == surfaces.end() || it->generation > source->generation)) {
+            source = it;
+        }
+    }
+    u32 first_row = 0;
+    if (source != surfaces.end()) {
+        const u32 offset = input - source->addr;
+        first_row = offset / (source->width * source->bpp);
+        DEBUG_ASSERT_MSG(
+            TextureFormatOf(config.input_format) == static_cast<Pica::TexturingRegs::TextureFormat>(
+                                                         source->format) &&
+                source->width == in_width && offset % (source->width * 8 * source->bpp) == 0 &&
+                first_row + height * scale_y <= source->height,
+            "GXM: AccelerateDisplayTransfer {}: {}x{} from {} rows into the {}x{} surface at "
+            "{:#x} (format {}) is not built",
+            describe(), width, height, first_row, source->width, source->height, source->addr,
+            static_cast<u32>(source->format));
+    }
 
     // The surface's row y is the PICA's row y. The PICA's RGB8 is B, G, R in memory, gxm's
     // U8U8U8_RGB store. Guest memory is mapped for the GPU at its PICA address; VRAM, and
@@ -436,6 +826,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     u32 ta_us = 0, d3_us = 0;
     backend.Blit(source->memory, width, height, store, &ta_us, &d3_us);
     TexturesWritten(output, output + bytes);
+    SurfacesWritten(output, output + bytes);
     // The blit's 3D stays pending, as a pass's does: the next list finishes it. Whatever waits on the
     // blit (a page hold on its output, a ticket) finishes it then (InterruptPoll, RenderWait).
     // Progress: a line every 30 transfers.
@@ -452,9 +843,35 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     // gxm_flags dumpat=N: transfers N and N + 1 checked and written, to compare runs frame for
     // frame. Only then: the check waits for the render and the write holds the emulation thread.
     static const u32 dump_at = GxmFlagValue("dumpat");
-    const bool dump = dump_at != 0 && transfers + 1 >= dump_at && transfers + 1 < dump_at + 2;
+    const bool dump = dump_at != 0 && transfers + 1 >= dump_at && transfers + 1 < dump_at + 2 &&
+                      source != surfaces.end();
     transfers++;
     if (dump) {
+        // The source surface (A8B8G8R8, every row) as a PPM and the output's bytes as they
+        // are, for any format.
+        backend.RenderIdle("the transfer's dump");
+        const std::string surface_path = fmt::format("host0:azahar-surface-{}.ppm", transfers);
+        if (std::FILE* f = std::fopen(surface_path.c_str(), "wb")) {
+            std::fprintf(f, "P6\n%u %u\n255\n", source->width, source->height);
+            std::vector<u8> rgb(source->width * source->height * 3);
+            for (u32 n = 0; n < source->width * source->height; n++) {
+                std::memcpy(&rgb[n * 3], source->memory.cpu + n * 4, 3);
+            }
+            std::fwrite(rgb.data(), 1, rgb.size(), f);
+            std::fclose(f);
+        }
+        const std::string out_path = fmt::format("host0:azahar-output-{}-{}x{}-f{}.bin", transfers,
+                                                 width, height,
+                                                 static_cast<u32>(config.output_format.Value()));
+        if (std::FILE* f = std::fopen(out_path.c_str(), "wb")) {
+            std::fwrite(out, 1, bytes, f);
+            std::fclose(f);
+        }
+        LOG_INFO(Render, "transfer {}: from row {} of the {}x{} surface at {:#x}; written to {} "
+                 "and {}", transfers, first_row, source->width, source->height, source->addr,
+                 surface_path, out_path);
+    }
+    if (dump && first_row == 0 && config.output_format == PixelFormat::RGB8) {
         // The check reads the output back: the async render completes first.
         backend.RenderIdle("the transfer's check");
         const auto pixel = [&](u32 x, u32 y) {
@@ -517,8 +934,8 @@ void RasterizerSgxd::NotifyP3D() {
         EndPass("P3D");
     }
     if (p3ds++ < 4 || p3ds % 60 == 0) {
-        LOG_INFO(Render, "P3D {}: {}; {} passes so far", p3ds,
-                 in_pass ? "ended the open pass" : "no pass open", passes);
+        LOG_INFO(Render, "P3D {}: {}; {} passes so far, {} opened by a covering draw", p3ds,
+                 in_pass ? "ended the open pass" : "no pass open", passes, covered_passes);
     }
 }
 
@@ -537,11 +954,32 @@ bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& con
     // Lines of input_width bytes input_gap apart into lines of output_width output_gap apart (16-byte
     // units); alike on both sides, or with no gaps, one contiguous copy.
     const auto& tc = config.texture_copy;
-    const u32 in_width = tc.input_width * 16, in_gap = tc.input_gap * 16;
-    const u32 out_width = tc.output_width * 16, out_gap = tc.output_gap * 16;
+    u32 in_width = tc.input_width * 16, out_width = tc.output_width * 16;
+    const u32 in_gap = tc.input_gap * 16, out_gap = tc.output_gap * 16;
     const PAddr src = config.GetPhysicalInputAddress(), dst = config.GetPhysicalOutputAddress();
+#ifdef VITA_DIAGNOSTICS
+    static const bool xfer_log = SgxdFlag("xferlog");
+    if (xfer_log) {
+        LOG_INFO(Render, "xferlog: texture copy {:#x} to {:#x}, {} bytes, input {}+{}, output {}+{}",
+                 src, dst, tc.size, in_width, in_gap, out_width, out_gap);
+    }
+#endif
+    // An address in no guest memory drops the copy.
+    if (!memory.IsValidPhysicalAddress(src) || !memory.IsValidPhysicalAddress(dst)) {
+        LOG_ERROR(Render,
+                  "sgxd: AccelerateTextureCopy from {:#x} to {:#x}, {} bytes: dropped, not "
+                  "guest memory",
+                  src, dst, tc.size);
+        return true;
+    }
     if (in_gap == 0 && out_gap == 0) {
         return AccelerateDma(src, dst, tc.size);
+    }
+    // A side with no gap is one stream whatever its width.
+    if (in_gap == 0) {
+        in_width = out_width;
+    } else if (out_gap == 0) {
+        out_width = in_width;
     }
     DEBUG_ASSERT_MSG(in_width == out_width && in_width != 0 && tc.size % in_width == 0,
                      "sgxd: AccelerateTextureCopy from {:#x} to {:#x}, {} bytes, input width {} "
@@ -555,6 +993,11 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     FlushImmediate();
     const PAddr start = config.GetStartAddress();
     const PAddr end = config.GetEndAddress();
+    // An address in no guest memory drops the fill.
+    if (!memory.IsValidPhysicalAddress(start)) {
+        LOG_ERROR(Render, "sgxd: AccelerateFill {:#x}-{:#x}: dropped, not guest memory", start, end);
+        return true;
+    }
     // The fill's pixel: 32, 24 or 16 bits, its value as the bytes the PICA writes, low first.
     const u32 bytes = config.fill_32bit ? 4 : (config.fill_24bit ? 3 : 2);
     const u32 value = config.fill_32bit  ? config.value_32bit
@@ -580,13 +1023,14 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     // A fill over the open pass's buffers comes after its draws: the pass renders first.
     if (backend.InPass()) {
         const Surface& s = surfaces[pass_surface];
-        const PAddr colour_end = s.addr + s.width * s.height * 4;
+        const PAddr colour_end = s.End();
         const PAddr depth_end = pass_depth + s.width * s.height * pass_depth_bytes;
         if ((start < colour_end && s.addr < end) ||
-            (pass_depth_cleared && start < depth_end && pass_depth < end)) {
+            ((pass_depth_cleared || pass_depth_used) && start < depth_end && pass_depth < end)) {
             EndPass("a fill over its buffers");
         }
     }
+    DepthStoresWritten(start, end);
 
     // The range as rows of 4096 pixels (under the PTLA's 64 KiB stride) and a last partial row, filled
     // in place at its PICA address, which is its GPU address.
@@ -669,8 +1113,11 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     };
     const bool src_fcram = inside(src, size, Memory::FCRAM_PADDR, Memory::FCRAM_SIZE);
     const bool dst_fcram = inside(dst, dst_size, Memory::FCRAM_PADDR, Memory::FCRAM_SIZE);
-    DEBUG_ASSERT_MSG(src % 4 == 0 && dst % 4 == 0 && size % 4 == 0 && size > 0,
-                     "GXM: AccelerateDma {}: only whole words are copied on the GPU", describe());
+    ASSERT_MSG(src % 4 == 0 && dst % 4 == 0 && size > 0 &&
+                   (!strided || (line % 4 == 0 && src_stride % 4 == 0 && dst_stride % 4 == 0 &&
+                                 line / 4 <= 4096)),
+               "sgxd: AccelerateDma {}: only word-aligned copies are built", describe());
+    const u32 tail = size % 4;
     // A range past guest FCRAM or VRAM reaches whatever the GPU has mapped after it.
     ASSERT_MSG((src_fcram || inside(src, size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)) &&
                    (dst_fcram || inside(dst, dst_size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)),
@@ -680,10 +1127,10 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     const PAddr end = dst + dst_size;
     if (backend.InPass()) {
         const Surface& s = surfaces[pass_surface];
-        const PAddr colour_end = s.addr + s.width * s.height * 4;
+        const PAddr colour_end = s.End();
         const PAddr depth_end = pass_depth + s.width * s.height * pass_depth_bytes;
         if ((dst < colour_end && s.addr < end) ||
-            (pass_depth_cleared && dst < depth_end && pass_depth < end)) {
+            ((pass_depth_cleared || pass_depth_used) && dst < depth_end && pass_depth < end)) {
             EndPass("a DMA over its buffers");
         }
     }
@@ -705,6 +1152,7 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     backend.RenderBefore(dst, end, "a DMA's destination");
     ForgetClears(dst, end);
     TexturesWritten(dst, end);
+    SurfacesWritten(dst, end);
 
     // Guest FCRAM is cached for the CPU (but the pages moved to CDRAM): the source is cleaned before
     // the PTLA reads it, the destination's lines leave the cache before and after.
@@ -733,7 +1181,8 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
                                pixels / RowPixels, pixels % RowPixels, 0};
     char failed[160];
     u32 elapsed_us = 0;
-    [[maybe_unused]] const int copied = sgxd_ptla_copy(&copy, &elapsed_us, failed, sizeof(failed));
+    [[maybe_unused]] const int copied =
+        pixels == 0 ? 0 : sgxd_ptla_copy(&copy, &elapsed_us, failed, sizeof(failed));
 #ifdef VITA_DIAGNOSTICS
     if (copied != 0) {
         // A stopped list before the PTLA op: its post-mortem and the GPU dump.
@@ -742,12 +1191,18 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     }
 #endif
     DEBUG_ASSERT_MSG(copied == 0, "sgxd: AccelerateDma {}: {}", describe(), failed);
-    if (dst_cached) {
-        // The CPU's lines over the destination go after the copy: an asynchronous one
-        // completes here first.
-        [[maybe_unused]] const int idle = sgxd_gpu_idle();
-        DEBUG_ASSERT_MSG(idle == 0, "GXM: AccelerateDma {}: the PTLA never completed", describe());
-        SgxdCacheRange(dst_cpu, dst_size, SGXD_CACHE_CLEAN_INVALIDATE, CacheSite::DmaDest);
+    // The copy is queued. The destination's cache lines go once it has completed, and the PTLA's
+    // uncopied last bytes then too: before the guest's interrupt, or the rasterizer's next read.
+    if (dst_cached || tail != 0) {
+        const u8* const src_cpu = memory.GetPhysicalPointer(src);
+        backend.AfterGpu([dst_cpu, dst_size, dst_cached, src_cpu, size, tail] {
+            if (dst_cached) {
+                SgxdCacheRange(dst_cpu, dst_size, SGXD_CACHE_CLEAN_INVALIDATE, CacheSite::DmaDest);
+            }
+            if (tail != 0) {
+                std::memcpy(dst_cpu + size - tail, src_cpu + size - tail, tail);
+            }
+        });
     }
     if (dmas++ < 4) {
         LOG_INFO(Render, "DMA {}: {} ({} to {}) in {} us", dmas, describe(),
@@ -794,71 +1249,287 @@ bool RasterizerSgxd::TakeClear(PAddr start, PAddr end, ClearedRange& out) {
     return false;
 }
 
-RasterizerGxm::Surface& RasterizerGxm::SurfaceFor(PAddr addr, u32 width, u32 height) {
+RasterizerGxm::Surface& RasterizerGxm::SurfaceFor(PAddr addr, u32 width, u32 height,
+                                                  FramebufferRegs::ColorFormat format) {
+    // A buffer the guest reshaped gets a surface of each shape: they overlap as any two
+    // surfaces do, the later pass's bytes winning (generation). a game reshapes its bloom
+    // buffer every frame, and a cleared pass then needs nothing of the other shape's.
     for (Surface& s : surfaces) {
-        if (s.addr == addr) {
-            DEBUG_ASSERT_MSG(
-                s.width == width && s.height == height,
-                "GXM: the colour buffer at {:#x} was {}x{} and is now {}x{}: a surface "
-                "that changes size is not built",
-                addr, s.width, s.height, width, height);
+        if (s.addr == addr && s.width == width && s.height == height && s.format == format) {
             return s;
         }
     }
-    surfaces.push_back({addr, width, height, backend.AllocSurface(width, height), 0});
-    LOG_INFO(Render, "surface {:#x}: {}x{} RGBA8 at GPU {:#010x}", addr, width, height,
-             surfaces.back().memory.gpu);
+    DEBUG_ASSERT(!backend.InPass());
+    for (const Surface& d : dead) {
+        backend.FreeSurface(d.memory, d.width, d.height);
+    }
+    dead.clear();
+    Surface s{addr, width, height, backend.AllocSurface(width, height), 0};
+    s.format = format;
+    s.bpp = FramebufferRegs::BytesPerColorPixel(format);
+    surfaces.push_back(s);
+    LOG_INFO(Render, "surface {:#x}: {}x{} format {} at GPU {:#010x}", addr, width, height,
+             static_cast<u32>(format), surfaces.back().memory.gpu);
     return surfaces.back();
 }
 
 namespace {
 
-/// How the untile reads a PICA texture format: the texture unit's format code and swizzle
-/// that give its channels as the PICA does (docs/sgxd/tsp.md), its bits a
-/// texel, and for the 4-bit formats and IA4 the palette that expands the index (P4, P8).
-/// Code 0xff: not built.
-struct UntileFormat {
-    u32 code;
-    u32 swizzle;
-    u32 bits;
-    TexturePalette palette = TexturePalette::None;
+/// A colour format as the PBE stores it: the pack, whether the lanes go mirrored, bytes a pixel.
+struct GuestPack {
+    u32 pack;
+    bool mirror;
 };
 
-UntileFormat UntileFormatFor(Pica::TexturingRegs::TextureFormat format) {
-    using F = Pica::TexturingRegs::TextureFormat;
+GuestPack GuestPackFor(FramebufferRegs::ColorFormat format, PAddr addr) {
+    using CF = FramebufferRegs::ColorFormat;
     switch (format) {
-    case F::RGBA8: // bytes A, B, G, R: U8U8U8U8 mirrored (RGBA)
-        return {0x0c, 2, 32};
-    case F::RGB8: // bytes B, G, R: U8U8U8 with red and blue swapped
-        return {0x98, 1, 24};
-    case F::RGB5A1: // R 15:11, G 10:6, B 5:1, A 0: U1U5U5U5 mirrored
-        return {0x04, 2, 16};
-    case F::RGB565: // R 15:11, G 10:5, B 4:0: U5U6U5 with red and blue swapped
-        return {0x05, 1, 16};
-    case F::RGBA4: // R 15:12 .. A 3:0: U4U4U4U4 mirrored
-        return {0x02, 2, 16};
-    case F::IA8: // byte 0 alpha, byte 1 intensity: U8U8 as RGGG
-        return {0x07, 3, 16};
-    case F::I8: // U8 as 1RRR
-        return {0x00, 5, 8};
-    case F::A8: // U8 as R000
-        return {0x00, 6, 8};
-    // The 4-bit formats: a nibble a texel, the low one first (upstream's texture_decode.cpp);
-    // IA4 a byte, intensity in the high nibble.
-    case F::IA4:
-        return {0x95, 0, 8, TexturePalette::IA4};
-    case F::I4:
-        return {0x94, 0, 4, TexturePalette::I4};
-    case F::A4:
-        return {0x94, 0, 4, TexturePalette::A4};
-    case F::ETC1: // the texture unit's ETC1 once its blocks are reordered (Untile)
-        return {SgxdBackend::UntileEtc1, 0, 4};
-    case F::ETC1A4: // its colour as ETC1's, the alpha joined by a merge render (Untile)
-        return {SgxdBackend::UntileEtc1A4, 0, 8};
+    case CF::RGBA8:
+        return {SGXD_RECIPE_PACK_U8888_RGBA, false};
+    case CF::RGB565:
+        return {SGXD_RECIPE_PACK_R5G6B5, false};
+    case CF::RGB5A1:
+        return {SGXD_RECIPE_PACK_A1R5G5B5_RGBA, false};
+    case CF::RGBA4:
+        return {SGXD_RECIPE_PACK_A4R4G4B4, true};
     default:
-        return {0xff, 0, 0};
+        UNREACHABLE_MSG("GXM: the colour buffer at {:#x} (format {}) written back to guest "
+                        "memory: that format is not built",
+                        addr, static_cast<u32>(format));
     }
 }
+
+bool InFcram(PAddr addr) {
+    return addr >= Memory::FCRAM_PADDR && addr < Memory::FCRAM_PADDR_END;
+}
+
+} // namespace
+
+const RasterizerSgxd::NarrowScratch& RasterizerSgxd::NarrowScratchFor(const ColourBuffer& c) {
+    for (const NarrowScratch& n : narrow_scratch) {
+        if (n.addr == c.addr && n.width == c.width && n.height == c.height && n.bpp == c.bpp) {
+            return n;
+        }
+    }
+    // 32-bit samples hold the widest format, and 32 rows at least the whole tile a store may write.
+    const u32 wide = NarrowWidth(c);
+    return narrow_scratch.emplace_back(NarrowScratch{
+        c.addr, c.width, c.height, c.bpp, wide,
+        backend.AllocSurface(wide, std::max(c.height, 32u))});
+}
+
+void RasterizerSgxd::CopyLines(u32 src, u32 dst, u32 line_bytes, u32 lines, u32 src_stride,
+                              u32 dst_stride, [[maybe_unused]] const char* what) {
+    DEBUG_ASSERT(line_bytes % 4 == 0 && src_stride % 4 == 0 && dst_stride % 4 == 0);
+    const SgxdPtlaCopy copy{src,   dst, SGXD_PTLA_8888, src_stride, line_bytes / 4,
+                            lines, 0,   dst_stride};
+    char failed[160];
+    u32 elapsed_us = 0;
+    [[maybe_unused]] const int copied = sgxd_ptla_copy(&copy, &elapsed_us, failed, sizeof(failed));
+    DEBUG_ASSERT_MSG(copied == 0, "sgxd: {}: {}", what, failed);
+}
+
+std::vector<u64> RasterizerGxm::TileHashes(const Surface& s) {
+    const u32 tile_bytes = 64 * s.bpp;
+    const u8* const guest = memory.GetPhysicalPointer(s.addr);
+    std::vector<u64> hashes(s.width * s.height / 64);
+    for (std::size_t t = 0; t < hashes.size(); t++) {
+        hashes[t] = Common::ComputeHash64(guest + t * tile_bytes, tile_bytes);
+    }
+    return hashes;
+}
+
+void RasterizerGxm::SyncToGuest(Surface& s) {
+    if (s.synced_passes == s.passes) {
+        return;
+    }
+    DEBUG_ASSERT_MSG(!backend.InPass() || &s != &surfaces[pass_surface] ||
+                         backend.PassDraws() == 0,
+                     "GXM: the colour buffer at {:#x} written back while its own pass draws",
+                     s.addr);
+    const GuestPack g = GuestPackFor(s.format, s.addr);
+    const u32 tile_bytes = 64 * s.bpp;
+    const u32 tiles = s.width * s.height / 64;
+    u32 cpu_tiles = 0;
+    if (!InFcram(s.addr)) {
+        // Guest VRAM, uncached for the CPU: the PBE writes it where it is. The CPU does not
+        // write VRAM (DMAs and transfers mark the surface guest_newer).
+        backend.TileBack(s.memory, s.width, s.height, {memory.GetPhysicalPointer(s.addr), s.addr},
+                         g.pack, g.mirror, s.bpp);
+    } else {
+        // FCRAM, cached: the tiles go through the pass's data, and the CPU copies those it did
+        // not write since the pass began.
+        const std::vector<u64> now = TileHashes(s);
+        const SgxdBackend::Data scratch = backend.Scratch(tiles * tile_bytes);
+        backend.TileBack(s.memory, s.width, s.height, scratch, g.pack, g.mirror, s.bpp);
+        // The CPU merges the tiles: it reads what the GPU wrote.
+        backend.RenderIdle("a write-back to FCRAM");
+        u8* const guest = memory.GetPhysicalPointer(s.addr);
+        for (u32 t = 0; t < tiles; t++) {
+            if (!s.tile_hashes.empty() && now[t] != s.tile_hashes[t]) {
+                cpu_tiles++;
+                continue;
+            }
+            std::memcpy(guest + t * tile_bytes, scratch.cpu + t * tile_bytes, tile_bytes);
+        }
+        s.tile_hashes = TileHashes(s);
+        s.guest_newer = s.guest_newer || cpu_tiles != 0;
+    }
+    s.synced_passes = s.passes;
+    TexturesWritten(s.addr, s.End());
+    synced_tiles += tiles;
+    sync_why[fmt::format("{:#x} {}x{} f{} {}", s.addr, s.width, s.height,
+                         static_cast<u32>(s.format), sync_reason)]++;
+    if (syncs % 200 == 199) {
+        std::string why;
+        for (const auto& [k, n] : sync_why) {
+            why += fmt::format("; {} x{}", k, n);
+        }
+        sync_why.clear();
+        LOG_INFO(Render, "{} write-backs to guest memory so far, {} tiles{}", syncs + 1,
+                 synced_tiles, why);
+    }
+    if (syncs++ < 8) {
+        LOG_INFO(Render, "the colour buffer at {:#x} ({}x{} format {}) written back to guest "
+                         "memory; {} of {} tiles the CPU's",
+                 s.addr, s.width, s.height, static_cast<u32>(s.format), cpu_tiles, tiles);
+    }
+#ifdef VITA_DIAGNOSTICS
+    // tilecheck: the write-back against the CPU's own encoding of the surface.
+    if (GxmFlag("tilecheck") && cpu_tiles == 0) {
+        backend.RenderIdle("tilecheck");
+        using CF = FramebufferRegs::ColorFormat;
+        const u8* const guest = memory.GetPhysicalPointer(s.addr);
+        const u32* const picture = reinterpret_cast<const u32*>(s.memory.cpu);
+        u32 wrong = 0;
+        for (u32 y = 0; y < s.height; y++) {
+            for (u32 x = 0; x < s.width; x++) {
+                const u32 c = picture[y * s.width + x];
+                const u32 r = c & 0xff, gr = c >> 8 & 0xff, b = c >> 16 & 0xff, a = c >> 24;
+                u32 want = 0;
+                switch (s.format) {
+                case CF::RGBA8:
+                    want = r << 24 | gr << 16 | b << 8 | a;
+                    break;
+                case CF::RGB565:
+                    want = (r >> 3) << 11 | (gr >> 2) << 5 | b >> 3;
+                    break;
+                default:
+                    want = (r >> 4) << 12 | (gr >> 4) << 8 | (b >> 4) << 4 | a >> 4;
+                    break;
+                }
+                const u32 i = (x & 1) | (y & 1) << 1 | (x & 2) << 1 | (y & 2) << 2 |
+                              (x & 4) << 2 | (y & 4) << 3;
+                const u32 at = ((y / 8) * (s.width / 8) + x / 8) * 64 + i;
+                u32 got = 0;
+                std::memcpy(&got, guest + at * s.bpp, s.bpp);
+                if (got != want && wrong++ < 4) {
+                    LOG_INFO(Render, "tilecheck {:#x}: pixel ({}, {}) {:#x}, want {:#x}", s.addr,
+                             x, y, got, want);
+                }
+            }
+        }
+        LOG_INFO(Render, "tilecheck {:#x}: {} of {} pixels differ", s.addr, wrong,
+                 s.width * s.height);
+    }
+#endif
+}
+
+bool RasterizerGxm::Superseded(const Surface& s) const {
+    const auto later = [&s](const Surface& o) {
+        return &o != &s && o.passes > 0 && o.generation > s.generation && o.addr < s.End() &&
+               s.addr < o.End();
+    };
+    return std::any_of(surfaces.begin(), surfaces.end(), later);
+}
+
+void RasterizerGxm::SyncRange(PAddr start, PAddr end) {
+    const auto overlap = [](const Surface& a, const Surface& b) {
+        return a.addr < b.End() && b.addr < a.End();
+    };
+    std::vector<Surface*> set;
+    for (Surface& s : surfaces) {
+        if (s.passes > 0 && !s.guest_newer && s.addr < end && start < s.End()) {
+            set.push_back(&s);
+        }
+    }
+    std::sort(set.begin(), set.end(),
+              [](const Surface* a, const Surface* b) { return a->generation < b->generation; });
+    std::vector<const Surface*> written;
+    for (Surface* s : set) {
+        // An earlier surface's write-back went over bytes this one drew later.
+        if (std::any_of(written.begin(), written.end(),
+                        [&](const Surface* w) { return overlap(*w, *s); })) {
+            s->synced_passes = ~0u;
+        }
+        if (s->synced_passes != s->passes) {
+            SyncToGuest(*s);
+            written.push_back(s);
+        }
+    }
+    for (Surface* s : set) {
+        if (std::any_of(set.begin(), set.end(), [&](const Surface* o) {
+                return o->generation > s->generation && overlap(*o, *s);
+            })) {
+            s->guest_newer = true;
+        }
+    }
+}
+
+bool RasterizerGxm::CpuWroteInto(Surface& s) {
+    if (s.guest_newer || !InFcram(s.addr) || s.tile_hashes.empty()) {
+        return s.guest_newer;
+    }
+    if (TileHashes(s) == s.tile_hashes) {
+        return false;
+    }
+    sync_reason = "cpu wrote";
+    SyncToGuest(s);
+    s.guest_newer = true;
+    return true;
+}
+
+namespace {
+
+/// A fill's value as the A8B8G8R8 word of the colour it leaves in a buffer of `format` (5 and 6
+/// bits widened by repeating their top bits). A wider fill clears only when it repeats per pixel.
+u32 ClearColour(FramebufferRegs::ColorFormat format, u32 value, u32 fill_bytes) {
+    using F = FramebufferRegs::ColorFormat;
+    const u32 bpp = FramebufferRegs::BytesPerColorPixel(format);
+    DEBUG_ASSERT_MSG(fill_bytes == bpp || (fill_bytes == 4 && bpp == 2 &&
+                                            (value & 0xffff) == value >> 16),
+                     "sgxd: a {}-byte fill of {:#x} over a colour buffer of format {}", fill_bytes,
+                     value, static_cast<u32>(format));
+    const auto x5 = [](u32 c) { return c << 3 | c >> 2; };
+    const auto x6 = [](u32 c) { return c << 2 | c >> 4; };
+    u32 r = 0, g = 0, b = 0, a = 255;
+    switch (format) {
+    case F::RGBA8: // the word 0xRRGGBBAA
+        r = value >> 24, g = value >> 16 & 0xff, b = value >> 8 & 0xff, a = value & 0xff;
+        break;
+    case F::RGB8: // bytes B, G, R from the low one
+        b = value & 0xff, g = value >> 8 & 0xff, r = value >> 16 & 0xff;
+        break;
+    case F::RGB5A1:
+        r = x5(value >> 11 & 31), g = x5(value >> 6 & 31), b = x5(value >> 1 & 31);
+        a = (value & 1) * 255;
+        break;
+    case F::RGB565:
+        r = x5(value >> 11 & 31), g = x6(value >> 5 & 63), b = x5(value & 31);
+        break;
+    case F::RGBA4:
+        r = (value >> 12 & 15) * 17, g = (value >> 8 & 15) * 17, b = (value >> 4 & 15) * 17;
+        a = (value & 15) * 17;
+        break;
+    default:
+        UNREACHABLE_MSG("sgxd: colour format {}", static_cast<u32>(format));
+    }
+    return a << 24 | b << 16 | g << 8 | r;
+}
+
+} // namespace
+
+namespace {
 
 /// A PICA wrap mode as DOUTT0's address mode (0 REPEAT, 1 MIRROR, 2 CLAMP). The border modes clamp
 /// and the fragment program puts the border colour past [0, 1].
@@ -881,6 +1552,61 @@ u32 AddressMode(Pica::TexturingRegs::TextureConfig::WrapMode mode) {
 
 } // namespace
 
+#ifdef VITA_DIAGNOSTICS
+RasterizerSgxd::StreamOutNote RasterizerSgxd::stream_note;
+RasterizerSgxd* RasterizerSgxd::stream_self;
+
+void RasterizerSgxd::NoteStreamOut(const char* stage, u32 mode, u32 invocations, u32 rows, u32 cap,
+                                  u32 count, const VertexProgram& program) {
+    stream_self = this;
+    SgxdBackend::stream_hook = PrintStreamOut;
+    stream_note = {stage,       passes, backend.PassDraws() + 1, mode,
+                   invocations, rows,   cap,                     count,
+                   program.primary_doutu0, program.gxp.temp_count};
+}
+
+#endif
+
+void RasterizerSgxd::KeepGsRows(u32 begin, u32 end) {
+    for (u32 r = 0; r < 16; r++) {
+        const u32 row = gs_last_rows[r] + 4;
+        if ((gs_regs_loaded >> r & 1) == 0 || (gs_rows_kept >> r & 1) != 0 || row < begin ||
+            row >= end) {
+            continue;
+        }
+        // Allocated with the first row (OpenPass is no place for an eviction).
+        DEBUG_ASSERT(gs_kept_rows.cpu != nullptr);
+        std::memcpy(gs_kept_rows.cpu + r * 16, backend.SharedAt(row), 16);
+        gs_last_rows[r] = gs_kept_rows.gpu + r * 16 - 4;
+        gs_rows_kept |= static_cast<u16>(1u << r);
+    }
+}
+
+bool RasterizerSgxd::EvictTexture() {
+    // Full pool (SgxdBackend::AllocTexture): the textures no draw has taken for longest go
+    // first, never one the open pass reads (last_used == passes); a pending render's are freed
+    // after it completes (FreeTexture). Retail games stream more textures than the pool holds
+    // (a game: 16 MiB at 69 s), and the untiles' temporaries come from it too.
+    const auto victim =
+        std::min_element(textures.begin(), textures.end(), [](const Texture& a, const Texture& b) {
+            return a.last_used < b.last_used;
+        });
+    if (victim == textures.end() || victim->last_used >= passes) {
+        u32 kib = 0;
+        for (const Texture& t : textures) {
+            kib += (t.bytes + t.alpha_bytes) >> 10;
+        }
+        LOG_CRITICAL(Render,
+                     "sgxd: texture eviction: {} textures left ({} KiB), the open pass reads them",
+                     textures.size(), kib);
+        return false;
+    }
+    backend.FreeTexture(victim->memory, victim->bytes);
+    textures.erase(victim);
+    evictions++;
+    return true;
+}
+
 const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
     const auto t = regs.texturing.GetTextures()[unit];
@@ -896,8 +1622,8 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     while (levels <= c.lod.max_level && width >> levels >= 8 && height >> levels >= 8) {
         levels++;
     }
-    DEBUG_ASSERT_MSG(!cube || (levels == 1 && width == height),
-                     "GXM: a {}x{} cube texture of {} levels is not built", width, height, levels);
+    DEBUG_ASSERT_MSG(!cube || width == height, "sgxd: a {}x{} cube texture is not built", width,
+                     height);
     // The guest's parts: a 2D texture's levels, which follow each other, or a cube's six
     // faces, each at its own address. The host cube's slots are the SGX's +X, -X, +Y, -Y, +Z,
     // -Z with the PICA's +Y and -Y swapped: the fragment program reads at (u, -v, w), which
@@ -916,13 +1642,52 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     for (u32 l = 0; l < levels; l++) {
         bytes += (width >> l) * (height >> l) * f.bits / 8;
     }
-    for (const Surface& s : surfaces) {
+    // A texture that is a colour buffer a pass drew reads the surface: the same rows in the
+    // same order as an untiled texture's (row 0 the buffer's first tile row), rows its width
+    // apart. It may start at a tile row inside the buffer. Its first level only. Any other
+    // texture over a drawn buffer reads guest memory, where the PICA would have rendered:
+    // the passes are written back there first (SyncToGuest), unless the CPU has written the
+    // buffer since (CpuWroteInto), which leaves guest memory the picture.
+    bool sync = false;
+    for (Surface& s : surfaces) {
+        if (s.passes == 0 || s.guest_newer) {
+            continue;
+        }
+        bool overlaps = false;
         for (u32 k = 0; k < parts; k++) {
-            DEBUG_ASSERT_MSG(part_addr[k] >= s.addr + s.width * s.height * 4 ||
-                                 s.addr >= part_addr[k] + bytes,
-                             "GXM: texture unit {} at {:#x} reads the colour buffer at {:#x}: "
-                             "rendering to a texture is not built",
-                             unit, part_addr[k], s.addr);
+            overlaps = overlaps || (part_addr[k] < s.End() && s.addr < part_addr[k] + bytes);
+        }
+        if (!overlaps || CpuWroteInto(s)) {
+            continue;
+        }
+        const u32 offset = addr - s.addr;
+        const u32 first_row = offset / (s.width * s.bpp);
+        const bool same = !cube && addr >= s.addr && addr < s.End() && width == s.width &&
+                          offset % (s.width * 8 * s.bpp) == 0 && first_row + height <= s.height &&
+                          static_cast<u32>(t.format) == static_cast<u32>(s.format);
+        if (!same || Superseded(s)) {
+            sync = true;
+            continue;
+        }
+        DEBUG_ASSERT_MSG(!backend.InPass() || &s != &surfaces[pass_surface],
+                         "GXM: texture unit {} reads the colour buffer at {:#x} its own pass draws",
+                         unit, s.addr);
+        using CF = FramebufferRegs::ColorFormat;
+        const u32 skip = first_row * s.width * 4;
+        Texture& rt = surface_textures[unit];
+        rt = Texture{addr, width, height, t.format, {s.memory.cpu + skip, s.memory.gpu + skip},
+                     0, 1, 1, {addr}, bytes, 0, passes, false};
+        rt.alpha_one = s.format == CF::RGB565 || s.format == CF::RGB8;
+        if (surface_reads++ < 4) {
+            LOG_INFO(Render, "texture unit {} at {:#x}: reads the {}x{} surface at {:#x}", unit,
+                     addr, s.width, s.height, s.addr);
+        }
+        return rt;
+    }
+    if (sync) {
+        for (u32 k = 0; k < parts; k++) {
+            sync_reason = "texture";
+            SyncRange(part_addr[k], part_addr[k] + bytes);
         }
     }
     auto it = std::find_if(textures.begin(), textures.end(),
@@ -940,6 +1705,7 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     // Guest VRAM changes only through the GPU operations that mark its textures dirty.
     const bool fcram = addr >= Memory::FCRAM_PADDR;
     if (it != textures.end()) {
+        it->last_used = passes;
         if (!it->dirty && (!fcram || it->untiled_pass == passes)) {
             return *it;
         }
@@ -949,7 +1715,9 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
         // cube face max(w, 32)^2 texels.
         u32 host_bytes = 0;
         if (cube) {
-            host_bytes = 5 * width * width * 4 + std::max(width, 32u) * std::max(width, 32u) * 4;
+            host_bytes = levels == 1 ? 5 * width * width * 4 +
+                                           std::max(width, 32u) * std::max(width, 32u) * 4
+                                     : 6 * CubeFaceStride(width) + 32 * 32 * 4;
         }
         for (u32 l = 0, offset = 0; !cube && l < levels; l++) {
             const u32 w = width >> l, h = height >> l;
@@ -960,9 +1728,11 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
         textures.push_back({addr, width, height, t.format, backend.AllocTexture(host_bytes),
                             host_bytes, levels, parts, part_addr, bytes, passes, false});
         it = std::prev(textures.end());
+        it->last_used = passes;
     }
     it->untiled_pass = passes;
     it->dirty = false;
+    it->alpha_one = t.format == Pica::TexturingRegs::TextureFormat::RG8;
     it->byte_swizzle = 0;
     // Each FCRAM part moves to CDRAM here, under the draw's read hold. A texture past VRAM's end reads
     // on into the filler past it (GuestGpuMemory::PastVramBytes); the tiny decode on the CPU has none.
@@ -993,11 +1763,17 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     }
     const u32 palette = PaletteFor(f.palette);
     if (cube) {
-        // Each face a SWIZZLED square, back to back in slot order; a face's whole tiles run
-        // over the ones after it, written next.
+        // Each face a SWIZZLED square (or its chain, level after level), in slots CubeFaceStride apart; a
+        // face's whole tiles run over the ones after it, written next.
+        const u32 stride = levels == 1 ? width * height * 4 : CubeFaceStride(width);
         for (u32 k = 0; k < 6; k++) {
-            backend.Untile({part_addr[k], width, height, f.bits, f.code, f.swizzle, palette},
-                           it->memory.gpu + k * width * height * 4, width, true);
+            for (u32 l = 0, guest = 0, host = 0; l < levels; l++) {
+                const u32 w = width >> l;
+                backend.Untile({part_addr[k] + guest, w, w, f.bits, f.code, f.swizzle, palette},
+                               it->memory.gpu + k * stride + host, w, true);
+                guest += w * w * f.bits / 8;
+                host += w * w * 4;
+            }
         }
     }
     // Largest first: a level's whole tiles run over the ones after it, written next.
@@ -1150,7 +1926,7 @@ u32 RasterizerSgxd::PaletteFor(TexturePalette palette) {
     }
     if (!palettes.cpu) {
         // U8888 words at 64-byte multiples: A4 (16), I4 (16), IA4 (256).
-        palettes = backend.AllocTexture(0x1000);
+        palettes = backend.AllocTextureFixed(0x1000);
         u32* const p = reinterpret_cast<u32*>(palettes.cpu);
         for (u32 i = 0; i < 16; i++) {
             p[i] = i * 17 << 24;
@@ -1199,8 +1975,15 @@ void RasterizerGxm::TextureWords(u32 unit, u32 words[4]) {
     const auto t = regs.texturing.GetTextures()[unit];
     // A unit that is off still reaches the TEV: it reads zeros, point sampled and clamped.
     const TextureConfig off{};
-    const Texture& tex = t.enabled ? TextureFor(unit) : NullTexture(unit);
-    const TextureConfig& c = t.enabled ? t.config : off;
+    // A texture at address 0 reads as transparent black.
+    const bool real = t.enabled && t.config.GetPhysicalAddress() != 0;
+    const Texture& tex = real ? TextureFor(unit) : NullTexture(unit);
+#ifdef VITA_DIAGNOSTICS
+    if (tex_dumping && real) {
+        DumpFrameTexture(unit, tex);
+    }
+#endif
+    const TextureConfig& c = real ? t.config : off;
     const u32 mag = c.mag_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
     const u32 min = c.min_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
     const u32 mipf = c.mip_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
@@ -1209,8 +1992,10 @@ void RasterizerGxm::TextureWords(u32 unit, u32 words[4]) {
     // DADJUST its bias in eighths, zero at 31.
     const u32 clamp = tex.levels > 1 ? tex.levels - 1 : 15;
     const u32 lod_min = std::min<u32>(c.lod.min_level, tex.levels - 1);
+    // A bias under DADJUST's -3.875 takes -3.875: the LOD differs only where it is above 3.875 before
+    // the bias.
     const s32 dadjust = 31 + ((static_cast<s32>(c.lod.bias) + 16) >> 5);
-    DEBUG_ASSERT_MSG(dadjust >= 0 && dadjust <= 63,
+    DEBUG_ASSERT_MSG(dadjust <= 63,
                      "sgxd: texture unit {}: LOD bias {} is past DADJUST's range", unit,
                      static_cast<s32>(c.lod.bias) / 256.0f);
     // U8U8U8U8, ABGR (R the lowest byte), LINEAR or a CUBE of SWIZZLED faces (log2 sizes);
@@ -1222,7 +2007,9 @@ void RasterizerGxm::TextureWords(u32 unit, u32 words[4]) {
                                     static_cast<u32>(std::countr_zero(tex.height))
                               : 3u << 29 | 0x0cu << 24 | (tex.width - 1) << 12 | (tex.height - 1);
     words[2] = tex.memory.gpu | lod_min >> 2;
-    words[3] = 1u << 31 | (lod_min & 3u) << 26;
+    // Swizzle 4 on U8U8U8U8: alpha one (bit 2).
+    const u32 swizzle = tex.byte_swizzle != 0 ? tex.byte_swizzle : tex.alpha_one ? 4u : 0u;
+    words[3] = 1u << 31 | swizzle << 28 | (lod_min & 3u) << 26;
 }
 
 void RasterizerSgxd::CachedRead(PAddr addr, u32 size) {
@@ -1255,6 +2042,51 @@ void RasterizerSgxd::TexturesWritten(PAddr start, PAddr end) {
     }
 }
 
+void RasterizerGxm::SurfacesWritten(PAddr start, PAddr end) {
+    DepthStoresWritten(start, end);
+    for (Surface& s : surfaces) {
+        if (start < s.End() && s.addr < end) {
+            s.guest_newer = true;
+        }
+    }
+}
+
+RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width, u32 height,
+                                                        u32 format) {
+    for (DepthStore& d : depth_stores) {
+        if (d.addr == addr) {
+            if (d.width == width && d.height == height && d.format == format) {
+                return d;
+            }
+            const auto& old = d.store;
+            backend.FreeSurface(old.memory, old.width, old.height * (old.stencil ? 5 : 4) / 4);
+            d = DepthStore{addr, width, height, format};
+            d.store = NewDepthStore(width, height, format);
+            return d;
+        }
+    }
+    depth_stores.push_back(DepthStore{addr, width, height, format});
+    depth_stores.back().store = NewDepthStore(width, height, format);
+    return depth_stores.back();
+}
+
+SgxdBackend::DepthStore RasterizerGxm::NewDepthStore(u32 width, u32 height, u32 format) {
+    // Whole 32x32 tiles; the stencil (D24S8's) a quarter of the depth's bytes after it.
+    const bool stencil = format == static_cast<u32>(FramebufferRegs::DepthFormat::D24S8);
+    const u32 w = Common::AlignUp(width, 32u), h = Common::AlignUp(height, 32u);
+    return {backend.AllocSurface(w, h * (stencil ? 5 : 4) / 4), w, h, stencil};
+}
+
+void RasterizerSgxd::DepthStoresWritten(PAddr start, PAddr end) {
+    for (DepthStore& d : depth_stores) {
+        const u32 bytes = FramebufferRegs::BytesPerDepthPixel(
+            static_cast<FramebufferRegs::DepthFormat>(d.format));
+        if (start < d.addr + d.width * d.height * bytes && d.addr < end) {
+            d.valid = false;
+        }
+    }
+}
+
 void RasterizerSgxd::EndPass(const char* why) {
     Surface& s = surfaces[pass_surface];
     const u32 pass_draws = backend.PassDraws();
@@ -1273,12 +2105,72 @@ void RasterizerSgxd::EndPass(const char* why) {
         }
     }
 #endif
+    // A pass that used depth keeps it for the next one on the buffer: stored, and loaded first
+    // when it was loaded, or the store filled with the clear (tiles it did not touch). A clear
+    // no draw used is the store's fill alone.
+    // A pass that neither cleared nor loaded it leaves depth known only where it drew: the
+    // store is stale.
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags eotmixnozls: the mixed end of tile's 2x passes store no depth (the eotmix probe;
+    // the next pass's depth is wrong).
+    static const bool eotmix_nozls = SgxdFlag("eotmixnozls");
+    const bool keep_depth = !(eotmix_nozls && backend.eot_mix_real >= 0 && pass_quarters == 8);
+#else
+    constexpr bool keep_depth = true;
+#endif
+    if (keep_depth && (pass_depth_cleared || pass_depth_load || pass_depth_covered)) {
+        DepthStore& d = DepthStoreFor(pass_depth, s.width, s.height, pass_depth_format);
+        if (!pass_depth_load) {
+            backend.FillDepthStore(d.store, pass_bg_depth, pass_bg_stencil);
+        }
+        if (pass_depth_used) {
+            using DL = SgxdBackend::DepthLoad;
+            backend.SetDepthStore(d.store, !pass_depth_load    ? DL::None
+                                           : pass_depth_guest ? DL::Guest
+                                                              : DL::Store);
+        }
+        d.valid = true;
+#ifdef VITA_DIAGNOSTICS
+        d.ta_w = pass_ta_w;
+#endif
+    } else if (pass_depth_used) {
+        DepthStoresWritten(pass_depth, pass_depth + s.width * s.height * pass_depth_bytes);
+    }
+#ifdef VITA_DIAGNOSTICS
+    const u32 ended_scale = pass_scale;
+#endif
     u32 ta_us = 0, d3_us = 0;
     backend.EndPass(&ta_us, &d3_us);
+    // A narrow buffer's scratch back into it, behind the pass's 3D.
+    if (pass_narrow) {
+        const NarrowScratch& n = *pass_narrow;
+        const u32 wide_strip = n.scratch_width * 8 * n.bpp;
+        backend.RenderBefore(n.surface.gpu, n.surface.gpu + wide_strip * (n.height / 8),
+                             "a narrow colour buffer's copy out");
+        CopyLines(n.surface.gpu, s.addr, n.width * 8 * n.bpp, n.height / 8, wide_strip,
+                  n.width * 8 * n.bpp, "a narrow colour buffer's copy out");
+        pass_narrow = nullptr;
+    }
     s.passes++;
+    s.generation = ++generations;
+    s.guest_newer = false;
+    // Surfaces this one covers whole are dead: its pass started from what they held.
+    const PAddr lo = s.addr, hi = s.End();
+    for (auto it = surfaces.begin(); it != surfaces.end();) {
+        if (&*it != &surfaces[pass_surface] && it->addr >= lo && it->End() <= hi) {
+            dead.push_back(std::move(*it));
+            const std::size_t at = static_cast<std::size_t>(it - surfaces.begin());
+            it = surfaces.erase(it);
+            if (at < pass_surface) {
+                pass_surface--;
+            }
+        } else {
+            ++it;
+        }
+    }
     if (passes++ < 8) {
         LOG_INFO(Render, "pass {} on {:#x}: {} draws, TA {} us, 3D {} us; ended by {}", passes,
-                 s.addr, pass_draws, ta_us, d3_us, why);
+                 lo, pass_draws, ta_us, d3_us, why);
     }
 }
 
@@ -1467,7 +2359,8 @@ void DumpPicaVertex(u64 key, const Pica::Shader::Generator::PicaVSConfig& config
 } // namespace
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
-    u16 default_regs, const std::array<u8, 16>& reg_components, u16 u8_regs, Usse::VsMode mode) {
+    u16 default_regs, const std::array<u8, 16>& reg_components, u16 u8_regs, u16 s8_regs,
+    u16 s16_regs, Usse::VsMode mode) {
     const Pica::Shader::Generator::PicaVSConfig config{regs, pica.vs_setup};
     const auto& state = config.state;
     // The bools the program branches on are baked in; which ones is found once per program.
@@ -1483,7 +2376,8 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     const u64 key = Common::HashCombine(
         config.Hash(),
         static_cast<u64>(mode) << 32 | static_cast<u64>(u8_regs) << 16 | default_regs,
-        static_cast<u64>(bools) << 16 | used->second,
+        static_cast<u64>(bools) << 16 | used->second |
+            (static_cast<u64>(s8_regs) << 32 | static_cast<u64>(s16_regs) << 48),
         Common::ComputeHash64(reg_components.data(), reg_components.size()));
     const auto make_request = [&] {
         Usse::VsRequest request{};
@@ -1504,6 +2398,8 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         request.bool_mask = used->second;
         request.reg_components = reg_components;
         request.u8_regs = u8_regs;
+        request.s8_regs = s8_regs;
+        request.s16_regs = s16_regs;
         request.mode = mode;
         return request;
     };
@@ -1559,11 +2455,9 @@ RasterizerGxm::VertexProgram RasterizerGxm::PlaceVertexProgram(Usse::GxpProgram 
     return v;
 }
 
-const RasterizerGxm::VertexProgram& RasterizerGxm::GeometryProgramFor(u32 rows, bool rows_uniform,
-                                                                      bool rows_table,
-                                                                      u32 first_uniform,
-                                                                      u32 max_triangles,
-                                                                      const Describe& describe) {
+const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
+    u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform, u16 input_rows,
+    u32 max_triangles, const Describe& describe) {
     Pica::ShaderSetup& setup = pica.gs_setup;
     setup.DoProgramCodeFixup();
     const u64 program_hash = setup.GetProgramCodeHash();
@@ -1590,7 +2484,8 @@ const RasterizerGxm::VertexProgram& RasterizerGxm::GeometryProgramFor(u32 rows, 
                             static_cast<u64>(bools) << 48 | static_cast<u64>(used->second) << 32 |
                                 static_cast<u64>(max_triangles) << 16 |
                                 (rows_table ? 0x8000u : 0u) | first_uniform << 8 |
-                                (rows_uniform ? 0x80u : 0u) | rows));
+                                (rows_uniform ? 0x80u : 0u) | rows) ^
+            static_cast<u64>(input_rows) << 40);
     if (const auto it = vertex_programs.find(key); it != vertex_programs.end()) {
         return it->second;
     }
@@ -1613,6 +2508,7 @@ const RasterizerGxm::VertexProgram& RasterizerGxm::GeometryProgramFor(u32 rows, 
     request.gs_rows_table = rows_table;
     request.gs_uniform_table = k.uniform_table;
     request.gs_first_uniform = first_uniform;
+    request.gs_input_rows = input_rows;
     request.gs_max_triangles = max_triangles;
     u32 input_regs = 0;
     std::string refusal;
@@ -1720,6 +2616,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     u32 first_uniform = 0;
     std::array<int, 64> row_attr{}; // row -> the invocation's attribute, or -1 for none
     row_attr.fill(-1);
+    u16 mapped = 0; // point mode: the input registers the draw loads
     switch (pipeline.gs_config.mode.Value()) {
     case GSMode::Point: {
         const u32 inputs = regs.gs.max_input_attribute_index + 1;
@@ -1731,6 +2628,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
             const u32 reg = regs.gs.GetRegisterForAttribute(a);
             row_attr[reg] = static_cast<int>(a);
             rows = std::max(rows, reg + 1);
+            mapped |= static_cast<u16>(1u << reg);
         }
         break;
     }
@@ -1863,6 +2761,38 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     }
 
     // --- pass A1: the geometry program, one invocation a vertex ---
+    // b15 turns true after every invocation and stays so until the game writes it again: a program
+    // that reads it while it is false runs the first invocation with it false and the rest true.
+    const bool b15 = pica.gs_setup.uniforms.b[15];
+    const VertexProgram* first_program = nullptr;
+    const VertexProgram* program = nullptr;
+    u16 input_rows = 0;
+    const auto programs = [&] {
+        pica.gs_setup.uniforms.b[15] = b15;
+        first_program = &GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform,
+                                            input_rows, cap, describe);
+        pica.gs_setup.uniforms.b[15] = true;
+        program = &GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform, input_rows,
+                                      cap, describe);
+    };
+    programs();
+    // The unit keeps its input registers between draws: one the draw does not load holds the row an
+    // earlier point-mode draw's last invocation loaded, or zero. The draw reads it where that draw's
+    // vertex program stored it: in the same pass (its A0s run before its A1s), in an earlier one's
+    // data, or in gs_kept_rows (KeepGsRows copies it out before the room is taken).
+    const u16 stale = static_cast<u16>((first_program->input_regs | program->input_regs) & ~mapped &
+                                       gs_regs_loaded);
+    DEBUG_ASSERT_MSG(stale == 0 || !rows_table,
+                     "sgxd: {}: a variable-primitive geometry program reads input registers {:#x} "
+                     "an earlier draw loaded: not built",
+                     describe(), stale);
+    if (rows_uniform && stale != 0) {
+        input_rows = stale;
+        programs();
+    } else if (!rows_uniform && stale >> rows != 0) {
+        rows = static_cast<u32>(std::bit_width(stale));
+        programs();
+    }
     // A row an earlier draw left in its own memory is gone with its pass.
     ASSERT_MSG((stale & gs_rows_own) == 0,
                "sgxd: {}: a geometry program reads input registers {:#x} an earlier draw left in "
@@ -1873,7 +2803,13 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         std::memset(gs_out.cpu, 0, invocations * cap * tri_bytes);
     }
     const SgxdBackend::Data gs_ends = backend.AllocData(invocations * 4);
-    const u32 words = rows_table ? 4 : 2 + rows;
+    const bool uniform_table = GsUniformTable(rows_uniform, rows_table);
+    ASSERT_MSG(!uniform_table || first_uniform + rows <= 128,
+               "sgxd: {}: geometry rows c{} to c{} past the float uniforms", describe(),
+               first_uniform, first_uniform + rows - 1);
+    const u32 words = rows_table ? 4
+                                 : 2 + rows + static_cast<u32>(std::popcount(input_rows)) +
+                                       (uniform_table ? 1u : 0u);
     const SgxdBackend::Data gs_table = stored_data(invocations * words * 4);
     const SgxdBackend::Data zero_row = backend.AllocData(16);
     std::memset(zero_row.cpu, 0, 16);
@@ -1895,10 +2831,15 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
             t[3] = 0;
             continue;
         }
+        for (u32 r = 0, k = 2 + rows; r < 16; r++) {
+            if ((input_rows >> r & 1) != 0) {
+                t[k++] = gs_last_rows[r];
+            }
+        }
         for (u32 r = 0; r < rows; r++) {
             const int a = row_attr[r];
             if (a < 0) {
-                t[2 + r] = zero_row.gpu - 4;
+                t[2 + r] = (stale >> r & 1) != 0 ? gs_last_rows[r] : zero_row.gpu - 4;
                 continue;
             }
             const u32 j = i * per_invocation + static_cast<u32>(a) / vs_outputs;
@@ -1906,9 +2847,24 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
             t[2 + r] = vs_out.gpu + v * vsize + (static_cast<u32>(a) % vs_outputs) * 16 - 4;
         }
     }
-    const VertexProgram& gp =
-        GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform, cap, describe);
-    {
+    // The rows the last invocation loaded: what those registers hold for the draws after.
+    if (!rows_table) {
+        if (!gs_kept_rows.cpu) {
+            gs_kept_rows = backend.AllocTextureFixed(16 * 16);
+        }
+        const u32* const last = rows_out + (invocations - 1) * words;
+        for (u32 r = 0; r < rows && !rows_uniform; r++) {
+            if (row_attr[r] >= 0) {
+                gs_last_rows[r] = last[2 + r];
+                gs_rows_kept &= static_cast<u16>(~(1u << r));
+                gs_rows_own = static_cast<u16>(gs_own_data ? gs_rows_own | 1u << r
+                                                           : gs_rows_own & ~(1u << r));
+            }
+        }
+    }
+    gs_regs_loaded |= mapped;
+    // Invocations [first, first + n) with program gp, padded to whole triangles with the last again.
+    const auto run_invocations = [&](const VertexProgram& gp, u32 first, u32 n) {
         const auto in = std::find_if(gp.gxp.attributes.begin(), gp.gxp.attributes.end(),
                                      [](const auto& a) { return a.name == "gs_in_rows"; });
         DEBUG_ASSERT(in != gp.gxp.attributes.end());
@@ -1916,12 +2872,12 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         a1.vp = &gp;
         a1.fetch[0] = {gs_table.gpu, words * 4, words, in->resource};
         a1.fetch_count = 1;
-        a1.count = Common::AlignUp(invocations, 3u);
+        a1.count = Common::AlignUp(n, 3u);
         const SgxdBackend::Data a1_indices = backend.AllocData(a1.count * 2, 4);
         u16* const list = reinterpret_cast<u16*>(a1_indices.cpu);
         DEBUG_ASSERT(invocations <= 0x10000);
         for (u32 i = 0; i < a1.count; i++) {
-            list[i] = static_cast<u16>(std::min(i, invocations - 1));
+            list[i] = static_cast<u16>(first + std::min(i, n - 1));
         }
         a1.indices = a1_indices.gpu;
         a1.setup = &pica.gs_setup;
@@ -1934,12 +2890,12 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
             std::memcpy(&pointer, vsa.cpu + gp.gxp.uniform_floats * 4, 4);
             u32* const tables = reinterpret_cast<u32*>(row_tables.cpu);
             float* const counts = reinterpret_cast<float*>(count_rows.cpu);
-            for (u32 i = 0; i < invocations; i++) {
+            for (u32 i = first; i < first + n; i++) {
                 const u32 j = prims[i];
-                const u32 n = vertex_at(j);
-                const u32 own = 1 + main_vertices * vs_outputs + (n - main_vertices);
+                const u32 v_n = vertex_at(j);
+                const u32 own = 1 + main_vertices * vs_outputs + (v_n - main_vertices);
                 u32* const t = tables + i * TableWords;
-                std::fill_n(counts + i * 4, 4, static_cast<float>(n));
+                std::fill_n(counts + i * 4, 4, static_cast<float>(v_n));
                 t[0] = count_rows.gpu + i * 16 - 4;
                 const u32 main_rows = main_vertices * vs_outputs;
                 for (u32 r = 1; r < own; r++) {
@@ -1973,13 +2929,21 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         SgxdRecipeDrawPrograms p{};
         VertexPrograms(a1, vsa, vsec_sa, p, describe);
 #ifdef VITA_DIAGNOSTICS
-        NoteStreamOut("A1", static_cast<u32>(pipeline.gs_config.mode.Value()), invocations, rows,
-                      cap, a1.count, gp);
+        NoteStreamOut("A1", static_cast<u32>(pipeline.gs_config.mode.Value()), n, rows, cap,
+                      a1.count, gp);
 #endif
         backend.StreamOut(p, a1.count, SgxdBackend::StreamStage::A1, wait);
 #ifdef VITA_DIAGNOSTICS
         stream_note.stage = nullptr;
 #endif
+    };
+    if (first_program == program) {
+        run_invocations(*program, 0, invocations);
+    } else {
+        run_invocations(*first_program, 0, 1);
+        if (invocations > 1) {
+            run_invocations(*program, 1, invocations - 1);
+        }
     }
 
     // --- pass B: the stored triangles, as the draw's vertices ---
@@ -1996,6 +2960,13 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     for (u32 i = 0; i < invocations && !padded; i++) {
         const u32 first = gs_out.gpu + i * cap * tri_bytes;
         const u32 stored = (ends[i] - first) / tri_bytes;
+#ifdef VITA_DIAGNOSTICS
+        // The programs and their state for tools/sgxd_gs_stage.py, before the assert.
+        if (!(ends[i] >= first && (ends[i] - first) % tri_bytes == 0 && stored < cap)) {
+            stream_note.stage = "B";
+            PrintStreamOut();
+        }
+#endif
         DEBUG_ASSERT_MSG(ends[i] >= first && (ends[i] - first) % tri_bytes == 0 && stored < cap,
                          "sgxd: {}: geometry invocation {} of {} ended at {:#x} (first triangle "
                          "{:#x}, {} bytes each, room for {})",
@@ -2058,9 +3029,20 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     return b;
 }
 
-const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(u64 blend) {
-    const Pica::Shader::FSConfig config{regs};
-    const u64 key = Common::HashCombine(config.Hash(), blend);
+const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(const Epilogue& epilogue) {
+    Pica::Shader::FSConfig config{regs};
+    // The SGX's samplers have no border colour: a border mode clamps (AddressMode) and the fragment
+    // program puts the border colour past the texture.
+    config.texture.ApplyProfile(Pica::Shader::Profile{});
+    // MIN and MAX blend in the epilogue's SOP2 (BlendWord): nothing for the fragment program to
+    // emulate.
+    for (auto* blend : {&config.framebuffer.requested_rgb_blend,
+                        &config.framebuffer.requested_alpha_blend}) {
+        if (blend->RequiresMinMaxEmulation()) {
+            blend->SetMinMaxEmulationDisabled();
+        }
+    }
+    const u64 key = Common::HashCombine(config.Hash(), epilogue.Key());
     if (const auto it = fragment_programs.find(key); it != fragment_programs.end()) {
         FragmentProgram& f = it->second;
         if (!f.tier2_queued && ++f.draws >= Tier2Draws) {
@@ -2079,7 +3061,7 @@ const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(u64 blen
                      refusal);
     DumpGxp("fs", key, *gxp);
     DumpPicaFragment(key, config);
-    FragmentProgram f = PlaceFragmentProgram(std::move(*gxp), blend, config.Hash());
+    FragmentProgram f = PlaceFragmentProgram(std::move(*gxp), epilogue, config.Hash());
     return fragment_programs.emplace(key, std::move(f)).first->second;
 }
 
@@ -2132,7 +3114,7 @@ void RasterizerSgxd::InstallTier2() {
         const u32 temps_before = it->second.gxp.temp_count;
         const std::size_t words_before = it->second.gxp.primary.size();
         FragmentProgram f =
-            PlaceFragmentProgram(std::move(*result.program), it->second.blend, result.key);
+            PlaceFragmentProgram(std::move(*result.program), it->second.epilogue, result.key);
         f.draws = it->second.draws;
         f.tier2_queued = true;
         LOG_INFO(Render,
@@ -2175,11 +3157,12 @@ void RasterizerSgxd::InstallVertexTier2(ShaderTier2::Result& result) {
     it->second = std::move(v);
 }
 
-RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProgram gxp, u64 blend,
-                                                                   u64 hash) {
+RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProgram gxp,
+                                                                     const Epilogue& epilogue,
+                                                                     u64 hash, u64 emit_us) {
     FragmentProgram f{};
     f.gxp = std::move(gxp);
-    f.blend = blend;
+    f.epilogue = epilogue;
 #ifdef VITA_DIAGNOSTICS
     // fsload: the primary program's words from host0:fsload.gxp instead of ours, with
     // our inputs, uniforms and samplers; its temps if more. For timing another compiler's code on
@@ -2211,12 +3194,8 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
     }
 #endif
     const Usse::GxpProgram& g = f.gxp;
-    // Not built yet: a second phase (a kill or a depth write) needs its PHAS to carry the next
-    // phase's address, which the patcher relocates; samplers need texture state words; a memory
-    // uniform buffer needs its pointer.
-    DEBUG_ASSERT_MSG(g.phase_starts.size() == 1,
-                     "GXM: a fragment program of {} phases (kill {}, depth write {}): not built",
-                     g.phase_starts.size(), g.uses_discard, g.writes_depth);
+    // A second phase (a kill or a depth write) gets its address into the first phase's PHAS
+    // where the code is placed (SgxdBackend::PlaceCodePhased), as libgxm's patcher relocates it.
     // The texture units' samplers, the lighting and fog LUT's (SyncLutLf) and the proctex
     // LUTs' are built.
     for (const Usse::GxpSampler& sampler : g.samplers) {
@@ -2233,14 +3212,17 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
                             names);
         }
     }
-    // SMP reads its four state words as two pairs.
+    // SMP reads its four state words as two pairs: with memory uniforms the resident count is odd and
+    // the buffer pointer makes it even.
     DEBUG_ASSERT(g.samplers.empty() ||
-                 Usse::SamplerSaOffset(g.uniform_floats, static_cast<u32>(g.literals.size()), 0) %
+                 Usse::SamplerSaOffset(g.uniform_floats + Usse::DataHead(g),
+                                       static_cast<u32>(g.literals.size()), 0) %
                          2 ==
                      0);
-    DEBUG_ASSERT_MSG(!g.buffer_pointer, "GXM: a fragment program with memory uniforms: not built");
     for (const Usse::GxpUniform& u : g.uniforms) {
-        DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <= g.uniform_floats);
+        // Resident, or in the memory buffer (FragmentSa) at the same float index.
+        DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <=
+                     (g.buffer_pointer ? g.buffer_floats : g.uniform_floats));
         const UniformField field = FragmentUniformField(u.name);
         f.uniforms.push_back({u.sa_offset, static_cast<u16>(field.offset),
                               static_cast<u8>(u.components), static_cast<u8>(u.array_size), 16,
@@ -2248,13 +3230,63 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
     }
 
     std::vector<u64> code = g.primary;
-    if (blend) {
-        code.push_back(PackInPlace);
-        code.push_back(blend);
-    } else {
-        code.push_back(PackToOutput);
+    // sgxd_flags fswhite=1: every fragment white, whatever the program computed (which still
+    // runs, kills included); fswhite=2: the program replaced by the white write alone (no
+    // kill): the vertex side and the rasterisation on their own.
+    // gxm_flags fsonly=N (with fswhite or fscut): those probes on the program whose key's low 32
+    // bits are N alone (drawkeys logs each draw's key).
+    static const u32 fs_only = GxmFlagValue("fsonly");
+    static const u32 fs_only_more[7] = {GxmFlagValue("fsonly2"), GxmFlagValue("fsonly3"),
+                                        GxmFlagValue("fsonly4"), GxmFlagValue("fsonly5"),
+                                        GxmFlagValue("fsonly6"), GxmFlagValue("fsonly7"),
+                                        GxmFlagValue("fsonly8")};
+    const bool probed = fs_only == 0 || static_cast<u32>(hash) == fs_only ||
+                        std::find(std::begin(fs_only_more), std::end(fs_only_more),
+                                  static_cast<u32>(hash)) != std::end(fs_only_more);
+    if (fs_only != 0) {
+        LOG_INFO(Render, "fsonly {:#010x}: program {:016x} {}", fs_only, hash,
+                 probed ? "probed" : "kept");
     }
-    const u32 doutu0 = sgxd_program_doutu0(1, backend.PlaceCode(1, code), g.temp_count);
+    const u32 fs_white = probed ? SgxdFlagValue("fswhite") : 0;
+    std::span<const u32> phase_starts = g.phase_starts;
+    static constexpr u32 single_phase[1] = {0};
+    // sgxd_flags fscut=N: a single-phase program's first N instructions, then the white write.
+    const u32 fs_cut = probed ? SgxdFlagValue("fscut") : 0;
+    const bool cut = fs_cut != 0 && phase_starts.size() == 1 && fs_cut < code.size();
+    if (cut) {
+        code.resize(fs_cut);
+    }
+    if (fs_white == 2 || fs_white == 4) {
+        // fswhite=4: as many NOPs as the program's words before the white write.
+        const std::size_t words = code.size();
+        code = {0xfa44070000000000ull}; // PHAS (last)
+        if (fs_white == 4) {
+            code.insert(code.end(), words, 0xf800094000000000ull);
+        }
+        code.push_back(Limm(1, 0, 0xffffffffu, true)); // LIMM o0
+        phase_starts = single_phase;
+    } else if (fs_white == 1 || cut) {
+        code.push_back(Limm(1, 0, 0xffffffffu, true));
+    } else if (epilogue.split_alpha) {
+        code.push_back(PackInPlace);
+        code.push_back(Limm(2, 2, epilogue.colour, false));
+        code.push_back(epilogue.split_alpha);
+        code.push_back(epilogue.blend);
+        code.push_back(Limm(2, 2, 0xff000000u, false));
+        code.push_back(BlendSplitSelect());
+    } else if (epilogue.blend) {
+        code.push_back(PackInPlace);
+        if (epilogue.constant) {
+            code.push_back(Limm(2, 0, epilogue.colour, false));
+        }
+        PushBlend(code, epilogue.blend, epilogue.mask);
+    } else {
+        code.push_back((PackToOutput & ~PackMask) | u64{epilogue.mask} << 34);
+    }
+    const std::size_t code_words = code.size();
+    const u32 doutu0 = sgxd_program_doutu0(
+        1, backend.PlaceCodePhased(1, std::move(code), phase_starts, g.temp_count),
+        g.temp_count);
     f.secondary_doutu0 = g.secondary.empty()
                              ? DummyPixelSecondary
                              : sgxd_program_doutu0(1, backend.PlaceCode(1, g.secondary), 0);
@@ -2273,15 +3305,17 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
     [[maybe_unused]] const int fprim = sgxd_program_pixel_pds(
         doutu0, iterators.data(), words.data(), static_cast<unsigned>(g.inputs.size()), &pds);
     DEBUG_ASSERT(fprim == 0);
-    f.fprim = backend.PlacePds(pds);
+    f.fprim = backend.PlacePds(pds, true); // kept with the program
     f.fprim_units = pds.units;
     // The pack reads pa0 and pa1 (four F16), the iterators write from pa0.
-    f.pixel_pa = std::max<u32>({g.pa_count, iterated, 2u});
+    // The split blend's scratch: pa1 and pa2.
+    f.pixel_pa = std::max<u32>({g.pa_count, iterated, epilogue.split_alpha ? 3u : 2u});
     LOG_INFO(Render,
              "fragment program {:016x}, blend {:016x}: {} words, {} inputs, {} PAs, {} temps, "
-             "{} uniform floats, {} literals",
-             hash, blend, code.size(), g.inputs.size(), f.pixel_pa,
-             g.temp_count, g.uniform_floats, g.literals.size());
+             "{} uniform floats, {} literals{}",
+             hash, epilogue.blend, code_words, g.inputs.size(), f.pixel_pa, g.temp_count,
+             g.uniform_floats, g.literals.size(),
+             emit_us != 0 ? fmt::format(", emitted in {} us", emit_us) : "");
     return f;
 }
 
@@ -2481,7 +3515,7 @@ u32 RasterizerSgxd::NoiseTable() {
         };
         static constexpr u32 table2[16] = {10, 2, 15, 8, 0, 7, 4, 5, 5, 13, 2, 6, 13, 9, 3, 14};
         // F16x4 texels, R first: h * (x odd), h * (y odd), h, 0, for the program's bilinear read.
-        noise_table = backend.AllocTexture(256 * 256 * 8);
+        noise_table = backend.AllocTextureFixed(256 * 256 * 8);
         u16* const texels = reinterpret_cast<u16*>(noise_table.cpu);
         for (u32 y = 0; y < 256; y++) {
             for (u32 x = 0; x < 256; x++) {
@@ -2629,7 +3663,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
     u32 feed_count = 0;
     u16 enabled_regs = 0;
     std::array<u8, 16> reg_components{};
-    u16 u8_regs = 0;
+    u16 u8_regs = 0, s8_regs = 0, s16_regs = 0;
     // An immediate batch sits in the pass data, each vertex its attributes' four floats.
     SgxdBackend::Data immediate_data{};
     if (immediate) {
@@ -2662,23 +3696,28 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
                 continue;
             }
             offset = Common::AlignUp(offset, va.GetElementSizeInBytes(attribute_index));
+            using AttributeFormat = Pica::PipelineRegs::VertexAttributeFormat;
             const auto format = va.GetFormat(attribute_index);
-            const bool is_u8 = format == Pica::PipelineRegs::VertexAttributeFormat::UBYTE;
-            DEBUG_ASSERT_MSG(is_u8 || format == Pica::PipelineRegs::VertexAttributeFormat::FLOAT,
-                             "GXM: {}: attribute {} is format {}; F32 and U8 attributes are built",
-                             describe(), attribute_index, static_cast<u32>(format));
+            // Integer attributes are unpacked by the program (UnpackInt): fetched as the words
+            // they start, one for bytes, one or two for shorts. The DMA reads from any byte
+            // address at any stride.
+            const bool is_s8 = format == AttributeFormat::BYTE;
+            const bool is_s16 = format == AttributeFormat::SHORT;
+            const bool is_u8 = format == AttributeFormat::UBYTE || is_s8 || is_s16;
             const u32 reg = regs.vs.GetRegisterForAttribute(attribute_index);
             const PAddr address = base + loader.data_offset + offset;
-            // A U8 attribute is fetched as the word its bytes start: the DMA moves words.
             const u32 stride = loader.byte_count;
-            DEBUG_ASSERT_MSG(!is_u8 || ((address | stride) & 3) == 0,
-                             "GXM: {}: U8 attribute {} at {:#x}, stride {}: not word-aligned",
-                             describe(), attribute_index, address, stride);
             // Two loaders feeding one register is a guest bug; the last wins, as in GL.
             const auto same = std::find_if(feeds.begin(), feeds.begin() + feed_count,
                                            [&](const Feed& f) { return f.reg == reg; });
-            const Feed feed{reg, address, stride, is_u8 ? 1u : elements};
-            u8_regs = static_cast<u16>(is_u8 ? u8_regs | 1u << reg : u8_regs & ~(1u << reg));
+            const Feed feed{reg, address, stride,
+                            is_s16 ? (elements + 1) / 2 : is_u8 ? 1u : elements};
+            const auto mark = [reg](u16& mask, bool on) {
+                mask = static_cast<u16>(on ? mask | 1u << reg : mask & ~(1u << reg));
+            };
+            mark(u8_regs, is_u8);
+            mark(s8_regs, is_s8);
+            mark(s16_regs, is_s16);
             if (same != feeds.begin() + feed_count) {
                 *same = feed;
             } else {
@@ -2692,7 +3731,8 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
     // Every register no loader feeds is a uniform: the fixed default attribute where the guest set
     // one, (0, 0, 0, 1) otherwise.
     const u16 default_regs = static_cast<u16>(~enabled_regs);
-    const VertexProgram& vp = VertexProgramFor(default_regs, reg_components, u8_regs, mode);
+    const VertexProgram& vp =
+        VertexProgramFor(default_regs, reg_components, u8_regs, s8_regs, s16_regs, mode);
     const Usse::GxpProgram& vg = vp.gxp;
 
     // --- the index list ---
@@ -2924,6 +3964,568 @@ void RasterizerSgxd::VertexPrograms(const VertexStage& stage, const SgxdBackend:
     p.indices = stage.indices;
 }
 
+bool RasterizerSgxd::QuadVertices(bool is_indexed, const float* immediate, u32 count,
+                                 std::array<Pica::OutputVertex, 6>& out) {
+    QuadRun& r = quad_run;
+    if (r.serial == draw_serial && r.indexed == is_indexed && r.immediate == immediate &&
+        r.count == count) {
+        out = r.out;
+        return r.ok;
+    }
+    r = QuadRun{draw_serial, is_indexed, immediate, count, false, {}};
+    r.ok = RunQuadVertices(is_indexed, immediate, count, r.out);
+    out = r.out;
+    return r.ok;
+}
+
+bool RasterizerSgxd::RunQuadVertices(bool is_indexed, const float* immediate, u32 count,
+                                    std::array<Pica::OutputVertex, 6>& out) {
+    const auto& pipeline = regs.pipeline;
+    if (!cover_engine) {
+        cover_engine = Pica::CreateEngine(false);
+    }
+    cover_engine->SetupBatch(pica.vs_setup, regs.vs.main_offset);
+    Pica::ShaderUnit unit;
+    const Pica::VertexLoader loader(memory, pipeline);
+    const PAddr base = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const u8* const indices = memory.GetPhysicalPointer(base + pipeline.index_array.offset);
+    const u32 attributes = regs.vs.max_input_attribute_index + 1;
+    for (u32 j = 0; j < count; j++) {
+        Pica::AttributeBuffer input{}, output{};
+        if (immediate) {
+            for (u32 a = 0; a < attributes; a++) {
+                for (u32 c = 0; c < 4; c++) {
+                    input[a][c] = f24::FromFloat32(immediate[(j * attributes + a) * 4 + c]);
+                }
+            }
+        } else {
+            if (is_indexed && indices == nullptr) {
+                return false;
+            }
+            const u32 vertex = !is_indexed ? j + pipeline.vertex_offset
+                               : pipeline.index_array.format != 0
+                                   ? reinterpret_cast<const u16*>(indices)[j]
+                                   : indices[j];
+            loader.LoadVertex(base, j, vertex, input, pica.input_default_attributes);
+        }
+        unit.LoadInput(regs.vs, input);
+        cover_engine->Run(pica.vs_setup, unit);
+        unit.WriteOutput(regs.vs, output);
+        out[j] = Pica::OutputVertex(regs.rasterizer, output);
+    }
+    return true;
+}
+
+
+void RasterizerSgxd::LogWbufMix(bool w_ta, bool dwrite, u32 dcmp, bool is_indexed,
+                                const float* immediate, u32 count) {
+    static const bool on = SgxdFlag("wbufmix");
+    if (!on) {
+        return;
+    }
+    if (w_ta) {
+        pass_ta_w = pass_ta_w || dwrite;
+        return;
+    }
+    if (!pass_ta_w || dcmp == 7 ||
+        regs.rasterizer.depthmap_enable != Pica::RasterizerRegs::DepthBuffering::ZBuffering) {
+        return;
+    }
+    static u32 seen = 0;
+    if (seen++ >= 200) {
+        return;
+    }
+    // The PICA's Z depth at each vertex: offset + scale * z / w. Against the W depths a constant
+    // 0 (a quad at z 0) compares alike in both (w > 1 either way); anything else does not.
+    float lo = std::numeric_limits<float>::infinity(), hi = -lo;
+    const bool positions = RunPositions(is_indexed, immediate, count);
+    for (u32 j = 0; positions && j < count; j++) {
+        const auto& v = clip_check_positions[j];
+        const float d = fs_data.depth_offset + fs_data.depth_scale * v[2] / v[3];
+        lo = std::min(lo, d);
+        hi = std::max(hi, d);
+    }
+    const std::string range = positions ? fmt::format("{:.6g}..{:.6g}", lo, hi)
+                                        : std::string("unknown (index list not in memory)");
+    LOG_INFO(Render,
+             "wbufmix {}: frame {} pass draw {}: a Z-buffered draw tests depth (ISP DCMP {}, write "
+             "{}) against the TA's W depths; {} vertices, vs code {:016x}, PICA depth {}",
+             seen, frames, backend.PassDraws() + 1, dcmp, dwrite ? 1 : 0, count,
+             pica.vs_setup.GetProgramCodeHash(), range);
+}
+
+void RasterizerSgxd::ClipCheck(bool is_indexed, const float* immediate, u32 count) {
+    // From N s of the process's time on, the draws in the first 50 ms of each second (with
+    // clipcheckall, every draw): the clipper locks up on triangles it clips at its guard band
+    // whose vertices differ in w. The TA's
+    // near and far planes are the PICA's (z from -w to 0, the vertex program's z), but it has no
+    // w plane: where those planes meet at w 0, what is left of a triangle keeps vertices at w 0
+    // (the PICA's w >= epsilon plane cuts them off), whose x/w the TA's w clamp makes enormous.
+    // A second's totals when the next begins.
+    static const u64 at = u64{SgxdFlagValue("clipcheck")} * 1000000;
+    static const bool every_draw = SgxdFlag("clipcheckall");
+    if (at == 0) {
+        return;
+    }
+    const u64 now = sceKernelGetProcessTimeWide();
+    if (now < at) {
+        return;
+    }
+    static u64 second = ~u64{0};
+    static u32 draws, triangles, band, band_mixed, near, near_zero, non_finite, logged;
+    if ((now - at) / 1000000 != second) {
+        if (second != ~u64{0}) {
+            LOG_INFO(Render,
+                     "clipcheck: second {}: {} draws, {} triangles; {} clipped at the band ({} "
+                     "with w differing), {} crossing w 0 ({} left with w near 0 after the near "
+                     "and far planes), {} non-finite",
+                     second, draws, triangles, band, band_mixed, near, near_zero, non_finite);
+        }
+        second = (now - at) / 1000000;
+        draws = triangles = band = band_mixed = near = near_zero = non_finite = 0;
+    }
+    if (!every_draw && (now - at) % 1000000 >= 50000) {
+        return;
+    }
+    using Topology = Pica::PipelineRegs::TriangleTopology;
+    using V = std::array<float, 4>;
+    const auto& pipeline = regs.pipeline;
+    if (!RunPositions(is_indexed, immediate, count)) {
+        return;
+    }
+    const auto& pos = clip_check_positions;
+    // The band on the PICA's axes: the TA's x is the PICA's y (DrawViewport's transpose).
+    const float bx = 1.5f * draw_view.guard[1], by = 1.5f * draw_view.guard[0];
+    const auto outside = [bx, by](const V& v) {
+        return !(v[3] > 0.0f) || std::abs(v[0]) > bx * v[3] || std::abs(v[1]) > by * v[3];
+    };
+    // A polygon clipped against plane d(v) >= 0 (Sutherland-Hodgman), in place.
+    const auto clip = [](std::array<V, 6>& poly, u32& n, auto d) {
+        std::array<V, 6> out;
+        u32 m = 0;
+        for (u32 i = 0; i < n; i++) {
+            const V& a = poly[i];
+            const V& b = poly[(i + 1) % n];
+            const float da = d(a), db = d(b);
+            if (da >= 0.0f && m < 6) {
+                out[m++] = a;
+            }
+            if ((da >= 0.0f) != (db >= 0.0f) && m < 6) {
+                const float t = da / (da - db);
+                V c;
+                for (u32 k = 0; k < 4; k++) {
+                    c[k] = a[k] + (b[k] - a[k]) * t;
+                }
+                out[m++] = c;
+            }
+        }
+        poly = out;
+        n = m;
+    };
+    u32 d_tris = 0, d_band = 0, d_mixed = 0, d_near = 0, d_zero = 0, d_bad = 0;
+    s32 example = -1;
+    float example_w = 0.0f;
+    const auto triangle = [&](u32 i0, u32 i1, u32 i2, u32 first) {
+        std::array<V, 6> poly{pos[i0], pos[i1], pos[i2]};
+        u32 n = 3;
+        d_tris++;
+        u32 positive = 0;
+        for (u32 i = 0; i < 3; i++) {
+            for (const float c : poly[i]) {
+                if (!std::isfinite(c)) {
+                    d_bad++;
+                    return;
+                }
+            }
+            positive += poly[i][3] > 0.0f ? 1 : 0;
+        }
+        d_near += positive != 0 && positive != 3 ? 1 : 0;
+        // The TA's near and far planes: z <= 0, z >= -w.
+        clip(poly, n, [](const V& v) { return -v[2]; });
+        clip(poly, n, [](const V& v) { return v[2] + v[3]; });
+        if (n < 3) {
+            return;
+        }
+        float w0 = 1e30f, w1 = -1e30f;
+        bool any_outside = false;
+        for (u32 i = 0; i < n; i++) {
+            w0 = std::min(w0, poly[i][3]), w1 = std::max(w1, poly[i][3]);
+            any_outside |= outside(poly[i]);
+        }
+        if (w0 < 1e-3f * w1) {
+            // Left at w 0: off the screen or not, the TA clamps w and clips what that makes.
+            d_zero++;
+            if (example < 0) {
+                example = static_cast<s32>(first);
+                example_w = w0;
+            }
+            return;
+        }
+        if (!any_outside) {
+            return;
+        }
+        // Off the screen whole: the TA drops it before clipping.
+        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+        for (u32 i = 0; i < n; i++) {
+            const float x = poly[i][0] / poly[i][3], y = poly[i][1] / poly[i][3];
+            x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+        }
+        if (x1 < -1.0f || x0 > 1.0f || y1 < -1.0f || y0 > 1.0f) {
+            return;
+        }
+        d_band++;
+        if (w1 - w0 > 1e-4f * w1) {
+            d_mixed++;
+        }
+    };
+    switch (pipeline.triangle_topology) {
+    case Topology::Strip:
+        for (u32 i = 0; i + 2 < count; i++) {
+            triangle(i, i + 1, i + 2, i);
+        }
+        break;
+    case Topology::Fan:
+        for (u32 i = 1; i + 1 < count; i++) {
+            triangle(0, i, i + 1, i);
+        }
+        break;
+    default:
+        for (u32 i = 0; i + 2 < count; i += 3) {
+            triangle(i, i + 1, i + 2, i);
+        }
+        break;
+    }
+    draws++;
+    triangles += d_tris, band += d_band, band_mixed += d_mixed, near += d_near;
+    near_zero += d_zero, non_finite += d_bad;
+    if ((d_zero != 0 || d_bad != 0) && logged < 600) {
+        logged++;
+        const auto& fb = regs.framebuffer.framebuffer;
+        std::string worst;
+        if (example >= 0) {
+            const u32 e = static_cast<u32>(example);
+            const bool fan = pipeline.triangle_topology == Topology::Fan;
+            for (const u32 k : {fan ? 0u : e, fan ? e : e + 1, fan ? e + 1 : e + 2}) {
+                worst += fmt::format(" ({:.4g} {:.4g} {:.4g} {:.4g})", pos[k][0], pos[k][1],
+                                     pos[k][2], pos[k][3]);
+            }
+        }
+        LOG_INFO(Render,
+                 "clipcheck: draw {} on {:#x} {}x{}, topology {}, {} vertices, vs {:#x} code "
+                 "{:016x}: {} triangles; {} clipped at the band ({} with w differing), {} crossing "
+                 "w 0, {} left with w near 0 ({:.3g}), {} non-finite; band {:.2f} x {:.2f}; "
+                 "first{}",
+                 draw_serial, fb.GetColorBufferPhysicalAddress(), fb.GetWidth(), fb.GetHeight(),
+                 TopologyName(pipeline.triangle_topology), count, regs.vs.main_offset.Value(),
+                 pica.vs_setup.GetProgramCodeHash(), d_tris, d_band, d_mixed, d_near, d_zero,
+                 example_w, d_bad, bx, by, worst);
+    }
+}
+u32 RasterizerSgxd::OwnPixelUnits(bool is_indexed, const float* immediate, u32 count) {
+    using Topology = Pica::PipelineRegs::TriangleTopology;
+    using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
+    using Filter = Pica::TexturingRegs::TextureConfig::TextureFilter;
+    const auto& fb = regs.framebuffer.framebuffer;
+    if (fb.color_format != FramebufferRegs::ColorFormat::RGBA8) {
+        return 0;
+    }
+    const PAddr colour = fb.GetColorBufferPhysicalAddress();
+    const u32 width = fb.GetWidth(), height = fb.GetHeight();
+    const auto textures = regs.texturing.GetTextures();
+    const auto& lighting = regs.lighting;
+    u32 units = 0;
+    for (u32 unit = 0; unit < 3; unit++) {
+        const auto& t = textures[unit];
+        const auto& c = t.config;
+        // The lighting's bump and shadow reads take F32 texels from a sampler.
+        const bool lit =
+            !lighting.disable &&
+            (lighting.config0.bump_selector == unit ||
+             (lighting.config0.enable_shadow && lighting.config0.shadow_selector == unit));
+        if (t.enabled && c.GetPhysicalAddress() == colour && c.width == width &&
+            c.height == height && t.format == Pica::TexturingRegs::TextureFormat::RGBA8 &&
+            c.mag_filter == Filter::Nearest && c.min_filter == Filter::Nearest &&
+            (unit != 0 || c.type == TextureType::Texture2D) && !lit) {
+            units |= 1u << unit;
+        }
+    }
+    if (units == 0) {
+        return 0;
+    }
+    const auto& pipeline = regs.pipeline;
+    const Topology topology = pipeline.triangle_topology;
+    const bool list = topology == Topology::List || topology == Topology::Shader;
+    if (pipeline.use_gs != Pica::PipelineRegs::UseGS::No || count != (list ? 6u : 4u) ||
+        (!list && topology != Topology::Strip && topology != Topology::Fan)) {
+        return 0;
+    }
+    std::array<Pica::OutputVertex, 6> v;
+    if (!QuadVertices(is_indexed, immediate, count, v)) {
+        return 0;
+    }
+    // One w: the coordinates interpolate linearly in the window.
+    const float w0 = v[0].pos.w.ToFloat32();
+    for (u32 j = 0; j < count; j++) {
+        if (!(w0 > 0.0001f) || v[j].pos.w.ToFloat32() != w0) {
+            return 0;
+        }
+    }
+    // The PICA reads texel floor(u * width) at the pixel's centre, rows bottom to
+    // top in both: the pixel's own when u * width is the window x plus an offset within half a texel,
+    // the same at every vertex.
+    const auto& rs = regs.rasterizer;
+    const float half_x = f24::FromRaw(rs.viewport_size_x).ToFloat32();
+    const float half_y = f24::FromRaw(rs.viewport_size_y).ToFloat32();
+    const float corner_x = static_cast<float>(rs.viewport_corner.x);
+    const float corner_y = static_cast<float>(rs.viewport_corner.y);
+    const bool unit2_coord1 = regs.texturing.main_config.texture2_use_coord1 != 0;
+    constexpr float same = 1.0f / 64, margin = 1.0f / 32;
+    u32 own = 0;
+    for (u32 unit = 0; unit < 3; unit++) {
+        if (!(units >> unit & 1)) {
+            continue;
+        }
+        float dx0 = 1e9f, dx1 = -1e9f, dy0 = 1e9f, dy1 = -1e9f;
+        for (u32 j = 0; j < count; j++) {
+            const auto& tc = unit == 0                     ? v[j].tc0
+                             : (unit == 1 || unit2_coord1) ? v[j].tc1
+                                                           : v[j].tc2;
+            const float x = (v[j].pos.x.ToFloat32() / w0 + 1) * half_x + corner_x;
+            const float y = (v[j].pos.y.ToFloat32() / w0 + 1) * half_y + corner_y;
+            const float dx = tc.u().ToFloat32() * static_cast<float>(width) - x;
+            const float dy = tc.v().ToFloat32() * static_cast<float>(height) - y;
+            dx0 = std::min(dx0, dx);
+            dx1 = std::max(dx1, dx);
+            dy0 = std::min(dy0, dy);
+            dy1 = std::max(dy1, dy);
+        }
+        if (dx1 - dx0 < same && dy1 - dy0 < same && dx0 > -0.5f + margin && dx1 < 0.5f - margin &&
+            dy0 > -0.5f + margin && dy1 < 0.5f - margin) {
+            own |= 1u << unit;
+        }
+    }
+    return own;
+}
+
+bool RasterizerSgxd::CoversTarget(bool is_indexed, const float* immediate, u32 count, u32 width,
+                                 u32 height, bool depth) {
+    using Topology = Pica::PipelineRegs::TriangleTopology;
+    using CullMode = Pica::RasterizerRegs::CullMode;
+    const auto& pipeline = regs.pipeline;
+    const auto& om = regs.framebuffer.output_merger;
+    const auto& fb = regs.framebuffer.framebuffer;
+    const auto& rs = regs.rasterizer;
+    const Topology topology = pipeline.triangle_topology;
+    const bool list = topology == Topology::List || topology == Topology::Shader;
+    if (pipeline.use_gs != Pica::PipelineRegs::UseGS::No || count != (list ? 6u : 4u) ||
+        (!list && topology != Topology::Strip && topology != Topology::Fan)) {
+        return false;
+    }
+    const bool writes_all = fb.allow_color_write != 0 && om.red_enable && om.green_enable &&
+                            om.blue_enable && om.alpha_enable;
+    // A blend keeps nothing of the target with ZERO for both destination factors and no source factor
+    // of the destination's.
+    using BF = FramebufferRegs::BlendFactor;
+    const auto of_dest = [](BF f) {
+        return f == BF::DestColor || f == BF::OneMinusDestColor || f == BF::DestAlpha ||
+               f == BF::OneMinusDestAlpha || f == BF::SourceAlphaSaturate;
+    };
+    const auto& b = om.alpha_blending;
+    const bool blend_reads =
+        om.alphablend_enable &&
+        (b.factor_dest_rgb != BF::Zero || b.factor_dest_a != BF::Zero ||
+         of_dest(b.factor_source_rgb) || of_dest(b.factor_source_a));
+    const bool reads_target =
+        blend_reads || (!om.alphablend_enable && om.logic_op != FramebufferRegs::LogicOp::Copy) ||
+        om.alpha_test.enable || om.depth_test_enable || om.stencil_test.enable;
+    // Every pixel's depth: written, nothing killing a pixel first (the alpha and stencil
+    // tests, a depth test other than ALWAYS).
+    const bool depth_kept =
+        om.alpha_test.enable || om.stencil_test.enable ||
+        (om.depth_test_enable && om.depth_test_func != FramebufferRegs::CompareFunc::Always);
+    if (depth ? depth_kept : (!writes_all || reads_target)) {
+        return false;
+    }
+    const auto& sc = rs.scissor_test;
+    if (sc.mode == Pica::RasterizerRegs::ScissorMode::Exclude ||
+        (sc.mode == Pica::RasterizerRegs::ScissorMode::Include &&
+         (sc.x1 != 0 || sc.y1 != 0 || sc.x2 + 1 < width || sc.y2 + 1 < height))) {
+        return false;
+    }
+    // The viewport clips x and y: it has to hold the target.
+    const float half_x = f24::FromRaw(rs.viewport_size_x).ToFloat32();
+    const float half_y = f24::FromRaw(rs.viewport_size_y).ToFloat32();
+    const float corner_x = static_cast<float>(rs.viewport_corner.x);
+    const float corner_y = static_cast<float>(rs.viewport_corner.y);
+    if (corner_x > 0 || corner_y > 0 || corner_x + 2 * half_x < static_cast<float>(width) ||
+        corner_y + 2 * half_y < static_cast<float>(height)) {
+        return false;
+    }
+
+    std::array<Pica::OutputVertex, 6> vertices;
+    if (!QuadVertices(is_indexed, immediate, count, vertices)) {
+        return false;
+    }
+    std::array<float, 12> x{}, y{};
+    for (u32 j = 0; j < count; j++) {
+        const Pica::OutputVertex& v = vertices[j];
+        const float w = v.pos.w.ToFloat32(), z = v.pos.z.ToFloat32();
+        if (!(w > 0.0001f) || z > 0 || z < -w) {
+            return false;
+        }
+        x[j] = (v.pos.x.ToFloat32() / w + 1) * half_x + corner_x;
+        y[j] = (v.pos.y.ToFloat32() / w + 1) * half_y + corner_y;
+    }
+    static constexpr u32 tris[3][2][3] = {
+        {{0, 1, 2}, {3, 4, 5}}, // list
+        {{0, 1, 2}, {2, 1, 3}}, // strip
+        {{0, 1, 2}, {0, 2, 3}}, // fan
+    };
+    const auto& t = tris[list ? 0 : topology == Topology::Strip ? 1 : 2];
+    const float x0 = *std::min_element(x.begin(), x.begin() + count);
+    const float x1 = *std::max_element(x.begin(), x.begin() + count);
+    const float y0 = *std::min_element(y.begin(), y.begin() + count);
+    const float y1 = *std::max_element(y.begin(), y.begin() + count);
+    if (x0 > 0.25f || y0 > 0.25f || x1 < static_cast<float>(width) - 0.25f ||
+        y1 < static_cast<float>(height) - 0.25f) {
+        return false;
+    }
+    // Each triangle is kept, its vertices on three of the box's corners, the two leaving out opposite
+    // corners: the box whole.
+    const float eps = 0.01f;
+    u32 left_out[2]{};
+    for (u32 k = 0; k < 2; k++) {
+        const u32 a = t[k][0], b = t[k][1], c = t[k][2];
+        const float area = (x[b] - x[a]) * (y[c] - y[a]) - (y[b] - y[a]) * (x[c] - x[a]);
+        const CullMode cull = rs.cull_mode;
+        if (area == 0 || (cull == CullMode::KeepCounterClockWise && area < 0) ||
+            (cull == CullMode::KeepClockWise && area > 0)) {
+            return false;
+        }
+        u32 corners = 0;
+        for (const u32 v : t[k]) {
+            const bool left = std::abs(x[v] - x0) < eps, right = std::abs(x[v] - x1) < eps;
+            const bool bottom = std::abs(y[v] - y0) < eps, top = std::abs(y[v] - y1) < eps;
+            if ((!left && !right) || (!bottom && !top)) {
+                return false;
+            }
+            corners |= 1u << ((right ? 1u : 0u) | (top ? 2u : 0u));
+        }
+        if (std::popcount(corners) != 3) {
+            return false;
+        }
+        left_out[k] = static_cast<u32>(std::countr_zero(~corners & 0xfu));
+    }
+    return (left_out[0] ^ left_out[1]) == 3;
+}
+
+void RasterizerGxm::VsProbe(bool is_indexed, u32 count, const Describe& describe) {
+    const u32 outputs = static_cast<u32>(std::popcount(regs.vs.output_mask.Value()));
+    VertexStage a0 =
+        VertexStageFor(is_indexed, nullptr, count, Usse::VsMode::StoreOutputs, describe);
+    const u32 vertices = a0.vertex_max - a0.vertex_min + 1;
+    const u32 vsize = outputs * 16;
+    DEBUG_ASSERT(vertices <= 0x10000);
+    const SgxdBackend::Data vs_out = backend.AllocData(vertices * vsize);
+    std::memset(vs_out.cpu, 0xcc, vertices * vsize);
+    const u32 a0_count = Common::AlignUp(vertices, 3u);
+    const SgxdBackend::Data a0_table = backend.AllocData(vertices * 4);
+    const SgxdBackend::Data a0_indices = backend.AllocData(a0_count * 2, 4);
+    u32* const table = reinterpret_cast<u32*>(a0_table.cpu);
+    u16* const a0_list = reinterpret_cast<u16*>(a0_indices.cpu);
+    for (u32 j = 0; j < vertices; j++) {
+        table[j] = vs_out.gpu + j * vsize;
+        a0_list[j] = static_cast<u16>(j);
+    }
+    for (u32 j = vertices; j < a0_count; j++) {
+        a0_list[j] = static_cast<u16>(vertices - 1);
+    }
+    const auto& ag = a0.vp->gxp;
+    const auto out_attr = std::find_if(ag.attributes.begin(), ag.attributes.end(),
+                                       [](const auto& a) { return a.name == "vs_out_address"; });
+    DEBUG_ASSERT(out_attr != ag.attributes.end() && a0.fetch_count < a0.fetch.size());
+    a0.fetch[a0.fetch_count++] = {a0_table.gpu, 4, 1, out_attr->resource};
+    a0.indices = a0_indices.gpu;
+    a0.count = a0_count;
+    u32 vsec_sa = 0;
+    const SgxdBackend::Data vsa = VertexSa(ag, pica.vs_setup, vsec_sa, describe);
+    SgxdRecipeDrawPrograms p{};
+    VertexPrograms(a0, vsa, vsec_sa, p, describe);
+#ifdef VITA_DIAGNOSTICS
+    NoteStreamOut("vsprobe", 0, 0, 0, 0, a0_count, *a0.vp);
+#endif
+    backend.StreamOut(p, a0_count);
+#ifdef VITA_DIAGNOSTICS
+    stream_note.stage = nullptr;
+#endif
+
+    // The loaders: each attribute's register, format, elements and offset, and the first
+    // vertex's bytes, to tell an unpack's error from the program's.
+    {
+        const auto& va = regs.pipeline.vertex_attributes;
+        for (u32 l = 0; l < 12; l++) {
+            const auto& loader = va.attribute_loaders[l];
+            if (loader.component_count == 0 || loader.byte_count == 0) {
+                continue;
+            }
+            std::string line;
+            for (u32 comp = 0; comp < loader.component_count && comp < 12; comp++) {
+                const u32 a = loader.GetComponent(comp);
+                line += a >= 12 ? fmt::format(" pad{}", (a - 11) * 4)
+                                : fmt::format(" a{}->v{} f{}x{}", a, regs.vs.GetRegisterForAttribute(a),
+                                              static_cast<u32>(va.GetFormat(a)),
+                                              va.GetNumElements(a));
+            }
+            const PAddr at = va.GetPhysicalBaseAddress() + loader.data_offset +
+                             a0.vertex_min * loader.byte_count;
+            const u8* const bytes = memory.GetPhysicalPointer(at);
+            std::string raw;
+            for (u32 n = 0; n < std::min<u32>(loader.byte_count, 32); n++) {
+                raw += fmt::format("{:02x}", bytes[n]);
+            }
+            LOG_INFO(Render, "vsprobe {}: loader {} at {:#x} stride {}:{}; vertex {}: {}", draws + 1,
+                     l, at, static_cast<u32>(loader.byte_count), line, a0.vertex_min, raw);
+        }
+    }
+    // Upstream's interpreter over the same vertices.
+    const auto engine = Pica::CreateEngine(false);
+    Pica::ShaderUnit unit;
+    engine->SetupBatch(pica.vs_setup, regs.vs.main_offset);
+    const Pica::VertexLoader loader(memory, regs.pipeline);
+    const PAddr base = regs.pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    u32 wrong = 0, compared = 0;
+    for (u32 j = 0; j < std::min(vertices, 64u); j++) {
+        Pica::AttributeBuffer input{}, want{};
+        loader.LoadVertex(base, j, a0.vertex_min + j, input, pica.input_default_attributes);
+        unit.LoadInput(regs.vs, input);
+        engine->Run(pica.vs_setup, unit);
+        unit.WriteOutput(regs.vs, want);
+        const float* got = reinterpret_cast<const float*>(vs_out.cpu + j * vsize);
+        for (u32 k = 0; k < outputs; k++) {
+            for (u32 c = 0; c < 4; c++) {
+                const float w = want[k][c].ToFloat32(), g = got[k * 4 + c];
+                compared++;
+                if (!(std::abs(w - g) <= 1e-3f * std::max(1.0f, std::abs(w)))) {
+                    if (wrong++ < 48) {
+                        LOG_INFO(Render, "vsprobe {}: vertex {} output {} lane {}: ours {} upstream {}",
+                                 draws + 1, a0.vertex_min + j, k, "xyzw"[c], g, w);
+                    }
+                }
+            }
+        }
+        if (j < 4) {
+            std::string line;
+            for (u32 k = 0; k < outputs; k++) {
+                line += fmt::format(" o{}=({:.4g} {:.4g} {:.4g} {:.4g})", k, got[k * 4],
+                                    got[k * 4 + 1], got[k * 4 + 2], got[k * 4 + 3]);
+            }
+            LOG_INFO(Render, "vsprobe {}: vertex {} ours:{}", draws + 1, a0.vertex_min + j, line);
+        }
+    }
+    LOG_INFO(Render, "vsprobe {}: {}: {} of {} output components differ from upstream's "
+             "interpreter", draws + 1, describe(), wrong, compared);
+}
+
 bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate_count) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
 #ifdef VITA_DIAGNOSTICS
@@ -2974,43 +4576,148 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     DEBUG_ASSERT_MSG(count > 0 && (is_indexed || count <= SGXD_RECIPE_MAX_INDICES),
                      "sgxd: {}: more vertices than the identity index list", describe());
     SyncDrawUniforms();
+    {
+        // The scissor box in the fragment program's position (WPOS: pixel centres from the
+        // target's top-left, rows as the memory's): x [x1, x2 + 1), and y mirrored like the
+        // viewport's corner (upstream's Vulkan path, FramebufferHelper with flip_rect).
+        const auto& sc = regs.rasterizer.scissor_test;
+        const s32 target_height = static_cast<s32>(regs.framebuffer.framebuffer.GetHeight());
+        fs_data.scissor_x1 = static_cast<s32>(sc.x1.Value());
+        fs_data.scissor_x2 = static_cast<s32>(sc.x2.Value()) + 1;
+        fs_data.scissor_y1 = target_height - (static_cast<s32>(sc.y2.Value()) + 1);
+        fs_data.scissor_y2 = target_height - static_cast<s32>(sc.y1.Value());
+    }
 
     // --- the target and the output merger ---
     const auto& fb = regs.framebuffer.framebuffer;
     const auto& om = regs.framebuffer.output_merger;
-    DEBUG_ASSERT_MSG(fb.color_format == FramebufferRegs::ColorFormat::RGBA8,
-                     "GXM: {}: colour format {} (RGBA8 only)", describe(),
-                     static_cast<u32>(fb.color_format.Value()));
-    DEBUG_ASSERT_MSG(fb.allow_color_write != 0 && om.red_enable && om.green_enable &&
-                         om.blue_enable && om.alpha_enable,
-                     "GXM: {}: a colour write mask is not built", describe());
     DEBUG_ASSERT_MSG(om.fragment_operation_mode == FramebufferRegs::FragmentOperationMode::Default,
                      "GXM: {}: gas and shadow rendering are not built", describe());
-    DEBUG_ASSERT_MSG(!om.stencil_test.enable, "GXM: {}: the stencil test is not built", describe());
+    // A texture unit that reads the pixel's own colour reads the tile (OwnPixelUnits).
+    draw_own_pixel = OwnPixelUnits(is_indexed, immediate, count);
+    // The colour write mask: without a blend, the pack's byte mask; with one, the masked channels blend
+    // as ZERO, ONE. The SOP2 has one factor pair for R, G and B, so they mask together.
+    using BF = FramebufferRegs::BlendFactor;
+    using BE = FramebufferRegs::BlendEquation;
+    u8 mask = fb.allow_color_write == 0
+                  ? 0
+                  : static_cast<u8>(om.red_enable | om.green_enable << 1 | om.blue_enable << 2 |
+                                    om.alpha_enable << 3);
     const bool blend = om.alphablend_enable != 0;
-    u64 blend_word = 0;
+    Epilogue epilogue{};
     if (blend) {
         const auto& b = om.alpha_blending;
-        blend_word = BlendWord(b.blend_equation_rgb, b.blend_equation_a, b.factor_source_rgb,
-                               b.factor_dest_rgb, b.factor_source_a, b.factor_dest_a);
-        DEBUG_ASSERT_MSG(blend_word != 0,
-                         "GXM: {}: blend {}/{} {}/{} {}/{}: a constant factor or ReverseSubtract "
-                         "is not built",
-                         describe(), static_cast<u32>(b.blend_equation_rgb.Value()),
-                         static_cast<u32>(b.blend_equation_a.Value()),
-                         static_cast<u32>(b.factor_source_rgb.Value()),
-                         static_cast<u32>(b.factor_dest_rgb.Value()),
-                         static_cast<u32>(b.factor_source_a.Value()),
-                         static_cast<u32>(b.factor_dest_a.Value()));
+        BE eq_rgb = b.blend_equation_rgb, eq_a = b.blend_equation_a;
+        BF src_rgb = b.factor_source_rgb, dst_rgb = b.factor_dest_rgb;
+        BF src_a = b.factor_source_a, dst_a = b.factor_dest_a;
+        // R, G and B masked apart: the blend into pa0, then the mask's bytes of it into o0 (PushBlend).
+        if ((mask & 7) != 0 && (mask & 7) != 7) {
+            epilogue.mask = mask;
+        }
+        if ((mask & 7) == 0) {
+            eq_rgb = BE::Add, src_rgb = BF::Zero, dst_rgb = BF::One;
+        }
+        if ((mask & 8) == 0) {
+            eq_a = BE::Add, src_a = BF::Zero, dst_a = BF::One;
+        }
+        // ReverseSubtract has no SOP2 form (src1 - src2 only), but with a ZERO factor it is an ADD for
+        // every input: dest factor ZERO gives 0, source factor ZERO the dest term alone.
+        const auto reverse_to_add = [](BE& eq, BF& src, BF& dst) {
+            if (eq == BE::ReverseSubtract && dst == BF::Zero) {
+                eq = BE::Add, src = BF::Zero;
+            } else if (eq == BE::ReverseSubtract && src == BF::Zero) {
+                eq = BE::Add;
+            }
+        };
+        reverse_to_add(eq_rgb, src_rgb, dst_rgb);
+        reverse_to_add(eq_a, src_a, dst_a);
+        // A constant factor: the SOP2 has none, but with no factor on the fragment's own colour the
+        // constant stands in for the source: LIMM pa0 before the blend, CONSTANT_* read as SRC_*.
+        const auto is_constant = [](BF f) { return f >= BF::ConstantColor && f <= BF::OneMinusConstantAlpha; };
+        const auto reads_source = [](BF f) {
+            return f == BF::SourceColor || f == BF::OneMinusSourceColor || f == BF::SourceAlpha ||
+                   f == BF::OneMinusSourceAlpha || f == BF::SourceAlphaSaturate;
+        };
+        const bool any_constant = is_constant(src_rgb) || is_constant(dst_rgb) ||
+                                  is_constant(src_a) || is_constant(dst_a);
+        const bool reads_fragment = src_rgb != BF::Zero || src_a != BF::Zero ||
+                                    reads_source(dst_rgb) || reads_source(dst_a);
+        if (any_constant && reads_fragment) {
+            // The constant beside the fragment's colour: the split form (BlendSplitWords).
+            [[maybe_unused]] const bool split = BlendSplitWords(
+                eq_rgb, eq_a, src_rgb, dst_rgb, src_a, dst_a, epilogue.split_alpha, epilogue.blend);
+            DEBUG_ASSERT_MSG(epilogue.mask == 0xf,
+                             "sgxd: {}: colour mask {:#x} with a split blend (a constant factor "
+                             "with the fragment's colour) is not built",
+                             describe(), mask);
+            DEBUG_ASSERT_MSG(split,
+                             "sgxd: {}: blend {}/{} {}/{} {}/{}: a constant factor with the "
+                             "fragment's colour and MIN, MAX or SRC_ALPHA_SATURATE in colour is "
+                             "not built",
+                             describe(), static_cast<u32>(eq_rgb), static_cast<u32>(eq_a),
+                             static_cast<u32>(src_rgb), static_cast<u32>(dst_rgb),
+                             static_cast<u32>(src_a), static_cast<u32>(dst_a));
+            epilogue.colour = om.blend_const.raw;
+        } else if (any_constant) {
+            // CONSTANT_COLOR 10 and 11 are SRC_COLOR 2 and 3 eight down, CONSTANT_ALPHA 12 and 13 SRC_ALPHA
+            // 6 and 7 six down (eight down for all four would make CONSTANT_ALPHA DEST_COLOR).
+            const auto as_source = [](BF f) {
+                switch (f) {
+                case BF::ConstantColor:
+                    return BF::SourceColor;
+                case BF::OneMinusConstantColor:
+                    return BF::OneMinusSourceColor;
+                case BF::ConstantAlpha:
+                    return BF::SourceAlpha;
+                case BF::OneMinusConstantAlpha:
+                    return BF::OneMinusSourceAlpha;
+                default:
+                    return f;
+                }
+            };
+            dst_rgb = as_source(dst_rgb);
+            dst_a = as_source(dst_a);
+            epilogue.constant = true;
+            epilogue.colour = om.blend_const.raw;
+        }
+        if (epilogue.split_alpha == 0) {
+            epilogue.blend = BlendWord(eq_rgb, eq_a, src_rgb, dst_rgb, src_a, dst_a);
+        }
+        if (epilogue.blend == 0 && (eq_rgb == BE::ReverseSubtract || eq_a == BE::ReverseSubtract)) {
+            epilogue.blend = BlendWordSwapped(eq_rgb, eq_a, src_rgb, dst_rgb, src_a, dst_a);
+        }
+        DEBUG_ASSERT_MSG(epilogue.blend != 0,
+                         "sgxd: {}: blend {}/{} {}/{} {}/{}: ReverseSubtract with Subtract or "
+                         "SRC_ALPHA_SATURATE is not built",
+                         describe(), static_cast<u32>(eq_rgb), static_cast<u32>(eq_a),
+                         static_cast<u32>(src_rgb), static_cast<u32>(dst_rgb),
+                         static_cast<u32>(src_a), static_cast<u32>(dst_a));
+    } else if (om.alphablend_enable != 0) {
+        // The identity blend: a copy (the logic op only applies with blending off).
+        epilogue.mask = mask;
     } else {
-        DEBUG_ASSERT_MSG(om.logic_op == FramebufferRegs::LogicOp::Copy,
+        // NoOp keeps the buffer: no byte written.
+        DEBUG_ASSERT_MSG(om.logic_op == FramebufferRegs::LogicOp::Copy ||
+                             om.logic_op == FramebufferRegs::LogicOp::NoOp,
                          "sgxd: {}: logic op {} is not built", describe(),
                          static_cast<u32>(om.logic_op.Value()));
+        if (om.logic_op == FramebufferRegs::LogicOp::NoOp) {
+            mask = 0;
+        }
+        epilogue.mask = mask;
     }
+    // A fragment that keeps some of what is under it reads o0: the pass type is translucent,
+    // so the ISP neither removes what it covers nor runs it out of order.
+    const bool translucent = blend || mask != 0xf;
     // As upstream: the test runs only when enabled, the write whenever enabled and allowed.
     const u32 dcmp = om.depth_test_enable ? DepthCompare(om.depth_test_func) : 7;
     const bool dwrite = fb.allow_depth_stencil_write != 0 && om.depth_write_enable;
-    const bool uses_depth = dcmp != 7 || dwrite;
+    // The stencil: a D24S8 buffer's top byte, on chip as the depth is. The ISP's compare codes are the
+    // depth's, and its ops are in the PICA's order.
+    const auto& st = om.stencil_test;
+    const bool stencil =
+        st.enable && fb.depth_format == FramebufferRegs::DepthFormat::D24S8;
+    const bool uses_depth = dcmp != 7 || dwrite || stencil;
 
     const PAddr colour = fb.GetColorBufferPhysicalAddress();
     const PAddr depth = fb.GetDepthBufferPhysicalAddress();
@@ -3019,19 +4726,86 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                              (uses_depth && pass_depth != depth))) {
         EndPass("a draw to other buffers");
     }
+    // A geometry draw's stages take the pass's data (GeometryStage): the stored vertex outputs, the
+    // triangles, B's index list and the row tables. A pass that may not hold them ends first; the
+    // bound keeps the room small where the program has one.
+    if (pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes) {
+        const u32 vertices = pipeline.num_vertices;
+        const u32 vs_outputs = pipeline.vs_outmap_total_minus_1_a + 1;
+        const u32 gs_outputs = static_cast<u32>(std::popcount(regs.gs.output_mask.Value()));
+        const u32 tri_bytes = 3 * gs_outputs * 16;
+        const bool variable =
+            pipeline.gs_config.mode == Pica::PipelineRegs::GSMode::VariablePrimitive;
+        const u32 room = std::max(256u << 10, vertices * tri_bytes);
+        const GsCodeFacts facts = GsFacts();
+        const u32 gs_bound = facts.bound;
+        const u32 triangles =
+            gs_bound != 0 ? std::min(room, vertices * gs_bound * (tri_bytes + 6)) : room;
+        const bool tables =
+            variable || (pipeline.gs_config.mode == Pica::PipelineRegs::GSMode::FixedPrimitive &&
+                         facts.indexes_uniforms);
+        // A0 stores every vertex of the indices' range, with a table entry and an index each.
+        u32 a0_vertices = vertices;
+        if (is_indexed) {
+            DEBUG_ASSERT_MSG(gs_indices_set, "sgxd: {}: a geometry draw without its indices' copy",
+                             describe());
+            const u8* const index_cpu = gs_indices.data();
+            if (pipeline.index_array.format != 0) {
+                const auto [lo, hi] = Common::FindMinMax(
+                    std::span<const u16>{reinterpret_cast<const u16*>(index_cpu), vertices});
+                a0_vertices = hi - lo + 1u;
+            } else {
+                const auto [lo, hi] = Common::FindMinMax(std::span<const u8>{index_cpu, vertices});
+                a0_vertices = hi - lo + 1u;
+            }
+        }
+        u32 bound = triangles + a0_vertices * (vs_outputs * 16 + 4 + 2) +
+                    vertices * (tables ? 576 : 96) + (16u << 10);
+        // Past what a pass's data holds, the stored outputs, triangles and tables take memory of their own
+        // (gs_own_data), the pass's data their index lists.
+        gs_own_data = bound > SgxdBackend::PassDataBytes - (64u << 10);
+        if (gs_own_data) {
+            bound = a0_vertices * 2 + vertices * (variable ? 22 : 6) + (128u << 10) + (16u << 10);
+        }
+        if (backend.InPass() && backend.DataLeft() < bound) {
+            EndPass("the pass's data for a geometry draw");
+        }
+    } else if (backend.InPass()) {
+        // Any other draw takes its immediate vertices or widened indices, and a few KiB for its programs'
+        // images and buffers and masks. A program that indexes its uniforms copies its whole bank when they
+        // change.
+        const u32 vertex_bytes = immediate ? count * immediate_attributes * 16 : count * 2;
+        if (backend.DataLeft() < vertex_bytes + (16u << 10)) {
+            EndPass("the pass's data for a draw");
+        }
+    }
+    // A pass holds SgxdBackend::MaxDraws draws (its arrays, its recipe's layout). From here a
+    // draw adds at most four to the open pass: the viewport's mask, every tile touched for guest
+    // memory's depth, the margin's mask (each once a pass) and its own. A pass with fewer left
+    // ends, and the draw goes on in the next pass over the same target, loaded. a game
+    // Chronicles 3D draws 1048-1061 into its top screen in later scenes.
+    constexpr u32 DrawAddsAtMost = 4;
+    if (backend.InPass() && backend.PassDraws() + DrawAddsAtMost > SgxdBackend::MaxDraws) {
+        EndPass("a pass full of draws");
+    }
     if (!backend.InPass()) {
-        Surface& s = SurfaceFor(colour, width, height);
+        Surface& s = SurfaceFor(colour, width, height, fb.color_format);
         ClearedRange clear{};
-        [[maybe_unused]] const bool took = TakeClear(colour, colour + width * height * 4, clear);
-        DEBUG_ASSERT_MSG(took,
-                         "GXM: {}: the colour buffer at {:#x} has no fill pending, and loading its "
-                         "picture into a pass is not built",
-                         describe(), colour);
+        const bool took = TakeClear(colour, s.End(), clear);
         ClearedRange depth_clear{};
         pass_depth = depth;
         pass_depth_bytes = FramebufferRegs::BytesPerDepthPixel(fb.depth_format);
         pass_depth_cleared = false;
+        pass_depth_format = static_cast<u32>(fb.depth_format.Value());
+        pass_depth_used = false;
+        pass_depth_load = false;
+        pass_depth_covered = false;
+        pass_depth_guest = false;
+#ifdef VITA_DIAGNOSTICS
+        pass_ta_w = false;
+#endif
         float bg_depth = 1.0f;
+        u32 bg_stencil = 0;
         if (TakeClear(depth, depth + width * height * pass_depth_bytes, depth_clear)) {
             // The depth is the low 16 or 24 bits of each pixel; a fill of another width clears it only when its
             // pattern repeats per pixel.
@@ -3046,16 +4820,151 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                              depth_clear.value);
             pass_depth_cleared = true;
             bg_depth = static_cast<float>(depth_clear.value & mask) / static_cast<float>(mask);
+            if (fb.depth_format == FramebufferRegs::DepthFormat::D24S8) {
+                bg_stencil = depth_clear.value >> 24;
+            }
         }
+        // FCRAM: bytes the CPU wrote into the buffer since its last pass began are the
+        // picture's there, and what the passes drew is the rest; guest memory gets that
+        // first (SyncToGuest) where it lacks it, and the pass loads the guest's picture.
+        // A first draw that writes every pixel from nothing: the pass starts from nothing.
+        const bool covered =
+            draw_own_pixel == 0 && CoversTarget(is_indexed, immediate, count, width, height);
+        bool merge = false;
+        if (!took && !covered && InFcram(colour) && s.passes > 0 && !s.guest_newer &&
+            !s.tile_hashes.empty() && TileHashes(s) != s.tile_hashes) {
+            merge = s.synced_passes != s.passes;
+            s.guest_newer = true;
+        }
+        // What the pass starts from is guest memory's where another surface's later pass
+        // overlaps this one's picture, or where this buffer is new over drawn ones: guest
+        // memory gets what those passes drew first (SyncRange), and the reshaped buffers' old
+        // surfaces go there in any case.
+        const bool overlapped =
+            !took && !covered && (s.passes == 0 || !s.guest_newer) &&
+            (s.passes > 0 ? Superseded(s)
+                          : std::any_of(surfaces.begin(), surfaces.end(), [&](const Surface& o) {
+                                return &o != &s && o.passes > 0 && !o.guest_newer &&
+                                       o.addr < s.End() && s.addr < o.End();
+                            }));
+        const bool sync = overlapped;
+        const bool load_guest =
+            !took && !covered && (s.passes == 0 || s.guest_newer || overlapped);
+        const u32 bytes = width * height * s.bpp;
+        const auto before = [&] {
+            if (merge) {
+                sync_reason = "merge";
+                SyncToGuest(s);
+            }
+            if (sync) {
+                sync_reason = s.passes == 0 ? "new buffer" : "superseded";
+                SyncRange(s.addr, s.End());
+            }
+            if (load_guest && !guest_memory.IsUncached(colour, bytes)) {
+                SgxdCacheRange(memory.GetPhysicalPointer(colour), bytes, SGXD_CACHE_CLEAN,
+                               CacheSite::Textures);
+            }
+        };
         pass_surface = static_cast<std::size_t>(&s - surfaces.data());
-        backend.BeginPass(s.memory, width, height, Common::swap32(clear.value), bg_depth);
+        if (covered) {
+            backend.BeginPassOver(s.memory, width, height, bg_depth, before);
+            covered_passes++;
+        } else if (took) {
+            backend.BeginPass(s.memory, width, height,
+                              ClearColour(s.format, clear.value, clear.bytes), bg_depth, before);
+        } else if (!load_guest) {
+            // No fill: the pass draws over what the last one left.
+            backend.BeginPassLoaded(s.memory, width, height, bg_depth, nullptr, before);
+        } else {
+            // A buffer no pass drew, or one whose guest memory is newer: the guest's picture,
+            // untiled as a texture of its format's (ColorFormat numbers the first five
+            // TextureFormats).
+            const UntileFormat f = UntileFormatFor(
+                static_cast<Pica::TexturingRegs::TextureFormat>(static_cast<u32>(s.format)));
+            const SgxdBackend::UntileSource guest{colour, width, height, f.bits,
+                                                  f.code, f.swizzle, 0};
+            backend.BeginPassLoaded(s.memory, width, height, bg_depth, &guest, before);
+            if (loads++ < 4) {
+                LOG_INFO(Render, "{}: the colour buffer at {:#x} loaded from guest memory",
+                         describe(), colour);
+            }
+        }
+        backend.SetBackgroundStencil(bg_stencil);
+        pass_bg_depth = bg_depth;
+        pass_bg_stencil = bg_stencil;
+        pass_drawn_lo = pass_drawn_hi = 0;
+        if (InFcram(colour)) {
+            s.tile_hashes = TileHashes(s);
+        }
     }
-    DEBUG_ASSERT_MSG(
-        !uses_depth || pass_depth_cleared,
-        "GXM: {}: the depth buffer at {:#x} (format {}) has no fill pending, and "
-        "loading depth into a pass is not built",
-        describe(), depth, static_cast<u32>(fb.depth_format.Value()));
+    // Without a clear, the depth is what the last pass on the buffer stored, or what guest
+    // memory holds when none did (a buffer the CPU cleared, or one reshaped). A draw that
+    // writes every pixel's depth without reading any (DCMP ALWAYS, no stencil test) needs
+    // none, and the pass then knows all of it, as after a clear, and stores it for the next:
+    // Ocarina of Time 3D draws a quad at the far plane before its scene, in a pass of its own,
+    // and the scene's LESS tests would meet guest memory's depth instead. Any other
+    // draw that writes depth starts from the depth before it, as one that reads it does.
+    const bool reads_depth = dcmp != 7 || stencil;
+    if (dwrite && !reads_depth && !pass_depth_cleared && !pass_depth_load && !pass_depth_covered &&
+        CoversTarget(is_indexed, immediate, count, width, height, true)) {
+        pass_depth_covered = true;
+    }
+    if ((reads_depth || dwrite) && !pass_depth_cleared && !pass_depth_load && !pass_depth_covered) {
+        const auto it = std::find_if(depth_stores.begin(), depth_stores.end(), [&](const DepthStore& d) {
+            return d.addr == depth && d.width == width && d.height == height &&
+                   d.format == pass_depth_format;
+        });
+        pass_depth_load = true;
+        pass_depth_guest = it == depth_stores.end() || !it->valid;
+        if (pass_depth_guest) {
+            // D24S8's words are ZLS's I24ZI8S (depth the low 24 bits, stencil the top byte),
+            // untiled raw into the store (U8U8U8U8, swizzle 0); D24's the same without stencil.
+            using DF = FramebufferRegs::DepthFormat;
+            const DF df = fb.depth_format;
+            DEBUG_ASSERT_MSG(df == DF::D24S8 || df == DF::D24,
+                             "sgxd: {}: the depth buffer at {:#x} (format {}) from guest memory: "
+                             "only D24 and D24S8 are built",
+                             describe(), depth, pass_depth_format);
+            const u32 bits = df == DF::D24S8 ? 32 : 24;
+            const u32 bytes = width * height * bits / 8;
+            if (!guest_memory.IsUncached(depth, bytes)) {
+                SgxdCacheRange(memory.GetPhysicalPointer(depth), bytes, SGXD_CACHE_CLEAN,
+                               CacheSite::Textures);
+            }
+            DepthStore& d = DepthStoreFor(depth, width, height, pass_depth_format);
+            backend.Untile({depth, width, height, bits, bits == 32 ? 0x0cu : 0x98u, 0, 0},
+                           d.store.memory.gpu, d.store.width);
+            // Every tile converts to F32, drawn on or not.
+            backend.TouchAllTiles();
+            if (guest_depth_loads++ < 4) {
+                LOG_INFO(Render, "{}: the depth buffer at {:#x} ({}x{} format {}) loaded from "
+                                 "guest memory",
+                         describe(), depth, width, height, pass_depth_format);
+            }
+        }
+    }
+    pass_depth_used |= uses_depth;
 
+    static const u32 vs_probe = GxmFlagValue("vsprobe");
+    // attrprobe: the first four draws with BYTE or SHORT attributes, for UnpackInt's lanes.
+    const auto signed_attributes = [&] {
+        const auto& va = pipeline.vertex_attributes;
+        for (u32 a = 0; a <= va.max_attribute_index; a++) {
+            const auto f = va.GetFormat(a);
+            if (va.GetNumElements(a) != 0 &&
+                (f == Pica::PipelineRegs::VertexAttributeFormat::BYTE ||
+                 f == Pica::PipelineRegs::VertexAttributeFormat::SHORT)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    static const bool attr_probe = GxmFlag("attrprobe");
+    if (!immediate && pipeline.use_gs == Pica::PipelineRegs::UseGS::No &&
+        ((vs_probe != 0 && draws + 1 >= vs_probe && draws + 1 < vs_probe + 4) ||
+         (attr_probe && attr_probes < 4 && signed_attributes() && ++attr_probes))) {
+        VsProbe(is_indexed, count, describe);
+    }
     // --- the vertex stage: the loaders' attributes into the vertex program, or with a
     // geometry shader, the triangles its passes stored ---
     const VertexStage stage = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes
@@ -3197,7 +5106,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const u32 vsec_sa = std::max(vg.secondary_reg_count, vsa_words);
 
     // --- the fragment program and its SA block ---
-    const FragmentProgram& fp = FragmentProgramFor(blend_word);
+    const FragmentProgram& fp = FragmentProgramFor(epilogue);
     const Usse::GxpProgram& fg = fp.gxp;
 #ifdef VITA_DIAGNOSTICS
     // sgxd_flags drawkeys: the first thousand draws' fragment program keys (drawkeys_at=S from S s), to
@@ -3231,17 +5140,28 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         SyncLutLf();
         SyncLutProcTex();
     }
-    const u32 fsa_words = fg.uniform_floats + static_cast<u32>(fg.literals.size()) +
+    // The data container follows the resident uniforms: the memory buffer's pointer first
+    // when the program has one (as VertexSa's), the literals, the samplers' words.
+    const u32 head = fg.uniform_floats + Usse::DataHead(fg);
+    const u32 fsa_words = head + static_cast<u32>(fg.literals.size()) +
                           static_cast<u32>(fg.samplers.size()) * 4;
     SgxdBackend::Data fsa{};
     if (fsa_words != 0) {
         fsa = backend.AllocData(fsa_words * 4);
         std::memset(fsa.cpu, 0, fsa_words * 4);
         float* const fsa_f = reinterpret_cast<float*>(fsa.cpu);
+        SgxdBackend::Data fbuf{};
+        if (fg.buffer_pointer) {
+            fbuf = backend.AllocData(fg.buffer_floats * 4);
+            std::memset(fbuf.cpu, 0, fg.buffer_floats * 4);
+            const u32 pointer = fbuf.gpu + static_cast<u32>(fg.ldst_base_value);
+            std::memcpy(fsa.cpu + fg.uniform_floats * 4, &pointer, 4);
+        }
         const u8* const fs_bytes = reinterpret_cast<const u8*>(&fs_data);
         for (const UniformSource& u : fp.uniforms) {
             const u8* src = fs_bytes + u.offset;
-            float* dst = fsa_f + u.sa;
+            float* dst = u.sa < fg.uniform_floats ? fsa_f + u.sa
+                                                  : reinterpret_cast<float*>(fbuf.cpu) + u.sa;
             for (u32 e = 0; e < u.count; e++, src += u.stride, dst += 4) {
                 for (u32 c = 0; c < u.components; c++) {
                     if (u.is_int) {
@@ -3255,7 +5175,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             }
         }
         for (size_t i = 0; i < fg.literals.size(); i++) {
-            std::memcpy(fsa.cpu + Usse::LiteralSaOffset(fg.uniform_floats, static_cast<u32>(i)) * 4,
+            std::memcpy(fsa.cpu + Usse::LiteralSaOffset(head, static_cast<u32>(i)) * 4,
                         &fg.literals[i], 4);
         }
         // The LUT textures, linear and point sampled (the program computes texel centres): F32F32 (value,
@@ -3285,7 +5205,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                                  Pica::Shader::LUT_LF_ROWS, 0, LutFormatF32F32, 0,
                                                  words);
             }
-            std::memcpy(fsa.cpu + Usse::SamplerSaOffset(fg.uniform_floats,
+            std::memcpy(fsa.cpu + Usse::SamplerSaOffset(head,
                                                         static_cast<u32>(fg.literals.size()),
                                                         static_cast<u32>(i)) *
                                       4,
@@ -3319,16 +5239,42 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const float half_h = f24::FromRaw(regs.rasterizer.viewport_size_y).ToFloat32();
     p.viewport[0] = static_cast<float>(regs.rasterizer.viewport_corner.x) + half_w;
     p.viewport[1] = half_w;
-    p.viewport[2] = static_cast<float>(regs.rasterizer.viewport_corner.y) + half_h;
-    p.viewport[3] = half_h;
+    // The PICA's window y runs up from the target's last memory row, and the surface's rows are the memory's: the corner is
+    // mirrored as upstream's y-down Vulkan path mirrors it (FramebufferHelper, flip_rect).
+    p.viewport[2] =
+        static_cast<float>(height) - static_cast<float>(regs.rasterizer.viewport_corner.y) - half_h;
+    // NDC y +1 is the target's first memory row (the top of the PICA's window, whose y runs
+    // up): the y scale is negative. With it positive every draw was mirrored along the rows.
+    p.viewport[3] = -half_h;
     p.viewport[4] = 0.0f;
     p.viewport[5] = 1.0f;
     p.primitive = primitive;
 
-    const u32 isp = (blend ? 1u : 0u) << 25 | dcmp << 22 | (dwrite ? 0u : 1u << 20) | 1u << 9;
+    // ISP A: PASSTYPE, DCMP, DWRITEDIS, BPRES. Translucent (1) with a blend or a write mask, else opaque
+    // (0); a program that kills is TRANSPT (2) or FASTPT (4): its first phase waits for the ISP's
+    // feedback, which the opaque and translucent types never give.
+    u32 pass_type = translucent ? 1u : 0u;
+    if (fg.uses_discard) {
+        pass_type = translucent ? 2u : 4u;
+    }
+    const u32 isp = pass_type << 25 | dcmp << 22 | (dwrite ? 0u : 1u << 20) | 1u << 9 |
+                    (stencil ? SGXD_RECIPE_ISP_CPRES | st.reference_value : 0u);
+    const u32 ispc =
+        !stencil ? 0u
+                 : DepthCompare(st.func) << 25 |
+                       static_cast<u32>(st.action_stencil_fail.Value()) << 22 |
+                       static_cast<u32>(st.action_depth_fail.Value()) << 19 |
+                       static_cast<u32>(st.action_depth_pass.Value()) << 16 |
+                       st.input_mask << 8 |
+                       (fb.allow_depth_stencil_write != 0 ? static_cast<u32>(st.write_mask) : 0u);
     const SgxdRecipeDraw draw{0, stage.count, isp, SGXD_R_FPRIM,
-                              CullMode(regs.rasterizer.cull_mode), 0, nullptr};
+                              CullMode(regs.rasterizer.cull_mode), 0, nullptr, ispc};
     backend.Draw(draw, p);
+    if (const auto [lo, hi] = DrawnRows(); lo < hi) {
+        const bool first = pass_drawn_lo >= pass_drawn_hi;
+        pass_drawn_lo = first ? lo : std::min(pass_drawn_lo, lo);
+        pass_drawn_hi = first ? hi : std::max(pass_drawn_hi, hi);
+    }
 #ifdef VITA_DIAGNOSTICS
     if (backend.PassDraws() <= 3 && GxmFlag("perflog")) {
         std::string units;

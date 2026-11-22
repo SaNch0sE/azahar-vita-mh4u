@@ -85,7 +85,7 @@ enum class Op : uint8_t {
     MadI32,
     PackS16,
     Mad2,
-    UnpackU8,
+    UnpackInt,
     Sta32,
     Idf,
 };
@@ -189,9 +189,11 @@ public:
     void MadI16(Reg dst, Reg src0, Reg src1, IOp src2);
     void MadI32(Reg dst, Reg src0, uint8_t imm, Reg src2);
     void PackS16(Reg dst, Reg src, uint8_t comp, Pred pred = Pred::None);
-    /// Byte `byte` (0-3) of the 32-bit register `src` into the register `dst`, as an
-    /// integer-valued float (VPCK U8 to F32 without the scale flag, which writes lane x only).
-    void UnpackU8(Reg dst, Reg src, uint8_t byte);
+    /// Lane `select` of the 64-bit register pair at `src` into the register `dst`, as an
+    /// integer-valued float (VPCK to F32 without the scale flag, which writes lane x only):
+    /// `format` is VPCK's source format, 0 U8 and 1 S8 (select a byte, 0-3 of the even
+    /// register) or 4 S16 (select a half, 0-3 over the pair).
+    void UnpackInt(Reg dst, Reg src, uint8_t select, uint8_t format = 0);
 
     // --- lowering ---
     /// Where virtual quads may live, in spill order. Without a call, the temporaries.

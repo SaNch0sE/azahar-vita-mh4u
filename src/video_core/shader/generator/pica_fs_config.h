@@ -163,6 +163,10 @@ struct TextureConfig {
         BitField<12, 3, Pica::TexturingRegs::FogMode> fog_mode;
         BitField<15, 1, u32> fog_flip;
         BitField<16, 1, u32> shadow_texture_orthographic;
+        // sgxd only: the units whose texel is the pixel's own colour in the buffer the draw
+        // writes, texel for pixel (RasterizerSgxd::OwnPixelUnits), set by the rasterizer: the
+        // program reads the tile's colour (o0) for them and samples nothing.
+        BitField<26, 3, u32> own_pixel;
     };
     std::array<TextureBorder, 3> texture_border_color{};
     std::array<TevStageConfigRaw, 6> tev_stages{};

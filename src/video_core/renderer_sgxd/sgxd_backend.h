@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -66,22 +67,37 @@ public:
     /// ends (DrawHang), to test hang recovery.
     static inline std::atomic<bool> hang_test{false};
 
-    /// Draws a pass takes at most.
-    static constexpr u32 MaxDraws = 256;
+    /// Draws a pass takes at most, each about 200 bytes of its recipe's layout
+    /// (RasterizerSgxd::Draw ends a full pass).
+    static constexpr u32 MaxDraws = 1024;
 
     /// USSE code: its offset from code base cb (0 vertex, 1 pixel).
     u32 PlaceCode(unsigned cb, std::span<const u64> words);
-    /// A PDS program's GPU address, the same for the same words.
-    u32 PlacePds(const SgxdPdsProgram& program);
+    /// PlaceCode for a program of several phases: each phase's opening PHAS but the last's
+    /// (an immediate PHAS at phase_starts[k]) gets the next phase's execution address, the
+    /// DOUTU0 EXE field's instruction index from the code base, and the temps in fours.
+    u32 PlaceCodePhased(unsigned cb, std::vector<u64> words, std::span<const u32> phase_starts,
+                        u32 temps);
+    /// A PDS program's GPU address, the same for the same words while it lasts: fixed, for
+    /// good (a program whose address is kept); otherwise until the flipping half it is in is
+    /// reused, at a pass start (OpenPass).
+    u32 PlacePds(const SgxdPdsProgram& program, bool fixed = false);
 
     struct Data {
         u8* cpu;
         u32 gpu;
     };
     Data AllocData(u32 bytes, u32 align = 16);
+    [[nodiscard]] u32 DataLeft() const {
+        const u32 at = (data_used + 15) & ~15u;
+        return at < data_end ? data_end - at : 0;
+    }
 
-    /// A host surface: width x height A8B8G8R8 pixels, rows width apart.
+    /// A host surface: width x height A8B8G8R8 pixels, rows width apart; the first fit of what
+    /// FreeSurface gave back.
     Data AllocSurface(u32 width, u32 height);
+    /// A surface no longer used (a colour buffer the guest reshaped), after its last read.
+    void FreeSurface(const Data& surface, u32 width, u32 height);
     /// The LUT texture's rows, in the shared block: Pica::Shader::LUT_LF_ROWS rows of 256 F32F32
     /// texels, the rasterizer's to manage.
     [[nodiscard]] Data LutRows() const;
@@ -91,8 +107,9 @@ public:
     [[nodiscard]] Data LutRgbaRows() const;
 
     /// Opens a pass on a surface, under the recipe for its size. The background is clear
-    /// (A8B8G8R8) at depth, what a fill left pending.
-    void BeginPass(const Data& target, u32 width, u32 height, u32 clear, float depth);
+    /// (A8B8G8R8) at depth, what a fill left pending. before: as BeginPassLoaded's.
+    void BeginPass(const Data& target, u32 width, u32 height, u32 clear, float depth,
+                   const std::function<void()>& before = {});
     [[nodiscard]] bool InPass() const {
         return in_pass;
     }
@@ -184,6 +201,23 @@ public:
     /// Guest textures' host copies (RasterizerSgxd's texture cache), from a block of their own:
     /// bytes at a 4 KiB multiple, the first fit of what FreeTexture gave back.
     Data AllocTexture(u32 bytes);
+    /// What AllocTexture calls while the pool has no room: frees a texture and returns true, or
+    /// returns false when none can go (the rasterizer's cached textures, least recently used).
+    void SetTextureEvictor(std::function<bool()> evictor) {
+        texture_evictor = std::move(evictor);
+    }
+    /// What OpenPass calls as a pass takes the room [begin, end) of AllocData's ring (GPU
+    /// addresses), the passes that wrote there done, before the pass writes over it: the
+    /// rasterizer keeps what a later draw still reads from there (RasterizerSgxd::KeepGsRows).
+    void SetRoomTaken(std::function<void(u32 begin, u32 end)> taken) {
+        room_taken = std::move(taken);
+    }
+    [[nodiscard]] const u8* SharedAt(u32 gpu) const;
+    u32 TexturePoolLive() const;
+    /// Memory from the textures pool that is never freed (vertex arrays built once, palettes,
+    /// the noise table): from the pool's end down, apart from the textures it would split.
+    Data AllocTextureFixed(u32 bytes);
+    [[nodiscard]] bool TextureFits(u32 bytes) const;
     void FreeTexture(const Data& texture, u32 bytes);
     /// poolcheck (diagnostics): each page of the textures pool in use as the GPU reads it (a
     /// PTLA copy to a probe page) against the CPU's view; logs the pages that differ.
@@ -205,6 +239,39 @@ public:
         bool byte_copy = false;
     };
     static constexpr u32 UntileSide = 1024;
+    /// Opens a pass on a surface that keeps its picture instead of a clear: the pass's first
+    /// draw blits the surface onto itself, or with guest, the guest's tiled picture (untiled
+    /// into the pass's data first), texel for pixel. before runs once the pass is open, ahead
+    /// of the load: side renders (TileBack) that must land in guest memory first.
+    void BeginPassLoaded(const Data& target, u32 width, u32 height, float depth,
+                         const UntileSource* guest, const std::function<void()>& before = {});
+    /// Opens a pass whose first draw writes every pixel: no clear and no load.
+    void BeginPassOver(const Data& target, u32 width, u32 height, float depth,
+                       const std::function<void()>& before = {});
+    /// The open pass's background stencil, a D24S8 clear's top byte (ISP_BGOBJ): 0 at each
+    /// OpenPass.
+    void SetBackgroundStencil(u32 stencil) {
+        sgxd_recipe_set_background_stencil(&current->recipe, static_cast<uint8_t>(stencil));
+    }
+    /// A depth buffer kept across passes: width x height F32 samples (whole 32x32 tiles, rows
+    /// width apart), then a stencil byte a sample in the same layout when stencil.
+    struct DepthStore {
+        Data memory;
+        u32 width, height;
+        bool stencil;
+    };
+    /// Where a pass's depth starts from: a clear, the store's F32 depth and stencil bytes, or
+    /// a guest D24S8 (D24) buffer's words untiled into the store (ZLS I24ZI8S).
+    enum class DepthLoad { None, Store, Guest };
+    /// The open pass's depth (and stencil) loaded from store at its start as load says, and
+    /// stored there at its end (ZLS, sgxd_recipe_set_zls). OpenPass turns it off.
+    void SetDepthStore(const DepthStore& store, DepthLoad load);
+    /// A quad over the open pass's whole target that the ISP rejects (DCMP NEVER): every tile
+    /// holds an object, so none stays EMPTY and skips its ZLS load and store.
+    void TouchAllTiles();
+    /// store's samples as a clear leaves them, depth z and stencil, through the PTLA: a tile no
+    /// primitive touches neither loads nor stores.
+    void FillDepthStore(const DepthStore& store, float z, u32 stencil);
     /// UntileSource::code for ETC1 (the texture unit's ETC1, whose blocks the untile reorders
     /// first).
     static constexpr u32 UntileEtc1 = 0x84;
@@ -255,9 +322,39 @@ public:
     void StreamOut(const SgxdRecipeDrawPrograms& programs, u32 count, StreamStage stage, bool wait);
     void FlushStreamOut(bool wait);
 
-    SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height);
+    /// mirror: the texel is read converted with its lanes mirrored (A, B, G, R) and packed
+    /// again, for a pack that stores the channels in the other order (A4R4G4B4 as RGBA4).
+    /// source_stride: the source's rows apart in texels, 0 for width.
+    /// scale_x, scale_y (1 or 2): each output pixel is the average of scale_x x scale_y
+    /// source texels (the display transfer's ScaleX and ScaleXY), a bilinear read between
+    /// them; the source then has width * scale_x columns and height * scale_y rows.
+    SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height,
+                                        bool mirror = false, u32 source_stride = 0,
+                                        u32 scale_x = 1, u32 scale_y = 1);
     void Blit(const Data& source, u32 width, u32 height, const Store& dest, u32* ta_us = nullptr,
               u32* d3_us = nullptr);
+    /// The same into a PICA-tiled picture: one pass on target as a PICA colour buffer (as
+    /// BeginPassLoaded opens it), the source read as its load reads, scaled.
+    void TransferTiledFromGuest(const PicaTarget& target, const UntileSource& source, u32 scale_x,
+                                u32 scale_y, u32* ta_us = nullptr, u32* d3_us = nullptr);
+    /**
+     * The untile's inverse: a pass's width x height surface (A8B8G8R8, rows width apart) written
+     * into dest as the PICA stores a colour buffer, in 8x8 tiles row after row with Morton
+     * order inside, x first, each pixel `bytes` wide in pack (an SGXD_RECIPE_PACK_*; mirror as
+     * Blit's). The PBE's TWIDDLED layout is Morton order y first: a PICA tile is an 8x8 block of
+     * it transposed, and the tiles in memory order fill a square twiddled target's blocks in its
+     * own order. So the picture goes out in square targets (a side render each, to completion),
+     * one quad a tile. Inside a pass or not; width and height multiples of 8. The PBE writes
+     * whole 32x32 tiles: the tiles past the last multiple of 16 render into a square of their
+     * own, which the CPU copies to dest.cpu.
+     */
+    void TileBack(const Data& surface, u32 width, u32 height, const Data& dest, u32 pack, bool mirror,
+                  u32 bytes);
+    /// Memory for a CPU copy of what a side render wrote (TileBack): one buffer in the textures
+    /// pool, grown as needed, valid until the next call. Side renders run to completion, so
+    /// the last copy's reads are done by then. Not the pass data: a pass opening writes back
+    /// several surfaces (sm3dl's passed 2 MiB).
+    Data Scratch(u32 bytes);
 
 private:
     /// One target size's recipe and its block: the layout, the background colour word, then
@@ -293,14 +390,13 @@ private:
         u32 first, count;
         u32 tex1[4];
     };
-    /// A render of its own under the side recipe, sent ahead of the open pass's:
-    /// the blit's quads in vertices (PutQuad) into a width x height U8888 target at dest_gpu,
-    /// rows dest_stride pixels apart, clipped to its tiles. With merge, the quads are
-    /// PutMergeQuad's, with a coordinate for each texture. With twiddled, the target is
-    /// stored in the PBE's TWIDDLED layout.
+    /// A render of its own under the side recipe, sent ahead of the open pass's: the quads in
+    /// vertices into a width x height target of pack at dest_gpu, rows dest_stride pixels apart.
+    /// merge: PutMergeQuad's quads, a coordinate for each texture. twiddled: the PBE's TWIDDLED
+    /// layout.
     void SideRender(const Data& vertices, std::span<const SideDraw> list, u32 dest_gpu,
                     u32 dest_stride, u32 width, u32 height, bool merge = false,
-                    bool twiddled = false);
+                    bool twiddled = false, u32 pack = SGXD_RECIPE_PACK_U8888);
     void UntileEtc1Blocks(const UntileSource& source, u32 dest_gpu, u32 dest_stride,
                           bool swizzled);
     void UntileEtc1A4Merge(const UntileSource& source, u32 colour_gpu, u32 colour_stride,
@@ -322,6 +418,8 @@ private:
     int surfaces_block{-1};
     u8* textures{};    // the guest textures' host copies
     u32 textures_used{};
+    /// AllocTextureFixed's lowest byte: its blocks run down from the pool's end.
+    u32 textures_fixed{};
     int textures_block{-1};
     struct FreeRange {
         u32 offset, bytes;
@@ -330,6 +428,10 @@ private:
         u32 fence = 0;
     };
     std::vector<FreeRange> textures_free;
+    std::vector<FreeRange> surfaces_free;
+    /// TileBack's quads by surface size (width << 16 | height), from the textures' block: the
+    /// same every time, so built once.
+    std::unordered_map<u32, Data> tileback_vertices;
     /// An untile's vertices by its geometry (GeometryKey): a texture of a size seen before reuses
     /// them. In the textures pool: ETC1 uploads inside a pass filled the pass data.
     std::unordered_map<u64, Data> geometry_vertices;
@@ -348,7 +450,25 @@ private:
     };
     std::vector<PlacedCode> placed_code;
     u32 pds_begin{}, pds_used{}, pds_end{};
+    u32 pds_fixed_used{}, pds_half{};
+    u64 pds_flips{};
+    /// Each half's last reader: FenceAll when the arena flipped away from it (its programs
+    /// are not reused after that).
+    std::array<u32, 2> pds_fence{};
+    /// Resets every core's data mover, shader units and caches together, the GPU idle: the PDS
+    /// forgets the programs it ran (docs/sgxd/pds.md). why: for the stop's message.
+    void ResetCores(const char* why);
+    void FlipPdsHalf();
     u32 data_begin{}, data_used{}, data_end{};
+    u32 data_peak{}; ///< perflog: the largest pass data logged
+    Data scratch{};    ///< Scratch's buffer
+    struct DataSite {
+        uintptr_t caller;
+        u32 bytes;
+        u32 count;
+    };
+    std::array<DataSite, 16> data_sites{}; ///< the open pass's AllocData by caller
+    u32 scratch_bytes{};
     /// The pass data's slots, in turn, each with its last pass's fence. The guest waits for
     /// P3D before its next command list, so only passes of one list follow each other unwaited.
     static constexpr u32 DataSlots = 2;
@@ -367,7 +487,10 @@ private:
     struct Footprint {
         u32 lo, hi;
     };
-    Footprint pass_target{}, pass_source{};
+    Footprint pass_target{}, pass_source{}, pass_zls{};
+    Data tileback_tail{}; ///< TileBack's square for the tiles past its last whole one
+    std::function<bool()> texture_evictor;
+    std::function<void(u32, u32)> room_taken;
     /// Our recipe whose 3D is pending, or null (none, or the present's).
     [[nodiscard]] Recipe* Pending() const;
     /// Why a pending 3D is finished by a list of its own rather than the next render list's
@@ -390,7 +513,10 @@ private:
     /// gxm_flags tracelog: the ended lists' GPU stamps as events.
     void TraceStamps();
     void Fault(const Recipe& r, const char* failed);
-    std::unordered_map<std::string, u32> pds_by_words;
+#ifdef VITA_DIAGNOSTICS
+    void WriteCode();
+#endif
+    std::unordered_map<std::string, u32> pds_by_words, pds_fixed_by_words;
 
     bool in_pass{};
     std::vector<SgxdRecipeDraw> draws;
@@ -403,6 +529,32 @@ private:
     std::vector<CachedRange> cached;
     std::vector<Store> stores;   // guest memory the open pass writes
     u32 passes{};
+    /// gxm_flags perflog: each target's passes, draws and GPU time over a second. A list's TA is
+    /// known when the next pass ends, the 3D it waited for one pass before that.
+    struct TargetTime {
+        u32 passes, draws;
+        u64 ta_us, d3_us;
+    };
+    std::unordered_map<u64, TargetTime> target_times;
+    std::array<u64, 2> ended_targets{};
+    std::string pass_note;
+    int eot_mix_variant = -1; ///< ProbeMixedEot's, for OpenPass
+public:
+    /// sgxd_flags eotmixreal=V+1: the 2x passes end their tiles with sgxd_recipe_pica_eot_mix's
+    /// variant V (the guest's 1x copy stored by the same end of tile), -1 for none.
+    int eot_mix_real = -1;
+private:
+    std::array<std::string, 2> ended_notes;
+    u32 slow_passes{};
+    std::array<u32, static_cast<std::size_t>(FinishWhy::Count)> finishes{};
+    u64 target_times_start{};
+    void TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us);
+    /// gxm_flags perflog: the CPU's spins on the GPU by the site that waited (string literals),
+    /// from sgxd_wait_us_total's growth across each; what no site took is "elsewhere".
+    std::unordered_map<const char*, std::pair<u32, u64>> wait_sites;
+    u64 wait_sites_mark{};
+#endif
+    void WaitSite(const char* site, u64 before);
 
     bool blit_ready{};
     u32 blit_vertex{}, blit_fragment{}, untile_fragment{}, merge_vertex{}, merge_fragment{};

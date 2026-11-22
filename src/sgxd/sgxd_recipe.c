@@ -551,9 +551,11 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
 
     uint32_t *L = r->offset;
     uint32_t o;
+    // The shared buffer's recipes have no page table or pages of their own.
+    const int own_pb = sgxd_recipe_pb.last == 0;
     L[SGXD_R_PT] = 0;
-    L[SGXD_R_PAGES] = 0x40000;
-    o = 0x40000 + pages * 0x1000;
+    L[SGXD_R_PAGES] = own_pb ? 0x40000 : 0;
+    o = own_pb ? 0x40000 + pages * 0x1000 : 0;
     for (unsigned c = 0; c < 4; c++) {
         L[SGXD_R_RGN0 + c] = o;
         o += r->rgn_size;
@@ -571,9 +573,9 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     o += 256;
     o = (o + 0xfff) & ~0xfffu;
     L[SGXD_R_FB] = o;
-    o += W * H * 4;
+    o += sgxd_recipe_external_fb ? 0 : W * H * 4;
     L[SGXD_R_DEPTH] = o;
-    o += W * H * 4;
+    o += sgxd_recipe_external_fb ? 0 : W * H * 4;
     L[SGXD_R_STREAM] = o;
     {
         const uint32_t s = ((draw_words(r) * ndraws + 5) * 4 + 0xff) & ~0xffu;
@@ -609,7 +611,8 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     o += 0x400;
     L[SGXD_R_END] = o;
 
-    r->shared_pb = sgxd_recipe_pb.last != 0;
+    r->shared_pb = !own_pb;
+    r->fb_external = sgxd_recipe_external_fb;
     if (r->shared_pb) {
         r->req_base = sgxd_recipe_pb.req_base;
         r->pt = sgxd_recipe_pb.pt;
@@ -635,6 +638,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     r->global_list = 0x10000 | gbl;
     r->bgobjtag = (((sgxd_recipe_va(r, SGXD_R_BGREC) - r->req_base) >> 4) & 0xffffffu) | 2u << 24;
     r->bgobjdepth = fbits(1.0f);
+    r->bgobj = 0x300;
 
     r->pbe[0] = SGXD_RECIPE_PACK_U8888;
     r->pbe[1] = sgxd_recipe_va(r, SGXD_R_FB);
@@ -704,6 +708,7 @@ static void put_page_list(const SgxdRecipe *r, uint8_t *memory) {
 }
 
 SgxdRecipePb sgxd_recipe_pb;
+int sgxd_recipe_external_fb;
 // The shared buffer's free lists are loaded in the DPM: the TA's, the 3D's (build order).
 static int pb_ta_loaded, pb_3d_loaded;
 
@@ -776,6 +781,37 @@ void sgxd_recipe_set_background_depth(SgxdRecipe *r, void *memory, float z) {
     bg[12] = bg[14] = bg[16] = fbits(z);
 }
 
+void sgxd_recipe_set_background_stencil(SgxdRecipe *r, uint8_t stencil) {
+    r->bgobj = (r->bgobj & ~0xffu) | stencil;
+}
+
+void sgxd_recipe_set_zls(SgxdRecipe *r, uint32_t depth, uint32_t stencil, int load, int store) {
+    memset(r->zls, 0, sizeof(r->zls));
+    if (depth == 0) {
+        return;
+    }
+    // ZLSCTL: F32Z (format 0) or I24ZI8S (1, load format bits 23..21) loads, F32Z stores,
+    // linear, ZLSEXTENT + 1 tiles a row, EXTERNALZBUFFER (bit 20); ZLOADEN (14) and FORCEZLOAD
+    // (1), ZSTOREEN (18) and FORCEZSTORE (2), and for the stencil SLOADEN (13) and SSTOREEN
+    // (17). The bases are offsets from BIF_ZLS_REQ_BASE, which the kick sets to req_base; the
+    // stencil's carry ENABLE (bit 0). I24ZI8S loads its stencil from the word, so
+    // STENCIL_LOAD_BASE stays off.
+    const uint32_t extent = (r->width + 31) / 32 - 1;
+    uint32_t ctl = 1u << 20 | extent << 3;
+    if (load) {
+        ctl |= 1u << 14 | 1u << 1 | (stencil ? 1u << 13 : 0) | (load == 2 ? 1u << 21 : 0);
+    }
+    if (store) {
+        ctl |= 1u << 18 | 1u << 2 | (stencil ? 1u << 17 : 0);
+    }
+    r->zls[0] = ctl;
+    r->zls[1] = r->zls[2] = depth - r->req_base;
+    if (stencil) {
+        r->zls[3] = load == 2 ? 0 : (stencil - r->req_base) | 1u;
+        r->zls[4] = (stencil - r->req_base) | 1u;
+    }
+}
+
 void sgxd_recipe_write_vertex_sa(const SgxdRecipe *r, void *memory_, const float sa[4]) {
     uint32_t *words = (uint32_t *)((uint8_t *)memory_ + r->vertex_sa);
     for (unsigned n = 0; n < 4; n++) {
@@ -818,7 +854,8 @@ static void write_draw(const SgxdRecipe *r, uint8_t *memory, unsigned n, const S
     const uint32_t clip = d->clip;
     const unsigned fprim = g ? SGXD_R_FPRIM : d->fprim;
     uint32_t state[24] = {
-        0xdfff, d->isp, 0, 0x0e000000, d->isp, 0, 0x0e000000, ptr(r, SGXD_R_FSEC),
+        0xdfff, d->isp, 0, d->ispc ? d->ispc : SGXD_RECIPE_ISP_C, d->isp, 0,
+        d->ispc ? d->ispc : SGXD_RECIPE_ISP_C, ptr(r, SGXD_R_FSEC),
         pixel_size_word(r, fprim) | msbs(r, SGXD_R_FSEC, fprim), ptr(r, fprim),
         clip_x(r, clip), clip_y(r, clip),
         fbits(W / 2.0f), fbits(W / 2.0f), fbits(H / 2.0f), fbits(H / 2.0f), fbits(0.5f),
@@ -895,7 +932,9 @@ void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
     const uint32_t *L = r->offset;
     const uint32_t W = r->width, H = r->height;
     memset(memory, 0, L[SGXD_R_END]);
-    fill(memory, L[SGXD_R_PAGES], SGXD_RECIPE_SENTINEL, r->pages * 0x1000);
+    if (!r->shared_pb) {
+        fill(memory, L[SGXD_R_PAGES], SGXD_RECIPE_SENTINEL, r->pages * 0x1000);
+    }
     // The region arrays start with the sentinel, which shows a header the TE's init did not write.
     fill(memory, L[SGXD_R_RGN0], SGXD_RECIPE_SENTINEL, L[SGXD_R_EXTZ] - L[SGXD_R_RGN0]);
     sgxd_recipe_restage(r, memory);
@@ -1204,8 +1243,9 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
         {0x4514, sgxd_recipe_va(r, SGXD_R_RGN2)}, {0x4518, sgxd_recipe_va(r, SGXD_R_RGN3)},
         {0x451c, r->rgn_size}, {0x0414, 0}, {0x0418, 1}, {0x041c, 0x1e3ce508},
         {0x0420, 0x1e3ce508}, {0x050c, sgxd_recipe_va(r, SGXD_R_EXTZ)}, {0x0424, 0xe9},
-        {0x042c, 0}, {0x044c, 0}, {0x0480, 0}, {0x0484, 0}, {0x0488, 0}, {0x048c, 0},
-        {0x0490, 0}, {0x04b8, r->bgobjdepth}, {0x04bc, 0x300}, {0x04c4, r->bgobjtag},
+        {0x042c, 0}, {0x044c, 0}, {0x0480, r->zls[0]}, {0x0484, r->zls[1]},
+        {0x0488, r->zls[2]}, {0x048c, r->zls[3]}, {0x0490, r->zls[4]},
+        {0x04b8, r->bgobjdepth}, {0x04bc, r->bgobj}, {0x04c4, r->bgobjtag},
         {0x04c8, 0x88}, {0x04cc, 0x188}, {0x04dc, 8}, {0x0520, r->mtile1},
         {0x0524, r->mtile2}, {0x0528, r->stride}, {0x0148, 0},
         {0x0a5c, sgxd_recipe_va(r, SGXD_R_PIXEV)}, {0x0a60, 3}, {0x0a64, 0x4000}, {0x0ae8, 0},

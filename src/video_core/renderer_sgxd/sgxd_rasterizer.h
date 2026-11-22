@@ -5,6 +5,8 @@
 #pragma once
 
 #include <array>
+#include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -18,6 +20,10 @@
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
 #include "video_core/shader/generator/profile.h"
+
+namespace Pica {
+class ShaderEngine;
+}
 
 namespace Pica {
 class PicaCore;
@@ -116,13 +122,31 @@ private:
         u32 order; // when it was recorded, for replacing the oldest
     };
 
-    /// A colour buffer's host surface.
+    /// A colour buffer's host surface: A8B8G8R8 whatever the guest's format, which sets its
+    /// bytes in guest memory.
     struct Surface {
         PAddr addr;
         u32 width;
         u32 height;
         SgxdBackend::Data memory;
         u32 passes;
+        Pica::FramebufferRegs::ColorFormat format = Pica::FramebufferRegs::ColorFormat::RGBA8;
+        u32 bpp = 4; ///< the guest's bytes a pixel
+        [[nodiscard]] PAddr End() const {
+            return addr + width * height * bpp;
+        }
+        /// A DMA or display transfer wrote its guest memory after its last pass: a pass that
+        /// keeps its picture loads the guest's.
+        bool guest_newer = false;
+        /// The passes guest memory holds (SyncToGuest); ~0 when a write-back of an older
+        /// surface over it has overwritten them there.
+        u32 synced_passes = 0;
+        /// When its last pass ended, in the order of all surfaces' passes: where surfaces
+        /// overlap, the later pass drew the bytes both cover.
+        u64 generation = 0;
+        /// FCRAM only: each 8x8 tile's hash of guest memory as the last pass began, or as
+        /// SyncToGuest left it. A tile whose bytes changed since, the CPU wrote.
+        std::vector<u64> tile_hashes;
     };
 
     /// A guest texture's host copy, untiled on the GPU into A8B8G8R8, rows in the PICA's order (row 0
@@ -140,6 +164,8 @@ private:
         u32 part_bytes;   // a part's guest bytes: the levels back to back, or a face
         u32 untiled_pass; // the pass that last untiled it (cached FCRAM: each that samples it)
         bool dirty;       // a fill, DMA or transfer wrote over the guest bytes
+        bool alpha_one = false; // a surface without alpha, read as a texture (swizzle bit 2)
+        u32 last_used = 0;      // the pass count when a draw last took it (eviction order)
         /// A non-power-of-two 2D texture's rows this many texels apart (a multiple of 32); 0 for a
         /// power-of-two chain.
         u32 stride = 0;
@@ -171,8 +197,21 @@ private:
         bool is_int;
     };
 
-    /// A fragment program with its blend, placed, and its pixel primary PDS (which holds no
-    /// address but the code's, so one serves every draw).
+    /// What follows a fragment program's own code: the pack to the output, or the pack and the blend.
+    struct Epilogue {
+        u64 blend = 0;      ///< the blend SOP2, 0 for none
+        /// The bytes of o0 written (bit 0 R): other than 0xf with a blend only for R, G and B masked apart.
+        u8 mask = 0xf;
+        bool constant = false; ///< the blend's source is `colour` (LIMM into pa0), not the fragment's
+        u32 colour = 0;     ///< the PICA's blend constant, R in the low byte
+        /// The split blend's alpha word (BlendSplitWords), 0 for none: blend is then its colour SOP3.
+        u64 split_alpha = 0;
+        u64 Key() const {
+            return (blend ^ split_alpha * 0xc2b2ae3d27d4eb4full) ^
+                   (u64{mask} << 8 | u64{constant} << 12 | u64{colour} << 16) *
+                       0x9e3779b97f4a7c15ull;
+        }
+    };
     struct FragmentProgram {
         std::vector<UniformSource> uniforms;
         Usse::GxpProgram gxp;
@@ -181,7 +220,7 @@ private:
         u32 fprim;
         u32 fprim_units;
         u32 pixel_pa;
-        u64 blend;         ///< the blend word its code ends with
+        Epilogue epilogue; ///< what its code ends with
         u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
         bool tier2_queued; ///< sent to the second tier (or never to be)
     };
@@ -191,7 +230,31 @@ private:
     void RecordClear(const ClearedRange& range);
     void ForgetClears(PAddr start, PAddr end);
     bool TakeClear(PAddr start, PAddr end, ClearedRange& out);
-    Surface& SurfaceFor(PAddr addr, u32 width, u32 height);
+    Surface& SurfaceFor(PAddr addr, u32 width, u32 height,
+                        Pica::FramebufferRegs::ColorFormat format);
+    /// Each 8x8 tile's hash of s's guest memory.
+    std::vector<u64> TileHashes(const Surface& s);
+    /**
+     * Writes what s's passes drew into its guest memory, as the PICA stores it (TileBack),
+     * inside an open pass. The PICA renders into guest memory, so a texture of another shape
+     * or format over it, or the CPU, reads that. In FCRAM, the tiles the CPU wrote since the
+     * last pass began (tile_hashes) keep the CPU's bytes, and the surface, which lacks them,
+     * is guest_newer from then on.
+     */
+    void SyncToGuest(Surface& s);
+    /// FCRAM: whether the CPU wrote into s since its last pass began. If it did, guest memory
+    /// takes the rest of what the passes drew (SyncToGuest) and is s's picture from then on.
+    bool CpuWroteInto(Surface& s);
+    /// Whether a surface whose last pass ended later overlaps s: s is then not all its own
+    /// picture any more.
+    bool Superseded(const Surface& s) const;
+    /**
+     * Guest memory over [start, end) made what the passes left there: every drawn surface
+     * overlapping it written back, the earliest first, so where two overlap the later pass's
+     * bytes stay. A surface a later one overlaps is guest_newer from then on. Inside an open
+     * pass, or with none open (a DMA's source).
+     */
+    void SyncRange(PAddr start, PAddr end);
     void EndPass(const char* why);
     /// A draw of the loaders' vertices, or of the immediate-mode batch (`count` vertices of
     /// `immediate_attributes` x 4 floats).
@@ -230,6 +293,62 @@ private:
     /// through two stream-out renders, then the triangles as the draw's vertices (the SGX has no
     /// geometry stage, so the geometry program runs as a vertex program that stores what it emits).
     VertexStage GeometryStage(bool is_indexed, const Describe& describe);
+    /// gxm_flags vsprobe=N: draw N's vertex program run with StoreOutputs and upstream's
+    /// interpreter run on the CPU for the same vertices (up to 64), every output component
+    /// that differs logged. A draw without a geometry shader or immediate vertices.
+    void VsProbe(bool is_indexed, u32 count, const Describe& describe);
+    /// Whether a draw writes every pixel of a width x height target whatever was there: two
+    /// triangles (4 or 6 vertices, positions from upstream's interpreter) covering it whole,
+    /// neither culled nor clipped, and an output merger that takes nothing from the target
+    /// (full colour mask, no blend, alpha, depth or stencil test, no scissor inside it). A
+    /// pass it opens starts from nothing: no load, and no write-backs for one.
+    /// `lines` lines of `line` bytes, src_stride apart, to dst_stride apart through the PTLA.
+    bool CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_stride, u32 line, u32 lines);
+    /// `depth`: whether the draw writes every pixel's depth instead, whatever it does to the
+    /// colour, its depth test ALWAYS or off.
+    bool CoversTarget(bool is_indexed, const float* immediate, u32 count, u32 width, u32 height,
+                      bool depth = false);
+    /// A draw of `count` vertices (4 or 6) run through the vertex program on the CPU; false when
+    /// its index list is not in memory. Once a draw.
+    bool QuadVertices(bool is_indexed, const float* immediate, u32 count,
+                      std::array<Pica::OutputVertex, 6>& out);
+    bool RunQuadVertices(bool is_indexed, const float* immediate, u32 count,
+                         std::array<Pica::OutputVertex, 6>& out);
+#ifdef VITA_DIAGNOSTICS
+    /// sgxd_flags dumptex: each level's guest bytes and host copy to host0, named by its guest address
+    /// (sgxd_dump.cpp). `bits`: the guest format's bits a texel.
+    void DumpTexture(const Texture& tex, u32 bits, bool split);
+    /// sgxd_flags `picdump=N`: after each of the first two display transfers into a screen picture
+    /// from N s on, every picture, screen picture and their guest bytes to host0 (sgxd_dump.cpp).
+    void DumpPictures();
+    /// sgxd_flags `texdump=N`: each texture a draw takes during the frame, as the GPU wrote it, to host0
+    /// (sgxd_dump.cpp).
+    void DumpFrameTexture(u32 unit, const Texture& tex);
+    std::vector<u64> tex_dumped;
+    u32 tex_dump_transfers = 0;
+    bool tex_dumping = false;
+    /// sgxd_flags wbufmix: a Z-buffered draw that tests depth against the TA's W depths (a
+    /// W-buffered draw of the pass wrote them, or the pass loaded a store holding them) is
+    /// logged with its PICA depth range: there the PICA compared W depths, sgxd 1 - 1/w.
+    /// `w_ta`: this draw is W-buffered through WBUFFEN.
+    void LogWbufMix(bool w_ta, bool dwrite, u32 dcmp, bool is_indexed, const float* immediate,
+                    u32 count);
+    bool pass_ta_w{}; ///< the pass's depth holds the TA's W depths (wbufmix)
+#endif
+    u32 draw_serial = 0; ///< counts Draw's calls: QuadVertices' result holds for one
+    struct QuadRun {
+        u32 serial = ~0u;
+        bool indexed{};
+        const float* immediate{};
+        u32 count{};
+        bool ok{};
+        std::array<Pica::OutputVertex, 6> out{};
+    } quad_run;
+    /// The texture units whose texel at each pixel is that pixel's own colour in the buffer the draw
+    /// writes (the buffer itself, point sampled, read by the combiners alone, window coordinates on a
+    /// quad of one w): the program reads the tile's colour for them, and the pass need not end.
+    u32 OwnPixelUnits(bool is_indexed, const float* immediate, u32 count);
+    std::unique_ptr<Pica::ShaderEngine> cover_engine;
     /// The vertex program's SA block: its uniforms from `setup`, its literals and buffer
     /// pointer; `vsec_sa` its words.
     SgxdBackend::Data VertexSa(const Usse::GxpProgram& vg, const Pica::ShaderSetup& setup,
@@ -239,33 +358,44 @@ private:
     void VertexPrograms(const VertexStage& stage, const SgxdBackend::Data& vsa, u32 vsec_sa,
                         SgxdRecipeDrawPrograms& p, const Describe& describe);
 
-    /// `u8_regs`: the input registers an UNSIGNED_BYTE loader feeds.
+    /// `u8_regs`: the input registers an integer loader feeds.
     const VertexProgram& VertexProgramFor(u16 default_regs,
                                           const std::array<u8, 16>& reg_components, u16 u8_regs,
+                                          u16 s8_regs, u16 s16_regs,
                                           Usse::VsMode mode = Usse::VsMode::Draw);
     VertexProgram PlaceVertexProgram(Usse::GxpProgram gxp, const char* what, u64 key);
-    /// The geometry program for `rows` input rows (uniform: from c<first_uniform>) and at most
-    /// `max_triangles` triangles an invocation.
+    /// The geometry program for `rows` input rows and at most `max_triangles` triangles an invocation;
+    /// `input_rows`: the fixed-primitive mode's registers that read rows of their own.
     const VertexProgram& GeometryProgramFor(u32 rows, bool rows_uniform, bool rows_table,
-                                            u32 first_uniform, u32 max_triangles,
+                                            u32 first_uniform, u16 input_rows, u32 max_triangles,
                                             const Describe& describe);
+    const VertexProgram& MakeGeometryProgram(u64 key, u16 bools, u16 used, u32 rows,
+                                             bool rows_uniform, bool rows_table, u32 first_uniform,
+                                             u16 input_rows, u32 max_triangles,
+                                             const Describe& describe);
     /// The vertex program that draws a geometry program's stored triangles: input k is output k.
     const VertexProgram& PassthroughProgramFor(u32 outputs);
-    const FragmentProgram& FragmentProgramFor(u64 blend);
+    const FragmentProgram& FragmentProgramFor(const Epilogue& epilogue);
     /// The program placed for sgxd: its code (with the blend's tail), secondary and PDS.
-    FragmentProgram PlaceFragmentProgram(Usse::GxpProgram gxp, u64 blend, u64 hash);
+    FragmentProgram PlaceFragmentProgram(Usse::GxpProgram gxp, const Epilogue& epilogue,
+                                         u64 hash);
     void InstallTier2();
     void InstallVertexTier2(ShaderTier2::Result& result);
     /// The host copy of texture unit `unit`'s texture for the open pass, untiled when it is
     /// new or the guest's bytes changed: cached FCRAM by its hash, compared once a pass;
     /// uncached memory (VRAM, FCRAM moved to CDRAM) when a GPU operation wrote over it.
     const Texture& TextureFor(u32 unit);
+    /// Frees the least recently used texture no open pass reads; false when there is none.
+    bool EvictTexture();
     /// The GPU address of a fixed palette for a 4-bit format (0 for none), written at the first use.
     u32 PaletteFor(TexturePalette palette);
     /// The sampler's four state words for unit `unit`'s texture.
     void TextureWords(u32 unit, u32 words[4]);
     /// Marks the textures over [start, end) to be untiled again.
     void TexturesWritten(PAddr start, PAddr end);
+    /// A DMA or display transfer wrote [start, end): the surfaces there are older than the guest's
+    /// memory.
+    void SurfacesWritten(PAddr start, PAddr end);
     /// The lighting and fog LUTs the guest changed into fresh rows, fs_data's offsets pointed at them.
     void SyncLutLf();
     /// The same for the proctex colour map, alpha map, colour and colour-difference tables.
@@ -285,7 +415,10 @@ private:
     u32 clear_count{};
     u32 clear_order{};
     std::vector<Surface> surfaces;
-    std::vector<Texture> textures;
+    /// A list: eviction during a texture's untile keeps the others in place.
+    std::list<Texture> textures;
+    /// The zeros of a unit that is off, 2D and cube (NullTexture), outside the eviction.
+    std::array<Texture, 2> null_textures{};
     SgxdBackend::Data palettes{};
     /// The proctex noise NoiseRand2D(x, y) = h for x, y < 256 as F16x4 texels h * (x odd),
     /// h * (y odd), h, 0.
@@ -327,6 +460,9 @@ private:
     KeyIndex<u32> proctex_tables_by_contents;
 
     std::size_t pass_surface{}; // into surfaces, while the backend is in a pass
+    u16 gs_regs_loaded = 0;     // the GS input registers point-mode draws have loaded
+    /// Each GS input register's row as the last draw that loaded it left it.
+    std::array<u32, 16> gs_last_rows{};
     /// The rows KeepGsRows copied out of a room a pass took, a 16-byte row a register.
     SgxdBackend::Data gs_kept_rows{};
     u16 gs_rows_kept = 0;
@@ -339,6 +475,26 @@ private:
     PAddr pass_depth{};
     bool pass_depth_cleared{};
     u32 pass_depth_bytes{4}; // 2, 3 or 4, the depth format's
+    u32 pass_depth_format{};
+    float pass_bg_depth{1.0f};  // the depth clear the pass took
+    u32 pass_bg_stencil{};
+    bool pass_depth_used{};     // a draw tested or wrote depth or stencil
+    bool pass_depth_load{};     // it starts from the depth an earlier pass stored
+    bool pass_depth_covered{};  // or a draw wrote every pixel's depth before any read it
+    bool pass_depth_guest{};    // or from guest memory's, untiled into the store
+    u32 guest_depth_loads{};
+    /// Depth buffers kept across passes (EndPass stores a pass's depth, the next pass without a clear
+    /// loads it).
+    struct DepthStore {
+        PAddr addr;
+        u32 width, height, format;
+        SgxdBackend::DepthStore store;
+        bool valid; // the last pass on the buffer stored it, and nothing wrote there since
+    };
+    std::vector<DepthStore> depth_stores;
+    DepthStore& DepthStoreFor(PAddr addr, u32 width, u32 height, u32 format);
+    SgxdBackend::DepthStore NewDepthStore(u32 width, u32 height, u32 format);
+    void DepthStoresWritten(PAddr start, PAddr end);
 
     u32 fills{};
     u32 dmas{};
@@ -359,6 +515,22 @@ private:
 #ifdef VITA_DIAGNOSTICS
     u32 transfers{}; ///< perflog's progress lines and vprof's transfer numbers
 #endif
+    u32 guest_transfers{}; ///< display transfers from pictures no pass drew
+    /// Each unit's texture when it reads a colour buffer a pass drew: the surface itself.
+    std::array<Texture, 3> surface_textures{};
+    u32 surface_reads{}; ///< draws that sampled a surface, for the log
+    u32 syncs{};         ///< SyncToGuest's write-backs, for the log
+    u64 evictions{};     ///< textures freed for room (TextureFor)
+    u64 synced_tiles{};  ///< SyncToGuest's tiles, for the log
+    const char* sync_reason = "";          ///< why the write-backs run, for the log
+    std::map<std::string, u32> sync_why{}; ///< write-backs by surface and reason, for the log
+    u64 generations{};   ///< passes ended, for Surface::generation
+    /// Surfaces a later pass's surface covers whole (EndPass): nothing reads them any more.
+    /// Their memory is freed before the next surface is allocated (SurfaceFor), when the
+    /// render that may still read them has most likely completed.
+    std::vector<Surface> dead;
+    u32 loads{}; ///< passes that loaded their colour buffer from guest memory
+    u64 covered_passes{}; ///< passes whose first draw covers the target (CoversTarget)
     u32 untiles{};
     u32 p3ds{};
 #ifdef VITA_DIAGNOSTICS

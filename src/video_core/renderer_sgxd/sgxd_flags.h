@@ -30,6 +30,8 @@ namespace GxmRenderer {
  *   latelog   the late skip's late frames: each kept draw reading a colour buffer whose draws
  *             the same frame dropped, the transfers (dropped or not) and the fills (400 lines
  *             each); latelog_at=S from S seconds of the process's time on
+ *   passdump=T the same for the first 32 passes from T s, any buffer,
+ *             host0:azahar-passNN-ADDR-WxH-fFORMAT.bin
  *   fsload    every fragment program's code from host0:fsload.gxp (a GXP's primary
  *             program, with our inputs, uniforms and samplers): another compiler's code, timed
  *

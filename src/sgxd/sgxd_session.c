@@ -259,7 +259,7 @@ int sgxd_session_render_async(const SgxdRecipe *r, int read_pages, char *failed,
 
 // The pending 3D: its recipe, what it touches, whether a fence waits on it.
 static const SgxdRecipe *pending;
-static uint32_t pending_touches[4];
+static uint32_t pending_touches[6];
 static int pending_fenced;
 // The pending 3D's kick, stamp 2, and whether the last overlapped list finished one: for the 3D
 // time sgxd_session_render_overlap_result reports.
@@ -274,7 +274,7 @@ int sgxd_session_pending_touches(uint32_t lo, uint32_t hi) {
     if (!pending) {
         return 0;
     }
-    for (unsigned n = 0; n < 4; n += 2) {
+    for (unsigned n = 0; n < 6; n += 2) {
         if (lo < pending_touches[n + 1] && pending_touches[n] < hi) {
             return 1;
         }
@@ -302,7 +302,7 @@ static void finish_phase(SgxdOpList *l) {
     sgxd_recipe_3d_done(pending, l);
 }
 
-int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[4], char *failed,
+int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], char *failed,
                                 unsigned failed_size) {
     const int finish_previous = pending != NULL;
     SgxdOpList l = {chain_ops, 0, SGXD_MAX_CHAIN_OPS, 0};
@@ -336,7 +336,7 @@ int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[4], 
     last_finished = finish_previous;
     pending = r;
     pending_fenced = 0;
-    for (unsigned n = 0; n < 4; n++) {
+    for (unsigned n = 0; n < 6; n++) {
         pending_touches[n] = touches ? touches[n] : 0;
     }
     renders++;

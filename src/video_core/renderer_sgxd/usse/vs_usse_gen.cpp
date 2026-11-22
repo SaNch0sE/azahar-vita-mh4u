@@ -12,11 +12,14 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <nihstro/shader_bytecode.h>
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
-#include "video_core/renderer_gxm/usse/usse_encoder.h"
-#include "video_core/renderer_gxm/usse/usse_ir.h"
-#include "video_core/renderer_gxm/usse/vs_usse_gen.h"
+#include "video_core/renderer_sgxd/usse/usse_encoder.h"
+#include "video_core/renderer_sgxd/usse/usse_ir.h"
+#include "video_core/renderer_sgxd/usse/usse_program.h"
+#include "video_core/renderer_sgxd/usse/vs_usse_gen.h"
 
 /**
  * How a PICA vertex program becomes a USSE one (the forms are psp2cgc's for the same
@@ -57,9 +60,26 @@ using nihstro::SwizzlePattern;
 
 namespace {
 
+/// The words an integer attribute of register i is fetched as: one for bytes, and for shorts
+/// its halves, two to a word (the DMA reads from any byte address).
+uint32_t RawWords(const VsRequest& req, uint32_t i) {
+    if ((req.s16_regs & (1u << i)) == 0) {
+        return 1;
+    }
+    uint32_t comps = req.reg_components[i];
+    if (comps == 0 || comps > 4) {
+        comps = 4;
+    }
+    return (comps + 1) >> 1;
+}
+
+
 [[noreturn]] void Refuse(const std::string& what) {
     throw std::runtime_error(what);
 }
+
+/// The static emit state's refusal, which EmitVertexProgram retries with the dynamic one.
+constexpr const char* UnknownEmitState = "an EMIT whose SETEMIT is not on its straight-line path";
 
 // Scratch, in the virtual store. One load quad: a PICA instruction reads at most one
 // uniform (the inverted forms exist so that either operand can be it). The floats sit at
@@ -236,7 +256,8 @@ bool InVec4Table(const Swizzle& s) {
 
 class VertexEmitter {
 public:
-    VertexEmitter(const VsRequest& request_, int level_) : req{request_}, level{level_} {}
+    VertexEmitter(const VsRequest& request_, int level_, bool dynamic_emit_)
+        : req{request_}, level{level_}, dynamic_emit{dynamic_emit_} {}
 
     std::optional<GxpProgram> Emit(uint32_t& input_regs);
     int level = 1;
@@ -359,6 +380,8 @@ private:
 
     int out_address_pa = -1;          ///< StoreOutputs: the vertex's store address
     std::vector<Quad> gs_row_quads;   ///< Geometry, point mode: input register v<r>
+    std::optional<Quad> gs_zero_inputs;        ///< Geometry, uniform modes: what v<r> reads (zero)
+    std::array<std::optional<Quad>, 16> gs_input_quads; ///< Geometry: VsRequest::gs_input_rows
     std::array<std::vector<Quad>, 3> gs_slots; ///< Geometry: the emit buffer's three vertices
     Quad gs_state{};                  ///< Geometry: x the triangles stored (float), y a triangle's
                                       ///< bytes / 16, z the next triangle's address (ints)
@@ -369,6 +392,17 @@ private:
         bool winding;
     };
     std::optional<EmitState> emit_state;
+    /// Geometry: the emit state in registers as well (gs_emit: x the vertex id, y the
+    /// primitive flag, z the winding flag, as floats), for an EMIT no straight-line SETEMIT
+    /// reaches (GsEmitDynamic). Only for a program the static form refuses.
+    bool dynamic_emit = false;
+    Quad gs_emit{};
+    /// Whether a SETEMIT ran on every path to here: upstream's emitter keeps its state from the
+    /// invocation before, which no invocation here sees. The same over the jumps into each
+    /// label not bound yet (-1 for none), and whether the code here is reached falling through.
+    bool setemit_done = false;
+    std::vector<int8_t> label_setemit;
+    bool falls_through = true;
     /// Literals past the shared ones: Geometry's cap and a pad, so the prefetched uniforms
     /// after them stay on even SAs (a pair operand addresses them).
     uint32_t ExtraLiterals() const {
@@ -379,6 +413,9 @@ private:
     std::optional<Operand> GsSource(const SourceRegister& reg, uint32_t addr, const Swizzle& swz,
                                     Mod mod);
     void GsEmit();
+    void GsEmitDynamic();
+    void GsCopyToSlot(uint8_t vertex_id);
+    void GsStoreTriangle(bool winding);
     void StoreQuad(Reg base, uint32_t word, const Quad& q);
     void EpilogueStreamOut();
 };
@@ -558,7 +595,11 @@ void VertexEmitter::Layout() {
         if (req.gs_uniform_table && (!req.gs_rows_uniform || req.gs_rows_table)) {
             Refuse("a uniform table outside the fixed-primitive mode");
         }
-        const uint32_t words = req.gs_rows_table ? 4 : 2 + req.gs_rows;
+        const uint32_t words =
+            req.gs_rows_table
+                ? 4
+                : 2 + req.gs_rows + static_cast<uint32_t>(std::popcount(req.gs_input_rows)) +
+                      (req.gs_uniform_table ? 1u : 0u);
         if (words + 2 > PaLimit) {
             Refuse("more geometry input rows than primary attributes");
         }
@@ -583,8 +624,9 @@ void VertexEmitter::Layout() {
         }
         pa_inputs = static_cast<uint8_t>(pa_inputs + 4);
     }
-    // A U8 attribute's word lands in a PA of its own after the quads, even as the unpack needs;
-    // the prologue unpacks it into the quad.
+    // An integer attribute's words (one for bytes, two for four shorts) land in a pair of PAs
+    // of their own after the quads, even as the unpack needs (docs/sgxd/usse.md); the prologue
+    // unpacks them into the quad.
     input_raw_pa.fill(-1);
     for (uint32_t i = 0; i < 16; i++) {
         if (input_pa[i] < 0 || (req.u8_regs & (1u << i)) == 0) {
@@ -592,8 +634,9 @@ void VertexEmitter::Layout() {
         }
         input_raw_pa[i] = pa_inputs;
         gxp.attributes.push_back({"vs_in_attr" + std::to_string(i), pa_inputs});
-        gxp.attrib_pa_regs |= 1ull << pa_inputs;
-        pa_inputs = static_cast<uint8_t>(pa_inputs + 2);
+        const uint32_t words = RawWords(req, i);
+        gxp.attrib_pa_regs |= ((1ull << words) - 1) << pa_inputs;
+        pa_inputs = static_cast<uint8_t>(pa_inputs + (words > 2 ? 4 : 2));
     }
     if (req.mode == VsMode::StoreOutputs) {
         out_address_pa = pa_inputs;
@@ -693,12 +736,26 @@ void VertexEmitter::Layout() {
         for (uint32_t r = 0; r < req.gs_rows && !req.gs_rows_uniform; r++) {
             gs_row_quads.push_back(AllocateQuad());
         }
+        if (scan.inputs >> (req.gs_rows_uniform ? 0 : std::min<uint32_t>(req.gs_rows, 16)) != 0) {
+            gs_zero_inputs = AllocateQuad();
+        }
+        if (req.gs_input_rows != 0 && (!req.gs_rows_uniform || req.gs_rows_table)) {
+            Refuse("input rows of their own outside the fixed-primitive mode");
+        }
+        for (uint32_t r = 0; r < 16; r++) {
+            if ((req.gs_input_rows >> r & 1) != 0) {
+                gs_input_quads[r] = AllocateQuad();
+            }
+        }
         for (auto& slot : gs_slots) {
             for (uint32_t k = 0; k < req.num_outputs; k++) {
                 slot.push_back(AllocateQuad());
             }
         }
         gs_state = AllocateQuad();
+        if (dynamic_emit) {
+            gs_emit = AllocateQuad();
+        }
     }
 }
 
@@ -713,8 +770,14 @@ std::optional<Operand> VertexEmitter::GsSource(const SourceRegister& reg, uint32
     const uint32_t index = static_cast<uint32_t>(reg.GetIndex());
     switch (reg.GetRegisterType()) {
     case RegisterType::Input:
+        // A register the draw's rows do not fill (the uniform modes fill none) keeps what the
+        // unit had: an earlier point-mode draw's last row, or zero. Point mode's table row for it
+        // points at either; the fixed-primitive mode reads a row of its own (gs_input_rows) or zero.
+        if (req.gs_rows_uniform && index < 16 && gs_input_quads[index]) {
+            return Operand{*gs_input_quads[index], swz, mod};
+        }
         if (req.gs_rows_uniform || index >= req.gs_rows) {
-            Refuse("a geometry program reads an input register no row fills");
+            return Operand{*gs_zero_inputs, swz, mod};
         }
         return Operand{gs_row_quads[index], swz, mod};
     case RegisterType::FloatUniform: {
@@ -882,6 +945,7 @@ void VertexEmitter::Store(const Quad& dst, uint8_t mask, Reg internal) {
 int VertexEmitter::NewLabel() {
     const int label = e.NewLabel();
     label_bound.push_back(false);
+    label_setemit.push_back(-1);
     return label;
 }
 
@@ -954,11 +1018,26 @@ void VertexEmitter::Bind(int label) {
     label_bound[static_cast<std::size_t>(label)] = true;
     e.Bind(label);
     emit_state.reset(); // a join: the paths into it may have set different emit states
+    // A backward jump's target (no jump into it yet) is first reached falling through.
+    const int8_t jumped = label_setemit[static_cast<std::size_t>(label)];
+    if (jumped >= 0) {
+        setemit_done = (!falls_through || setemit_done) && jumped != 0;
+    } else if (!falls_through) {
+        setemit_done = false;
+    }
+    falls_through = true;
 }
 
 void VertexEmitter::Branch(Pred pred, int target) {
     per_instance = true;
     e.Br(pred, target);
+    if (!Bound(target)) {
+        int8_t& jumped = label_setemit[static_cast<std::size_t>(target)];
+        jumped = static_cast<int8_t>((jumped != 0) && setemit_done);
+    }
+    if (pred == Pred::None) {
+        falls_through = false;
+    }
 }
 
 void VertexEmitter::CondBranch(Instruction::FlowControlType flow, int target, bool when_true) {
@@ -1496,6 +1575,19 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         emit_state = EmitState{static_cast<uint8_t>(instr.setemit.vertex_id.Value()),
                                instr.setemit.prim_emit.Value() != 0,
                                instr.setemit.winding.Value() != 0};
+        setemit_done = true;
+        if (dynamic_emit) {
+            if (emit_state->vertex_id > 2) {
+                Refuse("SETEMIT of vertex 3");
+            }
+            e.MoveInternal({gs_emit.Pair(0), 0x1},
+                           emit_state->vertex_id != 0 ? ConstOne : ConstZero);
+            if (emit_state->vertex_id == 2) {
+                e.Vec(VecOp::Add, {gs_emit.Base(), 0x1}, {gs_emit.Base(), XYZW}, ConstOne);
+            }
+            e.MoveInternal({gs_emit.Pair(0), 0x2}, emit_state->prim ? ConstOne : ConstZero);
+            e.MoveInternal({gs_emit.Pair(1), 0x1}, emit_state->winding ? ConstOne : ConstZero);
+        }
         return offset + 1;
     case OpCode::Id::EMIT:
         if (req.mode != VsMode::Geometry) {
@@ -1521,29 +1613,43 @@ void VertexEmitter::StoreQuad(Reg base, uint32_t word, const Quad& q) {
 /// 1, 0, 2 with the winding flag (the primitive assembler's inversion), stored at the next
 /// triangle's place unless gs_max_triangles are stored already.
 void VertexEmitter::GsEmit() {
+    if (!emit_state && dynamic_emit) {
+        GsEmitDynamic();
+        return;
+    }
     if (!emit_state) {
-        Refuse("an EMIT whose SETEMIT is not on its straight-line path");
+        Refuse(UnknownEmitState);
     }
     const EmitState st = *emit_state;
     if (st.vertex_id > 2) {
         Refuse("SETEMIT of vertex 3");
     }
-    for (uint32_t k = 0; k < req.num_outputs; k++) {
-        const Quad& slot = gs_slots[st.vertex_id][k];
-        e.MoveInternal({slot.Pair(0), 0x3}, {attr_quad[k]->Pair(0), XYZW});
-        e.MoveInternal({slot.Pair(1), 0x3}, {attr_quad[k]->Pair(1), XYZW});
-    }
+    GsCopyToSlot(st.vertex_id);
     if (!st.prim) {
         return;
     }
-    const Reg size = Reg::V(static_cast<uint8_t>(gs_state.base + 1));
-    const Reg next = Reg::V(static_cast<uint8_t>(gs_state.base + 2));
     const int full = NewLabel();
     e.Test(Cond::Ge, 2, {gs_state.Base()}, 0, Data(DataGsCap), true);
     Branch(Pred::P2, full);
+    GsStoreTriangle(st.winding);
+    Bind(full);
+    emit_state = st; // the join is this EMIT's own
+}
+
+void VertexEmitter::GsCopyToSlot(uint8_t vertex_id) {
+    for (uint32_t k = 0; k < req.num_outputs; k++) {
+        const Quad& slot = gs_slots[vertex_id][k];
+        e.MoveInternal({slot.Pair(0), 0x3}, {attr_quad[k]->Pair(0), XYZW});
+        e.MoveInternal({slot.Pair(1), 0x3}, {attr_quad[k]->Pair(1), XYZW});
+    }
+}
+
+void VertexEmitter::GsStoreTriangle(bool winding) {
+    const Reg size = Reg::V(static_cast<uint8_t>(gs_state.base + 1));
+    const Reg next = Reg::V(static_cast<uint8_t>(gs_state.base + 2));
     static constexpr uint8_t straight[3] = {0, 1, 2};
     static constexpr uint8_t inverted[3] = {1, 0, 2};
-    const uint8_t* order = st.winding ? inverted : straight;
+    const uint8_t* order = winding ? inverted : straight;
     for (uint32_t v = 0; v < 3; v++) {
         for (uint32_t k = 0; k < req.num_outputs; k++) {
             StoreQuad(next, (v * req.num_outputs + k) * 4, gs_slots[order[v]][k]);
@@ -1551,8 +1657,40 @@ void VertexEmitter::GsEmit() {
     }
     e.MadI32(next, size, 16, next);
     e.Vec(VecOp::Add, {gs_state.Base(), 0x1}, {gs_state.Base(), XYZW}, ConstOne);
-    Bind(full);
-    emit_state = st; // the join is this EMIT's own
+}
+
+/// EMIT with the emit state read from gs_emit (SETEMITs in the branches of an IF, the EMIT after
+/// it): the slot by the vertex id, then with the primitive flag the triangle in the winding's
+/// order.
+void VertexEmitter::GsEmitDynamic() {
+    if (!setemit_done) {
+        Refuse("an EMIT that can run before its invocation's first SETEMIT (upstream: the "
+               "invocation before's emit state)");
+    }
+    for (uint8_t id = 0; id < 3; id++) {
+        const int skip = NewLabel();
+        // P2: another vertex id (x is 0, 1 or 2).
+        e.Test(id == 2 ? Cond::Le : Cond::Ne, 2, {gs_emit.Pair(0)}, 0,
+               id == 0 ? ConstZero : ConstOne, true);
+        Branch(Pred::P2, skip);
+        GsCopyToSlot(id);
+        Bind(skip);
+    }
+    const int done = NewLabel();
+    e.Test(Cond::Eq, 2, {gs_emit.Pair(0)}, 1, ConstZero, true);
+    Branch(Pred::P2, done);
+    e.Test(Cond::Ge, 2, {gs_state.Base()}, 0, Data(DataGsCap), true);
+    Branch(Pred::P2, done);
+    const int inverted = NewLabel();
+    const int stored = NewLabel();
+    e.Test(Cond::Ne, 2, {gs_emit.Pair(1)}, 0, ConstZero, true);
+    Branch(Pred::P2, inverted);
+    GsStoreTriangle(false);
+    Branch(Pred::None, stored);
+    Bind(inverted);
+    GsStoreTriangle(true);
+    Bind(stored);
+    Bind(done);
 }
 
 /// The stream-out modes' end: the stores (StoreOutputs: the output attributes; Geometry: the
@@ -1588,10 +1726,13 @@ void VertexEmitter::Prologue() {
         }
         const Quad q{Bank::PrimAttr, static_cast<uint8_t>(input_pa[i])};
         if (input_raw_pa[i] >= 0) {
-            const Reg raw = Reg::Pa(static_cast<uint8_t>(input_raw_pa[i]));
+            const bool s16 = (req.s16_regs & (1u << i)) != 0;
+            const uint8_t format = s16 ? 4 : (req.s8_regs & (1u << i)) ? 1 : 0;
+            // A SHORT attribute's half h is in the pair h / 4, lane h % 4.
             for (uint32_t c = 0; c < comps; c++) {
-                e.UnpackU8(Reg::Pa(static_cast<uint8_t>(input_pa[i] + c)), raw,
-                           static_cast<uint8_t>(c));
+                const Reg raw = Reg::Pa(static_cast<uint8_t>(input_raw_pa[i] + 2 * (c >> 2)));
+                e.UnpackInt(Reg::Pa(static_cast<uint8_t>(input_pa[i] + c)), raw,
+                            static_cast<uint8_t>(c & 3), format);
             }
         }
         switch (comps) {
@@ -1650,6 +1791,17 @@ void VertexEmitter::Prologue() {
                     0);
             e.WdfVertex(0);
         }
+        for (uint32_t r = 0, k = 2 + req.gs_rows; r < 16; r++) {
+            if (gs_input_quads[r]) {
+                e.Lda32(gs_input_quads[r]->Base(), Reg::Pa(static_cast<uint8_t>(k++)), nullptr, 0,
+                        4, 0);
+                e.WdfVertex(0);
+            }
+        }
+        if (gs_zero_inputs) {
+            e.MoveInternal({gs_zero_inputs->Pair(0), 0x3}, {Reg::C(0), XYZW});
+            e.MoveInternal({gs_zero_inputs->Pair(1), 0x3}, {Reg::C(0), XYZW});
+        }
         // No triangle stored; the first goes at PA 0.
         const Reg size = Reg::V(static_cast<uint8_t>(gs_state.base + 1));
         const Reg next = Reg::V(static_cast<uint8_t>(gs_state.base + 2));
@@ -1657,6 +1809,12 @@ void VertexEmitter::Prologue() {
         e.Bitwise(BwOp::Or, size, IOp::Imm(static_cast<uint8_t>(3 * req.num_outputs)),
                   IOp::Imm(0));
         e.Bitwise(BwOp::Or, next, IOp::R(Reg::Pa(0)), IOp::Imm(0));
+        if (dynamic_emit) {
+            // Every EMIT that reads it comes after a SETEMIT (setemit_done): written for the
+            // register allocator, never read as zero.
+            e.MoveInternal({gs_emit.Pair(0), 0x3}, {Reg::C(0), XYZW});
+            e.MoveInternal({gs_emit.Pair(1), 0x3}, {Reg::C(0), XYZW});
+        }
     }
 }
 
@@ -1800,11 +1958,15 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
     }
     e.EndVertex();
 
-    // Where the virtual quads may live, in spill order: the temporaries, the primary
-    // attributes past the inputs, the output registers until the epilogue writes them.
+    // Where the virtual quads may live, in spill order: the temporaries, the primary attributes
+    // past the inputs, the output registers until the epilogue writes them, then the temporaries
+    // past r63.
+    // psp2cgc gives a vertex program up to 112 of them; from r120 the pair and single numbers name
+    // the internal registers. Geometry programs need up to 34 quads.
     e.AddClass({Bank::Temp, 0, 64});
     e.AddClass({Bank::PrimAttr, pa_inputs, PaLimit});
     e.AddClass({Bank::Output, 0, OutScratchEnd, epilogue_at});
+    e.AddClass({Bank::Temp, 64, 112});
     Encoder primary;
     const Ir::LowerResult lowered = e.Lower(primary, level);
     primary.FinishNosched();
@@ -1968,15 +2130,24 @@ bool GsIndexesUniforms(std::span<const uint32_t> code, uint32_t code_size) {
 
 std::optional<GxpProgram> EmitVertexGxp(const VsRequest& request, uint32_t& input_regs,
                                         std::string* refusal, int level) {
-    try {
-        VertexEmitter emitter{request, level};
-        return emitter.Emit(input_regs);
-    } catch (const std::exception& ex) {
-        if (refusal) {
-            *refusal = ex.what();
+    // A geometry program with an EMIT that different SETEMITs reach (a join between) keeps
+    // its emit state in registers too (VertexEmitter::dynamic_emit).
+    for (const bool dynamic_emit : {false, true}) {
+        try {
+            VertexEmitter emitter{request, level, dynamic_emit};
+            return emitter.Emit(input_regs);
+        } catch (const std::exception& ex) {
+            if (!dynamic_emit && request.mode == VsMode::Geometry &&
+                std::string_view{ex.what()} == UnknownEmitState) {
+                continue;
+            }
+            if (refusal) {
+                *refusal = ex.what();
+            }
+            return std::nullopt;
         }
-        return std::nullopt;
     }
+    return std::nullopt;
 }
 
 std::vector<uint8_t> EmitVertexProgram(const VsRequest& request, uint32_t& input_regs,

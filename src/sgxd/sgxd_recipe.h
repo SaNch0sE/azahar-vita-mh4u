@@ -98,7 +98,15 @@ typedef struct SgxdRecipeDraw {
     unsigned cull;
     uint32_t clip;
     const SgxdRecipeDrawPrograms *programs;   // NULL: the recipe's programs
+    // ISP C, the stencil (SCMP 27..25, SOP1 24..22 stencil fail,
+    // SOP2 21..19 depth fail, SOP3 18..16 pass, SCMPMASK 15..8, SWMASK 7..0), for both faces;
+    // the reference is ISP A's SREF (7..0). 0 means SGXD_RECIPE_ISP_C.
+    uint32_t ispc;
 } SgxdRecipeDraw;
+// ISP C with no stencil: SCMP ALWAYS, every op KEEP, both masks 0.
+#define SGXD_RECIPE_ISP_C 0x0e000000u
+// ISP A's CPRES: the object carries its ISP C word.
+#define SGXD_RECIPE_ISP_CPRES (1u << 8)
 #define SGXD_RECIPE_CLIP(x0, y0, x1, y1)                                                          \
     (1u << 31 | (uint32_t)(x0) << 24 | (uint32_t)(x1) << 16 | (uint32_t)(y0) << 8 | (uint32_t)(y1))
 
@@ -114,6 +122,8 @@ typedef struct SgxdRecipe {
     uint32_t ta_free_list, ta_alloc, ta_threshold, pds_threshold, global_list;
     uint32_t bgobjtag;
     uint32_t bgobjdepth;             // ISP_BGOBJDEPTH, the 3D kick's: 1.0 until a depth clear sets it
+    uint32_t bgobj;                  // ISP_BGOBJ, the 3D kick's: 0x300, stencil (7..0) 0 until set
+    uint32_t zls[5];                 // ISP_ZLSCTL and the four ZLS bases, the 3D kick's: 0 until set
     uint32_t pbe[6];
     uint32_t vdm_w2, vdm_w4, vdm_w5;  // the VDM index list's words 2, 4 and 5
     uint32_t units[SGXD_R_COUNT];    // PDS programs' data units (COPY .. BGPRIM)
@@ -151,6 +161,10 @@ typedef struct SgxdRecipePb {
     uint32_t req_base, pt, first, last;
 } SgxdRecipePb;
 extern SgxdRecipePb sgxd_recipe_pb;
+// Set before init: every recipe renders to an external target (sgxd_recipe_set_target), so
+// the layout gives the block's own FB and DEPTH no room. With sgxd_recipe_pb set, the page
+// table and pages take none either.
+extern int sgxd_recipe_external_fb;
 // sgxd_recipe_pb's page list into the CPU's view of its page table: page p links p - 1 and
 // p + 1, 0xffff at both ends. Before its first TA only; the DPM owns it afterwards.
 void sgxd_recipe_pb_write(void *pt_memory);
@@ -185,6 +199,15 @@ int sgxd_recipe_init_programs(SgxdRecipe *r, uint32_t width, uint32_t height, ui
 // The background object's depth, a pass's depth clear: ISP_BGOBJDEPTH, which the next 3D kick
 // writes and every pixel's depth starts from, and its three vertices' z. 1.0 as written.
 void sgxd_recipe_set_background_depth(SgxdRecipe *r, void *memory, float z);
+// The background object's stencil, a pass's stencil clear: ISP_BGOBJ's STENCIL (7..0), which the
+// next 3D kick writes. 0 as written.
+void sgxd_recipe_set_background_stencil(SgxdRecipe *r, uint8_t stencil);
+// The next 3D kick's depth load and store: F32 depth at the GPU address depth, rows of whole 32x32
+// tiles (AlignUp(width, 32) samples a row), and with stencil (not 0) one byte a sample at stencil
+// in the same layout. load (1: F32 and the stencil bytes, 2: I24ZI8S words at depth, a D24S8
+// buffer's, the stencil their top byte) and store force the ZLS for every tile a primitive touches;
+// the store is always F32. depth 0 turns the ZLS off, as written.
+void sgxd_recipe_set_zls(SgxdRecipe *r, uint32_t depth, uint32_t stencil, int load, int store);
 
 // ImGui's vertex path. nverts ImDrawVert records (SGXD_RECIPE_IMGUI_WORDS words each)
 // fetched at stride 20 into pa0..pa4; the vertex program maps x, y through the scale and offset in
@@ -288,6 +311,16 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory, uint32_t fb_va, uint32_
 #define SGXD_RECIPE_PACK_U8888 0x00010000u
 #define SGXD_RECIPE_PACK_U888 0x10010000u
 #define SGXD_RECIPE_PACK_U888_RGB 0x10110000u
+// U8888 SWIZ 2, stored 0xRRGGBBAA: the PICA's RGBA8 (bytes A, B, G, R) from an A8B8G8R8 source.
+#define SGXD_RECIPE_PACK_U8888_RGBA 0x00210000u
+// R5G6B5 SWIZ 1, conventional (red 0xf800): the PICA's RGB565.
+#define SGXD_RECIPE_PACK_R5G6B5 0x30110000u
+// A4R4G4B4: A in bits 15:12, R in 3:0 (red 0xf00f). A source read with its lanes mirrored
+// (A, B, G, R) gives the PICA's RGBA4, R in 15:12.
+#define SGXD_RECIPE_PACK_A4R4G4B4 0x50010000u
+// A1R5G5B5 SWIZ 2: R in bits 15:11, G 10:6, B 5:1, A 0, the PICA's RGB5A1 (SWIZ 0 stores A B G R
+// from bit 15, 1 A R G B, 3 B G R A; channels truncated, alpha its top bit).
+#define SGXD_RECIPE_PACK_A1R5G5B5_RGBA 0x40210000u
 void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory, uint32_t pbe0);
 
 typedef struct SgxdOpList {

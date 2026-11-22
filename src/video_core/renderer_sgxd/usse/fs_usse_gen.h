@@ -34,4 +34,17 @@ namespace GxmRenderer::Usse {
                                                        std::string* refusal = nullptr,
                                                        int level = 1);
 
+/// The lighting's diagnostics switch (sgxd_flags light16why), set before any program is
+/// emitted.
+struct LightingSwitches {
+    /// A probe: the U8 combiners read the vertex colour from a second, fixed-point iterator
+    /// of it (one register after the other inputs) instead of packing the four floats.
+    bool u8_colour = false;
+};
+inline LightingSwitches lighting_switches;
+
+/// The texture units 0-2 (a mask) the program for `config` samples: the TEV stages' sources,
+/// the bump map and the shadow texture, as the emitter plans them.
+[[nodiscard]] uint32_t SampledTextureUnits(const Pica::Shader::FSConfig& config);
+
 } // namespace GxmRenderer::Usse
