@@ -360,6 +360,7 @@ int azaharVersion() {
 #include "shell.c"
 #include "coresample.c"
 #include "uvc.c"
+#include "caps.c"
 #include "plugins.c"
 
 // ---------------------------------------------------------------------------- module
@@ -411,6 +412,7 @@ int module_stop(SceSize argc, const void *args) {
         sgxd_standby_uid = -1;
     }
     uvc_release();
+    caps_release();
     sgxd_unmap();
     const SceUID blocks[] = {coresample_dbg_uid, reback_moved_uid};
     for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {

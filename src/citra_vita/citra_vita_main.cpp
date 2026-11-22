@@ -180,6 +180,9 @@ constexpr char RelaunchArgument[] = "--azaharnative-loaded";
 using StartError = std::function<std::string()>;
 /// What LoadAzaharNative returned: none, or the error EmulatorMain shows once it can.
 StartError g_native_error;
+/// azaharUnlockCores': core 3 for this app's threads, CapUnlocker's or the module's own; 0 not
+/// asked (no module), negative refused.
+int g_cores_unlocked = 0;
 /// A crash's notice for the game list to show, the player closing it: a restart's after
 /// CrashReport::Recover (crashed=PATH), or a title's that crashed (RunTitle).
 std::string g_crash_notice;
@@ -2694,11 +2697,13 @@ int EmulatorMain() {
         ShowStartError(g_native_error());
         return -1;
     }
-    if (!module_installed("CapUnlocker")) {
-        ShowStartError(Tr("Install CapUnlocker.skprx from "
-                          "https://github.com/GrapheneCt/CapUnlocker, then reboot your console."));
+    // azaharnative knows the thread managers of the firmwares it unlocks core 3 on.
+    if (g_cores_unlocked == AZAHAR_ERR_RESOLVE) {
+        ShowStartError(Tr("Azahar needs firmware 3.60, 3.65, 3.68 or 3.73."));
         return -1;
     }
+    ASSERT_MSG(g_cores_unlocked > 0, "azaharUnlockCores: {:#010x}",
+               static_cast<u32>(g_cores_unlocked));
 
     SetupClocks();
 #ifdef VITA_DIAGNOSTICS
@@ -3053,6 +3058,14 @@ int main(int argc, char* argv[]) {
     g_native_error = LoadAzaharNative(relaunched);
     if (!g_native_error) {
         VitaFrontend::CrashReport::WatchBusErrors();
+        // Core 3, which the system keeps from games: before this thread and the rest are pinned
+        // there (SetCurrentThreadRole). CapUnlocker's where it is loaded, else the module's own.
+        g_cores_unlocked = azaharUnlockCores();
+        sceClibPrintf("[azahar] cores: %s (%08x)\n",
+                      g_cores_unlocked == AZAHAR_CORES_CAPUNLOCKER ? "CapUnlocker"
+                      : g_cores_unlocked == AZAHAR_CORES_OWN       ? "azaharnative"
+                                                                   : "not unlocked",
+                      static_cast<unsigned>(g_cores_unlocked));
     }
     // Without the module (g_native_error) its calls are not bound: the report lists no plugins.
     VitaFrontend::CrashReport::NoteSystem(g_native_error ? 0 : azaharVersion(), g_cores_unlocked);

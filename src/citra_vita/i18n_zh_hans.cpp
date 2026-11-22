@@ -155,9 +155,6 @@ constexpr std::array table{std::to_array<Translation>({
     {"In room \"{}\" ({} of {})", "已加入房间“{}”（{}/{} 人）"},
     {"In the ad hoc room at {}", "已加入 {} 的本地联机房间"},
     {"Install", "安装"},
-    {"Install CapUnlocker.skprx from https://github.com/GrapheneCt/CapUnlocker, then reboot your "
-     "console.",
-     "请从 https://github.com/GrapheneCt/CapUnlocker 安装 CapUnlocker.skprx，然后重启主机。"},
     {"Install CIA", "安装 CIA"},
     {"Installed", "已安装"},
     {"Installed from a CIA. Removing it takes the game back to its own version.",

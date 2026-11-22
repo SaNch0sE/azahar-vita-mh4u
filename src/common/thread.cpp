@@ -298,7 +298,7 @@ constexpr int PriorityCore(ThreadRole role) {
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 2;
     case ThreadRole::ShaderCompiler:
         // Behind the first tier's worker; a job runs for up to hundreds of milliseconds. Before
-        // the miscellaneous threads (CapUnlocker gives applications core 3).
+        // the miscellaneous threads (azaharnative gives the app core 3).
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 3;
     case ThreadRole::Parse:
     case ThreadRole::Y2r:

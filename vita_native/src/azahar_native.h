@@ -393,6 +393,13 @@ int azaharUvcPortTaken(void);
 int azaharUvcFrame(const void *yuy2, uint32_t size);
 /// Whether a host is streaming now (no syscall cost beyond the call: a load).
 int azaharUvcStreaming(void);
+/// Core 3, which the system keeps from game applications, for the calling app's threads (caps.c,
+/// version 85): AZAHAR_CORES_CAPUNLOCKER where CapUnlocker is loaded (nothing done), else
+/// AZAHAR_CORES_OWN once SceKernelThreadMgr's affinity check allows it (until the module stops),
+/// or AZAHAR_ERR_RESOLVE where that check is not the code known (another firmware's).
+#define AZAHAR_CORES_CAPUNLOCKER 1
+#define AZAHAR_CORES_OWN 2
+int azaharUnlockCores(void);
 /// The kernel modules loaded from outside the firmware (plugins.c, version 86): taiHEN, HENkaku
 /// and the plugins a taiHEN config.txt loads, as "name path" lines in `out` (`size` bytes, ended
 /// in a NUL, cut where they do not fit). Returns the count listed, or AZAHAR_ERR_*.
@@ -486,7 +493,7 @@ int azaharBusErrorWatch(AzaharBusErrorCatch *out);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.
-#define AZAHAR_NATIVE_VERSION 84
+#define AZAHAR_NATIVE_VERSION 87
 #define AZAHAR_NATIVE_UNLOADABLE 67
 int azaharVersion();
 /// This module as a UID of the calling process, for taiStopUnloadKernelModule: taiHEN stops and
