@@ -12,7 +12,10 @@ namespace GxmRenderer {
 
 RendererSgxd::RendererSgxd(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window)
     : VideoCore::RendererBase{system, window, nullptr}, memory{system.Memory()},
-      guest_memory{system.Memory()}, rasterizer{pica, system.Memory(), guest_memory} {}
+      guest_memory{system.Memory()}, rasterizer{pica, system.Memory(), guest_memory} {
+    rasterizer.SetFlipHook([this](u32* fence) { return FlipPending(fence); },
+                           [this] { return FlipDueIn(); }, [this] { FlipDone(); });
+}
 
 RendererSgxd::~RendererSgxd() {
     // The GPU's view of guest memory goes with guest_memory.
@@ -52,6 +55,18 @@ void RendererSgxd::PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb
 
 void RendererSgxd::PollWindow() {
     render_window.PollEvents();
+}
+
+void RendererSgxd::FlipDone() {
+    render_window.FlipDone();
+}
+
+bool RendererSgxd::FlipPending(u32* fence) {
+    return render_window.FlipPending(fence);
+}
+
+s64 RendererSgxd::FlipDueIn() {
+    return render_window.FlipDueIn();
 }
 
 bool RendererSgxd::WouldMakeUncached(PAddr addr, u32 size) const {

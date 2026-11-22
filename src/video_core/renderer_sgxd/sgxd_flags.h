@@ -21,8 +21,6 @@ namespace GxmRenderer {
  *   rendercheck  before each draw the emulation side sends its whole PICA state and the render
  *             thread compares its copy with it, logging each register, uniform and table that
  *             differs (once each): a gap in the state the render thread is sent
- *   nolimit   no frame limit: the core runs as fast as it goes
- *   novsync   the sgxd present does not wait for the frame before it to be on screen (tears)
  *   holdlog   with perflog, the first 200 page-hold aborts that waited (holdlog=N: from N
  *             seconds of the process's time on), each with the guest's PC and instruction, the
  *             held range and the page's live read and write bytes, parse holds and index watch

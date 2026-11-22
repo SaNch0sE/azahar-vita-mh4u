@@ -198,6 +198,23 @@ public:
     /// The memory the last guest screens named is about to go: stop drawing them.
     virtual void ForgetGuestScreens() {}
 
+    /// Whether the window's own overlay over the guest screens changed since the last call: a
+    /// renderer that presents only new guest screens presents for it as well.
+    virtual bool TakeOverlayChanged() {
+        return false;
+    }
+
+    /// The last present's picture, still being drawn on the GPU: true, with the fence its work
+    /// reaches (the renderer's own count). Drawn, it goes on screen when FlipDueIn (us) comes to
+    /// 0 (a paced flip): FlipDone shows it then.
+    virtual bool FlipPending([[maybe_unused]] u32* fence) {
+        return false;
+    }
+    virtual s64 FlipDueIn() {
+        return 0;
+    }
+    virtual void FlipDone() {}
+
     /**
      * Returns a GraphicsContext that the frontend provides that is shared with the emu window. This
      * context can be used from other threads for background graphics computation. If the frontend

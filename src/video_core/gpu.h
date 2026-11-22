@@ -224,6 +224,9 @@ private:
     /// Runs op, a GSP command's or a register trigger's work (vprof numbers it, perflog times
     /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).
     void RunGpuOp(OpKind kind, const std::function<void()>& op);
+    /// A write of [addr, addr + size): one into a framebuffer the LCD shows has the next vblank
+    /// present (VBlankCallback).
+    void ScreensWritten(PAddr addr, u32 size);
     /// Raises a GSP interrupt: a vblank at once; any other once the GPU has done the work sent
     /// before it (held, with the rasterizer's ticket for that work, until DeliverInterrupts or
     /// WaitInterrupt sees it done), never here: this may run without the HLE lock. No modelled

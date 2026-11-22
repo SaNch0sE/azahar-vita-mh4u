@@ -54,6 +54,7 @@ public:
     Action Update();
 
     /// Issues the built frame's draw commands. Must be called inside an SgxdPresent frame.
+    /// In game the frame is the stats overlay (StatsHud), drawn with no ImGui frame.
     void Draw();
 
     /// The game the user chose, valid after Action::LaunchGame.
@@ -124,7 +125,6 @@ private:
     Action DrawPauseSettings();
     Action DrawSavestates();
     void DrawStatusMessage();
-    void DrawStatsHud();
 
     /// Draws the settings body, showing only runtime-changeable rows when asked.
     void DrawSettingsBody(bool runtime_only);
@@ -147,6 +147,9 @@ private:
     int selected_game{};
     std::vector<Setting> settings;
     bool overlay_focused{};
+    /// Whether the last Update built an ImGui frame (a menu or the status message), which Draw
+    /// then draws; in game it builds none and Draw draws the stats overlay.
+    bool imgui_frame{};
 };
 
 } // namespace VitaFrontend

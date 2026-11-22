@@ -30,6 +30,8 @@ set(CITRA_VITA_SOURCES
     input_factory_vita.h
     sgxd_present.cpp
     sgxd_present.h
+    stats_hud.cpp
+    stats_hud.h
     vita_ui.cpp
     vita_ui.h
     "${GXM_SHADER_HEADER}"

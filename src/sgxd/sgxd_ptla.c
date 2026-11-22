@@ -7,7 +7,9 @@
 
 #include <stdio.h>
 
+#include <psp2/kernel/error.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
 
 #include "sgxd.h"
@@ -266,6 +268,64 @@ int sgxd_chain_wait(uint32_t fence) {
     }
 #ifdef VITA_DIAGNOSTICS
     sgxd_wait_us_add((azaharCycles() - start) / cycles_per_us);
+#endif
+    return 0;
+}
+
+int sgxd_chain_sleep(uint32_t fence, int32_t flag, uint32_t bits) {
+    return sgxd_chain_sleep_until(fence, flag, bits, 0);
+}
+
+int sgxd_chain_sleep_until(uint32_t fence, int32_t flag, uint32_t bits, uint64_t deadline) {
+    if (!events || sgxd_chain_reached(fence)) {
+        return 0;
+    }
+    const SceUInt64 start = sceKernelGetProcessTimeWide();
+    SceUInt64 progress_at = start;
+    uint32_t done = chains_done();
+    for (;;) {
+        if (chain_fault()) {
+            return -1;
+        }
+        // Armed for the fence and the PTLA ops done already: the microkernel's SW_EVENT once the
+        // list completes. 0: completed meanwhile.
+        if (sgxd_wake_arm(fence, twod_done()) == 0) {
+            break;
+        }
+        // A tenth of a second at a time, for the stall check, or to the deadline; a flag left
+        // from an earlier wake ends a sleep early, and the loop looks again.
+        SceUInt timeout = 100000;
+        if (deadline != 0) {
+            const SceUInt64 at = sceKernelGetProcessTimeWide();
+            if (at >= deadline) {
+                return 1;
+            }
+            if (deadline - at < timeout) {
+                timeout = (SceUInt)(deadline - at);
+            }
+        }
+        unsigned int got = 0;
+        const int r = sceKernelWaitEventFlag(flag, bits, SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
+                                             &got, &timeout);
+        sgxd_wake_disarm();
+        if (r < 0 && r != (int)SCE_KERNEL_ERROR_WAIT_TIMEOUT) {
+            return r;
+        }
+        if (sgxd_chain_reached(fence)) {
+            break;
+        }
+        const SceUInt64 now = sceKernelGetProcessTimeWide();
+        if (chains_done() != done) {
+            done = chains_done();
+            progress_at = now;
+        } else if (now - progress_at > sgxd_chain_stall_us) {
+            return -1;
+        }
+    }
+#ifdef VITA_DIAGNOSTICS
+    sgxd_wait_us_add((uint32_t)(sceKernelGetProcessTimeWide() - start));
+#else
+    (void)start;
 #endif
     return 0;
 }

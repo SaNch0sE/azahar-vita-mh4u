@@ -12,7 +12,7 @@
 
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/sgxd_present.h"
-#include "citra_vita/hud_stats.h"
+#include "citra_vita/stats_hud.h"
 #include "citra_vita/vita_ui.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
@@ -79,6 +79,7 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
 
     ImGui_ImplVita_Init();
     ImGui_ImplSgxd_Init();
+    StatsHud::Init();
     // The backend has copied the font atlas into GPU memory by now, and the pixels it was
     // built from are 4 MB of heap nothing reads again. ImGui rebuilds them on demand if anything
     // ever does.
@@ -432,29 +433,12 @@ void Ui::DrawStatusMessage() {
     ImGui::End();
 }
 
-void Ui::DrawStatsHud() {
-    // Top right, every frame while a title runs. A few text lines of ImGui, so a few hundred
-    // vertices.
-    if (!HudStats::valid.load(std::memory_order_acquire)) {
-        return;
-    }
-    using namespace HudStats;
-    const u32 shown = shown_fps.load(std::memory_order_relaxed);
-    const u32 fps10 = game_fps10.load(std::memory_order_relaxed);
-    ImGui::SetNextWindowPos(ImVec2(960.0f - 8.0f, 8.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGui::Begin("##stats", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
-                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-    // Three bare lines: speed/game fps, frame time/shown fps, guest core 0/core 1 busy.
-    ImGui::Text("%u%%/%u", speed_percent.load(std::memory_order_relaxed), (fps10 + 5) / 10);
-    ImGui::Text("%.1fms/%ufps", shown != 0 ? 1000.0f / static_cast<float>(shown) : 0.0f, shown);
-    ImGui::End();
-}
-
 Ui::Action Ui::Update() {
+    // In game: the stats overlay, which needs no ImGui frame (Draw).
+    imgui_frame = !status_message.empty() || state != State::InGame;
+    if (!imgui_frame) {
+        return Action::None;
+    }
     ImGui_ImplVita_NewFrame();
 
     Action action = Action::None;
@@ -469,7 +453,6 @@ Ui::Action Ui::Update() {
             action = DrawGameSettings();
             break;
         case State::InGame:
-            DrawStatsHud();
             break;
         case State::Pause:
             action = DrawPauseMenu();
@@ -495,6 +478,10 @@ Ui::Action Ui::Update() {
 }
 
 void Ui::Draw() {
+    if (!imgui_frame) {
+        StatsHud::Draw();
+        return;
+    }
     ImGui_ImplSgxd_RenderDrawData(ImGui::GetDrawData());
 }
 

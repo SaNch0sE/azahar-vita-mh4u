@@ -50,6 +50,19 @@ public:
     /// The renderer is going, and guest memory with it: presents show no guest screens again
     /// until the next PresentGuestScreens.
     void ForgetGuestScreens() override;
+    /// SgxdPresent::FlipPending, FlipDone: the last present on screen once its 3D is done.
+    bool FlipPending(u32* fence) override;
+    s64 FlipDueIn() override;
+    void FlipDone() override;
+
+    /// The stats overlay's numbers changed since the last call (GPU's vblank: a present for the
+    /// overlay when the guest's screens are unchanged).
+    bool TakeOverlayChanged() override {
+        return overlay_changed.exchange(false, std::memory_order_relaxed);
+    }
+    void MarkOverlayChanged() {
+        overlay_changed.store(true, std::memory_order_relaxed);
+    }
 
     /// Draws the guest's screens, if the renderer has sent any, and whatever the UI wants, and
     /// presents. `ui` may be null, in which case only the screens are drawn. The interface
@@ -120,6 +133,7 @@ private:
     std::atomic<s32> stick_x{}, stick_y{};
     std::atomic<bool> input_to_guest{true};
     std::atomic<bool> quit_requested{};
+    std::atomic<bool> overlay_changed{};
     bool touch_down{};
 
     GuestScreen screens[2]{};

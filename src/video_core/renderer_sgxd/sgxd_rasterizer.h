@@ -186,6 +186,17 @@ public:
     [[nodiscard]] bool InterruptArm(u64 fence);
     void InterruptDisarm();
     void InterruptWaker(s32 flag, u32 bits);
+    /// The render side took procedural texture tables: ProcTexTableWords makes its table.
+    void ProcTexTablesChanged() {
+        proctex_table_dirty = true;
+    }
+    [[nodiscard]] bool FlipArm(u32 fence) {
+        return backend.FlipArm(fence);
+    }
+    void SetFlipHook(std::function<bool(u32*)> pending, std::function<s64()> due_in,
+                     std::function<void()> flip) {
+        backend.SetFlipHook(std::move(pending), std::move(due_in), std::move(flip));
+    }
 #ifdef VITA_DIAGNOSTICS
     u64 GpuWaitUs() const override;
 #endif

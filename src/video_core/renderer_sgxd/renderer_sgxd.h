@@ -37,6 +37,12 @@ public:
     /// presents; the frame's end on the emulation thread leaves it alone.
     void PollWindowEvents() override {}
     void PollWindow();
+    /// The window's last present on screen once its GPU work is done (EmuWindow::FlipDone), and
+    /// whether one waits, with its fence (FlipPending). The backend's GPU waits flip it too
+    /// (SgxdBackend::SetFlipHook).
+    void FlipDone();
+    [[nodiscard]] bool FlipPending(u32* fence);
+    [[nodiscard]] s64 FlipDueIn();
     bool WouldMakeUncached(PAddr addr, u32 size) const override;
     void MakeUncached(PAddr addr, u32 size, bool overwritten) override;
     bool UncachedFrameEnded() override {

@@ -11,8 +11,10 @@ struct SgxdRecipeDraw;
 
 // The display through sgxd: the GPU taken from SceGpu for the
 // whole session, the recipe's ImGui pass rendering each frame into one of three CDRAM display
-// buffers, and SceDisplay flipping them. No GXM call may run while it is initialised: SceGpu's
-// callers wait at its gate until Shutdown gives the GPU back.
+// buffers, and SceDisplay switching to each at once, vsync off (it tears): a present
+// waits for no vblank, so a loop that presents paces itself (sceDisplayWaitVblankStart). No GXM
+// call may run while it is initialised: SceGpu's callers wait at its gate until Shutdown gives
+// the GPU back.
 namespace VitaFrontend::SgxdPresent {
 
 inline constexpr u32 DisplayWidth = 960;
@@ -48,6 +50,13 @@ struct Batch {
 /// Whether the last frame's render is still on the GPU: the caller drops this frame rather
 /// than wait for it (BeginFrame would).
 [[nodiscard]] bool Busy();
+/// The last async frame, its 3D not yet done: true, with the chain fence its 3D reaches.
+[[nodiscard]] bool FlipPending(u32* fence);
+/// The last async frame, drawn: the microseconds until its flip is due (the pacing), 0 when it
+/// is due or none waits.
+[[nodiscard]] s64 FlipDueIn();
+/// Puts the last async frame on screen once it is drawn and due.
+void FlipDone();
 void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b);
 /// The frame being built; valid between BeginFrame and EndFrame.
 [[nodiscard]] Batch& CurrentBatch();
@@ -64,6 +73,13 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
                      u32 y, u32 w, u32 h);
 /// Renders the batch, waits for the GPU, and queues the frame for the next vblank.
 void EndFrame();
+/// The BeginFrames since the last call that waited for a vblank to free a display buffer.
+[[nodiscard]] u32 TakeDisplayWaits();
+
+/// A GPU session's end (a title's, the game list banner's), once its backend has gone idle: the
+/// last present goes on screen, as the next session counts its lists from 0 again and its
+/// fence would read as not reached. The presenting thread's, with no other presenting.
+void SessionEnded();
 
 /// The next EndFrame writes its picture to ux0:data/azahar/frame_NN.ppm, as GxmPresent's does.
 void DumpNextFrame();

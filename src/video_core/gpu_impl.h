@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include "common/archives.h"
@@ -67,6 +68,14 @@ struct GPU::Impl {
     /// Oldest first (GPU::DeliverInterrupts).
     std::deque<HeldInterrupt> held_interrupts;
 #ifdef ENABLE_GXM
+    /// Whether the guest's screens may show something new since the last present a vblank
+    /// sent: a buffer swap, a write into a framebuffer the LCD shows (GPU::ScreensWritten), a
+    /// loaded state. The LCD's registers and fill are compared with the last present's too. A
+    /// vblank with none of them sends no present: a 30 fps game's second vblank would show the same
+    /// picture again.
+    bool screens_changed{true};
+    std::array<Pica::FramebufferConfig, 2> presented_fb{};
+    std::array<Pica::ColorFill, 2> presented_fill{};
     /// Last: it stops before anything it runs goes (GPU::~GPU stops it first).
     std::unique_ptr<SgxdRenderer::RenderThread> render;
 #endif

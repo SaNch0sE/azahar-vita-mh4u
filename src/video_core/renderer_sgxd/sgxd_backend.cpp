@@ -240,7 +240,36 @@ void SgxdBackend::RenderWait(u32 fence, const char* why) {
         FinishPending(FinishWhy::Wait);
     }
     [[maybe_unused]] const u64 before = WaitMark();
-    if (sgxd_chain_wait(fence) == 0) {
+    DEBUG_ASSERT_MSG(waker_flag >= 0, "sgxd: {} waits with no waker", why);
+    const TraceSpan span{"render_wait", "render_wait_end", sgxd_chain_fence() - fence};
+    int r;
+    for (;;) {
+        u32 flip_fence;
+        if (flip_pending && flip_pending(&flip_fence) && static_cast<s32>(fence - flip_fence) > 0) {
+            r = sgxd_chain_sleep(flip_fence, waker_flag, waker_bits);
+            if (r != 0) {
+                break;
+            }
+            flip_done();
+            continue;
+        }
+        const s64 due_in = flip_due_in ? flip_due_in() : 0;
+        if (due_in > 0) {
+            r = sgxd_chain_sleep_until(fence, waker_flag, waker_bits,
+                                       sceKernelGetProcessTimeWide() + static_cast<u64>(due_in));
+            if (r == 1) {
+                flip_done();
+                continue;
+            }
+            break;
+        }
+        r = sgxd_chain_sleep(fence, waker_flag, waker_bits);
+        break;
+    }
+    // The flag takes one waiter: a refused wait names the others.
+    ASSERT_MSG(r >= -1, "sgxd: {}: the wait's event flag failed ({:#010x}); {}", why,
+               static_cast<u32>(r), Common::DescribeWaiters(waker_flag));
+    if (r == 0) {
         WaitSite(why, before);
         RetireReached();
         return;
@@ -353,9 +382,15 @@ void SgxdBackend::InterruptDisarm() {
     sgxd_wake_disarm();
 }
 
+bool SgxdBackend::FlipArm(u32 fence) {
+    return sgxd_wake_arm(fence, sgxd_ptla_done()) != 0;
+}
+
 void SgxdBackend::InterruptWaker(s32 flag, u32 bits) {
     const int r = sgxd_ptla_waker(flag, bits);
     ASSERT_MSG(flag < 0 || r == 0, "sgxd: sgxdWaker {:#010x}", static_cast<u32>(r));
+    waker_flag = flag;
+    waker_bits = bits;
 }
 
 void SgxdBackend::InterruptWait(const InterruptFence& fence) {

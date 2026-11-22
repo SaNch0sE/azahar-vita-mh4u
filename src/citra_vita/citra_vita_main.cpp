@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 #include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
+#include <psp2/display.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
@@ -226,6 +227,9 @@ std::string DescribeLoadError(Core::System::ResultStatus status) {
 void ShutdownSystem(Core::System& system) {
     VitaFrontend::GxmPresent::UnmapAllGuestMemory();
     system.Shutdown();
+    // The title's GPU session is over: nothing of it is left for the next one (the game list's
+    // banner) to wait on.
+    VitaFrontend::SgxdPresent::SessionEnded();
 }
 
 #ifdef VITA_DIAGNOSTICS
@@ -275,6 +279,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             window.PollEvents();
             ui.Update();
             window.Present(&ui);
+            sceDisplayWaitVblankStart();
         }
         ui.ClearStatusMessage();
         return true;
@@ -382,6 +387,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 shown_fps.store(static_cast<u32>(std::max(perf.system_fps + 0.5, 0.0)),
                                 std::memory_order_relaxed);
                 valid.store(true, std::memory_order_release);
+                // Presented with the guest's screens unchanged too (GPU's vblank).
+                window.MarkOverlayChanged();
 #ifdef VITA_DIAGNOSTICS
                 static const bool perflog = SgxdRenderer::SgxdFlag("perflog");
                 if (perflog) {
@@ -513,9 +520,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const auto& p = render_counters.present;
                     LOG_INFO(Frontend,
                              "perf: present ui update {:.1f} ms, screens {:.1f} ms, ui draw "
-                             "{:.1f} ms, end frame {:.1f} ms",
-                             p.ui_update / 1e3, p.screens / 1e3, p.ui_draw / 1e3,
-                             p.end_frame / 1e3);
+                             "{:.1f} ms, end frame {:.1f} ms; {} waits for a display buffer",
+                             p.ui_update / 1e3, p.screens / 1e3, p.ui_draw / 1e3, p.end_frame / 1e3,
+                             p.display_waits);
                     const auto& c = render_counters.cache;
                     LOG_INFO(Frontend, "perf: cache ops {:.1f} ms in {} for {} KiB", c.us / 1e3,
                              c.calls, c.bytes / 1024);
@@ -949,6 +956,8 @@ int EmulatorMain() {
         window.PollEvents();
         const auto action = ui.Update();
         window.Present(&ui);
+        // The present waits for no vblank: a frame a refresh.
+        sceDisplayWaitVblankStart();
 
         switch (action) {
         case VitaFrontend::Ui::Action::LaunchGame: {

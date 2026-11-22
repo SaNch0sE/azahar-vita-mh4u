@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -96,6 +97,22 @@ struct State {
     bool shown_pending = false;
     u8* shown_buffer = nullptr;
     u32 shown_fence = 0;
+    // Flip pacing: a drawn async present goes on screen no sooner than 7/8 of the presents'
+    // running mean interval after the last flip (FlipDueIn). The last flip's and the last
+    // issue's process times, us.
+    SceUInt64 last_flip_us = 0;
+    SceUInt64 last_issue_us = 0;
+    s64 issue_interval_us = 0;
+    // Each display buffer's last sceDisplaySetFrameBuf: its order (0: never set) and the vblank
+    // count from which the display shows it, between from_lo and from_hi (the counts before and
+    // after the call, plus one: SceDisplay's NEXTFRAME set takes effect at its vblank count + 1,
+    // display.c ksceDisplaySetFrameBufInternal). The count is sceDisplayGetVcount's 16 bits.
+    struct BufferSet {
+        u32 order;
+        u16 from_lo, from_hi;
+    } sets[DisplayBuffers]{};
+    u32 set_order = 0;
+    u32 display_waits = 0;
     u32 touches[4]{}; // the guest screens this frame samples, [lo, hi) GPU address pairs
     char failed_text[160]{};
 
@@ -175,7 +192,7 @@ void WriteDisplayPpm(const char* path, const u8* px) {
     std::fclose(f);
 }
 
-int ShowFrame(void* base) {
+int ShowFrame(void* base, SceDisplaySetBufSync sync = SCE_DISPLAY_SETBUF_NEXTFRAME) {
     SceDisplayFrameBuf fb{};
     fb.size = sizeof(fb);
     fb.base = base;
@@ -183,7 +200,7 @@ int ShowFrame(void* base) {
     fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
     fb.width = DisplayWidth;
     fb.height = DisplayHeight;
-    return sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
+    return sceDisplaySetFrameBuf(&fb, sync);
 }
 
 // A black frame of its own, so the display leaves the buffers before they are freed.
@@ -199,6 +216,31 @@ void ShowBlackFrame() {
     std::memset(base, 0, DisplayBufferSize);
     ShowFrame(base);
     sceDisplayWaitSetFrameBuf();
+}
+
+bool AtOrAfter(u16 a, u16 b) {
+    return static_cast<s16>(static_cast<u16>(a - b)) >= 0;
+}
+
+// A display buffer the display neither shows nor will: one never set, or one a newer set has
+// taken over from (that set's from_hi reached) or takes over from before this one would show
+// (its from_hi at or before this one's from_lo). The oldest such, or -1.
+int FreeDisplayBuffer() {
+    const u16 now = static_cast<u16>(sceDisplayGetVcount());
+    int found = -1;
+    for (u32 i = 0; i < DisplayBuffers; i++) {
+        const State::BufferSet& s = g.sets[i];
+        bool free = s.order == 0;
+        for (u32 j = 0; j < DisplayBuffers && !free; j++) {
+            const State::BufferSet& n = g.sets[j];
+            free =
+                n.order > s.order && (AtOrAfter(now, n.from_hi) || AtOrAfter(s.from_lo, n.from_hi));
+        }
+        if (free && (found < 0 || s.order < g.sets[found].order)) {
+            found = static_cast<int>(i);
+        }
+    }
+    return found;
 }
 
 u32 ScreenVa(u32 offset) {
@@ -492,6 +534,32 @@ bool Busy() {
     return !sgxd_chain_reached(g.shown_fence);
 }
 
+bool FlipPending(u32* fence) {
+    if (!g.shown_pending || !Async() || sgxd_chain_reached(g.shown_fence)) {
+        return false;
+    }
+    *fence = g.shown_fence;
+    return true;
+}
+
+s64 FlipDueIn() {
+    if (!g.shown_pending || !Async() || !sgxd_chain_reached(g.shown_fence)) {
+        return 0;
+    }
+    const s64 due = static_cast<s64>(g.last_flip_us) + g.issue_interval_us * 7 / 8;
+    const s64 now = static_cast<s64>(sceKernelGetProcessTimeWide());
+    return due > now ? due - now : 0;
+}
+
+// On screen once its 3D is done, not at the next present's BeginFrame, which in a GPU-bound scene
+// comes tens of ms later. Paced (FlipDueIn): presents drawn 30 and 10 ms apart go on screen about
+// 20 ms apart.
+void FlipDone() {
+    if (g.shown_pending && Async() && sgxd_chain_reached(g.shown_fence) && FlipDueIn() == 0) {
+        ShowLast();
+    }
+}
+
 // The last async present's 3D completes, then its buffer goes on screen. Before the recipe block
 // or the texture is written again: its 3D reads them.
 void ShowLast() {
@@ -523,14 +591,21 @@ void ShowLast() {
         WriteDisplayPpm(path, buffer);
         LOG_INFO(Frontend, "wrote {}", path);
     }
-    static const bool novsync = GxmRenderer::GxmFlag("novsync");
-    if (!novsync) {
-        sceDisplayWaitSetFrameBuf();
-    }
-    const int shown = ShowFrame(buffer);
-    if (shown < 0) {
-        LOG_ERROR(Frontend, "sgxd: sceDisplaySetFrameBuf {:#010x}", static_cast<u32>(shown));
-    }
+    // Vsync off: the display switches to the buffer at once, within the picture it scans out
+    // (it tears), and every older buffer is free. BeginFrame renders into one of those.
+    // SceDisplay takes an immediate set only once a set has given the head its pitch, format and
+    // size (0x80290006 otherwise, ksceDisplaySetFrameBufInternal): the first is NEXTFRAME.
+    const bool first = g.set_order == 0;
+    const u16 before = static_cast<u16>(sceDisplayGetVcount());
+    const int shown =
+        ShowFrame(buffer, first ? SCE_DISPLAY_SETBUF_NEXTFRAME : SCE_DISPLAY_SETBUF_IMMEDIATE);
+    const u16 after = static_cast<u16>(sceDisplayGetVcount());
+    ASSERT_MSG(shown >= 0, "sgxd: sceDisplaySetFrameBuf {:#010x}", static_cast<u32>(shown));
+    g.last_flip_us = sceKernelGetProcessTimeWide();
+    State::BufferSet& set = g.sets[(buffer - g.buffers) / DisplayBufferSize];
+    set.order = ++g.set_order;
+    set.from_lo = first ? static_cast<u16>(before + 1) : before;
+    set.from_hi = first ? static_cast<u16>(after + 1) : before;
 }
 
 bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
@@ -567,7 +642,21 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
         return;
     }
     ShowLast();
-    g.back = g.frame_index % DisplayBuffers;
+    int back = FreeDisplayBuffer();
+    if (back < 0) {
+        // A vblank fell within a set and leaves which buffer shows open: the newest set shows
+        // once this wait returns, every older one is free.
+        g.display_waits++;
+        u32 newest = 0;
+        for (u32 i = 1; i < DisplayBuffers; i++) {
+            newest = g.sets[i].order > g.sets[newest].order ? i : newest;
+        }
+        sceDisplayWaitSetFrameBuf();
+        g.sets[newest].from_hi = static_cast<u16>(sceDisplayGetVcount());
+        back = FreeDisplayBuffer();
+        ASSERT_MSG(back >= 0, "sgxd: no display buffer free after the display took the newest");
+    }
+    g.back = static_cast<u32>(back);
     std::memset(g.touches, 0, sizeof(g.touches));
     g.clear = 0xff000000u | static_cast<u32>(clear_b) << 16 | static_cast<u32>(clear_g) << 8 |
               clear_r;
@@ -676,7 +765,7 @@ void EndFrame() {
     if (Async()) {
         // After the display transfer's blit: this list's TA runs over its 3D, then waits for it
         // (the guest screens are its output). The buffer goes on screen at the next BeginFrame,
-        // once this 3D is done; three buffers keep it apart from the shown and the queued one.
+        // once this 3D is done; three buffers keep it apart from the shown and the set one.
         if (sgxd_session_render_overlap(&r, g.touches, failed, sizeof(failed)) < 0) {
             std::snprintf(g.failed_text, sizeof(g.failed_text), "%s", failed);
             g.failed = true;
@@ -686,6 +775,14 @@ void EndFrame() {
         g.shown_pending = true;
         g.shown_buffer = buffer;
         g.shown_fence = sgxd_chain_fence() + 1;
+        // The presents' interval, for the flip's pacing: each one's from 4 to 100 ms.
+        const SceUInt64 now_us = sceKernelGetProcessTimeWide();
+        if (g.last_issue_us != 0) {
+            const s64 interval =
+                std::clamp<s64>(static_cast<s64>(now_us - g.last_issue_us), 4000, 100000);
+            g.issue_interval_us += (interval - g.issue_interval_us) / 8;
+        }
+        g.last_issue_us = now_us;
         SgxdRenderer::SgxdTrace("sgx_present_end");
         if (g.frame_index % 600 == 0) {
             Report("sgxd: frame {}: {} draws, {} vertices, {} indices (async)", g.frame_index,
@@ -716,6 +813,10 @@ void EndFrame() {
                render.ta_us, render.d3_us);
     }
     g.frame_index++;
+}
+
+u32 TakeDisplayWaits() {
+    return std::exchange(g.display_waits, 0);
 }
 
 void DumpNextFrame() {

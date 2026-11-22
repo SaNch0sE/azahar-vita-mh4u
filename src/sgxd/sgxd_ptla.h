@@ -124,6 +124,14 @@ int sgxd_chain_ta_reached(uint32_t fence);
 // on a fault or after sgxd_chain_stall_us in which no list completed. The spins time out on the
 // calling thread's cycle counter (azaharCycles): azaharCycleCounter must have run for the process.
 int sgxd_chain_wait(uint32_t fence);
+// The same, asleep: arms the waker (sgxd_wake_arm) for the fence and waits on the app's event
+// flag `flag` (bits, the ones sgxdWaker was given) until the microkernel's SW_EVENT, a tenth of
+// a second at a time. Returns 0, -1 on a fault or a stall as sgxd_chain_wait, or the event
+// flag's error. One waiter on the flag at a time (it is SCE_EVENT_WAITSINGLE).
+int sgxd_chain_sleep(uint32_t fence, int32_t flag, uint32_t bits);
+// The same until the process time `deadline` (us, sceKernelGetProcessTimeWide): 1 when that
+// comes first.
+int sgxd_chain_sleep_until(uint32_t fence, int32_t flag, uint32_t bits, uint64_t deadline);
 extern const uint32_t sgxd_chain_stall_us;
 // Spins until the last list queued completed, as sgxd_chain_wait.
 int sgxd_chain_idle(void);

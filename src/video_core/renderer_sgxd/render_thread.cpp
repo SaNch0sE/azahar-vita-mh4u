@@ -1105,6 +1105,7 @@ void RenderThread::RunAvailable() {
 #ifdef VITA_DIAGNOSTICS
     const auto start = Clock::now();
 #endif
+    u32 since_flip = 0;
     while (r != published.load(std::memory_order_acquire)) {
         Head head;
         const u8* const p = ring.get() + r % RingSize;
@@ -1122,6 +1123,9 @@ void RenderThread::RunAvailable() {
         }
         if (!pending.empty()) {
             PollFences();
+        }
+        if ((++since_flip & 7) == 0) {
+            renderer.FlipDone();
         }
     }
 #ifdef VITA_DIAGNOSTICS
@@ -1427,6 +1431,7 @@ void RenderThread::Loop() {
     for (;;) {
         RunAvailable();
         PollFences();
+        renderer.FlipDone();
         // The emulation side waits for a ticket: its work's pending 3D finishes now.
         if (!pending.empty() && ticket_wait.load(std::memory_order_relaxed)) {
             const u32 waited = waited_ticket.load(std::memory_order_relaxed);
@@ -1483,10 +1488,18 @@ void RenderThread::Loop() {
         sleeping.store(true);
         if (empty() && !park_requested && !stopping) {
             // With tickets pending, sgxd wakes the thread once the oldest one's GPU work is done
-            // (or the lists before a held-back 3D are, for PollFences to send it). Records, a
+            // (or the lists before a held-back 3D are, for PollFences to send it), or the
+            // window's last present's when that comes first, for its flip (FlipDone). Records, a
             // hold and the end wake it through Wake; the window's poll bounds the sleep.
-            const bool waiting = !pending.empty();
-            if (!waiting || rasterizer.InterruptArm(pending.front().fence)) {
+            u32 flip_fence;
+            const bool flip =
+                renderer.FlipPending(&flip_fence) &&
+                (pending.empty() ||
+                 static_cast<s32>(static_cast<u32>(pending.front().fence >> 32) - flip_fence) > 0);
+            const bool waiting = flip || !pending.empty();
+            const bool armed = flip ? rasterizer.FlipArm(flip_fence)
+                                    : waiting && rasterizer.InterruptArm(pending.front().fence);
+            if (!waiting || armed) {
 #ifdef VITA_DIAGNOSTICS
                 const auto start = now;
 #endif

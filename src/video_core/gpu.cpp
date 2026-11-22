@@ -3,12 +3,15 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include "common/archives.h"
 #include "common/hacks/hack_manager.h"
 #include "common/microprofile.h"
 #include "common/process_clock.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/frontend/emu_window.h"
 #include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/loader/loader.h"
@@ -249,11 +252,26 @@ void GPU::FlushRegion(PAddr addr, u32 size) {
 }
 
 void GPU::InvalidateRegion(PAddr addr, u32 size) {
+    ScreensWritten(addr, size);
     impl->rasterizer->InvalidateRegion(addr, size);
 }
 
 void GPU::FlushAndInvalidateRegion(PAddr addr, u32 size) {
+    ScreensWritten(addr, size);
     impl->rasterizer->FlushAndInvalidateRegion(addr, size);
+}
+
+void GPU::ScreensWritten([[maybe_unused]] PAddr addr, [[maybe_unused]] u32 size) {
+#ifdef ENABLE_GXM
+    // The LCD scans 400 columns on the top screen, 320 on the bottom (as VBlankCallback).
+    for (u32 i = 0; i < 2; i++) {
+        const Pica::FramebufferConfig& f = impl->pica.regs.framebuffer_config[i];
+        const PAddr shown = f.second_fb_active ? f.address_left2 : f.address_left1;
+        if (addr < shown + f.stride * (i == 0 ? 400u : 320u) && shown < addr + size) {
+            impl->screens_changed = true;
+        }
+    }
+#endif
 }
 
 void GPU::SwitchDiskResources(u64 title_id) {
@@ -428,6 +446,10 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     framebuffer.stride = info.stride;
     framebuffer.format = info.format;
     framebuffer.active_fb = info.shown_fb;
+#ifdef ENABLE_GXM
+    // The guest's frame, even to the buffer already shown: written again.
+    impl->screens_changed = true;
+#endif
     // vprof: the swap as the register writes it is.
     if (SgxdRenderer::Vprof::Recording()) {
         const u32 first = GPU_REG_INDEX(framebuffer_config[0]) +
@@ -599,6 +621,7 @@ void GPU::MemoryFill(u32 index, std::optional<Service::GSP::InterruptId> interru
     DEBUG_ASSERT_MSG(config.GetStartAddress() != 0, "GPU: memory fill {} from address 0 to {:#x}",
                      index, config.GetEndAddress());
 
+    ScreensWritten(config.GetStartAddress(), config.GetEndAddress() - config.GetStartAddress());
     // Perform memory fill: the PTLA's, queued behind the renders before it.
     RunGpuOp(OpKind::Fill, [this, &config] {
         if (!impl->rasterizer->AccelerateFill(config)) {
@@ -632,6 +655,14 @@ void GPU::MemoryTransfer() {
     // a pointer.
     if (!config.is_texture_copy && allow_display_transfer) {
         KeepUncached(config.GetPhysicalOutputAddress(), config.OutputBytes(), true);
+        ScreensWritten(config.GetPhysicalOutputAddress(), config.OutputBytes());
+    } else if (config.is_texture_copy) {
+        // Its lines of output_width with output_gap after each, as the copy writes them.
+        const u32 width = config.texture_copy.output_width * 16;
+        const u32 line = width + config.texture_copy.output_gap * 16;
+        const u32 size = config.texture_copy.size;
+        ScreensWritten(config.GetPhysicalOutputAddress(),
+                       width == 0 ? size : (size + width - 1) / width * line);
     }
     RunGpuOp(OpKind::Transfer,
              [this, &config, allow_display_transfer] {
@@ -653,6 +684,9 @@ void GPU::RunDma(const std::vector<DmaRun>& runs) {
         SgxdRenderer::Vprof::Dma(words.data(), static_cast<u32>(runs.size()));
     }
 #endif
+    for (const DmaRun& run : runs) {
+        ScreensWritten(run.dst, run.size);
+    }
     RunGpuOp(OpKind::Dma, [this, &runs] {
         for (const DmaRun& run : runs) {
             SgxdRenderer::Vprof::Memory(SgxdRenderer::Vprof::Mem::DmaSource, run.src, run.size);
@@ -837,9 +871,18 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                                               impl->pica.regs_lcd.color_fill_bottom};
 #ifdef ENABLE_GXM
     // On the render thread, after the work before it; it drops one too soon after the last.
-    // The rasterizer's frame ends here whether or not the present is shown.
+    // The rasterizer's frame ends here whether or not the present is shown. Nothing new on the
+    // guest's screens and none in the window's overlay: no present (Impl::screens_changed).
     impl->render->EndFrame();
-    impl->render->Present(fb, fill);
+    const bool overlay = impl->renderer->GetRenderWindow().TakeOverlayChanged();
+    if (impl->screens_changed || overlay ||
+        std::memcmp(&fb, &impl->presented_fb, sizeof(fb)) != 0 ||
+        std::memcmp(&fill, &impl->presented_fill, sizeof(fill)) != 0) {
+        impl->render->Present(fb, fill);
+        impl->screens_changed = false;
+        impl->presented_fb = fb;
+        impl->presented_fill = fill;
+    }
 #else
     // A present has no guest-visible effect: well past the display's rate it is dropped. 12 ms,
     // not a frame's 16.7: at 100% the guest's VBlanks jitter around the frame, and a frame's cap
@@ -861,6 +904,10 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 template <class Archive>
 void GPU::serialize(Archive& ar, const u32 file_version) {
     ar & impl->pica;
+#ifdef ENABLE_GXM
+    // A loaded state's screens are in the memory it loaded.
+    impl->screens_changed = true;
+#endif
 }
 
 SERIALIZE_IMPL(GPU)

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <psp2/ctrl.h>
+#include <psp2/display.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/touch.h>
 
@@ -237,13 +238,14 @@ void EmuWindowVita::RunPauseMenu(Ui& ui) {
         ReadPad();
         UpdateTouch();
         ps_held = (buttons_held.load(std::memory_order_relaxed) & SCE_CTRL_PSBUTTON) != 0;
-        // A frame a refresh: the present waits for the frame before it to be on screen, and is
-        // dropped while that one still renders, so wait for it here instead.
+        // A frame a refresh: the present waits for no vblank, and is dropped while the frame
+        // before still renders, so wait for both here instead.
         while (SgxdPresent::Busy()) {
             sceKernelDelayThread(1000);
         }
         action = ui.Update();
         Present(&ui, false);
+        sceDisplayWaitVblankStart();
     }
     LOG_INFO(Frontend, "pause menu: closed, action {}", static_cast<int>(action));
     switch (action) {
@@ -359,6 +361,18 @@ void EmuWindowVita::PresentGuestScreens(const GuestScreen (&next)[2]) {
     screens[1] = next[1];
     have_screens = true;
     Present(render_ui.load(std::memory_order_acquire));
+}
+
+bool EmuWindowVita::FlipPending(u32* fence) {
+    return SgxdPresent::FlipPending(fence);
+}
+
+s64 EmuWindowVita::FlipDueIn() {
+    return SgxdPresent::FlipDueIn();
+}
+
+void EmuWindowVita::FlipDone() {
+    SgxdPresent::FlipDone();
 }
 
 void EmuWindowVita::ForgetGuestScreens() {

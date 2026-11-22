@@ -195,6 +195,8 @@ public:
     [[nodiscard]] u32 FenceAll() const;
     /// Waits for a fence (RenderFence's, FenceAll's, or a list's count), sending the pending
     /// 3D's finish if the fence takes it; a failed list stops the process as RenderIdle does.
+    /// It sleeps on the waker's flag until the GPU's interrupt (sgxd_chain_sleep): the render
+    /// thread's own, or the emulation thread's under a hold, while the render thread is parked.
     void RenderWait(u32 fence, const char* why);
     /// A mark covering every pass so far, the open one included once it ends; WaitPassMark
     /// waits for its passes' 3Ds (the LUT rows they sample). Marks of passes long gone wait
@@ -243,6 +245,18 @@ public:
     /// sgxdWaker: the render thread's event flag, whose bits sgxd sets when an armed sleep's
     /// work is done; a negative flag stops it.
     void InterruptWaker(s32 flag, u32 bits);
+    /// The render thread's sleep until the window's last present is drawn (its chain fence):
+    /// false when it is drawn already. Disarm after the sleep.
+    [[nodiscard]] bool FlipArm(u32 fence);
+    /// The window's present waiting for its 3D (pending: its chain fence), drawn and held for
+    /// its paced flip (due_in, us), and its flip. A RenderWait for later work sleeps until that
+    /// 3D or that time first and flips it.
+    void SetFlipHook(std::function<bool(u32*)> pending, std::function<s64()> due_in,
+                     std::function<void()> flip) {
+        flip_pending = std::move(pending);
+        flip_due_in = std::move(due_in);
+        flip_done = std::move(flip);
+    }
     [[nodiscard]] const SgxdEvents& Events() const {
         return events;
     }
@@ -605,6 +619,12 @@ private:
      */
     void DrawTiled(const UntileSource& src, bool transposed, u32 scale_x = 1, u32 scale_y = 1);
 
+    s32 waker_flag = -1;
+    u32 waker_bits = 0;
+    std::function<bool(u32*)> flip_pending;
+    std::function<s64()> flip_due_in;
+    std::function<void()> flip_done;
+
     std::vector<std::unique_ptr<Recipe>> recipes;
     Recipe* current{}; // the open pass's
     u32 next_va{};     // where the next recipe's block goes
@@ -813,8 +833,6 @@ private:
     std::array<u32, static_cast<std::size_t>(FinishWhy::Count)> finishes{};
     u64 target_times_start{};
     void TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us);
-    /// gxm_flags perflog: the CPU's spins on the GPU by the site that waited (string literals),
-    /// from sgxd_wait_us_total's growth across each; what no site took is "elsewhere".
     std::unordered_map<const char*, std::pair<u32, u64>> wait_sites;
     u64 wait_sites_mark{};
 #endif
