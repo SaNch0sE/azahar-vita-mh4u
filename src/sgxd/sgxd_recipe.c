@@ -455,6 +455,7 @@ static unsigned draw_words(const SgxdRecipe *r) { return r->imgui || r->programs
 
 unsigned sgxd_recipe_grid;
 uint32_t sgxd_recipe_pixelbe = 0x80;
+unsigned sgxd_recipe_samples = 1;
 
 int sgxd_recipe_init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
                      uint32_t pages) {
@@ -490,28 +491,32 @@ int sgxd_recipe_init_imgui(SgxdRecipe *r, uint32_t width, uint32_t height, uint3
                 ndraws, 0, sa_offset, fs, 0);
 }
 
-// The tiling of a W x H target under r's macrotile grid (r->count).
+// The tiling of a W x H target under r's macrotile grid (r->count). The macrotiles count pixel
+// tiles, rounded to four along an axis of one sample and to two along one of two (Sony's 2x
+// render: 4 x 2 for a 32x32 target, MTILE stride 8); the region arrays and the tail pointer
+// caches hold the sample tiles, the rows twice over at 2x (its region array 0x300 bytes).
 static void tiling(SgxdRecipe *r, uint32_t W, uint32_t H) {
+    const uint32_t sy = r->samples == 2 ? 2 : 1, ry = 4 / sy - 1;
     r->tx = (W + 31) / 32;
     r->ty = (H + 31) / 32;
     if (r->count == 2) {
         r->mx = ((r->tx + 1) / 2 + 3) & ~3u;
-        r->my = ((r->ty + 1) / 2 + 3) & ~3u;
+        r->my = ((r->ty + 1) / 2 + ry) & ~ry;
         r->mtile1 = r->mx << 22 | r->mx << 12 | r->mx;
         r->mtile2 = r->my << 22 | r->my << 12 | r->my;
     } else {
         // The 4x4 grid (960x544, Sony's display form).
         r->mx = ((r->tx + 3) / 4 + 3) & ~3u;
-        r->my = ((r->ty + 3) / 4 + 3) & ~3u;
+        r->my = ((r->ty + 3) / 4 + ry) & ~ry;
         r->mtile1 = 1u << 31 | r->mx << 22 | 2 * r->mx << 12 | 3 * r->mx;
         r->mtile2 = r->my << 22 | 2 * r->my << 12 | 3 * r->my;
     }
     r->stride = r->mx * r->my;
     r->te_screen = (r->ty - 1) << 12 | (r->tx - 1);
     r->mte_screen = (H - 1) << 12 | (W - 1);
-    r->rgn_size = (r->count * r->count * r->mx * r->my * 12 + 63) & ~63u;
+    r->rgn_size = (r->count * r->count * r->mx * r->my * sy * 12 + 63) & ~63u;
     uint32_t pp = 1;
-    const uint32_t cm = r->count * (r->mx > r->my ? r->mx : r->my);
+    const uint32_t cm = r->count * (r->mx > r->my * sy ? r->mx : r->my * sy);
     while (pp < cm) {
         pp *= 2;
     }
@@ -559,6 +564,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     const uint32_t W = width, H = height;
 
     r->count = sgxd_recipe_grid ? sgxd_recipe_grid : W * H < 0x4b000 ? 2 : 4;
+    r->samples = sgxd_recipe_samples == 2 ? 2 : 1;
     tiling(r, W, H);
     r->layout_width = W;
     r->layout_height = H;
@@ -827,6 +833,9 @@ static uint64_t usse_ima32(unsigned dest, unsigned src0, unsigned src1, unsigned
 #define EMIT_FREEP 0x00200000ull
 #define USE1_END (0x00040000ull << 32)
 #define PBE_TWIDDLED (2u << 26)
+// The emit's sideband (low word 27..22 its bits 5..0): SCALE_AA, bit 0. Every emit here carries
+// TILERELATIVE (bit 2) in EMITPIX_EOT.
+#define EMIT_SCALE_AA (1ull << 22)
 #define PBE_NOADVANCE (1u << 31)
 
 // The end of tile storing a part of the target (SgxdPicaStore's x0..x1, y0..y1): the strips of
@@ -929,8 +938,10 @@ static unsigned pica_eot_part(const SgxdRecipe* r, const SgxdPicaStore* s, uint6
 // tools/sgx_pica_eot_probe.py prod_program, word for word.
 unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out) {
     const uint32_t width = r->width, height = r->height;
-    if (width % 8 || height % 16 || width < 8 || width > 1024 || height < 32 || height > 1024 ||
-        (s->bpp != 2 && s->bpp != 3 && s->bpp != 4)) {
+    // A 2x tile is 32x16 pixels, which the strips below do not cover: a 2x pass stores its
+    // picture (sgxd_recipe_pica_eot_scaled).
+    if (r->samples == 2 || width % 8 || height % 16 || width < 8 || width > 1024 || height < 32 ||
+        height > 1024 || (s->bpp != 2 && s->bpp != 3 && s->bpp != 4)) {
         return 0;
     }
     if (s->x1 != 0 && (s->x0 != 0 || s->x1 != width || s->y0 != 0 || s->y1 != height)) {
@@ -1042,7 +1053,9 @@ unsigned sgxd_recipe_pica_eot_scaled(const SgxdRecipe *r, const SgxdPicaStore *s
     PUT(usse_limm(4, EDGE(x0) | EDGE(y0) << 12 | floor_log2((r->width + 15) / 16) << 24 |
                          floor_log2((r->height + 15) / 16) << 28));
     PUT(usse_limm(5, (EDGE(x1) - 1) | (EDGE(y1) - 1) << 12));
-    PUT(EMITPIX_EOT);
+    // At 2x, SCALE_AA: the PBE stores each pixel's two samples averaged, the sizes and the clip
+    // in pixels (libgxm's 2x resolve: one such emit a tile, sideband 5).
+    PUT(r->samples == 2 ? EMITPIX_EOT | EMIT_SCALE_AA : EMITPIX_EOT);
 #undef PUT
 #undef EDGE
     return n;
@@ -1551,8 +1564,11 @@ void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
     }
 
     // T2: TE and MTE, then each core's region array, tail pointer cache and TE_STATE.
+    // TE_AA (0x0204) and MTE_MULTISAMPLECTL (0x0250): AA in y and the two samples' positions
+    // at 2x, the pixel centre at 1x (Sony's values).
+    const int msaa = r->samples == 2;
     const uint32_t t2[][3] = {
-        {0x0204, 0, KEPT_NONE},
+        {0x0204, msaa ? 0x40000000u : 0, KEPT_NONE},
         {0x0208, r->mtile1, SGXD_KEPT_MTILE1},
         {0x020c, r->mtile2, SGXD_KEPT_MTILE2},
         {0x0210, r->te_screen, SGXD_KEPT_TE_SCREEN},
@@ -1563,7 +1579,7 @@ void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
         {0x0244, 0x358637bd, KEPT_NONE},
         {0x0248, r->mte_screen, SGXD_KEPT_MTE_SCREEN},
         {0x0388, 0, KEPT_NONE},
-        {0x0250, 0x88, KEPT_NONE},
+        {0x0250, msaa ? 0xcc44u : 0x88u, KEPT_NONE},
         {0x0238, sgxd_recipe_va(r, SGXD_R_STREAM), KEPT_NONE},
     };
     for (unsigned n = 0; n < sizeof(t2) / sizeof(t2[0]); n++) {
@@ -1707,7 +1723,10 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
         slc_request(l, 0x44);
     }
 
-    // D2: ISP, PBE and the pixel event.
+    // D2: ISP, PBE and the pixel event. 3D_AA_MODE (0x042c) 1 and ISP_MULTISAMPLECTL (0x04c8)
+    // the samples' positions at 2x; MULTISAMPLECTL2 (0x04cc) iterates at the pixel centre either
+    // way.
+    const int msaa3d = r->samples == 2;
     const uint32_t d2[][3] = {
         {0x04c0, 0, KEPT_NONE},
         {0x040c, 0, KEPT_NONE},
@@ -1725,7 +1744,7 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
         {0x0420, 0x1e3ce508, KEPT_NONE},
         {0x050c, sgxd_recipe_va(r, SGXD_R_EXTZ), KEPT_NONE},
         {0x0424, 0xe9, KEPT_NONE},
-        {0x042c, 0, KEPT_NONE},
+        {0x042c, msaa3d ? 1u : 0u, KEPT_NONE},
         {0x044c, 0, KEPT_NONE},
         {0x0480, r->zls[0], SGXD_KEPT_ZLS0},
         {0x0484, r->zls[1], SGXD_KEPT_ZLS0 + 1},
@@ -1735,7 +1754,7 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
         {0x04b8, r->bgobjdepth, SGXD_KEPT_BGOBJDEPTH},
         {0x04bc, r->bgobj, SGXD_KEPT_BGOBJ},
         {0x04c4, r->bgobjtag, SGXD_KEPT_BGOBJTAG},
-        {0x04c8, 0x88, KEPT_NONE},
+        {0x04c8, msaa3d ? 0xcc44u : 0x88u, KEPT_NONE},
         {0x04cc, 0x188, KEPT_NONE},
         {0x04dc, 8, KEPT_NONE},
         {0x0520, r->mtile1, SGXD_KEPT_MTILE1},

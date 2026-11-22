@@ -446,6 +446,12 @@ static unsigned slc(SgxdOp *ops) {
     return sizeof(list) / sizeof(list[0]);
 }
 
+int sgxd_slc_invalidate(void) {
+    SgxdOp ops[8];
+    const unsigned n = slc(ops);
+    return sgxdSubmit(ops, n) == (int)n ? 0 : -1;
+}
+
 // A blit list's end, after FLUSH, with events: the microkernel clears TWOD_COMPLETE and counts
 // it, so the leading clear and the poll go; a blit before the last waits for that count, the last
 // returns. Returns the list's length.

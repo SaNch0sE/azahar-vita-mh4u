@@ -1387,6 +1387,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::Msaa,
+         Category::Display,
+         Kind::Toggle,
+         "Anti-aliasing (2x MSAA)",
+         "Smooths jagged edges on the top screen. It costs GPU time, so slow games get slower, and "
+         "the top screen stays at Native resolution while it is on. Can crash games that use a lot "
+         "of video memory.",
+         {},
+         0,
+         nullptr,
+         nullptr});
 
     // Speed: how fast and how smoothly.
     add({Option::Vsync,
@@ -1636,14 +1647,16 @@ void Ui::StepRow(const Row& row, int delta) {
 }
 
 const char* Ui::DisabledReason(const Row& row) const {
-    if (row.option == Config::Option::SpeedLimit) {
-        const int vsync = settings_title.empty()
-                              ? Config::Global(Config::Option::Vsync)
-                              : Config::ForTitle(settings_title, Config::Option::Vsync);
-        if (vsync != 0) {
-            return "Off while Vsync is on: vsync already holds the game to the display's rate. "
-                   "Turn Vsync off to set a speed limit.";
-        }
+    // The other option's value where this row's is edited: all games' or the title's.
+    const auto other = [this](Config::Option option) {
+        return settings_title.empty() ? Config::Global(option)
+                                      : Config::ForTitle(settings_title, option);
+    };
+    if (row.option == Config::Option::SpeedLimit && other(Config::Option::Vsync) != 0) {
+        return "Off while Vsync is on. Turn Vsync off to set a speed limit.";
+    }
+    if (row.option == Config::Option::TopScale && other(Config::Option::Msaa) != 0) {
+        return "Native while Anti-aliasing is on. Turn Anti-aliasing off to choose a resolution.";
     }
     return nullptr;
 }

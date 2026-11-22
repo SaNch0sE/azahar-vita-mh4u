@@ -181,6 +181,11 @@ u8* MapBlock(const char* name, u32 va, u32 size, int& uid) {
     const int mapped = sgxdMap(va, base, size, 0);
     DEBUG_ASSERT_MSG(mapped == 0, "sgxd: {} not mapped at GPU {:#010x}: {:#010x}", name, va,
                      static_cast<u32>(mapped));
+    // The map invalidates the BIF's caches, not the SLC, which the GPU's page-table walks go
+    // through: a PTLA op as the first work in a new block faulted on a mapped page. The 3D's kicks
+    // invalidate the SLC; the PTLA's lists do not.
+    [[maybe_unused]] const int slc = sgxd_slc_invalidate();
+    DEBUG_ASSERT_MSG(slc == 0, "sgxd: the SLC not emptied after mapping {}", name);
     return static_cast<u8*>(base);
 }
 
@@ -594,14 +599,14 @@ void SgxdBackend::FreeRecipeBlock(const Recipe& r) {
     shell_slots_used &= ~(u64{1} << r.shell_slot);
 }
 
-SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
+SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u32 samples) {
     // A recipe block is its render's until that 3D completes (its fence): an instance the GPU
     // is done with, else a new one, else the one done first. The pending 3D's is never free.
     const Recipe* const pending = Pending();
     u32 instances = 0;
     Recipe* oldest = nullptr;
     for (const auto& r : recipes) {
-        if (r->width == width && r->height == height && r->kind == kind) {
+        if (r->width == width && r->height == height && r->kind == kind && r->samples == samples) {
             instances++;
             if (r.get() == pending) {
                 continue;
@@ -652,7 +657,7 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
             sgxd_gpu_idle();
             for (const auto& r : recipes) {
                 if (r->width == width && r->height == height && r->kind == kind &&
-                    sgxd_chain_reached(r->fence)) {
+                    r->samples == samples && sgxd_chain_reached(r->fence)) {
                     return *r;
                 }
             }
@@ -687,15 +692,18 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     r.width = width;
     r.height = height;
     r.kind = kind;
+    r.samples = samples;
     r.instance = instances;
     r.va = va;
     // Every pass renders to a surface or guest memory: the recipe's own FB and DEPTH, and its
     // pages, take no CDRAM.
     sgxd_recipe_external_fb = 1;
+    sgxd_recipe_samples = samples;
     [[maybe_unused]] const int init = sgxd_recipe_init_programs(
         &r.recipe, width, height, r.va, Pages, identity.data(), MaxIndices, init_draws.data(),
         MaxDraws);
     sgxd_recipe_external_fb = 0;
+    sgxd_recipe_samples = 1;
     DEBUG_ASSERT_MSG(init == 0, "sgxd: the recipe does not take a {}x{} target", width, height);
     r.bg_offset = AlignUp(r.recipe.offset[SGXD_R_END], 0x1000);
     r.size = AlignUp(r.bg_offset + 0x1000, 256u << 10);
@@ -729,9 +737,10 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     sgxd_recipe_sa_background(&r.recipe, r.memory, r.bg_offset, 0xff000000u);
     static constexpr const char* kinds[] = {"linear", "PICA", "side"};
     LOG_INFO(Render,
-             "sgxd: the rasterizer's {}x{} {} recipe {}, {} KiB at GPU {:#010x} ({}): layout {} "
+             "sgxd: the rasterizer's {}x{} {}{} recipe {}, {} KiB at GPU {:#010x} ({}): layout {} "
              "KiB; shared block at {:#010x}",
-             width, height, kinds[static_cast<u32>(kind)], r.instance, r.size >> 10, r.va,
+             width, height, kinds[static_cast<u32>(kind)], samples == 2 ? " 2x" : "", r.instance,
+             r.size >> 10, r.va,
              r.shell_slot >= 0 ? "the shell's CDRAM" : "the game's",
              r.recipe.offset[SGXD_R_END] >> 10, BlockVa);
     recipes.push_back(std::move(made));
@@ -1689,8 +1698,11 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     const u32 margin = pica && pica->picture ? pica->picture_margin : 0;
     DEBUG_ASSERT(q >= 4 && q <= 8 && width * q % 4 == 0 && height * q % 4 == 0 &&
                  margin * q % 4 == 0);
+    // A 2x pass draws its picture alone (sgxd_recipe_pica_eot_scaled averages the samples).
+    const u32 samples = pica && pica->picture ? pica->picture_samples : 1;
+    DEBUG_ASSERT(samples == 1 || samples == 2);
     Recipe& r = RecipeFor((width + 2 * margin) * q / 4, height * q / 4,
-                          pica ? Kind::Pica : Kind::Linear);
+                          pica ? Kind::Pica : Kind::Linear, samples);
     current = &r;
     pass_target = pica ? Footprint{pica->gpu, pica->gpu + pica->width * pica->height * pica->bpp}
                        : Footprint{target_gpu, target_gpu + width * height * 4};

@@ -96,14 +96,19 @@ public:
     /// row's left edge at picture column (row + margin) * quarters / 4 and the 400 lower.
     static bool TopScreenPicture(PAddr lcd, u32& gpu, u32& width, u32& height, u32& row,
                                  u32& quarters, u32& margin, bool& flip);
-    /// The upscaled top screen's scale in quarters: 4 (none, the default), 5 (1.25x) or 6
-    /// (1.5x); the frontend's setting, read at each pass on the buffer. Any thread.
+    /// The internal resolution in quarters (4 native, 5 1.25x, 6 1.5x), read at each pass on a buffer.
+    /// TopScale answers 4 while TopMsaa is on. Any thread.
     static void SetTopScale(u32 quarters);
     [[nodiscard]] static u32 TopScale();
     /// Widescreen: the top screen's colour buffers drawn margin rows wider each side (a multiple of 4,
     /// 0 for none). Any thread.
     static void SetWidescreen(u32 margin);
     [[nodiscard]] static u32 Widescreen();
+    /// 2x MSAA on the top screen (every other buffer at 1x while it is on). Any thread.
+    static void SetTopMsaa(bool on);
+    [[nodiscard]] static bool TopMsaa();
+    /// Whether the top screen's pictures are other than 1x ones: upscaled, widescreen or 2x.
+    [[nodiscard]] static bool TopPictures();
     /// A guest frame has ended (each VBlank, its present shown or dropped): the draw logs count frames.
     void EndFrame() {
         frames++;
@@ -926,6 +931,7 @@ private:
         u32 width, height, bytes; ///< the guest buffer's
         u32 quarters;              ///< its scale (TopScale when it was made)
         u32 margin;                ///< its widescreen margin (Widescreen when it was made)
+        u32 samples;               ///< its passes' samples a pixel (2 with TopMsaa, at 1x)
         SgxdBackend::Data picture; ///< height x width scaled (the pass's transpose), LINEAR U8888
         u32 stride;                ///< its rows apart, in pixels (a multiple of 8)
         bool valid = false; ///< it holds the buffer's picture: only its scaled passes wrote since
@@ -937,6 +943,7 @@ private:
     u32 pass_quarters = 4;                       ///< the pass's pixels to the guest's, in quarters
     static constexpr u32 TopScreenRows = 400;
     u32 pass_margin = 0;  ///< its widescreen margin, in the buffer's rows (Upscaled::margin)
+    u32 pass_samples = 1; ///< its samples a pixel (Upscaled::samples)
     bool pass_widened{};  ///< its part as wide as the screen: the margins beside it drawn too
     /// A guest pixel edge in the pass's pixels: the first pixel whose centre is at or past it.
     [[nodiscard]] s32 PassEdge(s32 v) const {
@@ -1146,6 +1153,7 @@ private:
         u32 width, height, format; // the guest buffer's
         u32 quarters;              // the store's samples a pixel side, in quarters: 4 at 1x
         u32 margin;                // the widescreen margin it is wider by, the buffer's rows
+        u32 samples;               // samples a pixel: 2 for a 2x pass's (its rows twice over)
         SgxdBackend::DepthStore store;
         bool valid; // the last pass on the buffer stored it, and nothing wrote there since
         // A pass storing part of its target stores its depth here, then that part into store.
@@ -1165,14 +1173,14 @@ private:
     };
     std::vector<DepthStore> depth_stores;
     DepthStore& DepthStoreFor(PAddr addr, u32 width, u32 height, u32 format, u32 quarters = 4,
-                              u32 margin = 0);
+                              u32 margin = 0, u32 samples = 1);
     /// Whether a store of that shape holds the buffer's depth (a pass may load it).
     bool DepthStoreValid(PAddr addr, u32 width, u32 height, u32 format, u32 quarters,
-                         u32 margin) const;
+                         u32 margin, u32 samples = 1) const;
     DepthStore* DepthStoreOf(PAddr addr, u32 width, u32 height, u32 format);
     void SettleDepthClear(DepthStore& d);
     SgxdBackend::DepthStore NewDepthStore(u32 width, u32 height, u32 format,
-                                          bool upscaled = false);
+                                          bool upscaled = false, u32 samples = 1);
     void DepthStoresWritten(PAddr start, PAddr end);
 
     u32 fills{};

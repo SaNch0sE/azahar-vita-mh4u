@@ -416,6 +416,8 @@ StateArguments TakeStateArguments() {
             Config::Pin(Option::Widescreen, 0);
         } else if (argument == "wide=stretch") {
             Config::Pin(Option::Widescreen, 2);
+        } else if (argument.starts_with("msaa=")) {
+            Config::Pin(Option::Msaa, std::atoi(argument.c_str() + 5) != 0 ? 1 : 0);
         } else if (argument == "rightstick=cstick" || argument == "rightstick=lr" ||
                    argument == "rightstick=dpad") {
             using Mode = Config::RightStickMode;

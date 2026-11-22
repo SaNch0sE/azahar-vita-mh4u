@@ -39,6 +39,8 @@ enum class Option : u32 {
     /// hack, 2 stretched.
     Widescreen,
     TopScale,
+    /// 2x MSAA on the top screen (RasterizerSgxd::SetTopMsaa): 0 off, 1 on.
+    Msaa,
     Vsync,
     /// Percent of full speed, 0 for none. Not applied while vsync is on, which holds the
     /// emulation to the display's rate already: a limit kept for a title or all games waits

@@ -216,6 +216,9 @@ public:
         // part's columns grow by the margin each side too (a viewport as wide as the screen).
         u32 picture{}, picture_stride{}, picture_quarters{}, picture_margin{};
         bool picture_widen{};
+        // With a picture: its pass's samples a pixel, 1 or 2 (2x MSAA, sgxd_recipe_samples): a
+        // 2x pass's tiles store each pixel's samples averaged into the picture.
+        u32 picture_samples{1};
     };
     /// Opens a pass on target. The background is clear (A8B8G8R8) at depth, what a fill left
     /// pending in guest memory. before: as BeginPassLoaded's.
@@ -614,6 +617,7 @@ private:
         u32 width{}, height{};
         u32 bg_offset{}; // the background colour word and its SA secondary, after the layout
         Kind kind{};
+        u32 samples{1}; // samples a pixel (sgxd_recipe_samples)
         u32 instance{};   // up to MaxInstances of each size, the pending pass's among them
         u32 fence{};      // the list that completes its last render's 3D
     };
@@ -644,7 +648,7 @@ private:
 
     /// The recipe for a width x height target of kind, made at its first use. A PICA recipe's
     /// pixel event program DOUTAs IR0 to its end of tile (sgxd_recipe_pica_pixev).
-    Recipe& RecipeFor(u32 width, u32 height, Kind kind);
+    Recipe& RecipeFor(u32 width, u32 height, Kind kind, u32 samples = 1);
     void RenderSync(Recipe& r, u32* ta_us, u32* d3_us);
     void RenderAsync(Recipe& r, const u32 touches[6]);
     void PlaceFixedPrograms();

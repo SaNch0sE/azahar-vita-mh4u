@@ -162,6 +162,10 @@ typedef struct SgxdRecipe {
     uint32_t layout_width, layout_height, layout_rgn_size, layout_tpc_size;
     uint32_t term_va, term_units;          // sgxd_recipe_set_term: the stream's terminate program
     uint32_t double_pixels;                // DOUBLE_PIXEL_PARTITIONS (0x0148) at the 3D kick
+    // Samples a pixel, 1 or 2 (2x MSAA, sgxd_recipe_samples at init): two down, as Sony's 2x
+    // render takes them. Each 32x32-sample tile then holds 32x16 pixels; TE_SCREEN, the region
+    // clip and the background stay in pixels and pixel tiles.
+    uint32_t samples;
 } SgxdRecipe;
 
 // The macrotile grid of later inits. 0 (the default) picks by size as Sony's kernel does: 4x4
@@ -186,6 +190,13 @@ typedef struct SgxdRecipePb {
     uint32_t req_base, pt, first, last;
 } SgxdRecipePb;
 extern SgxdRecipePb sgxd_recipe_pb;
+// Set before init: the recipe's samples a pixel, 1 (the default) or 2 (2x MSAA). A 2x recipe
+// tiles its target in samples (the macrotiles' rows and the region arrays twice as tall), and its
+// kicks set TE_AA, 3D_AA_MODE and both multisample controls as Sony's 2x render does: samples at
+// (0.25, 0.25) and (0.75, 0.75), the pixel centre iterated. A pass on it stores through
+// SCALE_AA emits, which average each pixel's two samples, and its depth in memory is the
+// samples' (twice the rows).
+extern unsigned sgxd_recipe_samples;
 // Set before init: every recipe renders to an external target (sgxd_recipe_set_target), so
 // the layout gives the block's own FB and DEPTH no room. With sgxd_recipe_pb set, the page
 // table and pages take none either.
@@ -393,15 +404,16 @@ typedef struct SgxdPicaStore {
 #define SGXD_RECIPE_PICA_EOT_MAX 256u
 // The end-of-tile program storing r's target into s's buffer: up to SGXD_RECIPE_PICA_EOT_MAX
 // instructions into out, temporaries r0..r15. Returns the count, or 0 for a target route 1 does
-// not take (width a multiple of 8 up to 1024, height of 16 from 32 to 1024) or a part of it not
-// in 8s (y0 in 16s).
+// not take (width a multiple of 8 up to 1024, height of 16 from 32 to 1024), a part of it not
+// in 8s (y0 in 16s), or a 2x recipe.
 unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out);
 // The end of tile of a target r draws at quarters / 4 times the size of s's buffer (4 to 8: 1x
 // to 2x; 1x for a widescreen picture, whose buffer is the picture's columns at 1x and whose part
 // is in them): s's part (or all of it) scaled into picture, LINEAR U8888 rows picture_stride pixels
 // apart; s's buffer is left as it is. A part's edge at x lands on the first pixel whose centre is
-// at or past x * quarters / 4. Returns the count, or 0 for r not a whole buffer's size scaled, a
-// part outside it, or a stride under r's width or odd.
+// at or past x * quarters / 4. A 2x recipe's emit averages each pixel's samples (SCALE_AA).
+// Returns the count, or 0 for r not a whole buffer's size scaled, a part outside it, or a stride
+// under r's width or odd.
 unsigned sgxd_recipe_pica_eot_scaled(const SgxdRecipe *r, const SgxdPicaStore *s,
                                      unsigned quarters, uint32_t picture, uint32_t picture_stride,
                                      uint64_t *out);

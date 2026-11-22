@@ -64,6 +64,7 @@ const std::array<Definition, Count> definitions{{
     {"overlay_opacity", true, true, 10, 100, 60, {}},
     {"widescreen", true, true, 0, 2, 0, WidescreenWords},
     {"top_scale", true, true, 0, 4, 0, Scales},
+    {"msaa", true, true, 0, 1, 0, Toggle},
     {"vsync", true, true, 0, 1, 1, Toggle},
     // Full speed: applied only with vsync off (vsync holds the display's rate itself).
     {"speed_limit", true, true, 0, 200, 100, {}},
@@ -170,6 +171,9 @@ void ApplyLocked(Option option) {
     case Option::TopScale:
         // In quarters: 4 is the 3DS's resolution (Scales: 1x to 2x).
         SgxdRenderer::RasterizerSgxd::SetTopScale(TopScaleQuarters(value));
+        break;
+    case Option::Msaa:
+        SgxdRenderer::RasterizerSgxd::SetTopMsaa(value != 0);
         break;
     case Option::Vsync:
         Settings::values.use_vsync = value != 0;

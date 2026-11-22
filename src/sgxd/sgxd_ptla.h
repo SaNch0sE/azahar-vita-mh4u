@@ -152,6 +152,10 @@ extern const uint32_t sgxd_chain_stall_us;
 int sgxd_chain_idle(void);
 // The render drain, then sgxd_ptla_idle and sgxd_chain_idle: nothing of ours runs on the GPU.
 int sgxd_gpu_idle(void);
+// The SLC written back and emptied, synchronously, with nothing of ours on the GPU (after
+// sgxd_gpu_idle): after the CPU maps memory for the GPU, whose walks of the new page tables go
+// through the SLC. 0, or -1 when an op did not complete.
+int sgxd_slc_invalidate(void);
 // Who runs overlapped lists registers how to finish their last 3D (0, or -1 on a fault):
 // sgxd_gpu_idle calls it first. PTLA fills and copies do not: their caller queues that finish
 // first when the op touches the 3D's memory.
