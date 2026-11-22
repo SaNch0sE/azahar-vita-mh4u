@@ -154,11 +154,8 @@ vita_create_vpk(citra_vita.vpk ${VITA_TITLEID} citra_vita.self
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
         ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
 )
-# The module is a byproduct of the sub-build in src/core; this orders the vpk after it for
-# generators that do not follow a file dependency across directories.
-if (TARGET vita_native_module)
-    add_dependencies(citra_vita.vpk-vpk vita_native_module)
-endif()
+# The plugin is made in vita_native/: the vpk waits for it.
+add_dependencies(citra_vita.vpk-vpk azaharnative.skprx-self)
 
 # The replay player (diagnostics builds, on request: "ninja citra_vita_player.vpk-vpk"): a
 # vprof capture's frame on sgxd with no title, as Razor replays a capture without the game
@@ -179,9 +176,7 @@ if (ENABLE_VITA_DIAGNOSTICS)
             ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
             ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
     )
-    if (TARGET vita_native_module)
-        add_dependencies(citra_vita_player.vpk-vpk vita_native_module)
-    endif()
+    add_dependencies(citra_vita_player.vpk-vpk azaharnative.skprx-self)
     # vita.cmake makes its targets part of "all"; the player is built on request only.
     foreach(player_target citra_vita_player-velf citra_vita_player.self-self
                           citra_vita_player.vpk-vpk)

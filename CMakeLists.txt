@@ -619,6 +619,10 @@ if (USE_SYSTEM_SOUNDTOUCH)
     target_include_directories(SoundTouch INTERFACE "${SOUNDTOUCH_INCLUDE_DIRS}")
 endif()
 
+# The kernel plugin the Vita build carries (vita_native/CMakeLists.txt: azaharnative_stub).
+if (VITA)
+    add_subdirectory(vita_native)
+endif()
 add_subdirectory(src)
 
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT citra_meta)

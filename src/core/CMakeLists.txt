@@ -562,8 +562,6 @@ if (NOT VITA)
     )
 endif()
 
-include(ExternalProject)
-
 # Native execution on the PS Vita: guest code on the Vita's own CPU, through the kernel module in
 # vita_native/. See arm/vita/arm_vita_native.h and docs/native-execution.md.
 if (VITA)
@@ -572,86 +570,8 @@ if (VITA)
         arm/vita/arm_vita_native.h
     )
     target_compile_definitions(citra_core PUBLIC -DCITRA_HAS_VITA_NATIVE)
-    # Every svc an upcall (arm/vita/arm_vita_native.cpp, "Upcalls"): the module built unsealed
-    # (AZAHAR_SEAL=0), so the guest's world has the app's pages.
-    option(VITA_UPCALLS "Vita native core: every svc answered by an upcall (unsealed module)" ON)
-    if (VITA_UPCALLS)
-        target_compile_definitions(citra_core PUBLIC -DVITA_UPCALLS)
-        set(VITA_NATIVE_SEAL 0)
-    else()
-        set(VITA_NATIVE_SEAL 1)
-    endif()
-    # The module's ABI header, included from the module rather than copied here: the two halves
-    # of one interface, and a copy is a thing that drifts.
-    target_include_directories(citra_core PUBLIC "${CMAKE_SOURCE_DIR}/vita_native/src")
-
-    # The module cannot be a subdirectory of this build: it is a kernel plugin and needs
-    # vitasdk's own gcc toolchain, where the emulator is built with clang against a different
-    # sysroot. So it is a sub-build, driven from here so that a checkout produces both halves
-    # without being told to, and so that editing the module relinks the emulator.
-    #
-    # BUILD_ALWAYS is on because ExternalProject otherwise stamps its build step and never
-    # notices a source change; the sub-build is four files and its own no-op costs a second.
-    # BUILD_BYPRODUCTS is what tells Ninja which file the step produces, without which the
-    # link below has no rule to make it and the build stops on a bare missing-file error.
-    if (NOT VITA_NATIVE_STUB_DIR)
-        if (NOT DEFINED ENV{VITASDK})
-            message(FATAL_ERROR
-                "VITASDK is not set, so the kernel module in vita_native/ cannot be built. "
-                "Set it, or point VITA_NATIVE_STUB_DIR at a directory that already holds "
-                "libazaharnative_stub.a.")
-        endif()
-        set(VITA_NATIVE_BINARY_DIR "${CMAKE_BINARY_DIR}/vita_native")
-        set(VITA_NATIVE_STUB_DIR "${VITA_NATIVE_BINARY_DIR}/stubs")
-        set(VITA_NATIVE_MODULE "${VITA_NATIVE_BINARY_DIR}/azaharnative.skprx")
-        ExternalProject_Add(vita_native_module
-            SOURCE_DIR "${CMAKE_SOURCE_DIR}/vita_native"
-            BINARY_DIR "${VITA_NATIVE_BINARY_DIR}"
-            CMAKE_ARGS
-                "-DCMAKE_TOOLCHAIN_FILE=$ENV{VITASDK}/share/vita.toolchain.cmake"
-                "-DCMAKE_BUILD_TYPE=Release"
-                "-DAZAHAR_SEAL=${VITA_NATIVE_SEAL}"
-            BUILD_ALWAYS 1
-            INSTALL_COMMAND ""
-            BUILD_BYPRODUCTS
-                "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub_weak.a"
-                "${VITA_NATIVE_MODULE}"
-        )
-        add_dependencies(citra_core vita_native_module)
-    endif()
-    # A build directory configured before the module moved into the tree has the old path
-    # cached, and the cache wins, so it would quietly go on pointing at a stub that is no
-    # longer there - or worse, one that is. Say so rather than failing at link time.
-    if (NOT EXISTS "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub_weak.a"
-        AND NOT TARGET vita_native_module)
-        message(FATAL_ERROR
-            "VITA_NATIVE_STUB_DIR is set to ${VITA_NATIVE_STUB_DIR}, which holds no "
-            "libazaharnative_stub_weak.a. If this is a build directory from before the module "
-            "moved into vita_native/, clear the entry to build it from the tree:\n"
-            "  cmake -U VITA_NATIVE_STUB_DIR -B <build dir>")
-    endif()
-    # The vpk carries the module (citra_vita/CMakeLists.txt). A module built on its own leaves
-    # the plugin one directory above its stubs; VITA_NATIVE_MODULE names it when it is elsewhere.
-    if (NOT VITA_NATIVE_MODULE)
-        get_filename_component(VITA_NATIVE_MODULE
-            "${VITA_NATIVE_STUB_DIR}/../azaharnative.skprx" ABSOLUTE)
-    endif()
-    if (NOT EXISTS "${VITA_NATIVE_MODULE}" AND NOT TARGET vita_native_module)
-        message(FATAL_ERROR
-            "No azaharnative.skprx at ${VITA_NATIVE_MODULE}, and the vpk carries it. "
-            "Point VITA_NATIVE_MODULE at the plugin built with the stubs in "
-            "${VITA_NATIVE_STUB_DIR}.")
-    endif()
-    # An imported target rather than a bare path, so the dependency travels with the link.
-    #
-    # The weak stub, because the app starts before the module is loaded: it loads the module
-    # itself (LoadAzaharNative in citra_vita_main.cpp), and a strong import of a library that
-    # is not there yet stops the loader from starting the app at all. The plugin's path rides
-    # on the target so the vpk, in another directory, can find it.
-    add_library(azaharnative_stub STATIC IMPORTED GLOBAL)
-    set_target_properties(azaharnative_stub PROPERTIES
-        IMPORTED_LOCATION "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub_weak.a"
-        AZAHAR_NATIVE_MODULE "${VITA_NATIVE_MODULE}")
+    # The module's import stubs and its ABI header, included from the module rather than copied
+    # here: the two halves of one interface, and a copy is a thing that drifts.
     target_link_libraries(citra_core PUBLIC azaharnative_stub)
 
     # A savestate loads into any build of its format (savestate.h's SaveStateFormat): a change to

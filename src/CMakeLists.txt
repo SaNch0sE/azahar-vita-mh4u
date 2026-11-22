@@ -111,14 +111,19 @@ else()
         -Wall
         # In case a flag isn't supported on e.g. a certain architecture, don't error.
         -Wno-unused-command-line-argument
-        # Build fortification options
-        -fstack-protector-strong
     )
-    if (NOT ENABLE_LIBRETRO)
-        add_compile_options(
-            -Wp,-D_GLIBCXX_ASSERTIONS
-            -fstack-clash-protection
-        )
+    # Build fortification options. The Vita's release builds go without them and its
+    # diagnostics builds keep them, as debug checks: libstdc++'s bounds check on every std::array
+    # and std::vector index and the stack canaries cost the emulation thread 1.3-1.8 points of
+    # a core.
+    if (NOT VITA OR ENABLE_VITA_DIAGNOSTICS)
+        add_compile_options(-fstack-protector-strong)
+        if (NOT ENABLE_LIBRETRO)
+            add_compile_options(
+                -Wp,-D_GLIBCXX_ASSERTIONS
+                -fstack-clash-protection
+            )
+        endif()
     endif()
 
     # If we define _FORTIFY_SOURCE when it is already defined, compilation will fail
