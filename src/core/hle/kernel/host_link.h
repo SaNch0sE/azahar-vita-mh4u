@@ -16,8 +16,9 @@ class Object;
 
 /**
  * What one emulation thread (Core::ThisHost) hands the other, with no lock on either side: an
- * event's signal for the waiters on the receiving host's list, or a thread the sender woke,
- * created or changed the priority of whose core the receiver runs.
+ * event's signal for the waiters on the receiving host's list, a thread the sender woke,
+ * created or changed the priority of whose core the receiver runs, or a change of core 1's CPU
+ * limit, whose limiter is that core's host's.
  */
 struct HostMessage {
     enum class Kind : u8 {
@@ -26,6 +27,7 @@ struct HostMessage {
         NewThread,   ///< ThreadManager::AdoptThread
         ArbiterSignal, ///< AddressArbiter::ReceiveSignal(seq, count)
         Requeue,       ///< Thread::Requeue: its priority changed on the sending host
+        Core1Limit,    ///< core 1's CPU limit changed: its schedule mode (token, seq) or its share
     };
     Kind kind{};
     /// EventSignal of a one-shot event: the sender took its signal for this host's waiters.

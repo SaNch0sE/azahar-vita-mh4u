@@ -2063,7 +2063,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         "timer {}, faults {} (VFP short vectors {} in {}, loads past held "
                         "bytes {}, stores {} (of both, Thumb {}), {} past the budget left to wait; sites "
                         "patched to "
-                        "a thunk {}, to the svc {}); svc sites patched to a thunk {}; "
+                        "a thunk {}, to the svc {}; conditional BKPTs skipped {}, their sites "
+                        "patched {}); svc sites "
+                        "patched to a thunk {}; "
                         "upcall sites {} (Thumb {}) runs {} redirected {} rescheduled {} "
                         "switched {} idled {} ({} events, {} exits, {} for core 1, {} for the "
                         "vblank), exits for the slice's end {} and no next thread {} "
@@ -2078,7 +2080,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         n.reasons[AZAHAR_EXIT_SVC], n.reasons[AZAHAR_EXIT_TIMER],
                         n.slices - n.reasons[AZAHAR_EXIT_SVC] - n.reasons[AZAHAR_EXIT_TIMER],
                         n.vfp_insns, n.vfp_exits, n.hold_loads, n.hold_stores, n.hold_thumb,
-                        n.hold_load_waits, n.vfp_thunks, n.vfp_svcs,
+                        n.hold_load_waits, n.vfp_thunks, n.vfp_svcs, n.bkpt_skips, n.bkpt_sites,
                         n.svc_thunks,
                         n.upcall_sites, n.upcall_thumb_sites, n.upcall_runs, n.upcall_redirects,
                         n.upcall_reschedules, n.upcall_switches, n.upcall_idles,

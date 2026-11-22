@@ -794,6 +794,11 @@ bool CpuLimiterMulti::DoTimeLimit(Thread* thread) {
 
 void CpuLimiterMulti::OnTick(s64 cycles_late) {
     WakeupSleepingThreads();
+    // One tick at a time: a second one on the timer (two were queued in savestates made before
+    // the limit's changes went to this host) ends here, the other goes on.
+    if (kernel.timing.GetTimer(1)->EventCount(tick_event) != 0) {
+        return;
+    }
     ChangeState(cycles_late);
 }
 

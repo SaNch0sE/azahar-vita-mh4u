@@ -124,9 +124,7 @@ struct VitaNativeCensus {
     std::array<u32, AZAHAR_FAST_KINDS> fast{};        ///< By AZAHAR_FAST_*.
     u64 guest_ticks{}; ///< The slices' time in the guest, on the guest clock.
     u64 kernel_cycles{}; ///< azaharRun's own time in CPU cycles, the guest's included.
-    /// VFP instructions run under short vectors, the exits that ran them, and the sites patched to a
-    /// thunk or to the module's svc.
-    u32 vfp_insns{}, vfp_exits{}, vfp_thunks{}, vfp_svcs{};
+    u32 vfp_thunks{}, vfp_svcs{};
     u32 svc_thunks{};
     u32 hold_loads{}, hold_stores{}, hold_opens{};
     u32 hold_thumb{};
@@ -331,6 +329,8 @@ private:
     /// Patches the svc at `pc` into a branch to a stub that runs the HLE handler in the guest's world.
     void PatchUpcall(u32 pc, bool thumb);
     void PatchUpcallThumb(u32 pc);
+    /// A BKPT whose condition failed becomes a conditional BL to an unconditional trap.
+    void PatchBkpt(u32 pc, u32 insn);
     /// The upcall stubs' shared body and the redirect's entry, in this guest's thunk area.
     void EnsureUpcallBody();
     u32 FetchCode(u32 pc, bool thumb) const;

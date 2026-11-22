@@ -257,6 +257,14 @@ constexpr bool IsLumaAlias(u32 address) {
     return address >> 28 == 0xAu;
 }
 
+/// A conditional BKPT whose condition fails: the 3DS's ARM11 skips it, the A9 always breaks.
+bool FailedConditionalBkpt(u32 insn, u32 fsr, u32 cpsr) {
+    const u32 status = (fsr & 0xFu) | ((fsr >> 6) & 0x10u);
+    const u32 cond = insn >> 28;
+    return status == 0x2u && (cpsr & 0x20u) == 0 && (insn & 0x0FF000F0u) == 0x01200070u &&
+           cond < 0xEu && !ConditionPasses(cond, cpsr);
+}
+
 /// An ARM VFP data-processing instruction (cond 1110 .... 101x ...0, cond not 0xF).
 bool IsVfpDataProcessing(u32 insn) {
     return (insn >> 28) != 0xF && (insn & 0x0F000E10) == 0x0E000A00;
@@ -467,6 +475,8 @@ u32 upcall_body{}, upcall_after_svc{};
 /// The svc redirect's record: the module returns an svc it does not answer into `entry`.
 AzaharRedirect upcall_redirect{};
 std::unordered_set<u32> svc_refused;
+/// PatchBkpt's traps in the thunk area by the BKPT's immediate: an unconditional BKPT each.
+std::unordered_map<u32, u32> bkpt_traps;
 /// A GetSystemTick thunk's counters for the idle loops (CheckTickPolls): eight caller slots with
 /// their calls, then the caller sent to the idle skip.
 constexpr u32 TickSlots = 8;
@@ -555,11 +565,9 @@ std::unique_ptr<Common::HostSharedMemory> host1_area;
 bool host1_area_stale = true;
 /// Host 1 ran in this area since its reset (PrepareSaveState).
 bool host1_area_used = false;
-/// A thunk's site: its entry, the site, the instruction(s) the branch replaced (Thumb's halfwords
-/// high first, PatchedSite's), whether Thumb, and what host 1 builds: the svc or VFP instruction
-/// and a branch back, or a mutex svc's lock or unlock on the shared leases first (MutexFastPath,
-/// its entry 20 bytes into the room).
-enum class ClaimKind : u8 { Svc, Vfp, Mutex };
+/// What host 1 builds at a thunk: an svc or VFP instruction and a branch back, a mutex svc's fast
+/// path (MutexFastPath), or a conditional BKPT's trap (PatchBkpt).
+enum class ClaimKind : u8 { Svc, Vfp, Mutex, Bkpt };
 struct ThunkClaim {
     u32 entry;
     u32 site;
@@ -772,6 +780,7 @@ void ForgetThunks(const VitaGuestMap* map) {
         vfp_thunks.clear();
         svc_thunks.clear();
         svc_refused.clear();
+        bkpt_traps.clear();
         tick_thunks.clear();
         upcall_thunks.clear();
         upcall_body = upcall_after_svc = 0;
@@ -2542,6 +2551,37 @@ void ARM_VitaNative::PatchUpcall(u32 pc, bool thumb) {
 #endif
 }
 
+void ARM_VitaNative::PatchBkpt(u32 pc, u32 insn) {
+    if (InThunkArea(pc) || patched_sites.contains(pc)) {
+        return;
+    }
+    // The trap: the same BKPT unconditional, one a value of its immediate, in a room of the
+    // thunks' eight bytes (host 1 builds a claim's two words).
+    const u32 imm = (insn >> 4 & 0xFFF0u) | (insn & 0xFu);
+    auto trap = bkpt_traps.find(imm);
+    if (trap == bkpt_traps.end()) {
+        const auto room = ThunkRoom(8);
+        if (!room) {
+            return;
+        }
+        const u32 words[2] = {0xE0000000u | (insn & 0x0FFFFFFFu), ThunkTrapArm};
+        std::memcpy(thunk_area->Data() + thunk_area_used, words, sizeof(words));
+        map->SyncCode(*room, sizeof(words));
+        thunk_area_used += sizeof(words);
+        ClaimThunk(*map, *room, *room, words[0], false, ClaimKind::Bkpt);
+        trap = bkpt_traps.emplace(imm, *room).first;
+    }
+    // BL with the BKPT's condition: failed, the guest goes on with no exit; passed, the trap
+    // breaks as the BKPT would have (ReportFault), LR naming the site.
+    const auto branch = ArmBranch(insn >> 28, pc, trap->second);
+    if (!branch) {
+        return;
+    }
+    memory.Write32(pc, *branch | 0x01000000u);
+    map->SyncCode(pc, 4);
+    patched_sites[pc] = PatchedSite{insn, false};
+}
+
 void ARM_VitaNative::PatchUpcallThumb(u32 pc) {
     // A Thumb svc is 2 bytes and a B.W 4: the instruction after it moves into the stub, which
     // runs it on resuming and branches back past it. Only an instruction that means the same
@@ -3030,6 +3070,7 @@ void ARM_VitaNative::PrepareSaveState() {
     vfp_thunks.clear();
     svc_thunks.clear();
     svc_refused.clear();
+    bkpt_traps.clear();
     tick_thunks.clear();
     upcall_thunks.clear();
     upcall_body = upcall_after_svc = 0;
@@ -3377,7 +3418,17 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         ReportFault();
         return false;
     }
-    case AZAHAR_EXIT_PABT:
+    case AZAHAR_EXIT_PABT: {
+        const u32 insn = FetchCode(run.ctx.r[15], false);
+        if (FailedConditionalBkpt(insn, run.fsr, run.ctx.cpsr)) {
+            // The site becomes a branch that never leaves the guest.
+            PatchBkpt(run.ctx.r[15], insn);
+            run.ctx.r[15] += 4;
+            return !break_flag && !stop_requested;
+        }
+        ReportFault();
+        return false;
+    }
     default:
         ReportFault();
         return false;
@@ -3656,7 +3707,22 @@ bool ARM_VitaNative::RunSliceSecond(u64 quantum_ns) {
         ReportFault();
         return false;
     }
-    case AZAHAR_EXIT_PABT:
+    case AZAHAR_EXIT_PABT: {
+        // RunSliceOnce's conditional BKPT, uncounted.
+        const u32 insn = FetchCode(run.ctx.r[15], false);
+        if (FailedConditionalBkpt(insn, run.fsr, run.ctx.cpsr)) {
+            run.ctx.r[15] += 4;
+            return !break_flag && !stop_requested;
+        }
+        // A BKPT's event at a site that holds no BKPT now: host 0 patched it in between. What is there runs.
+        const u32 status = (run.fsr & 0xFu) | ((run.fsr >> 6) & 0x10u);
+        if (status == 0x2u && (run.ctx.cpsr & 0x20u) == 0 &&
+            (insn & 0x0FF000F0u) != 0x01200070u) {
+            return !break_flag && !stop_requested;
+        }
+        ReportFault();
+        return false;
+    }
     default:
         ReportFault();
         return false;

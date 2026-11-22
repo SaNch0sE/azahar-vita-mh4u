@@ -171,6 +171,13 @@ void KernelSystem::ProcessHostMessages(u32 host) {
             static_cast<Thread&>(*message.object).Requeue();
             PrepareReschedule();
             break;
+        case HostMessage::Kind::Core1Limit:
+            if (message.token) {
+                GetThreadManager(1).SetScheduleMode(static_cast<Core1ScheduleMode>(message.seq));
+            } else {
+                GetThreadManager(1).UpdateAppCpuLimit();
+            }
+            break;
         }
         message.object.reset();
     }
@@ -270,11 +277,25 @@ void KernelSystem::RestoreMemoryState(u64 title_id) {
     }
 }
 
+// Core 1's limiter (its tick on core 1's timer, the threads it put to sleep) is the host's that
+// runs core 1: a change made on the other host (a service's, on the first emulation thread) goes
+// there as a message. Made here, its unschedule left the tick on core 1's timer and scheduled a
+// second one, and its wakeups went through the list the other host was adding to.
 void KernelSystem::SetCore1ScheduleMode(Core1ScheduleMode mode) {
+    if (Core::HostOfCore(1) != Core::ThisHost()) {
+        SendToHost(Core::HostOfCore(1), HostMessage{HostMessage::Kind::Core1Limit, true,
+                                                    static_cast<u32>(mode), nullptr});
+        return;
+    }
     GetThreadManager(1).SetScheduleMode(mode);
 }
 
 void KernelSystem::UpdateCore1AppCpuLimit() {
+    if (Core::HostOfCore(1) != Core::ThisHost()) {
+        SendToHost(Core::HostOfCore(1),
+                   HostMessage{HostMessage::Kind::Core1Limit, false, 0, nullptr});
+        return;
+    }
     GetThreadManager(1).UpdateAppCpuLimit();
 }
 
