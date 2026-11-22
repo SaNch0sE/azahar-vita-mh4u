@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <vector>
+
 namespace GxmRenderer {
 
 /**
@@ -161,6 +163,10 @@ namespace GxmRenderer {
  *             records), parse/parse_end (the parse thread on a list)
  */
 [[nodiscard]] bool GxmFlag(const char* name);
+/// A flag written `name=N`: N, or 0 when the flag is not given (always 0 in the release build).
+[[nodiscard]] unsigned SgxdFlagValue(const char* name);
+/// Every `name=N` given, in the file's order (none in the release build).
+[[nodiscard]] std::vector<unsigned> SgxdFlagValues(const char* name);
 
 /// With sgxd_flags `tracelog`, one timeline event: `tag` a string literal, `arg` its detail (an
 /// op kind, an interrupt id). Any thread; nothing in the release build.

@@ -7,6 +7,7 @@
 #include "audio_core/sink.h"
 #include "audio_core/sink_details.h"
 #include "common/assert.h"
+#include "common/heap_check.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/dumping/backend.h"
@@ -71,6 +72,7 @@ void DspInterface::OutputSample(std::array<s16, 2> sample) {
 }
 
 void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
+    Common::HeapCheck::Check("the audio output's start");
     // Determine if we should stretch based on the current emulation speed.
     const auto perf_stats = system.GetLastPerfStats();
     const auto should_stretch = enable_time_stretching && perf_stats.emulation_speed <= 95;
@@ -98,6 +100,7 @@ void DspInterface::OutputCallback(s16* buffer, std::size_t num_frames) {
         frames_written += fifo.Pop(buffer, num_frames - frames_written);
     }
 
+    Common::HeapCheck::Check("the audio output's stretch and pop");
     if (frames_written > 0) {
         std::memcpy(&last_frame[0], buffer + 2 * (frames_written - 1), 2 * sizeof(s16));
     }

@@ -50,6 +50,8 @@
  */
 namespace GxmRenderer::Usse {
 
+bool z_flip = false;
+
 using nihstro::DestRegister;
 using nihstro::Instruction;
 using nihstro::OpCode;
@@ -973,7 +975,9 @@ int VertexEmitter::NewLabel() {
 int VertexEmitter::LabelAt(uint32_t offset) {
     Context& ctx = contexts.back();
     if (offset < ctx.begin || offset >= ctx.end) {
-        Refuse("jump out of its subroutine");
+        Refuse("jump out of its subroutine: to instruction " + std::to_string(offset) +
+               ", the subroutine's " + std::to_string(ctx.begin) + ".." +
+               std::to_string(ctx.end));
     }
     auto it = ctx.labels.find(offset);
     if (it == ctx.labels.end()) {
@@ -2042,7 +2046,6 @@ void VertexEmitter::Epilogue() {
     e.Vec(VecOp::Min, {Reg::O(OutColor), 0x3}, {I1, XYZW, Mod::Abs}, ConstOne);
     e.Vec(VecOp::Min, {Reg::O(OutColor + 2), 0x3}, {I1, ZWZW, Mod::Abs}, ConstOne);
 
-    // The quaternion, twice (TEXCOORD5 is its flat copy).
     GatherFour(I2, SemQuaternionX);
     e.MoveInternal({Reg::O(OutNormquat), 0x3}, {I2, XYZW});
     e.MoveInternal({Reg::O(OutNormquat + 2), 0x3}, {I2, ZWZW});

@@ -3849,6 +3849,7 @@ void ARM_VitaNative::ReportFault() {
                     registers, ReasonName(run.reason), run.ctx.r[15], run.ctx.cpsr, run.ctx.fpscr,
                     fpexc, run.fsr, run.far);
     LOG_CRITICAL(Core_ARM11, "{}", message);
+    // The thunk area's code as this host fetches it, not guest memory.
     std::string code;
     for (u32 a = run.ctx.r[15] - 16; a <= run.ctx.r[15] + 12; a += 4) {
         code += fmt::format("{}{:08X}", a == run.ctx.r[15] ? " *" : " ",

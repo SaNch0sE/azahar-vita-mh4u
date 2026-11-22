@@ -99,14 +99,15 @@ private:
 };
 
 /**
- * Runs the guest's ARM code natively on a PS Vita core taken away from the Vita's kernel.
+ * Runs the guest's ARM code natively on the PS Vita's own CPU, one slice at a time on the
+ * emulation thread's core.
  *
  * The counterpart of ARM_Native (the Linux backend) with every host mechanism replaced by a call
- * into the azahar-native kernel module: the guest is entered with azaharRun, which returns when the guest
- * takes an svc, an undefined instruction, a prefetch or data abort, or when its quantum on the
- * core's private timer expires. There are no signals and no address-space mirror; the module
+ * into the azahar-native kernel module: the guest is entered with azaharRun, which returns when the
+ * guest takes an svc, an undefined instruction, a prefetch or data abort, or when its quantum on
+ * the core's private timer expires. There are no signals and no address-space mirror; the module
  * owns the core's translation table (VitaGuestMap keeps it in step) and the guest runs at PL0
- * under vectors the module installed. See DEVELOPMENT.md.
+ * under vectors the module installed. docs/native-execution.md has the design.
  *
  * The svcs the module can answer from what each slice hands it - GetSystemTick, the cache
  * svcs on the current process, the current thread's and process's IDs (AZAHAR_FAST_*) - never
@@ -189,6 +190,10 @@ void SetVitaInKernelScheduling(bool on);
 
 class ARM_VitaNative final : public ARM_Interface {
 public:
+    /// A store permit's stores (AzaharStorePermit::left): the module makes them in its vector, no
+    /// exit each, so AccessesPerHold's reason is not theirs (at 32, a game's battle made ~400
+    /// permits a second again for stores used up).
+    static constexpr u32 PermitStores = 1u << 16;
     explicit ARM_VitaNative(Core::System& system, Memory::MemorySystem& memory, u32 id,
                             std::shared_ptr<Core::Timing::Timer> timer,
                             std::shared_ptr<VitaGuestMap> map);

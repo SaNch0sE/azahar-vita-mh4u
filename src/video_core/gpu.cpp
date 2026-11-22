@@ -292,9 +292,29 @@ bool GPU::GuestAbort([[maybe_unused]] const u8* host, [[maybe_unused]] bool writ
 #endif
 }
 
-void GPU::RunOnRenderThread(const std::function<void()>& fn) {
-    impl->render_thread->RunSync(fn);
+#ifdef VITA_DIAGNOSTICS
+void GPU::GuestIdle() {
+    if (impl->scans_pending.empty()) {
+        return;
+    }
+    const u64 now = static_cast<u64>(Common::ProcessClock::now().time_since_epoch().count());
+    auto& room = impl->scan_room;
+    for (const auto& [end, scan_us] : impl->scans_pending) {
+        const u64 gap = now > end ? now - end : 0;
+        room.lists++;
+        room.scan_us += scan_us;
+        room.hidden_us += std::min<u64>(scan_us, gap);
+        room.gaps[gap < 500 ? 0 : gap < 2000 ? 1 : gap < 8000 ? 2 : gap < 16000 ? 3 : 4]++;
+    }
+    impl->scans_pending.clear();
 }
+
+GPU::ScanRoom GPU::TakeScanRoom() {
+    ScanRoom r = std::exchange(impl->scan_room, {});
+    r.pending = static_cast<u32>(impl->scans_pending.size());
+    return r;
+}
+#endif
 
 PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
     if (addr == 0 || replay_physical) {

@@ -1,4 +1,7 @@
-// azahar-native — native.c: the emulator half. Takes one PS Vita core and runs guest code on it natively,
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// azahar-native, the emulator half: takes a PS Vita core and runs guest code on it natively,
 // at the guest's own addresses, under translation tables and exception vectors of ours.
 //
 // Included from main.c, whose helpers it uses (emit, translate, the cp15 accessors,
@@ -483,7 +486,8 @@ static volatile uint32_t azahar_installed;
 // one, and how many timed out with a bit still pending. Read on the syscall core at release.
 static volatile uint32_t azahar_sgi_windows, azahar_sgi_last_pend, azahar_sgi_stuck;
 // 1: every azaharRun logs its entry and exit (the trigger app's test); 0: only faults, preemptions
-// and errors (the emulator). The test app asks for it through azaharMap's count sign — see azaharMap.
+// and errors (the emulator). The test app asks for it through azaharMap's count sign — see
+// azaharMap.
 static int azahar_verbose;
 // Folded (the default): no resident thread. azaharRun switches the calling core into the guest
 // world for one slice and back, so the emulation thread and the guest share a core and the
@@ -1642,7 +1646,8 @@ static int build_table(const AzaharMapRequest *req) {
     keep[nkeep].len = sizeof(AzaharCpu) * AZAHAR_CORES;
     nkeep++;
     // The stack the slice runs on: the resident thread's own, or in folded mode the caller's
-    // syscall stack, whose depth differs between azaharMap and azaharRun - hence the slack each way.
+    // syscall stack, whose depth differs between azaharMap and azaharRun - hence the slack each
+    // way.
     keep[nkeep].addr = azahar_core2_sp - 0x8000u;
     keep[nkeep].len = 0x10000u;
     nkeep++;

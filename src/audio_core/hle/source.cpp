@@ -12,6 +12,7 @@
 #include "audio_core/hle/common.h"
 #include "audio_core/hle/source.h"
 #include "audio_core/interpolate.h"
+#include "common/heap_check.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/memory.h"
@@ -512,6 +513,7 @@ bool Source::DequeueBuffer() {
 
     // the first playthrough starts at play_position, loops start at the beginning of the buffer
     state.current_sample_number = (!buf.has_played) ? buf.play_position : 0;
+    Common::HeapCheck::Check("a DSP source buffer's decode");
     state.current_buffer_physical_address = buf.physical_address;
     state.current_buffer_id = buf.buffer_id;
     state.last_buffer_id = 0;

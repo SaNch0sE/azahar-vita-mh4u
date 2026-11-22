@@ -33,6 +33,15 @@ class Ui;
  * the run loop waits at WaitWhilePaused, and leaves what only the emulation thread can do
  * (savestates, quitting) for TakeUiAction.
  */
+#ifdef VITA_DIAGNOSTICS
+/// The present's time since the last call, in µs, by part (diagnostics: `perflog`).
+struct PresentTimes {
+    u64 ui_update, screens, ui_draw, end_frame;
+    u32 display_waits;
+};
+PresentTimes TakePresentTimes();
+#endif
+
 class EmuWindowVita final : public Frontend::EmuWindow {
 public:
     explicit EmuWindowVita(Core::System& system);

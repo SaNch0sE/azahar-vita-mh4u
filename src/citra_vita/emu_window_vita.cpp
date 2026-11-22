@@ -480,6 +480,28 @@ int EmuWindowVita::TakeUiAction() {
     return pending_ui_action.exchange(0, std::memory_order_acq_rel);
 }
 
+namespace {
+#ifdef VITA_DIAGNOSTICS
+std::atomic<u64> present_us[4]{};
+#endif
+u32 presents_busy;
+
+[[maybe_unused]] u64 Since(std::chrono::steady_clock::time_point& t) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - t).count();
+    t = now;
+    return static_cast<u64>(us);
+}
+} // namespace
+
+#ifdef VITA_DIAGNOSTICS
+PresentTimes TakePresentTimes() {
+    return PresentTimes{present_us[0].exchange(0), present_us[1].exchange(0),
+                        present_us[2].exchange(0), present_us[3].exchange(0),
+                        SgxdPresent::TakeDisplayWaits()};
+}
+#endif
+
 void EmuWindowVita::Present(Ui* ui, bool update) {
     const auto mark = [&t](u32 part) {
         present_us[part].fetch_add(Since(t), std::memory_order_relaxed);

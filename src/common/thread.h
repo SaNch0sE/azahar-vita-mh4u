@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <mutex>
 #include <thread>
+#include <vector>
 #include "common/common_types.h"
 #include "common/mutex.h"
 #include "common/polyfill_thread.h"
@@ -174,5 +175,16 @@ enum class ThreadRole {
  * A no-op everywhere else - a desktop scheduler does better than a hardcoded map.
  */
 void SetCurrentThreadRole(ThreadRole role, std::size_t index = 0);
+
+#ifdef __vita__
+/// A thread SetCurrentThreadRole placed: its kernel ID and the cores its role allows.
+struct RoleThread {
+    ThreadRole role;
+    int id;
+    int cores;
+};
+/// The threads placed so far (a gone one's slot until another takes it): perflog's run times.
+std::vector<RoleThread> RoleThreads();
+#endif
 
 } // namespace Common

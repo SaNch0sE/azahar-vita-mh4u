@@ -14,7 +14,8 @@ public:
     RightEyeDisabler(GPU& gpu) : gpu{gpu} {}
 
     bool ShouldAllowCmdQueueTrigger(PAddr addr, u32 size);
-    bool ShouldAllowDisplayTransfer(PAddr src_address, size_t size);
+    /// `size` the transfer's input rows, `output_rows` its output's.
+    bool ShouldAllowDisplayTransfer(PAddr src_address, size_t size, u32 output_rows);
 
     void ReportEndFrame();
 

@@ -1124,13 +1124,9 @@ std::string MemorySystem::ReadCString(VAddr vaddr, std::size_t max_length) {
 MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address) {
     // This lookup runs concurrently on the emulation thread and a render thread. A shared
     // single-entry cache in front of it could be rewritten by one thread while the other was
-    // mid-read; the torn result paired one region's backing memory with another region's start,
-    // yielding a well-formed pointer into the wrong part of guest RAM. The command-list parser
-    // reading one chain segment through such a pointer walked stale bytes, never saw the list's
-    // irq_request, and the title froze waiting for a P3D that had silently been dropped
-    // (Smash at match entry, software renderer, measured as a parser read exactly
-    // 0x7a00000 bytes off FCRAM's host base). The scan below is four compares against a
-    // constexpr table - it does not need a cache, and it must not have a shared one.
+    // mid-read, pairing one region's backing memory with another region's start: a well-formed
+    // pointer into the wrong part of guest RAM. The scan below is four compares against a constexpr
+    // table - it does not need a cache, and it must not have a shared one.
     constexpr std::array memory_areas = {
         std::make_pair(VRAM_PADDR, VRAM_SIZE),
         std::make_pair(DSP_RAM_PADDR, DSP_RAM_SIZE),

@@ -148,11 +148,11 @@ public:
     /// attribute bank codes there (the compiler's secondary programs, all forms), since a
     /// secondary program has no primary attributes of its own.
     bool secondary = false;
-    /// Places the nosched bits from the liveness of the internal registers: the bit on
-    /// instruction i keeps the instance scheduled across the boundary after instruction
-    /// i + 1, and psp2cgc sets it exactly when a component of i0-i2 is live there (652
-    /// instructions of seven SM3DL programs, no exception; a wait or a nop counts as an
-    /// instruction). Call once, after the last instruction.
+    /// Places the nosched bits from the liveness of the internal registers: the bit on instruction
+    /// i keeps the instance scheduled across the boundary after instruction i + 1, and psp2cgc sets
+    /// it exactly when a component of i0-i2 is live there (a wait or a nop counts as an
+    /// instruction).
+    /// Call once, after the last instruction. The builders' `nosched` arguments are ignored.
     void FinishNosched();
 
     const std::vector<uint64_t>& Words() const { return words; }
@@ -270,6 +270,7 @@ public:
     /// sa<sampler> (even), coordinates at coord.xy (pair-aligned); `lod` is an internal
     /// register holding the level in x, or
     /// null for the hardware's own level. Counter `drc` is what Wdf waits on.
+    /// `point`: point sampled from a texture of one level (the result needs no neighbour).
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
                   bool nosched = false, uint8_t fconv = 3, bool point = false);
     /// A probe (sgxd_flags smpskip): skip-invalid on the reads that are point sampled from one

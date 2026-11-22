@@ -33,6 +33,9 @@
 #include "core/cheats/cheats.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#ifdef ENABLE_GXM
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#endif
 #include "core/dumping/backend.h"
 #include "core/frontend/emu_window.h"
 #include "core/file_sys/ncch_container.h"
@@ -311,6 +314,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 idle(*cpu_core);
                 PrepareReschedule();
             } else {
+#ifdef VITA_DIAGNOSTICS
+                ran = true;
+#endif
                 // In the rare case the break flag is set (due to exception thrown)
                 // there is probably no need to adjust the timer accordingly.
                 if (tight_loop) {
@@ -323,6 +329,12 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             reached = cpu_core->GetTimer().GetTicks();
             Reschedule();
         }
+#ifdef VITA_DIAGNOSTICS
+        // Every core idle in this pass: the guest's clock jumped (GPU::GuestIdle).
+        if (!ran) {
+            gpu->GuestIdle();
+        }
+#endif
     }
 
     return status;

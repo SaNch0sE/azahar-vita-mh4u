@@ -95,6 +95,9 @@ public:
     virtual void UpdateAppCpuLimit() = 0;
 
     virtual bool DoTimeLimit(Thread* thread) = 0;
+
+    /// The limiter's state for the diagnostics' thread dump.
+    [[nodiscard]] virtual std::string DebugState() const = 0;
 };
 
 class CpuLimiterMulti : public CpuLimiter {
@@ -110,6 +113,8 @@ public:
     void UpdateAppCpuLimit() override;
 
     bool DoTimeLimit(Thread* thread) override;
+
+    [[nodiscard]] std::string DebugState() const override;
 
 private:
     enum class SchedState : u32 {

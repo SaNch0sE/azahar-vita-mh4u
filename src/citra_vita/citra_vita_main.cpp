@@ -9,10 +9,12 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <typeinfo>
 #include <unordered_map>
 #include <vector>
+#include <malloc.h>
 #include <pthread.h>
 
 #include <fmt/format.h>
@@ -156,16 +158,9 @@ void SetupTerminateHandler() {
     });
 }
 
-/// Brings the network stack up now rather than leaving it to the first guest socket call.
-///
-/// newlib initialises it lazily: socket(), inet_pton(), gethostbyname() and friends all route
-/// through _vita_net_init, which loads SCE_SYSMODULE_NET, takes ~140 KB for a net memory pool
-/// and calls sceNetInit/sceNetCtlInit. Loading that sysmodule drags in SceNet, SceLibNetCtl,
-/// SceLibHttp, SceLibSsl, SceNpManager, SceNpCommon, ScePaf, SceSqliteVsh, SceDbutil and
-/// SceDrmPsmKdc - about ten system modules, arriving in the middle of a title the moment its
-/// own soc:U or http:C service first touches a host socket, which is exactly where a level
-/// load was seen to fall over. Paying for it here means it happens once, before the guest
-/// exists, at a moment when nothing is timing-critical and the heap is nearly empty.
+/// Brings the network stack up now rather than at the first guest socket call: newlib's lazy
+/// _vita_net_init loads SCE_SYSMODULE_NET and about ten system modules with it, in the middle of a
+/// title. Here it happens once, before the guest exists.
 void SetupNetwork() {
     const int ret = _vita_net_init();
     if (ret < 0) {
@@ -579,6 +574,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             static SceUInt64 last_perf_us = 0;
             const SceUInt64 now_us = sceKernelGetProcessTimeWide();
             if (now_us - last_perf_us >= 1000000ull) {
+#ifdef VITA_DIAGNOSTICS
+                const SceUInt64 interval_us = now_us - last_perf_us;
+#endif
                 last_perf_us = now_us;
                 const auto perf = system.GetAndResetPerfStats();
                 using namespace VitaFrontend::HudStats;
@@ -1260,6 +1258,12 @@ int EmulatorMain() {
     SetupPaths();
     SetupLogging();
     MigrateNandLayout();
+#ifdef VITA_DIAGNOSTICS
+    // What SetupClocks got: the set calls' results are not checked.
+    LOG_INFO(Frontend, "clocks: ARM {} MHz, bus {} MHz, GPU {} MHz, GPU xbar {} MHz",
+             scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
+             scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
+#endif
     SetupNetwork();
 
     // What stops the start comes first, in the menus' language: before anything else is set up
@@ -1332,12 +1336,8 @@ int EmulatorMain() {
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());
 
     VitaFrontend::EmuWindowVita window(system);
-    // Not InputCommon::Init(): every factory it registers is one this frontend does not use.
-    // The buttons and the circle pad come from the "vita" engine above, the touchscreen from
-    // EmuWindow's own "emu_window" factory, and nothing here sets a motion device. What it would
-    // add is a Cemuhook UDP client - a socket and a thread of its own, talking to a desktop that
-    // is not there - and factories for a keyboard and a GameCube adapter this console has not
-    // got. SDL is a null state in this build either way.
+    // Not InputCommon::Init(): every factory it registers is one this frontend does not use (the
+    // buttons, circle pad and touch come from the "vita" engine and EmuWindow's own factory).
     VitaFrontend::InitInput(window);
 
     VitaFrontend::Ui ui(system, window);
@@ -1423,14 +1423,10 @@ int main(int argc, char* argv[]) {
     // Without the module (g_native_error) its calls are not bound: the report lists no plugins.
     VitaFrontend::CrashReport::NoteSystem(g_native_error ? 0 : azaharVersion(), g_cores_unlocked);
     Common::SetCurrentThreadRole(Common::ThreadRole::Other);
-    // The process's own thread gets a stack sized for a homebrew launcher, and the global that
-    // is supposed to change that does not work. Everything therefore runs on a thread created
-    // here with a stack the emulator can actually use - service handling and the savestate
-    // serializer both go deep.
-    // A thread stack comes out of the game partition, which measures about 238 MB in total and
-    // is mostly spoken for by the newlib heap - so this is worth no more than it needs. Eight
-    // megabytes still leaves the savestate serializer, which is the deepest thing that runs
-    // here, a wide margin over the megabyte every other thread gets.
+    // The process's own thread has a homebrew launcher's small stack, and the global meant to
+    // change that does not work: everything runs on this thread instead (service handling and the
+    // savestate serializer go deep). Its stack comes from the game partition, mostly the newlib
+    // heap's.
     constexpr std::size_t EmulationStackSize = 4 * 1024 * 1024;
 
     {

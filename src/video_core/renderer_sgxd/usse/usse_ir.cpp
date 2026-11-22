@@ -1765,16 +1765,12 @@ void Lowering::HoistLoads(int max_group) {
                 }
             }
         };
-        // Members whose chain is the emitter's indexed form (mad.i16 index + a, and
-        // 0x7f, mad.i32 * 16 + pointer) over the same address register and pointer
-        // share the lowest index's chain and load at an immediate offset from it (an
-        // index that wraps at 128 across the group is a matrix straddling the array
-        // end: never seen). A member already known from an earlier read is that quad.
-        // Members whose chain is the emitter's indexed form over the same address
-        // register and pointer share the lowest index's chain and load at an immediate
-        // offset from it, up to three rows away: the PICA index wraps at 128 per read
-        // (Smash reads with a0 = -2), and the uniform buffer carries rows 0-3 again past
-        // 127 so an offset from row 127 lands on the right data.
+        // Members whose chain is the emitter's indexed form (mad.i16 index + a, and 0x7f, mad.i32 *
+        // 16 + pointer) over the same address register and pointer share the lowest index's chain
+        // and load at an immediate offset from it, up to three rows away: the PICA index wraps at
+        // 128 per read, and the uniform buffer carries rows 0-3 again past 127 so an offset from
+        // row 127 lands on the right data. A member already known from an earlier read is that
+        // quad.
         std::vector<int> share_base(b - a + 1, -1);
         std::vector<bool> reused(b - a + 1, false);
         for (std::size_t k = a; k <= b; k++) {
@@ -1969,14 +1965,13 @@ std::optional<Src> Lowering::CopiedSourceOf(std::size_t at, const Src& half) con
 }
 
 void Lowering::TwoWideChains() {
-    // A chain of four-wide ops accumulating in the internal registers - `mad i2, v44, i0,
-    // i1; mad i1, v48, i0, i2; mad i2, v52, i0, i1`, the compiler's skinning idiom, each
-    // link reading the previous result as a gpi operand and the last moved out to unified
-    // pairs - becomes two-wide ops on the unified store: each link two vmad2/vec ops over
-    // fresh virtual quads, reading the loaded operands' quads directly, the last link
-    // writing the pairs the moves went to. Smash's skinning program: 11 instructions per
-    // bone group to 8, and the loads that fed the internal registers die. A single op
-    // followed by its moves is DirectTwoWide's case and is left to it.
+    // A chain of four-wide ops accumulating in the internal registers - `mad i2, v44, i0, i1; mad
+    // i1, v48, i0, i2; mad i2, v52, i0, i1`, the compiler's skinning idiom, each link reading the
+    // previous result as a gpi operand and the last moved out to unified pairs - becomes two-wide
+    // ops on the unified store: each link two vmad2/vec ops over fresh virtual quads, reading the
+    // loaded operands' quads directly, the last link writing the pairs the moves went to; the loads
+    // that fed the internal registers die. A single op followed by its moves is DirectTwoWide's
+    // case.
     const auto candidate = [](const Inst& inst) {
         const bool is_mad = inst.op == Op::Mad && inst.b[0];
         const bool is_vec = inst.op == Op::Vec &&
@@ -4239,7 +4234,7 @@ LowerResult Lowering::Run(Encoder& e, int level) {
         Fail("no register class");
     }
     // The first tier only places the registers (spilling as needed): microseconds, and
-    // the program the draw waits for. The second tier, off the render thread for programs
+    // the program the draw waits for. The second tier, off the drawing thread for programs
     // that draw a lot, runs the optimising passes first. Hoisting loads lengthens live
     // ranges; when the registers then do not fit, the program is lowered again without
     // it.
@@ -4378,6 +4373,9 @@ LowerResult Lowering::Run(Encoder& e, int level) {
     CheckTemps();
     LowerResult result;
     result.temp_count = temp_count;
+    result.peak_live = peak_live;
+    result.peak_at = peak_at;
+    result.peak_regs = peak_regs;
     result.pa_count = pa_count;
     result.spilled = spilled;
     Encode(e, result);
@@ -4388,7 +4386,6 @@ LowerResult Lowering::Run(Encoder& e, int level) {
 
 LowerResult Builder::Lower(Encoder& e, int level) {
     e.skip_invalid = skip_invalid;
-    e.nosched_override = nosched_override;
     e.secondary = secondary;
     std::vector<RegClass> cls = classes;
     if (cls.empty()) {

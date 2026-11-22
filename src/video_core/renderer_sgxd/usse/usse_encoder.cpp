@@ -431,12 +431,7 @@ void Encoder::FinishNosched() {
         if (meta[i].bit == 0) {
             continue;
         }
-        bool set = false;
-        if (nosched_override == 2) {
-            set = true;
-        } else if (nosched_override == 0) {
-            set = i + 1 < n && after[i + 1] != 0;
-        }
+        const bool set = i + 1 < n && after[i + 1] != 0;
         const uint64_t bit = 1ull << meta[i].bit;
         words[i] = set ? (words[i] | bit) : (words[i] & ~bit);
     }

@@ -566,8 +566,8 @@ endif()
 
 include(ExternalProject)
 
-# Native execution on the PS Vita: guest code on a core taken from the Vita's kernel, through
-# the kernel module in vita_native/. See arm/vita/arm_vita_native.h and DEVELOPMENT.md.
+# Native execution on the PS Vita: guest code on the Vita's own CPU, through the kernel module in
+# vita_native/. See arm/vita/arm_vita_native.h and docs/native-execution.md.
 if (VITA)
     target_sources(citra_core PRIVATE
         arm/vita/arm_vita_native.cpp

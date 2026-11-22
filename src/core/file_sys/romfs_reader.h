@@ -23,6 +23,22 @@ enum class ResultStatus;
 
 namespace FileSys {
 
+#ifdef VITA_DIAGNOSTICS
+/// The RomFS files' reads since the last call (perflog): the cached ones (a line's size or less),
+/// the lines they missed and read from the file there and then on the reading thread (the
+/// emulation thread's IPC), and the larger ones, read past the cache (on an async thread).
+struct RomFSReadStats {
+    u64 reads;
+    u64 read_bytes;
+    u64 misses;
+    u64 miss_us;
+    u64 large;
+    u64 large_bytes;
+    u64 large_us;
+};
+RomFSReadStats TakeRomFSReadStats();
+#endif
+
 /**
  * Interface for reading RomFS data.
  */

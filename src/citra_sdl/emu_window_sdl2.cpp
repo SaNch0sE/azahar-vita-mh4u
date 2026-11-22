@@ -246,19 +246,6 @@ bool EmuWindow_SDL2::TryCreateGLContext(bool want_gles, int gles_minor) {
         if (want_gles && !GLAD_GL_ES_VERSION_3_2) {
             AliasGLES31EntryPoints();
         }
-#ifdef CITRA_TRACE_PROBES
-        if (std::getenv("AZAHAR_GL_DEBUG") != nullptr && glDebugMessageCallback != nullptr) {
-            glEnable(GL_DEBUG_OUTPUT);
-            glDebugMessageCallback(
-                [](GLenum, GLenum type, GLuint, GLenum severity, GLsizei, const GLchar* message,
-                   const void*) {
-                    if (severity != GL_DEBUG_SEVERITY_NOTIFICATION) {
-                        LOG_ERROR(Frontend, "GL[{}]: {}", type, message);
-                    }
-                },
-                nullptr);
-        }
-#endif // CITRA_TRACE_PROBES
         is_gles = want_gles;
         const auto* gl_version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
         const auto* gl_renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));

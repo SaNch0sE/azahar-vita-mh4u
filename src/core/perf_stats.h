@@ -79,12 +79,23 @@ public:
         PerfArticEvents artic_events{};
     };
 
+#if defined(__vita__) && !defined(VITA_DIAGNOSTICS)
+    // The Vita's release build: the vblank interval's split is perflog's alone, and each of
+    // these timers reads steady_clock, a syscall there.
+    void BeginSVCProcessing() {}
+    void EndSVCProcessing() {}
+    void BeginIPCProcessing() {}
+    void EndIPCProcessing() {}
+    void BeginGPUProcessing() {}
+    void EndGPUProcessing() {}
+#else
     void BeginSVCProcessing();
     void EndSVCProcessing();
     void BeginIPCProcessing();
     void EndIPCProcessing();
     void BeginGPUProcessing();
     void EndGPUProcessing();
+#endif
     void StartSwap();
     void EndSwap();
     void BeginSystemFrame();

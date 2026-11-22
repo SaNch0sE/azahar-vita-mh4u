@@ -1,9 +1,9 @@
 // azahar-native — the ABI between the kernel plugin and the emulator. Included by both.
 //
 // The PS Vita is Sony's handheld games console; this is a hobby emulator project running on a
-// console the author owns. The plugin takes one CPU core away from the Vita's scheduler and
-// runs guest (Nintendo 3DS) code on it natively, at the guest's own addresses. DEVELOPMENT.md
-// beside this file is the design.
+// console the author owns. The plugin runs guest (Nintendo 3DS) code natively on the calling
+// core, one slice at a time, at the guest's own addresses. docs/native-execution.md has the
+// design.
 
 #ifndef AZAHAR_NATIVE_H
 #define AZAHAR_NATIVE_H

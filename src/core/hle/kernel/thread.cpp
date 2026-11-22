@@ -876,6 +876,17 @@ void CpuLimiterMulti::WakeupSleepingThreads() {
     }
 }
 
+std::string CpuLimiterMulti::DebugState() const {
+    std::string ids;
+    for (std::queue<u32> q = sleeping_thread_ids; !q.empty(); q.pop()) {
+        fmt::format_to(std::back_inserter(ids), " {}", q.front());
+    }
+    return fmt::format("ready {} active {} app time {} state {} tick events queued {}, asleep:{}",
+                       ready, active, static_cast<u32>(app_cpu_time),
+                       curr_state == SchedState::APP ? "APP" : "SYS",
+                       kernel.timing.GetTimer(1)->EventCount(tick_event), ids);
+}
+
 template <class Archive>
 void CpuLimiterMulti::serialize(Archive& ar, const unsigned int) {
     ar & ready;

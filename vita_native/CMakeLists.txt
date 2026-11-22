@@ -19,7 +19,7 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O2 -nostdlib -fno-optimize-sibling-calls -fno-tree-vectorize")
 
 # The guest's translation table: 1 (default) is sealed to what the taken core needs, 0 merges
-# the kernel's own tables into it. See DEVELOPMENT.md.
+# the kernel's own tables into it.
 set(AZAHAR_SEAL "1" CACHE STRING "1 = sealed L1, 0 = merged kernel L1")
 add_definitions(-DAZAHAR_SEAL=${AZAHAR_SEAL})
 

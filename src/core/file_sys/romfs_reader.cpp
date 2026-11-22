@@ -23,6 +23,27 @@ SERIALIZE_EXPORT_IMPL(FileSys::DirectRomFSReader)
 
 namespace FileSys {
 
+namespace {
+u64 NowUs() {
+    return static_cast<u64>(Common::ProcessClock::now().time_since_epoch().count());
+}
+} // namespace
+
+#ifdef VITA_DIAGNOSTICS
+namespace {
+struct {
+    std::atomic<u64> reads, read_bytes, misses, miss_us, large, large_bytes, large_us;
+} read_stats;
+} // namespace
+
+RomFSReadStats TakeRomFSReadStats() {
+    const auto take = [](std::atomic<u64>& v) { return v.exchange(0, std::memory_order_relaxed); };
+    return {take(read_stats.reads),  take(read_stats.read_bytes),  take(read_stats.misses),
+            take(read_stats.miss_us), take(read_stats.large),       take(read_stats.large_bytes),
+            take(read_stats.large_us)};
+}
+#endif
+
 std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, u8* buffer) {
     length = std::min(length, GetSize() - offset);
     if (length == 0)
@@ -33,8 +54,16 @@ std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, 
 
     // Skip cache if the read is too big
     if (segments.size() == 1 && segments[0].second > cache_line_size()) {
+        const u64 start = NowUs();
         length = file->ReadAtBytes(buffer, length, offset);
-        LOG_TRACE(Service_FS, "RomFS Cache SKIP: offset={}, length={}", offset, length);
+        const u64 took = NowUs() - start;
+#ifdef VITA_DIAGNOSTICS
+        read_stats.large.fetch_add(1, std::memory_order_relaxed);
+        read_stats.large_bytes.fetch_add(length, std::memory_order_relaxed);
+        read_stats.large_us.fetch_add(took, std::memory_order_relaxed);
+#endif
+        LOG_TRACE(Service_FS, "RomFS Cache SKIP: offset={}, length={}, {} us", offset, length,
+                  took);
         return length;
     }
 
@@ -47,9 +76,15 @@ std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, 
         auto cache_entry = cache.Request(page);
         if (!cache_entry.first) {
             // If not found, read from disk and cache the data
+            const u64 start = NowUs();
             read_size = file->ReadAtBytes(cache_entry.second, read_size, page);
-            LOG_TRACE(Service_FS, "RomFS Cache MISS: page={}, length={}, into={}", page, seg.second,
-                      (seg.first - page));
+            const u64 took = NowUs() - start;
+#ifdef VITA_DIAGNOSTICS
+            read_stats.misses.fetch_add(1, std::memory_order_relaxed);
+            read_stats.miss_us.fetch_add(took, std::memory_order_relaxed);
+#endif
+            LOG_TRACE(Service_FS, "RomFS Cache MISS: page={}, length={}, into={}, {} us", page,
+                      seg.second, (seg.first - page), took);
         } else {
             LOG_TRACE(Service_FS, "RomFS Cache HIT: page={}, length={}, into={}", page, seg.second,
                       (seg.first - page));
@@ -61,6 +96,10 @@ std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, 
         std::memcpy(buffer + read_progress, cache_entry.second + (seg.first - page), copy_amount);
         read_progress += copy_amount;
     }
+#ifdef VITA_DIAGNOSTICS
+    read_stats.reads.fetch_add(1, std::memory_order_relaxed);
+    read_stats.read_bytes.fetch_add(read_progress, std::memory_order_relaxed);
+#endif
     return read_progress;
 }
 

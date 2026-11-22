@@ -229,7 +229,7 @@ constexpr int RoleCores(ThreadRole role, std::size_t index) {
     switch (role) {
     case ThreadRole::Emulation:
         // Folded native execution: the guest runs on the emulation thread's own core, one
-        // slice at a time inside vanRun (vaprobe folded mode), so this core is the guest's
+        // slice at a time inside azaharRun (the folded design), so this core is the guest's
         // too and nothing else of ours goes there.
         return 1 << 2;
     case ThreadRole::Dsp:
@@ -239,8 +239,6 @@ constexpr int RoleCores(ThreadRole role, std::size_t index) {
         // The PICA stays on the emulation thread; what it draws is built and sent here. Core 1
         // is otherwise idle.
         return 1;
-    case ThreadRole::ShaderCompiler:
-        return 0;
     case ThreadRole::RasterWorker:
     case ThreadRole::ShaderCompiler:
     case ThreadRole::AudioSink:
@@ -274,6 +272,47 @@ constexpr int PriorityCore(ThreadRole role) {
     return 0;
 }
 
+namespace {
+/// The threads SetCurrentThreadRole placed, for RoleThreads: the role plus one above the kernel ID
+/// in one word (0: none), a slot a thread, taken again once its thread is gone.
+std::array<std::atomic<u64>, 32> placed{};
+
+void NotePlaced(ThreadRole role, int thread_id) {
+    const u64 word = u64{static_cast<u32>(role) + 1} << 32 | static_cast<u32>(thread_id);
+    for (int pass = 0; pass < 2; pass++) {
+        for (auto& p : placed) {
+            u64 seen = p.load(std::memory_order_relaxed);
+            if (seen != 0 && pass == 1) {
+                // Full: a slot whose thread is gone.
+                SceKernelThreadInfo info{};
+                info.size = sizeof(info);
+                if (sceKernelGetThreadInfo(static_cast<SceUID>(static_cast<u32>(seen)), &info) >=
+                    0) {
+                    continue;
+                }
+            } else if (seen != 0) {
+                continue;
+            }
+            if (p.compare_exchange_strong(seen, word, std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+}
+} // namespace
+
+std::vector<RoleThread> RoleThreads() {
+    std::vector<RoleThread> out;
+    for (const auto& p : placed) {
+        const u64 word = p.load(std::memory_order_relaxed);
+        if (word != 0) {
+            const auto role = static_cast<ThreadRole>((word >> 32) - 1);
+            out.push_back({role, static_cast<int>(static_cast<u32>(word)), RoleCores(role, 0)});
+        }
+    }
+    return out;
+}
+
 void SetCurrentThreadRole(ThreadRole role, std::size_t index) {
     const int cores = RoleCores(role, index);
     // Affinity is one bit per core from bit 16. The top of the four, SCE_KERNEL_CPU_MASK_SYSTEM,
@@ -287,6 +326,7 @@ void SetCurrentThreadRole(ThreadRole role, std::size_t index) {
         LOG_WARNING(Common, "Could not pin thread to cores {:#x}: {:#010x}", cores, result);
     }
     sceKernelChangeThreadPriority(thread_id, PriorityCore(role));
+    NotePlaced(role, thread_id);
 }
 
 #elif defined(__linux__)

@@ -40,6 +40,8 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     file_util.cpp
     file_util.h
     hash.h
+    heap_check.cpp
+    heap_check.h
     hacks/hack_list.h
     hacks/hack_list.cpp
     hacks/hack_manager.h

@@ -5,9 +5,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <psp2/kernel/threadmgr.h>
 #include "common/logging/log.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/vprof.h"

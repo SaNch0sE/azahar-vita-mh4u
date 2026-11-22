@@ -9,10 +9,10 @@
 #include <string>
 #include <fmt/format.h>
 #include "sgxd_program.h"
-#include "video_core/renderer_gxm/usse/fs_usse_gen.h"
-#include "video_core/renderer_gxm/usse/usse_encoder.h"
-#include "video_core/renderer_gxm/usse/usse_ir.h"
-#include "video_core/renderer_gxm/usse/usse_program.h"
+#include "video_core/renderer_sgxd/usse/fs_usse_gen.h"
+#include "video_core/renderer_sgxd/usse/usse_encoder.h"
+#include "video_core/renderer_sgxd/usse/usse_ir.h"
+#include "video_core/renderer_sgxd/usse/usse_program.h"
 
 namespace GxmRenderer::Usse {
 
@@ -133,7 +133,7 @@ constexpr uint8_t TmpAlphaSplit = 28; ///< a split unit's alpha texel (4 each,
                                       ///< FSConfig alpha_split), in the stage arguments'
                                       ///< homes while SampleTextures runs
 constexpr uint8_t TmpLutCoord = 28;   ///< lighting/fog: the LUT texel coordinate (2)
-constexpr uint8_t TmpLutDelta = 30;   ///< lighting/fog: the interpolation weight (1)
+constexpr uint8_t TmpLutDelta = 30;   ///< fog/proctex: the interpolation weight (1)
 constexpr uint8_t TmpLutEntry = 32;   ///< lighting/fog: the fetched LUT entry (4)
 constexpr uint8_t TmpHalf = 36;       ///< lighting: the normalised half vector (3)
 constexpr uint8_t TmpLight = 40;      ///< lighting: the normalised light vector (3)
@@ -358,10 +358,8 @@ private:
     void LightingLutRowFetch(Sampler sampler, bool abs_input, Dst into, const Src* scale = nullptr,
                              bool pair_free = false, bool row_set = false);
     void LutLfFetch();
-    /// A LUT texel fetch: i1.y holds the index, `sampler_index` names the LUT texture (256
-    /// texels a row, `inv_rows` its row count's inverse); the entry lands in TmpLutEntry.
-    /// Fetches the LUT entry at index i1.y (or -i1.y when `negated`) of a texture with the
-    /// given row scale and bias literal pairs into TmpLutEntry, and waits.
+    /// A LUT texel fetch at index i1.y (-i1.y when `negated`) from texture `sampler_index` (256
+    /// texels a row) through the row scale and bias literal pairs, into TmpLutEntry, and waits.
     void LutFetch(uint32_t sampler_index, uint8_t scale_lit, uint8_t bias_lit, bool negated);
     /// LutFetch's texel coordinate alone, into `coord`: the sample is the caller's, so several
     /// can share one WDF.
@@ -496,7 +494,6 @@ private:
     /// already; with `wait` waited for too, else a LUT fetch's WDF that follows covers them
     /// (no internal register may hold a value across either). Nothing for a resident light.
     void LightQuads(uint32_t mask, bool wait);
-    void WriteDepth();
     /// A uniform's place: `components` floats (or array_size float4s) at a pair-aligned
     /// offset.
     uint32_t AllocateUniform(UniformKind kind, uint8_t components, uint32_t array_size,
@@ -2260,7 +2257,8 @@ void FragmentEmitter::Lighting() {
         StoreVec4(tangent, I1);
     }
 
-    // quat = normalize(dot(normquat, normquat_flat) < 0 ? -normquat : normquat)
+    // quat = normalize(normquat); the rotation is the same for -q, so the flat copy's sign is not
+    // needed.
     LoadVec4(I0, normquat);
     e.Dot({I2, 0x1}, {I0, XYZW}, {I0, XYZW}, true, Pred::None, true);
     e.Comp(CompOp::Rsq, {I2, 0x1}, {I2}, 0, Pred::None, true);
@@ -2504,11 +2502,46 @@ void FragmentEmitter::Lighting() {
         // (and the distance bias in .w), 5 the spot direction (the distance scale).
         LightQuads(0x30, true);
 
-        // light_vector = position (+ view unless directional); distance; normalised.
-        // Normalising a directional light's direction once per draw in a secondary program
-        // (psp2cgc does that) drew a 32-pixel tile pattern over every lit surface on the
-        // console, 2026-09-06: the tiles of one fragment job do not all see the same
-        // secondary attributes once the secondary program has written them.
+        // The inputs this light's lookups read, a lane each for those read off its vectors.
+        u32 inputs = 0;
+        const auto input_of = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
+            if (LightingLutEnabled(lut, sampler)) {
+                inputs |= 1u << static_cast<u32>(lut.type.Value());
+            }
+        };
+        if (light.spot_atten_enable) {
+            input_of(lighting.lut_sp, Sampler::SpotlightAttenuation);
+        }
+        if (uses_secondary_color) {
+            if (!d0_shared) {
+                input_of(lighting.lut_d0, Sampler::Distribution0);
+            }
+            if (!d1_shared) {
+                input_of(lighting.lut_d1, Sampler::Distribution1);
+            }
+            input_of(lighting.lut_rr, Sampler::ReflectRed);
+            input_of(lighting.lut_rg, Sampler::ReflectGreen);
+            input_of(lighting.lut_rb, Sampler::ReflectBlue);
+        }
+        if (light_index + 1 == lighting.src_num &&
+            ((uses_primary_color && lighting.enable_primary_alpha) ||
+             (uses_secondary_color && lighting.enable_secondary_alpha))) {
+            input_of(lighting.lut_fr, Sampler::Fresnel);
+        }
+        const auto reads = [&](LutInput input) {
+            return (inputs >> static_cast<u32>(input) & 1) != 0;
+        };
+        input_lane.fill(-1);
+        int8_t lanes = 0;
+        for (const LutInput input : {LutInput::NH, LutInput::VH, LutInput::LN, LutInput::SP}) {
+            if (reads(input)) {
+                input_lane[static_cast<u32>(input)] = lanes++;
+            }
+        }
+
+        // The light vector in i0 = position (+ view unless directional); distance; normalised. A
+        // directional light's comes normalised in its uniform (LightPreNormalised): normalised in a
+        // secondary program it drew a 32-pixel tile pattern over lit surfaces.
         LoadVec4(I0, position);
         if (!LightPreNormalised(light)) {
             // Four lanes, though w means nothing: every lane the store reads is then the
@@ -2917,10 +2950,9 @@ Vec4Loc FragmentEmitter::SourceLocation(Source source, u32 stage_index, bool alp
 void FragmentEmitter::LoadArg(uint8_t arg_index, const TevStageConfig& stage, u32 stage_index,
                               Source csrc, ColorModifier cmod, Source asrc, AlphaModifier amod,
                               uint8_t lanes) {
-    // An argument is built in the internal register itself: the colour source's quad in one
-    // move (or one lane of it broadcast), the alpha source's lane moved into w when it
-    // differs, then one add for the inverted lanes. Assembling it in temporaries first cost
-    // three copies and a load per argument.
+    // An argument is built in the internal register itself: the colour source's quad in one move
+    // (or one lane broadcast), the alpha source's lane moved into w when it differs, then one add
+    // for the inverted lanes.
     const Reg dst = Reg::I(arg_index);
     const Vec4Loc c =
         SourceLocation(ColorSource(stage, csrc, stage_index), stage_index, ReadsAlphaLane(cmod));
@@ -3878,9 +3910,6 @@ void FragmentEmitter::AlphaTest(Reg* u8) {
     }
     if (func == FramebufferRegs::CompareFunc::Never) {
         e.Test(Cond::Gt, 1, ConstZero, 0, ConstZero, false);
-        if (uses_depth) {
-            WriteDepth();
-        }
         e.KillUnlessP1();
         NewPhaseAfterKill();
         return;
@@ -4034,13 +4063,10 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     e.skip_invalid_auto = true;
     e.skip_invalid = true;
 
-    // A kill ends its phase: psp2cgc follows every kill with its nop and then a new phase
-    // marker (all 148 of SM3DL's programs, whose scissor kill comes first: phase one is the
-    // scissor test alone, phase two everything else). The first marker waits with
-    // condition 1 when another phase follows, 7 otherwise, as the compiler's do. Before
-    // this the emitter kept sampling and shading in the kill's phase and opened its second
-    // phase only before the output pack; Vita3K did not mind, the console drew noise.
-    e.Phas(!(uses_kill || uses_depth));
+    // A kill ends its phase: psp2cgc follows every kill with its nop and a new phase marker. The
+    // first marker waits with condition 1 when another phase follows, 7 otherwise, as the
+    // compiler's do.
+    e.Phas(!uses_kill);
     e.Nop();
     Scissor();
     SampleTextures();
@@ -4156,7 +4182,6 @@ std::optional<Program> EmitFragmentProgram(const FSConfig& config, std::string* 
     FragmentEmitter emitter{config, level};
     std::optional<FragmentEmitter> exact;
     try {
-        FragmentEmitter emitter{config, level};
         std::optional<Program> emitted = emitter.Emit(refusal);
         if (!emitted || !emitter.LightsInMemory()) {
             return emitted;
@@ -4194,7 +4219,9 @@ std::optional<Program> EmitFragmentProgram(const FSConfig& config, std::string* 
         // An operand form the encoder cannot express; with the emission it stopped in and its
         // SA words so far (an SA past 127 does not fit an operand).
         if (refusal) {
-            *refusal = ex.what();
+            *refusal = fmt::format("{} (the {} emission: {}; the first read {} literal words)",
+                                   ex.what(), exact ? "second" : "first",
+                                   (exact ? *exact : emitter).Budget(), emitter.LiteralWords());
         }
         return std::nullopt;
     }

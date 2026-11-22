@@ -5,7 +5,7 @@
 // under translation tables and exception vectors this module owns.
 // The support half (report, cp15, translation, export resolver, peripheral block); native.c
 // is the emulator half. One translation unit: the taken core avoids calls into other objects.
-// DEVELOPMENT.md describes how the whole thing works.
+// docs/native-execution.md describes how the whole thing works.
 
 #include <psp2kern/io/fcntl.h>
 #include <taihen.h>

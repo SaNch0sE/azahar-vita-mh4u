@@ -653,6 +653,7 @@ void DspHle::SetSemaphore(u16 semaphore_value) {
 DspHle::Stats DspHle::TakeStats() {
     return impl->TakeStats();
 }
+#endif
 
 std::vector<u8> DspHle::PipeRead(DspPipe pipe_number, std::size_t length) {
     return impl->PipeRead(pipe_number, length);

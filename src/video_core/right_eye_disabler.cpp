@@ -8,6 +8,7 @@
 #include "video_core/gpu_impl.h"
 
 namespace VideoCore {
+
 bool RightEyeDisabler::ShouldAllowCmdQueueTrigger(PAddr addr, u32 size) {
     if (!enabled || !enable_for_frame)
         return true;
@@ -35,7 +36,8 @@ bool RightEyeDisabler::ShouldAllowCmdQueueTrigger(PAddr addr, u32 size) {
     cmd_trigger_blocked = false;
     return true;
 }
-bool RightEyeDisabler::ShouldAllowDisplayTransfer(PAddr src_address, size_t size) {
+bool RightEyeDisabler::ShouldAllowDisplayTransfer(PAddr src_address, size_t size,
+                                                  u32 output_rows) {
     if (!enabled || !enable_for_frame)
         return true;
 

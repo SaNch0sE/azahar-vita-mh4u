@@ -216,10 +216,6 @@ option(ENABLE_NATIVE_OPTIMIZATION "Enables processor-specific optimizations via 
 option(CITRA_USE_PRECOMPILED_HEADERS "Use precompiled headers" ON)
 option(CITRA_WARNINGS_AS_ERRORS "Enable warnings as errors" ON)
 option(CITRA_ADDRESS_SANITIZE "Enable address sanitizer" OFF)
-option(CITRA_TRACE_PROBES "Compile in env-gated diagnostic trace probes (see TRACE_PROBES.md; never for release)" OFF)
-if (CITRA_TRACE_PROBES)
-    add_compile_definitions(CITRA_TRACE_PROBES)
-endif()
 
 if (ENABLE_LTO)
     set(DEFAULT_VITA_DIAGNOSTICS OFF)

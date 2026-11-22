@@ -514,6 +514,10 @@ private:
 
     static const std::array<FunctionDef, 180> SVC_Table;
     static const FunctionDef* GetSVCInfo(u32 func_num);
+#ifdef VITA_DIAGNOSTICS
+    /// An svc outside the table: the thread, its registers, the code around it and its stack.
+    void LogUnknown(u32 immediate);
+#endif
 };
 
 /// Map application or GSP heap memory
@@ -2448,6 +2452,35 @@ const SVC::FunctionDef* SVC::GetSVCInfo(u32 func_num) {
     return &SVC_Table[func_num];
 }
 
+#ifdef VITA_DIAGNOSTICS
+void SVC::LogUnknown(u32 immediate) {
+    const Core::ARM_Interface& cpu = system.GetRunningCore();
+    const Process& process = *kernel.GetCurrentProcess();
+    const Thread* thread = kernel.GetCurrentThreadManager().GetCurrentThread();
+    const auto words = [&](u32 from, u32 count) {
+        std::string text;
+        for (u32 address = from; address != from + count * 4; address += 4) {
+            text += memory.IsValidVirtualAddress(process, address)
+                        ? fmt::format(" {:08x}", memory.Read32(address))
+                        : std::string{" --------"};
+        }
+        return text;
+    };
+    std::string registers;
+    for (int i = 0; i < 15; i++) {
+        registers += fmt::format(" {:08x}", cpu.GetReg(i));
+    }
+    const u32 pc = cpu.GetPC() & ~3u;
+    LOG_ERROR(Kernel_SVC,
+              "unknown svc {:#x}: thread {} \"{}\" on core {}, pc {:08x} cpsr {:08x}, r0-r14{}",
+              immediate, thread->thread_id, thread->name, cpu.GetID(), cpu.GetPC(), cpu.GetCPSR(),
+              registers);
+    LOG_ERROR(Kernel_SVC, "unknown svc: code from {:08x}{}", pc - 32, words(pc - 32, 12));
+    LOG_ERROR(Kernel_SVC, "unknown svc: stack from {:08x}{}", cpu.GetReg(13) & ~3u,
+              words(cpu.GetReg(13) & ~3u, 32));
+}
+#endif
+
 MICROPROFILE_DEFINE(Kernel_SVC, "Kernel", "SVC", MP_RGB(70, 200, 70));
 
 void SVC::CallSVCForUpcall(u32 immediate) {
@@ -2472,6 +2505,11 @@ void SVC::CallSVC(u32 immediate) {
                      "Running threads from exiting processes is unimplemented");
 
     const FunctionDef* info = GetSVCInfo(immediate);
+#ifdef VITA_DIAGNOSTICS
+    if (!info) {
+        LogUnknown(immediate);
+    }
+#endif
     LOG_TRACE(Kernel_SVC, "calling {}", info->name);
     if (info) {
         if (info->func) {

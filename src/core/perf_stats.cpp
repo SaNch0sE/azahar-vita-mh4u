@@ -50,6 +50,7 @@ PerfStats::~PerfStats() {
     file.WriteString(stream.str());
 }
 
+#if !defined(__vita__) || defined(VITA_DIAGNOSTICS)
 void PerfStats::BeginSVCProcessing() {
     start_svc_time = Clock::now();
 }
@@ -73,6 +74,7 @@ void PerfStats::BeginGPUProcessing() {
 void PerfStats::EndGPUProcessing() {
     accumulated_gpu_time += (Clock::now() - start_gpu_time);
 }
+#endif
 
 void PerfStats::StartSwap() {
     start_swap_time = Clock::now();

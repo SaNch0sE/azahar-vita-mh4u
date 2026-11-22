@@ -14,6 +14,9 @@
 #include "core/hle/kernel/process.h"
 #include "core/hle/service/cam/y2r_u.h"
 #include "core/hw/y2r.h"
+#ifdef ENABLE_GXM
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#endif
 
 SERVICE_CONSTRUCT_IMPL(Service::Y2R::Y2R_U)
 SERIALIZE_EXPORT_IMPL(Service::Y2R::Y2R_U)

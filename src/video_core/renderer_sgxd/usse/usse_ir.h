@@ -26,12 +26,22 @@ namespace GxmRenderer::Usse::Ir {
  * the epilogue writes last. Running out of one class spills the longest-lived value to the
  * next; running out of all refuses the program.
  *
- * Level 2, the second tier (gxm_shader_tier: off the render thread, for programs that
- * draw a lot), first runs the optimising passes:
+ * Level 2, the second tier (sgxd_shader_tier: off the drawing thread, for programs that
+ * draw a lot), first runs the optimising passes, in this order:
  *  - dead stores: an instruction whose only effect is a write to a virtual quad nothing
  *    reads afterwards is dropped;
+ *  - global hoist (hoisting level 3): an indexed uniform read whose address register is
+ *    written only before every use (a skinning program's MOVA) is read once, after that
+ *    write, and later reads of the same index use that quad;
+ *  - load hoist (levels 2 and 3): consecutive uniform reads in a block are issued together,
+ *    up to `level` of them, and wait once;
+ *  - output coalescing: a whole virtual pair moved into an output pair and dead afterwards
+ *    is that output pair throughout;
  *  - internal-register reloads: a four-wide load of the same operand into the same
  *    internal register, with neither changed in between, is dropped;
+ *  - two-wide chains: four-wide ops accumulating in the internal registers (each reading
+ *    the previous result, the last moved out to pairs) become two-wide ops on the unified
+ *    store;
  *  - direct two-wide ops: a four-wide op into an internal register whose result is only
  *    moved out to unified-store pairs becomes one two-wide op per pair, when each pair's
  *    two lanes come from one source pair (the compiler's own idiom, `mul.f32 o0.xy,
@@ -40,12 +50,21 @@ namespace GxmRenderer::Usse::Ir {
  *    compares or pack reads gets folded into them (they read the source's pair or lane
  *    directly; commutative ops swap operands for a negated source, compares swap with
  *    the condition flipped) and the load goes;
+ *  - results into internal registers: a quad assembled lane by lane only to be loaded
+ *    whole into an internal register is assembled in that register;
  *  - internal registers placed again: within a block each full write starts a range,
  *    the ranges go over i0-i2 keeping loaded operands resident (the one loaded again
  *    soonest is spent last), and a load of an operand a register still holds, unchanged
  *    since, is dropped;
+ *  - direct two-wide ops again, for the tails the chains leave;
  *  - internal-register dead writes: a write to i0-i2 nothing reads before it is
- *    overwritten, or before the next label or branch, is dropped.
+ *    overwritten, or before the next label or branch, is dropped; dead stores again.
+ *
+ * The lowering is tried at hoisting levels 3, 2 and 1 (none). A fragment program keeps the
+ * level whose register counts let the PDS keep the most pixel tasks in flight (Builder's
+ * occupancy), the most hoisting among equals; a vertex program keeps the highest level that
+ * fits. The passes are for fewer instructions and fewer registers: a fragment program's
+ * register counts decide how many of its pixel tasks a core runs at once (docs/sgxd/usse.md).
  *
  * The hardware's other registers (primary attributes the fetch fills, secondary
  * attributes, the internal registers, the constants, the outputs) are named physically and
@@ -131,6 +150,13 @@ struct LowerResult {
     uint32_t temp_count = 0; ///< temporaries used, r0 up
     uint32_t pa_count = 0;   ///< primary attributes used
     uint32_t spilled = 0;    ///< quads that left the first class
+    /// The most registers live at one instruction, over all units (AllocatePairs): what the
+    /// temporaries and primary attributes could come to with no packing loss.
+    uint32_t peak_live = 0;
+    /// Where that is (the first such instruction of the lowered list) and the units live
+    /// there, each its first virtual register (dumpusse: what holds the registers).
+    uint32_t peak_at = 0;
+    std::vector<uint16_t> peak_regs;
     std::vector<uint32_t> phase_starts{0};
 };
 
@@ -141,7 +167,6 @@ public:
     /// coordinates of a read with the hardware's own level (its LOD comes from the 2x2 quad's
     /// neighbours, invalid instances included). Takes the place of `skip_invalid`; no branches.
     bool skip_invalid_auto = false;
-    int nosched_override = 0;
     bool secondary = false;
     /// The registers in pairs: a virtual quad no operand reaches across its middle is two
     /// pairs placed apart (Lowering::AllocatePairs), so a scalar or a two-lane value takes two
