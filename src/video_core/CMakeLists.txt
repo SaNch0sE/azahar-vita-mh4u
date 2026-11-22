@@ -109,6 +109,8 @@ if (ENABLE_GXM)
             renderer_gxm/gxm_flags.h
             renderer_gxm/gxm_rasterizer.cpp
             renderer_gxm/gxm_rasterizer.h
+            renderer_gxm/guest_gpu_memory.cpp
+            renderer_gxm/guest_gpu_memory.h
             renderer_gxm/usse/fixed_usse_gen.cpp
             renderer_gxm/usse/fixed_usse_gen.h
             renderer_gxm/usse/fs_usse_gen.cpp
@@ -123,7 +125,21 @@ if (ENABLE_GXM)
             renderer_gxm/usse/vs_usse_gen.h
             renderer_gxm/renderer_gxm.cpp
             renderer_gxm/renderer_gxm.h
+            renderer_gxm/sgxd_backend.cpp
+            renderer_gxm/sgxd_backend.h
+            # sgxd's plain C pieces the rasterizer builds its passes with (the host build too).
+            ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_program.c
+            ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_recipe.c
     )
+    # sgxd_recipe.h takes the op list's types from the module's sgxd.h, plain C on any host.
+    target_include_directories(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/sgxd
+                                                  ${CMAKE_SOURCE_DIR}/vita_native/src)
+    # The precompiled header is C++; a C file given it makes CMake build a C one from it. The
+    # project's C++-only warning options are warnings of their own to a C compiler, which
+    # -Werror would stop on.
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_program.c
+        ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_recipe.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON
+        COMPILE_OPTIONS "-Wno-error")
     # libgxm only: every program comes from the USSE emitters, nothing compiles on the console.
     if (ENABLE_GXM_STUB)
         if (NOT DEFINED ENV{VITASDK})
@@ -145,6 +161,12 @@ if (ENABLE_GXM)
     else ()
         target_include_directories(video_core PRIVATE $ENV{VITASDK}/arm-vita-eabi/include)
         target_link_libraries(video_core PRIVATE SceGxm_stub)
+        # sgxd's user-side pieces that submit: the PTLA and the session (the frontend's
+        # presenter uses the session and the recipe from here too).
+        target_sources(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
+                                          ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c)
+        set_source_files_properties(${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_ptla.c
+            ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
     endif ()
 endif ()
 

@@ -6,6 +6,8 @@
 
 #include <atomic>
 #include <functional>
+#include <utility>
+#include <vector>
 #include "common/common_types.h"
 
 namespace Pica {
@@ -74,6 +76,17 @@ public:
     /// Attempt to draw using hardware shaders
     virtual bool AccelerateDrawBatch([[maybe_unused]] bool is_indexed) {
         return false;
+    }
+
+    /// The PICA is about to raise P3D. From then on the guest may overwrite the vertex and
+    /// index buffers of the draws before it.
+    virtual void NotifyP3D() {}
+
+    /// From the emulation thread: the guest ranges the GPU read from memory the CPU caches
+    /// since the last call (vertex and index buffers), as (address, size). The GPU hands them
+    /// to KeepUncached, so that a buffer drawn from each frame is not cleaned each frame.
+    virtual std::vector<std::pair<PAddr, u32>> TakeCachedReads() {
+        return {};
     }
 
     virtual void LoadDefaultDiskResources(

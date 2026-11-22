@@ -74,6 +74,9 @@ private:
     /// cleared too.
     void ForgetRange(VAddr base, u32 size, bool unmap);
     bool Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) const;
+    /// The permission a mapping of host is made with: guest VRAM, uncached in CDRAM, takes the app's
+    /// own memory attributes.
+    u32 MapPerm(const u8* host);
 
     Memory::MemorySystem& memory;
     bool installed{};

@@ -90,6 +90,12 @@ bool VitaGuestMap::Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) c
     return true;
 }
 
+u32 VitaGuestMap::MapPerm(const u8* host) {
+    const u8* vram = memory.GetPhysicalPointer(Memory::VRAM_PADDR);
+    const bool in_vram = vram != nullptr && host >= vram && host < vram + Memory::VRAM_SIZE;
+    return in_vram ? GuestPerm | AZAHAR_PERM_APP_ATTR : GuestPerm;
+}
+
 void VitaGuestMap::OnMapped(VAddr base, u32 size, MemoryRef target) {
     if (base + size > GuestEnd || base + size < base) {
         return;
@@ -117,7 +123,7 @@ void VitaGuestMap::OnMapped(VAddr base, u32 size, MemoryRef target) {
     ForgetRange(base, size, installed);
     live_mappings.emplace(base, wanted);
     if (installed) {
-        Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(host), base, size, GuestPerm);
+        Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(host), base, size, MapPerm(host));
     }
 }
 
@@ -190,7 +196,7 @@ bool VitaGuestMap::Install() {
     unsigned added = 0;
     for (const auto& [base, mapping] : live_mappings) {
         if (Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(mapping.host), base, mapping.size,
-                 GuestPerm)) {
+                 MapPerm(mapping.host))) {
             added++;
         }
     }

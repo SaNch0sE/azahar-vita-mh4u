@@ -80,7 +80,8 @@ unsigned int _pthread_stack_default_user = 1024 * 1024;
 int _vita_net_init(void);
 }
 
-constexpr int MinAzaharNativeVersion = 1;
+// 5: AZAHAR_PERM_APP_ATTR, guest VRAM in CDRAM mapped with the app's attributes.
+constexpr int MinAzaharNativeVersion = 5;
 
 namespace {
 /// The process's own arguments, kept for LaunchParameter.

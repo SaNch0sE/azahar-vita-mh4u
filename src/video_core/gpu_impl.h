@@ -5,7 +5,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include "common/archives.h"
+#include "common/thread.h"
 #include "common/microprofile.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -35,6 +38,19 @@ struct GPU::Impl {
     std::unique_ptr<SwRenderer::SwBlitter> sw_blitter;
     Core::TimingEventType* vblank_event;
     Service::GSP::InterruptHandler signal_interrupt;
+
+#ifdef VITA_DIAGNOSTICS
+    /// GPU::TakeOpStats's.
+    std::atomic<u64> kind_us[4]{};
+    std::atomic<u32> kind_ops[4]{};
+    /// What the render thread hands back to the emulation thread (interrupts, the fill's
+    /// finished bit), run in order by posted_event.
+    std::mutex posted_mutex;
+    std::deque<std::function<void()>> posted;
+    /// Work ops queued on the render thread and not yet finished: the interrupts they post are
+    /// still to come (WaitPostedIdle waits for them).
+    std::atomic<u32> ops_in_flight{};
+    Core::TimingEventType* posted_event{};
 
     explicit Impl(Core::System& system, Frontend::EmuWindow& emu_window,
                   Frontend::EmuWindow* secondary_window)

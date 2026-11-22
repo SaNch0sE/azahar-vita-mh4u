@@ -6,9 +6,11 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
+#include "video_core/renderer_gxm/usse/gxp_writer.h"
 
 namespace GxmRenderer::Usse {
 
@@ -49,9 +51,16 @@ struct VsRequest {
     uint16_t bools;
     uint16_t bool_mask;
     std::array<uint8_t, 16> reg_components;
+    /// Input registers whose loader is UNSIGNED_BYTE: the fetch brings the raw word, and the
+    /// prologue unpacks its bytes to integer-valued floats, as the PICA's loader converts them.
+    uint16_t u8_regs;
 };
 
 /// `level` 2 runs the IR's optimising passes (the second tier).
+[[nodiscard]] std::optional<GxpProgram> EmitVertexGxp(const VsRequest& request,
+                                                      uint32_t& input_regs,
+                                                      std::string* refusal = nullptr,
+                                                      int level = 1);
 [[nodiscard]] std::vector<uint8_t> EmitVertexProgram(const VsRequest& request, uint32_t& input_regs,
                                                      std::string* refusal = nullptr, int level = 1);
 

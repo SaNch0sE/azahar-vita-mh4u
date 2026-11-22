@@ -26,7 +26,6 @@
 #include "common/logging/backend.h"
 #include "common/logging/filter.h"
 #include "common/logging/log.h"
-#include "common/pipeline_stats.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -38,10 +37,6 @@
 #include "core/movie.h"
 #include "video_core/gpu.h"
 #include "video_core/pica/pica_core.h"
-#include "video_core/shader/generator/cg_fs_shader_gen.h"
-#ifdef ENABLE_GXM_STUB
-#include "video_core/renderer_gxm/gxm_stub/gxm_stub.h"
-#endif
 #include "input_common/main.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -54,7 +49,6 @@ struct Options {
     long frame_limit = -1;
     long seconds_limit = -1;
     long input_port = -1;
-    std::string dump_cg_path;
     bool interpreter = false;
     bool no_shader_jit = false;
     bool no_hw_shader = false;
@@ -75,7 +69,6 @@ void PrintUsage(const char* program) {
         "  -h, --help              Show this message\n"
         "  -f, --frames N          Stop after N presented frames\n"
         "  -s, --seconds N         Stop after N seconds\n"
-        "      --dump-cg DIR       Write every generated fragment shader as GXM Cg into DIR\n"
         "      --interpreter       Run guest code on the dyncom interpreter\n"
         "      --no-shader-jit     Interpret PICA vertex shaders instead of JITing them\n"
         "      --no-hw-shader      Run GL's vertex shaders on the CPU, not the host GPU\n"
@@ -161,12 +154,6 @@ bool ParseOptions(int argc, char** argv, Options& options) {
             options.deterministic = true;
         } else if (argument == "--unlimited") {
             options.unlimited = true;
-        } else if (argument == "--dump-cg") {
-            const char* value = next("--dump-cg");
-            if (value == nullptr) {
-                return false;
-            }
-            options.dump_cg_path = value;
         } else if (argument == "--interpreter") {
             options.interpreter = true;
         } else if (argument == "--no-shader-jit") {
@@ -272,10 +259,6 @@ int main(int argc, char** argv) {
     // as the automatic fallback when the whole ladder fails.
     // Shader paths, for attributing a rendering fault to one of them: the PICA vertex shader
     // JIT (shared by both renderers) and GL's generated GLSL (GL only).
-    if (!options.dump_cg_path.empty()) {
-        Pica::Shader::Generator::Cg::SetDumpDir(options.dump_cg_path);
-        LOG_INFO(Frontend, "GXM Cg fragment shaders will be dumped to {}", options.dump_cg_path);
-    }
     if (options.interpreter) {
         // The CPU the Vita build cannot use, and the only one an emulated Vita can run: having
         // it here as well is what lets a picture drawn over native execution be compared with
@@ -294,7 +277,6 @@ int main(int argc, char** argv) {
     EmuWindow_SDL2 window(system, options.software || options.gxm);
     if (options.gxm) {
 #ifdef ENABLE_GXM_STUB
-        GxmStub::InstallDevice();
         Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
         LOG_INFO(Frontend, "Using the GXM renderer on the stub libgxm: nothing is presented");
 #else
@@ -341,25 +323,15 @@ int main(int argc, char** argv) {
     }
     LOG_INFO(Frontend, "Loaded {}", options.rom_path);
 
-    // Hand the GL context to the render thread: from here on the emulation thread only queues
-    // GPU work and never waits for rendering; lagging frames are skipped, not slowed to.
-    // Deterministic runs stay lockstep so replays cannot diverge on host GPU speed.
-    // Load this title's shader disk cache while the context is still on this thread: done later
-    // it becomes a multi-second op that blocks the render queue exactly when boot screens draw.
+    // GL and the software renderer draw on this thread, which keeps the context. GXM runs its
+    // operations on the GPU's own render thread and needs no context here.
     {
         u64 title_id{};
         system.GetAppLoader().ReadProgramId(title_id);
         system.GPU().Renderer().Rasterizer()->SwitchDiskResources(title_id);
     }
     system.GPU().Renderer().Rasterizer()->ClearAll(true);
-    window.DoneCurrent();
-    // Deterministic runs keep the GPU synchronous: with the render thread on, completion
-    // interrupts and software-renderer writes land at host-scheduler-dependent guest ticks,
-    // and identical replays diverge. Single-thread mode is bit-reproducible (and what the
-    // pixel-diff harness compares); normal runs keep the threaded pipeline.
-    // A savestate restore must happen while the GPU is still synchronous (saves and loads
-    // are refused once the render thread runs). The signal executes at a quiescent point
-    // inside RunLoop, so give it a few slices before starting the thread.
+    // The signal executes at a quiescent point inside RunLoop, so give it a few slices.
     if (options.loadstate_slot >= 0) {
         // A harness tool: the states come from whatever build saved them, and every commit
         // changes the revision the header is checked against.
@@ -380,19 +352,6 @@ int main(int argc, char** argv) {
                 }
             }
         }
-    }
-
-    // The load took the context on this thread (ScopedRenderContext, with no render thread to
-    // take it from) and leaves it there: give it up again before the render thread starts, or
-    // its MakeCurrent fails and every GL call it makes afterwards does too (glCreateShader
-    // failed for every program after a --loadstate, 2026-09-07).
-    if (options.loadstate_slot >= 0) {
-        window.DoneCurrent();
-    }
-    // Timing replays (-R without -d) stay threaded; explicit -d keeps the GPU synchronous
-    // for bit-reproducible correctness runs.
-    if (!options.deterministic) {
-        system.GPU().StartRenderThread();
     }
 
     if (!options.record_path.empty()) {
@@ -430,51 +389,15 @@ int main(int argc, char** argv) {
         window.Present();
         frames++;
 
-        // Once a second, the same breakdown the console's frontend writes to its perf blob: the
-        // emulation speed, and where the emulation and render threads spend the time they are
-        // not running anything (common/pipeline_stats.h). This tier exists to rehearse the
-        // console's pipeline, which means measuring the same things.
+        // Once a second, upstream's perf stats: what the console's stats window shows.
         {
             static auto last_stats = std::chrono::steady_clock::now();
             const auto now = std::chrono::steady_clock::now();
             if (now - last_stats >= std::chrono::seconds(1)) {
                 last_stats = now;
                 const auto perf = system.GetAndResetPerfStats();
-                const u32 ops = Common::PipelineStats::gpu_ops.exchange(0);
-                const u64 busy_ms = Common::PipelineStats::gpu_busy_us.exchange(0) / 1000;
-                const u64 swap_ms = Common::PipelineStats::gpu_swap_us.exchange(0) / 1000;
-                const u32 brakes = Common::PipelineStats::gpu_brakes.exchange(0);
-                const u64 drain_ms = Common::PipelineStats::drain_us.exchange(0) / 1000;
-                const u32 drains = Common::PipelineStats::drain_count.exchange(0);
-                const u64 barrier_ms = Common::PipelineStats::barrier_us.exchange(0) / 1000;
-                const u64 frags = Common::PipelineStats::fragments.exchange(0);
-                const u32 barriers = Common::PipelineStats::barrier_count.exchange(0);
-                const u64 irq_us = Common::PipelineStats::interrupt_lag_us.exchange(0);
-                const u32 irqs = Common::PipelineStats::interrupt_count.exchange(0);
-                const u32 shown = Common::PipelineStats::presents.exchange(0);
-                const u64 present_ms = Common::PipelineStats::present_us.exchange(0) / 1000;
-                const u32 snaps = Common::PipelineStats::display_snapshots.exchange(0);
-                const auto wt = system.Memory().WriteTracker().TakeStats();
-                LOG_INFO(Frontend,
-                         "PIPE speed {:.0f}% game {:.1f} fps shown {} fps present {} ms snap {} "
-                         "read {}/{} KiB stale {} xfer {}/{} copy {}/{} wt f{} a{} c{} h{} | draws "
-                         "{} targets {} | gpu {} ops busy {} ms swap {} ms "
-                         "brake {} | emu drain {} ms ({}) | barrier {} ms ({}) | irq {}/s lag "
-                         "{:.2f} ms avg | {:.1f} Mfrag/s {:.1f} ns/frag",
-                         perf.emulation_speed * 100.0, perf.game_fps, shown, present_ms, snaps,
-                         Common::PipelineStats::cache_downloads.exchange(0),
-                         Common::PipelineStats::cache_download_kb.exchange(0),
-                         Common::PipelineStats::cache_stale_reads.exchange(0),
-                         Common::PipelineStats::xfer_accel.exchange(0),
-                         Common::PipelineStats::xfer_soft.exchange(0),
-                         Common::PipelineStats::copy_accel.exchange(0),
-                         Common::PipelineStats::copy_soft.exchange(0), wt.faults, wt.arms,
-                         wt.consumed_pages, wt.hot_skips,
-                         Common::PipelineStats::fb_binds.exchange(0),
-                         Common::PipelineStats::fb_switches.exchange(0), ops, busy_ms, swap_ms,
-                         brakes, drain_ms, drains, barrier_ms, barriers, irqs,
-                         irqs ? static_cast<double>(irq_us) / irqs / 1000.0 : 0.0, frags / 1e6,
-                         frags > 0 ? static_cast<double>(busy_ms) * 1e6 / frags : 0.0);
+                LOG_INFO(Frontend, "PIPE speed {:.0f}% game {:.1f} fps shown {:.1f} fps",
+                         perf.emulation_speed * 100.0, perf.game_fps, perf.system_fps);
             }
         }
 
@@ -505,15 +428,6 @@ int main(int argc, char** argv) {
         std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
     LOG_INFO(Frontend, "Ran {} frames in {:.2f}s ({:.2f} fps)", frames, seconds,
              seconds > 0.0 ? frames / seconds : 0.0);
-    // One figure for the whole run: with a fixed workload this is what a change to the
-    // fragment path moves, and it does not depend on which second happened to be sampled.
-    {
-        const u64 frags = Common::PipelineStats::fragments_total.load();
-        const u64 busy = Common::PipelineStats::gpu_busy_total_us.load();
-        LOG_INFO(Frontend, "BENCH fragments={} busy_ms={} ns_per_fragment={:.2f}", frags,
-                 busy / 1000, frags > 0 ? static_cast<double>(busy) * 1000.0 / frags : 0.0);
-    }
-
     if (!options.screenshot_path.empty()) {
         if (window.SaveScreenshot(options.screenshot_path)) {
             LOG_INFO(Frontend, "Wrote {}", options.screenshot_path);

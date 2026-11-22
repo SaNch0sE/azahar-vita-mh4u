@@ -73,12 +73,30 @@ enum { SGXD_IMGUI_COLOUR, SGXD_IMGUI_COLOUR_UV, SGXD_IMGUI_UV_RAW,
 // BGPRIM (the background's), with MTE CULLMODE cull (0 none, 1 clockwise, 2 counterclockwise).
 // clip 0 keeps the whole target; SGXD_RECIPE_CLIP(x0, y0, x1, y1) keeps the 32-pixel tiles x0..x1,
 // y0..y1 (inclusive), the TA's region clip (MODE OUTSIDE).
+// A draw with its own programs (sgxd_program.h builds them) instead of the recipe's
+// vertex fetch, vertex secondary and pixel programs. Every address is a GPU VA, every PDS program
+// 16-byte aligned, and each *_units is its PDS data size (pds_units).
+typedef struct SgxdRecipeDrawPrograms {
+    uint32_t vspds, vspds_units;      // the vertex fetch and the vertex program's DOUTU
+    uint32_t vdm_w2, vdm_w4, vdm_w5;  // sgxd_program_vertex_dms: the index list's words 2, 4, 5
+    uint32_t vsec, vsec_units;        // the vertex secondary: its SA and secondary program
+    uint32_t vsec_sa;                 // the SA words it loads (USEATTRIBUTESIZE)
+    uint32_t fsec, fsec_units;        // the pixel secondary
+    uint32_t fprim, fprim_units;      // the pixel primary: iterators, textures, DOUTU
+    uint32_t pixel_size;              // state word 8 less the address MSBs (sgxd_program_pixel_dms)
+    uint32_t outselects, texsize;     // state words 19 and 22 (the GXP's vertex_outputs1 and 2)
+    float viewport[6];                // state words 12-17: tx, sx, ty, sy, tz, sz
+    uint32_t indices;                 // the 16-bit index list, 0 for the layout's INDICES
+    uint32_t primitive;               // SGXD_PROGRAM_TRIANGLES, _STRIP or _FAN (sgxd_program.h)
+} SgxdRecipeDrawPrograms;
+
 typedef struct SgxdRecipeDraw {
     unsigned first, count;
     uint32_t isp;
-    unsigned fprim;   // SGXD_R_FPRIM or SGXD_R_BGPRIM
+    unsigned fprim;   // SGXD_R_FPRIM or SGXD_R_BGPRIM; unused with programs
     unsigned cull;
     uint32_t clip;
+    const SgxdRecipeDrawPrograms *programs;   // NULL: the recipe's programs
 } SgxdRecipeDraw;
 #define SGXD_RECIPE_CLIP(x0, y0, x1, y1)                                                          \
     (1u << 31 | (uint32_t)(x0) << 24 | (uint32_t)(x1) << 16 | (uint32_t)(y0) << 8 | (uint32_t)(y1))
@@ -91,6 +109,7 @@ typedef struct SgxdRecipe {
     uint32_t rgn_size, tpc_size;
     uint32_t ta_free_list, ta_alloc, ta_threshold, pds_threshold, global_list;
     uint32_t bgobjtag;
+    uint32_t bgobjdepth;             // ISP_BGOBJDEPTH, the 3D kick's: 1.0 until a depth clear sets it
     uint32_t pbe[6];
     uint32_t vdm_w2, vdm_w4, vdm_w5;  // the VDM index list's words 2, 4 and 5
     uint32_t units[SGXD_R_COUNT];    // PDS programs' data units (COPY .. BGPRIM)
@@ -107,11 +126,25 @@ typedef struct SgxdRecipe {
     unsigned imgui_fs;               // ImGui mode: SGXD_IMGUI_*
     int fb_external;                 // the target is not the block's FB (sgxd_recipe_set_target)
     int keep_code_caches;            // sgxd_test 11: the kicks skip the USE_CACHE invalidates
+    int programs;                    // sgxd_recipe_init_programs: draws bring programs
 } SgxdRecipe;
+
+// The macrotile grid of later inits. 0 (the default) picks by size as Sony's kernel does: 4x4
+// from 0x4b000 pixels (960x544), 2x2 below. 4 is 4x4 at every size: below 960x544 the 2x2 grid
+// leaves cores idle over much of the 3D time.
+extern unsigned sgxd_recipe_grid;
+
+// Diagnostics: TA-side writes Sony's microkernel never makes with a 3D in flight, left out of
+// every TA kick and TA done by bit: 1 each core's 0x0310; 2 the per-core cache invalidates (the
+// broadcast ones stay); 4 core 0's event program (0x0a68, 0x0a6c); 8 0x4134's and the cores'
+// 0x0134 event clears at the kick; 16 the TA done's SLC flush with Sony's mask (0x20) and no
+// invalidate; 32 0x0a0c when it holds the value already. 0 (default) writes them all.
+extern unsigned sgxd_recipe_tatrim;
+// Diagnostics: the TA kick waits for every core's TE_RGNHDR_INIT_COMPLETE, not only core 0's.
+extern unsigned sgxd_recipe_rgnwait;
 
 // A width x height (32 to 2048) target at GPU address base (1 MiB aligned), with pages parameter
 // pages, drawing the recipe's triangle. Returns 0, or -1 for sizes the layout does not cover.
-// From 0x4b000 pixels (960x544) the macrotiles are a 4x4 grid, below it 2x2.
 int sgxd_recipe_init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
                      uint32_t pages);
 // The same with a scene of the caller's: nverts vertices of four
@@ -123,6 +156,17 @@ int sgxd_recipe_init_scene(SgxdRecipe *r, uint32_t width, uint32_t height, uint3
                            uint32_t pages, const float *verts, unsigned nverts,
                            const uint16_t *indices, unsigned nindices,
                            const SgxdRecipeDraw *draws, unsigned ndraws);
+
+// Draws that bring their own programs (SgxdRecipeDraw.programs), each draw's VDM words
+// with a vertex secondary as in ImGui mode. The layout's VERTS stays unused; its INDICES holds
+// the caller's nindices indices (an identity list for non-indexed draws). draws sizes the layout
+// as sgxd_recipe_init_scene's, and each frame sets its own with sgxd_recipe_set_draws.
+int sgxd_recipe_init_programs(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
+                              uint32_t pages, const uint16_t *indices, unsigned nindices,
+                              const SgxdRecipeDraw *draws, unsigned ndraws);
+// The background object's depth, a pass's depth clear: ISP_BGOBJDEPTH, which the next 3D kick
+// writes and every pixel's depth starts from, and its three vertices' z. 1.0 as written.
+void sgxd_recipe_set_background_depth(SgxdRecipe *r, void *memory, float z);
 
 // ImGui's vertex path. nverts ImDrawVert records (SGXD_RECIPE_IMGUI_WORDS words each)
 // fetched at stride 20 into pa0..pa4; the vertex program maps x, y through the scale and offset in
@@ -186,12 +230,18 @@ void sgxd_recipe_draw_texture(const SgxdRecipe *r, void *memory, uint32_t offset
 // libgxm aligns a linear texture's rows to 8 texels, so keep width a multiple of 8.
 void sgxd_recipe_texture_words(uint32_t va, uint32_t width, uint32_t height, int bilinear,
                                uint32_t words[4]);
+// The same linear texture in another format: code TEXFEXT (word 0 bit 31) above the base format
+// (word 1 28..24), so 0x0c is U8U8U8U8 and 0x98 U8U8U8, and swizzle (word 3 30..28). Rows are width
+// texels of the format apart.
+void sgxd_recipe_texture_words_format(uint32_t va, uint32_t width, uint32_t height, int bilinear,
+                                      unsigned code, unsigned swizzle, uint32_t words[4]);
 static inline uint32_t sgxd_recipe_sa_colour_offset(uint32_t offset, unsigned draw) {
     return offset + 0x40 * (draw + 1) + 0x30;
 }
 
-// What a render changes, set back: the page table's free list, the region headers, EXTZ, the
-// tail pointer caches and, unless the target is external, FB and DEPTH (to the sentinel).
+// What a render changes, set back: the page table's free list and, unless the target is
+// external, FB and DEPTH (to the sentinel). The region headers are the TE's to write at each TA,
+// and the tail pointer caches and EXTZ stay as sgxd_recipe_write zeroed them.
 void sgxd_recipe_restage(const SgxdRecipe *r, void *memory);
 
 void sgxd_recipe_write_scene(const SgxdRecipe *r, void *memory);
@@ -213,6 +263,14 @@ void sgxd_recipe_set_clip(const SgxdRecipe *r, void *memory, unsigned draw, uint
 // with stride_px pixels a row. Rewrites the end-of-tile program's PBE words in memory, so the
 // 3D kick's USE code-cache invalidate must follow (sgxd_recipe_3d_kick has it).
 void sgxd_recipe_set_target(SgxdRecipe *r, void *memory, uint32_t fb_va, uint32_t stride_px);
+// The target's pack mode, PBE word 0 (the end-of-tile program's first LIMM), as
+// sgxd_recipe_set_target rewrites the others: A8B8G8R8 as written, or three bytes a pixel. gxm's
+// colour formats are these words: U888 is U8U8U8_BGR, R first (the hardware's store), and U888_RGB,
+// SWIZ 1 (bit 20), is U8U8U8_RGB, B first. The stride stays in pixels.
+#define SGXD_RECIPE_PACK_U8888 0x00010000u
+#define SGXD_RECIPE_PACK_U888 0x10010000u
+#define SGXD_RECIPE_PACK_U888_RGB 0x10110000u
+void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory, uint32_t pbe0);
 
 typedef struct SgxdOpList {
     SgxdOp *ops;

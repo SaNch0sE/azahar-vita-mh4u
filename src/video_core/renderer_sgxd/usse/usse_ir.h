@@ -119,6 +119,10 @@ struct LowerResult {
 class Builder {
 public:
     bool skip_invalid = true;
+    /// skipinv as psp2cgc places it: on every instruction but those whose results reach the
+    /// coordinates of a read with the hardware's own level (its LOD comes from the 2x2 quad's
+    /// neighbours, invalid instances included). Takes the place of `skip_invalid`; no branches.
+    bool skip_invalid_auto = false;
     int nosched_override = 0;
     bool secondary = false;
 
@@ -162,6 +166,9 @@ public:
               Pred pred = Pred::None);
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
                   bool nosched = false);
+    /// Sample2D from a texture of one level, point sampled both ways (b[1]): the result does not
+    /// depend on the level, so its coordinates need no neighbouring instance (skip_invalid_auto).
+    void Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc);
     void Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words, uint8_t count,
                uint8_t drc);
     void Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred = Pred::None);

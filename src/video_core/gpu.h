@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <boost/serialization/access.hpp>
@@ -24,6 +25,7 @@ class DebugContext;
 class PicaCore;
 struct RegsLcd;
 union ColorFill;
+struct DisplayTransferConfig;
 } // namespace Pica
 
 namespace Frontend {
@@ -99,6 +101,42 @@ public:
     /// Releases the renderer (for GL context destroy in libretro)
     void ReleaseRenderer();
 
+    /// Runs fn on the render thread, after every operation queued before it, and waits for it.
+    /// For the frontend's own presents while a title is loaded (the pause menu).
+    void RunOnRenderThread(const std::function<void()>& fn);
+
+    /// Since the last call (diagnostics: `perflog`): the GPU operations' time by kind, the part
+    /// of it spent waiting for the GPU, and the presents' time; presents dropped in any build.
+    struct OpStats {
+        u64 kind_us[static_cast<std::size_t>(OpKind::Count)];
+        u32 kind_ops[static_cast<std::size_t>(OpKind::Count)];
+        u64 kind_wait_us[static_cast<std::size_t>(OpKind::Count)];
+        u64 present_us;
+        u32 presents;
+        u32 presents_dropped;
+        /// Empty-queue waits a spin ended with an op, and those that slept.
+        u32 spin_hits;
+        u32 spin_misses;
+        /// The work ops' time by OpKind.
+        u64 kind_us[4];
+        u32 kind_ops[4];
+    };
+    OpStats TakeOpStats();
+    /// The guest goes idle (every core waiting: its clock jumps to the next event). Each command
+    /// list's scan since the last call is held against the emulation thread's time between the
+    /// scan's end and this idle: what a scan off the emulation thread could hide, if the guest
+    /// waited for nothing but the list's P3D here (diagnostics: `perflog`).
+    void GuestIdle();
+    struct ScanRoom {
+        u32 lists;               ///< scans an idle has followed
+        u64 scan_us;             ///< their time on the emulation thread
+        u64 hidden_us;           ///< of it, what the time before the idle covers
+        std::array<u32, 5> gaps; ///< scan end to idle: under 0.5, 2, 8, 16 ms, longer
+        u32 pending;             ///< scans no idle has followed yet
+    };
+    ScanRoom TakeScanRoom();
+#endif
+
 private:
     void SubmitCmdList(u32 index);
 
@@ -106,8 +144,18 @@ private:
     void MemoryFill(u32 index, u32 intr_index);
 
     void MemoryTransfer();
+    void RunMemoryTransfer(const Pica::DisplayTransferConfig& config, bool allow_display_transfer);
 
     void VBlankCallback(uintptr_t user_data, s64 cycles_late);
+
+    /// Queues op on the render thread.
+    /// What a render thread op is, for `perflog`'s split of the render thread's work.
+    enum class OpKind : u32 { CmdList, RegWrite, Fill, Transfer, Count };
+    void RunGpuOp(OpKind kind, std::function<void()> op);
+    /// Runs fn on the emulation thread: from the render thread through a core timing event,
+    /// in order, at the emulation thread's current time.
+    void PostToEmulation(std::function<void()> fn);
+    void PostedEventCallback(uintptr_t user_data, s64 cycles_late);
 
     friend class boost::serialization::access;
     template <class Archive>

@@ -170,11 +170,11 @@ static inline uint32_t rd_cpsr(void) {
 
 // ---------------------------------------------------------------------------- descriptors
 //
-// Short-descriptor format with SCTLR.AFE = 1 (sctlr 20c5587d on this console): AP[0] is the
-// Access Flag and must be set, the permission is AP[2:1]. Measured to behave exactly so by
-// vaprobe's STAGE_L2 on 2026-08-29. Memory attributes: TEX=001 C=1 B=1 (write-back,
-// write-allocate), S=1 so the other cores see what the guest writes. Domain 8 throughout — D0 is
-// No-access under this console's DACR and hung the console on 2026-08-26.
+// Short-descriptor format with SCTLR.AFE = 1: AP[0] is the Access Flag and must be set, the
+// permission is AP[2:1]. Memory attributes: TEX=001 C=1
+// B=1 (write-back, write-allocate), S=1 so the other cores see what the guest writes, unless a
+// range asks for the app's own (AZAHAR_PERM_APP_ATTR). Domain 8 throughout — D0 is No-access under
+// the console's DACR and hangs the console.
 
 #define AZAHAR_DOMAIN_FIELD (AZAHAR_DOMAIN << 5)
 
@@ -185,10 +185,34 @@ static inline uint32_t rd_cpsr(void) {
 // Coarse page table descriptor: L2 base (1 KB aligned), domain, type 01.
 #define AZAHAR_COARSE(l2_pa) (((l2_pa) & 0xFFFFFC00u) | AZAHAR_DOMAIN_FIELD | 1u)
 
-// Small page for a guest window: reachable from PL0 (AP[1] = 1), AF set, XN and APX per perm.
-static uint32_t azahar_small_page(uint32_t pa, uint32_t perm) {
-    uint32_t d = (pa & 0xFFFFF000u) | (1u << 10) /* S */ | (1u << 6) /* TEX */ | (1u << 3) |
-                 (1u << 2) | (1u << 4) /* AF */ | (1u << 5) /* PL0 */ | 2u;
+// A small page's memory attribute bits: S, TEX[2:0], C, B.
+#define AZAHAR_ATTR_MASK ((1u << 10) | (7u << 6) | (1u << 3) | (1u << 2))
+// The default: TEX=001 C=1 B=1 S=1.
+#define AZAHAR_ATTR_WB ((1u << 10) | (1u << 6) | (1u << 3) | (1u << 2))
+
+// A short-descriptor PAR's attributes as a small page's S, TEX, C and B. SCTLR.TRE is 0 on this
+// console, so TEX[2] = 1 selects Normal memory with the outer policy in TEX[1:0] and the inner in
+// C, B (00 non-cacheable, 01 WBWA, 10 WT, 11 WB). PAR has Inner in bits 6:4 (000 NC, 101 WBWA,
+// 110 WT, 111 WB), Outer in 3:2 (the same order as TEX[1:0]) and SH in bit 7. Strongly ordered and
+// device memory give 0: not for a guest window.
+static uint32_t azahar_attr_from_par(uint32_t par) {
+    uint32_t cb;
+    switch ((par >> 4) & 7u) {
+        case 0: cb = 0; break;
+        case 5: cb = 1; break;
+        case 6: cb = 2; break;
+        case 7: cb = 3; break;
+        default: return 0;
+    }
+    return (((par >> 7) & 1u) << 10) | ((4u | ((par >> 2) & 3u)) << 6) | ((cb >> 1) << 3) |
+           ((cb & 1u) << 2);
+}
+
+// Small page for a guest window: reachable from PL0 (AP[1] = 1), AF set, XN and APX per perm,
+// memory attributes attr (AZAHAR_ATTR_MASK bits).
+static uint32_t azahar_small_page(uint32_t pa, uint32_t perm, uint32_t attr) {
+    uint32_t d = (pa & 0xFFFFF000u) | (attr & AZAHAR_ATTR_MASK) | (1u << 4) /* AF */ |
+                 (1u << 5) /* PL0 */ | 2u;
     if (!(perm & AZAHAR_PERM_W)) {
         d |= (1u << 9); // APX: read-only
     }
@@ -841,10 +865,12 @@ static uint32_t dacr_grant_all(uint32_t d) {
     return g;
 }
 
-static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_out) {
+// want_par: translate with ATS1CUR even when VAtoPA would do, for the page's attributes in PAR.
+static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_out,
+                            int want_par) {
     uintptr_t p = 0;
     uint32_t par = 0;
-    if (ksceKernelVAtoPA((const void *)(uintptr_t)uva, &p) >= 0 && p) {
+    if (!want_par && ksceKernelVAtoPA((const void *)(uintptr_t)uva, &p) >= 0 && p) {
         *pa = (uint32_t)p & 0xFFFFF000u;
         *how = 0;
     } else {
@@ -1120,7 +1146,7 @@ static int l2_for(uint32_t idx, int create) {
 // descriptor written, the megabyte's L2 created on first use. Used at map and for MAP edits.
 static int map_range(const AzaharRange *rg, unsigned label) {
     unsigned pages = 0;
-    uint32_t first_pa = 0;
+    uint32_t first_pa = 0, first_par = 0, first_attr = 0;
     int first_how = -1;
     for (uint32_t off = 0; off < rg->size; off += 0x1000) {
         const uint32_t gva = rg->guest_va + off;
@@ -1132,16 +1158,25 @@ static int map_range(const AzaharRange *rg, unsigned label) {
         }
         uint32_t pa = 0, par = 0;
         int how = -1;
-        if (azahar_user_page(uva, &pa, &how, &par) != 0) {
+        const int app_attr = (rg->perm & AZAHAR_PERM_APP_ATTR) != 0;
+        if (azahar_user_page(uva, &pa, &how, &par, app_attr) != 0) {
             emit("  range %u: user va %08x does not translate (par %08x, VAtoPA refused)\n",
                  label, uva, par);
+            return AZAHAR_ERR_PAGE;
+        }
+        const uint32_t attr = app_attr ? azahar_attr_from_par(par) : AZAHAR_ATTR_WB;
+        if (!attr) {
+            emit("  range %u: user va %08x is not Normal memory (par %08x)\n", label, uva, par);
             return AZAHAR_ERR_PAGE;
         }
         if (off == 0) {
             first_pa = pa;
             first_how = how;
+            first_par = par;
+            first_attr = attr;
         }
-        azahar_l2[(unsigned)t * 256u + ((gva >> 12) & 0xFFu)] = azahar_small_page(pa, rg->perm);
+        azahar_l2[(unsigned)t * 256u + ((gva >> 12) & 0xFFu)] =
+            azahar_small_page(pa, rg->perm, attr);
         pages++;
     }
     emit("  range %u: user %08x -> guest %08x, %u page(s) over %u MB, perm %c%c%c, first pa "
@@ -1151,6 +1186,14 @@ static int map_range(const AzaharRange *rg, unsigned label) {
          (rg->perm & AZAHAR_PERM_R) ? 'r' : '-', (rg->perm & AZAHAR_PERM_W) ? 'w' : '-',
          (rg->perm & AZAHAR_PERM_X) ? 'x' : '-', first_pa,
          first_how == 0 ? "VAtoPA" : "ATS1CUR under a domain grant");
+    if (rg->perm & AZAHAR_PERM_APP_ATTR) {
+        // Always printed: these ranges are few (guest VRAM), and which attributes the kernel
+        // gave the app's block is the point of the flag.
+        ksceKernelPrintf("[azaharnative] guest %08x+%08x: the app's attributes, first page par "
+                         "%08x -> S %u TEX %u C %u B %u\n",
+                         rg->guest_va, rg->size, first_par, (first_attr >> 10) & 1u,
+                         (first_attr >> 6) & 7u, (first_attr >> 3) & 1u, (first_attr >> 2) & 1u);
+    }
     return 0;
 }
 
@@ -1535,7 +1578,7 @@ int azaharMap(const AzaharMapRequest *user_req) {
     azahar_run_count = 0;
     for (unsigned r = 0; r < azahar_req.count; r++) {
         const AzaharRange *rg = &azahar_req.ranges[r];
-        if (!check_range(rg, 1) || !(rg->perm & AZAHAR_PERM_R) || (rg->perm & ~7u)) {
+        if (!check_range(rg, 1) || !(rg->perm & AZAHAR_PERM_R) || (rg->perm & ~0xFu)) {
             emit("  range %u rejected: user %08x guest %08x size %08x perm %u\n", r, rg->user_va,
                  rg->guest_va, rg->size, rg->perm);
             ret = AZAHAR_ERR_ARG;
@@ -1752,7 +1795,7 @@ int azaharEdit(const AzaharEditRequest *user_req) {
         goto out;
     }
     if (!check_range(rg, op == AZAHAR_EDIT_MAP) ||
-        (op != AZAHAR_EDIT_UNMAP && (!(rg->perm & AZAHAR_PERM_R) || (rg->perm & ~7u)))) {
+        (op != AZAHAR_EDIT_UNMAP && (!(rg->perm & AZAHAR_PERM_R) || (rg->perm & ~0xFu)))) {
         ret = AZAHAR_ERR_ARG;
         goto out;
     }
@@ -1775,7 +1818,10 @@ int azaharEdit(const AzaharEditRequest *user_req) {
                     missing++;
                     continue;
                 }
-                *d = (op == AZAHAR_EDIT_UNMAP) ? 0u : azahar_small_page(*d & 0xFFFFF000u, rg->perm);
+                // A reprotect keeps the page's memory attributes (AZAHAR_PERM_APP_ATTR ranges).
+                *d = (op == AZAHAR_EDIT_UNMAP)
+                         ? 0u
+                         : azahar_small_page(*d & 0xFFFFF000u, rg->perm, *d & AZAHAR_ATTR_MASK);
                 if (lo == NULL || d < lo) {
                     lo = d;
                 }

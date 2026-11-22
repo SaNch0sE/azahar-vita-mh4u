@@ -791,6 +791,16 @@ static void sgxd_fault_snapshot(uint32_t index, const SgxdOp *op, uint32_t wante
              sgxd_read(SGX_MASTER_BIF_INT_STAT), sgxd_read(SGX_MASTER_BIF_FAULT));
 }
 
+// Whether an async list runs, read under its lock: the ISR counts the list's last SIGNAL before
+// it clears sgxd_chain_busy, so an app that saw the count can arrive in between; the lock waits
+// the ISR's run out.
+static int sgxd_chain_busy_locked(void) {
+    const SceKernelIntrStatus st = ksceKernelSpinlockLowLockCpuSuspendIntr(&sgxd_chain_lock);
+    const int busy = sgxd_chain_busy;
+    ksceKernelSpinlockLowUnlockCpuResumeIntr(&sgxd_chain_lock, st);
+    return busy;
+}
+
 // Returns the number of ops done, or a negative error. A bad op, or a poll that timed out, stops
 // the list there: the return is its index, and a poll's value is the register's last read.
 int sgxdSubmit(SgxdOp *user_ops, uint32_t count) {

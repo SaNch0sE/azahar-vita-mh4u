@@ -34,6 +34,10 @@ public:
     enum class Placement {
         Heap,
         PhysicallyContiguous,
+        /// The GPU's own memory, CDRAM on the Vita, which the CPU reads and writes uncached: guest
+        /// VRAM, so that what the GPU writes there needs no CPU cache maintenance. Falls back to
+        /// uncached main memory, then to the heap.
+        GpuLocal,
     };
 
     explicit HostSharedMemory(std::size_t size, const char* name,

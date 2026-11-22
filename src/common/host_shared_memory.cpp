@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include "common/assert.h"
 #include "common/host_shared_memory.h"
 #include "common/logging/log.h"
 #ifdef __vita__
@@ -118,23 +119,43 @@ HostSharedMemory::HostSharedMemory(std::size_t size_, [[maybe_unused]] const cha
     // taken by anything a megabyte or over, which meant guest FCRAM asked for 128 MB of a
     // ~26 MB pool at every boot and the kernel printed its refusal three times before the
     // fallback; the pool is for the RomFS cache, which is sized to it.
-    if (placement == Placement::PhysicallyContiguous) {
-        const std::size_t mb_rounded = (rounded + 0xFFFFFu) & ~static_cast<std::size_t>(0xFFFFFu);
-        const SceUID uid = sceKernelAllocMemBlock(
-            name ? name : "azahar-shared", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW,
-            static_cast<SceSize>(mb_rounded), nullptr);
+    // A kernel block of the given type, its size rounded to the type's unit. False, with
+    // nothing held, when the kernel refuses it.
+    const auto take_block = [&](SceKernelMemBlockType type, std::size_t unit,
+                                const char* type_name) {
+        const std::size_t block_size = (rounded + unit - 1) & ~(unit - 1);
+        const SceUID uid = sceKernelAllocMemBlock(name ? name : "azahar-shared", type,
+                                                  static_cast<SceSize>(block_size), nullptr);
         void* addr = nullptr;
         if (uid >= 0 && sceKernelGetMemBlockBase(uid, &addr) >= 0 && addr != nullptr) {
             memblock = uid;
             base = static_cast<u8*>(addr);
             std::memset(base, 0, rounded);
-            LOG_INFO(Common, "memblock {}: {} KiB PHYCONT_RW -> {:#x} (the guest's memory)",
-                     name ? name : "?", mb_rounded >> 10, static_cast<u32>(uid));
-            return;
+            LOG_INFO(Common, "memblock {}: {} KiB {} -> {:#x} at {} (the guest's memory)",
+                     name ? name : "?", block_size >> 10, type_name, static_cast<u32>(uid),
+                     fmt::ptr(base));
+            return true;
         }
         if (uid >= 0) {
             sceKernelFreeMemBlock(uid);
         }
+        LOG_WARNING(Common, "memblock {}: {} KiB {} refused ({:#010x})", name ? name : "?",
+                    block_size >> 10, type_name, static_cast<u32>(uid));
+        return false;
+    };
+    // A placement asked for is taken or the emulator stops: no heap stand-in.
+    if (placement == Placement::PhysicallyContiguous) {
+        const bool taken =
+            take_block(SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, 0x100000u, "PHYCONT_RW");
+        ASSERT_MSG(taken, "memblock {}: no {} KiB of PHYCONT", name ? name : "?", size >> 10);
+        return;
+    }
+    // CDRAM, in 256 KiB units, and nothing else: without it, it stops.
+    if (placement == Placement::GpuLocal) {
+        const bool taken =
+            take_block(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, 0x40000u, "USER_CDRAM_RW");
+        ASSERT_MSG(taken, "memblock {}: no {} KiB of CDRAM", name ? name : "?", size >> 10);
+        return;
     }
     raw = std::malloc(rounded + 0x1000);
     if (raw != nullptr) {

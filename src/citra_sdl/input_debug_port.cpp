@@ -332,26 +332,6 @@ std::string InputDebugPort::Execute(const std::string& line, EmuWindow_SDL2& win
         return "ok";
     }
 
-    if (command == "dumpsurfaces") {
-        std::string dir;
-        stream >> dir;
-        if (dir.empty()) {
-            return "error: dumpsurfaces needs a directory";
-        }
-        if (VideoCore::surface_dump_hook == nullptr) {
-            return "error: no rasterizer registered a dump";
-        }
-        // On the render thread: the dump reads back through the runtime.
-        auto& core = Core::System::GetInstance();
-        if (!core.IsPoweredOn()) {
-            return "error: no title running";
-        }
-        core.GPU().RunOnRenderThread([dir] {
-            VideoCore::surface_dump_hook(VideoCore::surface_dump_user, dir.c_str());
-        });
-        return "ok";
-    }
-
     if (command == "dumpframes") {
         std::string prefix;
         int count = 0;
@@ -379,10 +359,7 @@ std::string InputDebugPort::Execute(const std::string& line, EmuWindow_SDL2& win
     }
 
     if (command == "syncsave" || command == "syncload") {
-        // Savestates are refused while the GPU render thread runs; this variant stops the
-        // thread (draining its queue), queues the save or load, pumps the emulation until the
-        // signal executes, and restarts the thread. Lets fast frameskip-mode runs capture and
-        // restore states without a synchronous boot.
+        // Queues the save or load and pumps the emulation until the signal executes.
         int slot = 0;
         if (!(stream >> slot) || slot < 0) {
             slot = 0;
@@ -390,15 +367,6 @@ std::string InputDebugPort::Execute(const std::string& line, EmuWindow_SDL2& win
         auto& system = Core::System::GetInstance();
         if (!system.IsPoweredOn()) {
             return "error: nothing is running";
-        }
-        const bool was_running = system.GPU().RenderThreadRunning();
-        if (was_running) {
-            system.GPU().StopRenderThread();
-            // The render thread released the GL context when it stopped. Serializing flushes
-            // every cached surface back to guest RAM; without a current context those GL
-            // downloads return uninitialized memory, which lands in guest RAM and corrupts
-            // both the running game and the state being written. No-op under software.
-            window.MakeCurrent();
         }
         const auto signal =
             command == "syncsave" ? Core::System::Signal::Save : Core::System::Signal::Load;
@@ -411,10 +379,6 @@ std::string InputDebugPort::Execute(const std::string& line, EmuWindow_SDL2& win
                     break;
                 }
             }
-        }
-        if (was_running) {
-            window.DoneCurrent();
-            system.GPU().StartRenderThread();
         }
         return result + " " + command + " slot " + std::to_string(slot);
     }

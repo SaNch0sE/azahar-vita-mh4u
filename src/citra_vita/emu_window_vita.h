@@ -39,8 +39,15 @@ public:
 
     void SwapBuffers() override;
 
-    /// Draws whatever the UI wants and presents. `ui` may be null, in which case the frame
-    /// is left empty.
+    /// The renderer's present at each VBlank: keeps the guest's screens
+    /// and presents them under the interface.
+    void PresentGuestScreens(const GuestScreen (&screens)[2]) override;
+    /// The renderer is going, and guest memory with it: presents show no guest screens again
+    /// until the next PresentGuestScreens.
+    void ForgetGuestScreens() override;
+
+    /// Draws the guest's screens, if the renderer has sent any, and whatever the UI wants, and
+    /// presents. `ui` may be null, in which case only the screens are drawn.
     void Present(Ui* ui);
 
     /// Hands the interface to SwapBuffers, which builds and draws it from then on. Null
@@ -79,6 +86,7 @@ public:
 
 private:
     void UpdateTouch();
+    void DrawGuestScreens();
 
     Core::System& system;
 
@@ -90,6 +98,13 @@ private:
     std::atomic<bool> input_to_guest{true};
     std::atomic<bool> quit_requested{};
     bool touch_down{};
+
+    GuestScreen screens[2]{};
+    bool have_screens{};
+    u32 screens_skipped{};
+    /// Each screen's framebuffers as last logged (the last two addresses, format, stride,
+    /// fill): DrawGuestScreens logs a screen's when it changes, a double buffer's flips aside.
+    std::array<std::array<u32, 5>, 2> screens_seen{};
 };
 
 } // namespace VitaFrontend

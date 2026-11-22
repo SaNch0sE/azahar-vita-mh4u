@@ -30,8 +30,6 @@ add_executable(citra_vita
     input_factory_vita.h
     sgxd_present.cpp
     sgxd_present.h
-    ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_recipe.c
-    ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c
     vita_ui.cpp
     vita_ui.h
     "${GXM_SHADER_HEADER}"

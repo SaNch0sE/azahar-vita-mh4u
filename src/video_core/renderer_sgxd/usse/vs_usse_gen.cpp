@@ -36,7 +36,7 @@
  *
  * Uniforms. The 128 float4 uniforms cannot be register-resident (512 of 128 SAs), so
  * they sit in memory behind the resident part of the default uniform buffer: the ones a
- * program reads with a constant index are prefetched into SAs by the secondary program
+ * program reads with a constant index ride in the SA image the secondary PDS program DMAs
  * (per draw), the others are loaded at their use with lda32 through the buffer pointer
  * libgxm plants in the data container: base + address register, wrapped to 128 entries
  * and scaled to bytes with the compiler's integer sequence.
@@ -89,7 +89,7 @@ constexpr uint32_t SaResidentHead = 4;
 
 // The data container (19): the buffer pointer, then the literals. The ones a compare reads
 // as a scalar sit at even offsets (a test reads the .x of a pair); the odd slots between
-// them are the secondary program's scratch for computed load offsets.
+// them are unused.
 enum DataSlot : uint32_t {
     DataPtr = 0,
     DataPad1 = 1,    ///< zero (the compiler keeps integer operands on even SAs too)
@@ -108,7 +108,6 @@ enum DataSlot : uint32_t {
     DataSize = 14,
 };
 constexpr uint32_t DataLiteralCount = DataSize - 1;
-constexpr uint32_t ScratchSlots[4] = {DataScratch0, DataScratch1, DataScratch2, DataScratch3};
 
 // Output registers of the fragment interface, as the compiled programs with the same
 // interface lay them out: POSITION o0-o3, COLOR0 o4-o7, TEXCOORD0-2 two each from o8,
@@ -239,7 +238,7 @@ class VertexEmitter {
 public:
     VertexEmitter(const VsRequest& request_, int level_) : req{request_}, level{level_} {}
 
-    std::vector<uint8_t> Emit(uint32_t& input_regs);
+    std::optional<GxpProgram> Emit(uint32_t& input_regs);
     int level = 1;
 
 private:
@@ -309,6 +308,7 @@ private:
     // Control flow.
     int NewLabel();
     int LabelAt(uint32_t offset);
+    void OpenContext(uint32_t begin, uint32_t end);
     void Bind(int label);
     bool Bound(int label) const {
         return label_bound[static_cast<std::size_t>(label)];
@@ -363,6 +363,7 @@ private:
 
     // Where things landed.
     std::array<int, 16> input_pa{};   ///< input register -> PA base, or -1
+    std::array<int, 16> input_raw_pa{}; ///< a U8 input register -> its fetched word's PA, or -1
     std::array<int, 16> default_sa{}; ///< input register -> SA base, or -1
     std::array<std::optional<Quad>, 16> temp_quad{};
     std::array<std::optional<Quad>, 16> attr_quad{};
@@ -549,13 +550,27 @@ void VertexEmitter::Layout() {
             continue;
         }
         input_pa[i] = pa_inputs;
-        gxp.attributes.push_back({"vs_in_attr" + std::to_string(i), pa_inputs});
-        uint32_t comps = req.reg_components[i];
-        if (comps == 0 || comps > 4) {
-            comps = 4;
+        if ((req.u8_regs & (1u << i)) == 0) {
+            gxp.attributes.push_back({"vs_in_attr" + std::to_string(i), pa_inputs});
+            uint32_t comps = req.reg_components[i];
+            if (comps == 0 || comps > 4) {
+                comps = 4;
+            }
+            gxp.attrib_pa_regs |= ((1ull << comps) - 1) << pa_inputs;
         }
-        gxp.attrib_pa_regs |= ((1ull << comps) - 1) << pa_inputs;
         pa_inputs = static_cast<uint8_t>(pa_inputs + 4);
+    }
+    // A U8 attribute's word lands in a PA of its own after the quads, even as the unpack needs;
+    // the prologue unpacks it into the quad.
+    input_raw_pa.fill(-1);
+    for (uint32_t i = 0; i < 16; i++) {
+        if (input_pa[i] < 0 || (req.u8_regs & (1u << i)) == 0) {
+            continue;
+        }
+        input_raw_pa[i] = pa_inputs;
+        gxp.attributes.push_back({"vs_in_attr" + std::to_string(i), pa_inputs});
+        gxp.attrib_pa_regs |= 1ull << pa_inputs;
+        pa_inputs = static_cast<uint8_t>(pa_inputs + 2);
     }
 
     // Resident uniforms: the depth mapping, the input defaults, the integer uniforms.
@@ -622,48 +637,17 @@ void VertexEmitter::Layout() {
 }
 
 // ---------------------------------------------------------------------------------------
-// The secondary program: prefetch the constant-index uniforms into their SAs.
 
 void VertexEmitter::EmitSecondary() {
     sec.secondary = true;
     sec.skip_invalid = true;
     const bool any_hoist =
         std::any_of(hoist_at.begin(), hoist_at.end(), [](uint8_t h) { return h != 0; });
-    if (prefetch.empty() && !any_hoist) {
+    if (!any_hoist) {
         // Nothing to do: no words at all, as the compiler's programs without one.
         return;
     }
-    const Reg ptr = DataReg(DataPtr);
-    uint32_t outstanding = 0;
-    uint32_t scratch = 0;
-    const auto wait = [&] {
-        if (outstanding != 0) {
-            sec.WdfVertex(0);
-            outstanding = 0;
-            scratch = 0;
-        }
-    };
-    for (const uint8_t n : prefetch) {
-        const Reg dst = Reg::Sa(static_cast<uint8_t>(uniform_sa[n]));
-        if (n <= 31) {
-            // The immediate offset is in words, seven bits: uniform n at word 4n.
-            sec.Lda32(dst, ptr, nullptr, static_cast<uint8_t>(n * 4), 4, 0);
-        } else {
-            // Past the immediate's reach: the offset in a scratch SA, one per outstanding
-            // load so a load never has its offset overwritten under it.
-            if (scratch == 4) {
-                wait();
-            }
-            const Reg off = DataReg(static_cast<DataSlot>(ScratchSlots[scratch++]));
-            sec.Bitwise(BwOp::Or, off, IOp::Imm(n), IOp::Imm(0));
-            sec.MadI32(off, off, 16, DataReg(Data0x10000));
-            sec.Lda32(dst, ptr, &off, 0, 4, 0);
-        }
-        if (++outstanding == 8) {
-            wait();
-        }
-    }
-    wait();
+    sec.Phas(true);
     // The hoisted instructions follow, appended as the primary walk reaches them; the
     // program is ended once that walk is done (Emit).
 }
@@ -833,6 +817,42 @@ int VertexEmitter::LabelAt(uint32_t offset) {
         it = ctx.labels.emplace(offset, NewLabel()).first;
     }
     return it->second;
+}
+
+/// Enters main or a subroutine. A backward jump's target gets its label now: EmitRange binds
+/// labels as it walks past their offsets, and the jump comes after the target. Only the jumps
+/// the context's own walk reaches count (main's range runs over the subroutines after its END).
+void VertexEmitter::OpenContext(uint32_t begin, uint32_t end) {
+    contexts.push_back({begin, end, {}});
+    std::vector<bool> seen(end - begin, false);
+    std::vector<uint32_t> work{begin};
+    while (!work.empty()) {
+        const uint32_t offset = work.back();
+        work.pop_back();
+        if (offset < begin || offset >= end || seen[offset - begin]) {
+            continue;
+        }
+        seen[offset - begin] = true;
+        const Instruction instr = {req.code[offset]};
+        const auto& flow = instr.flow_control;
+        const auto op = instr.opcode.Value();
+        if (op == OpCode::Id::END) {
+            continue;
+        }
+        bool taken = op == OpCode::Id::JMPC;
+        if (op == OpCode::Id::JMPU) {
+            const auto known = KnownBool(flow.bool_uniform_id);
+            taken = known && *known != ((flow.num_instructions & 1) != 0);
+        }
+        if (taken || op == OpCode::Id::IFC || op == OpCode::Id::IFU) {
+            if (taken && flow.dest_offset <= offset && flow.dest_offset >= begin) {
+                LabelAt(flow.dest_offset);
+            }
+            work.push_back(flow.dest_offset);
+        }
+        // Calls return here; the subroutine opens its own context.
+        work.push_back(offset + 1);
+    }
 }
 
 void VertexEmitter::Bind(int label) {
@@ -1349,7 +1369,7 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         }
         const uint32_t begin = flow.dest_offset;
         const uint32_t end = begin + flow.num_instructions;
-        contexts.push_back({begin, end, {}});
+        OpenContext(begin, end);
         region_depth += skip >= 0;
         EmitRange(begin, end);
         region_depth -= skip >= 0;
@@ -1870,6 +1890,13 @@ void VertexEmitter::Prologue() {
             comps = 4;
         }
         const Quad q{Bank::PrimAttr, static_cast<uint8_t>(input_pa[i])};
+        if (input_raw_pa[i] >= 0) {
+            const Reg raw = Reg::Pa(static_cast<uint8_t>(input_raw_pa[i]));
+            for (uint32_t c = 0; c < comps; c++) {
+                e.UnpackU8(Reg::Pa(static_cast<uint8_t>(input_pa[i] + c)), raw,
+                           static_cast<uint8_t>(c));
+            }
+        }
         switch (comps) {
         case 1:
             e.MoveInternal({q.Pair(0), 0x2}, ConstZero);
@@ -2014,7 +2041,7 @@ void VertexEmitter::Epilogue() {
 
 // ---------------------------------------------------------------------------------------
 
-std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
+std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
     if (req.code.size() < req.code_size || req.main_offset >= req.code_size) {
         Refuse("program extent");
     }
@@ -2025,12 +2052,11 @@ std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
     EmitSecondary();
 
     e.skip_invalid = true;
-    e.nosched_override = 0;
     end_label = NewLabel();
     e.Phas(true);
     e.Nop();
     Prologue();
-    contexts.push_back({req.main_offset, req.code_size, {}});
+    OpenContext(req.main_offset, req.code_size);
     EmitRange(req.main_offset, req.code_size);
     for (const auto& [at, label] : contexts.back().labels) {
         if (!Bound(label)) {
@@ -2043,6 +2069,9 @@ std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
     // allocates: Layout's count left them undeclared, which Vita3K did not mind and the
     // console answered with black screens (2026-09-08).
     gxp.secondary_reg_count = sa_top;
+    for (const uint8_t n : prefetch) {
+        gxp.prefetched_uniforms.emplace_back(static_cast<uint32_t>(uniform_sa[n]), n);
+    }
     if (sec.Count() != 0) {
         sec.EndSecondary();
         if (hoisted_count != 0 && std::getenv("USSE_IR_DUMP") != nullptr) {
@@ -2087,13 +2116,13 @@ std::vector<uint8_t> VertexEmitter::Emit(uint32_t& input_regs) {
     }
     gxp.primary = primary.Words();
     gxp.secondary = secondary.Words();
-    return WriteGxp(gxp);
+    return gxp;
 }
 
 } // Anonymous namespace
 
-std::vector<uint8_t> EmitVertexProgram(const VsRequest& request, uint32_t& input_regs,
-                                       std::string* refusal, int level) {
+std::optional<GxpProgram> EmitVertexGxp(const VsRequest& request, uint32_t& input_regs,
+                                        std::string* refusal, int level) {
     try {
         VertexEmitter emitter{request, level};
         return emitter.Emit(input_regs);
@@ -2101,8 +2130,14 @@ std::vector<uint8_t> EmitVertexProgram(const VsRequest& request, uint32_t& input
         if (refusal) {
             *refusal = ex.what();
         }
-        return {};
+        return std::nullopt;
     }
+}
+
+std::vector<uint8_t> EmitVertexProgram(const VsRequest& request, uint32_t& input_regs,
+                                       std::string* refusal, int level) {
+    const std::optional<GxpProgram> program = EmitVertexGxp(request, input_regs, refusal, level);
+    return program ? WriteGxp(*program) : std::vector<uint8_t>{};
 }
 
 } // namespace GxmRenderer::Usse

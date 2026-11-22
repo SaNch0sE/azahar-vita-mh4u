@@ -4,7 +4,6 @@
 
 #include <mutex>
 #include "citra_sdl/emu_window_sdl2.h"
-#include "common/pipeline_stats.h"
 
 #include <algorithm>
 #include <atomic>
@@ -476,14 +475,7 @@ void EmuWindow_SDL2::SwapBuffers() {
                 dump_remaining--;
             }
         }
-        const auto swap_start = std::chrono::steady_clock::now();
         SDL_GL_SwapWindow(window);
-        Common::PipelineStats::present_us.fetch_add(
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
-                                                                  swap_start)
-                .count(),
-            std::memory_order_relaxed);
-        Common::PipelineStats::presents.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 #endif
@@ -524,7 +516,6 @@ void EmuWindow_SDL2::SwapBuffers() {
             }
         }
         {
-            const auto present_start = std::chrono::steady_clock::now();
             SDL_UpdateTexture(sw_texture, nullptr, present_canvas.data(), 400 * 4);
             SDL_RenderClear(sw_renderer);
             SDL_RenderCopy(sw_renderer, sw_texture, nullptr, nullptr);
@@ -556,12 +547,6 @@ void EmuWindow_SDL2::SwapBuffers() {
                 dump_remaining--;
             }
             SDL_RenderPresent(sw_renderer);
-            Common::PipelineStats::present_us.fetch_add(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - present_start)
-                    .count(),
-                std::memory_order_relaxed);
-            Common::PipelineStats::presents.fetch_add(1, std::memory_order_relaxed);
         }
     }
 #endif

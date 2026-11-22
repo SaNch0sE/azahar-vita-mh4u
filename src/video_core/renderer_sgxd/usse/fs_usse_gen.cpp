@@ -167,7 +167,7 @@ class FragmentEmitter {
 public:
     FragmentEmitter(const FSConfig& config_, int level_) : config{config_}, level{level_} {}
 
-    std::vector<uint8_t> Emit(std::string* refusal);
+    std::optional<GxpProgram> Emit(std::string* refusal);
     int level = 1;
 
 private:
@@ -410,6 +410,10 @@ void FragmentEmitter::PlanInputs() {
             }
         }
     }
+    // Lighting reaches the picture only through the fragment colours: a program whose stages read
+    // neither has nothing to light (lighting is on after reset, so a title that never touches it
+    // has it on).
+    uses_lighting = uses_lighting && (uses_primary_color || uses_secondary_color);
     if (uses_lighting && lighting.bump_mode != LightingRegs::LightingBumpMode::None) {
         const u32 unit = lighting.bump_selector;
         if (unit < 3 && (unit != 0 || tex.texture0_type != TextureType::Disabled)) {
@@ -2077,7 +2081,7 @@ void FragmentEmitter::AlphaTest() {
     NewPhaseAfterKill();
 }
 
-std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
+std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
     if (const char* why = Unsupported()) {
         if (refusal) {
             *refusal = why;
@@ -2146,9 +2150,11 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     // while the hardware wants the instruction before it: the bit guards the boundary
     // after the next instruction). Setting the bit everywhere cured the noise and cost
     // the GPU its instance switching; FinishNosched now places it as the compiler does.
-    // skipinv made no difference on the console and stays clear, as the ubershader has it.
-    e.nosched_override = 0;
-    e.skip_invalid = false;
+    // skipinv as psp2cgc places it (Ir::Builder::skip_invalid_auto): without it the pipes run a
+    // task's invalid instances too. The LUT and noise reads are point sampled from one level
+    // (Sample2DPoint), so only the texture units' coordinates keep it clear.
+    e.skip_invalid_auto = true;
+    e.skip_invalid = true;
 
     // A kill ends its phase: psp2cgc follows every kill with its nop and then a new phase
     // marker (all 148 of SM3DL's programs, whose scissor kill comes first: phase one is the
@@ -2198,22 +2204,31 @@ std::vector<uint8_t> FragmentEmitter::Emit(std::string* refusal) {
     gxp.pa_count = std::max<uint32_t>(gxp.pa_count, lowered.pa_count);
     gxp.phase_starts = lowered.phase_starts;
     gxp.primary = encoder.Words();
-    return WriteGxp(gxp);
+    return gxp;
 }
 
 } // Anonymous namespace
 
-std::vector<uint8_t> EmitFragmentProgram(const FSConfig& config, std::string* refusal, int level) {
+std::optional<GxpProgram> EmitFragmentGxp(const FSConfig& config, std::string* refusal,
+                                          int level) {
+    FragmentEmitter emitter{config, level};
+    std::optional<FragmentEmitter> exact;
     try {
         FragmentEmitter emitter{config, level};
         return emitter.Emit(refusal);
     } catch (const std::exception& ex) {
-        // An operand form the encoder cannot express: the compiler takes the program.
+        // An operand form the encoder cannot express; with the emission it stopped in and its
+        // SA words so far (an SA past 127 does not fit an operand).
         if (refusal) {
             *refusal = ex.what();
         }
-        return {};
+        return std::nullopt;
     }
+}
+
+std::vector<uint8_t> EmitFragmentProgram(const FSConfig& config, std::string* refusal, int level) {
+    const std::optional<GxpProgram> program = EmitFragmentGxp(config, refusal, level);
+    return program ? WriteGxp(*program) : std::vector<uint8_t>{};
 }
 
 } // namespace GxmRenderer::Usse

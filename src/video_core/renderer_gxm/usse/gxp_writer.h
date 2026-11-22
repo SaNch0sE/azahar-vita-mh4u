@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace GxmRenderer::Usse {
@@ -126,8 +127,13 @@ struct GxpProgram {
     int32_t ldst_base_value = 0;
     /// The default uniform buffer's size in floats when it extends past the resident part.
     uint32_t buffer_floats = 0;
-    /// Secondary attributes the secondary program writes, past the containers.
+    /// Secondary attributes past the containers: the prefetched uniforms, then what the
+    /// secondary program writes.
     uint32_t secondary_reg_count = 0;
+    /// The uniforms read with a constant index, each as (SA register, PICA uniform row). The
+    /// SA image carries them past the containers, so the secondary PDS program's DMA puts
+    /// them in place before any vertex runs.
+    std::vector<std::pair<uint32_t, uint32_t>> prefetched_uniforms;
 };
 
 /// The data container's first SA holds the buffer pointer in a vertex program that has one;
@@ -135,6 +141,10 @@ struct GxpProgram {
 inline uint32_t DataHead(const GxpProgram& p) {
     return p.buffer_pointer ? 1u : 0u;
 }
+
+/// A fragment program's varying descriptor for input `index`: the container's word, and the
+/// word 1 of the pixel PDS's DOUTI for that iterator (sgxd builds its PDS with it).
+[[nodiscard]] uint32_t VaryingDescriptor(const GxpProgram& program, size_t index);
 
 [[nodiscard]] std::vector<uint8_t> WriteGxp(const GxpProgram& program);
 

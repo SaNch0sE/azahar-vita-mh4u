@@ -168,6 +168,33 @@ public:
     /// Polls window events
     virtual void PollEvents() = 0;
 
+    /// One guest screen as the LCD scans it out: the framebuffer at physical address `address`
+    /// (0 before the guest names one), 240-pixel columns `stride` bytes apart, `columns` of them
+    /// (400 on the top screen, 320 on the bottom), in the PICA's pixel format `format`, and
+    /// `pixels`, the same bytes through the emulator's mapping; or, with `fill`, the LCD's solid
+    /// colour instead.
+    struct GuestScreen {
+        u32 address;
+        u32 stride;
+        u32 columns;
+        u32 format;
+        const u8* pixels;
+        bool fill;
+        u8 fill_r, fill_g, fill_b;
+    };
+
+    /**
+     * A renderer that shows guest memory presents here at each VBlank, with both guest screens
+     * (top, bottom) as the VBlank found them; the frontend draws them from guest memory. The
+     * default ignores them and swaps.
+     */
+    virtual void PresentGuestScreens([[maybe_unused]] const GuestScreen (&screens)[2]) {
+        SwapBuffers();
+    }
+
+    /// The memory the last guest screens named is about to go: stop drawing them.
+    virtual void ForgetGuestScreens() {}
+
     /**
      * Returns a GraphicsContext that the frontend provides that is shared with the emu window. This
      * context can be used from other threads for background graphics computation. If the frontend

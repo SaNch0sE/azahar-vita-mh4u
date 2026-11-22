@@ -176,7 +176,10 @@ public:
     // uses. Falls back to a plain allocation where the host cannot alias, which every other
     // backend is indifferent to.
     Common::HostSharedMemory fcram{Memory::FCRAM_SIZE, "azahar-fcram"};
-    Common::HostSharedMemory vram{Memory::VRAM_SIZE, "azahar-vram"};
+    // VRAM in the GPU's own memory where there is such a thing (the Vita's CDRAM): the GPU
+    // renders into it, and the CPU sees what it wrote with no cache maintenance.
+    Common::HostSharedMemory vram{Memory::VRAM_SIZE, "azahar-vram",
+                                  Common::HostSharedMemory::Placement::GpuLocal};
     // Only a New 3DS has this, and only an Old 3DS is emulated, so it is never allocated. The
     // block stays declared because the physical-address paths still name the region.
     Common::HostSharedMemory n3ds_extra_ram{0, "azahar-n3ds-ram"};

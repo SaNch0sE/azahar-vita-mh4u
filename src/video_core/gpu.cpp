@@ -20,6 +20,12 @@
 #include "video_core/renderer_software/sw_blitter.h"
 #include "video_core/right_eye_disabler.h"
 #include "video_core/video_core.h"
+#ifdef ENABLE_GXM
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#define GPU_TRACE(...) SgxdRenderer::SgxdTrace(__VA_ARGS__)
+#else
+#define GPU_TRACE(...) ((void)0)
+#endif
 
 namespace VideoCore {
 
@@ -152,11 +158,68 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
         [this](uintptr_t user_data, s64 cycles_late) { VBlankCallback(user_data, cycles_late); });
     impl->timing.ScheduleEvent(FRAME_TICKS, impl->vblank_event);
 
-    // Bind the rasterizer to the PICA GPU
-    impl->pica.BindRasterizer(impl->rasterizer);
+    impl->posted_event = impl->timing.RegisterEvent(
+        "GPU::PostedEvent",
+        [this](uintptr_t user_data, s64 cycles_late) { PostedEventCallback(user_data, cycles_late); });
+    // The PICA raises P3D from inside a command list, on the render thread: it goes back to the
+    // emulation thread like every other interrupt. Set before the thread starts, which owns the
+    // PICA from then on.
+    Service::GSP::InterruptHandler post_interrupt = [this](Service::GSP::InterruptId id,
+                                                           u64 delay) {
+        PostToEmulation([this, id, delay] { impl->signal_interrupt(id, delay); });
+    };
+    impl->pica.SetInterruptHandler(post_interrupt);
+    impl->render_thread = std::make_unique<GpuThread>(
+        [this] { impl->pica.BindRasterizer(impl->rasterizer); });
+    LOG_INFO(HW_GPU, "GPU operations run on the render thread");
 }
 
 GPU::~GPU() = default;
+
+void GPU::RunGpuOp(OpKind kind, std::function<void()> op) {
+    impl->render_thread->Push([this, kind, op = std::move(op)] {
+        const auto start = std::chrono::steady_clock::now();
+        GPU_TRACE("op", static_cast<unsigned>(kind));
+        op();
+        GPU_TRACE("done", static_cast<unsigned>(impl->rasterizer->GpuWaitUs() - waited));
+        const auto k = static_cast<std::size_t>(kind);
+        impl->kind_us[k].fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - start)
+                                       .count()),
+                                   std::memory_order_relaxed);
+        impl->kind_ops[k].fetch_add(1, std::memory_order_relaxed);
+        impl->ops_in_flight.fetch_sub(1, std::memory_order_release);
+    });
+}
+
+void GPU::PostToEmulation(std::function<void()> fn) {
+    {
+        std::scoped_lock lock{impl->posted_mutex};
+        impl->posted.push_back(std::move(fn));
+    }
+    // No delay of its own: the work is done now, and the interrupt's modelled delay travels
+    // inside fn to GSP.
+    impl->timing.ScheduleEvent(0, impl->posted_event, 0, 0, true);
+}
+
+void GPU::PostedEventCallback(uintptr_t, s64) {
+    std::function<void()> fn;
+    {
+        std::scoped_lock lock{impl->posted_mutex};
+        if (impl->posted.empty()) {
+            return;
+        }
+        fn = std::move(impl->posted.front());
+        impl->posted.pop_front();
+    }
+    GPU_TRACE("irq", static_cast<unsigned>(id));
+    impl->signal_interrupt(id, delay);
+    fn();
+}
+
+void GPU::RunOnRenderThread(const std::function<void()>& fn) {
+    impl->render_thread->RunSync(fn);
+}
 
 PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
     if (addr == 0) {
@@ -184,7 +247,6 @@ PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
 
 void GPU::SetInterruptHandler(Service::GSP::InterruptHandler handler) {
     impl->signal_interrupt = handler;
-    impl->pica.SetInterruptHandler(handler);
 }
 
 void GPU::FlushRegion(PAddr addr, u32 size) {
@@ -231,15 +293,19 @@ void GPU::Execute(const Service::GSP::Command& command) {
     }
     case CommandId::SubmitCmdList: {
         auto& params = command.submit_gpu_cmdlist;
-        auto& cmdbuffer = regs.internal.pipeline.command_buffer;
+        const PAddr address = VirtualToPhysicalAddress(params.address);
+        const u32 size = params.size;
+        RunGpuOp(OpKind::CmdList, [this, &regs, address, size] {
+            auto& cmdbuffer = regs.internal.pipeline.command_buffer;
 
-        // Write to the command buffer GPU registers
-        cmdbuffer.addr[0].Assign(VirtualToPhysicalAddress(params.address) >> 3);
-        cmdbuffer.size[0].Assign(params.size >> 3);
-        cmdbuffer.trigger[0] = 1;
+            // Write to the command buffer GPU registers
+            cmdbuffer.addr[0].Assign(address >> 3);
+            cmdbuffer.size[0].Assign(size >> 3);
+            cmdbuffer.trigger[0] = 1;
 
-        // Trigger processing of the command list
-        SubmitCmdList(0);
+            // Trigger processing of the command list
+            SubmitCmdList(0);
+        });
         break;
     }
     case CommandId::MemoryFill: {
@@ -387,6 +453,18 @@ void GPU::WriteReg(VAddr addr, u32 data) {
 
         ASSERT(addr % sizeof(u32) == 0);
         ASSERT(index < Pica::PicaCore::Regs::NUM_REGS);
+        if (index >= GPU_REG_INDEX(internal)) {
+            // An op like the GSP's commands, numbered with them in a vprof recording.
+            RunGpuOp(OpKind::RegWrite, [this, index, data] {
+                impl->pica.regs.reg_array[index] = data;
+                if (index == GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[0])) {
+                    SubmitCmdList(0);
+                } else if (index == GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[1])) {
+                    SubmitCmdList(1);
+                }
+            });
+            break;
+        }
         impl->pica.regs.reg_array[index] = data;
 
         // Handle registers that trigger GPU actions
@@ -399,12 +477,6 @@ void GPU::WriteReg(VAddr addr, u32 data) {
             break;
         case GPU_REG_INDEX(display_transfer_config.trigger):
             MemoryTransfer();
-            break;
-        case GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[0]):
-            SubmitCmdList(0);
-            break;
-        case GPU_REG_INDEX(internal.pipeline.command_buffer.trigger[1]):
-            SubmitCmdList(1);
             break;
         default:
             break;
@@ -476,30 +548,34 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
         return;
     }
 
-    // Perform memory fill.
-    if (!impl->rasterizer->AccelerateFill(config)) {
-        impl->sw_blitter->MemoryFill(config);
-    }
-
-    // Treat fill as texture transfer from VRAM
-    u64 delay = DelayGenerator::CalculateDelayNanoseconds(
-        DelayGenerator::GetCopyMode(true, config.IsVRAM()), true,
-        config.GetEndAddress() - config.GetStartAddress());
-
-    // It seems that it won't signal interrupt if "address_start" is zero.
-    // TODO: hwtest this
-    if (config.GetStartAddress() != 0) {
-        if (intr_index == 0) {
-            impl->signal_interrupt(Service::GSP::InterruptId::PSC0, delay);
-        } else if (intr_index == 1) {
-            impl->signal_interrupt(Service::GSP::InterruptId::PSC1, delay);
+    RunGpuOp(OpKind::Fill, [this, config, index, intr_index] {
+        // Perform memory fill.
+        if (!impl->rasterizer->AccelerateFill(config)) {
+            impl->sw_blitter->MemoryFill(config);
         }
-    }
 
-    // Reset "trigger" flag and set the "finish" flag
-    // This was confirmed to happen on hardware even if "address_start" is zero.
-    config.trigger.Assign(0);
-    config.finished.Assign(1);
+        // Treat fill as texture transfer from VRAM
+        u64 delay = DelayGenerator::CalculateDelayNanoseconds(
+            DelayGenerator::GetCopyMode(true, config.IsVRAM()), true,
+            config.GetEndAddress() - config.GetStartAddress());
+
+        PostToEmulation([this, index, intr_index, delay, start = config.GetStartAddress()] {
+            // It seems that it won't signal interrupt if "address_start" is zero.
+            // TODO: hwtest this
+            if (start != 0) {
+                GPU_TRACE("irq fill", intr_index);
+                if (intr_index == 0) {
+                    impl->signal_interrupt(Service::GSP::InterruptId::PSC0, delay);
+                } else if (intr_index == 1) {
+                    impl->signal_interrupt(Service::GSP::InterruptId::PSC1, delay);
+                }
+            }
+
+            // Set the "finish" flag once the fill is done (the trigger was reset above).
+            // This was confirmed to happen on hardware even if "address_start" is zero.
+            impl->pica.regs.memory_fill_config[index].finished.Assign(1);
+        });
+    });
 
     // Treat fill as texture transfer from VRAM
     u64 delay = DelayGenerator::CalculateDelayNanoseconds(
@@ -528,7 +604,33 @@ void GPU::MemoryTransfer() {
     if (!config.trigger.Value()) {
         return;
     }
+    const bool allow_display_transfer =
+        config.is_texture_copy ||
+        right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
+                                                       config.input_height, config.output_height);
+    RunGpuOp(OpKind::Transfer,
+             [this, &config, allow_display_transfer] {
+                 RunMemoryTransfer(config, allow_display_transfer);
+             });
 
+    u64 delay{};
+    if (config.is_texture_copy) {
+        delay = DelayGenerator::CalculateDelayNanoseconds(
+            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
+            config.texture_copy.size);
+    } else {
+        delay = DelayGenerator::CalculateDelayNanoseconds(
+            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
+            config.input_width * config.input_height * BytesPerPixel(config.input_format));
+    }
+
+    // Complete transfer.
+    config.trigger.Assign(0);
+    Signal(Service::GSP::InterruptId::PPF, delay);
+}
+
+void GPU::RunMemoryTransfer(const Pica::DisplayTransferConfig& config,
+                            bool allow_display_transfer) {
     MICROPROFILE_SCOPE(GPU_DisplayTransfer);
 
     // Notify debugger about the display transfer.
@@ -546,8 +648,7 @@ void GPU::MemoryTransfer() {
             DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
             config.texture_copy.size);
     } else {
-        if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
-                                                           config.input_height)) {
+        if (allow_display_transfer) {
             if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
                 impl->sw_blitter->DisplayTransfer(config);
             }
@@ -558,19 +659,58 @@ void GPU::MemoryTransfer() {
     }
 
     // Complete transfer.
-    config.trigger.Assign(0);
-    impl->signal_interrupt(Service::GSP::InterruptId::PPF, delay);
+    PostToEmulation(
+        [this, delay] { impl->signal_interrupt(Service::GSP::InterruptId::PPF, delay); });
 }
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+    GPU_TRACE("vblank");
     // Signal to GSP that GPU interrupt has occurred
     Signal(Service::GSP::InterruptId::PDC0, 0);
     Signal(Service::GSP::InterruptId::PDC1, 0);
 
     // Present renderered frame.
-    impl->renderer->SwapBuffers();
-    impl->render_thread->Push([this, fb, fill] { impl->renderer->PresentFrame(fb, fill); },
-                              GpuThread::Kind::Present);
+    if (impl->render_thread) {
+        // The present runs on the render thread, after the frame's work; a present still
+        // queued there when the next one comes is dropped. Pacing stays here.
+        // The screens' registers are the emulation thread's; the present takes a copy.
+        const auto& regs = impl->pica.regs;
+        const std::array<Pica::FramebufferConfig, 2> fb{regs.framebuffer_config[0],
+                                                        regs.framebuffer_config[1]};
+        const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
+                                                  impl->pica.regs_lcd.color_fill_bottom};
+        impl->render_thread->Push([this, fb, fill] { impl->renderer->PresentFrame(fb, fill); },
+                                  GpuThread::Kind::Present);
+        impl->renderer->EndFrame();
+    } else {
+        impl->renderer->SwapBuffers();
+    }
+
+    // Present renderered frame.
+    // A present has no guest-visible effect: well past the display's rate it is dropped. 12 ms,
+    // not a frame's 16.7: at 100% the guest's VBlanks jitter around the frame, and a frame's cap
+    // dropped a quarter of them.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - impl->last_present >= std::chrono::microseconds(12000)) {
+        impl->last_present = now;
+        const std::array<Pica::FramebufferConfig, 2> fb{regs.framebuffer_config[0],
+                                                        regs.framebuffer_config[1]};
+        const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
+                                                  impl->pica.regs_lcd.color_fill_bottom};
+        GPU_TRACE("present");
+        impl->renderer->PresentFrame(fb, fill);
+        GPU_TRACE("presented");
+        impl->rasterizer->GpuIdle();
+#ifdef VITA_DIAGNOSTICS
+        impl->present_us.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - now)
+                                       .count()),
+                                   std::memory_order_relaxed);
+        impl->presents.fetch_add(1, std::memory_order_relaxed);
+#endif
+    } else {
+        impl->presents_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
     impl->renderer->EndFrame();
 
     // Reschedule recurrent event

@@ -139,6 +139,22 @@ public:
 
 } // Anonymous namespace
 
+uint32_t VaryingDescriptor(const GxpProgram& program, size_t index) {
+    const auto& input = program.inputs[index];
+    // 0x0c00000f: constant bits and "no texture query"; the input id in bits 12-15; the
+    // component count minus one in bits 22-23; COLOR0 marked float (the default type of a
+    // colour iterator is otherwise fixed-point); bit 25 on the last descriptor.
+    uint32_t info = 0x0c00000f | (static_cast<uint32_t>(input.input) << 12) |
+                    (static_cast<uint32_t>(input.components - 1) << 22);
+    if (input.input == FragmentInput::Color0 || input.input == FragmentInput::Color1) {
+        info |= 0x00100000;
+    }
+    if (index + 1 == program.inputs.size()) {
+        info |= 0x02000000;
+    }
+    return info;
+}
+
 std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
     Writer w;
     w.out.reserve(1024);
@@ -215,18 +231,7 @@ std::vector<uint8_t> WriteGxp(const GxpProgram& program) {
         w.U32(4); // the descriptors follow this field directly
         for (size_t i = 0; i < program.inputs.size(); i++) {
             const auto& input = program.inputs[i];
-            // 0x0c00000f: constant bits and "no texture query"; the input id in bits 12-15; the
-            // component count minus one in bits 22-23; COLOR0 marked float (the default type
-            // of a colour iterator is otherwise fixed-point); bit 25 on the last descriptor.
-            uint32_t info = 0x0c00000f | (static_cast<uint32_t>(input.input) << 12) |
-                            (static_cast<uint32_t>(input.components - 1) << 22);
-            if (input.input == FragmentInput::Color0 || input.input == FragmentInput::Color1) {
-                info |= 0x00100000;
-            }
-            if (i + 1 == program.inputs.size()) {
-                info |= 0x02000000;
-            }
-            w.U32(info);
+            w.U32(VaryingDescriptor(program, i));
             w.U32(0);                                              // resource_index
             w.U32(static_cast<uint32_t>(input.components - 1) << 4); // registers minus one
             w.U32(0);                                              // component_info

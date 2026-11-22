@@ -416,6 +416,11 @@ void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, u
     }
 }
 
+void Builder::Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc) {
+    Sample2D(dst, coord, sampler_sa, nullptr, drc);
+    insts.back().b[1] = true;
+}
+
 void Builder::Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words,
                     uint8_t count, uint8_t drc) {
     Inst& i = Push(Op::Lda32);
@@ -478,8 +483,10 @@ public:
         : insts{insts_}, classes{classes_} {}
 
     LowerResult Run(Encoder& e, int level);
+    bool skip_auto = false;
 
 private:
+    std::vector<bool> SkipInvalid() const;
     void Liveness();
     void DeadStores();
     void Reloads();
@@ -3112,7 +3119,99 @@ Reg Lowering::Map(Reg r) const {
     return {iv.home->bank, static_cast<uint8_t>(iv.home->n + (r.n & 3))};
 }
 
+std::vector<bool> Lowering::SkipInvalid() const {
+    // Backward from each read with the hardware's own level: the registers its coordinates
+    // come from are needed in every instance. An instruction writing a needed register runs in
+    // every instance and needs its sources in turn. An unpredicated write ends the need for
+    // what it certainly writes: an F32 op's mask (one register a lane), a read's four words, a
+    // load's count; internal registers by lane. A read needs four registers from the one
+    // named. A predicated write needs the predicate, so every test before it runs in every
+    // instance too (predicates are not tracked apart).
+    std::vector<bool> skip(insts.size(), true);
+    std::set<std::pair<int, int>> needed; // (bank, register); internal: (bank, 4 * n + lane)
+    std::vector<Ref> refs;
+    bool predicates = false;
+    const auto regs_of = [](const Reg& r, uint8_t mask, std::vector<std::pair<int, int>>& out) {
+        out.clear();
+        for (int k = 0; k < 4; k++) {
+            if (mask & (1 << k)) {
+                out.push_back(r.bank == Bank::Internal
+                                  ? std::pair{static_cast<int>(r.bank), 4 * r.n + k}
+                                  : std::pair{static_cast<int>(r.bank), r.n + k});
+            }
+        }
+    };
+    // The registers a definition certainly writes (an empty mask: not known, no kill) and
+    // those it may write.
+    const auto written = [](const Inst& inst, const Reg& r, bool certain) -> uint8_t {
+        if (r.bank == Bank::Internal) {
+            return InternalWriteLanes(inst);
+        }
+        switch (inst.op) {
+        case Op::Vec:
+        case Op::Mad:
+        case Op::Mad2:
+        case Op::Dot:
+        case Op::Comp:
+        case Op::MoveInternal:
+        case Op::CondMove:
+            return inst.dst.mask;
+        case Op::Sample2D:
+            return 0xf;
+        case Op::Lda32:
+            return static_cast<uint8_t>((1u << std::min<unsigned>(inst.u[1], 4)) - 1);
+        case Op::Bitwise:
+        case Op::MadI16:
+        case Op::MadI32:
+        case Op::PackS16:
+        case Op::UnpackU8:
+            return 1;
+        default:
+            return certain ? 0 : 0xf; // F16 ops and packs: lanes are not registers
+        }
+    };
+    std::vector<std::pair<int, int>> regs;
+    for (std::size_t n = insts.size(); n-- > 0;) {
+        const Inst& inst = insts[n];
+        if (inst.op == Op::Br) {
+            Fail("skipinv placement across a branch: not built");
+        }
+        Refs(const_cast<Inst&>(inst), refs);
+        bool keep = (inst.op == Op::Sample2D && !inst.b[0] && !inst.b[1]) ||
+                    (inst.op == Op::Test && predicates);
+        for (const Ref& r : refs) {
+            if (r.def) {
+                regs_of(Map(*r.reg), written(inst, Map(*r.reg), false), regs);
+                for (const auto& k : regs) {
+                    keep = keep || needed.count(k) != 0;
+                }
+            }
+        }
+        if (!keep) {
+            continue;
+        }
+        skip[n] = false;
+        for (const Ref& r : refs) {
+            if (r.def && inst.pred == Pred::None) {
+                regs_of(Map(*r.reg), written(inst, Map(*r.reg), true), regs);
+                for (const auto& k : regs) {
+                    needed.erase(k);
+                }
+            }
+        }
+        for (const Ref& r : refs) {
+            if (!r.def || inst.pred != Pred::None) {
+                regs_of(Map(*r.reg), 0xf, regs);
+                needed.insert(regs.begin(), regs.end());
+            }
+        }
+        predicates = predicates || inst.pred != Pred::None;
+    }
+    return skip;
+}
+
 void Lowering::Encode(Encoder& e, LowerResult& result) {
+    const std::vector<bool> skip = skip_auto ? SkipInvalid() : std::vector<bool>{};
     std::map<int, std::size_t> label_word;
     std::vector<std::pair<std::size_t, int>> fixups; // (branch word, label)
     const auto S = [&](const Src& s) { return Src{Map(s.reg), s.swz, s.mod}; };
@@ -3121,6 +3220,9 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
     std::vector<Ref> refs;
     for (std::size_t n = 0; n < insts.size(); n++) {
         const Inst& i = insts[n];
+        if (skip_auto) {
+            e.skip_invalid = skip[n];
+        }
         switch (i.op) {
         case Op::Phas:
             e.Phas(i.b[0]);
@@ -3339,6 +3441,7 @@ LowerResult Builder::Lower(Encoder& e, int level) {
         cls.push_back({Bank::Temp, 0, 64});
     }
     Lowering lowering{insts, cls};
+    lowering.skip_auto = skip_invalid_auto;
     return lowering.Run(e, level);
 }
 

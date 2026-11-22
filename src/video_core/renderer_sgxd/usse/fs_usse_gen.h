@@ -5,8 +5,10 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
+#include "video_core/renderer_gxm/usse/gxp_writer.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 
 namespace GxmRenderer::Usse {
@@ -24,6 +26,10 @@ namespace GxmRenderer::Usse {
  */
 /// `refusal`, when given, receives why an empty result came back. `level` 2 runs the IR's
 /// optimising passes (the second tier).
+/// The program itself, for sgxd, which places the code and builds the PDS programs.
+[[nodiscard]] std::optional<GxpProgram> EmitFragmentGxp(const Pica::Shader::FSConfig& config,
+                                                        std::string* refusal = nullptr,
+                                                        int level = 1);
 [[nodiscard]] std::vector<uint8_t> EmitFragmentProgram(const Pica::Shader::FSConfig& config,
                                                        std::string* refusal = nullptr,
                                                        int level = 1);

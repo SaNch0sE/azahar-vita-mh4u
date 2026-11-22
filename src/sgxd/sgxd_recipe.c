@@ -7,6 +7,8 @@
 
 #include <string.h>
 
+#include "sgxd_pds.h"
+
 const char *const sgxd_recipe_names[SGXD_R_COUNT] = {
     "PT", "PAGES", "RGN0", "RGN1", "RGN2", "RGN3", "EXTZ", "TPC0", "TPC1", "TPC2", "TPC3",
     "BGREC", "FB", "DEPTH", "STREAM", "STATE", "VERTS", "INDICES", "PDS", "COPY", "VSPDS",
@@ -22,7 +24,7 @@ static const float triangle_verts[3 * NV] = {
     -0.5f, -0.5f, 0.25f, 1.0f, 0.5f, -0.5f, 0.5f, 1.0f, 0.0f, 0.5f, 0.75f, 1.0f,
 };
 static const uint16_t triangle_indices[3] = {0, 1, 2};
-static const SgxdRecipeDraw triangle_draw = {0, 3, SGXD_RECIPE_ISP_A, SGXD_R_FPRIM, 0, 0};
+static const SgxdRecipeDraw triangle_draw = {0, 3, SGXD_RECIPE_ISP_A, SGXD_R_FPRIM, 0, 0, NULL};
 
 #define OUTSELECTS (4u << 24 | 0x1000u)
 // VTXSIZE 8: the position and the base colour (bit 11, the TSP data's base colour).
@@ -282,93 +284,6 @@ static void make_cf(const SgxdRecipe *r, Code cf[CF_COUNT]) {
 
 // ---------------------------------------------------------------------------- PDS
 
-#define S1L 0u
-#define S1H 1u
-#define S2L 2u
-#define S2H 3u
-#define HALT 0xaf000000u
-
-static uint32_t movs(unsigned dest, unsigned s1sel, unsigned s1, unsigned s2sel, unsigned s2,
-                     unsigned w0, unsigned w1, unsigned w2, unsigned w3) {
-    return 7u << 24 | s1sel << 23 | (s1 & 0x1fu) << 18 | s2sel << 17 | (s2 & 0x1fu) << 12 |
-           w0 << 10 | w1 << 8 | w2 << 6 | w3 << 4 | dest;
-}
-static uint32_t doutd(unsigned p) { return movs(3, 0, p, 0, 24, S1L, S1H, S1L, S1H); }
-static uint32_t douta(unsigned p) { return movs(6, 0, p, 0, 24, S1L, S1H, S2L, S2L); }
-static uint32_t doutu(unsigned p, unsigned w2) {
-    const unsigned s = w2 & 1 ? S2H : S2L;
-    return movs(5, 0, p, 0, w2 / 2, S1L, S1H, s, s);
-}
-static uint32_t cc(uint32_t i, unsigned c) { return (i & ~(7u << 24)) | c << 24; }
-static uint32_t movsa(uint32_t i) { return i | 5u << 27; }
-static uint32_t mul(unsigned s1reg, unsigned s1, unsigned s2, unsigned d1, unsigned d) {
-    return 1u << 30 | 4u << 27 | 7u << 24 | s1reg << 23 | s1 << 16 | s2 << 8 | d1 << 6 | d;
-}
-// DOUTI of DS1 word w whose USE iterator writes itr_words words: the MOVS's last two swizzle
-// fields are TAGSIZE and ITRSIZE, each one less than the words.
-static uint32_t douti(unsigned w, unsigned itr_words) {
-    return (movs(2, 0, 1, 0, w / 2, w & 1 ? S2H : S2L, S1L, S1L, S1L) & ~0xf0u) |
-           (itr_words - 1) << 4;
-}
-static uint32_t doutt(unsigned p, unsigned fconv) {
-    return movs(4, 0, p, 0, p, S1L, S1L, S1L, S1L) | fconv << 4;
-}
-static uint32_t doutu0(unsigned cb, unsigned idx, unsigned tu) { return cb | idx << 4 | tu << 24; }
-static uint32_t doutd1(unsigned pa, unsigned n) { return (n - 1) | pa << 8; }
-static uint32_t douta1(unsigned pa) { return pa << 8; }
-
-// A PDS program: two data segments of words, then code.
-typedef struct Pds {
-    uint32_t ds[2][16];
-    unsigned len[2];
-    uint32_t code[8];
-    unsigned ncode;
-} Pds;
-
-static unsigned pds_word(Pds *p, unsigned b, uint32_t v) {
-    p->ds[b][p->len[b]++] = v;
-    return p->len[b] - 1;
-}
-static unsigned pds_pair(Pds *p, unsigned b, uint32_t lo, uint32_t hi) {
-    if (p->len[b] & 1) {
-        p->ds[b][p->len[b]++] = 0;
-    }
-    p->ds[b][p->len[b]++] = lo;
-    p->ds[b][p->len[b]++] = hi;
-    return p->len[b] / 2 - 1;
-}
-// Four words at one pair index of both segments, a DOUTT's: DS0 takes words 0 and 1, DS1 2 and 3.
-static unsigned pds_quad(Pds *p, const uint32_t w[4]) {
-    unsigned n = p->len[0] > p->len[1] ? p->len[0] : p->len[1];
-    n = (n + 1) & ~1u;
-    for (unsigned b = 0; b < 2; b++) {
-        while (p->len[b] < n) {
-            p->ds[b][p->len[b]++] = 0;
-        }
-        p->ds[b][p->len[b]++] = w[2 * b];
-        p->ds[b][p->len[b]++] = w[2 * b + 1];
-    }
-    return n / 2;
-}
-static void pds_emit(Pds *p, uint32_t i) { p->code[p->ncode++] = i; }
-static unsigned pds_units(const Pds *p) {
-    const unsigned n = p->len[0] > p->len[1] ? p->len[0] : p->len[1];
-    return (n + 1) / 2;
-}
-// Data units (DS0 w0, w1, DS1 w0, w1), then the code. Returns the words written.
-static unsigned pds_words(const Pds *p, uint32_t *out) {
-    const unsigned u = pds_units(p);
-    memset(out, 0, u * 16);
-    for (unsigned n = 0; n < p->len[0]; n++) {
-        out[(n / 2) * 4 + n % 2] = p->ds[0][n];
-    }
-    for (unsigned n = 0; n < p->len[1]; n++) {
-        out[(n / 2) * 4 + 2 + n % 2] = p->ds[1][n];
-    }
-    memcpy(out + u * 4, p->code, p->ncode * 4);
-    return u * 4 + p->ncode;
-}
-
 static void secondary(Pds *p, uint32_t dw0) {
     memset(p, 0, sizeof(*p));
     const unsigned k = pds_pair(p, 0, dw0, 0);
@@ -518,49 +433,32 @@ static unsigned make_idle(const Code *cv, uint32_t *out) {
 
 // ---------------------------------------------------------------------------- layout
 
-// The vertex DMS: the VDM index list's words 2, 4 and 5.
-static void vertex_dms(unsigned pa, unsigned temps, unsigned sa, unsigned out, uint32_t *w2,
-                       uint32_t *w4, uint32_t *w5) {
-    unsigned size = pa + (temps + 1) / 2 * 2;
-    size = (size + 3) / 4 * 4;
-    if (size && size % 16 == 0) {
-        size += 4;
-    }
-    unsigned max_inst = 8;
-    if (size) {
-        int m = (int)(0x900 - 126 - (sa + 31) / 32 * 32) / 3 / (int)size;
-        max_inst = m < 1 ? 1 : (m > 8 ? 8 : (unsigned)m);
-    }
-    out = (out + 3) / 4 * 4;
-    unsigned part = out ? 128 / out : 16;
-    part = part < 16 ? part : 16;
-    part = part < max_inst ? part : max_inst;
-    const unsigned adv = (part < 4 ? part : 4) - 1;
-    *w2 = (max_inst - 1) << 28;
-    *w4 = (part - 1) << 28;
-    *w5 = (out >> 2) << 25 | adv << 23 | (size >> 2) << 9;
-}
-
 // A draw init and sgxd_recipe_set_draws accept: first a multiple of 8, its indices inside nindices.
+// A draw with programs and its own index list is checked against nothing but its count.
 static int draw_valid(const SgxdRecipeDraw *d, unsigned nindices) {
-    return !(d->first & 7) && d->first <= nindices && d->count && d->count <= nindices - d->first &&
-           (d->fprim == SGXD_R_FPRIM || d->fprim == SGXD_R_BGPRIM) && d->cull <= 2 &&
-           !(d->clip && (d->clip & 0x40404040u));
+    const int own_indices = d->programs && d->programs->indices;
+    return (own_indices || (!(d->first & 7) && d->first <= nindices &&
+                            d->count <= nindices - d->first)) &&
+           d->count && (d->programs || d->fprim == SGXD_R_FPRIM || d->fprim == SGXD_R_BGPRIM) &&
+           d->cull <= 2 && !(d->clip && (d->clip & 0x40404040u));
 }
 
 static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, uint32_t pages,
                 const float *verts, const uint32_t *imgui_verts, unsigned nverts,
                 const uint16_t *indices, unsigned nindices, const SgxdRecipeDraw *draws,
-                unsigned ndraws, int copy_vs, uint32_t vertex_sa, unsigned imgui_fs);
+                unsigned ndraws, int copy_vs, uint32_t vertex_sa, unsigned imgui_fs, int programs);
 
-// A draw's VDM stream words: the state copy and the index list, and in ImGui mode the vertex
-// secondary between them, which loads the program's SA.
-static unsigned draw_words(const SgxdRecipe *r) { return r->imgui ? 10 : 8; }
+// A draw's VDM stream words: the state copy and the index list, and in ImGui and program mode
+// the vertex secondary between them, which loads the program's SA.
+static unsigned draw_words(const SgxdRecipe *r) { return r->imgui || r->programs ? 10 : 8; }
+
+unsigned sgxd_recipe_grid;
+uint32_t sgxd_recipe_pixelbe = 0x80;
 
 int sgxd_recipe_init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
                      uint32_t pages) {
     return init(r, width, height, base, pages, triangle_verts, NULL, 3, triangle_indices, 3,
-                &triangle_draw, 1, 0, 0, 0);
+                &triangle_draw, 1, 0, 0, 0, 0);
 }
 
 int sgxd_recipe_init_scene(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
@@ -568,7 +466,15 @@ int sgxd_recipe_init_scene(SgxdRecipe *r, uint32_t width, uint32_t height, uint3
                            const uint16_t *indices, unsigned nindices,
                            const SgxdRecipeDraw *draws, unsigned ndraws) {
     return init(r, width, height, base, pages, verts, NULL, nverts, indices, nindices, draws,
-                ndraws, 1, 0, 0);
+                ndraws, 1, 0, 0, 0);
+}
+
+int sgxd_recipe_init_programs(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
+                              uint32_t pages, const uint16_t *indices, unsigned nindices,
+                              const SgxdRecipeDraw *draws, unsigned ndraws) {
+    // VERTS holds the recipe's triangle for a draw without programs; nothing else reads it.
+    return init(r, width, height, base, pages, triangle_verts, NULL, 3, indices, nindices, draws,
+                ndraws, 1, 0, 0, 1);
 }
 
 int sgxd_recipe_init_imgui(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base,
@@ -580,13 +486,13 @@ int sgxd_recipe_init_imgui(SgxdRecipe *r, uint32_t width, uint32_t height, uint3
         return -1;
     }
     return init(r, width, height, base, pages, NULL, verts, nverts, indices, nindices, draws,
-                ndraws, 0, sa_offset, fs);
+                ndraws, 0, sa_offset, fs, 0);
 }
 
 static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, uint32_t pages,
                 const float *verts, const uint32_t *imgui_verts, unsigned nverts,
                 const uint16_t *indices, unsigned nindices, const SgxdRecipeDraw *draws,
-                unsigned ndraws, int copy_vs, uint32_t vertex_sa, unsigned imgui_fs) {
+                unsigned ndraws, int copy_vs, uint32_t vertex_sa, unsigned imgui_fs, int programs) {
     if (width < 32 || height < 32 || width > 2048 || height > 2048 || (base & 0xfffffu) ||
         pages < 64 || pages > 0x8000 || !nverts || nverts > 0xffff || !nindices ||
         nindices > SGXD_RECIPE_MAX_INDICES || !ndraws || ndraws > SGXD_RECIPE_MAX_DRAWS) {
@@ -598,6 +504,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
         }
     }
     memset(r, 0, sizeof(*r));
+    r->programs = programs;
     r->draws = draws;
     r->ndraws = ndraws;
     r->copy_vs = copy_vs;
@@ -618,7 +525,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
 
     r->tx = (W + 31) / 32;
     r->ty = (H + 31) / 32;
-    r->count = W * H < 0x4b000 ? 2 : 4;
+    r->count = sgxd_recipe_grid ? sgxd_recipe_grid : W * H < 0x4b000 ? 2 : 4;
     if (r->count == 2) {
         r->mx = ((r->tx + 1) / 2 + 3) & ~3u;
         r->my = ((r->ty + 1) / 2 + 3) & ~3u;
@@ -710,8 +617,9 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     r->pds_threshold = mn > 256 ? mn - 256 : 0;
     r->global_list = 0x10000 | gbl;
     r->bgobjtag = (((sgxd_recipe_va(r, SGXD_R_BGREC) - req_base) >> 4) & 0xffffffu) | 2u << 24;
+    r->bgobjdepth = fbits(1.0f);
 
-    r->pbe[0] = 256 << 8;
+    r->pbe[0] = SGXD_RECIPE_PACK_U8888;
     r->pbe[1] = sgxd_recipe_va(r, SGXD_R_FB);
     r->pbe[2] = (W - 1) >> 1;
     r->pbe[3] = 0;
@@ -775,8 +683,10 @@ void sgxd_recipe_restage(const SgxdRecipe *r, void *memory_) {
     uint8_t *memory = memory_;
     const uint32_t *L = r->offset;
     put_page_list(r, memory);
-    fill(memory, L[SGXD_R_RGN0], SGXD_RECIPE_SENTINEL, L[SGXD_R_EXTZ] - L[SGXD_R_RGN0]);
-    fill(memory, L[SGXD_R_EXTZ], 0, L[SGXD_R_BGREC] - L[SGXD_R_EXTZ]);
+    // Nothing for the region arrays, EXTZ or the tail pointer caches: TE_RGNHDR_INIT writes
+    // every region header at each TA's start (T3 waits for it in every core), and the tail
+    // pointer caches and EXTZ, zeroed when the recipe is written, are reused (zeroed once, at
+    // creation).
     if (!r->fb_external) {
         fill(memory, L[SGXD_R_FB], SGXD_RECIPE_SENTINEL, r->width * r->height * 4);
         fill(memory, L[SGXD_R_DEPTH], SGXD_RECIPE_SENTINEL, r->width * r->height * 4);
@@ -807,38 +717,24 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory_, uint32_t fb_va, uint32
     }
 }
 
+void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory_, uint32_t pbe0) {
+    uint8_t *memory = memory_;
+    r->pbe[0] = pbe0;
+    uint64_t *eot = (uint64_t *)(memory + r->offset[SGXD_R_CF] + CF_EOT_OFFSET);
+    eot[1] = usse_limm(0, r->pbe[0]) | SKIPINV;
+}
+
+void sgxd_recipe_set_background_depth(SgxdRecipe *r, void *memory, float z) {
+    r->bgobjdepth = fbits(z);
+    uint32_t *bg = (uint32_t *)((uint8_t *)memory + r->offset[SGXD_R_BGREC]);
+    bg[12] = bg[14] = bg[16] = fbits(z);
+}
+
 void sgxd_recipe_write_vertex_sa(const SgxdRecipe *r, void *memory_, const float sa[4]) {
     uint32_t *words = (uint32_t *)((uint8_t *)memory_ + r->vertex_sa);
     for (unsigned n = 0; n < 4; n++) {
         words[n] = fbits(sa[n]);
     }
-}
-
-// libgxm's CalculatePixelDMSInfo for one sample: the pixel
-// task's size word from its PAs, temporaries and SA. 0x08018000 for up to 4 PAs (Sony's).
-static uint32_t pixel_dms(unsigned pa, unsigned temps, unsigned sa) {
-    const unsigned size = (pa + (temps + 1) / 2 * 2 + 3) / 4 * 4, regs = size * 4;
-    const unsigned sa_chunks = (sa + 31) / 32;
-    if (!regs) {
-        return 3u << 15 | sa_chunks << 17;
-    }
-    const unsigned chunks = 0x900 / 32 - sa_chunks;
-    const unsigned use_regs = (chunks - 2) / 3 * 32, quarter = (chunks - 4) / 4 * 32;
-    unsigned use = use_regs / regs, pds;
-    use = use > 4 ? 4 : use < 1 ? 1 : use;
-    if (quarter < regs) {
-        pds = 1;
-    } else {
-        const unsigned use_chunks = (regs * use + 31) / 32;
-        const unsigned pds_chunks = chunks - 4 - 2 * (use_chunks - 1);
-        const unsigned full = pds_chunks / use_chunks;
-        unsigned limit = quarter / regs;
-        limit = limit < 16 ? limit : 16;
-        limit = limit < 4 * use ? limit : 4 * use;
-        pds = use * full + (pds_chunks - use_chunks * full) * 32 / regs;
-        pds = pds < limit ? pds : limit;
-    }
-    return (pds & 15) << 22 | (use - 1) << 15 | sa_chunks << 17 | (size >> 2) << 27;
 }
 
 // State word 8 of a draw: the colour+UV program's six PAs need two size units.
@@ -864,37 +760,59 @@ static uint32_t vsec_word(const SgxdRecipe *r) {
     return r->units[SGXD_R_VSEC] << 27 | 7u << 13 | 1u << 8 | (r->imgui ? 1u : 0u);
 }
 
-// Draw n's MTE state packet, and in the VDM control stream its state copy
-// and index list.
+// Draw n's MTE state packet, and in the VDM control stream its state copy and index list. A draw
+// with programs takes its PDS pointers, sizes, viewport, output selects and index list from them.
 static void write_draw(const SgxdRecipe *r, uint8_t *memory, unsigned n, const SgxdRecipeDraw *d) {
     const uint32_t *L = r->offset;
     const uint32_t W = r->width, H = r->height;
+    const SgxdRecipeDrawPrograms *g = d->programs;
     uint32_t *stream = (uint32_t *)(memory + L[SGXD_R_STREAM]);
     // Every copy program has COPY's shape and units.
     const uint32_t copy_va = r->base + copy_offset(r, n);
     const uint32_t clip = d->clip;
-    const uint32_t state[24] = {
+    const unsigned fprim = g ? SGXD_R_FPRIM : d->fprim;
+    uint32_t state[24] = {
         0xdfff, d->isp, 0, 0x0e000000, d->isp, 0, 0x0e000000, ptr(r, SGXD_R_FSEC),
-        pixel_size_word(r, d->fprim) | msbs(r, SGXD_R_FSEC, d->fprim), ptr(r, d->fprim),
+        pixel_size_word(r, fprim) | msbs(r, SGXD_R_FSEC, fprim), ptr(r, fprim),
         clip_x(r, clip), clip_y(r, clip),
         fbits(W / 2.0f), fbits(W / 2.0f), fbits(H / 2.0f), fbits(H / 2.0f), fbits(0.5f),
         fbits(0.5f), 0, outselects(r), 0x3727c5ac, 0x8000 | d->cull,
         imgui_uv(r) ? 1u : 0u, 0,
     };
+    if (g) {
+        state[7] = g->fsec_units << 27 | ((g->fsec >> 4) & 0x07ffffffu);
+        state[8] = g->pixel_size | (g->fsec & 0x80000000u ? 1u << 14 : 0) |
+                   (g->fprim & 0x80000000u ? 1u << 13 : 0);
+        state[9] = g->fprim_units << 27 | ((g->fprim >> 4) & 0x07ffffffu);
+        for (unsigned i = 0; i < 6; i++) {
+            state[12 + i] = fbits(g->viewport[i]);
+        }
+        state[19] = g->outselects;
+        state[22] = g->texsize;
+    }
     put(memory, L[SGXD_R_STATE] + n * 0x60, state, 24);
     uint32_t *w = stream + draw_words(r) * n;
     *w++ = 1u << 30 | copy_va >> 4;
     *w++ = r->units[SGXD_R_COPY] << 27 | 1u << 25 | 1u << 17 | (1u + n % 4) << 13 | 1u << 9 | 6;
-    if (r->imgui) {
+    if (g) {
+        // USEATTRIBUTESIZE in four-word units.
+        *w++ = 1u << 30 | g->vsec >> 4;
+        *w++ = g->vsec_units << 27 | 7u << 13 | 1u << 8 | (g->vsec_sa + 3) / 4;
+    } else if (r->imgui || r->programs) {
         *w++ = 1u << 30 | sgxd_recipe_va(r, SGXD_R_VSEC) >> 4;
         *w++ = vsec_word(r);
     }
-    *w++ = 2u << 30 | 0u << 26 | 7u << 22 | d->count;
-    *w++ = sgxd_recipe_va(r, SGXD_R_INDICES) + 2 * d->first;
-    *w++ = r->vdm_w2;
+    *w++ = 2u << 30 | (g ? g->primitive : 0u) << 26 | 7u << 22 | d->count;
+    *w++ = g && g->indices ? g->indices : sgxd_recipe_va(r, SGXD_R_INDICES) + 2 * d->first;
+    *w++ = g ? g->vdm_w2 : r->vdm_w2;
     *w++ = 0;
-    *w++ = r->vdm_w4 | ((sgxd_recipe_va(r, SGXD_R_VSPDS) >> 4) & 0x0fffffffu);
-    *w++ = r->vdm_w5 | 0x100 | r->units[SGXD_R_VSPDS];
+    if (g) {
+        *w++ = g->vdm_w4 | ((g->vspds >> 4) & 0x0fffffffu);
+        *w++ = g->vdm_w5 | 0x100 | g->vspds_units;
+    } else {
+        *w++ = r->vdm_w4 | ((sgxd_recipe_va(r, SGXD_R_VSPDS) >> 4) & 0x0fffffffu);
+        *w++ = r->vdm_w5 | 0x100 | r->units[SGXD_R_VSPDS];
+    }
 }
 
 // The stream's end after count draws: the secondary and the terminate.
@@ -932,6 +850,8 @@ void sgxd_recipe_write(const SgxdRecipe *r, void *memory_) {
     const uint32_t W = r->width, H = r->height;
     memset(memory, 0, L[SGXD_R_END]);
     fill(memory, L[SGXD_R_PAGES], SGXD_RECIPE_SENTINEL, r->pages * 0x1000);
+    // The region arrays start with the sentinel, which shows a header the TE's init did not write.
+    fill(memory, L[SGXD_R_RGN0], SGXD_RECIPE_SENTINEL, L[SGXD_R_EXTZ] - L[SGXD_R_RGN0]);
     sgxd_recipe_restage(r, memory);
 
     Code cv[CV_COUNT], cf[CF_COUNT];
@@ -1210,7 +1130,7 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
         {0x451c, r->rgn_size}, {0x0414, 0}, {0x0418, 1}, {0x041c, 0x1e3ce508},
         {0x0420, 0x1e3ce508}, {0x050c, sgxd_recipe_va(r, SGXD_R_EXTZ)}, {0x0424, 0xe9},
         {0x042c, 0}, {0x044c, 0}, {0x0480, 0}, {0x0484, 0}, {0x0488, 0}, {0x048c, 0},
-        {0x0490, 0}, {0x04b8, 0x3f800000}, {0x04bc, 0x300}, {0x04c4, r->bgobjtag},
+        {0x0490, 0}, {0x04b8, r->bgobjdepth}, {0x04bc, 0x300}, {0x04c4, r->bgobjtag},
         {0x04c8, 0x88}, {0x04cc, 0x188}, {0x04dc, 8}, {0x0520, r->mtile1},
         {0x0524, r->mtile2}, {0x0528, r->stride}, {0x0148, 0},
         {0x0a5c, sgxd_recipe_va(r, SGXD_R_PIXEV)}, {0x0a60, 3}, {0x0a64, 0x4000}, {0x0ae8, 0},
@@ -1260,10 +1180,15 @@ void sgxd_recipe_set_clip(const SgxdRecipe *r, void *memory, unsigned draw, uint
 
 void sgxd_recipe_texture_words(uint32_t va, uint32_t width, uint32_t height, int bilinear,
                                uint32_t words[4]) {
-    words[0] = 0x03fe0090u | (bilinear ? 1u << 12 | 1u << 10 : 0);
-    words[1] = 0x6c000000u | (width - 1) << 12 | (height - 1);
+    sgxd_recipe_texture_words_format(va, width, height, bilinear, 0x0c, 0, words);
+}
+
+void sgxd_recipe_texture_words_format(uint32_t va, uint32_t width, uint32_t height, int bilinear,
+                                      unsigned code, unsigned swizzle, uint32_t words[4]) {
+    words[0] = 0x03fe0090u | (bilinear ? 1u << 12 | 1u << 10 : 0) | (code >> 7 & 1u) << 31;
+    words[1] = 0x60000000u | (code & 0x1fu) << 24 | (width - 1) << 12 | (height - 1);
     words[2] = va;
-    words[3] = 0x80000000u;
+    words[3] = 0x80000000u | (swizzle & 7u) << 28;
 }
 
 void sgxd_recipe_set_texture(const SgxdRecipe *r, void *memory, const uint32_t words[4]) {

@@ -265,6 +265,7 @@ static_assert(sizeof(RegImplInfo) == sizeof(u16), "the loop reads the flags as h
  */
 void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     if (ignore_list) {
+        rasterizer->NotifyP3D();
         signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
         return;
     }
@@ -609,6 +610,7 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
         // TODO(PabloMK7): This logic is not fully accurate, but close enough:
         // https://problemkaputt.de/gbatek-3ds-gpu-internal-registers-finalize-interrupt-registers.htm
         if (any_byte_match(regs.internal.reg_array[id], regs.internal.irq_compare)) [[likely]] {
+            rasterizer->NotifyP3D();
             signal_interrupt(Service::GSP::InterruptId::P3D,
                              delay_generator.CalculateAndResetDelay());
             if (regs.internal.irq_autostop) [[likely]] {
@@ -983,7 +985,9 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     const u32 write_mask = ExpandBitsToBytes[mask];
     regs.internal.reg_array[id] = (old_value & ~write_mask) | (value & write_mask);
 
-    if (debug_context) [[unlikely]] {
+    // Read once: after a handler (a draw) the object's line may have left the cache.
+    const bool debugging = debug_context != nullptr;
+    if (debugging) [[unlikely]] {
         // Track register write.
         DebugUtils::OnPicaRegWrite(id, mask, regs.internal.reg_array[id]);
         // Track events.
@@ -996,7 +1000,7 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
 
     dirty_regs.Set(id);
 
-    if (debug_context) [[unlikely]] {
+    if (debugging) [[unlikely]] {
         debug_context->OnEvent(DebugContext::Event::PicaCommandProcessed, &id);
     }
 }

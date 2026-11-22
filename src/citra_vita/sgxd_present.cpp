@@ -15,8 +15,10 @@
 #include <fmt/format.h>
 
 #include "citra_vita/sgxd_present.h"
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "sgxd.h"
+#include "sgxd_program.h"
 #include "sgxd_recipe.h"
 #include "sgxd_session.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
@@ -48,6 +50,23 @@ constexpr u32 KickerValue = 0x5a;
 constexpr u32 BackgroundSa = 0x400;
 constexpr u32 VertexSa = 0xa00;
 
+// The guest screens' area, the pages after the kicker page: the programs (placed once, within
+// DOUTU's reach of CV and CF), their index list, each screen's six vertices and vertex fetch,
+// the dummy secondaries, and the pixel primaries, one per texture seen (a guest alternates two
+// or three framebuffers a screen), reused in turn when the table is full.
+constexpr u32 ScreenAreaSize = 0x4000;
+constexpr u32 ScreenVertexCode = 0x000;
+constexpr u32 ScreenFragmentCode = 0x040;
+constexpr u32 ScreenIndices = 0x080;
+constexpr u32 ScreenVertices = 0x100; // + 0x100 a screen
+constexpr u32 ScreenVertexPds = 0x400; // + 0x80 a screen
+constexpr u32 ScreenVsecPds = 0x500;
+constexpr u32 ScreenFsecPds = 0x580;
+constexpr u32 ScreenPixelPds = 0x800; // + 0x80 an entry
+constexpr u32 ScreenPixelEntries = 32;
+constexpr u32 ScreenPdsSlot = 0x80;
+constexpr u32 ScreenSlots = 2;
+
 struct State {
     bool initialized = false;
     SceUID block = -1, cdram = -1, texture = -1, black = -1;
@@ -64,6 +83,16 @@ struct State {
     bool in_frame = false;
     bool failed = false;
     char failed_text[160]{};
+
+    u32 screen_offset = 0;
+    u32 screen_vertex = 0, screen_fragment = 0;   // DOUTU word 0s
+    SgxdRecipeDrawPrograms screen_programs[ScreenSlots]{};
+    u32 screens_in_frame = 0;
+    struct PixelEntry {
+        u32 tex[4];
+        u32 va, units;
+    } pixel_entries[ScreenPixelEntries]{};
+    u32 pixel_used = 0, pixel_next = 0;
 };
 
 State g;
@@ -154,6 +183,105 @@ void ShowBlackFrame() {
     sceDisplayWaitSetFrameBuf();
 }
 
+u32 ScreenVa(u32 offset) {
+    return RecipeVa + g.screen_offset + offset;
+}
+
+void PutPds(u32 offset, const SgxdPdsProgram& p) {
+    std::memcpy(g.memory + g.screen_offset + offset, p.words, p.count * 4);
+}
+
+// The screens' programs, their index list, and each screen's vertex fetch and secondaries:
+// everything but the pixel primaries, which follow the textures.
+void WriteScreenPrograms() {
+    const SgxdRecipe& r = g.recipe;
+    u8* area = g.memory + g.screen_offset;
+    u64 words[4];
+    std::memcpy(area + ScreenVertexCode, words, sgxd_program_blit_vertex(words) * 8);
+    std::memcpy(area + ScreenFragmentCode, words, sgxd_program_screen_fragment(words) * 8);
+    g.screen_vertex = sgxd_program_doutu0(0, g.screen_offset + ScreenVertexCode -
+                                                 r.offset[SGXD_R_CV], 0);
+    g.screen_fragment = sgxd_program_doutu0(1, g.screen_offset + ScreenFragmentCode -
+                                                   r.offset[SGXD_R_CF], 0);
+    static const u16 indices[8] = {0, 1, 2, 3, 4, 5, 0, 0};
+    std::memcpy(area + ScreenIndices, indices, sizeof(indices));
+
+    SgxdPdsProgram pds{};
+    sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(0, 0, 0), &pds);
+    PutPds(ScreenVsecPds, pds);
+    const u32 vsec_units = pds.units;
+    sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(1, 0, 0), &pds);
+    PutPds(ScreenFsecPds, pds);
+    const u32 fsec_units = pds.units;
+    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    for (u32 slot = 0; slot < ScreenSlots; slot++) {
+        SgxdRecipeDrawPrograms& p = g.screen_programs[slot];
+        const SgxdVertexFetch fetch{ScreenVa(ScreenVertices + slot * 0x100), N * 4, N, 0};
+        sgxd_program_vertex_pds(&fetch, 1, g.screen_vertex, 0, &pds);
+        PutPds(ScreenVertexPds + slot * ScreenPdsSlot, pds);
+        p.vspds = ScreenVa(ScreenVertexPds + slot * ScreenPdsSlot);
+        p.vspds_units = pds.units;
+        p.vsec = ScreenVa(ScreenVsecPds);
+        p.vsec_units = vsec_units;
+        p.vsec_sa = 0;
+        p.fsec = ScreenVa(ScreenFsecPds);
+        p.fsec_units = fsec_units;
+        sgxd_program_vertex_dms(N, 0, 0, N, &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
+        p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
+        p.outselects = SGXD_PROGRAM_BLIT_OUTSELECTS;
+        p.texsize = SGXD_PROGRAM_BLIT_TEXSIZE;
+        const float viewport[6] = {DisplayWidth / 2.0f, DisplayWidth / 2.0f,
+                                   DisplayHeight / 2.0f, DisplayHeight / 2.0f, 0.0f, 1.0f};
+        std::memcpy(p.viewport, viewport, sizeof(viewport));
+        p.indices = ScreenVa(ScreenIndices);
+        p.primitive = SGXD_PROGRAM_TRIANGLES;
+    }
+}
+
+// The pixel primary sampling tex, written the first time tex is seen. A full table starts
+// over at its oldest entry.
+const State::PixelEntry& PixelEntryFor(const u32 tex[4]) {
+    for (u32 i = 0; i < g.pixel_used; i++) {
+        if (std::memcmp(g.pixel_entries[i].tex, tex, 16) == 0) {
+            return g.pixel_entries[i];
+        }
+    }
+    const u32 i = g.pixel_used < ScreenPixelEntries ? g.pixel_used++ : g.pixel_next;
+    g.pixel_next = (i + 1) % ScreenPixelEntries;
+    State::PixelEntry& e = g.pixel_entries[i];
+    SgxdPdsProgram pds{};
+    sgxd_program_screen_pixel_pds(g.screen_fragment, tex, &pds);
+    PutPds(ScreenPixelPds + i * ScreenPdsSlot, pds);
+    std::memcpy(e.tex, tex, 16);
+    e.va = ScreenVa(ScreenPixelPds + i * ScreenPdsSlot);
+    e.units = pds.units;
+    return e;
+}
+
+// The texture unit's format for a PICA framebuffer format: the code and swizzle that read its
+// bytes as the PICA stores them (SgxdBackend::Untile), and its bytes a pixel.
+bool ScreenFormat(u32 pica_format, u32& code, u32& swizzle, u32& bytes) {
+    switch (pica_format) {
+    case 0: // RGBA8, bytes A, B, G, R: U8U8U8U8 mirrored over the texel
+        code = 0x0c, swizzle = 2, bytes = 4;
+        return true;
+    case 1: // RGB8, bytes B, G, R: U8U8U8 mirrored
+        code = 0x98, swizzle = 1, bytes = 3;
+        return true;
+    case 2: // RGB565, red at 15:11
+        code = 0x05, swizzle = 1, bytes = 2;
+        return true;
+    case 3: // RGB5A1, alpha at bit 0
+        code = 0x04, swizzle = 2, bytes = 2;
+        return true;
+    case 4: // RGBA4, red in the top nibble
+        code = 0x02, swizzle = 2, bytes = 2;
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // Anonymous namespace
 
 bool Initialize(std::string* error) {
@@ -186,21 +314,20 @@ bool Initialize(std::string* error) {
         *error = "sgxd: the recipe does not take the display's size";
         return false;
     }
-    g.size = (g.kicker_offset + 0x1000 + 0xffff) & ~0xffffu;
+    g.screen_offset = g.kicker_offset + 0x1000;
+    g.size = (g.screen_offset + ScreenAreaSize + 0x3ffff) & ~0x3ffffu; // CDRAM's 256 KiB unit
 
-    g.block = sceKernelAllocMemBlock("sgxd_present_recipe", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW,
+    g.block = sceKernelAllocMemBlock("sgxd_present_recipe", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
                                      g.size, nullptr);
     g.cdram = sceKernelAllocMemBlock("sgxd_present_display", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
                                      DisplayBuffers * DisplayBufferSize, nullptr);
     void* base = nullptr;
     void* buffers = nullptr;
-    if (g.block < 0 || g.cdram < 0 || sceKernelGetMemBlockBase(g.block, &base) < 0 ||
-        sceKernelGetMemBlockBase(g.cdram, &buffers) < 0) {
-        *error = fmt::format("sgxd: no memory for the display ({:#010x}, {:#010x})",
-                             static_cast<u32>(g.block), static_cast<u32>(g.cdram));
-        FreeBlocks();
-        return false;
-    }
+    const bool got = g.block >= 0 && g.cdram >= 0 &&
+                     sceKernelGetMemBlockBase(g.block, &base) >= 0 &&
+                     sceKernelGetMemBlockBase(g.cdram, &buffers) >= 0;
+    ASSERT_MSG(got, "sgxd: no CDRAM for the display ({:#010x}, {:#010x})",
+               static_cast<u32>(g.block), static_cast<u32>(g.cdram));
     g.memory = static_cast<u8*>(base);
     g.buffers = static_cast<u8*>(buffers);
 
@@ -215,6 +342,7 @@ bool Initialize(std::string* error) {
     const float sa[4] = {2.0f / DisplayWidth, 2.0f / DisplayHeight, -1.0f, -1.0f};
     sgxd_recipe_write_vertex_sa(&r, g.memory, sa);
     std::memset(g.buffers, 0, DisplayBuffers * DisplayBufferSize);
+    WriteScreenPrograms();
 
     SgxdInfo info{};
     info.size = sizeof(info);
@@ -286,15 +414,13 @@ bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
         return false;
     }
     const u32 bytes = width * height * 4;
-    const u32 size = (bytes + 0xffff) & ~0xffffu;
-    g.texture = sceKernelAllocMemBlock("sgxd_present_texture", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW,
+    const u32 size = (bytes + 0x3ffff) & ~0x3ffffu; // CDRAM's 256 KiB unit
+    g.texture = sceKernelAllocMemBlock("sgxd_present_texture", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
                                        size, nullptr);
     void* base = nullptr;
-    if (g.texture < 0 || sceKernelGetMemBlockBase(g.texture, &base) < 0) {
-        Report("sgxd: no memory for a {}x{} texture ({:#010x})", width, height,
-               static_cast<u32>(g.texture));
-        return false;
-    }
+    const bool got = g.texture >= 0 && sceKernelGetMemBlockBase(g.texture, &base) >= 0;
+    ASSERT_MSG(got, "sgxd: no {} KiB of CDRAM for a {}x{} texture ({:#010x})", size >> 10,
+               width, height, static_cast<u32>(g.texture));
     std::memcpy(base, texels, bytes);
     const int mapped = sgxdMap(TextureVa, base, size, 0);
     if (mapped != 0) {
@@ -325,11 +451,59 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
     b.max_indices = MaxIndices;
     b.max_draws = MaxDraws;
     PutClear(b);
+    g.screens_in_frame = 0;
     g.in_frame = true;
 }
 
 Batch& CurrentBatch() {
     return g.batch;
+}
+
+bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_format, u32 x,
+                     u32 y, u32 w, u32 h) {
+    u32 code, swizzle, bytes;
+    Batch& b = g.batch;
+    // A linear texture's rows are its width rounded up to 8 texels: the framebuffer's stride is the
+    // texture's width, 240 texels or more, and u covers the first 240.
+    if (!g.in_frame || g.screens_in_frame >= ScreenSlots || b.draw_count >= b.max_draws ||
+        !ScreenFormat(pica_format, code, swizzle, bytes) || stride % bytes != 0 ||
+        stride / bytes < 240 || (stride / bytes) % 8 != 0 || w == 0 || h == 0 || columns == 0) {
+        return false;
+    }
+    const u32 texels = stride / bytes;
+    const float u_end = 240.0f / static_cast<float>(texels);
+    const u32 slot = g.screens_in_frame++;
+    // A picture the CPU drew is in memory before the GPU reads it.
+    GxmRenderer::SgxdCacheRange(cpu, stride * columns, SGXD_CACHE_CLEAN);
+
+    // Texel (u, v): u along a column, 240 pixels from the bottom of the upright picture to its
+    // top; v across the columns, left to right. So display x follows v and display y follows u
+    // reversed. Two triangles; x, y in clip space, z, w, a white colour (unused), u, v.
+    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    const float x0 = 2.0f * x / DisplayWidth - 1, x1 = 2.0f * (x + w) / DisplayWidth - 1;
+    const float y0 = 2.0f * y / DisplayHeight - 1, y1 = 2.0f * (y + h) / DisplayHeight - 1;
+    const float corner[6][4] = {
+        {x0, y0, 1, 0}, {x1, y0, 1, 1}, {x0, y1, 0, 0},
+        {x1, y0, 1, 1}, {x1, y1, 0, 1}, {x0, y1, 0, 0},
+    };
+    float* v = reinterpret_cast<float*>(g.memory + g.screen_offset + ScreenVertices + slot * 0x100);
+    for (u32 n = 0; n < 6; n++) {
+        const float words[N] = {corner[n][0], corner[n][1], 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                                corner[n][2] * u_end, corner[n][3]};
+        std::memcpy(v + n * N, words, sizeof(words));
+    }
+
+    // Point sampled: each display pixel shows the framebuffer pixel under its centre.
+    u32 tex[4];
+    sgxd_recipe_texture_words_format(va, texels, columns, 0, code, swizzle, tex);
+    const State::PixelEntry& e = PixelEntryFor(tex);
+    SgxdRecipeDrawPrograms& p = g.screen_programs[slot];
+    p.fprim = e.va;
+    p.fprim_units = e.units;
+    // Opaque, DCMP ALWAYS, no depth write (the blit's ISP word).
+    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    b.draws[b.draw_count++] = SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, &p};
+    return true;
 }
 
 void EndFrame() {
@@ -350,7 +524,8 @@ void EndFrame() {
     }
     sgxd_recipe_set_target(&r, g.memory, DisplayVa + g.back * DisplayBufferSize, DisplayWidth);
 #ifdef VITA_DIAGNOSTICS
-    // The last present's 3D reads the region arrays restage refills: it must be done.
+    // The last present's 3D reads this recipe's memory, which the restage and this list set
+    // up again: it must be done.
     if (Async() && g.frame_index > 0 &&
         (sgxd_session_pending() == &r || !sgxd_chain_reached(g.shown_fence))) {
         static u32 reported;

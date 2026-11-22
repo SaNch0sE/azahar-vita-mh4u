@@ -288,6 +288,54 @@ void EmuWindowVita::SwapBuffers() {
     Present(render_ui.load(std::memory_order_acquire));
 }
 
+void EmuWindowVita::PresentGuestScreens(const GuestScreen (&next)[2]) {
+    screens[0] = next[0];
+    screens[1] = next[1];
+    have_screens = true;
+    Present(render_ui.load(std::memory_order_acquire));
+}
+
+void EmuWindowVita::ForgetGuestScreens() {
+    have_screens = false;
+}
+
+// Each screen into its rectangle of the layout, sampled from guest memory where the guest
+// points the LCD. An LCD fill, or a screen no framebuffer
+// was named for, shows the frame's black clear.
+void EmuWindowVita::DrawGuestScreens() {
+    const auto& layout = GetFramebufferLayout();
+    const bool enabled[2] = {layout.top_screen_enabled, layout.bottom_screen_enabled};
+    const Common::Rectangle<u32> rects[2] = {layout.top_screen, layout.bottom_screen};
+    for (u32 i = 0; i < 2; i++) {
+        const GuestScreen& s = screens[i];
+        const Common::Rectangle<u32>& r = rects[i];
+        std::array<u32, 5>& seen = screens_seen[i];
+        const bool flipped = s.address == seen[0] || s.address == seen[1];
+        if (!flipped || s.format != seen[2] || s.stride != seen[3] || (s.fill ? 1u : 0u) != seen[4]) {
+            seen = {s.address, seen[0], s.format, s.stride, s.fill ? 1u : 0u};
+            LOG_INFO(Frontend,
+                     "screen {}: framebuffer {:#010x}, format {}, stride {}, {} columns{}, into "
+                     "{}x{} at ({}, {})",
+                     i, s.address, s.format, s.stride, s.columns,
+                     s.fill ? fmt::format(", filled {:02x}{:02x}{:02x}", s.fill_r, s.fill_g,
+                                          s.fill_b)
+                            : std::string{},
+                     r.GetWidth(), r.GetHeight(), r.left, r.top);
+        }
+        if (!enabled[i] || s.fill || s.address == 0 || s.pixels == nullptr) {
+            continue;
+        }
+        if (!SgxdPresent::DrawGuestScreen(s.address, s.pixels, s.stride, s.columns, s.format,
+                                          r.left, r.top, r.GetWidth(), r.GetHeight()) &&
+            screens_skipped++ % 600 == 0) {
+            LOG_WARNING(Frontend,
+                        "screen {} not drawn: framebuffer {:#010x}, format {}, stride {} ({} "
+                        "times)",
+                        i, s.address, s.format, s.stride, screens_skipped);
+        }
+    }
+}
+
 int EmuWindowVita::TakeUiAction() {
     return pending_ui_action.exchange(0, std::memory_order_acq_rel);
 }
@@ -302,6 +350,10 @@ void EmuWindowVita::Present(Ui* ui) {
     }
     present_us[0].fetch_add(Since(t), std::memory_order_relaxed);
     SgxdPresent::BeginFrame(0, 0, 0);
+    if (have_screens) {
+        DrawGuestScreens();
+    }
+    present_us[1].fetch_add(Since(t), std::memory_order_relaxed);
     // A frame being dumped leaves the menu out.
     if (ui != nullptr && !SgxdPresent::DumpPending()) {
         ui->Draw();

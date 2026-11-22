@@ -17,6 +17,10 @@
 #define AZAHAR_PERM_R 1u
 #define AZAHAR_PERM_W 2u
 #define AZAHAR_PERM_X 4u
+// The range's pages take the memory attributes the app's own mapping of them has (read back with
+// ATS1CUR), not write-back: for memory the app holds uncached, such as a CDRAM block. Two views
+// of one page with different cacheability are unpredictable on ARMv7. Since version 5.
+#define AZAHAR_PERM_APP_ATTR 8u
 
 // One range of the app's memory to appear at a guest virtual address. user_va, guest_va and size
 // are 4 KB aligned; the pages behind user_va need not be physically contiguous — the plugin

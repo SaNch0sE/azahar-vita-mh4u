@@ -4,8 +4,11 @@
 
 #pragma once
 
+#include <array>
 #include "common/common_types.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "video_core/pica/regs_external.h"
+#include "video_core/pica/regs_lcd.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Frontend {
@@ -46,6 +49,11 @@ public:
 
     /// Finalize rendering the guest frame and draw into the presentation texture
     virtual void SwapBuffers() = 0;
+
+    /// Shows the latest frame at a VBlank, with the guest's screens as the VBlank found them:
+    /// both framebuffer configurations and LCD fills (top, bottom).
+    virtual void PresentFrame([[maybe_unused]] const std::array<Pica::FramebufferConfig, 2>& fb,
+                              [[maybe_unused]] const std::array<Pica::ColorFill, 2>& fill) {}
 
     /// Draws the latest frame to the window waiting timeout_ms for a frame to arrive (Renderer
     /// specific implementation)
