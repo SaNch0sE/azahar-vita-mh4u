@@ -148,6 +148,10 @@ private:
 
     void VBlankCallback(uintptr_t user_data, s64 cycles_late);
 
+    /// Has the renderer keep [addr, addr + size) where the CPU reaches it uncached, if it would
+    /// (RendererBase::WouldMakeUncached), before the GPU writes or shows it.
+    void KeepUncached(PAddr addr, u32 size, bool overwritten);
+
     /// Queues op on the render thread.
     /// What a render thread op is, for `perflog`'s split of the render thread's work.
     enum class OpKind : u32 { CmdList, RegWrite, Fill, Transfer, Count };

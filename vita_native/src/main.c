@@ -84,6 +84,16 @@ static uint32_t translate(uint32_t va, int which) {
 #define PAR_FS(p) (((p) >> 1) & 0x3F)
 #define PAR_PA(p) ((p) & 0xFFFFF000u)
 
+// An ATS through a 64 KiB large-page descriptor returns the large page's first page (PAR bits
+// 15:12 zero). base_par translates the 64 KiB-aligned VA; where both agree, the VA's bits go in.
+static inline uint32_t par_large_page(uint32_t va, uint32_t par, uint32_t base_par) {
+    if ((va & 0xF000u) && !PAR_FAULTED(par) && !PAR_FAULTED(base_par) &&
+        PAR_PA(base_par) == PAR_PA(par)) {
+        return par | (va & 0xF000u);
+    }
+    return par;
+}
+
 
 // The affinity mask bit for one core, as SceKernelThreadOptParam wants it.
 #define CPU_AFFINITY(n) (0x10000 << (n))
@@ -320,6 +330,9 @@ static uint32_t active_cpu_mask(void) {
 }
 
 // 2: the sgxd calls (sgxd.c). 3: SCE-style error codes (azahar_native.h, AZAHAR_ERROR).
+// 7: azaharAdopt, azaharReback and azaharRebackRestore: guest FCRAM under tables of ours, and
+//    pages of it moved onto other physical pages (reback.c).
+// 8: azaharRebackReturn, moved pages back on their own.
 int azaharVersion() {
     return 5;
 }
@@ -330,6 +343,7 @@ int azaharVersion() {
 
 #include "native.c"
 #include "sgxd.c"
+#include "reback.c"
 
 // ---------------------------------------------------------------------------- module
 

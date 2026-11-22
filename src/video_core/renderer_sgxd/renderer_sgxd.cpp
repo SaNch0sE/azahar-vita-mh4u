@@ -12,7 +12,7 @@ namespace GxmRenderer {
 
 RendererSgxd::RendererSgxd(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window)
     : VideoCore::RendererBase{system, window, nullptr}, memory{system.Memory()},
-      guest_memory{system.Memory()}, rasterizer{pica, system.Memory()} {}
+      guest_memory{system.Memory()}, rasterizer{pica, system.Memory(), guest_memory} {}
 
 RendererSgxd::~RendererSgxd() {
     // The GPU's view of guest memory goes with guest_memory.
@@ -39,6 +39,7 @@ void RendererSgxd::PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb
         const bool mapped = inside(Memory::VRAM_PADDR, Memory::VRAM_SIZE) ||
                             inside(Memory::FCRAM_PADDR, Memory::FCRAM_SIZE);
         s.pixels = mapped ? memory.GetPhysicalPointer(s.address) : nullptr;
+        s.uncached = mapped && guest_memory.IsUncached(s.address, s.stride * s.columns);
         s.fill = fill[i].is_enabled != 0;
         s.fill_r = static_cast<u8>(fill[i].color_r);
         s.fill_g = static_cast<u8>(fill[i].color_g);
@@ -46,6 +47,14 @@ void RendererSgxd::PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb
     }
     // No swap timing: PerfStats' swap counters are the emulation thread's.
     render_window.PresentGuestScreens(screens);
+}
+
+bool RendererSgxd::WouldMakeUncached(PAddr addr, u32 size) const {
+    return guest_memory.WouldMove(addr, size);
+}
+
+void RendererSgxd::MakeUncached(PAddr addr, u32 size, bool overwritten) {
+    guest_memory.MakeUncached(addr, size, overwritten);
 }
 
 void RendererGxm::SwapBuffers() {

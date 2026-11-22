@@ -175,7 +175,10 @@ public:
     // Aliasable so that the native ARM backend can map these same pages at the addresses the guest
     // uses. Falls back to a plain allocation where the host cannot alias, which every other
     // backend is indifferent to.
-    Common::HostSharedMemory fcram{Memory::FCRAM_SIZE, "azahar-fcram"};
+    // A block of its own where the host has such a thing (the Vita), so that the GPU renderer
+    // can move pages of it to the GPU's own memory.
+    Common::HostSharedMemory fcram{Memory::FCRAM_SIZE, "azahar-fcram",
+                                   Common::HostSharedMemory::Placement::OwnBlock};
     // VRAM in the GPU's own memory where there is such a thing (the Vita's CDRAM): the GPU
     // renders into it, and the CPU sees what it wrote with no cache maintenance.
     Common::HostSharedMemory vram{Memory::VRAM_SIZE, "azahar-vram",

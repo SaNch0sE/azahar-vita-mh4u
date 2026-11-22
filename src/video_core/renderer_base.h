@@ -55,6 +55,25 @@ public:
     virtual void PresentFrame([[maybe_unused]] const std::array<Pica::FramebufferConfig, 2>& fb,
                               [[maybe_unused]] const std::array<Pica::ColorFill, 2>& fill) {}
 
+    /// From the emulation thread: whether the renderer would rather keep [addr, addr + size)
+    /// somewhere the CPU reaches uncached, because the GPU is about to write it (a display
+    /// transfer's output) or show it (a framebuffer the LCD names). The GPU then calls
+    /// MakeUncached, the guest stopped.
+    virtual bool WouldMakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] u32 size) const {
+        return false;
+    }
+    /// See WouldMakeUncached. `overwritten`: the GPU is about to write the whole range.
+    virtual void MakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] u32 size,
+                              [[maybe_unused]] bool overwritten) {}
+    /// From the emulation thread at vblank, with the guest stopped: a frame has ended. Whether
+    /// memory MakeUncached moved has gone unused long enough to go back, which the GPU then
+    /// has done by ReturnUncached.
+    virtual bool UncachedFrameEnded() {
+        return false;
+    }
+    /// See UncachedFrameEnded.
+    virtual void ReturnUncached() {}
+
     /// Draws the latest frame to the window waiting timeout_ms for a frame to arrive (Renderer
     /// specific implementation)
     virtual void TryPresent(int timeout_ms, bool is_secondary) = 0;

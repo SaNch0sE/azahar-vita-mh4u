@@ -179,6 +179,9 @@ public:
         u32 columns;
         u32 format;
         const u8* pixels;
+        /// The CPU reaches the framebuffer uncached (guest VRAM, or FCRAM the renderer moved to
+        /// the GPU's memory): nothing to clean before the GPU samples it.
+        bool uncached;
         bool fill;
         u8 fill_r, fill_g, fill_b;
     };

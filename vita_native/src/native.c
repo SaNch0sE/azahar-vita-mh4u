@@ -256,6 +256,15 @@ static uint32_t azahar_vec_va;      // where the vector page appears in our tabl
 static unsigned azahar_l2_used;
 static uint32_t azahar_l2_slot[AZAHAR_L2_COUNT]; // which L1 index each L2 serves
 
+// ---------------------------------------------------------------------------- windows
+
+#include "windows.h"
+
+// The guest's windows onto the app's memory, as map_range made them and edits cut them.
+#define AZAHAR_WINDOWS 256u
+static AzaharWindow azahar_window_list[AZAHAR_WINDOWS];
+static AzaharWindows azahar_windows = {azahar_window_list, 0, AZAHAR_WINDOWS};
+
 static SceUID azahar_thread = -1;
 static SceUID azahar_client_pid = -1;      // the process azaharTakeCore ran for
 static SceUID azahar_proc_handler = -1;    // registered once, on the first take
@@ -872,6 +881,13 @@ static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_
     uint32_t par = 0;
     if (!want_par && ksceKernelVAtoPA((const void *)(uintptr_t)uva, &p) >= 0 && p) {
         *pa = (uint32_t)p & 0xFFFFF000u;
+        // Sony's VAtoPA may be an ATS as well: the 64 KiB base the same way (par_large_page).
+        uintptr_t base = 0;
+        if ((uva & 0xF000u) &&
+            ksceKernelVAtoPA((const void *)(uintptr_t)(uva & ~0xFFFFu), &base) >= 0 &&
+            ((uint32_t)base & 0xFFFFF000u) == *pa) {
+            *pa |= uva & 0xF000u;
+        }
         *how = 0;
     } else {
         SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
@@ -879,6 +895,9 @@ static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_
         wr_dacr(dacr_grant_all(d));
         asm volatile("mcr p15, 0, %0, c7, c8, 2 \n isb" ::"r"(uva) : "memory"); // ATS1CUR
         par = rd_par();
+        // Its 64 KiB base (par_large_page).
+        asm volatile("mcr p15, 0, %0, c7, c8, 2 \n isb" ::"r"(uva & ~0xFFFFu) : "memory");
+        par = par_large_page(uva, par, rd_par());
         wr_dacr(d);
         ksceKernelCpuResumeIntr(st);
         *par_out = par;
@@ -918,10 +937,13 @@ static int azahar_stop_resident(void) {
 }
 
 static void sgxd_on_proc_gone(SceUID pid);   // sgxd.c
+static void reback_on_proc_gone(SceUID pid); // reback.c
+static uint32_t reback_attr_for(uint32_t pa); // reback.c
 
 // The client process is gone: same teardown as azaharRelease, which the two paths share below.
 static int azahar_on_proc_gone(SceUID pid) {
     sgxd_on_proc_gone(pid);
+    reback_on_proc_gone(pid);
     if (pid != azahar_client_pid || azahar_state == ST_NONE) {
         return 0;
     }
@@ -1142,6 +1164,12 @@ static int l2_for(uint32_t idx, int create) {
     return (int)t;
 }
 
+// The guest's window for the first `done` bytes of a range map_range wrote; the pages past
+// them still show what they showed.
+static int map_range_window(const AzaharRange *rg, uint32_t done) {
+    return done ? windows_add(&azahar_windows, rg->guest_va, rg->user_va, done) : 0;
+}
+
 // One range of the app's memory into the guest's table: every page resolved and cleaned, its
 // descriptor written, the megabyte's L2 created on first use. Used at map and for MAP edits.
 static int map_range(const AzaharRange *rg, unsigned label) {
@@ -1154,6 +1182,7 @@ static int map_range(const AzaharRange *rg, unsigned label) {
         const int t = l2_for(gva >> 20, 1);
         if (t < 0) {
             emit("  out of L2 tables at guest %08x\n", gva);
+            map_range_window(rg, off);
             return AZAHAR_ERR_TABLE;
         }
         uint32_t pa = 0, par = 0;
@@ -1162,11 +1191,16 @@ static int map_range(const AzaharRange *rg, unsigned label) {
         if (azahar_user_page(uva, &pa, &how, &par, app_attr) != 0) {
             emit("  range %u: user va %08x does not translate (par %08x, VAtoPA refused)\n",
                  label, uva, par);
+            map_range_window(rg, off);
             return AZAHAR_ERR_PAGE;
         }
-        const uint32_t attr = app_attr ? azahar_attr_from_par(par) : AZAHAR_ATTR_WB;
+        // A page azaharReback moved onto CDRAM is mapped as the app now maps it, whatever the
+        // range asked for: two views of one page with different cacheability are unpredictable.
+        const uint32_t moved = reback_attr_for(pa);
+        const uint32_t attr = moved ? moved : app_attr ? azahar_attr_from_par(par) : AZAHAR_ATTR_WB;
         if (!attr) {
             emit("  range %u: user va %08x is not Normal memory (par %08x)\n", label, uva, par);
+            map_range_window(rg, off);
             return AZAHAR_ERR_PAGE;
         }
         if (off == 0) {
@@ -1178,6 +1212,10 @@ static int map_range(const AzaharRange *rg, unsigned label) {
         azahar_l2[(unsigned)t * 256u + ((gva >> 12) & 0xFFu)] =
             azahar_small_page(pa, rg->perm, attr);
         pages++;
+    }
+    if (map_range_window(rg, rg->size) != 0) {
+        emit("  range %u: out of window records (%u)\n", label, AZAHAR_WINDOWS);
+        return AZAHAR_ERR_ALLOC;
     }
     emit("  range %u: user %08x -> guest %08x, %u page(s) over %u MB, perm %c%c%c, first pa "
          "%08x (%s)\n",
@@ -1509,6 +1547,7 @@ static int build_table(const AzaharMapRequest *req) {
 
     // The guest windows.
     azahar_l2_used = 0;
+    azahar_windows.count = 0;
     for (unsigned i = 0; i < AZAHAR_L2_COUNT * 256; i++) {
         azahar_l2[i] = 0;
     }
@@ -1806,6 +1845,12 @@ int azaharEdit(const AzaharEditRequest *user_req) {
             break;
         case AZAHAR_EDIT_UNMAP:
         case AZAHAR_EDIT_PROTECT: {
+            if (op == AZAHAR_EDIT_UNMAP &&
+                windows_remove(&azahar_windows, rg->guest_va, rg->size) != 0) {
+                emit("  out of window records (%u)\n", AZAHAR_WINDOWS);
+                ret = AZAHAR_ERR_ALLOC;
+                break;
+            }
             unsigned done = 0, missing = 0;
             // The descriptors this edit actually writes, so the clean below can cover them
             // rather than the whole table array.

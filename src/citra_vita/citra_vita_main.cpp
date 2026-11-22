@@ -50,23 +50,16 @@
 #include "core/movie.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
+#include "video_core/renderer_gxm/renderer_gxm.h"
 
 // The default heap is nowhere near enough for a 3DS: FCRAM alone is 128 MB, and the caches and
 // the surface storage sit on top of it. Newlib reads this at startup.
 extern "C" {
-// Old-3DS FCRAM is 128 MB (memory.cpp), so the runtime fits in ~200 MB and this leaves room
-// in the game partition - about 238 MB of USER_RW, measured with sceKernelGetFreeMemorySize -
-// for the thread stacks and the GPU allocations that come out of it alongside this.
-// Sized against the extended-memory budget (ATTRIBUTE2=12 in the param.sfo, +109 MB). The
-// guest's 128 MB FCRAM and 6 MB VRAM are ordinary mallocs inside this heap and the emulator's
-// working set sits on top, which measured a 207 MB peak - so the old 210 MB ran out, and a
-// level load's transient took it over into std::bad_alloc.
-//
-// Not more than this, though: newlib takes the whole heap as one memblock at startup and the
-// kernel commits real pages for it, so every megabyte here is a megabyte the *system* cannot
-// have. At 300 MB, 100 MB of it never allocated, the console had trouble the moment it wanted
-// to start its own services. 240 MB clears the measured peak by ~33 MB and leaves the rest.
-unsigned int _newlib_heap_size_user = 240 * 1024 * 1024;
+// The newlib heap: guest VRAM and the emulator's working set live in it, guest FCRAM in a block of
+// its own (HostSharedMemory::OwnBlock). newlib takes the whole heap as one memblock at startup and
+// the kernel commits it, so every megabyte here is one the system cannot have (at 300 MB its own
+// services failed to start).
+unsigned int _newlib_heap_size_user = 112 * 1024 * 1024;
 
 // Default stack for every pthread, and so for every std::thread: the GPU thread, the two
 // rasterizer workers, the service threads. vitasdk's built-in default is 32 KB (the fallback
@@ -366,6 +359,31 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const auto c = GxmRenderer::SgxdTakeCacheTimes();
                     LOG_INFO(Frontend, "perf: cache ops {:.1f} ms in {} for {} KiB", c.us / 1e3,
                              c.calls, c.bytes / 1024);
+                    // By site: done (time, calls, KiB), and not needed because the range is
+                    // uncached (calls, KiB).
+                    static constexpr const char* site_names[] = {
+                        "vertices", "transfer before", "transfer after", "screens", "other"};
+                    std::string sites;
+                    for (u32 i = 0; i < static_cast<u32>(SgxdRenderer::CacheSite::Count); i++) {
+                        const auto& s = c.sites[i];
+                        if (s.calls == 0 && s.skipped_calls == 0) {
+                            continue;
+                        }
+                        sites += fmt::format("{}{} {:.1f} ms in {} for {} KiB, {} skipped for {} KiB",
+                                             sites.empty() ? "" : "; ", site_names[i],
+                                             s.us / 1e3, s.calls, s.bytes / 1024, s.skipped_calls,
+                                             s.skipped_bytes / 1024);
+                    }
+                    LOG_INFO(Frontend, "perf: cache sites: {}", sites.empty() ? "none" : sites);
+                    if (auto* gxm = dynamic_cast<GxmRenderer::RendererGxm*>(
+                            &system.GPU().Renderer())) {
+                        const auto m = gxm->TakeMoveStats();
+                        LOG_INFO(Frontend,
+                                 "perf: FCRAM to CDRAM: {} move(s), {} page(s), {} copied; {} "
+                                 "return(s), {} page(s); {:.1f} ms; pool {} of {} pages",
+                                 m.calls, m.pages, m.copied_pages, m.returns, m.returned_pages,
+                                 m.us / 1e3, m.pool_pages_used, m.pool_pages);
+                    }
                 }
 #endif
             }

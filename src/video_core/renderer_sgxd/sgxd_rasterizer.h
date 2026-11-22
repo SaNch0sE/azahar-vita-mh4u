@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 #include "video_core/rasterizer_accelerated.h"
+#include "video_core/renderer_gxm/guest_gpu_memory.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 
@@ -36,7 +37,8 @@ namespace GxmRenderer {
  */
 class RasterizerSgxd : public VideoCore::RasterizerAccelerated {
 public:
-    explicit RasterizerGxm(Pica::PicaCore& pica, Memory::MemorySystem& memory);
+    explicit RasterizerSgxd(Pica::PicaCore& pica, Memory::MemorySystem& memory,
+                           GuestGpuMemory& guest_memory);
     ~RasterizerGxm() override;
 
     void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
@@ -50,6 +52,17 @@ public:
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
+    /// The GPU's MMU onto the pages a page move or return put under the CPU's views. Returns the fence
+    /// the work queued with it is done by.
+    u32 RemapMoved(const u32* pte_va, const u32* pte, u32 count);
+    /// Before a page move: a DMA into cached memory still queued retires first.
+    void MoveWaits();
+    [[nodiscard]] bool MovedFenceReached(u32 fence) const {
+        return backend.RenderReached(fence);
+    }
+    void MovedFenceWait(u32 fence) {
+        backend.RenderWait(fence, "a moved page's pool page");
+    }
     bool AccelerateDrawBatch(bool is_indexed) override;
     void NotifyP3D() override;
     std::vector<std::pair<PAddr, u32>> TakeCachedReads() override;
@@ -111,6 +124,10 @@ private:
     /// The same for the proctex colour map, alpha map, colour and colour-difference tables.
     void SyncLutProcTex();
 
+    GuestGpuMemory& guest_memory;
+    /// [addr, addr + size) in FCRAM moves to CDRAM where it is not yet, for the work about to use it:
+    /// its page holds keep the guest off it through the copy.
+    void KeepUncached(PAddr addr, u32 size);
     SgxdBackend backend;
     /// The pending clears, disjoint. A fill into a full table replaces the oldest.
     static constexpr u32 MaxClears = 8;

@@ -284,12 +284,13 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
     sgxd_recipe_restage(&recipe, memory);
 #ifdef __vita__
     for (const CachedRange& range : cached) {
-        SgxdCacheRange(range.cpu, range.bytes, SGXD_CACHE_CLEAN);
+        SgxdCacheRange(range.cpu, range.bytes, SGXD_CACHE_CLEAN, CacheSite::Vertices);
     }
     // A store's lines leave the cache before the GPU writes under them, and again after, so
     // the CPU reads what the GPU wrote (the second is an invalidate of clean lines).
     for (const Store& store : stores) {
-        SgxdCacheRange(store.cpu, store.bytes, SGXD_CACHE_CLEAN_INVALIDATE);
+        SgxdCacheRange(store.cpu, store.bytes, SGXD_CACHE_CLEAN_INVALIDATE,
+                       CacheSite::TransferBefore);
     }
     char failed[160] = "";
     SgxdSessionRender render{};
@@ -360,7 +361,8 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
     }
     ASSERT_MSG(ok, "sgxd: pass {} of {} draws stopped: {}", passes, draw_count, failed);
     for (const Store& store : stores) {
-        SgxdCacheRange(store.cpu, store.bytes, SGXD_CACHE_CLEAN_INVALIDATE);
+        SgxdCacheRange(store.cpu, store.bytes, SGXD_CACHE_CLEAN_INVALIDATE,
+                       CacheSite::TransferAfter);
     }
     if (ta_us) {
         *ta_us = render.ta_us;

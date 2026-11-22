@@ -92,6 +92,23 @@ typedef struct AzaharEditRequest {
     AzaharRange range;     // user_va is ignored for UNMAP; perm is ignored for UNMAP
 } AzaharEditRequest;
 
+// Moving pages of the app's memory onto other physical pages of its own (reback.c). First
+// azaharAdopt takes a block of the app's (1 MiB aligned, at most 256 MiB, all of it the app's
+// writable memory) under translation tables of the module's: the same pages and attributes.
+// Then azaharReback moves pages of it: the pages at user_va take the physical pages behind
+// pool_va, at the same virtual address, with the pool's memory attributes, and the guest's
+// windows follow. The GPU's mapping keeps the old pages: the app remaps it (sgxdPte) in its
+// queue's order, so the GPU need not be idle (version 53). For guest framebuffers in CDRAM: the
+// GPU writes and reads them with no cache maintenance. Page aligned, at most 256 pages a call;
+// the pool pages must stay the app's for as long as the move holds. Returns the pages moved.
+// Version 7.
+#define AZAHAR_REBACK_COPY 1u   // the old contents go along; without it the new pages keep theirs
+typedef struct AzaharRebackRequest {
+    uint32_t user_va;
+    uint32_t pool_va;
+    uint32_t size;
+    uint32_t flags;             // AZAHAR_REBACK_*
+} AzaharRebackRequest;
 // Error codes, beyond the kernel's own. They are SCE-style, bit 31 set and bit 30 clear: the
 // syscall return path clears bit 30 of a negative result, so a plain negative number reaches
 // user code changed (measured: -1102, 0xFFFFFBB2, arrives as 0xBFFFFBB2) and would
@@ -130,6 +147,19 @@ int azaharVersion();
 /// unloads a kernel module only by the UID its load gave the loading process, and an update's
 /// process is not that one. Version 67.
 int azaharModuleUid(void);
+/// See AzaharRebackRequest. Version 7.
+int azaharAdopt(uint32_t user_va, uint32_t size);
+int azaharReback(const AzaharRebackRequest *req);
+/// Puts moved pages of [user_va, user_va + size) back on the physical pages they had before
+/// azaharReback, with their attributes and contents, and the guest's windows follow; the GPU's
+/// mapping is the app's to remap, as a move's (version 53), and the pool pages are free for
+/// another move once the GPU no longer reads them. Every page must be a moved one; page
+/// aligned, at most 256 pages. Returns the pages returned. Version 8.
+int azaharRebackReturn(uint32_t user_va, uint32_t size);
+/// Gives the adopted block back to the kernel's tables, for the teardown: after it the app's
+/// pages are its old ones again, with whatever they held before any move. Also done when the
+/// process ends. Version 7.
+int azaharRebackRestore(void);
 
 #ifdef __cplusplus
 }

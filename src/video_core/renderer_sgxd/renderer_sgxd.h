@@ -32,6 +32,29 @@ public:
 
     void PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb,
                       const std::array<Pica::ColorFill, 2>& fill) override;
+    bool WouldMakeUncached(PAddr addr, u32 size) const override;
+    void MakeUncached(PAddr addr, u32 size, bool overwritten) override;
+    bool UncachedFrameEnded() override {
+        return guest_memory.EndFrame();
+    }
+    void ReturnUncached() override {
+        guest_memory.ReturnUnused();
+    }
+    /// The render side's part in the page moves (GuestGpuMemory::MoveHooks; RenderThread).
+    void SetMoveHooks(GuestGpuMemory::MoveHooks hooks) {
+        guest_memory.SetMoveHooks(std::move(hooks));
+    }
+
+#ifdef VITA_DIAGNOSTICS
+    /// The moves of guest FCRAM to CDRAM since the last call (`perflog`).
+    GuestGpuMemory::MoveStats TakeMoveStats() {
+        return guest_memory.TakeMoveStats();
+    }
+    /// GuestGpuMemory::DescribePages, for a fault's report.
+    [[nodiscard]] std::string DescribePages(PAddr addr, u32 size) const {
+        return guest_memory.DescribePages(addr, size);
+    }
+#endif
 
 private:
     Memory::MemorySystem& memory;

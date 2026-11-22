@@ -16,6 +16,10 @@ azaharnative:
         - azaharRelease: 0x3C1A7E04
         - azaharEdit: 0x3C1A7E05
         - azaharVersion: 0x3C1A7E0A
+        - azaharReback: 0x3C1A7E0C
+        - azaharRebackRestore: 0x3C1A7E0D
+        - azaharAdopt: 0x3C1A7E0E
+        - azaharRebackReturn: 0x3C1A7E0F
         - sgxdTake: 0x3C1A7E10
         - sgxdRelease: 0x3C1A7E11
         - sgxdSubmit: 0x3C1A7E12

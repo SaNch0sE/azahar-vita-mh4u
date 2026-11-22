@@ -34,10 +34,19 @@ public:
     enum class Placement {
         Heap,
         PhysicallyContiguous,
+        /// A kernel block of its own on the Vita, whole megabytes on megabyte boundaries, instead
+        /// of the heap: guest FCRAM, whose translation the native module takes over so that
+        /// pages of it can move to CDRAM (azaharAdopt). Falls back to the heap.
+        OwnBlock,
         /// The GPU's own memory, CDRAM on the Vita, which the CPU reads and writes uncached: guest
         /// VRAM, so that what the GPU writes there needs no CPU cache maintenance. Falls back to
         /// uncached main memory, then to the heap.
         GpuLocal,
+        /// GpuLocal, else uncached main memory (USER_RW_UNCACHE), which the CPU reaches uncached
+        /// as well and the GPU reads across the bus: blocks made late, when CDRAM may be full,
+        /// and only for the rare titles that need them (GSP's VRAM backup at an applet, the
+        /// moved-FCRAM pool past its first 8 MiB). The user's exception to "no fallbacks".
+        GpuLocalOrUncached,
     };
 
     explicit HostSharedMemory(std::size_t size, const char* name,
@@ -59,6 +68,12 @@ public:
     /// Whether this block can be mapped at a second host address.
     bool SupportsAliasing() const noexcept {
         return fd >= 0;
+    }
+
+    /// Whether the block is a kernel block of the type its placement asked for, not the heap
+    /// fallback. For GpuLocal: memory the CPU reaches uncached.
+    bool HasPlacement() const noexcept {
+        return memblock >= 0;
     }
 
     /**

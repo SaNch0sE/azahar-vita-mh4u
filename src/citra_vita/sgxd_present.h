@@ -50,12 +50,13 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b);
 [[nodiscard]] Batch& CurrentBatch();
 
 /// Up to two guest screens a frame, drawn in the frame being built under the draws after them.
-/// The framebuffer at GPU address va (its PICA physical address: guest
-/// memory is mapped there) holds `columns` columns of 240 pixels, stride bytes apart, in the
-/// PICA's pixel format pica_format (a Pica::PixelFormat's value); the texture unit reads it as
-/// it is, and the quad turns it upright over the display rectangle (x, y, w, h). cpu, the same
-/// bytes as the CPU sees them, is cleaned from its cache first. Returns false, drawing
-/// nothing, for a format, stride or third screen it does not take.
+/// The framebuffer at GPU address va (its PICA physical
+/// address: guest memory is mapped there) holds `columns` columns of 240 pixels, stride bytes
+/// apart, in the PICA's pixel format pica_format (a Pica::PixelFormat's value); the texture unit
+/// reads it as it is, and the quad turns it upright over the display rectangle (x, y, w, h). cpu,
+/// the same bytes as the CPU sees them, is cleaned from its cache first; nullptr for memory the CPU
+/// reaches uncached. Returns false, drawing nothing, for a format, stride or third screen it
+/// does not take.
 bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_format, u32 x,
                      u32 y, u32 w, u32 h);
 /// Renders the batch, waits for the GPU, and queues the frame for the next vblank.

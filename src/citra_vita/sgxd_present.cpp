@@ -474,7 +474,12 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
     const float u_end = 240.0f / static_cast<float>(texels);
     const u32 slot = g.screens_in_frame++;
     // A picture the CPU drew is in memory before the GPU reads it.
-    GxmRenderer::SgxdCacheRange(cpu, stride * columns, SGXD_CACHE_CLEAN);
+    if (cpu != nullptr) {
+        SgxdRenderer::SgxdCacheRange(cpu, stride * columns, SGXD_CACHE_CLEAN,
+                                    SgxdRenderer::CacheSite::Screens);
+    } else {
+        SgxdRenderer::SgxdCacheSkipped(SgxdRenderer::CacheSite::Screens, stride * columns);
+    }
 
     // Texel (u, v): u along a column, 240 pixels from the bottom of the upright picture to its
     // top; v across the columns, left to right. So display x follows v and display y follows u
@@ -554,7 +559,8 @@ void EndFrame() {
     static u32 dump_index = 0;
     if (dump_requested) {
         dump_requested = false;
-        GxmRenderer::SgxdCacheRange(buffer, DisplayWidth * DisplayHeight * 4, SGXD_CACHE_INVALIDATE);
+        GxmRenderer::SgxdCacheRange(buffer, DisplayWidth * DisplayHeight * 4, SGXD_CACHE_INVALIDATE,
+                                    GxmRenderer::CacheSite::Other);
         char path[64];
         std::snprintf(path, sizeof(path), "ux0:data/azahar/frame_%02u.ppm", dump_index++ % 20);
         WriteDisplayPpm(path, buffer);

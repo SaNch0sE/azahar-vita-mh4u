@@ -1183,6 +1183,16 @@ void VramBackupHandler::RestoreVRAMWithState(State state) {
     }
 }
 
+u8* VramBackupHandler::Bank(size_t bank_id) {
+    ASSERT(bank_id < BANK_COUNT);
+    if (!vram_backup) {
+        vram_backup = std::make_unique<Common::HostSharedMemory>(
+            BANK_COUNT * VRAM_BACKUP_BANK_SIZE, "azahar-vram-backup",
+            Common::HostSharedMemory::Placement::GpuLocalOrUncached);
+    }
+    return vram_backup->Data() + bank_id * VRAM_BACKUP_BANK_SIZE;
+}
+
 void VramBackupHandler::SaveVRAMBank(size_t bank_id) {
     ASSERT(bank_id < BANK_COUNT);
 
@@ -1192,7 +1202,7 @@ void VramBackupHandler::SaveVRAMBank(size_t bank_id) {
                                                  Memory::FlushMode::Flush);
 
     u8* data = system.Memory().GetPointer(bank_vaddr);
-    memcpy(vram_backup[bank_id].data(), data, VRAM_BACKUP_BANK_SIZE);
+    memcpy(Bank(bank_id), data, VRAM_BACKUP_BANK_SIZE);
 }
 
 void VramBackupHandler::RestoreVRAMBank(size_t bank_id) {
@@ -1201,7 +1211,8 @@ void VramBackupHandler::RestoreVRAMBank(size_t bank_id) {
     VAddr bank_vaddr = Memory::VRAM_VADDR + bank_id * VRAM_BACKUP_BANK_SIZE;
 
     u8* data = system.Memory().GetPointer(bank_vaddr);
-    memcpy(data, vram_backup[bank_id].data(), VRAM_BACKUP_BANK_SIZE);
+    // Never saved: zeros, as a bank made up front held.
+    memcpy(data, Bank(bank_id), VRAM_BACKUP_BANK_SIZE);
 
     system.Memory().RasterizerFlushVirtualRegion(bank_vaddr, VRAM_BACKUP_BANK_SIZE,
                                                  Memory::FlushMode::Invalidate);

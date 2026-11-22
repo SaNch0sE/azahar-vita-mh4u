@@ -12,6 +12,40 @@ namespace GxmRenderer {
  * Absent file: nothing set. Compiled in only when VITA_DIAGNOSTICS is defined; the release build
  * answers false to every one of them and reads no file.
  *
+ * Measuring:
+ *   perflog   log a second's `perf:` lines: speed and frame rates, the presents, the command
+ *             lists, fills and transfers, the cache operations by site, the FCRAM pages moved
+ *             to CDRAM
+ *   nolimit   no frame limit: the core runs as fast as it goes
+ *   novsync   the sgxd present does not wait for the frame before it to be on screen (tears)
+ *   holdlog   with perflog, the first 200 page-hold aborts that waited (holdlog=N: from N
+ *             seconds of the process's time on), each with the guest's PC and instruction, the
+ *             held range and the page's live read and write bytes, parse holds and index watch
+ *   screenlog  the late skip's screen map, four frames in every 600: the colour buffers drawn
+ *             and dropped and the screen each maps to, the transfers and fills, the LCD buffers
+ *             (RenderThread::EndFrame), and each present's buffer for each screen;
+ *             screenlog_at=S every frame from S seconds of the process's time on, 600 frames
+ *   serial    no overlap between the guest's frames and the GPU's: the vblank waits for the
+ *             GPU to finish the frame (no late skip)
+ *   latelog   the late skip's late frames: each kept draw reading a colour buffer whose draws
+ *             the same frame dropped, the transfers (dropped or not) and the fills (400 lines
+ *             each); latelog_at=S from S seconds of the process's time on
+ *   grid2     sgxd targets below 960x544 are a 2x2 grid of macrotiles, as Sony's kernel makes
+ *             them (4x4 at every size otherwise): the cores' balance
+ *   fsload    every fragment program's code from host0:fsload.gxp (a GXP's primary
+ *             program, with our inputs, uniforms and samplers): another compiler's code, timed
+ *
+ *   threadtimes  with perflog, each placed thread's run time in the second and the cores its
+ *             role allows (Common::RoleThreads; core 3's threads, which psp2prof cannot see).
+ *             Not for speed: sceKernelGetThreadInfo of another thread debug-suspends the
+ *             caller until a debugger resumes it (200-270 ms a second of the emulation thread).
+ *
+ * The shader emitter:
+ *   dumpgxp   write each emitted program to host0 as azahar-vs-KEY.gxp / azahar-fs-KEY.gxp,
+ *             a GXP container psp2shaderperf -disasm lists
+ *   usse_sechoist
+ *             opt in to hoisting vertex uniform loads into the secondary program
+ *
  * Debugging a pass on the console:
  *
  *   noload    a pass that would load its colour buffer's picture (BeginPassLoaded) starts from

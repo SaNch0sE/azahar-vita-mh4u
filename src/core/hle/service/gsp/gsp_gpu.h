@@ -4,8 +4,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,6 +15,7 @@
 #include <boost/serialization/export.hpp>
 #include "common/bit_field.h"
 #include "common/common_types.h"
+#include "common/host_shared_memory.h"
 #include "core/hle/kernel/event.h"
 #include "core/hle/kernel/hle_ipc.h"
 #include "core/hle/service/gsp/gsp_command.h"
@@ -129,11 +132,7 @@ private:
 
 class VramBackupHandler {
 public:
-    VramBackupHandler() : system(Core::Global<Core::System>()) {
-        for (auto& v : vram_backup) {
-            v.resize(VRAM_BACKUP_BANK_SIZE);
-        }
-    }
+    VramBackupHandler() : system(Core::Global<Core::System>()) {}
 
     // TODO(PabloMK7): Figure out what each state means
     enum class State : u32 { STATE_0, STATE_1, STATE_2 };
@@ -155,9 +154,14 @@ private:
 
     static constexpr u32 BANK_COUNT = Memory::VRAM_SIZE / VRAM_BACKUP_BANK_SIZE;
 
-    // A vector is needed because otherwise a stack overflow happens
-    // in the boost serialization code.
-    std::array<std::vector<u8>, BANK_COUNT> vram_backup{};
+    /// The banks' copies, all in one block beside guest VRAM (the GPU's own memory, CDRAM on the
+    /// Vita, or uncached main memory when sgxd has taken the CDRAM by then), made at the first save
+    /// or restore: most titles never save the area (the HOME menu's and the applets' business), and
+    /// twelve banks up front were 6 MiB of every title's heap.
+    std::unique_ptr<Common::HostSharedMemory> vram_backup;
+
+    /// A bank's copy, the block made first if need be (zeros until saved).
+    u8* Bank(size_t bank_id);
 
     // TODO(PabloMK7): Figure out what this means, it's taken from
     // GSP decompilation.
@@ -180,8 +184,19 @@ private:
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
+        // Each bank as a vector, as before the block (a vector, because otherwise a stack
+        // overflow happens in the boost serialization code): empty while there is no block.
         for (size_t i = 0; i < BANK_COUNT; i++) {
-            ar& vram_backup[i];
+            std::vector<u8> bank;
+            if (Archive::is_saving::value && vram_backup) {
+                bank.assign(Bank(i), Bank(i) + VRAM_BACKUP_BANK_SIZE);
+            }
+            ar & bank;
+            // A state from before the block holds every bank, mostly zeros: no block is zeros.
+            if (Archive::is_loading::value &&
+                std::any_of(bank.begin(), bank.end(), [](u8 b) { return b != 0; })) {
+                std::memcpy(Bank(i), bank.data(), VRAM_BACKUP_BANK_SIZE);
+            }
         }
 
         ar & curr_state;

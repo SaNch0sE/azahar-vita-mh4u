@@ -122,10 +122,15 @@ HostSharedMemory::HostSharedMemory(std::size_t size_, [[maybe_unused]] const cha
     // A kernel block of the given type, its size rounded to the type's unit. False, with
     // nothing held, when the kernel refuses it.
     const auto take_block = [&](SceKernelMemBlockType type, std::size_t unit,
-                                const char* type_name) {
+                                const char* type_name, std::size_t alignment = 0) {
         const std::size_t block_size = (rounded + unit - 1) & ~(unit - 1);
+        SceKernelAllocMemBlockOpt opt{};
+        opt.size = sizeof(opt);
+        opt.attr = 0x4; // the alignment is given
+        opt.alignment = static_cast<SceSize>(alignment);
         const SceUID uid = sceKernelAllocMemBlock(name ? name : "azahar-shared", type,
-                                                  static_cast<SceSize>(block_size), nullptr);
+                                                  static_cast<SceSize>(block_size),
+                                                  alignment ? &opt : nullptr);
         void* addr = nullptr;
         if (uid >= 0 && sceKernelGetMemBlockBase(uid, &addr) >= 0 && addr != nullptr) {
             memblock = uid;
@@ -150,11 +155,28 @@ HostSharedMemory::HostSharedMemory(std::size_t size_, [[maybe_unused]] const cha
         ASSERT_MSG(taken, "memblock {}: no {} KiB of PHYCONT", name ? name : "?", size >> 10);
         return;
     }
+    // A block of its own, whole megabytes on megabyte boundaries: azaharAdopt takes its
+    // translation over (renderer_sgxd/guest_gpu_memory.cpp).
+    if (placement == Placement::OwnBlock) {
+        const bool taken =
+            take_block(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, 0x100000u, "USER_RW", 0x100000u);
+        ASSERT_MSG(taken, "memblock {}: no {} KiB block of its own", name ? name : "?",
+                   size >> 10);
+        return;
+    }
     // CDRAM, in 256 KiB units, and nothing else: without it, it stops.
     if (placement == Placement::GpuLocal) {
         const bool taken =
             take_block(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, 0x40000u, "USER_CDRAM_RW");
         ASSERT_MSG(taken, "memblock {}: no {} KiB of CDRAM", name ? name : "?", size >> 10);
+        return;
+    }
+    if (placement == Placement::GpuLocalOrUncached) {
+        const bool taken =
+            take_block(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, 0x40000u, "USER_CDRAM_RW") ||
+            take_block(SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, 0x1000u, "USER_RW_UNCACHE");
+        ASSERT_MSG(taken, "memblock {}: no {} KiB of CDRAM or uncached main memory",
+                   name ? name : "?", size >> 10);
         return;
     }
     raw = std::malloc(rounded + 0x1000);

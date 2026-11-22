@@ -608,6 +608,12 @@ void GPU::MemoryTransfer() {
         config.is_texture_copy ||
         right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                        config.input_height, config.output_height);
+    if (!config.is_texture_copy && allow_display_transfer) {
+        KeepUncached(config.GetPhysicalOutputAddress(),
+                     config.output_width * config.output_height *
+                         BytesPerPixel(config.output_format),
+                     true);
+    }
     RunGpuOp(OpKind::Transfer,
              [this, &config, allow_display_transfer] {
                  RunMemoryTransfer(config, allow_display_transfer);
@@ -627,6 +633,14 @@ void GPU::MemoryTransfer() {
     // Complete transfer.
     config.trigger.Assign(0);
     Signal(Service::GSP::InterruptId::PPF, delay);
+}
+
+void GPU::KeepUncached(PAddr addr, u32 size, bool overwritten) {
+    // Rare: a page moves once and stays until the GPU leaves it unused (ReturnUncached). The
+    // move waits for the GPU's work first, so the GPU is idle under it.
+    if (impl->renderer->WouldMakeUncached(addr, size)) {
+        impl->renderer->MakeUncached(addr, size, overwritten);
+    }
 }
 
 void GPU::RunMemoryTransfer(const Pica::DisplayTransferConfig& config,
@@ -669,21 +683,30 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     Signal(Service::GSP::InterruptId::PDC0, 0);
     Signal(Service::GSP::InterruptId::PDC1, 0);
 
-    // Present renderered frame.
-    if (impl->render_thread) {
-        // The present runs on the render thread, after the frame's work; a present still
-        // queued there when the next one comes is dropped. Pacing stays here.
-        // The screens' registers are the emulation thread's; the present takes a copy.
-        const auto& regs = impl->pica.regs;
-        const std::array<Pica::FramebufferConfig, 2> fb{regs.framebuffer_config[0],
-                                                        regs.framebuffer_config[1]};
-        const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
-                                                  impl->pica.regs_lcd.color_fill_bottom};
-        impl->render_thread->Push([this, fb, fill] { impl->renderer->PresentFrame(fb, fill); },
-                                  GpuThread::Kind::Present);
-        impl->renderer->EndFrame();
-    } else {
-        impl->renderer->SwapBuffers();
+    // Moved pages the GPU has not used for a while go back to cached FCRAM first, so that the
+    // moves below can reuse their pool pages. Rare, as a move is: the GPU idle.
+    if (impl->renderer->UncachedFrameEnded()) {
+        impl->renderer->ReturnUncached();
+    }
+    // Vertex and index buffers the GPU read from cached FCRAM since the last vblank move to
+    // uncached memory once, so later draws from them need no clean.
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags vbcached: they stay cached, each draw cleaning them, for an A/B of the guest's own
+    // work on those pages.
+    static const bool vb_cached = SgxdRenderer::SgxdFlag("vbcached");
+#else
+    constexpr bool vb_cached = false;
+#endif
+    for (const auto& [addr, size] : impl->rasterizer->TakeCachedReads()) {
+        KeepUncached(addr, size, false);
+    }
+    // The LCD's picture comes from the GPU's present: kept uncached, it needs no clean
+    // before each one. The LCD scans 400 columns on the top screen, 320 on the bottom.
+    const auto& regs = impl->pica.regs;
+    for (u32 i = 0; i < 2; i++) {
+        const Pica::FramebufferConfig& f = regs.framebuffer_config[i];
+        KeepUncached(f.second_fb_active ? f.address_left2 : f.address_left1,
+                     f.stride * (i == 0 ? 400u : 320u), false);
     }
 
     // Present renderered frame.

@@ -326,8 +326,9 @@ void FragmentUniformValues(const Pica::Shader::Generator::FSUniformData& d,
 
 } // Anonymous namespace
 
-RasterizerGxm::RasterizerGxm(Pica::PicaCore& pica_, Memory::MemorySystem& memory_)
-    : VideoCore::RasterizerAccelerated{memory_, pica_} {}
+RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memory_,
+                             GuestGpuMemory& guest_memory_)
+    : VideoCore::RasterizerAccelerated{memory_, pica_}, guest_memory{guest_memory_} {}
 
 RasterizerGxm::~RasterizerGxm() = default;
 
@@ -401,10 +402,15 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
                describe(), width, height, input);
 
     // The surface's row y is the PICA's row y. The PICA's RGB8 is B, G, R in memory, gxm's
-    // U8U8U8_RGB store. Guest memory is mapped for the GPU at its PICA address; VRAM is
-    // uncached CDRAM and needs no cache work.
+    // U8U8U8_RGB store. Guest memory is mapped for the GPU at its PICA address; VRAM, and
+    // FCRAM moved to CDRAM (GuestGpuMemory), is uncached and needs no cache work.
     u8* const out = memory.GetPhysicalPointer(output);
-    const SgxdBackend::Store store{output, fcram ? out : nullptr, fcram ? bytes : 0,
+    const bool cached = fcram && !guest_memory.IsUncached(output, bytes);
+    if (fcram && !cached) {
+        SgxdCacheSkipped(CacheSite::TransferBefore, bytes);
+        SgxdCacheSkipped(CacheSite::TransferAfter, bytes);
+    }
+    const SgxdBackend::Store store{output, cached ? out : nullptr, cached ? bytes : 0,
                                    SGXD_RECIPE_PACK_U888_RGB};
     u32 ta_us = 0, d3_us = 0;
     backend.Blit(source->memory, width, height, store, &ta_us, &d3_us);
@@ -1146,7 +1152,9 @@ bool RasterizerSgxd::AccelerateDrawBatch(bool is_indexed) {
                        (address >= Memory::VRAM_PADDR && address + bytes <= Memory::VRAM_PADDR_END),
                    "GXM: {}: vertices at {:#x}+{:#x} are outside the mapped guest memory",
                    describe(), address, bytes);
-        if (address >= Memory::FCRAM_PADDR) {
+        if (guest_memory.IsUncached(address, bytes)) {
+            SgxdCacheSkipped(CacheSite::Vertices, bytes);
+        } else {
             backend.ReadsCached(memory.GetPhysicalPointer(address), bytes);
         }
     }

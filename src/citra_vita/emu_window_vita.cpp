@@ -325,7 +325,8 @@ void EmuWindowVita::DrawGuestScreens() {
         if (!enabled[i] || s.fill || s.address == 0 || s.pixels == nullptr) {
             continue;
         }
-        if (!SgxdPresent::DrawGuestScreen(s.address, s.pixels, s.stride, s.columns, s.format,
+        if (!SgxdPresent::DrawGuestScreen(s.address, s.uncached ? nullptr : s.pixels, s.stride,
+                                          s.columns, s.format,
                                           r.left, r.top, r.GetWidth(), r.GetHeight()) &&
             screens_skipped++ % 600 == 0) {
             LOG_WARNING(Frontend,

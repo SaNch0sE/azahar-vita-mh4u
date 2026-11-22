@@ -122,6 +122,11 @@ static volatile uint32_t *sgxd_mmu;        // [0, 1024) the directory, then the 
 static uint32_t sgxd_mmu_pa;
 static uint8_t sgxd_mmu_table[1024];       // directory index -> page table 1..255, 0 = none
 static unsigned sgxd_mmu_tables;           // page tables handed out
+// What sgxdMap mapped, GPU address onto the app's (native.c's windows): a page move finds the
+// PTEs naming a page from these (reback.c).
+#define SGXD_RANGES 128u
+static AzaharWindow sgxd_range_list[SGXD_RANGES];
+static AzaharWindows sgxd_ranges = {sgxd_range_list, 0, SGXD_RANGES};
 static uint32_t sgxd_mmu_pages;            // pages mapped
 
 static SgxdOp sgxd_ops[SGXD_MAX_OPS];
@@ -353,6 +358,7 @@ static int sgxd_mmu_alloc(void) {
     asm volatile("dsb" ::: "memory");
     __builtin_memset(sgxd_mmu_table, 0, sizeof(sgxd_mmu_table));
     sgxd_mmu_tables = 0;
+    sgxd_ranges.count = 0;
     sgxd_mmu_pages = 0;
     return 0;
 }
@@ -419,12 +425,17 @@ static int sgxd_user_page(uint32_t uva, int write, uint32_t *pa, uint32_t *par_o
     SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
     const uint32_t d = rd_dacr();
     wr_dacr(dacr_grant_all(d));
-    if (write) {
-        asm volatile("mcr p15, 0, %0, c7, c8, 3 \n isb" ::"r"(uva) : "memory");   // ATS1CUW
-    } else {
-        asm volatile("mcr p15, 0, %0, c7, c8, 2 \n isb" ::"r"(uva) : "memory");   // ATS1CUR
+    uint32_t par = 0, base_par = 0;
+    for (int k = 0; k < 2; k++) {
+        const uint32_t at = k ? uva & ~0xFFFFu : uva;
+        if (write) {
+            asm volatile("mcr p15, 0, %0, c7, c8, 3 \n isb" ::"r"(at) : "memory");   // ATS1CUW
+        } else {
+            asm volatile("mcr p15, 0, %0, c7, c8, 2 \n isb" ::"r"(at) : "memory");   // ATS1CUR
+        }
+        *(k ? &base_par : &par) = rd_par();
     }
-    const uint32_t par = rd_par();
+    par = par_large_page(uva, par, base_par);
     if (!PAR_FAULTED(par)) {
         ksceKernelDcacheCleanRange((void *)(uintptr_t)uva, 0x1000);
     }
@@ -444,7 +455,8 @@ static int sgxd_map_locked(uint32_t gpu_va, uint32_t uva, uint32_t size, uint32_
     for (uint32_t pde = gpu_va >> 22; pde <= (gpu_va + (size - 1)) >> 22; pde++) {
         need += !sgxd_mmu_table[pde];
     }
-    if (sgxd_mmu_tables + need > SGXD_MAP_TABLES) {
+    // A new range adjoins at most two others, so one free record is enough.
+    if (sgxd_mmu_tables + need > SGXD_MAP_TABLES || sgxd_ranges.count == sgxd_ranges.cap) {
         return SGXD_ERR_TABLES;
     }
     for (uint32_t off = 0; off < size; off += 0x1000) {
@@ -478,6 +490,7 @@ static int sgxd_map_locked(uint32_t gpu_va, uint32_t uva, uint32_t size, uint32_
         *sgxd_mmu_pte(gpu_va + off) = pa | flags | SGXD_PTE_VALID;
         sgxd_mmu_pages++;
     }
+    windows_add(&sgxd_ranges, gpu_va, uva, size);
     asm volatile("dsb" ::: "memory");
     sgxd_mmu_invalidate();
     return 0;
@@ -492,6 +505,10 @@ static int sgxd_unmap_locked(uint32_t gpu_va, uint32_t size) {
         if (!pte || !(*pte & SGXD_PTE_VALID)) {
             return SGXD_ERR_MAPPED;
         }
+    }
+    // Only an unmap from the middle of a range needs a record more.
+    if (windows_remove(&sgxd_ranges, gpu_va, size) != 0) {
+        return SGXD_ERR_TABLES;
     }
     for (uint32_t off = 0; off < size; off += 0x1000) {
         *sgxd_mmu_pte(gpu_va + off) = 0;
