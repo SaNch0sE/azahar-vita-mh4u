@@ -1,0 +1,20 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; depth_read_test: position through the projection, the vertex colour out as it is.
+.fvec projection[4]
+.constf ones(1.0, 1.0, 1.0, 1.0)
+.out outpos position
+.out outclr color
+.alias inpos v0
+.alias inclr v1
+.proc main
+	mov r0.xyz, inpos
+	mov r0.w, ones
+	dp4 outpos.x, projection[0], r0
+	dp4 outpos.y, projection[1], r0
+	dp4 outpos.z, projection[2], r0
+	dp4 outpos.w, projection[3], r0
+	mov outclr, inclr
+	end
+.end

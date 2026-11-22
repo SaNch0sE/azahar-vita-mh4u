@@ -1,0 +1,45 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; crash_cases_test's geometry program with a BREAKC: each input triangle out again, its green a
+; quarter for each round a LOOP of eight ran before a BREAKC left it at the round limit.x (Ghost
+; Recon Shadow Wars' geometry program leaves a LOOP so; sgxd's emitter had no BREAKC).
+.gsh point c0
+.fvec projection[4]
+.fvec limit
+.ivec rounds
+.constf consts(0.0, 1.0, 0.25, 0.0)
+.out outpos position
+.out outclr color
+; v0-v1, v2-v3, v4-v5: position and colour of the triangle's three vertices.
+.entry gmain
+.proc gmain
+	mov r10, consts.xxxx
+	for rounds
+		cmp limit.x, le, le, r10.x
+		breakc cmp.x
+		add r10.x, consts.y, r10.x
+	.end
+	mov r11, consts.xxxy
+	mul r11.y, consts.z, r10.x
+	setemit 0
+	mov r8, v0
+	call vert
+	emit
+	setemit 1
+	mov r8, v2
+	call vert
+	emit
+	setemit 2, prim
+	mov r8, v4
+	call vert
+	emit
+	end
+.end
+.proc vert
+	dp4 outpos.x, projection[0], r8
+	dp4 outpos.y, projection[1], r8
+	dp4 outpos.z, projection[2], r8
+	dp4 outpos.w, projection[3], r8
+	mov outclr, r11
+.end

@@ -1,0 +1,15 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; crash_cases_test's geometry draw: the vertex program passes position and colour on.
+.constf ones(1.0, 1.0, 1.0, 1.0)
+.out outpos position
+.out outclr color
+.alias inpos v0
+.alias inclr v1
+.proc main
+	mov outpos.xyz, inpos
+	mov outpos.w, ones
+	mov outclr, inclr
+	end
+.end

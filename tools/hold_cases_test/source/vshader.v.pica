@@ -1,0 +1,24 @@
+; SPDX-FileCopyrightText: 2026 Willi Ye
+; SPDX-License-Identifier: GPL-2.0-or-later
+
+; hold_cases_test: position through the projection, the vertex colour and texture coordinate out as
+; they are.
+.fvec projection[4]
+.constf ones(1.0, 1.0, 1.0, 1.0)
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.alias inpos v0
+.alias inclr v1
+.alias intc v2
+.proc main
+	mov r0.xyz, inpos
+	mov r0.w, ones
+	dp4 outpos.x, projection[0], r0
+	dp4 outpos.y, projection[1], r0
+	dp4 outpos.z, projection[2], r0
+	dp4 outpos.w, projection[3], r0
+	mov outclr, inclr
+	mov outtc0, intc
+	end
+.end
