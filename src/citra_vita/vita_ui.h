@@ -12,6 +12,8 @@
 #include "citra_vita/config.h"
 #include "citra_vita/multiplayer.h"
 #include "common/common_types.h"
+#include "common/math_util.h"
+#include "common/named_thread.h"
 #include "core/loader/title_patches.h"
 #include "core/savestate.h"
 
@@ -45,6 +47,18 @@ class EmuWindowVita;
  */
 class Ui {
 public:
+    /// The game list's banner, in display pixels: the 3DS top screen's 400x240 at 1.15x, the
+    /// panel's height, in its middle (BannerPlayer shows it there; DrawGameList leaves a hole for
+    /// it).
+    [[nodiscard]] static Common::Rectangle<u32> BannerRect();
+    [[nodiscard]] static u32 BannerBackdrop();
+    /// The title whose banner the panel shows: the selected one while the game list shows with
+    /// a title in focus (not the tools in the footer); empty otherwise.
+    [[nodiscard]] std::string BannerTitle() const;
+    /// Selects the first title whose name or path holds `text` (any case), as the pad would:
+    /// the command channel's `select`. False when no title does.
+    bool SelectTitle(const std::string& text);
+
     /// What the UI is asking the frontend to do, returned from Update.
     enum class Action {
         None,

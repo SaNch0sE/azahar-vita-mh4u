@@ -222,18 +222,38 @@ public:
     ScanRoom TakeScanRoom();
 #endif
 
+    /**
+     * With no title (Core::System::InitGpuOnly): `work` runs on this thread with the render
+     * thread held and the GPU's interrupts muted, its GSP commands given physical addresses
+     * (ExecutePhysical); then the LCD's screens go to the window as a vblank shows them
+     * (RendererSgxd::PresentFrame), the GPU idle after. The game list's banners.
+     */
+    void HostFrame(const std::function<void()>& work);
+    /// In HostFrame's `work`: a GSP command whose addresses are physical.
+    void ExecutePhysical(const Service::GSP::Command& command);
+    /// In HostFrame's `work`: the top screen's framebuffer, as the LCD's registers take it (the
+    /// left eye's first buffer, shown): its physical address, colour format and column stride.
+    void SetHostTopScreen(PAddr address, u32 format, u32 stride);
+    /// In HostFrame's `work`: the host wrote guest memory there (through
+    /// Memory::GetPhysicalPointer): the textures over it are untiled again at their next use.
+    void HostWrote(PAddr address, u32 size);
+
     /// vprof's replay: the GSP commands it executes carry physical addresses already, which
     /// VirtualToPhysicalAddress passes through.
     bool replay_physical{};
 #ifdef VITA_DIAGNOSTICS
     /// vprof's replay (vprof_replay.h) in the replay player, with no guest at all
-    /// (Core::System::InitReplay). `first` is the first batch of requests; more come from
+    /// (Core::System::InitGpuOnly). `first` is the first batch of requests; more come from
     /// host0:vprof-replay.txt until one quits.
     void VprofReplay(const std::string& capture, const std::string& first);
 #endif
 
 private:
     void SubmitCmdList(u32 index);
+
+    /// With the render thread held and no title: the LCD's screens to the window as
+    /// VBlankCallback shows them, then the GPU idle (the replay's presents, HostFrame's).
+    void PresentScreensNow();
 
     /// Runs fill unit `index` if triggered and raises `interrupt` for it (none: GSP's command
     /// raises one for both of its fills).

@@ -1294,21 +1294,19 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     return ResultStatus::Success;
 }
 
-#ifdef VITA_DIAGNOSTICS
-System::ResultStatus System::InitReplay(Frontend::EmuWindow& emu_window) {
+System::ResultStatus System::InitGpuOnly(Frontend::EmuWindow& emu_window) {
     memory = std::make_unique<Memory::MemorySystem>(*this);
     timing = std::make_unique<Timing>(1, Settings::values.cpu_clock_percentage.GetValue());
     gpu = std::make_unique<VideoCore::GPU>(*this, emu_window, nullptr);
-    LOG_INFO(Core, "replay player: memory, timing and the GPU, no application");
+    LOG_INFO(Core, "memory, timing and the GPU, no application");
     return ResultStatus::Success;
 }
 
-void System::ShutdownReplay() {
+void System::ShutdownGpuOnly() {
     gpu.reset();
     timing.reset();
     memory.reset();
 }
-#endif
 
 VideoCore::GPU& System::GPU() {
     return *gpu;

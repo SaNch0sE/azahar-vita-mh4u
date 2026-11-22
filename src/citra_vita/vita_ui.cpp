@@ -1981,17 +1981,80 @@ Ui::Action Ui::DrawSettings() {
     return Action::None;
 }
 
+/**
+ * The game list's layout: the 3DS HOME Menu's on one screen. The status bar; the selected
+ * title's banner in the middle of the panel where the 3DS has the top screen; the titles as a
+ * grid of two rows of tiles that scrolls sideways, the selected title's name and publisher in a
+ * speech bubble over the other row; the footer, with the pad's buttons at its left and the tools
+ * at its right. The grid sits close over the footer, which leaves the banner the rest.
+ */
+namespace ListLayout {
+constexpr float StatusHeight = 24.0f;
+constexpr float Footer = ScreenHeight - FooterHeight;
+// 80 a side: the banner's panel 276 rows for its 240.
+constexpr float Tile = 80.0f;
+constexpr float RowPitch = Tile + 8.0f;
+constexpr float Pitch = Tile + 10.0f;
+constexpr int Rows = 2;
+constexpr float RowTop = Footer - 16.0f - Tile - static_cast<float>(Rows - 1) * RowPitch;
+// Room for the selected tile's brackets.
+constexpr float BannerBottom = RowTop - 16.0f;
+constexpr float TileRounding = 16.0f;
+/// The banner: the 3DS top screen's 400x240 at 1.15x (460x276), in the panel's middle: the
+/// panel's 276 rows, the whole banner shown.
+constexpr float BannerWidth = 460.0f;
+constexpr float BannerHeight = 276.0f;
+constexpr float BannerLeft = (ScreenWidth - BannerWidth) * 0.5f;
+constexpr float BannerTop = StatusHeight + (BannerBottom - StatusHeight - BannerHeight) * 0.5f;
+static_assert(BannerTop >= 0.0f, "the banner starts on the display");
+} // namespace ListLayout
+
+Common::Rectangle<u32> Ui::BannerRect() {
+    using namespace ListLayout;
+    const u32 left = static_cast<u32>(BannerLeft), top = static_cast<u32>(BannerTop);
+    return {left, top, left + static_cast<u32>(BannerWidth), top + static_cast<u32>(BannerHeight)};
+}
+
+u32 Ui::BannerBackdrop() {
+    const ImVec4& c = palette->Backdrop;
+    const auto byte = [](float v) { return static_cast<u32>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    return byte(c.x) << 16 | byte(c.y) << 8 | byte(c.z);
+}
+
+bool Ui::SelectTitle(const std::string& text) {
+    const auto lower = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return v;
+    };
+    const std::string want = lower(text);
+    for (int i = 0; i < static_cast<int>(games.size()); i++) {
+        if (lower(games[i].name).find(want) != std::string::npos ||
+            lower(games[i].path).find(want) != std::string::npos) {
+            // The grid moves its focus there at its next frame, as its page arrows do.
+            selected_game = i;
+            carousel_focus = i;
+            tools_focused = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string Ui::BannerTitle() const {
+    if (state != State::GameList || tools_focused || selected_game < 0 ||
+        selected_game >= static_cast<int>(games.size())) {
+        return {};
+    }
+    return games[selected_game].path;
+}
+
 Ui::Action Ui::DrawGameList() {
-    constexpr float StatusHeight = 24.0f;
-    constexpr float Footer = ScreenHeight - FooterHeight;
-    constexpr float Tile = 96.0f;
-    constexpr float RowPitch = Tile + 8.0f;
-    constexpr float Pitch = Tile + 10.0f;
-    constexpr int Rows = 2;
-    constexpr float RowTop = Footer - 16.0f - Tile - static_cast<float>(Rows - 1) * RowPitch;
-    // Room for the selected tile's brackets.
-    constexpr float BannerBottom = RowTop - 16.0f;
-    constexpr float TileRounding = 16.0f;
+    using namespace ListLayout;
+    // The banner (BannerPlayer) shows under the interface, in a hole left in the panel.
+    const bool banner = window.MenuBannerShown();
+    const ImRect hole(ImVec2(BannerLeft, StatusHeight),
+                      ImVec2(BannerLeft + BannerWidth, BannerBottom));
     Action action = Action::None;
     if (!games.empty()) {
         selected_game = std::clamp(selected_game, 0, static_cast<int>(games.size()) - 1);
@@ -2001,7 +2064,8 @@ Ui::Action Ui::DrawGameList() {
 
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowSize(ImVec2(ScreenWidth, ScreenHeight));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, palette->Backdrop);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+                          banner ? ImVec4(0.0f, 0.0f, 0.0f, 0.0f) : palette->Backdrop);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::Begin("##home_backdrop", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -2017,13 +2081,13 @@ Ui::Action Ui::DrawGameList() {
         // exactly: with the banner showing (the window's own background transparent) those 8
         // pixels each side would stay black.
         dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, ScreenHeight), false);
-        // The theme's pattern: light diagonal bands behind the banner.
-        dl->PushClipRect(ImVec2(0.0f, StatusHeight), ImVec2(ScreenWidth, BannerBottom));
-        for (float x = -BannerBottom; x < ScreenWidth; x += 36.0f) {
-            dl->AddLine(ImVec2(x, BannerBottom), ImVec2(x + BannerBottom, 0.0f),
-                        Colour(palette->Pattern), 14.0f);
+        if (banner) {
+            const ImU32 c = Colour(palette->Backdrop);
+            dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, hole.Min.y), c);
+            dl->AddRectFilled(ImVec2(0.0f, hole.Max.y), ImVec2(ScreenWidth, ScreenHeight), c);
+            dl->AddRectFilled(ImVec2(0.0f, hole.Min.y), ImVec2(hole.Min.x, hole.Max.y), c);
+            dl->AddRectFilled(ImVec2(hole.Max.x, hole.Min.y), ImVec2(ScreenWidth, hole.Max.y), c);
         }
-        dl->PopClipRect();
         DrawStatusBar(dl, StatusHeight,
                       games.empty() ? std::string{}
                                     : fmt::format("{} {}", games.size(),
@@ -2040,7 +2104,7 @@ Ui::Action Ui::DrawGameList() {
                         ImVec2((ScreenWidth - size.x) * 0.5f,
                                (StatusHeight + BannerBottom - size.y) * 0.5f),
                         Colour(palette->Text), text.c_str(), nullptr, width);
-        } else {
+        } else if (!banner) {
             const GameEntry& game = games[static_cast<std::size_t>(selected_game)];
             // The icon a little over twice its size in a white frame, in the panel's middle.
             constexpr float Frame = 104.0f;

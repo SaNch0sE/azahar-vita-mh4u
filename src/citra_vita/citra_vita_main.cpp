@@ -38,6 +38,7 @@
 #include <psp2/shellutil.h>
 #include <psp2/vshbridge.h>
 #include <taihen.h>
+#include "citra_vita/banner_player.h"
 #include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
 #include "citra_vita/gxm_present.h"
@@ -2103,7 +2104,7 @@ bool IsCapture(std::string_view path) {
 /**
  * The replay player: a vprof capture's frame on the GPU with no title at all
  * (tools/frame_replay). Only memory,
- * timing and the GPU exist (Core::System::InitReplay); the frame's commands and memory come
+ * timing and the GPU exist (Core::System::InitGpuOnly); the frame's commands and memory come
  * from the capture. The first requests are the vpk's app0:replay.txt when host0 has none,
  * later ones host0:vprof-replay.txt's, and the results go to host0 (vprof_replay.cpp), so the
  * player needs host0.
@@ -2123,12 +2124,12 @@ void RunReplay(Core::System& system, VitaFrontend::EmuWindowVita& window,
     std::replace(shown.begin(), shown.end(), '\n', ';');
     LOG_INFO(Frontend, "replay player: {}, first requests {}", capture, shown);
     SgxdRenderer::Vprof::Info("replay", capture.c_str());
-    if (system.InitReplay(window) != Core::System::ResultStatus::Success) {
+    if (system.InitGpuOnly(window) != Core::System::ResultStatus::Success) {
         LOG_CRITICAL(Frontend, "replay player: the GPU could not be brought up");
         return;
     }
     system.GPU().VprofReplay(capture, first);
-    system.ShutdownReplay();
+    system.ShutdownGpuOnly();
     LOG_INFO(Frontend, "replay player: done");
 }
 #endif
@@ -2410,6 +2411,21 @@ int EmulatorMain() {
 
     VitaFrontend::Ui ui(system, window);
 
+    // The selected title's banner in the list's panel: the GPU on its own while the list shows,
+    // down while a title runs, which brings up its own.
+    VitaFrontend::BannerPlayer banner{system, window};
+    const auto run_title = [&](const std::string& path) {
+        banner.Stop();
+        const bool more = RunTitle(system, window, ui, path);
+        if (more) {
+            // A title may have installed or removed titles itself (AM: a launcher that
+            // reinstalls itself with a new content file): the list read again, or its entry names
+            // a content file that is gone.
+            ui.ScanGames();
+            banner.Start(VitaFrontend::Ui::BannerRect());
+        }
+        return more;
+    };
     VitaFrontend::CrashReport::EnableRecovery(restart,
                                               CommandChannel() ? command_file.LastSeq() : nullptr);
     bool running = true;
@@ -2431,8 +2447,15 @@ int EmulatorMain() {
         LOG_INFO(Frontend, "launch parameter names {}", launch);
         running = RunTitle(system, window, ui, launch);
     }
+    if (running) {
+        banner.Start(VitaFrontend::Ui::BannerRect());
+    }
     while (running && !window.IsQuitRequested()) {
         window.PollEvents();
+        // The banner before the interface: the list leaves the panel open for the banner as the
+        // banner stands when it draws (a new selection hides the old one here); drawn after it,
+        // the panel shows the frame's black clear for a few refreshes at each new selection.
+        banner.Frame(ui.BannerTitle(), VitaFrontend::Ui::BannerBackdrop());
         const auto action = ui.Update();
         window.Present(&ui);
         // The present waits for no vblank: a frame a refresh.
@@ -2440,7 +2463,7 @@ int EmulatorMain() {
 
         switch (action) {
         case VitaFrontend::Ui::Action::LaunchGame: {
-            running = RunTitle(system, window, ui, ui.SelectedGamePath());
+            running = run_title(ui.SelectedGamePath());
             break;
         }
         case VitaFrontend::Ui::Action::ExitApplication:
@@ -2448,12 +2471,14 @@ int EmulatorMain() {
             break;
         case VitaFrontend::Ui::Action::TogglePin: {
             ui.SetStatusMessage("Changing the LiveArea...");
+            banner.Frame(ui.BannerTitle(), VitaFrontend::Ui::BannerBackdrop());
             ui.Update();
             window.Present(&ui);
             ui.SetStatusMessage(ui.TogglePin());
             // The outcome for two seconds, as a load's failure.
             for (int i = 0; i < 120; i++) {
                 window.PollEvents();
+                banner.Frame(ui.BannerTitle(), VitaFrontend::Ui::BannerBackdrop());
                 ui.Update();
                 window.Present(&ui);
                 sceDisplayWaitVblankStart();
@@ -2467,7 +2492,7 @@ int EmulatorMain() {
         if (const std::string command = running && CommandChannel() ? command_file.Poll() : "";
             command.starts_with("launch ")) {
             sceClibPrintf("[azahar] %s (command)\n", command.c_str());
-            running = RunTitle(system, window, ui, command.substr(7));
+            running = run_title(command.substr(7));
         } else if (command.starts_with("select ")) {
             const bool found = ui.SelectTitle(command.substr(7));
             sceClibPrintf("[azahar] %s: %s (command)\n", command.c_str(),
@@ -2480,6 +2505,7 @@ int EmulatorMain() {
         }
     }
 
+    banner.Stop();
     Config::Save();
     VitaFrontend::Multiplayer::Shutdown();
     VitaFrontend::ShutdownInput();

@@ -7,7 +7,8 @@
 // Dear ImGui's rendering half through sgxd: each draw command becomes
 // one of the recipe's draws in SgxdPresent's frame, ImGui's own fragment program
 // (SGXD_IMGUI_MODULATE: the font atlas's texel times the vertex colour, blended over the
-// target), with the command's clip rectangle as a tile-granular region clip.
+// target), with the command's clip rectangle as the region clip of the 32-pixel tiles it
+// touches and its triangles across a side inside a tile cut to it on the CPU.
 
 struct ImDrawData;
 

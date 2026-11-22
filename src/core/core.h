@@ -170,15 +170,15 @@ public:
     [[nodiscard]] ResultStatus Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                     Frontend::EmuWindow* secondary_window = {});
 
-#ifdef VITA_DIAGNOSTICS
     /**
-     * vprof's replay player: memory, timing and the GPU alone, with no kernel, services, CPU or
-     * application. A capture's frame replays onto them (VideoCore::GPU::VprofReplay); nothing
-     * else may run, and the GPU's interrupts go nowhere. ShutdownReplay ends it.
+     * Memory, timing and the GPU alone, with no kernel, services, CPU or application: for work
+     * the GPU does with no title, which the host hands it itself (VideoCore::GPU::HostFrame).
+     * vprof's replay player replays a capture's frame onto them; the game list draws the
+     * selected title's banner with them. Nothing else may run, and the GPU's interrupts go
+     * nowhere. ShutdownGpuOnly ends it, before a title's Load.
      */
-    [[nodiscard]] ResultStatus InitReplay(Frontend::EmuWindow& emu_window);
-    void ShutdownReplay();
-#endif
+    [[nodiscard]] ResultStatus InitGpuOnly(Frontend::EmuWindow& emu_window);
+    void ShutdownGpuOnly();
 
     /**
      * Indicates if the emulated system is powered on (all subsystems initialized and able to run an

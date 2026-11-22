@@ -94,8 +94,8 @@ void EmuWindowVita::UpdateCurrentFramebufferLayout() {
         Settings::values.layout_option.GetValue() == Settings::LayoutOption::SingleScreen;
     const bool swapped = Settings::values.swap_screen.GetValue();
     // The widescreen top screen fills the display where it is the one screen shown; the
-    // renderer draws its margins only then.
-    const bool wide = Widescreen() && single && !swapped;
+    // renderer draws its margins only then. The game list's banner is a plain 5:3 picture.
+    const bool wide = Widescreen() && single && !swapped && !menu_banner;
     SgxdRenderer::RasterizerSgxd::SetWidescreen(wide ? WidescreenMargin : 0);
     if (wide) {
         layout.top_screen = {0, 0, DisplayWidth, DisplayHeight};
@@ -123,7 +123,21 @@ void EmuWindowVita::UpdateCurrentFramebufferLayout() {
             layout.top_opacity = opacity;
         }
     }
+    if (menu_banner) {
+        layout.top_screen = *menu_banner;
+        layout.top_screen_enabled = true;
+        layout.top_opacity = 1.0f;
+        layout.bottom_screen_enabled = false;
+    }
     NotifyFramebufferLayoutChanged(layout);
+}
+
+void EmuWindowVita::ShowMenuBanner(std::optional<Common::Rectangle<u32>> rect) {
+    menu_banner = rect;
+    if (!rect) {
+        have_screens = false;
+    }
+    UpdateCurrentFramebufferLayout();
 }
 
 namespace {
@@ -513,6 +527,9 @@ void EmuWindowVita::PresentGuestScreens(const GuestScreen (&next)[2]) {
     screens[0] = next[0];
     screens[1] = next[1];
     have_screens = true;
+    if (menu_banner) {
+        return;
+    }
     Present(render_ui.load(std::memory_order_acquire));
 }
 

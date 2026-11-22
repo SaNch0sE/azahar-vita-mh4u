@@ -17,6 +17,14 @@ add_custom_command(
 
 set(CITRA_VITA_SOURCES
     ../vita_compat/src/vita_libc_shims.c
+    banner_cgfx.cpp
+    banner_cgfx.h
+    banner_player.cpp
+    banner_player.h
+    banner_scene.cpp
+    banner_scene.h
+    banner_sound.cpp
+    banner_sound.h
     citra_vita_main.cpp
     config.cpp
     config.h

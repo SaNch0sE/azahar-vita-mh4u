@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 
 #include "common/common_types.h"
 #include "common/thread.h"
@@ -58,6 +59,15 @@ public:
     /// The renderer is going, and guest memory with it: presents show no guest screens again
     /// until the next PresentGuestScreens.
     void ForgetGuestScreens() override;
+    /// The game list's banner (BannerPlayer): the guest's top screen, which the GPU renders with
+    /// no title, shown in `rect` by the menus' own presents: PresentGuestScreens keeps the
+    /// screens without presenting, and Present draws them under the interface. No bottom
+    /// screen. nullopt: the layout as the settings make it, and no guest screens until a title
+    /// gives some.
+    void ShowMenuBanner(std::optional<Common::Rectangle<u32>> rect);
+    [[nodiscard]] bool MenuBannerShown() const {
+        return menu_banner.has_value();
+    }
     /// The last present's picture still rendering on the GPU (SgxdPresent::Busy).
     bool PresentBusy() override;
     /// SgxdPresent::FlipPending, FlipDone: the last present on screen once its 3D is done.
@@ -210,6 +220,7 @@ private:
 
     GuestScreen screens[2]{};
     bool have_screens{};
+    std::optional<Common::Rectangle<u32>> menu_banner;
     /// PaceFrame: the display's vblank count the next guest frame waits for, and whether the
     /// cadence runs (a frame paced the last time). 16 bits, as sceDisplayGetVcount counts.
     u16 pace_target{};

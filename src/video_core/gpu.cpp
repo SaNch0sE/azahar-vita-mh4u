@@ -923,20 +923,7 @@ void GPU::VprofReplay(const std::string& capture, const std::string& first) {
         [](std::function<void()> fn) { fn(); },
         // The screens as VBlankCallback shows them.
         [this] {
-            const auto& regs = impl->pica.regs;
-            for (u32 i = 0; i < 2; i++) {
-                const Pica::FramebufferConfig& f = regs.framebuffer_config[i];
-                KeepUncached(f.second_fb_active ? f.address_left2 : f.address_left1,
-                             f.stride * (i == 0 ? 400u : 320u), false);
-            }
-            const std::array<Pica::FramebufferConfig, 2> fb{regs.framebuffer_config[0],
-                                                            regs.framebuffer_config[1]};
-            const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
-                                                      impl->pica.regs_lcd.color_fill_bottom};
-            // PresentFrame waits for the flip. RendererSgxd::EndFrame is left out: its frame
-            // limiter and PerfStats belong to a running guest, and the player has neither.
-            impl->renderer->PresentFrame(fb, fill);
-            impl->rasterizer->GpuIdle();
+            PresentScreensNow();
         },
         [this] { right_eye_disabler->ReportEndFrame(); },
         [this] { impl->render->TakeWholeState(); },
@@ -945,6 +932,54 @@ void GPU::VprofReplay(const std::string& capture, const std::string& first) {
     impl->interrupts_muted = false;
 }
 #endif
+
+void GPU::PresentScreensNow() {
+    const auto& regs = impl->pica.regs;
+    for (u32 i = 0; i < 2; i++) {
+        const Pica::FramebufferConfig& f = regs.framebuffer_config[i];
+        KeepUncached(f.second_fb_active ? f.address_left2 : f.address_left1,
+                     f.stride * (i == 0 ? 400u : 320u));
+    }
+    const std::array<Pica::FramebufferConfig, 2> fb{regs.framebuffer_config[0],
+                                                    regs.framebuffer_config[1]};
+    const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
+                                              impl->pica.regs_lcd.color_fill_bottom};
+    // PresentFrame waits for the flip. RendererSgxd::EndFrame is left out: its frame limiter
+    // and PerfStats belong to a running guest, and there is none.
+    impl->renderer->PresentFrame(fb, fill);
+    impl->rasterizer->GpuIdle();
+}
+
+void GPU::HostFrame(const std::function<void()>& work) {
+    const auto hold = HoldRender();
+    // No guest hears of the host's work.
+    impl->interrupts_muted = true;
+    work();
+    PresentScreensNow();
+    impl->interrupts_muted = false;
+}
+
+void GPU::ExecutePhysical(const Service::GSP::Command& command) {
+    replay_physical = true;
+    Execute(command);
+    replay_physical = false;
+}
+
+void GPU::SetHostTopScreen(PAddr address, u32 format, u32 stride) {
+    Pica::FramebufferConfig& f = impl->pica.regs.framebuffer_config[0];
+    f.address_left1 = address;
+    f.address_right1 = address;
+    f.format = (f.format & 0xFFFF0000) | (format & 0xFFFF);
+    f.stride = stride;
+    f.active_fb = 0;
+    impl->screens_changed = true;
+}
+
+void GPU::HostWrote(PAddr address, u32 size) {
+    // The render thread is held (HostFrame): its rasterizer is this thread's until the work ends.
+    const PAddr first = address & ~0xfffu;
+    impl->render->Rasterizer().GuestWrote(first, ((address + size + 0xfff) & ~0xfffu) - first);
+}
 
 std::vector<GPU::DmaRun> GPU::DmaRuns(VAddr src, VAddr dst, u32 size) {
     // GSP copies through the process's mapping, the PTLA through the GPU's, where guest FCRAM

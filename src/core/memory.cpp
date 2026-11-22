@@ -279,8 +279,8 @@ public:
     }
 
     u32 GetPC() const noexcept {
-        // The replay player (System::InitReplay) runs no core: an error message naming the PC
-        // stopped it before it was written.
+        // A GPU-only system (System::InitGpuOnly: the replay player, the game list's banners)
+        // runs no core: an error message naming the PC stopped it before it was written.
         return system.IsPoweredOn() ? system.GetRunningCore().GetPC() : 0;
     }
 
