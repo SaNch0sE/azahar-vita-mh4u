@@ -274,7 +274,8 @@ private:
     std::string picker_cia_dir;
     std::vector<PickerEntry> picker_entries;
     std::string picked_cia;
-    /// The on-screen keyboard over the Multiplayer screen, editing `edit_text`. Not the system's
+    /// The on-screen keyboard over the Multiplayer screen and the Settings screen's console name,
+    /// editing `edit_text`. Not the system's
     /// keyboard dialog: it draws through GXM, and handing the GPU back to Sony's driver around
     /// it while sgxd holds a title's state is too risky.
     void DrawKeyboard();
@@ -394,6 +395,12 @@ private:
     bool check_records_loaded{};
     const CheckRecord* RememberedCheck(const std::string& path);
     void RememberCheck(const std::string& path, const RomCheck::Result& result);
+    /// The System tab's last row, all games' only: the 3DS's user name (Config::ConsoleName), which
+    /// cross edits on the keyboard. Its info beside the list while it has the focus (focused_row
+    /// ConsoleNameRow).
+    void DrawConsoleNameRow();
+    void DrawConsoleNameInfo();
+    static constexpr int ConsoleNameRow = -2;
     /// The System tab's rows after it, all games' only: each ROM folder the player added
     /// (Config::RomFolders), which cross pressed twice takes off, then the row whose cross opens
     /// the folder picker to add one (picker_folders). Their info beside the list (focused_row
@@ -407,8 +414,10 @@ private:
     void DrawFileRow();
     void DrawFileInfo();
 
-    /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none).
+    /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none; 0-3 the room's
+    /// address, port, nickname and password, KeyboardConsoleName the console name).
     Multiplayer::Fields room_fields{};
+    static constexpr int KeyboardConsoleName = 4;
     int editing_field = -1;
     std::string edit_text;
     bool keyboard_shift{};

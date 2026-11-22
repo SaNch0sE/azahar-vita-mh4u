@@ -24,6 +24,7 @@
 #include "common/logging/log.h"
 #include "common/mutex.h"
 #include "common/settings.h"
+#include "common/string_util.h"
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 
@@ -58,6 +59,10 @@ const std::vector<const char*> Scales{"1x", "1.25x", "1.5x", "1.75x", "2x"};
 const std::vector<const char*> Skips{"0", "1", "2", "3", "4", "none"};
 const std::vector<const char*> Regions{"auto",      "japan", "usa",   "europe",
                                        "australia", "china", "korea", "taiwan"};
+/// Service::CFG::SystemLanguage's order.
+const std::vector<const char*> SystemLanguages{
+    "japanese", "english", "french", "german",     "italian", "spanish",
+    "chinese_simplified", "korean", "dutch", "portuguese", "russian", "chinese_traditional"};
 const std::vector<const char*> Themes{"dark", "light"};
 const std::vector<const char*> UsbVideoScreens{"off", "top", "bottom"};
 const std::vector<const char*> Languages{"english", "chinese_simplified"};
@@ -99,6 +104,8 @@ const std::array<Definition, Count> definitions{{
     {"map_select", true, true, 0, 14, 11, Inputs},
     {"right_stick", true, true, 0, static_cast<int>(RightStickMode::Count) - 1, 0, RightStickWords},
     {"region", false, false, 0, 7, 0, Regions},
+    // English, the config save's own on a new card.
+    {"system_language", false, false, 0, 11, 1, SystemLanguages},
     {"force_new_3ds", true, false, 0, 1, 0, Toggle},
     {"theme", false, true, 0, 1, 0, Themes},
     {"startup_notice", false, true, 0, 1, 1, Toggle},
@@ -130,6 +137,22 @@ enum class Source : u8 { AllGames, Title, Pin };
 std::array<std::atomic<int>, Count> applied_values{};
 std::array<std::atomic<Source>, Count> applied_sources{};
 char applied_title[256];
+
+/// The 3DS's user name the player chose (ConsoleName), empty for the console's own; kept in all
+/// games' section. A copy for WriteApplied, which reads it without the lock.
+constexpr char ConsoleNameKey[] = "console_name";
+std::string console_name;
+/// ConsoleOwnName's, kept in all games' section too.
+constexpr char ConsoleOwnNameKey[] = "console_own_name";
+std::string console_own_name;
+char applied_console_name[64];
+/// RomFolders', kept in all games' section, a line each.
+constexpr char RomFolderKey[] = "rom_folder";
+std::vector<std::string> rom_folders;
+
+void NoteConsoleNameLocked() {
+    std::snprintf(applied_console_name, sizeof(applied_console_name), "%s", console_name.c_str());
+}
 
 const Definition& Of(Option option) {
     return definitions[static_cast<std::size_t>(option)];
@@ -255,6 +278,9 @@ void ApplyLocked(Option option) {
         // Index 0 is the automatic choice, Settings' -1.
         Settings::values.region_value = value - 1;
         break;
+    case Option::SystemLanguage:
+        // Into the config save as a title loads (ApplySystemLanguage), where CFG's module is.
+        break;
     case Option::ForceNew3ds:
         // Read by a title's load (ApplyForLoad before it), and a reset's.
         Settings::values.is_new_3ds = value != 0;
@@ -308,6 +334,20 @@ std::string FormatValue(Option option, int value) {
         return d.words[static_cast<std::size_t>(value)];
     }
     return std::to_string(value);
+}
+
+/// A console name within the 3DS's limit: MaxConsoleName UTF-16 units, cut between characters.
+std::string LimitConsoleName(const std::string& name) {
+    std::u16string units = Common::UTF8ToUTF16(name);
+    if (units.size() > MaxConsoleName) {
+        // A surrogate pair's first half at the cut goes with it.
+        std::size_t keep = MaxConsoleName;
+        if (units[keep - 1] >= 0xD800 && units[keep - 1] <= 0xDBFF) {
+            keep--;
+        }
+        units.resize(keep);
+    }
+    return Common::UTF16ToUTF8(units);
 }
 
 std::string Trim(const std::string& text) {
@@ -399,6 +439,14 @@ void Load() {
             }
             const std::size_t equals = line.find('=');
             const std::string key = Trim(line.substr(0, equals));
+            if (equals != std::string::npos && key == ConsoleNameKey && in_global) {
+                console_name = LimitConsoleName(Trim(line.substr(equals + 1)));
+                continue;
+            }
+            if (equals != std::string::npos && key == ConsoleOwnNameKey && in_global) {
+                console_own_name = Trim(line.substr(equals + 1));
+                continue;
+            }
             if (equals != std::string::npos && key == RomFolderKey && in_global) {
                 AddRomFolderLocked(Trim(line.substr(equals + 1)));
                 continue;
@@ -440,6 +488,7 @@ void Load() {
         filled |= FillFromGlobal(values);
     }
     dirty = filled;
+    NoteConsoleNameLocked();
     ApplyAllLocked();
 }
 
@@ -459,6 +508,12 @@ void Save() {
     for (std::size_t i = 0; i < Count; i++) {
         std::fprintf(f, "%s = %s\n", definitions[i].key,
                      FormatValue(static_cast<Option>(i), global_values[i]).c_str());
+    }
+    if (!console_name.empty()) {
+        std::fprintf(f, "%s = %s\n", ConsoleNameKey, console_name.c_str());
+    }
+    if (!console_own_name.empty()) {
+        std::fprintf(f, "%s = %s\n", ConsoleOwnNameKey, console_own_name.c_str());
     }
     for (const std::string& folder : rom_folders) {
         std::fprintf(f, "%s = %s\n", RomFolderKey, folder.c_str());
@@ -587,6 +642,30 @@ std::optional<int> PinOf(Option option) {
     return pins[static_cast<std::size_t>(option)];
 }
 
+std::string ConsoleName() {
+    std::scoped_lock lock{mutex};
+    return console_name;
+}
+
+void SetConsoleName(const std::string& name) {
+    std::scoped_lock lock{mutex};
+    const std::string wanted = LimitConsoleName(Trim(name));
+    dirty |= wanted != console_name;
+    console_name = wanted;
+    NoteConsoleNameLocked();
+}
+
+std::string ConsoleOwnName() {
+    std::scoped_lock lock{mutex};
+    return console_own_name;
+}
+
+void SetConsoleOwnName(const std::string& name) {
+    std::scoped_lock lock{mutex};
+    dirty |= name != console_own_name;
+    console_own_name = name;
+}
+
 std::vector<std::string> RomFolders() {
     std::scoped_lock lock{mutex};
     return rom_folders;
@@ -635,7 +714,8 @@ std::size_t WriteApplied(char* out, std::size_t size) {
             add(" %s=%d%s", d.key, value, mark);
         }
     }
-    add("\n");
+    add(" %s=%s\n", ConsoleNameKey,
+        applied_console_name[0] != '\0' ? applied_console_name : "(the console's)");
     return at;
 }
 

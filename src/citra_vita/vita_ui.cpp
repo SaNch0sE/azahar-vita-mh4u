@@ -1666,6 +1666,31 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::SystemLanguage,
+         Category::System,
+         Kind::Choice,
+         Translatable("System language"),
+         Translatable("The 3DS's language, which games show their text in. With region Auto, a "
+                      "language the game's region lacks gives that region's own."),
+         {Translatable("Japanese"), Translatable("English"), Translatable("French"),
+          Translatable("German"), Translatable("Italian"), Translatable("Spanish"),
+          Translatable("Simplified Chinese"), Translatable("Korean"), Translatable("Dutch"),
+          Translatable("Portuguese"), Translatable("Russian"), Translatable("Traditional Chinese")},
+         0,
+         nullptr,
+         nullptr});
+    add({Option::ForceNew3ds,
+         Category::System,
+         Kind::Toggle,
+         Translatable("Force New 3DS mode"),
+         Translatable("Runs every game as on a New 3DS. Games with New 3DS enhancements turn them "
+                      "on, which needs more of the Vita's CPU and memory, so they can get slower. "
+                      "Off: only games made for the New 3DS alone run as on one. A save state "
+                      "keeps the mode it was saved in."),
+         {},
+         0,
+         nullptr,
+         nullptr});
     add({Option::StartupNotice,
          Category::System,
          Kind::Toggle,
@@ -2327,6 +2352,44 @@ void Ui::DrawFileInfo() {
     }
 }
 
+void Ui::DrawConsoleNameRow() {
+    constexpr float Pad = 18.0f;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const Card card = CardItem("##console_name", ImVec2(width, RowHeight));
+    if (ImGui::GetFocusID() == card.id) {
+        focused_row = ConsoleNameRow;
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float y = card.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
+        dl->AddText(ImVec2(card.bb.Min.x + Pad, y), Colour(palette->Text), Tr("Console name"));
+        // Not set: the name the 3DS has, AZAHAR on a new one.
+        const std::string name = Config::ConsoleName();
+        const std::string value = name.empty() ? std::string{"AZAHAR"} : name;
+        const float value_width = ImGui::CalcTextSize(value.c_str()).x;
+        dl->AddText(ImVec2(card.bb.Max.x - Pad - value_width, y),
+                    Colour(name.empty() ? palette->TextDim : palette->Text), value.c_str());
+    }
+    if (card.pressed) {
+        editing_field = KeyboardConsoleName;
+        edit_text = Config::ConsoleName();
+        keyboard_shift = false;
+    }
+}
+
+void Ui::DrawConsoleNameInfo() {
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", Tr("Console name"));
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", Tr("The 3DS's user name, which games show: in greetings, as a save's "
+                                "owner, to other players. Up to 10 characters. Empty: AZAHAR."));
+    ImGui::Spacing();
+    if (!game_key.empty()) {
+        Note(palette->Accent, Tr("Takes effect when a game starts."));
+    }
+}
+
 void Ui::DrawRomFolderRows() {
     constexpr float Pad = 18.0f;
     const float width = ImGui::GetContentRegionAvail().x;
@@ -2409,6 +2472,14 @@ void Ui::DrawRomFolderInfo() {
 }
 
 void Ui::DrawRowInfo() {
+    if (focused_row == ConsoleNameRow) {
+        DrawConsoleNameInfo();
+        return;
+    }
+    if (focused_row == RomFolderRow || focused_row == AddRomFolderRow) {
+        DrawRomFolderInfo();
+        return;
+    }
     if (focused_row < 0) {
         return;
     }
@@ -2455,6 +2526,10 @@ void Ui::DrawRowInfo() {
 }
 
 Ui::Action Ui::DrawSettings() {
+    if (editing_field >= 0) {
+        DrawKeyboard();
+        return Action::None;
+    }
     const std::vector<Category> categories = SettingsCategories();
     const bool for_title = !settings_title.empty();
     const auto current = std::find(categories.begin(), categories.end(), category);
@@ -2570,6 +2645,10 @@ Ui::Action Ui::DrawSettings() {
             if (row.category == category && (!for_title || Config::PerTitle(row.option))) {
                 DrawRow(row, i);
             }
+        }
+        if (category == Category::System && !for_title) {
+            DrawConsoleNameRow();
+            DrawRomFolderRows();
         }
     }
     back |= BackPressed();
@@ -3769,13 +3848,21 @@ void Ui::DrawKeyboard() {
     static constexpr const char* key_rows[] = {"1234567890", "qwertyuiop", "asdfghjkl.",
                                                "zxcvbnm-_:"};
     static constexpr const char* titles[] = {Translatable("Address"), Translatable("Port"),
-                                             Translatable("Nickname"), Translatable("Password")};
+                                             Translatable("Nickname"), Translatable("Password"),
+                                             Translatable("Console name")};
+    const std::size_t limit =
+        editing_field == KeyboardConsoleName ? Config::MaxConsoleName : std::size_t{64};
     // Ten keys of 56 a row and their spacing.
     BeginCentered("##keyboard", 700.0f, 420.0f);
     ImGui::Text("%s", Tr(titles[editing_field]));
     ImGui::Separator();
     ImGui::Text("%s_", editing_field == 3 ? std::string(edit_text.size(), '*').c_str()
                                           : edit_text.c_str());
+    // The names with a limit of their own show how much of it is used: keys past it do nothing.
+    if (editing_field == KeyboardConsoleName || editing_field == KeyboardLayoutName) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%zu/%zu", edit_text.size(), limit);
+    }
     ImGui::Spacing();
     const ImVec2 key{56.0f, 44.0f};
     for (const char* row : key_rows) {
@@ -3787,7 +3874,7 @@ void Ui::DrawKeyboard() {
             const char label[2] = {ch, '\0'};
             // The port takes digits only.
             if (ImGui::Button(label, key) && (editing_field != 1 || (ch >= '0' && ch <= '9')) &&
-                edit_text.size() < 64) {
+                edit_text.size() < limit) {
                 edit_text.push_back(ch);
             }
         }
@@ -3797,7 +3884,8 @@ void Ui::DrawKeyboard() {
         keyboard_shift = !keyboard_shift;
     }
     ImGui::SameLine();
-    if (ImGui::Button(Tr("Space"), ImVec2(110.0f, 44.0f)) && editing_field != 1) {
+    if (ImGui::Button(Tr("Space"), ImVec2(110.0f, 44.0f)) && editing_field != 1 &&
+        edit_text.size() < limit) {
         edit_text.push_back(' ');
     }
     ImGui::SameLine();
@@ -3822,6 +3910,9 @@ void Ui::DrawKeyboard() {
             break;
         case 2:
             room_fields.nickname = edit_text;
+            break;
+        case KeyboardConsoleName:
+            Config::SetConsoleName(edit_text);
             break;
         default:
             room_fields.password = edit_text;

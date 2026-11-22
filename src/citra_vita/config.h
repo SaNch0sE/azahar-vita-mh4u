@@ -73,6 +73,11 @@ enum class Option : u32 {
     MapSelect,
     RightStick,
     Region,
+    /// The 3DS's system language (Service::CFG::SystemLanguage's order: Japanese, English, French,
+    /// German, Italian, Spanish, Simplified Chinese, Korean, Dutch, Portuguese, Russian,
+    /// Traditional Chinese), written into the config save as a title loads. With the region on
+    /// auto, a language the title's region lacks gives that region's first.
+    SystemLanguage,
     /// Every title as on a New 3DS (Settings' is_new_3ds): 1, or 0 for the New 3DS's own titles
     /// alone. Read as a title loads.
     ForceNew3ds,
@@ -142,10 +147,11 @@ enum class RightStickMode : int {
 /// Whether a title can have its own value. The options for the screens, the speed and the
 /// controls are: what suits one title (a top screen it needs whole, a scale its GPU work allows,
 /// vsync where its frame rate is uneven, ZL on a button it leaves free) does not suit the next. The
-/// sound, the region, the menus' theme and language and the start-up notice are the player's or
+/// sound, the region, the system language, the menus' theme and language and the start-up notice are the player's or
 /// the console's, the same whatever runs.
 [[nodiscard]] bool PerTitle(Option option);
-/// Whether a change takes effect under a running title. The region is read as a title loads.
+/// Whether a change takes effect under a running title. The region and the system language are
+/// read as a title loads.
 [[nodiscard]] bool Runtime(Option option);
 /// The option's range: 0 and 1 for a toggle, 0 and the last index for a choice.
 [[nodiscard]] int Minimum(Option option);
@@ -193,6 +199,18 @@ void ClearTitleValues(const std::string& title);
 /// option takes the pin away: what the player chose last is what runs.
 void Pin(Option option, int value);
 [[nodiscard]] std::optional<int> PinOf(Option option);
+
+/// The 3DS's user name the games read (CFG's username: a greeting, a save's owner), which a title
+/// gets as it starts; empty for the console's own (AZAHAR on a new one). At most MaxConsoleName
+/// UTF-16 units, the 3DS's limit, cut between characters (a settings file's longer name too); the
+/// menus' keyboard types ASCII only and shows how many are left.
+constexpr std::size_t MaxConsoleName = 10;
+[[nodiscard]] std::string ConsoleName();
+void SetConsoleName(const std::string& name);
+/// The name the console's config save held before the first ConsoleName written into it, which
+/// clearing the setting brings back; empty while none was written.
+[[nodiscard]] std::string ConsoleOwnName();
+void SetConsoleOwnName(const std::string& name);
 
 /// The folders the game list takes titles from besides ux0:data/azahar/roms, in the order the
 /// player added them: on another memory device (a USB or SD2Vita card's uma0:) or anywhere on one.

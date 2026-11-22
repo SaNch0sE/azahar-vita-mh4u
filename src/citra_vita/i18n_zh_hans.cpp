@@ -82,6 +82,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Circle", "○ 按钮"},
     {"Close", "关闭"},
     {"Command buffer reported", "上报命令缓冲区"},
+    {"Console name", "主机名称"},
     {"Continue", "继续"},
     {"Controls", "按键"},
     {"Could not load this title: {}", "无法加载此游戏：{}"},
@@ -113,7 +114,9 @@ constexpr std::array table{std::to_array<Translation>({
      "以更高分辨率绘制上屏：在“单屏”和“大屏”布局下更清晰，但 GPU 负担大幅增加（1.5x 时约为 2.25 "
      "倍），本来就慢的游戏会更慢。占用显存较多的游戏可能会崩溃。"},
     {"Dump frame", "转储画面"},
+    {"Dutch", "荷兰语"},
     {"Empty", "空"},
+    {"English", "英语"},
     {"Enter an address and a nickname to join.", "输入地址和昵称后即可加入。"},
     {"Europe", "欧洲"},
     {"Exit", "退出"},
@@ -137,6 +140,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Frame skip limit", "跳帧上限"},
     {"Free {} MiB on the memory card, then install it again.",
      "请在存储卡上腾出 {} MiB 空间，然后重新安装。"},
+    {"French", "法语"},
     {"From {}.", "来自 {}。"},
     {"Full check", "完整检查"},
     {"Game settings", "游戏设置"},
@@ -146,6 +150,7 @@ constexpr std::array table{std::to_array<Translation>({
      "为 3D 设计的游戏会为左右眼各绘制一次画面，而 Vita 只显示其中一个。开启后不绘制右眼画面，速度更"
      "快。如果某个游戏的上屏一直是灰色、黑色或静止不动，请为它关闭此选项。"},
     {"GBA titles are not supported", "不支持 GBA 游戏"},
+    {"German", "德语"},
     {"Host ad hoc", "创建本地联机"},
     {"Hosting an ad hoc room at {}", "已创建本地联机房间，地址：{}"},
     {"How fast the game may run, in percent of full speed. No limit runs it as fast as the console"
@@ -174,7 +179,9 @@ constexpr std::array table{std::to_array<Translation>({
     {"Installed game", "游戏本体"},
     {"Installing {}...", "正在安装 {}…"},
     {"it is encrypted. Decrypt it, then try again.", "文件已加密。请解密后重试。"},
+    {"Italian", "意大利语"},
     {"Japan", "日本"},
+    {"Japanese", "日语"},
     {"Join", "加入"},
     {"Join a room hosted by Azahar on a PC (Multiplayer > Host Room) or a room server, or play ad "
      "hoc with Vitas nearby: one hosts, the others join. Then everyone plays the same game in its "
@@ -188,6 +195,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Joining {}...", "正在加入 {}…"},
     {"kicked by the room's host", "已被房主踢出"},
     {"Korea", "韩国"},
+    {"Korean", "韩语"},
     {"L and R", "L 和 R"},
     {"Language", "语言"},
     {"Large overlay", "大号叠加"},
@@ -264,6 +272,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Pinned: its LiveArea bubble starts the game in Azahar.",
      "已固定：点击其 LiveArea 图标即可在 Azahar 中启动游戏。"},
     {"Port", "端口"},
+    {"Portuguese", "葡萄牙语"},
     {"Play without", "直接游戏"},
     {"Press X or O to continue.", "按 × 或 ○ 继续。"},
     {"Put this game's Gateway codes in {}: a [name] line for each cheat, then its code lines. "
@@ -298,6 +307,7 @@ constexpr std::array table{std::to_array<Translation>({
      "让所有游戏都像在 New 3DS 上一样运行。带有 New 3DS 增强功能的游戏会启用这些功能，这需要更多的 "
      "Vita CPU 和内存，因此可能变慢。关闭时，只有 New 3DS 专用游戏会以该模式运行。即时存档会保留保存"
      "时的模式。"},
+    {"Russian", "俄语"},
     {"Save", "保存"},
     {"Save over slot {}? Its state from {} is replaced.",
      "要覆盖槽位 {} 吗？{} 保存的即时存档将被替换。"},
@@ -330,6 +340,7 @@ constexpr std::array table{std::to_array<Translation>({
      "扩展宽屏：两侧显示更多场景；可能导致画面异常，部分游戏的新增边缘会是空白或绘制错误。拉伸宽屏："
      "将画面拉伸至屏幕宽度。"},
     {"Side by side", "并排"},
+    {"Simplified Chinese", "简体中文"},
     {"Single screen", "单屏"},
     {"Skip the 3D right eye", "跳过 3D 右眼画面"},
     {"Slot {}", "槽位 {}"},
@@ -349,6 +360,7 @@ constexpr std::array table{std::to_array<Translation>({
      "存较多的游戏可能会崩溃。"},
     {"Sound", "声音"},
     {"Space", "空格"},
+    {"Spanish", "西班牙语"},
     {"Speed", "速度"},
     {"Speed limit", "速度限制"},
     {"Square", "□ 按钮"},
@@ -356,12 +368,20 @@ constexpr std::array table{std::to_array<Translation>({
     {"Stretch audio", "音频拉伸"},
     {"Swap screens", "交换屏幕"},
     {"System", "系统"},
+    {"System language", "系统语言"},
     {"Tab", "切换分页"},
     {"Taiwan", "台湾"},
     {"Take over", "接管"},
     {"Take {}'s bubble off the LiveArea?", "要从 LiveArea 移除 {} 的图标吗？"},
     {"Takes effect when a game starts.", "下次启动游戏时生效。"},
+    {"The 3DS's language, which games show their text in. With region Auto, a language "
+     "the game's region lacks gives that region's own.",
+     "3DS 的语言，游戏以此语言显示文字。地区为“自动”时，若游戏的地区没有该语言，则使用该地区自己的语言。"},
     {"the connection to the room was lost", "与房间的连接已断开"},
+    {"The 3DS's user name, which games show: in greetings, as a save's owner, to other players. "
+     "Up to 10 characters. Empty: AZAHAR.",
+     "3DS 的用户名称，游戏会显示它：问候语、存档的所有者、其他玩家看到的名字。最多 10 个字符。留"
+     "空：AZAHAR。"},
     {"The console region reported to the game. Auto picks one the game accepts.",
      "报告给游戏的主机地区。“自动”会选择游戏接受的地区。"},
     {"the CPU could not start: azaharnative could not take a core",
@@ -444,6 +464,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"To report it, send this file:", "如需报告，请发送此文件："},
     {"Top screen", "上屏"},
     {"Top screen resolution", "上屏分辨率"},
+    {"Traditional Chinese", "繁体中文"},
     {"Triangle", "△ 按钮"},
     {"unknown error", "未知错误"},
     {"unknown file type", "未知的文件类型"},

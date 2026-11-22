@@ -75,10 +75,12 @@
 #include "common/logging/filter.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
+#include "common/string_util.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/image_interface.h"
+#include "core/hle/service/cfg/cfg.h"
 #include "core/hle/service/plgldr/plgldr.h"
 #include "core/hle/service/service.h"
 #include "core/loader/loader.h"
@@ -1447,6 +1449,60 @@ std::string CrashWhat(const VitaFrontend::Ui& ui, const char* what, std::string_
     return text;
 }
 
+/// The console name the player chose (Config::ConsoleName) into the config save, as the 3DS's own
+/// settings write it: its user name, which games read through CFG. After the load made CFG's
+/// module, before the title's first instruction; the save is written only where the name differs.
+void ApplyConsoleName(Core::System& system) {
+    // The name set, or with none the console's own: the name its config save held before the
+    // first one written (Config::ConsoleOwnName), brought back once the setting is cleared.
+    // Never set, the save is left as it is.
+    const auto cfg = Service::CFG::GetModule(system);
+    ASSERT_MSG(cfg != nullptr, "console name: no CFG module after the load");
+    const std::string set = Config::ConsoleName();
+    const std::string own = Config::ConsoleOwnName();
+    std::string name;
+    if (!set.empty()) {
+        name = set;
+        if (own.empty() && cfg->GetUsername() != Common::UTF8ToUTF16(set)) {
+            const std::string current = Common::UTF16ToUTF8(cfg->GetUsername());
+            Config::SetConsoleOwnName(current.empty() ? std::string{"AZAHAR"} : current);
+            Config::Save();
+        }
+    } else if (!own.empty()) {
+        name = own;
+        Config::SetConsoleOwnName({});
+        Config::Save();
+    } else {
+        return;
+    }
+    const std::u16string wanted = Common::UTF8ToUTF16(name);
+    if (cfg->GetUsername() == wanted) {
+        return;
+    }
+    cfg->SetUsername(wanted);
+    const Result written = cfg->UpdateConfigNANDSavegame();
+    sceClibPrintf("[azahar] console name %s: %s\n", name.c_str(),
+                  written.IsSuccess() ? "written" : "not written to the config save");
+}
+
+/// The system language the player chose (Config::Option::SystemLanguage) into the config save, as
+/// the 3DS's own settings write it. Like ApplyConsoleName, before the title's first instruction,
+/// and before anything reads the language: with the region on auto the first read picks the
+/// region from it (CFG's UpdatePreferredRegionCode). The save is written only where it differs.
+void ApplySystemLanguage(Core::System& system) {
+    const auto cfg = Service::CFG::GetModule(system);
+    ASSERT_MSG(cfg != nullptr, "system language: no CFG module after the load");
+    const auto wanted = static_cast<Service::CFG::SystemLanguage>(
+        Config::Effective(Config::Option::SystemLanguage));
+    if (cfg->GetRawSystemLanguage() == wanted) {
+        return;
+    }
+    cfg->SetSystemLanguage(wanted);
+    const Result written = cfg->UpdateConfigNANDSavegame();
+    sceClibPrintf("[azahar] system language %d: %s\n", static_cast<int>(wanted),
+                  written.IsSuccess() ? "written" : "not written to the config save");
+}
+
 /// What copy runs, for a crash report: the name, the product code and version (an update's or the
 /// cartridge's), the file's type and size, and its 3GX plugin. At a title's start and after a jump
 /// to another title, which the core makes alone.
@@ -1619,6 +1675,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             ui.ClearStatusMessage();
         }
     }
+    ApplyConsoleName(system);
+    ApplySystemLanguage(system);
     Config::SetRunningTitle(Config::TitleKeyOf(path));
     NoteRunningTitle(system);
     system.SetResetCallback([&system] {

@@ -540,6 +540,13 @@ public:
     SystemLanguage GetSystemLanguage();
 
     /**
+     * Gets the system language from config savegame as it is: without choosing the preferred
+     * region first (GetSystemLanguage), which may adjust it to the title's region.
+     * @returns the system language
+     */
+    SystemLanguage GetRawSystemLanguage();
+
+    /**
      * Sets the sound output mode in config savegame.
      * @param mode the sound output mode to set
      */
@@ -647,7 +654,6 @@ public:
 
 private:
     void UpdatePreferredRegionCode();
-    SystemLanguage GetRawSystemLanguage();
 
     Core::System& system;
 
