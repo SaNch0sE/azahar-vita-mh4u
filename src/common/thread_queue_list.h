@@ -125,6 +125,17 @@ struct ThreadQueueList {
         return cur->data.empty();
     }
 
+    /// Each thread with its level, most urgent level first, each level front to back.
+    template <typename F>
+    void for_each(F&& f) const {
+        for (u64 levels = nonempty; levels != 0; levels &= levels - 1) {
+            const Priority priority = static_cast<Priority>(std::countr_zero(levels));
+            for (const T& t : queues[priority].data) {
+                f(priority, t);
+            }
+        }
+    }
+
     void prepare(Priority priority) {
         Queue* cur = &queues[priority];
         if (cur->next_nonempty == UnlinkedTag())

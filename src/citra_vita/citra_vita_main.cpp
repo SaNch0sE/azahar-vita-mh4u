@@ -289,6 +289,9 @@ StateArguments TakeStateArguments() {
             a.load = std::atoi(argument.c_str() + 5);
         } else if (argument == "commands") {
             a.commands = true;
+        } else if (argument == "sched=0") {
+            // The module's in-kernel scheduling off: every SleepThread exits to the HLE kernel.
+            Core::SetVitaInKernelScheduling(false);
         } else if (argument.starts_with("save=")) {
             a.save = std::atoi(argument.c_str() + 5);
             if (const std::size_t at = argument.find('@'); at != std::string::npos) {
@@ -631,6 +634,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         svcs += fmt::format("{}{:02x} {}", svcs.empty() ? "" : ", ", i, n.svcs[i]);
                     }
                     LOG_INFO(Frontend, "perf: svc exits: {}", svcs.empty() ? "none" : svcs);
+                    LOG_INFO(Frontend,
+                             "perf: in-kernel scheduling: {} slices with the thread table, {} "
+                             "switches, {} SleepThreads answered, {} idle stretches skipped",
+                             n.sched_slices, n.sched_switches, n.sched_sleeps, n.sched_idle);
                     std::string sleeps;
                     for (const auto& s : n.sleeps) {
                         if (s.count != 0) {

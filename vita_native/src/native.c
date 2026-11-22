@@ -400,9 +400,17 @@ typedef struct AzaharCore {
     uint32_t attached;
     // The azahar_code_gen this core's instruction cache last caught up with (core2_install).
     uint32_t code_gen;
-    AzaharRunRequest run_req;
 } AzaharCore;
 static AzaharCore azahar_core[AZAHAR_CORES];
+// In-kernel scheduling's thread table and the contexts of the threads that do not run (version
+// 34): read while the core is sealed, so the seal keeps their megabytes (azaharMap's data list).
+static AzaharSchedThread sched_table[AZAHAR_SCHED_MAX];
+static AzaharContext sched_ctx[AZAHAR_SCHED_MAX];
+// Its functions run sealed too (between sub-slices): the seal keeps their megabytes as well.
+typedef struct SchedRun SchedRun;
+static void sched_fold_run(unsigned n, SchedRun *r);
+static int sched_sleep(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast);
+static void sched_reschedule(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast);
 
 // The core this runs on. Not ksceKernelCpuId: nothing of Sony's kernel is mapped once a core is
 // sealed (a call to it there takes a prefetch abort).
@@ -960,7 +968,32 @@ static int alloc_block(const char *name, SceSize size, SceSize align, SceUID *ui
     return 0;
 }
 
+// azaharRun's requests: the app's own blocks, one per emulated core, mapped into
+// the kernel at a block's first call and read and written in place from then on, not copied in
+// and out on every call (about 600 bytes each way, interrupts suspended for both). A block the app
+// no longer runs gives its slot to a new one, the least recently run first; all are unmapped with
+// the map's blocks.
+#define AZAHAR_RUN_BLOCKS 4u
+typedef struct AzaharRunBlock {
+    const AzaharRunRequest *user; // the app's address, NULL for a free slot
+    AzaharRunRequest *req;        // the kernel's view of it
+    SceUID uid;
+    uint32_t last_run;            // azahar_run_count at its last call
+} AzaharRunBlock;
+static AzaharRunBlock azahar_run_blocks[AZAHAR_RUN_BLOCKS];
+
+static void run_blocks_unmap(void) {
+    for (unsigned i = 0; i < AZAHAR_RUN_BLOCKS; i++) {
+        AzaharRunBlock *const b = &azahar_run_blocks[i];
+        if (b->user) {
+            ksceKernelUserUnmap(b->uid);
+            b->user = NULL;
+        }
+    }
+}
+
 static void free_blocks(void) {
+    run_blocks_unmap();
     if (azahar_vec_uid >= 0) { ksceKernelFreeMemBlock(azahar_vec_uid); azahar_vec_uid = -1; }
     if (azahar_l2_uid >= 0) { ksceKernelFreeMemBlock(azahar_l2_uid); azahar_l2_uid = -1; }
     if (azahar_l1_uid >= 0) { ksceKernelFreeMemBlock(azahar_l1_uid); azahar_l1_uid = -1; }
@@ -1444,14 +1477,20 @@ static int build_table(const AzaharMapRequest *req) {
                 (uint32_t)(uintptr_t)&azahar_get_banked_sp, (uint32_t)(uintptr_t)&core2_entry,
                 (uint32_t)(uintptr_t)&core2_run,         (uint32_t)(uintptr_t)&core2_install,
                 (uint32_t)(uintptr_t)&core2_uninstall,   (uint32_t)(uintptr_t)&translate,
+                (uint32_t)(uintptr_t)&sched_fold_run,    (uint32_t)(uintptr_t)&sched_sleep,
+                (uint32_t)(uintptr_t)&sched_reschedule,
             };
             const uint32_t data_syms[] = {
                 (uint32_t)(uintptr_t)&azahar_cpu[0],    (uint32_t)(uintptr_t)azahar_cpu[3].guard,
-                (uint32_t)(uintptr_t)&azahar_core[0],   (uint32_t)(uintptr_t)&azahar_core[3].run_req,
+                (uint32_t)(uintptr_t)&azahar_core[0],   (uint32_t)(uintptr_t)&azahar_core[3].code_gen,
                 (uint32_t)(uintptr_t)&azahar_cmd,       (uint32_t)(uintptr_t)&azahar_heartbeat,
                 (uint32_t)(uintptr_t)&azahar_timer_sample, (uint32_t)(uintptr_t)&gic_va,
                 (uint32_t)(uintptr_t)&azahar_l1_pa,     (uint32_t)(uintptr_t)azahar_sony,
                 (uint32_t)(uintptr_t)&azahar_state,
+                (uint32_t)(uintptr_t)sched_table,
+                (uint32_t)(uintptr_t)&sched_table[AZAHAR_SCHED_MAX - 1] + sizeof(AzaharSchedThread) - 1,
+                (uint32_t)(uintptr_t)sched_ctx,
+                (uint32_t)(uintptr_t)&sched_ctx[AZAHAR_SCHED_MAX - 1] + sizeof(AzaharContext) - 1,
             };
             uint32_t bases[2] = {0, 0};
             for (unsigned seg = 0; seg < 2; seg++) {
@@ -1529,8 +1568,13 @@ static int build_table(const AzaharMapRequest *req) {
             (uint32_t)(uintptr_t)&azahar_core[0],     (uint32_t)(uintptr_t)&azahar_cmd,
             (uint32_t)(uintptr_t)&azahar_heartbeat,   (uint32_t)(uintptr_t)&azahar_timer_sample,
             (uint32_t)(uintptr_t)&gic_va,
-            (uint32_t)(uintptr_t)&azahar_l1_pa,       (uint32_t)(uintptr_t)&azahar_core[3].run_req,
+            (uint32_t)(uintptr_t)&azahar_l1_pa,       (uint32_t)(uintptr_t)&azahar_core[3].code_gen,
             (uint32_t)(uintptr_t)azahar_sony,         (uint32_t)(uintptr_t)&azahar_state,
+            (uint32_t)(uintptr_t)&sched_fold_run,     (uint32_t)(uintptr_t)&sched_sleep,
+            (uint32_t)(uintptr_t)&sched_reschedule,   (uint32_t)(uintptr_t)sched_table,
+            (uint32_t)(uintptr_t)&sched_table[AZAHAR_SCHED_MAX - 1],
+            (uint32_t)(uintptr_t)sched_ctx,
+            (uint32_t)(uintptr_t)&sched_ctx[AZAHAR_SCHED_MAX - 1],
         };
         for (unsigned i = 0; i < sizeof(spot) / sizeof(spot[0]); i++) {
             keep[nkeep].addr = spot[i];
@@ -1821,6 +1865,249 @@ out:
     return ret;
 }
 
+// ---------------------------------------------------------------------------- in-kernel scheduling
+// azaharRun's thread table (azahar_native.h, AzaharSchedThread) and the contexts of the threads
+// that do not run (sched_table, sched_ctx above), copied in before the core is sealed: nothing
+// of the app is mapped then, only the guest's table and this module. The rules are
+// Kernel::ThreadManager's.
+
+struct SchedRun {
+    unsigned count;
+    int current;            // the RUNNING index, or -1
+    uint64_t now;           // the guest clock
+    uint64_t deadline;
+    // Guest ticks to timer ticks and nanoseconds to guest ticks, as integer and 32-bit
+    // fraction parts made before the seal: a division is a call into Sony's kernel
+    // (__aeabi_uldivmod), which nothing maps while the core is sealed.
+    uint32_t timer_int, timer_frac, ns_int, ns_frac;
+    int32_t front, back;    // the next push_front / push_back order
+    uint32_t switches, sleeps, idle;
+    uint32_t handled;       // the last stop was an svc answered here (sched_handled)
+};
+
+// A copy for sealed code: a struct assignment or memcpy is a call into Sony's kernel there.
+static void sealed_copy(void *dst, const void *src, unsigned bytes) {
+    volatile uint32_t *const d = (volatile uint32_t *)dst;
+    const volatile uint32_t *const s = (const volatile uint32_t *)src;
+    for (unsigned i = 0; i < bytes / 4u; i++) {
+        d[i] = s[i];
+    }
+}
+
+// x * (int + frac / 2^32) for x below 2^32, without a division.
+static uint64_t sched_scale(uint32_t x, uint32_t whole, uint32_t frac) {
+    return (uint64_t)x * whole + (((uint64_t)x * frac) >> 32);
+}
+
+// The most urgent READY thread better than `limit` (priority strictly lower), oldest first.
+static int sched_best(const SchedRun *r, uint32_t limit) {
+    int best = -1;
+    for (unsigned i = 0; i < r->count; i++) {
+        const AzaharSchedThread *t = &sched_table[i];
+        if (t->state != AZAHAR_SCHED_READY || t->priority >= limit) {
+            continue;
+        }
+        if (best < 0 || t->priority < sched_table[best].priority ||
+            (t->priority == sched_table[best].priority && t->order < sched_table[best].order)) {
+            best = (int)i;
+        }
+    }
+    return best;
+}
+
+// The sleepers whose wake is due become READY at the back of their level, in wake order (the
+// HLE kernel's wake events fire in time order, ties by when they were scheduled: by index here).
+static void sched_wake_due(SchedRun *r) {
+    for (;;) {
+        int due = -1;
+        for (unsigned i = 0; i < r->count; i++) {
+            const AzaharSchedThread *t = &sched_table[i];
+            if (t->state == AZAHAR_SCHED_SLEEP && t->wake <= r->now &&
+                (due < 0 || t->wake < sched_table[due].wake)) {
+                due = (int)i;
+            }
+        }
+        if (due < 0) {
+            return;
+        }
+        sched_table[due].state = AZAHAR_SCHED_READY;
+        sched_table[due].order = r->back++;
+    }
+}
+
+// The earliest sleeper's wake, or ~0.
+static uint64_t sched_next_wake(const SchedRun *r) {
+    uint64_t next = ~0ull;
+    for (unsigned i = 0; i < r->count; i++) {
+        if (sched_table[i].state == AZAHAR_SCHED_SLEEP && sched_table[i].wake < next) {
+            next = sched_table[i].wake;
+        }
+    }
+    return next;
+}
+
+// The running thread stops in `cpu->ctx` (state set by the caller); `next` runs from its copy.
+static void sched_switch(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast, int next) {
+    if (r->current >= 0) {
+        sealed_copy(&sched_ctx[r->current], &cpu->ctx, sizeof(AzaharContext));
+        sched_table[r->current].saved = 1;
+    }
+    r->current = next;
+    if (next >= 0) {
+        AzaharSchedThread *t = &sched_table[next];
+        // TPIDRURW stays the core's, as the HLE kernel's switch leaves it.
+        const uint32_t rw = cpu->ctx.tpidrurw;
+        sealed_copy(&cpu->ctx, &sched_ctx[next], sizeof(AzaharContext));
+        cpu->ctx.tpidruro = t->tls;
+        cpu->ctx.tpidrurw = rw;
+        cpu->ctx.cpsr = (cpu->ctx.cpsr & ~0x1DFu) | 0x10u;
+        t->state = AZAHAR_SCHED_RUNNING;
+        fast->thread_id = t->id;
+    }
+    r->switches++;
+}
+
+// After a slice boundary: due sleepers wake, and one more urgent than the running thread takes
+// the core (the running one to the front of its level). With none running, the most urgent.
+static void sched_reschedule(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast) {
+    sched_wake_due(r);
+    const uint32_t limit = r->current >= 0 ? sched_table[r->current].priority : 64u;
+    const int next = sched_best(r, limit);
+    if (next < 0) {
+        return;
+    }
+    if (r->current >= 0) {
+        sched_table[r->current].state = AZAHAR_SCHED_READY;
+        sched_table[r->current].order = r->front--;
+    }
+    sched_switch(r, cpu, fast, next);
+}
+
+// The running thread's SleepThread: 1 when answered here (some thread runs on, or the clock
+// reached the deadline idle), 0 to leave it to the app. SVC::SleepThread: 0 ns with nothing
+// else ready returns at once; otherwise the thread sleeps and a wake event of ns is set.
+static int sched_sleep(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast) {
+    const int64_t ns = (int64_t)((uint64_t)cpu->ctx.r[1] << 32 | cpu->ctx.r[0]);
+    if (ns < 0 || ns > 0xFFFFFFFFll || r->current < 0) {
+        return 0; // forever, or 4.3 s and more: the app's
+    }
+    if (ns == 0 && sched_best(r, 64u) < 0) {
+        return 1;
+    }
+    AzaharSchedThread *t = &sched_table[r->current];
+    t->state = AZAHAR_SCHED_SLEEP;
+    // nsToCycles, the HLE kernel's conversion (the app keeps the clock unscaled for this).
+    t->wake = r->now + sched_scale((uint32_t)ns, r->ns_int, r->ns_frac);
+    r->sleeps++;
+    for (;;) {
+        sched_wake_due(r);
+        const int next = sched_best(r, 64u);
+        if (next >= 0) {
+            sched_switch(r, cpu, fast, next);
+            return 1;
+        }
+        const uint64_t wake = sched_next_wake(r);
+        if (wake >= r->deadline) {
+            // Idle up to the app's next event: its loop idles there, with no thread running.
+            sched_switch(r, cpu, fast, -1);
+            return 1;
+        }
+        r->now = wake;
+        r->idle++;
+    }
+}
+
+// The slice under the table: sub-slices up to the deadline or the next wake, the svcs the
+// scheduler answers handled between them. The core is sealed throughout.
+static void sched_fold_run(unsigned n, SchedRun *r) {
+    AzaharCpu *const cpu = &azahar_cpu[n];
+    AzaharCore *const core = &azahar_core[n];
+    AzaharFast *const fast = &cpu->fast;
+    core2_install(n);
+    for (;;) {
+        uint64_t end = r->deadline;
+        const uint64_t wake = sched_next_wake(r);
+        if (wake < end) {
+            end = wake;
+        }
+        if (end <= r->now) {
+            end = r->now + 1;
+        }
+        // Guest ticks to timer ticks, at least one.
+        const uint64_t span = end - r->now;
+        const uint64_t ticks = sched_scale(span > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)span,
+                                           r->timer_int, r->timer_frac);
+        core->quantum_ticks = ticks == 0 ? 1u : ticks > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)ticks;
+        fast->quantum = core->quantum_ticks;
+        fast->base_lo = (uint32_t)r->now;
+        fast->base_hi = (uint32_t)(r->now >> 32);
+        core2_run(n);
+        r->now += fast_guest_ticks(fast, core->quantum_ticks - core->timer_left);
+        r->handled = 0;
+        if (core->run_reason == AZAHAR_EXIT_TIMER) {
+            if (r->now < end) {
+                r->now = end;
+            }
+            if (r->now >= r->deadline) {
+                break;
+            }
+            sched_reschedule(r, cpu, fast);
+            if (r->current < 0) {
+                break;
+            }
+            continue;
+        }
+        if (core->run_reason == AZAHAR_EXIT_SVC && core->run_svc == 0x0Au && sched_sleep(r, cpu, fast)) {
+            r->handled = 1;
+            if (r->current < 0 || r->now >= r->deadline) {
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    core2_uninstall(n);
+}
+
+// The kernel's view of the app's request block `user`, mapped at its first call; NULL if it
+// cannot be.
+static AzaharRunRequest *run_block(const AzaharRunRequest *user) {
+    AzaharRunBlock *slot = &azahar_run_blocks[0];
+    for (unsigned i = 0; i < AZAHAR_RUN_BLOCKS; i++) {
+        AzaharRunBlock *const b = &azahar_run_blocks[i];
+        if (b->user == user) {
+            b->last_run = azahar_run_count;
+            return b->req;
+        }
+        if (slot->user && (!b->user || b->last_run < slot->last_run)) {
+            slot = b;
+        }
+    }
+    if (((uintptr_t)user & 7u) != 0) {
+        emit("  run block %p is not 8-byte aligned\n", user);
+        return NULL;
+    }
+    if (slot->user) {
+        emit("  run block %p gives its slot to %p\n", slot->user, user);
+        ksceKernelUserUnmap(slot->uid);
+        slot->user = NULL;
+    }
+    void *page = NULL;
+    SceSize size = 0;
+    SceUInt32 offset = 0;
+    const SceUID uid =
+        ksceKernelUserMap("AzaharRunRequest", 3, user, sizeof(*user), &page, &size, &offset);
+    if (uid < 0) {
+        emit("  run block %p: ksceKernelUserMap 0x%08x\n", user, (uint32_t)uid);
+        return NULL;
+    }
+    slot->user = user;
+    slot->req = (AzaharRunRequest *)((uintptr_t)page + offset);
+    slot->uid = uid;
+    slot->last_run = azahar_run_count;
+    return slot->req;
+}
+
 int azaharRun(AzaharRunRequest *user_req) {
     uint32_t state;
     ENTER_SYSCALL(state);
@@ -1832,7 +2119,6 @@ int azaharRun(AzaharRunRequest *user_req) {
     const unsigned n = azahar_folded ? this_core() : AZAHAR_TARGET_CORE;
     AzaharCpu *const cpu = &azahar_cpu[n];
     AzaharCore *const core = &azahar_core[n];
-    AzaharRunRequest *const req = &core->run_req;
     AzaharFast *const fast = &cpu->fast;
 
     if (azahar_state != ST_MAPPED) {
@@ -1899,9 +2185,53 @@ int azaharRun(AzaharRunRequest *user_req) {
              req->quantum_us, core->quantum_ticks);
     }
 
+    // In-kernel scheduling (version 34): folded and timed only. The table and the contexts of
+    // the threads that do not run come in now, while the app is mapped.
+    SchedRun sched = {0};
+    const int sched_on = azahar_folded && timed && req->sched && req->sched_count &&
+                         req->sched_count <= AZAHAR_SCHED_MAX && req->sched_current >= 0 &&
+                         (uint32_t)req->sched_current < req->sched_count;
+    req->sched_handled = req->sched_switches = req->sched_sleeps = req->sched_idle = 0;
+    if (sched_on) {
+        if (ksceKernelCopyFromUser(sched_table, req->sched,
+                                   req->sched_count * sizeof(AzaharSchedThread)) < 0) {
+            ret = AZAHAR_ERR_ARG;
+            goto out;
+        }
+        sched.count = req->sched_count;
+        sched.current = req->sched_current;
+        sched.now = req->tick_base;
+        sched.deadline = req->sched_deadline;
+        sched.timer_int = (uint32_t)(core->timer_hz / req->tick_hz);
+        sched.timer_frac = (uint32_t)((((uint64_t)core->timer_hz % req->tick_hz) << 32) / req->tick_hz);
+        sched.ns_int = (uint32_t)(req->tick_hz / 1000000000ull);
+        sched.ns_frac = (uint32_t)(((req->tick_hz % 1000000000ull) << 32) / 1000000000ull);
+        sched.front = -1;
+        sched.back = 0;
+        for (unsigned i = 0; i < sched.count; i++) {
+            AzaharSchedThread *t = &sched_table[i];
+            t->saved = 0;
+            if (t->state == AZAHAR_SCHED_READY && t->order >= sched.back) {
+                sched.back = t->order + 1;
+            }
+            if (t->state == AZAHAR_SCHED_READY && t->order <= sched.front) {
+                sched.front = t->order - 1;
+            }
+            if ((int)i != sched.current && t->state != AZAHAR_SCHED_RUNNING &&
+                ksceKernelCopyFromUser(&sched_ctx[i], t->ctx, sizeof(AzaharContext)) < 0) {
+                ret = AZAHAR_ERR_ARG;
+                goto out;
+            }
+        }
+    }
+
     if (azahar_folded) {
         azahar_on_core = n;
-        fold_run(n);
+        if (sched_on) {
+            sched_fold_run(n, &sched);
+        } else {
+            fold_run(n);
+        }
         ret = 0;
     } else if ((ret = core2_command(CMD_RUN, AZAHAR_RUN_WAIT_STEPS)) != 0) {
         emit("== azaharRun  pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u ticks\n",
@@ -1936,6 +2266,25 @@ int azaharRun(AzaharRunRequest *user_req) {
     // The counter read at the exit is below every one azahar_svc_fast read, so no GetSystemTick
     // it answered is ahead of tick_base + guest_ticks.
     req->guest_ticks = timed ? fast_guest_ticks(fast, core->quantum_ticks - core->timer_left) : 0;
+    if (sched_on) {
+        // The whole slice on the guest clock, idle stretches included; the contexts of the
+        // threads that stopped running go back to the app's copies.
+        req->guest_ticks = sched.now - req->tick_base;
+        req->sched_current = sched.current;
+        req->sched_switches = sched.switches;
+        req->sched_sleeps = sched.sleeps;
+        req->sched_idle = sched.idle;
+        req->sched_handled = sched.handled;
+        for (unsigned i = 0; i < sched.count; i++) {
+            if (sched_table[i].saved &&
+                ksceKernelCopyToUser(sched_table[i].ctx, &sched_ctx[i], sizeof(AzaharContext)) < 0) {
+                ret = AZAHAR_ERR_ARG;
+            }
+        }
+        if (ksceKernelCopyToUser(req->sched, sched_table, sched.count * sizeof(AzaharSchedThread)) < 0) {
+            ret = AZAHAR_ERR_ARG;
+        }
+    }
     for (unsigned i = 0; i < AZAHAR_FAST_KINDS; i++) {
         req->fast_count[i] = fast->count[i];
     }

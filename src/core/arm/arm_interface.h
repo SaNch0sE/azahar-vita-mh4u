@@ -50,10 +50,15 @@ public:
             cpu_registers[15] = value;
         }
 
+        // In the Vita native core's order (its module's AzaharContext, then fpexc): the module
+        // loads a thread from here in place. tpidruro and tpidrurw are that context's and are not
+        // saved; the kernel keeps them per core (CP15).
         std::array<u32, 16> cpu_registers{};
         u32 cpsr{};
-        std::array<u32, 64> fpu_registers{};
+        u32 tpidruro{};
+        u32 tpidrurw{};
         u32 fpscr{};
+        std::array<u32, 64> fpu_registers{};
         u32 fpexc{};
 
     private:

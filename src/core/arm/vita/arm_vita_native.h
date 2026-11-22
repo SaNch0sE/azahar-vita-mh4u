@@ -133,9 +133,16 @@ struct VitaNativeCensus {
     };
     std::array<SleepCaller, 16> sleeps{};
     u32 sleep_other{};
+    /// In-kernel scheduling: the slices that carried the thread table, and the module's
+    /// switches, SleepThreads answered and idle stretches skipped in them.
+    u32 sched_slices{}, sched_switches{}, sched_sleeps{}, sched_idle{};
 };
 VitaNativeCensus TakeVitaNativeCensus();
 #endif
+
+/// In-kernel scheduling (azaharnative 34), on by default: the module switches the guest's
+/// threads on a SleepThread itself.
+void SetVitaInKernelScheduling(bool on);
 
 class ARM_VitaNative final : public ARM_Interface {
 public:
@@ -190,7 +197,7 @@ protected:
 private:
     /// One trip into the guest. Returns false if the core should stop running for now.
     bool RunSlice(u64 quantum_ns);
-    void ReportFault(const AzaharRunRequest& run);
+    void ReportFault();
     /// Patches a VFP instruction that trapped under the guest's LEN and STRIDE into a branch to a
     /// thunk, or out of reach into the module's svc.
     void PatchVfp(u32 pc, u32 insn, bool thumb);
@@ -201,9 +208,9 @@ private:
     Memory::MemorySystem& memory;
     Kernel::SVCContext svc_context;
 
-    /// The guest register file as the module expects it. The PC is kept without the Thumb bit;
-    /// the instruction set lives in CPSR.T alone.
-    AzaharContext context{};
+    /// The slices' request, which the module maps and works on in place. Its PC is kept without the
+    /// Thumb bit (CPSR.T says the instruction set).
+    AzaharRunRequest run{};
     std::shared_ptr<VitaGuestMap> map;
     std::shared_ptr<Memory::PageTable> current_page_table;
     std::array<u32, CP15_REGISTER_COUNT> cp15{};

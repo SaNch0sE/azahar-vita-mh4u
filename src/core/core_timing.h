@@ -226,6 +226,22 @@ public:
 
         void MoveEvents();
 
+        /// The tick an event of `type` for `user_data` is due at, or -1 (queued events only:
+        /// MoveEvents first).
+        [[nodiscard]] s64 EventTime(const TimingEventType* type, std::uintptr_t user_data) const;
+        /// How many events of `type` this timer's queue holds.
+        [[nodiscard]] std::size_t EventCount(const TimingEventType* type) const;
+        /// The earliest queued event's tick that `skip` does not leave out, or `limit`.
+        template <typename Skip>
+        [[nodiscard]] s64 NextEventTime(s64 limit, Skip&& skip) const {
+            for (const Event& e : event_queue) {
+                if (e.time < limit && !skip(e.type, e.user_data)) {
+                    limit = e.time;
+                }
+            }
+            return limit;
+        }
+
     private:
         friend class Timing;
         // The queue is a min-heap using std::make_heap/push_heap/pop_heap.

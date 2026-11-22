@@ -6,10 +6,14 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstring>
 #include <iterator>
 #include <optional>
 #include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
@@ -35,6 +39,45 @@ namespace {
 VitaNativeCensus census;
 std::unordered_map<u32, std::pair<u32, u32>> hold_page_accesses;
 #endif
+
+/// In-kernel scheduling (azaharnative 34): the module switches the guest's threads on a
+/// SleepThread itself (AzaharSchedThread). On unless the frontend turned it off.
+bool in_kernel_scheduling = true;
+/// One slice's thread table: as ThreadManager::ExportNativeSchedule gave it, the module's copy
+/// of it (the threads' contexts in place), and the states the slice left.
+std::vector<Kernel::ThreadManager::NativeSchedEntry> sched_before, sched_after;
+std::array<AzaharSchedThread, AZAHAR_SCHED_MAX> sched_table;
+/// The threads whose last stop was a SleepThread (an exit for one, or one the module answered):
+/// only their slices carry the table. A title that sleeps rarely (a game: 200 a second among 5,000
+/// svc exits) paid the table's export and import on every slice, 6% of its race.
+std::unordered_set<u32> sched_sleepers;
+
+// A thread's context is the module's AzaharContext, fpexc after it: the module loads a thread
+// from its own context in place (the upcall's switch, the in-kernel scheduler's table).
+using ThreadContext = ARM_Interface::ThreadContext;
+static_assert(std::is_standard_layout_v<ThreadContext>);
+static_assert(offsetof(ThreadContext, cpu_registers) == offsetof(AzaharContext, r) &&
+              sizeof(ThreadContext::cpu_registers) == sizeof(AzaharContext::r));
+static_assert(offsetof(ThreadContext, cpsr) == offsetof(AzaharContext, cpsr));
+static_assert(offsetof(ThreadContext, tpidruro) == offsetof(AzaharContext, tpidruro));
+static_assert(offsetof(ThreadContext, tpidrurw) == offsetof(AzaharContext, tpidrurw));
+static_assert(offsetof(ThreadContext, fpscr) == offsetof(AzaharContext, fpscr));
+static_assert(offsetof(ThreadContext, fpu_registers) == offsetof(AzaharContext, fpregs) &&
+              sizeof(ThreadContext::fpu_registers) == sizeof(AzaharContext::fpregs));
+static_assert(offsetof(ThreadContext, fpexc) == sizeof(AzaharContext));
+
+AzaharContext* AsAzahar(ThreadContext& t) {
+    return reinterpret_cast<AzaharContext*>(&t);
+}
+
+void ToAzahar(const ThreadContext& t, AzaharContext& c) {
+    std::memcpy(&c, &t, sizeof(c));
+    c.r[15] &= ~1u;
+}
+
+void FromAzahar(const AzaharContext& c, ThreadContext& t) {
+    std::memcpy(&t, &c, sizeof(c));
+}
 
 /// Never hand the guest a slice longer than this, so a runaway guest cannot stall the frontend.
 constexpr u64 MaxQuantumNs = 16'000'000;
@@ -775,7 +818,7 @@ ARM_VitaNative::ARM_VitaNative(Core::System& system_, Memory::MemorySystem& memo
     : ARM_Interface(id, timer_), system{system_}, memory{memory_}, svc_context{system_},
       map{std::move(map_)} {
     usable = map != nullptr;
-    context.cpsr = 0x10;
+    run.ctx.cpsr = 0x10;
 }
 
 ARM_VitaNative::~ARM_VitaNative() {
@@ -842,7 +885,7 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
     if (!DecodeVfp(insn, v)) {
         return false;
     }
-    const u32 vector = context.fpscr & FpscrVectorBits;
+    const u32 vector = run.ctx.fpscr & FpscrVectorBits;
     const u32 stride_field = vector >> 20 & 3;
     if (vector == 0 || (stride_field != 0 && stride_field != 3)) {
         return false;
@@ -1141,8 +1184,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         system.GPU().EnablePageHolds();
     }
 
-    AzaharRunRequest run{};
-    run.ctx = context;
+    // The last slice's request: every input is set again here.
     run.ctx.tpidruro = cp15[CP15_THREAD_URO];
     run.ctx.tpidrurw = cp15[CP15_THREAD_UPRW];
     run.quantum_us = static_cast<u32>(quantum_ns / 1000);
@@ -1152,15 +1194,67 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     if (const auto* thread = kernel.GetCurrentThreadManager().GetCurrentThread()) {
         run.thread_id = thread->GetThreadId();
     } else {
+        run.thread_id = 0;
         run.fast &= ~(1u << AZAHAR_FAST_THREAD_ID);
     }
     if (const auto process = kernel.GetCurrentProcess()) {
         run.process_id = process->process_id;
     } else {
+        run.process_id = 0;
         run.fast &= ~(1u << AZAHAR_FAST_PROCESS_ID);
     }
     run.tick_hz = static_cast<u64>(BASE_CLOCK_RATE_ARM11 * timer->GetClockScale() + 0.5);
     run.tick_base = timer->GetTicks();
+
+    // In-kernel scheduling: the running thread's process's ready and sleeping threads, up to the
+    // next event that is not one of their wakeups (at most a slice's length on). The clock must
+    // be unscaled: the module converts a sleep's nanoseconds as nsToCycles does.
+    run.sched = nullptr;
+    run.sched_count = 0;
+    run.sched_current = 0;
+    run.sched_deadline = 0;
+    run.sched_arbiter = 0;
+    bool scheduled = false;
+    const auto* const running = kernel.GetCurrentThreadManager().GetCurrentThread();
+    if (in_kernel_scheduling && timer->GetClockScale() == 1.0 && running != nullptr &&
+        sched_sleepers.contains(running->thread_id)) {
+        auto& threads = kernel.GetCurrentThreadManager();
+        const int current = threads.ExportNativeSchedule(sched_before, AZAHAR_SCHED_MAX);
+        if (current >= 0) {
+            const s64 base = static_cast<s64>(run.tick_base);
+            const auto* const wakeup = threads.WakeupEventType();
+            const s64 deadline = timer->NextEventTime(
+                base + Timing::MAX_SLICE_LENGTH, [&](const TimingEventType* type, uintptr_t id) {
+                    return type == wakeup && std::any_of(sched_before.begin(), sched_before.end(),
+                                                         [&](const auto& e) {
+                                                             return e.state == AZAHAR_SCHED_SLEEP &&
+                                                                    e.thread->thread_id == id;
+                                                         });
+                });
+            if (deadline > base) {
+                for (std::size_t i = 0; i < sched_before.size(); i++) {
+                    const auto& e = sched_before[i];
+                    sched_table[i] = AzaharSchedThread{e.thread->thread_id,
+                                                       static_cast<u32>(e.thread->current_priority),
+                                                       e.state,
+                                                       e.order,
+                                                       e.wake,
+                                                       e.thread->GetTLSAddress(),
+                                                       0,
+                                                       AsAzahar(e.thread->context),
+                                                       0};
+                    // The module loads it as it is (a thread that never ran has its entry's
+                    // Thumb bit in the PC).
+                    e.thread->context.cpu_registers[15] &= ~1u;
+                }
+                run.sched = sched_table.data();
+                run.sched_count = static_cast<u32>(sched_before.size());
+                run.sched_current = current;
+                run.sched_deadline = static_cast<u64>(deadline);
+                scheduled = true;
+            }
+        }
+    }
 
     const int ret = azaharRun(&run);
     if (ret < 0) {
@@ -1170,11 +1264,44 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         return false;
     }
 
-    context = run.ctx;
     cp15[CP15_THREAD_UPRW] = run.ctx.tpidrurw;
     // The guest ticks the module counted, converted as its GetSystemTick answers were: the clock ends
     // at or past every value the guest read in the slice.
     timer->AddScaledTicks(run.guest_ticks);
+
+    // The module's scheduling taken back (the threads that stopped running saved their contexts
+    // in place), the one running now's TLS; with none running the slice loop ends and RunLoop
+    // idles to its next event.
+    if (scheduled) {
+        sched_after = sched_before;
+        for (std::size_t i = 0; i < sched_after.size(); i++) {
+            const AzaharSchedThread& t = sched_table[i];
+            sched_after[i].state = t.state;
+            sched_after[i].order = t.order;
+            sched_after[i].wake = t.wake;
+            if (t.saved) {
+                // A thread the module put to sleep slept at its last stop.
+                if (t.state == AZAHAR_SCHED_SLEEP) {
+                    sched_sleepers.insert(t.id);
+                }
+            }
+        }
+        cp15[CP15_THREAD_URO] = run.ctx.tpidruro;
+        kernel.GetCurrentThreadManager().ImportNativeSchedule(sched_before, sched_after,
+                                                              run.sched_current, timer->GetTicks());
+#ifdef VITA_DIAGNOSTICS
+        census.sched_slices++;
+        census.sched_switches += run.sched_switches;
+        census.sched_sleeps += run.sched_sleeps;
+        census.sched_idle += run.sched_idle;
+#endif
+        if (run.sched_current < 0) {
+            return false;
+        }
+        if (run.reason == AZAHAR_EXIT_SVC && run.sched_handled) {
+            return !break_flag && !stop_requested;
+        }
+    }
 
 #ifdef VITA_DIAGNOSTICS
     census.slices++;
@@ -1186,39 +1313,34 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     census.kernel_us += run.kernel_us;
     if (run.reason == AZAHAR_EXIT_SVC) {
         census.svcs[run.svc_number < census.svcs.size() ? run.svc_number : 0]++;
-        static const bool perflog = SgxdRenderer::SgxdFlag("perflog");
-        if (perflog && run.svc_number == 0x22) {
-            CountArbitration();
-        }
-        if (perflog && run.svc_number == 0x0A) {
-            const auto* thread = system.Kernel().GetCurrentThreadManager().GetCurrentThread();
-            const u32 id = thread ? thread->GetThreadId() : 0;
-            const s64 ns = static_cast<s64>(u64{context.r[1]} << 32 | context.r[0]);
-            auto it = std::find_if(census.sleeps.begin(), census.sleeps.end(), [&](const auto& s) {
-                return s.count == 0 || (s.lr == context.r[14] && s.thread == id);
-            });
-            if (it == census.sleeps.end()) {
-                census.sleep_other++;
+    }
+#endif
+
+    // Whether this thread's slices carry the table from now on: a SleepThread exit says yes,
+    // any other svc exit no.
+    if (run.reason == AZAHAR_EXIT_SVC) {
+        if (const auto* const t = kernel.GetCurrentThreadManager().GetCurrentThread()) {
+            if (run.svc_number == 0x0A) {
+                sched_sleepers.insert(t->thread_id);
             } else {
-                *it = {context.r[14], id, it->count + 1, ns};
+                sched_sleepers.erase(t->thread_id);
             }
         }
     }
-#endif
 
     switch (run.reason) {
     case AZAHAR_EXIT_SVC:
         // A patched VFP instruction the module did not run: run here. One with no record is from a
         // savestate made before the restore at each save, and is lost.
         if (run.svc_number == AZAHAR_VFP_SVC) {
-            const bool thumb = context.cpsr >> 5 & 1;
-            const u32 site = context.r[15] - (thumb ? 2u : 4u);
+            const bool thumb = run.ctx.cpsr >> 5 & 1;
+            const u32 site = run.ctx.r[15] - (thumb ? 2u : 4u);
             const auto it = vfp_patched.find(site);
             ASSERT_MSG(it != vfp_patched.end(),
                        "svc {:#x} at {:08X} with no patched VFP instruction behind it (a savestate "
                        "from a build that saved the module's svcs)",
                        AZAHAR_VFP_SVC, site);
-            [[maybe_unused]] const bool ran = RunVfpVector(context, it->second.insn);
+            [[maybe_unused]] const bool ran = RunVfpVector(run.ctx, it->second.insn);
             DEBUG_ASSERT_MSG(ran, "a patched VFP instruction at {:08X} did not run", it->first);
             return !break_flag && !stop_requested;
         }
@@ -1240,17 +1362,18 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                 return !break_flag && !stop_requested;
             }
         }
-        ReportFault(run);
+        ReportFault();
         return false;
     }
     case AZAHAR_EXIT_UND: {
         // VFP instructions under the guest's short vectors (RunVfpVector), ARM or Thumb-2: the trapped
         // one and the data-processing ones after it run here.
-        if ((context.fpscr & FpscrVectorBits) != 0) {
-            u32 pc = context.r[15];
-            const bool thumb = context.cpsr >> 5 & 1;
-            DEBUG_ASSERT_MSG(!thumb || (context.cpsr & 0x0600FC00) == 0,
-                             "VFP short vectors in a Thumb IT block at {:08X}", pc);
+        if ((run.ctx.fpscr & FpscrVectorBits) != 0) {
+            u32 pc = run.ctx.r[15];
+            const bool thumb = run.ctx.cpsr >> 5 & 1;
+            // Run and patched as if unconditional: an IT block's condition would be lost.
+            ASSERT_MSG(!thumb || (run.ctx.cpsr & 0x0600FC00) == 0,
+                       "VFP short vectors in a Thumb IT block at {:08X}", pc);
             u32 ran = 0;
             for (; ran < MaxVfpRun; ran++) {
                 const u32 insn = FetchCode(pc, thumb);
@@ -1260,7 +1383,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                     break;
                 }
                 if (cond == 0xF ||
-                    !(!ConditionPasses(cond, context.cpsr) || RunVfpVector(context, insn))) {
+                    !(!ConditionPasses(cond, run.ctx.cpsr) || RunVfpVector(run.ctx, insn))) {
                     break;
                 }
                 PatchVfp(pc, insn, thumb);
@@ -1268,17 +1391,17 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
             }
             if (ran > 0) {
                 // The patched instructions past the guest's instruction cache.
-                map->SyncCode(context.r[15], pc - context.r[15]);
-                context.r[15] = pc;
+                map->SyncCode(run.ctx.r[15], pc - run.ctx.r[15]);
+                run.ctx.r[15] = pc;
                 return !break_flag && !stop_requested;
             }
         }
-        ReportFault(run);
+        ReportFault();
         return false;
     }
     case AZAHAR_EXIT_PABT:
     default:
-        ReportFault(run);
+        ReportFault();
         return false;
     }
 }
@@ -1287,9 +1410,9 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
 void ARM_VitaNative::CountArbitration() {
     // ArbitrateAddress(handle r0, address r1, type r2, value r3, ns r4:r5): would it wake a thread or
     // block this one?
-    const VAddr address = context.r[1];
-    const u32 type = context.r[2];
-    const s32 value = static_cast<s32>(context.r[3]);
+    const VAddr address = run.ctx.r[1];
+    const u32 type = run.ctx.r[2];
+    const s32 value = static_cast<s32>(run.ctx.r[3]);
     auto& kernel = system.Kernel();
     switch (type) {
     case 0: { // Signal
@@ -1324,20 +1447,25 @@ VitaNativeCensus TakeVitaNativeCensus() {
 }
 #endif
 
-void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
+void SetVitaInKernelScheduling(bool on) {
+    in_kernel_scheduling = on;
+}
+
+void ARM_VitaNative::ReportFault() {
     std::string registers;
     for (int i = 0; i < 16; i++) {
-        registers += fmt::format("r{:02d} = {:08X}\n", i, context.r[i]);
+        registers += fmt::format("r{:02d} = {:08X}\n", i, run.ctx.r[i]);
     }
     const std::string message =
         fmt::format("{}Guest {} at PC {:08X} (cpsr {:08X}, fpscr {:08X}, fpexc {:08X}), fsr {:08X} "
                     "far {:08X}",
-                    registers, ReasonName(run.reason), context.r[15], context.cpsr, context.fpscr,
+                    registers, ReasonName(run.reason), run.ctx.r[15], run.ctx.cpsr, run.ctx.fpscr,
                     fpexc, run.fsr, run.far);
     LOG_CRITICAL(Core_ARM11, "{}", message);
     std::string code;
-    for (u32 a = context.r[15] - 16; a <= context.r[15] + 12; a += 4) {
-        code += fmt::format("{}{:08X}", a == context.r[15] ? " *" : " ", memory.Read32(a));
+    for (u32 a = run.ctx.r[15] - 16; a <= run.ctx.r[15] + 12; a += 4) {
+        code += fmt::format("{}{:08X}", a == run.ctx.r[15] ? " *" : " ",
+                            InThunkArea(a) ? FetchCode(a, false) : memory.Read32(a));
     }
     LOG_CRITICAL(Core_ARM11, "code around PC:{}", code);
     if (InThunkArea(run.ctx.r[15])) {
@@ -1391,18 +1519,18 @@ void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
         }
     }
     // Where the guest came from: the code before LR and the stack from SP.
-    const u32 lr = context.r[14] & ~1u;
+    const u32 lr = run.ctx.r[14] & ~1u;
     std::string call;
     for (u32 a = lr - 16; a < lr + 8; a += 4) {
         call += fmt::format("{}{:08X}", a == (lr & ~3u) ? " *" : " ", memory.Read32(a));
     }
-    LOG_CRITICAL(Core_ARM11, "code around LR {:08X}:{}", context.r[14], call);
+    LOG_CRITICAL(Core_ARM11, "code around LR {:08X}:{}", run.ctx.r[14], call);
     for (u32 row = 0; row < 8; row++) {
         std::string words;
         for (u32 w = 0; w < 8; w++) {
-            words += fmt::format(" {:08X}", memory.Read32(context.r[13] + (row * 8 + w) * 4));
+            words += fmt::format(" {:08X}", memory.Read32(run.ctx.r[13] + (row * 8 + w) * 4));
         }
-        LOG_CRITICAL(Core_ARM11, "stack {:08X}:{}", context.r[13] + row * 32, words);
+        LOG_CRITICAL(Core_ARM11, "stack {:08X}:{}", run.ctx.r[13] + row * 32, words);
     }
     system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised, message.c_str());
 }
@@ -1472,16 +1600,16 @@ std::shared_ptr<Memory::PageTable> ARM_VitaNative::GetPageTable() const {
 }
 
 void ARM_VitaNative::SetPC(u32 pc) {
-    context.r[15] = pc & ~1u;
+    run.ctx.r[15] = pc & ~1u;
 }
 
 u32 ARM_VitaNative::GetPC() const {
-    return context.r[15] & ~1u;
+    return run.ctx.r[15] & ~1u;
 }
 
 u32 ARM_VitaNative::GetReg(int index) const {
     ASSERT(index >= 0 && index < 16);
-    return index == 15 ? GetPC() : context.r[index];
+    return index == 15 ? GetPC() : run.ctx.r[index];
 }
 
 void ARM_VitaNative::SetReg(int index, u32 value) {
@@ -1489,24 +1617,24 @@ void ARM_VitaNative::SetReg(int index, u32 value) {
     if (index == 15) {
         SetPC(value);
     } else {
-        context.r[index] = value;
+        run.ctx.r[index] = value;
     }
 }
 
 u32 ARM_VitaNative::GetVFPReg(int index) const {
     ASSERT(index >= 0 && index < 64);
-    return context.fpregs[index];
+    return run.ctx.fpregs[index];
 }
 
 void ARM_VitaNative::SetVFPReg(int index, u32 value) {
     ASSERT(index >= 0 && index < 64);
-    context.fpregs[index] = value;
+    run.ctx.fpregs[index] = value;
 }
 
 u32 ARM_VitaNative::GetVFPSystemReg(VFPSystemRegister reg) const {
     switch (reg) {
     case VFP_FPSCR:
-        return context.fpscr;
+        return run.ctx.fpscr;
     case VFP_FPEXC:
         return fpexc;
     default:
@@ -1517,7 +1645,7 @@ u32 ARM_VitaNative::GetVFPSystemReg(VFPSystemRegister reg) const {
 void ARM_VitaNative::SetVFPSystemReg(VFPSystemRegister reg, u32 value) {
     switch (reg) {
     case VFP_FPSCR:
-        context.fpscr = value;
+        run.ctx.fpscr = value;
         return;
     case VFP_FPEXC:
         fpexc = value;
@@ -1528,11 +1656,11 @@ void ARM_VitaNative::SetVFPSystemReg(VFPSystemRegister reg, u32 value) {
 }
 
 u32 ARM_VitaNative::GetCPSR() const {
-    return context.cpsr;
+    return run.ctx.cpsr;
 }
 
 void ARM_VitaNative::SetCPSR(u32 cpsr) {
-    context.cpsr = cpsr;
+    run.ctx.cpsr = cpsr;
 }
 
 u32 ARM_VitaNative::GetCP15Register(CP15Register reg) const {
@@ -1544,20 +1672,13 @@ void ARM_VitaNative::SetCP15Register(CP15Register reg, u32 value) {
 }
 
 void ARM_VitaNative::SaveContext(ThreadContext& ctx) {
-    std::memcpy(ctx.cpu_registers.data(), context.r, sizeof(context.r));
+    FromAzahar(run.ctx, ctx);
     ctx.cpu_registers[15] = GetPC();
-    ctx.cpsr = context.cpsr;
-    std::memcpy(ctx.fpu_registers.data(), context.fpregs, sizeof(context.fpregs));
-    ctx.fpscr = context.fpscr;
     ctx.fpexc = fpexc;
 }
 
 void ARM_VitaNative::LoadContext(const ThreadContext& ctx) {
-    std::memcpy(context.r, ctx.cpu_registers.data(), sizeof(context.r));
-    context.r[15] = ctx.cpu_registers[15] & ~1u;
-    context.cpsr = ctx.cpsr;
-    std::memcpy(context.fpregs, ctx.fpu_registers.data(), sizeof(context.fpregs));
-    context.fpscr = ctx.fpscr;
+    ToAzahar(ctx, run.ctx);
     fpexc = ctx.fpexc;
 }
 

@@ -201,6 +201,33 @@ public:
                                                                     : &multi_time_limiter;
     }
 
+    /**
+     * The Vita native core's in-kernel scheduling (azaharnative 34): the threads of the running
+     * thread's process its module may switch between itself, with this manager's rules.
+     */
+    struct NativeSchedEntry {
+        Thread* thread;
+        u32 state; ///< 1 ready, 2 asleep, 3 running (AZAHAR_SCHED_*)
+        s32 order; ///< ready: its place in its level, lower first
+        u64 wake;  ///< asleep: the tick its wakeup event is due at
+    };
+    /**
+     * The running thread, the ready ones in their queue's order and the sleepers with a wakeup
+     * event; the running one's index, or -1 for a state the module does not take (nothing runs,
+     * a thread of another process or one that cannot be scheduled is ready, more than `max`).
+     */
+    int ExportNativeSchedule(std::vector<NativeSchedEntry>& out, std::size_t max);
+    /**
+     * The module's view taken back: `after` is `before` (ExportNativeSchedule's) with the states
+     * the slice left, `current` the running index or -1. The contexts of the threads that stopped
+     * running are already in their Thread::context; `now` is the clock after the slice.
+     */
+    void ImportNativeSchedule(const std::vector<NativeSchedEntry>& before,
+                              const std::vector<NativeSchedEntry>& after, int current, u64 now);
+    [[nodiscard]] const Core::TimingEventType* WakeupEventType() const {
+        return ThreadWakeupEventType;
+    }
+
 private:
     /**
      * Switches the CPU's active thread context to that of the specified thread

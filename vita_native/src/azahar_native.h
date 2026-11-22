@@ -78,6 +78,36 @@ typedef struct AzaharContext {
 #define AZAHAR_FAST_KINDS 5u
 #define AZAHAR_FAST_ALL ((1u << AZAHAR_FAST_KINDS) - 1u)
 
+// In-kernel scheduling (version 34): azaharRun takes the table of the current process's threads
+// the module may switch between itself, the HLE kernel's rules copied (Kernel::ThreadManager). A
+// SleepThread (svc 0x0A) of the running thread no longer exits: the module puts it to sleep until
+// its wake tick, picks the next thread as PopNextReadyThread does (the most urgent priority, a
+// level's oldest first; a running thread yields only to a strictly more urgent one), switches
+// the context in place and runs on. With no thread to run it moves the guest clock to the
+// earliest wake (the HLE kernel's idle). Woken threads go to the back of their level, a
+// preempted one to the front. The slice ends at `sched_deadline`, the HLE kernel's next event
+// that is not one of these wakes; a sleep whose idle would pass it exits (sched_current -1).
+// Other svcs exit as before, from whichever thread runs then. Folded mode only.
+#define AZAHAR_SCHED_MAX 32u
+#define AZAHAR_SCHED_READY 1u   // runnable, at `order` in its level (lower first)
+#define AZAHAR_SCHED_SLEEP 2u   // asleep until `wake`
+#define AZAHAR_SCHED_RUNNING 3u // the thread in ctx (sched_current)
+typedef struct AzaharSchedThread {
+    uint32_t id;       // in: the guest thread's ID (GetThreadId's answer)
+    uint32_t priority; // in: 0 most urgent .. 63
+    uint32_t state;    // in/out: AZAHAR_SCHED_*
+    int32_t order;     // in/out: READY's place in its level
+    uint64_t wake;     // in/out: SLEEP's wake, on the guest clock
+    uint32_t tls;      // in: the thread's TLS address (TPIDRURO while it runs)
+    uint32_t saved;    // out: the module wrote ctx (the thread stopped running in it)
+    AzaharContext *ctx; // in: the app's copy of the thread's context while it does not run
+    uint32_t reserved;
+} AzaharSchedThread;
+
+// azaharRun's request (version 48): the app's own block, one per emulated core, kept from call to
+// call. The module maps it into the kernel at its first call and reads and writes it in place
+// from then on, with no copy in or out; up to four stay mapped (the least recently run gives its
+// slot to a fifth) until azaharRelease or the process's end. 8-byte aligned.
 typedef struct AzaharRunRequest {
     AzaharContext ctx;       // in: the state to enter with; out: the state at exit
     uint32_t reason;      // out: AZAHAR_EXIT_*
@@ -101,6 +131,15 @@ typedef struct AzaharRunRequest {
     uint32_t fast_count[AZAHAR_FAST_KINDS]; // out: the svcs answered in the guest, by kind
     uint32_t kernel_us;   // out: azaharRun's own time, the guest's included
     uint32_t reserved2;
+    // Since version 34: in-kernel scheduling (AzaharSchedThread above).
+    AzaharSchedThread *sched; // in: the app's table, or 0 for none
+    uint32_t sched_count;     // in: its threads, at most AZAHAR_SCHED_MAX
+    int32_t sched_current;    // in/out: the RUNNING thread's index, -1 when none runs (idle)
+    uint64_t sched_deadline;  // in: the guest tick the slice ends at
+    uint32_t sched_handled;   // out: the exit's svc was a SleepThread the module answered
+    uint32_t sched_switches;  // out: context switches made in the module
+    uint32_t sched_sleeps;    // out: SleepThreads answered in the module
+    uint32_t sched_idle;      // out: idle stretches skipped on the guest clock
 } AzaharRunRequest;
 
 // VFP short vectors (version 30). The Cortex-A9 has none: with the guest's FPSCR LEN or STRIDE

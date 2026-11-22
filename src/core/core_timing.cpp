@@ -210,6 +210,20 @@ void Timing::Timer::MoveEvents() {
     }
 }
 
+s64 Timing::Timer::EventTime(const TimingEventType* type, std::uintptr_t user_data) const {
+    for (const Event& e : event_queue) {
+        if (e.type == type && e.user_data == user_data) {
+            return e.time;
+        }
+    }
+    return -1;
+}
+
+std::size_t Timing::Timer::EventCount(const TimingEventType* type) const {
+    return static_cast<std::size_t>(std::count_if(
+        event_queue.begin(), event_queue.end(), [&](const Event& e) { return e.type == type; }));
+}
+
 s64 Timing::Timer::GetMaxSliceLength() const {
     const auto& next_event = event_queue.begin();
     if (next_event != event_queue.end()) {

@@ -508,6 +508,88 @@ std::shared_ptr<Thread> SetupMainThread(KernelSystem& kernel, u32 entry_point, u
     return thread;
 }
 
+int ThreadManager::ExportNativeSchedule(std::vector<NativeSchedEntry>& out, std::size_t max) {
+    out.clear();
+    Thread* const running = GetCurrentThread();
+    if (running == nullptr || running->status != ThreadStatus::Running || !running->CanSchedule()) {
+        return -1;
+    }
+    const auto process = running->owner_process.lock();
+    out.push_back({running, 3, 0, 0});
+    bool takeable = true;
+    std::array<s32, ThreadPrioLowest + 1> next{};
+    ready_queue.for_each([&](u32 priority, Thread* t) {
+        if (t->owner_process.lock() != process || !t->CanSchedule()) {
+            takeable = false;
+            return;
+        }
+        out.push_back({t, 1, next[priority]++, 0});
+    });
+    if (!takeable) {
+        return -1;
+    }
+    Core::Timing::Timer& timer = cpu->GetTimer();
+    timer.MoveEvents();
+    for (const auto& t : thread_list) {
+        if (t->status != ThreadStatus::WaitSleep || t->owner_process.lock() != process ||
+            !t->CanSchedule()) {
+            continue;
+        }
+        // Asleep for good (no wakeup event) stays the app's.
+        const s64 wake = timer.EventTime(ThreadWakeupEventType, t->thread_id);
+        if (wake >= 0) {
+            out.push_back({t.get(), 2, 0, static_cast<u64>(wake)});
+        }
+    }
+    return out.size() <= max ? 0 : -1;
+}
+
+void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& before,
+                                         const std::vector<NativeSchedEntry>& after, int current,
+                                         u64 now) {
+    Core::Timing& timing = kernel.timing;
+    std::vector<const NativeSchedEntry*> ready;
+    for (std::size_t i = 0; i < after.size(); i++) {
+        const NativeSchedEntry& was = before[i];
+        const NativeSchedEntry& is = after[i];
+        Thread* const t = is.thread;
+        if (was.state == 1) {
+            ready_queue.remove(t->current_priority, t);
+        }
+        const bool same_sleep = was.state == 2 && is.state == 2 && was.wake == is.wake;
+        if (was.state == 2 && !same_sleep) {
+            timing.UnscheduleEvent(ThreadWakeupEventType, t->thread_id);
+        }
+        switch (is.state) {
+        case 1:
+            t->status = ThreadStatus::Ready;
+            ready.push_back(&is);
+            break;
+        case 2:
+            t->status = ThreadStatus::WaitSleep;
+            if (!same_sleep) {
+                timing.ScheduleEvent(is.wake > now ? static_cast<s64>(is.wake - now) : 0,
+                                     ThreadWakeupEventType, t->thread_id);
+            }
+            break;
+        default:
+            t->status = ThreadStatus::Running;
+            break;
+        }
+        if (was.state == 3 && is.state != 3) {
+            t->last_running_ticks = now;
+        }
+    }
+    // The module's ready order: its pushes to the front and back of each level.
+    std::sort(ready.begin(), ready.end(), [](const NativeSchedEntry* a, const NativeSchedEntry* b) {
+        return a->order < b->order;
+    });
+    for (const NativeSchedEntry* e : ready) {
+        ready_queue.push_back(e->thread->current_priority, e->thread);
+    }
+    current_thread = current >= 0 ? SharedFrom(after[current].thread) : nullptr;
+}
+
 bool ThreadManager::HaveReadyThreads() {
     return ready_queue.get_first() != nullptr;
 }
