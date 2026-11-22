@@ -56,6 +56,9 @@ enum class Option : u32 {
     WaitForGpu,
     /// A stereo title's right eye left undrawn: 1, or 0 to draw both eyes.
     SkipRightEye,
+    /// Upstream's cpu_clock_percentage: the emulated CPU's clock in percent, 5 to 400. Applied
+    /// as a title starts: the second emulation thread reads the timers' scale unlocked.
+    CpuClock,
     StretchAudio,
     // The controls: the Vita input each 3DS button answers to (ControlInput's order), the
     // NativeButton order without the debug pad's, Home and Power.
@@ -215,8 +218,8 @@ enum class Shortcut : int {
 /// sound, the region, the system language, the menus' theme and language and the start-up notice are the player's or
 /// the console's, the same whatever runs.
 [[nodiscard]] bool PerTitle(Option option);
-/// Whether a change takes effect under a running title. The region and the system language are
-/// read as a title loads.
+/// Whether a change takes effect under a running title. The region, the system language and the
+/// CPU clock are read as a title starts.
 [[nodiscard]] bool Runtime(Option option);
 /// The option's range: 0 and 1 for a toggle, 0 and the last index for a choice (the screen layout's
 /// last custom layout's).

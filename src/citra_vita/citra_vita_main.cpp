@@ -380,6 +380,20 @@ bool TakeRenderCounters(Core::System& system, RenderCounters& out) {
 /// Runs one title to completion. Returns false when the user wants the application to close
 /// rather than to return to the game list.
 /**
+ * The savestate arguments after the title's path: `load=N` restores slot N before the title runs,
+ * `save=N@T` saves slot N once it has run T seconds. A scripted launch passes them at the launch to
+ * jump to a scene a run saved. Taken once: a title started from the list later gets none.
+ * `scale=1.5`, `layout=N` (`layout=overlay`), `wide` (`wide=0`), `opacity=N`, `vsync=0`, `limit=N`,
+ * `skips=N` (`skips=none`), `gpuwait=0`, `motion=0` and `rightstick=lr` (`cstick`, `dpad`) set the
+ * internal resolution, the screen layout, widescreen, the overlay's opacity, vsync, the speed
+ * limit, the late skip's cap, the wait for GPU results, the motion controls and what the right
+ * stick drives as the pause menu would, for the session: they pin the
+ * option over the settings file's values (Config::Pin), so that a run is what its arguments say
+ * whatever a player chose on the console, and are never written to the file. `clock=N` pins the
+ * emulated CPU's clock in percent the same way (at 50, a millisecond the guest runs is two of
+ * emulated time). `commands` turns on the command channel (CommandChannel) for the whole
+ * run, and `notice` shows the start-up notice on a launch by path, which skips it otherwise
+ * (EmulatorMain).
  */
 struct StateArguments {
     int load = -1;
@@ -466,6 +480,8 @@ StateArguments TakeStateArguments() {
             Config::Pin(Option::OverlayOpacity, std::atoi(argument.c_str() + 8));
         } else if (argument.starts_with("vsync=")) {
             Config::Pin(Option::Vsync, std::atoi(argument.c_str() + 6) != 0 ? 1 : 0);
+        } else if (argument.starts_with("clock=")) {
+            Config::Pin(Option::CpuClock, std::atoi(argument.c_str() + 6));
         } else if (argument.starts_with("limit=")) {
             Config::Pin(Option::SpeedLimit, std::atoi(argument.c_str() + 6));
         } else if (argument == "skips=none") {
@@ -1752,6 +1768,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     system.RegisterCoreLoopThreadId();
     StateArguments state_arguments = TakeStateArguments();
     window.UpdateCurrentFramebufferLayout(); // the title's own layout, or a layout=N argument's
+    // The timing exists since Load, at the clock all games' settings had: the title's own or a
+    // clock=N argument's from here, before any guest code runs.
+    system.CoreTiming().UpdateClockSpeed(
+        static_cast<u32>(Settings::values.cpu_clock_percentage.GetValue()));
 
 #ifdef VITA_DIAGNOSTICS
     SgxdRenderer::Vprof::Info("rom", path.c_str());

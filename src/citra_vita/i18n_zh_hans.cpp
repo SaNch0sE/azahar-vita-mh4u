@@ -20,6 +20,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"1 frame", "1 帧"},
     {"2 frames", "2 帧"},
     {"3 frames", "3 帧"},
+    {"3DS CPU clock", "3DS CPU 频率"},
     {"3DS size", "3DS 原始大小"},
     {"4 frames", "4 帧"},
     {"a console with the same ID is in that room", "该房间中已有相同 ID 的主机"},
@@ -172,6 +173,11 @@ constexpr std::array table{std::to_array<Translation>({
     {"Give the layout a name.", "请为布局命名。"},
     {"Host ad hoc", "创建本地联机"},
     {"Hosting an ad hoc room at {}", "已创建本地联机房间，地址：{}"},
+    {"How fast the emulated 3DS CPU runs, in percent of a 3DS's. Lower can speed up games the "
+     "Vita's CPU is too slow for; higher can smooth games that slow down on a 3DS too. Either can "
+     "make a game freeze or misbehave.",
+     "模拟的 3DS CPU 的运行速度，以 3DS 的百分比表示。调低可以让 Vita 的 CPU 跑不动的游戏变快；调高"
+     "可以让在 3DS 上也会变慢的游戏更流畅。两者都可能让游戏卡死或出错。"},
     {"How fast the game may run, in percent of full speed. No limit runs it as fast as the console"
      " can. Lower it to save battery.",
      "游戏的最高运行速度，以全速的百分比表示。“无限制”会让游戏以主机能达到的最快速度运行。调低可以"

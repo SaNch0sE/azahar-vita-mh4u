@@ -92,6 +92,7 @@ const std::array<Definition, Count> definitions{{
     {"frame_skip_limit", true, true, 0, NoFrameSkipLimit, 2, Skips},
     {"wait_for_gpu", true, true, 0, 1, 1, Toggle},
     {"skip_right_eye", true, true, 0, 1, 1, Toggle},
+    {"cpu_clock_percentage", true, false, 5, 400, 100, {}},
     {"stretch_audio", false, true, 0, 1, 1, Toggle},
     // The 3DS's layout by position (its A where the Vita's circle is), ZL and ZR on the rear
     // panel's halves.
@@ -272,6 +273,10 @@ void ApplyLocked(Option option) {
         break;
     case Option::WaitForGpu:
         SgxdRenderer::RenderThread::SetReadbackHolds(value != 0);
+        break;
+    case Option::CpuClock:
+        // Into the timing as a title starts (RunTitle), and a reset's new one.
+        Settings::values.cpu_clock_percentage = value;
         break;
     case Option::SkipRightEye:
         Settings::values.disable_right_eye_render = value != 0;

@@ -4,6 +4,9 @@
 
 #include <chrono>
 #include <cstring>
+#ifdef __vita__
+#include <psp2/rtc.h>
+#endif
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/binary_object.hpp>
 #include "common/archives.h"
@@ -30,6 +33,20 @@ template void load_construct_data<iarchive>(iarchive& ar, SharedPage::Handler* t
 } // namespace boost::serialization
 
 namespace SharedPage {
+
+#ifdef __vita__
+/// The Vita's local time less UTC in seconds now: its time zone and daylight saving as its own
+/// settings have them. Its C library knows no time zone (localtime and mktime are UTC).
+static s64 VitaLocalOffsetSeconds() {
+    SceRtcTick utc{}, local{};
+    const int got = sceRtcGetCurrentTick(&utc);
+    ASSERT_MSG(got >= 0, "the Vita's clock did not read: {:#010x}", static_cast<u32>(got));
+    const int converted = sceRtcConvertUtcToLocalTime(&utc, &local);
+    ASSERT_MSG(converted >= 0, "the Vita's local time did not convert: {:#010x}",
+               static_cast<u32>(converted));
+    return (static_cast<s64>(local.tick) - static_cast<s64>(utc.tick)) / 1000000;
+}
+#endif
 
 static std::chrono::seconds GetInitTime(u64 override_init_time) {
     if (override_init_time != 0) {
@@ -101,6 +118,13 @@ u64 Handler::GetSystemTimeSince2000() const {
 
     // 3DS system does't allow user to set a time before Jan 1 2000,
     // so we use it as an auxiliary epoch to calculate the console time.
+#ifdef __vita__
+    // The 3DS keeps local time: the epoch is 2000-01-01 in the Vita's local time, where mktime
+    // would take it as UTC (and the init time's daylight saving hour never comes: localtime's
+    // isdst is 0). The offset is read each time, so a change of zone or daylight saving shows
+    // at the next update.
+    const s64 epoch = (946684800LL - VitaLocalOffsetSeconds()) * 1000;
+#else
     std::tm epoch_tm;
     epoch_tm.tm_sec = 0;
     epoch_tm.tm_min = 0;
@@ -109,7 +133,9 @@ u64 Handler::GetSystemTimeSince2000() const {
     epoch_tm.tm_mon = 0;
     epoch_tm.tm_year = 100;
     epoch_tm.tm_isdst = 0;
-    s64 epoch = std::mktime(&epoch_tm) * 1000;
+    // In s64: where time_t is 32 bits the product wraps, to 1791994880 ms.
+    s64 epoch = static_cast<s64>(std::mktime(&epoch_tm)) * 1000;
+#endif
 
     // Only when system time is after 2000, we set it as 3DS system time
     if (now.count() > epoch) {

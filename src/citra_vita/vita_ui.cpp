@@ -1645,6 +1645,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::CpuClock,
+         Category::Speed,
+         Kind::Slider,
+         Translatable("3DS CPU clock"),
+         Translatable("How fast the emulated 3DS CPU runs, in percent of a 3DS's. Lower can speed "
+                      "up games the Vita's CPU is too slow for; higher can smooth games that slow "
+                      "down on a 3DS too. Either can make a game freeze or misbehave."),
+         {},
+         5,
+         "%",
+         nullptr});
 
     // Sound.
     add({Option::StretchAudio,

@@ -259,8 +259,8 @@ void KernelSystem::UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
     if (tid_high != TID_HIGH_APPLET && tid_high != TID_HIGH_SYSMODULE) {
         UpdateReportedMemory(memory_mode, n3ds_hw_cap.memory_mode);
     }
-    // A New 3DS title's 804 MHz clock, as APT reports it (GetApplicationRunningMode); the
-    // emulation's pace is the same either way.
+    // A New 3DS title's 804 MHz clock, as APT reports it (GetApplicationRunningMode); on the Vita
+    // the guest clock counts three A9 cycles a tick then (GuestTickHz).
     SetRunning804MHz(Core::System::GetInstance().IsNew3ds() && n3ds_hw_cap.enable_804MHz_cpu);
 }
 

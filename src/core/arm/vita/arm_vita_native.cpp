@@ -18,6 +18,7 @@
 #include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
 #include "common/assert.h"
+#include "common/host_clock.h"
 #include "common/host_shared_memory.h"
 #include "common/logging/log.h"
 #include "core/core.h"
@@ -79,6 +80,24 @@ void FromAzahar(const AzaharContext& c, ThreadContext& t) {
 constexpr u64 MaxQuantumNs = 16'000'000;
 /// Nor one so short that the timer costs more than the work it bounds.
 constexpr u64 MinQuantumNs = 250'000;
+
+/// The guest clock's rate: one tick an A9 cycle, scaled by the CPU clock setting. Frame pacing,
+/// not the clock, holds a game to real time.
+std::atomic<u64> guest_tick_hz{BASE_CLOCK_RATE_ARM11};
+std::atomic<u64> ns_per_tick_q32{(1'000'000'000ull << 32) / BASE_CLOCK_RATE_ARM11};
+
+/// A New 3DS title at 804 MHz counts three A9 cycles a 268 MHz tick.
+u64 GuestTickHz(const Core::Timing::Timer& timer) {
+    const double cycles_per_tick =
+        Core::System::GetInstance().Kernel().GetRunning804MHz() ? 3.0 : 1.0;
+    const u64 hz = static_cast<u64>(
+        Common::HostClockMhz() * 1'000'000.0 * timer.GetClockScale() / cycles_per_tick + 0.5);
+    if (hz != guest_tick_hz.load(std::memory_order_relaxed)) {
+        ns_per_tick_q32.store((1'000'000'000ull << 32) / hz, std::memory_order_relaxed);
+        guest_tick_hz.store(hz, std::memory_order_relaxed);
+    }
+    return hz;
+}
 
 u64 TicksToNanoseconds(s64 ticks) {
     if (ticks <= 0) {
@@ -1485,6 +1504,7 @@ void ARM_VitaNative::Run() {
     // The scheduler asks for a stop right before a new slice: that request was the last slice's.
     stop_requested = false;
 
+    GuestTickHz(*timer); // the slice's length at the rate it will run at
     const u64 quantum =
         std::clamp(TicksToNanoseconds(timer->GetDowncount()), MinQuantumNs, MaxQuantumNs);
     while (RunSlice(quantum)) {
@@ -3143,7 +3163,7 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         run.process_id = 0;
         run.fast &= ~(1u << AZAHAR_FAST_PROCESS_ID);
     }
-    run.tick_hz = static_cast<u64>(BASE_CLOCK_RATE_ARM11 * timer->GetClockScale() + 0.5);
+    run.tick_hz = GuestTickHz(*timer);
     run.tick_base = timer->GetTicks();
 
     {
@@ -3623,7 +3643,7 @@ bool ARM_VitaNative::RunSliceSecond(u64 quantum_ns) {
         run.process_id = 0;
         run.fast &= ~(1u << AZAHAR_FAST_PROCESS_ID);
     }
-    run.tick_hz = static_cast<u64>(BASE_CLOCK_RATE_ARM11 * timer->GetClockScale() + 0.5);
+    run.tick_hz = GuestTickHz(*timer);
     run.tick_base = timer->GetTicks();
     run.upcall_rearm_us = run.upcall_rearm_max = 0;
     run.upcall_switch = nullptr;
