@@ -319,6 +319,8 @@ StateArguments TakeStateArguments() {
             // The overlay layout's other screen, in percent (10 to 100).
             VitaFrontend::EmuWindowVita::SetOverlayOpacity(
                 static_cast<u32>(std::clamp(std::atoi(argument.c_str() + 8), 10, 100)));
+        } else if (argument.starts_with("vsync=")) {
+            Settings::values.use_vsync = std::atoi(argument.c_str() + 6) != 0;
         } else if (argument == "sched=0") {
             // The module's in-kernel scheduling off: every SleepThread exits to the HLE kernel.
             Core::SetVitaInKernelScheduling(false);

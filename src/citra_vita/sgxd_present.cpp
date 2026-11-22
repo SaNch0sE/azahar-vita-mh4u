@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -19,6 +20,9 @@
 #include "citra_vita/sgxd_present.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/named_thread.h"
+#include "common/settings.h"
+#include "common/thread.h"
 #include "sgxd.h"
 #include "sgxd_program.h"
 #include "sgxd_ptla.h"
@@ -117,6 +121,19 @@ struct State {
     } sets[DisplayBuffers]{};
     u32 set_order = 0;
     u32 display_waits = 0;
+    // Vsync, as libgxm's display queue: a picture whose 3D is done joins a queue (ShowLast), and
+    // the display thread sets each for the next vblank and waits until the display has taken it
+    // (sceDisplayWaitSetFrameBuf), one a vblank; the buffer shown before is free then. BeginFrame
+    // waits for a free buffer, so with one shown and two queued the render thread waits as
+    // sceGxmDisplayQueueAddEntry does: nothing is dropped and nothing polls. Each buffer's part
+    // and the queue, under display_gate; `queue_mode`: the parts are the queue's (vsync on), not
+    // the sets' (vsync off, the render thread's own flips).
+    enum class Part : u8 { Free, Drawn, Queued, Shown };
+    Part parts[DisplayBuffers]{};
+    u32 queue[DisplayBuffers]{};
+    u32 queued = 0;
+    bool queue_mode = false;
+    bool display_stop = false;
     u32 touches[4]{}; // the guest screens this frame samples, [lo, hi) GPU address pairs
     char failed_text[160]{};
 
@@ -134,6 +151,13 @@ struct State {
 
 State g;
 bool dump_requested = false;
+// The display thread and its gate (outside State, which Shutdown resets by assignment); the gate
+// made at its first use, not before main.
+Common::CoreCondition& DisplayGate() {
+    static Common::CoreCondition gate;
+    return gate;
+}
+Common::NamedThread display_thread;
 
 template <typename... Args>
 void Report(fmt::format_string<Args...> format, Args&&... args) {
@@ -353,6 +377,9 @@ bool ScreenFormat(u32 pica_format, u32& code, u32& swizzle, u32& bytes) {
 
 } // Anonymous namespace
 
+void DisplayLoop();
+void SetQueueMode(bool on);
+
 bool Initialize(std::string* error) {
     if (g.initialized) {
         return true;
@@ -489,6 +516,7 @@ bool Initialize(std::string* error) {
                sgxd_recipe_pb.first, sgxd_recipe_pb.last, PbVa + 0x40000, RecipeVa);
     }
     g.initialized = true;
+    display_thread = Common::NamedThread{Common::ThreadCfg{"SgxdDisplay"}, [] { DisplayLoop(); }};
     return true;
 }
 
@@ -502,6 +530,13 @@ void Shutdown() {
     if (!g.initialized) {
         return;
     }
+    SetQueueMode(false);
+    {
+        std::scoped_lock lk{DisplayGate()};
+        g.display_stop = true;
+        DisplayGate().NotifyAll();
+    }
+    display_thread.join();
     ShowLast();
     ShowBlackFrame();
     if (g.texture_size) {
@@ -556,6 +591,10 @@ s64 FlipDueIn() {
     if (!g.shown_pending || !Async() || !sgxd_chain_reached(g.shown_fence)) {
         return 0;
     }
+    if (g.queue_mode) {
+        // Queued as soon as its 3D is done: the display thread keeps the vblanks.
+        return 0;
+    }
     const s64 due = static_cast<s64>(g.last_flip_us) + g.issue_interval_us * 7 / 8;
     const s64 now = static_cast<s64>(sceKernelGetProcessTimeWide());
     return due > now ? due - now : 0;
@@ -570,26 +609,41 @@ void FlipDone() {
     }
 }
 
-// The last async present's 3D completes, then its buffer goes on screen. Before the recipe block
-// or the texture is written again: its 3D reads them.
+// The last async present's 3D, waited for: before the recipe block or the texture is written
+// again (its 3D reads them). Asleep until the GPU's interrupt (the backend's wait), not spinning.
+void FinishLast() {
+    if (sgxd_chain_reached(g.shown_fence)) {
+        return;
+    }
+    char failed[200] = "";
+    // No list after it has finished its 3D: one does now.
+    if (sgxd_session_pending() == &g.recipe &&
+        sgxd_session_finish_pending(failed, sizeof(failed)) < 0) {
+        ASSERT_MSG(false, "sgxd: the present's 3D did not finish: {}", failed);
+    }
+    SgxdRenderer::SgxdWaitChain(g.shown_fence);
+}
+
+void WaitDrawn() {
+    if (g.initialized && g.shown_pending && Async()) {
+        FinishLast();
+    }
+}
+
+void SessionEnded() {
+    // The session's lists are done (its backend's end waited for the GPU) and its events page
+    // is gone, so every fence reads as reached: the flip goes at once.
+    ShowLast();
+}
+
+// The last async present's 3D completes, then its buffer goes on screen.
 void ShowLast() {
     if (!g.shown_pending) {
         return;
     }
     g.shown_pending = false;
-    char failed[200] = "";
     SgxdRenderer::SgxdTrace("flip", sgxd_chain_reached(g.shown_fence) ? 1u : 0u);
-    if (!sgxd_chain_reached(g.shown_fence)) {
-        // No list after it has finished its 3D: one does now.
-        if (sgxd_session_pending() == &g.recipe &&
-            sgxd_session_finish_pending(failed, sizeof(failed)) < 0) {
-            ASSERT_MSG(false, "sgxd: the present's 3D did not finish: {}", failed);
-        }
-        if (sgxd_chain_idle() < 0) {
-            sgxd_session_render_async_failed(failed, sizeof(failed));
-            ASSERT_MSG(false, "sgxd: the async present stopped: {}", failed);
-        }
-    }
+    FinishLast();
     u8* const buffer = g.shown_buffer;
     static u32 dump_index = 0;
     if (dump_requested) {
@@ -601,21 +655,33 @@ void ShowLast() {
         WriteDisplayPpm(path, buffer);
         LOG_INFO(Frontend, "wrote {}", path);
     }
-    // Vsync off: the display switches to the buffer at once, within the picture it scans out
-    // (it tears), and every older buffer is free. BeginFrame renders into one of those.
-    // SceDisplay takes an immediate set only once a set has given the head its pitch, format and
-    // size (0x80290006 otherwise, ksceDisplaySetFrameBufInternal): the first is NEXTFRAME.
-    const bool first = g.set_order == 0;
+    if (g.queue_mode) {
+        // Vsync: to the display thread, in order. Three buffers: at most the one before waits.
+        std::scoped_lock lk{DisplayGate()};
+        const u32 index = static_cast<u32>((buffer - g.buffers) / DisplayBufferSize);
+        ASSERT_MSG(g.queued < DisplayBuffers - 1, "sgxd: the display queue is full");
+        g.parts[index] = State::Part::Queued;
+        g.queue[g.queued++] = index;
+        DisplayGate().NotifyAll();
+        return;
+    }
+    // Vsync off: the display switches to the buffer at once, within the picture it scans out (it
+    // tears), and every older buffer is free. SceDisplay takes an immediate set only once a set
+    // has given the head its pitch, format and size (0x80290006 otherwise,
+    // ksceDisplaySetFrameBufInternal): the first is NEXTFRAME. Sets before the queue runs
+    // (presents before sgxd's interrupt page) take effect at the vblank after.
+    const bool next = g.set_order == 0 || Settings::values.use_vsync.GetValue();
     const u16 before = static_cast<u16>(sceDisplayGetVcount());
     const int shown =
-        ShowFrame(buffer, first ? SCE_DISPLAY_SETBUF_NEXTFRAME : SCE_DISPLAY_SETBUF_IMMEDIATE);
+        ShowFrame(buffer, next ? SCE_DISPLAY_SETBUF_NEXTFRAME : SCE_DISPLAY_SETBUF_IMMEDIATE);
     const u16 after = static_cast<u16>(sceDisplayGetVcount());
+    SgxdRenderer::SgxdTrace("flip_vcount", before);
     ASSERT_MSG(shown >= 0, "sgxd: sceDisplaySetFrameBuf {:#010x}", static_cast<u32>(shown));
     g.last_flip_us = sceKernelGetProcessTimeWide();
     State::BufferSet& set = g.sets[(buffer - g.buffers) / DisplayBufferSize];
     set.order = ++g.set_order;
-    set.from_lo = first ? static_cast<u16>(before + 1) : before;
-    set.from_hi = first ? static_cast<u16>(after + 1) : before;
+    set.from_lo = next ? static_cast<u16>(before + 1) : before;
+    set.from_hi = next ? static_cast<u16>(after + 1) : before;
 }
 
 bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
@@ -647,11 +713,8 @@ bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
     return true;
 }
 
-void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
-    if (!g.initialized) {
-        return;
-    }
-    ShowLast();
+// Vsync off, or before the queue runs: a buffer no set shows or will (FreeDisplayBuffer).
+void BeginFrameSets() {
     int back = FreeDisplayBuffer();
     if (back < 0) {
         // A vblank fell within a set and leaves which buffer shows open: the newest set shows
@@ -667,6 +730,106 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
         ASSERT_MSG(back >= 0, "sgxd: no display buffer free after the display took the newest");
     }
     g.back = static_cast<u32>(back);
+}
+
+// Into or out of the display queue (vsync turned on or off, or the first async present).
+// Into: the last set shows once the display has taken it, the others are free. Out of: the queue
+// runs dry first, and the buffer shown then is the newest set.
+void SetQueueMode(bool on) {
+    if (on == g.queue_mode) {
+        return;
+    }
+    ShowLast();
+    if (on) {
+        if (g.set_order != 0) {
+            sceDisplayWaitSetFrameBuf();
+        }
+        std::scoped_lock lk{DisplayGate()};
+        u32 newest = 0;
+        for (u32 i = 1; i < DisplayBuffers; i++) {
+            newest = g.sets[i].order > g.sets[newest].order ? i : newest;
+        }
+        for (u32 i = 0; i < DisplayBuffers; i++) {
+            g.parts[i] = g.set_order != 0 && i == newest ? State::Part::Shown : State::Part::Free;
+        }
+        g.queued = 0;
+        g.queue_mode = true;
+        return;
+    }
+    std::scoped_lock lk{DisplayGate()};
+    while (g.queued != 0) {
+        DisplayGate().Wait();
+    }
+    const u16 now = static_cast<u16>(sceDisplayGetVcount());
+    for (u32 i = 0; i < DisplayBuffers; i++) {
+        g.sets[i] = {};
+        if (g.parts[i] == State::Part::Shown) {
+            g.sets[i] = {++g.set_order, now, now};
+        }
+    }
+    g.queue_mode = false;
+}
+
+// The display thread (vsync): each queued picture set for the next vblank, then waited for until
+// the display has taken it; the picture shown before is free from then on.
+void DisplayLoop() {
+    for (;;) {
+        u32 index;
+        {
+            std::scoped_lock lk{DisplayGate()};
+            while (g.queued == 0 && !g.display_stop) {
+                DisplayGate().Wait();
+            }
+            if (g.display_stop) {
+                return;
+            }
+            index = g.queue[0];
+        }
+        u8* const buffer = g.buffers + static_cast<std::size_t>(index) * DisplayBufferSize;
+        SgxdRenderer::SgxdTrace("flip_vcount", static_cast<u16>(sceDisplayGetVcount()));
+        const int shown = ShowFrame(buffer, SCE_DISPLAY_SETBUF_NEXTFRAME);
+        ASSERT_MSG(shown >= 0, "sgxd: sceDisplaySetFrameBuf {:#010x}", static_cast<u32>(shown));
+        sceDisplayWaitSetFrameBuf();
+        std::scoped_lock lk{DisplayGate()};
+        for (State::Part& part : g.parts) {
+            part = part == State::Part::Shown ? State::Part::Free : part;
+        }
+        g.parts[index] = State::Part::Shown;
+        g.queued--;
+        for (u32 i = 0; i < g.queued; i++) {
+            g.queue[i] = g.queue[i + 1];
+        }
+        g.set_order++;
+        DisplayGate().NotifyAll();
+    }
+}
+
+void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
+    if (!g.initialized) {
+        return;
+    }
+    SetQueueMode(Async() && Settings::values.use_vsync.GetValue());
+    ShowLast();
+    if (g.queue_mode) {
+        std::scoped_lock lk{DisplayGate()};
+        int free = -1;
+        for (;;) {
+            for (u32 i = 0; i < DisplayBuffers && free < 0; i++) {
+                free = g.parts[i] == State::Part::Free ? static_cast<int>(i) : -1;
+            }
+            if (free >= 0) {
+                break;
+            }
+            // One shown, two queued: the display thread frees one at the next vblank.
+            g.display_waits++;
+            SgxdRenderer::SgxdTrace("display_wait");
+            DisplayGate().Wait();
+        }
+        g.parts[free] = State::Part::Drawn;
+        g.back = static_cast<u32>(free);
+    } else {
+        BeginFrameSets();
+    }
     std::memset(g.touches, 0, sizeof(g.touches));
     g.clear = 0xff000000u | static_cast<u32>(clear_b) << 16 | static_cast<u32>(clear_g) << 8 |
               clear_r;

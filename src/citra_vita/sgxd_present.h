@@ -9,12 +9,10 @@
 
 struct SgxdRecipeDraw;
 
-// The display through sgxd: the GPU taken from SceGpu for the
-// whole session, the recipe's ImGui pass rendering each frame into one of three CDRAM display
-// buffers, and SceDisplay switching to each at once, vsync off (it tears): a present
-// waits for no vblank, so a loop that presents paces itself (sceDisplayWaitVblankStart). No GXM
-// call may run while it is initialised: SceGpu's callers wait at its gate until Shutdown gives
-// the GPU back.
+// The display through sgxd: the GPU taken from SceGpu for the whole session, the recipe's ImGui
+// pass rendering each frame into one of three CDRAM display buffers, flipped at the next vblank
+// (vsync) or at once. A present waits for no vblank, so a loop that presents paces itself. No
+// GXM call may run while it is initialised: SceGpu's callers wait at its gate until Shutdown.
 namespace VitaFrontend::SgxdPresent {
 
 inline constexpr u32 DisplayWidth = 960;
@@ -87,6 +85,10 @@ bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32
 void EndFrame();
 /// The BeginFrames since the last call that waited for a vblank to free a display buffer.
 [[nodiscard]] u32 TakeDisplayWaits();
+
+/// Waits, asleep until the GPU's interrupt, for the last present's 3D (a present while it
+/// renders would be dropped, Busy). The render thread's.
+void WaitDrawn();
 
 /// A GPU session's end (a title's, the game list banner's), once its backend has gone idle: the
 /// last present goes on screen, as the next session counts its lists from 0 again and its

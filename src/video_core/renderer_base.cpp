@@ -51,7 +51,9 @@ void RendererBase::EndFrame() {
 
     PollWindowEvents();
 
-    system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
+    if (!render_window.PaceFrame()) {
+        system.frame_limiter.DoFrameLimiting(system.CoreTiming().GetGlobalTimeUs());
+    }
     system.perf_stats->BeginSystemFrame();
 }
 

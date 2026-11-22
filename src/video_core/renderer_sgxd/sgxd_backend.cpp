@@ -121,7 +121,17 @@ SgxdBackend* drain_owner;
 
 } // Anonymous namespace
 
+namespace {
+SgxdBackend* live_backend = nullptr;
+} // namespace
+
+void SgxdWaitChain(u32 fence) {
+    ASSERT_MSG(live_backend != nullptr, "sgxd: a wait for the async chain with no backend");
+    live_backend->RenderWait(fence, "the window's present");
+}
+
 SgxdBackend::SgxdBackend() {
+    live_backend = this;
     // SceShell's CDRAM for the recipes: sgxd holds the GPU, and its release copies the shell's
     // contents back.
     u32 shell_va = 0;
@@ -455,6 +465,7 @@ SgxdBackend::~SgxdBackend() {
     RenderIdle("the backend's end");
     // The lists kept for this backend's recipes: the next backend makes its own at their addresses.
     sgxd_session_forget(nullptr);
+    live_backend = nullptr;
     sgxd_set_render_drain(nullptr);
     char failed[16];
     sgxd_ptla_events(nullptr, 0, failed, sizeof(failed));

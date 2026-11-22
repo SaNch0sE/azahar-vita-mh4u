@@ -230,6 +230,12 @@ void Ui::BuildSettings() {
                    value == no_skip_limit ? SgxdRenderer::RenderThread::NoScreenSkipLimit
                                           : static_cast<u32>(value));
            });
+    toggle(
+        "Vsync",
+        "Shows each picture from the display's next refresh, whole. Off, a picture goes on "
+        "screen at once, partway through the refresh it lands in, and tears.",
+        true, [] { return Settings::values.use_vsync.GetValue(); },
+        [](bool value) { Settings::values.use_vsync = value; });
     toggle("Swap screens", "Puts the touch screen where the top screen would be.", true,
            [] { return Settings::values.swap_screen.GetValue(); },
            [](bool value) { Settings::values.swap_screen = value; });

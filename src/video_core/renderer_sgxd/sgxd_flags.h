@@ -134,8 +134,11 @@ namespace GxmRenderer {
  *             sgxd's microkernel runs, carry no GPU stamps. Frame pacing: late (the next frame's
  *             decision: 0 whole, 1 whole with the GPU late, 2 the top's draws dropped, 3 the
  *             bottom's), lead_wait/lead_wait_end,
- *             present (1: the top screen's buffer differs from the last shown),
- *             present_behind, present_pending, flip (1: its 3D was done before the flip);
+ *             present (1: the top screen's buffer differs from the last shown), presented (it
+ *             is drawn), present_behind, present_pending, flip (1: its 3D was done before the flip),
+ *             flip_vcount (the display's vblank count at the set), limit (the frame limiter's
+ *             sleep, microseconds), display_wait (with vsync, the present waiting for a
+ *             display buffer: one shown, two queued);
  *             emu_ticket, emu_space, emu_sync (the emulation thread's waits for the render
  *             thread, each with an _end), idle (the guest has no thread to run: the ticks to
  *             its next event). The GPU's side: frame_ticket (a vblank's ticket, the late

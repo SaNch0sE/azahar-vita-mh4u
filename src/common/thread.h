@@ -89,6 +89,8 @@ public:
     /// With the lock held: releases it, waits for a NotifyAll or the timeout, holds it again.
     /// False on timeout.
     bool WaitFor(std::chrono::microseconds timeout);
+    /// With the lock held: releases it, waits for a NotifyAll, holds it again.
+    void Wait();
     /// With the lock held: wakes every waiter.
     void NotifyAll();
 

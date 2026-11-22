@@ -120,21 +120,6 @@ void SgxdTrace(const char* tag, unsigned arg) {
     if (!on || trace_written.load(std::memory_order_relaxed)) {
         return;
     }
-    // `tracelog_frames`: the frame pacing's events only (the core's idle and timing events fill
-    // the buffer in 5 s otherwise).
-    static const bool frames_only = SgxdFlag("tracelog_frames");
-    if (frames_only) {
-        static constexpr std::string_view frame_tags[] = {
-            "vblank",         "late",        "lead_wait",       "lead_wait_end",
-            "present",        "presented",   "present_behind",  "present_pending",
-            "flip",           "sgx_present", "sgx_present_end", "emu_ticket",
-            "emu_ticket_end", "emu_space",   "emu_space_end",   "emu_sync",
-            "emu_sync_end",   "hold",        "hold_parked",     "release"};
-        if (std::find(std::begin(frame_tags), std::end(frame_tags), std::string_view{tag}) ==
-            std::end(frame_tags)) {
-            return;
-        }
-    }
     // The window: `tracelog_at` seconds after the first event (8 when not given), for
     // `tracelog_len` seconds (1).
     static const long long trace_from =

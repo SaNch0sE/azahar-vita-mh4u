@@ -65,6 +65,9 @@ public:
     bool FlipPending(u32* fence) override;
     s64 FlipDueIn() override;
     void FlipDone() override;
+    /// With vsync, and no speed limit or 100%: one guest frame a display refresh (the
+    /// emulation waits for the refresh after the one its frame before had).
+    bool PaceFrame() override;
 
     /// The stats overlay's numbers or the volume changed since the last call (GPU's vblank:
     /// a present for the overlay when the guest's screens are unchanged).
@@ -182,6 +185,10 @@ private:
 
     GuestScreen screens[2]{};
     bool have_screens{};
+    /// PaceFrame: the display's vblank count the next guest frame waits for, and whether the
+    /// cadence runs (a frame paced the last time). 16 bits, as sceDisplayGetVcount counts.
+    u16 pace_target{};
+    bool pacing{};
     u32 screens_skipped{};
     /// Each screen's framebuffers as last logged (the last two addresses, format, stride,
     /// fill): DrawGuestScreens logs a screen's when it changes, a double buffer's flips aside.

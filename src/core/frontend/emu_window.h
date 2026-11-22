@@ -220,6 +220,12 @@ public:
         return 0;
     }
     virtual void FlipDone() {}
+    /// At the end of each guest frame, on the emulation thread: a window that paces the
+    /// emulation by its display's refresh does so and returns true, in place of the frame
+    /// limiter.
+    virtual bool PaceFrame() {
+        return false;
+    }
 
     /**
      * Returns a GraphicsContext that the frontend provides that is shared with the emu window. This

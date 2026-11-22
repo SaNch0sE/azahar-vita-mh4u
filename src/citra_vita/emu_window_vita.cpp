@@ -311,10 +311,8 @@ void EmuWindowVita::RunPauseMenu(Ui& ui) {
         UpdateTouch();
         ps_held = (buttons_held.load(std::memory_order_relaxed) & SCE_CTRL_PSBUTTON) != 0;
         // A frame a refresh: the present waits for no vblank, and is dropped while the frame
-        // before still renders, so wait for both here instead.
-        while (SgxdPresent::Busy()) {
-            sceKernelDelayThread(1000);
-        }
+        // before still renders, so wait for both here instead (each asleep until its event).
+        SgxdPresent::WaitDrawn();
         action = ui.Update();
         Present(&ui, false);
         sceDisplayWaitVblankStart();
@@ -500,6 +498,37 @@ s64 EmuWindowVita::FlipDueIn() {
 
 void EmuWindowVita::FlipDone() {
     SgxdPresent::FlipDone();
+}
+
+bool EmuWindowVita::PaceFrame() {
+    const double limit = Settings::GetFrameLimit();
+    if (!Settings::values.use_vsync.GetValue() || (limit != 0.0 && limit != 100.0)) {
+        pacing = false;
+        return false;
+    }
+    // A guest frame a display refresh: the frame that just ended waits for the refresh after its
+    // predecessor's, so the frames go on screen one a refresh (SgxdPresent sets one a vblank) and a
+    // heavy frame borrows from the light ones after it. The emulation is never held more than two
+    // refreshes behind: a title under full speed stays that far behind and does not wait, and one
+    // that was behind runs fast for two frames at most.
+    // SceDisplay's count has 16 bits, so the differences are taken in 16 bits: right while frames
+    // come less than 9 minutes apart. A target ahead of the count comes only after a longer pause,
+    // and the cadence starts again from now.
+    const u16 now = static_cast<u16>(sceDisplayGetVcount());
+    const s16 behind = static_cast<s16>(static_cast<u16>(now - pace_target));
+    if (!pacing || behind < 0) {
+        pace_target = now;
+        pacing = true;
+    } else if (behind > 2) {
+        pace_target = static_cast<u16>(now - 2);
+    }
+    pace_target = static_cast<u16>(pace_target + 1);
+    // The vblanks still to come, counted from one reading: the count read again at once after
+    // a wait may not have moved yet, and a second wait would cost a whole refresh.
+    for (s16 left = static_cast<s16>(static_cast<u16>(pace_target - now)); left > 0; left--) {
+        sceDisplayWaitVblankStart();
+    }
+    return true;
 }
 
 void EmuWindowVita::ForgetGuestScreens() {

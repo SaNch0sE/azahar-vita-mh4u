@@ -78,6 +78,11 @@ bool CoreCondition::WaitFor(std::chrono::microseconds timeout) {
     return r == 0;
 }
 
+void CoreCondition::Wait() {
+    const int r = sceKernelWaitLwCond(LwCond(lw_cond), nullptr);
+    ASSERT_MSG(r == 0, "CoreCondition: wait {:#010x}", static_cast<u32>(r));
+}
+
 void CoreCondition::NotifyAll() {
     sceKernelSignalLwCondAll(LwCond(lw_cond));
 }
@@ -100,6 +105,12 @@ bool CoreCondition::WaitFor(std::chrono::microseconds timeout) {
     const bool notified = condvar.wait_for(lk, timeout) == std::cv_status::no_timeout;
     lk.release();
     return notified;
+}
+
+void CoreCondition::Wait() {
+    std::unique_lock lk{mutex, std::adopt_lock};
+    condvar.wait(lk);
+    lk.release();
 }
 
 void CoreCondition::NotifyAll() {
