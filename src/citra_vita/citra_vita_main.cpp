@@ -496,6 +496,11 @@ StateArguments TakeStateArguments() {
             Config::Pin(Option::WaitForGpu, std::atoi(argument.c_str() + 8) != 0 ? 1 : 0);
         } else if (argument.starts_with("righteye=")) {
             Config::Pin(Option::SkipRightEye, std::atoi(argument.c_str() + 9) != 0 ? 1 : 0);
+        } else if (argument.starts_with("new3ds=")) {
+            Config::Pin(Option::ForceNew3ds, std::atoi(argument.c_str() + 7) != 0 ? 1 : 0);
+        } else if (argument == "diskcache=0") {
+            // Profiling runs: every program the first tier's, none from an earlier run's file.
+            Settings::values.use_disk_shader_cache = false;
         } else if (argument.starts_with("save=")) {
             a.save = std::atoi(argument.c_str() + 5);
             if (const std::size_t at = argument.find('@'); at != std::string::npos) {

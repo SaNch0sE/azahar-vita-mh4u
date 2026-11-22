@@ -51,6 +51,15 @@
 
 namespace FileUtil {
 
+#ifdef __vita__
+/// SCE_ERROR_ERRNO_ENODEV: what a call on a descriptor returns once a standby has closed it. The
+/// console closes every descriptor of its devices at a standby (the memory card's, the debug
+/// link's); a title's ROM, its RomFS cache's misses and the files it keeps open on the SD card
+/// all read and write through them (tools/fd_test). IOFile opens its own
+/// again (ReopenAfterStandby).
+inline constexpr int StandbyClosed = static_cast<int>(0x80010013u);
+#endif
+
 // User paths for GetUserPath
 enum class UserPath {
     CacheDir,

@@ -4,11 +4,12 @@
 
 #pragma once
 
+#include <cstdint>
 #ifndef __vita__
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #else
-#include <cstdint>
 #include "common/mutex.h"
 #endif
 
@@ -48,6 +49,8 @@ public:
     void Lower();
     /// Blocks until the flag is marked. Does not clear it.
     void Wait();
+    /// As Wait, for `us` at most.
+    void WaitFor(std::uint32_t us);
 
 private:
 #ifdef __vita__
@@ -88,6 +91,11 @@ inline void WakeFlag::Lower() {
 inline void WakeFlag::Wait() {
     std::unique_lock lock{mutex};
     condvar.wait(lock, [this] { return raised; });
+}
+
+inline void WakeFlag::WaitFor(std::uint32_t us) {
+    std::unique_lock lock{mutex};
+    condvar.wait_for(lock, std::chrono::microseconds{us}, [this] { return raised; });
 }
 
 #endif

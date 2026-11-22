@@ -17,13 +17,14 @@
 #include "common/mutex.h"
 #include "video_core/pica/regs_texturing.h"
 #include "video_core/rasterizer_accelerated.h"
-#include "video_core/renderer_gxm/guest_gpu_memory.h"
-#include "video_core/renderer_gxm/gxm_shader_tier.h"
-#include "video_core/renderer_gxm/key_index.h"
-#include "video_core/renderer_gxm/sgxd_backend.h"
-#include "video_core/renderer_gxm/state_regs.h"
-#include "video_core/renderer_gxm/usse/usse_program.h"
-#include "video_core/renderer_gxm/usse/vs_usse_gen.h"
+#include "video_core/renderer_sgxd/guest_gpu_memory.h"
+#include "video_core/renderer_sgxd/sgxd_shader_disk_cache.h"
+#include "video_core/renderer_sgxd/sgxd_shader_tier.h"
+#include "video_core/renderer_sgxd/key_index.h"
+#include "video_core/renderer_sgxd/sgxd_backend.h"
+#include "video_core/renderer_sgxd/state_regs.h"
+#include "video_core/renderer_sgxd/usse/usse_program.h"
+#include "video_core/renderer_sgxd/usse/vs_usse_gen.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 #include "video_core/shader/generator/profile.h"
 
@@ -246,6 +247,10 @@ public:
     }
     [[nodiscard]] bool FlipArm(u32 fence) {
         return backend.FlipArm(fence);
+    }
+    /// The title's program id, which names the disk cache (opened at the first program needed).
+    void SetTitle(u64 program_id) {
+        title_id = program_id;
     }
     /// Parse thread, at a draw whose fragment registers changed: its program queued for the first
     /// tier's worker.
@@ -911,6 +916,10 @@ private:
     std::optional<std::pair<u32, u32>> scanned_indices;
     std::vector<u8> gs_indices;
     bool gs_indices_set = false;
+    /// The second tier's programs of earlier runs. Before the tiers, whose workers read and
+    /// store into it.
+    ShaderDiskCache disk_cache;
+    u64 title_id = 0;
     /// The first tier's worker. Before tier2, whose workers emit its jobs too.
     std::unique_ptr<ShaderTier1> tier1;
     std::unique_ptr<ShaderTier2> tier2;

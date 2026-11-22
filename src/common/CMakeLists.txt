@@ -19,6 +19,8 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     bit_field.natvis
     bit_set.h
     bounded_threadsafe_queue.h
+    build_id.cpp
+    build_id.h
     cityhash.cpp
     cityhash.h
     color.h

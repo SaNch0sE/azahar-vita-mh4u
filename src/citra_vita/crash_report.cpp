@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -49,6 +50,7 @@
 #include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
 #include "common/assert.h"
+#include "common/build_id.h"
 #include "common/logging/backend.h"
 #include "common/logging/log.h"
 #include "common/named_thread.h"
@@ -63,9 +65,6 @@ extern "C" {
 // The text segment's ends (ldscript.ld).
 extern const char __executable_start[];
 extern const char etext[];
-// The link's build ID note (ldscript.ld).
-extern const char __build_id_start[];
-extern const char __build_id_end[];
 
 void __real___assert_func(const char* file, int line, const char* func, const char* expr);
 void* __real__malloc_r(struct _reent* r, size_t size);
@@ -263,21 +262,14 @@ void ConsoleRecord(std::string_view text) {
 }
 
 /// The link's build ID as hex, which names the one ELF that resolves this build's addresses: a
-/// commit does not, a `-dirty` build's least of all. Its note: the sizes of its name and ID, its
-/// type, the name to four bytes, the ID.
+/// commit does not, a `-dirty` build's least of all.
 const char* BuildId() {
     static char text[41];
-    const auto* const note = reinterpret_cast<const u32*>(__build_id_start);
-    const auto* const end = reinterpret_cast<const u8*>(__build_id_end);
-    if (__build_id_end - __build_id_start < 16) {
+    const std::span<const u8> id = Common::BuildId();
+    if (id.empty() || id.size() * 2 >= sizeof(text)) {
         return "none";
     }
-    const u32 id_size = note[1];
-    const u8* const id = reinterpret_cast<const u8*>(note + 3) + ((note[0] + 3) & ~3u);
-    if (id + id_size > end || id_size * 2 >= sizeof(text)) {
-        return "none";
-    }
-    for (u32 i = 0; i < id_size; i++) {
+    for (std::size_t i = 0; i < id.size(); i++) {
         std::snprintf(text + i * 2, 3, "%02x", id[i]);
     }
     return text;

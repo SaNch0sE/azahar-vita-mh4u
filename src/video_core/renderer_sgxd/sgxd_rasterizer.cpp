@@ -744,9 +744,6 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
                              GuestGpuMemory& guest_memory_)
     : VideoCore::RasterizerAccelerated{memory_, pica_}, guest_memory{guest_memory_} {
     Vprof::Start(memory_);
-    if (!SgxdFlag("notier2")) {
-        tier2 = std::make_unique<ShaderTier2>();
-    }
     tier1 = std::make_unique<ShaderTier1>(&disk_cache);
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>(&disk_cache, *tier1);
@@ -4694,6 +4691,31 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         return v;
     }
 
+    disk_cache.Open(title_id);
+    // A worker's, emitted or read from the disk; else the disk's here, else emitted here.
+    std::optional<ShaderTier1::Taken> taken = tier1->TakeVertex(key);
+    if (taken) {
+        NoteTier1(0, *taken);
+    }
+    if (!taken) {
+        if (auto cached = disk_cache.Find(key, true)) {
+            taken.emplace();
+            taken->program = std::move(cached->program);
+            taken->input_regs = cached->input_regs;
+            taken->from_disk = true;
+        }
+    }
+    if (taken && taken->from_disk) {
+        // A run before emitted its second tier: that one.
+        VertexProgram v{};
+        v.usse = std::move(*taken->program);
+        v.input_regs = taken->input_regs;
+        ResolveVertexProgram(v);
+        DumpProgram("vs2", key, v.usse);
+        PlaceVertexCode(v);
+        v.tier2_queued = true;
+        return vertex_programs.Emplace(key, std::move(v));
+    }
     const Usse::VsRequest request = VertexRequestOf(config, pica.vs_setup, in);
     VertexProgram v{};
     std::string refusal;
@@ -5686,6 +5708,36 @@ const RasterizerSgxd::FragmentProgram& RasterizerSgxd::FragmentProgramFor(const 
             const u64 key = Common::HashCombine(config.Hash(), epilogue_key);
             FragmentProgram* program = fragment_programs.Find(key);
             std::optional<ShaderTier1::Taken> taken;
+            if (!program) {
+                disk_cache.Open(title_id);
+                // The config's second tier, done for another epilogue: this one's program too.
+                const Tier2Config* const done =
+                    tier2_configs.Find(ShaderTier1::ConfigKey(config));
+                if (done && done->program) {
+                    program = &fragment_programs.Emplace(
+                        key, PlaceFragmentProgram(Usse::Program{*done->program}, epilogue, key));
+                    program->tier2_queued = true;
+                }
+            }
+            if (!program) {
+                // A worker's, emitted or read from the disk; else the disk's here, by the config
+                // alone (the program is the same under every epilogue); else emitted here.
+                taken = tier1->TakeFragment(config);
+                if (taken) {
+                    NoteTier1(2, *taken);
+                } else if (auto cached = disk_cache.Find(ShaderTier1::ConfigKey(config), false)) {
+                    taken.emplace();
+                    taken->program = std::move(cached->program);
+                    taken->from_disk = true;
+                }
+                if (taken && taken->from_disk) {
+                    // A run before emitted its second tier: that one.
+                    DumpProgram("fs2", key, *taken->program);
+                    program = &fragment_programs.Emplace(
+                        key, PlaceFragmentProgram(std::move(*taken->program), epilogue, key));
+                    program->tier2_queued = true;
+                }
+            }
             if (!program) {
                 // The first tier: registers placed, no optimising passes, and the draw waits for it (a
                 // worker's if one began it, else emitted here). The second tier replaces it after

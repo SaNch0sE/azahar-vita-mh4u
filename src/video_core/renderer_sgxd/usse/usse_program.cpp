@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstring>
+#include <type_traits>
 #include <fmt/format.h>
 #include "common/assert.h"
 #include "video_core/renderer_sgxd/usse/usse_program.h"
@@ -218,6 +220,217 @@ std::string ProgramJson(const Program& p) {
     });
     fmt::format_to(it, "}}\n");
     return out;
+}
+
+namespace {
+
+/// SerializeProgram's bytes: scalars as they lie in memory, vectors as a count then elements.
+class Writer {
+public:
+    template <typename T>
+        requires std::is_arithmetic_v<T> || std::is_enum_v<T>
+    void Put(T value) {
+        const auto* p = reinterpret_cast<const uint8_t*>(&value);
+        out.insert(out.end(), p, p + sizeof(T));
+    }
+    template <typename T, typename F>
+    void PutVector(const std::vector<T>& values, F&& put) {
+        Put(static_cast<uint32_t>(values.size()));
+        for (const T& value : values) {
+            put(value);
+        }
+    }
+    std::vector<uint8_t> out;
+};
+
+class Reader {
+public:
+    Reader(const uint8_t* data_, size_t size_) : data{data_}, size{size_} {}
+    template <typename T>
+        requires std::is_arithmetic_v<T> || std::is_enum_v<T>
+    void Get(T& value) {
+        if (at + sizeof(T) > size) {
+            ok = false;
+            value = T{};
+            return;
+        }
+        std::memcpy(&value, data + at, sizeof(T));
+        at += sizeof(T);
+    }
+    template <typename T, typename F>
+    void GetVector(std::vector<T>& values, F&& get) {
+        uint32_t count = 0;
+        Get(count);
+        // No more elements than bytes left: a damaged count reads no further.
+        if (!ok || count > size - at) {
+            ok = false;
+            return;
+        }
+        values.resize(count);
+        for (T& value : values) {
+            get(value);
+        }
+    }
+    [[nodiscard]] bool Done() const {
+        return ok && at == size;
+    }
+
+private:
+    const uint8_t* data;
+    size_t size;
+    size_t at = 0;
+    bool ok = true;
+};
+
+} // namespace
+
+std::vector<uint8_t> SerializeProgram(const Program& p) {
+    Writer w;
+    w.PutVector(p.inputs, [&](const Varying& v) {
+        w.Put(v.input);
+        w.Put(v.components);
+        w.Put(v.half);
+        w.Put(v.fixed);
+    });
+    w.PutVector(p.issues, [&](const TextureIssue& t) {
+        w.Put(t.unit);
+        w.Put(t.coord);
+        w.Put(t.pa);
+        w.Put(t.after_input);
+        w.Put(t.f16);
+        w.Put(t.fog);
+        w.Put(t.alpha);
+        w.Put(t.raw);
+        w.Put(t.proctex);
+    });
+    w.PutVector(p.uniforms, [&](const Uniform& u) {
+        w.Put(u.kind);
+        w.Put(u.index);
+        w.Put(u.sa_offset);
+        w.Put(u.components);
+        w.Put(u.array_size);
+        w.Put(u.u8);
+        w.Put(u.f16);
+        w.Put(u.lane);
+    });
+    w.PutVector(p.samplers, [&](const Sampler& s) {
+        w.Put(s.kind);
+        w.Put(s.index);
+        w.Put(s.unit);
+    });
+    w.Put(p.pa_count);
+    w.Put(p.temp_count);
+    w.Put(p.peak_live);
+    w.Put(p.uniform_floats);
+    w.PutVector(p.literals, [&](uint32_t l) { w.Put(l); });
+    w.Put(p.uses_discard);
+    w.Put(p.output_u8);
+    w.PutVector(p.phase_starts, [&](uint32_t start) { w.Put(start); });
+    w.PutVector(p.primary, [&](uint64_t word) { w.Put(word); });
+    w.PutVector(p.secondary, [&](uint64_t word) { w.Put(word); });
+    w.Put(p.vertex);
+    w.Put(p.gs_temps_read_first);
+    w.Put(p.per_instance);
+    w.PutVector(p.attributes, [&](const Attribute& a) {
+        w.Put(a.kind);
+        w.Put(a.index);
+        w.Put(a.resource);
+        w.Put(a.words);
+    });
+    w.Put(p.outselects);
+    w.Put(p.texsize);
+    for (const Program::PositionRow& row : p.position_rows) {
+        w.Put(row.uniform);
+        for (int c = 0; c < 4; c++) {
+            w.Put(row.uniform_lane[c]);
+            w.Put(row.source_lane[c]);
+        }
+        w.Put(row.negate);
+    }
+    w.Put(p.buffer_pointer);
+    w.Put(p.ldst_base_value);
+    w.Put(p.buffer_floats);
+    w.Put(p.secondary_reg_count);
+    w.PutVector(p.prefetched_uniforms, [&](const std::pair<uint32_t, uint32_t>& u) {
+        w.Put(u.first);
+        w.Put(u.second);
+    });
+    return std::move(w.out);
+}
+
+bool DeserializeProgram(const uint8_t* data, size_t size, Program& p) {
+    Reader r{data, size};
+    p = Program{};
+    r.GetVector(p.inputs, [&](Varying& v) {
+        r.Get(v.input);
+        r.Get(v.components);
+        r.Get(v.half);
+        r.Get(v.fixed);
+    });
+    r.GetVector(p.issues, [&](TextureIssue& t) {
+        r.Get(t.unit);
+        r.Get(t.coord);
+        r.Get(t.pa);
+        r.Get(t.after_input);
+        r.Get(t.f16);
+        r.Get(t.fog);
+        r.Get(t.alpha);
+        r.Get(t.raw);
+        r.Get(t.proctex);
+    });
+    r.GetVector(p.uniforms, [&](Uniform& u) {
+        r.Get(u.kind);
+        r.Get(u.index);
+        r.Get(u.sa_offset);
+        r.Get(u.components);
+        r.Get(u.array_size);
+        r.Get(u.u8);
+        r.Get(u.f16);
+        r.Get(u.lane);
+    });
+    r.GetVector(p.samplers, [&](Sampler& s) {
+        r.Get(s.kind);
+        r.Get(s.index);
+        r.Get(s.unit);
+    });
+    r.Get(p.pa_count);
+    r.Get(p.temp_count);
+    r.Get(p.peak_live);
+    r.Get(p.uniform_floats);
+    r.GetVector(p.literals, [&](uint32_t& l) { r.Get(l); });
+    r.Get(p.uses_discard);
+    r.Get(p.output_u8);
+    r.GetVector(p.phase_starts, [&](uint32_t& start) { r.Get(start); });
+    r.GetVector(p.primary, [&](uint64_t& word) { r.Get(word); });
+    r.GetVector(p.secondary, [&](uint64_t& word) { r.Get(word); });
+    r.Get(p.vertex);
+    r.Get(p.gs_temps_read_first);
+    r.Get(p.per_instance);
+    r.GetVector(p.attributes, [&](Attribute& a) {
+        r.Get(a.kind);
+        r.Get(a.index);
+        r.Get(a.resource);
+        r.Get(a.words);
+    });
+    r.Get(p.outselects);
+    r.Get(p.texsize);
+    for (Program::PositionRow& row : p.position_rows) {
+        r.Get(row.uniform);
+        for (int c = 0; c < 4; c++) {
+            r.Get(row.uniform_lane[c]);
+            r.Get(row.source_lane[c]);
+        }
+        r.Get(row.negate);
+    }
+    r.Get(p.buffer_pointer);
+    r.Get(p.ldst_base_value);
+    r.Get(p.buffer_floats);
+    r.Get(p.secondary_reg_count);
+    r.GetVector(p.prefetched_uniforms, [&](std::pair<uint32_t, uint32_t>& u) {
+        r.Get(u.first);
+        r.Get(u.second);
+    });
+    return r.Done();
 }
 
 } // namespace SgxdRenderer::Usse

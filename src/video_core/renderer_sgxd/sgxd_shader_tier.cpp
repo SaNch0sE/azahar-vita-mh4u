@@ -17,8 +17,14 @@
 
 namespace SgxdRenderer {
 
-ShaderTier2::ShaderTier2()
-    : thread{Common::ThreadCfg{"GxmTier2"}, [this](std::stop_token stop) { Loop(stop); }} {}
+ShaderTier2::ShaderTier2(ShaderDiskCache* disk_cache_, ShaderTier1& tier1_)
+    : disk_cache{disk_cache_}, tier1{tier1_},
+      threads{Common::NamedThread{Common::ThreadCfg{"SgxdTier2"},
+                                  [this](std::stop_token stop) { Loop(stop, Usse::Scratch::Tier2); }},
+              Common::NamedThread{Common::ThreadCfg{"SgxdTier2b"},
+                                  [this](std::stop_token stop) { Loop(stop, Usse::Scratch::Tier2b); }}} {
+    tier1.SetHelperWake(&wake);
+}
 
 ShaderTier2::~ShaderTier2() {
     for (Common::NamedThread& thread : threads) {
@@ -27,6 +33,9 @@ ShaderTier2::~ShaderTier2() {
     wake.RaiseAll();
     for (Common::NamedThread& thread : threads) {
         thread.join();
+    }
+    if (disk_cache != nullptr) {
+        disk_cache->WriteBatch(true);
     }
 }
 
@@ -85,7 +94,13 @@ void ShaderTier2::Loop(std::stop_token stop, Usse::Scratch scratch) {
             if (jobs.empty()) {
                 lock.unlock();
                 if (!tier1.Pending()) {
-                    wake.Wait();
+                    // Idle: the stored programs' batch is written once it is due.
+                    const u32 due = disk_cache != nullptr ? disk_cache->WriteBatch() : 0;
+                    if (due == 0) {
+                        wake.Wait();
+                    } else {
+                        wake.WaitFor(due);
+                    }
                 }
                 continue;
             }
@@ -104,6 +119,13 @@ void ShaderTier2::Loop(std::stop_token stop, Usse::Scratch scratch) {
         }
         result.took_cycles = azaharCycles() - start;
         result.took_us = static_cast<u32>(Common::CyclesToUs(result.took_cycles));
+        // On the card for the runs after, here: the file's writes stay off the render thread.
+        // A fragment program by its config alone (ShaderTier1::ConfigKey): the parse thread's
+        // first tier looks it up before its draw's blend is known.
+        if (disk_cache != nullptr && result.program) {
+            disk_cache->Store(job->fs ? ShaderTier1::ConfigKey(*job->fs) : result.key,
+                              result.vertex, *result.program, result.input_regs);
+        }
         std::scoped_lock lock{mutex};
         results.push_back(std::move(result));
         ready.store(true, std::memory_order_release);

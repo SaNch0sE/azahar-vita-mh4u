@@ -1673,7 +1673,6 @@ bool IOFile::Open() {
 
 #ifdef __vita__
 namespace {
-constexpr int StandbyClosed = static_cast<int>(0x80010013u);
 std::mutex reopen_mutex;
 } // Anonymous namespace
 

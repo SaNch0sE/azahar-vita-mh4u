@@ -19,8 +19,9 @@
 #include "common/named_thread.h"
 #include "common/wake_flag.h"
 #include "video_core/pica/shader_setup.h"
-#include "video_core/renderer_gxm/usse/usse_program.h"
-#include "video_core/renderer_gxm/usse/vs_usse_gen.h"
+#include "video_core/renderer_sgxd/sgxd_shader_disk_cache.h"
+#include "video_core/renderer_sgxd/usse/usse_program.h"
+#include "video_core/renderer_sgxd/usse/vs_usse_gen.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 
 namespace SgxdRenderer {
@@ -35,7 +36,9 @@ class ShaderTier1;
  */
 class ShaderTier2 {
 public:
-    ShaderTier2();
+    /// `disk_cache`: where each program emitted is stored for the runs after (null: nowhere).
+    /// `tier1`: whose queued jobs the workers emit first; it outlives this.
+    ShaderTier2(ShaderDiskCache* disk_cache, ShaderTier1& tier1);
     ~ShaderTier2();
 
     ShaderTier2(const ShaderTier2&) = delete;
@@ -70,6 +73,7 @@ private:
     /// `scratch`: the worker's own (Tier2 or Tier2b).
     void Loop(std::stop_token stop, Usse::Scratch scratch);
 
+    ShaderDiskCache* const disk_cache;
     ShaderTier1& tier1;
     Common::Mutex mutex;
     /// unique_ptr: a vertex job's request points into the job's own arrays.

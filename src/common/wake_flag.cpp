@@ -42,6 +42,11 @@ void WakeFlag::Wait() {
     sceKernelWaitEventFlag(evid, 1, SCE_EVENT_WAITOR, nullptr, nullptr);
 }
 
+void WakeFlag::WaitFor(std::uint32_t us) {
+    SceUInt timeout = us;
+    sceKernelWaitEventFlag(evid, 1, SCE_EVENT_WAITOR, nullptr, &timeout);
+}
+
 } // namespace Common
 
 #endif // __vita__

@@ -19,6 +19,13 @@ namespace SgxdRenderer {
 RendererSgxd::RendererSgxd(Core::System& system, Pica::PicaCore& pica, Frontend::EmuWindow& window)
     : system{system}, render_window{window}, memory{system.Memory()},
       guest_memory{system.Memory()}, rasterizer{pica, system.Memory(), guest_memory} {
+    // The loader has the title before the renderer starts (System::Load); the process comes
+    // after. The replay player has none: no title, so no programs on the memory card.
+    u64 program_id = 0;
+    if (system.HasAppLoader()) {
+        system.GetAppLoader().ReadProgramId(program_id);
+    }
+    rasterizer.SetTitle(program_id);
     rasterizer.SetFlipHook([this](u32* fence) { return FlipPending(fence); },
                            [this] { return FlipDueIn(); }, [this] { FlipDone(); });
 }

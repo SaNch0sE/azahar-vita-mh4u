@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 namespace SgxdRenderer {
@@ -124,6 +125,9 @@ namespace SgxdRenderer {
 [[nodiscard]] unsigned SgxdFlagValue(const char* name);
 /// Every `name=N` given, in the file's order (none in the release build).
 [[nodiscard]] std::vector<unsigned> SgxdFlagValues(const char* name);
+/// Every flag given, space-separated in the file's order (empty in the release build): part of
+/// the second tier's disk cache version, since some flags change what the emitter emits.
+[[nodiscard]] std::string SgxdFlagsText();
 
 /// With sgxd_flags `tracelog`, one timeline event: `tag` a string literal, `arg` its detail (an
 /// op kind, an interrupt id). Any thread; nothing in the release build.

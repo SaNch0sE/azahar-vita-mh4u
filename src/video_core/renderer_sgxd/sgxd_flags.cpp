@@ -100,6 +100,16 @@ std::vector<unsigned> SgxdFlagValues(const char* name) {
     return values;
 }
 
+std::string SgxdFlagsText() {
+    std::string text;
+#ifdef VITA_DIAGNOSTICS
+    for (const auto& flag : Flags()) {
+        text += flag + ' ';
+    }
+#endif
+    return text;
+}
+
 #ifdef VITA_DIAGNOSTICS
 namespace {
 struct TraceEvent {

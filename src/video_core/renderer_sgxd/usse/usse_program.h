@@ -74,6 +74,7 @@ struct Varying {
     /// A colour iterated in fixed point (DOUTI without the colour's float bit): its four
     /// bytes in one register.
     bool fixed = false;
+    bool operator==(const Varying&) const = default;
 };
 inline uint8_t VaryingWords(const Varying& v) {
     return v.fixed ? 1 : v.half ? static_cast<uint8_t>((v.components + 1) / 2) : v.components;
@@ -104,6 +105,7 @@ struct TextureIssue {
     /// The procedural texture's table (RasterizerSgxd::ProcTexTableWords), not a unit: the texture
     /// as a function of u alone, read at its coordinate set in the texel's form, f16 or F32.
     bool proctex = false;
+    bool operator==(const TextureIssue&) const = default;
 };
 /// TextureIssue::after_input of an issue ahead of every input (sgxd_program's
 /// SGXD_ISSUE_BEFORE_ITERATORS).
@@ -197,6 +199,7 @@ struct Uniform {
     /// u8: every byte component `lane` (a moved channel's broadcast, const.rrr); -1 for each
     /// byte its own.
     int8_t lane = -1;
+    bool operator==(const Uniform&) const = default;
 };
 
 enum class SamplerKind : uint8_t {
@@ -214,6 +217,7 @@ struct Sampler {
     SamplerKind kind;
     uint8_t index; ///< Texture's and TextureAlpha's PICA unit; 0 otherwise
     uint32_t unit; ///< TEXUNITn, 0-15
+    bool operator==(const Sampler&) const = default;
 };
 
 enum class AttributeKind : uint8_t {
@@ -227,6 +231,7 @@ struct Attribute {
     uint8_t index;     ///< Input's register; 0 otherwise
     uint32_t resource; ///< its first primary attribute register
     uint8_t words;     ///< the primary attribute registers its fetch fills
+    bool operator==(const Attribute&) const = default;
 };
 
 /// Names, for messages and the program dump (sgxd_flags dumpusse): the parameter names the
@@ -281,6 +286,7 @@ struct Program {
         std::array<uint8_t, 4> uniform_lane{}; ///< the uniform's component in each term
         std::array<uint8_t, 4> source_lane{};  ///< the register's component in each term
         bool negate = false;                   ///< one of the two operands negated
+        bool operator==(const PositionRow&) const = default;
     };
     std::array<PositionRow, 2> position_rows{}; ///< z, then w
     bool buffer_pointer = false;
@@ -293,6 +299,8 @@ struct Program {
     /// SA image carries them past the data block, so the secondary PDS program's DMA puts
     /// them in place before any vertex runs.
     std::vector<std::pair<uint32_t, uint32_t>> prefetched_uniforms;
+    /// Field by field: the disk cache checks that a record reads back as the program it holds.
+    bool operator==(const Program&) const = default;
 };
 
 /// The data block's first SA holds the buffer pointer in a program that has one; the literals
@@ -307,5 +315,11 @@ inline uint32_t DataHead(const Program& p) {
 /// The program as JSON for sgxd_flags dumpusse: its words and everything above, with the
 /// names, which tools/usse2gxp.py puts into a GXP for psp2shaderperf.
 [[nodiscard]] std::string ProgramJson(const Program& program);
+
+/// The program as bytes, every field in order, for the second tier's disk cache
+/// (ShaderDiskCache), and back. The layout is this emitter's own: the cache keeps no file an
+/// emitter of other sources wrote (its version is their hash).
+[[nodiscard]] std::vector<uint8_t> SerializeProgram(const Program& program);
+[[nodiscard]] bool DeserializeProgram(const uint8_t* data, size_t size, Program& program);
 
 } // namespace SgxdRenderer::Usse
