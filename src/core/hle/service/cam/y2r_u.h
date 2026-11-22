@@ -6,11 +6,15 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
 #include <boost/serialization/array.hpp>
 #include "common/common_types.h"
+#include "common/thread.h"
 #include "core/hle/result.h"
 #include "core/hle/service/service.h"
+#include "core/hw/y2r.h"
 
 namespace Core {
 class System;
@@ -356,6 +360,22 @@ private:
     bool transfer_end_interrupt_enabled = false;
     bool spacial_dithering_enabled = false;
     bool is_busy_conversion = false;
+
+    /// The conversions run on a thread of their own (Common::ThreadRole::Y2r, core 0), while the
+    /// guest runs on: StartConversion queues one with its buffers resolved, and the completion
+    /// event (and anything else that must see the output) waits for it (WaitConversion).
+    void WorkerLoop();
+    void QueueConversion(const ConversionConfiguration& cvt, const HW::Y2R::HostBuffers& buffers);
+    void WaitConversion();
+    std::thread worker;
+    Common::CoreCondition worker_lock; ///< guards job, converting, running, helping, stopping
+    std::optional<std::pair<ConversionConfiguration, HW::Y2R::HostBuffers>> job;
+    bool converting = false;
+    /// The conversion the worker runs (on its stack, while converting), and whether a waiting
+    /// thread is taking its strips too: the worker keeps it until that thread is out.
+    HW::Y2R::Conversion* running = nullptr;
+    bool helping = false;
+    bool stopping = false;
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);

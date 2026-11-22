@@ -170,6 +170,9 @@ enum class ThreadRole {
     Dsp,
     /// The sgxd render thread's command list parse (SgxdRenderer::RenderThread::ParseLoop).
     Parse,
+    /// The Y2R service's conversions (Service::Y2R::Y2R_U), beside the guest as the 3DS's Y2R
+    /// unit converts beside its ARM11.
+    Y2r,
 };
 
 /**

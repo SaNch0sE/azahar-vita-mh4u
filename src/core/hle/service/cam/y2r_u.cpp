@@ -25,6 +25,8 @@ namespace Service::Y2R {
 
 template <class Archive>
 void Y2R_U::serialize(Archive& ar, const unsigned int) {
+    // A conversion still running finishes first: its output is part of the state.
+    WaitConversion();
     ar& boost::serialization::base_object<Kernel::SessionRequestHandler>(*this);
     ar & completion_event;
     ar & conversion;
@@ -316,41 +318,47 @@ void Y2R_U::SetSendingYUYV(Kernel::HLERequestContext& ctx) {
 void Y2R_U::IsFinishedSendingYuv(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
+    // The worker converts after StartConversion returns: its buffers are done with once the
+    // completion event, which waits for it, has run (is_busy_conversion clear), and not before
+    // (a title polling these reads or refills them then).
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);
-    rb.Push<u8>(1);
+    rb.Push<u8>(is_busy_conversion ? 0 : 1);
 
-    LOG_DEBUG(Service_Y2R, "(STUBBED) called");
+    LOG_DEBUG(Service_Y2R, "called");
 }
 
 void Y2R_U::IsFinishedSendingY(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
+    // As IsFinishedSendingYuv.
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);
-    rb.Push<u8>(1);
+    rb.Push<u8>(is_busy_conversion ? 0 : 1);
 
-    LOG_DEBUG(Service_Y2R, "(STUBBED) called");
+    LOG_DEBUG(Service_Y2R, "called");
 }
 
 void Y2R_U::IsFinishedSendingU(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
+    // As IsFinishedSendingYuv.
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);
-    rb.Push<u8>(1);
+    rb.Push<u8>(is_busy_conversion ? 0 : 1);
 
-    LOG_DEBUG(Service_Y2R, "(STUBBED) called");
+    LOG_DEBUG(Service_Y2R, "called");
 }
 
 void Y2R_U::IsFinishedSendingV(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
+    // As IsFinishedSendingYuv.
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);
-    rb.Push<u8>(1);
+    rb.Push<u8>(is_busy_conversion ? 0 : 1);
 
-    LOG_DEBUG(Service_Y2R, "(STUBBED) called");
+    LOG_DEBUG(Service_Y2R, "called");
 }
 
 void Y2R_U::SetReceiving(Kernel::HLERequestContext& ctx) {
@@ -376,11 +384,12 @@ void Y2R_U::SetReceiving(Kernel::HLERequestContext& ctx) {
 void Y2R_U::IsFinishedReceiving(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
+    // As IsFinishedSendingYuv.
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);
-    rb.Push<u8>(1);
+    rb.Push<u8>(is_busy_conversion ? 0 : 1);
 
-    LOG_DEBUG(Service_Y2R, "(STUBBED) called");
+    LOG_DEBUG(Service_Y2R, "called");
 }
 
 void Y2R_U::SetInputLineWidth(Kernel::HLERequestContext& ctx) {
@@ -524,7 +533,10 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
     system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
                                                  Memory::FlushMode::FlushAndInvalidate);
 
-    HW::Y2R::PerformConversion(system.Memory(), conversion);
+    // On the worker, its buffers resolved here, where the page table is the guest's; one still
+    // running finishes first (the unit converts one at a time).
+    WaitConversion();
+    QueueConversion(conversion, HW::Y2R::ResolveBuffers(system.Memory(), conversion));
 
     if (is_busy_conversion) {
         system.CoreTiming().RemoveEvent(completion_signal_event);
@@ -550,6 +562,8 @@ void Y2R_U::StopConversion(Kernel::HLERequestContext& ctx) {
         is_busy_conversion = false;
         system.CoreTiming().RemoveEvent(completion_signal_event);
     }
+    // Nothing is written after the stop.
+    WaitConversion();
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
@@ -570,6 +584,9 @@ void Y2R_U::IsBusyConversion(Kernel::HLERequestContext& ctx) {
 void Y2R_U::SetPackageParameter(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
     auto params = rp.PopRaw<ConversionParameters>();
+    // The header (0x002901C0) counts seven words; the parameters fill the first three (libctru's
+    // Y2RU_SetConversionParams copies its 12-byte struct there and leaves the rest).
+    rp.Skip(7 - sizeof(ConversionParameters) / 4, false);
 
     conversion.input_format = params.input_format;
     conversion.output_format = params.output_format;
@@ -718,15 +735,95 @@ Y2R_U::Y2R_U(Core::System& system) : ServiceFramework("y2r:u", 1), system(system
     };
     RegisterHandlers(functions);
 
+    worker = std::thread([this] { WorkerLoop(); });
     completion_event = system.Kernel().CreateEvent(Kernel::ResetType::OneShot, "Y2R:Completed");
     completion_signal_event =
         system.CoreTiming().RegisterEvent("Y2R Completion Signal Event", [this](uintptr_t, s64) {
+            WaitConversion();
             completion_event->Signal();
             is_busy_conversion = false;
         });
 }
 
-Y2R_U::~Y2R_U() = default;
+Y2R_U::~Y2R_U() {
+    {
+        std::scoped_lock lk{worker_lock};
+        stopping = true;
+        worker_lock.NotifyAll();
+    }
+    worker.join();
+}
+
+void Y2R_U::WorkerLoop() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Y2r);
+    std::scoped_lock lk{worker_lock};
+    for (;;) {
+        while (!job && !stopping) {
+            worker_lock.Wait();
+        }
+        if (!job) {
+            return;
+        }
+        const auto [cvt, buffers] = *job;
+        job.reset();
+        HW::Y2R::Conversion conversion{buffers, cvt};
+        running = &conversion;
+        converting = true;
+        worker_lock.unlock();
+        {
+#ifdef ENABLE_GXM
+            // tracelog: the conversion on this thread, its pixels.
+            const SgxdRenderer::TraceSpan span{
+                "y2r_convert", "y2r_convert_end",
+                static_cast<unsigned>(cvt.input_line_width * cvt.input_lines)};
+#endif
+            conversion.Run();
+        }
+        worker_lock.lock();
+        // A waiting thread's last strip, and the thread itself, out of the conversion.
+        while (!conversion.Finished() || helping) {
+            worker_lock.Wait();
+        }
+        running = nullptr;
+        converting = false;
+        worker_lock.NotifyAll();
+    }
+}
+
+void Y2R_U::QueueConversion(const ConversionConfiguration& cvt,
+                            const HW::Y2R::HostBuffers& buffers) {
+    std::scoped_lock lk{worker_lock};
+    job.emplace(cvt, buffers);
+    worker_lock.NotifyAll();
+}
+
+void Y2R_U::WaitConversion() {
+    std::scoped_lock lk{worker_lock};
+    if (!job && !converting) {
+        return;
+    }
+#ifdef ENABLE_GXM
+    // tracelog: the guest's thread held until the worker's conversion ends.
+    const SgxdRenderer::TraceSpan span{"y2r_wait", "y2r_wait_end"};
+#endif
+    // The guest waits for the conversion: this thread takes its strips beside the worker, once.
+    // Then, or for a conversion that runs whole, it waits for the worker.
+    const HW::Y2R::Conversion* helped = nullptr;
+    while (job || converting) {
+        if (converting && running != nullptr && running != helped && !helping) {
+            HW::Y2R::Conversion* const conversion = running;
+            helped = conversion;
+            helping = true;
+            worker_lock.unlock();
+            conversion->Help();
+            worker_lock.lock();
+            helping = false;
+            worker_lock.NotifyAll();
+            continue;
+        }
+        worker_lock.Wait();
+    }
+}
 
 void InstallInterfaces(Core::System& system) {
     auto& service_manager = system.ServiceManager();

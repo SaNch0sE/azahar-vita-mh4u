@@ -2,6 +2,10 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <psp2/power.h>
+#include "common/heap_check.h"
+#include "common/host_clock.h"
 #include "core/core.h"
 #include "core/frontend/emu_window.h"
 #include "core/loader/loader.h"

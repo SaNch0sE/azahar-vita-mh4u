@@ -107,17 +107,6 @@ namespace GxmRenderer {
  *             (RasterizerGxm::Supersampled), a jittered second render of the scene drawn
  *             (RasterizerGxm::DoubleRender)
  *
- * Checking guest memory against the CPU:
- *   untilecheck  every RGBA8, RGB8, ETC1 and ETC1A4 untile's levels against upstream's CPU
- *             decode (ETC1's, and a split ETC1A4's colour and alpha, decoded back through the
- *             texture unit), once its batch is sent; the log counts the levels that differ
- *             (with dumptex, a "want" file too)
- *   keycheck  the fragment and vertex format registers' kept hashes, the program the hash
- *             found and the cached LUT rows against the registers at every draw: a register
- *             missing from StateRegs (or a collision) stops the run
- *   remapcheck  each page's newest remap whose list is done read back from the GPU's page
- *             table (sgxdTranslate) before the next list goes; a wrong entry is logged
- *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks
  *   (docs/debugging.md, "Wrong pictures")
  *
