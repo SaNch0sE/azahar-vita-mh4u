@@ -429,6 +429,7 @@ constexpr std::array table{std::to_array<Translation>({
      "游戏运行时在右上角显示速度和帧率。"},
     {"Side by side", "并排"},
     {"Simplified Chinese", "简体中文"},
+    {"Simulate 3DS GPU timings", "模拟 3DS GPU 耗时"},
     {"Single screen", "单屏"},
     {"Size", "大小"},
     {"Skip the 3D right eye", "跳过 3D 右眼画面"},
@@ -493,6 +494,11 @@ constexpr std::array table{std::to_array<Translation>({
      "shown, so only the left eye's is drawn.",
      "即使关闭 3D，游戏也会为两只眼睛各绘制一次 3D 场景。由于只显示一幅画面，现在只绘制左眼的画面"
      "。"},
+    {"The game hears that the GPU is done only after the time a 3DS's GPU would take. It can "
+     "steady games whose speed follows their frame time, but games that wait for the GPU lose "
+     "frames.",
+     "游戏要等到 3DS 的 GPU 所需的时间过后，才会得知 GPU 已完成。这可以让按帧耗时调整速度的游戏更"
+     "稳定，但等待 GPU 的游戏会掉帧。"},
     {"The game list also shows the titles in these folders, besides ux0:data/azahar/roms: on a "
      "USB or SD2Vita card (uma0:), for example. Only the files in the folder itself, not in "
      "folders inside it.",

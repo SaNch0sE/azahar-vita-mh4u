@@ -94,6 +94,7 @@ const std::array<Definition, Count> definitions{{
     {"frame_skip_limit", true, true, 0, NoFrameSkipLimit, 2, Skips},
     {"wait_for_gpu", true, true, 0, 1, 1, Toggle},
     {"skip_right_eye", true, true, 0, 1, 1, Toggle},
+    {"simulate_3ds_gpu_timings", true, true, 0, 1, 0, Toggle},
     {"cpu_clock_percentage", true, false, 5, 400, 100, {}},
     {"stretch_audio", false, true, 0, 1, 1, Toggle},
     // The 3DS's layout by position (its A where the Vita's circle is), ZL and ZR on the rear
@@ -278,6 +279,9 @@ void ApplyLocked(Option option) {
         break;
     case Option::WaitForGpu:
         SgxdRenderer::RenderThread::SetReadbackHolds(value != 0);
+        break;
+    case Option::SimulateGpuTimings:
+        Settings::values.simulate_3ds_gpu_timings = value != 0;
         break;
     case Option::CpuClock:
         // Into the timing as a title starts (RunTitle), and a reset's new one.
@@ -906,9 +910,11 @@ std::size_t WriteApplied(char* out, std::size_t size) {
 
 /// The options a game runs differently with (WriteChangedFromDefaults): those of the screen and
 /// speed rows that change what the emulation draws or when, not where the screens are shown.
-constexpr std::array crash_options{Option::Widescreen, Option::TopScale,       Option::Msaa,
-                                   Option::Vsync,      Option::SpeedLimit,     Option::FrameSkipLimit,
-                                   Option::WaitForGpu, Option::SkipRightEye};
+constexpr std::array crash_options{Option::Widescreen,   Option::TopScale,
+                                   Option::Msaa,         Option::Vsync,
+                                   Option::SpeedLimit,   Option::FrameSkipLimit,
+                                   Option::WaitForGpu,   Option::SkipRightEye,
+                                   Option::SimulateGpuTimings, Option::CpuClock};
 
 std::size_t WriteChangedFromDefaults(char* out, std::size_t size) {
     if (size == 0) {

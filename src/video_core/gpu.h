@@ -247,11 +247,12 @@ private:
     /// Runs op, a GSP command's or a register trigger's work (vprof numbers it, perflog times
     /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).
     void RunGpuOp(OpKind kind, const std::function<void()>& op);
-    /// Raises a GSP interrupt as upstream does: when its work is submitted, after the delay
-    /// generators' estimate of that work, which GSP adds. Any but a vblank
-    /// first takes the rasterizer's ticket for the work before it, which the page holds made
-    /// for that work wait for (SgxdRenderer::PageHolds): the guest hears of the work before the
-    /// SGX has done it, and a guest access to its pages waits. None while vprof's replay runs.
+    /// Raises a GSP interrupt as upstream does: when its work is submitted, with the delay
+    /// generators' estimate of that work (GSP applies it with simulate_3ds_gpu_timings). Any
+    /// but a vblank first takes the rasterizer's ticket for the work before it, which the page
+    /// holds made for that work wait for (SgxdRenderer::PageHolds): the guest hears of the work
+    /// before the SGX has done it, and a guest access to its pages waits. None while vprof's
+    /// replay runs.
     void Signal(Service::GSP::InterruptId id, u64 delay_ns);
 
     friend class boost::serialization::access;

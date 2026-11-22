@@ -59,6 +59,9 @@ enum class Option : u32 {
     WaitForGpu,
     /// A stereo title's right eye left undrawn: 1, or 0 to draw both eyes.
     SkipRightEye,
+    /// Upstream's simulate_3ds_gpu_timings: 1 delays GSP's interrupts by the delay generators'
+    /// estimates of their work, 0 (upstream's default) raises them at once.
+    SimulateGpuTimings,
     /// Upstream's cpu_clock_percentage: the emulated CPU's clock in percent, 5 to 400. Applied
     /// as a title starts: the second emulation thread reads the timers' scale unlocked.
     CpuClock,
@@ -302,10 +305,11 @@ std::size_t WriteApplied(char* out, std::size_t size);
 
 /// The running title's applied values that are not their options' defaults, among the options a
 /// game runs differently with (widescreen, the internal resolution, anti-aliasing, vsync, the
-/// speed limit, the frame skip limit and Wait for GPU results), as their file keys separated by
-/// commas in `out`: a crash's notice asks the player to try the defaults first. Nothing with no
-/// title running. Takes no lock and allocates nothing (CrashReport::Recover hands it to the
-/// restart). Returns the length written.
+/// speed limit, the frame skip limit, Wait for GPU results, skipping the right eye, the 3DS's
+/// GPU timings and its CPU clock), as their file keys separated by commas in `out`, a key marked *
+/// where the value is the game's own: a crash's notice asks the player to try the defaults first.
+/// Nothing with no title running. Takes no lock and allocates nothing (CrashReport::Recover hands
+/// it to the restart). Returns the length written.
 std::size_t WriteChangedFromDefaults(char* out, std::size_t size);
 
 /// An option WriteChangedFromDefaults named; `own` where the value was the game's own.

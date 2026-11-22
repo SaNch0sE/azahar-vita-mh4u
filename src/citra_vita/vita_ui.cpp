@@ -1654,6 +1654,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::SimulateGpuTimings,
+         Category::Speed,
+         Kind::Toggle,
+         Translatable("Simulate 3DS GPU timings"),
+         Translatable("The game hears that the GPU is done only after the time a 3DS's GPU would "
+                      "take. It can steady games whose speed follows their frame time, but games "
+                      "that wait for the GPU lose frames."),
+         {},
+         0,
+         nullptr,
+         nullptr});
     add({Option::CpuClock,
          Category::Speed,
          Kind::Slider,

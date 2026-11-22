@@ -37,8 +37,8 @@ namespace VideoCore {
 constexpr VAddr VADDR_LCD = 0x1ED02000;
 constexpr VAddr VADDR_GPU = 0x1EF00000;
 
-// Upstream's: how long the 3DS's transfer engines take, which GSP adds to their
-// interrupts.
+// Upstream's: how long the 3DS's transfer engines take, which GSP adds to their interrupts with
+// simulate_3ds_gpu_timings (and to SM3DL's texture copies).
 class DelayGenerator {
 private:
     DelayGenerator() = default;

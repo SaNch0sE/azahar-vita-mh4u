@@ -462,6 +462,9 @@ StateArguments TakeStateArguments() {
             Config::Pin(Option::WaitForGpu, std::atoi(argument.c_str() + 8) != 0 ? 1 : 0);
         } else if (argument.starts_with("righteye=")) {
             Config::Pin(Option::SkipRightEye, std::atoi(argument.c_str() + 9) != 0 ? 1 : 0);
+        } else if (argument.starts_with("gputimings=")) {
+            Config::Pin(Option::SimulateGpuTimings,
+                        std::atoi(argument.c_str() + 11) != 0 ? 1 : 0);
         } else if (argument.starts_with("new3ds=")) {
             Config::Pin(Option::ForceNew3ds, std::atoi(argument.c_str() + 7) != 0 ? 1 : 0);
         } else if (argument == "diskcache=0") {
