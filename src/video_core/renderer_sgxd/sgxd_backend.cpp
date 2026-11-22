@@ -1524,10 +1524,13 @@ void SgxdBackend::BeginPassLoaded(const PicaTarget& target, float depth, const U
     if (before) {
         before();
     }
-    // Each tile reads its own old texels before its end of tile stores the new ones over them
-    // (H2: a pass reading its own target reloads it exactly).
+    // Each tile reads its own old texels before its end of tile stores the new ones. A pass storing
+    // part of its target loads the part's tiles alone.
     pass_source = {guest.gpu, guest.gpu + guest.width * guest.height * guest.bits / 8};
-    DrawTiled(guest, true);
+    const u32 clip = target.x1 == 0 ? 0
+                                    : SGXD_RECIPE_CLIP(target.x0 / 32, target.y0 / 32,
+                                                       (target.x1 - 1) / 32, (target.y1 - 1) / 32);
+    DrawTiled(guest, true, 1, 1, 4, 0, clip);
 }
 
 void SgxdBackend::BeginPassLoadedScaled(const PicaTarget& target, float depth,
@@ -1698,18 +1701,39 @@ void SgxdBackend::MaskOutside(u32 x0, u32 x1, u32 y0, u32 y1, bool part_tiles) {
 }
 
 void SgxdBackend::FillDepthStore(const DepthStore& store, float z, u32 stencil) {
+    FillDepthStorePart(store, 0, store.width, 0, store.height, &z,
+                       store.stencil ? &stencil : nullptr);
+}
+
+void SgxdBackend::FillDepthStorePart(const DepthStore& store, u32 x0, u32 x1, u32 y0, u32 y1,
+                                     const float* z, const u32* stencil) {
+    DEBUG_ASSERT(x0 < x1 && y0 < y1 && x1 <= store.width && y1 <= store.height && x0 % 4 == 0 &&
+                 x1 % 4 == 0 && (!stencil || store.stencil));
     const u32 samples = store.width * store.height;
     RenderBefore(store.memory.gpu, store.memory.gpu + samples * (store.stencil ? 5 : 4),
                  "a depth store's fill");
     char failed[160];
-    const SgxdPtlaFill depth{store.memory.gpu, SGXD_PTLA_8888, store.width * 4, store.width,
-                             store.height, 0, std::bit_cast<u32>(z)};
-    [[maybe_unused]] int filled = sgxd_ptla_fill(&depth, nullptr, failed, sizeof(failed));
-    DEBUG_ASSERT_MSG(filled == 0, "sgxd: a {}x{} depth store's fill stopped: {}", store.width,
-                     store.height, failed);
-    if (store.stencil) {
-        const SgxdPtlaFill bytes{store.memory.gpu + samples * 4, SGXD_PTLA_8888, store.width,
-                                 store.width / 4, store.height, 0, (stencil & 0xff) * 0x01010101u};
+    [[maybe_unused]] int filled = 0;
+    if (z) {
+        const SgxdPtlaFill depth{store.memory.gpu + (y0 * store.width + x0) * 4,
+                                 SGXD_PTLA_8888,
+                                 store.width * 4,
+                                 x1 - x0,
+                                 y1 - y0,
+                                 0,
+                                 std::bit_cast<u32>(*z)};
+        filled = sgxd_ptla_fill(&depth, nullptr, failed, sizeof(failed));
+        DEBUG_ASSERT_MSG(filled == 0, "sgxd: a {}x{} depth store's fill stopped: {}",
+                         store.width, store.height, failed);
+    }
+    if (stencil) {
+        const SgxdPtlaFill bytes{store.memory.gpu + samples * 4 + y0 * store.width + x0,
+                                 SGXD_PTLA_8888,
+                                 store.width,
+                                 (x1 - x0) / 4,
+                                 y1 - y0,
+                                 0,
+                                 (*stencil & 0xff) * 0x01010101u};
         filled = sgxd_ptla_fill(&bytes, nullptr, failed, sizeof(failed));
         DEBUG_ASSERT_MSG(filled == 0, "sgxd: a {}x{} stencil store's fill stopped: {}",
                          store.width, store.height, failed);
@@ -3269,9 +3293,11 @@ void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_
     p.indices = 0;
     p.primitive = SGXD_PROGRAM_TRIANGLES;
     // ISP A: opaque, DCMP ALWAYS, DWRITEDIS, BPRES; no culling. The region clip keeps the
-    // target's tiles (quads wider than a transfer's output reach past them).
+    // target's tiles (quads wider than a transfer's output reach past them), or the caller's.
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
-    const u32 clip = SGXD_RECIPE_CLIP(0, 0, (r.width + 31) / 32 - 1, (r.height + 31) / 32 - 1);
+    if (clip == 0) {
+        clip = SGXD_RECIPE_CLIP(0, 0, (r.width + 31) / 32 - 1, (r.height + 31) / 32 - 1);
+    }
     for (const Band& band : g.bands) {
         const u32 band_texels = std::bit_ceil(band.rows * w);
         u32 tex[4];

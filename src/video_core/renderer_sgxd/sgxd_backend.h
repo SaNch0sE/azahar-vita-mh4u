@@ -454,6 +454,10 @@ public:
     /// store's samples as a clear leaves them, depth z and stencil, through the PTLA: a tile no
     /// primitive touches neither loads nor stores.
     void FillDepthStore(const DepthStore& store, float z, u32 stencil);
+    /// The same over the store's samples x0..x1 (in 4s) by y0..y1: the depth with z, the
+    /// stencil with stencil, each kept when null.
+    void FillDepthStorePart(const DepthStore& store, u32 x0, u32 x1, u32 y0, u32 y1,
+                            const float* z, const u32* stencil);
     /// UntileSource::code for ETC1 (the texture unit's ETC1, whose blocks the untile reorders
     /// first).
     static constexpr u32 UntileEtc1 = 0x84;
@@ -727,7 +731,8 @@ private:
      * column (a PICA target's load), which is the texture's own orientation; otherwise x is the
      * column (a display transfer's output). Opaque, DCMP ALWAYS, no depth write. magnify
      * (quarters, 5 to 8; unscaled only): each texel magnify / 4 pixels a side, nearest (a
-     * scaled pass's load of the guest's 1x bytes).
+     * scaled pass's load of the guest's 1x bytes). clip: the tiles drawn (SGXD_RECIPE_CLIP), 0
+     * for all of the target's. flip (not transposed): the target's rows in the other order.
      */
     void DrawTiled(const UntileSource& src, bool transposed, u32 scale_x = 1, u32 scale_y = 1,
                    u32 magnify_x = 1, u32 magnify_y = 1);

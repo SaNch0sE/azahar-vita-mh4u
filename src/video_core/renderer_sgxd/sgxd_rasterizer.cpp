@@ -20,6 +20,7 @@
 #include <nihstro/shader_bytecode.h>
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/color.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/math_util.h"
@@ -1220,6 +1221,8 @@ void RasterizerSgxd::NotifyP3D() {
     if (in_pass) {
         EndPass("P3D");
     }
+    // A clear quad filled before it was alone in what would have been its pass.
+    filled_site = -1;
     if (p3ds++ < 4 || p3ds % 60 == 0) {
         LOG_INFO(Render, "P3D {}: {}; {} passes so far, {} opened by a covering draw", p3ds,
                  in_pass ? "ended the open pass" : "no pass open", passes, covered_passes);
@@ -2834,6 +2837,37 @@ RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width,
     return depth_stores.back();
 }
 
+bool RasterizerSgxd::DepthStoreValid(PAddr addr, u32 width, u32 height, u32 format, u32 quarters,
+                                    u32 margin) const {
+    return std::any_of(depth_stores.begin(), depth_stores.end(), [&](const DepthStore& d) {
+        return d.addr == addr && d.width == width && d.height == height && d.format == format &&
+               d.quarters == quarters && d.margin == margin && d.valid;
+    });
+}
+
+RasterizerSgxd::DepthStore* RasterizerSgxd::DepthStoreOf(PAddr addr, u32 width, u32 height,
+                                                       u32 format) {
+    for (DepthStore& d : depth_stores) {
+        if (d.addr == addr && d.width == width && d.height == height && d.format == format &&
+            d.quarters == 4 && d.margin == 0) {
+            return &d;
+        }
+    }
+    return nullptr;
+}
+
+void RasterizerSgxd::SettleDepthClear(DepthStore& d) {
+    if (!d.pending) {
+        return;
+    }
+    const DepthStore::PendingClear p = *d.pending;
+    d.pending.reset();
+    const bool part = p.part.x1 != 0;
+    backend.FillDepthStorePart(d.store, part ? p.part.x0 : 0, part ? p.part.x1 : d.store.width,
+                               part ? p.part.y0 : 0, part ? p.part.y1 : d.store.height,
+                               p.has_z ? &p.z : nullptr, p.has_stencil ? &p.stencil : nullptr);
+}
+
 SgxdBackend::DepthStore RasterizerSgxd::NewDepthStore(u32 width, u32 height, u32 format,
                                                      bool upscaled) {
     // The pass's target, the guest buffer's transpose (SgxdBackend::PicaTarget), in whole 32x32
@@ -2849,6 +2883,7 @@ void RasterizerSgxd::DepthStoresWritten(PAddr start, PAddr end) {
             static_cast<FramebufferRegs::DepthFormat>(d.format));
         if (start < d.addr + d.width * d.height * bytes && d.addr < end) {
             d.valid = false;
+            d.pending.reset();
         }
     }
 }
@@ -2886,7 +2921,8 @@ void RasterizerSgxd::EndPass(const char* why) {
     if ((pass_depth_cleared || pass_depth_load || pass_depth_covered) && !depth_under_colour) {
         DepthStore& d = DepthStoreFor(pass_depth, s.width, s.height, pass_depth_format,
                                       pass_quarters, pass_margin);
-        if (!pass_depth_load) {
+        // A pass that wrote its part's depth whole keeps the rest of the store as it was.
+        if (!pass_depth_load && !pass_depth_part) {
             backend.FillDepthStore(d.store, pass_bg_depth, pass_bg_stencil);
         }
         if (pass_depth_used) {
@@ -2969,6 +3005,11 @@ void RasterizerSgxd::EndPass(const char* why) {
     pass_margin = 0;
     pass_widened = false;
     pass_drawn_lo = pass_drawn_hi = 0;
+    // A pass a clear quad opened: whether the next one there is filled.
+    if (pass_clear_site >= 0) {
+        clear_quad_sites[pass_clear_site].alone = pass_guest_draws == 1;
+        pass_clear_site = -1;
+    }
 #ifdef VITA_DIAGNOSTICS
     VprofPassResult(s);
     LogTextureStats();
@@ -5708,8 +5749,30 @@ u32 RasterizerSgxd::OwnPixelUnits(bool is_indexed, const float* immediate, u32 c
     return own;
 }
 
+namespace {
+// A stencil test that writes every pixel's stencil from its reference alone, reading none: ALWAYS,
+// the depth test ALWAYS or off, and the pass op ZERO or REPLACE through a full write mask.
+bool StencilOverwrites(const FramebufferRegs& f) {
+    using CF = FramebufferRegs::CompareFunc;
+    using SA = FramebufferRegs::StencilAction;
+    const auto& om = f.output_merger;
+    const auto& st = om.stencil_test;
+    return st.func == CF::Always && st.write_mask == 0xff &&
+           (!om.depth_test_enable || om.depth_test_func == CF::Always) &&
+           (st.action_depth_pass == SA::Zero || st.action_depth_pass == SA::Replace);
+}
+
+bool StencilWrites(const FramebufferRegs& f) {
+    using SA = FramebufferRegs::StencilAction;
+    const auto& st = f.output_merger.stencil_test;
+    return st.write_mask != 0 && (st.action_stencil_fail != SA::Keep ||
+                                  st.action_depth_fail != SA::Keep ||
+                                  st.action_depth_pass != SA::Keep);
+}
+} // Anonymous namespace
+
 bool RasterizerSgxd::CoversTarget(bool is_indexed, const float* immediate, u32 count, u32 width,
-                                 u32 height, bool depth) {
+                                 u32 height, const StorePart& part, bool depth) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
     using CullMode = Pica::RasterizerRegs::CullMode;
     const auto& pipeline = regs.pipeline;
@@ -5736,30 +5799,43 @@ bool RasterizerSgxd::CoversTarget(bool is_indexed, const float* immediate, u32 c
         om.alphablend_enable &&
         (b.factor_dest_rgb != BF::Zero || b.factor_dest_a != BF::Zero ||
          of_dest(b.factor_source_rgb) || of_dest(b.factor_source_a));
+    // A test kills a pixel unless it is ALWAYS.
+    using CF = FramebufferRegs::CompareFunc;
+    const bool depth_kills = om.depth_test_enable && om.depth_test_func != CF::Always;
+    const bool stencil_kills = om.stencil_test.enable && om.stencil_test.func != CF::Always;
     const bool reads_target =
         blend_reads || (!om.alphablend_enable && om.logic_op != FramebufferRegs::LogicOp::Copy) ||
-        om.alpha_test.enable || om.depth_test_enable || om.stencil_test.enable;
-    // Every pixel's depth: written, nothing killing a pixel first (the alpha and stencil
-    // tests, a depth test other than ALWAYS).
-    const bool depth_kept =
-        om.alpha_test.enable || om.stencil_test.enable ||
-        (om.depth_test_enable && om.depth_test_func != FramebufferRegs::CompareFunc::Always);
+        om.alpha_test.enable || depth_kills || stencil_kills;
+    // Every pixel's depth written, nothing killing a pixel first, and the stencil written whole or not
+    // tested.
+    const bool depth_kept = om.alpha_test.enable || depth_kills ||
+                            (om.stencil_test.enable && !StencilOverwrites(regs.framebuffer));
     if (depth ? depth_kept : (!writes_all || reads_target)) {
         return false;
+    }
+    // What has to be written, in window coordinates: the target, or the part.
+    u32 rx0 = 0, rx1 = width, ry0 = 0, ry1 = height;
+    if (part.x1 != 0) {
+        rx0 = part.y0;
+        rx1 = part.y1;
+        ry0 = height - part.x1;
+        ry1 = height - part.x0;
     }
     const auto& sc = rs.scissor_test;
     if (sc.mode == Pica::RasterizerRegs::ScissorMode::Exclude ||
         (sc.mode == Pica::RasterizerRegs::ScissorMode::Include &&
-         (sc.x1 != 0 || sc.y1 != 0 || sc.x2 + 1 < width || sc.y2 + 1 < height))) {
+         (sc.x1 > rx0 || sc.y1 > ry0 || sc.x2 + 1 < rx1 || sc.y2 + 1 < ry1))) {
         return false;
     }
-    // The viewport clips x and y: it has to hold the target.
+    // The viewport clips x and y: it has to hold that.
     const float half_x = f24::FromRaw(rs.viewport_size_x).ToFloat32();
     const float half_y = f24::FromRaw(rs.viewport_size_y).ToFloat32();
     const float corner_x = static_cast<float>(rs.viewport_corner.x);
     const float corner_y = static_cast<float>(rs.viewport_corner.y);
-    if (corner_x > 0 || corner_y > 0 || corner_x + 2 * half_x < static_cast<float>(width) ||
-        corner_y + 2 * half_y < static_cast<float>(height)) {
+    const float fx0 = static_cast<float>(rx0), fx1 = static_cast<float>(rx1);
+    const float fy0 = static_cast<float>(ry0), fy1 = static_cast<float>(ry1);
+    if (corner_x > fx0 || corner_y > fy0 || corner_x + 2 * half_x < fx1 ||
+        corner_y + 2 * half_y < fy1) {
         return false;
     }
 
@@ -5787,8 +5863,7 @@ bool RasterizerSgxd::CoversTarget(bool is_indexed, const float* immediate, u32 c
     const float x1 = *std::max_element(x.begin(), x.begin() + count);
     const float y0 = *std::min_element(y.begin(), y.begin() + count);
     const float y1 = *std::max_element(y.begin(), y.begin() + count);
-    if (x0 > 0.25f || y0 > 0.25f || x1 < static_cast<float>(width) - 0.25f ||
-        y1 < static_cast<float>(height) - 0.25f) {
+    if (x0 > fx0 + 0.25f || y0 > fy0 + 0.25f || x1 < fx1 - 0.25f || y1 < fy1 - 0.25f) {
         return false;
     }
     // Each triangle is kept, its vertices on three of the box's corners, the two leaving out opposite
@@ -5818,6 +5893,227 @@ bool RasterizerSgxd::CoversTarget(bool is_indexed, const float* immediate, u32 c
         left_out[k] = static_cast<u32>(std::countr_zero(~corners & 0xfu));
     }
     return (left_out[0] ^ left_out[1]) == 3;
+}
+
+bool RasterizerSgxd::FillsClearQuad(bool is_indexed, const float* immediate, u32 count,
+                                   const ColourBuffer& target, const StorePart& part,
+                                   PAddr depth, bool dwrite, bool stencil, bool act) {
+    using Tev = Pica::TexturingRegs::TevStageConfig;
+    const auto& om = regs.framebuffer.output_merger;
+    const auto& fb = regs.framebuffer.framebuffer;
+    const auto& rs = regs.rasterizer;
+    // The colour is one the CPU knows: the first stage replaces it with the primary colour or its
+    // constant, the later stages pass it on, no fog, and a blend that copies or none.
+    const auto stages = regs.texturing.GetTevStages();
+    const Tev& s0 = stages[0];
+    const auto known = [](Tev::Source s) {
+        return s == Tev::Source::PrimaryColor || s == Tev::Source::Constant;
+    };
+    const auto passes_on = [](const Tev& s) {
+        return s.color_op == Tev::Operation::Replace && s.alpha_op == Tev::Operation::Replace &&
+               s.color_source1 == Tev::Source::Previous &&
+               s.alpha_source1 == Tev::Source::Previous &&
+               s.color_modifier1 == Tev::ColorModifier::SourceColor &&
+               s.alpha_modifier1 == Tev::AlphaModifier::SourceAlpha &&
+               s.GetColorMultiplier() == 1 && s.GetAlphaMultiplier() == 1;
+    };
+    using BF = FramebufferRegs::BlendFactor;
+    using BE = FramebufferRegs::BlendEquation;
+    const auto& ab = om.alpha_blending;
+    const bool copies = om.alphablend_enable
+                            ? ab.blend_equation_rgb == BE::Add && ab.blend_equation_a == BE::Add &&
+                                  ab.factor_source_rgb == BF::One &&
+                                  ab.factor_dest_rgb == BF::Zero &&
+                                  ab.factor_source_a == BF::One && ab.factor_dest_a == BF::Zero
+                            : om.logic_op == FramebufferRegs::LogicOp::Copy;
+    if (om.fragment_operation_mode != FramebufferRegs::FragmentOperationMode::Default ||
+        regs.texturing.fog_mode != Pica::TexturingRegs::FogMode::None || !copies ||
+        s0.color_op != Tev::Operation::Replace || s0.alpha_op != Tev::Operation::Replace ||
+        !known(s0.color_source1) || !known(s0.alpha_source1) ||
+        s0.color_modifier1 != Tev::ColorModifier::SourceColor ||
+        s0.alpha_modifier1 != Tev::AlphaModifier::SourceAlpha || s0.GetColorMultiplier() != 1 ||
+        s0.GetAlphaMultiplier() != 1 ||
+        !std::all_of(stages.begin() + 1, stages.end(), passes_on)) {
+        return false;
+    }
+    // Guest VRAM, a buffer drawn at 1x and not through a scratch, and a stencil test that writes
+    // every pixel's or none.
+    const u32 width = target.width, height = target.height, bpp = target.bpp;
+    if (target.addr < Memory::VRAM_PADDR || target.End() > Memory::VRAM_PADDR_END ||
+        width < 32 || UpscaledFor(target) != nullptr ||
+        (stencil && !StencilOverwrites(regs.framebuffer))) {
+        return false;
+    }
+    if (!CoversTarget(is_indexed, immediate, count, width, height, part) ||
+        (dwrite && !CoversTarget(is_indexed, immediate, count, width, height, part, true))) {
+        return false;
+    }
+    // The tile rows the part takes and the tiles of each, as one strided fill; all of the buffer as
+    // one run.
+    const u32 tpr = width / 8;
+    const u32 r0 = part.x1 != 0 ? part.x0 / 8 : 0, r1 = part.x1 != 0 ? part.x1 / 8 : height / 8;
+    const u32 c0 = part.x1 != 0 ? part.y0 / 8 : 0, c1 = part.x1 != 0 ? part.y1 / 8 : tpr;
+    const u32 line = (c1 - c0) * 64, stride = tpr * 64 * bpp;
+    if (part.x1 != 0 && (line > SGXD_PTLA_MAX_EXTENT || stride > 0xffffu)) {
+        return false;
+    }
+    // The depth and stencil store, which a part, or the stencil alone, changes only in part.
+    const auto df = fb.depth_format.Value();
+    const bool has_stencil = df == FramebufferRegs::DepthFormat::D24S8;
+    const bool stencil_write = stencil && fb.allow_depth_stencil_write != 0;
+    const bool whole_store =
+        part.x1 == 0 && (!dwrite || stencil_write || !has_stencil) && (dwrite || !has_stencil);
+    if ((dwrite || stencil_write) && !whole_store &&
+        !DepthStoreValid(depth, width, height, static_cast<u32>(df), 4, 0)) {
+        return false;
+    }
+
+    // The window positions as the shader interpreter makes them: one colour and one depth.
+    std::array<Pica::OutputVertex, 6> v;
+    if (!QuadVertices(is_indexed, immediate, count, v)) {
+        return false;
+    }
+    std::array<u8, 4> rgba{};
+    for (u32 c = 0; c < 4; c++) {
+        const Tev::Source source = c < 3 ? s0.color_source1.Value() : s0.alpha_source1.Value();
+        if (source == Tev::Source::Constant) {
+            rgba[c] = static_cast<u8>(s0.const_color >> (8 * c));
+            continue;
+        }
+        // The interpolated colour times 255 is rounded: a value that far from a half rounds the same
+        // however the GPU interpolates it.
+        const f24 first = v[0].color[c];
+        const float scaled = first.ToFloat32() * 255.0f;
+        const float near = std::round(scaled);
+        if (!(scaled >= 0.0f && scaled <= 255.0f) || std::abs(scaled - near) > 0.01f) {
+            return false;
+        }
+        for (u32 j = 1; j < count; j++) {
+            if (v[j].color[c].ToFloat32() != first.ToFloat32()) {
+                return false;
+            }
+        }
+        rgba[c] = static_cast<u8>(near);
+    }
+    // The depth: z / w scaled and offset (times w W-buffered), clamped; only 0 and 1, which the TA
+    // gives exactly too.
+    float z = 0.0f;
+    if (dwrite) {
+        const float scale = f24::FromRaw(rs.viewport_depth_range).ToFloat32();
+        const float offset = f24::FromRaw(rs.viewport_depth_near_plane).ToFloat32();
+        for (u32 j = 0; j < count; j++) {
+            const float w = v[j].pos.w.ToFloat32();
+            float d = v[j].pos.z.ToFloat32() / w * scale + offset;
+            if (rs.depthmap_enable == Pica::RasterizerRegs::DepthBuffering::WBuffering) {
+                d *= w;
+            }
+            d = std::clamp(d, 0.0f, 1.0f);
+            if ((d != 0.0f && d != 1.0f) || (j != 0 && d != z)) {
+                return false;
+            }
+            z = d;
+        }
+    }
+    const auto& st = om.stencil_test;
+    const u32 stencil_value =
+        st.action_depth_pass == FramebufferRegs::StencilAction::Replace ? st.reference_value : 0;
+    if (!act) {
+        return true;
+    }
+
+    // The colour as the PICA writes it, its bytes low first, as a fill's value.
+    const Common::Vec4<u8> colour{rgba[0], rgba[1], rgba[2], rgba[3]};
+    std::array<u8, 4> bytes{};
+    using CF = FramebufferRegs::ColorFormat;
+    switch (target.format) {
+    case CF::RGBA8:
+        Common::Color::EncodeRGBA8(colour, bytes.data());
+        break;
+    case CF::RGB8:
+        Common::Color::EncodeRGB8(colour, bytes.data());
+        break;
+    case CF::RGB5A1:
+        Common::Color::EncodeRGB5A1(colour, bytes.data());
+        break;
+    case CF::RGB565:
+        Common::Color::EncodeRGB565(colour, bytes.data());
+        break;
+    case CF::RGBA4:
+        Common::Color::EncodeRGBA4(colour, bytes.data());
+        break;
+    default:
+        return false;
+    }
+    const u32 value = bytes[0] | bytes[1] << 8 | bytes[2] << 16 | bytes[3] << 24;
+    const u32 format = bpp == 4 ? SGXD_PTLA_8888 : (bpp == 3 ? SGXD_PTLA_888 : SGXD_PTLA_U88);
+    // A part: its tile rows, a buffer row of tiles apart. All of it: rows of 4096 pixels and a last
+    // partial one.
+    constexpr u32 RowPixels = 4096;
+    const PAddr start = target.addr + (r0 * tpr + c0) * 64 * bpp;
+    const PAddr end = part.x1 != 0 ? start + (r1 - r0 - 1) * stride + line * bpp : target.End();
+    const u32 pixels = width * height;
+    const SgxdPtlaFill fill = part.x1 != 0 ? SgxdPtlaFill{start, format, stride, line, r1 - r0, 0,
+                                                          value}
+                                           : SgxdPtlaFill{start, format, RowPixels * bpp,
+                                                          RowPixels, pixels / RowPixels,
+                                                          pixels % RowPixels, value};
+    DepthStoresWritten(start, end);
+    backend.RenderBefore(start, end, "a clear quad's fill");
+    char failed[160];
+    [[maybe_unused]] const int filled = sgxd_ptla_fill(&fill, nullptr, failed, sizeof(failed));
+    DEBUG_ASSERT_MSG(filled == 0, "sgxd: a clear quad's fill of {:#x}-{:#x}: {}", start, end,
+                     failed);
+    // All of the buffer cleared: a pass on it starts from the clear. A part: the clear recorded over
+    // the buffer no longer holds.
+    if (part.x1 == 0) {
+        RecordClear({target.addr, target.End(), value, bpp, 0});
+    } else {
+        ForgetClears(target.addr, target.End());
+    }
+    TexturesWritten(start, end);
+    // The depth and stencil wait in the store's pending clear until a pass uses them: a clear of the
+    // same part merges into it, one of another part writes it first.
+    if (dwrite || stencil_write) {
+        // A fill recorded over the depth buffer no longer holds.
+        ForgetClears(depth, depth + width * height * FramebufferRegs::BytesPerDepthPixel(df));
+        DepthStore& d = DepthStoreFor(depth, width, height, static_cast<u32>(df));
+        if (d.pending && d.pending->part != part) {
+            SettleDepthClear(d);
+        }
+        DepthStore::PendingClear p = d.pending.value_or(DepthStore::PendingClear{part});
+        if (dwrite) {
+            p.z = z;
+            p.has_z = true;
+        }
+        if (stencil_write) {
+            p.stencil = stencil_value;
+            p.has_stencil = true;
+        }
+        d.pending = p;
+        d.valid = true;
+#ifdef VITA_DIAGNOSTICS
+        d.ta_w = false;
+#endif
+    }
+    const auto filled_what = [&] {
+        return fmt::format("{:#x} ({}x{}, part {}..{} x {}..{}): colour {:#x}{}{}", target.addr,
+                           width, height, part.x0, part.x1, part.y0, part.y1, value,
+                           dwrite ? fmt::format(", depth {}", z) : "",
+                           stencil_write ? fmt::format(", stencil {}", stencil_value) : "");
+    };
+    if (quad_fills++ < 4) {
+        LOG_INFO(Render, "a clear quad filled over {}", filled_what());
+    }
+#ifdef VITA_DIAGNOSTICS
+    static const u64 pass_log_at = u64{SgxdFlagValue("passlog")} * 1000000;
+    if (pass_log_at != 0) {
+        const u64 now = sceKernelGetProcessTimeWide();
+        if (now >= pass_log_at && now < pass_log_at + 1000000) {
+            LOG_INFO(Render, "perf: clear quad filled over {}", filled_what());
+        }
+    }
+#endif
+    return true;
 }
 
 bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate_count) {
@@ -6209,6 +6505,38 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     if (backend.InPass() && backend.PassDraws() + DrawAddsAtMost > SgxdBackend::MaxDraws) {
         EndPass("a pass full of draws");
     }
+    // A pass that would only write one colour over the part it stores is a fill: the PTLA's, beside
+    // the 3D. Only where the last such quad was alone in its pass (ClearQuadSite).
+    if (!backend.InPass()) {
+        pass_clear_site = -1;
+        if (filled_site >= 0) {
+            ClearQuadSite& s = clear_quad_sites[filled_site];
+            if (s.addr == colour && s.part == part) {
+                s.alone = false;
+            }
+            filled_site = -1;
+        }
+        s32 site = -1;
+        for (u32 i = 0; i < clear_quad_sites.size(); i++) {
+            if (clear_quad_sites[i].addr == colour && clear_quad_sites[i].part == part) {
+                site = static_cast<s32>(i);
+            }
+        }
+        const bool alone = site >= 0 && clear_quad_sites[site].alone;
+        if (draw_own_pixel == 0 && FillsClearQuad(is_indexed, immediate, count, target, part,
+                                                  depth, dwrite, stencil, alone)) {
+            if (alone) {
+                filled_site = site;
+                return true;
+            }
+            if (site < 0) {
+                site = static_cast<s32>(clear_quad_next);
+                clear_quad_next = (clear_quad_next + 1) % clear_quad_sites.size();
+                clear_quad_sites[site] = {colour, part, false};
+            }
+            pass_clear_site = site;
+        }
+    }
     if (!backend.InPass()) {
         // A buffer of a width no pass draws: its scratch (NarrowScratch), the guest's bytes copied in.
         pass_narrow = nullptr;
@@ -6257,6 +6585,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         pass_depth_written = false;
         pass_depth_load = false;
         pass_depth_covered = false;
+        pass_depth_part = false;
         pass_depth_guest = false;
 #ifdef VITA_DIAGNOSTICS
         pass_ta_w = false;
@@ -6296,11 +6625,11 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             pass_scaled_target = t;
         }
         // The pass starts from the fill's clear, which guest memory holds already (a tile no
-        // draw touches keeps it), from nothing when its first draw writes every pixel, or else
-        // from the buffer's own bytes: its first draws read them (ColorFormat numbers the first
-        // five TextureFormats).
-        const bool covered =
-            draw_own_pixel == 0 && CoversTarget(is_indexed, immediate, count, width, height);
+        // draw touches keeps it), from nothing when its first draw writes every pixel it stores,
+        // or else from the buffer's own bytes: its first draws read them (ColorFormat numbers
+        // the first five TextureFormats).
+        const bool covered = draw_own_pixel == 0 && CoversTarget(is_indexed, immediate, count,
+                                                                 width, height, PartToCover());
         pass_colour = target;
 #ifdef VITA_DIAGNOSTICS
         drawn_buffers[colour] = target;
@@ -6352,7 +6681,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         pass_bg_stencil = bg_stencil;
         pass_open_draws = backend.PassDraws();
         pass_drawn_lo = pass_drawn_hi = 0;
+        pass_guest_draws = 0;
     }
+    pass_guest_draws++;
     // After the pass's load, whose draws cover the margin too.
     if (view_mask.x1 != 0 && pass_mask != view_mask) {
         DEBUG_ASSERT(pass_mask.x1 == 0);
@@ -6367,17 +6698,23 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             pass_open_draws = backend.PassDraws();
         }
     }
-    // Without a clear, the depth is what the last pass on the buffer stored, or what guest
-    // memory holds when none did (a buffer the CPU cleared, or one reshaped). A draw that
-    // writes every pixel's depth without reading any (DCMP ALWAYS, no stencil test) needs
-    // none, and the pass then knows all of it, as after a clear, and stores it for the next:
-    // Ocarina of Time 3D draws a quad at the far plane before its scene, in a pass of its own,
-    // and the scene's LESS tests would meet guest memory's depth instead. Any other
-    // draw that writes depth starts from the depth before it, as one that reads it does.
-    const bool reads_depth = dcmp != 7 || stencil;
+    // Without a clear, the depth is what the last pass on the buffer stored, or what guest memory
+    // holds. A draw writing every pixel's depth without reading any (DCMP ALWAYS, no stencil test)
+    // needs none, and the pass then knows all of it, as after a clear. Any other draw writing depth
+    // starts from the depth before it. A pass storing part of its target needs the part alone written
+    // and keeps the depth past it. A clear quad's depth not written yet goes into the store first.
+    if (uses_depth && !pass_depth_used) {
+        if (DepthStore* d = DepthStoreOf(depth, width, height, pass_depth_format)) {
+            SettleDepthClear(*d);
+        }
+    }
+    const bool reads_depth = dcmp != 7 || (stencil && !StencilOverwrites(regs.framebuffer));
     if (dwrite && !reads_depth && !pass_depth_cleared && !pass_depth_load && !pass_depth_covered &&
-        CoversTarget(is_indexed, immediate, count, width, height, true)) {
-        pass_depth_covered = true;
+        CoversTarget(is_indexed, immediate, count, width, height, PartToCover(), true)) {
+        const bool part = PartToCover().x1 != 0;
+        pass_depth_covered = !part || DepthStoreValid(depth, width, height, pass_depth_format,
+                                                      pass_quarters, pass_margin);
+        pass_depth_part = part && pass_depth_covered;
     }
     if ((reads_depth || dwrite) && !pass_depth_cleared && !pass_depth_load && !pass_depth_covered) {
         const auto it = std::find_if(depth_stores.begin(), depth_stores.end(), [&](const DepthStore& d) {

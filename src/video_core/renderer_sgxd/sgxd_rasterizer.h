@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 #include "common/mutex.h"
@@ -455,17 +456,44 @@ private:
     /// through two stream-out renders, then the triangles as the draw's vertices (the SGX has no
     /// geometry stage, so the geometry program runs as a vertex program that stores what it emits).
     VertexStage GeometryStage(bool is_indexed, const Describe& describe);
-    /// Whether a draw writes every pixel of a width x height target whatever was there: two
-    /// triangles (4 or 6 vertices, positions from upstream's interpreter) covering it whole,
-    /// neither culled nor clipped, and an output merger that takes nothing from the target
-    /// (full colour mask, no blend, alpha, depth or stencil test, no scissor inside it). A
-    /// pass it opens starts from nothing: no load, and no write-backs for one.
     /// `lines` lines of `line` bytes, src_stride apart, to dst_stride apart through the PTLA.
     bool CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_stride, u32 line, u32 lines);
-    /// `depth`: whether the draw writes every pixel's depth instead, whatever it does to the
-    /// colour, its depth test ALWAYS or off.
+    /// The part of a pass's target a draw's viewport covers, in the target's pixels (x in 8s, y0 in
+    /// 16s); x1 0 for all of it.
+    struct StorePart {
+        u32 x0{}, x1{}, y0{}, y1{};
+        bool operator==(const StorePart&) const = default;
+    };
+    /// Whether a draw writes every pixel of a width x height target (or of `part`) whatever was there:
+    /// two triangles covering it whole, not culled or clipped, and an output merger that takes nothing
+    /// from the target. A pass it opens loads nothing. `depth`: every pixel's depth instead, the depth
+    /// test ALWAYS or off and the stencil written whole or not tested.
     bool CoversTarget(bool is_indexed, const float* immediate, u32 count, u32 width, u32 height,
-                      bool depth = false);
+                      const StorePart& part, bool depth = false);
+    /// A draw that would open a pass only to write one colour (one depth, 0 or 1, and one
+    /// stencil, or none) over the part of target it stores (CoversTarget): done as fills of the
+    /// guest's buffer and the depth store through the PTLA, beside the 3D, where the pass would
+    /// store every tile of the part. Only for a buffer 32 wide or more drawn at 1x: the fill
+    /// takes the rows a 1x picture owns there (ColourWritesDue); a scaled picture's quad is
+    /// drawn. stencil: the draw's stencil test is on. False when it is not such a draw, and
+    /// nothing was done; with act false, only whether it is one.
+    bool FillsClearQuad(bool is_indexed, const float* immediate, u32 count,
+                        const ColourBuffer& target, const StorePart& part, PAddr depth,
+                        bool dwrite, bool stencil, bool act);
+    u32 quad_fills = 0;
+    /// Where clear quads were drawn (a buffer and its passes' part), and whether the last pass one
+    /// opened held nothing else. A quad is filled only there: one the pass's later draws join costs
+    /// next to nothing drawn, where a fill adds a PTLA op the 3D waits for.
+    struct ClearQuadSite {
+        PAddr addr{};
+        StorePart part{};
+        bool alone{};
+    };
+    std::array<ClearQuadSite, 16> clear_quad_sites{};
+    u32 clear_quad_next = 0;  ///< the site replaced next
+    s32 pass_clear_site = -1; ///< the open pass's first draw was a clear quad of this site
+    s32 filled_site = -1;     ///< a site filled since the last P3D, with no draw after it yet
+    u32 pass_guest_draws = 0; ///< the guest's draws in the open pass
     /// A draw of `count` vertices (4 or 6) run through the vertex program on the CPU; false when
     /// its index list is not in memory. Once a draw.
     bool QuadVertices(bool is_indexed, const float* immediate, u32 count,
@@ -706,13 +734,6 @@ private:
     VertexLayout DecodeVertexLayout() const;
     /// The raw words VertexProgramFor's program depends on past the layout.
     std::array<u32, VertexLayout::ProgramKeyWords> VertexProgramKey(Usse::VsMode mode);
-    /// The part of a pass's target (the colour buffer transposed) a draw's viewport covers, in
-    /// the target's pixels (SgxdPicaStore's x0..x1 and y0..y1: in 8s, y0 in 16s); x1 0 for all
-    /// of it.
-    struct StorePart {
-        u32 x0{}, x1{}, y0{}, y1{};
-        bool operator==(const StorePart&) const = default;
-    };
     /// What a pass on target stores for the draw (its viewport's part, or all of it off the grid).
     StorePart StorePartFor(const ColourBuffer& target) const;
     StorePart ViewportPart(const ColourBuffer& target) const;
@@ -872,6 +893,11 @@ private:
     [[nodiscard]] bool PassStoresWholeDepth() const {
         return pass_depth_guest;
     }
+    /// What a draw has to cover for nothing of its target to be loaded: the part it stores, or all of
+    /// the target when scaled, widened or narrow.
+    [[nodiscard]] StorePart PartToCover() const {
+        return pass_quarters == 4 && pass_margin == 0 && !pass_narrow ? pass_part : StorePart{};
+    }
 #ifdef VITA_DIAGNOSTICS
     const char* pass_opened = ""; ///< passlog: clear, covered, load
 #endif
@@ -1029,6 +1055,7 @@ private:
     bool pass_depth_written{};  // a draw wrote depth or stencil
     bool pass_depth_load{};     // it starts from the depth an earlier pass stored
     bool pass_depth_covered{};  // or a draw wrote every pixel's depth before any read it
+    bool pass_depth_part{};     // ... of the part it stores, the rest kept in its store
     bool pass_depth_guest{};    // or from guest memory's, untiled into the store
     u32 guest_depth_loads{};
     u32 window_misses{}; ///< draws reaching before the top screen's window (TopWindowFor), logged
@@ -1043,10 +1070,28 @@ private:
         bool valid; // the last pass on the buffer stored it, and nothing wrote there since
         // A pass storing part of its target stores its depth here, then that part into store.
         SgxdBackend::DepthStore scratch{};
+        /// A clear quad's depth and stencil over part of the store, not written yet: the PTLA fills it once
+        /// a pass uses the depth (SettleDepthClear), and a clear of the same part replaces it unwritten.
+        struct PendingClear {
+            StorePart part;
+            float z;
+            u32 stencil;
+            bool has_z, has_stencil;
+        };
+        std::optional<PendingClear> pending{};
+#ifdef VITA_DIAGNOSTICS
+        /// sgxd_flags wbufmix: the last pass stored the TA's W depths (WBUFFEN's 1 - 1/w)
+        bool ta_w = false;
+#endif
     };
     std::vector<DepthStore> depth_stores;
     DepthStore& DepthStoreFor(PAddr addr, u32 width, u32 height, u32 format, u32 quarters = 4,
                               u32 margin = 0);
+    /// Whether a store of that shape holds the buffer's depth (a pass may load it).
+    bool DepthStoreValid(PAddr addr, u32 width, u32 height, u32 format, u32 quarters,
+                         u32 margin) const;
+    DepthStore* DepthStoreOf(PAddr addr, u32 width, u32 height, u32 format);
+    void SettleDepthClear(DepthStore& d);
     SgxdBackend::DepthStore NewDepthStore(u32 width, u32 height, u32 format,
                                           bool upscaled = false);
     void DepthStoresWritten(PAddr start, PAddr end);
