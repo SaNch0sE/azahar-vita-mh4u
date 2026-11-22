@@ -6,8 +6,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include "video_core/renderer_gxm/usse/usse_ir.h"
@@ -1174,6 +1176,13 @@ void Lowering::HoistLoads(int max_group) {
             quad_defs[QuadOf(load.reg[0])] < 2) {
             continue; // the register-offset form, a physical destination, or a hoisted one
         }
+        if (load.reg[1].bank == Bank::Virtual && QuadOf(load.reg[1]) == QuadOf(load.reg[0])) {
+            // Its address is the quad it loads into (a geometry table's row after its entry,
+            // VertexEmitter::GsTableRead): a fresh destination would rename the address too,
+            // and a group would issue it before the load it waits for. It stays as it is and
+            // reads the entry wherever that load went.
+            continue;
+        }
         Sequence sq{w - 1, w - 1, w, load.reg[1], false, load.reg[0], {}};
         if (load.reg[1].bank == Bank::Virtual) {
             sq.has_addr = true;
@@ -1244,11 +1253,54 @@ void Lowering::HoistLoads(int max_group) {
     std::vector<Inst> out;
     out.reserve(insts.size() + 8);
     std::vector<std::pair<Bank, int>> written;
-    const auto emit = [&](const Inst& inst) {
+    // A load given a fresh quad leaves its original quad unwritten: every later read of that quad
+    // is the fresh one's, in program order, until something writes the whole quad again (a memory
+    // light's quad is read again after its later quads load). A read past a label or branch, or a
+    // part of the quad written, keeps the program as it was.
+    std::map<uint32_t, Reg> moved;
+    std::set<uint32_t> crossed; ///< moved quads a label, branch or phase start came after
+    bool keep_original = false;
+    const std::vector<Inst> original = insts;
+    const uint32_t original_quads = quad_count;
+    const auto follow_moves = [&](Inst& inst) {
+        if (inst.op == Op::Label || inst.op == Op::Br || inst.op == Op::PhaseStart) {
+            for (const auto& [quad, to] : moved) {
+                crossed.insert(quad);
+            }
+            moved.clear();
+            return;
+        }
+        Refs(inst, refs);
+        for (const Ref& r : refs) {
+            if (r.def || r.reg->bank != Bank::Virtual) {
+                continue;
+            }
+            keep_original |= crossed.contains(QuadOf(*r.reg));
+            const auto it = moved.find(QuadOf(*r.reg));
+            if (it != moved.end()) {
+                r.reg->n = static_cast<uint8_t>(it->second.n + (r.reg->n & 3));
+            }
+        }
+        for (const Ref& r : refs) {
+            if (!r.def || r.reg->bank != Bank::Virtual) {
+                continue;
+            }
+            const uint32_t quad = QuadOf(*r.reg);
+            const bool whole =
+                inst.pred == Pred::None && (r.reg->n & 3) == 0 && WriteLanes(inst, *r.reg) == 0xf;
+            if (moved.contains(quad) || crossed.contains(quad)) {
+                keep_original |= !whole;
+                moved.erase(quad);
+                crossed.erase(quad);
+            }
+        }
+    };
+    const auto emit = [&](Inst inst) {
+        follow_moves(inst);
         if (inst.op == Op::Label || inst.op == Op::Br || inst.op == Op::PhaseStart) {
             known.clear(); // control flow; waits and loads do not change a loaded quad
         } else {
-            WrittenRegs(const_cast<Inst&>(inst), written);
+            WrittenRegs(inst, written);
             for (const auto& wr : written) {
                 for (std::size_t j = 0; j < known.size();) {
                     const Reg& a = known[j].chain.areg;
@@ -1350,29 +1402,8 @@ void Lowering::HoistLoads(int max_group) {
                 }
             }
             if (!SameReg(dst, sq.dst)) {
-                // What follows reads the load's quad until it is written again.
-                std::size_t until = a + 1 < seqs.size() ? seqs[a + 1].start : insts.size();
-                for (std::size_t i = next; i < until; i++) {
-                    WrittenRegs(insts[i], written);
-                    bool writes_dst = false;
-                    for (const auto& wr : written) {
-                        writes_dst |= wr.first == Bank::Virtual && wr.second / 4 == static_cast<int>(QuadOf(sq.dst));
-                    }
-                    if (writes_dst || IsBarrier(insts[i])) {
-                        until = std::min(until, i);
-                        break;
-                    }
-                }
-                for (; next < until; next++) {
-                    Inst inst = insts[next];
-                    Refs(inst, refs);
-                    for (const Ref& r : refs) {
-                        if (!r.def && r.reg->bank == Bank::Virtual && QuadOf(*r.reg) == QuadOf(sq.dst)) {
-                            r.reg->n = static_cast<uint8_t>(dst.n + (r.reg->n & 3));
-                        }
-                    }
-                    emit(inst);
-                }
+                moved[QuadOf(sq.dst)] = dst;
+                crossed.erase(QuadOf(sq.dst));
             }
             done[a] = true;
             continue;
@@ -1456,39 +1487,37 @@ void Lowering::HoistLoads(int max_group) {
         if (any_load) {
             emit(insts[seqs[b].wait]);
         }
-        // The gaps, each reading its own load's quad.
+        // The gaps, in order: each member's quad is its fresh one from its own gap on.
+        const auto rename_addr = [&](Inst& inst, const Sequence& sq, Reg addr) {
+            Refs(inst, refs);
+            for (const Ref& r : refs) {
+                if (sq.has_addr && SameReg(*r.reg, sq.addr)) {
+                    *r.reg = addr;
+                }
+            }
+        };
         for (std::size_t k = a; k < b; k++) {
+            moved[QuadOf(seqs[k].dst)] = new_dst[k - a];
+            crossed.erase(QuadOf(seqs[k].dst));
             for (std::size_t i = seqs[k].wait + 1; i < seqs[k + 1].start; i++) {
                 Inst inst = insts[i];
-                rename(inst, seqs[k], new_addr[k - a], new_dst[k - a]);
+                rename_addr(inst, seqs[k], new_addr[k - a]);
                 emit(inst);
             }
             done[k] = true;
         }
+        moved[QuadOf(seqs[b].dst)] = new_dst[b - a];
+        crossed.erase(QuadOf(seqs[b].dst));
         done[b] = true;
         next = seqs[b].wait + 1;
-        // What follows reads the last load's quad until it is written again (the next
-        // sequence's own instructions are the next group's to copy).
-        std::size_t until = b + 1 < seqs.size() ? seqs[b + 1].start : insts.size();
-        for (std::size_t i = next; i < until; i++) {
-            WrittenRegs(insts[i], written);
-            bool writes_dst = false;
-            for (const auto& wr : written) {
-                writes_dst |= wr.first == Bank::Virtual && wr.second / 4 == static_cast<int>(QuadOf(seqs[b].dst));
-            }
-            if (writes_dst || IsBarrier(insts[i])) {
-                until = std::min(until, i);
-                break;
-            }
-        }
-        for (; next < until; next++) {
-            Inst inst = insts[next];
-            rename(inst, seqs[b], new_addr[b - a], new_dst[b - a]);
-            emit(inst);
-        }
     }
     for (; next < insts.size(); next++) {
         emit(insts[next]);
+    }
+    if (keep_original) {
+        insts = original;
+        quad_count = original_quads;
+        return;
     }
     insts.swap(out);
 }
@@ -1705,6 +1734,11 @@ void Lowering::TwoWideChains() {
                 j++;
             }
             if (moves.empty() || InternalRead(j, cur, 0xf)) {
+                ok = false;
+            }
+            // The last link writes each half once, to its move's pair: two moves of one half
+            // (a copy to two places) would leave the first pair unwritten.
+            if (moves.size() == 2 && insts[moves[0]].src[0].swz == insts[moves[1]].src[0].swz) {
                 ok = false;
             }
             break;
@@ -2537,13 +2571,22 @@ void Lowering::InternalRegisters() {
             Inst& inst = insts[i];
             Refs(inst, refs);
             const bool full = inst.pred == Pred::None && InternalWriteLanes(inst) == 0xf;
+            // A full write that reads its own register (`vec i1.xyzw, i1, c`) continues the
+            // range: the destination comes first in the references, so a range opened there
+            // would take the read along to wherever the new range is placed.
+            bool reads[3] = {false, false, false};
+            for (const Ref& r : refs) {
+                if (!r.def && r.reg->bank == Bank::Internal) {
+                    reads[r.reg->n] = true;
+                }
+            }
             for (int x = 0; x < static_cast<int>(refs.size()); x++) {
                 const Ref& r = refs[x];
                 if (r.reg->bank != Bank::Internal) {
                     continue;
                 }
                 const uint8_t k = r.reg->n;
-                if (r.def && full) {
+                if (r.def && full && !reads[k]) {
                     Range range{i, i, k, false, std::nullopt, {}};
                     if (IsInternalLoad(inst)) {
                         range.value = inst.src[0];
@@ -2558,7 +2601,7 @@ void Lowering::InternalRegisters() {
                 range.refs.emplace_back(i, x);
                 range_of[{i, x}] = static_cast<std::size_t>(current[k]);
                 range.last = i;
-                if (r.def && !full) {
+                if (r.def && (!full || reads[k])) {
                     range.value.reset();
                 }
             }

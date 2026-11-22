@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 #include <bit>
 #include <cstdio>
@@ -314,7 +315,22 @@ UniformField FragmentUniformField(const std::string& n) {
 
 RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memory_,
                              GuestGpuMemory& guest_memory_)
-    : VideoCore::RasterizerAccelerated{memory_, pica_}, guest_memory{guest_memory_} {}
+    : VideoCore::RasterizerAccelerated{memory_, pica_}, guest_memory{guest_memory_} {
+    Usse::Ir::SetTier2Skip(GxmFlagValue("tier2skip"));
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags eotmixpbe=N: EUR_CR_PIXELBE for every 3D kick built (the eotmix probes).
+    if (const unsigned pixelbe = SgxdFlagValue("eotmixpbe"); pixelbe != 0) {
+        sgxd_recipe_pixelbe = pixelbe;
+    }
+    // gxm_flags eotmixreal=V+1: the 2x passes' end of tile stores the guest's 1x copy too.
+    if (const unsigned real = GxmFlagValue("eotmixreal"); real != 0) {
+        backend.eot_mix_real = static_cast<int>(real) - 1;
+    }
+#endif
+    if (!SgxdFlag("notier2")) {
+        tier2 = std::make_unique<ShaderTier2>();
+    }
+}
 
 RasterizerGxm::~RasterizerGxm() = default;
 
@@ -1406,6 +1422,52 @@ void DumpGxp(const char* kind, u64 key, const Usse::GxpProgram& gxp) {
     }
 }
 
+/// With gxm_flags dumpgxp, bytes to host0:azahar-NAME.
+void DumpBytes(const std::string& name, const void* data, std::size_t size) {
+    const std::string path = fmt::format("host0:azahar-{}", name);
+    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(data, 1, size, f);
+        std::fclose(f);
+    }
+}
+
+/// With gxm_flags dumpgxp, the 3DS side of a fragment program: its PICA configuration's bytes
+/// (azahar-fs-KEY.fsconfig) and upstream's GLSL for it (azahar-fs-KEY.glsl), for glsl2cg and
+/// psp2cgc to compile the same program as Sony's compiler would.
+void DumpPicaFragment(u64 key, const Pica::Shader::FSConfig& config) {
+    if (!GxmFlag("dumpgxp")) {
+        return;
+    }
+    DumpBytes(fmt::format("fs-{:016x}.fsconfig", key), &config, sizeof(config));
+    const std::string glsl = Pica::Shader::Generator::GLSL::GenerateFragmentShader(
+        config, Pica::Shader::UserConfig{}, Pica::Shader::Profile{});
+    DumpBytes(fmt::format("fs-{:016x}.glsl", key), glsl.data(), glsl.size());
+}
+
+/// With gxm_flags dumpgxp, the 3DS side of a vertex program: its PicaVSConfig's bytes, then
+/// the PICA program code and swizzle data (4096 words each) as azahar-vs-KEY.pica, and
+/// upstream's GLSL for it (azahar-vs-KEY.glsl).
+void DumpPicaVertex(u64 key, const Pica::Shader::Generator::PicaVSConfig& config,
+                    const Pica::ShaderSetup& setup) {
+    if (!GxmFlag("dumpgxp")) {
+        return;
+    }
+    std::vector<u8> bytes(sizeof(config));
+    std::memcpy(bytes.data(), &config, sizeof(config));
+    const auto code = setup.GetProgramCode();
+    const auto swizzle = setup.GetSwizzleData();
+    const auto append = [&](const auto& words) {
+        const auto* p = reinterpret_cast<const u8*>(words.data());
+        bytes.insert(bytes.end(), p, p + words.size() * sizeof(words[0]));
+    };
+    append(code);
+    append(swizzle);
+    DumpBytes(fmt::format("vs-{:016x}.pica", key), bytes.data(), bytes.size());
+    const std::string glsl = Pica::Shader::Generator::GLSL::GenerateVertexShader(
+        setup, config, Pica::Shader::Generator::ExtraVSConfig{});
+    DumpBytes(fmt::format("vs-{:016x}.glsl", key), glsl.data(), glsl.size());
+}
+
 } // namespace
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
@@ -1427,30 +1489,40 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         static_cast<u64>(mode) << 32 | static_cast<u64>(u8_regs) << 16 | default_regs,
         static_cast<u64>(bools) << 16 | used->second,
         Common::ComputeHash64(reg_components.data(), reg_components.size()));
+    const auto make_request = [&] {
+        Usse::VsRequest request{};
+        request.code = pica.vs_setup.GetProgramCode();
+        request.swizzle = pica.vs_setup.GetSwizzleData();
+        request.code_size =
+            std::min<u32>(pica.vs_setup.GetBiggestProgramSize(), Pica::MAX_PROGRAM_CODE_LENGTH);
+        request.main_offset = state.main_offset;
+        request.num_outputs = state.num_outputs;
+        request.output_map = state.output_map;
+        const auto maps = state.gs_state.GetSemanticMaps();
+        for (u32 i = 0; i < maps.size(); i++) {
+            request.semantics[i] = {static_cast<u8>(std::min<u32>(maps[i].attribute_index, 255)),
+                                    static_cast<u8>(maps[i].component_index & 3)};
+        }
+        request.default_regs = default_regs;
+        request.bools = bools;
+        request.bool_mask = used->second;
+        request.reg_components = reg_components;
+        request.u8_regs = u8_regs;
+        request.mode = mode;
+        return request;
+    };
     if (const auto it = vertex_programs.find(key); it != vertex_programs.end()) {
-        return it->second;
+        VertexProgram& v = it->second;
+        if (!v.tier2_queued && ++v.draws >= Tier2Draws) {
+            v.tier2_queued = true;
+            if (tier2) {
+                tier2->QueueVertex(key, make_request());
+            }
+        }
+        return v;
     }
 
-    Usse::VsRequest request{};
-    request.code = pica.vs_setup.GetProgramCode();
-    request.swizzle = pica.vs_setup.GetSwizzleData();
-    request.code_size =
-        std::min<u32>(pica.vs_setup.GetBiggestProgramSize(), Pica::MAX_PROGRAM_CODE_LENGTH);
-    request.main_offset = state.main_offset;
-    request.num_outputs = state.num_outputs;
-    request.output_map = state.output_map;
-    const auto maps = state.gs_state.GetSemanticMaps();
-    for (u32 i = 0; i < maps.size(); i++) {
-        request.semantics[i] = {static_cast<u8>(std::min<u32>(maps[i].attribute_index, 255)),
-                                static_cast<u8>(maps[i].component_index & 3)};
-    }
-    request.default_regs = default_regs;
-    request.bools = bools;
-    request.bool_mask = used->second;
-    request.reg_components = reg_components;
-    request.u8_regs = u8_regs;
-    request.mode = mode;
-
+    const Usse::VsRequest request = make_request();
     VertexProgram v{};
     std::string refusal;
     auto gxp = Usse::EmitVertexGxp(request, v.input_regs, &refusal);
@@ -1459,6 +1531,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
                      state.program_hash, refusal);
     v.gxp = std::move(*gxp);
     DumpGxp("vs", key, v.gxp);
+    DumpPicaVertex(key, config, pica.vs_setup);
     v.primary_doutu0 =
         sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.primary), v.gxp.temp_count);
     v.secondary_doutu0 = v.gxp.secondary.empty()
@@ -1993,15 +2066,124 @@ const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(u64 blen
     const Pica::Shader::FSConfig config{regs};
     const u64 key = Common::HashCombine(config.Hash(), blend);
     if (const auto it = fragment_programs.find(key); it != fragment_programs.end()) {
-        return it->second;
+        FragmentProgram& f = it->second;
+        if (!f.tier2_queued && ++f.draws >= Tier2Draws) {
+            f.tier2_queued = true;
+            if (tier2) {
+                tier2->QueueFragment(key, config);
+            }
+        }
+        return f;
     }
-    FragmentProgram f{};
+    // The first tier: registers placed, no optimising passes; microseconds, and the draw
+    // waits for it. The second tier replaces it once it has drawn Tier2Draws times.
     std::string refusal;
     auto gxp = Usse::EmitFragmentGxp(config, &refusal);
     DEBUG_ASSERT_MSG(gxp.has_value(), "GXM: the emitter has no fragment program for this state: {}",
                      refusal);
-    f.gxp = std::move(*gxp);
-    DumpGxp("fs", key, f.gxp);
+    DumpGxp("fs", key, *gxp);
+    DumpPicaFragment(key, config);
+    FragmentProgram f = PlaceFragmentProgram(std::move(*gxp), blend, config.Hash());
+    return fragment_programs.emplace(key, std::move(f)).first->second;
+}
+
+void RasterizerSgxd::QueueFragmentTier2(u64 key, const Pica::Shader::FSConfig& config) {
+    const u64 config_key = ShaderTier1::ConfigKey(config);
+    Tier2Config* c = tier2_configs.Find(config_key);
+    if (c && c->program) {
+        InstallFragmentTier2(key, *c->program);
+        return;
+    }
+    if (!c) {
+        c = &tier2_configs.Emplace(config_key, Tier2Config{});
+        tier2->QueueFragment(config_key, config);
+    }
+    c->waiting.push_back(key);
+}
+
+void RasterizerSgxd::InstallFragmentTier2(u64 key, const Usse::Program& program) {
+    FragmentProgram* const old = fragment_programs.Find(key);
+    // A program FlushPrograms dropped after its second tier was queued.
+    ASSERT(old != nullptr || program_flushes != 0);
+    if (!old) {
+        return;
+    }
+    DumpProgram("fs2", key, program);
+    const u32 temps_before = old->usse.temp_count;
+    const std::size_t words_before = old->usse.primary.size();
+    FragmentProgram f = PlaceFragmentProgram(Usse::Program{program}, old->epilogue, key);
+    f.draws = old->draws;
+    f.tier2_queued = true;
+    LOG_INFO(Render, "tier 2 fragment program {:016x}: {} words to {}, {} temps to {}", key,
+             words_before, f.usse.primary.size(), temps_before, f.usse.temp_count);
+    // In place: last_fragment and every draw's reference see the new program. The first tier's code
+    // goes back to the heap once the passes that may run it are done.
+    FreeProgramCode(old->code);
+    *old = std::move(f);
+}
+
+void RasterizerSgxd::InstallTier2() {
+    for (ShaderTier2::Result& result : tier2->Take()) {
+        if (result.vertex) {
+            InstallVertexTier2(result);
+            continue;
+        }
+        const auto it = fragment_programs.find(result.key);
+        ASSERT_MSG(result.program.has_value(), "sgxd: tier 2 of fragment program {:016x}: {}",
+                   result.key, result.refusal);
+        ASSERT(it != fragment_programs.end());
+        DumpGxp("fs2", result.key, *result.program);
+        const u32 temps_before = it->second.gxp.temp_count;
+        const std::size_t words_before = it->second.gxp.primary.size();
+        FragmentProgram f =
+            PlaceFragmentProgram(std::move(*result.program), it->second.blend, result.key);
+        f.draws = it->second.draws;
+        f.tier2_queued = true;
+        LOG_INFO(Render,
+                 "tier 2 fragment program {:016x}: {} words to {}, {} temps to {}, emitted in {} "
+                 "us ({} cycles), program {:016x}",
+                 result.key, words_before, f.gxp.primary.size(), temps_before, f.gxp.temp_count,
+                 result.took_us, result.took_cycles, ProgramHash(f.usse));
+        it->second = std::move(f);
+    }
+}
+
+void RasterizerSgxd::InstallVertexTier2(ShaderTier2::Result& result) {
+    const auto it = vertex_programs.find(result.key);
+    ASSERT_MSG(result.program.has_value(), "sgxd: tier 2 of vertex program {:016x}: {}",
+               result.key, result.refusal);
+    ASSERT(it != vertex_programs.end());
+    // The draw binds an attribute for each input register the program reads: both tiers must read
+    // the same ones.
+    ASSERT_MSG(result.input_regs == it->second.input_regs,
+               "sgxd: tier 2 of vertex program {:016x} reads input registers {:#x}, tier 1 {:#x}",
+               result.key, result.input_regs, it->second.input_regs);
+    DumpGxp("vs2", result.key, *result.program);
+    const u32 temps_before = it->second.gxp.temp_count;
+    const std::size_t words_before = it->second.gxp.primary.size();
+    VertexProgram v{};
+    v.gxp = std::move(*result.program);
+    v.input_regs = result.input_regs;
+    v.primary_doutu0 = sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.primary),
+                                           v.gxp.temp_count);
+    v.secondary_doutu0 = v.gxp.secondary.empty()
+                             ? DummyVertexSecondary
+                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.secondary), 0);
+    v.draws = it->second.draws;
+    v.tier2_queued = true;
+    LOG_INFO(Render,
+             "tier 2 vertex program {:016x}: {} words to {}, {} temps to {}, emitted in {} us ({} "
+             "cycles), program {:016x}",
+             result.key, words_before, v.gxp.primary.size(), temps_before, v.gxp.temp_count,
+             result.took_us, result.took_cycles, ProgramHash(v.usse));
+    it->second = std::move(v);
+}
+
+RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProgram gxp, u64 blend,
+                                                                   u64 hash) {
+    FragmentProgram f{};
+    f.gxp = std::move(gxp);
+    f.blend = blend;
 #ifdef VITA_DIAGNOSTICS
     // fsload: the primary program's words from host0:fsload.gxp instead of ours, with
     // our inputs, uniforms and samplers; its temps if more. For timing another compiler's code on
@@ -2101,9 +2283,9 @@ const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(u64 blen
     LOG_INFO(Render,
              "fragment program {:016x}, blend {:016x}: {} words, {} inputs, {} PAs, {} temps, "
              "{} uniform floats, {} literals",
-             config.Hash(), blend, code.size(), g.inputs.size(), f.pixel_pa,
+             hash, blend, code.size(), g.inputs.size(), f.pixel_pa,
              g.temp_count, g.uniform_floats, g.literals.size());
-    return fragment_programs.emplace(key, std::move(f)).first->second;
+    return f;
 }
 
 void RasterizerSgxd::SyncLutLf() {
@@ -2599,6 +2781,18 @@ void RasterizerSgxd::VertexPrograms(const VertexStage& stage, const SgxdBackend:
 
 bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate_count) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
+#ifdef VITA_DIAGNOSTICS
+    clip_plane_all++;
+    if (regs.rasterizer.clip_enable) {
+        clip_plane_draws++;
+        const auto c = regs.rasterizer.GetClipCoef();
+        clip_plane_last = {c.x.ToFloat32(), c.y.ToFloat32(), c.z.ToFloat32(), c.w.ToFloat32()};
+    }
+#endif
+    // Second-tier programs go in before the draw looks any program up, so no draw swaps tiers halfway.
+    if (tier2 && tier2->Ready()) {
+        InstallTier2();
+    }
     // A DMA into cached memory still queued: the draw reads guest memory as the guest would after its
     // interrupt.
     if (backend.RetirePending()) {

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -12,6 +13,7 @@
 #include "video_core/pica/regs_texturing.h"
 #include "video_core/rasterizer_accelerated.h"
 #include "video_core/renderer_gxm/guest_gpu_memory.h"
+#include "video_core/renderer_gxm/gxm_shader_tier.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
@@ -157,6 +159,8 @@ private:
         u32 input_regs;
         u32 primary_doutu0;
         u32 secondary_doutu0;
+        u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
+        bool tier2_queued; ///< sent to the second tier (or never to be)
     };
 
     /// Where a fragment uniform's value is in FSUniformData: `count` elements of `components` values,
@@ -180,7 +184,12 @@ private:
         u32 fprim;
         u32 fprim_units;
         u32 pixel_pa;
+        u64 blend;         ///< the blend word its code ends with
+        u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
+        bool tier2_queued; ///< sent to the second tier (or never to be)
     };
+    /// Draws after which a program is emitted again with the optimising passes.
+    static constexpr u32 Tier2Draws = 100;
 
     void RecordClear(const ClearedRange& range);
     void ForgetClears(PAddr start, PAddr end);
@@ -246,6 +255,10 @@ private:
     /// The vertex program that draws a geometry program's stored triangles: input k is output k.
     const VertexProgram& PassthroughProgramFor(u32 outputs);
     const FragmentProgram& FragmentProgramFor(u64 blend);
+    /// The program placed for sgxd: its code (with the blend's tail), secondary and PDS.
+    FragmentProgram PlaceFragmentProgram(Usse::GxpProgram gxp, u64 blend, u64 hash);
+    void InstallTier2();
+    void InstallVertexTier2(ShaderTier2::Result& result);
     /// The host copy of texture unit `unit`'s texture for the open pass, untiled when it is
     /// new or the guest's bytes changed: cached FCRAM by its hash, compared once a pass;
     /// uncached memory (VRAM, FCRAM moved to CDRAM) when a GPU operation wrote over it.
@@ -277,6 +290,9 @@ private:
     std::unordered_map<u64, VertexProgram> vertex_programs;
     std::unordered_map<u64, u16> used_bools;
     std::unordered_map<u64, FragmentProgram> fragment_programs;
+    std::vector<u8> gs_indices;
+    bool gs_indices_set = false;
+    std::unique_ptr<ShaderTier2> tier2;
 
     // Immediate-mode vertices not drawn yet, four floats an attribute. One ImmDraw block is one draw.
     std::vector<float> immediate_vertices;

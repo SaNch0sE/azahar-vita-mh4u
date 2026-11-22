@@ -48,8 +48,10 @@ namespace GxmRenderer {
  *             caller until a debugger resumes it (200-270 ms a second of the emulation thread).
  *
  * The shader emitter:
- *   dumpgxp   write each emitted program to host0 as azahar-vs-KEY.gxp / azahar-fs-KEY.gxp,
- *             a GXP container psp2shaderperf -disasm lists
+ *   notier2   vertex and fragment programs stay the first tier's: no worker re-emits them with
+ *             the optimising passes after RasterizerSgxd::Tier2Draws draws
+ *   dumpgxp   write each emitted program to host0 as azahar-vs-KEY.gxp / azahar-fs-KEY.gxp
+ *             (vs2 / fs2 for the second tier's), a GXP container psp2shaderperf -disasm lists
  *   usse_sechoist
  *             opt in to hoisting vertex uniform loads into the secondary program
  *

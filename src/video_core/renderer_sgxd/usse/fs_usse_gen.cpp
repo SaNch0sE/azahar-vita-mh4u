@@ -89,6 +89,10 @@ constexpr uint8_t TmpTex3 = 96;       ///< the procedural texture's colour (4)
 constexpr uint8_t TmpProcUv = 100;    ///< proctex: u, v (2), the level (.z)
 constexpr uint8_t TmpSnap = 104;      ///< a stage's output kept for a later stage's
                                       ///< PreviousBuffer read (4 per stage, 0-3)
+constexpr uint8_t TmpBatch = 128;     ///< reads issued together before one WDF: read k's
+                                      ///< coordinate (2) and interpolation weight (.z) at
+                                      ///< 128 + 4k, k < 8
+constexpr uint8_t TmpBatchTexel = 160; ///< read k's texel (4) at 160 + 4k
 constexpr uint8_t TmpLightAcc = 20;   ///< lighting: the spot direction, then the reflection
                                       ///< vector, then the specular accumulator, in
                                       ///< next_combiner_buffer's home (3). Nothing lighting
@@ -188,9 +192,20 @@ private:
     /// Fetches the LUT entry at index i1.y (or -i1.y when `negated`) of a texture with the
     /// given row scale and bias literal pairs into TmpLutEntry, and waits.
     void LutFetch(uint32_t sampler_index, uint8_t scale_lit, uint8_t bias_lit, bool negated);
+    /// LutFetch's texel coordinate alone, into `coord`: the sample is the caller's, so several
+    /// can share one WDF.
+    void LutCoordInto(Reg coord, uint8_t scale_lit, uint8_t bias_lit, bool negated);
     void ProcTex();
+    void ProcTexColour(bool mipmapped);
     /// ProcTexLookupLUT: the rg LUT at i0.x (0..1) plus `offset`, interpolated, into i0.x.
     void ProcTexLookup(Src offset);
+    /// ProcTexLookup in three parts, for lookups that share one WDF: the coordinate and
+    /// weight of batch slot `slot` from i0.x, its sample, and after the WDF its value into i0.x.
+    void ProcTexLookupCoord(Src offset, uint8_t slot);
+    void ProcTexLookupSample(uint8_t slot);
+    void ProcSample(Reg dst, Reg coord, uint8_t sampler_sa);
+    void ProcWdf();
+    void ProcTexLookupFinish(uint8_t slot);
     /// The combiner of u and v (TmpProcUv) into i0.x.
     void ProcTexCombine(Pica::TexturingRegs::ProcTexCombiner combiner);
     /// The shift term for one axis from the other's coordinate, into i2.x.
@@ -303,6 +318,8 @@ private:
     bool uses_shadow = false;             ///< lighting reads the shadow texture
     bool uses_border = false;             ///< a unit clamps to its border colour
     bool uses_proctex = false;
+    bool proctex_rgb_read = false;   ///< a stage reads Texture3's red, green or blue
+    bool proctex_alpha_read = false; ///< a stage reads Texture3's alpha
     uint32_t sampler_rg = 0;              ///< the rg and rgba LUT samplers' indices
     uint32_t sampler_rgba = 0;
     uint32_t sa_proctex = 0;              ///< lut_offset, diff_lut_offset, color_map_offset,
@@ -414,6 +431,38 @@ void FragmentEmitter::PlanInputs() {
                 uses_secondary_color = true;
             } else if (s == Source::Texture3 && config.proctex.enable) {
                 uses_proctex = true;
+            }
+        }
+        // Which of Texture3's channels the stage's operations read: argument 1 for Replace,
+        // 1 and 2 for the two-argument operations, all three for the three-argument ones;
+        // Dot3_RGBA's alpha comes from its colour arguments.
+        const auto args = [](Operation op) -> u32 {
+            return op == Operation::Replace ? 1
+                   : (op == Operation::Lerp || op == Operation::MultiplyThenAdd ||
+                      op == Operation::AddThenMultiply)
+                       ? 3
+                       : 2;
+        };
+        const Source colour_src[] = {stage.color_source1, stage.color_source2,
+                                     stage.color_source3};
+        const ColorModifier colour_mod[] = {stage.color_modifier1, stage.color_modifier2,
+                                            stage.color_modifier3};
+        const Source alpha_src[] = {stage.alpha_source1, stage.alpha_source2,
+                                    stage.alpha_source3};
+        const AlphaModifier alpha_mod[] = {stage.alpha_modifier1, stage.alpha_modifier2,
+                                           stage.alpha_modifier3};
+        for (u32 k = 0; k < args(stage.color_op); k++) {
+            if (ColorSource(stage, colour_src[k], i) == Source::Texture3) {
+                const bool alpha = (static_cast<u32>(colour_mod[k]) & ~1u) == 0x2;
+                (alpha ? proctex_alpha_read : proctex_rgb_read) = true;
+            }
+        }
+        if (stage.color_op != Operation::Dot3_RGBA) {
+            for (u32 k = 0; k < args(stage.alpha_op); k++) {
+                if (AlphaSource(stage, alpha_src[k], i) == Source::Texture3) {
+                    const bool alpha = ((static_cast<u32>(alpha_mod[k]) >> 1) & 3) == 0;
+                    (alpha ? proctex_alpha_read : proctex_rgb_read) = true;
+                }
             }
         }
     }
@@ -765,15 +814,18 @@ void FragmentEmitter::LutFetch(uint32_t sampler_index, uint8_t scale_lit, uint8_
     // i1.y holds a whole-number index into a LUT texture (256 texels per row), negated when
     // the caller kept it as -floor (frc's form). (column, row) = (frac, floor) of index /
     // 256, then one scale and one bias to the texel centre.
+    LutCoordInto(Reg::V(TmpLutCoord), scale_lit, bias_lit, negated);
+    e.Sample2DPoint(Reg::V(TmpLutEntry), Reg::V(TmpLutCoord), SamplerSa(sampler_index), 0);
+    e.Wdf(0);
+}
+
+void FragmentEmitter::LutCoordInto(Reg coord, uint8_t scale_lit, uint8_t bias_lit, bool negated) {
     e.Vec(VecOp::Mul, {I0, 0x2}, {I1, YYYY, negated ? Mod::Neg : Mod::None}, Lit(LitInv256),
           Pred::None, true);
     e.Vec(VecOp::Frc, {I0, 0x1}, {I0, YYYY}, {I0, YYYY}, Pred::None, true);     // column / 256
     e.Vec(VecOp::Add, {I0, 0x2}, {I0, XXXX, Mod::Neg}, {I0, YYYY}, Pred::None, true); // row
     e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW}, {Lit(scale_lit).reg, XYZW}, Pred::None, true);
-    e.Vec(VecOp::Add, {Reg::V(TmpLutCoord), 0x3}, {I0, XYZW}, {Lit(bias_lit).reg, XYZW},
-          Pred::None, true);
-    e.Sample2D(Reg::V(TmpLutEntry), Reg::V(TmpLutCoord), SamplerSa(sampler_index), nullptr, 0);
-    e.Wdf(0);
+    e.Vec(VecOp::Add, {coord, 0x3}, {I0, XYZW}, {Lit(bias_lit).reg, XYZW}, Pred::None, true);
 }
 
 void FragmentEmitter::LutLfFetch() {
@@ -793,20 +845,45 @@ void FragmentEmitter::FloorLane(uint8_t lane) {
 }
 
 void FragmentEmitter::ProcTexLookup(Src offset) {
+    ProcTexLookupCoord(offset, 0);
+    ProcTexLookupSample(0);
+    ProcWdf();
+    ProcTexLookupFinish(0);
+}
+
+void FragmentEmitter::ProcTexLookupCoord(Src offset, uint8_t slot) {
     // coord * 128: the whole part (clamped to the table) selects the entry, the fraction
     // interpolates with its slope, as the generator's ProcTexLookupLUT.
+    const uint8_t home = static_cast<uint8_t>(TmpBatch + 4 * slot);
     e.Vec(VecOp::Mul, {I0, 0x2}, {I0, XXXX}, Lit(Lit128), Pred::None, true);
     e.Vec(VecOp::Frc, {I1, 0x2}, {I0, YYYY}, {I0, YYYY}, Pred::None, true);
     e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY, Mod::Neg}, {I0, YYYY}, Pred::None, true); // floor
     e.Vec(VecOp::Max, {I1, 0x2}, {I1, XYZW}, ConstZero, Pred::None, true);
     e.Vec(VecOp::Min, {I1, 0x2}, {I1, XYZW}, Lit(Lit127), Pred::None, true);
     e.Vec(VecOp::Add, {I1, 0x1}, {I1, YYYY, Mod::Neg}, {I0, YYYY}, Pred::None, true); // fraction
-    e.MoveInternal({Reg::V(TmpLutDelta), 0x1}, {I1, XYZW}, Pred::None, true);
+    e.MoveInternal({Reg::V(home + 2), 0x1}, {I1, XYZW}, Pred::None, true);
     e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY}, offset, Pred::None, true);
-    LutFetch(sampler_rg, LitRgScaleX, LitRgBiasX, false);
-    e.Vec(VecOp::Mul, {I0, 0x1}, {Reg::V(TmpLutEntry), YYYY}, {Reg::V(TmpLutDelta), XXXX},
+    LutCoordInto(Reg::V(home), LitRgScaleX, LitRgBiasX, false);
+}
+
+void FragmentEmitter::ProcTexLookupSample(uint8_t slot) {
+    ProcSample(Reg::V(TmpBatchTexel + 4 * slot), Reg::V(TmpBatch + 4 * slot),
+               SamplerSa(sampler_rg));
+}
+
+void FragmentEmitter::ProcSample(Reg dst, Reg coord, uint8_t sampler_sa) {
+    e.Sample2DPoint(dst, coord, sampler_sa, 0);
+}
+
+void FragmentEmitter::ProcWdf() {
+    e.Wdf(0);
+}
+
+void FragmentEmitter::ProcTexLookupFinish(uint8_t slot) {
+    const Reg texel = Reg::V(TmpBatchTexel + 4 * slot);
+    e.Vec(VecOp::Mul, {I0, 0x1}, {texel, YYYY}, {Reg::V(TmpBatch + 4 * slot + 2), XXXX},
           Pred::None, true);
-    e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, {Reg::V(TmpLutEntry), XXXX}, Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x1}, {I0, XYZW}, {texel, XXXX}, Pred::None, true);
     Clamp01(I0, 0x1);
 }
 
@@ -984,7 +1061,23 @@ void FragmentEmitter::ProcTex() {
     e.MoveInternal({uv, 0x2}, {I0, XXXX}, Pred::None, true);
     e.MoveInternal({uv, 0x1}, {I2, YYYY}, Pred::None, true);
 
-    // The colour LUT coordinate, then the colour.
+    // The colour LUT coordinate, then the colour; with a separate alpha that no stage's
+    // colour reads, none: its alpha is replaced and its rgb never read.
+    if (colour) {
+        ProcTexColour(mipmapped);
+    }
+    if (pt.separate_alpha && proctex_alpha_read) {
+        ProcTexCombine(pt.alpha_combiner);
+        ProcTexLookup(SaScalar(sa_proctex + 3));
+        e.MoveInternal({Reg::V(TmpTex3 + 2), 0x2}, {I0, XXXX}, Pred::None, true);
+    }
+}
+
+void FragmentEmitter::ProcTexColour(bool mipmapped) {
+    using Filter = TexturingRegs::ProcTexFilter;
+    const auto& pt = config.proctex;
+    const Vec4Loc uv_home{Bank::Virtual, TmpProcUv};
+    const auto filter = pt.lut_filter.Value();
     ProcTexCombine(pt.color_combiner);
     ProcTexLookup(SaScalar(sa_proctex + 2));
     // lut_coord * (width - 1) [+ 0.5 for nearest], the level's offset; the level's width is
@@ -1025,15 +1118,19 @@ void FragmentEmitter::ProcTex() {
         e.MoveInternal({Reg::V(TmpLutDelta), 0x1}, {I0, XXXX}, Pred::None, true);
         e.Vec(VecOp::Add, {I0, 0x4}, {I0, ZZZZ}, {I1, YYYY}, Pred::None, true);       // + offset
         e.MoveInternal({uv_home.Pair(1), 0x2}, {I0, ZZZZ}, Pred::None, true);       // .w = index_i
+        // The entry and its slope: both reads, one WDF.
         e.Vec(VecOp::Add, {I1, 0x2}, {I0, ZZZZ}, SaScalar(sa_proctex + 0), Pred::None, true);
-        LutFetch(sampler_rgba, LitRgScaleX, LitRgBiasX, false);
-        CopyVec4(tex3, entry);
+        LutCoordInto(Reg::V(TmpBatch), LitRgScaleX, LitRgBiasX, false);
         e.Vec(VecOp::Add, {I1, 0x2}, {uv_home.Pair(1), YYYY}, SaScalar(sa_proctex + 1),
               Pred::None, true);
-        LutFetch(sampler_rgba, LitRgScaleX, LitRgBiasX, false);
-        LoadVec4(I0, entry);
+        LutCoordInto(Reg::V(TmpBatch + 4), LitRgScaleX, LitRgBiasX, false);
+        const uint8_t rgba = SamplerSa(sampler_rgba);
+        ProcSample(Reg::V(TmpBatchTexel), Reg::V(TmpBatch), rgba);
+        ProcSample(Reg::V(TmpBatchTexel + 4), Reg::V(TmpBatch + 4), rgba);
+        ProcWdf();
+        LoadVec4(I0, {Bank::Virtual, static_cast<uint8_t>(TmpBatchTexel + 4)});
         e.Vec(VecOp::Mul, {I0, 0xf}, {I0, XYZW}, {Reg::V(TmpLutDelta), XXXX}, Pred::None, true);
-        LoadVec4(I1, tex3);
+        LoadVec4(I1, {Bank::Virtual, TmpBatchTexel});
         e.Vec(VecOp::Add, {I0, 0xf}, {I0, XYZW}, {I1, XYZW}, Pred::None, true);
         StoreVec4(tex3, I0);
     } else {
@@ -1044,11 +1141,6 @@ void FragmentEmitter::ProcTex() {
         e.Vec(VecOp::Add, {I1, 0x2}, {I0, XXXX}, SaScalar(sa_proctex + 0), Pred::None, true);
         LutFetch(sampler_rgba, LitRgScaleX, LitRgBiasX, false);
         CopyVec4(tex3, entry);
-    }
-    if (pt.separate_alpha) {
-        ProcTexCombine(pt.alpha_combiner);
-        ProcTexLookup(SaScalar(sa_proctex + 3));
-        e.MoveInternal({tex3.Pair(1), 0x2}, {I0, XXXX}, Pred::None, true);
     }
 }
 
