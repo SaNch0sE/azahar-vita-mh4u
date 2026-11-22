@@ -3935,10 +3935,17 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
                      (g.buffer_pointer ? g.buffer_floats : g.uniform_floats));
         const UniformField field = FragmentUniformField(u);
         DEBUG_ASSERT(!u.u8 || (!field.is_int && u.sa_offset + u.array_size <= g.uniform_floats));
-        f.uniforms.push_back({u.sa_offset, static_cast<u16>(field.offset),
-                              static_cast<u8>(u.components), static_cast<u8>(u.array_size), 16,
-                              field.is_int, u.kind == Usse::UniformKind::LightDirection, u.u8,
-                              u.kind == Usse::UniformKind::LightingLutRow});
+        f.uniforms.push_back(
+            {u.sa_offset, static_cast<u16>(field.offset), static_cast<u8>(u.components),
+             static_cast<u8>(u.array_size), 16, field.is_int,
+             u.kind == Usse::UniformKind::LightDirection, u.u8,
+             static_cast<u8>(u.kind == Usse::UniformKind::LightingLutRow         ? 1
+                             : u.kind == Usse::UniformKind::LightingLutCoordHalf ? 2
+                             : u.kind == Usse::UniformKind::LightingLutCoordWrap ? 3
+                                                                                 : 0),
+             static_cast<u8>(u.kind == Usse::UniformKind::LightDistAttenScale  ? 1
+                             : u.kind == Usse::UniformKind::LightDistAttenBias ? 2
+                                                                               : 0)});
     }
 
     std::vector<u64> code = g.primary;
@@ -6240,21 +6247,44 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             }
             float* dst = u.sa < fg.uniform_floats ? fsa_f + u.sa
                                                   : reinterpret_cast<float*>(fbuf_cpu) + u.sa;
+            if (u.dot3_const) {
+                float c[3];
+                std::memcpy(c, src, sizeof(c));
+                float sum = 0.0f;
+                for (u32 k = 0; k < 3; k++) {
+                    const float b = static_cast<float>(std::lround(
+                                        std::clamp(c[k], 0.0f, 1.0f) * 255.0f)) / 255.0f - 0.5f;
+                    dst[k] = 4.0f * b;
+                    sum += b;
+                }
+                dst[3] = -2.0f * sum;
+                continue;
+            }
+            if (u.lut_row != 0) {
+                // The row's centre, v = (offset / 256 + 0.5) / LUT_LF_ROWS; a pair's x first.
+                s32 value;
+                std::memcpy(&value, src, 4);
+                const float row = (static_cast<float>(value / 256) + 0.5f) /
+                                  static_cast<float>(Pica::Shader::LUT_LF_ROWS);
+                if (u.lut_row == 1) {
+                    dst[0] = row;
+                } else {
+                    dst[0] = (u.lut_row == 2 ? 0.5f : 127.5f) / 256.0f;
+                    dst[1] = row;
+                }
+                continue;
+            }
             for (u32 e = 0; e < u.count; e++, src += u.stride, dst += 4) {
                 for (u32 c = 0; c < u.components; c++) {
-                    if (u.lut_row) {
-                        // The row's centre, v = (offset / 256 + 0.5) / LUT_LF_ROWS, for
-                        // FragmentEmitter::LightingLutRowFetch.
-                        s32 value;
-                        std::memcpy(&value, src + c * 4, 4);
-                        dst[c] = (static_cast<float>(value / 256) + 0.5f) /
-                                 static_cast<float>(Pica::Shader::LUT_LF_ROWS);
-                    } else if (u.is_int) {
+                    if (u.is_int) {
                         s32 value;
                         std::memcpy(&value, src + c * 4, 4);
                         dst[c] = static_cast<float>(value);
                     } else {
                         std::memcpy(dst + c, src + c * 4, 4);
+                        if (u.dist_atten == 2) {
+                            dst[c] += 0.5f / 256.0f;
+                        }
                     }
                 }
                 if (u.normalize) {

@@ -337,7 +337,11 @@ private:
         bool is_int;
         bool normalize; ///< the vec3 normalised as it is copied (UniformKind::LightDirection)
         bool u8;        ///< packed to a word of bytes an element (Usse::Uniform::u8)
-        bool lut_row;   ///< a LUT offset as its row's centre (UniformKind::LightingLutRow)
+        /// A LUT offset as its row's centre: 1 alone, 2 and 3 after a pair's x; 0 none.
+        ::u8 lut_row;
+        /// The distance attenuation's scale (1) or bias (2), in the LUT read's units (the bias plus half a
+        /// texel). (::u8: the member u8 above hides the type.)
+        ::u8 dist_atten;
         /// A constant colour's two Dot3 terms (UniformKind::Dot3Const).
         bool dot3_const;
     };

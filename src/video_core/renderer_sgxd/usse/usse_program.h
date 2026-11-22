@@ -131,6 +131,11 @@ enum class UniformKind : uint8_t {
     LightingLutOffset,
     LightingLutRow, ///< each lighting LUT's row centre in the lf texture: (offset / 256 + 0.5) /
                     ///< LUT_LF_ROWS
+    /// A filtered read's (x, y) pair for lighting LUT `index` (FragmentEmitter::
+    /// LightingLutLookup): an unsigned input's half texel 0.5 / 256, or a signed input's last
+    /// x 127.5 / 256, then the row centre as LightingLutRow.
+    LightingLutCoordHalf,
+    LightingLutCoordWrap,
     LightingGlobalAmbient,
     // Light `index`'s members (light_src[index]).
     LightSpecular0,

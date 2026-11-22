@@ -92,6 +92,10 @@ std::string UniformName(const Uniform& uniform) {
         return "lighting_lut_offset";
     case UniformKind::LightingLutRow:
         return "lighting_lut_row";
+    case UniformKind::LightingLutCoordHalf:
+        return "lighting_lut_coord_half";
+    case UniformKind::LightingLutCoordWrap:
+        return "lighting_lut_coord_wrap";
     case UniformKind::LightingGlobalAmbient:
         return "lighting_global_ambient";
     case UniformKind::LightSpecular0:
