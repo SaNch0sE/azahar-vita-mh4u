@@ -484,9 +484,10 @@ void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, u
     }
 }
 
-void Builder::Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc) {
+void Builder::Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, uint8_t lanes) {
     Sample2D(dst, coord, sampler_sa, nullptr, drc);
     insts.back().b[1] = true;
+    insts.back().dst.mask = static_cast<uint8_t>((1u << lanes) - 1);
 }
 
 void Builder::Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words,
@@ -702,7 +703,7 @@ uint8_t WriteLanes(const Inst& inst, const Reg& r) {
         mask = (1u << std::min<unsigned>(inst.u[1], 4)) - 1;
         break;
     case Op::Sample2D:
-        mask = 0xf;
+        mask = inst.dst.mask; // Builder::Sample2DPoint's lanes
         break;
     case Op::Bitwise:
     case Op::MadI16:
@@ -924,7 +925,7 @@ void Lowering::Liveness(bool precise) {
                 // WriteLanes' mask before it is cut to the quad: a four-lane load or read
                 // into a pair's second register reaches the next quad.
                 touch(*r.reg, inst.op == Op::Lda32 ? (1u << std::min<unsigned>(inst.u[1], 4)) - 1
-                              : (inst.op == Op::Sample2D) ? 0xfu
+                              : (inst.op == Op::Sample2D) ? inst.dst.mask
                                                           : WriteLanes(inst, Reg{r.reg->bank, 0}));
             }
         }
@@ -1271,7 +1272,7 @@ void WrittenRegs(Inst& inst, std::vector<std::pair<Bank, int>>& out) {
             mask = static_cast<uint8_t>((1u << count) - 1);
             break;
         case Op::Sample2D:
-            mask = 0xf;
+            mask = inst.dst.mask;
             break;
         case Op::Bitwise:
         case Op::MadI16:
@@ -3990,7 +3991,7 @@ std::vector<bool> Lowering::SkipInvalid() const {
         case Op::CondMove:
             return inst.dst.mask;
         case Op::Sample2D:
-            return 0xf;
+            return inst.dst.mask;
         case Op::Lda32:
             return static_cast<uint8_t>((1u << std::min<unsigned>(inst.u[1], 4)) - 1);
         case Op::Bitwise:

@@ -129,8 +129,8 @@ enum class UniformKind : uint8_t {
     ProctexNoiseA,
     ProctexNoiseP,
     LightingLutOffset,
-    LightingLutRow, ///< each lighting LUT's row centre in the lf texture: (offset / 256 + 0.5) /
-                    ///< LUT_LF_ROWS
+    LightingLutRow, ///< lighting LUT `index`'s row centre in the lf texture: (offset / 256 +
+                    ///< 0.5) / LUT_LF_ROWS
     /// A filtered read's (x, y) pair for lighting LUT `index` (FragmentEmitter::
     /// LightingLutLookup): an unsigned input's half texel 0.5 / 256, or a signed input's last
     /// x 127.5 / 256, then the row centre as LightingLutRow.
@@ -166,11 +166,13 @@ struct Uniform {
 };
 
 enum class SamplerKind : uint8_t {
-    Texture,      ///< PICA texture unit `index`
-    TextureAlpha, ///< a split ETC1A4 unit's alpha (TEXUNIT 7 + index)
-    LutLf,        ///< the lighting and fog LUTs
-    LutRg,        ///< the proctex maps
-    LutRgba,      ///< the proctex colours
+    Texture,       ///< PICA texture unit `index`
+    TextureAlpha,  ///< a split ETC1A4 unit's alpha (TEXUNIT 7 + index)
+    LutLf,         ///< the lighting and fog LUTs
+    LutLfHalf,     ///< the lighting LUTs' values as F16, linearly filtered
+    LutLfHalfWrap, ///< the same rows repeating in u: the signed lookups' (their negative half)
+    LutRg,         ///< the proctex maps
+    LutRgba,       ///< the proctex colours
     ProctexNoise,
 };
 

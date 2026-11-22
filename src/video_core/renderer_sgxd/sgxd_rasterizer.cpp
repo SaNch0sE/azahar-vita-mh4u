@@ -153,6 +153,8 @@ static_assert(Limm(2, 0, 0x80402010u, false) == 0xfca2002200002010ull);
 constexpr unsigned LutFormatF32F32 = 0x1e;
 // F16F16F16F16 (0x1b), the proctex colour rows.
 constexpr unsigned LutFormatF16x4 = 0x1b;
+// F16 (0x0b), the lighting values' filtered rows (F16 filters linearly, F32 does not).
+constexpr unsigned LutFormatF16 = 0x0b;
 
 // sop2 o0, pa0, o0 (end): SRC_ALPHA, ONE_MINUS_SRC_ALPHA on colour and alpha. BlendWord sets its
 // factor and operation fields for other blends.
@@ -642,7 +644,9 @@ UniformField FragmentUniformField(const Usse::Uniform& u) {
     using D = Pica::Shader::Generator::FSUniformData;
     using L = Pica::Shader::Generator::LightSrc;
     using K = Usse::UniformKind;
-    DEBUG_ASSERT(u.index < 8);
+    const bool lut = u.kind == K::LightingLutRow || u.kind == K::LightingLutCoordHalf ||
+                     u.kind == K::LightingLutCoordWrap;
+    DEBUG_ASSERT(u.index < (lut ? 24 : 8));
     const std::size_t light = offsetof(D, light_src) + u.index * sizeof(L);
     switch (u.kind) {
     case K::AlphaTestRef:
@@ -684,8 +688,12 @@ UniformField FragmentUniformField(const Usse::Uniform& u) {
     case K::ProctexNoiseP:
         return {offsetof(D, proctex_noise_p), false};
     case K::LightingLutOffset:
-    case K::LightingLutRow:
         return {offsetof(D, lighting_lut_offset), true};
+    case K::LightingLutRow:
+    case K::LightingLutCoordHalf:
+    case K::LightingLutCoordWrap:
+        // LUT `index`'s offset, one int of the int4[6]
+        return {offsetof(D, lighting_lut_offset) + u.index * sizeof(s32), true};
     case K::LightingGlobalAmbient:
         return {offsetof(D, lighting_global_ambient), false};
     case K::LightSpecular0:
@@ -726,9 +734,11 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
 #ifdef VITA_DIAGNOSTICS
     Usse::Encoder::probe_skip_point_reads = SgxdFlag("smpskip");
 #endif
-    // f32tev: before the second tier starts emitting.
-    Usse::SetU8Combiners(!GxmFlag("f32tev"));
-    Usse::Ir::SetTier2Skip(GxmFlagValue("tier2skip"));
+    Usse::SetShadowSmpProbe(GxmFlag("shadowsmp"));
+#ifdef VITA_DIAGNOSTICS
+    // zflip: clip z = 2z + w, the TA's near plane the PICA's z = -w and its far plane z = 0.
+    Usse::z_flip = SgxdFlag("zflip");
+#endif
 #ifdef VITA_DIAGNOSTICS
     // sgxd_flags eotmixpbe=N: EUR_CR_PIXELBE for every 3D kick built (the eotmix probes).
     if (const unsigned pixelbe = SgxdFlagValue("eotmixpbe"); pixelbe != 0) {
@@ -3768,19 +3778,24 @@ const RasterizerSgxd::FragmentProgram& RasterizerSgxd::FragmentProgramFor(const 
     }
     if (!last_fragment || fragment_regs_hash != last_fragment_regs ||
         epilogue_key != last_fragment_epilogue || draw_own_pixel != last_fragment_own ||
-        draw_kills_viewport != last_fragment_kills) {
+        draw_kills_viewport != last_fragment_kills ||
+        draw_depth_stencil != last_fragment_depth_stencil) {
         last_fragment_regs = fragment_regs_hash;
         last_fragment_epilogue = epilogue_key;
         last_fragment_own = draw_own_pixel;
         last_fragment_kills = draw_kills_viewport;
-        // The own-pixel units come from the vertices, not the registers, and the viewport's
-        // kill from the pass.
+        last_fragment_depth_stencil = draw_depth_stencil;
+        // The own-pixel units come from the vertices, the viewport's kill from the pass, and the depth and
+        // stencil writes from registers the fragment ones leave out.
         u64 state = Common::HashCombine(fragment_regs_hash, epilogue_key);
         if (draw_own_pixel != 0) {
             state = Common::HashCombine(state, draw_own_pixel);
         }
         if (draw_kills_viewport) {
             state = Common::HashCombine(state, 0x6b696c6cu);
+        }
+        if (draw_depth_stencil) {
+            state = Common::HashCombine(state, 0x64737772u);
         }
         if (const FragmentState* const found = fragment_states.Find(state)) {
             last_fragment = found->program;
@@ -4085,6 +4100,15 @@ void LightingLutRow(float* out, const Pica::PicaCore::Lighting::LutEntry* lut, u
     }
 }
 
+u16 ToF16(float value);
+
+/// The lighting values alone as F16, for the filtered reads (SamplerKind::LutLfHalf).
+void LightingLutRowHalf(u16* out, const Pica::PicaCore::Lighting::LutEntry* lut, u32 count) {
+    for (u32 i = 0; i < count; i++) {
+        out[i] = ToF16(static_cast<float>(lut[i].raw & 0xfff) * (1.0f / 4095.0f));
+    }
+}
+
 /// The fog LutEntry: the difference 1.1.11 two's complement in bits 0-12, the value 0.0.11 in
 /// bits 13-23.
 void FogLutRow(float* out, const Pica::PicaCore::Fog::LutEntry* lut, u32 count) {
@@ -4130,6 +4154,7 @@ void RasterizerSgxd::SyncLutLf() {
         fog.lut_dirty = true;
     }
     const SgxdBackend::Data rows = backend.LutRows();
+    const SgxdBackend::Data half_rows = backend.LutLfHalfRows();
     const auto take_row = [&] {
         ASSERT_MSG(lut_row_pass[lut_row] != passes,
                    "sgxd: pass {} changed the LUTs more than {} rows' worth: the LUT ring would "
@@ -4152,6 +4177,9 @@ void RasterizerSgxd::SyncLutLf() {
             row = take_row();
             float* const out = reinterpret_cast<float*>(rows.cpu + row * RowBytes);
             LightingLutRow(out, lut.data(), static_cast<u32>(lut.size()));
+            LightingLutRowHalf(reinterpret_cast<u16*>(half_rows.cpu) +
+                                   row * Pica::Shader::LUT_TEX_WIDTH,
+                               lut.data(), static_cast<u32>(lut.size()));
             lut_rows_by_contents.Emplace(contents, u32{row});
         }
         fs_data.lighting_lut_offset[index / 4][index % 4] =
@@ -5742,6 +5770,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // As upstream: the test runs only when enabled, the write whenever enabled and allowed.
     const u32 dcmp = om.depth_test_enable ? DepthCompare(om.depth_test_func) : 7;
     const bool dwrite = fb.allow_depth_stencil_write != 0 && om.depth_write_enable;
+    // FragmentConfigFor's alpha test as a blend takes a draw writing neither.
+    draw_depth_stencil =
+        has_depth && ((fb.allow_depth_stencil_write != 0 && om.depth_write_enable) ||
+                      om.stencil_test.enable);
     // The stencil: a D24S8 buffer's top byte, on chip as the depth is. The ISP's compare codes are the
     // depth's, and its ops are in the PICA's order.
     const auto& st = om.stencil_test;
@@ -6340,6 +6372,15 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                                  Pica::Shader::LUT_TEX_WIDTH,
                                                  Pica::Shader::LUT_LF_ROWS, 0, LutFormatF32F32, 0,
                                                  words);
+                break;
+            case Usse::SamplerKind::LutLfHalf:
+            case Usse::SamplerKind::LutLfHalfWrap:
+                sgxd_recipe_texture_words_format(
+                    backend.LutLfHalfRows().gpu, Pica::Shader::LUT_TEX_WIDTH,
+                    Pica::Shader::LUT_LF_ROWS, 1, LutFormatF16, 0, words);
+                if (sampler.kind == Usse::SamplerKind::LutLfHalfWrap) {
+                    words[0] &= ~(7u << 6); // UADDRMODE REPEAT
+                }
                 break;
             }
             std::memcpy(fsa_cpu + Usse::SamplerSaOffset(head, static_cast<u32>(i)) * 4, words,

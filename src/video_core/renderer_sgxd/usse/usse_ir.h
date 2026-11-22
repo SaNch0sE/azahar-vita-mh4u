@@ -200,7 +200,10 @@ public:
                   bool nosched = false, uint8_t fconv = 3);
     /// Sample2D from a texture of one level, point sampled both ways (b[1]): the result does not
     /// depend on the level, so its coordinates need no neighbouring instance (skip_invalid_auto).
-    void Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc);
+    /// `lanes`: the registers from `dst` the read writes, in dst.mask (Sample2D's four, or two
+    /// for a one-channel format: its F32 word in the first, and the destination's 64-bit
+    /// alignment keeps the pair).
+    void Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, uint8_t lanes = 4);
     /// Op::Sample2D with three coordinates (u[2] = 3): Encoder::SampleCube.
     void SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc);
     void Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words, uint8_t count,

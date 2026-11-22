@@ -744,6 +744,7 @@ private:
     u64 last_fragment_epilogue = 0;
     u32 last_fragment_own = 0;
     bool last_fragment_kills = false;
+    bool last_fragment_depth_stencil = false;
     /// The open pass's colour buffer bytes its draws covered so far, whole tile rows.
     PAddr pass_drawn_lo = 0;
     PAddr pass_drawn_hi = 0;
@@ -752,6 +753,8 @@ private:
     /// The draw keeps its fragments inside its viewport by the scissor's kill: it writes depth or
     /// stencil in a pass that loaded guest memory's depth and stores part of its target.
     bool draw_kills_viewport = false;
+    /// The draw writes depth or tests the stencil: the alpha test stays a kill.
+    bool draw_depth_stencil = false;
     /// FSConfig from the registers, with the sgxd_flags' changes and the units' alpha split.
     Pica::Shader::FSConfig FragmentConfig() const;
     /// The hashes of StateRegs' sets, and whether a set's registers changed since.

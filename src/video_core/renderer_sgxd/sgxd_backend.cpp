@@ -77,7 +77,8 @@ constexpr u32 DataSize = SgxdBackend::PassDataBytes;
 constexpr u32 LutLfSize = Pica::Shader::LUT_LF_ROWS * 256 * 8;
 constexpr u32 LutRgSize = Pica::Shader::LUT_RG_ROWS * 256 * 8;
 constexpr u32 LutRgbaSize = Pica::Shader::LUT_RGBA_ROWS * 256 * 8;
-constexpr u32 LutSize = LutLfSize + LutRgSize + LutRgbaSize;
+constexpr u32 LutLfHalfSize = Pica::Shader::LUT_LF_ROWS * 256 * 2;
+constexpr u32 LutSize = LutLfSize + LutRgSize + LutRgbaSize + LutLfHalfSize;
 
 constexpr u32 AlignUp(u32 value, u32 align) {
     return (value + align - 1) & ~(align - 1);
@@ -1098,6 +1099,11 @@ SgxdBackend::Data SgxdBackend::LutRgRows() const {
 
 SgxdBackend::Data SgxdBackend::LutRgbaRows() const {
     const u32 at = lut_begin + LutLfSize + LutRgSize;
+    return {shared + at, BlockVa + at};
+}
+
+SgxdBackend::Data SgxdBackend::LutLfHalfRows() const {
+    const u32 at = lut_begin + LutLfSize + LutRgSize + LutRgbaSize;
     return {shared + at, BlockVa + at};
 }
 

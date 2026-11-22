@@ -128,6 +128,10 @@ std::string SamplerName(const Sampler& sampler) {
         return "tex" + std::to_string(sampler.index) + "a";
     case SamplerKind::LutLf:
         return "texture_buffer_lut_lf";
+    case SamplerKind::LutLfHalf:
+        return "texture_buffer_lut_lf_half";
+    case SamplerKind::LutLfHalfWrap:
+        return "texture_buffer_lut_lf_half_wrap";
     case SamplerKind::LutRg:
         return "texture_buffer_lut_rg";
     case SamplerKind::LutRgba:

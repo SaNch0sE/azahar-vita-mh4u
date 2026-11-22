@@ -148,6 +148,9 @@ public:
     /// F32F32 texels (value, delta) and Pica::Shader::LUT_RGBA_ROWS rows of 256 F16F16F16F16.
     [[nodiscard]] Data LutRgRows() const;
     [[nodiscard]] Data LutRgbaRows() const;
+    /// The LF rows' lighting values as F16, Pica::Shader::LUT_LF_ROWS rows of 256, row for row
+    /// (the lighting's filtered LUT reads).
+    [[nodiscard]] Data LutLfHalfRows() const;
 
     /**
      * A guest colour buffer a pass renders into, where it is: width x height pixels of bpp bytes at its PICA address, in

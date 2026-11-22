@@ -16,11 +16,10 @@
 
 namespace GxmRenderer::Usse {
 
-namespace {
-} // namespace
+bool shadow_smp_probe = false;
 
-bool LutFiltered() {
-    return lut_filtered;
+void SetShadowSmpProbe(bool on) {
+    shadow_smp_probe = on;
 }
 
 namespace {
@@ -201,9 +200,9 @@ constexpr uint8_t TmpU8EvenB = 190;
 /// lighting: a LUT read at N.V, the same for every light (.x D0, .y D1), read once before them;
 /// N.V itself in .z.
 constexpr uint8_t TmpLutShared = 244;
-/// lighting: a light's D0 (.x) and D1 (.y), and its distance attenuation after a spot factor
-/// (.z), in the last proctex batch read's home (the procedural texture is done before the
-/// lights).
+/// lighting: a light's D0 (.x) and D1 (.y), and its spot factor while the distance attenuation
+/// is read (.z), in the last proctex batch read's home (the procedural texture is done before
+/// the lights).
 constexpr uint8_t TmpLutValue = 156;
 /// lighting: the LUT inputs a light's lookups read off its light and half vectors (N.H, V.H,
 /// L.N, the spot's), a lane each in that order, in the batch read before's home.
@@ -278,6 +277,10 @@ enum Lit : uint8_t {
     LitNoisePad,
     LitU8White, ///< the U8 combiners' raw words: 0xffffffff, and 127 in each byte
     LitU8Half,
+    LitHalf,        ///< 0.5: a signed filtered LUT read's x per input
+    LitLutWrapLast, ///< 127.5 / 256: its last positive x, entry 127's centre
+    LitMinNormal,   ///< 2^-126, the smallest normal float: the bump renormalisation's floor
+    LitMinNormalPad,
     LiteralCount, // even, so the sampler words stay pair-aligned
 };
 static_assert(LiteralCount % 2 == 0);
@@ -344,18 +347,16 @@ private:
     void SampleTextures();
     void RoundPrimary();
     void Lighting();
-    /// The LUT's value at `input` (a scalar source) into `into`, one lane of a temporary.
-    /// `position`: the input is an unsigned LUT's position, 256 times the input, clamped here
-    /// to [0, 256] (the distance attenuation's).
-    /// `scale`: a filtered read's value is multiplied by it on its way into `into` (the LUT's
-    /// scale), else nothing.
+    /// The LUT's value at `input` into `into` (one temp lane): a filtered read of the LUT's F16
+    /// row, times `scale` if given. `pair_free`: `into` is an even lane with a free neighbour, so
+    /// an unscaled read lands there itself (LightingLutRowFetch).
     void LightingLutLookup(Sampler sampler, Src input, bool abs_input, bool two_sided, Dst into,
-                           bool position = false, const Src* scale = nullptr);
-    /// LightingLutLookup's second half, from TmpLutDelta (x the fraction, y the negated
-    /// index): the wrap, the texel and the interpolation, into `into`. A LUT at the input the
-    /// last lookup indexed goes on here from the same TmpLutDelta.
-    /// `row_set`: a filtered read's TmpLutCoord.y already holds the row (the pair's fold).
-    void LightingLutRowFetch(Sampler sampler, bool abs_input, Dst into, const Src* scale = nullptr);
+                           const Src* scale = nullptr, bool pair_free = false);
+    /// LightingLutLookup's second half, from TmpLutCoord's x: the row, the read and the value,
+    /// into `into`. A LUT at the input the last lookup read goes on here from the same x.
+    /// `row_set`: TmpLutCoord.y already holds the row (the pair's fold).
+    void LightingLutRowFetch(Sampler sampler, bool abs_input, Dst into, const Src* scale = nullptr,
+                             bool pair_free = false, bool row_set = false);
     void LutLfFetch();
     /// A LUT texel fetch: i1.y holds the index, `sampler_index` names the LUT texture (256
     /// texels a row, `inv_rows` its row count's inverse); the entry lands in TmpLutEntry.
@@ -545,6 +546,10 @@ private:
     /// The units whose read the pixel PDS program issues (Program::issues): plain 2D at an
     /// untouched coordinate. Their texels are PAs, the others' the SMPs' temporaries.
     std::array<bool, 3> unit_issued{};
+    bool lut_half_used = false;    ///< an unsigned lighting lookup reads the F16 rows
+    uint32_t sampler_lut_half = 0; ///< their sampler (SamplerKind::LutLfHalf)
+    bool lut_wrap_used = false;    ///< a signed one reads them repeating in u
+    uint32_t sampler_lut_wrap = 0; ///< SamplerKind::LutLfHalfWrap
     std::array<Vec4Loc, 3> texel_loc{
         {{Bank::Virtual, TmpTex0}, {Bank::Virtual, TmpTex0 + 4}, {Bank::Virtual, TmpTex0 + 8}}};
     std::array<Vec4Loc, 3> alpha_loc{};   ///< an issued split alpha's texel (AlphaIssued)
@@ -583,7 +588,7 @@ private:
     uint32_t sa_scissor = 0;
     uint32_t sa_fog_offset = 0;
     uint32_t sa_fog_color = 0;
-    uint32_t sa_lut_offset = 0;
+    std::array<uint32_t, 24> sa_lut_row{}; ///< per lighting LUT the program reads: its row's SA
     /// per lighting LUT: its (offset or bound, row) pair's SA, or UINT32_MAX (PlanUniforms)
     std::array<uint32_t, 24> sa_lut_coord{};
     uint32_t sa_global_ambient = 0;
@@ -806,6 +811,9 @@ void FragmentEmitter::PlanInputs() {
         unit_used[unit] = false;
     }
     shadow_scalar = uses_shadow && shadow_texture && lighting.shadow_selector == 0;
+    shadow_direct = shadow_scalar && !StageReads(Source::Texture0) &&
+                    !(lighting.bump_mode != LightingRegs::LightingBumpMode::None &&
+                      lighting.bump_selector == 0);
     for (u32 unit = 0; unit < 3; unit++) {
         const auto& border = tex.texture_border_color[unit];
         if (unit_used[unit] && (border.enable_s || border.enable_t)) {
@@ -813,20 +821,25 @@ void FragmentEmitter::PlanInputs() {
         }
     }
     if (uses_lighting) {
-        lut_used = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0) ||
-                   LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1) ||
-                   LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel) ||
-                   LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed) ||
-                   LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen) ||
-                   LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
+        // The lookups read the filtered F16 rows, a signed one repeating in u.
+        const auto note = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
+            if (LightingLutEnabled(lut, sampler)) {
+                (lut.abs_input ? lut_half_used : lut_wrap_used) = true;
+            }
+        };
+        note(lighting.lut_d0, Sampler::Distribution0);
+        note(lighting.lut_d1, Sampler::Distribution1);
+        note(lighting.lut_fr, Sampler::Fresnel);
+        note(lighting.lut_rr, Sampler::ReflectRed);
+        note(lighting.lut_rg, Sampler::ReflectGreen);
+        note(lighting.lut_rb, Sampler::ReflectBlue);
         for (u32 i = 0; i < lighting.src_num; i++) {
             const auto& light = lighting.lights[i];
             if (light.dist_atten_enable) {
-                lut_used = true;
+                lut_half_used = true;
             }
-            if (light.spot_atten_enable &&
-                LightingLutEnabled(lighting.lut_sp, Sampler::SpotlightAttenuation)) {
-                lut_used = true;
+            if (light.spot_atten_enable) {
+                note(lighting.lut_sp, Sampler::SpotlightAttenuation);
             }
         }
     }
@@ -964,6 +977,14 @@ void FragmentEmitter::PlanInputs() {
     if (lut_used) {
         program.samplers.push_back({SamplerKind::LutLf, 0, 3});
     }
+    if (lut_half_used) {
+        sampler_lut_half = static_cast<uint32_t>(program.samplers.size());
+        program.samplers.push_back({SamplerKind::LutLfHalf, 0, 10});
+    }
+    if (lut_wrap_used) {
+        sampler_lut_wrap = static_cast<uint32_t>(program.samplers.size());
+        program.samplers.push_back({SamplerKind::LutLfHalfWrap, 0, 11});
+    }
     if (uses_proctex && !proctex_tabled) {
         sampler_rg = static_cast<uint32_t>(program.samplers.size());
         program.samplers.push_back({SamplerKind::LutRg, 0, 4});
@@ -1084,14 +1105,14 @@ void FragmentEmitter::PlanUniforms() {
         }
     }
     light_memory.fill(-1);
+    sa_lut_row.fill(UINT32_MAX);
     sa_lut_coord.fill(UINT32_MAX);
     if (uses_lighting) {
-        // The LUT offsets as a prefix of the float4[6] up to the highest sampler used.
-        u32 highest = 0;
+        // A row scalar for each LUT read, packed: a prefix up to the highest of the 24 took the SAs
+        // a resident light needs.
+        std::array<bool, 24> row_used{};
         const auto note = [&](bool used, u32 sampler) {
-            if (used) {
-                highest = std::max(highest, sampler + 1);
-            }
+            row_used[sampler] = row_used[sampler] || used;
         };
         note(LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0), 0);
         note(LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1), 1);
@@ -1106,10 +1127,6 @@ void FragmentEmitter::PlanUniforms() {
                  8 + light.num);
             note(light.dist_atten_enable, 16 + light.num);
         }
-        if (highest != 0) {
-            sa_lut_offset = AllocateUniform(UniformKind::LightingLutRow, 4, (highest + 3) / 4);
-        }
-        sa_global_ambient = AllocateUniform(UniformKind::LightingGlobalAmbient, 3, 1);
         // Lights are register-resident (24 SAs each) while the budget holds, counting the
         // literals, the sampler words and the pointer behind them; the rest live in the
         // memory part of the uniform buffer and are loaded when their turn comes.
@@ -1904,7 +1921,9 @@ void FragmentEmitter::SampleTextures() {
         const auto& lighting = config.lighting;
         const Vec4Loc texel = texel_loc[lighting.shadow_selector];
         const Vec4Loc shadow{Bank::Virtual, TmpShadow};
-        if (shadow_scalar) {
+        if (shadow_direct) {
+            // ShadowTexture wrote it
+        } else if (shadow_scalar) {
             if (lighting.shadow_invert) {
                 e.Vec(VecOp::Add, {shadow.Pair(0), 0x1}, {texel.Pair(0), XXXX, Mod::Neg},
                       ConstOne);
@@ -1987,12 +2006,22 @@ void FragmentEmitter::RoundPrimary() {
 }
 
 void FragmentEmitter::LightingLutLookup(Sampler sampler, Src input, bool abs_input, bool two_sided,
-                                        Dst into, bool position, const Src* scale) {
+                                        Dst into, const Src* scale, bool pair_free) {
     // Unsigned: 256 steps over [0, 1]; signed: 128 steps over [-1, 1] with negatives wrapped
-    // to the top half of the table. The position (the input times the steps) goes to i0.x.
-    // The index is kept negated: frc with a zero first source is -floor in one
-    // instruction, and every later step takes the sign in its stride.
-    DEBUG_ASSERT(scale == nullptr); // a point read's value is a vmad2's
+    // to the top half of the table. The filtered F16 rows: a linear read's texel-space x is
+    // u * 256 - 0.5, so u = input + 0.5 / 256 puts it at the position, input * 256, and the
+    // texture unit interpolates between the entries there (with the next entry's value where
+    // entry.g is the delta, and 6-bit weights: docs/sgxd/tsp.md). The clamp takes a one-sided
+    // input's negatives to entry 0, and 1 and past it to entry 255. The distance's read makes
+    // its own x (Lighting).
+    const Reg coord = Reg::V(TmpLutCoord);
+    // With the LUT's (offset or bound, row) pair (PlanUniforms) the row rides in lane y:
+    // a first source's swizzle lane can be a constant (docs/sgxd/usse.md), so (input, 0) + (0.5
+    // / 256, row) and min((x, 2), (bound, row)) make both coordinates at once.
+    const uint32_t pair = sa_lut_coord[static_cast<uint32_t>(sampler)];
+    const bool fold = pair != UINT32_MAX;
+    DEBUG_ASSERT((pair & 1) == 0 || !fold);
+    const Src pair_src{Reg::Sa(static_cast<uint8_t>(pair)), XYZW};
     if (abs_input) {
         const Mod mod = two_sided ? Mod::Abs : Mod::None;
         if (fold) {
@@ -2030,22 +2059,34 @@ void FragmentEmitter::LightingLutLookup(Sampler sampler, Src input, bool abs_inp
 }
 
 void FragmentEmitter::LightingLutRowFetch(Sampler sampler, bool abs_input, Dst into,
-                                          const Src* scale) {
-    if (!abs_input) {
-        e.Test(Cond::Gt, 0, {delta}, 1, ConstZero, false);
-        e.Vec(VecOp::Add, {delta, 0x2}, {Lit(Lit256).reg, Lit(Lit256).swz, Mod::Neg}, {delta, YYYY},
-              Pred::P0, true);
-    }
+                                          const Src* scale, bool pair_free, bool row_set) {
     // The LUT is one whole row of the lf texture (lighting_lut_offset is row * 256): the row's
     // v comes from the CPU (UniformKind::LightingLutRow).
     const uint32_t sampler_index = static_cast<uint32_t>(sampler);
+    DEBUG_ASSERT_MSG(sa_lut_row[sampler_index] != UINT32_MAX,
+                     "lighting: LUT {} read without its row planned (PlanUniforms)", sampler_index);
     const Reg coord = Reg::V(TmpLutCoord);
-    DEBUG_ASSERT(scale == nullptr);
-    e.Mad2({coord, 0x1}, {delta, YYYY, Mod::Abs}, Lit(LitInv256), Lit(LitHalfInv256));
-    e.Vec(VecOp::Add, {coord, 0x2}, SaScalar(sa_lut_offset + sampler_index), ConstZero, Pred::None,
-          true);
-    e.Sample2DPoint(Reg::V(TmpLutEntry), coord, SamplerSa(LutSamplerIndex()), 0);
-    e.Wdf(0);
+    // TmpLutCoord.x holds the position (LightingLutLookup); the row's v, the read, the value.
+    if (!row_set) {
+        e.Vec(VecOp::Add, {coord, 0x2}, SaScalar(sa_lut_row[sampler_index]), ConstZero, Pred::None,
+              true);
+    }
+    const uint8_t row_sampler = SamplerSa(abs_input ? sampler_lut_half : sampler_lut_wrap);
+    const auto read = [&](Reg dst) {
+        e.Sample2DPoint(dst, coord, row_sampler, 0, 2);
+        e.Wdf(0);
+    };
+    // The F16 rows have one channel: the read writes one F32 register, the first of a
+    // 64-bit-aligned pair. Into an even lane with nothing in its neighbour it lands where it is
+    // read, without the move.
+    if (pair_free && scale == nullptr && (into.mask == 0x1 || into.mask == 0x4)) {
+        const uint8_t at = static_cast<uint8_t>(into.reg.n + (into.mask == 0x4 ? 2 : 0));
+        DEBUG_ASSERT(into.reg.bank == Bank::Virtual && (at & 1) == 0);
+        read(Reg::V(at));
+        light_mem_pending = false;
+        return;
+    }
+    read(Reg::V(TmpLutEntry));
     light_mem_pending = false; // the wait is for every read on the counter
     if (scale != nullptr) {
         e.Vec(VecOp::Mul, into, {Reg::V(TmpLutEntry), XXXX}, *scale);
@@ -2113,12 +2154,15 @@ void FragmentEmitter::Lighting() {
         u8_lighting_packed && lighting.src_num == 1 && uses_secondary_color &&
         !(lighting.enable_secondary_alpha && (fresnel_read || shadow_alpha_written));
 
-    // diffuse_sum = specular_sum = (0, 0, 0, 1): the alpha here, the colour by the first
-    // light's store (or zero below when there is none).
-    if (uses_primary_color) {
+    // diffuse_sum = specular_sum = (0, 0, 0, 1): the alpha here, unless the last light's
+    // fresnel read writes it or nothing reads it, the colour by the first light's store (or
+    // zero below when there is none).
+    if (uses_primary_color && primary_alpha_read && !direct_primary &&
+        !(fresnel_read && lighting.enable_primary_alpha)) {
         e.Vec(VecOp::Add, {diffuse_sum.Pair(1), 0x2}, ConstZero, {Reg::C(1), XYZW});
     }
-    if (uses_secondary_color) {
+    if (uses_secondary_color && secondary_alpha_read && !direct_secondary &&
+        !(fresnel_read && lighting.enable_secondary_alpha)) {
         e.Vec(VecOp::Add, {specular_sum.Pair(1), 0x2}, ConstZero, {Reg::C(1), XYZW});
     }
     if (lighting.src_num == 0) {
@@ -2145,11 +2189,9 @@ void FragmentEmitter::Lighting() {
               true);
         ambient_added = true;
     };
-    const auto accumulate3 = [&](Vec4Loc to, Reg internal) {
-        e.Vec(VecOp::Add, {to.Pair(0), 0x3}, {to.Pair(0), XYZW}, {internal, XYZW}, Pred::None,
-              true);
-        e.Vec(VecOp::Add, {to.Pair(1), 0x1}, {to.Pair(1), XYZW}, {internal, ZZZZ}, Pred::None,
-              true);
+    const auto accumulate3 = [&](Vec4Loc to, Reg internal, Pred pred = Pred::None) {
+        e.Vec(VecOp::Add, {to.Pair(0), 0x3}, {to.Pair(0), XYZW}, {internal, XYZW}, pred, true);
+        e.Vec(VecOp::Add, {to.Pair(1), 0x1}, {to.Pair(1), XYZW}, {internal, ZZZZ}, pred, true);
     };
 
     // The surface normal and tangent in the quaternion's frame, from the bump map or the
@@ -2376,8 +2418,9 @@ void FragmentEmitter::Lighting() {
         bool operator==(const LutIndexKey&) const = default;
     };
     std::optional<LutIndexKey> last_lut_index;
+    // `pair_free`: LightingLutLookup's, the caller's word that `into`'s neighbour is free.
     const auto lut_value = [&](const Pica::Shader::LutConfig& lut, Sampler sampler, bool two_sided,
-                               Dst into) {
+                               Dst into, bool pair_free = false) {
         const LutIndexKey key{lut.type.Value(), static_cast<bool>(lut.abs_input), two_sided};
         // Scales are powers of two between 0.25 and 8, made of one or two factors from the
         // constant bank; a filtered read takes the first on its value's move.
@@ -2402,14 +2445,13 @@ void FragmentEmitter::Lighting() {
         } else {
             DEBUG_ASSERT_MSG(scale == 1.0f, "lighting: LUT scale {}", scale);
         }
-        const bool filtered = key.abs_input && lut_filtered;
-        const Src* fetch_scale = filtered && factor_count > 0 ? &factors[0] : nullptr;
+        const Src* fetch_scale = factor_count > 0 ? &factors[0] : nullptr;
         if (last_lut_index == key) {
             // TmpLutCoord's x holds its position
-            LightingLutRowFetch(sampler, key.abs_input, into, fetch_scale);
+            LightingLutRowFetch(sampler, key.abs_input, into, fetch_scale, pair_free);
         } else {
             LightingLutLookup(sampler, lut_input(key.input), key.abs_input, two_sided, into,
-                              fetch_scale);
+                              fetch_scale, pair_free);
             last_lut_index = key;
         }
         for (u32 k = fetch_scale != nullptr ? 1 : 0; k < factor_count; k++) {
@@ -2433,7 +2475,9 @@ void FragmentEmitter::Lighting() {
     const bool d1_shared = shared_at_nv(lighting.lut_d1, Sampler::Distribution1);
     const bool sides = lighting.src_num > 0 && lighting.lights[0].two_sided_diffuse;
     if (d0_shared) {
-        lut_value(lighting.lut_d0, Sampler::Distribution0, sides, {Reg::V(TmpLutShared), 0x1});
+        // .y (D1's) is written after it
+        lut_value(lighting.lut_d0, Sampler::Distribution0, sides, {Reg::V(TmpLutShared), 0x1},
+                  true);
     }
     if (d1_shared) {
         lut_value(lighting.lut_d1, Sampler::Distribution1, sides, {Reg::V(TmpLutShared), 0x2});
@@ -2536,33 +2580,31 @@ void FragmentEmitter::Lighting() {
             e.Test(Cond::Gt, 0, {dot_product}, 1, ConstZero, false);
             e.MoveInternal({geo_reg, 0x2}, {Reg::C(0), XXXX}, Pred::NotP0, true);
         }
-        // Attenuation: spot and distance, multiplied into `atten`.x, which the first of them
-        // writes (no register at all when neither is on).
+        // Attenuation: spot and distance, multiplied into `atten`.x (no register at all when
+        // neither is on). The distance's factor lands in `atten` itself, read after the
+        // distance beside it (.y) is used; a spot factor before it waits in TmpLutValue.z,
+        // whose .w is free.
         const bool spot_on = light.spot_atten_enable &&
                              LightingLutEnabled(lighting.lut_sp, Sampler::SpotlightAttenuation);
         const bool atten_on = spot_on || light.dist_atten_enable;
+        const Reg spot_factor = light.dist_atten_enable ? Reg::V(TmpLutValue + 2) : atten;
         if (spot_on) {
+            // `atten`.y is the distance only with the distance attenuation on
             lut_value(lighting.lut_sp, LightingRegs::SpotlightAttenuationSampler(light.num),
-                      two_sided, {atten, 0x1});
+                      two_sided, {spot_factor, 0x1}, true);
         }
         if (light.dist_atten_enable) {
             // input = clamp(scale * distance + bias, 0, 1), unsigned lookup (the bias and
             // scale are the .w of quads 4 and 5, loaded with the light's position). They come
             // in the read's units (UniformSource::dist_atten): the bias has its half texel
             // added, so the read's x is one vmad2.
-            const Reg da = spot_on ? Reg::V(TmpLutValue + 2) : atten;
             const Sampler da_sampler = LightingRegs::DistanceAttenuationSampler(light.num);
-            if (lut_filtered) {
-                e.Mad2({Reg::V(TmpLutCoord), 0x1}, {misc_hi, YYYY}, Scalar(pb, sa + 23),
-                       Scalar(pb, sa + 19));
-                LightingLutRowFetch(da_sampler, true, {da, 0x1});
-            } else {
-                e.Mad2({misc_hi, 0x2}, {misc_hi, YYYY}, Scalar(pb, sa + 23), Scalar(pb, sa + 19));
-                LightingLutLookup(da_sampler, {misc_hi, YYYY}, true, false, {da, 0x1}, true);
-            }
-            last_lut_index.reset(); // TmpLutDelta holds the distance's index now
+            e.Mad2({Reg::V(TmpLutCoord), 0x1}, {misc_hi, YYYY}, Scalar(pb, sa + 23),
+                   Scalar(pb, sa + 19));
+            LightingLutRowFetch(da_sampler, true, {atten, 0x1}, nullptr, true);
+            last_lut_index.reset(); // TmpLutCoord's x holds the distance's position now
             if (spot_on) {
-                e.Vec(VecOp::Mul, {atten, 0x1}, {atten, XYZW}, {da, XXXX});
+                e.Vec(VecOp::Mul, {atten, 0x1}, {atten, XYZW}, {spot_factor, XXXX});
             }
         }
 
@@ -2582,37 +2624,43 @@ void FragmentEmitter::Lighting() {
             const bool refl_on = rr || rg || rb;
             // rr alone: refl = (rr, rr, rr), multiplied in as a broadcast.
             const bool refl_scalar = rr && !rg && !rb;
+            // An even lane's read before its odd neighbour's (rr before rg, d0 before d1), so it
+            // lands in place (LightingLutRowFetch's pair_free); rb's neighbour is acc.w, unused.
             struct Fetch {
                 const Pica::Shader::LutConfig* lut;
                 Sampler sampler;
                 Dst into;
+                bool pair_free;
             };
             std::array<Fetch, 5> fetches{};
             u32 fetch_count = 0;
+            if (rr) {
+                fetches[fetch_count++] = {
+                    &lighting.lut_rr, Sampler::ReflectRed, {acc.Pair(0), 0x1}, true};
+            }
             if (rg) {
                 fetches[fetch_count++] = {
-                    &lighting.lut_rg, Sampler::ReflectGreen, {acc.Pair(0), 0x2}};
+                    &lighting.lut_rg, Sampler::ReflectGreen, {acc.Pair(0), 0x2}, false};
             }
             if (rb) {
                 fetches[fetch_count++] = {
-                    &lighting.lut_rb, Sampler::ReflectBlue, {acc.Pair(1), 0x1}};
-            }
-            if (rr) {
-                fetches[fetch_count++] = {
-                    &lighting.lut_rr, Sampler::ReflectRed, {acc.Pair(0), 0x1}};
-            }
-            if (d1_on && !d1_shared) {
-                fetches[fetch_count++] = {&lighting.lut_d1, Sampler::Distribution1, {values, 0x2}};
+                    &lighting.lut_rb, Sampler::ReflectBlue, {acc.Pair(1), 0x1}, true};
             }
             if (d0_on && !d0_shared) {
-                fetches[fetch_count++] = {&lighting.lut_d0, Sampler::Distribution0, {values, 0x1}};
+                fetches[fetch_count++] = {
+                    &lighting.lut_d0, Sampler::Distribution0, {values, 0x1}, true};
+            }
+            if (d1_on && !d1_shared) {
+                fetches[fetch_count++] = {
+                    &lighting.lut_d1, Sampler::Distribution1, {values, 0x2}, false};
             }
             const uint32_t specular_quads = 0x3u;
             for (u32 i = 0; i < fetch_count; i++) {
                 if (i + 1 == fetch_count) {
                     LightQuads(specular_quads, false);
                 }
-                lut_value(*fetches[i].lut, fetches[i].sampler, two_sided, fetches[i].into);
+                lut_value(*fetches[i].lut, fetches[i].sampler, two_sided, fetches[i].into,
+                          fetches[i].pair_free);
             }
             LightQuads(specular_quads, true);
             if (refl_on && !refl_scalar) {
@@ -2659,10 +2707,14 @@ void FragmentEmitter::Lighting() {
         }
         // * clamp_highlights * atten, into specular_sum. clamp_highlights is sign(dot_product),
         // which is never negative: the term is zeroed where dot_product is not positive, the
-        // predicate made here, for the one instruction that reads it.
+        // predicate made here: the first light's term zeroed, a later one's accumulation
+        // predicated on it (a zeroing move fewer each).
+        const bool clamp_accumulate = lighting.clamp_highlights && !specular_empty;
         if (lighting.clamp_highlights) {
             e.Test(Cond::Gt, 0, {dot_product}, 0, ConstZero, false);
-            e.MoveInternal({I1, 0x7}, {Reg::C(0), XXXX}, Pred::NotP0, true);
+            if (!clamp_accumulate) {
+                e.MoveInternal({I1, 0x7}, {Reg::C(0), XXXX}, Pred::NotP0, true);
+            }
         }
         if (atten_on) {
             e.Vec(VecOp::Mul, {I1, 0x7}, {I1, XYZW}, {atten, XXXX}, Pred::None, true);
@@ -2686,7 +2738,7 @@ void FragmentEmitter::Lighting() {
             store3(specular_sum, I1);
             specular_empty = false;
         } else {
-            accumulate3(specular_sum, I1);
+            accumulate3(specular_sum, I1, clamp_accumulate ? Pred::P0 : Pred::None);
         }
         } // uses_secondary_color
         if (uses_primary_color) {
