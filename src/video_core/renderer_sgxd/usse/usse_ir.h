@@ -120,6 +120,10 @@ struct RegClass {
     /// Only values dead before the instruction at this index may use the class (the
     /// vertex epilogue writes the outputs); SIZE_MAX for no limit.
     std::size_t until = SIZE_MAX;
+    /// The program's inputs (a pixel program's interpolants and issued texels): each pair is
+    /// the program's from its start to its last reference, and free for a value born after it
+    /// (Lowering::AllocatePairs only).
+    bool inputs = false;
 };
 
 /// The second tier's passes a bisection leaves out (sgxd_flags `tier2skip=MASK`, diagnostics):
@@ -145,6 +149,11 @@ public:
     bool skip_invalid_auto = false;
     int nosched_override = 0;
     bool secondary = false;
+    /// The registers in pairs: a virtual quad no operand reaches across its middle is two
+    /// pairs placed apart (Lowering::AllocatePairs), so a scalar or a two-lane value takes two
+    /// registers, not four, and a whole quad any even base. The classes then hold only
+    /// temporaries and primary attributes.
+    bool split_pairs = false;
 
     std::size_t Count() const {
         return insts.size();

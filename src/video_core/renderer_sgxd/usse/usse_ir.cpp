@@ -3,6 +3,8 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -617,11 +619,18 @@ public:
 
     LowerResult Run(Encoder& e, int level);
     bool skip_auto = false;
+    bool split_pairs = false;                              ///< Builder::split_pairs
+    uint32_t peak_live = 0;                                ///< LowerResult::peak_live
+    uint32_t peak_at = 0;                                  ///< LowerResult::peak_at
+    std::vector<uint16_t> peak_regs;                       ///< LowerResult::peak_regs
     std::function<uint32_t(uint32_t, uint32_t)> occupancy; ///< Builder::occupancy
 
 private:
     std::vector<bool> SkipInvalid() const;
-    void Liveness();
+    /// `precise`: a read covers the lanes its operand reads (PreciseReads), not every lane
+    /// from the register named; with split_pairs, `split` and `halves` too. Only for the
+    /// allocation: the passes keep the coarser reads they were written against.
+    void Liveness(bool precise = false);
     void DeadStores();
     void Reloads();
     void HoistLoads(int max_group);
@@ -640,12 +649,16 @@ private:
     /// internal registers never hold a value across one).
     bool InternalRead(std::size_t from, uint8_t reg, uint8_t lanes);
     void Allocate();
+    /// Allocate in register pairs (split_pairs): a split quad's halves anywhere, a whole quad
+    /// on a 4-aligned base.
+    void AllocatePairs();
     /// USSE_IR_DUMP=1 in the environment prints the instruction list after each pass
     /// (host tests).
     void Dump(const char* stage) const;
     /// Refuses the program when an internal register is live across a barrier: the
     /// hardware would read stale lanes there, and Vita3K would not notice.
     void CheckInternals() const;
+    void CheckTemps() const;
     void Encode(Encoder& e, LowerResult& result);
     Reg Map(Reg r) const;
 
@@ -660,12 +673,17 @@ private:
         std::size_t end = 0;
         bool used = false;
         bool temp_or_pa = false; ///< a load, sample or integer op names it: not an output register
+        bool temp_only = false;  ///< depthf reads it: a temporary (Encoder::DepthF)
         std::optional<Reg> home;
         /// Bit i set when the quad is live at instruction i (defined, used, or carried
         /// across): the allocator fits quads into the holes, not the hull.
         std::vector<uint64_t> active;
     };
     std::vector<Interval> intervals;
+    /// split_pairs: whether a quad's two pairs live apart (no operand reaches across its
+    /// middle), and each pair's interval (lanes 0-1, 2-3).
+    std::vector<bool> split;
+    std::vector<std::array<Interval, 2>> halves;
     std::set<uint32_t> coalesced_outputs; ///< output quads written in place: no spills there
     uint32_t spilled = 0;
     uint32_t temp_count = 0;
@@ -708,6 +726,109 @@ uint8_t ReadLanes(const Reg& r) {
     return static_cast<uint8_t>((0xf << (r.n & 3)) & 0xf);
 }
 
+/// The registers a source's channels name, from its register: channel c is register n + c in
+/// the unified store (a two-wide op's pair is moved down to its lanes, HalfSource).
+uint8_t SwizzleRegs(const Src& src, uint8_t mask) {
+    uint8_t lanes = 0;
+    for (int l = 0; l < 4; l++) {
+        if ((mask >> l) & 1 && src.swz[l] <= Ch::W) {
+            lanes |= static_cast<uint8_t>(1u << static_cast<int>(src.swz[l]));
+        }
+    }
+    return lanes;
+}
+
+/// f(register, registers) for each register an instruction reads: bit k of `registers` is
+/// register n + k, which may reach past the register's quad. The shapes known here read
+/// what their operands name (a pair, a U8 or integer word, a swizzle's channels); any other
+/// is taken to read four registers from the one named.
+template <typename F>
+void PreciseReads(Inst& inst, std::vector<Ref>& refs, F&& f) {
+    switch (inst.op) {
+    case Op::Vec:
+        f(inst.src[0].reg, SwizzleRegs(inst.src[0], inst.dst.mask));
+        f(inst.src[1].reg, SwizzleRegs(inst.src[1], inst.dst.mask));
+        return;
+    case Op::Mad:
+        for (int k = 0; k < 3; k++) {
+            f(inst.src[k].reg, SwizzleRegs(inst.src[k], inst.dst.mask & (inst.b[0] ? 0xf : 0x7)));
+        }
+        return;
+    case Op::Dot:
+        f(inst.src[0].reg, SwizzleRegs(inst.src[0], inst.b[0] ? 0xf : 0x7));
+        f(inst.src[1].reg, SwizzleRegs(inst.src[1], inst.b[0] ? 0xf : 0x7));
+        return;
+    case Op::Comp:
+        f(inst.src[0].reg, static_cast<uint8_t>(1u << (inst.u[1] & 3)));
+        return;
+    case Op::MoveInternal:
+        f(inst.src[0].reg, SwizzleRegs(inst.src[0], inst.dst.mask));
+        return;
+    case Op::CondMove:
+    case Op::Mad2:
+        for (int k = 0; k < 3; k++) {
+            f(inst.src[k].reg, SwizzleRegs(inst.src[k], inst.dst.mask));
+        }
+        return;
+    case Op::Test:
+        f(inst.src[0].reg, static_cast<uint8_t>(1u << (inst.u[2] & 3)));
+        f(inst.src[1].reg, static_cast<uint8_t>(1u << (inst.b[0] ? 0 : (inst.u[2] & 3))));
+        return;
+    case Op::MoveF32x4:
+    case Op::PackF16:
+        // Pairs: (lo, hi), or the one pair of four F16 lanes; an internal source is whole.
+        f(inst.reg[0], 0x3);
+        if (inst.reg[0].bank != Bank::Internal && (inst.op == Op::PackF16 || !inst.b[0])) {
+            f(inst.reg[1], 0x3);
+        }
+        return;
+    case Op::PackU8:
+        f(inst.reg[1], 0x3);
+        if (inst.reg[1].bank != Bank::Internal && !inst.b[1]) {
+            f(inst.xreg[0], 0x3);
+        }
+        return;
+    case Op::UnpackU8:
+        f(inst.reg[0], 0x1);
+        return;
+    case Op::PackS16:
+        f(inst.reg[1], static_cast<uint8_t>(1u << (inst.u[0] & 3)));
+        return;
+    case Op::UnpackInt:
+        f(inst.reg[1], 0x3); // a lane of the 64-bit pair at the register
+        return;
+    case Op::Bitwise:
+        for (const IOp& o : inst.iop) {
+            if (!o.imm) {
+                f(o.reg, 0x1);
+            }
+        }
+        return;
+    case Op::Sop2:
+    case Op::Sop3:
+        f(inst.reg[1], 0x1);
+        f(inst.xreg[0], 0x1);
+        if (inst.op == Op::Sop3) {
+            f(inst.xreg[1], 0x1);
+        }
+        return;
+    case Op::Sample2D:
+        f(inst.reg[1], inst.u[2] == 3 ? 0x7 : 0x3);
+        if (inst.b[0]) {
+            f(inst.src[0].reg, 0xf);
+        }
+        return;
+    default:
+        Refs(inst, refs);
+        for (const Ref& r : refs) {
+            if (!r.def) {
+                f(*r.reg, 0xf);
+            }
+        }
+        return;
+    }
+}
+
 /// The lanes an instruction writes of an internal register (its number is not a lane
 /// offset: i0-i2 are whole 128-bit registers).
 uint8_t InternalWriteLanes(const Inst& inst) {
@@ -729,7 +850,7 @@ uint8_t InternalWriteLanes(const Inst& inst) {
     }
 }
 
-void Lowering::Liveness() {
+void Lowering::Liveness(bool precise) {
     const std::size_t n = insts.size();
     std::vector<Ref> refs;
     std::map<int, std::size_t> label_at;
@@ -762,23 +883,70 @@ void Lowering::Liveness() {
     // predicated write keeps the old lanes alive, so it reads them and defines nothing.
     std::vector<std::vector<uint8_t>> uses(n, std::vector<uint8_t>(quad_count, 0));
     std::vector<std::vector<uint8_t>> defs(n, std::vector<uint8_t>(quad_count, 0));
+    // split_pairs: a quad stays whole when an operand reaches across its middle or past it.
+    const bool pairs = precise && split_pairs;
+    split.assign(pairs ? quad_count : 0, true);
+    const auto touch = [&](const Reg& r, unsigned regs) {
+        const uint32_t q = QuadOf(r);
+        const unsigned lanes = regs << (r.n & 3);
+        if (lanes == 0) {
+            return;
+        }
+        if ((lanes & ~0xfu) != 0) {
+            split[q] = false;
+            if (q + 1 < quad_count) {
+                split[q + 1] = false;
+            }
+        }
+        // An operand counts its lanes from the register it names, at that half's home: one naming
+        // the first half and reaching the second (a write of z and w through the quad's first
+        // register) needs the halves side by side.
+        if ((r.n & 2) == 0 && (lanes & 0xc) != 0) {
+            split[q] = false;
+        }
+    };
     for (std::size_t i = 0; i < n; i++) {
         Inst& inst = insts[i];
         Refs(inst, refs);
         for (const Ref& r : refs) {
-            if (!IsVirtual(*r.reg)) {
+            if (!IsVirtual(*r.reg) || !r.def) {
                 continue;
             }
             const uint32_t q = QuadOf(*r.reg);
-            if (r.def) {
-                const uint8_t lanes = WriteLanes(inst, *r.reg);
-                if (inst.pred == Pred::None) {
-                    defs[i][q] |= lanes;
-                } else {
-                    uses[i][q] |= lanes;
-                }
+            const uint8_t lanes = WriteLanes(inst, *r.reg);
+            if (inst.pred == Pred::None) {
+                defs[i][q] |= lanes;
             } else {
-                uses[i][q] |= ReadLanes(*r.reg);
+                uses[i][q] |= lanes;
+            }
+            if (pairs) {
+                // WriteLanes' mask before it is cut to the quad: a four-lane load or read
+                // into a pair's second register reaches the next quad.
+                touch(*r.reg, inst.op == Op::Lda32 ? (1u << std::min<unsigned>(inst.u[1], 4)) - 1
+                              : (inst.op == Op::Sample2D) ? 0xfu
+                                                          : WriteLanes(inst, Reg{r.reg->bank, 0}));
+            }
+        }
+        if (precise) {
+            PreciseReads(inst, refs, [&](const Reg& r, uint8_t regs) {
+                if (!IsVirtual(r)) {
+                    return;
+                }
+                const unsigned lanes = static_cast<unsigned>(regs) << (r.n & 3);
+                uses[i][QuadOf(r)] |= static_cast<uint8_t>(lanes & 0xf);
+                if ((lanes >> 4) != 0 && QuadOf(r) + 1 < quad_count) {
+                    uses[i][QuadOf(r) + 1] |= static_cast<uint8_t>(lanes >> 4);
+                }
+                if (pairs) {
+                    touch(r, regs);
+                }
+            });
+        } else {
+            Refs(inst, refs);
+            for (const Ref& r : refs) {
+                if (IsVirtual(*r.reg) && !r.def) {
+                    uses[i][QuadOf(*r.reg)] |= ReadLanes(*r.reg);
+                }
             }
         }
     }
@@ -810,17 +978,33 @@ void Lowering::Liveness() {
     }
 
     intervals.assign(quad_count, {});
+    halves.assign(pairs ? quad_count : 0, {});
     for (uint32_t q = 0; q < quad_count; q++) {
         intervals[q].active.assign((n + 63) / 64, 0);
+        if (pairs) {
+            halves[q][0].active.assign((n + 63) / 64, 0);
+            halves[q][1].active.assign((n + 63) / 64, 0);
+        }
     }
+    const auto mark = [](Interval& iv, std::size_t i, bool used) {
+        iv.start = std::min(iv.start, i);
+        iv.end = std::max(iv.end, i);
+        iv.used = iv.used || used;
+        iv.active[i / 64] |= 1ull << (i % 64);
+    };
     for (std::size_t i = 0; i < n; i++) {
         for (uint32_t q = 0; q < quad_count; q++) {
-            if (uses[i][q] || defs[i][q] || in[i][q] || live[i][q]) {
-                Interval& iv = intervals[q];
-                iv.start = std::min(iv.start, i);
-                iv.end = std::max(iv.end, i);
-                iv.used = iv.used || uses[i][q] != 0;
-                iv.active[i / 64] |= 1ull << (i % 64);
+            const uint8_t lanes = uses[i][q] | defs[i][q] | in[i][q] | live[i][q];
+            if (lanes != 0) {
+                mark(intervals[q], i, uses[i][q] != 0);
+                if (pairs && split[q]) {
+                    for (int h = 0; h < 2; h++) {
+                        const uint8_t m = static_cast<uint8_t>(0x3 << (2 * h));
+                        if (lanes & m) {
+                            mark(halves[q][h], i, (uses[i][q] & m) != 0);
+                        }
+                    }
+                }
             }
         }
     }
@@ -835,12 +1019,19 @@ void Lowering::Liveness() {
                 }
             }
         }
+        if (inst.op == Op::DepthF && IsVirtual(inst.reg[0])) {
+            intervals[QuadOf(inst.reg[0])].temp_only = true;
+        }
         if (inst.op == Op::Mad2 && IsVirtual(inst.src[0].reg)) {
             intervals[QuadOf(inst.src[0].reg)].temp_or_pa = true;
         }
         if (inst.op == Op::Sop3 && IsVirtual(inst.xreg[1])) {
             intervals[QuadOf(inst.xreg[1])].temp_or_pa = true;
         }
+    }
+    for (uint32_t q = 0; q < halves.size(); q++) {
+        halves[q][0].temp_or_pa = halves[q][1].temp_or_pa = intervals[q].temp_or_pa;
+        halves[q][0].temp_only = halves[q][1].temp_only = intervals[q].temp_only;
     }
 }
 
@@ -3120,6 +3311,71 @@ void Lowering::Dump(const char* stage) const {
     }
 }
 
+void Lowering::CheckTemps() const {
+    // Each operand reaches registers from the one it names, at that register's home: they are
+    // the program's own (below temp_count, or other instances' tasks own them), and a split
+    // quad's operand stays inside its half's pair (the other half has a home of its own).
+    std::vector<Ref> refs;
+    for (std::size_t i = 0; i < insts.size(); i++) {
+        Inst& inst = const_cast<Inst&>(insts[i]);
+        const auto check = [&](const Reg& r, unsigned regs, const char* what) {
+            if (!IsVirtual(r) || regs == 0) {
+                return;
+            }
+            const unsigned top = 31u - static_cast<unsigned>(std::countl_zero(regs));
+            const uint32_t q = QuadOf(r);
+            const Reg home = Map(r);
+            const bool past_half = q < split.size() && split[q] && (r.n & 1) + top > 1;
+            const bool past_temps = (home.bank == Bank::Temp && home.n + top >= temp_count) ||
+                                    (home.bank == Bank::PrimAttr && home.n + top >= pa_count);
+            if (past_half || past_temps) {
+                Fail(std::string("a ") + what + " of v" + std::to_string(r.n) + " reaches " +
+                     std::to_string(top) + " registers past its home " + std::to_string(home.n) +
+                     (past_half ? ", out of its split quad's half" : "") +
+                     (past_temps ? ", past the " + std::to_string(temp_count) + " temporaries and " +
+                                       std::to_string(pa_count) + " primary attributes"
+                                 : "") +
+                     " at instruction " + std::to_string(i) + ": " + Describe(inst));
+            }
+        };
+        Refs(inst, refs);
+        for (const Ref& r : refs) {
+            if (r.def && IsVirtual(*r.reg)) {
+                check(*r.reg,
+                      inst.op == Op::Lda32 ? (1u << std::min<unsigned>(inst.u[1], 4)) - 1
+                      : inst.op == Op::Sample2D ? inst.dst.mask
+                                                : WriteLanes(inst, Reg{r.reg->bank, 0}),
+                      "write");
+            }
+        }
+        // The reads PreciseReads knows exactly; its other ops read a whole quad by default.
+        switch (inst.op) {
+        case Op::Vec:
+        case Op::Mad:
+        case Op::Dot:
+        case Op::Comp:
+        case Op::MoveInternal:
+        case Op::CondMove:
+        case Op::Mad2:
+        case Op::Test:
+        case Op::MoveF32x4:
+        case Op::PackF16:
+        case Op::PackU8:
+        case Op::UnpackU8:
+        case Op::PackS16:
+        case Op::UnpackInt:
+        case Op::Bitwise:
+        case Op::Sop2:
+        case Op::Sop3:
+        case Op::Sample2D:
+            PreciseReads(inst, refs, [&](const Reg& r, uint8_t regs) { check(r, regs, "read"); });
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 void Lowering::CheckInternals() const {
     std::vector<Ref> refs;
     // stale[k]: lanes of i<k> no instruction has written since the last barrier (or the
@@ -3420,7 +3676,7 @@ void Lowering::Allocate() {
         Interval& iv = intervals[q];
         bool placed = false;
         for (std::size_t c = 0; c < classes.size() && !placed; c++) {
-            if (iv.end >= classes[c].until) {
+            if (iv.end >= classes[c].until || classes[c].inputs) {
                 continue;
             }
             if (iv.temp_or_pa && classes[c].bank != Bank::Temp && classes[c].bank != Bank::PrimAttr) {
@@ -3458,11 +3714,163 @@ void Lowering::Allocate() {
     }
 }
 
+void Lowering::AllocatePairs() {
+    // Linear scan as Allocate, over register pairs: a split quad's halves each take any free
+    // pair, a whole quad two neighbouring free pairs. An even base is all a quad needs: the wide
+    // unified-store source numbers registers in 64-bit units, and a read's result starts on a
+    // 64-bit boundary.
+    const std::size_t words = (insts.size() + 63) / 64;
+    struct Slot {
+        Reg base;
+        std::vector<uint64_t> taken;
+    };
+    std::vector<std::vector<Slot>> slots(classes.size());
+    // Each primary attribute's last reference, read or write (the colour's pack into pa0 at
+    // the end), four registers from the one an operand names: an input pair is busy until then.
+    std::array<std::size_t, 128> pa_last;
+    pa_last.fill(SIZE_MAX);
+    {
+        std::vector<Ref> refs;
+        for (std::size_t i = 0; i < insts.size(); i++) {
+            Refs(insts[i], refs);
+            for (const Ref& r : refs) {
+                if (r.reg->bank == Bank::PrimAttr) {
+                    for (unsigned k = 0; k < 4 && r.reg->n + k < pa_last.size(); k++) {
+                        pa_last[r.reg->n + k] = i;
+                    }
+                }
+            }
+        }
+    }
+    for (std::size_t c = 0; c < classes.size(); c++) {
+        if (classes[c].bank != Bank::Temp && classes[c].bank != Bank::PrimAttr) {
+            Fail("pairs: a class of temporaries or primary attributes only");
+        }
+        for (uint32_t r = classes[c].first; r + 2 <= classes[c].end; r += 2) {
+            Slot slot{Reg{classes[c].bank, static_cast<uint8_t>(r)}, std::vector<uint64_t>(words, 0)};
+            if (classes[c].inputs) {
+                std::size_t last = SIZE_MAX;
+                for (const uint32_t k : {r, r + 1}) {
+                    if (pa_last[k] != SIZE_MAX) {
+                        last = last == SIZE_MAX ? pa_last[k] : std::max(last, pa_last[k]);
+                    }
+                }
+                for (std::size_t i = 0; last != SIZE_MAX && i <= last; i++) {
+                    slot.taken[i / 64] |= 1ull << (i % 64);
+                }
+            }
+            slots[c].push_back(std::move(slot));
+        }
+    }
+    struct Unit {
+        Interval* iv;
+        uint32_t regs; // 4 a whole quad, 2 a pair
+        uint16_t first; // its first virtual register
+    };
+    std::vector<Unit> units;
+    for (uint32_t q = 0; q < quad_count; q++) {
+        if (split[q]) {
+            for (uint32_t h = 0; h < 2; h++) {
+                if (halves[q][h].start != SIZE_MAX) {
+                    units.push_back({&halves[q][h], 2, static_cast<uint16_t>(q * 4 + h * 2)});
+                }
+            }
+        } else if (intervals[q].start != SIZE_MAX) {
+            units.push_back({&intervals[q], 4, static_cast<uint16_t>(q * 4)});
+        }
+    }
+    std::stable_sort(units.begin(), units.end(),
+                     [](const Unit& a, const Unit& b) { return a.iv->start < b.iv->start; });
+    // The pressure: registers live at each instruction, every unit counted (dumpusse's
+    // peak_live, against temp_count + pa_count).
+    {
+        std::vector<uint32_t> live(insts.size(), 0);
+        for (const Unit& u : units) {
+            for (std::size_t w = 0; w < words; w++) {
+                for (uint64_t bits = u.iv->active[w]; bits != 0; bits &= bits - 1) {
+                    const std::size_t i = w * 64 + static_cast<std::size_t>(std::countr_zero(bits));
+                    if (i < live.size()) {
+                        live[i] += u.regs;
+                    }
+                }
+            }
+        }
+        for (std::size_t i = 0; i < live.size(); i++) {
+            if (live[i] > peak_live) {
+                peak_live = live[i];
+                peak_at = static_cast<uint32_t>(i);
+            }
+        }
+        peak_regs.clear();
+        for (const Unit& u : units) {
+            if (peak_live != 0 && (u.iv->active[peak_at / 64] >> (peak_at % 64) & 1) != 0) {
+                peak_regs.push_back(u.first);
+            }
+        }
+    }
+    const auto free_over = [&](const Slot& s, const Interval& iv) {
+        for (std::size_t w = 0; w < words; w++) {
+            if ((s.taken[w] & iv.active[w]) != 0) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto take = [&](Slot& s, const Interval& iv) {
+        for (std::size_t w = 0; w < words; w++) {
+            s.taken[w] |= iv.active[w];
+        }
+    };
+    for (const Unit& u : units) {
+        Interval& iv = *u.iv;
+        bool placed = false;
+        for (std::size_t c = 0; c < classes.size() && !placed; c++) {
+            if (iv.end >= classes[c].until || (iv.temp_only && classes[c].bank != Bank::Temp)) {
+                continue;
+            }
+            std::vector<Slot>& ss = slots[c];
+            for (std::size_t k = 0; k < ss.size() && !placed; k++) {
+                if (u.regs == 2) {
+                    if (free_over(ss[k], iv)) {
+                        take(ss[k], iv);
+                        iv.home = ss[k].base;
+                        placed = true;
+                    }
+                } else if (k + 1 < ss.size() && free_over(ss[k], iv) && free_over(ss[k + 1], iv)) {
+                    take(ss[k], iv);
+                    take(ss[k + 1], iv);
+                    iv.home = ss[k].base;
+                    placed = true;
+                }
+            }
+            if (placed && classes[c].bank == Bank::PrimAttr && !classes[c].inputs) {
+                spilled++;
+            }
+        }
+        if (!placed) {
+            Fail("register budget: " + std::to_string(units.size()) + " units live");
+        }
+        if (iv.home->bank == Bank::Temp) {
+            temp_count = std::max<uint32_t>(temp_count, iv.home->n + u.regs);
+        } else {
+            pa_count = std::max<uint32_t>(pa_count, iv.home->n + u.regs);
+        }
+    }
+}
+
 Reg Lowering::Map(Reg r) const {
     if (!IsVirtual(r)) {
         return r;
     }
-    const Interval& iv = intervals[QuadOf(r)];
+    const uint32_t q = QuadOf(r);
+    if (q < split.size() && split[q]) {
+        const Interval& h = halves[q][(r.n & 3) >> 1];
+        if (!h.home) {
+            Fail("virtual register without a home");
+        }
+        return {h.home->bank, static_cast<uint8_t>(h.home->n + (r.n & 1))};
+    }
+    const Interval& iv = intervals[q];
     if (!iv.home) {
         Fail("virtual register without a home");
     }
@@ -3765,6 +4173,8 @@ LowerResult Lowering::Run(Encoder& e, int level) {
         insts = original;
         quad_count = original_quads;
         intervals.clear();
+        split.clear();
+        halves.clear();
         live.clear();
         coalesced_outputs.clear();
         spilled = temp_count = pa_count = peak_live = peak_at = 0;
@@ -3773,7 +4183,9 @@ LowerResult Lowering::Run(Encoder& e, int level) {
     // at all (1); throws when the registers do not fit.
     const auto lower = [&](int hoist) {
         if (level >= 2) {
-            Liveness();
+            // The dead stores by the lanes each operand reads (as the allocator places them): a
+            // read of a quad's first register is not a read of the rest (the U8 zero beside white).
+            Liveness(true);
             DeadStores();
             Dump("input");
             if (hoist >= 2) {
@@ -3803,12 +4215,17 @@ LowerResult Lowering::Run(Encoder& e, int level) {
             DirectTwoWide();
             Dump("two-wide again");
             InternalDeadWrites();
-            Liveness();
+            Liveness(true);
             DeadStores();
             Dump("final");
         }
-        Liveness();
-        Allocate();
+        if (split_pairs) {
+            Liveness(true);
+            AllocatePairs();
+        } else {
+            Liveness();
+            Allocate();
+        }
     };
     if (level >= 2 && occupancy) {
         // The lowering with the most instances is kept as it ended, and encoded from that.
@@ -3879,6 +4296,7 @@ LowerResult Lowering::Run(Encoder& e, int level) {
         }
     }
     CheckInternals();
+    CheckTemps();
     LowerResult result;
     result.temp_count = temp_count;
     result.pa_count = pa_count;
@@ -3899,6 +4317,7 @@ LowerResult Builder::Lower(Encoder& e, int level) {
     }
     Lowering lowering{insts, cls};
     lowering.skip_auto = skip_invalid_auto;
+    lowering.split_pairs = split_pairs;
     lowering.occupancy = occupancy;
     return lowering.Run(e, level);
 }

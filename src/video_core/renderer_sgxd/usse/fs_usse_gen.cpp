@@ -3452,9 +3452,15 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
         e.PackF16({Reg::Pa(0), 0xf}, Reg::V(TmpOutput), Reg::V(TmpOutput + 2));
     }
 
-    // The quads go to the temporaries, then to primary attributes past the interpolants.
+    // The quads go to the inputs' pairs past their last reference (free: a task's size counts
+    // its primary attributes and its temporaries together, sgxd_program_pixel_dms), then to the
+    // temporaries, then to primary attributes past the interpolants.
+    e.AddClass({Bank::PrimAttr, 0, static_cast<uint8_t>(program.pa_count & ~1u), SIZE_MAX, true});
     e.AddClass({Bank::Temp, 0, 64});
     e.AddClass({Bank::PrimAttr, static_cast<uint8_t>((program.pa_count + 3) & ~3u), 64});
+    // A scalar or a pair in a quad of its own takes two registers, not four: the temporaries
+    // decide how many pixel tasks run at once (the occupancy below).
+    e.split_pairs = true;
     // The second tier keeps the hoisting whose registers let the most pixel tasks run at once
     // (the PDS's count in the draw's sgxd_program_pixel_dms word, 16 written as 0), then the
     // most USE instances: the LUT reads wait one by one, and only other tasks hide that.
