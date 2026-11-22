@@ -35,7 +35,8 @@ PageHolds::PageHolds(Memory::MemorySystem& memory)
     : fcram_host{memory.GetFCRAMPointer(0)},
       vram_host{memory.GetPhysicalPointer(Memory::VRAM_PADDR)},
       fcram_pages{Memory::FCRAM_SIZE >> PageBits},
-      pages{fcram_pages + (Memory::VRAM_SIZE >> PageBits)}, read_ticket(fcram_pages),
+      pages{fcram_pages + (Memory::VRAM_SIZE >> PageBits)}, list_kept(pages),
+      read_ticket(fcram_pages),
       copy_ticket(fcram_pages), copy_lo(fcram_pages), copy_hi(fcram_pages), copy_from(fcram_pages),
       read_lo(fcram_pages), read_hi(fcram_pages), geometry_read(fcram_pages),
       move_ticket(fcram_pages), write_ticket(pages), write_run(pages),
@@ -325,6 +326,9 @@ void PageHolds::Write(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind k
         }
         write_ticket[p] = ticket;
         write_run[p] = first << 16 | count;
+        if (list_kept[p] != 0) {
+            list_writes.push_back({page_addr + lo, page_addr + hi});
+        }
         if (p < fcram_pages) {
             index_stamp[p]++;
             index_watch[p] = 0;
@@ -374,7 +378,7 @@ PageHolds::Access PageHolds::Wanted(u32 page, u32 reached) const {
     }
     const Access holds = HoldsWant(page, reached);
     return (Watched(page) || parse_held[page] != 0 || IndexWatched(page) ||
-            picture_watch[page] != 0) &&
+            picture_watch[page] != 0 || list_kept[page] != 0) &&
                    holds < ReadOnly
                ? ReadOnly
                : holds;
@@ -421,6 +425,31 @@ void PageHolds::ReleaseParsePage(u32 page, u32 count) {
 const u8* PageHolds::HostOf(u32 page) const {
     return page < fcram_pages ? fcram_host + (static_cast<uintptr_t>(page) << PageBits)
                               : vram_host + (static_cast<uintptr_t>(page - fcram_pages) << PageBits);
+}
+
+void PageHolds::KeepList(PAddr addr, u32 bytes) {
+    u32 first, count;
+    if (!PagesOf(addr, bytes, first, count)) {
+        return;
+    }
+    for (u32 p = first; p < first + count; p++) {
+        if (list_kept[p] != 0) {
+            continue;
+        }
+        list_kept[p] = 1;
+        if (applied[p] < ReadOnly) {
+            Change(p, ReadOnly);
+        }
+    }
+}
+
+void PageHolds::UnkeepList(u32 page, u32 reached) {
+    list_kept[page] = 0;
+    const Access wanted = Wanted(page, reached);
+    if (wanted < applied[page]) {
+        Change(page, wanted);
+    }
+    Flush();
 }
 
 void PageHolds::Watch(PAddr addr, u32 bytes) {
@@ -684,7 +713,7 @@ void PageHolds::Reopen(u32 page, u32 reached) {
     Access wanted = Wanted(page, reached);
     // A VRAM page the guest writes opens until the next GPU read of VRAM holds it again.
     if (page >= fcram_pages && wanted == ReadOnly && !Live(vram_read, reached) &&
-        parse_held[page] == 0 && picture_watch[page] == 0) {
+        parse_held[page] == 0 && picture_watch[page] == 0 && list_kept[page] == 0) {
         wanted = Unheld;
         vram_opened.push_back(page);
     }

@@ -311,6 +311,8 @@ public:
         u32 list_ranges;
         u32 list_parsed_max;
         u32 list_draws;
+        u64 list_kept_bytes;
+        u64 list_vram_bytes;
         u64 scan_us;
         u32 index_scans;
         u64 index_scan_indices;
@@ -587,17 +589,34 @@ private:
     bool scan_left_out{};
     bool FirstDrawLeavesOut();
     std::vector<GuestRange> scan_lists;
-    /// Each range's words in scan_words (an 8-byte offset), or NotCopied. A range in guest VRAM
-    /// is copied as the scan meets it, the scan reads the copy, and the list's record carries it
-    /// to the parse: guest VRAM is uncached CDRAM, where the scan's word-at-a-time reads cost
-    /// ~110 ns a word (a game, a game jump into such buffers tens of thousands of times a second),
-    /// and holding their pages for the parse flipped their protection for each list. A range in
-    /// FCRAM is read in place and held until the parse has copied it (HoldParse).
+    /// Each range's words in scan_words, or NotCopied. A range in guest VRAM (uncached, slow to read a
+    /// word at a time) is copied as the scan meets it and the record carries the copy to the parse; a
+    /// range in FCRAM is read in place and held until the parse has copied it.
     std::vector<u32> scan_offsets;
     std::unique_ptr<u8[]> scan_words;
     u32 scan_words_size{};
     u32 scan_words_cap{};
     static constexpr u32 NotCopied = 0xFFFFFFFF;
+    /// The lists' words in guest VRAM as the scan last read them, in cached memory, a bit a word kept.
+    /// A kept word is VRAM's as long as nothing wrote it, and every write is seen: a kept page is
+    /// closed to the guest's and HLE's writes, and a DMA or GPU operation takes a write hold over its
+    /// bytes. A page whose words a write dropped keeps none for ListQuietFrames frames.
+    struct ListKeep {
+        static constexpr u32 ChunkBytes = 64 << 10;
+        static constexpr u32 VramBytes = 0x00600000; ///< Memory::VRAM_SIZE
+        std::array<std::unique_ptr<u8[]>, VramBytes / ChunkBytes> chunks;
+        std::vector<u32> kept;
+        [[nodiscard]] bool Has(PAddr addr, u32 bytes) const;
+        void Read(u8* out, PAddr addr, u32 bytes) const;
+        void Store(PAddr addr, const u8* words, u32 bytes);
+        bool Drop(PAddr lo, PAddr hi);
+        void Clear();
+    };
+    ListKeep list_keep;
+    static constexpr u32 ListQuietFrames = 30;
+    u32 list_frame{};
+    std::vector<u32> list_quiet = std::vector<u32>(ListKeep::VramBytes >> 12);
+    void DropListWrites();
     std::vector<u64>* scan_irqs{};
     void PutScanDraw(const ListDraw& d, const u8* gs);
     void FlushScanDraws();
@@ -897,6 +916,8 @@ private:
     std::atomic<u32> list_ranges{};
     std::atomic<u32> list_parsed_max{};
     std::atomic<u32> list_draws{};
+    std::atomic<u64> list_kept_bytes{};
+    std::atomic<u64> list_vram_bytes{};
     std::atomic<u64> scan_us{};
     std::atomic<u32> index_scans{};
     std::atomic<u64> index_scan_indices{};

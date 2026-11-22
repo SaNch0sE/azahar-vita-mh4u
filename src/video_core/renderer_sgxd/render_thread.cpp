@@ -1215,6 +1215,8 @@ void RenderThread::PutPageRemaps() {
 void RenderThread::StartFramePageHolds() {
     held_colour = {};
     held_depth = {};
+    list_frame++;
+    DropListWrites();
     if (page_holds_on) {
         page_holds.StartFrame(reached.load(std::memory_order_acquire), HoldTicket());
         PutPageRemaps();
@@ -1659,6 +1661,7 @@ void RenderThread::TakeWholeState() {
     // A loaded state's memory: no index range of the memo holds.
     index_memo.fill({});
     frame_buffers.clear();
+    list_keep.Clear();
     // Once the parse thread has read everything queued: it takes the lists after this with the new
     // state, all of it marked changed. The pictures go: guest memory holds every buffer's colour now.
     RunSync([this] {
@@ -1675,14 +1678,104 @@ void RenderThread::GiveWholeState() {
     });
 }
 
+bool RenderThread::ListKeep::Has(PAddr addr, u32 bytes) const {
+    static_assert(VramBytes == Memory::VRAM_SIZE);
+    if (kept.empty()) {
+        return false;
+    }
+    const u32 first = (addr - Memory::VRAM_PADDR) / 4, last = first + bytes / 4 - 1;
+    for (u32 i = first / 32; i <= last / 32; i++) {
+        u32 mask = ~0u;
+        if (i == first / 32) {
+            mask &= ~0u << (first % 32);
+        }
+        if (i == last / 32) {
+            mask &= ~0u >> (31 - last % 32);
+        }
+        if ((kept[i] & mask) != mask) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void RenderThread::ListKeep::Read(u8* out, PAddr addr, u32 bytes) const {
+    for (u32 at = addr - Memory::VRAM_PADDR, end = at + bytes; at < end;) {
+        const u32 n = std::min(end - at, ChunkBytes - at % ChunkBytes);
+        std::memcpy(out, chunks[at / ChunkBytes].get() + at % ChunkBytes, n);
+        out += n;
+        at += n;
+    }
+}
+
+void RenderThread::ListKeep::Store(PAddr addr, const u8* words, u32 bytes) {
+    if (kept.empty()) {
+        kept.resize(VramBytes / 4 / 32);
+    }
+    for (u32 at = addr - Memory::VRAM_PADDR, end = at + bytes; at < end;) {
+        const u32 n = std::min(end - at, ChunkBytes - at % ChunkBytes);
+        auto& chunk = chunks[at / ChunkBytes];
+        if (!chunk) {
+            chunk.reset(new u8[ChunkBytes]);
+        }
+        std::memcpy(chunk.get() + at % ChunkBytes, words, n);
+        words += n;
+        at += n;
+    }
+    const u32 first = (addr - Memory::VRAM_PADDR) / 4, last = first + bytes / 4 - 1;
+    for (u32 i = first / 32; i <= last / 32; i++) {
+        u32 mask = ~0u;
+        if (i == first / 32) {
+            mask &= ~0u << (first % 32);
+        }
+        if (i == last / 32) {
+            mask &= ~0u >> (31 - last % 32);
+        }
+        kept[i] |= mask;
+    }
+}
+
+bool RenderThread::ListKeep::Drop(PAddr lo, PAddr hi) {
+    if (kept.empty() || lo >= hi) {
+        return false;
+    }
+    const u32 first = (lo - Memory::VRAM_PADDR) / 4;
+    const u32 last = (hi - Memory::VRAM_PADDR + 3) / 4 - 1;
+    u32 any = 0;
+    for (u32 i = first / 32; i <= last / 32; i++) {
+        u32 mask = ~0u;
+        if (i == first / 32) {
+            mask &= ~0u << (first % 32);
+        }
+        if (i == last / 32) {
+            mask &= ~0u >> (31 - last % 32);
+        }
+        any |= kept[i] & mask;
+        kept[i] &= ~mask;
+    }
+    return any != 0;
+}
+
+void RenderThread::ListKeep::Clear() {
+    std::fill(kept.begin(), kept.end(), 0u);
+}
+
+void RenderThread::DropListWrites() {
+    auto& writes = page_holds.ListWrites();
+    for (const auto& [lo, hi] : writes) {
+        if (list_keep.Drop(lo, hi)) {
+            list_quiet[(lo - Memory::VRAM_PADDR) >> 12] = list_frame + ListQuietFrames;
+        }
+    }
+    writes.clear();
+}
+
 const u8* RenderThread::ScanList(PAddr addr, u32 size) {
-    // A list, or a buffer it jumps to, a queued DMA still writes waits for it (a game Triple
-    // Deluxe's lists jump into VRAM its DMAs fill each frame: a stale buffer there ended the
-    // list before its P3D, and the game waited for that P3D for good).
-    memory.GuardPhysicalRead(addr, size);
     scan_lists.push_back({addr, size});
     const u8* const guest = memory.GetPhysicalPointer(addr);
     if (addr < Memory::VRAM_PADDR || addr >= Memory::VRAM_PADDR_END) {
+        // A list, or a buffer it jumps to, that a queued DMA still writes waits for it.
+        memory.GuardPhysicalRead(addr, size);
         scan_offsets.push_back(NotCopied);
         return guest;
     }
@@ -1695,15 +1788,39 @@ const u8* RenderThread::ScanList(PAddr addr, u32 size) {
         scan_words = std::move(grown);
         scan_words_cap = cap;
     }
-    std::memcpy(scan_words.get() + at, guest, size);
-#ifdef VITA_DIAGNOSTICS
-    if (static const bool listdiff = SgxdFlag("listdiff"); listdiff) {
-        ListDiff(addr, scan_words.get() + at, size);
+    u8* const words = scan_words.get() + at;
+    const bool keeps = page_holds_on && size != 0 && ((addr | size) & 3) == 0 &&
+                       addr + size <= Memory::VRAM_PADDR_END;
+    if (keeps) {
+        DropListWrites();
     }
+    if (keeps && list_keep.Has(addr, size)) {
+        list_keep.Read(words, addr, size);
+#ifdef VITA_DIAGNOSTICS
+        list_kept_bytes.fetch_add(size, std::memory_order_relaxed);
 #endif
+    } else {
+        memory.GuardPhysicalRead(addr, size);
+        std::memcpy(words, guest, size);
+#ifdef VITA_DIAGNOSTICS
+        list_vram_bytes.fetch_add(size, std::memory_order_relaxed);
+#endif
+        if (keeps) {
+            const u32 first = (addr - Memory::VRAM_PADDR) >> 12;
+            const u32 last = (addr + size - 1 - Memory::VRAM_PADDR) >> 12;
+            bool quiet = false;
+            for (u32 p = first; p <= last; p++) {
+                quiet |= static_cast<s32>(list_quiet[p] - list_frame) > 0;
+            }
+            if (!quiet) {
+                list_keep.Store(addr, words, size);
+                page_holds.KeepList(addr, size);
+            }
+        }
+    }
     scan_words_size = end;
     scan_offsets.push_back(at);
-    return scan_words.get() + at;
+    return words;
 }
 
 bool RenderThread::FirstDrawLeavesOut() {
@@ -2417,6 +2534,17 @@ RenderThread::HeldWrite RenderThread::TakeHeldWrite(u32 page, const u8* host, u3
     // The memo's index lists over the page: their ranges there are stale.
     if (page_holds.IndexWatched(page)) {
         page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
+        if (page_holds.Applied(page) == PageHolds::Unheld) {
+            return opened();
+        }
+    }
+    // The lists' words kept of the page: gone, wherever the write is, and the page no longer closed
+    // for them.
+    if (page_holds.ListKept(page)) {
+        if (list_keep.Drop(address, address + 0x1000)) {
+            list_quiet[(address - Memory::VRAM_PADDR) >> 12] = list_frame + ListQuietFrames;
+        }
+        page_holds.UnkeepList(page, reached.load(std::memory_order_acquire));
         if (page_holds.Applied(page) == PageHolds::Unheld) {
             return opened();
         }
@@ -3694,6 +3822,8 @@ RenderThread::Stats RenderThread::TakeStats() {
     s.list_ranges = list_ranges.exchange(0);
     s.list_parsed_max = list_parsed_max.exchange(0);
     s.list_draws = list_draws.exchange(0);
+    s.list_kept_bytes = list_kept_bytes.exchange(0);
+    s.list_vram_bytes = list_vram_bytes.exchange(0);
     s.scan_us = scan_us.exchange(0);
     s.resource_named = resource_named.exchange(0);
     s.resource_gone = resource_gone.exchange(0);

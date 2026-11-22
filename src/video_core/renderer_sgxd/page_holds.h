@@ -277,6 +277,20 @@ public:
     /// write beside them leaves them as they are.
     [[nodiscard]] bool TouchesWatch(const u8* host, u32 bytes) const;
 
+    /// The lists' scan keeps a copy of the words it read on these VRAM pages
+    /// (RenderThread::ScanList): each is closed to the guest's writes on top of the holds, as a
+    /// watched page is, until the guest or the HLE writes it (the caller drops the words kept of
+    /// it, then UnkeepList opens it as its holds allow). A GPU write hold over a kept page is
+    /// noted with its bytes there (ListWrites), for the scan to drop the words under them.
+    void KeepList(PAddr addr, u32 bytes);
+    [[nodiscard]] bool ListKept(u32 page) const {
+        return list_kept[page] != 0;
+    }
+    void UnkeepList(u32 page, u32 reached);
+    [[nodiscard]] std::vector<std::array<PAddr, 2>>& ListWrites() {
+        return list_writes;
+    }
+
     /// Index lists' write tracking, for the scan's memo of their ranges
     /// (RenderThread::HoldVertices): the FCRAM pages of a list scanned once are watched, closed to
     /// the guest's writes on top of the holds, until a write (the guest's, a store past the holds,
@@ -389,6 +403,9 @@ private:
     u8* vram_host;
     u32 fcram_pages;
     u32 pages;
+
+    std::vector<u8> list_kept;
+    std::vector<std::array<PAddr, 2>> list_writes;
 
     std::vector<u32> read_ticket;  ///< FCRAM pages only (VRAM's reads: vram_read)
     /// FCRAM pages: the last ticket whose CopyRead holds the page, and the bytes those cover,

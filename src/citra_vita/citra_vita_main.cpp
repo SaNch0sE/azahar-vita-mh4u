@@ -2260,11 +2260,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              "perf: command lists: {} ({:.1f} KiB; {:.1f} KiB parsed with the "
                              "buffers they jump to, in {} ranges; {:.1f} KiB the most in one), "
                              "{} draws; the emulation thread's scan {:.1f} ms; index scans {} "
-                             "({} indices, {:.1f} ms), {} ranges from the memo",
+                             "({} indices, {:.1f} ms), {} ranges from the memo; words in VRAM: "
+                             "{:.1f} KiB from the kept copy, {:.1f} KiB read",
                              t.lists, t.list_bytes / 1024.0, t.list_parsed_bytes / 1024.0,
                              t.list_ranges, t.list_parsed_max / 1024.0, t.list_draws,
                              t.scan_us / 1e3, t.index_scans, t.index_scan_indices,
-                             t.index_scan_us / 1e3, t.index_memo_hits);
+                             t.index_scan_us / 1e3, t.index_memo_hits,
+                             t.list_kept_bytes / 1024.0, t.list_vram_bytes / 1024.0);
                     LOG_INFO(Frontend,
                              "perf: resource files: {} named, {} gone, {} known ({:.1f} MiB); "
                              "reads inside them not held: textures {}, indices {}, vertices {}",
