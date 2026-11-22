@@ -7,6 +7,7 @@
 // Refer to the license.txt file included.
 
 #include <array>
+#include <set>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -165,6 +166,169 @@ static void StripTailDirSlashes(std::string& fname) {
     fname.resize(i);
 }
 
+namespace {
+
+#ifdef __vita__
+
+// The console's file system refuses a path with more than ten components below its device:
+// stat, mkdir and open all answer EINVAL (the kernel splits a path into a fixed table). Games
+// nest deeper than that inside the emulated SD card (a save's database may sit twelve
+// components below ux0:). So the components from the tenth on are joined into one name, with
+// a separator that no game path holds:
+//
+//   ux0:/c1/.../c9/c10∕c11∕c12
+//
+// A directory that deep is an empty marker directory under its joined name; its contents sit
+// beside it in the ninth component's directory, and a listing unfolds them. Anything ten
+// components deep or less keeps its plain path.
+constexpr std::size_t MaxDepth = 10;
+constexpr std::string_view FoldSeparator = "∕"; // DIVISION SLASH
+
+struct SplitPath {
+    std::string device; // "ux0:"
+    std::vector<std::string> parts;
+};
+
+SplitPath Split(const std::string& path) {
+    SplitPath split;
+    std::size_t begin = 0;
+    if (const std::size_t colon = path.find(':'); colon != std::string::npos) {
+        split.device = path.substr(0, colon + 1);
+        begin = colon + 1;
+    }
+    while (begin < path.size()) {
+        const std::size_t end = std::min(path.find('/', begin), path.size());
+        const std::string_view part(path.data() + begin, end - begin);
+        if (part == "..") {
+            ASSERT_MSG(!split.parts.empty(), "path leaves its device: {}", path);
+            split.parts.pop_back();
+        } else if (!part.empty() && part != ".") {
+            split.parts.emplace_back(part);
+        }
+        begin = end + 1;
+    }
+    return split;
+}
+
+// The first count components as a plain path.
+std::string Join(const SplitPath& split, std::size_t count) {
+    std::string path = split.device;
+    for (std::size_t i = 0; i < count; ++i) {
+        path += '/';
+        path += split.parts[i];
+    }
+    return path;
+}
+
+// The components from the tenth up to end as one name.
+std::string Fold(const SplitPath& split, std::size_t end) {
+    std::string name;
+    for (std::size_t i = MaxDepth - 1; i < end; ++i) {
+        ASSERT_MSG(split.parts[i].find(FoldSeparator) == std::string::npos,
+                   "path component holds the fold separator: {}", split.parts[i]);
+        if (i != MaxDepth - 1) {
+            name += FoldSeparator;
+        }
+        name += split.parts[i];
+    }
+    // exFAT counts a name's length in UTF-16 units, at most 255.
+    std::size_t units = 0;
+    for (const char c : name) {
+        const u8 b = static_cast<u8>(c);
+        units += ((b & 0xC0) != 0x80) + (b >= 0xF0);
+    }
+    ASSERT_MSG(units <= 255, "folded name too long ({} UTF-16 units): {}", units, name);
+    return name;
+}
+
+std::string HostPath(const std::string& path) {
+    const SplitPath split = Split(path);
+    if (split.parts.size() <= MaxDepth) {
+        return path;
+    }
+    return Join(split, MaxDepth - 1) + '/' + Fold(split, split.parts.size());
+}
+
+// The names in a directory, folded ones cut to their next component.
+std::optional<std::vector<std::string>> ListFolded(const std::string& directory) {
+    const SplitPath split = Split(directory);
+    const std::size_t depth = split.parts.size();
+    if (depth < MaxDepth - 1) {
+        DIR* dirp = opendir(directory.c_str());
+        if (!dirp) {
+            return std::nullopt;
+        }
+        std::vector<std::string> entries;
+        while (dirent* entry = readdir(dirp)) {
+            entries.emplace_back(entry->d_name);
+        }
+        closedir(dirp);
+        return entries;
+    }
+
+    // From the ninth component on, the names live in the ninth component's directory.
+    std::string prefix;
+    if (depth >= MaxDepth) {
+        SceIoStat st{};
+        if (sceIoGetstat(HostPath(directory).c_str(), &st) < 0 || !SCE_S_ISDIR(st.st_mode)) {
+            return std::nullopt;
+        }
+        prefix = Fold(split, depth);
+        prefix += FoldSeparator;
+    }
+    DIR* dirp = opendir(Join(split, MaxDepth - 1).c_str());
+    if (!dirp) {
+        return std::nullopt;
+    }
+    std::vector<std::string> entries;
+    std::set<std::string, std::less<>> seen;
+    while (dirent* entry = readdir(dirp)) {
+        std::string_view name = entry->d_name;
+        if (!name.starts_with(prefix)) {
+            continue;
+        }
+        name.remove_prefix(prefix.size());
+        name = name.substr(0, name.find(FoldSeparator));
+        if (!name.empty() && seen.emplace(name).second) {
+            entries.emplace_back(name);
+        }
+    }
+    closedir(dirp);
+    return entries;
+}
+
+// A directory whose contents fold differently at its new depth moves one file at a time.
+bool MoveTree(const std::string& src, const std::string& dst) {
+    if (!CreateDir(dst)) {
+        return false;
+    }
+    const auto entries = ListFolded(src);
+    if (!entries) {
+        return false;
+    }
+    for (const std::string& name : *entries) {
+        if (name == "." || name == "..") {
+            continue;
+        }
+        const std::string from = src + DIR_SEP + name;
+        const std::string to = dst + DIR_SEP + name;
+        if (IsDirectory(from) ? !MoveTree(from, to) : !Rename(from, to)) {
+            return false;
+        }
+    }
+    return DeleteDir(src);
+}
+
+#else
+
+[[maybe_unused]] const std::string& HostPath(const std::string& path) {
+    return path;
+}
+
+#endif
+
+} // anonymous namespace
+
 
 bool Exists(const std::string& filename) {
     std::string copy(filename);
@@ -187,7 +351,7 @@ bool Exists(const std::string& filename) {
     }
 #else
     struct stat file_info;
-    int result = stat(copy.c_str(), &file_info);
+    int result = stat(HostPath(copy).c_str(), &file_info);
 #endif
 
     return (result == 0);
@@ -215,7 +379,7 @@ bool IsDirectory(const std::string& filename) {
     }
 #else
     struct stat file_info;
-    int result = stat(copy.c_str(), &file_info);
+    int result = stat(HostPath(copy).c_str(), &file_info);
 #endif
 
     if (result < 0) {
@@ -283,7 +447,7 @@ bool Delete(const std::string& filepath) {
         }
     }
 #else
-    if (unlink(filepath.c_str()) == -1) {
+    if (unlink(HostPath(filepath).c_str()) == -1) {
         LOG_ERROR(Common_Filesystem, "unlink failed on {}: {}", filepath, GetLastErrorMsg());
         return false;
     }
@@ -352,7 +516,8 @@ bool CreateDir(const std::string& path_in) {
     // Straight to the kernel call: newlib's mkdir maps every SCE error to errno by its low
     // byte, which turns the console's own diagnosis into a bare "Invalid argument". The raw
     // code is what a failure here needs to show.
-    const int sce = sceIoMkdir(path.c_str(), 0777);
+    const std::string host = HostPath(path);
+    const int sce = sceIoMkdir(host.c_str(), 0777);
     if (sce >= 0) {
         return true;
     }
@@ -374,8 +539,8 @@ bool CreateDir(const std::string& path_in) {
         return fmt::format("mode 0x{:x} attr 0x{:x} size {}", static_cast<u32>(st.st_mode),
                            static_cast<u32>(st.st_attr), static_cast<u64>(st.st_size));
     };
-    LOG_ERROR(Common_Filesystem, "  target: {}", describe(path));
-    LOG_ERROR(Common_Filesystem, "  parent: {}", describe(std::string(GetParentPath(path))));
+    LOG_ERROR(Common_Filesystem, "  target: {}", describe(host));
+    LOG_ERROR(Common_Filesystem, "  parent: {}", describe(std::string(GetParentPath(host))));
     return false;
 #else
     if (mkdir(path.c_str(), 0755) == 0)
@@ -455,7 +620,16 @@ bool DeleteDir(const std::string& filename) {
             return true;
     }
 #else
-    if (rmdir(filename.c_str()) == 0)
+#ifdef __vita__
+    // A directory past the fold is an empty marker whatever it holds: its contents are beside it.
+    if (Split(filename).parts.size() >= MaxDepth) {
+        if (const auto entries = ListFolded(filename); entries && !entries->empty()) {
+            LOG_ERROR(Common_Filesystem, "failed {}: not empty", filename);
+            return false;
+        }
+    }
+#endif
+    if (rmdir(HostPath(filename).c_str()) == 0)
         return true;
 #endif
     LOG_ERROR(Common_Filesystem, "failed {}: {}", filename, GetLastErrorMsg());
@@ -482,7 +656,15 @@ bool Rename(const std::string& srcFullPath, const std::string& destFullPath) {
         }
     }
 #else
-    if (rename(srcFullPath.c_str(), destFullPath.c_str()) == 0)
+#ifdef __vita__
+    // A directory moved to another depth, or one past the fold, changes how its contents fold.
+    if (const std::size_t from = Split(srcFullPath).parts.size(),
+        to = Split(destFullPath).parts.size();
+        (from != to || from >= MaxDepth) && IsDirectory(srcFullPath)) {
+        return MoveTree(srcFullPath, destFullPath);
+    }
+#endif
+    if (rename(HostPath(srcFullPath).c_str(), HostPath(destFullPath).c_str()) == 0)
         return true;
 #endif
     LOG_ERROR(Common_Filesystem, "failed {} --> {}: {}", srcFullPath, destFullPath,
@@ -503,7 +685,7 @@ bool Copy(const std::string& srcFilename, const std::string& destFilename) {
 #else
     auto copy_files = [](const std::string& src, const std::string& dst) -> bool {
         // Open input file
-        FILE* input = FOPEN(src.c_str(), "rb");
+        FILE* input = FOPEN(HostPath(src).c_str(), "rb");
         if (!input) {
             LOG_ERROR(Common_Filesystem, "opening input failed {} --> {}: {}", src, dst,
                       GetLastErrorMsg());
@@ -512,7 +694,7 @@ bool Copy(const std::string& srcFilename, const std::string& destFilename) {
         SCOPE_EXIT({ FCLOSE(input); });
 
         // open output file
-        FILE* output = FOPEN(dst.c_str(), "wb");
+        FILE* output = FOPEN(HostPath(dst).c_str(), "wb");
         if (!output) {
             LOG_ERROR(Common_Filesystem, "opening output failed {} --> {}: {}", src, dst,
                       GetLastErrorMsg());
@@ -596,7 +778,7 @@ u64 GetSize(const std::string& filename) {
         return result;
     }
 #else
-    if (stat(filename.c_str(), &buf) == 0)
+    if (stat(HostPath(filename).c_str(), &buf) == 0)
 #endif
     {
         LOG_TRACE(Common_Filesystem, "{}: {}", filename, buf.st_size);
@@ -684,6 +866,12 @@ std::optional<std::vector<std::string>> ListDirectoryEntries(const std::string& 
     } else {
         return AndroidUtils::GetFilesName(directory);
     }
+}
+
+#elif defined(__vita__)
+
+std::optional<std::vector<std::string>> ListDirectoryEntries(const std::string& directory) {
+    return ListFolded(directory);
 }
 
 #else
@@ -1465,7 +1653,7 @@ bool IOFile::Open() {
     } else {
         mode = plus ? SCE_O_RDWR : SCE_O_RDONLY;
     }
-    const SceUID fd = sceIoOpen(filename.c_str(), mode, 0666);
+    const SceUID fd = sceIoOpen(HostPath(filename).c_str(), mode, 0666);
     m_fd = fd >= 0 ? static_cast<int>(fd) : -1;
     m_good = m_fd >= 0;
 #else

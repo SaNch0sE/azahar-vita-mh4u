@@ -293,7 +293,7 @@ Result SDMCArchive::CreateDirectory(const Path& path, u32 attributes) const {
         break; // Expected 'success' case
     }
 
-    if (FileUtil::CreateDir(mount_point + path.AsString())) {
+    if (FileUtil::CreateDir(full_path)) {
         return ResultSuccess;
     }
 
