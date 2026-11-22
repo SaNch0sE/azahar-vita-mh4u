@@ -6484,6 +6484,7 @@ bool RasterizerSgxd::AccelerateDrawBatch(bool is_indexed) {
 #endif
     const bool drawn = Draw(is_indexed, nullptr, 0);
     scanned_indices.reset();
+    cleaned_geometry = 0;
     gs_indices_set = false;
     return drawn;
 }
@@ -6687,6 +6688,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         PAddr address;
         u32 stride;
         u32 words;
+        u32 loader;
     };
     std::array<Feed, 16> feeds{};
     u32 feed_count = 0;
@@ -6701,7 +6703,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         std::memcpy(immediate_data.cpu, immediate, count * stride);
         for (u32 attr = 0; attr < immediate_attributes; attr++) {
             const u32 reg = regs.vs.GetRegisterForAttribute(attr);
-            feeds[feed_count++] = {reg, immediate_data.gpu + attr * 16, stride, 4};
+            feeds[feed_count++] = {reg, immediate_data.gpu + attr * 16, stride, 4, 0};
             enabled_regs |= static_cast<u16>(1u << reg);
             reg_components[reg] = 4;
         }
@@ -6713,7 +6715,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         for (u32 n = 0; n < layout->count; n++) {
             const VertexLayout::Attribute& a = layout->attributes[n];
             feeds[feed_count++] = {a.reg, base + va.attribute_loaders[a.loader].data_offset + a.offset,
-                                   a.stride, a.words};
+                                   a.stride, a.words, a.loader};
         }
         enabled_regs = layout->enabled_regs;
         u8_regs = layout->u8_regs;
@@ -6823,7 +6825,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
             }
             // The GPU reads them for a draw alone: a geometry draw's stages make their own lists.
             if (gs_indices_set) {
-            } else if (indices_uncached) {
+            } else if (indices_uncached || (cleaned_geometry & (1u << CleanedIndices)) != 0) {
                 indices_gpu = index_address;
                 SgxdCacheSkipped(CacheSite::Vertices, index_bytes);
             } else {
@@ -6889,7 +6891,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
                 (read >= Memory::VRAM_PADDR && read + bytes <= Memory::VRAM_PADDR_END),
             "sgxd: {}: vertices at {:#x}+{:#x} are outside the mapped guest memory", describe(),
             read, bytes);
-        if (guest_memory.IsUncached(read, bytes)) {
+        if (guest_memory.IsUncached(read, bytes) || (cleaned_geometry & (1u << f.loader)) != 0) {
             SgxdCacheSkipped(CacheSite::Vertices, bytes);
         } else {
             backend.ReadsCached(memory.GetPhysicalPointer(read), bytes);

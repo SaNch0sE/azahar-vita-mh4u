@@ -200,16 +200,6 @@ std::string DescribeIndexHold(PAddr page_addr) {
 namespace {
 std::atomic<RenderThread*> live_render_thread{};
 std::atomic<u32> max_screen_skips{2};
-
-/// sgxd_flags vbcached (GPU::VBlank's): geometry pages stay cached, a guest write to them too.
-bool GeometryStaysCached() {
-#ifdef VITA_DIAGNOSTICS
-    static const bool cached = SgxdFlag("vbcached");
-    return cached;
-#else
-    return false;
-#endif
-}
 } // namespace
 
 class RenderThread::ParsedOutput final : public VideoCore::RasterizerInterface {
@@ -248,6 +238,7 @@ public:
             const auto& pipeline = t.parse_pica.regs.internal.pipeline;
             t.held.draws = 1;
             t.held.first_indices = std::exchange(t.parse_indices, DrawIndexRange{});
+            t.held.cleaned = t.held.first_indices.cleaned;
             t.held.vertices.clear();
             for (u32 v = 0; v < pipeline.num_vertices; v++) {
                 t.held.vertices.push_back(static_cast<u16>(pipeline.vertex_offset + v));
@@ -308,6 +299,13 @@ RenderThread::RenderThread(Pica::PicaCore& pica_, Pica::PicaCore& parse_pica_,
     rasterizer.InterruptWaker(wake_flag, WakeBit);
     page_holds.picture_owned = [this](PAddr addr, u32 bytes) {
         return rasterizer.PictureOwns(addr, addr + bytes);
+    };
+    page_holds.wait_ticket = [this](u32 ticket) {
+        // The page's later holds carry the open ticket: no fence here.
+        ASSERT_MSG(ticket != HoldTicket(),
+                   "render thread: a page leaves its versions under the open ticket's reads");
+        InterruptWait(ticket);
+        return reached.load(std::memory_order_acquire);
     };
     page_holds.SetProcessed(&processed);
     rasterizer.guest_indices = [this](PAddr addr, u32 bytes) { return IndexBytes(addr, bytes); };
@@ -696,6 +694,7 @@ bool RenderThread::MergeDraw(bool is_indexed) {
         held.vertices.push_back(static_cast<u16>(pipeline.vertex_offset + v));
     }
     held.draws++;
+    held.cleaned &= parse_indices.cleaned;
     return true;
 }
 
@@ -708,7 +707,7 @@ void RenderThread::FlushRun() {
         ParsedPut(Op::Draw, held.first_indices, 0);
     } else {
         const u32 count = static_cast<u32>(held.vertices.size());
-        u8* p = ParsedBegin(Op::MergedDraw, sizeof(u32) + count * sizeof(u16));
+        u8* p = ParsedBegin(Op::MergedDraw, sizeof(u32) + count * sizeof(u16), held.cleaned);
         std::memcpy(p, &count, sizeof(count));
         std::memcpy(p + sizeof(count), held.vertices.data(), count * sizeof(u16));
         ParsedCommit();
@@ -806,7 +805,7 @@ void GsInvoked(Pica::PicaCore& p) {
 }
 } // namespace
 
-void RenderThread::DrawMerged(const u16* vertices, u32 count) {
+void RenderThread::DrawMerged(const u16* vertices, u32 count, u16 cleaned) {
     // The run as one draw indexed by its vertices' numbers, 16-bit; while b15 is false, the run's first
     // draw alone first.
     auto& regs = render_pica.regs.internal.reg_array;
@@ -822,6 +821,7 @@ void RenderThread::DrawMerged(const u16* vertices, u32 count) {
         rasterizer.GsIndices(reinterpret_cast<const u8*>(vertices + at), true);
         const auto [lo, hi] = std::minmax_element(vertices + at, vertices + at + n);
         rasterizer.ScannedIndices(*lo, *hi);
+        rasterizer.GeometryCleaned(cleaned);
         [[maybe_unused]] const bool drawn = rasterizer.AccelerateDrawBatch(true);
         DEBUG_ASSERT(drawn);
         GsInvoked(render_pica);
@@ -1028,6 +1028,7 @@ bool RenderThread::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& 
     // hold the pool's old bytes.
     if (const u32 out_bytes = config.OutputBytes();
         renderer.WouldMakeUncached(config.GetPhysicalOutputAddress(), out_bytes)) {
+        LeaveVersions(config.GetPhysicalOutputAddress(), out_bytes);
         RunSync([&] {
             renderer.MakeUncached(config.GetPhysicalOutputAddress(), out_bytes, true);
         });
@@ -1154,7 +1155,7 @@ void RenderThread::ClearAll(bool flush) {
     }
 }
 
-void RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
+bool RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
     if (FrameBuffer* const b = InFrameBuffer(addr, bytes)) {
         b->read_ticket = HoldTicket();
 #ifdef VITA_DIAGNOSTICS
@@ -1164,12 +1165,13 @@ void RenderThread::HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
         if (kind == PageHolds::Texture) {
             HoldMoves(addr, bytes);
         }
-        return;
+        return false;
     }
     if (page_holds_on) {
         page_holds.Read(addr, bytes, HoldTicket(), kind);
         PutPageRemaps();
     }
+    return page_holds_on;
 }
 
 void RenderThread::HoldCopyRead(PAddr addr, u32 bytes, PageHolds::Kind kind) {
@@ -1198,6 +1200,16 @@ void RenderThread::HoldMoves(PAddr addr, u32 bytes) {
     if (page_holds_on) {
         page_holds.Moves(addr, bytes, HoldTicket());
     }
+}
+
+void RenderThread::LeaveVersions(PAddr addr, u32 bytes) {
+    if (!page_holds_on || !page_holds.HasCachedVersions(addr, bytes)) {
+        return;
+    }
+    // The reads queued of the pages' homes get their ticket: going home waits for them.
+    InterruptFence();
+    page_holds.LeaveVersions(addr, bytes, HoldTicket());
+    PutPageRemaps();
 }
 
 void RenderThread::PutPageRemaps() {
@@ -1410,11 +1422,12 @@ void RenderThread::HoldVertices(bool is_indexed) {
     // the pass's data: held until then (CopyRead), not until the GPU's fence. 16-bit lists the GPU
     // reads in place.
     const bool gs = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes;
+    u16 cleaned = 0;
     const auto hold_indices = [&](PAddr address, u32 bytes, bool u16) {
         if (!u16 && !gs) {
             HoldCopyRead(address, bytes, PageHolds::Index);
-        } else {
-            HoldRead(address, bytes, PageHolds::Index);
+        } else if (HoldRead(address, bytes, PageHolds::Index)) {
+            cleaned |= 1u << CleanedIndices;
         }
 #ifdef VITA_DIAGNOSTICS
         NoteIndexHold(address, bytes, u16, gs);
@@ -1444,6 +1457,7 @@ void RenderThread::HoldVertices(bool is_indexed) {
                 hold_indices(index_address, index_bytes, pipeline.index_array.format != 0);
             }
         }
+        draw_indices.cleaned = cleaned;
         return;
     }
     if (is_indexed) {
@@ -1506,7 +1520,8 @@ void RenderThread::HoldVertices(bool is_indexed) {
             draw_indices = {a, b, 1};
         }
     }
-    for (const auto& loader : va.attribute_loaders) {
+    for (u32 n = 0; n < std::size(va.attribute_loaders); n++) {
+        const auto& loader = va.attribute_loaders[n];
         if (loader.component_count == 0 || loader.byte_count == 0) {
             continue;
         }
@@ -1518,8 +1533,11 @@ void RenderThread::HoldVertices(bool is_indexed) {
 #endif
             continue;
         }
-        HoldRead(at, (hi - lo + 1) * stride, PageHolds::Vertex);
+        if (HoldRead(at, (hi - lo + 1) * stride, PageHolds::Vertex)) {
+            cleaned |= 1u << n;
+        }
     }
+    draw_indices.cleaned = cleaned;
 }
 
 bool RenderThread::AccelerateDrawBatch(bool) {
@@ -1586,6 +1604,12 @@ bool RenderThread::SubmitCmdList(PAddr addr, u32 size, bool may_leave_out, std::
         }
     }
 #endif
+    // The draws' vertex and index pages the guest wrote: out of the CPU's cache before the list is
+    // the render thread's.
+    if (page_holds_on) {
+        page_holds.CleanGeometry(
+            [this](PAddr page) { return renderer.WouldMakeUncached(page, 0x1000); });
+    }
     const u32 seq = ++list_seq;
     // The words the parse reads in place: until it has copied them, a guest write to their pages takes
     // a copy for it (ParseFault).
@@ -1662,6 +1686,7 @@ void RenderThread::TakeWholeState() {
     index_memo.fill({});
     frame_buffers.clear();
     list_keep.Clear();
+    page_holds.AllWritten();
     // Once the parse thread has read everything queued: it takes the lists after this with the new
     // state, all of it marked changed. The pictures go: guest memory holds every buffer's colour now.
     RunSync([this] {
@@ -2596,15 +2621,21 @@ RenderThread::HeldWrite RenderThread::TakeHeldWrite(u32 page, const u8* host, u3
 #ifdef VITA_DIAGNOSTICS
         host_past += guest ? 0 : 1;
 #endif
+        page_holds.WrittenPast(page, host, bytes);
         return HeldWrite::PastHolds;
     }
     // No version of a closed page: its slot is the one the rows' copy goes to.
     if (closed) {
         return HeldWrite::Wait;
     }
-    // An FCRAM page the GPU still reads takes a version (moved pages only), and the writer goes on at
-    // once; the HLE's writes still due to the page are made first.
-    const bool versionable = fcram && !renderer.WouldMakeUncached(address, 0x1000);
+    // An FCRAM page the GPU still reads takes a version, and the writer goes on at once; the HLE's
+    // writes still due to the page are made first. A moved page, or a cached one that only vertex and
+    // index reads hold (it stays cached, on the cached pool's slots): any other cached page moves with
+    // its work, and waits for it.
+    const bool unmoved = fcram && renderer.WouldMakeUncached(address, 0x1000);
+    const bool cached = unmoved && !moving &&
+                        (page_holds.CachedVersions(page) || page_holds.GeometryReadOnly(page, now));
+    const bool versionable = fcram && (!unmoved || cached);
     // A version opens the whole page for the frame, a watched texture's bytes with it, so the guest's
     // writes there would go unseen: the textures count as written now.
     if (versionable && page_holds.Watched(page)) {
@@ -2619,7 +2650,7 @@ RenderThread::HeldWrite RenderThread::TakeHeldWrite(u32 page, const u8* host, u3
         later_pages.clear();
         done();
     }
-    if (versionable && page_holds.Version(page, now)) {
+    if (versionable && page_holds.Version(page, now, cached)) {
 #ifdef VITA_DIAGNOSTICS
         if (guest) {
             faults++;
@@ -2700,25 +2731,7 @@ bool RenderThread::OpensHeldPage(const u8* host, u32 size, bool write) {
     // Where the guest goes on writing is not known: the textures over the page are marked written and
     // the watch goes, then a version, or the page its own effects open.
     (void)size;
-    bool opened = TakeHeldWrite(page, host, 0, true, false, false) == HeldWrite::Open;
-    // A cached FCRAM page that only queued draws' geometry holds: a version is a moved page's alone,
-    // and the move was the fault's after its wait, which a store beside the held bytes never takes.
-    // Moved here, with no wait: the GPU reads on from the bytes the move copied, and the store takes a
-    // version.
-    if (!opened && !GeometryStaysCached() && page_addr >= Memory::FCRAM_PADDR &&
-        page_addr < Memory::FCRAM_PADDR_END &&
-        page_holds.GeometryReadOnly(page, reached.load(std::memory_order_acquire)) &&
-        renderer.WouldMakeUncached(page_addr, 0x1000)) {
-#ifdef VITA_DIAGNOSTICS
-        GuestGpuMemory::WatchNote("a guest store beside the bytes queued draws read as geometry",
-                                  page_addr, 0x1000);
-#endif
-        AskMove(page_addr, 0x1000);
-#ifdef VITA_DIAGNOSTICS
-        geometry_moves++;
-#endif
-        opened = TakeHeldWrite(page, host, 0, true, false, false) == HeldWrite::Open;
-    }
+    const bool opened = TakeHeldWrite(page, host, 0, true, false, false) == HeldWrite::Open;
 #ifdef VITA_DIAGNOSTICS
     static const bool holdlog = SgxdFlag("holdlog") || SgxdFlagValue("holdlog") != 0;
     static u32 logged = 0;
@@ -2836,15 +2849,6 @@ void RenderThread::AskPictureCopy(PAddr addr, u32 bytes, bool write, bool wait, 
         (write ? AccessWrite : 0u) | (wait ? 0u : AccessNoWait) | (beside ? AccessBeside : 0u));
 }
 
-void RenderThread::AskMove(PAddr addr, u32 bytes) {
-    // The page moves are the render side's, from any thread: served between records.
-    if (sceKernelGetThreadId() == render_tid.load(std::memory_order_relaxed)) {
-        renderer.MakeUncached(addr, bytes, false);
-        return;
-    }
-    Ask(addr, bytes, AccessMove);
-}
-
 void RenderThread::Ask(PAddr addr, u32 bytes, u32 flags) {
     u32 seq;
     {
@@ -2890,10 +2894,6 @@ void RenderThread::ServeGuestAccesses() {
         seq = access_requested.load(std::memory_order_relaxed);
     }
     for (const auto& [addr, bytes, flags] : requests) {
-        if ((flags & AccessMove) != 0) {
-            renderer.MakeUncached(addr, bytes, false);
-            continue;
-        }
         rasterizer.ServeGuestAccess(addr, addr + bytes, (flags & AccessWrite) != 0,
                                     (flags & AccessNoWait) == 0, (flags & AccessBeside) != 0);
     }
@@ -2937,13 +2937,6 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
         return true;
     }
     const PAddr address = page_holds.AddressOf(page);
-    // A write to a cached FCRAM page that only queued draws' geometry reads holds (a buffer the guest
-    // refills while the GPU still draws it): the page moves to CDRAM after this wait, so the next write
-    // takes a version instead.
-    const bool move_after = write && !GeometryStaysCached() && address >= Memory::FCRAM_PADDR &&
-                            address < Memory::FCRAM_PADDR_END &&
-                            page_holds.GeometryReadOnly(page, reached.load(std::memory_order_acquire)) &&
-                            renderer.WouldMakeUncached(address, 0x1000);
 #ifdef VITA_DIAGNOSTICS
     faults++;
     const auto start = Clock::now();
@@ -3017,33 +3010,20 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
     }
     page_holds.Reopen(page, reached.load(std::memory_order_acquire));
     [[maybe_unused]] const PageHolds::Access reopened = page_holds.Applied(page);
-    if (move_after) {
-#ifdef VITA_DIAGNOSTICS
-        GuestGpuMemory::WatchNote("a guest write to a page queued draws read as geometry", address,
-                                  0x1000,
-                                  fmt::format("guest pc {:08x}, address {:08x}", guest_pc, guest_va));
-#endif
-        // On the render thread, which owns the moves: the page's queued reads are done and no write is
-        // queued.
-        AskMove(address, 0x1000);
-#ifdef VITA_DIAGNOSTICS
-        geometry_moves++;
-#endif
-    }
-    [[maybe_unused]] const PageHolds::Access after_move = page_holds.Applied(page);
     // A versioned page the frame closed to writes, written while a GPU write was queued: with that
     // write done the version is taken now.
     if (write && page_holds.Applied(page) != PageHolds::Unheld && address >= Memory::FCRAM_PADDR &&
-        address < Memory::FCRAM_PADDR_END && !renderer.WouldMakeUncached(address, 0x1000)) {
-        page_holds.Version(page, reached.load(std::memory_order_acquire));
+        address < Memory::FCRAM_PADDR_END) {
+        const bool unmoved = renderer.WouldMakeUncached(address, 0x1000);
+        if (!unmoved || page_holds.CachedVersions(page)) {
+            page_holds.Version(page, reached.load(std::memory_order_acquire), unmoved);
+        }
     }
     DEBUG_ASSERT_MSG(page_holds.Applied(page) == PageHolds::Unheld ||
                          (page_holds.Applied(page) == PageHolds::ReadOnly && !write),
                      "render thread: page {} ({:#010x}) still held after its work ({} access): "
-                     "{} after the reopen, {} after the move{}; texture watch {}, index watch "
-                     "{}; {}; {}",
+                     "{} after the reopen; texture watch {}, index watch {}; {}; {}",
                      page, address, write ? "a write" : "a read", static_cast<u32>(reopened),
-                     static_cast<u32>(after_move), move_after ? " (moved)" : "",
                      page_holds.Watched(page), page_holds.IndexWatched(page),
                      page_holds.HoldState(page, reached.load(std::memory_order_acquire)),
                      page_holds.DisplayState(page, reached.load(std::memory_order_acquire)));
@@ -3228,7 +3208,6 @@ RenderThread::HoldStats RenderThread::TakeHoldStats() {
     h.host_past = std::exchange(host_past, 0);
     h.host_versions = std::exchange(host_versions, 0);
     h.versioned_faults = std::exchange(versioned_faults, 0);
-    h.geometry_moves = std::exchange(geometry_moves, 0);
     h.parse_copies = std::exchange(parse_copies, 0);
     h.parse_waits = std::exchange(parse_waits, 0);
     h.parse_wait_us = std::exchange(parse_wait_us, 0);
@@ -4155,6 +4134,7 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         if (indices.scanned != 0) {
             rasterizer.ScannedIndices(indices.lo, indices.hi);
         }
+        rasterizer.GeometryCleaned(indices.cleaned);
         // RasterizerSgxd draws or stops the emulator; the emulation side was told it drew.
         [[maybe_unused]] const bool drawn = rasterizer.AccelerateDrawBatch(head.extra != 0);
         DEBUG_ASSERT(drawn);
@@ -4164,7 +4144,7 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     case Op::MergedDraw: {
         u32 count;
         take(count);
-        DrawMerged(reinterpret_cast<const u16*>(p + sizeof(count)), count);
+        DrawMerged(reinterpret_cast<const u16*>(p + sizeof(count)), count, head.extra);
         break;
     }
     case Op::ImmediateVertex: {

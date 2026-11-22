@@ -213,8 +213,6 @@ public:
         PageHolds::Stats holds;
         u32 faults, fault_waits;
         u32 versioned_faults; ///< of the aborts, those a page version took
-        /// Geometry pages moved to CDRAM for a write.
-        u32 geometry_moves;
         /// Writes to a handed-over list's page: copies taken for the parse, and waits for a parse.
         u32 parse_copies, parse_waits;
         u64 parse_wait_us;
@@ -238,6 +236,10 @@ public:
     HoldStats TakeHoldStats();
 #endif
     std::vector<std::pair<PAddr, u32>> TakeCachedReads() override;
+    /// Before a move of [addr, addr + bytes)'s FCRAM pages to CDRAM that no hold announces: their
+    /// versions of the cached pool given up (PageHolds::LeaveVersions). From the emulation thread,
+    /// outside an operation's holds.
+    void LeaveVersions(PAddr addr, u32 bytes);
     void LoadDefaultDiskResources(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) override;
     void SwitchDiskResources(u64 title_id) override;
@@ -463,12 +465,9 @@ private:
     /// A guest or HLE access to [addr, addr + bytes) where a picture owns rows, from any thread: the
     /// render side copies them into guest memory before this returns.
     void AskPictureCopy(PAddr addr, u32 bytes, bool write, bool wait = true, bool beside = false);
-    /// [addr, addr + bytes)'s FCRAM pages moved to CDRAM by the render side, this thread waiting.
-    void AskMove(PAddr addr, u32 bytes);
     /// A request for the render side, served between its records; waited for unless AccessNoWait.
     static constexpr u32 AccessWrite = 1;
     static constexpr u32 AccessNoWait = 2;
-    static constexpr u32 AccessMove = 4;
     static constexpr u32 AccessBeside = 8;
     void Ask(PAddr addr, u32 bytes, u32 flags);
     void ServeGuestAccesses();
@@ -500,7 +499,8 @@ private:
     [[nodiscard]] u32 HoldTicket() const {
         return tickets + 1;
     }
-    void HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind);
+    /// Whether the range's pages are held (not one of the game's frame buffers, held by its turns).
+    bool HoldRead(PAddr addr, u32 bytes, PageHolds::Kind kind);
     void HoldWrite(PAddr addr, u32 bytes, PageHolds::Kind kind);
     void HoldMoves(PAddr addr, u32 bytes);
     void HoldDraw(const DrawTextures& textures, u32 count, bool vertices, bool is_indexed);
@@ -543,12 +543,16 @@ private:
     };
     std::array<IndexMemo, 4096> index_memo{};
     /// A draw's 16-bit indices' range as HoldVertices scanned it (scanned 0: not), sent with the draw
-    /// so the render thread does not scan them again.
+    /// so the render thread does not scan them again; and the ranges of the draw whose pages the holds
+    /// cleaned out of the CPU's cache (PageHolds::CleanGeometry), which the render thread reads as
+    /// they are: bit n the attribute loader n's, bit CleanedIndices the 16-bit index list's.
     struct DrawIndexRange {
         u16 lo;
         u16 hi;
-        u32 scanned;
+        u16 scanned;
+        u16 cleaned;
     };
+    static constexpr u32 CleanedIndices = 12;
     DrawIndexRange draw_indices{};
     DrawIndexRange parse_indices{};
     const u8* parse_gs{};
@@ -559,6 +563,7 @@ private:
     struct HeldRun {
         u32 draws = 0;
         DrawIndexRange first_indices{}; ///< sent as its own Draw when the run is that one
+        u16 cleaned{};                  ///< the loaders' ranges every draw of the run had cleaned
         std::vector<u16> vertices;
         decltype(Pica::RegsInternal::reg_array) regs{}; ///< as the run's first draw left them
     };
@@ -568,7 +573,7 @@ private:
     bool RunsDraw(bool is_indexed) const;
     bool MergeDraw(bool is_indexed);
     void FlushRun();
-    void DrawMerged(const u16* vertices, u32 count);
+    void DrawMerged(const u16* vertices, u32 count, u16 cleaned);
 
     /// The scan's decision on a list's draw, in the scan's order: whether it is dropped (late skip,
     /// right eye), the report to the rasterizer, its indices' range, and a geometry draw's indices as
@@ -704,7 +709,7 @@ private:
 #ifdef VITA_DIAGNOSTICS
     u32 faults{}, fault_waits{}, host_waits{}, versioned_faults{};
     u32 host_past{}, host_versions{};
-    u32 geometry_moves{}, parse_copies{}, parse_waits{};
+    u32 parse_copies{}, parse_waits{};
     u64 parse_wait_us{};
     u32 copy_faults{};
     u32 copy_bytes{};

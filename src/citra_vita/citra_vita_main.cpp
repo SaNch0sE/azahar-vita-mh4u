@@ -2388,14 +2388,14 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     LOG_INFO(Frontend,
                              "perf: page holds: azaharHold {} calls, {} runs, {} descriptors; "
                              "{} pages held, {} let go; guest aborts {} ({} versioned, {} "
-                             "waited, {:.1f} ms; {} geometry pages moved; {} list pages copied "
+                             "waited, {:.1f} ms; {} list pages copied "
                              "for the parse thread, {} waits for a parse ({:.1f} ms), {} copies "
                              "for the render thread's CPU reads ({} bytes)), HLE waits {} "
                              "({:.1f} ms), HLE writes past the holds {}, onto a version {}",
                              hs.holds.calls, hs.holds.runs, hs.holds.descriptors,
                              hs.holds.held_pages, hs.holds.released_pages, hs.faults,
                              hs.versioned_faults, hs.fault_waits, hs.fault_wait_us / 1e3,
-                             hs.geometry_moves, hs.parse_copies, hs.parse_waits,
+                             hs.parse_copies, hs.parse_waits,
                              hs.parse_wait_us / 1e3, hs.copy_faults, hs.copy_bytes,
                              hs.host_waits, hs.host_wait_us / 1e3, hs.host_past,
                              hs.host_versions);
@@ -2406,10 +2406,16 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     LOG_INFO(Frontend,
                              "perf: page versions: azaharFlip {} calls; {} versioned, {} swaps, "
                              "{} written in place under queued reads, {} in place; remaps {} at "
-                             "frame starts, {} early; {} home; {} slots in use",
+                             "frame starts, {} early; {} home; {} slots in use; cached "
+                             "geometry: {} slots in use, {} pages cleaned at their reads "
+                             "(stores past the holds alone {} on {} lines, with another cause "
+                             "{}, flips {}, other {}), {} pages left their versions",
                              hs.holds.flip_calls, hs.holds.versions, hs.holds.swaps,
                              hs.holds.in_place_read, hs.holds.in_place, hs.holds.frame_remaps,
-                             hs.holds.early_remaps, hs.holds.homes, hs.holds.slots_used);
+                             hs.holds.early_remaps, hs.holds.homes, hs.holds.slots_used,
+                             hs.holds.cached_slots_used, hs.holds.cleaned_pages,
+                             hs.holds.cleaned_past, hs.holds.past_lines, hs.holds.cleaned_past_and,
+                             hs.holds.cleaned_flip, hs.holds.cleaned_other, hs.holds.left_versions);
                     std::string by_kind;
                     for (u32 k = 0; k < SgxdRenderer::PageHolds::Kinds; k++) {
                         if (hs.fault_kinds[k] != 0) {

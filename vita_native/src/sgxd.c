@@ -614,7 +614,8 @@ static uint32_t sgxd_user_par(uint32_t uva) {
     return par;
 }
 
-static int sgxd_user_page(uint32_t uva, int write, uint32_t *pa, uint32_t *par_out) {
+static int sgxd_user_page(uint32_t uva, int write, int cache_clean, uint32_t *pa,
+                          uint32_t *par_out) {
     SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
     const uint32_t d = rd_dacr();
     wr_dacr(dacr_grant_all(d));
@@ -629,7 +630,7 @@ static int sgxd_user_page(uint32_t uva, int write, uint32_t *pa, uint32_t *par_o
         *(k ? &base_par : &par) = rd_par();
     }
     par = par_large_page(uva, par, base_par);
-    if (!PAR_FAULTED(par)) {
+    if (!PAR_FAULTED(par) && cache_clean) {
         ksceKernelDcacheCleanRange((void *)(uintptr_t)uva, 0x1000);
     }
     wr_dacr(d);
@@ -671,7 +672,7 @@ static int sgxd_map_locked(uint32_t gpu_va, uint32_t uva, uint32_t size, uint32_
     }
     for (uint32_t off = 0; off < size; off += 0x1000) {
         uint32_t pa = 0, par = 0;
-        if (sgxd_user_page(uva + off, !(flags & SGXD_MAP_READONLY), &pa, &par) != 0) {
+        if (sgxd_user_page(uva + off, !(flags & SGXD_MAP_READONLY), 1, &pa, &par) != 0) {
             SGXD_LOG("map: user %08x does not translate (par %08x)\n", uva + off, par);
             for (uint32_t undo = 0; undo < off; undo += 0x1000) {
                 *sgxd_mmu_pte(gpu_va + undo) = 0;
@@ -1665,7 +1666,7 @@ out:
     return ret;
 }
 
-int sgxdPte(uint32_t gpu_va, const void *user_va, uint32_t user_out[2]) {
+int sgxdPte(uint32_t gpu_va, const void *user_va, uint32_t flags, uint32_t user_out[2]) {
     uint32_t state;
     ENTER_SYSCALL(state);
     int ret = sgxd_enter();
@@ -1676,10 +1677,10 @@ int sgxdPte(uint32_t gpu_va, const void *user_va, uint32_t user_out[2]) {
         const volatile uint32_t *pte = sgxd_mmu ? sgxd_mmu_pte(gpu_va) : NULL;
         uint32_t pa = 0, par = 0;
         if (!sgxd_tables_va || !pte || !(*pte & SGXD_PTE_VALID) ||
-            ((uint32_t)(uintptr_t)user_va & 0xfffu)) {
+            ((uint32_t)(uintptr_t)user_va & 0xfffu) || (flags & ~SGXD_PTE_NO_CACHE_CLEAN)) {
             ret = AZAHAR_ERR_ARG;
-        } else if (sgxd_user_page((uint32_t)(uintptr_t)user_va, !(*pte & SGXD_MAP_READONLY), &pa,
-                                  &par) != 0) {
+        } else if (sgxd_user_page((uint32_t)(uintptr_t)user_va, !(*pte & SGXD_MAP_READONLY),
+                                  !(flags & SGXD_PTE_NO_CACHE_CLEAN), &pa, &par) != 0) {
             ret = AZAHAR_ERR_PAGE;
         } else {
             const uint32_t out[2] = {

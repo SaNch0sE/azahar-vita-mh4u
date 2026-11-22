@@ -984,6 +984,7 @@ void GPU::KeepUncached(PAddr addr, u32 size) {
     // thread waits for it); the GPU's mapping follows in its own order (GuestGpuMemory), without
     // an idle.
     if (impl->renderer->WouldMakeUncached(addr, size)) {
+        impl->render->LeaveVersions(addr, size);
         impl->render->RunSync([&] { impl->renderer->MakeUncached(addr, size, false); });
     }
 }
@@ -1032,25 +1033,18 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     if (impl->renderer->UncachedFrameEnded()) {
         impl->render->RunSync([this] { impl->renderer->ReturnUncached(); });
     }
-    // Vertex and index buffers the GPU read from cached FCRAM since the last vblank move to
-    // uncached memory once, so later draws from them need no clean.
-#ifdef VITA_DIAGNOSTICS
-    // sgxd_flags vbcached: they stay cached, each draw cleaning them, for an A/B of the guest's own
-    // work on those pages.
-    static const bool vb_cached = SgxdRenderer::SgxdFlag("vbcached");
-#else
-    constexpr bool vb_cached = false;
-#endif
+    // Vertex and index buffers the draws cleaned since the last vblank, those no page holds cover
+    // (the game's resource files and per-frame buffers), move to uncached memory once, so later
+    // draws from them need no clean. The held ones stay cached: their holds clean what the guest
+    // wrote (PageHolds::CleanGeometry).
     for (const auto& [addr, size] : impl->rasterizer->TakeCachedReads()) {
-#ifdef VITA_DIAGNOSTICS
-        if (!vb_cached && impl->renderer->WouldMakeUncached(addr, size)) {
-            SgxdRenderer::GuestGpuMemory::WatchNote("vertex or index buffers read since the vblank",
-                                                    addr, size);
+        if (!impl->renderer->WouldMakeUncached(addr, size)) {
+            continue;
         }
-#endif
-        if (!vb_cached) {
-            KeepUncached(addr, size);
-        }
+        const PAddr range = addr;
+        const u32 bytes = size;
+        impl->render->LeaveVersions(range, bytes);
+        impl->render->RunSync([&] { impl->renderer->MakeUncached(range, bytes, false); });
     }
     // The LCD's picture comes from the GPU's present: kept uncached, it needs no clean
     // before each one. The LCD scans 400 columns on the top screen, 320 on the bottom.

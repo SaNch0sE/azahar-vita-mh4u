@@ -59,11 +59,8 @@ public:
     static constexpr u32 StaleFrames = 1000;
 
     /// What a move needs of the render side (RenderThread sets them; a move runs on the render
-    /// thread, or with it held as every return does, its side on the caller's): waiting for the GPU
-    /// writes queued to a range; the GPU's own remap of PTE words (sgxdPte pairs) in its queue's
-    /// order, returning a fence the work queued with it is done by; that fence reached, and a wait
-    /// for it; whether page versions hold a moved FCRAM page (PageHolds::Versioned), which does not
-    /// go back until they let it go.
+    /// thread, or with it held as every return does). Page versions' pages (PageHolds::Versioned)
+    /// neither go back nor move.
     struct MoveHooks {
         /// The GPU's queued writes to [addr, addr + size) landed: before a move's copy, or a
         /// return's (`moved`: the pages are in the pool, where the GPU's passes write too).

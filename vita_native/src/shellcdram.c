@@ -484,9 +484,9 @@ int azaharShellCdram(uint32_t *user_va) {
         reback_tlb_flush_all();
         // The view must be the shell's pages.
         uint32_t first = 0, last = 0, par = 0;
-        int got = sgxd_user_page(uva, 1, &first, &par);
+        int got = sgxd_user_page(uva, 1, 1, &first, &par);
         if (got >= 0) {
-            got = sgxd_user_page(uva + SHELLCDRAM_SIZE - 0x1000, 1, &last, &par);
+            got = sgxd_user_page(uva + SHELLCDRAM_SIZE - 0x1000, 1, 1, &last, &par);
         }
         if (got < 0 || first != SHELLCDRAM_PA || last != SHELLCDRAM_PA + SHELLCDRAM_SIZE - 0x1000) {
             SGXD_LOG("shell CDRAM: saved to %p; the app's view at %08x (level-1 %08x -> %08x), "

@@ -159,6 +159,13 @@ public:
     void ScannedIndices(u32 lo, u32 hi) {
         scanned_indices = {lo, hi};
     }
+    /// The next draw's ranges in cached FCRAM that were cleaned out of the CPU's cache when the
+    /// draw was queued (PageHolds::CleanGeometry): bit n the attribute loader n's vertices, bit
+    /// CleanedIndices its 16-bit index list. They are read as they are, and stay cached.
+    static constexpr u32 CleanedIndices = 12;
+    void GeometryCleaned(u16 ranges) {
+        cleaned_geometry = ranges;
+    }
     /// The next draw's indices as the guest had them at the draw (a geometry draw's).
     void GsIndices(const u8* indices, bool index_u16) {
         const u32 bytes = regs.pipeline.num_vertices * (index_u16 ? 2u : 1u);
@@ -914,6 +921,7 @@ private:
     bool fragment_regs_dirty = true;
     bool layout_regs_dirty = true;
     std::optional<std::pair<u32, u32>> scanned_indices;
+    u16 cleaned_geometry = 0;
     std::vector<u8> gs_indices;
     bool gs_indices_set = false;
     /// The second tier's programs of earlier runs. Before the tiers, whose workers read and

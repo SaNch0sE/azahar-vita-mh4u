@@ -178,14 +178,15 @@ int sgxdTranslate(uint32_t gpu_va, uint32_t out[2]);
 // Remaps the GPU does itself (version 14; azahar's page versions): sgxdMapTables maps sgxd's
 // page directory and tables (SGXD_MMU_BYTES, physically one block, uncached for the CPU) at
 // gpu_va, CACHECONSISTENT, so that a list's STORE reaches memory past the SLC and the walker
-// reads it after an invalidate. With the GPU idle, once. sgxdPte gives a mapped page's remap:
-// out[0] the GPU address of gpu_va's PTE in that mapping, out[1] the PTE naming the physical
-// page behind the app's user_va with gpu_va's flags. The GPU stores it in its queue's order; the
-// kernel's own bookkeeping of the mapping (sgxdMap's ranges, a page move's retarget) does not
-// follow, so the app puts every such PTE back before it moves or unmaps the page.
+// reads it after an invalidate. With the GPU idle, once. sgxdPte: out[0] the GPU address of
+// gpu_va's PTE in that mapping, out[1] the PTE naming the physical page behind user_va with
+// gpu_va's flags, the page cache-cleaned first unless SGXD_PTE_NO_CACHE_CLEAN (version 100).
+// The kernel's bookkeeping (sgxdMap's ranges, a page move's retarget) does not follow such a
+// store, so the app puts every such PTE back before it moves or unmaps the page.
 #define SGXD_MMU_BYTES ((1u + SGXD_MAP_TABLES) * 0x1000u)
 int sgxdMapTables(uint32_t gpu_va);
-int sgxdPte(uint32_t gpu_va, const void *user_va, uint32_t out[2]);
+#define SGXD_PTE_NO_CACHE_CLEAN 0x1u
+int sgxdPte(uint32_t gpu_va, const void *user_va, uint32_t flags, uint32_t out[2]);
 // A system suspend while the app holds the GPU (version 16): sgxd takes its side down and the
 // shell gets its CDRAM back, the app's contents kept; every sgxd call of the app's then waits
 // instead of failing. The app takes the GPU again with sgxdTake (its shell CDRAM back with it),

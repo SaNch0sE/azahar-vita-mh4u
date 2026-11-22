@@ -37,21 +37,15 @@ namespace SgxdRenderer {
  * Guest VRAM is held for reads as a whole and for writes page by page; a write clear of the bytes
  * VRAM's live reads cover (vram_reads) goes past the holds.
  *
- * Page versions, per frame: an FCRAM page the GPU reads gets
- * more physical pages (Slots: its home and slots of a CDRAM pool), the first allocated the first
- * time the guest writes it while queued work reads it, the next when every slot it has is read.
- * A versioned page is protected by the frame, not by the work: armed (closed to writes) at each
- * frame's start (the vblank), open once the guest has written it in the frame. The first write
- * of a frame swaps the guest's mapping (the app's view and every guest window, azaharFlip) onto
- * a slot no queued work reads, its bytes copied there, when queued work reads the guest's slot;
- * the GPU's MMU keeps the slot its queued work reads, and the page is marked changed. With every
- * slot read, the write goes into the guest's slot, without a wait (queued work that reads it may
- * see the newer bytes). At the next frame's start the GPU's MMU is
- * remapped onto the changed pages' slots in one batch, in the GPU's queue order (Remaps: the
- * microkernel stores the PTEs and invalidates the MMU, sgxd_remap_submit). A changed page that
- * work later in the same frame reads or writes is remapped before that work, and stays open. A
- * page no GPU work has used for ConvergeFrames frames goes home and gives its slot back. Only
- * pages already moved to CDRAM are versioned (GuestGpuMemory): no slot then needs cache work.
+ * Page versions, per frame: an FCRAM page the GPU reads gets more physical pages (Slots: its home
+ * and slots of a pool). A versioned page is armed (closed to writes) at each vblank; its first
+ * write in a frame swaps the guest's mapping onto a slot no queued work reads (azaharFlip), while
+ * the GPU's MMU keeps its slot until the next frame's start remaps it (Remaps). A page the GPU has
+ * not used for ConvergeFrames frames goes home.
+ *
+ * Vertex and index pages take slots from a cached pool and are protected by the work, not the
+ * frame: their lines are cleaned out of the CPU's cache before the reading work is queued
+ * (CleanGeometry; docs/sgxd/memory.md).
  *
  * Emulation side only, under the GPU's lock, while the first emulation thread's guest is stopped
  * (Apply). The second emulation thread's guest runs on: a page whose bytes move has them moved by
@@ -186,12 +180,38 @@ public:
         return write_ticket[page];
     }
     /// Whether an FCRAM page's live holds are reads of vertices or indices alone, no GPU write
-    /// queued: a guest write that waits on it waits for draws reading geometry it fills again
-    /// (RenderThread::PageFault).
+    /// queued: a guest write to it, cached, takes a version of the cached pool.
     [[nodiscard]] bool GeometryReadOnly(u32 page, u32 reached) const {
-        return page < fcram_pages && geometry_read[page] != 0 &&
-               !Live(write_ticket[page], reached) && Live(read_ticket[page], reached);
+        return page < fcram_pages && Live(read_ticket[page], reached) &&
+               !Live(other_read[page], reached) && !Live(write_ticket[page], reached);
     }
+    [[nodiscard]] bool CachedVersions(u32 page) const {
+        return page < fcram_pages && versions[page].on && versions[page].cached;
+    }
+    [[nodiscard]] bool HasCachedVersions(PAddr addr, u32 bytes) const;
+    /// The cached-pool versions of [addr, addr + bytes)'s pages given up before a move of the
+    /// range that no hold announces, the GPU's MMU home from `ticket`'s work on.
+    void LeaveVersions(PAddr addr, u32 bytes, u32 ticket);
+    /// Waits for the GPU's work up to a closed ticket and returns the last ticket reached: a page
+    /// that leaves its versions takes the guest's bytes home, after the queued work that reads
+    /// the home's.
+    std::function<u32(u32 ticket)> wait_ticket;
+    /// The pages vertex and index reads have found written since the last call: closed in the
+    /// module first (the second emulation thread's guest writes them until then), then their
+    /// lines cleaned, of those `cached` names (FCRAM not moved to CDRAM). Before the reads' work
+    /// is queued: it reads them as they are (the page the GPU's MMU names then may no longer be
+    /// the one the app's view shows).
+    void CleanGeometry(const std::function<bool(PAddr)>& cached);
+    void WrittenPast(u32 page, [[maybe_unused]] const u8* host, [[maybe_unused]] u32 bytes) {
+        if (page < fcram_pages) {
+            written[page] = 1;
+#ifdef VITA_DIAGNOSTICS
+            NotePast(page, host, bytes);
+#endif
+        }
+    }
+    /// Guest memory was written past the holds as a whole (a loaded state).
+    void AllWritten();
     /// A guest access at host on an FCRAM page whose live holds are all the display's (a display
     /// transfer's output, the present's reads), the `reach` bytes its instruction may touch from
     /// host on clear of their bytes: the page opens until its next hold. A screen's framebuffer is
@@ -308,12 +328,12 @@ public:
     void IndexWritten(u32 page, u32 reached);
     static constexpr u32 IndexQuietFrames = 30;
 
-    /// A write onto FCRAM page `page`, moved to CDRAM (the caller checks): the guest's that
-    /// aborted, or the HLE's before it writes through the app's view (which the swap moves with the
-    /// guest's windows). Whether the page is open to the write now, swapped onto a free slot or
-    /// written in place. Not taken, the ordinary holds decide (a GPU write queued, or a page no
-    /// queued work reads).
-    bool Version(u32 page, u32 reached);
+    /// A write onto FCRAM page `page`, moved to CDRAM or (`cached`) one only vertex and index
+    /// reads hold (the caller checks): the guest's that aborted, or the HLE's before it writes
+    /// through the app's view (which the swap moves with the guest's windows). Whether the page is
+    /// open to the write now, swapped onto a free slot or written in place. Not taken, the ordinary
+    /// holds decide (a GPU write queued, or a page no queued work reads).
+    bool Version(u32 page, u32 reached, bool cached);
     /// A remap of the GPU's MMU the holds asked for: the GPU address of the page's PTE in
     /// sgxd's mapped tables and the PTE word naming the guest's page (sgxdPte), for the GPU to
     /// store before the work that reads or writes the page; and whether work queued since the
@@ -329,8 +349,8 @@ public:
         return remaps;
     }
     /// A frame starts (the vblank): the changed pages' remaps for `ticket` (the next fence's),
-    /// the versioned pages armed again, and pages no GPU work has used for ConvergeFrames frames
-    /// back home.
+    /// the CDRAM pool's versioned pages armed again, and pages no GPU work has used for
+    /// ConvergeFrames frames back home.
     void StartFrame(u32 reached, u32 ticket);
     static constexpr u32 ConvergeFrames = 60;
     /// Whether the FCRAM page has slots besides its home: the guest's view or the GPU's may be
@@ -349,6 +369,8 @@ public:
         u32 calls, runs, descriptors, held_pages, released_pages;
         u32 flip_calls, versions, swaps, in_place_read, in_place, frame_remaps, early_remaps, homes,
             slots_used;
+        u32 cached_slots_used, cleaned_pages, left_versions;
+        u32 cleaned_past, cleaned_past_and, cleaned_flip, cleaned_other, past_lines;
     };
     Stats TakeStats();
     /// The kind of the hold an access to the page waits for (WaitFor's ticket): the last
@@ -390,11 +412,17 @@ private:
     /// next Flush; with `copy`, the bytes the page shows go along (the module copies them before
     /// the guest's windows follow, the guest's writes refused meanwhile).
     void Flip(u32 page, u16 slot, bool copy = false);
-    [[nodiscard]] u16 AllocSlot();
+    [[nodiscard]] u16 AllocSlot(bool cached);
+    void FreeSlot(u16 slot);
+    /// A cached-pool page's versions given up: the guest home with its bytes, the GPU's MMU home
+    /// from `ticket`'s work on, the slots back once the work queued before has read them.
+    void LeaveVersions(u32 page, u32 ticket);
     [[nodiscard]] u8* SlotHost(u16 slot) const;
     /// The GPU's MMU onto the guest's slot of `page` before the work of `ticket` (a Remap); the
-    /// slot it leaves is read by queued work up to that ticket.
-    void RemapToGuest(u32 page, u32 ticket);
+    /// slot it leaves is read by queued work up to that ticket. Without `cache_clean`, a
+    /// cached-pool page written since its last cache clean: its next vertex or index read
+    /// cache-cleans it (CleanGeometry), before the work that reads the slot is queued.
+    void RemapToGuest(u32 page, u32 ticket, bool cache_clean);
     [[nodiscard]] bool Changed(u32 page) const {
         return versions[page].on && versions[page].guest != versions[page].gpu;
     }
@@ -424,8 +452,12 @@ private:
     /// FCRAM pages: the bytes its GPU reads cover, as write_lo and write_hi for the writes,
     /// merged while its last read ticket is live (StoreMisses).
     std::vector<std::array<u16, 2>> read_lo, read_hi;
-    /// FCRAM pages: whether the last read hold was a vertex or index read (GeometryReadOnly).
-    std::vector<u8> geometry_read;
+    std::vector<u32> other_read;
+    /// FCRAM pages: nonzero while the CPU's cache may hold lines of the page newer than memory:
+    /// since the guest's view opened to writes, a store went past the holds or the view moved
+    /// to another slot. CleanGeometry clears it.
+    std::vector<u8> written;
+    std::vector<u32> to_clean;
     std::vector<u32> move_ticket;
     void NoteMove(u32 p, u32 ticket) {
         move_ticket[p] = ticket;
@@ -486,10 +518,12 @@ private:
     bool batch{};
     std::vector<std::array<u32, 3>> calls_runs;
 
-    /// A page's versions: its slots (0 the home, the rest pages of the pool, NoSlot until used),
+    /// A page's versions: its slots (0 the home, the rest pages of the CDRAM pool, or of the
+    /// cached one: `cached`, slot numbers from CachedSlot on; NoSlot until used),
     /// the ticket up to which queued work reads each slot the GPU has left, which slot the guest
     /// (and the app) is on and which the GPU's MMU names as of the work queued, whether it is armed
-    /// (closed to writes) this frame, and the frame of its last GPU use. Five slots: the GPU runs
+    /// (closed to writes: this frame, or by a read since its last write when `cached`), and the
+    /// frame of its last GPU use. Five slots: the GPU runs
     /// up to four frames behind the guest (RenderThread::LeadFramesBack), each frame's work reading
     /// the slot of its own frame, so a page the guest rewrites each frame needs a fifth to write.
     static constexpr u16 NoSlot = 0xffff;
@@ -506,13 +540,17 @@ private:
         u8 gpu{};
         bool armed{};
         bool on{};
+        bool cached{};
         bool direct{}; ///< queued work read or wrote the GPU's slot other than as a texture
         u32 use_frame{};
     };
     std::unique_ptr<Common::HostSharedMemory> version_pool;
+    std::unique_ptr<Common::HostSharedMemory> cached_pool;
     std::vector<PageVersion> versions;
     std::vector<u32> versioned;
     std::vector<u16> free_slots;
+    std::vector<u16> free_cached_slots;
+    std::vector<std::pair<u16, u32>> retired_slots;
     std::vector<Remap> remaps;
     /// azaharFlip's runs for the next Flush: (app address with AZAHAR_FLIP_COPY or not,
     /// version's app address or 0).

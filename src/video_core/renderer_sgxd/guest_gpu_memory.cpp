@@ -235,7 +235,7 @@ u32 GuestGpuMemory::RemapGpu(u32 page, u32 count) {
         for (; n < SGXD_REMAP_MAX && k < count; n++, k++) {
             const PAddr addr = Memory::FCRAM_PADDR + (page + k) * PageSize;
             u32 out[2];
-            const int r = sgxdPte(addr, fcram + (page + k) * PageSize, out);
+            const int r = sgxdPte(addr, fcram + (page + k) * PageSize, 0, out);
             ASSERT_MSG(r == 0, "sgxd: no GPU remap of FCRAM {:#010x}: {:#010x}", addr,
                        static_cast<u32>(r));
             pte_va[n] = out[0];
@@ -293,6 +293,13 @@ u32 GuestGpuMemory::ReturnPages(const std::vector<std::pair<u32, u32>>& pages) {
         ASSERT_MSG(ret == static_cast<int>(run),
                    "sgxd: returning FCRAM {:#010x}+{:#x} from CDRAM failed ({:#010x})",
                    Memory::FCRAM_PADDR + page * PageSize, run * PageSize, static_cast<u32>(ret));
+        // The copy back went through the CPU's cache: out to memory, where the GPU reads vertex
+        // and index pages with no clean of its own (PageHolds::CleanGeometry cleans the written).
+        const int cleaned = SgxdCacheRange(fcram + page * PageSize, run * PageSize,
+                                           SGXD_CACHE_CLEAN, CacheSite::Vertices);
+        ASSERT_MSG(cleaned >= 0, "sgxd: no clean of the returned FCRAM {:#010x}+{:#x}: {:#010x}",
+                   Memory::FCRAM_PADDR + page * PageSize, run * PageSize,
+                   static_cast<u32>(cleaned));
         // The GPU onto the FCRAM pages after the work queued before, which may read the pool
         // pages: they take another move once that work is done.
         const u32 fence = RemapGpu(page, run);
@@ -464,11 +471,18 @@ void GuestGpuMemory::MakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] 
             page++;
             continue;
         }
+        // The guest's view of a versioned page may be off its home (PageHolds::LeaveVersions
+        // comes first).
+        ASSERT_MSG(!hooks.versioned(page), "sgxd: FCRAM {:#010x} moves to CDRAM with versions",
+                   Memory::FCRAM_PADDR + page * PageSize);
         // A run of pages not moved yet, alike in whether they are copied, within one call.
         const bool copy = copies(page);
         u32 run = 1;
         while (page + run < end && !Moved(page + run) && copies(page + run) == copy &&
                run < MaxPagesPerMove) {
+            ASSERT_MSG(!hooks.versioned(page + run),
+                       "sgxd: FCRAM {:#010x} moves to CDRAM with versions",
+                       Memory::FCRAM_PADDR + (page + run) * PageSize);
             run++;
         }
         auto [slot, free_pages] = FreePoolRun(run);
