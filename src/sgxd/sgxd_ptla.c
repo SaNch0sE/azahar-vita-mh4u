@@ -310,7 +310,7 @@ static int submit_queued(SgxdOp *ops, unsigned n, const char *what, char *failed
 
 // Submits the list. The time and the failure's description are the diagnostics build's
 // (elapsed_us 0 and failed untouched otherwise).
-static int submit(const SgxdOp *ops, unsigned n, const char *what, uint32_t *elapsed_us,
+static int submit(SgxdOp *ops, unsigned n, const char *what, uint32_t *elapsed_us,
                   char *failed, unsigned failed_size) {
 #ifdef VITA_DIAGNOSTICS
     sgxd_sync_submits++;
