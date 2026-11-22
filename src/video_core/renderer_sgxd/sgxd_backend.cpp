@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iterator>
 #include "common/assert.h"
+#include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/named_thread.h"
 #include "common/process_clock.h"
@@ -61,12 +62,10 @@ constexpr u32 MaxIndices = SGXD_RECIPE_MAX_INDICES;
 // The code heap follows each layout. It must stay within DOUTU's reach of CV and CF (EXE, 20
 // bits of 8 bytes: 8 MiB). The PDS arena and the pass data make the shared block.
 constexpr u32 CodeSize = SgxdBackend::CodeBytes;
-// The PDS arena: programs kept by address (a fragment program's pixel PDS) in a fixed part,
-// then two halves for the rest, which embed a draw's addresses (vertex buffers, SA data): a game
-// placed 14564 in 1 MiB by 114 s. A pass start past half of the current half flips to
-// the other, once no render reads it.
-constexpr u32 PdsFixedSize = 512u << 10;
-constexpr u32 PdsHalfSize = 768u << 10;
+// The PDS arena: two halves, each draw's programs placed in the current one. A pass start past half
+// of it flips to the other once no render reads it (FlipPdsHalf). No program is kept for good: a
+// pixel PDS names its code's address, which a flush or the second tier moves.
+constexpr u32 PdsHalfSize = 2u << 20;
 constexpr u32 PdsSize = 2 * PdsHalfSize;
 // The PDS keeps running a program at an address it has run, whatever is invalidated, so a half is
 // never written again at an address it ran under: each use of a half takes the next window, the
@@ -124,7 +123,8 @@ SgxdBackend::SgxdBackend() {
     data_begin = data_used = pds_end;
     data_end = data_begin + DataSize;
     lut_begin = data_begin + DataSlots * DataSize;
-    shared_size = AlignUp(lut_begin + LutSize, 1u << 20);
+    code_begin = AlignUp(lut_begin + LutSize, 0x1000);
+    shared_size = AlignUp(code_begin + CodeSize, 1u << 20);
     shared = MapBlock("azahar-sgxd-shared", BlockVa, shared_size, shared_block);
     for (u32 w = 0; w < PdsWindows; w++) {
         const int mapped = sgxdMap(PdsWindowVa + w * PdsHalfSize,
@@ -133,6 +133,7 @@ SgxdBackend::SgxdBackend() {
                    w, PdsWindowVa + w * PdsHalfSize, static_cast<u32>(mapped));
     }
     next_va = BlockVa + shared_size;
+    sgxd_recipe_code_heap = BlockVa + code_begin;
     draws.resize(MaxDraws);
     programs.resize(MaxDraws);
     identity.resize(MaxIndices);
@@ -173,11 +174,6 @@ SgxdBackend::SgxdBackend() {
     });
     // Four macrotiles a side at every size: the cores' loads then follow the scene's quadrants.
     sgxd_recipe_grid = 4;
-#ifdef VITA_DIAGNOSTICS
-    if (const unsigned stall = GxmFlagValue("gpustall")) {
-        sgxd_chain_stall_us = stall * 1000000u;
-    }
-#endif
 }
 
 u32 SgxdBackend::RenderFence() const {
@@ -419,6 +415,20 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
         RenderWait(oldest->fence, "a recipe instance");
         return *oldest;
     }
+    // CDRAM bounds the instances in all, not only each size's MaxInstances: a game had 14 blocks
+    // by 41 s, and a 15th found no CDRAM once its FCRAM textures were untiled every frame.
+    // With less free than a block and a margin, and an
+    // instance of the size in flight, that one's render is waited for, as at MaxInstances. The
+    // first instance of a size is made, or MapBlock stops the emulator.
+    if (oldest) {
+        SceKernelFreeMemorySizeInfo free{};
+        free.size = sizeof(free);
+        sceKernelGetFreeMemorySize(&free);
+        if (static_cast<u32>(free.size_cdram) < RecipeBlockSize + RecipeCdramMargin) {
+            RenderWait(oldest->fence, "a recipe instance (CDRAM)");
+            return *oldest;
+        }
+    }
     auto made = std::make_unique<Recipe>();
     Recipe& r = *made;
     r.width = width;
@@ -435,24 +445,9 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     sgxd_recipe_external_fb = 0;
     DEBUG_ASSERT_MSG(init == 0, "sgxd: the recipe does not take a {}x{} target", width, height);
     r.bg_offset = AlignUp(r.recipe.offset[SGXD_R_END], 0x1000);
-    r.code_begin = r.bg_offset + 0x1000;
-    // The block in CDRAM's 256 KiB unit, its base on the 1 MiB boundary a recipe wants: a 1 MiB
-    // block left a game's 13th recipe no CDRAM beside the microkernel's.
-    r.size = AlignUp(r.code_begin + CodeSize, 256u << 10);
-    DEBUG_ASSERT_MSG(r.code_begin + CodeSize - r.recipe.offset[SGXD_R_CV] <= (0xfffffu << 3),
-                     "sgxd: the code heap is past DOUTU's reach of CV");
-    // A program's DOUTU holds its distance from CV or CF, the same under every recipe only if
-    // the code heap is: the layout after CV does not depend on the size.
-    if (!recipes.empty()) {
-        const Recipe& first = *recipes.front();
-        [[maybe_unused]] const u32 cv = r.recipe.offset[SGXD_R_CV];
-        [[maybe_unused]] const u32 first_cv = first.recipe.offset[SGXD_R_CV];
-        DEBUG_ASSERT_MSG(r.code_begin - cv == first.code_begin - first_cv &&
-                             r.recipe.offset[SGXD_R_CF] - cv ==
-                                 first.recipe.offset[SGXD_R_CF] - first_cv,
-                         "sgxd: the {}x{} recipe's code heap is not where the {}x{} one's is",
-                         width, height, first.width, first.height);
-    }
+    r.size = AlignUp(r.bg_offset + 0x1000, 256u << 10);
+    DEBUG_ASSERT_MSG(r.size <= RecipeBlockSize, "sgxd: a {}x{} recipe takes {} KiB, past {}", width,
+                     height, r.size >> 10, RecipeBlockSize >> 10);
     DEBUG_ASSERT_MSG(r.va + r.size <= RecipesEnd, "sgxd: no GPU space for a {}x{} recipe",
                      width, height);
     r.memory = MapBlock("azahar-sgxd-recipe", r.va, r.size, r.block);
@@ -471,45 +466,34 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
         sgxd_recipe_set_pixel_event(&r.recipe, sgxd_recipe_va(&r.recipe, SGXD_R_PIXEV), 4, 4);
     }
     sgxd_recipe_sa_background(&r.recipe, r.memory, r.bg_offset, 0xff000000u);
-    if (!recipes.empty()) {
-        const Recipe& first = *recipes.front();
-        std::memcpy(r.memory + r.code_begin, first.memory + first.code_begin, code_used);
-    }
     static constexpr const char* kinds[] = {"linear", "PICA", "side"};
     LOG_INFO(Render,
-             "sgxd: the rasterizer's {}x{} {} recipe {}, {} KiB at GPU {:#010x}: layout {} KiB, "
-             "code heap copy at {:#x} ({} bytes); shared block at {:#010x}",
+             "sgxd: the rasterizer's {}x{} {} recipe {}, {} KiB at GPU {:#010x} ({}): layout {} "
+             "KiB; shared block at {:#010x}",
              width, height, kinds[static_cast<u32>(kind)], r.instance, r.size >> 10, r.va,
-             r.recipe.offset[SGXD_R_END] >> 10, r.code_begin, code_used, BlockVa);
+             r.shell_slot >= 0 ? "the shell's CDRAM" : "the game's",
+             r.recipe.offset[SGXD_R_END] >> 10, BlockVa);
     recipes.push_back(std::move(made));
     return r;
 }
 
 u32 SgxdBackend::PlaceCode(unsigned cb, std::span<const u64> words) {
-    DEBUG_ASSERT_MSG(!recipes.empty(), "sgxd: code placed before the first recipe");
     const u32 bytes = static_cast<u32>(words.size_bytes());
     const u32 at = AlignUp(code_used, 16);
     DEBUG_ASSERT_MSG(at + bytes <= CodeSize, "sgxd: the code heap is full ({} KiB)",
                      CodeSize >> 10);
-    for (const auto& r : recipes) {
-        std::memcpy(r->memory + r->code_begin + at, words.data(), bytes);
-    }
+    std::memcpy(shared + code_begin + at, words.data(), bytes);
     code_used = at + bytes;
-    const Recipe& first = *recipes.front();
-    const u32 offset = first.code_begin + at - first.recipe.offset[cb ? SGXD_R_CF : SGXD_R_CV];
 #ifdef VITA_DIAGNOSTICS
-    placed_code.push_back({cb, offset, bytes, at});
+    placed_code.push_back({cb, at, bytes, at});
 #endif
-    return offset;
+    return at;
 }
 
 u32 SgxdBackend::PlaceCodePhased(unsigned cb, std::vector<u64> words,
                                  std::span<const u32> phase_starts, u32 temps) {
-    DEBUG_ASSERT_MSG(!recipes.empty(), "sgxd: code placed before the first recipe");
-    // Where PlaceCode will put it.
-    const Recipe& first = *recipes.front();
-    const u32 offset = first.code_begin + AlignUp(code_used, 16) -
-                       first.recipe.offset[cb ? SGXD_R_CF : SGXD_R_CV];
+    // Where PlaceCode will put it, from the heap's start (HeapCodeBase(cb)).
+    const u32 offset = AlignUp(code_used, 16);
     for (std::size_t k = 0; k + 1 < phase_starts.size(); k++) {
         u64& phas = words[phase_starts[k]];
         // 11111 010 s 100: OTHER2 PHAS; bit 50 PHAS_IMM.
@@ -522,27 +506,6 @@ u32 SgxdBackend::PlaceCodePhased(unsigned cb, std::vector<u64> words,
     const u32 placed = PlaceCode(cb, words);
     DEBUG_ASSERT(placed == offset);
     return placed;
-}
-
-u32 SgxdBackend::PlacePds(const SgxdPdsProgram& program, bool fixed) {
-    const std::string key(reinterpret_cast<const char*>(program.words), program.count * 4);
-    auto& cache = fixed ? pds_fixed_by_words : pds_by_words;
-    if (const auto it = cache.find(key); it != cache.end()) {
-        return it->second;
-    }
-    u32& used = fixed ? pds_fixed_used : pds_used;
-    const u32 end = fixed ? pds_begin + PdsFixedSize
-                          : pds_begin + PdsFixedSize + (pds_half + 1) * PdsHalfSize;
-    const u32 at = AlignUp(used, 32);
-    DEBUG_ASSERT_MSG(at + program.count * 4 <= end,
-                     "sgxd: the PDS arena's {} part is full ({} KiB, {} programs)",
-                     fixed ? "fixed" : "flipping", (fixed ? PdsFixedSize : PdsHalfSize) >> 10,
-                     cache.size());
-    std::memcpy(shared + at, program.words, program.count * 4);
-    used = at + program.count * 4;
-    const u32 va = BlockVa + at;
-    cache.emplace(key, va);
-    return va;
 }
 
 u32 SgxdBackend::AppendPds(const SgxdPdsProgram& program) {
@@ -558,12 +521,14 @@ u32 SgxdBackend::AppendPds(const SgxdPdsProgram& program) {
 }
 
 u32 SgxdBackend::PdsIndex::Hash(const u32* key, u32 words) {
-    // MurmurHash3's 32-bit mixing: words are few, and 32-bit multiplies are what the CPU has.
-    u32 h = 0x9e3779b9u ^ words;
+    u32 h = HashStart(words);
     for (u32 i = 0; i < words; i++) {
-        const u32 k = std::rotl(key[i] * 0xcc9e2d51u, 15) * 0x1b873593u;
-        h = std::rotl(h ^ k, 13) * 5 + 0xe6546b64u;
+        h = HashStep(h, key[i]);
     }
+    return HashEnd(h);
+}
+
+u32 SgxdBackend::PdsIndex::HashEnd(u32 h) {
     h ^= h >> 16;
     h *= 0x85ebca6bu;
     h ^= h >> 13;
@@ -579,9 +544,15 @@ const SgxdBackend::PdsRef* SgxdBackend::PdsIndex::Find(const u32* key, u32 words
         if (slot.key_words == 0) {
             return nullptr;
         }
-        if (slot.hash == hash && slot.key_words == words &&
-            std::memcmp(keys.data() + slot.key_at, key, words * 4) == 0) {
-            return &slot.ref;
+        if (slot.hash == hash && slot.key_words == words) {
+            const u32* const kept = keys.data() + slot.key_at;
+            u32 n = 0;
+            while (n < words && kept[n] == key[n]) {
+                n++;
+            }
+            if (n == words) {
+                return &slot.ref;
+            }
         }
     }
 }
@@ -624,11 +595,16 @@ void SgxdBackend::PdsIndex::Clear() {
 
 template <typename Build>
 SgxdBackend::PdsRef SgxdBackend::KeyedPds(const u32* key, u32 words, Build&& build) {
-    const u32 hash = PdsIndex::Hash(key, words);
+    return KeyedPds(key, words, PdsIndex::Hash(key, words), build);
+}
+
+template <typename Build>
+SgxdBackend::PdsRef SgxdBackend::KeyedPds(const u32* key, u32 words, u32 hash, Build&& build) {
     if (const PdsRef* hit = pds_index.Find(key, words, hash)) {
         return *hit;
     }
-    SgxdPdsProgram pds{};
+    // The generators write the words they count (finish, pds_words); no clearing of the rest.
+    SgxdPdsProgram pds;
     if (build(pds) != 0) {
         return PdsRef{0, 0}; // the caller asserts, naming what it asked for
     }
@@ -672,12 +648,31 @@ SgxdBackend::PdsRef SgxdBackend::VertexPds(const SgxdVertexFetch* fetch, u32 cou
     static_assert(sizeof(SgxdVertexFetch) == 4 * sizeof(u32));
     std::array<u32, 4 + 4 * 32> key;
     DEBUG_ASSERT_MSG(count <= 32, "sgxd: {} vertex fetches", count);
+    const u32 words = 4 + 4 * count;
     key[1] = doutu0;
     key[2] = per_instance ? 1 : 0;
     key[3] = count;
-    std::memcpy(key.data() + 4, fetch, count * sizeof(SgxdVertexFetch));
-    return KeyedPds(key.data(), 4 + 4 * count, [&](SgxdPdsProgram& pds) {
-        return sgxd_program_vertex_pds(fetch, count, doutu0, per_instance ? 1 : 0, &pds);
+    u32 hash = 0;
+    if (!fresh) {
+        key[0] = TagVertex;
+        std::memcpy(key.data() + 4, fetch, count * sizeof(SgxdVertexFetch));
+        hash = PdsIndex::Hash(key.data(), words);
+        if (const PdsRef* hit = pds_index.Find(key.data(), words, hash)) {
+            return *hit;
+        }
+    }
+    // A miss, or a fetch of pass data allocated for this draw: the program built for the same
+    // fetches at other addresses, these written in.
+    key[0] = TagVertexShape;
+    for (u32 n = 0; n < count; n++) {
+        key[4 + 4 * n] = 0;
+        key[5 + 4 * n] = fetch[n].stride;
+        key[6 + 4 * n] = fetch[n].words;
+        key[7 + 4 * n] = fetch[n].pa;
+    }
+    PdsTemplate* const t = TemplatePds(key.data(), words, [&](PdsTemplate& built) {
+        return sgxd_program_vertex_pds_at(fetch, count, doutu0, per_instance ? 1 : 0,
+                                          &built.program, built.at.data());
     });
     if (!t) {
         return PdsRef{0, 0}; // the caller asserts, naming what it asked for
@@ -704,9 +699,13 @@ SgxdBackend::PdsRef SgxdBackend::SecondaryPds(u32 sa_address, u32 sa_words, u32 
             return sgxd_program_secondary_pds(0, 0, doutu0, &pds);
         });
     }
-    // Every SA image is pass data allocated for its draw (VertexSa, the fragment's), so no
-    // earlier program has its address: no lookup by it, the program for the same SA words at
-    // another address with this one written in (as VertexPds's).
+    // Every SA image is pass data allocated for its draw: no lookup by its address, the program for
+    // the same SA words at another address with this one written in. A draw that takes the last
+    // image of its program again finds the program in secondary_kept.
+    SecondaryKept& kept = secondary_kept[(sa_address >> 4) & (secondary_kept.size() - 1)];
+    if (kept.address == sa_address && kept.words == sa_words && kept.doutu0 == doutu0) {
+        return kept.ref;
+    }
     const u32 shape[4] = {TagSecondaryShape, 0, sa_words, doutu0};
     PdsTemplate* const t = TemplatePds(shape, 4, [&](PdsTemplate& built) {
         return sgxd_program_secondary_pds_at(sa_address, sa_words, doutu0, &built.program,
@@ -716,7 +715,9 @@ SgxdBackend::PdsRef SgxdBackend::SecondaryPds(u32 sa_address, u32 sa_words, u32 
         return PdsRef{0, 0};
     }
     t->program.words[t->at[0]] = sa_address;
-    return PdsRef{AppendPds(t->program), t->program.units};
+    const PdsRef ref{AppendPds(t->program), t->program.units};
+    kept = {sa_address, sa_words, doutu0, ref};
+    return ref;
 }
 
 SgxdBackend::PdsRef SgxdBackend::BlitPixelPds(u32 doutu0, const u32 tex[4]) {
@@ -786,6 +787,7 @@ void SgxdBackend::FlipPdsHalf() {
     RenderWait(pds_fence[other], "the PDS arena's flip");
     pds_fence[pds_half] = FenceAll();
     pds_index.Clear();
+    secondary_kept = {};
     pds_index_programs = 0;
     pds_window = window;
     pds_half = other;
@@ -837,21 +839,19 @@ const u8* SgxdBackend::SharedAt(u32 gpu) const {
 __attribute__((noinline)) SgxdBackend::Data SgxdBackend::AllocData(u32 bytes, u32 align) {
     DEBUG_ASSERT(in_pass);
     const u32 at = AlignUp(data_used, align);
-    // The pass's allocations by caller, for the overflow's message: which site filled it.
     const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-    for (DataSite& site : data_sites) {
-        if (site.caller == caller || site.caller == 0) {
-            site.caller = caller;
-            site.bytes += bytes;
-            site.count++;
-            break;
-        }
-    }
+    const u32 hashed = static_cast<u32>(caller >> 1 ^ caller >> 5 ^ caller >> 9);
+    DataSite& slot = data_sites[hashed & (data_sites.size() - 1)];
+    slot.caller = slot.caller == 0 || slot.caller == caller ? caller : 1;
+    slot.bytes += bytes;
+    slot.count++;
     if (at + bytes > data_end) {
         for (const DataSite& site : data_sites) {
             if (site.caller != 0) {
-                LOG_CRITICAL(Render, "sgxd: pass data from {:#010x}: {} bytes in {} allocations",
-                             site.caller, site.bytes, site.count);
+                LOG_CRITICAL(Render, "sgxd: pass data from {}: {} bytes in {} allocations",
+                             site.caller == 1 ? std::string("several callers")
+                                              : fmt::format("{:#010x}", site.caller),
+                             site.bytes, site.count);
             }
         }
     }
@@ -872,6 +872,18 @@ SgxdBackend::Data SgxdBackend::GeometryVertices(u64 key, u32 bytes, bool& fresh)
     const Data vertices = AllocTextureFixed(bytes);
     geometry_vertices.emplace(key, vertices);
     return vertices;
+}
+
+template <typename Make>
+const SgxdBackend::Geometry& SgxdBackend::GeometryFor(u64 key, u32 vertex_bytes, Make&& make) {
+    const auto [it, fresh] = geometries.try_emplace(key);
+    Geometry& g = it->second;
+    if (fresh) {
+        const u32 count = make(nullptr, g);
+        g.vertices = AllocTextureFixed(count * vertex_bytes);
+        make(reinterpret_cast<float*>(g.vertices.cpu), g);
+    }
+    return g;
 }
 
 SgxdBackend::Data SgxdBackend::LutRows() const {
@@ -1088,6 +1100,7 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     sgxd_recipe_set_zls(&r.recipe, 0, 0, 0, 0);
     pass_zls = {};
     data_used = data_begin;
+    data_opens++;
     data_sites = {};
     draw_count = 0;
     cached.clear();
@@ -1377,6 +1390,17 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
         LOG_INFO(Render, "perf: GPU waits by site: elsewhere {:.1f} ms{}",
                  (total - wait_sites_mark - sited) / 1000.0, line);
     }
+    static u32 kept_mark, built_mark, sync_mark, kick_mark;
+    if (side_times[0] != 0) {
+        LOG_INFO(Render, "perf: side renders (syncside) {}, TA {:.1f} ms, 3D {:.1f} ms",
+                 side_times[0], side_times[1] / 1000.0, side_times[2] / 1000.0);
+        side_times = {};
+    }
+    LOG_INFO(Render, "perf: render lists {} kept, {} built; sgxd calls {} sync, {} kicks",
+             sgxd_session_kept_sent - kept_mark, sgxd_session_kept_built - built_mark,
+             sgxd_sync_submits - sync_mark, sgxd_kicks - kick_mark);
+    kept_mark = sgxd_session_kept_sent;
+    built_mark = sgxd_session_kept_built;
     sync_mark = sgxd_sync_submits;
     kick_mark = sgxd_kicks;
     static u32 stream_draws_mark, stream_renders_mark;
@@ -1542,12 +1566,11 @@ void SgxdBackend::RenderSync(Recipe& r, u32* ta_us, u32* d3_us) {
 // The file's layout: "USSE", 1, the programs, the heap's bytes, then each program's
 // bank, offset (DOUTU's, from the bank's base), bytes and place in the heap.
 void SgxdBackend::WriteCode() {
-    if (std::FILE* f = std::fopen("host0:azahar-sgxd-code.bin", "wb"); f && !recipes.empty()) {
-        const Recipe& first = *recipes.front();
+    if (std::FILE* f = std::fopen("host0:azahar-sgxd-code.bin", "wb")) {
         const u32 head[4] = {0x45535355, 1, static_cast<u32>(placed_code.size()), code_used};
         std::fwrite(head, 4, 4, f);
         std::fwrite(placed_code.data(), sizeof(PlacedCode), placed_code.size(), f);
-        std::fwrite(first.memory + first.code_begin, 1, code_used, f);
+        std::fwrite(shared + code_begin, 1, code_used, f);
         std::fclose(f);
         LOG_CRITICAL(Render, "sgxd: {} USSE programs ({} KiB of code) written to host0",
                      placed_code.size(), code_used >> 10);
@@ -1688,22 +1711,23 @@ void SgxdBackend::PlaceFixedPrograms() {
         return;
     }
     u64 words[4];
-    blit_vertex = sgxd_program_doutu0(0, PlaceCode(0, {words, sgxd_program_blit_vertex(words)}), 0);
-    blit_fragment =
-        sgxd_program_doutu0(1, PlaceCode(1, {words, sgxd_program_blit_fragment(words)}), 0);
-    untile_fragment =
-        sgxd_program_doutu0(1, PlaceCode(1, {words, sgxd_program_screen_fragment(words)}), 0);
-    merge_vertex =
-        sgxd_program_doutu0(0, PlaceCode(0, {words, sgxd_program_merge_vertex(words)}), 0);
+    blit_vertex = sgxd_program_doutu0(HeapCodeBase(0),
+                                      PlaceCode(0, {words, sgxd_program_blit_vertex(words)}), 0);
+    blit_fragment = sgxd_program_doutu0(
+        HeapCodeBase(1), PlaceCode(1, {words, sgxd_program_blit_fragment(words)}), 0);
+    untile_fragment = sgxd_program_doutu0(
+        HeapCodeBase(1), PlaceCode(1, {words, sgxd_program_screen_fragment(words)}), 0);
+    merge_vertex = sgxd_program_doutu0(HeapCodeBase(0),
+                                       PlaceCode(0, {words, sgxd_program_merge_vertex(words)}), 0);
     // The merge fragment: the blit fragment with an `and o0, pa4, pa5` before its end.
     sgxd_program_blit_fragment(words);
     Usse::Encoder e;
     e.Bitwise(Usse::BwOp::And, Usse::Reg::O(0), Usse::IOp::R(Usse::Reg::Pa(4)),
               Usse::IOp::R(Usse::Reg::Pa(5)));
     const u64 merge[3] = {words[0], e.Words()[0], words[2]};
-    merge_fragment = sgxd_program_doutu0(1, PlaceCode(1, merge), 0);
-    raw64_fragment =
-        sgxd_program_doutu0(1, PlaceCode(1, {words, sgxd_program_raw64_fragment(words)}), 0);
+    merge_fragment = sgxd_program_doutu0(HeapCodeBase(1), PlaceCode(1, merge), 0);
+    raw64_fragment = sgxd_program_doutu0(
+        HeapCodeBase(1), PlaceCode(1, {words, sgxd_program_raw64_fragment(words)}), 0);
     blit_ready = true;
 }
 
@@ -2169,35 +2193,41 @@ void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride,
     const UntileTarget t = transposed ? UntileTarget{h, w, dest_stride, 1, false}
                                       : UntileTargetFor(w, h, dest_stride, swizzled);
     const u32 quads = t.per_row == 1 ? 1 : 8; // a tile row's
-    u32 vertex_count = 0;
-    const std::vector<Band> bands = TileBands(w, tile_rows, quads, vertex_count);
-    bool fresh = false;
-    const Data vertices =
-        GeometryVertices(GeometryKey(transposed ? 6 : 1, w, h, dest_stride, false, swizzled),
-                         vertex_count * SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4, fresh);
-    float* v = reinterpret_cast<float*>(vertices.cpu);
     // Tile row ty holds PICA rows 8ty..8ty+7, image rows 8ty..8ty+7. Along the quad, image
     // x is the band's SWIZZLED row (ty's local row) * w + x, image y the column: pixel
     // centres land on texel centres.
+    const Geometry& g = GeometryFor(
+        GeometryKey(transposed ? 6 : 1, w, h, dest_stride, false, swizzled),
+        SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4, [&](float* v, Geometry& geometry) {
+            u32 vertex_count = 0;
+            geometry.bands = TileBands(w, tile_rows, quads, vertex_count);
+            for (const Band& band : geometry.bands) {
+                const u32 band_texels = std::bit_ceil(band.rows * w);
+                float* const band_v =
+                    v ? v + band.first_vertex * SGXD_PROGRAM_BLIT_VERTEX_WORDS : nullptr;
+                for (u32 row = 0; row < band.rows && v; row++) {
+                    const u32 ty = band.first_row + row;
+                    const float v0 = static_cast<float>(row * w) / band_texels;
+                    const float v1 = static_cast<float>((row + 1) * w) / band_texels;
+                    if (transposed) {
+                        const float uv[4][2] = {{0, v0}, {1, v0}, {0, v1}, {1, v1}};
+                        PutQuad(band_v + row * QuadVertexWords, t.width, t.height,
+                                static_cast<float>(8 * ty), 0, static_cast<float>(8 * ty + 8),
+                                static_cast<float>(w), uv);
+                    } else {
+                        const float uv[4][2] = {{0, v0}, {0, v1}, {1, v0}, {1, v1}};
+                        PutRows(band_v + row * quads * QuadVertexWords, t, w, 8 * ty, 8 * (ty + 1),
+                                uv);
+                    }
+                }
+            }
+            return vertex_count;
+        });
+    const std::vector<Band>& bands = g.bands;
     std::vector<SideDraw> list(bands.size());
     for (std::size_t b = 0; b < bands.size(); b++) {
         const Band& band = bands[b];
         const u32 band_texels = std::bit_ceil(band.rows * w); // the band's SWIZZLED height
-        float* const band_v = v + band.first_vertex * SGXD_PROGRAM_BLIT_VERTEX_WORDS;
-        for (u32 row = 0; row < band.rows && fresh; row++) {
-            const u32 ty = band.first_row + row;
-            const float v0 = static_cast<float>(row * w) / band_texels;
-            const float v1 = static_cast<float>((row + 1) * w) / band_texels;
-            if (transposed) {
-                const float uv[4][2] = {{0, v0}, {1, v0}, {0, v1}, {1, v1}};
-                PutQuad(band_v + row * QuadVertexWords, t.width, t.height,
-                        static_cast<float>(8 * ty), 0, static_cast<float>(8 * ty + 8),
-                        static_cast<float>(w), uv);
-            } else {
-                const float uv[4][2] = {{0, v0}, {0, v1}, {1, v0}, {1, v1}};
-                PutRows(band_v + row * quads * QuadVertexWords, t, w, 8 * ty, 8 * (ty + 1), uv);
-            }
-        }
         SideTextureWords(0, src.code, src.swizzle, 8, band_texels,
                          src.gpu + band.first_row * 8 * w * src.bits / 8, list[b].tex,
                          src.palette);
@@ -2205,7 +2235,7 @@ void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride,
         list[b].first = band.first_vertex;
         list[b].count = band.rows * quads * 6;
     }
-    SideRender(vertices, list, dest_gpu, t.stride, t.width, t.height, false, t.twiddled);
+    SideRender(g.vertices, list, dest_gpu, t.stride, t.width, t.height, false, t.twiddled);
 }
 
 u32 SgxdBackend::ChainBytes(u32 width, u32 height, u32 levels, u32 bytes) {
@@ -2298,14 +2328,16 @@ SgxdBackend::UntileCopy SgxdBackend::QueueUntile(const UntileSource& src, u32 le
                      "power-of-two sides from 8 to {}, ETC1A4 up to {} wide",
                      w0, h0, levels, src.code, UntileSide, Etc1A4MaxWidth);
     DEBUG_ASSERT(!flushing_untiles);
-    // The chain's batch, its slot there and its draws.
-    std::vector<GeometryDraw> draws;
+    constexpr u32 VertexBytes = SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4;
+    const Geometry* geometry = nullptr;
     u32 batch = 0, units = 0;
     if (etc1) {
         const u32 side = Etc1TargetFor(w0, h0, levels).height;
         batch = BatchEtc1 + static_cast<u32>(std::countr_zero(side / 32));
         units = Etc1Squares(w0, h0, levels);
-        Etc1Vertices(w0, h0, levels, nullptr, draws);
+        geometry = &GeometryFor(
+            GeometryKey(9, w0, h0, levels, false, false), VertexBytes,
+            [&](float* v, Geometry& g) { return Etc1Vertices(w0, h0, levels, v, g.draws); });
     } else {
         const u32 stride = ChainBatchStride(w0);
         const ChainRender cr = ChainAt(w0, h0, levels, stride);
@@ -2321,11 +2353,13 @@ SgxdBackend::UntileCopy SgxdBackend::QueueUntile(const UntileSource& src, u32 le
                                       : BatchChain256) +
                 (src.byte_copy ? BatchBytes256 - BatchChain256 : 0);
         units = cr.rows;
-        ChainVertices(cr, w0, h0, src.bits, nullptr, draws);
+        geometry = &GeometryFor(
+            GeometryKey(15, w0, h0, levels | src.bits << 4, false, false), VertexBytes,
+            [&](float* v, Geometry& g) { return ChainVertices(cr, w0, h0, src.bits, v, g.draws); });
     }
     units = AlignUp(units, SlotUnits(batch));
     DEBUG_ASSERT(units <= MaxUnits(batch));
-    const u32 batch_draws = static_cast<u32>(draws.size());
+    const u32 batch_draws = static_cast<u32>(geometry->draws.size());
     // A split ETC1A4's A8 slot, a draw a level, and its gather's rows, a draw for the colour
     // words and one a level.
     const u32 alpha_units =
@@ -2361,8 +2395,18 @@ SgxdBackend::UntileCopy SgxdBackend::QueueUntile(const UntileSource& src, u32 le
     };
     UntileCopy copy{take(batch, units, batch_draws), units * UnitBytes(batch), {}, 0};
     UntileMember m{src, levels, batch, 0, 0, 0};
+    m.geometry = geometry;
     m.at = (copy.colour.gpu - untile_batches[batch].block.gpu) / UnitBytes(batch);
     if (split) {
+        m.gather = &GeometryFor(GeometryKey(13, w0, h0, levels, true, false), VertexBytes,
+                                [&](float* v, Geometry& g) {
+                                    return Etc1A4GatherVertices(w0, h0, levels, v, g.draws);
+                                });
+        const ChainRender alpha_cr = ChainAt(w0, h0, levels, AlphaBatchStride);
+        m.alpha = &GeometryFor(GeometryKey(14, w0, h0, levels, true, false), VertexBytes,
+                               [&](float* v, Geometry& g) {
+                                   return Etc1A4AlphaVertices(alpha_cr, w0, h0, levels, v, g.draws);
+                               });
         copy.alpha = take(BatchAlpha, alpha_units, levels);
         copy.alpha_bytes = alpha_units * AlphaBatchStride;
         m.alpha_at = (copy.alpha.gpu - untile_batches[BatchAlpha].block.gpu) / AlphaBatchStride;
@@ -2381,19 +2425,15 @@ void SgxdBackend::FlushUntiles() {
     DEBUG_ASSERT(!flushing_untiles);
     flushing_untiles = true;
     constexpr u32 G = Etc1A4GatherStride;
-    constexpr u32 VertexBytes = SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4;
-    std::vector<GeometryDraw> draws;
     std::vector<SideDraw> list;
-    // A member's draws: its quads (cached by their geometry, put for its own target), each
-    // view moved to its slot.
-    const auto add = [&](const Data& vertices, u32 view_x, u32 view_y, u32 view_width,
+    const auto add = [&](const Geometry& geometry, u32 view_x, u32 view_y, u32 view_width,
                          u32 view_height, const auto& texture) {
-        for (const GeometryDraw& d : draws) {
+        for (const GeometryDraw& d : geometry.draws) {
             SideDraw& sd = list.emplace_back();
             texture(d, sd);
             sd.first = d.first;
             sd.count = d.count;
-            sd.vertices = vertices.gpu;
+            sd.vertices = geometry.vertices.gpu;
             sd.view_x = view_x;
             sd.view_y = view_y;
             sd.view_width = view_width;
@@ -2413,15 +2453,7 @@ void SgxdBackend::FlushUntiles() {
                 continue;
             }
             const u32 w = m.source.width, h = m.source.height;
-            const u32 count = Etc1A4GatherVertices(w, h, m.levels, nullptr, draws);
-            bool fresh = false;
-            const Data vertices = GeometryVertices(GeometryKey(13, w, h, m.levels, true, false),
-                                                   count * VertexBytes, fresh);
-            if (fresh) {
-                Etc1A4GatherVertices(w, h, m.levels, reinterpret_cast<float*>(vertices.cpu),
-                                     draws);
-            }
-            add(vertices, 0, m.gather_row, G, Etc1A4GatherFor(w, h, m.levels).rows,
+            add(*m.gather, 0, m.gather_row, G, Etc1A4GatherFor(w, h, m.levels).rows,
                 [&](const GeometryDraw& d, SideDraw& sd) {
                     SideTextureWords(3, 0x0c, 0, d.view_width, d.view_rows,
                                      m.source.gpu + d.source, sd.tex);
@@ -2458,21 +2490,14 @@ void SgxdBackend::FlushUntiles() {
             }
             const UntileSource& src = m.source;
             const u32 w = src.width, h = src.height;
-            bool fresh = false;
             if (etc1) {
                 // U32U32 (0x1f), read raw: a block's two words as the guest stores them, a split
                 // member's from its gather's colour rows.
                 const u32 base =
                     src.code == UntileEtc1A4 ? scratch.gpu + m.gather_row * G * 4 : src.gpu;
-                const u32 count = Etc1Vertices(w, h, m.levels, nullptr, draws);
-                const Data vertices = GeometryVertices(
-                    GeometryKey(9, w, h, m.levels, false, false), count * VertexBytes, fresh);
-                if (fresh) {
-                    Etc1Vertices(w, h, m.levels, reinterpret_cast<float*>(vertices.cpu), draws);
-                }
                 const Etc1Target t = Etc1TargetFor(w, h, m.levels);
                 const auto size = list.size();
-                add(vertices, m.at * t.height, 0, t.width, t.height,
+                add(*m.geometry, m.at * t.height, 0, t.width, t.height,
                     [&](const GeometryDraw& d, SideDraw& sd) {
                         SideTextureWords(0, 0x1f, 0, 2, d.view_rows, base + d.source, sd.tex);
                     });
@@ -2498,15 +2523,8 @@ void SgxdBackend::FlushUntiles() {
                 }
             } else {
                 const ChainRender cr = ChainAt(w, h, m.levels, ChainBatchStride(w));
-                const u32 count = ChainVertices(cr, w, h, src.bits, nullptr, draws);
-                const Data vertices = GeometryVertices(
-                    GeometryKey(15, w, h, m.levels, false, false), count * VertexBytes, fresh);
-                if (fresh) {
-                    ChainVertices(cr, w, h, src.bits, reinterpret_cast<float*>(vertices.cpu),
-                                  draws);
-                }
                 const auto size = list.size();
-                add(vertices, 0, m.at, cr.stride, cr.rows,
+                add(*m.geometry, 0, m.at, cr.stride, cr.rows,
                     [&](const GeometryDraw& d, SideDraw& sd) {
                         SideTextureWords(0, src.code, src.swizzle, 8, d.view_rows,
                                          src.gpu + d.source, sd.tex, src.palette);
@@ -2546,16 +2564,8 @@ void SgxdBackend::FlushUntiles() {
             }
             const u32 w = m.source.width, h = m.source.height;
             const ChainRender cr = ChainAt(w, h, m.levels, AlphaBatchStride);
-            const u32 count = Etc1A4AlphaVertices(cr, w, h, m.levels, nullptr, draws);
-            bool fresh = false;
-            const Data vertices = GeometryVertices(GeometryKey(14, w, h, m.levels, true, false),
-                                                   count * VertexBytes, fresh);
-            if (fresh) {
-                Etc1A4AlphaVertices(cr, w, h, m.levels, reinterpret_cast<float*>(vertices.cpu),
-                                    draws);
-            }
             const u32 gather = scratch.gpu + m.gather_row * G * 4;
-            add(vertices, 0, m.alpha_at, cr.stride, cr.rows,
+            add(*m.alpha, 0, m.alpha_at, cr.stride, cr.rows,
                 [&](const GeometryDraw& d, SideDraw& sd) {
                     SideTextureWords(3, 0x94, 0, d.view_width, d.view_rows, gather + d.source,
                                      sd.tex, merge_palette.gpu);
@@ -2587,154 +2597,6 @@ void SgxdBackend::FlushUntiles() {
     gather_rows = 0;
     gather_draws = 0;
     flushing_untiles = false;
-u32 SgxdBackend::WidenIndices(u32 indices, u32 count, const u8* cpu) {
-    DEBUG_ASSERT(in_pass && count != 0);
-    const u32 rows = (count + WidenWidth - 1) / WidenWidth;
-    DEBUG_ASSERT_MSG(rows <= WidenRows, "sgxd: an 8-bit index list of {} entries, past {}",
-                     count, WidenWidth * WidenRows);
-    if (widen_target.cpu && widen_rows + rows > WidenRows) {
-        FlushWiden();
-    }
-    if (!widen_target.cpu) {
-        widen_target = AllocData(WidenWidth * 2 * WidenRows, 0x1000);
-        widen_rows = 0;
-    }
-    const u32 row = widen_rows;
-    widen_rows += rows;
-    widen_lists.push_back({indices, count, row, cpu});
-    return widen_target.gpu + row * WidenWidth * 2;
-}
-
-void SgxdBackend::FlushWiden() {
-    if (widen_lists.empty()) {
-        return;
-    }
-    DEBUG_ASSERT(in_pass);
-    // The lists in cached FCRAM, cleaned before the render that reads them (with the pass's
-    // other ranges, which EndPass would clean next).
-    for (const CachedRange& range : cached) {
-        SgxdCacheRange(range.cpu, range.bytes, SGXD_CACHE_CLEAN, CacheSite::Vertices);
-    }
-    cached.clear();
-    if (!widen_mask.cpu) {
-        widen_mask = AllocTextureFixed(0x1000);
-        u32* const words = reinterpret_cast<u32*>(widen_mask.cpu);
-        for (u32 n = 0; n < 8; n++) {
-            words[n] = 0xffu;
-        }
-    }
-    // The guest's bytes as LINEAR U8 views 4096 texels wide: 0 over VRAM (1536 rows), 1 + k
-    // over FCRAM's 16 MiB window k (4096 rows). A view's quads go together, one draw.
-    constexpr u32 ViewWidth = 4096;
-    constexpr u32 Views = 1 + (Memory::FCRAM_N3DS_SIZE >> 24);
-    const auto view_of = [](u32 address, u32& base, u32& rows) {
-        if (address < Memory::FCRAM_PADDR) {
-            base = Memory::VRAM_PADDR;
-            rows = Memory::VRAM_SIZE / ViewWidth;
-            return 0u;
-        }
-        const u32 window = (address - Memory::FCRAM_PADDR) >> 24;
-        base = Memory::FCRAM_PADDR + (window << 24);
-        rows = (1u << 24) / ViewWidth;
-        return 1 + window;
-    };
-    std::array<std::vector<float>, Views> quads;
-    const u32 height = widen_rows;
-    static constexpr float mask_uv[4][2] = {{0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, 0.5f}};
-    for (const WidenList& list : widen_lists) {
-        // Target row y holds entries [WidenWidth (y - row), ...): a run of the list's bytes.
-        for (u32 n = 0; n < list.count;) {
-            const u32 y = list.row + n / WidenWidth;
-            u32 x = n % WidenWidth;
-            u32 left = std::min(WidenWidth - x, list.count - n);
-            while (left != 0) {
-                u32 base = 0, rows = 0;
-                const u32 address = list.indices + n;
-                const u32 view = view_of(address, base, rows);
-                const u32 texel = address - base;
-                const u32 row = texel / ViewWidth, column = texel % ViewWidth;
-                DEBUG_ASSERT(row < rows);
-                const u32 k = std::min(left, ViewWidth - column);
-                const float ua = static_cast<float>(column) / ViewWidth;
-                const float ub = static_cast<float>(column + k) / ViewWidth;
-                const float v = (row + 0.5f) / rows;
-                const float uv[4][2] = {{ua, v}, {ub, v}, {ua, v}, {ub, v}};
-                std::vector<float>& q = quads[view];
-                q.resize(q.size() + MergeQuadWords);
-                PutMergeQuad(q.data() + q.size() - MergeQuadWords, WidenWidth, height,
-                             static_cast<float>(x), static_cast<float>(y),
-                             static_cast<float>(x + k), static_cast<float>(y + 1), uv, mask_uv);
-                x += k;
-                n += k;
-                left -= k;
-            }
-        }
-    }
-    // A view's quads from a vertex index that is a multiple of 8 (the recipe's rule).
-    u32 vertex_count = 0;
-    for (const std::vector<float>& q : quads) {
-        if (!q.empty()) {
-            vertex_count = ((vertex_count + 7) & ~7u) +
-                           static_cast<u32>(q.size()) / SGXD_PROGRAM_MERGE_VERTEX_WORDS;
-        }
-    }
-    const Data vertices = AllocData(vertex_count * SGXD_PROGRAM_MERGE_VERTEX_WORDS * 4, 64);
-    std::vector<SideDraw> list;
-    u32 first = 0;
-    for (u32 view = 0; view < Views; view++) {
-        const std::vector<float>& q = quads[view];
-        if (q.empty()) {
-            continue;
-        }
-        first = (first + 7) & ~7u;
-        std::memcpy(reinterpret_cast<float*>(vertices.cpu) + first * SGXD_PROGRAM_MERGE_VERTEX_WORDS,
-                    q.data(), q.size() * sizeof(float));
-        u32 base = 0, rows = 0;
-        view_of(view == 0 ? Memory::VRAM_PADDR : Memory::FCRAM_PADDR + ((view - 1) << 24), base,
-                rows);
-        SideDraw& d = list.emplace_back();
-        SideTextureWords(3, 0x00, 0, ViewWidth, rows, base, d.tex);
-        SideTextureWords(3, 0x0c, 0, 8, 1, widen_mask.gpu, d.tex1);
-        d.first = first;
-        d.count = static_cast<u32>(q.size()) / SGXD_PROGRAM_MERGE_VERTEX_WORDS;
-        first += d.count;
-    }
-    SideRender(vertices, list, widen_target.gpu, WidenWidth, WidenWidth, height, true, false,
-               SGXD_RECIPE_PACK_U16_RAW);
-    widened = true;
-#ifdef VITA_DIAGNOSTICS
-    // widencheck: every list's 16-bit copy against its guest bytes.
-    if (GxmFlag("widencheck")) {
-        RenderIdle("widencheck");
-        static u32 lists_checked, lists_bad, logged_at;
-        const u16* const out = reinterpret_cast<const u16*>(widen_target.cpu);
-        for (const WidenList& l : widen_lists) {
-            lists_checked++;
-            u32 wrong = 0, first_bad = 0;
-            for (u32 n = 0; n < l.count; n++) {
-                if (out[l.row * WidenWidth + n] != l.cpu[n] && wrong++ == 0) {
-                    first_bad = n;
-                }
-            }
-            if (wrong != 0 && lists_bad++ < 32) {
-                LOG_ERROR(Render,
-                          "widencheck: the 8-bit list at {:#010x} ({} entries): {} differ, the "
-                          "first at {}: want {} got {:#06x}",
-                          l.indices, l.count, wrong, first_bad, l.cpu[first_bad],
-                          out[l.row * WidenWidth + first_bad]);
-            }
-        }
-        if (lists_checked - logged_at >= 256) {
-            logged_at = lists_checked;
-            LOG_INFO(Render, "widencheck: {} lists checked, {} differ", lists_checked, lists_bad);
-        }
-    }
-#endif
-    widen_lists.clear();
-    widen_target = {};
-    widen_rows = 0;
-}
-
 }
 
 void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_x, u32 scale_y) {
@@ -2753,17 +2615,47 @@ void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_
     // linear one's height; scaled, scale_y picture rows to each.
     const u32 shown = (transposed ? r.width : r.height) * scale_y;
     const u32 tile_rows = std::min(h, AlignUp(shown, 8)) / 8;
-    u32 vertex_count = 0;
-    const std::vector<Band> bands = TileBands(w, tile_rows, 1, vertex_count);
     const u64 key = u64{0x80} << 56 | u64{transposed} << 55 | u64{scale_x - 1} << 54 |
                     u64{scale_y - 1} << 53 | u64{w} << 40 | u64{h} << 27 | u64{r.width} << 14 |
                     r.height;
-    bool fresh = false;
-    const Data vertices =
-        GeometryVertices(key, vertex_count * SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4, fresh);
-    float* const v = reinterpret_cast<float*>(vertices.cpu);
-
     constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    const Geometry& g = GeometryFor(key, N * 4, [&](float* v, Geometry& geometry) {
+        u32 vertex_count = 0;
+        geometry.bands = TileBands(w, tile_rows, 1, vertex_count);
+        for (const Band& band : geometry.bands) {
+            const u32 band_texels = std::bit_ceil(band.rows * w);
+            float* const band_v = v ? v + band.first_vertex * N : nullptr;
+            for (u32 row = 0; row < band.rows && v; row++) {
+                const u32 ty = band.first_row + row;
+                const float v0 = static_cast<float>(row * w) / band_texels;
+                const float v1 = static_cast<float>((row + 1) * w) / band_texels;
+                if (transposed) {
+                    // below.
+                    const float uv[4][2] = {{0, v0}, {1, v0}, {0, v1}, {1, v1}};
+                    PutQuad(band_v + row * QuadVertexWords, r.width, r.height,
+                            static_cast<float>(8 * ty) / scale_y, 0,
+                            static_cast<float>(8 * ty + 8) / scale_y,
+                            static_cast<float>(w) / scale_x, uv);
+                } else if (!flip) {
+                    // Target x is the picture's column, scaled: a pixel's centre between texels.
+                    const float uv[4][2] = {{0, v0}, {0, v1}, {1, v0}, {1, v1}};
+                    PutQuad(band_v + row * QuadVertexWords, r.width, r.height, 0,
+                            static_cast<float>(8 * ty) / scale_y, static_cast<float>(w) / scale_x,
+                            static_cast<float>(8 * ty + 8) / scale_y, uv);
+                } else {
+                    const float height_px = static_cast<float>(r.height);
+                    const float uv[4][2] = {{1, v0}, {1, v1}, {0, v0}, {0, v1}};
+                    PutQuad(band_v + row * QuadVertexWords, r.width, r.height, 0,
+                            height_px - static_cast<float>(8 * ty + 8) * fy,
+                            static_cast<float>(w) * fx,
+                            height_px - static_cast<float>(8 * ty) * fy, uv);
+                }
+            }
+        }
+        return vertex_count;
+    });
+    const Data& vertices = g.vertices;
+
     SgxdRecipeDrawPrograms p{};
     const SgxdVertexFetch fetch{vertices.gpu, N * 4, N, 0};
     const auto vspds = VertexPds(&fetch, 1, blit_vertex, false);
@@ -2792,27 +2684,8 @@ void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_
     // target's tiles (quads wider than a transfer's output reach past them).
     const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
     const u32 clip = SGXD_RECIPE_CLIP(0, 0, (r.width + 31) / 32 - 1, (r.height + 31) / 32 - 1);
-    for (const Band& band : bands) {
+    for (const Band& band : g.bands) {
         const u32 band_texels = std::bit_ceil(band.rows * w);
-        float* const band_v = v + band.first_vertex * N;
-        for (u32 row = 0; row < band.rows && fresh; row++) {
-            const u32 ty = band.first_row + row;
-            const float v0 = static_cast<float>(row * w) / band_texels;
-            const float v1 = static_cast<float>((row + 1) * w) / band_texels;
-            if (transposed) {
-                // Target x is the picture's row: the texture's own orientation.
-                const float uv[4][2] = {{0, v0}, {1, v0}, {0, v1}, {1, v1}};
-                PutQuad(band_v + row * QuadVertexWords, r.width, r.height,
-                        static_cast<float>(8 * ty), 0, static_cast<float>(8 * ty + 8),
-                        static_cast<float>(w), uv);
-            } else {
-                // Target x is the picture's column, scaled: a pixel's centre between texels.
-                const float uv[4][2] = {{0, v0}, {0, v1}, {1, v0}, {1, v1}};
-                PutQuad(band_v + row * QuadVertexWords, r.width, r.height, 0,
-                        static_cast<float>(8 * ty) / scale_y, static_cast<float>(w) / scale_x,
-                        static_cast<float>(8 * ty + 8) / scale_y, uv);
-            }
-        }
         u32 tex[4];
         SideTextureWords(0, src.code, src.swizzle, 8, band_texels,
                          src.gpu + band.first_row * 8 * w * src.bits / 8, tex, src.palette);

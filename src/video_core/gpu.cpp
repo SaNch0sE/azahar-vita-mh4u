@@ -837,6 +837,8 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
                                               impl->pica.regs_lcd.color_fill_bottom};
 #ifdef ENABLE_GXM
     // On the render thread, after the work before it; it drops one too soon after the last.
+    // The rasterizer's frame ends here whether or not the present is shown.
+    impl->render->EndFrame();
     impl->render->Present(fb, fill);
 #else
     // A present has no guest-visible effect: well past the display's rate it is dropped. 12 ms,

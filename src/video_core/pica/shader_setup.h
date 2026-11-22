@@ -204,6 +204,14 @@ public:
     u32 entry_point{};
     const void* cached_shader{};
     bool uniforms_dirty = true;
+    /// Counts the writes that changed a float uniform, so RasterizerSgxd names a bank it built
+    /// while it holds (the sgxd render thread's setup, which parses the lists).
+    u32 f_version{};
+#ifdef VITA_DIAGNOSTICS
+    /// perflog: the f_version at which each float uniform last changed (RasterizerSgxd's bank
+    /// counters).
+    std::array<u32, 96> f_stamp{};
+#endif
     /// Float uniform `index` changed.
     void FloatChanged(u32 index) {
         uniforms_dirty = true;

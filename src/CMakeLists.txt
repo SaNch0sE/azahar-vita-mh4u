@@ -220,7 +220,10 @@ endif()
 
 if (VITA)
     add_subdirectory(citra_vita)
-    add_subdirectory(sgxd_test)
+    # sgxd's op tests: the diagnostics build's only, as the counters it reports.
+    if (ENABLE_VITA_DIAGNOSTICS)
+        add_subdirectory(sgxd_test)
+    endif()
 endif()
 
 if (ENABLE_ROOM)

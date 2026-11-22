@@ -7,6 +7,7 @@
 #include <cryptopp/modes.h>
 #include <cryptopp/sha.h>
 #include "common/archives.h"
+#include "common/process_clock.h"
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/file_util.h"
@@ -89,7 +90,7 @@ void FS_USER::OpenFile(Kernel::HLERequestContext& ctx) {
         FileSys::Path file_path;
         FileSys::Mode mode;
         u32 attributes;
-        std::chrono::steady_clock::time_point pre_timer;
+        Common::ProcessClock::time_point pre_timer;
 
         std::pair<ResultVal<std::shared_ptr<File>>, std::chrono::nanoseconds> file;
     };
@@ -98,7 +99,7 @@ void FS_USER::OpenFile(Kernel::HLERequestContext& ctx) {
     async_data->file_path = file_path;
     async_data->mode = mode;
     async_data->attributes = attributes;
-    async_data->pre_timer = std::chrono::steady_clock::now();
+    async_data->pre_timer = Common::ProcessClock::now();
 
     ctx.RunOnThreadWorker(
         fs_async_worker,
@@ -107,7 +108,7 @@ void FS_USER::OpenFile(Kernel::HLERequestContext& ctx) {
                 archives.OpenFileFromArchive(async_data->archive_handle, async_data->file_path,
                                              async_data->mode, async_data->attributes);
             const auto time_took = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - async_data->pre_timer);
+                Common::ProcessClock::now() - async_data->pre_timer);
             return static_cast<s64>(((async_data->file.second > time_took)
                                          ? (async_data->file.second - time_took)
                                          : std::chrono::nanoseconds())
@@ -190,7 +191,7 @@ void FS_USER::OpenFileDirectly(Kernel::HLERequestContext& ctx) {
         u64 program_id;
         FileSys::Mode mode;
         u32 attributes;
-        std::chrono::steady_clock::time_point pre_timer;
+        Common::ProcessClock::time_point pre_timer;
 
         ResultVal<ArchiveHandle> archive_handle;
         std::pair<ResultVal<std::shared_ptr<File>>, std::chrono::nanoseconds> file;
@@ -202,7 +203,7 @@ void FS_USER::OpenFileDirectly(Kernel::HLERequestContext& ctx) {
     async_data->program_id = program_id;
     async_data->mode = mode;
     async_data->attributes = attributes;
-    async_data->pre_timer = std::chrono::steady_clock::now();
+    async_data->pre_timer = Common::ProcessClock::now();
 
     ctx.RunOnThreadWorker(
         fs_async_worker,
@@ -220,7 +221,7 @@ void FS_USER::OpenFileDirectly(Kernel::HLERequestContext& ctx) {
                                              async_data->mode, async_data->attributes);
             archives.CloseArchive(*async_data->archive_handle);
             const auto time_took = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - async_data->pre_timer);
+                Common::ProcessClock::now() - async_data->pre_timer);
             return static_cast<s64>(((async_data->file.second > time_took)
                                          ? (async_data->file.second - time_took)
                                          : std::chrono::nanoseconds())

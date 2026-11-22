@@ -738,9 +738,13 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
                     for (u32 i = 0; i < run; ++i) {
                         const u32 id = ids[i];
                         const u32 write_mask = ExpandBitsToBytes[masks[i]];
-                        regs.internal.reg_array[id] =
-                            (regs.internal.reg_array[id] & ~write_mask) | (values[i] & write_mask);
-                        dirty_regs.Set(id);
+                        const u32 old_value = regs.internal.reg_array[id];
+                        const u32 new_value = (old_value & ~write_mask) | (values[i] & write_mask);
+                        regs.internal.reg_array[id] = new_value;
+                        // Marked only when it changes (as pica_cmdlist_a32.S).
+                        if (new_value != old_value) {
+                            dirty_regs.Set(id);
+                        }
                     }
                     cmd_list.current_index = index;
 
@@ -959,10 +963,16 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     const u32 write_mask = ExpandBitsToBytes[mask];
     regs.internal.reg_array[id] = (old_value & ~write_mask) | (value & write_mask);
 
+    // A plain register is marked dirty only when the write changes it (the command lists
+    // rewrite most of them with the values they hold); a special one at every write, before its
+    // handler, which may draw (the render thread's copy takes it with that draw). The registers
+    // a handler advances (the upload indexes and offsets) the handler marks.
     if (const SpecialFn handler = special_lut[id]) {
+        dirty_regs.Set(id);
+        handler(*this, id, value, stop_requested);
+    } else if (regs.internal.reg_array[id] != old_value) {
+        dirty_regs.Set(id);
     }
-    dirty_regs.Set(id);
-
 }
 
 void PicaCore::SubmitImmediate(u32 value) {

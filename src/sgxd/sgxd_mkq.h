@@ -62,12 +62,11 @@ uint32_t sgxd_mkq_flips_done(void);
 // Spins until every job sent has been taken and the GPU has run out of jobs (BUSY clear): no run
 // is left but one finishing its last few instructions. 0, or -1 on a fault or after a second.
 int sgxd_mkq_idle(void);
-// Shapes compiled and their instructions (sgxd_test's results too), flips (the code space full:
-// the GPU idled, the USE code cache invalidated, every shape dropped; perflog's, diagnostics
-// builds only), and the last refusal: the op's index and kind.
-extern uint32_t sgxd_mkq_compiles, sgxd_mkq_instructions;
+// Shapes compiled, their instructions and flips (the code space full: the GPU idled, the USE
+// code cache invalidated, every shape dropped): perflog's and sgxd_test's, diagnostics builds
+// only. And the last refusal: the op's index and kind.
 #ifdef VITA_DIAGNOSTICS
-extern uint32_t sgxd_mkq_flips;
+extern uint32_t sgxd_mkq_compiles, sgxd_mkq_instructions, sgxd_mkq_flips;
 #endif
 #ifdef VITA_DIAGNOSTICS
 // Where the GPU stands, for perflog's sampler: the kind of the job the next sgxd_mkq_submit sends

@@ -24,7 +24,7 @@ namespace SgxdRenderer {
 
 /**
  * The second tier: fragment and vertex programs that draw a lot are emitted again with the IR's
- * optimising passes (usse_ir level 2) on a worker thread (ThreadRole::ShaderCompiler, core 1),
+ * optimising passes (usse_ir level 2) on a worker thread (ThreadRole::ShaderCompiler, core 3),
  * and the render thread installs the better program before a later draw. The first tier's
  * program serves until then, so no draw ever waits for the passes.
  */

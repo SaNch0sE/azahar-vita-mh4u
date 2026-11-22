@@ -4,6 +4,7 @@
 
 #include <boost/serialization/unique_ptr.hpp>
 #include "common/archives.h"
+#include "common/process_clock.h"
 #include "common/logging/log.h"
 #include "core/core.h"
 #include "core/file_sys/errors.h"
@@ -105,7 +106,7 @@ void File::Read(Kernel::HLERequestContext& ctx) {
         // Input
         u32 length;
         u64 offset;
-        std::chrono::steady_clock::time_point pre_timer;
+        Common::ProcessClock::time_point pre_timer;
         bool cache_ready;
 
         // Output
@@ -122,7 +123,7 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     async_data->cache_ready = backend->CacheReady(offset, length);
     const bool really_async = !async_data->cache_ready;
     if (really_async) {
-        async_data->pre_timer = std::chrono::steady_clock::now();
+        async_data->pre_timer = Common::ProcessClock::now();
     }
 
     // LOG_DEBUG(Service_FS, "cache={}, offset={}, length={}", cache_ready, offset, length);
@@ -142,7 +143,7 @@ void File::Read(Kernel::HLERequestContext& ctx) {
             const auto read_delay = static_cast<s64>(backend->GetReadDelayNs(async_data->length));
             if (!async_data->cache_ready) {
                 const auto time_took = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now() - async_data->pre_timer)
+                                           Common::ProcessClock::now() - async_data->pre_timer)
                                            .count();
                 /*
                 if (time_took > read_delay) {

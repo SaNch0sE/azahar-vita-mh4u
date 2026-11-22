@@ -62,7 +62,7 @@ int sgxd_program_vertex_pds_at(const SgxdVertexFetch *fetch, unsigned count, uin
         stride_of[i] = k;
     }
     Pds p;
-    memset(&p, 0, sizeof(p));
+    pds_init(&p);
     // DS1: word 0 strides 0 and 1, word 1 DOUTU word 2, words 2.. the other strides in pairs.
     pds_word(&p, 1, strides[0] | (uint32_t)strides[1] << 16);
     pds_word(&p, 1, 0);
@@ -101,7 +101,7 @@ int sgxd_program_secondary_pds_at(uint32_t sa_address, unsigned sa_words, uint32
         return -1;
     }
     Pds p;
-    memset(&p, 0, sizeof(p));
+    pds_init(&p);
     const unsigned dma = sa_words ? pds_pair(&p, 0, sa_address, doutd1(0, sa_words)) : 0;
     if (address_at) {
         *address_at = dma * 4;
@@ -122,7 +122,7 @@ int sgxd_program_pixel_pds(uint32_t kick0, const uint32_t *iterators, const unsi
         return -1;
     }
     Pds p;
-    memset(&p, 0, sizeof(p));
+    pds_init(&p);
     const unsigned kick =
         pds_pair(&p, 0, kick0, DOUTU1_SDSOFT | (count ? DOUTU1_ITERATORSDEPENDENCY : 0));
     pds_word(&p, 1, 0);   // DOUTU word 2
@@ -184,7 +184,7 @@ unsigned sgxd_program_screen_fragment(uint64_t words[4]) {
 static int textured_pixel_pds(uint32_t kick0, const uint32_t tex[4], unsigned fconv,
                               unsigned tag_words, SgxdPdsProgram *out) {
     Pds p;
-    memset(&p, 0, sizeof(p));
+    pds_init(&p);
     const unsigned kick = pds_pair(&p, 0, kick0,
                                    DOUTU1_SDSOFT | DOUTU1_ITERATORSDEPENDENCY |
                                        DOUTU1_TEXTUREDEPENDENCY);
@@ -214,7 +214,7 @@ int sgxd_program_screen_pixel_pds(uint32_t kick0, const uint32_t tex[4], SgxdPds
 // texture issues alone the 3D never finishes. Issues fill the PAs in PDS order.
 int sgxd_program_raw64_pixel_pds(uint32_t kick0, const uint32_t tex[4], SgxdPdsProgram *out) {
     Pds p;
-    memset(&p, 0, sizeof(p));
+    pds_init(&p);
     const unsigned kick = pds_pair(&p, 0, kick0,
                                    DOUTU1_SDSOFT | DOUTU1_ITERATORSDEPENDENCY |
                                        DOUTU1_TEXTUREDEPENDENCY);
@@ -247,7 +247,7 @@ unsigned sgxd_program_merge_vertex(uint64_t words[4]) {
 int sgxd_program_merge_pixel_pds(uint32_t kick0, const uint32_t tex0[4], const uint32_t tex1[4],
                                  SgxdPdsProgram *out) {
     Pds p;
-    memset(&p, 0, sizeof(p));
+    pds_init(&p);
     const unsigned kick = pds_pair(&p, 0, kick0,
                                    DOUTU1_SDSOFT | DOUTU1_ITERATORSDEPENDENCY |
                                        DOUTU1_TEXTUREDEPENDENCY);

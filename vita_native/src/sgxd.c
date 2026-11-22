@@ -912,6 +912,7 @@ static void sgxd_fault_snapshot(uint32_t index, const SgxdOp *op, uint32_t wante
     w[7] = op->value;
     w[8] = waited;
     w[9] = ksceKernelGetSystemTimeLow();
+    w[13] = op->op;
     SGXD_LOG("poll timeout: op %u reg %05x want %08x mask %08x last %08x after %u us; "
              "fault dump taken\n", index, op->reg, wanted, op->mask, op->value, waited);
     for (uint32_t core = 0; core < SGXD_CORES; core++) {

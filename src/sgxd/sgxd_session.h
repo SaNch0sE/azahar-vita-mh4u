@@ -96,6 +96,13 @@ int sgxd_session_render_overlap(const SgxdRecipe *r, const uint32_t touches[6], 
 // A recipe is no more (its block given back, a backend's end; NULL: every recipe): the lists kept
 // for it go, so a recipe made later at its address builds its own.
 void sgxd_session_forget(const SgxdRecipe *r);
+#ifdef VITA_DIAGNOSTICS
+// The overlapped lists sent as kept (a list kept for the recipe and key, values rewritten) and
+// as built (perflog; diagnostics builds only).
+extern uint32_t sgxd_session_kept_sent, sgxd_session_kept_built;
+// Always 0: kept for perflog.
+extern uint32_t sgxd_session_finishes;
+#endif
 // No 3D is ever left pending: these keep their callers, with nothing to do.
 const SgxdRecipe *sgxd_session_pending(void);
 int sgxd_session_pending_touches(uint32_t lo, uint32_t hi);

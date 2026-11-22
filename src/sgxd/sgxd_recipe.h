@@ -172,6 +172,10 @@ extern SgxdRecipePb sgxd_recipe_pb;
 // the layout gives the block's own FB and DEPTH no room. With sgxd_recipe_pb set, the page
 // table and pages take none either.
 extern int sgxd_recipe_external_fb;
+// A code heap every recipe shares (0: none): every kick sets USE code bases 2 and 3 to it,
+// the vertex and the pixel data master, beside bases 0 and 1 (the recipe's CV and CF). Programs
+// a DOUTU reaches through bases 2 and 3 are the same under every recipe, so none carries a copy.
+extern uint32_t sgxd_recipe_code_heap;
 // Every recipe's kicks leave core 0's event program alone, as events_owned does, and their SLC
 // requests take Sony's form: one value to MASTER_SLC_CTRL_FLUSH and _INVAL together, both events
 // awaited at once (sgxd_recipe_slc). sgxd_ptla_events sets it, the events page's release clears it.
@@ -185,6 +189,10 @@ extern void *sgxd_recipe_pb_memory;
 void sgxd_recipe_pb_rewrite(void);
 // The next TA and 3D built load the shared buffer's free lists again (at sgxd_recipe_pb_write).
 void sgxd_recipe_pb_reset(void);
+// Whether the TA's and the 3D's free lists are loaded: a kick built now loads them if not.
+void sgxd_recipe_pb_loaded(int *ta, int *d3);
+// The loads a TA and 3D kick of r leave, for a kept list sent instead of a built one.
+void sgxd_recipe_pb_kicked(const SgxdRecipe *r);
 
 // A width x height (32 to 2048) target at GPU address base (1 MiB aligned), with pages parameter
 // pages, drawing the recipe's triangle. Returns 0, or -1 for sizes the layout does not cover.
@@ -392,10 +400,35 @@ void sgxd_recipe_set_double_pixels(SgxdRecipe *r, int on);
 void sgxd_recipe_set_pixel_event(SgxdRecipe *r, uint32_t va, uint32_t units,
                                  uint32_t attribute_size);
 
+// The fields a kick's list carries that change from one render on a recipe to the next: a side
+// render's size (sgxd_recipe_set_size), the double pixels, a pass's background and depth store.
+// A list built with `kept` set records where each lands, so a list kept for the recipe takes
+// another render's values in place (sgxd_session's kept lists).
+enum {
+    SGXD_KEPT_MTILE1,
+    SGXD_KEPT_MTILE2,
+    SGXD_KEPT_TE_SCREEN,
+    SGXD_KEPT_STRIDE,
+    SGXD_KEPT_MTE_SCREEN,
+    SGXD_KEPT_RGN_SIZE,
+    SGXD_KEPT_BGOBJDEPTH,
+    SGXD_KEPT_BGOBJ,
+    SGXD_KEPT_BGOBJTAG,
+    SGXD_KEPT_DOUBLE_PIXELS,
+    SGXD_KEPT_ZLS0, // the five ZLS words
+    SGXD_KEPT_COUNT = SGXD_KEPT_ZLS0 + 5,
+};
+typedef struct SgxdKept {
+    uint16_t op, field;
+} SgxdKept;
+uint32_t sgxd_recipe_kept_value(const SgxdRecipe *r, unsigned field);
+
 typedef struct SgxdOpList {
     SgxdOp *ops;
     unsigned count, max;
     int overflow;
+    SgxdKept *kept;
+    unsigned nkept, max_kept;
 } SgxdOpList;
 
 // The TA: the code bases, the cache invalidates, the DPM free-list load, TE and MTE, the scene

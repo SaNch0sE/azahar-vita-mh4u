@@ -45,9 +45,9 @@ void RendererSgxd::PresentFrame(const std::array<Pica::FramebufferConfig, 2>& fb
         s.fill_g = static_cast<u8>(fill[i].color_g);
         s.fill_b = static_cast<u8>(fill[i].color_b);
     }
-    // No swap timing: PerfStats' swap counters are the emulation thread's.
+    // No swap timing: PerfStats' swap counters are the emulation thread's. The rasterizer's
+    // frame ends at every vblank, shown or not (RenderThread's Op::FrameEnd).
     render_window.PresentGuestScreens(screens);
-    rasterizer.EndFrame();
 }
 
 void RendererSgxd::PollWindow() {

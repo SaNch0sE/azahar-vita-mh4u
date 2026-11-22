@@ -53,20 +53,10 @@ static uint32_t cycles_per_us;
 // sgxd_ptla_events: the ISR's page, and the completions asked for so far (one a FLUSH).
 static const volatile SgxdEvents *events;
 static uint32_t twod_sent;
-// sgxd_chain_submit: the async lists sent, each ending in one SGXD_SIGNAL_DONE; the kernel
-// queue's copy, for a fault's description (sgxd_chain_op), and the position past its last op.
+// sgxd_chain_submit: the async lists sent, each ending in one SGXD_SIGNAL_DONE.
 static uint32_t chains_sent;
-static SgxdOp chain_mirror[SGXD_CHAIN_RING];
-static uint32_t chain_mirror_end;
-// The queue's ring (sgxdQueue): lists are written here and published through the events page's
-// queue_end, which only this side writes; the kernel copies each op out as it runs it, and a
-// list costs a syscall only when the queue had gone idle (sgxdKick).
-static SgxdOp *ring;
-static volatile uint32_t *queue_end;
-// The waker's fields of the events page (sgxd_wake_arm), which this side writes.
-static volatile SgxdEvents *wake_page;
-// sgxd_chain_microkernel: the microkernel's state block, whose counts, fault and waker words
-// stand for the events page's; NULL while IRQ 52's handler runs the lists.
+// The microkernel's state block, whose words hold the counts, the fault and the waker; set
+// with events.
 static volatile uint32_t *mk;
 
 static inline uint32_t twod_done(void) {
@@ -209,33 +199,7 @@ int sgxd_chain_submit_vars(const SgxdOp *ops, unsigned count, const uint8_t *var
     if (r == 0) {
         chains_sent++;
     }
-    // The ring's room comes back as the GPU runs the lists before: a full ring is the GPU a
-    // whole ring behind.
-    const uint32_t end = chain_end;
-    if (end + count - events->queue_pos > SGXD_CHAIN_RING) {
-        const uint32_t start = azaharCyclesStart();
-        const uint32_t limit = TWOD_POLL_US * cycles_per_us;
-        while (end + count - events->queue_pos > SGXD_CHAIN_RING) {
-            if (events->chain_fault) {
-                return AZAHAR_ERR_STATE;
-            }
-            if (azaharCycles() - start > limit) {
-                return AZAHAR_ERR_FULL;
-            }
-        }
-#ifdef VITA_DIAGNOSTICS
-        sgxd_wait_us_add((azaharCycles() - start) / cycles_per_us);
-#endif
-    }
-    for (unsigned i = 0; i < count; i++) {
-        ring[(end + i) & (SGXD_CHAIN_RING - 1u)] = ops[i];
-    }
-    for (unsigned n = 0; n < count; n++) {
-        chain_mirror[((uint32_t)r + n) & (SGXD_CHAIN_RING - 1u)] = ops[n];
-    }
-    chain_mirror_end = ((uint32_t)r + count) & 0x7fffffffu;
-    chains_sent++;
-    return 0;
+    return r;
 }
 
 int sgxd_ptla_waker(int32_t flag, uint32_t bits) {
@@ -262,16 +226,7 @@ void sgxd_wake_disarm(void) {
 }
 
 uint32_t sgxd_wake_count(void) {
-    return mk ? mk[SGXD_MK_WAKES] : wake_page ? wake_page->wakes : 0;
-}
-
-const SgxdOp *sgxd_chain_op(uint32_t pos, uint32_t *behind) {
-    const uint32_t back = (chain_mirror_end - pos) & 0x7fffffffu;
-    if (back == 0 || back > SGXD_CHAIN_RING) {
-        return NULL;
-    }
-    *behind = back;
-    return &chain_mirror[pos & (SGXD_CHAIN_RING - 1u)];
+    return mk ? mk[SGXD_MK_WAKES] : 0;
 }
 
 uint32_t sgxd_chain_fence(void) {

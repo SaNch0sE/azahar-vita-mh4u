@@ -15,6 +15,7 @@
 #include "video_core/renderer_sgxd/sgxd_backend.h"
 
 #include "azahar_native.h"
+#include "common/host_clock.h"
 #include "sgxd.h"
 #include "sgxd_ptla.h"
 #ifdef VITA_DIAGNOSTICS
@@ -323,11 +324,10 @@ u32 GuestGpuMemory::EvictPool(u32 want, u32 idle_frames) {
     NoteReturn(pages, idle_frames == IdleFrames ? "the pool full, 60 frames idle"
                                                 : "the pool full, 2 frames idle");
 #endif
-    const auto start = std::chrono::steady_clock::now();
+    const u32 start = azaharCyclesStart();
     const u32 returned = ReturnPages(pages);
-    const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::steady_clock::now() - start)
-                                        .count());
+    // This thread's cycles: the work's time, a wait in it left out, and no clock syscall.
+    const u64 us = Common::CyclesToUs(azaharCycles() - start);
 #ifdef VITA_DIAGNOSTICS
     stats.us += us;
     stats.returns++;
@@ -370,11 +370,10 @@ void GuestGpuMemory::ReturnStale() {
 #ifdef VITA_DIAGNOSTICS
     NoteReturn(stale, "stale");
 #endif
-    const auto start = std::chrono::steady_clock::now();
+    const u32 start = azaharCyclesStart();
     const u32 returned = ReturnPages(stale);
-    const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::steady_clock::now() - start)
-                                        .count());
+    // This thread's cycles: the work's time, a wait in it left out, and no clock syscall.
+    const u64 us = Common::CyclesToUs(azaharCycles() - start);
 #ifdef VITA_DIAGNOSTICS
     stats.us += us;
     stats.returns++;
@@ -450,7 +449,7 @@ void GuestGpuMemory::MakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] 
     // No idle GPU (the class's comment): the GPU's writes queued to the range land first, so
     // that the copy takes them; its reads go on from the old pages until its remap.
     hooks.wait_writes(addr, size);
-    const auto start = std::chrono::steady_clock::now();
+    const u32 start = azaharCyclesStart();
     const u32 offset = addr - Memory::FCRAM_PADDR;
     const u32 first = offset / PageSize;
     const u32 end = (offset + size + PageSize - 1) / PageSize;
@@ -515,9 +514,8 @@ void GuestGpuMemory::MakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] 
         copied_pages += copy ? run : 0;
         page += run;
     }
-    const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::steady_clock::now() - start)
-                                        .count());
+    // This thread's cycles: the work's time, a wait in it left out, and no clock syscall.
+    const u64 us = Common::CyclesToUs(azaharCycles() - start);
 #ifdef VITA_DIAGNOSTICS
     stats.us += us;
     stats.calls++;

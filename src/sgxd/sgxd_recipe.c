@@ -726,8 +726,20 @@ static void put_page_list(const SgxdRecipe *r, uint8_t *memory) {
 
 SgxdRecipePb sgxd_recipe_pb;
 int sgxd_recipe_external_fb;
+uint32_t sgxd_recipe_code_heap;
 // The shared buffer's free lists are loaded in the DPM: the TA's, the 3D's (build order).
 static int pb_ta_loaded, pb_3d_loaded;
+
+void sgxd_recipe_pb_loaded(int *ta, int *d3) {
+    *ta = pb_ta_loaded;
+    *d3 = pb_3d_loaded;
+}
+
+void sgxd_recipe_pb_kicked(const SgxdRecipe *r) {
+    // As the TA and 3D kicks leave them: loaded once with the shared buffer, else never.
+    pb_ta_loaded = r->shared_pb;
+    pb_3d_loaded = r->shared_pb;
+}
 
 void sgxd_recipe_pb_write(void *pt_memory) {
     page_list(pt_memory, sgxd_recipe_pb.first, sgxd_recipe_pb.last);
@@ -1006,7 +1018,6 @@ static void write_draw(const SgxdRecipe *r, uint8_t *memory, unsigned n, const S
     const uint32_t *L = r->offset;
     const uint32_t W = r->width, H = r->height;
     const SgxdRecipeDrawPrograms *g = d->programs;
-    uint32_t *stream = (uint32_t *)(memory + L[SGXD_R_STREAM]);
     // Every copy program has COPY's shape and units.
     const uint32_t copy_va = r->base + copy_offset(r, n);
     const uint32_t clip = d->clip;
@@ -1032,7 +1043,10 @@ static void write_draw(const SgxdRecipe *r, uint8_t *memory, unsigned n, const S
         state[22] = g->texsize;
     }
     put(memory, L[SGXD_R_STATE] + n * 0x60, state, 24);
-    uint32_t *w = stream + draw_words(r) * n;
+    // The stream's words made here and copied out at once: the recipe memory is uncached CDRAM,
+    // where one store a word costs more than the copy's bursts.
+    uint32_t words[10];
+    uint32_t *w = words;
     *w++ = 1u << 30 | copy_va >> 4;
     *w++ = r->units[SGXD_R_COPY] << 27 | 1u << 25 | 1u << 17 | (1u + n % 4) << 13 | 1u << 9 | 6;
     if (g) {
@@ -1054,6 +1068,7 @@ static void write_draw(const SgxdRecipe *r, uint8_t *memory, unsigned n, const S
         *w++ = r->vdm_w4 | ((sgxd_recipe_va(r, SGXD_R_VSPDS) >> 4) & 0x0fffffffu);
         *w++ = r->vdm_w5 | 0x100 | r->units[SGXD_R_VSPDS];
     }
+    put(memory, L[SGXD_R_STREAM] + draw_words(r) * n * 4, words, (unsigned)(w - words));
 }
 
 // The stream's end after count draws: the secondary and the terminate.
@@ -1255,8 +1270,54 @@ static void poll(SgxdOpList *l, uint32_t reg, uint32_t mask, uint32_t value, uin
     op(l, SGXD_OP_POLL, reg, value, mask, timeout_us);
 }
 
+uint32_t sgxd_recipe_kept_value(const SgxdRecipe *r, unsigned field) {
+    switch (field) {
+    case SGXD_KEPT_MTILE1:
+        return r->mtile1;
+    case SGXD_KEPT_MTILE2:
+        return r->mtile2;
+    case SGXD_KEPT_TE_SCREEN:
+        return r->te_screen;
+    case SGXD_KEPT_STRIDE:
+        return r->stride;
+    case SGXD_KEPT_MTE_SCREEN:
+        return r->mte_screen;
+    case SGXD_KEPT_RGN_SIZE:
+        return r->rgn_size;
+    case SGXD_KEPT_BGOBJDEPTH:
+        return r->bgobjdepth;
+    case SGXD_KEPT_BGOBJ:
+        return r->bgobj;
+    case SGXD_KEPT_BGOBJTAG:
+        return r->bgobjtag;
+    case SGXD_KEPT_DOUBLE_PIXELS:
+        return r->double_pixels;
+    default:
+        return r->zls[field - SGXD_KEPT_ZLS0];
+    }
+}
+
+// A table's register write {reg, value, field}: a SGXD_KEPT_* field's is recorded where it
+// lands, when the list records them.
+#define KEPT_NONE 0xffffu
+
+static void wr_entry(SgxdOpList *l, const uint32_t entry[3]) {
+    if (entry[2] != KEPT_NONE && l->kept && l->count < l->max) {
+        if (l->nkept >= l->max_kept) {
+            l->overflow = 1;
+            return;
+        }
+        l->kept[l->nkept++] = (SgxdKept){(uint16_t)l->count, (uint16_t)entry[2]};
+    }
+    wr(l, entry[0], entry[1]);
+}
+
 #define CORE(c, reg) (0x8000u + (c) * 0x4000u + (reg))
 #define SETUP_POLL_US 100000u   // the probe's set-up waits gave 2 s; each completes in µs
+// A core's tiling past core 0's (or the master's) TA_FINISHED, which says nothing of the other
+// cores': the TA's own time, as the session gives its TA wait. A stream-out of thousands of
+// geometry invocations in one task on one core runs past 100 ms.
+#define TA_CORES_POLL_US 1000000u
 
 void sgxd_recipe_slc(SgxdOpList *l, int inval) {
     wr(l, 0x4d2c, 0x10);
@@ -1298,6 +1359,9 @@ static void idle_event(const SgxdRecipe *r, SgxdOpList *l) {
 void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
     // T0.4-T0.8: the vertex code base, TA_CLK_GATE, the caches, the clocks and DMS_CTRL.
     wr(l, 0x0a0c, sgxd_recipe_va(r, SGXD_R_CV) >> 6);
+    if (sgxd_recipe_code_heap) {
+        wr(l, 0x0a14, sgxd_recipe_code_heap >> 6);
+    }
     for (unsigned c = 0; c < 4; c++) {
         wr(l, CORE(c, 0x0310), 1);
     }
@@ -1347,14 +1411,23 @@ void sgxd_recipe_ta_kick(const SgxdRecipe *r, SgxdOpList *l) {
     }
 
     // T2: TE and MTE, then each core's region array, tail pointer cache and TE_STATE.
-    const uint32_t t2[][2] = {
-        {0x0204, 0}, {0x0208, r->mtile1}, {0x020c, r->mtile2}, {0x0210, r->te_screen},
-        {0x0214, r->stride}, {0x0218, 0x00400000}, {0x023c, 0xa2}, {0x0240, 0x358637bd},
-        {0x0244, 0x358637bd}, {0x0248, r->mte_screen}, {0x0388, 0}, {0x0250, 0x88},
-        {0x0238, sgxd_recipe_va(r, SGXD_R_STREAM)},
+    const uint32_t t2[][3] = {
+        {0x0204, 0, KEPT_NONE},
+        {0x0208, r->mtile1, SGXD_KEPT_MTILE1},
+        {0x020c, r->mtile2, SGXD_KEPT_MTILE2},
+        {0x0210, r->te_screen, SGXD_KEPT_TE_SCREEN},
+        {0x0214, r->stride, SGXD_KEPT_STRIDE},
+        {0x0218, 0x00400000, KEPT_NONE},
+        {0x023c, 0xa2, KEPT_NONE},
+        {0x0240, 0x358637bd, KEPT_NONE},
+        {0x0244, 0x358637bd, KEPT_NONE},
+        {0x0248, r->mte_screen, SGXD_KEPT_MTE_SCREEN},
+        {0x0388, 0, KEPT_NONE},
+        {0x0250, 0x88, KEPT_NONE},
+        {0x0238, sgxd_recipe_va(r, SGXD_R_STREAM), KEPT_NONE},
     };
     for (unsigned n = 0; n < sizeof(t2) / sizeof(t2[0]); n++) {
-        wr(l, t2[n][0], t2[n][1]);
+        wr_entry(l, t2[n]);
     }
     for (unsigned c = 0; c < 4; c++) {
         wr(l, CORE(c, 0x021c), sgxd_recipe_va(r, SGXD_R_RGN0 + c));
@@ -1407,8 +1480,9 @@ void sgxd_recipe_ta_wait(SgxdOpList *l, uint32_t timeout_us) {
 
 void sgxd_recipe_ta_done(const SgxdRecipe *r, SgxdOpList *l) {
     (void)r;
+    // Every core's TA, TE and VDM clocks off: each core done tiling.
     for (unsigned c = 0; c < 4; c++) {
-        poll(l, CORE(c, 0x0008), 0x00100048, 0, SETUP_POLL_US);
+        poll(l, CORE(c, 0x0008), 0x00100048, 0, TA_CORES_POLL_US);
     }
     const uint32_t t5[][2] = {
         {0x4320, 1}, {0x4320, 0}, {0x0320, 1}, {0x0320, 0}, {0x0134, 0x2000}, {0x4134, 0x2000},
@@ -1431,6 +1505,9 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
     wr(l, 0x0080, 0x40);
     wr(l, 0x0080, 0);
     wr(l, 0x0a10, sgxd_recipe_va(r, SGXD_R_CF) >> 6 | 1u << 26);
+    if (sgxd_recipe_code_heap) {
+        wr(l, 0x0a18, sgxd_recipe_code_heap >> 6 | 1u << 26);
+    }
     wr(l, 0x0cac, r->req_base);
     wr(l, 0x0cb0, r->req_base);
     // D1: the DPM. With the shared buffer, Sony's: the TA's slot 1 into the scene's DPMSLOT table and the table
@@ -1484,22 +1561,47 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
     }
 
     // D2: ISP, PBE and the pixel event.
-    const uint32_t d2[][2] = {
-        {0x04c0, 0}, {0x040c, 0}, {0x0410, 0}, {0x0400, 0x80}, {0x0404, 0},
-        {0x0408, sgxd_recipe_va(r, SGXD_R_RGN0)}, {0x4510, sgxd_recipe_va(r, SGXD_R_RGN1)},
-        {0x4514, sgxd_recipe_va(r, SGXD_R_RGN2)}, {0x4518, sgxd_recipe_va(r, SGXD_R_RGN3)},
-        {0x451c, r->rgn_size}, {0x0414, 0}, {0x0418, 1}, {0x041c, 0x1e3ce508},
-        {0x0420, 0x1e3ce508}, {0x050c, sgxd_recipe_va(r, SGXD_R_EXTZ)}, {0x0424, 0xe9},
-        {0x042c, 0}, {0x044c, 0}, {0x0480, r->zls[0]}, {0x0484, r->zls[1]},
-        {0x0488, r->zls[2]}, {0x048c, r->zls[3]}, {0x0490, r->zls[4]},
-        {0x04b8, r->bgobjdepth}, {0x04bc, r->bgobj}, {0x04c4, r->bgobjtag},
-        {0x04c8, 0x88}, {0x04cc, 0x188}, {0x04dc, 8}, {0x0520, r->mtile1},
-        {0x0524, r->mtile2}, {0x0528, r->stride}, {0x0148, r->double_pixels},
-        {0x0a5c, r->pixev_va}, {0x0a60, r->pixev_units},
-        {0x0a64, r->pixev_attribute_size << 13}, {0x0ae8, 0},
+    const uint32_t d2[][3] = {
+        {0x04c0, 0, KEPT_NONE},
+        {0x040c, 0, KEPT_NONE},
+        {0x0410, 0, KEPT_NONE},
+        {0x0400, sgxd_recipe_pixelbe, KEPT_NONE},
+        {0x0404, 0, KEPT_NONE},
+        {0x0408, sgxd_recipe_va(r, SGXD_R_RGN0), KEPT_NONE},
+        {0x4510, sgxd_recipe_va(r, SGXD_R_RGN1), KEPT_NONE},
+        {0x4514, sgxd_recipe_va(r, SGXD_R_RGN2), KEPT_NONE},
+        {0x4518, sgxd_recipe_va(r, SGXD_R_RGN3), KEPT_NONE},
+        {0x451c, r->rgn_size, SGXD_KEPT_RGN_SIZE},
+        {0x0414, 0, KEPT_NONE},
+        {0x0418, 1, KEPT_NONE},
+        {0x041c, 0x1e3ce508, KEPT_NONE},
+        {0x0420, 0x1e3ce508, KEPT_NONE},
+        {0x050c, sgxd_recipe_va(r, SGXD_R_EXTZ), KEPT_NONE},
+        {0x0424, 0xe9, KEPT_NONE},
+        {0x042c, 0, KEPT_NONE},
+        {0x044c, 0, KEPT_NONE},
+        {0x0480, r->zls[0], SGXD_KEPT_ZLS0},
+        {0x0484, r->zls[1], SGXD_KEPT_ZLS0 + 1},
+        {0x0488, r->zls[2], SGXD_KEPT_ZLS0 + 2},
+        {0x048c, r->zls[3], SGXD_KEPT_ZLS0 + 3},
+        {0x0490, r->zls[4], SGXD_KEPT_ZLS0 + 4},
+        {0x04b8, r->bgobjdepth, SGXD_KEPT_BGOBJDEPTH},
+        {0x04bc, r->bgobj, SGXD_KEPT_BGOBJ},
+        {0x04c4, r->bgobjtag, SGXD_KEPT_BGOBJTAG},
+        {0x04c8, 0x88, KEPT_NONE},
+        {0x04cc, 0x188, KEPT_NONE},
+        {0x04dc, 8, KEPT_NONE},
+        {0x0520, r->mtile1, SGXD_KEPT_MTILE1},
+        {0x0524, r->mtile2, SGXD_KEPT_MTILE2},
+        {0x0528, r->stride, SGXD_KEPT_STRIDE},
+        {0x0148, r->double_pixels, SGXD_KEPT_DOUBLE_PIXELS},
+        {0x0a5c, r->pixev_va, KEPT_NONE},
+        {0x0a60, r->pixev_units, KEPT_NONE},
+        {0x0a64, r->pixev_attribute_size << 13, KEPT_NONE},
+        {0x0ae8, 0, KEPT_NONE},
     };
     for (unsigned n = 0; n < sizeof(d2) / sizeof(d2[0]); n++) {
-        wr(l, d2[n][0], d2[n][1]);
+        wr_entry(l, d2[n]);
     }
     if (sgxd_recipe_events_owned) {
         slc_request(l, 0x44);

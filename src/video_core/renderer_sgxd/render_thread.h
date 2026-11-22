@@ -69,6 +69,12 @@ public:
     RenderThread(const RenderThread&) = delete;
     RenderThread& operator=(const RenderThread&) = delete;
 
+    struct GuestRange {
+        PAddr addr;
+        u32 bytes;
+    };
+    using DrawTextures = std::array<GuestRange, 8>;
+
     // The rasterizer interface, for the emulation side. Each call queues; the Accelerate ones
     // answer true, as RasterizerSgxd's always do (it stops the emulator on what it cannot do).
     void AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
@@ -120,6 +126,10 @@ public:
     /// jitter around the display's frame.
     void Present(const std::array<Pica::FramebufferConfig, 2>& fb,
                  const std::array<Pica::ColorFill, 2>& fill);
+
+    /// A guest frame's end, each vblank, presented or not: the rasterizer's next draws start a
+    /// new frame (RasterizerGxm::EndFrame), in order with the work.
+    void EndFrame();
 
     /// Parks the thread once it has run everything queued; nests. Under the GPU's lock, which
     /// the caller may let go of and take again while the hold lasts.
@@ -194,12 +204,6 @@ private:
     /// render side compares with its copy, logging each register, uniform and table that
     /// differs once.
     void PutCheck();
-    /// Emulation side, before a draw: the colour buffer and the enabled textures' guest bytes in
-    /// FCRAM move to CDRAM (MakeUncached, held as GPU::KeepUncached holds), so that the passes
-    /// store into the buffer and the untiles read the textures with no CPU cache work (the
-    /// rasterizer asserts it for the buffer). Guest VRAM, and FCRAM moved already, cost a
-    /// range check.
-    void KeepTargetUncached();
     void RunCheck(const u8* payload);
     bool check{};
     /// A record of `bytes` payload bytes; the returned pointer is where they go.

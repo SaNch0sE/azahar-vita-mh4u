@@ -92,7 +92,7 @@ typedef struct SgxdOp {
 #define SGXD_DUMP_BANK_REGS 266u
 #define SGXD_DUMP_CORE_REGS 399u
 
-#define SGXD_VERSION 6
+#define SGXD_VERSION 13
 
 // sgxdEvents (version 4; 13: the microkernel's alone): the SGX's host interrupt (GIC 0x34,
 // SceGpu's "SceGpuLisr" otherwise) is sgxd's while the app has registered this page. The async
@@ -133,11 +133,10 @@ int sgxdUnmap(uint32_t gpu_va, uint32_t size);
 int sgxdCacheRange(const void *user_va, uint32_t size, uint32_t op);
 
 // Debugging (version 3).
-// sgxdFaultDump: the dump sgxdSubmit took itself the moment a poll timed out, before the app
-// could do anything else, in sgxdDump's layout with header words [2] SGXD_DUMP_FAULT, [3] the
-// op's index, [4] its register, [5] the value it wanted, [6] its mask, [7] the last read, [8]
-// the microseconds waited, [9] the system time's low word. The status registers a hang is read
-// by go to the kernel console at the same moment. Returns SGXD_DUMP_WORDS, or 0 when no poll
+// sgxdFaultDump: the dump sgxdSubmit took when a poll timed out, in sgxdDump's layout with
+// header words [2] SGXD_DUMP_FAULT, [3] the op's index, [4] its register, [5] the value it
+// wanted, [6] its mask, [7] the last read, [8] the microseconds waited, [9] the system time's
+// low word, [13] its kind (SGXD_OP_*, version 7). Returns SGXD_DUMP_WORDS, or 0 when no poll
 // has timed out since the module loaded; the next timeout replaces it.
 int sgxdFaultDump(uint32_t *words, uint32_t count);
 // sgxdReadRegs: count consecutive registers from reg (4-byte aligned, the master bank and the

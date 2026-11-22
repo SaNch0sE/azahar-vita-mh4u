@@ -4,15 +4,20 @@
 //
 // The PICA command-list fast path, hand-written for Thumb-2.
 //
-// The C++ version batches four commands through stack arrays so the compiler can try to
-// vectorize; on ARM32 it never does, and the staging becomes pure stack traffic around every
-// LUT access. This loop applies each plain register write immediately instead: one LDRD for
-// the {value, header} pair walked by pointer (with a PLD running ahead, since the guest
-// rewrote these lines this frame and they arrive cold), UBFX/TST field checks, one flags-LUT
-// halfword, the mask-expansion word, an EOR-blended read-modify-write of the register file,
-// and a byte-wise dirty-bitmap update. It exits at the first command needing special handling
-// (extra data, out-of-range id, or a flags-LUT hit) and the C++ caller runs that one through
-// the slow path.
+// The C++ version batches four commands through stack arrays so the compiler can try to vectorize;
+// on ARM32 it never does, and the staging becomes pure stack traffic around every LUT access. This
+// loop applies each plain register write immediately instead: one LDRD for the {value, header}
+// pair walked by pointer (no PLD: the list's lines are mostly in the cache by now), UBFX/TST field
+// checks, one flags-LUT halfword, the mask-expansion word, an EOR-blended read-modify-write of the
+// register file, and a byte-wise dirty-bitmap update, both only when the write changes a bit
+// (games rewrite most registers before each draw with the values they hold), so the dirty marks
+// name the registers that changed.
+//
+// A group write (extra data with group_commands set) whose registers are all plain is applied here
+// too, register by register with the same mask. It exits at the first command needing special
+// handling (a flags-LUT hit, an out-of-range id, a same-register batch, a group that reaches a
+// special register or past the register file or the list's end) and the C++ caller runs that one
+// through the slow path.
 //
 //   extern "C" u32 PicaCmdListFastLoop(const u32* head, u32 index, u32 length,
 //                                      const u16* flags_lut, const u32* expand_lut,
@@ -99,20 +104,8 @@ PicaCmdListFastLoop:
 
     ubfx    r12, r10, #16, #4       // parameter mask nibble
     ldr     r12, [r4, r12, lsl #2]  // ExpandBitsToBytes[mask]
-    ldr     r10, [r5, r11, lsl #2]  // old register value (header dead)
-    eor     r9, r9, r10             // EOR-blend: old ^ ((old ^ new) & mask)
-    and     r9, r9, r12
-    eor     r10, r10, r9
-    str     r10, [r5, r11, lsl #2]
-
-    lsr     r8, r11, #3             // dirty byte index
-    and     r12, r11, #7
-    ldrb    r10, [r6, r8]
-    lsl     r9, lr, r12
-    orr     r10, r10, r9
-    strb    r10, [r6, r8]
-
-    adds    r1, #8
+    APPLY   r11, r9, r8, 4f
+4:  adds    r1, #8
     adds    r7, #1
     b       1b
 

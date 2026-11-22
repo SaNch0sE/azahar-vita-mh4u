@@ -18,6 +18,9 @@
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/renderer_sgxd.h"
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <psp2/kernel/error.h>
 #include <psp2/kernel/threadmgr.h>
 #include "sgxd.h"
@@ -55,6 +58,8 @@ enum class RenderThread::Op : u16 {
     GpuIdle,
     Fence,
     Present,
+    FrameEnd,   ///< a guest frame's end, each vblank: RasterizerGxm::EndFrame
+    GuestWrote, ///< T12: a watched texture page's address, written by the guest or the HLE
     Call,
     Check, ///< rendercheck: CheckRecord
 };
@@ -242,13 +247,31 @@ RenderThread::~RenderThread() {
     sceKernelDeleteEventFlag(wake_flag);
 }
 
-void RenderThread::SyncState() {
-    // Registers: each one the command lists or the GPU's own writes marked since the last call.
-    auto& dirty = pica.dirty_regs;
+namespace {
+/// The dirty registers marked, counted with NEON (ARMv7 has no popcount).
+u32 CountDirty(const Pica::DirtyRegs& dirty) {
+#if defined(__ARM_NEON)
+    static_assert(sizeof(dirty.qwords) % 16 == 0);
+    const u8* const bytes = reinterpret_cast<const u8*>(dirty.qwords.data());
+    uint16x8_t sums = vdupq_n_u16(0);
+    for (std::size_t at = 0; at < sizeof(dirty.qwords); at += 16) {
+        sums = vpadalq_u8(sums, vcntq_u8(vld1q_u8(bytes + at)));
+    }
+    const uint64x2_t pairs = vpaddlq_u32(vpaddlq_u16(sums));
+    return static_cast<u32>(vget_lane_u64(vadd_u64(vget_low_u64(pairs), vget_high_u64(pairs)), 0));
+#else
     u32 count = 0;
     for (const u64 q : dirty.qwords) {
         count += static_cast<u32>(std::popcount(q));
     }
+    return count;
+#endif
+}
+} // namespace
+
+void RenderThread::SyncState() {
+    auto& dirty = pica.dirty_regs;
+    const u32 count = CountDirty(dirty);
     if (count != 0) {
         u8* p = Begin(Op::Regs, sizeof(dirty.qwords) + count * sizeof(u32));
         std::memcpy(p, dirty.qwords.data(), sizeof(dirty.qwords));
@@ -609,6 +632,49 @@ void RenderThread::AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputV
     Put(Op::AddTriangle, TriangleRecord{{v0, v1, v2}});
 }
 
+namespace {
+u32 TextureRanges(const Pica::RegsInternal& regs, RenderThread::DrawTextures& out);
+
+/// After a draw: a geometry shader that ran leaves b15 true until the game writes it again.
+void GsInvoked(Pica::PicaCore& p) {
+    const auto& pipeline = p.regs.internal.pipeline;
+    if (pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes && pipeline.num_vertices != 0) {
+        p.gs_setup.uniforms.b[15] = true;
+    }
+}
+} // namespace
+
+void RenderThread::DrawMerged(const u16* vertices, u32 count) {
+    // The run as one draw indexed by its vertices' numbers, 16-bit; while b15 is false, the run's first
+    // draw alone first.
+    auto& regs = render_pica.regs.internal.reg_array;
+    constexpr u32 NumReg = PICA_REG_INDEX(pipeline.num_vertices);
+    constexpr u32 IndexReg = PICA_REG_INDEX(pipeline.index_array);
+    const u32 num = regs[NumReg], index = regs[IndexReg];
+    for (u32 at = 0; at < count;) {
+        const u32 n = at == 0 && !render_pica.gs_setup.uniforms.b[15] ? 1 : count - at;
+        regs[NumReg] = n;
+        regs[IndexReg] = index | 1u << 31;
+        render_pica.dirty_regs.Set(NumReg);
+        render_pica.dirty_regs.Set(IndexReg);
+        rasterizer.GsIndices(reinterpret_cast<const u8*>(vertices + at), true);
+        const auto [lo, hi] = std::minmax_element(vertices + at, vertices + at + n);
+        rasterizer.ScannedIndices(*lo, *hi);
+        [[maybe_unused]] const bool drawn = rasterizer.AccelerateDrawBatch(true);
+        DEBUG_ASSERT(drawn);
+        GsInvoked(render_pica);
+        at += n;
+    }
+    regs[NumReg] = num;
+    regs[IndexReg] = index;
+    render_pica.dirty_regs.Set(NumReg);
+    render_pica.dirty_regs.Set(IndexReg);
+#ifdef VITA_DIAGNOSTICS
+    merged_draws.fetch_add(count, std::memory_order_relaxed);
+    merged_runs.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
 void RenderThread::DrawTriangles() {
     SyncState();
     Put(Op::DrawTriangles);
@@ -641,15 +707,11 @@ bool RenderThread::AccelerateDma(PAddr src, PAddr dst, u32 size) {
 
 namespace {
 
-/// A range of guest memory a draw's GPU work reads or writes.
-struct GuestRange {
-    PAddr addr;
-    u32 bytes;
-};
-
 /// The guest bytes the enabled texture units sample: each unit's chain down to a side of 8, a
 /// cube's for each face.
-u32 TextureRanges(const Pica::RegsInternal& regs, std::array<GuestRange, 8>& out) {
+using GuestRange = RenderThread::GuestRange;
+
+u32 TextureRanges(const Pica::RegsInternal& regs, RenderThread::DrawTextures& out) {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
     using F = Pica::TexturingRegs::TextureFormat;
     u32 n = 0;
@@ -689,9 +751,7 @@ u32 TextureRanges(const Pica::RegsInternal& regs, std::array<GuestRange, 8>& out
 
 } // namespace
 
-void RenderThread::KeepTargetUncached() {
-    std::array<GuestRange, 8> textures;
-    const u32 count = TextureRanges(pica.regs.internal, textures);
+void RenderThread::KeepTargetUncached(const DrawTextures& textures, u32 count) {
     const auto& fb = pica.regs.internal.framebuffer.framebuffer;
     const GuestRange colour{fb.GetColorBufferPhysicalAddress(),
                             fb.GetWidth() * fb.GetHeight() *
@@ -757,7 +817,9 @@ bool RenderThread::AccelerateImmediateVertex(const Pica::AttributeBuffer& input)
 }
 
 void RenderThread::FlushImmediate() {
-    KeepTargetUncached();
+    DrawTextures textures;
+    const u32 count = TextureRanges(pica.regs.internal, textures);
+    const PublishTogether together{*this};
     SyncState();
     if (check) {
         PutCheck();
@@ -919,6 +981,10 @@ void RenderThread::Present(const std::array<Pica::FramebufferConfig, 2>& fb,
     // The record's position, before it is published.
     newest_present.store(write, std::memory_order_relaxed);
     Commit();
+}
+
+void RenderThread::EndFrame() {
+    Put(Op::FrameEnd);
 }
 
 void RenderThread::Hold() {
@@ -1133,6 +1199,9 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
 #endif
             }
         }
+        if ((h.f[0] | h.f[1] | h.f[2]) != 0) {
+            setup.f_version++;
+        }
         if (h.bool_int) {
             std::memcpy(setup.uniforms.b.data(), values, sizeof(setup.uniforms.b));
             std::memcpy(setup.uniforms.i.data(), values + sizeof(setup.uniforms.b),
@@ -1307,6 +1376,9 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
 #endif
         break;
     }
+    case Op::FrameEnd:
+        rasterizer.EndFrame();
+        break;
     case Op::GuestWrote: {
         u32 addr;
         take(addr);

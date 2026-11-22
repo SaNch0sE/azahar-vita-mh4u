@@ -10,15 +10,17 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include "video_core/pica/regs_texturing.h"
 #include "video_core/rasterizer_accelerated.h"
 #include "video_core/renderer_gxm/guest_gpu_memory.h"
 #include "video_core/renderer_gxm/gxm_shader_tier.h"
+#include "video_core/renderer_gxm/key_index.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
+#include "video_core/renderer_gxm/state_regs.h"
 #include "video_core/renderer_gxm/usse/usse_program.h"
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
+#include "video_core/shader/generator/pica_fs_config.h"
 #include "video_core/shader/generator/profile.h"
 
 namespace Pica {
@@ -76,9 +78,7 @@ public:
     void FlushAndInvalidateRegion(PAddr addr, u32 size) override;
     void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
-    /// A guest frame has been presented (RendererGxm::PresentFrame, each VBlank, on the render
-    /// thread): the next draws start a new frame, whose first use of an FCRAM texture untiles
-    /// it again (TextureFor).
+    /// A guest frame has ended (each VBlank, its present shown or dropped): the draw logs count frames.
     void EndFrame() {
         frames++;
 #ifdef VITA_DIAGNOSTICS
@@ -231,7 +231,7 @@ private:
         u32 parts;        // 1, or a cube's 6 faces (SWIZZLED squares, one level)
         std::array<PAddr, 6> part_addr; // the guest's, in the host copy's order
         u32 part_bytes;   // a part's guest bytes: the levels back to back, or a face
-        bool dirty;       // a fill, DMA or transfer wrote over the guest bytes
+        u32 checked_seq;  // write_seq at its untile, or when TextureWritten last found none
         bool alpha_one = false; // a surface without alpha, read as a texture (swizzle bit 2)
         u32 last_used = 0;      // the pass count when a draw last took it (eviction order)
         SgxdBackend::Data alpha{}; // a split ETC1A4's A8 chain (alpha_bytes 0: none)
@@ -247,7 +247,15 @@ private:
 #endif
     };
 
-    /// A vertex program placed in the code heap, for one PICA program and draw shape.
+    /// A vertex program's SA slot that VertexSa fills each draw, one per uniform but the float bank.
+    struct VertexSaSlot {
+        Usse::UniformKind kind;
+        u8 components;
+        u8 index;    ///< DefaultInput's input register
+        u32 sa;      ///< the slot's first float in the SA image
+        u32 array_size;
+        u32 uniform; ///< its index in usse.uniforms, for messages
+    };
     struct VertexProgram {
         Usse::Program usse;
         u32 input_regs;
@@ -255,7 +263,40 @@ private:
         u32 secondary_doutu0;
         u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
         bool tier2_queued; ///< sent to the second tier (or never to be)
+        std::vector<VertexSaSlot> sa_slots;
+        /// The SA image's words (the secondary PDS program DMAs them all), and its fixed part.
+        u32 sa_words;
+        std::vector<float> sa_image;
+        /// VertexSa's image, put together in cached memory before its one copy into the pass data; every
+        /// draw writes the same words of it again.
+        mutable std::vector<float> sa_scratch;
+        /// The last image VertexSa put in the pass data, its pass and where: a draw with the same image
+        /// takes that copy and its secondary PDS program.
+        mutable std::vector<float> sa_last;
+        mutable u32 sa_last_pass = ~0u;
+        mutable SgxdBackend::Data sa_last_data{};
+        mutable std::array<u32, 3> vdm_words{};
+        mutable u32 vdm_sa = ~0u;
+        /// uniforms_f, the whole float bank, in the buffer the SA's pointer names.
+        bool has_bank;
+        u32 bank_offset; ///< its first float in the buffer
+        u32 bank_rows;
+        /// The Input attribute's first primary attribute register by input register; ~0u: none.
+        std::array<u32, 16> attr_resource;
     };
+    static void ResolveVertexProgram(VertexProgram& v);
+    /// The buffer a program's SA pointer names (zeros and the float bank), built once and named again
+    /// while its shape, the float uniforms' version and the pass stay the same.
+    struct BankUpload {
+        u32 pass;
+        const Pica::ShaderSetup* setup; ///< null: no bank, the buffer all zeros
+        u32 version;
+        u32 floats, offset, rows;
+        u32 gpu;
+    };
+    std::array<BankUpload, 8> bank_uploads{};
+    u32 bank_upload_next = 0;
+    [[nodiscard]] u32 BankBuffer(const VertexProgram& vp, const Pica::ShaderSetup& setup);
 
     /// Where a fragment uniform's value is in FSUniformData: `count` elements of `components` values,
     /// `stride` bytes apart, into the SA block at `sa` (elements four floats apart).
@@ -294,6 +335,11 @@ private:
         Epilogue epilogue; ///< what its code ends with
         u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
         bool tier2_queued; ///< sent to the second tier (or never to be)
+        mutable std::vector<u32> sa_last;
+        mutable u32 sa_last_pass = ~0u;
+        mutable SgxdBackend::Data sa_last_data{};
+        mutable std::vector<u32> buf_last; ///< its memory buffer's, if it has one
+        mutable SgxdBackend::Data buf_last_data{};
         mutable u32 pixel_size = 0;
         mutable u32 pixel_size_sa = ~0u;
     };
@@ -331,7 +377,7 @@ private:
 
     struct VertexStage {
         const VertexProgram* vp{};
-        std::array<SgxdVertexFetch, SGXD_PROGRAM_MAX_FETCH> fetch{};
+        std::array<SgxdVertexFetch, SGXD_PROGRAM_MAX_FETCH> fetch;
         u32 fetch_count{};
         u32 indices{};    // a 16-bit index list's GPU address, 0 for the identity list
         u32 count{};      // the indices the draw takes
@@ -400,10 +446,17 @@ private:
     /// quad of one w): the program reads the tile's colour for them, and the pass need not end.
     u32 OwnPixelUnits(bool is_indexed, const float* immediate, u32 count);
     std::unique_ptr<Pica::ShaderEngine> cover_engine;
+    DrawView draw_view{};
     /// The vertex program's SA block: its uniforms from `setup`, its literals and buffer
     /// pointer; `vsec_sa` its words.
-    SgxdBackend::Data VertexSa(const Usse::GxpProgram& vg, const Pica::ShaderSetup& setup,
+    SgxdBackend::Data VertexSa(const VertexProgram& vp, const Pica::ShaderSetup& setup,
                                u32& vsec_sa, const Describe& describe);
+    /// For each VS input register, the attribute whose default value it reads, -1 for none; made again
+    /// only when the attribute mask or the input map changed.
+    const std::array<s8, 16>& DefaultInputAttributes();
+    std::array<s8, 16> default_input_attr{};
+    std::array<u32, 3> default_input_key{};
+    bool default_input_valid = false;
     /// The vertex side of a draw's programs: the fetch and secondary PDS programs, the VDM words, the
     /// output selects.
     void VertexPrograms(const VertexStage& stage, const SgxdBackend::Data& vsa, u32 vsec_sa,
@@ -436,12 +489,12 @@ private:
                                          u64 emit_us = 0);
     void InstallTier2();
     void InstallVertexTier2(ShaderTier2::Result& result);
-    /// The host copy of texture unit `unit`'s texture for the open pass: untiled when it is
-    /// new, in every pass that samples it for FCRAM (no hash: the guest CPU's writes leave no
-    /// mark), and for VRAM when a GPU operation wrote over it. ETC1 stays compressed. Its untile
-    /// is queued (SgxdBackend::QueueUntile): the copy moves at each one, and the pass's
-    /// untiles of a kind are one side render, sent before the pass's own.
+    /// The host copy of texture unit `unit`'s texture for the open pass: untiled when new or written
+    /// over (queued, SgxdBackend::QueueUntile). A unit whose register words match a memo takes its
+    /// texture without TextureFromRegs.
     const Texture& TextureFor(u32 unit);
+    /// TextureFor from the unit's registers. `written`: the memo found a write over it.
+    Texture& TextureFromRegs(u32 unit, bool written);
     /// Whether the unit holds an ETC1A4 texture split into compressed colour and an A8 alpha texture.
     bool SplitAlpha(u32 unit) const;
     /// The alpha texture's words of a split unit from its colour's, over its A8 chain (swizzle R000).
@@ -453,8 +506,9 @@ private:
     /// The sampler's four state words for the unit's texture, which it returns (NullTexture when off).
     const Texture& TextureWords(u32 unit, u32 words[4]);
     const Texture& NullTexture(u32 unit);
-    /// Marks the textures over [start, end) to be untiled again.
+    /// A GPU write over [start, end): its pages stamped, so the textures over them are untiled again.
     void TexturesWritten(PAddr start, PAddr end);
+    bool TextureWritten(Texture& texture);
     /// The lighting and fog LUTs the guest changed into fresh rows, fs_data's offsets pointed at them.
     void SyncLutLf();
     /// The same for the proctex colour map, alpha map, colour and colour-difference tables.
@@ -483,7 +537,33 @@ private:
     /// Textures by address: a bucket for each 4 KiB guest page (TextureBucket), each a chain of the
     /// textures starting there (Texture::bucket_next).
     std::vector<Texture*> texture_buckets;
+    /// Each guest page's last GPU write as a write_seq stamp: a texture reads its own pages' stamps at
+    /// its next use.
+    std::vector<u32> page_writes;
+    u32 write_seq{};
+    /// How many textures' parts cover each guest page: a write over pages none covers stamps nothing.
+    std::vector<u16> page_textures;
+    /// TextureFor's last result for each unit: the five register words, their XOR, the texture and
+    /// texture_drops then. A unit whose words match any of the three takes its texture at once; a cube
+    /// is never memoised.
+    struct TextureMemo {
+        std::array<u32, 5> words{};
+        u32 hash = 0;
+        Texture* texture = nullptr;
+        u32 drops = 0;
+    };
+    std::array<TextureMemo, 3> texture_memos{};
+    u32 texture_drops{}; ///< DropTexture's count: a memo from before one is stale
     static u32 TextureBucket(PAddr addr);
+    /**
+     * The bytes of [addr, addr + bytes) that guest memory holds. A texture may run past VRAM's
+     * end: only its pages up to there are tracked, and its untile reads on into the filler mapped
+     * past VRAM (GuestGpuMemory::PastVramBytes), the texels past the end undefined. Past the
+     * filler or FCRAM's end is not built.
+     */
+    static u32 ReadableBytes(PAddr addr, u32 bytes);
+    /// The first and last page (TextureBucket) of the texture's part k, up to ReadableBytes.
+    static std::pair<u32, u32> PartPages(const Texture& texture, u32 k);
     Texture* FindTexture(PAddr addr) const;
     void IndexTexture(Texture& texture);
     void DropTexture(Texture& texture);
@@ -492,13 +572,12 @@ private:
     /// h * (y odd), h, 0.
     SgxdBackend::Data noise_table{};
     u32 NoiseTable();
-    std::unordered_map<u64, VertexProgram> vertex_programs;
+    KeyIndex<VertexProgram> vertex_programs;
     /**
      * VertexStageFor's decoded vertex formats, by the raw registers that describe one: the
      * attribute formats, each loader's component list, stride and component count, the VS
-     * input count and input map (VertexLayoutKey). Not the addresses: the base and the
-     * loaders' offsets change mesh by mesh and are added per draw. Most recently used first.
-     * Each also keeps the vertex program it resolved to, by the program's own inputs
+     * input count and input map (StateRegs::Layout). Not the addresses: the base and the
+     * loaders' offsets change mesh by mesh and are added per draw. Each also keeps the vertex program it resolved to, by the program's own inputs
      * (VertexProgramKey), once that program has drawn the draws before its second tier.
      */
     struct VertexLayout {
@@ -508,7 +587,6 @@ private:
             u32 offset; ///< from the loader's start of a vertex
             u32 stride, words;
         };
-        std::array<u32, KeyWords> key{};
         std::array<Attribute, 16> attributes{};
         u32 count = 0;
         u16 enabled_regs = 0, u8_regs = 0, s8_regs = 0, s16_regs = 0;
@@ -516,14 +594,72 @@ private:
         std::array<u32, ProgramKeyWords> program_key{};
         const VertexProgram* program = nullptr;
     };
-    std::array<VertexLayout, 8> vertex_layouts{};
-    u32 vertex_layout_count = 0;
-    /// The open draw's vertex format, decoded or found, at vertex_layouts[0].
+    /// The vertex formats met, by their registers' hash, hashed again only after one changed.
+    KeyIndex<VertexLayout> vertex_layouts;
+    static constexpr u32 MaxVertexLayouts = 1024; ///< past which vertex_layouts starts again
+    VertexLayout* last_layout = nullptr;
+    u64 last_layout_regs = 0;
     VertexLayout& VertexLayoutFor();
+    VertexLayout DecodeVertexLayout() const;
     /// The raw words VertexProgramFor's program depends on past the layout.
     std::array<u32, VertexLayout::ProgramKeyWords> VertexProgramKey(Usse::VsMode mode);
-    std::unordered_map<u64, u16> used_bools;
-    std::unordered_map<u64, FragmentProgram> fragment_programs;
+    KeyIndex<u16> used_bools;
+    /// The second tier by fragment config (ShaderTier1::ConfigKey): the program is the config's
+    /// under every epilogue, so one job a config. The programs waiting for it, and once done the
+    /// program, for the epilogues that come later.
+    struct Tier2Config {
+        std::optional<Usse::Program> program;
+        std::vector<u64> waiting;
+    };
+    KeyIndex<Tier2Config> tier2_configs;
+    /// The program of `key` to the config's second tier: queued once a config, or taken now.
+    void QueueFragmentTier2(u64 key, const Pica::Shader::FSConfig& config);
+    void InstallFragmentTier2(u64 key, const Usse::Program& program);
+    /// What each geometry program's code says, by its code's hash and entry: its
+    /// Usse::GsTriangleBound (0: none), and Usse::GsIndexesUniforms.
+    struct GsCodeFacts {
+        u32 bound;
+        bool indexes_uniforms;
+    };
+    KeyIndex<GsCodeFacts> gs_code_facts;
+    GsCodeFacts GsFacts();
+    /// Whether the geometry program set now gets its table of uniforms in this mode
+    /// (Usse::VsRequest::gs_uniform_table).
+    bool GsUniformTable(bool rows_uniform, bool rows_table) {
+        return rows_uniform && !rows_table && GsFacts().indexes_uniforms;
+    }
+    KeyIndex<FragmentProgram> fragment_programs;
+    /**
+     * FragmentProgramFor's programs by the hash of the registers FSConfig is built from
+     * (StateRegs::Fragment, hashed again only after one of them changed) and the epilogue's
+     * key: FSConfig, 272 bytes
+     * built from those registers and hashed with XXH3's long path, only for a state not met yet.
+     * A draw whose registers and epilogue are the last draw's keeps its program.
+     */
+    struct FragmentState {
+        FragmentProgram* program;
+        u64 key; ///< the program's in fragment_programs
+    };
+    KeyIndex<FragmentState> fragment_states;
+    /// States, past which fragment_states starts again (the texture sizes are among its words).
+    static constexpr u32 MaxFragmentStates = 1u << 14;
+    FragmentProgram* last_fragment = nullptr;
+    u64 last_fragment_key = 0;
+    u64 last_fragment_regs = 0;
+    u64 last_fragment_epilogue = 0;
+    u32 last_fragment_own = 0;
+    /// The open pass's colour buffer bytes its draws covered so far, whole tile rows.
+    PAddr pass_drawn_lo = 0;
+    PAddr pass_drawn_hi = 0;
+    std::array<UnitRead, 3> unit_reads{};
+    u32 draw_own_pixel = 0;
+    /// FSConfig from the registers, with the sgxd_flags' changes and the units' alpha split.
+    Pica::Shader::FSConfig FragmentConfig() const;
+    /// The hashes of StateRegs' sets, and whether a set's registers changed since.
+    u64 fragment_regs_hash = 0;
+    u64 layout_regs_hash = 0;
+    bool fragment_regs_dirty = true;
+    bool layout_regs_dirty = true;
     std::optional<std::pair<u32, u32>> scanned_indices;
     std::vector<u8> gs_indices;
     bool gs_indices_set = false;
@@ -546,6 +682,9 @@ private:
     /// The LUT rings' halves in use, and each half's pass mark when it was left.
     u32 lut_half{}, proctex_half{};
     std::array<u32, 2> lut_half_mark{}, proctex_half_mark{};
+    /// The lighting LUT rows of the current half by their table's contents: a table this half holds
+    /// takes that row again. Cleared when the ring moves to its other half.
+    KeyIndex<u32> lut_rows_by_contents;
     /// The procedural textures' tables, kept as the fog tables: the current half's by the guest
     /// tables' contents and the registers the table is made from (proctex_table_regs).
     SgxdBackend::Data proctex_tables{};
@@ -582,6 +721,9 @@ private:
     std::array<u32, 16> gs_last_rows{};
     /// The rows KeepGsRows copied out of a room a pass took, a 16-byte row a register.
     SgxdBackend::Data gs_kept_rows{};
+    /// A geometry draw's row no attribute fills: zeros, kept for good.
+    SgxdBackend::Data gs_zero_row{};
+    std::vector<u16> gs_list;
     /// Draw's fragment SA image and its memory buffer, made here and copied out whole.
     std::vector<u32> fsa_scratch;
     std::vector<u32> fbuf_scratch;
@@ -621,7 +763,7 @@ private:
     u32 draws{};
     u32 gs_draws{};
     u32 passes{};
-    u32 frames{}; ///< frames presented (EndFrame)
+    u32 frames{}; ///< guest frames ended (EndFrame)
 #ifdef VITA_DIAGNOSTICS
     bool vprof_frame_start = false; // VprofFrameStart's own EndPass is not a frame's result
     int replay_limit = -2; // -2: no replay; -1: a replay of every draw
@@ -668,6 +810,16 @@ private:
     struct TextureStats {
         u32 untiles{};        ///< textures untiled: new, written by a GPU op, or cached FCRAM
         u64 untiled_bytes{};  ///< their guest bytes
+        u32 lookups{};        ///< TextureFor's calls
+        u32 memo_hits{};      ///< ... answered by a memo
+        u32 writes{};         ///< TexturesWritten's writes
+        u32 stamped{};        ///< ... over a texture's pages, which stamped them
+        u64 write_pages{};    ///< the pages they stamped
+        u32 checks{};         ///< lookups that read their pages' stamps (a write since their last)
+        u64 check_pages{};    ///< the pages read
+        u32 written{};        ///< ... that found a page written since
+        u32 shared{};         ///< ... by writes none of which overlapped the texture's bytes
+        u32 untold{};         ///< ... by writes older than write_ring: not told apart
         u32 null_samples{};   ///< samplers of a unit that is off (NullTexture)
         u32 tiny{};           ///< untiles of a texture with a side under 8 (UntileTiny)
         u64 tiny_texels{};    ///< ... their texels
@@ -678,29 +830,13 @@ private:
         u64 evictions_mark{}; ///< evictions at the second's start
         std::vector<std::pair<const char*, u32>> pass_ends;
     } texture_stats;
-    /// gxm_flags perflog + bankstats: the `perf: banks` and `perf: LUT rows` lines, with the
-    /// textures' (NoteBankBuild, NoteLutTable; the draw and lookup counts are kept always).
-    struct BankLutStats {
-        u32 draws{};
-        u32 bank_lookups{};   ///< BankBuffer calls for a program with a uniform bank
-        u32 bank_builds{};    ///< ... that built a new bank
-        u32 zero_builds{};    ///< buffers built for a program without one (zeros)
-        u64 bank_rows{};      ///< the rows the builds copied
-        /// Rows changed since the bank built 1, 8 and 32 builds before: what a ring of that
-        /// many banks, each patched with its changed rows, would copy (one history for the VS
-        /// and GS setups: their versions mix if both have banks).
-        std::array<u64, 3> changed_since{};
-        std::array<u32, 32> build_versions{}; ///< the f_version of the last builds, a ring
-        u32 build_count{};
-        u32 lut_tables{};      ///< lighting tables converted
-        u32 lut_ring_moves{};  ///< ... of them because the ring moved to its other half
-        u64 lut_entries_changed{}; ///< entries differing from the table's previous contents
-        u32 lut_seen_64{}, lut_seen_256{}; ///< contents converted within the last 64 / 256
-        u32 fog_tables{};
-        std::vector<std::array<u32, 256>> lut_shadow; ///< the 24 tables as last converted
-        std::array<u64, 256> lut_hashes{};             ///< the last conversions' contents
-        u32 lut_hash_count{};
-    } bank_lut_stats;
+    struct EmitStats {
+        std::array<u32, 3> programs{};
+        std::array<u64, 3> us{};
+        u32 flushes_mark{};
+    } emit_stats;
+    /// The last writes' ranges: whether a texture a check found written was, or only shares a page.
+    std::array<std::pair<PAddr, PAddr>, 256> write_ring{};
     void LogTextureStats();
     /// perflog: draws with the PICA's user clip plane on (sgxd gives the TA none).
     u32 clip_plane_draws{}, clip_plane_all{};

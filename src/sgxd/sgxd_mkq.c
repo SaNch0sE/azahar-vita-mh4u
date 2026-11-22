@@ -17,13 +17,12 @@
 
 #define W(r, v) {SGXD_OP_WRITE, (r), (v), 0, 0}
 
-// One CDRAM block of 512 KiB (two of CDRAM's 256 KiB units): the code, then the state. A 2 MiB
-// code block and a 256 KiB state block left a game without the 2 MiB of CDRAM a recipe made at 75 s
-// needs (diag37); the code had reached 24306 instructions there, a full code space flips.
-#define MK_BLOCK (512u << 10)
+// One CDRAM block: the code, then the state. A full code space flips: the GPU idles and every
+// shape is compiled again. 1.25 MiB holds about 150 render lists of ~1060 instructions.
+#define CODE_BLOCK (1280u << 10)
+#define MK_BLOCK (CODE_BLOCK + STATE_BLOCK)
 // The code: core 0's event program in its first page (mapped plain, as sgxd_test's are), the
 // code after it (READONLY), code base 14.
-#define CODE_BLOCK (256u << 10)
 #define CODE_OFFSET 0x1000u
 #define CODE_CAP ((CODE_BLOCK - CODE_OFFSET) / 8u)
 #define CODE_BASE_REG (0x0a0cu + 14u * 4u)
@@ -65,7 +64,7 @@ static void pds_douta_code(uint32_t code[PDS_DOUTA_WORDS]) {
 // The shapes compiled: a table by hash, each with its ops (values the job carries zeroed) and
 // variable marks in the pool, to compare exactly.
 #define SHAPES 2048u
-#define POOL_OPS 32768u
+#define POOL_OPS 65536u
 typedef struct Shape {
     uint64_t hash;
     uint32_t count, at, entry;
@@ -89,9 +88,66 @@ static uint32_t pool_used;
 // sgxd_mk_compile writes here (patches read back), then the words go to CDRAM in one copy.
 static uint64_t scratch[16384];
 
-uint32_t sgxd_mkq_compiles, sgxd_mkq_instructions;
 #ifdef VITA_DIAGNOSTICS
-uint32_t sgxd_mkq_flips;
+uint32_t sgxd_mkq_compiles, sgxd_mkq_instructions, sgxd_mkq_flips;
+uint8_t sgxd_mkq_kind_next;
+// Each job's kind, at its slot, and each placed wait's kind, at the index a run stores in RESUME
+// when it stops there (the code's window index; a flip places waits anew over the old ones).
+static uint8_t job_kind[SGXD_MKQ_JOBS];
+static uint8_t wait_kind[CODE_CAP];
+
+static void wait_placed(uint32_t at, const SgxdOp *op) {
+    if (at < CODE_CAP) {
+        wait_kind[at] = op->op == SGXD_OP_WAIT_TWOD ? SGXD_MKQ_WAIT_TWOD
+                        : op->mask == 0x00002000u   ? SGXD_MKQ_WAIT_TA
+                        : op->mask == 0x00040000u   ? SGXD_MKQ_WAIT_3D
+                                                    : SGXD_MKQ_WAIT_EVENT;
+    }
+}
+
+uint8_t sgxd_mkq_job_kind(uint32_t job) {
+    return job_kind[job & (SGXD_MKQ_JOBS - 1u)];
+}
+
+uint8_t sgxd_mkq_wait_kind(uint32_t resume) {
+    return resume < CODE_CAP ? wait_kind[resume] : SGXD_MKQ_WAIT_EVENT;
+}
+
+uint8_t sgxd_mkq_label_next;
+uint32_t sgxd_mkq_label_sent[SGXD_MKQ_LABELS];
+static uint8_t job_label[SGXD_MKQ_JOBS];
+static const char *label_what[SGXD_MKQ_LABELS];
+static uint32_t label_key[SGXD_MKQ_LABELS];
+static unsigned labels = 1;
+
+uint8_t sgxd_mkq_label(const char *what, uint32_t key) {
+    for (unsigned n = 1; n < labels; n++) {
+        if (label_what[n] == what && label_key[n] == key) {
+            return (uint8_t)n;
+        }
+    }
+    if (labels == SGXD_MKQ_LABELS) {
+        return 0;
+    }
+    label_what[labels] = what;
+    label_key[labels] = key;
+    // Published after its fields: perflog reads them from another thread.
+    __atomic_store_n(&labels, labels + 1, __ATOMIC_RELEASE);
+    return (uint8_t)(labels - 1);
+}
+
+const char *sgxd_mkq_label_what(uint8_t label, uint32_t *key) {
+    if (label == 0 || label >= __atomic_load_n(&labels, __ATOMIC_ACQUIRE)) {
+        *key = 0;
+        return "other";
+    }
+    *key = label_key[label];
+    return label_what[label];
+}
+
+uint8_t sgxd_mkq_job_label(uint32_t job) {
+    return job_label[job & (SGXD_MKQ_JOBS - 1u)];
+}
 #endif
 uint32_t sgxd_mkq_refused, sgxd_mkq_refused_kind;
 
@@ -220,7 +276,7 @@ static int kept_state(uint32_t reg) {
     const uint32_t r = reg & 0x3fffu;
     return (r >= 0x0200u && r <= 0x0250u && r != 0x0200u) || (r >= 0x0400u && r <= 0x04dcu &&
            r != 0x0428u && r != 0x043cu) || (r >= 0x0500u && r <= 0x0528u) ||
-           (r >= 0x0510u && r <= 0x051cu) || r == 0x0148u || r == 0x0a0cu || r == 0x0a10u ||
+           (r >= 0x0510u && r <= 0x051cu) || r == 0x0148u || (r >= 0x0a0cu && r <= 0x0a18u) ||
            (r >= 0x0a5cu && r <= 0x0a64u) || r == 0x0ae8u || r == 0x0c90u || r == 0x0cacu ||
            r == 0x0cb0u || r == 0x0a74u || r == 0x0004u;
 }
@@ -470,8 +526,10 @@ static uint32_t shape_code(const SgxdOp *ops, unsigned count, const uint8_t *var
     shapes[slot] = (Shape){hash, count, pool_used, entry};
     pool_used += count;
     nshapes++;
+#ifdef VITA_DIAGNOSTICS
     sgxd_mkq_compiles++;
     sgxd_mkq_instructions += (uint32_t)len;
+#endif
     return entry;
 }
 

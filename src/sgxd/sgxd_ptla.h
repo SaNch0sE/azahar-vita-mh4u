@@ -112,10 +112,6 @@ int sgxd_ptla_waker(int32_t flag, uint32_t bits);
 int sgxd_wake_arm(uint32_t chains, uint32_t twod);
 void sgxd_wake_disarm(void);
 uint32_t sgxd_wake_count(void);
-// The queued op at the kernel's queue position pos (31 bits, as sgxdSubmitAsync's stop returns
-// it less one), and how many ops from the queue's end it is; NULL once the queue has moved past
-// it by a whole ring.
-const SgxdOp *sgxd_chain_op(uint32_t pos, uint32_t *behind);
 #ifdef VITA_DIAGNOSTICS
 // The app's sgxd syscalls counted (perflog; diagnostics builds only): synchronous lists
 // (sgxdSubmit) and sgxdKick.

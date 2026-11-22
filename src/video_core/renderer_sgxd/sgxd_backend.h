@@ -5,6 +5,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <bit>
 #include <functional>
 #include <memory>
 #include <span>
@@ -15,6 +17,7 @@
 #include "sgxd_program.h"
 #include "sgxd_ptla.h"
 #include "sgxd_recipe.h"
+#include "video_core/renderer_sgxd/untile_geometry.h"
 
 namespace SgxdRenderer {
 
@@ -73,7 +76,16 @@ public:
     /// (RasterizerSgxd::Draw ends a full pass).
     static constexpr u32 MaxDraws = 1024;
 
-    /// USSE code: its offset from code base cb (0 vertex, 1 pixel).
+    /// The USE code base a placed program's DOUTU names (PlaceCode's offsets are from it):
+    /// 2 for the vertex data master (cb 0), 3 for the pixel (cb 1). Both are the shared block's
+    /// code heap (sgxd_recipe_code_heap); 0 and 1 stay the recipe's own CV and CF.
+    static constexpr unsigned HeapCodeBase(unsigned cb) {
+        return cb + 2;
+    }
+
+    /// The code heap's size: the programs PlaceCode places share it.
+    static constexpr u32 CodeBytes = 1u << 20;
+    /// USSE code: its offset from code base HeapCodeBase(cb) (cb 0 vertex, 1 pixel).
     u32 PlaceCode(unsigned cb, std::span<const u64> words);
     /// The code heap's bytes free now: its free ranges and its unused end, once the code given
     /// back whose passes are done is free again.
@@ -110,6 +122,10 @@ public:
     [[nodiscard]] u32 DataLeft() const {
         const u32 at = (data_used + 15) & ~15u;
         return at < data_end ? data_end - at : 0;
+    }
+    /// Counts the passes opened: an AllocData block holds while it stays the same.
+    [[nodiscard]] u32 DataOpens() const {
+        return data_opens;
     }
 
     /// Memory for width x height 32-bit samples (a depth store), rows width apart; the first
@@ -411,7 +427,6 @@ public:
     /// Sends the queued untiles' side renders, the gather first (the ETC1 and alpha renders
     /// read it): one render for each batch the queue holds.
     void FlushUntiles();
-    u32 WidenIndices(u32 indices, u32 count, const u8* cpu);
 
     /// The geometry shader's stream-out stages (RasterizerSgxd::GeometryStage): A0 stores
     /// the vertex program's outputs, A1 runs the geometry program over them.
@@ -463,10 +478,6 @@ public:
                                u32* ta_us = nullptr, u32* d3_us = nullptr);
 
 private:
-    /// One target size's recipe and its block: the layout, the background colour word, then
-    /// the code heap's copy.
-    /// What a recipe's end of tile stores: a linear target (a display transfer's output), a
-    /// PICA target (route 1, a pass on a guest colour buffer), or a side render's.
     enum class Kind : u8 { Linear, Pica, Side };
     struct Recipe {
         SgxdRecipe recipe{};
@@ -475,8 +486,7 @@ private:
         u32 size{};
         int block{-1};
         u32 width{}, height{};
-        u32 bg_offset{};  // the background colour word and its SA secondary, after the layout
-        u32 code_begin{}; // the code heap's copy, from the block's start
+        u32 bg_offset{}; // the background colour word and its SA secondary, after the layout
         Kind kind{};
         u32 instance{};   // up to MaxInstances of each size, the pending pass's among them
         u32 fence{};      // the list that completes its last render's 3D
@@ -485,8 +495,14 @@ private:
     /// each pass on the recipe, before its 3D kick's USE code-cache invalidate.
     static constexpr u32 PicaEotOffset = 0x400;
     /// A size's instances at most: a render's recipe is the GPU's until its 3D completes, and
-    /// the CPU writes the next render's into another.
-    static constexpr u32 MaxInstances = 4;
+    /// the CPU writes the next render's into another. a game has three passes a frame into its
+    /// top screen's 416x256: eight let the render thread fill a frame ahead of the GPU.
+    static constexpr u32 MaxInstances = 8;
+    /// A recipe's block at most (layout and background page; the 1024x1024 side recipe's layout
+    /// is 430 KiB), and the CDRAM left free beside one before RecipeFor makes another instance:
+    /// the kernel's free figure is not one block's worth.
+    static constexpr u32 RecipeBlockSize = 512u << 10;
+    static constexpr u32 RecipeCdramMargin = 1u << 20;
 
     /// The recipe for a width x height target of kind, made at its first use. A PICA recipe's
     /// pixel event program DOUTAs IR0 to its end of tile (sgxd_recipe_pica_pixev).
@@ -517,23 +533,6 @@ private:
                     bool twiddled = false, u32 pack = SGXD_RECIPE_PACK_U8888,
                     bool double_pixels = false);
     PdsRef TermPds(const SgxdRecipe& recipe);
-    /// WidenIndices' batch: the lists given since the last widen render, the pass data its 16-bit
-    /// copies go to, and the rows taken.
-    struct WidenList {
-        u32 indices, count, row;
-        const u8* cpu;
-    };
-    static constexpr u32 WidenWidth = 128;
-    static constexpr u32 WidenRows = 512;
-    std::vector<WidenList> widen_lists;
-    Data widen_target{};
-    u32 widen_rows = 0;
-    /// The open pass had a widen render: its TA waits for that render's 3D.
-    bool widened = false;
-    /// A LINEAR U8888 texture of 0x000000ff words: the widen render's mask.
-    Data widen_mask{};
-    /// The batch's side render (WidenIndices), and widencheck.
-    void FlushWiden();
     /// QueueUntile's batches, each one side render's target: LINEAR U8888 chains in rows of
     /// 256, 512 or UntileSide texels (ChainBatchStride), the byte copies' U8 chains the same in
     /// bytes, TWIDDLED ETC1 chains in squares of 32, 64, 128 or 256 blocks a side, A8 alpha
@@ -558,6 +557,7 @@ private:
     };
     /// A queued untile: its source, its slot's first unit in its chain's batch, and a split
     /// ETC1A4's first row in the A8 batch and in the gather.
+    struct Geometry;
     struct UntileMember {
         UntileSource source;
         u32 levels;
@@ -565,6 +565,9 @@ private:
         u32 at;
         u32 alpha_at;
         u32 gather_row;
+        const Geometry* geometry = nullptr;
+        const Geometry* gather = nullptr;
+        const Geometry* alpha = nullptr;
     };
     std::array<UntileBatch, UntileBatchKinds> untile_batches{};
     std::vector<UntileMember> untile_members;
@@ -633,11 +636,26 @@ private:
     /// The cached vertices for key, or `bytes` of new ones with fresh set for the caller to
     /// fill.
     Data GeometryVertices(u64 key, u32 bytes, bool& fresh);
+    /// A shape's whole geometry, made once (GeometryFor): its vertices in the textures pool and
+    /// the draws that read them (an untile's) or its bands (a tiled picture's). An untile queued
+    /// or a picture drawn again builds no list.
+    struct Geometry {
+        Data vertices;
+        std::vector<UntileGeometry::GeometryDraw> draws;
+        std::vector<UntileGeometry::Band> bands;
+    };
+    std::unordered_map<u64, Geometry> geometries;
+    /// The geometry under key, made the first time by make(v, geometry), which fills the draws
+    /// or the bands and returns the vertex count: with v null for the count, then into the new
+    /// vertices, vertex_bytes each. The map is node-based: a geometry's address stays.
+    template <typename Make>
+    const Geometry& GeometryFor(u64 key, u32 vertex_bytes, Make&& make);
 
     std::vector<u16> identity;
     std::vector<SgxdRecipeDraw> init_draws;
 
-    u32 code_used{};   // the code heap's bytes, the same in every copy
+    u32 code_begin{}; // the code heap in the shared block (code bases 2 and 3)
+    u32 code_used{};  // its bytes
     /// Diagnostics: every program PlaceCode placed (bank, offset from the bank's base as the
     /// DOUTU takes it, bytes, place in the heap), written with the heap at a fault.
     struct PlacedCode {
@@ -662,7 +680,8 @@ private:
         u32 bytes;
         u32 count;
     };
-    std::array<DataSite, 16> data_sites{}; ///< the open pass's AllocData by caller
+    std::array<DataSite, 32> data_sites{};
+    u32 data_opens{};
     /// The pass data's slots, in turn, each with its last pass's fence. The guest waits for
     /// P3D before its next command list, so only passes of one list follow each other unwaited.
     static constexpr u32 DataSlots = 2;
@@ -707,7 +726,44 @@ private:
 #ifdef VITA_DIAGNOSTICS
     void WriteCode();
 #endif
-    std::unordered_map<std::string, u32> pds_by_words, pds_fixed_by_words;
+    /// The flipping half's programs by their generator's inputs (a tag, then the arguments):
+    /// open addressing over a power-of-two table. Emptied when the arena flips.
+    class PdsIndex {
+    public:
+        explicit PdsIndex(u32 first_slots = 4096) : slots(first_slots) {}
+        /// MurmurHash3's 32-bit mixing, whole or a word at a time: HashStart, HashStep, HashEnd.
+        static u32 Hash(const u32* key, u32 words);
+        static u32 HashStart(u32 words) {
+            return 0x9e3779b9u ^ words;
+        }
+        static u32 HashStep(u32 h, u32 word) {
+            const u32 k = std::rotl(word * 0xcc9e2d51u, 15) * 0x1b873593u;
+            return std::rotl(h ^ k, 13) * 5 + 0xe6546b64u;
+        }
+        static u32 HashEnd(u32 h);
+        const PdsRef* Find(const u32* key, u32 words, u32 hash) const;
+        void Insert(const u32* key, u32 words, u32 hash, PdsRef ref);
+        void Clear();
+
+    private:
+        struct Slot {
+            u32 hash;
+            u32 key_at;
+            u32 key_words; ///< 0: empty
+            PdsRef ref;
+        };
+        void Grow();
+        std::vector<Slot> slots;
+        std::vector<u32> keys;
+        u32 used = 0;
+    };
+    PdsIndex pds_index;
+    u32 pds_index_programs{}; ///< programs placed in the flipping half since its flip
+    template <typename Build>
+    PdsRef KeyedPds(const u32* key, u32 words, Build&& build);
+    template <typename Build>
+    PdsRef KeyedPds(const u32* key, u32 words, u32 hash, Build&& build);
+    u32 AppendPds(const SgxdPdsProgram& program);
     /// A vertex or secondary PDS program as its generator built it once, and where its addresses
     /// are in its words: the program for the same inputs at other addresses is these words with
     /// those changed. Kept for good; the flips do not touch them.
@@ -717,6 +773,15 @@ private:
     };
     std::deque<PdsTemplate> pds_templates;
     PdsIndex pds_shapes{256};
+    /// The secondary programs placed for recent SA images, a slot by the image's address
+    /// (SecondaryPds); emptied when the arena flips.
+    struct SecondaryKept {
+        u32 address;
+        u32 words; ///< 0: none
+        u32 doutu0;
+        PdsRef ref;
+    };
+    std::array<SecondaryKept, 16> secondary_kept{};
     /// The template for a key without addresses, built by `build` on a miss; null if it fails.
     template <typename Build>
     PdsTemplate* TemplatePds(const u32* key, u32 words, Build&& build);

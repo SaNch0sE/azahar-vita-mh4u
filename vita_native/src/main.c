@@ -331,6 +331,7 @@ static uint32_t active_cpu_mask(void) {
 // 14: azaharRun answers some svcs in the guest's own world (AZAHAR_FAST_*), and reports the
 //     slice's guest ticks and its own time.
 // 15: one world per Vita core, azaharAttach / azaharDetach: slices on several cores at once.
+// 16: sgxd 7, the fault dump's op kind (word 13): the app keeps no copy of the async queue.
 // 17: azaharCycleCounter, the PMU cycle counter readable in user mode by the process's threads.
 // 18: sgxd 8, the async queue as a ring in the app's memory (sgxdQueue, sgxdKick): no copy in.
 // 19: AzaharProfSample's syscall (svc, user PC, LR and SP) from the thread's SVC frame.

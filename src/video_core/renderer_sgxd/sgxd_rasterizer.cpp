@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <arm_neon.h>
 #include <chrono>
 #include <utility>
 #include <bit>
@@ -42,6 +43,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 #include "azahar_native.h"
+#include "common/host_clock.h"
 #include "sgxd.h"
 #include "sgxd_program.h"
 #include "sgxd_ptla.h"
@@ -50,6 +52,18 @@
 namespace GxmRenderer {
 
 namespace {
+
+/// The 4 KiB guest pages of VRAM and the New 3DS's FCRAM (TextureBucket's index).
+constexpr u32 GuestPages = (Memory::VRAM_SIZE + Memory::FCRAM_N3DS_SIZE) >> 12;
+
+/// The register words of each texture unit that TextureFor's memos follow.
+#define TEXTURE_UNIT_WORDS(n)                                                                      \
+    {PICA_REG_INDEX(texturing.texture##n.width), PICA_REG_INDEX(texturing.texture##n.type),        \
+     PICA_REG_INDEX(texturing.texture##n.lod), PICA_REG_INDEX(texturing.texture##n.address),       \
+     PICA_REG_INDEX(texturing.texture##n##_format)}
+constexpr std::array<std::array<u16, 5>, 3> TextureUnitWords{
+    {TEXTURE_UNIT_WORDS(0), TEXTURE_UNIT_WORDS(1), TEXTURE_UNIT_WORDS(2)}};
+#undef TEXTURE_UNIT_WORDS
 
 /// How the untile reads a PICA texture format: the texture unit's format code and swizzle, its
 /// bits a texel, and the palette that expands a 4-bit index. Code 0xff: not built.
@@ -559,6 +573,17 @@ u16 UsedBoolUniforms(const Pica::ShaderSetup& setup) {
 
 void PutVec(float* out, const float* values, u32 count) {
     std::memcpy(out, values, count * sizeof(float));
+}
+
+/// Rows [row, row + count) of the PICA's float uniforms as F32: the 96 real rows, then ones.
+void CopyUniformRows(float* out, u32 row, u32 count, const Pica::Uniforms& uniforms) {
+    static_assert(sizeof(Common::Vec4<f24>) == 4 * sizeof(float));
+    constexpr u32 Real = static_cast<u32>(std::tuple_size_v<decltype(uniforms.f)>);
+    const u32 real = row < Real ? std::min(count, Real - row) : 0;
+    if (real != 0) {
+        std::memcpy(out, uniforms.f.data() + row, real * sizeof(uniforms.f[0]));
+    }
+    std::fill(out + real * 4, out + count * 4, 1.0f);
 }
 
 /// A fragment uniform's byte offset in FSUniformData, and whether it holds ints.
@@ -1426,6 +1451,58 @@ bool RasterizerSgxd::EvictTexture() {
 }
 
 const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
+    const auto& at = TextureUnitWords[unit];
+    const u32* const r = regs.reg_array.data();
+    const std::array<u32, 5> words{r[at[0]], r[at[1]], r[at[2]], r[at[3]], r[at[4]]};
+    const u32 hash = words[0] ^ words[1] ^ words[2] ^ words[3] ^ words[4];
+    // A cube's faces are words of their own, and its type means a cube only on unit 0.
+    const bool memoised = (words[1] >> 28 & 7) != Pica::TexturingRegs::TextureConfig::TextureCube;
+#ifdef VITA_DIAGNOSTICS
+    texture_stats.lookups++;
+#endif
+    bool written = false;
+    for (u32 m = 0; memoised && m < texture_memos.size(); m++) {
+        // The XOR picks the candidates; the words decide.
+        const TextureMemo& memo = texture_memos[m];
+        if (memo.hash != hash || memo.drops != texture_drops || memo.texture == nullptr ||
+            memo.words != words) {
+            continue;
+        }
+        Texture& t = *memo.texture;
+        t.last_used = passes;
+        DEBUG_ASSERT_MSG(!backend.InPass() || t.addr >= pass_colour.End() ||
+                             pass_colour.addr >= t.addr + t.part_bytes,
+                         "sgxd: texture unit {} at {:#x} reads the colour buffer at {:#x} its own "
+                         "pass drew",
+                         unit, t.addr, pass_colour.addr);
+        // Stale only when written over (GPU work, or the guest's and HLE's writes to FCRAM textures).
+        written = TextureWritten(t);
+        if (!written) {
+#ifdef VITA_DIAGNOSTICS
+            texture_stats.memo_hits++;
+#endif
+            return t;
+        }
+        break;
+    }
+    Texture& t = TextureFromRegs(unit, written);
+    if (memoised) {
+        texture_memos[unit] = {words, hash, &t, texture_drops};
+    }
+    return t;
+}
+
+/// A mipmapped cube's face stride, for a w x w U8888 face: its chain down to 1x1 whatever
+/// MIPMAPCLAMP says, rounded up to 2 KiB (measured). Without mipmapping the faces touch.
+u32 CubeFaceStride(u32 w) {
+    u32 chain = 0;
+    for (u32 side = w; side >= 1; side >>= 1) {
+        chain += side * side * 4;
+    }
+    return Common::AlignUp(chain, 2048u);
+}
+
+RasterizerGxm::Texture& RasterizerGxm::TextureFromRegs(u32 unit, bool written) {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
     using TF = Pica::TexturingRegs::TextureFormat;
     const auto t = regs.texturing.GetTextures()[unit];
@@ -1481,16 +1558,11 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
         DropTexture(*it);
         it = nullptr;
     }
-    // A texture in FCRAM is untiled at its first use in each frame, and every pass of the frame
-    // after it reads that copy: the guest's CPU writes there leave no mark, and nothing compares
-    // the bytes. Its pages are in CDRAM by now (RenderThread::KeepTargetUncached), so the GPU
-    // reads what the guest wrote with no clean. Guest VRAM changes only through the GPU
-    // operations that mark its textures dirty, which in FCRAM untile it again within the frame
-    // too (a pass's colour buffer a later pass samples).
-    const bool fcram = addr >= Memory::FCRAM_PADDR;
+    // Untiled again only when its pages were written: by GPU work, or in FCRAM by the guest and the
+    // HLE (GuestWrote). FCRAM pages move to CDRAM at the untile, so no clean is needed.
     if (it) {
         it->last_used = passes;
-        if (!it->dirty && (!fcram || it->untiled_frame == frames)) {
+        if (!written && !TextureWritten(*it)) {
             return *it;
         }
     } else {
@@ -1512,12 +1584,12 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
         textures.push_back({addr, width, height, t.format,
                             host_bytes != 0 ? backend.AllocTexture(host_bytes)
                                             : SgxdBackend::Data{},
-                            host_bytes, levels, parts, part_addr, bytes, frames, false});
+                            host_bytes, levels, parts, part_addr, bytes, write_seq});
         it = &textures.back();
         it->last_used = passes;
         IndexTexture(*it);
     }
-    it->dirty = false;
+    it->checked_seq = write_seq;
     it->alpha_one = t.format == Pica::TexturingRegs::TextureFormat::RG8;
     it->byte_swizzle = 0;
     // Each FCRAM part moves to CDRAM here, under the draw's read hold. A texture past VRAM's end reads
@@ -1727,16 +1799,38 @@ u32 RasterizerSgxd::ReadableBytes(PAddr addr, u32 bytes) {
     return bytes;
 }
 
+std::pair<u32, u32> RasterizerSgxd::PartPages(const Texture& texture, u32 k) {
+    const PAddr addr = texture.part_addr[k];
+    return {TextureBucket(addr), TextureBucket(addr + ReadableBytes(addr, texture.part_bytes) - 1)};
+}
+
 void RasterizerSgxd::IndexTexture(Texture& texture) {
     if (texture_buckets.empty()) {
-        texture_buckets.assign((Memory::VRAM_SIZE + Memory::FCRAM_N3DS_SIZE) >> 12, nullptr);
+        texture_buckets.assign(GuestPages, nullptr);
+        page_textures.assign(GuestPages, 0);
+        page_writes.assign(GuestPages, 0);
     }
     Texture*& head = texture_buckets[TextureBucket(texture.addr)];
     texture.bucket_next = head;
     head = &texture;
+    for (u32 k = 0; k < texture.parts; k++) {
+        const auto [first, last] = PartPages(texture, k);
+        for (u32 p = first; p <= last; p++) {
+            DEBUG_ASSERT(page_textures[p] != 0xffff);
+            page_textures[p]++;
+        }
+    }
 }
 
 void RasterizerSgxd::DropTexture(Texture& texture) {
+    texture_drops++;
+    for (u32 k = 0; k < texture.parts; k++) {
+        const auto [first, last] = PartPages(texture, k);
+        for (u32 p = first; p <= last; p++) {
+            DEBUG_ASSERT(page_textures[p] != 0);
+            page_textures[p]--;
+        }
+    }
     for (Texture** link = &texture_buckets[TextureBucket(texture.addr)]; *link;
          link = &(*link)->bucket_next) {
         if (*link == &texture) {
@@ -1914,13 +2008,89 @@ std::vector<std::pair<PAddr, u32>> RasterizerSgxd::TakeCachedReads() {
 }
 
 void RasterizerSgxd::TexturesWritten(PAddr start, PAddr end) {
-    for (Texture& t : textures) {
-        for (u32 k = 0; k < t.parts; k++) {
-            if (start < t.part_addr[k] + t.part_bytes && t.part_addr[k] < end) {
-                t.dirty = true;
-            }
+#ifdef VITA_DIAGNOSTICS
+    texture_stats.writes++;
+#endif
+    if (page_textures.empty()) {
+        return; // no texture yet (IndexTexture makes the page tables)
+    }
+    std::array<std::pair<u32, u32>, 2> spans;
+    u32 count = 0;
+    const auto span = [&](PAddr base, u32 size, u32 base_page) {
+        const PAddr lo = std::max(start, base);
+        const u64 hi = std::min<u64>(end, u64{base} + size);
+        if (lo < hi) {
+            spans[count++] = {base_page + ((lo - base) >> 12),
+                              base_page + static_cast<u32>((hi - 1 - base) >> 12)};
+        }
+    };
+    span(Memory::VRAM_PADDR, Memory::VRAM_SIZE, 0);
+    span(Memory::FCRAM_PADDR, Memory::FCRAM_N3DS_SIZE, Memory::VRAM_SIZE >> 12);
+    // Pages no texture covers: nothing to stamp, and write_seq stays.
+    u32 covered = 0;
+    for (u32 i = 0; i < count; i++) {
+        for (u32 p = spans[i].first; p <= spans[i].second; p++) {
+            covered |= page_textures[p];
         }
     }
+    if (covered == 0) {
+        return;
+    }
+    write_seq++;
+    DEBUG_ASSERT_MSG(write_seq != 0, "sgxd: the guest write count wrapped");
+    for (u32 i = 0; i < count; i++) {
+        std::fill(page_writes.begin() + spans[i].first, page_writes.begin() + spans[i].second + 1,
+                  write_seq);
+#ifdef VITA_DIAGNOSTICS
+        texture_stats.write_pages += spans[i].second + 1 - spans[i].first;
+#endif
+    }
+#ifdef VITA_DIAGNOSTICS
+    texture_stats.stamped++;
+    write_ring[write_seq % write_ring.size()] = {start, end};
+#endif
+}
+
+bool RasterizerSgxd::TextureWritten(Texture& texture) {
+    if (texture.checked_seq == write_seq) {
+        return false;
+    }
+    const u32 since = texture.checked_seq;
+    texture.checked_seq = write_seq;
+    // The newest stamp over its parts' pages, without a branch a page.
+    u32 newest = 0;
+    [[maybe_unused]] u32 pages = 0;
+    for (u32 k = 0; k < texture.parts; k++) {
+        const auto [first, last] = PartPages(texture, k);
+        for (u32 p = first; p <= last; p++) {
+            newest = std::max(newest, page_writes[p]);
+        }
+        pages += last + 1 - first;
+    }
+    const bool written = newest > since;
+#ifdef VITA_DIAGNOSTICS
+    // A page written by none of the texture's bytes: the write shares only its page.
+    TextureStats& s = texture_stats;
+    s.checks++;
+    s.check_pages += pages;
+    if (written) {
+        s.written++;
+        if (write_seq - since > write_ring.size()) {
+            s.untold++;
+        } else {
+            bool overlaps = false;
+            for (u32 seq = since + 1; seq <= write_seq; seq++) {
+                const auto [start, end] = write_ring[seq % write_ring.size()];
+                for (u32 k = 0; k < texture.parts; k++) {
+                    overlaps |= start < texture.part_addr[k] + texture.part_bytes &&
+                                texture.part_addr[k] < end;
+                }
+            }
+            s.shared += overlaps ? 0 : 1;
+        }
+    }
+#endif
+    return written;
 }
 
 RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width, u32 height,
@@ -2071,107 +2241,52 @@ void RasterizerSgxd::LogTextureStats() {
     if (now - t.start_us < 1000000) {
         return;
     }
-    LOG_INFO(Render, "perf: textures in {:.2f} s: {} untiled ({} KiB); {} cached",
-             (now - t.start_us) / 1e6, t.untiles, t.untiled_bytes / 1024, textures.size());
+    LOG_INFO(Render,
+             "perf: textures in {:.2f} s: {} untiled ({} KiB); {} cached; {} lookups, {} from "
+             "the memos; {} writes, {} over texture pages ({} pages stamped); {} checks over {} "
+             "pages, {} found a write ({} only on a shared page, {} untold); {} samplers of a "
+             "unit that is off; {} untiles with a side under 8 ({} texels, {} us)",
+             (now - t.start_us) / 1e6, t.untiles, t.untiled_bytes / 1024, textures.size(),
+             t.lookups, t.memo_hits, t.writes, t.stamped, t.write_pages, t.checks, t.check_pages,
+             t.written, t.shared, t.untold, t.null_samples, t.tiny, t.tiny_texels, t.tiny_us);
+    if (clip_plane_draws != 0) {
+        LOG_INFO(Render, "perf: user clip plane on in {} of {} draws (ignored), last ({} {} {} {})",
+                 clip_plane_draws, clip_plane_all, clip_plane_last[0], clip_plane_last[1],
+                 clip_plane_last[2], clip_plane_last[3]);
+    }
+    clip_plane_draws = clip_plane_all = 0;
+    const WidenStats& w = widen_stats;
+    LOG_INFO(Render,
+             "perf: 8-bit index lists widened: {} ({} KiB read from VRAM, {} KiB from FCRAM on "
+             "CDRAM, {} KiB from cached FCRAM), {:.1f} ms",
+             w.lists, w.bytes[0] / 1024, w.bytes[1] / 1024, w.bytes[2] / 1024,
+             w.cycles / (1000.0 * scePowerGetArmClockFrequency()));
+    widen_stats = {};
+    // The pool is a cache that evicts only when full (EvictTexture), so how full it is says
+    // nothing of what a title needs: the copies cached, those a draw took this second, the
+    // evictions, and the pool's bytes in use (the untiles' temporaries and fixed part too).
+    u64 cached = 0, taken = 0;
+    for (const Texture& tex : textures) {
+        const u64 bytes = u64{tex.bytes} + tex.alpha_bytes;
+        cached += bytes;
+        taken += tex.last_used >= t.passes_mark ? bytes : 0;
+    }
+    LOG_INFO(Render,
+             "perf: texture pool: {} KiB cached, {} KiB taken by draws in the second, {} "
+             "evictions; {} KiB of the pool in use",
+             cached >> 10, taken >> 10, evictions - t.evictions_mark,
+             backend.TexturePoolLive() >> 10);
     std::string ends;
     for (const auto& [why, n] : t.pass_ends) {
         ends += fmt::format("{}{} {}", ends.empty() ? "" : "; ", why, n);
     }
     LOG_INFO(Render, "perf: passes ended by: {}", ends);
     t.pass_ends.clear();
-    static const bool bankstats = GxmFlag("bankstats");
-    BankLutStats& b = bank_lut_stats;
-    const auto per_build = [&](u64 rows) {
-        return b.bank_builds ? static_cast<double>(rows) / b.bank_builds : 0.0;
-    };
-    if (bankstats) {
-    LOG_INFO(Render,
-             "perf: banks: {} draws, {} with a bank, {} built ({:.1f} rows each; changed since "
-             "1 build {:.1f}, 8 builds {:.1f}, 32 builds {:.1f}), {} zero buffers",
-             b.draws, b.bank_lookups, b.bank_builds, per_build(b.bank_rows),
-             per_build(b.changed_since[0]), per_build(b.changed_since[1]),
-             per_build(b.changed_since[2]), b.zero_builds);
-    LOG_INFO(Render,
-             "perf: LUT rows: {} lighting tables changed ({:.1f} of 256 entries each; contents "
-             "converted within the last 64: {}, 256: {}), {} more rewritten for a ring move; "
-             "{} fog",
-             b.lut_tables,
-             b.lut_tables ? static_cast<double>(b.lut_entries_changed) / b.lut_tables : 0.0,
-             b.lut_seen_64, b.lut_seen_256, b.lut_ring_moves, b.fog_tables);
-    }
-    // The histories carry over: they describe the stream, not the second.
-    b.draws = b.bank_lookups = b.bank_builds = b.zero_builds = 0;
-    b.bank_rows = 0;
-    b.changed_since = {};
-    b.lut_tables = b.lut_ring_moves = b.lut_seen_64 = b.lut_seen_256 = b.fog_tables = 0;
-    b.lut_entries_changed = 0;
     t = TextureStats{};
     t.tiny_logged = tiny_logged;
     t.start_us = now;
     t.passes_mark = passes;
     t.evictions_mark = evictions;
-}
-
-void RasterizerGxm::NoteBankBuild(const Pica::ShaderSetup& setup, u32 rows) {
-    static const bool bankstats = GxmFlag("bankstats");
-    if (!bankstats) {
-        return;
-    }
-    BankLutStats& b = bank_lut_stats;
-    b.bank_builds++;
-    b.bank_rows += rows;
-    constexpr std::array<u32, 3> Back{1, 8, 32};
-    for (u32 k = 0; k < Back.size(); k++) {
-        // Before that many builds: the version that bank held (0, everything, at the start).
-        const u32 before = b.build_count >= Back[k]
-                               ? b.build_versions[(b.build_count - Back[k]) % b.build_versions.size()]
-                               : 0;
-        u32 changed = 0;
-        for (const u32 stamp : setup.f_stamp) {
-            changed += stamp > before ? 1 : 0;
-        }
-        b.changed_since[k] += changed;
-    }
-    b.build_versions[b.build_count % b.build_versions.size()] = setup.f_version;
-    b.build_count++;
-}
-
-void RasterizerGxm::NoteLutTable(u32 index, bool ring_move) {
-    static const bool bankstats = GxmFlag("bankstats");
-    if (!bankstats) {
-        return;
-    }
-    BankLutStats& b = bank_lut_stats;
-    if (ring_move) {
-        // Contents unchanged, rewritten into the half moved to.
-        b.lut_ring_moves++;
-        return;
-    }
-    b.lut_tables++;
-    const auto& lut = pica.lighting.luts[index];
-    std::array<u32, 256> words;
-    static_assert(sizeof(words) == sizeof(lut));
-    std::memcpy(words.data(), lut.data(), sizeof(words));
-    if (b.lut_shadow.empty()) {
-        b.lut_shadow.resize(pica.lighting.luts.size());
-    }
-    u32 changed = 0;
-    for (u32 i = 0; i < words.size(); i++) {
-        changed += words[i] != b.lut_shadow[index][i] ? 1 : 0;
-    }
-    b.lut_entries_changed += changed;
-    b.lut_shadow[index] = words;
-    const u64 hash = Common::ComputeHash64(words.data(), sizeof(words));
-    const u32 known = std::min<u32>(b.lut_hash_count, static_cast<u32>(b.lut_hashes.size()));
-    for (u32 back = 1; back <= known; back++) {
-        if (b.lut_hashes[(b.lut_hash_count - back) % b.lut_hashes.size()] == hash) {
-            b.lut_seen_64 += back <= 64 ? 1 : 0;
-            b.lut_seen_256++;
-            break;
-        }
-    }
-    b.lut_hashes[b.lut_hash_count % b.lut_hashes.size()] = hash;
-    b.lut_hash_count++;
 }
 #endif
 
@@ -2246,19 +2361,19 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     const Pica::Shader::Generator::PicaVSConfig config{regs, pica.vs_setup};
     const auto& state = config.state;
     // The bools the program branches on are baked in; which ones is found once per program.
-    auto used = used_bools.find(state.program_hash);
-    if (used == used_bools.end()) {
-        used = used_bools.emplace(state.program_hash, UsedBoolUniforms(pica.vs_setup)).first;
+    u16* used = used_bools.Find(state.program_hash);
+    if (!used) {
+        used = &used_bools.Emplace(state.program_hash, UsedBoolUniforms(pica.vs_setup));
     }
     u16 bools = 0;
     for (u32 n = 0; n < 16; n++) {
         bools |= static_cast<u16>((pica.vs_setup.uniforms.b[n] ? 1u : 0u) << n);
     }
-    bools &= used->second;
+    bools &= *used;
     const u64 key = Common::HashCombine(
         config.Hash(),
         static_cast<u64>(mode) << 32 | static_cast<u64>(u8_regs) << 16 | default_regs,
-        static_cast<u64>(bools) << 16 | used->second |
+        static_cast<u64>(bools) << 16 | *used |
             (static_cast<u64>(s8_regs) << 32 | static_cast<u64>(s16_regs) << 48),
         Common::ComputeHash64(reg_components.data(), reg_components.size()));
     const auto make_request = [&] {
@@ -2277,7 +2392,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         }
         request.default_regs = default_regs;
         request.bools = bools;
-        request.bool_mask = used->second;
+        request.bool_mask = *used;
         request.reg_components = reg_components;
         request.u8_regs = u8_regs;
         request.s8_regs = s8_regs;
@@ -2285,8 +2400,8 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
         request.mode = mode;
         return request;
     };
-    if (const auto it = vertex_programs.find(key); it != vertex_programs.end()) {
-        VertexProgram& v = it->second;
+    if (VertexProgram* const found = vertex_programs.Find(key)) {
+        VertexProgram& v = *found;
         if (!v.tier2_queued && ++v.draws >= Tier2Draws) {
             v.tier2_queued = true;
             if (tier2) {
@@ -2299,9 +2414,9 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     const Usse::VsRequest request = make_request();
     VertexProgram v{};
     std::string refusal;
-    const u64 emit_start = sceKernelGetProcessTimeWide();
+    const u32 emit_start = azaharCyclesStart();
     auto emitted = Usse::EmitVertexProgram(request, v.input_regs, &refusal);
-    const u64 emit_us = sceKernelGetProcessTimeWide() - emit_start;
+    const u64 emit_us = Common::CyclesToUs(azaharCycles() - emit_start);
     NoteEmit(0, emit_us);
     // The PICA side before the assert: a program the emitter refuses is the one to look at.
     DumpPicaVertex(key, config, pica.vs_setup, request);
@@ -2309,20 +2424,55 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
                "sgxd: vertex program {:016x} (entry {}): the emitter has no program for it: {}",
                state.program_hash, request.main_offset, refusal);
     v.usse = std::move(*emitted);
+    ResolveVertexProgram(v);
     DumpProgram("vs", key, v.usse);
     DumpPicaVertex(key, config, pica.vs_setup);
     v.primary_doutu0 =
         sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.primary), v.gxp.temp_count);
     v.secondary_doutu0 = v.gxp.secondary.empty()
                              ? DummyVertexSecondary
-                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.secondary), 0);
+                             : sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
+                                                   backend.PlaceCode(0, v.usse.secondary), 0);
     LOG_INFO(Render,
              "vertex program {:016x}: {} + {} words, {} PAs, {} temps, {} SAs, {} uniforms{}, "
              "emitted in {} us",
              state.program_hash, v.usse.primary.size(), v.usse.secondary.size(), v.usse.pa_count,
              v.usse.temp_count, v.usse.secondary_reg_count, v.usse.uniforms.size(),
              v.usse.per_instance ? ", per instance" : "", emit_us);
-    return vertex_programs.emplace(key, std::move(v)).first->second;
+    return vertex_programs.Emplace(key, std::move(v));
+}
+
+void RasterizerSgxd::ResolveVertexProgram(VertexProgram& v) {
+    const Usse::Program& g = v.usse;
+    // The image covers the resident uniforms, the data block, the prefetched uniforms and the SAs the
+    // secondary program writes; the secondary PDS program DMAs all of it.
+    const u32 head = g.uniform_floats + Usse::DataHead(g);
+    v.sa_words = std::max(g.secondary_reg_count, head + static_cast<u32>(g.literals.size()));
+    v.sa_image.assign(v.sa_words, 0.0f);
+    std::memcpy(v.sa_image.data() + head, g.literals.data(), g.literals.size() * 4);
+    v.sa_scratch = v.sa_image;
+    v.sa_slots.clear();
+    v.has_bank = false;
+    for (u32 n = 0; n < g.uniforms.size(); n++) {
+        const Usse::Uniform& u = g.uniforms[n];
+        if (u.kind == Usse::UniformKind::FloatBank) {
+            DEBUG_ASSERT(g.buffer_pointer && u.sa_offset + u.array_size * 4 <= g.buffer_floats);
+            v.has_bank = true;
+            v.bank_offset = u.sa_offset;
+            v.bank_rows = u.array_size;
+            continue;
+        }
+        DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <= g.uniform_floats);
+        DEBUG_ASSERT(u.kind != Usse::UniformKind::DefaultInput || u.index < 16);
+        v.sa_slots.push_back({u.kind, u.components, u.index, u.sa_offset, u.array_size, n});
+    }
+    v.attr_resource.fill(~0u);
+    for (const Usse::Attribute& a : g.attributes) {
+        if (a.kind == Usse::AttributeKind::Input) {
+            DEBUG_ASSERT(a.index < v.attr_resource.size() && v.attr_resource[a.index] == ~0u);
+            v.attr_resource[a.index] = a.resource;
+        }
+    }
 }
 
 void RasterizerSgxd::FlushPrograms() {
@@ -2345,12 +2495,14 @@ RasterizerSgxd::VertexProgram RasterizerSgxd::PlaceVertexProgram(Usse::Program u
                                                                  u64 emit_us) {
     VertexProgram v{};
     v.usse = std::move(usse);
+    ResolveVertexProgram(v);
     DumpProgram("vs", key, v.usse);
-    v.primary_doutu0 = sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.primary),
-                                           v.usse.temp_count);
+    v.primary_doutu0 = sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
+                                           backend.PlaceCode(0, v.usse.primary), v.usse.temp_count);
     v.secondary_doutu0 = v.usse.secondary.empty()
                              ? DummyVertexSecondary
-                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.secondary), 0);
+                             : sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
+                                                   backend.PlaceCode(0, v.usse.secondary), 0);
     LOG_INFO(Render, "{} {:016x}: {} words, {} PAs, {} temps, {} SAs{}, emitted in {} us", what,
              key, v.usse.primary.size(), v.usse.pa_count, v.usse.temp_count,
              v.usse.secondary_reg_count, v.usse.per_instance ? ", per instance" : "", emit_us);
@@ -2363,34 +2515,39 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
     Pica::ShaderSetup& setup = pica.gs_setup;
     setup.DoProgramCodeFixup();
     const u64 program_hash = setup.GetProgramCodeHash();
-    auto used = used_bools.find(program_hash);
-    if (used == used_bools.end()) {
-        used = used_bools.emplace(program_hash, UsedBoolUniforms(setup)).first;
+    u16* used = used_bools.Find(program_hash);
+    if (!used) {
+        used = &used_bools.Emplace(program_hash, UsedBoolUniforms(setup));
     }
     u16 bools = 0;
     for (u32 n = 0; n < 16; n++) {
         bools |= static_cast<u16>((setup.uniforms.b[n] ? 1u : 0u) << n);
     }
-    bools &= used->second;
+    bools &= *used;
     const bool uniform_table = GsUniformTable(rows_uniform, rows_table);
-    // b15 turns true after every invocation (upstream GeometryPipeline::SubmitVertex): baked
-    // in, it holds for all of them only when the draw's first sees it true already.
-    DEBUG_ASSERT_MSG((used->second & 0x8000) == 0 || (bools & 0x8000) != 0,
-                     "GXM: {}: the geometry program reads b15 while it is false (the first "
-                     "invocation's own value) is not built",
-                     describe());
     const u32 output_mask = regs.gs.output_mask;
     const u64 key = Common::HashCombine(
         Common::HashCombine(program_hash, setup.GetSwizzleDataHash()),
         Common::HashCombine(static_cast<u64>(regs.gs.main_offset.Value()) << 16 | output_mask,
-                            static_cast<u64>(bools) << 48 | static_cast<u64>(used->second) << 32 |
+                            static_cast<u64>(bools) << 48 | static_cast<u64>(*used) << 32 |
                                 static_cast<u64>(max_triangles) << 16 |
                                 (rows_table ? 0x8000u : 0u) | first_uniform << 8 |
                                 (rows_uniform ? 0x80u : 0u) | rows) ^
             static_cast<u64>(input_rows) << 40);
-    if (const auto it = vertex_programs.find(key); it != vertex_programs.end()) {
-        return it->second;
-    }
+    const VertexProgram* const found = vertex_programs.Find(key);
+    const VertexProgram& program =
+        found ? *found
+              : MakeGeometryProgram(key, bools, *used, rows, rows_uniform, rows_table,
+                                    first_uniform, input_rows, max_triangles, describe);
+    return program;
+}
+
+const RasterizerSgxd::VertexProgram& RasterizerSgxd::MakeGeometryProgram(
+    u64 key, u16 bools, u16 used, u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
+    u16 input_rows, u32 max_triangles, const Describe& describe) {
+    Pica::ShaderSetup& setup = pica.gs_setup;
+    const u64 program_hash = setup.GetProgramCodeHash();
+    const u32 output_mask = regs.gs.output_mask;
     Usse::VsRequest request{};
     request.code = setup.GetProgramCode();
     request.swizzle = setup.GetSwizzleData();
@@ -2403,7 +2560,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
         }
     }
     request.bools = bools;
-    request.bool_mask = used->second;
+    request.bool_mask = used;
     request.mode = Usse::VsMode::Geometry;
     request.gs_rows = rows;
     request.gs_rows_uniform = rows_uniform;
@@ -2421,9 +2578,9 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
     DEBUG_ASSERT_MSG(emitted.has_value(),
                      "sgxd: {}: geometry program {:016x}: the emitter has no program for it: {}",
                      describe(), program_hash, refusal);
-    return vertex_programs
-        .emplace(key, PlaceVertexProgram(std::move(*emitted), "geometry program", key))
-        .first->second;
+    VertexProgram v = PlaceVertexProgram(std::move(*emitted), "geometry program", key, emit_us);
+    v.input_regs = input_regs;
+    return vertex_programs.Emplace(key, std::move(v));
 }
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramFor(u32 outputs) {
@@ -2452,8 +2609,8 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
     for (const auto& m : maps) {
         key = Common::HashCombine(key, static_cast<u64>(m.attribute_index) << 8 | m.component_index);
     }
-    if (const auto it = vertex_programs.find(key); it != vertex_programs.end()) {
-        return it->second;
+    if (const VertexProgram* const found = vertex_programs.Find(key)) {
+        return *found;
     }
     std::vector<u32> code;
     Usse::VsRequest request{};
@@ -2487,7 +2644,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
     ASSERT(request.num_outputs == outputs);
     VertexProgram v = PlaceVertexProgram(std::move(*emitted), "geometry passthrough", key);
     v.input_regs = input_regs;
-    return vertex_programs.emplace(key, std::move(v)).first->second;
+    return vertex_programs.Emplace(key, std::move(v));
 }
 
 RasterizerSgxd::GsCodeFacts RasterizerSgxd::GsFacts() {
@@ -2676,7 +2833,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         a0.indices = a0_indices.gpu;
         a0.count = a0_count;
         u32 vsec_sa = 0;
-        const SgxdBackend::Data vsa = VertexSa(ag, pica.vs_setup, vsec_sa, describe);
+        const SgxdBackend::Data vsa = VertexSa(*a0.vp, pica.vs_setup, vsec_sa, describe);
         SgxdRecipeDrawPrograms p{};
         VertexPrograms(a0, vsa, vsec_sa, p, describe);
 #ifdef VITA_DIAGNOSTICS
@@ -2737,8 +2894,10 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
                                  : 2 + rows + static_cast<u32>(std::popcount(input_rows)) +
                                        (uniform_table ? 1u : 0u);
     const SgxdBackend::Data gs_table = stored_data(invocations * words * 4);
-    const SgxdBackend::Data zero_row = backend.AllocData(16);
-    std::memset(zero_row.cpu, 0, 16);
+    if (!gs_zero_row.cpu) {
+        gs_zero_row = backend.AllocTextureFixed(16);
+        std::memset(gs_zero_row.cpu, 0, 16);
+    }
     // The row tables (128 entries and 3 a fetch past the last may read) of the variable mode and of
     // a fixed-primitive program's indexed reads, and the variable mode's count rows.
     constexpr u32 TableWords = 128 + 3;
@@ -2747,41 +2906,60 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
                                              : SgxdBackend::Data{};
     const SgxdBackend::Data count_rows =
         rows_table ? backend.AllocData(invocations * 16) : SgxdBackend::Data{};
-    u32* const rows_out = reinterpret_cast<u32*>(gs_table.cpu);
-    for (u32 i = 0; i < invocations; i++) {
-        u32* const t = rows_out + i * words;
-        t[0] = gs_out.gpu + i * cap * tri_bytes;
-        t[1] = gs_ends.gpu + i * 4;
-        if (rows_table) {
-            t[2] = row_tables.gpu + i * TableWords * 4 - 4;
-            t[3] = 0;
-            continue;
-        }
-        for (u32 r = 0, k = 2 + rows; r < 16; r++) {
-            if ((input_rows >> r & 1) != 0) {
-                t[k++] = gs_last_rows[r];
-            }
-        }
+    // Each invocation's entry is made in `entry` and copied out whole: the pass data is uncached, and
+    // reading it back would wait on the bus. The unfilled rows and the kept registers' rows are the
+    // same in every entry.
+    std::array<u32, 2 + 64 + 16 + 1> entry;
+    std::array<u32, 64> row_vertex; // set for the rows with an attribute, the only ones read
+    std::array<u32, 64> row_offset; // the output's bytes, less 4
+    if (!rows_table) {
         for (u32 r = 0; r < rows; r++) {
             const int a = row_attr[r];
             if (a < 0) {
-                t[2 + r] = (stale >> r & 1) != 0 ? gs_last_rows[r] : zero_row.gpu - 4;
+                entry[2 + r] = (stale >> r & 1) != 0 ? gs_last_rows[r] : gs_zero_row.gpu - 4;
                 continue;
             }
-            const u32 j = i * per_invocation + static_cast<u32>(a) / vs_outputs;
-            const u32 v = vertex_at(j) - a0.vertex_min;
-            t[2 + r] = vs_out.gpu + v * vsize + (static_cast<u32>(a) % vs_outputs) * 16 - 4;
+            row_vertex[r] = static_cast<u32>(a) / vs_outputs;
+            row_offset[r] = (static_cast<u32>(a) % vs_outputs) * 16 - 4;
         }
+        for (u32 r = 0, k = 2 + rows; r < 16; r++) {
+            if ((input_rows >> r & 1) != 0) {
+                entry[k++] = gs_last_rows[r];
+            }
+        }
+    }
+    u32* const rows_out = reinterpret_cast<u32*>(gs_table.cpu);
+    for (u32 i = 0; i < invocations; i++) {
+        entry[0] = gs_out.gpu + i * cap * tri_bytes;
+        entry[1] = gs_ends.gpu + i * 4;
+        if (rows_table) {
+            entry[2] = row_tables.gpu + i * TableWords * 4 - 4;
+            entry[3] = 0;
+        } else {
+            for (u32 r = 0; r < rows; r++) {
+                if (row_attr[r] >= 0) {
+                    const u32 v = vertex_at(i * per_invocation + row_vertex[r]) - a0.vertex_min;
+                    entry[2 + r] = vs_out.gpu + v * vsize + row_offset[r];
+                }
+            }
+            if (uniform_table) {
+                // The rows at their uniforms' entries; run_invocations fills the others.
+                entry[words - 1] = row_tables.gpu + i * TableWords * 4 - 4;
+                std::memcpy(reinterpret_cast<u32*>(row_tables.cpu) + i * TableWords +
+                                first_uniform,
+                            entry.data() + 2, rows * 4);
+            }
+        }
+        std::memcpy(rows_out + i * words, entry.data(), words * 4);
     }
     // The rows the last invocation loaded: what those registers hold for the draws after.
     if (!rows_table) {
         if (!gs_kept_rows.cpu) {
             gs_kept_rows = backend.AllocTextureFixed(16 * 16);
         }
-        const u32* const last = rows_out + (invocations - 1) * words;
         for (u32 r = 0; r < rows && !rows_uniform; r++) {
             if (row_attr[r] >= 0) {
-                gs_last_rows[r] = last[2 + r];
+                gs_last_rows[r] = entry[2 + r];
                 gs_rows_kept &= static_cast<u16>(~(1u << r));
                 gs_rows_own = static_cast<u16>(gs_own_data ? gs_rows_own | 1u << r
                                                            : gs_rows_own & ~(1u << r));
@@ -2796,7 +2974,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
                                          return a.kind == Usse::AttributeKind::GsInRows;
                                      });
         DEBUG_ASSERT(in != gp.usse.attributes.end());
-        VertexStage a1{};
+        VertexStage a1;
         a1.vp = &gp;
         a1.fetch[0] = {gs_table.gpu, words * 4, words, in->resource};
         a1.fetch_count = 1;
@@ -2811,7 +2989,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         a1.indices = a1_indices.gpu;
         a1.setup = &pica.gs_setup;
         u32 vsec_sa = 0;
-        const SgxdBackend::Data vsa = VertexSa(gp.gxp, pica.gs_setup, vsec_sa, describe);
+        const SgxdBackend::Data vsa = VertexSa(gp, pica.gs_setup, vsec_sa, describe);
         if (rows_table) {
             // Past its rows an entry points at the shared uniform, as the SA image's bank pointer reads it.
             DEBUG_ASSERT(gp.usse.buffer_pointer);
@@ -2876,7 +3054,8 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     }
 
     // --- pass B: the stored triangles, as the draw's vertices ---
-    std::vector<u16> list;
+    std::vector<u16>& list = gs_list;
+    list.clear();
     const u32* const ends = reinterpret_cast<const u32*>(gs_ends.cpu);
     if (padded) {
         // Every slot: the ones no EMIT filled are zeros.
@@ -2934,20 +3113,16 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         LOG_INFO(Render, "geometry draw {}: {} invocations, {} triangles{}", gs_draws, invocations,
                  list.size() / 3, padded ? " (every slot, the room the program's bound)" : "");
     }
-    VertexStage b{};
+    VertexStage b;
     if (list.empty()) {
         return b;
     }
     const VertexProgram& pp = PassthroughProgramFor(gs_outputs);
     for (u32 k = 0; k < gs_outputs; k++) {
-        const std::string name = fmt::format("vs_in_attr{}", k);
-        const auto attribute =
-            std::find_if(pp.gxp.attributes.begin(), pp.gxp.attributes.end(),
-                         [&](const Usse::GxpAttribute& a) { return a.name == name; });
-        if (attribute == pp.gxp.attributes.end()) {
+        if (pp.attr_resource[k] == ~0u) {
             continue; // an output no semantic reads
         }
-        b.fetch[b.fetch_count++] = {gs_out.gpu + k * 16, gs_outputs * 16, 4, attribute->resource};
+        b.fetch[b.fetch_count++] = {gs_out.gpu + k * 16, gs_outputs * 16, 4, pp.attr_resource[k]};
     }
     const SgxdBackend::Data b_indices = backend.AllocData(static_cast<u32>(list.size()) * 2, 4);
     std::memcpy(b_indices.cpu, list.data(), list.size() * 2);
@@ -2959,7 +3134,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     return b;
 }
 
-const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(const Epilogue& epilogue) {
+Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
     Pica::Shader::FSConfig config{regs};
     // The SGX's samplers have no border colour: a border mode clamps (AddressMode) and the fragment
     // program puts the border colour past the texture.
@@ -2978,27 +3153,65 @@ const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(const Ep
     }
     config.texture.alpha_split.Assign(alpha_split);
     config.texture.own_pixel.Assign(draw_own_pixel);
-    const u64 key = Common::HashCombine(config.Hash(), epilogue.Key());
-    if (const auto it = fragment_programs.find(key); it != fragment_programs.end()) {
-        FragmentProgram& f = it->second;
-        if (!f.tier2_queued && ++f.draws >= Tier2Draws) {
-            f.tier2_queued = true;
-            if (tier2) {
-                tier2->QueueFragment(key, config);
-            }
-        }
-        return f;
+    return config;
+}
+
+const RasterizerSgxd::FragmentProgram& RasterizerSgxd::FragmentProgramFor(const Epilogue& epilogue) {
+    const u64 epilogue_key = epilogue.Key();
+    if (fragment_regs_dirty) {
+        fragment_regs_dirty = false;
+        fragment_regs_hash = StateRegs::Hash(StateRegs::Fragment, regs.reg_array);
     }
-    // The first tier: registers placed, no optimising passes; microseconds, and the draw
-    // waits for it. The second tier replaces it once it has drawn Tier2Draws times.
-    std::string refusal;
-    auto emitted = Usse::EmitFragmentProgram(config, &refusal);
-    DEBUG_ASSERT_MSG(emitted.has_value(),
-                     "GXM: the emitter has no fragment program for this state: {}", refusal);
-    DumpProgram("fs", key, *emitted);
-    DumpPicaFragment(key, config);
-    FragmentProgram f = PlaceFragmentProgram(std::move(*emitted), epilogue, config.Hash());
-    return fragment_programs.emplace(key, std::move(f)).first->second;
+    if (!last_fragment || fragment_regs_hash != last_fragment_regs ||
+        epilogue_key != last_fragment_epilogue || draw_own_pixel != last_fragment_own) {
+        last_fragment_regs = fragment_regs_hash;
+        last_fragment_epilogue = epilogue_key;
+        last_fragment_own = draw_own_pixel;
+        // The own-pixel units come from the vertices, not the registers.
+        u64 state = Common::HashCombine(fragment_regs_hash, epilogue_key);
+        if (draw_own_pixel != 0) {
+            state = Common::HashCombine(state, draw_own_pixel);
+        }
+        if (const FragmentState* const found = fragment_states.Find(state)) {
+            last_fragment = found->program;
+            last_fragment_key = found->key;
+        } else {
+            const Pica::Shader::FSConfig config = FragmentConfig();
+            const u64 key = Common::HashCombine(config.Hash(), epilogue_key);
+            FragmentProgram* program = fragment_programs.Find(key);
+            if (!program) {
+                // The first tier: registers placed, no optimising passes; microseconds, and
+                // the draw waits for it. The second tier replaces it once it has drawn
+                // Tier2Draws times.
+                std::string refusal;
+                const u64 emit_start = sceKernelGetProcessTimeWide();
+                auto emitted = Usse::EmitFragmentProgram(config, &refusal);
+                const u64 emit_us = sceKernelGetProcessTimeWide() - emit_start;
+                NoteEmit(2, emit_us);
+                ASSERT_MSG(emitted.has_value(),
+                           "sgxd: the emitter has no fragment program for this state: {}",
+                           refusal);
+                DumpProgram("fs", key, *emitted);
+                DumpPicaFragment(key, config);
+                program = &fragment_programs.Emplace(
+                    key, PlaceFragmentProgram(std::move(*emitted), epilogue, key, emit_us));
+            }
+            if (fragment_states.Size() >= MaxFragmentStates) {
+                fragment_states.Clear();
+            }
+            fragment_states.Emplace(state, FragmentState{program, key});
+            last_fragment = program;
+            last_fragment_key = key;
+        }
+    }
+    FragmentProgram& f = *last_fragment;
+    if (!f.tier2_queued && ++f.draws >= Tier2Draws) {
+        f.tier2_queued = true;
+        if (tier2) {
+            QueueFragmentTier2(last_fragment_key, FragmentConfig());
+        }
+    }
+    return f;
 }
 
 void RasterizerSgxd::QueueFragmentTier2(u64 key, const Pica::Shader::FSConfig& config) {
@@ -3042,55 +3255,57 @@ void RasterizerSgxd::InstallTier2() {
             InstallVertexTier2(result);
             continue;
         }
-        const auto it = fragment_programs.find(result.key);
-        ASSERT_MSG(result.program.has_value(), "sgxd: tier 2 of fragment program {:016x}: {}",
+        // One job a config (QueueFragmentTier2): every program of it that waits takes the result.
+        Tier2Config* const c = tier2_configs.Find(result.key);
+        ASSERT_MSG(c != nullptr, "sgxd: tier 2 of fragment config {:016x} that was never queued",
+                   result.key);
+        ASSERT_MSG(result.program.has_value(), "sgxd: tier 2 of fragment config {:016x}: {}",
                    result.key, result.refusal);
-        ASSERT(it != fragment_programs.end());
-        DumpProgram("fs2", result.key, *result.program);
-        const u32 temps_before = it->second.usse.temp_count;
-        const std::size_t words_before = it->second.usse.primary.size();
-        FragmentProgram f =
-            PlaceFragmentProgram(std::move(*result.program), it->second.epilogue, result.key);
-        f.draws = it->second.draws;
-        f.tier2_queued = true;
+        c->program = std::move(*result.program);
         LOG_INFO(Render,
                  "tier 2 fragment program {:016x}: {} words to {}, {} temps to {}, emitted in {} "
                  "us ({} cycles), program {:016x}",
                  result.key, words_before, f.usse.primary.size(), temps_before, f.usse.temp_count,
                  result.took_us, result.took_cycles, ProgramHash(f.usse));
-        it->second = std::move(f);
+        // In place: last_fragment, and any draw's reference, sees the new program.
+        *old = std::move(f);
     }
 }
 
 void RasterizerSgxd::InstallVertexTier2(ShaderTier2::Result& result) {
-    const auto it = vertex_programs.find(result.key);
+    VertexProgram* const old = vertex_programs.Find(result.key);
     ASSERT_MSG(result.program.has_value(), "sgxd: tier 2 of vertex program {:016x}: {}",
                result.key, result.refusal);
-    ASSERT(it != vertex_programs.end());
+    ASSERT(old != nullptr || program_flushes != 0);
+    if (!old) {
+        return;
+    }
     // The draw binds an attribute for each input register the program reads: both tiers must read
     // the same ones.
-    ASSERT_MSG(result.input_regs == it->second.input_regs,
+    ASSERT_MSG(result.input_regs == old->input_regs,
                "sgxd: tier 2 of vertex program {:016x} reads input registers {:#x}, tier 1 {:#x}",
-               result.key, result.input_regs, it->second.input_regs);
+               result.key, result.input_regs, old->input_regs);
     DumpProgram("vs2", result.key, *result.program);
-    const u32 temps_before = it->second.usse.temp_count;
-    const std::size_t words_before = it->second.usse.primary.size();
+    const u32 temps_before = old->usse.temp_count;
+    const std::size_t words_before = old->usse.primary.size();
     VertexProgram v{};
     v.usse = std::move(*result.program);
+    ResolveVertexProgram(v);
     v.input_regs = result.input_regs;
-    v.primary_doutu0 = sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.primary),
-                                           v.usse.temp_count);
+    v.primary_doutu0 = sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
+                                           backend.PlaceCode(0, v.usse.primary), v.usse.temp_count);
     v.secondary_doutu0 = v.usse.secondary.empty()
                              ? DummyVertexSecondary
-                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.secondary), 0);
-    v.draws = it->second.draws;
+                             : sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
+                                                   backend.PlaceCode(0, v.usse.secondary), 0);
+    v.draws = old->draws;
     v.tier2_queued = true;
     LOG_INFO(Render,
              "tier 2 vertex program {:016x}: {} words to {}, {} temps to {}, emitted in {} us ({} "
              "cycles), program {:016x}",
              result.key, words_before, v.usse.primary.size(), temps_before, v.usse.temp_count,
              result.took_us, result.took_cycles, ProgramHash(v.usse));
-    it->second = std::move(v);
+    *old = std::move(v);
 }
 
 RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Program usse,
@@ -3176,11 +3391,12 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
     }
     const std::size_t code_words = code.size();
     const u32 doutu0 = sgxd_program_doutu0(
-        1, backend.PlaceCodePhased(1, std::move(code), phase_starts, g.temp_count),
-        g.temp_count);
+        SgxdBackend::HeapCodeBase(1),
+        backend.PlaceCodePhased(1, std::move(code), phase_starts, g.temp_count), g.temp_count);
     f.secondary_doutu0 = g.secondary.empty()
                              ? DummyPixelSecondary
-                             : sgxd_program_doutu0(1, backend.PlaceCode(1, g.secondary), 0);
+                             : sgxd_program_doutu0(SgxdBackend::HeapCodeBase(1),
+                                                   backend.PlaceCode(1, g.secondary), 0);
     f.primary_doutu0 = doutu0;
 
     std::array<u32, 12> iterators{};
@@ -3210,6 +3426,52 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
     return f;
 }
 
+namespace {
+
+// The LUT rows as the shaders sample them: (value, difference) F32F32 texels. Multiplying by
+// reciprocals (within one ulp of the quotients) avoids VFP's unpipelined vdiv.
+
+/// The LutEntry: the value 0.12 fixed point in bits 0-11, the difference's magnitude 0.11 in
+/// bits 12-22 and its sign in bit 23.
+void LightingLutRow(float* out, const Pica::PicaCore::Lighting::LutEntry* lut, u32 count) {
+    static_assert(sizeof(*lut) == sizeof(u32));
+    DEBUG_ASSERT(count % 4 == 0);
+    const float32x4_t value_scale = vdupq_n_f32(1.0f / 4095.0f);
+    const float32x4_t diff_scale = vdupq_n_f32(1.0f / 2047.0f);
+    for (u32 i = 0; i < count; i += 4) {
+        const uint32x4_t raw = vld1q_u32(&lut[i].raw);
+        const float32x4_t value =
+            vmulq_f32(vcvtq_f32_u32(vandq_u32(raw, vdupq_n_u32(0xfff))), value_scale);
+        const float32x4_t magnitude = vmulq_f32(
+            vcvtq_f32_u32(vandq_u32(vshrq_n_u32(raw, 12), vdupq_n_u32(0x7ff))), diff_scale);
+        // Bit 23 moved to the float's sign bit.
+        const uint32x4_t sign = vandq_u32(vshlq_n_u32(raw, 8), vdupq_n_u32(0x80000000u));
+        const float32x4_t diff =
+            vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(magnitude), sign));
+        const float32x4x2_t texels{{value, diff}};
+        vst2q_f32(out + i * 2, texels);
+    }
+}
+
+/// The fog LutEntry: the difference 1.1.11 two's complement in bits 0-12, the value 0.0.11 in
+/// bits 13-23.
+void FogLutRow(float* out, const Pica::PicaCore::Fog::LutEntry* lut, u32 count) {
+    static_assert(sizeof(*lut) == sizeof(u32));
+    DEBUG_ASSERT(count % 4 == 0);
+    const float32x4_t scale = vdupq_n_f32(1.0f / 2047.0f);
+    for (u32 i = 0; i < count; i += 4) {
+        const uint32x4_t raw = vld1q_u32(&lut[i].raw);
+        const float32x4_t value = vmulq_f32(
+            vcvtq_f32_u32(vandq_u32(vshrq_n_u32(raw, 13), vdupq_n_u32(0x7ff))), scale);
+        const int32x4_t difference = vshrq_n_s32(vshlq_n_s32(vreinterpretq_s32_u32(raw), 19), 19);
+        const float32x4_t diff = vmulq_f32(vcvtq_f32_s32(difference), scale);
+        const float32x4x2_t texels{{value, diff}};
+        vst2q_f32(out + i * 2, texels);
+    }
+}
+
+} // namespace
+
 void RasterizerSgxd::SyncLutLf() {
     auto& lighting = pica.lighting;
     auto& fog = pica.fog;
@@ -3231,6 +3493,7 @@ void RasterizerSgxd::SyncLutLf() {
         lut_half ^= 1;
         backend.WaitPassMark(lut_half_mark[lut_half], "a LUT ring's half");
         lut_row = lut_half * Half;
+        lut_rows_by_contents.Clear();
         lighting.lut_dirty = lighting.LutAllDirty;
         fog.lut_dirty = true;
     }
@@ -3248,12 +3511,16 @@ void RasterizerSgxd::SyncLutLf() {
     while (lighting.lut_dirty) {
         const u32 index = static_cast<u32>(std::countr_zero(lighting.lut_dirty));
         lighting.lut_dirty &= ~(1u << index);
-        const u32 row = take_row();
-        float* const out = reinterpret_cast<float*>(rows.cpu + row * RowBytes);
         const auto& lut = lighting.luts[index];
-        for (u32 i = 0; i < lut.size(); i++) {
-            out[i * 2] = lut[i].ToFloat();
-            out[i * 2 + 1] = lut[i].DiffToFloat();
+        const u64 contents = Common::ComputeHash64(lut.data(), sizeof(lut));
+        u32 row;
+        if (const u32* const held = lut_rows_by_contents.Find(contents)) {
+            row = *held;
+        } else {
+            row = take_row();
+            float* const out = reinterpret_cast<float*>(rows.cpu + row * RowBytes);
+            LightingLutRow(out, lut.data(), static_cast<u32>(lut.size()));
+            lut_rows_by_contents.Emplace(contents, u32{row});
         }
         fs_data.lighting_lut_offset[index / 4][index % 4] =
             static_cast<int>(row * Pica::Shader::LUT_TEX_WIDTH);
@@ -3262,10 +3529,7 @@ void RasterizerSgxd::SyncLutLf() {
         fog.lut_dirty = false;
         const u32 row = take_row();
         float* const out = reinterpret_cast<float*>(rows.cpu + row * RowBytes);
-        for (u32 i = 0; i < fog.lut.size(); i++) {
-            out[i * 2] = fog.lut[i].ToFloat();
-            out[i * 2 + 1] = fog.lut[i].DiffToFloat();
-        }
+        FogLutRow(out, fog.lut.data(), static_cast<u32>(fog.lut.size()));
         fs_data.fog_lut_offset = static_cast<int>(row * Pica::Shader::LUT_TEX_WIDTH);
     }
 }
@@ -3547,36 +3811,26 @@ bool RasterizerSgxd::AccelerateDrawBatch(bool is_indexed) {
 }
 
 RasterizerSgxd::VertexLayout& RasterizerSgxd::VertexLayoutFor() {
-    const auto& va = regs.pipeline.vertex_attributes;
-    const auto& reg_array = regs.reg_array;
-    // The format words: the attribute formats after the base, each loader's words 1 and 2 (its
-    // word 0 is the offset), the VS input count and input map.
-    constexpr u32 Va = PICA_REG_INDEX(pipeline.vertex_attributes);
-    std::array<u32, VertexLayout::KeyWords> key;
-    key[0] = reg_array[Va + 1];
-    key[1] = reg_array[Va + 2];
-    for (u32 l = 0; l < 12; l++) {
-        key[2 + 2 * l] = reg_array[Va + 3 + 3 * l + 1];
-        key[3 + 2 * l] = reg_array[Va + 3 + 3 * l + 2];
+    if (layout_regs_dirty) {
+        layout_regs_dirty = false;
+        layout_regs_hash = StateRegs::Hash(StateRegs::Layout, regs.reg_array);
     }
-    key[26] = reg_array[PICA_REG_INDEX(vs.input_buffer_config)];
-    key[27] = reg_array[PICA_REG_INDEX(vs.input_attribute_to_register_map_low)];
-    key[28] = reg_array[PICA_REG_INDEX(vs.input_attribute_to_register_map_high)];
-    for (u32 i = 0; i < vertex_layout_count; i++) {
-        if (vertex_layouts[i].key == key) {
-            // To the front, the others in their order behind it.
-            std::rotate(vertex_layouts.begin(), vertex_layouts.begin() + i,
-                        vertex_layouts.begin() + i + 1);
-            return vertex_layouts[0];
+    if (!last_layout || layout_regs_hash != last_layout_regs) {
+        last_layout_regs = layout_regs_hash;
+        last_layout = vertex_layouts.Find(layout_regs_hash);
+        if (!last_layout) {
+            if (vertex_layouts.Size() >= MaxVertexLayouts) {
+                vertex_layouts.Clear();
+            }
+            last_layout = &vertex_layouts.Emplace(layout_regs_hash, DecodeVertexLayout());
         }
     }
-    // New: the least recently used goes.
-    vertex_layout_count = std::min<u32>(vertex_layout_count + 1, vertex_layouts.size());
-    std::rotate(vertex_layouts.begin(), vertex_layouts.begin() + vertex_layout_count - 1,
-                vertex_layouts.begin() + vertex_layout_count);
-    VertexLayout& layout = vertex_layouts[0];
-    layout = VertexLayout{};
-    layout.key = key;
+    return *last_layout;
+}
+
+RasterizerSgxd::VertexLayout RasterizerSgxd::DecodeVertexLayout() const {
+    const auto& va = regs.pipeline.vertex_attributes;
+    VertexLayout layout{};
     for (u32 loader_index = 0; loader_index < 12; loader_index++) {
         const auto& loader = va.attribute_loaders[loader_index];
         if (loader.component_count == 0 || loader.byte_count == 0) {
@@ -3830,7 +4084,8 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         }
     }
 
-    std::array<SgxdVertexFetch, SGXD_PROGRAM_MAX_FETCH> fetch{};
+    VertexStage stage;
+    std::array<SgxdVertexFetch, SGXD_PROGRAM_MAX_FETCH>& fetch = stage.fetch;
     u32 fetch_count = 0;
     const u32 first = mode != Usse::VsMode::Draw ? vertex_min
                      : is_indexed                ? 0
@@ -3840,19 +4095,15 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         if ((vp.input_regs & (1u << f.reg)) == 0) {
             continue;
         }
-        const std::string name = fmt::format("vs_in_attr{}", f.reg);
-        const auto attribute =
-            std::find_if(vg.attributes.begin(), vg.attributes.end(),
-                         [&](const Usse::GxpAttribute& a) { return a.name == name; });
-        DEBUG_ASSERT_MSG(attribute != vg.attributes.end(),
-                         "GXM: {}: the program reads {} but has no "
+        const u32 resource = vp.attr_resource[f.reg];
+        DEBUG_ASSERT_MSG(resource != ~0u, "sgxd: {}: the program reads vs_in_attr{} but has no "
                          "such attribute",
-                         describe(), name);
+                         describe(), f.reg);
         DEBUG_ASSERT(fetch_count < fetch.size());
         // The identity index list counts from 0, the first vertex in the address; a guest list indexes
         // from the loader's address.
         const PAddr address = immediate ? f.address : f.address + first * f.stride;
-        fetch[fetch_count++] = {address, f.stride, f.words, attribute->resource};
+        fetch[fetch_count++] = {address, f.stride, f.words, resource};
         // Unscanned, every vertex the indices can reach is uncached (above).
         if (immediate || !scan) {
             continue;
@@ -3875,9 +4126,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
     }
 
 
-    VertexStage stage{};
     stage.vp = &vp;
-    stage.fetch = fetch;
     stage.fetch_count = fetch_count;
     stage.indices = mode == Usse::VsMode::Draw ? indices_gpu : 0;
     stage.count = count;
@@ -3887,82 +4136,130 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
     return stage;
 }
 
-SgxdBackend::Data RasterizerGxm::VertexSa(const Usse::GxpProgram& vg,
+const std::array<s8, 16>& RasterizerSgxd::DefaultInputAttributes() {
+    const auto& va = regs.pipeline.vertex_attributes;
+    const std::array<u32, 3> key{va.attribute_mask.Value(),
+                                 regs.vs.input_attribute_to_register_map_low,
+                                 regs.vs.input_attribute_to_register_map_high};
+    if (!default_input_valid || key != default_input_key) {
+        default_input_key = key;
+        default_input_valid = true;
+        default_input_attr.fill(-1);
+        // In attribute order: a later attribute sent to the same register wins.
+        for (u32 attr = 0; attr < 16; attr++) {
+            if (va.IsDefaultAttribute(attr)) {
+                default_input_attr[regs.vs.GetRegisterForAttribute(attr)] = static_cast<s8>(attr);
+            }
+        }
+    }
+    return default_input_attr;
+}
+
+SgxdBackend::Data RasterizerSgxd::VertexSa(const VertexProgram& vp,
                                           const Pica::ShaderSetup& setup, u32& vsec_sa,
                                           const Describe& describe) {
-    // The image covers the containers, the prefetched uniforms after them and the SAs the
-    // secondary program writes; the secondary PDS program DMAs all of it.
-    const u32 vsa_words = vg.uniform_floats + Usse::DataHead(vg) + static_cast<u32>(vg.literals.size());
-    vsec_sa = std::max(vg.secondary_reg_count, vsa_words);
-    const SgxdBackend::Data vsa = backend.AllocData(vsec_sa * 4);
-    float* const vsa_f = reinterpret_cast<float*>(vsa.cpu);
-    std::memset(vsa.cpu, 0, vsec_sa * 4);
-    SgxdBackend::Data vbuf{};
-    if (vg.buffer_pointer) {
-        vbuf = backend.AllocData(vg.buffer_floats * 4);
-        std::memset(vbuf.cpu, 0, vg.buffer_floats * 4);
-        const u32 pointer = vbuf.gpu + static_cast<u32>(vg.ldst_base_value);
-        std::memcpy(vsa.cpu + vg.uniform_floats * 4, &pointer, 4);
-    }
-    for (size_t i = 0; i < vg.literals.size(); i++) {
-        std::memcpy(vsa.cpu + (vg.uniform_floats + Usse::DataHead(vg) + i) * 4, &vg.literals[i],
-                    4);
-    }
+    const Usse::Program& vg = vp.usse;
+    // The image is put together in cached memory and copied once (the pass data is uncached CDRAM).
+    // The program's scratch holds the fixed part; each draw writes its values over the same words.
+    vsec_sa = vp.sa_words;
+    DEBUG_ASSERT(vp.sa_scratch.size() == vsec_sa);
+    float* const vsa_f = vp.sa_scratch.data();
     const auto& uniforms = setup.uniforms;
-    const auto& va = regs.pipeline.vertex_attributes;
-    for (const Usse::GxpUniform& u : vg.uniforms) {
-        if (u.name == "uniforms_f") {
-            // The whole bank, f24 as float: rows past the 96 real uniforms read as ones, as the
-            // PICA reads them, and rows 0-3 again past 127 (the emitter's wrap mirror).
-            DEBUG_ASSERT(vg.buffer_pointer && u.sa_offset + u.array_size * 4 <= vg.buffer_floats);
-            float* const bank = reinterpret_cast<float*>(vbuf.cpu) + u.sa_offset;
-            for (u32 n = 0; n < u.array_size; n++) {
-                const u32 row = n < 128 ? n : n - 128;
-                for (u32 c = 0; c < 4; c++) {
-                    bank[n * 4 + c] = row < 96 ? uniforms.f[row][c].ToFloat32() : 1.0f;
-                }
-            }
-            continue;
-        }
-        DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <= vg.uniform_floats);
-        float* const out = vsa_f + u.sa_offset;
-        if (u.name == "flip_viewport") {
+    if (vg.buffer_pointer) {
+        const u32 pointer = BankBuffer(vp, setup) + static_cast<u32>(vg.ldst_base_value);
+        std::memcpy(vsa_f + vg.uniform_floats, &pointer, 4);
+    }
+    const std::array<s8, 16>* default_attrs = nullptr;
+    using Kind = Usse::UniformKind;
+    for (const VertexSaSlot& slot : vp.sa_slots) {
+        float* const out = vsa_f + slot.sa;
+        switch (slot.kind) {
+        case Kind::FlipViewport:
             out[0] = vs_data.flip_viewport ? 1.0f : 0.0f;
-        } else if (u.name == "depth_scale") {
+            break;
+        case Kind::DepthScale:
             out[0] = fs_data.depth_scale;
-        } else if (u.name == "depth_offset") {
+            break;
+        case Kind::DepthOffset:
             out[0] = fs_data.depth_offset;
-        } else if (u.name == "uniforms_i") {
-            for (u32 n = 0; n < 4 && n < u.array_size; n++) {
+            break;
+        case Kind::IntUniforms:
+            for (u32 n = 0; n < 4 && n < slot.array_size; n++) {
                 for (u32 c = 0; c < 4; c++) {
                     out[n * 4 + c] = static_cast<float>(uniforms.i[n][c]);
                 }
             }
-        } else if (u.name.starts_with("vs_in_reg")) {
-            const u32 reg = static_cast<u32>(std::stoul(u.name.substr(9)));
+            break;
+        case Kind::DefaultInput: {
             float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            for (u32 attr = 0; attr < 16; attr++) {
-                if (va.IsDefaultAttribute(attr) && regs.vs.GetRegisterForAttribute(attr) == reg) {
-                    for (u32 c = 0; c < 4; c++) {
-                        value[c] = pica.input_default_attributes[attr][c].ToFloat32();
-                    }
+            if (default_attrs == nullptr) {
+                default_attrs = &DefaultInputAttributes();
+            }
+            DEBUG_ASSERT(slot.index < 16);
+            if (const s8 attr = (*default_attrs)[slot.index]; attr >= 0) {
+                for (u32 c = 0; c < 4; c++) {
+                    value[c] = pica.input_default_attributes[attr][c].ToFloat32();
                 }
             }
-            PutVec(out, value, u.components);
-        } else {
-            UNREACHABLE_MSG("GXM: {}: the vertex uniform {} has no value", describe(), u.name);
+            PutVec(out, value, slot.components);
+            break;
+        }
+        default:
+            UNREACHABLE_MSG("sgxd: {}: the vertex uniform {} has no value", describe(),
+                            Usse::UniformName(vg.uniforms[slot.uniform]));
         }
     }
-    // The uniforms read with a constant index, as the bank has them: rows past the 96 real
-    // uniforms read as ones.
     for (const auto& [sa, row] : vg.prefetched_uniforms) {
         DEBUG_ASSERT(sa + 4 <= vsec_sa && row < 128);
-        for (u32 c = 0; c < 4; c++) {
-            vsa_f[sa + c] = row < 96 ? uniforms.f[row][c].ToFloat32() : 1.0f;
+        CopyUniformRows(vsa_f + sa, row, 1, uniforms);
+    }
+    // The program's last image in this pass again: that copy, whose secondary PDS program the backend
+    // still has.
+    const u32 pass = backend.DataOpens();
+    if (vp.sa_last_pass == pass && vp.sa_last.size() == vsec_sa &&
+        std::memcmp(vp.sa_last.data(), vsa_f, vsec_sa * 4) == 0) {
+        return vp.sa_last_data;
+    }
+    const SgxdBackend::Data vsa = backend.AllocData(vsec_sa * 4);
+    std::memcpy(vsa.cpu, vsa_f, vsec_sa * 4);
+    vp.sa_last.assign(vsa_f, vsa_f + vsec_sa);
+    vp.sa_last_pass = pass;
+    vp.sa_last_data = vsa;
+    return vsa;
+}
+
+u32 RasterizerSgxd::BankBuffer(const VertexProgram& vp, const Pica::ShaderSetup& setup) {
+    const Usse::Program& vg = vp.usse;
+    const u32 pass = backend.DataOpens();
+    const Pica::ShaderSetup* const from = vp.has_bank ? &setup : nullptr;
+    const u32 version = vp.has_bank ? setup.f_version : 0;
+    const u32 offset = vp.has_bank ? vp.bank_offset : 0;
+    const u32 rows = vp.has_bank ? vp.bank_rows : 0;
+    for (const BankUpload& u : bank_uploads) {
+        if (u.gpu != 0 && u.pass == pass && u.setup == from && u.version == version &&
+            u.floats == vg.buffer_floats && u.offset == offset && u.rows == rows) {
+            return u.gpu;
         }
     }
-
-    return vsa;
+    // The buffer: zeros, the float bank where uniforms_f is; rows past the 96 real ones read as ones,
+    // and rows 0-3 again past 127 (the emitter's wrap mirror).
+    const SgxdBackend::Data vbuf = backend.AllocData(vg.buffer_floats * 4);
+    float* const buffer = reinterpret_cast<float*>(vbuf.cpu);
+    const u32 bank_begin = vp.has_bank ? vp.bank_offset : vg.buffer_floats;
+    const u32 bank_end = vp.has_bank ? vp.bank_offset + vp.bank_rows * 4 : vg.buffer_floats;
+    std::memset(buffer, 0, bank_begin * 4);
+    std::memset(buffer + bank_end, 0, (vg.buffer_floats - bank_end) * 4);
+    if (vp.has_bank) {
+        float* const bank = buffer + vp.bank_offset;
+        const u32 low = std::min(vp.bank_rows, 128u);
+        CopyUniformRows(bank, 0, low, setup.uniforms);
+        if (vp.bank_rows > 128) {
+            CopyUniformRows(bank + 128 * 4, 0, vp.bank_rows - 128, setup.uniforms);
+        }
+    }
+    bank_uploads[bank_upload_next] = {pass, from, version, vg.buffer_floats, offset, rows, vbuf.gpu};
+    bank_upload_next = (bank_upload_next + 1) % bank_uploads.size();
+    return vbuf.gpu;
 }
 
 void RasterizerSgxd::VertexPrograms(const VertexStage& stage, const SgxdBackend::Data& vsa,
@@ -4450,210 +4747,6 @@ bool RasterizerSgxd::CoversTarget(bool is_indexed, const float* immediate, u32 c
     return (left_out[0] ^ left_out[1]) == 3;
 }
 
-#ifdef VITA_DIAGNOSTICS
-void RasterizerGxm::VsCpuCheck(bool is_indexed, const Describe& describe) {
-    static u32 checked = 0, reported = 0;
-    if (reported >= 8) {
-        return;
-    }
-    const auto info = AnalyzeVertexArray(is_indexed);
-    const auto engine = Pica::CreateEngine(false);
-    Pica::ShaderUnit unit;
-    engine->SetupBatch(pica.vs_setup, regs.vs.main_offset);
-    const Pica::VertexLoader loader(memory, regs.pipeline);
-    const auto& va = regs.pipeline.vertex_attributes;
-    const PAddr base = va.GetPhysicalBaseAddress();
-    const u32 outputs = static_cast<u32>(std::popcount(regs.vs.output_mask.Value()));
-    checked++;
-    for (u32 v = info.vs_input_index_min; v <= info.vs_input_index_max; v++) {
-        Pica::AttributeBuffer input{}, out{};
-        loader.LoadVertex(base, v - info.vs_input_index_min, v, input,
-                          pica.input_default_attributes);
-        unit.LoadInput(regs.vs, input);
-        engine->Run(pica.vs_setup, unit);
-        unit.WriteOutput(regs.vs, out);
-        u32 bad = ~0u;
-        for (u32 k = 0; k < outputs * 4 && bad == ~0u; k++) {
-            if (!std::isfinite(out[k / 4][k % 4].ToFloat32())) {
-                bad = k;
-            }
-        }
-        if (bad == ~0u) {
-            continue;
-        }
-        reported++;
-        LOG_WARNING(Render, "vscpu: draw {} ({}): {}: vertex {} of {}-{}: output {} lane {} is {} "
-                            "on the CPU's interpreter",
-                    draws + 1, checked, describe(), v, info.vs_input_index_min,
-                    info.vs_input_index_max, bad / 4, "xyzw"[bad % 4],
-                    out[bad / 4][bad % 4].ToFloat32());
-        std::string in;
-        for (u32 a = 0; a <= va.max_attribute_index && a < 16; a++) {
-            in += fmt::format(" a{}{}->v{}=({} {} {} {})", a,
-                              va.IsDefaultAttribute(a) ? "(default)" : "",
-                              regs.vs.GetRegisterForAttribute(a), input[a][0].ToFloat32(),
-                              input[a][1].ToFloat32(), input[a][2].ToFloat32(),
-                              input[a][3].ToFloat32());
-        }
-        LOG_WARNING(Render, "vscpu: draw {}: inputs{}", draws + 1, in);
-        for (u32 l = 0; l < 12; l++) {
-            const auto& ld = va.attribute_loaders[l];
-            if (ld.component_count == 0 || ld.byte_count == 0) {
-                continue;
-            }
-            const PAddr at = base + ld.data_offset + v * ld.byte_count;
-            const u8* const bytes = memory.GetPhysicalPointer(at);
-            std::string raw;
-            for (u32 n = 0; bytes && n < std::min<u32>(ld.byte_count, 48); n++) {
-                raw += fmt::format("{:02x}", bytes[n]);
-            }
-            LOG_WARNING(Render, "vscpu: draw {}: loader {} at {:#x} stride {}: {}", draws + 1, l,
-                        at, static_cast<u32>(ld.byte_count), raw);
-        }
-        std::string uf;
-        for (u32 i = 0; i < pica.vs_setup.uniforms.f.size(); i++) {
-            const auto& f = pica.vs_setup.uniforms.f[i];
-            if (!std::isfinite(f[0].ToFloat32()) || !std::isfinite(f[1].ToFloat32()) ||
-                !std::isfinite(f[2].ToFloat32()) || !std::isfinite(f[3].ToFloat32())) {
-                uf += fmt::format(" c{}=({} {} {} {})", i, f[0].ToFloat32(), f[1].ToFloat32(),
-                                  f[2].ToFloat32(), f[3].ToFloat32());
-            }
-        }
-        LOG_WARNING(Render, "vscpu: draw {}: non-finite float uniforms:{}; main {:#x}, "
-                            "bools {:#x}, ints {} {} {} {}",
-                    draws + 1, uf.empty() ? " none" : uf, regs.vs.main_offset.Value(),
-                    regs.vs.bool_uniforms.Value(), pica.vs_setup.uniforms.i[0].x,
-                    pica.vs_setup.uniforms.i[1].x, pica.vs_setup.uniforms.i[2].x,
-                    pica.vs_setup.uniforms.i[3].x);
-        return;
-    }
-    if (checked <= 4) {
-        LOG_INFO(Render, "vscpu: draw {} ({}): {}: vertices {}-{} all finite on the CPU", draws + 1,
-                 checked, describe(), info.vs_input_index_min, info.vs_input_index_max);
-    }
-}
-#endif
-
-void RasterizerGxm::VsProbe(bool is_indexed, u32 count, const Describe& describe) {
-    const u32 outputs = static_cast<u32>(std::popcount(regs.vs.output_mask.Value()));
-    VertexStage a0 =
-        VertexStageFor(is_indexed, nullptr, count, Usse::VsMode::StoreOutputs, describe);
-    const u32 vertices = a0.vertex_max - a0.vertex_min + 1;
-    const u32 vsize = outputs * 16;
-    DEBUG_ASSERT(vertices <= 0x10000);
-    const SgxdBackend::Data vs_out = backend.AllocData(vertices * vsize);
-    std::memset(vs_out.cpu, 0xcc, vertices * vsize);
-    const u32 a0_count = Common::AlignUp(vertices, 3u);
-    const SgxdBackend::Data a0_table = backend.AllocData(vertices * 4);
-    const SgxdBackend::Data a0_indices = backend.AllocData(a0_count * 2, 4);
-    u32* const table = reinterpret_cast<u32*>(a0_table.cpu);
-    u16* const a0_list = reinterpret_cast<u16*>(a0_indices.cpu);
-    for (u32 j = 0; j < vertices; j++) {
-        table[j] = vs_out.gpu + j * vsize;
-        a0_list[j] = static_cast<u16>(j);
-    }
-    for (u32 j = vertices; j < a0_count; j++) {
-        a0_list[j] = static_cast<u16>(vertices - 1);
-    }
-    const auto& ag = a0.vp->gxp;
-    const auto out_attr = std::find_if(ag.attributes.begin(), ag.attributes.end(),
-                                       [](const auto& a) { return a.name == "vs_out_address"; });
-    DEBUG_ASSERT(out_attr != ag.attributes.end() && a0.fetch_count < a0.fetch.size());
-    a0.fetch[a0.fetch_count++] = {a0_table.gpu, 4, 1, out_attr->resource};
-    a0.indices = a0_indices.gpu;
-    a0.count = a0_count;
-    u32 vsec_sa = 0;
-    const SgxdBackend::Data vsa = VertexSa(ag, pica.vs_setup, vsec_sa, describe);
-    SgxdRecipeDrawPrograms p{};
-    VertexPrograms(a0, vsa, vsec_sa, p, describe);
-#ifdef VITA_DIAGNOSTICS
-    NoteStreamOut("vsprobe", 0, 0, 0, 0, a0_count, *a0.vp);
-#endif
-    backend.StreamOut(p, a0_count);
-#ifdef VITA_DIAGNOSTICS
-    stream_note.stage = nullptr;
-#endif
-
-    // The loaders: each attribute's register, format, elements and offset, and the first
-    // vertex's bytes, to tell an unpack's error from the program's.
-    const auto log_loaders = [&] {
-        const auto& va = regs.pipeline.vertex_attributes;
-        for (u32 l = 0; l < 12; l++) {
-            const auto& loader = va.attribute_loaders[l];
-            if (loader.component_count == 0 || loader.byte_count == 0) {
-                continue;
-            }
-            std::string line;
-            for (u32 comp = 0; comp < loader.component_count && comp < 12; comp++) {
-                const u32 a = loader.GetComponent(comp);
-                line += a >= 12 ? fmt::format(" pad{}", (a - 11) * 4)
-                                : fmt::format(" a{}->v{} f{}x{}", a, regs.vs.GetRegisterForAttribute(a),
-                                              static_cast<u32>(va.GetFormat(a)),
-                                              va.GetNumElements(a));
-            }
-            const PAddr at = va.GetPhysicalBaseAddress() + loader.data_offset +
-                             a0.vertex_min * loader.byte_count;
-            const u8* const bytes = memory.GetPhysicalPointer(at);
-            std::string raw;
-            for (u32 n = 0; n < std::min<u32>(loader.byte_count, 32); n++) {
-                raw += fmt::format("{:02x}", bytes[n]);
-            }
-            LOG_INFO(Render, "vsprobe {}: loader {} at {:#x} stride {}:{}; vertex {}: {}", draws + 1,
-                     l, at, static_cast<u32>(loader.byte_count), line, a0.vertex_min, raw);
-        }
-    };
-    log_loaders();
-    // Upstream's interpreter over the same vertices.
-    const auto engine = Pica::CreateEngine(false);
-    Pica::ShaderUnit unit;
-    engine->SetupBatch(pica.vs_setup, regs.vs.main_offset);
-    const Pica::VertexLoader loader(memory, regs.pipeline);
-    const PAddr base = regs.pipeline.vertex_attributes.GetPhysicalBaseAddress();
-    u32 wrong = 0, compared = 0;
-    // Every vertex's outputs on the GPU, for a non-finite one past the 64 compared.
-    for (u32 j = 0; j < vertices; j++) {
-        const float* got = reinterpret_cast<const float*>(vs_out.cpu + j * vsize);
-        for (u32 k = 0; k < outputs * 4; k++) {
-            if (!std::isfinite(got[k])) {
-                LOG_INFO(Render, "vsprobe {}: {}: vertex {} output {} lane {} is {} on the GPU",
-                         draws + 1, describe(), a0.vertex_min + j, k / 4, "xyzw"[k % 4], got[k]);
-                j = vertices;
-                break;
-            }
-        }
-    }
-    for (u32 j = 0; j < std::min(vertices, 64u); j++) {
-        Pica::AttributeBuffer input{}, want{};
-        loader.LoadVertex(base, j, a0.vertex_min + j, input, pica.input_default_attributes);
-        unit.LoadInput(regs.vs, input);
-        engine->Run(pica.vs_setup, unit);
-        unit.WriteOutput(regs.vs, want);
-        const float* got = reinterpret_cast<const float*>(vs_out.cpu + j * vsize);
-        for (u32 k = 0; k < outputs; k++) {
-            for (u32 c = 0; c < 4; c++) {
-                const float w = want[k][c].ToFloat32(), g = got[k * 4 + c];
-                compared++;
-                if (!(std::abs(w - g) <= 1e-3f * std::max(1.0f, std::abs(w)))) {
-                    if (wrong++ < 48) {
-                        LOG_INFO(Render, "vsprobe {}: vertex {} output {} lane {}: ours {} upstream {}",
-                                 draws + 1, a0.vertex_min + j, k, "xyzw"[c], g, w);
-                    }
-                }
-            }
-        }
-        if (j < 4) {
-            std::string line;
-            for (u32 k = 0; k < outputs; k++) {
-                line += fmt::format(" o{}=({:.4g} {:.4g} {:.4g} {:.4g})", k, got[k * 4],
-                                    got[k * 4 + 1], got[k * 4 + 2], got[k * 4 + 3]);
-            }
-            LOG_INFO(Render, "vsprobe {}: vertex {} ours:{}", draws + 1, a0.vertex_min + j, line);
-        }
-    }
-    LOG_INFO(Render, "vsprobe {}: {}: {} of {} output components differ from upstream's "
-             "interpreter", draws + 1, describe(), wrong, compared);
-}
-
 bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate_count) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
 #ifdef VITA_DIAGNOSTICS
@@ -4715,6 +4808,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     }
     DEBUG_ASSERT_MSG(count > 0 && (is_indexed || count <= SGXD_RECIPE_MAX_INDICES),
                      "sgxd: {}: more vertices than the identity index list", describe());
+    // The cached state's registers changed, before SyncDrawUniforms clears the marks.
+    fragment_regs_dirty |= StateRegs::AnyDirty(StateRegs::FragmentMask, pica.dirty_regs.qwords);
+    layout_regs_dirty |= StateRegs::AnyDirty(StateRegs::LayoutMask, pica.dirty_regs.qwords);
     SyncDrawUniforms();
     {
         // The scissor box in the fragment program's position (WPOS: pixel centres from the
@@ -5093,6 +5189,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
 
     // --- the vertex stage: the loaders' attributes into the vertex program, or with a
     // geometry shader, the triangles its passes stored ---
+    draw_view = DrawViewport();
     const VertexStage stage = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes
                                   ? GeometryStage(is_indexed, describe)
                                   : VertexStageFor(is_indexed, immediate, count,
@@ -5217,21 +5314,15 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                           static_cast<u32>(fg.samplers.size()) * 4;
     SgxdBackend::Data fsa{};
     if (fsa_words != 0) {
-        fsa = backend.AllocData(fsa_words * 4);
-        // Made in cached memory and copied out once, as VertexSa's image: the pass data is
-        // uncached, and the clear, the scattered stores and the normalisation's reads went to
-        // it.
+        // Made in cached memory and copied out once (the pass data is uncached); the buffer's pointer goes
+        // in once the buffer is placed.
         fsa_scratch.assign(fsa_words, 0);
         u8* const fsa_cpu = reinterpret_cast<u8*>(fsa_scratch.data());
         float* const fsa_f = reinterpret_cast<float*>(fsa_cpu);
-        SgxdBackend::Data fbuf{};
         u8* fbuf_cpu = nullptr;
         if (fg.buffer_pointer) {
-            fbuf = backend.AllocData(fg.buffer_floats * 4);
             fbuf_scratch.assign(fg.buffer_floats, 0);
             fbuf_cpu = reinterpret_cast<u8*>(fbuf_scratch.data());
-            const u32 pointer = fbuf.gpu + static_cast<u32>(fg.ldst_base_value);
-            std::memcpy(fsa_cpu + fg.uniform_floats * 4, &pointer, 4);
         }
         const u8* const fs_bytes = reinterpret_cast<const u8*>(&fs_data);
         for (const UniformSource& u : fp.uniforms) {
@@ -5302,10 +5393,29 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                                       4,
                         words, sizeof(words));
         }
-        std::memcpy(fsa.cpu, fsa_cpu, fsa_words * 4);
+        // Placed in the pass data, or the program's last copies in this pass again when they are the same.
+        const u32 pass = backend.DataOpens();
+        const bool same_pass = fp.sa_last_pass == pass;
         if (fbuf_cpu != nullptr) {
-            std::memcpy(fbuf.cpu, fbuf_cpu, fg.buffer_floats * 4);
+            SgxdBackend::Data fbuf = fp.buf_last_data;
+            if (!same_pass || fp.buf_last != fbuf_scratch) {
+                fbuf = backend.AllocData(fg.buffer_floats * 4);
+                std::memcpy(fbuf.cpu, fbuf_cpu, fg.buffer_floats * 4);
+                fp.buf_last = fbuf_scratch;
+                fp.buf_last_data = fbuf;
+            }
+            const u32 pointer = fbuf.gpu + static_cast<u32>(fg.ldst_base_value);
+            std::memcpy(fsa_cpu + fg.uniform_floats * 4, &pointer, 4);
         }
+        if (same_pass && fp.sa_last == fsa_scratch) {
+            fsa = fp.sa_last_data;
+        } else {
+            fsa = backend.AllocData(fsa_words * 4);
+            std::memcpy(fsa.cpu, fsa_cpu, fsa_words * 4);
+            fp.sa_last = fsa_scratch;
+            fp.sa_last_data = fsa;
+        }
+        fp.sa_last_pass = pass;
     }
 
     // --- the PDS programs ---

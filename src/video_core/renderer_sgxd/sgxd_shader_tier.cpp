@@ -3,9 +3,11 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
-#include <chrono>
 #include <utility>
+#include "azahar_native.h"
+#include "common/host_clock.h"
 #include "common/logging/log.h"
+#include "common/process_clock.h"
 #include "common/thread.h"
 #include "video_core/renderer_sgxd/sgxd_shader_tier.h"
 #include "video_core/renderer_sgxd/usse/fs_usse_gen.h"
@@ -79,7 +81,7 @@ void ShaderTier2::Loop(std::stop_token stop) {
             job = std::move(jobs.front());
             jobs.pop_front();
         }
-        const auto start = std::chrono::steady_clock::now();
+        const u32 start = azaharCyclesStart();
         Result result{};
         result.key = job->key;
         result.vertex = !job->fs;
@@ -89,9 +91,8 @@ void ShaderTier2::Loop(std::stop_token stop) {
             result.program =
                 Usse::EmitVertexProgram(job->vs, result.input_regs, &result.refusal, 2);
         }
-        result.took_us = static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                              std::chrono::steady_clock::now() - start)
-                                              .count());
+        result.took_cycles = azaharCycles() - start;
+        result.took_us = static_cast<u32>(Common::CyclesToUs(result.took_cycles));
         std::scoped_lock lock{mutex};
         results.push_back(std::move(result));
         ready.store(true, std::memory_order_release);

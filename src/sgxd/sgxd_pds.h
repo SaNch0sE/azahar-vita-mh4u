@@ -59,6 +59,13 @@ typedef struct Pds {
     unsigned ncode;
 } Pds;
 
+// An empty program: only the counts. The segments and the code are written before they are read
+// (pds_pair and pds_quad zero the holes they skip, pds_words clears its output first), so they
+// need no clearing: thousands of programs are built a second.
+static inline void pds_init(Pds *p) {
+    p->len[0] = p->len[1] = 0;
+    p->ncode = 0;
+}
 static inline unsigned pds_word(Pds *p, unsigned b, uint32_t v) {
     p->ds[b][p->len[b]++] = v;
     return p->len[b] - 1;
