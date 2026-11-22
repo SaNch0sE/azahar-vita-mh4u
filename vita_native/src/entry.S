@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 @ azahar-native — entering the guest and leaving it.
 @
 @ ARM state throughout: exception entry is ARM, and `ldm ^` / `rfe` / `movs pc` have no useful

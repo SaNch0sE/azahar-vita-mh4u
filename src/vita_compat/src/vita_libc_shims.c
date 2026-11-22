@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* Definitions the PS Vita's newlib does not provide, for libraries that expect a fuller POSIX.
  *
  * These are linked into the executable itself rather than into a library, so that they satisfy

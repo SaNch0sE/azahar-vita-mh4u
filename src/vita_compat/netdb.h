@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* netdb.h for the PS Vita.
  *
  * The console's own netdb.h has the lookup functions but not the h_errno result codes that go

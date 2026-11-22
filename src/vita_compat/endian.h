@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* endian.h for the PS Vita.
  *
  * The console's newlib has <machine/endian.h> with the byte order macros but none of the

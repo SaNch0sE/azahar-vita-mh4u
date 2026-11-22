@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* sys/socket.h for the PS Vita.
  *
  * Forwards to the console's own header and adds the one call POSIX puts here that its network

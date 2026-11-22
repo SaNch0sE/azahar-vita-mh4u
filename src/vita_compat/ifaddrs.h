@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* ifaddrs.h for the PS Vita.
  *
  * The console has no getifaddrs. Only cpp-httplib asks for it, to enumerate local addresses for

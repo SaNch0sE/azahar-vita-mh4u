@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Willi Ye
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """Produce a SELF that still carries its section headers and symbol tables.
 
 `vita-make-fself` copies only the loadable segments of the velf into the SELF and writes a

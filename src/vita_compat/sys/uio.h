@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* sys/uio.h for the PS Vita.
  *
  * struct iovec is declared in the console's <sys/socket.h>, which ships no <sys/uio.h> to go

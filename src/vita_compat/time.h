@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* time.h for the PS Vita.
  *
  * newlib here has no timegm, which libressl's certificate validity checking needs. It is

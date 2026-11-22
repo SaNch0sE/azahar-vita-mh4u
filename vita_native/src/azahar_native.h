@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // azahar-native — the ABI between the kernel plugin and the emulator. Included by both.
 //
 // The PS Vita is Sony's handheld games console; this is a hobby emulator project running on a

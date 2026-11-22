@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Willi Ye
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
 # Regenerates the vendored .gxp next to each .cg in this directory.
 #
 # psp2cgc is the SDK's own Cg compiler: a 32-bit Windows tool, so it runs under wine in a

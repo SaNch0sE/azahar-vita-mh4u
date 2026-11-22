@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* net/if.h for the PS Vita.
  *
  * Interface enumeration does not exist on this console. The declarations here exist so headers

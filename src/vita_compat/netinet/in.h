@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 /* netinet/in.h for the PS Vita.
  *
  * The console's own header covers IPv4 and the parts of IPv6 its network stack implements. What
