@@ -103,11 +103,16 @@ extern "C" int __llvm_profile_write_buffer(char* buffer);
 // The default heap is nowhere near enough for a 3DS: FCRAM alone is 128 MB, and the caches and
 // the surface storage sit on top of it. Newlib reads this at startup.
 extern "C" {
-// The newlib heap: guest VRAM and the emulator's working set live in it, guest FCRAM in a block of
-// its own (HostSharedMemory::OwnBlock). newlib takes the whole heap as one memblock at startup and
-// the kernel commits it, so every megabyte here is one the system cannot have (at 300 MB its own
-// services failed to start).
+// The newlib heap: the emulator's working set, 21-32 MiB in play on players' consoles; guest
+// memory and the large transients have blocks of their own (HostSharedMemory). newlib takes the
+// whole heap as one memblock at startup and the kernel commits it, so every megabyte here is one
+// the textures pool's overflow cannot have: a retail Vita leaves a game about 28 MiB besides. The
+// replay player reads whole captures into it.
+#ifdef AZAHAR_REPLAY_PLAYER
 unsigned int _newlib_heap_size_user = 112 * 1024 * 1024;
+#else
+unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
+#endif
 
 // Default stack for every pthread, and so for every std::thread: the GPU thread, the two
 // rasterizer workers, the service threads. vitasdk's built-in default is 32 KB (the fallback
@@ -121,47 +126,8 @@ unsigned int _pthread_stack_default_user = 1024 * 1024;
 int _vita_net_init(void);
 }
 
-// 5: AZAHAR_PERM_APP_ATTR, guest VRAM in CDRAM mapped with the app's attributes.
-// 7: azaharAdopt and azaharReback, guest framebuffers moved to CDRAM.
-// 8: azaharRebackReturn, pages the GPU no longer uses back in FCRAM.
-// 14: AzaharRunRequest's fast svcs and guest ticks.
-// 17: azaharCycleCounter, the cycle counter sgxd's spins time out on.
-// 18: sgxd 8, the async queue as a ring in the app's memory (sgxdQueue, sgxdKick).
-// 19: AzaharProfSample's syscall frame (vprof's SYSF).
-// 20: sgxd 9, sgxdWaker: the render thread woken when the GPU has done its ticket's work.
-// 21: sgxd 10, sgxdMicrokernel (sgxd_flags `microkernel`).
-// 22: sgxd 11, the microkernel's kick as Sony's (EVENT_KICK after the kicker word).
-// 23: sgxd 12, KICK2 again.
-// 24: sgxd 13, the microkernel alone (sgxdEvents its interrupt set-up; no ring).
-// 28: azaharMemReport (perflog's CDRAM map).
-// 29: azaharShellCdram, the shell's CDRAM for the recipes.
-// 30: azaharVfpPatch, VFP short vectors run in the vector (AZAHAR_FAST_VFP).
-// 39: AZAHAR_TLS_SVC, the upcalls run with the emulation thread's TPIDRURO.
-// 40: AZAHAR_CLOCK_SVC, the upcalls idle the guest without an exit.
-// 41: AzaharRunRequest.phase_cycles, azaharRun's time by phase (perflog).
-// 42: AzaharRunRequest.upcall_rearm_us, quantums inside upcalls started again in the vector.
-// 44: azaharSyncUpper, the app's later megabytes for its upcalls.
-// 45: AzaharRunRequest.kernel_cycles.
-// 46: AzaharRunRequest.pmu_* and tlb_probe (diagnostics).
-// 47: azaharUpperDrift (diagnostics: the guest's copy of the app's level-1 entries).
-// 48: azaharRun's request read and written in place.
-// 49: the volume keys the app's, not SceShell's, while sgxd owns the GPU.
-// 50: azaharSystemVolume; SceAppMgr's shell watchdog fed while sgxd owns the GPU.
-// 52: AzaharRunRequest.pmu_* and tlb_probe gone.
-// 53: page moves leave the GPU's mapping to the emulator, which remaps it in the GPU's order.
-// 62: firmware 3.60 known (a 3.60 console that ran an older build still has its module).
-// 63: azaharVolumeKeys, the volume keys from Syscon (no SceCtrl mask gave them to the app).
-// 64: page moves up to 32 MiB in all (the CDRAM pool for moved FCRAM grows).
-// 69: sgxdResumed, the GPU taken again after a suspend.
-// 70: sgxdSuspend, the GPU given back at the app's own suspend.
-// 72: AzaharRunRequest without store_permits (the vector's stores past holds, 65-71, gone).
-// 73: firmware 3.68 known (a 3.68 console that ran an older build still has its module).
-// 74: azaharAttach refuses a core attached already (the second emulation thread on host 0's).
-// 75: the shell's CDRAM moves faster at a suspend, its resume and the exit (nothing to call).
-// 76: and faster again (its kernel alias normal non-cacheable).
-// 93: firmware 3.73 known (a 3.73 console that ran an older build still has its module).
-// 95: the shell's display plane kept off while its CDRAM is the app's (a notification's bands).
-// The app runs with its own version only: another one loaded stops the start (LoadAzaharNative).
+// The app runs with its module's own version only: another one loaded stops the start
+// (LoadAzaharNative).
 
 namespace {
 

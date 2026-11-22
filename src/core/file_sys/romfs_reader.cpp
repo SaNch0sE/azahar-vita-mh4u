@@ -103,10 +103,26 @@ std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, 
     return read_progress;
 }
 
+namespace {
+#ifdef __vita__
+/// The title's cache is in use (PickCacheSpec): one at a time.
+bool title_cache_taken = false;
+#endif
+} // Anonymous namespace
+
 DirectRomFSReader::LineCache::LineCache(const CacheSpec& spec)
     : line_size{spec.line_size}, line_count{spec.line_count},
+      title_cache{spec.placement == Common::HostSharedMemory::Placement::PhysicallyContiguous},
       storage{spec.line_size * spec.line_count, spec.name, spec.placement},
       line_page(spec.line_count, static_cast<std::size_t>(-1)), line_used(spec.line_count, 0) {}
+
+DirectRomFSReader::LineCache::~LineCache() {
+#ifdef __vita__
+    if (title_cache) {
+        title_cache_taken = false;
+    }
+#endif
+}
 
 std::pair<bool, u8*> DirectRomFSReader::LineCache::Request(std::size_t page) {
     ++clock;
@@ -131,11 +147,11 @@ std::pair<bool, u8*> DirectRomFSReader::LineCache::Request(std::size_t page) {
 
 DirectRomFSReader::CacheSpec DirectRomFSReader::PickCacheSpec() {
 #ifdef __vita__
-    // The first reader is the title's RomFS. One 16 MiB cache per process: a second of that
-    // size would not fit the pool.
-    static bool big_cache_taken = false;
-    if (!big_cache_taken) {
-        big_cache_taken = true;
+    // The first reader while none holds it is the title's RomFS. One 16 MiB cache at a time: a
+    // second of that size would not fit the pool. Its reader's end hands it back, for the next
+    // title in the session.
+    if (!title_cache_taken) {
+        title_cache_taken = true;
         return {64 * 1024, 256, "azahar-romfs-cache",
                 Common::HostSharedMemory::Placement::PhysicallyContiguous};
     }

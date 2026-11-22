@@ -83,9 +83,10 @@ private:
     /**
      * The read cache: whole lines of the file, least recently used out. Sized at
      * construction, because the console decides the size: its card reads are slow enough per
-     * call that the first reader made - the title's own RomFS - gets 64 KiB lines and 16 MiB
-     * of them, kept in the physically contiguous pool the heap cannot reach; every other
-     * reader (update RomFS, system archives) and every other platform keeps the 16 x 8 KiB
+     * call that the first reader made - the RomFS the title reads, its update's when it has
+     * one (ArchiveFactory_SelfNCCH::Register) - gets 64 KiB lines and 16 MiB of them, kept in
+     * the physically contiguous pool the heap cannot reach; every other reader (the base RomFS
+     * under an update, system archives) and every other platform keeps the 16 x 8 KiB
      * the cache always had - out of the heap, because the pool holds one of these and no
      * more. A read larger than a line bypasses it, as before.
      */
@@ -101,6 +102,10 @@ private:
     class LineCache {
     public:
         explicit LineCache(const CacheSpec& spec);
+        /// The title's cache handed back (PickCacheSpec): the next title's reader takes it.
+        ~LineCache();
+        LineCache(const LineCache&) = delete;
+        LineCache& operator=(const LineCache&) = delete;
         [[nodiscard]] std::size_t LineSize() const {
             return line_size;
         }
@@ -111,6 +116,7 @@ private:
     private:
         std::size_t line_size;
         std::size_t line_count;
+        bool title_cache;
         Common::HostSharedMemory storage;
         std::vector<std::size_t> line_page; ///< page held by each line (npos: empty)
         std::vector<u64> line_used;         ///< last use, for eviction

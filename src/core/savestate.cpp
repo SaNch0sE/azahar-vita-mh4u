@@ -10,6 +10,7 @@
 #include <zstd.h>
 #include "common/archives.h"
 #include "common/file_util.h"
+#include "common/host_shared_memory.h"
 #include "common/logging/log.h"
 #include "common/scm_rev.h"
 #include "common/swap.h"
@@ -409,7 +410,12 @@ void System::LoadState(u32 slot) {
     const u64 movie_id = movie.GetCurrentMovieID();
     const auto path = GetSaveStatePath(title_id, movie_id, slot);
 
-    std::vector<u8> buffer(FileUtil::GetSize(path) - sizeof(CSTHeader));
+    // The compressed state in a block of its own, not the heap: tens of megabytes, freed after
+    // the load.
+    const std::size_t compressed_size = FileUtil::GetSize(path) - sizeof(CSTHeader);
+    const Common::HostSharedMemory block{compressed_size, "azahar-savestate",
+                                         Common::HostSharedMemory::Placement::OwnBlock};
+    const std::span<u8> buffer{block.Data(), compressed_size};
     {
         FileUtil::IOFile file(path, "rb");
 

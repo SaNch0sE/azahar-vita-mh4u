@@ -192,11 +192,13 @@ private:
     }
 
     ResultVal<std::unique_ptr<FileBackend>> OpenUpdateRomFS() const {
-        if (ncch_data.update_romfs_file) {
+        // No update: the base RomFS, through its reader.
+        const auto& reader =
+            ncch_data.update_romfs_file ? ncch_data.update_romfs_file : ncch_data.romfs_file;
+        if (reader) {
             std::unique_ptr<DelayGenerator> delay_generator =
                 std::make_unique<RomFSDelayGenerator>();
-            return std::make_unique<IVFCFile>(ncch_data.update_romfs_file,
-                                              std::move(delay_generator));
+            return std::make_unique<IVFCFile>(reader, std::move(delay_generator));
         } else {
             LOG_INFO(Service_FS, "Unable to read update RomFS");
             return ResultRomfsNotFound;
@@ -266,16 +268,18 @@ void ArchiveFactory_SelfNCCH::Register(Loader::AppLoader& app_loader) {
 
     NCCHData& data = ncch_data[program_id];
 
-    std::shared_ptr<RomFSReader> romfs_file_;
-    if (Loader::ResultStatus::Success == app_loader.ReadRomFS(romfs_file_)) {
-
-        data.romfs_file = std::move(romfs_file_);
-    }
-
+    // The update's reader first: the first reader takes the title's cache (DirectRomFSReader),
+    // and a title with an update reads that RomFS.
     std::shared_ptr<RomFSReader> update_romfs_file;
     if (Loader::ResultStatus::Success == app_loader.ReadUpdateRomFS(update_romfs_file)) {
 
         data.update_romfs_file = std::move(update_romfs_file);
+    }
+
+    std::shared_ptr<RomFSReader> romfs_file_;
+    if (Loader::ResultStatus::Success == app_loader.ReadRomFS(romfs_file_)) {
+
+        data.romfs_file = std::move(romfs_file_);
     }
 
     std::vector<u8> buffer;

@@ -322,26 +322,6 @@ static uint32_t active_cpu_mask(void) {
     return p_GetActiveCpuMask ? (uint32_t)p_GetActiveCpuMask() : 0u;
 }
 
-// 2: the sgxd calls (sgxd.c). 3: SCE-style error codes (azahar_native.h, AZAHAR_ERROR).
-// 6: azaharKlogRead, the kernel's printf text (klog.c).
-// 7: azaharAdopt, azaharReback and azaharRebackRestore: guest FCRAM under tables of ours, and
-//    pages of it moved onto other physical pages (reback.c).
-// 8: azaharRebackReturn, moved pages back on their own.
-// 9: the ATS/PAR fix for 64 KiB pages.
-// 10: azaharProfStart, azaharProfRead, azaharProfStop: the CPU sampler (prof.c).
-// 11: the samples carry the running thread (thid for cid), azaharProfThreadName.
-// 12: azaharProfKernelModule, the kernel's module segments.
-// 13: sgxdSubmitAsync queues lists (SGXD_CHAIN_RING) and returns the first op's index.
-// 14: azaharRun answers some svcs in the guest's own world (AZAHAR_FAST_*), and reports the
-//     slice's guest ticks and its own time.
-// 15: one world per Vita core, azaharAttach / azaharDetach: slices on several cores at once.
-// 16: sgxd 7, the fault dump's op kind (word 13): the app keeps no copy of the async queue.
-// 17: azaharCycleCounter, the PMU cycle counter readable in user mode by the process's threads.
-// 18: sgxd 8, the async queue as a ring in the app's memory (sgxdQueue, sgxdKick): no copy in.
-// 19: AzaharProfSample's syscall (svc, user PC, LR and SP) from the thread's SVC frame.
-// 20: sgxd 9, sgxdWaker: the app's event flag set when the GPU reaches the counts it sleeps until.
-// 21: sgxd 10, sgxdMicrokernel: the async lists run by the app's microkernel on the GPU, IRQ 52
-//     for its SW_EVENT only.
 int azaharVersion() {
     return AZAHAR_NATIVE_VERSION;
 }

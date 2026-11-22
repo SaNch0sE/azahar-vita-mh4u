@@ -477,12 +477,9 @@ ResultStatus AppLoader_NCCH::ReadRomFS(std::shared_ptr<FileSys::RomFSReader>& ro
 }
 
 ResultStatus AppLoader_NCCH::ReadUpdateRomFS(std::shared_ptr<FileSys::RomFSReader>& romfs_file) {
-    ResultStatus result = update_ncch.ReadRomFS(romfs_file);
-
-    if (result != ResultStatus::Success)
-        return base_ncch.ReadRomFS(romfs_file);
-
-    return ResultStatus::Success;
+    // Without an update, SelfNCCH's update RomFS is the base RomFS's own reader: a second reader
+    // of the same file would have the small cache.
+    return update_ncch.ReadRomFS(romfs_file);
 }
 
 ResultStatus AppLoader_NCCH::DumpRomFS(const std::string& target_path) {
