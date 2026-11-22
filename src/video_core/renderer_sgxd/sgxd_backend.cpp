@@ -14,6 +14,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/named_thread.h"
+#include "core/memory.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
 #include "video_core/renderer_sgxd/untile_geometry.h"
@@ -2302,6 +2303,154 @@ void SgxdBackend::FlushUntiles() {
     gather_rows = 0;
     gather_draws = 0;
     flushing_untiles = false;
+u32 SgxdBackend::WidenIndices(u32 indices, u32 count, const u8* cpu) {
+    DEBUG_ASSERT(in_pass && count != 0);
+    const u32 rows = (count + WidenWidth - 1) / WidenWidth;
+    DEBUG_ASSERT_MSG(rows <= WidenRows, "sgxd: an 8-bit index list of {} entries, past {}",
+                     count, WidenWidth * WidenRows);
+    if (widen_target.cpu && widen_rows + rows > WidenRows) {
+        FlushWiden();
+    }
+    if (!widen_target.cpu) {
+        widen_target = AllocData(WidenWidth * 2 * WidenRows, 0x1000);
+        widen_rows = 0;
+    }
+    const u32 row = widen_rows;
+    widen_rows += rows;
+    widen_lists.push_back({indices, count, row, cpu});
+    return widen_target.gpu + row * WidenWidth * 2;
+}
+
+void SgxdBackend::FlushWiden() {
+    if (widen_lists.empty()) {
+        return;
+    }
+    DEBUG_ASSERT(in_pass);
+    // The lists in cached FCRAM, cleaned before the render that reads them (with the pass's
+    // other ranges, which EndPass would clean next).
+    for (const CachedRange& range : cached) {
+        SgxdCacheRange(range.cpu, range.bytes, SGXD_CACHE_CLEAN, CacheSite::Vertices);
+    }
+    cached.clear();
+    if (!widen_mask.cpu) {
+        widen_mask = AllocTextureFixed(0x1000);
+        u32* const words = reinterpret_cast<u32*>(widen_mask.cpu);
+        for (u32 n = 0; n < 8; n++) {
+            words[n] = 0xffu;
+        }
+    }
+    // The guest's bytes as LINEAR U8 views 4096 texels wide: 0 over VRAM (1536 rows), 1 + k
+    // over FCRAM's 16 MiB window k (4096 rows). A view's quads go together, one draw.
+    constexpr u32 ViewWidth = 4096;
+    constexpr u32 Views = 1 + (Memory::FCRAM_N3DS_SIZE >> 24);
+    const auto view_of = [](u32 address, u32& base, u32& rows) {
+        if (address < Memory::FCRAM_PADDR) {
+            base = Memory::VRAM_PADDR;
+            rows = Memory::VRAM_SIZE / ViewWidth;
+            return 0u;
+        }
+        const u32 window = (address - Memory::FCRAM_PADDR) >> 24;
+        base = Memory::FCRAM_PADDR + (window << 24);
+        rows = (1u << 24) / ViewWidth;
+        return 1 + window;
+    };
+    std::array<std::vector<float>, Views> quads;
+    const u32 height = widen_rows;
+    static constexpr float mask_uv[4][2] = {{0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, 0.5f}, {0.5f, 0.5f}};
+    for (const WidenList& list : widen_lists) {
+        // Target row y holds entries [WidenWidth (y - row), ...): a run of the list's bytes.
+        for (u32 n = 0; n < list.count;) {
+            const u32 y = list.row + n / WidenWidth;
+            u32 x = n % WidenWidth;
+            u32 left = std::min(WidenWidth - x, list.count - n);
+            while (left != 0) {
+                u32 base = 0, rows = 0;
+                const u32 address = list.indices + n;
+                const u32 view = view_of(address, base, rows);
+                const u32 texel = address - base;
+                const u32 row = texel / ViewWidth, column = texel % ViewWidth;
+                DEBUG_ASSERT(row < rows);
+                const u32 k = std::min(left, ViewWidth - column);
+                const float ua = static_cast<float>(column) / ViewWidth;
+                const float ub = static_cast<float>(column + k) / ViewWidth;
+                const float v = (row + 0.5f) / rows;
+                const float uv[4][2] = {{ua, v}, {ub, v}, {ua, v}, {ub, v}};
+                std::vector<float>& q = quads[view];
+                q.resize(q.size() + MergeQuadWords);
+                PutMergeQuad(q.data() + q.size() - MergeQuadWords, WidenWidth, height,
+                             static_cast<float>(x), static_cast<float>(y),
+                             static_cast<float>(x + k), static_cast<float>(y + 1), uv, mask_uv);
+                x += k;
+                n += k;
+                left -= k;
+            }
+        }
+    }
+    // A view's quads from a vertex index that is a multiple of 8 (the recipe's rule).
+    u32 vertex_count = 0;
+    for (const std::vector<float>& q : quads) {
+        if (!q.empty()) {
+            vertex_count = ((vertex_count + 7) & ~7u) +
+                           static_cast<u32>(q.size()) / SGXD_PROGRAM_MERGE_VERTEX_WORDS;
+        }
+    }
+    const Data vertices = AllocData(vertex_count * SGXD_PROGRAM_MERGE_VERTEX_WORDS * 4, 64);
+    std::vector<SideDraw> list;
+    u32 first = 0;
+    for (u32 view = 0; view < Views; view++) {
+        const std::vector<float>& q = quads[view];
+        if (q.empty()) {
+            continue;
+        }
+        first = (first + 7) & ~7u;
+        std::memcpy(reinterpret_cast<float*>(vertices.cpu) + first * SGXD_PROGRAM_MERGE_VERTEX_WORDS,
+                    q.data(), q.size() * sizeof(float));
+        u32 base = 0, rows = 0;
+        view_of(view == 0 ? Memory::VRAM_PADDR : Memory::FCRAM_PADDR + ((view - 1) << 24), base,
+                rows);
+        SideDraw& d = list.emplace_back();
+        SideTextureWords(3, 0x00, 0, ViewWidth, rows, base, d.tex);
+        SideTextureWords(3, 0x0c, 0, 8, 1, widen_mask.gpu, d.tex1);
+        d.first = first;
+        d.count = static_cast<u32>(q.size()) / SGXD_PROGRAM_MERGE_VERTEX_WORDS;
+        first += d.count;
+    }
+    SideRender(vertices, list, widen_target.gpu, WidenWidth, WidenWidth, height, true, false,
+               SGXD_RECIPE_PACK_U16_RAW);
+    widened = true;
+#ifdef VITA_DIAGNOSTICS
+    // widencheck: every list's 16-bit copy against its guest bytes.
+    if (GxmFlag("widencheck")) {
+        RenderIdle("widencheck");
+        static u32 lists_checked, lists_bad, logged_at;
+        const u16* const out = reinterpret_cast<const u16*>(widen_target.cpu);
+        for (const WidenList& l : widen_lists) {
+            lists_checked++;
+            u32 wrong = 0, first_bad = 0;
+            for (u32 n = 0; n < l.count; n++) {
+                if (out[l.row * WidenWidth + n] != l.cpu[n] && wrong++ == 0) {
+                    first_bad = n;
+                }
+            }
+            if (wrong != 0 && lists_bad++ < 32) {
+                LOG_ERROR(Render,
+                          "widencheck: the 8-bit list at {:#010x} ({} entries): {} differ, the "
+                          "first at {}: want {} got {:#06x}",
+                          l.indices, l.count, wrong, first_bad, l.cpu[first_bad],
+                          out[l.row * WidenWidth + first_bad]);
+            }
+        }
+        if (lists_checked - logged_at >= 256) {
+            logged_at = lists_checked;
+            LOG_INFO(Render, "widencheck: {} lists checked, {} differ", lists_checked, lists_bad);
+        }
+    }
+#endif
+    widen_lists.clear();
+    widen_target = {};
+    widen_rows = 0;
+}
+
 }
 
 void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_x, u32 scale_y) {

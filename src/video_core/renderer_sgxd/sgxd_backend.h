@@ -391,6 +391,7 @@ public:
     /// Sends the queued untiles' side renders, the gather first (the ETC1 and alpha renders
     /// read it): one render for each batch the queue holds.
     void FlushUntiles();
+    u32 WidenIndices(u32 indices, u32 count, const u8* cpu);
 
     /// The geometry shader's stream-out stages (RasterizerSgxd::GeometryStage): A0 stores
     /// the vertex program's outputs, A1 runs the geometry program over them.
@@ -483,6 +484,23 @@ private:
                     bool twiddled = false, u32 pack = SGXD_RECIPE_PACK_U8888,
                     bool double_pixels = false);
     PdsRef TermPds(const SgxdRecipe& recipe);
+    /// WidenIndices' batch: the lists given since the last widen render, the pass data its 16-bit
+    /// copies go to, and the rows taken.
+    struct WidenList {
+        u32 indices, count, row;
+        const u8* cpu;
+    };
+    static constexpr u32 WidenWidth = 128;
+    static constexpr u32 WidenRows = 512;
+    std::vector<WidenList> widen_lists;
+    Data widen_target{};
+    u32 widen_rows = 0;
+    /// The open pass had a widen render: its TA waits for that render's 3D.
+    bool widened = false;
+    /// A LINEAR U8888 texture of 0x000000ff words: the widen render's mask.
+    Data widen_mask{};
+    /// The batch's side render (WidenIndices), and widencheck.
+    void FlushWiden();
     /// QueueUntile's batches, each one side render's target: LINEAR U8888 chains in rows of
     /// 256, 512 or UntileSide texels (ChainBatchStride), the byte copies' U8 chains the same in
     /// bytes, TWIDDLED ETC1 chains in squares of 32, 64, 128 or 256 blocks a side, A8 alpha

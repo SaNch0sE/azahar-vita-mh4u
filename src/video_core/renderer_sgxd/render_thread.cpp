@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstring>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include "common/assert.h"
 #include "common/hash.h"
@@ -720,9 +721,10 @@ bool RenderThread::AccelerateDrawBatch(bool is_indexed) {
     if (is_indexed && pica.regs.internal.pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes) {
         PutGsIndices();
     }
-    // Whether it is indexed, in the head's extra field.
-    Begin(Op::Draw, 0, is_indexed ? 1 : 0);
-    Commit();
+    // Whether it is indexed, in the head's extra field; the indices' range if HoldVertices
+    // scanned them.
+    Put(Op::Draw, draw_indices, is_indexed ? 1 : 0);
+    draw_indices = {};
     // A geometry-shader draw's invocations leave b15 true (upstream GeometryPipeline::
     // SubmitVertex), here as on the render thread (Op::Draw); a late-dropped draw ran none.
     GsInvoked(pica);
@@ -1174,6 +1176,11 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         rasterizer.GsIndices(p, head.extra != 0);
         break;
     case Op::Draw: {
+        DrawIndexRange indices;
+        take(indices);
+        if (indices.scanned != 0) {
+            rasterizer.ScannedIndices(indices.lo, indices.hi);
+        }
         // RasterizerSgxd draws or stops the emulator; the emulation side was told it drew.
         [[maybe_unused]] const bool drawn = rasterizer.AccelerateDrawBatch(head.extra != 0);
         DEBUG_ASSERT(drawn);

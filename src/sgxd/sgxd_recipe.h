@@ -332,6 +332,8 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory, uint32_t fb_va, uint32_
 #define SGXD_RECIPE_PACK_F32F32_SWAPPED 0x11110000u
 // EXTMODE1 U8 SWIZ 1: one byte a pixel, the colour's A.
 #define SGXD_RECIPE_PACK_U8_A 0x80910000u
+// The output word's low 16 bits stored raw, two bytes a pixel (the F16 pack's code).
+#define SGXD_RECIPE_PACK_U16_RAW 0xf0010000u
 void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory, uint32_t pbe0);
 
 // Route 1: a pass renders the guest's picture

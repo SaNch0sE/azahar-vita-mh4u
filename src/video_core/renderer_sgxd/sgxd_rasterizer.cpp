@@ -3474,7 +3474,10 @@ bool RasterizerSgxd::AccelerateDrawBatch(bool is_indexed) {
         const auto& fb = regs.framebuffer.framebuffer;
     }
 #endif
-    return Draw(is_indexed, nullptr, 0);
+    const bool drawn = Draw(is_indexed, nullptr, 0);
+    scanned_indices.reset();
+    gs_indices_set = false;
+    return drawn;
 }
 
 RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, const float* immediate,
@@ -3566,13 +3569,16 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
     const Usse::GxpProgram& vg = vp.gxp;
 
     // --- the index list ---
-    // The VDM reads 16-bit indices where the guest put them (the GPU maps guest memory at the
-    // PICA's addresses); it has no 8-bit format (IDXSIZE is 16 or 32 bits), so 8-bit indices
-    // are widened into the pass data. The vertices an indexed draw reads are
-    // [vertex_min, vertex_max], which the cache clean below needs.
+    // The VDM reads 16-bit indices where the guest put them; it has no 8-bit format, so 8-bit indices
+    // are widened by the render thread into the pass data. The vertex range is what the cache clean
+    // needs.
     u32 indices_gpu = 0;
     u32 vertex_min = immediate ? 0 : pipeline.vertex_offset;
     u32 vertex_max = vertex_min + count - 1;
+    // A draw's vertex range only decides which of its bytes in cached FCRAM to clean (and record for
+    // the VBlank's move to CDRAM). Where every vertex an index can reach is uncached already (VRAM, or
+    // 8-bit indices into moved FCRAM pages), no index is read: uncached reads are slow.
+    bool scan = true;
     if (is_indexed) {
         const auto& index_info = pipeline.index_array;
         const PAddr index_address = va.GetPhysicalBaseAddress() + index_info.offset;
@@ -3604,15 +3610,42 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         const u8* const index_cpu = memory.GetPhysicalPointer(index_address);
         // What the CPU reads of them: a geometry draw's copy (GsIndices), else guest memory.
         const u8* const index_scan = gs_indices_set ? gs_indices.data() : index_cpu;
+        const bool indices_uncached = guest_memory.IsUncached(index_address, index_bytes);
+        const u32 reach = index_u16 ? 0xffffu : 0xffu; // the highest index there can be
+        if (mode == Usse::VsMode::Draw && indices_uncached) {
+            scan = false;
+            for (u32 n = 0; n < feed_count && !scan; n++) {
+                const Feed& f = feeds[n];
+                if ((vp.input_regs & (1u << f.reg)) == 0) {
+                    continue;
+                }
+                const bool vram =
+                    f.address >= Memory::VRAM_PADDR && f.address < Memory::VRAM_PADDR_END;
+                scan = !vram && (index_u16 || !guest_memory.IsUncached(
+                                                  f.address, reach * f.stride + f.words * 4));
+            }
+        }
+        if (!scan) {
+            // The range unread: every vertex the indices can reach.
+            vertex_min = 0;
+            vertex_max = reach;
+        }
         if (index_u16) {
             DEBUG_ASSERT_MSG(gs_indices_set || (index_address & 1) == 0,
                              "sgxd: {}: 16-bit indices at {:#x}", describe(), index_address);
-            const auto [lo, hi] = Common::FindMinMax(
-                std::span<const u16>{reinterpret_cast<const u16*>(index_cpu), count});
-            vertex_min = lo;
-            vertex_max = hi;
-            indices_gpu = index_address;
-            if (guest_memory.IsUncached(index_address, index_bytes)) {
+            if (scan && scanned_indices) {
+                vertex_min = scanned_indices->first;
+                vertex_max = scanned_indices->second;
+            } else if (scan) {
+                const auto [lo, hi] = Common::FindMinMax(
+                    std::span<const u16>{reinterpret_cast<const u16*>(index_scan), count});
+                vertex_min = lo;
+                vertex_max = hi;
+            }
+            // The GPU reads them for a draw alone: a geometry draw's stages make their own lists.
+            if (gs_indices_set) {
+            } else if (indices_uncached) {
+                indices_gpu = index_address;
                 SgxdCacheSkipped(CacheSite::Vertices, index_bytes);
             } else {
                 indices_gpu = index_address;
@@ -3620,16 +3653,21 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
                 CachedRead(index_address, index_bytes);
             }
         } else {
-            const auto [lo, hi] = Common::FindMinMax(std::span<const u8>{index_cpu, count});
-            vertex_min = lo;
-            vertex_max = hi;
+            if (scan) {
+                const auto [lo, hi] = Common::FindMinMax(std::span<const u8>{index_scan, count});
+                vertex_min = lo;
+                vertex_max = hi;
+            }
             if (mode == Usse::VsMode::Draw) {
-                const SgxdBackend::Data wide = backend.AllocData(count * 2, 4);
-                u16* const out = reinterpret_cast<u16*>(wide.cpu);
-                for (u32 n = 0; n < count; n++) {
-                    out[n] = index_cpu[n];
+                // Widened to 16 bits on the GPU before the pass (SgxdBackend::WidenIndices),
+                // which reads the guest's bytes: cleaned first where they are cached.
+                if (indices_uncached) {
+                    SgxdCacheSkipped(CacheSite::Vertices, index_bytes);
+                } else {
+                    backend.ReadsCached(index_cpu, index_bytes);
+                    CachedRead(index_address, index_bytes);
                 }
-                indices_gpu = wide.gpu;
+                indices_gpu = backend.WidenIndices(index_address, count, index_cpu);
             }
         }
     }
@@ -3657,7 +3695,8 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         // from the loader's address.
         const PAddr address = immediate ? f.address : f.address + first * f.stride;
         fetch[fetch_count++] = {address, f.stride, f.words, attribute->resource};
-        if (immediate) {
+        // Unscanned, every vertex the indices can reach is uncached (above).
+        if (immediate || !scan) {
             continue;
         }
         // FCRAM is cached for the CPU: what the guest wrote is cleaned to memory before the kick.
@@ -4689,7 +4728,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             DEBUG_ASSERT_MSG(gs_indices_set, "sgxd: {}: a geometry draw without its indices' copy",
                              describe());
             const u8* const index_cpu = gs_indices.data();
-            if (pipeline.index_array.format != 0) {
+            if (pipeline.index_array.format != 0 && scanned_indices) {
+                a0_vertices = scanned_indices->second - scanned_indices->first + 1u;
+            } else if (pipeline.index_array.format != 0) {
                 const auto [lo, hi] = Common::FindMinMax(
                     std::span<const u16>{reinterpret_cast<const u16*>(index_cpu), vertices});
                 a0_vertices = hi - lo + 1u;

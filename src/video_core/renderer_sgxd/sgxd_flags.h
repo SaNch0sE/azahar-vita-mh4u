@@ -90,6 +90,8 @@ namespace GxmRenderer {
  *             decode (ETC1's, and a split ETC1A4's colour and alpha, decoded back through the
  *             texture unit); the log counts the levels that differ (with dumptex, a "want"
  *             file too)
+ *   widencheck  every 8-bit index list's GPU widening (SgxdBackend::WidenIndices) against its
+ *             guest bytes, once its render is done
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks
  *   (docs/debugging.md, "Wrong pictures")

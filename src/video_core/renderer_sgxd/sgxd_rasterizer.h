@@ -105,6 +105,10 @@ public:
         backend.RenderWait(fence, "a moved page's pool page");
     }
     bool AccelerateDrawBatch(bool is_indexed) override;
+    /// The next draw's 16-bit indices span lo..hi, as the emulation side scanned them.
+    void ScannedIndices(u32 lo, u32 hi) {
+        scanned_indices = {lo, hi};
+    }
     /// The next draw's indices as the guest had them at the draw (a geometry draw's).
     void GsIndices(const u8* indices, bool index_u16) {
         const u32 bytes = regs.pipeline.num_vertices * (index_u16 ? 2u : 1u);
@@ -479,6 +483,7 @@ private:
     std::unordered_map<u64, VertexProgram> vertex_programs;
     std::unordered_map<u64, u16> used_bools;
     std::unordered_map<u64, FragmentProgram> fragment_programs;
+    std::optional<std::pair<u32, u32>> scanned_indices;
     std::vector<u8> gs_indices;
     bool gs_indices_set = false;
     std::unique_ptr<ShaderTier2> tier2;
