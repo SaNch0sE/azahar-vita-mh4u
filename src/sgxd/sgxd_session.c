@@ -67,11 +67,14 @@ int sgxd_session_init_script(const SgxdSessionAddresses *a, char *failed, unsign
     for (unsigned base = 0; base < 16; base++) {
         ops[n++] = (SgxdOp)W(0x0a0c + base * 4, a->code[base] >> 6);
     }
+    // EUR_CR_MASTER_MP_PRIMITIVE: Sony's 0x103e8 (TE split, runs of 1000 primitives) with
+    // SPLIT_MODE (bit 18) set: Sony's value alone stops the TA in the clipper where one core's
+    // run starts at a given primitive.
     const SgxdOp tail[] = {
         W(0x0b30, 0x100), W(0x0ac4, a->kicker),
         W(0x0a68, a->bank0_pds), W(0x0a6c, a->bank0_units), W(0x0a70, 0x12001),
         W(0x8a68, a->core0_pds), W(0x8a6c, a->core0_units), W(0x8a70, 0x12001),
-        W(0x8a58, 0x2200c000), W(0x4a58, 0x804300f), W(0x4808, 4), W(0x4144, 0x103e8),
+        W(0x8a58, 0x2200c000), W(0x4a58, 0x804300f), W(0x4808, 4), W(0x4144, 0x503e8),
         W(0x414c, 0), W(0x0bb4, 0),
     };
     memcpy(ops + n, tail, sizeof(tail));

@@ -108,9 +108,12 @@ inline constexpr uint8_t IssueTexelWordsRaw = 1;
 /// for messages and the program dump).
 enum class UniformKind : uint8_t {
     // Vertex programs.
-    FlipViewport,
+    PositionScale, ///< the position's clip x and y factors (RasterizerSgxd::GuardScale)
     DepthScale,
     DepthOffset,
+    /// Clip z's orientation, -1 or 1 (RasterizerSgxd::ClipZSign): the vertex program writes
+    /// clip z = sign * (2z + w).
+    ClipZSign,
     DefaultInput, ///< input register `index`'s fixed value
     IntUniforms,
     FloatBank, ///< the float bank, read through the buffer pointer
@@ -255,6 +258,17 @@ struct Program {
     /// three, 7 four).
     uint32_t outselects = 0;
     uint32_t texsize = 0;
+    /// Where a draw program's position z and w come from, when each is one DP4 of a float uniform
+    /// (a projection's row) with the same register: the rasterizer reads the two rows each draw to
+    /// orient clip z (UniformKind::ClipZSign). `uniform` is -1 for a program that writes them
+    /// otherwise.
+    struct PositionRow {
+        int8_t uniform = -1;
+        std::array<uint8_t, 4> uniform_lane{}; ///< the uniform's component in each term
+        std::array<uint8_t, 4> source_lane{};  ///< the register's component in each term
+        bool negate = false;                   ///< one of the two operands negated
+    };
+    std::array<PositionRow, 2> position_rows{}; ///< z, then w
     bool buffer_pointer = false;
     int32_t ldst_base_value = 0;
     uint32_t buffer_floats = 0;

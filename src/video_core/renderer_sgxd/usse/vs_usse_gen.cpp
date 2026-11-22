@@ -50,7 +50,6 @@
  */
 namespace SgxdRenderer::Usse {
 
-bool z_flip = false;
 
 using nihstro::DestRegister;
 using nihstro::Instruction;
@@ -102,10 +101,11 @@ constexpr uint8_t OutScratchEnd = 24;
 
 // The resident secondary attributes: the depth mapping, then the input defaults and the
 // integer uniforms.
-constexpr uint32_t SaFlipViewport = 0;
-constexpr uint32_t SaDepthScale = 1;
-constexpr uint32_t SaDepthOffset = 2;
-constexpr uint32_t SaResidentHead = 4;
+constexpr uint32_t SaPositionScale = 0; // two: the clip x and y factors
+constexpr uint32_t SaDepthScale = 2;
+constexpr uint32_t SaDepthOffset = 3;
+constexpr uint32_t SaClipZSign = 4; // its pair's second SA unused
+constexpr uint32_t SaResidentHead = 6;
 
 // The data block: the buffer pointer, then the literals. The ones a compare reads
 // as a scalar sit at even offsets (a test reads the .x of a pair); the odd slots between
@@ -286,6 +286,7 @@ private:
         bool cc = false;  ///< a conditional form reads the condition codes
     };
     void ScanProgram();
+    void FindPositionRows();
     void MarkReachable(uint32_t begin, uint32_t end);
     /// OpenContext's walk over [begin, end) from `entry`: the instructions a context's emission
     /// may pass; `backward` takes each taken jump's target at or before the jump. A subroutine's
@@ -530,6 +531,116 @@ void VertexEmitter::MarkReachable(uint32_t begin, uint32_t end) {
     }
 }
 
+/// Where the position's z and w come from (Program::position_rows): each written by exactly one
+/// reachable instruction, a DP4 of a float uniform read without the address register and one
+/// register, the same register through the same lanes for both, nothing writing it between the
+/// two in program order.
+void VertexEmitter::FindPositionRows() {
+    struct Found {
+        uint32_t offset = 0;
+        uint32_t writers = 0;
+    };
+    std::array<Found, 2> found{};
+    std::array<uint8_t, 2> lane{};
+    std::array<uint32_t, 2> attr{};
+    for (int k = 0; k < 2; k++) {
+        const VsSemantic& m = req.semantics[SemPositionX + 2 + k];
+        attr[k] = m.attribute;
+        lane[k] = m.component;
+    }
+    const uint32_t extent = static_cast<uint32_t>(reachable.size());
+    for (uint32_t offset = 0; offset < extent; offset++) {
+        if (!reachable[offset]) {
+            continue;
+        }
+        const Instruction instr = {req.code[offset]};
+        const OpCode::Info info = instr.opcode.Value().GetInfo();
+        uint8_t mask = 0;
+        DestRegister dest;
+        if (info.type == OpCode::Type::Arithmetic) {
+            dest = instr.common.dest.Value();
+            mask = DestMask(SwizzlePattern{req.swizzle[instr.common.operand_desc_id]});
+        } else if (info.type == OpCode::Type::MultiplyAdd) {
+            dest = instr.mad.dest.Value();
+            mask = DestMask(SwizzlePattern{req.swizzle[instr.mad.operand_desc_id]});
+        } else {
+            continue;
+        }
+        if (dest.GetRegisterType() != RegisterType::Output) {
+            continue;
+        }
+        const uint32_t out_attr = req.output_map[static_cast<uint32_t>(dest.GetIndex()) & 15];
+        for (int k = 0; k < 2; k++) {
+            if (out_attr == attr[k] && (mask >> lane[k] & 1) != 0) {
+                found[k].offset = offset;
+                found[k].writers++;
+            }
+        }
+    }
+    std::array<Program::PositionRow, 2> rows{};
+    SourceRegister shared{};
+    Swizzle shared_lanes{};
+    for (int k = 0; k < 2; k++) {
+        if (found[k].writers != 1) {
+            return;
+        }
+        const Instruction instr = {req.code[found[k].offset]};
+        if (instr.opcode.Value().EffectiveOpCode() != OpCode::Id::DP4) {
+            return;
+        }
+        const SwizzlePattern swz = {req.swizzle[instr.common.operand_desc_id]};
+        const SourceRegister s1 = instr.common.GetSrc1(false);
+        const SourceRegister s2 = instr.common.GetSrc2(false);
+        // DP4's second source cannot be a uniform: the first is the row.
+        if (s1.GetRegisterType() != RegisterType::FloatUniform ||
+            instr.common.address_register_index != 0 ||
+            (s2.GetRegisterType() != RegisterType::Temporary &&
+             s2.GetRegisterType() != RegisterType::Input)) {
+            return;
+        }
+        const Swizzle row_lanes = SelectorSwizzle(swz, 1);
+        const Swizzle source_lanes = SelectorSwizzle(swz, 2);
+        if (k == 0) {
+            shared = s2;
+            shared_lanes = source_lanes;
+        } else if (s2.GetRegisterType() != shared.GetRegisterType() ||
+                   s2.GetIndex() != shared.GetIndex() || source_lanes != shared_lanes) {
+            return;
+        }
+        Program::PositionRow& row = rows[k];
+        row.uniform = static_cast<int8_t>(s1.GetIndex());
+        for (int c = 0; c < 4; c++) {
+            row.uniform_lane[c] = static_cast<uint8_t>(row_lanes[c]);
+            row.source_lane[c] = static_cast<uint8_t>(source_lanes[c]);
+        }
+        row.negate = static_cast<bool>(swz.negate_src1) != static_cast<bool>(swz.negate_src2);
+    }
+    if (shared.GetRegisterType() == RegisterType::Temporary) {
+        const uint32_t lo = std::min(found[0].offset, found[1].offset);
+        const uint32_t hi = std::max(found[0].offset, found[1].offset);
+        for (uint32_t offset = lo + 1; offset < hi; offset++) {
+            const Instruction instr = {req.code[offset]};
+            const OpCode::Info info = instr.opcode.Value().GetInfo();
+            DestRegister dest;
+            if (info.type == OpCode::Type::Arithmetic) {
+                dest = instr.common.dest.Value();
+            } else if (info.type == OpCode::Type::MultiplyAdd) {
+                dest = instr.mad.dest.Value();
+            } else if (info.type == OpCode::Type::UniformFlowControl ||
+                       info.type == OpCode::Type::Conditional) {
+                return; // a branch between them: no single order
+            } else {
+                continue;
+            }
+            if (dest.GetRegisterType() == RegisterType::Temporary &&
+                dest.GetIndex() == shared.GetIndex()) {
+                return;
+            }
+        }
+    }
+    program.position_rows = rows;
+}
+
 void VertexEmitter::ScanProgram() {
     const uint32_t extent =
         std::min<uint32_t>(req.code_size, static_cast<uint32_t>(req.code.size()));
@@ -673,9 +784,10 @@ void VertexEmitter::Layout() {
     }
 
     // Resident uniforms: the depth mapping, the input defaults, the integer uniforms.
-    program.uniforms.push_back({UniformKind::FlipViewport, 0, SaFlipViewport, 1, 1});
+    program.uniforms.push_back({UniformKind::PositionScale, 0, SaPositionScale, 2, 1});
     program.uniforms.push_back({UniformKind::DepthScale, 0, SaDepthScale, 1, 1});
     program.uniforms.push_back({UniformKind::DepthOffset, 0, SaDepthOffset, 1, 1});
+    program.uniforms.push_back({UniformKind::ClipZSign, 0, SaClipZSign, 1, 1});
     resident = SaResidentHead;
     for (uint32_t i = 0; i < 16 && req.mode != VsMode::Geometry; i++) {
         if ((scan.inputs & (1u << i)) != 0 && (req.default_regs & (1u << i)) != 0) {
@@ -1991,8 +2103,8 @@ void VertexEmitter::OutputTexcoord(uint8_t out, Semantic su, Semantic sv) {
 }
 
 void VertexEmitter::Epilogue() {
-    // Position: after the wrappers' nudge of a z barely past a clip boundary and the viewport
-    // flip, clip z for the TA's clipping, which keeps -w <= z <= w (MTE_CTRL's OPENGL): the
+    // Position: after the wrappers' nudge of a z barely past a clip boundary, clip z for the
+    // TA's clipping, which keeps -w <= z <= w (MTE_CTRL's OPENGL): the
     // PICA's own planes, -w <= z <= 0, are that range for +-(2z + w), and the viewport maps it
     // back to the PICA depth (RasterizerSgxd::Draw). No division by w: a vertex in the eye's
     // plane has w = 0.
@@ -2005,35 +2117,21 @@ void VertexEmitter::Epilogue() {
     e.Test(Cond::Lt, 2, {I1}, 1, Data(DataNeg1), true);
     e.Test(Cond::Gt, 2, {I1}, 1, Data(DataNeg1Eps), true, Pred::P2);
     e.Vec(VecOp::Mul, {I0, 0x4}, {I0, WWWW, Mod::Neg}, ConstOne, Pred::P2); // z = -w
-    e.Test(Cond::Gt, 2, {Reg::Sa(SaFlipViewport)}, 0, ConstHalf, false);
-    e.Vec(VecOp::Mul, {I0, 0x2}, {I0, YYYY, Mod::Neg}, ConstOne, Pred::P2); // y = -y
-    e.Vec(VecOp::Mul, {I1, 0x2}, {I0, ZZZZ}, {Reg::Sa(0), YYYY});           // z * depth_scale (sa1)
-    e.Vec(VecOp::Mul, {I1, 0x1}, {I0, WWWW}, {Reg::Sa(2), XXXX}); // w * depth_offset (sa2)
+    e.Vec(VecOp::Mul, {I1, 0x2}, {I0, ZZZZ}, {Reg::Sa(SaDepthScale), XXXX}); // z * depth_scale
+    e.Vec(VecOp::Mul, {I1, 0x1}, {I0, WWWW}, {Reg::Sa(SaDepthScale), YYYY}); // w * depth_offset
     e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY}, {I1, XXXX});         // depth * w
-    if (far_user_plane && req.mode == VsMode::Draw) {
-        // The probe's far plane: the PICA's (z + w >= 0) as user clip plane 0, and the TA's 0..w
-        // range given -z / 1024, so that its own far plane lies 1024 times past the PICA's (the
-        // scale is exact; the viewport takes it back).
-        e.Vec(VecOp::Add, {I1, 0x1}, {I0, ZZZZ}, {I0, WWWW});
-        e.MoveInternal({I2, 0x1}, ConstOne);
-        e.DotClip({Reg::O(25 & ~1), 0x2}, {I1, XXXX}, {I2, XXXX}, 0);
-        e.Vec(VecOp::Mul, {I0, 0x4}, {I0, ZZZZ, Mod::Neg}, {DataReg(DataEpsilon), YYYY});
-    } else if (d3d_clip_range) {
-        e.Vec(VecOp::Mul, {I0, 0x4}, {I0, ZZZZ, Mod::Neg}, ConstOne); // z = -z, for 0 <= z <= w
-    } else {
-        e.Vec(VecOp::Add, {I1, 0x1}, {I0, ZZZZ}, {I0, ZZZZ});         // 2z
-        e.Vec(VecOp::Add, {I1, 0x1}, {I1, XXXX}, {I0, WWWW});         // 2z + w
-        if (z_flip) { // the probe's other orientation: the same planes, near and far swapped
-            e.Vec(VecOp::Mul, {I0, 0x4}, {I1, XXXX}, ConstOne);       // z = 2z + w
-        } else {
-            e.Vec(VecOp::Mul, {I0, 0x4}, {I1, XXXX, Mod::Neg}, ConstOne); // z = -(2z + w)
-        }
-    }
+    e.Vec(VecOp::Add, {I1, 0x1}, {I0, ZZZZ}, {I0, ZZZZ}); // 2z
+    e.Vec(VecOp::Add, {I1, 0x1}, {I1, XXXX}, {I0, WWWW}); // 2z + w
+    // z = sign * (2z + w): the TA's near plane on the side the draw's vertices behind the eye lie
+    // past (RasterizerSgxd::ClipZSign).
+    e.Vec(VecOp::Mul, {I0, 0x4}, {I1, XXXX}, {Reg::Sa(SaClipZSign), XXXX});
     // The draws render the guest's colour buffer transposed (SgxdBackend::PicaTarget, route 1):
-    // clip x takes y and clip y takes x, and the viewport maps them (RasterizerGxm::Draw). The
-    // standard swizzles have no YX pair: a lane each, as OutputLane writes them.
-    e.MoveInternal({Reg::O(OutPosition), 0x1}, {I0, YYYY});
-    e.MoveInternal({Reg::O(OutPosition), 0x2}, {I0, XXXX});
+    // clip x takes y and clip y takes x, and the viewport maps them (RasterizerSgxd::Draw). Each
+    // is scaled down by the factor the viewport is scaled up by, the viewport flip's sign in
+    // the first (RasterizerSgxd::GuardScale): the pixels are the same, and the TA's guard band,
+    // a multiple of the viewport, is wider. The standard swizzles have no YX pair: a lane each.
+    e.Vec(VecOp::Mul, {Reg::O(OutPosition), 0x1}, {I0, YYYY}, {Reg::Sa(SaPositionScale), XXXX});
+    e.Vec(VecOp::Mul, {Reg::O(OutPosition), 0x2}, {I0, XXXX}, {Reg::Sa(SaPositionScale), YYYY});
     e.MoveInternal({Reg::O(OutPosition + 2), 0x3}, {I0, ZWZW});
     // The fog table's coordinate (Usse::TextureIssue::fog): TEXCOORD3's u and t are the PICA
     // depth times w and w, which the PDS divides (TEXPROJ T) after iterating them
@@ -2067,6 +2165,9 @@ std::optional<Program> VertexEmitter::Emit(uint32_t& input_regs) {
         Refuse("program extent");
     }
     ScanProgram();
+    if (req.mode == VsMode::Draw) {
+        FindPositionRows();
+    }
     input_regs = scan.inputs;
     for (uint32_t t = 0; t < 16; t++) {
         if (scan.temp_init[t] != 0) {

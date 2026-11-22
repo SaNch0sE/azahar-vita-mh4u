@@ -750,21 +750,6 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
 #ifdef VITA_DIAGNOSTICS
     Usse::Encoder::probe_skip_point_reads = SgxdFlag("smpskip");
 #endif
-#ifdef VITA_DIAGNOSTICS
-    // zflip: clip z = 2z + w, the TA's near plane the PICA's z = -w and its far plane z = 0.
-    Usse::z_flip = SgxdFlag("zflip");
-#endif
-#ifdef VITA_DIAGNOSTICS
-    // sgxd_flags scaledmask: a scaled pass storing a part keeps its draws in it by the ISP's
-    // mask, not by the depth scratch and its copy (the mask's hang, open).
-    scaled_mask = SgxdFlag("scaledmask");
-    // sgxd_flags widescreen=N: the top screen N rows wider each side whatever the frontend's
-    // layout asks (frame replays of the widescreen passes).
-    if (const u32 margin = SgxdFlagValue("widescreen"); margin != 0) {
-        SetWidescreen(margin);
-        top_margin_forced = true;
-    }
-#endif
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
     }
@@ -3085,6 +3070,13 @@ void RasterizerSgxd::LogTextureStats() {
                  clip_plane_last[2], clip_plane_last[3]);
     }
     clip_plane_draws = clip_plane_all = 0;
+    if (clip_z_reversed + clip_z_oblique != 0) {
+        LOG_INFO(Render,
+                 "perf: clip z of {} draws: {} flipped (reversed depth), {} oblique (unflipped, "
+                 "can lock the clipper), {} without position rows",
+                 clip_z_all, clip_z_reversed, clip_z_oblique, clip_z_unknown);
+    }
+    clip_z_reversed = clip_z_oblique = clip_z_unknown = clip_z_all = 0;
     const WidenStats& w = widen_stats;
     LOG_INFO(Render,
              "perf: 8-bit index lists widened: {} ({} KiB read from VRAM, {} KiB from FCRAM on "
@@ -5456,6 +5448,116 @@ const std::array<s8, 16>& RasterizerSgxd::DefaultInputAttributes() {
     return default_input_attr;
 }
 
+RasterizerSgxd::DrawView RasterizerSgxd::DrawViewport() const {
+    // The target is the buffer transposed: the vertex program writes NDC y as clip x and NDC x as clip
+    // y. The PICA's window y runs up from the target's last memory row, so the corner is mirrored
+    // and NDC y +1 is the target's first memory row: its scale is
+    // negative. In the pass's pixels, past the picture's left margin when widescreen.
+    const float half_w = f24::FromRaw(regs.rasterizer.viewport_size_x).ToFloat32();
+    const float half_h = f24::FromRaw(regs.rasterizer.viewport_size_y).ToFloat32();
+    const float height = static_cast<float>(draw_rows);
+    const float vs = static_cast<float>(pass_quarters) / 4.0f;
+    DrawView view;
+    view.words[0] = (height + static_cast<float>(pass_margin) -
+                     static_cast<float>(regs.rasterizer.viewport_corner.y) - half_h) *
+                    vs;
+    view.words[1] = -half_h * vs;
+    view.words[2] = (static_cast<float>(regs.rasterizer.viewport_corner.x) + half_w) * vs;
+    view.words[3] = half_w * vs;
+    // The TA clips at a guard band 1.5 times the viewport's half extent either side, and its clipper
+    // locks up on triangles it clips there (docs/sgxd/ta.md). With x and y divided by k and the
+    // viewport's scale times k, every pixel stays put and the band is k times wider: k as large as
+    // keeps it inside the TA's pixel range (-1024 to 3071), margin 4. Not a power of two: one
+    // locked up the clipper.
+    constexpr float Lowest = -1024.0f + 4.0f, Highest = 3071.0f - 4.0f;
+    for (u32 a = 0; a < 2; a++) {
+        const float centre = view.words[2 * a];
+        const float band = 1.5f * std::abs(view.words[2 * a + 1]);
+        float k = 1.0f;
+        if (band > 0.0f) {
+            k = std::max(1.0f, std::min(centre - Lowest, Highest - centre) / band);
+        }
+        view.guard[a] = k;
+        view.words[2 * a + 1] *= k;
+    }
+    return view;
+}
+
+/// The least w > 0 the PICA's planes (-w <= z <= 0) leave of z = alpha w + beta: a standard
+/// projection's near plane beta / -alpha, a reversed one's -beta / (alpha + 1); NaN for none.
+static float ProjectionNearW(float alpha, float beta) {
+    float lo = 0.0f;
+    if (alpha < 0.0f) {
+        lo = std::max(lo, beta / -alpha);
+    }
+    if (alpha + 1.0f > 0.0f) {
+        lo = std::max(lo, -beta / (alpha + 1.0f));
+    }
+    return lo > 0.0f ? lo : std::numeric_limits<float>::quiet_NaN();
+}
+
+float RasterizerSgxd::ClipZSign(const VertexProgram& vp, const Pica::ShaderSetup& setup,
+                                float& near_w) {
+    near_w = std::numeric_limits<float>::quiet_NaN();
+    // The TA's clipper locks up on triangles through w = 0 whose vertex behind the eye lies inside its
+    // near plane and past its far plane (docs/sgxd/ta.md). Clip z -(2z + w) puts the near plane at the
+    // PICA's z = 0 (a standard projection's vertices behind the eye lie past it); 2z + w puts it at
+    // z = -w (a reversed one's). From the rows z and w come from: -1 when z + w >= 0 wherever w < 0,
+    // 1 when z <= 0 there; an oblique near plane serves neither and keeps -1.
+    float sign = -1.0f;
+    const auto& rows = vp.usse.position_rows;
+#ifdef VITA_DIAGNOSTICS
+    clip_z_all++;
+#endif
+    if (rows[0].uniform < 0) {
+#ifdef VITA_DIAGNOSTICS
+        clip_z_unknown++;
+#endif
+        return sign;
+    }
+    std::array<std::array<float, 4>, 2> r{};
+    for (int k = 0; k < 2; k++) {
+        const auto& row = rows[k];
+        const auto& u = setup.uniforms.f[static_cast<u32>(row.uniform)];
+        for (int c = 0; c < 4; c++) {
+            const float v = u[row.uniform_lane[c]].ToFloat32();
+            r[k][row.source_lane[c]] += row.negate ? -v : v;
+        }
+    }
+    const auto& z = r[0];
+    const auto& w = r[1];
+    const float ww = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+    if (ww == 0.0f) {
+        return sign; // w the same everywhere: nothing behind the eye
+    }
+    const float alpha = (z[0] * w[0] + z[1] * w[1] + z[2] * w[2]) / ww;
+    float rest = 0.0f, zz = 0.0f;
+    for (int c = 0; c < 3; c++) {
+        const float d = z[c] - alpha * w[c];
+        rest += d * d;
+        zz += z[c] * z[c];
+    }
+    const float beta = z[3] - alpha * w[3];
+    if (rest <= 1e-8f * zz) {
+        near_w = ProjectionNearW(alpha, beta);
+    }
+    if (rest > 1e-8f * zz) {
+#ifdef VITA_DIAGNOSTICS
+        clip_z_oblique++;
+#endif
+    } else if (alpha >= 0.0f && beta <= 0.0f) {
+        sign = 1.0f;
+#ifdef VITA_DIAGNOSTICS
+        clip_z_reversed++;
+#endif
+    } else if (!(alpha + 1.0f <= 0.0f && beta >= 0.0f)) {
+#ifdef VITA_DIAGNOSTICS
+        clip_z_oblique++;
+#endif
+    }
+    return sign;
+}
+
 SgxdBackend::Data RasterizerSgxd::VertexSa(const VertexProgram& vp,
                                           const Pica::ShaderSetup& setup, u32& vsec_sa,
                                           const Describe& describe) {
@@ -5475,14 +5577,20 @@ SgxdBackend::Data RasterizerSgxd::VertexSa(const VertexProgram& vp,
     for (const VertexSaSlot& slot : vp.sa_slots) {
         float* const out = vsa_f + slot.sa;
         switch (slot.kind) {
-        case Kind::FlipViewport:
-            out[0] = vs_data.flip_viewport ? 1.0f : 0.0f;
+        case Kind::PositionScale: {
+            // The clip x factor takes clip y's (the transpose), with the flip's sign.
+            out[0] = (vs_data.flip_viewport ? -1.0f : 1.0f) / draw_view.guard[0];
+            out[1] = 1.0f / draw_view.guard[1];
             break;
+        }
         case Kind::DepthScale:
             out[0] = fs_data.depth_scale;
             break;
         case Kind::DepthOffset:
             out[0] = fs_data.depth_offset;
+            break;
+        case Kind::ClipZSign:
+            out[0] = draw_clip_z_sign;
             break;
         case Kind::IntUniforms:
             for (u32 n = 0; n < 4 && n < slot.array_size; n++) {
@@ -7041,6 +7149,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     }
     const VertexProgram& vp = *stage.vp;
     const Usse::Program& vg = vp.usse;
+    draw_clip_z_sign = ClipZSign(vp, *stage.setup, draw_near_w);
 
     // --- the vertex program's SA block and uniform buffer ---
     u32 vsec_sa = 0;
@@ -7332,32 +7441,11 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         fp.pixel_size_sa = fsa_words;
     }
     p.pixel_size = fp.pixel_size;
-    // The target is the buffer transposed (SgxdBackend::PicaTarget): the vertex program
-    // writes NDC y as clip x and NDC x as clip y, so pixel column x is memory row x and pixel
-    // row y the PICA's x. The program writes z as -(2z + w), which the TA clips to the PICA's
-    // planes (VertexEmitter::Epilogue); the viewport's z maps it to the PICA depth,
-    // z / w * depth_scale + depth_offset.
-    const float half_w = f24::FromRaw(regs.rasterizer.viewport_size_x).ToFloat32();
-    const float half_h = f24::FromRaw(regs.rasterizer.viewport_size_y).ToFloat32();
-    // The PICA's window y runs up from the target's last memory row: the corner is mirrored as upstream's y-down Vulkan path
-    // mirrors it (FramebufferHelper, flip_rect), and NDC y +1 is the target's first memory row
-    // (the top of the PICA's window), so its scale is negative. With it positive every draw was
-    // mirrored along the rows.
-    // In the pass's pixels: the PICA's scaled with the pass (the upscaled top screen).
-    // Widescreen, past the picture's left margin.
-    const float vs = static_cast<float>(pass_quarters) / 4.0f;
-    p.viewport[0] = (static_cast<float>(height + pass_margin) -
-                     static_cast<float>(regs.rasterizer.viewport_corner.y) - half_h) *
-                    vs;
-    p.viewport[1] = -half_h * vs;
-    p.viewport[2] = (static_cast<float>(regs.rasterizer.viewport_corner.x) + half_w) * vs;
-    p.viewport[3] = half_w * vs;
+    // x and y as DrawViewport has them. The program writes z as sign * (2z + w), which the TA clips to
+    // the PICA's planes; the viewport's z maps it to the PICA depth.
+    std::copy(draw_view.words.begin(), draw_view.words.end(), p.viewport);
     p.viewport[4] = fs_data.depth_offset - fs_data.depth_scale / 2.0f;
-    p.viewport[5] = -fs_data.depth_scale / 2.0f;
-    if (Usse::z_flip) {
-        // z written as 2z + w: z / w * depth_scale / 2 + depth_offset - depth_scale / 2.
-        p.viewport[5] = fs_data.depth_scale / 2.0f;
-    }
+    p.viewport[5] = draw_clip_z_sign * fs_data.depth_scale / 2.0f;
     // W-buffering: the TA's WBUFFEN gives the ISP the viewport's z mapping of 1/w (docs/sgxd/ta.md),
     // linear on the screen and in the PICA's depth order: 1 - 1/w where the PICA's depth grows with w,
     // else 1/w. The depths stored are these, and a pass's Z-buffered draws do not compare with them as

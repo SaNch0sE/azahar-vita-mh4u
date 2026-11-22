@@ -34,8 +34,8 @@ std::string UniformName(const Uniform& uniform) {
         return "light_src[" + std::to_string(uniform.index) + "]." + member;
     };
     switch (uniform.kind) {
-    case UniformKind::FlipViewport:
-        return "flip_viewport";
+    case UniformKind::PositionScale:
+        return "position_scale";
     case UniformKind::DepthScale:
         return "depth_scale";
     case UniformKind::DepthOffset:

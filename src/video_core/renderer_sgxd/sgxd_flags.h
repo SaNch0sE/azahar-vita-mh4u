@@ -94,13 +94,6 @@ namespace SgxdRenderer {
  *             fswhite=4 as many NOPs as the program's words, then the white write (its time
  *             without its loads and reads)
  *   xferlog   every display transfer, texture copy and fill as it comes (sgxd_rasterizer.cpp)
- *   clipcheck=N  from N s of the process's time on, the draws in the first 50 ms of each second
- *             (clipcheckall: every draw) run through the vertex program on the CPU and clipped
- *             at the TA's near and far planes: their triangles the TA clips at its guard band
- *             with vertices of different w (the clipper lockup's trigger), those crossing w 0,
- *             those left with w near 0 by the near and far planes (the TA has no w plane), and
- *             non-finite positions; a line for each draw with the last two (600 at most) and
- *             each second's totals
  *   keepaa    the game's anti-aliasing kept, for comparing pictures and times: a colour
  *             buffer a display transfer averages down drawn at the game's size
  *             (RasterizerGxm::Supersampled), a jittered second render of the scene drawn

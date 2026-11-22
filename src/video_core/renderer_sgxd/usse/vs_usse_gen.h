@@ -119,7 +119,5 @@ inline constexpr uint32_t GsStateQuads = 16 + 3 * 16;
                                                       std::string* refusal = nullptr,
                                                       int level = 1);
 
-/// Probe zflip (diagnostics): clip z = 2z + w, the TA's near and far planes swapped.
-extern bool z_flip;
 
 } // namespace SgxdRenderer::Usse

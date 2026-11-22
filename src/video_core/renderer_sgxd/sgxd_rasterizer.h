@@ -545,11 +545,22 @@ private:
     /// quad of one w): the program reads the tile's colour for them, and the pass need not end.
     u32 OwnPixelUnits(bool is_indexed, const float* immediate, u32 count);
     std::unique_ptr<Pica::ShaderEngine> cover_engine;
+    /// A draw's viewport on the TA's axes: words 12-15 (x centre, x scale, y centre, y scale), each
+    /// scale widened by `guard`, which the vertex program divides x and y by: the TA's guard band is
+    /// `guard` times wider (DrawViewport).
+    struct DrawView {
+        std::array<float, 4> words;
+        std::array<float, 2> guard;
+    };
+    DrawView DrawViewport() const;
     /// The draw's target's rows, which DrawViewport's corner counts from.
     u32 draw_rows{};
     DrawView draw_view{};
-    /// The vertex program's SA block: its uniforms from `setup`, its literals and buffer
-    /// pointer; `vsec_sa` its words.
+    /// The draw's clip z orientation (Usse::UniformKind::ClipZSign) from its position rows and
+    /// uniforms; `near_w` the least w the PICA's planes leave of z = alpha w + beta, or NaN.
+    float ClipZSign(const VertexProgram& vp, const Pica::ShaderSetup& setup, float& near_w);
+    /// The draw's ClipZSign, for VertexSa's ClipZSign slot, and its near_w.
+    float draw_clip_z_sign = -1.0f;
     float draw_near_w = 0.0f;
     /// The W-buffered draws' TA depth 1 - K / w (K / w where the PICA's depth falls with w): K starts
     /// at 1 and only comes down, to the power of two at or below a W-buffered draw's near plane, so no
@@ -1272,6 +1283,8 @@ private:
     /// perflog: draws with the PICA's user clip plane on (sgxd gives the TA none).
     u32 clip_plane_draws{}, clip_plane_all{};
     std::array<float, 4> clip_plane_last{};
+    /// perflog: draws whose clip z ClipZSign flipped, left as they were (oblique rows), or had no rows.
+    u32 clip_z_reversed{}, clip_z_oblique{}, clip_z_unknown{}, clip_z_all{};
 #endif
 };
 
