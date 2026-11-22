@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "core/arm/arm_interface.h"
 #include "azahar_native.h"
@@ -122,6 +123,16 @@ struct VitaNativeCensus {
     std::array<u32, AZAHAR_FAST_KINDS> fast{};        ///< By AZAHAR_FAST_*.
     u64 guest_ticks{}; ///< The slices' time in the guest, on the guest clock.
     u64 kernel_us{};   ///< azaharRun's own time, the guest's included.
+    /// VFP instructions run under short vectors, the exits that ran them, and the sites patched to a
+    /// thunk or to the module's svc.
+    u32 vfp_insns{}, vfp_exits{}, vfp_thunks{}, vfp_svcs{};
+    /// SleepThread exits by caller (return address, thread, last ns, count); past 16, `sleep_other`.
+    struct SleepCaller {
+        u32 lr{}, thread{}, count{};
+        s64 ns{};
+    };
+    std::array<SleepCaller, 16> sleeps{};
+    u32 sleep_other{};
 };
 VitaNativeCensus TakeVitaNativeCensus();
 #endif
@@ -180,6 +191,9 @@ private:
     /// One trip into the guest. Returns false if the core should stop running for now.
     bool RunSlice(u64 quantum_ns);
     void ReportFault(const AzaharRunRequest& run);
+    /// Patches a VFP instruction that trapped under the guest's LEN and STRIDE into a branch to a
+    /// thunk, or out of reach into the module's svc.
+    void PatchVfp(u32 pc, u32 insn, bool thumb);
     bool PatchVfpThunk(u32 pc, u32 insn, bool thumb);
     u32 FetchCode(u32 pc, bool thumb) const;
 

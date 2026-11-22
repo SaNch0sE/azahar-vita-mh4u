@@ -54,10 +54,11 @@
     .equ CPU_FAST, 0x1f0            @ AzaharFast
     .equ CPU_STRAY_STACK_TOP, 0x278 @ 64 bytes below each
     .equ CPU_IRQ_STACK_TOP, 0x2b8
-    .equ CPU_SIZE, 0x2c0            @ the last 8 bytes keep both tops inside the block
+    .equ CPU_VFP_STACK_TOP, 0x6c0   @ azahar_vfp_svc's stack (1 KiB below)
+    .equ CPU_SIZE, 0x6c8            @ the last 8 bytes keep the tops inside the block
 @ AzaharFast, at CPU_FAST (native.c): on 0x00, timer 0x04, quantum 0x08, mult_int 0x0c,
-@ mult_frac 0x10, base 0x14 (low) and 0x18, thread_id 0x1c, process_id 0x20, count[4] 0x24,
-@ save[4] 0x34.
+@ mult_frac 0x10, base 0x14 (low) and 0x18, thread_id 0x1c, process_id 0x20, count[5] 0x24,
+@ save[4] 0x38.
     .equ FAST_ON, 0x00
     .equ FAST_TIMER, 0x04
     .equ FAST_QUANTUM, 0x08
@@ -68,7 +69,7 @@
     .equ FAST_THREAD_ID, 0x1c
     .equ FAST_PROCESS_ID, 0x20
     .equ FAST_COUNT, 0x24
-    .equ FAST_SAVE, 0x34
+    .equ FAST_SAVE, 0x38
 
     .global azahar_enter
     .type azahar_enter, %function
@@ -278,6 +279,8 @@ azahar_svc_fast:
     biceq   r5, r5, #0xff000000
     cmp     r5, #0x28
     beq     1f
+    cmp     r5, #0xfe                   @ AZAHAR_VFP_SVC
+    beq     5f
     cmp     r5, #0x37
     beq     3f
     cmp     r5, #0x35
@@ -342,6 +345,26 @@ azahar_svc_fast:
     ldr     r1, [r6, #FAST_PROCESS_ID]
     mov     r4, #(FAST_COUNT + 3 * 4)
     b       7f
+
+5:  @ A VFP instruction the app patched into this svc (azaharVfpPatch): azahar_vfp_svc runs it
+    @ by the svc's address, on the core's VFP stack, with the guest's r0-r3, r12 and LR_svc
+    @ kept around the call (r4-r7 are in the save words; r6 and r7 survive it). Not registered:
+    @ the ordinary svc exit, which the app answers itself.
+    tst     r7, #(1 << 4)
+    beq     8f
+    mrs     r4, spsr
+    tst     r4, #0x20
+    subne   r4, lr, #2                  @ the svc's address: Thumb's is 16 bits
+    subeq   r4, lr, #4
+    add     sp, r6, #(CPU_VFP_STACK_TOP - CPU_FAST)
+    push    {r0-r3, r12, lr}
+    mov     r0, r4
+    bl      azahar_vfp_svc
+    mov     r5, r0
+    pop     {r0-r3, r12, lr}
+    cmp     r5, #0
+    beq     8f
+    mov     r4, #(FAST_COUNT + 4 * 4)
 
 7:  @ answered: count it, put r4-r7 back, resume the guest after its svc
     ldr     r5, [r6, r4]

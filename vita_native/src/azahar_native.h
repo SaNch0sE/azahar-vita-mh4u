@@ -72,7 +72,10 @@ typedef struct AzaharContext {
                                   // answers them
 #define AZAHAR_FAST_THREAD_ID 2u  // 0x37 GetThreadId on the current thread (0xFFFF8000)
 #define AZAHAR_FAST_PROCESS_ID 3u // 0x35 GetProcessId on the current process (0xFFFF8001)
-#define AZAHAR_FAST_KINDS 4u
+#define AZAHAR_FAST_VFP 4u        // svc AZAHAR_VFP_SVC in place of a VFP instruction the app
+                                  // registered (azaharVfpPatch): run it in the vector, under
+                                  // the guest's LEN and STRIDE. Since version 30.
+#define AZAHAR_FAST_KINDS 5u
 #define AZAHAR_FAST_ALL ((1u << AZAHAR_FAST_KINDS) - 1u)
 
 typedef struct AzaharRunRequest {
@@ -99,6 +102,31 @@ typedef struct AzaharRunRequest {
     uint32_t kernel_us;   // out: azaharRun's own time, the guest's included
     uint32_t reserved2;
 } AzaharRunRequest;
+
+// VFP short vectors (version 30). The Cortex-A9 has none: with the guest's FPSCR LEN or STRIDE
+// set, every VFP data-processing instruction is undefined. The app patches such an instruction,
+// once it trapped, into svc AZAHAR_VFP_SVC (ARM: the instruction's own condition; Thumb: the svc
+// and a nop) and registers its decoded form here by its guest address; azahar_svc_fast then runs
+// it in the vector without an exit. The form: op (AZAHAR_VFP_OP_*) | dp << 4 | two << 5 | d << 8
+// | n << 16 | m << 24, with register numbers counted in the precision's own registers (singles
+// 0-31, doubles 0-15) and `two` an operation of one source (m). LEN and STRIDE are the live
+// FPSCR's when it runs: a destination in the first bank is a scalar, a second operand there the
+// same scalar for every element (VFPv2's vectors).
+#define AZAHAR_VFP_SVC 0xFEu
+#define AZAHAR_VFP_OP_MLA 0u
+#define AZAHAR_VFP_OP_MLS 1u
+#define AZAHAR_VFP_OP_NMLS 2u
+#define AZAHAR_VFP_OP_NMLA 3u
+#define AZAHAR_VFP_OP_MUL 4u
+#define AZAHAR_VFP_OP_NMUL 5u
+#define AZAHAR_VFP_OP_ADD 6u
+#define AZAHAR_VFP_OP_SUB 7u
+#define AZAHAR_VFP_OP_DIV 8u
+#define AZAHAR_VFP_OP_CPY 9u
+#define AZAHAR_VFP_OP_ABS 10u
+#define AZAHAR_VFP_OP_NEG 11u
+#define AZAHAR_VFP_OP_SQRT 12u
+#define AZAHAR_VFP_TABLE 4096u  // the registered instructions the module holds
 
 // Runtime edits to the guest's mapping, for svcControlMemory / svcMapMemoryBlock and friends.
 // Only between runs: the guest is stopped at an exit while the app handles its svc. MAP adds
@@ -196,6 +224,10 @@ int azaharMap(const AzaharMapRequest *req);
 int azaharRun(AzaharRunRequest *req);
 int azaharRelease(void);
 int azaharEdit(const AzaharEditRequest *req);
+/// Registers the decoded VFP instruction `form` at `guest_pc` (see AZAHAR_VFP_SVC), replacing one
+/// registered there before. Between slices. 0, or AZAHAR_ERR_ARG for a bad form and
+/// AZAHAR_ERR_STATE when the table is full. Version 30.
+int azaharVfpPatch(uint32_t guest_pc, uint32_t form);
 /// See AzaharHoldRun: `count` runs, 1 to AZAHAR_HOLD_MAX_RUNS. Returns the guest descriptors it
 /// changed. Version 25.
 int azaharHold(const AzaharHoldRun *runs, uint32_t count);

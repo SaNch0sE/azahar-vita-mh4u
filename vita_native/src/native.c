@@ -328,7 +328,7 @@ _Static_assert(__builtin_offsetof(AzaharFast, mult_int) == 0x0c, "entry.S FAST_M
 _Static_assert(__builtin_offsetof(AzaharFast, base_lo) == 0x14, "entry.S FAST_BASE_LO");
 _Static_assert(__builtin_offsetof(AzaharFast, process_id) == 0x20, "entry.S FAST_PROCESS_ID");
 _Static_assert(__builtin_offsetof(AzaharFast, count) == 0x24, "entry.S FAST_COUNT");
-_Static_assert(__builtin_offsetof(AzaharFast, save) == 0x34, "entry.S FAST_SAVE");
+_Static_assert(__builtin_offsetof(AzaharFast, save) == 0x38, "entry.S FAST_SAVE");
 
 // One block per Vita core (MPIDR & 3): a slice on a core reads and writes its own only. This is
 // entry.S's part, its CPU_* offsets checked below, with the context first so that a stub's SP
@@ -351,10 +351,11 @@ typedef struct AzaharCpu {
     volatile uint32_t stray[8];   // count, reason, lr, spsr, dfsr, dfar, ifsr, ifar
     uint32_t pad0;
     AzaharFast fast;
-    uint32_t pad1;
     uint8_t stray_stack[64];
     uint8_t irq_stack[64];
     uint32_t guard[2];            // both stacks' tops stay inside the block
+    uint8_t vfp_stack[1024];      // azahar_vfp_svc's, from azahar_svc_fast
+    uint32_t guard2[2];
 } AzaharCpu;
 #define AZAHAR_CORES 4u
 extern AzaharCpu azahar_cpu[AZAHAR_CORES]; // entry.S's .bss
@@ -376,7 +377,8 @@ _Static_assert(__builtin_offsetof(AzaharCpu, stray) == 0x1cc, "entry.S CPU_STRAY
 _Static_assert(__builtin_offsetof(AzaharCpu, fast) == 0x1f0, "entry.S CPU_FAST");
 _Static_assert(__builtin_offsetof(AzaharCpu, stray_stack) + 64 == 0x278, "entry.S CPU_STRAY_STACK_TOP");
 _Static_assert(__builtin_offsetof(AzaharCpu, irq_stack) + 64 == 0x2b8, "entry.S CPU_IRQ_STACK_TOP");
-_Static_assert(sizeof(AzaharCpu) == 0x2c0, "entry.S CPU_SIZE");
+_Static_assert(__builtin_offsetof(AzaharCpu, vfp_stack) + 1024 == 0x6c0, "entry.S CPU_VFP_STACK_TOP");
+_Static_assert(sizeof(AzaharCpu) == 0x6c8, "entry.S CPU_SIZE");
 
 // The rest of a core's state, C's alone: Sony's registers saved at install and put back at
 // uninstall, the private timer's clock, and the slice's figures.
@@ -1713,6 +1715,8 @@ static int build_table(const AzaharMapRequest *req) {
 
 static AzaharMapRequest azahar_req;
 
+void azahar_vfp_reset(void);
+
 int azaharMap(const AzaharMapRequest *user_req) {
     uint32_t state;
     ENTER_SYSCALL(state);
@@ -1736,6 +1740,7 @@ int azaharMap(const AzaharMapRequest *user_req) {
     // empty table and adds windows with azaharEdit, and cannot afford a synced line per exit.
     azahar_verbose = azahar_req.count > 0;
     azahar_run_count = 0;
+    azahar_vfp_reset(); // a new guest: the last one's patched VFP instructions go
     for (unsigned r = 0; r < azahar_req.count; r++) {
         const AzaharRange *rg = &azahar_req.ranges[r];
         if (!check_range(rg, 1) || !(rg->perm & AZAHAR_PERM_R) || (rg->perm & ~0xFu)) {
@@ -1960,6 +1965,153 @@ out:
 }
 
 static AzaharEditRequest azahar_edit_req;
+
+// ---------------------------------------------------------------------------- VFP short vectors
+// azaharVfpPatch's registered instructions, by guest address (open addressing; pc 0 is empty),
+// and azahar_vfp_svc, which azahar_svc_fast calls for svc AZAHAR_VFP_SVC: Supervisor mode, IRQs
+// masked, the core's VFP stack, the guest's VFP bank live in the registers. The bank and FPSCR
+// are saved first and put back last (the compiler may use any VFP register in between), and the
+// elements run with LEN and STRIDE cleared, as scalars, the way the app's RunVfpVector runs
+// them; FPSCR keeps the guest's LEN and STRIDE and takes the elements' exception flags.
+typedef struct AzaharVfpEntry {
+    uint32_t pc, form;
+} AzaharVfpEntry;
+static AzaharVfpEntry azahar_vfp_table[AZAHAR_VFP_TABLE];
+#define AZAHAR_FPSCR_VECTOR 0x00370000u // STRIDE (21:20) and LEN (18:16)
+
+static uint32_t vfp_slot(uint32_t pc) {
+    return ((pc >> 1) * 2654435761u) >> 20; // 12 bits: AZAHAR_VFP_TABLE
+}
+_Static_assert(AZAHAR_VFP_TABLE == 4096u, "vfp_slot's 12 bits");
+
+static float vfp_single(uint32_t op, float d, float n, float m) {
+    switch (op) {
+    case AZAHAR_VFP_OP_MLA: asm volatile("vmla.f32 %0, %1, %2" : "+t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_MLS: asm volatile("vmls.f32 %0, %1, %2" : "+t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_NMLS: asm volatile("vnmls.f32 %0, %1, %2" : "+t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_NMLA: asm volatile("vnmla.f32 %0, %1, %2" : "+t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_MUL: asm volatile("vmul.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_NMUL: asm volatile("vnmul.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_ADD: asm volatile("vadd.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_SUB: asm volatile("vsub.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_DIV: asm volatile("vdiv.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m)); break;
+    case AZAHAR_VFP_OP_CPY: asm volatile("vmov.f32 %0, %1" : "=t"(d) : "t"(m)); break;
+    case AZAHAR_VFP_OP_ABS: asm volatile("vabs.f32 %0, %1" : "=t"(d) : "t"(m)); break;
+    case AZAHAR_VFP_OP_NEG: asm volatile("vneg.f32 %0, %1" : "=t"(d) : "t"(m)); break;
+    case AZAHAR_VFP_OP_SQRT: asm volatile("vsqrt.f32 %0, %1" : "=t"(d) : "t"(m)); break;
+    }
+    return d;
+}
+
+static double vfp_double(uint32_t op, double d, double n, double m) {
+    switch (op) {
+    case AZAHAR_VFP_OP_MLA: asm volatile("vmla.f64 %P0, %P1, %P2" : "+w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_MLS: asm volatile("vmls.f64 %P0, %P1, %P2" : "+w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_NMLS: asm volatile("vnmls.f64 %P0, %P1, %P2" : "+w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_NMLA: asm volatile("vnmla.f64 %P0, %P1, %P2" : "+w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_MUL: asm volatile("vmul.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_NMUL: asm volatile("vnmul.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_ADD: asm volatile("vadd.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_SUB: asm volatile("vsub.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_DIV: asm volatile("vdiv.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m)); break;
+    case AZAHAR_VFP_OP_CPY: asm volatile("vmov.f64 %P0, %P1" : "=w"(d) : "w"(m)); break;
+    case AZAHAR_VFP_OP_ABS: asm volatile("vabs.f64 %P0, %P1" : "=w"(d) : "w"(m)); break;
+    case AZAHAR_VFP_OP_NEG: asm volatile("vneg.f64 %P0, %P1" : "=w"(d) : "w"(m)); break;
+    case AZAHAR_VFP_OP_SQRT: asm volatile("vsqrt.f64 %P0, %P1" : "=w"(d) : "w"(m)); break;
+    }
+    return d;
+}
+
+// Returns 1 when the instruction at pc ran, 0 when none is registered there.
+uint32_t azahar_vfp_svc(uint32_t pc) {
+    const AzaharVfpEntry *e = NULL;
+    for (uint32_t i = vfp_slot(pc), k = 0; k < AZAHAR_VFP_TABLE; i = (i + 1) & (AZAHAR_VFP_TABLE - 1), k++) {
+        if (azahar_vfp_table[i].pc == pc) {
+            e = &azahar_vfp_table[i];
+            break;
+        }
+        if (azahar_vfp_table[i].pc == 0) {
+            return 0;
+        }
+    }
+    if (!e) {
+        return 0;
+    }
+    uint64_t bank[32] __attribute__((aligned(8)));
+    uint32_t fpscr, flags;
+    asm volatile(".fpu neon \n vmrs %0, fpscr" : "=r"(fpscr));
+    vfp_bank_save(bank);
+    asm volatile(".fpu neon \n vmsr fpscr, %0" ::"r"(fpscr & ~AZAHAR_FPSCR_VECTOR) : "memory");
+    const uint32_t form = e->form;
+    const uint32_t op = form & 15, dp = form >> 4 & 1, two = form >> 5 & 1;
+    const uint32_t d = form >> 8 & 31, n = form >> 16 & 31, m = form >> 24 & 31;
+    const uint32_t bank_size = dp ? 4 : 8;
+    const uint32_t stride = (fpscr >> 20 & 3) == 3 ? 2 : 1;
+    const uint32_t len = d < bank_size ? 1 : (fpscr >> 16 & 7) + 1;
+    const int m_scalar = m < bank_size;
+    uint32_t di = d, ni = n, mi = m;
+    uint32_t *const s = (uint32_t *)bank;
+    for (uint32_t k = 0; k < len; k++) {
+        if (dp) {
+            double vd, vn, vm;
+            __builtin_memcpy(&vd, &bank[di], 8);
+            __builtin_memcpy(&vn, &bank[ni], 8);
+            __builtin_memcpy(&vm, &bank[mi], 8);
+            const double r = vfp_double(op, vd, two ? 0.0 : vn, vm);
+            __builtin_memcpy(&bank[di], &r, 8);
+        } else {
+            float vd, vn, vm;
+            __builtin_memcpy(&vd, &s[di], 4);
+            __builtin_memcpy(&vn, &s[ni], 4);
+            __builtin_memcpy(&vm, &s[mi], 4);
+            const float r = vfp_single(op, vd, two ? 0.0f : vn, vm);
+            __builtin_memcpy(&s[di], &r, 4);
+        }
+        di = di / bank_size * bank_size + (di % bank_size + stride) % bank_size;
+        ni = ni / bank_size * bank_size + (ni % bank_size + stride) % bank_size;
+        if (!m_scalar) {
+            mi = mi / bank_size * bank_size + (mi % bank_size + stride) % bank_size;
+        }
+    }
+    asm volatile(".fpu neon \n vmrs %0, fpscr" : "=r"(flags));
+    vfp_bank_load(bank);
+    asm volatile(".fpu neon \n vmsr fpscr, %0" ::"r"((fpscr & AZAHAR_FPSCR_VECTOR) |
+                                                     (flags & ~AZAHAR_FPSCR_VECTOR))
+                 : "memory");
+    return 1;
+}
+
+void azahar_vfp_reset(void) {
+    for (uint32_t i = 0; i < AZAHAR_VFP_TABLE; i++) {
+        azahar_vfp_table[i].pc = 0;
+    }
+}
+
+int azaharVfpPatch(uint32_t guest_pc, uint32_t form) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = 0;
+    const uint32_t op = form & 15, dp = form >> 4 & 1;
+    const uint32_t d = form >> 8 & 31, n = form >> 16 & 31, m = form >> 24 & 31;
+    if (guest_pc == 0 || op > AZAHAR_VFP_OP_SQRT || (form & 0xc0c0c0c0u) != 0 ||
+        (dp && (d > 15 || n > 15 || m > 15))) {
+        ret = AZAHAR_ERR_ARG;
+        goto out;
+    }
+    // Between slices only: the guest is stopped at an exit while the app handles it.
+    ret = AZAHAR_ERR_STATE;
+    for (uint32_t i = vfp_slot(guest_pc), k = 0; k < AZAHAR_VFP_TABLE; i = (i + 1) & (AZAHAR_VFP_TABLE - 1), k++) {
+        if (azahar_vfp_table[i].pc == guest_pc || azahar_vfp_table[i].pc == 0) {
+            azahar_vfp_table[i].form = form;
+            azahar_vfp_table[i].pc = guest_pc;
+            ret = 0;
+            break;
+        }
+    }
+out:
+    EXIT_SYSCALL(state);
+    return ret;
+}
 
 int azaharEdit(const AzaharEditRequest *user_req) {
     uint32_t state;

@@ -1553,8 +1553,8 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
         }
         Texture& t = *memo.texture;
         t.last_used = passes;
-        DEBUG_ASSERT_MSG(!backend.InPass() || t.addr >= pass_colour.End() ||
-                             pass_colour.addr >= t.addr + t.part_bytes,
+        DEBUG_ASSERT_MSG(!backend.InPass() || backend.PassDraws() == pass_open_draws ||
+                             !UnitReadsDrawn(unit),
                          "sgxd: texture unit {} at {:#x} reads the colour buffer at {:#x} its own "
                          "pass drew",
                          unit, t.addr, pass_colour.addr);
@@ -1585,8 +1585,154 @@ u32 CubeFaceStride(u32 w) {
     return Common::AlignUp(chain, 2048u);
 }
 
-RasterizerGxm::Texture& RasterizerGxm::TextureFromRegs(u32 unit, bool written) {
+RasterizerSgxd::TextureExtent RasterizerSgxd::TextureExtentFor(u32 unit) const {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
+    const auto t = regs.texturing.GetTextures()[unit];
+    const auto& c = t.config;
+    const u32 width = c.width, height = c.height;
+    TextureExtent e{};
+    e.cube = unit == 0 && c.type == TextureConfig::TextureCube;
+    // The levels down to a side of 8, as the texture cache builds them.
+    e.levels = 1;
+    while (e.levels <= c.lod.max_level && width >> e.levels >= 8 && height >> e.levels >= 8) {
+        e.levels++;
+    }
+    // The parts: a 2D texture's levels in a row, or a cube's six faces at their own addresses. The
+    // host cube's slots have the PICA's +Y and -Y swapped: the program reads at (u, -v, w).
+    e.part_addr = {c.GetPhysicalAddress()};
+    e.parts = e.cube ? 6 : 1;
+    if (e.cube) {
+        using Face = Pica::TexturingRegs::CubeFace;
+        static constexpr Face slots[6] = {Face::PositiveX, Face::NegativeX, Face::NegativeY,
+                                          Face::PositiveY, Face::PositiveZ, Face::NegativeZ};
+        for (u32 k = 0; k < 6; k++) {
+            e.part_addr[k] = regs.texturing.GetCubePhysicalAddress(slots[k]);
+        }
+    }
+    const u32 bits = UntileFormatFor(t.format).bits;
+    for (u32 l = 0; l < e.levels; l++) {
+        e.bytes += (width >> l) * (height >> l) * bits / 8;
+    }
+    return e;
+}
+
+bool RasterizerSgxd::UnitReadsDrawn(u32 unit) const {
+    const UnitRead& r = unit_reads[unit];
+    for (u32 k = 0; k < r.parts; k++) {
+        if (r.lo[k] < pass_drawn_hi && pass_drawn_lo < r.hi[k]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::pair<PAddr, PAddr> RasterizerSgxd::DrawnRows() const {
+    const auto& fb = regs.framebuffer.framebuffer;
+    const auto& rs = regs.rasterizer;
+    const s32 height = static_cast<s32>(fb.GetHeight());
+    // The viewport clips the primitives, an including scissor the pixels.
+    s32 y0 = static_cast<s32>(rs.viewport_corner.y);
+    s32 y1 = y0 + static_cast<s32>(std::ceil(f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2));
+    const auto& sc = rs.scissor_test;
+    if (sc.mode == Pica::RasterizerRegs::ScissorMode::Include) {
+        y0 = std::max(y0, static_cast<s32>(sc.y1.Value()));
+        y1 = std::min(y1, static_cast<s32>(sc.y2.Value()) + 1);
+    }
+    y0 = std::clamp(y0, 0, height);
+    y1 = std::clamp(y1, 0, height);
+    if (y0 >= y1) {
+        return {0, 0};
+    }
+    // Rows run bottom to top in memory, eight to a row of tiles.
+    const u32 tile_row = fb.GetWidth() * 8 * FramebufferRegs::BytesPerColorPixel(fb.color_format);
+    const u32 first = static_cast<u32>(height - y1) / 8;
+    const u32 last = static_cast<u32>(height - 1 - y0) / 8;
+    const PAddr addr = fb.GetColorBufferPhysicalAddress();
+    return {addr + first * tile_row, addr + (last + 1) * tile_row};
+}
+
+void RasterizerSgxd::TextureReads(bool is_indexed, const float* immediate, u32 count) {
+    using Topology = Pica::PipelineRegs::TriangleTopology;
+    using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
+    using WrapMode = Pica::TexturingRegs::TextureConfig::WrapMode;
+    const auto textures = regs.texturing.GetTextures();
+    std::array<Pica::OutputVertex, 6> v;
+    int quad = -1; // run on the first unit that needs it: 1 when its vertices are known
+    for (u32 unit = 0; unit < 3; unit++) {
+        UnitRead& r = unit_reads[unit];
+        r = {};
+        const auto& t = textures[unit];
+        if (!t.enabled || t.config.GetPhysicalAddress() == 0) {
+            continue;
+        }
+        const TextureExtent e = TextureExtentFor(unit);
+        r.parts = e.parts;
+        for (u32 k = 0; k < e.parts; k++) {
+            r.lo[k] = e.part_addr[k];
+            r.hi[k] = e.part_addr[k] + e.bytes;
+        }
+        // Narrowed only for a 2D texture of one level over what the pass drew, read by a quad.
+        const auto& c = t.config;
+        if (!backend.InPass() || !UnitReadsDrawn(unit) || e.cube || e.levels != 1 ||
+            (unit == 0 && c.type != TextureType::Texture2D) || c.height < 8) {
+            continue;
+        }
+        if (quad < 0) {
+            const auto& pipeline = regs.pipeline;
+            const Topology topology = pipeline.triangle_topology;
+            const bool list = topology == Topology::List || topology == Topology::Shader;
+            quad = pipeline.use_gs == Pica::PipelineRegs::UseGS::No && count == (list ? 6u : 4u) &&
+                           (list || topology == Topology::Strip || topology == Topology::Fan) &&
+                           QuadVertices(is_indexed, immediate, count, v)
+                       ? 1
+                       : 0;
+            for (u32 j = 0; quad == 1 && j < count; j++) {
+                quad = v[j].pos.w.ToFloat32() > 0.0001f ? 1 : 0;
+            }
+        }
+        if (quad == 0) {
+            continue;
+        }
+        const bool unit2_coord1 = regs.texturing.main_config.texture2_use_coord1 != 0;
+        float v0 = 1e9f, v1 = -1e9f;
+        for (u32 j = 0; j < count; j++) {
+            const auto& tc = unit == 0                     ? v[j].tc0
+                             : (unit == 1 || unit2_coord1) ? v[j].tc1
+                                                           : v[j].tc2;
+            v0 = std::min(v0, tc.v().ToFloat32());
+            v1 = std::max(v1, tc.v().ToFloat32());
+        }
+        // Past the edge, a clamped read stays on the edge's row; a repeated one reaches all.
+        const bool clamps =
+            c.wrap_t == WrapMode::ClampToEdge || c.wrap_t == WrapMode::ClampToBorder;
+        if (!(v0 >= 0.0f && v1 <= 1.0f) && !clamps) {
+            continue;
+        }
+        // A texel either side for the filter; rows bottom to top as the buffer's.
+        const s32 height = static_cast<s32>(c.height);
+        const s32 t0 = std::clamp(static_cast<s32>(std::floor(v0 * height)) - 1, 0, height - 1);
+        const s32 t1 = std::clamp(static_cast<s32>(std::ceil(v1 * height)) + 1, 0, height - 1);
+        const u32 tile_row = e.bytes / (c.height / 8);
+        const u32 first = static_cast<u32>(height - 1 - t1) / 8;
+        const u32 last = static_cast<u32>(height - 1 - t0) / 8;
+        r.lo[0] = e.part_addr[0] + first * tile_row;
+        r.hi[0] = e.part_addr[0] + (last + 1) * tile_row;
+    }
+}
+
+bool RasterizerSgxd::TexturesReadPassColour() const {
+    u32 overlapping = 0;
+    for (u32 unit = 0; unit < 3; unit++) {
+        if (UnitReadsDrawn(unit)) {
+            overlapping |= 1u << unit;
+        }
+    }
+    // Only a unit the program samples reads it (a unit left enabled that no stage reads would end
+    // passes for nothing).
+    return overlapping != 0 && (overlapping & Usse::SampledTextureUnits(FragmentConfig())) != 0;
+}
+
+RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written) {
     using TF = Pica::TexturingRegs::TextureFormat;
     const auto t = regs.texturing.GetTextures()[unit];
     const auto& c = t.config;
@@ -1595,46 +1741,24 @@ RasterizerGxm::Texture& RasterizerGxm::TextureFromRegs(u32 unit, bool written) {
     const UntileFormat f = UntileFormatFor(t.format);
     DEBUG_ASSERT_MSG(f.code != 0xff, "sgxd: texture unit {} at {:#x}, {}x{}: format {} is not built",
                      unit, addr, width, height, static_cast<u32>(t.format));
-    const bool cube = unit == 0 && c.type == TextureConfig::TextureCube;
-    // The levels upstream's cache builds (MipLevels): down to a side of 8, a whole 8x8 tile.
-    u32 levels = 1;
-    while (levels <= c.lod.max_level && width >> levels >= 8 && height >> levels >= 8) {
-        levels++;
-    }
+    const TextureExtent extent = TextureExtentFor(unit);
+    const bool cube = extent.cube;
+    const u32 levels = extent.levels;
     DEBUG_ASSERT_MSG(!cube || width == height, "sgxd: a {}x{} cube texture is not built", width,
                      height);
     // ETC1A4 as compressed colour and A8 alpha, or level by level into RGBA.
     const bool split = SplitAlpha(unit);
     const bool etc1a4_levels = !cube && t.format == TF::ETC1A4 && !split;
-    // The guest's parts: a 2D texture's levels, which follow each other, or a cube's six
-    // faces, each at its own address. The host cube's slots are the SGX's +X, -X, +Y, -Y, +Z,
-    // -Z with the PICA's +Y and -Y swapped: the fragment program reads at (u, -v, w), which
-    // flips t on every face (FragmentEmitter::SampleTextures).
-    std::array<PAddr, 6> part_addr{addr};
-    const u32 parts = cube ? 6 : 1;
-    if (cube) {
-        using Face = Pica::TexturingRegs::CubeFace;
-        static constexpr Face slots[6] = {Face::PositiveX, Face::NegativeX, Face::NegativeY,
-                                          Face::PositiveY, Face::PositiveZ, Face::NegativeZ};
-        for (u32 k = 0; k < 6; k++) {
-            part_addr[k] = regs.texturing.GetCubePhysicalAddress(slots[k]);
-        }
-    }
-    u32 bytes = 0;
-    for (u32 l = 0; l < levels; l++) {
-        bytes += (width >> l) * (height >> l) * f.bits / 8;
-    }
-    // A colour buffer a pass drew is a texture as any other: guest memory holds what the passes
-    // stored (EndPass marked the textures over it to be untiled again), and the untile's render
-    // runs after their 3D. One the open pass draws into would need its pass ended before its
-    // own draw, which is not built.
-    for (u32 k = 0; k < parts; k++) {
-        DEBUG_ASSERT_MSG(!backend.InPass() || part_addr[k] >= pass_colour.End() ||
-                             pass_colour.addr >= part_addr[k] + bytes,
-                         "GXM: texture unit {} at {:#x} reads the colour buffer at {:#x} its own "
-                         "pass draws",
-                         unit, part_addr[k], pass_colour.addr);
-    }
+    const std::array<PAddr, 6>& part_addr = extent.part_addr;
+    const u32 parts = extent.parts;
+    const u32 bytes = extent.bytes;
+    // A colour buffer a pass drew is a texture as any other: guest memory holds what the passes stored
+    // and the untile runs after their 3D. Draw ends the open pass before a draw that reads its buffer.
+    DEBUG_ASSERT_MSG(!backend.InPass() || backend.PassDraws() == pass_open_draws ||
+                         !UnitReadsDrawn(unit),
+                     "sgxd: texture unit {} at {:#x} reads the colour buffer at {:#x} its own pass "
+                     "drew",
+                     unit, part_addr[0], pass_colour.addr);
     Texture* it = FindTexture(addr);
     if (it && (it->width != width || it->height != height || it->format != t.format ||
                it->levels != levels || it->parts != parts || it->part_addr != part_addr)) {
@@ -2562,6 +2686,25 @@ void RasterizerSgxd::ResolveVertexProgram(VertexProgram& v) {
     }
 }
 
+void RasterizerSgxd::PlaceVertexCode(VertexProgram& v) {
+    const u32 primary = backend.PlaceCode(0, v.usse.primary);
+    v.primary_doutu0 =
+        sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0), primary, v.usse.temp_count);
+    v.code = {primary, static_cast<u32>(v.usse.primary.size() * sizeof(u64)), 0, 0};
+    v.secondary_doutu0 = DummyVertexSecondary;
+    if (!v.usse.secondary.empty()) {
+        const u32 secondary = backend.PlaceCode(0, v.usse.secondary);
+        v.secondary_doutu0 = sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0), secondary, 0);
+        v.code[2] = secondary;
+        v.code[3] = static_cast<u32>(v.usse.secondary.size() * sizeof(u64));
+    }
+}
+
+void RasterizerSgxd::FreeProgramCode(const std::array<u32, 4>& code) {
+    backend.FreeCode(code[0], code[1]);
+    backend.FreeCode(code[2], code[3]);
+}
+
 void RasterizerSgxd::FlushPrograms() {
     LOG_INFO(Render, "sgxd: code heap {} KiB free: {} vertex-side and {} fragment programs dropped",
              backend.CodeFree() >> 10, vertex_programs.Size(), fragment_programs.Size());
@@ -2584,12 +2727,7 @@ RasterizerSgxd::VertexProgram RasterizerSgxd::PlaceVertexProgram(Usse::Program u
     v.usse = std::move(usse);
     ResolveVertexProgram(v);
     DumpProgram("vs", key, v.usse);
-    v.primary_doutu0 = sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
-                                           backend.PlaceCode(0, v.usse.primary), v.usse.temp_count);
-    v.secondary_doutu0 = v.usse.secondary.empty()
-                             ? DummyVertexSecondary
-                             : sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
-                                                   backend.PlaceCode(0, v.usse.secondary), 0);
+    PlaceVertexCode(v);
     LOG_INFO(Render, "{} {:016x}: {} words, {} PAs, {} temps, {} SAs{}, emitted in {} us", what,
              key, v.usse.primary.size(), v.usse.pa_count, v.usse.temp_count,
              v.usse.secondary_reg_count, v.usse.per_instance ? ", per instance" : "", emit_us);
@@ -3378,12 +3516,13 @@ void RasterizerSgxd::InstallTier2() {
                    result.key, result.refusal);
         c->program = std::move(*result.program);
         LOG_INFO(Render,
-                 "tier 2 fragment program {:016x}: {} words to {}, {} temps to {}, emitted in {} "
-                 "us ({} cycles), program {:016x}",
-                 result.key, words_before, f.usse.primary.size(), temps_before, f.usse.temp_count,
-                 result.took_us, result.took_cycles, ProgramHash(f.usse));
-        // In place: last_fragment, and any draw's reference, sees the new program.
-        *old = std::move(f);
+                 "tier 2 fragment config {:016x}: emitted in {} us ({} cycles), program {:016x}, "
+                 "for {} programs",
+                 result.key, result.took_us, result.took_cycles, ProgramHash(*c->program),
+                 c->waiting.size());
+        for (const u64 key : std::exchange(c->waiting, {})) {
+            InstallFragmentTier2(key, *c->program);
+        }
     }
 }
 
@@ -3407,12 +3546,7 @@ void RasterizerSgxd::InstallVertexTier2(ShaderTier2::Result& result) {
     v.usse = std::move(*result.program);
     ResolveVertexProgram(v);
     v.input_regs = result.input_regs;
-    v.primary_doutu0 = sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
-                                           backend.PlaceCode(0, v.usse.primary), v.usse.temp_count);
-    v.secondary_doutu0 = v.usse.secondary.empty()
-                             ? DummyVertexSecondary
-                             : sgxd_program_doutu0(SgxdBackend::HeapCodeBase(0),
-                                                   backend.PlaceCode(0, v.usse.secondary), 0);
+    PlaceVertexCode(v);
     v.draws = old->draws;
     v.tier2_queued = true;
     LOG_INFO(Render,
@@ -3420,6 +3554,7 @@ void RasterizerSgxd::InstallVertexTier2(ShaderTier2::Result& result) {
              "cycles), program {:016x}",
              result.key, words_before, v.usse.primary.size(), temps_before, v.usse.temp_count,
              result.took_us, result.took_cycles, ProgramHash(v.usse));
+    FreeProgramCode(old->code);
     *old = std::move(v);
 }
 
@@ -3450,22 +3585,15 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
     }
 
     std::vector<u64> code = g.primary;
-    // sgxd_flags fswhite=1: every fragment white, whatever the program computed (which still
-    // runs, kills included); fswhite=2: the program replaced by the white write alone (no
-    // kill): the vertex side and the rasterisation on their own.
-    // gxm_flags fsonly=N (with fswhite or fscut): those probes on the program whose key's low 32
-    // bits are N alone (drawkeys logs each draw's key).
-    static const u32 fs_only = GxmFlagValue("fsonly");
-    static const u32 fs_only_more[7] = {GxmFlagValue("fsonly2"), GxmFlagValue("fsonly3"),
-                                        GxmFlagValue("fsonly4"), GxmFlagValue("fsonly5"),
-                                        GxmFlagValue("fsonly6"), GxmFlagValue("fsonly7"),
-                                        GxmFlagValue("fsonly8")};
-    const bool probed = fs_only == 0 || static_cast<u32>(hash) == fs_only ||
-                        std::find(std::begin(fs_only_more), std::end(fs_only_more),
-                                  static_cast<u32>(hash)) != std::end(fs_only_more);
-    if (fs_only != 0) {
-        LOG_INFO(Render, "fsonly {:#010x}: program {:016x} {}", fs_only, hash,
-                 probed ? "probed" : "kept");
+    // sgxd_flags fswhite=1: every fragment white, the program still run (kills included); fswhite=2:
+    // the program replaced by the white write alone. fsonly=N: those probes only on the programs whose
+    // keys' low 32 bits are N (drawkeys logs each draw's key).
+    static const std::vector<u32> fs_only = SgxdFlagValues("fsonly");
+    const u32 key = static_cast<u32>(hash);
+    const bool probed =
+        fs_only.empty() || std::find(fs_only.begin(), fs_only.end(), key) != fs_only.end();
+    if (!fs_only.empty()) {
+        LOG_INFO(Render, "fsonly: program {:016x} {}", hash, probed ? "probed" : "kept");
     }
     const u32 fs_white = probed ? SgxdFlagValue("fswhite") : 0;
     std::span<const u32> phase_starts = g.phase_starts;
@@ -3524,13 +3652,16 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
         code.push_back((PackToOutput & ~PackMask) | u64{epilogue.mask} << 34);
     }
     const std::size_t code_words = code.size();
-    const u32 doutu0 = sgxd_program_doutu0(
-        SgxdBackend::HeapCodeBase(1),
-        backend.PlaceCodePhased(1, std::move(code), phase_starts, g.temp_count), g.temp_count);
-    f.secondary_doutu0 = g.secondary.empty()
-                             ? DummyPixelSecondary
-                             : sgxd_program_doutu0(SgxdBackend::HeapCodeBase(1),
-                                                   backend.PlaceCode(1, g.secondary), 0);
+    const u32 primary = backend.PlaceCodePhased(1, std::move(code), phase_starts, g.temp_count);
+    const u32 doutu0 = sgxd_program_doutu0(SgxdBackend::HeapCodeBase(1), primary, g.temp_count);
+    f.code = {primary, static_cast<u32>(code_words * sizeof(u64)), 0, 0};
+    f.secondary_doutu0 = DummyPixelSecondary;
+    if (!g.secondary.empty()) {
+        const u32 secondary = backend.PlaceCode(1, g.secondary);
+        f.secondary_doutu0 = sgxd_program_doutu0(SgxdBackend::HeapCodeBase(1), secondary, 0);
+        f.code[2] = secondary;
+        f.code[3] = static_cast<u32>(g.secondary.size() * sizeof(u64));
+    }
     f.primary_doutu0 = doutu0;
 
     ASSERT_MSG(g.inputs.size() <= f.iterators.size(),
@@ -5211,6 +5342,13 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const u32 width = fb.GetWidth(), height = fb.GetHeight();
     const ColourBuffer target{colour, width, height, fb.color_format,
                               FramebufferRegs::BytesPerColorPixel(fb.color_format)};
+    // A draw whose texture reads bytes the open pass drew: guest memory holds them only once the pass
+    // ended, so it ends here. Bytes no
+    // draw covered are guest memory's still.
+    TextureReads(is_indexed, immediate, count);
+    if (backend.InPass() && TexturesReadPassColour()) {
+        EndPass("a draw reading its own colour buffer");
+    }
     if (backend.InPass() &&
         (pass_colour.addr != colour || pass_colour.width != width ||
          pass_colour.height != height || pass_colour.format != fb.color_format ||
@@ -5385,6 +5523,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         backend.SetBackgroundStencil(bg_stencil);
         pass_bg_depth = bg_depth;
         pass_bg_stencil = bg_stencil;
+        pass_open_draws = backend.PassDraws();
         pass_drawn_lo = pass_drawn_hi = 0;
     }
     // Without a clear, the depth is what the last pass on the buffer stored, or what guest

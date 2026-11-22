@@ -348,6 +348,7 @@ static uint32_t active_cpu_mask(void) {
 // 27: azaharAttach and azaharDetach gone, and the cross-core maintenance with them: one
 //     emulation thread, one attached core.
 // 29: azaharShellCdram, the shell's 16 MiB of CDRAM the app's while sgxd holds the GPU.
+// 30: VFP short vectors in the vector: azaharVfpPatch and svc AZAHAR_VFP_SVC (AZAHAR_FAST_VFP).
 int azaharVersion() {
     return 5;
 }

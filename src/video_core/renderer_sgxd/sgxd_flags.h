@@ -108,7 +108,7 @@ namespace GxmRenderer {
  *             eotmixnomask with no ISP mask over the part's margin; eotmixpart: the probe's 26x16 render
  *             stores a game's part (x 16..416, y 0..240 of its transpose)
  *   fsonly=N  fswhite and fscut on the program whose key's low 32 bits are N alone
- *             (drawkeys logs each draw's fs key); fsonly2..fsonly4 name more
+ *             (drawkeys logs each draw's fs key; the word repeated names more)
  *   fscut=N   a single-phase fragment program cut to its first N instructions, then the white
  *             write: bisecting which instruction a draw's time goes to
  *   fswhite=1 every fragment white, the program still run (kills included); fswhite=2 the

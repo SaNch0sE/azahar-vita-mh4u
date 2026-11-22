@@ -566,13 +566,83 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     return r;
 }
 
+void SgxdBackend::ReleaseCode() {
+    std::erase_if(code_pending, [this](const CodeRange& r) {
+        if (r.mark > passes) {
+            return false; // the open pass may run it
+        }
+        const u32 at = passes - r.mark < PassFences ? r.mark : passes - PassFences + 1;
+        if (r.mark != 0 && !RenderReached(pass_fences[at % PassFences])) {
+            return false;
+        }
+        const auto it =
+            std::lower_bound(code_free.begin(), code_free.end(), r.offset,
+                             [](const CodeRange& f, u32 offset) { return f.offset < offset; });
+        const auto placed = code_free.insert(it, {r.offset, r.bytes, 0});
+        if (placed + 1 != code_free.end() && placed->offset + placed->bytes == placed[1].offset) {
+            placed->bytes += placed[1].bytes;
+            code_free.erase(placed + 1);
+        }
+        if (placed != code_free.begin() && placed[-1].offset + placed[-1].bytes == placed->offset) {
+            placed[-1].bytes += placed->bytes;
+            code_free.erase(placed);
+        }
+        return true;
+    });
+}
+
+u32 SgxdBackend::AllocateCode(u32 bytes) {
+    const u32 need = AlignUp(bytes, 16);
+    for (;;) {
+        ReleaseCode();
+        for (auto it = code_free.begin(); it != code_free.end(); ++it) {
+            if (it->bytes >= need) {
+                const u32 at = it->offset;
+                it->offset += need;
+                it->bytes -= need;
+                if (it->bytes == 0) {
+                    code_free.erase(it);
+                }
+                return at;
+            }
+        }
+        const u32 at = AlignUp(code_used, 16);
+        if (at + need <= CodeSize) {
+            code_used = at + need;
+            return at;
+        }
+        ASSERT_MSG(!code_pending.empty() && code_pending.front().mark <= passes,
+                   "sgxd: the code heap is full ({} KiB, {} KiB free in pieces)", CodeSize >> 10,
+                   [this] {
+                       u32 sum = 0;
+                       for (const CodeRange& f : code_free) {
+                           sum += f.bytes;
+                       }
+                       return sum >> 10;
+                   }());
+        WaitPassMark(code_pending.front().mark, "the code heap's reuse");
+    }
+}
+
+u32 SgxdBackend::CodeFree() {
+    ReleaseCode();
+    u32 free = CodeSize - AlignUp(code_used, 16);
+    for (const CodeRange& f : code_free) {
+        free += f.bytes;
+    }
+    return free;
+}
+
+void SgxdBackend::FreeCode(u32 offset, u32 bytes) {
+    if (bytes != 0) {
+        code_pending.push_back({offset, AlignUp(bytes, 16), PassMark()});
+    }
+}
+
 u32 SgxdBackend::PlaceCode(unsigned cb, std::span<const u64> words) {
     const u32 bytes = static_cast<u32>(words.size_bytes());
-    const u32 at = AlignUp(code_used, 16);
-    DEBUG_ASSERT_MSG(at + bytes <= CodeSize, "sgxd: the code heap is full ({} KiB)",
-                     CodeSize >> 10);
+    const u32 at = AllocateCode(bytes);
     std::memcpy(shared + code_begin + at, words.data(), bytes);
-    code_used = at + bytes;
 #ifdef VITA_DIAGNOSTICS
     placed_code.push_back({cb, at, bytes, at});
 #endif
@@ -581,8 +651,8 @@ u32 SgxdBackend::PlaceCode(unsigned cb, std::span<const u64> words) {
 
 u32 SgxdBackend::PlaceCodePhased(unsigned cb, std::vector<u64> words,
                                  std::span<const u32> phase_starts, u32 temps) {
-    // Where PlaceCode will put it, from the heap's start (HeapCodeBase(cb)).
-    const u32 offset = AlignUp(code_used, 16);
+    // Its place first: each PHAS names the next phase's address, from the heap's start.
+    const u32 offset = AllocateCode(static_cast<u32>(words.size() * sizeof(u64)));
     for (std::size_t k = 0; k + 1 < phase_starts.size(); k++) {
         u64& phas = words[phase_starts[k]];
         // 11111 010 s 100: OTHER2 PHAS; bit 50 PHAS_IMM.
@@ -592,9 +662,11 @@ u32 SgxdBackend::PlaceCodePhased(unsigned cb, std::vector<u64> words,
         DEBUG_ASSERT(exe < (1u << 20));
         phas = (phas & ~(0xffull << 32 | 0xfffffull)) | u64{(temps + 3) / 4} << 32 | exe;
     }
-    const u32 placed = PlaceCode(cb, words);
-    DEBUG_ASSERT(placed == offset);
-    return placed;
+    std::memcpy(shared + code_begin + offset, words.data(), words.size() * sizeof(u64));
+#ifdef VITA_DIAGNOSTICS
+    placed_code.push_back({cb, offset, static_cast<u32>(words.size() * sizeof(u64)), offset});
+#endif
+    return offset;
 }
 
 u32 SgxdBackend::AppendPds(const SgxdPdsProgram& program) {

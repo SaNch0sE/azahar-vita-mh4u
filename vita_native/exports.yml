@@ -39,5 +39,6 @@ azaharnative:
         - sgxdMapTables: 0x3C1A7E28
         - sgxdPte: 0x3C1A7E29
         - azaharShellCdram: 0x3C1A7E2B
+        - azaharVfpPatch: 0x3C1A7E2C
         - azaharModuleUid: 0x3C1A7E35
         - sgxdResetAll: 0x3C1A7E44

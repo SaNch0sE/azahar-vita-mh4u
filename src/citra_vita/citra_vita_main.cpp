@@ -462,13 +462,15 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const double tick_ms = BASE_CLOCK_RATE_ARM11 / 1e3;
                     LOG_INFO(Frontend,
                              "perf: guest {:.1f} ms, azaharRun {:.1f} ms, {} slices: svc {}, "
-                             "timer {}, faults {}; svcs answered in the guest: tick {}, cache "
-                             "{}, thread id {}, process id {}",
+                             "timer {}, faults {} (VFP short vectors {} in {}); svcs answered "
+                             "in the guest: tick {}, cache {}, thread id {}, process id {}, "
+                             "VFP {}",
                              n.guest_ticks / tick_ms, n.kernel_us / 1e3, n.slices,
                              n.reasons[AZAHAR_EXIT_SVC], n.reasons[AZAHAR_EXIT_TIMER],
                              n.slices - n.reasons[AZAHAR_EXIT_SVC] - n.reasons[AZAHAR_EXIT_TIMER],
-                             n.fast[AZAHAR_FAST_TICK], n.fast[AZAHAR_FAST_CACHE],
-                             n.fast[AZAHAR_FAST_THREAD_ID], n.fast[AZAHAR_FAST_PROCESS_ID]);
+                             n.vfp_insns, n.vfp_exits, n.fast[AZAHAR_FAST_TICK],
+                             n.fast[AZAHAR_FAST_CACHE], n.fast[AZAHAR_FAST_THREAD_ID],
+                             n.fast[AZAHAR_FAST_PROCESS_ID], n.fast[AZAHAR_FAST_VFP]);
                     std::vector<u32> order;
                     for (u32 i = 0; i < n.svcs.size(); i++) {
                         if (n.svcs[i] != 0) {

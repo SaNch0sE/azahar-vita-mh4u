@@ -5,6 +5,7 @@
 #include "core/arm/vita/arm_vita_native.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <iterator>
 #include <optional>
@@ -71,6 +72,278 @@ const char* ReasonName(u32 reason) {
     default:
         return "unknown exit";
     }
+}
+
+// ---------------------------------------------------------------------------- VFP short vectors
+// The A9 has no VFPv2 short vectors and traps every VFP data-processing instruction while FPSCR's
+// LEN or STRIDE is set: those run here, element by element, as scalars under the guest's FPSCR.
+
+constexpr u32 FpscrVectorBits = 0x00370000; // STRIDE (21:20) and LEN (18:16)
+/// The most VFP instructions one undefined-instruction exit runs.
+constexpr u32 MaxVfpRun = 64;
+
+enum class VfpOp { Mla, Mls, Nmls, Nmla, Mul, Nmul, Add, Sub, Div, Cpy, Abs, Neg, Sqrt };
+
+u32 ReadFpscr() {
+    u32 v;
+    asm volatile("vmrs %0, fpscr" : "=r"(v));
+    return v;
+}
+
+void WriteFpscr(u32 v) {
+    asm volatile("vmsr fpscr, %0" ::"r"(v) : "memory");
+}
+
+float VfpSingle(VfpOp op, float d, float n, float m) {
+    switch (op) {
+    case VfpOp::Mla:
+        asm volatile("vmla.f32 %0, %1, %2" : "+t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Mls:
+        asm volatile("vmls.f32 %0, %1, %2" : "+t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Nmls:
+        asm volatile("vnmls.f32 %0, %1, %2" : "+t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Nmla:
+        asm volatile("vnmla.f32 %0, %1, %2" : "+t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Mul:
+        asm volatile("vmul.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Nmul:
+        asm volatile("vnmul.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Add:
+        asm volatile("vadd.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Sub:
+        asm volatile("vsub.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Div:
+        asm volatile("vdiv.f32 %0, %1, %2" : "=t"(d) : "t"(n), "t"(m));
+        break;
+    case VfpOp::Cpy:
+        asm volatile("vmov.f32 %0, %1" : "=t"(d) : "t"(m));
+        break;
+    case VfpOp::Abs:
+        asm volatile("vabs.f32 %0, %1" : "=t"(d) : "t"(m));
+        break;
+    case VfpOp::Neg:
+        asm volatile("vneg.f32 %0, %1" : "=t"(d) : "t"(m));
+        break;
+    case VfpOp::Sqrt:
+        asm volatile("vsqrt.f32 %0, %1" : "=t"(d) : "t"(m));
+        break;
+    }
+    return d;
+}
+
+double VfpDouble(VfpOp op, double d, double n, double m) {
+    switch (op) {
+    case VfpOp::Mla:
+        asm volatile("vmla.f64 %P0, %P1, %P2" : "+w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Mls:
+        asm volatile("vmls.f64 %P0, %P1, %P2" : "+w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Nmls:
+        asm volatile("vnmls.f64 %P0, %P1, %P2" : "+w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Nmla:
+        asm volatile("vnmla.f64 %P0, %P1, %P2" : "+w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Mul:
+        asm volatile("vmul.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Nmul:
+        asm volatile("vnmul.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Add:
+        asm volatile("vadd.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Sub:
+        asm volatile("vsub.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Div:
+        asm volatile("vdiv.f64 %P0, %P1, %P2" : "=w"(d) : "w"(n), "w"(m));
+        break;
+    case VfpOp::Cpy:
+        asm volatile("vmov.f64 %P0, %P1" : "=w"(d) : "w"(m));
+        break;
+    case VfpOp::Abs:
+        asm volatile("vabs.f64 %P0, %P1" : "=w"(d) : "w"(m));
+        break;
+    case VfpOp::Neg:
+        asm volatile("vneg.f64 %P0, %P1" : "=w"(d) : "w"(m));
+        break;
+    case VfpOp::Sqrt:
+        asm volatile("vsqrt.f64 %P0, %P1" : "=w"(d) : "w"(m));
+        break;
+    }
+    return d;
+}
+
+/// Whether the condition `cond` (an instruction's top four bits) holds for the flags in `cpsr`.
+bool ConditionPasses(u32 cond, u32 cpsr) {
+    const bool n = cpsr >> 31 & 1, z = cpsr >> 30 & 1, c = cpsr >> 29 & 1, v = cpsr >> 28 & 1;
+    bool pass = true;
+    switch (cond >> 1) {
+    case 0:
+        pass = z;
+        break;
+    case 1:
+        pass = c;
+        break;
+    case 2:
+        pass = n;
+        break;
+    case 3:
+        pass = v;
+        break;
+    case 4:
+        pass = c && !z;
+        break;
+    case 5:
+        pass = n == v;
+        break;
+    case 6:
+        pass = !z && n == v;
+        break;
+    default:
+        return true; // AL
+    }
+    return (cond & 1) ? !pass : pass;
+}
+
+/// An ARM VFP data-processing instruction (cond 1110 .... 101x ...0, cond not 0xF).
+bool IsVfpDataProcessing(u32 insn) {
+    return (insn >> 28) != 0xF && (insn & 0x0F000E10) == 0x0E000A00;
+}
+
+struct VfpDecoded {
+    VfpOp op;
+    bool dp, two;
+    u32 d, n, m;
+};
+
+/// The VFPv2 data-processing forms; false for the ones not run here (fused, immediate, compare,
+/// convert, registers past d15).
+bool DecodeVfp(u32 insn, VfpDecoded& out) {
+    if ((insn & 0x0F000E10) != 0x0E000A00) {
+        return false;
+    }
+    const bool dp = insn >> 8 & 1;
+    const u32 pqr = (insn >> 21 & 4) | (insn >> 20 & 3);
+    const bool op6 = insn >> 6 & 1;
+    const u32 vd = insn >> 12 & 15, vn = insn >> 16 & 15, vm = insn & 15;
+    const u32 bd = insn >> 22 & 1, bn = insn >> 7 & 1, bm = insn >> 5 & 1;
+    VfpOp op;
+    bool two = false;
+    switch (pqr) {
+    case 0:
+        op = op6 ? VfpOp::Mls : VfpOp::Mla;
+        break;
+    case 1:
+        op = op6 ? VfpOp::Nmla : VfpOp::Nmls;
+        break;
+    case 2:
+        op = op6 ? VfpOp::Nmul : VfpOp::Mul;
+        break;
+    case 3:
+        op = op6 ? VfpOp::Sub : VfpOp::Add;
+        break;
+    case 4:
+        if (op6) {
+            return false;
+        }
+        op = VfpOp::Div;
+        break;
+    case 7: {
+        const u32 opc3 = insn >> 6 & 3;
+        two = true;
+        if (vn == 0 && opc3 == 1) {
+            op = VfpOp::Cpy;
+        } else if (vn == 0 && opc3 == 3) {
+            op = VfpOp::Abs;
+        } else if (vn == 1 && opc3 == 1) {
+            op = VfpOp::Neg;
+        } else if (vn == 1 && opc3 == 3) {
+            op = VfpOp::Sqrt;
+        } else {
+            return false;
+        }
+        break;
+    }
+    default:
+        return false;
+    }
+    // Singles s0-s31 in banks of eight, doubles d0-d15 in banks of four (VFPv2's sixteen).
+    if (dp && (bd || bm || (!two && bn))) {
+        return false;
+    }
+    out = {op, dp, two, dp ? vd : vd << 1 | bd, dp ? vn : vn << 1 | bn, dp ? vm : vm << 1 | bm};
+    return true;
+}
+
+/// The decoded instruction as azaharVfpPatch takes it (VfpOp's order is AZAHAR_VFP_OP_*'s).
+u32 VfpForm(const VfpDecoded& v) {
+    return static_cast<u32>(v.op) | (v.dp ? 1u << 4 : 0u) | (v.two ? 1u << 5 : 0u) | v.d << 8 |
+           v.n << 16 | v.m << 24;
+}
+static_assert(static_cast<u32>(VfpOp::Sqrt) == AZAHAR_VFP_OP_SQRT &&
+              static_cast<u32>(VfpOp::Mul) == AZAHAR_VFP_OP_MUL);
+
+/// Runs a VFP instruction under the guest's LEN and STRIDE; false for one DecodeVfp refuses.
+bool RunVfpVector(AzaharContext& ctx, u32 insn) {
+    VfpDecoded v;
+    if (!DecodeVfp(insn, v)) {
+        return false;
+    }
+    const VfpOp op = v.op;
+    const bool dp = v.dp, two = v.two;
+    const u32 d = v.d, n = v.n, m = v.m;
+    const u32 bank = dp ? 4 : 8;
+    const u32 stride_field = ctx.fpscr >> 20 & 3;
+    if (stride_field != 0 && stride_field != 3) {
+        return false; // UNPREDICTABLE strides
+    }
+    const u32 stride = stride_field == 3 ? 2 : 1;
+    // A destination in the first bank is a scalar whatever LEN says; a second operand there
+    // is the same scalar for every element (VFPv2's mixed vectors).
+    const u32 len = d < bank ? 1 : (ctx.fpscr >> 16 & 7) + 1;
+    // More elements than the bank holds at the stride is UNPREDICTABLE.
+    ASSERT_MSG(len * stride <= bank, "VFP vector {:08X}: LEN {} at stride {} over a bank of {}",
+               insn, len, stride, bank);
+    const bool m_scalar = m < bank;
+    const auto next = [&](u32 r) { return r / bank * bank + (r % bank + stride) % bank; };
+    const u32 host = ReadFpscr();
+    WriteFpscr(ctx.fpscr & ~FpscrVectorBits);
+    u32 di = d, ni = n, mi = m;
+    for (u32 e = 0; e < len; e++) {
+        if (dp) {
+            const auto get = [&](u32 r) {
+                return std::bit_cast<double>(u64{ctx.fpregs[r * 2]} | u64{ctx.fpregs[r * 2 + 1]}
+                                                                          << 32);
+            };
+            const u64 r = std::bit_cast<u64>(VfpDouble(op, get(di), two ? 0.0 : get(ni), get(mi)));
+            ctx.fpregs[di * 2] = static_cast<u32>(r);
+            ctx.fpregs[di * 2 + 1] = static_cast<u32>(r >> 32);
+        } else {
+            const auto get = [&](u32 r) { return std::bit_cast<float>(ctx.fpregs[r]); };
+            ctx.fpregs[di] =
+                std::bit_cast<u32>(VfpSingle(op, get(di), two ? 0.0f : get(ni), get(mi)));
+        }
+        di = next(di);
+        ni = next(ni);
+        if (!m_scalar) {
+            mi = next(mi);
+        }
+    }
+    const u32 flags = ReadFpscr();
+    WriteFpscr(host);
+    ctx.fpscr = (ctx.fpscr & FpscrVectorBits) | (flags & ~FpscrVectorBits);
+    return true;
 }
 
 // ---------------------------------------------------------------------------- VFP thunks
@@ -536,6 +809,321 @@ void ARM_VitaNative::Step() {
     RunSlice(MinQuantumNs);
 }
 
+void ARM_VitaNative::PatchVfp(u32 pc, u32 insn, bool thumb) {
+    // A trapping instruction becomes a branch to a thunk; out of reach or room, svc AZAHAR_VFP_SVC,
+    // which the module runs without an exit. The caller syncs the site's code.
+    VfpDecoded v;
+    if (InVfpArea(pc) || !DecodeVfp(insn, v)) {
+        return;
+    }
+    if (PatchVfpThunk(pc, insn, thumb)) {
+#ifdef VITA_DIAGNOSTICS
+        census.vfp_thunks++;
+#endif
+        return;
+    }
+    if (azaharVfpPatch(pc, VfpForm(v)) != 0) {
+        return;
+    }
+    if (thumb) {
+        memory.Write16(pc, 0xDF00 | AZAHAR_VFP_SVC);
+        memory.Write16(pc + 2, 0xBF00);
+    } else {
+        memory.Write32(pc, (insn & 0xF0000000u) | 0x0F000000u | AZAHAR_VFP_SVC);
+    }
+    vfp_patched[pc] = VfpSite{insn, thumb};
+#ifdef VITA_DIAGNOSTICS
+    census.vfp_svcs++;
+#endif
+}
+
+bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
+    VfpDecoded v;
+    if (!DecodeVfp(insn, v)) {
+        return false;
+    }
+    const u32 vector = context.fpscr & FpscrVectorBits;
+    const u32 stride_field = vector >> 20 & 3;
+    if (vector == 0 || (stride_field != 0 && stride_field != 3)) {
+        return false;
+    }
+    const u32 bank = v.dp ? 4 : 8;
+    const bool scalar = v.d < bank; // one element whatever LEN says
+    const u32 len = scalar ? 1 : (vector >> 16 & 7) + 1;
+    const u32 stride = stride_field == 3 ? 2 : 1;
+    const auto next = [&](u32 r) { return r / bank * bank + (r % bank + stride) % bank; };
+    // An element: the instruction, unconditional, on its registers.
+    const u32 al = (insn & 0x0FFFFFFFu) | 0xE0000000u;
+    const u32 fields = 0x0040F02Fu | (v.two ? 0u : 0x000F0080u);
+    const auto element = [&](u32 d, u32 n, u32 m) {
+        u32 e = al & ~fields;
+        if (v.dp) {
+            e |= d << 12 | m;
+            if (!v.two) {
+                e |= n << 16;
+            }
+        } else {
+            e |= (d >> 1) << 12 | (d & 1) << 22 | (m >> 1) | (m & 1) << 5;
+            if (!v.two) {
+                e |= (n >> 1) << 16 | (n & 1) << 7;
+            }
+        }
+        return e;
+    };
+    DEBUG_ASSERT_MSG(element(v.d, v.n, v.m) == al, "VFP thunk: {:08X} re-encoded as {:08X}", al,
+                     element(v.d, v.n, v.m));
+    std::array<u32, 8> elements{};
+    for (u32 k = 0, d = v.d, n = v.n, m = v.m; k < len; k++) {
+        elements[k] = element(d, n, m);
+        d = next(d);
+        n = next(n);
+        if (v.m >= bank) {
+            m = next(m);
+        }
+    }
+
+    // The area, mapped into this guest's table.
+    if (!vfp_area) {
+        vfp_area = std::make_unique<Common::HostSharedMemory>(VfpAreaSize, "azahar-vfp-thunks");
+        ASSERT_MSG(vfp_area->Data() != nullptr &&
+                       (reinterpret_cast<uintptr_t>(vfp_area->Data()) & 0xFFFu) == 0,
+                   "the VFP thunk area's {} KiB", VfpAreaSize >> 10);
+    }
+    if (vfp_area_map != map.get()) {
+        ForgetVfpPatches(vfp_area_map); // another guest's
+        map->MapExtra(VfpAreaBase, VfpAreaSize, vfp_area->Data());
+        vfp_area_map = map.get();
+    }
+    if (vfp_area_used + VfpThunkMax > VfpAreaSize) {
+        return false;
+    }
+    const u32 base = VfpAreaBase + vfp_area_used;
+
+    // The thunk goes to a buffer first: nothing changes unless every branch reaches.
+    std::array<u8, VfpThunkMax> buf{};
+    u32 size = 0;
+    const auto at = [&] { return base + size; };
+    const auto put16 = [&](u16 h) {
+        ASSERT(size + 2 <= VfpThunkMax);
+        std::memcpy(buf.data() + size, &h, 2);
+        size += 2;
+    };
+    const auto put32 = [&](u32 w) {
+        if (thumb) {
+            put16(static_cast<u16>(w >> 16));
+            put16(static_cast<u16>(w));
+        } else {
+            ASSERT(size + 4 <= VfpThunkMax);
+            std::memcpy(buf.data() + size, &w, 4);
+            size += 4;
+        }
+    };
+    const auto put_pair = [&](const std::array<u16, 2>& hw) {
+        put16(hw[0]);
+        put16(hw[1]);
+    };
+    const u32 back_to = pc + 4;
+    VfpThunk t{};
+    t.site = pc;
+    t.thumb = thumb;
+    const auto put_back = [&] {
+        if (thumb) {
+            const auto b = ThumbBranchW(at(), back_to);
+            if (!b) {
+                return false;
+            }
+            put_pair(*b);
+        } else {
+            const auto b = ArmBranch(0xE, at(), back_to);
+            if (!b) {
+                return false;
+            }
+            put32(*b);
+        }
+        return true;
+    };
+
+    // push {r0-r2}; mrs r1, apsr; vmrs r2, fpscr; and r2, r2, #LEN|STRIDE; the guard
+    if (thumb) {
+        put16(0xB407);
+        t.mrs = at();
+        put_pair({0xF3EF, 0x8100});
+        put32(0xEEF12A10);
+        put_pair(ThumbImmOp(0xF002, 2, FpscrVectorBits)); // and r2, r2, #imm
+        if (scalar) {
+            put16(0x2A00); // cmp r2, #0
+        } else {
+            put_pair(ThumbImmOp(0xF1B2, 0xF, vector)); // cmp r2, #vector
+        }
+    } else {
+        put32(0xE92D0007);
+        t.mrs = at();
+        put32(0xE10F1000);
+        put32(0xEEF12A10);
+        put32(0xE2022837);                                        // and r2, r2, #0x370000
+        put32(scalar ? 0xE3520000u : 0xE3520800u | vector >> 16); // cmp r2, #...
+    }
+    const u32 guard_at = at(); // its branch to the miss, filled in below
+    thumb ? put16(0) : put32(0);
+    // vmrs r0, fpscr; bic r0, r0, #LEN|STRIDE; vmsr fpscr, r0
+    put32(0xEEF10A10);
+    if (thumb) {
+        put_pair(ThumbImmOp(0xF020, 0, FpscrVectorBits)); // bic r0, r0, #imm
+    } else {
+        put32(0xE3C00837);
+    }
+    put32(0xEEE10A10);
+    t.elements = at();
+    for (u32 k = 0; k < len; k++) {
+        put32(elements[k]);
+    }
+    t.restore = at();
+    // vmrs r0, fpscr; orr r0, r0, r2; vmsr fpscr, r0; msr apsr_nzcvq, r1; pop {r0-r2}; b back
+    put32(0xEEF10A10);
+    if (thumb) {
+        put16(0x4310); // orrs r0, r2 (the flags come back below)
+    } else {
+        put32(0xE1800002);
+    }
+    put32(0xEEE10A10);
+    if (thumb) {
+        put_pair({0xF381, 0x8800});
+        put16(0xBC07);
+    } else {
+        put32(0xE128F001);
+        put32(0xE8BD0007);
+    }
+    t.back = at();
+    if (!put_back()) {
+        return false;
+    }
+    // miss: msr apsr_nzcvq, r1; pop {r0-r2}; the original; b back
+    t.miss = at();
+    if (thumb) {
+        put_pair({0xF381, 0x8800});
+        put16(0xBC07);
+        t.miss_original = at();
+        put32(insn);
+    } else {
+        put32(0xE128F001);
+        put32(0xE8BD0007);
+        t.miss_original = at();
+        put32(al);
+    }
+    t.miss_back = at();
+    if (!put_back()) {
+        return false;
+    }
+    t.end = at();
+    // The guard's branch: bne (beq for a scalar destination) to the miss.
+    const u32 cond = scalar ? 0x0u : 0x1u;
+    if (thumb) {
+        const s32 off = static_cast<s32>(t.miss - (guard_at + 4));
+        ASSERT(off >= -256 && off <= 254 && (off & 1) == 0);
+        const u16 b =
+            static_cast<u16>(0xD000u | cond << 8 | ((static_cast<u32>(off) >> 1) & 0xFFu));
+        std::memcpy(buf.data() + (guard_at - base), &b, 2);
+    } else {
+        const auto b = ArmBranch(cond, guard_at, t.miss);
+        ASSERT(b.has_value());
+        std::memcpy(buf.data() + (guard_at - base), &*b, 4);
+    }
+
+    std::array<u16, 2> site_hw{};
+    u32 site_word = 0;
+    if (thumb) {
+        const auto b = ThumbBranchW(pc, base);
+        if (!b) {
+            return false;
+        }
+        site_hw = *b;
+    } else {
+        const auto b = ArmBranch(insn >> 28, pc, base);
+        if (!b) {
+            return false;
+        }
+        site_word = *b;
+    }
+
+    std::memcpy(vfp_area->Data() + vfp_area_used, buf.data(), size);
+    map->SyncCode(base, size);
+    vfp_area_used += (size + 3) & ~3u;
+    vfp_thunks[base] = t;
+    if (thumb) {
+        memory.Write16(pc, site_hw[0]);
+        memory.Write16(pc + 2, site_hw[1]);
+    } else {
+        memory.Write32(pc, site_word);
+    }
+    vfp_patched[pc] = VfpSite{insn, thumb};
+    return true;
+}
+
+u32 ARM_VitaNative::FetchCode(u32 pc, bool thumb) const {
+    if (InVfpArea(pc) && vfp_area) {
+        const u8* const p = vfp_area->Data() + (pc - VfpAreaBase);
+        if (thumb) {
+            u16 hw[2];
+            std::memcpy(hw, p, 4);
+            return u32{hw[0]} << 16 | hw[1];
+        }
+        u32 w;
+        std::memcpy(&w, p, 4);
+        return w;
+    }
+    return thumb ? u32{memory.Read16(pc)} << 16 | memory.Read16(pc + 2) : memory.Read32(pc);
+}
+
+void ARM_VitaNative::PrepareSaveState() {
+    if (vfp_patched.empty()) {
+        return;
+    }
+    // Every thread that stands in a thunk leaves it (FinishVfpThunk): each core's running one,
+    // through the core, and every other one through its saved context.
+    for (u32 i = 0; i < system.GetNumCores(); i++) {
+        ARM_Interface& core = system.GetCore(i);
+        if (!InVfpArea(core.GetPC())) {
+            continue;
+        }
+        ThreadContext t;
+        core.SaveContext(t);
+        AzaharContext c{};
+        ToAzahar(t, c);
+        FinishVfpThunk(memory, c);
+        FromAzahar(c, t);
+        core.LoadContext(t);
+    }
+    auto& kernel = system.Kernel();
+    for (u32 i = 0; i < system.GetNumCores(); i++) {
+        auto& manager = kernel.GetThreadManager(i);
+        const Kernel::Thread* const running = manager.GetCurrentThread();
+        for (const auto& thread : manager.GetThreadList()) {
+            if (thread.get() == running || !InVfpArea(thread->context.cpu_registers[15] & ~1u)) {
+                continue;
+            }
+            AzaharContext c{};
+            ToAzahar(thread->context, c);
+            FinishVfpThunk(memory, c);
+            FromAzahar(c, thread->context);
+        }
+    }
+    // The guest's own instructions back; each traps and is patched again at its next run.
+    for (const auto& [pc, site] : vfp_patched) {
+        if (site.thumb) {
+            memory.Write16(pc, static_cast<u16>(site.insn >> 16));
+            memory.Write16(pc + 2, static_cast<u16>(site.insn));
+        } else {
+            memory.Write32(pc, site.insn);
+        }
+        map->SyncCode(pc, 4);
+    }
+    LOG_INFO(Core_ARM11, "VFP: {} patched sites restored for the savestate ({} thunks)",
+             vfp_patched.size(), vfp_thunks.size());
+    vfp_patched.clear();
+    vfp_thunks.clear();
+    vfp_area_used = 0;
+}
+
 bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     if (!usable) [[unlikely]] {
         system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
@@ -620,6 +1208,20 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
 
     switch (run.reason) {
     case AZAHAR_EXIT_SVC:
+        // A patched VFP instruction the module did not run: run here. One with no record is from a
+        // savestate made before the restore at each save, and is lost.
+        if (run.svc_number == AZAHAR_VFP_SVC) {
+            const bool thumb = context.cpsr >> 5 & 1;
+            const u32 site = context.r[15] - (thumb ? 2u : 4u);
+            const auto it = vfp_patched.find(site);
+            ASSERT_MSG(it != vfp_patched.end(),
+                       "svc {:#x} at {:08X} with no patched VFP instruction behind it (a savestate "
+                       "from a build that saved the module's svcs)",
+                       AZAHAR_VFP_SVC, site);
+            [[maybe_unused]] const bool ran = RunVfpVector(context, it->second.insn);
+            DEBUG_ASSERT_MSG(ran, "a patched VFP instruction at {:08X} did not run", it->first);
+            return !break_flag && !stop_requested;
+        }
         svc_context.CallSVC(run.svc_number);
         // An svc can reschedule, which replaces the register file wholesale.
         return !break_flag && !stop_requested;
@@ -641,7 +1243,39 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
         ReportFault(run);
         return false;
     }
-    case AZAHAR_EXIT_UND:
+    case AZAHAR_EXIT_UND: {
+        // VFP instructions under the guest's short vectors (RunVfpVector), ARM or Thumb-2: the trapped
+        // one and the data-processing ones after it run here.
+        if ((context.fpscr & FpscrVectorBits) != 0) {
+            u32 pc = context.r[15];
+            const bool thumb = context.cpsr >> 5 & 1;
+            DEBUG_ASSERT_MSG(!thumb || (context.cpsr & 0x0600FC00) == 0,
+                             "VFP short vectors in a Thumb IT block at {:08X}", pc);
+            u32 ran = 0;
+            for (; ran < MaxVfpRun; ran++) {
+                const u32 insn = FetchCode(pc, thumb);
+                const u32 cond = thumb ? 0xEu : insn >> 28;
+                // After the trapped one, only data-processing forms (Thumb-2's start 0xEE).
+                if (ran > 0 && (thumb ? (insn >> 24) != 0xEE : !IsVfpDataProcessing(insn))) {
+                    break;
+                }
+                if (cond == 0xF ||
+                    !(!ConditionPasses(cond, context.cpsr) || RunVfpVector(context, insn))) {
+                    break;
+                }
+                PatchVfp(pc, insn, thumb);
+                pc += 4;
+            }
+            if (ran > 0) {
+                // The patched instructions past the guest's instruction cache.
+                map->SyncCode(context.r[15], pc - context.r[15]);
+                context.r[15] = pc;
+                return !break_flag && !stop_requested;
+            }
+        }
+        ReportFault(run);
+        return false;
+    }
     case AZAHAR_EXIT_PABT:
     default:
         ReportFault(run);
@@ -696,8 +1330,10 @@ void ARM_VitaNative::ReportFault(const AzaharRunRequest& run) {
         registers += fmt::format("r{:02d} = {:08X}\n", i, context.r[i]);
     }
     const std::string message =
-        fmt::format("{}Guest {} at PC {:08X} (cpsr {:08X}), fsr {:08X} far {:08X}", registers,
-                    ReasonName(run.reason), context.r[15], context.cpsr, run.fsr, run.far);
+        fmt::format("{}Guest {} at PC {:08X} (cpsr {:08X}, fpscr {:08X}, fpexc {:08X}), fsr {:08X} "
+                    "far {:08X}",
+                    registers, ReasonName(run.reason), context.r[15], context.cpsr, context.fpscr,
+                    fpexc, run.fsr, run.far);
     LOG_CRITICAL(Core_ARM11, "{}", message);
     std::string code;
     for (u32 a = context.r[15] - 16; a <= context.r[15] + 12; a += 4) {

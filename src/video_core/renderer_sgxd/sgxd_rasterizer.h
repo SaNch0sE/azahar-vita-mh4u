@@ -282,6 +282,7 @@ private:
         u32 input_regs;
         u32 primary_doutu0;
         u32 secondary_doutu0;
+        std::array<u32, 4> code; ///< the primary's and secondary's offset and bytes (FreeCode)
         u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
         bool tier2_queued; ///< sent to the second tier (or never to be)
         std::vector<VertexSaSlot> sa_slots;
@@ -359,6 +360,7 @@ private:
         std::array<u32, 12> iterator_words;
         u32 iterator_count;
         Epilogue epilogue; ///< what its code ends with
+        std::array<u32, 4> code; ///< the primary's and secondary's offset and bytes (FreeCode)
         u32 draws;         ///< draws with the first tier's program, up to Tier2Draws
         bool tier2_queued; ///< sent to the second tier (or never to be)
         mutable std::vector<u32> sa_last;
@@ -521,6 +523,37 @@ private:
     const Texture& TextureFor(u32 unit);
     /// TextureFor from the unit's registers. `written`: the memo found a write over it.
     Texture& TextureFromRegs(u32 unit, bool written);
+    /// A vertex-side program's code into the heap: its DOUTU words and code ranges.
+    void PlaceVertexCode(VertexProgram& v);
+    void FreeProgramCode(const std::array<u32, 4>& code);
+    /// Every vertex-side and fragment program's code back to the heap and the programs
+    /// forgotten (and the states and layouts that point at them): the draws from here emit
+    /// theirs again. Draw runs it before it looks a program up, with the heap a quarter free.
+    void FlushPrograms();
+    u32 program_flushes = 0;
+    /// Where a texture unit's texels are in guest memory: a 2D chain or six cube faces, `bytes` each.
+    struct TextureExtent {
+        std::array<PAddr, 6> part_addr{};
+        u32 parts = 1;
+        u32 bytes = 0;
+        u32 levels = 1;
+        bool cube = false;
+    };
+    [[nodiscard]] TextureExtent TextureExtentFor(u32 unit) const;
+    /// The guest bytes a unit may read in this draw: its parts, or for a quad's one-level 2D texture
+    /// the tile rows its coordinates reach.
+    struct UnitRead {
+        u32 parts = 0;
+        std::array<PAddr, 6> lo{};
+        std::array<PAddr, 6> hi{};
+    };
+    void TextureReads(bool is_indexed, const float* immediate, u32 count);
+    /// Whether unit `unit`'s read (unit_reads) meets what the open pass drew (pass_drawn_*).
+    [[nodiscard]] bool UnitReadsDrawn(u32 unit) const;
+    /// The colour buffer tile rows the draw can write, as guest bytes; empty when none.
+    [[nodiscard]] std::pair<PAddr, PAddr> DrawnRows() const;
+    /// Whether an enabled texture unit the program samples reads bytes the open pass drew.
+    [[nodiscard]] bool TexturesReadPassColour() const;
     /// Whether the unit holds an ETC1A4 texture split into compressed colour and an A8 alpha texture.
     bool SplitAlpha(u32 unit) const;
     /// The alpha texture's words of a split unit from its colour's, over its A8 chain (swizzle R000).
@@ -756,6 +789,7 @@ private:
     /// `lines` lines of `line_bytes` from src to dst, strides apart, queued on the PTLA.
     void CopyLines(u32 src, u32 dst, u32 line_bytes, u32 lines, u32 src_stride, u32 dst_stride,
                    const char* what);
+    u32 pass_open_draws = 0;    // the backend's draws when Draw opened the pass (its loads)
     u16 gs_regs_loaded = 0;     // the GS input registers point-mode draws have loaded
     /// Each GS input register's row as the last draw that loaded it left it.
     std::array<u32, 16> gs_last_rows{};

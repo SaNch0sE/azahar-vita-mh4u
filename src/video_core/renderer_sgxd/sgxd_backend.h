@@ -90,9 +90,11 @@ public:
     /// The code heap's bytes free now: its free ranges and its unused end, once the code given
     /// back whose passes are done is free again.
     u32 CodeFree();
-    /// PlaceCode for a program of several phases: each phase's opening PHAS but the last's
-    /// (an immediate PHAS at phase_starts[k]) gets the next phase's execution address, the
-    /// DOUTU0 EXE field's instruction index from the code base, and the temps in fours.
+    /// Code no draw will run again (a program its second tier replaced): its bytes are PlaceCode's
+    /// again once every pass begun so far has finished; the kicks invalidate the code caches.
+    void FreeCode(u32 offset, u32 bytes);
+    /// PlaceCode for a program of several phases: each phase's opening PHAS but the last's (an
+    /// immediate PHAS at phase_starts[k]) gets the next phase's execution address and temps.
     u32 PlaceCodePhased(unsigned cb, std::vector<u64> words, std::span<const u32> phase_starts,
                         u32 temps);
     /// A per-draw PDS program placed in the flipping half (until that half is reused, at a pass
@@ -698,6 +700,17 @@ private:
 
     u32 code_begin{}; // the code heap in the shared block (code bases 2 and 3)
     u32 code_used{};  // its bytes
+    /// Code FreeCode gave back: waiting for the passes begun before (mark, PassMark's), and
+    /// free (by offset, neighbours merged), which AllocateCode takes first.
+    struct CodeRange {
+        u32 offset, bytes, mark;
+    };
+    std::vector<CodeRange> code_pending;
+    std::vector<CodeRange> code_free;
+    /// Where `bytes` of code go: the first free range they fit, else the heap's end; a heap
+    /// with neither waits for the code given back longest ago.
+    u32 AllocateCode(u32 bytes);
+    void ReleaseCode();
     /// Diagnostics: every program PlaceCode placed (bank, offset from the bank's base as the
     /// DOUTU takes it, bytes, place in the heap), written with the heap at a fault.
     struct PlacedCode {
