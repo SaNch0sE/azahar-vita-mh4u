@@ -11,6 +11,7 @@
 #include <tuple>
 #include <type_traits>
 #include <fmt/ranges.h>
+#include "common/alignment.h"
 #include "common/archives.h"
 #include "common/assert.h"
 #include "common/hash.h"
@@ -1353,14 +1354,25 @@ void RenderThread::HoldDraw(const DrawTextures& textures, u32 count, bool vertic
     if (once(held_colour, colour, colour_bytes)) {
         HoldWrite(colour, colour_bytes, PageHolds::Colour);
     }
-    // Depth is loaded from the guest's buffer when a pass starts from it there, and stored in
-    // the rasterizer's own depth stores, never into guest memory.
+    // Depth is loaded from the guest's buffer when a pass starts from it there and kept in the
+    // rasterizer's depth stores; into guest memory only when something reads the buffer (the GPU,
+    // under that read's hold, or the guest and HLE, which the published bytes keep closed). Held as
+    // the GPU's write, as the colour is.
     if (om.depth_test_enable || (fb.allow_depth_stencil_write && om.depth_write_enable) ||
         om.stencil_test.enable) {
         const PAddr depth = fb.GetDepthBufferPhysicalAddress();
         const u32 depth_bytes = pixels * Pica::FramebufferRegs::BytesPerDepthPixel(fb.depth_format);
         if (once(held_depth, depth, depth_bytes)) {
-            HoldRead(depth, depth_bytes, PageHolds::Depth);
+            HoldWrite(depth, depth_bytes, PageHolds::Depth);
+        }
+        // Its whole pages watched as a texture's are, past that hold: the store is newer than the guest's
+        // bytes until something writes them, and the guest's own write there (the buffer freed) ends that
+        // in the queue's order (GuestWrote). The pages shared at its ends are not watched: the rasterizer
+        // compares their bytes before a write-back (DepthEdgesWritten).
+        const PAddr whole = Common::AlignUp(depth, Memory::CITRA_PAGE_SIZE);
+        const PAddr whole_end = Common::AlignDown(depth + depth_bytes, Memory::CITRA_PAGE_SIZE);
+        if (whole < whole_end) {
+            page_holds.Watch(whole, whole_end - whole);
         }
     }
     if (vertices) {

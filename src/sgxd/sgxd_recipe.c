@@ -1135,6 +1135,15 @@ void sgxd_recipe_set_zls_to(SgxdRecipe* r, uint32_t depth, uint32_t stencil, int
     }
 }
 
+void sgxd_recipe_set_zls_words(SgxdRecipe* r, uint32_t depth, uint32_t stencil, uint32_t words,
+                               uint32_t format) {
+    sgxd_recipe_set_zls_to(r, depth, stencil, 1, words, stencil);
+    // The store format (bits 26..24): I24ZI8S, which, as its load does, takes the stencil into
+    // the word (SSTOREEN stays, STENCIL_STORE_BASE off), or I16ZI16Z, no stencil.
+    r->zls[0] |= format << 24;
+    r->zls[4] = 0;
+}
+
 void sgxd_recipe_write_vertex_sa(const SgxdRecipe *r, void *memory_, const float sa[4]) {
     uint32_t *words = (uint32_t *)((uint8_t *)memory_ + r->vertex_sa);
     for (unsigned n = 0; n < 4; n++) {

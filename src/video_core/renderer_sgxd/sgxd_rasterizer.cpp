@@ -1162,6 +1162,8 @@ bool RasterizerSgxd::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig
     if (backend.InPass() && PassOverlaps(output, output + bytes)) {
         EndPass("a display transfer over its buffers");
     }
+    // A depth buffer's input reads the depth a pass left there.
+    WriteDepthBack(input, input + in_bytes, "a display transfer from a depth buffer");
     DEBUG_ASSERT_MSG(f.code != 0xff && f.code != SgxdBackend::UntileEtc1 &&
                          f.code != SgxdBackend::UntileEtc1A4 && in_width % 8 == 0 &&
                          in_width <= SgxdBackend::UntileSide && in_height % 8 == 0 &&
@@ -1508,6 +1510,8 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     if (backend.InPass() && PassColourOverlaps(src, src + size)) {
         EndPass("a DMA from its colour buffer");
     }
+    // From a depth buffer, the depth a pass left there.
+    WriteDepthBack(src, src + size, "a DMA from a depth buffer");
     // A supersampled buffer's live 1x picture is read in the game's layout (SupersampledSource).
     const PAddr read = SupersampledSource(src, size);
     DEBUG_ASSERT_MSG(read == src || size % 4 == 0,
@@ -1543,7 +1547,8 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     // As rows of 4096 words (under the PTLA's 64 KiB stride) and a last partial row; strided lines a
     // row each.
     constexpr u32 RowPixels = 4096;
-    const u32 pixels = strided ? line / 4 * lines : size / 4;
+    const u32 pixels = strided ? line / 4 * lines : (bytes ? size : size / 4);
+    const u32 pixel_bytes = bytes ? 1 : 4;
     const SgxdPtlaCopy copy =
         strided
             ? SgxdPtlaCopy{read, dst, SGXD_PTLA_8888, src_stride, line / 4, lines, 0, dst_stride}
@@ -2250,6 +2255,101 @@ std::pair<PAddr, PAddr> RasterizerSgxd::DrawnRows() const {
     return {addr + first * tile_row, addr + (last + 1) * tile_row};
 }
 
+const RasterizerSgxd::DepthStore* RasterizerSgxd::DepthWordsForTexture(PAddr addr, u32 width,
+                                                                      u32 height, u32 levels,
+                                                                      bool cube, u32 parts,
+                                                                      u32& first_row) const {
+    if (cube || levels != 1 || parts != 1 || height < 8) {
+        return nullptr;
+    }
+    // The words are D24S8's I24ZI8S, four bytes a pixel as the guest's, so an RGBA8 texture's texels
+    // are those bytes. W depths take the CPU's conversion (WDepthToGuest); a 2x store's words are its
+    // samples' rows. The store is the buffer's depth, kept on the GPU.
+    constexpr u32 d24s8 = static_cast<u32>(FramebufferRegs::DepthFormat::D24S8);
+    for (const DepthStore& d : depth_stores) {
+        if (!d.valid || d.samples != 1 || d.ta_w || d.format != d24s8 || addr < d.addr ||
+            addr >= d.addr + d.width * d.height * 4) {
+            continue;
+        }
+        const u32 strip = d.width * 8 * 4;
+        first_row = (addr - d.addr) / strip * 8;
+        if (width == d.width && (addr - d.addr) % strip == 0 && first_row + height <= d.height &&
+            (width * d.quarters) % 4 == 0 && (height * d.quarters) % 4 == 0 &&
+            ((d.margin + first_row) * d.quarters) % 4 == 0) {
+            return &d;
+        }
+    }
+    return nullptr;
+}
+
+RasterizerSgxd::DepthStore* RasterizerSgxd::DepthWordsForUnit(u32 unit) {
+    const auto t = regs.texturing.GetTextures()[unit];
+    const auto& c = t.config;
+    if (!t.enabled || t.format != Pica::TexturingRegs::TextureFormat::RGBA8 || c.width < 8 ||
+        c.height < 8) {
+        return nullptr;
+    }
+    const TextureExtent e = TextureExtentFor(unit);
+    u32 first_row = 0;
+    return const_cast<DepthStore*>(DepthWordsForTexture(c.GetPhysicalAddress(), c.width,
+                                                        c.height, e.levels, e.cube, e.parts,
+                                                        first_row));
+}
+
+bool RasterizerSgxd::WriteDepthWords(u32 unit, const char* why) {
+    DepthStore* d = DepthWordsForUnit(unit);
+    if (!d) {
+        return false;
+    }
+    // A pass open (or parked) that changed the buffer's depth stores it at its end; one that only
+    // tested it leaves the words current.
+    const auto open_over = [&](const DepthStore& s) {
+        const PAddr end = s.addr + s.width * s.height * 4;
+        const auto over = [&](PAddr depth, const ColourBuffer& c, u32 depth_bytes, bool kept) {
+            return kept && s.addr < depth + c.width * c.height * depth_bytes && depth < end;
+        };
+        return backend.InPass() &&
+               (over(pass_depth, pass_colour, pass_depth_bytes,
+                     pass_depth_cleared || pass_depth_written) ||
+                (backend.HasParked() &&
+                 over(parked_pass.depth, parked_pass.colour, parked_pass.depth_bytes,
+                      parked_pass.depth_cleared || parked_pass.depth_written)));
+    };
+    if (d->words_current && !open_over(*d)) {
+        return true;
+    }
+    // The words' render is a pass of its own: none stays open. A pass's end may make the store anew:
+    // looked up again.
+    while (backend.InPass()) {
+        EndPass(why);
+    }
+    d = DepthWordsForUnit(unit);
+    if (!d) {
+        return false;
+    }
+    if (d->words_current) {
+        return true;
+    }
+    // A clear quad's depth is the buffer's.
+    SettleDepthClear(*d);
+    if (!d->words.cpu) {
+        d->words = backend.AllocSurface(d->store.width, WordsRows(*d),
+                                        d->Scaled() || d->samples != 1);
+    }
+    backend.DepthToWords(d->store, d->words);
+    // The textures over the buffer are copied from the words again (after TexturesWritten, which
+    // clears words_current).
+    TexturesWritten(d->addr, d->addr + d->width * d->height * 4);
+    d->words_current = true;
+    if (depth_word_renders++ < 4) {
+        LOG_INFO(Render,
+                 "sgxd: {}: the depth buffer at {:#x} ({}x{}, {}/4x, margin {}) read from its "
+                 "words, guest memory left as it is",
+                 why, d->addr, d->width, d->height, d->quarters, d->margin);
+    }
+    return true;
+}
+
 void RasterizerSgxd::TextureReads(bool is_indexed, const float* immediate, u32 count) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
@@ -2399,6 +2499,7 @@ RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written)
     it->in_place = cube || etc1a4_levels;
     it->alpha_one = t.format == Pica::TexturingRegs::TextureFormat::RG8;
     it->byte_swizzle = 0;
+    it->gpu_width = it->gpu_height = 0;
     // Each FCRAM part moves to CDRAM here, under the draw's read hold. A texture past VRAM's end reads
     // on into the filler past it (GuestGpuMemory::PastVramBytes); the tiny decode on the CPU has none.
     const bool tiny_cut = (width < 8 || height < 8) && ReadableBytes(part_addr[0], bytes) < bytes;
@@ -2762,30 +2863,43 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[
     DEBUG_ASSERT_MSG(dadjust <= 63,
                      "sgxd: texture unit {}: LOD bias {} is past DADJUST's range", unit,
                      static_cast<s32>(c.lod.bias) / 256.0f);
-    // U8U8U8U8, ABGR (R the lowest byte), LINEAR or a CUBE of SWIZZLED faces (log2 sizes);
-    // a 2D ETC1, and a split ETC1A4's colour, a SWIZZLED chain of its blocks
-    // (SgxdBackend::QueueUntile; TEXFEXT and 0x04, log2 sizes; an ETC1 cube's faces are
-    // untiled); NORM.
-    if (tex.stride > tex.width) {
+    // U8U8U8U8 (R the lowest byte), LINEAR or a CUBE of SWIZZLED faces; a 2D ETC1 (and a split
+    // ETC1A4's colour) a SWIZZLED chain of its blocks; NORM. A scaled copy has its own sides.
+    const u32 tex_width = tex.gpu_width != 0 ? tex.gpu_width : tex.width;
+    const u32 tex_height = tex.gpu_height != 0 ? tex.gpu_height : tex.height;
+    if (tex.stride > tex_width) {
         // LINEAR_STRIDED: its stride (in words less one) takes DADJUST's, MIPMAPCLAMP's and the
         // minification filters' bits, so one level, no bias, the magnification filter for both. REPEAT
         // and MIRROR wrap over each side rounded up to a power of two (exact on a power-of-two side).
-        const bool pot = std::has_single_bit(tex.width) && std::has_single_bit(tex.height);
+        const bool pot = std::has_single_bit(tex_width) && std::has_single_bit(tex_height);
         DEBUG_ASSERT_MSG(min == mag &&
                              (pot || (AddressMode(c.wrap_s) == 2 && AddressMode(c.wrap_t) == 2)),
                          "sgxd: texture unit {}: a {}x{} texture (rows {} apart) with filters {} "
                          "{} or wrap {} {}: LINEAR_STRIDED magnifies and minifies alike, and "
                          "repeats or mirrors over a power of two",
-                         unit, tex.width, tex.height, tex.stride, mag, min,
+                         unit, tex_width, tex_height, tex.stride, mag, min,
                          static_cast<u32>(c.wrap_s.Value()), static_cast<u32>(c.wrap_t.Value()));
         const u32 internal = tex.stride - 1;
         words[0] = (internal >> 3 & 0x3ffu) << 17 | mag << 12 | (internal & 7u) << 9 | addressing |
                    (internal >> 13 & 3u) << 1;
-        words[1] = 6u << 29 | 0x0cu << 24 | (tex.width - 1) << 12 | (tex.height - 1);
+        words[1] = 6u << 29 | 0x0cu << 24 | (tex_width - 1) << 12 | (tex_height - 1);
         words[2] = tex.memory.gpu;
         words[3] = 1u << 31 | (tex.alpha_one ? 4u << 28 : 0u);
         return tex;
     }
+    // A scaled copy of a power-of-two texture is none: repeat and mirror wrap over its sides rounded
+    // up. Inside the texture the texels agree; past an edge a read gets the last row or column.
+#ifdef VITA_DIAGNOSTICS
+    if (tex.gpu_width != 0 &&
+        !(std::has_single_bit(tex_width) && std::has_single_bit(tex_height)) &&
+        (AddressMode(c.wrap_s) != 2 || AddressMode(c.wrap_t) != 2) && scaled_wraps++ < 4) {
+        LOG_INFO(Render,
+                 "sgxd: texture unit {}: a {}x{} copy of a scaled picture with wrap {} {}: past "
+                 "its edges the last row or column, not the other edge",
+                 unit, tex_width, tex_height, static_cast<u32>(c.wrap_s.Value()),
+                 static_cast<u32>(c.wrap_t.Value()));
+    }
+#endif
     const bool etc1 = (tex.format == Pica::TexturingRegs::TextureFormat::ETC1 ||
                        tex.alpha_bytes != 0) &&
                       tex.parts == 1;
@@ -2797,7 +2911,7 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[
     const u32 code = tex.byte_swizzle != 0 ? 0x00u : 0x0cu;
     words[1] = etc1             ? (SgxdBackend::UntileEtc1 & 0x1fu) << 24 | log2_sizes
                : tex.parts == 6 ? 2u << 29 | code << 24 | log2_sizes
-                                : 3u << 29 | code << 24 | (tex.width - 1) << 12 | (tex.height - 1);
+                                : 3u << 29 | code << 24 | (tex_width - 1) << 12 | (tex_height - 1);
     words[2] = tex.memory.gpu | lod_min >> 2;
     // Swizzle 4 on U8U8U8U8: alpha one (bit 2).
     const u32 swizzle = tex.byte_swizzle != 0 ? tex.byte_swizzle : tex.alpha_one ? 4u : 0u;
@@ -2829,6 +2943,14 @@ void RasterizerSgxd::TexturesWritten(PAddr start, PAddr end) {
 #ifdef VITA_DIAGNOSTICS
     texture_stats.writes++;
 #endif
+    // A write over a depth buffer's bytes: its words are no longer the guest's.
+    for (DepthStore& d : depth_stores) {
+        const u32 bytes = FramebufferRegs::BytesPerDepthPixel(
+            static_cast<FramebufferRegs::DepthFormat>(d.format));
+        if (d.words_current && start < d.addr + d.width * d.height * bytes && d.addr < end) {
+            d.words_current = false;
+        }
+    }
     // A write into an upscaled buffer by anything but its own scaled pass: its picture is stale.
     for (Upscaled& u : upscaled) {
         if (&u != upscaled_writing && start < u.addr + u.bytes && u.addr < end) {
@@ -2937,6 +3059,9 @@ RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width,
                                         old->height * (old->stencil ? 5 : 4) / 4);
                 }
             }
+            if (d.words.cpu) {
+                backend.FreeSurface(d.words, d.store.width, WordsRows(d));
+            }
             d = DepthStore{addr, width, height, format, quarters, margin, samples};
             d.store = make();
             return d;
@@ -2993,8 +3118,325 @@ void RasterizerSgxd::DepthStoresWritten(PAddr start, PAddr end) {
             static_cast<FramebufferRegs::DepthFormat>(d.format));
         if (start < d.addr + d.width * d.height * bytes && d.addr < end) {
             d.valid = false;
+            d.SetGuestStale(false);
+            d.words_current = false;
             d.pending.reset();
+            // The write may be the GPU's, sent now: the edges change when it runs.
+            d.edges.clear();
+            d.gpu_wrote = true;
         }
+    }
+    // Their bytes the write's now: open to the guest as its holds allow.
+    DepthGuardsChanged();
+}
+
+void RasterizerSgxd::GuestWrote(PAddr address, u32 size) {
+    const PAddr end = address + size;
+    TexturesWritten(address, end);
+    // A depth buffer's whole pages: the guest's bytes are the newer from here in the queue's order, so
+    // a pass open on the buffer stores its depth first. A page it only shares says nothing.
+    const auto reaches = [&](const DepthStore& d) {
+        const u32 bytes = FramebufferRegs::BytesPerDepthPixel(
+            static_cast<FramebufferRegs::DepthFormat>(d.format));
+        const PAddr whole = Common::AlignUp(d.addr, Memory::CITRA_PAGE_SIZE);
+        const PAddr whole_end =
+            Common::AlignDown(d.addr + d.width * d.height * bytes, Memory::CITRA_PAGE_SIZE);
+        return address < whole_end && whole < end;
+    };
+    const bool reached = std::any_of(depth_stores.begin(), depth_stores.end(), reaches);
+    if (!reached) {
+        return;
+    }
+    if (backend.InPass() && PassOverlaps(address, end)) {
+        EndPass("a write of the guest's over its depth buffer");
+    }
+    DepthStoresWritten(address, end);
+}
+
+std::pair<u32, u32> RasterizerSgxd::DepthEdges(PAddr addr, PAddr end) {
+    const PAddr whole = Common::AlignUp(addr, Memory::CITRA_PAGE_SIZE);
+    const PAddr whole_end = Common::AlignDown(end, Memory::CITRA_PAGE_SIZE);
+    if (whole >= whole_end) {
+        return {end - addr, 0};
+    }
+    return {whole - addr, end - whole_end};
+}
+
+void RasterizerSgxd::NoteDepthEdges(DepthStore& d) {
+    d.edges.clear();
+    // A GPU write to the buffer's bytes sent since the last pass: read once it has run.
+    if (d.gpu_wrote) {
+        d.gpu_wrote = false;
+        d.gpu_write = backend.FenceAll();
+    }
+    if (d.gpu_write) {
+        if (!backend.RenderReached(*d.gpu_write)) {
+            return;
+        }
+        d.gpu_write.reset();
+    }
+    const u32 bytes = d.width * d.height *
+                      FramebufferRegs::BytesPerDepthPixel(
+                          static_cast<FramebufferRegs::DepthFormat>(d.format));
+    // FCRAM alone: no watch covers VRAM's whole pages either.
+    if (d.addr < Memory::FCRAM_PADDR || d.addr + bytes > Memory::FCRAM_PADDR_END) {
+        return;
+    }
+    const auto [head, tail] = DepthEdges(d.addr, d.addr + bytes);
+    if (head + tail == 0) {
+        return;
+    }
+    // Pages the CPU caches still (WouldMove, which does not count as a use).
+    if ((head != 0 && !guest_memory.WouldMove(d.addr, head)) ||
+        (tail != 0 && !guest_memory.WouldMove(d.addr + bytes - tail, tail))) {
+        return;
+    }
+    const u8* const guest = memory.GetPhysicalPointer(d.addr);
+    d.edges.resize(head + tail);
+    std::memcpy(d.edges.data(), guest, head);
+    std::memcpy(d.edges.data() + head, guest + bytes - tail, tail);
+}
+
+void RasterizerSgxd::DepthEdgesWritten(PAddr start, PAddr end) {
+    for (DepthStore& d : depth_stores) {
+        if (!d.valid || !d.guest_stale || d.edges.empty()) {
+            continue;
+        }
+        const u32 bytes = d.width * d.height *
+                          FramebufferRegs::BytesPerDepthPixel(
+                              static_cast<FramebufferRegs::DepthFormat>(d.format));
+        if (!(start < d.addr + bytes && d.addr < end)) {
+            continue;
+        }
+        const auto [head, tail] = DepthEdges(d.addr, d.addr + bytes);
+        const u8* const guest = memory.GetPhysicalPointer(d.addr);
+        if (std::memcmp(guest, d.edges.data(), head) == 0 &&
+            std::memcmp(guest + bytes - tail, d.edges.data() + head, tail) == 0) {
+            continue;
+        }
+        if (depth_edge_writes++ < 4) {
+            LOG_INFO(Render,
+                     "sgxd: the depth buffer at {:#x} ({}x{}, format {}): the guest wrote its "
+                     "bytes since its last pass, no write-back over them ({:#x}..{:#x} read)",
+                     d.addr, d.width, d.height, d.format, start, end);
+        }
+        d.valid = false;
+        d.SetGuestStale(false);
+        d.words_current = false;
+        d.pending.reset();
+        d.edges.clear();
+    }
+    DepthGuardsChanged();
+}
+
+bool RasterizerSgxd::DepthBackDue(PAddr start, PAddr end) const {
+    // The open (or parked) pass's depth, stored at its end when it changed it.
+    const auto open = [&](PAddr depth, const ColourBuffer& c, u32 depth_bytes, bool changed) {
+        return changed && start < depth + c.width * c.height * depth_bytes && depth < end;
+    };
+    if (backend.InPass() &&
+        (open(pass_depth, pass_colour, pass_depth_bytes,
+              pass_depth_cleared || pass_depth_written) ||
+         (backend.HasParked() && open(parked_pass.depth, parked_pass.colour,
+                                      parked_pass.depth_bytes,
+                                      parked_pass.depth_cleared || parked_pass.depth_written)))) {
+        return true;
+    }
+    return std::any_of(depth_stores.begin(), depth_stores.end(), [&](const DepthStore& d) {
+        const u32 bytes = FramebufferRegs::BytesPerDepthPixel(
+            static_cast<FramebufferRegs::DepthFormat>(d.format));
+        return d.valid && d.guest_stale && start < d.addr + d.width * d.height * bytes &&
+               d.addr < end && !DepthTilesFresh(d, start, end);
+    });
+}
+
+namespace {
+// The 8x8 tiles first..last of a depth buffer's bytes start..end (clipped to it), a row of width
+// / 8 tiles eight PICA rows tall.
+std::pair<u32, u32> DepthTileSpan(PAddr addr, u32 width, u32 height, u32 bytes, PAddr start,
+                                  PAddr end) {
+    const PAddr lo = std::max(start, addr), hi = std::min(end, addr + width * height * bytes);
+    return {(lo - addr) / (64 * bytes), (hi - 1 - addr) / (64 * bytes)};
+}
+} // Anonymous namespace
+
+bool RasterizerSgxd::DepthTilesFresh(const DepthStore& d, PAddr start, PAddr end) {
+    if (d.fresh.empty()) {
+        return false;
+    }
+    const u32 bytes =
+        FramebufferRegs::BytesPerDepthPixel(static_cast<FramebufferRegs::DepthFormat>(d.format));
+    const auto [first, last] = DepthTileSpan(d.addr, d.width, d.height, bytes, start, end);
+    for (u32 t = first; t <= last; t++) {
+        if ((d.fresh[t / 64] >> (t % 64) & 1) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+RasterizerSgxd::StorePart RasterizerSgxd::DepthPartFor(const DepthStore& d, PAddr start,
+                                                       PAddr end) {
+    // The transpose's columns are the buffer's memory rows, eight to a row of tiles: tiles of one
+    // memory row are columns 8m..8m + 8; tiles over two or more rows take those rows whole.
+    const u32 bytes =
+        FramebufferRegs::BytesPerDepthPixel(static_cast<FramebufferRegs::DepthFormat>(d.format));
+    const u32 per_row = d.width / 8;
+    const auto [first, last] = DepthTileSpan(d.addr, d.width, d.height, bytes, start, end);
+    const u32 m0 = first / per_row, m1 = last / per_row;
+    // The store grid's steps: columns in 8s, rows in 8s from a multiple of 16.
+    const StorePart p = m0 == m1 ? StorePart{8 * m0, 8 * (m0 + 1), first % per_row * 8 / 16 * 16,
+                                             (last % per_row + 1) * 8}
+                                 : StorePart{8 * m0, 8 * (m1 + 1), 0, d.width};
+    if (2 * (p.x1 - p.x0) * (p.y1 - p.y0) >= d.width * d.height) {
+        return {};
+    }
+    return p;
+}
+
+void RasterizerSgxd::WriteDepthBack(PAddr start, PAddr end, const char* why) {
+    DepthEdgesWritten(start, end);
+    if (!DepthBackDue(start, end)) {
+        return;
+    }
+    // The pass over it stores its depth at its end, and the write-back's renders are passes of their
+    // own: none stays open.
+    while (backend.InPass()) {
+        EndPass(why);
+    }
+    using DF = FramebufferRegs::DepthFormat;
+    for (DepthStore& d : depth_stores) {
+        const u32 bytes = FramebufferRegs::BytesPerDepthPixel(static_cast<DF>(d.format));
+        const PAddr d_end = d.addr + d.width * d.height * bytes;
+        if (!d.valid || !d.guest_stale || !(start < d_end && d.addr < end) ||
+            DepthTilesFresh(d, start, end)) {
+            continue;
+        }
+        // D24S8's words are the ZLS's I24ZI8S, D16's its I16ZI16Z, D24's the I24ZI8S words' three depth
+        // bytes; a scaled store gives each pixel the sample its centre falls in, a 2x one one of its two.
+        // W depths (1 - K / w) go in as they are and the CPU turns them into the PICA's (WDepthToGuest).
+        const DF df = static_cast<DF>(d.format);
+        const bool d16 = df == DF::D16;
+        const bool d24 = df == DF::D24;
+        ASSERT_MSG((d16 || d24 || df == DF::D24S8) && (!d.ta_w || (!d16 && d.ta_map.fitted)),
+                   "sgxd: {}: the depth buffer at {:#x} ({}x{}, format {}, {}/4x, margin {}, {} "
+                   "samples{}) read back: a D16 store of W depths, or W depths not fitted to the "
+                   "draws' projection, is not written back",
+                   why, d.addr, d.width, d.height, d.format, d.quarters, d.margin, d.samples,
+                   d.ta_w ? ", W depths" : "");
+        SettleDepthClear(d);
+        if (!d.words.cpu) {
+            d.words = backend.AllocSurface(d.store.width, WordsRows(d),
+                                           d.Scaled() || d.samples != 1);
+        }
+        // The buffer as a colour buffer of its words, low byte first, or of D16's two bytes a pixel.
+        const ColourBuffer as_colour =
+            d16   ? ColourBuffer{d.addr, d.width, d.height, FramebufferRegs::ColorFormat::RGB565, 2}
+            : d24 ? ColourBuffer{d.addr, d.width, d.height, FramebufferRegs::ColorFormat::RGB8, 3}
+                  : ColourBuffer{d.addr, d.width, d.height, FramebufferRegs::ColorFormat::RGBA8, 4};
+        // A buffer of a width no pass draws: the words go into its scratch, whole, and its rows of tiles
+        // into the buffer (NarrowScratch); both widths align to the same 32. Not one in FCRAM or of W
+        // depths (not built).
+        const NarrowScratch* const narrow =
+            NarrowWidth(as_colour) != 0 ? &NarrowScratchFor(as_colour) : nullptr;
+        ASSERT_MSG(!narrow || (!InFcram(d.addr) && !d.ta_w && d.quarters == 4 && d.margin == 0 &&
+                               d.samples == 1),
+                   "sgxd: {}: the depth buffer at {:#x} ({}x{}, format {}, {}/4x, margin {}, {} "
+                   "samples{}) read back: a buffer of a width no pass draws is written back only "
+                   "at 1x, out of FCRAM and without W depths",
+                   why, d.addr, d.width, d.height, d.format, d.quarters, d.margin, d.samples,
+                   d.ta_w ? ", W depths" : "");
+        ColourBuffer drawn = as_colour;
+        if (narrow) {
+            drawn.addr = narrow->surface.gpu;
+            drawn.width = narrow->scratch_width;
+            drawn.height = std::max(d.height, 32u);
+        }
+        SgxdBackend::PicaTarget t = PicaTargetFor(drawn, "a depth buffer written back");
+        t.pack = d16 ? SGXD_RECIPE_PACK_U16_RAW
+                 : d24 ? SGXD_RECIPE_PACK_U888
+                       : SGXD_RECIPE_PACK_U8888;
+        // The tiles the read takes alone, or the whole buffer when they are most of it; W depths and a
+        // narrow buffer's whole.
+        const StorePart part = d.ta_w || narrow ? StorePart{} : DepthPartFor(d, start, end);
+        t.x0 = part.x0;
+        t.x1 = part.x1;
+        t.y0 = part.y0;
+        t.y1 = part.y1;
+        backend.DepthToGuest(d.store, d.words, t, d16, d.quarters, d.margin, d.samples);
+        if (narrow) {
+            const u32 strip = d.width * 8 * bytes;
+            const u32 wide_strip = narrow->scratch_width * 8 * bytes;
+            backend.RenderBefore(narrow->surface.gpu,
+                                 narrow->surface.gpu + wide_strip * (d.height / 8),
+                                 "a narrow depth buffer's copy out");
+            CopyLines(narrow->surface.gpu, d.addr, strip, d.height / 8, wide_strip, strip,
+                      "a narrow depth buffer's copy out");
+        }
+        // The buffer's bytes change as the GPU runs it.
+        d.edges.clear();
+        d.gpu_wrote = false;
+        d.gpu_write = backend.FenceAll();
+        if (d.ta_w) {
+            WDepthToGuest(d);
+        }
+        // The bytes it writes count as a picture's copy in flight until the GPU is past it.
+        const u32 row = d.width * 8 * bytes;
+        copies_in_flight.push_back({part.x1 == 0 ? d.addr : d.addr + part.x0 / 8 * row,
+                                    part.x1 == 0 ? d_end : d.addr + part.x1 / 8 * row, 0});
+        if (part.x1 == 0) {
+            d.SetGuestStale(false);
+            TexturesWritten(d.addr, d_end);
+            // After TexturesWritten, which clears it for any other write.
+            d.words_current = !d.ta_w;
+        } else {
+            depth_writeback_parts++;
+            MarkDepthPartFresh(d, part);
+        }
+        const u32 kind = 1u << ((d16 ? 1 : 0) | (d.samples != 1 ? 2 : 0) | (d.Scaled() ? 4 : 0));
+        if (depth_writebacks++ < 4 || (depth_writeback_kinds & kind) == 0) {
+            depth_writeback_kinds |= kind;
+            LOG_INFO(Render,
+                     "sgxd: {} ({:#x}..{:#x}): the depth buffer at {:#x} ({}x{}, format {}, "
+                     "{}/4x, margin {}, {} samples) written back{}",
+                     why, start, end, d.addr, d.width, d.height, d.format, d.quarters, d.margin,
+                     d.samples,
+                     part.x1 == 0 ? std::string{}
+                                  : fmt::format(", its part {}..{} x {}..{}", part.x0, part.x1,
+                                                part.y0, part.y1));
+        }
+    }
+    const u64 fence = InterruptFence();
+    for (CopyInFlight& c : copies_in_flight) {
+        if (c.fence == 0) {
+            c.fence = fence;
+        }
+    }
+    PublishOwned();
+}
+
+void RasterizerSgxd::MarkDepthPartFresh(DepthStore& d, const StorePart& part) {
+    const u32 per_row = d.width / 8, tiles = per_row * (d.height / 8);
+    if (d.fresh.empty()) {
+        d.fresh.assign((tiles + 63) / 64, 0);
+    }
+    for (u32 m = part.x0 / 8; m < part.x1 / 8; m++) {
+        for (u32 c = part.y0 / 8; c < part.y1 / 8; c++) {
+            const u32 t = m * per_row + c;
+            d.fresh[t / 64] |= u64{1} << (t % 64);
+        }
+    }
+    // The bytes the part holds take their depth: textures over them are read again.
+    const u32 bytes =
+        FramebufferRegs::BytesPerDepthPixel(static_cast<FramebufferRegs::DepthFormat>(d.format));
+    const u32 row = d.width * 8 * bytes;
+    TexturesWritten(d.addr + part.x0 / 8 * row, d.addr + part.x1 / 8 * row);
+    u32 set = 0;
+    for (const u64 w : d.fresh) {
+        set += static_cast<u32>(std::popcount(w));
+    }
+    if (set == tiles) {
+        d.SetGuestStale(false);
     }
 }
 
@@ -3026,6 +3468,11 @@ void RasterizerSgxd::EndOnePass(const char* why) {
         }
     }
 #endif
+    // The colour it drew is what guest memory holds there now: a depth store over those bytes no
+    // longer has the guest's depth. Before this pass's own depth below.
+    if (pass_drawn_lo < pass_drawn_hi) {
+        DepthStoresWritten(pass_drawn_lo, pass_drawn_hi);
+    }
     // A pass that used depth keeps it for the next one on the buffer, stored (loaded first when it
     // was loaded, else filled with the clear). A clear no draw used is the store's fill alone; a pass
     // that neither cleared nor loaded it leaves the store stale. An unused depth in the bytes the
@@ -3072,11 +3519,23 @@ void RasterizerSgxd::EndOnePass(const char* why) {
             }
         }
         d.valid = true;
-        d.ta_w = pass_ta_w;
-        d.ta_map = pass_w_map;
+        // Loaded from the store and only tested: the store holds what it held, and its words, guest
+        // memory's copy and W mapping stay as current as they were.
+        const bool unchanged = pass_depth_load && !pass_depth_guest && !pass_depth_cleared &&
+                               !pass_depth_written;
+        if (!unchanged) {
+            d.SetGuestStale(true);
+            NoteDepthEdges(d);
+            d.ta_w = pass_ta_w;
+            d.ta_map = pass_w_map;
+            d.ta_k = w_depth_k;
+        }
     } else if (pass_depth_used) {
         DepthStoresWritten(pass_depth, pass_depth + s.width * s.height * pass_depth_bytes);
     }
+    // Published before the pass is sent: a store newer than guest memory keeps the buffer's pages
+    // closed once the GPU is past the pass (PublishOwned).
+    DepthGuardsChanged();
 #ifdef VITA_DIAGNOSTICS
     const u32 ended_quarters = pass_quarters;
 #endif
@@ -6518,7 +6977,9 @@ bool RasterizerSgxd::FillsClearQuad(bool is_indexed, const float* immediate, u32
         }
         d.pending = p;
         d.valid = true;
+        d.SetGuestStale(true);
         d.ta_w = false;
+        DepthGuardsChanged();
     }
     const auto filled_what = [&] {
         return fmt::format("{:#x} ({}x{}, part {}..{} x {}..{}): colour {:#x}{}{}", target.addr,
@@ -6822,6 +7283,30 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // ended, so it ends here. Bytes no
     // draw covered are guest memory's still.
     TextureReads(is_indexed, immediate, count);
+    // A texture over a depth buffer reads the depth a pass left there; only a unit the program samples.
+    u32 depth_units = 0;
+    for (u32 unit = 0; unit < 3; unit++) {
+        const UnitRead& r = unit_reads[unit];
+        for (u32 k = 0; k < r.parts; k++) {
+            depth_units |= DepthBackDue(r.lo[k], r.hi[k]) ? 1u << unit : 0u;
+        }
+    }
+    if (depth_units != 0) {
+        depth_units &= Usse::SampledTextureUnits(FragmentConfig());
+        for (u32 unit = 0; unit < 3; unit++) {
+            if ((depth_units >> unit & 1) == 0) {
+                continue;
+            }
+            // A texture the store's words serve takes them; any other read gets the depth written back.
+            if (WriteDepthWords(unit, "a draw reading a depth buffer")) {
+                continue;
+            }
+            const UnitRead& r = unit_reads[unit];
+            for (u32 k = 0; k < r.parts; k++) {
+                WriteDepthBack(r.lo[k], r.hi[k], "a draw reading a depth buffer");
+            }
+        }
+    }
     DEBUG_ASSERT_MSG(
         std::none_of(unit_reads.begin(), unit_reads.end(),
                      [&](const UnitRead& r) {
@@ -7019,11 +7504,17 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         float bg_depth = 1.0f;
         u32 bg_stencil = 0;
         if (TakeClear(depth, depth + width * height * pass_depth_bytes, depth_clear)) {
-            // The depth is the low 16 or 24 bits of each pixel; a fill of another width clears it only when its
-            // pattern repeats per pixel.
+            // The depth is the low 16 or 24 bits of each pixel; a fill of another width clears it
+            // only when its pattern repeats per pixel: halves alike over 2-byte pixels, or one byte
+            // throughout (a 3-byte depth cleared with a 4-byte fill of 0xffffffff).
             const u32 depth_bits = fb.depth_format == FramebufferRegs::DepthFormat::D16 ? 16 : 24;
             const u32 mask = (1u << depth_bits) - 1;
-            DEBUG_ASSERT_MSG(depth_clear.bytes == pass_depth_bytes ||
+            const u32 fill_mask =
+                depth_clear.bytes >= 4 ? 0xffffffffu : (1u << (8 * depth_clear.bytes)) - 1;
+            [[maybe_unused]] const bool one_byte =
+                (depth_clear.value & fill_mask) ==
+                ((depth_clear.value & 0xff) * 0x01010101u & fill_mask);
+            DEBUG_ASSERT_MSG(depth_clear.bytes == pass_depth_bytes || one_byte ||
                                  (depth_clear.bytes == 4 && pass_depth_bytes == 2 &&
                                   (depth_clear.value & 0xffff) == depth_clear.value >> 16),
                              "sgxd: {}: the depth buffer at {:#x} ({} bytes a pixel) was cleared "

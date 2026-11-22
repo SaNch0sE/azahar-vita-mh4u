@@ -198,10 +198,12 @@ public:
     }
     [[nodiscard]] const u8* HostOf(u32 page) const;
 
-    /// T12, texture write tracking: the FCRAM pages a texture is taken
-    /// from are watched, closed to the guest's writes on top of the holds, until the guest or
-    /// the HLE writes one (the caller marks the textures over it written, then Unwatch opens it
-    /// as its holds allow). A texture's next use watches its pages again.
+    /// Texture write tracking: the FCRAM pages a texture is taken from are watched, closed to
+    /// the guest's writes on top of the holds, until the guest or the HLE writes one (the caller
+    /// marks the textures over it written, then Unwatch opens it as its holds allow). A texture's
+    /// next use watches its pages again. The whole pages of a pass's depth buffer in FCRAM are
+    /// watched the same way (RenderThread::HoldDraw): its depth is in a store of the rasterizer's,
+    /// which a write of the guest's to the buffer's bytes makes the older.
     void Watch(PAddr addr, u32 bytes);
     [[nodiscard]] bool Watched(u32 page) const {
         return page < fcram_pages && watched[page] != 0;
@@ -359,7 +361,7 @@ private:
     /// a free one, else the nearer one; two grown into each other become one.
     static void AddRange(std::array<u16, 2>& lo, std::array<u16, 2>& hi, u16 l, u16 h);
     std::vector<u8> applied;       ///< Access, as the guest's view has it (after Apply)
-    std::vector<u8> watched;       ///< T12: FCRAM pages a texture is taken from (Watch)
+    std::vector<u8> watched;       ///< T12: FCRAM pages of a texture or a depth buffer (Watch)
     /// T12: a watched page's textures' bytes, as up to two ranges [lo, hi) (hi 0: none), and
     /// a count of the times it was watched anew (the stores beside them: StoreMisses).
     std::vector<std::array<u16, 2>> watch_lo, watch_hi;

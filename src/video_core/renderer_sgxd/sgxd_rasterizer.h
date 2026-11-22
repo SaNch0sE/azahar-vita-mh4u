@@ -113,12 +113,9 @@ public:
     void EndFrame() {
         frames++;
     }
-    /// The guest wrote a watched texture page (T12), or the HLE wrote [address, address + size)
-    /// (RenderThread's GuestWrote, Y2R's picture): the textures over it are untiled again at
-    /// their next use.
-    void GuestWrote(PAddr address, u32 size) {
-        TexturesWritten(address, address + size);
-    }
+    /// The guest wrote a watched page, or the HLE wrote [address, address + size): the textures over it
+    /// are untiled again, and a depth store whose buffer's whole pages it reaches is no longer newer.
+    void GuestWrote(PAddr address, u32 size);
     /// the late skip dropped a draw into `colour` with that viewport (RenderThread's LateDropped): a double
     /// render being skipped over that buffer (or its copy) never sees its blend back, so the
     /// skipping ends here. Before, it ran on into the next frame's first render, and MH
@@ -305,6 +302,10 @@ private:
         /// A byte copy's U8 swizzle: 6 for A8 and A4 (alpha), 5 for I8 and I4 (intensity); 0 for
         /// A8B8G8R8.
         u8 byte_swizzle = 0;
+        /// A copy at an upscaled picture's or depth store's own scale: the GPU texture's sides; 0 for the
+        /// PICA's. The coordinates are normalised, so a draw reads it as the 1x one.
+        u32 gpu_width = 0;
+        u32 gpu_height = 0;
 #ifdef VITA_DIAGNOSTICS
 #endif
     };
@@ -1222,11 +1223,62 @@ private:
             bool has_z, has_stencil;
         };
         std::optional<PendingClear> pending{};
-        /// The last pass on the buffer stored the TA's W depths (WBUFFEN), and their map.
         bool ta_w = false;
         WDepthMap ta_map{};
+        float ta_k = 1.0f;
+        /// A pass stored it since guest memory last took its depth: the guest's bytes are older.
+        bool guest_stale = false;
+        /// With guest_stale, the buffer's 8x8 tiles a part's write-back gave their depth since, a bit each.
+        std::vector<u64> fresh{};
+        /// words holds the store's depth as it is now, at its scale: a texture over the buffer is copied
+        /// from it. A pass storing the depth, a pending clear, or any write over the bytes clears it.
+        bool words_current = false;
+        /// What PublishOwned last published: bit 0 valid, bit 1 newer than guest memory (its bytes closed
+        /// to the guest and the HLE).
+        u8 published = 0;
+        [[nodiscard]] u8 GuardState() const {
+            return static_cast<u8>((valid ? 1 : 0) | (valid && guest_stale ? 2 : 0));
+        }
+        void SetGuestStale(bool stale) {
+            guest_stale = stale;
+            fresh.clear();
+            if (stale) {
+                words_current = false;
+            }
+        }
+        /// The guest's bytes at the buffer's two ends on the FCRAM pages it shares with other data, as the
+        /// last pass found them: other bytes there before a write-back are the guest's writes since. Empty
+        /// for whole pages, outside FCRAM, or while a GPU write to the bytes may be on its way.
+        std::vector<u8> edges{};
+        /// The GPU was sent a write to the buffer's bytes since the last pass on it; the edges are read
+        /// once the GPU is past it.
+        bool gpu_wrote = false;
+        std::optional<u32> gpu_write{};
+        /// WriteDepthBack's I24ZI8S words (D16's I16ZI16Z in their first half), twice the size when
+        /// scaled or 2x.
+        SgxdBackend::Data words{};
+        [[nodiscard]] bool Scaled() const {
+            return quarters != 4 || margin != 0;
+        }
     };
+    /// A W-depth buffer's write-back: the guest bytes the words left, 1 - K / w (or K / w), turned
+    /// into the PICA's depths on the CPU.
+    void WDepthToGuest(const DepthStore& d);
+    /// Twice the store's rows: the words' renders put their pixels on the second half.
+    [[nodiscard]] static u32 WordsRows(const DepthStore& d) {
+        return d.store.height * 2;
+    }
     std::vector<DepthStore> depth_stores;
+    /// The D24S8 store an RGBA8 texture is copied from at the store's scale instead of untiled: one
+    /// level of whole rows from first_row; null for none.
+    [[nodiscard]] const DepthStore* DepthWordsForTexture(PAddr addr, u32 width, u32 height,
+                                                         u32 levels, bool cube, u32 parts,
+                                                         u32& first_row) const;
+    [[nodiscard]] DepthStore* DepthWordsForUnit(u32 unit);
+    /// A sampled unit's read of a store's words: made from the store if older, guest memory left as
+    /// it is (closed to the guest). Whether the words serve the unit: else the caller writes back.
+    bool WriteDepthWords(u32 unit, const char* why);
+    std::vector<u8> w_depth_scratch; ///< WDepthToGuest's cached copy of the buffer
     DepthStore& DepthStoreFor(PAddr addr, u32 width, u32 height, u32 format, u32 quarters = 4,
                               u32 margin = 0, u32 samples = 1);
     /// Whether a store of that shape holds the buffer's depth (a pass may load it).
@@ -1237,6 +1289,33 @@ private:
     SgxdBackend::DepthStore NewDepthStore(u32 width, u32 height, u32 format,
                                           bool upscaled = false, u32 samples = 1);
     void DepthStoresWritten(PAddr start, PAddr end);
+    /// The bytes [addr, end) has on its first page before a page boundary and on its last after one.
+    [[nodiscard]] static std::pair<u32, u32> DepthEdges(PAddr addr, PAddr end);
+    /// A pass stored the buffer's depth: its edges as guest memory holds them now.
+    void NoteDepthEdges(DepthStore& d);
+    /// Before a write-back over [start, end): a store whose edges changed since its last pass is
+    /// stale (the guest wrote them).
+    void DepthEdgesWritten(PAddr start, PAddr end);
+    /// A GPU read of [start, end) (a transfer's input, a texture): a depth store over it newer than
+    /// guest memory goes into the guest's buffer first, as the PICA's depth buffer would hold it.
+    void WriteDepthBack(PAddr start, PAddr end, const char* why);
+    /// The depth stores newer than guest memory over [lo, hi), as their whole buffers (a guest access
+    /// writes them back whole).
+    [[nodiscard]] std::vector<std::pair<PAddr, PAddr>> GuardedDepths(PAddr lo, PAddr hi) const;
+    /// PublishOwned again when a store's guard state is not the one published: a store that became
+    /// newer must be closed before the pass's holds let its pages go.
+    void DepthGuardsChanged();
+    [[nodiscard]] bool DepthBackDue(PAddr start, PAddr end) const;
+    u32 depth_writebacks{};      ///< WriteDepthBack's, for the log's first few
+    u32 depth_edge_writes{};     ///< DepthEdgesWritten's finds, for the log's first few
+    u32 depth_writeback_kinds{}; ///< the kinds logged (D16, 2x, scaled: a bit each combination)
+    u32 depth_writebacks_mark{}; ///< depth_writebacks at perflog's last second
+    u32 depth_writeback_parts{}; ///< of them a part's (perflog's line, the second's)
+    /// The part of d's buffer holding start..end, in the store grid's steps; x1 0 for most of it.
+    [[nodiscard]] static StorePart DepthPartFor(const DepthStore& d, PAddr start, PAddr end);
+    /// Whether every tile of d's buffer under start..end was written back since its last pass.
+    [[nodiscard]] static bool DepthTilesFresh(const DepthStore& d, PAddr start, PAddr end);
+    void MarkDepthPartFresh(DepthStore& d, const StorePart& part);
 
     u32 fills{};
     u32 dmas{};

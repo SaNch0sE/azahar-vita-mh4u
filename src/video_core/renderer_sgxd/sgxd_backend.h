@@ -441,8 +441,14 @@ public:
                                bool magnified, const std::function<void()>& before = {});
     /// One pass storing a scaled pass's picture (target.picture) into target's guest buffer (its
     /// part, or all of it) at 1x: at 2x each pixel the average of its 2x2 block, at the other
-    /// scales a bilinear read at the pixel's centre.
-    void DownscalePicture(const PicaTarget& target);
+    /// scales a bilinear read at the pixel's centre. nearest: each pixel the texel its centre
+    /// falls in instead, for words that do not average (a depth buffer's).
+    /// quad_to_part: the quad covers the target's part alone (its other tiles stay EMPTY and
+    /// skip their store), not the whole target. rows: the picture's rows a pixel row scaled (2
+    /// for a 2x store's words, a row a sample). format: the picture's texels (U8888, or 0x09
+    /// U16 for a D16 buffer's values), read unconverted.
+    void DownscalePicture(const PicaTarget& target, bool nearest = false,
+                          bool quad_to_part = false, u32 rows = 1, u32 format = 0x0c);
     /// One pass copying width x height pixels of a LINEAR U8888 picture (rows stride apart),
     /// from its column source_x on, into dest, LINEAR U8888 rows width apart: a scaled picture
     /// kept for the present.
@@ -475,9 +481,30 @@ public:
     /// stencil, through the PTLA, behind every 3D sent before (sgxd_ptla's queued copies).
     void CopyDepthPart(const DepthStore& from, const DepthStore& to, u32 x0, u32 x1, u32 y0,
                        u32 y1);
+    /// A store's depth and stencil into the guest's buffer as the PICA lays it out, in two renders
+    /// (no pass open): the ZLS stores the samples as I24ZI8S words (D16: I16ZI16Z) into words,
+    /// then a pass copies the words into target as U8888 (D16: U16_RAW).
+    /// At 1x (quarters 4, no margin) words are the store's size and the copy is texel for pixel;
+    /// scaled or widescreen, words are twice that, the first render on their second half, and each
+    /// pixel takes the word its centre falls in. A 2x store (pixel_samples 2) converts as a store
+    /// of its samples, each pixel taking one sample's word.
+    /// A target with a part (x1 non-zero) writes that part alone; the other tiles stay EMPTY.
+    /// `d16`: the guest's buffer is D16, else D24S8 or D24 (target's pack U8888, or U888 for D24).
+    void DepthToGuest(const DepthStore& store, const Data& words, const PicaTarget& target,
+                      bool d16, u32 quarters, u32 margin, u32 pixel_samples);
+    /// DepthToGuest's first render alone: the store's I24ZI8S words (D24S8's) into words, every
+    /// tile, the pass's pixels on the words' second half; nothing into guest memory. A texture
+    /// copied from the words takes them (RasterizerSgxd::WriteDepthWords).
+    void DepthToWords(const DepthStore& store, const Data& words);
+    struct PassRect {
+        u32 x0, x1, y0, y1;
+    };
     /// A quad over the open pass's whole target that the ISP rejects (DCMP NEVER): every tile
     /// holds an object, so none stays EMPTY and skips its ZLS load and store.
-    void TouchAllTiles();
+    void TouchAllTiles() {
+        TouchTiles(nullptr);
+    }
+    void TouchTiles(const PassRect* rect);
     /// Whether an opaque draw that keeps what is under it (colour mask without alpha, no blend)
     /// can go in as opaque: the ISP removes hidden opaque objects before shading, and a hidden
     /// object that writes the pixel would not write the bytes this draw keeps. True with no such
@@ -609,9 +636,16 @@ public:
     /// scale_x, scale_y (1 to 2): the source has width * scale_x columns and height * scale_y
     /// rows (whole), read bilinear at each output pixel's centre: at 2, the average of 2x2
     /// texels (the display transfer's ScaleX and ScaleXY).
+    /// nearest: scaled, the texel the centre falls in instead of the bilinear read.
+    /// rect: the two triangles over that part of the target alone, each pixel reading what it
+    /// reads in the whole one.
+    /// format: the source's texel format code (sgxd_recipe_texture_words_format), U8888 or one
+    /// read as raw the same way (0x09 U16).
     SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height,
                                         bool mirror = false, u32 source_stride = 0,
-                                        float scale_x = 1, float scale_y = 1, u32 source_x = 0);
+                                        float scale_x = 1, float scale_y = 1, u32 source_x = 0,
+                                        bool nearest = false, const PassRect* rect = nullptr,
+                                        u32 format = 0x0c);
     /// A display transfer from a PICA-tiled picture in guest memory: one pass whose draws read
     /// it a band of tile rows at a time (DrawTiled), into dest_gpu as width x height pixels of
     /// pack (an SGXD_RECIPE_PACK_*), rows width apart, the source's top-left width * scale_x x

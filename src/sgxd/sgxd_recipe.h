@@ -254,12 +254,19 @@ void sgxd_recipe_set_background_stencil(SgxdRecipe *r, uint8_t stencil);
 // tiles (AlignUp(width, 32) samples a row), and with stencil (not 0) one byte a sample at stencil
 // in the same layout. load (1: F32 and the stencil bytes, 2: I24ZI8S words at depth, a D24S8
 // buffer's, the stencil their top byte) and store force the ZLS for every tile a primitive touches;
-// the store is always F32. depth 0 turns the ZLS off, as written.
+// the store is F32 (but sgxd_recipe_set_zls_words'). depth 0 turns the ZLS off, as written.
 void sgxd_recipe_set_zls(SgxdRecipe *r, uint32_t depth, uint32_t stencil, int load, int store);
 // The same, stored at store_depth and store_stencil (ZSTORE_BASE, STENCIL_STORE_BASE) instead of
 // where it loads from; store_depth 0 stores nothing.
 void sgxd_recipe_set_zls_to(SgxdRecipe* r, uint32_t depth, uint32_t stencil, int load,
                             uint32_t store_depth, uint32_t store_stencil);
+// The next 3D kick's ZLS turning a depth store into a guest depth buffer's values: the F32 depth
+// at depth and its stencil bytes at stencil loaded (load 1 above), and stored at words in the same
+// linear layout, for every tile a primitive touches, as format says: 1 I24ZI8S (min(trunc(z x
+// 2^24), 0xFFFFFF), the stencil byte above: D24S8's words) or 2 I16ZI16Z (min(trunc(z x 2^16),
+// 0xFFFF), two bytes a sample: D16's; stencil 0).
+void sgxd_recipe_set_zls_words(SgxdRecipe* r, uint32_t depth, uint32_t stencil, uint32_t words,
+                               uint32_t format);
 
 // ImGui's vertex path. nverts ImDrawVert records (SGXD_RECIPE_IMGUI_WORDS words each)
 // fetched at stride 20 into pa0..pa4; the vertex program maps x, y through the scale and offset in
