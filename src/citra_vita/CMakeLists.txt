@@ -149,6 +149,7 @@ function(citra_vita_executable target titleid)
         SceGxm_stub
         SceCtrl_stub
         SceTouch_stub
+        SceMotion_stub
         SceAudio_stub
         SceAudioIn_stub
         ScePower_stub

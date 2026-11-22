@@ -77,6 +77,9 @@ enum class Option : u32 {
     /// layouts (custom layout N is CustomControlValue(N)), each its own mapping and on-screen
     /// buttons in place of the Map* options'.
     ControlLayout,
+    /// The 3DS's accelerometer and gyroscope from the Vita's (VitaMotion): 1, or 0 for none
+    /// (both read zero).
+    Motion,
     RightStick,
     Region,
     /// The 3DS's system language (Service::CFG::SystemLanguage's order: Japanese, English, French,

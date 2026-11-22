@@ -1725,6 +1725,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::Motion,
+         Category::Controls,
+         Kind::Toggle,
+         Translatable("Motion controls"),
+         Translatable("Tilting and turning the Vita moves the 3DS's motion sensors, for games "
+                      "that steer or aim with them. Its screen is the touch screen, held as you "
+                      "would hold the 3DS open. Off, the sensors stay still."),
+         {},
+         0,
+         nullptr,
+         nullptr});
 
     // System: the console and the menus.
     add({Option::Theme,

@@ -106,6 +106,7 @@ const std::array<Definition, Count> definitions{{
     {"map_start", true, true, 0, 14, 10, Inputs},
     {"map_select", true, true, 0, 14, 11, Inputs},
     {"control_layout", true, true, 0, 0, 0, ControlLayoutWords},
+    {"motion", true, true, 0, 1, 1, Toggle},
     {"right_stick", true, true, 0, static_cast<int>(RightStickMode::Count) - 1, 0, RightStickWords},
     {"region", false, false, 0, 7, 0, Regions},
     // English, the config save's own on a new card.
@@ -311,6 +312,9 @@ void ApplyLocked(Option option) {
             }
             EmuWindowVita::SetOnScreenButtons(std::nullopt);
         }
+        break;
+    case Option::Motion:
+        SetMotion(value != 0);
         break;
     case Option::RightStick:
         SetRightStick(static_cast<RightStickMode>(value));

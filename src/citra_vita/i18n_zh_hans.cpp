@@ -255,6 +255,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Memory devices", "存储设备"},
     {"Menu theme", "菜单主题"},
     {"Model files reported", "上报模型文件"},
+    {"Motion controls", "体感操作"},
     {"Move: d-pad, left stick or drag. Size: L, R or pinch.", "移动：方向键、左摇杆或拖动。大小：L、R 或双指缩放。"},
     {"Move: d-pad, left stick or drag. Size: L, R or pinch. Stretch: right stick.",
      "移动：方向键、左摇杆或拖动。缩放：L、R 或双指捏合。拉伸：右摇杆。"},
@@ -539,6 +540,11 @@ constexpr std::array table{std::to_array<Translation>({
     {"This game file cannot be read. Make it again from your game.", "无法读取此游戏文件。请从你的游戏重新制作。"},
     {"This game file is gone.", "此游戏文件已不存在。"},
     {"Three command buffers", "三个命令缓冲区"},
+    {"Tilting and turning the Vita moves the 3DS's motion sensors, for games that steer or aim "
+     "with them. Its screen is the touch screen, held as you would hold the 3DS open. Off, the "
+     "sensors stay still.",
+     "倾斜和转动 Vita 即可带动 3DS 的体感传感器，供用体感转向或瞄准的游戏使用。Vita 的屏幕相当于触摸屏，"
+     "握法与打开的 3DS 相同。关闭后传感器保持静止。"},
     {"Title {:016X}.", "游戏 ID {:016X}。"},
     {"To report it, send these files:", "如需报告，请发送以下文件："},
     {"To report it, send this file:", "如需报告，请发送此文件："},

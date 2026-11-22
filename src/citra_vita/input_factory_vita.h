@@ -24,6 +24,10 @@ void ShutdownInput();
 /// once, the guest reading its buttons from it on. Any thread.
 void SetControl(int control, Config::ControlInput input);
 
+/// Whether the 3DS's accelerometer and gyroscope read the Vita's (Config's Motion option), or
+/// zero as with no motion device. At once; any thread.
+void SetMotion(bool on);
+
 /// What the right stick drives (Config's RightStick option). At once; any thread.
 void SetRightStick(Config::RightStickMode mode);
 

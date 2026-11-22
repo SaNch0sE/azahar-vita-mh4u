@@ -5,14 +5,18 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <numbers>
 
 #include <psp2/ctrl.h>
+#include <psp2/motion.h>
 
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/input_factory_vita.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/param_package.h"
 #include "common/settings.h"
+#include "common/vector_math.h"
 #include "core/frontend/input.h"
 
 namespace VitaFrontend {
@@ -131,6 +135,59 @@ public:
     }
 };
 
+std::atomic<bool> motion_on{true};
+/// SceMotion samples from the first status a guest asks for (a title that enables a sensor) on.
+std::atomic<bool> motion_sampling{false};
+
+/**
+ * The 3DS's accelerometer and gyroscope from the Vita's (SceMotion's filtered state), in
+ * Input::MotionDevice's frame: x+ the d-pad's left, y+ out of the touch screen, z+ the d-pad's
+ * up. The Vita held in landscape is the 3DS held open, its screen the touch screen: SceMotion's
+ * x (to the screen's right), y (to its top edge) and z (out of it) are the 3DS's -x, z and y,
+ * one rotation for both vectors.
+ * Both report what the 3DS's do: the acceleration with gravity in g (lying face up, (0, -1, 0)),
+ * the angular velocity in degrees a second (SceMotion's radians), its bias corrected.
+ */
+class VitaMotion final : public Input::MotionDevice {
+public:
+    std::tuple<Common::Vec3<float>, Common::Vec3<float>> GetStatus() const override {
+        if (!motion_on.load(std::memory_order_relaxed)) {
+            return {{}, {}};
+        }
+        if (!motion_sampling.exchange(true, std::memory_order_relaxed)) {
+            // A plugin may sample in this process already (the start answers
+            // ALREADY_SAMPLING); the state reads the same.
+            const int started = sceMotionStartSampling();
+            ASSERT_MSG(started >= 0 ||
+                           static_cast<u32>(started) == SCE_MOTION_ERROR_ALREADY_SAMPLING,
+                       "motion: sceMotionStartSampling: {:#010x}", static_cast<u32>(started));
+        }
+        SceMotionState state{};
+        const int read = sceMotionGetState(&state);
+        ASSERT_MSG(read >= 0, "motion: sceMotionGetState: {:#010x}", static_cast<u32>(read));
+        const auto to_3ds = [](const SceFVector3& v) { return Common::MakeVec(-v.x, v.z, v.y); };
+        constexpr float DegreesPerRadian = 180.0f / std::numbers::pi_v<float>;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_INFO(Input,
+                     "motion: SceMotion acceleration ({:.3f}, {:.3f}, {:.3f}) g, angular velocity "
+                     "({:.3f}, {:.3f}, {:.3f}) rad/s, basic orientation ({:.0f}, {:.0f}, {:.0f})",
+                     state.acceleration.x, state.acceleration.y, state.acceleration.z,
+                     state.angularVelocity.x, state.angularVelocity.y, state.angularVelocity.z,
+                     state.basicOrientation.x, state.basicOrientation.y, state.basicOrientation.z);
+        }
+        return {to_3ds(state.acceleration), to_3ds(state.angularVelocity) * DegreesPerRadian};
+    }
+};
+
+class VitaMotionFactory final : public Input::Factory<Input::MotionDevice> {
+public:
+    std::unique_ptr<Input::MotionDevice> Create(const Common::ParamPackage&) override {
+        return std::make_unique<VitaMotion>();
+    }
+};
+
 /// The Map* options' buttons, in their order, as NativeButtons.
 constexpr std::array<Settings::NativeButton::Values, 14> MappedButtons = {
     Settings::NativeButton::A,     Settings::NativeButton::B,      Settings::NativeButton::X,
@@ -169,6 +226,10 @@ void SetControl(int control, Config::ControlInput input) {
         InputMasks[static_cast<std::size_t>(input)], std::memory_order_relaxed);
 }
 
+void SetMotion(bool on) {
+    motion_on.store(on, std::memory_order_relaxed);
+}
+
 void SetRightStick(Config::RightStickMode mode) {
     right_stick.store(mode, std::memory_order_relaxed);
 }
@@ -177,6 +238,7 @@ void InitInput(EmuWindowVita& window) {
     g_window = &window;
     Input::RegisterFactory<Input::ButtonDevice>(EngineName, std::make_shared<VitaButtonFactory>());
     Input::RegisterFactory<Input::AnalogDevice>(EngineName, std::make_shared<VitaAnalogFactory>());
+    Input::RegisterFactory<Input::MotionDevice>(EngineName, std::make_shared<VitaMotionFactory>());
 
     auto& profile = Settings::values.current_input_profile;
     for (std::size_t i = 0; i < button_masks.size(); i++) {
@@ -200,11 +262,13 @@ void InitInput(EmuWindowVita& window) {
     }
     // The touchscreen is the window's own device, fed from the front panel.
     profile.touch_device = "engine:emu_window";
+    profile.motion_device = std::string{"engine:"} + EngineName;
 }
 
 void ShutdownInput() {
     Input::UnregisterFactory<Input::ButtonDevice>(EngineName);
     Input::UnregisterFactory<Input::AnalogDevice>(EngineName);
+    Input::UnregisterFactory<Input::MotionDevice>(EngineName);
     g_window = nullptr;
 }
 
