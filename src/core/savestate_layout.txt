@@ -1,4 +1,4 @@
 # The serialized state's code as tools/savestate_check.py hashes it, for the savestate
 # format in src/core/savestate.h (SaveStateFormat). Written by savestate_check.py --update.
-format 1
+format 2
 hash d104f3111575d047c9da838c7e4ab0d9a4ab2f4f34627cf8eefd0555644c0b92

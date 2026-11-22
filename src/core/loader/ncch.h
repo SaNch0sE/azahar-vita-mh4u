@@ -9,6 +9,7 @@
 #include "common/swap.h"
 #include "core/file_sys/ncch_container.h"
 #include "core/loader/loader.h"
+#include "core/loader/title_patches.h"
 
 namespace Loader {
 
@@ -90,6 +91,8 @@ public:
 
     ResultStatus ReadTitle(std::string& title) override;
 
+    void ScanEngine() override;
+
     CompressFileInfo GetCompressFileInfo() override;
 
     bool IsFileCompressed() override;
@@ -99,6 +102,9 @@ public:
     }
 
 private:
+    /// Makes an installed update's NCCH the overlay, whose code and ExeFS replace the title's.
+    void OpenUpdate(u64 program_id);
+
     /**
      * Loads .code section into memory for booting
      * @param process The newly created process

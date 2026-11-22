@@ -45,8 +45,8 @@ enum class RenderThread::Op : u16 {
     ListDraws, ///< scan decisions of the next list's draws (RenderThread::ListDraw each)
     CmdList,   ///< CmdListRecord: the list to parse, its decisions in the ListDraws before it
     RegWrite,  ///< a register id and value the guest wrote outside a list
-    // The parse thread's: the PICA state applied to the render side's PicaCore, and the rasterizer's
-    // draw calls.
+    // The parse thread's: the PICA state applied to the render side's PicaCore, and the
+    // rasterizer's draw calls.
     Regs,     ///< the dirty table's 12 words, then each dirty register's value, in order
     Uniforms, ///< extra: the setup (0 VS, 1 GS); UniformsHead, then the values it names
     Code,     ///< extra: the setup; RangeHead, then the words
@@ -62,9 +62,7 @@ enum class RenderThread::Op : u16 {
     FlushImmediate,
     AddTriangle,
     DrawTriangles,
-    LateDropped, ///< the late skip: a dropped draw's colour buffer and viewport
-                 ///< (RasterizerSgxd::LateDropped)
-    ListEnd,     ///< the list's parsed records end (RunParsed)
+    ListEnd, ///< the list's parsed records end (RunParsed)
     P3D,
     Fill,
     DisplayTransfer,
@@ -73,9 +71,8 @@ enum class RenderThread::Op : u16 {
     GpuIdle,
     Fence,
     Present,
-    FrameEnd,    ///< a guest frame's end, each vblank: RasterizerGxm::EndFrame
-    GuestWrote,  ///< T12: a watched texture page's address, written by the guest or the HLE
-    LateDropped, ///< The late skip: a dropped draw's colour buffer and viewport (RasterizerGxm::LateDropped)
+    FrameEnd,   ///< a guest frame's end, each vblank: RasterizerSgxd::EndFrame
+    GuestWrote, ///< address, size: a watched texture page the guest or the HLE wrote (T12)
     Call,
     PageRemap, ///< extra: the count; PageHolds::Remap each: the GPU's MMU onto pages' slots
 };
@@ -2123,9 +2120,6 @@ bool RenderThread::RenderDraw() {
     std::memcpy(&d, parse_draws.data() + parse_draw_at, sizeof(d));
     const u8* const gs = parse_draws.data() + parse_draw_at + sizeof(d);
     parse_draw_at += sizeof(d) + ((d.gs_bytes + 7) & ~7u);
-    if (d.report != 0) {
-        ParsedPut(Op::LateDropped, d.late_report);
-    }
     if (d.dropped != 0) {
         return false;
     }
@@ -3482,7 +3476,6 @@ void RenderThread::EndFrame() {
         o.earlier = true;
     }
     dropped_lcd.clear();
-    late_reported = {};
     for (u32 i = 0; i < 2; i++) {
         screen_cost[i] = screen_cost[i] - screen_cost[i] / 8 + frame_cost[i];
     }
@@ -3733,18 +3726,7 @@ bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
     if (lcd_screen >= 0) {
         NoteLcdWrite(lcd_screen, lcd, dropped);
     }
-    // The rasterizer told of a dropped draw, once for each buffer and viewport a frame: a game's
-    // double render (RasterizerGxm::DoubleRender) whose blend back a late frame drops ends there.
-    if (dropped) {
-        const auto& rs = pica.regs.internal.rasterizer;
-        const std::array<u32, 3> report{
-            addr, static_cast<u32>(Pica::f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2),
-            static_cast<u32>(Pica::f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2)};
-        if (report != late_reported) {
-            late_reported = report;
-            Put(Op::LateDropped, report);
-        }
-    }
+    d.dropped = dropped ? 1 : 0;
     if (!dropped) {
 #ifdef VITA_DIAGNOSTICS
         if (late_skip) {
@@ -4166,12 +4148,6 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     case Op::DrawTriangles:
         rasterizer.DrawTriangles();
         break;
-    case Op::LateDropped: {
-        std::array<u32, 3> dropped;
-        take(dropped);
-        rasterizer.LateDropped(dropped[0], dropped[1], dropped[2]);
-        break;
-    }
     case Op::P3D:
         rasterizer.NotifyP3D();
         break;
@@ -4268,15 +4244,6 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         rasterizer.GuestWrote(range[0], range[1]);
         break;
     }
-    case Op::LateDropped: {
-        std::array<u32, 3> dropped;
-        take(dropped);
-        rasterizer.LateDropped(dropped[0], dropped[1], dropped[2]);
-        break;
-    }
-    case Op::Check:
-        RunCheck(p);
-        break;
     case Op::PageRemap: {
         std::array<u32, SGXD_REMAP_MAX> pages, pte_va, pte;
         bool direct = false;

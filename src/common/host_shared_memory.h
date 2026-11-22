@@ -36,7 +36,8 @@ public:
         PhysicallyContiguous,
         /// A kernel block of its own on the Vita, whole megabytes on megabyte boundaries, instead
         /// of the heap: guest FCRAM, whose translation the native module takes over so that
-        /// pages of it can move to CDRAM (azaharAdopt). Falls back to the heap.
+        /// pages of it can move to CDRAM (azaharAdopt), a title's code image read for a search
+        /// (Loader::AppLoader::ScanEngine) and a savestate's compressed bytes during its load.
         OwnBlock,
         /// The GPU's own memory, CDRAM on the Vita, which the CPU reads and writes uncached: guest
         /// VRAM, so that what the GPU writes there needs no CPU cache maintenance. Falls back to

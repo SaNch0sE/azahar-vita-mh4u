@@ -318,6 +318,19 @@ private:
     void PatchUpcallThumb(u32 pc);
     /// A BKPT whose condition failed becomes a conditional BL to an unconditional trap.
     void PatchBkpt(u32 pc, u32 insn);
+    /// The engine guard (Loader::EngineGuardTarget): the MT Framework render config word checked
+    /// a frame at a time, put back to the player's bits, its page held against stores while
+    /// something changes it, and each store that does made a trap that stores with the bits set.
+    /// Host 0, between slices.
+    void GuardTick();
+    /// A store's abort on the guarded page: made past the hold, the word put back; false when the
+    /// page is not the guard's.
+    bool GuardStore(u32 va, bool write, u32 pc);
+    /// A guard trap's PABT: its store run with the bits set; false when the PC is no trap.
+    bool GuardTrap();
+    /// The guard from nothing (the code's patched sites were restored, or a new map).
+    void GuardReset();
+    void GuardPatch(u32 pc);
     /// The upcall stubs' shared body and the redirect's entry, in this guest's thunk area.
     void EnsureUpcallBody();
     u32 FetchCode(u32 pc, bool thumb) const;

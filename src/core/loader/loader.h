@@ -294,6 +294,11 @@ public:
     /// title's code after a save state's load, which restores the code the state was saved with.
     virtual void ReapplyCodePatch() {}
 
+    /// Searches the title's code (an installed update's where it has one) for MT Framework's
+    /// render config and records what it finds (NoteEngineFound, NoteEngineAbsent): the engine
+    /// settings of a title not started yet.
+    virtual void ScanEngine() {}
+
     /// Whether each patch built in for the loaded title (TitlePatchesOf) is in its code, as the
     /// load or the last state's load left it; empty for a title with none.
     [[nodiscard]] virtual std::vector<bool> TitlePatchesIn() const {

@@ -2127,12 +2127,17 @@ void Ui::OpenSettings(std::string title, std::string name, State back, u64 progr
         const auto cheats = engine.GetCheats();
         settings_cheats.assign(cheats.begin(), cheats.end());
     }
+    settings_engine = settings_program_id != 0 ? Loader::EngineChoicesOf(settings_program_id)
+                                               : Loader::EngineChoices{};
+    // A title not started yet: its code searched when the Patches tab first opens.
+    engine_search_asked = false;
     ScanInstalled();
     settings_data.clear();
     data_scanned = false;
     category = SettingsCategories().front();
     focused_row = -1;
     focused_patch = -1;
+    focused_engine = -1;
     focused_cheat = -1;
     focused_installed = armed_installed = -1;
     focused_data = -1;
@@ -2195,8 +2200,8 @@ std::vector<Ui::Category> Ui::SettingsCategories() const {
         // Patches and Cheats even with none: the engine settings are looked for when the tab
         // opens, and the Cheats tab says where the title's cheat file goes.
         const bool has_rows =
-            tab == Category::Patches  ? !settings_patches.empty()
-            : tab == Category::Cheats ? settings_program_id != 0
+            tab == Category::Patches     ? settings_program_id != 0
+            : tab == Category::Cheats    ? settings_program_id != 0
             : tab == Category::Installed ? !settings_installed.empty()
             : tab == Category::Data      ? settings_program_id != 0
             : tab == Category::File
@@ -2480,6 +2485,7 @@ void Ui::DrawPatchRow(std::size_t index) {
     }
     if (ImGui::GetFocusID() == card.id) {
         focused_patch = static_cast<int>(index);
+        focused_engine = -1;
     }
     if (card.visible) {
         ImDrawList* const dl = ImGui::GetWindowDrawList();
@@ -2533,6 +2539,120 @@ void Ui::DrawPatchInfo() {
              Tr("Left out: your copy is a different version from the one it was made for."));
     }
     Note(palette->TextDim, Tr("Built into Azahar for this game. It can't be turned off."));
+}
+
+void Ui::DrawEngineRow(std::size_t index) {
+    constexpr float Pad = 18.0f;
+
+    ImGui::PushID(static_cast<int>(index));
+    const Loader::EngineSetting& setting = Loader::EngineSettings()[index];
+    const bool on = Loader::EngineSettingOn(settings_engine, index);
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float label_width = width - 56.0f - 3.0f * Pad;
+    const char* const name = Tr(setting.name);
+    const ImVec2 label = ImGui::CalcTextSize(name, nullptr, false, label_width);
+    const Card card = CardItem("##engine", ImVec2(width, std::max(RowHeight, label.y + 28.0f)));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    const bool focused = ImGui::GetFocusID() == card.id;
+    if (focused) {
+        focused_engine = static_cast<int>(index);
+        focused_patch = -1;
+    }
+    if (card.pressed ||
+        (focused && (ImGui::IsNavInputTest(ImGuiNavInput_DpadLeft, ImGuiInputReadMode_Pressed) ||
+                     ImGui::IsNavInputTest(ImGuiNavInput_DpadRight, ImGuiInputReadMode_Pressed)))) {
+        Loader::SetEngineChoice(settings_program_id, 1u << settings_engine.bits[index], !on);
+        settings_engine = Loader::EngineChoicesOf(settings_program_id);
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float mid = card.bb.GetCenter().y;
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text), name,
+                    nullptr, label_width);
+        DrawSwitch(dl, card.bb.Max.x - Pad, mid, Loader::EngineSettingOn(settings_engine, index),
+                   1.0f);
+    }
+    ImGui::PopID();
+}
+
+void Ui::DrawEngineInfo() {
+    const std::size_t index = static_cast<std::size_t>(focused_engine);
+    const Loader::EngineSetting& setting = Loader::EngineSettings()[index];
+
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", Tr(setting.name));
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", Tr(setting.description));
+    ImGui::Spacing();
+
+    const bool own = ((settings_engine.defaults >> settings_engine.bits[index]) & 1) != 0;
+    Note(palette->TextDim, own ? Tr("The game's own: on.") : Tr("The game's own: off."));
+    if (setting.azahar == Loader::EngineDefault::Off) {
+        Note(palette->TextDim, Tr("Azahar turns it off unless you turn it on."));
+    } else if (setting.azahar == Loader::EngineDefault::On) {
+        Note(palette->TextDim, Tr("Azahar turns it on unless you turn it off."));
+    }
+    const bool running = !settings_title.empty() && settings_title == game_key;
+    Note(running ? palette->Accent : palette->TextDim,
+         running ? Tr("The running game keeps what it started with: restart it to apply this.")
+                 : Tr("Applied when the game starts."));
+}
+
+void Ui::StartEngineSearch() {
+    if (std::exchange(engine_search_asked, true) || settings_engine.scanned ||
+        settings_path.empty()) {
+        return;
+    }
+    ASSERT_MSG(!engine_search.joinable(), "settings: an engine search already runs");
+    engine_search_done.store(false, std::memory_order_relaxed);
+    // On the cores the game list leaves idle; the screen keeps drawing meanwhile.
+    engine_search = Common::NamedThread{
+        Common::ThreadCfg{"engine search", 1024 * 1024, 1 << 0 | 1 << 1 | 1 << 3},
+        [this, path = settings_path] {
+            if (const auto loader = Loader::GetLoader(path)) {
+                loader->ScanEngine();
+            }
+            engine_search_done.store(true, std::memory_order_release);
+        }};
+}
+
+void Ui::DrawEngineSearch() {
+    if (engine_search_done.load(std::memory_order_acquire)) {
+        engine_search.join();
+        settings_engine = Loader::EngineChoicesOf(settings_program_id);
+        focus_first_row = true;
+        return;
+    }
+    constexpr float Padding = 28.0f;
+    constexpr float Width = 560.0f;
+    constexpr float BarHeight = 12.0f;
+    constexpr float BarGap = 18.0f;
+    DimScreen("##engine_search_dim");
+    const char* const text = Tr("Looking for this game's engine settings...");
+    const ImVec2 size = ImGui::CalcTextSize(text, nullptr, false, Width - 2.0f * Padding);
+    BeginCentered("##engine_search", Width, size.y + 2.0f * Padding + BarGap + BarHeight);
+    ImGui::SetCursorPos(ImVec2(std::max(Padding, (Width - size.x) * 0.5f), Padding));
+    ImGui::PushTextWrapPos(Width - Padding);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    // No share to show: a piece of the bar sweeps across it, a second a pass.
+    ImDrawList* const dl = ImGui::GetWindowDrawList();
+    const ImVec2 min = ImGui::GetWindowPos() + ImVec2(Padding, Padding + size.y + BarGap);
+    const float track = Width - 2.0f * Padding;
+    const float piece = track * 0.3f;
+    const float at =
+        std::fmod(static_cast<float>(ImGui::GetTime()), 1.0f) * (track + piece) - piece;
+    dl->AddRectFilled(min, min + ImVec2(track, BarHeight), Colour(palette->SwitchOff),
+                      BarHeight * 0.5f);
+    dl->AddRectFilled(ImVec2(min.x + std::max(at, 0.0f), min.y),
+                      ImVec2(min.x + std::min(at + piece, track), min.y + BarHeight),
+                      Colour(palette->Accent), BarHeight * 0.5f);
+    ImGui::End();
 }
 
 void Ui::DrawCheatRow(std::size_t index) {
@@ -3218,6 +3338,7 @@ Ui::Action Ui::DrawSettings() {
         category = *next_category;
         focused_row = -1;
         focused_patch = -1;
+        focused_engine = -1;
         focused_cheat = -1;
         focused_installed = armed_installed = -1;
         focused_rom_folder = armed_rom_folder = -1;
@@ -3236,6 +3357,11 @@ Ui::Action Ui::DrawSettings() {
     if (category == Category::Patches) {
         for (std::size_t i = 0; i < settings_patches.size(); i++) {
             DrawPatchRow(i);
+        }
+        for (std::size_t i = 0; settings_engine.found && i < Loader::EngineSettings().size(); i++) {
+            if (settings_engine.bits[i] >= 0) {
+                DrawEngineRow(i);
+            }
         }
     } else if (category == Category::Cheats) {
         for (std::size_t i = 0; i < settings_cheats.size(); i++) {
@@ -3282,7 +3408,11 @@ Ui::Action Ui::DrawSettings() {
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav);
     if (category == Category::Patches) {
-        DrawPatchInfo();
+        if (focused_engine >= 0) {
+            DrawEngineInfo();
+        } else {
+            DrawPatchInfo();
+        }
     } else if (category == Category::Cheats) {
         DrawCheatInfo();
     } else if (category == Category::Installed) {

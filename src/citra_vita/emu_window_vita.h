@@ -134,7 +134,6 @@ public:
     /// the state the pause menu leaves it in. False with no title running, or at the timeout.
     bool PauseForSuspend(std::chrono::milliseconds timeout);
 
-    /// True once the user has asked to leave.
     [[nodiscard]] bool IsQuitRequested() const {
         return quit_requested;
     }

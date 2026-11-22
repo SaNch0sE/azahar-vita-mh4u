@@ -114,11 +114,8 @@ unsigned int _newlib_heap_size_user = 112 * 1024 * 1024;
 unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 #endif
 
-// Default stack for every pthread, and so for every std::thread: the GPU thread, the two
-// rasterizer workers, the service threads. vitasdk's built-in default is 32 KB (the fallback
-// constant in libpthread's create.o), which the renderer and the savestate serializer overrun.
-// std::thread offers no way to ask for a bigger stack, so this weak global is the only lever;
-// the emulation thread sets its own, larger stack through pthread_attr_setstacksize in main().
+// Default stack for every pthread, and so for every std::thread, which cannot ask for one.
+// vitasdk's default is 32 KB, which the renderer and the savestate serializer overrun.
 unsigned int _pthread_stack_default_user = 1024 * 1024;
 
 // newlib's lazy network bring-up (libc/sys/vita/vitanet.c). Not declared in any header, but a
@@ -134,7 +131,6 @@ namespace {
 using VitaFrontend::I18n::Tr;
 using VitaFrontend::I18n::Translatable;
 using VitaFrontend::I18n::TrFormat;
-/// The process's own arguments, kept for LaunchParameter.
 std::vector<std::string> g_arguments;
 /// Whether the process was launched by its SELF's path (LOADP, SceAppMgr's
 /// LaunchAppByPath), not from the LiveArea; LoadAzaharNative's restart carries it on.

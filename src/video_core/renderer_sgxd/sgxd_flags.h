@@ -88,10 +88,6 @@ namespace SgxdRenderer {
  *             fswhite=4 as many NOPs as the program's words, then the white write (its time
  *             without its loads and reads)
  *   xferlog   every display transfer, texture copy and fill as it comes (sgxd_rasterizer.cpp)
- *   keepaa    the game's anti-aliasing kept, for comparing pictures and times: a colour
- *             buffer a display transfer averages down drawn at the game's size
- *             (RasterizerGxm::Supersampled), a jittered second render of the scene drawn
- *             (RasterizerGxm::DoubleRender)
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks
  *   (docs/debugging.md, "Wrong pictures")

@@ -135,9 +135,8 @@ HostSharedMemory::HostSharedMemory(std::size_t size_, [[maybe_unused]] const cha
             memblock = uid;
             base = static_cast<u8*>(addr);
             std::memset(base, 0, rounded);
-            LOG_INFO(Common, "memblock {}: {} KiB {} -> {:#x} at {} (the guest's memory)",
-                     name ? name : "?", block_size >> 10, type_name, static_cast<u32>(uid),
-                     fmt::ptr(base));
+            LOG_INFO(Common, "memblock {}: {} KiB {} -> {:#x} at {}", name ? name : "?",
+                     block_size >> 10, type_name, static_cast<u32>(uid), fmt::ptr(base));
             return true;
         }
         if (uid >= 0) {

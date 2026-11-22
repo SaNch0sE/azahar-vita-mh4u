@@ -737,8 +737,7 @@ void Encoder::NopAfterKill() {
 }
 
 void Encoder::Wdf(uint8_t drc) {
-    // The fragment form always carried bit 43 (nosched) since it was copied from a
-    // compiler sequence that needed it; now placed by FinishNosched like every other.
+    // Bit 43 (nosched) is placed by FinishNosched, as for every other instruction.
     Push(drc ? 0xf920000100000000ull : 0xf920000000000000ull, 43, 0, 0);
 }
 

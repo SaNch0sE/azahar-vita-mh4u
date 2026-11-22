@@ -171,7 +171,6 @@ public:
     /// quit that did not come through the menu (the command channel).
     void LeaveGame();
 
-    /// Opens the pause menu over a running title.
     void OpenPauseMenu();
 
     /// Shows a full-screen message instead of a menu, for the stretches where the frontend is
@@ -363,6 +362,15 @@ private:
     [[nodiscard]] std::string ValueText(const Row& row, int value) const;
     void DrawPatchRow(std::size_t index);
     void DrawPatchInfo();
+    /// One of the Patches tab's engine settings (an MT Framework title's render config bits): its
+    /// switch, which cross, a touch or the pad's left and right flips; kept at once, applied at the
+    /// title's next start.
+    void DrawEngineRow(std::size_t index);
+    void DrawEngineInfo();
+    /// The Patches tab's first opening for a title never started: its code searched for engine
+    /// settings on a worker (AppLoader::ScanEngine), under a panel, once.
+    void StartEngineSearch();
+    void DrawEngineSearch();
     void DrawCheatRow(std::size_t index);
     void DrawCheatInfo();
     void DrawInstalledRow(std::size_t index);
@@ -420,6 +428,18 @@ private:
     std::vector<Loader::TitlePatchInfo> settings_patches;
     std::vector<bool> settings_patches_in;
     int focused_patch = -1;
+    /// The title's engine settings (found: its code has the render config, known once it ran), and
+    /// the selected one (-1: none, or a patch).
+    Loader::EngineChoices settings_engine;
+    int focused_engine = -1;
+    /// What the description panel shows (the tab and each list's selection): a change scrolls it
+    /// back to its top.
+    std::array<int, 8> info_shown{};
+    /// StartEngineSearch's: whether this screen asked for the search, its end, and its worker
+    /// (last: joined before what it writes goes).
+    bool engine_search_asked = false;
+    std::atomic<bool> engine_search_done{false};
+    Common::NamedThread engine_search;
     /// The title's program ID (0: none, or all games), its cheats as the cheat engine holds them
     /// (its file's, read when the screen opens), and the selected one (-1: none yet).
     u64 settings_program_id{};

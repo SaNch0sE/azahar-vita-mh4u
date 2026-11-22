@@ -2972,14 +2972,6 @@ void SgxdBackend::TransferLinearToTiled(const PicaTarget& target, const UntileSo
     EndPass(ta_us, d3_us);
 }
 
-void SgxdBackend::MagnifyTiled(const PicaTarget& target, const UntileSource& source, u32 magnify_x,
-                               u32 magnify_y) {
-    OpenPass(target.gpu, target.height, target.width, target.pack, 0, 1.0f, &target);
-    pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
-    DrawTiled(source, true, 1, 1, magnify_x, magnify_y);
-    EndPass(nullptr, nullptr);
-}
-
 void SgxdBackend::TransferFromGuest(const UntileSource& source, u32 dest_gpu, u32 width,
                                     u32 height, u32 pack, u32* ta_us, u32* d3_us, u32 scale_x,
                                     u32 scale_y, bool flip) {
@@ -3864,29 +3856,30 @@ void SgxdBackend::FlushUntiles() {
 }
 
 void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_x, u32 scale_y,
-                            u32 magnify_x, u32 magnify_y) {
+                            u32 magnify, u32 offset_x, u32 clip, bool flip) {
     DEBUG_ASSERT(in_pass);
     const u32 w = src.width, h = src.height;
     DEBUG_ASSERT_MSG(w >= 8 && h >= 8 && w <= 4096 && w % 8 == 0 && h % 8 == 0 &&
                          src.code != UntileEtc1 && src.code != UntileEtc1A4 &&
                          (scale_x == 1 || scale_x == 2) && (scale_y == 1 || scale_y == 2) &&
-                         (magnify_x == 1 || magnify_x == 2) && (magnify_y == 1 || magnify_y == 2) &&
-                         (scale_x * scale_y == 1 || magnify_x * magnify_y == 1),
-                     "sgxd: a {}x{} tiled picture (format {:#x}, scale {}x{}, magnified {}x{}) "
-                     "read into a pass is not built",
-                     w, h, src.code, scale_x, scale_y, magnify_x, magnify_y);
+                         magnify >= 4 && magnify <= 8 &&
+                         (magnify == 4 || (scale_x == 1 && scale_y == 1)),
+                     "sgxd: a {}x{} tiled picture (format {:#x}, scale {}x{}, magnified {}/4) read "
+                     "into a pass is not built",
+                     w, h, src.code, scale_x, scale_y, magnify);
     DEBUG_ASSERT_MSG(!flip || !transposed, "sgxd: a flipped transposed tiled picture is not built");
     PlaceFixedPrograms();
     const Recipe& r = *current;
     // The tile rows the target shows: a transposed target's width is the picture's rows, a
-    // linear one's height; scaled, scale_y picture rows to each, magnified, one to magnify_y.
-    const u32 shown = (transposed ? r.width : r.height) * scale_y / magnify_y;
+    // linear one's height; scaled, scale_y picture rows to each; magnified, four to every
+    // magnify.
+    const u32 shown = (transposed ? r.width : r.height) * scale_y * 4 / magnify;
     const u32 tile_rows = std::min(h, AlignUp(shown, 8)) / 8;
-    const float fx = static_cast<float>(magnify_x) / static_cast<float>(scale_x);
-    const float fy = static_cast<float>(magnify_y) / static_cast<float>(scale_y);
-    const u64 key = u64{0x80} << 56 | u64{magnify_y - 1} << 58 | u64{magnify_x - 1} << 57 |
-                    u64{transposed} << 55 | u64{scale_x - 1} << 54 | u64{scale_y - 1} << 53 |
-                    u64{w} << 40 | u64{h} << 27 | u64{r.width} << 14 | r.height;
+    const float fx = magnify != 4 ? magnify / 4.0f : 1.0f / static_cast<float>(scale_x);
+    const float fy = magnify != 4 ? magnify / 4.0f : 1.0f / static_cast<float>(scale_y);
+    const u64 key = u64{0x80} << 56 | u64{flip} << 62 | u64{magnify} << 56 | u64{transposed} << 55 |
+                    u64{scale_x - 1} << 54 | u64{scale_y - 1} << 53 | u64{w} << 40 | u64{h} << 27 |
+                    u64{r.width} << 14 | r.height;
     constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
     const Geometry& g = GeometryFor(key, N * 4, [&](float* v, Geometry& geometry) {
         u32 vertex_count = 0;

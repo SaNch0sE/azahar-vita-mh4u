@@ -576,16 +576,14 @@ private:
     void DrawMerged(const u16* vertices, u32 count, u16 cleaned);
 
     /// The scan's decision on a list's draw, in the scan's order: whether it is dropped (late skip,
-    /// right eye), the report to the rasterizer, its indices' range, and a geometry draw's indices as
-    /// the guest had them at the scan (gs_bytes after it: the guest may have rewritten them since).
+    /// right eye), its indices' range, and a geometry draw's indices as the guest had them at the
+    /// scan (gs_bytes after it: the guest may have rewritten them since).
     struct alignas(8) ListDraw {
         u8 dropped;
-        u8 report;
         u8 gs_u16;
-        u8 pad;
+        u8 pad[2];
         DrawIndexRange indices;
         u32 gs_bytes;
-        std::array<u32, 3> late_report;
     };
     std::vector<u8> scan_draws;
     u32 scan_draw_count{};
@@ -769,9 +767,6 @@ private:
     u32 frame_ticket_at{};
     bool late_batch_open{};
     bool late_batch_skip{};
-    bool late_triangles_open{};
-    /// The last dropped draw's colour buffer and viewport reported this frame (Op::LateDropped).
-    std::array<u32, 3> late_reported{};
     /// The colour buffers drawn lately (the newest 16), each with its segments: a segment is the draws
     /// into it up to a transfer from it. Per buffer: this frame's segment, a dropped draw, open (drawn
     /// since its last transfer), and each segment's screen as the transfer that ended it last found it.

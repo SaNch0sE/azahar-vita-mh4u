@@ -2533,8 +2533,8 @@ int azaharRun(AzaharRunRequest *user_req) {
     azahar_run_count++;
     if (azahar_verbose || (core->run_reason > AZAHAR_EXIT_SVC && core->run_reason != AZAHAR_EXIT_TIMER)) {
         // Faults are rare enough to record. svc exits are the common case, and a guest that
-        // busy-waits through its quantum makes preemptions just as common (hundreds a minute
-        // in the first commercial title tried), so both stay silent unless verbose.
+        // busy-waits through its quantum makes preemptions just as common (hundreds a minute),
+        // so both stay silent unless verbose.
         emit("  run %u (cpu%u): exit reason %u  svc %06x  pc %08x  raw lr %08x  spsr %08x  fsr %08x "
              "far %08x  r0 %08x r1 %08x sp %08x  timer left %u  irq id %08x stray %u\n",
              azahar_run_count, n, core->run_reason, core->run_svc, cpu->ctx.r[15], core->run_rawlr,

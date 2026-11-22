@@ -692,11 +692,6 @@ public:
                             const PictureFormat& format);
     /// The same into a PICA-tiled picture: one pass on target as a PICA colour buffer (as
     /// BeginPassLoaded opens it), the source read as its load reads, scaled.
-    /// A PICA-tiled picture into one magnify_x x magnify_y times its size, each texel repeated
-    /// (point sampled): a supersampled buffer's 1x picture in the game's layout
-    /// (RasterizerGxm::Supersampled), one pass on target.
-    void MagnifyTiled(const PicaTarget& target, const UntileSource& source, u32 magnify_x,
-                      u32 magnify_y);
     void TransferTiledFromGuest(const PicaTarget& target, const UntileSource& source, u32 scale_x,
                                 u32 scale_y, u32* ta_us = nullptr, u32* d3_us = nullptr);
     /// A display transfer from a linear picture into a PICA-tiled one (input_linear): one pass
@@ -843,8 +838,7 @@ private:
                   const PicaTarget* pica = nullptr);
     /**
      * Draws into the open pass that read src, a PICA-tiled picture, texel for pixel (scaled:
-     * each target pixel the average of scale_x x scale_y texels, bilinear between them;
-     * magnified: each texel magnify_x x magnify_y pixels, point sampled), from
+     * each target pixel the average of scale_x x scale_y texels, bilinear between them), from
      * the target's top-left. Untile's bands: a band of tile rows is an 8-texel-wide SWIZZLED
      * texture whose texel (sx, sy) is PICA pixel (sy % w, 8 (band row + sy / w) + sx), one
      * draw a band, a quad a tile row. transposed: target x is the picture's row and y its
@@ -855,7 +849,7 @@ private:
      * for all of the target's. flip (not transposed): the target's rows in the other order.
      */
     void DrawTiled(const UntileSource& src, bool transposed, u32 scale_x = 1, u32 scale_y = 1,
-                   u32 magnify_x = 1, u32 magnify_y = 1);
+                   u32 magnify = 4, u32 offset_x = 0, u32 clip = 0, bool flip = false);
 
     s32 waker_flag = -1;
     u32 waker_bits = 0;

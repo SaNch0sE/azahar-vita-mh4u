@@ -9,6 +9,7 @@
 #include <fmt/format.h>
 #include "common/file_derived.h"
 #include "common/file_util.h"
+#include "common/host_shared_memory.h"
 #include "common/literals.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
@@ -280,6 +281,26 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
             return code_result;
         }
         title_patches_in = ApplyTitlePatches(system, *process);
+        // The MT Framework render config, which the native core keeps at the player's engine
+        // settings (Azahar's defaults where the player set none). A title searched once without
+        // one is not searched again.
+        SetEngineGuardTarget({});
+        if (const EngineChoices known = EngineChoicesOf(program_id);
+            known.scanned && !known.found) {
+            LOG_INFO(Loader, "engine settings: {:016X} has no MT Framework render config",
+                     static_cast<u64>(program_id));
+        } else if (const RenderConfig config = FindRenderConfig(*process);
+                   config.constructors == 0) {
+            NoteEngineAbsent(program_id);
+        } else {
+            NoteEngineFound(program_id, config.defaults.empty() ? 0 : config.defaults.front().value,
+                            config.bits);
+            if (!config.defaults.empty()) {
+                const EngineGuardBits bits = GuardBitsOf(EngineChoicesOf(program_id));
+                SetEngineGuardTarget(
+                    {config.global, config.defaults.front().value, bits.on, bits.off});
+            }
+        }
         const auto& code = product_info.product_code;
         const auto code_end = std::find(code.begin(), code.end(), u8{0});
         product_summary = fmt::format(
@@ -382,6 +403,62 @@ void AppLoader_NCCH::ReapplyCodePatch() {
                loaded_program_id);
 }
 
+void AppLoader_NCCH::OpenUpdate(u64 program_id) {
+    if ((program_id & 0xFFFFFFFF00000000) == DLP_CHILD_TID_HIGH) {
+        return;
+    }
+    const u64 update_tid = (program_id & 0xFFFFFFFFULL) | UPDATE_TID_HIGH;
+    update_ncch.OpenFile(
+        Service::AM::GetTitleContentPath(Service::FS::MediaType::SDMC, update_tid));
+    if (update_ncch.Load() == ResultStatus::Success) {
+        overlay_ncch = &update_ncch;
+    }
+}
+
+void AppLoader_NCCH::ScanEngine() {
+    u64 program_id = 0;
+    if (base_ncch.Load() != ResultStatus::Success ||
+        ReadProgramId(program_id) != ResultStatus::Success) {
+        return;
+    }
+    if (!is_loaded) {
+        OpenUpdate(program_id);
+    }
+    if (!overlay_ncch->CodeLoadsInPlace()) {
+        LOG_INFO(Loader,
+                 "engine settings: {:016X}'s code is searched at its start: it is not the ExeFS's "
+                 "own (an override, a patch or a prototype's)",
+                 program_id);
+        return;
+    }
+    const auto& info = overlay_ncch->exheader_header.codeset_info;
+    const u32 text_size = info.text.num_max_pages * Memory::CITRA_PAGE_SIZE;
+    const u32 ro_size = info.ro.num_max_pages * Memory::CITRA_PAGE_SIZE;
+    const u32 image_size = text_size + ro_size + info.data.num_max_pages * Memory::CITRA_PAGE_SIZE;
+    // Outside the heap, which may not have the whole image in one piece.
+    const Common::HostSharedMemory image{image_size, "engine scan",
+                                         Common::HostSharedMemory::Placement::OwnBlock};
+    const std::span<u8> bytes{image.Data(), image_size};
+    const std::array<std::span<u8>, 1> pieces{bytes};
+    std::size_t size = 0;
+    std::array<u8, 16> tail{};
+    if (const ResultStatus result = overlay_ncch->LoadCodeInto(pieces, size, tail);
+        result != ResultStatus::Success) {
+        LOG_ERROR(Loader, "engine settings: {:016X}'s code not read ({})", program_id,
+                  static_cast<int>(result));
+        return;
+    }
+    const RenderConfig config = FindRenderConfig(
+        program_id, info.text.address, bytes.first(text_size), info.ro.address,
+        bytes.subspan(text_size, ro_size), info.data.address, bytes.subspan(text_size + ro_size));
+    if (config.constructors == 0) {
+        NoteEngineAbsent(program_id);
+    } else {
+        NoteEngineFound(program_id, config.defaults.empty() ? 0 : config.defaults.front().value,
+                        config.bits);
+    }
+}
+
 ResultStatus AppLoader_NCCH::Load(std::shared_ptr<Kernel::Process>& process) {
     u64_le ncch_program_id;
 
@@ -397,17 +474,7 @@ ResultStatus AppLoader_NCCH::Load(std::shared_ptr<Kernel::Process>& process) {
 
     LOG_INFO(Loader, "Program ID: {}", program_id);
 
-    bool is_dlp_child = (ncch_program_id & 0xFFFFFFFF00000000) == DLP_CHILD_TID_HIGH;
-
-    if (!is_dlp_child) {
-        u64 update_tid = (ncch_program_id & 0xFFFFFFFFULL) | UPDATE_TID_HIGH;
-        update_ncch.OpenFile(
-            Service::AM::GetTitleContentPath(Service::FS::MediaType::SDMC, update_tid));
-        result = update_ncch.Load();
-        if (result == ResultStatus::Success) {
-            overlay_ncch = &update_ncch;
-        }
-    }
+    OpenUpdate(ncch_program_id);
 
 #ifdef ENABLE_ROOM
     if (auto room_member = Network::GetRoomMember().lock()) {

@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <type_traits>
@@ -21,6 +22,7 @@
 #include "common/host_clock.h"
 #include "common/host_shared_memory.h"
 #include "common/logging/log.h"
+#include "common/process_clock.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/address_arbiter.h"
@@ -36,6 +38,7 @@
 #include "core/hle/kernel/thread.h"
 #include "core/hle/kernel/vm_manager.h"
 #include "core/hle/kernel/wait_object.h"
+#include "core/loader/title_patches.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
@@ -532,6 +535,25 @@ AzaharRedirect upcall_redirect{};
 std::unordered_set<u32> svc_refused;
 /// PatchBkpt's traps in the thunk area by the BKPT's immediate: an unconditional BKPT each.
 std::unordered_map<u32, u32> bkpt_traps;
+/// The engine guard's state (ARM_VitaNative::GuardTick). The lock: host 1's aborts and traps.
+struct EngineGuard {
+    std::mutex lock;
+    Loader::EngineGuardTarget target{};
+    VAddr word = 0;
+    const u8* page_host = nullptr;
+    bool armed = false;
+    bool changed = false;               ///< a store changed the bits since the last check
+    std::vector<u32> writers;           ///< those stores, made traps at the next check (host 0)
+    std::unordered_map<u32, u32> traps; ///< trap site -> the store it stands for
+    u64 checked_us = 0;
+    u32 put_back = 0; ///< words put back, for the log
+    bool not_found_logged = false;
+};
+/// How far into the config object the guard looks for its words.
+constexpr u32 ObjectSearchBytes = 0x8000;
+EngineGuard engine_guard;
+/// A guard trap: BKPT #0xA55A.
+constexpr u32 GuardTrapInsn = 0xE12A557Au;
 /// A GetSystemTick thunk's counters for the idle loops (CheckTickPolls): eight caller slots with
 /// their calls, then the caller sent to the idle skip.
 constexpr u32 TickSlots = 8;
@@ -832,6 +854,14 @@ void ForgetThunks(const VitaGuestMap* map) {
     if (thunk_area_map == map) {
         ResetLeases();
         patched_sites.clear();
+        // The guest's tables went with azaharRelease, the guard's hold in them too.
+        {
+            std::scoped_lock lk{engine_guard.lock};
+            engine_guard.armed = engine_guard.changed = false;
+            engine_guard.word = 0;
+            engine_guard.writers.clear();
+            engine_guard.traps.clear();
+        }
         vfp_thunks.clear();
         svc_thunks.clear();
         svc_refused.clear();
@@ -2607,6 +2637,216 @@ void ARM_VitaNative::PatchUpcall(u32 pc, bool thumb) {
 #endif
 }
 
+namespace {
+
+void GuardHold(const u8* page, u32 hold) {
+    const AzaharHoldRun run{static_cast<u32>(reinterpret_cast<uintptr_t>(page)), 0x1000, hold};
+    const int r = azaharHold(&run, 1);
+    ASSERT_MSG(r >= 0, "engine guard: azaharHold of {:#010x} failed: {:#010x}", run.user_va,
+               static_cast<u32>(r));
+}
+
+} // namespace
+
+void ARM_VitaNative::GuardTick() {
+    const Loader::EngineGuardTarget& t = Loader::EngineGuardTargetNow();
+    EngineGuard& g = engine_guard;
+    if (t.global == 0 && g.target.global == 0) {
+        return;
+    }
+    std::scoped_lock lk{g.lock};
+    // Until the word is found, every slice: the views the engine builds copy its bits. Then a
+    // frame at a time, the clock (a syscall) read every 64th slice.
+    if (g.word != 0 && g.target == t) {
+        static u32 slices = 0;
+        if (++slices % 64 != 0) {
+            return;
+        }
+        const u64 now = static_cast<u64>(Common::ProcessClock::now().time_since_epoch().count());
+        if (now - g.checked_us < 16'667) {
+            return;
+        }
+        g.checked_us = now;
+    }
+    if (!(g.target == t)) {
+        if (g.armed) {
+            GuardHold(g.page_host, AZAHAR_HOLD_NONE);
+        }
+        g.armed = false;
+        g.word = 0;
+        g.not_found_logged = false;
+        g.target = t;
+        if (t.global == 0) {
+            return;
+        }
+    }
+    if (g.word == 0) {
+        // The object from the global the engine keeps it in: null until it is made. The words:
+        // the two in a row its constructor stored the default in.
+        const u32 object = memory.Read32(t.global);
+        if (object == 0) {
+            return;
+        }
+        VAddr word = 0;
+        for (u32 off = 0; off + 8 <= ObjectSearchBytes && word == 0; off += 4) {
+            if (memory.Read32(object + off) == t.initial &&
+                memory.Read32(object + off + 4) == t.initial) {
+                word = object + off;
+            }
+        }
+        if (word == 0) {
+            if (!std::exchange(g.not_found_logged, true)) {
+                LOG_WARNING(Core_ARM11,
+                            "engine guard: the config object {:#010x} holds no two words of its "
+                            "default {:#010x} yet",
+                            object, t.initial);
+            }
+            return;
+        }
+        g.page_host = map->HostAt(word & ~0xFFFu);
+        ASSERT_MSG(g.page_host != nullptr && map->HostAt(word + 4) != nullptr,
+                   "engine guard: the render config word {:#010x} is in no mapped page", word);
+        g.word = word;
+        LOG_INFO(Core_ARM11, "engine guard: the render config words at {:#010x}: {:#010x} {:#010x}",
+                 word, memory.Read32(word), memory.Read32(word + 4));
+    }
+    // The stores that changed the bits since the last check: traps from now on.
+    for (const u32 pc : g.writers) {
+        GuardPatch(pc);
+    }
+    g.writers.clear();
+    bool wrong = false;
+    for (const VAddr at : {g.word, g.word + 4}) {
+        const u32 v = memory.Read32(at);
+        const u32 want = (v & ~t.off) | t.on;
+        if (v != want) {
+            memory.Write32(at, want);
+            wrong = true;
+            if (g.put_back++ < 16) {
+                LOG_INFO(Core_ARM11,
+                         "engine guard: the render config word {:#010x}: {:#010x} -> "
+                         "{:#010x}",
+                         at, v, want);
+            }
+        }
+    }
+    // Held while something changes the bits; a frame with no such store lets the page go.
+    const bool hold = wrong || g.changed;
+    g.changed = false;
+#ifdef VITA_DIAGNOSTICS
+    if (Core::EngineWatch::Watches(g.word)) {
+        return;
+    }
+#endif
+    if (hold != g.armed) {
+        GuardHold(g.page_host, hold ? AZAHAR_HOLD_WRITES : AZAHAR_HOLD_NONE);
+        g.armed = hold;
+    }
+}
+
+bool ARM_VitaNative::GuardStore(u32 va, bool write, u32 pc) {
+    EngineGuard& g = engine_guard;
+    std::scoped_lock lk{g.lock};
+    if (!g.armed || !write || (va & ~0xFFFu) != (g.word & ~0xFFFu)) {
+        return false;
+    }
+    refused_va = 0;
+    // An access the core cannot make past the hold: the page let go, the store runs again.
+    if (!AccessPastHolds(pc, write)) {
+        GuardHold(g.page_host, AZAHAR_HOLD_NONE);
+        g.armed = false;
+        g.changed = true;
+        LOG_WARNING(Core_ARM11, "engine guard: the store at {:#010x} not made past the hold", pc);
+        return true;
+    }
+    bool wrong = false;
+    for (const VAddr at : {g.word, g.word + 4}) {
+        const u32 v = memory.Read32(at);
+        const u32 want = (v & ~g.target.off) | g.target.on;
+        if (v != want) {
+            memory.Write32(at, want);
+            wrong = true;
+        }
+    }
+    if (wrong) {
+        g.changed = true;
+        if ((run.ctx.cpsr & 0x20u) != 0) {
+            if (!g.traps.contains(pc)) {
+                g.traps.emplace(pc, 0);
+                LOG_WARNING(Core_ARM11,
+                            "engine guard: a Thumb store at {:#010x} changes the render config's "
+                            "bits: put back a frame at a time",
+                            pc);
+            }
+        } else if (std::find(g.writers.begin(), g.writers.end(), pc) == g.writers.end()) {
+            g.writers.push_back(pc);
+        }
+    }
+    return true;
+}
+
+void ARM_VitaNative::GuardPatch(u32 pc) {
+    EngineGuard& g = engine_guard;
+    if (g.traps.contains(pc) || patched_sites.contains(pc) || InThunkArea(pc)) {
+        return;
+    }
+    // str rT, [rN, #+-imm], no write-back, rT not the PC: a trap that stores with the bits set.
+    const u32 insn = memory.Read32(pc);
+    if ((insn >> 28) == 0xF || (insn & 0x0F700000u) != 0x05000000u || ((insn >> 12) & 15) == 15) {
+        LOG_WARNING(Core_ARM11,
+                    "engine guard: the store at {:#010x} ({:#010x}) changes the render config's "
+                    "bits and is no str rT, [rN, #imm]: put back a frame at a time",
+                    pc, insn);
+        g.traps.emplace(pc, 0);
+        return;
+    }
+    memory.Write32(pc, GuardTrapInsn);
+    map->SyncCode(pc, 4);
+    patched_sites[pc] = PatchedSite{insn, false};
+    g.traps.emplace(pc, insn);
+    LOG_INFO(Core_ARM11,
+             "engine guard: the store at {:#010x} ({:#010x}) changes the render "
+             "config's bits: a trap",
+             pc, insn);
+}
+
+bool ARM_VitaNative::GuardTrap() {
+    EngineGuard& g = engine_guard;
+    const u32 pc = run.ctx.r[15];
+    std::scoped_lock lk{g.lock};
+    const auto it = g.traps.find(pc);
+    if (it == g.traps.end() || it->second == 0 || (run.ctx.cpsr & 0x20u) != 0) {
+        return false;
+    }
+    const u32 insn = it->second;
+    if (ConditionPasses(insn >> 28, run.ctx.cpsr)) {
+        const u32 rn = (insn >> 16) & 15;
+        const u32 base = rn == 15 ? pc + 8 : run.ctx.r[rn];
+        const u32 imm = insn & 0xFFF;
+        const VAddr addr = (insn & 0x00800000u) ? base + imm : base - imm;
+        u32 value = run.ctx.r[(insn >> 12) & 15];
+        if (addr == g.word || addr == g.word + 4) {
+            value = (value & ~g.target.off) | g.target.on;
+        }
+        memory.Write32(addr, value);
+    }
+    run.ctx.r[15] = pc + 4;
+    return true;
+}
+
+void ARM_VitaNative::GuardReset() {
+    EngineGuard& g = engine_guard;
+    std::scoped_lock lk{g.lock};
+    if (g.armed) {
+        GuardHold(g.page_host, AZAHAR_HOLD_NONE);
+    }
+    g.armed = false;
+    g.changed = false;
+    g.word = 0;
+    g.writers.clear();
+    g.traps.clear();
+}
+
 void ARM_VitaNative::PatchBkpt(u32 pc, u32 insn) {
     if (InThunkArea(pc) || patched_sites.contains(pc)) {
         return;
@@ -3123,6 +3363,7 @@ void ARM_VitaNative::PrepareSaveState() {
              "thunks: {} patched sites restored for the savestate ({} VFP thunks, {} svc thunks)",
              patched_sites.size(), vfp_thunks.size(), svc_thunks.size());
     patched_sites.clear();
+    GuardReset();
     vfp_thunks.clear();
     svc_thunks.clear();
     svc_refused.clear();
@@ -3136,6 +3377,9 @@ void ARM_VitaNative::PrepareSaveState() {
 }
 
 bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
+    if (Core::ThisHost() == 0) {
+        GuardTick();
+    }
     if (Core::ThisHost() == 1) {
         // A thread stopped in a mutex thunk runs on until it is out: another thread through the same
         // site would overwrite the registers the thunk keeps in its slots.
@@ -3479,6 +3723,9 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         return false;
     }
     case AZAHAR_EXIT_PABT: {
+        if (GuardTrap()) {
+            return !break_flag && !stop_requested;
+        }
         const u32 insn = FetchCode(run.ctx.r[15], false);
         if (FailedConditionalBkpt(insn, run.fsr, run.ctx.cpsr)) {
             // The site becomes a branch that never leaves the guest.
@@ -3820,6 +4067,9 @@ VitaNativeCensus TakeVitaNativeCensus() {
 #endif
 
 bool ARM_VitaNative::TakeHeldPage(u32 va, bool write, u32 pc) {
+    if (GuardStore(va, write, pc)) {
+        return true;
+    }
     // A page held for the display alone opens; otherwise an access clear of the bytes the holds
     // protect is made here, the page held still.
     const u8* const host = map->HostAt(va);

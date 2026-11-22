@@ -4,10 +4,23 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <bitset>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 #include <fmt/format.h>
+#include "common/assert.h"
 #include "common/common_types.h"
+#include "common/file_util.h"
 #include "common/logging/log.h"
 #include "core/core.h"
 #include "core/hle/kernel/process.h"
@@ -342,6 +355,1162 @@ std::string TitlePatchesWarning(u64 title_id, std::string_view product_code, u16
         }
     }
     return {};
+}
+
+namespace {
+
+/// Code as its words: a process's from the host memory behind it, copied 32 KiB at a time into a
+/// window (word by word, the reads through the guest memory's mapping cost ~50-80 ns each), or a
+/// code image's.
+class CodeReader {
+public:
+    CodeReader(Kernel::Process& process, VAddr base_, u32 bytes) : base{base_}, words{bytes / 4} {
+        auto blocks = process.vm_manager.GetBackingBlocksForRange(base, bytes);
+        if (blocks.Succeeded()) {
+            u32 at = 0;
+            for (auto& [backing, size] : blocks.Unwrap()) {
+                pieces.push_back({at, size / 4, reinterpret_cast<const u32*>(backing.GetPtr())});
+                at += size / 4;
+            }
+        }
+        words = pieces.empty() ? 0 : std::min(words, pieces.back().first + pieces.back().words);
+        window.resize(WindowWords);
+    }
+
+    CodeReader(VAddr base_, std::span<const u8> bytes)
+        : base{base_}, words{static_cast<u32>(bytes.size() / 4)} {
+        DEBUG_ASSERT(reinterpret_cast<uintptr_t>(bytes.data()) % 4 == 0);
+        if (words != 0) {
+            pieces.push_back({0, words, reinterpret_cast<const u32*>(bytes.data())});
+        }
+        window.resize(WindowWords);
+    }
+
+    [[nodiscard]] u32 Words() const {
+        return words;
+    }
+    [[nodiscard]] VAddr Base() const {
+        return base;
+    }
+    [[nodiscard]] u32 operator[](u32 i) {
+        if (i - window_first >= window_words) {
+            Fill(i);
+        }
+        return window[i - window_first];
+    }
+
+private:
+    static constexpr u32 WindowWords = 8192;
+    struct Piece {
+        u32 first;
+        u32 words;
+        const u32* data;
+    };
+
+    /// The window from word `i` on (a scan's next words; a jump back starts it a little before).
+    void Fill(u32 i) {
+        DEBUG_ASSERT_MSG(i < words, "code reader: word {} of {}", i, words);
+        window_first = i >= 64 ? i - 64 : 0;
+        window_words = std::min(WindowWords, words - window_first);
+        u32 done = 0;
+        auto piece = std::upper_bound(pieces.begin(), pieces.end(), window_first,
+                                      [](u32 v, const Piece& p) { return v < p.first; }) -
+                     1;
+        while (done < window_words) {
+            const u32 from = window_first + done - piece->first;
+            const u32 n = std::min(window_words - done, piece->words - from);
+            std::memcpy(window.data() + done, piece->data + from, n * 4);
+            done += n;
+            ++piece;
+        }
+    }
+
+    VAddr base;
+    u32 words;
+    std::vector<Piece> pieces;
+    std::vector<u32> window;
+    u32 window_first = 0;
+    u32 window_words = 0;
+};
+
+u32 RotImm(u32 imm12) {
+    const u32 r = (imm12 >> 8) * 2;
+    const u32 v = imm12 & 0xff;
+    return r != 0 ? (v >> r) | (v << (32 - r)) : v;
+}
+
+VAddr BlTarget(u32 x, VAddr at) {
+    if ((x & 0xFF000000) != 0xEB000000) {
+        return 0;
+    }
+    const s32 off = static_cast<s32>(x << 8) >> 8;
+    return static_cast<VAddr>(at + 8 + off * 4);
+}
+
+/// What a register or a stack slot holds in FsaaSlotLiteral's simulation.
+struct Held {
+    enum Kind : u8 { None, Literal, SpOffset } kind = None;
+    u32 a = 0; ///< the literal's address, or the offset from sp
+    u32 v = 0; ///< the literal's value
+};
+
+/// The literal that the stack argument `slot` holds at the call at word `call`: the caller run
+/// forward from 512 words before it, its registers, VFP registers and stack slots holding a
+/// literal (an `ldr rd, [pc, #imm]`'s), an sp offset (`add rd, sp, #imm`) or nothing.
+Held FsaaSlotLiteral(CodeReader& code, u32 call, u32 slot) {
+    std::array<Held, 16> r{};
+    std::array<Held, 32> s{};
+    std::array<Held, 1024> m{}; // sp + 0 .. 4092
+    const auto base_of = [&](u32 rn) -> std::optional<u32> {
+        if (rn == 13) {
+            return 0u;
+        }
+        if (r[rn].kind == Held::SpOffset) {
+            return r[rn].a;
+        }
+        return std::nullopt;
+    };
+    const auto slot_of = [&](std::optional<u32> off) -> Held* {
+        return off && *off % 4 == 0 && *off < 4096 ? &m[*off / 4] : nullptr;
+    };
+    const auto load = [&](Held& to, std::optional<u32> off) {
+        Held* from = slot_of(off);
+        to = from != nullptr ? *from : Held{};
+    };
+    const auto store = [&](const Held& from, std::optional<u32> off) {
+        if (Held* to = slot_of(off)) {
+            *to = from.kind == Held::Literal ? from : Held{};
+        }
+    };
+    const VAddr end = code.Base() + code.Words() * 4;
+    for (u32 i = call > 512 ? call - 512 : 0; i < call; i++) {
+        const u32 x = code[i];
+        const VAddr at = code.Base() + i * 4;
+        const u32 cond = x >> 28;
+        const u32 rd = (x >> 12) & 15;
+        const u32 rn = (x >> 16) & 15;
+        if (cond != 0xE) {
+            // A conditional instruction: what it writes is no longer known.
+            if (cond == 0xF) {
+                continue;
+            }
+            if ((x & 0x0C000000) == 0x04000000) {
+                if (x & 0x00100000) {
+                    r[rd] = {};
+                } else if (rn == 13) {
+                    store({}, x & 0xfff);
+                }
+            } else if ((x & 0x0C000000) == 0 && (x & 0x01900000) != 0x01000000) {
+                r[rd] = {};
+            } else if ((x & 0x0E000000) == 0x08000000) {
+                if (x & 0x00100000) {
+                    for (u32 k = 0; k < 16; k++) {
+                        if (x >> k & 1) {
+                            r[k] = {};
+                        }
+                    }
+                } else {
+                    m.fill({});
+                }
+            } else if ((x & 0x0E000E00) == 0x0C000A00 || (x & 0x0F000E10) == 0x0E000A00) {
+                s.fill({});
+                m.fill({});
+            }
+            continue;
+        }
+        if ((x & 0xFF7F0000) == 0xE51F0000) { // ldr rd, [pc, #+-imm]
+            const u32 imm = x & 0xfff;
+            const VAddr a = (x & 0x00800000) ? at + 8 + imm : at + 8 - imm;
+            if (a >= code.Base() && a < end && a % 4 == 0) {
+                r[rd] = {Held::Literal, a, code[(a - code.Base()) / 4]};
+            } else {
+                r[rd] = {};
+            }
+            continue;
+        }
+        if ((x & 0xFFF00000) == 0xE5900000 || (x & 0xFFF00000) == 0xE5800000) {
+            // ldr / str rd, [rn, #imm]
+            const auto b = base_of(rn);
+            const std::optional<u32> off = b ? std::optional<u32>{*b + (x & 0xfff)} : std::nullopt;
+            if (x & 0x00100000) {
+                load(r[rd], off);
+            } else {
+                store(r[rd], off);
+            }
+            continue;
+        }
+        if ((x & 0xFFFF0000) == 0xE28D0000) { // add rd, sp, #imm
+            r[rd] = {Held::SpOffset, RotImm(x & 0xfff), 0};
+            continue;
+        }
+        if ((x & 0xFFFF0FF0) == 0xE1A00000) { // mov rd, rm
+            const u32 rm = x & 15;
+            r[rd] = rm == 13 ? Held{Held::SpOffset, 0, 0} : r[rm];
+            continue;
+        }
+        if ((x & 0xFFC00000) == 0xE8800000) { // ldmia / stmia rn{!}, {list}
+            const auto b = base_of(rn);
+            u32 index = 0;
+            for (u32 k = 0; k < 16; k++) {
+                if (!(x >> k & 1)) {
+                    continue;
+                }
+                const std::optional<u32> off =
+                    b ? std::optional<u32>{*b + 4 * index} : std::nullopt;
+                if (x & 0x00100000) {
+                    load(r[k], off);
+                } else {
+                    store(r[k], off);
+                }
+                index++;
+            }
+            if ((x & 0x00200000) && rn != 13) {
+                r[rn] = b ? Held{Held::SpOffset, *b + 4 * index, 0} : Held{};
+            }
+            continue;
+        }
+        if ((x & 0xFF300F00) == 0xED100A00 || (x & 0xFF300F00) == 0xED000A00) {
+            // vldr / vstr sd, [rn, #+-imm * 4]
+            const u32 sd = ((x >> 12) & 15) << 1 | ((x >> 22) & 1);
+            const auto b = base_of(rn);
+            const u32 imm = (x & 0xff) * 4;
+            const std::optional<u32> off =
+                b ? std::optional<u32>{(x & 0x00800000) ? *b + imm : *b - imm} : std::nullopt;
+            if (x & 0x00100000) {
+                load(s[sd], off);
+            } else {
+                store(s[sd], off);
+            }
+            continue;
+        }
+        if ((x & 0xFFB00F00) == 0xEC900A00 || (x & 0xFFB00F00) == 0xEC800A00) {
+            // vldmia / vstmia rn, {sd ...}
+            const u32 sd = ((x >> 12) & 15) << 1 | ((x >> 22) & 1);
+            const auto b = base_of(rn);
+            for (u32 k = 0; k < (x & 0xff) && sd + k < 32; k++) {
+                const std::optional<u32> off = b ? std::optional<u32>{*b + 4 * k} : std::nullopt;
+                if (x & 0x00100000) {
+                    load(s[sd + k], off);
+                } else {
+                    store(s[sd + k], off);
+                }
+            }
+            continue;
+        }
+        if ((x & 0xFF000000) == 0xEB000000) { // bl: the caller-saved registers go
+            for (const u32 k : {0u, 1u, 2u, 3u, 12u, 14u}) {
+                r[k] = {};
+            }
+            for (u32 k = 0; k < 16; k++) {
+                s[k] = {};
+            }
+            continue;
+        }
+        // Anything else that writes a core register leaves it unknown.
+        if (((x & 0x0C000000) == 0 && (x & 0x01900000) != 0x01000000) ||
+            ((x & 0x0C000000) == 0x04000000 && (x & 0x00100000))) {
+            r[rd] = {};
+        }
+    }
+    return m[slot];
+}
+
+std::vector<u32> CallsTo(CodeReader& code, VAddr target) {
+    std::vector<u32> calls;
+    for (u32 i = 0; i < code.Words(); i++) {
+        if (BlTarget(code[i], code.Base() + i * 4) == target) {
+            calls.push_back(i);
+        }
+    }
+    return calls;
+}
+
+} // namespace
+
+namespace {
+
+/// MT Framework's build stamp in the read-only data ("MasterRelease CTR Oct 15 2014 14:02:51": its
+/// configuration, platform and build time), or empty.
+std::string BuildStamp(CodeReader& data) {
+    constexpr std::string_view Prefix = "MasterRelease CTR ";
+    const auto byte = [&](u32 at) { return static_cast<char>(data[at / 4] >> (at % 4 * 8)); };
+    for (u32 i = 0; i + 1 < data.Words(); i++) {
+        const u64 pair = data[i] | u64{data[i + 1]} << 32;
+        for (u32 shift = 0; shift < 4; shift++) {
+            if (static_cast<u32>(pair >> (shift * 8)) != 0x7473614D) { // "Mast"
+                continue;
+            }
+            const u32 at = i * 4 + shift;
+            std::string stamp;
+            for (u32 k = 0; at + k < data.Words() * 4 && k < 64; k++) {
+                const char c = byte(at + k);
+                if (c == 0) {
+                    break;
+                }
+                stamp += c;
+            }
+            if (stamp.starts_with(Prefix)) {
+                return stamp;
+            }
+        }
+    }
+    return {};
+}
+
+} // namespace
+
+namespace {
+
+constexpr std::array<EngineSetting, EngineSettingCount> engine_settings{{
+    {{"mFSAA_2D"},
+     10,
+     EngineDefault::Off,
+     Translatable("2D anti-aliasing"),
+     Translatable("The game draws its 3D scene twice a frame, half a pixel apart, and blends the "
+                  "two: smoother edges for far less speed (FSAA_2D).")},
+    {{"mULCDEnableEdit", "mULCDEnable"},
+     6,
+     EngineDefault::Off,
+     Translatable("Right eye render"),
+     Translatable("The scene drawn a second time for the right eye, which the 3D slider shows. "
+                  "Off, the scene is drawn once (mULCDEnable).")},
+    {{"FSAA2X"},
+     -1,
+     EngineDefault::Off,
+     Translatable("2x anti-aliasing"),
+     Translatable("The top screen drawn at twice its pixels and scaled down to the screen: "
+                  "smoother edges for more drawing (FSAA2X).")},
+    {{"FSAA4X"},
+     -1,
+     EngineDefault::Off,
+     Translatable("4x anti-aliasing"),
+     Translatable("The top screen drawn at four times its pixels and scaled down to the screen: "
+                  "smoother edges for more drawing (FSAA4X).")},
+    {{"NoAADisplay1"},
+     -1,
+     EngineDefault::On,
+     Translatable("No bottom screen anti-aliasing"),
+     Translatable("Leaves out the bottom screen's anti-aliasing (NoAADisplay1).")},
+    {{"FSAA2XDisplay1"},
+     -1,
+     EngineDefault::Off,
+     Translatable("Bottom screen 2x anti-aliasing"),
+     Translatable("The bottom screen drawn at twice its pixels and scaled down to the screen "
+                  "(FSAA2XDisplay1).")},
+    {{"FSAA4XDisplay1"},
+     -1,
+     EngineDefault::Off,
+     Translatable("Bottom screen 4x anti-aliasing"),
+     Translatable("The bottom screen drawn at four times its pixels and scaled down to the screen "
+                  "(FSAA4XDisplay1).")},
+    {{"mVSyncEdit", "mVsyncEdit", "mVSync"},
+     0,
+     EngineDefault::Game,
+     Translatable("Vertical sync"),
+     Translatable("The engine waits for the screen's refresh before it shows a new frame "
+                  "(mVSync).")},
+    {{"mTripleBufferRenderWaitEdit", "mTripleBufferRenderWait"},
+     2,
+     EngineDefault::Game,
+     Translatable("Triple buffer wait"),
+     Translatable("The engine's wait for a frame when it draws with three frame buffers "
+                  "(mTripleBufferRenderWait).")},
+    {{"mRenderSkipEdit", "mRenderSkip"},
+     -1,
+     EngineDefault::Game,
+     Translatable("Render skip"),
+     Translatable("The engine leaves frames undrawn when it falls behind (mRenderSkip).")},
+}};
+
+/// Whether the code holds `name` at word `i`, ended by a NUL: where the compiler puts the engine's
+/// property names, word-aligned beside the code that registers them.
+bool NameAt(CodeReader& code, u32 i, std::string_view name) {
+    for (u32 k = 0; k <= name.size(); k++) {
+        const u32 at = i * 4 + k;
+        if (at / 4 >= code.Words()) {
+            return false;
+        }
+        const char c = static_cast<char>(code[at / 4] >> (at % 4 * 8));
+        if (c != (k < name.size() ? name[k] : '\0')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct Image {
+    CodeReader& code;
+    CodeReader& ro;
+    CodeReader& data;
+
+    [[nodiscard]] std::optional<u32> Word(VAddr a) {
+        for (CodeReader* r : {&code, &ro, &data}) {
+            if (a % 4 == 0 && a >= r->Base() && (a - r->Base()) / 4 < r->Words()) {
+                return (*r)[(a - r->Base()) / 4];
+            }
+        }
+        return std::nullopt;
+    }
+};
+
+/// The bit a property's accessor at `a` sets (a setter's orrne/biceq or bicne/orreq of one bit),
+/// else the bit it reads (a getter's tst or and of one bit, or lsl #s then lsr #31, the byte an
+/// ldrb loads counted in), and whether it sets it; nothing for any other function.
+struct AccessorBit {
+    u32 bit;
+    bool sets;
+};
+std::optional<AccessorBit> DecodeAccessor(CodeReader& code, VAddr a) {
+    if (a % 4 != 0 || a < code.Base() || (a - code.Base()) / 4 >= code.Words()) {
+        return std::nullopt;
+    }
+    const u32 first = (a - code.Base()) / 4;
+    u32 byte = 0;
+    std::optional<u32> reads;
+    for (u32 i = first; i < first + 24 && i + 1 < code.Words(); i++) {
+        const u32 x = code[i];
+        if (x == 0xE12FFF1E) { // bx lr
+            break;
+        }
+        const u32 cond = x >> 28;
+        const u32 imm = RotImm(x & 0xfff);
+        if ((x & 0x0E500000) == 0x04500000 && (x & 0x00100000) && !reads) { // ldrb
+            byte = (x & 0xfff) & 3;
+        }
+        const bool orr_bic = (x & 0x0FE00000) == 0x03800000 || (x & 0x0FE00000) == 0x03C00000;
+        if (orr_bic && cond <= 1 && std::has_single_bit(imm)) {
+            return AccessorBit{static_cast<u32>(std::countr_zero(imm)), true};
+        }
+        if (reads || cond != 0xE) {
+            continue;
+        }
+        if (((x & 0x0FE00000) == 0x02000000 || (x & 0x0FF0F000) == 0x03100000) &&
+            std::has_single_bit(imm)) {
+            reads = static_cast<u32>(std::countr_zero(imm)) + 8 * byte;
+        } else if ((x & 0x0FFF0070) == 0x01A00000 && ((x >> 7) & 31) != 0) { // lsl #s
+            const u32 y = code[i + 1];
+            if ((y & 0x0FFF0FF0) == 0x01A00FA0 || (y & 0x0FF00FF0) == 0x01500FA0) {
+                reads = 31 - ((x >> 7) & 31) + 8 * byte; // lsr #31, or cmp rN, rM, lsr #31
+            }
+        }
+    }
+    if (reads && *reads < 32) {
+        return AccessorBit{*reads, false};
+    }
+    return std::nullopt;
+}
+
+/// The bit of the property whose name the `add rd, pc, #imm` at word `ref` points at: its
+/// registering function (back to its push {..., lr}) run forward, over its literal pools, with the
+/// words its registers hold from literals and tables, to the next call of the function that
+/// inserts a property (the one it calls most); the words that step loads, read as accessors. A
+/// setter's bit, else a getter's; nothing where they disagree.
+std::optional<u32> RegisteredBit(Image& image, u32 ref) {
+    CodeReader& code = image.code;
+    constexpr u32 FunctionWords = 0x2000;
+    constexpr u32 StepWords = 64;
+    u32 f = ref;
+    while (f > 0 && ref - f < FunctionWords && (code[f] & 0xFFFF4000) != 0xE92D4000) {
+        f--;
+    }
+    if ((code[f] & 0xFFFF4000) != 0xE92D4000) {
+        return std::nullopt;
+    }
+    const u32 last = std::min(code.Words(), ref + StepWords);
+    std::vector<std::pair<VAddr, u32>> called;
+    for (u32 i = f; i < last; i++) {
+        const VAddr to = BlTarget(code[i], code.Base() + i * 4);
+        if (to == 0) {
+            continue;
+        }
+        const auto it = std::find_if(called.begin(), called.end(),
+                                     [&](const auto& c) { return c.first == to; });
+        if (it != called.end()) {
+            it->second++;
+        } else {
+            called.emplace_back(to, 1);
+        }
+    }
+    if (called.empty()) {
+        return std::nullopt;
+    }
+    const VAddr insert =
+        std::max_element(called.begin(), called.end(), [](const auto& a, const auto& b) {
+            return a.second < b.second;
+        })->first;
+    u32 start = f;
+    std::optional<u32> end;
+    for (u32 i = f; i < last && !end; i++) {
+        if (BlTarget(code[i], code.Base() + i * 4) == insert) {
+            if (i < ref) {
+                start = i;
+            } else {
+                end = i;
+            }
+        }
+    }
+    if (!end) {
+        return std::nullopt;
+    }
+    std::array<std::optional<u32>, 16> r{};
+    std::vector<u32> loaded;
+    const auto load = [&](u32 i, std::optional<VAddr> a) -> std::optional<u32> {
+        const std::optional<u32> v = a ? image.Word(*a) : std::nullopt;
+        if (v && i > start) {
+            loaded.push_back(*v);
+        }
+        return v;
+    };
+    for (u32 i = f; i < *end; i++) {
+        const u32 x = code[i];
+        const u32 rd = (x >> 12) & 15;
+        const u32 rn = (x >> 16) & 15;
+        const VAddr pc = code.Base() + i * 4 + 8;
+        const bool writes_rd = ((x & 0x0C000000) == 0 && (x & 0x01900000) != 0x01000000) ||
+                               (x & 0x0C100000) == 0x04100000;
+        if ((x >> 28) != 0xE) {
+            if (writes_rd) {
+                r[rd].reset();
+            }
+            continue;
+        }
+        const u32 imm = x & 0xfff;
+        const bool up = (x & 0x00800000) != 0;
+        if ((x & 0xFF000000) == 0xEA000000) {
+            // b: over a literal pool (the function runs straight on); one back ends it.
+            const VAddr to = pc + static_cast<u32>(static_cast<s32>(x << 8) >> 6);
+            if (to <= pc - 8) {
+                break;
+            }
+            i = (to - code.Base()) / 4 - 1;
+        } else if (BlTarget(x, pc - 8) != 0) {
+            for (const u32 k : {0u, 1u, 2u, 3u, 12u, 14u}) {
+                r[k].reset();
+            }
+        } else if ((x & 0x0FE00000) == 0x02800000 || (x & 0x0FE00000) == 0x02400000) {
+            // add / sub rd, rn, #imm
+            const std::optional<u32> b = rn == 15 ? std::optional<u32>{pc} : r[rn];
+            const bool add = (x & 0x0FE00000) == 0x02800000;
+            r[rd] =
+                b ? std::optional<u32>{add ? *b + RotImm(imm) : *b - RotImm(imm)} : std::nullopt;
+        } else if ((x & 0x0FFF0FF0) == 0x01A00000) { // mov rd, rm
+            r[rd] = r[x & 15];
+        } else if ((x & 0x0E500000) == 0x04100000) { // ldr rd, [rn, #imm]{!} / [rn], #imm
+            const std::optional<u32> b = rn == 15 ? std::optional<u32>{pc} : r[rn];
+            const bool pre = (x & 0x01000000) != 0;
+            const std::optional<u32> moved =
+                b ? std::optional<u32>{up ? *b + imm : *b - imm} : std::nullopt;
+            const std::optional<u32> v = load(i, pre ? moved : b);
+            if ((!pre || (x & 0x00200000)) && rn != 15) {
+                r[rn] = moved;
+            }
+            r[rd] = v;
+        } else if ((x & 0x0E5000F0) == 0x004000D0 && (x & 0x01000000)) { // ldrd rd, [rn, #imm]
+            const u32 off = ((x >> 4) & 0xF0) | (x & 0xF);
+            const std::optional<u32> b = r[rn];
+            const std::optional<VAddr> a =
+                b ? std::optional<VAddr>{up ? *b + off : *b - off} : std::nullopt;
+            r[rd] = load(i, a);
+            r[(rd + 1) & 15] = load(i, a ? std::optional<VAddr>{*a + 4} : std::nullopt);
+            if (x & 0x00200000) {
+                r[rn] = a;
+            }
+        } else if ((x & 0x0E100000) == 0x08100000) { // ldm rn{!}, {list}
+            const u32 n = static_cast<u32>(std::popcount(x & 0xffff));
+            const bool pre = (x & 0x01000000) != 0;
+            const std::optional<u32> b = r[rn];
+            std::optional<VAddr> a;
+            if (b) {
+                a = up ? *b + (pre ? 4 : 0) : *b - 4 * n + (pre ? 0 : 4);
+            }
+            for (u32 k = 0, at = 0; k < 16; k++) {
+                if (x >> k & 1) {
+                    r[k] = load(i, a ? std::optional<VAddr>{*a + 4 * at} : std::nullopt);
+                    at++;
+                }
+            }
+            if ((x & 0x00200000) && !(x >> rn & 1)) {
+                r[rn] = b ? std::optional<u32>{up ? *b + 4 * n : *b - 4 * n} : std::nullopt;
+            }
+        } else if ((x & 0x0F300E00) == 0x0D100A00) { // vldr sd / dd, [rn, #+-imm * 4]
+            const std::optional<u32> b = rn == 15 ? std::optional<u32>{pc} : r[rn];
+            const u32 off = (x & 0xff) * 4;
+            const std::optional<VAddr> a =
+                b ? std::optional<VAddr>{up ? *b + off : *b - off} : std::nullopt;
+            for (u32 k = 0; k < ((x & 0x100) ? 2u : 1u); k++) {
+                load(i, a ? std::optional<VAddr>{*a + 4 * k} : std::nullopt);
+            }
+        } else if ((x & 0x0F900E00) == 0x0C900A00) { // vldmia rn{!}, {...}
+            const std::optional<u32> b = r[rn];
+            for (u32 k = 0; k < (x & 0xff); k++) {
+                load(i, b ? std::optional<VAddr>{*b + 4 * k} : std::nullopt);
+            }
+            if (x & 0x00200000) {
+                r[rn] = b ? std::optional<u32>{*b + 4 * (x & 0xff)} : std::nullopt;
+            }
+        } else if (writes_rd) {
+            r[rd].reset();
+        } else if (((x & 0x0E100000) == 0x08000000 || (x & 0x0C100000) == 0x04000000) &&
+                   (x & 0x00200000)) {
+            r[rn].reset(); // a store's write-back
+        }
+    }
+    std::optional<u32> set, get;
+    bool agree = true;
+    for (const u32 v : loaded) {
+        const std::optional<AccessorBit> a = DecodeAccessor(code, v);
+        if (!a) {
+            continue;
+        }
+        std::optional<u32>& kind = a->sets ? set : get;
+        agree &= !kind || *kind == a->bit;
+        kind = a->bit;
+    }
+    if (!agree) {
+        return std::nullopt;
+    }
+    return set ? set : get;
+}
+
+/// The bit of the property named at word `name`: the first of its registrations, the `add rd, pc,
+/// #imm` pointing at it within 64 KiB before it, that gives one.
+std::optional<u32> NamedBit(Image& image, u32 name) {
+    CodeReader& code = image.code;
+    constexpr u32 ReachWords = 0x4000;
+    const VAddr at = code.Base() + name * 4;
+    for (u32 i = name > ReachWords ? name - ReachWords : 0; i < name; i++) {
+        const u32 x = code[i];
+        if ((x & 0xFFFF0000) == 0xE28F0000 && code.Base() + i * 4 + 8 + RotImm(x & 0xfff) == at) {
+            if (const std::optional<u32> bit = RegisteredBit(image, i)) {
+                return bit;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+namespace {
+
+RenderConfig FindRenderConfigIn(CodeReader& code, CodeReader& ro, CodeReader& data,
+                                u64 program_id) {
+    RenderConfig config;
+    const auto started = std::chrono::steady_clock::now();
+    const auto ms = [](auto from, auto to) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count();
+    };
+    // MT Framework's build stamp first: the code is searched only in a title that has one.
+    const std::string stamp = BuildStamp(ro);
+    const auto stamped = std::chrono::steady_clock::now();
+    if (stamp.empty()) {
+        LOG_INFO(Loader, "title {:016X}: no MT Framework build stamp ({} ms)", program_id,
+                 ms(started, stamped));
+        return config;
+    }
+    const VAddr base = code.Base();
+    // One pass for the constructor and the config word's readers. The constructor: push {r0-r3};
+    // push {r4-r11, lr}; [vpush {d8...}]; [sub sp, sp, #n]; then a stack argument loaded (ldr rN,
+    // [sp, #S]) and its high bits masked (bic rD, rN, #M).
+    struct Ctor {
+        VAddr at;
+        u32 slot;
+        u32 mask;
+    };
+    std::vector<Ctor> ctors;
+    // The candidate readers by the word's offset: (offset, bit, the test's word index).
+    struct Read {
+        u32 offset;
+        u32 bit;
+        u32 at;
+        u32 global; ///< the pointer it loads the object from (ldr rG, =global; ldr rT, [rG]), or 0
+    };
+    // The object pointer a reader's base comes from, a few words before its add (0: none seen).
+    const auto global_of = [&](u32 add, u32 rt) -> u32 {
+        for (u32 i = add; i + 6 > add && i > 0; i--) {
+            const u32 y = code[i - 1];
+            if ((y & 0xFFF0FFFF) != (0xE5900000 | rt << 12)) {
+                continue;
+            }
+            const u32 rg = (y >> 16) & 15;
+            for (u32 k = i - 1; k + 8 > i - 1 && k > 0; k--) {
+                const u32 z = code[k - 1];
+                if ((z & 0xFF7FF000) != (0xE51F0000 | rg << 12)) {
+                    continue;
+                }
+                const u32 imm = z & 0xfff;
+                const VAddr lit = base + (k - 1) * 4 + 8;
+                const VAddr a = (z & 0x00800000) ? lit + imm : lit - imm;
+                return a >= base && a < base + code.Words() * 4 && a % 4 == 0 ? code[(a - base) / 4]
+                                                                              : 0;
+            }
+            return 0;
+        }
+        return 0;
+    };
+    std::vector<Read> reads;
+    // The settings' property names: their first words, and where the code has them.
+    struct Name {
+        std::size_t setting;
+        std::string_view name;
+        u32 head;
+    };
+    std::vector<Name> names;
+    std::bitset<256> name_starts;
+    for (std::size_t s = 0; s < engine_settings.size(); s++) {
+        for (const char* property : engine_settings[s].properties) {
+            if (property == nullptr) {
+                continue;
+            }
+            const std::string_view name = property;
+            DEBUG_ASSERT(name.size() >= 4);
+            u32 head = 0;
+            for (u32 k = 0; k < 4; k++) {
+                head |= static_cast<u32>(static_cast<u8>(name[k])) << (k * 8);
+            }
+            names.push_back({s, name, head});
+            name_starts.set(head & 0xff);
+        }
+    }
+    std::vector<std::pair<std::size_t, u32>> named; // (names' index, word)
+    for (u32 f = 0; f + 8 <= code.Words(); f++) {
+        const u32 w0 = code[f];
+        for (std::size_t n = 0; name_starts.test(w0 & 0xff) && n < names.size(); n++) {
+            if (w0 == names[n].head && NameAt(code, f, names[n].name)) {
+                named.emplace_back(n, f);
+            }
+        }
+        // A reader: add rB, rT, #0x6000 or #0x6800; [add rB, rB, #imm;] ldr rV, [rB, #imm]; then
+        // within two words a tst or an and of rV with one bit.
+        if ((w0 & 0xFFF00000) == 0xE2800000 &&
+            (RotImm(w0 & 0xfff) == 0x6000 || RotImm(w0 & 0xfff) == 0x6800)) {
+            const u32 rb = (w0 >> 12) & 15;
+            u32 offset = RotImm(w0 & 0xfff);
+            u32 j = f + 1;
+            u32 x = code[j];
+            if ((x & 0xFFF00000) == 0xE2800000 && ((x >> 16) & 15) == rb &&
+                ((x >> 12) & 15) == rb) {
+                offset += RotImm(x & 0xfff);
+                x = code[++j];
+            }
+            if ((x & 0xFFF00000) == 0xE5900000 && ((x >> 16) & 15) == rb) {
+                offset += x & 0xfff;
+                const u32 rv = (x >> 12) & 15;
+                for (u32 k = j + 1; k <= j + 2; k++) {
+                    const u32 t = code[k];
+                    if (((t & 0x0FF0F000) == 0x03100000 || (t & 0x0FE00000) == 0x02000000) &&
+                        ((t >> 16) & 15) == rv) {
+                        if (std::popcount(RotImm(t & 0xfff)) == 1) {
+                            reads.push_back(
+                                {offset, RotImm(t & 0xfff), k, global_of(f, (w0 >> 16) & 15)});
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (w0 == 0xE92D000F && code[f + 1] == 0xE92D4FF0) {
+            u32 frame = 16 + 36;
+            u32 j = f + 2;
+            if ((code[j] & 0xFFFFFF00) == 0xED2D8B00) {
+                frame += (code[j] & 0xff) * 4;
+                j++;
+            }
+            if ((code[j] & 0xFFFFF000) == 0xE24DD000) {
+                frame += RotImm(code[j] & 0xfff);
+                j++;
+            }
+            std::array<s32, 16> loaded;
+            loaded.fill(-1);
+            for (u32 i = j; i < std::min(code.Words(), j + 256); i++) {
+                const u32 x = code[i];
+                if ((x & 0xFFFF0000) == 0xE59D0000) {
+                    loaded[(x >> 12) & 15] = static_cast<s32>(x & 0xfff);
+                    continue;
+                }
+                const u32 mask = RotImm(x & 0xfff);
+                if ((x & 0xFFF00000) == 0xE3C00000 && (mask == 0xFF000000 || mask == 0xF8000000)) {
+                    const s32 at = loaded[(x >> 16) & 15];
+                    if (at < 0) {
+                        continue;
+                    }
+                    // The argument's offset past the spilled r0-r3 and the frame below them.
+                    const s32 off = at - static_cast<s32>(frame - 16) - 16;
+                    if (off >= 0 && off % 4 == 0) {
+                        ctors.push_back({base + f * 4, static_cast<u32>(off / 4), mask});
+                    }
+                    break;
+                }
+                if ((x & 0x0FFF8000) == 0x08BD8000) { // pop {..., pc}
+                    break;
+                }
+            }
+            continue;
+        }
+    }
+    // The constructors' calls, and those of wrappers that pass their stack arguments on as they
+    // are (push {lr}; sub sp, sp, #n; ... vstmia sp, {...}; bl): a pass for each.
+    const auto calls_to = [&](std::span<const VAddr> targets) {
+        std::vector<std::pair<u32, u32>> calls; // word, target's index
+        for (u32 i = 0; !targets.empty() && i < code.Words(); i++) {
+            const VAddr to = BlTarget(code[i], code.Base() + i * 4);
+            if (to == 0) {
+                continue;
+            }
+            for (u32 t = 0; t < targets.size(); t++) {
+                if (targets[t] == to) {
+                    calls.emplace_back(i, t);
+                }
+            }
+        }
+        return calls;
+    };
+    std::vector<VAddr> ctor_at;
+    for (const Ctor& c : ctors) {
+        ctor_at.push_back(c.at);
+    }
+    const auto scanned = std::chrono::steady_clock::now();
+    std::vector<std::pair<u32, u32>> calls = calls_to(ctor_at);
+    std::vector<VAddr> wrapper_at;
+    std::vector<u32> wrapper_ctor;
+    for (const auto& [c, t] : calls) {
+        u32 f = c;
+        while (f + 16 > c && f > 0 && code[f] != 0xE52DE004) {
+            f--;
+        }
+        if (code[f] != 0xE52DE004 || (code[f + 1] & 0xFFFFF000) != 0xE24DD000) {
+            continue;
+        }
+        for (u32 i = f + 2; i < c; i++) {
+            if ((code[i] & 0xFFFF0F00) == 0xEC8D0A00) {
+                wrapper_at.push_back(base + f * 4);
+                wrapper_ctor.push_back(t);
+                break;
+            }
+        }
+    }
+    for (auto& [c, t] : calls_to(wrapper_at)) {
+        calls.emplace_back(c, wrapper_ctor[t]);
+    }
+    const auto called = std::chrono::steady_clock::now();
+    for (const auto& [c, t] : calls) {
+        const Held lit = FsaaSlotLiteral(code, c, ctors[t].slot);
+        if (lit.kind != Held::Literal || (lit.v & ctors[t].mask) != 0) {
+            continue;
+        }
+        if (std::none_of(config.defaults.begin(), config.defaults.end(),
+                         [&](const RenderConfig::Word& w) { return w.addr == lit.a; })) {
+            config.defaults.push_back({lit.a, lit.v});
+        }
+    }
+    std::sort(
+        config.defaults.begin(), config.defaults.end(),
+        [](const RenderConfig::Word& a, const RenderConfig::Word& b) { return a.addr < b.addr; });
+    config.constructors = static_cast<u32>(ctors.size());
+    // The config word: the offset read for the most different bits, at least MinWordBits. With
+    // fewer it is some other word, and the defaults are enough.
+    constexpr u32 MinWordBits = 8;
+    if (!ctors.empty()) {
+        std::map<u32, u32> bits_of;
+        for (const Read& r : reads) {
+            bits_of[r.offset] |= r.bit;
+        }
+        u32 most = 0;
+        for (const auto& [offset, bits] : bits_of) {
+            if (std::popcount(bits) > most) {
+                most = static_cast<u32>(std::popcount(bits));
+                config.word_offset = offset;
+            }
+        }
+        if (most < MinWordBits) {
+            config.word_offset = 0;
+        }
+        std::map<u32, u32> globals;
+        for (const Read& r : reads) {
+            if (config.word_offset != 0 && r.offset == config.word_offset) {
+                config.readers.push_back({base + r.at * 4, code[r.at]});
+            }
+            if (r.global != 0) {
+                globals[r.global]++;
+            }
+        }
+        u32 votes = 0;
+        for (const auto& [global, n] : globals) {
+            if (n > votes) {
+                votes = n;
+                config.global = global;
+            }
+        }
+    }
+    // Each setting's bit: its first property name whose registration gives one, else its fixed bit;
+    // a bit two settings got goes to the first, a resolved one before a fixed one.
+    std::string how;
+    if (!ctors.empty()) {
+        Image image{code, ro, data};
+        std::array<const char*, EngineSettingCount> by{};
+        for (std::size_t n = 0; n < names.size(); n++) {
+            const std::size_t s = names[n].setting;
+            for (const auto& [index, word] : named) {
+                if (index != n || config.bits[s] >= 0) {
+                    continue;
+                }
+                if (const std::optional<u32> bit = NamedBit(image, word)) {
+                    config.bits[s] = static_cast<s8>(*bit);
+                    by[s] = names[n].name.data();
+                }
+            }
+        }
+        u32 taken = 0;
+        for (const bool resolved : {true, false}) {
+            for (std::size_t s = 0; s < engine_settings.size(); s++) {
+                if (resolved != (config.bits[s] >= 0)) {
+                    continue;
+                }
+                s8& bit = config.bits[s];
+                if (!resolved) {
+                    bit = engine_settings[s].fixed_bit;
+                }
+                if (bit < 0) {
+                    continue;
+                }
+                if ((taken >> bit) & 1) {
+                    LOG_WARNING(Loader,
+                                "title {:016X}: the engine setting {} has bit {} too: left out",
+                                program_id, engine_settings[s].name, bit);
+                    bit = -1;
+                    by[s] = nullptr;
+                    continue;
+                }
+                taken |= 1u << bit;
+            }
+        }
+        for (std::size_t s = 0; s < engine_settings.size(); s++) {
+            how += fmt::format(" {} {}{};", engine_settings[s].name,
+                               config.bits[s] >= 0 ? fmt::format("bit {}", config.bits[s])
+                                                   : std::string{"none"},
+                               config.bits[s] < 0 ? ""
+                               : by[s] != nullptr ? fmt::format(" ({})", by[s])
+                                                  : " (fixed)");
+        }
+    }
+    const auto done = std::chrono::steady_clock::now();
+    std::string found;
+    for (const auto& w : config.defaults) {
+        found += fmt::format(" default {:#010x} = {:#010x};", w.addr, w.value);
+    }
+    found += fmt::format(" the word +{:#x}, {} readers, the object at [{:#010x}];",
+                         config.word_offset, config.readers.size(), config.global);
+    if (ctors.empty()) {
+        LOG_WARNING(Loader,
+                    "title {:016X}: an MT Framework build ({}) with no render config this search "
+                    "knows: its engine settings are left as the game has them",
+                    program_id, stamp);
+    }
+    LOG_INFO(Loader,
+             "title {:016X}: {}: {} render config constructors ({} ms: the stamp {}, scan {}, "
+             "calls {}, literals {})",
+             program_id, stamp, ctors.size(), ms(started, done), ms(started, stamped),
+             ms(stamped, scanned), ms(scanned, called), ms(called, done));
+    if (!found.empty()) {
+        LOG_INFO(Loader, "title {:016X}:{}", program_id, found);
+    }
+    if (!how.empty()) {
+        LOG_INFO(Loader, "title {:016X}: engine settings:{}", program_id, how);
+    }
+    return config;
+}
+
+} // namespace
+
+RenderConfig FindRenderConfig(Kernel::Process& process) {
+    if (process.codeset == nullptr) {
+        return {};
+    }
+    const auto& text = process.codeset->CodeSegment();
+    const auto& ro_segment = process.codeset->RODataSegment();
+    const auto& data_segment = process.codeset->DataSegment();
+    CodeReader code{process, text.addr, static_cast<u32>(text.size)};
+    CodeReader ro{process, ro_segment.addr, static_cast<u32>(ro_segment.size)};
+    CodeReader data{process, data_segment.addr, static_cast<u32>(data_segment.size)};
+    return FindRenderConfigIn(code, ro, data, process.codeset->program_id);
+}
+
+RenderConfig FindRenderConfig(u64 program_id, VAddr text_addr, std::span<const u8> text,
+                              VAddr ro_addr, std::span<const u8> ro, VAddr data_addr,
+                              std::span<const u8> data) {
+    CodeReader code_reader{text_addr, text};
+    CodeReader ro_reader{ro_addr, ro};
+    CodeReader data_reader{data_addr, data};
+    return FindRenderConfigIn(code_reader, ro_reader, data_reader, program_id);
+}
+
+namespace {
+
+/// FindRenderConfig's version: a title it searched before a change of what it finds is searched
+/// again (its record keeps the player's choices).
+constexpr unsigned FinderVersion = 4;
+
+std::mutex engine_mutex;
+bool engine_read = false;
+std::map<u64, EngineChoices> engine_titles;
+
+std::string EnginePath() {
+    return FileUtil::GetUserPath(FileUtil::UserPath::UserDir) + "engine_settings.txt";
+}
+
+void ReadEngineLocked() {
+    if (std::exchange(engine_read, true)) {
+        return;
+    }
+    FILE* f = std::fopen(EnginePath().c_str(), "r");
+    if (f == nullptr) {
+        return;
+    }
+    char line[256];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        unsigned long long id = 0;
+        unsigned finder = 0, defaults = 0, on = 0, off = 0, found = 0;
+        char bits[96] = {};
+        // A record of an older search has other bits or none; it is searched again.
+        const int fields =
+            line[0] == '#'
+                ? 0
+                : std::sscanf(line, "%llx finder %u found %u defaults %x on %x off %x bits %95s",
+                              &id, &finder, &found, &defaults, &on, &off, bits);
+        if (fields < 6) {
+            continue;
+        }
+        EngineChoices& c = engine_titles[id];
+        c = {finder == FinderVersion, found != 0, defaults, NoEngineBits, on, off};
+        std::size_t s = 0;
+        for (const char* at = bits; fields == 7 && *at != 0 && s < EngineSettingCount; s++) {
+            const long bit = *at == '-' ? -1 : std::strtol(at, nullptr, 10);
+            c.bits[s] = static_cast<s8>(bit >= 0 && bit < 32 ? bit : -1);
+            at = std::strchr(at, ',');
+            at = at != nullptr ? at + 1 : "";
+        }
+        if (s != EngineSettingCount) {
+            c.scanned = false;
+            c.bits = NoEngineBits;
+        }
+    }
+    std::fclose(f);
+}
+
+void WriteEngineLocked() {
+    FILE* f = std::fopen(EnginePath().c_str(), "w");
+    if (f == nullptr) {
+        LOG_ERROR(Loader, "Could not write {}", EnginePath());
+        return;
+    }
+    std::fprintf(f, "# Azahar's MT Framework render settings by title ID: the search that looked, "
+                    "whether its code has\n# the render config, the bits it starts with, the "
+                    "player's (bits set, bits cleared), and\n# each setting's bit in its engine "
+                    "(-: none).\n");
+    for (const auto& [id, c] : engine_titles) {
+        std::string bits;
+        for (const s8 bit : c.bits) {
+            bits += (bits.empty() ? "" : ",") + (bit >= 0 ? std::to_string(bit) : "-");
+        }
+        std::fprintf(f, "%016llX finder %u found %u defaults %#010x on %#010x off %#010x bits %s\n",
+                     static_cast<unsigned long long>(id), c.scanned ? FinderVersion : 0u,
+                     c.found ? 1u : 0u, c.defaults, c.on, c.off, bits.c_str());
+    }
+    std::fclose(f);
+}
+
+} // namespace
+
+namespace {
+EngineGuardTarget guard_target;
+} // namespace
+
+void SetEngineGuardTarget(const EngineGuardTarget& target) {
+    guard_target = target;
+}
+
+const EngineGuardTarget& EngineGuardTargetNow() {
+    return guard_target;
+}
+
+std::span<const EngineSetting> EngineSettings() {
+    return engine_settings;
+}
+
+bool EngineSettingOn(const EngineChoices& choices, std::size_t setting) {
+    const s8 bit = choices.bits[setting];
+    if (bit < 0) {
+        return false;
+    }
+    const u32 mask = 1u << bit;
+    if ((choices.on & mask) != 0 || (choices.off & mask) != 0) {
+        return (choices.on & mask) != 0;
+    }
+    switch (engine_settings[setting].azahar) {
+    case EngineDefault::Off:
+        return false;
+    case EngineDefault::On:
+        return true;
+    case EngineDefault::Game:
+        break;
+    }
+    return (choices.defaults & mask) != 0;
+}
+
+EngineGuardBits GuardBitsOf(const EngineChoices& choices) {
+    u32 shown = 0;
+    u32 on_by_default = 0;
+    u32 off_by_default = 0;
+    for (std::size_t s = 0; s < engine_settings.size(); s++) {
+        if (choices.bits[s] < 0) {
+            continue;
+        }
+        const u32 mask = 1u << choices.bits[s];
+        shown |= mask;
+        on_by_default |= engine_settings[s].azahar == EngineDefault::On ? mask : 0;
+        off_by_default |= engine_settings[s].azahar == EngineDefault::Off ? mask : 0;
+    }
+    return {(choices.on | (on_by_default & ~choices.off)) & shown,
+            (choices.off | (off_by_default & ~choices.on)) & shown};
+}
+
+EngineChoices EngineChoicesOf(u64 title_id) {
+    std::scoped_lock lock{engine_mutex};
+    ReadEngineLocked();
+    const auto it = engine_titles.find(title_id);
+    return it != engine_titles.end() ? it->second : EngineChoices{};
+}
+
+void SetEngineChoice(u64 title_id, u32 bit, bool on) {
+    std::scoped_lock lock{engine_mutex};
+    ReadEngineLocked();
+    EngineChoices& c = engine_titles[title_id];
+    c.on = on ? c.on | bit : c.on & ~bit;
+    c.off = on ? c.off & ~bit : c.off | bit;
+    WriteEngineLocked();
+}
+
+void NoteEngineFound(u64 title_id, u32 defaults, const std::array<s8, EngineSettingCount>& bits) {
+    std::scoped_lock lock{engine_mutex};
+    ReadEngineLocked();
+    EngineChoices& c = engine_titles[title_id];
+    if (c.scanned && c.found && c.defaults == defaults && c.bits == bits) {
+        return;
+    }
+    c.scanned = true;
+    c.found = true;
+    c.defaults = defaults;
+    c.bits = bits;
+    WriteEngineLocked();
+}
+
+void NoteEngineAbsent(u64 title_id) {
+    std::scoped_lock lock{engine_mutex};
+    ReadEngineLocked();
+    EngineChoices& c = engine_titles[title_id];
+    c.scanned = true;
+    c.found = false;
+    WriteEngineLocked();
 }
 
 void SetTitlePatchesTranslator(const char* (*translate)(const char* english)) {

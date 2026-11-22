@@ -1253,7 +1253,6 @@ bool RasterizerSgxd::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig
     const u32 scale_x = config.scaling != config.NoScale ? 2 : 1;
     const u32 scale_y = config.scaling == config.ScaleXY ? 2 : 1;
     const u32 width = config.output_width / scale_x, height = config.output_height / scale_y;
-    EndDoubleRender(width, height);
     const auto describe = [&] {
         return fmt::format("{}, format {} to {}, flags {:#x}", config.DebugName(),
                            static_cast<u32>(config.input_format.Value()),
@@ -1273,50 +1272,30 @@ bool RasterizerSgxd::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig
                   describe());
         return true;
     }
-    EndDoubleRender(input, width | height << 16);
-    u32 in_width = config.input_width, in_height = config.input_height;
+    // A tiled picture into a linear one: the output takes the input's top-left width x height, its
+    // rows input_width apart. Flipped, the rows in the other order.
+    const u32 in_width = config.input_width, in_height = config.input_height;
     // A tiled picture into a tiled one (dont_swizzle on a tiled input): a pass on the output as a PICA
     // colour buffer.
     const bool tiled_out = !config.input_linear && config.dont_swizzle;
-    // The game's supersampling (Supersampled): an averaging transfer of a colour buffer to the
-    // screen marks the buffer, whose passes draw at 1x from then on; once they have, the
-    // transfer copies their picture, rows in_width / scale_x apart, as it is.
-    u32 read_x = scale_x, read_y = scale_y;
-    const u32 in_bits = UntileFormatFor(TextureFormatOf(config.input_format)).bits;
-    static const bool keep_supersample = GxmFlag("keepaa");
-    if ((scale_x != 1 || scale_y != 1) && !tiled_out && !keep_supersample) {
-        const auto s = std::find_if(supersampled.begin(), supersampled.end(),
-                                    [&](const Supersampled& e) { return e.colour == input; });
-        if (s == supersampled.end()) {
-            supersampled.push_back({input, in_width, in_height, scale_x, scale_y, width * scale_x,
-                                    height * scale_y, in_width * in_height * in_bits / 8, 0, 0,
-                                    static_cast<FramebufferRegs::ColorFormat>(
-                                        static_cast<u32>(config.input_format.Value())),
-                                    in_bits / 8});
-            LOG_INFO(Render, "supersampling: {}x{} at {:#x} averaged {}x{}: drawn at 1x from now",
-                     in_width, in_height, input, scale_x, scale_y);
-        } else if (s->drawn_1x) {
-            DEBUG_ASSERT_MSG(s->width == in_width && s->height == in_height &&
-                                 s->scale_x == scale_x && s->scale_y == scale_y,
-                             "GXM: AccelerateDisplayTransfer {}: the supersampled buffer was "
-                             "{}x{} averaged {}x{}",
-                             describe(), s->width, s->height, s->scale_x, s->scale_y);
-            in_width /= scale_x;
-            in_height /= scale_y;
-            read_x = read_y = 1;
-            s->live = false;
-        }
-    } else {
-        DEBUG_ASSERT_MSG(!MeetsSupersampled1x(input, input + in_width * in_height * in_bits / 8),
-                         "GXM: AccelerateDisplayTransfer {}: a transfer of a supersampled buffer "
-                         "drawn at 1x before its averaging one is not built",
-                         describe());
-    }
-    DEBUG_ASSERT_MSG(!config.input_linear && !config.flip_vertically &&
-                         config.scaling <= config.ScaleXY && in_width >= width * read_x &&
-                         in_height >= height * read_y,
-                     "GXM: AccelerateDisplayTransfer {}: only a tiled input without flip is "
-                     "built",
+    // A linear picture into a tiled one (input_linear without dont_swizzle): a pass on the output, the
+    // input read as a linear texture, flipped as asked. Scaled, flipped and cropped, or linear into
+    // linear, is not built.
+    const bool linear_in = config.input_linear != 0;
+    ASSERT_MSG(!linear_in || (!config.dont_swizzle && config.scaling == config.NoScale &&
+                              !(config.flip_vertically && config.crop_input_lines) &&
+                              in_width >= width && in_height >= height),
+               "sgxd: AccelerateDisplayTransfer {}: a linear input is built only into a tiled "
+               "output, unscaled, flipped only uncropped",
+               describe());
+    DEBUG_ASSERT_MSG(config.scaling <= config.ScaleXY && in_width >= width * scale_x &&
+                         in_height >= height * scale_y,
+                     "sgxd: AccelerateDisplayTransfer {}: the input is smaller than the output",
+                     describe());
+    DEBUG_ASSERT_MSG(!config.flip_vertically ||
+                         (!tiled_out && (!skewed || config.scaling == config.NoScale)),
+                     "sgxd: AccelerateDisplayTransfer {}: a flipped transfer that keeps the "
+                     "tiling, or a scaled one that crops (where its skew puts it), is not built",
                      describe());
     // The output format as the PBE's pack mode, from an A8B8G8R8 picture (the PBE truncates, as the
     // PICA does).
@@ -1471,11 +1450,11 @@ bool RasterizerSgxd::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig
         }
     } else {
         backend.TransferFromGuest({input, in_width, in_height, f.bits, f.code, f.swizzle, 0},
-                                  output, width, height, out_format.pack, out_format.mirror, &ta_us,
-                                  &d3_us, read_x, read_y);
+                                  output, width, height, out_format.pack, &ta_us, &d3_us, scale_x,
+                                  scale_y, config.flip_vertically != 0);
     }
 #ifdef VITA_DIAGNOSTICS
-    PerflogTransfer(input, in_width, in_height, output, width, height, read_x, read_y, ta_us,
+    PerflogTransfer(input, in_width, in_height, output, width, height, scale_x, scale_y, ta_us,
                     d3_us);
 #endif
     TexturesWritten(output, output + bytes);
@@ -1795,16 +1774,8 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     // there first.
     WriteColourBack(src, src + size, "a DMA from a pictured buffer");
     ColourWritesDue(dst, end, "a DMA over a pictured buffer");
-    // A supersampled buffer's live 1x picture is read in the game's layout (SupersampledSource).
-    const PAddr read = SupersampledSource(src, size);
-    DEBUG_ASSERT_MSG(read == src || size % 4 == 0,
-                     "GXM: AccelerateDma {}: a supersampled buffer's copy with a byte tail",
-                     describe());
     // The pending 3D completes before the PTLA reads what it writes, or writes what it reads.
     backend.RenderBefore(src, src + size, "a DMA's source");
-    if (read != src) {
-        backend.RenderBefore(read, read + size, "a DMA's magnified source");
-    }
     backend.RenderBefore(dst, end, "a DMA's destination");
     ForgetClears(dst, end);
     TexturesWritten(dst, end);
@@ -1812,7 +1783,7 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
 
     // Guest FCRAM is cached for the CPU (but the pages moved to CDRAM): the source is cleaned before
     // the PTLA reads it, the destination's lines leave the cache before and after.
-    const bool src_cached = read == src && src_fcram && !guest_memory.IsUncached(src, size);
+    const bool src_cached = src_fcram && !guest_memory.IsUncached(src, size);
     const bool dst_cached = dst_fcram && !guest_memory.IsUncached(dst, dst_size);
     u8* const dst_cpu = memory.GetPhysicalPointer(dst);
     if (src_cached) {
@@ -1833,16 +1804,17 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
     const u32 pixels = strided ? line / 4 * lines : (bytes ? size : size / 4);
     const u32 pixel_bytes = bytes ? 1 : 4;
     const SgxdPtlaCopy copy =
-        strided
-            ? SgxdPtlaCopy{read, dst, SGXD_PTLA_8888, src_stride, line / 4, lines, 0, dst_stride}
-            : SgxdPtlaCopy{read,
-                           dst,
-                           SGXD_PTLA_8888,
-                           RowPixels * 4,
-                           RowPixels,
-                           pixels / RowPixels,
-                           pixels % RowPixels,
-                           0};
+        strided ? SgxdPtlaCopy{src, dst, SGXD_PTLA_8888, src_stride, line / 4, lines, 0, dst_stride}
+                : SgxdPtlaCopy{src & ~3u,
+                               dst & ~3u,
+                               bytes ? SGXD_PTLA_U8 : SGXD_PTLA_8888,
+                               RowPixels * pixel_bytes,
+                               RowPixels,
+                               pixels / RowPixels,
+                               pixels % RowPixels,
+                               0,
+                               src % 4,
+                               dst % 4};
     char failed[160];
     u32 elapsed_us = 0;
     [[maybe_unused]] const int copied =
@@ -1900,234 +1872,6 @@ void RasterizerSgxd::ForgetClears(PAddr start, PAddr end) {
             i++;
         }
     }
-}
-
-namespace {
-/// A float24 register value halved: its exponent less one (16 mantissa bits, 7 exponent bits).
-u32 HalveF24(u32 raw) {
-    DEBUG_ASSERT_MSG((raw >> 16 & 0x7f) > 1, "GXM: halving the float24 {:#x}", raw);
-    return raw - (1u << 16);
-}
-} // namespace
-
-bool RasterizerGxm::DropSupersampling() {
-    auto& fb = regs.framebuffer.framebuffer;
-    const PAddr colour = fb.GetColorBufferPhysicalAddress();
-    const auto s = std::find_if(supersampled.begin(), supersampled.end(),
-                                [&](const Supersampled& e) { return e.colour == colour; });
-    // A draw of the averaged picture: its viewport the averaged region's size.
-    const auto& vp = regs.rasterizer;
-    const float vp_width = f24::FromRaw(vp.viewport_size_x).ToFloat32() * 2;
-    const float vp_height = f24::FromRaw(vp.viewport_size_y).ToFloat32() * 2;
-    const bool picture = s != supersampled.end() &&
-                         vp_width == static_cast<float>(s->region_width) &&
-                         vp_height == static_cast<float>(s->region_height);
-    DEBUG_ASSERT_MSG(s == supersampled.end() || picture || !s->live,
-                     "GXM: a draw with a {}x{} viewport to the supersampled colour buffer at "
-                     "{:#x} while its 1x picture ({}x{}) waits for its transfer is not built",
-                     vp_width, vp_height, colour, s->region_width, s->region_height);
-    const bool drop = picture;
-    if (drop != supersample_dropped) {
-        // The per-draw caches keyed by these words (StateRegs::Fragment) saw the other values.
-        for (const u32 r : {PICA_REG_INDEX(rasterizer.scissor_test.mode),
-                            PICA_REG_INDEX(rasterizer.scissor_test.x1),
-                            PICA_REG_INDEX(rasterizer.scissor_test.x2),
-                            PICA_REG_INDEX(rasterizer.viewport_size_x),
-                            PICA_REG_INDEX(rasterizer.viewport_size_y),
-                            PICA_REG_INDEX(rasterizer.viewport_corner),
-                            PICA_REG_INDEX(framebuffer.framebuffer.width)}) {
-            pica.dirty_regs.Set(r);
-        }
-        supersample_dropped = drop;
-    }
-    if (!drop) {
-        return false;
-    }
-    DEBUG_ASSERT_MSG(fb.GetWidth() == s->width && fb.GetHeight() == s->height &&
-                         s->width % (8 * s->scale_x) == 0 && s->height % (8 * s->scale_y) == 0,
-                     "GXM: the supersampled colour buffer at {:#x} ({}x{}, averaged {}x{}) drawn "
-                     "as {}x{}",
-                     colour, s->width, s->height, s->scale_x, s->scale_y, fb.GetWidth(),
-                     fb.GetHeight());
-    auto& rs = regs.rasterizer;
-    std::memcpy(&supersample_saved_fb, &fb, sizeof(fb));
-    std::memcpy(&supersample_saved_rs, &rs, sizeof(rs));
-    fb.width.Assign(s->width / s->scale_x);
-    fb.height.Assign(s->height / s->scale_y - 1);
-    // The scissor's [first, last + 1) halved outward.
-    auto& sc = rs.scissor_test;
-    if (s->scale_x == 2) {
-        rs.viewport_size_x.Assign(HalveF24(rs.viewport_size_x));
-        rs.viewport_corner.x.Assign(rs.viewport_corner.x >> 1);
-        sc.x1.Assign(sc.x1 / 2);
-        sc.x2.Assign((sc.x2 + 2) / 2 - 1);
-    }
-    if (s->scale_y == 2) {
-        rs.viewport_size_y.Assign(HalveF24(rs.viewport_size_y));
-        rs.viewport_corner.y.Assign(rs.viewport_corner.y >> 1);
-        sc.y1.Assign(sc.y1 / 2);
-        sc.y2.Assign((sc.y2 + 2) / 2 - 1);
-    }
-    s->live = true;
-    s->full_current = false;
-    if (!s->drawn_1x) {
-        s->drawn_1x = true;
-        s->depth = fb.GetDepthBufferPhysicalAddress();
-        s->depth_bytes =
-            s->width * s->height * FramebufferRegs::BytesPerDepthPixel(fb.depth_format);
-        LOG_INFO(Render, "supersampling: the colour buffer at {:#x} drawn {}x{} for {}x{}", colour,
-                 fb.GetWidth(), fb.GetHeight(), s->width, s->height);
-    }
-    return true;
-}
-
-void RasterizerGxm::RestoreSupersampling() {
-    std::memcpy(&regs.framebuffer.framebuffer, &supersample_saved_fb, sizeof(supersample_saved_fb));
-    std::memcpy(&regs.rasterizer, &supersample_saved_rs, sizeof(supersample_saved_rs));
-}
-
-PAddr RasterizerGxm::SupersampledSource(PAddr src, u32 size) {
-    for (Supersampled& s : supersampled) {
-        if (!s.live || src + size <= s.colour || s.colour + s.bytes <= src) {
-            continue;
-        }
-        DEBUG_ASSERT_MSG(src >= s.colour && src + size <= s.colour + s.bytes,
-                         "GXM: a copy of {:#x}+{:#x} reaches past the supersampled buffer at "
-                         "{:#x}+{:#x}",
-                         src, size, s.colour, s.bytes);
-        if (!s.full_current) {
-            // a game copies its top screen whole in its menus (a 480x400 TextureCopy).
-            if (s.full.gpu == 0) {
-                s.full = backend.AllocSurface(s.bytes / 4, 1);
-            }
-            if (backend.InPass()) {
-                EndPass("a supersampled buffer's picture magnified");
-            }
-            const UntileFormat f = UntileFormatFor(
-                static_cast<Pica::TexturingRegs::TextureFormat>(static_cast<u32>(s.format)));
-            backend.MagnifyTiled(
-                PicaTargetFor({s.full.gpu, s.width, s.height, s.format, s.bpp},
-                              "a supersampled buffer's picture magnified"),
-                {s.colour, s.width / s.scale_x, s.height / s.scale_y, f.bits, f.code, f.swizzle, 0},
-                s.scale_x, s.scale_y);
-            s.full_current = true;
-        }
-        return s.full.gpu + (src - s.colour);
-    }
-    return src;
-}
-
-bool RasterizerGxm::MeetsSupersampled1x(PAddr lo, PAddr hi) const {
-    return std::any_of(supersampled.begin(), supersampled.end(), [&](const Supersampled& s) {
-        return s.live && ((lo < s.colour + s.bytes && s.colour < hi) ||
-                          (s.depth != 0 && lo < s.depth + s.depth_bytes && s.depth < hi));
-    });
-}
-
-bool RasterizerGxm::SkipsDoubleRender(u32 count) {
-    static const bool keep = GxmFlag("keepaa");
-    if (keep) {
-        return false;
-    }
-    const auto& fb = regs.framebuffer.framebuffer;
-    const auto& om = regs.framebuffer.output_merger;
-    const PAddr colour = fb.GetColorBufferPhysicalAddress();
-    const auto unit0 = regs.texturing.GetTextures()[0];
-    const PAddr tex0 = unit0.enabled ? unit0.config.GetPhysicalAddress() : 0;
-    const bool quad = count == 4 || count == 6;
-    // The blend back: the copy over the scene at an alpha (MH Generations: SourceAlpha,
-    // OneMinusSourceAlpha, the TEV's constant alpha 0x7f).
-    using BF = FramebufferRegs::BlendFactor;
-    const auto& b = om.alpha_blending;
-    const bool alpha_blend =
-        om.alphablend_enable &&
-        (b.factor_source_rgb == BF::SourceAlpha || b.factor_source_rgb == BF::ConstantAlpha) &&
-        (b.factor_dest_rgb == BF::OneMinusSourceAlpha ||
-         b.factor_dest_rgb == BF::OneMinusConstantAlpha);
-    const auto& rs = regs.rasterizer;
-    const u32 vp_width = static_cast<u32>(f24::FromRaw(rs.viewport_size_x).ToFloat32() * 2);
-    const u32 vp_height = static_cast<u32>(f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2);
-    // The scene's draws: the bottom screen's (MH Generations draws it into the same buffer,
-    // 240x320) go on.
-    if (skipping_scene != 0 && colour == skipping_scene && vp_width == skipping_width &&
-        vp_height == skipping_height) {
-        if (quad && tex0 == skipping_copy && alpha_blend) {
-            skipping_scene = 0; // the blend: drawn
-        } else {
-            double_render_draws++;
-            return true;
-        }
-    }
-    if (colour != prev_draw_colour) {
-        prev_other_colour = std::exchange(prev_draw_colour, colour);
-    }
-    // MH Generations draws four times into the copy's buffer between its scene and the copy. The
-    // copy writes the texel as it is: no blend, or ONE, ZERO, ADD (MH Generations' blending is
-    // on for every draw).
-    const bool copies =
-        !om.alphablend_enable || (b.blend_equation_rgb == FramebufferRegs::BlendEquation::Add &&
-                                  b.blend_equation_a == FramebufferRegs::BlendEquation::Add &&
-                                  b.factor_source_rgb == BF::One && b.factor_dest_rgb == BF::Zero &&
-                                  b.factor_source_a == BF::One && b.factor_dest_a == BF::Zero);
-    if (quad && tex0 != 0 && tex0 == prev_other_colour && colour != tex0 && copies) {
-        // A copy of the last buffer drawn before this one: the first render's, when its pair is
-        // known.
-        copy_scene = tex0;
-        copy_target = colour;
-        drawn_after_copy = false;
-        const auto d =
-            std::find_if(double_renders.begin(), double_renders.end(), [&](const DoubleRender& r) {
-                return r.scene == tex0 && r.copy == colour;
-            });
-        if (d != double_renders.end()) {
-            skipping_scene = tex0;
-            skipping_copy = colour;
-            skipping_width = d->width;
-            skipping_height = d->height;
-        }
-    } else if (colour == copy_scene && copy_scene != 0) {
-        if (quad && tex0 == copy_target && alpha_blend && drawn_after_copy) {
-            if (std::none_of(double_renders.begin(), double_renders.end(),
-                             [&](const DoubleRender& d) {
-                                 return d.scene == copy_scene && d.copy == copy_target;
-                             })) {
-                double_renders.push_back({copy_scene, copy_target, vp_width, vp_height});
-                LOG_INFO(Render,
-                         "double render: {:#x} drawn twice, the first copied to {:#x} and blended "
-                         "back: the second skipped from now",
-                         copy_scene, copy_target);
-            }
-            copy_scene = 0;
-        } else {
-            drawn_after_copy = true;
-        }
-    }
-    return false;
-}
-
-void RasterizerGxm::LateDropped(PAddr colour, u32 width, u32 height) {
-    if (skipping_scene == 0 ||
-        !((colour == skipping_scene && width >= skipping_width && height >= skipping_height) ||
-          colour == skipping_copy)) {
-        return;
-    }
-    LOG_DEBUG(Render, "double render: a draw into {:#x} dropped late: the skip of {:#x} ends",
-              colour, skipping_scene);
-    skipping_scene = 0;
-}
-
-void RasterizerGxm::EndDoubleRender(u32 width, u32 height) {
-    if (skipping_scene == 0 || width != skipping_width || height != skipping_height) {
-        return;
-    }
-    LOG_WARNING(Render,
-                "double render: no blend of {:#x} back over {:#x} before the display transfer: "
-                "the pair dropped",
-                skipping_copy, skipping_scene);
-    std::erase_if(double_renders, [&](const DoubleRender& d) {
-        return d.scene == skipping_scene && d.copy == skipping_copy;
-    });
-    skipping_scene = 0;
 }
 
 bool RasterizerSgxd::TakeClear(PAddr start, PAddr end, ClearedRange& out) {
@@ -4492,6 +4236,39 @@ void RasterizerSgxd::LogTextureStats() {
              ends, std::exchange(viewport_masks, 0), std::exchange(pass_parks, 0),
              std::exchange(pass_trades, 0));
     t.pass_ends.clear();
+    LOG_INFO(Render, "perf: depth buffers written back: {} ({} parts)",
+             depth_writebacks - std::exchange(depth_writebacks_mark, depth_writebacks),
+             std::exchange(depth_writeback_parts, 0u));
+    std::string writeback_reasons;
+    for (const auto& [why, n] : t.writeback_reasons) {
+        writeback_reasons += fmt::format("{}{} {}", writeback_reasons.empty() ? "" : "; ", why, n);
+    }
+    t.writeback_reasons.clear();
+    LOG_INFO(Render,
+             "perf: pictures written back: {} ({}); display transfers from a picture: {}; "
+             "textures copied from one: {}",
+             colour_writebacks - std::exchange(colour_writebacks_mark, colour_writebacks),
+             writeback_reasons,
+             picture_transfers - std::exchange(picture_transfers_mark, picture_transfers),
+             picture_textures - std::exchange(picture_textures_mark, picture_textures));
+    LOG_INFO(Render,
+             "perf: alpha-keeping draws: {} opaque, {} translucent (a kill or past the flushes); "
+             "{} flush objects",
+             std::exchange(keep_alpha_opaques, 0), std::exchange(keep_alpha_translucents, 0),
+             backend.TakeAlphaFlushes());
+    EmitStats& e = emit_stats;
+    LOG_INFO(Render,
+             "perf: first tier: {} vertex programs emitted in {:.1f} ms, {} geometry in {:.1f} ms, "
+             "{} fragment in {:.1f} ms; {} code heap flushes; from the workers: {} vertex, {} "
+             "geometry, {} fragment ({:.1f} ms their emission), {} vertex and {} fragment from the "
+             "disk ({:.1f} ms), {:.1f} ms waited, {} waits helped",
+             e.programs[0], e.us[0] / 1e3, e.programs[1], e.us[1] / 1e3, e.programs[2],
+             e.us[2] / 1e3, program_flushes - e.flushes_mark, e.taken[0], e.taken[1], e.taken[2],
+             e.taken_us / 1e3, e.from_disk[0], e.from_disk[2], e.disk_us / 1e3,
+             e.waited_us / 1e3, e.helped);
+    e = EmitStats{};
+    e.flushes_mark = program_flushes;
+    const u32 tiny_logged = t.tiny_logged;
     t = TextureStats{};
     t.tiny_logged = tiny_logged;
     t.start_us = now;
@@ -7945,20 +7722,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         return true;
     }
 #endif
-    if (SkipsDoubleRender(count)) {
-        return true;
-    }
-    // The game's supersampling dropped (Supersampled): what the draw reads of its target's
-    // size, its viewport and its scissor are the 1x buffer's until it returns.
-    struct SupersampleRestore {
-        RasterizerGxm& r;
-        const bool dropped;
-        ~SupersampleRestore() {
-            if (dropped) {
-                r.RestoreSupersampling();
-            }
-        }
-    } const supersample_restore{*this, DropSupersampling()};
     const auto describe = [&] {
         return fmt::format("{} draw, topology {}, {} vertices",
                            immediate ? "immediate" : (is_indexed ? "indexed" : "non-indexed"),
@@ -8215,19 +7978,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             }
         }
     }
-    DEBUG_ASSERT_MSG(
-        std::none_of(unit_reads.begin(), unit_reads.end(),
-                     [&](const UnitRead& r) {
-                         for (u32 k = 0; k < r.parts; k++) {
-                             if (MeetsSupersampled1x(r.lo[k], r.hi[k])) {
-                                 return true;
-                             }
-                         }
-                         return false;
-                     }),
-        "GXM: {}: a texture read of a supersampled buffer drawn at 1x before its transfer is "
-        "not built",
-        describe());
     if (backend.InPass() && TexturesReadPassColour()) {
         EndPass("a draw reading its own colour buffer");
     }
