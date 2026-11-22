@@ -56,6 +56,12 @@ constexpr Swizzle YYYY{Ch::Y, Ch::Y, Ch::Y, Ch::Y};
 constexpr Swizzle ZZZZ{Ch::Z, Ch::Z, Ch::Z, Ch::Z};
 constexpr Swizzle WWWW{Ch::W, Ch::W, Ch::W, Ch::W};
 constexpr Swizzle ZWZW{Ch::Z, Ch::W, Ch::Z, Ch::W};
+/// A VPCK's lane selects, two bits a destination lane from x up: each lane its own.
+constexpr uint8_t PackSelIdentity = 0xE4;
+/// Every destination lane from source lane `lane`.
+constexpr uint8_t PackSelBroadcast(uint8_t lane) {
+    return static_cast<uint8_t>(lane * 0x55);
+}
 
 /// Source modifiers.
 enum class Mod : uint8_t { None = 0, Neg = 1, Abs = 2, NegAbs = 3 };
@@ -88,6 +94,27 @@ enum class Cond : uint8_t { Gt, Ge, Lt, Le, Eq, Ne };
 
 /// The bitwise operations (VBW).
 enum class BwOp : uint8_t { And, Or, Xor };
+
+/// The integer colour unit's factors and operations (SOP2 and SOP3) on U8 registers: four bytes, x (red) the lowest, alpha the
+/// top. Each product is x * y / 255 to nearest, a sum of two rounds once, and the result
+/// saturates (docs/sgxd/usse.md).
+struct SopCtl {
+    /// Colour factors. SOP2: 0 zero, 1 src1, 2 src2, 3 src1 alpha, 4 src2 alpha, 5 min(src1
+    /// alpha, 1 - src2 alpha); csel1 6 is 2 x src2. SOP3: 0 zero, 2 src1, 3 src1 alpha, 4 src0,
+    /// 5 src0 alpha, 6 src2, 7 src2 alpha.
+    uint8_t csel1 = 0, csel2 = 0;
+    /// Alpha factors. SOP2: asel1 0 zero, 1 src1 alpha, 2 src2 alpha, 3 2 x src2 alpha; asel2
+    /// 0 zero, 1 src1 alpha, 2 src2 alpha. SOP3: asel1 0 zero, 1 src0 alpha, 2 src1 alpha,
+    /// 3 src2 alpha; its second alpha factor is csel2's alpha (asel2 unused).
+    uint8_t asel1 = 0, asel2 = 0;
+    bool cmod1 = false, cmod2 = false, amod1 = false, amod2 = false; ///< factors complemented
+    uint8_t cop = 0, aop = 0; ///< 0 add, 1 sub (clamped at 0); SOP2 also 2 min, 3 max
+    bool src1_mod = false, asrc1_mod = false; ///< SOP2: source 1's colour, alpha complemented
+
+    /// The fields in one word (Ir::Inst keeps them so).
+    uint32_t Pack() const;
+    static SopCtl Unpack(uint32_t word);
+};
 
 /// An integer operand of the bitwise and integer multiply-add forms: a single 32-bit
 /// register, or a 7-bit (VBW) / 8-bit (I16MAD) immediate.
@@ -244,14 +271,36 @@ public:
     /// register holding the level in x, or
     /// null for the hardware's own level. Counter `drc` is what Wdf waits on.
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
-                  bool nosched = false);
+                  bool nosched = false, uint8_t fconv = 3, bool point = false);
+    /// A probe (sgxd_flags smpskip): skip-invalid on the reads that are point sampled from one
+    /// level, which run in a task's uncovered instances as every read with the hardware's own
+    /// level does. Set before any program is emitted.
+    static inline bool probe_skip_point_reads = false;
     /// The same for a cube texture: the direction at coord.xyz, three 32-bit registers from a
     /// pair boundary (CDIM 2, as psp2cgc encodes a dependent texCUBE), the hardware's level.
     void SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, bool nosched = false);
+    /// dst = c.csel1 * src1 c.cop c.csel2 * src2 on U8 registers (SOP2); `end` ends the program.
+    /// Operands are temporaries, primary or secondary attributes or outputs, not internal.
+    void Sop2(Reg dst, Reg src1, Reg src2, const SopCtl& c, bool end = false);
+    /// The three-source form (SOP3): source 0 is a temporary or a primary attribute.
+    void Sop3(Reg dst, Reg src0, Reg src1, Reg src2, const SopCtl& c, bool end = false);
+    /// VPCK F32 to normalised U8 (x 255 to nearest, saturating): the four lanes at (lo, hi),
+    /// as MoveF32x4 reads them, into the one register `dst`. `sel` picks each byte's source
+    /// lane, two bits a byte from x up (PackSelIdentity: x, y, z, w; C0SSEL-C3SSEL).
+    void PackU8(Reg dst, Reg lo, Reg hi, uint8_t sel = PackSelIdentity);
+    /// The same from four F16 lanes in the one pair at `src` (pack.u8.f16.scl).
+    void PackU8F16(Reg dst, Reg src, uint8_t sel = PackSelIdentity);
+    /// VPCK normalised U8 to F32: bytes of the register `src` (even) as F32 lanes, `sel`
+    /// each lane's byte as PackU8's. A unified-store destination takes two lanes (mask bits 2
+    /// and 3 write nothing), so four bytes go to two pairs, the
+    /// second's selects bytes 2 and 3.
+    void UnpackU8(Dst dst, Reg src, uint8_t sel = PackSelIdentity);
 
 private:
-    /// Sample2D and SampleCube: `dims` coordinates (CDIM dims - 1).
-    void Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const Reg* lod, uint8_t drc);
+    /// Sample2D and SampleCube: `dims` coordinates (CDIM dims - 1); `fconv` the result's
+    /// conversion (3 four F32 words, 2 four F16 in two words: Vita3K's fconv_type).
+    void Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
+                uint8_t fconv = 3, bool point = false);
     /// What FinishNosched needs of each word: the internal register components it reads
     /// and writes (bit = register * 4 + component) and where its nosched bit is (0: none).
     struct Meta {

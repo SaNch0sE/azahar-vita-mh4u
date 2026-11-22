@@ -89,6 +89,10 @@ enum class Op : uint8_t {
     UnpackInt,
     Sta32,
     Idf,
+    Sop2,
+    Sop3,
+    PackU8,
+    UnpackU8,
 };
 
 struct Inst {
@@ -101,6 +105,11 @@ struct Inst {
     uint8_t u[3]{};
     bool b[2]{};
     int label = -1;
+    /// Sop2, Sop3: the SopCtl word; reg[0] the destination, reg[1] source 1, xreg[0] source
+    /// 2 and xreg[1] (Sop3) source 0. PackU8: reg[0] the destination, reg[1] and xreg[0] the
+    /// F32 lanes' pairs (lo, hi). Kept out of src[] so no pass folds a load into them.
+    uint32_t ctl = 0;
+    Reg xreg[2]{};
 };
 
 /// A range of physical registers values may live in, offered in spill order.
@@ -180,8 +189,9 @@ public:
     void CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched = false);
     void Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, bool src2_scalar,
               Pred pred = Pred::None);
+    /// `fconv` 3 four F32 words, 2 four F16 in two words (Encoder::Sample2D); in Inst::ctl.
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
-                  bool nosched = false);
+                  bool nosched = false, uint8_t fconv = 3);
     /// Sample2D from a texture of one level, point sampled both ways (b[1]): the result does not
     /// depend on the level, so its coordinates need no neighbouring instance (skip_invalid_auto).
     void Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc);
@@ -195,6 +205,15 @@ public:
     void MadI16(Reg dst, Reg src0, Reg src1, IOp src2);
     void MadI32(Reg dst, Reg src0, uint8_t imm, Reg src2);
     void PackS16(Reg dst, Reg src, uint8_t comp, Pred pred = Pred::None);
+    /// The U8 colour forms (Encoder::Sop2, Sop3, PackU8, UnpackU8). A U8 value is one 32-bit
+    /// register; a virtual one sits at its quad's first register.
+    void Sop2(Reg dst, Reg src1, Reg src2, const SopCtl& c, bool end = false);
+    void Sop3(Reg dst, Reg src0, Reg src1, Reg src2, const SopCtl& c, bool end = false);
+    /// `sel`: Encoder::PackU8's lane selects, in Inst::u[0].
+    void PackU8(Reg dst, Reg lo, Reg hi, uint8_t sel = PackSelIdentity);
+    /// PackU8 from four F16 lanes in the one pair at `src` (Inst::b[1]).
+    void PackU8F16(Reg dst, Reg src, uint8_t sel = PackSelIdentity);
+    void UnpackU8(Dst dst, Reg src, uint8_t sel = PackSelIdentity);
     /// Lane `select` of the 64-bit register pair at `src` into the register `dst`, as an
     /// integer-valued float (VPCK to F32 without the scale flag, which writes lane x only):
     /// `format` is VPCK's source format, 0 U8 and 1 S8 (select a byte, 0-3 of the even

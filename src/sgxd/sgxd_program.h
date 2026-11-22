@@ -16,7 +16,7 @@ extern "C" {
 
 // A PDS program's words: data units of four words, then the code. The builders write at most
 // this many.
-#define SGXD_PROGRAM_MAX_PDS 96u
+#define SGXD_PROGRAM_MAX_PDS 160u   // 32 data units (64 words a segment) and 32 instructions
 // Attributes a vertex fetch takes (the PICA has 12), and distinct strides among them.
 #define SGXD_PROGRAM_MAX_FETCH 12u
 #define SGXD_PROGRAM_MAX_STRIDES 8u
@@ -76,6 +76,9 @@ typedef struct SgxdTextureIssue {
     uint32_t tex[4];
     unsigned coord;
     unsigned after;
+    unsigned f16;   // the texel as four F16 (FCONV 2, two words), not four F32 (FCONV 3, four)
+    unsigned raw;   // the texel's packed word as stored (FCONV 0, one word), filtered bytewise
+    unsigned proj_t;   // TEXPROJ T: the coordinate divided by its set's fourth lane (projected)
 } SgxdTextureIssue;
 
 // sgxd_program_pixel_pds with texture issues: after iterator `after`'s DOUTI, each issue's own
@@ -83,7 +86,7 @@ typedef struct SgxdTextureIssue {
 // TAGSIZE four words) and DOUTT of its words converted to F32 (FCONV 3), so its texel lands as
 // four F32 words at the PA the DOUTIs before it leave (issues fill the PAs in PDS order,
 // docs/sgxd/pds.md). DOUTU TEXTUREDEPENDENCY with any issue. -1 for more than 12
-// iterators or 3 issues.
+// iterators or 7 issues (three units, their split alphas and the fog table).
 int sgxd_program_pica_pixel_pds(uint32_t doutu0, const uint32_t *iterators, const unsigned *words,
                                 unsigned count, const SgxdTextureIssue *issues,
                                 unsigned issue_count, SgxdPdsProgram *out);

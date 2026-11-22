@@ -3,17 +3,18 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
-#include <arm_neon.h>
-#include <chrono>
-#include <utility>
 #include <bit>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <span>
 #include <string>
+#include <utility>
+#include <arm_neon.h>
 #include <fmt/ranges.h>
 #include <nihstro/shader_bytecode.h>
 #include "common/alignment.h"
@@ -28,17 +29,19 @@
 #include "video_core/pica/shader_setup.h"
 #include "video_core/pica/shader_unit.h"
 #include "video_core/pica/vertex_loader.h"
-#include "video_core/shader/shader.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
-#include "video_core/renderer_gxm/gxm_rasterizer.h"
-#include "video_core/renderer_gxm/untile_geometry.h"
-#include "video_core/renderer_gxm/vprof.h"
-#include "video_core/texture/texture_decode.h"
-#include "video_core/renderer_gxm/usse/fs_usse_gen.h"
-#include "video_core/renderer_gxm/usse/usse_ir.h"
-#include "video_core/renderer_gxm/usse/usse_program.h"
-#include "video_core/renderer_gxm/usse/vs_usse_gen.h"
+#include "video_core/renderer_sgxd/sgxd_dump.h"
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#include "video_core/renderer_sgxd/sgxd_rasterizer.h"
+#include "video_core/renderer_sgxd/untile_geometry.h"
+#include "video_core/renderer_sgxd/usse/fs_usse_gen.h"
+#include "video_core/renderer_sgxd/usse/usse_encoder.h"
+#include "video_core/renderer_sgxd/usse/usse_ir.h"
+#include "video_core/renderer_sgxd/usse/usse_program.h"
+#include "video_core/renderer_sgxd/usse/vs_usse_gen.h"
+#include "video_core/renderer_sgxd/vprof.h"
 #include "video_core/shader/generator/shader_gen.h"
+#include "video_core/shader/shader.h"
+#include "video_core/texture/texture_decode.h"
 
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
@@ -489,6 +492,49 @@ u64 BlendSplitSelect() {
     return enc.Words()[0];
 }
 
+/// A U8 program's output into o0, ending the program: `sop2 o0, pa0, pa0`.
+u64 U8OutputCopy() {
+    Usse::Encoder enc;
+    Usse::SopCtl s;
+    s.cmod1 = s.amod1 = true;
+    enc.Sop2(Usse::Reg::O(0), Usse::Reg::Pa(0), Usse::Reg::Pa(0), s, true);
+    return enc.Words()[0];
+}
+
+/// The same under a write mask: `sop3 o0, pa1, pa0, o0` with pa1 0xff in each byte written and 0
+/// in each kept (exact: each product is x * 255 / 255 or zero).
+u64 U8OutputSelect() {
+    Usse::Encoder enc;
+    Usse::SopCtl s;
+    s.csel1 = 4;
+    s.csel2 = 4;
+    s.cmod2 = true;
+    s.asel1 = 1;
+    enc.Sop3(Usse::Reg::O(0), Usse::Reg::Pa(1), Usse::Reg::Pa(0), Usse::Reg::O(0), s, true);
+    return enc.Words()[0];
+}
+
+/// A blend SOP2 into pa0 instead of o0, not ending the program (U8OutputSelect then writes the
+/// masked bytes): the destination and end fields differ.
+u64 BlendIntoPa0(u64 blend) {
+    static const u64 retarget = [] {
+        Usse::Encoder to_o0, to_pa0;
+        to_o0.Sop2(Usse::Reg::O(0), Usse::Reg::Pa(0), Usse::Reg::O(0), {}, true);
+        to_pa0.Sop2(Usse::Reg::Pa(0), Usse::Reg::Pa(0), Usse::Reg::O(0), {}, false);
+        return to_o0.Words()[0] ^ to_pa0.Words()[0];
+    }();
+    return blend ^ retarget;
+}
+
+/// The epilogue's byte mask (bit 0 R) as U8OutputSelect's pa1.
+constexpr u32 U8ByteMask(u8 mask) {
+    u32 word = 0;
+    for (u32 i = 0; i < 4; i++) {
+        word |= (mask >> i & 1) ? 0xffu << (i * 8) : 0;
+    }
+    return word;
+}
+
 /// The epilogue's blend: into o0, or with R, G and B masked apart into pa0 and through the mask.
 void PushBlend(std::vector<u64>& code, u64 blend, u8 mask) {
     if (mask == 0xf) {
@@ -679,6 +725,7 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
     Usse::Encoder::probe_skip_point_reads = SgxdFlag("smpskip");
 #endif
     // f32tev: before the second tier starts emitting.
+    Usse::SetU8Combiners(!GxmFlag("f32tev"));
     Usse::Ir::SetTier2Skip(GxmFlagValue("tier2skip"));
 #ifdef VITA_DIAGNOSTICS
     // sgxd_flags eotmixpbe=N: EUR_CR_PIXELBE for every 3D kick built (the eotmix probes).
@@ -3392,12 +3439,14 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
                  Usse::SamplerSaOffset(g.uniform_floats + Usse::DataHead(g), 0) % 2 == 0);
     for (const Usse::Uniform& u : g.uniforms) {
         // Resident, or in the memory buffer (FragmentSa) at the same float index.
-        DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <=
+        DEBUG_ASSERT(u.sa_offset + (u.u8 ? 1u : u.components) * u.array_size <=
                      (g.buffer_pointer ? g.buffer_floats : g.uniform_floats));
         const UniformField field = FragmentUniformField(u);
+        DEBUG_ASSERT(!u.u8 || (!field.is_int && u.sa_offset + u.array_size <= g.uniform_floats));
         f.uniforms.push_back({u.sa_offset, static_cast<u16>(field.offset),
                               static_cast<u8>(u.components), static_cast<u8>(u.array_size), 16,
-                              field.is_int, u.kind == Usse::UniformKind::LightDirection});
+                              field.is_int, u.kind == Usse::UniformKind::LightDirection, u.u8,
+                              u.kind == Usse::UniformKind::LightingLutRow});
     }
 
     std::vector<u64> code = g.primary;
@@ -3438,6 +3487,26 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
         phase_starts = single_phase;
     } else if (fs_white == 1 || cut) {
         code.push_back(Limm(1, 0, 0xffffffffu, true));
+    } else if (g.output_u8) {
+        // pa0 holds the colour as U8 already: the blend reads it as it is; without one, a copy into o0, or
+        // with bytes kept a select by the write mask.
+        if (epilogue.split_alpha) {
+            code.push_back(Limm(2, 2, epilogue.colour, false));
+            code.push_back(epilogue.split_alpha);
+            code.push_back(epilogue.blend);
+            code.push_back(Limm(2, 2, 0xff000000u, false));
+            code.push_back(BlendSplitSelect());
+        } else if (epilogue.blend) {
+            if (epilogue.constant) {
+                code.push_back(Limm(2, 0, epilogue.colour, false));
+            }
+            PushBlend(code, epilogue.blend, epilogue.mask);
+        } else if (epilogue.mask == 0xf) {
+            code.push_back(U8OutputCopy());
+        } else {
+            code.push_back(Limm(2, 1, U8ByteMask(epilogue.mask), false));
+            code.push_back(U8OutputSelect());
+        }
     } else if (epilogue.split_alpha) {
         code.push_back(PackInPlace);
         code.push_back(Limm(2, 2, epilogue.colour, false));
@@ -3623,6 +3692,74 @@ u16 ToF16(float value) {
 }
 
 } // namespace
+
+namespace {
+
+// The fog factor table: FogTableTexels x 1 U8888 texels, u the PICA depth: texel j is depth
+// (j + 0.5) / FogTableTexels, and a bilinear read between two texels interpolates the factor
+// (exact where the LUT is linear between them). A side's size is a power of two.
+constexpr u32 FogTableTexels = 1024;
+constexpr u32 FogTableBytes = FogTableTexels * 4;
+constexpr u32 FogTableSlots = 16;
+// U8888, read raw as the stored word, filtered byte by byte.
+constexpr unsigned FogTableFormatU8888 = 0x0c;
+
+} // namespace
+
+void RasterizerSgxd::FogTableWords(bool flip, u32 words[4]) {
+    static_assert(std::tuple_size_v<decltype(fog_table_pass)> == FogTableSlots);
+    if (fog_table_dirty || flip != fog_table_flip) {
+        fog_table_dirty = false;
+        fog_table_flip = flip;
+        const auto& lut = pica.fog.lut;
+        const u64 contents =
+            Common::HashCombine(Common::ComputeHash64(lut.data(), sizeof(lut)), flip ? 1 : 0);
+        if (!fog_tables.cpu) {
+            fog_tables = backend.AllocTextureFixed(FogTableSlots * FogTableBytes);
+            fog_table_pass.fill(~0u);
+        }
+        u32 slot;
+        if (const u32* const held = fog_tables_by_contents.Find(contents)) {
+            slot = *held;
+        } else {
+            // As SyncLutLf's ring.
+            constexpr u32 Half = FogTableSlots / 2;
+            if (fog_table_next == (fog_table_half + 1) * Half) {
+                fog_table_half_mark[fog_table_half] = backend.PassMark();
+                fog_table_half ^= 1;
+                backend.WaitPassMark(fog_table_half_mark[fog_table_half],
+                                     "a fog table ring's half");
+                fog_table_next = fog_table_half * Half;
+                fog_tables_by_contents.Clear();
+            }
+            slot = fog_table_next++;
+            DEBUG_ASSERT_MSG(fog_table_pass[slot] != passes,
+                             "sgxd: pass {} changed the fog LUT {} times: the fog table ring "
+                             "would overwrite a table its own draws read",
+                             passes, Half);
+            fog_table_pass[slot] = passes;
+            // The shader generator's factor: index = depth * 128 (1 - depth flipped), entry floor(index)
+            // clamped to [0, 127], value + difference * (index - entry) clamped to [0, 1]; (f, f, f, 1) in 8
+            // bits as the program's pack rounds, so the fog's SOP3 reads alpha one.
+            u32* const texels = reinterpret_cast<u32*>(fog_tables.cpu + slot * FogTableBytes);
+            for (u32 j = 0; j < FogTableTexels; j++) {
+                const float depth = (static_cast<float>(j) + 0.5f) / FogTableTexels;
+                const float index = (flip ? 1.0f - depth : depth) * 128.0f;
+                const u32 entry = std::min<u32>(static_cast<u32>(index), 127);
+                const float factor =
+                    std::clamp(lut[entry].ToFloat() +
+                                   lut[entry].DiffToFloat() * (index - static_cast<float>(entry)),
+                               0.0f, 1.0f);
+                const u32 byte = static_cast<u32>(std::lround(factor * 255.0f));
+                texels[j] = 0xff000000u | byte * 0x010101u;
+            }
+            fog_tables_by_contents.Emplace(contents, u32{slot});
+        }
+        sgxd_recipe_texture_words_format(fog_tables.gpu + slot * FogTableBytes, FogTableTexels, 1,
+                                         1, FogTableFormatU8888, 0, fog_table_words.data());
+    }
+    std::memcpy(words, fog_table_words.data(), sizeof(fog_table_words));
+}
 
 namespace {
 
@@ -5430,7 +5567,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // sampler: their words here.
     const Texture* unit_texture[3] = {};
     for (const Usse::TextureIssue& issue : fg.issues) {
-        unit_texture[issue.unit] = &TextureWords(issue.unit, unit_words[issue.unit]);
+        if (!issue.fog && !issue.alpha && !issue.proctex) {
+            unit_texture[issue.unit] = &TextureWords(issue.unit, unit_words[issue.unit]);
+        }
     }
     if (fsa_words != 0) {
         // Made in cached memory and copied out once (the pass data is uncached); the buffer's pointer goes
@@ -5446,6 +5585,21 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         const u8* const fs_bytes = reinterpret_cast<const u8*>(&fs_data);
         for (const UniformSource& u : fp.uniforms) {
             const u8* src = fs_bytes + u.offset;
+            if (u.u8) {
+                // A word an element, the colour's channels as bytes, rounded as the program's pack rounds.
+                for (u32 e = 0; e < u.count; e++, src += u.stride) {
+                    u32 word = 0;
+                    for (u32 c = 0; c < u.components; c++) {
+                        float value;
+                        std::memcpy(&value, src + c * 4, 4);
+                        word |=
+                            static_cast<u32>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f))
+                            << (8 * c);
+                    }
+                    std::memcpy(fsa_cpu + (u.sa + e) * 4, &word, 4);
+                }
+                continue;
+            }
             float* dst = u.sa < fg.uniform_floats ? fsa_f + u.sa
                                                   : reinterpret_cast<float*>(fbuf_cpu) + u.sa;
             for (u32 e = 0; e < u.count; e++, src += u.stride, dst += 4) {
@@ -5568,12 +5722,25 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         p.fprim = fprim.va;
         p.fprim_units = fprim.units;
     } else {
-        std::array<SgxdTextureIssue, 3> issues;
+        std::array<SgxdTextureIssue, Usse::MaxTextureIssues> issues{};
+        DEBUG_ASSERT(fg.issues.size() <= issues.size());
         for (size_t i = 0; i < fg.issues.size(); i++) {
             const Usse::TextureIssue& issue = fg.issues[i];
-            std::memcpy(issues[i].tex, unit_words[issue.unit], sizeof(issues[i].tex));
+            if (issue.fog) {
+                FogTableWords(regs.texturing.fog_flip != 0, issues[i].tex);
+                issues[i].raw = 1u;
+                issues[i].proj_t = 1u;
+            } else if (issue.proctex) {
+                ProcTexTableWords(issues[i].tex);
+            } else if (issue.alpha) {
+                DEBUG_ASSERT(unit_texture[issue.unit] != nullptr);
+                AlphaTextureWords(*unit_texture[issue.unit], unit_words[issue.unit], issues[i].tex);
+            } else {
+                std::memcpy(issues[i].tex, unit_words[issue.unit], sizeof(issues[i].tex));
+            }
             issues[i].coord = issue.coord;
             issues[i].after = issue.after_input;
+            issues[i].f16 = issue.f16 ? 1u : 0u;
         }
         const auto fprim = backend.PicaPixelPds(fp.primary_doutu0, fp.iterators.data(),
                                                 fp.iterator_words.data(), fp.iterator_count,

@@ -269,14 +269,20 @@ int sgxd_program_merge_pixel_pds(uint32_t kick0, const uint32_t tex0[4], const u
 
 // A texture issue's DOUTI: TEXISSUE the coordinate set, USEISSUE none and TEXPROJ RHW, as the
 // merge's MERGE_DOUTI_TC0 and TC1 (0x0000f100 | TCn), with TEXLASTISSUE (0x800) on the last.
-#define PICA_DOUTI_TEX(coord, last) (0x0000f100u | (coord) | ((last) ? 0x800u : 0u))
+// `proj_t`: TEXPROJ T (bits 9..8 = 2), the coordinate divided by its set's T: a projected read.
+#define PICA_DOUTI_TEX(coord, last, proj_t) \
+    (((proj_t) ? 0x0000f200u : 0x0000f100u) | (coord) | ((last) ? 0x800u : 0u))
 #define PICA_TEXEL_WORDS 4u
 #define PICA_FCONV_F32 3u
+#define PICA_TEXEL_WORDS_F16 2u
+#define PICA_FCONV_F16 2u
+#define PICA_TEXEL_WORDS_RAW 1u
+#define PICA_FCONV_RAW 0u
 
 int sgxd_program_pica_pixel_pds(uint32_t kick0, const uint32_t *iterators, const unsigned *words,
                                 unsigned count, const SgxdTextureIssue *issues,
                                 unsigned issue_count, SgxdPdsProgram *out) {
-    if (count > 12 || issue_count > 3) {
+    if (count > 12 || issue_count > 7) {
         return -1;
     }
     Pds p;
@@ -298,11 +304,18 @@ int sgxd_program_pica_pixel_pds(uint32_t kick0, const uint32_t *iterators, const
                 continue;
             }
             const unsigned last = ++issued == issue_count;
-            const unsigned issue = pds_word(&p, 1, PICA_DOUTI_TEX(issues[k].coord, last));
+            const unsigned issue =
+                pds_word(&p, 1, PICA_DOUTI_TEX(issues[k].coord, last, issues[k].proj_t));
             const unsigned quad = pds_quad(&p, issues[k].tex);
             // The DOUTI's TAGSIZE (MOVS bits 7..6) is one less than the texel's words.
-            pds_emit(&p, douti(issue, 1) | (PICA_TEXEL_WORDS - 1u) << 6);
-            pds_emit(&p, doutt(quad, PICA_FCONV_F32));
+            const unsigned texel_words = issues[k].raw   ? PICA_TEXEL_WORDS_RAW
+                                         : issues[k].f16 ? PICA_TEXEL_WORDS_F16
+                                                         : PICA_TEXEL_WORDS;
+            const unsigned fconv = issues[k].raw   ? PICA_FCONV_RAW
+                                   : issues[k].f16 ? PICA_FCONV_F16
+                                                   : PICA_FCONV_F32;
+            pds_emit(&p, douti(issue, 1) | (texel_words - 1u) << 6);
+            pds_emit(&p, doutt(quad, fconv));
         }
     }
     if (issued != issue_count) {

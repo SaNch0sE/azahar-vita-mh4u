@@ -11,7 +11,7 @@
 #include <string.h>
 
 // A program's room: words in each data segment, and instructions.
-#define SGXD_PDS_MAX_DATA 32u
+#define SGXD_PDS_MAX_DATA 64u   // a DOUT's 5-bit pair index reaches 64 words a segment
 #define SGXD_PDS_MAX_CODE 32u
 
 #define S1L 0u

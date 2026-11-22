@@ -83,10 +83,20 @@ struct TextureIssue {
     uint8_t coord;       ///< TEXISSUE: the coordinate set, TCn
     uint8_t pa;          ///< the texel's first PA register
     uint8_t after_input; ///< issued after this input's DOUTI
+    bool f16 = false;    ///< four F16 in two words (FCONV F16), for the U8 combiners
+    /// The fog factor table (RasterizerSgxd::FogTableWords), not a unit: its packed U8888 word
+    /// (FCONV raw, one word) read at TEXCOORD3 projected (TEXPROJ T), whose u and t the vertex
+    /// program writes as clip z and w: u / t is the PICA depth, linear in screen space.
+    bool fog = false;
+    /// The unit's split alpha texture (RasterizerSgxd::AlphaTextureWords, A8 with its byte in
+    /// .w), read at the unit's coordinate in the texel's form, f16 or F32.
+    bool alpha = false;
 };
 inline constexpr uint8_t IssueTexelWords = 4;
 /// The issues a pixel PDS program takes (sgxd_program_pica_pixel_pds).
 inline constexpr uint32_t MaxTextureIssues = 7;
+inline constexpr uint8_t IssueTexelWordsF16 = 2;
+inline constexpr uint8_t IssueTexelWordsRaw = 1;
 
 /// What a uniform holds: the rasterizer fills it by its kind and index (UniformName names it
 /// for messages and the program dump).
@@ -142,6 +152,9 @@ struct Uniform {
     uint32_t sa_offset;  ///< its first SA (resident) or float of the memory buffer
     uint8_t components;  ///< 1-4
     uint32_t array_size; ///< 1 for a scalar or vector
+    /// One word an element, the components as unsigned bytes (round(x * 255), x the lowest,
+    /// a missing component zero): what the U8 combiners' SOPs read in place.
+    bool u8 = false;
 };
 
 enum class SamplerKind : uint8_t {
@@ -194,6 +207,9 @@ struct Program {
     uint32_t uniform_floats = 0;
     std::vector<uint32_t> literals;
     bool uses_discard = false;
+    /// The fragment's colour leaves in pa0 as one U8 register (the U8 combiners without fog),
+    /// not as four F16 lanes in pa0 and pa1: the epilogue packs nothing.
+    bool output_u8 = false;
     /// Instruction index at which each phase begins (the first is 0); one entry per PHAS.
     std::vector<uint32_t> phase_starts{0};
     std::vector<uint64_t> primary;

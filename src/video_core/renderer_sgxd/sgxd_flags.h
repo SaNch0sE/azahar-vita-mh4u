@@ -124,6 +124,8 @@ namespace GxmRenderer {
  *             those left with w near 0 by the near and far planes (the TA has no w plane), and
  *             non-finite positions; a line for each draw with the last two (600 at most) and
  *             each second's totals
+ *   noclipplanes  no clip planes at a viewport smaller than its buffer (RasterizerGxm::
+ *             ClipPlanes): whether the TA's lockups come with the MTE clipper's work
  *
  * Checking guest memory against the CPU:
  *   untilecheck  every RGBA8, RGB8, ETC1 and ETC1A4 untile's levels against upstream's CPU

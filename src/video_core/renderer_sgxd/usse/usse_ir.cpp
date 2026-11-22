@@ -126,6 +126,26 @@ void Refs(Inst& i, std::vector<Ref>& out) {
         out.push_back({&i.reg[0], false});
         out.push_back({&i.reg[1], false});
         break;
+    case Op::Sop2:
+    case Op::Sop3:
+        out.push_back({&i.reg[0], true});
+        out.push_back({&i.reg[1], false});
+        out.push_back({&i.xreg[0], false});
+        if (i.op == Op::Sop3) {
+            out.push_back({&i.xreg[1], false});
+        }
+        break;
+    case Op::PackU8:
+        out.push_back({&i.reg[0], true});
+        out.push_back({&i.reg[1], false});
+        if (i.reg[1].bank != Bank::Internal && !i.b[1]) {
+            out.push_back({&i.xreg[0], false});
+        }
+        break;
+    case Op::UnpackU8:
+        out.push_back({&i.dst.reg, true});
+        out.push_back({&i.reg[0], false});
+        break;
     default:
         break;
     }
@@ -149,6 +169,10 @@ bool PureWrite(const Inst& i) {
     case Op::MadI32:
     case Op::PackS16:
     case Op::UnpackInt:
+    case Op::Sop2:
+    case Op::Sop3:
+    case Op::PackU8:
+    case Op::UnpackU8:
         return true;
     default:
         return false; // loads and samples have waits paired with them; tests write predicates
@@ -170,12 +194,18 @@ bool SameReg(Reg a, Reg b) {
 
 const char* OpName(Op op) {
     static const char* names[] = {
-        "phas",   "nop",   "nop_after_kill", "wdf",     "wdf_vertex", "kill_unless_p1",
-        "depthf", "end",   "end_secondary",  "label",   "br",         "phase_start",
-        "vec",    "vec16", "mad",            "dot",     "comp",       "mov_f32x4",
-        "pack_f16", "mov_internal", "cond_mov", "test", "sample2d",  "lda32",
-        "bitwise", "mad_i16", "mad_i32",     "pack_s16", "mad2",       "unpack_u8",
-        "sta32",   "idf",
+        "phas",     "nop",          "nop_after_kill",
+        "wdf",      "wdf_vertex",   "kill_unless_p1",
+        "depthf",   "end",          "end_secondary",
+        "label",    "br",           "phase_start",
+        "vec",      "vec16",        "mad",
+        "dot",      "comp",         "mov_f32x4",
+        "pack_f16", "mov_internal", "cond_mov",
+        "test",     "sample2d",     "lda32",
+        "bitwise",  "mad_i16",      "mad_i32",
+        "pack_s16", "mad2",         "unpack_u8",
+        "sta32",    "idf",          "sop2",
+        "sop3",     "pack_u8",      "unpack_u8n",
     };
     const auto n = static_cast<std::size_t>(op);
     return n < sizeof(names) / sizeof(names[0]) ? names[n] : "?";
@@ -218,6 +248,10 @@ std::string Describe(Inst& i) {
         out += " s" + std::to_string(k) + "=" + SrcName(i.src[k]);
     }
     out += " r0=" + RegName(i.reg[0]) + " r1=" + RegName(i.reg[1]);
+    if (i.op == Op::Sop2 || i.op == Op::Sop3 || i.op == Op::PackU8) {
+        out += " x0=" + RegName(i.xreg[0]) + " x1=" + RegName(i.xreg[1]) +
+               " ctl=" + std::to_string(i.ctl);
+    }
     out += " u=" + std::to_string(i.u[0]) + "," + std::to_string(i.u[1]) + "," + std::to_string(i.u[2]);
     out += " b=" + std::to_string(i.b[0]) + "," + std::to_string(i.b[1]);
     for (int k = 0; k < 2; k++) {
@@ -433,13 +467,15 @@ void Builder::SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc) {
     insts.back().u[2] = 3;
 }
 
-void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc, bool) {
+void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc, bool,
+                       uint8_t fconv) {
     Inst& i = Push(Op::Sample2D);
     i.reg[0] = dst;
     i.reg[1] = coord;
     i.u[0] = sampler_sa;
     i.u[1] = drc;
     i.u[2] = 2; // coordinates
+    i.ctl = fconv;
     i.b[0] = lod != nullptr;
     if (lod != nullptr) {
         i.src[0].reg = *lod;
@@ -521,6 +557,48 @@ void Builder::UnpackInt(Reg dst, Reg src, uint8_t select, uint8_t format) {
     i.reg[1] = src;
     i.u[0] = select;
     i.u[1] = format;
+}
+
+void Builder::Sop2(Reg dst, Reg src1, Reg src2, const SopCtl& c, bool end) {
+    Inst& i = Push(Op::Sop2);
+    i.reg[0] = dst;
+    i.reg[1] = src1;
+    i.xreg[0] = src2;
+    i.ctl = c.Pack();
+    i.b[0] = end;
+}
+
+void Builder::Sop3(Reg dst, Reg src0, Reg src1, Reg src2, const SopCtl& c, bool end) {
+    Inst& i = Push(Op::Sop3);
+    i.reg[0] = dst;
+    i.reg[1] = src1;
+    i.xreg[0] = src2;
+    i.xreg[1] = src0;
+    i.ctl = c.Pack();
+    i.b[0] = end;
+}
+
+void Builder::PackU8(Reg dst, Reg lo, Reg hi, uint8_t sel) {
+    Inst& i = Push(Op::PackU8);
+    i.reg[0] = dst;
+    i.reg[1] = lo;
+    i.xreg[0] = hi;
+    i.u[0] = sel;
+}
+
+void Builder::PackU8F16(Reg dst, Reg src, uint8_t sel) {
+    Inst& i = Push(Op::PackU8);
+    i.reg[0] = dst;
+    i.reg[1] = src;
+    i.b[1] = true;
+    i.u[0] = sel;
+}
+
+void Builder::UnpackU8(Dst dst, Reg src, uint8_t sel) {
+    Inst& i = Push(Op::UnpackU8);
+    i.dst = dst;
+    i.reg[0] = src;
+    i.u[0] = sel;
 }
 
 void Builder::AddClass(RegClass cls) {
@@ -611,6 +689,9 @@ uint8_t WriteLanes(const Inst& inst, const Reg& r) {
     case Op::MadI16:
     case Op::MadI32:
     case Op::PackS16:
+    case Op::Sop2:
+    case Op::Sop3:
+    case Op::PackU8:
         mask = 1;
         break;
     case Op::UnpackInt:
@@ -641,6 +722,7 @@ uint8_t InternalWriteLanes(const Inst& inst) {
     case Op::PackF16:
     case Op::MoveInternal:
     case Op::CondMove:
+    case Op::UnpackU8:
         return inst.dst.mask;
     default:
         return 0xf;
@@ -755,6 +837,9 @@ void Lowering::Liveness() {
         }
         if (inst.op == Op::Mad2 && IsVirtual(inst.src[0].reg)) {
             intervals[QuadOf(inst.src[0].reg)].temp_or_pa = true;
+        }
+        if (inst.op == Op::Sop3 && IsVirtual(inst.xreg[1])) {
+            intervals[QuadOf(inst.xreg[1])].temp_or_pa = true;
         }
     }
 }
@@ -1000,6 +1085,9 @@ void WrittenRegs(Inst& inst, std::vector<std::pair<Bank, int>>& out) {
         case Op::MadI16:
         case Op::MadI32:
         case Op::PackS16:
+        case Op::Sop2:
+        case Op::Sop3:
+        case Op::PackU8:
             mask = 1;
             break;
         case Op::UnpackInt:
@@ -3427,7 +3515,12 @@ std::vector<bool> Lowering::SkipInvalid() const {
         case Op::MadI32:
         case Op::PackS16:
         case Op::UnpackInt:
+        case Op::Sop2:
+        case Op::Sop3:
+        case Op::PackU8:
             return 1;
+        case Op::UnpackU8:
+            return inst.dst.mask;
         default:
             return certain ? 0 : 0xf; // F16 ops and packs: lanes are not registers
         }
@@ -3590,7 +3683,8 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
                 e.SampleCube(Map(i.reg[0]), Map(i.reg[1]), i.u[0], i.u[1]);
                 break;
             }
-            e.Sample2D(Map(i.reg[0]), Map(i.reg[1]), i.u[0], i.b[0] ? &lod : nullptr, i.u[1]);
+            e.Sample2D(Map(i.reg[0]), Map(i.reg[1]), i.u[0], i.b[0] ? &lod : nullptr, i.u[1], false,
+                       static_cast<uint8_t>(i.ctl), i.b[1]);
             break;
         }
         case Op::Lda32: {
@@ -3618,6 +3712,23 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             break;
         case Op::Idf:
             e.Idf(i.u[0]);
+            break;
+        case Op::Sop2:
+            e.Sop2(Map(i.reg[0]), Map(i.reg[1]), Map(i.xreg[0]), SopCtl::Unpack(i.ctl), i.b[0]);
+            break;
+        case Op::Sop3:
+            e.Sop3(Map(i.reg[0]), Map(i.xreg[1]), Map(i.reg[1]), Map(i.xreg[0]),
+                   SopCtl::Unpack(i.ctl), i.b[0]);
+            break;
+        case Op::PackU8:
+            if (i.b[1]) {
+                e.PackU8F16(Map(i.reg[0]), Map(i.reg[1]), i.u[0]);
+            } else {
+                e.PackU8(Map(i.reg[0]), Map(i.reg[1]), Map(i.xreg[0]), i.u[0]);
+            }
+            break;
+        case Op::UnpackU8:
+            e.UnpackU8(D(i.dst), Map(i.reg[0]), i.u[0]);
             break;
         }
     }

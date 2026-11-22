@@ -190,6 +190,10 @@ public:
     [[nodiscard]] bool InterruptArm(u64 fence);
     void InterruptDisarm();
     void InterruptWaker(s32 flag, u32 bits);
+    /// The render side took a fog LUT: FogTableWords makes its table.
+    void FogLutChanged() {
+        fog_table_dirty = true;
+    }
     /// The render side took procedural texture tables: ProcTexTableWords makes its table.
     void ProcTexTablesChanged() {
         proctex_table_dirty = true;
@@ -325,6 +329,7 @@ private:
         u8 stride;
         bool is_int;
         bool normalize; ///< the vec3 normalised as it is copied (UniformKind::LightDirection)
+        bool u8;        ///< packed to a word of bytes an element (Usse::Uniform::u8)
         bool lut_row;   ///< a LUT offset as its row's centre (UniformKind::LightingLutRow)
     };
 
@@ -534,6 +539,8 @@ private:
     void SyncLutLf();
     /// The same for the proctex colour map, alpha map, colour and colour-difference tables.
     void SyncLutProcTex();
+    /// The fog factor table's texture words for the fog LUT and `flip`, made again when either changed.
+    void FogTableWords(bool flip, u32 words[4]);
     /// The procedural texture's table (Usse::TextureIssue::proctex) for the tables and registers
     /// now, made again when either changed.
     void ProcTexTableWords(u32 words[4]);
@@ -708,6 +715,16 @@ private:
     /// The lighting LUT rows of the current half by their table's contents: a table this half holds
     /// takes that row again. Cleared when the ring moves to its other half.
     KeyIndex<u32> lut_rows_by_contents;
+    /// The fog factor tables: a ring of slots in two halves, kept as the LUT rows, the current half's
+    /// by contents and flip.
+    SgxdBackend::Data fog_tables{};
+    u32 fog_table_next{}, fog_table_half{};
+    std::array<u32, 2> fog_table_half_mark{};
+    std::array<u32, 16> fog_table_pass{};
+    std::array<u32, 4> fog_table_words{};
+    bool fog_table_dirty{true};
+    bool fog_table_flip{};
+    KeyIndex<u32> fog_tables_by_contents;
     /// The procedural textures' tables, kept as the fog tables: the current half's by the guest
     /// tables' contents and the registers the table is made from (proctex_table_regs).
     SgxdBackend::Data proctex_tables{};

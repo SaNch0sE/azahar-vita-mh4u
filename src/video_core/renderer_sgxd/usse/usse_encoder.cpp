@@ -28,6 +28,9 @@ constexpr const char* PatVdp = "00011pppsc0oderaagttnwwwwbflllkkhhiijjjjjjzzzzmm
 constexpr const char* PatVcomp = "00110pppsddyenr-aaaaobbccmmff-ttkk--ggggggg-------hhhhhhh---wwww";
 constexpr const char* PatVmov = "00111pppstrydecbmmaanoooiwwwwkllffgghhhhjjjjjjqqqqqquuuuuuvvvvvv";
 constexpr const char* PatVpck = "01000pppsnuydercaaaaffftttmmmmbbkkllgggggggoohiijjqqqqqqvwwwwwwx";
+// SOP2 and SOP3 (Vita3K's layouts).
+constexpr const char* PatSop2 = "10000ppcsnaaderbmooofllggghhhittkkjjqqqqqqquvvwwxyzzzzzzzAAAAAAA";
+constexpr const char* PatSop3 = "10001ppcsnooderbmallfgghhhiiikttjjqquuuuuuuvvvvvvvwwwwwwwxxxxxxx";
 // Bit 54 ('-' in Vita3K's pattern) is the compare's nosched bit, where VPCK and SMP have
 // theirs; exposed as 'K'. (It looked like "set on every compare except the one feeding a
 // kill" until the liveness rule explained it.)
@@ -974,17 +977,21 @@ void Encoder::Comp(CompOp op, Dst dst, Src src, uint8_t src_comp, Pred pred, boo
 }
 
 namespace {
-// VPCK from F32 (source format 6), or from F16 (5) with the four halves in the one pair at `lo`.
+// VPCK from F32 (source format 6), or from F16 (5) with the four halves in the one pair at `lo`,
+// or from U8 (0) with the four bytes in the one register at `lo`; `scale` normalises the U8 side.
+// `sel` is each destination lane's source lane, two bits a lane from x up: C1SSEL, C2SSEL and
+// C3SSEL in their own fields, C0SSEL split over bits 7 and 0 for an F32 source and in bits 1..0
+// (the absent second source's number) for the others (sgxvec34usedefs.h).
 uint64_t PackMove(uint64_t dest_fmt, Dst dst, Reg lo, Reg hi, bool skip_invalid,
-                  uint64_t src_fmt = 6) {
+                  uint64_t src_fmt = 6, uint64_t scale = 0, uint8_t sel = PackSelIdentity) {
     const auto [db, dext] = DestBank(dst.reg.bank);
     const auto [lb, lext] = Src12Bank(lo.bank);
     uint64_t hb = 0, hext = 0, hn = 0;
-    if (lo.bank == Bank::Internal || src_fmt == 5) {
+    if (lo.bank == Bank::Internal || src_fmt == 5 || src_fmt == 0) {
         // An internal register is a whole 128 bits; the second source is marked absent.
         hb = 2;
         hext = 1;
-        hn = 0;
+        hn = src_fmt == 6 ? 0 : (sel >> 1) & 1;
     } else {
         const auto [b, e] = Src12Bank(hi.bank);
         hb = b;
@@ -992,14 +999,184 @@ uint64_t PackMove(uint64_t dest_fmt, Dst dst, Reg lo, Reg hi, bool skip_invalid,
         hn = DoubledNum(hi, 7);
     }
     return Pack(PatVpck, {
-        {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'u', 0}, {'y', 0}, {'d', dext},
-        {'e', 0}, {'r', lext}, {'c', hext}, {'a', 0}, {'f', src_fmt}, {'t', dest_fmt},
-        {'m', dst.mask}, {'b', db}, {'k', lb}, {'l', hb}, {'g', SingleNum(dst.reg, 7)},
-        {'o', 3}, {'h', 0}, {'i', 1}, {'j', 2}, {'q', DoubledNum(lo, 7)}, {'v', 0},
-        {'w', hn}, {'x', 0},
-    });
+                             {'p', 0},
+                             {'s', skip_invalid ? 1u : 0u},
+                             {'n', 0},
+                             {'u', 0},
+                             {'y', 0},
+                             {'d', dext},
+                             {'e', 0},
+                             {'r', lext},
+                             {'c', hext},
+                             {'a', 0},
+                             {'f', src_fmt},
+                             {'t', dest_fmt},
+                             {'m', dst.mask},
+                             {'b', db},
+                             {'k', lb},
+                             {'l', hb},
+                             {'g', SingleNum(dst.reg, 7)},
+                             {'o', static_cast<uint64_t>(sel >> 6 & 3)},
+                             {'h', scale},
+                             {'i', static_cast<uint64_t>(sel >> 2 & 3)},
+                             {'j', static_cast<uint64_t>(sel >> 4 & 3)},
+                             {'q', DoubledNum(lo, 7)},
+                             {'v', src_fmt == 6 ? static_cast<uint64_t>(sel >> 1 & 1) : 0u},
+                             {'w', hn},
+                             {'x', static_cast<uint64_t>(sel & 1)},
+                         });
+}
+
+// A U8 operand of SOP2/SOP3: (bank, ext, number). Internal and constant registers have none.
+// A number's top bit selects the C10 reading under colour format control (psp2cgc's fx10 SOPs
+// read sa64 for sa0): the U8 operands stay below it.
+std::array<uint64_t, 3> SopOperand(Reg r) {
+    if (r.bank == Bank::Internal || r.bank == Bank::Const) {
+        Fail("usse: a SOP operand is a temporary, attribute or output register");
+    }
+    if (r.bank != Bank::Virtual && r.n >= 64) {
+        Fail("usse: a SOP operand's register number has the C10 select bit");
+    }
+    const auto [b, e] = Src12Bank(r.bank);
+    return {b, e, SingleNum(r, 7)};
 }
 } // Anonymous namespace
+
+uint32_t SopCtl::Pack() const {
+    return uint32_t{csel1} | uint32_t{csel2} << 3 | uint32_t{asel1} << 6 | uint32_t{asel2} << 8 |
+           uint32_t{cmod1} << 10 | uint32_t{cmod2} << 11 | uint32_t{amod1} << 12 |
+           uint32_t{amod2} << 13 | uint32_t{cop} << 14 | uint32_t{aop} << 16 |
+           uint32_t{src1_mod} << 18 | uint32_t{asrc1_mod} << 19;
+}
+
+SopCtl SopCtl::Unpack(uint32_t w) {
+    SopCtl c;
+    c.csel1 = w & 7;
+    c.csel2 = w >> 3 & 7;
+    c.asel1 = w >> 6 & 3;
+    c.asel2 = w >> 8 & 3;
+    c.cmod1 = w >> 10 & 1;
+    c.cmod2 = w >> 11 & 1;
+    c.amod1 = w >> 12 & 1;
+    c.amod2 = w >> 13 & 1;
+    c.cop = w >> 14 & 3;
+    c.aop = w >> 16 & 3;
+    c.src1_mod = w >> 18 & 1;
+    c.asrc1_mod = w >> 19 & 1;
+    return c;
+}
+
+void Encoder::Sop2(Reg dst, Reg src1, Reg src2, const SopCtl& c, bool end) {
+    dst = Map(dst);
+    const auto [db, dext] = DestBank(dst.bank);
+    if (dst.bank == Bank::Internal || dst.bank == Bank::Const) {
+        Fail("usse: a SOP destination is a temporary, attribute or output register");
+    }
+    const auto s1 = SopOperand(Map(src1));
+    const auto s2 = SopOperand(Map(src2));
+    Push(Pack(PatSop2,
+              {
+                  {'p', 0},
+                  {'c', c.cmod1},
+                  {'s', skip_invalid ? 1u : 0u},
+                  {'n', 0},
+                  {'a', c.asel1},
+                  {'d', dext},
+                  {'e', end ? 1u : 0u},
+                  {'r', s1[1]},
+                  {'b', s2[1]},
+                  {'m', c.cmod2},
+                  {'o', 0},
+                  {'f', c.amod1},
+                  {'l', c.asel2},
+                  {'g', c.csel1},
+                  {'h', c.csel2},
+                  {'i', c.amod2},
+                  {'t', db},
+                  {'k', s1[0]},
+                  {'j', s2[0]},
+                  {'q', SingleNum(dst, 7)},
+                  {'u', c.src1_mod},
+                  {'v', c.cop},
+                  {'w', c.aop},
+                  {'x', c.asrc1_mod},
+                  {'y', 0},
+                  {'z', s1[2]},
+                  {'A', s2[2]},
+              }),
+         54, 0, 0);
+}
+
+void Encoder::Sop3(Reg dst, Reg src0, Reg src1, Reg src2, const SopCtl& c, bool end) {
+    dst = Map(dst);
+    src0 = Map(src0);
+    const auto [db, dext] = DestBank(dst.bank);
+    if (dst.bank == Bank::Internal || dst.bank == Bank::Const) {
+        Fail("usse: a SOP destination is a temporary, attribute or output register");
+    }
+    if (src0.bank != Bank::Temp && src0.bank != Bank::PrimAttr) {
+        Fail("usse: SOP3's source 0 is a temporary or a primary attribute");
+    }
+    const auto s1 = SopOperand(Map(src1));
+    const auto s2 = SopOperand(Map(src2));
+    Push(Pack(PatSop3,
+              {
+                  {'p', 0},
+                  {'c', c.cmod1},
+                  {'s', skip_invalid ? 1u : 0u},
+                  {'n', 0},
+                  {'o', c.cop},
+                  {'d', dext},
+                  {'e', end ? 1u : 0u},
+                  {'r', s1[1]},
+                  {'b', s2[1]},
+                  {'m', c.cmod2},
+                  {'a', c.amod1},
+                  {'l', c.asel1},
+                  {'f', 0},
+                  {'g', c.aop},
+                  {'h', c.csel1},
+                  {'i', c.csel2},
+                  {'k', src0.bank == Bank::PrimAttr ? 1u : 0u},
+                  {'t', db},
+                  {'j', s1[0]},
+                  {'q', s2[0]},
+                  {'u', SingleNum(dst, 7)},
+                  {'v', SingleNum(src0, 7)},
+                  {'w', s1[2]},
+                  {'x', s2[2]},
+              }),
+         54, 0, 0);
+}
+
+void Encoder::PackU8(Reg dst, Reg lo, Reg hi, uint8_t sel) {
+    dst = Map(dst);
+    lo = Map(lo);
+    hi = Map(hi);
+    Push(PackMove(0, {dst, 0xf}, lo, hi, skip_invalid, 6, 1, sel), 54, ReadsAll(lo) | ReadsAll(hi),
+         0);
+}
+
+void Encoder::PackU8F16(Reg dst, Reg src, uint8_t sel) {
+    dst = Map(dst);
+    src = Map(src);
+    if (src.n & 1) {
+        Fail("usse: four F16 lanes are read from an even register");
+    }
+    Push(PackMove(0, {dst, 0xf}, src, src, skip_invalid, 5, 1, sel), 54, ReadsAll(src), 0);
+}
+
+void Encoder::UnpackU8(Dst dst, Reg src, uint8_t sel) {
+    dst.reg = Map(dst.reg);
+    src = Map(src);
+    if (src.n & 1) {
+        Fail("usse: four U8 lanes are read from an even register");
+    }
+    if (dst.reg.bank != Bank::Internal && (dst.mask & 0xc) != 0) {
+        Fail("usse: a U8 unpack into unified-store registers writes two lanes");
+    }
+    Push(PackMove(6, dst, src, src, skip_invalid, 0, 1, sel), 54, 0, Writes(dst, Pred::None));
+}
 
 void Encoder::UnpackF16x4(Dst dst, Reg src) {
     dst.reg = Map(dst.reg);
@@ -1103,8 +1280,8 @@ void Encoder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2,
 }
 
 void Encoder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
-                       bool nosched) {
-    Sample(dst, coord, 2, sampler_sa, lod, drc);
+                       bool nosched, uint8_t fconv, bool point) {
+    Sample(dst, coord, 2, sampler_sa, lod, drc, fconv, point);
 }
 
 void Encoder::SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, bool nosched) {
@@ -1112,7 +1289,7 @@ void Encoder::SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, bo
 }
 
 void Encoder::Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const Reg* lod,
-                     uint8_t drc) {
+                     uint8_t drc, uint8_t fconv, bool point) {
     const auto [cb, cext] = Src0Bank(coord.bank);
     if (dst.bank != Bank::Temp && dst.bank != Bank::PrimAttr) {
         Fail("usse: a texture read lands in a temporary or a primary attribute");
@@ -1126,15 +1303,33 @@ void Encoder::Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const
     if (sampler_sa & 1) {
         Fail("usse: a texture's control words start at an even secondary attribute");
     }
-    Push(Pack(PatSmp, {
-        {'p', 0}, {'s', lod ? 1u : 0u}, {'n', 0}, {'y', 0}, {'m', 0},
-        {'r', cext}, {'c', 0}, {'e', lod ? 0u : 1u}, {'f', 3}, {'a', 0},
-        {'d', static_cast<uint64_t>(dims - 1)},
-        {'l', lod ? 2u : 0u}, {'t', dst.bank == Bank::PrimAttr ? 1u : 0u}, {'b', 0},
-        {'g', 0}, {'k', cb}, {'h', drc}, {'i', 3}, {'j', lod ? 0u : 2u}, {'o', dst.n},
-        {'q', DoubledNum(coord, 8)}, {'u', static_cast<uint64_t>(sampler_sa >> 1)},
-        {'v', lod ? DoubledNum(*lod, 8) : 0u},
-    }), 54, static_cast<uint16_t>(ReadsAll(coord) | (lod ? ReadsAll(*lod) : 0)), 0);
+    Push(Pack(PatSmp,
+              {
+                  {'p', 0},
+                  {'s', lod || (point && probe_skip_point_reads && skip_invalid) ? 1u : 0u},
+                  {'n', 0},
+                  {'y', 0},
+                  {'m', 0},
+                  {'r', cext},
+                  {'c', 0},
+                  {'e', lod ? 0u : 1u},
+                  {'f', fconv},
+                  {'a', 0},
+                  {'d', static_cast<uint64_t>(dims - 1)},
+                  {'l', lod ? 2u : 0u},
+                  {'t', dst.bank == Bank::PrimAttr ? 1u : 0u},
+                  {'b', 0},
+                  {'g', 0},
+                  {'k', cb},
+                  {'h', drc},
+                  {'i', 3},
+                  {'j', lod ? 0u : 2u},
+                  {'o', dst.n},
+                  {'q', DoubledNum(coord, 8)},
+                  {'u', static_cast<uint64_t>(sampler_sa >> 1)},
+                  {'v', lod ? DoubledNum(*lod, 8) : 0u},
+              }),
+         54, static_cast<uint16_t>(ReadsAll(coord) | (lod ? ReadsAll(*lod) : 0)), 0);
 }
 
 } // namespace GxmRenderer::Usse

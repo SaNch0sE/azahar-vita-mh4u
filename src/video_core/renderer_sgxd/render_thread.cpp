@@ -2362,6 +2362,7 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
     case Op::Fog:
         std::memcpy(render_pica.fog.lut.data(), p, sizeof(render_pica.fog.lut));
         render_pica.fog.lut_dirty = true;
+        rasterizer.FogLutChanged();
         break;
     case Op::ProcTex: {
         auto& t = render_pica.proctex;

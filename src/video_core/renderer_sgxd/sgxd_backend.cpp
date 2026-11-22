@@ -872,8 +872,8 @@ SgxdBackend::PdsRef SgxdBackend::PixelPds(u32 doutu0, const u32* iterators, cons
 SgxdBackend::PdsRef SgxdBackend::PicaPixelPds(u32 doutu0, const u32* iterators, const u32* words,
                                               u32 count, const SgxdTextureIssue* issues,
                                               u32 issue_count) {
-    DEBUG_ASSERT(count <= 12 && issue_count <= 3);
-    std::array<u32, 4 + 2 * 12 + 6 * 3> key;
+    DEBUG_ASSERT(count <= 12 && issue_count <= 7);
+    std::array<u32, 4 + 2 * 12 + 5 * 7> key;
     u32 n = 0;
     key[n++] = TagPicaPixel;
     key[n++] = doutu0;
@@ -884,7 +884,8 @@ SgxdBackend::PdsRef SgxdBackend::PicaPixelPds(u32 doutu0, const u32* iterators, 
         key[n++] = words[i];
     }
     for (u32 i = 0; i < issue_count; i++) {
-        key[n++] = issues[i].coord | issues[i].after << 8;
+        key[n++] = issues[i].coord | issues[i].after << 8 | issues[i].f16 << 16 |
+                   issues[i].raw << 17 | issues[i].proj_t << 18;
         key[n++] = issues[i].tex[0];
         key[n++] = issues[i].tex[1];
         key[n++] = issues[i].tex[2];
