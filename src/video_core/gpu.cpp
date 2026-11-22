@@ -584,11 +584,12 @@ void GPU::MemoryTransfer() {
         config.is_texture_copy ||
         right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                        config.input_height, config.output_height);
+    // The output's pages move without their contents: only the bytes the transfer writes
+    // (OutputBytes, the scaling's). The registers' unscaled size moved a game Y's heap past
+    // a halved screen capture's output, uncopied, and the guest read the pool's old pixels as
+    // a pointer.
     if (!config.is_texture_copy && allow_display_transfer) {
-        KeepUncached(config.GetPhysicalOutputAddress(),
-                     config.output_width * config.output_height *
-                         BytesPerPixel(config.output_format),
-                     true);
+        KeepUncached(config.GetPhysicalOutputAddress(), config.OutputBytes(), true);
     }
     RunGpuOp(OpKind::Transfer,
              [this, &config, allow_display_transfer] {

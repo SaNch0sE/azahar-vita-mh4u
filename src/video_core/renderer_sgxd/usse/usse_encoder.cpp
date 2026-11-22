@@ -512,6 +512,28 @@ void Encoder::Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_
     }), 54, 0, 0);
 }
 
+void Encoder::Sta32(Reg base, uint8_t offset_words, Reg value, uint8_t drc) {
+    base = Map(base);
+    value = Map(value);
+    if (offset_words > 127) {
+        Fail("usse: a store's immediate offset is 7 bits");
+    }
+    const auto [bb, bext] = Src0Bank(base.bank);
+    const auto [vb, vext] = IntSrc12Bank(value.bank);
+    // op 2 (store), one word; moe_expand and the L1/L2 bypass set as in the firmware's word
+    // f022000280004282.
+    Push(Pack(PatVldst, {
+        {'o', 2}, {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'n', 0}, {'m', 1}, {'y', 0}, {'c', 0},
+        {'r', bext}, {'b', 1}, {'a', vext}, {'k', 0}, {'d', 0}, {'e', 0}, {'t', 0}, {'g', 0},
+        {'f', 0}, {'i', 0}, {'h', bb}, {'j', 1}, {'l', drc}, {'q', 2}, {'u', vb}, {'v', 0},
+        {'w', SingleNum(base, 7)}, {'x', offset_words}, {'z', SingleNum(value, 7)},
+    }), 54, 0, 0);
+}
+
+void Encoder::Idf(uint8_t drc) {
+    Push(drc ? 0xf820000100000000ull : 0xf820000000000000ull, 0, 0, 0);
+}
+
 void Encoder::Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred) {
     dst = Map(dst);
     const auto [db, dext] = DestBank(dst.bank);

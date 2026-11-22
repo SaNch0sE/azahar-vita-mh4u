@@ -106,6 +106,7 @@ enum DataSlot : uint32_t {
     DataOnes16 = 12, ///< 0x00010001: the mad.i16 multiplier for an add (even, like psp2cgc's)
     DataPad13 = 13,
     DataSize = 14,
+    DataGsCap = DataSize, ///< Geometry: gs_max_triangles as a float, past the shared literals
 };
 constexpr uint32_t DataLiteralCount = DataSize - 1;
 
@@ -381,6 +382,31 @@ private:
     std::vector<Context> contexts;
     int loop_depth = 0;
     bool per_instance = false;
+
+    int out_address_pa = -1;          ///< StoreOutputs: the vertex's store address
+    std::vector<Quad> gs_row_quads;   ///< Geometry, point mode: input register v<r>
+    std::array<std::vector<Quad>, 3> gs_slots; ///< Geometry: the emit buffer's three vertices
+    Quad gs_state{};                  ///< Geometry: x the triangles stored (float), y a triangle's
+                                      ///< bytes / 16, z the next triangle's address (ints)
+    /// The last SETEMIT on the straight-line path to here, or nothing past a join.
+    struct EmitState {
+        uint8_t vertex_id;
+        bool prim;
+        bool winding;
+    };
+    std::optional<EmitState> emit_state;
+    /// Literals past the shared ones: Geometry's cap and a pad, so the prefetched uniforms
+    /// after them stay on even SAs (a pair operand addresses them).
+    uint32_t ExtraLiterals() const {
+        return req.mode == VsMode::Geometry ? 2u : 0u;
+    }
+    std::optional<Operand> GsTableRead(uint32_t index, uint32_t addr, const Swizzle& swz,
+                                       Mod mod, Reg table);
+    std::optional<Operand> GsSource(const SourceRegister& reg, uint32_t addr, const Swizzle& swz,
+                                    Mod mod);
+    void GsEmit();
+    void StoreQuad(Reg base, uint32_t word, const Quad& q);
+    void EpilogueStreamOut();
 };
 
 // ---------------------------------------------------------------------------------------
@@ -543,9 +569,22 @@ void VertexEmitter::Layout() {
     default_sa.fill(-1);
     uniform_sa.fill(-1);
 
+    // A geometry program's attribute is its row addresses (VsMode); its inputs are loaded.
+    if (req.mode == VsMode::Geometry) {
+        if (req.gs_uniform_table && (!req.gs_rows_uniform || req.gs_rows_table)) {
+            Refuse("a uniform table outside the fixed-primitive mode");
+        }
+        const uint32_t words = req.gs_rows_table ? 4 : 2 + req.gs_rows;
+        if (words + 2 > PaLimit) {
+            Refuse("more geometry input rows than primary attributes");
+        }
+        gxp.attributes.push_back({"gs_in_rows", 0});
+        gxp.attrib_pa_regs = (1ull << words) - 1;
+        pa_inputs = static_cast<uint8_t>((words + 1) & ~1u);
+    }
     // Attributes: four PAs each, in register order; the components a loader does not
     // supply are filled by the prologue.
-    for (uint32_t i = 0; i < 16; i++) {
+    for (uint32_t i = 0; i < 16 && req.mode != VsMode::Geometry; i++) {
         if ((scan.inputs & (1u << i)) == 0 || (req.default_regs & (1u << i)) != 0) {
             continue;
         }
@@ -572,13 +611,19 @@ void VertexEmitter::Layout() {
         gxp.attrib_pa_regs |= 1ull << pa_inputs;
         pa_inputs = static_cast<uint8_t>(pa_inputs + 2);
     }
+    if (req.mode == VsMode::StoreOutputs) {
+        out_address_pa = pa_inputs;
+        gxp.attributes.push_back({"vs_out_address", pa_inputs});
+        gxp.attrib_pa_regs |= 1ull << pa_inputs;
+        pa_inputs = static_cast<uint8_t>(pa_inputs + 2);
+    }
 
     // Resident uniforms: the depth mapping, the input defaults, the integer uniforms.
     gxp.uniforms.push_back({"flip_viewport", SaFlipViewport, 1, 1});
     gxp.uniforms.push_back({"depth_scale", SaDepthScale, 1, 1});
     gxp.uniforms.push_back({"depth_offset", SaDepthOffset, 1, 1});
     resident = SaResidentHead;
-    for (uint32_t i = 0; i < 16; i++) {
+    for (uint32_t i = 0; i < 16 && req.mode != VsMode::Geometry; i++) {
         if ((scan.inputs & (1u << i)) != 0 && (req.default_regs & (1u << i)) != 0) {
             default_sa[i] = static_cast<int>(resident);
             gxp.uniforms.push_back({"vs_in_reg" + std::to_string(i), resident, 4, 1});
@@ -594,8 +639,9 @@ void VertexEmitter::Layout() {
 
     // The data container, then the prefetched uniforms.
     data_base = resident;
-    sa_top = data_base + DataSize;
-    if (scan.any_uniform) {
+    sa_top = data_base + DataSize + ExtraLiterals();
+    // The variable-primitive mode's tables point past an invocation's rows into the bank.
+    if (scan.any_uniform || req.gs_rows_table) {
         // 128 entries plus a mirror of the first four: an indexed read whose index wraps
         // at 128 (Smash reads with a0 = -2) may be issued at an immediate offset from a
         // neighbouring row's address, and the offset runs into the mirror.
@@ -607,7 +653,9 @@ void VertexEmitter::Layout() {
     // Most used first, as many as fit.
     std::vector<uint8_t> order;
     for (uint32_t n = 0; n < 128; n++) {
-        if (scan.uniform_uses[n] != 0) {
+        const bool row = req.mode == VsMode::Geometry && req.gs_rows_uniform &&
+                         n >= req.gs_first_uniform && n < req.gs_first_uniform + req.gs_rows;
+        if (scan.uniform_uses[n] != 0 && !row) {
             order.push_back(static_cast<uint8_t>(n));
         }
     }
@@ -634,6 +682,97 @@ void VertexEmitter::Layout() {
             temp_quad[t] = AllocateQuad();
         }
     }
+    if (req.mode == VsMode::Geometry) {
+        if (req.num_outputs * 12 > 127) {
+            Refuse("a geometry program's triangle is past a store's immediate offset");
+        }
+        for (uint32_t r = 0; r < req.gs_rows && !req.gs_rows_uniform; r++) {
+            gs_row_quads.push_back(AllocateQuad());
+        }
+        for (auto& slot : gs_slots) {
+            for (uint32_t k = 0; k < req.num_outputs; k++) {
+                slot.push_back(AllocateQuad());
+            }
+        }
+        gs_state = AllocateQuad();
+    }
+}
+
+/// Point mode's rows are the input registers, loaded by the prologue. The uniform modes' rows
+/// are loaded where they are read, as the uniforms not prefetched are: particle systems read
+/// dozens of rows in their loops, more than the registers hold.
+std::optional<Operand> VertexEmitter::GsSource(const SourceRegister& reg, uint32_t addr,
+                                               const Swizzle& swz, Mod mod) {
+    if (req.mode != VsMode::Geometry) {
+        return std::nullopt;
+    }
+    const uint32_t index = static_cast<uint32_t>(reg.GetIndex());
+    switch (reg.GetRegisterType()) {
+    case RegisterType::Input:
+        if (req.gs_rows_uniform || index >= req.gs_rows) {
+            Refuse("a geometry program reads an input register no row fills");
+        }
+        return Operand{gs_row_quads[index], swz, mod};
+    case RegisterType::FloatUniform: {
+        if (!req.gs_rows_uniform) {
+            return std::nullopt;
+        }
+        if (req.gs_rows_table) {
+            return GsTableRead(index, addr, swz, mod, Reg::Pa(2));
+        }
+        if (addr != 0) {
+            if (!req.gs_uniform_table) {
+                Refuse("an indexed uniform read in a geometry program with its inputs in "
+                       "uniforms, without its table");
+            }
+            return GsTableRead(index, addr, swz, mod, GsWord(gs_entry_words - 1));
+        }
+        const uint32_t n = index & 127;
+        if (n < req.gs_first_uniform || n >= req.gs_first_uniform + req.gs_rows) {
+            return std::nullopt;
+        }
+        if (hoisting) {
+            Refuse("hoisted read of a geometry input row");
+        }
+        const Reg dst = Reg::V(TmpLoad);
+        out->Lda32(dst, Reg::Pa(static_cast<uint8_t>(2 + n - req.gs_first_uniform)), nullptr, 0,
+                   4, 0);
+        out->WdfVertex(0);
+        return Operand{{Bank::Virtual, TmpLoad}, swz, mod};
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+/// A read through the invocation's table (`table` holds its address less 4, and a fetch reads
+/// one word on): entry n, then the row that entry points at. The variable-primitive mode's
+/// constant index past every invocation's rows reads the shared uniform as usual.
+std::optional<Operand> VertexEmitter::GsTableRead(uint32_t index, uint32_t addr,
+                                                  const Swizzle& swz, Mod mod, Reg table) {
+    const uint32_t n = index & 127;
+    if (addr == 0 && n >= req.gs_rows) {
+        return std::nullopt;
+    }
+    if (hoisting) {
+        Refuse("hoisted read of a geometry input row");
+    }
+    const Reg dst = Reg::V(TmpLoad);
+    if (addr == 0) {
+        out->Lda32(dst, Reg::Pa(2), nullptr, static_cast<uint8_t>(n), 4, 0);
+    } else {
+        // (index + a) & 127, times 4, plus the table: as the indexed uniform read's address.
+        const Reg areg = addr == 1 ? Reg::V(TmpA0X) : addr == 2 ? Reg::V(TmpA0Y) : Reg::V(TmpAlS16);
+        const Reg address = Reg::V(TmpAddr);
+        out->MadI16(address, areg, DataReg(DataOnes16), IOp::Imm(static_cast<uint8_t>(n)));
+        out->Bitwise(BwOp::And, address, IOp::Imm(0x7f), IOp::R(address));
+        out->MadI32(address, address, 4, Reg::Pa(2));
+        out->Lda32(dst, address, nullptr, 0, 4, 0);
+    }
+    out->WdfVertex(0);
+    out->Lda32(dst, dst, nullptr, 0, 4, 0);
+    out->WdfVertex(0);
+    return Operand{{Bank::Virtual, TmpLoad}, swz, mod};
 }
 
 // ---------------------------------------------------------------------------------------
@@ -660,6 +799,9 @@ Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Sw
     constexpr uint8_t load_quad = TmpLoad;
     const uint32_t index = static_cast<uint32_t>(reg.GetIndex());
     const Mod mod = negate ? Mod::Neg : Mod::None;
+    if (const auto row = GsSource(reg, addr, swz, mod)) {
+        return *row;
+    }
     switch (reg.GetRegisterType()) {
     case RegisterType::Input:
         if (input_pa[index & 15] >= 0) {
@@ -858,6 +1000,7 @@ void VertexEmitter::OpenContext(uint32_t begin, uint32_t end) {
 void VertexEmitter::Bind(int label) {
     label_bound[static_cast<std::size_t>(label)] = true;
     e.Bind(label);
+    emit_state.reset(); // a join: the paths into it may have set different emit states
 }
 
 void VertexEmitter::Branch(Pred pred, int target) {
@@ -1446,9 +1589,88 @@ uint32_t VertexEmitter::EmitInstruction(uint32_t offset) {
         return flow.dest_offset + 1;
     }
 
+    case OpCode::Id::SETEMIT:
+        if (req.mode != VsMode::Geometry) {
+            Refuse("SETEMIT outside a geometry program");
+        }
+        emit_state = EmitState{static_cast<uint8_t>(instr.setemit.vertex_id.Value()),
+                               instr.setemit.prim_emit.Value() != 0,
+                               instr.setemit.winding.Value() != 0};
+        return offset + 1;
+    case OpCode::Id::EMIT:
+        if (req.mode != VsMode::Geometry) {
+            Refuse("EMIT outside a geometry program");
+        }
+        GsEmit();
+        return offset + 1;
+
     default:
         Refuse(std::string("unhandled instruction ") + info.name);
     }
+}
+
+void VertexEmitter::StoreQuad(Reg base, uint32_t word, const Quad& q) {
+    for (uint32_t c = 0; c < 4; c++) {
+        e.Sta32(base, static_cast<uint8_t>(word + c), Reg{q.bank, static_cast<uint8_t>(q.base + c)},
+                0);
+    }
+}
+
+/// EMIT (upstream's GeometryEmitter::Emit): the output attributes into the emit buffer's
+/// vertex; with the primitive flag, the buffer's three vertices are a triangle, in the order
+/// 1, 0, 2 with the winding flag (the primitive assembler's inversion), stored at the next
+/// triangle's place unless gs_max_triangles are stored already.
+void VertexEmitter::GsEmit() {
+    if (!emit_state) {
+        Refuse("an EMIT whose SETEMIT is not on its straight-line path");
+    }
+    const EmitState st = *emit_state;
+    if (st.vertex_id > 2) {
+        Refuse("SETEMIT of vertex 3");
+    }
+    for (uint32_t k = 0; k < req.num_outputs; k++) {
+        const Quad& slot = gs_slots[st.vertex_id][k];
+        e.MoveInternal({slot.Pair(0), 0x3}, {attr_quad[k]->Pair(0), XYZW});
+        e.MoveInternal({slot.Pair(1), 0x3}, {attr_quad[k]->Pair(1), XYZW});
+    }
+    if (!st.prim) {
+        return;
+    }
+    const Reg size = Reg::V(static_cast<uint8_t>(gs_state.base + 1));
+    const Reg next = Reg::V(static_cast<uint8_t>(gs_state.base + 2));
+    const int full = NewLabel();
+    e.Test(Cond::Ge, 2, {gs_state.Base()}, 0, Data(DataGsCap), true);
+    Branch(Pred::P2, full);
+    static constexpr uint8_t straight[3] = {0, 1, 2};
+    static constexpr uint8_t inverted[3] = {1, 0, 2};
+    const uint8_t* order = st.winding ? inverted : straight;
+    for (uint32_t v = 0; v < 3; v++) {
+        for (uint32_t k = 0; k < req.num_outputs; k++) {
+            StoreQuad(next, (v * req.num_outputs + k) * 4, gs_slots[order[v]][k]);
+        }
+    }
+    e.MadI32(next, size, 16, next);
+    e.Vec(VecOp::Add, {gs_state.Base(), 0x1}, {gs_state.Base(), XYZW}, ConstOne);
+    Bind(full);
+    emit_state = st; // the join is this EMIT's own
+}
+
+/// The stream-out modes' end: the stores (StoreOutputs: the output attributes; Geometry: the
+/// end of the triangles into the region's header), their completion, and a position every
+/// vertex shares, so the draw covers nothing.
+void VertexEmitter::EpilogueStreamOut() {
+    if (req.mode == VsMode::StoreOutputs) {
+        const Reg base = Reg::Pa(static_cast<uint8_t>(out_address_pa));
+        for (uint32_t k = 0; k < req.num_outputs; k++) {
+            StoreQuad(base, k * 4, *attr_quad[k]);
+        }
+    } else {
+        e.Sta32(Reg::Pa(1), 0, Reg::V(static_cast<uint8_t>(gs_state.base + 2)), 0);
+    }
+    e.Idf(0);
+    e.WdfVertex(0);
+    e.MoveInternal({Reg::O(OutPosition), 0x3}, {Reg::C(0), XYZW});
+    e.MoveInternal({Reg::O(OutPosition + 2), 0x3}, ConstZeroOne);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1539,7 +1761,7 @@ void VertexEmitter::PlanHoist() {
     hoist_uncopied.fill(0);
     // Opt-in until the console has shown the declared-SA fix holds: `usse_sechoist`.
     static const bool hoist_on = GxmFlag("usse_sechoist");
-    if (!hoist_on || level < 2) {
+    if (!hoist_on || level < 2 || req.mode != VsMode::Draw) {
         return;
     }
     using Lanes = std::array<uint8_t, 16>;
@@ -1946,6 +2168,21 @@ void VertexEmitter::Prologue() {
     if (scan.al) {
         e.Bitwise(BwOp::Or, Reg::V(TmpAlS16), IOp::Imm(0), IOp::Imm(0));
     }
+    if (req.mode == VsMode::Geometry) {
+        // The input rows, each a fetch from its address (PA 2 + r, less the fetch's word).
+        for (uint32_t r = 0; r < gs_row_quads.size(); r++) {
+            e.Lda32(gs_row_quads[r].Base(), Reg::Pa(static_cast<uint8_t>(2 + r)), nullptr, 0, 4,
+                    0);
+            e.WdfVertex(0);
+        }
+        // No triangle stored; the first goes at PA 0.
+        const Reg size = Reg::V(static_cast<uint8_t>(gs_state.base + 1));
+        const Reg next = Reg::V(static_cast<uint8_t>(gs_state.base + 2));
+        e.MoveInternal({gs_state.Pair(0), 0x1}, ConstZero);
+        e.Bitwise(BwOp::Or, size, IOp::Imm(static_cast<uint8_t>(3 * req.num_outputs)),
+                  IOp::Imm(0));
+        e.Bitwise(BwOp::Or, next, IOp::R(Reg::Pa(0)), IOp::Imm(0));
+    }
 }
 
 std::optional<Src> VertexEmitter::SemanticSrc(Semantic s) const {
@@ -2081,7 +2318,11 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
     }
     const std::size_t epilogue_at = e.Count();
     Bind(end_label);
-    Epilogue();
+    if (req.mode == VsMode::Draw) {
+        Epilogue();
+    } else {
+        EpilogueStreamOut();
+    }
     e.EndVertex();
 
     // Where the virtual quads may live, in spill order: the temporaries, the primary
@@ -2114,12 +2355,147 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
         // No uniform read: the pointer slot stays, as a literal, so the layout is one.
         gxp.literals.insert(gxp.literals.begin(), 0u);
     }
+    if (req.mode == VsMode::Geometry) {
+        gxp.literals.push_back(std::bit_cast<uint32_t>(static_cast<float>(req.gs_max_triangles)));
+        gxp.literals.push_back(0u);
+    }
     gxp.primary = primary.Words();
     gxp.secondary = secondary.Words();
     return gxp;
 }
 
+struct GsBoundWalk {
+    std::span<const uint32_t> code;
+    uint32_t extent;
+    bool bounded = true;
+
+    /// Whether a run over `begin` up to `end` may change the primitive flag: a SETEMIT there or
+    /// in a body it calls.
+    bool SetsPrim(uint32_t begin, uint32_t end, int depth) const {
+        if (depth > 16) {
+            return true;
+        }
+        for (uint32_t offset = begin; offset < end && offset < extent; offset++) {
+            const Instruction instr = {code[offset]};
+            const auto& flow = instr.flow_control;
+            switch (instr.opcode.Value()) {
+            case OpCode::Id::SETEMIT:
+                return true;
+            case OpCode::Id::CALL:
+            case OpCode::Id::CALLC:
+            case OpCode::Id::CALLU:
+                if (SetsPrim(flow.dest_offset, flow.dest_offset + flow.num_instructions,
+                             depth + 1)) {
+                    return true;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        return false;
+    }
+
+    /// The most triangles a run from `begin` up to `end` (or an END) stores; `prim` is the last
+    /// SETEMIT's primitive flag on the way in.
+    uint32_t Range(uint32_t begin, uint32_t end, bool prim, int depth) {
+        if (depth > 16) {
+            bounded = false;
+            return 0;
+        }
+        uint32_t count = 0;
+        for (uint32_t offset = begin; offset < end && offset < extent && bounded; offset++) {
+            const Instruction instr = {code[offset]};
+            const auto& flow = instr.flow_control;
+            switch (instr.opcode.Value()) {
+            case OpCode::Id::END:
+                return count;
+            case OpCode::Id::SETEMIT:
+                prim = instr.setemit.prim_emit.Value() != 0;
+                break;
+            case OpCode::Id::EMIT:
+                count += prim ? 1 : 0;
+                break;
+            case OpCode::Id::JMPC:
+            case OpCode::Id::JMPU:
+                if (flow.dest_offset <= offset) {
+                    bounded = false;
+                    return 0;
+                }
+                // Taken or not: the longer of the two ways on.
+                return count + std::max(Range(offset + 1, end, prim, depth + 1),
+                                        Range(flow.dest_offset, end, prim, depth + 1));
+            case OpCode::Id::CALL:
+            case OpCode::Id::CALLC:
+            case OpCode::Id::CALLU: {
+                // A call that returns: its body's EMITs, then on (an END inside it counts the
+                // rest too, which only raises the bound). A SETEMIT in the body leaves the flag
+                // set, as after an IF: the bound can only be higher.
+                const uint32_t body = flow.dest_offset, body_end = body + flow.num_instructions;
+                count += Range(body, body_end, prim, depth + 1);
+                prim = prim || SetsPrim(body, body_end, depth + 1);
+                break;
+            }
+            case OpCode::Id::IFC:
+            case OpCode::Id::IFU:
+                return count +
+                       std::max(Range(offset + 1, flow.dest_offset, prim, depth + 1),
+                                Range(flow.dest_offset, flow.dest_offset + flow.num_instructions,
+                                      prim, depth + 1)) +
+                       Range(flow.dest_offset + flow.num_instructions, end, true, depth + 1);
+            case OpCode::Id::LOOP: {
+                // A body that stores a triangle on any round is unbounded; a SETEMIT in it sets
+                // the flag for the rounds after the first.
+                const bool sets = SetsPrim(offset + 1, flow.dest_offset + 1, depth + 1);
+                if (Range(offset + 1, flow.dest_offset + 1, prim || sets, depth + 1) != 0) {
+                    bounded = false;
+                    return 0;
+                }
+                prim = prim || sets;
+                offset = flow.dest_offset;
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        return count;
+    }
+};
+
 } // Anonymous namespace
+
+uint32_t GsTriangleBound(std::span<const uint32_t> code, uint32_t code_size, uint32_t main_offset) {
+    GsBoundWalk walk{code, std::min<uint32_t>(code_size, static_cast<uint32_t>(code.size()))};
+    const uint32_t bound = walk.Range(main_offset, walk.extent, false, 0);
+    return walk.bounded ? bound : 0;
+}
+
+bool GsIndexesUniforms(std::span<const uint32_t> code, uint32_t code_size) {
+    const uint32_t extent = std::min<uint32_t>(code_size, static_cast<uint32_t>(code.size()));
+    for (uint32_t offset = 0; offset < extent; offset++) {
+        const Instruction instr = {code[offset]};
+        const OpCode::Info info = instr.opcode.Value().GetInfo();
+        // The operand the address register applies to, as ScanProgram notes it.
+        if (info.type == OpCode::Type::Arithmetic && instr.common.address_register_index != 0) {
+            const bool inverted = (info.subtype & OpCode::Info::SrcInversed) != 0;
+            const SourceRegister indexed =
+                inverted ? instr.common.GetSrc2(true) : instr.common.GetSrc1(false);
+            if (indexed.GetRegisterType() == RegisterType::FloatUniform) {
+                return true;
+            }
+        } else if (info.type == OpCode::Type::MultiplyAdd &&
+                   instr.mad.address_register_index != 0) {
+            const bool inverted = instr.opcode.Value().EffectiveOpCode() == OpCode::Id::MADI;
+            const SourceRegister indexed =
+                inverted ? instr.mad.GetSrc3(true) : instr.mad.GetSrc2(false);
+            if (indexed.GetRegisterType() == RegisterType::FloatUniform) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 std::optional<GxpProgram> EmitVertexGxp(const VsRequest& request, uint32_t& input_regs,
                                         std::string* refusal, int level) {

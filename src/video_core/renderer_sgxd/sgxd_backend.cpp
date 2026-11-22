@@ -498,6 +498,10 @@ void SgxdBackend::ReadsCached(const u8* cpu, u32 bytes) {
 
 void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
     DEBUG_ASSERT(in_pass);
+    FlushStreamOut(false);
+    if (draw_count != 0 && draw_count < MaxDraws && hang_test.exchange(false)) {
+        DrawHang();
+    }
     in_pass = false;
     passes++;
     if (draw_count == 0) {
@@ -641,8 +645,11 @@ void SgxdBackend::RenderAsync(Recipe& r, const u32 touches[6]) {
     if (sgxd_session_render_overlap(&r.recipe, touches, failed, sizeof(failed)) != 0) {
         Fault(r, failed);
     }
-    // The next list finishes this 3D.
-    r.fence = sgxd_chain_fence() + 1;
+    // Its list ends with its 3D, nothing left pending: that list's fence is the render's.
+    r.fence = sgxd_chain_fence();
+    SgxdTrace("kick", r.width);
+    sent_renders[sent_renders_next++ % sent_renders.size()] = {
+        sgxd_mkq_jobs_sent(), r.width, r.height, static_cast<u32>(r.kind), 0, "render"};
 }
 
 void SgxdBackend::RenderSync(Recipe& r, u32* ta_us, u32* d3_us) {
@@ -782,6 +789,12 @@ void SgxdBackend::WriteCode() {
 #endif
 
 void SgxdBackend::Fault(const Recipe& r, const char* failed) {
+    for (u32 k = sent_renders_next > sent_renders.size() ? sent_renders_next - 64 : 0;
+         k != sent_renders_next; k++) {
+        const SentRender& sr = sent_renders[k % sent_renders.size()];
+        LOG_CRITICAL(Render, "sgxd: sent render: job {}, {} {}x{} kind {}, {} draws", sr.job,
+                     sr.what, sr.width, sr.height, sr.kind, sr.draws);
+    }
     SgxdDrainKernelLog();
     static u32 dump[SGXD_DUMP_WORDS];
     const int dumped = sgxdDump(dump, SGXD_DUMP_WORDS);
@@ -1189,6 +1202,94 @@ void SgxdBackend::SideRender(const Data& vertices, std::span<const SideDraw> lis
         sgxd_mkq_label("side", reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 #endif
     RenderAsync(r, everything);
+    NoteSent("side", static_cast<u32>(list.size()));
+}
+
+void SgxdBackend::StreamOut(const SgxdRecipeDrawPrograms& programs, u32 count, StreamStage stage,
+                            bool wait) {
+    DEBUG_ASSERT(in_pass && count != 0 && count % 3 == 0);
+    for (const CachedRange& range : cached) {
+        SgxdCacheRange(range.cpu, range.bytes, SGXD_CACHE_CLEAN, CacheSite::Vertices);
+    }
+    cached.clear();
+    auto& queued = stream_draws[static_cast<u32>(stage)];
+    if (queued.size() == StreamMaxDraws) {
+        // A full render: the A0s queued go first, so this draw's A0 is sent before its A1.
+        FlushStreamOut(false);
+    }
+    queued.push_back({programs, count});
+    if (wait && stage == StreamStage::A1) {
+        FlushStreamOut(true);
+    }
+}
+
+void SgxdBackend::FlushStreamOut(bool wait) {
+    for (auto& queued : stream_draws) {
+        if (!queued.empty()) {
+            StreamRender(queued, wait);
+        }
+    }
+}
+
+void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
+    DEBUG_ASSERT(in_pass && !queued.empty() && queued.size() <= StreamMaxDraws);
+    Recipe& r = RecipeFor(UntileSide, UntileSide, true);
+    PlaceFixedPrograms();
+    if (stream_target.cpu == nullptr) {
+        stream_target = AllocSurface(32, 32);
+    }
+    SgxdPdsProgram pds{};
+    [[maybe_unused]] const int fsec =
+        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(1, 0, 0), &pds);
+    DEBUG_ASSERT(fsec == 0);
+    p.fsec = PlacePds(pds);
+    p.fsec_units = pds.units;
+    const u32 tex[4] = {};
+    [[maybe_unused]] const int fprim = sgxd_program_blit_pixel_pds(blit_fragment, tex, &pds);
+    DEBUG_ASSERT(fprim == 0);
+    p.fprim = PlacePds(pds);
+    p.fprim_units = pds.units;
+    p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
+    const float viewport[6] = {16.0f, 16.0f, 16.0f, 16.0f, 0.0f, 1.0f};
+    constexpr u32 clip = SGXD_RECIPE_CLIP(0, 0, 0, 0);
+    untile_programs.resize(queued.size());
+    untile_draws.resize(queued.size());
+    for (std::size_t d = 0; d < queued.size(); d++) {
+        SgxdRecipeDrawPrograms& p = untile_programs[d];
+        p = queued[d].programs;
+        p.fsec = fsec.va;
+        p.fsec_units = fsec.units;
+        p.fprim = fprim.va;
+        p.fprim_units = fprim.units;
+        p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
+        std::memcpy(p.viewport, viewport, sizeof(viewport));
+        p.primitive = SGXD_PROGRAM_TRIANGLES;
+        untile_draws[d] = {0, queued[d].count, SGXD_RECIPE_ISP_NEVER, SGXD_R_FPRIM, 0, clip, &p};
+    }
+    sgxd_recipe_set_target(&r.recipe, r.memory, stream_target.gpu, 32);
+    sgxd_recipe_set_target_pack(&r.recipe, r.memory, SGXD_RECIPE_PACK_U8888);
+    [[maybe_unused]] const int taken = sgxd_recipe_set_draws(
+        &r.recipe, r.memory, untile_draws.data(), static_cast<unsigned>(queued.size()));
+    DEBUG_ASSERT_MSG(taken == 0, "sgxd: the {} stream-out draws were not taken", queued.size());
+    sgxd_recipe_restage(&r.recipe, r.memory);
+    [[maybe_unused]] const u32 draws = static_cast<u32>(queued.size());
+#ifdef VITA_DIAGNOSTICS
+    stream_draws_sent += draws;
+    stream_renders_sent++;
+#endif
+    queued.clear();
+    if (wait) {
+        RenderSync(r, nullptr, nullptr);
+        return;
+    }
+    // As SideRender's: what it stores is pass data, read by the pass's own TA after it.
+    static constexpr u32 everything[6] = {0, ~0u, 0, 0, 0, 0};
+#ifdef VITA_DIAGNOSTICS
+    sgxd_mkq_label_next =
+        sgxd_mkq_label(&queued == &stream_draws[0] ? "stream-out A0" : "stream-out A1", 0);
+#endif
+    RenderAsync(r, everything);
+    NoteSent(&queued == &stream_draws[0] ? "stream-out A0" : "stream-out A1", draws);
 }
 
 void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride, bool swizzled) {

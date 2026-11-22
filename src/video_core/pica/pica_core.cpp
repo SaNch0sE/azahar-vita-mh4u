@@ -1109,9 +1109,10 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }
 
     const bool accelerate_draw = [this] {
-        // Geometry shaders cannot be accelerated due to register preservation.
+        // Geometry shaders cannot be accelerated due to register preservation, except by a
+        // rasterizer that runs the whole geometry pipeline itself.
         if (regs.internal.pipeline.use_gs == PipelineRegs::UseGS::Yes) {
-            return false;
+            return rasterizer->AcceleratesGeometryShaders() && primitive_assembler.IsEmpty();
         }
 
         // TODO (wwylele): for Strip/Fan topology, if the primitive assember is not restarted

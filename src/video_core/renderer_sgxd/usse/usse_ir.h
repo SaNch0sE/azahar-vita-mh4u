@@ -86,6 +86,8 @@ enum class Op : uint8_t {
     PackS16,
     Mad2,
     UnpackU8,
+    Sta32,
+    Idf,
 };
 
 struct Inst {
@@ -174,6 +176,8 @@ public:
     void SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc);
     void Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words, uint8_t count,
                uint8_t drc);
+    void Sta32(Reg base, uint8_t offset_words, Reg value, uint8_t drc);
+    void Idf(uint8_t drc);
     void Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred = Pred::None);
     void MadI16(Reg dst, Reg src0, Reg src1, IOp src2);
     void MadI32(Reg dst, Reg src0, uint8_t imm, Reg src2);

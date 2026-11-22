@@ -47,6 +47,8 @@ namespace SgxdRenderer {
  */
 class SgxdBackend {
 public:
+    static constexpr u32 PassDataBytes = 2u << 20;
+
     SgxdBackend();
     ~SgxdBackend();
 
@@ -225,6 +227,26 @@ public:
      */
     void Untile(const UntileSource& source, u32 dest_gpu, u32 dest_stride, bool swizzled = false);
 
+    /// The geometry shader's stream-out stages (RasterizerSgxd::GeometryStage): A0 stores
+    /// the vertex program's outputs, A1 runs the geometry program over them.
+    enum class StreamStage : u32 { A0, A1 };
+
+    /**
+     * A draw whose vertex program stores its results (Usse::VsMode StoreOutputs or Geometry)
+     * and covers no pixel, queued for one render of its stage. `programs` brings the vertex
+     * side (vspds, vsec, the VDM words, the output selects, the index list of `count`
+     * indices, a multiple of 3); the pixel side is the blit's, never run (DCMP never). The
+     * vertex ranges ReadsCached named are cleaned now (the pass's own draws read them later,
+     * from memory). The queue goes out at the pass's end, before an op that changes guest
+     * memory (RenderBefore, a remap), or when a stage holds StreamMaxDraws draws, as two
+     * renders under the side recipe: every queued A0
+     * draw, then every A1 draw, so an A1 reads its A0's stores from memory, and the pass's TA
+     * after both reads A1's. With `wait`, an A1 sends the queue and the open pass waits for
+     * it, so the CPU can read what it stored.
+     */
+    void StreamOut(const SgxdRecipeDrawPrograms& programs, u32 count, StreamStage stage, bool wait);
+    void FlushStreamOut(bool wait);
+
     SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height);
     void Blit(const Data& source, u32 width, u32 height, const Store& dest, u32* ta_us = nullptr,
               u32* d3_us = nullptr);
@@ -345,6 +367,17 @@ private:
     u32 blit_vertex{}, blit_fragment{}, untile_fragment{}, merge_vertex{}, merge_fragment{};
     std::vector<SgxdRecipeDraw> untile_draws;
     std::vector<SgxdRecipeDrawPrograms> untile_programs;
+    // StreamOut's target: one tile, which the render never writes.
+    Data stream_target{};
+    // StreamOut's queue, at most StreamMaxDraws a render: a render of 247 A0 draws stopped its TA;
+    // up to 64 ran.
+    static constexpr u32 StreamMaxDraws = 64;
+    struct StreamDraw {
+        SgxdRecipeDrawPrograms programs;
+        u32 count;
+    };
+    std::array<std::vector<StreamDraw>, 2> stream_draws;
+    void StreamRender(std::vector<StreamDraw>& queued, bool wait);
     // ETC1A4's alpha palette for the merge: entry n is 17n in alpha over white (the AND keeps
     // the colour), from the texture block at the first ETC1A4.
     Data merge_palette{};

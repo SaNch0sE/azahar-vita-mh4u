@@ -82,6 +82,12 @@ public:
         return false;
     }
 
+    /// Whether AccelerateDrawBatch takes draws with a geometry shader too (the sgxd renderer's
+    /// stream-out passes); the others run the geometry shader on the CPU.
+    virtual bool AcceleratesGeometryShaders() const {
+        return false;
+    }
+
     /// Immediate mode: one vertex's input attributes, as the PICA formed them. Returning true
     /// takes the vertex off the CPU vertex path; the rasterizer draws the vertices it collected
     /// at FlushImmediate.

@@ -161,6 +161,15 @@ struct DisplayTransferConfig {
                            input_width.Value(), output_width.Value());
     }
 
+    /// The bytes a display transfer writes: the output's width halved by either scaling and
+    /// its height by XY, as upstream's RasterizerCache::AccelerateDisplayTransfer sizes the
+    /// destination (the registers give the size before the scaling).
+    u32 OutputBytes() const {
+        const u32 width = scaling != NoScale ? output_width / 2 : output_width.Value();
+        const u32 height = scaling == ScaleXY ? output_height / 2 : output_height.Value();
+        return width * height * BytesPerPixel(output_format);
+    }
+
     bool IsInputVRAM() {
         u32 addr = GetPhysicalInputAddress();
         return !(addr >= Memory::FCRAM_PADDR && addr < Memory::FCRAM_PADDR_END);

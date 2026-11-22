@@ -61,6 +61,15 @@ namespace GxmRenderer {
  *             comes well before the run ends, or the file is cut short
  *   dumptex   write the first eight untiled textures to host0, each level: the guest's bytes
  *             and the host copy, azahar-texN-ADDR-WxH-fFORMAT-sSTRIDE-{guest,host}.bin
+ *   texdump=N  every texture the draws sample over a frame of both screens from N s of the
+ *             process's time on, once each, as the host copy its unit reads, at its GPU size:
+ *             azahar-texf-ADDR-WxH-sSTRIDE-fFORMAT-lLEVELS-uUNIT-KIND.bin
+ *   picdump=N  after each of the first two display transfers from N s on, the GPU idle: every
+ *             scaled picture with its buffer's guest bytes, every screen picture with its
+ *             output's guest bytes (azahar-picN-*.bin; tools/picdump_view.py makes PNGs)
+ *   drawkeys  log the first thousand draws' fragment programs by dumpusse's key (words, temps,
+ *             PAs, issues): a replay's per-draw costs tied to the dumped programs;
+ *             drawkeys_at=S the first thousand from S seconds of the process's time on
  *
  *   noload    a pass that would load its colour buffer's picture (BeginPassLoaded) starts from
  *             a clear instead; nozload: a pass's depth is not loaded (still stored): what the

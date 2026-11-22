@@ -159,6 +159,13 @@ public:
     /// base register; the read completes at Wdf(drc).
     void Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words, uint8_t count,
                uint8_t drc);
+    /// Store the 32-bit register `value` at the address in register `base` plus
+    /// `offset_words` 4-byte words (an immediate): the firmware's single-word `sta32`, past the
+    /// L1 and L2 caches. The store
+    /// completes at Idf(drc) then Wdf(drc).
+    void Sta32(Reg base, uint8_t offset_words, Reg value, uint8_t drc);
+    /// Mark the outstanding stores on counter `drc`, which a following Wdf waits for.
+    void Idf(uint8_t drc);
     /// dst = src1 op src2 on 32-bit words. An immediate operand is 7 bits.
     void Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred = Pred::None);
     /// dst.x = src0.x * src1 + src2 on signed 16-bit lanes (mad.i16): src1 is a register

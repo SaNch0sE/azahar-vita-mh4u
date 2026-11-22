@@ -1184,7 +1184,11 @@ const RasterizerSgxd::Texture& RasterizerSgxd::NullTexture(u32 unit) {
 
 void RasterizerGxm::TextureWords(u32 unit, u32 words[4]) {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
-    const auto& c = regs.texturing.GetTextures()[unit].config;
+    const auto t = regs.texturing.GetTextures()[unit];
+    // A unit that is off still reaches the TEV: it reads zeros, point sampled and clamped.
+    const TextureConfig off{};
+    const Texture& tex = t.enabled ? TextureFor(unit) : NullTexture(unit);
+    const TextureConfig& c = t.enabled ? t.config : off;
     const u32 mag = c.mag_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
     const u32 min = c.min_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
     const u32 mipf = c.mip_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
@@ -1242,6 +1246,21 @@ void RasterizerSgxd::TexturesWritten(PAddr start, PAddr end) {
 void RasterizerSgxd::EndPass(const char* why) {
     Surface& s = surfaces[pass_surface];
     const u32 pass_draws = backend.PassDraws();
+#ifdef VITA_DIAGNOSTICS
+    const u32 pass_prims = backend.PassPrimitives();
+#endif
+#ifdef VITA_DIAGNOSTICS
+    {
+        auto& ends = texture_stats.pass_ends;
+        const auto it =
+            std::find_if(ends.begin(), ends.end(), [why](const auto& e) { return e.first == why; });
+        if (it != ends.end()) {
+            it->second++;
+        } else {
+            ends.emplace_back(why, 1u);
+        }
+    }
+#endif
     u32 ta_us = 0, d3_us = 0;
     backend.EndPass(&ta_us, &d3_us);
     s.passes++;
@@ -1268,6 +1287,12 @@ void RasterizerSgxd::LogTextureStats() {
     }
     LOG_INFO(Render, "perf: textures in {:.2f} s: {} untiled ({} KiB); {} cached",
              (now - t.start_us) / 1e6, t.untiles, t.untiled_bytes / 1024, textures.size());
+    std::string ends;
+    for (const auto& [why, n] : t.pass_ends) {
+        ends += fmt::format("{}{} {}", ends.empty() ? "" : "; ", why, n);
+    }
+    LOG_INFO(Render, "perf: passes ended by: {}", ends);
+    t.pass_ends.clear();
     static const bool bankstats = GxmFlag("bankstats");
     BankLutStats& b = bank_lut_stats;
     const auto per_build = [&](u64 rows) {
@@ -1384,7 +1409,7 @@ void DumpGxp(const char* kind, u64 key, const Usse::GxpProgram& gxp) {
 } // namespace
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
-    u16 default_regs, const std::array<u8, 16>& reg_components, u16 u8_regs) {
+    u16 default_regs, const std::array<u8, 16>& reg_components, u16 u8_regs, Usse::VsMode mode) {
     const Pica::Shader::Generator::PicaVSConfig config{regs, pica.vs_setup};
     const auto& state = config.state;
     // The bools the program branches on are baked in; which ones is found once per program.
@@ -1398,7 +1423,8 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     }
     bools &= used->second;
     const u64 key = Common::HashCombine(
-        config.Hash(), static_cast<u64>(u8_regs) << 16 | default_regs,
+        config.Hash(),
+        static_cast<u64>(mode) << 32 | static_cast<u64>(u8_regs) << 16 | default_regs,
         static_cast<u64>(bools) << 16 | used->second,
         Common::ComputeHash64(reg_components.data(), reg_components.size()));
     if (const auto it = vertex_programs.find(key); it != vertex_programs.end()) {
@@ -1423,6 +1449,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     request.bool_mask = used->second;
     request.reg_components = reg_components;
     request.u8_regs = u8_regs;
+    request.mode = mode;
 
     VertexProgram v{};
     std::string refusal;
@@ -1444,6 +1471,522 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
              v.gxp.temp_count, v.gxp.secondary_reg_count, v.gxp.uniforms.size(),
              v.gxp.per_instance ? ", per instance" : "");
     return vertex_programs.emplace(key, std::move(v)).first->second;
+}
+
+RasterizerGxm::VertexProgram RasterizerGxm::PlaceVertexProgram(Usse::GxpProgram gxp,
+                                                                 const char* what, u64 key,
+                                                                 u64 emit_us) {
+    VertexProgram v{};
+    v.gxp = std::move(gxp);
+    DumpGxp("vs", key, v.gxp);
+    v.primary_doutu0 = sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.primary),
+                                           v.gxp.temp_count);
+    v.secondary_doutu0 = v.gxp.secondary.empty()
+                             ? DummyVertexSecondary
+                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.secondary), 0);
+    LOG_INFO(Render, "{} {:016x}: {} words, {} PAs, {} temps, {} SAs{}", what, key,
+             v.gxp.primary.size(), v.gxp.pa_count, v.gxp.temp_count, v.gxp.secondary_reg_count,
+             v.gxp.per_instance ? ", per instance" : "");
+    return v;
+}
+
+const RasterizerGxm::VertexProgram& RasterizerGxm::GeometryProgramFor(u32 rows, bool rows_uniform,
+                                                                      bool rows_table,
+                                                                      u32 first_uniform,
+                                                                      u32 max_triangles,
+                                                                      const Describe& describe) {
+    Pica::ShaderSetup& setup = pica.gs_setup;
+    setup.DoProgramCodeFixup();
+    const u64 program_hash = setup.GetProgramCodeHash();
+    auto used = used_bools.find(program_hash);
+    if (used == used_bools.end()) {
+        used = used_bools.emplace(program_hash, UsedBoolUniforms(setup)).first;
+    }
+    u16 bools = 0;
+    for (u32 n = 0; n < 16; n++) {
+        bools |= static_cast<u16>((setup.uniforms.b[n] ? 1u : 0u) << n);
+    }
+    bools &= used->second;
+    const bool uniform_table = GsUniformTable(rows_uniform, rows_table);
+    // b15 turns true after every invocation (upstream GeometryPipeline::SubmitVertex): baked
+    // in, it holds for all of them only when the draw's first sees it true already.
+    DEBUG_ASSERT_MSG((used->second & 0x8000) == 0 || (bools & 0x8000) != 0,
+                     "GXM: {}: the geometry program reads b15 while it is false (the first "
+                     "invocation's own value) is not built",
+                     describe());
+    const u32 output_mask = regs.gs.output_mask;
+    const u64 key = Common::HashCombine(
+        Common::HashCombine(program_hash, setup.GetSwizzleDataHash()),
+        Common::HashCombine(static_cast<u64>(regs.gs.main_offset.Value()) << 16 | output_mask,
+                            static_cast<u64>(bools) << 48 | static_cast<u64>(used->second) << 32 |
+                                static_cast<u64>(max_triangles) << 16 |
+                                (rows_table ? 0x8000u : 0u) | first_uniform << 8 |
+                                (rows_uniform ? 0x80u : 0u) | rows));
+    if (const auto it = vertex_programs.find(key); it != vertex_programs.end()) {
+        return it->second;
+    }
+    Usse::VsRequest request{};
+    request.code = setup.GetProgramCode();
+    request.swizzle = setup.GetSwizzleData();
+    request.code_size = std::min<u32>(setup.GetBiggestProgramSize(), Pica::MAX_PROGRAM_CODE_LENGTH);
+    request.main_offset = regs.gs.main_offset;
+    request.output_map.fill(16);
+    for (u32 reg = 0; reg < 16; reg++) {
+        if ((output_mask >> reg) & 1) {
+            request.output_map[reg] = request.num_outputs++;
+        }
+    }
+    request.bools = bools;
+    request.bool_mask = used->second;
+    request.mode = Usse::VsMode::Geometry;
+    request.gs_rows = rows;
+    request.gs_rows_uniform = rows_uniform;
+    request.gs_rows_table = rows_table;
+    request.gs_uniform_table = k.uniform_table;
+    request.gs_first_uniform = first_uniform;
+    request.gs_max_triangles = max_triangles;
+    u32 input_regs = 0;
+    std::string refusal;
+    auto gxp = Usse::EmitVertexGxp(request, input_regs, &refusal);
+    DEBUG_ASSERT_MSG(gxp.has_value(),
+                     "sgxd: {}: geometry program {:016x}: the emitter has no program for it: {}",
+                     describe(), program_hash, refusal);
+    return vertex_programs.emplace(key, PlaceVertexProgram(std::move(*gxp), "geometry program", key))
+        .first->second;
+}
+
+const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramFor(u32 outputs) {
+    // mov o<reg>, v<k> for the k-th register of the output mask, then end.
+    const u32 output_mask = regs.gs.output_mask;
+    const Pica::Shader::Generator::PicaFixedGSConfig gs_config{regs};
+    const auto maps = gs_config.state.GetSemanticMaps();
+    u64 key = Common::HashCombine(0x6770617373ull /* "gpass" */, output_mask);
+    for (const auto& m : maps) {
+        key = Common::HashCombine(key, static_cast<u64>(m.attribute_index) << 8 | m.component_index);
+    }
+    if (const auto it = vertex_programs.find(key); it != vertex_programs.end()) {
+        return it->second;
+    }
+    std::vector<u32> code;
+    Usse::VsRequest request{};
+    request.output_map.fill(16);
+    for (u32 reg = 0; reg < 16; reg++) {
+        if ((output_mask >> reg) & 1) {
+            // MOV (0x13): dest o<reg> at bit 21, src1 v<k> at bit 12, operand descriptor 0.
+            code.push_back(0x13u << 26 | reg << 21 | request.num_outputs << 12);
+            request.output_map[reg] = request.num_outputs++;
+        }
+    }
+    code.push_back(0x22u << 26); // END
+    // Descriptor 0: dest xyzw, src1 xyzw (0x36f).
+    static const std::array<u32, 1> swizzle{0x36f};
+    request.code = code;
+    request.swizzle = swizzle;
+    request.code_size = static_cast<u32>(code.size());
+    request.main_offset = 0;
+    for (u32 i = 0; i < maps.size(); i++) {
+        request.semantics[i] = {static_cast<u8>(std::min<u32>(maps[i].attribute_index, 255)),
+                                static_cast<u8>(maps[i].component_index & 3)};
+    }
+    for (u32 k = 0; k < request.num_outputs; k++) {
+        request.reg_components[k] = 4;
+    }
+    request.default_regs = static_cast<u16>(~((1u << request.num_outputs) - 1));
+    u32 input_regs = 0;
+    std::string refusal;
+    auto gxp = Usse::EmitVertexGxp(request, input_regs, &refusal);
+    ASSERT_MSG(gxp.has_value(), "GXM: the geometry passthrough program: {}", refusal);
+    ASSERT(request.num_outputs == outputs);
+    VertexProgram v = PlaceVertexProgram(std::move(*gxp), "geometry passthrough", key);
+    v.input_regs = input_regs;
+    return vertex_programs.emplace(key, std::move(v)).first->second;
+}
+
+RasterizerSgxd::GsCodeFacts RasterizerSgxd::GsFacts() {
+    Pica::ShaderSetup& setup = pica.gs_setup;
+    setup.DoProgramCodeFixup();
+    const u64 key = Common::HashCombine(setup.GetProgramCodeHash(), regs.gs.main_offset.Value());
+    if (const GsCodeFacts* const found = gs_code_facts.Find(key)) {
+        return *found;
+    }
+    const u32 size =
+        std::min<u32>(setup.GetBiggestProgramSize(), Pica::MAX_PROGRAM_CODE_LENGTH);
+    return gs_code_facts.Emplace(
+        key, {Usse::GsTriangleBound(setup.GetProgramCode(), size, regs.gs.main_offset),
+              Usse::GsIndexesUniforms(setup.GetProgramCode(), size)});
+}
+
+RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
+                                                        const Describe& describe) {
+    using GSMode = Pica::PipelineRegs::GSMode;
+    const auto& pipeline = regs.pipeline;
+    const u32 count = pipeline.num_vertices;
+    const u32 vs_outputs = pipeline.vs_outmap_total_minus_1_a + 1;
+
+    // --- the invocations: the vertices each one takes, and where its inputs land ---
+    // Point mode: attribute a of the invocation's buffer is input register GetRegisterForAttribute(a).
+    // The fixed-primitive mode: the vertices' outputs are float uniforms from start_index on.
+    const u8* index_cpu = nullptr;
+    const bool index_u16 = pipeline.index_array.format != 0;
+    if (is_indexed) {
+        // As the guest had them at the draw (RenderThread::PutGsIndices).
+        DEBUG_ASSERT_MSG(gs_indices_set, "sgxd: {}: a geometry draw without its indices' copy",
+                         describe());
+        index_cpu = gs_indices.data();
+    }
+    const auto vertex_at = [&](u32 j) -> u32 {
+        if (!is_indexed) {
+            return pipeline.vertex_offset + j;
+        }
+        return index_u16 ? reinterpret_cast<const u16*>(index_cpu)[j] : index_cpu[j];
+    };
+    u32 per_invocation = 0;
+    u32 rows = 0;
+    bool rows_uniform = false;
+    bool rows_table = false;
+    // The variable mode: each primitive's count is in the index stream; its first main_vertices
+    // vertices bring every output, the others their first.
+    std::vector<u32> prims;
+    const u32 main_vertices = pipeline.variable_vertex_main_num_minus_1 + 1;
+    u32 first_uniform = 0;
+    std::array<int, 64> row_attr{}; // row -> the invocation's attribute, or -1 for none
+    row_attr.fill(-1);
+    switch (pipeline.gs_config.mode.Value()) {
+    case GSMode::Point: {
+        const u32 inputs = regs.gs.max_input_attribute_index + 1;
+        DEBUG_ASSERT_MSG(inputs % vs_outputs == 0 && regs.gs.input_to_uniform == 0,
+                         "sgxd: {}: geometry point mode with {} inputs of {} outputs a vertex",
+                         describe(), inputs, vs_outputs);
+        per_invocation = inputs / vs_outputs;
+        for (u32 a = 0; a < inputs; a++) {
+            const u32 reg = regs.gs.GetRegisterForAttribute(a);
+            row_attr[reg] = static_cast<int>(a);
+            rows = std::max(rows, reg + 1);
+        }
+        break;
+    }
+    case GSMode::FixedPrimitive:
+        DEBUG_ASSERT(vs_outputs == pipeline.gs_config.stride_minus_1 + 1u);
+        per_invocation = pipeline.gs_config.fixed_vertex_num_minus_1 + 1;
+        rows = vs_outputs * per_invocation;
+        rows_uniform = true;
+        first_uniform = pipeline.gs_config.start_index;
+        for (u32 r = 0; r < rows; r++) {
+            row_attr[r] = static_cast<int>(r);
+        }
+        break;
+    case GSMode::VariablePrimitive:
+        // c0 = the count, the main vertices' outputs from c1 on, then the other vertices' first outputs.
+        // The rows differ in number between invocations, so they go through a table.
+        DEBUG_ASSERT_MSG(is_indexed && regs.gs.input_to_uniform == 1,
+                         "sgxd: {}: a variable-primitive geometry draw without indices", describe());
+        rows_uniform = true;
+        rows_table = true;
+        for (u32 j = 0; j < count;) {
+            const u32 n = vertex_at(j);
+            DEBUG_ASSERT_MSG(n >= main_vertices && j + 1 + n <= count,
+                             "sgxd: {}: a variable primitive of {} vertices at {} of {} ({} main): a "
+                             "primitive carried to the next draw is not built",
+                             describe(), n, j, count, main_vertices);
+            prims.push_back(j);
+            rows = std::max(rows, 1 + main_vertices * vs_outputs + (n - main_vertices));
+            j += 1 + n;
+        }
+        DEBUG_ASSERT_MSG(rows < 128, "sgxd: {}: {} geometry input rows", describe(), rows);
+        break;
+    default:
+        UNREACHABLE_MSG("sgxd: {}: geometry shader mode {} is not built", describe(),
+                        static_cast<u32>(pipeline.gs_config.mode.Value()));
+    }
+    DEBUG_ASSERT_MSG(rows_table || (count % per_invocation == 0 && count != 0),
+                     "sgxd: {}: {} vertices for invocations of {}: a partial invocation carried "
+                     "to the next draw is not built",
+                     describe(), count, per_invocation);
+    const u32 invocations = rows_table ? static_cast<u32>(prims.size()) : count / per_invocation;
+
+    // The room an invocation gets, and whether the CPU must read back what each stored. With the
+    // program's own bound (Usse::GsTriangleBound) as the room, the unused triangles zeroed (three
+    // equal vertices, which the TA drops) and pass B's list over every slot, nothing is read back: A0
+    // and A1 join the pass's stream-out queue (SgxdBackend::StreamOut). Without a bound, or past the
+    // pass data, they run to completion and the stored counts are read back.
+    const u32 gs_outputs = static_cast<u32>(std::popcount(regs.gs.output_mask.Value()));
+    const u32 tri_bytes = 3 * gs_outputs * 16;
+    // Triangles an invocation may store: what a quarter of the pass data holds, to 1024.
+    const u32 room = std::clamp<u32>((256u << 10) / (invocations * tri_bytes), 1u, 1024u);
+    const u32 bound = GsFacts().bound;
+    const bool padded = bound != 0 && bound <= room;
+    const u32 cap = padded ? bound : room;
+#ifdef VITA_DIAGNOSTICS
+    // dumpgs reads what the first four draws stored: those wait.
+    static const bool dump_gs = GxmFlag("dumpgs");
+    const bool wait = !padded || (dump_gs && gs_draws < 4);
+#else
+    const bool wait = !padded;
+
+    // --- pass A0: the vertex program, each vertex's outputs stored densely ---
+    VertexStage a0 = VertexStageFor(is_indexed, nullptr, count, Usse::VsMode::StoreOutputs,
+                                    describe);
+    const u32 vertices = a0.vertex_max - a0.vertex_min + 1;
+    const u32 vsize = vs_outputs * 16;
+    if (rows_table) {
+        // The vertices alone must reach A0's range's ends, or it runs the program on vertices the draw
+        // has not got.
+        u32 lo = ~0u, hi = 0;
+        for (const u32 j : prims) {
+            for (u32 k = 1; k <= vertex_at(j); k++) {
+                lo = std::min(lo, vertex_at(j + k));
+                hi = std::max(hi, vertex_at(j + k));
+            }
+        }
+        DEBUG_ASSERT_MSG(lo == a0.vertex_min && hi == a0.vertex_max,
+                         "sgxd: {}: the variable primitives' vertices are {}..{}, the index range "
+                         "{}..{} (a count outside the vertices)",
+                         describe(), lo, hi, a0.vertex_min, a0.vertex_max);
+    }
+    DEBUG_ASSERT_MSG(vertices <= 0x10000 &&
+                         static_cast<u32>(std::popcount(regs.vs.output_mask.Value())) == vs_outputs,
+                     "sgxd: {}: {} vertices, {} vertex outputs for {} geometry inputs a vertex",
+                     describe(), vertices, std::popcount(regs.vs.output_mask.Value()), vs_outputs);
+    // The stored vertex outputs, triangles and tables: the pass's data, or memory of their own
+    // (gs_own_data), which the CPU writes at once after the work that last used it.
+    const auto stored_data = [&](u32 bytes) {
+        if (!gs_own_data) {
+            return backend.AllocData(bytes);
+        }
+        // Given back after the open pass, whose stream-out and B draw read it.
+        DEBUG_ASSERT(backend.InPass());
+        u32 ready = 0;
+        const SgxdBackend::Data d = backend.AllocTexture(bytes, &ready);
+        backend.RenderWait(ready, "a geometry draw's own data");
+        backend.FreeTextureAfterPass(d, bytes);
+        return d;
+    };
+    const SgxdBackend::Data vs_out = stored_data(vertices * vsize);
+    const u32 a0_count = Common::AlignUp(vertices, 3u);
+    const SgxdBackend::Data a0_table = stored_data(vertices * 4);
+    const SgxdBackend::Data a0_indices = backend.AllocData(a0_count * 2, 4);
+    u32* const table = reinterpret_cast<u32*>(a0_table.cpu);
+    u16* const a0_list = reinterpret_cast<u16*>(a0_indices.cpu);
+    for (u32 j = 0; j < vertices; j++) {
+        table[j] = vs_out.gpu + j * vsize;
+        a0_list[j] = static_cast<u16>(j);
+    }
+    for (u32 j = vertices; j < a0_count; j++) {
+        a0_list[j] = static_cast<u16>(vertices - 1); // the last again: the same stores
+    }
+    {
+        const auto& ag = a0.vp->gxp;
+        const auto out = std::find_if(ag.attributes.begin(), ag.attributes.end(),
+                                      [](const auto& a) { return a.name == "vs_out_address"; });
+        DEBUG_ASSERT(out != ag.attributes.end() && a0.fetch_count < a0.fetch.size());
+        a0.fetch[a0.fetch_count++] = {a0_table.gpu, 4, 1, out->resource};
+        a0.indices = a0_indices.gpu;
+        a0.count = a0_count;
+        u32 vsec_sa = 0;
+        const SgxdBackend::Data vsa = VertexSa(ag, pica.vs_setup, vsec_sa, describe);
+        SgxdRecipeDrawPrograms p{};
+        VertexPrograms(a0, vsa, vsec_sa, p, describe);
+#ifdef VITA_DIAGNOSTICS
+        NoteStreamOut("A0", static_cast<u32>(pipeline.gs_config.mode.Value()), invocations, rows,
+                      0, a0_count, *a0.vp);
+#endif
+        backend.StreamOut(p, a0_count, SgxdBackend::StreamStage::A0, wait);
+    }
+
+    // --- pass A1: the geometry program, one invocation a vertex ---
+    // A row an earlier draw left in its own memory is gone with its pass.
+    ASSERT_MSG((stale & gs_rows_own) == 0,
+               "sgxd: {}: a geometry program reads input registers {:#x} an earlier draw left in "
+               "memory of its own (past a pass's data): not built",
+               describe(), stale & gs_rows_own);
+    const SgxdBackend::Data gs_out = stored_data(invocations * cap * tri_bytes);
+    if (padded) {
+        std::memset(gs_out.cpu, 0, invocations * cap * tri_bytes);
+    }
+    const SgxdBackend::Data gs_ends = backend.AllocData(invocations * 4);
+    const u32 words = rows_table ? 4 : 2 + rows;
+    const SgxdBackend::Data gs_table = stored_data(invocations * words * 4);
+    const SgxdBackend::Data zero_row = backend.AllocData(16);
+    std::memset(zero_row.cpu, 0, 16);
+    // The row tables (128 entries and 3 a fetch past the last may read) of the variable mode and of
+    // a fixed-primitive program's indexed reads, and the variable mode's count rows.
+    constexpr u32 TableWords = 128 + 3;
+    const SgxdBackend::Data row_tables = rows_table || uniform_table
+                                             ? stored_data(invocations * TableWords * 4)
+                                             : SgxdBackend::Data{};
+    const SgxdBackend::Data count_rows =
+        rows_table ? backend.AllocData(invocations * 16) : SgxdBackend::Data{};
+    u32* const rows_out = reinterpret_cast<u32*>(gs_table.cpu);
+    for (u32 i = 0; i < invocations; i++) {
+        u32* const t = rows_out + i * words;
+        t[0] = gs_out.gpu + i * cap * tri_bytes;
+        t[1] = gs_ends.gpu + i * 4;
+        if (rows_table) {
+            t[2] = row_tables.gpu + i * TableWords * 4 - 4;
+            t[3] = 0;
+            continue;
+        }
+        for (u32 r = 0; r < rows; r++) {
+            const int a = row_attr[r];
+            if (a < 0) {
+                t[2 + r] = zero_row.gpu - 4;
+                continue;
+            }
+            const u32 j = i * per_invocation + static_cast<u32>(a) / vs_outputs;
+            const u32 v = vertex_at(j) - a0.vertex_min;
+            t[2 + r] = vs_out.gpu + v * vsize + (static_cast<u32>(a) % vs_outputs) * 16 - 4;
+        }
+    }
+    const VertexProgram& gp =
+        GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform, cap, describe);
+    {
+        const auto in = std::find_if(gp.gxp.attributes.begin(), gp.gxp.attributes.end(),
+                                     [](const auto& a) { return a.name == "gs_in_rows"; });
+        DEBUG_ASSERT(in != gp.gxp.attributes.end());
+        VertexStage a1{};
+        a1.vp = &gp;
+        a1.fetch[0] = {gs_table.gpu, words * 4, words, in->resource};
+        a1.fetch_count = 1;
+        a1.count = Common::AlignUp(invocations, 3u);
+        const SgxdBackend::Data a1_indices = backend.AllocData(a1.count * 2, 4);
+        u16* const list = reinterpret_cast<u16*>(a1_indices.cpu);
+        DEBUG_ASSERT(invocations <= 0x10000);
+        for (u32 i = 0; i < a1.count; i++) {
+            list[i] = static_cast<u16>(std::min(i, invocations - 1));
+        }
+        a1.indices = a1_indices.gpu;
+        a1.setup = &pica.gs_setup;
+        u32 vsec_sa = 0;
+        const SgxdBackend::Data vsa = VertexSa(gp.gxp, pica.gs_setup, vsec_sa, describe);
+        if (rows_table) {
+            // Past its rows an entry points at the shared uniform, as the SA image's bank pointer reads it.
+            DEBUG_ASSERT(gp.gxp.buffer_pointer);
+            u32 pointer = 0;
+            std::memcpy(&pointer, vsa.cpu + gp.gxp.uniform_floats * 4, 4);
+            u32* const tables = reinterpret_cast<u32*>(row_tables.cpu);
+            float* const counts = reinterpret_cast<float*>(count_rows.cpu);
+            for (u32 i = 0; i < invocations; i++) {
+                const u32 j = prims[i];
+                const u32 n = vertex_at(j);
+                const u32 own = 1 + main_vertices * vs_outputs + (n - main_vertices);
+                u32* const t = tables + i * TableWords;
+                std::fill_n(counts + i * 4, 4, static_cast<float>(n));
+                t[0] = count_rows.gpu + i * 16 - 4;
+                const u32 main_rows = main_vertices * vs_outputs;
+                for (u32 r = 1; r < own; r++) {
+                    const bool full = r - 1 < main_rows;
+                    const u32 k = full ? (r - 1) / vs_outputs : main_vertices + (r - 1 - main_rows);
+                    const u32 output = full ? (r - 1) % vs_outputs : 0;
+                    const u32 v = vertex_at(j + 1 + k) - a0.vertex_min;
+                    t[r] = vs_out.gpu + v * vsize + output * 16 - 4;
+                }
+                for (u32 r = own; r < TableWords; r++) {
+                    t[r] = pointer + 16 * (r & 127);
+                }
+            }
+        } else if (uniform_table) {
+            // Around the rows the entry loop placed, the shared uniforms: the same in every table.
+            DEBUG_ASSERT(gp.usse.buffer_pointer);
+            u32 pointer = 0;
+            std::memcpy(&pointer, vsa.cpu + gp.usse.uniform_floats * 4, 4);
+            std::array<u32, TableWords> shared;
+            for (u32 r = 0; r < TableWords; r++) {
+                shared[r] = pointer + 16 * (r & 127);
+            }
+            const u32 past = first_uniform + rows;
+            u32* const tables = reinterpret_cast<u32*>(row_tables.cpu);
+            for (u32 i = first; i < first + n; i++) {
+                u32* const t = tables + i * TableWords;
+                std::memcpy(t, shared.data(), first_uniform * 4);
+                std::memcpy(t + past, shared.data() + past, (TableWords - past) * 4);
+            }
+        }
+        SgxdRecipeDrawPrograms p{};
+        VertexPrograms(a1, vsa, vsec_sa, p, describe);
+#ifdef VITA_DIAGNOSTICS
+        NoteStreamOut("A1", static_cast<u32>(pipeline.gs_config.mode.Value()), invocations, rows,
+                      cap, a1.count, gp);
+#endif
+        backend.StreamOut(p, a1.count, SgxdBackend::StreamStage::A1, wait);
+#ifdef VITA_DIAGNOSTICS
+        stream_note.stage = nullptr;
+#endif
+    }
+
+    // --- pass B: the stored triangles, as the draw's vertices ---
+    std::vector<u16> list;
+    const u32* const ends = reinterpret_cast<const u32*>(gs_ends.cpu);
+    if (padded) {
+        // Every slot: the ones no EMIT filled are zeros.
+        DEBUG_ASSERT(invocations * cap * 3 <= 0x10000);
+        list.resize(invocations * cap * 3);
+        for (u32 n = 0; n < list.size(); n++) {
+            list[n] = static_cast<u16>(n);
+        }
+    }
+    for (u32 i = 0; i < invocations && !padded; i++) {
+        const u32 first = gs_out.gpu + i * cap * tri_bytes;
+        const u32 stored = (ends[i] - first) / tri_bytes;
+        DEBUG_ASSERT_MSG(ends[i] >= first && (ends[i] - first) % tri_bytes == 0 && stored < cap,
+                         "sgxd: {}: geometry invocation {} of {} ended at {:#x} (first triangle "
+                         "{:#x}, {} bytes each, room for {})",
+                         describe(), i, invocations, ends[i], first, tri_bytes, cap);
+        for (u32 t = 0; t < stored; t++) {
+            const u32 base = (i * cap + t) * 3;
+            DEBUG_ASSERT(base + 2 < 0x10000);
+            list.push_back(static_cast<u16>(base));
+            list.push_back(static_cast<u16>(base + 1));
+            list.push_back(static_cast<u16>(base + 2));
+        }
+    }
+#ifdef VITA_DIAGNOSTICS
+    // dumpgs: the first four geometry draws' vertex stage outputs (vs_outputs vec4s a vertex
+    // from a0's vertex_min), stored triangles (room for `cap` an invocation) and end addresses.
+    if (gs_draws < 4 && GxmFlag("dumpgs")) {
+        const auto write = [&](const char* what, const void* data, u32 size) {
+            const std::string path =
+                fmt::format("host0:azahar-gs{}-{}-v{}-o{}-c{}-{}.bin", gs_draws, invocations,
+                            a0.vertex_min, gs_outputs, cap, what);
+            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(data, 1, size, file);
+                std::fclose(file);
+            }
+        };
+        write("vs", vs_out.cpu, vertices * vsize);
+        write("out", gs_out.cpu, invocations * cap * tri_bytes);
+        std::vector<u32> firsts(invocations);
+        for (u32 i = 0; i < invocations; i++) {
+            firsts[i] = (ends[i] - (gs_out.gpu + i * cap * tri_bytes)) / tri_bytes;
+        }
+        write("stored", firsts.data(), invocations * 4);
+    }
+#endif
+    if (gs_draws++ < 4) {
+        LOG_INFO(Render, "geometry draw {}: {} invocations, {} triangles{}", gs_draws, invocations,
+                 list.size() / 3, padded ? " (every slot, the room the program's bound)" : "");
+    }
+    VertexStage b{};
+    if (list.empty()) {
+        return b;
+    }
+    const VertexProgram& pp = PassthroughProgramFor(gs_outputs);
+    for (u32 k = 0; k < gs_outputs; k++) {
+        const std::string name = fmt::format("vs_in_attr{}", k);
+        const auto attribute =
+            std::find_if(pp.gxp.attributes.begin(), pp.gxp.attributes.end(),
+                         [&](const Usse::GxpAttribute& a) { return a.name == name; });
+        if (attribute == pp.gxp.attributes.end()) {
+            continue; // an output no semantic reads
+        }
+        b.fetch[b.fetch_count++] = {gs_out.gpu + k * 16, gs_outputs * 16, 4, attribute->resource};
+    }
+    const SgxdBackend::Data b_indices = backend.AllocData(static_cast<u32>(list.size()) * 2, 4);
+    std::memcpy(b_indices.cpu, list.data(), list.size() * 2);
+    b.vp = &pp;
+    b.indices = b_indices.gpu;
+    b.count = static_cast<u32>(list.size());
+    b.setup = &pica.vs_setup;
+    return b;
 }
 
 const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(u64 blend) {
@@ -1743,6 +2286,317 @@ bool RasterizerSgxd::AccelerateDrawBatch(bool is_indexed) {
     return Draw(is_indexed, nullptr, 0);
 }
 
+RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, const float* immediate,
+                                                         u32 count, Usse::VsMode mode,
+                                                         const Describe& describe) {
+    const auto& pipeline = regs.pipeline;
+    const auto& va = pipeline.vertex_attributes;
+    const PAddr base = va.GetPhysicalBaseAddress();
+    struct Feed {
+        u32 reg;
+        PAddr address;
+        u32 stride;
+        u32 words;
+    };
+    std::array<Feed, 16> feeds{};
+    u32 feed_count = 0;
+    u16 enabled_regs = 0;
+    std::array<u8, 16> reg_components{};
+    u16 u8_regs = 0;
+    // An immediate batch sits in the pass data, each vertex its attributes' four floats.
+    SgxdBackend::Data immediate_data{};
+    if (immediate) {
+        const u32 stride = immediate_attributes * 16;
+        immediate_data = backend.AllocData(count * stride);
+        std::memcpy(immediate_data.cpu, immediate, count * stride);
+        for (u32 attr = 0; attr < immediate_attributes; attr++) {
+            const u32 reg = regs.vs.GetRegisterForAttribute(attr);
+            feeds[feed_count++] = {reg, immediate_data.gpu + attr * 16, stride, 4};
+            enabled_regs |= static_cast<u16>(1u << reg);
+            reg_components[reg] = 4;
+        }
+    }
+    for (u32 loader_index = 0; loader_index < 12 && !immediate; loader_index++) {
+        const auto& loader = va.attribute_loaders[loader_index];
+        if (loader.component_count == 0 || loader.byte_count == 0) {
+            continue;
+        }
+        u32 offset = 0;
+        for (u32 comp = 0; comp < loader.component_count && comp < 12; ++comp) {
+            const u32 attribute_index = loader.GetComponent(comp);
+            if (attribute_index >= 12) {
+                // Attribute ids 12, 13, 14 and 15 signify 4, 8, 12 and 16-byte paddings.
+                offset = Common::AlignUp(offset, 4);
+                offset += (attribute_index - 11) * 4;
+                continue;
+            }
+            const u32 elements = va.GetNumElements(attribute_index);
+            if (elements == 0) {
+                continue;
+            }
+            offset = Common::AlignUp(offset, va.GetElementSizeInBytes(attribute_index));
+            const auto format = va.GetFormat(attribute_index);
+            const bool is_u8 = format == Pica::PipelineRegs::VertexAttributeFormat::UBYTE;
+            DEBUG_ASSERT_MSG(is_u8 || format == Pica::PipelineRegs::VertexAttributeFormat::FLOAT,
+                             "GXM: {}: attribute {} is format {}; F32 and U8 attributes are built",
+                             describe(), attribute_index, static_cast<u32>(format));
+            const u32 reg = regs.vs.GetRegisterForAttribute(attribute_index);
+            const PAddr address = base + loader.data_offset + offset;
+            // A U8 attribute is fetched as the word its bytes start: the DMA moves words.
+            const u32 stride = loader.byte_count;
+            DEBUG_ASSERT_MSG(!is_u8 || ((address | stride) & 3) == 0,
+                             "GXM: {}: U8 attribute {} at {:#x}, stride {}: not word-aligned",
+                             describe(), attribute_index, address, stride);
+            // Two loaders feeding one register is a guest bug; the last wins, as in GL.
+            const auto same = std::find_if(feeds.begin(), feeds.begin() + feed_count,
+                                           [&](const Feed& f) { return f.reg == reg; });
+            const Feed feed{reg, address, stride, is_u8 ? 1u : elements};
+            u8_regs = static_cast<u16>(is_u8 ? u8_regs | 1u << reg : u8_regs & ~(1u << reg));
+            if (same != feeds.begin() + feed_count) {
+                *same = feed;
+            } else {
+                feeds[feed_count++] = feed;
+            }
+            enabled_regs |= static_cast<u16>(1u << reg);
+            reg_components[reg] = static_cast<u8>(elements);
+            offset += va.GetStride(attribute_index);
+        }
+    }
+    // Every register no loader feeds is a uniform: the fixed default attribute where the guest set
+    // one, (0, 0, 0, 1) otherwise.
+    const u16 default_regs = static_cast<u16>(~enabled_regs);
+    const VertexProgram& vp = VertexProgramFor(default_regs, reg_components, u8_regs, mode);
+    const Usse::GxpProgram& vg = vp.gxp;
+
+    // --- the index list ---
+    // The VDM reads 16-bit indices where the guest put them (the GPU maps guest memory at the
+    // PICA's addresses); it has no 8-bit format (IDXSIZE is 16 or 32 bits), so 8-bit indices
+    // are widened into the pass data. The vertices an indexed draw reads are
+    // [vertex_min, vertex_max], which the cache clean below needs.
+    u32 indices_gpu = 0;
+    u32 vertex_min = immediate ? 0 : pipeline.vertex_offset;
+    u32 vertex_max = vertex_min + count - 1;
+    if (is_indexed) {
+        const auto& index_info = pipeline.index_array;
+        const PAddr index_address = va.GetPhysicalBaseAddress() + index_info.offset;
+        const bool index_u16 = index_info.format != 0;
+        const u32 index_bytes = count * (index_u16 ? 2 : 1);
+        // A geometry draw's copy stands for guest memory.
+        const bool indices_mapped = gs_indices_set ||
+                                    (index_address >= Memory::FCRAM_PADDR &&
+                                     index_address + index_bytes <= Memory::FCRAM_PADDR_END) ||
+                                    (index_address >= Memory::VRAM_PADDR &&
+                                     index_address + index_bytes <= Memory::VRAM_PADDR_END);
+        if (!indices_mapped) {
+            // Indices past the guest's memory (a New 3DS's FCRAM range on an Old 3DS): all 0, every triangle
+            // degenerate. The TA would stop on the GPU's page fault reading them.
+            ASSERT_MSG(mode == Usse::VsMode::Draw,
+                       "sgxd: {}: a stream-out's indices at {:#x}+{:#x} are outside the mapped "
+                       "guest memory",
+                       describe(), index_address, index_bytes);
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG_WARNING(Render,
+                            "sgxd: {}: indices at {:#x}+{:#x} are outside the guest's memory: "
+                            "the draw draws nothing (logged once)",
+                            describe(), index_address, index_bytes);
+            }
+            return VertexStage{};
+        }
+        const u8* const index_cpu = memory.GetPhysicalPointer(index_address);
+        // What the CPU reads of them: a geometry draw's copy (GsIndices), else guest memory.
+        const u8* const index_scan = gs_indices_set ? gs_indices.data() : index_cpu;
+        if (index_u16) {
+            DEBUG_ASSERT_MSG(gs_indices_set || (index_address & 1) == 0,
+                             "sgxd: {}: 16-bit indices at {:#x}", describe(), index_address);
+            const auto [lo, hi] = Common::FindMinMax(
+                std::span<const u16>{reinterpret_cast<const u16*>(index_cpu), count});
+            vertex_min = lo;
+            vertex_max = hi;
+            indices_gpu = index_address;
+            if (guest_memory.IsUncached(index_address, index_bytes)) {
+                SgxdCacheSkipped(CacheSite::Vertices, index_bytes);
+            } else {
+                indices_gpu = index_address;
+                backend.ReadsCached(index_cpu, index_bytes);
+                CachedRead(index_address, index_bytes);
+            }
+        } else {
+            const auto [lo, hi] = Common::FindMinMax(std::span<const u8>{index_cpu, count});
+            vertex_min = lo;
+            vertex_max = hi;
+            if (mode == Usse::VsMode::Draw) {
+                const SgxdBackend::Data wide = backend.AllocData(count * 2, 4);
+                u16* const out = reinterpret_cast<u16*>(wide.cpu);
+                for (u32 n = 0; n < count; n++) {
+                    out[n] = index_cpu[n];
+                }
+                indices_gpu = wide.gpu;
+            }
+        }
+    }
+
+    std::array<SgxdVertexFetch, SGXD_PROGRAM_MAX_FETCH> fetch{};
+    u32 fetch_count = 0;
+    const u32 first = mode != Usse::VsMode::Draw ? vertex_min
+                     : is_indexed                ? 0
+                                                 : pipeline.vertex_offset;
+    for (u32 n = 0; n < feed_count; n++) {
+        const Feed& f = feeds[n];
+        if ((vp.input_regs & (1u << f.reg)) == 0) {
+            continue;
+        }
+        const std::string name = fmt::format("vs_in_attr{}", f.reg);
+        const auto attribute =
+            std::find_if(vg.attributes.begin(), vg.attributes.end(),
+                         [&](const Usse::GxpAttribute& a) { return a.name == name; });
+        DEBUG_ASSERT_MSG(attribute != vg.attributes.end(),
+                         "GXM: {}: the program reads {} but has no "
+                         "such attribute",
+                         describe(), name);
+        DEBUG_ASSERT(fetch_count < fetch.size());
+        // The identity index list counts from 0, the first vertex in the address; a guest list indexes
+        // from the loader's address.
+        const PAddr address = immediate ? f.address : f.address + first * f.stride;
+        fetch[fetch_count++] = {address, f.stride, f.words, attribute->resource};
+        if (immediate) {
+            continue;
+        }
+        // FCRAM is cached for the CPU: what the guest wrote is cleaned to memory before the kick.
+        const PAddr read = address + (vertex_min - first) * f.stride;
+        const u32 bytes = (vertex_max - vertex_min) * f.stride + f.words * 4;
+        // Not seen yet: the TA would stop on the GPU's page fault.
+        ASSERT_MSG(
+            (read >= Memory::FCRAM_PADDR && read + bytes <= Memory::FCRAM_PADDR_END) ||
+                (read >= Memory::VRAM_PADDR && read + bytes <= Memory::VRAM_PADDR_END),
+            "sgxd: {}: vertices at {:#x}+{:#x} are outside the mapped guest memory", describe(),
+            read, bytes);
+        if (guest_memory.IsUncached(read, bytes)) {
+            SgxdCacheSkipped(CacheSite::Vertices, bytes);
+        } else {
+            backend.ReadsCached(memory.GetPhysicalPointer(read), bytes);
+            CachedRead(read, bytes);
+        }
+    }
+
+
+    VertexStage stage{};
+    stage.vp = &vp;
+    stage.fetch = fetch;
+    stage.fetch_count = fetch_count;
+    stage.indices = mode == Usse::VsMode::Draw ? indices_gpu : 0;
+    stage.count = count;
+    stage.vertex_min = vertex_min;
+    stage.vertex_max = vertex_max;
+    stage.setup = &pica.vs_setup;
+    return stage;
+}
+
+SgxdBackend::Data RasterizerGxm::VertexSa(const Usse::GxpProgram& vg,
+                                          const Pica::ShaderSetup& setup, u32& vsec_sa,
+                                          const Describe& describe) {
+    // The image covers the containers, the prefetched uniforms after them and the SAs the
+    // secondary program writes; the secondary PDS program DMAs all of it.
+    const u32 vsa_words = vg.uniform_floats + Usse::DataHead(vg) + static_cast<u32>(vg.literals.size());
+    vsec_sa = std::max(vg.secondary_reg_count, vsa_words);
+    const SgxdBackend::Data vsa = backend.AllocData(vsec_sa * 4);
+    float* const vsa_f = reinterpret_cast<float*>(vsa.cpu);
+    std::memset(vsa.cpu, 0, vsec_sa * 4);
+    SgxdBackend::Data vbuf{};
+    if (vg.buffer_pointer) {
+        vbuf = backend.AllocData(vg.buffer_floats * 4);
+        std::memset(vbuf.cpu, 0, vg.buffer_floats * 4);
+        const u32 pointer = vbuf.gpu + static_cast<u32>(vg.ldst_base_value);
+        std::memcpy(vsa.cpu + vg.uniform_floats * 4, &pointer, 4);
+    }
+    for (size_t i = 0; i < vg.literals.size(); i++) {
+        std::memcpy(vsa.cpu + (vg.uniform_floats + Usse::DataHead(vg) + i) * 4, &vg.literals[i],
+                    4);
+    }
+    const auto& uniforms = setup.uniforms;
+    const auto& va = regs.pipeline.vertex_attributes;
+    for (const Usse::GxpUniform& u : vg.uniforms) {
+        if (u.name == "uniforms_f") {
+            // The whole bank, f24 as float: rows past the 96 real uniforms read as ones, as the
+            // PICA reads them, and rows 0-3 again past 127 (the emitter's wrap mirror).
+            DEBUG_ASSERT(vg.buffer_pointer && u.sa_offset + u.array_size * 4 <= vg.buffer_floats);
+            float* const bank = reinterpret_cast<float*>(vbuf.cpu) + u.sa_offset;
+            for (u32 n = 0; n < u.array_size; n++) {
+                const u32 row = n < 128 ? n : n - 128;
+                for (u32 c = 0; c < 4; c++) {
+                    bank[n * 4 + c] = row < 96 ? uniforms.f[row][c].ToFloat32() : 1.0f;
+                }
+            }
+            continue;
+        }
+        DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <= vg.uniform_floats);
+        float* const out = vsa_f + u.sa_offset;
+        if (u.name == "flip_viewport") {
+            out[0] = vs_data.flip_viewport ? 1.0f : 0.0f;
+        } else if (u.name == "depth_scale") {
+            out[0] = fs_data.depth_scale;
+        } else if (u.name == "depth_offset") {
+            out[0] = fs_data.depth_offset;
+        } else if (u.name == "uniforms_i") {
+            for (u32 n = 0; n < 4 && n < u.array_size; n++) {
+                for (u32 c = 0; c < 4; c++) {
+                    out[n * 4 + c] = static_cast<float>(uniforms.i[n][c]);
+                }
+            }
+        } else if (u.name.starts_with("vs_in_reg")) {
+            const u32 reg = static_cast<u32>(std::stoul(u.name.substr(9)));
+            float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            for (u32 attr = 0; attr < 16; attr++) {
+                if (va.IsDefaultAttribute(attr) && regs.vs.GetRegisterForAttribute(attr) == reg) {
+                    for (u32 c = 0; c < 4; c++) {
+                        value[c] = pica.input_default_attributes[attr][c].ToFloat32();
+                    }
+                }
+            }
+            PutVec(out, value, u.components);
+        } else {
+            UNREACHABLE_MSG("GXM: {}: the vertex uniform {} has no value", describe(), u.name);
+        }
+    }
+    // The uniforms read with a constant index, as the bank has them: rows past the 96 real
+    // uniforms read as ones.
+    for (const auto& [sa, row] : vg.prefetched_uniforms) {
+        DEBUG_ASSERT(sa + 4 <= vsec_sa && row < 128);
+        for (u32 c = 0; c < 4; c++) {
+            vsa_f[sa + c] = row < 96 ? uniforms.f[row][c].ToFloat32() : 1.0f;
+        }
+    }
+
+    return vsa;
+}
+
+void RasterizerSgxd::VertexPrograms(const VertexStage& stage, const SgxdBackend::Data& vsa,
+                                   u32 vsec_sa, SgxdRecipeDrawPrograms& p,
+                                   const Describe& describe) {
+    const VertexProgram& vp = *stage.vp;
+    const Usse::GxpProgram& vg = vp.gxp;
+    SgxdPdsProgram pds{};
+    [[maybe_unused]] const int vspds =
+        sgxd_program_vertex_pds(stage.fetch.data(), stage.fetch_count, vp.primary_doutu0,
+                                vg.per_instance ? 1 : 0, &pds);
+    DEBUG_ASSERT_MSG(vspds == 0, "GXM: {}: {} attributes the vertex PDS does not take", describe(),
+                     stage.fetch_count);
+    p.vspds = backend.PlacePds(pds);
+    p.vspds_units = pds.units;
+    [[maybe_unused]] const int vsec =
+        sgxd_program_secondary_pds(vsa.gpu, vsec_sa, vp.secondary_doutu0, &pds);
+    DEBUG_ASSERT(vsec == 0);
+    p.vsec = backend.PlacePds(pds);
+    p.vsec_units = pds.units;
+    p.vsec_sa = vsec_sa;
+    sgxd_program_vertex_dms(vg.pa_count, vg.temp_count, vsec_sa, vg.vertex_outputs1 >> 24,
+                            &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
+    p.outselects = vg.vertex_outputs1;
+    p.texsize = vg.vertex_outputs2;
+    p.indices = stage.indices;
+}
+
 bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate_count) {
     using Topology = Pica::PipelineRegs::TriangleTopology;
     // A DMA into cached memory still queued: the draw reads guest memory as the guest would after its
@@ -1757,8 +2611,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                            immediate ? "immediate" : (is_indexed ? "indexed" : "non-indexed"),
                            TopologyName(pipeline.triangle_topology), count);
     };
-    DEBUG_ASSERT_MSG(pipeline.use_gs == Pica::PipelineRegs::UseGS::No,
-                     "GXM: {}: geometry shaders are not built", describe());
+    DEBUG_ASSERT_MSG(pipeline.use_gs == Pica::PipelineRegs::UseGS::No ||
+                         (!immediate && (pipeline.triangle_topology == Topology::Shader ||
+                                         pipeline.triangle_topology == Topology::List)),
+                     "sgxd: {}: a geometry shader with this topology or in immediate mode is "
+                     "not built",
+                     describe());
     u32 primitive = SGXD_PROGRAM_TRIANGLES;
     switch (pipeline.triangle_topology) {
     case Topology::List:
@@ -1858,84 +2716,16 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         "loading depth into a pass is not built",
         describe(), depth, static_cast<u32>(fb.depth_format.Value()));
 
-    // --- the vertex fetch: every loader's attributes at their PICA addresses ---
-    const auto& va = pipeline.vertex_attributes;
-    const PAddr base = va.GetPhysicalBaseAddress();
-    struct Feed {
-        u32 reg;
-        PAddr address;
-        u32 stride;
-        u32 words;
-    };
-    std::array<Feed, 16> feeds{};
-    u32 feed_count = 0;
-    u16 enabled_regs = 0;
-    std::array<u8, 16> reg_components{};
-    u16 u8_regs = 0;
-    // An immediate batch sits in the pass data, each vertex its attributes' four floats, and
-    // attribute n feeds the register the PICA's LoadInput puts it in.
-    SgxdBackend::Data immediate_data{};
-    if (immediate) {
-        const u32 stride = immediate_attributes * 16;
-        immediate_data = backend.AllocData(count * stride);
-        std::memcpy(immediate_data.cpu, immediate, count * stride);
-        for (u32 attr = 0; attr < immediate_attributes; attr++) {
-            const u32 reg = regs.vs.GetRegisterForAttribute(attr);
-            feeds[feed_count++] = {reg, immediate_data.gpu + attr * 16, stride, 4};
-            enabled_regs |= static_cast<u16>(1u << reg);
-            reg_components[reg] = 4;
-        }
+    // --- the vertex stage: the loaders' attributes into the vertex program, or with a
+    // geometry shader, the triangles its passes stored ---
+    const VertexStage stage = pipeline.use_gs == Pica::PipelineRegs::UseGS::Yes
+                                  ? GeometryStage(is_indexed, describe)
+                                  : VertexStageFor(is_indexed, immediate, count,
+                                                   Usse::VsMode::Draw, describe);
+    if (stage.count == 0) {
+        return true; // the geometry program stored no triangle
     }
-    for (u32 loader_index = 0; loader_index < 12 && !immediate; loader_index++) {
-        const auto& loader = va.attribute_loaders[loader_index];
-        if (loader.component_count == 0 || loader.byte_count == 0) {
-            continue;
-        }
-        u32 offset = 0;
-        for (u32 comp = 0; comp < loader.component_count && comp < 12; ++comp) {
-            const u32 attribute_index = loader.GetComponent(comp);
-            if (attribute_index >= 12) {
-                // Attribute ids 12, 13, 14 and 15 signify 4, 8, 12 and 16-byte paddings.
-                offset = Common::AlignUp(offset, 4);
-                offset += (attribute_index - 11) * 4;
-                continue;
-            }
-            const u32 elements = va.GetNumElements(attribute_index);
-            if (elements == 0) {
-                continue;
-            }
-            offset = Common::AlignUp(offset, va.GetElementSizeInBytes(attribute_index));
-            const auto format = va.GetFormat(attribute_index);
-            const bool is_u8 = format == Pica::PipelineRegs::VertexAttributeFormat::UBYTE;
-            DEBUG_ASSERT_MSG(is_u8 || format == Pica::PipelineRegs::VertexAttributeFormat::FLOAT,
-                             "GXM: {}: attribute {} is format {}; F32 and U8 attributes are built",
-                             describe(), attribute_index, static_cast<u32>(format));
-            const u32 reg = regs.vs.GetRegisterForAttribute(attribute_index);
-            const PAddr address = base + loader.data_offset + offset;
-            // A U8 attribute is fetched as the word its bytes start: the DMA moves words.
-            const u32 stride = loader.byte_count;
-            DEBUG_ASSERT_MSG(!is_u8 || ((address | stride) & 3) == 0,
-                             "GXM: {}: U8 attribute {} at {:#x}, stride {}: not word-aligned",
-                             describe(), attribute_index, address, stride);
-            // Two loaders feeding one register is a guest bug; the last wins, as in GL.
-            const auto same = std::find_if(feeds.begin(), feeds.begin() + feed_count,
-                                           [&](const Feed& f) { return f.reg == reg; });
-            const Feed feed{reg, address, stride, is_u8 ? 1u : elements};
-            u8_regs = static_cast<u16>(is_u8 ? u8_regs | 1u << reg : u8_regs & ~(1u << reg));
-            if (same != feeds.begin() + feed_count) {
-                *same = feed;
-            } else {
-                feeds[feed_count++] = feed;
-            }
-            enabled_regs |= static_cast<u16>(1u << reg);
-            reg_components[reg] = static_cast<u8>(elements);
-            offset += va.GetStride(attribute_index);
-        }
-    }
-    // Every register no loader feeds is a uniform to the program (vs_in_regN): the fixed default
-    // attribute's value where the guest set one, (0, 0, 0, 1) otherwise.
-    const u16 default_regs = static_cast<u16>(~enabled_regs);
-    const VertexProgram& vp = VertexProgramFor(default_regs, reg_components, u8_regs);
+    const VertexProgram& vp = *stage.vp;
     const Usse::GxpProgram& vg = vp.gxp;
 #ifdef VITA_DIAGNOSTICS
     // drawring: the last draws, printed when a render stops (SgxdBackend::fault_hook).
@@ -2000,93 +2790,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         }
     }
 #endif
-
-    // --- the index list ---
-    // The VDM reads 16-bit indices where the guest put them (the GPU maps guest memory at the
-    // PICA's addresses); it has no 8-bit format (IDXSIZE is 16 or 32 bits), so 8-bit indices
-    // are widened into the pass data. The vertices an indexed draw reads are
-    // [vertex_min, vertex_max], which the cache clean below needs.
-    u32 indices_gpu = 0;
-    u32 vertex_min = immediate ? 0 : pipeline.vertex_offset;
-    u32 vertex_max = vertex_min + count - 1;
-    if (is_indexed) {
-        const auto& index_info = pipeline.index_array;
-        const PAddr index_address = va.GetPhysicalBaseAddress() + index_info.offset;
-        const bool index_u16 = index_info.format != 0;
-        const u32 index_bytes = count * (index_u16 ? 2 : 1);
-        DEBUG_ASSERT_MSG(
-            (index_address >= Memory::FCRAM_PADDR &&
-             index_address + index_bytes <= Memory::FCRAM_PADDR_END) ||
-                (index_address >= Memory::VRAM_PADDR &&
-                 index_address + index_bytes <= Memory::VRAM_PADDR_END),
-            "GXM: {}: indices at {:#x}+{:#x} are outside the mapped guest memory", describe(),
-            index_address, index_bytes);
-        const u8* const index_cpu = memory.GetPhysicalPointer(index_address);
-        if (index_u16) {
-            DEBUG_ASSERT_MSG((index_address & 1) == 0, "GXM: {}: 16-bit indices at {:#x}",
-                             describe(), index_address);
-            const auto [lo, hi] = Common::FindMinMax(
-                std::span<const u16>{reinterpret_cast<const u16*>(index_cpu), count});
-            vertex_min = lo;
-            vertex_max = hi;
-            indices_gpu = index_address;
-            if (guest_memory.IsUncached(index_address, index_bytes)) {
-                SgxdCacheSkipped(CacheSite::Vertices, index_bytes);
-            } else {
-                backend.ReadsCached(index_cpu, index_bytes);
-            }
-        } else {
-            const auto [lo, hi] = Common::FindMinMax(std::span<const u8>{index_cpu, count});
-            vertex_min = lo;
-            vertex_max = hi;
-            const SgxdBackend::Data wide = backend.AllocData(count * 2, 4);
-            u16* const out = reinterpret_cast<u16*>(wide.cpu);
-            for (u32 n = 0; n < count; n++) {
-                out[n] = index_cpu[n];
-            }
-            indices_gpu = wide.gpu;
-        }
-    }
-
-    std::array<SgxdVertexFetch, SGXD_PROGRAM_MAX_FETCH> fetch{};
-    u32 fetch_count = 0;
-    const u32 first = is_indexed ? 0 : pipeline.vertex_offset;
-    for (u32 n = 0; n < feed_count; n++) {
-        const Feed& f = feeds[n];
-        if ((vp.input_regs & (1u << f.reg)) == 0) {
-            continue;
-        }
-        const std::string name = fmt::format("vs_in_attr{}", f.reg);
-        const auto attribute =
-            std::find_if(vg.attributes.begin(), vg.attributes.end(),
-                         [&](const Usse::GxpAttribute& a) { return a.name == name; });
-        DEBUG_ASSERT_MSG(attribute != vg.attributes.end(),
-                         "GXM: {}: the program reads {} but has no "
-                         "such attribute",
-                         describe(), name);
-        DEBUG_ASSERT(fetch_count < fetch.size());
-        // The identity index list counts from 0: the first vertex is in the address. A guest
-        // index list indexes from the loader's address, as the PICA's does.
-        const PAddr address = immediate ? f.address : f.address + first * f.stride;
-        fetch[fetch_count++] = {address, f.stride, f.words, attribute->resource};
-        if (immediate) {
-            continue;
-        }
-        // FCRAM is cached for the CPU: what the guest wrote is cleaned to memory before the
-        // kick. VRAM is uncached CDRAM.
-        const PAddr read = address + (vertex_min - first) * f.stride;
-        const u32 bytes = (vertex_max - vertex_min) * f.stride + f.words * 4;
-        DEBUG_ASSERT_MSG(
-            (read >= Memory::FCRAM_PADDR && read + bytes <= Memory::FCRAM_PADDR_END) ||
-                (read >= Memory::VRAM_PADDR && read + bytes <= Memory::VRAM_PADDR_END),
-            "GXM: {}: vertices at {:#x}+{:#x} are outside the mapped guest memory", describe(),
-            read, bytes);
-        if (guest_memory.IsUncached(read, bytes)) {
-            SgxdCacheSkipped(CacheSite::Vertices, bytes);
-        } else {
-            backend.ReadsCached(memory.GetPhysicalPointer(read), bytes);
-        }
-    }
 
     // --- the vertex program's SA block and uniform buffer ---
     // The image covers the containers, the prefetched uniforms after them and the SAs the
@@ -2247,11 +2950,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     }
 
     // --- the PDS programs ---
-    SgxdPdsProgram pds{};
-    [[maybe_unused]] const int vspds = sgxd_program_vertex_pds(
-        fetch.data(), fetch_count, vp.primary_doutu0, vg.per_instance ? 1 : 0, &pds);
-    DEBUG_ASSERT_MSG(vspds == 0, "GXM: {}: {} attributes the vertex PDS does not take", describe(),
-                     fetch_count);
     SgxdRecipeDrawPrograms p{};
     p.vspds = backend.PlacePds(pds);
     p.vspds_units = pds.units;
@@ -2281,11 +2979,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     p.viewport[3] = half_h;
     p.viewport[4] = 0.0f;
     p.viewport[5] = 1.0f;
-    p.indices = indices_gpu;
     p.primitive = primitive;
 
     const u32 isp = (blend ? 1u : 0u) << 25 | dcmp << 22 | (dwrite ? 0u : 1u << 20) | 1u << 9;
-    const SgxdRecipeDraw draw{0, count, isp, SGXD_R_FPRIM,
+    const SgxdRecipeDraw draw{0, stage.count, isp, SGXD_R_FPRIM,
                               CullMode(regs.rasterizer.cull_mode), 0, nullptr};
     backend.Draw(draw, p);
 #ifdef VITA_DIAGNOSTICS
@@ -2310,7 +3007,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         LOG_INFO(Render,
                  "draw {}: {}, {} attributes, ISP {:#010x}, cull {}, viewport {} {} {} {}; "
                  "VSPDS {:#010x} VSEC {:#010x} ({} SAs) FSEC {:#010x} FPRIM {:#010x}",
-                 draws, describe(), fetch_count, isp, CullMode(regs.rasterizer.cull_mode),
+                 draws, describe(), stage.fetch_count, isp, CullMode(regs.rasterizer.cull_mode),
                  p.viewport[0], p.viewport[1], p.viewport[2], p.viewport[3], p.vspds, p.vsec,
                  vsec_sa, p.fsec, p.fprim);
         LOG_INFO(Render, "draw {}: depth test {} ({}), write {}, blend {}; vertex SAs [{}]",

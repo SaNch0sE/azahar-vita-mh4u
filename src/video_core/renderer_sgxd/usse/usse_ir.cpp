@@ -120,6 +120,10 @@ void Refs(Inst& i, std::vector<Ref>& out) {
     case Op::DepthF:
         out.push_back({&i.reg[0], false});
         break;
+    case Op::Sta32:
+        out.push_back({&i.reg[0], false});
+        out.push_back({&i.reg[1], false});
+        break;
     default:
         break;
     }
@@ -168,7 +172,8 @@ const char* OpName(Op op) {
         "depthf", "end",   "end_secondary",  "label",   "br",         "phase_start",
         "vec",    "vec16", "mad",            "dot",     "comp",       "mov_f32x4",
         "pack_f16", "mov_internal", "cond_mov", "test", "sample2d",  "lda32",
-        "bitwise", "mad_i16", "mad_i32",     "pack_s16", "mad2",
+        "bitwise", "mad_i16", "mad_i32",     "pack_s16", "mad2",       "unpack_u8",
+        "sta32",   "idf",
     };
     const auto n = static_cast<std::size_t>(op);
     return n < sizeof(names) / sizeof(names[0]) ? names[n] : "?";
@@ -232,6 +237,8 @@ bool IsBarrier(const Inst& i) {
     case Op::Wdf:
     case Op::WdfVertex:
     case Op::Lda32:
+    case Op::Sta32:
+    case Op::Idf:
     case Op::Sample2D:
     case Op::Phas:
         return true;
@@ -441,6 +448,18 @@ void Builder::Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_
     if (offset_reg != nullptr) {
         i.src[0].reg = *offset_reg;
     }
+}
+
+void Builder::Sta32(Reg base, uint8_t offset_words, Reg value, uint8_t drc) {
+    Inst& i = Push(Op::Sta32);
+    i.reg[0] = base;
+    i.reg[1] = value;
+    i.u[0] = offset_words;
+    i.u[1] = drc;
+}
+
+void Builder::Idf(uint8_t drc) {
+    Push(Op::Idf).u[0] = drc;
 }
 
 void Builder::Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred) {
@@ -704,7 +723,8 @@ void Lowering::Liveness() {
     for (std::size_t i = 0; i < n; i++) {
         const Inst& inst = insts[i];
         if (inst.op == Op::Lda32 || inst.op == Op::Sample2D || inst.op == Op::MadI16 ||
-            inst.op == Op::MadI32 || inst.op == Op::DepthF || inst.op == Op::UnpackU8) {
+            inst.op == Op::MadI32 || inst.op == Op::DepthF || inst.op == Op::UnpackU8 ||
+            inst.op == Op::Sta32) {
             for (const Reg r : {inst.reg[0], inst.reg[1]}) {
                 if (IsVirtual(r)) {
                     intervals[QuadOf(r)].temp_or_pa = true;
@@ -3366,6 +3386,12 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             break;
         case Op::UnpackU8:
             e.UnpackU8(Map(i.reg[0]), Map(i.reg[1]), i.u[0]);
+            break;
+        case Op::Sta32:
+            e.Sta32(Map(i.reg[0]), i.u[0], Map(i.reg[1]), i.u[1]);
+            break;
+        case Op::Idf:
+            e.Idf(i.u[0]);
             break;
         }
     }

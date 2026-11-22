@@ -6,6 +6,7 @@
 
 #include <array>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include "video_core/pica/regs_texturing.h"
@@ -13,6 +14,7 @@
 #include "video_core/renderer_gxm/guest_gpu_memory.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
+#include "video_core/renderer_gxm/usse/vs_usse_gen.h"
 #include "video_core/shader/generator/profile.h"
 
 namespace Pica {
@@ -79,6 +81,15 @@ public:
         backend.RenderWait(fence, "a moved page's pool page");
     }
     bool AccelerateDrawBatch(bool is_indexed) override;
+    /// The next draw's indices as the guest had them at the draw (a geometry draw's).
+    void GsIndices(const u8* indices, bool index_u16) {
+        const u32 bytes = regs.pipeline.num_vertices * (index_u16 ? 2u : 1u);
+        gs_indices.assign(indices, indices + bytes);
+        gs_indices_set = true;
+    }
+    bool AcceleratesGeometryShaders() const override {
+        return true;
+    }
     bool AccelerateImmediateVertex(const Pica::AttributeBuffer& input) override;
     void FlushImmediate() override;
     void NotifyP3D() override;
@@ -130,6 +141,9 @@ private:
         u32 part_bytes;   // a part's guest bytes: the levels back to back, or a face
         u32 untiled_pass; // the pass that last untiled it (cached FCRAM: each that samples it)
         bool dirty;       // a fill, DMA or transfer wrote over the guest bytes
+        /// A non-power-of-two 2D texture's rows this many texels apart (a multiple of 32); 0 for a
+        /// power-of-two chain.
+        u32 stride = 0;
         /// A byte copy's U8 swizzle: 6 for A8 and A4 (alpha), 5 for I8 and I4 (intensity); 0 for
         /// A8B8G8R8.
         u8 byte_swizzle = 0;
@@ -177,9 +191,60 @@ private:
     /// `immediate_attributes` x 4 floats).
     bool Draw(bool is_indexed, const float* immediate, u32 count);
 
+    /// A draw's description for its assert messages, formatted only when one fires.
+    class Describe {
+    public:
+        template <typename F>
+        Describe(const F& f)
+            : ctx{&f}, fn{[](const void* c) { return (*static_cast<const F*>(c))(); }} {}
+        std::string operator()() const {
+            return fn(ctx);
+        }
+
+    private:
+        const void* ctx;
+        std::string (*fn)(const void*);
+    };
+
+    struct VertexStage {
+        const VertexProgram* vp{};
+        std::array<SgxdVertexFetch, SGXD_PROGRAM_MAX_FETCH> fetch{};
+        u32 fetch_count{};
+        u32 indices{};    // a 16-bit index list's GPU address, 0 for the identity list
+        u32 count{};      // the indices the draw takes
+        u32 vertex_min{}; // the PICA vertices it reads
+        u32 vertex_max{};
+        const Pica::ShaderSetup* setup{}; // the unit whose uniforms the program reads
+    };
+    /// The loaders' attributes into the PICA's vertex program. With StoreOutputs the fetch covers
+    /// vertex_min to vertex_max densely and the caller adds the stores and the index list.
+    VertexStage VertexStageFor(bool is_indexed, const float* immediate, u32 count,
+                               Usse::VsMode mode, const Describe& describe);
+    /// A draw with a geometry shader: the vertex program's outputs and the geometry program's triangles
+    /// through two stream-out renders, then the triangles as the draw's vertices (the SGX has no
+    /// geometry stage, so the geometry program runs as a vertex program that stores what it emits).
+    VertexStage GeometryStage(bool is_indexed, const Describe& describe);
+    /// The vertex program's SA block: its uniforms from `setup`, its literals and buffer
+    /// pointer; `vsec_sa` its words.
+    SgxdBackend::Data VertexSa(const Usse::GxpProgram& vg, const Pica::ShaderSetup& setup,
+                               u32& vsec_sa, const Describe& describe);
+    /// The vertex side of a draw's programs: the fetch and secondary PDS programs, the VDM words, the
+    /// output selects.
+    void VertexPrograms(const VertexStage& stage, const SgxdBackend::Data& vsa, u32 vsec_sa,
+                        SgxdRecipeDrawPrograms& p, const Describe& describe);
+
     /// `u8_regs`: the input registers an UNSIGNED_BYTE loader feeds.
     const VertexProgram& VertexProgramFor(u16 default_regs,
-                                          const std::array<u8, 16>& reg_components, u16 u8_regs);
+                                          const std::array<u8, 16>& reg_components, u16 u8_regs,
+                                          Usse::VsMode mode = Usse::VsMode::Draw);
+    VertexProgram PlaceVertexProgram(Usse::GxpProgram gxp, const char* what, u64 key);
+    /// The geometry program for `rows` input rows (uniform: from c<first_uniform>) and at most
+    /// `max_triangles` triangles an invocation.
+    const VertexProgram& GeometryProgramFor(u32 rows, bool rows_uniform, bool rows_table,
+                                            u32 first_uniform, u32 max_triangles,
+                                            const Describe& describe);
+    /// The vertex program that draws a geometry program's stored triangles: input k is output k.
+    const VertexProgram& PassthroughProgramFor(u32 outputs);
     const FragmentProgram& FragmentProgramFor(u64 blend);
     /// The host copy of texture unit `unit`'s texture for the open pass, untiled when it is
     /// new or the guest's bytes changed: cached FCRAM by its hash, compared once a pass;
@@ -232,6 +297,15 @@ private:
     std::array<u32, 2> lut_half_mark{}, proctex_half_mark{};
 
     std::size_t pass_surface{}; // into surfaces, while the backend is in a pass
+    /// The rows KeepGsRows copied out of a room a pass took, a 16-byte row a register.
+    SgxdBackend::Data gs_kept_rows{};
+    u16 gs_rows_kept = 0;
+    /// The geometry draw's outputs, triangles and tables are past a pass's data and take memory of
+    /// their own, given back as the pass is sent.
+    bool gs_own_data = false;
+    u16 gs_rows_own = 0;
+    /// SgxdBackend::SetRoomTaken: each GS input register's last row in [begin, end) copied out.
+    void KeepGsRows(u32 begin, u32 end);
     PAddr pass_depth{};
     bool pass_depth_cleared{};
     u32 pass_depth_bytes{4}; // 2, 3 or 4, the depth format's
@@ -276,6 +350,7 @@ private:
         u64 start_us{};
         u32 passes_mark{};    ///< passes at the second's start: the textures draws took since
         u64 evictions_mark{}; ///< evictions at the second's start
+        std::vector<std::pair<const char*, u32>> pass_ends;
     } texture_stats;
     /// gxm_flags perflog + bankstats: the `perf: banks` and `perf: LUT rows` lines, with the
     /// textures' (NoteBankBuild, NoteLutTable; the draw and lookup counts are kept always).
