@@ -219,6 +219,9 @@ struct Program {
     std::vector<uint64_t> secondary;
 
     bool vertex = false;
+    /// The PICA temporaries the program reads before it writes them (a geometry program
+    /// that needs VsRequest::gs_serial).
+    uint16_t gs_temps_read_first = 0;
     /// One vertex per USSE instance (the vertex PDS's per-instance mode): set on a program
     /// that branches on per-vertex data; the others run several vertices per instance.
     bool per_instance = false;

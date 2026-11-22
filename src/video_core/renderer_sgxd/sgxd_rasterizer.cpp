@@ -2738,7 +2738,7 @@ RasterizerSgxd::VertexProgram RasterizerSgxd::PlaceVertexProgram(Usse::Program u
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
     u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform, u16 input_rows,
-    u32 max_triangles, const Describe& describe) {
+    u32 max_triangles, bool serial, const Describe& describe) {
     Pica::ShaderSetup& setup = pica.gs_setup;
     setup.DoProgramCodeFixup();
     const u64 program_hash = setup.GetProgramCodeHash();
@@ -2753,25 +2753,26 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
     bools &= *used;
     const bool uniform_table = GsUniformTable(rows_uniform, rows_table);
     const u32 output_mask = regs.gs.output_mask;
+    // Every field through a combine: a bit XORed onto the result's top bit would undo a bool at the
+    // top of the argument before it.
     const u64 key = Common::HashCombine(
         Common::HashCombine(program_hash, setup.GetSwizzleDataHash()),
-        Common::HashCombine(static_cast<u64>(regs.gs.main_offset.Value()) << 16 | output_mask,
-                            static_cast<u64>(bools) << 48 | static_cast<u64>(*used) << 32 |
-                                static_cast<u64>(max_triangles) << 16 |
-                                (rows_table ? 0x8000u : 0u) | first_uniform << 8 |
-                                (rows_uniform ? 0x80u : 0u) | rows) ^
-            static_cast<u64>(input_rows) << 40);
+        static_cast<u64>(regs.gs.main_offset.Value()) << 16 | output_mask,
+        static_cast<u64>(bools) << 48 | static_cast<u64>(*used) << 32 |
+            static_cast<u64>(max_triangles) << 16 | (rows_table ? 0x8000u : 0u) |
+            first_uniform << 8 | (rows_uniform ? 0x80u : 0u) | rows,
+        static_cast<u64>(input_rows) << 1 | (serial ? 1u : 0u));
     const VertexProgram* const found = vertex_programs.Find(key);
     const VertexProgram& program =
         found ? *found
               : MakeGeometryProgram(key, bools, *used, rows, rows_uniform, rows_table,
-                                    first_uniform, input_rows, max_triangles, describe);
+                                    first_uniform, input_rows, max_triangles, serial, describe);
     return program;
 }
 
 const RasterizerSgxd::VertexProgram& RasterizerSgxd::MakeGeometryProgram(
     u64 key, u16 bools, u16 used, u32 rows, bool rows_uniform, bool rows_table, u32 first_uniform,
-    u16 input_rows, u32 max_triangles, const Describe& describe) {
+    u16 input_rows, u32 max_triangles, bool serial, const Describe& describe) {
     Pica::ShaderSetup& setup = pica.gs_setup;
     const u64 program_hash = setup.GetProgramCodeHash();
     const u32 output_mask = regs.gs.output_mask;
@@ -2796,6 +2797,7 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::MakeGeometryProgram(
     request.gs_first_uniform = first_uniform;
     request.gs_input_rows = input_rows;
     request.gs_max_triangles = max_triangles;
+    request.gs_serial = serial;
     u32 input_regs = 0;
     std::string refusal;
     const u64 emit_start = sceKernelGetProcessTimeWide();
@@ -2993,11 +2995,6 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     const u32 bound = GsFacts().bound;
     const bool padded = bound != 0 && bound <= room;
     const u32 cap = padded ? bound : room;
-#ifdef VITA_DIAGNOSTICS
-    // dumpgs reads what the first four draws stored: those wait.
-    static const bool dump_gs = GxmFlag("dumpgs");
-    const bool wait = !padded || (dump_gs && gs_draws < 4);
-#else
     const bool wait = !padded;
 
     // --- pass A0: the vertex program, each vertex's outputs stored densely ---
@@ -3080,15 +3077,22 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     const VertexProgram* first_program = nullptr;
     const VertexProgram* program = nullptr;
     u16 input_rows = 0;
+    // A program that reads a temporary before it writes it runs its invocations in order, the
+    // temporaries kept from each to the next and from the draw before, as the PICA's unit keeps them.
+    bool serial = false;
     const auto programs = [&] {
         pica.gs_setup.uniforms.b[15] = b15;
         first_program = &GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform,
-                                            input_rows, cap, describe);
+                                            input_rows, cap, serial, describe);
         pica.gs_setup.uniforms.b[15] = true;
         program = &GeometryProgramFor(rows, rows_uniform, rows_table, first_uniform, input_rows,
-                                      cap, describe);
+                                      cap, serial, describe);
     };
     programs();
+    if (!serial && (first_program->usse.gs_temps_read_first | program->usse.gs_temps_read_first)) {
+        serial = true;
+        programs();
+    }
     // The unit keeps its input registers between draws: one the draw does not load holds the row an
     // earlier point-mode draw's last invocation loaded, or zero. The draw reads it where that draw's
     // vertex program stored it: in the same pass (its A0s run before its A1s), in an earlier one's
@@ -3206,15 +3210,32 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         DEBUG_ASSERT(in != gp.usse.attributes.end());
         VertexStage a1;
         a1.vp = &gp;
-        a1.fetch[0] = {gs_table.gpu, words * 4, words, in->resource};
         a1.fetch_count = 1;
         a1.fresh = true; // the table or the serial entries
-        a1.count = Common::AlignUp(n, 3u);
+        if (serial) {
+            // One instance runs them all (VsRequest::gs_serial): its entry the count, the first table entry
+            // and the unit's temporaries; the triangle that vertex three times.
+            if (!gs_unit_temps.cpu) {
+                gs_unit_temps = backend.AllocTextureFixed(Usse::GsStateQuads * 16);
+                std::memset(gs_unit_temps.cpu, 0, Usse::GsStateQuads * 16);
+            }
+            const SgxdBackend::Data entries = backend.AllocData(16);
+            u32* const e = reinterpret_cast<u32*>(entries.cpu);
+            e[0] = std::bit_cast<u32>(static_cast<float>(n));
+            e[1] = gs_table.gpu + first * words * 4 - 4;
+            e[2] = gs_unit_temps.gpu - 4;
+            e[3] = gs_unit_temps.gpu;
+            a1.fetch[0] = {entries.gpu, 16, 4, in->resource};
+            a1.count = 3;
+        } else {
+            a1.fetch[0] = {gs_table.gpu, words * 4, words, in->resource};
+            a1.count = Common::AlignUp(n, 3u);
+        }
         const SgxdBackend::Data a1_indices = backend.AllocData(a1.count * 2, 4);
         u16* const list = reinterpret_cast<u16*>(a1_indices.cpu);
         DEBUG_ASSERT(invocations <= 0x10000);
         for (u32 i = 0; i < a1.count; i++) {
-            list[i] = static_cast<u16>(first + std::min(i, n - 1));
+            list[i] = static_cast<u16>(serial ? 0 : first + std::min(i, n - 1));
         }
         a1.indices = a1_indices.gpu;
         a1.setup = &pica.gs_setup;
@@ -3269,7 +3290,15 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         NoteStreamOut("A1", static_cast<u32>(pipeline.gs_config.mode.Value()), n, rows, cap,
                       a1.count, gp);
 #endif
+        // In order, a render of its own: the A1 draws of one render run side by side, and the unit's
+        // temporaries go from one in-order draw to the next.
+        if (serial) {
+            backend.FlushStreamOut(false);
+        }
         backend.StreamOut(p, a1.count, SgxdBackend::StreamStage::A1, wait);
+        if (serial && !wait) {
+            backend.FlushStreamOut(false);
+        }
 #ifdef VITA_DIAGNOSTICS
         stream_note.stage = nullptr;
 #endif
@@ -3317,28 +3346,6 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
             list.push_back(static_cast<u16>(base + 2));
         }
     }
-#ifdef VITA_DIAGNOSTICS
-    // dumpgs: the first four geometry draws' vertex stage outputs (vs_outputs vec4s a vertex
-    // from a0's vertex_min), stored triangles (room for `cap` an invocation) and end addresses.
-    if (gs_draws < 4 && GxmFlag("dumpgs")) {
-        const auto write = [&](const char* what, const void* data, u32 size) {
-            const std::string path =
-                fmt::format("host0:azahar-gs{}-{}-v{}-o{}-c{}-{}.bin", gs_draws, invocations,
-                            a0.vertex_min, gs_outputs, cap, what);
-            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
-                std::fwrite(data, 1, size, file);
-                std::fclose(file);
-            }
-        };
-        write("vs", vs_out.cpu, vertices * vsize);
-        write("out", gs_out.cpu, invocations * cap * tri_bytes);
-        std::vector<u32> firsts(invocations);
-        for (u32 i = 0; i < invocations; i++) {
-            firsts[i] = (ends[i] - (gs_out.gpu + i * cap * tri_bytes)) / tri_bytes;
-        }
-        write("stored", firsts.data(), invocations * 4);
-    }
-#endif
     if (gs_draws++ < 4) {
         LOG_INFO(Render, "geometry draw {}: {} invocations, {} triangles{}", gs_draws, invocations,
                  list.size() / 3, padded ? " (every slot, the room the program's bound)" : "");
@@ -5175,10 +5182,11 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     if (tier2 && tier2->Ready()) {
         InstallTier2();
     }
-    // The programs start again with the code heap three quarters full: A Link Between Worlds'
-    // intro filled the 1 MiB with programs it had drawn once. Here, before the
-    // draw holds any; their code is the heap's again once the passes begun so far are done.
-    if (backend.CodeFree() < SgxdBackend::CodeBytes / 4) {
+    // The programs start again with the code heap half full, before the draw holds any: their code
+    // goes back once the passes begun so far are done, and the open pass's draws emit theirs again
+    // from the half left (no second flush before the next pass).
+    if (backend.CodeFree() < SgxdBackend::CodeBytes / 2 && backend.PassMark() != flush_mark) {
+        flush_mark = backend.PassMark();
         FlushPrograms();
     }
     // A DMA into cached memory still queued: the draw reads guest memory as the guest would after its

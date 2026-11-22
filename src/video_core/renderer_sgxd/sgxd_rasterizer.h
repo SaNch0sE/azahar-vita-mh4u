@@ -508,10 +508,10 @@ private:
     /// `input_rows`: the fixed-primitive mode's registers that read rows of their own.
     const VertexProgram& GeometryProgramFor(u32 rows, bool rows_uniform, bool rows_table,
                                             u32 first_uniform, u16 input_rows, u32 max_triangles,
-                                            const Describe& describe);
+                                            bool serial, const Describe& describe);
     const VertexProgram& MakeGeometryProgram(u64 key, u16 bools, u16 used, u32 rows,
                                              bool rows_uniform, bool rows_table, u32 first_uniform,
-                                             u16 input_rows, u32 max_triangles,
+                                             u16 input_rows, u32 max_triangles, bool serial,
                                              const Describe& describe);
     /// The vertex program that draws a geometry program's stored triangles: input k is output k.
     const VertexProgram& PassthroughProgramFor(u32 outputs);
@@ -533,11 +533,18 @@ private:
     /// A vertex-side program's code into the heap: its DOUTU words and code ranges.
     void PlaceVertexCode(VertexProgram& v);
     void FreeProgramCode(const std::array<u32, 4>& code);
-    /// Every vertex-side and fragment program's code back to the heap and the programs
-    /// forgotten (and the states and layouts that point at them): the draws from here emit
-    /// theirs again. Draw runs it before it looks a program up, with the heap a quarter free.
+    /// Every program's code back to the heap and the programs forgotten (with the states and layouts
+    /// that point at them). Run before a draw looks a program up, with the heap half free.
     void FlushPrograms();
     u32 program_flushes = 0;
+    /// The first tier's emission of a vertex (0), geometry (1) or fragment (2) program, for perflog.
+    void NoteEmit([[maybe_unused]] int kind, [[maybe_unused]] u64 us) {
+#ifdef VITA_DIAGNOSTICS
+        emit_stats.programs[kind]++;
+        emit_stats.us[kind] += us;
+#endif
+    }
+    u32 flush_mark = ~0u; ///< the backend's PassMark at the last flush
     /// Where a texture unit's texels are in guest memory: a 2D chain or six cube faces, `bytes` each.
     struct TextureExtent {
         std::array<PAddr, 6> part_addr{};
@@ -802,6 +809,8 @@ private:
     std::array<u32, 16> gs_last_rows{};
     /// The rows KeepGsRows copied out of a room a pass took, a 16-byte row a register.
     SgxdBackend::Data gs_kept_rows{};
+    /// The geometry unit's temporaries and emit buffer between draws run in order, zero at first.
+    SgxdBackend::Data gs_unit_temps{};
     /// A geometry draw's row no attribute fills: zeros, kept for good.
     SgxdBackend::Data gs_zero_row{};
     std::vector<u16> gs_list;

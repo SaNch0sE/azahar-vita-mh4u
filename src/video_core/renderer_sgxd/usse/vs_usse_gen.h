@@ -92,7 +92,20 @@ struct VsRequest {
     /// The indexed reads go through it, the others as without it.
     bool gs_uniform_table = false;
     uint32_t gs_max_triangles = 0;
+    /// Geometry, point and fixed-primitive modes: the invocations run in order in one
+    /// instance, the temporaries and the emit buffer's vertices kept from each to the next
+    /// and, through a state block (GsStateQuads), from the draw before: for a program that reads
+    /// a temporary before it writes it
+    /// (Program::gs_temps_read_first). Its attribute is four words: the invocation count (a
+    /// float), the first invocation's table entry less 4, the state block less 4 (its loads)
+    /// and the state block (its stores); each entry is the words the parallel form's attribute
+    /// holds. The count is at least one.
+    bool gs_serial = false;
 };
+
+/// The in-order state block (VsRequest::gs_serial), in float4s: the 16 temporaries, then the emit
+/// buffer's three vertices, 16 output attributes each (vertex v's attribute k at 16 + 16 v + k).
+inline constexpr uint32_t GsStateQuads = 16 + 3 * 16;
 
 /// The triangles one invocation of the geometry program at `main_offset` stores at most: the
 /// EMITs after a SETEMIT that asks for a primitive, along the longest path (an IF's longer

@@ -394,6 +394,18 @@ private:
     std::array<std::vector<Quad>, 3> gs_slots; ///< Geometry: the emit buffer's three vertices
     Quad gs_state{};                  ///< Geometry: x the triangles stored (float), y a triangle's
                                       ///< bytes / 16, z the next triangle's address (ints)
+    /// Geometry, gs_serial: the invocation's table entry (loaded words), the loop's state (x
+    /// the invocations left, a float; y the next entry's address less 4; z 1) and its labels.
+    std::vector<Quad> gs_entry_quads;
+    Quad gs_loop{};
+    int gs_loop_top = -1;
+    uint32_t gs_entry_words = 0;
+    Reg GsWord(uint32_t k) const {
+        if (!req.gs_serial) {
+            return Reg::Pa(static_cast<uint8_t>(k));
+        }
+        return Reg::V(static_cast<uint8_t>(gs_entry_quads[k / 4].base + k % 4));
+    }
     /// The last SETEMIT on the straight-line path to here, or nothing past a join.
     struct EmitState {
         uint8_t vertex_id;
@@ -424,6 +436,7 @@ private:
     void GsEmit();
     void GsEmitDynamic();
     void GsCopyToSlot(uint8_t vertex_id);
+    Reg GsStateSlot(uint32_t v, Reg block);
     void GsStoreTriangle(bool winding);
     void StoreQuad(Reg base, uint32_t word, const Quad& q);
     void EpilogueStreamOut();
@@ -612,8 +625,14 @@ void VertexEmitter::Layout() {
         if (words + 2 > PaLimit) {
             Refuse("more geometry input rows than primary attributes");
         }
-        program.attributes.push_back({AttributeKind::GsInRows, 0, 0, static_cast<uint8_t>(words)});
-        pa_inputs = static_cast<uint8_t>((words + 1) & ~1u);
+        if (req.gs_serial && req.gs_rows_table) {
+            Refuse("the variable-primitive mode's invocations in order (temporaries kept)");
+        }
+        gs_entry_words = words;
+        const uint32_t attribute_words = req.gs_serial ? 4 : words;
+        program.attributes.push_back(
+            {AttributeKind::GsInRows, 0, 0, static_cast<uint8_t>(attribute_words)});
+        pa_inputs = static_cast<uint8_t>((attribute_words + 1) & ~1u);
     }
     // Attributes: four PAs each, in register order; the components a loader does not
     // supply are filled by the prologue.
@@ -744,6 +763,9 @@ void VertexEmitter::Layout() {
                 gs_input_quads[r] = AllocateQuad();
             }
         }
+        if (req.gs_serial && req.num_outputs > 16) {
+            Refuse("more than 16 output attributes in the in-order state block");
+        }
         for (auto& slot : gs_slots) {
             for (uint32_t k = 0; k < req.num_outputs; k++) {
                 slot.push_back(AllocateQuad());
@@ -752,6 +774,12 @@ void VertexEmitter::Layout() {
         gs_state = AllocateQuad();
         if (dynamic_emit) {
             gs_emit = AllocateQuad();
+        }
+        if (req.gs_serial) {
+            for (uint32_t q = 0; q < (gs_entry_words + 3) / 4; q++) {
+                gs_entry_quads.push_back(AllocateQuad());
+            }
+            gs_loop = AllocateQuad();
         }
     }
 }
@@ -796,8 +824,7 @@ std::optional<Operand> VertexEmitter::GsSource(const SourceRegister& reg, uint32
             return std::nullopt;
         }
         const Reg dst = Reg::V(TmpLoad);
-        e.Lda32(dst, Reg::Pa(static_cast<uint8_t>(2 + n - req.gs_first_uniform)), nullptr, 0,
-                   4, 0);
+        e.Lda32(dst, GsWord(2 + n - req.gs_first_uniform), nullptr, 0, 4, 0);
         e.WdfVertex(0);
         return Operand{{Bank::Virtual, TmpLoad}, swz, mod};
     }
@@ -1653,6 +1680,15 @@ void VertexEmitter::GsEmit() {
     emit_state = st; // the join is this EMIT's own
 }
 
+/// The address of the state block's emit buffer vertex v (GsStateQuads, 256 bytes in) from
+/// `block` (PA 2 for the loads, PA 3 for the stores): the offsets' 7 bits reach 32 float4s.
+Reg VertexEmitter::GsStateSlot(uint32_t v, Reg block) {
+    const Reg address = Reg::V(TmpAddr);
+    e.Bitwise(BwOp::Or, address, IOp::Imm(static_cast<uint8_t>(16 * (v + 1))), IOp::Imm(0));
+    e.MadI32(address, address, 16, block);
+    return address;
+}
+
 void VertexEmitter::GsCopyToSlot(uint8_t vertex_id) {
     for (uint32_t k = 0; k < req.num_outputs; k++) {
         const Quad& slot = gs_slots[vertex_id][k];
@@ -1719,8 +1755,31 @@ void VertexEmitter::EpilogueStreamOut() {
         for (uint32_t k = 0; k < req.num_outputs; k++) {
             StoreQuad(base, k * 4, *attr_quad[k]);
         }
+    } else if (req.gs_serial) {
+        // The invocation's end, then the next until none is left; the temporaries to the
+        // state block for the draw after.
+        const Reg entry = Reg::V(static_cast<uint8_t>(gs_loop.base + 1));
+        e.Sta32(GsWord(1), 0, Reg::V(static_cast<uint8_t>(gs_state.base + 2)), 0);
+        // The entry's words times 4: an immediate of 64 or more reads negative, so 16- and 17-word
+        // entries would step back into other data.
+        e.MadI32(entry, Reg::V(static_cast<uint8_t>(gs_loop.base + 2)), 4, entry);
+        e.Vec(VecOp::Add, {gs_loop.Pair(0), 0x1}, {ConstOne.reg, ConstOne.swz, Mod::Neg},
+              {gs_loop.Pair(0), XYZW});
+        e.Test(Cond::Gt, 2, {gs_loop.Pair(0)}, 0, ConstZero, true);
+        Branch(Pred::P2, gs_loop_top);
+        for (uint32_t t = 0; t < 16; t++) {
+            if (temp_quad[t]) {
+                StoreQuad(Reg::Pa(3), t * 4, *temp_quad[t]);
+            }
+        }
+        for (uint32_t v = 0; v < 3; v++) {
+            const Reg slot = GsStateSlot(v, Reg::Pa(3));
+            for (uint32_t k = 0; k < req.num_outputs; k++) {
+                StoreQuad(slot, k * 4, gs_slots[v][k]);
+            }
+        }
     } else {
-        e.Sta32(Reg::Pa(1), 0, Reg::V(static_cast<uint8_t>(gs_state.base + 2)), 0);
+        e.Sta32(GsWord(1), 0, Reg::V(static_cast<uint8_t>(gs_state.base + 2)), 0);
     }
     e.Idf(0);
     e.WdfVertex(0);
@@ -1773,9 +1832,10 @@ void VertexEmitter::Prologue() {
             e.MoveInternal({attr_quad[k]->Pair(1), 0x3}, ConstZeroOne);
         }
     }
-    // Temporaries read before they are written start at (0, 0, 0, 1) too.
+    // Temporaries read before they are written start at (0, 0, 0, 1) too; in order
+    // (gs_serial), they are the state block's, below.
     for (uint32_t t = 0; t < 16; t++) {
-        if (!temp_quad[t] || scan.temp_init[t] == 0) {
+        if (!temp_quad[t] || scan.temp_init[t] == 0 || req.gs_serial) {
             continue;
         }
         const uint8_t m = scan.temp_init[t];
@@ -1801,17 +1861,47 @@ void VertexEmitter::Prologue() {
     if (scan.al) {
         e.Bitwise(BwOp::Or, Reg::V(TmpAlS16), IOp::Imm(0), IOp::Imm(0));
     }
+    if (req.mode == VsMode::Geometry && req.gs_serial) {
+        const Reg entry = Reg::V(static_cast<uint8_t>(gs_loop.base + 1));
+        gs_loop_top = NewLabel();
+        e.MoveInternal({gs_loop.Pair(0), 0x1}, {Reg::Pa(0), XXXX});
+        e.Bitwise(BwOp::Or, entry, IOp::R(Reg::Pa(1)), IOp::Imm(0));
+        // z: the entry's words, mad.i32's multiplier for the entry's step (its first source is
+        // no SA, and its immediate is signed, EpilogueStreamOut).
+        e.Bitwise(BwOp::Or, Reg::V(static_cast<uint8_t>(gs_loop.base + 2)),
+                  IOp::Imm(static_cast<uint8_t>(gs_entry_words)), IOp::Imm(0));
+        // Every temporary the program touches: one it writes first in code order may still be read
+        // first on an invocation's path.
+        for (uint32_t t = 0; t < 16; t++) {
+            if (temp_quad[t]) {
+                e.Lda32(temp_quad[t]->Base(), Reg::Pa(2), nullptr, static_cast<uint8_t>(t * 4), 4,
+                        0);
+                e.WdfVertex(0);
+            }
+        }
+        // The emit buffer's vertices the draw before left (GsStateQuads).
+        for (uint32_t v = 0; v < 3; v++) {
+            const Reg slot = GsStateSlot(v, Reg::Pa(2));
+            for (uint32_t k = 0; k < req.num_outputs; k++) {
+                e.Lda32(gs_slots[v][k].Base(), slot, nullptr, static_cast<uint8_t>(k * 4), 4, 0);
+                e.WdfVertex(0);
+            }
+        }
+        Bind(gs_loop_top);
+        for (uint32_t q = 0; q < gs_entry_quads.size(); q++) {
+            e.Lda32(gs_entry_quads[q].Base(), entry, nullptr, static_cast<uint8_t>(q * 4), 4, 0);
+            e.WdfVertex(0);
+        }
+    }
     if (req.mode == VsMode::Geometry) {
-        // The input rows, each a fetch from its address (PA 2 + r, less the fetch's word).
+        // word).
         for (uint32_t r = 0; r < gs_row_quads.size(); r++) {
-            e.Lda32(gs_row_quads[r].Base(), Reg::Pa(static_cast<uint8_t>(2 + r)), nullptr, 0, 4,
-                    0);
+            e.Lda32(gs_row_quads[r].Base(), GsWord(2 + r), nullptr, 0, 4, 0);
             e.WdfVertex(0);
         }
         for (uint32_t r = 0, k = 2 + req.gs_rows; r < 16; r++) {
             if (gs_input_quads[r]) {
-                e.Lda32(gs_input_quads[r]->Base(), Reg::Pa(static_cast<uint8_t>(k++)), nullptr, 0,
-                        4, 0);
+                e.Lda32(gs_input_quads[r]->Base(), GsWord(k++), nullptr, 0, 4, 0);
                 e.WdfVertex(0);
             }
         }
@@ -1825,7 +1915,7 @@ void VertexEmitter::Prologue() {
         e.MoveInternal({gs_state.Pair(0), 0x1}, ConstZero);
         e.Bitwise(BwOp::Or, size, IOp::Imm(static_cast<uint8_t>(3 * req.num_outputs)),
                   IOp::Imm(0));
-        e.Bitwise(BwOp::Or, next, IOp::R(Reg::Pa(0)), IOp::Imm(0));
+        e.Bitwise(BwOp::Or, next, IOp::R(GsWord(0)), IOp::Imm(0));
         if (dynamic_emit) {
             // Every EMIT that reads it comes after a SETEMIT (setemit_done): written for the
             // register allocator, never read as zero.
@@ -1974,6 +2064,11 @@ std::optional<Program> VertexEmitter::Emit(uint32_t& input_regs) {
     }
     ScanProgram();
     input_regs = scan.inputs;
+    for (uint32_t t = 0; t < 16; t++) {
+        if (scan.temp_init[t] != 0) {
+            program.gs_temps_read_first |= static_cast<uint16_t>(1u << t);
+        }
+    }
     Layout();
 
     e.skip_invalid = true;
@@ -2022,7 +2117,10 @@ std::optional<Program> VertexEmitter::Emit(uint32_t& input_regs) {
     // the internal registers. Geometry programs need up to 34 quads.
     e.AddClass({Bank::Temp, 0, 64});
     e.AddClass({Bank::PrimAttr, pa_inputs, PaLimit});
-    e.AddClass({Bank::Output, 0, OutScratchEnd, epilogue_at});
+    // In order (gs_serial) the loop runs back past epilogue_at: no output register for them.
+    if (!req.gs_serial) {
+        e.AddClass({Bank::Output, 0, OutScratchEnd, epilogue_at});
+    }
     e.AddClass({Bank::Temp, 64, 112});
     Encoder primary;
     const Ir::LowerResult lowered = e.Lower(primary, level);

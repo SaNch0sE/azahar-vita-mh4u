@@ -625,8 +625,9 @@ void Encoder::MadI32(Reg dst, Reg src0, uint8_t imm, Reg src2) {
     case Bank::PrimAttr: s0b = 1; break;
     default: Fail("usse: mad.i32's first source is a temporary or a primary attribute");
     }
-    if (imm > 127) {
-        Fail("usse: mad.i32 immediate is 7 bits");
+    // The immediate is a signed 7 bits: 0x44 multiplies as -60.
+    if (imm > 63) {
+        Fail("usse: mad.i32's immediate is a signed 7 bits");
     }
     const auto [s2b, s2ext] = IntSrc12Bank(src2.bank);
     // The compiler's words have bit 55 set and bit 56 clear, where Vita3K's pattern puts
