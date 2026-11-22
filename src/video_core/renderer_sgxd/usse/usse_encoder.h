@@ -62,6 +62,11 @@ constexpr uint8_t PackSelIdentity = 0xE4;
 constexpr uint8_t PackSelBroadcast(uint8_t lane) {
     return static_cast<uint8_t>(lane * 0x55);
 }
+/// The source lanes a select takes, a bit each.
+constexpr uint8_t PackSelLanes(uint8_t sel) {
+    return static_cast<uint8_t>(1u << (sel & 3) | 1u << (sel >> 2 & 3) | 1u << (sel >> 4 & 3) |
+                                1u << (sel >> 6 & 3));
+}
 
 /// Source modifiers.
 enum class Mod : uint8_t { None = 0, Neg = 1, Abs = 2, NegAbs = 3 };

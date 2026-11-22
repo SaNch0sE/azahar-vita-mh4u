@@ -510,9 +510,26 @@ private:
     /// a float offset past the resident part (the light parameters of lights past the SA
     /// budget); returns the offset.
     uint32_t AllocateMemoryUniform(UniformKind kind, uint8_t index, uint8_t components);
-    /// A light's parameters: the SA quad set for a resident light, else TmpLightMem, which
-    /// LightQuads fills quad by quad.
-    Vec4Loc LightParams(uint32_t num);
+    /// The light about to be lit: whether its parameters live in memory (light_mem), and the
+    /// loads' state for one that does. Its quads are read through LightQuad.
+    void LightParams(uint32_t num);
+    /// Quad q of the light LightParams named (0 specular_0, 1 specular_1, 2 diffuse with the
+    /// distance scale in .w, 3 ambient, 4 position with the distance bias in .w, 5 the spot
+    /// direction): a resident light's SAs, a memory light's quad of TmpLightMem, which
+    /// LightQuads fills.
+    Vec4Loc LightQuad(uint32_t q) const;
+    /// Whether light i of the config has a specular_0 or a specular_1 term: the secondary
+    /// colour is read and the light's colour is not zero (nor every light's, for specular_0).
+    bool LightSpecular0(uint32_t light_index) const;
+    bool LightSpecular1(uint32_t light_index) const;
+    /// D0 or D1 read at N.V: the same for every light, read once before them (Lighting).
+    bool LutSharedAtNv(const Pica::Shader::LutConfig& lut, Sampler sampler) const;
+    /// The LUT inputs light i's own reads take (a bit per LutInput): the reads of a term that
+    /// is left out are not made.
+    uint32_t LightInputs(uint32_t light_index) const;
+    /// The quads light i's program reads (bit q): a zero colour's, an unread spot direction's
+    /// and an unlit sum's take no registers.
+    uint32_t LightQuadsRead(uint32_t light_index) const;
     /// A memory light's parameter quads in `mask` loaded into TmpLightMem unless they are
     /// already; with `wait` waited for too, else a LUT fetch's WDF that follows covers them
     /// (no internal register may hold a value across either). Nothing for a resident light.
@@ -647,6 +664,7 @@ private:
     /// TmpLightBase with light_mem_far), its quads loaded into TmpLightMem so far (bit q:
     /// floats 4q..4q+3), and whether a load still waits for its WDF.
     bool light_mem = false;
+    uint32_t light_num = 0; ///< the PICA number of the light being lit
     bool light_mem_far = false;
     uint32_t light_mem_offset = 0;
     uint32_t light_mem_loaded = 0;
@@ -684,10 +702,10 @@ private:
     uint32_t sa_noise_f = 0;              ///< proctex_noise_f, _a, _p (pairs)
     uint32_t sa_noise_a = 0;
     uint32_t sa_noise_p = 0;
-    std::array<uint32_t, 8> sa_light{}; ///< per PICA light number; per light: specular_0
-                                        ///< +0, dist_atten_bias +3, specular_1 +4,
-                                        ///< dist_atten_scale +7, diffuse +8, ambient +12,
-                                        ///< position +16, spot_direction +20
+    /// Per PICA light number, each quad's place (LightQuad's numbers): a resident light's SA,
+    /// a memory light's float offset from light_memory; -1 for a quad its program does not
+    /// read (LightQuadsRead).
+    std::array<std::array<int32_t, 6>, 8> light_quad{};
 };
 
 const char* FragmentEmitter::Unsupported() const {
@@ -1244,16 +1262,14 @@ void FragmentEmitter::PlanUniforms() {
                  8 + light.num);
             note(light.dist_atten_enable, 16 + light.num);
         }
-        // Lights are register-resident (24 SAs each) while the budget holds, counting the
-        // literals, the sampler words and the pointer behind them; the rest live in the
-        // memory part of the uniform buffer and are loaded when their turn comes.
+        // Lights are register-resident (four SAs a quad they read) while the budget holds, counting
+        // the literals, the sampler words and the pointer behind them; the rest live in the memory
+        // part of the uniform buffer and are loaded when their turn comes.
         const uint32_t tail =
             literal_reserve + static_cast<uint32_t>(program.samplers.size()) * 4 + 1;
-        // A filtered read through LightingLutLookup takes its row as the y of a pair whose x
-        // is the read's offset (an unsigned input's half texel) or bound (a signed input's
-        // last x): its coordinate is one instruction, (input, 0) + pair or min((x, 2), pair),
-        // where the x and the row took two. The distance attenuation makes its x itself and
-        // keeps a scalar. The pairs cost an SA each, so only while every light stays resident.
+        // A filtered lookup takes its row as the y of a pair whose x is the read's offset
+        // (unsigned input) or bound (signed), so its coordinate is one instruction. The pairs
+        // cost an SA each, so only while every light stays resident: shared LUTs first.
         std::array<const Pica::Shader::LutConfig*, 24> pair_lut{};
         pair_lut[0] = &lighting.lut_d0;
         pair_lut[1] = &lighting.lut_d1;
@@ -1264,11 +1280,11 @@ void FragmentEmitter::PlanUniforms() {
         for (u32 num = 0; num < 8; num++) {
             pair_lut[8 + num] = &lighting.lut_sp;
         }
-        const auto resident_lights = [&](bool pairs) {
+        const auto resident_lights = [&](u32 paired) {
             uint32_t at = uniform_floats;
             u32 singles = 0;
             for (u32 sampler = 0; sampler < row_used.size(); sampler++) {
-                if (row_used[sampler] && pairs && pair_lut[sampler] != nullptr) {
+                if (row_used[sampler] && (paired >> sampler & 1) != 0) {
                     at = ((at + 1) & ~1u) + 2;
                 } else if (row_used[sampler]) {
                     singles++;
@@ -1276,15 +1292,26 @@ void FragmentEmitter::PlanUniforms() {
             }
             at = ((at + singles + 1) & ~1u) + 3; // the global ambient
             u32 resident = 0;
-            for (u32 i = 0; i < lighting.src_num && ((at + 1) & ~1u) + 24 + tail <= 128; i++) {
-                at = ((at + 1) & ~1u) + 24;
+            for (u32 i = 0; i < lighting.src_num; i++) {
+                const u32 floats = 4 * static_cast<u32>(std::popcount(LightQuadsRead(i)));
+                if (((at + 1) & ~1u) + floats + tail > 128) {
+                    break;
+                }
+                at = ((at + 1) & ~1u) + floats;
                 resident++;
             }
             return resident;
         };
-        const bool pairs = resident_lights(true) == resident_lights(false);
+        const u32 resident = resident_lights(0);
+        u32 paired = 0;
         for (u32 sampler = 0; sampler < row_used.size(); sampler++) {
-            if (row_used[sampler] && pairs && pair_lut[sampler] != nullptr) {
+            if (row_used[sampler] && pair_lut[sampler] != nullptr &&
+                resident_lights(paired | 1u << sampler) == resident) {
+                paired |= 1u << sampler;
+            }
+        }
+        for (u32 sampler = 0; sampler < row_used.size(); sampler++) {
+            if (row_used[sampler] && (paired >> sampler & 1) != 0) {
                 const UniformKind kind = static_cast<bool>(pair_lut[sampler]->abs_input)
                                              ? UniformKind::LightingLutCoordHalf
                                              : UniformKind::LightingLutCoordWrap;
@@ -1299,37 +1326,56 @@ void FragmentEmitter::PlanUniforms() {
             }
         }
         sa_global_ambient = AllocateUniform(UniformKind::LightingGlobalAmbient, 3, 1);
+        for (auto& quads : light_quad) {
+            quads.fill(-1);
+        }
+        bool in_memory = false;
         for (u32 i = 0; i < lighting.src_num; i++) {
-            const u32 num = lighting.lights[i].num;
+            const auto& config_light = lighting.lights[i];
+            const u32 num = config_light.num;
             // A directional light's vector is its position normalised, the same for the
             // whole draw: the rasterizer normalises it (LightDirection), unless the distance
             // attenuation wants the position's length.
-            const UniformKind position = LightPreNormalised(lighting.lights[i])
+            const UniformKind position = LightPreNormalised(config_light)
                                              ? UniformKind::LightDirection
                                              : UniformKind::LightPosition;
-            // The distance attenuation's bias and scale ride in the .w of the position and
-            // spot quads, which a memory light loads first (Lighting).
-            const UniformKind members[8] = {UniformKind::LightSpecular0,
+            // A quad a member of three floats, the quads the program reads alone
+            // (LightQuadsRead). The distance attenuation's scale and bias ride in the .w of
+            // the diffuse and position quads; a memory light loads those first (Lighting).
+            const UniformKind members[6] = {UniformKind::LightSpecular0,
                                             UniformKind::LightSpecular1,
                                             UniformKind::LightDiffuse,
                                             UniformKind::LightAmbient,
                                             position,
-                                            UniformKind::LightDistAttenBias,
-                                            UniformKind::LightSpotDirection,
-                                            UniformKind::LightDistAttenScale};
-            const uint8_t sizes[8] = {3, 3, 3, 3, 3, 1, 3, 1};
-            const bool resident_light = ((uniform_floats + 1) & ~1u) + 24 + tail <= 128;
-            for (int m = 0; m < 8; m++) {
-                const uint8_t light = static_cast<uint8_t>(num);
+                                            UniformKind::LightSpotDirection};
+            const u32 quads = LightQuadsRead(i);
+            const u32 floats = 4 * static_cast<u32>(std::popcount(quads));
+            // Once a light is in memory the ones after it are too (resident_lights' count).
+            const bool resident_light =
+                !in_memory && ((uniform_floats + 1) & ~1u) + floats + tail <= 128;
+            in_memory = !resident_light;
+            const uint8_t light = static_cast<uint8_t>(num);
+            for (u32 q = 0; q < 6; q++) {
+                if ((quads >> q & 1) == 0) {
+                    continue;
+                }
+                const UniformKind partner =
+                    q == 2 ? UniformKind::LightDistAttenScale : UniformKind::LightDistAttenBias;
+                const bool partnered = (q == 2 || q == 4) && config_light.dist_atten_enable;
                 if (resident_light) {
-                    const uint32_t at = AllocateUniform(members[m], sizes[m], 1, light);
-                    if (m == 0) {
-                        sa_light[num] = at;
+                    light_quad[num][q] =
+                        static_cast<int32_t>(AllocateUniform(members[q], 3, 1, light));
+                    if (partnered) {
+                        AllocateUniform(partner, 1, 1, light);
                     }
                 } else {
-                    const uint32_t at = AllocateMemoryUniform(members[m], light, sizes[m]);
-                    if (m == 0) {
+                    const uint32_t at = AllocateMemoryUniform(members[q], light, 3);
+                    if (light_memory[num] < 0) {
                         light_memory[num] = static_cast<int32_t>(at);
+                    }
+                    light_quad[num][q] = static_cast<int32_t>(at) - light_memory[num];
+                    if (partnered) {
+                        AllocateMemoryUniform(partner, light, 1);
                     }
                 }
             }
@@ -1366,21 +1412,18 @@ uint32_t FragmentEmitter::AllocateMemoryUniform(UniformKind kind, uint8_t index,
     return at;
 }
 
-Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
+void FragmentEmitter::LightParams(uint32_t num) {
+    light_num = num;
     light_mem = light_memory[num] >= 0;
     if (!light_mem) {
-        return {Bank::SecAttr, static_cast<uint8_t>(sa_light[num])};
+        return;
     }
-    // 24 floats from the buffer, a load per quad. The allocator places each quad on its
-    // own: one sixteen-float load filled sixteen registers from the first quad's home (past
-    // the program's temps), while the three quads after it read registers nothing loaded
-    // (a game's speckled drivers). The immediate offset is in floats and seven
-    // bits wide, which the fifth light past the budget passes (a game: seven lights
-    // in memory, the sixth's at float 120): from there the light's quads load from a base the
-    // pointer plus its quad, as psp2cgc moves a far uniform's (`or`, then `mad.i32` by 16 and
-    // the pointer; the vertex programs' far uniforms).
+    // A load per quad: one sixteen-float load left the quads after the first unloaded. The offset
+    // is seven bits of floats, which the fifth light past the budget passes: from there the quads
+    // load from the pointer plus the light's quad, as psp2cgc addresses a far uniform.
     const uint32_t off = static_cast<uint32_t>(light_memory[num]);
-    light_mem_far = off + 20 > 127;
+    const int32_t last = *std::max_element(light_quad[num].begin(), light_quad[num].end());
+    light_mem_far = off + static_cast<uint32_t>(last) > 127;
     if (light_mem_far) {
         const Reg base = Reg::V(TmpLightBase);
         e.Bitwise(BwOp::Or, base, IOp::Imm(static_cast<uint8_t>(off / 4)), IOp::Imm(0));
@@ -1389,13 +1432,95 @@ Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
     light_mem_offset = light_mem_far ? off % 4 : off;
     light_mem_loaded = 0;
     light_mem_pending = false;
-    return {Bank::Virtual, TmpLightMem};
+}
+
+Vec4Loc FragmentEmitter::LightQuad(uint32_t q) const {
+    if (light_mem) {
+        return {Bank::Virtual, static_cast<uint8_t>(TmpLightMem + 4 * q)};
+    }
+    DEBUG_ASSERT_MSG(light_quad[light_num][q] >= 0, "lighting: light {}'s quad {} is not planned",
+                     light_num, q);
+    return {Bank::SecAttr, static_cast<uint8_t>(light_quad[light_num][q])};
+}
+
+bool FragmentEmitter::LightSpecular0(uint32_t light_index) const {
+    const auto& lighting = config.lighting;
+    return uses_secondary_color && !lighting.specular0_zero &&
+           !lighting.lights[light_index].specular0_zero;
+}
+
+bool FragmentEmitter::LightSpecular1(uint32_t light_index) const {
+    return uses_secondary_color && !config.lighting.lights[light_index].specular1_zero;
+}
+
+bool FragmentEmitter::LutSharedAtNv(const Pica::Shader::LutConfig& lut, Sampler sampler) const {
+    // The lights' two-sidedness picks the lookup's form, so they must agree.
+    const auto& lighting = config.lighting;
+    bool same_sides = lighting.src_num > 1;
+    for (u32 i = 1; i < lighting.src_num; i++) {
+        same_sides = same_sides &&
+                     lighting.lights[i].two_sided_diffuse == lighting.lights[0].two_sided_diffuse;
+    }
+    return uses_secondary_color && same_sides && LightingLutEnabled(lut, sampler) &&
+           lut.type == LutInput::NV;
+}
+
+uint32_t FragmentEmitter::LightInputs(uint32_t light_index) const {
+    const auto& lighting = config.lighting;
+    const auto& light = lighting.lights[light_index];
+    u32 inputs = 0;
+    const auto input_of = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
+        if (LightingLutEnabled(lut, sampler)) {
+            inputs |= 1u << static_cast<u32>(lut.type.Value());
+        }
+    };
+    if (light.spot_atten_enable) {
+        input_of(lighting.lut_sp, Sampler::SpotlightAttenuation);
+    }
+    // D0 multiplies specular_0 alone; D1 and the reflection tables specular_1.
+    if (LightSpecular0(light_index) &&
+        !LutSharedAtNv(lighting.lut_d0, Sampler::Distribution0)) {
+        input_of(lighting.lut_d0, Sampler::Distribution0);
+    }
+    if (LightSpecular1(light_index)) {
+        if (!LutSharedAtNv(lighting.lut_d1, Sampler::Distribution1)) {
+            input_of(lighting.lut_d1, Sampler::Distribution1);
+        }
+        input_of(lighting.lut_rr, Sampler::ReflectRed);
+        input_of(lighting.lut_rg, Sampler::ReflectGreen);
+        input_of(lighting.lut_rb, Sampler::ReflectBlue);
+    }
+    if (light_index + 1 == lighting.src_num &&
+        ((uses_primary_color && lighting.enable_primary_alpha) ||
+         (uses_secondary_color && lighting.enable_secondary_alpha))) {
+        input_of(lighting.lut_fr, Sampler::Fresnel);
+    }
+    return inputs;
+}
+
+uint32_t FragmentEmitter::LightQuadsRead(uint32_t light_index) const {
+    const auto& light = config.lighting.lights[light_index];
+    u32 quads = 0x10; // the position
+    if (uses_primary_color || light.dist_atten_enable) {
+        quads |= 0x4; // the diffuse colour, the distance scale beside it
+    }
+    if (uses_primary_color && !light.ambient_zero) {
+        quads |= 0x8;
+    }
+    if (LightSpecular0(light_index)) {
+        quads |= 0x1;
+    }
+    if (LightSpecular1(light_index)) {
+        quads |= 0x2;
+    }
+    if ((LightInputs(light_index) >> static_cast<u32>(LutInput::SP) & 1) != 0) {
+        quads |= 0x20;
+    }
+    return quads;
 }
 
 void FragmentEmitter::LightQuads(uint32_t mask, bool wait) {
-    // Each quad is loaded just before the code that reads it, not all six at the light's
-    // start: the six quads (24 temporaries) were live across every LUT fetch of the light, and
-    // the programs with a light in memory were the ones at 60-64 temporaries.
+    // Each quad is loaded just before the code that reads it, to keep the temporaries down.
     if (!light_mem) {
         return;
     }
@@ -1403,9 +1528,10 @@ void FragmentEmitter::LightQuads(uint32_t mask, bool wait) {
     const Reg ptr =
         light_mem_far ? Reg::V(TmpLightBase) : Reg::Sa(static_cast<uint8_t>(uniform_floats));
     for (uint32_t q = 0; q < 6; q++) {
-        if ((mask >> q & 1) != 0 && (light_mem_loaded >> q & 1) == 0) {
+        const int32_t at = light_quad[light_num][q];
+        if ((mask >> q & 1) != 0 && (light_mem_loaded >> q & 1) == 0 && at >= 0) {
             e.Lda32(Reg::V(static_cast<uint8_t>(TmpLightMem + 4 * q)), ptr, nullptr,
-                    static_cast<uint8_t>(light_mem_offset + 4 * q), 4, 0);
+                    static_cast<uint8_t>(light_mem_offset + static_cast<uint32_t>(at)), 4, 0);
             light_mem_loaded |= 1u << q;
             light_mem_pending = true;
         }
@@ -2552,6 +2678,8 @@ void FragmentEmitter::Lighting() {
     bool lanes_moved = false;
     bool primary_alpha_read = !u8_tev;
     bool secondary_alpha_read = !u8_tev;
+    // The secondary colour's colour lanes the arguments read (bit per lane).
+    uint32_t secondary_lanes = u8_tev ? 0 : 0x7;
     if (u8_tev) {
         ForEachU8Arg([&](u32, Source csrc, ColorModifier cmod, Source asrc, AlphaModifier amod) {
             const auto lit = [](Source s) {
@@ -2563,6 +2691,12 @@ void FragmentEmitter::Lighting() {
                 cmod == ColorModifier::SourceAlpha || cmod == ColorModifier::OneMinusSourceAlpha;
             const bool a_alpha =
                 amod == AlphaModifier::SourceAlpha || amod == AlphaModifier::OneMinusSourceAlpha;
+            if (csrc == Source::SecondaryFragmentColor && !c_alpha) {
+                secondary_lanes |= MovedLane(cmod) >= 0 ? 1u << MovedLane(cmod) : 0x7u;
+            }
+            if (asrc == Source::SecondaryFragmentColor && MovedLane(amod) >= 0) {
+                secondary_lanes |= 1u << MovedLane(amod);
+            }
             for (const Source lit_src :
                  {Source::PrimaryFragmentColor, Source::SecondaryFragmentColor}) {
                 if ((csrc == lit_src && c_alpha) || (asrc == lit_src && a_alpha)) {
@@ -2575,6 +2709,13 @@ void FragmentEmitter::Lighting() {
     u8_lighting_packed = u8_tev && !lanes_moved;
     primary_alpha_read = primary_alpha_read || !u8_lighting_packed;
     secondary_alpha_read = secondary_alpha_read || !u8_lighting_packed;
+    // One colour lane of the secondary read (specular.rrr): the specular sum is that lane's, a
+    // light's term stored or added in one instruction instead of two. The other lanes stay
+    // unwritten: only U8Inputs' packs read the sum, and a lane no argument takes is a byte no SOP
+    // reads.
+    const int spec_lane = u8_tev && std::has_single_bit(secondary_lanes)
+                              ? std::countr_zero(secondary_lanes)
+                              : -1;
 
     const bool fresnel_read = lighting.src_num > 0 &&
                               LightingLutEnabled(lighting.lut_fr, Sampler::Fresnel);
@@ -2628,6 +2769,17 @@ void FragmentEmitter::Lighting() {
     const auto accumulate3 = [&](Vec4Loc to, Reg internal, Pred pred = Pred::None) {
         e.Vec(VecOp::Add, {to.Pair(0), 0x3}, {to.Pair(0), XYZW}, {internal, XYZW}, pred, true);
         e.Vec(VecOp::Add, {to.Pair(1), 0x1}, {to.Pair(1), XYZW}, {internal, ZZZZ}, pred, true);
+    };
+    const auto store1 = [&](Vec4Loc to, Reg internal, int lane) {
+        const uint8_t mask = static_cast<uint8_t>(1u << (lane & 1));
+        e.MoveInternal({to.Pair(lane >> 1), mask}, {internal, lane < 2 ? XYZW : ZWZW}, Pred::None,
+                       true);
+    };
+    const auto accumulate1 = [&](Vec4Loc to, Reg internal, int lane, Pred pred = Pred::None) {
+        const Reg pair = to.Pair(lane >> 1);
+        const uint8_t mask = static_cast<uint8_t>(1u << (lane & 1));
+        e.Vec(VecOp::Add, {pair, mask}, {pair, XYZW}, {internal, lane < 2 ? XYZW : ZZZZ}, pred,
+              true);
     };
 
     // The surface normal and tangent in the quaternion's frame, from the bump map or the
@@ -2723,6 +2875,9 @@ void FragmentEmitter::Lighting() {
         e.Mad({I1, 0x7}, {I0, ZXY, Mod::Neg}, {I2, YZX}, {I1, XYZW}, true, Pred::None, true);
         StoreVec4(v, I1);
     };
+    // Where i2 starts to hold the default normal (stored, and kept in i2 from there): SIZE_MAX
+    // for none.
+    std::size_t normal_i2_from = SIZE_MAX;
     if (default_normal_only) {
         // rotate(q, (0, 0, 1)) = (2(xz + yw), 2(yz - xw), 1 - 2(x^2 + y^2)), with i0 = q:
         // P = (x^2, y^2, xz, yz) doubled, Q = (yw, xw, yw, xw), then n.xy = (2, -2) * Q.zw
@@ -2739,6 +2894,7 @@ void FragmentEmitter::Lighting() {
         e.Vec(VecOp::Add, {I2, 0x4}, {I1, XXXX}, {I1, YYYY}, Pred::None, true);
         e.Vec(VecOp::Add, {I2, 0x4}, {I2, ZZZZ, Mod::Neg}, ConstOne, Pred::None, true);
         StoreVec4(normal, I2);
+        normal_i2_from = e.Count();
     } else if (normal_in_place) {
         perturbation(I1);
         if (lighting.bump_renorm) {
@@ -2899,17 +3055,8 @@ void FragmentEmitter::Lighting() {
     // D0 or D1 read at N.V gives every light the same value (the normal and the view are no
     // light's): read once here, kept in TmpLutShared. The lights' two-sidedness picks the lookup's
     // form, so they must agree.
-    bool same_sides = lighting.src_num > 1;
-    for (u32 i = 1; i < lighting.src_num; i++) {
-        same_sides = same_sides &&
-                     lighting.lights[i].two_sided_diffuse == lighting.lights[0].two_sided_diffuse;
-    }
-    const auto shared_at_nv = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
-        return uses_secondary_color && same_sides && LightingLutEnabled(lut, sampler) &&
-               lut.type == LutInput::NV;
-    };
-    const bool d0_shared = shared_at_nv(lighting.lut_d0, Sampler::Distribution0);
-    const bool d1_shared = shared_at_nv(lighting.lut_d1, Sampler::Distribution1);
+    const bool d0_shared = LutSharedAtNv(lighting.lut_d0, Sampler::Distribution0);
+    const bool d1_shared = LutSharedAtNv(lighting.lut_d1, Sampler::Distribution1);
     const bool sides = lighting.src_num > 0 && lighting.lights[0].two_sided_diffuse;
     if (d0_shared) {
         // .y (D1's) is written after it
@@ -2923,50 +3070,35 @@ void FragmentEmitter::Lighting() {
     for (u32 light_index = 0; light_index < lighting.src_num; light_index++) {
         const auto& light = lighting.lights[light_index];
         last_lut_index.reset(); // another light's vectors
-        const Vec4Loc params = LightParams(light.num);
-        const Bank pb = params.bank;
-        const uint32_t sa = params.base;
-        const Vec4Loc position{pb, static_cast<uint8_t>(sa + 16)};
-        const Vec4Loc spot{pb, static_cast<uint8_t>(sa + 20)};
-        const Vec4Loc diffuse{pb, static_cast<uint8_t>(sa + 8)};
-        const Vec4Loc ambient{pb, static_cast<uint8_t>(sa + 12)};
-        const Vec4Loc specular_0{pb, static_cast<uint8_t>(sa + 0)};
-        const Vec4Loc specular_1{pb, static_cast<uint8_t>(sa + 4)};
+        LightParams(light.num);
+        const Bank pb = light_mem ? Bank::Virtual : Bank::SecAttr;
+        // The light's terms: a zero colour's is left out (RasterizerSgxd::FragmentConfigFor),
+        // with the table reads that only multiply it and the colour's quad.
+        const bool spec0_on = LightSpecular0(light_index);
+        const bool spec1_on = LightSpecular1(light_index);
+        const bool ambient_on = !light.ambient_zero;
+        const u32 quads_read = LightQuadsRead(light_index);
+        const auto quad = [&](u32 q) {
+            return (quads_read >> q & 1) != 0 ? LightQuad(q) : Vec4Loc{pb, 0};
+        };
+        const Vec4Loc position = quad(4);
+        const Vec4Loc spot = quad(5);
+        const Vec4Loc diffuse = quad(2);
+        const Vec4Loc ambient = quad(3);
+        const Vec4Loc specular_0 = quad(0);
+        const Vec4Loc specular_1 = quad(1);
         const bool two_sided = light.two_sided_diffuse;
         const bool shadow_primary = uses_shadow && lighting.shadow_primary && light.shadow_enable;
         const bool shadow_secondary =
             uses_shadow && lighting.shadow_secondary && light.shadow_enable;
         const Vec4Loc shadow{Bank::Virtual, TmpShadow};
-        // A memory light's quads: 0 specular_0, 1 specular_1, 2 diffuse, 3 ambient, 4 position
-        // (and the distance bias in .w), 5 the spot direction (the distance scale).
-        LightQuads(0x30, true);
+        // A memory light's quads: the position (the distance bias in its .w), the spot
+        // direction, and with the distance attenuation the diffuse colour's, whose .w is the
+        // scale.
+        LightQuads(0x30 | (light.dist_atten_enable ? 0x4u : 0u), true);
 
         // The inputs this light's lookups read, a lane each for those read off its vectors.
-        u32 inputs = 0;
-        const auto input_of = [&](const Pica::Shader::LutConfig& lut, Sampler sampler) {
-            if (LightingLutEnabled(lut, sampler)) {
-                inputs |= 1u << static_cast<u32>(lut.type.Value());
-            }
-        };
-        if (light.spot_atten_enable) {
-            input_of(lighting.lut_sp, Sampler::SpotlightAttenuation);
-        }
-        if (uses_secondary_color) {
-            if (!d0_shared) {
-                input_of(lighting.lut_d0, Sampler::Distribution0);
-            }
-            if (!d1_shared) {
-                input_of(lighting.lut_d1, Sampler::Distribution1);
-            }
-            input_of(lighting.lut_rr, Sampler::ReflectRed);
-            input_of(lighting.lut_rg, Sampler::ReflectGreen);
-            input_of(lighting.lut_rb, Sampler::ReflectBlue);
-        }
-        if (light_index + 1 == lighting.src_num &&
-            ((uses_primary_color && lighting.enable_primary_alpha) ||
-             (uses_secondary_color && lighting.enable_secondary_alpha))) {
-            input_of(lighting.lut_fr, Sampler::Fresnel);
-        }
+        const u32 inputs = LightInputs(light_index);
         const auto reads = [&](LutInput input) {
             return (inputs >> static_cast<u32>(input) & 1) != 0;
         };
@@ -2978,10 +3110,24 @@ void FragmentEmitter::Lighting() {
             }
         }
 
+        const bool geo0 = light.geometric_factor_0 && spec0_on;
+        const bool geo1 = light.geometric_factor_1 && spec1_on;
+        const bool geo = geo0 || geo1;
+        const bool halfway = geo || reads(LutInput::NH) || reads(LutInput::VH) || reads(LutInput::CP);
+        // A directional light's vector with the default normal still in i2: L.N reads the vector
+        // where its uniform lies, against i2, and so does the half vector's add, as its first
+        // source (whose z and w lanes a unified-store read gives): no load into i0. Not with
+        // the geometric factor or C.P (they keep the half vector's length or the vector), nor
+        // the spot's input (a second dot with the vector).
+        const bool light_in_sa = normal_i2_from != SIZE_MAX && pb == Bank::SecAttr &&
+                                 LightPreNormalised(light) && !geo && !reads(LutInput::CP) &&
+                                 !reads(LutInput::SP) && e.InternalKept(normal_i2_from, 2);
         // The light vector in i0 = position (+ view unless directional); distance; normalised. A
         // directional light's comes normalised in its uniform (LightPreNormalised): normalised in a
         // secondary program it drew a 32-pixel tile pattern over lit surfaces.
-        LoadVec4(I0, position);
+        if (!light_in_sa) {
+            LoadVec4(I0, position);
+        }
         if (!LightPreNormalised(light)) {
             // Four lanes, though w means nothing: every lane the store reads is then the
             // op's, so the loads fold into the ops (Lowering::LoadSources) instead of moves.
@@ -3001,18 +3147,22 @@ void FragmentEmitter::Lighting() {
         // never parked (nor the half vector, but for C.P).
         // half_vector = normalize(nview + light_vector) in i1; its squared length kept for the
         // geometric factor.
-        const bool geo0 = light.geometric_factor_0;
-        const bool geo1 = light.geometric_factor_1;
-        const bool geo = uses_secondary_color && (geo0 || geo1);
-        if (geo || reads(LutInput::NH) || reads(LutInput::VH) || reads(LutInput::CP)) {
+        if (halfway) {
+            // light_in_sa: the length in i0 (free), so i2 keeps the normal.
+            const Reg scratch = light_in_sa ? I0 : I2;
             LoadVec4(I1, nview);
-            e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
-            e.Dot({I2, 0x1}, {I1, XYZW}, {I1, XYZW}, false, Pred::None, true);
-            if (geo) {
-                e.MoveInternal({dot_product, 0x2}, {I2, XXXX}, Pred::None, true);
+            if (light_in_sa) {
+                e.Vec(VecOp::Add, {I1, 0xf}, {position.Pair(0), XYZW}, {I1, XYZW}, Pred::None,
+                      true);
+            } else {
+                e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
             }
-            e.Comp(CompOp::Rsq, {I2, 0x1}, {I2}, 0, Pred::None, true);
-            e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, {I2, XXXX}, Pred::None, true);
+            e.Dot({scratch, 0x1}, {I1, XYZW}, {I1, XYZW}, false, Pred::None, true);
+            if (geo) {
+                e.MoveInternal({dot_product, 0x2}, {scratch, XXXX}, Pred::None, true);
+            }
+            e.Comp(CompOp::Rsq, {scratch, 0x1}, {scratch}, 0, Pred::None, true);
+            e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, {scratch, XXXX}, Pred::None, true);
             if (reads(LutInput::NH)) {
                 e.Dot(input_dst(LutInput::NH), {normal.Pair(0), XYZW}, {I1, XYZW}, false,
                       Pred::None, true);
@@ -3026,8 +3176,15 @@ void FragmentEmitter::Lighting() {
             }
         }
         // dot(l, n), the L.N input; the spot's input dot(l, spot_dir).
-        const Dst ln = reads(LutInput::LN) ? input_dst(LutInput::LN) : Dst{I2, 0x1};
-        e.Dot(ln, {normal.Pair(0), XYZW}, {I0, XYZW}, false, Pred::None, true);
+        // light_in_sa: the value into i0 (holding nothing now), so i2 keeps the normal for the
+        // next light.
+        const Dst ln =
+            reads(LutInput::LN) ? input_dst(LutInput::LN) : Dst{light_in_sa ? I0 : I2, 0x1};
+        if (light_in_sa) {
+            e.Dot(ln, {position.Pair(0), XYZW}, {I2, XYZW}, false, Pred::None, true);
+        } else {
+            e.Dot(ln, {normal.Pair(0), XYZW}, {I0, XYZW}, false, Pred::None, true);
+        }
         if (reads(LutInput::SP)) {
             e.Dot(input_dst(LutInput::SP), {spot.Pair(0), XYZW}, {I0, XYZW}, false, Pred::None,
                   true);
@@ -3067,12 +3224,12 @@ void FragmentEmitter::Lighting() {
         }
         if (light.dist_atten_enable) {
             // input = clamp(scale * distance + bias, 0, 1), unsigned lookup (the bias and
-            // scale are the .w of quads 4 and 5, loaded with the light's position). They come
+            // scale are the .w of quads 4 and 2, loaded with the light's position). They come
             // in the read's units (UniformSource::dist_atten): the bias has its half texel
             // added, so the read's x is one vmad2.
             const Sampler da_sampler = LightingRegs::DistanceAttenuationSampler(light.num);
-            e.Mad2({Reg::V(TmpLutCoord), 0x1}, {misc_hi, YYYY}, Scalar(pb, sa + 23),
-                   Scalar(pb, sa + 19));
+            e.Mad2({Reg::V(TmpLutCoord), 0x1}, {misc_hi, YYYY}, Scalar(pb, diffuse.base + 3u),
+                   Scalar(pb, position.base + 3u));
             LightingLutRowFetch(da_sampler, true, {atten, 0x1}, nullptr, true);
             last_lut_index.reset(); // TmpLutCoord's x holds the distance's position now
             if (spot_on) {
@@ -3080,7 +3237,12 @@ void FragmentEmitter::Lighting() {
             }
         }
 
-        if (uses_secondary_color) {
+        // A light with neither term adds nothing to the specular sum; the one light whose term
+        // is the sum itself (direct_secondary) packs zero.
+        if (uses_secondary_color && (spec0_on || spec1_on || direct_secondary)) {
+        if (!spec0_on && !spec1_on) {
+            e.Vec(VecOp::Add, {I1, 0x7}, ConstZero, ConstZero, Pred::None, true);
+        } else {
             // The light's LUT values first, each into a lane of its own: refl = (rr ? LUT : 1, rg ?
             // LUT : refl.r, rb ? LUT : refl.r) in TmpLightAcc (no register when all three LUTs are
             // off: refl = 1), d0 and d1 in TmpLutValue (or TmpLutShared). A memory light's specular
@@ -3088,11 +3250,16 @@ void FragmentEmitter::Lighting() {
             // diffuse term, when the specular quads are dead (keeping the register peak down).
             const Vec4Loc acc{Bank::Virtual, TmpLightAcc};
             const Reg values = Reg::V(TmpLutValue);
-            const bool rr = LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
-            const bool rg = LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
-            const bool rb = LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
-            const bool d1_on = LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1);
-            const bool d0_on = LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
+            const bool rr =
+                spec1_on && LightingLutEnabled(lighting.lut_rr, Sampler::ReflectRed);
+            const bool rg =
+                spec1_on && LightingLutEnabled(lighting.lut_rg, Sampler::ReflectGreen);
+            const bool rb =
+                spec1_on && LightingLutEnabled(lighting.lut_rb, Sampler::ReflectBlue);
+            const bool d1_on =
+                spec1_on && LightingLutEnabled(lighting.lut_d1, Sampler::Distribution1);
+            const bool d0_on =
+                spec0_on && LightingLutEnabled(lighting.lut_d0, Sampler::Distribution0);
             const bool refl_on = rr || rg || rb;
             // rr alone: refl = (rr, rr, rr), multiplied in as a broadcast.
             const bool refl_scalar = rr && !rg && !rb;
@@ -3126,7 +3293,7 @@ void FragmentEmitter::Lighting() {
                 fetches[fetch_count++] = {
                     &lighting.lut_d1, Sampler::Distribution1, {values, 0x2}, false};
             }
-            const uint32_t specular_quads = 0x3u;
+            const uint32_t specular_quads = (spec0_on ? 0x1u : 0u) | (spec1_on ? 0x2u : 0u);
             for (u32 i = 0; i < fetch_count; i++) {
                 if (i + 1 == fetch_count) {
                     LightQuads(specular_quads, false);
@@ -3147,21 +3314,27 @@ void FragmentEmitter::Lighting() {
                 }
             }
             // specular_1 * d1 * refl (each factor only when it is not 1) in i2, then
-            // specular_0 * d0 added on in i1.
-            LoadVec4(I2, specular_1);
+            // specular_0 * d0 added on in i1. With specular_0 zero (the light's or every
+            // light's) the first part alone, made in i1; with specular_1 zero the second.
+            const Reg term = spec0_on ? I2 : I1;
+            const Reg scratch = spec0_on ? I1 : I2;
+            if (spec1_on) {
+            LoadVec4(term, specular_1);
             if (d1_on) {
                 const Src d1 = d1_shared ? Src{Reg::V(TmpLutShared), YYYY} : Src{values, YYYY};
-                e.Vec(VecOp::Mul, {I2, 0x7}, {I2, XYZW}, d1, Pred::None, true);
+                e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, d1, Pred::None, true);
             }
         if (refl_scalar) {
-            e.Vec(VecOp::Mul, {I2, 0x7}, {I2, XYZW}, {acc.Pair(0), XXXX}, Pred::None, true);
+            e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, {acc.Pair(0), XXXX}, Pred::None, true);
         } else if (refl_on) {
-            LoadVec4(I1, acc);
-            e.Vec(VecOp::Mul, {I2, 0x7}, {I2, XYZW}, {I1, XYZW}, Pred::None, true);
+            LoadVec4(scratch, acc);
+            e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, {scratch, XYZW}, Pred::None, true);
         }
         if (geo1) {
-            e.Vec(VecOp::Mul, {I2, 0x7}, {I2, XYZW}, {geo_reg, YYYY}, Pred::None, true);
+            e.Vec(VecOp::Mul, {term, 0x7}, {term, XYZW}, {geo_reg, YYYY}, Pred::None, true);
         }
+            } // spec1_on
+        if (spec0_on) {
         LoadVec4(I1, specular_0);
         if (d0_on) {
             const Src d0 = d0_shared ? Src{Reg::V(TmpLutShared), XXXX} : Src{values, XXXX};
@@ -3172,11 +3345,15 @@ void FragmentEmitter::Lighting() {
         }
         // The add's first source the side that is a plain load (only the first source folds
         // a load): specular_1's when nothing multiplies it but something multiplies specular_0.
-        if (!d1_on && !refl_on && !geo1 && (d0_on || geo0)) {
+        if (!spec1_on) {
+            // specular_0's part alone
+        } else if (!d1_on && !refl_on && !geo1 && (d0_on || geo0)) {
             e.Vec(VecOp::Add, {I1, 0x7}, {I2, XYZW}, {I1, XYZW}, Pred::None, true);
         } else {
             e.Vec(VecOp::Add, {I1, 0x7}, {I1, XYZW}, {I2, XYZW}, Pred::None, true);
         }
+        }
+        } // a term
         // * clamp_highlights * atten, into specular_sum. clamp_highlights is sign(dot_product),
         // which is never negative: the term is zeroed where dot_product is not positive, the
         // predicate made here: the first light's term zeroed, a later one's accumulation
@@ -3207,8 +3384,14 @@ void FragmentEmitter::Lighting() {
             e.PackU8(Reg::V(TmpU8Specular), I1, I1, secondary_alpha_read ? PackSelIdentity : xyzz);
             specular_empty = false;
         } else if (specular_empty) {
-            store3(specular_sum, I1);
+            if (spec_lane >= 0) {
+                store1(specular_sum, I1, spec_lane);
+            } else {
+                store3(specular_sum, I1);
+            }
             specular_empty = false;
+        } else if (spec_lane >= 0) {
+            accumulate1(specular_sum, I1, spec_lane, clamp_accumulate ? Pred::P0 : Pred::None);
         } else {
             accumulate3(specular_sum, I1, clamp_accumulate ? Pred::P0 : Pred::None);
         }
@@ -3217,7 +3400,9 @@ void FragmentEmitter::Lighting() {
         // diffuse_sum += (diffuse * dot_product + ambient) * atten
         LightQuads(0xc, true);
         LoadVec4(I0, diffuse);
-        LoadVec4(I1, ambient);
+        if (ambient_on) {
+            LoadVec4(I1, ambient);
+        }
         e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {dot_product, XXXX}, Pred::None, true);
         if (shadow_primary && shadow_scalar) {
             e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {shadow.Pair(0), XXXX}, Pred::None, true);
@@ -3226,7 +3411,9 @@ void FragmentEmitter::Lighting() {
             e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {I2, XYZW}, Pred::None, true);
         }
         // The ambient first, so its load folds into the add's first source.
-        e.Vec(VecOp::Add, {I0, 0x7}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
+        if (ambient_on) {
+            e.Vec(VecOp::Add, {I0, 0x7}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
+        }
         if (atten_on) {
             e.Vec(VecOp::Mul, {I0, 0x7}, {I0, XYZW}, {atten, XXXX}, Pred::None, true);
         }
@@ -3257,6 +3444,11 @@ void FragmentEmitter::Lighting() {
         }
     }
 
+    // Every light's specular term left out: the sum's colour is zero.
+    if (uses_secondary_color && specular_empty && lighting.src_num != 0) {
+        e.Vec(VecOp::Add, {specular_sum.Pair(0), 0x3}, ConstZero, ConstZero);
+        e.Vec(VecOp::Add, {specular_sum.Pair(1), 0x1}, ConstZero, ConstZero);
+    }
     if (uses_shadow && lighting.shadow_alpha) {
         const Vec4Loc shadow{Bank::Virtual, TmpShadow};
         const Src shadow_alpha =
@@ -3271,11 +3463,13 @@ void FragmentEmitter::Lighting() {
         }
     }
     // diffuse_sum.rgb += global ambient (unless the first light's store added it); both
-    // clamped in place, or packed for the U8 combiners (unless packed at the light).
+    // clamped in place, or packed for the U8 combiners (unless packed at the light). For the U8
+    // combiners with a moved lane the sums stay F32 for U8Inputs' packs, which saturate as the
+    // clamp does: not clamped.
     if (uses_primary_color && !direct_primary) {
         if (ambient_added && u8_lighting_packed) {
             e.PackU8(Reg::V(TmpU8Diffuse), diffuse_sum.Pair(0), diffuse_sum.Pair(1));
-        } else {
+        } else if (!(ambient_added && u8_tev)) {
             LoadVec4(I0, diffuse_sum);
             if (!ambient_added) {
                 e.Vec(VecOp::Add, {I0, 0x7}, {global_ambient, XYZW}, {I0, XYZW}, Pred::None, true);
@@ -3283,7 +3477,9 @@ void FragmentEmitter::Lighting() {
             if (u8_lighting_packed) {
                 e.PackU8(Reg::V(TmpU8Diffuse), I0, I0);
             } else {
-                Clamp01(I0);
+                if (!u8_tev) {
+                    Clamp01(I0);
+                }
                 StoreVec4(diffuse_sum, I0);
             }
         }
@@ -3291,7 +3487,7 @@ void FragmentEmitter::Lighting() {
     if (uses_secondary_color && !direct_secondary) {
         if (u8_lighting_packed) {
             e.PackU8(Reg::V(TmpU8Specular), specular_sum.Pair(0), specular_sum.Pair(1));
-        } else {
+        } else if (!u8_tev) {
             LoadVec4(I0, specular_sum);
             Clamp01(I0);
             StoreVec4(specular_sum, I0);

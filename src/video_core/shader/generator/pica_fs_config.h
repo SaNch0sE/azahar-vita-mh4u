@@ -237,6 +237,12 @@ union Light {
     BitField<7, 1, u16> geometric_factor_0;
     BitField<8, 1, u16> geometric_factor_1;
     BitField<9, 1, u16> shadow_enable;
+    /// Set by the sgxd backend alone, from the registers: the light's specular_0, specular_1
+    /// or ambient colour is zero, so its term and the colour's registers are left out of the
+    /// program.
+    BitField<10, 1, u16> specular0_zero;
+    BitField<11, 1, u16> specular1_zero;
+    BitField<12, 1, u16> ambient_zero;
 
     static consteval u64 StructHash() {
         constexpr u64 STRUCT_VERSION = 0;
@@ -251,7 +257,9 @@ union Light {
                                    FIELD_HASH(num), FIELD_HASH(directional),
                                    FIELD_HASH(two_sided_diffuse), FIELD_HASH(dist_atten_enable),
                                    FIELD_HASH(spot_atten_enable), FIELD_HASH(geometric_factor_0),
-                                   FIELD_HASH(geometric_factor_1), FIELD_HASH(shadow_enable));
+                                   FIELD_HASH(geometric_factor_1), FIELD_HASH(shadow_enable),
+                                   FIELD_HASH(specular0_zero), FIELD_HASH(specular1_zero),
+                                   FIELD_HASH(ambient_zero));
     }
 };
 static_assert(std::has_unique_object_representations_v<Light>);
@@ -309,6 +317,9 @@ struct LightConfig {
         BitField<20, 1, u32> shadow_invert;
         BitField<21, 1, u32> shadow_alpha;
         BitField<22, 2, u32> shadow_selector;
+        /// Set by the sgxd backend alone, from the registers: every light's specular_0 is
+        /// zero, so its term (D0 with it) is left out of the program.
+        BitField<24, 1, u32> specular0_zero;
     };
     LutConfig lut_d0{};
     LutConfig lut_d1{};
@@ -335,7 +346,8 @@ struct LightConfig {
             FIELD_HASH(config), FIELD_HASH(enable_primary_alpha),
             FIELD_HASH(enable_secondary_alpha), FIELD_HASH(enable_shadow),
             FIELD_HASH(shadow_primary), FIELD_HASH(shadow_secondary), FIELD_HASH(shadow_invert),
-            FIELD_HASH(shadow_alpha), FIELD_HASH(shadow_selector), FIELD_HASH(lut_d0),
+            FIELD_HASH(shadow_alpha), FIELD_HASH(shadow_selector), FIELD_HASH(specular0_zero),
+            FIELD_HASH(lut_d0),
             FIELD_HASH(lut_d1), FIELD_HASH(lut_sp), FIELD_HASH(lut_fr), FIELD_HASH(lut_rr),
             FIELD_HASH(lut_rg), FIELD_HASH(lut_rb), FIELD_HASH(lights),
 

@@ -183,6 +183,10 @@ public:
     const std::vector<Inst>& Insts() const {
         return insts;
     }
+    /// Whether internal register i<reg> still holds what it held before instruction `from`: no
+    /// instruction from there on writes it, and none deschedules the instance (a wait, load,
+    /// read or branch, after which no internal register survives).
+    bool InternalKept(std::size_t from, uint8_t reg) const;
 
     // --- control flow ---
     int NewLabel();

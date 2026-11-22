@@ -520,6 +520,23 @@ void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, u
     }
 }
 
+bool Builder::InternalKept(std::size_t from, uint8_t reg) const {
+    RefList refs;
+    for (std::size_t i = from; i < insts.size(); i++) {
+        Inst& inst = const_cast<Inst&>(insts[i]);
+        if (IsBarrier(inst)) {
+            return false;
+        }
+        Refs(inst, refs);
+        for (const Ref& r : refs) {
+            if (r.def && r.reg->bank == Bank::Internal && r.reg->n == reg) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void Builder::Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, uint8_t lanes,
                             uint8_t fconv) {
     Sample2D(dst, coord, sampler_sa, nullptr, drc, false, fconv);
@@ -864,9 +881,17 @@ void PreciseReads(Inst& inst, RefList& refs, F&& f) {
         }
         return;
     case Op::PackU8:
-        f(inst.reg[1], 0x3);
         if (inst.reg[1].bank != Bank::Internal && !inst.b[1]) {
-            f(inst.xreg[0], 0x3);
+            // Two pairs of F32 lanes: the lanes the select takes (a broadcast's one).
+            const uint8_t taken = PackSelLanes(static_cast<uint8_t>(inst.u[0]));
+            if ((taken & 0x3) != 0) {
+                f(inst.reg[1], static_cast<uint8_t>(taken & 0x3));
+            }
+            if ((taken & 0xc) != 0) {
+                f(inst.xreg[0], static_cast<uint8_t>(taken >> 2));
+            }
+        } else {
+            f(inst.reg[1], 0x3);
         }
         return;
     case Op::UnpackU8:
@@ -4377,7 +4402,12 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             if (i.b[1]) {
                 e.PackU8F16(Map(i.reg[0]), Map(i.reg[1]), i.u[0]);
             } else {
-                e.PackU8(Map(i.reg[0]), Map(i.reg[1]), Map(i.xreg[0]), i.u[0]);
+                // A pair the select takes no lane of is read for nothing (PreciseReads), and
+                // may have no home: the other pair in its place.
+                const uint8_t taken = PackSelLanes(static_cast<uint8_t>(i.u[0]));
+                const Reg lo = (taken & 0x3) != 0 ? i.reg[1] : i.xreg[0];
+                const Reg hi = (taken & 0xc) != 0 ? i.xreg[0] : i.reg[1];
+                e.PackU8(Map(i.reg[0]), Map(lo), Map(hi), i.u[0]);
             }
             break;
         case Op::UnpackU8:

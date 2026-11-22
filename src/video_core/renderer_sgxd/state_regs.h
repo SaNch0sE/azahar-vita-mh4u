@@ -27,14 +27,18 @@ namespace SgxdRenderer::StateRegs {
 #define STATE_TEXTURE_REGS(n)                                                                      \
     PICA_REG_INDEX(texturing.texture##n.width), PICA_REG_INDEX(texturing.texture##n.type),         \
         PICA_REG_INDEX(texturing.texture##n##_format)
-#define STATE_LIGHT_REGS(n) PICA_REG_INDEX(lighting.light[n].config)
+#define STATE_LIGHT_REGS(n)                                                                        \
+    PICA_REG_INDEX(lighting.light[n].config), PICA_REG_INDEX(lighting.light[n].specular_0),        \
+        PICA_REG_INDEX(lighting.light[n].specular_1), PICA_REG_INDEX(lighting.light[n].ambient)
 
 /// The registers FSConfig's constructor and RasterizerSgxd::SplitAlpha read, whole words (a
 /// field's neighbours in its word come along). Not the TEV constant colours or the lights'
-/// colours and positions: uniforms, not the program. The scissor box, the viewport and the colour
-/// buffer's size are, as far as RasterizerSgxd::FragmentConfig drops a box that covers the
-/// viewport.
-inline constexpr std::array<u16, 67> Fragment{
+/// colours and positions: uniforms, not the program, but for each light's specular_0,
+/// specular_1 and ambient: one that is zero leaves its term out of the program
+/// (RasterizerSgxd::FragmentConfigFor). The scissor box, the
+/// viewport and the colour buffer's size are, as far as RasterizerSgxd::FragmentConfig drops a box
+/// that covers the viewport.
+inline constexpr std::array<u16, 91> Fragment{
     // FramebufferConfig
     PICA_REG_INDEX(rasterizer.scissor_test.mode),
     PICA_REG_INDEX(rasterizer.scissor_test.x1),

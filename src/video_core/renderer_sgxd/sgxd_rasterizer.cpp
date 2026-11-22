@@ -5510,6 +5510,31 @@ void RasterizerSgxd::PrefetchFragment(const Pica::RegsInternal& parse_regs) {
 Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInternal& regs,
                                                          u32 own_pixel, bool kills_viewport) {
     Pica::Shader::FSConfig config{regs};
+    // A light's specular_0 term is specular_0 * D0: with that colour zero on every light the term is
+    // left out (its D0 lookups, loads and adds). The colours are state the key holds, so a nonzero one
+    // brings the term back.
+    auto& lighting = config.lighting;
+    if (lighting.enable) {
+        bool dark = true;
+        for (u32 i = 0; i < lighting.src_num; ++i) {
+            const auto& c = regs.lighting.light[lighting.lights[i].num].specular_0;
+            dark &= c.r == 0 && c.g == 0 && c.b == 0;
+        }
+        if (dark) {
+            lighting.lut_d0 = {};
+            lighting.specular0_zero.Assign(1);
+        }
+        // A light's own zero colours: its specular_0 or specular_1 term and its ambient add are left out,
+        // and the colour takes none of the program's registers.
+        for (u32 i = 0; i < lighting.src_num; ++i) {
+            auto& light = lighting.lights[i];
+            const auto& src = regs.lighting.light[light.num];
+            const auto zero = [](const auto& c) { return c.r == 0 && c.g == 0 && c.b == 0; };
+            light.specular0_zero.Assign(zero(src.specular_0) ? 1 : 0);
+            light.specular1_zero.Assign(zero(src.specular_1) ? 1 : 0);
+            light.ambient_zero.Assign(zero(src.ambient) ? 1 : 0);
+        }
+    }
     // The SGX's samplers have no border colour: a border mode clamps (AddressMode) and the fragment
     // program puts the border colour past the texture.
     config.texture.ApplyProfile(Pica::Shader::Profile{});
