@@ -256,11 +256,12 @@ constexpr int PriorityCore(ThreadRole role) {
     case ThreadRole::Render:
     case ThreadRole::RasterWorker:
     case ThreadRole::AudioSink:
-    case ThreadRole::Dsp:
-        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH;
     case ThreadRole::SecondEmulation:
-        // Behind the DSP's frames on core 1: its slices cannot be preempted, so the DSP's thread
-        // takes the core whenever the second emulation thread is between them or asleep.
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH;
+    case ThreadRole::Dsp:
+        // Behind the second emulation thread: with core 1 taken the DSP's frames go to core 3
+        // (RoleCores), and the emulated cores' jobs the main thread waits for go on (a game's
+        // wait for core 2's job: the DSP on core 1 for 46% of it at the same priority).
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
     case ThreadRole::ShaderCompiler:
         // On core 3 with the miscellaneous threads, before them (CapUnlocker gives

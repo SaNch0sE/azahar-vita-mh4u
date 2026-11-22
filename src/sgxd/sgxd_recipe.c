@@ -1017,6 +1017,37 @@ unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint6
     return n;
 }
 
+unsigned sgxd_recipe_pica_eot_scaled(const SgxdRecipe *r, const SgxdPicaStore *s,
+                                     unsigned quarters, uint32_t picture, uint32_t picture_stride,
+                                     uint64_t *out) {
+    // The guest's transpose at 1x, as sgxd_recipe_pica_eot takes it; the render is that scaled.
+    if (quarters < 5 || quarters > 8 || r->width * 4 % quarters || r->height * 4 % quarters) {
+        return 0;
+    }
+    const uint32_t width = r->width * 4 / quarters, height = r->height * 4 / quarters;
+    const uint32_t x0 = s->x1 ? s->x0 : 0, x1 = s->x1 ? s->x1 : width;
+    const uint32_t y0 = s->x1 ? s->y0 : 0, y1 = s->x1 ? s->y1 : height;
+    if (picture_stride < r->width || picture_stride % 2 || x0 >= x1 || y0 >= y1 || x1 > width ||
+        y1 > height) {
+        return 0;
+    }
+#define EDGE(v) ((2 * (v) * quarters + 3) / 8)
+    unsigned n = 0;
+#define PUT(w) (out[n++] = (w))
+    PUT(PHAS_LAST);
+    PUT(usse_limm(0, SGXD_RECIPE_PACK_U8888));
+    PUT(usse_limm(1, picture));
+    PUT(usse_limm(2, (picture_stride - 1) >> 1));
+    PUT(usse_limm(3, 0));
+    PUT(usse_limm(4, EDGE(x0) | EDGE(y0) << 12 | floor_log2((r->width + 15) / 16) << 24 |
+                         floor_log2((r->height + 15) / 16) << 28));
+    PUT(usse_limm(5, (EDGE(x1) - 1) | (EDGE(y1) - 1) << 12));
+    PUT(EMITPIX_EOT);
+#undef PUT
+#undef EDGE
+    return n;
+}
+
 void sgxd_recipe_pica_pixev(const SgxdRecipe *r, uint32_t eot_index,
                             uint32_t out[SGXD_RECIPE_PICA_PIXEV_WORDS]) {
     Code cf[CF_COUNT];

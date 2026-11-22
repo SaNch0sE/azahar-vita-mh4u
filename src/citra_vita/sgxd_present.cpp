@@ -734,6 +734,48 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
     return true;
 }
 
+bool DrawPictureScreen(u32 va, u32 width, u32 height, u32 row, u32 quarters, u32 x, u32 y, u32 w,
+                       u32 h) {
+    Batch& b = g.batch;
+    if (!g.in_frame || g.screens_in_frame >= ScreenSlots || b.draw_count >= b.max_draws ||
+        width % 8 != 0 || width == 0 || height == 0 || w == 0 || h == 0) {
+        return false;
+    }
+    const u32 slot = g.screens_in_frame++;
+    g.touches[slot * 2] = va;
+    g.touches[slot * 2 + 1] = va + width * height * 4;
+    SgxdRenderer::SgxdCacheSkipped(SgxdRenderer::CacheSite::Screens, width * height * 4);
+    // Texel (u, v): u along a picture row, the LCD buffer's rows, left to right on the display;
+    // v across them, the buffer's columns, from the bottom of the upright picture to its top.
+    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    const float x0 = 2.0f * x / DisplayWidth - 1, x1 = 2.0f * (x + w) / DisplayWidth - 1;
+    const float y0 = 2.0f * y / DisplayHeight - 1, y1 = 2.0f * (y + h) / DisplayHeight - 1;
+    const float scale = static_cast<float>(quarters) / 4.0f;
+    const float u0 = scale * row / width, u1 = scale * (row + 400) / width;
+    const float v1 = scale * 240 / height;
+    const float corner[6][4] = {
+        {x0, y0, u0, v1}, {x1, y0, u1, v1}, {x0, y1, u0, 0},
+        {x1, y0, u1, v1}, {x1, y1, u1, 0},  {x0, y1, u0, 0},
+    };
+    float* v = reinterpret_cast<float*>(g.memory + g.screen_offset + ScreenVertices + slot * 0x100);
+    for (u32 n = 0; n < 6; n++) {
+        const float words[N] = {corner[n][0], corner[n][1], 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                                corner[n][2], corner[n][3]};
+        std::memcpy(v + n * N, words, sizeof(words));
+    }
+    // Bilinear: the scaled picture scaled again to the layout's rectangle. U8888 as the pass's tile held
+    // it (SGXD_RECIPE_PACK_U8888), so unmirrored.
+    u32 tex[4];
+    sgxd_recipe_texture_words_format(va, width, height, 1, 0x0c, 0, tex);
+    const State::PixelEntry& e = PixelEntryFor(tex);
+    SgxdRecipeDrawPrograms& p = g.screen_programs[slot];
+    p.fprim = e.va;
+    p.fprim_units = e.units;
+    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    b.draws[b.draw_count++] = SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, &p};
+    return true;
+}
+
 void EndFrame() {
     if (!g.initialized || !g.in_frame) {
         return;

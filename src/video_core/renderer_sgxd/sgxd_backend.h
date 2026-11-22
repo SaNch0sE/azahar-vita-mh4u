@@ -136,8 +136,8 @@ public:
     }
 
     /// Memory for width x height 32-bit samples (a depth store), rows width apart; the first
-    /// fit of what FreeSurface gave back.
-    Data AllocSurface(u32 width, u32 height);
+    /// fit of what FreeSurface gave back. `upscaled`: in the upscaled top screen's block.
+    Data AllocSurface(u32 width, u32 height, bool upscaled = false);
     /// Memory AllocSurface gave, no longer used (a depth buffer the guest reshaped), after its
     /// last read.
     void FreeSurface(const Data& surface, u32 width, u32 height);
@@ -166,6 +166,11 @@ public:
         u32 bpp;
         // The part of the transpose stored (SgxdPicaStore's x0..x1, y0..y1); x1 0 for all of it.
         u32 x0{}, x1{}, y0{}, y1{};
+        // Drawn scaled by picture_quarters / 4 (5 to 8: the upscaled top screen): the pass is
+        // height x width scaled, each tile stored whole into picture, LINEAR U8888 rows
+        // picture_stride pixels apart (sgxd_recipe_pica_eot_scaled), the guest's buffer left to
+        // DownscalePicture; picture 0 for 1x.
+        u32 picture{}, picture_stride{}, picture_quarters{};
     };
     /// Opens a pass on target. The background is clear (A8B8G8R8) at depth, what a fill left
     /// pending in guest memory. before: as BeginPassLoaded's.
@@ -352,6 +357,20 @@ public:
     /// before runs once the pass is open, ahead of the load.
     void BeginPassLoaded(const PicaTarget& target, float depth, const UntileSource& guest,
                          const std::function<void()>& before = {});
+    /// The same for a target drawn scaled (PicaTarget::picture): its first draws read the
+    /// scaled picture texel for pixel, or with magnified the guest's 1x bytes, each texel
+    /// magnified to the scale (nearest).
+    void BeginPassLoadedScaled(const PicaTarget& target, float depth, const UntileSource& guest,
+                               bool magnified, const std::function<void()>& before = {});
+    /// One pass storing a scaled pass's picture (target.picture) into target's guest buffer (its
+    /// part, or all of it) at 1x: at 2x each pixel the average of its 2x2 block, at the other
+    /// scales a bilinear read at the pixel's centre.
+    void DownscalePicture(const PicaTarget& target);
+    /// One pass copying width x height pixels of a LINEAR U8888 picture (rows stride apart),
+    /// from its column source_x on, into dest, LINEAR U8888 rows width apart: a scaled picture
+    /// kept for the present.
+    void CopyPicture(u32 dest_gpu, u32 source_gpu, u32 width, u32 height, u32 stride,
+                     u32 source_x = 0);
     /// Opens a pass whose first draw writes every pixel: no clear and no load.
     void BeginPassOver(const PicaTarget& target, float depth,
                        const std::function<void()>& before = {});
@@ -491,12 +510,12 @@ public:
     /// mirror: the texel is read converted with its lanes mirrored (A, B, G, R) and packed
     /// again, for a pack that stores the channels in the other order (A4R4G4B4 as RGBA4).
     /// source_stride: the source's rows apart in texels, 0 for width.
-    /// scale_x, scale_y (1 or 2): each output pixel is the average of scale_x x scale_y
-    /// source texels (the display transfer's ScaleX and ScaleXY), a bilinear read between
-    /// them; the source then has width * scale_x columns and height * scale_y rows.
+    /// scale_x, scale_y (1 to 2): the source has width * scale_x columns and height * scale_y
+    /// rows (whole), read bilinear at each output pixel's centre: at 2, the average of 2x2
+    /// texels (the display transfer's ScaleX and ScaleXY).
     SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height,
                                         bool mirror = false, u32 source_stride = 0,
-                                        u32 scale_x = 1, u32 scale_y = 1);
+                                        float scale_x = 1, float scale_y = 1);
     /// A display transfer from a PICA-tiled picture in guest memory: one pass whose draws read
     /// it a band of tile rows at a time (DrawTiled), into dest_gpu as width x height pixels of
     /// pack (an SGXD_RECIPE_PACK_*), rows width apart, the source's top-left width * scale_x x
@@ -660,7 +679,9 @@ private:
      * texture whose texel (sx, sy) is PICA pixel (sy % w, 8 (band row + sy / w) + sx), one
      * draw a band, a quad a tile row. transposed: target x is the picture's row and y its
      * column (a PICA target's load), which is the texture's own orientation; otherwise x is the
-     * column (a display transfer's output). Opaque, DCMP ALWAYS, no depth write.
+     * column (a display transfer's output). Opaque, DCMP ALWAYS, no depth write. magnify
+     * (quarters, 5 to 8; unscaled only): each texel magnify / 4 pixels a side, nearest (a
+     * scaled pass's load of the guest's 1x bytes).
      */
     void DrawTiled(const UntileSource& src, bool transposed, u32 scale_x = 1, u32 scale_y = 1,
                    u32 magnify_x = 1, u32 magnify_y = 1);
@@ -683,6 +704,9 @@ private:
     u32 surfaces_spilled{}; ///< surfaces the block had no room for (AllocSurface), for its log
     u32 surfaces_used{};
     int surfaces_block{-1};
+    u8* upscale{};     // the upscaled top screen's surfaces, from the first scaled pass
+    u32 upscale_used{};
+    int upscale_block{-1};
     u8* textures{};    // the guest textures' host copies
     u32 textures_used{};
     /// AllocTextureFixed's lowest byte: its blocks run down from the pool's end.
@@ -696,6 +720,7 @@ private:
     };
     std::vector<FreeRange> textures_free;
     std::vector<FreeRange> surfaces_free;
+    std::vector<FreeRange> upscale_free;
     /// An untile's vertices by its geometry (GeometryKey): a texture of a size seen before reuses
     /// them. In the textures pool: ETC1 uploads inside a pass filled the pass data.
     std::unordered_map<u64, Data> geometry_vertices;
@@ -886,12 +911,6 @@ private:
     };
     std::unordered_map<u64, TargetTime> target_times;
     std::string pass_note;
-    int eot_mix_variant = -1; ///< ProbeMixedEot's, for OpenPass
-public:
-    /// sgxd_flags eotmixreal=V+1: the 2x passes end their tiles with sgxd_recipe_pica_eot_mix's
-    /// variant V (the guest's 1x copy stored by the same end of tile), -1 for none.
-    int eot_mix_real = -1;
-private:
     u32 slow_passes{};
     std::array<u32, static_cast<std::size_t>(FinishWhy::Count)> finishes{};
     u64 target_times_start{};

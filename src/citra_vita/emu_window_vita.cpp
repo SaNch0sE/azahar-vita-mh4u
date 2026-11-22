@@ -25,6 +25,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "video_core/renderer_gxm/gxm_rasterizer.h"
 
 namespace VitaFrontend {
 
@@ -462,6 +463,16 @@ void EmuWindowVita::DrawGuestScreens() {
                      r.GetWidth(), r.GetHeight(), r.left, r.top);
         }
         if (!enabled[i] || s.fill || s.address == 0 || s.pixels == nullptr) {
+            continue;
+        }
+        // The upscaled top screen's picture, when the buffer's transfer copied one.
+        u32 picture = 0, picture_w = 0, picture_h = 0, picture_row = 0, quarters = 4;
+        bool flip = false;
+        if (i == 0 &&
+            SgxdRenderer::RasterizerSgxd::TopScreenPicture(s.address, picture, picture_w, picture_h,
+                                                         picture_row, quarters) &&
+            SgxdPresent::DrawPictureScreen(picture, picture_w, picture_h, picture_row, quarters,
+                                           r.left, r.top, r.GetWidth(), r.GetHeight())) {
             continue;
         }
         if (!SgxdPresent::DrawGuestScreen(s.address, s.uncached ? nullptr : s.pixels, s.stride,

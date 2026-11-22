@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <atomic>
 #include <arm_neon.h>
 #include <fmt/ranges.h>
 #include <nihstro/shader_bytecode.h>
@@ -22,6 +23,7 @@
 #include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/math_util.h"
+#include "common/settings.h"
 #include "common/swap.h"
 #include "core/memory.h"
 #include "video_core/pica/pica_core.h"
@@ -746,14 +748,9 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
     Usse::z_flip = SgxdFlag("zflip");
 #endif
 #ifdef VITA_DIAGNOSTICS
-    // sgxd_flags eotmixpbe=N: EUR_CR_PIXELBE for every 3D kick built (the eotmix probes).
-    if (const unsigned pixelbe = SgxdFlagValue("eotmixpbe"); pixelbe != 0) {
-        sgxd_recipe_pixelbe = pixelbe;
-    }
-    // gxm_flags eotmixreal=V+1: the 2x passes' end of tile stores the guest's 1x copy too.
-    if (const unsigned real = GxmFlagValue("eotmixreal"); real != 0) {
-        backend.eot_mix_real = static_cast<int>(real) - 1;
-    }
+    // sgxd_flags scaledmask: a scaled pass storing a part keeps its draws in it by the ISP's
+    // mask, not by the depth scratch and its copy (the mask's hang, open).
+    scaled_mask = SgxdFlag("scaledmask");
 #endif
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
@@ -762,7 +759,175 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
     backend.SetRoomTaken([this](u32 begin, u32 end) { KeepGsRows(begin, end); });
 }
 
-RasterizerGxm::~RasterizerGxm() = default;
+RasterizerSgxd::~RasterizerSgxd() {
+    if (upscale_instance == this) {
+        upscale_instance = nullptr;
+    }
+}
+
+RasterizerSgxd* RasterizerSgxd::upscale_instance = nullptr;
+
+namespace {
+std::atomic<u32> top_scale{4};
+} // namespace
+
+void RasterizerSgxd::SetTopScale(u32 quarters) {
+    top_scale.store(std::clamp(quarters, 4u, 8u), std::memory_order_relaxed);
+}
+
+u32 RasterizerSgxd::TopScale() {
+    return top_scale.load(std::memory_order_relaxed);
+}
+
+bool RasterizerSgxd::ScalesWhole(const ColourBuffer& target, u32 quarters, u32 margin) {
+    // The 1x copy's sizes (DownscalePicture): the transpose in 8s by 32 or more in 16s, at most
+    // ScaledSideMax a side. Widescreen, the margins wider.
+    return target.height % 8 == 0 && target.width % 16 == 0 && target.width >= 32 &&
+           (target.height + 2 * margin) * quarters / 4 <= ScaledSideMax &&
+           target.width * quarters / 4 <= ScaledSideMax;
+}
+
+RasterizerSgxd::ColourBuffer RasterizerSgxd::TopWindowFor(const ColourBuffer& buffer) const {
+    const u32 q = TopScale();
+    const u32 margin = Widescreen();
+    if ((q == 4 && margin == 0) || ScalesWhole(buffer, q, margin)) {
+        return buffer;
+    }
+    // A top-screen transfer from inside it, whole strips of 8 rows in: the rows from there to the
+    // buffer's end. The window's rows count up from the buffer's last memory row, so they number the
+    // same in both.
+    const u32 strip = buffer.width * 8 * buffer.bpp;
+    ColourBuffer window = buffer;
+    for (const PAddr s : top_sources) {
+        if (s > buffer.addr && s < buffer.End() && (s - buffer.addr) % strip == 0 &&
+            s > window.addr) {
+            const ColourBuffer w{s, buffer.width, buffer.height - (s - buffer.addr) / strip * 8,
+                                 buffer.format, buffer.bpp};
+            if (ScalesWhole(w, q, margin)) {
+                window = w;
+            }
+        }
+    }
+    return window;
+}
+
+RasterizerSgxd::Upscaled* RasterizerSgxd::UpscaledFor(const ColourBuffer& target) {
+    upscale_instance = this;
+    const u32 q = TopScale();
+    if (q == 4) {
+        return nullptr;
+    }
+    if (std::none_of(top_sources.begin(), top_sources.end(), [&](PAddr s) {
+            return s >= target.addr && s < target.End();
+        })) {
+        return nullptr;
+    }
+    // The 1x copy's sizes (route 1, DownscalePicture), with the scaled pass at most 1024 a
+    // side: the transpose (height x width) up to 512 in 8s by 32 to 512 in 16s. Scaled by
+    // quarters, those are whole pixels.
+    if (target.height % 8 != 0 || target.height > 512 || target.width % 16 != 0 ||
+        target.width < 32 || target.width > 512) {
+        return nullptr;
+    }
+    const auto make = [&](Upscaled& u) {
+        u = Upscaled{target.addr, target.width, target.height, target.End() - target.addr, q};
+        u.stride = Common::AlignUp(target.height * q / 4, 8u);
+        u.picture = backend.AllocSurface(u.stride, target.width * q / 4, true);
+    };
+    for (Upscaled& u : upscaled) {
+        if (u.addr == target.addr) {
+            if (u.width != target.width || u.height != target.height || u.quarters != q) {
+                backend.FreeSurface(u.picture, u.stride, u.width * u.quarters / 4);
+                make(u);
+            }
+            return &u;
+        }
+    }
+    make(upscaled.emplace_back());
+    LOG_INFO(Render, "GXM: the top screen's {}x{} colour buffer at {:#x} is drawn at {}/4x",
+             target.width, target.height, target.addr, q);
+    return &upscaled.back();
+}
+
+void RasterizerSgxd::NoteTopTransfer(PAddr input, PAddr output, u32 out_width, u32 out_height,
+                                    u32 bpp, bool flip) {
+    if (std::find(top_sources.begin(), top_sources.end(), input) == top_sources.end()) {
+        if (top_sources.size() == 4) {
+            top_sources.erase(top_sources.begin());
+        }
+        top_sources.push_back(input);
+    }
+    const auto sp = std::find_if(screen_pictures.begin(), screen_pictures.end(),
+                                 [output](const ScreenPicture& p) { return p.output == output; });
+    const auto u = std::find_if(upscaled.begin(), upscaled.end(), [input](const Upscaled& x) {
+        return input >= x.addr && input < x.addr + x.bytes;
+    });
+    // From inside the buffer, whole strips of 8 rows in: the transfer's first row.
+    const u32 strip = u != upscaled.end() ? u->bytes / u->height * 8 : 0;
+    const u32 first_row = u != upscaled.end() ? (input - u->addr) / strip * 8 : 0;
+    if (TopScale() == 4 || u == upscaled.end() || !u->valid || out_width > u->width ||
+        out_height > u->height || out_width * u->quarters % 4 != 0 ||
+        out_height * u->quarters % 4 != 0) {
+        if (sp != screen_pictures.end()) {
+            sp->valid = false;
+        }
+        return;
+    }
+    // The transfer takes the buffer's top-left out_width columns of out_height rows: the
+    // picture's first out_height pixels of its first out_width rows, scaled (its transpose).
+    // The present reads the copy's rows 8s of pixels apart; the columns past out_height's are
+    // the picture's next ones, never shown.
+    const u32 q = u->quarters;
+    const u32 w = Common::AlignUp(out_height * q / 4, 8u), h = out_width * q / 4;
+    ScreenPicture* p = sp != screen_pictures.end() ? &*sp : nullptr;
+    if (p && (p->width != w || p->height != h)) {
+        backend.FreeSurface(p->picture, p->width, p->height);
+        p->picture = backend.AllocSurface(w, h, true);
+    }
+    if (!p) {
+        p = &screen_pictures.emplace_back(ScreenPicture{output, 0, 0, backend.AllocSurface(w, h, true)});
+        LOG_INFO(Render, "sgxd: the scaled copy of the top screen's transfers to {:#x} ({} in all)",
+                 output, screen_pictures.size());
+    }
+    p->bytes = out_width * out_height * bpp;
+    p->row_bytes = out_width * bpp;
+    p->width = w;
+    p->height = h;
+    p->quarters = q;
+    p->flip = flip;
+    if (backend.InPass()) {
+        EndPass("the upscaled top screen's copy");
+    }
+    backend.CopyPicture(p->picture.gpu, u->picture.gpu, w, h, u->stride, first_row * q / 4);
+    p->valid = true;
+}
+
+bool RasterizerSgxd::TopScreenPicture(PAddr lcd, u32& gpu, u32& width, u32& height, u32& row,
+                                     u32& quarters) {
+    const RasterizerSgxd* r = upscale_instance;
+    if (!r || TopScale() == 4) {
+        return false;
+    }
+    for (const ScreenPicture& p : r->screen_pictures) {
+        if (p.valid && lcd >= p.output && lcd < p.output + p.bytes &&
+            (lcd - p.output) % p.row_bytes == 0 &&
+            (lcd - p.output) / p.row_bytes + 400 <= p.bytes / p.row_bytes &&
+            p.height >= 60 * p.quarters) {
+            gpu = p.picture.gpu;
+            width = p.width;
+            height = p.height;
+            row = (lcd - p.output) / p.row_bytes;
+            // Flipped, the output's row r is the picture's row count - r.
+            if (p.flip) {
+                row = p.bytes / p.row_bytes - row;
+            }
+            quarters = p.quarters;
+            flip = p.flip;
+            return true;
+        }
+    }
+    return false;
+}
 
 void RasterizerSgxd::AddTriangle(const Pica::OutputVertex&, const Pica::OutputVertex&,
                                 const Pica::OutputVertex&) {
@@ -1003,6 +1168,13 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
 #endif
     TexturesWritten(output, output + bytes);
     DepthStoresWritten(output, output + bytes);
+    // A whole picture of the top screen's size or more (a game: 256x416, the LCD 16 rows into
+    // it): its source is the upscaled top screen.
+    if (!tiled_out && !linear_in && scale_x == 1 && scale_y == 1 && width >= 240 &&
+        height >= 400) {
+        NoteTopTransfer(input, output, width, height, out_format.bytes,
+                        config.flip_vertically != 0);
+    }
     // The blit's 3D stays pending, as a pass's does: the next list finishes it. Whatever waits on the
     // blit (a page hold on its output, a ticket) finishes it then (InterruptPoll, RenderWait).
 #ifdef VITA_DIAGNOSTICS
@@ -2522,6 +2694,12 @@ void RasterizerSgxd::TexturesWritten(PAddr start, PAddr end) {
 #ifdef VITA_DIAGNOSTICS
     texture_stats.writes++;
 #endif
+    // A write into an upscaled buffer by anything but its own scaled pass: its picture is stale.
+    for (Upscaled& u : upscaled) {
+        if (&u != upscaled_writing && start < u.addr + u.bytes && u.addr < end) {
+            u.valid = false;
+        }
+    }
     if (page_textures.empty()) {
         return; // no texture yet (IndexTexture makes the page tables)
     }
@@ -2605,10 +2783,11 @@ bool RasterizerSgxd::TextureWritten(Texture& texture) {
 }
 
 RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width, u32 height,
-                                                        u32 format) {
+                                                        u32 format, u32 quarters) {
     for (DepthStore& d : depth_stores) {
         if (d.addr == addr) {
-            if (d.width == width && d.height == height && d.format == format) {
+            if (d.width == width && d.height == height && d.format == format &&
+                d.quarters == quarters) {
                 return d;
             }
             for (const auto* old : {&d.store, &d.scratch}) {
@@ -2617,22 +2796,25 @@ RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width,
                                         old->height * (old->stencil ? 5 : 4) / 4);
                 }
             }
-            d = DepthStore{addr, width, height, format};
-            d.store = NewDepthStore(width, height, format);
+            d = DepthStore{addr, width, height, format, quarters};
+            d.store = NewDepthStore(width * quarters / 4, height * quarters / 4, format,
+                                    quarters != 4);
             return d;
         }
     }
-    depth_stores.push_back(DepthStore{addr, width, height, format});
-    depth_stores.back().store = NewDepthStore(width, height, format);
+    depth_stores.push_back(DepthStore{addr, width, height, format, quarters});
+    depth_stores.back().store =
+        NewDepthStore(width * quarters / 4, height * quarters / 4, format, quarters != 4);
     return depth_stores.back();
 }
 
-SgxdBackend::DepthStore RasterizerGxm::NewDepthStore(u32 width, u32 height, u32 format) {
+SgxdBackend::DepthStore RasterizerSgxd::NewDepthStore(u32 width, u32 height, u32 format,
+                                                     bool upscaled) {
     // The pass's target, the guest buffer's transpose (SgxdBackend::PicaTarget), in whole 32x32
     // tiles; the stencil (D24S8's) a quarter of the depth's bytes after it.
     const bool stencil = format == static_cast<u32>(FramebufferRegs::DepthFormat::D24S8);
     const u32 w = Common::AlignUp(height, 32u), h = Common::AlignUp(width, 32u);
-    return {backend.AllocSurface(w, h * (stencil ? 5 : 4) / 4), w, h, stencil};
+    return {backend.AllocSurface(w, h * (stencil ? 5 : 4) / 4, upscaled), w, h, stencil};
 }
 
 void RasterizerSgxd::DepthStoresWritten(PAddr start, PAddr end) {
@@ -2675,16 +2857,9 @@ void RasterizerSgxd::EndPass(const char* why) {
                      "buffer at {:#x} in the bytes it drew ({:#x}..{:#x})",
                      why, s.addr, s.width, s.height, pass_depth, pass_drawn_lo, pass_drawn_hi);
     DepthStore* part_copy = nullptr;
-#ifdef VITA_DIAGNOSTICS
-    // sgxd_flags eotmixnozls: the mixed end of tile's 2x passes store no depth (the eotmix probe;
-    // the next pass's depth is wrong).
-    static const bool eotmix_nozls = SgxdFlag("eotmixnozls");
-    const bool keep_depth = !(eotmix_nozls && backend.eot_mix_real >= 0 && pass_quarters == 8);
-#else
-    constexpr bool keep_depth = true;
-#endif
-    if (keep_depth && (pass_depth_cleared || pass_depth_load || pass_depth_covered)) {
-        DepthStore& d = DepthStoreFor(pass_depth, s.width, s.height, pass_depth_format);
+    if ((pass_depth_cleared || pass_depth_load || pass_depth_covered) && !depth_under_colour) {
+        DepthStore& d =
+            DepthStoreFor(pass_depth, s.width, s.height, pass_depth_format, pass_quarters);
         if (!pass_depth_load) {
             backend.FillDepthStore(d.store, pass_bg_depth, pass_bg_stencil);
         }
@@ -2695,15 +2870,15 @@ void RasterizerSgxd::EndPass(const char* why) {
             static const bool no_zload = SgxdFlag("nozload");
             load = no_zload ? DL::None : load;
 #endif
-            // A pass storing part of its target (StorePartFor) drew depth past it as well,
-            // where the PICA's viewport clipped: its depth goes to the scratch, every tile of it,
-            // and only its part into the store once its 3D is done, the rest as it was. Guest
-            // memory's depth, untiled into the store as its words, is no F32 to keep: such a
-            // pass stores its whole target, and its draws writing depth or stencil kill past
-            // their viewport (draw_kills_viewport), so the store is exact in all of it.
-            if (pass_part.x1 != 0 && !pass_depth_guest) {
+            // A pass storing part of its target (StorePartFor) also drew depth past it, where the PICA's
+            // viewport clipped: its depth goes to the scratch, and only its part into the store once its 3D
+            // is done. A pass storing its whole target (PassStoresWholeDepth), or masked to its part from its
+            // first draw, keeps its draws off the margin and stores into the store itself.
+            const bool masked_whole = pass_margin_masked && !pass_depth_part;
+            if (pass_part.x1 != 0 && !PassStoresWholeDepth() && !masked_whole) {
                 if (!d.scratch.memory.cpu) {
-                    d.scratch = NewDepthStore(d.width, d.height, d.format);
+                    d.scratch = NewDepthStore(d.width * d.quarters / 4, d.height * d.quarters / 4,
+                                              d.format, d.quarters != 4);
                 }
                 backend.SetDepthStore(d.store, load, &d.scratch);
                 backend.TouchAllTiles();
@@ -2720,13 +2895,26 @@ void RasterizerSgxd::EndPass(const char* why) {
         DepthStoresWritten(pass_depth, pass_depth + s.width * s.height * pass_depth_bytes);
     }
 #ifdef VITA_DIAGNOSTICS
-    const u32 ended_scale = pass_scale;
+    const u32 ended_quarters = pass_quarters;
 #endif
     u32 ta_us = 0, d3_us = 0;
     backend.EndPass(&ta_us, &d3_us);
     if (part_copy) {
-        backend.CopyDepthPart(part_copy->scratch, part_copy->store, pass_part.x0, pass_part.x1,
-                              pass_part.y0, pass_part.y1);
+        // The part's edges in the store's samples (PassEdge's): x in the 8s CopyDepthPart takes,
+        // exact at 1x; at 1.25x and 1.5x widened out to them, so up to 7 samples of the
+        // margin past the viewport (never shown) take the depth the pass drew there.
+        const u32 x0 = static_cast<u32>(PassEdge(static_cast<s32>(pass_part.x0))) & ~7u;
+        const u32 x1 = std::min(Common::AlignUp(static_cast<u32>(PassEdge(
+                                                    static_cast<s32>(pass_part.x1))),
+                                                8u),
+                                part_copy->store.width);
+        backend.CopyDepthPart(part_copy->scratch, part_copy->store, x0, x1,
+                              static_cast<u32>(PassEdge(static_cast<s32>(pass_part.y0))),
+                              static_cast<u32>(PassEdge(static_cast<s32>(pass_part.y1))));
+    }
+    // A scaled pass stored its picture alone: the guest's buffer from it, at 1x.
+    if (pass_upscaled) {
+        backend.DownscalePicture(pass_scaled_target);
     }
     // A narrow buffer's scratch back into it, behind the pass's 3D.
     if (pass_narrow) {
@@ -2741,9 +2929,16 @@ void RasterizerSgxd::EndPass(const char* why) {
     // The pass stored its tiles into the guest's buffer: the textures over what it drew are
     // untiled again, behind its 3D. The tiles no draw covered store the bytes they loaded or
     // the clear guest memory holds.
+    upscaled_writing = pass_upscaled;
     if (pass_drawn_lo < pass_drawn_hi) {
         TexturesWritten(pass_drawn_lo, pass_drawn_hi);
     }
+    upscaled_writing = nullptr;
+    if (pass_upscaled) {
+        pass_upscaled->valid = true;
+        pass_upscaled = nullptr;
+    }
+    pass_quarters = 4;
     pass_drawn_lo = pass_drawn_hi = 0;
 #ifdef VITA_DIAGNOSTICS
     VprofPassResult(s);
@@ -2757,10 +2952,10 @@ void RasterizerSgxd::EndPass(const char* why) {
                                     : pass_depth_guest ? "loaded from guest memory"
                                                        : "loaded";
             LOG_INFO(Render,
-                     "perf: pass on {:#x} {}x{} at {}x: {} draws, opened by {}, depth {}, TA {} us, "
-                     "3D {} us; ended by {}",
-                     s.addr, s.width, s.height, ended_scale, pass_draws, pass_opened, depth_how,
-                     ta_us, d3_us, why);
+                     "perf: pass on {:#x} {}x{} at {}/4x: {} draws, {} primitives, opened by {}, "
+                     "depth {}, TA {} us, 3D {} us; ended by {}",
+                     s.addr, s.width, s.height, ended_quarters, pass_draws, pass_prims, pass_opened,
+                     depth_how, ta_us, d3_us, why);
         }
     }
 #endif
@@ -5853,11 +6048,38 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                          fb.depth_format == FramebufferRegs::DepthFormat::D24S8;
     const bool uses_depth = dcmp != 7 || dwrite || stencil;
 
-    const PAddr colour = fb.GetColorBufferPhysicalAddress();
-    const PAddr depth = fb.GetDepthBufferPhysicalAddress();
-    const u32 width = fb.GetWidth(), height = fb.GetHeight();
-    const ColourBuffer target{colour, width, height, fb.color_format,
+    // With the top screen upscaled, a buffer too tall to scale whole is drawn from the top screen's
+    // first row on alone (TopWindowFor). A draw onto rows before that alone is drawn onto the whole
+    // buffer at 1x; a draw over both is drawn in the window alone.
+    const ColourBuffer buffer{fb.GetColorBufferPhysicalAddress(), fb.GetWidth(), fb.GetHeight(),
+                              fb.color_format,
                               FramebufferRegs::BytesPerColorPixel(fb.color_format)};
+    ColourBuffer target = TopWindowFor(buffer);
+    if (target.addr != buffer.addr) {
+        const auto [lo, hi] = DrawnRows();
+        if (lo < target.addr && lo < hi) {
+            const bool before_only = hi <= target.addr;
+            if (window_misses++ < 8) {
+                [[maybe_unused]] const u32 row_bytes = buffer.width * buffer.bpp;
+                LOG_INFO(Render,
+                         "{}: rows {}..{} of the colour buffer at {:#x}, {} its upscaled top "
+                         "screen's window, drawn {} (frame {})",
+                         describe(), (lo - buffer.addr) / row_bytes,
+                         (hi - buffer.addr) / row_bytes, buffer.addr,
+                         before_only ? "before" : "before and in",
+                         before_only ? "at 1x" : "in the window alone", frames);
+            }
+            if (before_only) {
+                target = buffer;
+            }
+        }
+    }
+    const PAddr colour = target.addr;
+    const u32 width = target.width, height = target.height;
+    const PAddr depth = fb.GetDepthBufferPhysicalAddress() +
+                        (buffer.height - height) * width *
+                            FramebufferRegs::BytesPerDepthPixel(fb.depth_format);
+    draw_rows = height;
     // A draw whose texture reads bytes the open pass drew: guest memory holds them only once the pass
     // ended, so it ends here. Bytes no
     // draw covered are guest memory's still.
@@ -6035,6 +6257,15 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                 bg_stencil = depth_clear.value >> 24;
             }
         }
+        // The upscaled top screen's buffer is drawn scaled.
+        pass_upscaled = !pass_narrow ? UpscaledFor(target) : nullptr;
+        pass_quarters = pass_upscaled ? pass_upscaled->quarters : 4;
+        if (pass_upscaled) {
+            t.picture = pass_upscaled->picture.gpu;
+            t.picture_stride = pass_upscaled->stride;
+            t.picture_quarters = pass_quarters;
+            pass_scaled_target = t;
+        }
         // The pass starts from the fill's clear, which guest memory holds already (a tile no
         // draw touches keeps it), from nothing when its first draw writes every pixel, or else
         // from the buffer's own bytes: its first draws read them (ColorFormat numbers the first
@@ -6056,6 +6287,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             covered_passes++;
         } else if (took) {
             backend.BeginPass(t, ClearColour(target.format, clear.value, clear.bytes), bg_depth);
+            if (pass_upscaled) {
+                // Every tile stores, so the picture is the guest's buffer in all of it.
+                backend.TouchAllTiles();
+            }
 #ifdef VITA_DIAGNOSTICS
         } else if (static const bool no_load = SgxdFlag("noload"); no_load) {
             // sgxd_flags `noload`: the pass starts from a clear, its picture's load left out.
@@ -6064,9 +6299,15 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         } else {
             const UntileFormat f = UntileFormatFor(
                 static_cast<Pica::TexturingRegs::TextureFormat>(static_cast<u32>(target.format)));
-            // A narrow buffer loads from its scratch, which holds the guest's bytes already.
-            backend.BeginPassLoaded(
-                t, bg_depth, {drawn.addr, drawn.width, height, f.bits, f.code, f.swizzle, 0});
+            // A narrow buffer loads from its scratch; a scaled pass loads its picture, or the guest's bytes
+            // magnified when that is stale.
+            const SgxdBackend::UntileSource guest{drawn.addr, drawn.width, height, f.bits,
+                                                  f.code,     f.swizzle,   0};
+            if (pass_upscaled) {
+                backend.BeginPassLoadedScaled(t, bg_depth, guest, !pass_upscaled->valid);
+            } else {
+                backend.BeginPassLoaded(t, bg_depth, guest);
+            }
             if (loads++ < 4) {
                 LOG_INFO(Render, "{}: the colour buffer at {:#x} loaded from guest memory",
                          describe(), colour);
@@ -6082,7 +6323,8 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     if (view_mask.x1 != 0 && pass_mask != view_mask) {
         DEBUG_ASSERT(pass_mask.x1 == 0);
         const bool opening = backend.PassDraws() == pass_open_draws;
-        backend.MaskOutside(view_mask.x0, view_mask.x1, view_mask.y0, view_mask.y1);
+        backend.MaskOutside(PassEdge(view_mask.x0), PassEdge(view_mask.x1), PassEdge(view_mask.y0),
+                            PassEdge(view_mask.y1));
         pass_mask = view_mask;
         if (opening) {
             pass_open_draws = backend.PassDraws();
@@ -6103,10 +6345,22 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     if ((reads_depth || dwrite) && !pass_depth_cleared && !pass_depth_load && !pass_depth_covered) {
         const auto it = std::find_if(depth_stores.begin(), depth_stores.end(), [&](const DepthStore& d) {
             return d.addr == depth && d.width == width && d.height == height &&
-                   d.format == pass_depth_format;
+                   d.format == pass_depth_format && d.quarters == pass_quarters;
         });
         pass_depth_load = true;
         pass_depth_guest = it == depth_stores.end() || !it->valid;
+        if (pass_depth_guest && pass_quarters != 4) {
+            // A scaled pass with no scaled depth to load (the buffer just turned scaled; a game
+            // never clears its depth, every pass loads the last one's): its store starts at the
+            // far plane, as no scaled pass can load the 1x depth. One frame drawn without the
+            // depth before it.
+            DepthStore& d = DepthStoreFor(depth, width, height, pass_depth_format, pass_quarters);
+            backend.FillDepthStore(d.store, 1.0f, 0);
+            d.valid = true;
+            pass_depth_guest = false;
+            LOG_INFO(Render, "{}: the {}/4x depth store of {:#x} starts at the far plane",
+                     describe(), pass_quarters, depth);
+        }
         if (pass_depth_guest) {
             // D24S8's words are ZLS's I24ZI8S (depth the low 24 bits, stencil the top byte),
             // untiled raw into the store (U8U8U8U8, swizzle 0); D24's the same without stencil.
@@ -6137,15 +6391,18 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     }
     pass_depth_used |= uses_depth;
     pass_depth_written |= dwrite || (stencil && StencilWrites(regs.framebuffer));
-    // A pass that loaded guest memory's depth stores all of it (EndPass): a draw writing depth
-    // or stencil past the part the pass stores, where the PICA's viewport clips, must not. The
-    // ISP's mask over the margin keeps it out from here to the pass's end, as a viewport off the
-    // store grid's (MaskOutside): the draws stay opaque, where a kill made them punch-through
-    // and their programs read the position.
-    if (pass_depth_guest && pass_part.x1 != 0 && (dwrite || stencil) && pass_mask.x1 == 0) {
+    // A pass that loaded guest memory's depth, or a scaled one, stores all of it: a draw writing depth
+    // past the part where the PICA's viewport clips must not. The ISP's mask over the margin keeps it
+    // out from here on (the draws stay opaque, where a kill made them punch-through). Any other pass
+    // storing a part of its target takes the mask from its first draw too: the SGX draws a triangle
+    // out to the target's edge, and fragments past the part would be shaded for nothing.
+    const bool margin_mask =
+        pass_quarters == 4 && pass_margin == 0 && pass_samples == 1 && !pass_narrow;
+    if (pass_part.x1 != 0 && pass_mask.x1 == 0 &&
+        (margin_mask || (PassStoresWholeDepth() && (dwrite || stencil)))) {
         const bool opening = backend.PassDraws() == pass_open_draws;
-        backend.MaskOutside(pass_part.x0 * pass_scale, pass_part.x1 * pass_scale,
-                            pass_part.y0 * pass_scale, pass_part.y1 * pass_scale);
+        backend.MaskOutside(PassEdge(pass_part.x0), PassEdge(pass_part.x1), PassEdge(pass_part.y0),
+                            PassEdge(pass_part.y1));
         pass_mask = pass_part;
         if (opening) {
             pass_open_draws = backend.PassDraws();
@@ -6155,7 +6412,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const bool masked_inside = pass_mask.x1 != 0 && pass_mask.x0 >= pass_part.x0 &&
                                pass_mask.x1 <= pass_part.x1 && pass_mask.y0 >= pass_part.y0 &&
                                pass_mask.y1 <= pass_part.y1;
-    draw_kills_viewport = pass_depth_guest && pass_part.x1 != 0 && (dwrite || stencil) &&
+    draw_kills_viewport = PassStoresWholeDepth() && pass_part.x1 != 0 && (dwrite || stencil) &&
                           !masked_inside;
     {
         // The scissor box in WPOS (pixel centres from the target's top-left). The target is transposed:
@@ -6178,11 +6435,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             y2 = std::min(y2,
                           vy + static_cast<s32>(f24::FromRaw(rs.viewport_size_y).ToFloat32() * 2));
         }
-        const s32 target_height = static_cast<s32>(regs.framebuffer.framebuffer.GetHeight());
-        fs_data.scissor_x1 = target_height - y2;
-        fs_data.scissor_x2 = target_height - y1;
-        fs_data.scissor_y1 = x1;
-        fs_data.scissor_y2 = x2;
+        const s32 target_height = static_cast<s32>(height);
+        // In the pass's pixels: scaled with the pass, each edge at the first pixel centre past it.
+        fs_data.scissor_x1 = PassEdge(target_height - y2);
+        fs_data.scissor_x2 = PassEdge(target_height - y1);
+        fs_data.scissor_y1 = PassEdge(x1);
+        fs_data.scissor_y2 = PassEdge(x2);
     }
 
     // --- the vertex stage: the loaders' attributes into the vertex program, or with a
@@ -6563,11 +6821,14 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // mirrors it (FramebufferHelper, flip_rect), and NDC y +1 is the target's first memory row
     // (the top of the PICA's window), so its scale is negative. With it positive every draw was
     // mirrored along the rows.
-    p.viewport[0] =
-        static_cast<float>(height) - static_cast<float>(regs.rasterizer.viewport_corner.y) - half_h;
-    p.viewport[1] = -half_h;
-    p.viewport[2] = static_cast<float>(regs.rasterizer.viewport_corner.x) + half_w;
-    p.viewport[3] = half_w;
+    // In the pass's pixels: the PICA's scaled with the pass (the upscaled top screen).
+    const float vs = static_cast<float>(pass_quarters) / 4.0f;
+    p.viewport[0] = (static_cast<float>(height) -
+                     static_cast<float>(regs.rasterizer.viewport_corner.y) - half_h) *
+                    vs;
+    p.viewport[1] = -half_h * vs;
+    p.viewport[2] = (static_cast<float>(regs.rasterizer.viewport_corner.x) + half_w) * vs;
+    p.viewport[3] = half_w * vs;
     p.viewport[4] = fs_data.depth_offset - fs_data.depth_scale / 2.0f;
     p.viewport[5] = -fs_data.depth_scale / 2.0f;
     p.primitive = primitive;

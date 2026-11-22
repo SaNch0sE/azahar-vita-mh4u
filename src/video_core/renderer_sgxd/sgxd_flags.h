@@ -88,18 +88,6 @@ namespace GxmRenderer {
  *   keepalpha_opaque  a probe: a draw with no blend that keeps the destination's alpha
  *             (colour mask RGB) is opaque, not translucent (pictures may be wrong: a hidden
  *             opaque draw's alpha is lost)
- *   eagercopy  an upscaled pass's 1x copy into the guest's buffer sent at the pass's end, not
- *             held back until something may read the buffer (RasterizerGxm::DeferDownscale)
- *   eotmix=V+1... eotmixset=S...  the SCALE_AA probe: at the 300th frame, an 832x512 render
- *             with sgxd_recipe_pica_eot_mix's variant V over each tile set S in turn, for each V
- *             (RasterizerSgxd::ProbeEotMix), each logged before and after; eotmixpbe=N writes
- *             EUR_CR_PIXELBE as N in every 3D kick (bit 10 AA_EDGEOPT_OFF); eotmixsize=1 a
- *             64x64 render, 2 a 128x128 one; eotmixgrid=N+1 the probe recipe's macrotile grid N;
- *             eotmixdim=C*100+R (repeated) renders C tiles across and R down, each in turn;
- *             eotmixreal=V+1: the game's 2x passes end their tiles with variant V, which stores
- *             the guest's 1x copy too (no DownscalePicture), eotmixnozls with no depth stored,
- *             eotmixnomask with no ISP mask over the part's margin; eotmixpart: the probe's 26x16 render
- *             stores a game's part (x 16..416, y 0..240 of its transpose)
  *   fsonly=N  fswhite and fscut on the program whose key's low 32 bits are N alone
  *             (drawkeys logs each draw's fs key; the word repeated names more)
  *   fscut=N   a single-phase fragment program cut to its first N instructions, then the white

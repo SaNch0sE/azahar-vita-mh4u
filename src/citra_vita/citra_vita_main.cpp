@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -302,6 +303,13 @@ StateArguments TakeStateArguments() {
             a.load = std::atoi(argument.c_str() + 5);
         } else if (argument == "commands") {
             a.commands = true;
+        } else if (argument.starts_with("scale=")) {
+            // The top screen's scale: 1, 1.25 or 1.5.
+            SgxdRenderer::RasterizerSgxd::SetTopScale(
+                static_cast<u32>(std::lround(std::atof(argument.c_str() + 6) * 4)));
+        } else if (argument.starts_with("layout=")) {
+            Settings::values.layout_option =
+                static_cast<Settings::LayoutOption>(std::atoi(argument.c_str() + 7));
         } else if (argument == "sched=0") {
             // The module's in-kernel scheduling off: every SleepThread exits to the HLE kernel.
             Core::SetVitaInKernelScheduling(false);
@@ -445,6 +453,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     }
     ui.ClearStatusMessage();
     StateArguments state_arguments = TakeStateArguments();
+    window.UpdateCurrentFramebufferLayout(); // a layout=N argument's
 
 #ifdef VITA_DIAGNOSTICS
     SgxdRenderer::Vprof::Info("rom", path.c_str());

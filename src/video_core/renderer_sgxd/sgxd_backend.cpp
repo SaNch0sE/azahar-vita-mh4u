@@ -7,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -56,6 +57,13 @@ constexpr u32 SurfacesSize = 8u << 20;
 // texture's bytes: a game's open pass read 42 textures in 14 MiB.
 constexpr u32 TexturesVa = SurfacesVa + SurfacesSize;
 constexpr u32 TexturesSize = 40u << 20;
+// The upscaled top screen's surfaces (AllocSurface's `upscaled`): its scaled picture, its scaled
+// depth store and the screens' copies of the picture, mapped at the first scaled pass, so without
+// upscaling it takes no CDRAM. Sized when 2x was the largest scale: a game's 416x256 target took
+// 7 MiB of it then (in the surfaces' 8 MiB, its second 2x pass found no room), about 4 MiB at
+// 1.5x by the scale's square; every game measured had 11 MiB of CDRAM free.
+constexpr u32 UpscaleVa = TexturesVa + TexturesSize;
+constexpr u32 UpscaleSize = 11u << 20;
 constexpr u32 MicrokernelVa = 0x00400000;
 constexpr u32 Pages = 418;
 constexpr u32 MaxIndices = SGXD_RECIPE_MAX_INDICES;
@@ -460,6 +468,7 @@ SgxdBackend::~SgxdBackend() {
     FreeBlock(shared, BlockVa, shared_size, shared_block);
     FreeBlock(surfaces, SurfacesVa, surfaces_size, surfaces_block);
     FreeBlock(textures, TexturesVa, TexturesSize, textures_block);
+    FreeBlock(upscale, UpscaleVa, UpscaleSize, upscale_block);
 }
 
 void SgxdBackend::FreeRecipeBlock(const Recipe& r) {
@@ -1153,9 +1162,24 @@ void GiveFree(std::vector<Range>& free, Range range) {
 
 } // namespace
 
-SgxdBackend::Data SgxdBackend::AllocSurface(u32 width, u32 height) {
+SgxdBackend::Data SgxdBackend::AllocSurface(u32 width, u32 height, bool upscaled) {
     const u32 bytes = AlignUp(width * height * 4, 0x1000);
     u32 at = 0;
+    if (upscaled) {
+        if (upscale == nullptr) {
+            upscale = MapBlock("azahar-sgxd-upscale", UpscaleVa, UpscaleSize, upscale_block);
+        }
+        if (!TakeFree(upscale_free, bytes, at)) {
+            ASSERT_MSG(upscale_used + bytes <= UpscaleSize,
+                       "sgxd: no room for a {}x{} upscaled surface ({} KiB used, {} ranges free)",
+                       width, height, upscale_used >> 10, upscale_free.size());
+            at = upscale_used;
+            upscale_used += bytes;
+        }
+        LOG_INFO(Render, "sgxd: a {}x{} upscaled surface at GPU {:#010x} ({} KiB of {} used)",
+                 width, height, UpscaleVa + at, upscale_used >> 10, UpscaleSize >> 10);
+        return {upscale + at, UpscaleVa + at};
+    }
     if (TakeFree(surfaces_free, bytes, at)) {
         return {surfaces + at, SurfacesVa + at};
     }
@@ -1182,8 +1206,12 @@ void SgxdBackend::FreeSurface(const Data& surface, u32 width, u32 height) {
     // The next surface there is cleared or loaded by the GPU behind the lists reading this one; the
     // pending 3D's finish goes ahead of them.
     FinishPending(FinishWhy::FreeSurface);
-    GiveFree(surfaces_free,
-             FreeRange{surface.gpu - SurfacesVa, AlignUp(width * height * 4, 0x1000)});
+    const u32 bytes = AlignUp(width * height * 4, 0x1000);
+    if (surface.gpu >= UpscaleVa) {
+        GiveFree(upscale_free, FreeRange{surface.gpu - UpscaleVa, bytes});
+        return;
+    }
+    GiveFree(surfaces_free, FreeRange{surface.gpu - SurfacesVa, bytes});
 }
 
 bool SgxdBackend::TextureFits(u32 bytes) const {
@@ -1279,7 +1307,9 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     if (pds_used - (pds_begin + pds_half * PdsHalfSize) > PdsHalfSize / 2) {
         FlipPdsHalf();
     }
-    Recipe& r = RecipeFor(width, height, pica ? Kind::Pica : Kind::Linear);
+    const u32 q = pica && pica->picture ? pica->picture_quarters : 4;
+    DEBUG_ASSERT(q >= 4 && q <= 8 && width * q % 4 == 0 && height * q % 4 == 0);
+    Recipe& r = RecipeFor(width * q / 4, height * q / 4, pica ? Kind::Pica : Kind::Linear);
     current = &r;
     pass_target = pica ? Footprint{pica->gpu, pica->gpu + pica->width * pica->height * pica->bpp}
                        : Footprint{target_gpu, target_gpu + width * height * 4};
@@ -1328,7 +1358,15 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
         const SgxdPicaStore store{pica->gpu, pica->pack, pica->bpp, pica->x0,
                                   pica->x1,  pica->y0,   pica->y1};
         u64 eot[SGXD_RECIPE_PICA_EOT_MAX];
-        const unsigned words = sgxd_recipe_pica_eot(&r.recipe, &store, eot);
+        const unsigned words =
+            pica->picture ? sgxd_recipe_pica_eot_scaled(&r.recipe, &store, q, pica->picture,
+                                                        pica->picture_stride, eot)
+                          : sgxd_recipe_pica_eot(&r.recipe, &store, eot);
+        ASSERT_MSG(!pica->picture || words != 0,
+                   "sgxd: a {}x{} colour buffer at {:#010x} drawn at {}/4x: its part {}..{} x "
+                   "{}..{} or its picture's stride {} is not sgxd_recipe_pica_eot_scaled's",
+                   pica->width, pica->height, pica->gpu, q, pica->x0, pica->x1, pica->y0, pica->y1,
+                   pica->picture_stride);
         // No end of tile: the instance would keep the last target's.
         ASSERT_MSG(words != 0,
                    "sgxd: a {}x{} colour buffer at {:#010x} (its part {}..{} x {}..{}): route 1 "
@@ -1381,6 +1419,57 @@ void SgxdBackend::BeginPassLoaded(const PicaTarget& target, float depth, const U
     // (H2: a pass reading its own target reloads it exactly).
     pass_source = {guest.gpu, guest.gpu + guest.width * guest.height * guest.bits / 8};
     DrawTiled(guest, true);
+}
+
+void SgxdBackend::BeginPassLoadedScaled(const PicaTarget& target, float depth,
+                                        const UntileSource& guest, bool magnified,
+                                        const std::function<void()>& before) {
+    DEBUG_ASSERT(target.picture != 0);
+    OpenPass(target.gpu, target.height, target.width, target.pack, 0, depth, &target);
+    if (before) {
+        before();
+    }
+    if (magnified) {
+        pass_source = {guest.gpu, guest.gpu + guest.width * guest.height * guest.bits / 8};
+        DrawTiled(guest, true, 1, 1, target.picture_quarters);
+        return;
+    }
+    const Recipe& r = *current;
+    pass_source = {target.picture, target.picture + target.picture_stride * r.height * 4};
+    const SgxdRecipeDrawPrograms p = BlitPrograms(Data{nullptr, target.picture}, r.width,
+                                                  r.height, false, target.picture_stride);
+    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
+}
+
+void SgxdBackend::DownscalePicture(const PicaTarget& target) {
+    DEBUG_ASSERT(target.picture != 0);
+    PicaTarget t = target;
+    t.picture = t.picture_stride = 0;
+    OpenPass(t.gpu, t.height, t.width, t.pack, 0, 1.0f, &t);
+    const Recipe& r = *current;
+    const u32 q = target.picture_quarters;
+    pass_source = {target.picture,
+                   target.picture + target.picture_stride * (r.height * q / 4) * 4};
+    // Pixel (x, y) reads the picture at its centre scaled (BlitPrograms' scale): the two
+    // nearest texels a side, weighed by the distance.
+    const float s = static_cast<float>(q) / 4.0f;
+    const SgxdRecipeDrawPrograms p = BlitPrograms(Data{nullptr, target.picture}, r.width,
+                                                  r.height, false, target.picture_stride, s, s);
+    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
+    EndPass();
+}
+
+void SgxdBackend::CopyPicture(u32 dest_gpu, u32 source_gpu, u32 width, u32 height, u32 stride,
+                              u32 source_x) {
+    OpenPass(dest_gpu, width, height, SGXD_RECIPE_PACK_U8888, 0, 1.0f);
+    pass_source = {source_gpu, source_gpu + stride * height * 4};
+    const SgxdRecipeDrawPrograms p =
+        BlitPrograms(Data{nullptr, source_gpu}, width, height, false, stride, 1, 1, source_x);
+    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
+    EndPass();
 }
 
 void SgxdBackend::SetDepthStore(const DepthStore& store, DepthLoad load,
@@ -2153,9 +2242,11 @@ void SgxdBackend::PlaceFixedPrograms() {
 }
 
 SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, u32 height,
-                                                 bool mirror, u32 source_stride, u32 scale_x,
-                                                 u32 scale_y) {
-    DEBUG_ASSERT((scale_x == 1 || scale_x == 2) && (scale_y == 1 || scale_y == 2));
+                                                 bool mirror, u32 source_stride, float scale_x,
+                                                 float scale_y) {
+    const u32 source_rows = static_cast<u32>(std::lround(height * scale_y));
+    DEBUG_ASSERT(scale_x >= 1 && scale_x <= 2 && scale_y >= 1 && scale_y <= 2 &&
+                 static_cast<float>(source_rows) == height * scale_y);
     const u32 stride = source_stride != 0 ? source_stride : width;
     PlaceFixedPrograms();
     // Two triangles over the target: x, y, z, w, a white colour (unused), u, v. Pixel row y
@@ -2194,7 +2285,7 @@ SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, 
     // The texel comes back unconverted (FCONV 0), the surface's word as it is; mirrored, the
     // screen program converts it (U8U8U8U8 under swizzle 2) and packs U8888 again.
     u32 tex[4];
-    sgxd_recipe_texture_words_format(source.gpu, stride, height * scale_y,
+    sgxd_recipe_texture_words_format(source.gpu, stride, source_rows,
                                      scale_x != 1 || scale_y != 1, 0x0c, mirror ? 2 : 0, tex);
     const PdsRef fprim =
         mirror ? ScreenPixelPds(untile_fragment, tex) : BlitPixelPds(blit_fragment, tex);

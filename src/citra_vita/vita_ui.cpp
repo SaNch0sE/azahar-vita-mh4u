@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/renderer_sgxd/render_thread.h"
+#include "video_core/renderer_sgxd/sgxd_rasterizer.h"
 
 namespace VitaFrontend {
 
@@ -171,6 +172,32 @@ void Ui::BuildSettings() {
            [] { return static_cast<int>(Settings::values.layout_option.GetValue()); },
            [](int value) {
                Settings::values.layout_option = static_cast<Settings::LayoutOption>(value);
+           });
+    choice("Top screen resolution",
+           "Draws the top screen's picture above the 3DS's resolution: sharper in the single and "
+           "large screen layouts, the GPU's work for that picture growing with the scale's "
+           "square (about 2.25 times at 1.5x).",
+           true, {"Native", "1.25x", "1.5x"},
+           [] { return static_cast<int>(SgxdRenderer::RasterizerSgxd::TopScale()) - 4; },
+           [](int value) { SgxdRenderer::RasterizerSgxd::SetTopScale(static_cast<u32>(value) + 4); });
+    // The late skip's cap (RenderThread::MaxScreenSkips): 0 to 4 frames, or none.
+    static constexpr int no_skip_limit = 5;
+    choice("Frame skip limit",
+           "When the GPU falls behind, the screen that draws more is left out of a frame, so the "
+           "game keeps its speed and shows fewer pictures. This is how many frames in a row a "
+           "screen may be left out: higher keeps GPU-heavy games faster, with fewer pictures. "
+           "Off draws every frame, and the game slows down instead.",
+           true, {"Off", "1 frame", "2 frames", "3 frames", "4 frames", "No limit"},
+           [] {
+               const u32 frames = SgxdRenderer::RenderThread::MaxScreenSkips();
+               return frames == SgxdRenderer::RenderThread::NoScreenSkipLimit
+                          ? no_skip_limit
+                          : static_cast<int>(std::min<u32>(frames, no_skip_limit - 1));
+           },
+           [](int value) {
+               SgxdRenderer::RenderThread::SetMaxScreenSkips(
+                   value == no_skip_limit ? SgxdRenderer::RenderThread::NoScreenSkipLimit
+                                          : static_cast<u32>(value));
            });
     toggle("Swap screens", "Puts the touch screen where the top screen would be.", true,
            [] { return Settings::values.swap_screen.GetValue(); },
