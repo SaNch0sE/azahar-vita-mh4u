@@ -37,6 +37,29 @@ public:
     std::size_t GetPipeReadableSize(DspPipe pipe_number) const override;
     void PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) override;
 
+#ifdef VITA_DIAGNOSTICS
+    /// The DSP thread's counters since the last call (perflog; diagnostics builds only): frames
+    /// generated, the thread's time on them, the emulation thread's waits for a frame at its
+    /// interrupt, the application's semaphore signals (its "shared memory written") and how late
+    /// they came.
+    struct Stats {
+        u32 frames{};
+        u64 work_us{};
+        u32 waits{};
+        u64 wait_us{};
+        u32 semaphores{};
+        /// Ticks that found no new frame from the application (the region and counter of the
+        /// tick before), and the buffer changes such frames reported: statuses written into
+        /// the region the application is still working in, which it reads no more.
+        u32 late_ticks{};
+        u32 late_buffer_changes{};
+        /// From the interrupt to the application's semaphore signal: total and longest.
+        u64 answer_us{};
+        u32 answer_longest_us{};
+    };
+    Stats TakeStats();
+#endif
+
     void SetInterruptHandler(
         std::function<void(Service::DSP::InterruptType type, DspPipe pipe)> handler) override;
 

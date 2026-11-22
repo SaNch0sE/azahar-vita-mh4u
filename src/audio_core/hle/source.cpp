@@ -29,6 +29,25 @@ SourceStatus::Status Source::Tick(SourceConfiguration::Configuration& config,
     return GetCurrentStatus();
 }
 
+namespace {
+/// Whether every sample of the frame is zero.
+bool IsSilent(const StereoFrame16& frame) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    static_assert(sizeof(StereoFrame16) % 32 == 0);
+    const auto* const words = reinterpret_cast<const u32*>(frame.data());
+    uint32x4_t acc = vdupq_n_u32(0);
+    for (std::size_t i = 0; i < sizeof(StereoFrame16) / 4; i += 8) {
+        acc = vorrq_u32(acc, vorrq_u32(vld1q_u32(words + i), vld1q_u32(words + i + 4)));
+    }
+    const uint32x2_t half = vorr_u32(vget_low_u32(acc), vget_high_u32(acc));
+    return vget_lane_u32(vpmax_u32(half, half), 0) == 0;
+#else
+    return std::all_of(frame.begin(), frame.end(),
+                       [](const auto& lr) { return lr[0] == 0 && lr[1] == 0; });
+#endif
+}
+} // namespace
+
 void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
     const std::array<float, 4>& gains = state.gain.at(intermediate_mix_id);
     if (!state.enabled) {
@@ -40,6 +59,18 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
     const bool ramp_active = state.gain_ramp_active.at(intermediate_mix_id);
     const std::array<float, 4>& ramp_start = state.gain_ramp_start.at(intermediate_mix_id);
     constexpr float ramp_scale = 1.0f / static_cast<float>(samples_per_frame - 1);
+
+    // Nothing to add: a silent frame, or zero gains without a ramp (a source mostly feeds one of
+    // the three mixes). Each product is zero then, and zero truncates to zero.
+    const bool zero_gains =
+        gains[0] == 0.0f && gains[1] == 0.0f && gains[2] == 0.0f && gains[3] == 0.0f;
+    if (frame_silent || (zero_gains && !ramp_active)) {
+        if (ramp_active) {
+            state.gain_ramp_start.at(intermediate_mix_id) = gains;
+            state.gain_ramp_active.at(intermediate_mix_id) = false;
+        }
+        return;
+    }
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     // Stereo-to-quad expansion: each output sample is {gain0*L, gain1*R, gain2*L, gain3*R},
@@ -90,6 +121,7 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
 
 void Source::Reset() {
     current_frame.fill({});
+    frame_silent = true;
     state = {};
 }
 
@@ -100,6 +132,7 @@ void Source::Sleep() {
 
 void Source::Wakeup() {
     current_frame = backup_frame;
+    frame_silent = IsSilent(current_frame);
     state = backup_state;
     backup_frame.fill({});
     backup_state = {};
@@ -386,6 +419,7 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
 
 void Source::GenerateFrame() {
     current_frame.fill({});
+    frame_silent = true;
 
     if (state.current_buffer.empty()) {
         // TODO(SachinV): Should dequeue happen at the end of the frame generation?
@@ -429,6 +463,7 @@ void Source::GenerateFrame() {
     state.current_sample_number += static_cast<u32>(frame_position * state.rate_multiplier);
 
     state.filters.ProcessFrame(current_frame);
+    frame_silent = IsSilent(current_frame);
 }
 
 bool Source::DequeueBuffer() {

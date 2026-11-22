@@ -161,6 +161,9 @@ enum class ThreadRole {
     RasterWorker,
     ShaderCompiler,
     AudioSink,
+    /// The HLE DSP's frames (AudioCore::DspHle), beside the emulation thread as the 3DS's DSP
+    /// runs beside its ARM11.
+    Dsp,
 };
 
 /**

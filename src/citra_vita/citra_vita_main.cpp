@@ -542,6 +542,61 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              "return(s), {} page(s); {:.1f} ms; pool {} of {} pages",
                              m.calls, m.pages, m.copied_pages, m.returns, m.returned_pages,
                              m.us / 1e3, m.pool_pages_used, m.pool_pages);
+                    // The RomFS reads: a cached read's miss reads its line on the emulation
+                    // thread, the larger reads go to an async thread.
+                    {
+                        const auto r = FileSys::TakeRomFSReadStats();
+                        LOG_INFO(Frontend,
+                                 "perf: romfs: {} cached reads ({} KiB), {} misses ({:.1f} ms on "
+                                 "the reading thread); {} large reads ({} KiB, {:.1f} ms)",
+                                 r.reads, r.read_bytes >> 10, r.misses, r.miss_us / 1e3, r.large,
+                                 r.large_bytes >> 10, r.large_us / 1e3);
+                    }
+                    // The HLE DSP's thread: the frames it generated, the emulation thread's
+                    // waits for one at its interrupt, the application's semaphore signals.
+                    if (auto* dsp = dynamic_cast<AudioCore::DspHle*>(&system.DSP())) {
+                        const auto d = dsp->TakeStats();
+                        LOG_INFO(Frontend,
+                                 "perf: dsp: {} frames, {:.1f} ms on its thread ({:.2f} ms a "
+                                 "frame); {} waits at the interrupt, {:.2f} ms; {} semaphore "
+                                 "signals, {:.0f} us after the interrupt (longest {}); {} ticks "
+                                 "with no new frame from the application, {} buffer changes "
+                                 "reported in them",
+                                 d.frames, d.work_us / 1e3,
+                                 d.frames ? d.work_us / 1e3 / d.frames : 0.0, d.waits,
+                                 d.wait_us / 1e3, d.semaphores,
+                                 d.semaphores ? static_cast<double>(d.answer_us) / d.semaphores
+                                              : 0.0,
+                                 d.answer_longest_us, d.late_ticks, d.late_buffer_changes);
+                    }
+                    // sgxd_flags threadtimes: each placed thread's run time in the second and
+                    // the cores it may take; psp2prof's sampler holds core 3, so its share shows
+                    // here only.
+                    static const bool thread_times = SgxdRenderer::SgxdFlag("threadtimes");
+                    if (thread_times) {
+                        static std::unordered_map<int, u64> thread_runs;
+                        std::string runs;
+                        for (const Common::RoleThread& r : Common::RoleThreads()) {
+                            SceKernelThreadInfo info{};
+                            info.size = sizeof(info);
+                            if (sceKernelGetThreadInfo(r.id, &info) < 0) {
+                                continue;
+                            }
+                            const u64 now = info.runClocks;
+                            const auto [it, fresh] = thread_runs.try_emplace(r.id, now);
+                            const u64 delta = fresh ? 0 : now - it->second;
+                            it->second = now;
+                            std::string cores;
+                            for (int core = 0; core < 4; core++) {
+                                if (r.cores >> core & 1) {
+                                    cores += static_cast<char>('0' + core);
+                                }
+                            }
+                            runs += fmt::format("{}{} [{}] {:.1f}", runs.empty() ? "" : ", ",
+                                                info.name, cores, delta / 1e3);
+                        }
+                        LOG_INFO(Frontend, "perf: threads' run time (ms): {}", runs);
+                    }
                 }
 #endif
             }
@@ -782,7 +837,7 @@ void show_error_dialog(const std::string& message) {
 /// The emulator proper. Runs on a thread of its own; see main.
 int EmulatorMain() {
     // This thread drives the guest (which itself runs on the detached core 2, outside the
-    // system scheduler) and runs the GPU; RoleCore in common/thread.cpp lays out
+    // system scheduler) and runs the GPU; RoleCores in common/thread.cpp lays out
     // which of the three schedulable cores each host thread gets.
     Common::SetCurrentThreadRole(Common::ThreadRole::Emulation);
 

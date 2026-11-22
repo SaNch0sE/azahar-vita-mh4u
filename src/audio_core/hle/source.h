@@ -71,6 +71,8 @@ private:
     const std::size_t source_id;
     Memory::MemorySystem* memory_system{};
     StereoFrame16 current_frame;
+    /// current_frame is all zero (GenerateFrame): MixInto has nothing to add.
+    bool frame_silent = true;
     StereoFrame16 backup_frame; // TODO(PabloMK7): Check if we actually need this
 
     using Format = SourceConfiguration::Configuration::Format;

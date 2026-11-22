@@ -203,7 +203,7 @@ void SetCurrentThreadName(const char*) {
 #endif
 
 /**
- * The core each role owns, indexed by ThreadRole.
+ * The cores each role may run on (one bit per core), indexed by ThreadRole.
  *
  * Core 2 is not in this table at all: the native backend detaches it from the system scheduler
  * (vanTakeCore) and the guest's ARM11 code runs on it directly. No host thread may be pinned
@@ -224,23 +224,30 @@ void SetCurrentThreadName(const char*) {
  * which the GXM build does not run at all, and the miscellaneous threads - goes to core 3 with
  * whatever the system keeps there.
  */
-constexpr int RoleCore(ThreadRole role, std::size_t index) {
+constexpr int RoleCores(ThreadRole role, std::size_t index) {
     (void)index;
     switch (role) {
     case ThreadRole::Emulation:
         // Folded native execution: the guest runs on the emulation thread's own core, one
         // slice at a time inside vanRun (vaprobe folded mode), so this core is the guest's
         // too and nothing else of ours goes there.
-        return 2;
+        return 1 << 2;
+    case ThreadRole::Dsp:
+        // The DSP's frames take a fifth of the emulation thread's time in a game's race.
+        return 0;
+    case ThreadRole::Render:
+        // The PICA stays on the emulation thread; what it draws is built and sent here. Core 1
+        // is otherwise idle.
+        return 1;
     case ThreadRole::ShaderCompiler:
         return 0;
     case ThreadRole::RasterWorker:
     case ThreadRole::ShaderCompiler:
     case ThreadRole::AudioSink:
     case ThreadRole::Other:
-        return 3;
+        return 1 << 3;
     }
-    return 0;
+    return 1 << 0;
 }
 
 #if defined(__vita__)
@@ -251,7 +258,12 @@ constexpr int PriorityCore(ThreadRole role) {
     case ThreadRole::Render:
     case ThreadRole::RasterWorker:
     case ThreadRole::AudioSink:
+    case ThreadRole::Dsp:
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH;
+    case ThreadRole::SecondEmulation:
+        // Behind the DSP's frames on core 1: its slices cannot be preempted, so the DSP's thread
+        // takes the core whenever the second emulation thread is between them or asleep.
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
     case ThreadRole::ShaderCompiler:
         // On core 3 with the miscellaneous threads, before them (CapUnlocker gives
         // applications core 3).
@@ -263,7 +275,7 @@ constexpr int PriorityCore(ThreadRole role) {
 }
 
 void SetCurrentThreadRole(ThreadRole role, std::size_t index) {
-    const int core = RoleCore(role, index);
+    const int cores = RoleCores(role, index);
     // Affinity is one bit per core from bit 16. The top of the four, SCE_KERNEL_CPU_MASK_SYSTEM,
     // is the core the kernel keeps for itself; it is reachable from homebrew loaded through
     // taiHEN, which is how this build runs. Miscellaneous threads are mostly idle, so they may
@@ -272,7 +284,7 @@ void SetCurrentThreadRole(ThreadRole role, std::size_t index) {
     const int thread_id = sceKernelGetThreadId();
     const int result = sceKernelChangeThreadCpuAffinityMask(thread_id, mask);
     if (result < 0) {
-        LOG_WARNING(Common, "Could not pin thread to core {}: {:#010x}", core, result);
+        LOG_WARNING(Common, "Could not pin thread to cores {:#x}: {:#010x}", cores, result);
     }
     sceKernelChangeThreadPriority(thread_id, PriorityCore(role));
 }
@@ -282,17 +294,21 @@ void SetCurrentThreadRole(ThreadRole role, std::size_t index) {
 void SetCurrentThreadRole(ThreadRole role, std::size_t index) {
     // Off-console the partition is a test aid, not a policy: it only applies where the host has
     // the four cores it was written for, so a desktop keeps its own scheduler.
-    const long cores = sysconf(_SC_NPROCESSORS_ONLN);
-    const int core = RoleCore(role, index);
-    if (cores < 4) {
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    const int cores = RoleCores(role, index);
+    if (online < 4) {
         return;
     }
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET(core, &set);
+    for (int core = 0; core < 4; core++) {
+        if (cores & (1 << core)) {
+            CPU_SET(core, &set);
+        }
+    }
     const int result = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
     if (result != 0) {
-        LOG_WARNING(Common, "Could not pin thread to core {}: {}", core, result);
+        LOG_WARNING(Common, "Could not pin thread to cores {:#x}: {}", cores, result);
     }
 }
 
