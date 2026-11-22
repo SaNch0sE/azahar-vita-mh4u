@@ -232,32 +232,32 @@ constexpr u64 XenobladeUsa = 0x000400000F700100;
 
 constexpr std::array title_patches{
     TitlePatch{XenobladeUsa, "Left eye only",
-               "The game draws its 3D scene twice, once for each eye, even with the 3D slider "
-               "off. Only one picture is shown, so it draws the left eye's alone.",
+               "The game draws its 3D scene twice, once per eye, even with 3D off. Only one "
+               "picture is shown, so only the left eye's is drawn.",
                xenoblade_left_eye},
     TitlePatch{XenobladeUsa, "Joined 2D quads",
-               "The game draws its text and menus one small square at a time. Squares that "
-               "follow each other are drawn together, as one.",
+               "The game draws its text and menus one small square at a time. Squares drawn one "
+               "after another are joined into one draw.",
                xenoblade_quads},
     TitlePatch{XenobladeUsa, "Fewer texture writes",
-               "Binding a texture rewrites its settings every time. They are written only when "
-               "they change, which saves work on memory the GPU still reads.",
+               "The game rewrites a texture's settings every time it uses one. Now they are "
+               "written only when they change, which saves work.",
                xenoblade_texture_binds},
     TitlePatch{XenobladeUsa, "Fewer model writes",
-               "Each model's visibility is rewritten every frame. It is written only when it "
-               "changes, which saves work on memory the GPU still reads.",
+               "The game rewrites each model's visibility every frame. Now it is written only when "
+               "it changes, which saves work.",
                xenoblade_mesh_visibility},
     TitlePatch{XenobladeUsa, "Model files reported",
-               "The game tells the emulator where each model and texture file it loads lies, so "
-               "the emulator does not have to track the GPU's reads inside it.",
+               "The game tells Azahar where the model and texture files it loads are, so Azahar "
+               "has less to keep track of.",
                xenoblade_resource_watcher},
     TitlePatch{XenobladeUsa, "Three command buffers",
-               "The game builds each frame's GPU commands in one of two buffers in turn. It uses "
-               "three, so it waits less for the GPU to finish with the one it reuses.",
+               "The game takes turns between two buffers for each frame's GPU commands. With "
+               "three, it waits less for the GPU.",
                xenoblade_three_frame_buffers, XenobladeThreeFrameBuffersApplied},
     TitlePatch{XenobladeUsa, "Command buffer reported",
-               "The game tells the emulator which command buffer each frame fills, so the "
-               "emulator does not have to track the GPU's reads inside it.",
+               "The game tells Azahar which command buffer each frame fills, so Azahar has less to "
+               "keep track of.",
                xenoblade_frame_buffer_watcher},
 };
 
@@ -313,18 +313,16 @@ std::string TitlePatchesWarning(u64 title_id, std::string_view product_code, u16
             if (left_out == 0) {
                 return {};
             }
-            return fmt::format(
-                "For full speed, play {} from the {} copy ({}), revision {}, without an update: "
-                "Azahar's speed patches for it are made for that code. This copy's code is "
-                "revision {} or has an update installed, so {} of its {} patches are left out.",
-                t.name, t.region, t.product_code, t.remaster_version, remaster_version, left_out,
-                in.size());
+            return fmt::format("For full speed, play {} from the {} copy ({}), revision {}, "
+                               "without an update. This copy is revision {} or has an update "
+                               "installed, so {} of its {} speed patches are left out.",
+                               t.name, t.region, t.product_code, t.remaster_version,
+                               remaster_version, left_out, in.size());
         }
         if (product_code.size() == wanted.size() && product_code.starts_with(stem)) {
             return fmt::format(
-                "For full speed, play {} from the {} copy ({}), revision {}, without an update: "
-                "Azahar's speed patches for it are made for that copy. This one is {}'s ({}), so "
-                "it runs without them.",
+                "For full speed, play {} from the {} copy ({}), revision {}, without an update. "
+                "This copy is from {} ({}), so it runs without Azahar's speed patches.",
                 t.name, t.region, t.product_code, t.remaster_version, RegionOf(product_code),
                 product_code);
         }

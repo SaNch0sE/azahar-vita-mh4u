@@ -4,10 +4,11 @@
 
 #pragma once
 
-#include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "citra_vita/config.h"
 #include "citra_vita/multiplayer.h"
 #include "common/common_types.h"
 
@@ -21,12 +22,15 @@ class EmuWindowVita;
 
 /**
  * The on-screen interface: a game list before anything is running and a pause menu over a
- * running title, drawn with Dear ImGui through sgxd (imgui_impl_sgxd).
+ * running title, drawn with Dear ImGui through sgxd (imgui_impl_sgxd). One menu owns the loop
+ * while it is open; the pad is the primary input, with touch alongside.
  *
- * Structure follows DSVita's, which is the working reference for this shape of interface on this
- * console: one menu that owns the loop while it is open, a settings body shared between the
- * pre-launch and in-game paths with the in-game one showing only what can be changed while a
- * title runs, and gamepad navigation as the primary input with touch alongside it.
+ * The settings screen is shared between the game list and the pause menu, and edits either the
+ * values for all games or one title's own (Config): the same rows, the title's showing which of
+ * them it sets itself. A row is one line, its label and its value; the selected row's description
+ * and state (why it is greyed out, whether a title sets its own) show in full beside the list,
+ * so that nothing has to be cut to fit. A title with patches built in (Loader::TitlePatchesOf)
+ * has a tab more that lists them, which nothing on the screen changes.
  *
  * While a title runs the interface is the sgxd render thread's (SgxdRenderer::RenderThread), as
  * the window is: it builds and draws the stats overlay in each present, and runs the pause menu
@@ -68,6 +72,9 @@ public:
         return selected_slot;
     }
 
+    /// The title a launch has loaded, for the pause menu's game settings: its settings' key
+    /// (Config::RunningTitle) and its file's name, as the game list shows it. Before EnterGame.
+    void SetGame(const std::string& path);
     /// Switches to the in-game state, where nothing is drawn over the title.
     void EnterGame();
     /// Back to the game list, where the pause menu's "Quit game" leaves the interface: after a
@@ -85,49 +92,67 @@ public:
 private:
     enum class State {
         GameList,
-        GameSettings,
+        Settings,
         InGame,
         Pause,
-        PauseSettings,
         Savestates,
         Multiplayer,
     };
 
-    /// One row of the settings body. The value is read and written through closures so a row can
-    /// name any setting without this file knowing the shape of the settings structure.
-    struct Setting {
+    /// The settings screen's groups, its tabs. Patches holds no rows: a title's built-in patches.
+    enum class Category {
+        Display,
+        Speed,
+        Sound,
+        System,
+        Patches,
+        Count,
+    };
+
+    /// One row of the settings screen: an option of Config's, and how it is shown and changed.
+    /// The values are Config's: a toggle's 0 or 1, a choice's index, a slider's number.
+    struct Row {
         enum class Kind { Toggle, Choice, Slider };
 
+        Config::Option option;
+        Category category;
+        Kind kind;
         const char* title;
         const char* description;
-        Kind kind;
-        /// Whether the setting can be changed while a title is running. The pause menu shows
-        /// only these; the rest would need a reboot to take effect and pretending otherwise
-        /// is how a menu comes to lie about what the emulator is doing.
-        bool runtime;
-        std::function<bool()> get_bool;
-        std::function<void(bool)> set_bool;
-        std::function<int()> get_choice;
-        std::function<void(int)> set_choice;
         std::vector<const char*> choices;
-        std::function<int()> get_slider;
-        std::function<void(int)> set_slider;
-        int slider_min;
-        int slider_max;
+        /// A slider's step for each press of the pad, its unit, and what its 0 shows instead of
+        /// a number (null: the number).
+        int step;
+        const char* unit;
+        const char* zero;
     };
 
     struct GameEntry {
         std::string path;
+        std::string name; ///< the title's own short name (its SMDH's), else the file's
+        std::string file; ///< the file's name under the title's; empty when `name` is it
+    };
+    /// The titles' names read from their SMDH, by path, with the file's size they were read at: a
+    /// scan reads only files new or changed since.
+    struct CachedTitle {
+        u64 size;
         std::string name;
     };
+    std::unordered_map<std::string, CachedTitle> title_cache;
+    bool title_cache_loaded = false;
+    void LoadTitleCache();
+    void SaveTitleCache() const;
 
-    void BuildSettings();
+    void BuildRows();
     void ScanGames();
 
+    /// Opens the settings screen on the values for all games (an empty `title`) or the title's
+    /// own (`name`: what the screen calls it; `program_id`: its patches'). Back returns to `back`.
+    void OpenSettings(std::string title, std::string name, State back, u64 program_id = 0);
+
     Action DrawGameList();
-    Action DrawGameSettings();
+    Action DrawSettings();
     Action DrawPauseMenu();
-    Action DrawPauseSettings();
     Action DrawSavestates();
     Action DrawMultiplayer();
     /// The on-screen keyboard over the Multiplayer screen, editing `edit_text`. Not the system's
@@ -136,15 +161,25 @@ private:
     void DrawKeyboard();
     void DrawStatusMessage();
 
-    /// Draws the settings body, showing only runtime-changeable rows when asked.
-    void DrawSettingsBody(bool runtime_only);
-    void DrawSetting(Setting& setting, std::size_t index);
+    /// The tabs the settings screen shows: all of them but Patches for all games, those with
+    /// options a title can set itself for a title, and Patches when it has some.
+    [[nodiscard]] std::vector<Category> SettingsCategories() const;
+    void DrawRow(const Row& row, std::size_t index);
+    void DrawRowInfo();
+    void StepRow(const Row& row, int delta);
+    /// The value the screen shows and edits: the title's own (or all games' where it has none),
+    /// or all games'.
+    [[nodiscard]] int RowValue(const Row& row) const;
+    void SetRowValue(const Row& row, int value);
+    /// Why the row cannot be changed on this screen now, or null when it can.
+    [[nodiscard]] const char* DisabledReason(const Row& row) const;
+    [[nodiscard]] std::string ValueText(const Row& row, int value) const;
     void DrawPatchRow(std::size_t index);
     void DrawPatchInfo();
 
     /// True when the user pressed cancel and this overlay was the thing focused, which is what
-    /// separates "close the menu" from "leave the combo box the cancel already closed" - ImGui
-    /// has consumed the press by the time this runs.
+    /// separates "close the menu" from "leave the child the cancel already left" - ImGui has
+    /// consumed the press by the time this runs.
     [[nodiscard]] bool BackPressed() const;
 
     Core::System& system;
@@ -157,7 +192,25 @@ private:
 
     std::vector<GameEntry> games;
     int selected_game{};
-    std::vector<Setting> settings;
+    std::string game_key;
+    std::string game_name;
+
+    std::vector<Row> rows;
+    /// The settings screen: the title it edits (empty: all games), its name, the screen Back
+    /// returns to, the tab, the selected row (an index into rows, -1: none yet), and whether
+    /// the tab's first row is to be selected (a new tab, the screen just opened).
+    std::string settings_title;
+    std::string settings_name;
+    State settings_back{State::GameList};
+    Category category{Category::Display};
+    int focused_row = -1;
+    bool focus_first_row{};
+    /// The patches built in for the title the screen edits, whether each is in its code when it
+    /// is the running title (empty when it is not), and the selected one (-1: none yet).
+    std::vector<Loader::TitlePatchInfo> settings_patches;
+    std::vector<bool> settings_patches_in;
+    int focused_patch = -1;
+
     /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none).
     Multiplayer::Fields room_fields{};
     int editing_field = -1;

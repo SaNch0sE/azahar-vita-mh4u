@@ -77,6 +77,17 @@ void ImGui_ImplVita_NewFrame() {
         nav(ImGuiNavInput_DpadRight, SCE_CTRL_RIGHT);
         nav(ImGuiNavInput_FocusPrev, SCE_CTRL_LTRIGGER);
         nav(ImGuiNavInput_FocusNext, SCE_CTRL_RTRIGGER);
+        // The left stick moves the selection as the d-pad does, past half its travel (ImGui's
+        // own stick inputs scroll windows instead).
+        const auto stick = [&](ImGuiNavInput_ input, float value) {
+            if (value > 0.5f) {
+                io.NavInputs[input] = 1.0f;
+            }
+        };
+        stick(ImGuiNavInput_DpadLeft, (128.0f - pad.lx) / 128.0f);
+        stick(ImGuiNavInput_DpadRight, (pad.lx - 128.0f) / 128.0f);
+        stick(ImGuiNavInput_DpadUp, (128.0f - pad.ly) / 128.0f);
+        stick(ImGuiNavInput_DpadDown, (pad.ly - 128.0f) / 128.0f);
 
         if (s.mouse_stick_enabled) {
             // The right stick drives a cursor, for the odd widget navigation cannot reach.

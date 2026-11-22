@@ -116,9 +116,10 @@ void Make(u32 speed, u32 fps10, u32 shown, u32 volume) {
 
 void Init() {
     const ImGuiIO& io = ImGui::GetIO();
+    // The atlas's first font, the 13-pixel one, at 1.2 rather than the menus' scale
+    // (FontGlobalScale).
     const ImFont* font = io.Fonts->Fonts[0];
-    // The size ImGui drew this font at: its own times the global scale.
-    const float scale = io.FontGlobalScale;
+    constexpr float scale = 1.2f;
     for (const char c : std::string_view{" 0123456789%/.fmpsVolue"}) {
         const ImFontGlyph* g = font->FindGlyph(static_cast<ImWchar>(c));
         ASSERT_MSG(g != nullptr && g->Codepoint == static_cast<u32>(c),

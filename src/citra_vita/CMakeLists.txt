@@ -18,6 +18,8 @@ add_custom_command(
 set(CITRA_VITA_SOURCES
     ../vita_compat/src/vita_libc_shims.c
     citra_vita_main.cpp
+    config.cpp
+    config.h
     crash_report.cpp
     crash_report.h
     emu_window_vita.cpp

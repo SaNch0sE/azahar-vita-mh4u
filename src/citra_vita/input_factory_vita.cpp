@@ -30,7 +30,7 @@ public:
         if (g_window == nullptr || mask == 0) {
             return false;
         }
-        return (g_window->ButtonsHeld() & mask) != 0;
+        return (g_window->GuestButtons() & mask) != 0;
     }
 
 private:

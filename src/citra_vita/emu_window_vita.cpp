@@ -19,6 +19,7 @@
 #include <psp2/touch.h>
 
 #include "azahar_native.h"
+#include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/hud_stats.h"
@@ -346,6 +347,10 @@ void EmuWindowVita::RunPauseMenu(Ui& ui) {
         sceDisplayWaitVblankStart();
     }
     LOG_INFO(Frontend, "pause menu: closed, action {}", static_cast<int>(action));
+    // The layout's settings as the menu left them, however it closed (Resume, cancel, a
+    // savestate): the presents from here draw them.
+    UpdateCurrentFramebufferLayout();
+    menu_held.store(buttons_held.load(std::memory_order_relaxed), std::memory_order_relaxed);
     switch (action) {
     case Ui::Action::SaveState:
     case Ui::Action::LoadState:
@@ -397,6 +402,7 @@ void EmuWindowVita::ReadPad() {
             pad.ly = ly;
         }
         buttons_held.store(pad.buttons, std::memory_order_relaxed);
+        menu_held.fetch_and(pad.buttons, std::memory_order_relaxed);
         stick_x.store(pad.lx, std::memory_order_relaxed);
         stick_y.store(pad.ly, std::memory_order_relaxed);
         right_x.store(pad.rx, std::memory_order_relaxed);
@@ -437,16 +443,10 @@ void EmuWindowVita::VolumeKeys(u32 buttons) {
     volume_keys = held;
     const int step = held == SCE_CTRL_VOLUP ? 1 : -1;
     // The system volume, as SceShell steps it (azaharnative sets it while SceShell sleeps).
-    int level = azaharSystemVolume(step);
-    if (level == AZAHAR_ERR_ROUTE) {
-        constexpr int Steps = 20;
-        const int emulator =
-            std::clamp(static_cast<int>(std::lround(Settings::values.volume.GetValue() * Steps)) +
-                           step,
-                       0, Steps);
-        Settings::values.volume = static_cast<float>(emulator) / Steps;
-        level = static_cast<int>(HudStats::VolumeEmulator | (emulator * 100 / Steps));
-    } else if (level < 0) {
+    // HDMI and USB audio have no volume of their own, and
+    // SceShell's handler steps nothing there either (AZAHAR_ERR_ROUTE).
+    const int level = azaharSystemVolume(step);
+    if (level < 0) {
         LOG_DEBUG(Frontend, "azaharSystemVolume: {:#010x}", static_cast<u32>(level));
         return;
     }

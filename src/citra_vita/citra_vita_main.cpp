@@ -11,6 +11,7 @@
 #include <exception>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <typeinfo>
@@ -36,6 +37,7 @@
 #include <psp2/shellutil.h>
 #include <psp2/vshbridge.h>
 #include <taihen.h>
+#include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
 #include "citra_vita/gxm_present.h"
 #include "citra_vita/sgxd_present.h"
@@ -237,11 +239,11 @@ void SetupClocks() {
 std::string DescribeLoadError(Core::System::ResultStatus status) {
     switch (status) {
     case Core::System::ResultStatus::ErrorGetLoader:
-        return "no loader for this file";
+        return "unknown file type";
     case Core::System::ResultStatus::ErrorSystemMode:
         return "could not read the system mode";
     case Core::System::ResultStatus::ErrorLoader_ErrorEncrypted:
-        return "the title is encrypted";
+        return "it is encrypted. Decrypt it, then try again.";
     case Core::System::ResultStatus::ErrorLoader_ErrorInvalidFormat:
         return "unsupported file format";
     case Core::System::ResultStatus::ErrorLoader_ErrorGbaTitle:
@@ -345,6 +347,31 @@ struct StateArguments {
     SceUInt64 save_after_us = 0;
 };
 
+namespace Config = VitaFrontend::Config;
+using Config::Option;
+
+/// `layout=N`: N is a Settings::LayoutOption; the menu's layouts
+/// are the ones it offers. Empty for any other argument, or a layout the menu does not offer.
+std::optional<Config::Layout> LayoutArgument(const std::string& argument) {
+    if (!argument.starts_with("layout=")) {
+        return std::nullopt;
+    }
+    switch (static_cast<Settings::LayoutOption>(std::atoi(argument.c_str() + 7))) {
+    case Settings::LayoutOption::Default:
+        return Config::Layout::Default;
+    case Settings::LayoutOption::SingleScreen:
+        return Config::Layout::SingleScreen;
+    case Settings::LayoutOption::LargeScreen:
+        return Config::Layout::LargeScreen;
+    case Settings::LayoutOption::SideScreen:
+        return Config::Layout::SideBySide;
+    case Settings::LayoutOption::HybridScreen:
+        return Config::Layout::Hybrid;
+    default:
+        return std::nullopt;
+    }
+}
+
 /// Launch argument statslog=1: the stats overlay's numbers on the console once a second,
 /// release builds too.
 bool stats_log = false;
@@ -363,17 +390,21 @@ StateArguments TakeStateArguments() {
         } else if (argument == "commands") {
             // CommandChannel's.
         } else if (argument.starts_with("scale=")) {
-            // The top screen's scale: 1, 1.25 or 1.5.
-            SgxdRenderer::RasterizerSgxd::SetTopScale(
-                static_cast<u32>(std::lround(std::atof(argument.c_str() + 6) * 4)));
+            // The top screen's scale: 1, 1.25, 1.5, 1.75 or 2 (Config::TopScaleValue).
+            Config::Pin(Option::TopScale,
+                        Config::TopScaleValue(static_cast<float>(std::atof(argument.c_str() + 6))));
         } else if (argument == "layout=overlay") {
-            Settings::values.layout_option = Settings::LayoutOption::SingleScreen;
-            VitaFrontend::EmuWindowVita::SetOverlay(true);
-        } else if (argument.starts_with("layout=")) {
-            Settings::values.layout_option =
-                static_cast<Settings::LayoutOption>(std::atoi(argument.c_str() + 7));
+            Config::Pin(Option::ScreenLayout, static_cast<int>(Config::Layout::Overlay));
+        } else if (argument == "layout=largeoverlay") {
+            Config::Pin(Option::ScreenLayout, static_cast<int>(Config::Layout::LargeOverlay));
+        } else if (const auto layout = LayoutArgument(argument); layout) {
+            Config::Pin(Option::ScreenLayout, static_cast<int>(*layout));
         } else if (argument == "wide") {
-            VitaFrontend::EmuWindowVita::SetWidescreen(true);
+            Config::Pin(Option::Widescreen, 1);
+        } else if (argument == "wide=0") {
+            Config::Pin(Option::Widescreen, 0);
+        } else if (argument == "wide=stretch") {
+            Config::Pin(Option::Widescreen, 2);
         } else if (argument == "rightstick=cstick" || argument == "rightstick=lr" ||
                    argument == "rightstick=dpad") {
             using Mode = Config::RightStickMode;
@@ -383,17 +414,17 @@ StateArguments TakeStateArguments() {
             Config::Pin(Option::RightStick, static_cast<int>(mode));
         } else if (argument.starts_with("opacity=")) {
             // The overlay layout's other screen, in percent (10 to 100).
-            VitaFrontend::EmuWindowVita::SetOverlayOpacity(
-                static_cast<u32>(std::clamp(std::atoi(argument.c_str() + 8), 10, 100)));
+            Config::Pin(Option::OverlayOpacity, std::atoi(argument.c_str() + 8));
         } else if (argument.starts_with("vsync=")) {
-            Settings::values.use_vsync = std::atoi(argument.c_str() + 6) != 0;
+            Config::Pin(Option::Vsync, std::atoi(argument.c_str() + 6) != 0 ? 1 : 0);
         } else if (argument.starts_with("limit=")) {
-            Settings::values.frame_limit = static_cast<double>(std::atoi(argument.c_str() + 6));
-        } else if (argument.starts_with("skips=")) {
-            // The late skip's cap in frames, or none: skips=none.
-            SgxdRenderer::RenderThread::SetMaxScreenSkips(
-                argument == "skips=none" ? SgxdRenderer::RenderThread::NoScreenSkipLimit
-                                         : static_cast<u32>(std::atoi(argument.c_str() + 6)));
+            Config::Pin(Option::SpeedLimit, std::atoi(argument.c_str() + 6));
+        } else if (argument == "skips=none") {
+            Config::Pin(Option::FrameSkipLimit, Config::NoFrameSkipLimit);
+        } else if (argument.starts_with("skips=") && std::atoi(argument.c_str() + 6) >= 0 &&
+                   std::atoi(argument.c_str() + 6) < Config::NoFrameSkipLimit) {
+            // The late skip's cap in frames, 0 to 4 as the settings offer them.
+            Config::Pin(Option::FrameSkipLimit, std::atoi(argument.c_str() + 6));
         } else if (argument.starts_with("save=")) {
             a.save = std::atoi(argument.c_str() + 5);
             if (const std::size_t at = argument.find('@'); at != std::string::npos) {
@@ -847,14 +878,15 @@ bool RunSettingCommand(const std::string& command) {
         sceClibPrintf("[azahar] console name \"%s\" (command)\n", Config::ConsoleName().c_str());
         return true;
     }
+    // As the launch arguments, pins over the settings file's values (Config::Pin).
     int value = 0;
     if (std::sscanf(command.c_str(), "limit %d", &value) == 1) {
-        Settings::values.frame_limit = static_cast<double>(value);
+        Config::Pin(Option::SpeedLimit, value);
         sceClibPrintf("[azahar] speed limit %d%% (command)\n", value);
         return true;
     }
     if (std::sscanf(command.c_str(), "vsync %d", &value) == 1) {
-        Settings::values.use_vsync = value != 0;
+        Config::Pin(Option::Vsync, value != 0 ? 1 : 0);
         sceClibPrintf("[azahar] vsync %s (command)\n", value != 0 ? "on" : "off");
         return true;
     }
@@ -1093,7 +1125,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         !warning.empty()) {
         sceClibPrintf("[azahar] %s\n", warning.c_str());
         if (!g_launched_by_path) {
-            ui.SetStatusMessage(warning + "\n\nPress X or O to go on.");
+            ui.SetStatusMessage(warning + "\n\nPress X or O to continue.");
             // The buttons let go, one pressed, let go again.
             for (int phase = 0; phase < 3;) {
                 window.PollEvents();
@@ -1110,10 +1142,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             ui.ClearStatusMessage();
         }
     }
+    Config::SetRunningTitle(Config::TitleKeyOf(path));
+    NoteRunningTitle(system);
+    system.SetResetCallback([&system] {
+        NoteRunningTitle(system);
+        VitaFrontend::CrashReport::NoteJump();
+    });
+    VitaFrontend::CrashReport::NoteCheats(&system.CheatEngine());
+    ui.SetGame(path);
     // nwm::UDS signals its events directly only on this thread; the room's thread queues them.
     system.RegisterCoreLoopThreadId();
     StateArguments state_arguments = TakeStateArguments();
-    window.UpdateCurrentFramebufferLayout(); // a layout=N argument's
+    window.UpdateCurrentFramebufferLayout(); // the title's own layout, or a layout=N argument's
 
 #ifdef VITA_DIAGNOSTICS
     SgxdRenderer::Vprof::Info("rom", path.c_str());
@@ -1166,6 +1206,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             window.SetLoading(false);
             window.SetUi(nullptr);
             ShutdownSystem(system, threads_before);
+            Config::SetRunningTitle({});
+            VitaFrontend::CrashReport::NoteCheats(nullptr);
+            VitaFrontend::CrashReport::NoteGame({}, 0, {});
+            Config::Save();
             // The menu's quit has left the interface on the game list already; the command
             // channel's has not, and the render thread that drew the title is gone by now.
             ui.LeaveGame();
@@ -1844,6 +1888,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     window.SetLoading(false);
     window.SetUi(nullptr);
     ShutdownSystem(system, threads_before);
+    Config::SetRunningTitle({});
+    VitaFrontend::CrashReport::NoteCheats(nullptr);
+    VitaFrontend::CrashReport::NoteGame({}, 0, {});
+    Config::Save();
     return true;
 }
 
@@ -2052,9 +2100,9 @@ std::string LoadAzaharNative(bool relaunched) {
             sceKernelDelayThread(100 * 1000);
         }
     }
-    return fmt::format("azaharnative.skprx is loaded, but Azahar could not restart to use it "
-                       "({:#010x}). Start Azahar again.",
-                       static_cast<u32>(exec));
+    return fmt::format(
+        "Azahar could not restart to use azaharnative.skprx ({:#010x}). Start Azahar again.",
+        static_cast<u32>(exec));
 }
 
 /// The system's message dialog, over GXM: only before sgxd has the GPU, or when it could not
@@ -2156,9 +2204,8 @@ int EmulatorMain() {
     // Vertex shading happens on the GPU or not at all: with this off, the PICA code would send
     // every draw down its CPU vertex path, which the sgxd rasterizer does not have.
     Settings::values.use_hw_shader = true;
-    // Measurement builds (the -nl branches): no speed limit from the start, as the pause menu's
-    // speed limit at 0, so that a release recording shows how far past full speed it runs.
-    Settings::values.frame_limit = 0.0;
+    // What the player chose, from the memory card: the values for all games until a title runs.
+    Config::Load();
     Frontend::RegisterDefaultApplets(system);
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());
 
@@ -2224,6 +2271,7 @@ int EmulatorMain() {
         }
     }
 
+    Config::Save();
     VitaFrontend::Multiplayer::Shutdown();
     VitaFrontend::ShutdownInput();
     Common::Log::Stop();

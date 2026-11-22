@@ -121,6 +121,12 @@ public:
         return buttons_held.load(std::memory_order_relaxed);
     }
 
+    /// The pad as the guest sees it: without the buttons still held from closing the pause menu.
+    [[nodiscard]] u32 GuestButtons() const {
+        return buttons_held.load(std::memory_order_relaxed) &
+               ~menu_held.load(std::memory_order_relaxed);
+    }
+
     /// Left stick, each axis in [-1, 1] with y positive upwards.
     [[nodiscard]] std::pair<float, float> LeftStick() const;
     /// Right stick, as LeftStick: the guest's C-stick (the Circle Pad Pro's, the New 3DS's).
@@ -183,6 +189,9 @@ private:
     bool paused{};
 
     std::atomic<u32> buttons_held{};
+    /// The buttons held when the pause menu closed, each kept from the guest until released: the
+    /// press that chose Resume (cross, the 3DS's B) or cancelled (circle, its A) is the menu's.
+    std::atomic<u32> menu_held{};
     std::atomic<s32> stick_x{}, stick_y{};
     std::atomic<s32> right_x{128}, right_y{128};
     std::atomic<bool> input_to_guest{true};

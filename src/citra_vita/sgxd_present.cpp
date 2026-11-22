@@ -690,12 +690,17 @@ bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
         return false;
     }
     const u32 bytes = width * height * 4;
-    const u32 size = (bytes + 0x3ffff) & ~0x3ffffu; // CDRAM's 256 KiB unit
-    g.texture = sceKernelAllocMemBlock("sgxd_present_texture", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
-                                       size, nullptr);
+    // Main memory, uncached: the menus' atlas with the Chinese glyphs (MenuGlyphs) is 1-2 MiB,
+    // which CDRAM, a game's to fill, does not spare; a frame reads only the glyphs it draws.
+    const u32 size = (bytes + 0xfff) & ~0xfffu;
+    // Its GPU addresses end where the renderer's blocks start (64 MiB).
+    ASSERT_MSG(size <= 0x400000, "sgxd: a {} KiB texture runs past its 4 MiB of GPU addresses",
+               size >> 10);
+    g.texture = sceKernelAllocMemBlock("sgxd_present_texture",
+                                       SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, size, nullptr);
     void* base = nullptr;
     const bool got = g.texture >= 0 && sceKernelGetMemBlockBase(g.texture, &base) >= 0;
-    ASSERT_MSG(got, "sgxd: no {} KiB of CDRAM for a {}x{} texture ({:#010x})", size >> 10,
+    ASSERT_MSG(got, "sgxd: no {} KiB of main memory for a {}x{} texture ({:#010x})", size >> 10,
                width, height, static_cast<u32>(g.texture));
     std::memcpy(base, texels, bytes);
     const int mapped = sgxdMap(TextureVa, base, size, 0);

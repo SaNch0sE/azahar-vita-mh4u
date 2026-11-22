@@ -58,6 +58,8 @@ bool ImGui_ImplSgxd_Init() {
         LOG_CRITICAL(Frontend, "sgxd: the {}x{} font atlas was not taken", width, height);
         return false;
     }
+    LOG_INFO(Frontend, "sgxd: the font atlas is {}x{} ({} KiB)", width, height,
+             width * height * 4 / 1024);
     io.Fonts->TexID = &font_texture_tag;
     io.BackendRendererName = "imgui_impl_sgxd";
     overflow_logged = false;
