@@ -30,6 +30,8 @@ set(CITRA_VITA_SOURCES
     imgui_impl_vita.h
     input_factory_vita.cpp
     input_factory_vita.h
+    multiplayer.cpp
+    multiplayer.h
     sgxd_present.cpp
     sgxd_present.h
     stats_hud.cpp
@@ -61,7 +63,8 @@ function(citra_vita_executable target titleid)
                                                  "${CMAKE_SOURCE_DIR}/src/sgxd")
     create_target_directory_groups(${target})
 
-    target_link_libraries(${target} PRIVATE citra_common citra_core input_common video_core)
+    target_link_libraries(${target} PRIVATE citra_common citra_core input_common network
+                                            video_core)
     # The upcall experiment's TLS lookup and malloc lock (upcall_tls.cpp), and the abort report
     # (crash_report.cpp), which keeps the console's last text too.
     target_link_options(${target} PRIVATE

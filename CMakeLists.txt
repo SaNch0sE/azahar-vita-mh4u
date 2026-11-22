@@ -111,12 +111,15 @@ endif()
 if (VITA)
     set(_VITA_UNSUPPORTED_OPTIONS
         ENABLE_SDL2 ENABLE_QT ENABLE_WEB_SERVICE ENABLE_SCRIPTING ENABLE_GDBSTUB
-        ENABLE_OPENAL ENABLE_ROOM ENABLE_ROOM_STANDALONE ENABLE_CUBEB ENABLE_LIBUSB
+        ENABLE_OPENAL ENABLE_ROOM_STANDALONE ENABLE_CUBEB ENABLE_LIBUSB
         ENABLE_OPENGL ENABLE_VULKAN ENABLE_TESTS ENABLE_LIBRETRO ENABLE_DISCORD_RPC
         ENABLE_QT_TRANSLATION ENABLE_QT_UPDATE_CHECKER ENABLE_DSP_LLE ENABLE_ARTIC)
     foreach(_opt IN LISTS _VITA_UNSUPPORTED_OPTIONS)
         set(${_opt} OFF CACHE BOOL "Unsupported on the PS Vita" FORCE)
     endforeach()
+    # The multiplayer rooms' client (the guest's local wireless carried to other emulators in a
+    # room); hosting stays with the desktop builds and the standalone room server.
+    set(ENABLE_ROOM ON CACHE BOOL "The multiplayer rooms" FORCE)
     # The Vita renders through GXM and nothing else (GXM_PLAN.md). The software renderer is
     # too slow on a 444 MHz A9 to be worth carrying, so it is not built; ENABLE_GXM is not an
     # option because no other platform can use it - it is a fact of the target.

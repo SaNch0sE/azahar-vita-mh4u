@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "citra_vita/multiplayer.h"
 #include "common/common_types.h"
 
 namespace Core {
@@ -89,6 +90,7 @@ private:
         Pause,
         PauseSettings,
         Savestates,
+        Multiplayer,
     };
 
     /// One row of the settings body. The value is read and written through closures so a row can
@@ -127,6 +129,11 @@ private:
     Action DrawPauseMenu();
     Action DrawPauseSettings();
     Action DrawSavestates();
+    Action DrawMultiplayer();
+    /// The on-screen keyboard over the Multiplayer screen, editing `edit_text`. Not the system's
+    /// keyboard dialog: it draws through GXM, and handing the GPU back to Sony's driver around
+    /// it while sgxd holds a title's state is too risky.
+    void DrawKeyboard();
     void DrawStatusMessage();
 
     /// Draws the settings body, showing only runtime-changeable rows when asked.
@@ -149,6 +156,11 @@ private:
     std::vector<GameEntry> games;
     int selected_game{};
     std::vector<Setting> settings;
+    /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none).
+    Multiplayer::Fields room_fields{};
+    int editing_field = -1;
+    std::string edit_text;
+    bool keyboard_shift{};
     bool overlay_focused{};
     /// Whether the last Update built an ImGui frame (a menu or the status message), which Draw
     /// then draws; in game it builds none and Draw draws the stats overlay.

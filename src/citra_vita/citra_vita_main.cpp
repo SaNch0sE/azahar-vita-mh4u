@@ -41,6 +41,7 @@
 
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/input_factory_vita.h"
+#include "citra_vita/multiplayer.h"
 
 #include "azahar_native.h"
 #include "common/heap_check.h"
@@ -1176,7 +1177,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     for (const std::string& line : Core::ModuleTablesAt(va)) {
                         sceClibPrintf("[azahar] %s (command)\n", line.c_str());
                     }
-                } else if (RunSettingCommand(command)) {
+                } else if (RunSettingCommand(command) ||
+                           VitaFrontend::Multiplayer::RunCommand(system, command)) {
                 } else if (command == "threads") {
 #ifdef VITA_DIAGNOSTICS
                     LogGuestThreads(system);
@@ -1905,14 +1907,6 @@ int EmulatorMain() {
 
     SetupPaths();
     SetupLogging();
-    MigrateNandLayout();
-#ifdef VITA_DIAGNOSTICS
-    // What SetupClocks got: the set calls' results are not checked.
-    LOG_INFO(Frontend, "clocks: ARM {} MHz, bus {} MHz, GPU {} MHz, GPU xbar {} MHz",
-             scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
-             scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
-#endif
-    SetupNetwork();
 
     // What stops the start comes first, in the menus' language: before anything else is set up
     // and before the startup notice. Closing it exits the app.
@@ -2042,11 +2036,13 @@ int EmulatorMain() {
                           found ? "selected" : "no such title");
         } else if (command == "exit") {
             running = false;
-        } else if (!command.empty() && !RunSettingCommand(command)) {
+        } else if (!command.empty() && !RunSettingCommand(command) &&
+                   !VitaFrontend::Multiplayer::RunCommand(system, command)) {
             sceClibPrintf("[azahar] command \"%s\" not known on the game list\n", command.c_str());
         }
     }
 
+    VitaFrontend::Multiplayer::Shutdown();
     VitaFrontend::ShutdownInput();
     Common::Log::Stop();
 

@@ -3,7 +3,10 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <utility>
 
 #include <imgui_vita2d/imgui.h>
 
@@ -415,7 +418,7 @@ Ui::Action Ui::DrawGameSettings() {
 
 Ui::Action Ui::DrawPauseMenu() {
     Action action = Action::None;
-    BeginCentered("##pause", 360.0f, 420.0f);
+    BeginCentered("##pause", 360.0f, 480.0f);
     ImGui::TextUnformatted("Paused");
     ImGui::Separator();
 
@@ -423,6 +426,12 @@ Ui::Action Ui::DrawPauseMenu() {
     if (ImGui::Button("Resume", button_size)) {
         action = Action::ResumeGame;
         window.UpdateCurrentFramebufferLayout();
+    }
+    if (ImGui::Button("Multiplayer", button_size)) {
+        state = State::Multiplayer;
+        room_fields = Multiplayer::CurrentFields();
+        editing_field = -1;
+        overlay_focused = false;
     }
     if (ImGui::Button("Settings", button_size)) {
         state = State::PauseSettings;
@@ -511,6 +520,140 @@ Ui::Action Ui::DrawSavestates() {
     return action;
 }
 
+Ui::Action Ui::DrawMultiplayer() {
+    if (editing_field >= 0) {
+        DrawKeyboard();
+        return Action::None;
+    }
+    BeginCentered("##multiplayer", 720.0f, 500.0f);
+    ImGui::TextUnformatted("Multiplayer");
+    ImGui::Separator();
+    ImGui::TextWrapped("%s", Multiplayer::Status().c_str());
+    ImGui::Spacing();
+
+    // Each field a button that opens the keyboard on it.
+    const std::string port = std::to_string(room_fields.port);
+    const std::string password(room_fields.password.size(), '*');
+    const std::pair<const char*, const std::string*> rows[] = {
+        {"Address", &room_fields.address},
+        {"Port", &port},
+        {"Nickname", &room_fields.nickname},
+        {"Password", &password},
+    };
+    for (int i = 0; i < 4; i++) {
+        ImGui::PushID(i);
+        ImGui::Text("%s", rows[i].first);
+        ImGui::SameLine(140.0f);
+        const std::string label = rows[i].second->empty() ? "(none)" : *rows[i].second;
+        if (ImGui::Button(label.c_str(), ImVec2(400.0f, 40.0f))) {
+            editing_field = i;
+            edit_text = i == 1 ? port : i == 3 ? room_fields.password : *rows[i].second;
+            keyboard_shift = false;
+        }
+        ImGui::PopID();
+    }
+    ImGui::Spacing();
+    const bool can_join = !room_fields.address.empty() && !room_fields.nickname.empty();
+    if (ImGui::Button(Multiplayer::InRoom() ? "Join again" : "Join", ImVec2(200.0f, 48.0f)) &&
+        can_join) {
+        Multiplayer::Join(system, room_fields);
+    }
+    ImGui::SameLine();
+    if (Multiplayer::InRoom() && ImGui::Button("Leave", ImVec2(200.0f, 48.0f))) {
+        Multiplayer::Leave();
+    }
+    // Back on the same row: the panel's bottom is under the screen's edge otherwise.
+    ImGui::SameLine(472.0f);
+    const bool back = ImGui::Button("Back", ImVec2(200.0f, 48.0f)) || BackPressed();
+    ImGui::Separator();
+    ImGui::BeginChild("##members", ImVec2(0.0f, 0.0f));
+    const std::vector<std::string> members = Multiplayer::Members();
+    if (members.empty()) {
+        ImGui::TextWrapped("Join a room hosted by a desktop Azahar (Multiplayer, Host Room) or its "
+                           "room server. Every player runs the same game; its local wireless "
+                           "play then finds the others.");
+    }
+    for (const std::string& member : members) {
+        ImGui::TextUnformatted(member.c_str());
+    }
+    ImGui::EndChild();
+    overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGui::End();
+    if (back) {
+        state = State::Pause;
+        overlay_focused = false;
+    }
+    return Action::None;
+}
+
+void Ui::DrawKeyboard() {
+    static constexpr const char* rows[] = {"1234567890", "qwertyuiop", "asdfghjkl.",
+                                           "zxcvbnm-_:"};
+    static constexpr const char* titles[] = {"Address", "Port", "Nickname", "Password"};
+    // Ten keys of 56 a row and their spacing.
+    BeginCentered("##keyboard", 700.0f, 420.0f);
+    ImGui::Text("%s", titles[editing_field]);
+    ImGui::Separator();
+    ImGui::Text("%s_", editing_field == 3 ? std::string(edit_text.size(), '*').c_str()
+                                          : edit_text.c_str());
+    ImGui::Spacing();
+    const ImVec2 key{56.0f, 44.0f};
+    for (const char* row : rows) {
+        for (const char* c = row; *c != '\0'; c++) {
+            if (c != row) {
+                ImGui::SameLine();
+            }
+            const char ch = keyboard_shift && *c >= 'a' && *c <= 'z' ? *c - 'a' + 'A' : *c;
+            const char label[2] = {ch, '\0'};
+            // The port takes digits only.
+            if (ImGui::Button(label, key) && (editing_field != 1 || (ch >= '0' && ch <= '9')) &&
+                edit_text.size() < 64) {
+                edit_text.push_back(ch);
+            }
+        }
+    }
+    bool done = false, cancel = false;
+    if (ImGui::Button(keyboard_shift ? "SHIFT" : "Shift", ImVec2(110.0f, 44.0f))) {
+        keyboard_shift = !keyboard_shift;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Space", ImVec2(110.0f, 44.0f)) && editing_field != 1) {
+        edit_text.push_back(' ');
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Delete", ImVec2(110.0f, 44.0f)) && !edit_text.empty()) {
+        edit_text.pop_back();
+    }
+    ImGui::SameLine();
+    cancel = ImGui::Button("Cancel", ImVec2(110.0f, 44.0f)) || BackPressed();
+    ImGui::SameLine();
+    done = ImGui::Button("OK", ImVec2(110.0f, 44.0f));
+    overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGui::End();
+    if (done) {
+        switch (editing_field) {
+        case 0:
+            room_fields.address = edit_text;
+            break;
+        case 1:
+            if (const int port = std::atoi(edit_text.c_str()); port > 0 && port <= 65535) {
+                room_fields.port = static_cast<u16>(port);
+            }
+            break;
+        case 2:
+            room_fields.nickname = edit_text;
+            break;
+        default:
+            room_fields.password = edit_text;
+            break;
+        }
+    }
+    if (done || cancel) {
+        editing_field = -1;
+        overlay_focused = false;
+    }
+}
+
 void Ui::DrawStatusMessage() {
     BeginCentered("##status", 560.0f, 140.0f);
     ImGui::TextWrapped("%s", status_message.c_str());
@@ -546,6 +689,9 @@ Ui::Action Ui::Update() {
             break;
         case State::Savestates:
             action = DrawSavestates();
+            break;
+        case State::Multiplayer:
+            action = DrawMultiplayer();
             break;
         }
     }
