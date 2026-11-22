@@ -264,6 +264,10 @@ public:
     void EndFrame();
     void FrameTicket(u64 ticket);
 
+    [[nodiscard]] u32 ShownFrames() const {
+        return shown_frames.load(std::memory_order_relaxed);
+    }
+
     /// Parks the thread once it has run everything queued; nests. Under the GPU's lock, which
     /// the caller may let go of and take again while the hold lasts.
     void Hold();
@@ -735,6 +739,7 @@ private:
     static constexpr std::chrono::milliseconds WindowPollInterval{16};
     Common::ProcessClock::time_point last_window_poll{};
     std::atomic<u32> presents_queued{};
+    std::atomic<u32> shown_frames{};
     /// The late skip (emulation side): the vblank never waits for the GPU, so when the GPU is
     /// TicketFramesBack frames behind, the next frame's busier screen's draws are not recorded and the
     /// game keeps its CPU speed. The screen a late frame keeps (or -1), and an open batch's decision.

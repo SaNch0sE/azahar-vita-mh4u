@@ -3961,20 +3961,9 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
             break;
         }
 #ifdef VITA_DIAGNOSTICS
-        const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_present);
-        present_gaps[gap.count() <= 20   ? 0
-                     : gap.count() <= 37 ? 1
-                     : gap.count() <= 54 ? 2
-                                         : 3]
-            .fetch_add(1, std::memory_order_relaxed);
-#endif
-        last_present = now;
-        GxmTrace("present");
-        renderer.PresentFrame(r.fb, r.fill);
-        GxmTrace("presented");
-        rasterizer.GpuIdle();
-#ifdef VITA_DIAGNOSTICS
-        presents.fetch_add(1, std::memory_order_relaxed);
+        if (present_pending) {
+            presents_soon.fetch_add(1, std::memory_order_relaxed);
+        }
 #endif
         present_pending = false;
         ShowPresent(r.fb, r.fill, now);

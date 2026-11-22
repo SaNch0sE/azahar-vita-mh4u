@@ -383,17 +383,17 @@ bool TakeRenderCounters(Core::System& system, RenderCounters& out) {
  * The savestate arguments after the title's path: `load=N` restores slot N before the title runs,
  * `save=N@T` saves slot N once it has run T seconds. A scripted launch passes them at the launch to
  * jump to a scene a run saved. Taken once: a title started from the list later gets none.
- * `scale=1.5`, `layout=N` (`layout=overlay`), `wide` (`wide=0`), `opacity=N`, `vsync=0`, `limit=N`,
- * `skips=N` (`skips=none`), `gpuwait=0`, `motion=0` and `rightstick=lr` (`cstick`, `dpad`) set the
- * internal resolution, the screen layout, widescreen, the overlay's opacity, vsync, the speed
- * limit, the late skip's cap, the wait for GPU results, the motion controls and what the right
- * stick drives as the pause menu would, for the session: they pin the
- * option over the settings file's values (Config::Pin), so that a run is what its arguments say
- * whatever a player chose on the console, and are never written to the file. `clock=N` pins the
- * emulated CPU's clock in percent the same way (at 50, a millisecond the guest runs is two of
- * emulated time). `commands` turns on the command channel (CommandChannel) for the whole
- * run, and `notice` shows the start-up notice on a launch by path, which skips it otherwise
- * (EmulatorMain).
+ * `scale=1.5`, `layout=N` (`layout=overlay`), `wide` (`wide=0`, `wide=stretch`), `opacity=N`,
+ * `vsync=0`, `limit=N`, `skips=N` (`skips=none`), `gpuwait=0`, `motion=0`, `rightstick=lr`
+ * (`cstick`, `dpad`) and `stats=0` set the internal resolution, the screen layout, widescreen,
+ * the overlay's opacity, vsync, the speed limit, the late skip's cap, the wait for GPU results,
+ * the motion controls, what the right stick drives and the stats overlay as the settings would,
+ * for the session: they pin the option over the settings file's values (Config::Pin), so that a
+ * run is what its arguments say whatever a player chose on the console, and are never written to
+ * the file. `clock=N` pins the emulated CPU's clock in percent the same way (at 50, a millisecond
+ * the guest runs is two of emulated time). `commands` turns on the command channel
+ * (CommandChannel) for the whole run, and `notice` shows the start-up notice on a launch by path,
+ * which skips it otherwise (EmulatorMain).
  */
 struct StateArguments {
     int load = -1;
@@ -464,6 +464,8 @@ StateArguments TakeStateArguments() {
             Config::Pin(Option::Widescreen, 2);
         } else if (argument.starts_with("msaa=")) {
             Config::Pin(Option::Msaa, std::atoi(argument.c_str() + 5) != 0 ? 1 : 0);
+        } else if (argument.starts_with("stats=")) {
+            Config::Pin(Option::StatsOverlay, std::atoi(argument.c_str() + 6) != 0 ? 1 : 0);
         } else if (argument.starts_with("statslog=")) {
             stats_log = std::atoi(argument.c_str() + 9) != 0;
         } else if (argument.starts_with("motion=")) {
@@ -2011,8 +2013,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     std::memory_order_relaxed);
                 game_fps10.store(static_cast<u32>(std::max(perf.game_fps * 10.0 + 0.5, 0.0)),
                                  std::memory_order_relaxed);
-                shown_fps.store(static_cast<u32>(std::max(perf.system_fps + 0.5, 0.0)),
-                                std::memory_order_relaxed);
+                // The frames the render thread presented, not the vblanks (perf.system_fps):
+                // dropped presents and skipped frames show nothing new.
+                static u32 last_shown = 0;
+                const u32 shown = system.GPU().GetRenderThread().ShownFrames();
+                shown_fps.store(shown - last_shown, std::memory_order_relaxed);
+                if (stats_log) {
+                    const u32 g10 = game_fps10.load(std::memory_order_relaxed);
+                    sceClibPrintf("[azahar] stats: speed %u%% game %u.%u fps shown %u fps\n",
+                                  speed_percent.load(std::memory_order_relaxed), g10 / 10,
+                                  g10 % 10, shown - last_shown);
+                }
+                last_shown = shown;
                 valid.store(true, std::memory_order_release);
                 // Presented with the guest's screens unchanged too (GPU's vblank).
                 window.MarkOverlayChanged();

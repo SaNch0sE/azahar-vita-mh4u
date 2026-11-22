@@ -425,6 +425,8 @@ constexpr std::array table{std::to_array<Translation>({
      "在“单屏”和叠加布局中（“交换屏幕”关闭时），上屏如何填满屏幕。关：保持 3DS 的比例，两侧有黑边。"
      "扩展宽屏：两侧显示更多场景；可能导致画面异常，部分游戏的新增边缘会是空白或绘制错误。拉伸宽屏："
      "将画面拉伸至屏幕宽度。"},
+    {"Shows the speed and frame rates in the top-right corner while a game runs.",
+     "游戏运行时在右上角显示速度和帧率。"},
     {"Side by side", "并排"},
     {"Simplified Chinese", "简体中文"},
     {"Single screen", "单屏"},
@@ -452,6 +454,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Speed limit", "速度限制"},
     {"Square", "□ 按钮"},
     {"Startup notice", "启动提示"},
+    {"Stats overlay", "性能信息"},
     {"Stretch audio", "音频拉伸"},
     {"Stretch over the display", "拉伸至整个显示屏"},
     {"Swap screens", "交换屏幕"},

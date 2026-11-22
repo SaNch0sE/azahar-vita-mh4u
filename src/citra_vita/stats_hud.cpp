@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -50,8 +51,10 @@ constexpr u32 MaxQuads = 48;
 std::array<u32, MaxQuads * 4 * VertexWords> vertices{};
 u32 quads = 0;
 u32 clip = 0;
-/// The numbers the quads show: speed, game fps, shown fps, and the volume (~0u: none).
+/// The numbers the quads show: speed, game fps, shown fps (all three ~0u: the stats hidden), and
+/// the volume (~0u: none).
 std::array<u32, 4> made_for{~0u, ~0u, ~0u, ~0u};
+std::atomic<bool> stats_shown{true};
 
 void PutQuad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1,
              u32 colour) {
@@ -85,26 +88,33 @@ void PutText(float x, float y, const char* text) {
     }
 }
 
-void Make(u32 speed, u32 fps10, u32 shown, u32 volume) {
+void Make(bool stats, u32 speed, u32 fps10, u32 shown, u32 volume) {
     char speed_line[32], frame_line[32], volume_line[32];
     std::snprintf(speed_line, sizeof(speed_line), "%u%%/%u", speed, (fps10 + 5) / 10);
     std::snprintf(frame_line, sizeof(frame_line), "%.1fms/%ufps",
                   shown != 0 ? 1000.0f / static_cast<float>(shown) : 0.0f, shown);
     std::snprintf(volume_line, sizeof(volume_line), "Volume %u/30", volume);
-    const u32 lines = volume != ~0u ? 3 : 2;
-    float width = std::max(Width(speed_line), Width(frame_line));
-    if (lines == 3) {
-        width = std::max(width, Width(volume_line));
+    // The speed and frame lines, then the volume's.
+    std::array<const char*, 3> text{};
+    u32 lines = 0;
+    if (stats) {
+        text[lines++] = speed_line;
+        text[lines++] = frame_line;
+    }
+    if (volume != ~0u) {
+        text[lines++] = volume_line;
+    }
+    float width = 0.0f;
+    for (u32 n = 0; n < lines; n++) {
+        width = std::max(width, Width(text[n]));
     }
     width += 2.0f * Padding;
     const float height = lines * line_height + (lines - 1) * LineGap + 2.0f * Padding;
     const float left = std::floor(Right - width);
     quads = 0;
     PutQuad(left, Top, Right, Top + height, white_u, white_v, white_u, white_v, BoxColour);
-    PutText(left + Padding, Top + Padding, speed_line);
-    PutText(left + Padding, Top + Padding + line_height + LineGap, frame_line);
-    if (lines == 3) {
-        PutText(left + Padding, Top + Padding + 2.0f * (line_height + LineGap), volume_line);
+    for (u32 n = 0; n < lines; n++) {
+        PutText(left + Padding, Top + Padding + n * (line_height + LineGap), text[n]);
     }
     // The 32-pixel tiles the box covers: the TA's region clip.
     clip = SGXD_RECIPE_CLIP(static_cast<u32>(left) / 32, static_cast<u32>(Top) / 32,
@@ -113,6 +123,10 @@ void Make(u32 speed, u32 fps10, u32 shown, u32 volume) {
 }
 
 } // Anonymous namespace
+
+void SetShown(bool shown) {
+    stats_shown.store(shown, std::memory_order_relaxed);
+}
 
 void Init() {
     const ImGuiIO& io = ImGui::GetIO();
@@ -140,14 +154,18 @@ void Draw() {
     // The volume while the volume keys' last step is recent (EmuWindowVita::VolumeKeys).
     const bool volume =
         sceKernelGetProcessTimeWide() < HudStats::volume_until_us.load(std::memory_order_acquire);
-    const std::array<u32, 4> now{HudStats::speed_percent.load(std::memory_order_relaxed),
-                                 HudStats::game_fps10.load(std::memory_order_relaxed),
-                                 HudStats::shown_fps.load(std::memory_order_relaxed),
-                                 volume ? HudStats::volume_level.load(std::memory_order_relaxed)
-                                        : ~0u};
+    const bool stats = stats_shown.load(std::memory_order_relaxed);
+    if (!stats && !volume) {
+        return;
+    }
+    const std::array<u32, 4> now{
+        stats ? HudStats::speed_percent.load(std::memory_order_relaxed) : ~0u,
+        stats ? HudStats::game_fps10.load(std::memory_order_relaxed) : ~0u,
+        stats ? HudStats::shown_fps.load(std::memory_order_relaxed) : ~0u,
+        volume ? HudStats::volume_level.load(std::memory_order_relaxed) : ~0u};
     if (now != made_for) {
         made_for = now;
-        Make(now[0], now[1], now[2], now[3]);
+        Make(stats, now[0], now[1], now[2], now[3]);
     }
     auto& b = SgxdPresent::CurrentBatch();
     const u32 count = quads * 4;

@@ -19,4 +19,8 @@ void Init();
 /// The overlay into the frame being built (SgxdPresent), once HudStats are valid.
 void Draw();
 
+/// Whether the speed and frame lines show (Config::Option::StatsOverlay); without them the box
+/// shows only the volume, after a volume key. Any thread.
+void SetShown(bool shown);
+
 } // namespace VitaFrontend::StatsHud

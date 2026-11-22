@@ -43,6 +43,9 @@ enum class Option : u32 {
     TopScale,
     /// 2x MSAA on the top screen (RasterizerSgxd::SetTopMsaa): 0 off, 1 on.
     Msaa,
+    /// The stats overlay over a running title (StatsHud): 1, or 0 for none (the volume still
+    /// shows after a volume key). All games' alone; the overlay reads it as it draws.
+    StatsOverlay,
     Vsync,
     /// Percent of full speed, 0 for none. Not applied while vsync is on, which holds the
     /// emulation to the display's rate already: a limit kept for a title or all games waits

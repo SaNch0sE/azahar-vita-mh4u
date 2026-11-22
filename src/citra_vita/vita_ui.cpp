@@ -1587,6 +1587,15 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::StatsOverlay,
+         Category::Display,
+         Kind::Toggle,
+         Translatable("Stats overlay"),
+         Translatable("Shows the speed and frame rates in the top-right corner while a game runs."),
+         {},
+         0,
+         nullptr,
+         nullptr});
 
     // Speed: how fast and how smoothly.
     add({Option::Vsync,
