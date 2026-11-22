@@ -13,7 +13,7 @@
 #include <psp2/touch.h>
 
 #include "citra_vita/emu_window_vita.h"
-#include "citra_vita/gxm_present.h"
+#include "citra_vita/sgxd_present.h"
 #include "citra_vita/vita_ui.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
@@ -300,12 +300,15 @@ void EmuWindowVita::Present(Ui* ui) {
             pending_ui_action.store(static_cast<int>(action), std::memory_order_release);
         }
     }
-    GxmPresent::BeginFrame(0, 0, 0);
+    present_us[0].fetch_add(Since(t), std::memory_order_relaxed);
+    SgxdPresent::BeginFrame(0, 0, 0);
     // A frame being dumped leaves the menu out.
-    if (ui != nullptr && !GxmPresent::DumpPending()) {
+    if (ui != nullptr && !SgxdPresent::DumpPending()) {
         ui->Draw();
     }
-    GxmPresent::EndFrame();
+    present_us[2].fetch_add(Since(t), std::memory_order_relaxed);
+    SgxdPresent::EndFrame();
+    present_us[3].fetch_add(Since(t), std::memory_order_relaxed);
 }
 
 } // namespace VitaFrontend

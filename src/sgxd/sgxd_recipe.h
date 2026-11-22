@@ -18,6 +18,10 @@
 
 #include "sgxd.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 enum {
     SGXD_R_PT, SGXD_R_PAGES, SGXD_R_RGN0, SGXD_R_RGN1, SGXD_R_RGN2, SGXD_R_RGN3, SGXD_R_EXTZ,
     SGXD_R_TPC0, SGXD_R_TPC1, SGXD_R_TPC2, SGXD_R_TPC3, SGXD_R_BGREC, SGXD_R_FB, SGXD_R_DEPTH,
@@ -175,6 +179,13 @@ void sgxd_recipe_draw_textures(const SgxdRecipe *r, void *memory, uint32_t offse
                                const uint32_t (*words)[4]);
 void sgxd_recipe_draw_texture(const SgxdRecipe *r, void *memory, uint32_t offset, unsigned draw,
                               const uint32_t words[4]);
+// A linear U8U8U8U8 texture's four control words (SceGxmTexture, libgxm's for one level), as
+// test 08 ran them: DADJUST 31, MIPMAPCLAMP 15, U and V CLAMP; TEXTYPE LINEAR, format 0x0c,
+// width and height less one (1 to 4096); the address va; FCNORM, swizzle ABGR (R the lowest
+// byte). Bilinear sets MAGFILTER and MINFILTER (bits 12 and 10). Rows are width texels apart;
+// libgxm aligns a linear texture's rows to 8 texels, so keep width a multiple of 8.
+void sgxd_recipe_texture_words(uint32_t va, uint32_t width, uint32_t height, int bilinear,
+                               uint32_t words[4]);
 static inline uint32_t sgxd_recipe_sa_colour_offset(uint32_t offset, unsigned draw) {
     return offset + 0x40 * (draw + 1) + 0x30;
 }
@@ -226,5 +237,9 @@ void sgxd_recipe_3d_done(const SgxdRecipe *r, SgxdOpList *list);
 
 // The SLC flush, and with inval the invalidate (T0.1, T0.2). An invalidate only while idle.
 void sgxd_recipe_slc(SgxdOpList *list, int inval);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

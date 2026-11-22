@@ -7,10 +7,11 @@
 
 #include <imgui_vita2d/imgui.h>
 
-#include "citra_vita/imgui_impl_gxm.h"
+#include "citra_vita/imgui_impl_sgxd.h"
+#include "citra_vita/imgui_impl_vita.h"
 
 #include "citra_vita/emu_window_vita.h"
-#include "citra_vita/gxm_present.h"
+#include "citra_vita/sgxd_present.h"
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/vita_ui.h"
 #include "common/file_util.h"
@@ -76,21 +77,22 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     // The console is held at arm's length, so everything is a size up from a desktop default.
     ImGui::GetIO().FontGlobalScale = 1.2f;
 
-    ImGui_ImplGxm_Init();
-    // The backend has uploaded the font atlas to a GXM texture by now, and the pixels it was
+    ImGui_ImplVita_Init();
+    ImGui_ImplSgxd_Init();
+    // The backend has copied the font atlas into GPU memory by now, and the pixels it was
     // built from are 4 MB of heap nothing reads again. ImGui rebuilds them on demand if anything
     // ever does.
     ImGui::GetIO().Fonts->ClearTexData();
-    ImGui_ImplGxm_TouchUsage(true);
-    ImGui_ImplGxm_GamepadUsage(true);
-    ImGui_ImplGxm_MouseStickUsage(true);
+    ImGui_ImplVita_TouchUsage(true);
+    ImGui_ImplVita_GamepadUsage(true);
+    ImGui_ImplVita_MouseStickUsage(true);
 
     BuildSettings();
     ScanGames();
 }
 
 Ui::~Ui() {
-    ImGui_ImplGxm_Shutdown();
+    ImGui_ImplSgxd_Shutdown();
     ImGui::DestroyContext();
 }
 
@@ -348,7 +350,7 @@ Ui::Action Ui::DrawPauseMenu() {
 #ifdef VITA_DIAGNOSTICS
     if (ImGui::Button("Dump frame", button_size)) {
         // The next presented frame, without the menu, to ux0:data/azahar/frame_NN.ppm.
-        GxmPresent::DumpNextFrame();
+        SgxdPresent::DumpNextFrame();
     }
 #endif
     if (ImGui::Button("Quit game", button_size)) {
@@ -453,7 +455,7 @@ void Ui::DrawStatsHud() {
 }
 
 Ui::Action Ui::Update() {
-    ImGui_ImplGxm_NewFrame();
+    ImGui_ImplVita_NewFrame();
 
     Action action = Action::None;
     if (!status_message.empty()) {
@@ -493,7 +495,7 @@ Ui::Action Ui::Update() {
 }
 
 void Ui::Draw() {
-    ImGui_ImplGxm_RenderDrawData(ImGui::GetDrawData());
+    ImGui_ImplSgxd_RenderDrawData(ImGui::GetDrawData());
 }
 
 } // namespace VitaFrontend

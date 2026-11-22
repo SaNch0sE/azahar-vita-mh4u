@@ -25,6 +25,7 @@
 #include <psp2/vshbridge.h>
 #include <taihen.h>
 #include "citra_vita/gxm_present.h"
+#include "citra_vita/sgxd_present.h"
 
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/input_factory_vita.h"
@@ -520,7 +521,13 @@ std::string LoadAzaharNative(bool relaunched) {
                        static_cast<u32>(exec));
 }
 
+/// The system's message dialog, over GXM: only before sgxd has the GPU, or when it could not
+/// take it.
 void show_error_dialog(const std::string& message) {
+    if (!VitaFrontend::GxmPresent::Initialize()) {
+        LOG_CRITICAL(Frontend, "Could not bring up GXM for: {}", message);
+        return;
+    }
     SceMsgDialogUserMessageParam msg_param{};
     msg_param.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_OK;
     msg_param.msg = reinterpret_cast<const SceChar8*>(message.c_str());
@@ -536,6 +543,7 @@ void show_error_dialog(const std::string& message) {
         VitaFrontend::GxmPresent::SwapCommonDialog();
     }
     sceMsgDialogTerm();
+    VitaFrontend::GxmPresent::Shutdown();
 }
 
 /// The emulator proper. Runs on a thread of its own; see main.
@@ -551,27 +559,6 @@ int EmulatorMain() {
 
     // What stops the start comes first, in the menus' language: before anything else is set up
     // and before the startup notice. Closing it exits the app.
-    if (!VitaFrontend::GxmPresent::Initialize()) {
-        LOG_CRITICAL(Frontend, "Could not bring up GXM");
-        return -1;
-    }
-
-    SceGxmNotification notification{};
-    notification.address = sceGxmGetNotificationRegion();
-    notification.value = 0;
-    u32 test[1024] = {0};
-    u32 color = 0xdeadbeef;
-    int ret = sceGxmTransferFill(color, SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR, test, 0, 0, 1024, 1,
-                                 1024 * 4, nullptr, 0, &notification);
-    if (ret != SCE_OK) {
-        sceClibPrintf("Couldn't start sceGxmTransferFill %x\n", ret);
-    } else {
-        sceGxmNotificationWait(&notification);
-        for (int i = 0; i < 1024; ++i) {
-            sceClibPrintf("transfer fill %d %x\n", i, test[i]);
-        }
-    }
-
     {
         SceCommonDialogConfigParam dialog_config_param{};
         sceCommonDialogSetConfigParam(&dialog_config_param);
@@ -599,9 +586,19 @@ int EmulatorMain() {
     SetupNetwork();
     VitaFrontend::Multiplayer::Init();
 
-    // Presents never block this thread in a vblank wait: the display queue's own thread
-    // does the flip and the wait, and submission only blocks past two pending flips - which
-    // the run loop's own pacing keeps from happening.
+    // The GPU is sgxd's from here to the end of the session (docs/sgxd/takeover.md). No GXM call
+    // may follow: SceGpu's callers would wait at its gate.
+    std::string sgxd_error;
+    if (!VitaFrontend::SgxdPresent::Initialize(&sgxd_error)) {
+        LOG_CRITICAL(Frontend, "{}", sgxd_error);
+        sceClibPrintf("[azahar] %s\n", sgxd_error.c_str());
+        show_error_dialog(sgxd_error);
+        return -1;
+    }
+
+    // A present waits until the frame before it is on screen (SgxdPresent::EndFrame), so this
+    // thread runs at most one frame ahead of the display. A flip thread would lift that (the
+    // plan's 5.2); the menus do not need it.
     // The PS button would otherwise hand the display to the home menu, which this process does
     // not survive once a core is taken; locked, its presses appear in the pad data instead, and
     // the run loop opens the pause menu on them. The quick menu lock keeps the power slider out
@@ -670,7 +667,7 @@ int EmulatorMain() {
     sceShellUtilUnlock(static_cast<SceShellUtilLockType>(SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN |
                                                          SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN_2 |
                                                          SCE_SHELL_UTIL_LOCK_TYPE_QUICK_MENU));
-    VitaFrontend::GxmPresent::Shutdown();
+    VitaFrontend::SgxdPresent::Shutdown();
     return 0;
 }
 } // Anonymous namespace

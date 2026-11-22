@@ -20,14 +20,14 @@ class EmuWindowVita;
 
 /**
  * The on-screen interface: a game list before anything is running and a pause menu over a
- * running title, drawn with Dear ImGui through the raw-GXM backend (imgui_impl_gxm).
+ * running title, drawn with Dear ImGui through sgxd (imgui_impl_sgxd).
  *
  * Structure follows DSVita's, which is the working reference for this shape of interface on this
  * console: one menu that owns the loop while it is open, a settings body shared between the
  * pre-launch and in-game paths with the in-game one showing only what can be changed while a
  * title runs, and gamepad navigation as the primary input with touch alongside it.
  *
- * Every method here runs on the emulation thread, which is the thread that owns GXM.
+ * Every method here runs on the emulation thread, which is the thread that presents.
  */
 class Ui {
 public:
@@ -49,7 +49,7 @@ public:
     /// before Draw.
     Action Update();
 
-    /// Issues the built frame's draw commands. Must be called inside a GxmPresent frame.
+    /// Issues the built frame's draw commands. Must be called inside an SgxdPresent frame.
     void Draw();
 
     /// True while a menu owns the input and the emulation should not advance.

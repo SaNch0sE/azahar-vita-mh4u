@@ -22,15 +22,22 @@ add_executable(citra_vita
     emu_window_vita.h
     gxm_present.cpp
     gxm_present.h
-    imgui_impl_gxm.cpp
-    imgui_impl_gxm.h
+    imgui_impl_sgxd.cpp
+    imgui_impl_sgxd.h
+    imgui_impl_vita.cpp
+    imgui_impl_vita.h
     input_factory_vita.cpp
     input_factory_vita.h
+    sgxd_present.cpp
+    sgxd_present.h
+    ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_recipe.c
+    ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_session.c
     vita_ui.cpp
     vita_ui.h
     "${GXM_SHADER_HEADER}"
 )
-target_include_directories(citra_vita PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(citra_vita PRIVATE "${CMAKE_CURRENT_BINARY_DIR}"
+                                              "${CMAKE_SOURCE_DIR}/src/sgxd")
 
 # The shims must survive LTO. clang only emits the call to __aeabi_h2f during code generation,
 # which happens after LTO has decided what to keep - so with the shim in bitcode, LLVM sees a

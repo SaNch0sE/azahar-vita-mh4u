@@ -22,7 +22,7 @@ class Ui;
 /**
  * The Vita's window, such as it is: a fixed 960x544 display with no window system above it.
  *
- * Every GXM call happens on the emulation thread. A finished frame is presented from
+ * Every present happens on the emulation thread. A finished frame is presented from
  * SwapBuffers, which the renderer calls at the end of each guest frame.
  *
  * The interface is drawn there too: ImGui's frame is built and rendered inside that same call,

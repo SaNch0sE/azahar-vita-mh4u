@@ -139,6 +139,13 @@ static int imgui_uv(const SgxdRecipe *r) {
 static int imgui_texel(const SgxdRecipe *r) {
     return r->imgui_fs == SGXD_IMGUI_TEXEL || r->imgui_fs == SGXD_IMGUI_MODULATE;
 }
+// A PDS part's room in the layout: 0x40 bytes, TERM and PIXEV 0x80, and FPRIM 0x80 in the
+// texture modes, whose FPRIM carries the texture's four words (17 words with them; in 0x40 its
+// last word would land on BGSEC's DOUTD address when sgxd_recipe_set_texture rewrites it).
+static uint32_t pds_slot(const SgxdRecipe *r, unsigned part) {
+    return part == SGXD_R_TERM || part == SGXD_R_PIXEV ||
+           (part == SGXD_R_FPRIM && imgui_texel(r)) ? 0x80u : 0x40u;
+}
 
 // Its fragment program, the pixel's iterated base colour (four F32 lanes in pa0..pa3) to o0 as
 // four unorm bytes: a pack of F32 to F16 into pa0 and one of F16 to U8 scaled into o0, with END.
@@ -678,7 +685,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     L[SGXD_R_PDS] = o;
     for (unsigned s = SGXD_R_COPY; s <= SGXD_R_IDLE; s++) {
         L[s] = o;
-        o += s == SGXD_R_TERM || s == SGXD_R_PIXEV ? 0x80 : 0x40;
+        o += pds_slot(r, s);
     }
     // The other draws' state copies, consecutive; the unused parts of COPY1..COPY7 take no room.
     for (unsigned n = 1; n < 8; n++) {
@@ -1251,13 +1258,26 @@ void sgxd_recipe_set_clip(const SgxdRecipe *r, void *memory, unsigned draw, uint
     state[11] = clip_y(r, clip);
 }
 
+void sgxd_recipe_texture_words(uint32_t va, uint32_t width, uint32_t height, int bilinear,
+                               uint32_t words[4]) {
+    words[0] = 0x03fe0090u | (bilinear ? 1u << 12 | 1u << 10 : 0);
+    words[1] = 0x6c000000u | (width - 1) << 12 | (height - 1);
+    words[2] = va;
+    words[3] = 0x80000000u;
+}
+
 void sgxd_recipe_set_texture(const SgxdRecipe *r, void *memory, const uint32_t words[4]) {
     Code cf[CF_COUNT];
     Pds p;
     uint32_t program[SGXD_RECIPE_TEX_PDS / 4];
     make_cf(r, cf);
     imgui_prim(r, cf, &p, words);
-    put(memory, r->offset[SGXD_R_FPRIM], program, pds_words(&p, program));
+    const unsigned n = pds_words(&p, program);
+    // The layout gives FPRIM the room of the texture program in these modes (pds_slot); a
+    // longer program would run into BGSEC.
+    if (imgui_texel(r) && n * 4 <= pds_slot(r, SGXD_R_FPRIM)) {
+        put(memory, r->offset[SGXD_R_FPRIM], program, n);
+    }
 }
 
 void sgxd_recipe_draw_texture(const SgxdRecipe *r, void *memory, uint32_t offset, unsigned draw,
