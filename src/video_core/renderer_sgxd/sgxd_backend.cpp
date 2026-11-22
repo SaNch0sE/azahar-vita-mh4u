@@ -137,6 +137,9 @@ SgxdBackend::SgxdBackend() {
     // Four macrotiles a side at every size: the cores' loads then follow the scene's quadrants.
     sgxd_recipe_grid = 4;
 #ifdef VITA_DIAGNOSTICS
+    if (const unsigned stall = GxmFlagValue("gpustall")) {
+        sgxd_chain_stall_us = stall * 1000000u;
+    }
 #endif
 }
 

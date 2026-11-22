@@ -679,6 +679,27 @@ void GSP_GPU::TriggerCmdReqQueue(Kernel::HLERequestContext& ctx) {
 
         // Decode and execute command
         system.perf_stats->BeginGPUProcessing();
+#ifdef VITA_MULTICORE
+#ifdef VITA_MULTICORE
+        if (system.IsParallel()) {
+            // Parallel cores: the work runs without the HLE lock, so the other core's svcs go on
+            // meanwhile. The GPU's lock is taken first, so commands
+            // still execute in queue order across threads; it is let go before the HLE lock is
+            // taken back, so nothing waits for the HLE lock while holding it. The interrupts the
+            // work raises wait for the HLE lock (GPU::BeginUnlockedWork).
+            auto& hle = system.Kernel().GetHLELock();
+            std::unique_lock gpu_lock{gpu.Lock()};
+            const u32 held = hle.ReleaseAll();
+            gpu.BeginUnlockedWork();
+            gpu.Execute(command);
+            gpu.EndUnlockedWork();
+            gpu_lock.unlock();
+            hle.Reacquire(held);
+            gpu.FlushDeferredInterrupts();
+        } else {
+            gpu.Execute(command);
+        }
+#else
         gpu.Execute(command);
         system.perf_stats->EndGPUProcessing();
 

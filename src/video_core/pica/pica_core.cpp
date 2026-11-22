@@ -179,8 +179,7 @@ struct PicaCore::Dispatch {
         if (any_byte_match(p.regs.internal.reg_array[id], p.regs.internal.irq_compare))
             [[likely]] {
             p.rasterizer->NotifyP3D();
-            p.signal_interrupt(Service::GSP::InterruptId::P3D,
-                               p.delay_generator.CalculateAndResetDelay());
+            p.signal_interrupt(Service::GSP::InterruptId::P3D, 0);
             if (p.regs.internal.irq_autostop) [[likely]] {
                 stop_requested = true;
             }
@@ -647,7 +646,7 @@ static_assert(sizeof(RegImplInfo) == sizeof(u16), "the loop reads the flags as h
 void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     if (ignore_list) {
         rasterizer->NotifyP3D();
-        signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
+        signal_interrupt(Service::GSP::InterruptId::P3D, 0);
         return;
     }
 
@@ -704,7 +703,6 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
                         reinterpret_cast<u8*>(dirty_regs.qwords.data()), &run);
                 }
                 if (run > 0) {
-                    delay_generator.AddCommands(run);
                     cmd_list.current_index = index;
                     if (index + 1 >= cmd_list.length) {
                         continue;
@@ -736,7 +734,6 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
 
                 // Process the commands that we have read so far (up to 4).
                 if (run > 0) {
-                    delay_generator.AddCommands(run);
                     for (u32 i = 0; i < run; ++i) {
                         const u32 id = ids[i];
                         const u32 write_mask = ExpandBitsToBytes[masks[i]];
@@ -839,7 +836,6 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
         return;
     }
 
-    delay_generator.AddCommands(count);
     if (immediate_open && !IsImmediateData(id)) {
         FlushImmediate();
     }
@@ -897,7 +893,6 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         const u32 batch_count =
             std::min<u32>(reg_impl_flags_lut[reg].RegsUntilSpecial(), count - offset);
         if (batch_count > 0) {
-            delay_generator.AddCommands(batch_count);
 
             // Allows the compiler to auto-vectorize thanks to the __restrict keywords.
             // Verified in MSVC that vectorization is happening.
@@ -953,7 +948,6 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
         return;
     }
 
-    delay_generator.AddCommands(1);
 
     if (immediate_open && !IsImmediateData(id)) {
         FlushImmediate();
@@ -1152,8 +1146,6 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }();
 
     // Add vertices to the delay generator.
-    delay_generator.AddVertices(regs.internal.pipeline.num_vertices,
-                                regs.internal.pipeline.triangle_topology);
 
     // Attempt to use hardware vertex shaders if possible.
     if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {

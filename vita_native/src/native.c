@@ -120,10 +120,10 @@ static int azahar_log_enabled(void) {
 
 static void log_open(void) {
     if (!azahar_log_enabled()) {
+        // Muted from the first native call on, and never unmuted by one: emit's buffer must not
+        // see a second writer. The probe stages in main.c run at module_start, before any native
+        // call.
         azahar_mute = 1;
-        out_fd = -1;
-        buf_len = 0;
-        log_sync = 0;
         return;
     }
     azahar_mute = 0;
@@ -137,6 +137,9 @@ static void log_open(void) {
 }
 
 static void log_close(void) {
+    if (!azahar_log_enabled()) {
+        return;
+    }
     if (azahar_mute) {
         // The mute lasts exactly as long as the native call: the probe stages in main.c share
         // emit() and log for their own reasons.
@@ -277,15 +280,9 @@ static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at ma
 enum { CMD_NONE, CMD_INSTALL, CMD_RUN, CMD_UNINSTALL };
 static volatile uint32_t azahar_cmd, azahar_cmd_done, azahar_cmd_status;
 static volatile uint32_t azahar_heartbeat, azahar_on_core, azahar_stop, azahar_park;
-static volatile uint32_t azahar_guest_on; // 0x100 | the core while it runs the guest (prof.c)
 
 static volatile uint32_t azahar_core2_vbar, azahar_core2_cpsr, azahar_core2_ttbr1, azahar_core2_sp;
 
-// Saved on core 2 at install, restored at uninstall.
-static volatile uint32_t sv_ttbcr, sv_ttbr0, sv_ctxid, sv_vbar, sv_sp_und, sv_sp_abt, sv_tpidruro;
-static volatile uint32_t sv_tpidrurw, sv_cpacr, sv_fpexc;
-static uint32_t sv_fpscr;
-static uint64_t sv_vfp_bank[32];
 
 static inline uint32_t rd_tpidrurw(void) {
     uint32_t v;
@@ -320,18 +317,9 @@ static void vfp_bank_save(uint64_t *p) {
 static void vfp_bank_load(const uint64_t *p) {
     asm volatile(".fpu neon \n vldmia %0!, {d0-d15} \n vldmia %0, {d16-d31}" : "+r"(p));
 }
-static volatile uint32_t azahar_ttbcr_seen;
-
-// The guest context and the host block live here, word aligned; entry.S addresses them through
-// azahar_ctx_ptr / azahar_host_ptr.
-static AzaharContext azahar_ctx __attribute__((aligned(8)));
-static uint32_t azahar_host[4] __attribute__((aligned(8)));
-static volatile uint32_t azahar_run_reason, azahar_run_svc, azahar_run_fsr, azahar_run_far, azahar_run_spsr,
-    azahar_run_rawlr, azahar_run_pmr_before, azahar_run_pmr_after;
-
 // The svcs answered in the guest's own world (azahar_native.h, AZAHAR_FAST_*): entry.S's
-// azahar_svc_fast reads this and counts in it; azaharRun fills it for each slice. The offsets are
-// entry.S's FAST_* and are checked below.
+// azahar_svc_fast reads a core's and counts in it; azaharRun fills it for each slice. The
+// offsets are entry.S's FAST_* and are checked below.
 typedef struct AzaharFast {
     uint32_t on;          // AZAHAR_FAST_* bits allowed this slice
     uint32_t timer;       // the private timer's counter register, 0 when the slice has no timer
@@ -343,46 +331,122 @@ typedef struct AzaharFast {
     uint32_t count[AZAHAR_FAST_KINDS]; // answered this slice
     uint32_t save[4];     // the guest's r4-r7 while the vector works
 } AzaharFast;
-AzaharFast azahar_fast __attribute__((aligned(8)));
 _Static_assert(__builtin_offsetof(AzaharFast, mult_int) == 0x0c, "entry.S FAST_MULT_INT");
 _Static_assert(__builtin_offsetof(AzaharFast, base_lo) == 0x14, "entry.S FAST_BASE_LO");
 _Static_assert(__builtin_offsetof(AzaharFast, process_id) == 0x20, "entry.S FAST_PROCESS_ID");
 _Static_assert(__builtin_offsetof(AzaharFast, count) == 0x24, "entry.S FAST_COUNT");
 _Static_assert(__builtin_offsetof(AzaharFast, save) == 0x34, "entry.S FAST_SAVE");
-// The guest clock rate and timer clock mult_int/mult_frac were made for.
-static uint64_t azahar_fast_tick_hz;
-static uint32_t azahar_fast_timer_hz;
 
-// Private-timer ticks as guest ticks, as azahar_svc_fast computes them: monotonic in `spent`.
-static uint64_t fast_guest_ticks(uint32_t spent) {
-    return (uint64_t)spent * azahar_fast.mult_int + (((uint64_t)spent * azahar_fast.mult_frac) >> 32);
+// One block per Vita core (MPIDR & 3): a slice on a core reads and writes its own only. This is
+// entry.S's part, its CPU_* offsets checked below, with the context first so that a stub's SP
+// after it saved the user file is the block. VBAR is banked per core, and each core's vector
+// table (azahar_vec + AZAHAR_VEC_STRIDE * core) names that core's copy of the stubs.
+typedef struct AzaharCpu {
+    AzaharContext ctx;
+    uint32_t host[4];             // host cpsr, host sp, Sony's SP_svc, ctx
+    volatile uint32_t guest_active;
+    // Where the slice got to: 1-3 C before entry; 10-11 entry asm; 31-35 the user file was
+    // saved; 40-41 back in host mode; 42-50 back in C.
+    volatile uint32_t progress;
+    // A stub's word equal to its own address means that exception was taken.
+    volatile uint32_t prog_und, prog_svc, prog_pabt, prog_dabt, prog_irq;
+    volatile uint32_t stray_retry;
+    uint32_t exit_info[7];        // reason, raw lr, spsr, dfsr, dfar, ifsr, ifar
+    volatile uint32_t irq_last, irq_stray;
+    // {saved SP for the mode, Sony's handler} per vector, filled at install
+    uint32_t chain_und[2], chain_svc[2], chain_pabt[2], chain_dabt[2], chain_irq[2];
+    volatile uint32_t stray[8];   // count, reason, lr, spsr, dfsr, dfar, ifsr, ifar
+    uint32_t pad0;
+    AzaharFast fast;
+    uint32_t pad1;
+    uint8_t stray_stack[64];
+    uint8_t irq_stack[64];
+    uint32_t guard[2];            // both stacks' tops stay inside the block
+} AzaharCpu;
+#define AZAHAR_CORES 4u
+extern AzaharCpu azahar_cpu[AZAHAR_CORES]; // entry.S's .bss
+_Static_assert(__builtin_offsetof(AzaharCpu, host) == 0x150, "entry.S CPU_HOST");
+_Static_assert(__builtin_offsetof(AzaharCpu, guest_active) == 0x160, "entry.S CPU_ACTIVE");
+_Static_assert(__builtin_offsetof(AzaharCpu, progress) == 0x164, "entry.S CPU_PROGRESS");
+_Static_assert(__builtin_offsetof(AzaharCpu, prog_und) == 0x168, "entry.S CPU_PROG_UND");
+_Static_assert(__builtin_offsetof(AzaharCpu, prog_irq) == 0x178, "entry.S CPU_PROG_IRQ");
+_Static_assert(__builtin_offsetof(AzaharCpu, stray_retry) == 0x17c, "entry.S CPU_STRAY_RETRY");
+_Static_assert(__builtin_offsetof(AzaharCpu, exit_info) == 0x180, "entry.S CPU_EXIT");
+_Static_assert(__builtin_offsetof(AzaharCpu, irq_last) == 0x19c, "entry.S CPU_IRQ_LAST");
+_Static_assert(__builtin_offsetof(AzaharCpu, irq_stray) == 0x1a0, "entry.S CPU_IRQ_STRAY");
+_Static_assert(__builtin_offsetof(AzaharCpu, chain_und) == 0x1a4, "entry.S CPU_CHAIN_UND");
+_Static_assert(__builtin_offsetof(AzaharCpu, chain_svc) == 0x1ac, "entry.S CPU_CHAIN_SVC");
+_Static_assert(__builtin_offsetof(AzaharCpu, chain_pabt) == 0x1b4, "entry.S CPU_CHAIN_PABT");
+_Static_assert(__builtin_offsetof(AzaharCpu, chain_dabt) == 0x1bc, "entry.S CPU_CHAIN_DABT");
+_Static_assert(__builtin_offsetof(AzaharCpu, chain_irq) == 0x1c4, "entry.S CPU_CHAIN_IRQ");
+_Static_assert(__builtin_offsetof(AzaharCpu, stray) == 0x1cc, "entry.S CPU_STRAY");
+_Static_assert(__builtin_offsetof(AzaharCpu, fast) == 0x1f0, "entry.S CPU_FAST");
+_Static_assert(__builtin_offsetof(AzaharCpu, stray_stack) + 64 == 0x278, "entry.S CPU_STRAY_STACK_TOP");
+_Static_assert(__builtin_offsetof(AzaharCpu, irq_stack) + 64 == 0x2b8, "entry.S CPU_IRQ_STACK_TOP");
+_Static_assert(sizeof(AzaharCpu) == 0x2c0, "entry.S CPU_SIZE");
+
+// The rest of a core's state, C's alone: Sony's registers saved at install and put back at
+// uninstall, the private timer's clock, and the slice's figures.
+typedef struct AzaharCore {
+    volatile uint32_t sv_ttbcr, sv_ttbr0, sv_ctxid, sv_vbar, sv_sp_und, sv_sp_abt, sv_sp_svc;
+    volatile uint32_t sv_sp_irq, sv_tpidruro, sv_tpidrurw, sv_cpacr, sv_fpexc, sv_pmr;
+    volatile uint32_t sv_isenabler_timer;
+    uint32_t sv_fpscr;
+    uint64_t sv_vfp_bank[32];
+    volatile uint32_t ttbcr_seen;
+    uint32_t timer_hz;            // this core's private timer, measured on it
+    volatile uint32_t quantum_ticks, timer_left;
+    volatile uint32_t run_reason, run_svc, run_fsr, run_far, run_spsr, run_rawlr;
+    volatile uint32_t run_pmr_before, run_pmr_after;
+    // The guest clock rate and timer clock fast.mult_int/mult_frac were made for.
+    uint64_t fast_tick_hz;
+    uint32_t fast_timer_hz;
+    // azaharMap's core: azaharRun runs a slice here only then.
+    uint32_t attached;
+    // The azahar_code_gen this core's instruction cache last caught up with (core2_install).
+    uint32_t code_gen;
+    AzaharRunRequest run_req;
+} AzaharCore;
+static AzaharCore azahar_core[AZAHAR_CORES];
+
+// The core this runs on. Not ksceKernelCpuId: nothing of Sony's kernel is mapped once a core is
+// sealed (a call to it there takes a prefetch abort).
+static inline unsigned this_core(void) {
+    uint32_t mpidr;
+    asm volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
+    return mpidr & 3u;
 }
 
-extern int azahar_enter(AzaharContext *ctx, uint32_t *host);
+// Private-timer ticks as guest ticks, as azahar_svc_fast computes them: monotonic in `spent`.
+static uint64_t fast_guest_ticks(const AzaharFast *fast, uint32_t spent) {
+    return (uint64_t)spent * fast->mult_int + (((uint64_t)spent * fast->mult_frac) >> 32);
+}
+
+extern int azahar_enter(AzaharCpu *cpu);
 extern uint32_t azahar_get_banked_sp(uint32_t mode);
 extern void azahar_set_banked_sp(uint32_t mode, uint32_t sp);
-extern void azahar_vec_und(void);
-extern void azahar_vec_svc(void);
-extern void azahar_vec_pabt(void);
-extern void azahar_vec_dabt(void);
-extern uint32_t azahar_exit_info[7];
-extern volatile uint32_t azahar_progress, azahar_prog_und, azahar_prog_svc, azahar_prog_pabt, azahar_prog_dabt;
-extern volatile uint32_t azahar_guest_active, azahar_stray[8];
-extern uint32_t azahar_chain_und[2], azahar_chain_svc[2], azahar_chain_pabt[2], azahar_chain_dabt[2];
-extern uint32_t azahar_chain_irq[2];
-extern volatile uint32_t azahar_prog_irq, azahar_gic_va, azahar_irq_last, azahar_irq_stray, azahar_seal_flag;
-extern void azahar_vec_irq(void);
-extern uint8_t azahar_stray_stack_top[], azahar_irq_stack_top[];
-extern volatile uint32_t azahar_stray_retry;
+extern volatile uint32_t azahar_gic_va, azahar_seal_flag;
+// Each core's stubs, in the order its vector table names them: und, svc, pabt, dabt, irq.
+#define AZAHAR_STUBS(n)                                                                        \
+    extern void azahar_vec_und_##n(void), azahar_vec_svc_##n(void), azahar_vec_pabt_##n(void), \
+        azahar_vec_dabt_##n(void), azahar_vec_irq_##n(void)
+AZAHAR_STUBS(0);
+AZAHAR_STUBS(1);
+AZAHAR_STUBS(2);
+AZAHAR_STUBS(3);
+#define AZAHAR_STUB_ROW(n)                                                                     \
+    {azahar_vec_und_##n, azahar_vec_svc_##n, azahar_vec_pabt_##n, azahar_vec_dabt_##n,         \
+     azahar_vec_irq_##n}
+static void (*const azahar_stubs[AZAHAR_CORES][5])(void) = {
+    AZAHAR_STUB_ROW(0), AZAHAR_STUB_ROW(1), AZAHAR_STUB_ROW(2), AZAHAR_STUB_ROW(3)};
+// One vector table per core in the vector page: Sony's 16 words and our five handler words.
+#define AZAHAR_VEC_STRIDE 0x80u
 // taiHEN's module utility, imported but not declared by any header vitasdk installs.
 extern int module_get_offset(SceUID pid, SceUID modid, int segidx, size_t offset,
                              uintptr_t *addr);
 
 #define MODE_IRQ 0x12u
-static volatile uint32_t sv_sp_irq, sv_isenabler_timer;
 static volatile uint32_t azahar_timer_sample;   // idle loop: the free-running counter
-static uint32_t azahar_timer_hz;                // measured at map
-static volatile uint32_t azahar_run_quantum_ticks, azahar_run_timer_left;
 static volatile uint32_t azahar_tlb_dirty;      // an edit happened since the guest last ran
 static uint32_t azahar_run_count;
 // Core-2 side: our table/vectors/PMR are in (set at the end of core2_install, cleared first
@@ -401,10 +465,30 @@ static int azahar_verbose;
 static int azahar_folded = 1;
 // The instruction cache is invalidated when the guest's code may have changed under us, not
 // on every install: folded mode installs once per slice, and an ICIALLU each time would throw
-// away the emulation thread's own cached code three thousand times a second. The map and every
-// azaharEdit set it, core2_install consumes it, and core2_run's azahar_tlb_dirty path does the same
-// job for a descriptor change mid-session.
-static volatile uint32_t azahar_icache_stale = 1;
+// away the emulation thread's own cached code. Every edit that
+// can change what an address executes bumps the generation (tables_changed); each core's
+// install, and core2_run's azahar_tlb_dirty path, catch up with it on that core.
+static volatile uint32_t azahar_code_gen = 1;
+// Serialises the table and L2 pool edits (azaharEdit, azaharHold). Created by the first folded
+// azaharTakeCore.
+static SceUID azahar_edit_mutex = -1;
+
+static void detach_all(void) {
+    for (unsigned n = 0; n < AZAHAR_CORES; n++) {
+        azahar_core[n].attached = 0;
+    }
+}
+
+// After descriptors changed (`code`: and what an address executes may have): the attached core
+// drops its stale translations at its next install (core2_switch's TLBIALL) and, for a new code
+// generation, its instruction cache.
+static void tables_changed(int code) {
+    asm volatile("dsb ish" ::: "memory");
+    azahar_tlb_dirty = 1;
+    if (code) {
+        azahar_code_gen++;
+    }
+}
 
 static int azahar_resident_requested(void) {
     const SceUID fd = ksceIoOpen(OUT_DIR "/resident", SCE_O_RDONLY, 0);
@@ -416,7 +500,6 @@ static int azahar_resident_requested(void) {
 }
 
 #define MODE_SVC 0x13u
-static volatile uint32_t sv_sp_svc, sv_pmr;
 
 #define MODE_UND 0x1Bu
 #define MODE_ABT 0x17u
@@ -449,42 +532,44 @@ static void core2_switch(uint32_t ttbcr, uint32_t ttbr0, uint32_t ctxid, int ica
     }
 }
 
-static void core2_install(void) {
+static void core2_install(unsigned n) {
+    AzaharCpu *const cpu = &azahar_cpu[n];
+    AzaharCore *const core = &azahar_core[n];
     // Own the core from here on: nothing of Sony's is delivered to it while our table is in.
     // The 2026-08-29 run that left interrupts open between install and the first run took a
     // prefetch abort within 0.1 s — Sony's IRQ path running under a copy of its L1 that had
     // already gone stale.
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
     if (pmr) {
-        sv_pmr = *pmr & 0xFFu;
+        core->sv_pmr = *pmr & 0xFFu;
         *pmr = AZAHAR_PMR_MASK;
         asm volatile("dsb \n isb" ::: "memory");
     }
 
-    sv_ttbcr = rd_ttbcr();
-    sv_ttbr0 = rd_ttbr0();
-    sv_ctxid = rd_contextidr();
-    sv_vbar = rd_vbar();
-    sv_tpidruro = rd_tpidruro();
-    sv_tpidrurw = rd_tpidrurw();
+    core->sv_ttbcr = rd_ttbcr();
+    core->sv_ttbr0 = rd_ttbr0();
+    core->sv_ctxid = rd_contextidr();
+    core->sv_vbar = rd_vbar();
+    core->sv_tpidruro = rd_tpidruro();
+    core->sv_tpidrurw = rd_tpidrurw();
     // The VFP, for the guest and for entry.S's own vldm/vstm: cp10/cp11 open at both privilege
     // levels, FPEXC.EN set. Sony's threads are lazily given the VFP on first use; this core is
     // no longer Sony's, so it is simply on.
-    sv_cpacr = rd_cpacr();
-    wr_cpacr(sv_cpacr | (0xFu << 20));
-    sv_fpexc = rd_fpexc_here();
-    wr_fpexc(sv_fpexc | (1u << 30));
+    core->sv_cpacr = rd_cpacr();
+    wr_cpacr(core->sv_cpacr | (0xFu << 20));
+    core->sv_fpexc = rd_fpexc_here();
+    wr_fpexc(core->sv_fpexc | (1u << 30));
     // The whole register bank and FPSCR belong to whichever Sony thread lazily owned the VFP
     // on this core, and the guest is about to clobber both. Hand back at uninstall exactly
     // what was here: a guest FPSCR with exception bits left live panicked Sony's first VFP
     // operation after release ("VFP/NEON exception occurred in kernel thread", 2026-08-30).
-    sv_fpscr = rd_fpscr_here();
-    vfp_bank_save(sv_vfp_bank);
-    sv_sp_und = azahar_get_banked_sp(MODE_UND);
-    sv_sp_abt = azahar_get_banked_sp(MODE_ABT);
-    sv_sp_svc = azahar_get_banked_sp(MODE_SVC);
-    sv_sp_irq = azahar_get_banked_sp(MODE_IRQ);
-    azahar_chain_irq[0] = sv_sp_irq;
+    core->sv_fpscr = rd_fpscr_here();
+    vfp_bank_save(core->sv_vfp_bank);
+    core->sv_sp_und = azahar_get_banked_sp(MODE_UND);
+    core->sv_sp_abt = azahar_get_banked_sp(MODE_ABT);
+    core->sv_sp_svc = azahar_get_banked_sp(MODE_SVC);
+    core->sv_sp_irq = azahar_get_banked_sp(MODE_IRQ);
+    cpu->chain_irq[0] = core->sv_sp_irq;
     azahar_gic_va = gic_va;
     azahar_seal_flag = AZAHAR_SEAL;
 
@@ -493,7 +578,7 @@ static void core2_install(void) {
     // measured against the system clock from the idle loop's samples.
     if (pmr) {
         volatile uint32_t *const isen = (volatile uint32_t *)(gic_va + GICD_ISENABLER0);
-        sv_isenabler_timer = (*isen >> PTIMER_PPI) & 1u;
+        core->sv_isenabler_timer = (*isen >> PTIMER_PPI) & 1u;
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
         *(volatile uint32_t *)(gic_va + PTIMER_STATUS) = 1;
         *(volatile uint32_t *)(gic_va + PTIMER_LOAD) = 0xFFFFFFFFu;
@@ -504,65 +589,68 @@ static void core2_install(void) {
 
     // The stray-exception chains: this mode's SP and Sony's handler, decoded from Sony's own
     // vector instruction (azahar_sony_target, at map time).
-    azahar_chain_und[0] = sv_sp_und;
-    azahar_chain_und[1] = azahar_sony[1];
-    azahar_chain_svc[0] = sv_sp_svc;
-    azahar_chain_svc[1] = azahar_sony[2];
-    azahar_chain_pabt[0] = sv_sp_abt;
-    azahar_chain_pabt[1] = azahar_sony[3];
-    azahar_chain_dabt[0] = sv_sp_abt;
-    azahar_chain_dabt[1] = azahar_sony[4];
-    azahar_guest_active = 0;
-    azahar_stray_retry = 0;
+    cpu->chain_und[0] = core->sv_sp_und;
+    cpu->chain_und[1] = azahar_sony[1];
+    cpu->chain_svc[0] = core->sv_sp_svc;
+    cpu->chain_svc[1] = azahar_sony[2];
+    cpu->chain_pabt[0] = core->sv_sp_abt;
+    cpu->chain_pabt[1] = azahar_sony[3];
+    cpu->chain_dabt[0] = core->sv_sp_abt;
+    cpu->chain_dabt[1] = azahar_sony[4];
+    cpu->guest_active = 0;
+    cpu->stray_retry = 0;
     for (unsigned i = 0; i < 8; i++) {
-        azahar_stray[i] = 0;
+        cpu->stray[i] = 0;
     }
     asm volatile("dsb" ::: "memory");
 
     // N = 0: the table base is bits [31:14].
-    const uint32_t ours = ((uint32_t)azahar_l1_pa & 0xFFFFC000u) | (sv_ttbr0 & 0x3FFFu);
-    core2_switch(sv_ttbcr & ~7u, ours, sv_ctxid, (int)azahar_icache_stale);
-    azahar_icache_stale = 0;
-    azahar_ttbcr_seen = rd_ttbcr();
+    const uint32_t ours = ((uint32_t)azahar_l1_pa & 0xFFFFC000u) | (core->sv_ttbr0 & 0x3FFFu);
+    const uint32_t gen = azahar_code_gen;
+    core2_switch(core->sv_ttbcr & ~7u, ours, core->sv_ctxid, core->code_gen != gen);
+    core->code_gen = gen;
+    core->ttbcr_seen = rd_ttbcr();
 
-    // Our vectors, executable only because our table says so.
-    asm volatile("mcr p15, 0, %0, c12, c0, 0 \n isb" ::"r"(azahar_vec_va) : "memory");
+    // Our vectors, this core's table, executable only because our table says so.
+    asm volatile("mcr p15, 0, %0, c12, c0, 0 \n isb" ::"r"(azahar_vec_va + n * AZAHAR_VEC_STRIDE)
+                 : "memory");
     azahar_installed = 1;
     azahar_cmd_status = 0;
 }
 
-static void core2_uninstall(void) {
+static void core2_uninstall(unsigned n) {
+    AzaharCore *const core = &azahar_core[n];
     azahar_installed = 0;
-    asm volatile("mcr p15, 0, %0, c12, c0, 0 \n isb" ::"r"(sv_vbar) : "memory");
-    core2_switch(sv_ttbcr, sv_ttbr0, sv_ctxid, 0);
-    azahar_set_banked_sp(MODE_UND, sv_sp_und);
-    azahar_set_banked_sp(MODE_ABT, sv_sp_abt);
+    asm volatile("mcr p15, 0, %0, c12, c0, 0 \n isb" ::"r"(core->sv_vbar) : "memory");
+    core2_switch(core->sv_ttbcr, core->sv_ttbr0, core->sv_ctxid, 0);
+    azahar_set_banked_sp(MODE_UND, core->sv_sp_und);
+    azahar_set_banked_sp(MODE_ABT, core->sv_sp_abt);
     // Never the mode we are running in: azahar_set_banked_sp writes the live stack pointer, and
     // install and uninstall do not stand at the same depth, so this would move the stack under
     // the caller and it would return into nothing. Both designs install from SVC, so SVC is
     // the entry that has to be skipped; UND, ABT and IRQ are always foreign here.
     if ((rd_cpsr() & 0x1Fu) != MODE_SVC) {
-        azahar_set_banked_sp(MODE_SVC, sv_sp_svc);
+        azahar_set_banked_sp(MODE_SVC, core->sv_sp_svc);
     }
-    azahar_set_banked_sp(MODE_IRQ, sv_sp_irq);
-    wr_tpidruro(sv_tpidruro);
-    wr_tpidrurw(sv_tpidrurw);
+    azahar_set_banked_sp(MODE_IRQ, core->sv_sp_irq);
+    wr_tpidruro(core->sv_tpidruro);
+    wr_tpidrurw(core->sv_tpidrurw);
     // Bank and FPSCR back before FPEXC/CPACR close the door (and before the PMR reopens
     // interrupts: Sony's IRQ path must never see the guest's VFP state).
-    vfp_bank_load(sv_vfp_bank);
-    wr_fpscr(sv_fpscr);
-    wr_fpexc(sv_fpexc);
-    wr_cpacr(sv_cpacr);
+    vfp_bank_load(core->sv_vfp_bank);
+    wr_fpscr(core->sv_fpscr);
+    wr_fpexc(core->sv_fpexc);
+    wr_cpacr(core->sv_cpacr);
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
     if (pmr) {
         // Timer off and its PPI back to disabled before the mask lifts.
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
         *(volatile uint32_t *)(gic_va + PTIMER_STATUS) = 1;
-        if (!sv_isenabler_timer) {
+        if (!core->sv_isenabler_timer) {
             *(volatile uint32_t *)(gic_va + GICD_ICENABLER0) = 1u << PTIMER_PPI;
         }
         asm volatile("dsb \n isb" ::: "memory");
-        *pmr = sv_pmr;
+        *pmr = core->sv_pmr;
         asm volatile("dsb \n isb" ::: "memory");
     }
     azahar_cmd_status = 0;
@@ -585,8 +673,8 @@ static void core2_uninstall(void) {
 // handler returns. The TLBIALL/ICIALLU each way is the price of the round trip; a window opens
 // only when an SGI actually pends. Latency to the answer is bounded by one guest slice
 // (16 ms cap, sub-millisecond in practice with the SVC exit rate).
-static void core2_sgi_window(void) {
-    core2_uninstall();
+static void core2_sgi_window(unsigned n) {
+    core2_uninstall(n);
     // The interrupt delivers within a few cycles of the PMR write above. Stay open while
     // pending bits keep appearing — a process start loads many modules back to back — bounded
     // in case a bit sticks (a pending-but-disabled SGI would otherwise pin the loop).
@@ -602,18 +690,20 @@ static void core2_sgi_window(void) {
     if (spins >= 100000u) {
         azahar_sgi_stuck++;
     }
-    core2_install();
+    core2_install(n);
     azahar_sgi_windows++;
 }
 
 // One trip into the guest. Interrupts are masked at the GIC for its duration — the core is
 // owned, not shared, while guest code runs — and put back afterwards.
-static void core2_run(void) {
+static void core2_run(unsigned n) {
+    AzaharCpu *const cpu = &azahar_cpu[n];
+    AzaharCore *const core = &azahar_core[n];
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
-    azahar_progress = 1;
-    azahar_prog_und = azahar_prog_svc = azahar_prog_pabt = azahar_prog_dabt = azahar_prog_irq = 0;
+    cpu->progress = 1;
+    cpu->prog_und = cpu->prog_svc = cpu->prog_pabt = cpu->prog_dabt = cpu->prog_irq = 0;
     if (pmr) {
-        azahar_run_pmr_before = *pmr & 0xFFu; // masked since install
+        core->run_pmr_before = *pmr & 0xFFu; // masked since install
     }
 
     if (azahar_tlb_dirty) {
@@ -630,48 +720,40 @@ static void core2_run(void) {
                      :
                      : "r"(0u)
                      : "memory");
-        if (azahar_icache_stale) {
+        const uint32_t gen = azahar_code_gen;
+        if (core->code_gen != gen) {
             asm volatile("mcr p15, 0, %0, c7, c5, 6 \n"  // BPIALL
                          "mcr p15, 0, %0, c7, c5, 0 \n"  // ICIALLU
                          :
                          : "r"(0u)
                          : "memory");
-            azahar_icache_stale = 0;
+            core->code_gen = gen;
         }
         asm volatile("dsb \n isb" ::: "memory");
         azahar_tlb_dirty = 0;
     }
-    azahar_progress = 2;
-    wr_tpidruro(azahar_ctx.tpidruro);
-    wr_tpidrurw(azahar_ctx.tpidrurw);
+    cpu->progress = 2;
+    wr_tpidruro(cpu->ctx.tpidruro);
+    wr_tpidrurw(cpu->ctx.tpidrurw);
     // IRQs off at the CPU from the timer's start until the guest runs: azahar_enter returns
     // from exception into it with the guest's CPSR, which lets a timer that has already
-    // expired in as an ordinary preemption. With IRQs open here, a quantum that ran out before
-    // azahar_enter masked them took the IRQ stub with
-    // azahar_guest_active set: it saved this host code's System-mode registers as the guest's,
-    // and the next slice entered user mode at an address in this module and took a prefetch
-    // abort. Restored once the timer is stopped below.
+    // expired in as an ordinary preemption. An IRQ taken here, with CPU_ACTIVE set, would save
+    // this host code's registers as the guest's. Restored once the timer is stopped below.
     uint32_t irq_was;
     asm volatile("mrs %0, cpsr \n cpsid i" : "=r"(irq_was)::"memory");
-    if (pmr && azahar_run_quantum_ticks) {
+    if (pmr && core->quantum_ticks) {
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
         *(volatile uint32_t *)(gic_va + PTIMER_STATUS) = 1;
-        *(volatile uint32_t *)(gic_va + PTIMER_LOAD) = azahar_run_quantum_ticks;
+        *(volatile uint32_t *)(gic_va + PTIMER_LOAD) = core->quantum_ticks;
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) =
             PTIMER_CTRL_ENABLE | PTIMER_CTRL_IRQ; // one shot: no reload
         asm volatile("dsb \n isb" ::: "memory");
     }
-    azahar_progress = 3;
-    // prof.c: this core runs the guest until azahar_enter returns (0x100 | the core). The core
-    // comes from MPIDR: nothing of Sony's kernel is mapped here once the core is sealed.
-    uint32_t mpidr;
-    asm volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
-    azahar_guest_on = 0x100u | (mpidr & 3u);
-    const uint32_t reason = (uint32_t)azahar_enter(&azahar_ctx, azahar_host);
-    azahar_guest_on = 0;
-    azahar_progress = 42;
+    cpu->progress = 3;
+    const uint32_t reason = (uint32_t)azahar_enter(cpu);
+    cpu->progress = 42;
     if (pmr) {
-        azahar_run_timer_left = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
+        core->timer_left = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
         *(volatile uint32_t *)(gic_va + PTIMER_STATUS) = 1;
         asm volatile("dsb \n isb" ::: "memory");
@@ -680,19 +762,19 @@ static void core2_run(void) {
         // A timer IRQ still pending from the slice goes to the stray path, which ends it.
         asm volatile("cpsie i" ::: "memory");
     }
-    azahar_ctx.tpidruro = rd_tpidruro();
-    azahar_ctx.tpidrurw = rd_tpidrurw();
+    cpu->ctx.tpidruro = rd_tpidruro();
+    cpu->ctx.tpidrurw = rd_tpidrurw();
 
     if (pmr) {
-        azahar_run_pmr_after = *pmr & 0xFFu;
+        core->run_pmr_after = *pmr & 0xFFu;
     }
 
     // entry.S left the raw exception LR in ctx.r[15] and the SPSR in ctx.cpsr. Turn the LR into
     // the address the reason means (azahar_native.h), and pull the svc immediate out of the
     // instruction — readable here because our table is still installed and the code window is
     // readable at PL1.
-    const uint32_t thumb = azahar_ctx.cpsr & (1u << 5);
-    const uint32_t raw_lr = azahar_ctx.r[15];
+    const uint32_t thumb = cpu->ctx.cpsr & (1u << 5);
+    const uint32_t raw_lr = cpu->ctx.r[15];
     uint32_t pc = raw_lr, svc = 0;
     switch (reason) {
         case AZAHAR_EXIT_SVC:
@@ -709,16 +791,16 @@ static void core2_run(void) {
         case AZAHAR_EXIT_TIMER: pc = raw_lr - 4u; break; // IRQ: LR is the next instruction + 4
         default: break;
     }
-    azahar_ctx.r[15] = pc;
-    azahar_run_reason = reason;
-    azahar_run_svc = svc;
-    azahar_run_rawlr = raw_lr;
-    azahar_run_spsr = azahar_exit_info[2];
-    azahar_run_fsr = (reason == AZAHAR_EXIT_DABT) ? azahar_exit_info[3]
-                  : (reason == AZAHAR_EXIT_PABT) ? azahar_exit_info[5] : 0u;
-    azahar_run_far = (reason == AZAHAR_EXIT_DABT) ? azahar_exit_info[4]
-                  : (reason == AZAHAR_EXIT_PABT) ? azahar_exit_info[6] : 0u;
-    azahar_progress = 50;
+    cpu->ctx.r[15] = pc;
+    core->run_reason = reason;
+    core->run_svc = svc;
+    core->run_rawlr = raw_lr;
+    core->run_spsr = cpu->exit_info[2];
+    core->run_fsr = (reason == AZAHAR_EXIT_DABT) ? cpu->exit_info[3]
+                  : (reason == AZAHAR_EXIT_PABT) ? cpu->exit_info[5] : 0u;
+    core->run_far = (reason == AZAHAR_EXIT_DABT) ? cpu->exit_info[4]
+                  : (reason == AZAHAR_EXIT_PABT) ? cpu->exit_info[6] : 0u;
+    cpu->progress = 50;
     azahar_cmd_status = 0;
 }
 
@@ -728,17 +810,18 @@ static void core2_run(void) {
 // runs on this core in between; the moment the mask lifts, anything that pended (the tick,
 // a cross-core call) is delivered into Sony's own handler, which replaces the SGI window.
 // The syscall's kernel stack is the host stack azahar_enter saves and the vectors come back to.
-static void fold_run(void) {
-    core2_install();
-    core2_run();
-    core2_uninstall();
+static void fold_run(unsigned n) {
+    core2_install(n);
+    core2_run(n);
+    core2_uninstall(n);
 }
 
 // Folded mode's timer calibration: the private timer of this core, free-running against the
 // system clock for AZAHAR_TIMER_MEASURE_US. The thread is pinned, so the counter read after the
 // delay is the same core's.
-static void fold_measure_timer(void) {
-    azahar_timer_hz = 0;
+static void fold_measure_timer(unsigned n) {
+    AzaharCore *const core = &azahar_core[n];
+    core->timer_hz = 0;
     if (!gic_va) {
         return;
     }
@@ -762,9 +845,10 @@ static void fold_measure_timer(void) {
     asm volatile("dsb \n isb" ::: "memory");
     const uint32_t ticks = s0 - s1, us = t1 - t0; // counts down
     if (us) {
-        azahar_timer_hz = (uint32_t)(((uint64_t)ticks * 1000000ull) / us);
+        core->timer_hz = (uint32_t)(((uint64_t)ticks * 1000000ull) / us);
     }
-    emit("  private timer (folded): %u ticks in %u us -> %u Hz\n", ticks, us, azahar_timer_hz);
+    emit("  private timer (folded, cpu%u): %u ticks in %u us -> %u Hz\n", n, ticks, us,
+         core->timer_hz);
 }
 
 static int core2_entry(SceSize args, void *argp) {
@@ -799,7 +883,7 @@ static int core2_entry(SceSize args, void *argp) {
                                   *(volatile uint32_t *)(gic_va + GICD_ISENABLER0) & 0x7FFFu;
             if (pend) {
                 azahar_sgi_last_pend = pend;
-                core2_sgi_window();
+                core2_sgi_window(AZAHAR_TARGET_CORE);
             }
         }
         const uint32_t cmd = azahar_cmd;
@@ -807,9 +891,9 @@ static int core2_entry(SceSize args, void *argp) {
             continue;
         }
         switch (cmd) {
-            case CMD_INSTALL: core2_install(); break;
-            case CMD_RUN: core2_run(); break;
-            case CMD_UNINSTALL: core2_uninstall(); break;
+            case CMD_INSTALL: core2_install(AZAHAR_TARGET_CORE); break;
+            case CMD_RUN: core2_run(AZAHAR_TARGET_CORE); break;
+            case CMD_UNINSTALL: core2_uninstall(AZAHAR_TARGET_CORE); break;
             default: azahar_cmd_status = 1; break;
         }
         // Publish the results before the done flag: without the barrier the other core can
@@ -824,14 +908,18 @@ static int core2_entry(SceSize args, void *argp) {
 // ---------------------------------------------------------------------------- syscall side
 
 static void report_stray(void) {
-    if (!azahar_stray[0]) {
-        return;
-    }
     static const char *const names[] = {"?", "svc", "undefined", "prefetch abort", "data abort"};
-    emit("  STRAY exception(s) on core 2 with no guest active: %u, first %s lr %08x spsr %08x "
-         "dfsr %08x dfar %08x ifsr %08x ifar %08x (%u retried store(s))\n",
-         azahar_stray[0], azahar_stray[1] < 5 ? names[azahar_stray[1]] : "?", azahar_stray[2], azahar_stray[3],
-         azahar_stray[4], azahar_stray[5], azahar_stray[6], azahar_stray[7], azahar_stray_retry);
+    for (unsigned n = 0; n < AZAHAR_CORES; n++) {
+        const AzaharCpu *const cpu = &azahar_cpu[n];
+        if (!cpu->stray[0]) {
+            continue;
+        }
+        emit("  STRAY exception(s) on cpu%u with no guest active: %u, first %s lr %08x spsr %08x "
+             "dfsr %08x dfar %08x ifsr %08x ifar %08x (%u retried store(s))\n",
+             n, cpu->stray[0], cpu->stray[1] < 5 ? names[cpu->stray[1]] : "?", cpu->stray[2],
+             cpu->stray[3], cpu->stray[4], cpu->stray[5], cpu->stray[6], cpu->stray[7],
+             cpu->stray_retry);
+    }
 }
 
 static int core2_command(uint32_t cmd, unsigned steps) {
@@ -1002,6 +1090,7 @@ static int azahar_on_proc_gone(SceUID pid) {
     emit("== client process gone (state %d)\n", azahar_state);
     if (azahar_folded) {
         free_blocks();
+        detach_all();
         azahar_state = ST_NONE;
         azahar_client_pid = -1;
         log_release();
@@ -1068,7 +1157,16 @@ int azaharTakeCore(void) {
             free_blocks();
             goto out;
         }
+        if (azahar_edit_mutex < 0) {
+            azahar_edit_mutex = ksceKernelCreateMutex("SceAzaharEdit", 0, 0, NULL);
+            if (azahar_edit_mutex < 0) {
+                free_blocks();
+                ret = AZAHAR_ERR_ALLOC;
+                goto out;
+            }
+        }
         azahar_installed = 0;
+        detach_all();
         azahar_client_pid = ksceKernelGetProcessId();
         if (azahar_proc_handler < 0) {
             azahar_proc_handler = ksceKernelRegisterProcEventHandler("azaharnative", &azahar_proc_events, 0);
@@ -1362,20 +1460,18 @@ static int build_table(const AzaharMapRequest *req) {
         tinfo.size = sizeof(tinfo);
         if (taiGetModuleInfoForKernel(0x10005 /* the kernel */, "azaharnative", &tinfo) >= 0) {
             const uint32_t text_syms[] = {
-                (uint32_t)(uintptr_t)&azahar_enter,         (uint32_t)(uintptr_t)&azahar_vec_irq,
+                (uint32_t)(uintptr_t)&azahar_enter,         (uint32_t)(uintptr_t)&azahar_vec_irq_3,
                 (uint32_t)(uintptr_t)&azahar_get_banked_sp, (uint32_t)(uintptr_t)&core2_entry,
                 (uint32_t)(uintptr_t)&core2_run,         (uint32_t)(uintptr_t)&core2_install,
                 (uint32_t)(uintptr_t)&core2_uninstall,   (uint32_t)(uintptr_t)&translate,
             };
             const uint32_t data_syms[] = {
-                (uint32_t)(uintptr_t)&azahar_ctx,       (uint32_t)(uintptr_t)azahar_host,
-                (uint32_t)(uintptr_t)&azahar_progress,  (uint32_t)(uintptr_t)azahar_exit_info,
-                (uint32_t)(uintptr_t)azahar_stray,      (uint32_t)(uintptr_t)&azahar_cmd,
-                (uint32_t)(uintptr_t)&azahar_heartbeat, (uint32_t)(uintptr_t)&azahar_timer_sample,
-                (uint32_t)(uintptr_t)&gic_va,        (uint32_t)(uintptr_t)&sv_ttbcr,
-                (uint32_t)(uintptr_t)&azahar_l1_pa,     (uint32_t)(uintptr_t)&azahar_run_reason,
-                (uint32_t)(uintptr_t)azahar_sony,       (uint32_t)(uintptr_t)&azahar_state,
-                (uint32_t)(uintptr_t)azahar_irq_stack_top, (uint32_t)(uintptr_t)&azahar_fast,
+                (uint32_t)(uintptr_t)&azahar_cpu[0],    (uint32_t)(uintptr_t)azahar_cpu[3].guard,
+                (uint32_t)(uintptr_t)&azahar_core[0],   (uint32_t)(uintptr_t)&azahar_core[3].run_req,
+                (uint32_t)(uintptr_t)&azahar_cmd,       (uint32_t)(uintptr_t)&azahar_heartbeat,
+                (uint32_t)(uintptr_t)&azahar_timer_sample, (uint32_t)(uintptr_t)&gic_va,
+                (uint32_t)(uintptr_t)&azahar_l1_pa,     (uint32_t)(uintptr_t)azahar_sony,
+                (uint32_t)(uintptr_t)&azahar_state,
             };
             uint32_t bases[2] = {0, 0};
             for (unsigned seg = 0; seg < 2; seg++) {
@@ -1448,18 +1544,16 @@ static int build_table(const AzaharMapRequest *req) {
     if (nkeep == 0) {
         emit("  seal: module segment lookup failed; falling back to the spot list\n");
         const uint32_t spot[] = {
-            (uint32_t)(uintptr_t)&azahar_enter,       (uint32_t)(uintptr_t)&azahar_vec_irq,
+            (uint32_t)(uintptr_t)&azahar_enter,       (uint32_t)(uintptr_t)&azahar_vec_irq_3,
             (uint32_t)(uintptr_t)&azahar_get_banked_sp, (uint32_t)(uintptr_t)&core2_entry,
             (uint32_t)(uintptr_t)&core2_run,       (uint32_t)(uintptr_t)&core2_install,
             (uint32_t)(uintptr_t)&core2_uninstall, (uint32_t)(uintptr_t)&translate,
-            (uint32_t)(uintptr_t)&azahar_ctx,         (uint32_t)(uintptr_t)azahar_host,
-            (uint32_t)(uintptr_t)&azahar_progress,    (uint32_t)(uintptr_t)azahar_exit_info,
-            (uint32_t)(uintptr_t)azahar_stray,        (uint32_t)(uintptr_t)&azahar_cmd,
+            (uint32_t)(uintptr_t)&azahar_cpu[0],      (uint32_t)(uintptr_t)azahar_cpu[3].guard,
+            (uint32_t)(uintptr_t)&azahar_core[0],     (uint32_t)(uintptr_t)&azahar_cmd,
             (uint32_t)(uintptr_t)&azahar_heartbeat,   (uint32_t)(uintptr_t)&azahar_timer_sample,
-            (uint32_t)(uintptr_t)&gic_va,          (uint32_t)(uintptr_t)&sv_ttbcr,
-            (uint32_t)(uintptr_t)&azahar_l1_pa,       (uint32_t)(uintptr_t)&azahar_run_reason,
+            (uint32_t)(uintptr_t)&gic_va,
+            (uint32_t)(uintptr_t)&azahar_l1_pa,       (uint32_t)(uintptr_t)&azahar_core[3].run_req,
             (uint32_t)(uintptr_t)azahar_sony,         (uint32_t)(uintptr_t)&azahar_state,
-            (uint32_t)(uintptr_t)&azahar_fast,
         };
         for (unsigned i = 0; i < sizeof(spot) / sizeof(spot[0]); i++) {
             keep[nkeep].addr = spot[i];
@@ -1467,11 +1561,10 @@ static int build_table(const AzaharMapRequest *req) {
             nkeep++;
         }
     }
-    // Always: both asm stacks (contiguous in .bss, stray then irq), the worker's kernel
+    // Always: every core's block with its asm stacks (entry.S's .bss), the worker's kernel
     // stack, and the GIC window.
-    keep[nkeep].addr = (uint32_t)(uintptr_t)azahar_stray_stack_top - 0x40u;
-    keep[nkeep].len = (uint32_t)(uintptr_t)azahar_irq_stack_top -
-                      ((uint32_t)(uintptr_t)azahar_stray_stack_top - 0x40u);
+    keep[nkeep].addr = (uint32_t)(uintptr_t)azahar_cpu;
+    keep[nkeep].len = sizeof(AzaharCpu) * AZAHAR_CORES;
     nkeep++;
     // The stack the slice runs on: the resident thread's own, or in folded mode the caller's
     // syscall stack, whose depth differs between azaharMap and azaharRun - hence the slack each way.
@@ -1570,11 +1663,23 @@ static int build_table(const AzaharMapRequest *req) {
          "0x200-0x3ff)\n",
          azahar_vec_va, KERNEL_L1(azahar_vec_va >> 20), upper_used);
 
-    // Sony's 16 words, four slots replaced with `ldr pc, [pc, #0x34]` reading our handlers'
-    // addresses from 0x40..0x4c: UND at 0x04, SVC at 0x08, PABT at 0x0c, DABT at 0x10.
+    // Per core, at AZAHAR_VEC_STRIDE: Sony's 16 words, four slots replaced with
+    // `ldr pc, [pc, #0x34]` reading that core's handlers' addresses from 0x40..0x4c: UND at 0x04,
+    // SVC at 0x08, PABT at 0x0c, DABT at 0x10.
     const volatile uint32_t *sony = (const volatile uint32_t *)(uintptr_t)azahar_core2_vbar;
-    for (unsigned i = 0; i < 16; i++) {
-        azahar_vec[i] = sony[i];
+    for (unsigned n = 0; n < AZAHAR_CORES; n++) {
+        uint32_t *const vec = azahar_vec + n * (AZAHAR_VEC_STRIDE / 4);
+        for (unsigned i = 0; i < 16; i++) {
+            vec[i] = sony[i];
+        }
+        for (unsigned h = 0; h < 5; h++) {
+            vec[0x40 / 4 + h] = (uint32_t)(uintptr_t)azahar_stubs[n][h];
+        }
+        vec[0x04 / 4] = 0xE59FF034u;
+        vec[0x08 / 4] = 0xE59FF034u;
+        vec[0x0C / 4] = 0xE59FF034u;
+        vec[0x10 / 4] = 0xE59FF034u;
+        vec[0x18 / 4] = 0xE59FF030u; // IRQ: at 0x18 the PC reads 0x20; pointer at 0x50
     }
     for (unsigned i = 0; i < 8; i++) {
         azahar_sony[i] = azahar_sony_target(azahar_core2_vbar, i);
@@ -1582,16 +1687,6 @@ static int build_table(const AzaharMapRequest *req) {
     emit("  sony vectors: rst %08x und %08x svc %08x pabt %08x dabt %08x irq %08x fiq %08x\n",
          azahar_sony[0], azahar_sony[1], azahar_sony[2], azahar_sony[3], azahar_sony[4], azahar_sony[6],
          azahar_sony[7]);
-    azahar_vec[0x40 / 4] = (uint32_t)(uintptr_t)&azahar_vec_und;
-    azahar_vec[0x44 / 4] = (uint32_t)(uintptr_t)&azahar_vec_svc;
-    azahar_vec[0x48 / 4] = (uint32_t)(uintptr_t)&azahar_vec_pabt;
-    azahar_vec[0x4C / 4] = (uint32_t)(uintptr_t)&azahar_vec_dabt;
-    azahar_vec[0x50 / 4] = (uint32_t)(uintptr_t)&azahar_vec_irq;
-    azahar_vec[0x04 / 4] = 0xE59FF034u;
-    azahar_vec[0x08 / 4] = 0xE59FF034u;
-    azahar_vec[0x0C / 4] = 0xE59FF034u;
-    azahar_vec[0x10 / 4] = 0xE59FF034u;
-    azahar_vec[0x18 / 4] = 0xE59FF030u; // IRQ: at 0x18 the PC reads 0x20; pointer at 0x50
     azahar_l1[azahar_vec_va >> 20] = AZAHAR_SEC_PRIV_RWX((uint32_t)azahar_vec_pa);
     emit("  vectors: copied from %08x, ours at %08x (pa %08x); und %08x svc %08x pabt %08x dabt %08x irq %08x\n",
          azahar_core2_vbar, azahar_vec_va, (uint32_t)azahar_vec_pa, azahar_vec[0x40 / 4], azahar_vec[0x44 / 4],
@@ -1612,7 +1707,7 @@ static int build_table(const AzaharMapRequest *req) {
     emit("  %u L2 table(s) in use of %u\n", azahar_l2_used, AZAHAR_L2_COUNT);
 
     // Preflight: at N=0 there is no TTBR1 to catch a gap, so what core 2 will touch must resolve.
-    const uint32_t crit[] = {(uint32_t)(uintptr_t)&azahar_enter, (uint32_t)(uintptr_t)&azahar_ctx,
+    const uint32_t crit[] = {(uint32_t)(uintptr_t)&azahar_enter, (uint32_t)(uintptr_t)azahar_cpu,
                              azahar_core2_sp, gic_va, (uint32_t)(uintptr_t)&core2_run};
     static const char *const crit_name[] = {"entry code", "context", "core-2 stack", "gic",
                                             "core-2 C code"};
@@ -1637,7 +1732,7 @@ static int build_table(const AzaharMapRequest *req) {
     // The app's pages were cleaned one by one above; the tables and vectors go with them.
     // The vector page is code and core 2 fetches it through a mapping of its own, so it is
     // cleaned; the tables are read by the walker, which is coherent with these caches.
-    ksceKernelDcacheCleanRange(azahar_vec, 0x100);
+    ksceKernelDcacheCleanRange(azahar_vec, AZAHAR_VEC_STRIDE * AZAHAR_CORES);
     asm volatile("dsb" ::: "memory");
     return 0;
 }
@@ -1696,39 +1791,47 @@ int azaharMap(const AzaharMapRequest *user_req) {
     }
     if (azahar_folded) {
         // Prove the world switch on this core once, both ways, before any guest runs.
-        core2_install();
-        core2_uninstall();
+        const unsigned n = this_core();
+        const AzaharCore *const core = &azahar_core[n];
+        core2_install(n);
+        core2_uninstall(n);
         emit("  installed and removed once on cpu%u: ttbcr %08x -> %08x, vbar %08x -> %08x, "
              "pmr %02x -> %02x, cpacr %08x fpexc %08x\n",
-             (uint32_t)ksceKernelCpuId(), sv_ttbcr, azahar_ttbcr_seen, sv_vbar, azahar_vec_va, sv_pmr,
-             AZAHAR_PMR_MASK, sv_cpacr, sv_fpexc);
-        fold_measure_timer();
+             n, core->sv_ttbcr, core->ttbcr_seen, core->sv_vbar,
+             azahar_vec_va + n * AZAHAR_VEC_STRIDE, core->sv_pmr, AZAHAR_PMR_MASK, core->sv_cpacr,
+             core->sv_fpexc);
+        fold_measure_timer(n);
+        // The mapping thread's core is the attached one.
+        detach_all();
+        azahar_core[n].attached = 1;
         azahar_state = ST_MAPPED;
         goto out;
     }
     if ((ret = core2_command(CMD_INSTALL, AZAHAR_WAIT_STEPS)) != 0) {
         goto out;
     }
+    AzaharCore *const target = &azahar_core[AZAHAR_TARGET_CORE];
     emit("  installed on core %u: ttbcr %08x -> %08x, vbar %08x -> %08x, sp_und %08x sp_abt %08x "
          "sp_svc %08x sp_irq %08x, pmr %02x -> %02x, timer ppi was %s, cpacr %08x fpexc %08x\n",
-         AZAHAR_TARGET_CORE, sv_ttbcr, azahar_ttbcr_seen, sv_vbar, azahar_vec_va, sv_sp_und, sv_sp_abt,
-         sv_sp_svc, sv_sp_irq, sv_pmr, AZAHAR_PMR_MASK, sv_isenabler_timer ? "enabled" : "disabled",
-         sv_cpacr, sv_fpexc);
+         AZAHAR_TARGET_CORE, target->sv_ttbcr, target->ttbcr_seen, target->sv_vbar,
+         azahar_vec_va + AZAHAR_TARGET_CORE * AZAHAR_VEC_STRIDE, target->sv_sp_und,
+         target->sv_sp_abt, target->sv_sp_svc, target->sv_sp_irq, target->sv_pmr, AZAHAR_PMR_MASK,
+         target->sv_isenabler_timer ? "enabled" : "disabled", target->sv_cpacr, target->sv_fpexc);
 
     // The private timer's clock, from the idle loop's samples of the free-running counter
     // against the system clock. A device-tree claim of a fixed 144 MHz against the A9
     // ratio exists; this is the number the quantum is actually converted with.
-    azahar_timer_hz = 0;
+    target->timer_hz = 0;
     if (gic_va) {
         const uint32_t s0 = azahar_timer_sample, t0 = ksceKernelGetSystemTimeLow();
         ksceKernelDelayThread(AZAHAR_TIMER_MEASURE_US);
         const uint32_t s1 = azahar_timer_sample, t1 = ksceKernelGetSystemTimeLow();
         const uint32_t ticks = s0 - s1, us = t1 - t0; // counts down
         if (us) {
-            azahar_timer_hz = (uint32_t)(((uint64_t)ticks * 1000000ull) / us);
+            target->timer_hz = (uint32_t)(((uint64_t)ticks * 1000000ull) / us);
         }
         emit("  private timer: %u ticks in %u us -> %u Hz (%u.%02u MHz)\n", ticks, us,
-             azahar_timer_hz, azahar_timer_hz / 1000000u, (azahar_timer_hz / 10000u) % 100u);
+             target->timer_hz, target->timer_hz / 1000000u, (target->timer_hz / 10000u) % 100u);
     }
     azahar_state = ST_MAPPED;
 
@@ -1739,126 +1842,137 @@ out:
     return ret;
 }
 
-static AzaharRunRequest azahar_run_req;
-
 int azaharRun(AzaharRunRequest *user_req) {
     uint32_t state;
     ENTER_SYSCALL(state);
     const uint32_t start_us = ksceKernelGetSystemTimeLow();
     log_open();
     int ret = 0;
+    // Folded, the slice runs on the caller's core (its thread is pinned); resident, on the
+    // resident thread's.
+    const unsigned n = azahar_folded ? this_core() : AZAHAR_TARGET_CORE;
+    AzaharCpu *const cpu = &azahar_cpu[n];
+    AzaharCore *const core = &azahar_core[n];
+    AzaharRunRequest *const req = &core->run_req;
+    AzaharFast *const fast = &cpu->fast;
 
     if (azahar_state != ST_MAPPED) {
         ret = AZAHAR_ERR_STATE;
         goto out;
     }
-    if (ksceKernelCopyFromUser(&azahar_run_req, user_req, sizeof(azahar_run_req)) < 0) {
+    if (azahar_folded && !core->attached) {
+        // The saved banked SPs and the stack's seal entries are the attached thread's: a
+        // thread that moved cores, or one never attached, would run on what is not its own.
+        emit("  azaharRun on cpu%u, which azaharMap did not attach\n", n);
+        ret = AZAHAR_ERR_CORE;
+        goto out;
+    }
+    if (ksceKernelCopyFromUser(req, user_req, sizeof(*req)) < 0) {
         ret = AZAHAR_ERR_ARG;
         goto out;
     }
     // User mode only, and interrupts unmasked at the CPU: the GIC mask does the owning.
-    azahar_ctx = azahar_run_req.ctx;
-    azahar_ctx.cpsr = (azahar_ctx.cpsr & ~0x1DFu) | 0x10u; // keep T (bit 5); mode user; A/I/F clear
-    azahar_run_quantum_ticks = 0;
-    if (azahar_run_req.quantum_us) {
-        if (!azahar_timer_hz) {
-            emit("  quantum requested but the timer clock is unmeasured\n");
+    cpu->ctx = req->ctx;
+    cpu->ctx.cpsr = (cpu->ctx.cpsr & ~0x1DFu) | 0x10u; // keep T (bit 5); mode user; A/I/F clear
+    core->quantum_ticks = 0;
+    if (req->quantum_us) {
+        if (!core->timer_hz) {
+            emit("  quantum requested but cpu%u's timer clock is unmeasured\n", n);
             ret = AZAHAR_ERR_STATE;
             goto out;
         }
-        const uint64_t t = ((uint64_t)azahar_run_req.quantum_us * azahar_timer_hz) / 1000000ull;
-        azahar_run_quantum_ticks = t > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)t;
-        if (!azahar_run_quantum_ticks) {
-            azahar_run_quantum_ticks = 1;
+        const uint64_t t = ((uint64_t)req->quantum_us * core->timer_hz) / 1000000ull;
+        core->quantum_ticks = t > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)t;
+        if (!core->quantum_ticks) {
+            core->quantum_ticks = 1;
         }
     }
-    azahar_run_timer_left = 0;
+    core->timer_left = 0;
     // What azahar_svc_fast may answer this slice. GetSystemTick needs the slice's timer, and the
     // conversion to guest ticks, made again only when one of the two clocks changes.
-    azahar_fast.on = azahar_run_req.fast & AZAHAR_FAST_ALL;
-    azahar_fast.timer = 0;
-    const int timed = azahar_run_quantum_ticks && azahar_run_req.tick_hz;
+    fast->on = req->fast & AZAHAR_FAST_ALL;
+    fast->timer = 0;
+    const int timed = core->quantum_ticks && req->tick_hz;
     if (timed) {
-        if (azahar_run_req.tick_hz != azahar_fast_tick_hz || azahar_timer_hz != azahar_fast_timer_hz) {
-            azahar_fast_tick_hz = azahar_run_req.tick_hz;
-            azahar_fast_timer_hz = azahar_timer_hz;
-            azahar_fast.mult_int = (uint32_t)(azahar_fast_tick_hz / azahar_timer_hz);
-            azahar_fast.mult_frac = (uint32_t)(((azahar_fast_tick_hz % azahar_timer_hz) << 32) / azahar_timer_hz);
+        if (req->tick_hz != core->fast_tick_hz || core->timer_hz != core->fast_timer_hz) {
+            core->fast_tick_hz = req->tick_hz;
+            core->fast_timer_hz = core->timer_hz;
+            fast->mult_int = (uint32_t)(core->fast_tick_hz / core->timer_hz);
+            fast->mult_frac =
+                (uint32_t)(((core->fast_tick_hz % core->timer_hz) << 32) / core->timer_hz);
         }
         if (gic_va) {
-            azahar_fast.timer = gic_va + PTIMER_COUNTER;
+            fast->timer = gic_va + PTIMER_COUNTER;
         }
     }
-    azahar_fast.quantum = azahar_run_quantum_ticks;
-    azahar_fast.base_lo = (uint32_t)azahar_run_req.tick_base;
-    azahar_fast.base_hi = (uint32_t)(azahar_run_req.tick_base >> 32);
-    azahar_fast.thread_id = azahar_run_req.thread_id;
-    azahar_fast.process_id = azahar_run_req.process_id;
+    fast->quantum = core->quantum_ticks;
+    fast->base_lo = (uint32_t)req->tick_base;
+    fast->base_hi = (uint32_t)(req->tick_base >> 32);
+    fast->thread_id = req->thread_id;
+    fast->process_id = req->process_id;
     for (unsigned i = 0; i < AZAHAR_FAST_KINDS; i++) {
-        azahar_fast.count[i] = 0;
+        fast->count[i] = 0;
     }
     if (azahar_verbose) {
-        emit("== azaharRun  pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u ticks\n",
-             azahar_ctx.r[15], azahar_ctx.cpsr, azahar_ctx.r[13], azahar_ctx.r[0], azahar_ctx.r[1],
-             azahar_run_req.quantum_us, azahar_run_quantum_ticks);
+        emit("== azaharRun  cpu%u pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u "
+             "ticks\n",
+             n, cpu->ctx.r[15], cpu->ctx.cpsr, cpu->ctx.r[13], cpu->ctx.r[0], cpu->ctx.r[1],
+             req->quantum_us, core->quantum_ticks);
     }
 
     if (azahar_folded) {
-        azahar_on_core = (uint32_t)ksceKernelCpuId() & 3;
-        fold_run();
+        azahar_on_core = n;
+        fold_run(n);
         ret = 0;
     } else if ((ret = core2_command(CMD_RUN, AZAHAR_RUN_WAIT_STEPS)) != 0) {
         emit("== azaharRun  pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u ticks\n",
-             azahar_run_req.ctx.r[15], azahar_ctx.cpsr, azahar_ctx.r[13], azahar_ctx.r[0], azahar_ctx.r[1],
-             azahar_run_req.quantum_us, azahar_run_quantum_ticks);
-        // Where core 2 got to. 1-3 C before entry; 10-11 entry asm; a stub word equal to its
-        // own address means that exception was taken; 31-34 the user file was saved; 40-41
-        // back in host mode; 42-50 back in C.
+             req->ctx.r[15], cpu->ctx.cpsr, cpu->ctx.r[13], cpu->ctx.r[0], cpu->ctx.r[1],
+             req->quantum_us, core->quantum_ticks);
+        // Where the core got to (AzaharCpu.progress), and which stubs were reached.
         emit("  progress %u  stubs und %s svc %s pabt %s dabt %s irq %s  irq id %08x stray %u\n",
-             azahar_progress,
-             azahar_prog_und == (uint32_t)(uintptr_t)&azahar_prog_und ? "hit" : "-",
-             azahar_prog_svc == (uint32_t)(uintptr_t)&azahar_prog_svc ? "hit" : "-",
-             azahar_prog_pabt == (uint32_t)(uintptr_t)&azahar_prog_pabt ? "hit" : "-",
-             azahar_prog_dabt == (uint32_t)(uintptr_t)&azahar_prog_dabt ? "hit" : "-",
-             azahar_prog_irq == (uint32_t)(uintptr_t)&azahar_prog_irq ? "hit" : "-", azahar_irq_last,
-             azahar_irq_stray);
+             cpu->progress,
+             cpu->prog_und == (uint32_t)(uintptr_t)&cpu->prog_und ? "hit" : "-",
+             cpu->prog_svc == (uint32_t)(uintptr_t)&cpu->prog_svc ? "hit" : "-",
+             cpu->prog_pabt == (uint32_t)(uintptr_t)&cpu->prog_pabt ? "hit" : "-",
+             cpu->prog_dabt == (uint32_t)(uintptr_t)&cpu->prog_dabt ? "hit" : "-",
+             cpu->prog_irq == (uint32_t)(uintptr_t)&cpu->prog_irq ? "hit" : "-", cpu->irq_last,
+             cpu->irq_stray);
         emit("  ctx now: r0 %08x r1 %08x r2 %08x r4 %08x sp %08x lr %08x pc/lr %08x cpsr/spsr %08x\n",
-             azahar_ctx.r[0], azahar_ctx.r[1], azahar_ctx.r[2], azahar_ctx.r[4], azahar_ctx.r[13], azahar_ctx.r[14],
-             azahar_ctx.r[15], azahar_ctx.cpsr);
+             cpu->ctx.r[0], cpu->ctx.r[1], cpu->ctx.r[2], cpu->ctx.r[4], cpu->ctx.r[13],
+             cpu->ctx.r[14], cpu->ctx.r[15], cpu->ctx.cpsr);
         emit("  exit info: reason %u rawlr %08x spsr %08x dfsr %08x dfar %08x ifsr %08x ifar %08x\n",
-             azahar_exit_info[0], azahar_exit_info[1], azahar_exit_info[2], azahar_exit_info[3],
-             azahar_exit_info[4], azahar_exit_info[5], azahar_exit_info[6]);
+             cpu->exit_info[0], cpu->exit_info[1], cpu->exit_info[2], cpu->exit_info[3],
+             cpu->exit_info[4], cpu->exit_info[5], cpu->exit_info[6]);
         goto out;
     }
-    azahar_run_req.ctx = azahar_ctx;
-    azahar_run_req.reason = azahar_run_reason;
-    azahar_run_req.svc_number = azahar_run_svc;
-    azahar_run_req.fsr = azahar_run_fsr;
-    azahar_run_req.far = azahar_run_far;
-    azahar_run_req.spsr = azahar_run_spsr;
-    azahar_run_req.raw_lr = azahar_run_rawlr;
-    azahar_run_req.timer_hz = azahar_timer_hz;
-    azahar_run_req.timer_left = azahar_run_timer_left;
+    req->ctx = cpu->ctx;
+    req->reason = core->run_reason;
+    req->svc_number = core->run_svc;
+    req->fsr = core->run_fsr;
+    req->far = core->run_far;
+    req->spsr = core->run_spsr;
+    req->raw_lr = core->run_rawlr;
+    req->timer_hz = core->timer_hz;
+    req->timer_left = core->timer_left;
     // The counter read at the exit is below every one azahar_svc_fast read, so no GetSystemTick
     // it answered is ahead of tick_base + guest_ticks.
-    azahar_run_req.guest_ticks =
-        timed ? fast_guest_ticks(azahar_run_quantum_ticks - azahar_run_timer_left) : 0;
+    req->guest_ticks = timed ? fast_guest_ticks(fast, core->quantum_ticks - core->timer_left) : 0;
     for (unsigned i = 0; i < AZAHAR_FAST_KINDS; i++) {
-        azahar_run_req.fast_count[i] = azahar_fast.count[i];
+        req->fast_count[i] = fast->count[i];
     }
-    azahar_run_req.kernel_us = ksceKernelGetSystemTimeLow() - start_us;
+    req->kernel_us = ksceKernelGetSystemTimeLow() - start_us;
     azahar_run_count++;
-    if (azahar_verbose || (azahar_run_reason > AZAHAR_EXIT_SVC && azahar_run_reason != AZAHAR_EXIT_TIMER)) {
+    if (azahar_verbose || (core->run_reason > AZAHAR_EXIT_SVC && core->run_reason != AZAHAR_EXIT_TIMER)) {
         // Faults are rare enough to record. svc exits are the common case, and a guest that
         // busy-waits through its quantum makes preemptions just as common (hundreds a minute
         // in the first commercial title tried), so both stay silent unless verbose.
-        emit("  run %u: exit reason %u  svc %06x  pc %08x  raw lr %08x  spsr %08x  fsr %08x far "
-             "%08x  r0 %08x r1 %08x sp %08x  timer left %u  irq id %08x stray %u\n",
-             azahar_run_count, azahar_run_reason, azahar_run_svc, azahar_ctx.r[15], azahar_run_rawlr,
-             azahar_run_spsr, azahar_run_fsr, azahar_run_far, azahar_ctx.r[0], azahar_ctx.r[1], azahar_ctx.r[13],
-             azahar_run_timer_left, azahar_irq_last, azahar_irq_stray);
+        emit("  run %u (cpu%u): exit reason %u  svc %06x  pc %08x  raw lr %08x  spsr %08x  fsr %08x "
+             "far %08x  r0 %08x r1 %08x sp %08x  timer left %u  irq id %08x stray %u\n",
+             azahar_run_count, n, core->run_reason, core->run_svc, cpu->ctx.r[15], core->run_rawlr,
+             core->run_spsr, core->run_fsr, core->run_far, cpu->ctx.r[0], cpu->ctx.r[1],
+             cpu->ctx.r[13], core->timer_left, cpu->irq_last, cpu->irq_stray);
     }
-    if (ksceKernelCopyToUser(user_req, &azahar_run_req, sizeof(azahar_run_req)) < 0) {
+    if (ksceKernelCopyToUser(user_req, req, sizeof(*req)) < 0) {
         ret = AZAHAR_ERR_ARG;
     }
 
@@ -1879,11 +1993,16 @@ int azaharEdit(const AzaharEditRequest *user_req) {
     log_open();
     int ret = 0;
     int quiet = 0; /* SYNC_CODE comes once a frame on some titles: logged only when it fails */
+    int locked = 0;
 
     if (azahar_state != ST_MAPPED) {
         ret = AZAHAR_ERR_STATE;
         goto out;
     }
+    // The request copy, the descriptors, the L2 pool and the maintenance after them, one edit
+    // at a time.
+    ksceKernelLockMutex(azahar_edit_mutex, 1, NULL);
+    locked = 1;
     if (ksceKernelCopyFromUser(&azahar_edit_req, user_req, sizeof(azahar_edit_req)) < 0) {
         ret = AZAHAR_ERR_ARG;
         goto out;
@@ -1913,9 +2032,7 @@ int azaharEdit(const AzaharEditRequest *user_req) {
             wr_dacr(d);
             ksceKernelCpuResumeIntr(st);
         }
-        asm volatile("dsb" ::: "memory");
-        azahar_tlb_dirty = 1;
-        azahar_icache_stale = 1; // the whole point of this op: the guest rewrote instructions
+        tables_changed(1); // the whole point of this op: the guest rewrote instructions
         goto out;
     }
     if (!check_range(rg, op == AZAHAR_EDIT_MAP) ||
@@ -1982,16 +2099,15 @@ int azaharEdit(const AzaharEditRequest *user_req) {
         // the kernel's own tables are read: it edits those constantly and cleans nothing.
         // Cleaning the whole array on every call would be 256 KB of descriptors plus 16 KB of
         // the top level, whatever the edit had touched.
-        asm volatile("dsb" ::: "memory");
-        azahar_tlb_dirty = 1;
-        if (op != AZAHAR_EDIT_PROTECT) {
-            // A map can bring different code to an address this core has executed at, and an
-            // unmap is cheap enough not to argue about.
-            azahar_icache_stale = 1;
-        }
+        // A map can bring different code to an address a core has executed at, and an unmap
+        // is cheap enough not to argue about.
+        tables_changed(op != AZAHAR_EDIT_PROTECT);
     }
 
 out:
+    if (locked) {
+        ksceKernelUnlockMutex(azahar_edit_mutex, 1);
+    }
     if (!quiet || ret != 0)
         emit("  -> %d\n", ret);
     log_close();
@@ -2013,13 +2129,15 @@ int azaharRelease(void) {
         }
         emit("  %u run(s) since the map (folded)\n", azahar_run_count);
         free_blocks();
+        detach_all();
         azahar_state = ST_NONE;
         azahar_client_pid = -1;
         goto out;
     }
     if (azahar_state == ST_MAPPED) {
         ret = core2_command(CMD_UNINSTALL, AZAHAR_WAIT_STEPS);
-        emit("  uninstall -> %d (vbar back to %08x)\n", ret, sv_vbar);
+        emit("  uninstall -> %d (vbar back to %08x)\n", ret,
+             azahar_core[AZAHAR_TARGET_CORE].sv_vbar);
     } else if (azahar_state != ST_TAKEN) {
         ret = AZAHAR_ERR_STATE;
         goto out;

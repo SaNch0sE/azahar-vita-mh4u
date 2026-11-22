@@ -1301,6 +1301,9 @@ Result SVC::CreateThread(Handle* out_handle, u32 entry_point, u32 arg, VAddr sta
         // returned). When processorid==0x3 and the process is not a BASE mem-region process, error
         // 0xD9001BEA is returned. These are the only restriction checks done by the kernel for
         // processorid. If this is implemented, make sure to check process->no_thread_restrictions.
+        // Processors 2 and 3 exist only on a New 3DS; refused before the thread count is reserved,
+        // which a failed kernel.CreateThread would not give back.
+        R_UNLESS(static_cast<u32>(processor_id) < system.GetNumCores(), ResultOutOfRangeKernel);
         break;
     default:
         return ResultOutOfRange;

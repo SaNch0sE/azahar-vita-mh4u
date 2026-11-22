@@ -340,7 +340,10 @@ static uint32_t active_cpu_mask(void) {
 // 13: sgxdSubmitAsync queues lists (SGXD_CHAIN_RING) and returns the first op's index.
 // 14: azaharRun answers some svcs in the guest's own world (AZAHAR_FAST_*), and reports the
 //     slice's guest ticks and its own time.
+// 15: one world per Vita core, azaharAttach / azaharDetach: slices on several cores at once.
 // 19: AzaharProfSample's syscall (svc, user PC, LR and SP) from the thread's SVC frame.
+// 27: azaharAttach and azaharDetach gone, and the cross-core maintenance with them: one
+//     emulation thread, one attached core.
 int azaharVersion() {
     return 5;
 }

@@ -4,6 +4,8 @@
 
 #include <string>
 
+#include <algorithm>
+#include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
@@ -34,6 +36,77 @@
 #endif
 
 namespace Common {
+
+#ifdef __vita__
+
+namespace {
+SceKernelLwMutexWork* LwMutex(std::array<u8, 0x20>& work) {
+    return reinterpret_cast<SceKernelLwMutexWork*>(work.data());
+}
+SceKernelLwCondWork* LwCond(std::array<u8, 0x10>& work) {
+    return reinterpret_cast<SceKernelLwCondWork*>(work.data());
+}
+} // namespace
+
+CoreCondition::CoreCondition() {
+    const int m = sceKernelCreateLwMutex(LwMutex(lw_mutex), "CoreCondition", 0, 0, nullptr);
+    const int c =
+        sceKernelCreateLwCond(LwCond(lw_cond), "CoreCondition", 0, LwMutex(lw_mutex), nullptr);
+    ASSERT_MSG(m == 0 && c == 0, "CoreCondition: LwMutex {:#010x}, LwCond {:#010x}",
+               static_cast<u32>(m), static_cast<u32>(c));
+}
+
+CoreCondition::~CoreCondition() {
+    sceKernelDeleteLwCond(LwCond(lw_cond));
+    sceKernelDeleteLwMutex(LwMutex(lw_mutex));
+}
+
+void CoreCondition::lock() {
+    const int r = sceKernelLockLwMutex(LwMutex(lw_mutex), 1, nullptr);
+    ASSERT_MSG(r == 0, "CoreCondition: lock {:#010x}", static_cast<u32>(r));
+}
+
+void CoreCondition::unlock() {
+    sceKernelUnlockLwMutex(LwMutex(lw_mutex), 1);
+}
+
+bool CoreCondition::WaitFor(std::chrono::microseconds timeout) {
+    SceUInt us = static_cast<SceUInt>(std::max<s64>(timeout.count(), 1));
+    const int r = sceKernelWaitLwCond(LwCond(lw_cond), &us);
+    ASSERT_MSG(r == 0 || r == static_cast<int>(0x80028005), "CoreCondition: wait {:#010x}",
+               static_cast<u32>(r));
+    return r == 0;
+}
+
+void CoreCondition::NotifyAll() {
+    sceKernelSignalLwCondAll(LwCond(lw_cond));
+}
+
+#else
+
+CoreCondition::CoreCondition() = default;
+CoreCondition::~CoreCondition() = default;
+
+void CoreCondition::lock() {
+    mutex.lock();
+}
+
+void CoreCondition::unlock() {
+    mutex.unlock();
+}
+
+bool CoreCondition::WaitFor(std::chrono::microseconds timeout) {
+    std::unique_lock lk{mutex, std::adopt_lock};
+    const bool notified = condvar.wait_for(lk, timeout) == std::cv_status::no_timeout;
+    lk.release();
+    return notified;
+}
+
+void CoreCondition::NotifyAll() {
+    condvar.notify_all();
+}
+
+#endif
 
 #ifdef _WIN32
 

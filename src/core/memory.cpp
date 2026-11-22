@@ -257,7 +257,9 @@ public:
     }
 
     u32 GetPC() const noexcept {
-        return system.GetRunningCore().GetPC();
+        // The replay player (System::InitReplay) runs no core: an error message naming the PC
+        // stopped it before it was written.
+        return system.IsPoweredOn() ? system.GetRunningCore().GetPC() : 0;
     }
 
     template <bool UNSAFE>
@@ -405,6 +407,9 @@ public:
                 return;
             }
 
+            // The renderer's state: under the GPU's lock, which GSP's command work holds without
+            // the HLE lock when cores run in parallel.
+            std::scoped_lock gpu_lock{system.GPU().Lock()};
             auto& renderer = system.GPU().Renderer();
             VAddr overlap_start = std::max(start, region_start);
             VAddr overlap_end = std::min(end, region_end);

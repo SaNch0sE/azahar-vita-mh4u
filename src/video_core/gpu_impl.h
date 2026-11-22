@@ -7,7 +7,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <deque>
 #include "common/archives.h"
 #include "common/microprofile.h"
 #include "common/thread.h"

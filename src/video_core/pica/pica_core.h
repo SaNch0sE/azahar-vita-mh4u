@@ -28,81 +28,14 @@ namespace Pica {
 
 class ShaderEngine;
 
-class DelayGenerator {
-private:
-    // A GPU is a very complex system, the timings resulting from
-    // a 3D draw depend on many factors, including triangle counts,
-    // texture sizes and format, shader complexity, cache
-    // and memory layout, etc. At this point in time, we don't
-    // have enough information nor implemented hw emulation
-    // capabilities to achieve a proper timing estimate.
-    //
-    // Instead, we will try to measure how complex a scene is based
-    // on the amount of geometry that is drawn, the amount of GPU
-    // commands and the shader complexity. We will ignore all
-    // the other factors for now.
-
-    // Using Mario Kart 7 as the reference, it is understood that on
-    // average the console can handle around 20k triangles per frame.
-    // This game uses standard GPU features, with no fancy stuff,
-    // so we can consider it an average. To prevent hurting performance,
-    // we will also assume the GPU is twice as powerful. Afterall we only
-    // want timing accuracy to fix bugs at this point.
-    // This average already takes into account shader complexity averages.
-    static constexpr float nanoseconds_per_triangle = 800.f / 2;
-
-    // Of the total amount of submitted triangles, many of them will be culled.
-    // This heavily depends on the specific scene, so we will assume 35% of the
-    // triangles being culled. Furthermore, the culled triangles will take way less
-    // processing time as they will skip most of the pipeline processing, so we
-    // can assume that a culled triangle will only take about 20% of the time.
-    static constexpr float culled_triangle_threshold = 0.35f; // 35%
-    static constexpr float culled_triangle_time_cost = 0.20f; // 20%
-
-    // We will assume that each command will take around 6 cycles @ 268MHz
-    // There are no real measurements to support this claim, but it sounds
-    // reasonable. TODO: Measure on real HW.
-    static constexpr float nanoseconds_per_command = 22.4f;
-
-public:
-    inline void AddCommands(size_t commands) {
-        command_count += commands;
-    }
-
-    inline void AddVertices(size_t vertices, PipelineRegs::TriangleTopology topology) {
-        size_t triangles{};
-        if (topology == PipelineRegs::TriangleTopology::Fan ||
-            topology == PipelineRegs::TriangleTopology::Strip) {
-            triangles = (vertices >= 3) ? (vertices - 2) : 1;
-        } else {
-            // Geometry shaders produce more vertices per given vertex,
-            // but they are not that relevant for timing emulation.
-            triangles = vertices / 3;
-        }
-
-        triangle_count += triangles;
-    }
-
-    u64 CalculateAndResetDelay() {
-        float result = command_count * nanoseconds_per_command;
-
-        result += (1.f - culled_triangle_threshold) * triangle_count * nanoseconds_per_triangle;
-        result += culled_triangle_threshold * triangle_count *
-                  (nanoseconds_per_triangle * culled_triangle_time_cost);
-
-        triangle_count = 0;
-        command_count = 0;
-
-        return static_cast<u64>(result);
-    }
-
-private:
+/// Upstream's model of how long the PICA took for a command list, which delayed P3D. The GSP's
+/// interrupts now come when the SGX has done the work (VideoCore::GPU::Signal), so nothing counts
+/// any more; the two counts stay in the savestate archive for the states made before.
+struct ArchivedDelayCounts {
     size_t triangle_count{};
     size_t command_count{};
-
-    friend class boost::serialization::access;
     template <class Archive>
-    void serialize(Archive& ar, const u32 file_version) {
+    void serialize(Archive& ar, const u32) {
         ar & triangle_count;
         ar & command_count;
     }
@@ -384,7 +317,7 @@ public:
     /// WriteInternalReg, which flushes them first (the fast command loop is skipped).
     bool immediate_open{};
 
-    DelayGenerator delay_generator{};
+    ArchivedDelayCounts delay_counts{};
 
     /// Whether the geometry unit takes the vertex unit's uniforms, code and swizzles: not
     /// configured on its own, and no geometry shader.
@@ -414,7 +347,7 @@ private:
         ar & fog;
         ar & input_default_attributes;
         ar & immediate;
-        ar & delay_generator;
+        ar & delay_counts;
         ar & geometry_pipeline;
         ar & primitive_assembler;
         ar & cmd_list;

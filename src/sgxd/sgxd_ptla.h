@@ -95,8 +95,9 @@ uint32_t sgxd_chain_fence(void);
 int sgxd_chain_reached(uint32_t fence);
 int sgxd_chain_ta_reached(uint32_t fence);
 // Spins until the list that returned fence (the count after it) has completed. Returns 0, or -1
-// on a fault or after a second in which no list completed.
+// on a fault or after sgxd_chain_stall_us in which no list completed.
 int sgxd_chain_wait(uint32_t fence);
+extern const uint32_t sgxd_chain_stall_us;
 // Spins until the last list queued completed, as sgxd_chain_wait.
 int sgxd_chain_idle(void);
 // The render drain, then sgxd_ptla_idle and sgxd_chain_idle: nothing of ours runs on the GPU.

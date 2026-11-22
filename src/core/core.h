@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <boost/optional.hpp>
 #include <boost/serialization/version.hpp>
 #include "common/common_types.h"

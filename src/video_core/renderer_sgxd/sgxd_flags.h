@@ -16,9 +16,12 @@ namespace GxmRenderer {
  *   perflog   log a second's `perf:` lines: speed and frame rates, the presents, the command
  *             lists, fills and transfers, the cache operations by site, the FCRAM pages moved
  *             to CDRAM
- *   leakcheck the native core logs guest registers, and IPC reply words, that hold an
- *             address near the emulation thread's stack (24 hits at most): an emulator
- *             address handed to the guest
+  *   parallel  emulated core 1 on a second emulation thread on Vita core 1, at the same time as
+ *             core 0.
+ *             Multicore builds only (ENABLE_VITA_MULTICORE); elsewhere it does nothing
+ *   parallel_slice=N, parallel_skew=N  with parallel, the longest slice and how far a core may
+ *             run past the slowest other, in microseconds (default 4270 each, one slice): a
+ *             shorter slice bounds how long a thread woken on a core in the guest waits
  *   nolimit   no frame limit: the core runs as fast as it goes
  *   novsync   the sgxd present does not wait for the frame before it to be on screen (tears)
  *   holdlog   with perflog, the first 200 page-hold aborts that waited (holdlog=N: from N

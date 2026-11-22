@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -64,6 +65,39 @@ private:
     std::condition_variable condvar;
     std::mutex mutex;
     std::atomic_bool is_set{false};
+};
+
+/**
+ * A mutex and a condition variable on it, for waits two threads make and answer at a high rate
+ * (the HLE DSP's frames). On the Vita they are the kernel's lightweight mutex and condition
+ * variable (SceKernelLwMutex, SceKernelLwCond): newlib's pthread-embedded builds
+ * std::condition_variable from semaphores, and at thousands of waits a second it leaked counts
+ * until every sceKernelSignalSema failed with 0x80028103. Elsewhere
+ * std::mutex and std::condition_variable. Meets BasicLockable, for std::scoped_lock.
+ */
+class CoreCondition {
+public:
+    CoreCondition();
+    ~CoreCondition();
+    CoreCondition(const CoreCondition&) = delete;
+    CoreCondition& operator=(const CoreCondition&) = delete;
+
+    void lock();
+    void unlock();
+    /// With the lock held: releases it, waits for a NotifyAll or the timeout, holds it again.
+    /// False on timeout.
+    bool WaitFor(std::chrono::microseconds timeout);
+    /// With the lock held: wakes every waiter.
+    void NotifyAll();
+
+private:
+#ifdef __vita__
+    alignas(8) std::array<u8, 0x20> lw_mutex{}; ///< SceKernelLwMutexWork
+    alignas(8) std::array<u8, 0x10> lw_cond{};  ///< SceKernelLwCondWork
+#else
+    std::mutex mutex;
+    std::condition_variable condvar;
+#endif
 };
 
 class Barrier {

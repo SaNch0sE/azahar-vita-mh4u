@@ -30,8 +30,9 @@ void AddressArbiter::WaitThread(std::shared_ptr<Thread> thread, VAddr wait_addre
 
 void AddressArbiter::ResumeSignaled(Thread& thread) {
     // The timeout types answered the waiter ResultTimeout when it went to sleep (ArbitrateAddress,
-    // below); a signal before the timeout is a success. Without this libctru's LightEvent_WaitTimeout,
-    // which loops until the timeout result, took every signal for a timeout.
+    // below); a signal before the timeout is a success. Without this libctru's
+    // LightEvent_WaitTimeout, which loops until the timeout result, takes every signal for a
+    // timeout.
     thread.SetWaitSynchronizationResult(ResultSuccess);
     thread.ResumeFromWait();
 }

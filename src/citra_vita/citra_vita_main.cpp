@@ -19,6 +19,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
+#include <unwind.h>
 #include <psp2/message_dialog.h>
 #include <psp2/power.h>
 #include <psp2/shellutil.h>
@@ -31,15 +32,17 @@
 #include "citra_vita/input_factory_vita.h"
 
 #include "azahar_native.h"
-#include "sgxd_ptla.h"
+#include "common/heap_check.h"
+#include "common/named_thread.h"
 #include "core/arm/vita/arm_vita_native.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
+#include "sgxd_ptla.h"
 #include "video_core/renderer_sgxd/vprof.h"
-#include "common/named_thread.h"
 
 #include <cstdio>
 
+#include "audio_core/hle/hle.h"
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/vita_ui.h"
 #include "common/file_util.h"
@@ -105,8 +108,38 @@ void SetupPaths() {
 /// SIGABRT - the crash dump then points at _kill_r and says nothing about the cause, and azahar's
 /// own ASSERT is not it (that traps). std::bad_alloc and the std::system_error that a failing
 /// pthread call turns into both arrive here.
+/// The return addresses on the calling thread's stack, innermost first (ARM EHABI unwind tables).
+struct TerminateTrace {
+    std::array<uintptr_t, 24> pcs{};
+    std::size_t n = 0;
+};
+_Unwind_Reason_Code TerminateTraceStep(_Unwind_Context* context, void* arg) {
+    auto* const trace = static_cast<TerminateTrace*>(arg);
+    if (trace->n == trace->pcs.size()) {
+        return _URC_END_OF_STACK;
+    }
+    trace->pcs[trace->n++] = _Unwind_GetIP(context);
+    return _URC_NO_REASON;
+}
+
 void SetupTerminateHandler() {
     std::set_terminate([] {
+        // First, while the stack is still the throw's: an exception nothing catches reaches
+        // here before any unwinding. The ELF is linked NOASLR, so the addresses are its own
+        // (arm-vita-eabi-addr2line -e citra_vita).
+        TerminateTrace trace;
+        _Unwind_Backtrace(TerminateTraceStep, &trace);
+        char where[24 * 11 + 1] = {};
+        for (std::size_t i = 0, at = 0; i < trace.n; i++) {
+            at += std::snprintf(where + at, sizeof(where) - at, " %08x",
+                                static_cast<unsigned>(trace.pcs[i]));
+        }
+        SceKernelThreadInfo info{};
+        info.size = sizeof(info);
+        const SceUID self = sceKernelGetThreadId();
+        sceKernelGetThreadInfo(self, &info);
+        sceClibPrintf("[azahar] std::terminate on thread %08x \"%s\", stack:%s\n",
+                      static_cast<unsigned>(self), info.name, where);
         std::string what = "no active exception";
         if (std::current_exception()) {
             try {
@@ -150,7 +183,9 @@ void SetupLogging() {
 #ifdef VITA_DIAGNOSTICS
     Common::Log::Initialize();
     Common::Log::Filter filter;
-    filter.ParseFilterString("*:Info");
+    // Debug.Emulated: the guest's own svcOutputDebugString lines (homebrew tests such as
+    // src/native_mc_test/litmus report through it; retail titles rarely call it).
+    filter.ParseFilterString("*:Info Debug.Emulated:Debug");
     Common::Log::SetGlobalFilter(filter);
 #endif
     // The release build starts no logging backend at all, so every LOG_* macro reaches a
@@ -285,8 +320,12 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 
         if (ui.MenuOpen()) {
             // Emulation does not advance while a menu is up, so no frames arrive to carry a
-            // present: make one here.
-            window.Present(&ui);
+            // present: make one here. Under the GPU's lock: with parallel cores the other
+            // emulation thread can be in GPU work.
+            {
+                std::scoped_lock gpu_lock{system.GPU().Lock()};
+                window.Present(&ui);
+            }
             const auto action = static_cast<VitaFrontend::Ui::Action>(window.TakeUiAction());
             switch (action) {
             case VitaFrontend::Ui::Action::QuitGame:
@@ -340,6 +379,16 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 #ifdef VITA_DIAGNOSTICS
                 static const bool perflog = SgxdRenderer::SgxdFlag("perflog");
                 if (perflog) {
+                    // With parallel cores the second emulation thread writes these counters
+                    // (the censuses, the GPU's and sgxd's) under the HLE lock; they are taken
+                    // under it too.
+                    Common::MulticoreLock perf_lock{system.Kernel().GetHLELock(),
+                                                    system.GPU().Lock()};
+                    // A wait for the lock while this prints is charged to it (perflog's own
+                    // cost), not to the site that held the lock last.
+                    static const char perflog_key = 0;
+                    const auto perflog_start = Core::HleCensus::Clock::now();
+                    Core::hle_holder.store(&perflog_key, std::memory_order_relaxed);
                     // The vblank interval split as core/perf_stats.h measures it, in ms.
                     LOG_INFO(Frontend,
                              "perf: speed {:.1f}% game {:.1f} fps shown {:.1f} fps; vblank "

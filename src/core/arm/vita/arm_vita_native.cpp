@@ -16,13 +16,13 @@
 #include "common/host_shared_memory.h"
 #include "common/logging/log.h"
 #include "core/core.h"
-#include "video_core/gpu.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
-#include "core/hle/kernel/vm_manager.h"
 #include "core/hle/kernel/thread.h"
+#include "core/hle/kernel/vm_manager.h"
 #include "core/memory.h"
+#include "video_core/gpu.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/vprof.h"
 
@@ -30,8 +30,10 @@ namespace Core {
 
 namespace {
 
-/// TakeVitaNativeCensus's counts since the last call.
+#ifdef VITA_DIAGNOSTICS
 VitaNativeCensus census;
+std::unordered_map<u32, std::pair<u32, u32>> hold_page_accesses;
+#endif
 
 /// Never hand the guest a slice longer than this, so a runaway guest cannot stall the frontend.
 constexpr u64 MaxQuantumNs = 16'000'000;
@@ -523,11 +525,29 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                          "Vita native backend is not usable");
         return false;
     }
-    if (!map->IsInstalled() && !map->Install()) {
-        system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
-                         "Vita native backend could not install the guest table");
-        usable = false;
-        return false;
+    if (GetID() == 0 || !system.IsParallel()) {
+        if (!map->IsInstalled() && !map->Install()) {
+            system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
+                             "Vita native backend could not install the guest table");
+            usable = false;
+            return false;
+        }
+    } else if (!attached) {
+        // Parallel cores: this core's emulation thread joins the table core 0 installed
+        // once it is there.
+        if (!map->IsInstalled()) {
+            return false;
+        }
+        const int version = azaharVersion();
+        const int ret = version >= 15 ? azaharAttach() : version;
+        if (ret < 0 || version < 15) {
+            system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
+                             "Vita native backend could not install the guest table");
+            usable = false;
+            return false;
+        }
+        // From now on there is a guest view for the GPU's work to hold pages of.
+        system.GPU().EnablePageHolds();
     }
 
     AzaharRunRequest run{};
@@ -565,6 +585,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     // at or past every value the guest read in the slice.
     timer->AddScaledTicks(run.guest_ticks);
 
+#ifdef VITA_DIAGNOSTICS
     census.slices++;
     census.reasons[run.reason < census.reasons.size() ? run.reason : 0]++;
     for (u32 i = 0; i < AZAHAR_FAST_KINDS; i++) {
@@ -613,41 +634,6 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
 }
 
 #ifdef VITA_DIAGNOSTICS
-void ARM_VitaNative::CheckHostLeak(const char* where, u32 svc) {
-    // gxm_flags `leakcheck`: a guest register or IPC word within 64 KiB of this thread's own
-    // stack is an emulator address the guest was handed. The first hits are logged, with where they were seen.
-    static const bool on = GxmRenderer::GxmFlag("leakcheck");
-    static u32 hits = 0;
-    if (!on || hits >= 24) {
-        return;
-    }
-    const u32 stack = static_cast<u32>(reinterpret_cast<uintptr_t>(&where));
-    const auto near_stack = [stack](u32 value) { return value - (stack - 0x10000u) < 0x20000u; };
-    for (int i = 0; i < 15 && hits < 24; i++) {
-        if (near_stack(context.r[i])) {
-            LOG_WARNING(Core_ARM11,
-                        "leakcheck: r{} = {:08X} near the host stack {:08X}, after the {} "
-                        "(svc {:02X}), pc {:08X} lr {:08X}",
-                        i, context.r[i], stack, where, svc, context.r[15], context.r[14]);
-            hits++;
-        }
-    }
-    // After an IPC request: the reply in the thread's command buffer (TLS + 0x80).
-    if (std::string_view{where} == "svc" && svc == 0x32 && cp15[CP15_THREAD_URO] != 0) {
-        const VAddr cmdbuf = cp15[CP15_THREAD_URO] + 0x80;
-        for (u32 w = 0; w < 64 && hits < 24; w++) {
-            const u32 value = memory.Read32(cmdbuf + w * 4);
-            if (near_stack(value)) {
-                LOG_WARNING(Core_ARM11,
-                            "leakcheck: IPC reply word {} = {:08X} near the host stack {:08X} "
-                            "(header {:08X}), pc {:08X}",
-                            w, value, stack, memory.Read32(cmdbuf), context.r[15]);
-                hits++;
-            }
-        }
-    }
-}
-
 void ARM_VitaNative::CountArbitration() {
     // ArbitrateAddress(handle r0, address r1, type r2, value r3, ns r4:r5): would it wake a thread or
     // block this one?

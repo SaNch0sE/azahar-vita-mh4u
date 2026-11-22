@@ -394,6 +394,12 @@ ResultVal<std::shared_ptr<Thread>> KernelSystem::CreateThread(
         LOG_ERROR(Kernel_SVC, "Invalid processor id: {}", processor_id);
         return ResultOutOfRangeKernel;
     }
+    // Indexes thread_managers below: one per emulated core, two on an Old 3DS.
+    if (processor_id < 0 || static_cast<std::size_t>(processor_id) >= thread_managers.size()) {
+        LOG_ERROR(Kernel_SVC, "Processor id {} past the {} cores", processor_id,
+                  thread_managers.size());
+        return ResultOutOfRangeKernel;
+    }
 
     // TODO(yuriks): Other checks, returning 0xD9001BEA
     if (!memory.IsValidVirtualAddress(*owner_process, entry_point)) {

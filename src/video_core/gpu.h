@@ -4,10 +4,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <boost/serialization/access.hpp>
 
@@ -97,18 +100,37 @@ public:
 
     void ApplyPerProgramSettings(u64 program_ID);
 
-    /// Recreates the renderer (for GL context reset in libretro)
-    void RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window);
-
-    /// Releases the renderer (for GL context destroy in libretro)
-    void ReleaseRenderer();
-
     /// Raises the held interrupts (Signal) whose GPU work has completed, in order, without
     /// waiting: the emulation loop's, between slices.
     void DeliverInterrupts();
     /// The guest has nothing to run: waits for the oldest held interrupt's GPU work and raises
     /// what has completed. False when none is held (core timing may idle ahead then).
     bool WaitInterrupt();
+    /// Parallel cores: WaitInterrupt's wait alone, under this lock only, so the HLE lock can be
+    /// let go meanwhile; the next DeliverInterrupts raises what completed. False when none is
+    /// held.
+    bool WaitHeldInterrupt();
+
+    /**
+     * The GPU's own lock. Every entry point takes it (recursively), as do memory's rasterizer
+     * flushes and the frontend's presents, so that with parallel cores the work of GSP's command
+     * queue can run without the HLE lock (GSP_GPU::TriggerCmdReqQueue) while the other core's
+     * svcs go on. Lock order: the HLE lock, then this one; never the other way.
+     */
+    std::recursive_mutex& Lock() const {
+        return lock;
+    }
+    /// Between these (under Lock, without the HLE lock) the interrupts the work raises are kept;
+    /// FlushDeferredInterrupts raises them, in order, once the HLE lock is held again: raising
+    /// one touches kernel state.
+    void BeginUnlockedWork();
+    void EndUnlockedWork();
+    void FlushDeferredInterrupts();
+    /// Whether DeliverInterrupts has anything to deliver, read without the lock (parallel cores:
+    /// a boundary that takes no lock while nothing is due, System::QuietBoundary).
+    [[nodiscard]] bool HasHeldInterrupts() const {
+        return held_count.load(std::memory_order_acquire) != 0;
+    }
 
     /// What a GPU operation is, for `perflog`'s split of the GPU's work and vprof's numbering.
     enum class OpKind : u32 { CmdList, RegWrite, Fill, Transfer, Dma, Count };
@@ -174,7 +196,7 @@ private:
     /// runs. Memory outside guest FCRAM and VRAM stops the emulator.
     std::vector<DmaRun> DmaRuns(VAddr src, VAddr dst, u32 size);
     /// A DMA's runs, queued to the PTLA; the DMA interrupt after delay.
-    void RunDma(const std::vector<DmaRun>& runs, u64 delay);
+    void RunDma(const std::vector<DmaRun>& runs);
 
     /// Runs op, a GSP command's or a register trigger's work (vprof numbers it, perflog times
     /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).
@@ -195,7 +217,14 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 
+    mutable std::recursive_mutex lock;
+    std::atomic<u32> held_count{0}; ///< held_interrupts' size plus the deferred ones
+    bool defer_interrupts = false;
+    std::vector<std::pair<Service::GSP::InterruptId, u64>> deferred_interrupts;
+
     PAddr VirtualToPhysicalAddress(VAddr addr);
+    /// Updates held_count, under the lock.
+    void CountHeld();
 };
 
 } // namespace VideoCore

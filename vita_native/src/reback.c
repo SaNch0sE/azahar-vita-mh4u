@@ -218,8 +218,8 @@ static unsigned reback_retarget_guest(void) {
         }
     }
     if (changed) {
-        asm volatile("dsb" ::: "memory");
-        azahar_tlb_dirty = 1;
+        // A moved page can hold code.
+        tables_changed(1);
     }
     return changed;
 }

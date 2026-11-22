@@ -36,63 +36,6 @@ namespace VideoCore {
 constexpr VAddr VADDR_LCD = 0x1ED02000;
 constexpr VAddr VADDR_GPU = 0x1EF00000;
 
-class DelayGenerator {
-private:
-    DelayGenerator() = default;
-
-    // Average transfer speed based on measurements taken from real
-    // hardware. 4 different modes have been taken into consideration:
-    // RAM -> RAM, RAM -> VRAM, VRAM -> RAM and VRAM -> VRAM.
-    // Furthermore, measurements are split into DMA transfers and tex
-    // copies. For simplicity, we will assume fills are as fast as
-    // texture copies.
-
-    static constexpr double mibps_to_ns_per_byte(double mib_per_sec) {
-        return 1'000'000'000.0 / (mib_per_sec * 1024.0 * 1024.0);
-    }
-
-    static constexpr std::array<std::array<double, 4>, 2> speed_mibps = {
-        {{
-             190.0, // DMA RAMTORAM
-             310.0, // DMA RAMTOVRAM
-             380.0, // DMA VRAMTORAM
-             380.0, // DMA VRAMTOVRAM
-         },
-         {
-             450.0,  // TEX RAMTORAM
-             3100.0, // TEX RAMTOVRAM
-             5400.0, // TEX VRAMTORAM
-             5400.0, // TEX VRAMTOVRAM
-         }}};
-
-public:
-    enum class CopyMode {
-        RAMTORAM,
-        RAMTOVRAM,
-        VRAMTORAM,
-        VRAMTOVRAM,
-    };
-
-    static CopyMode GetCopyMode(bool input_vram, bool output_vram) {
-        if (!input_vram && !output_vram) {
-            return CopyMode::RAMTORAM;
-        } else if (!input_vram && output_vram) {
-            return CopyMode::RAMTOVRAM;
-        } else if (input_vram && !output_vram) {
-            return CopyMode::VRAMTORAM;
-        } else {
-            return CopyMode::VRAMTOVRAM;
-        }
-    }
-
-    static u64 CalculateDelayNanoseconds(CopyMode mode, bool is_textre, size_t size) {
-        double base_ns_per_byte =
-            mibps_to_ns_per_byte(speed_mibps[is_textre][static_cast<u32>(mode)]);
-
-        return static_cast<u64>(size * base_ns_per_byte);
-    }
-};
-
 MICROPROFILE_DEFINE(GPU_DisplayTransfer, "GPU", "DisplayTransfer", MP_RGB(100, 100, 255));
 MICROPROFILE_DEFINE(GPU_CmdlistProcessing, "GPU", "Cmdlist Processing", MP_RGB(100, 255, 100));
 
@@ -107,8 +50,9 @@ GPU::GPU(Core::System& system, Frontend::EmuWindow& emu_window,
 
     // The PICA raises P3D from inside a command list, when the list's IRQ request comes; Signal
     // holds it until the GPU has run the list's work.
-    Service::GSP::InterruptHandler pica_interrupt = [this](Service::GSP::InterruptId id,
-                                                           u64 delay) { Signal(id, delay); };
+    Service::GSP::InterruptHandler pica_interrupt = [this](Service::GSP::InterruptId id, u64) {
+        Signal(id);
+    };
     impl->pica.SetInterruptHandler(pica_interrupt);
 #ifdef ENABLE_GXM
 #endif
@@ -144,9 +88,16 @@ void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op
     impl->rasterizer->GpuIdle();
 }
 
-void GPU::Signal(Service::GSP::InterruptId id, [[maybe_unused]] u64 delay) {
+void GPU::Signal(Service::GSP::InterruptId id) {
     using Service::GSP::InterruptId;
     if (impl->interrupts_muted) {
+        return;
+    }
+    if (defer_interrupts) {
+        // Work running without the HLE lock (BeginUnlockedWork): raised by
+        // FlushDeferredInterrupts, as it would have been here, once the lock is back.
+        deferred_interrupts.emplace_back(id, delay);
+        CountHeld();
         return;
     }
     // The vblanks keep core timing's cadence. Every other interrupt comes when the GPU has
@@ -165,6 +116,31 @@ void GPU::Signal(Service::GSP::InterruptId id, [[maybe_unused]] u64 delay) {
     }
     GPU_TRACE("irq_held", static_cast<unsigned>(id));
     impl->held_interrupts.emplace_back(id, fence);
+    CountHeld();
+}
+
+void GPU::BeginUnlockedWork() {
+    std::scoped_lock gpu_lock{lock};
+    defer_interrupts = true;
+}
+
+void GPU::EndUnlockedWork() {
+    std::scoped_lock gpu_lock{lock};
+    defer_interrupts = false;
+}
+
+void GPU::FlushDeferredInterrupts() {
+    std::scoped_lock gpu_lock{lock};
+    auto deferred = std::exchange(deferred_interrupts, {});
+    for (const auto& [id, delay] : deferred) {
+        Signal(id, delay);
+    }
+    CountHeld();
+}
+
+void GPU::CountHeld() {
+    held_count.store(static_cast<u32>(impl->held_interrupts.size() + deferred_interrupts.size()),
+                     std::memory_order_release);
 }
 
 void GPU::DeliverInterrupts() {
@@ -176,9 +152,20 @@ void GPU::DeliverInterrupts() {
         GPU_TRACE("irq", static_cast<unsigned>(id));
         impl->signal_interrupt(id, 0);
     }
+    CountHeld();
+}
+
+bool GPU::WaitHeldInterrupt() {
+    std::scoped_lock gpu_lock{lock};
+    if (impl->held_interrupts.empty()) {
+        return false;
+    }
+    impl->rasterizer->InterruptWait(impl->held_interrupts.front().second);
+    return true;
 }
 
 bool GPU::WaitInterrupt() {
+    std::scoped_lock gpu_lock{lock};
     if (impl->held_interrupts.empty()) {
         return false;
     }
@@ -283,16 +270,7 @@ void GPU::Execute(const Service::GSP::Command& command) {
         auto runs = DmaRuns(command.dma_request.source_address, command.dma_request.dest_address,
                             command.dma_request.size);
 
-        auto is_vram = [&](u32 addr) {
-            return addr >= Memory::VRAM_VADDR && addr <= Memory::VRAM_VADDR_END;
-        };
-
-        u64 delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(is_vram(command.dma_request.source_address),
-                                        is_vram(command.dma_request.dest_address)),
-            false, command.dma_request.size);
-
-        RunDma(runs, delay);
+        RunDma(runs);
         break;
     }
     case CommandId::SubmitCmdList: {
@@ -570,18 +548,13 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
         }
     });
 
-    // Treat fill as texture transfer from VRAM
-    u64 delay = DelayGenerator::CalculateDelayNanoseconds(
-        DelayGenerator::GetCopyMode(true, config.IsVRAM()), true,
-        config.GetEndAddress() - config.GetStartAddress());
-
     // It seems that it won't signal interrupt if "address_start" is zero.
     // TODO: hwtest this
     if (config.GetStartAddress() != 0) {
         if (intr_index == 0) {
-            Signal(Service::GSP::InterruptId::PSC0, delay);
+            Signal(Service::GSP::InterruptId::PSC0);
         } else if (intr_index == 1) {
-            Signal(Service::GSP::InterruptId::PSC1, delay);
+            Signal(Service::GSP::InterruptId::PSC1);
         }
     }
 
@@ -613,23 +586,12 @@ void GPU::MemoryTransfer() {
                  RunMemoryTransfer(config, allow_display_transfer);
              });
 
-    u64 delay{};
-    if (config.is_texture_copy) {
-        delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
-            config.texture_copy.size);
-    } else {
-        delay = DelayGenerator::CalculateDelayNanoseconds(
-            DelayGenerator::GetCopyMode(config.IsInputVRAM(), config.IsOutputVRAM()), true,
-            config.input_width * config.input_height * BytesPerPixel(config.input_format));
-    }
-
     // Complete transfer.
     config.trigger.Assign(0);
-    Signal(Service::GSP::InterruptId::PPF, delay);
+    Signal(Service::GSP::InterruptId::PPF);
 }
 
-void GPU::RunDma(const std::vector<DmaRun>& runs, u64 delay) {
+void GPU::RunDma(const std::vector<DmaRun>& runs) {
 #ifdef VITA_DIAGNOSTICS
     if (SgxdRenderer::Vprof::Recording()) {
         std::vector<u32> words;
@@ -648,11 +610,12 @@ void GPU::RunDma(const std::vector<DmaRun>& runs, u64 delay) {
             }
         }
     });
-    Signal(Service::GSP::InterruptId::DMA, delay);
+    Signal(Service::GSP::InterruptId::DMA);
 }
 
 #ifdef VITA_DIAGNOSTICS
 void GPU::VprofReplay(const std::string& capture, const std::string& first) {
+    std::scoped_lock gpu_lock{lock};
     // The guest sees none of the replay's interrupts.
     impl->interrupts_muted = true;
     auto& rasterizer = *static_cast<GxmRenderer::RasterizerGxm*>(impl->rasterizer);
@@ -675,7 +638,7 @@ void GPU::VprofReplay(const std::string& capture, const std::string& first) {
             for (std::size_t i = 0; i + 2 < triples.size(); i += 3) {
                 runs.push_back({triples[i], triples[i + 1], triples[i + 2]});
             }
-            RunDma(runs, 0);
+            RunDma(runs);
         },
         [this](std::function<void()> fn) { RunGpuOp(OpKind::RegWrite, fn); },
         [](std::function<void()> fn) { fn(); },
@@ -777,8 +740,8 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
         });
     }
     // Signal to GSP that GPU interrupt has occurred
-    Signal(Service::GSP::InterruptId::PDC0, 0);
-    Signal(Service::GSP::InterruptId::PDC1, 0);
+    Signal(Service::GSP::InterruptId::PDC0);
+    Signal(Service::GSP::InterruptId::PDC1);
 
     // Moved pages the GPU has not used for a while go back to cached FCRAM first, so that the
     // moves below can reuse their pool pages. Rare, as a move is: the GPU idle.
@@ -838,6 +801,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
 }
 
 void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window) {
+    std::scoped_lock gpu_lock{lock};
     // Reset the renderer (this will destroy OpenGL resources)
     impl->renderer.reset();
 
@@ -874,6 +838,7 @@ void GPU::RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow*
 }
 
 void GPU::ReleaseRenderer() {
+    std::scoped_lock gpu_lock{lock};
     // Just reset the renderer to release OpenGL resources
     // Don't null out rasterizer pointer as it will become dangling
     impl->renderer.reset();

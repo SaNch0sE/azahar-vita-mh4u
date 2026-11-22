@@ -214,7 +214,10 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     // go out between slices. A core with nothing to run, when no core has a thread, waits for
     // that work instead of idling ahead in guest time: guest time stands still while the guest
     // waits for the GPU, and runs on while the GPU works for a guest that does not.
-    gpu->DeliverInterrupts();
+    static const char deliver_key = 0;
+    CensusHold(
+        &deliver_key, [] { return std::string("GPU interrupt delivery"); },
+        [this] { gpu->DeliverInterrupts(); });
     const auto idle = [this](ARM_Interface& core) {
         for (const auto& c : cpu_cores) {
             if (kernel->GetThreadManager(c->GetID()).GetCurrentThread() != nullptr) {
@@ -559,6 +562,184 @@ void System::Reschedule() {
     curr_core_reschedule_pending = false;
     kernel->GetThreadManager(running_core->GetID()).Reschedule();
 }
+
+#ifdef VITA_MULTICORE
+bool System::QuietBoundary(ARM_Interface& core, bool main_thread) {
+    // Nothing for the HLE side at this boundary: no reschedule asked for, the thread that ran
+    // goes on (and is no time limiter's to stop), no GPU interrupt to deliver, no event due.
+    const u32 id = core.GetID();
+    if (reschedule_pending[id].load()) {
+        return false;
+    }
+#ifdef ENABLE_GXM
+    if (main_thread && gpu->HasHeldInterrupts()) {
+        return false;
+    }
+#endif
+    auto& manager = kernel->GetThreadManager(id);
+    const auto* const thread = manager.GetCurrentThread();
+    if (thread == nullptr || thread->status != Kernel::ThreadStatus::Running ||
+        manager.TimeLimiting()) {
+        return false;
+    }
+    return core.GetTimer().AdvanceQuietly();
+}
+
+void System::StepCore(ARM_Interface& core, bool main_thread) {
+    auto& timer = core.GetTimer();
+    const u32 id = core.GetID();
+    enum class Next { Run, Idled, Wait, GpuWait } next;
+    if (QuietBoundary(core, main_thread)) {
+        // Such a boundary takes no lock, so it never waits for the
+        // other core's svc or GPU work.
+        const s64 now = static_cast<s64>(timer.GetTicks());
+        timing->PublishTicks(id, now);
+        const s64 room = ParallelRoom(id);
+        if (room <= 0) {
+            next = Next::Wait;
+        } else {
+            timer.SetNextSliceQuietly(room);
+            next = Next::Run;
+        }
+        if (hle_census.on) {
+            hle_census.Of(id).quiet_boundaries++;
+        }
+    } else {
+        const auto hle = LockHle(kernel->GetHLELock(), id);
+#ifdef ENABLE_GXM
+        if (main_thread) {
+            static const char deliver_key = 0;
+            CensusHold(
+                &deliver_key, [] { return std::string("GPU interrupt delivery"); },
+                [this] { gpu->DeliverInterrupts(); });
+        }
+#endif
+        CensusBoundary(id, Boundary::Events, [&] {
+            timer.Advance();
+            core.PrepareReschedule();
+            reschedule_pending[id] = false;
+            kernel->GetThreadManager(id).Reschedule();
+        });
+        const s64 now = static_cast<s64>(timer.GetTicks());
+        timing->PublishTicks(id, now);
+        // How far this core may run: at most one slice, and no more than the skew (one slice by
+        // default, which the sequential loop already allows within an iteration) past the
+        // slowest other core.
+        const s64 room = ParallelRoom(id);
+        bool any_thread = false;
+        for (const auto& other : cpu_cores) {
+            any_thread |= kernel->GetThreadManager(other->GetID()).GetCurrentThread() != nullptr;
+        }
+        if (room <= 0) {
+            next = Next::Wait;
+        } else if (kernel->GetThreadManager(id).GetCurrentThread() != nullptr) {
+            timer.SetNextSlice(room);
+            next = Next::Run;
+        } else {
+            // Nothing to run here: on to the next event, or as far as the other cores allow.
+            timer.SetNextSlice(room);
+            next = Next::Idled;
+#ifdef ENABLE_GXM
+            // With no thread on any core, the main thread waits for the GPU work the guest waits
+            // for, as the sequential loop does (guest time stands still meanwhile), but with the
+            // HLE lock let go: another core's own events can wake a thread there meanwhile.
+            if (main_thread && !any_thread && gpu->HasHeldInterrupts()) {
+                next = Next::GpuWait;
+            } else
+#endif
+            {
+                CensusRun(id, false, [&] { timer.Idle(); });
+            }
+        }
+    }
+    WakeWaitingCores(); // this core's time moved on
+    switch (next) {
+    case Next::Run: {
+        CensusRun(id, true, [&] { core.Run(); });
+        if (reschedule_pending[id].load()) {
+            const auto hle = LockHle(kernel->GetHLELock(), id);
+            CensusBoundary(id, Boundary::Reschedule, [this] { Reschedule(); });
+        }
+        break;
+    }
+    case Next::Wait: {
+        // Until another core's progress gives this one room, a thread is readied here, or the
+        // loop stops. Common::CoreCondition, not std::condition_variable: on the Vita that is
+        // pthread-embedded's, whose semaphores leaked counts at this rate until every
+        // sceKernelSignalSema failed with 0x80028103. The timeout is a
+        // backstop only.
+        const auto start = hle_census.on ? HleCensus::Clock::now() : HleCensus::Clock::time_point{};
+        {
+            std::scoped_lock lk{parallel_cond};
+            parallel_waiters.fetch_add(1);
+            while (!parallel_stop.load() && !reschedule_pending[id].load() &&
+                   ParallelRoom(id) <= 0) {
+                if (!parallel_cond.WaitFor(std::chrono::milliseconds(1))) {
+                    break;
+                }
+            }
+            parallel_waiters.fetch_sub(1);
+        }
+        if (hle_census.on) {
+            auto& t = hle_census.Of(id);
+            t.horizon_wait_us += HleCensus::Since(start);
+            t.horizon_waits++;
+        }
+        break;
+    }
+    case Next::GpuWait:
+        // The interrupts it waited for are delivered at the next boundary, at once.
+        CensusRun(id, false, [&] { gpu->WaitHeldInterrupt(); });
+        break;
+    case Next::Idled:
+        break;
+    }
+}
+
+void System::SecondCoreLoop() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::EmulationSecond);
+    ARM_Interface& core = *cpu_cores[1];
+    running_core = &core;
+    {
+        std::scoped_lock hle{kernel->GetHLELock()};
+        kernel->SetRunningCPU(&core);
+    }
+    LOG_INFO(Core, "Parallel cores: core 1 on its own emulation thread");
+    while (!parallel_stop.load(std::memory_order_acquire)) {
+        StepCore(core, false);
+    }
+}
+
+void System::StartParallel() {
+    // The calling thread owns core 0 from now on.
+    running_core = cpu_cores[0].get();
+    {
+        std::scoped_lock hle{kernel->GetHLELock()};
+        kernel->SetRunningCPU(running_core);
+        for (const auto& core : cpu_cores) {
+            timing->PublishTicks(core->GetID(), static_cast<s64>(core->GetTimer().GetTicks()));
+        }
+    }
+    parallel_stop = false;
+    // Service handling goes deep; the savestate serializer, which needs the most, never runs
+    // here (savestates are refused while cores run in parallel).
+    constexpr std::size_t SecondCoreStackSize = 2 * 1024 * 1024;
+    second_core_thread = Common::NamedThread{Common::ThreadCfg{"emulation core 1", SecondCoreStackSize},
+                                             [this] { SecondCoreLoop(); }};
+}
+
+void System::StopParallel() {
+    if (!second_core_thread.joinable()) {
+        return;
+    }
+    parallel_stop = true;
+    {
+        std::scoped_lock lk{parallel_cond};
+        parallel_cond.NotifyAll();
+    }
+    second_core_thread.join();
+}
+#endif
 
 System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
                                   Frontend::EmuWindow* secondary_window,

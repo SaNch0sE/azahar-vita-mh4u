@@ -34,6 +34,9 @@
 // A blit's wait: the hardware completes at the first read after FLUSH.
 #define TWOD_POLL_US 1000000u
 
+// sgxd_chain_wait's limit: no list completed in this long is a stopped GPU.
+const uint32_t sgxd_chain_stall_us = TWOD_POLL_US;
+
 // sgxd_ptla_events: the ISR's page, and the completions asked for so far (one a FLUSH).
 static const volatile SgxdEvents *events;
 static uint32_t twod_sent;
@@ -159,7 +162,8 @@ int sgxd_chain_wait(uint32_t fence) {
     if (!events || sgxd_chain_reached(fence)) {
         return 0;
     }
-    // A second with no list completed is a stopped GPU; a deep queue takes as long as it takes.
+    // A second with no list completed (sgxd_chain_stall_us) is a stopped GPU; a deep queue takes
+    // as long as it takes.
     const SceUInt64 start = sceKernelGetProcessTimeWide();
     SceUInt64 progress = start;
     uint32_t done = events->chains;
@@ -169,7 +173,7 @@ int sgxd_chain_wait(uint32_t fence) {
             done = events->chains;
             progress = now;
         }
-        if (events->chain_fault || now - progress > TWOD_POLL_US) {
+        if (events->chain_fault || now - progress > sgxd_chain_stall_us) {
             return -1;
         }
     }
