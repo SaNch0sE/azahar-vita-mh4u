@@ -8,6 +8,7 @@
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/version.hpp>
 #include "audio_core/audio_types.h"
+#include "audio_core/hle/effects.h"
 #include "audio_core/hle/shared_memory.h"
 
 namespace AudioCore::HLE {
@@ -42,6 +43,10 @@ private:
         std::array<bool, 2> aux_bus_enable = {};
         std::array<QuadFrame32, 3> intermediate_mix_buffer = {};
 
+        // Effect index i applies to intermediate_mix_buffer[i + 1].
+        std::array<DelayEffect, 2> delay_effect = {};
+        std::array<ReverbEffect, 2> reverb_effect = {};
+
         OutputFormat output_format = OutputFormat::Stereo;
 
         template <class Archive>
@@ -49,6 +54,11 @@ private:
             ar & intermediate_mixer_volume;
             ar & aux_bus_enable;
             ar & intermediate_mix_buffer;
+            // Version 1: the effects. A state from before them starts with both off.
+            if (file_version >= 1) {
+                ar & delay_effect;
+                ar & reverb_effect;
+            }
             ar & output_format;
         }
     };
@@ -62,6 +72,8 @@ private:
     void AuxReturn(const IntermediateMixSamples& read_samples);
     /// INTERNAL: Write samples to shared memory for the ARM11 to modify.
     void AuxSend(IntermediateMixSamples& write_samples, const std::array<QuadFrame32, 3>& input);
+    /// INTERNAL: Apply the delay and reverb effects.
+    void ApplyEffects();
     /// INTERNAL: Mix current_frame.
     void MixCurrentFrame();
     /// INTERNAL: Downmix from quadraphonic to stereo based on status.output_format and accumulate
