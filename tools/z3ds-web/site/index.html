@@ -1,0 +1,105 @@
+<!doctype html>
+<!-- SPDX-FileCopyrightText: 2026 Willi Ye
+     SPDX-License-Identifier: GPL-2.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Z3DS Compressor</title>
+<meta name="description" content="Compress 3DS ROMs into the formats azahar plays directly, in your browser.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M5 3h17l5 5v19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z' fill='%23d9541e'/%3E%3Crect x='7' y='12' width='16' height='13' rx='2' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="masthead">
+  <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+    <path d="M5 3h17l5 5v19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/>
+    <rect x="7" y="12" width="16" height="13" rx="2"/>
+  </svg>
+  <h1>Z3DS Compressor</h1>
+  <p class="lede">Compresses 3DS games into the formats azahar plays directly: <code>.zcci</code>,
+    <code>.zcxi</code>, <code>.z3dsx</code> and <code>.zcia</code>. It all runs in this browser:
+    your files are never uploaded.</p>
+</header>
+
+<main>
+  <section class="intake" aria-label="Add ROMs">
+    <label class="drop" id="drop">
+      <input type="file" id="pick" multiple accept=".3ds,.cci,.cxi,.3dsx,.cia,.app">
+      <svg class="slot" viewBox="0 0 64 48" aria-hidden="true">
+        <rect x="2" y="30" width="60" height="14" rx="4"/>
+        <path d="M16 4h27l7 7v23H16z"/>
+        <path d="M32 14v12m-5-5 5 5 5-5"/>
+      </svg>
+      <span class="drop-title">Drop 3DS ROMs here</span>
+      <span class="drop-sub">or <span class="link">choose files</span></span>
+      <span class="drop-types">.3ds · .cci · .cxi · .3dsx · .cia — decrypted</span>
+    </label>
+    <div class="settings">
+      <label class="level">Compression
+        <select id="level">
+          <option value="3" selected>Level 3 · azahar's default</option>
+          <option value="9">Level 9 · smaller, slower</option>
+          <option value="19">Level 19 · smallest, much slower</option>
+        </select>
+      </label>
+      <span class="threads" id="threads"></span>
+      <button type="button" class="primary" id="all" hidden>Compress all</button>
+    </div>
+  </section>
+
+  <ol class="queue" id="queue" aria-live="polite"></ol>
+
+  <section class="notes">
+    <div>
+      <h2>Playing the compressed files</h2>
+      <p>On a Vita, copy them to <code>ux0:data/azahar/roms/</code>: azahar lists
+        <code>.zcci</code>, <code>.zcxi</code> and <code>.z3dsx</code> files there. On a PC or
+        Android, open them in azahar like any ROM, and install a <code>.zcia</code> the way you
+        install a CIA.</p>
+    </div>
+    <div>
+      <h2>The format</h2>
+      <p>A Z3DS file keeps the ROM in independent zstd frames of 256 KiB (32 MiB for a CIA)
+        followed by a seek table, so azahar decompresses only the parts a game reads. At level 3
+        this page writes the same compressed bytes as azahar's own compressor.</p>
+    </div>
+    <div>
+      <h2>Your browser</h2>
+      <p>Chrome and Edge save straight to disk. Firefox and Safari build the file in the
+        browser's storage first, then download it, so they need room for it twice for a
+        moment.</p>
+    </div>
+  </section>
+</main>
+
+<template id="card">
+  <li class="rom">
+    <div class="cart" aria-hidden="true"><div class="label"><canvas width="48" height="48"></canvas></div></div>
+    <div class="body">
+      <div class="head">
+        <h2 class="title"></h2>
+        <p class="sub"></p>
+      </div>
+      <dl class="facts"></dl>
+      <ul class="checks"></ul>
+      <p class="error" hidden></p>
+      <div class="progress" hidden>
+        <div class="bar"><i></i></div>
+        <p class="stat"></p>
+      </div>
+      <p class="result" hidden></p>
+      <div class="actions">
+        <span class="out"></span>
+        <button type="button" class="primary act-compress">Compress</button>
+        <button type="button" class="ghost act-cancel" hidden>Cancel</button>
+        <a class="button primary act-download" hidden></a>
+        <button type="button" class="ghost act-remove">Remove</button>
+      </div>
+    </div>
+  </li>
+</template>
+</body>
+</html>
