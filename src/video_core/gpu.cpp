@@ -251,6 +251,14 @@ bool GPU::GuestAbort([[maybe_unused]] const u8* host, [[maybe_unused]] bool writ
 }
 
 #ifdef VITA_DIAGNOSTICS
+void GPU::CheckHoldsSent(const char* where) {
+    impl->render->CheckHoldsSent(where);
+}
+
+std::string GPU::GuestHoldState(const u8* host) {
+    return impl->render->HoldState(host);
+}
+
 void GPU::GuestIdle() {
     if (impl->scans_pending.empty()) {
         return;

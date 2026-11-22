@@ -196,6 +196,10 @@ public:
     /// Since the last call (`perflog`): T12's texture pages written by the guest (aborts) and
     /// the texture pages the HLE wrote (InvalidateWritten).
     std::pair<u32, u32> TakeTextureWrites();
+    /// No page held less than the module still holds it (`where`).
+    void CheckHoldsSent(const char* where);
+    std::string HoldState(const u8* host);
+    std::string VersionList() const;
 #endif
     /// A vblank: a frame starts for the page versions (changed pages remapped, versions armed again).
     void StartFramePageHolds();
@@ -584,9 +588,9 @@ private:
     void PutPageRemaps();
     /// Waits for the work a guest access to the page waits for, the open holds' ticket fenced first.
     void WaitHeldPage(u32 page, bool write);
-    /// A texture page the HLE wrote: the render side marks the textures over it written
-    /// (RasterizerSgxd::TexturesWritten), in order with the work.
-    void TextureWritten(u32 page);
+    /// Guest FCRAM written (a watched texture page, or the HLE's write): the render side marks the
+    /// textures over it written, in order with the work.
+    void TexturesWritten(PAddr address, u32 size);
 #ifdef VITA_DIAGNOSTICS
     u32 texture_write_faults{}, texture_write_hle{};
 #endif

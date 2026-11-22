@@ -47,6 +47,10 @@ PageHolds::PageHolds(Memory::MemorySystem& memory)
     ranges.resize(pages);
     write_kinds.resize(pages);
     write_ranges.resize(pages);
+    sent.resize(pages);
+    changed_by.resize(pages);
+    written_by.assign(fcram_pages, ByAll);
+    past_lines.resize(fcram_pages);
 #endif
     ASSERT_MSG(fcram_host != nullptr && vram_host != nullptr,
                "page holds: guest FCRAM or VRAM has no host address");
@@ -117,8 +121,12 @@ bool PageHolds::Seen(PAddr addr, u32 bytes, u32 kind) {
     return false;
 }
 
+#ifdef VITA_DIAGNOSTICS
+[[gnu::noinline]]
+#endif
 void PageHolds::Change(u32 page, Access access) {
 #ifdef VITA_DIAGNOSTICS
+    changed_by[page] = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     if (access > applied[page]) {
         stats.held_pages++;
     } else {
@@ -400,14 +408,22 @@ void PageHolds::WatchIndices(u32 first, u32 count) {
 }
 
 void PageHolds::IndexWritten(u32 page, u32 reached) {
+    IndexWrittenUnsent(page, reached);
+    Flush();
+}
+
+void PageHolds::IndexWrittenUnsent(u32 page, u32 reached) {
     index_stamp[page]++;
     index_write_frame[page] = frame;
     index_watch[page] = 0;
+    // An open page has nothing to open.
+    if (applied[page] == Unheld) {
+        return;
+    }
     const Access wanted = Wanted(page, reached);
     if (wanted < applied[page]) {
         Change(page, wanted);
     }
-    Flush();
 }
 
 void PageHolds::Unwatch(u32 page, u32 reached) {
@@ -529,7 +545,24 @@ void PageHolds::Release(u32 reached) {
     while (!groups.empty() && !Live(groups.front().ticket, reached)) {
         for (const Run& run : groups.front().runs) {
             for (u32 p = run.first; p < run.first + run.count; p++) {
-                const Access wanted = Wanted(p, reached);
+                // Nothing to change (below): an FCRAM page, not versioned, closed to writes or
+                // open (a live write would have closed it whole), or a VRAM page the GPU wrote.
+                // Most of a frame's pages: the loop was ~1.25% of a game's emulation thread.
+                if (p < fcram_pages ? applied[p] <= ReadOnly && !versions[p].on
+                                    : applied[p] == NoAccess) {
+                    continue;
+                }
+                Access wanted = Wanted(p, reached);
+                // Lazily, as the next frame holds the same pages again: each let go of and held
+                // again was two descriptor changes a page (a game's fight, ~17500 pages each
+                // way a second, azaharHold ~2.4% of its emulation thread). A VRAM page the GPU
+                // wrote stays closed (the next frame's passes write the same render targets, the
+                // guest's CPU rarely touches VRAM); an FCRAM page whose work is all done stays
+                // closed to writes, reads going on. An access opens either as any abort on a page
+                // with no live hold (PageFault, Reopen).
+                if (wanted == Unheld && p < fcram_pages && !versions[p].on) {
+                    wanted = ReadOnly;
+                }
                 if (wanted < applied[p]) {
                     Change(p, wanted);
                 }
@@ -747,6 +780,9 @@ void PageHolds::Flush() {
     changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
     calls_runs.clear();
     for (const u32 p : changed) {
+#ifdef VITA_DIAGNOSTICS
+        sent[p] = applied[p];
+#endif
         const u8* const host = p < fcram_pages ? fcram_host + (p << PageBits)
                                                : vram_host + ((p - fcram_pages) << PageBits);
         const u32 va = static_cast<u32>(reinterpret_cast<uintptr_t>(host));
@@ -945,6 +981,42 @@ std::string PageHolds::DisplayState(u32 page, u32 reached) const {
                        Live(write_ticket[page], reached) ? "live" : "done", write_lo[page][0],
                        write_hi[page][0], write_lo[page][1], write_hi[page][1], parse_held[page],
                        index_watch[page]);
+}
+
+u32 PageHolds::LoweredUnsent() const {
+    for (const u32 p : changed) {
+        if (applied[p] < sent[p]) {
+            return p;
+        }
+    }
+    return NoPage;
+}
+
+std::string PageHolds::HoldState(u32 page, u32 reached) const {
+    const bool queued = std::find(changed.begin(), changed.end(), page) != changed.end();
+    std::string s = fmt::format("applied {} sent {} {} by {:#010x}, parse {}, write {} {}",
+                                applied[page], sent[page], queued ? "queued" : "not queued",
+                                changed_by[page], parse_held[page], write_ticket[page],
+                                Live(write_ticket[page], reached) ? "live" : "done");
+    if (page < fcram_pages) {
+        const PageVersion& v = versions[page];
+        s += fmt::format(", read {} {}, watch {}, version on {} armed {} guest {} gpu {}, {} flips "
+                         "queued, {} changed queued",
+                         read_ticket[page], Live(read_ticket[page], reached) ? "live" : "done",
+                         index_watch[page], v.on, v.armed, v.guest, v.gpu, flips.size(),
+                         changed.size());
+    }
+    return s;
+}
+
+std::string PageHolds::VersionList() const {
+    std::string s = fmt::format("{} versioned pages:", versioned.size());
+    for (const u32 page : versioned) {
+        const PageVersion& v = versions[page];
+        s += fmt::format(" {:#010x} (guest {} gpu {}{}{})", AddressOf(page), v.guest, v.gpu,
+                         v.armed ? " armed" : "", v.cached ? " cached" : "");
+    }
+    return s;
 }
 
 PageHolds::Kind PageHolds::WaitKind(u32 page, bool write, u32 reached) const {

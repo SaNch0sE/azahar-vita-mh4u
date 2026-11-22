@@ -2510,6 +2510,9 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
         LeaseMutex(kernel, regs[0]);
     }
     core.svc_context.CallSVCForUpcall(svc);
+#ifdef VITA_DIAGNOSTICS
+    upcall_system->GPU().CheckHoldsSent("an svc's upcall");
+#endif
     core.upcall_regs_live = false;
     // The outputs: r0 the result, r1-r12 into the frame. Some svcs' outputs reach past r3
     // (QueryMemory's go to r5).
@@ -2809,6 +2812,9 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     // A slice that ended inside an upcall runs the same thread on at once, a minimal quantum at a
     // time, until it is back in its own code (RunSliceOnce sets upcall_again).
     for (;;) {
+#ifdef VITA_DIAGNOSTICS
+        upcall_held = upcall_again;
+#endif
         upcall_again = false;
         const bool go_on = RunSliceOnce(quantum_ns);
         if (!upcall_again) {
@@ -2887,6 +2893,10 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         run.store_permits = nullptr;
     }
 #ifdef VITA_DIAGNOSTICS
+    // A held upcall's C++ may stand halfway through a change of the holds: checked when it is back.
+    if (!upcall_held) {
+        system.GPU().CheckHoldsSent("a slice");
+    }
 #endif
     const int ret = azaharRun(&run);
     if (ret < 0) {
@@ -3083,6 +3093,20 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         if (LumaAliasAccess(write)) {
             return !break_flag && !stop_requested;
         }
+#ifdef VITA_DIAGNOSTICS
+        // A permission fault no hold took: the holds' record of the page.
+        if (const u8* const host = map->HostAt(run.far); status == 0xFu && host != nullptr) {
+            LOG_CRITICAL(Core_ARM11, "page holds at {:08X}: {}", run.far,
+                         system.GPU().GuestHoldState(host));
+        }
+        if (const u32 next_page = (run.far & ~0xFFFu) + 0x1000u;
+            status == 0xFu && (run.far & 0xFFFu) + AccessReach(run.ctx.r[15]) > 0x1000u) {
+            if (const u8* const host = map->HostAt(next_page); host != nullptr) {
+                LOG_CRITICAL(Core_ARM11, "page holds at {:08X} (the next page): {}", next_page,
+                             system.GPU().GuestHoldState(host));
+            }
+        }
+#endif
         ReportFault();
         return false;
     }

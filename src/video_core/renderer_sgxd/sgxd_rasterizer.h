@@ -107,10 +107,11 @@ public:
     void EndFrame() {
         frames++;
     }
-    /// The HLE wrote a texture page (RenderThread's GuestWrote, Y2R's picture): the textures
-    /// over it are untiled again at their next use.
-    void GuestWrote(PAddr page) {
-        TexturesWritten(page, page + 0x1000);
+    /// The guest wrote a watched texture page (T12), or the HLE wrote [address, address + size)
+    /// (RenderThread's GuestWrote, Y2R's picture): the textures over it are untiled again at
+    /// their next use.
+    void GuestWrote(PAddr address, u32 size) {
+        TexturesWritten(address, address + size);
     }
     /// the late skip dropped a draw into `colour` with that viewport (RenderThread's LateDropped): a double
     /// render being skipped over that buffer (or its copy) never sees its blend back, so the

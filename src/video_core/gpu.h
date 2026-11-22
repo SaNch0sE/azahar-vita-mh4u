@@ -192,6 +192,10 @@ public:
     /// scan's end and this idle: what a scan off the emulation thread could hide, if the guest
     /// waited for nothing but the list's P3D here (diagnostics: `perflog`).
     void GuestIdle();
+    /// The page holds' record agrees with the guest's view as the guest goes on (`where`).
+    void CheckHoldsSent(const char* where);
+    /// The page holds' record of the page at `host`, for a guest fault's report.
+    std::string GuestHoldState(const u8* host);
     struct ScanRoom {
         u32 lists;               ///< scans an idle has followed
         u64 scan_us;             ///< their time on the emulation thread

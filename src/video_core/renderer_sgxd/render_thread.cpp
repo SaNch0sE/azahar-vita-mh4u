@@ -1555,6 +1555,9 @@ void RenderThread::ReleaseParsed() {
 bool RenderThread::ParseFault(u32 page) {
     ReleaseParsed();
     if (!page_holds.ParseHeld(page)) {
+        // The pages the copied lists let go of open now (a guest store there must not abort on a page the
+        // record says is open).
+        page_holds.Apply();
         return false;
     }
     // Each unparsed list that reads the page reads a copy of it as handed over, and lets it go.
@@ -2328,34 +2331,72 @@ void RenderThread::InvalidateWritten(PAddr addr, u32 size) {
         return;
     }
     const u8* const end = host + size;
+    // The range's FCRAM pages, first and one past the last.
+    u32 first = PageHolds::NoPage, last = 0;
     for (const u8* p = host; p < end;
          p = reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1)) {
         const u32 page = page_holds.PageOf(p);
         if (page != PageHolds::NoPage && page < Memory::FCRAM_SIZE >> 12) {
             // Watched or not: Y2R writes without a fault. A watched texture page opens as its
             // other holds allow; the range's record below marks its textures (T12).
-            page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
-            TextureWritten(page);
+            page_holds.IndexWrittenUnsent(page, reached.load(std::memory_order_acquire));
+            if (page_holds.Watched(page)) {
+                page_holds.UnwatchUnsent(page, reached.load(std::memory_order_acquire));
+            }
+            first = std::min(first, page);
+            last = std::max(last, page + 1);
 #ifdef VITA_DIAGNOSTICS
             texture_write_hle++;
 #endif
         }
     }
+    if (first != PageHolds::NoPage) {
+        TexturesWritten(page_holds.AddressOf(first), (last - first) << 12);
+    }
+    // The guest's view of the range in one azaharHold. Sent page by page, each was a syscall
+    // forwarded out of the upcall (Y2R's StartConversion): MH Generations' opening movie, ~70
+    // pages a conversion, made ~2000 a second at ~25000 cycles each.
+    page_holds.Apply();
 }
 
-void RenderThread::TextureWritten(u32 page) {
+void RenderThread::TexturesWritten(PAddr address, u32 size) {
     ASSERT_MSG(sceKernelGetThreadId() == producer,
                "render thread: a texture's page written off the emulation thread; {}",
                Common::DescribeWaiters(wake_flag));
     // Closed, not published: the texture's next use is a later record, whose publish takes this along
     // (publishing would wake a sleeping render thread each time).
-    const u32 address = static_cast<u32>(page_holds.AddressOf(page));
-    std::memcpy(Begin(Op::GuestWrote, sizeof(address)), &address, sizeof(address));
+    const std::array<u32, 2> range{static_cast<u32>(address), size};
+    std::memcpy(Begin(Op::GuestWrote, sizeof(range)), range.data(), sizeof(range));
     write += open_record;
     ForgetDroppedOutputs(address, address + size);
 }
 
 #ifdef VITA_DIAGNOSTICS
+void RenderThread::CheckHoldsSent(const char* where) {
+    if (!page_holds_on) {
+        return;
+    }
+    const u32 page = page_holds.LoweredUnsent();
+    DEBUG_ASSERT_MSG(page == PageHolds::NoPage,
+                     "render thread: page {:#010x} let go of but not sent as {} goes on: {}",
+                     page_holds.AddressOf(page), where,
+                     page_holds.HoldState(page, reached.load(std::memory_order_acquire)));
+}
+
+std::string RenderThread::HoldState(const u8* host) {
+    const u32 page = page_holds.PageOf(host);
+    if (!page_holds_on || page == PageHolds::NoPage) {
+        return "no page of the holds";
+    }
+    return fmt::format("page {:#010x}: {}; {}", page_holds.AddressOf(page),
+                       page_holds.HoldState(page, reached.load(std::memory_order_acquire)),
+                       renderer.DescribePages(page_holds.AddressOf(page), 0x1000));
+}
+
+std::string RenderThread::VersionList() const {
+    return page_holds_on ? page_holds.VersionList() : "the page holds are off";
+}
+
 std::pair<u32, u32> RenderThread::TakeTextureWrites() {
     return {std::exchange(texture_write_faults, 0), std::exchange(texture_write_hle, 0)};
 }
@@ -3468,9 +3509,9 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
 #endif
         break;
     case Op::GuestWrote: {
-        u32 addr;
-        take(addr);
-        rasterizer.GuestWrote(addr);
+        std::array<u32, 2> range;
+        take(range);
+        rasterizer.GuestWrote(range[0], range[1]);
         break;
     }
     case Op::LateDropped: {

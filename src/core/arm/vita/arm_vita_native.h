@@ -332,6 +332,10 @@ private:
     std::atomic<bool> stop_requested{};
     /// The slice ended inside an upcall: RunSlice runs the thread on.
     bool upcall_again{};
+#ifdef VITA_DIAGNOSTICS
+    /// This round of RunSlice goes on inside an upcall the last one left held.
+    bool upcall_held{};
+#endif
     /// An upcall's svc register file; `run.ctx` is the live state of an exit inside the upcall.
     std::array<u32, 16> upcall_regs{};
     bool upcall_regs_live{};

@@ -215,6 +215,9 @@ public:
     }
     /// A write to the page (or one may have been made): its stamp moves on, the watch goes.
     void IndexWritten(u32 page, u32 reached);
+    /// IndexWritten with the guest's view left to the caller's Apply, for a range of pages
+    /// written at once: one azaharHold for all of them.
+    void IndexWrittenUnsent(u32 page, u32 reached);
     /// Whether the page is closed to writes by the index watch alone (Wanted without it: open).
     [[nodiscard]] bool ClosedByIndexWatchAlone(u32 page, u32 reached) const {
         return IndexWatched(page) && HoldsWant(page, reached) == Unheld && !Watched(page) &&
@@ -275,6 +278,12 @@ public:
     [[nodiscard]] std::pair<Kind, std::pair<PAddr, u32>> WriterOf(u32 page) const {
         return {static_cast<Kind>(write_kinds[page]), write_ranges[page]};
     }
+    /// A page whose access went below what the module was last sent (Flush), or NoPage: the
+    /// guest's view still closed where the record says open, and a guest abort there taken for
+    /// the guest's own fault (PageFault finds no hold).
+    [[nodiscard]] u32 LoweredUnsent() const;
+    [[nodiscard]] std::string HoldState(u32 page, u32 reached) const;
+    [[nodiscard]] std::string VersionList() const;
 #endif
 
 private:
@@ -429,6 +438,14 @@ private:
     std::vector<u8> write_kinds;
     std::vector<std::pair<PAddr, u32>> write_ranges;
     u8 vram_read_kind{};
+    std::vector<u8> sent;
+    std::vector<uintptr_t> changed_by;
+    /// Why each FCRAM page's `written` is set, and the 32-byte lines stores past the holds
+    /// touched since its last clean.
+    enum WrittenBy : u8 { ByOpen = 1, ByFlip = 2, ByPast = 4, ByAll = 8 };
+    std::vector<u8> written_by;
+    std::vector<std::array<u32, 4>> past_lines;
+    void NotePast(u32 page, const u8* host, u32 bytes);
 #endif
 };
 
