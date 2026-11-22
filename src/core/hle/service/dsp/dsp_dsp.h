@@ -256,6 +256,9 @@ private:
     /// Checks if we are trying to register more than 6 events
     bool HasTooManyEventsRegistered() const;
 
+    /// The application's signal of the semaphore event reaches the DSP (SetSemaphore).
+    void SetSemaphoreNotifier();
+
     Core::System& system;
 
     std::shared_ptr<Kernel::Event> semaphore_event;
@@ -272,6 +275,10 @@ private:
         DEBUG_SERIALIZATION_POINT;
         ar& boost::serialization::base_object<Kernel::SessionRequestHandler>(*this);
         ar & semaphore_event;
+        if (Archive::is_loading::value) {
+            // A notifier is not in a state: the restored event is a new one without it.
+            SetSemaphoreNotifier();
+        }
         ar & preset_semaphore;
         ar & interrupt_zero;
         ar & interrupt_one;

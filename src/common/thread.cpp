@@ -221,8 +221,8 @@ void SetCurrentThreadName(const char*) {
  * guest's for one slice and back (docs/native-execution.md), so the emulation thread and the guest
  * share core 2, and nothing else of ours goes there. The second
  * emulation thread (the emulated cores other than core 0) has core 1 the same way, with the HLE
- * DSP's thread beside it (and on core 3 when core 1 is taken); the render thread
- * (SgxdRenderer::RenderThread: the rasterizer, sgxd and the presents) has core 0 with Y2R.
+ * DSP's thread beside it (and on core 3, before the parse, when core 1 is taken); the render
+ * thread (SgxdRenderer::RenderThread: the rasterizer, sgxd and the presents) has core 0 with Y2R.
  * Everything else - the command lists' parse and the miscellaneous threads - goes to
  * core 3 with whatever the system keeps there; the shader workers take what cores 0 and 3
  * leave, and core 1 where the multicore setting is off.
@@ -239,11 +239,12 @@ int RoleCores(ThreadRole role, std::size_t index) {
         // The emulated cores other than core 0, the guest on this core as on core 2.
         return 1 << 1;
     case ThreadRole::Dsp:
-        // The DSP's frames take a fifth of the emulation thread's time in a game's race. Beside the
-        // second emulation thread, which sleeps most of the time (a game's ~870 ms a second)
-        // and leaves the core to it between its slices (PriorityCore), or on core 3: on core 1
-        // alone, the DSP ran ahead of core 2's job for half of the main thread's wait for it
-        // (a game).
+        // The DSP's frames take a fifth of the emulation thread's time. Beside the second emulation
+        // thread, which sleeps most of the time and leaves the core to it between its slices
+        // (PriorityCore), or on core 3, where it goes before the parse: a frame starts at the
+        // application's answer to the last interrupt, often while its sound thread still runs on
+        // core 1, and the emulation thread waits at the tick for a frame that has not run
+        // (PriorityCore).
         return 1 << 1 | 1 << 3;
     case ThreadRole::Parse:
         // The command lists' parse, ahead of the render thread, on a core of its own (on core 0 the
@@ -287,26 +288,26 @@ constexpr int PriorityCore(ThreadRole role) {
     case ThreadRole::SecondEmulation:
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH;
     case ThreadRole::Dsp:
-        // Behind the second emulation thread: with core 1 taken the DSP's frames go to core 3
-        // (RoleCores), and the emulated cores' jobs the main thread waits for go on (a game's
-        // wait for core 2's job: the DSP on core 1 for 46% of it at the same priority).
+        // Behind the second emulation thread on core 1: the emulated cores' jobs the main thread
+        // waits for go on. Before the parse on core 3: with core 1 taken the frame starts there at
+        // once (behind both, the emulation thread waited for it at the tick).
         return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
+    case ThreadRole::Parse:
+    case ThreadRole::Y2r:
+    case ThreadRole::UsbVideo:
+        // Behind the render thread on core 0 (Y2R) and the DSP on core 3, before the rest on
+        // core 3 (the parse). A USB frame takes a millisecond or two: before the shader workers,
+        // whose jobs hold a core for tens of milliseconds, it is never a frame late.
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 2;
     case ThreadRole::ShaderTier1:
         // Behind the parse and Y2R, which share its cores (a geometry program takes tens of
         // milliseconds, and at their priority it could hold either that long), before the second
         // tier: the render thread may be waiting for its program.
-        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 2;
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 3;
     case ThreadRole::ShaderCompiler:
         // Behind the first tier's worker; a job runs for up to hundreds of milliseconds. Before
         // the miscellaneous threads (azaharnative gives the app core 3).
-        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 3;
-    case ThreadRole::Parse:
-    case ThreadRole::Y2r:
-    case ThreadRole::UsbVideo:
-        // Behind the render thread on core 0 (Y2R), before the rest on core 3 (the parse). A USB
-        // frame takes a millisecond or two: before the shader workers, whose jobs hold a core for
-        // tens of milliseconds, it is never a frame late.
-        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 1;
+        return SCE_KERNEL_PROCESS_PRIORITY_USER_HIGH + 4;
     case ThreadRole::Other:
         return SCE_KERNEL_PROCESS_PRIORITY_USER_DEFAULT;
     }

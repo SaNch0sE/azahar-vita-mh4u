@@ -2469,17 +2469,23 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     if (auto* dsp = dynamic_cast<AudioCore::DspHle*>(&system.DSP())) {
                         const auto d = dsp->TakeStats();
                         LOG_INFO(Frontend,
-                                 "perf: dsp: {} frames, {:.1f} ms on its thread ({:.2f} ms a "
-                                 "frame); {} waits at the interrupt, {:.2f} ms; {} semaphore "
+                                 "perf: dsp: {} frames ({} started at the tick), {:.1f} ms on "
+                                 "its thread ({:.2f} ms a frame); {} waits at the interrupt, "
+                                 "{:.2f} ms; {} semaphore "
                                  "signals, {:.0f} us after the interrupt (longest {}); {} ticks "
                                  "with no new frame from the application, {} buffer changes "
-                                 "reported in them",
-                                 d.frames, d.work_us / 1e3,
+                                 "reported in them; ticks waited {} steps for the answer, {} "
+                                 "given up; frames started {:.0f} us after their post, the "
+                                 "ones waited for were posted {:.0f} us before the wait",
+                                 d.frames, d.tick_frames, d.work_us / 1e3,
                                  d.frames ? d.work_us / 1e3 / d.frames : 0.0, d.waits,
                                  d.wait_us / 1e3, d.semaphores,
                                  d.semaphores ? static_cast<double>(d.answer_us) / d.semaphores
                                               : 0.0,
-                                 d.answer_longest_us, d.late_ticks, d.late_buffer_changes);
+                                 d.answer_longest_us, d.late_ticks, d.late_buffer_changes,
+                                 d.tick_waits, d.unanswered,
+                                 d.frames ? static_cast<double>(d.start_us) / d.frames : 0.0,
+                                 d.waits ? static_cast<double>(d.wait_lead_us) / d.waits : 0.0);
                     }
                     // sgxd_flags threadtimes: each placed thread's run time in the second and
                     // the cores it may take; psp2prof's sampler holds core 3, so its share shows

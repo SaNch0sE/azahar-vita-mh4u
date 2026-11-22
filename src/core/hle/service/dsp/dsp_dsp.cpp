@@ -346,6 +346,13 @@ bool DSP_DSP::HasTooManyEventsRegistered() const {
     return number >= max_number_of_interrupt_events;
 }
 
+void DSP_DSP::SetSemaphoreNotifier() {
+    if (semaphore_event) {
+        semaphore_event->SetHLENotifier(
+            [this]() { this->system.DSP().SetSemaphore(preset_semaphore); });
+    }
+}
+
 DSP_DSP::DSP_DSP(Core::System& system)
     : ServiceFramework("dsp::DSP", DefaultMaxSessions), system(system) {
     static const FunctionInfo functions[] = {
@@ -391,8 +398,7 @@ DSP_DSP::DSP_DSP(Core::System& system)
     semaphore_event =
         system.Kernel().CreateEvent(Kernel::ResetType::OneShot, "DSP_DSP::semaphore_event");
 
-    semaphore_event->SetHLENotifier(
-        [this]() { this->system.DSP().SetSemaphore(preset_semaphore); });
+    SetSemaphoreNotifier();
 
     system.DSP().SetInterruptHandler([dsp_ref = this, &system](InterruptType type, DspPipe pipe) {
         std::scoped_lock lock{system.Kernel().GetHLELock()};

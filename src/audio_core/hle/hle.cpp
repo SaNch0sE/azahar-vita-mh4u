@@ -90,15 +90,30 @@ private:
     // application keeps to the shared memory's protocol with it: the application writes a
     // region and signals the semaphore; at its audio tick the DSP reads the region with the
     // newer frame counter, writes its statuses and output into the other one, and interrupts;
-    // the application touches the regions again only after that interrupt. Here the tick, on
-    // the emulation thread, picks the region (the guest ran on this core: its writes are in
-    // order here, and the lock below hands them to the DSP thread) and posts the frame; the
-    // interrupt fires half a frame later, on the emulation thread again, once the DSP thread
-    // has finished, so the application sees the frame done at the same guest time every run.
-    // Whatever else touches the DSP's state (the pipe's state changes, a savestate) waits for
-    // the thread first (Finish).
+    // the application touches the regions again only after that interrupt.
+    //
+    // Here the frame starts at the application's semaphore signal, its answer to the last
+    // interrupt: the region it wrote is the one the tick would read, and it leaves both alone
+    // from there on. The DSP thread has the rest of the frame's time for it, and the tick, on
+    // the emulation thread, finds it done and fires the interrupt: answer, frame, tick and
+    // interrupt follow each other, the emulation thread waits for nothing, and no lock is
+    // needed. The application sees each frame done at its tick, as on the 3DS.
+    //
+    // The application's sound thread may run on the other emulation thread, beside this one, and
+    // come late: its wake-up crosses the threads, and core 1 gives it a share of its time. A frame
+    // made at a tick while it still read the last frame's statuses or wrote its next frame came
+    // from the old region and put statuses into the region in use: buffer changes the application
+    // never read, or read for one voice of a pair only. So a tick with no answer yet waits for it,
+    // in steps of guest time. An application that stops answering (TickWaitSteps steps, one frame)
+    // is not waited for again until it signals: its frames (and the first one, before any answer)
+    // start at the tick, which waits for the DSP thread and then interrupts.
+    // Whatever else touches the DSP's state (the pipe's state changes, a savestate) waits for the
+    // thread first (Finish).
 public:
     void Finish();
+    /// The application's semaphore signal: its answer to the last interrupt, and the next
+    /// frame's start.
+    void Answered();
     /// DspHle::DescribeWorker's text.
     void DescribeWorker(char* out, std::size_t size) const;
 #ifdef VITA_DIAGNOSTICS
@@ -109,7 +124,9 @@ public:
 private:
     void Worker();
     void Post(std::size_t read, bool late);
-    void InterruptCallback();
+    /// Posts the frame of the region the application wrote last. `at_tick`: the tick starts
+    /// it, not the application's answer.
+    void StartFrame(bool at_tick);
 
     DspState dsp_state = DspState::Off;
     std::array<std::vector<u8>, num_dsp_pipe> pipe_data{};
@@ -132,10 +149,16 @@ private:
     DspHle& parent;
     Core::Timing& core_timing;
     Core::TimingEventType* tick_event{};
-    Core::TimingEventType* interrupt_event{};
-    /// A frame posted whose interrupt has not fired (interrupt_event is scheduled). Not in a
-    /// savestate: one restored with the event scheduled has it false.
-    bool interrupt_pending{};
+    /// The emulation thread's: a frame is posted whose interrupt has not fired (the coming
+    /// tick's), the last interrupt has no answer (the application's semaphore signal) yet, the
+    /// application answers its interrupts (it has, and no wait for it ran out since), and the
+    /// steps the coming tick has waited for the answer. None is in a savestate: a restored
+    /// one starts as an application that has not answered yet.
+    bool frame_pending{};
+    bool awaiting_answer{};
+    bool answers{};
+    u32 tick_waits{};
+    static constexpr u32 TickWaitSteps = 16;
 
     /// Under frame_cond: the frames posted and generated, the posted frame's read region, the
     /// thread's end, and the counters.
@@ -151,6 +174,8 @@ private:
     bool frame_late{};
     u32 last_tick_key{~0u};
     Common::ProcessClock::time_point interrupt_at{};
+    /// When the frame in flight was posted.
+    Common::ProcessClock::time_point posted_at{};
 #endif
     /// Where the worker's frame is, for DescribeWorker: a source's index, MixersAt, OutputAt,
     /// or IdleAt between frames.
@@ -168,14 +193,20 @@ private:
     void serialize(Archive& ar, const unsigned int) {
         // The DSP thread's frame done before its state is saved or replaced.
         Finish();
+        if (Archive::is_loading::value) {
+            // A frame the saved state had made and not reported is made again at the first
+            // tick, from the same region (its changes were taken the first time).
+            frame_pending = false;
+            awaiting_answer = false;
+            answers = false;
+            tick_waits = 0;
+        }
         ar& boost::serialization::make_binary_object(backup_dsp_memory.raw_memory.data(),
                                                      backup_dsp_memory.raw_memory.size());
         ar & dsp_state;
         ar & pipe_data;
         ar & sources;
         ar & mixers;
-        // interrupt_pending is not kept (states from before the DSP thread load as they were):
-        // a state saved between a tick and its interrupt restores the event, which still fires.
         // interrupt_handler is reregistered when loading state from DSP_DSP
     }
     friend class boost::serialization::access;
@@ -200,8 +231,10 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
         core_timing.RegisterEvent("AudioCore::DspHle::tick_event", [this](u64, s64 cycles_late) {
             this->AudioTickCallback(cycles_late);
         });
-    interrupt_event = core_timing.RegisterEvent("AudioCore::DspHle::interrupt_event",
-                                                [this](u64, s64) { this->InterruptCallback(); });
+    // The interrupt had its own event, half a frame after the tick, while the frames started
+    // at the tick: a state saved then with it scheduled restores it, and it does nothing (the
+    // first tick reports the frame).
+    core_timing.RegisterEvent("AudioCore::DspHle::interrupt_event", [](u64, s64) {});
     core_timing.ScheduleEvent(audio_frame_ticks, tick_event);
     worker = Common::NamedThread{Common::ThreadCfg{"dsp", 256 * 1024}, [this] { Worker(); }};
     live_dsp.store(this, std::memory_order_release);
@@ -210,7 +243,6 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
 DspHle::Impl::~Impl() {
     live_dsp.store(nullptr, std::memory_order_release);
     core_timing.UnscheduleEvent(tick_event, 0);
-    core_timing.UnscheduleEvent(interrupt_event, 0);
     {
         std::scoped_lock lk{frame_cond};
         worker_stop = true;
@@ -232,11 +264,10 @@ void DspHle::Impl::Worker() {
         const std::size_t read = frame_read;
 #ifdef VITA_DIAGNOSTICS
         const bool late = frame_late;
+        const auto start = Common::ProcessClock::now();
+        stats.start_us += static_cast<u64>((start - posted_at).count());
 #endif
         frame_cond.unlock();
-#ifdef VITA_DIAGNOSTICS
-        const auto start = Common::ProcessClock::now();
-#endif
         Common::HeapCheck::Check("the DSP frame's start");
         const StereoFrame16 frame = GenerateFrame(read);
 #ifdef VITA_DIAGNOSTICS
@@ -286,6 +317,7 @@ void DspHle::Impl::Post(std::size_t read, [[maybe_unused]] bool late) {
 #ifdef VITA_DIAGNOSTICS
     frame_late = late;
     stats.late_ticks += late ? 1 : 0;
+    posted_at = Common::ProcessClock::now();
 #endif
     frames_posted++;
     frame_cond.NotifyAll();
@@ -305,6 +337,7 @@ void DspHle::Impl::Finish() {
 #ifdef VITA_DIAGNOSTICS
     stats.waits++;
     stats.wait_us += static_cast<u64>((Common::ProcessClock::now() - start).count());
+    stats.wait_lead_us += static_cast<u64>((start - posted_at).count());
 #endif
 }
 
@@ -323,17 +356,35 @@ DspHle::Stats DspHle::Impl::TakeStats() {
 }
 #endif
 
-void DspHle::Impl::InterruptCallback() {
-    Finish();
-    interrupt_pending = false;
+void DspHle::Impl::StartFrame([[maybe_unused]] bool at_tick) {
+    // The region with the newer frame counter is the one the application finished: it bumps
+    // the counter when it is done writing, and signals the semaphore (SetSemaphore).
+    const std::size_t read = CurrentRegionIndex();
+    bool late = false;
 #ifdef VITA_DIAGNOSTICS
-    {
+    const u32 key = static_cast<u32>(read) << 16 |
+                    static_cast<u16>(read == 0 ? dsp_memory->region_0.frame_counter
+                                               : dsp_memory->region_1.frame_counter);
+    late = key == last_tick_key;
+    last_tick_key = key;
+#endif
+    Post(read, late);
+#ifdef VITA_DIAGNOSTICS
+    if (at_tick) {
         std::scoped_lock lk{frame_cond};
-        interrupt_at = Common::ProcessClock::now();
+        stats.tick_frames++;
     }
 #endif
-    // TODO(merry): Signal all the other interrupts as appropriate.
-    interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
+    frame_pending = true;
+}
+
+void DspHle::Impl::Answered() {
+    answers = true;
+    awaiting_answer = false;
+    // One frame an interrupt: a second signal before the tick starts none.
+    if (GetDspState() == DspState::On && !frame_pending) {
+        StartFrame(false);
+    }
 }
 
 DspState DspHle::Impl::GetDspState() const {
@@ -406,12 +457,8 @@ size_t DspHle::Impl::GetPipeReadableSize(DspPipe pipe_number) const {
 }
 
 void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
-    // A state change resets or saves what the DSP thread uses, and comes after the frame
-    // before it: that frame's interrupt fires first, as it did at the frame's tick.
-    if (interrupt_pending) {
-        core_timing.UnscheduleEvent(interrupt_event, 0);
-        InterruptCallback();
-    }
+    // The DSP thread's frame is done before anything else works on the DSP's state.
+    Finish();
     switch (pipe_number) {
     case DspPipe::Audio: {
         if (buffer.size() != 4) {
@@ -419,6 +466,13 @@ void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
                       buffer.size());
             return;
         }
+        // A state change resets or saves what the frames use, and starts the exchange with
+        // the application over: a frame made and not reported is dropped with the state it
+        // was made in (the change came before its tick).
+        frame_pending = false;
+        awaiting_answer = false;
+        answers = false;
+        tick_waits = 0;
 
         enum class StateChange {
             Initialize = 0,
@@ -644,31 +698,45 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
                        Core::System::GetInstance().GetStableFrameTimeScale())
             : 1.0;
     const s64 frame_ticks = static_cast<s64>(audio_frame_ticks / time_scale);
-    if (interrupt_pending) {
-        // The last frame's interrupt (half a frame on) has not fired: a time scale that shrank
-        // the frame. It fires now, before the next frame.
-        core_timing.UnscheduleEvent(interrupt_event, 0);
-        InterruptCallback();
-    }
-    // The region with the newer frame counter is the one the application finished: it bumps
-    // the counter when it is done writing, and signals the semaphore (SetSemaphore, counted
-    // for perflog's `perf: dsp` line).
     if (GetDspState() == DspState::On) {
-        const std::size_t read = CurrentRegionIndex();
-        bool late = false;
+        if (!frame_pending) {
+            // The application is still on the last frame: the tick waits for its answer.
+            if (answers && awaiting_answer) {
+                if (tick_waits < TickWaitSteps) {
+                    tick_waits++;
 #ifdef VITA_DIAGNOSTICS
-        const u32 key =
-            static_cast<u32>(read) << 16 |
-            static_cast<u16>(read == 0 ? dsp_memory->region_0.frame_counter
-                                       : dsp_memory->region_1.frame_counter);
-        late = key == last_tick_key;
-        last_tick_key = key;
+                    {
+                        std::scoped_lock lk{frame_cond};
+                        stats.tick_waits++;
+                    }
 #endif
-        Post(read, late);
-        interrupt_pending = true;
-        core_timing.ScheduleEvent(std::max<s64>(0, frame_ticks / 2 - cycles_late),
-                                  interrupt_event);
+                    core_timing.ScheduleEvent(
+                        std::max<s64>(0, frame_ticks / TickWaitSteps - cycles_late), tick_event);
+                    return;
+                }
+                answers = false;
+#ifdef VITA_DIAGNOSTICS
+                std::scoped_lock lk{frame_cond};
+                stats.unanswered++;
+#endif
+            }
+            // No answer started the frame (the first one, a restored state, an application
+            // that does not answer): it starts here.
+            StartFrame(true);
+        }
+        Finish();
+        frame_pending = false;
+#ifdef VITA_DIAGNOSTICS
+        {
+            std::scoped_lock lk{frame_cond};
+            interrupt_at = Common::ProcessClock::now();
+        }
+#endif
+        awaiting_answer = true;
+        // TODO(merry): Signal all the other interrupts as appropriate.
+        interrupt_handler(InterruptType::Pipe, DspPipe::Audio);
     }
+    tick_waits = 0;
 
     // Reschedule recurrent event
     core_timing.ScheduleEvent(frame_ticks - cycles_late, tick_event);
@@ -712,9 +780,10 @@ bool DspHle::RecvDataIsReady(u32 register_number) const {
 }
 
 void DspHle::SetSemaphore(u16 semaphore_value) {
-    // The application's "shared memory written": the frame counters already say which region
-    // is newer, and the application touches the regions only between the DSP's interrupt and
-    // its next tick, so the HLE needs nothing from it beyond the count (perflog's).
+    // The application's "shared memory written": the frame counters say which region is
+    // newer, and the signal that it is done with the regions until the next interrupt (the
+    // next frame starts here).
+    impl->Answered();
 #ifdef VITA_DIAGNOSTICS
     impl->NoteSemaphore();
 #endif

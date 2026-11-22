@@ -44,15 +44,24 @@ public:
     /// they came.
     struct Stats {
         u32 frames{};
+        /// Frames the tick started itself (no answer from the application had).
+        u32 tick_frames{};
         u64 work_us{};
         u32 waits{};
         u64 wait_us{};
+        /// From a frame's post to its start on the DSP thread (all frames), and from the post to
+        /// the emulation thread's wait for it (the frames waited for).
+        u64 start_us{};
+        u64 wait_lead_us{};
         u32 semaphores{};
         /// Ticks that found no new frame from the application (the region and counter of the
         /// tick before), and the buffer changes such frames reported: statuses written into
         /// the region the application is still working in, which it reads no more.
         u32 late_ticks{};
         u32 late_buffer_changes{};
+        /// The steps ticks waited for the application's answer, and the waits given up.
+        u32 tick_waits{};
+        u32 unanswered{};
         /// From the interrupt to the application's semaphore signal: total and longest.
         u64 answer_us{};
         u32 answer_longest_us{};
