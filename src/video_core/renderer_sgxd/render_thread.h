@@ -172,6 +172,12 @@ private:
     /// render side compares with its copy, logging each register, uniform and table that
     /// differs once.
     void PutCheck();
+    /// Emulation side, before a draw: the colour buffer and the enabled textures' guest bytes in
+    /// FCRAM move to CDRAM (MakeUncached, held as GPU::KeepUncached holds), so that the passes
+    /// store into the buffer and the untiles read the textures with no CPU cache work (the
+    /// rasterizer asserts it for the buffer). Guest VRAM, and FCRAM moved already, cost a
+    /// range check.
+    void KeepTargetUncached();
     void RunCheck(const u8* payload);
     bool check{};
     /// A record of `bytes` payload bytes; the returned pointer is where they go.

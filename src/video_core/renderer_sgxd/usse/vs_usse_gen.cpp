@@ -1886,7 +1886,11 @@ void VertexEmitter::Epilogue() {
     e.Vec(VecOp::Mul, {I1, 0x2}, {I1, YYYY}, {Reg::Sa(0), YYYY});           // * depth_scale (sa1)
     e.Vec(VecOp::Add, {I1, 0x2}, {I1, YYYY}, {Reg::Sa(2), XXXX});           // + depth_offset (sa2)
     e.Vec(VecOp::Mul, {I0, 0x4}, {I1, YYYY}, {I0, WWWW});                   // z = depth * w
-    e.MoveInternal({Reg::O(OutPosition), 0x3}, {I0, XYZW});
+    // The draws render the guest's colour buffer transposed (SgxdBackend::PicaTarget, route 1):
+    // clip x takes y and clip y takes x, and the viewport maps them (RasterizerGxm::Draw). The
+    // standard swizzles have no YX pair: a lane each, as OutputLane writes them.
+    e.MoveInternal({Reg::O(OutPosition), 0x1}, {I0, YYYY});
+    e.MoveInternal({Reg::O(OutPosition), 0x2}, {I0, XXXX});
     e.MoveInternal({Reg::O(OutPosition + 2), 0x3}, {I0, ZWZW});
 
     // Colour: min(abs(c), 1).

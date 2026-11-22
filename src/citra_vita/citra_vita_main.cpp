@@ -193,7 +193,8 @@ void SetupLogging() {
     // filter that discards it before it formats anything.
 }
 
-/// The Vita boots at a conservative clock; a software-rendered 3DS needs every megahertz.
+/// The Vita boots at a conservative clock; an emulated 3DS needs every megahertz. The GPU's
+/// clock is set before sgxd takes the GPU and never changes after (docs/sgxd/takeover.md).
 void SetupClocks() {
     scePowerSetArmClockFrequency(444);
     scePowerSetBusClockFrequency(222);

@@ -44,11 +44,18 @@ enum class TexturePalette : u32 { None, A4, I4, IA4 };
  * hooks return true or crash, and the CPU vertex path, which ends in AddTriangle, always
  * crashes.
  *
- * Draws render into host surfaces (linear A8B8G8R8, SgxdBackend's second block) in passes: a
- * pass is one colour target from its first draw until P3D (the draws' vertices are the guest's
- * again after it), something needs the picture (the display transfer) or another target is
- * drawn to. A pass starts from what a memory fill left pending on
- * its colour and depth buffers; loading a buffer's earlier picture is not built.
+ * Draws render in passes: a pass is one colour buffer from its first draw until P3D (the draws'
+ * vertices are the guest's again after it), something reads the buffer (a transfer, a DMA, a
+ * texture) or another buffer is drawn to. A buffer a render takes whole (ScalesWhole) is drawn
+ * into a picture of its own (Upscaled), at the internal resolution (TopScale, 1x by default) and
+ * in the guest's format (PictureFormatFor):
+ * its colour stays there until something else reads or writes the buffer's bytes, which have it
+ * copied into guest memory in the PICA's tiling first (WriteColourBack); a display transfer reads
+ * the picture itself, and a texture over it is copied from it. Any other buffer (narrower than
+ * 32, or of a size no render takes) is drawn straight into guest memory, in the guest's format
+ * and the PICA's tiling (SgxdBackend::PicaTarget, route 1). A pass starts from what a memory fill
+ * left in its buffers (the clear), from nothing when its first draw covers the target, or else
+ * from its picture or the buffer's own bytes, loaded by its first draws.
  *
  * Immediate-mode vertices reach the GPU too: the PICA hands over each vertex's raw attributes
  * (AccelerateImmediateVertex) and the batch is drawn with the USSE vertex program at the next
@@ -114,16 +121,15 @@ public:
         return replay_draw_index;
     }
     void ReplayEndPass();
-    /// The surface at `addr` as its A8B8G8R8 rows, once the GPU is idle; false when there is
-    /// none.
+    /// The colour buffer at `addr` as a pass last drew it, as A8B8G8R8 rows; false when none did.
     bool ReplayReadSurface(PAddr addr, std::vector<u8>& out, u32& width, u32& height);
     SgxdBackend& Backend() {
         return backend;
     }
 #endif
 #ifdef VITA_DIAGNOSTICS
-    /// vprof: what a pass can start from, as the recorded frame began: the pending clears, the colour surfaces a pass drew with their
-    /// pixels, and the depth stores with their samples. Pointers into the capture.
+    /// vprof: what a pass can start from as the recorded frame began: the pending clears and the depth
+    /// stores (pointers into the capture).
     struct VprofState {
         struct Clear {
             PAddr start, end;
@@ -150,8 +156,8 @@ public:
     };
     /// vprof: the recorded frame starts: the open pass ended, the GPU idle, VprofState recorded.
     void VprofFrameStart();
-    /// vprof's replay: `state` in place of this renderer's surfaces, depth stores and clears
-    /// before each run of the frame, and with `retile` every texture untiled again.
+    /// vprof's replay: `state` in place of the depth stores and clears before each run, and with
+    /// `retile` every texture untiled again.
     void ReplayRestore(const VprofState& state, bool retile);
     /// vprof's replay wrote guest memory: the textures there are untiled again.
     void ReplayMemoryWritten(PAddr start, PAddr end) {
@@ -183,31 +189,15 @@ private:
         u32 order; // when it was recorded, for replacing the oldest
     };
 
-    /// A colour buffer's host surface: A8B8G8R8 whatever the guest's format, which sets its
-    /// bytes in guest memory.
-    struct Surface {
-        PAddr addr;
-        u32 width;
-        u32 height;
-        SgxdBackend::Data memory;
-        u32 passes;
+    struct ColourBuffer {
+        PAddr addr{};
+        u32 width{};
+        u32 height{};
         Pica::FramebufferRegs::ColorFormat format = Pica::FramebufferRegs::ColorFormat::RGBA8;
         u32 bpp = 4; ///< the guest's bytes a pixel
         [[nodiscard]] PAddr End() const {
             return addr + width * height * bpp;
         }
-        /// A DMA or display transfer wrote its guest memory after its last pass: a pass that
-        /// keeps its picture loads the guest's.
-        bool guest_newer = false;
-        /// The passes guest memory holds (SyncToGuest); ~0 when a write-back of an older
-        /// surface over it has overwritten them there.
-        u32 synced_passes = 0;
-        /// When its last pass ended, in the order of all surfaces' passes: where surfaces
-        /// overlap, the later pass drew the bytes both cover.
-        u64 generation = 0;
-        /// FCRAM only: each 8x8 tile's hash of guest memory as the last pass began, or as
-        /// SyncToGuest left it. A tile whose bytes changed since, the CPU wrote.
-        std::vector<u64> tile_hashes;
     };
 
     /// A guest texture's host copy, untiled on the GPU into A8B8G8R8, rows in the PICA's order (row 0
@@ -291,31 +281,12 @@ private:
     void RecordClear(const ClearedRange& range);
     void ForgetClears(PAddr start, PAddr end);
     bool TakeClear(PAddr start, PAddr end, ClearedRange& out);
-    Surface& SurfaceFor(PAddr addr, u32 width, u32 height,
-                        Pica::FramebufferRegs::ColorFormat format);
-    /// Each 8x8 tile's hash of s's guest memory.
-    std::vector<u64> TileHashes(const Surface& s);
-    /**
-     * Writes what s's passes drew into its guest memory, as the PICA stores it (TileBack),
-     * inside an open pass. The PICA renders into guest memory, so a texture of another shape
-     * or format over it, or the CPU, reads that. In FCRAM, the tiles the CPU wrote since the
-     * last pass began (tile_hashes) keep the CPU's bytes, and the surface, which lacks them,
-     * is guest_newer from then on.
-     */
-    void SyncToGuest(Surface& s);
-    /// FCRAM: whether the CPU wrote into s since its last pass began. If it did, guest memory
-    /// takes the rest of what the passes drew (SyncToGuest) and is s's picture from then on.
-    bool CpuWroteInto(Surface& s);
-    /// Whether a surface whose last pass ended later overlaps s: s is then not all its own
-    /// picture any more.
-    bool Superseded(const Surface& s) const;
-    /**
-     * Guest memory over [start, end) made what the passes left there: every drawn surface
-     * overlapping it written back, the earliest first, so where two overlap the later pass's
-     * bytes stay. A surface a later one overlaps is guest_newer from then on. Inside an open
-     * pass, or with none open (a DMA's source).
-     */
-    void SyncRange(PAddr start, PAddr end);
+    /// The PBE's form of a colour buffer (route 1 takes widths of 32 to 1024 in 16s and heights of 8
+    /// to 1024 in 8s).
+    SgxdBackend::PicaTarget PicaTargetFor(const ColourBuffer& c, const char* what);
+    /// Whether [start, end) overlaps the open pass's colour buffer, or its depth buffer when a
+    /// draw uses it.
+    bool PassOverlaps(PAddr start, PAddr end) const;
     void EndPass(const char* why);
     /// A draw of the loaders' vertices, or of the immediate-mode batch (`count` vertices of
     /// `immediate_attributes` x 4 floats).
@@ -450,9 +421,6 @@ private:
     void TextureWords(u32 unit, u32 words[4]);
     /// Marks the textures over [start, end) to be untiled again.
     void TexturesWritten(PAddr start, PAddr end);
-    /// A DMA or display transfer wrote [start, end): the surfaces there are older than the guest's
-    /// memory.
-    void SurfacesWritten(PAddr start, PAddr end);
     /// The lighting and fog LUTs the guest changed into fresh rows, fs_data's offsets pointed at them.
     void SyncLutLf();
     /// The same for the proctex colour map, alpha map, colour and colour-difference tables.
@@ -471,7 +439,9 @@ private:
     std::array<ClearedRange, MaxClears> cleared{};
     u32 clear_count{};
     u32 clear_order{};
-    std::vector<Surface> surfaces;
+#ifdef VITA_DIAGNOSTICS
+    std::map<PAddr, ColourBuffer> drawn_buffers;
+#endif
     /// A list: eviction during a texture's untile keeps the others in place.
     std::list<Texture> textures;
     /// The zeros of a unit that is off, 2D and cube (NullTexture), outside the eviction.
@@ -516,7 +486,26 @@ private:
     bool proctex_table_dirty{true};
     KeyIndex<u32> proctex_tables_by_contents;
 
-    std::size_t pass_surface{}; // into surfaces, while the backend is in a pass
+    ColourBuffer pass_colour{}; // while the backend is in a pass
+    /// A colour buffer of a width no pass draws (under 32, or not in 16s): the pass draws into a
+    /// scratch of the next width in 16s (32 at least) and 32 rows at least, copied in before and out
+    /// after.
+    struct NarrowScratch {
+        PAddr addr;
+        u32 width, height, bpp;
+        u32 scratch_width;
+        SgxdBackend::Data surface;
+    };
+    /// The width of c's scratch; 0 for a width a pass draws itself (32 or more, in 16s).
+    [[nodiscard]] static u32 NarrowWidth(const ColourBuffer& c) {
+        return c.width >= 32 && c.width % 16 == 0 ? 0 : std::max((c.width + 15) / 16 * 16, 32u);
+    }
+    std::vector<NarrowScratch> narrow_scratch;
+    const NarrowScratch* pass_narrow = nullptr; // the open pass's
+    const NarrowScratch& NarrowScratchFor(const ColourBuffer& c);
+    /// `lines` lines of `line_bytes` from src to dst, strides apart, queued on the PTLA.
+    void CopyLines(u32 src, u32 dst, u32 line_bytes, u32 lines, u32 src_stride, u32 dst_stride,
+                   const char* what);
     u16 gs_regs_loaded = 0;     // the GS input registers point-mode draws have loaded
     /// Each GS input register's row as the last draw that loaded it left it.
     std::array<u32, 16> gs_last_rows{};
@@ -565,15 +554,12 @@ private:
     u32 vprof_draws = 0;
     bool vprof_draw_noted = false;
     void VprofDraw(bool is_indexed, bool immediate, u32 count);
-    /// vprof: a pass's surface, and a display transfer's output, as results of the frame.
-    void VprofPassResult(const Surface& s);
+    void VprofPassResult(const ColourBuffer& c);
     void VprofTransferResult(PAddr output, u32 width, u32 height, u32 format, const u8* out,
                              u32 bytes);
     bool ReplaySkipsDraw();
-    /// perflog: a slow display transfer (source null: from guest memory), a pass's first draws.
     void PerflogTransfer(PAddr input, u32 in_width, u32 in_height, PAddr output, u32 width,
-                         u32 height, u32 scale_x, u32 scale_y, const Surface* source,
-                         u32 first_row, u32 ta_us, u32 d3_us);
+                         u32 height, u32 scale_x, u32 scale_y, u32 ta_us, u32 d3_us);
     void PerflogDraw(const Describe& describe, u32 isp, bool blend,
                      const SgxdRecipeDrawPrograms& p);
 #endif
@@ -591,20 +577,7 @@ private:
 #ifdef VITA_DIAGNOSTICS
     u32 transfers{}; ///< perflog's progress lines and vprof's transfer numbers
 #endif
-    u32 guest_transfers{}; ///< display transfers from pictures no pass drew
-    /// Each unit's texture when it reads a colour buffer a pass drew: the surface itself.
-    std::array<Texture, 3> surface_textures{};
-    u32 surface_reads{}; ///< draws that sampled a surface, for the log
-    u32 syncs{};         ///< SyncToGuest's write-backs, for the log
     u64 evictions{};     ///< textures freed for room (TextureFor)
-    u64 synced_tiles{};  ///< SyncToGuest's tiles, for the log
-    const char* sync_reason = "";          ///< why the write-backs run, for the log
-    std::map<std::string, u32> sync_why{}; ///< write-backs by surface and reason, for the log
-    u64 generations{};   ///< passes ended, for Surface::generation
-    /// Surfaces a later pass's surface covers whole (EndPass): nothing reads them any more.
-    /// Their memory is freed before the next surface is allocated (SurfaceFor), when the
-    /// render that may still read them has most likely completed.
-    std::vector<Surface> dead;
     u32 loads{}; ///< passes that loaded their colour buffer from guest memory
     u64 covered_passes{}; ///< passes whose first draw covers the target (CoversTarget)
     u32 untiles{};

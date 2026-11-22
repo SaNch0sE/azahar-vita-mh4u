@@ -646,6 +646,7 @@ static int init(SgxdRecipe *r, uint32_t width, uint32_t height, uint32_t base, u
     r->pbe[3] = 0;
     r->pbe[4] = floor_log2((W + 15) / 16) << 24 | floor_log2((H + 15) / 16) << 28;
     r->pbe[5] = (W - 1) | (H - 1) << 12;
+    sgxd_recipe_set_pixel_event(r, sgxd_recipe_va(r, SGXD_R_PIXEV), 3, 2);
 
     Code cv[CV_COUNT], cf[CF_COUNT];
     Pds pds[SGXD_R_COUNT];
@@ -773,6 +774,147 @@ void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory_, uint32_t pbe0) {
     r->pbe[0] = pbe0;
     uint64_t *eot = (uint64_t *)(memory + r->offset[SGXD_R_CF] + CF_EOT_OFFSET);
     eot[1] = usse_limm(0, r->pbe[0]) | SKIPINV;
+}
+
+// ---------------------------------------------------------------------------- route 1
+
+// The bitwise class with an immediate source 2: op1 in bits 63..59,
+// bit 35 the pair's second operation, source 1 a temporary or with pa a PA register.
+enum { BW_AND, BW_OR, BW_XOR, BW_SHL, BW_SHR };
+static uint64_t usse_bitwise_imm(unsigned op, unsigned dest, unsigned src1, uint32_t imm, int pa) {
+    static const uint32_t op1[] = {0x0a, 0x0a, 0x0b, 0x0c, 0x0d};
+    const uint32_t hi = op1[op] << 27 | (op == BW_OR ? 1u : 0u) << 3 | 1u << 16 |
+                        ((imm >> 14) & 3u) << 4;
+    const uint32_t lo = dest << 21 | src1 << 7 | (pa ? 2u << 30 : 0u) | 2u << 28 | (imm & 0x7fu) |
+                        ((imm >> 7) & 0x7fu) << 14;
+    return (uint64_t)hi << 32 | lo;
+}
+// IMA32 step 1: dest = src0 * lo16(src1) + src2, temporaries,
+// unsigned, the sum wrapping at 32 bits.
+static uint64_t usse_ima32(unsigned dest, unsigned src0, unsigned src1, unsigned src2) {
+    return (uint64_t)0xd0000000u << 32 | dest << 21 | src0 << 14 | src1 << 7 | src2;
+}
+#define EMIT_FREEP 0x00200000ull
+#define USE1_END (0x00040000ull << 32)
+#define PBE_TWIDDLED (2u << 26)
+#define PBE_NOADVANCE (1u << 31)
+
+// tools/sgx_pica_eot_probe.py prod_program, word for word.
+unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out) {
+    const uint32_t width = r->width, height = r->height;
+    if (width % 8 || height % 16 || width < 8 || width > 1024 || height < 32 || height > 1024 ||
+        (s->bpp != 2 && s->bpp != 3 && s->bpp != 4)) {
+        return 0;
+    }
+    // The guest's tiles a row (its width is our height); the target in whole tiles, its last
+    // tile column and row (in 16 pixels, as IR0 has them), and the pixels they hold.
+    const uint32_t tpr = height / 8, bpp = s->bpp;
+    const uint32_t aw = (width + 31) & ~31u, ah = (height + 31) & ~31u;
+    unsigned xsize = 0;
+    while ((16u << xsize) < aw) {
+        xsize++;
+    }
+    const uint32_t xlast = (aw - 32) / 16, ylast = (ah - 32) / 16;
+    const uint32_t xrem = width - 16 * xlast, yrem = height - 16 * ylast;
+    unsigned n = 0;
+#define PUT(w) (out[n++] = (w))
+    PUT(PHAS_LAST);
+    PUT(usse_bitwise_imm(BW_OR, 8, 0, 0, 1));          // r8 = pa0 (IR0)
+    PUT(usse_bitwise_imm(BW_AND, 9, 8, 0xff, 0));      // r9 = X
+    PUT(usse_bitwise_imm(BW_SHR, 10, 8, 8, 0));
+    PUT(usse_bitwise_imm(BW_AND, 10, 10, 0xff, 0));    // r10 = Y
+    PUT(usse_limm(13, 1));
+    PUT(usse_limm(0, 0xffffffffu));
+    // r6 = nx, 1 but in the last tile column: ((X ^ Xlast) - 1) >> 31 ^ 1; r7 = ny the same.
+    if (xrem < 32) {
+        PUT(usse_bitwise_imm(BW_XOR, 6, 9, xlast, 0));
+        PUT(usse_ima32(6, 6, 13, 0));
+        PUT(usse_bitwise_imm(BW_SHR, 6, 6, 31, 0));
+        PUT(usse_bitwise_imm(BW_XOR, 6, 6, 1, 0));
+        PUT(usse_limm(14, 8));
+    }
+    if (yrem < 32) {
+        PUT(usse_bitwise_imm(BW_XOR, 7, 10, ylast, 0));
+        PUT(usse_ima32(7, 7, 13, 0));
+        PUT(usse_bitwise_imm(BW_SHR, 7, 7, 31, 0));
+        PUT(usse_bitwise_imm(BW_XOR, 7, 7, 1, 0));
+        PUT(usse_limm(15, 0x10000));
+    }
+    // r11 = the tile's base: X bpp (128 tpr - 256) + Y bpp 128 + buffer; r12 = 16 X | 16 Y << 12.
+    PUT(usse_limm(0, bpp * (128 * tpr - 256)));
+    PUT(usse_limm(1, s->buffer));
+    PUT(usse_ima32(11, 9, 0, 1));
+    PUT(usse_limm(0, bpp * 128));
+    PUT(usse_ima32(11, 10, 0, 11));
+    PUT(usse_bitwise_imm(BW_SHL, 12, 10, 16, 0));
+    PUT(usse_limm(0, 16));
+    PUT(usse_ima32(12, 9, 0, 12));
+    // Strip (qx, qy, h) starts at x0 = 16 X + 16 qx + 8 h, y0 = 16 Y + 16 qy: its first pixel is
+    // the guest's (y0, x0), PICA offset ((2 X + 2 qx + h) tpr + 2 Y + 2 qy) 64, and its TWIDDLED
+    // index there 128 h + (X + qx) 256; the base is their difference. A strip past the target gets
+    // XMAX x0 - 1 (YMAX y0 - 1): word 5 less 8 (16 rows), plus that times nx (ny).
+    const uint64_t emit = EMITPIX_EOT & ~(EMIT_FREEP | USE1_END | 3ull << 32);
+    for (unsigned k = 0; k < 8; k++) {
+        const unsigned qy = k / 4, qx = k / 2 % 2, h = k % 2, sx = k % 4;
+        const uint32_t cx = 16 * qx + 8 * h, cy = 16 * qy;
+        const uint32_t cb = bpp * (qx * (128 * tpr - 256) + qy * 128 + h * (64 * tpr - 128));
+        const uint32_t c4 = cx | cy << 12 | xsize << 24;
+        uint32_t c5 = (cx + 7) | (cy + 15) << 12 | PBE_NOADVANCE;
+        const int x_edge = xrem < 32 && 8 * sx >= xrem;
+        const int y_edge = yrem < 32 && qy == 1;
+        c5 -= (x_edge ? 8u : 0u) + (y_edge ? 16u << 12 : 0u);
+        if (k == 7) {
+            c5 &= ~PBE_NOADVANCE;    // the tile's last emit advances the PBE
+        }
+        PUT(usse_limm(1, cb));
+        PUT(usse_ima32(1, 11, 13, 1));
+        PUT(usse_limm(4, c4));
+        PUT(usse_ima32(4, 12, 13, 4));
+        PUT(usse_limm(5, c5));
+        PUT(usse_ima32(5, 12, 13, 5));
+        if (x_edge) {
+            PUT(usse_ima32(5, 6, 14, 5));    // + 8 nx
+        }
+        if (y_edge) {
+            PUT(usse_ima32(5, 15, 7, 5));    // + 0x10000 ny
+        }
+        PUT(usse_limm(0, s->pack | PBE_TWIDDLED));
+        PUT(usse_limm(2, (width - 1) >> 1));
+        PUT(usse_limm(3, 0));
+        PUT(k == 7 ? EMITPIX_EOT : emit);     // the last frees the partition and ends
+    }
+#undef PUT
+    return n;
+}
+
+void sgxd_recipe_pica_pixev(const SgxdRecipe *r, uint32_t eot_index,
+                            uint32_t out[SGXD_RECIPE_PICA_PIXEV_WORDS]) {
+    Code cf[CF_COUNT];
+    make_cf(r, cf);
+    uint32_t old[32];
+    (void)make_pixev(cf, old);
+    // The recipe's three data units and a fourth for the DOUTA's words (DS0 pair 3: pa0's), then
+    // the DOUTAs of IR0 ahead of its code; its branches name instruction indices, moved by three.
+    memcpy(out, old, 12 * 4);
+    out[0] = doutu0(1, eot_index, 4);
+    out[12] = douta1(0);
+    out[13] = douta1(1);
+    out[14] = douta1(2);
+    out[15] = 0;
+    const uint32_t ir0 = movs(6, 0, 3, 1, 0, S2L, S1L, S2L, S2L);
+    out[16] = old[12] + 3;                 // the branch past the end of tile
+    out[17] = out[18] = out[19] = ir0;
+    out[20] = old[13];
+    out[21] = old[14];
+    out[22] = old[15] + 3;                 // the branch past the end of render
+    memcpy(out + 23, old + 16, 9 * 4);
+}
+
+void sgxd_recipe_set_pixel_event(SgxdRecipe *r, uint32_t va, uint32_t units,
+                                 uint32_t attribute_size) {
+    r->pixev_va = va;
+    r->pixev_units = units;
+    r->pixev_attribute_size = attribute_size;
 }
 
 void sgxd_recipe_set_background_depth(SgxdRecipe *r, void *memory, float z) {
@@ -1248,7 +1390,8 @@ void sgxd_recipe_3d_kick(const SgxdRecipe *r, SgxdOpList *l) {
         {0x04b8, r->bgobjdepth}, {0x04bc, r->bgobj}, {0x04c4, r->bgobjtag},
         {0x04c8, 0x88}, {0x04cc, 0x188}, {0x04dc, 8}, {0x0520, r->mtile1},
         {0x0524, r->mtile2}, {0x0528, r->stride}, {0x0148, 0},
-        {0x0a5c, sgxd_recipe_va(r, SGXD_R_PIXEV)}, {0x0a60, 3}, {0x0a64, 0x4000}, {0x0ae8, 0},
+        {0x0a5c, r->pixev_va}, {0x0a60, r->pixev_units},
+        {0x0a64, r->pixev_attribute_size << 13}, {0x0ae8, 0},
     };
     for (unsigned n = 0; n < sizeof(d2) / sizeof(d2[0]); n++) {
         wr(l, d2[n][0], d2[n][1]);

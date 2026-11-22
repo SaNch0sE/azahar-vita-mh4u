@@ -689,7 +689,30 @@ u32 TextureRanges(const Pica::RegsInternal& regs, std::array<GuestRange, 8>& out
 
 } // namespace
 
+void RenderThread::KeepTargetUncached() {
+    std::array<GuestRange, 8> textures;
+    const u32 count = TextureRanges(pica.regs.internal, textures);
+    const auto& fb = pica.regs.internal.framebuffer.framebuffer;
+    const GuestRange colour{fb.GetColorBufferPhysicalAddress(),
+                            fb.GetWidth() * fb.GetHeight() *
+                                Pica::FramebufferRegs::BytesPerColorPixel(fb.color_format)};
+    bool move = renderer.WouldMakeUncached(colour.addr, colour.bytes);
+    for (u32 i = 0; i < count && !move; i++) {
+        move = renderer.WouldMakeUncached(textures[i].addr, textures[i].bytes);
+    }
+    if (!move) {
+        return;
+    }
+    Hold();
+    for (u32 i = 0; i < count; i++) {
+        renderer.MakeUncached(textures[i].addr, textures[i].bytes, false);
+    }
+    renderer.MakeUncached(colour.addr, colour.bytes, false);
+    Release();
+}
+
 bool RenderThread::AccelerateDrawBatch(bool is_indexed) {
+    KeepTargetUncached();
     SyncState();
     if (check) {
         PutCheck();
@@ -733,6 +756,7 @@ bool RenderThread::AccelerateImmediateVertex(const Pica::AttributeBuffer& input)
 }
 
 void RenderThread::FlushImmediate() {
+    KeepTargetUncached();
     SyncState();
     if (check) {
         PutCheck();

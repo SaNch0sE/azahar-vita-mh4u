@@ -514,16 +514,14 @@ u32 DepthCompare(FramebufferRegs::CompareFunc func) {
     UNREACHABLE();
 }
 
-/// The cull mode for the MTE (state word 21's CULLMODE). The MTE culls by the winding in
-/// device space, and the draws' y scale is negative
-/// (NDC y +1 at the target's first row, Draw): a triangle's device winding is the reverse of
-/// its NDC one, so the PICA's modes map the other way round from a positive y scale's.
+/// The MTE's cull mode. The draws render the target transposed (SgxdBackend::PicaTarget), which
+/// keeps a triangle's winding, so the PICA's modes map as they are.
 u32 CullMode(Pica::RasterizerRegs::CullMode mode) {
     switch (mode) {
     case Pica::RasterizerRegs::CullMode::KeepClockWise:
-        return 2;
-    case Pica::RasterizerRegs::CullMode::KeepCounterClockWise:
         return 1;
+    case Pica::RasterizerRegs::CullMode::KeepCounterClockWise:
+        return 2;
     default:
         return 0;
     }
@@ -676,8 +674,7 @@ void RasterizerGxm::DrawTriangles() {
                     TopologyName(pipeline.triangle_topology), pipeline.num_vertices);
 }
 
-// The host surfaces are the only copy of what the passes drew; the display transfer writes
-// them into guest memory, and nothing else reads them back.
+// The passes store into guest memory itself: there is nothing to flush or invalidate.
 
 void RasterizerSgxd::FlushAll() {}
 
@@ -794,33 +791,23 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
         fcram || (output >= Memory::VRAM_PADDR && output + bytes <= Memory::VRAM_PADDR_END),
         "sgxd: AccelerateDisplayTransfer {}: the output is outside the mapped guest memory",
         describe());
-    if (backend.InPass()) {
-        EndPass("the display transfer");
+    // From guest memory: a pass over it renders first, and the transfer's render reads what its 3D
+    // stored (the GPU's renders run in order).
+    const UntileFormat f = UntileFormatFor(TextureFormatOf(config.input_format));
+    const u32 in_bytes = in_width * in_height * f.bits / 8;
+    if (backend.InPass() && PassOverlaps(input, input + in_bytes)) {
+        EndPass("a display transfer from its colour buffer");
     }
-    // The source: a surface a pass drew, from its first row or a whole tile row inside it (the
-    // guest's two screens in one buffer); otherwise the guest's own tiled picture.
-    // Of surfaces there in several shapes, the one a pass drew last.
-    auto source = surfaces.end();
-    for (auto it = surfaces.begin(); it != surfaces.end(); ++it) {
-        if (input >= it->addr && input < it->End() && it->passes > 0 && !it->guest_newer &&
-            (source == surfaces.end() || it->generation > source->generation)) {
-            source = it;
-        }
+    if (backend.InPass() && PassOverlaps(output, output + bytes)) {
+        EndPass("a display transfer over its buffers");
     }
-    u32 first_row = 0;
-    if (source != surfaces.end()) {
-        const u32 offset = input - source->addr;
-        first_row = offset / (source->width * source->bpp);
-        DEBUG_ASSERT_MSG(
-            TextureFormatOf(config.input_format) == static_cast<Pica::TexturingRegs::TextureFormat>(
-                                                         source->format) &&
-                source->width == in_width && offset % (source->width * 8 * source->bpp) == 0 &&
-                first_row + height * scale_y <= source->height,
-            "GXM: AccelerateDisplayTransfer {}: {}x{} from {} rows into the {}x{} surface at "
-            "{:#x} (format {}) is not built",
-            describe(), width, height, first_row, source->width, source->height, source->addr,
-            static_cast<u32>(source->format));
-    }
+    DEBUG_ASSERT_MSG(f.code != 0xff && f.code != SgxdBackend::UntileEtc1 &&
+                         f.code != SgxdBackend::UntileEtc1A4 && in_width % 8 == 0 &&
+                         in_width <= SgxdBackend::UntileSide && in_height % 8 == 0 &&
+                         in_height <= SgxdBackend::UntileSide,
+                     "sgxd: AccelerateDisplayTransfer {}: a {}x{} picture: the untile takes sides "
+                     "of whole tiles",
+                     describe(), in_width, in_height);
 
     // The surface's row y is the PICA's row y. The PICA's RGB8 is B, G, R in memory, gxm's
     // U8U8U8_RGB store. Guest memory is mapped for the GPU at its PICA address; VRAM, and
@@ -836,7 +823,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
     u32 ta_us = 0, d3_us = 0;
     backend.Blit(source->memory, width, height, store, &ta_us, &d3_us);
     TexturesWritten(output, output + bytes);
-    SurfacesWritten(output, output + bytes);
+    DepthStoresWritten(output, output + bytes);
     // The blit's 3D stays pending, as a pass's does: the next list finishes it. Whatever waits on the
     // blit (a page hold on its output, a ticket) finishes it then (InterruptPoll, RenderWait).
     // Progress: a line every 30 transfers.
@@ -850,85 +837,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
                  ev.slc_timeouts, ev.unexpected, sgxd_session_renders(), ev.chains, ev.ta, ev.d3,
                  ev.chain_isr_us_max);
     }
-    // gxm_flags dumpat=N: transfers N and N + 1 checked and written, to compare runs frame for
-    // frame. Only then: the check waits for the render and the write holds the emulation thread.
-    static const u32 dump_at = GxmFlagValue("dumpat");
-    const bool dump = dump_at != 0 && transfers + 1 >= dump_at && transfers + 1 < dump_at + 2 &&
-                      source != surfaces.end();
     transfers++;
-    if (dump) {
-        // The source surface (A8B8G8R8, every row) as a PPM and the output's bytes as they
-        // are, for any format.
-        backend.RenderIdle("the transfer's dump");
-        const std::string surface_path = fmt::format("host0:azahar-surface-{}.ppm", transfers);
-        if (std::FILE* f = std::fopen(surface_path.c_str(), "wb")) {
-            std::fprintf(f, "P6\n%u %u\n255\n", source->width, source->height);
-            std::vector<u8> rgb(source->width * source->height * 3);
-            for (u32 n = 0; n < source->width * source->height; n++) {
-                std::memcpy(&rgb[n * 3], source->memory.cpu + n * 4, 3);
-            }
-            std::fwrite(rgb.data(), 1, rgb.size(), f);
-            std::fclose(f);
-        }
-        const std::string out_path = fmt::format("host0:azahar-output-{}-{}x{}-f{}.bin", transfers,
-                                                 width, height,
-                                                 static_cast<u32>(config.output_format.Value()));
-        if (std::FILE* f = std::fopen(out_path.c_str(), "wb")) {
-            std::fwrite(out, 1, bytes, f);
-            std::fclose(f);
-        }
-        LOG_INFO(Render, "transfer {}: from row {} of the {}x{} surface at {:#x}; written to {} "
-                 "and {}", transfers, first_row, source->width, source->height, source->addr,
-                 surface_path, out_path);
-    }
-    if (dump && first_row == 0 && config.output_format == PixelFormat::RGB8) {
-        // The check reads the output back: the async render completes first.
-        backend.RenderIdle("the transfer's check");
-        const auto pixel = [&](u32 x, u32 y) {
-            const u8* p = out + (y * width + x) * 3;
-            return static_cast<u32>(p[2]) << 16 | static_cast<u32>(p[1]) << 8 | p[0];
-        };
-        // Every byte against the PICA's RGB8 of the surface (B, G, R from R, G, B, A).
-        u32 wrong = 0;
-        for (u32 n = 0; n < width * height; n++) {
-            const u8* in = source->memory.cpu + n * 4;
-            const u8* got = out + n * 3;
-            wrong += (got[0] != in[2]) + (got[1] != in[1]) + (got[2] != in[0]);
-        }
-        LOG_INFO(Render,
-                 "transfer {}: {:#x} to {:#x} ({}), {}x{} RGB8, TA {} us, 3D {} us; {} of {} bytes "
-                 "differ from the surface's RGB8; as R G B: centre {:06x}, corners {:06x} {:06x} "
-                 "{:06x} {:06x}",
-                 transfers, input, output, fcram ? "FCRAM" : "VRAM", width, height, ta_us, d3_us,
-                 wrong, bytes, pixel(width / 2, height / 2), pixel(0, 0), pixel(width - 1, 0),
-                 pixel(0, height - 1), pixel(width - 1, height - 1));
-        // The frame as a PPM (R, G, B, rows as in memory) where the Vita build has a host0;
-        // nothing without one.
-        const std::string path = fmt::format("host0:azahar-transfer-{}.ppm", transfers);
-        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
-            std::fprintf(f, "P6\n%u %u\n255\n", width, height);
-            std::vector<u8> rgb(bytes);
-            for (u32 n = 0; n < width * height; n++) {
-                rgb[n * 3] = out[n * 3 + 2];
-                rgb[n * 3 + 1] = out[n * 3 + 1];
-                rgb[n * 3 + 2] = out[n * 3];
-            }
-            std::fwrite(rgb.data(), 1, rgb.size(), f);
-            std::fclose(f);
-            LOG_INFO(Render, "transfer {}: written to {}", transfers, path);
-        }
-        // The picture as a map, a character per 16x16 block from its centre pixel: '.' the
-        // first corner's value, '#' white, '+' anything else; a row of blocks a line.
-        const u32 background = pixel(0, 0);
-        for (u32 ty = 0; ty < height / 16; ty++) {
-            std::string row;
-            for (u32 tx = 0; tx < width / 16; tx++) {
-                const u32 v = pixel(tx * 16 + 8, ty * 16 + 8);
-                row += v == background ? '.' : v == 0xffffffu ? '#' : '+';
-            }
-            LOG_INFO(Render, "transfer {} rows {:2}: |{}|", transfers, ty, row);
-        }
-    }
     VprofTransferResult(output, width, height, static_cast<u32>(config.output_format.Value()),
                         out, bytes);
 #endif
@@ -1050,14 +959,8 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
                      "sgxd: AccelerateFill {}: only guest VRAM is filled on the GPU", describe());
 
     // A fill over the open pass's buffers comes after its draws: the pass renders first.
-    if (backend.InPass()) {
-        const Surface& s = surfaces[pass_surface];
-        const PAddr colour_end = s.End();
-        const PAddr depth_end = pass_depth + s.width * s.height * pass_depth_bytes;
-        if ((start < colour_end && s.addr < end) ||
-            ((pass_depth_cleared || pass_depth_used) && start < depth_end && pass_depth < end)) {
-            EndPass("a fill over its buffers");
-        }
+    if (backend.InPass() && PassOverlaps(start, end)) {
+        EndPass("a fill over its buffers");
     }
     DepthStoresWritten(start, end);
 
@@ -1152,36 +1055,20 @@ bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_str
                    (dst_fcram || inside(dst, dst_size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)),
                "sgxd: AccelerateDma {}: outside the mapped guest memory", describe());
 
-    // A copy over the open pass's buffers comes after its draws: the pass renders first.
+    // A copy over the open pass's buffers, or from its colour buffer, comes after its draws.
     const PAddr end = dst + dst_size;
-    if (backend.InPass()) {
-        const Surface& s = surfaces[pass_surface];
-        const PAddr colour_end = s.End();
-        const PAddr depth_end = pass_depth + s.width * s.height * pass_depth_bytes;
-        if ((dst < colour_end && s.addr < end) ||
-            ((pass_depth_cleared || pass_depth_used) && dst < depth_end && pass_depth < end)) {
-            EndPass("a DMA over its buffers");
-        }
+    if (backend.InPass() && PassOverlaps(dst, end)) {
+        EndPass("a DMA over its buffers");
     }
-    // A source a pass drew is in its surface: guest memory takes it first (SyncRange), the
-    // open pass ended first if it draws there.
-    const bool drawn_source = std::any_of(surfaces.begin(), surfaces.end(), [&](const Surface& o) {
-        return o.passes > 0 && !o.guest_newer && o.addr < src + size && src < o.End();
-    });
-    if (drawn_source) {
-        if (backend.InPass() && surfaces[pass_surface].addr < src + size &&
-            src < surfaces[pass_surface].End()) {
-            EndPass("a DMA from its colour buffer");
-        }
-        sync_reason = "dma source";
-        SyncRange(src, src + size);
+    if (backend.InPass() && src < pass_colour.End() && pass_colour.addr < src + size) {
+        EndPass("a DMA from its colour buffer");
     }
     // The pending 3D completes before the PTLA reads what it writes, or writes what it reads.
     backend.RenderBefore(src, src + size, "a DMA's source");
     backend.RenderBefore(dst, end, "a DMA's destination");
     ForgetClears(dst, end);
     TexturesWritten(dst, end);
-    SurfacesWritten(dst, end);
+    DepthStoresWritten(dst, end);
 
     // Guest FCRAM is cached for the CPU (but the pages moved to CDRAM): the source is cleaned before
     // the PTLA reads it, the destination's lines leave the cache before and after.
@@ -1278,55 +1165,7 @@ bool RasterizerSgxd::TakeClear(PAddr start, PAddr end, ClearedRange& out) {
     return false;
 }
 
-RasterizerGxm::Surface& RasterizerGxm::SurfaceFor(PAddr addr, u32 width, u32 height,
-                                                  FramebufferRegs::ColorFormat format) {
-    // A buffer the guest reshaped gets a surface of each shape: they overlap as any two
-    // surfaces do, the later pass's bytes winning (generation). a game reshapes its bloom
-    // buffer every frame, and a cleared pass then needs nothing of the other shape's.
-    for (Surface& s : surfaces) {
-        if (s.addr == addr && s.width == width && s.height == height && s.format == format) {
-            return s;
-        }
-    }
-    DEBUG_ASSERT(!backend.InPass());
-    for (const Surface& d : dead) {
-        backend.FreeSurface(d.memory, d.width, d.height);
-    }
-    dead.clear();
-    Surface s{addr, width, height, backend.AllocSurface(width, height), 0};
-    s.format = format;
-    s.bpp = FramebufferRegs::BytesPerColorPixel(format);
-    surfaces.push_back(s);
-    LOG_INFO(Render, "surface {:#x}: {}x{} format {} at GPU {:#010x}", addr, width, height,
-             static_cast<u32>(format), surfaces.back().memory.gpu);
-    return surfaces.back();
-}
-
 namespace {
-
-/// A colour format as the PBE stores it: the pack, whether the lanes go mirrored, bytes a pixel.
-struct GuestPack {
-    u32 pack;
-    bool mirror;
-};
-
-GuestPack GuestPackFor(FramebufferRegs::ColorFormat format, PAddr addr) {
-    using CF = FramebufferRegs::ColorFormat;
-    switch (format) {
-    case CF::RGBA8:
-        return {SGXD_RECIPE_PACK_U8888_RGBA, false};
-    case CF::RGB565:
-        return {SGXD_RECIPE_PACK_R5G6B5, false};
-    case CF::RGB5A1:
-        return {SGXD_RECIPE_PACK_A1R5G5B5_RGBA, false};
-    case CF::RGBA4:
-        return {SGXD_RECIPE_PACK_A4R4G4B4, true};
-    default:
-        UNREACHABLE_MSG("GXM: the colour buffer at {:#x} (format {}) written back to guest "
-                        "memory: that format is not built",
-                        addr, static_cast<u32>(format));
-    }
-}
 
 bool InFcram(PAddr addr) {
     return addr >= Memory::FCRAM_PADDR && addr < Memory::FCRAM_PADDR_END;
@@ -1358,164 +1197,51 @@ void RasterizerSgxd::CopyLines(u32 src, u32 dst, u32 line_bytes, u32 lines, u32 
     DEBUG_ASSERT_MSG(copied == 0, "sgxd: {}: {}", what, failed);
 }
 
-std::vector<u64> RasterizerGxm::TileHashes(const Surface& s) {
-    const u32 tile_bytes = 64 * s.bpp;
-    const u8* const guest = memory.GetPhysicalPointer(s.addr);
-    std::vector<u64> hashes(s.width * s.height / 64);
-    for (std::size_t t = 0; t < hashes.size(); t++) {
-        hashes[t] = Common::ComputeHash64(guest + t * tile_bytes, tile_bytes);
+SgxdBackend::PicaTarget RasterizerSgxd::PicaTargetFor(const ColourBuffer& c, const char* what) {
+    // The PBE's pack for each colour format: the
+    // PICA's bytes from the A8B8G8R8 a pass's fragments leave on chip.
+    using CF = FramebufferRegs::ColorFormat;
+    u32 pack = 0;
+    switch (c.format) {
+    case CF::RGBA8:
+        pack = SGXD_RECIPE_PACK_U8888_RGBA;
+        break;
+    case CF::RGB8: // B, G, R in memory: U8U8U8_RGB
+        pack = SGXD_RECIPE_PACK_U888_RGB;
+        break;
+    case CF::RGB565:
+        pack = SGXD_RECIPE_PACK_R5G6B5;
+        break;
+    case CF::RGB5A1:
+        pack = SGXD_RECIPE_PACK_A1R5G5B5_RGBA;
+        break;
+    case CF::RGBA4:
+        pack = SGXD_RECIPE_PACK_A4R4G4B4_RGBA;
+        break;
+    default:
+        UNREACHABLE_MSG("sgxd: {}: the colour buffer at {:#x} has format {}, which is not built",
+                        what, c.addr, static_cast<u32>(c.format));
     }
-    return hashes;
+    // Route 1 draws the buffer transposed in 8x16 strips: its width in 16s, its height in 8s.
+    ASSERT_MSG(c.width % 16 == 0 && c.width >= 32 && c.width <= 1024 && c.height % 8 == 0 &&
+                   c.height >= 32 && c.height <= 1024,
+               "sgxd: {}: a {}x{} colour buffer at {:#x}: passes take widths of 32 to 1024 in 16s "
+               "and heights of 32 to 1024 in 8s",
+               what, c.width, c.height, c.addr);
+    // FCRAM is drawn into once it is uncached (moved under the draw's or transfer's write hold).
+    if (InFcram(c.addr)) {
+        KeepUncached(c.addr, c.End() - c.addr);
+    }
+    ASSERT_MSG(!InFcram(c.addr) || guest_memory.IsUncached(c.addr, c.End() - c.addr),
+               "sgxd: {}: the colour buffer at {:#x}-{:#x} is FCRAM the CPU caches", what, c.addr,
+               c.End());
+    return {c.addr, c.width, c.height, pack, c.bpp};
 }
 
-void RasterizerGxm::SyncToGuest(Surface& s) {
-    if (s.synced_passes == s.passes) {
-        return;
-    }
-    DEBUG_ASSERT_MSG(!backend.InPass() || &s != &surfaces[pass_surface] ||
-                         backend.PassDraws() == 0,
-                     "GXM: the colour buffer at {:#x} written back while its own pass draws",
-                     s.addr);
-    const GuestPack g = GuestPackFor(s.format, s.addr);
-    const u32 tile_bytes = 64 * s.bpp;
-    const u32 tiles = s.width * s.height / 64;
-    u32 cpu_tiles = 0;
-    if (!InFcram(s.addr)) {
-        // Guest VRAM, uncached for the CPU: the PBE writes it where it is. The CPU does not
-        // write VRAM (DMAs and transfers mark the surface guest_newer).
-        backend.TileBack(s.memory, s.width, s.height, {memory.GetPhysicalPointer(s.addr), s.addr},
-                         g.pack, g.mirror, s.bpp);
-    } else {
-        // FCRAM, cached: the tiles go through the pass's data, and the CPU copies those it did
-        // not write since the pass began.
-        const std::vector<u64> now = TileHashes(s);
-        const SgxdBackend::Data scratch = backend.Scratch(tiles * tile_bytes);
-        backend.TileBack(s.memory, s.width, s.height, scratch, g.pack, g.mirror, s.bpp);
-        // The CPU merges the tiles: it reads what the GPU wrote.
-        backend.RenderIdle("a write-back to FCRAM");
-        u8* const guest = memory.GetPhysicalPointer(s.addr);
-        for (u32 t = 0; t < tiles; t++) {
-            if (!s.tile_hashes.empty() && now[t] != s.tile_hashes[t]) {
-                cpu_tiles++;
-                continue;
-            }
-            std::memcpy(guest + t * tile_bytes, scratch.cpu + t * tile_bytes, tile_bytes);
-        }
-        s.tile_hashes = TileHashes(s);
-        s.guest_newer = s.guest_newer || cpu_tiles != 0;
-    }
-    s.synced_passes = s.passes;
-    TexturesWritten(s.addr, s.End());
-    synced_tiles += tiles;
-    sync_why[fmt::format("{:#x} {}x{} f{} {}", s.addr, s.width, s.height,
-                         static_cast<u32>(s.format), sync_reason)]++;
-    if (syncs % 200 == 199) {
-        std::string why;
-        for (const auto& [k, n] : sync_why) {
-            why += fmt::format("; {} x{}", k, n);
-        }
-        sync_why.clear();
-        LOG_INFO(Render, "{} write-backs to guest memory so far, {} tiles{}", syncs + 1,
-                 synced_tiles, why);
-    }
-    if (syncs++ < 8) {
-        LOG_INFO(Render, "the colour buffer at {:#x} ({}x{} format {}) written back to guest "
-                         "memory; {} of {} tiles the CPU's",
-                 s.addr, s.width, s.height, static_cast<u32>(s.format), cpu_tiles, tiles);
-    }
-#ifdef VITA_DIAGNOSTICS
-    // tilecheck: the write-back against the CPU's own encoding of the surface.
-    if (GxmFlag("tilecheck") && cpu_tiles == 0) {
-        backend.RenderIdle("tilecheck");
-        using CF = FramebufferRegs::ColorFormat;
-        const u8* const guest = memory.GetPhysicalPointer(s.addr);
-        const u32* const picture = reinterpret_cast<const u32*>(s.memory.cpu);
-        u32 wrong = 0;
-        for (u32 y = 0; y < s.height; y++) {
-            for (u32 x = 0; x < s.width; x++) {
-                const u32 c = picture[y * s.width + x];
-                const u32 r = c & 0xff, gr = c >> 8 & 0xff, b = c >> 16 & 0xff, a = c >> 24;
-                u32 want = 0;
-                switch (s.format) {
-                case CF::RGBA8:
-                    want = r << 24 | gr << 16 | b << 8 | a;
-                    break;
-                case CF::RGB565:
-                    want = (r >> 3) << 11 | (gr >> 2) << 5 | b >> 3;
-                    break;
-                default:
-                    want = (r >> 4) << 12 | (gr >> 4) << 8 | (b >> 4) << 4 | a >> 4;
-                    break;
-                }
-                const u32 i = (x & 1) | (y & 1) << 1 | (x & 2) << 1 | (y & 2) << 2 |
-                              (x & 4) << 2 | (y & 4) << 3;
-                const u32 at = ((y / 8) * (s.width / 8) + x / 8) * 64 + i;
-                u32 got = 0;
-                std::memcpy(&got, guest + at * s.bpp, s.bpp);
-                if (got != want && wrong++ < 4) {
-                    LOG_INFO(Render, "tilecheck {:#x}: pixel ({}, {}) {:#x}, want {:#x}", s.addr,
-                             x, y, got, want);
-                }
-            }
-        }
-        LOG_INFO(Render, "tilecheck {:#x}: {} of {} pixels differ", s.addr, wrong,
-                 s.width * s.height);
-    }
-#endif
-}
-
-bool RasterizerGxm::Superseded(const Surface& s) const {
-    const auto later = [&s](const Surface& o) {
-        return &o != &s && o.passes > 0 && o.generation > s.generation && o.addr < s.End() &&
-               s.addr < o.End();
-    };
-    return std::any_of(surfaces.begin(), surfaces.end(), later);
-}
-
-void RasterizerGxm::SyncRange(PAddr start, PAddr end) {
-    const auto overlap = [](const Surface& a, const Surface& b) {
-        return a.addr < b.End() && b.addr < a.End();
-    };
-    std::vector<Surface*> set;
-    for (Surface& s : surfaces) {
-        if (s.passes > 0 && !s.guest_newer && s.addr < end && start < s.End()) {
-            set.push_back(&s);
-        }
-    }
-    std::sort(set.begin(), set.end(),
-              [](const Surface* a, const Surface* b) { return a->generation < b->generation; });
-    std::vector<const Surface*> written;
-    for (Surface* s : set) {
-        // An earlier surface's write-back went over bytes this one drew later.
-        if (std::any_of(written.begin(), written.end(),
-                        [&](const Surface* w) { return overlap(*w, *s); })) {
-            s->synced_passes = ~0u;
-        }
-        if (s->synced_passes != s->passes) {
-            SyncToGuest(*s);
-            written.push_back(s);
-        }
-    }
-    for (Surface* s : set) {
-        if (std::any_of(set.begin(), set.end(), [&](const Surface* o) {
-                return o->generation > s->generation && overlap(*o, *s);
-            })) {
-            s->guest_newer = true;
-        }
-    }
-}
-
-bool RasterizerGxm::CpuWroteInto(Surface& s) {
-    if (s.guest_newer || !InFcram(s.addr) || s.tile_hashes.empty()) {
-        return s.guest_newer;
-    }
-    if (TileHashes(s) == s.tile_hashes) {
-        return false;
-    }
-    sync_reason = "cpu wrote";
-    SyncToGuest(s);
-    s.guest_newer = true;
-    return true;
+bool RasterizerSgxd::PassOverlaps(PAddr start, PAddr end) const {
+    const PAddr depth_end = pass_depth + pass_colour.width * pass_colour.height * pass_depth_bytes;
+    return (start < pass_colour.End() && pass_colour.addr < end) ||
+           ((pass_depth_cleared || pass_depth_used) && start < depth_end && pass_depth < end);
 }
 
 namespace {
@@ -1671,53 +1397,16 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
     for (u32 l = 0; l < levels; l++) {
         bytes += (width >> l) * (height >> l) * f.bits / 8;
     }
-    // A texture that is a colour buffer a pass drew reads the surface: the same rows in the
-    // same order as an untiled texture's (row 0 the buffer's first tile row), rows its width
-    // apart. It may start at a tile row inside the buffer. Its first level only. Any other
-    // texture over a drawn buffer reads guest memory, where the PICA would have rendered:
-    // the passes are written back there first (SyncToGuest), unless the CPU has written the
-    // buffer since (CpuWroteInto), which leaves guest memory the picture.
-    bool sync = false;
-    for (Surface& s : surfaces) {
-        if (s.passes == 0 || s.guest_newer) {
-            continue;
-        }
-        bool overlaps = false;
-        for (u32 k = 0; k < parts; k++) {
-            overlaps = overlaps || (part_addr[k] < s.End() && s.addr < part_addr[k] + bytes);
-        }
-        if (!overlaps || CpuWroteInto(s)) {
-            continue;
-        }
-        const u32 offset = addr - s.addr;
-        const u32 first_row = offset / (s.width * s.bpp);
-        const bool same = !cube && addr >= s.addr && addr < s.End() && width == s.width &&
-                          offset % (s.width * 8 * s.bpp) == 0 && first_row + height <= s.height &&
-                          static_cast<u32>(t.format) == static_cast<u32>(s.format);
-        if (!same || Superseded(s)) {
-            sync = true;
-            continue;
-        }
-        DEBUG_ASSERT_MSG(!backend.InPass() || &s != &surfaces[pass_surface],
-                         "GXM: texture unit {} reads the colour buffer at {:#x} its own pass draws",
-                         unit, s.addr);
-        using CF = FramebufferRegs::ColorFormat;
-        const u32 skip = first_row * s.width * 4;
-        Texture& rt = surface_textures[unit];
-        rt = Texture{addr, width, height, t.format, {s.memory.cpu + skip, s.memory.gpu + skip},
-                     0, 1, 1, {addr}, bytes, 0, passes, false};
-        rt.alpha_one = s.format == CF::RGB565 || s.format == CF::RGB8;
-        if (surface_reads++ < 4) {
-            LOG_INFO(Render, "texture unit {} at {:#x}: reads the {}x{} surface at {:#x}", unit,
-                     addr, s.width, s.height, s.addr);
-        }
-        return rt;
-    }
-    if (sync) {
-        for (u32 k = 0; k < parts; k++) {
-            sync_reason = "texture";
-            SyncRange(part_addr[k], part_addr[k] + bytes);
-        }
+    // A colour buffer a pass drew is a texture as any other: guest memory holds what the passes
+    // stored (EndPass marked the textures over it to be untiled again), and the untile's render
+    // runs after their 3D. One the open pass draws into would need its pass ended before its
+    // own draw, which is not built.
+    for (u32 k = 0; k < parts; k++) {
+        DEBUG_ASSERT_MSG(!backend.InPass() || part_addr[k] >= pass_colour.End() ||
+                             pass_colour.addr >= part_addr[k] + bytes,
+                         "GXM: texture unit {} at {:#x} reads the colour buffer at {:#x} its own "
+                         "pass draws",
+                         unit, part_addr[k], pass_colour.addr);
     }
     auto it = std::find_if(textures.begin(), textures.end(),
                            [addr](const Texture& e) { return e.addr == addr; });
@@ -2071,15 +1760,6 @@ void RasterizerSgxd::TexturesWritten(PAddr start, PAddr end) {
     }
 }
 
-void RasterizerGxm::SurfacesWritten(PAddr start, PAddr end) {
-    DepthStoresWritten(start, end);
-    for (Surface& s : surfaces) {
-        if (start < s.End() && s.addr < end) {
-            s.guest_newer = true;
-        }
-    }
-}
-
 RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width, u32 height,
                                                         u32 format) {
     for (DepthStore& d : depth_stores) {
@@ -2100,9 +1780,10 @@ RasterizerSgxd::DepthStore& RasterizerSgxd::DepthStoreFor(PAddr addr, u32 width,
 }
 
 SgxdBackend::DepthStore RasterizerGxm::NewDepthStore(u32 width, u32 height, u32 format) {
-    // Whole 32x32 tiles; the stencil (D24S8's) a quarter of the depth's bytes after it.
+    // The pass's target, the guest buffer's transpose (SgxdBackend::PicaTarget), in whole 32x32
+    // tiles; the stencil (D24S8's) a quarter of the depth's bytes after it.
     const bool stencil = format == static_cast<u32>(FramebufferRegs::DepthFormat::D24S8);
-    const u32 w = Common::AlignUp(width, 32u), h = Common::AlignUp(height, 32u);
+    const u32 w = Common::AlignUp(height, 32u), h = Common::AlignUp(width, 32u);
     return {backend.AllocSurface(w, h * (stencil ? 5 : 4) / 4), w, h, stencil};
 }
 
@@ -2117,7 +1798,7 @@ void RasterizerSgxd::DepthStoresWritten(PAddr start, PAddr end) {
 }
 
 void RasterizerSgxd::EndPass(const char* why) {
-    Surface& s = surfaces[pass_surface];
+    const ColourBuffer& s = pass_colour;
     const u32 pass_draws = backend.PassDraws();
 #ifdef VITA_DIAGNOSTICS
     const u32 pass_prims = backend.PassPrimitives();
@@ -2180,9 +1861,13 @@ void RasterizerSgxd::EndPass(const char* why) {
                   n.width * 8 * n.bpp, "a narrow colour buffer's copy out");
         pass_narrow = nullptr;
     }
-    s.passes++;
-    s.generation = ++generations;
-    s.guest_newer = false;
+    // The pass stored its tiles into the guest's buffer: the textures over what it drew are
+    // untiled again, behind its 3D. The tiles no draw covered store the bytes they loaded or
+    // the clear guest memory holds.
+    if (pass_drawn_lo < pass_drawn_hi) {
+        TexturesWritten(pass_drawn_lo, pass_drawn_hi);
+    }
+    pass_drawn_lo = pass_drawn_hi = 0;
 #ifdef VITA_DIAGNOSTICS
     VprofPassResult(s);
     LogTextureStats();
@@ -2202,23 +1887,9 @@ void RasterizerSgxd::EndPass(const char* why) {
         }
     }
 #endif
-    // Surfaces this one covers whole are dead: its pass started from what they held.
-    const PAddr lo = s.addr, hi = s.End();
-    for (auto it = surfaces.begin(); it != surfaces.end();) {
-        if (&*it != &surfaces[pass_surface] && it->addr >= lo && it->End() <= hi) {
-            dead.push_back(std::move(*it));
-            const std::size_t at = static_cast<std::size_t>(it - surfaces.begin());
-            it = surfaces.erase(it);
-            if (at < pass_surface) {
-                pass_surface--;
-            }
-        } else {
-            ++it;
-        }
-    }
     if (passes++ < 8) {
         LOG_INFO(Render, "pass {} on {:#x}: {} draws, TA {} us, 3D {} us; ended by {}", passes,
-                 lo, pass_draws, ta_us, d3_us, why);
+                 s.addr, pass_draws, ta_us, d3_us, why);
     }
 }
 
@@ -4734,14 +4405,16 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     SyncDrawUniforms();
     {
         // The scissor box in the fragment program's position (WPOS: pixel centres from the
-        // target's top-left, rows as the memory's): x [x1, x2 + 1), and y mirrored like the
-        // viewport's corner (upstream's Vulkan path, FramebufferHelper with flip_rect).
+        // target's top-left). The target is the buffer transposed (SgxdBackend::PicaTarget):
+        // WPOS x is the memory's row, so the PICA's y, mirrored like the viewport's corner
+        // (upstream's Vulkan path, FramebufferHelper with flip_rect); WPOS y is the PICA's x,
+        // [x1, x2 + 1).
         const auto& sc = regs.rasterizer.scissor_test;
         const s32 target_height = static_cast<s32>(regs.framebuffer.framebuffer.GetHeight());
-        fs_data.scissor_x1 = static_cast<s32>(sc.x1.Value());
-        fs_data.scissor_x2 = static_cast<s32>(sc.x2.Value()) + 1;
-        fs_data.scissor_y1 = target_height - (static_cast<s32>(sc.y2.Value()) + 1);
-        fs_data.scissor_y2 = target_height - static_cast<s32>(sc.y1.Value());
+        fs_data.scissor_x1 = target_height - (static_cast<s32>(sc.y2.Value()) + 1);
+        fs_data.scissor_x2 = target_height - static_cast<s32>(sc.y1.Value());
+        fs_data.scissor_y1 = static_cast<s32>(sc.x1.Value());
+        fs_data.scissor_y2 = static_cast<s32>(sc.x2.Value()) + 1;
     }
 
     // --- the target and the output merger ---
@@ -4878,8 +4551,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const PAddr colour = fb.GetColorBufferPhysicalAddress();
     const PAddr depth = fb.GetDepthBufferPhysicalAddress();
     const u32 width = fb.GetWidth(), height = fb.GetHeight();
-    if (backend.InPass() && (surfaces[pass_surface].addr != colour ||
-                             (uses_depth && pass_depth != depth))) {
+    const ColourBuffer target{colour, width, height, fb.color_format,
+                              FramebufferRegs::BytesPerColorPixel(fb.color_format)};
+    if (backend.InPass() &&
+        (pass_colour.addr != colour || pass_colour.width != width ||
+         pass_colour.height != height || pass_colour.format != fb.color_format ||
+         (uses_depth && pass_depth != depth))) {
         EndPass("a draw to other buffers");
     }
     // A geometry draw's stages take the pass's data (GeometryStage): the stored vertex outputs, the
@@ -4945,9 +4622,37 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         EndPass("a pass full of draws");
     }
     if (!backend.InPass()) {
-        Surface& s = SurfaceFor(colour, width, height, fb.color_format);
+        // A buffer of a width no pass draws: its scratch (NarrowScratch), the guest's bytes copied in.
+        pass_narrow = nullptr;
+        ColourBuffer drawn = target;
+        if (narrow != 0) {
+            DEBUG_ASSERT_MSG(target.width % 8 == 0 && target.height >= 8 &&
+                                 target.height % 8 == 0 && (target.width >= 32 || !uses_depth),
+                             "sgxd: {}: a {}x{} colour buffer{}: a narrow buffer is drawn only "
+                             "8s wide and high, under 32 wide without depth",
+                             describe(), target.width, target.height,
+                             uses_depth ? " with depth" : "");
+            // Its depth (32 wide or more) needs nothing of its own: the store's tiles cover the scratch's pass
+            // (NewDepthStore aligns both widths to the same 32).
+            ASSERT_MSG(target.width < 32 || target.width % 8 == 0,
+                       "sgxd: {}: a {}x{} colour buffer: a buffer not in 16s wide is drawn only 8s "
+                       "wide",
+                       describe(), target.width, target.height);
+            const NarrowScratch& n = NarrowScratchFor(target);
+            const u32 strip = target.width * 8 * target.bpp;
+            backend.RenderBefore(target.addr, target.End(), "a narrow colour buffer's copy in");
+            CopyLines(target.addr, n.surface.gpu, strip, target.height / 8, strip,
+                      narrow * 8 * target.bpp, "a narrow colour buffer's copy in");
+            drawn.addr = n.surface.gpu;
+            drawn.width = narrow;
+            // A pass's target is 32 rows at least; the viewport and scissor mirror the guest's height, so its
+            // rows are the scratch's first strips all the same.
+            drawn.height = std::max(target.height, 32u);
+            pass_narrow = &n;
+        }
+        const SgxdBackend::PicaTarget t = PicaTargetFor(drawn, "a draw");
         ClearedRange clear{};
-        const bool took = TakeClear(colour, s.End(), clear);
+        const bool took = TakeClear(colour, target.End(), clear);
         ClearedRange depth_clear{};
         pass_depth = depth;
         pass_depth_bytes = FramebufferRegs::BytesPerDepthPixel(fb.depth_format);
@@ -4980,66 +4685,38 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                 bg_stencil = depth_clear.value >> 24;
             }
         }
-        // FCRAM: bytes the CPU wrote into the buffer since its last pass began are the
-        // picture's there, and what the passes drew is the rest; guest memory gets that
-        // first (SyncToGuest) where it lacks it, and the pass loads the guest's picture.
-        // A first draw that writes every pixel from nothing: the pass starts from nothing.
+        // The pass starts from the fill's clear, which guest memory holds already (a tile no
+        // draw touches keeps it), from nothing when its first draw writes every pixel, or else
+        // from the buffer's own bytes: its first draws read them (ColorFormat numbers the first
+        // five TextureFormats).
         const bool covered =
             draw_own_pixel == 0 && CoversTarget(is_indexed, immediate, count, width, height);
-        bool merge = false;
-        if (!took && !covered && InFcram(colour) && s.passes > 0 && !s.guest_newer &&
-            !s.tile_hashes.empty() && TileHashes(s) != s.tile_hashes) {
-            merge = s.synced_passes != s.passes;
-            s.guest_newer = true;
-        }
-        // What the pass starts from is guest memory's where another surface's later pass
-        // overlaps this one's picture, or where this buffer is new over drawn ones: guest
-        // memory gets what those passes drew first (SyncRange), and the reshaped buffers' old
-        // surfaces go there in any case.
-        const bool overlapped =
-            !took && !covered && (s.passes == 0 || !s.guest_newer) &&
-            (s.passes > 0 ? Superseded(s)
-                          : std::any_of(surfaces.begin(), surfaces.end(), [&](const Surface& o) {
-                                return &o != &s && o.passes > 0 && !o.guest_newer &&
-                                       o.addr < s.End() && s.addr < o.End();
-                            }));
-        const bool sync = overlapped;
-        const bool load_guest =
-            !took && !covered && (s.passes == 0 || s.guest_newer || overlapped);
-        const u32 bytes = width * height * s.bpp;
-        const auto before = [&] {
-            if (merge) {
-                sync_reason = "merge";
-                SyncToGuest(s);
-            }
-            if (sync) {
-                sync_reason = s.passes == 0 ? "new buffer" : "superseded";
-                SyncRange(s.addr, s.End());
-            }
-            if (load_guest && !guest_memory.IsUncached(colour, bytes)) {
-                SgxdCacheRange(memory.GetPhysicalPointer(colour), bytes, SGXD_CACHE_CLEAN,
-                               CacheSite::Textures);
-            }
-        };
-        pass_surface = static_cast<std::size_t>(&s - surfaces.data());
+        pass_colour = target;
+#ifdef VITA_DIAGNOSTICS
+        drawn_buffers[colour] = target;
+#endif
+#ifdef VITA_DIAGNOSTICS
+        pass_opened = covered                                     ? "covered"
+                      : took                                      ? "clear"
+                      : pass_upscaled && !pass_upscaled->valid    ? "magnified load"
+                                                                  : "load";
+#endif
         if (covered) {
-            backend.BeginPassOver(s.memory, width, height, bg_depth, before);
+            backend.BeginPassOver(t, bg_depth);
             covered_passes++;
         } else if (took) {
-            backend.BeginPass(s.memory, width, height,
-                              ClearColour(s.format, clear.value, clear.bytes), bg_depth, before);
-        } else if (!load_guest) {
-            // No fill: the pass draws over what the last one left.
-            backend.BeginPassLoaded(s.memory, width, height, bg_depth, nullptr, before);
+            backend.BeginPass(t, ClearColour(target.format, clear.value, clear.bytes), bg_depth);
+#ifdef VITA_DIAGNOSTICS
+        } else if (static const bool no_load = SgxdFlag("noload"); no_load) {
+            // sgxd_flags `noload`: the pass starts from a clear, its picture's load left out.
+            backend.BeginPass(t, 0, bg_depth);
+#endif
         } else {
-            // A buffer no pass drew, or one whose guest memory is newer: the guest's picture,
-            // untiled as a texture of its format's (ColorFormat numbers the first five
-            // TextureFormats).
             const UntileFormat f = UntileFormatFor(
-                static_cast<Pica::TexturingRegs::TextureFormat>(static_cast<u32>(s.format)));
-            const SgxdBackend::UntileSource guest{colour, width, height, f.bits,
-                                                  f.code, f.swizzle, 0};
-            backend.BeginPassLoaded(s.memory, width, height, bg_depth, &guest, before);
+                static_cast<Pica::TexturingRegs::TextureFormat>(static_cast<u32>(target.format)));
+            // A narrow buffer loads from its scratch, which holds the guest's bytes already.
+            backend.BeginPassLoaded(
+                t, bg_depth, {drawn.addr, drawn.width, height, f.bits, f.code, f.swizzle, 0});
             if (loads++ < 4) {
                 LOG_INFO(Render, "{}: the colour buffer at {:#x} loaded from guest memory",
                          describe(), colour);
@@ -5049,9 +4726,6 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         pass_bg_depth = bg_depth;
         pass_bg_stencil = bg_stencil;
         pass_drawn_lo = pass_drawn_hi = 0;
-        if (InFcram(colour)) {
-            s.tile_hashes = TileHashes(s);
-        }
     }
     // Without a clear, the depth is what the last pass on the buffer stored, or what guest
     // memory holds when none did (a buffer the CPU cleared, or one reshaped). A draw that
@@ -5087,9 +4761,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                 SgxdCacheRange(memory.GetPhysicalPointer(depth), bytes, SGXD_CACHE_CLEAN,
                                CacheSite::Textures);
             }
+            // The store is the pass's transposed target: the untile transposes too.
             DepthStore& d = DepthStoreFor(depth, width, height, pass_depth_format);
             backend.Untile({depth, width, height, bits, bits == 32 ? 0x0cu : 0x98u, 0, 0},
-                           d.store.memory.gpu, d.store.width);
+                           d.store.memory.gpu, d.store.width, false, true);
             // Every tile converts to F32, drawn on or not.
             backend.TouchAllTiles();
             if (guest_depth_loads++ < 4) {
@@ -5313,19 +4988,20 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     p.pixel_size = sgxd_program_pixel_dms(fp.pixel_pa, fg.temp_count, fsa_words);
     p.outselects = vg.vertex_outputs1;
     p.texsize = vg.vertex_outputs2;
-    // Pixel row y is memory row y: the PICA's viewport as it stands, and z as the program
-    // wrote it (depth times w).
+    // The target is the buffer transposed (SgxdBackend::PicaTarget): the vertex program
+    // writes NDC y as clip x and NDC x as clip y, so pixel column x is memory row x and pixel
+    // row y the PICA's x. z is as the program wrote it (depth times w).
     const float half_w = f24::FromRaw(regs.rasterizer.viewport_size_x).ToFloat32();
     const float half_h = f24::FromRaw(regs.rasterizer.viewport_size_y).ToFloat32();
-    p.viewport[0] = static_cast<float>(regs.rasterizer.viewport_corner.x) + half_w;
-    p.viewport[1] = half_w;
-    // The PICA's window y runs up from the target's last memory row, and the surface's rows are the memory's: the corner is
-    // mirrored as upstream's y-down Vulkan path mirrors it (FramebufferHelper, flip_rect).
-    p.viewport[2] =
+    // The PICA's window y runs up from the target's last memory row: the corner is mirrored as upstream's y-down Vulkan path
+    // mirrors it (FramebufferHelper, flip_rect), and NDC y +1 is the target's first memory row
+    // (the top of the PICA's window), so its scale is negative. With it positive every draw was
+    // mirrored along the rows.
+    p.viewport[0] =
         static_cast<float>(height) - static_cast<float>(regs.rasterizer.viewport_corner.y) - half_h;
-    // NDC y +1 is the target's first memory row (the top of the PICA's window, whose y runs
-    // up): the y scale is negative. With it positive every draw was mirrored along the rows.
-    p.viewport[3] = -half_h;
+    p.viewport[1] = -half_h;
+    p.viewport[2] = static_cast<float>(regs.rasterizer.viewport_corner.x) + half_w;
+    p.viewport[3] = half_w;
     p.viewport[4] = 0.0f;
     p.viewport[5] = 1.0f;
     p.primitive = primitive;

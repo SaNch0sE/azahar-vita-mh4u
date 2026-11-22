@@ -141,6 +141,7 @@ typedef struct SgxdRecipe {
     int fb_external;                 // the target is not the block's FB (sgxd_recipe_set_target)
     int keep_code_caches;            // sgxd_test 11: the kicks skip the USE_CACHE invalidates
     int programs;                    // sgxd_recipe_init_programs: draws bring programs
+    uint32_t pixev_va, pixev_units, pixev_attribute_size;  // sgxd_recipe_set_pixel_event
 } SgxdRecipe;
 
 // The macrotile grid of later inits. 0 (the default) picks by size as Sony's kernel does: 4x4
@@ -321,7 +322,40 @@ void sgxd_recipe_set_target(SgxdRecipe *r, void *memory, uint32_t fb_va, uint32_
 // A1R5G5B5 SWIZ 2: R in bits 15:11, G 10:6, B 5:1, A 0, the PICA's RGB5A1 (SWIZ 0 stores A B G R
 // from bit 15, 1 A R G B, 3 B G R A; channels truncated, alpha its top bit).
 #define SGXD_RECIPE_PACK_A1R5G5B5_RGBA 0x40210000u
+// A4R4G4B4 SWIZ 2: R in bits 15:12, A in 3:0, the PICA's RGBA4 from an A8B8G8R8 source.
+#define SGXD_RECIPE_PACK_A4R4G4B4_RGBA 0x50210000u
 void sgxd_recipe_set_target_pack(SgxdRecipe *r, void *memory, uint32_t pbe0);
+
+// Route 1: a pass renders the guest's picture
+// transposed, the recipe's x a guest row and its y a guest column, and its end of tile stores
+// each tile into the guest's colour buffer as the PICA lays it out: 8x8 tiles row after row,
+// Morton order inside, x first. The tile's eight 8x16 strips are TWIDDLED emits 16 rows high,
+// each two PICA tiles, their words computed from IR0 (the tile's origin in 16 pixels, X in bits
+// 0-7 and Y in 8-15), which the pixel event program DOUTAs into the task's pa0. The PBE takes
+// a tile's emit words once for its four tasks, so every task emits all eight strips and the
+// clips keep each one's own. Strips past the target (its width a multiple of 8, its height of
+// 16, neither of 32) get an empty clip.
+typedef struct SgxdPicaStore {
+    uint32_t buffer;   // the guest colour buffer's GPU address
+    uint32_t pack;     // its format: PBE word 0's pack and swizzle (SGXD_RECIPE_PACK_*)
+    uint32_t bpp;      // its bytes a pixel: 2, 3 or 4
+} SgxdPicaStore;
+#define SGXD_RECIPE_PICA_EOT_MAX 128u
+// The end-of-tile program storing r's target into s's buffer: up to SGXD_RECIPE_PICA_EOT_MAX
+// instructions into out, temporaries r0..r15. Returns the count, or 0 for a target route 1 does
+// not take (width a multiple of 8 up to 1024, height of 16 from 32 to 1024).
+unsigned sgxd_recipe_pica_eot(const SgxdRecipe *r, const SgxdPicaStore *s, uint64_t *out);
+// The pixel event program for it: the recipe's, with IR0 DOUTAed into the end-of-tile task's pa0
+// first (three times: a DOUTA is repeated), and the end of tile at eot_index (DOUTU's
+// instruction index from code base 1) with 16 temporaries. Four data units; the 3D kick takes it
+// through sgxd_recipe_set_pixel_event(r, va, 4, 4).
+#define SGXD_RECIPE_PICA_PIXEV_WORDS 32u
+void sgxd_recipe_pica_pixev(const SgxdRecipe *r, uint32_t eot_index,
+                            uint32_t out[SGXD_RECIPE_PICA_PIXEV_WORDS]);
+// The pixel event program the 3D kick names (EVENT_PIXEL_PDS_EXEC, _DATA's units and _INFO's
+// ATTRIBUTE_SIZE): as init sets it, the layout's PIXEV, 3 units and 2.
+void sgxd_recipe_set_pixel_event(SgxdRecipe *r, uint32_t va, uint32_t units,
+                                 uint32_t attribute_size);
 
 typedef struct SgxdOpList {
     SgxdOp *ops;

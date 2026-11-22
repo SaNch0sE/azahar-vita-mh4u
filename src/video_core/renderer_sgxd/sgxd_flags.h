@@ -53,11 +53,6 @@ namespace GxmRenderer {
  *             (vs2 / fs2 for the second tier's), a GXP container psp2shaderperf -disasm lists
  *
  * Debugging a pass on the console:
- *   dumpat=N  check transfers N and N + 1 (counted from 1) against their surfaces and write
- *             them as azahar-transfer-N.ppm: dumpat=1 for the first frames, a late N for one
- *             the second tier drew, for comparing runs. Off, no transfer is checked or
- *             written. Each host0 write holds the emulation about 2 s, so pick N that
- *             comes well before the run ends, or the file is cut short
  *   dumptex   write the first eight untiled textures to host0, each level: the guest's bytes
  *             and the host copy, azahar-texN-ADDR-WxH-fFORMAT-sSTRIDE-{guest,host}.bin
  *   texdump=N  every texture the draws sample over a frame of both screens from N s of the
@@ -94,7 +89,6 @@ namespace GxmRenderer {
  *   untilecheck  every RGBA8, RGB8, ETC1 and ETC1A4 untile's level 0 against upstream's CPU
  *             decode; the log counts the levels that differ (with dumptex, a "want" file too)
  *   poolcheck the textures pool's GPU mapping, checked at the first untile that differs
- *   tilecheck a write-back against the CPU's own encoding of the surface
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks
  *   (docs/debugging.md, "Wrong pictures")

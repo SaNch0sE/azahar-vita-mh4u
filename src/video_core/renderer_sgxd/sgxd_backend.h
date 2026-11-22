@@ -40,7 +40,9 @@ namespace SgxdRenderer {
  * - the LUT rows: the lighting and fog LUTs as one 256-wide F32F32 texture, a ring of rows the
  *   rasterizer hands out (TCU invalidated by every kick).
  *
- * Host surfaces (render targets) come from a second block. Nothing the GPU runs is waited
+ * Passes render into a colour buffer's picture (PicaTarget::picture), or into guest memory
+ * itself where the buffer has none (PicaTarget); the depth stores they keep come from a second
+ * block. Nothing the GPU runs is waited
  * for when it is sent: passes, side renders, fills and copies are lists in sgxd's queue, run in
  * order. Each CPU-written resource (a recipe instance, a pass data slot, a PDS half, the LUT
  * halves) carries the fence of the last list that reads it, waited for only when the CPU
@@ -93,10 +95,11 @@ public:
         return at < data_end ? data_end - at : 0;
     }
 
-    /// A host surface: width x height A8B8G8R8 pixels, rows width apart; the first fit of what
-    /// FreeSurface gave back.
+    /// Memory for width x height 32-bit samples (a depth store), rows width apart; the first
+    /// fit of what FreeSurface gave back.
     Data AllocSurface(u32 width, u32 height);
-    /// A surface no longer used (a colour buffer the guest reshaped), after its last read.
+    /// Memory AllocSurface gave, no longer used (a depth buffer the guest reshaped), after its
+    /// last read.
     void FreeSurface(const Data& surface, u32 width, u32 height);
     /// The LUT texture's rows, in the shared block: Pica::Shader::LUT_LF_ROWS rows of 256 F32F32
     /// texels, the rasterizer's to manage.
@@ -106,9 +109,22 @@ public:
     [[nodiscard]] Data LutRgRows() const;
     [[nodiscard]] Data LutRgbaRows() const;
 
-    /// Opens a pass on a surface, under the recipe for its size. The background is clear
-    /// (A8B8G8R8) at depth, what a fill left pending. before: as BeginPassLoaded's.
-    void BeginPass(const Data& target, u32 width, u32 height, u32 clear, float depth,
+    /**
+     * A guest colour buffer a pass renders into, where it is: width x height pixels of bpp bytes at its PICA address, in
+     * the PICA's 8x8 tiles, the format as the PBE's pack (SGXD_RECIPE_PACK_*). The pass draws
+     * its transpose, height x width under the recipe for that size: x is the guest's row, y its
+     * column. Its end of tile (sgxd_recipe_pica_eot) stores every tile it renders into the guest
+     * buffer as the PICA lays it out; a tile no draw touches keeps the guest's bytes.
+     */
+    struct PicaTarget {
+        u32 gpu;
+        u32 width, height;
+        u32 pack;
+        u32 bpp;
+    };
+    /// Opens a pass on target. The background is clear (A8B8G8R8) at depth, what a fill left
+    /// pending in guest memory. before: as BeginPassLoaded's.
+    void BeginPass(const PicaTarget& target, u32 clear, float depth,
                    const std::function<void()>& before = {});
     [[nodiscard]] bool InPass() const {
         return in_pass;
@@ -263,14 +279,13 @@ public:
         bool byte_copy = false;
     };
     static constexpr u32 UntileSide = 1024;
-    /// Opens a pass on a surface that keeps its picture instead of a clear: the pass's first
-    /// draw blits the surface onto itself, or with guest, the guest's tiled picture (untiled
-    /// into the pass's data first), texel for pixel. before runs once the pass is open, ahead
-    /// of the load: side renders (TileBack) that must land in guest memory first.
-    void BeginPassLoaded(const Data& target, u32 width, u32 height, float depth,
-                         const UntileSource* guest, const std::function<void()>& before = {});
+    /// Opens a pass on target that keeps its picture instead of a clear: its first draws read
+    /// guest (the target's own bytes) texel for pixel, a band of tile rows a draw (DrawTiled).
+    /// before runs once the pass is open, ahead of the load.
+    void BeginPassLoaded(const PicaTarget& target, float depth, const UntileSource& guest,
+                         const std::function<void()>& before = {});
     /// Opens a pass whose first draw writes every pixel: no clear and no load.
-    void BeginPassOver(const Data& target, u32 width, u32 height, float depth,
+    void BeginPassOver(const PicaTarget& target, float depth,
                        const std::function<void()>& before = {});
     /// The open pass's background stencil, a D24S8 clear's top byte (ISP_BGOBJ): 0 at each
     /// OpenPass.
@@ -323,8 +338,13 @@ public:
      *
      * swizzled: dest is a square SWIZZLED texture instead (a cube face), written through the
      * PBE's TWIDDLED layout; dest_stride is unused. The whole tiles take max(w, 32)^2 texels.
+     *
+     * transposed: dest is the image's transpose, h texels a row (dest_stride apart) and w rows,
+     * as a pass draws a PICA target (PicaTarget): a guest depth buffer into its depth store.
+     * Not with ETC1 or swizzled.
      */
-    void Untile(const UntileSource& source, u32 dest_gpu, u32 dest_stride, bool swizzled = false);
+    void Untile(const UntileSource& source, u32 dest_gpu, u32 dest_stride, bool swizzled = false,
+                bool transposed = false);
 
     /// The geometry shader's stream-out stages (RasterizerSgxd::GeometryStage): A0 stores
     /// the vertex program's outputs, A1 runs the geometry program over them.
@@ -361,28 +381,13 @@ public:
     /// BeginPassLoaded opens it), the source read as its load reads, scaled.
     void TransferTiledFromGuest(const PicaTarget& target, const UntileSource& source, u32 scale_x,
                                 u32 scale_y, u32* ta_us = nullptr, u32* d3_us = nullptr);
-    /**
-     * The untile's inverse: a pass's width x height surface (A8B8G8R8, rows width apart) written
-     * into dest as the PICA stores a colour buffer, in 8x8 tiles row after row with Morton
-     * order inside, x first, each pixel `bytes` wide in pack (an SGXD_RECIPE_PACK_*; mirror as
-     * Blit's). The PBE's TWIDDLED layout is Morton order y first: a PICA tile is an 8x8 block of
-     * it transposed, and the tiles in memory order fill a square twiddled target's blocks in its
-     * own order. So the picture goes out in square targets (a side render each, to completion),
-     * one quad a tile. Inside a pass or not; width and height multiples of 8. The PBE writes
-     * whole 32x32 tiles: the tiles past the last multiple of 16 render into a square of their
-     * own, which the CPU copies to dest.cpu.
-     */
-    void TileBack(const Data& surface, u32 width, u32 height, const Data& dest, u32 pack, bool mirror,
-                  u32 bytes);
-    /// Memory for a CPU copy of what a side render wrote (TileBack): one buffer in the textures
-    /// pool, grown as needed, valid until the next call. Side renders run to completion, so
-    /// the last copy's reads are done by then. Not the pass data: a pass opening writes back
-    /// several surfaces (sm3dl's passed 2 MiB).
-    Data Scratch(u32 bytes);
 
 private:
     /// One target size's recipe and its block: the layout, the background colour word, then
     /// the code heap's copy.
+    /// What a recipe's end of tile stores: a linear target (a display transfer's output), a
+    /// PICA target (route 1, a pass on a guest colour buffer), or a side render's.
+    enum class Kind : u8 { Linear, Pica, Side };
     struct Recipe {
         SgxdRecipe recipe{};
         u8* memory{};
@@ -392,16 +397,20 @@ private:
         u32 width{}, height{};
         u32 bg_offset{};  // the background colour word and its SA secondary, after the layout
         u32 code_begin{}; // the code heap's copy, from the block's start
-        bool side{};      // the untile's, which no pass shares
+        Kind kind{};
         u32 instance{};   // up to MaxInstances of each size, the pending pass's among them
         u32 fence{};      // the list that completes its last render's 3D
     };
+    /// A PICA recipe's end-of-tile program (sgxd_recipe_pica_eot), from bg_offset: rewritten at
+    /// each pass on the recipe, before its 3D kick's USE code-cache invalidate.
+    static constexpr u32 PicaEotOffset = 0x400;
     /// A size's instances at most: a render's recipe is the GPU's until its 3D completes, and
     /// the CPU writes the next render's into another.
     static constexpr u32 MaxInstances = 4;
 
-    /// The recipe for a width x height target, made at its first use; side: the untile's.
-    Recipe& RecipeFor(u32 width, u32 height, bool side = false);
+    /// The recipe for a width x height target of kind, made at its first use. A PICA recipe's
+    /// pixel event program DOUTAs IR0 to its end of tile (sgxd_recipe_pica_pixev).
+    Recipe& RecipeFor(u32 width, u32 height, Kind kind);
     void RenderSync(Recipe& r, u32* ta_us, u32* d3_us);
     void RenderAsync(Recipe& r, const u32 touches[6]);
     void PlaceFixedPrograms();
@@ -425,8 +434,20 @@ private:
                           bool swizzled);
     void UntileEtc1A4Merge(const UntileSource& source, u32 colour_gpu, u32 colour_stride,
                            u32 dest_gpu, u32 dest_stride, bool swizzled);
-    /// The recipe's target, and the pass state reset.
-    void OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 clear, float depth);
+    /// The recipe's target, and the pass state reset: a linear target at target_gpu (rows
+    /// width apart), or with pica that guest buffer (width and height its transpose's).
+    void OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 clear, float depth,
+                  const PicaTarget* pica = nullptr);
+    /**
+     * Draws into the open pass that read src, a PICA-tiled picture, texel for pixel (scaled:
+     * each target pixel the average of scale_x x scale_y texels, bilinear between them), from
+     * the target's top-left. Untile's bands: a band of tile rows is an 8-texel-wide SWIZZLED
+     * texture whose texel (sx, sy) is PICA pixel (sy % w, 8 (band row + sy / w) + sx), one
+     * draw a band, a quad a tile row. transposed: target x is the picture's row and y its
+     * column (a PICA target's load), which is the texture's own orientation; otherwise x is the
+     * column (a display transfer's output). Opaque, DCMP ALWAYS, no depth write.
+     */
+    void DrawTiled(const UntileSource& src, bool transposed, u32 scale_x = 1, u32 scale_y = 1);
 
     std::vector<std::unique_ptr<Recipe>> recipes;
     Recipe* current{}; // the open pass's
@@ -435,7 +456,7 @@ private:
     u8* shared{};      // the shared block: PDS arena, pass data
     u32 shared_size{};
     int shared_block{-1};
-    u8* surfaces{};    // the host surfaces' block
+    u8* surfaces{};    // the depth stores' block
     u32 surfaces_size{};
     u32 surfaces_spilled{}; ///< surfaces the block had no room for (AllocSurface), for its log
     u32 surfaces_used{};
@@ -453,9 +474,6 @@ private:
     };
     std::vector<FreeRange> textures_free;
     std::vector<FreeRange> surfaces_free;
-    /// TileBack's quads by surface size (width << 16 | height), from the textures' block: the
-    /// same every time, so built once.
-    std::unordered_map<u32, Data> tileback_vertices;
     /// An untile's vertices by its geometry (GeometryKey): a texture of a size seen before reuses
     /// them. In the textures pool: ETC1 uploads inside a pass filled the pass data.
     std::unordered_map<u64, Data> geometry_vertices;
@@ -485,14 +503,12 @@ private:
     void FlipPdsHalf();
     u32 data_begin{}, data_used{}, data_end{};
     u32 data_peak{}; ///< perflog: the largest pass data logged
-    Data scratch{};    ///< Scratch's buffer
     struct DataSite {
         uintptr_t caller;
         u32 bytes;
         u32 count;
     };
     std::array<DataSite, 16> data_sites{}; ///< the open pass's AllocData by caller
-    u32 scratch_bytes{};
     /// The pass data's slots, in turn, each with its last pass's fence. The guest waits for
     /// P3D before its next command list, so only passes of one list follow each other unwaited.
     static constexpr u32 DataSlots = 2;
@@ -512,7 +528,6 @@ private:
         u32 lo, hi;
     };
     Footprint pass_target{}, pass_source{}, pass_zls{};
-    Data tileback_tail{}; ///< TileBack's square for the tiles past its last whole one
     std::function<bool()> texture_evictor;
     std::function<void(u32, u32)> room_taken;
     /// Our recipe whose 3D is pending, or null (none, or the present's).

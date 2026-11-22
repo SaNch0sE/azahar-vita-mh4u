@@ -356,14 +356,14 @@ SgxdBackend::~SgxdBackend() {
     FreeBlock(textures, TexturesVa, TexturesSize, textures_block);
 }
 
-SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, bool side) {
+SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
     // A recipe block is its render's until that 3D completes (its fence): an instance the GPU
     // is done with, else a new one, else the one done first. The pending 3D's is never free.
     const Recipe* const pending = Pending();
     u32 instances = 0;
     Recipe* oldest = nullptr;
     for (const auto& r : recipes) {
-        if (r->width == width && r->height == height && r->side == side) {
+        if (r->width == width && r->height == height && r->kind == kind) {
             instances++;
             if (r.get() == pending) {
                 continue;
@@ -384,7 +384,7 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, bool side) {
     Recipe& r = *made;
     r.width = width;
     r.height = height;
-    r.side = side;
+    r.kind = kind;
     r.instance = instances;
     r.va = next_va;
     // Every pass renders to a surface or guest memory: the recipe's own FB and DEPTH, and its
@@ -420,16 +420,26 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, bool side) {
     sgxd_recipe_write(&r.recipe, r.memory);
     // The arrays go with the recipe: only the indices are read again.
     r.recipe.draws = nullptr;
+    if (kind == Kind::Pica) {
+        // The pixel event program DOUTAs IR0 to the end of tile, which OpenPass writes after the
+        // background word: in the layout's PIXEV, before its first run.
+        const u32 eot_index = (r.bg_offset + PicaEotOffset - r.recipe.offset[SGXD_R_CF]) >> 3;
+        u32 pixev[SGXD_RECIPE_PICA_PIXEV_WORDS];
+        sgxd_recipe_pica_pixev(&r.recipe, eot_index, pixev);
+        std::memcpy(r.memory + r.recipe.offset[SGXD_R_PIXEV], pixev, sizeof(pixev));
+        sgxd_recipe_set_pixel_event(&r.recipe, sgxd_recipe_va(&r.recipe, SGXD_R_PIXEV), 4, 4);
+    }
     sgxd_recipe_sa_background(&r.recipe, r.memory, r.bg_offset, 0xff000000u);
     if (!recipes.empty()) {
         const Recipe& first = *recipes.front();
         std::memcpy(r.memory + r.code_begin, first.memory + first.code_begin, code_used);
     }
+    static constexpr const char* kinds[] = {"linear", "PICA", "side"};
     LOG_INFO(Render,
-             "sgxd: the rasterizer's {}x{} recipe {}, {} KiB at GPU {:#010x}: layout {} KiB, code "
-             "heap copy at {:#x} ({} bytes); shared block at {:#010x}",
-             width, height, r.instance, r.size >> 10, r.va, r.recipe.offset[SGXD_R_END] >> 10,
-             r.code_begin, code_used, BlockVa);
+             "sgxd: the rasterizer's {}x{} {} recipe {}, {} KiB at GPU {:#010x}: layout {} KiB, "
+             "code heap copy at {:#x} ({} bytes); shared block at {:#010x}",
+             width, height, kinds[static_cast<u32>(kind)], r.instance, r.size >> 10, r.va,
+             r.recipe.offset[SGXD_R_END] >> 10, r.code_begin, code_used, BlockVa);
     recipes.push_back(std::move(made));
     return r;
 }
@@ -573,18 +583,6 @@ SgxdBackend::Data SgxdBackend::GeometryVertices(u64 key, u32 bytes, bool& fresh)
     return vertices;
 }
 
-SgxdBackend::Data SgxdBackend::Scratch(u32 bytes) {
-    bytes = AlignUp(bytes, 0x1000);
-    if (bytes > scratch_bytes) {
-        if (scratch_bytes != 0) {
-            FreeTexture(scratch, scratch_bytes);
-        }
-        scratch = AllocTexture(bytes);
-        scratch_bytes = bytes;
-    }
-    return scratch;
-}
-
 SgxdBackend::Data SgxdBackend::LutRows() const {
     return {shared + lut_begin, BlockVa + lut_begin};
 }
@@ -703,10 +701,8 @@ SgxdBackend::Data SgxdBackend::AllocTexture(u32 bytes, u32* ready) {
         return {textures + at, TexturesVa + at};
     }
     DEBUG_ASSERT_MSG(textures_used + bytes <= textures_fixed,
-                     "sgxd: no room for a {} KiB texture ({} KiB used, {} KiB fixed, scratch {} "
-                     "KiB at {:#x}; free{})",
-                     bytes >> 10, textures_used >> 10, (TexturesSize - textures_fixed) >> 10,
-                     scratch_bytes >> 10, scratch.gpu - TexturesVa, [&] {
+                     "sgxd: no room for a {} KiB texture ({} KiB used, {} KiB fixed; free{})",
+                     bytes >> 10, textures_used >> 10, (TexturesSize - textures_fixed) >> 10, [&] {
                          std::string f;
                          for (const FreeRange& r : textures_free) {
                              f += fmt::format(" {:#x}+{}K", r.offset, r.bytes >> 10);
@@ -730,9 +726,8 @@ SgxdBackend::Data SgxdBackend::AllocTextureFixed(u32 bytes) {
 }
 
 void SgxdBackend::FreeTexture(const Data& texture, u32 bytes) {
-    // The range goes to the next texture, which an untile writes behind the lists that sample
-    // this one; the pending 3D may still, so its finish goes ahead of them. The CPU reads
-    // such a range (Scratch) only after waiting for its writer.
+    // The range goes to the next texture, written behind the lists that sample this one; the
+    // pending 3D's finish goes ahead of them.
     FinishPending(FinishWhy::FreeTexture);
     GiveFree(textures_free,
              FreeRange{texture.gpu - TexturesVa, AlignUp(bytes, 0x1000), FenceAll()});
@@ -745,7 +740,7 @@ void SgxdBackend::FreeTexture(const Data& texture, u32 bytes) {
 }
 
 void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 clear,
-                           float depth) {
+                           float depth, const PicaTarget* pica) {
     DEBUG_ASSERT(!in_pass);
     // The recipe instance and the pass data slot are the GPU's until their last render's 3D
     // completes: RecipeFor and the slot's fence wait only when the GPU is that far behind.
@@ -753,16 +748,28 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     if (pds_used - (pds_begin + PdsFixedSize + pds_half * PdsHalfSize) > PdsHalfSize / 2) {
         FlipPdsHalf();
     }
-    Recipe& r = RecipeFor(width, height);
+    Recipe& r = RecipeFor(width, height, pica ? Kind::Pica : Kind::Linear);
     current = &r;
-    pass_target = {target_gpu, target_gpu + width * height * 4};
+    pass_target = pica ? Footprint{pica->gpu, pica->gpu + pica->width * pica->height * pica->bpp}
+                       : Footprint{target_gpu, target_gpu + width * height * 4};
     pass_source = {};
     data_slot = (data_slot + 1) % DataSlots;
     RenderWait(data_fence[data_slot], "a pass's data slot");
     data_begin = pds_end + data_slot * DataSize;
     data_end = data_begin + DataSize;
-    sgxd_recipe_set_target(&r.recipe, r.memory, target_gpu, width);
-    sgxd_recipe_set_target_pack(&r.recipe, r.memory, pack);
+    if (pica) {
+        const SgxdPicaStore store{pica->gpu, pica->pack, pica->bpp};
+        u64 eot[SGXD_RECIPE_PICA_EOT_MAX];
+        const unsigned words = sgxd_recipe_pica_eot(&r.recipe, &store, eot);
+        DEBUG_ASSERT_MSG(words != 0,
+                         "sgxd: a {}x{} colour buffer at {:#010x}: route 1 takes widths of 32 to "
+                         "1024 in 16s and heights of 8 to 1024 in 8s",
+                         pica->width, pica->height, pica->gpu);
+        std::memcpy(r.memory + r.bg_offset + PicaEotOffset, eot, words * 8);
+    } else {
+        sgxd_recipe_set_target(&r.recipe, r.memory, target_gpu, width);
+        sgxd_recipe_set_target_pack(&r.recipe, r.memory, pack);
+    }
     *reinterpret_cast<volatile u32*>(r.memory + r.bg_offset) = clear;
     sgxd_recipe_set_background_depth(&r.recipe, r.memory, depth);
     sgxd_recipe_set_background_stencil(&r.recipe, 0);
@@ -776,56 +783,34 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     in_pass = true;
 }
 
-void SgxdBackend::BeginPass(const Data& target, u32 width, u32 height, u32 clear, float depth,
+void SgxdBackend::BeginPass(const PicaTarget& target, u32 clear, float depth,
                             const std::function<void()>& before) {
-    // A tile no draw touches stays EMPTY and is skipped whole, background included, keeping the
-    // target's bytes: the target starts
-    // as the clear through the PTLA, and the background repeats it in the tiles that render.
-    RenderBefore(target.gpu, target.gpu + width * height * 4, "a pass's clear");
-    const SgxdPtlaFill fill{target.gpu, SGXD_PTLA_8888, width * 4, width, height, 0, clear};
-    char failed[160];
-    [[maybe_unused]] const int filled = sgxd_ptla_fill(&fill, nullptr, failed, sizeof(failed));
-    DEBUG_ASSERT_MSG(filled == 0, "sgxd: a {}x{} target's clear stopped: {}", width, height,
-                     failed);
-    OpenPass(target.gpu, width, height, SGXD_RECIPE_PACK_U8888, clear, depth);
+    // A tile no draw touches stays EMPTY and is skipped whole, keeping the target's bytes (the
+    // guest's, which the fill cleared).
+    OpenPass(target.gpu, target.height, target.width, target.pack, clear, depth, &target);
     if (before) {
         before();
     }
 }
 
-void SgxdBackend::BeginPassOver(const Data& target, u32 width, u32 height, float depth,
+void SgxdBackend::BeginPassOver(const PicaTarget& target, float depth,
                                 const std::function<void()>& before) {
-    OpenPass(target.gpu, width, height, SGXD_RECIPE_PACK_U8888, 0, depth);
+    OpenPass(target.gpu, target.height, target.width, target.pack, 0, depth, &target);
     if (before) {
         before();
     }
 }
 
-void SgxdBackend::BeginPassLoaded(const Data& target, u32 width, u32 height, float depth,
-                                  const UntileSource* guest, const std::function<void()>& before) {
-    OpenPass(target.gpu, width, height, SGXD_RECIPE_PACK_U8888, 0, depth);
+void SgxdBackend::BeginPassLoaded(const PicaTarget& target, float depth, const UntileSource& guest,
+                                  const std::function<void()>& before) {
+    OpenPass(target.gpu, target.height, target.width, target.pack, 0, depth, &target);
     if (before) {
         before();
     }
-    Data picture = target;
-    u32 stride = width;
-    if (guest != nullptr) {
-        // Rows of whole 32-pixel tiles, as a side render writes them (UntileTargetFor).
-        stride = AlignUp(width, 32);
-        const u32 bytes = stride * AlignUp(height, 32) * 4;
-        DEBUG_ASSERT_MSG(bytes <= DataSize / 2,
-                         "sgxd: a {}x{} picture loaded from guest memory: more than the pass's "
-                         "data",
-                         width, height);
-        picture = AllocData(bytes, 0x1000);
-        Untile(*guest, picture.gpu, stride);
-    }
-    pass_source = {picture.gpu, picture.gpu + stride * height * 4};
-    // Texel for pixel, opaque, DCMP ALWAYS, DWRITEDIS: each tile reads its own old texels
-    // before its end-of-tile write stores the new ones.
-    const SgxdRecipeDrawPrograms p = BlitPrograms(picture, width, height, false, stride);
-    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
-    Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
+    // Each tile reads its own old texels before its end of tile stores the new ones over them
+    // (H2: a pass reading its own target reloads it exactly).
+    pass_source = {guest.gpu, guest.gpu + guest.width * guest.height * guest.bits / 8};
+    DrawTiled(guest, true);
 }
 
 void SgxdBackend::SetDepthStore(const DepthStore& store, DepthLoad load) {
@@ -1513,6 +1498,12 @@ void SgxdBackend::TransferFromGuest(const UntileSource& source, u32 dest_gpu, u3
                                     u32 height, u32 pack, bool mirror, u32* ta_us, u32* d3_us,
                                     u32 scale_x, u32 scale_y) {
     OpenPass(dest_gpu, width, height, pack, 0, 1.0f);
+    if (!mirror) {
+        pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
+        DrawTiled(source, false, scale_x, scale_y);
+        EndPass(ta_us, d3_us);
+        return;
+    }
     // The untile writes whole 32x32 tiles (UntileTargetFor), rows a multiple of 32 apart; the
     // picture is the pass's data until its render completes.
     const u32 stride = AlignUp(source.width, 32);
@@ -1666,7 +1657,7 @@ void SgxdBackend::SideRender(const Data& vertices, std::span<const SideDraw> lis
     ASSERT(!list.empty() && list.size() <= MaxDraws);
     DEBUG_ASSERT(dest_stride >= std::max(width, 32u) && dest_stride % 32 == 0 &&
                  width <= UntileSide && height <= UntileSide);
-    Recipe& r = RecipeFor(UntileSide, UntileSide, true);
+    Recipe& r = RecipeFor(UntileSide, UntileSide, Kind::Side);
     PlaceFixedPrograms();
     const u32 N = merge ? SGXD_PROGRAM_MERGE_VERTEX_WORDS : SGXD_PROGRAM_BLIT_VERTEX_WORDS;
 
@@ -1787,7 +1778,7 @@ void SgxdBackend::FlushStreamOut(bool wait) {
 
 void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
     DEBUG_ASSERT(in_pass && !queued.empty() && queued.size() <= StreamMaxDraws);
-    Recipe& r = RecipeFor(UntileSide, UntileSide, true);
+    Recipe& r = RecipeFor(UntileSide, UntileSide, Kind::Side);
     PlaceFixedPrograms();
     if (stream_target.cpu == nullptr) {
         stream_target = AllocSurface(32, 32);
@@ -1846,49 +1837,60 @@ void SgxdBackend::StreamRender(std::vector<StreamDraw>& queued, bool wait) {
     NoteSent(&queued == &stream_draws[0] ? "stream-out A0" : "stream-out A1", draws);
 }
 
-void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride, bool swizzled) {
+namespace {
+
+/// A PICA-tiled picture's bands of tile rows (Untile, DrawTiled): a band's tiles are a SWIZZLED
+/// texture 8 texels wide and rows * w tall, at most 4096 (the texture unit's largest side), its
+/// height rounded up to a power of two; the quads read only the band's own rows. Each band's
+/// first vertex is a multiple of 8 (the recipe's rule), after unused vertices where the band
+/// before ends short of it.
+struct Band {
+    u32 first_row, rows, first_vertex;
+};
+std::vector<Band> TileBands(u32 w, u32 tile_rows, u32 quads_a_row, u32& vertex_count) {
+    const u32 max_band = std::min(tile_rows, 4096 / w);
+    std::vector<Band> bands;
+    vertex_count = 0;
+    for (u32 ty = 0; ty < tile_rows; ty += max_band) {
+        const u32 first = (vertex_count + 7) & ~7u;
+        const u32 rows = std::min(max_band, tile_rows - ty);
+        bands.push_back({ty, rows, first});
+        vertex_count = first + rows * quads_a_row * 6;
+    }
+    return bands;
+}
+
+} // namespace
+
+void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride, bool swizzled,
+                         bool transposed) {
     const u32 w = src.width, h = src.height;
     // A texture's sides are powers of two; a display transfer's picture has any height of whole
     // tiles (416 for a 3D-mode screen).
     const bool pot = (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
+    const bool etc1 = src.code == UntileEtc1 || src.code == UntileEtc1A4;
     DEBUG_ASSERT_MSG(w >= 8 && h >= 8 && w <= UntileSide && h <= UntileSide && w % 8 == 0 &&
-                         h % 8 == 0 &&
-                         (swizzled || src.code == UntileEtc1 || src.code == UntileEtc1A4 ? pot
-                                                                                        : true),
+                         h % 8 == 0 && (swizzled || etc1 ? pot : true) &&
+                         !(transposed && (swizzled || etc1)),
                      "sgxd: a {}x{} picture: the untile takes sides of whole tiles up to {} "
-                     "(powers of two for ETC1 and cube faces)",
+                     "(powers of two for ETC1 and cube faces; transposed, neither)",
                      w, h, UntileSide);
-    if (src.code == UntileEtc1 || src.code == UntileEtc1A4) {
+    if (etc1) {
         UntileEtc1Blocks(src, dest_gpu, dest_stride, swizzled);
         return;
     }
-    // Bands of tile rows: a band's tiles are a SWIZZLED texture 8 texels wide and rows * w
-    // tall, at most 4096 (the texture unit's largest side), its height rounded up to a power
-    // of two; the quads read only the band's own rows. A texture's bands (powers of two) end
-    // where it does.
     const u32 tile_rows = h / 8;
-    const u32 max_band = std::min(tile_rows, 4096 / w);
-    struct Band {
-        u32 first_row, rows;
-    };
-    std::vector<Band> bands;
-    for (u32 ty = 0; ty < tile_rows; ty += max_band) {
-        bands.push_back({ty, std::min(max_band, tile_rows - ty)});
-    }
-    const UntileTarget t = UntileTargetFor(w, h, dest_stride, swizzled);
+    // Transposed, the target is h wide and w tall, and the texture's own orientation: tile row
+    // ty is target columns 8ty..8ty+7, its texel (sx, sy) at (8ty + sx, sy % w).
+    const UntileTarget t = transposed ? UntileTarget{h, w, dest_stride, 1, false}
+                                      : UntileTargetFor(w, h, dest_stride, swizzled);
     const u32 quads = t.per_row == 1 ? 1 : 8; // a tile row's
-    // A draw's first vertex is a multiple of 8 (the recipe's rule): each band's quads start
-    // there, after unused vertices where the band before ends short of it.
-    std::vector<u32> first(bands.size());
     u32 vertex_count = 0;
-    for (std::size_t b = 0; b < bands.size(); b++) {
-        first[b] = (vertex_count + 7) & ~7u;
-        vertex_count = first[b] + bands[b].rows * quads * 6;
-    }
+    const std::vector<Band> bands = TileBands(w, tile_rows, quads, vertex_count);
     bool fresh = false;
-    const Data vertices = GeometryVertices(GeometryKey(1, w, h, dest_stride, false, swizzled),
-                                           vertex_count * SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4,
-                                           fresh);
+    const Data vertices =
+        GeometryVertices(GeometryKey(transposed ? 6 : 1, w, h, dest_stride, false, swizzled),
+                         vertex_count * SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4, fresh);
     float* v = reinterpret_cast<float*>(vertices.cpu);
     // Tile row ty holds PICA rows 8ty..8ty+7, image rows 8ty..8ty+7. Along the quad, image
     // x is the band's SWIZZLED row (ty's local row) * w + x, image y the column: pixel
@@ -1897,13 +1899,18 @@ void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride,
     for (std::size_t b = 0; b < bands.size(); b++) {
         const Band& band = bands[b];
         const u32 band_texels = std::bit_ceil(band.rows * w); // the band's SWIZZLED height
-        float* const band_v = v + first[b] * SGXD_PROGRAM_BLIT_VERTEX_WORDS;
-        for (u32 row = 0; row < band.rows; row++) {
+        float* const band_v = v + band.first_vertex * SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+        for (u32 row = 0; row < band.rows && fresh; row++) {
             const u32 ty = band.first_row + row;
             const float v0 = static_cast<float>(row * w) / band_texels;
             const float v1 = static_cast<float>((row + 1) * w) / band_texels;
-            const float uv[4][2] = {{0, v0}, {0, v1}, {1, v0}, {1, v1}};
-            if (fresh) {
+            if (transposed) {
+                const float uv[4][2] = {{0, v0}, {1, v0}, {0, v1}, {1, v1}};
+                PutQuad(band_v + row * QuadVertexWords, t.width, t.height,
+                        static_cast<float>(8 * ty), 0, static_cast<float>(8 * ty + 8),
+                        static_cast<float>(w), uv);
+            } else {
+                const float uv[4][2] = {{0, v0}, {0, v1}, {1, v0}, {1, v1}};
                 PutRows(band_v + row * quads * QuadVertexWords, t, w, 8 * ty, 8 * (ty + 1), uv);
             }
         }
@@ -1911,96 +1918,102 @@ void SgxdBackend::Untile(const UntileSource& src, u32 dest_gpu, u32 dest_stride,
                          src.gpu + band.first_row * 8 * w * src.bits / 8, list[b].tex,
                          src.palette);
         list[b].converted = true;
-        list[b].first = first[b];
+        list[b].first = band.first_vertex;
         list[b].count = band.rows * quads * 6;
     }
     SideRender(vertices, list, dest_gpu, t.stride, t.width, t.height, false, t.twiddled);
 }
 
-void SgxdBackend::TileBack(const Data& surface, u32 width, u32 height, const Data& dest, u32 pack,
-                           bool mirror, u32 bytes) {
-    // A square target of side S takes S * S / 64 tiles and six vertices each: at most 512
-    // (24576 vertices, under the VDM's 65535). The last tiles short of a 32x32 square (16
-    // tiles; sm3dl's 240x400 has 12 over) render into a square of their own, copied by the CPU.
-    constexpr u32 MaxSide = 512;
-    const u32 tiles = width * height / 64;
-    const u32 whole = tiles / 16 * 16;
-    DEBUG_ASSERT_MSG(width % 8 == 0 && height % 8 == 0 && width <= UntileSide &&
-                         height <= UntileSide,
-                     "sgxd: a {}x{} surface written back to guest memory: only whole 8x8 tiles "
-                     "are built",
-                     width, height);
-    const auto side_at = [&](u32 k0) {
-        u32 side = 32;
-        while (side < MaxSide && (2 * side) * (2 * side) / 64 <= tiles - k0) {
-            side *= 2;
-        }
-        return side;
-    };
-    // The quads, every target's in turn: built at the size's first write-back.
-    Data& vertices = tileback_vertices[width << 16 | height];
-    if (vertices.cpu == nullptr) {
-        vertices = AllocTextureFixed(tiles * QuadVertexWords * 4);
-        float* const v = reinterpret_cast<float*>(vertices.cpu);
-        const u32 tiles_x = width / 8;
-        for (u32 k0 = 0; k0 < tiles;) {
-            const u32 side = side_at(k0);
-            const u32 n = std::min(side * side / 64, tiles - k0);
-            for (u32 j = 0; j < n; j++) {
-                // Block j of the target, Morton y first: even bits are its row, odd its
-                // column.
-                u32 bx = 0, by = 0;
-                for (u32 b = 0; (1u << (2 * b)) < n; b++) {
-                    by |= (j >> (2 * b) & 1u) << b;
-                    bx |= (j >> (2 * b + 1) & 1u) << b;
-                }
-                // Tile k's pixel (x, y) is the block's (y, x): along the block's x the
-                // picture's y.
-                const u32 k = k0 + j;
-                const float u0 = static_cast<float>(k % tiles_x * 8) / width;
-                const float u1 = static_cast<float>(k % tiles_x * 8 + 8) / width;
-                const float v0 = static_cast<float>(k / tiles_x * 8) / height;
-                const float v1 = static_cast<float>(k / tiles_x * 8 + 8) / height;
-                const float uv[4][2] = {{u0, v0}, {u0, v1}, {u1, v0}, {u1, v1}};
-                PutQuad(v + k * QuadVertexWords, side, side, static_cast<float>(8 * bx),
-                        static_cast<float>(8 * by), static_cast<float>(8 * bx + 8),
-                        static_cast<float>(8 * by + 8), uv);
+void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_x, u32 scale_y) {
+    DEBUG_ASSERT(in_pass);
+    const u32 w = src.width, h = src.height;
+    DEBUG_ASSERT_MSG(w >= 8 && h >= 8 && w <= 4096 && w % 8 == 0 && h % 8 == 0 &&
+                         src.code != UntileEtc1 && src.code != UntileEtc1A4 &&
+                         (scale_x == 1 || scale_x == 2) && (scale_y == 1 || scale_y == 2),
+                     "sgxd: a {}x{} tiled picture (format {:#x}, scale {}x{}) read into a pass is "
+                     "not built",
+                     w, h, src.code, scale_x, scale_y);
+    PlaceFixedPrograms();
+    const Recipe& r = *current;
+    // The tile rows the target shows: a transposed target's width is the picture's rows, a
+    // linear one's height; scaled, scale_y picture rows to each.
+    const u32 shown = (transposed ? r.width : r.height) * scale_y;
+    const u32 tile_rows = std::min(h, AlignUp(shown, 8)) / 8;
+    u32 vertex_count = 0;
+    const std::vector<Band> bands = TileBands(w, tile_rows, 1, vertex_count);
+    const u64 key = u64{0x80} << 56 | u64{transposed} << 55 | u64{scale_x - 1} << 54 |
+                    u64{scale_y - 1} << 53 | u64{w} << 40 | u64{h} << 27 | u64{r.width} << 14 |
+                    r.height;
+    bool fresh = false;
+    const Data vertices =
+        GeometryVertices(key, vertex_count * SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4, fresh);
+    float* const v = reinterpret_cast<float*>(vertices.cpu);
+
+    constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
+    SgxdRecipeDrawPrograms p{};
+    SgxdPdsProgram pds{};
+    const SgxdVertexFetch fetch{vertices.gpu, N * 4, N, 0};
+    [[maybe_unused]] const int vspds = sgxd_program_vertex_pds(&fetch, 1, blit_vertex, 0, &pds);
+    DEBUG_ASSERT(vspds == 0);
+    p.vspds = PlacePds(pds);
+    p.vspds_units = pds.units;
+    [[maybe_unused]] const int vsec =
+        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(0, 0, 0), &pds);
+    DEBUG_ASSERT(vsec == 0);
+    p.vsec = PlacePds(pds);
+    p.vsec_units = pds.units;
+    p.vsec_sa = 0;
+    [[maybe_unused]] const int fsec =
+        sgxd_program_secondary_pds(0, 0, sgxd_program_doutu0(1, 0, 0), &pds);
+    DEBUG_ASSERT(fsec == 0);
+    p.fsec = PlacePds(pds);
+    p.fsec_units = pds.units;
+    sgxd_program_vertex_dms(N, 0, 0, N, &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
+    p.pixel_size = sgxd_program_pixel_dms(SGXD_PROGRAM_BLIT_PA, 0, 0);
+    p.outselects = SGXD_PROGRAM_BLIT_OUTSELECTS;
+    p.texsize = SGXD_PROGRAM_BLIT_TEXSIZE;
+    const float viewport[6] = {r.width / 2.0f, r.width / 2.0f, r.height / 2.0f, r.height / 2.0f,
+                               0.0f, 1.0f};
+    std::memcpy(p.viewport, viewport, sizeof(viewport));
+    p.indices = 0;
+    p.primitive = SGXD_PROGRAM_TRIANGLES;
+    // ISP A: opaque, DCMP ALWAYS, DWRITEDIS, BPRES; no culling. The region clip keeps the
+    // target's tiles (quads wider than a transfer's output reach past them).
+    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    const u32 clip = SGXD_RECIPE_CLIP(0, 0, (r.width + 31) / 32 - 1, (r.height + 31) / 32 - 1);
+    for (const Band& band : bands) {
+        const u32 band_texels = std::bit_ceil(band.rows * w);
+        float* const band_v = v + band.first_vertex * N;
+        for (u32 row = 0; row < band.rows && fresh; row++) {
+            const u32 ty = band.first_row + row;
+            const float v0 = static_cast<float>(row * w) / band_texels;
+            const float v1 = static_cast<float>((row + 1) * w) / band_texels;
+            if (transposed) {
+                // Target x is the picture's row: the texture's own orientation.
+                const float uv[4][2] = {{0, v0}, {1, v0}, {0, v1}, {1, v1}};
+                PutQuad(band_v + row * QuadVertexWords, r.width, r.height,
+                        static_cast<float>(8 * ty), 0, static_cast<float>(8 * ty + 8),
+                        static_cast<float>(w), uv);
+            } else {
+                // Target x is the picture's column, scaled: a pixel's centre between texels.
+                const float uv[4][2] = {{0, v0}, {0, v1}, {1, v0}, {1, v1}};
+                PutQuad(band_v + row * QuadVertexWords, r.width, r.height, 0,
+                        static_cast<float>(8 * ty) / scale_y, static_cast<float>(w) / scale_x,
+                        static_cast<float>(8 * ty + 8) / scale_y, uv);
             }
-            k0 += n;
         }
-    }
-    u32 tex[4];
-    sgxd_recipe_texture_words_format(surface.gpu, width, height, false, 0x0c, mirror ? 2 : 0,
-                                     tex);
-    for (u32 k0 = 0; k0 < tiles;) {
-        const u32 side = side_at(k0);
-        const u32 n = std::min(side * side / 64, tiles - k0);
-        SideDraw draw{};
-        std::memcpy(draw.tex, tex, sizeof(tex));
-        draw.converted = mirror;
-        draw.first = k0 * 6;
-        draw.count = n * 6;
-        if (k0 < whole) {
-            SideRender(vertices, std::span<const SideDraw>(&draw, 1), dest.gpu + k0 * 64 * bytes,
-                       side, side, side, false, true, pack);
-        } else {
-            // The square's first tiles into place by a PTLA copy, queued behind its render's
-            // 3D: one row of raw words.
-            if (tileback_tail.cpu == nullptr) {
-                tileback_tail = AllocSurface(32, 32);
-            }
-            SideRender(vertices, std::span<const SideDraw>(&draw, 1), tileback_tail.gpu, 32, 32,
-                       32, false, true, pack);
-            const u32 words = n * 64 * bytes / 4;
-            RenderBefore(tileback_tail.gpu, tileback_tail.gpu + words * 4, "a write-back's tail");
-            const SgxdPtlaCopy copy{tileback_tail.gpu, dest.gpu + k0 * 64 * bytes, SGXD_PTLA_8888,
-                                    words * 4, words, 1, 0, 0};
-            char failed[160];
-            [[maybe_unused]] const int copied = sgxd_ptla_copy(&copy, nullptr, failed,
-                                                               sizeof(failed));
-            DEBUG_ASSERT_MSG(copied == 0, "sgxd: a write-back's tail copy: {}", failed);
+        u32 tex[4];
+        SideTextureWords(0, src.code, src.swizzle, 8, band_texels,
+                         src.gpu + band.first_row * 8 * w * src.bits / 8, tex, src.palette);
+        if (scale_x != 1 || scale_y != 1) {
+            tex[0] |= 1u << 12 | 1u << 10; // MAGFILTER, MINFILTER bilinear
         }
-        k0 += n;
+        [[maybe_unused]] const int fprim = sgxd_program_screen_pixel_pds(untile_fragment, tex, &pds);
+        DEBUG_ASSERT(fprim == 0);
+        p.fprim = PlacePds(pds);
+        p.fprim_units = pds.units;
+        Draw(SgxdRecipeDraw{band.first_vertex, band.rows * 6, isp, SGXD_R_FPRIM, 0, clip, nullptr},
+             p);
     }
 }
 
