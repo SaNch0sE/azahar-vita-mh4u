@@ -433,26 +433,9 @@ void Ui::DrawStatusMessage() {
     ImGui::End();
 }
 
-void Ui::DrawGpuHud() {
-    static const bool on = GxmRenderer::GxmFlag("gpuhud");
-    if (!on) {
-        return;
-    }
-    const std::string& text = GxmPresent::GpuLiveText();
-    ImGui::SetNextWindowPos(ImVec2(8.0f, 8.0f));
-    ImGui::SetNextWindowBgAlpha(0.55f);
-    ImGui::Begin("##gpuhud", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
-                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-    ImGui::TextUnformatted(text.empty() ? "GPU live: waiting for the first second" : text.c_str());
-    ImGui::End();
-}
-
 void Ui::DrawStatsHud() {
-    // Top right, every frame while a title runs: what the console line prints once a second.
-    // A dozen text lines of ImGui, so a few hundred vertices; `nostats` hides it.
+    // Top right, every frame while a title runs. A few text lines of ImGui, so a few hundred
+    // vertices; `nostats` hides it.
     static const bool off = GxmRenderer::GxmFlag("nostats");
     if (off || !HudStats::valid.load(std::memory_order_acquire)) {
         return;
@@ -488,7 +471,6 @@ Ui::Action Ui::Update() {
             action = DrawGameSettings();
             break;
         case State::InGame:
-            DrawGpuHud();
             DrawStatsHud();
             break;
         case State::Pause:

@@ -125,9 +125,6 @@ private:
     Action DrawPauseSettings();
     Action DrawSavestates();
     void DrawStatusMessage();
-    /// The GPU counters over the game (gxm flag gpuhud), drawn every frame like vitaGL's
-    /// debugger window.
-    void DrawGpuHud();
     void DrawStatsHud();
 
     /// Draws the settings body, showing only runtime-changeable rows when asked.

@@ -10,8 +10,8 @@
 
 /**
  * The numbers the on-screen stats window shows, published once a second by the emulation
- * thread from the same figures the [azahar] console line prints, read by the render thread
- * when it draws the interface. Plain atomics, so neither side waits on the other.
+ * thread from the core's perf stats, read by the render thread when it draws the interface.
+ * Plain atomics, so neither side waits on the other.
  */
 namespace VitaFrontend::HudStats {
 

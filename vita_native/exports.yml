@@ -15,8 +15,5 @@ azaharnative:
         - azaharRun: 0x3C1A7E03
         - azaharRelease: 0x3C1A7E04
         - azaharEdit: 0x3C1A7E05
-        - azaharPmuRead: 0x3C1A7E06
-        - azaharPmuReadAll: 0x3C1A7E07
-        - azaharSgiStats: 0x3C1A7E08
-        - azaharThreadDump: 0x3C1A7E09
         - azaharVersion: 0x3C1A7E0A
+        - azaharModuleUid: 0x3C1A7E35

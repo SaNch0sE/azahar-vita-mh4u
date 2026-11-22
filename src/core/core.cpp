@@ -21,12 +21,13 @@
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #endif
-#include "core/arm/dyncom/arm_dyncom.h"
-#ifdef CITRA_HAS_NATIVE_ARM
-#include "core/arm/native/arm_native.h"
-#endif
 #ifdef CITRA_HAS_VITA_NATIVE
 #include "core/arm/vita/arm_vita_native.h"
+#else
+#include "core/arm/dyncom/arm_dyncom.h"
+#endif
+#ifdef CITRA_HAS_NATIVE_ARM
+#include "core/arm/native/arm_native.h"
 #endif
 #include "core/cheats/cheats.h"
 #include "core/core.h"
@@ -609,6 +610,20 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     exclusive_monitor = MakeExclusiveMonitor(*memory, num_cores);
     cpu_cores.reserve(num_cores);
 
+#ifdef CITRA_HAS_VITA_NATIVE
+    // The PS Vita runs guest code natively and only natively: on a core taken from the Vita's
+    // kernel, through the azaharnative module. Without the module there is no CPU to run on.
+    const auto map = ARM_VitaNative::CreateMap(*memory);
+    if (!map) {
+        LOG_CRITICAL(Core, "Vita native execution unavailable: the azaharnative kernel module is "
+                           "not loaded, or it could not take a core");
+        return ResultStatus::ErrorNotInitialized;
+    }
+    for (u32 i = 0; i < num_cores; ++i) {
+        cpu_cores.push_back(
+            std::make_shared<ARM_VitaNative>(*this, *memory, i, timing->GetTimer(i), map));
+    }
+#else
 #ifdef CITRA_HAS_NATIVE_ARM
     // On a 32-bit ARM host the guest's own instructions are host instructions, so they are executed
     // directly rather than interpreted or recompiled. Both emulated cores share one address space
@@ -626,54 +641,28 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
         LOG_WARNING(Core, "Native execution unavailable; falling back to interpretation");
     }
 #endif
-
-#ifdef CITRA_HAS_VITA_NATIVE
-    // The PS Vita: guest code on a core taken from the Vita's kernel, through the azahar-native module.
-    // This is the backend on hardware — interpreting a 3DS on a 444 MHz A9 is unusable. It needs
-    // the module, so it is exactly what is missing under the Vita3K emulator, where the graphics
-    // work is debugged; there the interpreter runs instead, slowly but on a host with cores to
-    // spare. On hardware a missing module means the user did not install it, so say so loudly.
-    if (auto map = ARM_VitaNative::CreateMap(*memory)) {
-        for (u32 i = 0; i < num_cores; ++i) {
-            cpu_cores.push_back(std::make_shared<ARM_VitaNative>(*this, *memory, i,
-                                                                 timing->GetTimer(i), map));
-        }
-        LOG_INFO(Core, "Executing guest code natively on the taken Vita core ({} guest core(s))",
-                 num_cores);
-    } else {
-        LOG_CRITICAL(Core, "Vita native execution unavailable: the azahar-native kernel module is not "
-                           "loaded, or core {} could not be taken - interpreting instead, which "
-                           "is only usable under an emulated Vita", 2);
-    }
-#endif
     if (cpu_cores.empty()) {
-#ifndef CITRA_HAS_VITA_NATIVE
-    if (Settings::values.use_cpu_jit) {
+        if (Settings::values.use_cpu_jit) {
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
-        for (u32 i = 0; i < num_cores; ++i) {
-            cpu_cores.push_back(std::make_shared<ARM_Dynarmic>(
-                *this, *memory, i, timing->GetTimer(i), *exclusive_monitor));
-        }
+            for (u32 i = 0; i < num_cores; ++i) {
+                cpu_cores.push_back(std::make_shared<ARM_Dynarmic>(
+                    *this, *memory, i, timing->GetTimer(i), *exclusive_monitor));
+            }
 #else
-        for (u32 i = 0; i < num_cores; ++i) {
-            cpu_cores.push_back(
-                std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i, timing->GetTimer(i)));
-        }
-        LOG_WARNING(Core, "CPU JIT requested, but Dynarmic not available");
+            for (u32 i = 0; i < num_cores; ++i) {
+                cpu_cores.push_back(std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i,
+                                                                 timing->GetTimer(i)));
+            }
+            LOG_WARNING(Core, "CPU JIT requested, but Dynarmic not available");
 #endif
-    } else {
-        for (u32 i = 0; i < num_cores; ++i) {
-            cpu_cores.push_back(
-                std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i, timing->GetTimer(i)));
+        } else {
+            for (u32 i = 0; i < num_cores; ++i) {
+                cpu_cores.push_back(std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i,
+                                                                 timing->GetTimer(i)));
+            }
         }
     }
-#else
-        for (u32 i = 0; i < num_cores; ++i) {
-            cpu_cores.push_back(
-                std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i, timing->GetTimer(i)));
-        }
 #endif // CITRA_HAS_VITA_NATIVE
-    }
     running_core = cpu_cores[0].get();
 
     kernel->SetCPUs(cpu_cores);

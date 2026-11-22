@@ -88,34 +88,6 @@ typedef struct AzaharEditRequest {
     AzaharRange range;     // user_va is ignored for UNMAP; perm is ignored for UNMAP
 } AzaharEditRequest;
 
-// Cortex-A9 performance counters, accumulated over guest slices. The plugin reprograms core 2's
-// PMU at every azaharRun: the cycle counter and the six event counters are reset just before the
-// guest is entered and read back at the exit, so the totals cover guest execution (plus the few
-// hundred cycles of the entry/exit path) and nothing else that ever ran on the core. azaharPmuRead
-// copies the totals out and zeroes them. Call it from the thread that calls azaharRun: the totals
-// are not synchronized against a run in flight.
-// events[] order (Cortex-A9 event numbers):
-//   0  0x68 instructions passing the rename stage (the A9 has no retired-instruction event)
-//   1  0x60 cycles stalled on an instruction-cache miss
-//   2  0x61 cycles stalled on a data-cache miss
-//   3  0x03 L1 data cache refills
-//   4  0x01 L1 instruction cache refills
-//   5  0x10 mispredicted branches
-typedef struct AzaharPmuStats {
-    uint64_t cycles;
-    uint64_t events[6];
-    uint32_t runs;    // azaharRun slices the totals cover
-    uint32_t pad;
-} AzaharPmuStats;
-
-// All four cores' counters. core[2] is the guest slice totals described above; the other
-// cores are whole-core samples, taken every 10 ms by a small kernel thread pinned to each,
-// counting everything scheduled there. The first azaharPmuReadAll starts the samplers; every
-// read drains the totals.
-typedef struct AzaharPmuAll {
-    AzaharPmuStats core[4];
-} AzaharPmuAll;
-
 // Error codes (negative), beyond the kernel's own.
 #define AZAHAR_ERR_STATE (-1000)      // call out of order (map before take, run before map...)
 #define AZAHAR_ERR_ARG (-1001)        // bad request (alignment, count, perm)
@@ -140,28 +112,16 @@ int azaharMap(const AzaharMapRequest *req);
 int azaharRun(AzaharRunRequest *req);
 int azaharRelease(void);
 int azaharEdit(const AzaharEditRequest *req);
-int azaharPmuRead(AzaharPmuStats *out);
-int azaharPmuReadAll(AzaharPmuAll *out);
+/// This module's version, and the first version that can be stopped and unloaded: from it on,
+/// module_stop lets go of everything the module registered or allocated, and refuses while a
+/// process holds any of it, so an update can replace a loaded module without a reboot.
+#define AZAHAR_NATIVE_VERSION 67
+#define AZAHAR_NATIVE_UNLOADABLE 67
 int azaharVersion();
-
-/// The SGI service-window counters and the resident loop's heartbeat (resident mode; the
-/// folded mode reports zeros except installed). pending_now is the banked GICD_ISPENDR0.
-typedef struct AzaharSgiStats {
-    uint32_t windows;
-    uint32_t last_pend;
-    uint32_t stuck;
-    uint32_t heartbeat;
-    uint32_t installed;
-    uint32_t pending_now;
-    /// The core the last slice ran on: the resident thread's in the held design, the caller's
-    /// own in the folded one, where it answers "is the guest where the partition put it".
-    uint32_t core;
-} AzaharSgiStats;
-int azaharSgiStats(AzaharSgiStats *out);
-/// Writes every thread of the client with its kernel-held registers (user and kernel pc,
-/// lr, sp; status, priority, last core, wait) to ux0:data/azahar/native.txt, when logging
-/// is enabled (ux0:data/azahar/log). Returns the number of threads seen, 0 without a client.
-int azaharThreadDump(void);
+/// This module as a UID of the calling process, for taiStopUnloadKernelModule: taiHEN stops and
+/// unloads a kernel module only by the UID its load gave the loading process, and an update's
+/// process is not that one. Version 67.
+int azaharModuleUid(void);
 
 #ifdef __cplusplus
 }

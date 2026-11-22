@@ -4,14 +4,10 @@
 
 #include "core/arm/vita/arm_vita_native.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
-#include "core/arm/vita/native_stats.h"
 
 #include <algorithm>
 #include <cstring>
 #include <iterator>
-#include <psp2/io/fcntl.h>
-#include <psp2/kernel/clib.h>
-#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -281,15 +277,6 @@ void VitaGuestMap::SyncAllCode() {
 // ---------------------------------------------------------------------------- ARM_VitaNative
 
 std::shared_ptr<VitaGuestMap> ARM_VitaNative::CreateMap(Memory::MemorySystem& memory) {
-    // Under the Vita3K emulator there is no kernel to take a core from, and an unresolved import
-    // there returns zero rather than an error - which azaharTakeCore cannot tell from success. So
-    // that target says so with a file instead, and the caller falls back to the interpreter.
-    if (SceUID fd = sceIoOpen("ux0:data/azahar/cpu_interpreter", SCE_O_RDONLY, 0); fd >= 0) {
-        sceIoClose(fd);
-        LOG_WARNING(Core_ARM11, "ux0:data/azahar/cpu_interpreter present: not taking a core");
-        return nullptr;
-    }
-
     // The module holds a core only in its resident design, and a thread pinned to a held core
     // never runs again - so this thread steps aside before the take, and steps back if the
     // module answers that it folded the guest into its caller instead. Folded, the partition's
@@ -301,9 +288,7 @@ std::shared_ptr<VitaGuestMap> ARM_VitaNative::CreateMap(Memory::MemorySystem& me
         sceKernelChangeThreadCpuAffinityMask(self, SCE_KERNEL_CPU_MASK_USER_0);
     }
 
-    sceClibPrintf("[azahar] CreateMap: calling azaharTakeCore\n");
     const int ret = azaharTakeCore();
-    sceClibPrintf("[azahar] CreateMap: azaharTakeCore -> %d\n", ret);
     if (ret < 0) {
         LOG_WARNING(Core_ARM11, "azaharTakeCore failed ({}): native execution unavailable", ret);
         return nullptr;
@@ -381,10 +366,7 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
     run.ctx.tpidrurw = cp15[CP15_THREAD_UPRW];
     run.quantum_us = static_cast<u32>(quantum_ns / 1000);
 
-    const SceUInt64 vanrun_start = sceKernelGetProcessTimeWide();
     const int ret = azaharRun(&run);
-    NativeStats::vanrun_us.fetch_add(sceKernelGetProcessTimeWide() - vanrun_start,
-                                     std::memory_order_relaxed);
     if (ret < 0) {
         system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
                          fmt::format("azaharRun failed: {}", ret).c_str());
@@ -394,19 +376,11 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
 
     context = run.ctx;
     cp15[CP15_THREAD_UPRW] = run.ctx.tpidrurw;
-    NativeStats::slices.fetch_add(1, std::memory_order_relaxed);
-    if (run.reason == AZAHAR_EXIT_SVC) {
-        NativeStats::svcs.fetch_add(1, std::memory_order_relaxed);
-    }
     CreditTime(run, quantum_ns);
 
     switch (run.reason) {
-    case AZAHAR_EXIT_SVC: {
-        const SceUInt64 svc_start = sceKernelGetProcessTimeWide();
+    case AZAHAR_EXIT_SVC:
         svc_context.CallSVC(run.svc_number);
-        NativeStats::svc_us.fetch_add(sceKernelGetProcessTimeWide() - svc_start,
-                                      std::memory_order_relaxed);
-    }
         // An svc can reschedule, which replaces the register file wholesale.
         return !break_flag && !stop_requested;
 
@@ -432,7 +406,6 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
                 },
                 &ctx);
             if (ours) {
-                NativeStats::write_faults.fetch_add(1, std::memory_order_relaxed);
                 return !break_flag && !stop_requested;
             }
         }
@@ -456,7 +429,6 @@ void ARM_VitaNative::CreditTime(const AzaharRunRequest& run, u64 quantum_ns) {
         const u64 spent = quantum_ticks > run.timer_left ? quantum_ticks - run.timer_left : 0;
         elapsed_ns = spent * 1'000'000'000ull / run.timer_hz;
     }
-    NativeStats::credited_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
     const u64 ticks = NanosecondsToTicks(elapsed_ns);
     if (ticks > 0) {
         timer->AddTicks(ticks);

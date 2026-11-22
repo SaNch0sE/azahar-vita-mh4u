@@ -17,17 +17,11 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/razor_capture.h>
-#include <psp2/razor_hud.h>
-// In librazorhud and its stub, not yet in vitasdk's header.
-extern "C" int sceRazorHudReloadSettings();
-extern "C" int sceRazorGpuPerfGetMode();
-extern "C" int sceRazorHudSetDisplayEnabled(int enabled);
 #include <psp2/sysmodule.h>
 
 #include "citra_vita/gxm_present.h"
 #include "citra_vita/gxm_shaders.gen.h"
 #include "common/logging/log.h"
-#include "common/pipeline_stats.h"
 #include "video_core/pica/regs_external.h"
 #include "video_core/renderer_gxm/gxm_device.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
@@ -260,394 +254,6 @@ void LogMemBlock(const char* name, SceKernelMemBlockType type, SceSize size, Sce
     }
 }
 
-// Razor GPU Live: the GPU's own job timings per frame, the way vitaGL reads them. Two
-// result buffers, one per display buffer; a [gpu] line once a second.
-//
-// The hardware reports one counter group at a time, so a run picks one and the fields of
-// the others stay zero. The gxm flags are gpulive0 (parameter buffer: peak usage, partial
-// renders, paused vertex jobs), gpulive for the USSE overview, gpulive2 (pixels before and
-// after hidden surface removal, vertex and primitive counts) and gpulive3 (tiling and ISP
-// parameter fetch bytes). gpuhud draws the same numbers over the game and selects the USSE
-// overview unless one of the others asked for a group.
-struct GpuLive {
-    bool on = false;
-    void* buffer[MaxDisplayBuffers]{};
-    static constexpr u32 BufferSize = 256 * 1024;
-    u64 report_at_us = 0;
-    u32 frames = 0, frame_us = 0, busy_us = 0, vertex_us = 0, fragment_us = 0, firmware_us = 0;
-    u32 vertex_jobs = 0, fragment_jobs = 0;
-    float usse_vertex = 0, usse_fragment = 0, dep_tex = 0, nondep_tex = 0;
-    u32 px_before_hsr = 0, px_out = 0, vdm_verts = 0, mte_prims = 0;
-    u32 tiling_writes = 0, isp_reads = 0, pbuf_peak = 0, partial = 0;
-    /// A vertex job paused for want of parameter buffer space, and the jobs that were
-    /// themselves partial renders. The SDK ranks the ways a scene can be split: a paused
-    /// vertex job is the cheap one, a partial render the middling one, and a fragment ring
-    /// buffer that runs out is the expensive one, since it processes every tile again.
-    u32 vertex_paused = 0, partial_jobs = 0;
-    u32 entries = 0, set_failures = 0;
-    int last_set_error = 0;
-    /// Fragment time, jobs and pixels by the scene's index within its frame, so the render
-    /// targets can be told apart: the renderer opens its scenes in order and the
-    /// presentation layer's is the last of each frame.
-    static constexpr u32 Scenes = 12;
-    u32 scene_fragment_us[Scenes]{};
-    u32 scene_jobs[Scenes]{};
-    u32 scene_pixels[Scenes]{};
-    /// Where the GPU had nothing to do: before the frame's first job, between jobs, and
-    /// after the last one. Every job carries a start and an end, so the gaps are exact.
-    u64 idle_before_us = 0, idle_between_us = 0, idle_after_us = 0;
-    u32 max_gap_us = 0, max_gap_scene = 0, gaps = 0;
-} live;
-/// The last second's summary for the on-screen HUD (gxm flag gpuhud), rewritten with the
-/// [gpu] line; read on the presenting thread only, like everything here.
-std::string live_text;
-
-/// One GPU job's span, for the gap arithmetic below.
-struct JobSpan {
-    u64 start, end;
-    u16 scene;
-};
-
-#ifdef VITA_DIAGNOSTICS
-// Reads the GPU's own counters for the last second and prints them. Diagnostic only:
-// the release build neither starts the counters nor carries the strings.
-void GpuLiveFrame() {
-    SceRazorGpuLiveResultInfo res{};
-    JobSpan spans[128];
-    u32 span_count = 0;
-    u64 frame_start = 0, frame_end = 0;
-    const int set = sceRazorGpuLiveSetBuffer(live.buffer[g.frame_index % MaxDisplayBuffers],
-                                             GpuLive::BufferSize, &res);
-    if (set < 0 || res.result_data == nullptr) {
-        // Reported with the next line rather than silently: which of the two it is says
-        // whether the module is there at all or just has nothing for this process.
-        live.set_failures++;
-        live.last_set_error = set;
-        res.entry_count = 0;
-    }
-    live.entries += res.entry_count;
-    const SceUID pid = sceKernelGetProcessId();
-    const u8* ptr = static_cast<const u8*>(res.result_data);
-    for (u32 i = 0; i < res.entry_count; i++) {
-        const auto* header = reinterpret_cast<const SceRazorGpuLiveEntryHeader*>(ptr);
-        if (header->entry_size == 0) {
-            break;
-        }
-        switch (header->entry_type) {
-        case SCE_RAZOR_LIVE_TRACE_METRIC_ENTRY_TYPE_JOB: {
-            const auto* job = reinterpret_cast<const SceRazorGpuLiveEntryJob*>(ptr);
-            const u32 us = static_cast<u32>(job->end_time - job->start_time);
-            if (span_count < std::size(spans) && job->end_time > job->start_time) {
-                spans[span_count++] = {job->start_time, job->end_time, job->scene_index};
-            }
-            // vitasdk names the last word of the entry `unk`; the SDK header has it as a
-            // draw count it never fills in and a flag word, whose first bit marks a job that
-            // was a partial render. The struct sizes agree, so the halves are these.
-            if ((static_cast<u32>(job->unk) >> 16) & 1u) {
-                live.partial_jobs++;
-            }
-            if (job->type == SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_FIRMWARE) {
-                live.firmware_us += us;
-            } else if (job->process_id == static_cast<u32>(pid)) {
-                switch (job->type) {
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_VERTEX0:
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_VERTEX1:
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_VERTEX2:
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_VERTEX3:
-                    live.vertex_jobs++;
-                    live.vertex_us += us;
-                    break;
-                default:
-                    live.fragment_jobs++;
-                    live.fragment_us += us;
-                    if (job->scene_index < GpuLive::Scenes) {
-                        live.scene_fragment_us[job->scene_index] += us;
-                        live.scene_jobs[job->scene_index]++;
-                    }
-                    break;
-                }
-                const auto& v = job->job_values;
-                switch (job->type) {
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_VERTEX1:
-                    live.usse_vertex += v.vertex_values_type1.usse_vertex_processing_percent;
-                    break;
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_FRAGMENT1:
-                    live.usse_fragment += v.fragment_values_type1.usse_fragment_processing_percent;
-                    live.dep_tex += v.fragment_values_type1.usse_dependent_texture_reads_percent;
-                    live.nondep_tex +=
-                        v.fragment_values_type1.usse_non_dependent_texture_reads_percent;
-                    break;
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_VERTEX2:
-                    live.vdm_verts += v.vertex_values_type2.vdm_vertices_input_num;
-                    live.mte_prims += v.vertex_values_type2.mte_primitives_output_num;
-                    break;
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_FRAGMENT2:
-                    live.px_before_hsr += v.fragment_values_type2.rasterized_pixels_before_hsr_num;
-                    live.px_out += v.fragment_values_type2.rasterized_output_pixels_num;
-                    if (job->scene_index < GpuLive::Scenes) {
-                        live.scene_pixels[job->scene_index] +=
-                            v.fragment_values_type2.rasterized_output_pixels_num;
-                    }
-                    break;
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_VERTEX3:
-                    live.tiling_writes += v.vertex_values_type3.tiling_accelerated_mem_writes;
-                    break;
-                case SCE_RAZOR_LIVE_TRACE_METRIC_JOB_TYPE_FRAGMENT3:
-                    live.isp_reads += v.fragment_values_type3.isp_parameter_fetches_mem_reads;
-                    break;
-                default:
-                    break;
-                }
-            }
-            break;
-        }
-        case SCE_RAZOR_LIVE_TRACE_METRIC_ENTRY_TYPE_PARAMETER_BUFFER: {
-            const auto* pb = reinterpret_cast<const SceRazorGpuLiveEntryParameterBuffer*>(ptr);
-            live.pbuf_peak = std::max(live.pbuf_peak, pb->peak_usage_value);
-            live.partial += pb->partial_render;
-            live.vertex_paused += pb->vertex_job_paused;
-            break;
-        }
-        case SCE_RAZOR_LIVE_TRACE_METRIC_ENTRY_TYPE_FRAME: {
-            const auto* frame = reinterpret_cast<const SceRazorGpuLiveEntryFrame*>(ptr);
-            frame_start = frame->start_time;
-            frame_end = frame->start_time + frame->duration;
-            live.frames++;
-            live.frame_us += frame->duration;
-            live.busy_us += frame->gpu_activity_duration_time;
-            break;
-        }
-        default:
-            break;
-        }
-        ptr += header->entry_size;
-    }
-    // The gaps in the GPU's work: sort the jobs by start, walk them keeping the furthest
-    // end seen, and every jump forward is time the GPU had nothing queued. The scene of the
-    // job that ends the gap says what it was waiting for.
-    if (span_count > 0) {
-        std::sort(spans, spans + span_count,
-                  [](const JobSpan& a, const JobSpan& b) { return a.start < b.start; });
-        u64 cursor = spans[0].start;
-        for (u32 i = 0; i < span_count; i++) {
-            if (spans[i].start > cursor) {
-                const u64 gap = spans[i].start - cursor;
-                live.idle_between_us += gap;
-                live.gaps++;
-                if (gap > live.max_gap_us) {
-                    live.max_gap_us = static_cast<u32>(gap);
-                    live.max_gap_scene = spans[i].scene;
-                }
-            }
-            cursor = std::max(cursor, spans[i].end);
-        }
-        if (frame_start != 0 && spans[0].start > frame_start) {
-            live.idle_before_us += spans[0].start - frame_start;
-        }
-        if (frame_end > cursor) {
-            live.idle_after_us += frame_end - cursor;
-        }
-    }
-
-    const u64 now = sceKernelGetProcessTimeWide();
-    if (now < live.report_at_us) {
-        return;
-    }
-    live.report_at_us = now + 1000000;
-    const u32 n = std::max(live.frames, 1u);
-    const u32 fj = std::max(live.fragment_jobs, 1u);
-    const u32 vj = std::max(live.vertex_jobs, 1u);
-    if (live.frames == 0) {
-        sceClibPrintf("[gpu] no frame entries: %u entries in all, set buffer failed %u times "
-                      "(last %#x)\n",
-                      live.entries, live.set_failures, static_cast<unsigned>(live.last_set_error));
-    }
-    const u32 frame_us = live.frame_us / n;
-    const u32 busy_us = live.busy_us / n;
-    sceClibPrintf("[gpu] %u frames: per frame %u us, gpu busy %u us, vertex %u us (%u jobs), "
-                  "fragment %u us (%u jobs), firmware %u us | usse vertex %u%% fragment %u%% "
-                  "dependent tex %u%% non-dependent %u%% | pixels before hsr %u after %u, "
-                  "vertices %u, prims %u | tiling writes %u KiB, isp reads %u KiB, "
-                  "pbuf peak %u KiB, partial renders %u (%u jobs), vertex jobs paused %u\n",
-                  live.frames, frame_us, busy_us, live.vertex_us / n, live.vertex_jobs,
-                  live.fragment_us / n, live.fragment_jobs, live.firmware_us / n,
-                  static_cast<u32>(live.usse_vertex / vj),
-                  static_cast<u32>(live.usse_fragment / fj), static_cast<u32>(live.dep_tex / fj),
-                  static_cast<u32>(live.nondep_tex / fj), live.px_before_hsr / n, live.px_out / n,
-                  live.vdm_verts / n, live.mte_prims / n, live.tiling_writes / n / 1024,
-                  live.isp_reads / n / 1024, live.pbuf_peak / 1024, live.partial, live.partial_jobs,
-                  live.vertex_paused);
-    // Where the fragment time goes, by the scene's place in its frame, in the order the
-    // renderer opened them: a scene that costs most of the frame can be found this way.
-    char scenes[256];
-    int at = 0;
-    for (u32 i = 0; i < GpuLive::Scenes && at < static_cast<int>(sizeof(scenes)) - 40; i++) {
-        if (live.scene_jobs[i] == 0) {
-            continue;
-        }
-        at += std::snprintf(scenes + at, sizeof(scenes) - at, " %u: %u us %u px,", i,
-                            live.scene_fragment_us[i] / n, live.scene_pixels[i] / n);
-    }
-    if (at > 0) {
-        scenes[at - 1] = '\0';
-        sceClibPrintf("[gpu] fragment us and pixels per frame by scene:%s\n", scenes);
-    }
-    sceClibPrintf("[gpu] idle per frame: %llu us before the first job, %llu us in %u gaps "
-                  "between jobs, %llu us after the last; the biggest gap was %u us, ending "
-                  "at a job of scene %u\n",
-                  live.idle_before_us / n, live.idle_between_us / n, live.gaps / n,
-                  live.idle_after_us / n, live.max_gap_us, live.max_gap_scene);
-    live_text = fmt::format(
-        "GPU {} frames/s: {} us per frame, busy {} us ({}%)\n"
-        "vertex {} us ({} jobs)  fragment {} us ({} jobs)  firmware {} us\n"
-        "usse vertex {}%  fragment {}%  tex dependent {}%  non-dependent {}%\n"
-        "pixels {} before hsr, {} out  vertices {}  prims {}\n"
-        "tiling {} KiB  isp {} KiB  pbuf peak {} KiB\n"
-        "partial renders {} ({} jobs)  vertex jobs paused {}",
-        live.frames, frame_us, busy_us, frame_us ? busy_us * 100 / frame_us : 0, live.vertex_us / n,
-        live.vertex_jobs, live.fragment_us / n, live.fragment_jobs, live.firmware_us / n,
-        static_cast<u32>(live.usse_vertex / vj), static_cast<u32>(live.usse_fragment / fj),
-        static_cast<u32>(live.dep_tex / fj), static_cast<u32>(live.nondep_tex / fj),
-        live.px_before_hsr / n, live.px_out / n, live.vdm_verts / n, live.mte_prims / n,
-        live.tiling_writes / n / 1024, live.isp_reads / n / 1024, live.pbuf_peak / 1024,
-        live.partial, live.partial_jobs, live.vertex_paused);
-    if (live.frames == 0) {
-        live_text =
-            fmt::format("GPU live: no frame entries ({} entries, set buffer failed {} "
-                        "times, last {:#x})",
-                        live.entries, live.set_failures, static_cast<u32>(live.last_set_error));
-    }
-    const bool on = live.on;
-    void* buffers[MaxDisplayBuffers];
-    std::memcpy(buffers, live.buffer, sizeof(buffers));
-    live = GpuLive{};
-    live.on = on;
-    std::memcpy(live.buffer, buffers, sizeof(buffers));
-    live.report_at_us = now + 1000000;
-}
-#else
-void GpuLiveFrame() {}
-#endif
-
-u32 GpuLiveGroup() {
-#ifndef VITA_DIAGNOSTICS
-    // No counters in the release build, so the module is never loaded either.
-    return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_NUM;
-#else
-    // One group per run, so the first flag named here wins. gpuhud comes last because it is
-    // about drawing the numbers rather than about which ones to collect.
-    if (GxmRenderer::GxmFlag("gpulive0")) {
-        return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_PBUFFER_USAGE;
-    }
-    if (GxmRenderer::GxmFlag("gpulive2")) {
-        return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_OVERVIEW_2;
-    }
-    if (GxmRenderer::GxmFlag("gpulive3")) {
-        return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_OVERVIEW_3;
-    }
-    if (GxmRenderer::GxmFlag("gpulive") || GxmRenderer::GxmFlag("gpuhud")) {
-        return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_OVERVIEW_1;
-    }
-    return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_NUM;
-#endif
-}
-
-/// The HUD module hooks libgxm when libgxm initialises, so it has to be loaded before
-/// sceGxmInitialize (loaded after, every call answers NOT_INITIALIZED, perf mode 0); the
-/// live metrics are started after, as vitaGL orders both.
-int hud_module = -1;
-void LoadGpuLiveModule() {
-    if (GpuLiveGroup() != SCE_RAZOR_GPU_LIVE_METRICS_GROUP_NUM) {
-        hud_module = sceSysmoduleLoadModule(SCE_SYSMODULE_RAZOR_HUD);
-    }
-}
-
-void StartGpuLive() {
-    const u32 group = GpuLiveGroup();
-    if (group == SCE_RAZOR_GPU_LIVE_METRICS_GROUP_NUM) {
-        return;
-    }
-    const int hud = hud_module;
-    for (u32 i = 0; i < MaxDisplayBuffers; i++) {
-        const SceUID uid = sceKernelAllocMemBlock(
-            "azahar-gpulive", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, GpuLive::BufferSize, nullptr);
-        LogMemBlock("azahar-gpulive", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, GpuLive::BufferSize, uid);
-        if (uid < 0 || sceKernelGetMemBlockBase(uid, &live.buffer[i]) < 0) {
-            LOG_WARNING(Frontend, "GPU Live: no result buffer ({:#x})", static_cast<u32>(uid));
-            return;
-        }
-        sceGxmMapMemory(live.buffer[i], GpuLive::BufferSize,
-                        static_cast<SceGxmMemoryAttribFlags>(SCE_GXM_MEMORY_ATTRIB_READ |
-                                                             SCE_GXM_MEMORY_ATTRIB_WRITE));
-    }
-    // The perf mode comes from app0:hud_settings.ini (LIVE=1 selects live metrics, mode
-    // 3); it is read when the module starts, and reloaded here in case that was too early.
-    const int mode_before = sceRazorGpuPerfGetMode();
-    int reload = sceRazorHudReloadSettings();
-    if (reload == static_cast<int>(0x8008c008)) { // SCE_RAZOR_GPU_ERROR_SETTINGS_NOT_FOUND
-        // app0:hud_settings.ini is not where this firmware's module looks. Probe: the same
-        // file at each candidate, a reload after each, the first that is found is logged.
-        static const char* const candidates[] = {
-            "ux0:data/hud_settings.ini",
-            "ux0:hud_settings.ini",
-            "ux0:data/azahar/hud_settings.ini",
-            "ur0:data/hud_settings.ini",
-            "ux0:temp/hud_settings.ini",
-            "host0:hud_settings.ini",
-            "ur0:hud_settings.ini",
-            "ux0:app/hud_settings.ini",
-        };
-        // The module's own on-screen HUD (GPU_HUD = 1) never drew anything on this
-        // firmware; the gpuhud flag draws the live counters with imgui instead (vita_ui).
-        const std::string settings = "ENABLE = 1\nLIVE = 1\nGPU_HUD = 0\nCPU_HUD = 0\n"
-                                     "HUD_DISPLAY_FRAMES = 2\nHUD_FIRMWARE = 1\n";
-        for (const char* path : candidates) {
-            FILE* f = std::fopen(path, "wb");
-            if (f == nullptr) {
-                LOG_WARNING(Frontend, "GPU Live: cannot write {}", path);
-                continue;
-            }
-            std::fwrite(settings.data(), 1, settings.size(), f);
-            std::fclose(f);
-            reload = sceRazorHudReloadSettings();
-            LOG_WARNING(Frontend, "GPU Live: settings at {} -> reload {:#x} mode {}", path,
-                        static_cast<u32>(reload), sceRazorGpuPerfGetMode());
-            if (reload >= 0) {
-                break;
-            }
-        }
-    }
-    const int mode = sceRazorGpuPerfGetMode();
-    const int set = sceRazorGpuLiveSetMetricsGroup(group);
-    const int start = sceRazorGpuLiveStart();
-    live.on = set >= 0 && start >= 0;
-    LOG_WARNING(Frontend,
-                "GPU Live: hud {:#x} perf mode {} -> {} after reload ({:#x}), group {} set {:#x} "
-                "start {:#x} -> {}",
-                static_cast<u32>(hud), mode_before, mode, static_cast<u32>(reload), group,
-                static_cast<u32>(set), static_cast<u32>(start), live.on ? "on" : "off");
-}
-/// What a presented frame costs this thread, reported once a second: the wait for the
-/// display slot the frame is about to draw into (the GPU must be done with the buffer that
-/// was on screen two flips ago), the two scene calls, and handing the frame to the display
-/// queue. The vertical blank the queue callback waits for is on libgxm's own thread and is
-/// counted apart.
-struct PresentTimes {
-    u64 report_at_us = 0;
-    u32 frames = 0, slot_waits = 0, callbacks = 0;
-    u64 slot_wait_us = 0, begin_scene_us = 0, end_scene_us = 0, queue_us = 0, callback_us = 0;
-} ptimes;
-
-/// Microseconds from here to the destructor, into `into`.
-struct PresentTimer {
-    u64& into;
-    u64 start = sceKernelGetProcessTimeWide();
-    explicit PresentTimer(u64& t) : into{t} {}
-    ~PresentTimer() {
-        into += sceKernelGetProcessTimeWide() - start;
-    }
-};
-
 bool dump_requested = false; ///< DumpNextFrame: the next EndFrame writes its picture
 
 // The frame just drawn as a PPM, after waiting for the GPU. A frame is 1.5 MB.
@@ -707,8 +313,6 @@ void DisplayCallback(const void* data) {
     fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
     fb.width = DisplayWidth;
     fb.height = DisplayHeight;
-    const PresentTimer timer{ptimes.callback_us};
-    ptimes.callbacks++;
     sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
     // Returning before the flip lands would let the GPU write the buffer still on screen -
     // the SDK is explicit that this wait is correctness, not politeness.
@@ -1177,7 +781,6 @@ bool Initialize() {
     }
 
     LoadRazor();
-    LoadGpuLiveModule();
 
     SceGxmInitializeParams init{};
     init.flags = 0;
@@ -1190,8 +793,6 @@ bool Initialize() {
         LOG_CRITICAL(Frontend, "sceGxmInitialize failed");
         return false;
     }
-    // Razor GPU Live wants libgxm up, as vitaGL orders it.
-    StartGpuLive();
     CreatePools();
 
     // The immediate context and its ring buffers. Both hold default uniform buffers, which a
@@ -1490,10 +1091,6 @@ void FreeBlock(void* block) {
     }
 }
 
-const std::string& GpuLiveText() {
-    return live_text;
-}
-
 bool HasRazor() {
     return razor_loaded;
 }
@@ -1557,9 +1154,6 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
         SceGxmNotification wait{};
         wait.address = const_cast<u32*>(g.notification[g.back]);
         wait.value = g.notification_value[g.back];
-        const PresentTimer timer{ptimes.slot_wait_us};
-        ptimes.slot_waits++;
-        GXM_PHASE("present:slot-wait");
         sceGxmNotificationWait(&wait);
     }
     g.arena_used[g.back] = 0;
@@ -1567,14 +1161,9 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
     // The screens are sampled from surfaces the renderer's own scenes wrote, and scenes on
     // one context are not ordered against each other unless they say so. The renderer sets
     // FRAGMENT_SET_DEPENDENCY on every scene it ends, so waiting here is what pairs with it.
-    {
-        const PresentTimer timer{ptimes.begin_scene_us};
-        GXM_PHASE("present:begin-scene");
-        sceGxmBeginScene(
-            g.context,
-            SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY | SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY,
-            g.render_target, nullptr, nullptr, g.sync[g.back], &g.display_surface[g.back], nullptr);
-    }
+    sceGxmBeginScene(
+        g.context, SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY | SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY,
+        g.render_target, nullptr, nullptr, g.sync[g.back], &g.display_surface[g.back], nullptr);
     g.in_scene = true;
 
     sceGxmSetDefaultRegionClipAndViewport(g.context, DisplayWidth - 1, DisplayHeight - 1);
@@ -1753,11 +1342,7 @@ void EndFrame() {
     done.address = const_cast<u32*>(g.notification[g.back]);
     done.value = g.notification_counter;
     g.notification_value[g.back] = g.notification_counter;
-    {
-        const PresentTimer timer{ptimes.end_scene_us};
-        GXM_PHASE("present:end-scene");
-        sceGxmEndScene(g.context, nullptr, &done);
-    }
+    sceGxmEndScene(g.context, nullptr, &done);
     g.in_scene = false;
 
     // Bring-up switch: every five seconds, the frame just drawn as a PPM under
@@ -1778,7 +1363,6 @@ void EndFrame() {
     // The surface dump the button (or the dumpsurfaces flag) asked for: here, after the
     // frame is done, whether or not the emulation is running.
     if (GxmRenderer::SurfaceDumpPending()) {
-        GXM_PHASE("present:dump-finish");
         sceGxmFinish(g.context);
         GxmRenderer::RunSurfaceDumpIfRequested();
     }
@@ -1787,37 +1371,11 @@ void EndFrame() {
     DisplayData data{g.display_mem[g.back]};
     // Razor's frame marker, as vitaGL sends it before every flip: what the capture library
     // and the HUD use to know a frame's end and which surface the HUD is drawn over.
-    if (razor_loaded || live.on || hud_module >= 0) {
+    if (razor_loaded) {
         sceGxmPadHeartbeat(&g.display_surface[g.back], g.sync[g.back]);
     }
-    {
-        const PresentTimer timer{ptimes.queue_us};
-        GXM_PHASE("present:queue-add");
-        sceGxmDisplayQueueAddEntry(g.sync[front], g.sync[g.back], &data);
-    }
+    sceGxmDisplayQueueAddEntry(g.sync[front], g.sync[g.back], &data);
     g.frame_index++;
-    ptimes.frames++;
-#ifdef VITA_DIAGNOSTICS
-    if (const u64 now = sceKernelGetProcessTimeWide(); now >= ptimes.report_at_us) {
-        if (ptimes.report_at_us != 0 && ptimes.frames != 0) {
-            const u32 n = ptimes.frames;
-            sceClibPrintf("[present] %u frames: slot wait %llu us over %u waits, begin scene "
-                          "%llu us, end scene %llu us, queue %llu us (all per frame); the "
-                          "display thread's flip and vblank %llu us over %u callbacks\n",
-                          n, ptimes.slot_wait_us / n, ptimes.slot_waits, ptimes.begin_scene_us / n,
-                          ptimes.end_scene_us / n, ptimes.queue_us / n,
-                          ptimes.callbacks ? ptimes.callback_us / ptimes.callbacks : 0,
-                          ptimes.callbacks);
-        }
-        ptimes = PresentTimes{};
-        ptimes.report_at_us = now + 1000000;
-    }
-#endif
-    if (live.on) {
-        GpuLiveFrame();
-    }
-    Common::PipelineStats::presents.fetch_add(1, std::memory_order_relaxed);
-    GXM_PHASE("present:done");
 }
 
 void SwapCommonDialog() {

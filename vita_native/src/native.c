@@ -241,100 +241,8 @@ static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at ma
 // Resident thread <-> syscall side. Everything volatile, no kernel calls on the core-2 side.
 enum { CMD_NONE, CMD_INSTALL, CMD_RUN, CMD_UNINSTALL };
 static volatile uint32_t azahar_cmd, azahar_cmd_done, azahar_cmd_status;
-static volatile uint32_t azahar_heartbeat, azahar_on_core, azahar_stop, azahar_park, azahar_park_cycles;
+static volatile uint32_t azahar_heartbeat, azahar_on_core, azahar_stop, azahar_park;
 
-// PMU totals over guest slices; see AzaharPmuStats in azahar_native.h. Written by core 2 between
-// slices, read and zeroed by azaharPmuRead on the syscall core. The emulator calls azaharRun and
-// azaharPmuRead from one thread, so the two never overlap and the 64-bit sums need no lock.
-static volatile uint64_t azahar_pmu_cycles;
-static volatile uint64_t azahar_pmu_ev[6];
-static volatile uint32_t azahar_pmu_runs;
-static const uint32_t azahar_pmu_events[6] = {0x68u, 0x60u, 0x61u, 0x03u, 0x01u, 0x10u};
-
-// Host-core sampling (azaharPmuReadAll): one kernel thread pinned to each schedulable core
-// programs that core's PMU with the same six events and folds 10 ms deltas into per-core
-// totals. The PMU is banked per core and counts whatever the scheduler runs there, so this is
-// a per-core profile, not a per-thread one. Deltas are unsigned 32-bit subtractions, so a
-// counter wrapping between samples is harmless; the readout races the samplers by design
-// (statistics, not bookkeeping).
-static volatile uint64_t azahar_pmu_host_cycles[4];
-static volatile uint64_t azahar_pmu_host_ev[4][6];
-static volatile uint32_t azahar_pmu_host_samples[4];
-static volatile uint32_t azahar_pmu_host_stop;
-static SceUID azahar_pmu_host_thread[4] = {-1, -1, -1, -1};
-static uint32_t azahar_pmu_host_core_arg[4] = {0, 1, 2, 3};
-
-static uint32_t pmu_read_event(uint32_t i) {
-    uint32_t v;
-    asm volatile("mcr p15, 0, %0, c9, c12, 5" ::"r"(i));  // PMSELR
-    asm volatile("isb");
-    asm volatile("mrc p15, 0, %0, c9, c13, 2" : "=r"(v)); // PMXEVCNTR
-    return v;
-}
-
-static int pmu_host_entry(SceSize args, void *argp) {
-    (void)args;
-    const uint32_t core = *(const uint32_t *)argp;
-    PmuSave save;
-    pmu_begin(&save); // PMCR.E on, cycle counter on, previous state saved; PMCR.C stays clear
-    for (uint32_t i = 0; i < 6; i++) {
-        asm volatile("mcr p15, 0, %0, c9, c12, 5" ::"r"(i));                  // PMSELR
-        asm volatile("mcr p15, 0, %0, c9, c13, 1" ::"r"(azahar_pmu_events[i]));  // PMXEVTYPER
-    }
-    asm volatile("mcr p15, 0, %0, c9, c12, 1" ::"r"(0x3Fu));  // PMCNTENSET: events 0-5
-    asm volatile("isb" ::: "memory");
-    uint32_t prev[7];
-    prev[6] = rd_pmccntr();
-    for (uint32_t i = 0; i < 6; i++) {
-        prev[i] = pmu_read_event(i);
-    }
-    while (!azahar_pmu_host_stop) {
-        ksceKernelDelayThread(10000);
-        uint32_t cur = rd_pmccntr();
-        azahar_pmu_host_cycles[core] += (uint32_t)(cur - prev[6]);
-        prev[6] = cur;
-        for (uint32_t i = 0; i < 6; i++) {
-            cur = pmu_read_event(i);
-            azahar_pmu_host_ev[core][i] += (uint32_t)(cur - prev[i]);
-            prev[i] = cur;
-        }
-        azahar_pmu_host_samples[core]++;
-    }
-    asm volatile("mcr p15, 0, %0, c9, c12, 2" ::"r"(0x3Fu));  // PMCNTENCLR: events 0-5
-    pmu_end(&save);
-    return 0;
-}
-
-static void pmu_host_start(void) {
-    static const uint32_t cores[3] = {0, 1, 3};
-    static const char *const names[3] = {"vanpmu_c0", "vanpmu_c1", "vanpmu_c3"};
-    if (azahar_pmu_host_thread[0] >= 0) {
-        return;
-    }
-    azahar_pmu_host_stop = 0;
-    for (unsigned i = 0; i < 3; i++) {
-        const uint32_t c = cores[i];
-        const SceUID t = ksceKernelCreateThread(names[i], pmu_host_entry, 0x10000100, 0x1000, 0,
-                                                CPU_AFFINITY(c), NULL);
-        if (t < 0) {
-            continue;
-        }
-        azahar_pmu_host_thread[c] = t;
-        ksceKernelStartThread(t, sizeof(azahar_pmu_host_core_arg[c]), &azahar_pmu_host_core_arg[c]);
-    }
-}
-
-static void pmu_host_stop_all(void) {
-    azahar_pmu_host_stop = 1;
-    for (unsigned c = 0; c < 4; c++) {
-        if (azahar_pmu_host_thread[c] >= 0) {
-            SceUInt timeout = 1000000;
-            ksceKernelWaitThreadEnd(azahar_pmu_host_thread[c], NULL, &timeout);
-            ksceKernelDeleteThread(azahar_pmu_host_thread[c]);
-            azahar_pmu_host_thread[c] = -1;
-        }
-    }
-}
 static volatile uint32_t azahar_core2_vbar, azahar_core2_cpsr, azahar_core2_ttbr1, azahar_core2_sp;
 
 // Saved on core 2 at install, restored at uninstall.
@@ -634,34 +542,6 @@ static void core2_sgi_window(void) {
 }
 
 // One trip into the guest. Interrupts are masked at the GIC for its duration — the core is
-// Program core 2's PMU for a slice: the six A9 event counters get the events AzaharPmuStats
-// documents, overflow interrupts stay off (nothing may interrupt the detached core but the
-// preemption timer), and PMCR.E|P|C starts everything from zero. Resetting PMCCNTR is fine
-// here, unlike in the surveys: the core is ours, and Sony's kernel never reads its counters
-// again (azaharRelease parks it for good).
-static void pmu_slice_start(void) {
-    for (uint32_t i = 0; i < 6; i++) {
-        asm volatile("mcr p15, 0, %0, c9, c12, 5" ::"r"(i));                  // PMSELR
-        asm volatile("mcr p15, 0, %0, c9, c13, 1" ::"r"(azahar_pmu_events[i]));  // PMXEVTYPER
-    }
-    asm volatile("mcr p15, 0, %0, c9, c14, 2" ::"r"(0xFFFFFFFFu));  // PMINTENCLR
-    asm volatile("mcr p15, 0, %0, c9, c12, 1" ::"r"(0x8000003Fu));  // PMCNTENSET: cycle + 0-5
-    asm volatile("mcr p15, 0, %0, c9, c12, 0" ::"r"(0x7u));         // PMCR E|P|C
-    asm volatile("isb" ::: "memory");
-}
-
-static void pmu_slice_end(void) {
-    uint32_t v;
-    asm volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(v));  // PMCCNTR
-    azahar_pmu_cycles += v;
-    for (uint32_t i = 0; i < 6; i++) {
-        asm volatile("mcr p15, 0, %0, c9, c12, 5" ::"r"(i));   // PMSELR
-        asm volatile("mrc p15, 0, %0, c9, c13, 2" : "=r"(v));  // PMXEVCNTR
-        azahar_pmu_ev[i] += v;
-    }
-    azahar_pmu_runs++;
-}
-
 // owned, not shared, while guest code runs — and put back afterwards.
 static void core2_run(void) {
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
@@ -709,10 +589,8 @@ static void core2_run(void) {
         asm volatile("dsb \n isb" ::: "memory");
     }
     azahar_progress = 3;
-    pmu_slice_start();
     const uint32_t reason = (uint32_t)azahar_enter(&azahar_ctx, azahar_host);
     azahar_progress = 42;
-    pmu_slice_end();
     if (pmr) {
         azahar_run_timer_left = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
@@ -819,23 +697,12 @@ static int core2_entry(SceSize args, void *argp) {
         azahar_core2_sp = sp;
     }
 
-    int pmu_on = 0;
-    PmuSave pmu;
     while (!azahar_stop) {
         azahar_heartbeat++;
         if (azahar_park) {
-            // PMCCNTR stops in WFI, so its delta across the park is awake cycles: ~250M per
-            // 0.5 s means spinning, a few thousand means sleeping between interrupts. The
-            // kernel's own idle accounting cannot see this — it counts Sony's idle thread,
-            // which never runs on a held core — so any overlay will read 100% regardless.
-            if (!pmu_on) {
-                pmu_begin(&pmu);
-                pmu_on = 1;
-            }
             // WFE, not WFI: a taken core sees no interrupt for seconds at a time, and the
             // next azaharTakeCore has to be able to wake this. SEV from any core does.
             asm volatile("wfe" ::: "memory");
-            azahar_park_cycles = rd_pmccntr();
             continue;
         }
         if (azahar_gic_va) {
@@ -1032,7 +899,6 @@ static int azahar_on_proc_gone(SceUID pid) {
     }
     log_open();
     emit("== client process gone (state %d)\n", azahar_state);
-    pmu_host_stop_all();
     if (azahar_folded) {
         free_blocks();
         azahar_state = ST_NONE;
@@ -1956,139 +1822,12 @@ out:
     return ret;
 }
 
-// The counters the release prints, readable while a title runs: how many SGI service
-// windows core 2 has opened, the last pending mask that opened one, how many timed out, and
-// the resident loop's heartbeat - so a freeze log's last second says whether core 2 was still
-// polling and whether a cross-core call had just been serviced or was pending.
-int azaharSgiStats(AzaharSgiStats *user_out) {
-    uint32_t state;
-    ENTER_SYSCALL(state);
-    AzaharSgiStats out;
-    out.windows = azahar_sgi_windows;
-    out.last_pend = azahar_sgi_last_pend;
-    out.stuck = azahar_sgi_stuck;
-    out.heartbeat = azahar_heartbeat;
-    out.installed = azahar_installed;
-    out.pending_now = 0;
-    out.core = azahar_on_core;
-    if (azahar_installed && gic_va) {
-        out.pending_now = *(volatile uint32_t *)(gic_va + GICD_ISPENDR0) & 0x7FFFu;
-    }
-    const int ret = ksceKernelCopyToUser(user_out, &out, sizeof(out)) < 0 ? AZAHAR_ERR_ARG : 0;
-    EXIT_SYSCALL(state);
-    return ret;
-}
-
-// Every thread of the client with the registers the kernel holds for it: where a thread
-// that stopped retiring work actually is. ksceKernelGetThreadCpuRegisters wants the thread
-// suspended, so each thread but the caller's is debug-suspended around the read and resumed
-// at once. This is what found the 2026-09-08 freeze (an overtaken notification wait).
-int azaharThreadDump(void) {
-    uint32_t state;
-    ENTER_SYSCALL(state);
-    int count = 0;
-    if (azahar_client_pid >= 0) {
-        log_open();
-        emit("== azaharThreadDump\n");
-        static SceUID ids[128];
-        int copied = 0;
-        if (ksceKernelGetThreadIdList(azahar_client_pid, ids, 128, &copied) >= 0) {
-            for (int i = 0; i < copied; i++) {
-                SceKernelThreadInfo info;
-                info.size = sizeof(info);
-                if (ksceKernelGetThreadInfo(ids[i], &info) < 0) {
-                    continue;
-                }
-                SceThreadCpuRegisters regs;
-                __builtin_memset(&regs, 0, sizeof(regs));
-                int r = -1;
-                if (ids[i] != ksceKernelGetThreadId()) {
-                    const int sus = ksceKernelDebugSuspendThread(ids[i], 0x100);
-                    r = ksceKernelGetThreadCpuRegisters(ids[i], &regs);
-                    if (sus >= 0) {
-                        ksceKernelDebugResumeThread(ids[i], 0x100);
-                    }
-                }
-                emit("  %-24s thid %08x status %x prio %3d cpu %d aff %05x wait %d/%08x  user pc %08x "
-                     "lr %08x sp %08x  kernel pc %08x lr %08x  (regs %d)\n",
-                     info.name, (uint32_t)ids[i], (uint32_t)info.status, info.currentPriority,
-                     info.lastExecutedCpuId, (uint32_t)info.currentCpuAffinityMask,
-                     (int)info.waitType, (uint32_t)info.waitId, regs.entry[0].pc, regs.entry[0].lr,
-                     regs.entry[0].sp, regs.entry[1].pc, regs.entry[1].lr, r);
-                count++;
-            }
-        }
-        log_close();
-    }
-    EXIT_SYSCALL(state);
-    return count;
-}
-
-int azaharPmuReadAll(AzaharPmuAll *user_out) {
-    uint32_t state;
-    ENTER_SYSCALL(state);
-    pmu_host_start();
-    AzaharPmuAll out;
-    for (unsigned c = 0; c < 4; c++) {
-        if (c == AZAHAR_TARGET_CORE) {
-            out.core[c].cycles = azahar_pmu_cycles;
-            for (unsigned i = 0; i < 6; i++) {
-                out.core[c].events[i] = azahar_pmu_ev[i];
-            }
-            out.core[c].runs = azahar_pmu_runs;
-            azahar_pmu_cycles = 0;
-            for (unsigned i = 0; i < 6; i++) {
-                azahar_pmu_ev[i] = 0;
-            }
-            azahar_pmu_runs = 0;
-        } else {
-            out.core[c].cycles = azahar_pmu_host_cycles[c];
-            for (unsigned i = 0; i < 6; i++) {
-                out.core[c].events[i] = azahar_pmu_host_ev[c][i];
-            }
-            out.core[c].runs = azahar_pmu_host_samples[c];
-            azahar_pmu_host_cycles[c] = 0;
-            for (unsigned i = 0; i < 6; i++) {
-                azahar_pmu_host_ev[c][i] = 0;
-            }
-            azahar_pmu_host_samples[c] = 0;
-        }
-        out.core[c].pad = 0;
-    }
-    const int ret = ksceKernelCopyToUser(user_out, &out, sizeof(out)) < 0 ? AZAHAR_ERR_ARG : 0;
-    EXIT_SYSCALL(state);
-    return ret;
-}
-
-int azaharPmuRead(AzaharPmuStats *user_out) {
-    uint32_t state;
-    ENTER_SYSCALL(state);
-    AzaharPmuStats out;
-    out.cycles = azahar_pmu_cycles;
-    for (unsigned i = 0; i < 6; i++) {
-        out.events[i] = azahar_pmu_ev[i];
-    }
-    out.runs = azahar_pmu_runs;
-    out.pad = 0;
-    azahar_pmu_cycles = 0;
-    for (unsigned i = 0; i < 6; i++) {
-        azahar_pmu_ev[i] = 0;
-    }
-    azahar_pmu_runs = 0;
-    // No log_open: this is called every second and has nothing to say.
-    const int ret = ksceKernelCopyToUser(user_out, &out, sizeof(out)) < 0 ? AZAHAR_ERR_ARG : 0;
-    EXIT_SYSCALL(state);
-    return ret;
-}
-
 int azaharRelease(void) {
     uint32_t state;
     ENTER_SYSCALL(state);
     log_open();
     emit("== azaharRelease\n");
     int ret = 0;
-
-    pmu_host_stop_all();
 
     if (azahar_folded) {
         if (azahar_state != ST_MAPPED && azahar_state != ST_TAKEN) {

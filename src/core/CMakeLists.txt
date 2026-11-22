@@ -548,23 +548,23 @@ if ("arm" IN_LIST ARCHITECTURE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(citra_core PRIVATE rt)
 endif()
 
-# The dyncom interpreter is the universal fallback CPU. On the PS Vita the native backend is
-# the whole point and interpreting a 3DS on a 444 MHz A9 is unusable, so it is never chosen on
-# hardware — but it is built there anyway, because it is the only backend that runs under the
-# Vita3K emulator, which cannot host the azahar-native kernel module (nor any self-modifying code).
-target_sources(citra_core PRIVATE
-        arm/dyncom/arm_dyncom.cpp
-        arm/dyncom/arm_dyncom.h
-        arm/dyncom/arm_dyncom_dec.cpp
-        arm/dyncom/arm_dyncom_dec.h
-        arm/dyncom/arm_dyncom_interpreter.cpp
-        arm/dyncom/arm_dyncom_interpreter.h
-        arm/dyncom/arm_dyncom_run.h
-        arm/dyncom/arm_dyncom_thumb.cpp
-        arm/dyncom/arm_dyncom_thumb.h
-        arm/dyncom/arm_dyncom_trans.cpp
-        arm/dyncom/arm_dyncom_trans.h
-)
+# The dyncom interpreter is the fallback CPU everywhere but the PS Vita, which runs guest code
+# natively and only natively.
+if (NOT VITA)
+    target_sources(citra_core PRIVATE
+            arm/dyncom/arm_dyncom.cpp
+            arm/dyncom/arm_dyncom.h
+            arm/dyncom/arm_dyncom_dec.cpp
+            arm/dyncom/arm_dyncom_dec.h
+            arm/dyncom/arm_dyncom_interpreter.cpp
+            arm/dyncom/arm_dyncom_interpreter.h
+            arm/dyncom/arm_dyncom_run.h
+            arm/dyncom/arm_dyncom_thumb.cpp
+            arm/dyncom/arm_dyncom_thumb.h
+            arm/dyncom/arm_dyncom_trans.cpp
+            arm/dyncom/arm_dyncom_trans.h
+    )
+endif()
 
 include(ExternalProject)
 
@@ -598,6 +598,7 @@ if (VITA)
         endif()
         set(VITA_NATIVE_BINARY_DIR "${CMAKE_BINARY_DIR}/vita_native")
         set(VITA_NATIVE_STUB_DIR "${VITA_NATIVE_BINARY_DIR}/stubs")
+        set(VITA_NATIVE_MODULE "${VITA_NATIVE_BINARY_DIR}/azaharnative.skprx")
         ExternalProject_Add(vita_native_module
             SOURCE_DIR "${CMAKE_SOURCE_DIR}/vita_native"
             BINARY_DIR "${VITA_NATIVE_BINARY_DIR}"
@@ -606,25 +607,45 @@ if (VITA)
                 "-DCMAKE_BUILD_TYPE=Release"
             BUILD_ALWAYS 1
             INSTALL_COMMAND ""
-            BUILD_BYPRODUCTS "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a"
+            BUILD_BYPRODUCTS
+                "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub_weak.a"
+                "${VITA_NATIVE_MODULE}"
         )
         add_dependencies(citra_core vita_native_module)
     endif()
     # A build directory configured before the module moved into the tree has the old path
     # cached, and the cache wins, so it would quietly go on pointing at a stub that is no
     # longer there - or worse, one that is. Say so rather than failing at link time.
-    if (NOT EXISTS "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a"
+    if (NOT EXISTS "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub_weak.a"
         AND NOT TARGET vita_native_module)
         message(FATAL_ERROR
             "VITA_NATIVE_STUB_DIR is set to ${VITA_NATIVE_STUB_DIR}, which holds no "
-            "libazaharnative_stub.a. If this is a build directory from before the module "
+            "libazaharnative_stub_weak.a. If this is a build directory from before the module "
             "moved into vita_native/, clear the entry to build it from the tree:\n"
             "  cmake -U VITA_NATIVE_STUB_DIR -B <build dir>")
     endif()
+    # The vpk carries the module (citra_vita/CMakeLists.txt). A module built on its own leaves
+    # the plugin one directory above its stubs; VITA_NATIVE_MODULE names it when it is elsewhere.
+    if (NOT VITA_NATIVE_MODULE)
+        get_filename_component(VITA_NATIVE_MODULE
+            "${VITA_NATIVE_STUB_DIR}/../azaharnative.skprx" ABSOLUTE)
+    endif()
+    if (NOT EXISTS "${VITA_NATIVE_MODULE}" AND NOT TARGET vita_native_module)
+        message(FATAL_ERROR
+            "No azaharnative.skprx at ${VITA_NATIVE_MODULE}, and the vpk carries it. "
+            "Point VITA_NATIVE_MODULE at the plugin built with the stubs in "
+            "${VITA_NATIVE_STUB_DIR}.")
+    endif()
     # An imported target rather than a bare path, so the dependency travels with the link.
+    #
+    # The weak stub, because the app starts before the module is loaded: it loads the module
+    # itself (LoadAzaharNative in citra_vita_main.cpp), and a strong import of a library that
+    # is not there yet stops the loader from starting the app at all. The plugin's path rides
+    # on the target so the vpk, in another directory, can find it.
     add_library(azaharnative_stub STATIC IMPORTED GLOBAL)
     set_target_properties(azaharnative_stub PROPERTIES
-        IMPORTED_LOCATION "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a")
+        IMPORTED_LOCATION "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub_weak.a"
+        AZAHAR_NATIVE_MODULE "${VITA_NATIVE_MODULE}")
     target_link_libraries(citra_core PUBLIC azaharnative_stub)
 endif()
 

@@ -1,19 +1,10 @@
-// azahar-native - the kernel side of azahar's ARM32 native execution on the PS Vita.
-//
-// The PS Vita is Sony's handheld games console (2011-2019). azahar is a Nintendo 3DS
-// emulator; this plugin lets it run the guest's ARM11 code on the Vita's own Cortex-A9
-// instead of interpreting or recompiling it, at the guest's own virtual addresses, under
-// translation tables and exception vectors this module owns. It loads through taiHEN, the
-// plugin framework Vita homebrew already uses, on a console its owner has opened themselves.
-// It has no networking and touches no system but the one it runs on.
-//
-// This file is the support half: the report buffer, the cp15 accessors, the address
-// translation helper, the performance-counter save and restore, the runtime export resolver,
-// and the discovery of the private peripheral block. native.c is the emulator half and holds
-// everything the exported calls do. They are one translation unit because the emulator half
-// uses these helpers on the taken core, where a call through a pointer into another object is
-// one more thing that can go wrong.
-//
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// azahar-native: the kernel side of azahar's ARM32 native execution on the PS Vita, run
+// under translation tables and exception vectors this module owns.
+// The support half (report, cp15, translation, export resolver, peripheral block); native.c
+// is the emulator half. One translation unit: the taken core avoids calls into other objects.
 // DEVELOPMENT.md describes how the whole thing works.
 
 #include <psp2kern/io/fcntl.h>
@@ -29,11 +20,11 @@
 #include <psp2kern/kernel/sysmem/memtype.h>
 #include <psp2kern/kernel/sysmem/uid_class.h>
 #include <psp2kern/kernel/threadmgr.h>
-#include <psp2kern/kernel/threadmgr/debugger.h>
 
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "azahar_native.h"
 
 int vsnprintf(char *s, size_t n, const char *fmt, va_list ap);
 
@@ -56,8 +47,6 @@ CP15_READ(ttbr1, c2, 0, c0, 1)
 CP15_READ(ttbcr, c2, 0, c0, 2)
 CP15_READ(dacr, c3, 0, c0, 0)
 CP15_READ(par, c7, 0, c4, 0)
-CP15_READ(pmcr, c9, 0, c12, 0)
-CP15_READ(pmccntr, c9, 0, c13, 0)
 CP15_READ(vbar, c12, 0, c0, 0)
 CP15_READ(contextidr, c13, 0, c0, 1)
 CP15_READ(mpidr, c0, 0, c0, 5)
@@ -65,33 +54,6 @@ CP15_READ(cbar, c15, 4, c0, 0)
 
 static inline void wr_cpacr(uint32_t v) {
     asm volatile("mcr p15, 0, %0, c1, c0, 2" ::"r"(v));
-    asm volatile("isb" ::: "memory");
-}
-
-// delta across the sample needs no reset.
-typedef struct {
-    uint32_t pmcr;
-    uint32_t cntenset;
-} PmuSave;
-
-static inline void pmu_begin(PmuSave *s) {
-    asm volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(s->pmcr));      // PMCR
-    asm volatile("mrc p15, 0, %0, c9, c12, 1" : "=r"(s->cntenset));  // PMCNTENSET
-    uint32_t v = s->pmcr;
-    v &= ~((1u << 5) | (1u << 3) | (1u << 2));   // DP=0 (count regardless), D=0 (no /64), C=0
-    v |= (1u << 0);                              // E=1 (enable the counters)
-    asm volatile("mcr p15, 0, %0, c9, c12, 0" ::"r"(v));
-    asm volatile("mcr p15, 0, %0, c9, c12, 1" ::"r"(0x80000000u));   // PMCNTENSET bit31
-    asm volatile("isb" ::: "memory");
-}
-
-static inline void pmu_end(const PmuSave *s) {
-    // PMCNTENSET only sets; clearing goes through PMCNTENCLR. Only undo the enable if the
-    // cycle counter was not already running when we arrived.
-    if (!(s->cntenset & 0x80000000u)) {
-        asm volatile("mcr p15, 0, %0, c9, c12, 2" ::"r"(0x80000000u));  // PMCNTENCLR bit31
-    }
-    asm volatile("mcr p15, 0, %0, c9, c12, 0" ::"r"(s->pmcr));
     asm volatile("isb" ::: "memory");
 }
 
@@ -369,6 +331,18 @@ int azaharVersion() {
 
 // ---------------------------------------------------------------------------- module
 
+int azaharModuleUid(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    tai_module_info_t info = {.size = sizeof(info)};
+    int ret = taiGetModuleInfoForKernel(AZAHAR_KERNEL_PID, "azaharnative", &info);
+    if (ret >= 0) {
+        ret = ksceKernelCreateUserUid(ksceKernelGetProcessId(), info.modid);
+    }
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
 int module_start(SceSize argc, const void *args) {
     (void)argc;
     (void)args;
@@ -378,9 +352,41 @@ int module_start(SceSize argc, const void *args) {
     return SCE_KERNEL_START_SUCCESS;
 }
 
+// Stopped only when no process holds any of it; nothing it registered or allocated outlives it.
 int module_stop(SceSize argc, const void *args) {
     (void)argc;
     (void)args;
+    if (azahar_state != ST_NONE || azahar_client_pid >= 0 || azahar_thread >= 0 ||
+        sgxd_state != SGXD_NONE || sgxd_owner >= 0 || sgxd_isr_ours || reback_owner >= 0 ||
+        shellcdram_pid >= 0 || shell_thread >= 0) {
+        ksceKernelPrintf("[azaharnative] stop refused: in use (state %d, sgxd %d)\n", azahar_state,
+                         sgxd_state);
+        return SCE_KERNEL_STOP_CANCEL;
+    }
+    if (azahar_proc_handler >= 0) {
+        ksceKernelUnregisterProcEventHandler(azahar_proc_handler);
+        azahar_proc_handler = -1;
+    }
+    if (sgxd_sysevent_uid >= 0) {
+        ksceKernelUnregisterSysEventHandler(sgxd_sysevent_uid);
+        sgxd_sysevent_uid = -1;
+    }
+    sgxd_unmap();
+    const SceUID blocks[] = {coresample_dbg_uid, reback_moved_uid};
+    for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
+        if (blocks[i] >= 0) {
+            ksceKernelFreeMemBlock(blocks[i]);
+        }
+    }
+    coresample_dbg_uid = reback_moved_uid = -1;
+    const SceUID mutexes[] = {sgxd_mutex, reback_mutex, azahar_edit_mutex};
+    for (unsigned i = 0; i < sizeof(mutexes) / sizeof(mutexes[0]); i++) {
+        if (mutexes[i] >= 0) {
+            ksceKernelDeleteMutex(mutexes[i]);
+        }
+    }
+    sgxd_mutex = reback_mutex = azahar_edit_mutex = -1;
+    ksceKernelPrintf("[azaharnative] stopped (version %d)\n", AZAHAR_NATIVE_VERSION);
     return SCE_KERNEL_STOP_SUCCESS;
 }
 

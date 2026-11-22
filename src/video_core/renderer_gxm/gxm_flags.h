@@ -14,21 +14,6 @@ namespace GxmRenderer {
  *
  *   logdraw   log one draw's state and first vertex per report, and the first few
  *             format-converting GPU blits with their rectangles
- *   gpuhud    the Razor GPU Live counters drawn over the game every frame (imgui, as
- *             vitaGL's debugger window). Selects the USSE overview group unless one of the
- *             gpulive switches below asked for another one
- *   gpulive, gpulive0, gpulive2, gpulive3
- *             Razor GPU Live without the on-screen counters: a [gpu] line once a second with
- *             the GPU's own job timings, the idle gaps between jobs, and one counter group.
- *             The hardware reports a single group at a time, so a run picks one and the
- *             fields belonging to the others read zero:
- *               gpulive   the USSE overview - fragment and vertex processing, and the
- *                         dependent and non-dependent texture read requests
- *               gpulive0  the parameter buffer - peak usage, partial renders, paused vertex
- *                         jobs, which together say whether a scene is being split
- *               gpulive2  pixels before and after hidden surface removal, and the vertex and
- *                         primitive counts: overdraw, and how much of it HSR removes
- *               gpulive3  tiling accelerator writes and ISP parameter fetch reads, in bytes
  *   notrim    keep every surface until the video memory pool is exhausted. The default gives
  *             up the least recently used surfaces once the pool is within 12 MB of its end
  *             (RasterizerCache::TrimSurfaces via RasterizerGxm::TrimSurfaceCache); a Smash

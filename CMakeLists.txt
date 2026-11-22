@@ -232,12 +232,10 @@ if (ENABLE_LTO)
 else()
     set(DEFAULT_VITA_DIAGNOSTICS ON)
 endif()
-option(ENABLE_VITA_DIAGNOSTICS "Compile in the Vita's logging, measurements and bring-up switches" ${DEFAULT_VITA_DIAGNOSTICS})
+option(ENABLE_VITA_DIAGNOSTICS "Compile in the Vita's logging and bring-up switches" ${DEFAULT_VITA_DIAGNOSTICS})
 if (ENABLE_VITA_DIAGNOSTICS)
     add_compile_definitions(VITA_DIAGNOSTICS)
 endif()
-
-option(ENABLE_VITA_RENDER_TRACE "Record where the Vita render thread is, for locating a hang" ${DEFAULT_VITA_DIAGNOSTICS})
 
 # Handle incompatible options for libretro builds
 if(ENABLE_LIBRETRO)

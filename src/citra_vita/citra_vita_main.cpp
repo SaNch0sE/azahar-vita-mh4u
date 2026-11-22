@@ -2,13 +2,17 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <string>
 #include <vector>
 #include <pthread.h>
 
+#include <fmt/format.h>
 #include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
 #include <psp2/kernel/clib.h>
@@ -19,6 +23,7 @@
 #include <psp2/power.h>
 #include <psp2/shellutil.h>
 #include <psp2/vshbridge.h>
+#include <taihen.h>
 #include "citra_vita/gxm_present.h"
 
 #include "citra_vita/emu_window_vita.h"
@@ -26,72 +31,9 @@
 
 #include "azahar_native.h"
 #include "common/named_thread.h"
-#include "common/pipeline_stats.h"
-#include "core/arm/vita/native_stats.h"
 
-#include <cstdint>
 #include <cstdio>
-#include <malloc.h>
-#include <psp2/io/stat.h>
 
-namespace {
-// One record per second, appended to ux0:data/azahar/perf.bin; read the file back with
-// src/citra_vita/tools/read_perf.py. The console keeps only the speed line - everything
-// else lives here, where a run's whole history survives instead of scrolling away.
-#pragma pack(push, 1)
-struct PerfFileHeader {
-    char magic[4]; // "AZPF"
-    std::uint32_t version;
-    std::uint32_t record_size;
-};
-
-struct PerfRecord {
-    std::uint64_t time_us;
-    float speed;
-    float fps;
-    std::uint32_t slices;
-    std::uint32_t svcs;
-    std::uint64_t guest_ns;
-    std::uint32_t gpu_ops;
-    std::uint32_t gpu_brakes;
-    std::uint64_t gpu_busy_ns;
-    std::uint64_t runloop_us;
-    /// Wall time inside the azaharRun syscall. Minus guest_ns it is what entering and leaving
-    /// the guest costs: the syscall itself, the two world switches and their TLB flushes.
-    std::uint64_t vanrun_us;
-    std::uint64_t present_us;
-    AzaharPmuStats pmu[4]; // zeros when the build carries no CITRA_VITA_PMU
-    // Version 2: the emulation thread's HLE and RunSync-drain time, and the GPU thread's
-    // swap-op and stripe-barrier time - the second-level decomposition of the two "busy
-    // asleep" totals above it.
-    std::uint64_t svc_us;
-    std::uint64_t drain_us;
-    std::uint32_t drain_count;
-    std::uint32_t barrier_count;
-    std::uint64_t gpu_swap_ns;
-    std::uint64_t barrier_ns;
-    // Version 4: how long a completion interrupt sits in the render thread's queue before it
-    // is posted - what a guest waiting on a fill or transfer has to sit through.
-    std::uint64_t irq_lag_us;
-    std::uint32_t irq_count;
-    std::uint32_t pad4;
-};
-#pragma pack(pop)
-// The reader (tools/read_perf.py) parses this layout by hand; keep the two in lockstep.
-static_assert(sizeof(PerfFileHeader) == 12);
-static_assert(sizeof(PerfRecord) == 384);
-
-FILE* OpenPerfFile() {
-    sceIoMkdir("ux0:data/azahar", 0777);
-    FILE* f = std::fopen("ux0:data/azahar/perf.bin", "wb");
-    if (f != nullptr) {
-        const PerfFileHeader hdr{{'A', 'Z', 'P', 'F'}, 5u, sizeof(PerfRecord)};
-        std::fwrite(&hdr, sizeof(hdr), 1, f);
-        std::fflush(f);
-    }
-    return f;
-}
-} // namespace
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/vita_ui.h"
 #include "common/file_util.h"
@@ -105,7 +47,6 @@ FILE* OpenPerfFile() {
 #include "core/frontend/image_interface.h"
 #include "core/hle/service/service.h"
 #include "core/movie.h"
-#include "pte_sema.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 
@@ -144,55 +85,13 @@ namespace {
 /// The process's own arguments, kept for LaunchParameter.
 std::vector<std::string> g_arguments;
 
-// Startup trace, to the kernel's printf channel (visible over the module logger / a PC). The
-// app was failing to launch with no on-screen detail; this says how far it got.
-#define VTRACE(...)                                                                                \
-    do {                                                                                           \
-        sceClibPrintf("[azahar] " __VA_ARGS__);                                                    \
-        sceClibPrintf("\n");                                                                       \
-    } while (0)
-
-#ifdef CITRA_VITA_PMU
-/// The kernel module's counters as one string: SGI service windows, the last pending mask,
-/// windows that timed out, what pends now, the resident loop's heartbeat, and the core-2
-/// eviction sweep (threads moved off the core, threads pinned to it alone, threads last run
-/// on it). Empty when the module does not answer.
-void FormatSgiStats(char* out, std::size_t size) {
-    out[0] = '\0';
-    AzaharSgiStats st{};
-    if (azaharSgiStats(&st) == 0) {
-        sceClibSnprintf(out, size, "  guest cpu%u  sgi w%u p%04x s%u pend%04x hb%u", st.core,
-                        st.windows, st.last_pend, st.stuck, st.pending_now, st.heartbeat);
-    }
-}
-
-/// Appended to the render-queue-stuck log (GpuThread::Enqueue), once a second while it lasts:
-/// the emulation thread is parked at the brake then and its own per-second line stops.
-void StuckReport() {
-    char sgi[128];
-    FormatSgiStats(sgi, sizeof(sgi));
-    const struct mallinfo heap = mallinfo();
-    sceClibPrintf("[azahar] stuck: heap %u/%u KiB%s\n", static_cast<unsigned>(heap.uordblks / 1024),
-                  static_cast<unsigned>(heap.arena / 1024), sgi);
-    // Where every thread is, into native.txt: the render thread's pc is the question.
-    static int dumps = 0;
-    if (dumps < 3) {
-        dumps++;
-        sceClibPrintf("[azahar] stuck: azaharThreadDump wrote %d threads to native.txt\n",
-                      azaharThreadDump());
-    }
-}
-#endif
-
-#ifdef VITA_ALLOC_TRACE
-extern "C" void VitaAllocTraceDump(void);
-extern "C" void VitaAllocTraceWatchThread(void);
-#else
-// So the call sites do not each need a guard: with the tracer off this folds away to nothing.
-inline void VitaAllocTraceDump() {}
-
-inline void VitaAllocTraceWatchThread() {}
-#endif
+/// Where the vpk puts the kernel module. The kernel opens the file itself, and app0: is this
+/// process's mount rather than a path the kernel resolves, so this is the installed copy.
+constexpr char AzaharNativePath[] = "ux0:app/" AZAHAR_VITA_TITLEID "/azaharnative.skprx";
+/// Marks the one restart that loading the module costs; see LoadAzaharNative.
+constexpr char RelaunchArgument[] = "--azaharnative-loaded";
+/// What LoadAzaharNative returned: empty, or the error EmulatorMain shows once it can.
+std::string g_native_error;
 
 constexpr char UserDirectory[] = "ux0:/data/azahar/";
 
@@ -279,8 +178,7 @@ std::string DescribeLoadError(Core::System::ResultStatus status) {
     case Core::System::ResultStatus::ErrorLoader_ErrorGbaTitle:
         return "GBA titles are not supported";
     case Core::System::ResultStatus::ErrorNotInitialized:
-        return "the CPU could not start: load the azahar-native kernel module (ux0:tai/config.txt) "
-               "and reboot";
+        return "the CPU could not start: azaharnative could not take a core";
     default:
         return "unknown error";
     }
@@ -299,18 +197,13 @@ void ShutdownSystem(Core::System& system) {
 /// rather than to return to the game list.
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
               const std::string& path) {
-    VTRACE("RunTitle: %s", path.c_str());
-
     window.UpdateCurrentFramebufferLayout();
 
     ui.SetStatusMessage("Loading...");
     ui.Update();
     window.Present(&ui);
 
-    VTRACE("RunTitle: system.Load");
     const auto load_result = system.Load(window, path);
-    VTRACE("RunTitle: system.Load -> %d", static_cast<int>(load_result));
-    VitaAllocTraceDump(); // what the load itself allocated
     if (load_result != Core::System::ResultStatus::Success) {
         LOG_CRITICAL(Frontend, "Could not load {}: {}", path, DescribeLoadError(load_result));
         ui.SetStatusMessage("Could not load this title: " + DescribeLoadError(load_result));
@@ -323,17 +216,6 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         return true;
     }
     ui.ClearStatusMessage();
-
-    // The window presents straight out of guest memory, so the renderer can skip its
-    // screen_infos conversion entirely.
-    system.GPU().Renderer().SetFrontendPresentsGuestMemory(true);
-    // Bring-up switch: frameskip drops top-screen draws when the render thread is behind,
-    // which is indistinguishable from a renderer that draws nothing until it is turned off.
-    system.GPU().SetFrameskipAllowed(!GxmRenderer::GxmFlag("noskip"));
-    // Bring-up switch: every operation the emulation thread queues is finished before it goes
-    // on, so nothing the guest writes can change under a draw the render thread has not run
-    // yet. A picture that comes right this way was being raced.
-    system.GPU().SetRenderThreadLockstep(GxmRenderer::GxmFlag("lockstep"));
 
 #ifdef VITA_DIAGNOSTICS
     // ux0:data/azahar/autoload.txt names a savestate slot to restore before the render thread
@@ -381,13 +263,11 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     }
 #endif
 
-    VTRACE("RunTitle: StartRenderThread");
     system.GPU().StartRenderThread();
     ui.EnterGame();
     // From here the GXM presentation layer belongs to the render thread, which draws the
     // interface along with the frame it has just finished.
     window.SetUi(&ui);
-    VTRACE("RunTitle: entering run loop");
 
     bool keep_running = true;
     bool combo_held = false;
@@ -438,15 +318,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             continue;
         }
 
-        // Periodic snapshot on the emulation thread, never from the allocation path.
-        static unsigned van_trace_tick = 0;
-        if ((++van_trace_tick % 600u) == 0u) {
-            VitaAllocTraceDump();
-        }
-        const SceUInt64 runloop_start = sceKernelGetProcessTimeWide();
         const auto status = system.RunLoop();
-        Core::NativeStats::runloop_us.fetch_add(sceKernelGetProcessTimeWide() - runloop_start,
-                                                std::memory_order_relaxed);
         if (status == Core::System::ResultStatus::ErrorSavestate) {
             // A refused save or load is not fatal; the title keeps running.
             LOG_ERROR(Frontend, "Savestate operation failed");
@@ -455,136 +327,56 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             break;
         }
 
-        // Once a second: the speed line to the console, the full record - GPU health, the
-        // emulation thread's time split, all four cores' PMU counters - to the perf blob.
-        // Everything measured once a second, and where it is printed. Compiled in only
-        // for the diagnostic build: the release build takes no clock readings, drains no
-        // counters, and prints nothing.
+        // Once a second, the figures the stats window shows. It reads them on the render thread.
         {
             static SceUInt64 last_perf_us = 0;
             const SceUInt64 now_us = sceKernelGetProcessTimeWide();
             if (now_us - last_perf_us >= 1000000ull) {
                 last_perf_us = now_us;
                 const auto perf = system.GetAndResetPerfStats();
-                const int speed = static_cast<int>(perf.emulation_speed * 100.0 + 0.5);
-                const int fps10 = static_cast<int>(perf.game_fps * 10.0 + 0.5);
-
-                const unsigned presented =
-                    Common::PipelineStats::presents.exchange(0, std::memory_order_relaxed);
-
+                using namespace VitaFrontend::HudStats;
+                speed_percent.store(
+                    static_cast<u32>(std::max(perf.emulation_speed * 100.0 + 0.5, 0.0)),
+                    std::memory_order_relaxed);
+                game_fps10.store(static_cast<u32>(std::max(perf.game_fps * 10.0 + 0.5, 0.0)),
+                                 std::memory_order_relaxed);
+                shown_fps.store(static_cast<u32>(std::max(perf.system_fps + 0.5, 0.0)),
+                                std::memory_order_relaxed);
+                valid.store(true, std::memory_order_release);
 #ifdef VITA_DIAGNOSTICS
-                // Frames the guest ran whose draws were dropped: the difference between
-                // this and the game's frame rate is what the renderer actually drew, which
-                // is the number to read against the presented rate.
-                static u64 skipped_total = 0;
-                const u64 skipped_now = system.GPU().SkippedFrames();
-                const unsigned skipped = static_cast<unsigned>(skipped_now - skipped_total);
-                skipped_total = skipped_now;
-                static FILE* const perf_file = OpenPerfFile();
-
-                PerfRecord rec{};
-                rec.time_us = now_us;
-                rec.speed = static_cast<float>(perf.emulation_speed);
-                rec.fps = static_cast<float>(perf.game_fps);
-                rec.slices = Core::NativeStats::slices.exchange(0);
-                rec.svcs = Core::NativeStats::svcs.exchange(0);
-                rec.guest_ns = Core::NativeStats::credited_ns.exchange(0);
-                rec.gpu_ops = Common::PipelineStats::gpu_ops.exchange(0);
-                rec.gpu_brakes = Common::PipelineStats::gpu_brakes.exchange(0);
-                rec.gpu_busy_ns = Common::PipelineStats::gpu_busy_us.exchange(0) * 1000ull;
-                rec.runloop_us = Core::NativeStats::runloop_us.exchange(0);
-                rec.vanrun_us = Core::NativeStats::vanrun_us.exchange(0);
-                rec.present_us = Core::NativeStats::present_us.exchange(0);
-                rec.svc_us = Core::NativeStats::svc_us.exchange(0);
-                rec.drain_us = Common::PipelineStats::drain_us.exchange(0);
-                rec.drain_count = Common::PipelineStats::drain_count.exchange(0);
-                rec.gpu_swap_ns = Common::PipelineStats::gpu_swap_us.exchange(0) * 1000ull;
-                rec.barrier_ns = Common::PipelineStats::barrier_us.exchange(0) * 1000ull;
-                rec.barrier_count = Common::PipelineStats::barrier_count.exchange(0);
-                rec.irq_lag_us = Common::PipelineStats::interrupt_lag_us.exchange(0);
-                rec.irq_count = Common::PipelineStats::interrupt_count.exchange(0);
-#ifdef CITRA_VITA_PMU
-                {
-                    AzaharPmuAll pmu;
-                    if (azaharPmuReadAll(&pmu) == 0) {
-                        for (unsigned c = 0; c < 4; c++) {
-                            rec.pmu[c] = pmu.core[c];
-                        }
-                    }
+                static const bool perflog = SgxdRenderer::SgxdFlag("perflog");
+                if (perflog) {
+                    // The vblank interval split as core/perf_stats.h measures it, in ms.
+                    LOG_INFO(Frontend,
+                             "perf: speed {:.1f}% game {:.1f} fps shown {:.1f} fps; vblank "
+                             "{:.2f} ms: svc {:.2f} ipc {:.2f} gpu {:.2f} swap {:.2f} rest {:.2f}",
+                             perf.emulation_speed * 100.0, perf.game_fps, perf.system_fps,
+                             perf.time_vblank_interval * 1e3, perf.time_hle_svc * 1e3,
+                             perf.time_hle_ipc * 1e3, perf.time_gpu * 1e3, perf.time_swap * 1e3,
+                             perf.time_remaining * 1e3);
+                    // The render thread's second, and the core's idle waits for it (ms).
+                    const auto r = system.GPU().TakeRenderStats();
+                    LOG_INFO(Frontend,
+                             "perf: render work {:.1f} ms in {} ops, present {:.1f} ms in {} "
+                             "({} dropped); idle wait {:.1f} ms in {}",
+                             r.work_us / 1e3, r.work_ops, r.present_us / 1e3, r.presents,
+                             r.presents_dropped, r.idle_wait_us / 1e3, r.idle_waits);
+                    LOG_INFO(Frontend,
+                             "perf: cmdlist {:.1f} ms in {}, regwrite {:.1f} ms in {}, fill "
+                             "{:.1f} ms in {}, transfer {:.1f} ms in {}",
+                             r.kind_us[0] / 1e3, r.kind_ops[0], r.kind_us[1] / 1e3, r.kind_ops[1],
+                             r.kind_us[2] / 1e3, r.kind_ops[2], r.kind_us[3] / 1e3, r.kind_ops[3]);
+                    const auto p = VitaFrontend::TakePresentTimes();
+                    LOG_INFO(Frontend,
+                             "perf: present ui update {:.1f} ms, screens {:.1f} ms, ui draw "
+                             "{:.1f} ms, end frame {:.1f} ms",
+                             p.ui_update / 1e3, p.screens / 1e3, p.ui_draw / 1e3,
+                             p.end_frame / 1e3);
+                    const auto c = GxmRenderer::SgxdTakeCacheTimes();
+                    LOG_INFO(Frontend, "perf: cache ops {:.1f} ms in {} for {} KiB", c.us / 1e3,
+                             c.calls, c.bytes / 1024);
                 }
 #endif
-                // sceClibPrintf has no reliable float formatting, so fixed-point by hand.
-                // Live heap, because a run that lasts long enough dies in std::bad_alloc and
-                // the rate of climb here is the only thing that says what is leaking. uordblks
-                // is what newlib has handed out and not got back; arena is what it took from
-                // the kernel, which only grows.
-                const struct mallinfo heap = mallinfo();
-                // Both empty unless the Vita tracing is built in.
-                char sema[64] = {};
-                char phase[128] = {};
-                // azahar-native's SGI service windows and core 2's heartbeat: a freeze log's last
-                // second says whether core 2 was still polling between commands, whether a
-                // cross-core call was pending, and whether a window ever timed out.
-                // Like azaharPmuReadAll, an import only a module new enough exports, so it sits
-                // behind the same VITA_PMU option (under Vita3K, which has no module, the
-                // import resolves to a stub that returns 0 and the fields print as zeros).
-                char sgi[128] = {};
-#ifdef CITRA_VITA_PMU
-                FormatSgiStats(sgi, sizeof(sgi));
-#endif
-#ifdef VITA_ALLOC_TRACE
-                unsigned sema_created = 0, sema_deleted = 0, sema_refused = 0;
-                VitaSemaTotals(&sema_created, &sema_deleted, &sema_refused);
-                sceClibSnprintf(sema, sizeof(sema), "  sema %d/%d (%u-%u)", VitaSemaLive(),
-                                VitaSemaPeak(), sema_created, sema_deleted);
-#endif
-#ifdef VITA_RENDER_TRACE
-                // The render thread's breadcrumb. It hangs without printing anything itself,
-                // and this line keeps coming for the few seconds before the queue reaches its
-                // ceiling and the brake parks the emulation thread too - so a phase that stops
-                // advancing while its age climbs names the call that never returned.
-                {
-                    const char* const where =
-                        Common::PipelineStats::render_phase.load(std::memory_order_relaxed);
-                    const u64 since =
-                        Common::PipelineStats::render_phase_us.load(std::memory_order_relaxed);
-                    const u64 now = Common::PipelineStats::NowUs();
-                    sceClibSnprintf(
-                        phase, sizeof(phase), "  render %s %llu us [%llu %llu %llu]", where,
-                        since != 0 && now > since ? now - since : 0,
-                        Common::PipelineStats::render_phase_a.load(std::memory_order_relaxed),
-                        Common::PipelineStats::render_phase_b.load(std::memory_order_relaxed),
-                        Common::PipelineStats::render_phase_c.load(std::memory_order_relaxed));
-                }
-#endif
-                const auto wt_stats = system.Memory().WriteTracker().TakeStats();
-                sceClibPrintf(
-                    "[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  "
-                    "slices %u (svc %u)  guest %u us  in %u us  wf %u wa %u wh %u  "
-                    "queue %u brake %u us  heap %u/%u KiB%s%s%s\n",
-                    speed, fps10 / 10, fps10 % 10, presented, skipped, rec.slices, rec.svcs,
-                    static_cast<unsigned>(rec.guest_ns / 1000),
-                    static_cast<unsigned>(rec.vanrun_us),
-                    Core::NativeStats::write_faults.exchange(0, std::memory_order_relaxed),
-                    static_cast<unsigned>(wt_stats.arms), static_cast<unsigned>(wt_stats.hot_skips),
-                    system.GPU().RenderQueueDepth(), rec.gpu_brakes,
-                    static_cast<unsigned>(heap.uordblks / 1024),
-                    static_cast<unsigned>(heap.arena / 1024), sema, phase, sgi);
-                if (perf_file != nullptr) {
-                    std::fwrite(&rec, sizeof(rec), 1, perf_file);
-                    std::fflush(perf_file);
-                }
-#endif // VITA_DIAGNOSTICS
-       // The stats window reads these on the render thread.
-                {
-                    using namespace VitaFrontend::HudStats;
-                    speed_percent.store(static_cast<u32>(std::max(speed, 0)),
-                                        std::memory_order_relaxed);
-                    game_fps10.store(static_cast<u32>(std::max(fps10, 0)),
-                                     std::memory_order_relaxed);
-                    shown_fps.store(presented, std::memory_order_relaxed);
-                    valid.store(true, std::memory_order_release);
-                }
             }
         }
         // Nothing to present from here: a finished frame is presented by the render thread
@@ -601,9 +393,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
  *
  * Two ways in, because there are two launchers. A LiveArea bubble or another application
  * starts this one with a `psgm:play?titleid=...&param=<path>` string, which arrives through
- * sceAppMgrGetAppParam. The Vita3K emulator, where the rendering is debugged off-console,
- * passes its --app-args as the process's own arguments instead. Empty when neither did:
- * then the list comes up as always.
+ * sceAppMgrGetAppParam. The Vita3K emulator passes its --app-args as the process's own
+ * arguments instead. Empty when neither did: then the list comes up as always.
  */
 std::string LaunchParameter() {
     if (!g_arguments.empty()) {
@@ -629,6 +420,117 @@ bool module_installed(const std::string& name) {
     return _vshKernelSearchModuleByName(name.c_str(), search_unk) >= 0;
 }
 
+/**
+ * Finds the marker LoadAzaharNative's restart carries. The argument after it, when there is
+ * one, is the launch parameter the first process was started with, which the restart would
+ * otherwise lose. The scan starts at argv[0] because nothing says whether the restarted
+ * process gets its own path there.
+ */
+bool TakeRelaunchArguments(int argc, char* argv[]) {
+    for (int i = 0; i < argc; ++i) {
+        if (argv[i] == nullptr || std::strcmp(argv[i], RelaunchArgument) != 0) {
+            continue;
+        }
+        if (i + 1 < argc && argv[i + 1] != nullptr && argv[i + 1][0] != '\0') {
+            g_arguments.emplace_back(argv[i + 1]);
+        }
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Makes sure the kernel module is loaded: the one already there, or the one the vpk carries,
+ * which takes the place of a loaded one that can be unloaded (UnloadAzaharNative).
+ *
+ * The app imports the module's calls through the weak stub, so it starts without the module.
+ * The loader binds a process's imports when the process loads, and nothing here counts on a
+ * library that arrives later being bound into a process that is already running. So the first
+ * start after a boot loads the module and starts the app again, and the second process binds
+ * to the module as it loads.
+ *
+ * Returns an empty string, or the error to show once a dialog can be shown. Does not return
+ * when it restarts the app.
+ */
+/// Stops and unloads the loaded azaharnative (`version`, AZAHAR_NATIVE_UNLOADABLE on): for this
+/// vpk's to take its place, or at the exit. True once it is gone. taiHEN takes the module by a UID
+/// of this process, which the module gives (the one its load gave may have been an earlier
+/// process's). This process is bound to it and makes no call into it after this; a restart binds
+/// to the module loaded then.
+bool UnloadAzaharNative(int version) {
+    const SceUID module = azaharModuleUid();
+    int stop = 0;
+    const int r =
+        module < 0 ? module : taiStopUnloadKernelModule(module, 0, nullptr, 0, nullptr, &stop);
+    sceClibPrintf("[azahar] azaharnative %d unloaded: 0x%08x, its stop %d\n", version,
+                  static_cast<u32>(r), stop);
+    return r >= 0 && !module_installed("azaharnative");
+}
+
+std::string LoadAzaharNative(bool relaunched) {
+    if (module_installed("azaharnative")) {
+        // A module stays loaded until it is unloaded or the console reboots. One that can be
+        // unloaded (AZAHAR_NATIVE_UNLOADABLE on) and is not this vpk's, an earlier or a later
+        // Azahar's, is replaced below; any other stops the start until a reboot.
+        const int loaded = azaharVersion();
+        const bool replaced = loaded != AZAHAR_NATIVE_VERSION &&
+                              loaded >= AZAHAR_NATIVE_UNLOADABLE && UnloadAzaharNative(loaded);
+        if (!replaced) {
+            if (loaded != AZAHAR_NATIVE_VERSION) {
+                // Version 1 is the first release's module, which taiHEN's config.txt loaded at
+                // boot; every later one comes with the vpk and is loaded here, at the launch.
+                if (loaded <= 1) {
+                    return "Remove the azaharnative.skprx line from your taiHEN config.txt "
+                           "(ux0:tai/config.txt or ur0:tai/config.txt), then reboot your "
+                           "console.";
+                }
+                // Retail firmware keeps a module that exports calls to user mode (a syscall
+                // export, as this one's are) loaded outside development mode: SceKernelModulemgr's
+                // stop answers 0x8002d002. This vpk's module is
+                // loaded by the next start after a reboot.
+                sceClibPrintf("[azahar] azaharnative %d stays loaded, this vpk's is %d: a reboot "
+                              "finishes the update\n",
+                              loaded, AZAHAR_NATIVE_VERSION);
+                return "Azahar was updated. Reboot your console to finish the update.";
+            }
+            // The kernel's printf text from here on reaches this app's TTY (klog.c).
+            SgxdRenderer::SgxdDrainKernelLog();
+            // sgxd's spins time out on the calling thread's cycle counter (azaharCycles): every
+            // thread of this process may read it, those that exist now and those created later.
+            if (const int cycles = azaharCycleCounter(); cycles < 0) {
+                return fmt::format("azaharCycleCounter failed ({:#010x}).",
+                                   static_cast<u32>(cycles));
+            }
+            return {};
+        }
+        return {};
+    }
+    const SceUID module = taiLoadStartKernelModule(AzaharNativePath, 0, nullptr, 0);
+    if (module < 0) {
+        return fmt::format("{} could not be loaded ({:#010x}). Reinstall the vpk.",
+                           AzaharNativePath, static_cast<u32>(module));
+    }
+    // Restarting a second time would not bind anything the first restart did not.
+    if (relaunched) {
+        return "azaharnative.skprx was loaded twice without the restarted app seeing it.";
+    }
+
+    std::string marker{RelaunchArgument};
+    std::string launch = LaunchParameter();
+    char* const args[] = {marker.data(), launch.empty() ? nullptr : launch.data(), nullptr};
+    const int exec = sceAppMgrLoadExec("app0:eboot.bin", args, nullptr);
+    if (exec >= 0) {
+        // The call returns once the restart is queued, and the system ends this process soon
+        // after. Wait for that rather than start an emulator whose calls are not bound.
+        for (int waited = 0; waited < 50; ++waited) {
+            sceKernelDelayThread(100 * 1000);
+        }
+    }
+    return fmt::format("azaharnative.skprx is loaded, but Azahar could not restart to use it "
+                       "({:#010x}). Start Azahar again.",
+                       static_cast<u32>(exec));
+}
+
 void show_error_dialog(const std::string& message) {
     SceMsgDialogUserMessageParam msg_param{};
     msg_param.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_OK;
@@ -649,25 +551,18 @@ void show_error_dialog(const std::string& message) {
 
 /// The emulator proper. Runs on a thread of its own; see main.
 int EmulatorMain() {
-    // Register this stack with the allocation tracer's overflow watch; see alloc_trace.c.
-    VitaAllocTraceWatchThread();
     // This thread drives the guest (which itself runs on the detached core 2, outside the
     // system scheduler) and feeds the render thread; RoleCore in common/thread.cpp lays out
     // which of the three schedulable cores each host thread gets.
     Common::SetCurrentThreadRole(Common::ThreadRole::Emulation);
 
-    VTRACE("EmulatorMain: clocks");
-    SetupClocks();
-    VTRACE("EmulatorMain: paths");
     SetupPaths();
-    VTRACE("EmulatorMain: logging");
     SetupLogging();
-    VTRACE("EmulatorMain: network");
     SetupNetwork();
 
-    VTRACE("EmulatorMain: GxmPresent::Initialize");
+    // What stops the start comes first, in the menus' language: before anything else is set up
+    // and before the startup notice. Closing it exits the app.
     if (!VitaFrontend::GxmPresent::Initialize()) {
-        VTRACE("EmulatorMain: GxmPresent::Initialize FAILED");
         LOG_CRITICAL(Frontend, "Could not bring up GXM");
         return -1;
     }
@@ -676,8 +571,8 @@ int EmulatorMain() {
         SceCommonDialogConfigParam dialog_config_param{};
         sceCommonDialogSetConfigParam(&dialog_config_param);
 
-        if (!module_installed("azaharnative")) {
-            show_error_dialog("azaharnative.skprx not installed. Check the release page.");
+        if (!g_native_error.empty()) {
+            show_error_dialog(g_native_error);
             return -1;
         }
 
@@ -686,13 +581,18 @@ int EmulatorMain() {
                               "https://github.com/GrapheneCt/CapUnlocker");
             return -1;
         }
-
-        if (azaharVersion() < MinAzaharNativeVersion) {
-            show_error_dialog(
-                "The installed azaharnative.skprx module is not compatible. Please update it.");
-            return -1;
-        }
     }
+
+    SetupClocks();
+#ifdef VITA_DIAGNOSTICS
+    // What SetupClocks got: the set calls' results are not checked.
+    LOG_INFO(Frontend, "clocks: ARM {} MHz, bus {} MHz, GPU {} MHz, GPU xbar {} MHz",
+             scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
+             scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
+#endif
+    MigrateNandLayout();
+    SetupNetwork();
+    VitaFrontend::Multiplayer::Init();
 
     // Presents never block this thread in a vblank wait: the display queue's own thread
     // does the flip and the wait, and submission only blocks past two pending flips - which
@@ -707,9 +607,7 @@ int EmulatorMain() {
                                                        SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN_2 |
                                                        SCE_SHELL_UTIL_LOCK_TYPE_QUICK_MENU));
 
-    VTRACE("EmulatorMain: shell lock");
     auto& system = Core::System::GetInstance();
-    VTRACE("EmulatorMain: got System instance");
 
     // The Vita has neither the memory nor the drivers for the LLE service modules. GXM is the
     // only renderer in this build: the software renderer was too slow on this
@@ -718,15 +616,11 @@ int EmulatorMain() {
         Settings::values.lle_modules.emplace(service_module.name, false);
     }
     Settings::values.graphics_api = Settings::GraphicsAPI::Gxm;
-    Settings::values.use_cpu_jit = false;
     Settings::values.disable_right_eye_render = true;
-    VTRACE("EmulatorMain: applets");
     Frontend::RegisterDefaultApplets(system);
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());
 
-    VTRACE("EmulatorMain: EmuWindowVita");
     VitaFrontend::EmuWindowVita window(system);
-    VTRACE("EmulatorMain: InitInput");
     // Not InputCommon::Init(): every factory it registers is one this frontend does not use.
     // The buttons and the circle pad come from the "vita" engine above, the touchscreen from
     // EmuWindow's own "emu_window" factory, and nothing here sets a motion device. What it would
@@ -735,12 +629,10 @@ int EmulatorMain() {
     // got. SDL is a null state in this build either way.
     VitaFrontend::InitInput(window);
 
-    VTRACE("EmulatorMain: Ui");
     VitaFrontend::Ui ui(system, window);
-    VTRACE("EmulatorMain: entering main loop");
 
-    VitaAllocTraceDump();
-
+    VitaFrontend::CrashReport::EnableRecovery(restart,
+                                              CommandChannel() ? command_file.LastSeq() : nullptr);
     bool running = true;
     if (const std::string launch = LaunchParameter(); !launch.empty()) {
         LOG_INFO(Frontend, "launch parameter names {}", launch);
@@ -776,22 +668,12 @@ int EmulatorMain() {
 } // Anonymous namespace
 
 int main(int argc, char* argv[]) {
-#ifdef CITRA_VITA_PMU
-    Common::PipelineStats::stuck_report.store(&StuckReport, std::memory_order_relaxed);
-#endif
+    const bool relaunched = TakeRelaunchArguments(argc, argv);
 #ifdef VITA_DIAGNOSTICS
-    // What the partition has left after newlib took the heap. The extended-memory mode
-    // (ATTRIBUTE2=12, ~365 MB) is only granted with every system app closed; without it the
-    // 240 MB heap overruns the plain partition and newlib silently has no heap at all.
+    // The extended-memory mode (ATTRIBUTE2=12, ~365 MB) is only granted with every system app
+    // closed; without it the 240 MB heap overruns the plain partition and newlib silently has
+    // no heap at all.
     {
-        SceKernelFreeMemorySizeInfo info{};
-        info.size = sizeof(info);
-        sceKernelGetFreeMemorySize(&info);
-        sceClibPrintf(
-            "[azahar] free memory after the heap: user %u KiB, cdram %u KiB, phycont %u KiB\n",
-            static_cast<unsigned>(info.size_user / 1024),
-            static_cast<unsigned>(info.size_cdram / 1024),
-            static_cast<unsigned>(info.size_phycont / 1024));
         void* probe = std::malloc(64);
         if (probe == nullptr) {
             sceClibPrintf("[azahar] the %u MB heap could not be allocated. The extended memory "
@@ -803,13 +685,16 @@ int main(int argc, char* argv[]) {
         }
         std::free(probe);
     }
-    for (int i = 1; i < argc; ++i) {
+    // A restart's arguments are its marker and the launch parameter, taken above.
+    for (int i = 1; i < argc && !relaunched; ++i) {
         if (argv[i] != nullptr && argv[i][0] != '\0') {
             g_arguments.emplace_back(argv[i]);
         }
     }
     SetupTerminateHandler();
 #endif
+    // Before anything is brought up, because the first start after a boot restarts from here.
+    g_native_error = LoadAzaharNative(relaunched);
     Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     // The process's own thread gets a stack sized for a homebrew launcher, and the global that
     // is supposed to change that does not work. Everything therefore runs on a thread created
@@ -826,6 +711,12 @@ int main(int argc, char* argv[]) {
                                        EmulatorMain};
         emu_thread.join();
     }
-
+    // Nothing of Azahar's stays in the kernel after an exit: the session gave everything back (the
+    // GPU at the frontend's shutdown, the core and the moved pages at the title's end), so the
+    // module stops, and the next launch loads it again. One that cannot be unloaded stays, and so
+    // does this one if its stop finds anything still held (the process's exit takes that back).
+    if (g_native_error.empty() && azaharVersion() >= AZAHAR_NATIVE_UNLOADABLE) {
+        UnloadAzaharNative(azaharVersion());
+    }
     return 0;
 }
