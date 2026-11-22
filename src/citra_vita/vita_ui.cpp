@@ -15,6 +15,8 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include <imgui_vita2d/imgui.h>
 #include <imgui_vita2d/imgui_internal.h>
+#include <psp2/io/devctl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 #include <psp2/rtc.h>
@@ -33,12 +35,16 @@
 #include "citra_vita/stats_hud.h"
 #include "citra_vita/vita_ui.h"
 #include "common/assert.h"
+#include "common/file_derived.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
 #include "core/cheats/cheat_base.h"
 #include "core/cheats/cheats.h"
 #include "core/core.h"
+#include "core/file_sys/cia_container.h"
+#include "core/file_sys/title_metadata.h"
+#include "core/hle/service/am/am.h"
 #include "core/loader/loader.h"
 #include "core/loader/smdh.h"
 #include "core/movie.h"
@@ -148,11 +154,42 @@ struct TitleInfo {
     bool has_icon{};
 };
 
+/// Whether the file is a CIA, plain or Z3DS-compressed: a title to install onto the emulated SD
+/// card, which the list then shows as an installed title.
+bool IsCiaFile(const std::string& name) {
+    const auto dot = name.rfind('.');
+    if (dot == std::string::npos) {
+        return false;
+    }
+    std::string extension = name.substr(dot);
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return extension == ".cia" || extension == ".zcia";
+}
+
+/// A CIA's header, ticket, TMD and SMDH, read through Z3DS where it is compressed. False when the
+/// file is no CIA.
+bool ReadCia(const std::string& path, FileSys::CIAContainer& container) {
+    std::unique_ptr<FileUtil::IOFileBase> file = std::make_unique<FileUtil::IOFile>(path, "rb");
+    if (FileUtil::Z3DSReadIOFile::GetUnderlyingFileMagic(file.get())) {
+        file = std::make_unique<FileUtil::Z3DSReadIOFile>(std::move(file));
+    }
+    return container.Load(file.get()) == Loader::ResultStatus::Success;
+}
+
 TitleInfo ReadTitleInfo(const std::string& path) {
-    const std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(path);
     std::vector<u8> smdh;
-    if (!loader || loader->ReadIcon(smdh) != Loader::ResultStatus::Success ||
-        !Loader::IsValidSMDH(smdh)) {
+    if (IsCiaFile(path)) {
+        // No loader opens a CIA: its SMDH is in its meta section.
+        FileSys::CIAContainer container;
+        if (ReadCia(path, container) && container.GetSMDH()) {
+            const auto* const data = reinterpret_cast<const u8*>(container.GetSMDH().get());
+            smdh.assign(data, data + sizeof(Loader::SMDH));
+        }
+    } else if (const std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(path)) {
+        loader->ReadIcon(smdh);
+    }
+    if (!Loader::IsValidSMDH(smdh)) {
         return {};
     }
     Loader::SMDH data;
@@ -194,8 +231,9 @@ std::vector<u32> LoadIcon(const std::string& path) {
 bool HasRomExtension(const std::string& name) {
     // Azahar's compressed forms too (Z3DS: .zcci, .zcxi, .z3dsx), which the loaders read as they
     // read the plain ones.
-    static constexpr const char* extensions[] = {".3ds", ".3dsx", ".cci",  ".cxi",  ".app",
-                                                 ".elf", ".axf",  ".zcci", ".zcxi", ".z3dsx"};
+    static constexpr const char* extensions[] = {".3ds",  ".3dsx",  ".cci", ".cxi",
+                                                 ".app",  ".elf",   ".axf", ".zcci",
+                                                 ".zcxi", ".z3dsx", ".cia", ".zcia"};
     const auto dot = name.rfind('.');
     if (dot == std::string::npos) {
         return false;
@@ -368,7 +406,7 @@ enum class Icon {
     Gauge,
     Speaker,
     Globe,
-    Refresh,
+    Install,
     Patch,
     Cheat,
 };
@@ -483,17 +521,17 @@ void DrawIcon(ImDrawList* dl, Icon icon, ImVec2 c, float size, ImU32 colour, ImU
         dl->PathStroke(colour, true, line);
         dl->AddLine(ImVec2(c.x - 0.4f * s, c.y), ImVec2(c.x + 0.4f * s, c.y), colour, line);
         break;
-    case Icon::Refresh: {
-        const float r = 0.32f * s;
-        const float start = -0.25f * IM_PI;
-        dl->PathArcTo(c, r, start + 0.35f, start + 1.75f * IM_PI, 20);
-        dl->PathStroke(colour, false, 0.09f * s);
-        // The arrow's head at the arc's start, pointing back along it.
-        const ImVec2 radial(std::cos(start + 0.35f), std::sin(start + 0.35f));
-        const ImVec2 back(radial.y, -radial.x);
-        const ImVec2 at = c + radial * r;
-        dl->AddTriangleFilled(at + back * (0.2f * s), at + radial * (0.15f * s),
-                              at - radial * (0.15f * s), colour);
+    case Icon::Install: {
+        // An arrow down into a tray, as a CIA's badge in the grid.
+        const float w = 0.09f * s;
+        dl->AddLine(c + ImVec2(0.0f, -0.38f * s), c + ImVec2(0.0f, 0.02f * s), colour, w);
+        dl->AddTriangleFilled(c + ImVec2(-0.2f * s, -0.02f * s), c + ImVec2(0.2f * s, -0.02f * s),
+                              c + ImVec2(0.0f, 0.2f * s), colour);
+        dl->PathLineTo(c + ImVec2(-0.36f * s, 0.1f * s));
+        dl->PathLineTo(c + ImVec2(-0.36f * s, 0.36f * s));
+        dl->PathLineTo(c + ImVec2(0.36f * s, 0.36f * s));
+        dl->PathLineTo(c + ImVec2(0.36f * s, 0.1f * s));
+        dl->PathStroke(colour, false, w);
         break;
     }
     case Icon::Patch: {
@@ -706,7 +744,7 @@ bool FooterButton(Glyph glyph, const char* label) {
     constexpr float R = 13.0f;
     const ImVec2 text = ImGui::CalcTextSize(label);
     const float glyph_width = GlyphWidth(glyph, R);
-    const ImVec2 size(glyph_width + 10.0f + text.x + 20.0f, FooterButtonHeight);
+    const ImVec2 size(glyph_width + 10.0f + text.x + 16.0f, FooterButtonHeight);
     const ImVec2 at = ImGui::GetCursorScreenPos();
     const bool pressed = ImGui::InvisibleButton(label, size, ImGuiButtonFlags_NoNavFocus);
     ImDrawList* const dl = ImGui::GetWindowDrawList();
@@ -716,7 +754,7 @@ bool FooterButton(Glyph glyph, const char* label) {
     DrawGlyph(dl, glyph, ImVec2(at.x + 10.0f + glyph_width * 0.5f, at.y + size.y * 0.5f), R);
     dl->AddText(ImVec2(at.x + 10.0f + glyph_width + 10.0f, at.y + (size.y - text.y) * 0.5f),
                 Colour(palette->Text), label);
-    ImGui::SameLine(0.0f, 12.0f);
+    ImGui::SameLine(0.0f, 8.0f);
     return pressed;
 }
 
@@ -822,7 +860,7 @@ bool IconCard(const char* label, Icon icon, ImVec2 size) {
 }
 
 float BarButtonWidth(const char* label) {
-    return 12.0f + 20.0f + 8.0f + ImGui::CalcTextSize(label).x + 14.0f;
+    return 10.0f + 20.0f + 8.0f + ImGui::CalcTextSize(label).x + 10.0f;
 }
 
 /// One of the game list's tools in its footer: an icon and a label on a pill, which the pad
@@ -839,7 +877,7 @@ bool BarButton(const char* label, Icon icon) {
             dl->AddRect(card.bb.Min + ImVec2(1.0f, 1.0f), card.bb.Max - ImVec2(1.0f, 1.0f),
                         Colour(palette->Accent), round, ImDrawCornerFlags_All, 2.5f);
         }
-        const ImVec2 icon_at(card.bb.Min.x + 22.0f, card.bb.GetCenter().y);
+        const ImVec2 icon_at(card.bb.Min.x + 20.0f, card.bb.GetCenter().y);
         DrawIcon(dl, icon, icon_at, 20.0f, Colour(palette->Accent), fill);
         const ImVec2 text = ImGui::CalcTextSize(label);
         dl->AddText(ImVec2(icon_at.x + 18.0f, card.bb.GetCenter().y - text.y * 0.5f),
@@ -974,15 +1012,23 @@ void Note(const ImVec4& dot, const std::string& text) {
 }
 
 const char* CategoryName(int category) {
-    static constexpr const char* names[] = {"Display", "Speed",   "Sound",
-                                            "System",  "Patches", "Cheats"};
+    static constexpr const char* names[] = {"Display", "Speed",  "Sound",    "System",
+                                            "Patches", "Cheats", "Installed"};
     return names[category];
 }
 
 Icon CategoryIcon(int category) {
-    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge, Icon::Speaker,
-                                     Icon::Globe,   Icon::Patch, Icon::Cheat};
+    static constexpr Icon icons[] = {Icon::Screens, Icon::Gauge, Icon::Speaker, Icon::Globe,
+                                     Icon::Patch,   Icon::Cheat, Icon::Disk};
     return icons[category];
+}
+
+u64 TreeSize(const FileUtil::FSTEntry& entry) {
+    u64 size = 0;
+    for (const FileUtil::FSTEntry& child : entry.children) {
+        size += child.isDirectory ? TreeSize(child) : child.size;
+    }
+    return size;
 }
 
 /// The title's program ID, as its file names it; 0 for a file without one (a 3DSX).
@@ -1184,6 +1230,24 @@ void Ui::ScanGames() {
             : std::string{};
     games.clear();
     bool cache_changed = false;
+    // A title's entry, `file` naming it where its SMDH has no name.
+    const auto add = [&](const std::string& path, u64 size, const std::string& file,
+                         const char* suffix) {
+        auto cached = title_cache.find(path);
+        if (cached == title_cache.end() || cached->second.size != size || cached->second.stale) {
+            TitleInfo info = ReadTitleInfo(path);
+            cached = title_cache
+                         .insert_or_assign(path, CachedTitle{size, std::move(info.name),
+                                                             std::move(info.publisher),
+                                                             info.has_icon, false})
+                         .first;
+            cache_changed = true;
+        }
+        const CachedTitle& title = cached->second;
+        games.push_back({path, title.name.empty() ? file + suffix : title.name + suffix,
+                         title.name.empty() ? std::string{} : file, title.publisher,
+                         title.has_icon, IsCiaFile(path)});
+    };
     const auto scan = [&](const char* directory, const char* suffix) {
         FileUtil::FSTEntry root;
         if (!FileUtil::ScanDirectoryTree(directory, root)) {
@@ -1191,26 +1255,9 @@ void Ui::ScanGames() {
             return;
         }
         for (const auto& entry : root.children) {
-            if (entry.isDirectory || !HasRomExtension(entry.virtualName)) {
-                continue;
+            if (!entry.isDirectory && HasRomExtension(entry.virtualName)) {
+                add(entry.physicalName, entry.size, entry.virtualName, suffix);
             }
-            auto cached = title_cache.find(entry.physicalName);
-            if (cached == title_cache.end() || cached->second.size != entry.size ||
-                cached->second.stale) {
-                TitleInfo info = ReadTitleInfo(entry.physicalName);
-                cached = title_cache
-                             .insert_or_assign(entry.physicalName,
-                                               CachedTitle{entry.size, std::move(info.name),
-                                                           std::move(info.publisher),
-                                                           info.has_icon, false})
-                             .first;
-                cache_changed = true;
-            }
-            const std::string file = entry.virtualName + suffix;
-            const CachedTitle& title = cached->second;
-            games.push_back({entry.physicalName, title.name.empty() ? file : title.name + suffix,
-                             title.name.empty() ? std::string{} : entry.virtualName,
-                             title.publisher, title.has_icon});
         }
     };
     scan(GameDirectory, "");
@@ -1220,6 +1267,27 @@ void Ui::ScanGames() {
 #ifdef VITA_DIAGNOSTICS
     scan(HostGameDirectory, " (host0)");
 #endif
+    // The titles installed from CIAs onto the emulated SD card, applications and demos, each by
+    // its boot content, named by its title ID where it has no SMDH.
+    const std::string title_root = Service::AM::GetMediaTitlePath(Service::FS::MediaType::SDMC);
+    for (const u32 high : {0x00040000u, 0x00040002u}) {
+        FileUtil::FSTEntry titles;
+        if (!FileUtil::ScanDirectoryTree(fmt::format("{}{:08x}", title_root, high), titles)) {
+            continue;
+        }
+        for (const auto& title : titles.children) {
+            if (!title.isDirectory) {
+                continue;
+            }
+            const u64 title_id =
+                u64{high} << 32 | std::strtoul(title.virtualName.c_str(), nullptr, 16);
+            const std::string content =
+                Service::AM::GetTitleContentPath(Service::FS::MediaType::SDMC, title_id);
+            if (const u64 size = content.empty() ? 0 : FileUtil::GetSize(content); size != 0) {
+                add(content, size, fmt::format("{:016X}", title_id), "");
+            }
+        }
+    }
     if (cache_changed) {
         SaveTitleCache();
     }
@@ -1234,6 +1302,11 @@ void Ui::ScanGames() {
         kept != games.end()
             ? static_cast<int>(kept - games.begin())
             : std::clamp(selected_game, 0, std::max(static_cast<int>(games.size()) - 1, 0));
+    // The grid's focus is a tile's place in the list: it moves to the title's new place at the
+    // next frame, as the page arrows' does (not off the tools, where the pad is).
+    if (!tools_focused) {
+        carousel_focus = selected_game;
+    }
     LOG_INFO(Frontend, "Found {} titles", games.size());
 }
 
@@ -1466,10 +1539,30 @@ void Ui::OpenSettings(std::string title, std::string name, State back, u64 progr
         const auto cheats = engine.GetCheats();
         settings_cheats.assign(cheats.begin(), cheats.end());
     }
+    // What of it is installed: from the game list only, never under a running title.
+    settings_installed.clear();
+    if (back == State::GameList && settings_program_id != 0) {
+        const u64 low = settings_program_id & 0xFFFFFFFF;
+        const bool application = settings_program_id >> 32 == 0x00040000;
+        const std::pair<const char*, u64> parts[] = {
+            {"Installed game", settings_program_id},
+            {"Update", application ? 0x0004000Eull << 32 | low : 0},
+            {"Downloadable content", application ? 0x0004008Cull << 32 | low : 0},
+        };
+        for (const auto& [kind, title_id] : parts) {
+            const std::string content =
+                Service::AM::GetTitlePath(Service::FS::MediaType::SDMC, title_id) + "content";
+            FileUtil::FSTEntry tree;
+            if (title_id != 0 && FileUtil::ScanDirectoryTree(content, tree, 2) != 0) {
+                settings_installed.push_back({kind, title_id, TreeSize(tree)});
+            }
+        }
+    }
     category = SettingsCategories().front();
     focused_row = -1;
     focused_patch = -1;
     focused_cheat = -1;
+    focused_installed = armed_installed = -1;
     focus_first_row = true;
     state = State::Settings;
     overlay_focused = false;
@@ -1484,11 +1577,12 @@ std::vector<Ui::Category> Ui::SettingsCategories() const {
         const bool has_rows =
             tab == Category::Patches  ? !settings_patches.empty()
             : tab == Category::Cheats ? settings_program_id != 0
-                                      : std::any_of(rows.begin(), rows.end(), [&](const Row& row) {
-                                            return row.category == tab &&
-                                                   (settings_title.empty() ||
-                                                    Config::PerTitle(row.option));
-                                        });
+            : tab == Category::Installed
+                ? !settings_installed.empty()
+                : std::any_of(rows.begin(), rows.end(), [&](const Row& row) {
+                      return row.category == tab &&
+                             (settings_title.empty() || Config::PerTitle(row.option));
+                  });
         if (has_rows) {
             shown.push_back(tab);
         }
@@ -1864,6 +1958,85 @@ void Ui::DrawCheatInfo() {
     Note(palette->TextDim, fmt::format("From {}.", file));
 }
 
+void Ui::DrawInstalledRow(std::size_t index) {
+    constexpr float Pad = 18.0f;
+
+    ImGui::PushID(static_cast<int>(index));
+    const InstalledPart part = settings_installed[index];
+    const bool armed = armed_installed == static_cast<int>(index);
+    const std::string size_text =
+        armed ? std::string{"Cross again to remove"}
+              : fmt::format("{} MiB", (part.size + 1024 * 1024 - 1) / (1024 * 1024));
+    const float width = ImGui::GetContentRegionAvail().x;
+    const Card card = CardItem("##installed", ImVec2(width, RowHeight));
+    if (focus_first_row) {
+        focus_first_row = false;
+        FocusLastItem();
+    }
+    if (ImGui::GetFocusID() == card.id) {
+        focused_installed = static_cast<int>(index);
+    } else if (armed) {
+        // Moving off a row disarms it.
+        armed_installed = -1;
+    }
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float mid = card.bb.GetCenter().y;
+        const ImVec2 label = ImGui::CalcTextSize(part.kind);
+        const ImVec2 size_size = ImGui::CalcTextSize(size_text.c_str());
+        dl->AddText(ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text),
+                    part.kind);
+        dl->AddText(ImVec2(card.bb.Max.x - Pad - size_size.x, mid - size_size.y * 0.5f),
+                    Colour(armed ? palette->Accent : palette->TextDim), size_text.c_str());
+    }
+    ImGui::PopID();
+    if (!card.pressed) {
+        return;
+    }
+    if (!armed) {
+        armed_installed = static_cast<int>(index);
+        return;
+    }
+    const Result result =
+        Service::AM::UninstallProgram(Service::FS::MediaType::SDMC, part.title_id);
+    LOG_INFO(Frontend, "Removed {} {:016X}: {:08X}", part.kind, part.title_id, result.raw);
+    settings_installed.erase(settings_installed.begin() + static_cast<std::ptrdiff_t>(index));
+    focused_installed = armed_installed = -1;
+    focus_first_row = true;
+    ScanGames();
+    // The installed game whose screen this is has left the list: back to it.
+    if (part.title_id == settings_program_id &&
+        settings_title == fmt::format("{:016x}", part.title_id)) {
+        state = settings_back;
+        overlay_focused = false;
+        return;
+    }
+    if (settings_installed.empty()) {
+        category = SettingsCategories().front();
+    }
+}
+
+void Ui::DrawInstalledInfo() {
+    if (focused_installed < 0) {
+        return;
+    }
+    const InstalledPart& part = settings_installed[static_cast<std::size_t>(focused_installed)];
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", part.kind);
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    const u32 high = static_cast<u32>(part.title_id >> 32);
+    ImGui::TextWrapped(
+        "%s", high == 0x0004000E
+                  ? "Installed from a CIA. Removing it takes the game back to its own version."
+              : high == 0x0004008C
+                  ? "Installed from a CIA. Removing it takes this content out of the game."
+                  : "Installed from a CIA. Removing it takes the game off the list.");
+    ImGui::Spacing();
+    Note(palette->TextDim, "Removing it keeps the game's save data.");
+    Note(palette->TextDim, fmt::format("Title {:016X}.", part.title_id));
+}
+
 void Ui::DrawRomFolderRows() {
     constexpr float Pad = 18.0f;
     const float width = ImGui::GetContentRegionAvail().x;
@@ -2013,13 +2186,17 @@ Ui::Action Ui::DrawSettings() {
     BeginBackdrop("##settings_backdrop", for_title ? Icon::Cartridge : Icon::Gear,
                   for_title ? "Game settings" : "Settings",
                   for_title ? settings_name : std::string{"All games"});
-    // The Patches tab changes nothing; the Cheats tab's rows are switches alone.
-    const bool option_rows = category != Category::Patches && category != Category::Cheats;
+    // The Patches tab changes nothing; the Cheats tab's rows are switches alone, the Installed
+    // tab's are removed.
+    const bool option_rows = category != Category::Patches && category != Category::Cheats &&
+                             category != Category::Installed;
     bool back = FooterButton(Glyph::Circle, "Back");
     if (option_rows) {
         FooterButton(Glyph::LeftRight, "Change");
     } else if (category == Category::Cheats && !settings_cheats.empty()) {
         FooterButton(Glyph::Cross, "On or off");
+    } else if (category == Category::Installed) {
+        FooterButton(Glyph::Cross, "Remove");
     }
     if (categories.size() > 1 && FooterButton(Glyph::Shoulders, "Tab") && !next_category) {
         const int at = static_cast<int>(current - categories.begin());
@@ -2064,6 +2241,7 @@ Ui::Action Ui::DrawSettings() {
         focused_row = -1;
         focused_patch = -1;
         focused_cheat = -1;
+        focused_installed = armed_installed = -1;
         focused_rom_folder = armed_rom_folder = -1;
         focus_first_row = true;
     }
@@ -2083,6 +2261,10 @@ Ui::Action Ui::DrawSettings() {
     } else if (category == Category::Cheats) {
         for (std::size_t i = 0; i < settings_cheats.size(); i++) {
             DrawCheatRow(i);
+        }
+    } else if (category == Category::Installed) {
+        for (std::size_t i = 0; i < settings_installed.size() && state == State::Settings; i++) {
+            DrawInstalledRow(i);
         }
     } else {
         for (std::size_t i = 0; i < rows.size(); i++) {
@@ -2105,6 +2287,8 @@ Ui::Action Ui::DrawSettings() {
         DrawPatchInfo();
     } else if (category == Category::Cheats) {
         DrawCheatInfo();
+    } else if (category == Category::Installed) {
+        DrawInstalledInfo();
     } else {
         DrawRowInfo();
     }
@@ -2235,7 +2419,7 @@ Ui::Action Ui::DrawGameList() {
 
         if (games.empty()) {
             const std::string text = fmt::format(
-                "No titles found. Copy .3ds or .cci files into {} and choose Rescan.",
+                "No titles found. Copy .3ds or .cci files into {}, or choose Install CIA.",
                 GameDirectory);
             const float width = ScreenWidth - 2.0f * (Margin + 24.0f);
             const ImVec2 size = ImGui::CalcTextSize(text.c_str(), nullptr, false, width);
@@ -2280,10 +2464,14 @@ Ui::Action Ui::DrawGameList() {
     const float bar_y = Footer + (FooterHeight - FooterButtonHeight) * 0.5f;
     ImGui::SetCursorScreenPos(ImVec2(Margin, bar_y));
     ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
-    bool start = !games.empty() && FooterButton(Glyph::Cross, "Open");
-    bool game_settings = !games.empty() && FooterButton(Glyph::Triangle, "Game settings");
+    // A CIA is installed rather than opened, and has no settings or bubble of its own.
+    const bool installer =
+        !games.empty() && games[static_cast<std::size_t>(selected_game)].installer;
+    bool start = !games.empty() && FooterButton(Glyph::Cross, installer ? "Install" : "Open");
+    bool game_settings =
+        !games.empty() && !installer && FooterButton(Glyph::Triangle, "Game settings");
     bool pin = false;
-    if (!games.empty()) {
+    if (!games.empty() && !installer) {
         const std::string& path = games[static_cast<std::size_t>(selected_game)].path;
         if (pin_checked_path != path) {
             pin_checked_path = path;
@@ -2294,9 +2482,9 @@ Ui::Action Ui::DrawGameList() {
     ImGui::PopItemFlag();
 
     // The tools at the footer's right, which the pad reaches down from the grid's lower row.
-    constexpr float ToolGap = 8.0f;
+    constexpr float ToolGap = 6.0f;
     ImGui::SetCursorScreenPos(ImVec2(ScreenWidth - Margin - BarButtonWidth("Settings") -
-                                         BarButtonWidth("Rescan") - BarButtonWidth("Exit") -
+                                         BarButtonWidth("Install CIA") - BarButtonWidth("Exit") -
                                          2.0f * ToolGap,
                                      bar_y));
     // The pad's selection on a tool, however it got there: a touch leaves ImGui's highlight off,
@@ -2310,8 +2498,10 @@ Ui::Action Ui::DrawGameList() {
     }
     on_tools |= tool_selected();
     ImGui::SameLine(0.0f, ToolGap);
-    if (BarButton("Rescan", Icon::Refresh)) {
-        ScanGames();
+    if (BarButton("Install CIA", Icon::Install)) {
+        OpenPickerDir(picker_dir.empty() ? std::string{GameDirectory} : picker_dir);
+        state = State::InstallPicker;
+        focus_first_row = true;
     }
     on_tools |= tool_selected();
     ImGui::SameLine(0.0f, ToolGap);
@@ -2469,6 +2659,16 @@ Ui::Action Ui::DrawGameList() {
             } else {
                 DrawIcon(dl, Icon::Cartridge, art.GetCenter(), 44.0f, Colour(palette->Icon), white);
             }
+            if (games[static_cast<std::size_t>(i)].installer) {
+                // A CIA's badge in the corner: an arrow down into a tray.
+                const ImVec2 c = card.bb.Max - ImVec2(15.0f, 15.0f);
+                const ImU32 mark = IM_COL32_WHITE;
+                dl->AddCircleFilled(c, 13.0f, Colour(palette->Accent), 20);
+                dl->AddLine(c + ImVec2(0.0f, -7.0f), c + ImVec2(0.0f, 1.0f), mark, 2.5f);
+                dl->AddTriangleFilled(c + ImVec2(-5.0f, -1.0f), c + ImVec2(5.0f, -1.0f),
+                                      c + ImVec2(0.0f, 5.0f), mark);
+                dl->AddLine(c + ImVec2(-7.0f, 7.0f), c + ImVec2(7.0f, 7.0f), mark, 2.0f);
+            }
             if (card.focused) {
                 DrawBrackets(dl, card.bb, Colour(palette->Accent));
             }
@@ -2490,7 +2690,9 @@ Ui::Action Ui::DrawGameList() {
         const float room = 560.0f;
         const std::string name = Fit(game.name, room);
         const std::string publisher =
-            game.publisher.empty() ? std::string{} : Fit(game.publisher, room);
+            game.installer          ? Fit("CIA file: install it to play", room)
+            : game.publisher.empty() ? std::string{}
+                                     : Fit(game.publisher, room);
         const ImVec2 name_size = ImGui::CalcTextSize(name.c_str());
         const ImVec2 publisher_size = ImGui::CalcTextSize(publisher.c_str());
         const float lines = publisher.empty() ? name_size.y : name_size.y + 4.0f + publisher_size.y;
@@ -2558,6 +2760,9 @@ Ui::Action Ui::DrawGameList() {
         return action;
     }
     const GameEntry& game = games[static_cast<std::size_t>(selected_game)];
+    if (game.installer) {
+        game_settings = pin = false;
+    }
     if (game_settings) {
         OpenSettings(Config::TitleKeyOf(game.path), game.name, State::GameList,
                      ProgramIdOf(game.path));
@@ -2566,9 +2771,98 @@ Ui::Action Ui::DrawGameList() {
         action = Action::TogglePin;
     } else if (start) {
         selected_game_path = game.path;
-        action = Action::LaunchGame;
+        action = game.installer ? Action::InstallTitle : Action::LaunchGame;
     }
     return action;
+}
+
+std::string Ui::InstallSelected(const std::function<void()>& present) {
+    GameEntry entry;
+    if (!picked_cia.empty()) {
+        // The Install CIA screen's: its file's name until the CIA's SMDH names it.
+        entry.path = std::exchange(picked_cia, {});
+        entry.name = std::string{FileUtil::GetFilename(entry.path)};
+    } else if (games.empty() || !games[static_cast<std::size_t>(selected_game)].installer) {
+        return "Choose a CIA to install.";
+    } else {
+        entry = games[static_cast<std::size_t>(selected_game)];
+    }
+    FileSys::CIAContainer container;
+    if (!ReadCia(entry.path, container)) {
+        LOG_ERROR(Frontend, "{} does not read as a CIA", entry.path);
+        return "This CIA cannot be read. Make it again from your game.";
+    }
+    const u64 title_id = container.GetTitleMetadata().GetTitleID();
+    // The contents against the memory card's free space: a title that does not fit would stop
+    // partway, minutes in.
+    const u64 needed = container.GetTitleMetadata().GetCombinedContentSize(container.GetHeader());
+    const std::string sdmc = FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir);
+    const std::string device = sdmc.substr(0, sdmc.find(':') + 1);
+    struct {
+        u64 max_size;
+        u64 free_size;
+        u32 cluster_size;
+        u32 unknown;
+    } space{};
+    if (sceIoDevctl(device.c_str(), 0x3001, nullptr, 0, &space, sizeof(space)) >= 0 &&
+        space.free_size < needed) {
+        LOG_ERROR(Frontend, "{} needs {} bytes on {}, {} are free", entry.path, needed, device,
+                  space.free_size);
+        constexpr u64 MiB = 1024 * 1024;
+        return fmt::format("Free {} MiB on the memory card, then install it again.",
+                           (needed - space.free_size + MiB - 1) / MiB);
+    }
+
+    SetStatusMessage(fmt::format("Installing {}...", entry.name));
+    SetProgress(0.0f);
+    present();
+    const u64 start = sceKernelGetProcessTimeWide();
+    u64 shown = start;
+    const Service::AM::InstallStatus status = Service::AM::InstallCIA(
+        entry.path, [&](std::size_t done, std::size_t total) {
+            const u64 now = sceKernelGetProcessTimeWide();
+            if (now - shown < 100'000 || total == 0) {
+                return;
+            }
+            shown = now;
+            SetProgress(static_cast<float>(done) / static_cast<float>(total));
+            present();
+        });
+    LOG_INFO(Frontend, "Install of {} ({:016X}, {} bytes): status {} after {} ms", entry.path,
+             title_id, needed, static_cast<u32>(status),
+             (sceKernelGetProcessTimeWide() - start) / 1000);
+    switch (status) {
+    case Service::AM::InstallStatus::Success:
+        break;
+    case Service::AM::InstallStatus::ErrorEncrypted:
+        return "Decrypt this CIA, then install it again.";
+    case Service::AM::InstallStatus::ErrorInvalid:
+        return "This CIA cannot be read. Make it again from your game.";
+    case Service::AM::InstallStatus::ErrorAborted:
+        return "The install stopped. Install the CIA again.";
+    default:
+        return "This CIA is gone. Choose it again with Install CIA.";
+    }
+
+    // The installed title in the list, selected (an update or DLC adds none: its game uses it).
+    ScanGames();
+    const std::string content =
+        Service::AM::GetTitleContentPath(Service::FS::MediaType::SDMC, title_id);
+    for (std::size_t i = 0; i < games.size(); i++) {
+        if (games[i].path == content) {
+            selected_game = static_cast<int>(i);
+            carousel_focus = selected_game;
+            tools_focused = false;
+        }
+    }
+    switch (title_id >> 32) {
+    case 0x0004000E:
+        return fmt::format("{}: its update is installed.", entry.name);
+    case 0x0004008C:
+        return fmt::format("{}: its downloadable content is installed.", entry.name);
+    default:
+        return fmt::format("{} is installed.", entry.name);
+    }
 }
 
 Ui::Action Ui::DrawPauseMenu() {
@@ -2729,6 +3023,143 @@ Ui::Action Ui::DrawSavestates() {
         state = State::Pause;
         overlay_focused = false;
         focus_first_row = true;
+    }
+    return action;
+}
+
+void Ui::OpenPickerDir(std::string dir) {
+    picker_dir = std::move(dir);
+    picker_entries.clear();
+    if (picker_dir.empty()) {
+        // The memory devices that are there, Emu4VitaPlus's: the memory card, a USB or SD2Vita
+        // card, the system's user storage, the internal memory card, and host0. A device
+        // is there when its root stats (opening the root as a folder misses mounted ones).
+        for (const char* device : {"ux0:", "uma0:", "ur0:", "imc0:", "xmc0:", "host0:"}) {
+            if (SceIoStat stat{}; sceIoGetstat(device, &stat) >= 0) {
+                picker_entries.push_back({device, device, 0, true});
+            }
+        }
+        return;
+    }
+    FileUtil::FSTEntry root;
+    if (FileUtil::ScanDirectoryTree(picker_dir, root) == 0 && !FileUtil::IsDirectory(picker_dir)) {
+        // A folder gone (the card taken out): its device's list instead.
+        OpenPickerDir({});
+        return;
+    }
+    for (const auto& entry : root.children) {
+        // Adding a ROM folder, the titles the game list would take from it.
+        if (entry.isDirectory ||
+            (picker_folders ? HasRomExtension(entry.virtualName) : IsCiaFile(entry.virtualName))) {
+            picker_entries.push_back(
+                {entry.virtualName, entry.physicalName, entry.size, entry.isDirectory});
+        }
+    }
+    // Folders first, then the files, each by name as the game list orders titles.
+    std::sort(picker_entries.begin(), picker_entries.end(),
+              [](const PickerEntry& a, const PickerEntry& b) {
+                  return a.folder != b.folder ? a.folder : NaturalLess(a.name, b.name);
+              });
+}
+
+Ui::Action Ui::DrawInstallPicker() {
+    Action action = Action::None;
+    BeginBackdrop("##picker_backdrop", Icon::Install, "Install CIA",
+                  picker_dir.empty() ? std::string{"Memory devices"} : picker_dir);
+    bool back = FooterButton(Glyph::Circle, picker_dir.empty() ? "Back" : "Parent folder");
+    const bool open = FooterButton(Glyph::Cross, "Open");
+    // In a folder, triangle leaves at once: back only goes up a folder.
+    bool close = !picker_dir.empty() && FooterButton(Glyph::Triangle, Tr("Close"));
+    bool add =
+        picker_folders && !picker_dir.empty() && FooterButton(Glyph::Square, Tr("Add this folder"));
+    EndBackdrop();
+
+    BeginList("##picker", ImVec2(Margin - 4.0f, HeaderHeight + 8.0f),
+              ImVec2(ScreenWidth - Margin + 4.0f, ScreenHeight - FooterHeight - 8.0f));
+    const float width = ImGui::GetContentRegionAvail().x;
+    std::optional<PickerEntry> chosen;
+    for (std::size_t i = 0; i < picker_entries.size(); i++) {
+        const PickerEntry& entry = picker_entries[i];
+        ImGui::PushID(static_cast<int>(i));
+        const Card card = CardItem("##entry", ImVec2(width, RowHeight));
+        if (focus_first_row && i == 0) {
+            focus_first_row = false;
+            FocusLastItem();
+        }
+        if (card.visible) {
+            ImDrawList* const dl = ImGui::GetWindowDrawList();
+            const ImU32 under = Colour(card.focused ? palette->RowFocused : palette->Row);
+            const float mid = card.bb.GetCenter().y;
+            const Icon icon = entry.folder     ? Icon::Disk
+                              : picker_folders ? Icon::Cartridge
+                                               : Icon::Install;
+            DrawIcon(dl, icon, ImVec2(card.bb.Min.x + 30.0f, mid), 24.0f, Colour(palette->Accent),
+                     under);
+            // A file's size at the right, in MiB as the install's free-space check counts.
+            std::string size;
+            if (!entry.folder) {
+                size = fmt::format("{:.1f} MiB", static_cast<double>(entry.size) / (1024.0 * 1024.0));
+            }
+            const float size_width = ImGui::CalcTextSize(size.c_str()).x;
+            const std::string name = Fit(entry.name, width - 90.0f - size_width);
+            const float y = mid - ImGui::GetFontSize() * 0.5f;
+            dl->AddText(ImVec2(card.bb.Min.x + 56.0f, y), Colour(palette->Text), name.c_str());
+            if (!size.empty()) {
+                dl->AddText(ImVec2(card.bb.Max.x - 18.0f - size_width, y),
+                            Colour(palette->TextDim), size.c_str());
+            }
+        }
+        // The row pressed, or the selected one when the footer's Open is touched.
+        if (card.pressed || (open && card.focused)) {
+            chosen = entry;
+        }
+        ImGui::PopID();
+    }
+    if (picker_entries.empty()) {
+        ImGui::TextColored(palette->TextDim, "No folders or CIA files here.");
+    }
+    back |= BackPressed();
+    close |= !picker_dir.empty() && overlay_focused &&
+             ImGui::IsNavInputTest(ImGuiNavInput_Input, ImGuiInputReadMode_Pressed);
+    add |= picker_folders && !picker_dir.empty() && overlay_focused &&
+           ImGui::IsNavInputTest(ImGuiNavInput_Menu, ImGuiInputReadMode_Pressed);
+    overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    ImGui::End();
+
+    if (add) {
+        // Listed already, or the default folder: the settings show the list as it is.
+        if (Config::AddRomFolder(picker_dir)) {
+            LOG_INFO(Frontend, "ROM folder {} added", picker_dir);
+            Config::Save();
+            ScanGames();
+        }
+        ClosePicker();
+    } else if (chosen && chosen->folder) {
+        OpenPickerDir(chosen->path);
+        focus_first_row = true;
+    } else if (chosen && !picker_folders) {
+        picked_cia = chosen->path;
+        state = State::GameList;
+        overlay_focused = false;
+        action = Action::InstallTitle;
+    } else if (close) {
+        // Install CIA's folder is kept: the screen opens on it again.
+        ClosePicker();
+    } else if (back && !picker_dir.empty()) {
+        // Up a folder ("ux0:/data/azahar" to "ux0:/data", "ux0:/data" to "ux0:"), and from a
+        // device's root to the devices.
+        const std::size_t colon = picker_dir.find(':');
+        const std::size_t slash = picker_dir.find_last_of('/');
+        std::string up;
+        if (slash != std::string::npos && slash > colon + 1) {
+            up = picker_dir.substr(0, slash);
+        } else if (picker_dir.size() > colon + 2) {
+            up = picker_dir.substr(0, colon + 1);
+        }
+        OpenPickerDir(std::move(up));
+        focus_first_row = true;
+    } else if (back) {
+        ClosePicker();
     }
     return action;
 }
@@ -2986,6 +3417,9 @@ Ui::Action Ui::Update() {
             break;
         case State::Multiplayer:
             action = DrawMultiplayer();
+            break;
+        case State::InstallPicker:
+            action = DrawInstallPicker();
             break;
         }
     }

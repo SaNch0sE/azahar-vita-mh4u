@@ -97,7 +97,8 @@ void Load();
 void Save();
 
 /// The key a title's own values are kept under: its file's name, the same in the game list and
-/// at the launch, and each file its own.
+/// at the launch, and each file its own; for a title installed onto the emulated SD card, whose
+/// contents are all named by number, its title ID.
 [[nodiscard]] std::string TitleKeyOf(const std::string& path);
 
 /// Makes `title`'s own values the effective ones (an empty key: none, the values for all games),

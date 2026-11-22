@@ -2436,6 +2436,28 @@ int EmulatorMain() {
     if (running) {
         banner.Start(VitaFrontend::Ui::BannerRect());
     }
+    // A frame of the game list, for a busy stretch (a pin, an install): the loop is alive.
+    const auto present_list = [&] {
+        VitaFrontend::CrashReport::StallWatchBeat();
+        window.PollEvents();
+        banner.Frame(ui.BannerTitle(), VitaFrontend::Ui::BannerBackdrop());
+        ui.Update();
+        window.Present(&ui);
+    };
+    // An outcome as the status message, for two seconds, as a load's failure.
+    const auto show_outcome = [&](std::string message) {
+        ui.SetStatusMessage(std::move(message));
+        for (int i = 0; i < 120; i++) {
+            present_list();
+            sceDisplayWaitVblankStart();
+        }
+        ui.ClearStatusMessage();
+    };
+    const auto install_selected = [&] {
+        std::string outcome = ui.InstallSelected(present_list);
+        sceClibPrintf("[azahar] install: %s\n", outcome.c_str());
+        show_outcome(std::move(outcome));
+    };
     while (running && !window.IsQuitRequested()) {
         window.PollEvents();
         // The banner before the interface: the list leaves the panel open for the banner as the
@@ -2460,18 +2482,12 @@ int EmulatorMain() {
             banner.Frame(ui.BannerTitle(), VitaFrontend::Ui::BannerBackdrop());
             ui.Update();
             window.Present(&ui);
-            ui.SetStatusMessage(ui.TogglePin());
-            // The outcome for two seconds, as a load's failure.
-            for (int i = 0; i < 120; i++) {
-                window.PollEvents();
-                banner.Frame(ui.BannerTitle(), VitaFrontend::Ui::BannerBackdrop());
-                ui.Update();
-                window.Present(&ui);
-                sceDisplayWaitVblankStart();
-            }
-            ui.ClearStatusMessage();
+            show_outcome(ui.TogglePin());
             break;
         }
+        case VitaFrontend::Ui::Action::InstallTitle:
+            install_selected();
+            break;
         default:
             break;
         }
@@ -2483,6 +2499,17 @@ int EmulatorMain() {
             const bool found = ui.SelectTitle(command.substr(7));
             sceClibPrintf("[azahar] %s: %s (command)\n", command.c_str(),
                           found ? "selected" : "no such title");
+        } else if (command == "rescan") {
+            ui.ScanGames();
+            sceClibPrintf("[azahar] rescan (command)\n");
+        } else if (command.starts_with("install ")) {
+            // The CIA whose name or path holds the text, installed as the list's cross does.
+            if (ui.SelectTitle(command.substr(8))) {
+                sceClibPrintf("[azahar] %s (command)\n", command.c_str());
+                install_selected();
+            } else {
+                sceClibPrintf("[azahar] %s: no such title (command)\n", command.c_str());
+            }
         } else if (command == "exit") {
             running = false;
         } else if (!command.empty() && !RunSettingCommand(command) &&

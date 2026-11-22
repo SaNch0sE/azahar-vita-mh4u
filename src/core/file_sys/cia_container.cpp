@@ -282,8 +282,10 @@ u64 CIAContainer::GetTotalContentSize() const {
 }
 
 u64 CIAContainer::GetContentSize(std::size_t index) const {
-    // If the content doesn't exist in the CIA, it doesn't have a size.
-    if (!cia_header.IsContentPresent(index)) {
+    // If the content doesn't exist in the CIA, it doesn't have a size. The header marks contents
+    // by their content index, which skips numbers where a title has no such content (a CCI's
+    // conversion without a manual has records 0 and 2).
+    if (!cia_header.IsContentPresent(cia_tmd.GetContentIndexByIndex(index))) {
         return 0;
     }
 

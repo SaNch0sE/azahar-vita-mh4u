@@ -411,6 +411,12 @@ void Save() {
 }
 
 std::string TitleKeyOf(const std::string& path) {
+    // An installed content: .../title/<high>/<low>/content/<id>.app.
+    if (const auto at = path.rfind("/title/");
+        at != std::string::npos && path.size() > at + 25 && path[at + 15] == '/' &&
+        path.compare(at + 24, 9, "/content/") == 0) {
+        return path.substr(at + 7, 8) + path.substr(at + 16, 8);
+    }
     return std::string{FileUtil::GetFilename(path)};
 }
 

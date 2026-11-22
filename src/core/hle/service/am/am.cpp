@@ -1223,8 +1223,10 @@ InstallStatus InstallCIA(const std::string& path,
             return InstallStatus::ErrorEncrypted;
         }
 
+        // A round of 1 MiB: on a Vita's memory card each read and write costs tens of ms whatever
+        // its size, and rounds of 64 KiB installed at 1.8 MB/s.
         std::vector<u8> buffer;
-        buffer.resize(0x10000);
+        buffer.resize(0x100000);
         auto file_size = in_file->GetSize();
         std::size_t total_bytes_read = 0;
         while (total_bytes_read != file_size) {
@@ -1297,6 +1299,9 @@ InstallStatus CheckCIAToInstall(const std::string& path, bool& is_compressed,
             }
 
             for (size_t i = 0; i < tmd.GetContentCount(); i++) {
+                if (container.GetContentSize(i) == 0) {
+                    continue;
+                }
                 u64 offset = container.GetContentOffset(i);
                 NCCH_Header ncch;
                 const auto read = in_file->ReadAtBytes(&ncch, sizeof(ncch), offset);

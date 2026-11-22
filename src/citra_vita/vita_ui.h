@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -70,6 +71,7 @@ public:
         SaveState,
         LoadState,
         TogglePin,
+        InstallTitle,
     };
 
     explicit Ui(Core::System& system, EmuWindowVita& window);
@@ -89,6 +91,16 @@ public:
     }
 
     std::string TogglePin();
+
+    /// Installs the CIA the Install CIA screen chose, else the selected one, onto the emulated SD
+    /// card (Service::AM::InstallCIA), its progress shown through `present` (which draws the
+    /// interface), then lists the title it installed and selects it: what happened, for the
+    /// status message. After Action::InstallTitle.
+    std::string InstallSelected(const std::function<void()>& present);
+
+    /// Lists the titles again (at the start, after an install, the command channel's `rescan`),
+    /// keeping the selected one selected.
+    void ScanGames();
 
     /// The savestate slot the user chose, valid after Action::SaveState / Action::LoadState.
     [[nodiscard]] u32 SelectedSlot() const {
@@ -121,10 +133,11 @@ private:
         Pause,
         Savestates,
         Multiplayer,
+        InstallPicker,
     };
 
-    /// The settings screen's groups, its tabs. Patches and Cheats hold no rows: a title's
-    /// built-in patches, and its cheat file's cheats.
+    /// The settings screen's groups, its tabs. Patches, Cheats and Installed hold no rows: a
+    /// title's built-in patches, its cheat file's cheats, and what of it is installed.
     enum class Category {
         Display,
         Speed,
@@ -132,6 +145,7 @@ private:
         System,
         Patches,
         Cheats,
+        Installed,
         Count,
     };
 
@@ -159,6 +173,7 @@ private:
         std::string file; ///< the file's name under the title's; empty when `name` is it
         std::string publisher; ///< its SMDH's, or empty
         bool has_icon{};       ///< its SMDH's large icon is in the icon cache
+        bool installer{};      ///< a CIA, which the list installs instead of opening
     };
     /// The titles' names read from their SMDH, by path, with the file's size they were read at: a
     /// scan reads only files new or changed since.
@@ -192,7 +207,6 @@ private:
     std::vector<Core::SaveStateInfo> slot_states;
 
     void BuildRows();
-    void ScanGames();
 
     /// Opens the settings screen on the values for all games (an empty `title`) or the title's
     /// own (`name`: what the screen calls it; `program_id`: its patches'). Back returns to `back`.
@@ -203,6 +217,28 @@ private:
     Action DrawPauseMenu();
     Action DrawSavestates();
     Action DrawMultiplayer();
+    /// The Install CIA screen: the memory devices, then a folder's folders and CIA files; a
+    /// file's cross installs it (picked_cia, Action::InstallTitle). With picker_folders, the Add
+    /// ROM folder screen: folders and the titles in them, square adding the folder shown.
+    Action DrawInstallPicker();
+    void OpenPickerDir(std::string dir);
+    void OpenRomFolderPicker();
+    /// Leaves the picker: for the game list, or for the settings when it chose a ROM folder
+    /// (Install CIA's folder in picker_dir again).
+    void ClosePicker();
+    struct PickerEntry {
+        std::string name;
+        std::string path;
+        u64 size{};
+        bool folder{};
+    };
+    std::string picker_dir; ///< the folder shown, kept for the next time the screen opens
+    /// The picker chooses a ROM folder for the settings (square takes the folder shown) instead of
+    /// a CIA; Install CIA's folder waits in picker_cia_dir meanwhile.
+    bool picker_folders{};
+    std::string picker_cia_dir;
+    std::vector<PickerEntry> picker_entries;
+    std::string picked_cia;
     /// The on-screen keyboard over the Multiplayer screen, editing `edit_text`. Not the system's
     /// keyboard dialog: it draws through GXM, and handing the GPU back to Sony's driver around
     /// it while sgxd holds a title's state is too risky.
@@ -227,6 +263,8 @@ private:
     void DrawPatchInfo();
     void DrawCheatRow(std::size_t index);
     void DrawCheatInfo();
+    void DrawInstalledRow(std::size_t index);
+    void DrawInstalledInfo();
 
     /// True when the user pressed cancel and this overlay was the thing focused, which is what
     /// separates "close the menu" from "leave the child the cancel already left" - ImGui has
@@ -284,6 +322,17 @@ private:
     u64 settings_program_id{};
     std::vector<std::shared_ptr<Cheats::CheatBase>> settings_cheats;
     int focused_cheat = -1;
+    /// What of the title is installed on the emulated SD card (its game, update, DLC), read when
+    /// the screen opens from the game list; the selected part, and the one a first cross armed
+    /// for removal (-1: none).
+    struct InstalledPart {
+        const char* kind;
+        u64 title_id;
+        u64 size;
+    };
+    std::vector<InstalledPart> settings_installed;
+    int focused_installed = -1;
+    int armed_installed = -1;
 
     /// The Multiplayer screen's fields, and the one the keyboard edits (-1: none).
     Multiplayer::Fields room_fields{};

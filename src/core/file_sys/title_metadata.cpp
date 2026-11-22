@@ -184,6 +184,10 @@ u64 TitleMetadata::GetContentSizeByIndex(std::size_t index) const {
     return tmd_chunks[index].size;
 }
 
+u16 TitleMetadata::GetContentIndexByIndex(std::size_t index) const {
+    return tmd_chunks[index].index;
+}
+
 u64 TitleMetadata::GetCombinedContentSize(const CIAHeader* header) const {
     u64 total_size = 0;
     for (auto& chunk : tmd_chunks) {

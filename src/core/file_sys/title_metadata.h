@@ -101,6 +101,9 @@ public:
     u64 GetContentSizeByIndex(std::size_t index) const;
     /// The SHA-256 of the index-th record's content, as the content is stored decrypted.
     const std::array<u8, 0x20>& GetContentHashByIndex(std::size_t index) const;
+    /// The content index (0 game, 1 manual, 2 download play, ...) of the TMD's index-th record:
+    /// what a CIA header's present bits and a ticket's rights are kept by.
+    u16 GetContentIndexByIndex(std::size_t index) const;
     u64 GetCombinedContentSize(const CIAHeader* header) const;
     bool GetContentOptional(std::size_t index) const;
     std::array<u8, 16> GetContentCTRByIndex(std::size_t index) const;
