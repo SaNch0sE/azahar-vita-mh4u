@@ -76,15 +76,6 @@
 #endif
 #define AZAHAR_TIMER_MEASURE_US 300000u
 
-// 1: the table holds only what core 2 needs — guest windows, the vector page, this module's
-//    megabytes, the resident thread's stack, the GIC alias — and nothing of the kernel's.
-// 0: the kernel's two tables merged. With interrupts masked from install nothing of Sony's
-//    executes on core 2, so the merge has no purpose; without the seal a guest that runs off its
-//    window executes kernel-mapped memory.
-#ifndef AZAHAR_SEAL
-#define AZAHAR_SEAL 1
-#endif
-
 // ---------------------------------------------------------------------------- log
 //
 // emit() writes to out_fd. The calls here keep a file of their own open from the first call
@@ -277,6 +268,15 @@ static volatile uint32_t azahar_heartbeat, azahar_on_core, azahar_stop, azahar_p
 static volatile uint32_t azahar_core2_vbar, azahar_core2_cpsr, azahar_core2_ttbr1, azahar_core2_sp;
 
 
+// azaharRun's phases (AZAHAR_PHASE_*), this call's: the cycle counter, its enable set at the
+// call's start (a thread's resume clears it).
+static uint32_t azahar_phase[AZAHAR_PHASES];
+static inline uint32_t phase_now(void) {
+    uint32_t c;
+    asm volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(c));
+    return c;
+}
+
 static inline uint32_t rd_tpidrurw(void) {
     uint32_t v;
     asm volatile("mrc p15, 0, %0, c13, c0, 2" : "=r"(v));
@@ -323,12 +323,23 @@ typedef struct AzaharFast {
     uint32_t thread_id, process_id;   // the running guest thread's and its process's IDs
     uint32_t count[AZAHAR_FAST_KINDS]; // answered this slice
     uint32_t save[4];     // the guest's r4-r7 while the vector works
+    // A quantum that ends inside an upcall: the IRQ stub starts the timer again
+    // over rearm_ticks, rearm_left times at most this call, and adds the ended quantum to the
+    // guest clock and to accrued, which the exit (or an AZAHAR_CLOCK_SVC) reports.
+    uint32_t rearm_ticks, rearm_left;
+    uint32_t accrued_lo, accrued_hi;
+    uint32_t rearms;
+    uint32_t spare;       // keeps the stacks after the block 8-byte aligned
 } AzaharFast;
 _Static_assert(__builtin_offsetof(AzaharFast, mult_int) == 0x0c, "entry.S FAST_MULT_INT");
 _Static_assert(__builtin_offsetof(AzaharFast, base_lo) == 0x14, "entry.S FAST_BASE_LO");
 _Static_assert(__builtin_offsetof(AzaharFast, process_id) == 0x20, "entry.S FAST_PROCESS_ID");
 _Static_assert(__builtin_offsetof(AzaharFast, count) == 0x24, "entry.S FAST_COUNT");
 _Static_assert(__builtin_offsetof(AzaharFast, save) == 0x38, "entry.S FAST_SAVE");
+_Static_assert(__builtin_offsetof(AzaharFast, rearm_ticks) == 0x48, "entry.S FAST_REARM_TICKS");
+_Static_assert(__builtin_offsetof(AzaharFast, accrued_lo) == 0x50, "entry.S FAST_ACCRUED_LO");
+_Static_assert(__builtin_offsetof(AzaharFast, rearms) == 0x58, "entry.S FAST_REARMS");
+_Static_assert(sizeof(AzaharFast) == 0x60, "AzaharCpu's stacks after it");
 
 // One block per Vita core (MPIDR & 3): a slice on a core reads and writes its own only. This is
 // entry.S's part, its CPU_* offsets checked below, with the context first so that a stub's SP
@@ -376,17 +387,21 @@ _Static_assert(__builtin_offsetof(AzaharCpu, chain_irq) == 0x1c4, "entry.S CPU_C
 _Static_assert(__builtin_offsetof(AzaharCpu, stray) == 0x1cc, "entry.S CPU_STRAY");
 _Static_assert(__builtin_offsetof(AzaharCpu, fast) == 0x1f0, "entry.S CPU_FAST");
 _Static_assert(__builtin_offsetof(AzaharCpu, fast_site) + 4 == 0x1f0, "entry.S FAST_SITE");
-_Static_assert(__builtin_offsetof(AzaharCpu, stray_stack) + 64 == 0x278, "entry.S CPU_STRAY_STACK_TOP");
-_Static_assert(__builtin_offsetof(AzaharCpu, irq_stack) + 64 == 0x2b8, "entry.S CPU_IRQ_STACK_TOP");
-_Static_assert(__builtin_offsetof(AzaharCpu, vfp_stack) + 1024 == 0x6c0, "entry.S CPU_VFP_STACK_TOP");
-_Static_assert(sizeof(AzaharCpu) == 0x6c8, "entry.S CPU_SIZE");
+_Static_assert(__builtin_offsetof(AzaharUserPage, thread_id) == 0x1c, "entry.S USER_THREAD_ID");
+_Static_assert(__builtin_offsetof(AzaharSwitch, in) == 0x08, "entry.S SWITCH_IN");
+_Static_assert(__builtin_offsetof(AzaharRedirect, site) == 0x0c, "entry.S REDIRECT_SITE");
+_Static_assert(__builtin_offsetof(AzaharContext, fpregs) == 0x50, "entry.S context layout");
+_Static_assert(__builtin_offsetof(AzaharCpu, stray_stack) + 64 == 0x290, "entry.S CPU_STRAY_STACK_TOP");
+_Static_assert(__builtin_offsetof(AzaharCpu, irq_stack) + 64 == 0x2d0, "entry.S CPU_IRQ_STACK_TOP");
+_Static_assert(__builtin_offsetof(AzaharCpu, vfp_stack) + 1024 == 0x6d8, "entry.S CPU_VFP_STACK_TOP");
+_Static_assert(sizeof(AzaharCpu) == 0x6e0, "entry.S CPU_SIZE");
 
 // The rest of a core's state, C's alone: Sony's registers saved at install and put back at
 // uninstall, the private timer's clock, and the slice's figures.
 typedef struct AzaharCore {
     volatile uint32_t sv_ttbcr, sv_ttbr0, sv_ctxid, sv_vbar, sv_sp_und, sv_sp_abt, sv_sp_svc;
     volatile uint32_t sv_sp_irq, sv_tpidruro, sv_tpidrurw, sv_cpacr, sv_fpexc, sv_pmr;
-    uint32_t sv_dacr;             // AZAHAR_SEAL=0 only: the syscall's DACR, granted for the guest
+    uint32_t sv_dacr;             // the syscall's DACR, granted for the guest
     volatile uint32_t sv_isenabler_timer;
     uint32_t sv_fpscr;
     uint64_t sv_vfp_bank[32];
@@ -398,6 +413,8 @@ typedef struct AzaharCore {
     // The guest clock rate and timer clock fast.mult_int/mult_frac were made for.
     uint64_t fast_tick_hz;
     uint32_t fast_timer_hz;
+    // AzaharRunRequest.upcall_rearm_us and the timer clock AzaharFast.rearm_ticks were made for.
+    uint32_t rearm_us, rearm_timer_hz, rearm_ticks;
     // azaharMap's core: azaharRun runs a slice here only then.
     uint32_t attached;
     // The azahar_code_gen this core's instruction cache last caught up with (core2_install).
@@ -411,18 +428,11 @@ static uint8_t azahar_user_area[2 * 4096];
 static inline AzaharUserPage *azahar_user(void) {
     return (AzaharUserPage *)(((uintptr_t)azahar_user_area + 0xFFFu) & ~(uintptr_t)0xFFFu);
 }
-
-// In-kernel scheduling's thread table and the contexts of the threads that do not run (version
-// 34): read while the core is sealed, so the seal keeps their megabytes (azaharMap's data list).
-static AzaharSchedThread sched_table[AZAHAR_SCHED_MAX];
-static AzaharContext sched_ctx[AZAHAR_SCHED_MAX];
-// Its functions run sealed too (between sub-slices): the seal keeps their megabytes as well.
-typedef struct SchedRun SchedRun;
-static void sched_fold_run(unsigned n, SchedRun *r);
-static int sched_sleep(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast);
-static int sched_arbitrate(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast);
-static int sched_block(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast);
-static void sched_reschedule(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast);
+// For entry.S's AZAHAR_SWITCH_SVC: the user page (its thread_id) and the app's AzaharSwitch,
+// set per slice from AzaharRunRequest.upcall_switch.
+uint32_t azahar_user_page_kva;
+uint32_t azahar_switch_va;
+uint32_t azahar_redirect_va; // entry.S's svc redirect: AzaharRunRequest.upcall_redirect
 
 // The core this runs on. Not ksceKernelCpuId: nothing of Sony's kernel is mapped once a core is
 // sealed (a call to it there takes a prefetch abort).
@@ -534,7 +544,6 @@ static void core2_switch(uint32_t ttbcr, uint32_t ttbr0, uint32_t ctxid, int ica
                  "mcr p15, 0, %[ctx],  c13, c0, 1 \n"
                  "dsb                             \n"
                  "mcr p15, 0, %[zero], c8, c7, 0  \n" // TLBIALL
-                 "mcr p15, 0, %[zero], c7, c5, 6  \n" // BPIALL
                  "dsb                             \n"
                  "isb                             \n"
                  :
@@ -569,14 +578,12 @@ static void core2_install(unsigned n) {
     core->sv_vbar = rd_vbar();
     core->sv_tpidruro = rd_tpidruro();
     core->sv_tpidrurw = rd_tpidrurw();
-#if !AZAHAR_SEAL
-    // Unsealed, the guest's world has the app's own pages (the process's TTBR1 entries), whose
-    // domains the syscall holds at No-access (DACR 15450000): granted Client for the slice, so
-    // that code the app placed in the guest's world can call into the app (an experiment).
+    // The guest's world has the app's own pages (the process's TTBR1 entries), whose domains the
+    // syscall holds at No-access (DACR 15450000): granted Client for the slice, so that the
+    // upcalls' code can call into the app.
     core->sv_dacr = rd_dacr();
     wr_dacr(dacr_grant_all(core->sv_dacr));
     asm volatile("isb" ::: "memory");
-#endif
     // The VFP, for the guest and for entry.S's own vldm/vstm: cp10/cp11 open at both privilege
     // levels, FPEXC.EN set. Sony's threads are lazily given the VFP on first use; this core is
     // no longer Sony's, so it is simply on.
@@ -660,10 +667,8 @@ static void core2_uninstall(unsigned n) {
     azahar_set_banked_sp(MODE_IRQ, core->sv_sp_irq);
     wr_tpidruro(core->sv_tpidruro);
     wr_tpidrurw(core->sv_tpidrurw);
-#if !AZAHAR_SEAL
     wr_dacr(core->sv_dacr);
     asm volatile("isb" ::: "memory");
-#endif
     // Bank and FPSCR back before FPEXC/CPACR close the door (and before the PMR reopens
     // interrupts: Sony's IRQ path must never see the guest's VFP state).
     vfp_bank_load(core->sv_vfp_bank);
@@ -719,6 +724,7 @@ static void core2_sgi_window(unsigned n) {
 
 // One trip into the guest. Interrupts are masked at the GIC for its duration — the core is
 // owned, not shared, while guest code runs — and put back afterwards.
+static uint32_t azahar_t_post; // the cycle counter at the guest's exit (AZAHAR_PHASE_POST)
 static void core2_run(unsigned n) {
     AzaharCpu *const cpu = &azahar_cpu[n];
     AzaharCore *const core = &azahar_core[n];
@@ -786,6 +792,9 @@ static void core2_run(unsigned n) {
     }
     cpu->progress = 3;
     const uint32_t reason = (uint32_t)azahar_enter(cpu);
+    const uint32_t t_post = phase_now();
+    azahar_phase[AZAHAR_PHASE_GUEST] += t_post - t_guest;
+    azahar_t_post = t_post;
     cpu->progress = 42;
     if (pmr) {
         core->timer_left = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
@@ -848,6 +857,8 @@ static void core2_run(unsigned n) {
 static void fold_run(unsigned n) {
     core2_install(n);
     core2_run(n);
+    t = phase_now();
+    azahar_phase[AZAHAR_PHASE_POST] += t - azahar_t_post;
     core2_uninstall(n);
 }
 
@@ -1533,12 +1544,10 @@ static int build_table(const AzaharMapRequest *req) {
                 (uint32_t)(uintptr_t)&azahar_timer_sample, (uint32_t)(uintptr_t)&gic_va,
                 (uint32_t)(uintptr_t)&azahar_l1_pa,     (uint32_t)(uintptr_t)azahar_sony,
                 (uint32_t)(uintptr_t)&azahar_state,
-                (uint32_t)(uintptr_t)sched_table,
-                (uint32_t)(uintptr_t)&sched_table[AZAHAR_SCHED_MAX - 1] + sizeof(AzaharSchedThread) - 1,
-                (uint32_t)(uintptr_t)sched_ctx,
-                (uint32_t)(uintptr_t)&sched_ctx[AZAHAR_SCHED_MAX - 1] + sizeof(AzaharContext) - 1,
                 (uint32_t)(uintptr_t)azahar_user_area,
                 (uint32_t)(uintptr_t)azahar_user_area + sizeof(azahar_user_area) - 1,
+                (uint32_t)(uintptr_t)&azahar_user_page_kva, (uint32_t)(uintptr_t)&azahar_switch_va,
+                (uint32_t)(uintptr_t)&azahar_redirect_va,
             };
             uint32_t bases[2] = {0, 0};
             for (unsigned seg = 0; seg < 2; seg++) {
@@ -1618,11 +1627,6 @@ static int build_table(const AzaharMapRequest *req) {
             (uint32_t)(uintptr_t)&gic_va,
             (uint32_t)(uintptr_t)&azahar_l1_pa,       (uint32_t)(uintptr_t)&azahar_core[3].code_gen,
             (uint32_t)(uintptr_t)azahar_sony,         (uint32_t)(uintptr_t)&azahar_state,
-            (uint32_t)(uintptr_t)&sched_fold_run,     (uint32_t)(uintptr_t)&sched_sleep,
-            (uint32_t)(uintptr_t)&sched_reschedule,   (uint32_t)(uintptr_t)sched_table,
-            (uint32_t)(uintptr_t)&sched_table[AZAHAR_SCHED_MAX - 1],
-            (uint32_t)(uintptr_t)sched_ctx,
-            (uint32_t)(uintptr_t)&sched_ctx[AZAHAR_SCHED_MAX - 1],
         };
         for (unsigned i = 0; i < sizeof(spot) / sizeof(spot[0]); i++) {
             keep[nkeep].addr = spot[i];
@@ -1712,7 +1716,6 @@ static int build_table(const AzaharMapRequest *req) {
     }
     emit("  L1 merged from the kernel's two tables (AZAHAR_SEAL=0): ttbr0 table at va %p, ttbr1 pa "
          "%08x\n", (const void *)kernel_l1, ttbr1_pa);
-#endif
 
     // The vector page: the highest free megabyte below 0x40000000 that no guest range wants.
     // The top half of the low quarter is fully populated on the console (no free entry in
@@ -1804,6 +1807,7 @@ static int build_table(const AzaharMapRequest *req) {
         for (unsigned i = 0; i < 4096u; i++) {
             ((uint8_t *)azahar_user())[i] = 0;
         }
+        azahar_user_page_kva = (uint32_t)(uintptr_t)azahar_user();
         azahar_l2[(unsigned)t * 256u + ((AZAHAR_USER_PAGE_VA >> 12) & 0xFFu)] =
             azahar_small_page(PAR_PA(par), AZAHAR_PERM_R, attr);
         if (gic_va) {
@@ -1960,344 +1964,18 @@ out:
     return ret;
 }
 
-// ---------------------------------------------------------------------------- in-kernel scheduling
-// azaharRun's thread table (azahar_native.h, AzaharSchedThread) and the contexts of the threads
-// that do not run (sched_table, sched_ctx above), copied in before the core is sealed: nothing
-// of the app is mapped then, only the guest's table and this module. The rules are
-// Kernel::ThreadManager's.
-
-struct SchedRun {
-    unsigned count;
-    int current;            // the RUNNING index, or -1
-    uint64_t now;           // the guest clock
-    uint64_t deadline;
-    // Guest ticks to timer ticks and nanoseconds to guest ticks, as integer and 32-bit
-    // fraction parts made before the seal: a division is a call into Sony's kernel
-    // (__aeabi_uldivmod), which nothing maps while the core is sealed.
-    uint32_t timer_int, timer_frac, ns_int, ns_frac;
-    int32_t front, back;    // the next push_front / push_back order
-    uint32_t switches, sleeps, idle;
-    uint32_t arbiter;       // ArbitrateAddress's handle answered here, 0 for none
-    int32_t arb_next;       // the next ARB order: the arbiter's list's back
-    uint32_t arbitrations;
-    uint32_t handled;       // the last stop was an svc answered here (sched_handled)
-};
-
-// A copy for sealed code: a struct assignment or memcpy is a call into Sony's kernel there.
-static void sealed_copy(void *dst, const void *src, unsigned bytes) {
-    volatile uint32_t *const d = (volatile uint32_t *)dst;
-    const volatile uint32_t *const s = (const volatile uint32_t *)src;
-    for (unsigned i = 0; i < bytes / 4u; i++) {
-        d[i] = s[i];
-    }
-}
-
-// x * (int + frac / 2^32) for x below 2^32, without a division.
-static uint64_t sched_scale(uint32_t x, uint32_t whole, uint32_t frac) {
-    return (uint64_t)x * whole + (((uint64_t)x * frac) >> 32);
-}
-
-// The most urgent READY thread better than `limit` (priority strictly lower), oldest first.
-static int sched_best(const SchedRun *r, uint32_t limit) {
-    int best = -1;
-    for (unsigned i = 0; i < r->count; i++) {
-        const AzaharSchedThread *t = &sched_table[i];
-        if (t->state != AZAHAR_SCHED_READY || t->priority >= limit) {
-            continue;
-        }
-        if (best < 0 || t->priority < sched_table[best].priority ||
-            (t->priority == sched_table[best].priority && t->order < sched_table[best].order)) {
-            best = (int)i;
-        }
-    }
-    return best;
-}
-
-// The sleepers, and the timed arbitration waits, whose wake is due become READY at the back of
-// their level, in wake order (the HLE kernel's wake events fire in time order, ties by when they
-// were scheduled: by index here). A timed wait keeps the timeout result it waited with.
-static void sched_wake_due(SchedRun *r) {
-    for (;;) {
-        int due = -1;
-        for (unsigned i = 0; i < r->count; i++) {
-            const AzaharSchedThread *t = &sched_table[i];
-            if ((t->state == AZAHAR_SCHED_SLEEP || t->state == AZAHAR_SCHED_ARB) &&
-                t->wake <= r->now && (due < 0 || t->wake < sched_table[due].wake)) {
-                due = (int)i;
-            }
-        }
-        if (due < 0) {
-            return;
-        }
-        sched_table[due].state = AZAHAR_SCHED_READY;
-        sched_table[due].order = r->back++;
-    }
-}
-
-// The earliest sleeper's or timed arbitration wait's wake, or ~0.
-static uint64_t sched_next_wake(const SchedRun *r) {
-    uint64_t next = ~0ull;
-    for (unsigned i = 0; i < r->count; i++) {
-        if ((sched_table[i].state == AZAHAR_SCHED_SLEEP ||
-             sched_table[i].state == AZAHAR_SCHED_ARB) &&
-            sched_table[i].wake < next) {
-            next = sched_table[i].wake;
-        }
-    }
-    return next;
-}
-
-// The running thread stops in `cpu->ctx` (state set by the caller); `next` runs from its copy.
-static void sched_switch(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast, int next) {
-    if (r->current >= 0) {
-        sealed_copy(&sched_ctx[r->current], &cpu->ctx, sizeof(AzaharContext));
-        sched_table[r->current].saved = 1;
-    }
-    r->current = next;
-    if (next >= 0) {
-        AzaharSchedThread *t = &sched_table[next];
-        // TPIDRURW stays the core's, as the HLE kernel's switch leaves it.
-        const uint32_t rw = cpu->ctx.tpidrurw;
-        sealed_copy(&cpu->ctx, &sched_ctx[next], sizeof(AzaharContext));
-        cpu->ctx.tpidruro = t->tls;
-        cpu->ctx.tpidrurw = rw;
-        cpu->ctx.cpsr = (cpu->ctx.cpsr & ~0x1DFu) | 0x10u;
-        t->state = AZAHAR_SCHED_RUNNING;
-        fast->thread_id = t->id;
-    }
-    r->switches++;
-}
-
-// After a slice boundary: due sleepers wake, and one more urgent than the running thread takes
-// the core (the running one to the front of its level). With none running, the most urgent.
-static void sched_reschedule(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast) {
-    sched_wake_due(r);
-    const uint32_t limit = r->current >= 0 ? sched_table[r->current].priority : 64u;
-    const int next = sched_best(r, limit);
-    if (next < 0) {
-        return;
-    }
-    if (r->current >= 0) {
-        sched_table[r->current].state = AZAHAR_SCHED_READY;
-        sched_table[r->current].order = r->front--;
-    }
-    sched_switch(r, cpu, fast, next);
-}
-
-// The running thread's SleepThread: 1 when answered here (some thread runs on, or the clock
-// reached the deadline idle), 0 to leave it to the app. SVC::SleepThread: 0 ns with nothing
-// else ready returns at once; otherwise the thread sleeps and a wake event of ns is set.
-static int sched_sleep(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast) {
-    const int64_t ns = (int64_t)((uint64_t)cpu->ctx.r[1] << 32 | cpu->ctx.r[0]);
-    if (ns < 0 || ns > 0xFFFFFFFFll || r->current < 0) {
-        return 0; // forever, or 4.3 s and more: the app's
-    }
-    if (ns == 0 && sched_best(r, 64u) < 0) {
-        return 1;
-    }
-    AzaharSchedThread *t = &sched_table[r->current];
-    t->state = AZAHAR_SCHED_SLEEP;
-    // nsToCycles, the HLE kernel's conversion (the app keeps the clock unscaled for this).
-    t->wake = r->now + sched_scale((uint32_t)ns, r->ns_int, r->ns_frac);
-    r->sleeps++;
-    return sched_block(r, cpu, fast);
-}
-
-// The running thread stopped running (asleep, or waiting at the arbiter): the next READY thread
-// runs, or with none the clock idles to the earliest wake, up to the deadline. Answers 1.
-static int sched_block(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast) {
-    for (;;) {
-        sched_wake_due(r);
-        const int next = sched_best(r, 64u);
-        if (next >= 0) {
-            sched_switch(r, cpu, fast, next);
-            return 1;
-        }
-        const uint64_t wake = sched_next_wake(r);
-        if (wake >= r->deadline) {
-            // Idle up to the app's next event: its loop idles there, with no thread running.
-            sched_switch(r, cpu, fast, -1);
-            return 1;
-        }
-        r->now = wake;
-        r->idle++;
-    }
-}
-
-// The guest's word at `address` through the guest's table as installed: readable (and
-// writable) at PL1 under the descriptors the guest's own accesses use, a GPU hold's included.
-// An ATS of its own: translate() suspends interrupts through Sony's kernel, which nothing maps
-// while the core is sealed (a call here takes the sealed abort stub and hangs the core). None is
-// needed: the GIC's mask holds every interrupt off between sub-slices, so
-// nothing else uses PAR meanwhile.
-static int sched_guest_word(uint32_t address, int write) {
-    if (address & 3u) {
-        return 0;
-    }
-    uint32_t par;
-    if (write) {
-        asm volatile("mcr p15, 0, %1, c7, c8, 1 \n isb \n mrc p15, 0, %0, c7, c4, 0"
-                     : "=r"(par)
-                     : "r"(address)
-                     : "memory");
-    } else {
-        asm volatile("mcr p15, 0, %1, c7, c8, 0 \n isb \n mrc p15, 0, %0, c7, c4, 0"
-                     : "=r"(par)
-                     : "r"(address)
-                     : "memory");
-    }
-    return !PAR_FAULTED(par);
-}
-
-// The running thread's ArbitrateAddress (azahar_native.h, AZAHAR_SCHED_ARB): 1 when answered
-// here, 0 to leave it to the app. AddressArbiter::ArbitrateAddress's rules.
-static int sched_arbitrate(SchedRun *r, AzaharCpu *cpu, AzaharFast *fast) {
-    AzaharContext *const c = &cpu->ctx;
-    if (r->current < 0 || r->arbiter == 0 || c->r[0] != r->arbiter || c->r[2] > 4u) {
-        return 0;
-    }
-    AzaharSchedThread *const self = &sched_table[r->current];
-    const uint32_t address = c->r[1];
-    const uint32_t type = c->r[2];
-    const int32_t value = (int32_t)c->r[3];
-    if (type == 0) {
-        // Signal: up to `value` waiters on the address, the most urgent first and a level's
-        // oldest first (ResumeHighestPriorityThread); a negative count, all of them in the
-        // list's order (ResumeAllThreads). Each READY at the back of its level with a success.
-        uint32_t woken = 0;
-        for (;;) {
-            if (value >= 0 && woken >= (uint32_t)value) {
-                break;
-            }
-            int pick = -1;
-            for (unsigned i = 0; i < r->count; i++) {
-                const AzaharSchedThread *t = &sched_table[i];
-                if ((t->state != AZAHAR_SCHED_ARB && t->state != AZAHAR_SCHED_ARB_FAR) ||
-                    t->address != address) {
-                    continue;
-                }
-                if (pick < 0) {
-                    pick = (int)i;
-                    continue;
-                }
-                const AzaharSchedThread *p = &sched_table[pick];
-                const int earlier = t->order < p->order;
-                if (value < 0 ? earlier
-                              : (t->priority < p->priority ||
-                                 (t->priority == p->priority && earlier))) {
-                    pick = (int)i;
-                }
-            }
-            if (pick < 0) {
-                break;
-            }
-            AzaharSchedThread *const t = &sched_table[pick];
-            // Another core's waiter is ready on its own core, not here.
-            if (t->state == AZAHAR_SCHED_ARB_FAR) {
-                t->state = AZAHAR_SCHED_WOKEN_FAR;
-            } else {
-                t->state = AZAHAR_SCHED_READY;
-                t->order = r->back++;
-            }
-            t->wake = ~0ull;
-            sched_ctx[pick].r[0] = 0;
-            t->saved = 1;
-            woken++;
-        }
-        // A low-priority thread that wakes nobody pays the official kernel's 1614 ticks.
-        if (woken == 0 && self->priority >= 49u) {
-            r->now += 1614u;
-        }
-        c->r[0] = 0;
-        r->arbitrations++;
-        if (woken != 0) {
-            sched_reschedule(r, cpu, fast);
-        }
-        return 1;
-    }
-    // A wait: decided before the guest's word changes. The timeout in nanoseconds (types 3 and
-    // 4): -1 is none, as WakeAfterDelay takes it; another negative one, or 4.3 s and more, the
-    // app's.
-    const int timed = type == 3u || type == 4u;
-    const int decrement = type == 2u || type == 4u;
-    const int64_t ns = (int64_t)((uint64_t)c->r[5] << 32 | c->r[4]);
-    if (timed && ns != -1 && (ns < 0 || ns > 0xFFFFFFFFll)) {
-        return 0;
-    }
-    if (!sched_guest_word(address, decrement)) {
-        return 0;
-    }
-    volatile int32_t *const word = (volatile int32_t *)(uintptr_t)address;
-    const int32_t now_value = *word;
-    // The timeout types answer the timeout result whether or not they wait.
-    c->r[0] = timed ? AZAHAR_RESULT_TIMEOUT : 0u;
-    r->arbitrations++;
-    if (now_value >= value) {
-        return 1;
-    }
-    if (decrement) {
-        *word = now_value - 1;
-    }
-    self->state = AZAHAR_SCHED_ARB;
-    self->address = address;
-    self->order = r->arb_next++;
-    self->wake = timed && ns != -1 ? r->now + sched_scale((uint32_t)ns, r->ns_int, r->ns_frac)
-                                   : ~0ull;
-    return sched_block(r, cpu, fast);
-}
-
-// The slice under the table: sub-slices up to the deadline or the next wake, the svcs the
-// scheduler answers handled between them. The core is sealed throughout.
-static void sched_fold_run(unsigned n, SchedRun *r) {
-    AzaharCpu *const cpu = &azahar_cpu[n];
-    AzaharCore *const core = &azahar_core[n];
-    AzaharFast *const fast = &cpu->fast;
-    core2_install(n);
-    for (;;) {
-        uint64_t end = r->deadline;
-        const uint64_t wake = sched_next_wake(r);
-        if (wake < end) {
-            end = wake;
-        }
-        if (end <= r->now) {
-            end = r->now + 1;
-        }
-        // Guest ticks to timer ticks, at least one.
-        const uint64_t span = end - r->now;
-        const uint64_t ticks = sched_scale(span > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)span,
-                                           r->timer_int, r->timer_frac);
-        core->quantum_ticks = ticks == 0 ? 1u : ticks > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)ticks;
-        fast->quantum = core->quantum_ticks;
-        fast->base_lo = (uint32_t)r->now;
-        fast->base_hi = (uint32_t)(r->now >> 32);
-        core2_run(n);
-        r->now += fast_guest_ticks(fast, core->quantum_ticks - core->timer_left);
-        r->handled = 0;
-        if (core->run_reason == AZAHAR_EXIT_TIMER) {
-            if (r->now < end) {
-                r->now = end;
-            }
-            if (r->now >= r->deadline) {
-                break;
-            }
-            sched_reschedule(r, cpu, fast);
-            if (r->current < 0) {
-                break;
-            }
-            continue;
-        }
-        if (core->run_reason == AZAHAR_EXIT_SVC &&
-            ((core->run_svc == 0x0Au && sched_sleep(r, cpu, fast)) ||
-             (core->run_svc == 0x22u && sched_arbitrate(r, cpu, fast)))) {
-            r->handled = 1;
-            if (r->current < 0 || r->now >= r->deadline) {
-                break;
-            }
-            continue;
-        }
-        break;
-    }
-    core2_uninstall(n);
+// azaharHold's and azaharFlip's runs: the caller's own blocks, read and written directly under a
+// domain grant with interrupts off (the grant never outlives the copy on a switch), as
+// azahar_user_page reads user pages, not through ksceKernelCopyFromUser (thousands of cycles a
+// call); the app is the only caller and hands its own blocks, their sizes bounded before the
+// copy. sgxd's calls on the frame path (sgxdKick, sgxdWaker, the job ring) copy nothing.
+static void request_copy(void *dst, const void *src, unsigned bytes) {
+    const SceKernelIntrStatus st = ksceKernelCpuSuspendIntr();
+    const uint32_t d = rd_dacr();
+    wr_dacr(dacr_grant_all(d));
+    __builtin_memcpy(dst, src, bytes);
+    wr_dacr(d);
+    ksceKernelCpuResumeIntr(st);
 }
 
 // The kernel's view of the app's request block `user`, mapped at its first call; NULL if it
@@ -2342,7 +2020,9 @@ static AzaharRunRequest *run_block(const AzaharRunRequest *user) {
 int azaharRun(AzaharRunRequest *user_req) {
     uint32_t state;
     ENTER_SYSCALL(state);
-    const uint32_t start_us = ksceKernelGetSystemTimeLow();
+    // The cycle counter on (PMCNTENSET's C) for kernel_cycles.
+    asm volatile("mcr p15, 0, %0, c9, c12, 1" ::"r"(1u << 31));
+    const uint32_t start_cycles = cycles_now();
     log_open();
     int ret = 0;
     // Folded, the slice runs on the caller's core (its thread is pinned); resident, on the
@@ -2363,7 +2043,9 @@ int azaharRun(AzaharRunRequest *user_req) {
         ret = AZAHAR_ERR_CORE;
         goto out;
     }
-    if (ksceKernelCopyFromUser(req, user_req, sizeof(*req)) < 0) {
+    // The app's block, read and written in place.
+    AzaharRunRequest *const req = run_block(user_req);
+    if (!req) {
         ret = AZAHAR_ERR_ARG;
         goto out;
     }
@@ -2409,7 +2091,21 @@ int azaharRun(AzaharRunRequest *user_req) {
     for (unsigned i = 0; i < AZAHAR_FAST_KINDS; i++) {
         fast->count[i] = 0;
     }
+    // A quantum that ends inside an upcall starts again in the vector (azahar_irq_rearm), over
+    // the app's quantum in timer ticks, made again only when one of the two changes.
+    if (req->upcall_rearm_us != core->rearm_us || core->timer_hz != core->rearm_timer_hz) {
+        core->rearm_us = req->upcall_rearm_us;
+        core->rearm_timer_hz = core->timer_hz;
+        const uint64_t t = ((uint64_t)req->upcall_rearm_us * core->timer_hz) / 1000000ull;
+        core->rearm_ticks = t > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)t;
+    }
+    fast->rearm_ticks = timed && fast->timer ? core->rearm_ticks : 0;
+    fast->rearm_left = req->upcall_rearm_max;
+    fast->accrued_lo = fast->accrued_hi = 0;
+    fast->rearms = 0;
     cpu->fast_site = 0;
+    azahar_switch_va = (uint32_t)(uintptr_t)req->upcall_switch;
+    azahar_redirect_va = (uint32_t)(uintptr_t)req->upcall_redirect;
     if (azahar_verbose) {
         emit("== azaharRun  cpu%u pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u "
              "ticks\n",
@@ -2423,6 +2119,9 @@ int azaharRun(AzaharRunRequest *user_req) {
     const int sched_on = azahar_folded && timed && req->sched && req->sched_count &&
                          req->sched_count <= AZAHAR_SCHED_MAX && req->sched_current >= 0 &&
                          (uint32_t)req->sched_current < req->sched_count;
+    if (sched_on) {
+        fast->rearm_ticks = 0; // the in-kernel scheduling times its own sub-slices
+    }
     req->sched_handled = req->sched_switches = req->sched_sleeps = req->sched_idle = 0;
     req->sched_arbitrations = 0;
     if (sched_on) {
@@ -2465,11 +2164,7 @@ int azaharRun(AzaharRunRequest *user_req) {
 
     if (azahar_folded) {
         azahar_on_core = n;
-        if (sched_on) {
-            sched_fold_run(n, &sched);
-        } else {
-            fold_run(n);
-        }
+        fold_run(n);
         ret = 0;
     } else if ((ret = core2_command(CMD_RUN, AZAHAR_RUN_WAIT_STEPS)) != 0) {
         emit("== azaharRun  pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u ticks\n",
@@ -2503,32 +2198,19 @@ int azaharRun(AzaharRunRequest *user_req) {
     req->timer_left = core->timer_left;
     // The counter read at the exit is below every one azahar_svc_fast read, so no GetSystemTick
     // it answered is ahead of tick_base + guest_ticks.
-    req->guest_ticks = timed ? fast_guest_ticks(fast, core->quantum_ticks - core->timer_left) : 0;
-    if (sched_on) {
-        // The whole slice on the guest clock, idle stretches included; the contexts of the
-        // threads that stopped running go back to the app's copies.
-        req->guest_ticks = sched.now - req->tick_base;
-        req->sched_current = sched.current;
-        req->sched_switches = sched.switches;
-        req->sched_sleeps = sched.sleeps;
-        req->sched_idle = sched.idle;
-        req->sched_arbitrations = sched.arbitrations;
-        req->sched_handled = sched.handled;
-        for (unsigned i = 0; i < sched.count; i++) {
-            if (sched_table[i].saved &&
-                ksceKernelCopyToUser(sched_table[i].ctx, &sched_ctx[i], sizeof(AzaharContext)) < 0) {
-                ret = AZAHAR_ERR_ARG;
-            }
-        }
-        if (ksceKernelCopyToUser(req->sched, sched_table, sched.count * sizeof(AzaharSchedThread)) < 0) {
-            ret = AZAHAR_ERR_ARG;
-        }
-    }
+    // From the clock's last start: the entry, or an AZAHAR_CLOCK_SVC that started it again.
+    // and the quantums the vector started again inside upcalls since then (azahar_irq_rearm).
+    req->guest_ticks =
+        timed ? fast_guest_ticks(fast, fast->quantum - core->timer_left) +
+                    ((uint64_t)fast->accrued_hi << 32 | fast->accrued_lo)
+              : 0;
+    req->upcall_rearms = fast->rearms;
     for (unsigned i = 0; i < AZAHAR_FAST_KINDS; i++) {
         req->fast_count[i] = fast->count[i];
     }
     req->fast_site = cpu->fast_site;
-    req->kernel_us = ksceKernelGetSystemTimeLow() - start_us;
+    // Cycles, not two ksceKernelGetSystemTimeLow calls (about 1% of the emulation thread).
+    req->kernel_cycles = cycles_now() - start_cycles;
     azahar_run_count++;
     if (azahar_verbose || (core->run_reason > AZAHAR_EXIT_SVC && core->run_reason != AZAHAR_EXIT_TIMER)) {
         // Faults are rare enough to record. svc exits are the common case, and a guest that
@@ -2539,9 +2221,6 @@ int azaharRun(AzaharRunRequest *user_req) {
              azahar_run_count, n, core->run_reason, core->run_svc, cpu->ctx.r[15], core->run_rawlr,
              core->run_spsr, core->run_fsr, core->run_far, cpu->ctx.r[0], cpu->ctx.r[1],
              cpu->ctx.r[13], core->timer_left, cpu->irq_last, cpu->irq_stray);
-    }
-    if (ksceKernelCopyToUser(user_req, req, sizeof(*req)) < 0) {
-        ret = AZAHAR_ERR_ARG;
     }
 
 out:
@@ -2674,6 +2353,89 @@ void azahar_vfp_reset(void) {
     for (uint32_t i = 0; i < AZAHAR_VFP_TABLE; i++) {
         azahar_vfp_table[i].pc = 0;
     }
+}
+
+int azaharSyncUpper(uint32_t user_va) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = 0;
+    if (azahar_state != ST_MAPPED || user_va < 0x40000000u) {
+        ret = AZAHAR_ERR_ARG;
+    } else {
+        SceUID uid = -1;
+        const volatile uint32_t *const t = reback_map_l1(user_va & 0xFFF00000u, 1u, &uid);
+        if (!t) {
+            ret = AZAHAR_ERR_TABLE;
+        } else {
+            const uint32_t e = *t;
+            ksceKernelFreeMemBlock(uid);
+            const uint32_t idx = user_va >> 20;
+            if ((e & 3u) != 0 && azahar_l1[idx] != e) {
+                azahar_l1[idx] = e;
+                // The table walk reads the entry from memory: cleaned there, and the next
+                // install's TLBIALL drops whatever the old one left.
+                asm volatile("dsb" ::: "memory");
+                ksceKernelDcacheCleanRange((void *)&azahar_l1[idx], 4);
+                ret = 1;
+            }
+        }
+    }
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int azaharUpperDrift(int fix) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int ret = 0;
+    // The guest's table holds a copy of the process's level-1 entries for 0x40000000 up, made at
+    // azaharMap (and a megabyte at a time by azaharSyncUpper on a translation fault). Each entry
+    // that differs from the process's now: in the low 16 bits one the copy lacks (taken on its
+    // first fault), in the bits above one the copy holds otherwise (stale: a translation the
+    // process no longer makes), the first few printed. With `fix` both are taken over.
+    if (azahar_state != ST_MAPPED) {
+        ret = AZAHAR_ERR_STATE;
+    } else {
+        uint32_t missing = 0, stale = 0;
+        for (uint32_t pg = 1; pg < 4; pg++) {
+            SceUID uid = -1;
+            const volatile uint32_t *const t = reback_map_l1(pg << 30, 1024u, &uid);
+            if (!t) {
+                ret = AZAHAR_ERR_TABLE;
+                break;
+            }
+            for (uint32_t i = 0; i < 1024u; i++) {
+                const uint32_t idx = pg * 1024u + i;
+                const uint32_t e = t[i], g = azahar_l1[idx];
+                if (g == e) {
+                    continue;
+                }
+                if ((g & 3u) == 0) {
+                    missing++;
+                } else {
+                    if (stale < 4) {
+                        ksceKernelPrintf("[azaharnative] upper drift: %08x guest %08x process %08x\n",
+                                         idx << 20, g, e);
+                    }
+                    stale++;
+                }
+                if (fix) {
+                    azahar_l1[idx] = e;
+                }
+            }
+            ksceKernelFreeMemBlock(uid);
+        }
+        if (ret == 0) {
+            ret = (int)((stale << 16) | (missing & 0xFFFFu));
+            if (fix && (stale | missing) != 0) {
+                asm volatile("dsb" ::: "memory");
+                ksceKernelDcacheCleanRange((void *)&azahar_l1[1024], 3072u * 4u);
+                tables_changed(0);
+            }
+        }
+    }
+    EXIT_SYSCALL(state);
+    return ret;
 }
 
 int azaharVfpPatch(uint32_t guest_pc, uint32_t form) {
@@ -2860,10 +2622,7 @@ int azaharHold(const AzaharHoldRun *user_runs, uint32_t count) {
     // The windows, the descriptors and the maintenance after them, as azaharEdit's.
     ksceKernelLockMutex(azahar_edit_mutex, 1, NULL);
     locked = 1;
-    if (ksceKernelCopyFromUser(azahar_hold_runs, user_runs, count * sizeof(AzaharHoldRun)) < 0) {
-        ret = AZAHAR_ERR_ARG;
-        goto out;
-    }
+    request_copy(azahar_hold_runs, user_runs, count * sizeof(AzaharHoldRun));
     unsigned changed = 0;
     for (uint32_t r = 0; r < count; r++) {
         const AzaharHoldRun *h = &azahar_hold_runs[r];

@@ -53,16 +53,6 @@ public:
     Result ArbitrateAddress(std::shared_ptr<Thread> thread, ArbitrationType type, VAddr address,
                             s32 value, u64 nanoseconds);
 
-    /// The Vita native core's in-kernel scheduling (ThreadManager::ExportNativeSchedule): the
-    /// waiters in their list's order; one the module woke leaves the list, one it made wait joins
-    /// it at the back, a timed one with the arbiter's timeout callback (its wakeup event is the
-    /// caller's to schedule).
-    [[nodiscard]] const std::vector<std::shared_ptr<Thread>>& GetWaitingThreads() const {
-        return waiting_threads;
-    }
-    void RemoveNativeWaiter(const Thread* thread);
-    void AddNativeWaiter(std::shared_ptr<Thread> thread, VAddr address, bool timed);
-
     class Callback;
 
 private:

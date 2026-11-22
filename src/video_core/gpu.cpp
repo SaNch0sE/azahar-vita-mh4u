@@ -159,6 +159,10 @@ SgxdRenderer::RenderThread& GPU::GetRenderThread() {
     return *impl->render;
 }
 
+const Core::TimingEventType* GPU::VBlankEventType() const {
+    return impl->vblank_event;
+}
+
 void GPU::SyncCaptureHold() {
     const bool recording = SgxdRenderer::Vprof::Recording();
     if (recording && !capture_hold) {

@@ -233,6 +233,10 @@ s64 Timing::Timer::GetMaxSliceLength() const {
     return MAX_SLICE_LENGTH;
 }
 
+const TimingEventType* Timing::Timer::NextEventType() const {
+    return event_queue.empty() ? nullptr : event_queue.front().type;
+}
+
 void Timing::Timer::Advance() {
     MoveEvents();
 

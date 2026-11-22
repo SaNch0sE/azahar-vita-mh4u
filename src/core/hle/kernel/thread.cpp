@@ -652,6 +652,32 @@ void ThreadManager::ImportNativeSchedule(const std::vector<NativeSchedEntry>& be
     current_thread = current >= 0 ? SharedFrom(after[current].thread) : nullptr;
 }
 
+Thread* ThreadManager::SwitchForNative() {
+    Thread* const cur = GetCurrentThread();
+    Thread* const next = PopNextReadyThread();
+    // The running thread keeps going. One that stopped and is ready again (woken while the
+    // upcall idled the guest: popped off the ready queue) becomes the running one below.
+    if (next == nullptr || (next == cur && cur->status == ThreadStatus::Running)) {
+        return next;
+    }
+    if (cur == nullptr || next->owner_process.lock() != cur->owner_process.lock()) {
+        ready_queue.push_front(next->current_priority, next);
+        return nullptr;
+    }
+    // SwitchContext's, but for SaveContext and LoadContext.
+    cur->last_running_ticks = cpu->GetTimer().GetTicks();
+    if (cur->status == ThreadStatus::Running) {
+        ready_queue.push_front(cur->current_priority, cur);
+        cur->status = ThreadStatus::Ready;
+    }
+    ASSERT_MSG(next->status == ThreadStatus::Ready, "Thread must be ready to become running.");
+    kernel.timing.UnscheduleEvent(ThreadWakeupEventType, next->thread_id);
+    current_thread = SharedFrom(next);
+    ready_queue.remove(next->current_priority, next);
+    next->status = ThreadStatus::Running;
+    return next;
+}
+
 bool ThreadManager::HaveReadyThreads() {
     return ready_queue.get_first() != nullptr;
 }

@@ -1442,6 +1442,9 @@ Result SVC::GetThreadId(u32* thread_id, Handle handle) {
     R_UNLESS(thread, ResultInvalidHandle);
 
     *thread_id = thread->GetThreadId();
+    if (thread_id_hooks.answered != nullptr) {
+        thread_id_hooks.answered(*kernel.GetCurrentProcess(), handle, *thread_id);
+    }
     return ResultSuccess;
 }
 

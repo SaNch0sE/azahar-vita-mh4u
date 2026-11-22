@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <boost/serialization/array.hpp>
@@ -280,7 +281,18 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             kernel->GetThreadManager(cpu_core->GetID()).Reschedule();
             max_slice = std::min(max_slice, cpu_core->GetTimer().GetMaxSliceLength());
         }
+        // Each core after the first runs up to where the one before it got: the same span when
+        // they start together, less for a core whose idle time has run already (the Vita native
+        // core's upcalls run an idle core's timer along with the running one's).
+        std::optional<u64> reached;
+#ifdef VITA_DIAGNOSTICS
+        bool ran = false;
+#endif
         for (auto& cpu_core : cpu_cores) {
+            if (reached) {
+                const u64 at = cpu_core->GetTimer().GetTicks();
+                max_slice = *reached > at ? static_cast<s64>(*reached - at) : 0;
+            }
             cpu_core->GetTimer().SetNextSlice(max_slice);
             auto start_ticks = cpu_core->GetTimer().GetTicks();
             LOG_TRACE(Core_ARM11, "Core {} running for {} ticks", cpu_core->GetID(),
@@ -307,6 +319,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 }
             }
             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
+            reached = cpu_core->GetTimer().GetTicks();
             Reschedule();
         }
     }
@@ -518,6 +531,11 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     [[maybe_unused]] const PerfStats::Results result = GetAndResetPerfStats();
     perf_stats->BeginSystemFrame();
     return status;
+}
+
+void System::SelectCore(u32 core_id) {
+    running_core = cpu_cores[core_id].get();
+    kernel->SetRunningCPU(running_core);
 }
 
 void System::PrepareReschedule() {

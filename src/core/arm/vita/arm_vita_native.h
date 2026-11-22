@@ -123,24 +123,53 @@ struct VitaNativeCensus {
     std::array<u32, 256> svcs{};                      ///< The svc exits, by immediate.
     std::array<u32, AZAHAR_FAST_KINDS> fast{};        ///< By AZAHAR_FAST_*.
     u64 guest_ticks{}; ///< The slices' time in the guest, on the guest clock.
-    u64 kernel_us{};   ///< azaharRun's own time, the guest's included.
+    u64 kernel_cycles{}; ///< azaharRun's own time in CPU cycles, the guest's included.
     /// VFP instructions run under short vectors, the exits that ran them, and the sites patched to a
     /// thunk or to the module's svc.
     u32 vfp_insns{}, vfp_exits{}, vfp_thunks{}, vfp_svcs{};
     u32 svc_thunks{};
+    u32 idle_waits{}, idle_skips{};
+    u64 idle_skip_ticks{};
     u32 upcall_sites{}, upcall_runs{}, upcall_preempted{};
-    /// Upcalls that asked for a reschedule, and those that answered busy (none since the generic
-    /// upcall).
-    u32 upcall_reschedules{}, upcall_busy{};
+    std::array<u32, 256> upcall_svcs{};
+    /// The store permits AccessPastHolds made, by what the page's slot held before: none (voided
+    /// or never made), another page's, the page's with its stores used up, the page's still live
+    /// (a store the module left to the app: its form, or past the permit's bytes).
+    u32 permits_after_none{}, permits_after_other{}, permits_after_used{}, permits_after_live{};
+    std::array<std::array<u32, 3>, 8> permits_live_sites{};
+    /// The pages the module made the most permitted stores on since the last census: the guest
+    /// page (VA >> 12) and the stores (the permits' `left` read and reset each census).
+    std::array<std::array<u32, 2>, 8> permitted_store_pages{};
+    /// Times every permit went at once (ClearStorePermits: the guest's mappings changed).
+    u32 permit_clears{};
+    u32 upcall_reschedules{};
+    u32 upcall_exits_slice_up{}, upcall_exits_no_next{};
+    u32 upcall_thumb_sites{}, upcall_redirects{};
     u32 upcall_syscalls{};
-    /// In-kernel scheduling: the slices that carried the thread table, and the module's
-    /// switches, SleepThreads answered and idle stretches skipped in them.
-    u32 sched_slices{}, sched_switches{}, sched_sleeps{}, sched_idle{};
-    /// ArbitrateAddresses the module answered (azaharnative 36).
-    u32 sched_arbitrations{};
-    /// With `perflog`: the last slices in which the module answered one, each table entry's
-    /// state, address, order, wake and r0 before and after (the module's transitions).
-    std::vector<std::string> arb_traces;
+    u32 upcall_switches{};
+    u32 upcall_idles{}, upcall_idle_events{}, upcall_idle_exits{};
+    u32 upcall_idle_exits_other_busy{};
+    u32 upcall_idle_exits_vblank{};
+    std::array<u32, 6> upcall_idle_exit_why{};
+    u32 upcall_rearms{};
+    u32 upcall_synced{};
+    /// The upcall stack's deepest use so far, in bytes (of 64 KiB).
+    u32 upcall_stack_used{};
+    /// Forwarded Sony syscalls by caller (return address, number, count); past 16, `forward_other`.
+    struct ForwardCaller {
+        u32 lr{}, number{}, count{};
+        u32 app{}; ///< the first return address into the app's code above the svc's SP
+    };
+    std::array<ForwardCaller, 16> forwards{};
+    u32 forward_other{};
+    /// SleepThread upcalls by the guest's return address (count, nanoseconds asked); past 12,
+    /// `sleep_other`; and those asking for 0 ns.
+    struct SleepCaller {
+        u32 lr{}, count{};
+        u64 ns{};
+    };
+    std::array<SleepCaller, 12> sleeps{};
+    u32 sleep_other{}, sleep_zero{};
 };
 VitaNativeCensus TakeVitaNativeCensus();
 #endif
@@ -194,6 +223,9 @@ public:
     /// An upcall: svc `svc` answered from the guest's world by the HLE handler with r0-r7 from `in`.
     /// Returns the result (r0) and the thunk's UpcallStatus.
     static u64 UpcallSvc(u32 svc, const std::array<u32, 8>& in);
+    /// The idle skip: a GetSystemTick from a caller spinning on the clock. The clock moves to the
+    /// slice's end and the slice ends there.
+    static u64 UpcallIdleSkip(u32 r0);
 
     bool HasSingleInstructionBreakAccuracy() override {
         return false;
@@ -207,7 +239,13 @@ private:
     /// stop for now.
     bool RunSlice(u64 quantum_ns);
     bool RunSliceOnce(u64 quantum_ns);
+    /// A Thumb thread's resume PC past a patched svc site's moved instruction.
+    u32 PastPatchedThumbSvc(u32 pc);
     void ReportFault();
+    /// A guest access at `va` the guest's table refused (a permission fault on a small page) by
+    /// `pc`: a page hold over a page queued GPU work still uses opens, or is taken as the guest's
+    /// access takes it, and the access can run again. False when no hold closed the page.
+    bool TakeHeldPage(u32 va, bool write, u32 pc);
     /// Patches a VFP instruction that trapped under the guest's LEN and STRIDE into a branch to a
     /// thunk, or out of reach into the module's svc.
     void PatchVfp(u32 pc, u32 insn, bool thumb);
@@ -217,9 +255,16 @@ private:
     /// Patches an ARM svc the module answered in the vector into a branch to a thunk answering it
     /// from the module's user pages.
     void PatchSvc(u32 pc);
-    /// The upcall experiment: the ARM svc at `pc` (gxm_flags `upcall=N`'s) into a branch to a
-    /// thunk that calls the emulator's C++ for it in the guest's world (AZAHAR_SEAL=0 only).
-    void PatchUpcall(u32 pc);
+    /// A caller reading the clock IdleReadsPerVblank times a guest vblank spins on it: its reads go
+    /// to the idle skip from then on.
+    void CheckTickPolls();
+    /// The tick thunk at `base` sends `caller`'s reads to the idle skip's upcall.
+    void EnableIdleSkip(u32 base, u32 caller);
+    /// Patches the svc at `pc` into a branch to a stub that runs the HLE handler in the guest's world.
+    void PatchUpcall(u32 pc, bool thumb);
+    void PatchUpcallThumb(u32 pc);
+    /// The upcall stubs' shared body and the redirect's entry, in this guest's thunk area.
+    void EnsureUpcallBody();
     u32 FetchCode(u32 pc, bool thumb) const;
 
     Core::System& system;
@@ -236,6 +281,9 @@ private:
     std::atomic<bool> stop_requested{};
     /// The slice ended inside an upcall: RunSlice runs the thread on.
     bool upcall_again{};
+    /// An upcall's svc register file; `run.ctx` is the live state of an exit inside the upcall.
+    std::array<u32, 16> upcall_regs{};
+    bool upcall_regs_live{};
     bool usable{};
 };
 

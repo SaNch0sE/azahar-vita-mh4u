@@ -19,6 +19,17 @@ enum KernelHandle : Handle {
     CurrentProcess = 0xFFFF8001,
 };
 
+class Process;
+
+/// The native core's thunks answer GetThreadId from the IDs they keep by handle: told of an
+/// answer, of a thread's handle closed, and of a table's handles all gone or loaded.
+struct ThreadIdHooks {
+    void (*answered)(const Process& process, Handle handle, u32 thread_id);
+    void (*closed)(Handle handle);
+    void (*cleared)();
+};
+extern ThreadIdHooks thread_id_hooks;
+
 /**
  * This class allows the creation of Handles, which are references to objects that can be tested
  * for validity and looked up. Here they are used to pass references to kernel objects to/from the

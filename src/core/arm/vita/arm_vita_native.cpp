@@ -52,23 +52,7 @@ std::unordered_map<u32, std::pair<u32, u32>> hold_page_accesses;
 /// In-kernel scheduling (azaharnative 34): the module switches the guest's threads on a
 /// SleepThread itself (AzaharSchedThread). On unless the frontend turned it off.
 bool in_kernel_scheduling = true;
-/// One slice's thread table: as ThreadManager::ExportNativeSchedule gave it, the module's copy
-/// of it (the threads' contexts in place), and the states the slice left.
-std::vector<Kernel::ThreadManager::NativeSchedEntry> sched_before, sched_after;
-std::array<AzaharSchedThread, AZAHAR_SCHED_MAX> sched_table;
-/// The arbiter the slice's table carries the waiters of, from export to import.
-std::shared_ptr<Kernel::AddressArbiter> sched_arbiter;
-/// The threads whose last stop was a SleepThread or an ArbitrateAddress (an exit for one, or one
-/// the module answered): only their slices carry the table. A title that sleeps rarely (a game: 200
-/// a second among 5,000 svc exits) paid the table's export and import on every slice, 6% of its
-/// race.
-std::unordered_set<u32> sched_waiters;
-/// The arbiter handle of the last ArbitrateAddress that exited: the one the module answers
-/// (azaharnative 36; a title has one, MH Generations its single CreateAddressArbiter).
-Kernel::Handle sched_arbiter_handle{};
-
-// A thread's context is the module's AzaharContext, fpexc after it: the module loads a thread
-// from its own context in place (the upcall's switch, the in-kernel scheduler's table).
+// The module loads a thread from its AzaharContext in place; fpexc follows it.
 using ThreadContext = ARM_Interface::ThreadContext;
 static_assert(std::is_standard_layout_v<ThreadContext>);
 static_assert(offsetof(ThreadContext, cpu_registers) == offsetof(AzaharContext, r) &&
@@ -451,6 +435,7 @@ struct VfpThunk {
 // to r0 and r1. A handle it does not answer, or an answer the page does not hold this entry, runs
 // the original svc in the thunk's miss path (an exit, or the module's own answer). Thumb's 16-bit
 // svc has no room for a branch and stays.
+// GetThreadId's thunk answers for another handle too, from the IDs the svc gave before (ThreadIds).
 
 /// An svc thunk's instructions by address, for a thread stopped inside it (FinishSvcThunk).
 struct SvcThunk {
@@ -464,28 +449,80 @@ struct SvcThunk {
     u32 miss_pop;
     u32 miss_svc;
     u32 miss_back;
+    /// GetSystemTick's only: the idle skip's exit and resume points, and the callers' counters.
+    u32 idle, idle_pop, idle_b;
+    u32 answer, answer_mrs, answer_b;
+    u32 data;
+    u32 skip; ///< the idle skip's upcall stub, 0 until a caller spins on the clock
     u32 end;
 };
-/// The largest svc thunk: GetSystemTick's 31 words.
-constexpr u32 SvcThunkMax = 136;
+/// The largest svc thunk: GetSystemTick's 71 words.
+constexpr u32 SvcThunkMax = 296;
 
 /// The guest's patched sites and thunks; the svc sites PatchSvc could not patch.
 std::unordered_map<u32, PatchedSite> patched_sites;
 std::map<u32, VfpThunk> vfp_thunks;
 std::map<u32, SvcThunk> svc_thunks;
-/// An upcall thunk (the experiment below): its site, end, and the svcs its tail may run (the
-/// reschedule's and the original's), each followed by the branch back.
+/// An upcall thunk: its entry stub, its end, and where the guest's moved code in it starts.
 struct UpcallThunk {
     u32 site;
     u32 end;
-    u32 svc_reschedule;
-    u32 svc_original;
+    u32 moved;
 };
 std::map<u32, UpcallThunk> upcall_thunks;
+/// The upcall thunks' shared body (EnsureUpcallBody) and the PC after its AZAHAR_SWITCH_SVC; 0
+/// for none.
+u32 upcall_body{}, upcall_after_svc{};
+/// The svc redirect's record: the module returns an svc it does not answer into `entry`.
+AzaharRedirect upcall_redirect{};
 std::unordered_set<u32> svc_refused;
+/// A GetSystemTick thunk's counters for the idle loops (CheckTickPolls): eight caller slots with
+/// their calls, then the caller sent to the idle skip.
+constexpr u32 TickSlots = 8;
+constexpr u32 TickSkipWord = 2 * TickSlots;
+constexpr u32 TickDataWords = TickSkipWord + 1;
+struct TickWindow {
+    u32 caller{};
+    u32 calls{};
+    u64 since{};
+};
+struct TickThunk {
+    u32 base;
+    u32 site;
+    u32 data;
+    std::array<TickWindow, TickSlots> window{};
+};
+std::vector<TickThunk> tick_thunks;
+/// A caller reading the clock this often in a guest vblank is spinning on it.
+constexpr u64 IdleReadsPerVblank = 1000;
 std::unique_ptr<Common::HostSharedMemory> thunk_area;
 const VitaGuestMap* thunk_area_map{};
 u32 thunk_area_used{};
+
+/// GetThreadId's answer for a handle, the thunk's from now on. One word a slot: a thunk reading
+/// while another host's thread closes the handle sees the ID or none.
+void ThreadIdAnswered(const Kernel::Process& process, Kernel::Handle handle, u32 thread_id) {
+    const u32 slot = handle >> 15;
+    if (slot >= LeaseSlots || thread_id >> (32 - ThreadIdShift) != 0) {
+        return; // the current thread's pseudo handle; an ID past the word
+    }
+    if (LeaseProcess() == NoLeaseProcess) {
+        LeaseProcess() = process.process_id;
+    } else if (LeaseProcess() != process.process_id) {
+        return;
+    }
+    std::atomic_ref<u32>(ThreadIds()[slot]).store(thread_id << ThreadIdShift | (handle & 0x7FFFu));
+}
+
+void ThreadIdClosed(Kernel::Handle handle) {
+    std::atomic_ref<u32>(ThreadIds()[handle >> 15]).store(0);
+}
+
+void ThreadIdsCleared() {
+    for (u32 slot = 0; slot < LeaseSlots; slot++) {
+        std::atomic_ref<u32>(ThreadIds()[slot]).store(0);
+    }
+}
 
 /// The guest that map held is gone, and its patches with it.
 void ForgetThunks(const VitaGuestMap* map) {
@@ -494,7 +531,10 @@ void ForgetThunks(const VitaGuestMap* map) {
         vfp_thunks.clear();
         svc_thunks.clear();
         svc_refused.clear();
+        tick_thunks.clear();
         upcall_thunks.clear();
+        upcall_body = upcall_after_svc = 0;
+        upcall_redirect.entry = 0;
         thunk_area_used = 0;
         thunk_area_map = nullptr;
     }
@@ -619,17 +659,17 @@ void FinishSvcThunk(Memory::MemorySystem& memory, AzaharContext& c) {
         c.r[13] += 16;
     };
     const auto flags = [&] { c.cpsr = (c.cpsr & ~0xF8000000u) | (c.r[14] & 0xF8000000u); };
-    if (pc == it->first || pc == t.miss_svc) {
+    if (pc == it->first || pc == t.miss_svc || pc == t.idle_b || pc == t.answer) {
         c.r[15] = t.site;
     } else if (pc == t.back || pc == t.miss_back) {
         c.r[15] = t.site + 4;
-    } else if (pc == t.pop || pc == t.miss_pop) {
+    } else if (pc == t.pop || pc == t.miss_pop || pc == t.idle_pop || pc == t.answer_mrs) {
         pop();
         c.r[15] = pc == t.pop ? t.site + 4 : t.site;
     } else {
-        // Between the mrs and an msr: the flags are in LR.
-        DEBUG_ASSERT_MSG(pc <= t.done || pc == t.miss, "a thread at {:08X} in svc thunk {:08X}", pc,
-                         it->first);
+        // Between the mrs and an msr (or the answer's mrs and its branch): the flags are in LR.
+        DEBUG_ASSERT_MSG(pc <= t.done || pc == t.miss || pc == t.idle || pc == t.answer_b,
+                         "a thread at {:08X} in svc thunk {:08X}", pc, it->first);
         if (pc > t.mrs) {
             flags();
         }
@@ -638,53 +678,50 @@ void FinishSvcThunk(Memory::MemorySystem& memory, AzaharContext& c) {
     }
 }
 
-// Upcalls (the module built with AZAHAR_SEAL=0; on in a VITA_UPCALLS build, else sgxd_flags
-// `upcalls`): an svc that leaves the guest is answered by the HLE kernel's own
-// handler, called from the guest's world. The unsealed table has the app's pages (the process's
-// TTBR1 entries, with the domains granted for the slice), so a thunk in place of the svc switches
-// to a stack of the app's and BLXes into the app's code at user level, with no exception and no
-// world switch. The C++ for svc N (UpcallSvcN, ARM_VitaNative::UpcallSvc) loads the running
-// core's register file from the svc's r0-r7, runs SVC::CallSVCForUpcall under the HLE lock, and
-// answers in r0 (the svc's result) and r1 (UpcallStatus), r1-r3's outputs in the thunk's frame.
+// Upcalls: an svc that leaves the guest is answered by the HLE kernel's handler, called from the
+// guest's world. A thunk in place of the svc switches to a stack of the app's and BLXes into the
+// app's code at user level (UpcallSvcN, ARM_VitaNative::UpcallSvc), which answers in r0 (the
+// result) and r1 (UpcallStatus), the other outputs in the thunk's frame.
 //
-// An svc keeps every register but its outputs, and the flags; the C++ keeps r4-r11, d8-d15 and
-// SP by the calling convention, so the thunk keeps the caller-saved rest: r0-r3, r12, LR (the
-// BLX's) and the flags on the guest's stack, the guest's SP on the app's stack, r4-r7 copied as
-// the C++'s stack arguments. FPSCR stays the guest's (LEN and STRIDE are 0 at a call). The C++
-// runs with the guest's TPIDRURO (user mode cannot write it): the frontend's wraps find the
-// emulation thread's thread-local storage for it (citra_vita/upcall_tls.cpp), and a Sony syscall
-// it makes is forwarded to Sony's world (ForwardSonySyscall).
+// The thunk keeps the caller-saved registers, the flags and LR; r4-r7 go as the C++'s stack
+// arguments. The C++ runs with the emulation thread's TPIDRURO and FPSCR (Sony's libraries find
+// the thread through TPIDRURO); a Sony syscall it makes is forwarded (ForwardSonySyscall).
 //
-// A svc that stopped the thread or asked for a reschedule answers UpcallReschedule, and the
-// thunk's tail runs svc UpcallRescheduleSvc for an exit that only reschedules. (The tail's other
-// svc, the original for UpcallBusy, is no longer answered.) A quantum that ends inside a thunk or
-// the C++ runs the same thread on at once, and the in-kernel scheduler is off meanwhile: another
-// thread's upcall would use the same stack.
+// Each site's stub pushes the frame with its resume PC and goes to the shared body. A Thumb
+// site's 16-bit svc has no room for a branch: the next instruction moves into the stub. A site
+// out of reach stays an svc, which the module returns into the redirect (AzaharRedirect).
+//
+// An svc that stopped the thread or asked for a reschedule answers UpcallReschedule and the tail
+// runs svc UpcallRescheduleSvc. A quantum ending inside a thunk or its C++ runs the same thread
+// on: another thread's upcall would use the same stack.
 
-enum UpcallStatus : u32 { UpcallDone = 0, UpcallReschedule = 1, UpcallBusy = 2 };
-constexpr u32 UpcallRescheduleSvc = 0xFD;
+enum UpcallStatus : u32 { UpcallDone = 0, UpcallReschedule = 1 };
+constexpr u32 UpcallRescheduleSvc = AZAHAR_SWITCH_SVC;
 
 alignas(16) std::array<u8, 64 * 1024> upcall_stack;
-Core::System* upcall_system{};
-/// Every svc an upcall (a VITA_UPCALLS build); the svcs the
-/// module does not answer go to the redirect too. Idle loops are skipped (CheckTickPolls) with
-/// upcalls only: the skip is one.
-bool upcall_all{};
+#ifdef VITA_DIAGNOSTICS
+constexpr u8 UpcallStackFill = 0xA5;
+bool upcall_stack_filled{};
+#endif
+} // Anonymous namespace
+} // namespace Core
 
+/// The emulation thread's TPIDRURO, set at each slice, for the upcall body and upcall_tls.cpp.
+extern "C" u32 azahar_upcall_host_tp = 0;
+
+namespace Core {
+namespace {
+Core::System* upcall_system{};
 u32 upcall_quantums{};
+/// The quantums one upcall may take before the stop: five seconds of minimal ones.
+constexpr u32 MaxUpcallQuantums = 20000;
+u32 upcall_forwards{};
+/// The last Sony syscall an upcall forwarded, and its caller: for the asserts.
+u32 upcall_last_syscall{}, upcall_last_syscall_lr{};
 /// The core whose slice an upcall runs in: its register file is the svc's for the HLE handlers.
 ARM_VitaNative* upcall_core{};
 
-bool UpcallsOn() {
-    return upcall_all;
-}
-
-/// Whether svc `number`'s sites become upcalls: with upcalls on, every svc PatchUpcall has a C++
-/// answer for.
 bool UpcallFor(u32 number) {
-    if (!upcall_all) {
-        return false;
-    }
     // Every svc but the module's own.
     return number != 0 && number != AZAHAR_VFP_SVC && number != UpcallRescheduleSvc;
 }
@@ -703,36 +740,126 @@ constexpr auto upcall_table = MakeUpcallTable(std::make_index_sequence<0x100>{})
 /// Whether a reschedule was asked while an upcall ran (ARM_VitaNative::PrepareReschedule).
 std::atomic<bool> upcall_reschedule_asked{};
 
+/// The emulation thread's FPSCR, set at each slice: the upcall body's for the C++.
+u32 upcall_host_fpscr{};
+
+/// Whether `pc` is the app's code or an upcall thunk's own (not a Thumb site's moved instruction).
 bool InUpcall(u32 pc) {
     if (pc >= 0x40000000u) {
         return true; // the app's own code
     }
     const auto it = upcall_thunks.upper_bound(pc);
-    return it != upcall_thunks.begin() && pc < std::prev(it)->second.end;
+    return it != upcall_thunks.begin() && pc < std::prev(it)->second.moved;
 }
 
-/// The svc at `pc` is one an upcall thunk's tail runs: the guest's registers and stack are its
-/// own again there, and the exit is an ordinary one.
-bool IsUpcallTailSvc(u32 pc) {
-    const auto it = upcall_thunks.upper_bound(pc);
-    if (it == upcall_thunks.begin()) {
-        return false;
-    }
-    const UpcallThunk& t = std::prev(it)->second;
-    return pc == t.svc_reschedule || pc == t.svc_original;
+/// An svc exit at `pc` came from the upcall body's tail: an ordinary exit.
+bool IsUpcallTailExit(u32 pc) {
+    return upcall_after_svc != 0 && pc == upcall_after_svc;
 }
 
 u64 UpcallAnswer(u32 result, UpcallStatus status) {
     return u64{result} | u64{status} << 32;
 }
 
-/// The guest's r0-r3, r12 and LR as the thunk saved them on the guest's stack (the guest's SP is
-/// at the top of the app's stack): an output beyond r0 goes into its slot, which the thunk's
-/// tail pops. A guest address, reachable as it is because the upcall runs in the guest's world.
-u32* UpcallGuestRegs() {
-    u32 guest_sp;
-    std::memcpy(&guest_sp, upcall_stack.data() + upcall_stack.size() - 8, sizeof(guest_sp));
-    return reinterpret_cast<u32*>(static_cast<uintptr_t>(guest_sp)) + 1; // past the flags word
+/// The thunk's frame at the upcall stack's top, never on the guest's stack (a game may keep words
+/// below its SP live): [0] the flags, [1 + n] rn for r0-r12, [14] SP, [15] LR, [16] the resume PC
+/// (bit 0 for Thumb). The tail loads r0-r12, SP, LR and PC with one ldm. Below the frame, the
+/// body's: the guest's TPIDRURO, d8-d15, FPSCR, the C++'s address and r4-r7.
+constexpr u32 UpcallFrameWords = 17;
+constexpr u32 FrameFlags = 0, FrameR0 = 1, FrameSp = 14, FrameLr = 15, FrameResume = 16;
+u32* UpcallFrame() {
+    return reinterpret_cast<u32*>(upcall_stack.data() + upcall_stack.size() - UpcallFrameWords * 4);
+}
+/// The guest's d8-d15 at the svc, as the body saved them.
+const u32* UpcallVfpSave() {
+    return reinterpret_cast<const u32*>(reinterpret_cast<const u8*>(UpcallFrame()) - 4 - 64);
+}
+/// The guest's FPSCR at the svc (the C++ runs with the emulation thread's).
+u32 UpcallGuestFpscr() {
+    u32 v;
+    std::memcpy(&v, reinterpret_cast<const u8*>(UpcallFrame()) - 4 - 64 - 4, sizeof(v));
+    return v;
+}
+
+/// The guest clock's rate this slice (AzaharRunRequest.tick_hz), for an idle's quantum.
+u64 upcall_tick_hz{};
+
+/// AZAHAR_CLOCK_SVC, from an upcall only: the guest ticks since the slice's clock last started;
+/// it starts again over `quantum` private-timer ticks, from `base` when `set`.
+u64 UpcallClock(bool set, u32 quantum, u64 base) {
+    static_assert(AZAHAR_CLOCK_SVC == 0xFB);
+    register u32 r0 asm("r0") = set ? 1u : 0u;
+    register u32 r1 asm("r1") = quantum;
+    register u32 r2 asm("r2") = static_cast<u32>(base);
+    register u32 r3 asm("r3") = static_cast<u32>(base >> 32);
+    asm volatile("svc #0xfb" : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3) : : "r12", "memory");
+    return u64{r1} << 32 | r0;
+}
+
+/// `ns` in private-timer ticks at this slice's guest clock rate, at least one, in 32.32 fixed
+/// point (no doubles: a library call each on ARM32). For up to MaxQuantumNs.
+u32 UpcallTimerTicks(u64 ns) {
+    const auto* const page = reinterpret_cast<const volatile AzaharUserPage*>(
+        static_cast<uintptr_t>(AZAHAR_USER_PAGE_VA));
+    static u64 tick_hz{}, ticks_per_ns_q32{};
+    static u32 mult_int{}, mult_frac{};
+    if (upcall_tick_hz != tick_hz || page->mult_int != mult_int || page->mult_frac != mult_frac) {
+        tick_hz = upcall_tick_hz;
+        mult_int = page->mult_int;
+        mult_frac = page->mult_frac;
+        const double per_tick = mult_int + mult_frac / 4294967296.0;
+        ticks_per_ns_q32 =
+            static_cast<u64>(static_cast<double>(tick_hz) / 1e9 / per_tick * 4294967296.0);
+    }
+    DEBUG_ASSERT(ns <= MaxQuantumNs);
+    const u64 ticks = (ns * ticks_per_ns_q32) >> 32;
+    return static_cast<u32>(std::clamp<u64>(ticks, 1, 0xFFFFFFFF));
+}
+
+/// Whether the module's clock stands still for an upcall's C++: an exit inside adds no guest time.
+bool upcall_clock_paused{};
+
+/// The guest's time on again after an upcall's C++, over `quantum_ns`, the C++'s time left out.
+void ResumeUpcallClock(Core::Timing::Timer& timer, u64 quantum_ns) {
+    upcall_clock_paused = false;
+    UpcallClock(true, UpcallTimerTicks(quantum_ns), timer.GetTicks());
+}
+
+/// Pauses the guest's clock for an upcall's C++. The timer runs on over the re-arm quantum: it is
+/// the core's only interrupt in the guest's world, and its re-arm is where a pending SGI sends the
+/// core back to Sony's.
+u64 PauseUpcallClock() {
+    upcall_clock_paused = true;
+    return UpcallClock(false, UpcallTimerTicks(MinQuantumNs), 0);
+}
+
+/// The redirect's C++: the svc's number from the record.
+u64 UpcallSvcRedirect(u32 r0, u32 r1, u32 r2, u32 r3, u32 r4, u32 r5, u32 r6, u32 r7) {
+#ifdef VITA_DIAGNOSTICS
+    census.upcall_redirects++;
+#endif
+    return ARM_VitaNative::UpcallSvc(upcall_redirect.svc, {r0, r1, r2, r3, r4, r5, r6, r7});
+}
+
+/// The thread switch the module makes from an upcall (AZAHAR_SWITCH_SVC).
+AzaharSwitch upcall_switch{};
+
+/// The words on the upcall stack that point into the app's code, deepest first: the C++'s return
+/// addresses, for an assert's message.
+std::string UpcallReturns(const AzaharContext& c) {
+    std::string list;
+    const u32 stack_lo = static_cast<u32>(reinterpret_cast<uintptr_t>(upcall_stack.data()));
+    const u32 stack_hi = stack_lo + static_cast<u32>(upcall_stack.size());
+    if (c.r[13] >= stack_lo && c.r[13] < stack_hi) {
+        for (u32 a = c.r[13] & ~3u; a < stack_hi && list.size() < 400; a += 4) {
+            u32 w;
+            std::memcpy(&w, upcall_stack.data() + (a - stack_lo), 4);
+            if (w >= 0x81000000u && w < 0x82000000u) {
+                list += fmt::format(" {:08X}", w);
+            }
+        }
+    }
+    return list;
 }
 
 /// A Sony syscall (svc 0, its number in r12) an upcall's C++ made in the guest's world, made again
@@ -761,16 +888,25 @@ void ForwardSonySyscall(AzaharContext& c) {
     c.r[12] = r12;
 }
 
-/// A thread stopped in an upcall thunk stands after one of its tail's svcs (any other stop runs
-/// on at once): it goes on after the site.
-void FinishUpcallThunk(AzaharContext& c) {
+/// A thread stopped in an upcall thunk stands in a Thumb site's moved instruction: it goes on at
+/// the guest's own code.
+void FinishUpcallThunk(Memory::MemorySystem& memory, AzaharContext& c) {
+    // The moved instruction, or its branch back: the site's next instruction, or the one after.
+    const auto unmove = [](u32 pc) -> std::optional<u32> {
+        const auto it = upcall_thunks.upper_bound(pc);
+        if (it == upcall_thunks.begin()) {
+            return std::nullopt;
+        }
+        const UpcallThunk& t = std::prev(it)->second;
+        if (t.site == 0 || pc < t.moved || pc >= t.end) {
+            return std::nullopt;
+        }
+        return pc == t.moved ? t.site + 2 : t.site + 4;
+    };
     const u32 pc = c.r[15];
-    const auto it = upcall_thunks.upper_bound(pc);
-    ASSERT_MSG(it != upcall_thunks.begin(), "a thread at {:08X} in no upcall thunk", pc);
-    const UpcallThunk& t = std::prev(it)->second;
-    ASSERT_MSG(pc == t.svc_reschedule + 4 || pc == t.svc_original + 4,
-               "a thread at {:08X} inside upcall thunk {:08X}", pc, std::prev(it)->first);
-    c.r[15] = t.site + 4;
+    const auto back = unmove(pc);
+    ASSERT_MSG(back.has_value(), "a thread at {:08X} inside an upcall thunk", pc);
+    c.r[15] = *back;
 }
 
 /// The Finish* for the thunk the thread stands in.
@@ -782,7 +918,7 @@ void FinishThunk(Memory::MemorySystem& memory, AzaharContext& c) {
     };
     const s64 v = below(vfp_thunks), s = below(svc_thunks), u = below(upcall_thunks);
     if (u > v && u > s) {
-        FinishUpcallThunk(c);
+        FinishUpcallThunk(memory, c);
     } else if (s > v) {
         FinishSvcThunk(memory, c);
     } else {
@@ -961,7 +1097,7 @@ bool VitaGuestMap::Install() {
     }
     if (extra.size != 0) {
         const bool mapped = Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(extra.host), extra_base,
-                                 extra.size, AZAHAR_PERM_R | AZAHAR_PERM_X);
+                                 extra.size, GuestPerm);
         ASSERT_MSG(mapped, "the VFP thunk area {:#010x}+{:#x} was not mapped", extra_base,
                    extra.size);
     }
@@ -1011,8 +1147,8 @@ void VitaGuestMap::MapExtra(VAddr base, u32 size, u8* host) {
     extra_base = base;
     extra = Mapping{size, host};
     if (installed) {
-        const bool mapped = Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(host), base, size,
-                                 AZAHAR_PERM_R | AZAHAR_PERM_X);
+        const bool mapped =
+            Edit(AZAHAR_EDIT_MAP, reinterpret_cast<u32>(host), base, size, GuestPerm);
         ASSERT_MSG(mapped, "the extra guest mapping {:#010x}+{:#x} was not mapped", base, size);
     }
 }
@@ -1083,8 +1219,8 @@ void ARM_VitaNative::Run() {
     // about the slice that just ended.
     stop_requested = false;
 
-    const u64 quantum = std::clamp(TicksToNanoseconds(timer->GetDowncount()), MinQuantumNs,
-                                   MaxQuantumNs);
+    const u64 quantum =
+        std::clamp(TicksToNanoseconds(timer->GetDowncount()), MinQuantumNs, MaxQuantumNs);
     while (RunSlice(quantum)) {
         if (timer->GetDowncount() <= 0 || break_flag || stop_requested) {
             break;
@@ -1345,6 +1481,7 @@ std::optional<u32> ARM_VitaNative::ThunkRoom(u32 size) {
         ASSERT_MSG(thunk_area->Data() != nullptr &&
                        (reinterpret_cast<uintptr_t>(thunk_area->Data()) & 0xFFFu) == 0,
                    "the thunk area's {} KiB", ThunkAreaSize >> 10);
+        Kernel::thread_id_hooks = {&ThreadIdAnswered, &ThreadIdClosed, &ThreadIdsCleared};
     }
     if (thunk_area_map != map.get()) {
         ForgetThunks(thunk_area_map); // another guest's
@@ -1426,7 +1563,7 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
         to_miss.emplace_back(n, c);
         put(0);
     };
-    constexpr u32 EQ = 0x0, NE = 0x1;
+    constexpr u32 EQ = 0x0, NE = 0x1, HS = 0x2;
     const auto page = [&] {
         put(movw(12, AZAHAR_USER_PAGE_VA & 0xFFFF));
         put(movt(12, AZAHAR_USER_PAGE_VA));
@@ -1450,8 +1587,37 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
     put(0xE92D500Cu); // push {r2, r3, r12, lr}
     t.mrs = at();
     put(0xE10FE000u); // mrs lr, apsr
+    // GetSystemTick's counters' address (two movw/movt pairs) and its branch to the idle skip's
+    // way out, filled in once both have an address; where the answer starts.
+    std::array<u32, 2> data_mov{};
+    u32 to_idle = 0, normal = 0;
+    // GetThreadId's branch from its other handles' answer to the way back.
+    u32 to_done = 0;
     switch (kind) {
     case AZAHAR_FAST_TICK: {
+        // The call counted in its caller's slot (the guest's LR, pushed; CheckTickPolls reads
+        // them); the caller that spins on the clock goes out to the idle skip.
+        data_mov[0] = n;
+        put(0);
+        put(0);
+        put(ldr(3, 13, 12)); // the caller
+        put(0xE203201Cu);    // and r2, r3, #0x1c: its slot's index times 4
+        put(0xE08C2082u);    // add r2, r12, r2, lsl #1: its slot
+        put(ldr(12, 2, 0));  // the slot's caller
+        put(cmp(12, 3));
+        put(0x0592C004u); // ldreq r12, [r2, #4]
+        put(0x028CC001u); // addeq r12, r12, #1
+        put(0x13A0C001u); // movne r12, #1
+        put(0xE582C004u); // str r12, [r2, #4]: its calls
+        put(0x15823000u); // strne r3, [r2]: a caller new to the slot
+        data_mov[1] = n;
+        put(0);
+        put(0);
+        put(ldr(2, 12, 4 * TickSkipWord)); // the caller sent to the skip, 0 for none
+        put(cmp(2, 3));
+        to_idle = n;
+        put(0); // beq idle
+        normal = at();
         // r1:r0 = base + (quantum - counter) * mult, the counter read between two reads of the
         // same gen (r2): azahar_svc_fast's computation.
         page();
@@ -1481,16 +1647,52 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
         t.answered = at();
         break;
     }
-    case AZAHAR_FAST_THREAD_ID:
-    case AZAHAR_FAST_PROCESS_ID:
-        // r0 = 0, r1 = the ID, for the current thread (0xFFFF8000) or process (0xFFFF8001).
-        handle(1, kind == AZAHAR_FAST_THREAD_ID ? 0xFFFF8000u : 0xFFFF8001u);
+    case AZAHAR_FAST_THREAD_ID: {
+        // r0 = 0, r1 = the ID: the current thread's (0xFFFF8000) from the page, another handle's
+        // from the IDs the svc gave before (ThreadIds), while the handle's slot holds its
+        // generation and the leases' process runs.
+        put(movw(12, 0x8000));
+        put(movt(12, 0xFFFF8000u));
+        put(cmp(1, 12));
+        const u32 to_current = n;
+        put(0);
+        page();
+        put(ldr(2, 12, offsetof(AzaharUserPage, process_id)));
+        put(movw(12, (ThunkAreaBase + LeaseTableOffset) & 0xFFFF));
+        put(movt(12, ThunkAreaBase + LeaseTableOffset));
+        put(ldr(3, 12, 0));
+        put(cmp(2, 3));
+        branch_miss(NE);
+        put(0xE1A027A1u); // mov r2, r1, lsr #15: the handle's slot
+        put(0xE3520A01u); // cmp r2, #0x1000
+        branch_miss(HS);
+        static_assert(LeaseTableOffset - ThreadIdsOffset == 0x4000 && LeaseSlots == 0x1000);
+        put(0xE24C3901u); // sub r3, r12, #0x4000
+        put(0xE7932102u); // ldr r2, [r3, r2, lsl #2]
+        put(0xE0223001u); // eor r3, r2, r1
+        put(0xE1B03883u); // movs r3, r3, lsl #17: the generations differ
+        branch_miss(NE);
+        put(0xE1B03881u); // movs r3, r1, lsl #17: generation 0, an empty word's
+        branch_miss(EQ);
+        put(0xE3A00000u); // mov r0, #0
+        put(0xE1A017A2u); // mov r1, r2, lsr #15
+        to_done = n;
+        put(0);
+        buf[to_current] = ArmBranch(EQ, base + to_current * 4, at()).value();
         page();
         answers();
         put(0xE3A00000u); // mov r0, #0
-        put(ldr(1, 12,
-                kind == AZAHAR_FAST_THREAD_ID ? offsetof(AzaharUserPage, thread_id)
-                                              : offsetof(AzaharUserPage, process_id)));
+        put(ldr(1, 12, offsetof(AzaharUserPage, thread_id)));
+        t.answered = at();
+        break;
+    }
+    case AZAHAR_FAST_PROCESS_ID:
+        // r0 = 0, r1 = the ID, for the current process (0xFFFF8001).
+        handle(1, 0xFFFF8001u);
+        page();
+        answers();
+        put(0xE3A00000u); // mov r0, #0
+        put(ldr(1, 12, offsetof(AzaharUserPage, process_id)));
         t.answered = at();
         break;
     default:
@@ -1504,6 +1706,9 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
     }
     // msr apsr_nzcvq, lr; pop {r2, r3, r12, lr}; b back
     t.done = at();
+    if (to_done != 0) {
+        buf[to_done] = ArmBranch(0xE, base + to_done * 4, t.done).value();
+    }
     put(0xE128F00Eu);
     t.pop = at();
     put(0xE8BD500Cu);
@@ -1528,6 +1733,32 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
     put(0xEF000000u | number);
     t.miss_back = at();
     put_back();
+    if (kind == AZAHAR_FAST_TICK) {
+        // idle: the guest's flags and registers back, then the idle skip's upcall (EnableIdleSkip
+        // branches there; until then the miss's svc). answer: the skip's resume, the thunk again
+        // past its check, the clock moved on. Then the counters.
+        t.idle = at();
+        put(0xE128F00Eu); // msr apsr_nzcvq, lr
+        t.idle_pop = at();
+        put(0xE8BD500Cu); // pop {r2, r3, r12, lr}
+        t.idle_b = at();
+        put(ArmBranch(0xE, t.idle_b, t.miss_svc).value());
+        t.answer = at();
+        put(0xE92D500Cu); // push {r2, r3, r12, lr}
+        t.answer_mrs = at();
+        put(0xE10FE000u); // mrs lr, apsr
+        t.answer_b = at();
+        put(ArmBranch(0xE, t.answer_b, normal).value());
+        t.data = at();
+        for (u32 k = 0; k < TickDataWords; k++) {
+            put(0);
+        }
+        for (const u32 w : data_mov) {
+            buf[w] = movw(12, t.data);
+            buf[w + 1] = movt(12, t.data);
+        }
+        buf[to_idle] = ArmBranch(EQ, base + to_idle * 4, t.idle).value();
+    }
     t.end = at();
     for (const auto& [word, c] : to_miss) {
         const auto b = ArmBranch(c, base + word * 4, t.miss);
@@ -1544,6 +1775,9 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
     map->SyncCode(base, n * 4);
     thunk_area_used += n * 4;
     svc_thunks[base] = t;
+    if (kind == AZAHAR_FAST_TICK) {
+        tick_thunks.push_back(TickThunk{base, pc, t.data});
+    }
     memory.Write32(pc, *site);
     map->SyncCode(pc, 4);
     patched_sites[pc] = PatchedSite{insn, false};
@@ -1552,8 +1786,273 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
 #endif
 }
 
-void ARM_VitaNative::PatchUpcall(u32 pc) {
+namespace {
+u32 ArmMovw(u32 rd, u32 v) {
+    return 0xE3000000u | (v >> 12 & 0xF) << 16 | rd << 12 | (v & 0xFFF);
+}
+u32 ArmMovt(u32 rd, u32 v) {
+    return 0xE3400000u | (v >> 28 & 0xF) << 16 | rd << 12 | (v >> 16 & 0xFFF);
+}
+/// Thumb-2 MOVW (`op` 0xF240) or MOVT (0xF2C0) of the 16-bit `v` into `rd`, its halfwords.
+std::array<u16, 2> ThumbMov16(u16 op, u32 rd, u32 v) {
+    return {static_cast<u16>(op | (v >> 11 & 1) << 10 | (v >> 12 & 0xF)),
+            static_cast<u16>((v >> 8 & 7) << 12 | rd << 8 | (v & 0xFF))};
+}
+/// Thumb-2 BLX (T2) at `from` to the ARM code at `to`, its halfwords, if in reach.
+std::optional<std::array<u16, 2>> ThumbBlxArm(u32 from, u32 to) {
+    const s32 off = static_cast<s32>(to - ((from + 4) & ~3u));
+    if ((off & 3) != 0 || off < -(1 << 24) || off >= (1 << 24)) {
+        return std::nullopt;
+    }
+    const u32 u = static_cast<u32>(off);
+    const u32 sign = u >> 31 & 1, i1 = u >> 23 & 1, i2 = u >> 22 & 1;
+    const u32 j1 = ~(i1 ^ sign) & 1, j2 = ~(i2 ^ sign) & 1;
+    return std::array<u16, 2>{static_cast<u16>(0xF000u | sign << 10 | (u >> 12 & 0x3FFu)),
+                              static_cast<u16>(0xC000u | j1 << 13 | j2 << 11 | (u >> 1 & 0x7FEu))};
+}
+u32 HostAddress(const void* p) {
+    return static_cast<u32>(reinterpret_cast<uintptr_t>(p));
+}
+u32 HostAddress(UpcallFn fn) {
+    return static_cast<u32>(reinterpret_cast<uintptr_t>(fn));
+}
+/// A thunk's way into the body, from `base`: the guest's SP into a slot of its own, SP to the
+/// frame's SP word, r0-r12, LR and the guest's SP into the frame, `resume` (instructions that
+/// leave the resume PC in r12) and the resume PC into it, SP to r0's word, the C++ (`fn`) in r12
+/// and a branch to the body; then the frame's address and the slot. Nothing below the guest's
+/// SP is written.
+std::optional<std::vector<u32>> UpcallEntry(u32 base, std::initializer_list<u32> resume, u32 fn,
+                                            u32 body) {
+    std::vector<u32> w;
+    w.push_back(0);           // str sp, [pc, #slot]
+    w.push_back(0);           // ldr sp, [pc, #frame_sp]
+    w.push_back(0xE90D1FFFu); // stmdb sp, {r0-r12}
+    w.push_back(0xE58DE004u); // str lr, [sp, #4]
+    const std::size_t load_slot = w.size();
+    w.push_back(0);           // ldr r12, [pc, #slot]: the guest's SP
+    w.push_back(0xE58DC000u); // str r12, [sp]
+    w.insert(w.end(), resume);
+    w.push_back(0xE58DC008u); // str r12, [sp, #8]: the resume PC
+    w.push_back(0xE24DD034u); // sub sp, sp, #52: r0's word
+    w.push_back(ArmMovw(12, fn));
+    w.push_back(ArmMovt(12, fn));
+    const std::size_t branch = w.size();
+    w.push_back(0);
+    const std::size_t frame_sp = w.size();
+    w.push_back(HostAddress(&UpcallFrame()[FrameSp]));
+    const std::size_t slot = w.size();
+    w.push_back(0);
+    const auto pc_rel = [](std::size_t at, std::size_t target) {
+        return static_cast<u32>((target - at) * 4 - 8);
+    };
+    w[0] = 0xE58FD000u | pc_rel(0, slot);
+    w[1] = 0xE59FD000u | pc_rel(1, frame_sp);
+    w[load_slot] = 0xE59FC000u | pc_rel(load_slot, slot);
+    const auto to_body = ArmBranch(0xE, base + static_cast<u32>(branch) * 4, body);
+    if (!to_body) {
+        return std::nullopt;
+    }
+    w[branch] = *to_body;
+    return w;
+}
+
+} // Anonymous namespace
+
+void ARM_VitaNative::EnsureUpcallBody() {
+    if (upcall_body != 0 && thunk_area_map == map.get()) {
+        return;
+    }
+    constexpr u32 BodyMax = 384;
+    const auto room = ThunkRoom(BodyMax); // may forget another guest's thunks, this body's too
+    ASSERT_MSG(room.has_value(), "no room for the upcall thunks' body");
+    const u32 base = *room;
+    std::array<u32, BodyMax / 4> buf{};
+    u32 n = 0;
+    const auto at = [&] { return base + n * 4; };
+    const auto put = [&](u32 w) {
+        ASSERT(n < buf.size());
+        buf[n++] = w;
+    };
+    const auto put_mov32 = [&](u32 rd, u32 v) {
+        put(ArmMovw(rd, v));
+        put(ArmMovt(rd, v));
+    };
+#ifdef VITA_DIAGNOSTICS
+    std::memset(upcall_stack.data(), UpcallStackFill, upcall_stack.size() - 256);
+    upcall_stack_filled = true;
+#endif
+    // The body, entered from a thunk's UpcallEntry: the frame complete but for the flags, SP at
+    // its r0 word, the C++ in r12.
+    put(0xE10FE000u); // mrs lr, apsr
+    put(0xE52DE004u); // str lr, [sp, #-4]!: the flags, SP at the frame
+    put(0xEE1DEF70u); // mrc p15, 0, lr, c13, c0, 3: the guest's TPIDRURO
+    put(0xE52DE004u); // push {lr}
+    put(0xED2D8B10u); // vpush {d8-d15}: the guest's callee-saved VFP registers
+    put(0xEEF1EA10u); // vmrs lr, fpscr
+    put(0xE52DE004u); // push {lr}: the guest's FPSCR
+    put(0xE52DC004u); // push {r12}: the C++
+    put_mov32(14, HostAddress(&upcall_host_fpscr));
+    put(0xE59EE000u); // ldr lr, [lr]
+    put(0xEEE1EA10u); // vmsr fpscr, lr: the emulation thread's
+    put_mov32(12, HostAddress(&azahar_upcall_host_tp));
+    put(0xE59CC000u);                  // ldr r12, [r12]
+    put(0xEF000000u | AZAHAR_TLS_SVC); // TPIDRURO = r12: the emulation thread's
+    put(0xE59DC000u);                  // ldr r12, [sp]: the C++
+    put(0xE92D00F0u); // push {r4-r7}: an svc's fifth to eighth inputs, the C++'s stack arguments
+    put(0xE12FFF3Cu); // blx r12: the arguments in r0-r7; r0 the result, r1 UpcallStatus
+    put(0xE28DD014u); // add sp, sp, #20: past r4-r7 and the C++
+    put(0xE49D2004u); // pop {r2}: the guest's FPSCR
+    put(0xEEE12A10u); // vmsr fpscr, r2
+    put(0xE28DD040u); // add sp, sp, #64: past d8-d15 (the C++ kept them)
+    put(0xE49DC004u); // pop {r12}: the guest's TPIDRURO
+    put(0xEF000000u | AZAHAR_TLS_SVC);
+    put(0xE49DC004u); // pop {r12}: the guest's flags; SP at r0's word
+    put(0xE3510001u); // cmp r1, #1
+    put(0xE58D0000u); // str r0, [sp]: the result over the guest's r0
+    const u32 to_reschedule = n;
+    put(0); // beq reschedule
+    put(0xE12CF00Cu); // msr apsr_nzcvqg, r12
+    put(0xE89DFFFFu); // ldm sp, {r0-r12, sp, lr, pc}: the guest's, at the resume PC
+    // reschedule: the guest's registers but its PC, then svc AZAHAR_SWITCH_SVC: the module
+    // switches to the thread the upcall armed, or exits, and the exit puts the resume PC in
+    // (RunSliceOnce). Nothing runs after the svc.
+    const u32 reschedule = at();
+    put(0xE12CF00Cu); // msr apsr_nzcvqg, r12
+    put(0xE89D7FFFu); // ldm sp, {r0-r12, sp, lr}
+    put(0xEF000000u | UpcallRescheduleSvc);
+    const u32 after_svc = at();
+    put(0xE7F000F0u); // udf
+    const auto beq = ArmBranch(0x0, base + to_reschedule * 4, reschedule);
+    ASSERT(beq.has_value());
+    buf[to_reschedule] = *beq;
+    const u32 body_end = at();
+    // The redirect's entry: a thunk's way in with the record's resume PC, its C++ the one that
+    // reads the svc's number from the record.
+    const u32 redirect = at();
+    const auto entry = UpcallEntry(redirect,
+                                   {ArmMovw(12, HostAddress(&upcall_redirect)),
+                                    ArmMovt(12, HostAddress(&upcall_redirect)),
+                                    0xE59CC008u /* ldr r12, [r12, #8]: AzaharRedirect.pc */},
+                                   HostAddress(&UpcallSvcRedirect), base);
+    ASSERT(entry.has_value());
+    for (const u32 w : *entry) {
+        put(w);
+    }
+    const u32 end = at();
+    std::memcpy(thunk_area->Data() + thunk_area_used, buf.data(), n * 4);
+    map->SyncCode(base, n * 4);
+    thunk_area_used += n * 4;
+    upcall_thunks[base] = UpcallThunk{0, body_end, body_end};
+    upcall_thunks[redirect] = UpcallThunk{0, end, end};
+    upcall_body = base;
+    upcall_after_svc = after_svc;
+    upcall_redirect.entry = redirect;
+}
+
+namespace {
+/// The idle skip's C++ (EnableIdleSkip's stub): the upcall's calling convention.
+u64 UpcallIdleSkipFn(u32 r0, u32, u32, u32, u32, u32, u32, u32) {
+    return ARM_VitaNative::UpcallIdleSkip(r0);
+}
+} // Anonymous namespace
+
+void ARM_VitaNative::CheckTickPolls() {
+    if (tick_thunks.empty()) {
+        return;
+    }
+    // Each caller's reads over a vblank of guest time at least: a slot that changed caller, or
+    // that a new caller took and gave back, starts its window again.
+    const u64 now = timer->GetTicks();
+    for (TickThunk& tt : tick_thunks) {
+        const u32* const words =
+            reinterpret_cast<const u32*>(thunk_area->Data() + (tt.data - ThunkAreaBase));
+        if (words[TickSkipWord] != 0) {
+            continue; // one caller a site goes to the skip
+        }
+        for (u32 k = 0; k < TickSlots; k++) {
+            const u32 caller = words[2 * k], calls = words[2 * k + 1];
+            TickWindow& w = tt.window[k];
+            if (caller == 0 || caller != w.caller || calls < w.calls) {
+                w = TickWindow{caller, calls, now};
+                continue;
+            }
+            if (now - w.since < VideoCore::FRAME_TICKS) {
+                continue;
+            }
+            const u64 per_vblank = u64{calls - w.calls} * VideoCore::FRAME_TICKS / (now - w.since);
+            w = TickWindow{caller, calls, now};
+            if (per_vblank >= IdleReadsPerVblank) {
+                LOG_INFO(Core_ARM11,
+                         "idle loop: GetSystemTick at {:08X} from {:08X}, {} reads a vblank: "
+                         "skipped to the next event from now on",
+                         tt.site, caller, per_vblank);
+#ifdef VITA_DIAGNOSTICS
+                census.idle_waits++;
+#endif
+                EnableIdleSkip(tt.base, caller);
+                break;
+            }
+        }
+    }
+}
+
+void ARM_VitaNative::EnableIdleSkip(u32 base, u32 caller) {
+    SvcThunk& t = svc_thunks.at(base);
+    if (t.skip == 0) {
+        // The skip's upcall stub, entered with the guest's registers as at the svc and resuming
+        // at the thunk's answer; the thunk's way out branched to it.
+        EnsureUpcallBody();
+        const auto room = ThunkRoom(32 * 4);
+        if (!room) {
+            LOG_WARNING(Core_ARM11, "idle loop: no room for the skip of the thunk at {:08X}", base);
+            return;
+        }
+        const u32 stub = *room;
+        const auto entry = UpcallEntry(stub, {ArmMovw(12, t.answer), ArmMovt(12, t.answer)},
+                                       HostAddress(&UpcallIdleSkipFn), upcall_body);
+        const auto out = ArmBranch(0xE, t.idle_b, stub);
+        ASSERT_MSG(entry.has_value() && out.has_value(), "idle loop: the skip's stub at {:08X}",
+                   stub);
+        const u32 bytes = static_cast<u32>(entry->size() * 4);
+        std::memcpy(thunk_area->Data() + thunk_area_used, entry->data(), bytes);
+        map->SyncCode(stub, bytes);
+        thunk_area_used += bytes;
+        upcall_thunks[stub] = UpcallThunk{t.site, stub + bytes, stub + bytes};
+        std::memcpy(thunk_area->Data() + (t.idle_b - ThunkAreaBase), &*out, 4);
+        map->SyncCode(t.idle_b, 4);
+        t.skip = stub;
+    }
+    u32* const words = reinterpret_cast<u32*>(thunk_area->Data() + (t.data - ThunkAreaBase));
+    words[TickSkipWord] = caller;
+}
+
+u64 ARM_VitaNative::UpcallIdleSkip(u32 r0) {
+    ARM_VitaNative& core = *upcall_core;
+    Core::Timing::Timer& timer = *core.timer;
+    // The guest's time so far, then the slice's rest: the caller spins on the clock
+    // (CheckTickPolls), so the clock goes to the slice's end, the next event, as if it had spun
+    // there. The slice ends (the tail's exit) for RunLoop's events; the thread goes on into the
+    // thunk's answer at the new time.
+    timer.AddScaledTicks(PauseUpcallClock());
+    const s64 rest = timer.GetDowncount();
+    if (rest > 0) {
+        timer.Idle();
+    }
+#ifdef VITA_DIAGNOSTICS
+    census.idle_skips++;
+    census.idle_skip_ticks += rest > 0 ? static_cast<u64>(rest) : 0;
+    upcall_system->GPU().GuestIdle();
+#endif
+    ResumeUpcallClock(timer, MinQuantumNs);
+    return UpcallAnswer(r0, UpcallReschedule);
+}
+
+void ARM_VitaNative::PatchUpcall(u32 pc, bool thumb) {
     if (InThunkArea(pc) || patched_sites.contains(pc) || svc_refused.contains(pc)) {
+        return;
+    }
+    if (thumb) {
+        PatchUpcallThumb(pc);
         return;
     }
     const u32 insn = memory.Read32(pc);
@@ -1566,103 +2065,116 @@ void ARM_VitaNative::PatchUpcall(u32 pc) {
         svc_refused.insert(pc);
         return;
     }
-    const UpcallFn fn = upcall_table[number];
-    constexpr u32 UpcallThunkMax = 160;
-    const auto room = ThunkRoom(UpcallThunkMax);
+    EnsureUpcallBody();
+    const auto room = ThunkRoom(32 * 4);
     if (!room) {
         svc_refused.insert(pc);
         return;
     }
     const u32 base = *room;
-    std::array<u32, UpcallThunkMax / 4> buf{};
-    u32 n = 0;
-    const auto at = [&] { return base + n * 4; };
-    const auto put = [&](u32 w) {
-        ASSERT(n < buf.size());
-        buf[n++] = w;
-    };
-    const auto movw = [](u32 rd, u32 v) {
-        return 0xE3000000u | (v >> 12 & 0xF) << 16 | rd << 12 | (v & 0xFFF);
-    };
-    const auto movt = [](u32 rd, u32 v) {
-        return 0xE3400000u | (v >> 28 & 0xF) << 16 | rd << 12 | (v >> 16 & 0xFFF);
-    };
-    const u32 top =
-        static_cast<u32>(reinterpret_cast<uintptr_t>(upcall_stack.data() + upcall_stack.size()));
-    const u32 target = static_cast<u32>(reinterpret_cast<uintptr_t>(fn));
-    put(0xE92D500Fu); // push {r0-r3, r12, lr}: the guest's stack
-    put(0xE10FC000u); // mrs r12, apsr
-    put(0xE52DC004u); // push {r12}
-    put(movw(14, top));
-    put(movt(14, top));
-    put(0xE52ED008u); // str sp, [lr, #-8]!: the guest's SP at the app stack's top
-    put(0xE1A0D00Eu); // mov sp, lr
-    put(0xE92D00F0u); // push {r4-r7}: an svc's fifth to eighth inputs, the C++'s stack arguments
-    put(movw(12, target));
-    put(movt(12, target));
-    put(0xE12FFF3Cu); // blx r12: the arguments in r0-r7; r0 the result, r1 UpcallStatus
-    put(0xE59DD010u); // ldr sp, [sp, #16]
-    put(0xE3510001u); // cmp r1, #1
-    put(0xE49DC004u); // pop {r12}: the guest's flags
-    const u32 to_busy = n;
-    put(0); // bhi busy
-    const u32 to_reschedule = n;
-    put(0); // beq reschedule
-    UpcallThunk t{};
-    t.site = pc;
-    std::array<u32, 2> backs{};
-    // done: the result over the guest's r0; msr apsr_nzcvq, r12; pop {r0-r3, r12, lr}; b back
-    put(0xE58D0000u);
-    put(0xE128F00Cu);
-    put(0xE8BD500Fu);
-    backs[0] = n;
-    put(0);
-    // reschedule: the same, then svc UpcallRescheduleSvc
-    const u32 reschedule = at();
-    put(0xE58D0000u);
-    put(0xE128F00Cu);
-    put(0xE8BD500Fu);
-    t.svc_reschedule = at();
-    put(0xEF000000u | UpcallRescheduleSvc);
-    backs[1] = n;
-    put(0);
-    // busy: msr apsr_nzcvq, r12; pop {r0-r3, r12, lr}; the original svc; b back
-    const u32 busy = at();
-    put(0xE128F00Cu);
-    put(0xE8BD500Fu);
-    t.svc_original = at();
-    put(0xEF000000u | number);
-    const u32 last_back = n;
-    put(0);
-    t.end = at();
-    for (const u32 word : {backs[0], backs[1], last_back}) {
-        const auto b = ArmBranch(0xE, base + word * 4, pc + 4);
-        if (!b) {
-            svc_refused.insert(pc);
-            return;
-        }
-        buf[word] = *b;
-    }
-    const auto b_busy = ArmBranch(0x8, base + to_busy * 4, busy);                // HI
-    const auto b_resched = ArmBranch(0x0, base + to_reschedule * 4, reschedule); // EQ
+    const u32 fn = HostAddress(upcall_table[number]);
+    const u32 resume = pc + 4;
+    const auto entry =
+        UpcallEntry(base, {ArmMovw(12, resume), ArmMovt(12, resume)}, fn, upcall_body);
     const auto site = ArmBranch(cond, pc, base);
-    if (!b_busy || !b_resched || !site) {
+    if (!entry || !site) {
         svc_refused.insert(pc);
         return;
     }
-    buf[to_busy] = *b_busy;
-    buf[to_reschedule] = *b_resched;
-    std::memcpy(thunk_area->Data() + thunk_area_used, buf.data(), n * 4);
-    map->SyncCode(base, n * 4);
-    thunk_area_used += n * 4;
-    upcall_thunks[base] = t;
+    const u32 bytes = static_cast<u32>(entry->size() * 4);
+    std::memcpy(thunk_area->Data() + thunk_area_used, entry->data(), bytes);
+    map->SyncCode(base, bytes);
+    thunk_area_used += bytes;
+    upcall_thunks[base] = UpcallThunk{pc, base + bytes, base + bytes};
     memory.Write32(pc, *site);
     map->SyncCode(pc, 4);
     patched_sites[pc] = PatchedSite{insn, false};
-    LOG_INFO(Core_ARM11, "upcall: svc {:#x} at {:08X} -> thunk {:08X}, C++ {:08X}, stack {:08X}",
-             insn & 0x00FFFFFFu, pc, base, target, top);
 #ifdef VITA_DIAGNOSTICS
     census.upcall_sites++;
+#endif
+}
+
+void ARM_VitaNative::PatchUpcallThumb(u32 pc) {
+    // A Thumb svc is 2 bytes and a B.W 4: the instruction after it moves into the stub, which
+    // runs it on resuming and branches back past it. Only an instruction that means the same
+    // anywhere: no PC-relative load, ADR or PC operand, no branch but `bx lr` and pop, no IT or
+    // 32-bit instruction. (Nothing here can see whether it is another branch's target: an svc
+    // wrapper's `bx lr` or pop is not one.)
+    const u16 svc = memory.Read16(pc);
+    const u16 next = memory.Read16(pc + 2);
+    const auto movable = [](u16 h) {
+        if (h < 0x4400 || (h >= 0x5000 && h < 0xA000) || (h >= 0xA800 && h < 0xB100) ||
+            (h >= 0xB200 && h < 0xB300) || (h >= 0xB400 && h < 0xB600) ||
+            (h >= 0xBA00 && h < 0xBB00) || (h >= 0xBC00 && h < 0xBE00) ||
+            (h >= 0xC000 && h < 0xD000)) {
+            return true; // no PC in these forms (push/pop {..., pc} returns)
+        }
+        if (h == 0x4770 || h == 0xBF00) {
+            return true; // bx lr, nop
+        }
+        if (h >= 0x4400 && h < 0x4700) {
+            // add/cmp/mov with high registers: not with PC as an operand
+            const u32 rm = (h >> 3) & 0xF;
+            const u32 rdn = ((h >> 4) & 0x8) | (h & 0x7);
+            return rm != 15 && rdn != 15;
+        }
+        return false;
+    };
+    // An svc an IT block covers (an IT up to four instructions before it) stays: the branch in
+    // its place would take its condition, and the moved instruction, outside the block, would
+    // not run when it fails. A halfword that only looks like an IT refuses a site too.
+    bool in_it = false;
+    for (u32 back = 2; back <= 14; back += 2) {
+        const u16 h = memory.Read16(pc - back);
+        in_it |= (h & 0xFF00u) == 0xBF00u && (h & 0xFu) != 0;
+    }
+    if ((svc & 0xFF00u) != 0xDF00u || !movable(next) || in_it) {
+        svc_refused.insert(pc);
+        return;
+    }
+    const u32 number = svc & 0xFFu;
+    EnsureUpcallBody();
+    // bx pc; nop: the ARM way in at base + 4 (the thunks are word-aligned), with the resume PC
+    // `moved | 1` (UpcallEntry); moved: the instruction; b.w site + 4.
+    const auto room = ThunkRoom(48 * 4);
+    if (!room) {
+        svc_refused.insert(pc);
+        return;
+    }
+    const u32 base = *room;
+    ASSERT((base & 3u) == 0);
+    const u32 fn = HostAddress(upcall_table[number]);
+    const auto sized = UpcallEntry(base + 4, {ArmMovw(12, 0), ArmMovt(12, 0)}, fn, upcall_body);
+    if (!sized) {
+        svc_refused.insert(pc);
+        return;
+    }
+    const u32 moved = base + 4 + static_cast<u32>(sized->size() * 4);
+    const auto entry =
+        UpcallEntry(base + 4, {ArmMovw(12, moved | 1u), ArmMovt(12, moved | 1u)}, fn, upcall_body);
+    const auto back = ThumbBranchW(moved + 2, pc + 4);
+    const auto site = ThumbBranchW(pc, base);
+    if (!entry || !back || !site) {
+        svc_refused.insert(pc);
+        return;
+    }
+    std::vector<u8> stub(moved + 6 - base);
+    const u16 to_arm[2] = {0x4778, 0x46C0}; // bx pc; nop
+    std::memcpy(stub.data(), to_arm, 4);
+    std::memcpy(stub.data() + 4, entry->data(), entry->size() * 4);
+    const u16 tail[3] = {next, (*back)[0], (*back)[1]};
+    std::memcpy(stub.data() + (moved - base), tail, 6);
+    std::memcpy(thunk_area->Data() + thunk_area_used, stub.data(), stub.size());
+    map->SyncCode(base, static_cast<u32>(stub.size()));
+    thunk_area_used += (static_cast<u32>(stub.size()) + 3) & ~3u;
+    upcall_thunks[base] = UpcallThunk{pc, base + static_cast<u32>(stub.size()), moved};
+    memory.Write16(pc, (*site)[0]);
+    memory.Write16(pc + 2, (*site)[1]);
+    map->SyncCode(pc, 4);
+    patched_sites[pc] = PatchedSite{u32{svc} << 16 | next, true};
+#ifdef VITA_DIAGNOSTICS
+    census.upcall_sites++;
+    census.upcall_thumb_sites++;
 #endif
 }
 
@@ -1672,35 +2184,284 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
     census.upcall_runs++;
     census.upcall_svcs[svc & 0xff]++;
 #endif
-    // The svc's register file for the HLE kernel's handler (SVC::GetReg reads the running
-    // core's): r0-r7 as they came, r12 and LR from the thunk's frame, SP the guest's at the svc.
-    u32* const frame = UpcallGuestRegs();
+    // The svc's register file for the HLE handler: r0-r7 as they came, the rest from the frame.
+    u32* const frame = UpcallFrame();
+    const u32 guest_sp = frame[FrameSp];
+#ifdef VITA_DIAGNOSTICS
+    if (svc == 0x0a) {
+        const u64 ns = in[0] | u64{in[1]} << 32;
+        census.sleep_zero += ns == 0 ? 1 : 0;
+        const u32 lr = frame[FrameLr];
+        auto it = std::find_if(census.sleeps.begin(), census.sleeps.end(),
+                               [&](const auto& s) { return s.count == 0 || s.lr == lr; });
+        if (it == census.sleeps.end()) {
+            census.sleep_other++;
+        } else {
+            it->lr = lr;
+            it->count++;
+            it->ns += ns;
+        }
+    }
+#endif
+    // Its own register file, not `run.ctx`: an exit inside the upcall writes the live state there.
+    auto& regs = core.upcall_regs;
     for (u32 i = 0; i < in.size(); i++) {
-        core.context.r[i] = in[i];
+        regs[i] = in[i];
     }
-    core.context.r[12] = frame[4];
-    core.context.r[13] = static_cast<u32>(reinterpret_cast<uintptr_t>(frame + 6));
-    core.context.r[14] = frame[5];
+    for (u32 i = 8; i < 13; i++) {
+        regs[i] = frame[FrameR0 + i];
+    }
+    regs[13] = guest_sp;
+    regs[14] = frame[FrameLr];
+    regs[15] = frame[FrameResume] & ~1u;
+    core.upcall_regs_live = true;
     auto& kernel = upcall_system->Kernel();
-    const Kernel::Thread* const thread = kernel.GetCurrentThreadManager().GetCurrentThread();
+    Kernel::Thread* const thread = kernel.GetCurrentThreadManager().GetCurrentThread();
     upcall_reschedule_asked.store(false, std::memory_order_relaxed);
+    // The timer up to the guest's time, then the guest's clock stops for the C++: the emulator's own
+    // time (its waits for the render thread among it) must not count as the guest's.
+    Core::Timing::Timer& slice_timer = *core.timer;
+    slice_timer.AddScaledTicks(PauseUpcallClock());
+    const auto rest_of_slice = [&] {
+        return std::clamp(TicksToNanoseconds(slice_timer.GetDowncount()), MinQuantumNs,
+                          MaxQuantumNs);
+    };
+    // Back into the guest while the slice has time left, else the slice ends here: a fresh quantum at
+    // every svc would never let the timer fire, and RunLoop's events and Sony's SGIs would stand
+    // still.
+    const auto back_to_guest = [&] {
+        if (slice_timer.GetDowncount() > 0) {
+            ResumeUpcallClock(slice_timer, rest_of_slice());
+            return UpcallAnswer(regs[0], UpcallDone);
+        }
+#ifdef VITA_DIAGNOSTICS
+        census.upcall_exits_slice_up++;
+#endif
+        ResumeUpcallClock(slice_timer, MinQuantumNs);
+        return UpcallAnswer(regs[0], UpcallReschedule);
+    };
     core.svc_context.CallSVCForUpcall(svc);
-    // The outputs: r0 as the result, r1-r3 into the frame the thunk's tail pops. The thunk keeps
-    // r4-r7 (callee-saved), so an svc must not write them.
-    for (u32 i = 1; i < 4; i++) {
-        frame[i] = core.context.r[i];
+    core.upcall_regs_live = false;
+    // The outputs: r0 the result, r1-r12 into the frame. Some svcs' outputs reach past r3
+    // (QueryMemory's go to r5).
+    constexpr u32 Outputs = 12;
+    for (u32 i = 1; i <= Outputs; i++) {
+        frame[FrameR0 + i] = regs[i];
     }
-    for (u32 i = 4; i < in.size(); i++) {
-        DEBUG_ASSERT_MSG(core.context.r[i] == in[i], "upcall: svc {:#x} wrote r{}", svc, i);
-    }
-    // The thread stopped running, or one more urgent may run: the scheduler's, after an exit.
     const bool reschedule = upcall_reschedule_asked.load(std::memory_order_relaxed) ||
                             thread == nullptr || thread->status != Kernel::ThreadStatus::Running ||
                             kernel.GetCurrentThreadManager().GetCurrentThread() != thread;
+    if (!reschedule) {
+        return back_to_guest();
+    }
 #ifdef VITA_DIAGNOSTICS
-    census.upcall_reschedules += reschedule;
+    census.upcall_reschedules++;
 #endif
-    return UpcallAnswer(core.context.r[0], reschedule ? UpcallReschedule : UpcallDone);
+    // The next thread runs by the module's switch, no exit; another process's, or the slice's time
+    // up, exits to reschedule (two threads rescheduling each other would keep the slice going).
+    if (slice_timer.GetDowncount() <= 0) {
+#ifdef VITA_DIAGNOSTICS
+        census.upcall_exits_slice_up++;
+#endif
+        ResumeUpcallClock(slice_timer, MinQuantumNs);
+        return UpcallAnswer(regs[0], UpcallReschedule);
+    }
+    auto& threads = kernel.GetCurrentThreadManager();
+    std::unique_lock lock{kernel.GetHLELock()};
+    // A thread that exited has current_thread as its last owner: held until its context is written.
+    std::shared_ptr<Kernel::Thread> exited;
+    if (thread != nullptr && thread->status == Kernel::ThreadStatus::Dead) {
+        exited = Kernel::SharedFrom(thread);
+    }
+    Kernel::Thread* next = threads.SwitchForNative();
+    if (next == thread && thread != nullptr) {
+        return back_to_guest();
+    }
+    const bool idle = next == nullptr && thread != nullptr && !threads.HaveReadyThreads();
+    if ((next == nullptr && !idle) || thread == nullptr) {
+#ifdef VITA_DIAGNOSTICS
+        census.upcall_exits_no_next++;
+#endif
+        ResumeUpcallClock(slice_timer, MinQuantumNs);
+        return UpcallAnswer(regs[0], UpcallReschedule);
+    }
+    // The outgoing thread as it stands after the svc: its answer, its registers from the frame, d8-d15
+    // and FPSCR from the thunk's save. Saved before an idle too: a wait it ends writes its result here.
+    auto& out = thread->context;
+    for (u32 i = 0; i < 4; i++) {
+        out.cpu_registers[i] = regs[i];
+    }
+    for (u32 i = 4; i < 13; i++) {
+        out.cpu_registers[i] = frame[FrameR0 + i];
+    }
+    const u32 resume = frame[FrameResume];
+    out.cpu_registers[13] = guest_sp;
+    out.cpu_registers[14] = frame[FrameLr];
+    out.cpu_registers[15] = resume & ~1u;
+    out.cpsr = (frame[FrameFlags] & 0xF80F0000u) | 0x10u | ((resume & 1u) << 5);
+    std::memcpy(&out.fpu_registers[16], UpcallVfpSave(), 64);
+    out.fpscr = UpcallGuestFpscr();
+    exited.reset();
+    if (idle) {
+        // No thread to run: the guest idles here with no exit. Every core's timer moves on together,
+        // event by event, until a thread of this core's is ready; another core with work, or an HLE host
+        // thread at work, ends the idle in an exit. Page holds whose work is done are released later by
+        // RunLoop (each release is a module call, an exit from here).
+        lock.unlock();
+        Core::Timing::Timer& timer = *core.timer;
+        PauseUpcallClock(); // the C++'s time so far: none of the guest's
+        const u32 self = core.GetID();
+        const u32 cores = upcall_system->GetNumCores();
+        const Core::TimingEventType* const vblank = upcall_system->GPU().VBlankEventType();
+        const auto others_busy = [&] {
+            std::scoped_lock others_lock{kernel.GetHLELock()};
+            for (u32 c = 0; c < cores; c++) {
+                if (c == self) {
+                    continue;
+                }
+                auto& other = kernel.GetThreadManager(c);
+                const auto* const t = other.GetCurrentThread();
+                if (other.HaveReadyThreads() ||
+                    (t != nullptr && t->status == Kernel::ThreadStatus::Running)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+#ifdef VITA_DIAGNOSTICS
+        const u64 idle_from = timer.GetTicks();
+        u32 idle_events = 0;
+#endif
+        do {
+#ifdef VITA_DIAGNOSTICS
+            // An idle no event ends: every thread, what it waits on, and the timer.
+            if (++idle_events == 1200) {
+                std::scoped_lock dump_lock{kernel.GetHLELock()};
+                std::string dump;
+                for (const auto& t : threads.GetThreadList()) {
+                    dump +=
+                        fmt::format(" [{} prio {} status {} pc {:08x} lr {:08x} r0 {:08x} "
+                                    "addr {:08x} waits",
+                                    t->thread_id, t->current_priority, static_cast<u32>(t->status),
+                                    t->context.cpu_registers[15], t->context.cpu_registers[14],
+                                    t->context.cpu_registers[0], t->wait_address);
+                    for (const auto& o : t->wait_objects) {
+                        dump += fmt::format(" {}:{}", o->GetTypeName(), o->GetName());
+                    }
+                    dump += fmt::format(" callback {}]", t->wakeup_callback != nullptr);
+                }
+                ASSERT_MSG(false,
+                           "upcall idle: 1200 timer advances with no thread to run, svc {:#x} "
+                           "of thread {}; ticks {} -> {}, next event in {}; ready {}:{}",
+                           svc, thread->thread_id, idle_from, timer.GetTicks(),
+                           timer.GetMaxSliceLength(), threads.HaveReadyThreads(), dump);
+            }
+#endif
+            if (others_busy()) {
+                ResumeUpcallClock(timer, MinQuantumNs);
+#ifdef VITA_DIAGNOSTICS
+                census.upcall_idle_exits++;
+                census.upcall_idle_exits_other_busy++;
+#endif
+                return UpcallAnswer(regs[0], UpcallReschedule);
+            }
+            // Where every core goes next: this core's next event, or another's if sooner.
+            u64 to = timer.GetTicks() + static_cast<u64>(std::max<s64>(timer.GetDowncount(), 0));
+            for (u32 c = 0; c < cores; c++) {
+                if (c != self) {
+                    const auto& other = upcall_system->GetCore(c).GetTimer();
+                    to = std::min(to,
+                                  other.GetTicks() + static_cast<u64>(other.GetMaxSliceLength()));
+                }
+            }
+            // The vblank is RunLoop's: its many Sony syscalls would each be an exit from here.
+            for (u32 c = 0; c < cores; c++) {
+                const auto& t = upcall_system->GetCore(c).GetTimer();
+                if (t.NextEventType() == vblank &&
+                    t.GetTicks() + static_cast<u64>(t.GetMaxSliceLength()) <= to) {
+                    ResumeUpcallClock(timer, MinQuantumNs);
+#ifdef VITA_DIAGNOSTICS
+                    census.upcall_idle_exits++;
+                    census.upcall_idle_exits_vblank++;
+#endif
+                    return UpcallAnswer(regs[0], UpcallReschedule);
+                }
+            }
+            // A slice already past it keeps what it ran over.
+            if (to > timer.GetTicks()) {
+                timer.ForceExceptionCheck(static_cast<s64>(to - timer.GetTicks()));
+                timer.Idle();
+            } else {
+                timer.ForceExceptionCheck(0);
+            }
+            timer.Advance();
+            // The other cores to the same time, their events their own.
+            for (u32 c = 0; c < cores; c++) {
+                auto& other = upcall_system->GetCore(c).GetTimer();
+                if (c == self || other.GetTicks() >= to) {
+                    continue;
+                }
+                upcall_system->SelectCore(c);
+                other.SetNextSlice(static_cast<s64>(to - other.GetTicks()));
+                other.Idle();
+                other.Advance();
+            }
+#ifdef VITA_DIAGNOSTICS
+            // Every core to the next event: the guest's clock jumped (GPU::GuestIdle).
+            upcall_system->GPU().GuestIdle();
+#endif
+            upcall_system->SelectCore(self);
+            lock.lock();
+            next = threads.SwitchForNative();
+            DEBUG_ASSERT_MSG(next != nullptr || !threads.HaveReadyThreads(),
+                             "upcall idle: another process's thread is ready");
+            lock.unlock();
+            timer.SetNextSlice(Core::Timing::MAX_SLICE_LENGTH);
+#ifdef VITA_DIAGNOSTICS
+            census.upcall_idle_events++;
+#endif
+            // An HLE request's host thread at work may share this core, which takes no interrupt in the
+            // guest's world but the module's timer: the core goes back to Sony's world to idle.
+            if (next == nullptr && kernel.AreAsyncOperationsPending()) {
+                ResumeUpcallClock(timer, MinQuantumNs);
+#ifdef VITA_DIAGNOSTICS
+                census.upcall_idle_exits++;
+#endif
+                return UpcallAnswer(regs[0], UpcallReschedule);
+            }
+        } while (next == nullptr);
+        // Another core with a thread to run: a minimal quantum, and back to RunLoop.
+        if (others_busy()) {
+            timer.ForceExceptionCheck(0);
+        }
+        const u64 quantum_ns =
+            std::clamp(TicksToNanoseconds(timer.GetDowncount()), MinQuantumNs, MaxQuantumNs);
+        ResumeUpcallClock(timer, quantum_ns);
+#ifdef VITA_DIAGNOSTICS
+        census.upcall_idles++;
+#endif
+    }
+    // The incoming thread, loaded by the module in place with its TLS and TPIDRURW. A thread that
+    // never ran has its entry's Thumb bit in the PC.
+    auto& incoming = next->context;
+    incoming.cpu_registers[15] &= ~1u;
+    if ((incoming.cpsr & 0x20u) != 0) {
+        incoming.cpu_registers[15] = core.PastPatchedThumbSvc(incoming.cpu_registers[15]);
+    }
+    incoming.tpidruro = next->GetTLSAddress();
+    u32 tpidrurw;
+    asm volatile("mrc p15, 0, %0, c13, c0, 2" : "=r"(tpidrurw));
+    incoming.tpidrurw = tpidrurw;
+    upcall_switch.in = AsAzahar(incoming);
+    upcall_switch.thread_id = next->GetThreadId();
+    upcall_switch.armed = 1;
+    if (upcall_clock_paused) {
+        ResumeUpcallClock(slice_timer, rest_of_slice());
+    }
+#ifdef VITA_DIAGNOSTICS
+    census.upcall_switches++;
+#endif
+    return UpcallAnswer(regs[0], UpcallReschedule);
 }
 
 u32 ARM_VitaNative::FetchCode(u32 pc, bool thumb) const {
@@ -1768,7 +2529,10 @@ void ARM_VitaNative::PrepareSaveState() {
     vfp_thunks.clear();
     svc_thunks.clear();
     svc_refused.clear();
+    tick_thunks.clear();
     upcall_thunks.clear();
+    upcall_body = upcall_after_svc = 0;
+    upcall_redirect.entry = 0;
     thunk_area_used = 0;
 }
 
@@ -1824,72 +2588,24 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
     run.tick_hz = static_cast<u64>(BASE_CLOCK_RATE_ARM11 * timer->GetClockScale() + 0.5);
     run.tick_base = timer->GetTicks();
 
-    // In-kernel scheduling: the running thread's process's ready and sleeping threads, up to the
-    // next event that is not one of their wakeups (at most a slice's length on). The clock must
-    // be unscaled: the module converts a sleep's nanoseconds as nsToCycles does.
-    run.sched = nullptr;
-    run.sched_count = 0;
-    run.sched_current = 0;
-    run.sched_deadline = 0;
-    run.sched_arbiter = 0;
-    bool scheduled = false;
-    int current_before = -1;
-    const auto* const running = kernel.GetCurrentThreadManager().GetCurrentThread();
-    if (!UpcallsOn() && timer->GetClockScale() == 1.0 &&
-        running != nullptr && sched_waiters.contains(running->thread_id)) {
-        auto& threads = kernel.GetCurrentThreadManager();
-        // The DSP's interrupt wakes the guest's event waiters from its own thread, under the HLE
-        // lock: the ready queue and the threads' states are read here, and rewritten at the
-        // import, under it too.
-        std::scoped_lock hle_lock{kernel.GetHLELock()};
-        sched_arbiter = sched_arbiter_handle != 0
-                            ? kernel.GetCurrentProcess()->handle_table.Get<Kernel::AddressArbiter>(
-                                  sched_arbiter_handle)
-                            : nullptr;
-        const int current =
-            threads.ExportNativeSchedule(sched_before, AZAHAR_SCHED_MAX, sched_arbiter.get());
-        if (current >= 0) {
-            const s64 base = static_cast<s64>(run.tick_base);
-            const auto* const wakeup = threads.WakeupEventType();
-            const s64 deadline = timer->NextEventTime(
-                base + Timing::MAX_SLICE_LENGTH, [&](const TimingEventType* type, uintptr_t id) {
-                    // The sleepers' and the timed arbitration waits' wakes are the module's.
-                    return type == wakeup &&
-                           std::any_of(
-                               sched_before.begin(), sched_before.end(), [&](const auto& e) {
-                                   return (e.state == AZAHAR_SCHED_SLEEP ||
-                                           (e.state == AZAHAR_SCHED_ARB && e.wake != ~0ull)) &&
-                                          e.thread->thread_id == id;
-                               });
-                });
-            if (deadline > base) {
-                for (std::size_t i = 0; i < sched_before.size(); i++) {
-                    const auto& e = sched_before[i];
-                    sched_table[i] = AzaharSchedThread{e.thread->thread_id,
-                                                       static_cast<u32>(e.thread->current_priority),
-                                                       e.state,
-                                                       e.order,
-                                                       e.wake,
-                                                       e.thread->GetTLSAddress(),
-                                                       0,
-                                                       AsAzahar(e.thread->context),
-                                                       e.address};
-                    // The module loads it as it is (a thread that never ran has its entry's
-                    // Thumb bit in the PC).
-                    e.thread->context.cpu_registers[15] &= ~1u;
-                }
-                run.sched = sched_table.data();
-                run.sched_count = static_cast<u32>(sched_before.size());
-                run.sched_current = current;
-                run.sched_deadline = static_cast<u64>(deadline);
-                run.sched_arbiter = sched_arbiter ? sched_arbiter_handle : 0;
-                current_before = current;
-                scheduled = true;
-            }
-        }
+    {
+        u32 tp, fpscr;
+        asm volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(tp));
+        asm volatile("vmrs %0, fpscr" : "=r"(fpscr));
+        azahar_upcall_host_tp = tp;
+        upcall_host_fpscr = fpscr;
     }
-
     upcall_core = this;
+    upcall_tick_hz = run.tick_hz;
+    // A quantum ending inside an upcall restarts in the vector; counted against the same guard.
+    run.upcall_rearm_us = static_cast<u32>(MinQuantumNs / 1000);
+    run.upcall_rearm_max =
+        upcall_quantums < MaxUpcallQuantums ? MaxUpcallQuantums - upcall_quantums : 0;
+    run.upcall_switch = &upcall_switch;
+    EnsureUpcallBody();
+    run.upcall_redirect = &upcall_redirect;
+#ifdef VITA_DIAGNOSTICS
+#endif
     const int ret = azaharRun(&run);
     if (ret < 0) {
         system.SetStatus(System::ResultStatus::ErrorCoreExceptionRaised,
@@ -1899,131 +2615,123 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
     }
 
     cp15[CP15_THREAD_UPRW] = run.ctx.tpidrurw;
-    if (run.fast_site != 0) {
-        PatchSvc(run.fast_site - 4);
+    // The module may have switched threads in the slice: the TLS is the running one's.
+    cp15[CP15_THREAD_URO] = run.ctx.tpidruro;
+    // A slice stopped inside an upcall: its C++ is this thread, held maybe inside the logger or malloc
+    // with their locks. Nothing here may lock or allocate until it goes on.
+    if (!SgxdRenderer::Vprof::Capturing()) {
+        upcall_quantums += run.upcall_rearms;
     }
-    if (UpcallsOn() && InUpcall(context.r[15]) &&
-        !(run.reason == AZAHAR_EXIT_SVC && IsUpcallTailSvc(context.r[15] - 4))) {
-        // The words on the upcall stack that point into the app's code (0x81000000 up), deepest
-        // first: the C++ path's return addresses, for addr2line on the run's ELF.
-        const auto returns = [&] {
-            std::string list;
-            const u32 stack_lo = static_cast<u32>(reinterpret_cast<uintptr_t>(upcall_stack.data()));
-            const u32 stack_hi = stack_lo + static_cast<u32>(upcall_stack.size());
-            if (context.r[13] >= stack_lo && context.r[13] < stack_hi) {
-                for (u32 a = context.r[13] & ~3u; a < stack_hi && list.size() < 400; a += 4) {
-                    u32 w;
-                    std::memcpy(&w, upcall_stack.data() + (a - stack_lo), 4);
-                    if (w >= 0x81000000u && w < 0x82000000u) {
-                        list += fmt::format(" {:08X}", w);
+#ifdef VITA_DIAGNOSTICS
+    census.upcall_preempted += run.upcall_rearms;
+    census.upcall_rearms += run.upcall_rearms;
+#endif
+    if (InUpcall(run.ctx.r[15]) &&
+        !(run.reason == AZAHAR_EXIT_SVC && IsUpcallTailExit(run.ctx.r[15]))) {
+        // The C++'s own time is not the guest's (UpcallSvc stops the clock for it).
+        if (!upcall_clock_paused) {
+            timer->AddScaledTicks(run.guest_ticks);
+        }
+        // A Sony syscall from the app's code in the guest's world: made in Sony's, then the thread on.
+        if (run.reason == AZAHAR_EXIT_SVC && run.svc_number == 0 && run.ctx.r[15] >= 0x40000000u) {
+            upcall_last_syscall = run.ctx.r[12];
+            upcall_last_syscall_lr = run.ctx.r[14];
+            upcall_forwards++;
+#ifdef VITA_DIAGNOSTICS
+            {
+                // By caller, in place. A call from Sony's library code also names the app's code above it.
+                u32 app = 0;
+                if (run.ctx.r[14] >= 0xE0000000u) {
+                    const auto* const stack =
+                        reinterpret_cast<const u32*>(static_cast<uintptr_t>(run.ctx.r[13] & ~3u));
+                    for (u32 i = 0; i < 64 && app == 0; i++) {
+                        if (stack[i] >= 0x81000000u && stack[i] < 0x82000000u) {
+                            app = stack[i];
+                        }
                     }
                 }
+                auto it = std::find_if(
+                    census.forwards.begin(), census.forwards.end(), [&](const auto& f) {
+                        return f.count == 0 ||
+                               (f.lr == run.ctx.r[14] && f.number == run.ctx.r[12] && f.app == app);
+                    });
+                if (it == census.forwards.end()) {
+                    census.forward_other++;
+                } else {
+                    it->lr = run.ctx.r[14];
+                    it->number = run.ctx.r[12];
+                    it->app = app;
+                    it->count++;
+                }
             }
-            return list;
-        };
-        // A Sony syscall from the app's code in the guest's world: made in Sony's, then the same
-        // thread on. Each is logged before and after: one that never answers is the last line.
-        if (run.reason == AZAHAR_EXIT_SVC && run.svc_number == 0 && context.r[15] >= 0x40000000u) {
-            const u32 number = context.r[12];
-            LOG_INFO(Core_ARM11, "upcall: Sony syscall {:#x} from {:08X} (lr {:08X}); path:{}",
-                     number, context.r[15], context.r[14], returns());
+#endif
+            ASSERT_MSG(upcall_forwards < 100000,
+                       "upcall: 100000 Sony syscalls in one, the last {:#x} from {:08X} (r0 "
+                       "{:08X}); app code on the upcall stack:{}",
+                       run.ctx.r[12], run.ctx.r[14], run.ctx.r[0], UpcallReturns(run.ctx));
             ForwardSonySyscall(run.ctx);
-            LOG_INFO(Core_ARM11, "upcall: Sony syscall {:#x} answered {:08X}", number,
-                     context.r[0]);
-            timer->AddScaledTicks(run.guest_ticks);
 #ifdef VITA_DIAGNOSTICS
             census.upcall_syscalls++;
 #endif
             upcall_again = true;
             return true;
         }
-        // The experiment's observation: anything but a quantum's end inside an upcall.
+        // A block the app mapped after azaharMap (vprof's capture buffer): the module takes the megabyte
+        // from the process's table now and the access runs again.
+        if ((run.reason == AZAHAR_EXIT_DABT || run.reason == AZAHAR_EXIT_PABT) &&
+            run.far >= 0x40000000u) {
+            const u32 status = (run.fsr & 0xFu) | ((run.fsr >> 6) & 0x10u);
+            if ((status == 0x5 || status == 0x7) && azaharSyncUpper(run.far) > 0) {
+#ifdef VITA_DIAGNOSTICS
+                census.upcall_synced++;
+#endif
+                upcall_again = true;
+                return true;
+            }
+        }
+        // Anything but a quantum's end inside an upcall.
         if (run.reason != AZAHAR_EXIT_TIMER) {
             ASSERT_MSG(false,
                        "upcall: {} at {:08X} (svc {:#x}, lr {:08X}, sp {:08X}, fsr {:08X}, far "
                        "{:08X}); app code on the upcall stack:{}",
-                       ReasonName(run.reason), context.r[15], run.svc_number, context.r[14],
-                       context.r[13], run.fsr, run.far, returns());
+                       ReasonName(run.reason), run.ctx.r[15], run.svc_number, run.ctx.r[14],
+                       run.ctx.r[13], run.fsr, run.far, UpcallReturns(run.ctx));
         }
-        // An upcall that does not come back (a spin on a lock another thread holds) runs one
-        // quantum after another: logged at a quarter second, stopped at five.
-        upcall_quantums++;
-        if (upcall_quantums == 1000) {
-            LOG_WARNING(Core_ARM11, "upcall: 1000 quantums in one, pc {:08X} lr {:08X}; path:{}",
-                        context.r[15], context.r[14], returns());
+        // An upcall that never comes back (a spin on another thread's lock) stops at five seconds, not
+        // while a frame capture slows the render thread it may wait on.
+        if (!SgxdRenderer::Vprof::Capturing()) {
+            upcall_quantums++;
         }
-        ASSERT_MSG(upcall_quantums < 20000,
-                   "upcall: 20000 quantums in one, pc {:08X} lr {:08X}; app code on the upcall "
-                   "stack:{}",
-                   context.r[15], context.r[14], returns());
-        timer->AddScaledTicks(run.guest_ticks);
+        ASSERT_MSG(upcall_quantums < MaxUpcallQuantums,
+                   "upcall: 20000 quantums in one, pc {:08X} lr {:08X}, last forwarded syscall "
+                   "{:#x} from {:08X}; app code on the upcall stack:{}",
+                   run.ctx.r[15], run.ctx.r[14], upcall_last_syscall, upcall_last_syscall_lr,
+                   UpcallReturns(run.ctx));
 #ifdef VITA_DIAGNOSTICS
         census.upcall_preempted++;
 #endif
         upcall_again = true; // the same thread on, until it is back in its own code
         return true;
     }
+    if (run.fast_site != 0) {
+        PatchSvc(run.fast_site - 4);
+    }
+    CheckTickPolls();
+    // The last site the module redirected: patched to its own stub if it can be.
+    if (upcall_redirect.site != 0) {
+        const u32 next = upcall_redirect.site;
+        upcall_redirect.site = 0;
+        const bool thumb = (next & 1u) != 0;
+        PatchUpcall((next & ~1u) - (thumb ? 2u : 4u), thumb);
+        if ((run.ctx.cpsr & 0x20u) != 0) {
+            run.ctx.r[15] = PastPatchedThumbSvc(run.ctx.r[15]);
+        }
+    }
     upcall_quantums = 0;
+    upcall_forwards = 0;
     // The guest ticks the module counted, converted as its GetSystemTick answers were: the clock ends
     // at or past every value the guest read in the slice.
     timer->AddScaledTicks(run.guest_ticks);
-
-    // The module's scheduling taken back (the threads that stopped running saved their contexts
-    // in place), the one running now's TLS; with none running the slice loop ends and RunLoop
-    // idles to its next event.
-    if (scheduled) {
-        sched_after = sched_before;
-        for (std::size_t i = 0; i < sched_after.size(); i++) {
-            const AzaharSchedThread& t = sched_table[i];
-            sched_after[i].state = t.state;
-            sched_after[i].order = t.order;
-            sched_after[i].wake = t.wake;
-            sched_after[i].address = t.address;
-            if (t.saved) {
-                // A thread the module put to sleep, or to wait at the arbiter, stopped there.
-                if (t.state == AZAHAR_SCHED_SLEEP || t.state == AZAHAR_SCHED_ARB) {
-                    sched_waiters.insert(t.id);
-                }
-            }
-        }
-        cp15[CP15_THREAD_URO] = run.ctx.tpidruro;
-#ifdef VITA_DIAGNOSTICS
-        static const bool trace_arb = SgxdRenderer::SgxdFlag("perflog");
-        if (trace_arb && run.sched_arbitrations != 0 && census.arb_traces.size() < 16) {
-            std::string trace = fmt::format(
-                "arbiter {:#x}, current {} -> {}, exit {} svc {:#x}:", run.sched_arbiter,
-                current_before, run.sched_current, ReasonName(run.reason), run.svc_number);
-            for (std::size_t i = 0; i < sched_before.size(); i++) {
-                const auto& b = sched_before[i];
-                const auto& a = sched_after[i];
-                trace += fmt::format(" [{} {}->{} {:08x}->{:08x} o{}->{} w{:x}->{:x} r0 {:08x}]",
-                                     b.thread->thread_id, b.state, a.state, b.address, a.address,
-                                     b.order, a.order, b.wake, a.wake,
-                                     b.thread->context.cpu_registers[0]);
-            }
-            census.arb_traces.push_back(std::move(trace));
-        }
-#endif
-        {
-            std::scoped_lock hle_lock{kernel.GetHLELock()};
-            kernel.GetCurrentThreadManager().ImportNativeSchedule(
-                sched_before, sched_after, run.sched_current, timer->GetTicks(),
-                sched_arbiter.get());
-        }
-#ifdef VITA_DIAGNOSTICS
-        census.sched_slices++;
-        census.sched_switches += run.sched_switches;
-        census.sched_sleeps += run.sched_sleeps;
-        census.sched_idle += run.sched_idle;
-        census.sched_arbitrations += run.sched_arbitrations;
-#endif
-        if (run.sched_current < 0) {
-            return false;
-        }
-        if (run.reason == AZAHAR_EXIT_SVC && run.sched_handled) {
-            return !break_flag && !stop_requested;
-        }
-    }
 
 #ifdef VITA_DIAGNOSTICS
     census.slices++;
@@ -2032,32 +2740,21 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         census.fast[i] += run.fast_count[i];
     }
     census.guest_ticks += run.guest_ticks;
-    census.kernel_us += run.kernel_us;
+    census.kernel_cycles += run.kernel_cycles;
     if (run.reason == AZAHAR_EXIT_SVC) {
         census.svcs[run.svc_number < census.svcs.size() ? run.svc_number : 0]++;
     }
 #endif
 
-    // Whether this thread's slices carry the table from now on: a SleepThread or ArbitrateAddress
-    // exit says yes (the latter's arbiter the one the module answers), any other svc exit no.
-    if (run.reason == AZAHAR_EXIT_SVC) {
-        if (const auto* const t = kernel.GetCurrentThreadManager().GetCurrentThread()) {
-            if (run.svc_number == 0x0A || run.svc_number == 0x22) {
-                sched_waiters.insert(t->thread_id);
-            } else {
-                sched_waiters.erase(t->thread_id);
-            }
-            if (run.svc_number == 0x22) {
-                sched_arbiter_handle = run.ctx.r[0];
-            }
-        }
-    }
-
     switch (run.reason) {
     case AZAHAR_EXIT_SVC:
         // An upcall asked for a reschedule: this exit is for it alone.
-        if (run.svc_number == UpcallRescheduleSvc && UpcallsOn() &&
-            IsUpcallTailSvc(context.r[15] - 4)) {
+        if (run.svc_number == UpcallRescheduleSvc &&
+            IsUpcallTailExit(run.ctx.r[15])) {
+            // The resume PC from the frame (Thumb by bit 0), before another upcall uses it.
+            const u32 resume = UpcallFrame()[FrameResume];
+            run.ctx.r[15] = (resume & 1u) != 0 ? PastPatchedThumbSvc(resume & ~1u) : resume;
+            run.ctx.cpsr = (run.ctx.cpsr & ~(0x20u | 0x0600FC00u)) | ((resume & 1u) << 5);
             return false;
         }
         // A patched VFP instruction the module did not run: run here. One with no record is from a
@@ -2074,8 +2771,15 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
             DEBUG_ASSERT_MSG(ran, "a patched VFP instruction at {:08X} did not run", it->first);
             return !break_flag && !stop_requested;
         }
-        if (UpcallFor(run.svc_number) && (context.cpsr & 0x20) == 0) {
-            PatchUpcall(context.r[15] - 4);
+        if (UpcallFor(run.svc_number)) {
+            // Not a Thumb svc an IT block covers.
+            const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
+            if (!thumb) {
+                PatchUpcall(run.ctx.r[15] - 4, false);
+            } else if ((run.ctx.cpsr & 0x0600FC00u) == 0) {
+                PatchUpcall(run.ctx.r[15] - 2, true);
+                run.ctx.r[15] = PastPatchedThumbSvc(run.ctx.r[15]);
+            }
         }
         svc_context.CallSVC(run.svc_number);
         // An svc can reschedule, which replaces the register file wholesale.
@@ -2141,12 +2845,39 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
 
 #ifdef VITA_DIAGNOSTICS
 VitaNativeCensus TakeVitaNativeCensus() {
+    // The upcall stack's deepest use: an overflow would write over the globals below it.
+    if (upcall_stack_filled) {
+        u32 untouched = 0;
+        while (untouched < upcall_stack.size() && upcall_stack[untouched] == UpcallStackFill) {
+            untouched++;
+        }
+        census.upcall_stack_used = static_cast<u32>(upcall_stack.size()) - untouched;
+        DEBUG_ASSERT_MSG(untouched > 1024, "upcall: the stack's deepest use left {} bytes of {}",
+                         untouched, upcall_stack.size());
+    }
+    census.hold_pages = static_cast<u32>(hold_page_accesses.size());
+    std::vector<std::array<u32, 3>> pages;
+    for (const auto& [page, access] : hold_page_accesses) {
+        pages.push_back({page, access.first, access.second});
+    }
+    std::sort(pages.begin(), pages.end(), [](const auto& a, const auto& b) { return a[1] > b[1]; });
+    for (std::size_t i = 0; i < std::min(pages.size(), census.hold_top.size()); i++) {
+        census.hold_top[i] = pages[i];
+    }
+    hold_page_accesses.clear();
     return std::exchange(census, VitaNativeCensus{});
 }
 #endif
 
 void SetVitaInKernelScheduling(bool on) {
     in_kernel_scheduling = on;
+}
+
+bool ARM_VitaNative::TakeHeldPage(u32 va, bool write, u32 pc) {
+    // A page held for the display alone opens instead (PageHolds::OpenPastDisplay).
+    const u8* const host = map->HostAt(va);
+    return host != nullptr && (system.GPU().GuestOpensDisplayPage(host, write) ||
+                               system.GPU().GuestAbort(host, write, pc, va));
 }
 
 void ARM_VitaNative::ReportFault() {
@@ -2307,12 +3038,17 @@ u32 ARM_VitaNative::GetPC() const {
 
 u32 ARM_VitaNative::GetReg(int index) const {
     ASSERT(index >= 0 && index < 16);
+    if (upcall_regs_live) {
+        return upcall_regs[index];
+    }
     return index == 15 ? GetPC() : run.ctx.r[index];
 }
 
 void ARM_VitaNative::SetReg(int index, u32 value) {
     ASSERT(index >= 0 && index < 16);
-    if (index == 15) {
+    if (upcall_regs_live) {
+        upcall_regs[index] = value;
+    } else if (index == 15) {
         SetPC(value);
     } else {
         run.ctx.r[index] = value;
@@ -2377,6 +3113,9 @@ void ARM_VitaNative::SaveContext(ThreadContext& ctx) {
 
 void ARM_VitaNative::LoadContext(const ThreadContext& ctx) {
     ToAzahar(ctx, run.ctx);
+    if ((run.ctx.cpsr & 0x20u) != 0) {
+        run.ctx.r[15] = PastPatchedThumbSvc(run.ctx.r[15]);
+    }
     fpexc = ctx.fpexc;
 }
 

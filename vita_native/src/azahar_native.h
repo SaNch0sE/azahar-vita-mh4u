@@ -93,6 +93,51 @@ typedef struct AzaharContext {
 // azaharMap refuses a guest range over either page.
 #define AZAHAR_USER_TIMER_VA 0x000BE000u
 #define AZAHAR_USER_PAGE_VA 0x000BF000u
+// A thread switch the app arms from the guest's world (version 37): the emulator's upcalls (C++
+// it runs at user level in the guest's world) answer an svc that
+// stops the thread or wakes a more urgent one with the next thread's state here, `armed` set,
+// and make svc AZAHAR_SWITCH_SVC. The module's vector then loads `in` (r0-r15, the CPSR in user
+// mode, TPIDRURO, TPIDRURW, FPSCR and the VFP bank), clears `armed`, sets GetThreadId's answer
+// (AzaharUserPage.thread_id and its own) to `thread_id`, and returns into it: no exit. The
+// outgoing thread's state is the app's to keep (the upcall saved it). Not armed, the svc exits as
+// AZAHAR_EXIT_SVC. AzaharRunRequest.upcall_switch is where it is in the app.
+#define AZAHAR_SWITCH_SVC 0xFDu
+typedef struct AzaharSwitch {
+    uint32_t armed;
+    uint32_t thread_id;
+    const AzaharContext *in;
+    uint32_t reserved;
+} AzaharSwitch;
+
+// A guest svc the vector does not answer, redirected to the app's upcall instead of exiting
+// (version 38): with AzaharRunRequest.upcall_redirect set, an svc from the guest's code (below
+// 0x40000000, outside an IT block; not svc 0, AZAHAR_SWITCH_SVC or AZAHAR_VFP_SVC) returns into
+// `entry` (ARM state, the flags and every register the guest's) with `svc` its number and `pc`
+// the instruction after it (bit 0 set for Thumb), and `site` the same, for the app to patch the
+// site into a branch (the app clears it). The app's thunk at `entry` answers the svc and goes
+// back to `pc`.
+typedef struct AzaharRedirect {
+    uint32_t entry;
+    uint32_t svc;
+    uint32_t pc;
+    uint32_t site;
+} AzaharRedirect;
+
+// TPIDRURO from the guest's world (version 39): svc AZAHAR_TLS_SVC sets it to r12 and returns,
+// every other register and the flags kept. The app's upcalls run with its own thread's (Sony's
+// user libraries find the thread through it) and put the guest's back before they return.
+#define AZAHAR_TLS_SVC 0xFCu
+
+// The slice's clock from the guest's world (version 40): svc AZAHAR_CLOCK_SVC answers in r1:r0
+// the guest ticks the slice's clock counted since it last started (the slice's entry, or this
+// svc), and starts it again: the private timer over r1 timer ticks (at least 1), the guest clock
+// from where it is (r0 = 0) or from r3:r2 (r0 = 1). The fast svcs' answers and AzaharUserPage
+// follow, and the exit's AzaharRunRequest.guest_ticks counts from the restart. r2, r3 and r12
+// are the svc's; the other registers and the flags are kept. The app's upcalls take the slice's
+// time with it when the guest goes idle, move its own clock on to the next thread's, and start
+// the slice again from there.
+#define AZAHAR_CLOCK_SVC 0xFBu
+
 typedef struct AzaharUserPage {
     uint32_t gen;        // changed at every entry into the guest
     uint32_t on;         // 1 << AZAHAR_FAST_* for each answer below that holds; TICK only with a timer
@@ -103,50 +148,6 @@ typedef struct AzaharUserPage {
     uint32_t thread_id;  // GetThreadId(0xFFFF8000)'s answer
     uint32_t process_id; // GetProcessId(0xFFFF8001)'s
 } AzaharUserPage;
-
-// In-kernel scheduling (version 34): azaharRun takes the table of the current process's threads
-// the module may switch between itself, the HLE kernel's rules copied (Kernel::ThreadManager). A
-// SleepThread (svc 0x0A) of the running thread no longer exits: the module puts it to sleep until
-// its wake tick, picks the next thread as PopNextReadyThread does (the most urgent priority, a
-// level's oldest first; a running thread yields only to a strictly more urgent one), switches
-// the context in place and runs on. With no thread to run it moves the guest clock to the
-// earliest wake (the HLE kernel's idle). Woken threads go to the back of their level, a
-// preempted one to the front. The slice ends at `sched_deadline`, the HLE kernel's next event
-// that is not one of these wakes; a sleep whose idle would pass it exits (sched_current -1).
-// Other svcs exit as before, from whichever thread runs then. Folded mode only.
-//
-// ArbitrateAddress (svc 0x22, version 36) on the arbiter handle sched_arbiter is answered the
-// same way, with the HLE kernel's AddressArbiter rules: a signal wakes up to r3 waiters on the
-// address r1 (all for a negative count; the most urgent first, a level's oldest waiter first,
-// list order for all) to the back of their levels with r0 0, and the caller yields to a woken
-// thread more urgent than it; one that wakes none from priority 49 or below moves the clock 1614
-// ticks. A wait (types 1-4) reads the guest's word at r1 and, below r3, decrements it (types 2
-// and 4) and puts the caller to wait on the address (ARB), types 3 and 4 with a timeout of
-// r4:r5 nanoseconds, after which it is READY with the timeout result; r0 is 0, or the timeout
-// result for types 3 and 4 whether or not it waits. Another handle, a word the guest's table
-// does not let the module read (or write), a misaligned one, a timeout of 4.3 s and more or an
-// unknown type exits as before.
-#define AZAHAR_SCHED_MAX 32u
-#define AZAHAR_SCHED_READY 1u   // runnable, at `order` in its level (lower first)
-#define AZAHAR_SCHED_SLEEP 2u   // asleep until `wake`
-#define AZAHAR_SCHED_RUNNING 3u // the thread in ctx (sched_current)
-#define AZAHAR_SCHED_ARB 4u     // waiting on sched_arbiter at `address`, at `order` in its list
-                                // (lower first); `wake` its timeout, ~0 for none (version 36)
-#define AZAHAR_SCHED_ARB_FAR 5u // the same, a thread of another emulated core's: a signal wakes
-                                // it (WOKEN_FAR) but it never runs here; `wake` ~0
-#define AZAHAR_SCHED_WOKEN_FAR 6u // an ARB_FAR waiter a signal here woke, r0 0: ready on its core
-#define AZAHAR_RESULT_TIMEOUT 0x09401BFEu // the HLE kernel's ResultTimeout
-typedef struct AzaharSchedThread {
-    uint32_t id;       // in: the guest thread's ID (GetThreadId's answer)
-    uint32_t priority; // in: 0 most urgent .. 63
-    uint32_t state;    // in/out: AZAHAR_SCHED_*
-    int32_t order;     // in/out: READY's place in its level
-    uint64_t wake;     // in/out: SLEEP's wake, on the guest clock
-    uint32_t tls;      // in: the thread's TLS address (TPIDRURO while it runs)
-    uint32_t saved;    // out: the module wrote ctx (the thread stopped running in it)
-    AzaharContext *ctx; // in: the app's copy of the thread's context while it does not run
-    uint32_t address;   // in/out: ARB's address (version 36)
-} AzaharSchedThread;
 
 // azaharRun's request (version 48): the app's own block, one per emulated core, kept from call to
 // call. The module maps it into the kernel at its first call and reads and writes it in place
@@ -167,28 +168,28 @@ typedef struct AzaharRunRequest {
     uint32_t fast;        // in: 1 << AZAHAR_FAST_* for each svc the module may answer itself
     uint32_t thread_id;   // in: the running guest thread's ID (AZAHAR_FAST_THREAD_ID)
     uint32_t process_id;  // in: its process's ID (AZAHAR_FAST_PROCESS_ID)
-    uint32_t sched_arbiter; // in: the arbiter handle whose ArbitrateAddress the module answers
-                            // with the thread table, 0 for none (version 36)
     uint64_t tick_hz;     // in: the guest clock's rate, in ticks a second (AZAHAR_FAST_TICK)
     uint64_t tick_base;   // in: the guest clock at entry
     uint64_t guest_ticks; // out: the slice's length on the guest clock, timed by the private
                           // timer. No AZAHAR_FAST_TICK answer exceeds tick_base + guest_ticks
     uint32_t fast_count[AZAHAR_FAST_KINDS]; // out: the svcs answered in the guest, by kind
-    uint32_t kernel_us;   // out: azaharRun's own time, the guest's included
+    uint32_t kernel_cycles; // out: azaharRun's own time in the cycle counter's cycles, the
+                            // guest's included (version 45)
     uint32_t fast_site;   // out: the address after the last ARM-mode svc the module answered in
                           // the guest this slice (AZAHAR_FAST_TICK to AZAHAR_FAST_PROCESS_ID), 0
                           // for none: the app's to patch into a branch (AZAHAR_USER_PAGE_VA).
                           // Version 35
-    // Since version 34: in-kernel scheduling (AzaharSchedThread above).
-    AzaharSchedThread *sched; // in: the app's table, or 0 for none
-    uint32_t sched_count;     // in: its threads, at most AZAHAR_SCHED_MAX
-    int32_t sched_current;    // in/out: the RUNNING thread's index, -1 when none runs (idle)
-    uint64_t sched_deadline;  // in: the guest tick the slice ends at
-    uint32_t sched_handled;   // out: the exit's svc was a SleepThread the module answered
-    uint32_t sched_switches;  // out: context switches made in the module
-    uint32_t sched_sleeps;    // out: SleepThreads answered in the module
-    uint32_t sched_idle;      // out: idle stretches skipped on the guest clock
-    uint32_t sched_arbitrations; // out: ArbitrateAddresses answered in the module (version 36)
+    AzaharSwitch *upcall_switch; // in: the app's switch request (AZAHAR_SWITCH_SVC), or 0
+                                 // (version 37)
+    AzaharRedirect *upcall_redirect; // in: the app's svc redirect (AzaharRedirect), or 0
+                                     // (version 38)
+    // Version 42: a quantum that ends inside an upcall (the app's code, at or above 0x40000000)
+    // is started again in the vector over upcall_rearm_us, at most upcall_rearm_max times a
+    // call, with no exit unless an SGI is pending; 0 for none. guest_ticks includes those
+    // quantums.
+    uint32_t upcall_rearm_us;  // in
+    uint32_t upcall_rearm_max; // in
+    uint32_t upcall_rearms;    // out: the quantums started again this call
 } AzaharRunRequest;
 
 // VFP short vectors (version 30). The Cortex-A9 has none: with the guest's FPSCR LEN or STRIDE
@@ -316,6 +317,12 @@ int azaharEdit(const AzaharEditRequest *req);
 /// registered there before. Between slices. 0, or AZAHAR_ERR_ARG for a bad form and
 /// AZAHAR_ERR_STATE when the table is full. Version 30.
 int azaharVfpPatch(uint32_t guest_pc, uint32_t form);
+/// The process's own megabyte at `user_va` (0x40000000 up) into the guest's table as the process's
+/// table has it now: a block the app mapped after azaharMap, which an upcall then touched (the
+/// guest's world holds the app's megabytes). Between slices. 1 when the entry was added or changed,
+/// 0 when it was already there or the process has nothing there, AZAHAR_ERR_* otherwise. Version
+/// 44.
+int azaharSyncUpper(uint32_t user_va);
 /// See AzaharHoldRun: `count` runs, 1 to AZAHAR_HOLD_MAX_RUNS. Returns the guest descriptors it
 /// changed. Version 25.
 int azaharHold(const AzaharHoldRun *runs, uint32_t count);

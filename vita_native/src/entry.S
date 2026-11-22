@@ -52,10 +52,10 @@
     .equ CPU_CHAIN_IRQ, 0x1c4
     .equ CPU_STRAY, 0x1cc           @ count, reason, lr, spsr, dfsr, dfar, ifsr, ifar
     .equ CPU_FAST, 0x1f0            @ AzaharFast
-    .equ CPU_STRAY_STACK_TOP, 0x278 @ 64 bytes below each
-    .equ CPU_IRQ_STACK_TOP, 0x2b8
-    .equ CPU_VFP_STACK_TOP, 0x6c0   @ azahar_vfp_svc's stack (1 KiB below)
-    .equ CPU_SIZE, 0x6c8            @ the last 8 bytes keep the tops inside the block
+    .equ CPU_STRAY_STACK_TOP, 0x290 @ 64 bytes below each
+    .equ CPU_IRQ_STACK_TOP, 0x2d0
+    .equ CPU_VFP_STACK_TOP, 0x6d8   @ azahar_vfp_svc's stack (1 KiB below)
+    .equ CPU_SIZE, 0x6e0            @ the last 8 bytes keep the tops inside the block
 @ AzaharFast, at CPU_FAST (native.c): on 0x00, timer 0x04, quantum 0x08, mult_int 0x0c,
 @ mult_frac 0x10, base 0x14 (low) and 0x18, thread_id 0x1c, process_id 0x20, count[5] 0x24,
 @ save[4] 0x38. AzaharCpu.fast_site is the word before it.
@@ -70,7 +70,27 @@
     .equ FAST_PROCESS_ID, 0x20
     .equ FAST_COUNT, 0x24
     .equ FAST_SAVE, 0x38
+    .equ FAST_REARM_TICKS, 0x48
+    .equ FAST_REARM_LEFT, 0x4c
+    .equ FAST_ACCRUED_LO, 0x50
+    .equ FAST_ACCRUED_HI, 0x54
+    .equ FAST_REARMS, 0x58
     .equ FAST_SITE, -4
+    .equ USER_GEN, 0x00             @ AzaharUserPage
+    .equ USER_QUANTUM, 0x08
+    .equ USER_BASE_LO, 0x14
+    .equ USER_BASE_HI, 0x18
+    .equ USER_THREAD_ID, 0x1c
+    .equ PTIMER_LOAD_FROM_COUNTER, -4      @ the private timer's registers by its counter's
+    .equ PTIMER_CONTROL_FROM_COUNTER, 4
+    .equ PTIMER_STATUS_FROM_COUNTER, 8
+    .equ SWITCH_ARMED, 0x00         @ AzaharSwitch
+    .equ SWITCH_THREAD_ID, 0x04
+    .equ SWITCH_IN, 0x08
+    .equ REDIRECT_ENTRY, 0x00       @ AzaharRedirect
+    .equ REDIRECT_SVC, 0x04
+    .equ REDIRECT_PC, 0x08
+    .equ REDIRECT_SITE, 0x0c
 
     .global azahar_enter
     .type azahar_enter, %function
@@ -223,8 +243,7 @@ azahar_vec_irq_\core:
     mov     r0, sp
     bl      azahar_irq_ack          @ r0-r2 free now; r3 preserved by it
     mov     lr, r3
-    mov     r0, #5
-    b       azahar_exit_common
+    b       azahar_irq_rearm        @ inside an upcall, the timer again; else the exit (5)
 9:  ldr     sp, =azahar_cpu + \core * CPU_SIZE + CPU_IRQ_STACK_TOP
     push    {r0-r3, lr}
     ldr     r0, =azahar_cpu + \core * CPU_SIZE
@@ -269,19 +288,25 @@ azahar_vec_irq_\core:
 azahar_svc_fast:
     stmia   sp, {r4-r7}
     sub     r6, sp, #FAST_SAVE          @ r6 = this core's AzaharFast from here on
-    ldr     r7, [r6, #FAST_ON]
-    cmp     r7, #0
-    beq     8f
     mrs     r4, spsr
     tst     r4, #0x20                   @ Thumb: a 16-bit svc, 8-bit immediate
     ldrhne  r5, [lr, #-2]
     andne   r5, r5, #0xff
     ldreq   r5, [lr, #-4]
     biceq   r5, r5, #0xff000000
+    cmp     r5, #0xfc                   @ AZAHAR_TLS_SVC
+    beq     10f
+    cmp     r5, #0xfb                   @ AZAHAR_CLOCK_SVC
+    beq     11f
+    ldr     r7, [r6, #FAST_ON]
+    cmp     r7, #0
+    beq     8f
     cmp     r5, #0x28
     beq     1f
     cmp     r5, #0xfe                   @ AZAHAR_VFP_SVC
     beq     5f
+    cmp     r5, #0xfd                   @ AZAHAR_SWITCH_SVC
+    beq     9f
     cmp     r5, #0x37
     beq     3f
     cmp     r5, #0x35
@@ -357,7 +382,8 @@ azahar_svc_fast:
     tst     r4, #0x20
     subne   r4, lr, #2                  @ the svc's address: Thumb's is 16 bits
     subeq   r4, lr, #4
-    add     sp, r6, #(CPU_VFP_STACK_TOP - CPU_FAST)
+    add     sp, r6, #(CPU_VFP_STACK_TOP - CPU_FAST - 8) @ two adds: no one immediate takes it
+    add     sp, sp, #8
     push    {r0-r3, r12, lr}
     mov     r0, r4
     bl      azahar_vfp_svc
@@ -382,7 +408,148 @@ azahar_svc_fast:
     ldmia   sp, {r4-r7}
     movs    pc, lr
 
-8:  @ not answered here: the ordinary svc exit, from the core's block
+10: @ AZAHAR_TLS_SVC: TPIDRURO = r12, for the app's upcalls (their C++ runs with the app
+    @ thread's; the thunk puts the guest's back)
+    mcr     p15, 0, r12, c13, c0, 3
+    add     sp, r6, #FAST_SAVE
+    ldmia   sp, {r4-r7}
+    movs    pc, lr
+
+11: @ AZAHAR_CLOCK_SVC: r1:r0 = the guest ticks since the clock's last start; the private timer
+    @ again over r1 ticks (one shot, its interrupt on); the guest clock from where it is
+    @ (r0 = 0) or from r3:r2; the user page follows. r2, r3 and r12 are the svc's. No timer
+    @ (an untimed slice): r1:r0 = 0 and nothing changes.
+    ldr     r4, [r6, #FAST_TIMER]
+    cmp     r4, #0
+    moveq   r0, #0
+    moveq   r1, #0
+    beq     12f
+    ldr     r5, [r4]                    @ the counter, down from the quantum (0 once expired)
+    ldr     r7, [r6, #FAST_QUANTUM]
+    sub     r5, r7, r5                  @ spent
+    mov     r7, #0
+    str     r7, [r4, #PTIMER_CONTROL_FROM_COUNTER]
+    mov     r7, #1
+    str     r7, [r4, #PTIMER_STATUS_FROM_COUNTER]
+    str     r1, [r4, #PTIMER_LOAD_FROM_COUNTER]
+    str     r1, [r6, #FAST_QUANTUM]
+    mov     r7, #5                      @ enable, interrupt, no reload
+    str     r7, [r4, #PTIMER_CONTROL_FROM_COUNTER]
+    ldr     r4, [r6, #FAST_MULT_FRAC]   @ r4:r1 = spent * mult, as GetSystemTick's
+    umull   r7, r12, r5, r4
+    ldr     r4, [r6, #FAST_MULT_INT]
+    umull   r1, r4, r5, r4
+    adds    r1, r1, r12
+    adc     r4, r4, #0
+    ldr     r7, [r6, #FAST_ACCRUED_LO]  @ and the quantums re-armed since the last start
+    ldr     r12, [r6, #FAST_ACCRUED_HI]
+    adds    r1, r1, r7
+    adc     r4, r4, r12
+    mov     r7, #0
+    str     r7, [r6, #FAST_ACCRUED_LO]
+    str     r7, [r6, #FAST_ACCRUED_HI]
+    cmp     r0, #0
+    ldreq   r2, [r6, #FAST_BASE_LO]
+    ldreq   r3, [r6, #FAST_BASE_HI]
+    addseq  r2, r2, r1
+    adceq   r3, r3, r4
+    str     r2, [r6, #FAST_BASE_LO]
+    str     r3, [r6, #FAST_BASE_HI]
+    ldr     r7, =azahar_user_page_kva
+    ldr     r7, [r7]
+    ldr     r12, [r6, #FAST_QUANTUM]
+    str     r12, [r7, #USER_QUANTUM]
+    str     r2, [r7, #USER_BASE_LO]
+    str     r3, [r7, #USER_BASE_HI]
+    ldr     r12, [r7, #USER_GEN]
+    add     r12, r12, #1
+    str     r12, [r7, #USER_GEN]
+    mov     r0, r1
+    mov     r1, r4
+12: add     sp, r6, #FAST_SAVE
+    ldmia   sp, {r4-r7}
+    movs    pc, lr
+
+9:  @ AZAHAR_SWITCH_SVC: the thread switch the app armed from the guest's world (AzaharSwitch):
+    @ the next thread's state loaded and resumed, no exit. The outgoing thread's state is the
+    @ app's (the upcall saved it). Not armed: the ordinary exit, which reschedules in the app.
+    ldr     r4, =azahar_switch_va
+    ldr     r4, [r4]
+    cmp     r4, #0
+    beq     8f
+    ldr     r5, [r4, #SWITCH_ARMED]
+    cmp     r5, #0
+    beq     8f
+    mov     r5, #0
+    str     r5, [r4, #SWITCH_ARMED]
+    ldr     r7, [r4, #SWITCH_THREAD_ID]
+    ldr     r5, [r4, #SWITCH_IN]
+    str     r7, [r6, #FAST_THREAD_ID]
+    ldr     r4, =azahar_user_page_kva
+    ldr     r4, [r4]
+    str     r7, [r4, #USER_THREAD_ID]
+    add     r4, r5, #0x50
+    vldmia  r4!, {d0-d15}
+    vldmia  r4, {d16-d31}
+    ldr     r4, [r5, #0x4c]
+    vmsr    fpscr, r4
+    ldr     r4, [r5, #0x44]
+    mcr     p15, 0, r4, c13, c0, 3      @ TPIDRURO
+    ldr     r4, [r5, #0x48]
+    mcr     p15, 0, r4, c13, c0, 2      @ TPIDRURW
+    ldr     r4, [r5, #0x40]
+    bic     r4, r4, #0x1d0              @ user mode, A/I/F clear, T kept (as azaharRun does)
+    bic     r4, r4, #0x00f
+    orr     r4, r4, #0x10
+    msr     spsr_cxsf, r4
+    ldr     lr, [r5, #0x3c]             @ its pc
+    clrex                               @ no reservation crosses a thread switch
+    add     r4, r5, #0x34
+    ldmia   r4, {r13, r14}^             @ its user sp and lr
+    nop
+    ldmia   r5, {r0-r12}
+    movs    pc, lr
+
+8:  @ not answered here. With the app's redirect (AzaharRedirect): a guest svc goes to the app's
+    @ upcall thunk instead of exiting (its number and return address in the record). Not one from
+    @ the app's own code (svc 0, a Sony syscall the app forwards), the module's own (0xFD, 0xFE),
+    @ or one in an IT block, whose state user mode cannot put back: those exit.
+    ldr     r4, =azahar_redirect_va
+    ldr     r4, [r4]
+    cmp     r4, #0
+    beq     18f
+    cmp     lr, #0x40000000
+    bhs     18f
+    mrs     r7, spsr
+    tst     r7, #0x06000000             @ IT[1:0]
+    bne     18f
+    tst     r7, #0x0000fc00             @ IT[7:2]
+    bne     18f
+    tst     r7, #0x20                   @ the immediate again: the paths here changed r5
+    ldrhne  r5, [lr, #-2]
+    andne   r5, r5, #0xff
+    ldreq   r5, [lr, #-4]
+    biceq   r5, r5, #0xff000000
+    cmp     r5, #0
+    beq     18f
+    cmp     r5, #0xfd
+    beq     18f
+    cmp     r5, #0xfe
+    beq     18f
+    str     r5, [r4, #REDIRECT_SVC]
+    tst     r7, #0x20
+    orrne   r5, lr, #1
+    moveq   r5, lr
+    str     r5, [r4, #REDIRECT_PC]
+    str     r5, [r4, #REDIRECT_SITE]
+    ldr     lr, [r4, #REDIRECT_ENTRY]
+    bic     r7, r7, #0x20               @ the entry is ARM
+    msr     spsr_cxsf, r7
+    add     sp, r6, #FAST_SAVE
+    ldmia   sp, {r4-r7}
+    movs    pc, lr
+
+18: @ the ordinary svc exit, from the core's block
     add     sp, r6, #FAST_SAVE
     ldmia   sp, {r4-r7}
     sub     sp, sp, #(CPU_FAST + FAST_SAVE)
@@ -411,6 +578,84 @@ azahar_irq_ack:
     str     r2, [r1, #0x60c]        @ interrupt status: clear
     dsb     sy
     bx      lr
+
+@ The private timer's quantum ended inside an upcall (the app's code, at or above 0x40000000,
+@ which the guest's never is): the timer again over AzaharFast.rearm_ticks and back into the
+@ upcall, no exit, the ended quantum added to the guest clock (the fast svcs' base, the user page)
+@ and to AzaharFast.accrued for the exit to report. An exit instead for the guest's own code, any
+@ other interrupt, a pending SGI (a cross-core call waits for the core to be Sony's), or no
+@ re-arms left. sp = the core's block with the user file saved, lr = LR_irq; r0-r12 are free
+@ (put back from the block).
+azahar_irq_rearm:
+    ldr     r4, [sp, #(CPU_FAST + FAST_REARM_TICKS)]
+    cmp     r4, #0
+    beq     8f
+    sub     r1, lr, #4
+    cmp     r1, #0x40000000
+    blo     8f
+    ldr     r1, [sp, #CPU_IRQ_LAST]
+    lsl     r1, r1, #22
+    lsr     r1, r1, #22
+    cmp     r1, #29                 @ the private timer's PPI
+    bne     8f
+    ldr     r1, [sp, #(CPU_FAST + FAST_REARM_LEFT)]
+    cmp     r1, #0
+    beq     8f
+    ldr     r5, =azahar_gic_va
+    ldr     r5, [r5]
+    add     r6, r5, #0x1000         @ the distributor
+    ldr     r2, [r6, #0x200]        @ GICD_ISPENDR0
+    ldr     r7, [r6, #0x100]        @ GICD_ISENABLER0
+    and     r2, r2, r7
+    lsls    r2, r2, #17             @ SGIs 0-14, as core2_sgi_window
+    bne     8f
+    sub     r1, r1, #1
+    str     r1, [sp, #(CPU_FAST + FAST_REARM_LEFT)]
+    ldr     r7, [sp, #(CPU_FAST + FAST_QUANTUM)]
+    ldr     r2, [sp, #(CPU_FAST + FAST_MULT_FRAC)]
+    umull   r0, r1, r7, r2          @ r1 = quantum * frac >> 32
+    ldr     r2, [sp, #(CPU_FAST + FAST_MULT_INT)]
+    umull   r2, r3, r7, r2          @ r3:r2 = quantum * int
+    adds    r2, r2, r1
+    adc     r3, r3, #0              @ r3:r2 = the quantum on the guest clock
+    ldr     r0, [sp, #(CPU_FAST + FAST_BASE_LO)]
+    ldr     r1, [sp, #(CPU_FAST + FAST_BASE_HI)]
+    adds    r0, r0, r2
+    adc     r1, r1, r3
+    str     r0, [sp, #(CPU_FAST + FAST_BASE_LO)]
+    str     r1, [sp, #(CPU_FAST + FAST_BASE_HI)]
+    ldr     r8, [sp, #(CPU_FAST + FAST_ACCRUED_LO)]
+    ldr     r9, [sp, #(CPU_FAST + FAST_ACCRUED_HI)]
+    adds    r8, r8, r2
+    adc     r9, r9, r3
+    str     r8, [sp, #(CPU_FAST + FAST_ACCRUED_LO)]
+    str     r9, [sp, #(CPU_FAST + FAST_ACCRUED_HI)]
+    str     r4, [sp, #(CPU_FAST + FAST_QUANTUM)]
+    mov     r2, #0
+    str     r2, [r5, #0x608]        @ private timer: off (the ack stopped it)
+    mov     r2, #1
+    str     r2, [r5, #0x60c]        @ its event cleared
+    str     r4, [r5, #0x600]        @ load
+    mov     r2, #5
+    str     r2, [r5, #0x608]        @ enable, interrupt, one shot
+    ldr     r6, =azahar_user_page_kva
+    ldr     r6, [r6]
+    str     r4, [r6, #USER_QUANTUM]
+    str     r0, [r6, #USER_BASE_LO]
+    str     r1, [r6, #USER_BASE_HI]
+    ldr     r2, [r6, #USER_GEN]
+    add     r2, r2, #1
+    str     r2, [r6, #USER_GEN]
+    ldr     r2, [sp, #(CPU_FAST + FAST_REARMS)]
+    add     r2, r2, #1
+    str     r2, [sp, #(CPU_FAST + FAST_REARMS)]
+    dsb     sy
+    isb
+    ldmia   sp, {r0-r14}^           @ the upcall's registers, and on
+    nop
+    subs    pc, lr, #4
+8:  mov     r0, #5
+    b       azahar_exit_common
 
 @ sp = the core's block (its ctx, this mode's SP), r0 = reason, guest r0-r14 already in ctx.
 azahar_exit_common:

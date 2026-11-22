@@ -34,6 +34,7 @@ set(CITRA_VITA_SOURCES
     sgxd_present.h
     stats_hud.cpp
     stats_hud.h
+    upcall_tls.cpp
     vita_ui.cpp
     vita_ui.h
     "${GXM_SHADER_HEADER}"
@@ -46,6 +47,9 @@ set(CITRA_VITA_SOURCES
 # can always see them.
 set_source_files_properties(../vita_compat/src/vita_libc_shims.c PROPERTIES
     COMPILE_OPTIONS "-fno-lto")
+# The same for the upcalls' wraps of newlib's TLS lookup and malloc lock (upcall_tls.cpp): what
+# the linker's --wrap redirects to must be a real definition at the final link.
+set_source_files_properties(upcall_tls.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 # And for the abort report's wraps of raise and __assert_func (crash_report.cpp).
 set_source_files_properties(crash_report.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 
@@ -58,6 +62,11 @@ function(citra_vita_executable target titleid)
     create_target_directory_groups(${target})
 
     target_link_libraries(${target} PRIVATE citra_common citra_core input_common video_core)
+    # The upcall experiment's TLS lookup and malloc lock (upcall_tls.cpp), and the abort report
+    # (crash_report.cpp), which keeps the console's last text too.
+    target_link_options(${target} PRIVATE
+        "LINKER:--wrap=sceKernelGetTLSAddr,--wrap=__malloc_lock,--wrap=__malloc_unlock"
+        "LINKER:--wrap=raise,--wrap=__assert_func,--wrap=malloc")
     # The ID the crash report names the build by: a commit does not tell a dirty build's ELF.
     target_link_options(${target} PRIVATE "LINKER:--build-id=sha1")
 

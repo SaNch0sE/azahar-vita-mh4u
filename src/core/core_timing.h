@@ -201,6 +201,8 @@ public:
         ~Timer();
 
         s64 GetMaxSliceLength() const;
+        /// The type of the event GetMaxSliceLength runs up to, or null with none queued.
+        const TimingEventType* NextEventType() const;
 
         void Advance();
 
@@ -231,16 +233,6 @@ public:
         [[nodiscard]] s64 EventTime(const TimingEventType* type, std::uintptr_t user_data) const;
         /// How many events of `type` this timer's queue holds.
         [[nodiscard]] std::size_t EventCount(const TimingEventType* type) const;
-        /// The earliest queued event's tick that `skip` does not leave out, or `limit`.
-        template <typename Skip>
-        [[nodiscard]] s64 NextEventTime(s64 limit, Skip&& skip) const {
-            for (const Event& e : event_queue) {
-                if (e.time < limit && !skip(e.type, e.user_data)) {
-                    limit = e.time;
-                }
-            }
-            return limit;
-        }
 
     private:
         friend class Timing;

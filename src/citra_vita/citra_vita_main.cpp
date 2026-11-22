@@ -621,6 +621,47 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              n.vfp_insns, n.vfp_exits, n.fast[AZAHAR_FAST_TICK],
                              n.fast[AZAHAR_FAST_CACHE], n.fast[AZAHAR_FAST_THREAD_ID],
                              n.fast[AZAHAR_FAST_PROCESS_ID], n.fast[AZAHAR_FAST_VFP]);
+                    LOG_INFO(Frontend,
+                             "perf: idle loops: {} callers sent to the skip; {} skips, {:.1f} ms "
+                             "of guest time skipped",
+                             n.idle_waits, n.idle_skips, n.idle_skip_ticks / tick_ms);
+                    LOG_INFO(Frontend,
+                             "perf: idle exits to RunLoop: host 1 running {}, its next event "
+                             "soon {}, a message for it {}, one for host 0 {}, a forward {}, "
+                             "quiet {}",
+                             n.upcall_idle_exit_why[0], n.upcall_idle_exit_why[1],
+                             n.upcall_idle_exit_why[2], n.upcall_idle_exit_why[3],
+                             n.upcall_idle_exit_why[4], n.upcall_idle_exit_why[5]);
+                    std::string sleeps;
+                    for (const auto& s : n.sleeps) {
+                        if (s.count != 0) {
+                            fmt::format_to(std::back_inserter(sleeps), " {:08x} {} ({:.1f} us)",
+                                           s.lr, s.count, s.ns / 1e3 / s.count);
+                        }
+                    }
+                    LOG_INFO(Frontend, "perf: SleepThread by caller:{}; other {}, 0 ns {}", sleeps,
+                             n.sleep_other, n.sleep_zero);
+                    std::string hold_top;
+                    for (const auto& [page, count, pc] : n.hold_top) {
+                        if (count != 0) {
+                            hold_top += fmt::format(" {:#010x} {} (pc {:#010x})", page, count, pc);
+                        }
+                    }
+                    LOG_INFO(Frontend, "perf: accesses past holds: {} pages;{}", n.hold_pages,
+                             hold_top);
+                    std::vector<std::pair<u32, u32>> upcall_svcs;
+                    for (u32 s = 0; s < n.upcall_svcs.size(); s++) {
+                        if (n.upcall_svcs[s] != 0) {
+                            upcall_svcs.emplace_back(n.upcall_svcs[s], s);
+                        }
+                    }
+                    std::sort(upcall_svcs.rbegin(), upcall_svcs.rend());
+                    std::string upcall_top;
+                    for (std::size_t i = 0; i < std::min<std::size_t>(upcall_svcs.size(), 10); i++) {
+                        upcall_top += fmt::format(" {:#04x} {}", upcall_svcs[i].second,
+                                                  upcall_svcs[i].first);
+                    }
+                    LOG_INFO(Frontend, "perf: upcalls by svc:{}", upcall_top);
                     std::vector<u32> order;
                     for (u32 i = 0; i < n.svcs.size(); i++) {
                         if (n.svcs[i] != 0) {
@@ -634,14 +675,18 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                         svcs += fmt::format("{}{:02x} {}", svcs.empty() ? "" : ", ", i, n.svcs[i]);
                     }
                     LOG_INFO(Frontend, "perf: svc exits: {}", svcs.empty() ? "none" : svcs);
-                    LOG_INFO(Frontend,
-                             "perf: in-kernel scheduling: {} slices with the thread table, {} "
-                             "switches, {} SleepThreads and {} ArbitrateAddresses answered, {} "
-                             "idle stretches skipped",
-                             n.sched_slices, n.sched_switches, n.sched_sleeps, n.sched_arbitrations,
-                             n.sched_idle);
-                    for (const auto& trace : n.arb_traces) {
-                        LOG_INFO(Frontend, "perf: in-kernel arbitration: {}", trace);
+                    std::string forwards;
+                    for (const auto& f : n.forwards) {
+                        if (f.count != 0) {
+                            forwards += fmt::format(
+                                "{}{:08x}{} #{:x} {}", forwards.empty() ? "" : ", ", f.lr,
+                                f.app ? fmt::format("<{:08x}", f.app) : std::string{}, f.number,
+                                f.count);
+                        }
+                    }
+                    if (!forwards.empty()) {
+                        LOG_INFO(Frontend, "perf: Sony syscalls forwarded by caller: {}; {} more",
+                                 forwards, n.forward_other);
                     }
                     // Room for the lists' scan off the emulation thread (GPU::GuestIdle).
                     const auto room = system.GPU().TakeScanRoom();

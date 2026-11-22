@@ -184,6 +184,11 @@ public:
     /// Prepare the core emulation for a reschedule
     void PrepareReschedule();
 
+    /// Makes core `core_id` the running one, as RunLoop does before each core's turn: the
+    /// kernel's current core, its timer and its process (the Vita native core's upcalls run the
+    /// other cores' timer events while the guest idles).
+    void SelectCore(u32 core_id);
+
     [[nodiscard]] PerfStats::Results GetAndResetPerfStats();
 
     void ReportArticTraffic(u32 bytes) {

@@ -16,6 +16,9 @@
 SERIALIZE_EXPORT_IMPL(Kernel::HandleTable)
 
 namespace Kernel {
+
+ThreadIdHooks thread_id_hooks{};
+
 namespace {
 constexpr u16 GetSlot(Handle handle) {
     return handle >> 15;
@@ -65,6 +68,10 @@ Result HandleTable::Close(Handle handle) {
     R_UNLESS(IsValid(handle), ResultInvalidHandle);
 
     const u16 slot = GetSlot(handle);
+    if (thread_id_hooks.closed != nullptr &&
+        objects[slot]->GetHandleType() == HandleType::Thread) {
+        thread_id_hooks.closed(handle);
+    }
     objects[slot] = nullptr;
 
     generations[slot] = next_free_slot;
@@ -97,6 +104,9 @@ void HandleTable::Clear() {
         objects[i] = nullptr;
     }
     next_free_slot = 0;
+    if (thread_id_hooks.cleared != nullptr) {
+        thread_id_hooks.cleared();
+    }
 }
 
 template <class Archive>
@@ -105,6 +115,9 @@ void HandleTable::serialize(Archive& ar, const unsigned int) {
     ar & generations;
     ar & next_generation;
     ar & next_free_slot;
+    if (Archive::is_loading::value && thread_id_hooks.cleared != nullptr) {
+        thread_id_hooks.cleared();
+    }
 }
 SERIALIZE_IMPL(HandleTable)
 

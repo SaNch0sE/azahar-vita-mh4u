@@ -25,6 +25,7 @@ struct FrameBufferInfo;
 
 namespace Core {
 class System;
+struct TimingEventType;
 }
 
 namespace Pica {
@@ -144,6 +145,9 @@ public:
     /// The render thread, the rasterizer the PICA calls (renderer_sgxd/render_thread.h).
     [[nodiscard]] SgxdRenderer::RenderThread& GetRenderThread();
 #endif
+    /// The vblank's timer event (VBlankCallback): the frame's end, the presents and the page
+    /// holds' remaps.
+    [[nodiscard]] const Core::TimingEventType* VBlankEventType() const;
 
     /// Switches the rasterizer's disk shader cache to the title's, in order with the GPU's work.
     void SwitchDiskResources(u64 title_id);

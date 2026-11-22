@@ -573,10 +573,7 @@ int azaharFlip(const AzaharFlipRun *user_runs, uint32_t count) {
         ret = AZAHAR_ERR_STATE;
         goto out;
     }
-    if (ksceKernelCopyFromUser(reback_flip_runs, user_runs, count * sizeof(AzaharFlipRun)) < 0) {
-        ret = AZAHAR_ERR_ARG;
-        goto out;
-    }
+    request_copy(reback_flip_runs, user_runs, count * sizeof(AzaharFlipRun));
     for (uint32_t r = 0; r < count; r++) {
         const AzaharFlipRun *run = &reback_flip_runs[r];
         const uint32_t uva = run->user_va;
