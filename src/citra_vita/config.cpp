@@ -55,6 +55,7 @@ const std::vector<const char*> Scales{"1x", "1.25x", "1.5x", "1.75x", "2x"};
 const std::vector<const char*> Skips{"0", "1", "2", "3", "4", "none"};
 const std::vector<const char*> Regions{"auto",      "japan", "usa",   "europe",
                                        "australia", "china", "korea", "taiwan"};
+const std::vector<const char*> Themes{"dark", "light"};
 
 /// In Option's order (checked at Load).
 const std::array<Definition, Count> definitions{{
@@ -71,6 +72,8 @@ const std::array<Definition, Count> definitions{{
     {"stretch_audio", false, true, 0, 1, 1, Toggle},
     {"right_stick", true, true, 0, static_cast<int>(RightStickMode::Count) - 1, 0, RightStickWords},
     {"region", false, false, 0, 7, 0, Regions},
+    {"force_new_3ds", true, false, 0, 1, 0, Toggle},
+    {"theme", false, true, 0, 1, 0, Themes},
 }};
 
 /// The screen layouts' choices as the emulator's layout options; the overlay is the single
@@ -198,6 +201,13 @@ void ApplyLocked(Option option) {
         // Index 0 is the automatic choice, Settings' -1.
         Settings::values.region_value = value - 1;
         break;
+    case Option::ForceNew3ds:
+        // Read by a title's load (ApplyForLoad before it), and a reset's.
+        Settings::values.is_new_3ds = value != 0;
+        break;
+    case Option::Theme:
+        // Nothing of the emulator's: the menus read it as they draw (Ui::Update).
+        break;
     case Option::Count:
         UNREACHABLE();
     }
@@ -242,6 +252,32 @@ std::string Trim(const std::string& text) {
         return {};
     }
     return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+}
+
+/// A folder as the memory devices' file systems tell folders apart: letters' case, a slash after
+/// the device ("ux0:/data" is "ux0:data") and at the end left out.
+std::string FolderKey(const std::string& folder) {
+    std::string key = Common::ToLower(folder);
+    if (const std::size_t colon = key.find(':');
+        colon != std::string::npos && colon + 1 < key.size() && key[colon + 1] == '/') {
+        key.erase(colon + 1, 1);
+    }
+    while (!key.empty() && key.back() == '/') {
+        key.pop_back();
+    }
+    return key;
+}
+
+bool AddRomFolderLocked(const std::string& folder) {
+    const std::string key = FolderKey(folder);
+    // A path with no device is not one the Vita opens.
+    if (key.find(':') == std::string::npos || key == FolderKey("ux0:data/azahar/roms") ||
+        std::any_of(rom_folders.begin(), rom_folders.end(),
+                    [&](const std::string& f) { return FolderKey(f) == key; })) {
+        return false;
+    }
+    rom_folders.push_back(folder);
+    return true;
 }
 
 } // Anonymous namespace
@@ -292,6 +328,10 @@ void Load() {
             }
             const std::size_t equals = line.find('=');
             const std::string key = Trim(line.substr(0, equals));
+            if (equals != std::string::npos && key == RomFolderKey && in_global) {
+                AddRomFolderLocked(Trim(line.substr(equals + 1)));
+                continue;
+            }
             const auto definition = std::find_if(definitions.begin(), definitions.end(),
                                                  [&](const Definition& d) { return key == d.key; });
             if (equals == std::string::npos || definition == definitions.end() ||
@@ -348,6 +388,9 @@ void Save() {
     for (std::size_t i = 0; i < Count; i++) {
         std::fprintf(f, "%s = %s\n", definitions[i].key,
                      FormatValue(static_cast<Option>(i), global_values[i]).c_str());
+    }
+    for (const std::string& folder : rom_folders) {
+        std::fprintf(f, "%s = %s\n", RomFolderKey, folder.c_str());
     }
     for (const auto& [title, values] : title_values) {
         std::fprintf(f, "\n[%s]\n", title.c_str());
@@ -465,6 +508,26 @@ void Pin(Option option, int value) {
 std::optional<int> PinOf(Option option) {
     std::scoped_lock lock{mutex};
     return pins[static_cast<std::size_t>(option)];
+}
+
+std::vector<std::string> RomFolders() {
+    std::scoped_lock lock{mutex};
+    return rom_folders;
+}
+
+bool AddRomFolder(const std::string& folder) {
+    std::scoped_lock lock{mutex};
+    const bool added = AddRomFolderLocked(folder);
+    dirty |= added;
+    return added;
+}
+
+void RemoveRomFolder(std::size_t index) {
+    std::scoped_lock lock{mutex};
+    if (index < rom_folders.size()) {
+        rom_folders.erase(rom_folders.begin() + static_cast<std::ptrdiff_t>(index));
+        dirty = true;
+    }
 }
 
 std::size_t WriteApplied(char* out, std::size_t size) {

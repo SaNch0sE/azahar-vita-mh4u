@@ -41,6 +41,10 @@ bool Resume(std::string* error);
 /// The texture every draw samples (ImGui's font atlas): width x height texels of A8B8G8R8,
 /// width a multiple of 8. Once, before the first frame: it is written into a PDS program.
 bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear);
+/// Rewrites a width x height block of SetTexture's texture at (x, y) with `texels` (A8B8G8R8,
+/// rows width apart): the menus' title icons, in slots of the font atlas. A frame already queued
+/// may sample the old texels or the new; callers write only slots no recent frame drew.
+bool UpdateTexture(u32 x, u32 y, u32 width, u32 height, const u32* texels);
 
 /// A frame's geometry, written in place into GPU memory. Vertex n is VertexWords words at
 /// vertices + n * VertexWords; the indices are 16-bit, into the frame's whole vertex array. A

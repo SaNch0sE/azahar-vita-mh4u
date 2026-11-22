@@ -51,11 +51,14 @@ public:
         if (!field || field->format != 0x0204 || field->room == 0) {
             return false;
         }
-        // Shortened to the room, a whole character at a time.
+        // Shortened to the room, a whole character at a time: its continuation bytes, then its
+        // first (a first byte left behind would end the field in half a character).
         std::string text = value;
         while (text.size() >= field->room) {
-            text.pop_back();
             while (!text.empty() && (static_cast<u8>(text.back()) & 0xc0) == 0x80) {
+                text.pop_back();
+            }
+            if (!text.empty()) {
                 text.pop_back();
             }
         }

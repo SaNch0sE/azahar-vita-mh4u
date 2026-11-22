@@ -6,6 +6,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "citra_vita/config.h"
@@ -13,6 +14,8 @@
 #include "common/common_types.h"
 #include "core/loader/title_patches.h"
 #include "core/savestate.h"
+
+#include <imgui_vita2d/imgui.h>
 
 namespace Core {
 class System;
@@ -137,13 +140,34 @@ private:
         std::string path;
         std::string name; ///< the title's own short name (its SMDH's), else the file's
         std::string file; ///< the file's name under the title's; empty when `name` is it
+        std::string publisher; ///< its SMDH's, or empty
+        bool has_icon{};       ///< its SMDH's large icon is in the icon cache
     };
     /// The titles' names read from their SMDH, by path, with the file's size they were read at: a
     /// scan reads only files new or changed since.
     struct CachedTitle {
         u64 size;
         std::string name;
+        std::string publisher;
+        bool has_icon{};
+        /// From a cache of before publishers and icons were kept: read the file again.
+        bool stale{};
     };
+    /// A slot of the font atlas a title's 48x48 icon is written into (SgxdPresent::UpdateTexture),
+    /// for as long as the game list shows it. `used`: the frame that last drew it.
+    struct IconSlot {
+        std::string path;
+        u64 used{};
+        int x{}, y{};
+        ImVec2 uv0{}, uv1{};
+    };
+    std::vector<IconSlot> icon_slots;
+    std::vector<int> icon_rects; ///< the atlas's custom rects, reserved before it was built
+    std::unordered_set<std::string> icon_missing; ///< titles whose cached icon would not read
+    u64 frame{}; ///< ImGui frames built, for the slots' ages
+    /// The slot holding the title's icon, written now if no slot does; null when the title has
+    /// no icon or every slot was drawn in the last few frames.
+    const IconSlot* IconFor(const GameEntry& game);
     std::unordered_map<std::string, CachedTitle> title_cache;
     bool title_cache_loaded = false;
     void LoadTitleCache();
@@ -200,6 +224,19 @@ private:
 
     std::vector<GameEntry> games;
     int selected_game{};
+    /// The game grid's scroll in pixels, eased towards the selected tile's column; whether a
+    /// touch has dragged it away from the selection (it stays where the finger left it until the
+    /// selection moves); a tile the grid's arrows select at the next frame (-1: none); and the
+    /// selection when the current touch began (a tap on the selected tile opens it).
+    float carousel_scroll{};
+    bool carousel_free{};
+    int carousel_focus = -1;
+    int tap_selected = -1;
+    /// The scroll the tiles were drawn at last frame, where ImGui measures the pad's step from.
+    float carousel_drawn{};
+    /// The pad was on the tools in the footer last frame: coming back up, it returns to the
+    /// selected tile rather than the one nearest the tool.
+    bool tools_focused{};
     /// Whether the selected game has a bubble (LiveArea::IsPinned), for the footer: asked again
     /// when the selection changes.
     std::string pin_checked_path;

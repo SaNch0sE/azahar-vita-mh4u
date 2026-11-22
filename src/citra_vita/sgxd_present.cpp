@@ -92,6 +92,8 @@ struct State {
     u8* pb_memory = nullptr;
     u8* buffers = nullptr;
     u32 size = 0, texture_size = 0;
+    u8* texture_base = nullptr;
+    u32 texture_width = 0, texture_height = 0;
     u32 kicker_offset = 0;
     SgxdRecipe recipe{};
     SgxdRecipeDraw draws[MaxDraws]{};
@@ -182,6 +184,8 @@ void FreeBlocks() {
     }
     g.texture = g.cdram = g.block = g.pb = -1;
     g.memory = g.buffers = g.pb_memory = nullptr;
+    g.texture_base = nullptr;
+    g.texture_width = g.texture_height = 0;
 }
 
 // The clear: a quad over the whole target that covers no pixel (DCMP never), so every tile is
@@ -766,10 +770,27 @@ bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
         return false;
     }
     g.texture_size = size;
+    g.texture_base = static_cast<u8*>(base);
+    g.texture_width = width;
+    g.texture_height = height;
     ShowLast();
     u32 words[4];
     sgxd_recipe_texture_words(TextureVa, width, height, bilinear ? 1 : 0, words);
     sgxd_recipe_set_texture(&g.recipe, g.memory, words);
+    return true;
+}
+
+bool UpdateTexture(u32 x, u32 y, u32 width, u32 height, const u32* texels) {
+    if (!g.initialized || g.texture_base == nullptr || x + width > g.texture_width ||
+        y + height > g.texture_height) {
+        return false;
+    }
+    // Memory the CPU writes uncached and the texture unit reads through its cache, which every
+    // kick invalidates.
+    for (u32 row = 0; row < height; ++row) {
+        std::memcpy(g.texture_base + ((y + row) * g.texture_width + x) * 4, texels + row * width,
+                    width * 4);
+    }
     return true;
 }
 

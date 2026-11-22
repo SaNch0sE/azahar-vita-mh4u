@@ -16,6 +16,7 @@
 #include <imgui_vita2d/imgui.h>
 #include <imgui_vita2d/imgui_internal.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/power.h>
 #include <psp2/rtc.h>
 
 #include "citra_vita/imgui_impl_sgxd.h"
@@ -52,9 +53,6 @@ constexpr float ScreenHeight = 544.0f;
 constexpr char GameDirectory[] = "ux0:/data/azahar/roms";
 #ifdef VITA_DIAGNOSTICS
 constexpr char HostGameDirectory[] = "host0:roms";
-constexpr char ListedDirectories[] = "ux0:/data/azahar/roms and host0:roms";
-#else
-constexpr const char* ListedDirectories = GameDirectory;
 #endif
 
 /// Names in the order a person reads them: a run of digits by its number (clip_test_2 before
@@ -111,13 +109,44 @@ std::string LocalTimeText(u64 seconds) {
                        local.hour, local.minute);
 }
 
-/// Where Ui keeps the titles' names between runs (Ui::title_cache): a line a file, its size, path
-/// and name, tab-separated.
+/// Where Ui keeps the titles' names between runs (Ui::title_cache): a line a file, its size, path,
+/// name, publisher and whether its icon is cached, tab-separated.
 constexpr char TitleCacheFile[] = "ux0:data/azahar/titles.txt";
+/// The titles' 48x48 icons, a file a title (IconFile), RGB565 rows as the SMDH decodes them.
+constexpr char IconDirectory[] = "ux0:data/azahar/icons";
+constexpr u32 IconSize = 48;
+/// The font atlas's slots for icons: a screen shows at most a dozen, and the rest keep the
+/// icons last shown, so that scrolling back finds them still there.
+constexpr int IconSlots = 40;
 
-/// The title's short name in English from its SMDH (a 3DSX's own, when it has one), on one line;
-/// empty when it has none.
-std::string ReadShortTitle(const std::string& path) {
+std::string IconFile(const std::string& path) {
+    u64 hash = 0xcbf29ce484222325ull; // FNV-1a over the path
+    for (const unsigned char c : path) {
+        hash = (hash ^ c) * 0x100000001b3ull;
+    }
+    return fmt::format("{}/{:016x}.rgb565", IconDirectory, hash);
+}
+
+/// One of the SMDH's English strings, on one line and trimmed.
+template <std::size_t N>
+std::string SmdhText(const std::array<char16_t, N>& field) {
+    const std::u16string text(field.data(), std::find(field.begin(), field.end(), u'\0'));
+    std::string out = Common::UTF16ToUTF8(text);
+    std::replace_if(out.begin(), out.end(), [](char c) { return c == '\n' || c == '\t'; }, ' ');
+    const auto first = out.find_first_not_of(' ');
+    const auto last = out.find_last_not_of(' ');
+    return first == std::string::npos ? std::string{} : out.substr(first, last - first + 1);
+}
+
+/// What the game list shows of a title, from its SMDH (a 3DSX's own, when it has one). The large
+/// icon goes to the icon cache.
+struct TitleInfo {
+    std::string name;
+    std::string publisher;
+    bool has_icon{};
+};
+
+TitleInfo ReadTitleInfo(const std::string& path) {
     const std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(path);
     std::vector<u8> smdh;
     if (!loader || loader->ReadIcon(smdh) != Loader::ResultStatus::Success ||
@@ -126,18 +155,45 @@ std::string ReadShortTitle(const std::string& path) {
     }
     Loader::SMDH data;
     std::memcpy(&data, smdh.data(), sizeof(data));
-    const auto title = data.GetShortTitle(Loader::SMDH::TitleLanguage::English);
-    const std::u16string text(title.data(), std::find(title.begin(), title.end(), u'\0'));
-    std::string name = Common::UTF16ToUTF8(text);
-    std::replace_if(name.begin(), name.end(), [](char c) { return c == '\n' || c == '\t'; }, ' ');
-    const auto first = name.find_first_not_of(' ');
-    const auto last = name.find_last_not_of(' ');
-    return first == std::string::npos ? std::string{} : name.substr(first, last - first + 1);
+    const auto& title = data.titles[static_cast<int>(Loader::SMDH::TitleLanguage::English)];
+    TitleInfo info{SmdhText(title.short_title), SmdhText(title.publisher), false};
+    const std::vector<u16> icon = data.GetIcon(true);
+    if (icon.size() == IconSize * IconSize) {
+        FileUtil::CreateDir(IconDirectory);
+        if (std::FILE* const f = std::fopen(IconFile(path).c_str(), "wb")) {
+            info.has_icon = std::fwrite(icon.data(), 2, icon.size(), f) == icon.size();
+            std::fclose(f);
+        }
+    }
+    return info;
+}
+
+/// A cached icon as A8B8G8R8 texels for the font atlas; empty when the file is missing.
+std::vector<u32> LoadIcon(const std::string& path) {
+    std::vector<u16> rgb565(IconSize * IconSize);
+    std::FILE* const f = std::fopen(IconFile(path).c_str(), "rb");
+    if (f == nullptr) {
+        return {};
+    }
+    const bool whole = std::fread(rgb565.data(), 2, rgb565.size(), f) == rgb565.size();
+    std::fclose(f);
+    if (!whole) {
+        return {};
+    }
+    std::vector<u32> texels(rgb565.size());
+    for (std::size_t i = 0; i < rgb565.size(); ++i) {
+        const u32 c = rgb565[i];
+        const u32 r = (c >> 11) * 255 / 31, g = (c >> 5 & 63) * 255 / 63, b = (c & 31) * 255 / 31;
+        texels[i] = 0xff000000u | b << 16 | g << 8 | r;
+    }
+    return texels;
 }
 
 bool HasRomExtension(const std::string& name) {
-    static constexpr const char* extensions[] = {".3ds", ".3dsx", ".cci", ".cxi",
-                                                 ".app", ".elf",  ".axf"};
+    // Azahar's compressed forms too (Z3DS: .zcci, .zcxi, .z3dsx), which the loaders read as they
+    // read the plain ones.
+    static constexpr const char* extensions[] = {".3ds", ".3dsx", ".cci",  ".cxi",  ".app",
+                                                 ".elf", ".axf",  ".zcci", ".zcxi", ".z3dsx"};
     const auto dot = name.rfind('.');
     if (dot == std::string::npos) {
         return false;
@@ -149,21 +205,79 @@ bool HasRomExtension(const std::string& name) {
                        [&](const char* candidate) { return extension == candidate; });
 }
 
-/// The menus' colours: the 3DS's dark menus, near-black panels with light text and a soft blue
-/// for what is selected, and a warm amber for a title's own setting.
-namespace Palette {
-const ImVec4 Backdrop{0.075f, 0.082f, 0.098f, 1.0f};
-const ImVec4 Panel{0.125f, 0.137f, 0.161f, 0.97f};
-const ImVec4 Row{0.176f, 0.192f, 0.224f, 1.0f};
-const ImVec4 RowFocused{0.231f, 0.263f, 0.314f, 1.0f};
-const ImVec4 Accent{0.369f, 0.769f, 0.941f, 1.0f};
-const ImVec4 AccentDim{0.369f, 0.769f, 0.941f, 0.35f};
-const ImVec4 Own{0.949f, 0.698f, 0.361f, 1.0f};
-const ImVec4 Text{0.925f, 0.937f, 0.945f, 1.0f};
-const ImVec4 TextDim{0.588f, 0.627f, 0.667f, 1.0f};
-const ImVec4 Line{1.0f, 1.0f, 1.0f, 0.08f};
-const ImVec4 SwitchOff{0.333f, 0.361f, 0.408f, 1.0f};
-} // namespace Palette
+/// The menus' colours, in two themes (Config::Option::Theme). The light one is the 3DS HOME Menu's:
+/// light grey ground, white panels and tiles, dark grey text. The dark one keeps its roles on dark
+/// grey, never black: the ground darkest, panels and tiles a step lighter each, light grey text.
+/// Both mark what is selected in the HOME Menu's teal and a title's own setting in a warm amber.
+struct Palette {
+    ImVec4 Backdrop;
+    ImVec4 Panel;
+    ImVec4 Row;
+    ImVec4 RowFocused;
+    ImVec4 Accent;
+    ImVec4 AccentDim;
+    ImVec4 Icon;
+    ImVec4 Own;
+    ImVec4 Text;
+    ImVec4 TextDim;
+    ImVec4 Line;
+    ImVec4 Shadow;
+    ImVec4 SwitchOff;
+    ImVec4 Bar;
+    /// The pad buttons' discs (DrawGlyph): darker than the footer, for the face buttons' light
+    /// colours to show on.
+    ImVec4 ButtonDisc;
+    /// The game list's speech bubble and its two lines: the theme's colours turned around, so
+    /// that it stands out over the tiles it lies on.
+    ImVec4 Bubble;
+    ImVec4 BubbleText;
+    ImVec4 BubbleTextDim;
+};
+
+const Palette LightPalette{
+    .Backdrop{0.898f, 0.902f, 0.910f, 1.0f},
+    .Panel{0.980f, 0.980f, 0.984f, 0.98f},
+    .Row{1.0f, 1.0f, 1.0f, 1.0f},
+    .RowFocused{0.925f, 0.984f, 0.969f, 1.0f},
+    .Accent{0.196f, 0.784f, 0.659f, 1.0f},
+    .AccentDim{0.196f, 0.784f, 0.659f, 0.30f},
+    .Icon{0.282f, 0.569f, 0.859f, 1.0f},
+    .Own{0.918f, 0.573f, 0.141f, 1.0f},
+    .Text{0.275f, 0.282f, 0.302f, 1.0f},
+    .TextDim{0.533f, 0.541f, 0.569f, 1.0f},
+    .Line{0.0f, 0.0f, 0.0f, 0.09f},
+    .Shadow{0.0f, 0.0f, 0.0f, 0.10f},
+    .SwitchOff{0.780f, 0.788f, 0.808f, 1.0f},
+    .Bar{0.886f, 0.890f, 0.898f, 1.0f},
+    .ButtonDisc{0.333f, 0.345f, 0.373f, 1.0f},
+    .Bubble{0.235f, 0.243f, 0.267f, 1.0f},
+    .BubbleText{0.980f, 0.980f, 0.984f, 1.0f},
+    .BubbleTextDim{0.733f, 0.745f, 0.769f, 1.0f},
+};
+
+/// The teal and the blue a little lighter than the light theme's, for their contrast on dark grey.
+const Palette DarkPalette{
+    .Backdrop{0.118f, 0.125f, 0.141f, 1.0f},
+    .Panel{0.161f, 0.169f, 0.188f, 0.98f},
+    .Row{0.212f, 0.224f, 0.247f, 1.0f},
+    .RowFocused{0.165f, 0.286f, 0.263f, 1.0f},
+    .Accent{0.290f, 0.835f, 0.710f, 1.0f},
+    .AccentDim{0.290f, 0.835f, 0.710f, 0.30f},
+    .Icon{0.420f, 0.663f, 0.925f, 1.0f},
+    .Own{0.961f, 0.651f, 0.290f, 1.0f},
+    .Text{0.902f, 0.910f, 0.925f, 1.0f},
+    .TextDim{0.600f, 0.616f, 0.647f, 1.0f},
+    .Line{1.0f, 1.0f, 1.0f, 0.08f},
+    .Shadow{0.0f, 0.0f, 0.0f, 0.35f},
+    .SwitchOff{0.341f, 0.353f, 0.384f, 1.0f},
+    .Bar{0.090f, 0.094f, 0.106f, 1.0f},
+    .ButtonDisc{0.067f, 0.071f, 0.078f, 1.0f},
+    .Bubble{0.902f, 0.910f, 0.925f, 1.0f},
+    .BubbleText{0.118f, 0.125f, 0.141f, 1.0f},
+    .BubbleTextDim{0.380f, 0.392f, 0.420f, 1.0f},
+};
+
+const Palette* palette = &DarkPalette;
 
 ImU32 Colour(const ImVec4& colour, float alpha = 1.0f) {
     return ImGui::ColorConvertFloat4ToU32(ImVec4(colour.x, colour.y, colour.z, colour.w * alpha));
@@ -173,7 +287,9 @@ ImU32 Colour(const ImVec4& colour, float alpha = 1.0f) {
 /// margin around them, a row's height and rounding. A row is a finger high.
 constexpr float Margin = 16.0f;
 constexpr float HeaderHeight = 64.0f;
-constexpr float FooterHeight = 56.0f;
+constexpr float FooterHeight = 44.0f;
+/// The footer's buttons: the pad's (FooterButton) and the game list's tools (BarButton).
+constexpr float FooterButtonHeight = 32.0f;
 constexpr float TabsHeight = 44.0f;
 constexpr float RowHeight = 56.0f;
 constexpr float RowRounding = 12.0f;
@@ -200,30 +316,39 @@ void ApplyStyle() {
     style.GrabMinSize = 24.0f;
 
     ImVec4* c = style.Colors;
-    c[ImGuiCol_Text] = Palette::Text;
-    c[ImGuiCol_TextDisabled] = Palette::TextDim;
-    c[ImGuiCol_WindowBg] = Palette::Panel;
+    c[ImGuiCol_Text] = palette->Text;
+    c[ImGuiCol_TextDisabled] = palette->TextDim;
+    c[ImGuiCol_WindowBg] = palette->Panel;
     c[ImGuiCol_ChildBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
-    c[ImGuiCol_PopupBg] = Palette::Panel;
-    c[ImGuiCol_Border] = Palette::Line;
-    c[ImGuiCol_FrameBg] = Palette::Row;
-    c[ImGuiCol_FrameBgHovered] = Palette::RowFocused;
-    c[ImGuiCol_FrameBgActive] = Palette::RowFocused;
-    c[ImGuiCol_Button] = Palette::Row;
-    c[ImGuiCol_ButtonHovered] = Palette::RowFocused;
-    c[ImGuiCol_ButtonActive] = Palette::AccentDim;
-    c[ImGuiCol_Header] = Palette::Row;
-    c[ImGuiCol_HeaderHovered] = Palette::RowFocused;
-    c[ImGuiCol_HeaderActive] = Palette::AccentDim;
-    c[ImGuiCol_CheckMark] = Palette::Accent;
-    c[ImGuiCol_SliderGrab] = Palette::Accent;
-    c[ImGuiCol_SliderGrabActive] = Palette::Accent;
-    c[ImGuiCol_Separator] = Palette::Line;
+    c[ImGuiCol_PopupBg] = palette->Panel;
+    c[ImGuiCol_Border] = palette->Line;
+    c[ImGuiCol_FrameBg] = palette->Row;
+    c[ImGuiCol_FrameBgHovered] = palette->RowFocused;
+    c[ImGuiCol_FrameBgActive] = palette->RowFocused;
+    c[ImGuiCol_Button] = palette->Row;
+    c[ImGuiCol_ButtonHovered] = palette->RowFocused;
+    c[ImGuiCol_ButtonActive] = palette->AccentDim;
+    c[ImGuiCol_Header] = palette->Row;
+    c[ImGuiCol_HeaderHovered] = palette->RowFocused;
+    c[ImGuiCol_HeaderActive] = palette->AccentDim;
+    c[ImGuiCol_CheckMark] = palette->Accent;
+    c[ImGuiCol_SliderGrab] = palette->Accent;
+    c[ImGuiCol_SliderGrabActive] = palette->Accent;
+    c[ImGuiCol_Separator] = palette->Line;
     c[ImGuiCol_ScrollbarBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
-    c[ImGuiCol_ScrollbarGrab] = Palette::Row;
-    c[ImGuiCol_ScrollbarGrabHovered] = Palette::RowFocused;
-    c[ImGuiCol_ScrollbarGrabActive] = Palette::AccentDim;
-    c[ImGuiCol_NavHighlight] = Palette::Accent;
+    c[ImGuiCol_ScrollbarGrab] = palette->Row;
+    c[ImGuiCol_ScrollbarGrabHovered] = palette->RowFocused;
+    c[ImGuiCol_ScrollbarGrabActive] = palette->AccentDim;
+    c[ImGuiCol_NavHighlight] = palette->Accent;
+}
+
+void UseTheme() {
+    const Palette* const chosen =
+        Config::Effective(Config::Option::Theme) == 0 ? &DarkPalette : &LightPalette;
+    if (chosen != palette) {
+        palette = chosen;
+        ApplyStyle();
+    }
 }
 
 /// The menus' icons, drawn from shapes: the font has ASCII alone, and an icon texture would
@@ -398,7 +523,8 @@ enum class Glyph {
 /// A pad button's glyph centred at `c`, `r` its radius: the face buttons in their own colours on
 /// a dark disc, as the console's own menus show them.
 void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float r) {
-    const ImU32 disc = Colour(Palette::SwitchOff);
+    const ImU32 disc = Colour(palette->ButtonDisc);
+    const ImU32 mark = Colour(palette->Row);
     const float line = 2.0f;
     switch (glyph) {
     case Glyph::Cross: {
@@ -429,9 +555,9 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float r) {
     case Glyph::LeftRight:
         dl->AddCircleFilled(c, r, disc, 20);
         dl->AddTriangleFilled(ImVec2(c.x - 0.6f * r, c.y), ImVec2(c.x - 0.12f * r, c.y - 0.4f * r),
-                              ImVec2(c.x - 0.12f * r, c.y + 0.4f * r), Colour(Palette::Text));
+                              ImVec2(c.x - 0.12f * r, c.y + 0.4f * r), mark);
         dl->AddTriangleFilled(ImVec2(c.x + 0.6f * r, c.y), ImVec2(c.x + 0.12f * r, c.y - 0.4f * r),
-                              ImVec2(c.x + 0.12f * r, c.y + 0.4f * r), Colour(Palette::Text));
+                              ImVec2(c.x + 0.12f * r, c.y + 0.4f * r), mark);
         break;
     case Glyph::Shoulders: {
         // L and R, two pills.
@@ -441,8 +567,7 @@ void DrawGlyph(ImDrawList* dl, Glyph glyph, ImVec2 c, float r) {
         for (const auto& [x, letter] : pills) {
             dl->AddRectFilled(ImVec2(x, c.y) - half, ImVec2(x, c.y) + half, disc, 0.5f * r);
             const ImVec2 size = ImGui::CalcTextSize(letter);
-            dl->AddText(ImVec2(x - size.x * 0.5f, c.y - size.y * 0.5f), Colour(Palette::Text),
-                        letter);
+            dl->AddText(ImVec2(x - size.x * 0.5f, c.y - size.y * 0.5f), mark, letter);
         }
         break;
     }
@@ -497,7 +622,7 @@ std::string Fit(const std::string& text, float width, int lines = 1) {
 void BeginBackdrop(const char* id, Icon icon, const char* title, const std::string& note) {
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowSize(ImVec2(ScreenWidth, ScreenHeight));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, Palette::Backdrop);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, palette->Backdrop);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::Begin(id, nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
@@ -511,15 +636,15 @@ void BeginBackdrop(const char* id, Icon icon, const char* title, const std::stri
     // The header and the footer span the display: inside the window's clip (half its padding in
     // from each side) they stopped 8 pixels short of each edge.
     dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, ScreenHeight), false);
-    const ImU32 panel = Colour(Palette::Panel, 1.0f / Palette::Panel.w);
+    const ImU32 panel = Colour(palette->Panel, 1.0f / palette->Panel.w);
     dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, HeaderHeight), panel);
     dl->AddLine(ImVec2(0.0f, HeaderHeight), ImVec2(ScreenWidth, HeaderHeight),
-                Colour(Palette::Line));
-    DrawIcon(dl, icon, ImVec2(Margin + 16.0f, HeaderHeight * 0.5f), 30.0f, Colour(Palette::Accent),
+                Colour(palette->Line));
+    DrawIcon(dl, icon, ImVec2(Margin + 16.0f, HeaderHeight * 0.5f), 30.0f, Colour(palette->Accent),
              panel);
     const float title_x = Margin + 44.0f;
     dl->AddText(ImGui::GetFont(), TitleSize, ImVec2(title_x, (HeaderHeight - TitleSize) * 0.5f),
-                Colour(Palette::Text), title);
+                Colour(palette->Text), title);
     const float title_width = ImGui::GetFont()->CalcTextSizeA(TitleSize, FLT_MAX, 0.0f, title).x;
     // The note at the header's right on one line where it fits; else (a long game's name) over
     // two lines from the title on, and shortened only past those.
@@ -527,19 +652,20 @@ void BeginBackdrop(const char* id, Icon icon, const char* title, const std::stri
     const float note_room = ScreenWidth - Margin - note_x;
     if (const ImVec2 size = ImGui::CalcTextSize(note.c_str()); size.x <= note_room) {
         dl->AddText(ImVec2(ScreenWidth - Margin - size.x, (HeaderHeight - size.y) * 0.5f),
-                    Colour(Palette::TextDim), note.c_str());
+                    Colour(palette->TextDim), note.c_str());
     } else {
         const std::string shown = Fit(note, note_room, 2);
         const ImVec2 wrapped = ImGui::CalcTextSize(shown.c_str(), nullptr, false, note_room);
         dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-                    ImVec2(note_x, (HeaderHeight - wrapped.y) * 0.5f), Colour(Palette::TextDim),
+                    ImVec2(note_x, (HeaderHeight - wrapped.y) * 0.5f), Colour(palette->TextDim),
                     shown.c_str(), nullptr, note_room);
     }
 
     const float footer = ScreenHeight - FooterHeight;
     dl->AddRectFilled(ImVec2(0.0f, footer), ImVec2(ScreenWidth, ScreenHeight), panel);
-    dl->AddLine(ImVec2(0.0f, footer), ImVec2(ScreenWidth, footer), Colour(Palette::Line));
-    ImGui::SetCursorScreenPos(ImVec2(Margin, footer + (FooterHeight - 40.0f) * 0.5f));
+    dl->AddLine(ImVec2(0.0f, footer), ImVec2(ScreenWidth, footer), Colour(palette->Line));
+    dl->PopClipRect();
+    ImGui::SetCursorScreenPos(ImVec2(Margin, footer + (FooterHeight - FooterButtonHeight) * 0.5f));
 }
 
 void EndBackdrop() {
@@ -547,21 +673,21 @@ void EndBackdrop() {
 }
 
 /// One of the footer's buttons: the pad button's glyph and what it does, a touch target for the
-/// same. Laid out left to right.
+/// same, which never takes the pad's selection. Laid out left to right.
 bool FooterButton(Glyph glyph, const char* label) {
     constexpr float R = 13.0f;
     const ImVec2 text = ImGui::CalcTextSize(label);
     const float glyph_width = GlyphWidth(glyph, R);
-    const ImVec2 size(glyph_width + 10.0f + text.x + 20.0f, 40.0f);
+    const ImVec2 size(glyph_width + 10.0f + text.x + 20.0f, FooterButtonHeight);
     const ImVec2 at = ImGui::GetCursorScreenPos();
-    const bool pressed = ImGui::InvisibleButton(label, size);
+    const bool pressed = ImGui::InvisibleButton(label, size, ImGuiButtonFlags_NoNavFocus);
     ImDrawList* const dl = ImGui::GetWindowDrawList();
     if (ImGui::IsItemActive()) {
-        dl->AddRectFilled(at, at + size, Colour(Palette::AccentDim), size.y * 0.5f);
+        dl->AddRectFilled(at, at + size, Colour(palette->AccentDim), size.y * 0.5f);
     }
     DrawGlyph(dl, glyph, ImVec2(at.x + 10.0f + glyph_width * 0.5f, at.y + size.y * 0.5f), R);
     dl->AddText(ImVec2(at.x + 10.0f + glyph_width + 10.0f, at.y + (size.y - text.y) * 0.5f),
-                Colour(Palette::Text), label);
+                Colour(palette->Text), label);
     ImGui::SameLine(0.0f, 12.0f);
     return pressed;
 }
@@ -614,7 +740,8 @@ struct Card {
     bool by_pad;
 };
 
-Card CardItem(const char* str_id, ImVec2 size) {
+/// A card's item alone, which the caller draws: the game row's tiles.
+Card CardBehavior(const char* str_id, ImVec2 size, bool* held_out = nullptr) {
     ImGuiWindow* const window = ImGui::GetCurrentWindow();
     Card card{};
     card.id = window->GetID(str_id);
@@ -625,34 +752,134 @@ Card CardItem(const char* str_id, ImVec2 size) {
     card.by_pad = ImGui::GetCurrentContext()->NavActivateId == card.id;
     bool hovered = false, held = false;
     card.pressed = card.visible && ImGui::ButtonBehavior(card.bb, card.id, &hovered, &held);
+    if (held_out) {
+        *held_out = held;
+    }
+    return card;
+}
+
+Card CardItem(const char* str_id, ImVec2 size) {
+    bool held = false;
+    const Card card = CardBehavior(str_id, size, &held);
     if (card.visible) {
+        ImGuiWindow* const window = ImGui::GetCurrentWindow();
         ImDrawList* const dl = window->DrawList;
         dl->AddRectFilled(card.bb.Min, card.bb.Max,
-                          Colour(card.focused || held ? Palette::RowFocused : Palette::Row),
+                          Colour(card.focused || held ? palette->RowFocused : palette->Row),
                           RowRounding);
         if (card.focused) {
             dl->AddRect(card.bb.Min + ImVec2(1.0f, 1.0f), card.bb.Max - ImVec2(1.0f, 1.0f),
-                        Colour(Palette::Accent), RowRounding, ImDrawCornerFlags_All, 2.5f);
+                        Colour(palette->Accent), RowRounding, ImDrawCornerFlags_All, 2.5f);
         }
     }
     return card;
 }
 
-/// A card with an icon and a label, for the pause menu's tiles and the game list's tools.
+/// A card with an icon and a label, for the pause menu's tiles and the multiplayer screen's
+/// buttons.
 bool IconCard(const char* label, Icon icon, ImVec2 size) {
     const Card card = CardItem(label, size);
     if (card.visible) {
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         const float icon_size = std::min(size.y * 0.5f, 30.0f);
         const ImVec2 icon_at(card.bb.Min.x + 14.0f + icon_size * 0.5f, card.bb.GetCenter().y);
-        DrawIcon(dl, icon, icon_at, icon_size, Colour(Palette::Accent),
-                 Colour(card.focused ? Palette::RowFocused : Palette::Row));
+        DrawIcon(dl, icon, icon_at, icon_size, Colour(palette->Accent),
+                 Colour(card.focused ? palette->RowFocused : palette->Row));
         const ImVec2 text = ImGui::CalcTextSize(label);
         dl->AddText(
             ImVec2(icon_at.x + icon_size * 0.5f + 14.0f, card.bb.GetCenter().y - text.y * 0.5f),
-            Colour(Palette::Text), label);
+            Colour(palette->Text), label);
     }
     return card.pressed;
+}
+
+float BarButtonWidth(const char* label) {
+    return 12.0f + 20.0f + 8.0f + ImGui::CalcTextSize(label).x + 14.0f;
+}
+
+/// One of the game list's tools in its footer: an icon and a label on a pill, which the pad
+/// selects and cross or a touch presses.
+bool BarButton(const char* label, Icon icon) {
+    bool held = false;
+    const Card card = CardBehavior(label, ImVec2(BarButtonWidth(label), FooterButtonHeight), &held);
+    if (card.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float round = card.bb.GetHeight() * 0.5f;
+        const ImU32 fill = Colour(card.focused || held ? palette->RowFocused : palette->Backdrop);
+        dl->AddRectFilled(card.bb.Min, card.bb.Max, fill, round);
+        if (card.focused) {
+            dl->AddRect(card.bb.Min + ImVec2(1.0f, 1.0f), card.bb.Max - ImVec2(1.0f, 1.0f),
+                        Colour(palette->Accent), round, ImDrawCornerFlags_All, 2.5f);
+        }
+        const ImVec2 icon_at(card.bb.Min.x + 22.0f, card.bb.GetCenter().y);
+        DrawIcon(dl, icon, icon_at, 20.0f, Colour(palette->Accent), fill);
+        const ImVec2 text = ImGui::CalcTextSize(label);
+        dl->AddText(ImVec2(icon_at.x + 18.0f, card.bb.GetCenter().y - text.y * 0.5f),
+                    Colour(palette->Text), label);
+    }
+    return card.pressed;
+}
+
+/// The HOME Menu's mark of the selected tile: a rounded corner at each of the tile's corners,
+/// breathing in and out.
+void DrawBrackets(ImDrawList* dl, const ImRect& tile, ImU32 colour) {
+    const float breath = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 5.0f);
+    const float out = 5.0f + 4.0f * breath;
+    const ImRect r(tile.Min - ImVec2(out, out), tile.Max + ImVec2(out, out));
+    constexpr float Length = 24.0f, Radius = 10.0f, Thickness = 6.0f;
+    // Each corner from its horizontal end round to its vertical end.
+    const struct {
+        ImVec2 corner;
+        float sx, sy, from, to;
+    } corners[] = {
+        {r.Min, 1.0f, 1.0f, 1.5f * IM_PI, IM_PI},
+        {ImVec2(r.Max.x, r.Min.y), -1.0f, 1.0f, 1.5f * IM_PI, 2.0f * IM_PI},
+        {r.Max, -1.0f, -1.0f, 0.5f * IM_PI, 0.0f},
+        {ImVec2(r.Min.x, r.Max.y), 1.0f, -1.0f, 0.5f * IM_PI, IM_PI},
+    };
+    for (const auto& c : corners) {
+        dl->PathLineTo(c.corner + ImVec2(c.sx * Length, 0.0f));
+        dl->PathArcTo(c.corner + ImVec2(c.sx * Radius, c.sy * Radius), Radius, c.from, c.to, 6);
+        dl->PathLineTo(c.corner + ImVec2(0.0f, c.sy * Length));
+        dl->PathStroke(colour, false, Thickness);
+    }
+}
+
+/// The HOME Menu's status bar: the app's name and `note` at the left, the time in the middle, the
+/// battery at the right.
+void DrawStatusBar(ImDrawList* dl, float height, const std::string& note) {
+    dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, height), Colour(palette->Bar));
+    dl->AddLine(ImVec2(0.0f, height), ImVec2(ScreenWidth, height), Colour(palette->Line));
+    const float mid = height * 0.5f;
+    const float text_y = mid - ImGui::GetFontSize() * 0.5f;
+    dl->AddText(ImVec2(Margin, text_y), Colour(palette->TextDim), "Azahar");
+    if (!note.empty()) {
+        const float x = Margin + ImGui::CalcTextSize("Azahar").x + 24.0f;
+        dl->AddText(ImVec2(x, text_y), Colour(palette->TextDim), note.c_str());
+    }
+    SceDateTime now{};
+    if (sceRtcGetCurrentClockLocalTime(&now) >= 0) {
+        const std::string time = fmt::format("{:02}:{:02}", now.hour, now.minute);
+        const ImVec2 size = ImGui::CalcTextSize(time.c_str());
+        dl->AddText(ImVec2((ScreenWidth - size.x) * 0.5f, mid - size.y * 0.5f),
+                    Colour(palette->Text), time.c_str());
+    }
+    const int percent = scePowerGetBatteryLifePercent();
+    if (percent >= 0) {
+        const ImVec2 body(34.0f, 16.0f);
+        const ImVec2 at(ScreenWidth - Margin - body.x - 4.0f, mid - body.y * 0.5f);
+        dl->AddRect(at, at + body, Colour(palette->Text), 3.0f, ImDrawCornerFlags_All, 2.0f);
+        dl->AddRectFilled(ImVec2(at.x + body.x, mid - 4.0f),
+                          ImVec2(at.x + body.x + 4.0f, mid + 4.0f), Colour(palette->Text), 1.0f);
+        const float fill = (body.x - 6.0f) * static_cast<float>(std::min(percent, 100)) / 100.0f;
+        const bool low = percent <= 15 && !scePowerIsBatteryCharging();
+        dl->AddRectFilled(at + ImVec2(3.0f, 3.0f), ImVec2(at.x + 3.0f + fill, at.y + body.y - 3.0f),
+                          Colour(low ? palette->Own : palette->Accent), 1.5f);
+        const std::string text = fmt::format("{}%", percent);
+        const ImVec2 size = ImGui::CalcTextSize(text.c_str());
+        dl->AddText(ImVec2(at.x - 8.0f - size.x, mid - size.y * 0.5f), Colour(palette->TextDim),
+                    text.c_str());
+    }
 }
 
 /// The system volume over whichever menu is open, for two seconds after a volume key changed
@@ -743,6 +970,7 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ApplyStyle();
+    UseTheme();
 
     ImGuiIO& io = ImGui::GetIO();
     // Nothing to remember between sessions: every window here is placed by the code.
@@ -769,9 +997,26 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     io.FontDefault = io.Fonts->AddFontDefault(&font);
     io.Fonts->Flags |= ImFontAtlasFlags_NoMouseCursors | ImFontAtlasFlags_NoPowerOfTwoHeight;
     io.FontGlobalScale = 0.75f;
+    // The titles' icons get slots of the atlas, written as the game list shows them (IconFor):
+    // the menus draw with one texture, and a slot is a rectangle of it like a glyph.
+    for (int i = 0; i < IconSlots; ++i) {
+        icon_rects.push_back(io.Fonts->AddCustomRectRegular(IconSize, IconSize));
+    }
 
     ImGui_ImplVita_Init();
     ImGui_ImplSgxd_Init();
+    for (const int rect : icon_rects) {
+        const ImFontAtlasCustomRect* r = io.Fonts->GetCustomRectByIndex(rect);
+        IconSlot slot{};
+        slot.x = r->X;
+        slot.y = r->Y;
+        // Half a texel in from each edge: the filter never reaches a neighbouring slot or glyph.
+        const ImVec2 texel(1.0f / io.Fonts->TexWidth, 1.0f / io.Fonts->TexHeight);
+        io.Fonts->CalcCustomRectUV(r, &slot.uv0, &slot.uv1);
+        slot.uv0 = slot.uv0 + texel * 0.5f;
+        slot.uv1 = slot.uv1 - texel * 0.5f;
+        icon_slots.push_back(slot);
+    }
     StatsHud::Init();
     // The backend has copied the font atlas into GPU memory by now, and the pixels it was
     // built from are heap nothing reads again. ImGui rebuilds them on demand if anything ever
@@ -784,6 +1029,40 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     BuildRows();
     ScanGames();
     focus_first_row = true;
+}
+
+const Ui::IconSlot* Ui::IconFor(const GameEntry& game) {
+    if (!game.has_icon || icon_slots.empty() || icon_missing.contains(game.path)) {
+        return nullptr;
+    }
+    for (IconSlot& slot : icon_slots) {
+        if (slot.path == game.path) {
+            slot.used = frame;
+            return &slot;
+        }
+    }
+    // The slot drawn longest ago; not one a frame still in flight may sample.
+    IconSlot* oldest = &icon_slots.front();
+    for (IconSlot& slot : icon_slots) {
+        if (slot.used < oldest->used) {
+            oldest = &slot;
+        }
+    }
+    if (!oldest->path.empty() && oldest->used + 4 > frame) {
+        return nullptr;
+    }
+    const std::vector<u32> texels = LoadIcon(game.path);
+    if (texels.empty()) {
+        icon_missing.insert(game.path);
+        return nullptr;
+    }
+    if (!SgxdPresent::UpdateTexture(static_cast<u32>(oldest->x), static_cast<u32>(oldest->y),
+                                    IconSize, IconSize, texels.data())) {
+        return nullptr;
+    }
+    oldest->path = game.path;
+    oldest->used = frame;
+    return oldest;
 }
 
 std::string Ui::TogglePin() {
@@ -833,8 +1112,20 @@ void Ui::LoadTitleCache() {
         if (tab2 == std::string::npos) {
             continue;
         }
-        title_cache[text.substr(tab1 + 1, tab2 - tab1 - 1)] = {
-            std::strtoull(text.c_str(), nullptr, 10), text.substr(tab2 + 1)};
+        // size, path, name[, publisher, icon]: a line of before publishers and icons is read
+        // again from its file.
+        const auto tab3 = text.find('\t', tab2 + 1);
+        const auto tab4 = tab3 == std::string::npos ? tab3 : text.find('\t', tab3 + 1);
+        CachedTitle title{std::strtoull(text.c_str(), nullptr, 10), {}, {}, false, false};
+        if (tab4 == std::string::npos) {
+            title.name = text.substr(tab2 + 1);
+            title.stale = true;
+        } else {
+            title.name = text.substr(tab2 + 1, tab3 - tab2 - 1);
+            title.publisher = text.substr(tab3 + 1, tab4 - tab3 - 1);
+            title.has_icon = text.substr(tab4 + 1) == "1";
+        }
+        title_cache[text.substr(tab1 + 1, tab2 - tab1 - 1)] = std::move(title);
     }
     std::fclose(f);
 }
@@ -846,8 +1137,9 @@ void Ui::SaveTitleCache() const {
         return;
     }
     for (const auto& [path, title] : title_cache) {
-        std::fprintf(f, "%llu\t%s\t%s\n", static_cast<unsigned long long>(title.size), path.c_str(),
-                     title.name.c_str());
+        std::fprintf(f, "%llu\t%s\t%s\t%s\t%d\n", static_cast<unsigned long long>(title.size),
+                     path.c_str(), title.name.c_str(), title.publisher.c_str(),
+                     title.has_icon ? 1 : 0);
     }
     std::fclose(f);
 }
@@ -856,6 +1148,11 @@ void Ui::ScanGames() {
     if (!title_cache_loaded) {
         LoadTitleCache();
     }
+    // A rescan keeps the title selected, wherever titles added or gone put it in the list.
+    const std::string selected_path =
+        selected_game >= 0 && selected_game < static_cast<int>(games.size())
+            ? games[static_cast<std::size_t>(selected_game)].path
+            : std::string{};
     games.clear();
     bool cache_changed = false;
     const auto scan = [&](const char* directory, const char* suffix) {
@@ -869,21 +1166,28 @@ void Ui::ScanGames() {
                 continue;
             }
             auto cached = title_cache.find(entry.physicalName);
-            if (cached == title_cache.end() || cached->second.size != entry.size) {
+            if (cached == title_cache.end() || cached->second.size != entry.size ||
+                cached->second.stale) {
+                TitleInfo info = ReadTitleInfo(entry.physicalName);
                 cached = title_cache
-                             .insert_or_assign(
-                                 entry.physicalName,
-                                 CachedTitle{entry.size, ReadShortTitle(entry.physicalName)})
+                             .insert_or_assign(entry.physicalName,
+                                               CachedTitle{entry.size, std::move(info.name),
+                                                           std::move(info.publisher),
+                                                           info.has_icon, false})
                              .first;
                 cache_changed = true;
             }
             const std::string file = entry.virtualName + suffix;
-            const std::string& title = cached->second.name;
-            games.push_back({entry.physicalName, title.empty() ? file : title + suffix,
-                             title.empty() ? std::string{} : entry.virtualName});
+            const CachedTitle& title = cached->second;
+            games.push_back({entry.physicalName, title.name.empty() ? file : title.name + suffix,
+                             title.name.empty() ? std::string{} : entry.virtualName,
+                             title.publisher, title.has_icon});
         }
     };
     scan(GameDirectory, "");
+    for (const std::string& folder : Config::RomFolders()) {
+        scan(folder.c_str(), "");
+    }
 #ifdef VITA_DIAGNOSTICS
     scan(HostGameDirectory, " (host0)");
 #endif
@@ -894,7 +1198,13 @@ void Ui::ScanGames() {
         return NaturalLess(a.name, b.name) ||
                (!NaturalLess(b.name, a.name) && NaturalLess(a.file, b.file));
     });
-    selected_game = std::clamp(selected_game, 0, std::max(static_cast<int>(games.size()) - 1, 0));
+    const auto kept = std::find_if(games.begin(), games.end(), [&](const GameEntry& game) {
+        return game.path == selected_path;
+    });
+    selected_game =
+        kept != games.end()
+            ? static_cast<int>(kept - games.begin())
+            : std::clamp(selected_game, 0, std::max(static_cast<int>(games.size()) - 1, 0));
     LOG_INFO(Frontend, "Found {} titles", games.size());
 }
 
@@ -1017,7 +1327,16 @@ void Ui::BuildRows() {
          nullptr,
          nullptr});
 
-    // System.
+    // System: the console and the menus.
+    add({Option::Theme,
+         Category::System,
+         Kind::Choice,
+         "Menu theme",
+         "The menus' colours: dark grey, or the light grey of the 3DS HOME Menu.",
+         {"Dark", "Light"},
+         0,
+         nullptr,
+         nullptr});
     add({Option::Region,
          Category::System,
          Kind::Choice,
@@ -1281,28 +1600,29 @@ void Ui::DrawRow(const Row& row, std::size_t index) {
             // A title's own value, not all games': an amber mark at the row's left edge.
             dl->AddRectFilled(ImVec2(card.bb.Min.x + 6.0f, card.bb.Min.y + 14.0f),
                               ImVec2(card.bb.Min.x + 10.0f, card.bb.Max.y - 14.0f),
-                              Colour(Palette::Own), 2.0f);
+                              Colour(palette->Own), 2.0f);
         }
         dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
-                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(Palette::Text, alpha),
+                    ImVec2(card.bb.Min.x + Pad, mid - label.y * 0.5f), Colour(palette->Text, alpha),
                     row.title, nullptr, label_width);
-        // On a title's screen its own value is amber, all games' it follows plain.
-        const ImU32 value_colour = Colour(for_title && own ? Palette::Own : Palette::Text, alpha);
+        // On a title's screen its own value is amber where it is not all games', else plain.
+        const ImU32 value_colour =
+            Colour(for_title && marked ? palette->Own : palette->Text, alpha);
         switch (row.kind) {
         case Row::Kind::Toggle: {
             const ImVec2 min(value_bb.Max.x - SwitchWidth, mid - 15.0f);
             const ImVec2 max(value_bb.Max.x, mid + 15.0f);
             dl->AddRectFilled(
-                min, max, Colour(value != 0 ? Palette::Accent : Palette::SwitchOff, alpha), 15.0f);
+                min, max, Colour(value != 0 ? palette->Accent : palette->SwitchOff, alpha), 15.0f);
             const float knob = value != 0 ? max.x - 15.0f : min.x + 15.0f;
-            dl->AddCircleFilled(ImVec2(knob, mid), 11.0f, Colour(Palette::Text, alpha), 16);
+            dl->AddCircleFilled(ImVec2(knob, mid), 11.0f, Colour(palette->Text, alpha), 16);
             if (for_title && marked) {
-                dl->AddCircle(ImVec2(knob, mid), 11.0f, Colour(Palette::Own, alpha), 16, 2.0f);
+                dl->AddCircle(ImVec2(knob, mid), 11.0f, Colour(palette->Own, alpha), 16, 2.0f);
             }
             break;
         }
         case Row::Kind::Choice: {
-            const ImU32 arrows = Colour(focused ? Palette::Accent : Palette::TextDim, alpha);
+            const ImU32 arrows = Colour(focused ? palette->Accent : palette->TextDim, alpha);
             dl->AddTriangleFilled(ImVec2(value_bb.Min.x, mid),
                                   ImVec2(value_bb.Min.x + Arrow, mid - Arrow),
                                   ImVec2(value_bb.Min.x + Arrow, mid + Arrow), arrows);
@@ -1320,11 +1640,11 @@ void Ui::DrawRow(const Row& row, std::size_t index) {
                             static_cast<float>(Config::Maximum(row.option) - low);
             const ImVec2 min(value_bb.Min.x, mid - 4.0f);
             dl->AddRectFilled(min, ImVec2(min.x + BarWidth, mid + 4.0f),
-                              Colour(Palette::SwitchOff, alpha), 4.0f);
+                              Colour(palette->SwitchOff, alpha), 4.0f);
             dl->AddRectFilled(min, ImVec2(min.x + BarWidth * t, mid + 4.0f),
-                              Colour(Palette::Accent, alpha), 4.0f);
+                              Colour(palette->Accent, alpha), 4.0f);
             dl->AddCircleFilled(ImVec2(min.x + BarWidth * t, mid), 10.0f,
-                                Colour(Palette::Text, alpha), 16);
+                                Colour(palette->Text, alpha), 16);
             const ImVec2 size = ImGui::CalcTextSize(text.c_str());
             dl->AddText(ImVec2(value_bb.Max.x - size.x, mid - size.y * 0.5f), value_colour,
                         text.c_str());
@@ -1414,6 +1734,87 @@ void Ui::DrawPatchInfo() {
     Note(palette->TextDim, "Built into Azahar for this game. It can't be turned off.");
 }
 
+void Ui::DrawRomFolderRows() {
+    constexpr float Pad = 18.0f;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const std::vector<std::string> folders = Config::RomFolders();
+    std::optional<std::size_t> remove;
+    for (std::size_t i = 0; i < folders.size(); i++) {
+        ImGui::PushID(static_cast<int>(i));
+        const bool armed = armed_rom_folder == static_cast<int>(i);
+        const Card card = CardItem("##rom_folder", ImVec2(width, RowHeight));
+        if (ImGui::GetFocusID() == card.id) {
+            focused_row = RomFolderRow;
+            focused_rom_folder = static_cast<int>(i);
+        } else if (armed) {
+            // Moving off a row disarms it.
+            armed_rom_folder = -1;
+        }
+        if (card.visible) {
+            ImDrawList* const dl = ImGui::GetWindowDrawList();
+            const float y = card.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
+            const char* const label = Tr("ROM folder");
+            const float label_width = ImGui::CalcTextSize(label).x;
+            dl->AddText(ImVec2(card.bb.Min.x + Pad, y), Colour(palette->Text), label);
+            const std::string value = armed ? std::string{Tr("Cross again to remove")}
+                                            : Fit(folders[i], width - 3.0f * Pad - label_width);
+            const float value_width = ImGui::CalcTextSize(value.c_str()).x;
+            dl->AddText(ImVec2(card.bb.Max.x - Pad - value_width, y),
+                        Colour(armed ? palette->Accent : palette->Text), value.c_str());
+        }
+        if (card.pressed) {
+            if (armed) {
+                remove = i;
+            } else {
+                armed_rom_folder = static_cast<int>(i);
+            }
+        }
+        ImGui::PopID();
+    }
+    const Card add = CardItem("##add_rom_folder", ImVec2(width, RowHeight));
+    if (ImGui::GetFocusID() == add.id) {
+        focused_row = AddRomFolderRow;
+    }
+    if (add.visible) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const float y = add.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
+        dl->AddText(ImVec2(add.bb.Min.x + Pad, y), Colour(palette->Text), Tr("Add ROM folder"));
+    }
+    if (remove) {
+        // The folder's files stay where they are: the game list leaves them out.
+        LOG_INFO(Frontend, "ROM folder {} removed", folders[*remove]);
+        Config::RemoveRomFolder(*remove);
+        Config::Save();
+        focused_rom_folder = armed_rom_folder = -1;
+        focus_first_row = true;
+        ScanGames();
+    } else if (add.pressed) {
+        OpenRomFolderPicker();
+    }
+}
+
+void Ui::DrawRomFolderInfo() {
+    const bool add = focused_row == AddRomFolderRow;
+    ImGui::SetWindowFontScale(TitleSize / ImGui::GetFontSize());
+    ImGui::TextWrapped("%s", add ? Tr("Add ROM folder") : Tr("ROM folder"));
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", Tr("The game list also shows the titles in these folders, besides "
+                                "ux0:data/azahar/roms: on a USB or SD2Vita card (uma0:), for "
+                                "example. Only the files in the folder itself, not in folders "
+                                "inside it."));
+    ImGui::Spacing();
+    if (add) {
+        Note(palette->TextDim, Tr("Open the folder, then press square to add it."));
+        return;
+    }
+    const std::vector<std::string> folders = Config::RomFolders();
+    if (focused_rom_folder >= 0 && static_cast<std::size_t>(focused_rom_folder) < folders.size()) {
+        Note(palette->TextDim, folders[static_cast<std::size_t>(focused_rom_folder)]);
+        Note(palette->TextDim, Tr("Removing it from the list keeps its files."));
+    }
+}
+
 void Ui::DrawRowInfo() {
     if (focused_row < 0) {
         return;
@@ -1431,23 +1832,28 @@ void Ui::DrawRowInfo() {
     ImGui::Spacing();
 
     if (const char* reason = DisabledReason(row)) {
-        Note(Palette::Accent, reason);
+        Note(palette->Accent, reason);
     }
-    if (for_title && own) {
-        Note(Palette::Own, fmt::format("Set for this game. All games: {}.",
-                                       ValueText(row, Config::Global(row.option))));
+    const int all_games = Config::Global(row.option);
+    if (for_title && own && *own != all_games) {
+        Note(palette->Own,
+             fmt::format("Set for this game. All games: {}.", ValueText(row, all_games)));
+    } else if (for_title && own) {
+        Note(palette->TextDim, "Set for this game, the same as all games for now. Changing it for "
+                               "all games won't change it here.");
     } else if (for_title) {
-        Note(Palette::TextDim, "Follows the setting for all games.");
+        Note(palette->TextDim, "Follows the setting for all games.");
     } else if (!game_key.empty() && own) {
-        Note(Palette::Own, fmt::format("{} sets its own: {}. Change it in Game settings.",
-                                       game_name, ValueText(row, *own)));
+        Note(*own != all_games ? palette->Own : palette->TextDim,
+             fmt::format("{} sets its own: {}. Change it in Game settings.", game_name,
+                         ValueText(row, *own)));
     }
     if (const std::optional<int> pin = Config::PinOf(row.option)) {
-        Note(Palette::Accent, fmt::format("A launch argument holds this at {} until Azahar exits.",
+        Note(palette->Accent, fmt::format("A launch argument holds this at {} until Azahar exits.",
                                           ValueText(row, *pin)));
     }
     if (!Config::Runtime(row.option) && !game_key.empty()) {
-        Note(Palette::Accent, "Takes effect when a game starts.");
+        Note(palette->Accent, "Takes effect when a game starts.");
     }
 }
 
@@ -1511,10 +1917,10 @@ Ui::Action Ui::DrawSettings() {
             ImGui::PopID();
             const bool selected = c == category;
             dl->AddRectFilled(ImVec2(x, y), ImVec2(x, y) + size,
-                              Colour(selected ? Palette::Accent : Palette::Row), size.y * 0.5f);
-            const ImU32 ink = Colour(selected ? Palette::Backdrop : Palette::Text);
+                              Colour(selected ? palette->Accent : palette->Row), size.y * 0.5f);
+            const ImU32 ink = Colour(selected ? palette->Backdrop : palette->Text);
             DrawIcon(dl, CategoryIcon(i), ImVec2(x + 26.0f, y + size.y * 0.5f), 22.0f, ink,
-                     Colour(selected ? Palette::Accent : Palette::Row));
+                     Colour(selected ? palette->Accent : palette->Row));
             dl->AddText(ImVec2(x + 46.0f, y + (size.y - text.y) * 0.5f), ink, name);
             x += size.x + 10.0f;
         }
@@ -1525,6 +1931,7 @@ Ui::Action Ui::DrawSettings() {
         category = *next_category;
         focused_row = -1;
         focused_patch = -1;
+        focused_rom_folder = armed_rom_folder = -1;
         focus_first_row = true;
     }
     if (category == Category::Patches) {
@@ -1575,87 +1982,360 @@ Ui::Action Ui::DrawSettings() {
 }
 
 Ui::Action Ui::DrawGameList() {
+    constexpr float StatusHeight = 24.0f;
+    constexpr float Footer = ScreenHeight - FooterHeight;
+    constexpr float Tile = 96.0f;
+    constexpr float RowPitch = Tile + 8.0f;
+    constexpr float Pitch = Tile + 10.0f;
+    constexpr int Rows = 2;
+    constexpr float RowTop = Footer - 16.0f - Tile - static_cast<float>(Rows - 1) * RowPitch;
+    // Room for the selected tile's brackets.
+    constexpr float BannerBottom = RowTop - 16.0f;
+    constexpr float TileRounding = 16.0f;
     Action action = Action::None;
-    const std::string note = fmt::format("{} {} in {}", games.size(),
-                                         games.size() == 1 ? "title" : "titles", ListedDirectories);
-    BeginBackdrop("##gamelist_backdrop", Icon::Home, "Azahar", note);
-    bool start = !games.empty() && FooterButton(Glyph::Cross, "Start");
-    bool game_settings = !games.empty() && FooterButton(Glyph::Triangle, "Game settings");
-    EndBackdrop();
+    if (!games.empty()) {
+        selected_game = std::clamp(selected_game, 0, static_cast<int>(games.size()) - 1);
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    const ImTextureID atlas = io.Fonts->TexID;
 
-    BeginList("##games", ImVec2(Margin - 4.0f, HeaderHeight + 8.0f),
-              ImVec2(ScreenWidth - Margin + 4.0f, ScreenHeight - FooterHeight - 8.0f));
-    // The tools first, as the 3DS's HOME Menu has its own above the games.
-    const ImVec2 tool(180.0f, 48.0f);
-    if (IconCard("Settings", Icon::Gear, tool)) {
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(ScreenWidth, ScreenHeight));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, palette->Backdrop);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::Begin("##home_backdrop", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        // The backdrop and the status bar span the display. The window's draw list clips half its
+        // padding in from each side (ImGui's inner clip rectangle), which the renderer cuts
+        // exactly: with the banner showing (the window's own background transparent) those 8
+        // pixels each side would stay black.
+        dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, ScreenHeight), false);
+        // The theme's pattern: light diagonal bands behind the banner.
+        dl->PushClipRect(ImVec2(0.0f, StatusHeight), ImVec2(ScreenWidth, BannerBottom));
+        for (float x = -BannerBottom; x < ScreenWidth; x += 36.0f) {
+            dl->AddLine(ImVec2(x, BannerBottom), ImVec2(x + BannerBottom, 0.0f),
+                        Colour(palette->Pattern), 14.0f);
+        }
+        dl->PopClipRect();
+        DrawStatusBar(dl, StatusHeight,
+                      games.empty() ? std::string{}
+                                    : fmt::format("{} {}", games.size(),
+                                                  games.size() == 1 ? "title" : "titles"));
+        dl->PopClipRect();
+
+        if (games.empty()) {
+            const std::string text = fmt::format(
+                "No titles found. Copy .3ds or .cci files into {} and choose Rescan.",
+                GameDirectory);
+            const float width = ScreenWidth - 2.0f * (Margin + 24.0f);
+            const ImVec2 size = ImGui::CalcTextSize(text.c_str(), nullptr, false, width);
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                        ImVec2((ScreenWidth - size.x) * 0.5f,
+                               (StatusHeight + BannerBottom - size.y) * 0.5f),
+                        Colour(palette->Text), text.c_str(), nullptr, width);
+        } else {
+            const GameEntry& game = games[static_cast<std::size_t>(selected_game)];
+            // The icon a little over twice its size in a white frame, in the panel's middle.
+            constexpr float Frame = 104.0f;
+            const ImVec2 at((ScreenWidth - Frame) * 0.5f,
+                            (StatusHeight + BannerBottom - Frame) * 0.5f);
+            const ImRect frame(at, at + ImVec2(Frame, Frame));
+            dl->AddRectFilled(frame.Min + ImVec2(0.0f, 3.0f), frame.Max + ImVec2(0.0f, 3.0f),
+                              Colour(palette->Shadow), TileRounding);
+            dl->AddRectFilled(frame.Min, frame.Max, Colour(palette->Row), TileRounding);
+            const ImRect art(frame.Min + ImVec2(4.0f, 4.0f), frame.Max - ImVec2(4.0f, 4.0f));
+            if (const IconSlot* slot = IconFor(game)) {
+                dl->AddImageRounded(atlas, art.Min, art.Max, slot->uv0, slot->uv1, IM_COL32_WHITE,
+                                    TileRounding - 4.0f);
+            } else {
+                DrawIcon(dl, Icon::Cartridge, art.GetCenter(), 56.0f, Colour(palette->Icon),
+                         Colour(palette->Row));
+            }
+        }
+        // The footer spans the display too: inside the clip it would stop 8 pixels short of each
+        // edge.
+        dl->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(ScreenWidth, ScreenHeight), false);
+        const ImU32 panel = Colour(palette->Panel, 1.0f / palette->Panel.w);
+        dl->AddRectFilled(ImVec2(0.0f, Footer), ImVec2(ScreenWidth, ScreenHeight), panel);
+        dl->AddLine(ImVec2(0.0f, Footer), ImVec2(ScreenWidth, Footer), Colour(palette->Line));
+        dl->PopClipRect();
+    }
+    ImGui::End();
+
+    // Everything under the banner is the window the pad navigates: the grid, and the footer's
+    // tools. The footer's pad buttons are in it too, for touch alone, as the window takes the
+    // touches over its whole area.
+    BeginList("##home", ImVec2(0.0f, BannerBottom), ImVec2(ScreenWidth, ScreenHeight));
+    ImDrawList* const dl = ImGui::GetWindowDrawList();
+    const float bar_y = Footer + (FooterHeight - FooterButtonHeight) * 0.5f;
+    ImGui::SetCursorScreenPos(ImVec2(Margin, bar_y));
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    bool start = !games.empty() && FooterButton(Glyph::Cross, "Open");
+    bool game_settings = !games.empty() && FooterButton(Glyph::Triangle, "Game settings");
+    bool pin = false;
+    if (!games.empty()) {
+        const std::string& path = games[static_cast<std::size_t>(selected_game)].path;
+        if (pin_checked_path != path) {
+            pin_checked_path = path;
+            pin_checked = LiveArea::IsPinned(path);
+        }
+        pin = FooterButton(Glyph::Square, pin_checked ? "Unpin" : "Pin to LiveArea");
+    }
+    ImGui::PopItemFlag();
+
+    // The tools at the footer's right, which the pad reaches down from the grid's lower row.
+    constexpr float ToolGap = 8.0f;
+    ImGui::SetCursorScreenPos(ImVec2(ScreenWidth - Margin - BarButtonWidth("Settings") -
+                                         BarButtonWidth("Rescan") - BarButtonWidth("Exit") -
+                                         2.0f * ToolGap,
+                                     bar_y));
+    // The pad's selection on a tool, however it got there: a touch leaves ImGui's highlight off,
+    // and IsItemFocused asks for that too.
+    const auto tool_selected = [] {
+        return ImGui::GetFocusID() == ImGui::GetCurrentWindow()->DC.LastItemId;
+    };
+    bool on_tools = false;
+    if (BarButton("Settings", Icon::Gear)) {
         OpenSettings({}, {}, State::GameList);
     }
-    ImGui::SameLine();
-    if (IconCard("Rescan", Icon::Refresh, tool)) {
+    on_tools |= tool_selected();
+    ImGui::SameLine(0.0f, ToolGap);
+    if (BarButton("Rescan", Icon::Refresh)) {
         ScanGames();
     }
-    ImGui::SameLine();
-    if (IconCard("Exit", Icon::Power, tool)) {
+    on_tools |= tool_selected();
+    ImGui::SameLine(0.0f, ToolGap);
+    if (BarButton("Exit", Icon::Power)) {
         action = Action::ExitApplication;
     }
-    ImGui::Spacing();
+    on_tools |= tool_selected();
 
-    if (games.empty()) {
-        ImGui::TextWrapped("No titles found. Copy .3ds or .cci files into %s and choose Rescan.",
-                           GameDirectory);
-    }
-    const float width = ImGui::GetContentRegionAvail().x;
-    for (int i = 0; i < static_cast<int>(games.size()); i++) {
+    // The grid: the titles down its columns, two to a column, the selected tile's column in the
+    // middle, eased there; a touch drags it sideways.
+    const int count = static_cast<int>(games.size());
+    const int columns = (count + Rows - 1) / Rows;
+    const auto tile_id = [](int i) {
         ImGui::PushID(i);
-        // The name wraps rather than being cut; the right end is the game's settings, for touch.
-        constexpr float GearRoom = 56.0f;
-        const float name_width = width - 64.0f - GearRoom;
-        const ImVec2 name = ImGui::CalcTextSize(games[i].name.c_str(), nullptr, false, name_width);
-        // The file's name under the title's, dimmer, where the title has its own.
-        const float file_height = games[i].file.empty() ? 0.0f : ImGui::GetFontSize() + 4.0f;
-        const Card card =
-            CardItem("##game", ImVec2(width, std::max(RowHeight, name.y + file_height + 28.0f)));
-        // Back on the list: the game selected before. Not when a tool has just opened another
-        // screen, which selects its own first item.
+        const ImGuiID id = ImGui::GetID("##tile");
+        ImGui::PopID();
+        return id;
+    };
+    // A step of the pad lands as the frame begins (ImGui applies it in NewFrame): the selection
+    // follows it before the grid is laid out, so that the tile is drawn where the next step is
+    // measured from. Holding a direction steps every frame, and a grid that caught up a frame
+    // later would leave the next step's tile off the screen, where ImGui drops the pad's focus.
+    // Coming back from the tools, the tile below them gives way to the selected one instead.
+    bool on_tile = false;
+    if (const ImGuiID focus = ImGui::GetFocusID(); focus != 0 && !tools_focused) {
+        for (int i = 0; i < count; i++) {
+            if (tile_id(i) == focus) {
+                if (i != selected_game && !io.MouseDown[0]) {
+                    carousel_free = false;
+                }
+                selected_game = i;
+                on_tile = true;
+                break;
+            }
+        }
+    }
+    const float target = static_cast<float>(selected_game / Rows) * Pitch;
+    const float row_mid = ScreenWidth * 0.5f;
+    const float grid_bottom = RowTop + static_cast<float>(Rows - 1) * RowPitch + Tile;
+    const ImRect band(ImVec2(0.0f, RowTop - 12.0f), ImVec2(ScreenWidth, grid_bottom + 12.0f));
+    if (io.MouseClicked[0]) {
+        tap_selected = selected_game;
+    }
+    if (io.MouseDown[0] && band.Contains(io.MouseClickedPos[0])) {
+        const ImVec2 drag = ImGui::GetMouseDragDelta(0, 0.0f);
+        if (std::abs(drag.x) > 12.0f && std::abs(drag.x) > std::abs(drag.y)) {
+            carousel_free = true;
+            carousel_scroll -= io.MouseDelta.x;
+            if (ImGui::GetActiveID() != 0) {
+                ImGui::ClearActiveID();
+            }
+        }
+    }
+    carousel_scroll = std::clamp(carousel_scroll, -Pitch,
+                                 static_cast<float>(std::max(columns - 1, 0)) * Pitch + Pitch);
+    if (!carousel_free) {
+        carousel_scroll += (target - carousel_scroll) * std::min(1.0f, io.DeltaTime * 14.0f);
+    }
+    // ImGui measures the pad's step from where the selected tile was drawn last frame. The grid
+    // has scrolled since (a step moves it), so the measure moves with the tiles: from the old
+    // place a held direction would skip columns.
+    if (ImGuiContext& nav = *ImGui::GetCurrentContext(); nav.NavMoveRequest && on_tile) {
+        nav.NavScoringRect.TranslateX(carousel_drawn - carousel_scroll);
+    }
+    carousel_drawn = carousel_scroll;
+
+    // The grid's ends: a page of columns back or on, for touch, and L and R while the pad is on
+    // the tiles. Their buttons go in before the tiles they lie over, which would take the touch
+    // otherwise (the first item under it is the one hovered); they are drawn over the tiles.
+    const float first_x = row_mid - Tile * 0.5f - carousel_scroll;
+    const float last_x = first_x + static_cast<float>(std::max(columns - 1, 0)) * Pitch;
+    constexpr float ArrowRadius = 30.0f;
+    const float arrow_y = (RowTop + grid_bottom) * 0.5f;
+    const auto arrow_shown = [&](bool left) {
+        return count > 0 && (left ? first_x < 0.0f : last_x + Tile > ScreenWidth);
+    };
+    const auto turn_page = [&](bool left) {
+        // A page from the column in the middle: the selected one, or after a drag the one the
+        // grid shows there; in the selected tile's row.
+        const int column =
+            carousel_free
+                ? std::clamp(static_cast<int>(std::lround(carousel_scroll / Pitch)), 0, columns - 1)
+                : selected_game / Rows;
+        const int page = static_cast<int>(std::floor(ScreenWidth / Pitch)) - 1;
+        const int to = std::clamp(column + (left ? -page : page), 0, columns - 1);
+        carousel_focus = std::min(to * Rows + selected_game % Rows, count - 1);
+    };
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    for (const bool left : {true, false}) {
+        if (!arrow_shown(left)) {
+            continue;
+        }
+        ImGui::SetCursorScreenPos(
+            ImVec2(left ? 0.0f : ScreenWidth - ArrowRadius, arrow_y - ArrowRadius));
+        if (ImGui::InvisibleButton(left ? "##back" : "##on",
+                                   ImVec2(ArrowRadius, 2.0f * ArrowRadius))) {
+            turn_page(left);
+        }
+    }
+    ImGui::PopItemFlag();
+    if (on_tile && count > 0) {
+        if (io.NavInputsDownDuration[ImGuiNavInput_FocusPrev] == 0.0f) {
+            turn_page(true);
+        } else if (io.NavInputsDownDuration[ImGuiNavInput_FocusNext] == 0.0f) {
+            turn_page(false);
+        }
+    }
+
+    const int before = selected_game;
+    for (int i = 0; i < count; i++) {
+        ImGui::PushID(i);
+        const float x =
+            row_mid - Tile * 0.5f + static_cast<float>(i / Rows) * Pitch - carousel_scroll;
+        ImGui::SetCursorScreenPos(ImVec2(x, RowTop + static_cast<float>(i % Rows) * RowPitch));
+        bool held = false;
+        const Card card = CardBehavior("##tile", ImVec2(Tile, Tile), &held);
+        // Back on the list: the game selected before, its tile in the middle at once. Not when a
+        // tool has just opened another screen, which selects its own first item.
         if (focus_first_row && i == selected_game && state == State::GameList) {
             focus_first_row = false;
+            carousel_free = false;
+            carousel_scroll = target;
+            FocusLastItem();
+        }
+        if (carousel_focus == i) {
+            // The tile a page or the tools' way back chose, the grid eased back to it from
+            // where a drag left it.
+            carousel_focus = -1;
+            carousel_free = false;
             FocusLastItem();
         }
         if (ImGui::GetFocusID() == card.id) {
-            selected_game = i;
+            if (tools_focused && i != selected_game && !io.MouseDown[0]) {
+                carousel_focus = selected_game;
+            } else {
+                selected_game = i;
+            }
         }
-        const ImRect gear(card.bb.Max.x - GearRoom, card.bb.Min.y, card.bb.Max.x, card.bb.Max.y);
         if (card.pressed) {
-            selected_game = i;
-            const bool on_gear = !card.by_pad && gear.Contains(ImGui::GetIO().MousePos);
-            (on_gear ? game_settings : start) = true;
+            // A tap selects a tile; a tap on the one selected (or cross) opens it.
+            if (card.by_pad || tap_selected == i) {
+                selected_game = i;
+                start = true;
+            }
         }
         if (card.visible) {
-            ImDrawList* const dl = ImGui::GetWindowDrawList();
-            const ImU32 under = Colour(card.focused ? Palette::RowFocused : Palette::Row);
-            const float mid = card.bb.GetCenter().y;
-            DrawIcon(dl, Icon::Cartridge, ImVec2(card.bb.Min.x + 30.0f, mid), 28.0f,
-                     Colour(Palette::Accent), under);
-            const float top = mid - (name.y + file_height) * 0.5f;
-            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(card.bb.Min.x + 64.0f, top),
-                        Colour(Palette::Text), games[i].name.c_str(), nullptr, name_width);
-            if (!games[i].file.empty()) {
-                const std::string file = Fit(games[i].file, name_width);
-                dl->AddText(ImVec2(card.bb.Min.x + 64.0f, top + name.y + 4.0f),
-                            Colour(Palette::TextDim), file.c_str());
+            const ImU32 white = Colour(held ? palette->RowFocused : palette->Row);
+            dl->AddRectFilled(card.bb.Min + ImVec2(0.0f, 4.0f), card.bb.Max + ImVec2(0.0f, 4.0f),
+                              Colour(palette->Shadow), TileRounding);
+            dl->AddRectFilled(card.bb.Min, card.bb.Max, white, TileRounding);
+            const ImRect art(card.bb.Min + ImVec2(7.0f, 7.0f), card.bb.Max - ImVec2(7.0f, 7.0f));
+            if (const IconSlot* slot = IconFor(games[static_cast<std::size_t>(i)])) {
+                dl->AddImageRounded(atlas, art.Min, art.Max, slot->uv0, slot->uv1, IM_COL32_WHITE,
+                                    TileRounding - 7.0f);
+            } else {
+                DrawIcon(dl, Icon::Cartridge, art.GetCenter(), 44.0f, Colour(palette->Icon), white);
             }
-            DrawIcon(dl, Icon::Gear, gear.GetCenter(), 24.0f,
-                     Colour(card.focused ? Palette::Accent : Palette::TextDim), under);
+            if (card.focused) {
+                DrawBrackets(dl, card.bb, Colour(palette->Accent));
+            }
         }
         ImGui::PopID();
     }
+    if (selected_game != before && !io.MouseDown[0]) {
+        carousel_free = false;
+    }
+    tools_focused = on_tools;
     if (state == State::GameList) {
         focus_first_row = false;
     }
+
+    // The speech bubble: the selected title's name and publisher over the grid's other row, its
+    // point at the selected tile. Not while the pad is on the footer's tools.
+    if (count > 0 && !on_tools) {
+        const GameEntry& game = games[static_cast<std::size_t>(selected_game)];
+        const float room = 560.0f;
+        const std::string name = Fit(game.name, room);
+        const std::string publisher =
+            game.publisher.empty() ? std::string{} : Fit(game.publisher, room);
+        const ImVec2 name_size = ImGui::CalcTextSize(name.c_str());
+        const ImVec2 publisher_size = ImGui::CalcTextSize(publisher.c_str());
+        const float lines = publisher.empty() ? name_size.y : name_size.y + 4.0f + publisher_size.y;
+        const ImVec2 size(std::max(name_size.x, publisher_size.x) + 48.0f, lines + 18.0f);
+        const float tile_x =
+            row_mid + static_cast<float>(selected_game / Rows) * Pitch - carousel_scroll;
+        const float point = std::clamp(tile_x, 24.0f, ScreenWidth - 24.0f);
+        const float left = std::clamp(point - size.x * 0.5f, Margin, ScreenWidth - Margin - size.x);
+        // Clear of the selected tile's brackets, the point between: under a tile of the upper
+        // row, over one of the lower.
+        constexpr float Gap = 16.0f;
+        const bool upper = selected_game % Rows == 0;
+        const float tile_top = RowTop + static_cast<float>(selected_game % Rows) * RowPitch;
+        const float y = upper ? tile_top + Tile + Gap : tile_top - Gap - size.y;
+        const ImRect bubble(ImVec2(left, y), ImVec2(left + size.x, y + size.y));
+        dl->AddRectFilled(bubble.Min + ImVec2(0.0f, 3.0f), bubble.Max + ImVec2(0.0f, 3.0f),
+                          Colour(palette->Shadow), 14.0f);
+        dl->AddRectFilled(bubble.Min, bubble.Max, Colour(palette->Bubble), 14.0f);
+        const float edge = upper ? bubble.Min.y + 1.0f : bubble.Max.y - 1.0f;
+        const float tip = upper ? bubble.Min.y - 10.0f : bubble.Max.y + 10.0f;
+        dl->AddTriangleFilled(ImVec2(point - 10.0f, edge), ImVec2(point + 10.0f, edge),
+                              ImVec2(point, tip), Colour(palette->Bubble));
+        const float top = bubble.Min.y + 9.0f;
+        dl->AddText(ImVec2(bubble.GetCenter().x - name_size.x * 0.5f, top),
+                    Colour(palette->BubbleText), name.c_str());
+        if (!publisher.empty()) {
+            dl->AddText(
+                ImVec2(bubble.GetCenter().x - publisher_size.x * 0.5f, top + name_size.y + 4.0f),
+                Colour(palette->BubbleTextDim), publisher.c_str());
+        }
+    }
+
+    for (const bool left : {true, false}) {
+        if (!arrow_shown(left)) {
+            continue;
+        }
+        const ImVec2 c(left ? 0.0f : ScreenWidth, arrow_y);
+        dl->AddCircleFilled(c + ImVec2(0.0f, 3.0f), ArrowRadius, Colour(palette->Shadow), 24);
+        dl->AddCircleFilled(c, ArrowRadius, Colour(palette->Row), 24);
+        const float d = left ? 1.0f : -1.0f;
+        const ImVec2 tip(c.x + d * 10.0f, c.y);
+        dl->AddTriangleFilled(tip, ImVec2(tip.x + d * 9.0f, c.y - 9.0f),
+                              ImVec2(tip.x + d * 9.0f, c.y + 9.0f), Colour(palette->TextDim));
+    }
+
     // Triangle on the list: the selected game's settings.
     const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-    // Nothing selected (a touch scrolled the selection out of view and a pad move found no item
-    // beside it, so cross pressed nothing): the game selected last, back in view, next frame.
+    // Nothing selected (the selection's item went away): the game selected last, next frame.
     if (state == State::GameList && focused && !games.empty() && ImGui::GetFocusID() == 0) {
         focus_first_row = true;
     }
@@ -1703,13 +2383,13 @@ Ui::Action Ui::DrawPauseMenu() {
     {
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         const ImVec2 at = ImGui::GetCursorScreenPos();
-        dl->AddText(ImGui::GetFont(), TitleSize, at, Colour(Palette::Text), "Paused");
+        dl->AddText(ImGui::GetFont(), TitleSize, at, Colour(palette->Text), "Paused");
         const float room = ImGui::GetContentRegionAvail().x - 130.0f;
         const std::string name = Fit(game_name, room);
         const ImVec2 size = ImGui::CalcTextSize(name.c_str());
         dl->AddText(ImVec2(at.x + ImGui::GetContentRegionAvail().x - size.x,
                            at.y + (TitleSize - size.y) * 0.5f),
-                    Colour(Palette::TextDim), name.c_str());
+                    Colour(palette->TextDim), name.c_str());
         ImGui::Dummy(ImVec2(0.0f, TitleSize + 6.0f));
     }
 
@@ -1786,7 +2466,7 @@ Ui::Action Ui::DrawSavestates() {
         const ImVec2 at = ImGui::GetCursorScreenPos();
         const float width = ImGui::GetContentRegionAvail().x;
         ImGui::GetWindowDrawList()->AddRectFilled(at, at + ImVec2(width, 52.0f),
-                                                  Colour(Palette::Row), RowRounding);
+                                                  Colour(palette->Row), RowRounding);
         // The slot's state: when it was saved (the console's local time), from a version whose
         // states this one can't load (another savestate format), or none.
         const auto saved =
@@ -1801,10 +2481,10 @@ Ui::Action Ui::DrawSavestates() {
         }
         const float text_y = at.y + (52.0f - ImGui::GetFontSize()) * 0.5f;
         ImDrawList* const dl = ImGui::GetWindowDrawList();
-        dl->AddText(ImVec2(at.x + 18.0f, text_y), Colour(Palette::Text),
+        dl->AddText(ImVec2(at.x + 18.0f, text_y), Colour(palette->Text),
                     fmt::format("Slot {}", slot).c_str());
         dl->AddText(ImVec2(at.x + 110.0f, text_y),
-                    Colour(saved != slot_states.end() ? Palette::Text : Palette::TextDim),
+                    Colour(saved != slot_states.end() ? palette->Text : palette->TextDim),
                     info.c_str());
         ImGui::SetCursorScreenPos(at + ImVec2(width - 2.0f * button.x - 16.0f, 6.0f));
         if (ImGui::Button("Save", button)) {
@@ -1850,6 +2530,27 @@ Ui::Action Ui::DrawSavestates() {
     return action;
 }
 
+void Ui::OpenRomFolderPicker() {
+    picker_cia_dir = picker_dir;
+    picker_folders = true;
+    OpenPickerDir({});
+    state = State::InstallPicker;
+    focus_first_row = true;
+}
+
+void Ui::ClosePicker() {
+    if (picker_folders) {
+        picker_folders = false;
+        picker_dir = std::move(picker_cia_dir);
+        picker_entries.clear();
+        state = State::Settings;
+    } else {
+        state = State::GameList;
+    }
+    overlay_focused = false;
+    focus_first_row = true;
+}
+
 Ui::Action Ui::DrawMultiplayer() {
     if (editing_field >= 0) {
         DrawKeyboard();
@@ -1885,12 +2586,12 @@ Ui::Action Ui::DrawMultiplayer() {
         if (card.visible) {
             ImDrawList* const dl = ImGui::GetWindowDrawList();
             const float y = card.bb.GetCenter().y - ImGui::GetFontSize() * 0.5f;
-            dl->AddText(ImVec2(card.bb.Min.x + 18.0f, y), Colour(Palette::Text), fields[i].first);
+            dl->AddText(ImVec2(card.bb.Min.x + 18.0f, y), Colour(palette->Text), fields[i].first);
             const bool empty = fields[i].second->empty();
             const std::string value = Fit(empty ? "(none)" : *fields[i].second, width - 190.0f);
             const float value_width = ImGui::CalcTextSize(value.c_str()).x;
             dl->AddText(ImVec2(card.bb.Max.x - 18.0f - value_width, y),
-                        Colour(empty ? Palette::TextDim : Palette::Text), value.c_str());
+                        Colour(empty ? palette->TextDim : palette->Text), value.c_str());
         }
         if (card.pressed) {
             editing_field = i;
@@ -1937,10 +2638,10 @@ Ui::Action Ui::DrawMultiplayer() {
                            "then finds the others.");
     }
     for (const std::string& member : members) {
-        Note(Palette::Accent, member);
+        Note(palette->Accent, member);
     }
     if (!can_join) {
-        Note(Palette::TextDim, "Join needs an address and a nickname.");
+        Note(palette->TextDim, "Enter an address and a nickname to join.");
     }
     ImGui::End();
 
@@ -2040,10 +2741,10 @@ void Ui::DrawStatusMessage() {
         ImDrawList* const dl = ImGui::GetWindowDrawList();
         const ImVec2 min = ImGui::GetWindowPos() + ImVec2(Padding, Padding + text.y + BarGap);
         const ImVec2 max = min + ImVec2(Width - 2.0f * Padding, BarHeight);
-        dl->AddRectFilled(min, max, Colour(Palette::SwitchOff), BarHeight * 0.5f);
+        dl->AddRectFilled(min, max, Colour(palette->SwitchOff), BarHeight * 0.5f);
         if (status_progress > 0.0f) {
             const float filled = std::max(BarHeight, (max.x - min.x) * status_progress);
-            dl->AddRectFilled(min, ImVec2(min.x + filled, max.y), Colour(Palette::Accent),
+            dl->AddRectFilled(min, ImVec2(min.x + filled, max.y), Colour(palette->Accent),
                               BarHeight * 0.5f);
         }
     }
@@ -2056,6 +2757,9 @@ Ui::Action Ui::Update() {
     if (!imgui_frame) {
         return Action::None;
     }
+    ++frame;
+    // A theme chosen in the settings shows from the frame after.
+    UseTheme();
     ImGui_ImplVita_NewFrame();
 
     Action action = Action::None;

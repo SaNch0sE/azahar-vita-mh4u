@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -23,9 +24,9 @@
  * file) over the running title's own value over the one for all games.
  *
  * The values are the emulator's settings and the frontend's own switches (the layout's overlay,
- * widescreen, the top screen's scale); this is the only place that writes them, so that what a
- * menu shows is what runs. Any thread: the pause menu edits on the render thread, the run loop
- * applies a title's values on the emulation thread.
+ * widescreen, the top screen's scale, the menus' theme); this is the only place that writes them,
+ * so that what a menu shows is what runs. Any thread: the pause menu edits on the render thread,
+ * the run loop applies a title's values on the emulation thread.
  */
 namespace VitaFrontend::Config {
 
@@ -50,6 +51,12 @@ enum class Option : u32 {
     StretchAudio,
     RightStick,
     Region,
+    /// Every title as on a New 3DS (Settings' is_new_3ds): 1, or 0 for the New 3DS's own titles
+    /// alone. Read as a title loads.
+    ForceNew3ds,
+    /// Their colours: 0 dark, 1 light (the HOME Menu's). The frontend's own; the menus read it
+    /// as they draw.
+    Theme,
     Count,
 };
 
@@ -72,8 +79,8 @@ constexpr int NoFrameSkipLimit = 5;
 
 /// Whether a title can have its own value. The options for the screens and the speed are: what
 /// suits one title (a top screen it needs whole, a scale its GPU work allows, vsync where its
-/// frame rate is uneven) does not suit the next. The sound and the region are the player's or
-/// the console's, the same whatever runs.
+/// frame rate is uneven) does not suit the next. The sound, the region and the menus' theme are
+/// the player's or the console's, the same whatever runs.
 [[nodiscard]] bool PerTitle(Option option);
 /// Whether a change takes effect under a running title. The region is read as a title loads.
 [[nodiscard]] bool Runtime(Option option);
@@ -121,6 +128,16 @@ void ClearTitleValues(const std::string& title);
 /// option takes the pin away: what the player chose last is what runs.
 void Pin(Option option, int value);
 [[nodiscard]] std::optional<int> PinOf(Option option);
+
+/// The folders the game list takes titles from besides ux0:data/azahar/roms, in the order the
+/// player added them: on another memory device (a USB or SD2Vita card's uma0:) or anywhere on one.
+/// All games' section keeps them, one `rom_folder` line each.
+[[nodiscard]] std::vector<std::string> RomFolders();
+/// Adds `folder` (a path as the Vita writes it, "uma0:" or "uma0:/roms"): false where it is
+/// ux0:data/azahar/roms or listed already, a slash after the device or at the end aside, and
+/// letters' case too, as the memory devices' file systems ignore it.
+bool AddRomFolder(const std::string& folder);
+void RemoveRomFolder(std::size_t index);
 
 /// The values applied last, each option's file key and word, marked where the running title's own
 /// or a pin set it, as "[azahar] settings:" lines in `out` (cut where they do not fit): for a
