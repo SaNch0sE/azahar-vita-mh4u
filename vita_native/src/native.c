@@ -427,6 +427,10 @@ typedef struct AzaharCore {
     uint32_t attached;
     // The azahar_code_gen this core's instruction cache last caught up with (core2_install).
     uint32_t code_gen;
+    // The kernel megabytes azaharAttach put in the table for this core's thread's stack
+    // (keep_kernel_range): azaharDetach takes them out again.
+    uint32_t kept_l1[2];
+    uint32_t kept_count;
 } AzaharCore;
 static AzaharCore azahar_core[AZAHAR_CORES];
 // The page AZAHAR_USER_PAGE_VA shows the guest, one per core, each core's
@@ -457,6 +461,9 @@ extern int azahar_enter(AzaharCpu *cpu);
 extern uint32_t azahar_get_banked_sp(uint32_t mode);
 extern void azahar_set_banked_sp(uint32_t mode, uint32_t sp);
 extern volatile uint32_t azahar_gic_va, azahar_seal_flag;
+// The linker script's: the end of the read-only segment's exception index (past .rodata) and
+// of the data segment, for the seal's keep list.
+extern const char __exidx_end[], _end[];
 // Each core's stubs, in the order its vector table names them: und, svc, pabt, dabt, irq.
 #define AZAHAR_STUBS(n)                                                                        \
     extern void azahar_vec_und_##n(void), azahar_vec_svc_##n(void), azahar_vec_pabt_##n(void), \
@@ -580,22 +587,45 @@ static int azahar_resident_requested(void) {
 // ---------------------------------------------------------------------------- core 2 side
 
 // The table switch, both directions. ARM ARM B3.10.4 example B3-3 with erratum 754322's dsb on
-// each side; TTBCR and TTBR0 change inside one break-before-make block because between them the
-// CPU would read a 1024-entry table as though it had 4096 (vaprobe's STAGE_OWN, 2026-08-26).
+// each side. Until the ISB after a write, the table walker may use the old or the new value of
+// each register, and speculative walks run in that window. TTBCR.N = 0 over Sony's TTBR0 (an
+// N = 2 table) reads the 12 KiB past it as descriptors, and a walk into an address hole parks
+// the core in SceKernelBusError's handler. So the write that keeps every state a whole table
+// goes first, an ISB after it: going to N = 0, TTBR0 takes our table while N = 2 still holds;
+// going back, TTBCR returns to N = 2 while TTBR0 is still ours.
+// No BPIALL: a stale prediction costs a misprediction, the flush costs every slice more.
 static void core2_switch(uint32_t ttbcr, uint32_t ttbr0, uint32_t ctxid, int icache) {
     asm volatile("dsb                             \n"
                  "mcr p15, 0, %[zero], c13, c0, 1 \n"
                  "isb                             \n"
-                 "mcr p15, 0, %[tcr],  c2, c0, 2  \n"
-                 "mcr p15, 0, %[ttb],  c2, c0, 0  \n"
-                 "isb                             \n"
-                 "mcr p15, 0, %[ctx],  c13, c0, 1 \n"
+                 :
+                 : [zero] "r"(0u)
+                 : "memory");
+    if ((ttbcr & 7u) < (rd_ttbcr() & 7u)) {
+        // N shrinks, the TTBR0 region grows: the bigger table first.
+        asm volatile("mcr p15, 0, %[ttb],  c2, c0, 0  \n"
+                     "isb                             \n"
+                     "mcr p15, 0, %[tcr],  c2, c0, 2  \n"
+                     "isb                             \n"
+                     :
+                     : [tcr] "r"(ttbcr), [ttb] "r"(ttbr0)
+                     : "memory");
+    } else {
+        asm volatile("mcr p15, 0, %[tcr],  c2, c0, 2  \n"
+                     "isb                             \n"
+                     "mcr p15, 0, %[ttb],  c2, c0, 0  \n"
+                     "isb                             \n"
+                     :
+                     : [tcr] "r"(ttbcr), [ttb] "r"(ttbr0)
+                     : "memory");
+    }
+    asm volatile("mcr p15, 0, %[ctx],  c13, c0, 1 \n"
                  "dsb                             \n"
                  "mcr p15, 0, %[zero], c8, c7, 0  \n" // TLBIALL
                  "dsb                             \n"
                  "isb                             \n"
                  :
-                 : [tcr] "r"(ttbcr), [ttb] "r"(ttbr0), [ctx] "r"(ctxid), [zero] "r"(0u)
+                 : [ctx] "r"(ctxid), [zero] "r"(0u)
                  : "memory");
     if (icache) {
         // Guest code was written as data: the instruction cache is physically tagged, so this
@@ -651,7 +681,9 @@ static void core2_install(unsigned n) {
     core->sv_sp_irq = azahar_get_banked_sp(MODE_IRQ);
     cpu->chain_irq[0] = core->sv_sp_irq;
     azahar_gic_va = gic_va;
-    azahar_seal_flag = AZAHAR_SEAL;
+    // A stray exception parks in both builds: the guest's world maps nothing of Sony's kernel
+    // besides what this module touches, so its handlers are not there to chain to.
+    azahar_seal_flag = 1;
 
     // The private timer: enable its PPI at this core's banked GIC enable register (measured
     // disabled on every core), and start it free-running with no interrupt so its clock can be
@@ -684,10 +716,15 @@ static void core2_install(unsigned n) {
     }
     asm volatile("dsb" ::: "memory");
 
-    // N = 0: the table base is bits [31:14].
-    const uint32_t ours = ((uint32_t)azahar_l1_pa & 0xFFFFC000u) | (core->sv_ttbr0 & 0x3FFFu);
+    // Sony's N = 2: our table for the low gigabyte, the process's own through TTBR1 above it.
+    // The table base is bits [31:12] at N = 2 (our table is 16 KiB aligned); Sony's walk
+    // attributes (bits 6:0) and nothing of its base.
+    const uint32_t tcr = core->sv_ttbcr;
+    // An attached core's own view, else the shared table.
+    const uintptr_t l1_pa = azahar_view[n].l1 ? azahar_view[n].l1_pa : azahar_l1_pa;
+    const uint32_t ours = ((uint32_t)l1_pa & 0xFFFFC000u) | (core->sv_ttbr0 & 0x7Fu);
     const uint32_t gen = azahar_code_gen;
-    core2_switch(core->sv_ttbcr & ~7u, ours, core->sv_ctxid, core->code_gen != gen);
+    core2_switch(tcr, ours, core->sv_ctxid, core->code_gen != gen);
     core->code_gen = gen;
     core->ttbcr_seen = rd_ttbcr();
 
@@ -1046,24 +1083,76 @@ static int core2_command(uint32_t cmd, unsigned steps) {
     return ret;
 }
 
-static int alloc_block(const char *name, SceSize size, SceSize align, SceUID *uid, uint32_t **va,
-                       uintptr_t *pa) {
+// Physically contiguous kernel memory, its base and its physical address: what the table walker,
+// the GPU's MMU and the USB controller's DMA reach as base + offset. A *_PHYCONT_* memory type
+// only names the partition; its pages are contiguous only with ATTR_PHYCONT. Without it a page
+// can lie far from base + its offset, where a level-1 entry would name it.
+// Every page is checked; a block that is not contiguous anyway is freed and refused.
+static SceUID phycont_alloc(const char *name, SceKernelMemBlockType type, SceSize size,
+                            SceSize align, void **va, uintptr_t *pa) {
     SceKernelAllocMemBlockKernelOpt opt;
     __builtin_memset(&opt, 0, sizeof(opt));
     opt.size = sizeof(opt);
-    opt.attr = 0x4;
+    opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT | SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
     opt.alignment = align;
-    *uid = ksceKernelAllocMemBlock(name, SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_RW, size, &opt);
+    const SceUID uid = ksceKernelAllocMemBlock(name, type, size, &opt);
+    if (uid < 0) {
+        ksceKernelPrintf("[azaharnative] %s: %u KiB not allocated (0x%08x)\n", name,
+                         (unsigned)(size >> 10), (unsigned)uid);
+        return uid;
+    }
+    int r = ksceKernelGetMemBlockBase(uid, va);
+    if (r >= 0) {
+        r = ksceKernelVAtoPA(*va, pa);
+    }
+    for (uint32_t off = 0x1000u; r >= 0 && off < size; off += 0x1000u) {
+        uintptr_t p = 0;
+        if (ksceKernelVAtoPA((void *)((uintptr_t)*va + off), &p) < 0 || p != *pa + off) {
+            ksceKernelPrintf("[azaharnative] %s: page +%05x at pa %08x, not %08x: not contiguous\n",
+                             name, (unsigned)off, (unsigned)p, (unsigned)(*pa + off));
+            r = (int)0x80024302;  // SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE
+        }
+    }
+    if (r < 0) {
+        ksceKernelFreeMemBlock(uid);
+        return r;
+    }
+    return uid;
+}
+
+static int alloc_block(const char *name, SceSize size, SceSize align, SceUID *uid, uint32_t **va,
+                       uintptr_t *pa) {
+    *uid = phycont_alloc(name, SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_RW, size, align,
+                         (void **)va, pa);
     if (*uid < 0) {
         emit("  %s: alloc failed 0x%08x\n", name, (uint32_t)*uid);
         return AZAHAR_ERR_ALLOC;
     }
-    if (ksceKernelGetMemBlockBase(*uid, (void **)va) < 0 || ksceKernelVAtoPA(*va, pa) < 0) {
-        emit("  %s: base/pa lookup failed\n", name);
-        return AZAHAR_ERR_ALLOC;
-    }
     return 0;
 }
+
+
+// One word of physical memory through a page mapped at that address, as reback_map_l1 maps a
+// level-1 page: what the table walker reads there (azaharVaReport).
+static int phys_word(uint32_t pa, uint32_t *out) {
+    SceKernelAllocMemBlockKernelOpt opt;
+    __builtin_memset(&opt, 0, sizeof(opt));
+    opt.size = sizeof(opt);
+    opt.attr = 2;   // physical address given
+    opt.paddr = pa & 0xFFFFF000u;
+    const SceUID uid = ksceKernelAllocMemBlock("SceAzaharPhys", 0x6020D006, 0x1000, &opt);
+    void *va = NULL;
+    if (uid < 0 || ksceKernelGetMemBlockBase(uid, &va) < 0 || !va) {
+        if (uid >= 0) {
+            ksceKernelFreeMemBlock(uid);
+        }
+        return uid < 0 ? uid : -1;
+    }
+    *out = *(volatile uint32_t *)((uintptr_t)va + (pa & 0xFFCu));
+    ksceKernelFreeMemBlock(uid);
+    return 0;
+}
+
 
 // azaharRun's requests: the app's own blocks, one per emulated core, mapped into
 // the kernel at a block's first call and read and written in place from then on, not copied in
@@ -1539,6 +1628,23 @@ int azaharVaReport(uint32_t va, AzaharVaReport *out) {
             r.view_overrides[n] = v->count;
         }
     }
+    if (idx == 0) {
+        for (unsigned n = 0; n < AZAHAR_CORES; n++) {
+            const AzaharView *const v = &azahar_view[n];
+            if (!v->l1) {
+                continue;
+            }
+            uintptr_t mb0_real = 0;
+            const int vr = ksceKernelVAtoPA((void *)(v->mb0 + page), &mb0_real);
+            const uint32_t l1e = v->l1[0], walk_pa = (l1e & 0xFFFFFC00u) + page * 4u;
+            uint32_t walked = 0;
+            const int pr = phys_word(walk_pa, &walked);
+            ksceKernelPrintf("[azaharnative] report %08x core %u: view l1[0] %08x -> the walker reads "
+                             "pa %08x = %08x (0x%08x); the CPU's entry at pa %08x (0x%08x) = %08x\n",
+                             va, n, l1e, walk_pa, walked, (unsigned)pr, (unsigned)mb0_real,
+                             (unsigned)vr, v->mb0[page]);
+        }
+    }
     const AzaharView *const own = &azahar_view[r.core & 3u];
     for (unsigned i = 0; i < own->count && i < AZAHAR_ATTACH_OVERRIDES; i++) {
         r.overrides[i] = own->overrides[i];
@@ -1646,9 +1752,10 @@ static int check_range(const AzaharRange *rg, int need_user) {
     return 1;
 }
 
-// Build the N=0 table: the kernel's TTBR0 entries below 0x40000000 and its TTBR1 entries above,
-// as this process sees them, then our vector page in a free 1 MB slot at the top of the low
-// quarter, then the guest windows as coarse L2s.
+// Build the guest's table: of the kernel's TTBR0 entries below 0x40000000 the ones this module
+// touches (the seal's keep list), then our vector page in a free 1 MB slot at the top of the low
+// quarter, then the guest windows as coarse L2s. Above 0x40000000 nothing when sealed (N = 0);
+// unsealed, the process's own table through TTBR1 (N = 2).
 static int build_table(const AzaharMapRequest *req) {
     // TTBR0 is one global table; TTBR1 is per process, and the one core 2 needs is the resident
     // kernel thread's, not this syscall's — the app's TTBR1, whose pages are not where the
@@ -1689,13 +1796,14 @@ static int build_table(const AzaharMapRequest *req) {
     for (unsigned i = 0; i < AZAHAR_L1_ENTRIES; i++) {
         azahar_l1[i] = 0;
     }
-#if AZAHAR_SEAL
-    // What core 2 touches while our table is in, by the addresses of the things it touches:
-    // this module's code and data, its stack, the GIC. Each address names one megabyte, and
-    // that megabyte's entry — the kernel's own, pointing at the kernel's own L2 — is kept.
-    // The module's own megabytes come from its segment table — code and data/bss both,
+    // Both builds keep only this of the kernel's low gigabyte: an entry copied for anything else
+    // goes stale when the kernel unmaps that megabyte, and a speculative access through it parks a
+    // core in SceKernelBusError's handler. Kept: the megabytes of what core 2 touches while our
+    // table is in (this module's code and data, its stack, the GIC), each the kernel's own entry.
+    // The module's megabytes come from its segment table, as its layout differs per boot; the
+    // by-symbol spot list is only the fallback when the lookup fails.
     struct KeepRange { uint32_t addr, len; };
-    struct KeepRange keep[40];
+    struct KeepRange keep[44];
     unsigned nkeep = 0;
     {
         // Segment bases from taiHEN (already imported; the module manager's own
@@ -1740,7 +1848,8 @@ static int build_table(const AzaharMapRequest *req) {
             // megabytes the kernel never mapped, and the install would fail on them.
             const unsigned n_text = sizeof(text_syms) / sizeof(text_syms[0]);
             const unsigned n_data = sizeof(data_syms) / sizeof(data_syms[0]);
-            int bucket[32];
+            int bucket[sizeof(text_syms) / sizeof(text_syms[0]) +
+                       sizeof(data_syms) / sizeof(data_syms[0])];
             uint32_t ends[2] = {bases[0], bases[1]};
             for (unsigned i = 0; i < n_text + n_data; i++) {
                 const uint32_t sym = i < n_text ? text_syms[i] : data_syms[i - n_text];
@@ -1775,6 +1884,20 @@ static int build_table(const AzaharMapRequest *req) {
                 keep[nkeep].addr = bases[seg];
                 keep[nkeep].len = len;
                 emit("  seal: segment %u %08x..%08x\n", seg, bases[seg], bases[seg] + len);
+                nkeep++;
+            }
+            // The segments' whole extents as well: the symbol lists name what this file thinks
+            // core 2 touches, and the unsealed world's upcall paths reach more of the data. The
+            // read-only segment ends with its exception index (the linker script's
+            // __exidx_end, past .rodata), the data segment at _end.
+            if (bases[0] != 0 && (uint32_t)(uintptr_t)__exidx_end > bases[0]) {
+                keep[nkeep].addr = bases[0];
+                keep[nkeep].len = (uint32_t)(uintptr_t)__exidx_end - bases[0];
+                nkeep++;
+            }
+            if (bases[1] != 0 && (uint32_t)(uintptr_t)_end > bases[1]) {
+                keep[nkeep].addr = bases[1];
+                keep[nkeep].len = (uint32_t)(uintptr_t)_end - bases[1];
                 nkeep++;
             }
             for (unsigned i = 0; i < n_text + n_data; i++) {
@@ -1868,13 +1991,17 @@ static int build_table(const AzaharMapRequest *req) {
     emit("  L1 sealed: %u kernel megabyte(s) kept (%s ), the rest invalid; kernel ttbr0 table at "
          "va %p, ttbr1 pa %08x, core-2 sp %08x\n",
          kept, kept_list, (const void *)kernel_l1, ttbr1_pa, azahar_core2_sp);
-#else
-    for (unsigned i = 0; i < AZAHAR_L1_ENTRIES; i++) {
-        azahar_l1[i] = KERNEL_L1(i);
+    // The process's own megabytes above the low gigabyte are reached through TTBR1,
+    // the process's table itself: core2_install keeps Sony's N = 2 (a copy went stale the same
+    // way as the kernel's). Our table is then the low gigabyte's alone.
+    if ((rd_ttbcr() & 7u) != 2u) {
+        emit("  unsealed: TTBCR %08x, not N = 2\n", rd_ttbcr());
+        return AZAHAR_ERR_TABLE;
     }
-    // The process's own megabytes: its table's pages are not in the kernel's low 8 MB (the
-    // folded design calls from the app), so each is read through a mapping of its own, as
-    // reback.c reads it. A copy: what the app maps after this is not in the guest's world.
+    // A copy of the process's entries all the same, which the walker does not read: what
+    // azaharTableScan compares. Its table's pages are not in the kernel's low
+    // 8 MB (the folded design calls from the app), so each is read through a mapping of its own,
+    // as reback.c reads it.
     for (unsigned pg = 1; pg < 4; pg++) {
         if (upper[pg]) {
             continue;
@@ -1890,8 +2017,6 @@ static int build_table(const AzaharMapRequest *req) {
         }
         ksceKernelFreeMemBlock(uid);
     }
-    emit("  L1 merged from the kernel's two tables (AZAHAR_SEAL=0): ttbr0 table at va %p, ttbr1 pa "
-         "%08x\n", (const void *)kernel_l1, ttbr1_pa);
 
     // The vector page: the highest free megabyte below 0x40000000 that no guest range wants.
     // The top half of the low quarter is fully populated on the console (no free entry in
@@ -2387,7 +2512,8 @@ out:
 // invalid: the caller's own tables (TTBR0's global low gigabyte, its process's TTBR1 above), as
 // build_table's seal keeps what the mapping core touches. An invalid entry made valid needs no
 // TLB maintenance: translation faults are not cached (ARM ARM B3.10).
-static int keep_kernel_range(uint32_t addr, uint32_t len) {
+static int keep_kernel_range(uint32_t addr, uint32_t len, uint32_t *kept_l1,
+                             uint32_t *kept_count) {
     const uint32_t *const low = find_kernel_page(rd_ttbr0() & 0xFFFFF000u);
     const uint32_t ttbr1_pa = rd_ttbr1() & 0xFFFFC000u;
     unsigned kept = 0;
@@ -2407,6 +2533,9 @@ static int keep_kernel_range(uint32_t addr, uint32_t len) {
         }
         azahar_l1[idx] = e;
         views_l1_set(idx);
+        if (*kept_count < 2u) {
+            kept_l1[(*kept_count)++] = idx;
+        }
         kept++;
     }
     asm volatile("dsb ish" ::: "memory");
@@ -2471,7 +2600,9 @@ int azaharAttach(const AzaharAttachRequest *user_req) {
     asm volatile("mov %0, sp" : "=r"(sp));
     // The syscall stack's depth differs between this call and azaharRun: slack each way, as
     // build_table keeps for the mapping thread.
-    if ((ret = keep_kernel_range(sp - 0x8000u, 0x10000u)) != 0) {
+    azahar_core[n].kept_count = 0;
+    if ((ret = keep_kernel_range(sp - 0x8000u, 0x10000u, azahar_core[n].kept_l1,
+                                 &azahar_core[n].kept_count)) != 0) {
         goto out;
     }
     // Its own view: the shared level-1 table's copy, its first megabyte its own.
@@ -2532,6 +2663,26 @@ int azaharDetach(void) {
     azahar_core[n].attached = 0;
     azahar_attached_cores--;
     view_free(n);
+    // Its stack's megabytes out of the table, unless another attached core's stack shares one:
+    // the thread ends after this, each savestate attaches a new one, and a copy of a kernel
+    // descriptor the kernel frees or reuses later is what parked a core with a bus error.
+    for (uint32_t k = 0; k < azahar_core[n].kept_count; k++) {
+        const uint32_t idx = azahar_core[n].kept_l1[k];
+        int shared = 0;
+        for (unsigned m = 0; m < AZAHAR_CORES; m++) {
+            for (uint32_t j = 0; m != n && azahar_core[m].attached && j < azahar_core[m].kept_count;
+                 j++) {
+                shared |= azahar_core[m].kept_l1[j] == idx;
+            }
+        }
+        if (!shared) {
+            azahar_l1[idx] = 0;
+            views_l1_set(idx);
+        }
+    }
+    emit("  %u kernel megabyte(s) of cpu%u's stack taken out\n", azahar_core[n].kept_count, n);
+    azahar_core[n].kept_count = 0;
+    tables_changed(0);
     ksceKernelUnlockMutex(azahar_edit_mutex, 1);
 
 out:

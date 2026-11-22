@@ -434,6 +434,15 @@ azahar_svc_fast:
     str     r7, [r4, #PTIMER_CONTROL_FROM_COUNTER]
     mov     r7, #1
     str     r7, [r4, #PTIMER_STATUS_FROM_COUNTER]
+    @ An expiry in this svc's masked instructions left PPI 29 pending at the GIC, which clearing
+    @ the timer's flag does not end: taken after the return, azahar_irq_rearm would add the
+    @ quantum loaded below to the guest clock, never run (version 79). Its pending state goes too.
+    ldr     r12, =azahar_gic_va
+    ldr     r12, [r12]
+    add     r12, r12, #0x1000       @ the distributor
+    mov     r7, #0x20000000
+    str     r7, [r12, #0x280]       @ GICD_ICPENDR0: PPI 29, this core's bank
+    dsb     sy
     str     r1, [r4, #PTIMER_LOAD_FROM_COUNTER]
     str     r1, [r6, #FAST_QUANTUM]
     mov     r7, #5                      @ enable, interrupt, no reload

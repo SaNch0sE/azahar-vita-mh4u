@@ -397,8 +397,7 @@ bool RunVfpVector(AzaharContext& ctx, u32 insn) {
 /// below ~0x010C0000; farther ones take the svc.
 constexpr VAddr ThunkAreaBase = 0x000C0000;
 constexpr u32 ThunkAreaSize = 0x40000;
-/// The largest thunk: ARM 19 words and eight elements, Thumb about as many bytes.
-constexpr u32 VfpThunkMax = 128;
+constexpr u32 VfpThunkMax = 160;
 
 bool InThunkArea(u32 addr) {
     return addr - ThunkAreaBase < ThunkAreaSize;
@@ -424,16 +423,9 @@ struct VfpThunk {
     u32 end;
 };
 
-// The svcs the module answers in the vector (AZAHAR_FAST_*) are answered by thunks as well, from
-// two read-only pages it maps into the guest's table (AZAHAR_USER_TIMER_VA): GetSystemTick from
-// the private timer and the entry's clock, GetThreadId and GetProcessId on the current thread and
-// process, and the process data cache svcs on the current process. The module reports an ARM site
-// it answered (AzaharRunRequest.fast_site) and PatchSvc branches the site to a thunk. An svc keeps
-// every register but its outputs, and the flags: the thunk works in the caller-saved r2, r3 and
-// r12 with LR holding the flags, all four on the guest's stack meanwhile, and writes its answer
-// to r0 and r1. A handle it does not answer, or an answer the page does not hold this entry, runs
-// the original svc in the thunk's miss path (an exit, or the module's own answer). Thumb's 16-bit
-// svc has no room for a branch and stays.
+// The svcs the module answers itself (AZAHAR_FAST_*) get thunks too, reading the two read-only
+// pages it maps (AZAHAR_USER_TIMER_VA). A thunk works in r2, r3, r12 and LR, saved in words of its
+// own (never below the guest's SP), and a miss runs the original svc. Thumb's 16-bit svc stays.
 // GetThreadId's thunk answers for another handle too, from the IDs the svc gave before (ThreadIds).
 
 /// An svc thunk's instructions by address, for a thread stopped inside it (FinishSvcThunk).
@@ -442,7 +434,7 @@ struct SvcThunk {
     u32 mrs;      ///< mrs lr: past it LR holds the guest's flags
     u32 answered; ///< from here the answer is in r0 and r1 (and the svc's inputs may be gone)
     u32 done;     ///< the hit's msr
-    u32 pop;      ///< pop {r2, r3, r12, lr}
+    u32 pop;      ///< its four loads of r2, r3, r12 and LR
     u32 back;
     u32 miss; ///< the miss's msr
     u32 miss_pop;
@@ -455,8 +447,8 @@ struct SvcThunk {
     u32 skip; ///< the idle skip's upcall stub, 0 until a caller spins on the clock
     u32 end;
 };
-/// The largest svc thunk: GetSystemTick's 71 words.
-constexpr u32 SvcThunkMax = 296;
+/// The largest svc thunk: GetSystemTick's 90 words.
+constexpr u32 SvcThunkMax = 384;
 
 /// The guest's patched sites and thunks; the svc sites PatchSvc could not patch.
 std::unordered_map<u32, PatchedSite> patched_sites;
@@ -842,6 +834,19 @@ void FinishVfpThunk(Memory::MemorySystem& memory, AzaharContext& c) {
     ASSERT_MSG(it != vfp_thunks.begin(), "a thread at {:08X} in no VFP thunk", pc);
     const VfpThunk& t = (--it)->second;
     ASSERT_MSG(pc < t.end, "a thread at {:08X} past its VFP thunk", pc);
+    if (!t.thumb) {
+        // An ARM thunk keeps r0-r2 in its own words, and a thread inside runs on until it leaves.
+        if (pc <= t.mrs || pc == t.miss_original) {
+            c.r[15] = t.site;
+        } else if (pc == t.back || pc == t.miss_back) {
+            c.r[15] = t.site + 4;
+        } else {
+            UNREACHABLE_MSG("a thread at {:08X} inside the VFP thunk for {:08X}, which host 0 runs "
+                            "on until it leaves",
+                            pc, t.site);
+        }
+        return;
+    }
     const auto pop = [&] {
         c.r[0] = memory.Read32(c.r[13]);
         c.r[1] = memory.Read32(c.r[13] + 4);
@@ -895,36 +900,22 @@ void FinishVfpThunk(Memory::MemorySystem& memory, AzaharContext& c) {
 
 /// FinishVfpThunk's for an svc thunk: before its answer the thread stands at the site, after it
 /// past it.
-void FinishSvcThunk(Memory::MemorySystem& memory, AzaharContext& c) {
+void FinishSvcThunk(Memory::MemorySystem&, AzaharContext& c) {
     const u32 pc = c.r[15];
     auto it = svc_thunks.upper_bound(pc);
     ASSERT_MSG(it != svc_thunks.begin(), "a thread at {:08X} in no svc thunk", pc);
     const SvcThunk& t = (--it)->second;
     ASSERT_MSG(pc < t.end && (c.cpsr & 0x20) == 0, "a thread at {:08X} past its svc thunk", pc);
-    const auto pop = [&] {
-        c.r[2] = memory.Read32(c.r[13]);
-        c.r[3] = memory.Read32(c.r[13] + 4);
-        c.r[12] = memory.Read32(c.r[13] + 8);
-        c.r[14] = memory.Read32(c.r[13] + 12);
-        c.r[13] += 16;
-    };
-    const auto flags = [&] { c.cpsr = (c.cpsr & ~0xF8000000u) | (c.r[14] & 0xF8000000u); };
-    if (pc == it->first || pc == t.miss_svc || pc == t.idle_b || pc == t.answer) {
+    // The thunk keeps r2, r3, r12 and LR in its own words, and a thread inside runs on until it leaves.
+    if (pc <= t.mrs || pc == t.miss_svc || pc == t.idle_b ||
+        (t.answer != 0 && pc >= t.answer && pc <= t.answer_mrs)) {
         c.r[15] = t.site;
     } else if (pc == t.back || pc == t.miss_back) {
         c.r[15] = t.site + 4;
-    } else if (pc == t.pop || pc == t.miss_pop || pc == t.idle_pop || pc == t.answer_mrs) {
-        pop();
-        c.r[15] = pc == t.pop ? t.site + 4 : t.site;
     } else {
-        // Between the mrs and an msr (or the answer's mrs and its branch): the flags are in LR.
-        DEBUG_ASSERT_MSG(pc <= t.done || pc == t.miss || pc == t.idle || pc == t.answer_b,
-                         "a thread at {:08X} in svc thunk {:08X}", pc, it->first);
-        if (pc > t.mrs) {
-            flags();
-        }
-        pop();
-        c.r[15] = pc >= t.answered && pc <= t.done ? t.site + 4 : t.site;
+        UNREACHABLE_MSG("a thread at {:08X} inside the svc thunk for {:08X}, which host 0 runs on "
+                        "until it leaves",
+                        pc, t.site);
     }
 }
 
@@ -1608,6 +1599,16 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
     VfpThunk t{};
     t.site = pc;
     t.thumb = thumb;
+    // An ARM thunk keeps r0-r2 in its own words (never below the guest's SP); a Thumb one pushes them
+    // (ARMv6K's Thumb has no VFP).
+    if (!thumb) {
+        put32(0);
+        put32(0);
+        put32(0);
+    }
+    const u32 entry = at();
+    // STR (0xE50F0000) or LDR (0xE51F0000) of rk with its word, PC-relative.
+    const auto word_k = [&](u32 op, u32 k) { put32(op | k << 12 | (at() + 8 - (base + 4 * k))); };
     const auto put_back = [&] {
         if (thumb) {
             const auto b = ThumbBranchW(at(), back_to);
@@ -1638,7 +1639,9 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
             put_pair(ThumbImmOp(0xF1B2, 0xF, vector)); // cmp r2, #vector
         }
     } else {
-        put32(0xE92D0007);
+        for (u32 k = 0; k < 3; k++) {
+            word_k(0xE50F0000u, k); // str rk
+        }
         t.mrs = at();
         put32(0xE10F1000);
         put32(0xEEF12A10);
@@ -1660,7 +1663,7 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
         put32(elements[k]);
     }
     t.restore = at();
-    // vmrs r0, fpscr; orr r0, r0, r2; vmsr fpscr, r0; msr apsr_nzcvq, r1; pop {r0-r2}; b back
+    // vmrs r0, fpscr; orr r0, r0, r2; vmsr fpscr, r0; msr apsr_nzcvq, r1; r0-r2 back; b back
     put32(0xEEF10A10);
     if (thumb) {
         put16(0x4310); // orrs r0, r2 (the flags come back below)
@@ -1673,13 +1676,15 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
         put16(0xBC07);
     } else {
         put32(0xE128F001);
-        put32(0xE8BD0007);
+        for (u32 k = 0; k < 3; k++) {
+            word_k(0xE51F0000u, k); // ldr rk
+        }
     }
     t.back = at();
     if (!put_back()) {
         return false;
     }
-    // miss: msr apsr_nzcvq, r1; pop {r0-r2}; the original; b back
+    // miss: msr apsr_nzcvq, r1; r0-r2 back; the original; b back
     t.miss = at();
     if (thumb) {
         put_pair({0xF381, 0x8800});
@@ -1688,7 +1693,9 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
         put32(insn);
     } else {
         put32(0xE128F001);
-        put32(0xE8BD0007);
+        for (u32 k = 0; k < 3; k++) {
+            word_k(0xE51F0000u, k); // ldr rk
+        }
         t.miss_original = at();
         put32(al);
     }
@@ -1714,13 +1721,13 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
     std::array<u16, 2> site_hw{};
     u32 site_word = 0;
     if (thumb) {
-        const auto b = ThumbBranchW(pc, base);
+        const auto b = ThumbBranchW(pc, entry);
         if (!b) {
             return false;
         }
         site_hw = *b;
     } else {
-        const auto b = ArmBranch(insn >> 28, pc, base);
+        const auto b = ArmBranch(insn >> 28, pc, entry);
         if (!b) {
             return false;
         }
@@ -1730,8 +1737,8 @@ bool ARM_VitaNative::PatchVfpThunk(u32 pc, u32 insn, bool thumb) {
     std::memcpy(thunk_area->Data() + thunk_area_used, buf.data(), size);
     map->SyncCode(base, size);
     thunk_area_used += (size + 3) & ~3u;
-    vfp_thunks[base] = t;
-    ClaimThunk(*map, base, pc, insn, thumb, ClaimKind::Vfp);
+    vfp_thunks[entry] = t;
+    ClaimThunk(*map, entry, pc, insn, thumb, ClaimKind::Vfp);
     if (thumb) {
         memory.Write16(pc, site_hw[0]);
         memory.Write16(pc + 2, site_hw[1]);
@@ -1856,9 +1863,25 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
         branch_miss(NE);
     };
 
+    // The guest's r2, r3, r12 and LR: four words before the entry, stored and loaded PC-relative.
+    for (u32 k = 0; k < 4; k++) {
+        put(0);
+    }
+    const u32 entry = at();
+    constexpr std::array<u32, 4> SavedRegs{2, 3, 12, 14};
+    const auto save = [&] {
+        for (u32 k = 0; k < 4; k++) {
+            put(0xE50F0000u | SavedRegs[k] << 12 | (at() + 8 - (base + 4 * k))); // str
+        }
+    };
+    const auto restore = [&] {
+        for (u32 k = 0; k < 4; k++) {
+            put(0xE51F0000u | SavedRegs[k] << 12 | (at() + 8 - (base + 4 * k))); // ldr
+        }
+    };
     SvcThunk t{};
     t.site = pc;
-    put(0xE92D500Cu); // push {r2, r3, r12, lr}
+    save();
     t.mrs = at();
     put(0xE10FE000u); // mrs lr, apsr
     // GetSystemTick's counters' address (two movw/movt pairs) and its branch to the idle skip's
@@ -1869,12 +1892,12 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
     u32 to_done = 0;
     switch (kind) {
     case AZAHAR_FAST_TICK: {
-        // The call counted in its caller's slot (the guest's LR, pushed; CheckTickPolls reads
+        // The call counted in its caller's slot (the guest's LR, saved; CheckTickPolls reads
         // them); the caller that spins on the clock goes out to the idle skip.
         data_mov[0] = n;
         put(0);
         put(0);
-        put(ldr(3, 13, 12)); // the caller
+        put(0xE51F3000u | (at() + 8 - (base + 12))); // ldr r3, the guest's LR: the caller
         put(0xE203201Cu);    // and r2, r3, #0x1c: its slot's index times 4
         put(0xE08C2082u);    // add r2, r12, r2, lsl #1: its slot
         put(ldr(12, 2, 0));  // the slot's caller
@@ -1978,14 +2001,14 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
         t.answered = at();
         break;
     }
-    // msr apsr_nzcvq, lr; pop {r2, r3, r12, lr}; b back
+    // msr apsr_nzcvq, lr; r2, r3, r12 and LR back; b back
     t.done = at();
     if (to_done != 0) {
         buf[to_done] = ArmBranch(0xE, base + to_done * 4, t.done).value();
     }
     put(0xE128F00Eu);
     t.pop = at();
-    put(0xE8BD500Cu);
+    restore();
     const auto put_back = [&] {
         const auto b = ArmBranch(0xE, at(), pc + 4);
         if (b) {
@@ -1998,11 +2021,11 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
         svc_refused.insert(pc);
         return;
     }
-    // miss: msr apsr_nzcvq, lr; pop {r2, r3, r12, lr}; the svc, its inputs untouched; b back
+    // miss: msr apsr_nzcvq, lr; the four back; the svc, its inputs untouched; b back
     t.miss = at();
     put(0xE128F00Eu);
     t.miss_pop = at();
-    put(0xE8BD500Cu);
+    restore();
     t.miss_svc = at();
     put(0xEF000000u | number);
     t.miss_back = at();
@@ -2014,11 +2037,11 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
         t.idle = at();
         put(0xE128F00Eu); // msr apsr_nzcvq, lr
         t.idle_pop = at();
-        put(0xE8BD500Cu); // pop {r2, r3, r12, lr}
+        restore();
         t.idle_b = at();
         put(ArmBranch(0xE, t.idle_b, t.miss_svc).value());
         t.answer = at();
-        put(0xE92D500Cu); // push {r2, r3, r12, lr}
+        save();
         t.answer_mrs = at();
         put(0xE10FE000u); // mrs lr, apsr
         t.answer_b = at();
@@ -2039,7 +2062,7 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
         ASSERT(b.has_value());
         buf[word] = *b;
     }
-    const auto site = ArmBranch(cond, pc, base);
+    const auto site = ArmBranch(cond, pc, entry);
     if (!site) {
         svc_refused.insert(pc);
         return;
@@ -2048,11 +2071,11 @@ void ARM_VitaNative::PatchSvc(u32 pc) {
     std::memcpy(thunk_area->Data() + thunk_area_used, buf.data(), n * 4);
     map->SyncCode(base, n * 4);
     thunk_area_used += n * 4;
-    svc_thunks[base] = t;
+    svc_thunks[entry] = t;
     if (kind == AZAHAR_FAST_TICK) {
-        tick_thunks.push_back(TickThunk{base, pc, t.data});
+        tick_thunks.push_back(TickThunk{entry, pc, t.data});
     }
-    ClaimThunk(*map, base, pc, insn, false, ClaimKind::Svc);
+    ClaimThunk(*map, entry, pc, insn, false, ClaimKind::Svc);
     memory.Write32(pc, *site);
     map->SyncCode(pc, 4);
     patched_sites[pc] = PatchedSite{insn, false};
@@ -3028,8 +3051,8 @@ bool ARM_VitaNative::RunSlice(u64 quantum_ns) {
             quantum_ns = MinQuantumNs;
         }
     }
-    // A slice that ended inside an upcall runs the same thread on at once, a minimal quantum at a
-    // time, until it is back in its own code (RunSliceOnce sets upcall_again).
+    // A slice that ended inside an upcall or thunk runs the same thread on until it is back in its
+    // own code.
     for (;;) {
 #ifdef VITA_DIAGNOSTICS
         upcall_held = upcall_again;
@@ -3286,6 +3309,10 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         return !break_flag && !stop_requested;
 
     case AZAHAR_EXIT_TIMER:
+        // A thread in an svc or VFP thunk runs on until it leaves: the thunk's words hold its registers.
+        if (InThunkArea(run.ctx.r[15])) {
+            upcall_again = true;
+        }
         return false;
 
     case AZAHAR_EXIT_DABT: {

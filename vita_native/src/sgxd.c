@@ -109,6 +109,7 @@ int ksceKernelUnregisterSysEventHandler(SceUID uid);
 #define SGXD_GPU_INTR_CODE 0x41C8u    // data
 #define SGXD_GPU_DEVICE 0x41E0u       // data
 #define SGXD_INTR 0x34
+#define SGXD_GICD_ISACTIVER 0x1300u   // from PERIPHBASE: the distributor page, active bits by 32
 #define SGXD_LOWIO_PERVASIVE 0xE692C727u
 #define SGXD_GPU_POWER_ON 0x84EAB5BCu
 #define SGXD_GPU_POWER_OFF 0xE8656ADFu
@@ -393,12 +394,54 @@ static int sgxd_isr(int unk, void *ctx) {
     return -1;
 }
 
+// The interrupt disabled, then waited for until no core has it active. A core that has taken it
+// reads its handler's entry with interrupts on again and without the entry's lock (IntrMgr's
+// dispatch, 3.60's at text+0x4ac), while ksceKernelReleaseIntrHandler zeroes that entry under
+// the lock: a release then makes that core call address 0, a prefetch abort ThreadMgr's abort
+// handler answers by spinning with interrupts off, and every core stops at the next cross-core
+// call. The GIC keeps the interrupt active from its acknowledge to its end of interrupt, after
+// the handler has returned; disabled, it is not taken again. A second look after a pause covers
+// a core that took it as it was disabled. A wait that found it active says so.
+static void sgxd_intr_quiesce(const char *why) {
+    ksceKernelDisableIntr(SGXD_INTR);
+    if (!gic_va) {
+        gic_locate();
+    }
+    if (!gic_va || !gic_has_dist) {
+        SGXD_LOG("interrupt %u: no GIC distributor alias, its release not waited for\n", SGXD_INTR);
+        return;
+    }
+    volatile uint32_t *const active =
+        (volatile uint32_t *)(gic_va + SGXD_GICD_ISACTIVER + 4u * (SGXD_INTR / 32u));
+    const uint32_t bit = 1u << (SGXD_INTR % 32u);
+    const uint32_t t0 = ksceKernelGetSystemTimeLow();
+    int seen = 0;
+    for (int quiet = 0; quiet < 2;) {
+        if (*active & bit) {
+            quiet = 0;
+            seen = 1;
+            if (ksceKernelGetSystemTimeLow() - t0 > SGXD_POLL_US) {
+                SGXD_LOG("%s: interrupt %u still active after %u us\n", why, SGXD_INTR,
+                         SGXD_POLL_US);
+                return;
+            }
+        } else {
+            quiet++;
+        }
+        ksceKernelDelayThread(10);
+    }
+    if (seen) {
+        SGXD_LOG("%s: interrupt %u was active, its handler released %u us later\n", why,
+                 SGXD_INTR, ksceKernelGetSystemTimeLow() - t0);
+    }
+}
+
 // SceGpu's handler out, ours in; the interrupt enabled. SceGpu's suspend left it disabled.
 static int sgxd_isr_take(void) {
     if (sgxd_isr_ours) {
         return 0;
     }
-    ksceKernelDisableIntr(SGXD_INTR);
+    sgxd_intr_quiesce("take");
     int r = ksceKernelReleaseIntrHandler(SGXD_INTR);
     if (r < 0) {
         SGXD_LOG("release of SceGpuLisr: %08x\n", (uint32_t)r);
@@ -426,7 +469,7 @@ static void sgxd_isr_give_back(void) {
     }
     ksceKernelSpinlockLowUnlockCpuResumeIntr(&sgxd_isr_lock, st);
     if (sgxd_isr_ours) {
-        ksceKernelDisableIntr(SGXD_INTR);
+        sgxd_intr_quiesce("give back");
         ksceKernelReleaseIntrHandler(SGXD_INTR);
         const int r = ksceKernelRegisterIntrHandler(SGXD_INTR, "SceGpuLisr", 0, sgxd_gpu_lisr,
                                                     (void *)*sgxd_gpu_device, 0x50, 0xf, NULL);
@@ -470,23 +513,13 @@ static void sgxd_hand_back(void) {
 // block is uncached, so the GPU reads what the CPU wrote once a DSB has drained it.
 
 static int sgxd_mmu_alloc(void) {
-    SceKernelAllocMemBlockKernelOpt opt = {0};
-    opt.size = sizeof(opt);
-    opt.attr = 0x4;   // alignment given
-    opt.alignment = 0x1000;
-    sgxd_mmu_uid = ksceKernelAllocMemBlock("SceSgxdMmu", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW,
-                                           SGXD_MMU_SIZE, &opt);
-    if (sgxd_mmu_uid < 0) {
-        return sgxd_mmu_uid;
-    }
+    // The directory and its tables at sgxd_mmu_pa + offset: contiguous (phycont_alloc).
     void *base = NULL;
     uintptr_t pa = 0;
-    int r = ksceKernelGetMemBlockBase(sgxd_mmu_uid, &base);
-    if (r >= 0) {
-        r = ksceKernelVAtoPA(base, &pa);
-    }
-    if (r < 0) {
-        ksceKernelFreeMemBlock(sgxd_mmu_uid);
+    sgxd_mmu_uid = phycont_alloc("SceSgxdMmu", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW,
+                                 SGXD_MMU_SIZE, 0x1000, &base, &pa);
+    if (sgxd_mmu_uid < 0) {
+        const int r = sgxd_mmu_uid;
         sgxd_mmu_uid = -1;
         return r;
     }
