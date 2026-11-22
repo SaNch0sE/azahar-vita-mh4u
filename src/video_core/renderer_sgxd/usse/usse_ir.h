@@ -170,6 +170,8 @@ public:
     /// Sample2D from a texture of one level, point sampled both ways (b[1]): the result does not
     /// depend on the level, so its coordinates need no neighbouring instance (skip_invalid_auto).
     void Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc);
+    /// Op::Sample2D with three coordinates (u[2] = 3): Encoder::SampleCube.
+    void SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc);
     void Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words, uint8_t count,
                uint8_t drc);
     void Bitwise(BwOp op, Reg dst, IOp src1, IOp src2, Pred pred = Pred::None);

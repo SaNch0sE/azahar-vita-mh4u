@@ -232,8 +232,13 @@ public:
     /// null for the hardware's own level. Counter `drc` is what Wdf waits on.
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
                   bool nosched = false);
+    /// The same for a cube texture: the direction at coord.xyz, three 32-bit registers from a
+    /// pair boundary (CDIM 2, as psp2cgc encodes a dependent texCUBE), the hardware's level.
+    void SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, bool nosched = false);
 
 private:
+    /// Sample2D and SampleCube: `dims` coordinates (CDIM dims - 1).
+    void Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const Reg* lod, uint8_t drc);
     /// What FinishNosched needs of each word: the internal register components it reads
     /// and writes (bit = register * 4 + component) and where its nosched bit is (0: none).
     struct Meta {

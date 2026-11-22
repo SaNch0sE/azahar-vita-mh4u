@@ -367,7 +367,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     // uncached (calls, KiB).
                     static constexpr const char* site_names[] = {
                         "vertices",   "transfer before", "transfer after", "screens",
-                        "dma source", "dma destination", "other"};
+                        "dma source", "dma destination", "textures", "other"};
                     std::string sites;
                     for (u32 i = 0; i < static_cast<u32>(SgxdRenderer::CacheSite::Count); i++) {
                         const auto& s = c.sites[i];

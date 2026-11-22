@@ -26,10 +26,10 @@ namespace SgxdRenderer {
 
 namespace {
 constexpr u32 PageSize = 0x1000;
-// The CDRAM pool for moved FCRAM pages: a title's framebuffers (two top, two bottom, about 1 MiB
-// with libctru's), the vertex and index buffers its draws read, and their edge pages. A full
-// pool stops the emulator: FCRAM the GPU writes, reads and shows is never left cached.
-constexpr u32 PoolSize = 32 * 1024 * 1024;
+// The CDRAM pool for moved FCRAM pages; a frame can use about 8 MiB. It grows by GrowSize
+// blocks, CDRAM or uncached main memory, up to what azaharReback takes. Full with nothing to put
+// back stops the emulator: FCRAM the GPU writes, reads and shows is never left cached.
+constexpr u32 PoolSize = 8 * 1024 * 1024;
 constexpr u32 GrowSize = 1024 * 1024;
 constexpr u32 MaxPoolSize = 32 * 1024 * 1024;
 // A pool short of free pages puts back the pages no GPU use stamped for a second (at vblank).
@@ -46,6 +46,16 @@ GuestGpuMemory::GuestGpuMemory([[maybe_unused]] Memory::MemorySystem& memory) {
     vram = host;
     LOG_INFO(Render, "sgxd: guest VRAM {} mapped at GPU {:#010x}, {} KiB", fmt::ptr(host),
              static_cast<u32>(Memory::VRAM_PADDR), static_cast<u32>(Memory::VRAM_SIZE) >> 10);
+    // The filler past VRAM's end (PastVramBytes): the untile reads on into it.
+    alignas(0x1000) static u8 past_vram_block[PastVramBlock];
+    for (u32 at = 0; at < PastVramBytes; at += PastVramBlock) {
+        const u32 gpu = Memory::VRAM_PADDR + Memory::VRAM_SIZE + at;
+        const int past_ret = sgxdMap(gpu, past_vram_block, PastVramBlock, 0);
+        ASSERT_MSG(past_ret >= 0, "sgxd: the filler past guest VRAM was not mapped at GPU "
+                                  "{:#010x}: {:#010x}",
+                   gpu, static_cast<u32>(past_ret));
+    }
+    past_vram = true;
 
     // FCRAM is cached and the GPU does not snoop: cleaned before a kick reads it
     // (SgxdBackend::ReadsCached), except the pages moved to CDRAM.
@@ -117,6 +127,13 @@ GuestGpuMemory::~GuestGpuMemory() {
         const int ret = sgxdUnmap(Memory::VRAM_PADDR, Memory::VRAM_SIZE);
         if (ret < 0) {
             LOG_ERROR(Render, "sgxd: guest VRAM unmap failed: {:#010x}", static_cast<u32>(ret));
+        }
+    }
+    if (past_vram) {
+        const int ret = sgxdUnmap(Memory::VRAM_PADDR + Memory::VRAM_SIZE, PastVramBytes);
+        if (ret < 0) {
+            LOG_ERROR(Render, "sgxd: the filler past guest VRAM: unmap failed: {:#010x}",
+                      static_cast<u32>(ret));
         }
     }
     if (fcram != nullptr) {

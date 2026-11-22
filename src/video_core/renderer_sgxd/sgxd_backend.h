@@ -171,6 +171,60 @@ public:
         u32 bytes;
         u32 pack;
     };
+    /// Guest textures' host copies (RasterizerSgxd's texture cache), from a block of their own:
+    /// bytes at a 4 KiB multiple, the first fit of what FreeTexture gave back.
+    Data AllocTexture(u32 bytes);
+    void FreeTexture(const Data& texture, u32 bytes);
+    /// poolcheck (diagnostics): each page of the textures pool in use as the GPU reads it (a
+    /// PTLA copy to a probe page) against the CPU's view; logs the pages that differ.
+    void CheckTexturePool();
+
+    /// A PICA texture as the untile reads it: width x height texels (powers of two, 8 to
+    /// UntileSide) of bits each at gpu, in 8x8 tiles with Morton order inside, read through
+    /// the texture unit's format code and swizzle (docs/sgxd/tsp.md), and for P4
+    /// and P8 the palette's GPU address (64-byte aligned).
+    struct UntileSource {
+        u32 gpu;
+        u32 width, height;
+        u32 bits;
+        u32 code;
+        u32 swizzle;
+        u32 palette;
+        /// The copy a byte a texel, the texel's A (EXTMODE1 U8): QueueUntile's and UntileChain's
+        /// LINEAR chains of a one-channel format, read as U8 (RasterizerSgxd::TextureWords).
+        bool byte_copy = false;
+    };
+    static constexpr u32 UntileSide = 1024;
+    /// UntileSource::code for ETC1 (the texture unit's ETC1, whose blocks the untile reorders
+    /// first).
+    static constexpr u32 UntileEtc1 = 0x84;
+    /// UntileSource::code for ETC1A4, which the texture unit has no format for: ETC1 blocks
+    /// each after a 4-bit alpha block, joined with the alpha by a merge render.
+    static constexpr u32 UntileEtc1A4 = 0x184;
+    /**
+     * Untiles source into dest, a linear A8B8G8R8 image (R the lowest byte) with rows
+     * dest_stride texels apart, in the PICA's row order: row 0 is the texture's t = 1, and the
+     * fragment programs read at (s, 1 - t), since an ETC1 block cannot be flipped by moving
+     * it. A render of its own under a recipe no pass uses, queued ahead of the open pass's
+     * render, whose draws are not kicked yet.
+     *
+     * The tiled bytes read as a SWIZZLED texture 8 texels wide are the PICA's tiles stacked,
+     * each transposed (SWIZZLED is Morton with y in bit 0): SGX texel (sx, sy) is tile sy / 8,
+     * PICA x = sy % 8, y = sx. One quad per tile row samples it point for pixel through the
+     * screen program (the texel converted to half4, packed to U8888), in bands of at most 4096
+     * SWIZZLED rows, the texture unit's largest side.
+     *
+     * dest_stride is a multiple of 32, or the width when that is under 32 (a LINEAR mip
+     * level's rows, max(w, 8) texels apart: docs/sgxd/tsp.md), where 32 / w rows share
+     * each 32-pixel PBE row. The PBE writes every tile a quad touches whole: dest takes
+     * max(rows, 32) of max(dest_stride, 32) texels, rows the image's or, packed, h * w / 32.
+     * Past the image that is scratch a later untile may write over.
+     *
+     * swizzled: dest is a square SWIZZLED texture instead (a cube face), written through the
+     * PBE's TWIDDLED layout; dest_stride is unused. The whole tiles take max(w, 32)^2 texels.
+     */
+    void Untile(const UntileSource& source, u32 dest_gpu, u32 dest_stride, bool swizzled = false);
+
     SgxdRecipeDrawPrograms BlitPrograms(const Data& source, u32 width, u32 height);
     void Blit(const Data& source, u32 width, u32 height, const Store& dest, u32* ta_us = nullptr,
               u32* d3_us = nullptr);
@@ -187,13 +241,38 @@ private:
         u32 width{}, height{};
         u32 bg_offset{};  // the background colour word and its SA secondary, after the layout
         u32 code_begin{}; // the code heap's copy, from the block's start
+        bool side{};      // the untile's, which no pass shares
     };
     /// A size's instances at most: a render's recipe is the GPU's until its 3D completes, and
     /// the CPU writes the next render's into another.
     static constexpr u32 MaxInstances = 4;
 
-    /// The recipe for a width x height target, made at its first use.
-    Recipe& RecipeFor(u32 width, u32 height);
+    /// The recipe for a width x height target, made at its first use; side: the untile's.
+    Recipe& RecipeFor(u32 width, u32 height, bool side = false);
+    void RenderSync(Recipe& r, u32* ta_us, u32* d3_us);
+    void RenderAsync(Recipe& r, const u32 touches[6]);
+    void PlaceFixedPrograms();
+    /// One draw of a side render: its texture, whether the texel is converted (the screen
+    /// program) or copied raw (the blit's), and its vertices. A merge render's draws read
+    /// tex and tex1 raw and write their AND.
+    struct SideDraw {
+        u32 tex[4];
+        bool converted;
+        u32 first, count;
+        u32 tex1[4];
+    };
+    /// A render of its own under the side recipe, sent ahead of the open pass's:
+    /// the blit's quads in vertices (PutQuad) into a width x height U8888 target at dest_gpu,
+    /// rows dest_stride pixels apart, clipped to its tiles. With merge, the quads are
+    /// PutMergeQuad's, with a coordinate for each texture. With twiddled, the target is
+    /// stored in the PBE's TWIDDLED layout.
+    void SideRender(const Data& vertices, std::span<const SideDraw> list, u32 dest_gpu,
+                    u32 dest_stride, u32 width, u32 height, bool merge = false,
+                    bool twiddled = false);
+    void UntileEtc1Blocks(const UntileSource& source, u32 dest_gpu, u32 dest_stride,
+                          bool swizzled);
+    void UntileEtc1A4Merge(const UntileSource& source, u32 colour_gpu, u32 colour_stride,
+                           u32 dest_gpu, u32 dest_stride, bool swizzled);
     /// The recipe's target, and the pass state reset.
     void OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 clear, float depth);
 
@@ -209,6 +288,22 @@ private:
     u32 surfaces_spilled{}; ///< surfaces the block had no room for (AllocSurface), for its log
     u32 surfaces_used{};
     int surfaces_block{-1};
+    u8* textures{};    // the guest textures' host copies
+    u32 textures_used{};
+    int textures_block{-1};
+    struct FreeRange {
+        u32 offset, bytes;
+        /// The textures' pools: FenceAll when the range was given back, the work that may still
+        /// sample or write it (AllocTexture's `ready`); merged ranges keep the newer.
+        u32 fence = 0;
+    };
+    std::vector<FreeRange> textures_free;
+    /// An untile's vertices by its geometry (GeometryKey): a texture of a size seen before reuses
+    /// them. In the textures pool: ETC1 uploads inside a pass filled the pass data.
+    std::unordered_map<u64, Data> geometry_vertices;
+    /// The cached vertices for key, or `bytes` of new ones with fresh set for the caller to
+    /// fill.
+    Data GeometryVertices(u64 key, u32 bytes, bool& fresh);
 
     std::vector<u16> identity;
     std::vector<SgxdRecipeDraw> init_draws;
@@ -246,9 +341,13 @@ private:
     std::vector<Store> stores;   // guest memory the open pass writes
     u32 passes{};
 
-    // The blit's programs (DOUTU word 0s), placed at its first use.
     bool blit_ready{};
-    u32 blit_vertex{}, blit_fragment{};
+    u32 blit_vertex{}, blit_fragment{}, untile_fragment{}, merge_vertex{}, merge_fragment{};
+    std::vector<SgxdRecipeDraw> untile_draws;
+    std::vector<SgxdRecipeDrawPrograms> untile_programs;
+    // ETC1A4's alpha palette for the merge: entry n is 17n in alpha over white (the AND keeps
+    // the colour), from the texture block at the first ETC1A4.
+    Data merge_palette{};
 };
 
 } // namespace SgxdRenderer

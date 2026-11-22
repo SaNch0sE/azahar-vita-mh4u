@@ -43,14 +43,13 @@ typedef struct SgxdPtlaFill {
     uint32_t colour;
 } SgxdPtlaFill;
 
-// A copy between two strided surfaces of the same format and stride: `rows` whole rows of
-// `width` pixels, then `tail` pixels at the start of the next row, from src to dst, both at
-// (0, 0) of their surface. Both surfaces must be one the PTLA reads through its directory.
+// A copy between two strided surfaces of the same format: `rows` whole rows of `width` pixels,
 typedef struct SgxdPtlaCopy {
     uint32_t src, dst;
     uint32_t format;
     uint32_t stride;
     uint32_t width, rows, tail;
+    uint32_t dst_stride;
 } SgxdPtlaCopy;
 
 // Without events: runs the fill and waits for it: the SLC flushed and invalidated, each

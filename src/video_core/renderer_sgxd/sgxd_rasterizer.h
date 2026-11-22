@@ -8,6 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include "video_core/pica/regs_texturing.h"
 #include "video_core/rasterizer_accelerated.h"
 #include "video_core/renderer_gxm/guest_gpu_memory.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
@@ -23,6 +24,9 @@ class MemorySystem;
 }
 
 namespace GxmRenderer {
+
+/// The fixed palettes that expand a 4-bit format's index for the untile (P4 and P8).
+enum class TexturePalette : u32 { None, A4, I4, IA4 };
 
 /**
  * The PICA on the SGX through sgxd. There is no CPU fallback: every operation either runs on
@@ -55,6 +59,11 @@ public:
     void FlushAndInvalidateRegion(PAddr addr, u32 size) override;
     void ClearAll(bool flush) override;
     bool AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) override;
+    /// The HLE wrote a texture page (RenderThread's GuestWrote, Y2R's picture): the textures
+    /// over it are untiled again at their next use.
+    void GuestWrote(PAddr page) {
+        TexturesWritten(page, page + 0x1000);
+    }
     bool AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) override;
     bool AccelerateFill(const Pica::MemoryFillConfig& config) override;
     bool AccelerateDma(PAddr src, PAddr dst, u32 size) override;
@@ -106,6 +115,28 @@ private:
         u32 passes;
     };
 
+    /// A guest texture's host copy, untiled on the GPU into A8B8G8R8, rows in the PICA's order (row 0
+    /// is t = 1): a LINEAR chain of the levels, each level's rows its width apart.
+    struct Texture {
+        PAddr addr;
+        u32 width;
+        u32 height;
+        Pica::TexturingRegs::TextureFormat format;
+        SgxdBackend::Data memory;
+        u32 bytes;        // of memory
+        u32 levels;       // the chain's, 1 to the PICA's max_level + 1
+        u32 parts;        // 1, or a cube's 6 faces (SWIZZLED squares, one level)
+        std::array<PAddr, 6> part_addr; // the guest's, in the host copy's order
+        u32 part_bytes;   // a part's guest bytes: the levels back to back, or a face
+        u32 untiled_pass; // the pass that last untiled it (cached FCRAM: each that samples it)
+        bool dirty;       // a fill, DMA or transfer wrote over the guest bytes
+        /// A byte copy's U8 swizzle: 6 for A8 and A4 (alpha), 5 for I8 and I4 (intensity); 0 for
+        /// A8B8G8R8.
+        u8 byte_swizzle = 0;
+#ifdef VITA_DIAGNOSTICS
+#endif
+    };
+
     /// A vertex program placed in the code heap, for one PICA program and draw shape.
     struct VertexProgram {
         Usse::GxpProgram gxp;
@@ -150,6 +181,16 @@ private:
     const VertexProgram& VertexProgramFor(u16 default_regs,
                                           const std::array<u8, 16>& reg_components, u16 u8_regs);
     const FragmentProgram& FragmentProgramFor(u64 blend);
+    /// The host copy of texture unit `unit`'s texture for the open pass, untiled when it is
+    /// new or the guest's bytes changed: cached FCRAM by its hash, compared once a pass;
+    /// uncached memory (VRAM, FCRAM moved to CDRAM) when a GPU operation wrote over it.
+    const Texture& TextureFor(u32 unit);
+    /// The GPU address of a fixed palette for a 4-bit format (0 for none), written at the first use.
+    u32 PaletteFor(TexturePalette palette);
+    /// The sampler's four state words for unit `unit`'s texture.
+    void TextureWords(u32 unit, u32 words[4]);
+    /// Marks the textures over [start, end) to be untiled again.
+    void TexturesWritten(PAddr start, PAddr end);
     /// The lighting and fog LUTs the guest changed into fresh rows, fs_data's offsets pointed at them.
     void SyncLutLf();
     /// The same for the proctex colour map, alpha map, colour and colour-difference tables.
@@ -166,6 +207,8 @@ private:
     u32 clear_count{};
     u32 clear_order{};
     std::vector<Surface> surfaces;
+    std::vector<Texture> textures;
+    SgxdBackend::Data palettes{};
     std::unordered_map<u64, VertexProgram> vertex_programs;
     std::unordered_map<u64, u16> used_bools;
     std::unordered_map<u64, FragmentProgram> fragment_programs;
@@ -212,6 +255,7 @@ private:
 #ifdef VITA_DIAGNOSTICS
     u32 transfers{}; ///< perflog's progress lines and vprof's transfer numbers
 #endif
+    u32 untiles{};
     u32 p3ds{};
 #ifdef VITA_DIAGNOSTICS
     /// perflog's `perf: textures` line (LogTextureStats), and the 8-bit index lists widened since the
@@ -222,11 +266,7 @@ private:
         u64 cycles{};
     } widen_stats;
     struct TextureStats {
-        u32 checks{};         ///< hashes of a cached FCRAM texture's guest bytes
-        u32 changed{};        ///< checks of a known texture that found new bytes
-        u64 hashed_bytes{};
-        u64 hash_us{};
-        u32 untiles{};        ///< textures untiled: new, written by a GPU op, or changed
+        u32 untiles{};        ///< textures untiled: new, written by a GPU op, or cached FCRAM
         u64 untiled_bytes{};  ///< their guest bytes
         u32 null_samples{};   ///< samplers of a unit that is off (NullTexture)
         u32 tiny{};           ///< untiles of a texture with a side under 8 (UntileTiny)

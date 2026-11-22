@@ -54,6 +54,13 @@ namespace GxmRenderer {
  *             opt in to hoisting vertex uniform loads into the secondary program
  *
  * Debugging a pass on the console:
+ *   dumpat=N  check transfers N and N + 1 (counted from 1) against their surfaces and write
+ *             them as azahar-transfer-N.ppm: dumpat=1 for the first frames, a late N for one
+ *             the second tier drew, for comparing runs. Off, no transfer is checked or
+ *             written. Each host0 write holds the emulation about 2 s, so pick N that
+ *             comes well before the run ends, or the file is cut short
+ *   dumptex   write the first eight untiled textures to host0, each level: the guest's bytes
+ *             and the host copy, azahar-texN-ADDR-WxH-fFORMAT-sSTRIDE-{guest,host}.bin
  *
  *   noload    a pass that would load its colour buffer's picture (BeginPassLoaded) starts from
  *             a clear instead; nozload: a pass's depth is not loaded (still stored): what the

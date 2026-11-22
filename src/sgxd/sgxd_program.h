@@ -85,6 +85,19 @@ int sgxd_program_blit_pixel_pds(uint32_t doutu0, const uint32_t tex[4], SgxdPdsP
 unsigned sgxd_program_screen_fragment(uint64_t words[4]);
 int sgxd_program_screen_pixel_pds(uint32_t doutu0, const uint32_t tex[4], SgxdPdsProgram *out);
 
+// Two textures joined per pixel (azahar's ETC1A4 untile): the blit's vertex with a second
+// texture coordinate after the first, twelve words (the position, a colour, TC0, TC1;
+// OUTSELECTS VTXSIZE 12, TEXSIZE TC0 and TC1 two-dimensional), and a pixel primary that reads
+// both textures unconverted, tex0's texel into pa4 and tex1's into pa5: per texture its DOUTI
+// issue (TC0, then TC1 as the last issue) and its DOUTT. The fragment program
+// is the caller's. The PA count stays SGXD_PROGRAM_BLIT_PA.
+#define SGXD_PROGRAM_MERGE_VERTEX_WORDS 12u
+#define SGXD_PROGRAM_MERGE_OUTSELECTS (12u << 24 | 0x1000u | 0x800u)
+#define SGXD_PROGRAM_MERGE_TEXSIZE (1u | 1u << 3)
+unsigned sgxd_program_merge_vertex(uint64_t words[4]);
+int sgxd_program_merge_pixel_pds(uint32_t doutu0, const uint32_t tex0[4], const uint32_t tex1[4],
+                                 SgxdPdsProgram *out);
+
 // State word 8 and the VDM index list's words 2, 4 and 5 (libgxm's CalculatePixelDMSInfo and
 // vertex DMS).
 uint32_t sgxd_program_pixel_dms(unsigned pa, unsigned temps, unsigned sa);

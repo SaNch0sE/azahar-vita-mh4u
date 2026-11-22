@@ -415,6 +415,7 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
                                    SGXD_RECIPE_PACK_U888_RGB};
     u32 ta_us = 0, d3_us = 0;
     backend.Blit(source->memory, width, height, store, &ta_us, &d3_us);
+    TexturesWritten(output, output + bytes);
     // Progress: a line every 30 transfers.
     if (transfers > 0 && transfers % 30 == 0) {
         const SgxdEvents& ev = backend.Events();
@@ -540,13 +541,21 @@ u64 RasterizerSgxd::GpuWaitUs() const {
 #endif
 
 bool RasterizerGxm::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
-    UNREACHABLE_MSG("GXM: AccelerateTextureCopy from {:#x} to {:#x}, {} bytes, input "
-                    "width {} gap {}, output width {} gap {}",
-                    config.GetPhysicalInputAddress(), config.GetPhysicalOutputAddress(),
-                    config.texture_copy.size, config.texture_copy.input_width.Value(),
-                    config.texture_copy.input_gap.Value(),
-                    config.texture_copy.output_width.Value(),
-                    config.texture_copy.output_gap.Value());
+    // Lines of input_width bytes input_gap apart into lines of output_width output_gap apart (16-byte
+    // units); alike on both sides, or with no gaps, one contiguous copy.
+    const auto& tc = config.texture_copy;
+    const u32 in_width = tc.input_width * 16, in_gap = tc.input_gap * 16;
+    const u32 out_width = tc.output_width * 16, out_gap = tc.output_gap * 16;
+    const PAddr src = config.GetPhysicalInputAddress(), dst = config.GetPhysicalOutputAddress();
+    if (in_gap == 0 && out_gap == 0) {
+        return AccelerateDma(src, dst, tc.size);
+    }
+    DEBUG_ASSERT_MSG(in_width == out_width && in_width != 0 && tc.size % in_width == 0,
+                     "sgxd: AccelerateTextureCopy from {:#x} to {:#x}, {} bytes, input width {} "
+                     "gap {}, output width {} gap {}: lines of two widths are not built",
+                     src, dst, tc.size, in_width, in_gap, out_width, out_gap);
+    return CopyLines(src, in_width + in_gap, dst, out_width + out_gap, in_width,
+                     tc.size / in_width);
 }
 
 bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
@@ -598,6 +607,7 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
     [[maybe_unused]] const int filled = sgxd_ptla_fill(&fill, &elapsed_us, failed, sizeof(failed));
     DEBUG_ASSERT_MSG(filled == 0, "sgxd: AccelerateFill {}: {}", describe(), failed);
     RecordClear({start, end, value, bytes, 0});
+    TexturesWritten(start, end);
 
     // The first fills are logged with what the guest's view of VRAM holds at both ends.
     if (fills++ < 4) {
@@ -612,21 +622,60 @@ bool RasterizerGxm::AccelerateFill(const Pica::MemoryFillConfig& config) {
 }
 
 bool RasterizerSgxd::AccelerateDma(PAddr src, PAddr dst, u32 size) {
+#ifdef VITA_DIAGNOSTICS
+    static const bool xfer_log = SgxdFlag("xferlog");
+    if (xfer_log) {
+        LOG_INFO(Render, "xferlog: dma {:#x} to {:#x}, {} bytes", src, dst, size);
+    }
+#endif
+    return CopyLines(src, size, dst, size, size, 1);
+}
+
+void RasterizerSgxd::MoveWaits() {
+    if (backend.RetirePending()) {
+        backend.RetireAll("a page move after a DMA's cache work");
+    }
+}
+
+void RasterizerSgxd::KeepUncached(PAddr addr, u32 size) {
+    if (guest_memory.WouldMove(addr, size)) {
+        guest_memory.MakeUncached(addr, size, false);
+    }
+}
+
+u32 RasterizerSgxd::RemapMoved(const u32* pte_va, const u32* pte, u32 count) {
+    // A page move's or return's: the GPU onto the pages the CPU's views have now, after the work
+    // queued before. Nothing else changes.
+    backend.RemapPages(pte_va, pte, count);
+    return backend.FenceAll();
+}
+
+bool RasterizerSgxd::CopyLines(PAddr src, u32 src_stride, PAddr dst, u32 dst_stride, u32 line,
+                              u32 lines) {
     FlushImmediate();
-    const auto describe = [&] { return fmt::format("{:#x} to {:#x}, {} bytes", src, dst, size); };
+    // The spans the lines lie in; one line (a DMA) is a plain copy.
+    const bool strided = lines > 1 && (src_stride != line || dst_stride != line);
+    const u32 size = strided ? src_stride * (lines - 1) + line : line * lines;
+    const u32 dst_size = strided ? dst_stride * (lines - 1) + line : size;
+    const auto describe = [&] {
+        return strided ? fmt::format("{:#x} to {:#x}, {} lines of {} bytes, {} and {} apart", src,
+                                     dst, lines, line, src_stride, dst_stride)
+                       : fmt::format("{:#x} to {:#x}, {} bytes", src, dst, size);
+    };
     const auto inside = [](PAddr addr, u32 bytes, PAddr base, u32 region) {
         return addr >= base && addr - base + u64{bytes} <= region;
     };
     const bool src_fcram = inside(src, size, Memory::FCRAM_PADDR, Memory::FCRAM_SIZE);
-    const bool dst_fcram = inside(dst, size, Memory::FCRAM_PADDR, Memory::FCRAM_SIZE);
+    const bool dst_fcram = inside(dst, dst_size, Memory::FCRAM_PADDR, Memory::FCRAM_SIZE);
     DEBUG_ASSERT_MSG(src % 4 == 0 && dst % 4 == 0 && size % 4 == 0 && size > 0,
                      "GXM: AccelerateDma {}: only whole words are copied on the GPU", describe());
-    DEBUG_ASSERT_MSG((src_fcram || inside(src, size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)) &&
-                         (dst_fcram || inside(dst, size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)),
-                     "sgxd: AccelerateDma {}: outside the mapped guest memory", describe());
+    // A range past guest FCRAM or VRAM reaches whatever the GPU has mapped after it.
+    ASSERT_MSG((src_fcram || inside(src, size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)) &&
+                   (dst_fcram || inside(dst, dst_size, Memory::VRAM_PADDR, Memory::VRAM_SIZE)),
+               "sgxd: AccelerateDma {}: outside the mapped guest memory", describe());
 
     // A copy over the open pass's buffers comes after its draws: the pass renders first.
-    const PAddr end = dst + size;
+    const PAddr end = dst + dst_size;
     if (backend.InPass()) {
         const Surface& s = surfaces[pass_surface];
         const PAddr colour_end = s.addr + s.width * s.height * 4;
@@ -636,12 +685,26 @@ bool RasterizerSgxd::AccelerateDma(PAddr src, PAddr dst, u32 size) {
             EndPass("a DMA over its buffers");
         }
     }
+    // A source a pass drew is in its surface: guest memory takes it first (SyncRange), the
+    // open pass ended first if it draws there.
+    const bool drawn_source = std::any_of(surfaces.begin(), surfaces.end(), [&](const Surface& o) {
+        return o.passes > 0 && !o.guest_newer && o.addr < src + size && src < o.End();
+    });
+    if (drawn_source) {
+        if (backend.InPass() && surfaces[pass_surface].addr < src + size &&
+            src < surfaces[pass_surface].End()) {
+            EndPass("a DMA from its colour buffer");
+        }
+        sync_reason = "dma source";
+        SyncRange(src, src + size);
+    }
     ForgetClears(dst, end);
+    TexturesWritten(dst, end);
 
     // Guest FCRAM is cached for the CPU (but the pages moved to CDRAM): the source is cleaned before
     // the PTLA reads it, the destination's lines leave the cache before and after.
     const bool src_cached = src_fcram && !guest_memory.IsUncached(src, size);
-    const bool dst_cached = dst_fcram && !guest_memory.IsUncached(dst, size);
+    const bool dst_cached = dst_fcram && !guest_memory.IsUncached(dst, dst_size);
     u8* const dst_cpu = memory.GetPhysicalPointer(dst);
     if (src_cached) {
         SgxdCacheRange(memory.GetPhysicalPointer(src), size, SGXD_CACHE_CLEAN,
@@ -650,17 +713,19 @@ bool RasterizerSgxd::AccelerateDma(PAddr src, PAddr dst, u32 size) {
         SgxdCacheSkipped(CacheSite::DmaSource, size);
     }
     if (dst_cached) {
-        SgxdCacheRange(dst_cpu, size, SGXD_CACHE_CLEAN_INVALIDATE, CacheSite::DmaDest);
+        SgxdCacheRange(dst_cpu, dst_size, SGXD_CACHE_CLEAN_INVALIDATE, CacheSite::DmaDest);
     } else if (dst_fcram) {
-        SgxdCacheSkipped(CacheSite::DmaDest, size);
+        SgxdCacheSkipped(CacheSite::DmaDest, dst_size);
     }
 
-    // As rows of 4096 words (16 KiB, under the PTLA's 64 KiB stride) and a last partial row,
-    // at their PICA addresses, which are their GPU addresses.
+    // As rows of 4096 words (under the PTLA's 64 KiB stride) and a last partial row; strided lines a
+    // row each.
     constexpr u32 RowPixels = 4096;
-    const u32 pixels = size / 4;
-    const SgxdPtlaCopy copy{
-        src, dst, SGXD_PTLA_8888, RowPixels * 4, RowPixels, pixels / RowPixels, pixels % RowPixels};
+    const u32 pixels = strided ? line / 4 * lines : size / 4;
+    const SgxdPtlaCopy copy =
+        strided ? SgxdPtlaCopy{src, dst, SGXD_PTLA_8888, src_stride, line / 4, lines, 0, dst_stride}
+                : SgxdPtlaCopy{src, dst, SGXD_PTLA_8888, RowPixels * 4, RowPixels,
+                               pixels / RowPixels, pixels % RowPixels, 0};
     char failed[160];
     u32 elapsed_us = 0;
     [[maybe_unused]] const int copied = sgxd_ptla_copy(&copy, &elapsed_us, failed, sizeof(failed));
@@ -670,7 +735,7 @@ bool RasterizerSgxd::AccelerateDma(PAddr src, PAddr dst, u32 size) {
         // completes here first.
         [[maybe_unused]] const int idle = sgxd_gpu_idle();
         DEBUG_ASSERT_MSG(idle == 0, "GXM: AccelerateDma {}: the PTLA never completed", describe());
-        SgxdCacheRange(dst_cpu, size, SGXD_CACHE_CLEAN_INVALIDATE, CacheSite::DmaDest);
+        SgxdCacheRange(dst_cpu, dst_size, SGXD_CACHE_CLEAN_INVALIDATE, CacheSite::DmaDest);
     }
     if (dmas++ < 4) {
         LOG_INFO(Render, "DMA {}: {} ({} to {}) in {} us", dmas, describe(),
@@ -734,6 +799,446 @@ RasterizerGxm::Surface& RasterizerGxm::SurfaceFor(PAddr addr, u32 width, u32 hei
     return surfaces.back();
 }
 
+namespace {
+
+/// How the untile reads a PICA texture format: the texture unit's format code and swizzle
+/// that give its channels as the PICA does (docs/sgxd/tsp.md), its bits a
+/// texel, and for the 4-bit formats and IA4 the palette that expands the index (P4, P8).
+/// Code 0xff: not built.
+struct UntileFormat {
+    u32 code;
+    u32 swizzle;
+    u32 bits;
+    TexturePalette palette = TexturePalette::None;
+};
+
+UntileFormat UntileFormatFor(Pica::TexturingRegs::TextureFormat format) {
+    using F = Pica::TexturingRegs::TextureFormat;
+    switch (format) {
+    case F::RGBA8: // bytes A, B, G, R: U8U8U8U8 mirrored (RGBA)
+        return {0x0c, 2, 32};
+    case F::RGB8: // bytes B, G, R: U8U8U8 with red and blue swapped
+        return {0x98, 1, 24};
+    case F::RGB5A1: // R 15:11, G 10:6, B 5:1, A 0: U1U5U5U5 mirrored
+        return {0x04, 2, 16};
+    case F::RGB565: // R 15:11, G 10:5, B 4:0: U5U6U5 with red and blue swapped
+        return {0x05, 1, 16};
+    case F::RGBA4: // R 15:12 .. A 3:0: U4U4U4U4 mirrored
+        return {0x02, 2, 16};
+    case F::IA8: // byte 0 alpha, byte 1 intensity: U8U8 as RGGG
+        return {0x07, 3, 16};
+    case F::I8: // U8 as 1RRR
+        return {0x00, 5, 8};
+    case F::A8: // U8 as R000
+        return {0x00, 6, 8};
+    // The 4-bit formats: a nibble a texel, the low one first (upstream's texture_decode.cpp);
+    // IA4 a byte, intensity in the high nibble.
+    case F::IA4:
+        return {0x95, 0, 8, TexturePalette::IA4};
+    case F::I4:
+        return {0x94, 0, 4, TexturePalette::I4};
+    case F::A4:
+        return {0x94, 0, 4, TexturePalette::A4};
+    case F::ETC1: // the texture unit's ETC1 once its blocks are reordered (Untile)
+        return {SgxdBackend::UntileEtc1, 0, 4};
+    case F::ETC1A4: // its colour as ETC1's, the alpha joined by a merge render (Untile)
+        return {SgxdBackend::UntileEtc1A4, 0, 8};
+    default:
+        return {0xff, 0, 0};
+    }
+}
+
+/// A PICA wrap mode as DOUTT0's address mode (0 REPEAT, 1 MIRROR, 2 CLAMP). The border modes clamp
+/// and the fragment program puts the border colour past [0, 1].
+u32 AddressMode(Pica::TexturingRegs::TextureConfig::WrapMode mode) {
+    using W = Pica::TexturingRegs::TextureConfig::WrapMode;
+    switch (mode) {
+    case W::ClampToEdge:
+    case W::ClampToBorder:
+        return 2;
+    case W::Repeat:
+    case W::Repeat2:
+    case W::Repeat3:
+        return 0;
+    case W::MirroredRepeat:
+        return 1;
+    default:
+        UNREACHABLE_MSG("sgxd: texture wrap mode {} is not built", static_cast<u32>(mode));
+    }
+}
+
+} // namespace
+
+const RasterizerSgxd::Texture& RasterizerSgxd::TextureFor(u32 unit) {
+    using TextureConfig = Pica::TexturingRegs::TextureConfig;
+    const auto t = regs.texturing.GetTextures()[unit];
+    const auto& c = t.config;
+    const PAddr addr = c.GetPhysicalAddress();
+    const u32 width = c.width, height = c.height;
+    const UntileFormat f = UntileFormatFor(t.format);
+    DEBUG_ASSERT_MSG(f.code != 0xff, "sgxd: texture unit {} at {:#x}, {}x{}: format {} is not built",
+                     unit, addr, width, height, static_cast<u32>(t.format));
+    const bool cube = unit == 0 && c.type == TextureConfig::TextureCube;
+    // The levels upstream's cache builds (MipLevels): down to a side of 8, a whole 8x8 tile.
+    u32 levels = 1;
+    while (levels <= c.lod.max_level && width >> levels >= 8 && height >> levels >= 8) {
+        levels++;
+    }
+    DEBUG_ASSERT_MSG(!cube || (levels == 1 && width == height),
+                     "GXM: a {}x{} cube texture of {} levels is not built", width, height, levels);
+    // The guest's parts: a 2D texture's levels, which follow each other, or a cube's six
+    // faces, each at its own address. The host cube's slots are the SGX's +X, -X, +Y, -Y, +Z,
+    // -Z with the PICA's +Y and -Y swapped: the fragment program reads at (u, -v, w), which
+    // flips t on every face (FragmentEmitter::SampleTextures).
+    std::array<PAddr, 6> part_addr{addr};
+    const u32 parts = cube ? 6 : 1;
+    if (cube) {
+        using Face = Pica::TexturingRegs::CubeFace;
+        static constexpr Face slots[6] = {Face::PositiveX, Face::NegativeX, Face::NegativeY,
+                                          Face::PositiveY, Face::PositiveZ, Face::NegativeZ};
+        for (u32 k = 0; k < 6; k++) {
+            part_addr[k] = regs.texturing.GetCubePhysicalAddress(slots[k]);
+        }
+    }
+    u32 bytes = 0;
+    for (u32 l = 0; l < levels; l++) {
+        bytes += (width >> l) * (height >> l) * f.bits / 8;
+    }
+    for (const Surface& s : surfaces) {
+        for (u32 k = 0; k < parts; k++) {
+            DEBUG_ASSERT_MSG(part_addr[k] >= s.addr + s.width * s.height * 4 ||
+                                 s.addr >= part_addr[k] + bytes,
+                             "GXM: texture unit {} at {:#x} reads the colour buffer at {:#x}: "
+                             "rendering to a texture is not built",
+                             unit, part_addr[k], s.addr);
+        }
+    }
+    auto it = std::find_if(textures.begin(), textures.end(),
+                           [addr](const Texture& e) { return e.addr == addr; });
+    if (it != textures.end() &&
+        (it->width != width || it->height != height || it->format != t.format ||
+         it->levels != levels || it->parts != parts || it->part_addr != part_addr)) {
+        backend.FreeTexture(it->memory, it->bytes);
+        textures.erase(it);
+        it = textures.end();
+    }
+    // A texture in FCRAM is untiled again in each pass that samples it: the guest's CPU writes
+    // there leave no mark, and nothing compares the bytes. Its pages are in CDRAM by now
+    // (RenderThread::KeepTargetUncached), so the GPU reads what the guest wrote with no clean.
+    // Guest VRAM changes only through the GPU operations that mark its textures dirty.
+    const bool fcram = addr >= Memory::FCRAM_PADDR;
+    if (it != textures.end()) {
+        if (!it->dirty && (!fcram || it->untiled_pass == passes)) {
+            return *it;
+        }
+    } else {
+        // The PBE writes whole 32-pixel tiles: a level's untile writes up to 32 rows of at
+        // least 32 texels (SgxdBackend::Untile), past the chain's end for the last levels; a
+        // cube face max(w, 32)^2 texels.
+        u32 host_bytes = 0;
+        if (cube) {
+            host_bytes = 5 * width * width * 4 + std::max(width, 32u) * std::max(width, 32u) * 4;
+        }
+        for (u32 l = 0, offset = 0; !cube && l < levels; l++) {
+            const u32 w = width >> l, h = height >> l;
+            const u32 rows = w < 32 ? h * w / 32 : h;
+            host_bytes = std::max(host_bytes, offset + std::max(w, 32u) * std::max(rows, 32u) * 4);
+            offset += w * h * 4;
+        }
+        textures.push_back({addr, width, height, t.format, backend.AllocTexture(host_bytes),
+                            host_bytes, levels, parts, part_addr, bytes, passes, false});
+        it = std::prev(textures.end());
+    }
+    it->untiled_pass = passes;
+    it->dirty = false;
+    it->byte_swizzle = 0;
+    // Each FCRAM part moves to CDRAM here, under the draw's read hold. A texture past VRAM's end reads
+    // on into the filler past it (GuestGpuMemory::PastVramBytes); the tiny decode on the CPU has none.
+    const bool tiny_cut = (width < 8 || height < 8) && ReadableBytes(part_addr[0], bytes) < bytes;
+    ASSERT_MSG(!tiny_cut,
+               "sgxd: texture unit {} at {:#x}, {}x{} format {}: a side under 8 past VRAM's end",
+               unit, addr, width, height, static_cast<u32>(t.format));
+    for (u32 k = 0; k < parts; k++) {
+        const u32 part_bytes = ReadableBytes(part_addr[k], bytes);
+        if (part_addr[k] >= Memory::FCRAM_PADDR) {
+            KeepUncached(part_addr[k], part_bytes);
+        }
+#ifdef VITA_DIAGNOSTICS
+        ASSERT_MSG(guest_memory.IsUncached(part_addr[k], part_bytes),
+                   "sgxd: texture unit {} at {:#x}, {} bytes ({}x{}, format {}, {} levels): still "
+                   "in cached FCRAM after its move; {}",
+                   unit, part_addr[k], part_bytes, width, height, static_cast<u32>(t.format),
+                   levels, guest_memory.DescribePages(part_addr[k], part_bytes));
+#else
+        ASSERT_MSG(guest_memory.IsUncached(part_addr[k], part_bytes),
+                   "sgxd: texture unit {} at {:#x}, {} bytes: still in cached FCRAM after its "
+                   "move",
+                   unit, part_addr[k], part_bytes);
+#endif
+        if (part_addr[k] >= Memory::FCRAM_PADDR) {
+            SgxdCacheSkipped(CacheSite::Textures, part_bytes);
+        }
+    }
+    const u32 palette = PaletteFor(f.palette);
+    if (cube) {
+        // Each face a SWIZZLED square, back to back in slot order; a face's whole tiles run
+        // over the ones after it, written next.
+        for (u32 k = 0; k < 6; k++) {
+            backend.Untile({part_addr[k], width, height, f.bits, f.code, f.swizzle, palette},
+                           it->memory.gpu + k * width * height * 4, width, true);
+        }
+    }
+    // Largest first: a level's whole tiles run over the ones after it, written next.
+    for (u32 l = 0, guest = 0, host = 0; !cube && l < levels; l++) {
+        const u32 w = width >> l, h = height >> l;
+        backend.Untile({addr + guest, w, h, f.bits, f.code, f.swizzle, palette},
+                       it->memory.gpu + host, w);
+        guest += w * h * f.bits / 8;
+        host += w * h * 4;
+    }
+#ifdef VITA_DIAGNOSTICS
+    texture_stats.untiles++;
+    texture_stats.untiled_bytes += u64{bytes} * parts;
+    // untilecheck: every level against upstream's decoder, for the formats whose host copy is
+    // R, G, B, A bytes; either row order (the rows it matches, the first it does not). The
+    // levels follow each other in both copies: the guest's packed, the host's rows of their
+    // width (a LINEAR chain, down to a side of 8).
+    using TF = Pica::TexturingRegs::TextureFormat;
+    // Upstream's level 0 (RGBA bytes) when the check failed, for dumptex's "want" file.
+    std::vector<u8> want_image;
+    if (!cube && GxmFlag("untilecheck") &&
+        (t.format == TF::RGBA8 || t.format == TF::RGB8 || t.format == TF::ETC1 ||
+         t.format == TF::ETC1A4)) {
+        const bool alpha = t.format == TF::RGBA8 || t.format == TF::ETC1A4;
+        backend.RenderIdle("untilecheck");
+        static u32 untile_checks, untile_bad;
+        untile_checks++;
+        bool level0_bad = false;
+        for (u32 l = 0, guest_at = 0, host_at = 0; l < levels; l++) {
+            const u32 w = width >> l, h = height >> l;
+            Pica::Texture::TextureInfo info{addr + guest_at, w, h, 0, t.format, false};
+            info.SetDefaultStride();
+            const u8* const guest = memory.GetPhysicalPointer(addr + guest_at);
+            const u8* const host = it->memory.cpu + host_at;
+            guest_at += w * h * f.bits / 8;
+            host_at += w * h * 4;
+            u32 wrong[2] = {}, first_bad[2] = {h, h};
+            // The first differing texel of each order: x, y, then want and got as RGBA words.
+            std::array<u32, 4> first_texel[2]{};
+            if (l == 0) {
+                want_image.resize(w * h * 4);
+            }
+            for (u32 y = 0; y < h; y++) {
+                for (u32 x = 0; x < w; x++) {
+                    const auto want = Pica::Texture::LookupTexture(guest, x, y, info);
+                    if (l == 0) {
+                        for (u32 c = 0; c < 4; c++) {
+                            want_image[(y * w + x) * 4 + c] = want[c];
+                        }
+                    }
+                    for (u32 o = 0; o < 2; o++) {
+                        const u8* got = host + ((o ? h - 1 - y : y) * w + x) * 4;
+                        bool bad = false;
+                        for (u32 c = 0; c < (alpha ? 4u : 3u); c++) {
+                            bad = bad || std::abs(static_cast<int>(got[c]) - want[c]) > 3;
+                        }
+                        if (bad) {
+                            if (wrong[o]++ == 0) {
+                                first_texel[o] = {
+                                    x, y,
+                                    u32{want[0]} | u32{want[1]} << 8 | u32{want[2]} << 16 |
+                                        u32{want[3]} << 24,
+                                    u32{got[0]} | u32{got[1]} << 8 | u32{got[2]} << 16 |
+                                        u32{got[3]} << 24};
+                            }
+                            first_bad[o] = std::min(first_bad[o], o ? h - 1 - y : y);
+                        }
+                    }
+                }
+            }
+            const u32 o = wrong[1] < wrong[0] ? 1 : 0;
+            if (wrong[o] == 0) {
+                continue;
+            }
+            level0_bad = level0_bad || l == 0;
+            if (untile_bad++ < 64) {
+                LOG_ERROR(Render,
+                          "untilecheck {}: texture {:#x} {}x{} format {}, level {} of {} ({}x{}) "
+                          "at GPU {:#x}: {} of {} texels differ ({} row order), the first in "
+                          "host row {}; texel ({}, {}) want {:#010x} got {:#010x} (RGBA from "
+                          "the low byte)",
+                          untiles, addr, width, height, static_cast<u32>(t.format), l, levels, w,
+                          h, it->memory.gpu + (host_at - w * h * 4), wrong[o], w * h,
+                          o ? "flipped" : "same", first_bad[o], first_texel[o][0],
+                          first_texel[o][1], first_texel[o][2], first_texel[o][3]);
+            }
+        }
+        if (!level0_bad) {
+            want_image.clear();
+        }
+        if (untile_checks % 64 == 0) {
+            LOG_INFO(Render, "untilecheck: {} checked, {} levels differ", untile_checks,
+                     untile_bad);
+        }
+    }
+#endif
+    // Each format's first 8 untiles (dumptex), or 48 from untile N on (dumptexfrom=N); the
+    // log's first 8 of any.
+    static std::array<u32, 16> format_untiles{};
+    static const u32 dump_from = GxmFlagValue("dumptexfrom");
+    static u32 dumped_from;
+    const u32 format_untile = format_untiles[static_cast<u32>(t.format) & 15]++;
+    const bool dump_this = (format_untile < 8 && GxmFlag("dumptex")) ||
+                           (dump_from != 0 && untiles >= dump_from && dumped_from++ < 48);
+    if (untiles++ < 8 || dump_this) {
+        LOG_INFO(Render, "texture {:#x}: {}x{} format {}, {} levels{}, untiled to GPU {:#010x}",
+                 addr, width, height, static_cast<u32>(t.format), levels, cube ? ", cube" : "",
+                 it->memory.gpu);
+#ifdef VITA_DIAGNOSTICS
+        // dumptex: each level's (a cube: each face's) guest bytes and host copy to host0,
+        // named by its guest address. A 2D level's host copy has rows of its width; a cube
+        // face is SWIZZLED, written as -s0.
+        if (dump_this) {
+            const auto write = [&](PAddr at, u32 w, u32 h, u32 stride, const char* what,
+                                   const void* data, u32 size) {
+                const std::string path =
+                    fmt::format("host0:azahar-tex{}-{:x}-{}x{}-f{}-s{}-{}.bin", untiles, at, w, h,
+                                static_cast<u32>(t.format), stride, what);
+                if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(data, 1, size, file);
+                    std::fclose(file);
+                }
+            };
+            for (u32 k = 0; cube && k < 6; k++) {
+                const u32 size = width * height * 4;
+                write(part_addr[k], width, height, 0, "guest",
+                      memory.GetPhysicalPointer(part_addr[k]), bytes);
+                write(part_addr[k], width, height, 0, "host", it->memory.cpu + k * size, size);
+            }
+            for (u32 l = 0, guest = 0, host = 0; !cube && l < levels; l++) {
+                const u32 w = width >> l, h = height >> l;
+                write(addr + guest, w, h, w, "guest", memory.GetPhysicalPointer(addr) + guest,
+                      w * h * f.bits / 8);
+                write(addr + guest, w, h, w, "host", it->memory.cpu + host, w * h * 4);
+                if (l == 0 && !want_image.empty()) {
+                    write(addr, w, h, w, "want", want_image.data(), w * h * 4);
+                }
+                guest += w * h * f.bits / 8;
+                host += w * h * 4;
+            }
+        }
+#endif
+    }
+    return *it;
+}
+
+u32 RasterizerSgxd::PaletteFor(TexturePalette palette) {
+    if (palette == TexturePalette::None) {
+        return 0;
+    }
+    if (!palettes.cpu) {
+        // U8888 words at 64-byte multiples: A4 (16), I4 (16), IA4 (256).
+        palettes = backend.AllocTexture(0x1000);
+        u32* const p = reinterpret_cast<u32*>(palettes.cpu);
+        for (u32 i = 0; i < 16; i++) {
+            p[i] = i * 17 << 24;
+            p[16 + i] = 0xff000000u | i * 0x111111u;
+        }
+        for (u32 b = 0; b < 256; b++) {
+            p[32 + b] = (b & 15) * 17 << 24 | (b >> 4) * 0x111111u;
+        }
+    }
+    static constexpr u32 offset[] = {0, 0, 64, 128};
+    return palettes.gpu + offset[static_cast<u32>(palette)];
+}
+
+const RasterizerSgxd::Texture& RasterizerSgxd::NullTexture(u32 unit) {
+    // Unit 0's type picks the sampler, a 2D or a cube; units 1 and 2 are 2D.
+    using TextureConfig = Pica::TexturingRegs::TextureConfig;
+    const TextureConfig::TextureType type = regs.texturing.texture0.type;
+    const bool cube = unit == 0 && type == TextureConfig::TextureCube;
+    DEBUG_ASSERT_MSG(unit != 0 || cube || type == TextureConfig::Texture2D ||
+                         type == TextureConfig::Projection2D,
+                     "sgxd: texture unit 0 is off, of type {}: no null texture for it is built",
+                     static_cast<u32>(type));
+#ifdef VITA_DIAGNOSTICS
+    texture_stats.null_samples++;
+#endif
+    Texture& tex = null_textures[cube ? 1 : 0];
+    if (tex.bytes == 0) {
+        // Whole 32-texel tiles of zeros: a LINEAR 2D, or six SWIZZLED cube faces.
+        constexpr u32 side = 32;
+        tex.width = side;
+        tex.height = side;
+        tex.format = Pica::TexturingRegs::TextureFormat::RGBA8;
+        tex.levels = 1;
+        tex.parts = cube ? 6 : 1;
+        tex.bytes = tex.parts * side * side * 4;
+        u32 ready = 0;
+        tex.memory = backend.AllocTexture(tex.bytes, &ready);
+        backend.RenderWait(ready, "the null texture's range");
+        std::memset(tex.memory.cpu, 0, tex.bytes);
+    }
+    return tex;
+}
+
+void RasterizerGxm::TextureWords(u32 unit, u32 words[4]) {
+    using TextureConfig = Pica::TexturingRegs::TextureConfig;
+    const auto& c = regs.texturing.GetTextures()[unit].config;
+    const u32 mag = c.mag_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
+    const u32 min = c.min_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
+    const u32 mipf = c.mip_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
+    const u32 addressing = AddressMode(c.wrap_s) << 6 | AddressMode(c.wrap_t) << 3;
+    // The chain's levels: MIPMAPCLAMP the last level (15 for one), LODMIN the PICA's min_level,
+    // DADJUST its bias in eighths, zero at 31.
+    const u32 clamp = tex.levels > 1 ? tex.levels - 1 : 15;
+    const u32 lod_min = std::min<u32>(c.lod.min_level, tex.levels - 1);
+    const s32 dadjust = 31 + ((static_cast<s32>(c.lod.bias) + 16) >> 5);
+    DEBUG_ASSERT_MSG(dadjust >= 0 && dadjust <= 63,
+                     "sgxd: texture unit {}: LOD bias {} is past DADJUST's range", unit,
+                     static_cast<s32>(c.lod.bias) / 256.0f);
+    // U8U8U8U8, ABGR (R the lowest byte), LINEAR or a CUBE of SWIZZLED faces (log2 sizes);
+    // NORM.
+    words[0] = static_cast<u32>(std::clamp(dadjust, 0, 63)) << 21 | clamp << 17 | mag << 12 |
+               min << 10 | mipf << 9 | addressing;
+    words[1] = tex.parts == 6 ? 2u << 29 | 0x0cu << 24 |
+                                    static_cast<u32>(std::countr_zero(tex.width)) << 16 |
+                                    static_cast<u32>(std::countr_zero(tex.height))
+                              : 3u << 29 | 0x0cu << 24 | (tex.width - 1) << 12 | (tex.height - 1);
+    words[2] = tex.memory.gpu | lod_min >> 2;
+    words[3] = 1u << 31 | (lod_min & 3u) << 26;
+}
+
+void RasterizerSgxd::CachedRead(PAddr addr, u32 size) {
+    std::scoped_lock lock{cached_reads_mutex};
+    // A draw's attributes are usually one buffer: extend the last range where they touch.
+    if (!cached_reads.empty()) {
+        auto& [last, last_size] = cached_reads.back();
+        if (addr <= last + last_size && last <= addr + size) {
+            const PAddr end = std::max(last + last_size, addr + size);
+            last = std::min(last, addr);
+            last_size = end - last;
+            return;
+        }
+    }
+    cached_reads.emplace_back(addr, size);
+}
+
+std::vector<std::pair<PAddr, u32>> RasterizerSgxd::TakeCachedReads() {
+    std::scoped_lock lock{cached_reads_mutex};
+    return std::exchange(cached_reads, {});
+}
+
+void RasterizerSgxd::TexturesWritten(PAddr start, PAddr end) {
+    for (Texture& t : textures) {
+        for (u32 k = 0; k < t.parts; k++) {
+            if (start < t.part_addr[k] + t.part_bytes && t.part_addr[k] < end) {
+                t.dirty = true;
+            }
+        }
+    }
+}
+
 void RasterizerSgxd::EndPass(const char* why) {
     Surface& s = surfaces[pass_surface];
     const u32 pass_draws = backend.PassDraws();
@@ -761,11 +1266,34 @@ void RasterizerSgxd::LogTextureStats() {
     if (now - t.start_us < 1000000) {
         return;
     }
+    LOG_INFO(Render, "perf: textures in {:.2f} s: {} untiled ({} KiB); {} cached",
+             (now - t.start_us) / 1e6, t.untiles, t.untiled_bytes / 1024, textures.size());
+    static const bool bankstats = GxmFlag("bankstats");
+    BankLutStats& b = bank_lut_stats;
+    const auto per_build = [&](u64 rows) {
+        return b.bank_builds ? static_cast<double>(rows) / b.bank_builds : 0.0;
+    };
+    if (bankstats) {
     LOG_INFO(Render,
-             "perf: textures in {:.2f} s: {} change checks ({} found new bytes) over {} KiB in "
-             "{:.1f} ms; {} untiled ({} KiB); {} cached",
-             (now - t.start_us) / 1e6, t.checks, t.changed, t.hashed_bytes / 1024,
-             t.hash_us / 1e3, t.untiles, t.untiled_bytes / 1024, textures.size());
+             "perf: banks: {} draws, {} with a bank, {} built ({:.1f} rows each; changed since "
+             "1 build {:.1f}, 8 builds {:.1f}, 32 builds {:.1f}), {} zero buffers",
+             b.draws, b.bank_lookups, b.bank_builds, per_build(b.bank_rows),
+             per_build(b.changed_since[0]), per_build(b.changed_since[1]),
+             per_build(b.changed_since[2]), b.zero_builds);
+    LOG_INFO(Render,
+             "perf: LUT rows: {} lighting tables changed ({:.1f} of 256 entries each; contents "
+             "converted within the last 64: {}, 256: {}), {} more rewritten for a ring move; "
+             "{} fog",
+             b.lut_tables,
+             b.lut_tables ? static_cast<double>(b.lut_entries_changed) / b.lut_tables : 0.0,
+             b.lut_seen_64, b.lut_seen_256, b.lut_ring_moves, b.fog_tables);
+    }
+    // The histories carry over: they describe the stream, not the second.
+    b.draws = b.bank_lookups = b.bank_builds = b.zero_builds = 0;
+    b.bank_rows = 0;
+    b.changed_since = {};
+    b.lut_tables = b.lut_ring_moves = b.lut_seen_64 = b.lut_seen_256 = b.fog_tables = 0;
+    b.lut_entries_changed = 0;
     t = TextureStats{};
     t.tiny_logged = tiny_logged;
     t.start_us = now;
@@ -968,16 +1496,18 @@ const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(u64 blen
     DEBUG_ASSERT_MSG(g.phase_starts.size() == 1,
                      "GXM: a fragment program of {} phases (kill {}, depth write {}): not built",
                      g.phase_starts.size(), g.uses_discard, g.writes_depth);
-    // The lighting and fog LUT sampler is built (SyncLutLf); textures and the proctex LUTs
-    // are not.
+    // The texture units' samplers, the lighting and fog LUT's (SyncLutLf) and the proctex
+    // LUTs' are built.
     for (const Usse::GxpSampler& sampler : g.samplers) {
         if (sampler.name != "texture_buffer_lut_lf" && sampler.name != "texture_buffer_lut_rg" &&
-            sampler.name != "texture_buffer_lut_rgba") {
+            sampler.name != "texture_buffer_lut_rgba" && sampler.name != "tex0" &&
+            sampler.name != "tex1" && sampler.name != "tex2") {
             std::string names;
             for (const Usse::GxpSampler& s : g.samplers) {
                 names += fmt::format(" {} (unit {})", s.name, s.unit);
             }
-            UNREACHABLE_MSG("GXM: a fragment program with samplers:{}; only the LUTs are built",
+            UNREACHABLE_MSG("GXM: a fragment program with samplers:{}; only the textures and "
+                            "the LUTs are built",
                             names);
         }
     }
@@ -1690,7 +2220,9 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         for (size_t i = 0; i < fg.samplers.size(); i++) {
             const std::string& name = fg.samplers[i].name;
             u32 words[4];
-            if (name == "texture_buffer_lut_rg") {
+            if (name == "tex0" || name == "tex1" || name == "tex2") {
+                TextureWords(fg.samplers[i].unit, words);
+            } else if (name == "texture_buffer_lut_rg") {
                 sgxd_recipe_texture_words_format(backend.LutRgRows().gpu,
                                                  Pica::Shader::LUT_TEX_WIDTH,
                                                  Pica::Shader::LUT_RG_ROWS, 0, LutFormatF32F32, 0,

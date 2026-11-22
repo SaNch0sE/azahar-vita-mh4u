@@ -134,6 +134,10 @@ int sgxd_program_pixel_pds(uint32_t kick0, const uint32_t *iterators, const unsi
 // imgui_prim, SGXD_IMGUI_TEXEL).
 #define BLIT_DOUTI_COLOUR 0x0ed0a00fu
 #define BLIT_DOUTI_TEX 0x0000f900u
+// The merge's issues: TC0 (USEISSUE none, TEXPROJ RHW, TEXISSUE TC0), then TC1 with
+// TEXLASTISSUE.
+#define MERGE_DOUTI_TC0 0x0000f100u
+#define MERGE_DOUTI_TC1 0x0000f901u
 
 unsigned sgxd_program_blit_vertex(uint64_t words[4]) {
     words[0] = USSE_PHAS_LAST;
@@ -187,6 +191,37 @@ int sgxd_program_blit_pixel_pds(uint32_t kick0, const uint32_t tex[4], SgxdPdsPr
 
 int sgxd_program_screen_pixel_pds(uint32_t kick0, const uint32_t tex[4], SgxdPdsProgram *out) {
     return textured_pixel_pds(kick0, tex, 2, 2, out);
+}
+
+unsigned sgxd_program_merge_vertex(uint64_t words[4]) {
+    words[0] = USSE_PHAS_LAST;
+    words[1] = USSE_NOP;
+    words[2] = USSE_COPY(0u, SGXD_PROGRAM_MERGE_VERTEX_WORDS);
+    words[3] = USSE_END_VERTEX;
+    return 4;
+}
+
+int sgxd_program_merge_pixel_pds(uint32_t kick0, const uint32_t tex0[4], const uint32_t tex1[4],
+                                 SgxdPdsProgram *out) {
+    Pds p;
+    memset(&p, 0, sizeof(p));
+    const unsigned kick = pds_pair(&p, 0, kick0,
+                                   DOUTU1_SDSOFT | DOUTU1_ITERATORSDEPENDENCY |
+                                       DOUTU1_TEXTUREDEPENDENCY);
+    pds_word(&p, 1, 0);   // DOUTU word 2
+    const unsigned colour = pds_word(&p, 1, BLIT_DOUTI_COLOUR);
+    const unsigned issue0 = pds_word(&p, 1, MERGE_DOUTI_TC0);
+    const unsigned issue1 = pds_word(&p, 1, MERGE_DOUTI_TC1);
+    const unsigned quad0 = pds_quad(&p, tex0);
+    const unsigned quad1 = pds_quad(&p, tex1);
+    pds_emit(&p, doutu(kick, 0));
+    pds_emit(&p, douti(colour, 4));
+    pds_emit(&p, douti(issue0, 1));
+    pds_emit(&p, doutt(quad0, 0));
+    pds_emit(&p, douti(issue1, 1));
+    pds_emit(&p, doutt(quad1, 0));
+    pds_emit(&p, HALT);
+    return finish(&p, out);
 }
 
 uint32_t sgxd_program_pixel_dms(unsigned pa, unsigned temps, unsigned sa) {

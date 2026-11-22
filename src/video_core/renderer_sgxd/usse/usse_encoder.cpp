@@ -941,13 +941,23 @@ void Encoder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2,
 
 void Encoder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
                        bool nosched) {
+    Sample(dst, coord, 2, sampler_sa, lod, drc);
+}
+
+void Encoder::SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, bool nosched) {
+    Sample(dst, coord, 3, sampler_sa, nullptr, drc);
+}
+
+void Encoder::Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const Reg* lod,
+                     uint8_t drc) {
     const auto [cb, cext] = Src0Bank(coord.bank);
     if (dst.bank != Bank::Temp && dst.bank != Bank::PrimAttr) {
         Fail("usse: a texture read lands in a temporary or a primary attribute");
     }
     Push(Pack(PatSmp, {
         {'p', 0}, {'s', lod ? 1u : 0u}, {'n', 0}, {'y', 0}, {'m', 0},
-        {'r', cext}, {'c', 0}, {'e', lod ? 0u : 1u}, {'f', 3}, {'a', 0}, {'d', 1},
+        {'r', cext}, {'c', 0}, {'e', lod ? 0u : 1u}, {'f', 3}, {'a', 0},
+        {'d', static_cast<uint64_t>(dims - 1)},
         {'l', lod ? 2u : 0u}, {'t', dst.bank == Bank::PrimAttr ? 1u : 0u}, {'b', 0},
         {'g', 0}, {'k', cb}, {'h', drc}, {'i', 3}, {'j', lod ? 0u : 2u}, {'o', dst.n},
         {'q', DoubledNum(coord, 8)}, {'u', static_cast<uint64_t>(sampler_sa >> 1)},

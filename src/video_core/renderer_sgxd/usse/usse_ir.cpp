@@ -406,12 +406,18 @@ void Builder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, 
     i.pred = pred;
 }
 
+void Builder::SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc) {
+    Sample2D(dst, coord, sampler_sa, nullptr, drc);
+    insts.back().u[2] = 3;
+}
+
 void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc, bool) {
     Inst& i = Push(Op::Sample2D);
     i.reg[0] = dst;
     i.reg[1] = coord;
     i.u[0] = sampler_sa;
     i.u[1] = drc;
+    i.u[2] = 2; // coordinates
     i.b[0] = lod != nullptr;
     if (lod != nullptr) {
         i.src[0].reg = *lod;
@@ -3334,6 +3340,10 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             break;
         case Op::Sample2D: {
             const Reg lod = Map(i.src[0].reg);
+            if (i.u[2] == 3) {
+                e.SampleCube(Map(i.reg[0]), Map(i.reg[1]), i.u[0], i.u[1]);
+                break;
+            }
             e.Sample2D(Map(i.reg[0]), Map(i.reg[1]), i.u[0], i.b[0] ? &lod : nullptr, i.u[1]);
             break;
         }

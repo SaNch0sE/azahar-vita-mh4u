@@ -129,9 +129,16 @@ public:
     MoveStats TakeMoveStats();
 #endif
 
+    /// The filler mapped on the GPU past VRAM's end, for textures that run past it: one block of
+    /// main memory again and again, its contents undefined, so the GPU's reads there are mapped and
+    /// its writes reach no guest memory.
+    static constexpr u32 PastVramBytes = Memory::VRAM_SIZE;
+    static constexpr u32 PastVramBlock = 1u << 20;
+
 private:
     const u8* vram{};
     u8* fcram{};
+    bool past_vram{};
     std::vector<std::unique_ptr<Common::HostSharedMemory>> pool;
     std::vector<u32> pool_starts;
     std::atomic<u32> pool_used{}; ///< pool pages under an FCRAM page (EndFrame reads it)

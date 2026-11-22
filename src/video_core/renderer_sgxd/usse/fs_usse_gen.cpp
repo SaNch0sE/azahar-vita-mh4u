@@ -60,6 +60,8 @@ constexpr uint8_t TmpOutput = 0;      ///< combiner_output, the running result (
 constexpr uint8_t TmpTex0 = 4;        ///< the three texture units' colours (4 each)
 constexpr uint8_t TmpBuffer = 16;     ///< combiner_buffer (4)
 constexpr uint8_t TmpNextBuffer = 20; ///< next_combiner_buffer (4)
+constexpr uint8_t TmpTexFlip = 16;    ///< the texture units' (s, 1 - t) (2 each), in the
+                                      ///< combiner buffers' homes before the stages run
 constexpr uint8_t TmpPrimary = 24;    ///< the vertex colour, byte-rounded (4)
 constexpr uint8_t TmpArg = 28;        ///< the three stage arguments (4 each); lighting
                                       ///< scratch before the stages run
@@ -81,7 +83,8 @@ constexpr uint8_t TmpLightAtten = 0;  ///< lighting: per-light attenuation (.x) 
 constexpr uint8_t TmpShadow = 64;     ///< lighting: the shadow texture's colour (4)
 constexpr uint8_t TmpLightMem = 68;   ///< lighting: a light's parameters loaded from the
                                       ///< uniform buffer (24: the SA layout, six quads)
-constexpr uint8_t TmpProj = 92;       ///< unit 0's projected coordinate (2), or the depth (1)
+constexpr uint8_t TmpProj = 92;       ///< unit 0's projected coordinate (2), its cube
+                                      ///< direction (3), or the depth (1)
 constexpr uint8_t TmpTex3 = 96;       ///< the procedural texture's colour (4)
 constexpr uint8_t TmpProcUv = 100;    ///< proctex: u, v (2), the level (.z)
 constexpr uint8_t TmpSnap = 104;      ///< a stage's output kept for a later stage's
@@ -214,7 +217,7 @@ private:
     void Byteround(Reg value, Reg scratch);
     void Clamp01(Reg value, uint8_t mask = 0xf);
     void LoadVec4(Reg internal, Vec4Loc from);
-    void StoreVec4(Vec4Loc to, Reg internal);
+    void StoreVec4(Vec4Loc to, Reg internal, uint8_t mask = 0xf);
     void CopyVec4(Vec4Loc to, Vec4Loc from, uint8_t mask = 0xf);
     /// Normalises the float3 at `from` into internal register `into` (xyz), through `scratch`.
     void Normalize3(Reg into, Vec4Loc from, Reg scratch);
@@ -332,12 +335,16 @@ const char* FragmentEmitter::Unsupported() const {
     if (rgb.RequiresMinMaxEmulation() || alpha.RequiresMinMaxEmulation()) {
         return "min/max blend";
     }
-    // Cube and shadow textures: the rasterizer binds a white texture for them (P5), so a
-    // program sampling them would not be the fix.
+    // Shadow textures: the rasterizer binds a white texture for them (P5), so a program
+    // sampling them would not be the fix.
     const auto t0 = tex.texture0_type.Value();
     if (t0 != TextureType::Disabled && t0 != TextureType::Texture2D &&
-        t0 != TextureType::Projection2D) {
+        t0 != TextureType::Projection2D && t0 != TextureType::TextureCube) {
         return "texture unit 0 type";
+    }
+    if (t0 == TextureType::TextureCube &&
+        (tex.texture_border_color[0].enable_s || tex.texture_border_color[0].enable_t)) {
+        return "cube texture border colour";
     }
     for (u32 i = 0; i < tex.tev_stages.size(); i++) {
         const TevStageConfig stage = tex.tev_stages[i];
@@ -494,7 +501,8 @@ void FragmentEmitter::PlanInputs() {
         view_pa = pa;
         pa += 4;
     }
-    if (unit_used[0] && tex.texture0_type == TextureType::Projection2D) {
+    if (unit_used[0] && (tex.texture0_type == TextureType::Projection2D ||
+                         tex.texture0_type == TextureType::TextureCube)) {
         // texcoord0's w, one register, last so nothing pair-aligned has to follow it.
         gxp.inputs.push_back({FragmentInput::TexCoord3, 1});
         texcoord0_w_pa = pa;
@@ -1088,6 +1096,26 @@ void FragmentEmitter::SampleTextures() {
         }
         const int coord = (unit == 2 && tex.texture2_use_coord1) ? 1 : static_cast<int>(unit);
         coords[unit] = Reg::Pa(texcoord_pa[coord]);
+        if (unit == 0 && tex.texture0_type == TextureType::TextureCube) {
+            // The direction (u, v, w) of texcoord0 and texcoord0_w. The SGX's cube takes a
+            // face's (s, t) as the PICA does (docs/sgxd/tsp.md), and the
+            // faces keep the PICA's rows with t = 1 at row 0 as every host copy does. Reading
+            // at (u, -v, w) flips t on every face, with the +Y and -Y faces swapped in the host
+            // cube (RasterizerGxm::TextureFor).
+            const Reg dir = Reg::V(TmpProj);
+            e.Vec(VecOp::Add, {dir, 0x3}, {coords[0], XYZW}, ConstZero, Pred::None, true);
+            e.Vec(VecOp::Add, {dir, 0x2}, {coords[0], XYZW, Mod::Neg}, ConstZero, Pred::None,
+                  true);
+            e.Vec(VecOp::Add, {Reg::V(TmpProj + 2), 0x1},
+                  {Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u)),
+                   (texcoord0_w_pa & 1) ? YYYY : XXXX},
+                  ConstZero, Pred::None, true);
+            coords[0] = dir;
+            e.SampleCube(Reg::V(TmpTex0), dir, SamplerSa(sampler_index), 0);
+            sampler_index++;
+            any = true;
+            continue;
+        }
         if (unit == 0 && tex.texture0_type == TextureType::Projection2D) {
             // texcoord0 / texcoord0_w
             e.Comp(CompOp::Rcp, {I0, 0x1}, {Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u))},
@@ -1096,6 +1124,15 @@ void FragmentEmitter::SampleTextures() {
                   true);
             coords[0] = Reg::V(TmpProj);
         }
+        // The host copy keeps the PICA's rows in memory order, t = 1 at row 0
+        // (SgxdBackend::Untile: an ETC1 block cannot be flipped by moving it), so the read is
+        // at (s, 1 - t). REPEAT, MIRROR and CLAMP, and the border test below, are symmetric
+        // under it. The combiner buffers' homes are free until the stages run.
+        const Reg flipped = Reg::V(static_cast<uint8_t>(TmpTexFlip + unit * 2));
+        e.Vec(VecOp::Add, {flipped, 0x3}, {coords[unit], XYZW}, ConstZero, Pred::None, true);
+        e.Vec(VecOp::Add, {flipped, 0x2}, {coords[unit], XYZW, Mod::Neg}, ConstOne, Pred::None,
+              true);
+        coords[unit] = flipped;
         e.Sample2D(Reg::V(static_cast<uint8_t>(TmpTex0 + unit * 4)), coords[unit],
                    SamplerSa(sampler_index), nullptr, 0);
         sampler_index++;
@@ -1149,9 +1186,16 @@ void FragmentEmitter::LoadVec4(Reg internal, Vec4Loc from) {
     e.MoveF32x4({internal, 0xf}, from.Pair(0), from.Pair(1), true);
 }
 
-void FragmentEmitter::StoreVec4(Vec4Loc to, Reg internal) {
-    e.MoveInternal({to.Pair(0), 0x3}, {internal, XYZW}, Pred::None, true);
-    e.MoveInternal({to.Pair(1), 0x3}, {internal, ZWZW}, Pred::None, true);
+void FragmentEmitter::StoreVec4(Vec4Loc to, Reg internal, uint8_t mask) {
+    // Only the lanes written: an internal register's others are another instance's.
+    if (mask & 0x3) {
+        e.MoveInternal({to.Pair(0), static_cast<uint8_t>(mask & 0x3)}, {internal, XYZW},
+                       Pred::None, true);
+    }
+    if (mask & 0xc) {
+        e.MoveInternal({to.Pair(1), static_cast<uint8_t>(mask >> 2)}, {internal, ZWZW},
+                       Pred::None, true);
+    }
 }
 
 void FragmentEmitter::CopyVec4(Vec4Loc to, Vec4Loc from, uint8_t mask) {
@@ -1995,8 +2039,9 @@ void FragmentEmitter::TevStage(u32 index) {
         ColorOp(stage.color_op, same_op || dot3_alpha ? 0xf : 0x7);
         if (separate_alpha) {
             if (alpha_three) {
-                // i2's colour result must survive: park it, load the alphas, restore.
-                StoreVec4({Bank::Virtual, TmpOutput}, I2);
+                // i2's colour result must survive: park it, load the alphas, restore (its
+                // w was never written: a game).
+                StoreVec4({Bank::Virtual, TmpOutput}, I2, 0x7);
                 load(0, 0x8);
                 load(1, 0x8);
                 load(2, 0x8);
