@@ -38,6 +38,7 @@
 #include <psp2/touch.h>
 #include <psp2/vshbridge.h>
 #include <taihen.h>
+#include "citra_vita/adhoc.h"
 #include "citra_vita/banner_player.h"
 #include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
@@ -1792,7 +1793,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     title_crashed = true;
                     break;
                 } else if (RunSettingCommand(command) ||
-                           VitaFrontend::Multiplayer::RunCommand(system, command)) {
+                           VitaFrontend::Multiplayer::RunCommand(system, command) ||
+                           VitaFrontend::Adhoc::RunCommand(system, command)) {
                 } else {
                     sceClibPrintf("[azahar] command \"%s\" not known\n", command.c_str());
                 }
@@ -2940,7 +2942,8 @@ int EmulatorMain() {
         } else if (command == "exit") {
             running = false;
         } else if (!command.empty() && !RunSettingCommand(command) &&
-                   !VitaFrontend::Multiplayer::RunCommand(system, command)) {
+                   !VitaFrontend::Multiplayer::RunCommand(system, command) &&
+                   !VitaFrontend::Adhoc::RunCommand(system, command)) {
             sceClibPrintf("[azahar] command \"%s\" not known on the game list\n", command.c_str());
         }
     }
@@ -2948,6 +2951,9 @@ int EmulatorMain() {
     banner.Stop();
     Config::Save();
     power_window = nullptr;
+    if (VitaFrontend::Adhoc::Active()) {
+        VitaFrontend::Adhoc::Leave();
+    }
     VitaFrontend::Multiplayer::Shutdown();
     VitaFrontend::ShutdownInput();
     Common::Log::Stop();

@@ -3430,11 +3430,24 @@ Ui::Action Ui::DrawMultiplayer() {
     if (IconCard(Multiplayer::InRoom() ? "Join again" : "Join", Icon::People, tool) && can_join) {
         Multiplayer::Join(system, room_fields);
     }
-    if (Multiplayer::InRoom()) {
+    if (Multiplayer::InRoom() || Adhoc::Active()) {
         ImGui::SameLine();
         if (IconCard("Leave", Icon::Home, tool)) {
-            Multiplayer::Leave();
+            if (Adhoc::Active()) {
+                Adhoc::Leave();
+            } else {
+                Multiplayer::Leave();
+            }
         }
+    }
+    // Ad hoc play: no access point and no room elsewhere, one Vita hosts and the others join it.
+    const bool can_adhoc = !room_fields.nickname.empty() && !Adhoc::Active();
+    if (IconCard("Host ad hoc", Icon::Globe, tool) && can_adhoc) {
+        Adhoc::Host(system, room_fields.nickname);
+    }
+    ImGui::SameLine();
+    if (IconCard("Join ad hoc", Icon::Globe, tool) && can_adhoc) {
+        Adhoc::Join(system, room_fields.nickname);
     }
     back |= BackPressed();
     overlay_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
@@ -3455,11 +3468,15 @@ Ui::Action Ui::DrawMultiplayer() {
         ImGui::TextWrapped("%s", status.c_str());
         ImGui::Spacing();
     }
+    if (Adhoc::Active()) {
+        ImGui::TextWrapped("%s", Adhoc::Status().c_str());
+        ImGui::Spacing();
+    }
     const std::vector<std::string> members = Multiplayer::Members();
     if (members.empty()) {
-        ImGui::TextWrapped("Join a room hosted by a desktop Azahar (Multiplayer, Host Room) or its "
-                           "room server. Every player runs the same game; its local wireless play "
-                           "then finds the others.");
+        ImGui::TextWrapped("Join a room hosted by Azahar on a PC (Multiplayer > Host Room) or a "
+                           "room server, or play ad hoc with Vitas nearby: one hosts, the others "
+                           "join. Then everyone plays the same game in its local wireless mode.");
     }
     for (const std::string& member : members) {
         Note(palette->Accent, member);

@@ -15,8 +15,21 @@ add_custom_command(
     DEPENDS ${GXM_SHADER_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/shaders/EmbedShaders.cmake"
     COMMENT "Embedding GXM shader programs")
 
+# SceNetCtl's unnamed ad hoc exports (netctl_adhoc.yml), as an import stub of their own.
+set(NETCTL_ADHOC_STUB_DIR "${CMAKE_CURRENT_BINARY_DIR}/netctl_adhoc_stub")
+set(NETCTL_ADHOC_STUB "${NETCTL_ADHOC_STUB_DIR}/libSceLibNetCtl_stub.a")
+add_custom_command(OUTPUT "${NETCTL_ADHOC_STUB}"
+    COMMAND ${VITA_LIBS_GEN} ${CMAKE_CURRENT_SOURCE_DIR}/netctl_adhoc.yml ${NETCTL_ADHOC_STUB_DIR}
+    COMMAND make -s -C ${NETCTL_ADHOC_STUB_DIR}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/netctl_adhoc.yml
+    COMMENT "Building SceNetCtl's ad hoc import stub"
+    VERBATIM)
+add_custom_target(netctl_adhoc_stub DEPENDS "${NETCTL_ADHOC_STUB}")
+
 set(CITRA_VITA_SOURCES
     ../vita_compat/src/vita_libc_shims.c
+    adhoc.cpp
+    adhoc.h
     banner_cgfx.cpp
     banner_cgfx.h
     banner_player.cpp
@@ -115,8 +128,12 @@ function(citra_vita_executable target titleid)
         SceKernelDmacMgr_stub
         SceKernelModulemgr_stub
         SceVshBridge_stub
+        SceNetCtl_stub
+        SceNpManager_stub
+        ${NETCTL_ADHOC_STUB}
         m
     )
+    add_dependencies(${target} netctl_adhoc_stub)
 
     target_include_directories(${target} PRIVATE ${VITASDK}/arm-vita-eabi/include)
 

@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "citra_vita/adhoc.h"
 #include "citra_vita/config.h"
 #include "citra_vita/multiplayer.h"
 #include "common/common_types.h"

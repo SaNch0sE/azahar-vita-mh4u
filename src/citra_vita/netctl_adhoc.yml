@@ -1,0 +1,17 @@
+# SceNetCtl's exports for the ad hoc network that the SDK leaves unnamed, as the netcheck
+# dialog's library (libcdlg_netcheck) calls them to join a Vita ad hoc network (adhoc.cpp). The
+# names are ours: AdhocConnect sends SceShell request 0x2001b (its network worker's "connect":
+# join the IBSS of that SSID, or start it); the other two each raise one SceShell event bit per
+# argument 1-3 (0x14/0x10/0x12 and 0x13/0x0f/0x11), which the dialog raises before connecting.
+---
+modules:
+  SceLibNetCtl:
+    nid: 0xFA4A5948
+    libraries:
+      SceNetCtl:
+        kernel: false
+        nid: 0xC6083AE1
+        functions:
+          sceNetCtlAdhocConnectSsid: 0xC1677C65
+          sceNetCtlAdhocShellEventA: 0xE4B3142E
+          sceNetCtlAdhocShellEventB: 0xBC0563A0
