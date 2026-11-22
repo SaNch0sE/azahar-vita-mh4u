@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <deque>
 #include <tuple>
 #include <boost/serialization/deque.hpp>
@@ -24,6 +25,7 @@ struct ThreadQueueList {
 
     // Number of priority levels. (Valid levels are [0..NUM_QUEUES).)
     static constexpr Priority NUM_QUEUES = N;
+    static_assert(N <= 64, "one bit a level in `nonempty`");
 
     ThreadQueueList() {
         first = nullptr;
@@ -41,57 +43,30 @@ struct ThreadQueueList {
         return -1;
     }
 
+    // The first thread of the most urgent level that has one: the lowest set bit of `nonempty`, not
+    // a walk over every level ever used.
     [[nodiscard]] T get_first() const {
-        const Queue* cur = first;
-        while (cur != nullptr) {
-            if (!cur->data.empty()) {
-                return cur->data.front();
-            }
-            cur = cur->next_nonempty;
-        }
-
-        return T();
+        return nonempty != 0 ? queues[std::countr_zero(nonempty)].data.front() : T();
     }
 
     std::pair<Priority, T> pop_first() {
-        Queue* cur = first;
-        while (cur != nullptr) {
-            if (!cur->data.empty()) {
-                auto tmp = std::move(cur->data.front());
-                cur->data.pop_front();
-                Priority prio = static_cast<Priority>(ToIndex(cur));
-                return {prio, tmp};
-            }
-            cur = cur->next_nonempty;
-        }
-
-        return {Priority(), T()};
+        return PopLevelIn(nonempty);
     }
 
     std::pair<Priority, T> pop_first_better(Priority priority) {
-        Queue* cur = first;
-        Queue* stop = &queues[priority];
-        while (cur < stop) {
-            if (!cur->data.empty()) {
-                auto tmp = std::move(cur->data.front());
-                cur->data.pop_front();
-                Priority prio = static_cast<Priority>(ToIndex(cur));
-                return {prio, tmp};
-            }
-            cur = cur->next_nonempty;
-        }
-
-        return {Priority(), T()};
+        return PopLevelIn(nonempty & ((u64{1} << priority) - 1));
     }
 
     void push_front(Priority priority, const T& thread_id) {
         Queue* cur = &queues[priority];
         cur->data.push_front(thread_id);
+        nonempty |= u64{1} << priority;
     }
 
     void push_back(Priority priority, const T& thread_id) {
         Queue* cur = &queues[priority];
         cur->data.push_back(thread_id);
+        nonempty |= u64{1} << priority;
     }
 
     void move(const T& thread_id, Priority old_priority, Priority new_priority) {
@@ -104,6 +79,9 @@ struct ThreadQueueList {
         Queue* const cur = &queues[priority];
         const auto iter = std::remove(cur->data.begin(), cur->data.end(), thread_id);
         cur->data.erase(iter, cur->data.end());
+        if (cur->data.empty()) {
+            nonempty &= ~(u64{1} << priority);
+        }
     }
 
     void rotate(Priority priority) {
@@ -118,6 +96,7 @@ struct ThreadQueueList {
     void clear() {
         queues.fill(Queue());
         first = nullptr;
+        nonempty = 0;
     }
 
     [[nodiscard]] bool empty(Priority priority) const {
@@ -150,6 +129,21 @@ private:
         std::deque<T> data;
     };
 
+    /// The first thread of the most urgent level among `levels` (bits of non-empty levels).
+    std::pair<Priority, T> PopLevelIn(u64 levels) {
+        if (levels == 0) {
+            return {Priority(), T()};
+        }
+        const Priority prio = static_cast<Priority>(std::countr_zero(levels));
+        Queue& cur = queues[prio];
+        auto tmp = std::move(cur.data.front());
+        cur.data.pop_front();
+        if (cur.data.empty()) {
+            nonempty &= ~(u64{1} << prio);
+        }
+        return {prio, tmp};
+    }
+
     /// Special tag used to mark priority levels that have never been used.
     static Queue* UnlinkedTag() {
         return reinterpret_cast<Queue*>(1);
@@ -172,6 +166,8 @@ private:
 
     // The first queue that's ever been used.
     Queue* first;
+    // Bit p set while level p holds a thread.
+    u64 nonempty = 0;
     // The priority level queues of thread ids.
     std::array<Queue, NUM_QUEUES> queues;
 
@@ -216,6 +212,12 @@ private:
             ar >> idx;
             queues[i].next_nonempty = ToPointer(idx);
             ar >> queues[i].data;
+        }
+        nonempty = 0;
+        for (std::size_t i = 0; i < NUM_QUEUES; i++) {
+            if (!queues[i].data.empty()) {
+                nonempty |= u64{1} << i;
+            }
         }
     }
 

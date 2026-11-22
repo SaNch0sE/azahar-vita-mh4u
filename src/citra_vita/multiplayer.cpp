@@ -7,10 +7,9 @@
 #include <mutex>
 #include <sstream>
 
-#include <psp2/kernel/clib.h>
-
 #include "citra_vita/i18n.h"
 #include "citra_vita/multiplayer.h"
+#include "common/logging/log.h"
 #include "common/named_thread.h"
 #include "core/core.h"
 #include "core/hle/service/cfg/cfg.h"
@@ -129,12 +128,12 @@ void SaveFields() {
 void Init() {
     LoadFields();
     if (!Network::Init()) {
-        sceClibPrintf("[azahar] room: the network library did not start\n");
+        LOG_INFO(Frontend, "room: the network library did not start");
         return;
     }
     const auto member = Network::GetRoomMember().lock();
     on_state = member->BindOnStateChanged([](const State& state) {
-        sceClibPrintf("[azahar] room: %s\n", StateText(state));
+        LOG_INFO(Frontend, "room: {}", StateText(state));
         if (state == State::Idle) {
             std::scoped_lock lk{mutex};
             members.clear();
@@ -142,7 +141,7 @@ void Init() {
         }
     });
     on_error = member->BindOnError([](const Error& error) {
-        sceClibPrintf("[azahar] room: %s\n", ErrorText(error));
+        LOG_INFO(Frontend, "room: {}", ErrorText(error));
         std::scoped_lock lk{mutex};
         last_error = ErrorText(error);
     });
@@ -252,6 +251,7 @@ std::vector<std::string> Members() {
     return members;
 }
 
+#ifdef VITA_DEBUG_TOOLS
 bool RunCommand(Core::System& system, const std::string& command) {
     std::istringstream in(command);
     std::string word, verb;
@@ -264,25 +264,26 @@ bool RunCommand(Core::System& system, const std::string& command) {
         int port = 0;
         in >> wanted.address >> port >> wanted.nickname >> wanted.password;
         if (wanted.address.empty() || port <= 0 || port > 65535 || wanted.nickname.empty()) {
-            sceClibPrintf("[azahar] room: join wants HOST PORT NICK [PASSWORD] (command)\n");
+            LOG_INFO(Frontend, "room: join wants HOST PORT NICK [PASSWORD] (command)");
         } else if (!system.IsPoweredOn()) {
-            sceClibPrintf("[azahar] room: join needs a running title (command)\n");
+            LOG_INFO(Frontend, "room: join needs a running title (command)");
         } else {
             wanted.port = static_cast<u16>(port);
-            sceClibPrintf("[azahar] room: joining %s:%d as %s (command)\n",
-                          wanted.address.c_str(), port, wanted.nickname.c_str());
+            LOG_INFO(Frontend, "room: joining {}:{} as {} (command)", wanted.address, port,
+                     wanted.nickname);
             Join(system, wanted);
         }
     } else if (verb == "leave") {
         Leave();
-        sceClibPrintf("[azahar] room: left (command)\n");
+        LOG_INFO(Frontend, "room: left (command)");
     } else {
-        sceClibPrintf("[azahar] room: %s (command)\n", Status().c_str());
+        LOG_INFO(Frontend, "room: {} (command)", Status());
         for (const std::string& line : Members()) {
-            sceClibPrintf("[azahar] room:   %s\n", line.c_str());
+            LOG_INFO(Frontend, "room:   {}", line);
         }
     }
     return true;
 }
+#endif
 
 } // namespace VitaFrontend::Multiplayer

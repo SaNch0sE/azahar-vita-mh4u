@@ -222,17 +222,25 @@ void SetupNetwork() {
     }
 }
 
+/// The log goes to the debug channel (Common::Log's VitaBackend). What prints there itself
+/// (sceClibPrintf) cannot wait for the log's lock or allocate: main's lines before this, a crash's,
+/// the power callbacks' and the heap walks'.
+Common::Log::Filter log_filter;
+
 void SetupLogging() {
-#ifdef VITA_DIAGNOSTICS
     Common::Log::Initialize();
-    Common::Log::Filter filter;
-    // Debug.Emulated: the guest's own svcOutputDebugString lines (homebrew tests such as
-    // src/native_mc_test/litmus report through it; retail titles rarely call it).
+    Common::Log::Filter& filter = log_filter;
+#ifdef VITA_DIAGNOSTICS
+    // The guest's own svcOutputDebugString lines (homebrew tests report through it).
     filter.ParseFilterString("*:Info Debug.Emulated:Debug");
-    Common::Log::SetGlobalFilter(filter);
+#else
+    // What a title's calls log (services, kernel, hardware) only when critical: a title calls a
+    // stub or an unimplemented path up to hundreds of times a second, a line each. The
+    // emulator's own classes stay, for the crash report's console tail.
+    filter.ParseFilterString("*:Critical Common:Info Core:Info Config:Info Savestate:Info "
+                             "Frontend:Info Render:Info Loader:Info");
 #endif
-    // The release build starts no logging backend at all, so every LOG_* macro reaches a
-    // filter that discards it before it formats anything.
+    Common::Log::SetGlobalFilter(filter);
 }
 
 /// The Vita boots at a conservative clock; an emulated 3DS needs every megahertz. The GPU's
@@ -279,14 +287,15 @@ void ShutdownSystem(Core::System& system, std::size_t threads_before) {
     // banner) to wait on.
     VitaFrontend::SgxdPresent::SessionEnded();
     if (const std::shared_ptr<Kernel::Process> alive = process.lock()) {
-        sceClibPrintf("[azahar] shutdown: the title's process outlived it (%ld references); HLE "
-                      "async sections in flight: %u at the quit, %u now\n",
-                      static_cast<long>(alive.use_count() - 1), static_cast<unsigned>(in_flight),
-                      static_cast<unsigned>(Kernel::AsyncSectionsInFlight()));
+        LOG_INFO(Frontend,
+                 "shutdown: the title's process outlived it ({} references); HLE async sections in "
+                 "flight: {} at the quit, {} now",
+                 static_cast<long>(alive.use_count() - 1), static_cast<unsigned>(in_flight),
+                 static_cast<unsigned>(Kernel::AsyncSectionsInFlight()));
     }
     if (const std::size_t running = Common::RunningNamedThreads(); running != threads_before) {
-        sceClibPrintf("[azahar] shutdown: %u threads running, %u before the title\n",
-                      static_cast<unsigned>(running), static_cast<unsigned>(threads_before));
+        LOG_INFO(Frontend, "shutdown: {} threads running, {} before the title",
+                 static_cast<unsigned>(running), static_cast<unsigned>(threads_before));
     }
 }
 
@@ -345,6 +354,7 @@ bool TakeRenderCounters(Core::System& system, RenderCounters& out) {
 
 /// Runs one title to completion. Returns false when the user wants the application to close
 /// rather than to return to the game list.
+#ifdef VITA_DEBUG_TOOLS
 /**
  * The savestate arguments after the title's path: `load=N` restores slot N before the title runs,
  * `save=N@T` saves slot N once it has run T seconds. A scripted launch passes them at the launch to
@@ -366,10 +376,12 @@ struct StateArguments {
     int save = -1;
     SceUInt64 save_after_us = 0;
 };
+#endif
 
 namespace Config = VitaFrontend::Config;
 using Config::Option;
 
+#ifdef VITA_DEBUG_TOOLS
 /// `layout=N`: N is a Settings::LayoutOption; the menu's layouts
 /// are the ones it offers. Empty for any other argument, or a layout the menu does not offer.
 std::optional<Config::Layout> LayoutArgument(const std::string& argument) {
@@ -434,6 +446,10 @@ StateArguments TakeStateArguments() {
             Config::Pin(Option::StatsOverlay, std::atoi(argument.c_str() + 6) != 0 ? 1 : 0);
         } else if (argument.starts_with("statslog=")) {
             stats_log = std::atoi(argument.c_str() + 9) != 0;
+        } else if (argument.starts_with("log=")) {
+            // A log filter rule on top of SetupLogging's: log=Service.FS:Debug, the ROM's reads.
+            log_filter.ParseFilterString(argument.substr(4));
+            Common::Log::SetGlobalFilter(log_filter);
         } else if (argument.starts_with("motion=")) {
             Config::Pin(Option::Motion, std::atoi(argument.c_str() + 7) != 0 ? 1 : 0);
         } else if (argument == "rightstick=cstick" || argument == "rightstick=lr" ||
@@ -476,7 +492,7 @@ StateArguments TakeStateArguments() {
                 a.save_after_us = std::strtoull(argument.c_str() + at + 1, nullptr, 10) * 1000000;
             }
         } else {
-            sceClibPrintf("[azahar] launch argument %s not known\n", argument.c_str());
+            LOG_INFO(Frontend, "launch argument {} not known", argument);
         }
     }
     return a;
@@ -562,7 +578,7 @@ public:
         if (due.rfind("quiet ", 0) == 0) {
             const unsigned long seconds = std::strtoul(due.c_str() + 6, nullptr, 10);
             quiet_until_us = now + std::min(seconds, 600ul) * 1000000;
-            sceClibPrintf("[azahar] quiet: no host0 requests for %lu s (command)\n", seconds);
+            LOG_INFO(Frontend, "quiet: no host0 requests for {} s (command)", seconds);
             return {};
         }
         return due;
@@ -716,7 +732,7 @@ bool RunLayoutCommand(VitaFrontend::EmuWindowVita& window, const std::string& co
     }
     Config::Pin(option, value);
     window.RequestLayoutUpdate();
-    sceClibPrintf("[azahar] %s %d (command)\n", name, Config::Effective(option));
+    LOG_INFO(Frontend, "{} {} (command)", name, Config::Effective(option));
     return true;
 }
 
@@ -724,8 +740,8 @@ bool RunSettingCommand(const std::string& command) {
     if (command == "suspend") {
         // The power button's short press, for a console with none to press remotely; its
         // resume is the CP's power-on.
-        sceClibPrintf("[azahar] suspend (command): 0x%08x\n",
-                      static_cast<unsigned>(scePowerRequestSuspend()));
+        LOG_INFO(Frontend, "suspend (command): 0x{:08x}",
+                 static_cast<unsigned>(scePowerRequestSuspend()));
         return true;
     }
 #ifdef VITA_DIAGNOSTICS
@@ -748,15 +764,16 @@ bool RunSettingCommand(const std::string& command) {
         SceKernelFreeMemorySizeInfo free{};
         free.size = sizeof(free);
         sceKernelGetFreeMemorySize(&free);
-        sceClibPrintf("[azahar] heap: %u KiB in use, %u KiB free inside the %u KiB taken, of %u KiB; "
-                      "largest block %u KiB; free memory %u KiB, CDRAM %u KiB, phycont %u KiB; "
-                      "%u threads (command)\n",
-                      static_cast<unsigned>(m.uordblks >> 10), static_cast<unsigned>(m.fordblks >> 10),
-                      static_cast<unsigned>(m.arena >> 10), _newlib_heap_size_user >> 10, low >> 10,
-                      static_cast<unsigned>(free.size_user) >> 10,
-                      static_cast<unsigned>(free.size_cdram) >> 10,
-                      static_cast<unsigned>(free.size_phycont) >> 10,
-                      static_cast<unsigned>(Common::RunningNamedThreads()));
+        LOG_INFO(
+            Frontend,
+            "heap: {} KiB in use, {} KiB free inside the {} KiB taken, of {} KiB; largest block {} "
+            "KiB; free memory {} KiB, CDRAM {} KiB, phycont {} KiB; {} threads (command)",
+            static_cast<unsigned>(m.uordblks >> 10), static_cast<unsigned>(m.fordblks >> 10),
+            static_cast<unsigned>(m.arena >> 10), _newlib_heap_size_user >> 10, low >> 10,
+            static_cast<unsigned>(free.size_user) >> 10,
+            static_cast<unsigned>(free.size_cdram) >> 10,
+            static_cast<unsigned>(free.size_phycont) >> 10,
+            static_cast<unsigned>(Common::RunningNamedThreads()));
         return true;
     }
     if (command == "heapmap") {
@@ -771,8 +788,8 @@ bool RunSettingCommand(const std::string& command) {
     if (command.rfind("rm ", 0) == 0) {
         // `rm PATH`: a file on the console removed (a title's savestate slots, its .cst files).
         const std::string path = command.substr(3);
-        sceClibPrintf("[azahar] rm %s: %08x (command)\n", path.c_str(),
-                      static_cast<unsigned>(sceIoRemove(path.c_str())));
+        LOG_INFO(Frontend, "rm {}: {:08x} (command)", path,
+                 static_cast<unsigned>(sceIoRemove(path.c_str())));
         return true;
     }
     if (command.rfind("copy ", 0) == 0 && command.find('|') != std::string::npos) {
@@ -801,8 +818,7 @@ bool RunSettingCommand(const std::string& command) {
             }
             ok = ok && copied == in.GetSize();
         }
-        sceClibPrintf("[azahar] copy %s -> %s: %s (command)\n", from.c_str(), to.c_str(),
-                      ok ? "done" : "failed");
+        LOG_INFO(Frontend, "copy {} -> {}: {} (command)", from, to, ok ? "done" : "failed");
         return true;
     }
 #ifdef AZAHAR_PGO_GENERATE
@@ -818,8 +834,8 @@ bool RunSettingCommand(const std::string& command) {
         void* base = nullptr;
         if (block < 0 || sceKernelGetMemBlockBase(block, &base) < 0 ||
             __llvm_profile_write_buffer(static_cast<char*>(base)) != 0) {
-            sceClibPrintf("[azahar] pgo: %llu bytes not serialised (block %08x) (command)\n",
-                          static_cast<unsigned long long>(size), static_cast<unsigned>(block));
+            LOG_INFO(Frontend, "pgo: {} bytes not serialised (block {:08x}) (command)",
+                     static_cast<unsigned long long>(size), static_cast<unsigned>(block));
             if (block >= 0) {
                 sceKernelFreeMemBlock(block);
             }
@@ -831,8 +847,8 @@ bool RunSettingCommand(const std::string& command) {
             const SceSize piece = static_cast<SceSize>(std::min<u64>(size - written, 1u << 20));
             const int put = sceIoWrite(fd, static_cast<const u8*>(base) + written, piece);
             if (put <= 0) {
-                sceClibPrintf("[azahar] pgo: a write at %llu failed: %08x (command)\n",
-                              static_cast<unsigned long long>(written), static_cast<unsigned>(put));
+                LOG_INFO(Frontend, "pgo: a write at {} failed: {:08x} (command)",
+                         static_cast<unsigned long long>(written), static_cast<unsigned>(put));
                 break;
             }
             written += static_cast<u64>(put);
@@ -841,9 +857,8 @@ bool RunSettingCommand(const std::string& command) {
             sceIoClose(fd);
         }
         sceKernelFreeMemBlock(block);
-        sceClibPrintf("[azahar] pgo: %s, %llu of %llu bytes (command)\n", path.c_str(),
-                      static_cast<unsigned long long>(written),
-                      static_cast<unsigned long long>(size));
+        LOG_INFO(Frontend, "pgo: {}, {} of {} bytes (command)", path,
+                 static_cast<unsigned long long>(written), static_cast<unsigned long long>(size));
         return true;
     }
 #endif
@@ -862,8 +877,8 @@ bool RunSettingCommand(const std::string& command) {
         const SceUID out =
             in < 0 ? -1 : sceIoOpen(dst, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
         if (in < 0 || out < 0) {
-            sceClibPrintf("[azahar] copy: %s %08x, %s %08x (command)\n", src,
-                          static_cast<unsigned>(in), dst, static_cast<unsigned>(out));
+            LOG_INFO(Frontend, "copy: {} {:08x}, {} {:08x} (command)", src,
+                     static_cast<unsigned>(in), dst, static_cast<unsigned>(out));
             if (in >= 0) {
                 sceIoClose(in);
             }
@@ -875,21 +890,21 @@ bool RunSettingCommand(const std::string& command) {
         while ((got = sceIoRead(in, piece.data(), piece.size())) > 0) {
             if (const int put = sceIoWrite(out, piece.data(), got); put != got) {
                 // 0x8001001c: ENOSPC, the card full.
-                sceClibPrintf("[azahar] copy: a write to %s failed at %llu: %08x (command)\n", dst,
-                              static_cast<unsigned long long>(copied), static_cast<unsigned>(put));
+                LOG_INFO(Frontend, "copy: a write to {} failed at {}: {:08x} (command)", dst,
+                         static_cast<unsigned long long>(copied), static_cast<unsigned>(put));
                 break;
             }
             copied += static_cast<u64>(got);
             VitaFrontend::CrashReport::StallWatchBeat();
             if (copied % (64u << 20) == 0) {
-                sceClibPrintf("[azahar] copy: %llu MiB (command)\n",
-                              static_cast<unsigned long long>(copied >> 20));
+                LOG_INFO(Frontend, "copy: {} MiB (command)",
+                         static_cast<unsigned long long>(copied >> 20));
             }
         }
         sceIoClose(out);
         sceIoClose(in);
-        sceClibPrintf("[azahar] copy: %s to %s, %llu bytes%s (command)\n", src, dst,
-                      static_cast<unsigned long long>(copied), got < 0 ? ", a read failed" : "");
+        LOG_INFO(Frontend, "copy: {} to {}, {} bytes{} (command)", src, dst,
+                 static_cast<unsigned long long>(copied), got < 0 ? ", a read failed" : "");
         return true;
     }
 #ifdef VITA_DIAGNOSTICS
@@ -900,8 +915,8 @@ bool RunSettingCommand(const std::string& command) {
         int hz = 0, seconds = 0;
         std::sscanf(command.c_str(), "tone %d %d", &hz, &seconds);
         if (hz <= 0 || hz > 20000 || seconds <= 0 || seconds > 30) {
-            sceClibPrintf("[azahar] tone: wants HZ (1-20000) SECONDS (1-30, under the stall "
-                          "watch) (command)\n");
+            LOG_INFO(Frontend,
+                     "tone: wants HZ (1-20000) SECONDS (1-30, under the stall watch) (command)");
             return true;
         }
         constexpr int Rate = 48000;
@@ -909,14 +924,14 @@ bool RunSettingCommand(const std::string& command) {
         const int port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, Frames, Rate,
                                              SCE_AUDIO_OUT_MODE_STEREO);
         if (port < 0) {
-            sceClibPrintf("[azahar] tone: no port (%08x) (command)\n", static_cast<unsigned>(port));
+            LOG_INFO(Frontend, "tone: no port ({:08x}) (command)", static_cast<unsigned>(port));
             return true;
         }
         int volume[2] = {SCE_AUDIO_VOLUME_0DB, SCE_AUDIO_VOLUME_0DB};
         sceAudioOutSetVolume(port, static_cast<SceAudioOutChannelFlag>(
                                        SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH),
                              volume);
-        sceClibPrintf("[azahar] tone: %d Hz for %d s at %d Hz (command)\n", hz, seconds, Rate);
+        LOG_INFO(Frontend, "tone: {} Hz for {} s at {} Hz (command)", hz, seconds, Rate);
         static std::array<s16, Frames * 2> buffer;
         double phase = 0.0;
         const double step = 2.0 * M_PI * hz / Rate;
@@ -932,7 +947,7 @@ bool RunSettingCommand(const std::string& command) {
         }
         sceAudioOutOutput(port, nullptr);
         sceAudioOutReleasePort(port);
-        sceClibPrintf("[azahar] tone: done (command)\n");
+        LOG_INFO(Frontend, "tone: done (command)");
         return true;
     }
     if (command == "cores") {
@@ -942,15 +957,15 @@ bool RunSettingCommand(const std::string& command) {
             const int got = azaharCoreSample(core, &cs);
             cs.thread_name[sizeof(cs.thread_name) - 1] = '\0';
             cs.module_name[sizeof(cs.module_name) - 1] = '\0';
-            sceClibPrintf("[azahar] cores: core %u: %08x, pid %08x thread %08x \"%s\"%s, PC in "
-                          "%s+%x, PCs %08x %08x %08x %08x (command)\n",
-                          static_cast<unsigned>(core), static_cast<unsigned>(got),
-                          static_cast<unsigned>(cs.pid), static_cast<unsigned>(cs.thid),
-                          cs.thread_name, cs.idle ? " (idle)" : "",
-                          cs.module_name[0] ? cs.module_name : "?",
-                          static_cast<unsigned>((cs.pcs[0] & ~1u) - cs.module_text),
-                          static_cast<unsigned>(cs.pcs[0]), static_cast<unsigned>(cs.pcs[1]),
-                          static_cast<unsigned>(cs.pcs[2]), static_cast<unsigned>(cs.pcs[3]));
+            LOG_INFO(Frontend,
+                     "cores: core {}: {:08x}, pid {:08x} thread {:08x} \"{}\"{}, PC in {}+{:x}, "
+                     "PCs {:08x} {:08x} {:08x} {:08x} (command)",
+                     static_cast<unsigned>(core), static_cast<unsigned>(got),
+                     static_cast<unsigned>(cs.pid), static_cast<unsigned>(cs.thid), cs.thread_name,
+                     cs.idle ? " (idle)" : "", cs.module_name[0] ? cs.module_name : "?",
+                     static_cast<unsigned>((cs.pcs[0] & ~1u) - cs.module_text),
+                     static_cast<unsigned>(cs.pcs[0]), static_cast<unsigned>(cs.pcs[1]),
+                     static_cast<unsigned>(cs.pcs[2]), static_cast<unsigned>(cs.pcs[3]));
         }
         VitaFrontend::CrashReport::PrintBusErrorDump(false);
         VitaFrontend::CrashReport::PrintTableScan(false);
@@ -978,7 +993,7 @@ bool RunSettingCommand(const std::string& command) {
         // stop ends (sgxd's Fault).
         auto& system = Core::System::GetInstance();
         if (!system.IsPoweredOn()) {
-            sceClibPrintf("[azahar] crashtest render: no title runs (command)\n");
+            LOG_INFO(Frontend, "crashtest render: no title runs (command)");
             return true;
         }
         sceClibPrintf("[azahar] %s (command)\n", command.c_str());
@@ -996,7 +1011,7 @@ bool RunSettingCommand(const std::string& command) {
         // A GPU hang on purpose with a title's frames on the GPU: the next pass's 3D never ends
         // (SgxdBackend::DrawHang), then the stop, the fault's report and the recovery from it.
         if (!Core::System::GetInstance().IsPoweredOn()) {
-            sceClibPrintf("[azahar] hangtest: no title runs (command)\n");
+            LOG_INFO(Frontend, "hangtest: no title runs (command)");
             return true;
         }
         sceClibPrintf("[azahar] hangtest (command)\n");
@@ -1028,8 +1043,8 @@ bool RunSettingCommand(const std::string& command) {
         // (Common::HeapCheck), until the first damage stops the process.
         Common::HeapCheck::full.store(command == "heapcheck full", std::memory_order_relaxed);
         Common::HeapCheck::enabled.store(true, std::memory_order_relaxed);
-        sceClibPrintf("[azahar] heapcheck: on%s (command)\n",
-                      command == "heapcheck full" ? ", every chunk" : ", the bins");
+        LOG_INFO(Frontend, "heapcheck: on{} (command)",
+                 command == "heapcheck full" ? ", every chunk" : ", the bins");
         return true;
     }
     if (command == "heapcheck stats") {
@@ -1051,29 +1066,30 @@ bool RunSettingCommand(const std::string& command) {
     if (command == "name" || command.starts_with("name ")) {
         Config::SetConsoleName(command.size() > 5 ? command.substr(5) : std::string{});
         Config::Save();
-        sceClibPrintf("[azahar] console name \"%s\" (command)\n", Config::ConsoleName().c_str());
+        LOG_INFO(Frontend, "console name \"{}\" (command)", Config::ConsoleName());
         return true;
     }
     // As the launch arguments, pins over the settings file's values (Config::Pin).
     int value = 0;
     if (std::sscanf(command.c_str(), "limit %d", &value) == 1) {
         Config::Pin(Option::SpeedLimit, value);
-        sceClibPrintf("[azahar] speed limit %d%% (command)\n", value);
+        LOG_INFO(Frontend, "speed limit {}% (command)", value);
         return true;
     }
     if (std::sscanf(command.c_str(), "vsync %d", &value) == 1) {
         Config::Pin(Option::Vsync, value != 0 ? 1 : 0);
-        sceClibPrintf("[azahar] vsync %s (command)\n", value != 0 ? "on" : "off");
+        LOG_INFO(Frontend, "vsync {} (command)", value != 0 ? "on" : "off");
         return true;
     }
     // The top screen's scale, as `scale=` at launch: 1, 1.25, 1.5, 1.75 or 2.
     if (float scale = 0.0f; std::sscanf(command.c_str(), "scale %f", &scale) == 1) {
         Config::Pin(Option::TopScale, Config::TopScaleValue(scale));
-        sceClibPrintf("[azahar] top screen scale %.2fx (command)\n", static_cast<double>(scale));
+        LOG_INFO(Frontend, "top screen scale {:.2f}x (command)", static_cast<double>(scale));
         return true;
     }
     return false;
 }
+#endif // VITA_DEBUG_TOOLS
 
 #ifdef VITA_DIAGNOSTICS
 /// `memfind V` or `memfind LO-HI`: the running title's writable memory searched for V, or for a
@@ -1092,7 +1108,7 @@ void Memfind(Core::System& system, const std::string& argument) {
     if (argument == "reset") {
         memfind_hits.clear();
         memfind_listed = false;
-        sceClibPrintf("[azahar] memfind: reset\n");
+        LOG_INFO(Frontend, "memfind: reset");
         return;
     }
     const auto process = system.Kernel().GetCurrentProcess();
@@ -1152,22 +1168,22 @@ void Memfind(Core::System& system, const std::string& argument) {
             }
         }
         memfind_listed = true;
-        sceClibPrintf("[azahar] memfind %s: %u pages, %u hits%s\n", argument.c_str(), scanned,
-                      static_cast<unsigned>(memfind_hits.size()),
-                      memfind_hits.size() >= Most ? " (the most kept)" : "");
+        LOG_INFO(Frontend, "memfind {}: {} pages, {} hits{}", argument, scanned,
+                 static_cast<unsigned>(memfind_hits.size()),
+                 memfind_hits.size() >= Most ? " (the most kept)" : "");
     } else {
         std::erase_if(memfind_hits, [&](const MemfindHit& hit) {
             u8 bytes[4]{};
             system.Memory().ReadBlock(*process, hit.addr, bytes, hit.kind == 0 ? 2 : 4);
             return !matches(bytes, hit.kind);
         });
-        sceClibPrintf("[azahar] memfind %s: %u hits left\n", argument.c_str(),
-                      static_cast<unsigned>(memfind_hits.size()));
+        LOG_INFO(Frontend, "memfind {}: {} hits left", argument,
+                 static_cast<unsigned>(memfind_hits.size()));
     }
     static constexpr const char* Kinds[] = {"u16", "u32", "f32"};
     for (std::size_t i = 0; i < memfind_hits.size() && i < 24; i++) {
-        sceClibPrintf("[azahar] memfind:   %08x %s\n", static_cast<unsigned>(memfind_hits[i].addr),
-                      Kinds[memfind_hits[i].kind]);
+        LOG_INFO(Frontend, "memfind:   {:08x} {}", static_cast<unsigned>(memfind_hits[i].addr),
+                 Kinds[memfind_hits[i].kind]);
     }
 }
 
@@ -1189,27 +1205,22 @@ void LogGuestThreads(Core::System& system) {
                 thread->owner_process.lock() == kernel.GetCurrentProcess()) {
                 header = system.Memory().Read32(thread->GetCommandBufferAddress());
             }
-            sceClibPrintf("[azahar] thread %u \"%s\" core %u: status %d, priority %u, pc %08x "
-                          "lr %08x sp %08x r0 %08x, arbiter %08x, ipc header %08x, timeout %d;%s\n",
-                          thread->thread_id, thread->name.c_str(), core,
-                          static_cast<int>(thread->status), thread->current_priority, r[15], r[14],
-                          r[13], r[0], thread->wait_address, header, thread->wakeup_queued,
-                          waits.c_str());
-            sceClibPrintf("[azahar] thread %u: r1 %08x r2 %08x r3 %08x r4 %08x r5 %08x r6 %08x "
-                          "r7 %08x r8 %08x r9 %08x r10 %08x r11 %08x r12 %08x cpsr %08x\n",
-                          thread->thread_id, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
-                          r[10], r[11], r[12], thread->context.cpsr);
+            LOG_INFO(Frontend,
+                     "thread {} \"{}\" core {}: status {}, priority {}, pc {:08x} lr {:08x} sp "
+                     "{:08x} r0 {:08x}, arbiter {:08x}, ipc header {:08x}, timeout {:d};{}",
+                     thread->thread_id, thread->name, core, static_cast<int>(thread->status),
+                     thread->current_priority, r[15], r[14], r[13], r[0], thread->wait_address,
+                     header, thread->wakeup_queued, waits);
+            LOG_INFO(Frontend,
+                     "thread {}: r1 {:08x} r2 {:08x} r3 {:08x} r4 {:08x} r5 {:08x} r6 {:08x} r7 "
+                     "{:08x} r8 {:08x} r9 {:08x} r10 {:08x} r11 {:08x} r12 {:08x} cpsr {:08x}",
+                     thread->thread_id, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
+                     r[11], r[12], thread->context.cpsr);
         }
     }
 }
 #endif
 
-/**
- * Restores a savestate slot before the title runs. The signal executes at a quiescent point
- * inside RunLoop, so it gets a few slices. A state from another build is taken: the archive
- * layout is what has to match, not the revision (a scene saved once is loaded into the builds
- * after it).
- */
 /// A savestate's save or load refused or failed with the title still running: what to do next.
 std::string StateErrorText(bool load, u32 slot) {
     if (!load) {
@@ -1233,13 +1244,19 @@ std::string PartialLoadNotice(u32 slot) {
            "\n\n" + Tr("Press X or O to continue.");
 }
 
+#ifdef VITA_DEBUG_TOOLS
+/**
+ * Restores a savestate slot before the title runs. The signal executes at a quiescent point
+ * inside RunLoop, so it gets a few slices. A state from another build is taken: the archive
+ * layout is what has to match, not the revision.
+ */
 void RestoreStateAtStart(Core::System& system, u32 slot) {
     system.SetLoadStateAnyBuild(true);
     if (!system.SendSignal(Core::System::Signal::Load, slot)) {
-        sceClibPrintf("[azahar] savestate: could not queue a load of slot %u\n", slot);
+        LOG_INFO(Frontend, "savestate: could not queue a load of slot {}", slot);
         return;
     }
-    sceClibPrintf("[azahar] savestate: restoring slot %u\n", slot);
+    LOG_INFO(Frontend, "savestate: restoring slot {}", slot);
     // The load runs inside RunLoop once the kernel has no asynchronous HLE request in flight; at
     // this point in the boot that is immediate. Requests run inline while the load is pending so a
     // title that streams from its ROM cannot keep one in flight, and a failed load is reported
@@ -1251,21 +1268,22 @@ void RestoreStateAtStart(Core::System& system, u32 slot) {
     for (int i = 0; i < 200000; i++) {
         const auto status = system.RunLoop();
         if (status != Core::System::ResultStatus::Success) {
-            sceClibPrintf("[azahar] savestate: load of slot %u failed: %d (%s)\n", slot,
-                          static_cast<int>(status), system.GetStatusDetails().c_str());
+            LOG_INFO(Frontend, "savestate: load of slot {} failed: {} ({})", slot,
+                     static_cast<int>(status), system.GetStatusDetails());
             break;
         }
         if (!system.IsSaveStateRequestPending()) {
-            sceClibPrintf("[azahar] savestate: slot %u restored\n", slot);
+            LOG_INFO(Frontend, "savestate: slot {} restored", slot);
             VitaFrontend::CrashReport::NoteStateLoaded(slot);
             break;
         }
     }
     Settings::values.deterministic_async_operations = async_before;
     if (system.IsSaveStateRequestPending()) {
-        sceClibPrintf("[azahar] savestate: slot %u never became loadable\n", slot);
+        LOG_INFO(Frontend, "savestate: slot {} never became loadable", slot);
     }
 }
+#endif
 
 /**
  * A suspend while sgxd holds the GPU (docs/sgxd/takeover.md). The title is paused, the GPU's
@@ -1504,8 +1522,8 @@ void ApplyConsoleName(Core::System& system) {
     }
     cfg->SetUsername(wanted);
     const Result written = cfg->UpdateConfigNANDSavegame();
-    sceClibPrintf("[azahar] console name %s: %s\n", name.c_str(),
-                  written.IsSuccess() ? "written" : "not written to the config save");
+    LOG_INFO(Frontend, "console name {}: {}", name,
+             written.IsSuccess() ? "written" : "not written to the config save");
 }
 
 /// The system language the player chose (Config::Option::SystemLanguage) into the config save, as
@@ -1522,8 +1540,8 @@ void ApplySystemLanguage(Core::System& system) {
     }
     cfg->SetSystemLanguage(wanted);
     const Result written = cfg->UpdateConfigNANDSavegame();
-    sceClibPrintf("[azahar] system language %d: %s\n", static_cast<int>(wanted),
-                  written.IsSuccess() ? "written" : "not written to the config save");
+    LOG_INFO(Frontend, "system language {}: {}", static_cast<int>(wanted),
+             written.IsSuccess() ? "written" : "not written to the config save");
 }
 
 /// A crash's files waiting for their archive and notice (ArchivedCrashNotice): Recover's restart
@@ -1591,6 +1609,7 @@ void NoteRunningTitle(Core::System& system) {
     VitaFrontend::CrashReport::NotePlugin(plugin);
 }
 
+#ifdef VITA_DEBUG_TOOLS
 /// The commands that only read the title's state: `dump PADDR SIZE` and `vdump VADDR SIZE` (its
 /// memory to host0), `memfind`, `tables VADDR`, `pageinfo VADDR` (`tables` and the GPU's holds of
 /// the page), `versions` (the versioned pages) and `threads`. The title's loop takes them, and so
@@ -1608,10 +1627,10 @@ bool RunInspectCommand(Core::System& system, const std::string& command) {
         if (out) {
             std::fclose(out);
         }
-        sceClibPrintf("[azahar] dump %08x+%x: %u bytes to %s\n", paddr, size,
-                      static_cast<unsigned>(written), name.c_str());
+        LOG_INFO(Frontend, "dump {:08x}+{:x}: {} bytes to {}", paddr, size,
+                 static_cast<unsigned>(written), name);
 #else
-        sceClibPrintf("[azahar] dump: a diagnostics build's command\n");
+        LOG_INFO(Frontend, "dump: a diagnostics build's command");
 #endif
         return true;
     }
@@ -1629,10 +1648,10 @@ bool RunInspectCommand(Core::System& system, const std::string& command) {
         if (out) {
             std::fclose(out);
         }
-        sceClibPrintf("[azahar] vdump %08x+%x: %u bytes to %s\n", vaddr, size,
-                      static_cast<unsigned>(written), name.c_str());
+        LOG_INFO(Frontend, "vdump {:08x}+{:x}: {} bytes to {}", vaddr, size,
+                 static_cast<unsigned>(written), name);
 #else
-        sceClibPrintf("[azahar] vdump: a diagnostics build's command\n");
+        LOG_INFO(Frontend, "vdump: a diagnostics build's command");
 #endif
         return true;
     }
@@ -1640,7 +1659,7 @@ bool RunInspectCommand(Core::System& system, const std::string& command) {
 #ifdef VITA_DIAGNOSTICS
         Memfind(system, command.substr(8));
 #else
-        sceClibPrintf("[azahar] memfind: a diagnostics build's command\n");
+        LOG_INFO(Frontend, "memfind: a diagnostics build's command");
 #endif
         return true;
     }
@@ -1649,7 +1668,7 @@ bool RunInspectCommand(Core::System& system, const std::string& command) {
         // emulation thread's core (host 0's).
         const u32 va = static_cast<u32>(std::strtoul(command.c_str() + 7, nullptr, 16));
         for (const std::string& line : Core::ModuleTablesAt(va)) {
-            sceClibPrintf("[azahar] %s (command)\n", line.c_str());
+            LOG_INFO(Frontend, "{} (command)", line);
         }
         return true;
     }
@@ -1681,12 +1700,13 @@ bool RunInspectCommand(Core::System& system, const std::string& command) {
 #ifdef VITA_DIAGNOSTICS
         LogGuestThreads(system);
 #else
-        sceClibPrintf("[azahar] threads: a diagnostics build's command\n");
+        LOG_INFO(Frontend, "threads: a diagnostics build's command");
 #endif
         return true;
     }
     return false;
 }
+#endif
 
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
               const std::string& path) {
@@ -1718,7 +1738,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     // until the player closes it. A launch by path (a scripted launch) has it on the TTY alone.
     if (const std::string warning = system.GetAppLoader().TitlePatchesWarning();
         !warning.empty()) {
-        sceClibPrintf("[azahar] %s\n", warning.c_str());
+        LOG_INFO(Frontend, "{}", warning);
         if (!g_launched_by_path) {
             ui.SetStatusMessage(warning + "\n\n" + Tr("Press X or O to continue."));
             // The buttons let go, one pressed, let go again.
@@ -1749,7 +1769,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     ui.SetGame(path);
     // nwm::UDS signals its events directly only on this thread; the room's thread queues them.
     system.RegisterCoreLoopThreadId();
+#ifdef VITA_DEBUG_TOOLS
     StateArguments state_arguments = TakeStateArguments();
+#endif
     window.UpdateCurrentFramebufferLayout(); // the title's own layout, or a layout=N argument's
     // The timing exists since Load, at the clock all games' settings had: the title's own or a
     // clock=N argument's from here, before any guest code runs.
@@ -1823,6 +1845,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             system.SetStateProgressCallback({});
         }
     } progress_reset{system};
+#ifdef VITA_DEBUG_TOOLS
     if (state_arguments.load >= 0) {
         progress_slot = static_cast<u32>(state_arguments.load);
         window.SetLoading(true);
@@ -1830,11 +1853,12 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         window.SetLoading(false);
         ui.ClearStatusMessage();
         if (system.IsStateLoadPartial()) {
-            sceClibPrintf("[azahar] savestate: the load stopped partway; the title is stopped\n");
+            LOG_INFO(Frontend, "savestate: the load stopped partway; the title is stopped");
             g_crash_notice = PartialLoadNotice(progress_slot);
             window.RequestQuit(false);
         }
     }
+#endif
     // A failed save or load's text over the paused game, for three seconds.
     const auto show_state_error = [&](const std::string& text) {
         ui.SetStatusMessage(text);
@@ -1848,9 +1872,11 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         }
         ui.ClearStatusMessage();
     };
+#ifdef VITA_DEBUG_TOOLS
     // `save=N@T`: once the title has run T seconds (real time, from here).
     const SceUInt64 title_start_us = sceKernelGetProcessTimeWide();
     bool state_save_sent = false;
+#endif
     // A save or load sent (the argument's or the menu's) whose result is still to print.
     bool state_watch = false;
     bool state_watch_is_load = false;
@@ -1888,18 +1914,19 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             progress_slot = ui.SelectedSlot();
             state_watch_is_load = false;
             state_watch = system.SendSignal(Core::System::Signal::Save, ui.SelectedSlot());
-            sceClibPrintf("[azahar] savestate: saving slot %u from the menu\n", ui.SelectedSlot());
+            LOG_INFO(Frontend, "savestate: saving slot {} from the menu", ui.SelectedSlot());
             break;
         case VitaFrontend::Ui::Action::LoadState:
             progress_slot = ui.SelectedSlot();
             state_watch_is_load = true;
             state_watch = system.SendSignal(Core::System::Signal::Load, ui.SelectedSlot());
-            sceClibPrintf("[azahar] savestate: loading slot %u from the menu\n", ui.SelectedSlot());
+            LOG_INFO(Frontend, "savestate: loading slot {} from the menu", ui.SelectedSlot());
             break;
         default:
             break;
         }
 
+#ifdef VITA_DEBUG_TOOLS
         if (state_arguments.save >= 0 && !state_save_sent &&
             sceKernelGetProcessTimeWide() - title_start_us >= state_arguments.save_after_us) {
             state_save_sent = true;
@@ -1907,8 +1934,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             state_watch_is_load = false;
             state_watch = system.SendSignal(Core::System::Signal::Save,
                                             static_cast<u32>(state_arguments.save));
-            sceClibPrintf("[azahar] savestate: saving slot %d %s\n", state_arguments.save,
-                          state_watch ? "queued" : "refused");
+            LOG_INFO(Frontend, "savestate: saving slot {} {}", state_arguments.save,
+                     state_watch ? "queued" : "refused");
         }
         if (CommandChannel()) {
             if (const std::string command = command_file.Poll(); !command.empty()) {
@@ -1922,32 +1949,32 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     state_watch = system.SendSignal(save ? Core::System::Signal::Save
                                                          : Core::System::Signal::Load,
                                                     static_cast<u32>(slot));
-                    sceClibPrintf("[azahar] savestate: %s slot %d (command) %s\n",
-                                  save ? "saving" : "loading", slot,
-                                  state_watch ? "queued" : "refused");
+                    LOG_INFO(Frontend, "savestate: {} slot {} (command) {}",
+                             save ? "saving" : "loading", slot, state_watch ? "queued" : "refused");
                 } else if (RunInspectCommand(system, command)) {
                 } else if (command == "menu quit") {
                     // As a player quits: the pause menu open a second, then its "Quit game".
-                    sceClibPrintf("[azahar] menu quit (command)\n");
+                    LOG_INFO(Frontend, "menu quit (command)");
                     window.ScriptPauseMenu(static_cast<int>(VitaFrontend::Ui::Action::QuitGame));
                 } else if (command == "quit" || command == "exit") {
                     // The next round of this loop shuts the title down, as after the menu's.
-                    sceClibPrintf("[azahar] %s (command)\n", command.c_str());
+                    LOG_INFO(Frontend, "{} (command)", command);
                     window.RequestQuit(command == "exit");
                 } else if (command == "crashtest guest") {
                     // The title stopped as a crash in its code stops it: the frontend's side
                     // (the core dump with the title's state, the game list's notice).
-                    sceClibPrintf("[azahar] crashtest guest (command)\n");
+                    LOG_INFO(Frontend, "crashtest guest (command)");
                     title_crashed = true;
                     break;
                 } else if (RunLayoutCommand(window, command) || RunSettingCommand(command) ||
                            VitaFrontend::Multiplayer::RunCommand(system, command) ||
                            VitaFrontend::Adhoc::RunCommand(system, command)) {
                 } else {
-                    sceClibPrintf("[azahar] command \"%s\" not known\n", command.c_str());
+                    LOG_INFO(Frontend, "command \"{}\" not known", command);
                 }
             }
         }
+#endif
         // A save or load sent and not done yet: the volume keys do nothing meanwhile.
         window.SetLoading(state_watch);
         const auto status = system.RunLoop();
@@ -1958,8 +1985,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             window.SetLoading(false);
             ui.ClearStatusMessage();
             const bool ok = status == Core::System::ResultStatus::Success;
-            sceClibPrintf("[azahar] savestate: %s%s\n",
-                          ok ? "done" : "failed: ", ok ? "" : system.GetStatusDetails().c_str());
+            LOG_INFO(Frontend, "savestate: {}{}",
+                     ok ? "done" : "failed: ", ok ? "" : system.GetStatusDetails().c_str());
             if (ok && state_watch_is_load) {
                 VitaFrontend::CrashReport::NoteStateLoaded(progress_slot);
             }
@@ -1970,7 +1997,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         if (status == Core::System::ResultStatus::ErrorSavestate && system.IsStateLoadPartial()) {
             // A load that failed partway through the file left a state the title cannot run on
             // (part the old one, part the file's): back to the game list.
-            sceClibPrintf("[azahar] savestate: the load stopped partway; the title is stopped\n");
+            LOG_INFO(Frontend, "savestate: the load stopped partway; the title is stopped");
             LOG_CRITICAL(Frontend, "Savestate load stopped partway: {}", system.GetStatusDetails());
             g_crash_notice = PartialLoadNotice(progress_slot);
             window.RequestQuit(false);
@@ -2006,12 +2033,14 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 static u32 last_shown = 0;
                 const u32 shown = system.GPU().GetRenderThread().ShownFrames();
                 shown_fps.store(shown - last_shown, std::memory_order_relaxed);
+#ifdef VITA_DEBUG_TOOLS
                 if (stats_log) {
                     const u32 g10 = game_fps10.load(std::memory_order_relaxed);
-                    sceClibPrintf("[azahar] stats: speed %u%% game %u.%u fps shown %u fps\n",
-                                  speed_percent.load(std::memory_order_relaxed), g10 / 10,
-                                  g10 % 10, shown - last_shown);
+                    LOG_INFO(Frontend, "stats: speed {}% game {}.{} fps shown {} fps",
+                             speed_percent.load(std::memory_order_relaxed), g10 / 10, g10 % 10,
+                             shown - last_shown);
                 }
+#endif
                 last_shown = shown;
                 valid.store(true, std::memory_order_release);
                 // Presented with the guest's screens unchanged too (GPU's vblank).
@@ -2945,12 +2974,12 @@ int EmulatorMain() {
     // showing the app's data in the shell's CDRAM; frame buffers the shell hands the display after
     // the take are kept off by the module.
     if (VitaFrontend::SystemUiOverlaid() || VitaFrontend::ShellPlaneShown()) {
-        sceClibPrintf("[azahar] the system's UI or its plane over the app: the GPU taken once "
-                      "they are gone\n");
+        LOG_INFO(Frontend,
+                 "the system's UI or its plane over the app: the GPU taken once they are gone");
         while (VitaFrontend::SystemUiOverlaid() || VitaFrontend::ShellPlaneShown()) {
             sceKernelDelayThread(100 * 1000);
         }
-        sceClibPrintf("[azahar] the system's UI and its plane gone\n");
+        LOG_INFO(Frontend, "the system's UI and its plane gone");
     }
 
     // The GPU is sgxd's from here to the end of the session (docs/sgxd/takeover.md). No GXM call
@@ -2958,7 +2987,6 @@ int EmulatorMain() {
     std::string sgxd_error;
     if (!VitaFrontend::SgxdPresent::Initialize(&sgxd_error)) {
         LOG_CRITICAL(Frontend, "{}", sgxd_error);
-        sceClibPrintf("[azahar] %s\n", sgxd_error.c_str());
         ShowStartError(sgxd_error);
         return -1;
     }
@@ -3044,9 +3072,12 @@ int EmulatorMain() {
             g_crash_files = CrashFiles{CrashWhat(ui, Tr("Azahar crashed and started again."), changed),
                                        VitaFrontend::CrashReport::LastReportPath,
                                        argument.substr(8)};
-        } else if (argument.starts_with("seq=")) {
+        }
+#ifdef VITA_DEBUG_TOOLS
+        if (argument.starts_with("seq=")) {
             command_file.StartAfter(std::strtoul(argument.c_str() + 4, nullptr, 10));
         }
+#endif
     }
     // From here a crash the process finds itself starts it again on the game list
     // (CrashReport::Recover); before, the system takes it, as a restart would crash again. The
@@ -3060,8 +3091,12 @@ int EmulatorMain() {
             restart.push_back(argument);
         }
     }
+#ifdef VITA_DEBUG_TOOLS
     VitaFrontend::CrashReport::EnableRecovery(restart,
                                               CommandChannel() ? command_file.LastSeq() : nullptr);
+#else
+    VitaFrontend::CrashReport::EnableRecovery(restart, nullptr);
+#endif
     bool running = true;
 #ifdef VITA_DIAGNOSTICS
     // The replay player's vpk carries its capture; the emulator's replays one it is launched
@@ -3133,12 +3168,12 @@ int EmulatorMain() {
     };
     const auto install_selected = [&] {
         std::string outcome = ui.InstallSelected(present_list);
-        sceClibPrintf("[azahar] install: %s\n", outcome.c_str());
+        LOG_INFO(Frontend, "install: {}", outcome);
         show_outcome(std::move(outcome));
     };
     const auto check_selected = [&] {
         const std::string outcome = ui.CheckSelected(present_list);
-        sceClibPrintf("[azahar] check: %s\n", outcome.c_str());
+        LOG_INFO(Frontend, "check: {}", outcome);
         show_notice(outcome + "\n\n" + Tr("Press X or O to continue."));
     };
     while (running && !window.IsQuitRequested()) {
@@ -3147,9 +3182,9 @@ int EmulatorMain() {
             g_crash_files.reset();
         }
         if (!g_crash_notice.empty()) {
-            sceClibPrintf("[azahar] crash notice shown\n");
+            LOG_INFO(Frontend, "crash notice shown");
             show_notice(std::exchange(g_crash_notice, {}));
-            sceClibPrintf("[azahar] crash notice closed\n");
+            LOG_INFO(Frontend, "crash notice closed");
         }
         window.PollEvents();
         // The banner before the interface: the list leaves the panel open for the banner as the
@@ -3189,49 +3224,50 @@ int EmulatorMain() {
             break;
         case VitaFrontend::Ui::Action::ClearData: {
             const std::string outcome = ui.ClearData(present_list);
-            sceClibPrintf("[azahar] clear: %s\n", outcome.c_str());
+            LOG_INFO(Frontend, "clear: {}", outcome);
             show_notice(outcome + "\n\n" + Tr("Press X or O to continue."));
             break;
         }
         default:
             break;
         }
+#ifdef VITA_DEBUG_TOOLS
         if (const std::string command = running && CommandChannel() ? command_file.Poll() : "";
             command.starts_with("launch ")) {
-            sceClibPrintf("[azahar] %s (command)\n", command.c_str());
+            LOG_INFO(Frontend, "{} (command)", command);
             running = run_title(command.substr(7));
         } else if (command.starts_with("select ")) {
             const bool found = ui.SelectTitle(command.substr(7));
-            sceClibPrintf("[azahar] %s: %s (command)\n", command.c_str(),
-                          found ? "selected" : "no such title");
+            LOG_INFO(Frontend, "{}: {} (command)", command, found ? "selected" : "no such title");
         } else if (command == "rescan") {
             ui.ScanGames();
-            sceClibPrintf("[azahar] rescan (command)\n");
+            LOG_INFO(Frontend, "rescan (command)");
         } else if (command.starts_with("install ")) {
             // The CIA whose name or path holds the text, installed as the list's cross does.
             if (ui.SelectTitle(command.substr(8))) {
-                sceClibPrintf("[azahar] %s (command)\n", command.c_str());
+                LOG_INFO(Frontend, "{} (command)", command);
                 install_selected();
             } else {
-                sceClibPrintf("[azahar] %s: no such title (command)\n", command.c_str());
+                LOG_INFO(Frontend, "{}: no such title (command)", command);
             }
         } else if (command.starts_with("check ")) {
             // The title whose name or path holds the text, checked as its File tab does.
             if (ui.SelectTitle(command.substr(6))) {
-                sceClibPrintf("[azahar] %s (command)\n", command.c_str());
+                LOG_INFO(Frontend, "{} (command)", command);
                 const std::string outcome = ui.CheckSelected(present_list);
-                sceClibPrintf("[azahar] check: %s\n", outcome.c_str());
+                LOG_INFO(Frontend, "check: {}", outcome);
                 show_outcome(outcome);
             } else {
-                sceClibPrintf("[azahar] %s: no such title (command)\n", command.c_str());
+                LOG_INFO(Frontend, "{}: no such title (command)", command);
             }
         } else if (command == "exit") {
             running = false;
         } else if (!command.empty() && !RunSettingCommand(command) &&
                    !VitaFrontend::Multiplayer::RunCommand(system, command) &&
                    !VitaFrontend::Adhoc::RunCommand(system, command)) {
-            sceClibPrintf("[azahar] command \"%s\" not known on the game list\n", command.c_str());
+            LOG_INFO(Frontend, "command \"{}\" not known on the game list", command);
         }
+#endif
     }
 
     banner.Stop();
@@ -3303,9 +3339,11 @@ int main(int argc, char* argv[]) {
     SetupTerminateHandler();
     Common::Log::SetStopHook(VitaFrontend::CrashReport::BlankDisplay);
     VitaFrontend::CrashReport::PrintLast();
+#ifdef VITA_DEBUG_TOOLS
     if (CommandChannel()) {
         VitaFrontend::CrashReport::StartStallWatch();
     }
+#endif
     // Before anything is brought up, because the first start after a boot restarts from here.
     g_native_error = LoadAzaharNative(relaunched);
     if (!g_native_error) {

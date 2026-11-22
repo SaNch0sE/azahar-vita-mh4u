@@ -40,8 +40,10 @@ bool Active();
 /// the last error.
 std::string Status();
 
+#ifdef VITA_DEBUG_TOOLS
 /// The command channel's `adhoc host [NICK]`, `adhoc join [NICK]`, `adhoc leave` and `adhoc`
 /// (the status): whether `command` was one of them.
 bool RunCommand(Core::System& system, const std::string& command);
+#endif
 
 } // namespace VitaFrontend::Adhoc

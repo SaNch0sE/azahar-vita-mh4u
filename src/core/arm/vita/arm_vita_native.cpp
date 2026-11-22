@@ -100,10 +100,13 @@ u64 GuestTickHz(const Core::Timing::Timer& timer) {
 }
 
 u64 TicksToNanoseconds(s64 ticks) {
-    if (ticks <= 0) {
-        return 0;
-    }
-    return static_cast<u64>(ticks) * 1'000'000'000ull / BASE_CLOCK_RATE_ARM11;
+    // 32.32 fixed point: 64-bit division and doubles are library calls on ARM32. The result only
+    // sizes a slice, which every caller clamps.
+    const s64 one_second = static_cast<s64>(guest_tick_hz.load(std::memory_order_relaxed));
+    return ticks <= 0 ? 0
+                      : (static_cast<u64>(std::min(ticks, one_second)) *
+                         ns_per_tick_q32.load(std::memory_order_relaxed)) >>
+                            32;
 }
 
 /// Every guest page is mapped RWX; the process's own permissions are not tracked.
@@ -3180,7 +3183,8 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
     // The last slice's request: every input is set again here.
     run.ctx.tpidruro = cp15[CP15_THREAD_URO];
     run.ctx.tpidrurw = cp15[CP15_THREAD_UPRW];
-    run.quantum_us = static_cast<u32>(quantum_ns / 1000);
+    DEBUG_ASSERT(quantum_ns <= MaxQuantumNs);
+    run.quantum_us = static_cast<u32>(quantum_ns) / 1000u; // a 32-bit division
     // The svcs the module answers without an exit (none of their answers change before one).
     run.fast = AZAHAR_FAST_ALL;
     auto& kernel = system.Kernel();

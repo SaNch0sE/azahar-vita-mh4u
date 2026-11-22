@@ -44,6 +44,8 @@
 
 namespace Common::Log {
 
+std::array<Level, static_cast<std::size_t>(Class::Count)> class_level{}; // all Trace
+
 namespace {
 
 /**
@@ -321,6 +323,7 @@ public:
         Filter filter;
         filter.ParseFilterString(Settings::values.log_filter.GetValue());
         instance = std::unique_ptr<Impl, decltype(&Deleter)>(new Impl(callback, filter), Deleter);
+        class_level = filter.ClassLevels();
         initialization_in_progress_suppress_logging = false;
     }
 #endif
@@ -331,11 +334,14 @@ public:
         }
         initialization_in_progress_suppress_logging = true;
         const auto& log_dir = FileUtil::GetUserPath(FileUtil::UserPath::LogDir);
+#ifndef __vita__ // no log file there
         void(FileUtil::CreateFullPath(log_dir));
+#endif
         Filter filter;
         filter.ParseFilterString(Settings::values.log_filter.GetValue());
         instance = std::unique_ptr<Impl, decltype(&Deleter)>(
             new Impl(fmt::format("{}{}", log_dir, log_file), filter), Deleter);
+        class_level = filter.ClassLevels();
         initialization_in_progress_suppress_logging = false;
         logging_initialized = true;
     }
@@ -352,6 +358,7 @@ public:
 
     void SetGlobalFilter(const Filter& f) {
         filter = f;
+        class_level = f.ClassLevels();
     }
 
     bool SetRegexFilter(const std::string& regex) {

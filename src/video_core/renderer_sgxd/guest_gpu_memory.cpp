@@ -20,7 +20,6 @@
 #include "sgxd.h"
 #include "sgxd_ptla.h"
 #ifdef VITA_DIAGNOSTICS
-#include <psp2/kernel/clib.h>
 #include <psp2/kernel/threadmgr.h>
 #endif
 
@@ -52,33 +51,6 @@ void GuestGpuMemory::DescribePool(char* out, std::size_t size) {
     std::snprintf(out, size, "GPU pool %u of %u KiB", live->pool_used.load() * 4,
                   live->pool_pages.load() * 4);
 }
-
-#ifdef VITA_DIAGNOSTICS
-namespace {
-// pagewatch's range, [start, end): none when end is 0.
-std::pair<PAddr, PAddr> WatchRange() {
-    static const std::pair<PAddr, PAddr> range = [] {
-        const PAddr start = SgxdFlagValue("pagewatch");
-        const u32 bytes = SgxdFlagValue("pagewatch_bytes");
-        return std::pair<PAddr, PAddr>{start, start != 0 && bytes != 0 ? start + bytes : 0};
-    }();
-    return range;
-}
-} // namespace
-
-void GuestGpuMemory::WatchNote(const char* what, PAddr addr, u32 size, const std::string& detail) {
-    const auto [start, end] = WatchRange();
-    if (end == 0 || addr >= end || addr + size <= start) {
-        return;
-    }
-    const GuestGpuMemory* const live = live_guest_memory.load(std::memory_order_acquire);
-    sceClibPrintf("[azahar] pagewatch: sys %u frame %u: move %08x+%x by %s%s%s\n",
-                  static_cast<unsigned>(sceKernelGetSystemTimeWide()),
-                  live ? static_cast<unsigned>(live->frame.load(std::memory_order_relaxed)) : 0u,
-                  static_cast<unsigned>(addr), static_cast<unsigned>(size), what,
-                  detail.empty() ? "" : ": ", detail.c_str());
-}
-#endif
 
 GuestGpuMemory::GuestGpuMemory([[maybe_unused]] Memory::MemorySystem& memory) {
     live_guest_memory.store(this, std::memory_order_release);
@@ -423,10 +395,10 @@ void GuestGpuMemory::ReturnStale() {
     stats.returns++;
     stats.returned_pages += returned;
 #endif
-    LOG_INFO(Render,
-             "sgxd: {} FCRAM page(s) unused for {} frames back from CDRAM in {} us; pool {} of "
-             "{} pages",
-             returned, StaleFrames, us, pool_used.load(), pool_owner.size());
+    LOG_DEBUG(Render,
+              "sgxd: {} FCRAM page(s) unused for {} frames back from CDRAM in {} us; pool {} of "
+              "{} pages",
+              returned, StaleFrames, us, pool_used.load(), pool_owner.size());
 }
 
 #ifdef VITA_DIAGNOSTICS
@@ -437,22 +409,6 @@ void GuestGpuMemory::NoteReturn(const std::vector<std::pair<u32, u32>>& pages, c
     }
     last_return_frame = frame.load(std::memory_order_relaxed);
     last_return_kind = kind;
-    const auto [start, end] = WatchRange();
-    u32 in_range = 0, first = 0, last = 0;
-    for (const auto& [page, slot] : pages) {
-        const PAddr addr = Memory::FCRAM_PADDR + page * PageSize;
-        if (end != 0 && addr >= start && addr < end) {
-            first = in_range++ == 0 ? addr : first;
-            last = addr;
-        }
-    }
-    if (in_range != 0) {
-        sceClibPrintf("[azahar] pagewatch: sys %u frame %u: return %u pages %08x-%08x (%s)\n",
-                      static_cast<unsigned>(sceKernelGetSystemTimeWide()),
-                      static_cast<unsigned>(last_return_frame), static_cast<unsigned>(in_range),
-                      static_cast<unsigned>(first), static_cast<unsigned>(last + PageSize - 1),
-                      kind);
-    }
 }
 
 std::string GuestGpuMemory::DescribePages(PAddr addr, u32 size) const {
@@ -566,11 +522,11 @@ void GuestGpuMemory::MakeUncached([[maybe_unused]] PAddr addr, [[maybe_unused]] 
     stats.pages += moved_pages;
     stats.copied_pages += copied_pages;
 #endif
-    LOG_INFO(Render,
-             "sgxd: FCRAM {:#010x}+{:#x} to CDRAM{}: {} page(s) moved, {} copied, in {} us; pool "
-             "{} of {} pages",
-             addr, size, overwritten ? " (the GPU overwrites it)" : "", moved_pages, copied_pages,
-             us, pool_used.load(), pool_owner.size());
+    LOG_DEBUG(Render,
+              "sgxd: FCRAM {:#010x}+{:#x} to CDRAM{}: {} page(s) moved, {} copied, in {} us; pool "
+              "{} of {} pages",
+              addr, size, overwritten ? " (the GPU overwrites it)" : "", moved_pages, copied_pages,
+              us, pool_used.load(), pool_owner.size());
 }
 
 #ifdef VITA_DIAGNOSTICS

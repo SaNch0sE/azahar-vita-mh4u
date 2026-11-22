@@ -9,7 +9,6 @@
 #include <mutex>
 #include <sstream>
 
-#include <psp2/kernel/clib.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
@@ -19,6 +18,7 @@
 #include "citra_vita/adhoc.h"
 #include "citra_vita/i18n.h"
 #include "citra_vita/multiplayer.h"
+#include "common/logging/log.h"
 #include "common/named_thread.h"
 #include "core/core.h"
 #include "network/network.h"
@@ -93,7 +93,7 @@ void Fail(const std::string& error) {
     std::scoped_lock lk{mutex};
     last_error = error;
     role = Role::None;
-    sceClibPrintf("[azahar] adhoc: %s\n", error.c_str());
+    LOG_INFO(Frontend, "adhoc: {}", error);
 }
 
 /// SceNetCtl's ad hoc events (sceNetCtlCheckCallback runs it): logged, with the result of an
@@ -101,8 +101,7 @@ void Fail(const std::string& error) {
 void OnEvent(int event_type, void*) {
     int error = 0;
     sceNetCtlAdhocGetResult(event_type, &error);
-    sceClibPrintf("[azahar] adhoc: event %d, result %08x\n", event_type,
-                  static_cast<unsigned>(error));
+    LOG_INFO(Frontend, "adhoc: event {}, result {:08x}", event_type, static_cast<unsigned>(error));
 }
 
 int State() {
@@ -124,7 +123,7 @@ std::string AddressText(u32 address) {
 
 void Disconnect() {
     const int left = sceNetCtlAdhocDisconnect();
-    sceClibPrintf("[azahar] adhoc: left the ad hoc network: %08x\n", static_cast<unsigned>(left));
+    LOG_INFO(Frontend, "adhoc: left the ad hoc network: {:08x}", static_cast<unsigned>(left));
     if (callback_id >= 0) {
         sceNetCtlAdhocUnregisterCallback(callback_id);
         callback_id = -1;
@@ -159,8 +158,8 @@ bool ConnectNow() {
         std::memcpy(id.data, CommId, sizeof(id.data));
         const SceNpCommunicationConfig config{&id, nullptr, nullptr};
         const int np = sceNpInit(&config, nullptr);
-        sceClibPrintf("[azahar] adhoc: NP with communication ID %s: %08x\n", CommId,
-                      static_cast<unsigned>(np));
+        LOG_INFO(Frontend, "adhoc: NP with communication ID {}: {:08x}", CommId,
+                 static_cast<unsigned>(np));
         if (np < 0) {
             Fail("NP did not start (" + Hex(np) + ")");
             return false;
@@ -180,7 +179,7 @@ bool ConnectNow() {
         sceNetCtlAdhocShellEventB(which);
     }
     const int asked = sceNetCtlAdhocConnectSsid(Ssid);
-    sceClibPrintf("[azahar] adhoc: connect to %s: %08x\n", Ssid, static_cast<unsigned>(asked));
+    LOG_INFO(Frontend, "adhoc: connect to {}: {:08x}", Ssid, static_cast<unsigned>(asked));
     if (asked < 0) {
         Fail("the system refused the ad hoc connection (" + Hex(asked) + ")");
         return false;
@@ -191,12 +190,11 @@ bool ConnectNow() {
     for (int tick = 0; tick < ConnectSeconds * 10; tick++) {
         const int state = State();
         if (state != last) {
-            sceClibPrintf("[azahar] adhoc: state %d after %d ms\n", state, tick * 100);
+            LOG_INFO(Frontend, "adhoc: state {} after {} ms", state, tick * 100);
             last = state;
         }
         if (state == StateConnected) {
-            sceClibPrintf("[azahar] adhoc: connected, address %s\n",
-                          AddressText(Address()).c_str());
+            LOG_INFO(Frontend, "adhoc: connected, address {}", AddressText(Address()));
             return true;
         }
         sceKernelDelayThread(100 * 1000);
@@ -211,7 +209,7 @@ bool ConnectNow() {
 int OpenSocket(int type, u16 port, u16 vport, int timeout_ms) {
     const int s = sceNetSocket("azahar-adhoc", SCE_NET_AF_INET, type, 0);
     if (s < 0) {
-        sceClibPrintf("[azahar] adhoc: socket type %d: %08x\n", type, static_cast<unsigned>(s));
+        LOG_INFO(Frontend, "adhoc: socket type {}: {:08x}", type, static_cast<unsigned>(s));
         return s;
     }
     const int on = 1;
@@ -226,8 +224,8 @@ int OpenSocket(int type, u16 port, u16 vport, int timeout_ms) {
     sin.sin_addr.s_addr = SCE_NET_INADDR_ANY;
     const int bound = sceNetBind(s, reinterpret_cast<SceNetSockaddr*>(&sin), sizeof(sin));
     if (bound < 0) {
-        sceClibPrintf("[azahar] adhoc: socket type %d bound to port %u vport %u: %08x\n", type,
-                      port, vport, static_cast<unsigned>(bound));
+        LOG_INFO(Frontend, "adhoc: socket type {} bound to port {} vport {}: {:08x}", type, port,
+                 vport, static_cast<unsigned>(bound));
         sceNetSocketClose(s);
         return bound;
     }
@@ -285,8 +283,8 @@ std::pair<u32, u16> FindRoom() {
         in >> tag >> version >> port;
         if (tag == AnnounceTag && version == 1 && port > 0 && port <= 65535) {
             found = {from.sin_addr.s_addr, static_cast<u16>(port)};
-            sceClibPrintf("[azahar] adhoc: room announced by %s port %d: %s\n",
-                          AddressText(found.first).c_str(), port, buffer);
+            LOG_INFO(Frontend, "adhoc: room announced by {} port {}: {}", AddressText(found.first),
+                     port, buffer);
         }
     }
     sceNetSocketClose(s);
@@ -326,8 +324,8 @@ void HostNow(Core::System& system, const std::string& nickname) {
         Abandon("the room did not open on " + AddressText(address));
         return;
     }
-    sceClibPrintf("[azahar] adhoc: hosting a room on %s port %u\n", AddressText(address).c_str(),
-                  Network::DefaultRoomPort);
+    LOG_INFO(Frontend, "adhoc: hosting a room on {} port {}", AddressText(address),
+             Network::DefaultRoomPort);
     {
         std::scoped_lock lk{mutex};
         role = Role::Hosting;
@@ -423,6 +421,7 @@ std::string Status() {
     }
 }
 
+#ifdef VITA_DEBUG_TOOLS
 bool RunCommand(Core::System& system, const std::string& command) {
     std::istringstream in(command);
     std::string word, verb, argument;
@@ -434,20 +433,21 @@ bool RunCommand(Core::System& system, const std::string& command) {
         argument.empty() ? Multiplayer::CurrentFields().nickname : argument;
     if (verb == "host" || verb == "join") {
         if (!system.IsPoweredOn()) {
-            sceClibPrintf("[azahar] adhoc: %s needs a running title (command)\n", verb.c_str());
+            LOG_INFO(Frontend, "adhoc: {} needs a running title (command)", verb);
         } else if (verb == "host") {
-            sceClibPrintf("[azahar] adhoc: hosting as %s (command)\n", nickname.c_str());
+            LOG_INFO(Frontend, "adhoc: hosting as {} (command)", nickname);
             Host(system, nickname);
         } else {
-            sceClibPrintf("[azahar] adhoc: joining as %s (command)\n", nickname.c_str());
+            LOG_INFO(Frontend, "adhoc: joining as {} (command)", nickname);
             Join(system, nickname);
         }
     } else if (verb == "leave") {
         Leave();
     } else {
-        sceClibPrintf("[azahar] adhoc: %s (command)\n", Status().c_str());
+        LOG_INFO(Frontend, "adhoc: {} (command)", Status());
     }
     return true;
 }
+#endif
 
 } // namespace VitaFrontend::Adhoc

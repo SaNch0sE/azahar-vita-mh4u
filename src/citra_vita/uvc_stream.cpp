@@ -6,10 +6,9 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
-#include <vector>
 #include <type_traits>
+#include <vector>
 #include <arm_neon.h>
-#include <psp2/kernel/clib.h>
 #include "azahar_native.h"
 #include "citra_vita/i18n.h"
 #include "citra_vita/uvc_stream.h"
@@ -232,7 +231,6 @@ bool Start(int screen) {
     LOG_INFO(Frontend, "usb video: {} screen, start {:#010x}", screen == 1 ? "top" : "bottom",
              static_cast<u32>(r));
     if (r < 0) {
-        sceClibPrintf("[azahar] usb video: not started (%08x)\n", static_cast<unsigned>(r));
         problem.store(
             r == AZAHAR_ERR_TAKEN
                 ? TakenText

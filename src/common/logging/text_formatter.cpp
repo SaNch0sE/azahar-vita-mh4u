@@ -9,6 +9,8 @@
 #include <windows.h>
 #elif defined(ANDROID)
 #include <android/log.h>
+#elif defined(__vita__)
+#include <psp2/kernel/clib.h>
 #endif
 
 #include "common/assert.h"
@@ -34,7 +36,15 @@ std::string FormatLogMessage(const Entry& entry) {
 
 void PrintMessage(const Entry& entry) {
     const auto str = FormatLogMessage(entry).append(1, '\n');
+#ifdef __vita__
+    // A line from before the backend starts (an assert's message in main's first steps): stderr
+    // reaches nothing on the Vita, the debug channel reaches the console, and the crash report
+    // keeps it.
+    sceClibPrintf("%s", str.c_str());
+    AppendCrashReport(str);
+#else
     fputs(str.c_str(), stderr);
+#endif
 }
 
 void PrintColoredMessage(const Entry& entry) {

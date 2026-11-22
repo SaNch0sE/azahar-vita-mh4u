@@ -261,11 +261,6 @@ int azaharSystemVolume(int step) {
     if (sgxd_state == SGXD_OWNED && sgxd_owner == ksceKernelGetProcessId() && shell_av_data) {
         int route = 0, spare = 0;
         shell_route(&route, &spare);
-        static int logged_route = -1;
-        if (route != logged_route) {
-            SGXD_LOG("shell: volume step on output route %d\n", route);
-            logged_route = route;
-        }
         if (route != 1 && route != 2) {
             // HDMI, USB and no output: SceShell's handler steps nothing either.
             ret = AZAHAR_ERR_ROUTE;

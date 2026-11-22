@@ -784,6 +784,7 @@ void EmuWindowVita::DrawGuestScreens() {
     for (const u32 i : draw_order) {
         const GuestScreen& s = screens[i];
         const PlacedScreen& place = placed[i];
+#ifdef VITA_DIAGNOSTICS
         std::array<u32, 5>& seen = screens_seen[i];
         const bool flipped = s.address == seen[0] || s.address == seen[1];
         if (!flipped || s.format != seen[2] || s.stride != seen[3] || (s.fill ? 1u : 0u) != seen[4]) {
@@ -798,6 +799,7 @@ void EmuWindowVita::DrawGuestScreens() {
                      place.quad.x[0], place.quad.y[0], place.quad.x[1], place.quad.y[1],
                      place.quad.x[2], place.quad.y[2], place.quad.x[3], place.quad.y[3]);
         }
+#endif
         if (!s.fill && s.address != 0) {
             // The stream reads the LCD buffer with the CPU: a screen picture's bytes go there
             // first.

@@ -168,10 +168,12 @@ static int shellcdram_shell_redirect(const uint8_t *save, int on_copy) {
         reback_tlb_flush_all();
     }
     ksceKernelProcessSwitchContext(&prev, NULL);
-    SGXD_LOG("shell CDRAM: the shell's window (pid %08x, level-1 %08x) on %s: %u pages of the "
-             "range, %u others, %u read-only -> %d\n",
-             (uint32_t)pid, shellcdram_shell_old_l1[0], on_copy ? "the copy" : "our tables",
-             moved, kept, read_only, ret);
+    if (ret < 0) {
+        SGXD_LOG("shell CDRAM: the shell's window (pid %08x, level-1 %08x) on %s: %u pages of the "
+                 "range, %u others, %u read-only -> %d\n",
+                 (uint32_t)pid, shellcdram_shell_old_l1[0], on_copy ? "the copy" : "our tables",
+                 moved, kept, read_only, ret);
+    }
     return ret;
 }
 
@@ -188,17 +190,12 @@ static void shellcdram_move(int to_copy) {
     for (uint32_t i = 0; i < SHELLCDRAM_PAGES / 32; i++) {
         done[i] = 0;
     }
-    uint32_t carried = 0, moved = 0;
-    // The move's time by step, in microseconds (the log line at its end).
-    SceUInt64 t_copy = 0, t_turn = 0, t_carry = 0, t_restore = 0;
-    const SceUInt64 t0 = ksceKernelGetSystemTimeWide();
+    uint32_t carried = 0;
     for (uint32_t slot = 0; slot < SHELLCDRAM_SLOTS; slot++) {
         const uint32_t page = shellcdram_shell_page[slot];
         if (page == SHELLCDRAM_NO_PAGE) {
             continue;
         }
-        moved++;
-        SceUInt64 t = ksceKernelGetSystemTimeWide();
         // The copy: the kernel's cached view, which the shell's shares (one cache).
         uint32_t *const r = (uint32_t *)(alias + (page << 12));
         uint32_t *const c = (uint32_t *)(save + (page << 12));
@@ -207,18 +204,12 @@ static void shellcdram_move(int to_copy) {
         memcpy(keep, to, 0x1000);
         memcpy(snap, from, 0x1000);
         memcpy(to, snap, 0x1000);
-        SceUInt64 now = ksceKernelGetSystemTimeWide();
-        t_copy += now - t;
-        t = now;
         asm volatile("dsb" ::: "memory");
         shellcdram_shell_l2[slot] = (to_copy ? shellcdram_shell_on_copy : shellcdram_shell_on_range)[slot];
         // TLBIMVAAIS: the shell's entries for the page, on every core.
         asm volatile("dsb \n mcr p15, 0, %0, c8, c3, 3 \n dsb \n isb" ::"r"(
                          SHELLCDRAM_SHELL_VA + (slot << 12))
                      : "memory");
-        now = ksceKernelGetSystemTimeWide();
-        t_turn += now - t;
-        t = now;
         // The old place as the shell left it, then each word it changed there, unless it has
         // written that word in the new place since (read there, a word, only then).
         memcpy(now_words, from, 0x1000);
@@ -230,14 +221,9 @@ static void shellcdram_move(int to_copy) {
                 carried++;
             }
         }
-        now = ksceKernelGetSystemTimeWide();
-        t_carry += now - t;
-        t = now;
         memcpy(from, keep, 0x1000);
-        t_restore += ksceKernelGetSystemTimeWide() - t;
         done[page / 32] |= 1u << (page % 32);
     }
-    const SceUInt64 t1 = ksceKernelGetSystemTimeWide();
     for (uint32_t page = 0; page < SHELLCDRAM_PAGES; page++) {
         if (done[page / 32] & (1u << (page % 32))) {
             continue;
@@ -248,16 +234,8 @@ static void shellcdram_move(int to_copy) {
         memcpy(r, c, 0x1000);
         memcpy(c, keep, 0x1000);
     }
-    const SceUInt64 t2 = ksceKernelGetSystemTimeWide();
     ksceKernelDcacheCleanRange(save, SHELLCDRAM_SIZE);
     asm volatile("dsb" ::: "memory");
-    const SceUInt64 t3 = ksceKernelGetSystemTimeWide();
-    SGXD_LOG("shell CDRAM: %u pages moved to the %s in %u ms (copy %u, turn %u, carry %u, "
-             "restore %u), the other %u exchanged in %u ms, the copy cleaned in %u ms\n",
-             moved, to_copy ? "copy" : "range", (uint32_t)((t1 - t0) / 1000),
-             (uint32_t)(t_copy / 1000), (uint32_t)(t_turn / 1000), (uint32_t)(t_carry / 1000),
-             (uint32_t)(t_restore / 1000), SHELLCDRAM_PAGES - moved, (uint32_t)((t2 - t1) / 1000),
-             (uint32_t)((t3 - t2) / 1000));
     if (carried) {
         SGXD_LOG("shell CDRAM: %u words the shell wrote while its pages moved carried over\n",
                  carried);
@@ -276,7 +254,6 @@ static int shellcdram_suspended;
 static SceUID shellcdram_iftu_uid = -1;
 static tai_hook_ref_t shellcdram_iftu_ref;
 static volatile int shellcdram_iftu_in_hook; // callers inside the hook, for its release
-static volatile uint32_t shellcdram_iftu_kept_off; // frame buffers turned into the plane off
 
 static int shellcdram_iftu_hook(int plane, const uint32_t *params, int arg3, int sync) {
     __atomic_add_fetch(&shellcdram_iftu_in_hook, 1, __ATOMIC_SEQ_CST);
@@ -288,7 +265,6 @@ static int shellcdram_iftu_hook(int plane, const uint32_t *params, int arg3, int
         uint32_t off[SHELLCDRAM_IFTU_PARAMS / 4];
         memcpy(off, params, sizeof(off));
         off[0] = 0;
-        shellcdram_iftu_kept_off++;
         ret = TAI_CONTINUE(int, shellcdram_iftu_ref, plane, off, arg3, sync);
     } else {
         ret = TAI_CONTINUE(int, shellcdram_iftu_ref, plane, params, arg3, sync);
@@ -305,10 +281,10 @@ static void shellcdram_iftu_hook_once(void) {
     const SceUID uid = taiHookFunctionImportForKernel(AZAHAR_KERNEL_PID, &shellcdram_iftu_ref,
                                                       "SceDisplay", TAI_ANY_LIBRARY, 0x7CE0C4DAu,
                                                       shellcdram_iftu_hook);
-    SGXD_LOG("shell CDRAM: the shell's plane kept off while the range is the app's (hook %08x)\n",
-             (uint32_t)uid);
     if (uid >= 0) {
         shellcdram_iftu_uid = uid;
+    } else {
+        SGXD_LOG("shell CDRAM: the shell's plane not kept off (hook %08x)\n", (uint32_t)uid);
     }
 }
 
@@ -393,34 +369,8 @@ static void shellcdram_give_back(void) {
     if (shellcdram_pid < 0) {
         return;
     }
-    void *alias = NULL, *save = NULL;
-    ksceKernelGetMemBlockBase(shellcdram_alias, &alias);
-    ksceKernelGetMemBlockBase(shellcdram_save, &save);
-    // Which 64 KiB of the range differ from the save, before it goes back: the app's writes,
-    // and anyone else's while it was the app's (the shell's own CPU, the kernel's drivers).
-    uint32_t differ[SHELLCDRAM_SIZE / 0x10000 / 32] = {0};
-    uint32_t chunks = 0;
-    for (uint32_t c = 0; c < SHELLCDRAM_SIZE / 0x10000; c++) {
-        const volatile uint32_t *a = (const volatile uint32_t *)((uintptr_t)alias + c * 0x10000);
-        const uint32_t *b = (const uint32_t *)((uintptr_t)save + c * 0x10000);
-        for (uint32_t w = 0; w < 0x10000 / 4; w++) {
-            if (a[w] != b[w]) {
-                differ[c / 32] |= 1u << (c % 32);
-                chunks++;
-                break;
-            }
-        }
-    }
-    SGXD_LOG("shell CDRAM: %u of 256 64 KiB chunks differ from the copy: %08x %08x %08x %08x "
-             "%08x %08x %08x %08x\n",
-             chunks, differ[0], differ[1], differ[2], differ[3], differ[4], differ[5], differ[6],
-             differ[7]);
     shellcdram_move(0);
     shellcdram_shell_restore();
-    SGXD_LOG("shell CDRAM given back to the shell (process %08x's view gone); its plane was "
-             "kept off %u time(s)\n",
-             (uint32_t)shellcdram_pid, (uint32_t)shellcdram_iftu_kept_off);
-    shellcdram_iftu_kept_off = 0;
     shellcdram_free(1);
 }
 
@@ -538,10 +488,10 @@ int azaharShellCdram(uint32_t *user_va) {
         if (got >= 0) {
             got = sgxd_user_page(uva + SHELLCDRAM_SIZE - 0x1000, 1, &last, &par);
         }
-        SGXD_LOG("shell CDRAM: saved to %p; the app's view at %08x (level-1 %08x -> %08x), "
-                 "physical %08x..%08x\n",
-                 save, uva, shellcdram_old_l1[0], sections[0], first, last);
         if (got < 0 || first != SHELLCDRAM_PA || last != SHELLCDRAM_PA + SHELLCDRAM_SIZE - 0x1000) {
+            SGXD_LOG("shell CDRAM: saved to %p; the app's view at %08x (level-1 %08x -> %08x), "
+                     "physical %08x..%08x\n",
+                     save, uva, shellcdram_old_l1[0], sections[0], first, last);
             // Nothing was written into the range: the save copy is the shell's as it is.
             shellcdram_free(1);
             ret = AZAHAR_ERR_STATE;

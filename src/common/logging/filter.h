@@ -59,6 +59,11 @@ public:
     /// Returns true if any logging classes are set to debug
     bool IsDebug() const;
 
+    /// Each class's lowest level logged.
+    const std::array<Level, static_cast<std::size_t>(Class::Count)>& ClassLevels() const {
+        return class_levels;
+    }
+
 private:
     std::array<Level, static_cast<std::size_t>(Class::Count)> class_levels;
 };

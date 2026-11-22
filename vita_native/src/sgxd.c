@@ -261,9 +261,9 @@ static int sgxd_identify(SgxdInfo *info) {
                                                 SGXD_GPU_SYSEVENT_CODE);
     const uint32_t lists = sgxd_fingerprint((const uint8_t *)(data + SGXD_GPU_REGLISTS),
                                             SGXD_GPU_REGLISTS_SIZE);
-    SGXD_LOG("SceGpuEs4 text %08x data %08x, handler %08x, register lists %08x\n",
-             (uint32_t)text, (uint32_t)data, code, lists);
     if (code != SGXD_GPU_SYSEVENT_PRINT || lists != SGXD_GPU_REGLISTS_PRINT) {
+        SGXD_LOG("SceGpuEs4 text %08x data %08x, handler %08x, register lists %08x\n",
+                 (uint32_t)text, (uint32_t)data, code, lists);
         info->step_status = (int32_t)(code != SGXD_GPU_SYSEVENT_PRINT ? code : lists);
         return SGXD_ERR_FIRMWARE;
     }
@@ -910,13 +910,17 @@ static int sgxd_take_locked(SgxdInfo *info) {
     }
     if (sgxd_sysevent_uid < 0) {
         r = ksceKernelRegisterSysEventHandler("SceSgxd", sgxd_sysevent, NULL);
-        SGXD_LOG("sysevent handler: 0x%08x\n", (uint32_t)r);
+        if (r < 0) {
+            SGXD_LOG("sysevent handler: 0x%08x\n", (uint32_t)r);
+        }
         sgxd_sysevent_uid = r;
     }
     if (sgxd_standby_uid < 0) {
         r = ksceKernelRegisterSysEventHandler("SceSgxdStandby", sgxd_standby_sysevent, NULL);
         const int first = r < 0 ? r : sgxd_sysevent_first(r, sgxd_standby_sysevent);
-        SGXD_LOG("standby handler: 0x%08x, first 0x%08x\n", (uint32_t)r, (uint32_t)first);
+        if (r < 0 || first < 0) {
+            SGXD_LOG("standby handler: 0x%08x, first 0x%08x\n", (uint32_t)r, (uint32_t)first);
+        }
         if (r >= 0 && first < 0) {
             // A list not as decomp sysmem.c has it: no early ask, the standby goes on as before.
             ksceKernelUnregisterSysEventHandler(r);
@@ -1022,11 +1026,13 @@ int sgxdTake(SgxdInfo *user_info) {
             sgxd_owner = -1;
         }
     }
-    SGXD_LOG("take -> %d: step %u status %08x, core id %08x revision %08x, %u cores, "
-             "quiesce %u, bif %08x/%08x/%08x, %u us\n",
-             ret, info.step, (uint32_t)info.step_status, info.core_id, info.core_revision,
-             info.cores, info.quiesce_tries, info.bif_int_stat, info.bif_fault,
-             info.master_bif_fault, info.take_us);
+    if (ret != 0) {
+        SGXD_LOG("take -> %d: step %u status %08x, core id %08x revision %08x, %u cores, "
+                 "quiesce %u, bif %08x/%08x/%08x, %u us\n",
+                 ret, info.step, (uint32_t)info.step_status, info.core_id, info.core_revision,
+                 info.cores, info.quiesce_tries, info.bif_int_stat, info.bif_fault,
+                 info.master_bif_fault, info.take_us);
+    }
     sgxd_leave();
 out:
     info.size = sizeof(info);
@@ -1063,8 +1069,9 @@ static int sgxd_release_locked(void) {
     sgxd_mmu_free();
     sgxd_state = SGXD_NONE;
     sgxd_owner = -1;
-    SGXD_LOG("release (%s), %u GPU page(s) were mapped\n", was == SGXD_OWNED ? "handed back" : "was lost",
-             pages);
+    if (was != SGXD_OWNED) {
+        SGXD_LOG("release (was lost), %u GPU page(s) were mapped\n", pages);
+    }
     return 0;
 }
 
@@ -1296,7 +1303,9 @@ int sgxdResetAll(void) {
         sgxd_mmu_program();
         ret = 0;
     }
-    SGXD_LOG("reset all -> %08x\n", (uint32_t)ret);
+    if (ret != 0) {
+        SGXD_LOG("reset all -> %08x\n", (uint32_t)ret);
+    }
     sgxd_leave();
 out:
     EXIT_SYSCALL(state);
@@ -1366,7 +1375,9 @@ int sgxdWaker(int32_t user_flag, uint32_t bits) {
             ksceKernelSpinlockLowUnlockCpuResumeIntr(&sgxd_isr_lock, st);
         }
     }
-    SGXD_LOG("waker %08x bits %x -> %08x\n", (uint32_t)user_flag, bits, (uint32_t)ret);
+    if (ret < 0) {
+        SGXD_LOG("waker %08x bits %x -> %08x\n", (uint32_t)user_flag, bits, (uint32_t)ret);
+    }
     sgxd_leave();
 out:
     EXIT_SYSCALL(state);
@@ -1435,7 +1446,9 @@ int sgxdEvents(SgxdEvents *user_events) {
             }
         }
     }
-    SGXD_LOG("events %p -> %08x\n", user_events, (uint32_t)ret);
+    if (ret < 0) {
+        SGXD_LOG("events %p -> %08x\n", user_events, (uint32_t)ret);
+    }
     sgxd_leave();
 out:
     EXIT_SYSCALL(state);
@@ -1472,7 +1485,9 @@ int sgxdStandby(int32_t user_flag, uint32_t bits) {
             sgxd_standby_bits = bits;
         }
     }
-    SGXD_LOG("standby flag %08x bits %x -> %08x\n", (uint32_t)user_flag, bits, (uint32_t)ret);
+    if (ret < 0) {
+        SGXD_LOG("standby flag %08x bits %x -> %08x\n", (uint32_t)user_flag, bits, (uint32_t)ret);
+    }
     sgxd_leave();
 out:
     EXIT_SYSCALL(state);
@@ -1639,8 +1654,10 @@ int sgxdMapTables(uint32_t gpu_va) {
                 sgxd_tables_va = gpu_va;
             }
         }
-        SGXD_LOG("map tables at gpu %08x (pa %08x, %08x bytes) -> %08x\n", gpu_va, sgxd_mmu_pa,
-                 SGXD_MMU_SIZE, (uint32_t)ret);
+        if (ret < 0) {
+            SGXD_LOG("map tables at gpu %08x (pa %08x, %08x bytes) -> %08x\n", gpu_va, sgxd_mmu_pa,
+                     SGXD_MMU_SIZE, (uint32_t)ret);
+        }
     }
     sgxd_leave();
 out:
@@ -1715,9 +1732,12 @@ int sgxdMap(uint32_t gpu_va, const void *user_va, uint32_t size, uint32_t flags)
         if (ret == 0) {
             ret = sgxd_map_locked(gpu_va, (uint32_t)(uintptr_t)user_va, size, flags);
         }
-        SGXD_LOG("map gpu %08x <- user %08x, %08x bytes, flags %x -> %08x (%u tables, %u pages)\n",
-                 gpu_va, (uint32_t)(uintptr_t)user_va, size, flags, (uint32_t)ret,
-                 sgxd_mmu_tables, sgxd_mmu_pages);
+        if (ret < 0) {
+            SGXD_LOG("map gpu %08x <- user %08x, %08x bytes, flags %x -> %08x (%u tables, %u "
+                     "pages)\n",
+                     gpu_va, (uint32_t)(uintptr_t)user_va, size, flags, (uint32_t)ret,
+                     sgxd_mmu_tables, sgxd_mmu_pages);
+        }
         sgxd_leave();
     }
     EXIT_SYSCALL(state);

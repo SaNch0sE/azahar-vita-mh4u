@@ -13,12 +13,12 @@
 #include <fmt/format.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
-#include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include "common/assert.h"
 #include "common/build_id.h"
 #include "common/file_util.h"
 #include "common/hash.h"
+#include "common/logging/log.h"
 #include "common/named_thread.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -185,8 +185,29 @@ void Load(std::stop_token stop) {
             removed = true;
         }
     }
-    sceClibPrintf("[azahar] shader cache: %u programs read in %u ms, %u damaged\n", read,
-                  static_cast<unsigned>((sceKernelGetProcessTimeWide() - start) / 1000), damaged);
+    {
+        std::scoped_lock lock{s.mutex};
+        s.failed = removed || unread;
+        // The programs stored before their records were read are in the file: not written again.
+        std::vector<u8> kept;
+        bool none = false;
+        Records(s.pending.data(), s.pending.size(), none, [&](const u8* r, std::size_t length) {
+            if (!stored_first[Get<u32>(r + 12)].contains(Get<u64>(r + 4))) {
+                kept.insert(kept.end(), r, r + length);
+            }
+            return true;
+        });
+        s.pending = std::move(kept);
+        s.file_bytes = whole;
+        s.read = true;
+    }
+    LOG_INFO(Frontend, "shader cache {}: {} fragment and {} vertex programs read in {} ms{}",
+             s.path, read[0], read[1],
+             static_cast<unsigned>((sceKernelGetProcessTimeWide() - start) / 1000),
+             unread          ? std::string{"; a read failed: nothing stored this run"}
+             : whole != size ? fmt::format(", {} bytes after them {}", size - whole,
+                                           removed ? "not cut: the file removed" : "cut")
+                             : std::string{});
 }
 
 } // namespace
@@ -224,24 +245,7 @@ void ShaderDiskCache::Open(u64 title_id) {
         s.read = false;
         s.failed = false;
         sceIoMkdir(Directory, 0777);
-        sceIoMkdir(path.c_str(), 0777);
-        // The programs there (PathIn's names).
-        if (const SceUID d = sceIoDopen(path.c_str()); d >= 0) {
-            SceIoDirent entry{};
-            while (sceIoDread(d, &entry) > 0) {
-                const bool vertex = EndsWith(entry.d_name, ".v");
-                char* end = nullptr;
-                const u64 key = std::strtoull(entry.d_name, &end, 16);
-                if ((vertex || EndsWith(entry.d_name, ".f")) && end == entry.d_name + 16 &&
-                    *end == '.') {
-                    s.keys[vertex ? 1 : 0].insert(key);
-                }
-            }
-            sceIoDclose(d);
-        }
-        sceClibPrintf("[azahar] shader cache %s: %u fragment and %u vertex programs\n",
-                      path.c_str(), static_cast<unsigned>(s.keys[0].size()),
-                      static_cast<unsigned>(s.keys[1].size()));
+        sceIoMkdir(directory.c_str(), 0777);
         s.loader = Common::NamedThread{Common::ThreadCfg{"SgxdShaderLoad", 256 * 1024},
                                        [](std::stop_token stop) { Load(stop); }};
     }

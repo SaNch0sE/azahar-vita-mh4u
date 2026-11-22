@@ -54,8 +54,10 @@ bool InRoom();
 /// The room's members, each "nickname - game" (as the room last sent them).
 std::vector<std::string> Members();
 
+#ifdef VITA_DEBUG_TOOLS
 /// The command channel's `room join HOST PORT NICK [PASSWORD]`, `room leave` and `room`
 /// (the status and the members): whether `command` was one of them.
 bool RunCommand(Core::System& system, const std::string& command);
+#endif
 
 } // namespace VitaFrontend::Multiplayer

@@ -11,11 +11,10 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
 #include <psp2/display.h>
-#include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
-#include <fmt/format.h>
 
 #include "citra_vita/crash_report.h"
 #include "citra_vita/i18n.h"
@@ -174,9 +173,7 @@ Common::NamedThread display_thread;
 
 template <typename... Args>
 void Report(fmt::format_string<Args...> format, Args&&... args) {
-    const std::string text = fmt::format(format, std::forward<Args>(args)...);
-    LOG_INFO(Frontend, "{}", text);
-    sceClibPrintf("[azahar] %s\n", text.c_str());
+    LOG_INFO(Frontend, "{}", fmt::format(format, std::forward<Args>(args)...));
 }
 
 void FreeBlocks() {
@@ -550,6 +547,7 @@ bool Initialize(std::string* error) {
         FreeBlocks();
         return false;
     }
+#ifdef VITA_DIAGNOSTICS
     Report("sgxd: {} KiB at {:#010x}, {} display buffers at {:#010x}", g.size / 1024, RecipeVa,
            DisplayBuffers, DisplayVa);
     if (g.pb >= 0) {
@@ -558,6 +556,7 @@ bool Initialize(std::string* error) {
                sgxd_recipe_pb.first, sgxd_recipe_pb.last, PbVa + 0x40000, PbCdramPages, PbExtPages,
                PbExtVa, RecipeVa);
     }
+#endif
     g.initialized = true;
     display_thread = Common::NamedThread{Common::ThreadCfg{"SgxdDisplay"}, [] { DisplayLoop(); }};
     return true;
@@ -1188,10 +1187,12 @@ void EndFrame() {
         }
         g.last_issue_us = now_us;
         SgxdRenderer::SgxdTrace("sgx_present_end");
+#ifdef VITA_DIAGNOSTICS
         if (g.frame_index % 600 == 0) {
             Report("sgxd: frame {}: {} draws, {} vertices, {} indices (async)", g.frame_index,
                    g.batch.draw_count, g.batch.vertex_count, g.batch.index_count);
         }
+#endif
         g.frame_index++;
         return;
     }
@@ -1211,11 +1212,13 @@ void EndFrame() {
     g.shown_buffer = buffer;
     g.shown_fence = sgxd_chain_fence();
     ShowLast();
+#ifdef VITA_DIAGNOSTICS
     if (g.frame_index % 600 == 0) {
         Report("sgxd: frame {}: {} draws, {} vertices, {} indices; TA {} us, 3D {} us",
                g.frame_index, g.batch.draw_count, g.batch.vertex_count, g.batch.index_count,
                render.ta_us, render.d3_us);
     }
+#endif
     g.frame_index++;
 }
 

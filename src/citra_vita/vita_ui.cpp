@@ -24,7 +24,6 @@
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
-#include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 #include <psp2/rtc.h>
@@ -81,9 +80,10 @@ constexpr float ScreenWidth = 960.0f;
 constexpr float ScreenHeight = 544.0f;
 
 /// Where titles are looked for. One directory, no recursion: a console file manager is enough
-/// host0 does not open and adds nothing.
+/// work to use that a deep tree is worse than a flat one. A build with the debug tools also lists
+/// the host PC's ROMs (host0:roms); without one host0 does not open and adds nothing.
 constexpr char GameDirectory[] = "ux0:/data/azahar/roms";
-#ifdef VITA_DIAGNOSTICS
+#ifdef VITA_DEBUG_TOOLS
 constexpr char HostGameDirectory[] = "host0:roms";
 #endif
 
@@ -1352,8 +1352,7 @@ void ShowGxmNotice(const char* title, const std::string& text, const std::string
     for (bool done = false; !done;) {
         const bool overlaid = SystemUiOverlaid();
         if (overlaid != was_overlaid) {
-            sceClibPrintf("[azahar] notice: the system's UI %s the app\n",
-                          overlaid ? "over" : "off");
+            LOG_INFO(Frontend, "notice: the system's UI {} the app", overlaid ? "over" : "off");
             was_overlaid = overlaid;
         }
         if (overlaid) {
@@ -1623,7 +1622,7 @@ void Ui::ScanGames() {
     for (const std::string& folder : Config::RomFolders()) {
         scan(folder.c_str(), "");
     }
-#ifdef VITA_DIAGNOSTICS
+#ifdef VITA_DEBUG_TOOLS
     scan(HostGameDirectory, " (host0)");
 #endif
     // The titles installed from CIAs onto the emulated SD card, applications and demos, each by
@@ -4092,9 +4091,9 @@ bool Ui::LaunchChecked(const std::string& path, const std::function<void()>& pre
         result.outcome != RomCheck::Outcome::CutShort) {
         return true;
     }
-    sceClibPrintf("[azahar] launch check of %s: %s %s\n", path.c_str(),
-                  result.outcome == RomCheck::Outcome::Damaged ? "damaged in" : "cut short",
-                  result.part != nullptr ? result.part : "");
+    LOG_INFO(Frontend, "launch check of {}: {} {}", path,
+             result.outcome == RomCheck::Outcome::Damaged ? "damaged in" : "cut short",
+             result.part != nullptr ? result.part : "");
     selected_game_path = path;
     question = Question::Damaged;
     question_game = name;

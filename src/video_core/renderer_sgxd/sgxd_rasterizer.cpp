@@ -1526,8 +1526,8 @@ void RasterizerSgxd::NotifyP3D() {
     // A clear quad filled before it was alone in what would have been its pass.
     filled_site = -1;
     if (p3ds++ < 4 || p3ds % 60 == 0) {
-        LOG_INFO(Render, "P3D {}: {}; {} passes so far, {} opened by a covering draw", p3ds,
-                 in_pass ? "ended the open pass" : "no pass open", passes, covered_passes);
+        LOG_DEBUG(Render, "P3D {}: {}; {} passes so far, {} opened by a covering draw", p3ds,
+                  in_pass ? "ended the open pass" : "no pass open", passes, covered_passes);
     }
 }
 
@@ -4742,12 +4742,12 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     DumpProgram("vs", key, v.usse);
     DumpPicaVertex(key, config, pica.vs_setup);
     PlaceVertexCode(v);
-    LOG_INFO(Render,
-             "vertex program {:016x}: {} + {} words, {} PAs, {} temps, {} SAs, {} uniforms{}, "
-             "emitted in {} us{}",
-             state.program_hash, v.usse.primary.size(), v.usse.secondary.size(), v.usse.pa_count,
-             v.usse.temp_count, v.usse.secondary_reg_count, v.usse.uniforms.size(),
-             v.usse.per_instance ? ", per instance" : "", emit_us, taken ? " (worker)" : "");
+    LOG_DEBUG(Render,
+              "vertex program {:016x}: {} + {} words, {} PAs, {} temps, {} SAs, {} uniforms{}, "
+              "emitted in {} us{}",
+              state.program_hash, v.usse.primary.size(), v.usse.secondary.size(), v.usse.pa_count,
+              v.usse.temp_count, v.usse.secondary_reg_count, v.usse.uniforms.size(),
+              v.usse.per_instance ? ", per instance" : "", emit_us, taken ? " (worker)" : "");
     if (tier2 && v.usse.primary.size() >= Tier2Words) {
         v.tier2_queued = true;
         tier2->QueueVertex(key, request);
@@ -4830,9 +4830,9 @@ RasterizerSgxd::VertexProgram RasterizerSgxd::PlaceVertexProgram(Usse::Program u
     ResolveVertexProgram(v);
     DumpProgram("vs", key, v.usse);
     PlaceVertexCode(v);
-    LOG_INFO(Render, "{} {:016x}: {} words, {} PAs, {} temps, {} SAs{}, emitted in {} us", what,
-             key, v.usse.primary.size(), v.usse.pa_count, v.usse.temp_count,
-             v.usse.secondary_reg_count, v.usse.per_instance ? ", per instance" : "", emit_us);
+    LOG_DEBUG(Render, "{} {:016x}: {} words, {} PAs, {} temps, {} SAs{}, emitted in {} us", what,
+              key, v.usse.primary.size(), v.usse.pa_count, v.usse.temp_count,
+              v.usse.secondary_reg_count, v.usse.per_instance ? ", per instance" : "", emit_us);
     return v;
 }
 
@@ -5812,8 +5812,8 @@ void RasterizerSgxd::InstallFragmentTier2(u64 key, const Usse::Program& program)
     FragmentProgram f = PlaceFragmentProgram(Usse::Program{program}, old->epilogue, key);
     f.draws = old->draws;
     f.tier2_queued = true;
-    LOG_INFO(Render, "tier 2 fragment program {:016x}: {} words to {}, {} temps to {}", key,
-             words_before, f.usse.primary.size(), temps_before, f.usse.temp_count);
+    LOG_DEBUG(Render, "tier 2 fragment program {:016x}: {} words to {}, {} temps to {}", key,
+              words_before, f.usse.primary.size(), temps_before, f.usse.temp_count);
     // In place: last_fragment and every draw's reference see the new program. The first tier's code
     // goes back to the heap once the passes that may run it are done.
     FreeProgramCode(old->code);
@@ -5833,11 +5833,11 @@ void RasterizerSgxd::InstallTier2() {
         ASSERT_MSG(result.program.has_value(), "sgxd: tier 2 of fragment config {:016x}: {}",
                    result.key, result.refusal);
         c->program = std::move(*result.program);
-        LOG_INFO(Render,
-                 "tier 2 fragment config {:016x}: emitted in {} us ({} cycles), program {:016x}, "
-                 "for {} programs",
-                 result.key, result.took_us, result.took_cycles, ProgramHash(*c->program),
-                 c->waiting.size());
+        LOG_DEBUG(Render,
+                  "tier 2 fragment config {:016x}: emitted in {} us ({} cycles), program {:016x}, "
+                  "for {} programs",
+                  result.key, result.took_us, result.took_cycles, ProgramHash(*c->program),
+                  c->waiting.size());
         for (const u64 key : std::exchange(c->waiting, {})) {
             InstallFragmentTier2(key, *c->program);
         }
@@ -5867,11 +5867,11 @@ void RasterizerSgxd::InstallVertexTier2(ShaderTier2::Result& result) {
     PlaceVertexCode(v);
     v.draws = old->draws;
     v.tier2_queued = true;
-    LOG_INFO(Render,
-             "tier 2 vertex program {:016x}: {} words to {}, {} temps to {}, emitted in {} us ({} "
-             "cycles), program {:016x}",
-             result.key, words_before, v.usse.primary.size(), temps_before, v.usse.temp_count,
-             result.took_us, result.took_cycles, ProgramHash(v.usse));
+    LOG_DEBUG(Render,
+              "tier 2 vertex program {:016x}: {} words to {}, {} temps to {}, emitted in {} us ({} "
+              "cycles), program {:016x}",
+              result.key, words_before, v.usse.primary.size(), temps_before, v.usse.temp_count,
+              result.took_us, result.took_cycles, ProgramHash(v.usse));
     FreeProgramCode(old->code);
     *old = std::move(v);
 }
@@ -6014,12 +6014,12 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
     f.iterator_count = static_cast<u32>(g.inputs.size());
     // The pack reads pa0 and pa1 (four F16); the split blend's scratch is pa1 and pa2.
     f.pixel_pa = std::max<u32>({g.pa_count, iterated, epilogue.split_alpha ? 3u : 2u});
-    LOG_INFO(Render,
-             "fragment program {:016x}, blend {:016x}: {} words, {} inputs, {} PAs, {} temps, "
-             "{} uniform floats, {} literals{}",
-             hash, epilogue.blend, code_words, g.inputs.size(), f.pixel_pa, g.temp_count,
-             g.uniform_floats, g.literals.size(),
-             emit_us != 0 ? fmt::format(", emitted in {} us", emit_us) : "");
+    LOG_DEBUG(Render,
+              "fragment program {:016x}, blend {:016x}: {} words, {} inputs, {} PAs, {} temps, "
+              "{} uniform floats, {} literals{}",
+              hash, epilogue.blend, code_words, g.inputs.size(), f.pixel_pa, g.temp_count,
+              g.uniform_floats, g.literals.size(),
+              emit_us != 0 ? fmt::format(", emitted in {} us", emit_us) : "");
     return f;
 }
 
