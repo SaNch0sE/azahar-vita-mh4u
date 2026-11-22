@@ -10,6 +10,7 @@
 #include "common/logging/log.h"
 #include "core/hle/kernel/errors.h"
 #include "core/hle/kernel/handle_table.h"
+#include "core/hle/kernel/mutex.h"
 #include "core/hle/kernel/process.h"
 #include "core/hle/kernel/thread.h"
 
@@ -68,6 +69,13 @@ Result HandleTable::Close(Handle handle) {
     R_UNLESS(IsValid(handle), ResultInvalidHandle);
 
     const u16 slot = GetSlot(handle);
+    // A leased mutex's handle goes from the native core's thunks with it (Mutex::lease).
+    if (mutex_lease_hooks.closed != nullptr && objects[slot]->GetHandleType() == HandleType::Mutex) {
+        auto& mutex = static_cast<Mutex&>(*objects[slot]);
+        if (mutex.lease != nullptr) {
+            mutex_lease_hooks.closed(mutex, handle);
+        }
+    }
     if (thread_id_hooks.closed != nullptr &&
         objects[slot]->GetHandleType() == HandleType::Thread) {
         thread_id_hooks.closed(handle);

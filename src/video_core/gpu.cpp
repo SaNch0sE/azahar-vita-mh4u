@@ -238,6 +238,51 @@ void GPU::EnablePageHolds() {
 #endif
 }
 
+bool GPU::GuestStoreMissesHolds([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
+                                [[maybe_unused]] u32& ticket) {
+#ifdef ENABLE_GXM
+    return impl->render->StoreMissesHolds(host, size, ticket);
+#else
+    return false;
+#endif
+}
+
+void GPU::GuestStoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi,
+                              u32 slot) {
+    impl->render->StoreForbidden(host, lo, hi, slot);
+}
+
+void GPU::SetStorePermits(AzaharStorePermits* table) {
+    impl->render->SetStorePermits(table);
+}
+
+const u32* GPU::PageHoldsGeneration() const {
+    return impl->render->PageHoldsGeneration();
+}
+
+bool GPU::GuestReadMissesWrites([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
+                                [[maybe_unused]] u32& write_ticket) {
+#ifdef ENABLE_GXM
+    return impl->render->ReadMissesWrites(host, size, write_ticket);
+#else
+    return false;
+#endif
+}
+
+bool GPU::GuestOpensHeldPage([[maybe_unused]] const u8* host, [[maybe_unused]] u32 size,
+                             [[maybe_unused]] bool write) {
+    return impl->render->OpensHeldPage(host, size, write);
+}
+
+bool GPU::GuestOpensDisplayPage([[maybe_unused]] const u8* host, [[maybe_unused]] bool write,
+                                [[maybe_unused]] u32 reach) {
+#ifdef ENABLE_GXM
+    return impl->render->OpensDisplayPage(host, write, reach);
+#else
+    return false;
+#endif
+}
+
 bool GPU::GuestAbort([[maybe_unused]] const u8* host, [[maybe_unused]] bool write,
                      [[maybe_unused]] u32 guest_pc, [[maybe_unused]] u32 guest_va) {
 #ifdef ENABLE_GXM

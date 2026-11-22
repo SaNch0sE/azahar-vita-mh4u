@@ -125,6 +125,25 @@ public:
     /// A guest access aborted on the page of `host`: whether a hold refused it. If so, the work it
     /// waited for is done and the page open, and the guest runs the access again.
     bool PageFault(const u8* host, bool write, u32 guest_pc, u32 guest_va);
+    bool OpensDisplayPage(const u8* host, bool write, u32 reach);
+    /// GPU::GuestReadMissesWrites: a page held for a GPU write (the guest's view closed), the
+    /// read clear of that write's bytes (PageHolds::TouchesWrite), as the HLE's reads go on;
+    /// write_ticket the page's last write's.
+    bool ReadMissesWrites(const u8* host, u32 size, u32& write_ticket);
+    /// GPU::GuestStoreMissesHolds: a held page, the store clear of its queued GPU work's bytes
+    /// (PageHolds::StoreMisses); ticket the page's last live hold's.
+    bool StoreMissesHolds(const u8* host, u32 size, u32& ticket);
+    /// GPU::GuestStoreForbidden: PageHolds::StoreForbidden, the page StoreMissesHolds passed,
+    /// for the permit at `slot` (PageHolds::PermitGranted).
+    void StoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi, u32 slot);
+    /// GPU::SetStorePermits: PageHolds::SetStorePermits.
+    void SetStorePermits(AzaharStorePermits* table) {
+        page_holds.SetStorePermits(table);
+    }
+    /// GPU::PageHoldsGeneration: PageHolds::Generation.
+    [[nodiscard]] const u32* PageHoldsGeneration() const {
+        return page_holds.Generation();
+    }
     /// The HLE reads or writes [host, host + size) of guest memory through its own view: it
     /// waits for the queued GPU work the guest would wait for (Memory's host guard).
     void HostAccess(const u8* host, u32 size, bool write);

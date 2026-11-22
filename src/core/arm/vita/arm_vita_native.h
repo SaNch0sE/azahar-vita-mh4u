@@ -128,6 +128,15 @@ struct VitaNativeCensus {
     /// thunk or to the module's svc.
     u32 vfp_insns{}, vfp_exits{}, vfp_thunks{}, vfp_svcs{};
     u32 svc_thunks{};
+    u32 hold_loads{}, hold_stores{}, hold_opens{};
+    u32 hold_thumb{};
+    /// The store permits AccessPastHolds gave, and the stores the module made by them
+    /// (AzaharStorePermits), no exit.
+    u32 store_permits{}, permitted_stores{};
+    /// Accesses past the budget (TakeHoldBudget), left to wait.
+    u32 hold_load_waits{};
+    u32 hold_pages{};
+    std::array<std::array<u32, 3>, 6> hold_top{};
     u32 idle_waits{}, idle_skips{};
     u64 idle_skip_ticks{};
     u32 upcall_sites{}, upcall_runs{}, upcall_preempted{};
@@ -242,10 +251,29 @@ private:
     /// A Thumb thread's resume PC past a patched svc site's moved instruction.
     u32 PastPatchedThumbSvc(u32 pc);
     void ReportFault();
-    /// A guest access at `va` the guest's table refused (a permission fault on a small page) by
-    /// `pc`: a page hold over a page queued GPU work still uses opens, or is taken as the guest's
-    /// access takes it, and the access can run again. False when no hold closed the page.
+    /// A permission fault on a small page at `va` by `pc`: a page held for the display alone opens,
+    /// an access clear of the holds' bytes is made here, else the GPU takes it (GPU::GuestAbort) and
+    /// it runs again. False when no hold closed the page.
     bool TakeHeldPage(u32 va, bool write, u32 pc);
+    /// A permission fault of an ARM load clear of the bytes the GPU's queued work writes on its
+    /// held page (GPU::GuestReadMissesWrites), or of an ARM store clear of the bytes its queued
+    /// work reads and writes there (GPU::GuestStoreMissesHolds): made here through the app's
+    /// view, the guest resuming after it and the page staying held. LDR, LDRB, LDRH, LDRSB,
+    /// LDRSH and LDRD, STR, STRB, STRH and STRD with an immediate or register offset, LDM and
+    /// STM (no user bank, no PC), VLDR, VSTR, VLDM and VSTM (IA, DB); whether it was one.
+    bool AccessPastHolds(u32 pc, bool write);
+    struct HoldBudget {
+        u32 page = ~0u;
+        u32 ticket = 0;
+        u32 accesses = 0;
+    };
+    static constexpr u32 AccessesPerHold = 32;
+    std::array<HoldBudget, 4> hold_budgets{};
+    u32 hold_budget_next{};
+    bool TakeHoldBudget(u32 page, u32 ticket);
+    /// The most bytes the instruction at `pc` may touch from its faulting address on: 8 for a single
+    /// access, 128 for a block.
+    u32 AccessReach(u32 pc) const;
     /// Patches a VFP instruction that trapped under the guest's LEN and STRIDE into a branch to a
     /// thunk, or out of reach into the module's svc.
     void PatchVfp(u32 pc, u32 insn, bool thumb);

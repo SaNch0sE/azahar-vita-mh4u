@@ -59,6 +59,18 @@ public:
      */
     Result Release(Thread* thread);
 
+    /// A lease (the Vita native core's): while no thread waits on the mutex, the guest's own
+    /// code locks and unlocks it through this word, which the core's svc thunks share: free
+    /// (LeaseFree), held by a thread (its ID << 8 | its lock count, 1-255), or the kernel's
+    /// (LeaseKernel: lock_count and holding_thread are the truth). Every kernel use of the mutex
+    /// takes the state back first (Reclaim), and an unlocked mutex no thread waits on is lent
+    /// again (Relet).
+    static constexpr u32 LeaseFree = 0;
+    static constexpr u32 LeaseKernel = 0xFFFFFFFF;
+    u32* lease = nullptr;
+    void Reclaim() const;
+    void Relet();
+
 private:
     KernelSystem& kernel;
 
@@ -72,6 +84,15 @@ private:
  * @param thread Thread that is holding the mutexes
  */
 void ReleaseThreadMutexes(Thread* thread);
+
+/// The Vita native core's side of the leases (Mutex::lease): a leased mutex's handle closed, a
+/// leased mutex gone, and a thread that ends taking back the mutexes it holds by lease.
+struct MutexLeaseHooks {
+    void (*closed)(Mutex& mutex, Handle handle) = nullptr;
+    void (*freed)(Mutex& mutex) = nullptr;
+    void (*reclaim_held)(u32 thread_id) = nullptr;
+};
+extern MutexLeaseHooks mutex_lease_hooks;
 
 } // namespace Kernel
 

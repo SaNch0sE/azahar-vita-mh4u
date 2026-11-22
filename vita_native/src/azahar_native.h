@@ -138,6 +138,21 @@ typedef struct AzaharRedirect {
 // the slice again from there.
 #define AZAHAR_CLOCK_SVC 0xFBu
 
+#define AZAHAR_STORE_PERMITS 1024u
+#define AZAHAR_STORE_RANGES 6u
+typedef struct AzaharStorePermit {
+    uint32_t page; // the guest VA >> 12; 0 for none
+    uint32_t gen;
+    uint32_t host; // the page's address in the app
+    uint32_t left;
+    uint16_t lo[AZAHAR_STORE_RANGES], hi[AZAHAR_STORE_RANGES];
+} AzaharStorePermit;
+typedef struct AzaharStorePermits {
+    const volatile uint32_t *gen;
+    uint32_t made;
+    AzaharStorePermit permit[AZAHAR_STORE_PERMITS];
+} AzaharStorePermits;
+
 typedef struct AzaharUserPage {
     uint32_t gen;        // changed at every entry into the guest
     uint32_t on;         // 1 << AZAHAR_FAST_* for each answer below that holds; TICK only with a timer
@@ -190,6 +205,7 @@ typedef struct AzaharRunRequest {
     uint32_t upcall_rearm_us;  // in
     uint32_t upcall_rearm_max; // in
     uint32_t upcall_rearms;    // out: the quantums started again this call
+    AzaharStorePermits *store_permits; // in: the app's permits, or 0 (version 65)
 } AzaharRunRequest;
 
 // VFP short vectors (version 30). The Cortex-A9 has none: with the guest's FPSCR LEN or STRIDE

@@ -19,7 +19,12 @@ SERIALIZE_EXPORT_IMPL(Kernel::Mutex)
 
 namespace Kernel {
 
+MutexLeaseHooks mutex_lease_hooks{};
+
 void ReleaseThreadMutexes(Thread* thread) {
+    if (mutex_lease_hooks.reclaim_held != nullptr) {
+        mutex_lease_hooks.reclaim_held(thread->thread_id);
+    }
     for (auto& mtx : thread->held_mutexes) {
         mtx->lock_count = 0;
         mtx->holding_thread = nullptr;
@@ -31,6 +36,9 @@ void ReleaseThreadMutexes(Thread* thread) {
 Mutex::Mutex(KernelSystem& kernel) : WaitObject(kernel), kernel(kernel) {}
 
 Mutex::~Mutex() {
+    if (lease != nullptr && mutex_lease_hooks.freed != nullptr) {
+        mutex_lease_hooks.freed(*this);
+    }
     if (resource_limit) {
         resource_limit->Release(ResourceLimitType::Mutex, 1);
     }
@@ -50,11 +58,41 @@ std::shared_ptr<Mutex> KernelSystem::CreateMutex(bool initial_locked, std::strin
     return mutex;
 }
 
+void Mutex::Reclaim() const {
+    if (lease == nullptr || *lease == LeaseKernel) {
+        return;
+    }
+    const u32 state = *lease;
+    *lease = LeaseKernel;
+    if (state == LeaseFree) {
+        return;
+    }
+    // Held by the guest's own lock: the holder and its count as Acquire would have kept them.
+    auto& self = const_cast<Mutex&>(*this);
+    DEBUG_ASSERT(self.lock_count == 0 && self.holding_thread == nullptr);
+    const std::shared_ptr<Thread> holder = kernel.GetThreadByID(state >> 8);
+    ASSERT_MSG(holder != nullptr, "mutex lease held by thread {}, which is gone", state >> 8);
+    self.priority = holder->current_priority;
+    holder->held_mutexes.insert(SharedFrom(&self));
+    self.holding_thread = holder;
+    self.lock_count = static_cast<int>(state & 0xFF);
+    holder->UpdatePriority();
+}
+
+void Mutex::Relet() {
+    if (lease != nullptr && lock_count == 0 && GetWaitingThreads().empty()) {
+        DEBUG_ASSERT(holding_thread == nullptr);
+        *lease = LeaseFree;
+    }
+}
+
 bool Mutex::ShouldWait(const Thread* thread) const {
+    Reclaim();
     return lock_count > 0 && thread != holding_thread.get();
 }
 
 void Mutex::Acquire(Thread* thread) {
+    Reclaim();
     ASSERT_MSG(!ShouldWait(thread), "object unavailable!");
 
     // Actually "acquire" the mutex only if we don't already have it
@@ -70,6 +108,7 @@ void Mutex::Acquire(Thread* thread) {
 }
 
 Result Mutex::Release(Thread* thread) {
+    Reclaim();
     // We can only release the mutex if it's held by the calling thread.
     if (thread != holding_thread.get()) {
         if (holding_thread) {
@@ -97,21 +136,25 @@ Result Mutex::Release(Thread* thread) {
         holding_thread = nullptr;
         WakeupAllWaitingThreads();
         kernel.PrepareReschedule();
+        Relet();
     }
 
     return ResultSuccess;
 }
 
 void Mutex::AddWaitingThread(std::shared_ptr<Thread> thread) {
+    Reclaim();
     WaitObject::AddWaitingThread(thread);
     thread->pending_mutexes.insert(SharedFrom(this));
     UpdatePriority();
 }
 
 void Mutex::RemoveWaitingThread(Thread* thread) {
+    Reclaim();
     WaitObject::RemoveWaitingThread(thread);
     thread->pending_mutexes.erase(SharedFrom(this));
     UpdatePriority();
+    Relet();
 }
 
 void Mutex::UpdatePriority() {
@@ -132,6 +175,10 @@ void Mutex::UpdatePriority() {
 
 template <class Archive>
 void Mutex::serialize(Archive& ar, const unsigned int) {
+    // A savestate has the kernel's state of a leased mutex; the lease is not kept.
+    if constexpr (Archive::is_saving::value) {
+        Reclaim();
+    }
     ar& boost::serialization::base_object<WaitObject>(*this);
     ar & lock_count;
     ar & priority;

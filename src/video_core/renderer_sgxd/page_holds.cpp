@@ -36,7 +36,10 @@ PageHolds::PageHolds(Memory::MemorySystem& memory)
       vram_host{memory.GetPhysicalPointer(Memory::VRAM_PADDR)},
       fcram_pages{Memory::FCRAM_SIZE >> PageBits},
       pages{fcram_pages + (Memory::VRAM_SIZE >> PageBits)}, read_ticket(fcram_pages),
-      write_ticket(pages), applied(pages), watched(fcram_pages) {
+      read_lo(fcram_pages), read_hi(fcram_pages), geometry_read(fcram_pages),
+      write_ticket(pages), write_lo(pages), write_hi(pages), display_ticket(fcram_pages),
+      other_ticket(fcram_pages), display_lo(fcram_pages), display_hi(fcram_pages), applied(pages),
+      watched(fcram_pages) {
 #ifdef VITA_DIAGNOSTICS
     kinds.resize(pages);
     ranges.resize(pages);
@@ -126,8 +129,8 @@ void PageHolds::Change(u32 page, Access access) {
 
 const char* PageHolds::KindName(Kind kind) {
     static constexpr const char* names[Kinds] = {
-        "texture",     "depth",        "index",  "vertex",  "colour", "fill",
-        "transfer in", "transfer out", "dma in", "dma out", "present"};
+        "texture",     "depth",        "index",       "vertex", "colour",  "fill",
+        "transfer in", "transfer out", "display out", "dma in", "dma out", "present"};
     return kind < Kinds ? names[kind] : "?";
 }
 
@@ -167,8 +170,21 @@ void PageHolds::Read(PAddr addr, u32 bytes, u32 ticket, Kind kind) {
         return;
     }
     for (u32 p = first; p < first + count; p++) {
+        NoteDisplay(p, addr, bytes, ticket, kind == Present);
+        // The bytes it reads on the page, with the page's other live reads' (StoreMisses).
+        const PAddr page_addr = AddressOf(p);
+        const u16 lo = static_cast<u16>(std::max(addr, page_addr) - page_addr);
+        const u16 hi = static_cast<u16>(
+            std::min<u64>(u64{addr} + bytes, u64{page_addr} + PageSize) - page_addr);
+        if (Live(read_ticket[p], last_reached)) {
+            AddRange(read_lo[p], read_hi[p], lo, hi);
+        } else {
+            read_lo[p] = {lo, 0};
+            read_hi[p] = {hi, 0};
+        }
         read_ticket[p] = ticket;
         geometry_read[p] = kind == Vertex || kind == Index ? 1 : 0;
+        RefreshPermit(p);
 #ifdef VITA_DIAGNOSTICS
         kinds[p] = kind;
         ranges[p] = {addr, bytes};
@@ -216,7 +232,23 @@ void PageHolds::Write(PAddr addr, u32 bytes, u32 ticket, [[maybe_unused]] Kind k
             versions[p].direct = true;
             versions[p].use_frame = frame;
         }
+        if (p < fcram_pages) {
+            NoteDisplay(p, addr, bytes, ticket, kind == DisplayOut);
+        }
+        // The bytes it writes on the page, with the page's other live writes' (TouchesWrite), as
+        // two ranges: a game can read a header between two display-transfer outputs on one page.
+        const PAddr page_addr = AddressOf(p);
+        const u16 lo = static_cast<u16>(std::max(addr, page_addr) - page_addr);
+        const u16 hi = static_cast<u16>(
+            std::min<u64>(u64{addr} + bytes, u64{page_addr} + PageSize) - page_addr);
+        if (Live(write_ticket[p], last_reached)) {
+            AddRange(write_lo[p], write_hi[p], lo, hi);
+        } else {
+            write_lo[p] = {lo, 0};
+            write_hi[p] = {hi, 0};
+        }
         write_ticket[p] = ticket;
+        RefreshPermit(p);
         if (p < fcram_pages) {
             index_stamp[p]++;
             index_watch[p] = 0;
@@ -286,36 +318,6 @@ void PageHolds::Watch(PAddr addr, u32 bytes) {
         }
     }
     seen_slot = {addr, bytes, unwatches};
-}
-
-void PageHolds::Watch(PAddr addr, u32 bytes) {
-    u32 first, count;
-    if (!PagesOf(addr, bytes, first, count) || first >= fcram_pages) {
-        return;
-    }
-    // The texture's bytes on each page (StoreMisses lets the guest's stores clear of them
-    // through): only the first and last pages can hold part of it. Every draw watches its
-    // textures again, so a page already watched over these bytes costs a compare (merging every
-    // page's range each time was ~5% of a game's emulation thread).
-    const u32 last = first + count - 1;
-    const u16 first_lo = static_cast<u16>(addr & (PageSize - 1));
-    const u16 last_hi = static_cast<u16>(((addr + bytes - 1) & (PageSize - 1)) + 1);
-    for (u32 p = first; p <= last; p++) {
-        const u16 lo = p == first ? first_lo : 0;
-        const u16 hi = p == last ? last_hi : static_cast<u16>(PageSize);
-        if (watched[p] == 0) {
-            watched[p] = 1;
-            watch_lo[p] = {lo, 0};
-            watch_hi[p] = {hi, 0};
-            watch_ticket[p]++;
-            if (applied[p] < ReadOnly) {
-                Change(p, ReadOnly);
-            }
-        } else if (!(watch_lo[p][0] <= lo && hi <= watch_hi[p][0]) &&
-                   !(watch_hi[p][1] != 0 && watch_lo[p][1] <= lo && hi <= watch_hi[p][1])) {
-            AddRange(watch_lo[p], watch_hi[p], lo, hi);
-        }
-    }
 }
 
 bool PageHolds::IndexMemoable(u32 first, u32 count) const {
@@ -405,7 +407,76 @@ u32 PageHolds::WaitFor(u32 page, bool write, u32 reached) const {
     return ticket;
 }
 
+void PageHolds::AddRange(std::array<u16, 2>& lo, std::array<u16, 2>& hi, u16 l, u16 h) {
+    // The range it overlaps or touches, else a free one, else the nearer one (hi 0: none).
+    u32 k = 2;
+    for (u32 i = 0; i < 2 && k == 2; i++) {
+        if (hi[i] != 0 && l <= hi[i] && h >= lo[i]) {
+            k = i;
+        }
+    }
+    if (k == 2) {
+        const auto gap = [&](u32 i) { return l > hi[i] ? l - hi[i] : lo[i] - h; };
+        k = hi[1] == 0 ? 1 : gap(0) <= gap(1) ? 0 : 1;
+    }
+    lo[k] = hi[k] == 0 ? l : std::min(lo[k], l);
+    hi[k] = std::max(hi[k], h);
+    // Grown into each other: one.
+    if (hi[1] != 0 && lo[0] <= hi[1] && lo[1] <= hi[0]) {
+        lo = {std::min(lo[0], lo[1]), 0};
+        hi = {std::max(hi[0], hi[1]), 0};
+    }
+}
+
+void PageHolds::NoteDisplay(u32 p, PAddr addr, u32 bytes, u32 ticket, bool display) {
+    if (!display) {
+        other_ticket[p] = ticket;
+        return;
+    }
+    const PAddr page_addr = AddressOf(p);
+    const u16 l = static_cast<u16>(std::max(addr, page_addr) - page_addr);
+    const u16 h = static_cast<u16>(std::min(addr + bytes, page_addr + PageSize) - page_addr);
+    if (!Live(display_ticket[p], last_reached)) {
+        display_lo[p] = {l, 0};
+        display_hi[p] = {h, 0};
+    } else {
+        AddRange(display_lo[p], display_hi[p], l, h);
+    }
+    display_ticket[p] = ticket;
+}
+
+bool PageHolds::DisplayOnly(u32 page, u32 reached) const {
+    if (page == NoPage || page >= fcram_pages || !Live(display_ticket[page], reached) ||
+        Live(other_ticket[page], reached) || watched[page] != 0) {
+        return false;
+    }
+    const PageVersion& v = versions[page];
+    return !(v.on && v.gpu != v.guest);
+}
+
+bool PageHolds::OpenPastDisplay(const u8* host, u32 reached, u32 reach) {
+    const u32 page = PageOf(host);
+    if (!DisplayOnly(page, reached)) {
+        return false;
+    }
+    const u32 offset =
+        static_cast<u32>(host - (fcram_host + (static_cast<uintptr_t>(page) << PageBits)));
+    // Clear of the display bytes: nothing of what the aborted instruction may touch from there on,
+    // [offset, offset + reach), in a range (a flat margin shut reads just before a framebuffer).
+    const auto& lo = display_lo[page];
+    const auto& hi = display_hi[page];
+    for (u32 i = 0; i < 2; i++) {
+        if (hi[i] != 0 && offset < hi[i] && offset + reach > lo[i]) {
+            return false;
+        }
+    }
+    Change(page, Unheld);
+    Flush();
+    return true;
+}
+
 void PageHolds::Release(u32 reached) {
+    last_reached = reached;
     while (!groups.empty() && !Live(groups.front().ticket, reached)) {
         for (const Run& run : groups.front().runs) {
             for (u32 p = run.first; p < run.first + run.count; p++) {
@@ -485,6 +556,7 @@ bool PageHolds::Version(u32 page, u32 reached) {
         v = PageVersion{};
         v.pool[0] = AllocSlot();
         v.on = true;
+        VoidPermit(page);
         index_stamp[page]++;
         index_watch[page] = 0;
         versioned.push_back(page);
@@ -652,6 +724,147 @@ void PageHolds::Flush() {
     }
 }
 
+bool PageHolds::TouchesWrite(const u8* host, u32 bytes) const {
+    const u32 page = PageOf(host);
+    const u8* const base = page < fcram_pages ? fcram_host : vram_host;
+    const u32 at = static_cast<u32>(host - base) & (PageSize - 1);
+    DEBUG_ASSERT(page != NoPage && at + bytes <= PageSize);
+    const auto& lo = write_lo[page];
+    const auto& hi = write_hi[page];
+    return (at < hi[0] && at + bytes > lo[0]) || (hi[1] != 0 && at < hi[1] && at + bytes > lo[1]);
+}
+
+bool PageHolds::StoreMisses(const u8* host, u32 bytes, u32 reached, u32& ticket) const {
+    const u32 page = PageOf(host);
+    // FCRAM pages the ordinary holds alone close: a texture's watched page, a versioned one and
+    // a display page have their own paths (PageFault, OpenPastDisplay).
+    if (page == NoPage || page >= fcram_pages || watched[page] != 0 || versions[page].on ||
+        Live(display_ticket[page], reached)) {
+        return false;
+    }
+    const u32 at = static_cast<u32>(host - fcram_host) & (PageSize - 1);
+    DEBUG_ASSERT(at + bytes <= PageSize);
+    const auto overlaps = [](const std::array<u16, 2>& lo, const std::array<u16, 2>& hi, u32 l,
+                             u32 h) {
+        return (hi[0] != 0 && l < hi[0] && h > lo[0]) || (hi[1] != 0 && l < hi[1] && h > lo[1]);
+    };
+    // T12: a store into a watched texture's bytes marks it written (PageFault). One beside them
+    // leaves it as it was: a game's stage select stores a word 0x100-0x2cc bytes before or after
+    // each of its ETC1A4 textures every frame, and they were untiled again each time, ~20% of
+    // the GPU's 3D.
+    const bool watching = watched[page] != 0;
+    if (watching && overlaps(watch_lo[page], watch_hi[page], at, at + bytes)) {
+        return false;
+    }
+    const bool reading = Live(read_ticket[page], reached);
+    const bool writing = Live(write_ticket[page], reached);
+    if (reading && overlaps(read_lo[page], read_hi[page], at, at + bytes)) {
+        return false;
+    }
+    // Clear of the GPU's writes by whole cache lines: a line the store dirties that holds bytes
+    // the GPU writes would be written back over them.
+    constexpr u32 Line = 64;
+    if (writing && overlaps(write_lo[page], write_hi[page], at & ~(Line - 1),
+                            (at + bytes + Line - 1) & ~(Line - 1))) {
+        return false;
+    }
+    // The later of the live tickets; a page the watch alone closes, its watch's.
+    const u32 w = write_ticket[page], r = read_ticket[page];
+    ticket = !reading && !writing          ? watch_ticket[page]
+             : !writing                    ? r
+             : !reading                    ? w
+             : static_cast<s32>(w - r) > 0 ? w
+                                           : r;
+    return reading || writing || watching || closed;
+}
+
+[[gnu::noinline]] void PageHolds::NoteVramRead(PAddr addr, u32 bytes, u32 ticket) {
+    // The ranges done dropped from the front.
+    while (vram_reads_count != 0 && !Live(vram_reads[vram_reads_head][2], last_reached)) {
+        vram_reads_head = (vram_reads_head + 1) % VramReads;
+        vram_reads_count--;
+    }
+    if (vram_reads_count != 0) {
+        auto& last = vram_reads[(vram_reads_head + vram_reads_count - 1) % VramReads];
+        if ((last[2] == ticket && addr <= last[1] && last[0] <= addr + bytes) ||
+            vram_reads_count == VramReads) {
+            last[0] = std::min<u32>(last[0], addr);
+            last[1] = std::max<u32>(last[1], addr + bytes);
+            last[2] = ticket;
+            return;
+        }
+    }
+    vram_reads[(vram_reads_head + vram_reads_count) % VramReads] = {addr, addr + bytes, ticket};
+    vram_reads_count++;
+}
+
+void PageHolds::StoreForbidden(const u8* host, u32 reached, std::array<u16, 6>& lo,
+                               std::array<u16, 6>& hi) const {
+    const u32 page = PageOf(host);
+    DEBUG_ASSERT(page < fcram_pages);
+    lo = {};
+    hi = {};
+    if (watched[page] != 0) {
+        lo[0] = watch_lo[page][0], hi[0] = watch_hi[page][0];
+        lo[1] = watch_lo[page][1], hi[1] = watch_hi[page][1];
+    }
+    if (Live(read_ticket[page], reached)) {
+        lo[2] = read_lo[page][0], hi[2] = read_hi[page][0];
+        lo[3] = read_lo[page][1], hi[3] = read_hi[page][1];
+    }
+    // The GPU's writes by whole cache lines, as StoreMisses takes them.
+    constexpr u32 Line = 64;
+    if (Live(write_ticket[page], reached)) {
+        for (u32 k = 0; k < 2; k++) {
+            if (write_hi[page][k] != 0) {
+                lo[4 + k] = static_cast<u16>(write_lo[page][k] & ~(Line - 1));
+                hi[4 + k] = static_cast<u16>((write_hi[page][k] + Line - 1) & ~(Line - 1));
+            }
+        }
+    }
+}
+
+void PageHolds::PermitGranted(const u8* host, u32 slot) {
+    const u32 page = PageOf(host);
+    DEBUG_ASSERT(page < fcram_pages && slot < AZAHAR_STORE_PERMITS);
+    // One permit a page: another guest address of it had one, which this page's next hold would
+    // not find.
+    VoidPermit(page);
+    permit_slot[page] = static_cast<u16>(slot + 1);
+}
+
+void PageHolds::RefreshPermitSlot(u32 page) {
+    DEBUG_ASSERT(permits != nullptr);
+    AzaharStorePermit& permit = permits->permit[permit_slot[page] - 1];
+    if (permit.page == 0 ||
+        permit.host != static_cast<u32>(reinterpret_cast<uintptr_t>(HostOf(page)))) {
+        permit_slot[page] = 0;
+        return;
+    }
+    // StoreMisses' refusals: a versioned page, the display's, a handed-over list's.
+    if (versions[page].on || Live(display_ticket[page], last_reached) || parse_held[page] != 0 ||
+        index_watch[page] != 0) {
+        permit.page = 0;
+        permit_slot[page] = 0;
+        return;
+    }
+    std::array<u16, 6> lo, hi;
+    StoreForbidden(HostOf(page), last_reached, lo, hi);
+    std::copy(lo.begin(), lo.end(), permit.lo);
+    std::copy(hi.begin(), hi.end(), permit.hi);
+}
+
+void PageHolds::VoidPermitSlot(u32 page) {
+    DEBUG_ASSERT(permits != nullptr);
+    AzaharStorePermit& permit = permits->permit[permit_slot[page] - 1];
+    // The slot may hold another page's permit since (a guest page with the same slot).
+    if (permit.page != 0 &&
+        permit.host == static_cast<u32>(reinterpret_cast<uintptr_t>(HostOf(page)))) {
+        permit.page = 0;
+    }
+    permit_slot[page] = 0;
+}
+
 PAddr PageHolds::AddressOf(u32 page) const {
     return page < fcram_pages ? Memory::FCRAM_PADDR + (page << PageBits)
                               : Memory::VRAM_PADDR + ((page - fcram_pages) << PageBits);
@@ -668,10 +881,12 @@ std::string PageHolds::DisplayState(u32 page, u32 reached) const {
         return "VRAM";
     }
     const PageVersion& v = versions[page];
-    return fmt::format("display {} {:#x}-{:#x}, other {}, watched {}, version {}",
-                       Live(display_ticket[page], reached) ? "live" : "done", display_lo[page],
-                       display_hi[page], Live(other_ticket[page], reached) ? "live" : "done",
-                       watched[page],
+    return fmt::format("display {} {:#x}-{:#x} {:#x}-{:#x}, other {}, watched {}, version {}; "
+                       "reads {} {:#x}-{:#x} {:#x}-{:#x}, writes {} {:#x}-{:#x} {:#x}-{:#x}, "
+                       "parse {}, index watch {}",
+                       Live(display_ticket[page], reached) ? "live" : "done", display_lo[page][0],
+                       display_hi[page][0], display_lo[page][1], display_hi[page][1],
+                       Live(other_ticket[page], reached) ? "live" : "done", watched[page],
                        !v.on              ? "none"
                        : v.gpu != v.guest ? "changed"
                                           : "on",

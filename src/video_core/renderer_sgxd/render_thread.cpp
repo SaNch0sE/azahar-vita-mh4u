@@ -882,10 +882,12 @@ bool RenderThread::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& 
     HoldRead(config.GetPhysicalInputAddress(),
              config.input_width * config.input_height * Pica::BytesPerPixel(config.input_format),
              PageHolds::TransferIn);
-    HoldWrite(config.GetPhysicalOutputAddress(),
-              config.output_width * config.output_height *
-                  Pica::BytesPerPixel(config.output_format),
-              PageHolds::TransferOut);
+    // An LCD buffer a present named is the display's: its page opens past its bytes. Another output is
+    // a transfer's like any (a game may read a converted picture back).
+    const PAddr output = config.GetPhysicalOutputAddress();
+    HoldWrite(output, config.OutputBytes(),
+              LcdScreenOf(output, config.OutputBytes()) >= 0 ? PageHolds::DisplayOut
+                                                             : PageHolds::TransferOut);
     SyncState();
     Put(Op::DisplayTransfer, config);
     return true;
@@ -1381,6 +1383,69 @@ void RenderThread::WaitHeldPage(u32 page, bool write) {
     InterruptWait(ticket);
 }
 
+bool RenderThread::ReadMissesWrites(const u8* host, u32 size, u32& write_ticket) {
+    if (!page_holds_on) {
+        return false;
+    }
+    const u32 page = page_holds.PageOf(host);
+    if (page == PageHolds::NoPage || page_holds.PageOf(host + size - 1) != page ||
+        page_holds.Applied(page) != PageHolds::NoAccess) {
+        return false;
+    }
+    // The page's GPU write done (holds are let go of lazily): the fault's path opens it without a
+    // wait, and the guest's next loads there run natively. Not a page a picture's rows close.
+    const PAddr page_addr = page_holds.AddressOf(page);
+    if (page_holds.WaitFor(page, false, reached.load(std::memory_order_acquire)) == 0 &&
+        !rasterizer.PictureOwns(page_addr, page_addr + 0x1000)) {
+        return false;
+    }
+    write_ticket = page_holds.WriteTicket(page);
+    return !page_holds.TouchesWrite(host, size);
+}
+
+bool RenderThread::StoreMissesHolds(const u8* host, u32 size, u32& ticket) {
+    if (!page_holds_on) {
+        return false;
+    }
+    const u32 page = page_holds.PageOf(host);
+    if (page == PageHolds::NoPage || page_holds.PageOf(host + size - 1) != page ||
+        page_holds.Applied(page) == PageHolds::Unheld) {
+        return false;
+    }
+    // A store to a page of the memo's index lists: a write, as PageFault takes it; past the holds
+    // then as any store. Closed by the watch alone, the page is PageFault's to open: opened here,
+    // PageFault would find no hold over it and take the abort for the guest's own (a game's
+    // command-buffer page).
+    if (page_holds.IndexWatched(page)) {
+        if (page_holds.ClosedByIndexWatchAlone(page, reached.load(std::memory_order_acquire))) {
+            return false;
+        }
+        page_holds.IndexWritten(page, reached.load(std::memory_order_acquire));
+    }
+    return page_holds.StoreMisses(host, size, reached.load(std::memory_order_acquire), ticket);
+}
+
+void RenderThread::StoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi,
+                                  u32 slot) {
+    page_holds.StoreForbidden(host, reached.load(std::memory_order_acquire), lo, hi);
+    page_holds.PermitGranted(host, slot);
+}
+
+bool RenderThread::OpensDisplayPage(const u8* host, bool write, u32 reach) {
+    if (!page_holds_on) {
+        return false;
+    }
+    const u32 page = page_holds.PageOf(host);
+    if (page == PageHolds::NoPage) {
+        return false;
+    }
+    const PageHolds::Access access = page_holds.Applied(page);
+    if (access == PageHolds::Unheld || (access == PageHolds::ReadOnly && !write)) {
+        return false;
+    }
+    return page_holds.OpenPastDisplay(host, now, reach);
+}
+
 bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 guest_pc,
                              [[maybe_unused]] u32 guest_va) {
     if (!page_holds_on) {
@@ -1484,6 +1549,13 @@ bool RenderThread::PageFault(const u8* host, bool write, [[maybe_unused]] u32 gu
         geometry_moves++;
 #endif
     }
+    [[maybe_unused]] const PageHolds::Access after_move = page_holds.Applied(page);
+    // A versioned page the frame closed to writes, written while a GPU write was queued: with that
+    // write done the version is taken now.
+    if (write && page_holds.Applied(page) != PageHolds::Unheld && address >= Memory::FCRAM_PADDR &&
+        address < Memory::FCRAM_PADDR_END && !renderer.WouldMakeUncached(address, 0x1000)) {
+        page_holds.Version(page, reached.load(std::memory_order_acquire));
+    }
     DEBUG_ASSERT_MSG(page_holds.Applied(page) == PageHolds::Unheld ||
                          (page_holds.Applied(page) == PageHolds::ReadOnly && !write),
                      "render thread: page {} ({:#010x}) still held after its work ({} access): "
@@ -1505,6 +1577,23 @@ void RenderThread::HostAccess(const u8* host, u32 size, bool write) {
         if (page == PageHolds::NoPage || page_holds.Applied(page) == PageHolds::Unheld) {
             continue;
         }
+        // T12: the HLE writes a texture's page (a file read, the DSP): as a guest write does.
+        if (write && page_holds.Watched(page)) {
+            TexturesWritten(page_holds.AddressOf(page), 0x1000);
+            page_holds.Unwatch(page, reached.load(std::memory_order_acquire));
+#ifdef VITA_DIAGNOSTICS
+            texture_write_hle++;
+#endif
+        }
+        // A read clear of the bytes the queued GPU writes cover goes on: the page shares them
+        // with other data (PageHolds::TouchesWrite). The HLE's reads do not change the guest's
+        // view, which stays held.
+        const u8* const page_end =
+            reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1);
+        const u32 bytes = static_cast<u32>(std::min(end, page_end) - p);
+        if (!write && !page_holds.TouchesWrite(p, bytes)) {
+            continue;
+        }
 #ifdef VITA_DIAGNOSTICS
         const auto start = Clock::now();
         const u32 before = reached.load(std::memory_order_acquire);
@@ -1523,15 +1612,13 @@ void RenderThread::HostAccess(const u8* host, u32 size, bool write) {
             if (holdlog &&
                 static_cast<u64>(Clock::now().time_since_epoch().count()) >= holdlog_from_us &&
                 logged++ < 200) {
-                const u8* const page_end =
-                    reinterpret_cast<const u8*>((reinterpret_cast<uintptr_t>(p) | 0xFFF) + 1);
                 LOG_INFO(Render,
                          "holdlog: HLE {} of {:#010x}+{:#x}: {} write of {:#010x}+{:#x}, ticket "
                          "{} with {} reached and {} queued, waited {} us",
                          write ? "write" : "read",
                          page_holds.AddressOf(page) + (reinterpret_cast<uintptr_t>(p) & 0xfff),
-                         std::min(end, page_end) - p, PageHolds::KindName(writer),
-                         writer_range.first, writer_range.second, waited, before, tickets, us);
+                         bytes, PageHolds::KindName(writer), writer_range.first,
+                         writer_range.second, waited, before, tickets, us);
             }
         }
 #endif

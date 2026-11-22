@@ -167,8 +167,12 @@ azahar_vec_\name\()_\core:
     ldr     sp, =azahar_cpu + \core * CPU_SIZE
     stmia   sp, {r0-r14}^
     nop
+    .if \reason == 4
+    b       azahar_dabt_fast
+    .else
     mov     r0, #\reason
     b       azahar_exit_common
+    .endif
     .endif
 9:  ldr     sp, =azahar_cpu + \core * CPU_SIZE + CPU_STRAY_STACK_TOP
     push    {r0-r3}
@@ -655,6 +659,33 @@ azahar_irq_rearm:
     nop
     subs    pc, lr, #4
 8:  mov     r0, #5
+    b       azahar_exit_common
+
+@ A guest data abort: a store the app permits (azahar_store_fast, version 65) is made and the
+@ guest resumes after it, its registers from ctx (a writeback changed its base); any other abort
+@ exits (4). sp = the core's block with the user file saved, lr = LR_abt; r0-r12 are free (put
+@ back from the block). The call runs on the core's VFP stack: its other user, azahar_vfp_svc,
+@ runs in the svc fast path with IRQs masked and makes no guest access, so the two never nest.
+azahar_dabt_fast:
+    ldr     r0, =azahar_store_va
+    ldr     r0, [r0]
+    cmp     r0, #0
+    beq     8f
+    mov     r4, sp
+    mov     r5, lr
+    add     sp, r4, #(CPU_VFP_STACK_TOP - 8) @ two adds: no one immediate takes it
+    add     sp, sp, #8
+    mov     r0, r4                  @ the context
+    sub     r1, lr, #8              @ the aborted instruction
+    bl      azahar_store_fast
+    mov     sp, r4
+    mov     lr, r5
+    cmp     r0, #0
+    beq     8f
+    ldmia   sp, {r0-r14}^
+    nop
+    subs    pc, lr, #4              @ after the store, the guest's CPSR
+8:  mov     r0, #4
     b       azahar_exit_common
 
 @ sp = the core's block (its ctx, this mode's SP), r0 = reason, guest r0-r14 already in ctx.

@@ -499,6 +499,133 @@ std::unique_ptr<Common::HostSharedMemory> thunk_area;
 const VitaGuestMap* thunk_area_map{};
 u32 thunk_area_used{};
 
+/// The mutex leases at the thunk area's end: the owning process's ID, then by handle slot
+/// (handle >> 15) the handle and its lease word's address, then the words (MutexFastPath).
+constexpr u32 LeaseSlots = 4096;
+constexpr u32 LeaseTableOffset = ThunkAreaSize - LeaseSlots * 12 - 16;
+constexpr u32 LeaseEntriesOffset = LeaseTableOffset + 16;
+constexpr u32 LeaseWordsOffset = ThunkAreaSize - LeaseSlots * 4;
+constexpr u32 NoLeaseProcess = 0xFFFFFFFF;
+struct LeaseEntry {
+    u32 handle;
+    u32 word;
+};
+/// Below the leases, the same process's thread IDs by handle slot, for GetThreadId's thunk: the ID
+/// << 15 | the handle's generation, 0 for none (no handle has generation 0).
+constexpr u32 ThreadIdsOffset = LeaseTableOffset - LeaseSlots * 4;
+constexpr u32 ThreadIdShift = 15;
+/// Each word's mutex, the entry slot + 1 that names it (0: none), and the free words.
+std::array<Kernel::Mutex*, LeaseSlots> lease_owner{};
+std::array<u16, LeaseSlots> lease_entry_of{};
+std::vector<u16> lease_free;
+u32& LeaseProcess() {
+    return *reinterpret_cast<u32*>(thunk_area->Data() + LeaseTableOffset);
+}
+LeaseEntry* LeaseEntries() {
+    return reinterpret_cast<LeaseEntry*>(thunk_area->Data() + LeaseEntriesOffset);
+}
+u32* LeaseWords() {
+    return reinterpret_cast<u32*>(thunk_area->Data() + LeaseWordsOffset);
+}
+u32* ThreadIds() {
+    return reinterpret_cast<u32*>(thunk_area->Data() + ThreadIdsOffset);
+}
+u32 LeaseIndex(const u32* word) {
+    const auto i = static_cast<u32>(word - LeaseWords());
+    ASSERT(i < LeaseSlots);
+    return i;
+}
+
+/// Every lease dropped (the guest is gone, or the area new): the mutexes are the kernel's alone.
+void ResetLeases() {
+    for (Kernel::Mutex*& mutex : lease_owner) {
+        if (mutex != nullptr) {
+            mutex->lease = nullptr;
+            mutex = nullptr;
+        }
+    }
+    lease_entry_of.fill(0);
+    lease_free.clear();
+    for (u32 i = LeaseSlots; i-- > 0;) {
+        lease_free.push_back(static_cast<u16>(i));
+    }
+    std::memset(thunk_area->Data() + ThreadIdsOffset, 0, ThunkAreaSize - ThreadIdsOffset);
+    LeaseProcess() = NoLeaseProcess;
+}
+
+void LeaseClosed(Kernel::Mutex& mutex, Kernel::Handle handle) {
+    LeaseEntry& entry = LeaseEntries()[handle >> 15];
+    if (entry.handle == handle) {
+        lease_entry_of[LeaseIndex(mutex.lease)] = 0;
+        entry = {};
+    }
+}
+
+void LeaseFreed(Kernel::Mutex& mutex) {
+    const u32 i = LeaseIndex(mutex.lease);
+    DEBUG_ASSERT(lease_owner[i] == &mutex);
+    if (lease_entry_of[i] != 0) {
+        LeaseEntries()[lease_entry_of[i] - 1] = {};
+        lease_entry_of[i] = 0;
+    }
+    lease_owner[i] = nullptr;
+    lease_free.push_back(static_cast<u16>(i));
+}
+
+void LeaseReclaimHeld(u32 thread_id) {
+    const u32* const words = LeaseWords();
+    for (u32 i = 0; i < LeaseSlots; i++) {
+        const u32 state = words[i];
+        if (lease_owner[i] != nullptr && state != Kernel::Mutex::LeaseFree &&
+            state != Kernel::Mutex::LeaseKernel && state >> 8 == thread_id) {
+            lease_owner[i]->Reclaim();
+        }
+    }
+}
+
+/// Lends the mutex behind `handle` to the guest's thunks, which lock and unlock it from the next
+/// call on while no thread waits on it.
+void LeaseMutex(Kernel::KernelSystem& kernel, u32 handle) {
+    const u32 slot = handle >> 15;
+    if (slot >= LeaseSlots || LeaseEntries()[slot].handle == handle) {
+        return;
+    }
+    const auto& process = *kernel.GetCurrentProcess();
+    const auto mutex = process.handle_table.Get<Kernel::Mutex>(handle);
+    if (mutex == nullptr) {
+        return;
+    }
+    // One process's: the thunks find a handle by its value alone.
+    if (LeaseProcess() == NoLeaseProcess) {
+        LeaseProcess() = process.process_id;
+    } else if (LeaseProcess() != process.process_id) {
+        return;
+    }
+    u32 i;
+    if (mutex->lease == nullptr) {
+        if (lease_free.empty()) {
+            return;
+        }
+        i = lease_free.back();
+        lease_free.pop_back();
+        lease_owner[i] = mutex.get();
+        mutex->lease = &LeaseWords()[i];
+        *mutex->lease = Kernel::Mutex::LeaseKernel;
+        mutex->Relet();
+    } else {
+        i = LeaseIndex(mutex->lease);
+        if (lease_entry_of[i] != 0) {
+            return; // another handle names it
+        }
+    }
+    LeaseEntry& entry = LeaseEntries()[slot];
+    if (entry.handle != 0) {
+        lease_entry_of[(entry.word - ThunkAreaBase - LeaseWordsOffset) / 4] = 0;
+    }
+    entry = {handle, ThunkAreaBase + LeaseWordsOffset + i * 4};
+    lease_entry_of[i] = static_cast<u16>(slot + 1);
+}
+
 /// GetThreadId's answer for a handle, the thunk's from now on. One word a slot: a thunk reading
 /// while another host's thread closes the handle sees the ID or none.
 void ThreadIdAnswered(const Kernel::Process& process, Kernel::Handle handle, u32 thread_id) {
@@ -524,9 +651,21 @@ void ThreadIdsCleared() {
     }
 }
 
+alignas(64) AzaharStorePermits store_permits{};
+void ClearStorePermits() {
+    for (AzaharStorePermit& p : store_permits.permit) {
+        p.page = 0;
+    }
+#ifdef VITA_DIAGNOSTICS
+    census.permit_clears++;
+#endif
+}
+
 /// The guest that map held is gone, and its patches with it.
 void ForgetThunks(const VitaGuestMap* map) {
+    ClearStorePermits();
     if (thunk_area_map == map) {
+        ResetLeases();
         patched_sites.clear();
         vfp_thunks.clear();
         svc_thunks.clear();
@@ -940,6 +1079,7 @@ VitaGuestMap::~VitaGuestMap() {
 }
 
 bool VitaGuestMap::Edit(u32 op, u32 user_va, u32 guest_va, u32 size, u32 perm) const {
+    ClearStorePermits();
     AzaharEditRequest req{};
     req.op = op;
     req.range = AzaharRange{user_va, guest_va, size, perm};
@@ -1481,6 +1621,8 @@ std::optional<u32> ARM_VitaNative::ThunkRoom(u32 size) {
         ASSERT_MSG(thunk_area->Data() != nullptr &&
                        (reinterpret_cast<uintptr_t>(thunk_area->Data()) & 0xFFFu) == 0,
                    "the thunk area's {} KiB", ThunkAreaSize >> 10);
+        ResetLeases();
+        Kernel::mutex_lease_hooks = {&LeaseClosed, &LeaseFreed, &LeaseReclaimHeld};
         Kernel::thread_id_hooks = {&ThreadIdAnswered, &ThreadIdClosed, &ThreadIdsCleared};
     }
     if (thunk_area_map != map.get()) {
@@ -1488,7 +1630,7 @@ std::optional<u32> ARM_VitaNative::ThunkRoom(u32 size) {
         map->MapExtra(ThunkAreaBase, ThunkAreaSize, thunk_area->Data());
         thunk_area_map = map.get();
     }
-    if (thunk_area_used + size > ThunkAreaSize) {
+    if (thunk_area_used + size > LeaseTableOffset) {
         return std::nullopt;
     }
     return ThunkAreaBase + thunk_area_used;
@@ -1856,6 +1998,122 @@ std::optional<std::vector<u32>> UpcallEntry(u32 base, std::initializer_list<u32>
     return w;
 }
 
+/// The guest's own lock or unlock of a leased mutex (Kernel::Mutex::lease) at an ARM site of
+/// ReleaseMutex (svc 0x14) or WaitSynchronization1 (0x24), from `base`: five words for r1-r3, r12
+/// and the flags (the guest's stack may be held), then the code, in at `base` + 20. In the
+/// leases' process, the handle's lease word from the table (LeaseEntries), then with
+/// LDREX/STREX: a free mutex taken (the
+/// thread's ID << 8, count 1) or one the thread holds counted up; counted down, and freed at 0.
+/// r0 0, every other register and the flags as they came, on at `resume`. Anything else (no
+/// lease, the kernel's, another thread's, a count of 255) falls through past the end to the
+/// upcall with every register as it came. A thread stopped inside runs on alone (InUpcall).
+/// Nothing when `resume` is out of a branch's reach.
+std::optional<std::vector<u32>> MutexFastPath(u32 svc, u32 base, u32 resume) {
+    std::vector<u32> w(5, 0);
+    const auto at = [&](std::size_t i) { return base + static_cast<u32>(i) * 4; };
+    // STR or LDR of rt to slot k, PC-relative (the slots lie behind).
+    const auto slot = [&](u32 op, u32 rt, u32 k) {
+        w.push_back(op | rt << 12 | (at(w.size()) + 8 - at(k)));
+    };
+    constexpr u32 Str = 0xE50F0000u, Ldr = 0xE51F0000u;
+    struct Fixup {
+        std::size_t at;
+        u32 cond;
+        int label;
+    };
+    std::vector<Fixup> fixups;
+    std::array<std::size_t, 4> labels{}; // retry, store, slow_clrex, slow
+    enum { Retry, Store, SlowClrex, Slow };
+    const auto branch = [&](u32 cond, int label) {
+        fixups.push_back({w.size(), cond, label});
+        w.push_back(0);
+    };
+    const u32 table = ThunkAreaBase + LeaseTableOffset;
+    slot(Str, 1, 0);
+    slot(Str, 2, 1);
+    slot(Str, 3, 2);
+    slot(Str, 12, 3);
+    w.push_back(0xE10F3000u); // mrs r3, apsr
+    slot(Str, 3, 4);
+    w.push_back(ArmMovw(1, table));
+    w.push_back(ArmMovt(1, table));
+    w.push_back(ArmMovw(3, AZAHAR_USER_PAGE_VA));
+    w.push_back(ArmMovt(3, AZAHAR_USER_PAGE_VA));
+    static_assert(offsetof(AzaharUserPage, process_id) == 0x20);
+    w.push_back(0xE5932020u); // ldr r2, [r3, #0x20]: the running process's ID
+    w.push_back(0xE591C000u); // ldr r12, [r1]: the leases'
+    w.push_back(0xE152000Cu); // cmp r2, r12
+    branch(0x1, Slow);        // bne
+    w.push_back(0xE2811010u); // add r1, r1, #16: the entries
+    w.push_back(0xE1A027A0u); // mov r2, r0, lsr #15: the handle's slot
+    w.push_back(0xE3520A01u); // cmp r2, #0x1000
+    branch(0x2, Slow);        // bhs
+    w.push_back(0xE0811182u); // add r1, r1, r2, lsl #3
+    w.push_back(0xE5912000u); // ldr r2, [r1]: the entry's handle
+    w.push_back(0xE1520000u); // cmp r2, r0
+    branch(0x1, Slow);        // bne
+    w.push_back(0xE5911004u); // ldr r1, [r1, #4]: the lease word
+    static_assert(offsetof(AzaharUserPage, thread_id) == 0x1c);
+    w.push_back(0xE593301Cu); // ldr r3, [r3, #0x1c]: the running thread's ID
+    labels[Retry] = w.size();
+    w.push_back(0xE1912F9Fu); // ldrex r2, [r1]
+    if (svc == 0x14) {
+        w.push_back(0xE023C422u); // eor r12, r3, r2, lsr #8
+        w.push_back(0xE35C0000u); // cmp r12, #0: held by this thread
+        branch(0x1, SlowClrex);
+        w.push_back(0xE202C0FFu); // and r12, r2, #0xff
+        w.push_back(0xE35C0001u); // cmp r12, #1
+        w.push_back(0x03A02000u); // moveq r2, #0: free
+        w.push_back(0x12422001u); // subne r2, r2, #1
+        w.push_back(0xE181CF92u); // strex r12, r2, [r1]
+        w.push_back(0xE35C0000u); // cmp r12, #0
+        branch(0x1, Retry);
+    } else {
+        w.push_back(0xE3520000u); // cmp r2, #0: free
+        w.push_back(0x01A0C403u); // moveq r12, r3, lsl #8
+        w.push_back(0x038CC001u); // orreq r12, r12, #1
+        branch(0x0, Store);
+        w.push_back(0xE023C422u); // eor r12, r3, r2, lsr #8
+        w.push_back(0xE35C0000u); // cmp r12, #0: held by this thread
+        branch(0x1, SlowClrex);
+        w.push_back(0xE202C0FFu); // and r12, r2, #0xff
+        w.push_back(0xE35C00FFu); // cmp r12, #0xff
+        branch(0x0, SlowClrex);
+        w.push_back(0xE282C001u); // add r12, r2, #1
+        labels[Store] = w.size();
+        w.push_back(0xE1812F9Cu); // strex r2, r12, [r1]
+        w.push_back(0xE3520000u); // cmp r2, #0
+        branch(0x1, Retry);
+    }
+    w.push_back(0xE3A00000u); // mov r0, #0: success
+    slot(Ldr, 3, 4);
+    w.push_back(0xE12CF003u); // msr apsr_nzcvqg, r3
+    slot(Ldr, 1, 0);
+    slot(Ldr, 2, 1);
+    slot(Ldr, 3, 2);
+    slot(Ldr, 12, 3);
+    const std::size_t to_resume = w.size();
+    w.push_back(0);
+    labels[SlowClrex] = w.size();
+    w.push_back(0xF57FF01Fu); // clrex
+    labels[Slow] = w.size();
+    slot(Ldr, 3, 4);
+    w.push_back(0xE12CF003u); // msr apsr_nzcvqg, r3
+    slot(Ldr, 1, 0);
+    slot(Ldr, 2, 1);
+    slot(Ldr, 3, 2);
+    slot(Ldr, 12, 3);
+    for (const Fixup& f : fixups) {
+        w[f.at] = *ArmBranch(f.cond, at(f.at), at(labels[f.label]));
+    }
+    const auto back = ArmBranch(0xE, at(to_resume), resume);
+    if (!back) {
+        return std::nullopt;
+    }
+    w[to_resume] = *back;
+    return w;
+}
+
 } // Anonymous namespace
 
 void ARM_VitaNative::EnsureUpcallBody() {
@@ -2066,7 +2324,10 @@ void ARM_VitaNative::PatchUpcall(u32 pc, bool thumb) {
         return;
     }
     EnsureUpcallBody();
-    const auto room = ThunkRoom(32 * 4);
+    // ReleaseMutex and WaitSynchronization1: the guest's own unlock and lock first.
+    const bool fast = number == 0x14 || number == 0x24;
+    const u32 room_bytes = fast ? 96 * 4 : 32 * 4;
+    const auto room = ThunkRoom(room_bytes);
     if (!room) {
         svc_refused.insert(pc);
         return;
@@ -2074,15 +2335,28 @@ void ARM_VitaNative::PatchUpcall(u32 pc, bool thumb) {
     const u32 base = *room;
     const u32 fn = HostAddress(upcall_table[number]);
     const u32 resume = pc + 4;
-    const auto entry =
-        UpcallEntry(base, {ArmMovw(12, resume), ArmMovt(12, resume)}, fn, upcall_body);
-    const auto site = ArmBranch(cond, pc, base);
+    std::vector<u32> words;
+    u32 in = base;
+    if (fast) {
+        auto fast_path = MutexFastPath(number, base, resume);
+        if (!fast_path) {
+            svc_refused.insert(pc);
+            return;
+        }
+        words = std::move(*fast_path);
+        in = base + 20;
+    }
+    const auto entry = UpcallEntry(base + static_cast<u32>(words.size()) * 4,
+                                   {ArmMovw(12, resume), ArmMovt(12, resume)}, fn, upcall_body);
+    const auto site = ArmBranch(cond, pc, in);
     if (!entry || !site) {
         svc_refused.insert(pc);
         return;
     }
-    const u32 bytes = static_cast<u32>(entry->size() * 4);
-    std::memcpy(thunk_area->Data() + thunk_area_used, entry->data(), bytes);
+    words.insert(words.end(), entry->begin(), entry->end());
+    const u32 bytes = static_cast<u32>(words.size() * 4);
+    ASSERT(bytes <= room_bytes);
+    std::memcpy(thunk_area->Data() + thunk_area_used, words.data(), bytes);
     map->SyncCode(base, bytes);
     thunk_area_used += bytes;
     upcall_thunks[base] = UpcallThunk{pc, base + bytes, base + bytes};
@@ -2240,6 +2514,11 @@ u64 ARM_VitaNative::UpcallSvc(u32 svc, const std::array<u32, 8>& in) {
         ResumeUpcallClock(slice_timer, MinQuantumNs);
         return UpcallAnswer(regs[0], UpcallReschedule);
     };
+    // A mutex the thunk did not lock or unlock itself: lent to it from the next call on.
+    if (svc == 0x14 || svc == 0x24) {
+        std::scoped_lock lock{kernel.GetHLELock()};
+        LeaseMutex(kernel, regs[0]);
+    }
     core.svc_context.CallSVCForUpcall(svc);
     core.upcall_regs_live = false;
     // The outputs: r0 the result, r1-r12 into the frame. Some svcs' outputs reach past r3
@@ -2604,6 +2883,19 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
     run.upcall_switch = &upcall_switch;
     EnsureUpcallBody();
     run.upcall_redirect = &upcall_redirect;
+    // The module writes a permitted store through the app's view, which the guest's world maps
+    // with the upcalls.
+    if (UpcallsOn()) {
+        const u32* const gen = system.GPU().PageHoldsGeneration();
+        if (store_permits.gen != gen) {
+            ClearStorePermits();
+            store_permits.gen = gen;
+            system.GPU().SetStorePermits(&store_permits);
+        }
+        run.store_permits = &store_permits;
+    } else {
+        run.store_permits = nullptr;
+    }
 #ifdef VITA_DIAGNOSTICS
 #endif
     const int ret = azaharRun(&run);
@@ -2746,6 +3038,8 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
     }
 #endif
 
+    // The monitor an LDREX made past the holds left holds for this exit alone (Exclusive).
+    exclusive_held = std::exchange(exclusive, Exclusive{});
     switch (run.reason) {
     case AZAHAR_EXIT_SVC:
         // An upcall asked for a reschedule: this exit is for it alone.
@@ -2793,11 +3087,8 @@ bool ARM_VitaNative::RunSliceOnce(u64 quantum_ns) {
         // work, opens the page, and the access runs again.
         const u32 status = (run.fsr & 0xFu) | ((run.fsr >> 6) & 0x10u);
         const bool write = (run.fsr & (1u << 11)) != 0;
-        if (status == 0xFu) {
-            const u8* const host = map->HostAt(run.far);
-            if (host != nullptr && system.GPU().GuestAbort(host, write, context.r[15], run.far)) {
-                return !break_flag && !stop_requested;
-            }
+        if (status == 0xFu && TakeHeldPage(run.far, write, run.ctx.r[15])) {
+            return !break_flag && !stop_requested;
         }
         ReportFault();
         return false;
@@ -2855,6 +3146,29 @@ VitaNativeCensus TakeVitaNativeCensus() {
         DEBUG_ASSERT_MSG(untouched > 1024, "upcall: the stack's deepest use left {} bytes of {}",
                          untouched, upcall_stack.size());
     }
+    census.permitted_stores = std::exchange(store_permits.made, 0u);
+    // Each live permit's stores since the last census: its `left` against the last census's, one
+    // made since from whole (at least: made again for the same page, it may have gone below the
+    // last census's). `left` stays as it is: made whole each second, diagnostics' permits never ran
+    // out where release's do.
+    static std::array<std::array<u32, 2>, AZAHAR_STORE_PERMITS> seen{};
+    for (u32 s = 0; s < AZAHAR_STORE_PERMITS; s++) {
+        const AzaharStorePermit& permit = store_permits.permit[s];
+        const auto [seen_page, seen_left] = seen[s];
+        seen[s] = {permit.page, permit.left};
+        if (permit.page == 0) {
+            continue;
+        }
+        const u32 stores = permit.page == seen_page && permit.left <= seen_left
+                               ? seen_left - permit.left
+                               : ARM_VitaNative::PermitStores - permit.left;
+        auto& top = census.permitted_store_pages;
+        auto least = std::min_element(top.begin(), top.end(),
+                                      [](const auto& a, const auto& b) { return a[1] < b[1]; });
+        if (stores > (*least)[1]) {
+            *least = {permit.page, stores};
+        }
+    }
     census.hold_pages = static_cast<u32>(hold_page_accesses.size());
     std::vector<std::array<u32, 3>> pages;
     for (const auto& [page, access] : hold_page_accesses) {
@@ -2874,10 +3188,624 @@ void SetVitaInKernelScheduling(bool on) {
 }
 
 bool ARM_VitaNative::TakeHeldPage(u32 va, bool write, u32 pc) {
-    // A page held for the display alone opens instead (PageHolds::OpenPastDisplay).
+    // A page held for the display alone opens; otherwise an access clear of the bytes the holds
+    // protect is made here, the page held still.
     const u8* const host = map->HostAt(va);
-    return host != nullptr && (system.GPU().GuestOpensDisplayPage(host, write) ||
-                               system.GPU().GuestAbort(host, write, pc, va));
+    if (host != nullptr && system.GPU().GuestOpensDisplayPage(host, write, AccessReach(pc))) {
+        return true;
+    }
+    // A page the guest keeps accessing past its holds opens without a wait where it can.
+    HotPage* hot = nullptr;
+    for (HotPage& h : hot_pages) {
+        if (h.page == va >> 12) {
+            hot = &h;
+            break;
+        }
+    }
+    if (hot == nullptr) {
+        hot = &hot_pages[hot_next++ % hot_pages.size()];
+        *hot = {va >> 12, 0};
+    }
+    if (hot->accesses >= AccessesPerOpen && host != nullptr) {
+        hot->accesses = 0;
+        if (system.GPU().GuestOpensHeldPage(host, std::min(AccessReach(pc), 0x1000u - (va & 0xFFFu)),
+                                            write)) {
+#ifdef VITA_DIAGNOSTICS
+            census.hold_opens++;
+#endif
+            return true;
+        }
+    }
+#ifdef VITA_DIAGNOSTICS
+    // Before the access: a load into the PC may change the state.
+    const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
+#endif
+    if (AccessPastHolds(pc, write)) {
+        hot->accesses++;
+#ifdef VITA_DIAGNOSTICS
+        (write ? census.hold_stores : census.hold_loads)++;
+        census.hold_thumb += thumb ? 1 : 0;
+        auto& [count, at] = hold_page_accesses[va & ~0xFFFu];
+        count++;
+        at = pc;
+#endif
+        return true;
+    }
+    return host != nullptr && system.GPU().GuestAbort(host, write, pc, va);
+}
+
+bool ARM_VitaNative::TakeHoldBudget(u32 page, u32 ticket) {
+    HoldBudget* entry = nullptr;
+    for (HoldBudget& b : hold_budgets) {
+        if (b.page == page) {
+            entry = &b;
+            break;
+        }
+    }
+    if (entry == nullptr) {
+        entry = &hold_budgets[hold_budget_next++ % hold_budgets.size()];
+        *entry = {page, ticket, 0};
+    } else if (entry->ticket != ticket) {
+        entry->ticket = ticket;
+        entry->accesses = 0;
+    }
+    if (entry->accesses == AccessesPerHold) {
+#ifdef VITA_DIAGNOSTICS
+        census.hold_load_waits++;
+#endif
+        return false;
+    }
+    entry->accesses++;
+    return true;
+}
+
+bool ARM_VitaNative::AccessPastHolds(u32 pc, bool write) {
+    const bool thumb = (run.ctx.cpsr & 0x20u) != 0;
+    const u32 next = pc + (thumb ? 2 : 4);
+    // The app's view of the guest's page: the guest's slot, open to the app. A load needs the
+    // GPU's writes missed, a store everything the queued work touches.
+    const auto misses = [&](u32 address, u32 bytes) -> u8* {
+        const u8* const host = map->HostAt(address);
+        u32 ticket = 0;
+        if (host == nullptr ||
+            !(write ? system.GPU().GuestStoreMissesHolds(host, bytes, ticket)
+                    : system.GPU().GuestReadMissesWrites(host, bytes, ticket)) ||
+            !TakeHoldBudget(address >> 12, ticket)) {
+            return nullptr;
+        }
+        // The page's next stores clear of its queued work are the module's (AzaharStorePermits),
+        // as many as a hold's budget.
+        if (write && run.store_permits != nullptr) {
+            const u32 page = address >> 12;
+            AzaharStorePermit& permit = store_permits.permit[page % AZAHAR_STORE_PERMITS];
+#ifdef VITA_DIAGNOSTICS
+            if (permit.page == 0) {
+                census.permits_after_none++;
+            } else if (permit.page != page) {
+                census.permits_after_other++;
+            } else if (permit.left == 0) {
+                census.permits_after_used++;
+            } else {
+                census.permits_after_live++;
+                // The sites of the stores the module left to the app on a live permit: the
+                // guest's PC, its instruction, how many (8 sites at most).
+                for (auto& site : census.permits_live_sites) {
+                    if (site[2] == 0 || site[0] == pc) {
+                        site = {pc, insn, site[2] + 1};
+                        break;
+                    }
+                }
+            }
+#endif
+            std::array<u16, AZAHAR_STORE_RANGES> lo, hi;
+            system.GPU().GuestStoreForbidden(host, lo, hi, page % AZAHAR_STORE_PERMITS);
+            permit.page = page;
+            permit.gen = *store_permits.gen;
+            permit.host = HostAddress(host - (address & 0xFFFu));
+            permit.left = PermitStores;
+            std::copy(lo.begin(), lo.end(), permit.lo);
+            std::copy(hi.begin(), hi.end(), permit.hi);
+#ifdef VITA_DIAGNOSTICS
+            census.store_permits++;
+#endif
+        }
+        return const_cast<u8*>(host);
+    };
+    const auto span = [&](u32 address, u32 bytes, bool store, Span& s) {
+        if (bytes == 0 || run.far - address >= bytes) {
+            return false;
+        }
+        s.split = std::min(bytes, 0x1000u - (address & 0xFFFu));
+        for (u32 k = 0; k < 2; k++) {
+            const u32 at = k == 0 ? address : address + s.split;
+            const u32 n = k == 0 ? s.split : bytes - s.split;
+            if (n == 0) {
+                break;
+            }
+            if (IsLumaAlias(at)) {
+                const PAddr physical = at & 0x7FFFFFFFu;
+                if (!memory.IsValidPhysicalAddress(physical)) {
+                    return false;
+                }
+                s.host[k] = memory.GetPhysicalPointer(physical);
+                continue;
+            }
+            const u8* const host = map->HostAt(at);
+            if (host == nullptr || !system.GPU().GuestAccessMisses(host, n, store)) {
+                return false;
+            }
+            s.host[k] = const_cast<u8*>(host);
+        }
+        return true;
+    };
+    // n bytes at `offset` into the span, from or to `data`, split at the page boundary.
+    const auto put = [](const Span& s, u32 offset, const void* data, u32 n) {
+        const u8* const from = static_cast<const u8*>(data);
+        const u32 first = offset >= s.split ? 0 : std::min(n, s.split - offset);
+        if (first != 0) {
+            std::memcpy(s.host[0] + offset, from, first);
+        }
+        if (first != n) {
+            std::memcpy(s.host[1] + (offset + first - s.split), from + first, n - first);
+        }
+    };
+    const auto get = [](const Span& s, u32 offset, void* data, u32 n) {
+        u8* const to = static_cast<u8*>(data);
+        const u32 first = offset >= s.split ? 0 : std::min(n, s.split - offset);
+        if (first != 0) {
+            std::memcpy(to, s.host[0] + offset, first);
+        }
+        if (first != n) {
+            std::memcpy(to + first, s.host[1] + (offset + first - s.split), n - first);
+        }
+    };
+    // A load into the PC: a branch with ARMv5T's interworking, bit 0 the Thumb state.
+    const auto load_pc = [&](u32 value) {
+        if ((value & 1u) != 0) {
+            run.ctx.cpsr |= 0x20u;
+            run.ctx.r[15] = value & ~1u;
+        } else {
+            run.ctx.cpsr &= ~0x20u;
+            run.ctx.r[15] = value & ~3u;
+        }
+    };
+    // The PC as a store reads it: + 8 in ARM, + 4 in Thumb.
+    const u32 pc_read = pc + (thumb ? 4 : 8);
+    // Words [start, start + 4 count) to or from regs[0..count), the base written back.
+    const auto core_block = [&](u32 start, const std::array<u32, 16>& regs, u32 count, u32 base,
+                                bool writeback, u32 written_back) {
+        Span s;
+        if (count == 0 || !span(start, count * 4, write, s)) {
+            return false;
+        }
+        bool to_pc = false;
+        u32 pc_value = 0;
+        for (u32 k = 0; k < count; k++) {
+            const u32 r = regs[k];
+            if (write) {
+                const u32 v = r == 15 ? pc_read : run.ctx.r[r];
+                put(s, 4 * k, &v, 4);
+            } else {
+                u32 v;
+                get(s, 4 * k, &v, 4);
+                if (r == 15) {
+                    to_pc = true;
+                    pc_value = v;
+                } else {
+                    run.ctx.r[r] = v;
+                }
+            }
+        }
+        if (writeback) {
+            run.ctx.r[base] = written_back;
+        }
+        if (to_pc) {
+            load_pc(pc_value);
+        } else {
+            run.ctx.r[15] = next;
+        }
+        return true;
+    };
+    // One value of size bytes to or from register t (a pair: t, t + 1), signed loads sign-extended.
+    const auto one = [&](u32 address, u32 size, u32 t, bool sign, bool pair) {
+        Span s;
+        if (!span(address, size, write, s)) {
+            return false;
+        }
+        if (write) {
+            if (pair) {
+                put(s, 0, &run.ctx.r[t], 4);
+                put(s, 4, &run.ctx.r[t + 1], 4);
+            } else if (size == 4) {
+                const u32 v = t == 15 ? pc_read : run.ctx.r[t];
+                put(s, 0, &v, 4);
+            } else if (size == 2) {
+                const u16 half = static_cast<u16>(run.ctx.r[t]);
+                put(s, 0, &half, 2);
+            } else {
+                const u8 byte = static_cast<u8>(run.ctx.r[t]);
+                put(s, 0, &byte, 1);
+            }
+        } else if (pair) {
+            get(s, 0, &run.ctx.r[t], 4);
+            get(s, 4, &run.ctx.r[t + 1], 4);
+        } else if (size == 4) {
+            u32 v;
+            get(s, 0, &v, 4);
+            if (t == 15) {
+                load_pc(v);
+                return true;
+            }
+            run.ctx.r[t] = v;
+        } else if (size == 2) {
+            u16 half;
+            get(s, 0, &half, 2);
+            run.ctx.r[t] =
+                sign ? static_cast<u32>(static_cast<s32>(static_cast<s16>(half))) : half;
+        } else {
+            u8 byte;
+            get(s, 0, &byte, 1);
+            run.ctx.r[t] = sign ? static_cast<u32>(static_cast<s32>(static_cast<s8>(byte))) : byte;
+        }
+        return true;
+    };
+    const auto regs_of = [](u32 list, std::array<u32, 16>& regs) {
+        u32 count = 0;
+        for (u32 r = 0; r < 16; r++) {
+            if ((list >> r & 1u) != 0) {
+                regs[count++] = r;
+            }
+        }
+        return count;
+    };
+    // A base in a store's list with writeback stores its original value only as the lowest register
+    // (else UNKNOWN); a load's is unpredictable.
+    const auto base_listed_ok = [&](u32 list, u32 base, bool load) {
+        return (list >> base & 1u) == 0 || (!load && (list & ((1u << base) - 1)) == 0);
+    };
+    if (thumb) {
+        // The ARM11's Thumb (ARMv6K): 16-bit, its loads and stores unconditional.
+        const u32 insn = memory.Read16(pc);
+        const bool l = (insn >> 11 & 1u) != 0;
+        if ((insn & 0xF000u) == 0xC000u || (insn & 0xF600u) == 0xB400u) {
+            // LDMIA, STMIA: 1100 L Rn list. PUSH: 1011 010 R list; POP: 1011 110 P list.
+            const bool stack = (insn & 0xF000u) == 0xB000u;
+            const bool extra = stack && (insn >> 8 & 1u) != 0;
+            const u32 base = stack ? 13 : insn >> 8 & 7u;
+            const u32 list = (insn & 0xFFu) | (extra ? (l ? 1u << 15 : 1u << 14) : 0);
+            // An LDMIA's base in its list takes the loaded value (no writeback).
+            if (l == write || (!stack && !l && !base_listed_ok(list, base, false))) {
+                return false;
+            }
+            std::array<u32, 16> regs{};
+            const u32 count = regs_of(list, regs);
+            const u32 b = run.ctx.r[base];
+            const u32 start = stack && !l ? b - 4 * count : b;
+            // An LDMIA's base in its list takes the loaded value; an STMIA always writes its base back.
+            return core_block(start, regs, count, base,
+                              stack || !l || (list >> base & 1u) == 0,
+                              stack && !l ? start : b + 4 * count);
+        }
+        const u32 rn = insn >> 3 & 7u, imm5 = insn >> 6 & 0x1Fu;
+        u32 address = 0, size = 0, t = insn & 7u;
+        bool load_form = l, sign = false;
+        switch (insn >> 11) {
+        case 0b01001u: // LDR Rt, [PC, #imm8 * 4]: from the word-aligned PC + 4
+            t = insn >> 8 & 7u;
+            address = ((pc + 4) & ~3u) + (insn & 0xFFu) * 4;
+            size = 4;
+            load_form = true;
+            break;
+        case 0b01010u:
+        case 0b01011u: {
+            // The register offsets: 0101 op Rm Rn Rt (STR, STRH, STRB, LDRSB, LDR, LDRH, LDRB, LDRSH).
+            static constexpr std::array<u8, 8> sizes{4, 2, 1, 1, 4, 2, 1, 2};
+            const u32 op = insn >> 9 & 7u;
+            address = run.ctx.r[rn] + run.ctx.r[insn >> 6 & 7u];
+            size = sizes[op];
+            load_form = op >= 3;
+            sign = op == 3 || op == 7;
+            break;
+        }
+        case 0b01100u:
+        case 0b01101u: // STR, LDR Rt, [Rn, #imm5 * 4]
+            address = run.ctx.r[rn] + imm5 * 4;
+            size = 4;
+            break;
+        case 0b01110u:
+        case 0b01111u: // STRB, LDRB Rt, [Rn, #imm5]
+            address = run.ctx.r[rn] + imm5;
+            size = 1;
+            break;
+        case 0b10000u:
+        case 0b10001u: // STRH, LDRH Rt, [Rn, #imm5 * 2]
+            address = run.ctx.r[rn] + imm5 * 2;
+            size = 2;
+            break;
+        case 0b10010u:
+        case 0b10011u: // STR, LDR Rt, [SP, #imm8 * 4]
+            t = insn >> 8 & 7u;
+            address = run.ctx.r[13] + (insn & 0xFFu) * 4;
+            size = 4;
+            break;
+        default:
+            return false;
+        }
+        if (load_form == write || !one(address, size, t, sign, false)) {
+            return false;
+        }
+        run.ctx.r[15] = next;
+        return true;
+    }
+    // The condition passed: a failing one makes no access.
+    const u32 insn = memory.Read32(pc);
+    if (insn >> 28 == 0xFu) {
+        return false;
+    }
+    const u32 n = insn >> 16 & 0xFu, t = insn >> 12 & 0xFu;
+    const bool pre = (insn >> 24 & 1u) != 0, up = (insn >> 23 & 1u) != 0,
+               w = (insn >> 21 & 1u) != 0;
+    // The L bit (bit 20) of the forms below: set for the loads.
+    const u32 load = write ? 0 : 0x00100000u;
+    if ((insn & 0x0E100000u) == (0x08000000u | load)) {
+        // LDM, STM: cond 100P USWL Rn register_list (S not built).
+        const u32 list = insn & 0xFFFFu;
+        if ((insn >> 22 & 1u) != 0 || n == 15 || (w && !base_listed_ok(list, n, !write))) {
+            return false;
+        }
+        std::array<u32, 16> regs{};
+        const u32 count = regs_of(list, regs);
+        const u32 rn = run.ctx.r[n];
+        const u32 start = up ? (pre ? rn + 4 : rn) : (pre ? rn - 4 * count : rn - 4 * count + 4);
+        return core_block(start, regs, count, n, w, up ? rn + 4 * count : rn - 4 * count);
+    }
+    if ((insn & 0x0F800FF0u) == 0x01800F90u) {
+        // LDREX, STREX and their D, B, H forms: cond 0001 1 sz L Rn Rt 1111 1001 Rt2. Aligned, or they
+        // fault for that and never get here.
+        static constexpr std::array<u32, 4> sizes{4, 8, 1, 2};
+        const u32 sz = insn >> 21 & 3u;
+        const u32 size = sizes[sz];
+        const bool l = (insn >> 20 & 1u) != 0;
+        const u32 address = run.ctx.r[n];
+        if (n == 15 || l == write) {
+            return false;
+        }
+        Span s;
+        if (l) {
+            if ((insn & 0xFu) != 0xFu || t == 15 || (sz == 1 && ((t & 1u) != 0 || t == 14)) ||
+                !span(address, size, false, s) || s.split != size) {
+                return false;
+            }
+            // Single-copy atomic as the hardware's.
+            u64 value = 0;
+            switch (size) {
+            case 1:
+                value = __atomic_load_n(s.host[0], __ATOMIC_SEQ_CST);
+                break;
+            case 2:
+                value = __atomic_load_n(reinterpret_cast<u16*>(s.host[0]), __ATOMIC_SEQ_CST);
+                break;
+            case 4:
+                value = __atomic_load_n(reinterpret_cast<u32*>(s.host[0]), __ATOMIC_SEQ_CST);
+                break;
+            default:
+                value = __atomic_load_n(reinterpret_cast<u64*>(s.host[0]), __ATOMIC_SEQ_CST);
+                break;
+            }
+            run.ctx.r[t] = static_cast<u32>(value);
+            if (sz == 1) {
+                run.ctx.r[t + 1] = static_cast<u32>(value >> 32);
+            }
+            exclusive = {address, size, value, true};
+            run.ctx.r[15] = next;
+            return true;
+        }
+        const u32 rt = insn & 0xFu;
+        if (t == 15 || rt == 15 || t == n || t == rt ||
+            (sz == 1 && ((rt & 1u) != 0 || rt == 14 || t == rt + 1))) {
+            return false;
+        }
+        // Only right after its LDREX here, else the fault's path.
+        if (!exclusive_held.valid || exclusive_held.address != address ||
+            exclusive_held.size != size || !span(address, size, true, s) || s.split != size) {
+            return false;
+        }
+        const u64 desired = sz == 1 ? u64{run.ctx.r[rt + 1]} << 32 | run.ctx.r[rt] : run.ctx.r[rt];
+        // A compare and swap against the value its LDREX loaded: another core's store meanwhile fails it.
+        const auto swap = [&]<typename T>(T*) {
+            T* const at = reinterpret_cast<T*>(s.host[0]);
+            for (u32 tries = 0; tries < 64; tries++) {
+                T expected = static_cast<T>(exclusive_held.value);
+                if (__atomic_compare_exchange_n(at, &expected, static_cast<T>(desired), true,
+                                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                    return true;
+                }
+                if (expected != static_cast<T>(exclusive_held.value)) {
+                    return false;
+                }
+            }
+            return false;
+        };
+        bool stored;
+        switch (size) {
+        case 1:
+            stored = swap(static_cast<u8*>(nullptr));
+            break;
+        case 2:
+            stored = swap(static_cast<u16*>(nullptr));
+            break;
+        case 4:
+            stored = swap(static_cast<u32*>(nullptr));
+            break;
+        default:
+            stored = swap(static_cast<u64*>(nullptr));
+            break;
+        }
+        exclusive_held = {};
+        run.ctx.r[t] = stored ? 0 : 1;
+        run.ctx.r[15] = next;
+        return true;
+    }
+    if ((insn & 0x0E100E00u) == (0x0C000A00u | load) && (pre || up)) {
+        // VLDR, VSTR (P 1, W 0), VLDM, VSTM IA (P 0, U 1) and DB (P 1, U 0, W 1): cond 110P UDWL Rn Vd
+        // 101 sz imm8.
+        const bool dbl = (insn >> 8 & 1u) != 0;
+        const u32 d = insn >> 22 & 1u, vd = insn >> 12 & 0xFu, imm8 = insn & 0xFFu;
+        const u32 first = dbl ? ((d << 4) | vd) * 2 : (vd << 1) | d;
+        const u32 base = n == 15 ? (pc + 8) & ~3u : run.ctx.r[n];
+        u32 start = 0, words = 0, written_back = 0;
+        if (pre && !w) {
+            words = dbl ? 2 : 1;
+            start = up ? base + imm8 * 4 : base - imm8 * 4;
+        } else if (!pre && up) {
+            words = imm8;
+            start = base;
+            written_back = base + imm8 * 4;
+        } else if (pre && !up && w) {
+            words = imm8;
+            start = base - imm8 * 4;
+            written_back = start;
+        } else {
+            return false;
+        }
+        Span s;
+        if (words == 0 || (dbl && words % 2 != 0) || first + words > (dbl ? 64u : 32u) ||
+            (w && n == 15) || !span(start, words * 4, write, s)) {
+            return false;
+        }
+        for (u32 k = 0; k < words; k++) {
+            if (write) {
+                put(s, 4 * k, &run.ctx.fpregs[first + k], 4);
+            } else {
+                get(s, 4 * k, &run.ctx.fpregs[first + k], 4);
+            }
+        }
+        if (w) {
+            run.ctx.r[n] = written_back;
+        }
+        run.ctx.r[15] = next;
+        return true;
+    }
+    u32 offset = 0, size = 0;
+    bool sign = false, pair = false;
+    const u32 m = insn & 0xFu;
+    if ((insn & 0x0C100000u) == (0x04000000u | load) &&
+        ((insn >> 25 & 1u) == 0 || (insn >> 4 & 1u) == 0)) {
+        // LDR, LDRB, STR, STRB: cond 010P UBWL Rn Rt imm12, or 011P UBWL Rn Rt imm5 type 0 Rm. The T forms
+        // (P 0, W 1) are not built.
+        if (!pre && w) {
+            return false;
+        }
+        size = (insn >> 22 & 1u) != 0 ? 1 : 4;
+        if ((insn >> 25 & 1u) != 0) {
+            const u32 amount = insn >> 7 & 0x1Fu, type = insn >> 5 & 3u, rm = run.ctx.r[m];
+            if (m == 15) {
+                return false;
+            }
+            switch (type) {
+            case 0:
+                offset = rm << amount;
+                break;
+            case 1:
+                offset = amount == 0 ? 0 : rm >> amount;
+                break;
+            case 2:
+                offset = static_cast<u32>(static_cast<s32>(rm) >> (amount == 0 ? 31 : amount));
+                break;
+            default:
+                offset = amount == 0 ? (run.ctx.cpsr >> 29 & 1u) << 31 | rm >> 1
+                                     : std::rotr(rm, static_cast<int>(amount));
+                break;
+            }
+        } else {
+            offset = insn & 0xFFFu;
+        }
+        // A byte to or from the PC is unpredictable.
+        if (t == 15 && size == 1) {
+            return false;
+        }
+    } else if ((insn & 0x0E000090u) == 0x00000090u && (insn & 0x60u) != 0 &&
+               ((insn >> 22 & 1u) != 0 || (insn & 0xF00u) == 0)) {
+        // The extra loads and stores: cond 000P U1WL Rn Rt imm4H 1 op2 1 imm4L, or cond 000P U0WL Rn Rt
+        // 0000 1 op2 1 Rm.
+        const u32 op2 = insn >> 5 & 3u;
+        const bool l = (insn >> 20 & 1u) != 0;
+        if (!pre && w) {
+            return false;
+        }
+        if (write) {
+            if (!l && op2 == 1) {
+                size = 2; // STRH
+            } else if (!l && op2 == 3) {
+                size = 8, pair = true; // STRD
+            } else {
+                return false;
+            }
+        } else if (l && op2 == 1) {
+            size = 2; // LDRH
+        } else if (l && op2 == 2) {
+            size = 1, sign = true; // LDRSB
+        } else if (l && op2 == 3) {
+            size = 2, sign = true; // LDRSH
+        } else if (!l && op2 == 2) {
+            size = 8, pair = true; // LDRD
+        } else {
+            return false; // the stores
+        }
+        if ((insn >> 22 & 1u) != 0) {
+            offset = (insn >> 4 & 0xF0u) | (insn & 0xFu);
+        } else if (m == 15) {
+            return false;
+        } else {
+            offset = run.ctx.r[m];
+        }
+        if (t == 15) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    const u32 base = n == 15 ? pc + 8 : run.ctx.r[n];
+    const u32 indexed = up ? base + offset : base - offset;
+    const u32 address = pre ? indexed : base;
+    const bool writeback = !pre || w;
+    if ((pair && ((t & 1u) != 0 || t == 14)) ||
+        (writeback && (n == 15 || n == t || (pair && n == t + 1)))) {
+        return false;
+    }
+    // The access first, the base after.
+    if (!one(address, size, t, sign, pair)) {
+        return false;
+    }
+    if (writeback) {
+        run.ctx.r[n] = indexed;
+    }
+    if (t != 15 || write) {
+        run.ctx.r[15] = next;
+    }
+    return true;
+}
+
+u32 ARM_VitaNative::AccessReach(u32 pc) const {
+    constexpr u32 Single = 8, Block = 128;
+    if ((run.ctx.cpsr & 0x20u) != 0) {
+        // The ARM11's Thumb is 16-bit: LDMIA/STMIA 1100, PUSH 1011010, POP 1011110.
+        const u16 insn = memory.Read16(pc);
+        return (insn & 0xF000u) == 0xC000u || (insn & 0xF600u) == 0xB400u ? Block : 4;
+    }
+    const u32 insn = memory.Read32(pc);
+    if (insn >> 28 == 0xFu) {
+        return Block; // the unconditional space: SRS, RFE
+    }
+    switch (insn >> 25 & 7u) {
+    case 0b100u:
+        return Block; // LDM/STM
+    case 0b110u:
+        // LDC/STC: VLDR/VSTR (P set, W clear) one value, the others a block (VLDM/VSTM).
+        return (insn >> 24 & 1u) != 0 && (insn >> 21 & 1u) == 0 ? Single : Block;
+    default:
+        return Single;
+    }
 }
 
 void ARM_VitaNative::ReportFault() {
@@ -3007,10 +3935,10 @@ void ARM_VitaNative::InvalidateCacheRange(u32 start_address, std::size_t length)
 }
 
 void ARM_VitaNative::ClearExclusiveState() {
-    // Nothing to do here. Whether an exception return clears the local monitor is
-    // IMPLEMENTATION DEFINED on ARMv7-A, so entry.S executes
-    // CLREX explicitly before every guest entry - which covers this and every other path back
-    // into the guest, including the ones that never call through here.
+    // Whether an exception return clears the local monitor is IMPLEMENTATION DEFINED on ARMv7-A:
+    // entry.S runs CLREX before every guest entry. AccessPastHolds' own monitor goes too.
+    exclusive = {};
+    exclusive_held = {};
 }
 
 void ARM_VitaNative::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
@@ -3112,6 +4040,9 @@ void ARM_VitaNative::SaveContext(ThreadContext& ctx) {
 }
 
 void ARM_VitaNative::LoadContext(const ThreadContext& ctx) {
+    // Another thread's registers: AccessPastHolds' monitor was the last thread's.
+    exclusive = {};
+    exclusive_held = {};
     ToAzahar(ctx, run.ctx);
     if ((run.ctx.cpsr & 0x20u) != 0) {
         run.ctx.r[15] = PastPatchedThumbSvc(run.ctx.r[15]);

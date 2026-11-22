@@ -610,17 +610,39 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              n.permits_after_none, n.permits_after_other, n.permits_after_used,
                              n.permits_after_live, n.permit_clears, live_sites);
                     const double tick_ms = BASE_CLOCK_RATE_ARM11 / 1e3;
-                    LOG_INFO(Frontend,
-                             "perf: guest {:.1f} ms, azaharRun {:.1f} ms, {} slices: svc {}, "
-                             "timer {}, faults {} (VFP short vectors {} in {}); svcs answered "
-                             "in the guest: tick {}, cache {}, thread id {}, process id {}, "
-                             "VFP {}",
-                             n.guest_ticks / tick_ms, n.kernel_us / 1e3, n.slices,
-                             n.reasons[AZAHAR_EXIT_SVC], n.reasons[AZAHAR_EXIT_TIMER],
-                             n.slices - n.reasons[AZAHAR_EXIT_SVC] - n.reasons[AZAHAR_EXIT_TIMER],
-                             n.vfp_insns, n.vfp_exits, n.fast[AZAHAR_FAST_TICK],
-                             n.fast[AZAHAR_FAST_CACHE], n.fast[AZAHAR_FAST_THREAD_ID],
-                             n.fast[AZAHAR_FAST_PROCESS_ID], n.fast[AZAHAR_FAST_VFP]);
+                    LOG_INFO(
+                        Frontend,
+                        "perf: guest {:.1f} ms, azaharRun {:.1f} ms, {} slices: svc {}, "
+                        "timer {}, faults {} (VFP short vectors {} in {}, loads past held "
+                        "bytes {}, stores {} (permits {}, {} stores made by them in the "
+                        "vector), {} past the budget left to wait; sites patched to "
+                        "a thunk {}, to the svc {}); svc sites patched to a thunk {}; "
+                        "upcall sites {} (Thumb {}) runs {} redirected {} rescheduled {} "
+                        "switched {} idled {} ({} events, {} exits, {} for core 1, {} for the "
+                        "vblank), exits for the slice's end {} and no next thread {} "
+                        "syscalls {} "
+                        "preempted {} ({} in the vector), app megabytes taken {}, upcall "
+                        "stack {} bytes, the app's level-1 entries the guest's table lacks "
+                        "{} and holds stale {}; svcs "
+                        "answered in the guest: "
+                        "tick {}, cache {}, thread id {}, process id {}, VFP {}",
+                        n.guest_ticks / tick_ms,
+                        n.kernel_cycles / (scePowerGetArmClockFrequency() * 1e3), n.slices,
+                        n.reasons[AZAHAR_EXIT_SVC], n.reasons[AZAHAR_EXIT_TIMER],
+                        n.slices - n.reasons[AZAHAR_EXIT_SVC] - n.reasons[AZAHAR_EXIT_TIMER],
+                        n.vfp_insns, n.vfp_exits, n.hold_loads, n.hold_stores, n.hold_thumb,
+                        n.store_permits, n.permitted_stores, n.hold_load_waits, n.vfp_thunks, n.vfp_svcs,
+                        n.svc_thunks,
+                        n.upcall_sites, n.upcall_thumb_sites, n.upcall_runs, n.upcall_redirects,
+                        n.upcall_reschedules, n.upcall_switches, n.upcall_idles,
+                        n.upcall_idle_events, n.upcall_idle_exits, n.upcall_idle_exits_other_busy,
+                        n.upcall_idle_exits_vblank, n.upcall_exits_slice_up,
+                        n.upcall_exits_no_next, n.upcall_syscalls, n.upcall_preempted,
+                        n.upcall_rearms, n.upcall_synced, n.upcall_stack_used,
+                        n.upcall_drift < 0 ? n.upcall_drift : n.upcall_drift & 0xFFFF,
+                        n.upcall_drift < 0 ? 0 : n.upcall_drift >> 16, n.fast[AZAHAR_FAST_TICK],
+                        n.fast[AZAHAR_FAST_CACHE], n.fast[AZAHAR_FAST_THREAD_ID],
+                        n.fast[AZAHAR_FAST_PROCESS_ID], n.fast[AZAHAR_FAST_VFP]);
                     LOG_INFO(Frontend,
                              "perf: idle loops: {} callers sent to the skip; {} skips, {:.1f} ms "
                              "of guest time skipped",

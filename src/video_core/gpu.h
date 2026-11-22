@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -17,6 +18,8 @@
 
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/rasterizer_interface.h"
+
+struct AzaharStorePermits;
 
 namespace Service::GSP {
 struct Command;
@@ -121,6 +124,32 @@ public:
     /// it. If so, the GPU work it waited for is done and the guest may run the access again.
     /// `guest_pc` and `guest_va` are the abort's instruction and address (for `holdlog`).
     bool GuestAbort(const u8* host, bool write, u32 guest_pc, u32 guest_va);
+    /// Whether an aborted guest access at host opened its page, held for the display alone,
+    /// the `reach` bytes its instruction may touch from host on being clear of the display's
+    /// bytes (renderer_sgxd's PageHolds::OpenPastDisplay).
+    bool GuestOpensDisplayPage(const u8* host, bool write, u32 reach);
+    /// Whether an aborted guest read of [host, host + size), on one page, misses the bytes the
+    /// GPU's queued work writes there, so it can be made at once with the page still held;
+    /// write_ticket names that work (the page's last write hold).
+    bool GuestReadMissesWrites(const u8* host, u32 size, u32& write_ticket);
+    /// Whether an aborted guest store to [host, host + size), on one page, misses the bytes
+    /// the GPU's queued work reads and writes there, so it can be made at once with the page
+    /// still held; ticket names the page's last live hold (renderer_sgxd's
+    /// PageHolds::StoreMisses).
+    bool GuestStoreMissesHolds(const u8* host, u32 size, u32& ticket);
+    /// Whether an aborted guest access of up to [host, host + size), on one page the guest keeps
+    /// accessing past its holds, opened that page without a wait (renderer_sgxd's
+    /// RenderThread::OpensHeldPage: a store's version; a picture's rows written back, the page
+    /// opening later): the access runs again natively, and so do the guest's next ones there.
+    bool GuestOpensHeldPage(const u8* host, u32 size, bool write);
+    /// The bytes of the page a store GuestStoreMissesHolds passed must miss, as six [lo, hi) page
+    /// offsets (hi 0 for none), for the native core's store permit at `slot`; the permits' table,
+    /// whose permits a page's next hold voids one by one, and their generation (renderer_sgxd's
+    /// PageHolds::StoreForbidden, PermitGranted, SetStorePermits, Generation).
+    void GuestStoreForbidden(const u8* host, std::array<u16, 6>& lo, std::array<u16, 6>& hi,
+                             u32 slot);
+    void SetStorePermits(AzaharStorePermits* table);
+    const u32* PageHoldsGeneration() const;
 
     /**
      * With the sgxd renderer, its render thread held (RenderThread::Hold): for the guard's life the

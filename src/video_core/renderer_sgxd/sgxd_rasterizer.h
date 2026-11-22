@@ -801,6 +801,72 @@ private:
     bool proctex_table_dirty{true};
     KeyIndex<u32> proctex_tables_by_contents;
 
+    /// A colour buffer a display transfer averages down (ScaleX, ScaleXY): the game's
+    /// supersampling (a game draws its top screen 480x400 for a 240x400 picture). From
+    /// the first such transfer on, the buffer's passes draw at 1x along the averaged axes, as a
+    /// buffer of width / scale_x by height / scale_y at the same address, and its transfers copy
+    /// that 1:1 (gxm_flags keepaa keeps the game's).
+    struct Supersampled {
+        PAddr colour{};
+        u32 width{}, height{}; ///< the game's buffer
+        u32 scale_x = 1, scale_y = 1;
+        /// The region the transfer averages (its output times the scale): the draws whose
+        /// viewport is this size draw the picture; the buffer's other uses keep its size
+        /// (a game's bottom screen, a 240x320 viewport on the same buffer).
+        u32 region_width{}, region_height{};
+        u32 bytes{};
+        PAddr depth{}; ///< the depth buffer its 1x passes drew, the game's size of it
+        u32 depth_bytes{};
+        Pica::FramebufferRegs::ColorFormat format{};
+        u32 bpp{};
+        /// The 1x picture magnified into the game's layout, for a copy of the buffer
+        /// (SupersampledSource), and whether it is the current picture's.
+        SgxdBackend::Data full{};
+        bool full_current = false;
+        bool drawn_1x = false; ///< a pass drew it at 1x: its transfers read the 1x picture
+        /// Drawn at 1x since its last averaging transfer: what the game would read of it is
+        /// the 1x picture (the memory goes to other uses after the transfer: a game
+        /// draws its bottom screen 80 rows into its top screen's).
+        bool live = false;
+    };
+    std::vector<Supersampled> supersampled;
+    bool supersample_dropped = false; ///< the last draw's (DropSupersampling)
+    Pica::FramebufferRegs::FramebufferConfig supersample_saved_fb{};
+    Pica::RasterizerRegs supersample_saved_rs{};
+    /// For a draw to a Supersampled buffer: its buffer size, viewport and scissor at 1x in regs
+    /// until RestoreSupersampling. Whether it was one.
+    bool DropSupersampling();
+    void RestoreSupersampling();
+    /// The GPU address a copy of guest [src, src + size) reads: within a live Supersampled
+    /// buffer, the 1x picture magnified into the game's layout (once a picture), else src.
+    PAddr SupersampledSource(PAddr src, u32 size);
+    /// Whether guest bytes [lo, hi) meet a live Supersampled buffer (colour or depth).
+    [[nodiscard]] bool MeetsSupersampled1x(PAddr lo, PAddr hi) const;
+    /// The game's jittered double render (MH Generations' anti-aliasing: its scene drawn twice a
+    /// frame, the projection half a pixel apart, the first render copied aside whole by one
+    /// draw and blended back over the second at alpha 0.5). Seen once - a copy of the last
+    /// buffer drawn before the copy's own, draws on that buffer, the copy blended back over it -
+    /// the draws on the scene between the copy and the blend are skipped from then on, and the
+    /// blend mixes the first render with its own copy (gxm_flags keepaa keeps the game's).
+    struct DoubleRender {
+        PAddr scene{}, copy{};
+        u32 width{}, height{}; ///< the scene's viewport (the blend's): other draws on it go on
+    };
+    std::vector<DoubleRender> double_renders;
+    /// The colour buffer the draw before drew, and the last one before it other than it.
+    PAddr prev_draw_colour{}, prev_other_colour{};
+    PAddr copy_scene{}, copy_target{};       ///< the last whole-buffer copy draw
+    bool drawn_after_copy = false;           ///< a draw on copy_scene since that copy
+    PAddr skipping_scene{}, skipping_copy{}; ///< the second render being skipped, or 0
+    u32 skipping_width{}, skipping_height{};
+    u32 double_render_draws = 0;             ///< skipped (perflog)
+    /// Whether the draw is a skipped second render's (DoubleRender); follows the copies and
+    /// blends that make one.
+    bool SkipsDoubleRender(u32 count);
+    /// A display transfer of the scene's size (MH Generations transfers its bottom screen from
+    /// the same buffer, 240x320): a second render still skipped never met its blend.
+    void EndDoubleRender(u32 width, u32 height);
+
     ColourBuffer pass_colour{}; // while the backend is in a pass
     StorePart pass_part{};      // what its end of tile stores (its draws' viewport)
     StorePart pass_mask{};      // its draws' viewport off the store's grid, masked (MaskOutside)

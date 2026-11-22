@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <span>
@@ -504,6 +505,11 @@ public:
                            u32 scale_x = 1, u32 scale_y = 1, bool flip = false);
     /// The same into a PICA-tiled picture: one pass on target as a PICA colour buffer (as
     /// BeginPassLoaded opens it), the source read as its load reads, scaled.
+    /// A PICA-tiled picture into one magnify_x x magnify_y times its size, each texel repeated
+    /// (point sampled): a supersampled buffer's 1x picture in the game's layout
+    /// (RasterizerGxm::Supersampled), one pass on target.
+    void MagnifyTiled(const PicaTarget& target, const UntileSource& source, u32 magnify_x,
+                      u32 magnify_y);
     void TransferTiledFromGuest(const PicaTarget& target, const UntileSource& source, u32 scale_x,
                                 u32 scale_y, u32* ta_us = nullptr, u32* d3_us = nullptr);
     /// A display transfer from a linear picture into a PICA-tiled one (input_linear): one pass
@@ -531,10 +537,9 @@ private:
     /// A PICA recipe's end-of-tile program (sgxd_recipe_pica_eot), from bg_offset: rewritten at
     /// each pass on the recipe, before its 3D kick's USE code-cache invalidate.
     static constexpr u32 PicaEotOffset = 0x400;
-    /// A size's instances at most: a render's recipe is the GPU's until its 3D completes, and
-    /// the CPU writes the next render's into another. a game has three passes a frame into its
-    /// top screen's 416x256: eight let the render thread fill a frame ahead of the GPU.
-    static constexpr u32 MaxInstances = 8;
+    /// A size's instances at most: a render's recipe is the GPU's until its 3D completes, and the
+    /// CPU writes the next render's into another.
+    static constexpr u32 MaxInstances = 16;
     /// A recipe's block at most (layout and background page; the 1024x1024 side recipe's layout
     /// is 430 KiB), and the CDRAM left free beside one before RecipeFor makes another instance:
     /// the kernel's free figure is not one block's worth.
@@ -646,14 +651,16 @@ private:
                   const PicaTarget* pica = nullptr);
     /**
      * Draws into the open pass that read src, a PICA-tiled picture, texel for pixel (scaled:
-     * each target pixel the average of scale_x x scale_y texels, bilinear between them), from
+     * each target pixel the average of scale_x x scale_y texels, bilinear between them;
+     * magnified: each texel magnify_x x magnify_y pixels, point sampled), from
      * the target's top-left. Untile's bands: a band of tile rows is an 8-texel-wide SWIZZLED
      * texture whose texel (sx, sy) is PICA pixel (sy % w, 8 (band row + sy / w) + sx), one
      * draw a band, a quad a tile row. transposed: target x is the picture's row and y its
      * column (a PICA target's load), which is the texture's own orientation; otherwise x is the
      * column (a display transfer's output). Opaque, DCMP ALWAYS, no depth write.
      */
-    void DrawTiled(const UntileSource& src, bool transposed, u32 scale_x = 1, u32 scale_y = 1);
+    void DrawTiled(const UntileSource& src, bool transposed, u32 scale_x = 1, u32 scale_y = 1,
+                   u32 magnify_x = 1, u32 magnify_y = 1);
 
     s32 waker_flag = -1;
     u32 waker_bits = 0;
@@ -749,17 +756,17 @@ private:
     };
     std::array<DataSite, 32> data_sites{};
     u32 data_opens{};
-    /// The pass data's slots, in turn, each with its last pass's fence: a pass opens once the
-    /// one DataSlots before it has finished its 3D. A pass is sent whole at EndPass, so the
-    /// render thread's work on a pass overlaps the GPU's only on passes far enough back. a game
-    /// makes five passes a frame (the top screen's 3D and 2D, a display transfer, the bottom
-    /// screen, another transfer), so with two or four slots the next frame's 3D waited for
-    /// this frame's 3D, and the thread's ~9 ms on it left the GPU idle: 36 pictures a second
-    /// from ~16 ms of GPU a frame. Eight cover a frame and the late skip's passes in between,
-    /// so the thread fills the next 3D while the GPU draws this one.
-    static constexpr u32 DataSlots = 8;
-    u32 data_slot{};
-    std::array<u32, DataSlots> data_fence{};
+    /// The pass data: a ring of DataSlots x DataSize bytes. A pass's data starts where the last
+    /// one's ended (at the ring's start when DataSize does not fit before its end) and may take
+    /// DataSize; opening it waits only for the sent passes whose data that room overlaps, and on a
+    /// wrap for those in the tail it skips.
+    static constexpr u32 DataSlots = 4;
+    struct DataSpan {
+        u32 begin, end, fence;
+    };
+    std::deque<DataSpan> data_spans; ///< the sent passes' data, oldest first
+    u32 data_next{};                 ///< where the next pass's data starts
+    void CloseData(u32 fence);
     u32 lut_begin{};
     /// The last passes' fences by number (passes % PassFences): WaitPassMark's.
     static constexpr u32 PassFences = 64;

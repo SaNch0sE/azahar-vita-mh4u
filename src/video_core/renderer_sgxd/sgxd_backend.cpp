@@ -129,7 +129,7 @@ SgxdBackend::SgxdBackend() {
     pds_begin = 0;
     pds_used = pds_begin;
     pds_end = pds_begin + PdsSize;
-    data_begin = data_used = pds_end;
+    data_begin = data_used = data_next = pds_end;
     data_end = data_begin + DataSize;
     lut_begin = data_begin + DataSlots * DataSize;
     code_begin = AlignUp(lut_begin + LutSize, 0x1000);
@@ -1024,6 +1024,15 @@ void SgxdBackend::ResetCores(const char* why) {
     LOG_INFO(Render, "sgxd: the cores reset: {}", why);
 }
 
+void SgxdBackend::CloseData(u32 fence) {
+    // A pass without data leaves no span: an empty one guards nothing, and would stop OpenPass's
+    // loop before the spans after it.
+    if (data_used != data_begin) {
+        data_spans.push_back({data_begin, data_used, fence});
+    }
+    data_next = data_used;
+}
+
 const u8* SgxdBackend::SharedAt(u32 gpu) const {
     return shared + (gpu - BlockVa);
 }
@@ -1269,9 +1278,45 @@ void SgxdBackend::OpenPass(u32 target_gpu, u32 width, u32 height, u32 pack, u32 
     pass_target = pica ? Footprint{pica->gpu, pica->gpu + pica->width * pica->height * pica->bpp}
                        : Footprint{target_gpu, target_gpu + width * height * 4};
     pass_source = {};
-    data_slot = (data_slot + 1) % DataSlots;
-    RenderWait(data_fence[data_slot], "a pass's data slot");
-    data_begin = pds_end + data_slot * DataSize;
+    // The pass data's room in the ring (DataSpan): the sent passes it overlaps, and on a wrap
+    // those in the tail it skips (older than the ones at the ring's start), finish first.
+    const u32 ring_end = pds_end + DataSlots * DataSize;
+    u32 at = AlignUp(data_next, 16);
+    const bool wrap = at + DataSize > ring_end;
+    if (wrap) {
+        at = pds_end;
+    }
+    while (!data_spans.empty()) {
+        const DataSpan& span = data_spans.front();
+        const bool in_room = span.begin < at + DataSize && at < span.end;
+        const bool in_tail = wrap && span.begin >= data_next;
+        if (!in_room && !in_tail) {
+            break;
+        }
+        RenderWait(span.fence, "a pass's data");
+        data_spans.pop_front();
+    }
+#ifdef VITA_DIAGNOSTICS
+    // The ring's order is what the loop relies on: no span past the first it kept may meet the
+    // room.
+    for (const DataSpan& span : data_spans) {
+        if (span.begin < at + DataSize && at < span.end) {
+            std::string spans;
+            for (const DataSpan& s : data_spans) {
+                spans += fmt::format(" {:#x}..{:#x}@{}", s.begin, s.end, s.fence);
+            }
+            ASSERT_MSG(false,
+                       "sgxd: a pass's data room {:#x}..{:#x} (wrap {}, data_next {:#x}) over a sent "
+                       "pass's data {:#x}..{:#x} (fence {}, reached {}); the spans:{}",
+                       at, at + DataSize, wrap, data_next, span.begin, span.end, span.fence,
+                       sgxd_chain_reached(span.fence) != 0, spans);
+        }
+    }
+#endif
+    if (room_taken) {
+        room_taken(BlockVa + at, BlockVa + at + DataSize);
+    }
+    data_begin = at;
     data_end = data_begin + DataSize;
     if (pica) {
         const SgxdPicaStore store{pica->gpu, pica->pack, pica->bpp, pica->x0,
@@ -1523,7 +1568,7 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
     };
     if (draw_count == 0) {
         // Its data may hold a side render's vertices, sent already.
-        data_fence[data_slot] = pass_fences[passes % PassFences] = FenceAll();
+        CloseData(pass_fences[passes % PassFences] = FenceAll());
         give_back();
         return;
     }
@@ -1540,7 +1585,7 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
     static const bool sync_passes = SgxdFlag("syncpasses");
     if (sync_passes || replay_sync || Vprof::FrameSync()) {
         RenderSync(r, &render.ta_us, &render.d3_us);
-        r.fence = data_fence[data_slot] = pass_fences[passes % PassFences] = FenceAll();
+        CloseData(r.fence = pass_fences[passes % PassFences] = FenceAll());
         if (replay_sync) {
             replay_times.push_back({passes, render.ta_us, render.d3_us});
         } else if (Vprof::FrameSync()) {
@@ -1719,8 +1764,11 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
     SceKernelFreeMemorySizeInfo free{};
     free.size = sizeof(free);
     sceKernelGetFreeMemorySize(&free);
-    LOG_INFO(Render, "perf: CDRAM free {} KiB; {} recipe blocks, {} pass data slots of {} KiB",
-             free.size_cdram >> 10, recipes.size(), DataSlots, DataSize >> 10);
+    LOG_INFO(Render,
+             "perf: CDRAM free {} KiB; {} recipe blocks, pass data ring {} KiB ({} passes sent "
+             "in it)",
+             free.size_cdram >> 10, recipes.size(), (DataSlots * DataSize) >> 10,
+             data_spans.size());
     static u32 map_lines;
     if (map_lines++ % 30 == 0) {
         std::string map;
@@ -2223,6 +2271,14 @@ void SgxdBackend::TransferLinearToTiled(const PicaTarget& target, const UntileSo
     const u32 clip = SGXD_RECIPE_CLIP(0, 0, (r.width + 31) / 32 - 1, (r.height + 31) / 32 - 1);
     Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, clip, nullptr}, p);
     EndPass(ta_us, d3_us);
+}
+
+void SgxdBackend::MagnifyTiled(const PicaTarget& target, const UntileSource& source, u32 magnify_x,
+                               u32 magnify_y) {
+    OpenPass(target.gpu, target.height, target.width, target.pack, 0, 1.0f, &target);
+    pass_source = {source.gpu, source.gpu + source.width * source.height * source.bits / 8};
+    DrawTiled(source, true, 1, 1, magnify_x, magnify_y);
+    EndPass(nullptr, nullptr);
 }
 
 void SgxdBackend::TransferFromGuest(const UntileSource& source, u32 dest_gpu, u32 width,
@@ -2966,25 +3022,30 @@ void SgxdBackend::FlushUntiles() {
     flushing_untiles = false;
 }
 
-void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_x, u32 scale_y) {
+void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_x, u32 scale_y,
+                            u32 magnify_x, u32 magnify_y) {
     DEBUG_ASSERT(in_pass);
     const u32 w = src.width, h = src.height;
     DEBUG_ASSERT_MSG(w >= 8 && h >= 8 && w <= 4096 && w % 8 == 0 && h % 8 == 0 &&
                          src.code != UntileEtc1 && src.code != UntileEtc1A4 &&
-                         (scale_x == 1 || scale_x == 2) && (scale_y == 1 || scale_y == 2),
-                     "sgxd: a {}x{} tiled picture (format {:#x}, scale {}x{}) read into a pass is "
-                     "not built",
-                     w, h, src.code, scale_x, scale_y);
+                         (scale_x == 1 || scale_x == 2) && (scale_y == 1 || scale_y == 2) &&
+                         (magnify_x == 1 || magnify_x == 2) && (magnify_y == 1 || magnify_y == 2) &&
+                         (scale_x * scale_y == 1 || magnify_x * magnify_y == 1),
+                     "sgxd: a {}x{} tiled picture (format {:#x}, scale {}x{}, magnified {}x{}) "
+                     "read into a pass is not built",
+                     w, h, src.code, scale_x, scale_y, magnify_x, magnify_y);
     DEBUG_ASSERT_MSG(!flip || !transposed, "sgxd: a flipped transposed tiled picture is not built");
     PlaceFixedPrograms();
     const Recipe& r = *current;
     // The tile rows the target shows: a transposed target's width is the picture's rows, a
-    // linear one's height; scaled, scale_y picture rows to each.
-    const u32 shown = (transposed ? r.width : r.height) * scale_y;
+    // linear one's height; scaled, scale_y picture rows to each, magnified, one to magnify_y.
+    const u32 shown = (transposed ? r.width : r.height) * scale_y / magnify_y;
     const u32 tile_rows = std::min(h, AlignUp(shown, 8)) / 8;
-    const u64 key = u64{0x80} << 56 | u64{transposed} << 55 | u64{scale_x - 1} << 54 |
-                    u64{scale_y - 1} << 53 | u64{w} << 40 | u64{h} << 27 | u64{r.width} << 14 |
-                    r.height;
+    const float fx = static_cast<float>(magnify_x) / static_cast<float>(scale_x);
+    const float fy = static_cast<float>(magnify_y) / static_cast<float>(scale_y);
+    const u64 key = u64{0x80} << 56 | u64{magnify_y - 1} << 58 | u64{magnify_x - 1} << 57 |
+                    u64{transposed} << 55 | u64{scale_x - 1} << 54 | u64{scale_y - 1} << 53 |
+                    u64{w} << 40 | u64{h} << 27 | u64{r.width} << 14 | r.height;
     constexpr u32 N = SGXD_PROGRAM_BLIT_VERTEX_WORDS;
     const Geometry& g = GeometryFor(key, N * 4, [&](float* v, Geometry& geometry) {
         u32 vertex_count = 0;
@@ -3000,15 +3061,14 @@ void SgxdBackend::DrawTiled(const UntileSource& src, bool transposed, u32 scale_
                     // below.
                     const float uv[4][2] = {{0, v0}, {1, v0}, {0, v1}, {1, v1}};
                     PutQuad(band_v + row * QuadVertexWords, r.width, r.height,
-                            static_cast<float>(8 * ty) / scale_y, 0,
-                            static_cast<float>(8 * ty + 8) / scale_y,
-                            static_cast<float>(w) / scale_x, uv);
+                            static_cast<float>(8 * ty) * fy, 0, static_cast<float>(8 * ty + 8) * fy,
+                            static_cast<float>(w) * fx, uv);
                 } else if (!flip) {
                     // Target x is the picture's column, scaled: a pixel's centre between texels.
                     const float uv[4][2] = {{0, v0}, {0, v1}, {1, v0}, {1, v1}};
                     PutQuad(band_v + row * QuadVertexWords, r.width, r.height, 0,
-                            static_cast<float>(8 * ty) / scale_y, static_cast<float>(w) / scale_x,
-                            static_cast<float>(8 * ty + 8) / scale_y, uv);
+                            static_cast<float>(8 * ty) * fy, static_cast<float>(w) * fx,
+                            static_cast<float>(8 * ty + 8) * fy, uv);
                 } else {
                     const float height_px = static_cast<float>(r.height);
                     const float uv[4][2] = {{1, v0}, {1, v1}, {0, v0}, {0, v1}};

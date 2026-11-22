@@ -12,6 +12,8 @@
 #include <vector>
 #include "common/common_types.h"
 
+struct AzaharStorePermits;
+
 namespace Common {
 class HostSharedMemory;
 }
@@ -35,11 +37,8 @@ namespace SgxdRenderer {
  * app's address: every guest alias of the page at once. The holds are not write tracking:
  * nothing is kept about a page once its work is done.
  *
- * Guest VRAM is held for reads as a whole, from the first GPU read of it on, and for writes
- * page by page: the guest writes VRAM with the CPU rarely (titles fill it by DMA, which is
- * ordered on the GPU), and a vertex range in VRAM is not scanned for its indices (they are
- * uncached CDRAM). A guest write to VRAM waits for every read of VRAM queued before it, and
- * the page is closed to writes again at the next GPU read of VRAM.
+ * Guest VRAM is held for reads as a whole and for writes page by page; a write clear of the bytes
+ * VRAM's live reads cover (vram_reads) goes past the holds.
  *
  * Page versions, per frame: an FCRAM page the GPU reads gets
  * more physical pages (Slots: its home and slots of a CDRAM pool), the first allocated the first
@@ -81,6 +80,7 @@ public:
         FillOut,
         TransferIn,
         TransferOut,
+        DisplayOut, ///< a display transfer's output into a screen's framebuffer (an LCD buffer)
         DmaIn,
         DmaOut,
         Present,
@@ -105,6 +105,61 @@ public:
     /// The ticket a guest access to the page must wait for, 0 for none: a read waits for the
     /// page's last GPU writer, a write for its last reader too. Tickets past `reached` only.
     [[nodiscard]] u32 WaitFor(u32 page, bool write, u32 reached) const;
+    /// Whether [host, host + bytes), inside one page, touches the bytes the page's live GPU writes
+    /// cover: a read clear of them needs no wait for those writes. A hold takes whole pages, and a
+    /// buffer's first and last pages are shared with what lies beside it (command buffers past a
+    /// colour buffer, in its last page).
+    [[nodiscard]] bool TouchesWrite(const u8* host, u32 bytes) const;
+    /// Whether a guest store of [host, host + bytes), inside one FCRAM page held by plain
+    /// holds or watched (not versioned or the display's), misses the page's queued GPU work and
+    /// its watched textures: clear of the bytes its live reads and its textures cover, and by
+    /// whole cache lines of those its live writes cover. It can then be made through the app's
+    /// view with the page still held and watched; ticket names the page's last live hold, or
+    /// its watch. a game X and Y keep a flag 0x55 bytes before a 512 KiB DMA
+    /// buffer, on its first page, and set it while the buffer's DMAs are queued: each store
+    /// would wait for them (a scene change's hitches).
+    [[nodiscard]] bool StoreMisses(const u8* host, u32 bytes, u32 reached, u32& ticket) const;
+    /// The bytes of the FCRAM page at host a guest store must miss, as StoreMisses tests them:
+    /// its watched textures', its live reads' and its live writes' by whole cache lines, as six
+    /// [lo, hi) page offsets (hi 0 for none). For the module's store permits (AzaharStorePermits).
+    void StoreForbidden(const u8* host, u32 reached, std::array<u16, 6>& lo,
+                        std::array<u16, 6>& hi) const;
+    /// The module's store permits (the native core's table), and the permit at `slot` made for
+    /// the page at host (from StoreForbidden's bytes). A hold that takes more of a page (a GPU
+    /// read or write, a watch that grows) takes the new bytes into that page's permit
+    /// (RefreshPermit), and one no store past the holds may go by (a parse hold, a version, the
+    /// display's) voids it. One generation voided every permit at each such hold, and a void of
+    /// the page's alone still left a game's battle ~1300 permits a second to make again: the
+    /// game writes on in buffers whose earlier bytes each new draw reads.
+    void SetStorePermits(AzaharStorePermits* table) {
+        permits = table;
+    }
+    void PermitGranted(const u8* host, u32 slot);
+    /// The permits' generation: the module's check against each permit's, constant (permits go
+    /// one by one, VoidPermit).
+    [[nodiscard]] const u32* Generation() const {
+        return &generation;
+    }
+    [[nodiscard]] u32 WriteTicket(u32 page) const {
+        return write_ticket[page];
+    }
+    /// Whether an FCRAM page's live holds are reads of vertices or indices alone, no GPU write
+    /// queued: a guest write that waits on it waits for draws reading geometry it fills again
+    /// (RenderThread::PageFault).
+    [[nodiscard]] bool GeometryReadOnly(u32 page, u32 reached) const {
+        return page < fcram_pages && geometry_read[page] != 0 &&
+               !Live(write_ticket[page], reached) && Live(read_ticket[page], reached);
+    }
+    /// A guest access at host on an FCRAM page whose live holds are all the display's (a display
+    /// transfer's output, the present's reads), the `reach` bytes its instruction may touch from
+    /// host on clear of their bytes: the page opens until its next hold. A screen's framebuffer is
+    /// never read or written by the guest's CPU while its transfer or present is queued, and the
+    /// data sharing its first and last pages is the guest's own. Whether it opened the page.
+    bool OpenPastDisplay(const u8* host, u32 reached, u32 reach);
+    /// Whether the FCRAM page's live holds are all the display's, and nothing else keeps it
+    /// closed (a watch, a list's parse, a version the GPU is not on): OpenPastDisplay's page,
+    /// before the bytes.
+    [[nodiscard]] bool DisplayOnly(u32 page, u32 reached) const;
     [[nodiscard]] PAddr AddressOf(u32 page) const;
     [[nodiscard]] Access Applied(u32 page) const {
         return static_cast<Access>(applied[page]);
@@ -177,7 +232,7 @@ public:
     /// Whether the FCRAM page has slots besides its home: the guest's view or the GPU's may be
     /// on one (azaharFlip), and the page stays moved (GuestGpuMemory) until it is home again.
     [[nodiscard]] bool Versioned(u32 page) const {
-        return versions[page].on;
+        return page < fcram_pages && versions[page].on;
     }
     /// A byte a page, FCRAM's then VRAM's: nonzero where the guest's view is held (the HLE's
     /// block copies check it, Memory::MemorySystem::SetHostGuard).
@@ -227,6 +282,22 @@ private:
     /// Whether this ticket held the range already (a small cache of the ranges held for it).
     bool Seen(PAddr addr, u32 bytes, u32 kind);
     void Change(u32 page, Access access);
+    /// A hold no store past the holds may go by took the FCRAM page: its store permit, if any,
+    /// is void.
+    void VoidPermit(u32 page) {
+        if (page < fcram_pages && permit_slot[page] != 0) {
+            VoidPermitSlot(page);
+        }
+    }
+    void VoidPermitSlot(u32 page);
+    /// A hold took more of the FCRAM page (its ranges recorded): its permit, if any, misses the
+    /// new bytes too (StoreForbidden), or is void where StoreMisses would refuse every store.
+    void RefreshPermit(u32 page) {
+        if (page < fcram_pages && permit_slot[page] != 0) {
+            RefreshPermitSlot(page);
+        }
+    }
+    void RefreshPermitSlot(u32 page);
     /// Sends the changed pages to the module, the flips before the holds.
     void Flush();
     /// The page's app view and guest windows on slot `slot`'s page, or home (NoSlot), at the
@@ -247,9 +318,26 @@ private:
     u32 pages;
 
     std::vector<u32> read_ticket;  ///< FCRAM pages only (VRAM's reads: vram_read)
+    /// FCRAM pages: the bytes its GPU reads cover, as write_lo and write_hi for the writes,
+    /// merged while its last read ticket is live (StoreMisses).
+    std::vector<std::array<u16, 2>> read_lo, read_hi;
     /// FCRAM pages: whether the last read hold was a vertex or index read (GeometryReadOnly).
     std::vector<u8> geometry_read;
     std::vector<u32> write_ticket; ///< every page
+    /// Every page: the bytes its GPU writes cover, as up to two ranges [lo, hi) (hi 0: none),
+    /// merged while its last write ticket is live (TouchesWrite).
+    std::vector<std::array<u16, 2>> write_lo, write_hi;
+    u32 last_reached{};
+    /// FCRAM pages: the display holds' last ticket and their bytes while live, as up to two ranges
+    /// [lo, hi) (hi 0: none), and the last ticket of any other hold (OpenPastDisplay). Two: a page
+    /// with one buffer's end and the next one's start (framebuffers with the game's own bytes
+    /// between them) has no bytes past a single extent of both.
+    std::vector<u32> display_ticket, other_ticket;
+    std::vector<std::array<u16, 2>> display_lo, display_hi;
+    void NoteDisplay(u32 p, PAddr addr, u32 bytes, u32 ticket, bool display);
+    /// [l, h) into up to two ranges [lo, hi) (hi 0: none): the one it overlaps or touches, else
+    /// a free one, else the nearer one; two grown into each other become one.
+    static void AddRange(std::array<u16, 2>& lo, std::array<u16, 2>& hi, u16 l, u16 h);
     std::vector<u8> applied;       ///< Access, as the guest's view has it (after Apply)
     std::vector<u8> watched;       ///< T12: FCRAM pages a texture is taken from (Watch)
     /// T12: a watched page's textures' bytes, as up to two ranges [lo, hi) (hi 0: none), and
@@ -266,6 +354,10 @@ private:
 
     /// The holds made for the next ticket, and the tickets' groups not yet released.
     u32 open_ticket{};
+    u32 generation{};
+    /// The module's store permits, and each FCRAM page's permit slot + 1 (0: none made).
+    AzaharStorePermits* permits{};
+    std::vector<u16> permit_slot;
     std::vector<Run> open_runs;
     std::deque<Group> groups;
     /// Seen's ranges, direct-mapped: 256 slots, as a draw-heavy list's textures and vertex ranges
