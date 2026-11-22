@@ -1446,7 +1446,7 @@ private:
         u32 shared{};         ///< ... by writes none of which overlapped the texture's bytes
         u32 untold{};         ///< ... by writes older than write_ring: not told apart
         u32 null_samples{};   ///< samplers of a unit that is off (NullTexture)
-        u32 tiny{};           ///< untiles of a texture with a side under 8 (UntileTiny)
+        u32 tiny{};           ///< textures with a side under 8, decoded on the CPU
         u64 tiny_texels{};    ///< ... their texels
         u64 tiny_us{};        ///< ... the render thread's time in them
         u32 tiny_logged{};    ///< the first ones logged (carried across lines)

@@ -366,13 +366,8 @@ bool RasteriseDraws(const char* what, const std::vector<float>& v,
     return ok;
 }
 
-// A split ETC1A4's three renders on a random ETC1A4 chain: the gather (raw words through LINEAR
-// U8888 views), the ETC1 render over the gathered colour, and the alpha render (a LINEAR P4 view
-// through the 17n palette, its A stored as a byte), against the guest's colour blocks and
-// alpha nibbles.
-void CheckEtc1A4(u32 width, u32 height, u32 levels) {
-    char what[64];
-    snprintf(what, sizeof(what), "etc1a4 %ux%u/%u", width, height, levels);
+// A random ETC1A4 chain (8x8 tiles of four blocks, each its alpha u64 and then its colour u64).
+std::vector<u8> RandomEtc1A4(u32 width, u32 height, u32 levels) {
     u32 tiles = 0;
     for (u32 l = 0; l < levels; l++) {
         tiles += (width >> l) / 8 * ((height >> l) / 8);
@@ -381,16 +376,22 @@ void CheckEtc1A4(u32 width, u32 height, u32 levels) {
     for (u8& b : guest) {
         b = static_cast<u8>(rng());
     }
-    // The gather.
+    return guest;
+}
+
+// A split ETC1A4's gather (raw words through LINEAR U8888 views) of `guest` into scratch. False
+// on a target past a render's.
+bool RunGather(const char* what, u32 width, u32 height, u32 levels, const std::vector<u8>& guest,
+               std::vector<u32>& scratch) {
     const Etc1A4Gather g = Etc1A4GatherFor(width, height, levels);
     if (g.rows > UntileSide || g.stride > UntileSide || 8 * g.stride > 4096) {
         printf("%s: gather target %u x %u\n", what, g.stride, g.rows);
         failures++;
-        return;
+        return false;
     }
-    std::vector<u32> scratch(g.stride * g.rows + 16, 0xdeadbeefu);
+    scratch.assign(g.stride * g.rows + 16, 0xdeadbeefu);
     std::vector<GeometryDraw> draws, filled;
-    u32 count = Etc1A4GatherVertices(width, height, levels, nullptr, draws);
+    const u32 count = Etc1A4GatherVertices(width, height, levels, nullptr, draws);
     std::vector<float> v(count * SGXD_PROGRAM_BLIT_VERTEX_WORDS, NAN);
     Etc1A4GatherVertices(width, height, levels, v.data(), filled);
     const auto word = [&](u64 byte) -> u32 {
@@ -406,6 +407,35 @@ void CheckEtc1A4(u32 width, u32 height, u32 levels) {
         const u32 row = static_cast<u32>(std::floor(vv * d.view_rows));
         scratch[py * g.stride + px] = word(d.source + (u64{row} * d.view_width + col) * 4);
     });
+    return true;
+}
+
+// The alpha nibble of texel (x, y) of level l, whose blocks start at byte `at` of an ETC1A4
+// chain, as an 8-bit alpha (17n).
+u32 GuestAlpha(const std::vector<u8>& guest, u32 at, u32 w, u32 x, u32 y) {
+    const u32 tile = (y / 8) * (w / 8) + x / 8;
+    const u32 block = tile * 4 + (x % 8) / 4 + 2 * ((y % 8) / 4);
+    u64 a;
+    std::memcpy(&a, &guest[at + block * 16], 8);
+    return static_cast<u32>(a >> (4 * (4 * (x % 4) + y % 4)) & 15) * 17;
+}
+
+// A split ETC1A4's three renders on a random ETC1A4 chain: the gather, the ETC1 render over the
+// gathered colour, and the alpha render (a LINEAR P4 view through the 17n palette, its A stored
+// as a byte), against the guest's colour blocks and alpha nibbles.
+void CheckEtc1A4(u32 width, u32 height, u32 levels) {
+    char what[64];
+    snprintf(what, sizeof(what), "etc1a4 %ux%u/%u", width, height, levels);
+    const std::vector<u8> guest = RandomEtc1A4(width, height, levels);
+    const u32 tiles = static_cast<u32>(guest.size() / 64);
+    const Etc1A4Gather g = Etc1A4GatherFor(width, height, levels);
+    std::vector<u32> scratch;
+    if (!RunGather(what, width, height, levels, guest, scratch)) {
+        return;
+    }
+    std::vector<GeometryDraw> draws, filled;
+    std::vector<float> v;
+    u32 count = 0;
     // The ETC1 render over the colour words.
     std::vector<u8> colour(tiles * 32);
     std::memcpy(colour.data(), scratch.data(), colour.size());
@@ -465,11 +495,7 @@ void CheckEtc1A4(u32 width, u32 height, u32 levels) {
         const u32 w = width >> l, h = height >> l;
         for (u32 y = 0; y < h; y++) {
             for (u32 x = 0; x < w; x++) {
-                const u32 tile = (y / 8) * (w / 8) + x / 8;
-                const u32 block = tile * 4 + (x % 8) / 4 + 2 * ((y % 8) / 4);
-                u64 a;
-                std::memcpy(&a, &guest[at + block * 16], 8);
-                const u32 want = static_cast<u32>(a >> (4 * (4 * (x % 4) + y % 4)) & 15) * 17;
+                const u32 want = GuestAlpha(guest, at, w, x, y);
                 wrong_alpha += alpha[host + y * w + x] != want || alpha_writes[host + y * w + x] != 1;
             }
         }
@@ -482,6 +508,97 @@ void CheckEtc1A4(u32 width, u32 height, u32 levels) {
         failures++;
     }
     printf("%s: gather %u x %u words, ok\n", what, g.stride, g.rows);
+}
+
+// A split ETC1A4 cube face (UntileCube): the gather, then the alpha render into the face's TWIDDLED
+// A8 target, against the face's SWIZZLED alpha levels back to back; every texel once, nothing
+// else, and the whole tiles touched by it and by the colour's ETC1 render inside the bytes
+// CompressedCubeBytes leaves the last face, the chains inside a face's stride.
+void CheckCube(u32 width, u32 levels) {
+    char what[64];
+    snprintf(what, sizeof(what), "cube %u/%u", width, levels);
+    const std::vector<u8> guest = RandomEtc1A4(width, width, levels);
+    std::vector<u32> scratch;
+    if (!RunGather(what, width, width, levels, guest, scratch)) {
+        return;
+    }
+    const CubeAlphaTarget target = CubeAlphaTargetFor(width, levels);
+    const u32 s = target.height;
+    if (target.width > UntileSide || s > UntileSide || target.width < s ||
+        !std::has_single_bit(target.width) || !std::has_single_bit(s)) {
+        printf("%s: alpha target %ux%u\n", what, target.width, s);
+        failures++;
+        return;
+    }
+    std::vector<u8> alpha(target.width * s, 0), writes(target.width * s, 0);
+    std::vector<GeometryDraw> draws, filled;
+    const u32 count = CubeAlphaVertices(width, levels, nullptr, draws);
+    std::vector<float> v(count * SGXD_PROGRAM_BLIT_VERTEX_WORDS, NAN);
+    CubeAlphaVertices(width, levels, v.data(), filled);
+    const u8* const nibbles = reinterpret_cast<const u8*>(scratch.data());
+    RasteriseDraws(what, v, draws, target.width, s, [&](u32 px, u32 py, float u, float vv,
+                                                        const GeometryDraw& d) {
+        const u32 col = static_cast<u32>(std::floor(u * d.view_width));
+        const u32 row = static_cast<u32>(std::floor(vv * d.view_rows));
+        const u64 n = u64{row} * d.view_width + col;
+        const u8 byte = nibbles[d.source + n / 2];
+        // PBE TWIDDLED, a byte a pixel, the smaller side the height.
+        const u32 index = MortonYFirst(px % s, py) + px / s * s * s;
+        alpha[index] = static_cast<u8>(((n & 1) ? byte >> 4 : byte & 15) * 17);
+        writes[index]++;
+    });
+    u32 wrong = 0, texels = 0, last = 0, written = 0;
+    for (u32 l = 0, at = 0, first = 0; l < levels; l++) {
+        const u32 w = width >> l;
+        for (u32 y = 0; y < w; y++) {
+            for (u32 x = 0; x < w; x++) {
+                const u32 index = first + MortonYFirst(x, y);
+                wrong += alpha[index] != GuestAlpha(guest, at, w, x, y) || writes[index] != 1;
+            }
+        }
+        at += w * w;
+        first += w * w;
+        texels += w * w;
+    }
+    for (u32 n = 0; n < writes.size(); n++) {
+        if (writes[n] != 0) {
+            written++;
+            last = n;
+        }
+    }
+    const u32 alpha_stride = CompressedCubeFaceStride(width, levels > 1, 8);
+    const u32 alpha_room = CompressedCubeBytes(width, levels, 8) - 5 * alpha_stride;
+    const u32 alpha_tiles = (last / 1024 + 1) * 1024;
+    // The colour: RunEtc1's blocks, 8 bytes a pixel.
+    std::vector<u8> blocks(guest.size() / 2);
+    std::vector<u64> out;
+    std::vector<u8> block_writes;
+    u32 etc1_count = 0;
+    if (!RunEtc1(width, width, levels, blocks, out, block_writes, etc1_count)) {
+        return;
+    }
+    u32 last_block = 0, chain_blocks = 0;
+    for (u32 n = 0; n < block_writes.size(); n++) {
+        last_block = block_writes[n] != 0 ? n : last_block;
+    }
+    for (u32 l = 0; l < levels; l++) {
+        chain_blocks += ((width >> l) / 4) * ((width >> l) / 4);
+    }
+    const u32 colour_stride = CompressedCubeFaceStride(width, levels > 1, 4);
+    const u32 colour_room = CompressedCubeBytes(width, levels, 4) - 5 * colour_stride;
+    const u32 colour_tiles = (last_block / 1024 + 1) * 1024 * 8;
+    const bool slots_ok =
+        !CompressedCubeFits(width) || (colour_stride % 128 == 0 && alpha_stride % 128 == 0);
+    if (wrong || written != texels || alpha_tiles > alpha_room || colour_tiles > colour_room ||
+        texels > alpha_stride || chain_blocks * 8 > colour_stride || !slots_ok) {
+        printf("%s: %u alpha texels wrong, %u written of %u; tiles to %u of %u (alpha), %u of %u "
+               "(colour); strides %u (%u texels), %u (%u bytes)\n",
+               what, wrong, written, texels, alpha_tiles, alpha_room, colour_tiles, colour_room,
+               alpha_stride, texels, colour_stride, chain_blocks * 8);
+        failures++;
+    }
+    printf("%s: alpha target %ux%u, face strides %u and %u, ok\n", what, target.width, s,
+           colour_stride, alpha_stride);
 }
 
 u32 MaxLevels(u32 w, u32 h) {
@@ -519,6 +636,12 @@ int main() {
             if (max > 1) {
                 CheckEtc1A4(s[0], s[1], 1);
             }
+        }
+    }
+    for (u32 w = 8; w <= Etc1A4MaxWidth; w *= 2) {
+        CheckCube(w, MaxLevels(w, w));
+        if (w > 8) {
+            CheckCube(w, 1);
         }
     }
     printf("untile_geometry_test: %s\n", failures ? "FAIL" : "PASS");

@@ -2517,6 +2517,10 @@ RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written)
     // ETC1A4 as compressed colour and A8 alpha, or level by level into RGBA.
     const bool split = SplitAlpha(unit);
     const bool etc1a4_levels = !cube && t.format == TF::ETC1A4 && !split;
+    // An ETC1 cube, or a split ETC1A4's, stays compressed (SgxdBackend::UntileCube) where its face
+    // slots allow (CompressedCubeFits).
+    const bool cube_blocks = cube && (t.format == TF::ETC1 || split) &&
+                             UntileGeometry::CompressedCubeFits(width);
     const std::array<PAddr, 6>& part_addr = extent.part_addr;
     const u32 parts = extent.parts;
     const u32 bytes = extent.bytes;
@@ -2545,7 +2549,9 @@ RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written)
         // others are queued (QueueUntile). The PBE writes whole 32-pixel tiles, so those copies leave room
         // past the chain's end.
         u32 host_bytes = 0;
-        if (cube) {
+        if (cube_blocks) {
+            host_bytes = UntileGeometry::CompressedCubeBytes(width, levels, 4);
+        } else if (cube) {
             host_bytes = levels == 1 ? 5 * width * width * 4 +
                                            std::max(width, 32u) * std::max(width, 32u) * 4
                                      : 6 * CubeFaceStride(width) + 32 * 32 * 4;
@@ -2561,6 +2567,10 @@ RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written)
                                             : SgxdBackend::Data{},
                             host_bytes, levels, parts, part_addr, bytes, write_seq});
         it = &textures.back();
+        if (cube_blocks && split) {
+            it->alpha_bytes = UntileGeometry::CompressedCubeBytes(width, levels, 8);
+            it->alpha = backend.AllocTexture(it->alpha_bytes);
+        }
         it->last_used = passes;
         IndexTexture(*it);
     }
@@ -2597,7 +2607,9 @@ RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written)
         }
     }
     const u32 palette = PaletteFor(f.palette);
-    if (cube) {
+    if (cube_blocks) {
+        backend.UntileCube(part_addr, width, levels, split, it->memory.gpu, it->alpha.gpu);
+    } else if (cube) {
         // Each face a SWIZZLED square (or its chain, level after level), in slots CubeFaceStride apart; a
         // face's whole tiles run over the ones after it, written next.
         const u32 stride = levels == 1 ? width * height * 4 : CubeFaceStride(width);
@@ -2619,7 +2631,8 @@ RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written)
     // parameter buffer of its own.
     const bool npot = !cube && (!std::has_single_bit(width) || !std::has_single_bit(height));
     // A side under 8 is less than a tile: the PICA's tile rows are width / 8 tiles apart (none for a
-    // 4-wide texture), so rows 8 on read tile 0 again. Decoded on the CPU, rows 32 texels apart.
+    // 4-wide texture), so rows 8 on read tile 0 again. Decoded on the CPU, rows 32 texels apart: a
+    // side render each costs ~10x the decode at 4x4.
     const bool tiny = !cube && (width < 8 || height < 8);
     // A one-channel format's queued copy is a byte a texel, which the draws read with the format's
     // own U8 swizzle: a quarter of A8B8G8R8.
@@ -2703,7 +2716,9 @@ RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written)
         if (it->bytes != 0) {
             backend.FreeTextureAfterPass(it->memory, it->bytes);
         }
-        // Rows 32 texels apart, or the width's 32s.
+#ifdef VITA_DIAGNOSTICS
+        const u64 tiny_start = sceKernelGetProcessTimeWide();
+#endif
         it->stride = Common::AlignUp(width, 32u);
         it->bytes = it->stride * Common::AlignUp(height, 32u) * 4;
         // Written by the CPU at once: the work that may still sample or untile into the range goes first.
@@ -2722,6 +2737,16 @@ RasterizerSgxd::Texture& RasterizerSgxd::TextureFromRegs(u32 unit, bool written)
                 }
             }
         }
+#ifdef VITA_DIAGNOSTICS
+        const u64 tiny_us = sceKernelGetProcessTimeWide() - tiny_start;
+        if (texture_stats.tiny_logged++ < 16) {
+            LOG_INFO(Render, "sgxd: texture {:#x}, {}x{} format {}: a side under 8, {} us", addr,
+                     width, height, static_cast<u32>(t.format), tiny_us);
+        }
+        texture_stats.tiny++;
+        texture_stats.tiny_texels += width * height;
+        texture_stats.tiny_us += tiny_us;
+#endif
     } else if (npot) {
         DEBUG_ASSERT_MSG(levels == 1 && !etc1a4_levels && t.format != TF::ETC1 &&
                              t.format != TF::ETC1A4,
@@ -2895,9 +2920,11 @@ bool RasterizerSgxd::SplitAlpha(u32 unit) const {
 
 bool RasterizerSgxd::SplitAlphaIn(const Pica::RegsInternal& regs, u32 unit) {
     const auto t = regs.texturing.GetTextures()[unit];
+    const bool cube =
+        unit == 0 && t.config.type == Pica::TexturingRegs::TextureConfig::TextureCube;
     return t.enabled && t.format == Pica::TexturingRegs::TextureFormat::ETC1A4 &&
-           !(unit == 0 && t.config.type == Pica::TexturingRegs::TextureConfig::TextureCube) &&
-           t.config.width <= UntileGeometry::Etc1A4MaxWidth;
+           t.config.width <= UntileGeometry::Etc1A4MaxWidth &&
+           (!cube || UntileGeometry::CompressedCubeFits(t.config.width));
 }
 
 bool RasterizerSgxd::RawBytesIn(const Pica::RegsInternal& regs, u32 unit) {
@@ -2923,9 +2950,12 @@ bool RasterizerSgxd::RawBytesIn(const Pica::RegsInternal& regs, u32 unit) {
 
 void RasterizerSgxd::AlphaTextureWords(const Texture& tex, const u32 colour[4], u32 words[4]) {
     DEBUG_ASSERT(tex.alpha_bytes != 0);
-    // LINEAR U8 (0x00, sizes less one); the LODMIN bits in words 2 and 3 kept.
+    // U8 (0x00): LINEAR (sizes less one), or a cube's SWIZZLED faces (log2 sizes); the LODMIN bits
+    // in words 2 and 3 kept.
     words[0] = colour[0] & ~(1u << 31);
-    words[1] = 3u << 29 | (tex.width - 1) << 12 | (tex.height - 1);
+    words[1] = tex.parts == 6 ? 2u << 29 | static_cast<u32>(std::countr_zero(tex.width)) << 16 |
+                                    static_cast<u32>(std::countr_zero(tex.height))
+                              : 3u << 29 | (tex.width - 1) << 12 | (tex.height - 1);
     words[2] = tex.alpha.gpu | (colour[2] & 3u);
     words[3] = 1u << 31 | 6u << 28 | (colour[3] & 3u << 26);
 }
@@ -3015,8 +3045,9 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[
     DEBUG_ASSERT_MSG(dadjust <= 63,
                      "sgxd: texture unit {}: LOD bias {} is past DADJUST's range", unit,
                      static_cast<s32>(c.lod.bias) / 256.0f);
-    // U8U8U8U8 (R the lowest byte), LINEAR or a CUBE of SWIZZLED faces; a 2D ETC1 (and a split
-    // ETC1A4's colour) a SWIZZLED chain of its blocks; NORM. A scaled copy has its own sides.
+    // U8U8U8U8 (R the lowest byte), LINEAR or a CUBE of SWIZZLED faces; ETC1 (and a split ETC1A4's
+    // colour) a SWIZZLED chain of its blocks, or a CUBE of them; NORM. A scaled copy has its own
+    // sides.
     const u32 tex_width = tex.gpu_width != 0 ? tex.gpu_width : tex.width;
     const u32 tex_height = tex.gpu_height != 0 ? tex.gpu_height : tex.height;
     if (tex.stride > tex_width) {
@@ -3052,17 +3083,18 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[
                  static_cast<u32>(c.wrap_t.Value()));
     }
 #endif
-    const bool etc1 = (tex.format == Pica::TexturingRegs::TextureFormat::ETC1 ||
-                       tex.alpha_bytes != 0) &&
-                      tex.parts == 1;
+    const bool etc1 = tex.alpha_bytes != 0 ||
+                      (tex.format == Pica::TexturingRegs::TextureFormat::ETC1 &&
+                       (tex.parts == 1 || UntileGeometry::CompressedCubeFits(tex.width)));
     const u32 log2_sizes = static_cast<u32>(std::countr_zero(tex.width)) << 16 |
                            static_cast<u32>(std::countr_zero(tex.height));
     words[0] = (etc1 ? 1u << 31 : 0u) | static_cast<u32>(std::clamp(dadjust, 0, 63)) << 21 |
                clamp << 17 | mag << 12 | min << 10 | mipf << 9 | addressing;
     // A byte copy is U8 (0x00) with its format's swizzle (Texture::byte_swizzle).
     const u32 code = tex.byte_swizzle != 0 ? 0x00u : 0x0cu;
-    words[1] = etc1             ? (SgxdBackend::UntileEtc1 & 0x1fu) << 24 | log2_sizes
-               : tex.parts == 6 ? 2u << 29 | code << 24 | log2_sizes
+    const u32 layout = tex.parts == 6 ? 2u << 29 : 0u;
+    words[1] = etc1             ? layout | (SgxdBackend::UntileEtc1 & 0x1fu) << 24 | log2_sizes
+               : tex.parts == 6 ? layout | code << 24 | log2_sizes
                                 : 3u << 29 | code << 24 | (tex_width - 1) << 12 | (tex_height - 1);
     words[2] = tex.memory.gpu | lod_min >> 2;
     // Swizzle 4 on U8U8U8U8: alpha one (bit 2).

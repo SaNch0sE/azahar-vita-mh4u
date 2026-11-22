@@ -787,9 +787,6 @@ const char* FragmentEmitter::Unsupported() const {
     if (fb.shadow_rendering && tex.fog_mode == TexturingRegs::FogMode::Fog) {
         return "shadow rendering with fog";
     }
-    if ((tex.alpha_split & 1) && tex.texture0_type == TextureType::TextureCube) {
-        return "a split alpha texture on a cube";
-    }
     if (fb.logic_op != FramebufferRegs::LogicOp::Copy &&
         fb.logic_op != FramebufferRegs::LogicOp::NoOp) {
         return "logic op";
@@ -2457,6 +2454,10 @@ void FragmentEmitter::SampleTextures(uint32_t units) {
             coords[0] = dir;
             e.SampleCube(Reg::V(TmpTex0), dir, SamplerSa(sampler_index), 0);
             sampler_index++;
+            if (tex.alpha_split & 1) {
+                // A split ETC1A4 cube's alpha from its A8 cube at the same direction.
+                e.SampleCube(Reg::V(TmpAlphaSplit), dir, SamplerSa(sampler_alpha[0]), 0);
+            }
             any = true;
             continue;
         }

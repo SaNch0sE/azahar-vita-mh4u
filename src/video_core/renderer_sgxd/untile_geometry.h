@@ -430,4 +430,95 @@ inline u32 Etc1A4AlphaVertices(const ChainRender& cr, u32 width, u32 height, u32
     return vertex_count;
 }
 
+/// A compressed cube's face stride in bytes (SgxdBackend::UntileCube), `bits` a texel: 4 for its
+/// ETC1 colour, 8 for its A8 alpha. Without mipmaps the faces touch. With them a face is its whole
+/// chain to 1x1, a block format's levels under 4x4 a block each, in a slot rounded up to 2 KiB
+/// when the side is over 16: libgxm's rule for 8-bit and block formats, whose 2 KiB slots the
+/// U8888 cube shows (docs/sgxd/tsp.md).
+inline u32 CompressedCubeFaceStride(u32 width, bool mipmapped, u32 bits) {
+    if (!mipmapped) {
+        return width * width * bits / 8;
+    }
+    const u32 block = bits == 4 ? 4 : 1;
+    u32 chain = 0;
+    for (u32 side = width; side >= 1; side >>= 1) {
+        const u32 s = std::max(side, block);
+        chain += s * s * bits / 8;
+    }
+    const u32 align = width > 16 ? 2048 : 4;
+    return (chain + align - 1) / align * align;
+}
+
+/// Whether a cube `width` wide is kept compressed: from 32 a side, where its colour's and its
+/// alpha's face slots are multiples of 128 bytes whatever its levels (512 bytes and up, or 2 KiB
+/// slots): TWIDDLED face stores at 184 and 344 bytes apart came out wrong or stopped the 3D. By
+/// the side alone, so that the split alpha (RasterizerSgxd::SplitAlphaIn) follows the fragment
+/// registers' size word. A narrower cube stays RGBA8 (12 KiB at most).
+inline bool CompressedCubeFits(u32 width) {
+    return width >= 32;
+}
+
+/// The bytes a compressed cube takes (six faces CompressedCubeFaceStride apart, `levels` of each
+/// rendered): the last face's render stores the whole 32x32 TWIDDLED tiles its chain touches,
+/// aligned runs of 1024 pixels from the face (8 bytes a pixel for the colour's blocks, one for
+/// the alpha's texels).
+inline u32 CompressedCubeBytes(u32 width, u32 levels, u32 bits) {
+    const u32 block = bits == 4 ? 4 : 1;
+    u32 pixels = 0;
+    for (u32 l = 0; l < levels; l++) {
+        const u32 side = (width >> l) / block;
+        pixels += side * side;
+    }
+    const u32 stride = CompressedCubeFaceStride(width, levels > 1, bits);
+    const u32 stored = (pixels + 1023) / 1024 * 1024 * (bits == 4 ? 8 : 1);
+    return 5 * stride + std::max(stride, stored);
+}
+
+/// A split ETC1A4 cube face's A8 chain target (CubeAlphaVertices): TWIDDLED, a byte a texel, its
+/// height max(32, width) so that level 0 is one of its squares.
+struct CubeAlphaTarget {
+    u32 width, height;
+};
+
+inline CubeAlphaTarget CubeAlphaTargetFor(u32 width, u32 levels) {
+    u32 texels = 0;
+    for (u32 l = 0; l < levels; l++) {
+        texels += (width >> l) * (width >> l);
+    }
+    const u32 side = std::max(32u, width);
+    return {std::bit_ceil((texels + side * side - 1) / (side * side)) * side, side};
+}
+
+/// A split ETC1A4 cube face's alpha render: the face's SWIZZLED A8 levels back to back, level l
+/// the square of its side at TwiddledPixel of its first texel in CubeAlphaTargetFor's target,
+/// where texel (x, y) lands at the square's (x, y). Each level's texels come from its gathered
+/// alpha words as Etc1A4AlphaVertices reads them, a quad a texel row. Returns the vertices'
+/// count.
+inline u32 CubeAlphaVertices(u32 width, u32 levels, float* v, std::vector<GeometryDraw>& draws) {
+    draws.clear();
+    const Etc1A4Gather g = Etc1A4GatherFor(width, width, levels);
+    const CubeAlphaTarget target = CubeAlphaTargetFor(width, levels);
+    const u32 p4_width = 8 * g.stride;
+    u32 vertex_count = 0;
+    for (u32 l = 0, offset = 0; l < levels; l++) {
+        const u32 w = width >> l, tile_rows = w / 8;
+        const auto [px, py] = TwiddledPixel(offset, target.height);
+        const u32 base = (vertex_count + 7) & ~7u;
+        for (u32 y = 0; y < w && v; y++) {
+            const u32 k = 4 * w * (y >> 2 & 1) + (y & 3);
+            // Nibble 4x + k's centre at pixel x's centre.
+            const float ua = (k - 1.5f) / p4_width, ub = (4.0f * w + k - 1.5f) / p4_width;
+            const float row = (static_cast<float>(y >> 3) + 0.5f) / tile_rows;
+            const float uv[4][2] = {{ua, row}, {ub, row}, {ua, row}, {ub, row}};
+            PutQuad(v + (base + y * 6) * SGXD_PROGRAM_BLIT_VERTEX_WORDS, target.width,
+                    target.height, static_cast<float>(px), static_cast<float>(py + y),
+                    static_cast<float>(px + w), static_cast<float>(py + y + 1), uv);
+        }
+        draws.push_back({base, w * 6, tile_rows, g.alpha_row[l] * g.stride * 4, p4_width});
+        vertex_count = base + w * 6;
+        offset += w * w;
+    }
+    return vertex_count;
+}
+
 } // namespace SgxdRenderer::UntileGeometry

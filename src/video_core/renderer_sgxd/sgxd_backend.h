@@ -632,6 +632,17 @@ public:
     /// Sends the queued untiles' side renders, the gather first (the ETC1 and alpha renders
     /// read it): one render for each batch the queue holds.
     void FlushUntiles();
+    /**
+     * An ETC1 cube's faces (faces: each face's guest address, its chain of `levels` after it) as
+     * the texture unit's ETC1 CUBE at colour_gpu, still compressed: each face's chain moved as
+     * QueueUntile moves a 2D square chain, into its slot CompressedCubeFaceStride apart. With
+     * `alpha` the faces are ETC1A4, up to Etc1A4MaxWidth wide: the colour words gathered first,
+     * and the alpha an A8 CUBE at alpha_gpu, each face's SWIZZLED chain rendered TWIDDLED
+     * (CubeAlphaVertices). Side renders a face at a time, in address order: a face's whole tiles
+     * past its chain land where the next face's render writes. Not queued.
+     */
+    void UntileCube(const std::array<u32, 6>& faces, u32 width, u32 levels, bool alpha,
+                    u32 colour_gpu, u32 alpha_gpu);
 
     /// The geometry shader's stream-out stages (RasterizerSgxd::GeometryStage): A0 stores
     /// the vertex program's outputs, A1 runs the geometry program over them.

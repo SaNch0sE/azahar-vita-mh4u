@@ -111,11 +111,29 @@ void RasterizerSgxd::DumpTexture(const Texture& tex, u32 bits, bool split) {
             std::fclose(file);
         }
     };
+    // A compressed cube (SgxdBackend::UntileCube): each face's level 0 blocks, a split's A8 beside.
+    const bool cube_blocks =
+        cube && (split || (tex.format == TF::ETC1 &&
+                           UntileGeometry::CompressedCubeFits(tex.width)));
     for (u32 k = 0; cube && k < 6; k++) {
         const u32 size = tex.width * tex.height * 4;
         write(tex.part_addr[k], tex.width, tex.height, 0, "guest",
               memory.GetPhysicalPointer(tex.part_addr[k]), tex.part_bytes);
-        write(tex.part_addr[k], tex.width, tex.height, 0, "host", tex.memory.cpu + k * size, size);
+        if (!cube_blocks) {
+            write(tex.part_addr[k], tex.width, tex.height, 0, "host", tex.memory.cpu + k * size,
+                  size);
+            continue;
+        }
+        const u32 colour_stride =
+            UntileGeometry::CompressedCubeFaceStride(tex.width, tex.levels > 1, 4);
+        write(tex.part_addr[k], tex.width, tex.height, 0, "swizzled",
+              tex.memory.cpu + k * colour_stride, tex.width * tex.height / 2);
+        if (split) {
+            const u32 alpha_stride =
+                UntileGeometry::CompressedCubeFaceStride(tex.width, tex.levels > 1, 8);
+            write(tex.part_addr[k], tex.width, tex.height, 0, "alpha",
+                  tex.alpha.cpu + k * alpha_stride, tex.width * tex.height);
+        }
     }
     // The guest's bytes up to VRAM's end (ReadableBytes).
     const u32 readable = cube ? 0 : ReadableBytes(tex.addr, tex.part_bytes);

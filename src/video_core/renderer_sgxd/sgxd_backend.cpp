@@ -4043,6 +4043,95 @@ void SgxdBackend::UntileEtc1Blocks(const UntileSource& src, u32 dest_gpu, u32 de
     }
 }
 
+void SgxdBackend::UntileCube(const std::array<u32, 6>& faces, u32 width, u32 levels, bool alpha,
+                             u32 colour_gpu, u32 alpha_gpu) {
+    DEBUG_ASSERT_MSG(std::has_single_bit(width) && width <= UntileSide &&
+                         (width >> (levels - 1)) >= 8 && (!alpha || width <= Etc1A4MaxWidth),
+                     "sgxd: a {}x{} cube of {} levels: the untile takes power-of-two sides from 8, "
+                     "ETC1A4 up to {}",
+                     width, width, levels, Etc1A4MaxWidth);
+    DEBUG_ASSERT(!flushing_untiles);
+    constexpr u32 VertexBytes = SGXD_PROGRAM_BLIT_VERTEX_WORDS * 4;
+    constexpr u32 G = Etc1A4GatherStride;
+    const Geometry& blocks = GeometryFor(
+        GeometryKey(9, width, width, levels, false, false), VertexBytes,
+        [&](float* v, Geometry& g) { return Etc1Vertices(width, width, levels, v, g.draws); });
+    const Etc1Target target = Etc1TargetFor(width, width, levels);
+    const u32 colour_stride = CompressedCubeFaceStride(width, levels > 1, 4);
+    const u32 alpha_stride = CompressedCubeFaceStride(width, levels > 1, 8);
+    const Geometry* gather = nullptr;
+    const Geometry* alphas = nullptr;
+    Etc1A4Gather g{};
+    CubeAlphaTarget alpha_target{};
+    Data scratch{};
+    u32 scratch_bytes = 0;
+    if (alpha) {
+        g = Etc1A4GatherFor(width, width, levels);
+        gather = &GeometryFor(GeometryKey(13, width, width, levels, true, false), VertexBytes,
+                              [&](float* v, Geometry& geometry) {
+                                  return Etc1A4GatherVertices(width, width, levels, v,
+                                                              geometry.draws);
+                              });
+        alphas = &GeometryFor(
+            GeometryKey(17, width, width, levels, true, true), VertexBytes,
+            [&](float* v, Geometry& geometry) {
+                return CubeAlphaVertices(width, levels, v, geometry.draws);
+            });
+        alpha_target = CubeAlphaTargetFor(width, levels);
+        // One face's gather, made again for each face behind the renders that read it.
+        scratch_bytes = G * 4 * AlignUp(g.rows, 32u);
+        scratch = AllocTexture(scratch_bytes);
+        if (!merge_palette.cpu) {
+            merge_palette = AllocTextureFixed(0x1000);
+            u32* const entries = reinterpret_cast<u32*>(merge_palette.cpu);
+            for (u32 n = 0; n < 16; n++) {
+                entries[n] = (n * 17) << 24 | 0xffffffu;
+            }
+        }
+    }
+    std::vector<SideDraw> list;
+    const auto draws = [&](const Geometry& geometry, const auto& texture) {
+        list.clear();
+        for (const GeometryDraw& d : geometry.draws) {
+            SideDraw& sd = list.emplace_back();
+            texture(d, sd);
+            sd.first = d.first;
+            sd.count = d.count;
+            sd.vertices = geometry.vertices.gpu;
+        }
+    };
+    for (u32 f = 0; f < 6; f++) {
+        u32 source = faces[f];
+        if (alpha) {
+            draws(*gather, [&](const GeometryDraw& d, SideDraw& sd) {
+                SideTextureWords(3, 0x0c, 0, d.view_width, d.view_rows, faces[f] + d.source,
+                                 sd.tex);
+            });
+            SideRender({}, list, scratch.gpu, G, G, g.rows);
+            source = scratch.gpu;
+        }
+        draws(blocks, [&](const GeometryDraw& d, SideDraw& sd) {
+            SideTextureWords(0, 0x1f, 0, 2, d.view_rows, source + d.source, sd.tex);
+            sd.raw64 = true;
+        });
+        SideRender({}, list, colour_gpu + f * colour_stride, std::max(target.width, 32u),
+                   target.width, target.height, false, true, SGXD_RECIPE_PACK_F32F32_SWAPPED,
+                   true);
+        if (alpha) {
+            draws(*alphas, [&](const GeometryDraw& d, SideDraw& sd) {
+                SideTextureWords(3, 0x94, 0, d.view_width, d.view_rows, scratch.gpu + d.source,
+                                 sd.tex, merge_palette.gpu);
+            });
+            SideRender({}, list, alpha_gpu + f * alpha_stride, std::max(alpha_target.width, 32u),
+                       alpha_target.width, alpha_target.height, false, true,
+                       SGXD_RECIPE_PACK_U8_A);
+        }
+    }
+    if (alpha) {
+        FreeTexture(scratch, scratch_bytes);
+    }
+}
+
 void SgxdBackend::UntileEtc1A4Merge(const UntileSource& src, u32 colour_gpu, u32 colour_stride,
                                     u32 dest_gpu, u32 dest_stride, bool swizzled) {
     const u32 w = src.width, h = src.height;
