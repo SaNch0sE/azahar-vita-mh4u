@@ -80,8 +80,6 @@ namespace SgxdRenderer {
  *             SUM_MUX bits set
  *   u8colour  a probe: the U8 combiners read the vertex colour's bytes from a second,
  *             fixed-point iterator of it (what that iterator delivers; a pack fewer)
- *   smpskip   a probe: skip-invalid on the texture reads that are point sampled from one level
- *             (the lighting's tables, a shadow's taps), which run in uncovered instances too
  *   fsonly=N  fswhite and fscut on the program whose key's low 32 bits are N alone
  *             (drawkeys logs each draw's fs key; the word repeated names more)
  *   fscut=N   a single-phase fragment program cut to its first N instructions, then the white

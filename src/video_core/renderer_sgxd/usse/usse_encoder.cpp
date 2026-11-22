@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cstdio>
 #include <optional>
@@ -1323,6 +1324,454 @@ void Encoder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2,
     }), 54, ReadsOne(src1.reg, chan) | ReadsOne(src2.reg, src2_scalar ? 0 : chan), 0);
 }
 
+namespace {
+
+// The dual-issue words' swizzle tables, which are not the single-issue ones: sixteen standard
+// entries ending in the constants 0, 0.5, 1 and 2, and an extended set. Three-wide entries'
+// fourth channel is unused.
+#define SW(a, b, c, d) Swizzle{Ch::a, Ch::b, Ch::c, Ch::d}
+constexpr Swizzle DualVec3Std[16] = {
+    SW(X, X, X, X),          SW(Y, Y, Y, X),          SW(Z, Z, Z, X),       SW(W, W, W, X),
+    SW(X, Y, Z, X),          SW(Y, Z, W, X),          SW(X, X, Y, X),       SW(X, Y, X, X),
+    SW(Y, Y, X, X),          SW(Y, Y, Z, X),          SW(Z, X, Y, X),       SW(X, Z, Y, X),
+    SW(Zero, Zero, Zero, X), SW(Half, Half, Half, X), SW(One, One, One, X), SW(Two, Two, Two, X),
+};
+constexpr Swizzle DualVec3Ext[11] = {
+    SW(X, Y, Y, X),    SW(Y, X, Y, X),      SW(X, X, Z, X), SW(Y, X, X, X),
+    SW(X, Y, Zero, X), SW(X, One, Zero, X), SW(X, Z, Y, X), SW(Y, Z, X, X),
+    SW(Z, Y, X, X),    SW(Z, Z, Y, X),      SW(X, Y, One, X),
+};
+constexpr Swizzle DualVec4Std[16] = {
+    SW(X, X, X, X),             SW(Y, Y, Y, Y),             SW(Z, Z, Z, Z),
+    SW(W, W, W, W),             SW(X, Y, Z, W),             SW(Y, Z, W, W),
+    SW(X, Y, Z, Z),             SW(X, X, Y, Z),             SW(X, Y, X, Y),
+    SW(X, Y, W, Z),             SW(Z, X, Y, W),             SW(Z, W, Z, W),
+    SW(Zero, Zero, Zero, Zero), SW(Half, Half, Half, Half), SW(One, One, One, One),
+    SW(Two, Two, Two, Two),
+};
+constexpr Swizzle DualVec4Ext[16] = {
+    SW(Y, Z, X, W), SW(Z, W, X, Y), SW(X, Z, W, Y), SW(Y, Y, W, W),
+    SW(W, Y, Z, W), SW(W, Z, W, Z), SW(X, Y, Z, X), SW(Z, Z, W, W),
+    SW(X, W, Z, X), SW(Y, Y, Y, X), SW(Y, Y, Y, Z), SW(Z, W, Z, W),
+    SW(Y, Z, X, Z), SW(X, X, Y, Y), SW(X, Z, W, W), SW(X, Y, Z, One),
+};
+#undef SW
+
+// A source slot of a dual-issue word: the unified store's operand, or an internal register.
+enum class DualSlot : uint8_t { U, G0, G1, G2, None };
+using DualSlots = std::array<DualSlot, 3>;
+constexpr DualSlots DualInvalid{DualSlot::None, DualSlot::None, DualSlot::None};
+#define SL(...) DualSlots{__VA_ARGS__}
+#define U DualSlot::U
+#define G0 DualSlot::G0
+#define G1 DualSlot::G1
+#define G2 DualSlot::G2
+// OP1's slots by its source count and the source configuration, then OP2's by both counts.
+constexpr DualSlots DualPrimary[3][4] = {
+    {SL(U), SL(G0), SL(G1), SL(G2)},
+    {SL(U, G1), SL(G0, U), SL(G0, G1), DualInvalid},
+    {SL(U, G1, G2), SL(G0, U, G2), SL(G0, G1, U), SL(G0, G1, G2)},
+};
+constexpr DualSlots DualSecondary[3][3][4] = {
+    {
+        {SL(G0), SL(U), SL(U), SL(U)},
+        {SL(G0, G1), SL(U, G1), SL(G0, U), SL(G0, U)},
+        {SL(G0, G1, G2), SL(U, G1, G2), SL(G0, U, G2), SL(G0, U, G1)},
+    },
+    {
+        {SL(G0), SL(G1), SL(U), DualInvalid},
+        {SL(G0, G2), SL(G1, G2), SL(G2, U), DualInvalid},
+        {DualInvalid, DualInvalid, DualInvalid, DualInvalid},
+    },
+    {
+        {SL(G0), SL(G1), SL(G2), SL(U)},
+        {DualInvalid, DualInvalid, DualInvalid, DualInvalid},
+        {DualInvalid, DualInvalid, DualInvalid, DualInvalid},
+    },
+};
+#undef SL
+#undef U
+#undef G0
+#undef G1
+#undef G2
+
+// How an operation sits in one half of the word.
+struct DualForm {
+    uint8_t code = 0;     // the operation's code, standard or extended
+    bool ext = false;
+    bool vector = false;  // sources read lane by lane (`lanes`), else one lane of each (`lane`)
+    uint8_t lanes = 0;
+    uint8_t lane = 0;
+    // The destination: an internal register and its mask, or the unified store's fields.
+    uint8_t gpi = 0, mask = 0;
+    uint8_t usd = 0, usd_bank = 0;
+};
+
+bool OneLane(uint8_t mask, uint8_t& lane) {
+    if (mask == 0 || (mask & (mask - 1)) != 0) {
+        return false;
+    }
+    lane = static_cast<uint8_t>(std::countr_zero(mask));
+    return true;
+}
+
+// The form of `op` writing the internal register (`to_us` false) or the unified store.
+bool DualFormOf(const DualOp& op, bool vec4, bool to_us, DualForm& f) {
+    using K = DualOp::Kind;
+    const uint8_t full = vec4 ? 0xf : 0x7;
+    const bool lanewise = op.kind == K::Mul || op.kind == K::Add || op.kind == K::Mov ||
+                          op.kind == K::Mad;
+    const uint8_t mask = op.dst.mask & 0xf;
+    uint8_t lane = 0;
+    const bool one = OneLane(mask, lane);
+    if (op.kind == K::Dot && op.vec4 != vec4) {
+        return false;
+    }
+    // A lane-by-lane operation as its vector form, or (one unified-store register) its scalar.
+    const auto vector_code = [&]() -> uint8_t {
+        return op.kind == K::Mad ? 0 : op.kind == K::Mul ? 3 : op.kind == K::Add ? 4 : 5;
+    };
+    const auto scalar = [&]() {
+        f.vector = false;
+        f.lane = lane;
+        switch (op.kind) {
+        case K::Dot:
+            f.code = 1;
+            f.vector = true;
+            f.lanes = full;
+            return true;
+        case K::Rsq:
+            f.code = 6;
+            return true;
+        case K::Rcp:
+            f.code = 7;
+            return true;
+        case K::Add:
+            f.code = 1;
+            f.ext = true;
+            return true;
+        case K::Mul:
+            f.code = 2;
+            f.ext = true;
+            return true;
+        case K::Frc:
+            f.code = 3;
+            f.ext = true;
+            return true;
+        case K::Exp:
+            f.code = 4;
+            f.ext = true;
+            return true;
+        case K::Log:
+            f.code = 5;
+            f.ext = true;
+            return true;
+        default:
+            return false; // no scalar move
+        }
+    };
+    if (!to_us) {
+        if (op.dst.reg.bank != Bank::Internal || mask == 0 || (mask & ~full) != 0) {
+            return false;
+        }
+        f.gpi = op.dst.reg.n;
+        f.mask = mask;
+        if (lanewise) {
+            f.code = vector_code();
+            f.vector = true;
+            f.lanes = mask;
+            return true;
+        }
+        return one && scalar();
+    }
+    if (op.dst.reg.bank == Bank::Internal) {
+        // The unified store's destination can name an internal register (all of it). Not
+        // emitted: a pair forms only where nothing internal is live past it (Lowering::Encode).
+        return false;
+    }
+    switch (op.dst.reg.bank) {
+    case Bank::Temp:
+        f.usd_bank = 0;
+        break;
+    case Bank::Output:
+        f.usd_bank = 1;
+        break;
+    case Bank::PrimAttr:
+        f.usd_bank = 2;
+        break;
+    default:
+        return false;
+    }
+    if (lanewise && mask == 0x3) {
+        // A vector result: the pair's x and y, implied.
+        if ((op.dst.reg.n & 1) != 0 || op.dst.reg.n / 2 >= 124) {
+            return false;
+        }
+        f.code = vector_code();
+        f.vector = true;
+        f.lanes = 0x3;
+        f.usd = static_cast<uint8_t>(op.dst.reg.n / 2);
+        return true;
+    }
+    // A scalar result: the one register, its number not doubled.
+    if (!one || op.dst.reg.n + lane >= 124) {
+        return false;
+    }
+    f.usd = static_cast<uint8_t>(op.dst.reg.n + lane);
+    return scalar();
+}
+
+// A source's fields in its slot.
+struct DualSource {
+    uint8_t num = 0, bank = 0, swizzle = 4;
+    bool ext = false, neg = false, abs = false;
+};
+
+// The table entry reading `swz` in `lanes`, standard first. The extended tables are unused: on
+// the console g1's extended entry 7 (yzx) read garbage, and the unified store's are unmeasured.
+bool DualSwizzle(const Swizzle& swz, uint8_t lanes, bool vec4, bool allow_ext, DualSource& out) {
+    const auto match = [&](const Swizzle* table, std::size_t count, bool ext) {
+        for (std::size_t i = 0; i < count; i++) {
+            bool same = true;
+            for (unsigned l = 0; l < 4 && same; l++) {
+                same = !(lanes >> l & 1) || table[i][l] == swz[l];
+            }
+            if (same) {
+                out.swizzle = static_cast<uint8_t>(i);
+                out.ext = ext;
+                return true;
+            }
+        }
+        return false;
+    };
+    if (vec4) {
+        return match(DualVec4Std, 16, false) || (allow_ext && match(DualVec4Ext, 16, true));
+    }
+    return match(DualVec3Std, 16, false) || (allow_ext && match(DualVec3Ext, 11, true));
+}
+
+// Whether `src`, read as `f` reads it, fits `slot`. `few`: OP1 has under two sources (the
+// unified store then has its extended swizzles and its absolute flag, and g2 is i2).
+bool DualFit(const Src& src, const DualForm& f, DualSlot slot, bool vec4, bool few,
+             DualSource& out) {
+    out = {};
+    const bool neg = src.mod == Mod::Neg || src.mod == Mod::NegAbs;
+    const bool abs = src.mod == Mod::Abs || src.mod == Mod::NegAbs;
+    const Ch scalar_ch = src.swz[f.lane & 3];
+    if (src.reg.bank == Bank::Const) {
+        // One of the tables' constants in every lane read: the constant bank's 0, 1, 2 and
+        // 0.5 (word x of entries 0, 2, 4 and 12), in any slot but g2, whose swizzle is fixed.
+        const uint8_t lanes = f.vector ? f.lanes : static_cast<uint8_t>(1u << (f.lane & 3));
+        for (unsigned l = 0; l < 4; l++) {
+            if ((lanes >> l & 1) && src.swz[l] != Ch::X) {
+                return false;
+            }
+        }
+        switch (src.reg.n) {
+        case 0:
+            out.swizzle = 12;
+            break;
+        case 12:
+            out.swizzle = 13;
+            break;
+        case 2:
+            out.swizzle = 14;
+            break;
+        case 4:
+            out.swizzle = 15;
+            break;
+        default:
+            return false;
+        }
+        out.neg = neg;
+        return slot == DualSlot::G1 || slot == DualSlot::U || (slot == DualSlot::G0 && !neg);
+    }
+    if (slot == DualSlot::U) {
+        switch (src.reg.bank) {
+        case Bank::Temp:
+            out.bank = 0;
+            break;
+        case Bank::Output:
+            out.bank = 1;
+            break;
+        case Bank::PrimAttr:
+            out.bank = 2;
+            break;
+        case Bank::SecAttr:
+            out.bank = 3;
+            break;
+        default:
+            return false;
+        }
+        if (abs && !few) {
+            return false;
+        }
+        out.neg = neg;
+        out.abs = abs;
+        if (!f.vector) {
+            // One register, its number not doubled: the lane's own.
+            if (scalar_ch > Ch::W) {
+                return false;
+            }
+            const unsigned n = src.reg.n + static_cast<unsigned>(scalar_ch);
+            if (n > 127 || (src.reg.bank == Bank::Temp && n >= 124)) {
+                return false;
+            }
+            out.num = static_cast<uint8_t>(n);
+            out.swizzle = 0;
+            return true;
+        }
+        if ((src.reg.n & 1) != 0 || (src.reg.bank == Bank::Temp && src.reg.n / 2 >= 124)) {
+            return false;
+        }
+        out.num = static_cast<uint8_t>(src.reg.n / 2);
+        return DualSwizzle(src.swz, f.lanes, vec4, false, out);
+    }
+    if (src.reg.bank != Bank::Internal || abs) {
+        return false;
+    }
+    out.num = src.reg.n;
+    out.neg = neg;
+    if (slot != DualSlot::G1 && neg) {
+        return false;
+    }
+    if (slot == DualSlot::G2) {
+        if (!f.vector) {
+            return scalar_ch == Ch::X;
+        }
+        for (unsigned l = 0; l < 4; l++) {
+            if ((f.lanes >> l & 1) && src.swz[l] != static_cast<Ch>(l)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (!f.vector) {
+        if (scalar_ch > Ch::W) {
+            return false;
+        }
+        out.swizzle = static_cast<uint8_t>(scalar_ch);
+        return true;
+    }
+    return DualSwizzle(src.swz, f.lanes, vec4, false, out);
+}
+
+} // Anonymous namespace
+
+bool Encoder::Dual(const DualOp& first, const DualOp& second) {
+    using K = DualOp::Kind;
+    DualOp ops[2] = {first, second};
+    for (DualOp& op : ops) {
+        op.dst.reg = Map(op.dst.reg);
+        for (unsigned k = 0; k < op.count; k++) {
+            op.src[k].reg = Map(op.src[k].reg);
+        }
+        if (op.count == 0 || op.count > 3) {
+            return false;
+        }
+    }
+    // The orders an operation's sources may take: a product's two swapped.
+    const auto orders = [](const DualOp& op) {
+        return (op.kind == K::Mul || op.kind == K::Add || op.kind == K::Dot || op.kind == K::Mad)
+                   ? 2
+                   : 1;
+    };
+    const auto source = [](const DualOp& op, int order, unsigned k) -> const Src& {
+        return op.src[order == 1 && k < 2 ? 1 - k : k];
+    };
+    for (int primary = 0; primary < 2; primary++) {
+        const DualOp& p = ops[primary];
+        const DualOp& s = ops[1 - primary];
+        const bool few = p.count < 2;
+        for (int vec4 = 0; vec4 < 2; vec4++) {
+            for (int pri_us = 0; pri_us < 2; pri_us++) {
+                DualForm pf, sf;
+                if (!DualFormOf(p, vec4 != 0, pri_us != 0, pf) ||
+                    !DualFormOf(s, vec4 != 0, pri_us == 0, sf)) {
+                    continue;
+                }
+                // OP1's extended table is DVEC3's alone (the bit is DVEC4's w mask); OP2 has
+                // no standard code 0.
+                if ((pf.ext && vec4 != 0) || (!sf.ext && sf.code == 0)) {
+                    continue;
+                }
+                for (unsigned cfg = 0; cfg < 4; cfg++) {
+                    const DualSlots& ps = DualPrimary[p.count - 1][cfg];
+                    const DualSlots& ss = DualSecondary[p.count - 1][s.count - 1][cfg];
+                    if (ps[0] == DualSlot::None || ss[0] == DualSlot::None) {
+                        continue;
+                    }
+                    for (int po = 0; po < orders(p); po++) {
+                        for (int so = 0; so < orders(s); so++) {
+                            std::array<DualSource, 4> slot{}; // by DualSlot
+                            bool ok = true;
+                            uint16_t reads = 0;
+                            const auto place = [&](const DualOp& op, const DualForm& f,
+                                                   const DualSlots& slots, int order) {
+                                for (unsigned k = 0; k < op.count && ok; k++) {
+                                    const Src& src = source(op, order, k);
+                                    DualSource fit;
+                                    ok = DualFit(src, f, slots[k], vec4 != 0, few, fit);
+                                    if (!ok) {
+                                        break;
+                                    }
+                                    if (slots[k] == DualSlot::G2 && few && fit.num != 2 &&
+                                        src.reg.bank == Bank::Internal) {
+                                        ok = false; // g2 is i2 when OP1 has one source
+                                        break;
+                                    }
+                                    slot[static_cast<std::size_t>(slots[k])] = fit;
+                                    reads |= f.vector
+                                                 ? Reads(src, f.lanes)
+                                                 : ReadsOne(src.reg, static_cast<uint8_t>(
+                                                                         src.swz[f.lane & 3]));
+                                }
+                            };
+                            place(p, pf, ps, po);
+                            place(s, sf, ss, so);
+                            if (!ok) {
+                                continue;
+                            }
+                            const DualForm& gf = pri_us != 0 ? sf : pf; // the internal write
+                            const DualForm& uf = pri_us != 0 ? pf : sf;
+                            const DualSource& u = slot[0];
+                            const DualSource& g0 = slot[1];
+                            const DualSource& g1 = slot[2];
+                            const DualSource& g2 = slot[3];
+                            const uint64_t g2_field =
+                                few ? (u.ext ? 2u : 0u) | (u.abs ? 1u : 0u) : g2.num;
+                            if (!few && (u.ext || u.abs)) {
+                                continue;
+                            }
+                            const uint64_t hi =
+                                (vec4 != 0 ? 5ull : 4ull) << 27 | (g1.neg ? 1ull : 0ull) << 26 |
+                                (skip_invalid ? 1ull : 0ull) << 23 |
+                                (vec4 != 0 ? (gf.mask >> 3 & 1ull) : (pf.ext ? 1ull : 0ull)) << 22 |
+                                (g1.ext ? 1ull : 0ull) << 20 | uint64_t{u.swizzle} << 16 |
+                                (u.neg ? 1ull : 0ull) << 15 | uint64_t{pf.code} << 12 |
+                                (sf.ext ? 1ull : 0ull) << 11 | (pri_us != 0 ? 1ull : 0ull) << 10 |
+                                uint64_t{g0.swizzle} << 6 | uint64_t{g1.swizzle} << 2 |
+                                uint64_t{uf.usd_bank};
+                            const uint64_t lo =
+                                uint64_t{u.bank} << 30 | uint64_t{gf.gpi} << 28 |
+                                uint64_t{uf.usd} << 21 | uint64_t{sf.code} << 18 |
+                                uint64_t{cfg} << 16 | g2_field << 14 | uint64_t{g1.num} << 12 |
+                                uint64_t{g0.num} << 10 | (gf.mask & 7ull) << 7 | uint64_t{u.num};
+                            uint16_t writes = static_cast<uint16_t>(gf.mask << (gf.gpi * 4));
+                            if (uf.usd_bank == 0 && uf.usd >= 124 && uf.vector) {
+                                writes |= static_cast<uint16_t>(uf.lanes << ((uf.usd - 124) * 4));
+                            }
+                            Push(hi << 32 | lo, 0, reads, writes);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 void Encoder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
                        bool nosched, uint8_t fconv, bool point) {
     Sample(dst, coord, 2, sampler_sa, lod, drc, fconv, point);
@@ -1350,7 +1799,7 @@ void Encoder::Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const
     Push(Pack(PatSmp,
               {
                   {'p', 0},
-                  {'s', lod || (point && probe_skip_point_reads && skip_invalid) ? 1u : 0u},
+                  {'s', lod || (point && skip_invalid) ? 1u : 0u},
                   {'n', 0},
                   {'y', 0},
                   {'m', 0},

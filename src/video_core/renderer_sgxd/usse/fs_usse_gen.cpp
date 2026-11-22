@@ -4901,6 +4901,8 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     // (Sample2DPoint), so only the texture units' coordinates keep it clear.
     e.skip_invalid_auto = true;
     e.skip_invalid = true;
+    // Dual-issue words in the second tier alone: finding them slows the first tier's worker.
+    e.dual_issue = level >= 2;
 
     // A kill ends its phase: psp2cgc follows every kill with its nop and a new phase marker. The
     // first marker waits with condition 1 when another phase follows, 7 otherwise, as the

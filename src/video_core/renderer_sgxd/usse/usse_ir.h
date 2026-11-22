@@ -176,6 +176,9 @@ public:
     /// registers, not four, and a whole quad any even base. The classes then hold only
     /// temporaries and primary attributes.
     bool split_pairs = false;
+    /// Two neighbouring F32 operations that do not depend on each other go into one
+    /// dual-issue word where one holds them (Encoder::Dual).
+    bool dual_issue = false;
 
     std::size_t Count() const {
         return insts.size();

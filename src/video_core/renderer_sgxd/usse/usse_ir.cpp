@@ -722,6 +722,7 @@ public:
     LowerResult Run(Encoder& e, int level);
     bool skip_auto = false;
     bool split_pairs = false;                              ///< Builder::split_pairs
+    bool dual_issue = false;                               ///< Builder::dual_issue
     uint32_t peak_live = 0;                                ///< LowerResult::peak_live
     uint32_t peak_at = 0;                                  ///< LowerResult::peak_at
     std::vector<uint16_t> peak_regs;                       ///< LowerResult::peak_regs
@@ -4251,10 +4252,164 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
     const auto D = [&](const Dst& d) { return Dst{Map(d.reg), d.mask}; };
     const auto I = [&](const IOp& o) { return o.imm ? o : IOp::R(Map(o.reg)); };
     RefList refs;
+    // An F32 operation as a dual-issue word can hold it, its registers placed.
+    const auto dual_of = [&](const Inst& i, DualOp& out) {
+        if (i.pred != Pred::None) {
+            return false;
+        }
+        out = {};
+        out.dst = D(i.dst);
+        // A unified-store destination's z and w are a second word (Encoder::Vec).
+        const bool pair = out.dst.reg.bank == Bank::Internal || (out.dst.mask & 0xc) == 0;
+        switch (i.op) {
+        case Op::Vec: {
+            const auto op = static_cast<VecOp>(i.u[0]);
+            if (!pair || (op != VecOp::Mul && op != VecOp::Add && op != VecOp::Frc)) {
+                return false;
+            }
+            out.src[0] = S(i.src[0]);
+            out.src[1] = S(i.src[1]);
+            out.count = 2;
+            const Src& one = out.src[1];
+            if (op == VecOp::Mul && one.reg.bank == Bank::Const && one.reg.n == 2 &&
+                one.swz == XXXX && one.mod == Mod::None) {
+                out.kind = DualOp::Kind::Mov; // times one: the operand itself
+                out.count = 1;
+            } else {
+                out.kind = op == VecOp::Mul   ? DualOp::Kind::Mul
+                           : op == VecOp::Add ? DualOp::Kind::Add
+                                              : DualOp::Kind::Frc;
+            }
+            return true;
+        }
+        case Op::Mad:
+            out.kind = DualOp::Kind::Mad;
+            out.src = {S(i.src[0]), S(i.src[1]), S(i.src[2])};
+            out.count = 3;
+            out.vec4 = i.b[0];
+            return true;
+        case Op::Dot:
+            if (i.u[2] != 0) {
+                return false; // a clip plane's test
+            }
+            out.kind = DualOp::Kind::Dot;
+            out.src[0] = S(i.src[0]);
+            out.src[1] = S(i.src[1]);
+            out.count = 2;
+            out.vec4 = i.b[0];
+            return true;
+        case Op::Comp: {
+            static constexpr DualOp::Kind kinds[4] = {DualOp::Kind::Rcp, DualOp::Kind::Rsq,
+                                                      DualOp::Kind::Log, DualOp::Kind::Exp};
+            out.kind = kinds[i.u[0] & 3];
+            out.src[0] = S(i.src[0]);
+            const Ch lane = static_cast<Ch>(i.u[1] & 3); // the one lane it reads
+            out.src[0].swz = {lane, lane, lane, lane};
+            out.count = 1;
+            return true;
+        }
+        case Op::MoveInternal:
+            if (!pair) {
+                return false;
+            }
+            out.kind = DualOp::Kind::Mov;
+            out.src[0] = S(i.src[0]);
+            out.count = 1;
+            return true;
+        default:
+            return false;
+        }
+    };
+    // Whether `b` reads nothing `a` writes and they write apart: then the two in one word,
+    // each reading before either writes, are the two in a row.
+    const auto dual_apart = [](const DualOp& a, const DualOp& b) {
+        const auto word = [](const Reg& r, unsigned lane) {
+            return static_cast<int>(r.bank) << 16 |
+                   static_cast<int>(r.bank == Bank::Internal ? r.n * 4 + lane : r.n + lane);
+        };
+        std::array<int, 4> written{};
+        unsigned count = 0;
+        for (unsigned l = 0; l < 4; l++) {
+            if (a.dst.mask >> l & 1) {
+                written[count++] = word(a.dst.reg, l);
+            }
+        }
+        const auto hits = [&](int w) {
+            return std::find(written.begin(), written.begin() + count, w) !=
+                   written.begin() + count;
+        };
+        for (unsigned l = 0; l < 4; l++) {
+            if ((b.dst.mask >> l & 1) && hits(word(b.dst.reg, l))) {
+                return false;
+            }
+        }
+        const uint8_t lanes = b.kind == DualOp::Kind::Dot ? (b.vec4 ? 0xf : 0x7) : b.dst.mask;
+        for (unsigned k = 0; k < b.count; k++) {
+            const Src& src = b.src[k];
+            if (src.reg.bank == Bank::Const) {
+                continue;
+            }
+            for (unsigned l = 0; l < 4; l++) {
+                if ((lanes >> l & 1) && src.swz[l] <= Ch::W &&
+                    hits(word(src.reg, static_cast<unsigned>(src.swz[l])))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    // The internal lanes live after each instruction (none across a barrier: the emitters keep none
+    // there). A dual-issue word has no NOSCHED bit, and the hardware does not take it as set: the
+    // boundary after the word that follows it is left unguarded, and an internal register live
+    // across it is lost when the pipe runs another task there (docs/sgxd/usse.md).
+    // A pair is made only where nothing internal is live after its second instruction (which may
+    // encode as more than one word: the word after the pair can be its own second half) nor after
+    // the next two (which may be a pair themselves).
+    std::vector<uint16_t> internal_live_after(insts.size(), 0);
+    {
+        uint16_t live = 0;
+        RefList scratch;
+        for (std::size_t m = insts.size(); m-- > 0;) {
+            internal_live_after[m] = live;
+            Inst& inst = insts[m];
+            if (IsBarrier(inst)) {
+                live = 0;
+                continue;
+            }
+            if (inst.pred == Pred::None) {
+                const uint8_t lanes = InternalWriteLanes(inst);
+                Refs(inst, scratch);
+                for (const Ref& r : scratch) {
+                    if (r.def && r.reg->bank == Bank::Internal) {
+                        live = static_cast<uint16_t>(live & ~(lanes << (r.reg->n * 4)));
+                    }
+                }
+            }
+            ForEachRead(inst, scratch, [&](const Reg& r, uint8_t lanes) {
+                if (r.bank == Bank::Internal) {
+                    live = static_cast<uint16_t>(live | (lanes & 0xf) << (r.n * 4));
+                }
+            });
+        }
+    }
+    const auto guarded = [&](std::size_t n) {
+        return internal_live_after[n + 1] == 0 &&
+               (n + 2 >= insts.size() || internal_live_after[n + 2] == 0) &&
+               (n + 3 >= insts.size() || internal_live_after[n + 3] == 0);
+    };
     for (std::size_t n = 0; n < insts.size(); n++) {
         const Inst& i = insts[n];
         if (skip_auto) {
             e.skip_invalid = skip[n];
+        }
+        if (dual_issue && n + 1 < insts.size() && (!skip_auto || skip[n] == skip[n + 1]) &&
+            guarded(n)) {
+            DualOp first, second;
+            if (dual_of(i, first) && dual_of(insts[n + 1], second) && dual_apart(first, second) &&
+                e.Dual(first, second)) {
+                n++;
+                continue;
+            }
         }
         switch (i.op) {
         case Op::Phas:
@@ -4619,6 +4774,7 @@ LowerResult Builder::Lower(Encoder& e, int level) {
     Lowering lowering{insts, cls, s};
     lowering.skip_auto = skip_invalid_auto;
     lowering.split_pairs = split_pairs;
+    lowering.dual_issue = dual_issue;
     lowering.occupancy = occupancy;
     return lowering.Run(e, level);
 }

@@ -742,14 +742,10 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
                              GuestGpuMemory& guest_memory_)
     : VideoCore::RasterizerAccelerated{memory_, pica_}, guest_memory{guest_memory_} {
     Vprof::Start(memory_);
-#ifdef VITA_DIAGNOSTICS
     Usse::sched_probe.lut_reads = SgxdFlagValue("fslut");
     Usse::sched_probe.lut_kind = SgxdFlagValue("fslutkind");
     Usse::sched_probe.nosched = static_cast<int>(SgxdFlagValue("fsnosched"));
-#endif
-#ifdef VITA_DIAGNOSTICS
-    Usse::Encoder::probe_skip_point_reads = SgxdFlag("smpskip");
-#endif
+    Usse::sched_probe.u8_colour = SgxdFlag("u8colour");
     if (!SgxdFlag("notier2")) {
         tier2 = std::make_unique<ShaderTier2>();
     }

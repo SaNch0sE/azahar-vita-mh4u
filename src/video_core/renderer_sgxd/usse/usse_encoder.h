@@ -145,6 +145,20 @@ struct Dst {
     uint8_t mask = 0xf; ///< components written, bit 0 = x
 };
 
+/// One of the two operations a dual-issue word holds (Encoder::Dual).
+struct DualOp {
+    /// Mad: src[0] * src[1] + src[2]. Frc: src[0] - floor(src[1]). Dot: three lanes, or four
+    /// with `vec4`. Mul, Add, Mov and Mad are lane by lane over dst.mask; Dot, Rsq, Rcp, Frc,
+    /// Exp and Log write the one lane dst.mask names, each source read at that lane of its
+    /// swizzle (Dot: at lanes x to z or w).
+    enum class Kind : uint8_t { Mad, Dot, Mul, Add, Mov, Rsq, Rcp, Frc, Exp, Log };
+    Kind kind;
+    Dst dst;
+    std::array<Src, 3> src{};
+    uint8_t count = 0;
+    bool vec4 = false;
+};
+
 class Encoder {
 public:
     /// The "skip invalid instances" bit every arithmetic instruction carries. The compiler
@@ -279,13 +293,22 @@ public:
     /// sa<sampler> (even), coordinates at coord.xy (pair-aligned); `lod` is an internal
     /// register holding the level in x, or
     /// null for the hardware's own level. Counter `drc` is what Wdf waits on.
-    /// `point`: point sampled from a texture of one level (the result needs no neighbour).
+    /// `point`: point sampled from a texture of one level: the result needs no neighbour, so
+    /// the read takes skip-invalid where the program has it on (a read with the hardware's own
+    /// level runs in a task's uncovered instances too, its level coming from the 2x2 block).
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
                   bool nosched = false, uint8_t fconv = 3, bool point = false);
-    /// A probe (sgxd_flags smpskip): skip-invalid on the reads that are point sampled from one
-    /// level, which run in a task's uncovered instances as every read with the hardware's own
-    /// level does. Set before any program is emitted.
-    static inline bool probe_skip_point_reads = false;
+    /// Two F32 operations in one dual-issue word (DVEC3, or DVEC4 when one needs lane w): both
+    /// read their sources before either writes. One result goes to an internal register under
+    /// its mask; the other to the unified store (a pair's x and y, or one register for a scalar
+    /// result) or to a whole internal register (never emitted). Between them they read one
+    /// unified-store operand; every other source is an internal register in the slot a source
+    /// configuration gives it, with that slot's standard swizzle table and modifiers, or one of
+    /// the constants 0, 0.5, 1 and 2 as a swizzle. The word carries no nosched bit, and pixel
+    /// tasks do not take it as set: the boundary after the instruction that follows it is
+    /// unguarded, so the caller pairs only where nothing internal is live there
+    /// (Lowering::Encode). False, and nothing written, when no form holds the two.
+    bool Dual(const DualOp& a, const DualOp& b);
     /// The same for a cube texture: the direction at coord.xyz, three 32-bit registers from a
     /// pair boundary (CDIM 2, as psp2cgc encodes a dependent texCUBE), the hardware's level.
     void SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, bool nosched = false);
