@@ -1192,10 +1192,11 @@ void NoteSystem(int version, int cores) {
 }
 
 void NoteGpuDriver(u32 module_nid) {
-    // sgxd's three (sgxd.c's SGXD_GPU_MODULE_NID*).
+    // sgxd's four (sgxd.c's SGXD_GPU_MODULE_NID*).
     firmware = module_nid == 0x4069F83Bu   ? "3.60"
                : module_nid == 0xC0F361A3u ? "3.65"
                : module_nid == 0xC01EF58Au ? "3.68"
+               : module_nid == 0x18EECAEEu ? "3.73"
                                            : "not one sgxd knows";
 }
 

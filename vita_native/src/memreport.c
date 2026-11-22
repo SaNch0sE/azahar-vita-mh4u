@@ -1,18 +1,13 @@
-// azahar-native - azaharMemReport: who holds the console's CDRAM.
-//
-// Included from main.c, whose helpers it uses (module_get_export_func, ENTER_SYSCALL). A game
-// gets 112 MiB of the 128 MiB of CDRAM (SceProcessmgr's ScePhyMemPartGameCdram; the shell has
-// ScePhyMemPartShellCdram, 16 MiB), and the app's own blocks and free size leave part of its
-// 112 unaccounted. This prints, once, to the kernel console: the physical memory partitions of
-// the calling process's address space by index (name, the info core's words), and every
-// memblock in the system of 64 KiB or more (owner pid, name, type, base, size; the physical
-// address of the kernel's own). A block's type names its partition class: 0x09 user CDRAM,
-// 0x40 kernel CDRAM, 0x11 the GPU's game memory (memtype.h).
-//
-// The functions are SceSysmemForKernel's, re-versioned every firmware, so they are resolved at
-// runtime by 3.63-3.65's NIDs (the wiki's SceSysmem page). Read-only: nothing is changed.
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
 
-#define MEMREPORT_SYSMEM_KERNEL 0x02451F0F // SceSysmemForKernel, 3.63-3.65
+// azahar-native azaharMemReport: who holds the console's CDRAM, printed once to the kernel
+// console: the calling process's physical memory partitions and every memblock of 64 KiB or
+// more. A block's type names its partition class: 0x09 user CDRAM, 0x40 kernel CDRAM, 0x11 the
+// GPU's game memory (memtype.h). SceSysmemForKernel's NIDs change every firmware, so they are
+// resolved at runtime. Read-only.
+
+#define MEMREPORT_SYSMEM_KERNEL 0x02451F0F // SceSysmemForKernel, 3.63-3.73
 #define MEMREPORT_VECTOR_SIZE 0x10000      // the memblock UIDs' vector, a block for the call
 #define MEMREPORT_MAX_UIDS (MEMREPORT_VECTOR_SIZE / sizeof(SceUID))
 

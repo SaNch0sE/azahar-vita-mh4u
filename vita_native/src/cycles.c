@@ -4,10 +4,15 @@
 // azahar-native cycles.c: the PMU's cycle counter readable in user mode, for every thread of the
 // calling process (azaharCycleCounter).
 //
+// ThreadMgr saves PMCR, PMCCNTR and PMUSERENR per thread, so the setting goes where it keeps
+// them: the process's defaults for later threads (process object +0x28c PMUSERENR, +0x290 PMCR,
+// written directly: ProcessMgr's setters need the debug dipsw), and every existing thread through
+// ThreadMgr's driver calls. PMCNTENSET's C is not saved and a resume clears it: user code sets it
+// itself (azaharCyclesStart).
 
 #define CYCLES_PMUSERENR_EN 1u
 #define CYCLES_PMCR_E 1u
-// ThreadMgr's objects, 3.65 (SceThreadmgrForDriver_5053B005).
+// ThreadMgr's objects, 3.65 (SceThreadmgrForDriver_5053B005); 3.60, 3.68 and 3.73 alike.
 #define CYCLES_THREAD_PROCESS 0x18u
 #define CYCLES_PROCESS_PMUSERENR 0x28cu
 #define CYCLES_PROCESS_PMCR 0x290u

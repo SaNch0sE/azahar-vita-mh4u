@@ -1,6 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// azahar-native plugins.c: the kernel modules the console runs besides its firmware, for the
+// app's crash report (azaharKernelPlugins). SceModulemgrForKernel's NIDs changed at 3.63, so
+// both sets are tried. Modules from os0:, vs0: or bootfs: are the firmware's and left out.
 
 #define PLUGINS_LIB_360 0xC445FA63u // SceModulemgrForKernel, 3.60
-#define PLUGINS_LIB_363 0x92C9FFC2u // SceModulemgrForKernel, 3.63-3.68
+#define PLUGINS_LIB_363 0x92C9FFC2u // SceModulemgrForKernel, 3.63-3.73
 #define PLUGINS_MAX_MODULES 256
 
 typedef int (*plugins_list_fn)(SceUID pid, int flags1, int flags2, SceUID *modids, SceSize *num);

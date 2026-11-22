@@ -14,7 +14,8 @@
 // What a take reports. Filled on success and, as far as it got, on failure.
 typedef struct SgxdInfo {
     uint32_t size;           // in: sizeof(SgxdInfo)
-    uint32_t module_nid;     // SceGpuEs4's module NID (0xC0F361A3 on 3.65)
+    uint32_t module_nid;     // SceGpuEs4's module NID (0xC0F361A3 on 3.65, 0x4069F83B on 3.60,
+                             // 0xC01EF58A on 3.68, 0x18EECAEE on 3.73)
     uint32_t step;           // SGXD_STEP_*: the last step started; on failure, the one that failed
     int32_t step_status;     // that step's own status (a kernel error or a register value)
     uint32_t quiesce_tries;  // (0, 0x402) calls until SceGpu reported no bridge call inside
@@ -131,7 +132,7 @@ typedef struct SgxdEvents {
 #define SGXD_MAX_READ_REGS 4096u
 
 // Errors, beyond azahar_native.h's own and the kernel's; SCE-style like those (AZAHAR_ERROR).
-#define SGXD_ERR_FIRMWARE AZAHAR_ERROR(1100)  // SceGpuEs4 is not the build sgxd knows (3.65)
+#define SGXD_ERR_FIRMWARE AZAHAR_ERROR(1100)  // SceGpuEs4 is not a build sgxd knows (3.60, 3.65, 3.68, 3.73)
 #define SGXD_ERR_BUSY AZAHAR_ERROR(1101)      // a SceGpu bridge call stayed inside for the whole quiesce wait
 #define SGXD_ERR_LOST AZAHAR_ERROR(1102)      // the system suspended while owned; take again
 #define SGXD_ERR_HW AZAHAR_ERROR(1103)        // the GPU did not answer with its IDs after the power-up

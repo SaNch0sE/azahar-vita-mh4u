@@ -13,7 +13,7 @@
 #define CORESAMPLE_DBG_SIZE 0x8000u
 #define CORESAMPLE_DBGPCSR 0x084u
 
-// SceKernelThreadMgr's per-CPU blocks (firmware 3.65): its data segment's first word points at
+// SceKernelThreadMgr's per-CPU blocks (firmware 3.65; 3.60, 3.68 and 3.73 alike): its data segment's first word points at
 // cpuCB[0], the four 0x880 bytes apart; +0x00 the running thread's object, +0x14 its pid, +0x18
 // its thread, +0x34 the core's idle thread.
 #define CORESAMPLE_CPUCB_STRIDE 0x880u

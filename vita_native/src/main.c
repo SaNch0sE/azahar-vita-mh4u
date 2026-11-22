@@ -342,7 +342,7 @@ static uint32_t active_cpu_mask(void) {
 // 21: sgxd 10, sgxdMicrokernel: the async lists run by the app's microkernel on the GPU, IRQ 52
 //     for its SW_EVENT only.
 int azaharVersion() {
-    return 61;
+    return AZAHAR_NATIVE_VERSION;
 }
 
 // One read into `out`. Returns the call's own status; the caller decides what a failure means.

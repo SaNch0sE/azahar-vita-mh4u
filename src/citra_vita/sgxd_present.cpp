@@ -483,6 +483,13 @@ bool Initialize(std::string* error) {
            static_cast<u32>(taken), info.step, static_cast<u32>(info.step_status), info.core_id,
            info.take_us);
     CrashReport::NoteGpuDriver(info.module_nid);
+    if (taken == SGXD_ERR_FIRMWARE) {
+        // sgxd knows the GPU drivers of firmware 3.60, 3.65 and 3.68. The firmware's version is no
+        // check: HENkaku spoofs it (3.70) for every caller, the kernel's included.
+        *error = "Azahar needs firmware 3.60, 3.65 or 3.68.";
+        FreeBlocks();
+        return false;
+    }
     if (taken < 0) {
         *error = fmt::format("sgxd: the GPU could not be taken ({:#010x} at step {})",
                              static_cast<u32>(taken), info.step);

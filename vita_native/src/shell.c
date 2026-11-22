@@ -1,20 +1,45 @@
+// SPDX-FileCopyrightText: 2026 Willi Ye
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// azahar-native: SceShell while sgxd holds the GPU (shell_take to shell_give). Its main thread
+// sleeps at SceGpu's gate, and SceAppMgr's watchdog reboots once SceShell has not called
+// sceAppMgrReceiveShellEventNum for 30 s. So:
+// - a thread of ours makes that call's write every 5 s, the same function under the same mutex;
+// - the volume keys are out of SceShell's pad data (it would sleep at its volume bar); our
+//   thread reads them from Syscon every 20 ms for azaharVolumeKeys;
+// - the app steps the system volume (azaharSystemVolume) as SceShell's handler does, past
+//   sceAVConfigSetSystemVol's system-program check: the route, the level under SceAVConfig's
+//   spinlock, event 2. The built-in output's level goes into the registry at the release.
+// Both modules are pinned by their module NIDs and the code of each function used, for 3.60, 3.65,
+// 3.68 and 3.73; with another build the watchdog is left alone and the volume calls fail.
 
 #include <psp2kern/ctrl.h>
 #include <psp2kern/kernel/syscon.h>
 #include <psp2kern/kernel/threadmgr/event_flags.h>
 #include <psp2kern/registrymgr.h>
 
-#define SHELL_APPMGR_NID 0x1C9879D6u
-#define SHELL_FEED 0x9B04u           // the system time into the watchdog's word
+// SceAppMgr's builds: the module NID, then where its two functions are and their code prints:
+// the feed writes the system time into the watchdog's word; the other is
+// sceAppMgrReceiveShellEventNum's body.
+typedef struct {
+    uint32_t nid;
+    uint32_t feed, feed_print;
+    uint32_t event_num, event_num_print;
+} ShellAppMgrBuild;
+static const ShellAppMgrBuild shell_appmgr_builds[] = {
+    {0x1C9879D6u, 0x9B04u, 0xB2883646u, 0x14A50u, 0x03E0F663u}, // 3.65
+    {0xDBB29DB7u, 0x9B04u, 0x94EE7168u, 0x14A50u, 0x74A57E41u}, // 3.60
+    {0xC3C538DEu, 0x9B10u, 0xB2883646u, 0x14A5Cu, 0x391A55DBu}, // 3.68
+    {0xB299D195u, 0x9B18u, 0x1985AA76u, 0x14A84u, 0xB21FD26Bu}, // 3.73
+};
 #define SHELL_FEED_CODE 0x14u
-#define SHELL_FEED_PRINT 0xB2883646u
-#define SHELL_EVENT_NUM 0x14A50u     // sceAppMgrReceiveShellEventNum's body
 #define SHELL_EVENT_NUM_CODE 0x7Cu
-#define SHELL_EVENT_NUM_PRINT 0x03E0F663u
 #define SHELL_MUTEX 0x4A4u           // data: the mutex's UID, then its holder's thread ID
 #define SHELL_FEED_US 5000000u
 
-#define SHELL_AVCONFIG_NID 0x55A6E312u
+// SceAVConfig's builds (3.65, 3.60, 3.68, 3.73): one code and data, the module NID apart.
+static const uint32_t shell_avconfig_nids[] = {0x55A6E312u, 0x222DDEB1u, 0xA1F08F46u,
+                                               0x136D0561u};
 #define SHELL_SET_VOL 0x1F60u        // sceAVConfigSetSystemVol, whose steps these are
 #define SHELL_SET_VOL_CODE 0xA8u
 #define SHELL_SET_VOL_PRINT 0x5AA7379Bu
@@ -56,7 +81,9 @@ static int shell_keys_taken;
 static volatile uint32_t shell_keys_held; // the volume keys held, SCE_CTRL_* bits (shell_main)
 static int shell_volume_start = -1; // the built-in output's level at the take
 
-static int shell_module(const char *name, uint32_t nid, uintptr_t *text, uintptr_t *data) {
+// The module's segments, if its module NID is one of `nids`: *build is its index there.
+static int shell_module(const char *name, const uint32_t *nids, unsigned count, uintptr_t *text,
+                        uintptr_t *data, unsigned *build) {
     tai_module_info_t tai = {.size = sizeof(tai)};
     if (taiGetModuleInfoForKernel(AZAHAR_KERNEL_PID, name, &tai) < 0 ||
         module_get_offset(AZAHAR_KERNEL_PID, tai.modid, 0, 0, text) < 0 ||
@@ -64,11 +91,15 @@ static int shell_module(const char *name, uint32_t nid, uintptr_t *text, uintptr
         SGXD_LOG("shell: %s not found\n", name);
         return 0;
     }
-    if (tai.module_nid != nid) {
-        SGXD_LOG("shell: %s module nid %08x, want %08x\n", name, tai.module_nid, nid);
-        return 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (tai.module_nid == nids[i]) {
+            *build = i;
+            return 1;
+        }
     }
-    return 1;
+    SGXD_LOG("shell: %s module nid %08x is no build known (3.60, 3.65, 3.68, 3.73)\n", name,
+             tai.module_nid);
+    return 0;
 }
 
 static int shell_code(uintptr_t text, uint32_t offset, uint32_t size, uint32_t print) {
@@ -87,13 +118,23 @@ static void shell_identify(void) {
     }
     shell_identified = 1;
     uintptr_t text = 0, data = 0;
-    if (shell_module("SceAppMgr", SHELL_APPMGR_NID, &text, &data) &&
-        shell_code(text, SHELL_FEED, SHELL_FEED_CODE, SHELL_FEED_PRINT) &&
-        shell_code(text, SHELL_EVENT_NUM, SHELL_EVENT_NUM_CODE, SHELL_EVENT_NUM_PRINT)) {
-        shell_feed = (shell_feed_fn)(text + SHELL_FEED + 1);
-        shell_mutex = (volatile SceUID *)(data + SHELL_MUTEX);
+    uint32_t appmgr_nids[sizeof(shell_appmgr_builds) / sizeof(shell_appmgr_builds[0])];
+    for (unsigned i = 0; i < sizeof(appmgr_nids) / sizeof(appmgr_nids[0]); i++) {
+        appmgr_nids[i] = shell_appmgr_builds[i].nid;
     }
-    if (shell_module("SceAVConfig", SHELL_AVCONFIG_NID, &text, &data) &&
+    unsigned build = 0;
+    if (shell_module("SceAppMgr", appmgr_nids, sizeof(appmgr_nids) / sizeof(appmgr_nids[0]),
+                     &text, &data, &build)) {
+        const ShellAppMgrBuild *b = &shell_appmgr_builds[build];
+        if (shell_code(text, b->feed, SHELL_FEED_CODE, b->feed_print) &&
+            shell_code(text, b->event_num, SHELL_EVENT_NUM_CODE, b->event_num_print)) {
+            shell_feed = (shell_feed_fn)(text + b->feed + 1);
+            shell_mutex = (volatile SceUID *)(data + SHELL_MUTEX);
+        }
+    }
+    if (shell_module("SceAVConfig", shell_avconfig_nids,
+                     sizeof(shell_avconfig_nids) / sizeof(shell_avconfig_nids[0]), &text, &data,
+                     &build) &&
         shell_code(text, SHELL_SET_VOL, SHELL_SET_VOL_CODE, SHELL_SET_VOL_PRINT) &&
         shell_code(text, SHELL_ROUTE, SHELL_ROUTE_CODE, SHELL_ROUTE_PRINT) &&
         shell_code(text, SHELL_EVENT, SHELL_EVENT_CODE, SHELL_EVENT_PRINT)) {

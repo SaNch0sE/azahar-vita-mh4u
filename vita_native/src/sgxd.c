@@ -84,8 +84,13 @@ int ksceKernelUnregisterSysEventHandler(SceUID uid);
 #define SGXD_EXPECT_CORE_ID 0x01174403u
 #define SGXD_EXPECT_CORE_REVISION 0x00020106u
 
-// SceGpuEs4 3.65. The module NID pins the build; the fingerprints pin what is called and read.
-#define SGXD_GPU_MODULE_NID 0xC0F361A3u
+// SceGpuEs4 3.65, and 3.60's, 3.68's and 3.73's, whose text and data are 3.65's but for the
+// module NID and the SDK version word, so one set of offsets serves all four. The module NID pins
+// the build; the fingerprints pin what is called and read.
+#define SGXD_GPU_MODULE_NID 0xC0F361A3u     // 3.65
+#define SGXD_GPU_MODULE_NID_360 0x4069F83Bu // 3.60
+#define SGXD_GPU_MODULE_NID_368 0xC01EF58Au // 3.68
+#define SGXD_GPU_MODULE_NID_373 0x18EECAEEu // 3.73
 #define SGXD_GPU_SYSEVENT 0x7764u         // GpuSysEventHandler, Thumb
 #define SGXD_GPU_SYSEVENT_CODE 0x70u      // its code, up to the literal pool the loader relocates
 #define SGXD_GPU_SYSEVENT_PRINT 0x35E469F5u
@@ -225,8 +230,12 @@ static int sgxd_identify(SgxdInfo *info) {
         return AZAHAR_ERR_RESOLVE;
     }
     info->module_nid = tai.module_nid;
-    if (tai.module_nid != SGXD_GPU_MODULE_NID) {
-        SGXD_LOG("SceGpuEs4 module nid %08x, want %08x\n", tai.module_nid, SGXD_GPU_MODULE_NID);
+    if (tai.module_nid != SGXD_GPU_MODULE_NID && tai.module_nid != SGXD_GPU_MODULE_NID_360 &&
+        tai.module_nid != SGXD_GPU_MODULE_NID_368 && tai.module_nid != SGXD_GPU_MODULE_NID_373) {
+        SGXD_LOG("SceGpuEs4 module nid %08x, want %08x (3.65), %08x (3.60), %08x (3.68) or %08x "
+                 "(3.73)\n",
+                 tai.module_nid, SGXD_GPU_MODULE_NID, SGXD_GPU_MODULE_NID_360,
+                 SGXD_GPU_MODULE_NID_368, SGXD_GPU_MODULE_NID_373);
         return SGXD_ERR_FIRMWARE;
     }
     uintptr_t text = 0, data = 0;

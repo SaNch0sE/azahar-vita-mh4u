@@ -137,7 +137,11 @@ int _vita_net_init(void);
 // 50: azaharSystemVolume; SceAppMgr's shell watchdog fed while sgxd owns the GPU.
 // 52: AzaharRunRequest.pmu_* and tlb_probe gone.
 // 53: page moves leave the GPU's mapping to the emulator, which remaps it in the GPU's order.
-constexpr int MinAzaharNativeVersion = 53;
+// 62: firmware 3.60 known (a 3.60 console that ran an older build still has its module).
+// 63: azaharVolumeKeys, the volume keys from Syscon (no SceCtrl mask gave them to the app).
+// 64: page moves up to 32 MiB in all (the CDRAM pool for moved FCRAM grows).
+// 69: sgxdResumed, the GPU taken again after a suspend.
+constexpr int MinAzaharNativeVersion = 69;
 
 namespace {
 /// The process's own arguments, kept for LaunchParameter.

@@ -108,8 +108,8 @@ static int klog_find_slots(uintptr_t fn, uint32_t **handler_slot, uint32_t **arg
     return 0;
 }
 
-// SceDebugForKernel's registration: 3.65's NIDs, then 3.60's. Without the slots, which the
-// handler has to be put back from, klog stays out.
+// SceDebugForKernel's registration: 3.65's NIDs (3.68's and 3.73's too), then 3.60's. Without
+// the slots, which the handler has to be put back from, klog stays out.
 static int klog_start(void) {
     static const uint32_t nids[2][2] = {{0x13D793B7, 0x88AD6D0C}, {0x88C17370, 0x10067B7B}};
     klog_register_fn reg = NULL;
