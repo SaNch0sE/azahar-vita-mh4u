@@ -220,6 +220,7 @@ endif()
 
 if (VITA)
     add_subdirectory(citra_vita)
+    add_subdirectory(sgxd_test)
 endif()
 
 if (ENABLE_ROOM)

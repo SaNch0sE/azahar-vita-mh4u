@@ -88,15 +88,19 @@ typedef struct AzaharEditRequest {
     AzaharRange range;     // user_va is ignored for UNMAP; perm is ignored for UNMAP
 } AzaharEditRequest;
 
-// Error codes (negative), beyond the kernel's own.
-#define AZAHAR_ERR_STATE (-1000)      // call out of order (map before take, run before map...)
-#define AZAHAR_ERR_ARG (-1001)        // bad request (alignment, count, perm)
-#define AZAHAR_ERR_RESOLVE (-1002)    // a kernel export needed did not resolve
-#define AZAHAR_ERR_ALLOC (-1003)      // a kernel allocation failed
-#define AZAHAR_ERR_CORE (-1004)       // the core could not be taken, or the thread did not answer
-#define AZAHAR_ERR_TABLE (-1005)      // the table could not be built (kernel L1 not found, gap)
-#define AZAHAR_ERR_PAGE (-1006)       // a user page did not translate
-#define AZAHAR_ERR_TIMEOUT (-1007)    // the core-2 thread did not complete a command in time
+// Error codes, beyond the kernel's own. They are SCE-style, bit 31 set and bit 30 clear: the
+// syscall return path clears bit 30 of a negative result, so a plain negative number reaches
+// user code changed (measured: -1102, 0xFFFFFBB2, arrives as 0xBFFFFBB2) and would
+// not compare equal there.
+#define AZAHAR_ERROR(n) ((int)(0x80A50000u | (n)))
+#define AZAHAR_ERR_STATE AZAHAR_ERROR(1000)    // call out of order (map before take, run before map...)
+#define AZAHAR_ERR_ARG AZAHAR_ERROR(1001)      // bad request (alignment, count, perm)
+#define AZAHAR_ERR_RESOLVE AZAHAR_ERROR(1002)  // a kernel export needed did not resolve
+#define AZAHAR_ERR_ALLOC AZAHAR_ERROR(1003)    // a kernel allocation failed
+#define AZAHAR_ERR_CORE AZAHAR_ERROR(1004)     // the core could not be taken, or the thread did not answer
+#define AZAHAR_ERR_TABLE AZAHAR_ERROR(1005)    // the table could not be built (kernel L1 not found, gap)
+#define AZAHAR_ERR_PAGE AZAHAR_ERROR(1006)     // a user page did not translate
+#define AZAHAR_ERR_TIMEOUT AZAHAR_ERROR(1007)  // the core-2 thread did not complete a command in time
 
 #ifdef __cplusplus
 extern "C" {

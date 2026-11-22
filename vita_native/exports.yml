@@ -16,4 +16,8 @@ azaharnative:
         - azaharRelease: 0x3C1A7E04
         - azaharEdit: 0x3C1A7E05
         - azaharVersion: 0x3C1A7E0A
+        - sgxdTake: 0x3C1A7E10
+        - sgxdRelease: 0x3C1A7E11
+        - sgxdSubmit: 0x3C1A7E12
+        - sgxdDump: 0x3C1A7E13
         - azaharModuleUid: 0x3C1A7E35

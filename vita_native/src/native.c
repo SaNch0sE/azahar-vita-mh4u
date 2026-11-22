@@ -891,8 +891,11 @@ static int azahar_stop_resident(void) {
     return 0;
 }
 
+static void sgxd_on_proc_gone(SceUID pid);   // sgxd.c
+
 // The client process is gone: same teardown as azaharRelease, which the two paths share below.
 static int azahar_on_proc_gone(SceUID pid) {
+    sgxd_on_proc_gone(pid);
     if (pid != azahar_client_pid || azahar_state == ST_NONE) {
         return 0;
     }
