@@ -1658,10 +1658,12 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
         new_3ds =
             mem_mode == Kernel::MemoryMode::NewProd || mem_mode == Kernel::MemoryMode::NewDev1;
         SavestateTrace("re-initialising");
+        ReportStateProgress(StatePhase::Restarting, 0.0f);
 
         [[maybe_unused]] const System::ResultStatus result =
             Init(*m_emu_window, m_secondary_window, mem_mode, num_cores);
         SavestateTrace("re-initialised");
+        ReportStateProgress(StatePhase::Restarting, 1.0f);
     }
 
     // Flush on save, don't flush on load - but only where the cache knows what the guest has

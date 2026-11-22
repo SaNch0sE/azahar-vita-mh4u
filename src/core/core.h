@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -508,6 +509,22 @@ public:
 
     /// Accept a state saved by another build of the same serialization layout (the Vita
     /// autoload restores states other builds saved; every commit changes the revision).
+    /// Where a savestate's save or load has got to, for a frontend's progress bar: a save
+    /// streams the state into the file; a load reads the file, restarts the system, then restores
+    /// the state from what it read.
+    enum class StatePhase { Saving, Reading, Restarting, Restoring };
+    /// Called on the thread that saves or loads, with the phase and how far through it (0 to 1),
+    /// a few times a megabyte; the load's Restarting while no GPU exists.
+    using StateProgressCallback = std::function<void(StatePhase phase, float fraction)>;
+    void SetStateProgressCallback(StateProgressCallback callback) {
+        state_progress = std::move(callback);
+    }
+    void ReportStateProgress(StatePhase phase, float fraction) const {
+        if (state_progress) {
+            state_progress(phase, fraction);
+        }
+    }
+
     void SetLoadStateAnyBuild(bool accept) {
         load_state_any_build = accept;
     }
@@ -674,6 +691,7 @@ private:
     SaveStateStatus save_state_status = SaveStateStatus::NONE;
     SaveStateStatus save_state_request_status = SaveStateStatus::NONE;
     bool load_state_any_build = false;
+    StateProgressCallback state_progress;
     bool state_load_partial = false;
     u32 save_state_slot = 0;
     std::chrono::steady_clock::time_point save_state_request_time{};

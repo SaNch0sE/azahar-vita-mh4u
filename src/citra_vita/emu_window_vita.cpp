@@ -658,6 +658,16 @@ PresentTimes TakePresentTimes() {
 }
 #endif
 
+void EmuWindowVita::PresentInterfaceOnly(Ui* ui) {
+    SgxdPresent::WaitDrawn();
+    if (SgxdPresent::Busy()) {
+        return;
+    }
+    SgxdPresent::BeginFrame(0, 0, 0);
+    ui->Draw();
+    SgxdPresent::EndFrame();
+}
+
 void EmuWindowVita::Present(Ui* ui, bool update) {
     SgxdRenderer::SgxdDrainKernelLog();
 #ifdef VITA_DIAGNOSTICS

@@ -3,10 +3,11 @@
 // Refer to the license.txt file included.
 
 #include <chrono>
+#include <functional>
 #include <sstream>
-#include <zstd.h>
 #include <cryptopp/hex.h>
 #include <fmt/ranges.h>
+#include <zstd.h>
 #include "common/archives.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
@@ -16,10 +17,11 @@
 #include "core/core.h"
 #include "core/hle/kernel/thread.h"
 #include "core/loader/loader.h"
+#include "core/memory.h"
 #include "core/movie.h"
 #include "core/savestate.h"
-#include "video_core/gpu.h"
 #include "network/network.h"
+#include "video_core/gpu.h"
 
 namespace Core {
 
@@ -32,7 +34,9 @@ namespace {
  */
 class ZstdFileOStreamBuf final : public std::streambuf {
 public:
-    explicit ZstdFileOStreamBuf(FileUtil::IOFile& file_) : file{file_} {
+    /// `progress`: called with the bytes compressed so far, each megabyte.
+    ZstdFileOStreamBuf(FileUtil::IOFile& file_, std::function<void(u64)> progress_)
+        : file{file_}, progress{std::move(progress_)} {
         cctx = ZSTD_createCCtx();
         // The fastest regular level: at the default level 3 a Vita spends most of a save
         // compressing.
@@ -85,9 +89,17 @@ private:
         } while (mode == ZSTD_e_end ? remaining != 0 : input.pos < input.size);
         setp(reinterpret_cast<char*>(in_buffer.data()),
              reinterpret_cast<char*>(in_buffer.data() + in_buffer.size()));
+        bytes_in += input.size;
+        if (progress && bytes_in - reported >= (1u << 20)) {
+            reported = bytes_in;
+            progress(bytes_in);
+        }
     }
 
     FileUtil::IOFile& file;
+    std::function<void(u64)> progress;
+    u64 bytes_in = 0;
+    u64 reported = 0;
     ZSTD_CCtx* cctx{};
     std::vector<u8> in_buffer;
     std::vector<u8> out_buffer;
@@ -98,7 +110,9 @@ private:
 /// image (the compressed input stays in memory; it is a fifth of the size).
 class ZstdIStreamBuf final : public std::streambuf {
 public:
-    explicit ZstdIStreamBuf(std::span<const u8> compressed_) : compressed{compressed_} {
+    /// `progress`: called with the share of the input decompressed so far, each megabyte of it.
+    ZstdIStreamBuf(std::span<const u8> compressed_, std::function<void(float)> progress_)
+        : compressed{compressed_}, progress{std::move(progress_)} {
         dctx = ZSTD_createDCtx();
         out_buffer.resize(ZSTD_DStreamOutSize());
         input = {compressed.data(), compressed.size(), 0};
@@ -128,10 +142,16 @@ private:
         }
         char* base = reinterpret_cast<char*>(out_buffer.data());
         setg(base, base, base + output.pos);
+        if (progress && input.pos - reported >= (1u << 20)) {
+            reported = input.pos;
+            progress(static_cast<float>(input.pos) / static_cast<float>(input.size));
+        }
         return traits_type::to_int_type(*gptr());
     }
 
     std::span<const u8> compressed;
+    std::function<void(float)> progress;
+    std::size_t reported = 0;
     ZSTD_DCtx* dctx{};
     ZSTD_inBuffer input{};
     std::vector<u8> out_buffer;
@@ -341,23 +361,9 @@ void System::SaveState(u32 slot) const {
         FileUtil::Delete(part);
         throw;
     }
-
-    // A backend that rewrote guest code (the Vita's VFP thunks) puts the guest's own back: the
-    // state holds the title's code, and a load patches it again as it traps.
-    for (const auto& cpu_core : cpu_cores) {
-        cpu_core->PrepareSaveState();
-    }
-
-    // Serialize straight through the compressor into the file.
-    ZstdFileOStreamBuf zstd_buf{file};
-    std::ostream stream{&zstd_buf};
-    {
-        oarchive oa{stream};
-        oa&* this;
-    }
-    stream.flush();
-    if (!zstd_buf.Finish()) {
-        throw std::runtime_error("Could not write to file " + path);
+    file.Close();
+    if (!FileUtil::Delete(path) || !FileUtil::Rename(part, path)) {
+        throw std::runtime_error("Could not replace " + path);
     }
 }
 
@@ -422,15 +428,23 @@ void System::LoadState(u32 slot) {
             throw std::runtime_error("Invalid savestate");
         }
 
-        if (file.ReadBytes(buffer.data(), buffer.size()) != buffer.size()) {
-            throw std::runtime_error("Could not read from file at " + path);
+        // In parts, for the progress: the memory card reads ~8 MB a second.
+        constexpr std::size_t Part = 4u << 20;
+        for (std::size_t at = 0; at < buffer.size(); at += Part) {
+            const std::size_t part = std::min(Part, buffer.size() - at);
+            if (file.ReadBytes(buffer.data() + at, part) != part) {
+                throw std::runtime_error("Could not read from file at " + path);
+            }
+            ReportStateProgress(StatePhase::Reading,
+                                static_cast<float>(at + part) / static_cast<float>(buffer.size()));
         }
     }
 
     LOG_INFO(Core, "savestate: {} compressed bytes read", buffer.size());
     // Deserialize, decompressing as the archive reads; only the compressed image is resident.
     {
-        ZstdIStreamBuf zstd_buf{buffer};
+        ZstdIStreamBuf zstd_buf{
+            buffer, [this](float share) { ReportStateProgress(StatePhase::Restoring, share); }};
         std::istream stream{&zstd_buf};
         iarchive ia{stream};
         LOG_INFO(Core, "savestate: archive open");

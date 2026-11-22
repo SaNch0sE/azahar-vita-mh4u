@@ -81,6 +81,10 @@ public:
     /// presents. `ui` may be null, in which case only the screens are drawn. The interface
     /// SetUi attached is built first unless `update` is false (the caller built it).
     void Present(Ui* ui, bool update = true);
+    /// The interface alone on black, without the guest's screens: a savestate's progress, while
+    /// the screens' memory may be the load's to replace. The caller keeps the render thread from
+    /// presenting meanwhile (GPU::RenderHold), or there is none.
+    void PresentInterfaceOnly(Ui* ui);
 
     /// Hands the interface to SwapBuffers, which builds and draws it from then on. Null
     /// detaches it again.

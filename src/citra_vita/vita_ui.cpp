@@ -16,6 +16,7 @@
 #include <imgui_vita2d/imgui.h>
 #include <imgui_vita2d/imgui_internal.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/rtc.h>
 
 #include "citra_vita/imgui_impl_sgxd.h"
 #include "citra_vita/imgui_impl_vita.h"
@@ -36,6 +37,8 @@
 #include "core/core.h"
 #include "core/loader/loader.h"
 #include "core/loader/smdh.h"
+#include "core/movie.h"
+#include "core/savestate.h"
 
 namespace VitaFrontend {
 
@@ -92,6 +95,19 @@ bool NaturalLess(const std::string& a, const std::string& b) {
         j++;
     }
     return a.size() - i < b.size() - j;
+}
+
+/// A savestate's time (seconds from 1970, UTC) as the console's local date and time.
+std::string LocalTimeText(u64 seconds) {
+    SceDateTime utc{};
+    sceRtcSetTime64_t(&utc, seconds);
+    SceRtcTick utc_tick{}, local_tick{};
+    sceRtcGetTick(&utc, &utc_tick);
+    sceRtcConvertUtcToLocalTime(&utc_tick, &local_tick);
+    SceDateTime local{};
+    sceRtcSetTick(&local, &local_tick);
+    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}", local.year, local.month, local.day,
+                       local.hour, local.minute);
 }
 
 /// Where Ui keeps the titles' names between runs (Ui::title_cache): a line a file, its size, path
@@ -1022,8 +1038,13 @@ void Ui::SetStatusMessage(std::string message) {
     status_message = std::move(message);
 }
 
+void Ui::SetProgress(float fraction) {
+    status_progress = std::clamp(fraction, 0.0f, 1.0f);
+}
+
 void Ui::ClearStatusMessage() {
     status_message.clear();
+    status_progress = -1.0f;
 }
 
 void Ui::OpenSettings(std::string title, std::string name, State back, u64 program_id) {
@@ -1673,6 +1694,10 @@ Ui::Action Ui::DrawPauseMenu() {
     }
     // The settings for all games are the game list's alone: in a game, its own.
     if (tile("Save states", Icon::Disk)) {
+        // The slots as the card holds them now (a save since adds one).
+        u64 program_id = 0;
+        system.GetAppLoader().ReadProgramId(program_id);
+        slot_states = Core::ListSaveStates(program_id, system.Movie().GetCurrentMovieID());
         state = State::Savestates;
         overlay_focused = false;
         focus_first_row = true;
@@ -1720,21 +1745,52 @@ Ui::Action Ui::DrawSavestates() {
         const float width = ImGui::GetContentRegionAvail().x;
         ImGui::GetWindowDrawList()->AddRectFilled(at, at + ImVec2(width, 52.0f),
                                                   Colour(Palette::Row), RowRounding);
-        ImGui::SetCursorScreenPos(at + ImVec2(18.0f, (52.0f - ImGui::GetFontSize()) * 0.5f));
-        ImGui::Text("Slot %u", slot);
+        // The slot's state: when it was saved (the console's local time), from a version whose
+        // states this one can't load (another savestate format), or none.
+        const auto saved =
+            std::find_if(slot_states.begin(), slot_states.end(),
+                         [slot](const Core::SaveStateInfo& s) { return s.slot == slot; });
+        std::string info = "Empty";
+        if (saved != slot_states.end()) {
+            info = LocalTimeText(saved->time);
+            if (saved->status == Core::SaveStateInfo::ValidationStatus::BuildMismatch) {
+                info += "  (another build's)";
+            }
+        }
+        const float text_y = at.y + (52.0f - ImGui::GetFontSize()) * 0.5f;
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        dl->AddText(ImVec2(at.x + 18.0f, text_y), Colour(Palette::Text),
+                    fmt::format("Slot {}", slot).c_str());
+        dl->AddText(ImVec2(at.x + 110.0f, text_y),
+                    Colour(saved != slot_states.end() ? Palette::Text : Palette::TextDim),
+                    info.c_str());
         ImGui::SetCursorScreenPos(at + ImVec2(width - 2.0f * button.x - 16.0f, 6.0f));
         if (ImGui::Button("Save", button)) {
             selected_slot = slot;
-            action = Action::SaveState;
+            if (saved != slot_states.end()) {
+                question = Question::SaveOver;
+            } else {
+                action = Action::SaveState;
+            }
         }
         if (focus_first_row && slot == 1) {
             focus_first_row = false;
             FocusLastItem();
         }
         ImGui::SameLine(0.0f, 8.0f);
-        if (ImGui::Button("Load", button)) {
+        // Another format's state is refused by the core: nothing to load either.
+        const bool loadable =
+            saved != slot_states.end() &&
+            saved->status != Core::SaveStateInfo::ValidationStatus::BuildMismatch;
+        if (!loadable) {
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.4f);
+        }
+        if (ImGui::Button("Load", button) && loadable) {
             selected_slot = slot;
-            action = Action::LoadState;
+            question = Question::LoadSlot;
+        }
+        if (!loadable) {
+            ImGui::PopStyleVar();
         }
         ImGui::SetCursorScreenPos(at + ImVec2(0.0f, 52.0f + 6.0f));
         ImGui::Dummy(ImVec2(0.0f, 0.0f));
@@ -1927,13 +1983,28 @@ void Ui::DrawStatusMessage() {
     // A panel as tall as its text, the text centred in it (a line across, wrapped lines left).
     constexpr float Width = 560.0f;
     constexpr float Padding = 28.0f;
+    // With a progress: a bar under the text, its share filled in the accent colour.
+    constexpr float BarHeight = 12.0f;
+    constexpr float BarGap = 18.0f;
+    const bool bar = status_progress >= 0.0f;
     const ImVec2 text =
         ImGui::CalcTextSize(status_message.c_str(), nullptr, false, Width - 2.0f * Padding);
-    BeginCentered("##status", Width, text.y + 2.0f * Padding);
+    BeginCentered("##status", Width, text.y + 2.0f * Padding + (bar ? BarGap + BarHeight : 0.0f));
     ImGui::SetCursorPos(ImVec2(std::max(Padding, (Width - text.x) * 0.5f), Padding));
     ImGui::PushTextWrapPos(Width - Padding);
     ImGui::TextUnformatted(status_message.c_str());
     ImGui::PopTextWrapPos();
+    if (bar) {
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        const ImVec2 min = ImGui::GetWindowPos() + ImVec2(Padding, Padding + text.y + BarGap);
+        const ImVec2 max = min + ImVec2(Width - 2.0f * Padding, BarHeight);
+        dl->AddRectFilled(min, max, Colour(Palette::SwitchOff), BarHeight * 0.5f);
+        if (status_progress > 0.0f) {
+            const float filled = std::max(BarHeight, (max.x - min.x) * status_progress);
+            dl->AddRectFilled(min, ImVec2(min.x + filled, max.y), Colour(Palette::Accent),
+                              BarHeight * 0.5f);
+        }
+    }
     ImGui::End();
 }
 

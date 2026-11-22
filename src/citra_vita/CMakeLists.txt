@@ -92,6 +92,7 @@ function(citra_vita_executable target titleid)
         SceShellSvc_stub
         SceAppMgr_stub
         SceAppUtil_stub
+        SceRtc_stub
         SceKernelDmacMgr_stub
         SceKernelModulemgr_stub
         SceVshBridge_stub

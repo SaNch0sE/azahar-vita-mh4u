@@ -11,6 +11,8 @@
 #include "citra_vita/config.h"
 #include "citra_vita/multiplayer.h"
 #include "common/common_types.h"
+#include "core/loader/title_patches.h"
+#include "core/savestate.h"
 
 namespace Core {
 class System;
@@ -87,6 +89,7 @@ public:
     /// Shows a full-screen message instead of a menu, for the stretches where the frontend is
     /// busy and the display would otherwise sit on a stale frame.
     void SetStatusMessage(std::string message);
+    void SetProgress(float fraction);
     void ClearStatusMessage();
 
 private:
@@ -142,6 +145,7 @@ private:
     bool title_cache_loaded = false;
     void LoadTitleCache();
     void SaveTitleCache() const;
+    std::vector<Core::SaveStateInfo> slot_states;
 
     void BuildRows();
     void ScanGames();
@@ -189,6 +193,7 @@ private:
     std::string selected_game_path;
     u32 selected_slot{};
     std::string status_message;
+    float status_progress = -1.0f; ///< SetProgress's; below 0, no bar
 
     std::vector<GameEntry> games;
     int selected_game{};

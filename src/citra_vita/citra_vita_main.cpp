@@ -1034,6 +1034,29 @@ void LogGuestThreads(Core::System& system) {
  * layout is what has to match, not the revision (a scene saved once is loaded into the builds
  * after it).
  */
+/// A savestate's save or load refused or failed with the title still running: what to do next.
+std::string StateErrorText(bool load, u32 slot) {
+    if (!load) {
+        return TrFormat("Slot {} was not saved. Make sure the memory card has free space, then save "
+                        "again.",
+                        slot);
+    }
+    if (VitaFrontend::Multiplayer::InRoom()) {
+        return TrFormat("Slot {} can't be loaded in a multiplayer room. Leave the room, then load "
+                        "it again.",
+                        slot);
+    }
+    return TrFormat("Slot {} could not be loaded. Save to it again, or load another slot.", slot);
+}
+
+/// A load that stopped partway, which stops the title: the game list's notice.
+std::string PartialLoadNotice(u32 slot) {
+    return TrFormat("Slot {} could not be loaded, so the game was stopped. Start the game again, "
+                    "and save to that slot again before you load it.",
+                    slot) +
+           "\n\n" + Tr("Press X or O to continue.");
+}
+
 void RestoreStateAtStart(Core::System& system, u32 slot) {
     system.SetLoadStateAnyBuild(true);
     if (!system.SendSignal(Core::System::Signal::Load, slot)) {
@@ -1172,15 +1195,74 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         }
     }
 #endif
+    // A savestate's save or load: a panel with its progress on black, ten times a second. This
+    // thread presents, with the render thread held (it may still be drawing the frames before a
+    // save); the load's restart has none. The share of each load phase is from a load of RE
+    u32 progress_slot = 0;
+    u64 progress_shown = 0;
+    system.SetStateProgressCallback([&](Core::System::StatePhase phase, float fraction) {
+        using Phase = Core::System::StatePhase;
+        const u64 now = sceKernelGetProcessTimeWide();
+        if (now - progress_shown < 100'000) {
+            return;
+        }
+        progress_shown = now;
+        float overall = fraction;
+        switch (phase) {
+        case Phase::Saving:
+            break;
+        case Phase::Reading:
+            overall = 0.36f * fraction;
+            break;
+        case Phase::Restarting:
+            overall = 0.36f + 0.23f * fraction;
+            break;
+        case Phase::Restoring:
+            overall = 0.59f + 0.41f * fraction;
+            break;
+        }
+        ui.SetStatusMessage(fmt::format(
+            "{} slot {}...", phase == Phase::Saving ? "Saving" : "Loading", progress_slot));
+        ui.SetProgress(overall);
+        std::optional<VideoCore::GPU::RenderHold> hold;
+        if (phase != Phase::Restarting) {
+            hold.emplace(system.GPU());
+        }
+        ui.Update();
+        window.PresentInterfaceOnly(&ui);
+    });
+    // The callback holds this function's locals: gone with them, whichever way it returns.
+    struct ProgressReset {
+        Core::System& system;
+        ~ProgressReset() {
+            system.SetStateProgressCallback({});
+        }
+    } progress_reset{system};
     if (state_arguments.load >= 0) {
+        progress_slot = static_cast<u32>(state_arguments.load);
         window.SetLoading(true);
         RestoreStateAtStart(system, static_cast<u32>(state_arguments.load));
         window.SetLoading(false);
+        ui.ClearStatusMessage();
         if (system.IsStateLoadPartial()) {
             sceClibPrintf("[azahar] savestate: the load stopped partway; the title is stopped\n");
+            g_crash_notice = PartialLoadNotice(progress_slot);
             window.RequestQuit(false);
         }
     }
+    // A failed save or load's text over the paused game, for three seconds.
+    const auto show_state_error = [&](const std::string& text) {
+        ui.SetStatusMessage(text);
+        const auto present = [&] {
+            ui.Update();
+            window.PresentInterfaceOnly(&ui);
+        };
+        for (int i = 0; i < 180; i++) {
+            system.GPU().GetRenderThread().RunSync(present);
+            sceDisplayWaitVblankStart();
+        }
+        ui.ClearStatusMessage();
+    };
     // `save=N@T`: once the title has run T seconds (real time, from here).
     const SceUInt64 title_start_us = sceKernelGetProcessTimeWide();
     bool state_save_sent = false;
@@ -1215,11 +1297,13 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             ui.LeaveGame();
             return action == VitaFrontend::Ui::Action::QuitGame;
         case VitaFrontend::Ui::Action::SaveState:
+            progress_slot = ui.SelectedSlot();
             state_watch_is_load = false;
             state_watch = system.SendSignal(Core::System::Signal::Save, ui.SelectedSlot());
             sceClibPrintf("[azahar] savestate: saving slot %u from the menu\n", ui.SelectedSlot());
             break;
         case VitaFrontend::Ui::Action::LoadState:
+            progress_slot = ui.SelectedSlot();
             state_watch_is_load = true;
             state_watch = system.SendSignal(Core::System::Signal::Load, ui.SelectedSlot());
             sceClibPrintf("[azahar] savestate: loading slot %u from the menu\n", ui.SelectedSlot());
@@ -1231,6 +1315,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         if (state_arguments.save >= 0 && !state_save_sent &&
             sceKernelGetProcessTimeWide() - title_start_us >= state_arguments.save_after_us) {
             state_save_sent = true;
+            progress_slot = static_cast<u32>(state_arguments.save);
             state_watch_is_load = false;
             state_watch = system.SendSignal(Core::System::Signal::Save,
                                             static_cast<u32>(state_arguments.save));
@@ -1244,6 +1329,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 const bool load = !save && std::sscanf(command.c_str(), "load %d", &slot) == 1;
                 if ((save || load) && slot >= 0) {
                     system.SetLoadStateAnyBuild(true);
+                    progress_slot = static_cast<u32>(slot);
                     state_watch_is_load = load;
                     state_watch = system.SendSignal(save ? Core::System::Signal::Save
                                                          : Core::System::Signal::Load,
@@ -1331,11 +1417,15 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         if (state_watch && !system.IsSaveStateRequestPending()) {
             state_watch = false;
             window.SetLoading(false);
+            ui.ClearStatusMessage();
             const bool ok = status == Core::System::ResultStatus::Success;
             sceClibPrintf("[azahar] savestate: %s%s\n",
                           ok ? "done" : "failed: ", ok ? "" : system.GetStatusDetails().c_str());
             if (ok && state_watch_is_load) {
                 VitaFrontend::CrashReport::NoteStateLoaded(progress_slot);
+            }
+            if (!ok && !system.IsStateLoadPartial()) {
+                show_state_error(StateErrorText(state_watch_is_load, progress_slot));
             }
         }
         if (status == Core::System::ResultStatus::ErrorSavestate && system.IsStateLoadPartial()) {
@@ -1343,9 +1433,12 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             // (part the old one, part the file's): back to the game list.
             sceClibPrintf("[azahar] savestate: the load stopped partway; the title is stopped\n");
             LOG_CRITICAL(Frontend, "Savestate load stopped partway: {}", system.GetStatusDetails());
+            g_crash_notice = PartialLoadNotice(progress_slot);
             window.RequestQuit(false);
-        } else if (status == Core::System::ResultStatus::ErrorSavestate) {
-            // A refused save or load is not fatal; the title keeps running.
+        } else if (status == Core::System::ResultStatus::ErrorSavestate ||
+                   status == Core::System::ResultStatus::ErrorSavestateBuildMismatch) {
+            // A refused save or load is not fatal; the title keeps running. Another build's
+            // state is refused before anything of it is read.
             LOG_ERROR(Frontend, "Savestate operation failed");
         } else if (status != Core::System::ResultStatus::Success) {
             LOG_CRITICAL(Frontend, "Emulation stopped: {}", static_cast<int>(status));
@@ -1885,6 +1978,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     }
 
     window.SetPauseMenu(nullptr);
+    window.SetInputToGuest(true);
     window.SetLoading(false);
     window.SetUi(nullptr);
     ShutdownSystem(system, threads_before);
@@ -1892,6 +1986,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     VitaFrontend::CrashReport::NoteCheats(nullptr);
     VitaFrontend::CrashReport::NoteGame({}, 0, {});
     Config::Save();
+    // A stopped title can leave the interface on a pause screen: back to the game list.
+    ui.LeaveGame();
     return true;
 }
 
