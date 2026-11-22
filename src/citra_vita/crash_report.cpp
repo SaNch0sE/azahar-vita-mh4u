@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <string>
@@ -28,13 +29,20 @@
 
 #include <psp2/appmgr.h>
 #include <psp2/display.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/rtc.h>
 #include <unwind.h>
+#include <zlib.h>
+
+#include <cryptopp/sha.h>
+#include <fmt/format.h>
 
 #include "audio_core/hle/hle.h"
 #include "azahar_native.h"
@@ -42,6 +50,7 @@
 #include "citra_vita/crash_report.h"
 #include "common/assert.h"
 #include "common/logging/backend.h"
+#include "common/logging/log.h"
 #include "common/named_thread.h"
 #include "common/scm_rev.h"
 #include "core/cheats/cheat_base.h"
@@ -1137,6 +1146,10 @@ int ProbeEntry(SceSize, void*) {
     return 0;
 }
 
+/// A core whose probe did not run (ProbeCores), -1 for none: a core dump would wait for it for
+/// good, as the suspend of every thread does.
+std::atomic<int> stopped_core{-1};
+
 /// Whether each core still runs a thread of ours: a probe pinned to it in turn, given 200 ms to
 /// run and end. A render thread ready to run that never runs leaves this open: its core stopped,
 /// or the thread did.
@@ -1161,6 +1174,7 @@ void ProbeCores() {
             sceKernelDeleteThread(t);
             continue;
         }
+        stopped_core = core;
         // A core that runs nothing of ours: what it runs instead, three times 50 ms apart.
         for (int k = 0; k < 3; k++) {
             AzaharCoreSample cs{};
@@ -1185,6 +1199,34 @@ void ProbeCores() {
                       static_cast<unsigned>(cs.pcs[7]));
             sceKernelDelayThread(50 * 1000);
         }
+    }
+}
+
+/// The module's stray exceptions (azaharStray): code of its own that faulted outside the guest's,
+/// which parks a core that has no slice to end. The instruction, and an abort's address.
+void PrintStrays() {
+    static constexpr const char* Names[] = {"exception", "svc", "undefined instruction",
+                                            "prefetch abort", "data abort"};
+    for (u32 core = 0; core < 4; core++) {
+        AzaharStray s{};
+        const int got = azaharStray(core, &s);
+        if (got < 0 || s.count == 0) {
+            continue;
+        }
+        s.module_name[sizeof(s.module_name) - 1] = '\0';
+        const bool thumb = (s.spsr & (1u << 5)) != 0;
+        const u32 at = s.lr - (s.reason == 4 ? 8u : (thumb && s.reason != 3) ? 2u : 4u);
+        StallLine("[azahar] stray: core %u: %u, the first a %s at %s+%x (LR %08x, SPSR %08x); "
+                  "DFSR %08x DFAR %08x IFSR %08x IFAR %08x; %u retries; slice step %u; %u slices "
+                  "ended so far\n",
+                  static_cast<unsigned>(core), static_cast<unsigned>(s.count),
+                  s.reason < std::size(Names) ? Names[s.reason] : Names[0],
+                  s.module_text != 0 ? s.module_name : "?",
+                  static_cast<unsigned>(at - s.module_text), static_cast<unsigned>(s.lr),
+                  static_cast<unsigned>(s.spsr), static_cast<unsigned>(s.dfsr),
+                  static_cast<unsigned>(s.dfar), static_cast<unsigned>(s.ifsr),
+                  static_cast<unsigned>(s.ifar), static_cast<unsigned>(s.retries),
+                  static_cast<unsigned>(s.progress), static_cast<unsigned>(s.ended));
     }
 }
 
@@ -1420,6 +1462,7 @@ void StartStallWatch() {
                 Common::Log::RenewCrashReport();
                 PrintThreadStates(reason, true);
                 ProbeCores();
+                PrintStrays();
                 PrintBusErrorDump(true);
                 PrintTableScan(true);
                 MoveRenderThread();
@@ -1453,9 +1496,255 @@ void EnableRecovery(const std::vector<std::string>& arguments, const unsigned lo
     Common::Log::SetCrashHook([] { Recover("a failed assert"); });
 }
 
+u64 DumpBytesWritten(long since) {
+    // The file's path once found: the system writes the dump under it to the end.
+    static char found[160];
+    static long found_since;
+    if (found_since != since) {
+        found[0] = '\0';
+        found_since = since;
+    }
+    if (found[0] == '\0') {
+        long newest = since - 1;
+        for (const char* dir : {"host0:", "ux0:data/"}) {
+            const SceUID d = sceIoDopen(dir);
+            if (d < 0) {
+                continue;
+            }
+            SceIoDirent entry{};
+            while (sceIoDread(d, &entry) > 0) {
+                const std::string_view name{entry.d_name};
+                if (name.starts_with("psp2core-") && name.ends_with(".psp2dmp.tmp")) {
+                    const long time = std::strtol(entry.d_name + 9, nullptr, 10);
+                    if (time > newest) {
+                        newest = time;
+                        std::snprintf(found, sizeof(found), "%s%s", dir, entry.d_name);
+                    }
+                }
+                entry = {};
+            }
+            sceIoDclose(d);
+        }
+    }
+    SceIoStat stat{};
+    return found[0] != '\0' && sceIoGetstat(found, &stat) >= 0 ? static_cast<u64>(stat.st_size)
+                                                                : 0;
+}
+
+namespace {
+constexpr char DumpSizePath[] = "ux0:data/azahar/dump-size.txt";
+}
+
+u64 LastDumpSize() {
+    char text[32]{};
+    const SceUID fd = sceIoOpen(DumpSizePath, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    sceIoRead(fd, text, sizeof(text) - 1);
+    sceIoClose(fd);
+    return std::strtoull(text, nullptr, 10);
+}
+
+void NoteDumpSize(const char* path) {
+    SceIoStat stat{};
+    if (sceIoGetstat(path, &stat) < 0) {
+        return;
+    }
+    char text[32];
+    const int n = std::snprintf(text, sizeof(text), "%llu\n",
+                                static_cast<unsigned long long>(stat.st_size));
+    const SceUID fd = sceIoOpen(DumpSizePath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+    if (fd >= 0) {
+        sceIoWrite(fd, text, n);
+        sceIoClose(fd);
+    }
+}
+
+namespace {
+
+constexpr char CrashesDir[] = "ux0:data/azahar/crashes";
+
+struct ZipEntry {
+    std::string name;
+    u32 crc{}, compressed{}, size{}, offset{};
+};
+
+void Put16(std::vector<u8>& out, u32 v) {
+    out.push_back(static_cast<u8>(v));
+    out.push_back(static_cast<u8>(v >> 8));
+}
+
+void Put32(std::vector<u8>& out, u32 v) {
+    Put16(out, v & 0xFFFF);
+    Put16(out, v >> 16);
+}
+
+bool WriteAll(SceUID fd, const void* data, std::size_t size) {
+    return sceIoWrite(fd, data, static_cast<SceSize>(size)) == static_cast<int>(size);
+}
+
+/// A local header (signature, version 2.0, no flags, deflate, the time, then the entry's crc and
+/// sizes, which are written again once known) or a central directory record.
+std::vector<u8> ZipHeader(const ZipEntry& e, u32 dos_time, u32 dos_date, bool central) {
+    std::vector<u8> h;
+    Put32(h, central ? 0x02014b50 : 0x04034b50);
+    if (central) {
+        Put16(h, 20);
+    }
+    Put16(h, 20);
+    Put16(h, 0);
+    Put16(h, 8);
+    Put16(h, dos_time);
+    Put16(h, dos_date);
+    Put32(h, e.crc);
+    Put32(h, e.compressed);
+    Put32(h, e.size);
+    Put16(h, static_cast<u32>(e.name.size()));
+    Put16(h, 0);
+    if (central) {
+        Put16(h, 0);           // comment
+        Put16(h, 0);           // disk
+        Put16(h, 0);           // internal attributes
+        Put32(h, 0);           // external attributes
+        Put32(h, e.offset);
+    }
+    h.insert(h.end(), e.name.begin(), e.name.end());
+    return h;
+}
+
+bool ZipFile(SceUID fd, const std::string& path, ZipEntry& e, u32 dos_time, u32 dos_date,
+             u64& done, u64 total, const std::function<void(u64, u64)>& progress) {
+    const SceUID in = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+    if (in < 0) {
+        return false;
+    }
+    e.offset = static_cast<u32>(sceIoLseek(fd, 0, SCE_SEEK_CUR));
+    const std::vector<u8> header = ZipHeader(e, dos_time, dos_date, false);
+    bool ok = WriteAll(fd, header.data(), header.size());
+    z_stream z{};
+    ok = ok && deflateInit2(&z, Z_BEST_SPEED, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK;
+    std::vector<u8> input(256 * 1024), output(256 * 1024);
+    uLong crc = crc32(0, nullptr, 0);
+    int read = 0;
+    for (bool end = false; ok && !end;) {
+        read = sceIoRead(in, input.data(), static_cast<SceSize>(input.size()));
+        if (read < 0) {
+            ok = false;
+            break;
+        }
+        end = read == 0;
+        crc = crc32(crc, input.data(), static_cast<uInt>(read));
+        e.size += static_cast<u32>(read);
+        z.next_in = input.data();
+        z.avail_in = static_cast<uInt>(read);
+        do {
+            z.next_out = output.data();
+            z.avail_out = static_cast<uInt>(output.size());
+            deflate(&z, end ? Z_FINISH : Z_NO_FLUSH);
+            const std::size_t produced = output.size() - z.avail_out;
+            ok = WriteAll(fd, output.data(), produced);
+            e.compressed += static_cast<u32>(produced);
+        } while (ok && z.avail_out == 0);
+        done += static_cast<u64>(read);
+        progress(done, total);
+    }
+    deflateEnd(&z);
+    sceIoClose(in);
+    e.crc = static_cast<u32>(crc);
+    const SceOff end = sceIoLseek(fd, 0, SCE_SEEK_CUR);
+    const std::vector<u8> final_header = ZipHeader(e, dos_time, dos_date, false);
+    ok = ok && sceIoLseek(fd, e.offset, SCE_SEEK_SET) == e.offset &&
+         WriteAll(fd, final_header.data(), final_header.size()) &&
+         sceIoLseek(fd, end, SCE_SEEK_SET) == end;
+    return ok;
+}
+
+u64 FileSize(const std::string& path) {
+    SceIoStat stat{};
+    return sceIoGetstat(path.c_str(), &stat) >= 0 ? static_cast<u64>(stat.st_size) : 0;
+}
+
+} // Anonymous namespace
+
+std::string ArchiveCrash(const std::string& report, const std::string& dump,
+                         const std::function<void(u64 done, u64 total)>& progress) {
+    SceDateTime now{};
+    sceRtcGetCurrentClockLocalTime(&now);
+    sceIoMkdir(CrashesDir, 0777);
+    const std::string archive =
+        fmt::format("{}/crash-{:04}{:02}{:02}-{:02}{:02}{:02}.zip", CrashesDir, now.year, now.month,
+                    now.day, now.hour, now.minute, now.second);
+    const u32 dos_time = static_cast<u32>(now.hour << 11 | now.minute << 5 | now.second / 2);
+    const u32 dos_date =
+        static_cast<u32>(std::max(now.year - 1980, 0) << 9 | now.month << 5 | now.day);
+    const SceUID fd = sceIoOpen(archive.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+    if (fd < 0) {
+        LOG_ERROR(Frontend, "Could not create {}: {:#010x}", archive, static_cast<u32>(fd));
+        return {};
+    }
+    std::vector<ZipEntry> entries{{"crash.txt"}};
+    if (!dump.empty()) {
+        const std::size_t slash = dump.find_last_of(":/");
+        entries.push_back({slash == std::string::npos ? dump : dump.substr(slash + 1)});
+    }
+    const u64 total = FileSize(report) + (dump.empty() ? 0 : FileSize(dump));
+    u64 done = 0;
+    bool ok = ZipFile(fd, report, entries[0], dos_time, dos_date, done, total, progress) &&
+              (dump.empty() ||
+               ZipFile(fd, dump, entries[1], dos_time, dos_date, done, total, progress));
+    std::vector<u8> directory;
+    for (const ZipEntry& e : entries) {
+        const std::vector<u8> h = ZipHeader(e, dos_time, dos_date, true);
+        directory.insert(directory.end(), h.begin(), h.end());
+    }
+    const u32 directory_at = static_cast<u32>(sceIoLseek(fd, 0, SCE_SEEK_CUR));
+    const u32 directory_size = static_cast<u32>(directory.size());
+    Put32(directory, 0x06054b50);
+    Put16(directory, 0);
+    Put16(directory, 0);
+    Put16(directory, static_cast<u32>(entries.size()));
+    Put16(directory, static_cast<u32>(entries.size()));
+    Put32(directory, directory_size);
+    Put32(directory, directory_at);
+    Put16(directory, 0);
+    ok = ok && WriteAll(fd, directory.data(), directory.size());
+    ok = sceIoClose(fd) >= 0 && ok;
+    if (!ok) {
+        LOG_ERROR(Frontend, "Could not write {}; {} and {} stay", archive, report, dump);
+        sceIoRemove(archive.c_str());
+        return {};
+    }
+    if (!dump.empty()) {
+        sceIoRemove(dump.c_str());
+    }
+    sceClibPrintf("[azahar] crash archive %s: %u + %u bytes in %llu\n", archive.c_str(),
+                  entries[0].size, dump.empty() ? 0u : entries[1].size,
+                  static_cast<unsigned long long>(FileSize(archive)));
+    return archive;
+}
+
+/// A core dump being written (Coredump's or Recover's). The module's dump keeps one dump's state at
+/// a time, with no guard of its own, and its first part suspends the process, the rest runs beside
+/// it: a crash of another thread meanwhile (an assert's Recover) would start a second one, then
+/// end the process under the first, and a process that ends while its dump runs takes the kernel
+/// down. So a dump waits for the one running.
+std::atomic<bool> dump_running;
+
+int DumpAlone(char* path, unsigned path_size) {
+    bool idle = false;
+    while (!dump_running.compare_exchange_weak(idle, true)) {
+        idle = false;
+        sceKernelDelayThread(100 * 1000);
+    }
+    const int dumped = azaharCoredump(path, path_size);
+    dump_running = false;
+    return dumped;
+}
+
 int Coredump(char* path, unsigned path_size) {
     stall_held = true;
-    const int dumped = azaharCoredump(path, path_size);
+    const int dumped = DumpAlone(path, path_size);
     stall_held = false;
     return dumped;
 }
@@ -1477,10 +1766,19 @@ void Recover(const char* reason) {
         __builtin_trap();
     }
     // The dump before anything else changes the process. Minutes over host0, seconds
-    // to a memory card; the display stays black meanwhile.
+    // to a memory card; the display stays black meanwhile. None with a core stopped: the dump's
+    // suspend of every thread would wait for it for good.
     static char path[256];
-    const int dumped = azaharCoredump(path, sizeof(path));
     static char line[320];
+    const int stopped = stopped_core.load();
+    int dumped = -1;
+    if (stopped >= 0) {
+        std::snprintf(line, sizeof(line), "[azahar] crash: no core dump, core %d stopped\n",
+                      stopped);
+        Write(line);
+    } else {
+        dumped = DumpAlone(path, sizeof(path));
+    }
     std::snprintf(line, sizeof(line), "[azahar] crash: core dump %08x, %s; restarting\n",
                   static_cast<unsigned>(dumped), dumped >= 0 ? path : "none");
     Write(line);

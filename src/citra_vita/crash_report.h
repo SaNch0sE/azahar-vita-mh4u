@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -92,6 +93,23 @@ void EnableRecovery(const std::vector<std::string>& arguments, const unsigned lo
 /// A core dump of the process (azaharCoredump) with the stall watch held, for a crash the app
 /// lives on after (a title's): azaharCoredump's result, the path in `path`.
 int Coredump(char* path, unsigned path_size);
+
+/// The core dump Coredump is writing (on another thread): its bytes so far, the size of the
+/// system's psp2core-*.psp2dmp.tmp in host0: or ux0:data/ whose name's time is
+/// `since` (time() as the dump started) or later; 0 until it appears.
+u64 DumpBytesWritten(long since);
+/// The last dump's size (ux0:data/azahar/dump-size.txt), the whole a new dump's progress is shown
+/// against; 0 before the first. NoteDumpSize keeps a written dump's.
+u64 LastDumpSize();
+void NoteDumpSize(const char* path);
+
+/// A crash's files in one archive for the player to send: ux0:data/azahar/crashes/crash-DATE-TIME
+/// .zip with the report (`report`, as crash.txt) and the core dump (`dump`, under its own name),
+/// deflated, and the dump deleted once the archive is whole. `progress` gets the bytes read so far
+/// and the whole. The archive's path, or empty when it could not be written: then both files stay
+/// as they were. A healthy process's: it allocates.
+std::string ArchiveCrash(const std::string& report, const std::string& dump,
+                         const std::function<void(u64 done, u64 total)>& progress);
 
 /// The heap's live blocks of 512 KiB or more, each with the return addresses on its allocating
 /// thread's stack: on the debug channel, and with `to_report` in the crash report too.

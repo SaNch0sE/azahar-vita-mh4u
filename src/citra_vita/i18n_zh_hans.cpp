@@ -263,6 +263,7 @@ constexpr std::array table{std::to_array<Translation>({
     {"Overlay opacity", "叠加不透明度"},
     {"Parent folder", "上一级"},
     {"Password", "密码"},
+    {"Packing the crash report...", "正在打包崩溃报告…"},
     {"Patches", "补丁"},
     {"Paused", "已暂停"},
     {"permission denied", "权限不足"},
@@ -389,6 +390,9 @@ constexpr std::array table{std::to_array<Translation>({
     {"the game", "游戏本体"},
     {"The game crashed.", "游戏崩溃了。"},
     {"The game crashed. Saving a crash report...", "游戏崩溃了。正在保存崩溃报告…"},
+    {"The game crashed. Saving a crash report: {}, about {}:{:02} left...",
+     "游戏崩溃了。正在保存崩溃报告：{}，大约还剩 {}:{:02}…"},
+    {"The game crashed. Saving a crash report: {}...", "游戏崩溃了。正在保存崩溃报告：{}…"},
     {"The game draws its 3D scene twice, once per eye, even with 3D off. Only one picture is "
      "shown, so only the left eye's is drawn.",
      "即使关闭 3D，游戏也会为两只眼睛各绘制一次 3D 场景。由于只显示一幅画面，现在只绘制左眼的画面"

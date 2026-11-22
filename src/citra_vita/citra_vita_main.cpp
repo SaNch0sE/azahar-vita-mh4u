@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -15,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <typeinfo>
 #include <unordered_map>
 #include <utility>
@@ -1503,6 +1505,45 @@ void ApplySystemLanguage(Core::System& system) {
                   written.IsSuccess() ? "written" : "not written to the config save");
 }
 
+/// A crash's files waiting for their archive and notice (ArchivedCrashNotice): Recover's restart
+/// sets them (crashed=PATH), for the game list to pack where it can show the progress.
+struct CrashFiles {
+    std::string what, report, dump;
+};
+std::optional<CrashFiles> g_crash_files;
+
+/// The crash's report and dump (none: the report alone) packed into one archive
+/// (CrashReport::ArchiveCrash), its progress on the status panel (`present` draws a frame), and the
+/// notice naming the archive: or the files themselves where it could not be written.
+std::string ArchivedCrashNotice(VitaFrontend::Ui& ui, const std::function<void()>& present,
+                                const CrashFiles& files) {
+    // This run's own report (a game's crash), packed away or named by the notice: the next
+    // crash's report starts afresh, with its own preamble.
+    const bool live = files.report == Common::Log::CrashReportPath;
+    ui.SetStatusMessage(Tr("Packing the crash report..."));
+    ui.SetProgress(0.0f);
+    present();
+    u64 shown = 0;
+    const std::string archive = VitaFrontend::CrashReport::ArchiveCrash(
+        files.report, files.dump, [&](u64 done, u64 total) {
+            // Alive: a full dump takes about a minute to pack, past the stall watch's limit.
+            VitaFrontend::CrashReport::StallWatchBeat();
+            const u64 now = sceKernelGetProcessTimeWide();
+            if (now - shown < 100'000 || total == 0) {
+                return;
+            }
+            shown = now;
+            ui.SetProgress(static_cast<float>(done) / static_cast<float>(total));
+            present();
+        });
+    ui.ClearStatusMessage();
+    if (live) {
+        Common::Log::EndCrashReport(!archive.empty());
+    }
+    return archive.empty() ? CrashNotice(files.what, files.report, files.dump)
+                           : CrashNotice(files.what, archive, "");
+}
+
 /// What copy runs, for a crash report: the name, the product code and version (an update's or the
 /// cartridge's), the file's type and size, and its 3GX plugin. At a title's start and after a jump
 /// to another title, which the core makes alone.
@@ -2469,16 +2510,67 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         };
         ui.SetStatusMessage(Tr("The game crashed. Saving a crash report..."));
         present();
+        // The dump on a thread of its own, the panel meanwhile showing how much of it is written:
+        // minutes over host0, the whole process suspended for its first part. The
+        // last dump's size stands for the whole; without one, the size alone.
         char dump[256] = {};
-        const int dumped = VitaFrontend::CrashReport::Coredump(dump, sizeof(dump));
+        std::atomic<bool> dump_done{false};
+        int dumped = 0;
+        const long dump_since = static_cast<long>(time(nullptr));
+        std::thread dumper([&] {
+            dumped = VitaFrontend::CrashReport::Coredump(dump, sizeof(dump));
+            dump_done = true;
+        });
+        const u64 expected = VitaFrontend::CrashReport::LastDumpSize();
+        const u64 dump_start_us = sceKernelGetProcessTimeWide();
+        u64 last_written = 0, done_at_us = 0;
+        for (u32 frame = 0; !dump_done; frame++) {
+            // About six times a second: the size to a tenth of a MB (KB below one) and, against
+            // the last dump's size, the time left at the rate so far. The system writes the dump
+            // a MiB at a time, a step every four seconds over host0: the time left
+            // counts down between the steps.
+            if (frame % 10 == 0) {
+                const u64 written = VitaFrontend::CrashReport::DumpBytesWritten(dump_since);
+                const u64 now = sceKernelGetProcessTimeWide();
+                if (written != last_written && written != 0 && written < expected) {
+                    last_written = written;
+                    done_at_us = now + (now - dump_start_us) * (expected - written) / written;
+                }
+                const std::string size =
+                    written < (u64{1} << 20)
+                        ? fmt::format("{} KB", written >> 10)
+                        : fmt::format("{}.{} MB", written >> 20, ((written & 0xFFFFF) * 10) >> 20);
+                const u64 left =
+                    written < expected && done_at_us > now ? (done_at_us - now + 999'999) / 1'000'000
+                                                           : 0;
+                ui.SetStatusMessage(
+                    left != 0
+                        ? TrFormat("The game crashed. Saving a crash report: {}, about {}:{:02} "
+                                   "left...",
+                                   size, left / 60, left % 60)
+                        : TrFormat("The game crashed. Saving a crash report: {}...", size));
+                if (expected != 0) {
+                    ui.SetProgress(std::min(0.99f, static_cast<float>(written) /
+                                                       static_cast<float>(expected)));
+                }
+            }
+            present();
+            sceDisplayWaitVblankStart();
+        }
+        dumper.join();
+        if (dumped >= 0) {
+            VitaFrontend::CrashReport::NoteDumpSize(dump);
+        }
         sceClibPrintf("[azahar] the title crashed; core dump %08x, %s\n",
                       static_cast<unsigned>(dumped), dumped >= 0 ? dump : "none");
-        g_crash_notice = CrashNotice(Tr("The game crashed."), Common::Log::CrashReportPath,
-                                     dumped >= 0 ? dump : "");
         ui.ClearStatusMessage();
         // The title's settings still applied (SetRunningTitle below).
         char changed[192];
         Config::WriteChangedFromDefaults(changed, sizeof(changed));
+        g_crash_notice = ArchivedCrashNotice(
+            ui, present,
+            {CrashWhat(ui, Tr("The game crashed."), changed), Common::Log::CrashReportPath,
+             dumped >= 0 ? dump : ""});
     }
     window.SetPauseMenu(nullptr);
     window.SetInputToGuest(true);
@@ -2892,9 +2984,9 @@ int EmulatorMain() {
     }
     for (const std::string& argument : g_arguments) {
         if (argument.starts_with("crashed=")) {
-            g_crash_notice = CrashNotice(Tr("Azahar crashed and started again."),
-                                         VitaFrontend::CrashReport::LastReportPath,
-                                         std::string_view{argument}.substr(8));
+            g_crash_files = CrashFiles{CrashWhat(ui, Tr("Azahar crashed and started again."), changed),
+                                       VitaFrontend::CrashReport::LastReportPath,
+                                       argument.substr(8)};
         } else if (argument.starts_with("seq=")) {
             command_file.StartAfter(std::strtoul(argument.c_str() + 4, nullptr, 10));
         }
@@ -2993,6 +3085,10 @@ int EmulatorMain() {
         show_notice(outcome + "\n\n" + Tr("Press X or O to continue."));
     };
     while (running && !window.IsQuitRequested()) {
+        if (g_crash_files) {
+            g_crash_notice = ArchivedCrashNotice(ui, present_list, *g_crash_files);
+            g_crash_files.reset();
+        }
         if (!g_crash_notice.empty()) {
             sceClibPrintf("[azahar] crash notice shown\n");
             show_notice(std::exchange(g_crash_notice, {}));

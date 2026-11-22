@@ -116,8 +116,9 @@ function(citra_vita_executable target titleid)
                                                  "${CMAKE_SOURCE_DIR}/src/sgxd")
     create_target_directory_groups(${target})
 
+    # zlib (the SDK's): a crash's files packed into one zip (CrashReport::ArchiveCrash).
     target_link_libraries(${target} PRIVATE citra_common citra_core input_common network
-                                            video_core cryptopp lodepng)
+                                            video_core cryptopp lodepng z)
     if (AZAHAR_PGO_MODE STREQUAL "GENERATE")
         target_link_libraries(${target} PRIVATE "${AZAHAR_PGO_RUNTIME}")
     endif()
