@@ -15,6 +15,7 @@
 //                SceGpu's resume writes before its first read, a per-core cache reset, the IDs.
 //   sgxdRelease  the reverse: cache reset, unmap, power-off, then (1, 0x10005), which is how the
 //                system resumes SceGpu: power state 0, its microkernel reloaded, the gate open.
+//                Between the two SceShell is kept from harm (shell.c).
 //   sgxdSubmit   an op list against the registers: reads, writes, polls and delays.
 //   sgxdEvents   IRQ 52 from SceGpu's handler while we own the GPU: the app's microkernel runs
 //                the async lists on the GPU and raises SW_EVENT for its wakes and faults.
@@ -125,6 +126,8 @@ enum { SGXD_NONE, SGXD_OWNED, SGXD_LOST };
 static int sgxd_state;
 static SceUID sgxd_owner = -1;
 static void shellcdram_give_back(void); // shellcdram.c
+static void shell_take(void);           // shell.c
+static void shell_give(void);
 static SceUID sgxd_mutex = -1;
 static SceUID sgxd_sysevent_uid = -1;
 
@@ -785,6 +788,7 @@ int sgxdTake(SgxdInfo *user_info) {
         if (ret == 0) {
             sgxd_state = SGXD_OWNED;
             sgxd_owner = pid;
+            shell_take();
         } else {
             sgxd_mmu_free();
             sgxd_state = SGXD_NONE;
@@ -818,6 +822,7 @@ static int sgxd_release_locked(void) {
         sgxd_hand_back();
     }
     // LOST: the system's resume already gave SceGpu its GPU back.
+    shell_give();
     const int was = sgxd_state;
     const uint32_t pages = sgxd_mmu_pages;
     sgxd_mmu_free();

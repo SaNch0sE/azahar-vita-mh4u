@@ -12,6 +12,7 @@
 
 #include "citra_vita/crash_report.h"
 #include "citra_vita/emu_window_vita.h"
+#include "citra_vita/hud_stats.h"
 #include "citra_vita/sgxd_present.h"
 #include "citra_vita/stats_hud.h"
 #include "citra_vita/vita_ui.h"
@@ -475,6 +476,9 @@ Ui::Action Ui::Update() {
         overlay_focused = false;
     }
 
+    if (state != State::InGame) {
+        DrawVolume();
+    }
     ImGui::Render();
     return action;
 }

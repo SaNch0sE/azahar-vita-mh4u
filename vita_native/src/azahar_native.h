@@ -313,6 +313,7 @@ typedef struct AzaharRebackRequest {
 #define AZAHAR_ERR_PAGE AZAHAR_ERROR(1006)     // a user page did not translate
 #define AZAHAR_ERR_TIMEOUT AZAHAR_ERROR(1007)  // the core-2 thread did not complete a command in time
 #define AZAHAR_ERR_FULL AZAHAR_ERROR(1008)     // a queue has no room yet (the microkernel's jobs)
+#define AZAHAR_ERR_ROUTE AZAHAR_ERROR(1009)    // the sound goes where no system volume is (HDMI, USB)
 
 
 #ifdef __cplusplus
@@ -350,6 +351,16 @@ int azaharFlip(const AzaharFlipRun *runs, uint32_t count);
 /// them back before SceGpu has the GPU again. `*user_va` gets the range's address in the app.
 /// Version 29.
 int azaharShellCdram(uint32_t *user_va);
+/// The system volume one step up (`step` > 0) or down (< 0), or as it is (0), while the caller
+/// holds the GPU (sgxdTake): the volume keys are the app's then, and SceShell, which would step
+/// it, sleeps at SceGpu's gate (shell.c). Returns the level, 0 to 30 (AVLS stops the built-in
+/// output's at 21), or AZAHAR_ERR_ROUTE when the sound goes where SceShell steps nothing either
+/// (HDMI, USB). Version 50.
+int azaharSystemVolume(int step);
+/// The volume keys held (SCE_CTRL_VOLUP, SCE_CTRL_VOLDOWN) while the caller holds the GPU
+/// (sgxdTake), read from Syscon every 20 ms (shell.c): out of SceShell's pad data then, they are
+/// in no app's either. Version 63.
+int azaharVolumeKeys(void);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.

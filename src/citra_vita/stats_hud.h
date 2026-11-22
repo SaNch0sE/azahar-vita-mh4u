@@ -6,10 +6,10 @@
 
 /**
  * The stats overlay over a running title, top right: speed and game fps, frame time and shown
- * fps (HudStats), in a translucent box. No ImGui frame: its quads go straight into the present's
- * batch, glyphs of the font atlas the present samples (ImGui's, the one texture of the present's
- * recipe), and are made again only when the numbers change, once a second. ImGui's frame for
- * these two lines cost about 0.25 ms a present.
+ * fps (HudStats), and for two seconds after a volume key the volume, in a translucent box. No ImGui
+ * frame: its quads go straight into the present's batch, glyphs of the font atlas the present
+ * samples, and are made again only when the numbers change (ImGui's frame would cost about
+ * 0.25 ms a present).
  */
 namespace VitaFrontend::StatsHud {
 

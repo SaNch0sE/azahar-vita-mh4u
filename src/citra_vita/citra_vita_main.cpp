@@ -433,7 +433,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     ui.Update();
     window.Present(&ui);
 
+    window.SetLoading(true);
     const auto load_result = system.Load(window, path);
+    window.SetLoading(false);
     if (load_result != Core::System::ResultStatus::Success) {
         LOG_CRITICAL(Frontend, "Could not load {}: {}", path, DescribeLoadError(load_result));
         ui.SetStatusMessage("Could not load this title: " + DescribeLoadError(load_result));
@@ -467,7 +469,9 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     }
 #endif
     if (state_arguments.load >= 0) {
+        window.SetLoading(true);
         RestoreStateAtStart(system, static_cast<u32>(state_arguments.load));
+        window.SetLoading(false);
         if (system.IsStateLoadPartial()) {
             sceClibPrintf("[azahar] savestate: the load stopped partway; the title is stopped\n");
             window.RequestQuit(false);
@@ -496,6 +500,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         case VitaFrontend::Ui::Action::ExitApplication:
             window.SetPauseMenu(nullptr);
             window.SetInputToGuest(true);
+            window.SetLoading(false);
             window.SetUi(nullptr);
             ShutdownSystem(system);
             return action == VitaFrontend::Ui::Action::QuitGame;
@@ -541,11 +546,14 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 }
             }
         }
+        // A save or load sent and not done yet: the volume keys do nothing meanwhile.
+        window.SetLoading(state_watch);
         const auto status = system.RunLoop();
         // The signal becomes a request inside RunLoop, which runs it once no HLE request is
         // in flight: the same call or a later one.
         if (state_watch && !system.IsSaveStateRequestPending()) {
             state_watch = false;
+            window.SetLoading(false);
             const bool ok = status == Core::System::ResultStatus::Success;
             sceClibPrintf("[azahar] savestate: %s%s\n",
                           ok ? "done" : "failed: ", ok ? "" : system.GetStatusDetails().c_str());
@@ -996,6 +1004,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     }
 
     window.SetPauseMenu(nullptr);
+    window.SetLoading(false);
     window.SetUi(nullptr);
     ShutdownSystem(system);
     return true;
@@ -1292,18 +1301,19 @@ int EmulatorMain() {
         return -1;
     }
 
-    // A present waits until the frame before it is on screen (SgxdPresent::EndFrame), so this
-    // thread runs at most one frame ahead of the display. A flip thread would lift that (the
-    // plan's 5.2); the menus do not need it.
-    // The PS button would otherwise hand the display to the home menu, which this process does
-    // not survive once a core is taken; locked, its presses appear in the pad data instead, and
-    // the run loop opens the pause menu on them. The quick menu lock keeps the power slider out
-    // from under a running title. Both are held for the whole session, because the core, once
-    // taken, is taken for the whole session.
+    // SceShell draws nothing while sgxd owns the GPU: its GPU calls sleep at SceGpu's gate
+    // (docs/sgxd/takeover.md), and azaharnative keeps SceAppMgr's
+    // watchdog from taking it for hung. So every shell overlay that can be locked is, for the
+    // whole session: the PS button (its presses reach the pad data instead, and the pause menu
+    // opens on them), the quick menu, the power menu, and the USB, memory card and music player
+    // notices. The volume keys are this app's (azaharnative).
+    const auto shell_locks = static_cast<SceShellUtilLockType>(
+        SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN | SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN_2 |
+        SCE_SHELL_UTIL_LOCK_TYPE_QUICK_MENU | SCE_SHELL_UTIL_LOCK_TYPE_POWEROFF_MENU |
+        SCE_SHELL_UTIL_LOCK_TYPE_USB_CONNECTION | SCE_SHELL_UTIL_LOCK_TYPE_MC_INSERTED |
+        SCE_SHELL_UTIL_LOCK_TYPE_MC_REMOVED | SCE_SHELL_UTIL_LOCK_TYPE_MUSIC_PLAYER);
     sceShellUtilInitEvents(0);
-    sceShellUtilLock(static_cast<SceShellUtilLockType>(SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN |
-                                                       SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN_2 |
-                                                       SCE_SHELL_UTIL_LOCK_TYPE_QUICK_MENU));
+    sceShellUtilLock(shell_locks);
 
     auto& system = Core::System::GetInstance();
 
@@ -1376,9 +1386,7 @@ int EmulatorMain() {
     VitaFrontend::ShutdownInput();
     Common::Log::Stop();
 
-    sceShellUtilUnlock(static_cast<SceShellUtilLockType>(SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN |
-                                                         SCE_SHELL_UTIL_LOCK_TYPE_PS_BTN_2 |
-                                                         SCE_SHELL_UTIL_LOCK_TYPE_QUICK_MENU));
+    sceShellUtilUnlock(shell_locks);
     VitaFrontend::SgxdPresent::Shutdown();
     return 0;
 }

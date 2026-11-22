@@ -4,17 +4,21 @@
 
 #include <algorithm>
 #include <chrono>
-#include <optional>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <optional>
 #include <vector>
 
 #include <psp2/ctrl.h>
 #include <psp2/display.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/touch.h>
 
+#include "azahar_native.h"
 #include "citra_vita/emu_window_vita.h"
+#include "citra_vita/hud_stats.h"
 #include "citra_vita/sgxd_present.h"
 #include "citra_vita/vita_ui.h"
 #include "common/logging/log.h"
@@ -299,7 +303,58 @@ void EmuWindowVita::ReadPad() {
         buttons_held.store(pad.buttons, std::memory_order_relaxed);
         stick_x.store(pad.lx, std::memory_order_relaxed);
         stick_y.store(pad.ly, std::memory_order_relaxed);
+        // The volume keys are in no app's pad data while sgxd owns the GPU (out of SceShell's,
+        // they are out of every app's too): azaharnative reads them from Syscon. Pad data a
+        // debugger injects presses them past SceCtrl's masks, into the pad data only.
+        const int volume = azaharVolumeKeys();
+        VolumeKeys(pad.buttons | (volume > 0 ? static_cast<u32>(volume) : 0u));
     }
+    // A standby takes the GPU from sgxd for the rest of the session (docs/sgxd/takeover.md): no
+    // automatic one while the emulator runs, as a video player keeps it off. The timer counts
+    // minutes.
+    if (++pad_reads % 64 == 0) {
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+    }
+}
+
+void EmuWindowVita::VolumeKeys(u32 buttons) {
+    constexpr u32 Keys = SCE_CTRL_VOLUP | SCE_CTRL_VOLDOWN;
+    const u32 held = buttons & Keys;
+    if (held == 0 || held == Keys) {
+        volume_keys = 0;
+        return;
+    }
+    // During a load or save the keys do nothing, and one held through its end does nothing
+    // until it is let go.
+    if (loading.load(std::memory_order_relaxed)) {
+        volume_keys = held;
+        volume_repeat_us = std::numeric_limits<u64>::max();
+        return;
+    }
+    const u64 now = sceKernelGetProcessTimeWide();
+    if (held == volume_keys && now < volume_repeat_us) {
+        return;
+    }
+    volume_repeat_us = now + (held == volume_keys ? 100000u : 400000u);
+    volume_keys = held;
+    const int step = held == SCE_CTRL_VOLUP ? 1 : -1;
+    // The system volume, as SceShell steps it (azaharnative sets it while SceShell sleeps).
+    int level = azaharSystemVolume(step);
+    if (level == AZAHAR_ERR_ROUTE) {
+        constexpr int Steps = 20;
+        const int emulator =
+            std::clamp(static_cast<int>(std::lround(Settings::values.volume.GetValue() * Steps)) +
+                           step,
+                       0, Steps);
+        Settings::values.volume = static_cast<float>(emulator) / Steps;
+        level = static_cast<int>(HudStats::VolumeEmulator | (emulator * 100 / Steps));
+    } else if (level < 0) {
+        LOG_DEBUG(Frontend, "azaharSystemVolume: {:#010x}", static_cast<u32>(level));
+        return;
+    }
+    HudStats::volume_level.store(static_cast<u32>(level), std::memory_order_relaxed);
+    HudStats::volume_until_us.store(now + 2000000u, std::memory_order_release);
+    MarkOverlayChanged();
 }
 
 void EmuWindowVita::UpdateTouch() {

@@ -41,6 +41,8 @@ azaharnative:
         - azaharShellCdram: 0x3C1A7E2B
         - azaharVfpPatch: 0x3C1A7E2C
         - azaharSyncUpper: 0x3C1A7E2D
+        - azaharSystemVolume: 0x3C1A7E2F
+        - azaharVolumeKeys: 0x3C1A7E34
         - azaharModuleUid: 0x3C1A7E35
         - azaharKernelPlugins: 0x3C1A7E41
         - azaharVaReport: 0x3C1A7E42

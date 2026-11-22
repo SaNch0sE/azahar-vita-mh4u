@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include <imgui_vita2d/imgui.h>
+#include <psp2/kernel/processmgr.h>
 
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/sgxd_present.h"
@@ -49,7 +50,8 @@ constexpr u32 MaxQuads = 48;
 std::array<u32, MaxQuads * 4 * VertexWords> vertices{};
 u32 quads = 0;
 u32 clip = 0;
-std::array<u32, 3> made_for{~0u, ~0u, ~0u};
+/// The numbers the quads show: speed, game fps, shown fps, and the volume (~0u: none).
+std::array<u32, 4> made_for{~0u, ~0u, ~0u, ~0u};
 
 void PutQuad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1,
              u32 colour) {
@@ -83,18 +85,27 @@ void PutText(float x, float y, const char* text) {
     }
 }
 
-void Make(u32 speed, u32 fps10, u32 shown) {
-    char speed_line[32], frame_line[32];
+void Make(u32 speed, u32 fps10, u32 shown, u32 volume) {
+    char speed_line[32], frame_line[32], volume_line[32];
     std::snprintf(speed_line, sizeof(speed_line), "%u%%/%u", speed, (fps10 + 5) / 10);
     std::snprintf(frame_line, sizeof(frame_line), "%.1fms/%ufps",
                   shown != 0 ? 1000.0f / static_cast<float>(shown) : 0.0f, shown);
-    const float width = std::max(Width(speed_line), Width(frame_line)) + 2.0f * Padding;
-    const float height = 2.0f * line_height + LineGap + 2.0f * Padding;
+    std::snprintf(volume_line, sizeof(volume_line), "Volume %u/30", volume);
+    const u32 lines = volume != ~0u ? 3 : 2;
+    float width = std::max(Width(speed_line), Width(frame_line));
+    if (lines == 3) {
+        width = std::max(width, Width(volume_line));
+    }
+    width += 2.0f * Padding;
+    const float height = lines * line_height + (lines - 1) * LineGap + 2.0f * Padding;
     const float left = std::floor(Right - width);
     quads = 0;
     PutQuad(left, Top, Right, Top + height, white_u, white_v, white_u, white_v, BoxColour);
     PutText(left + Padding, Top + Padding, speed_line);
     PutText(left + Padding, Top + Padding + line_height + LineGap, frame_line);
+    if (lines == 3) {
+        PutText(left + Padding, Top + Padding + 2.0f * (line_height + LineGap), volume_line);
+    }
     // The 32-pixel tiles the box covers: the TA's region clip.
     clip = SGXD_RECIPE_CLIP(static_cast<u32>(left) / 32, static_cast<u32>(Top) / 32,
                             (static_cast<u32>(Right) - 1) / 32,
@@ -108,7 +119,7 @@ void Init() {
     const ImFont* font = io.Fonts->Fonts[0];
     // The size ImGui drew this font at: its own times the global scale.
     const float scale = io.FontGlobalScale;
-    for (const char c : std::string_view{" 0123456789%/.fmps"}) {
+    for (const char c : std::string_view{" 0123456789%/.fmpsVolue"}) {
         const ImFontGlyph* g = font->FindGlyph(static_cast<ImWchar>(c));
         ASSERT_MSG(g != nullptr && g->Codepoint == static_cast<u32>(c),
                    "stats overlay: the font has no glyph for {:?}", c);
@@ -125,12 +136,17 @@ void Draw() {
     if (!HudStats::valid.load(std::memory_order_acquire)) {
         return;
     }
-    const std::array<u32, 3> now{HudStats::speed_percent.load(std::memory_order_relaxed),
+    // The volume while the volume keys' last step is recent (EmuWindowVita::VolumeKeys).
+    const bool volume =
+        sceKernelGetProcessTimeWide() < HudStats::volume_until_us.load(std::memory_order_acquire);
+    const std::array<u32, 4> now{HudStats::speed_percent.load(std::memory_order_relaxed),
                                  HudStats::game_fps10.load(std::memory_order_relaxed),
-                                 HudStats::shown_fps.load(std::memory_order_relaxed)};
+                                 HudStats::shown_fps.load(std::memory_order_relaxed),
+                                 volume ? HudStats::volume_level.load(std::memory_order_relaxed)
+                                        : ~0u};
     if (now != made_for) {
         made_for = now;
-        Make(now[0], now[1], now[2]);
+        Make(now[0], now[1], now[2], now[3]);
     }
     auto& b = SgxdPresent::CurrentBatch();
     const u32 count = quads * 4;

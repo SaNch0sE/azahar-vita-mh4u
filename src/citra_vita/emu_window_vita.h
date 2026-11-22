@@ -57,8 +57,8 @@ public:
     s64 FlipDueIn() override;
     void FlipDone() override;
 
-    /// The stats overlay's numbers changed since the last call (GPU's vblank: a present for the
-    /// overlay when the guest's screens are unchanged).
+    /// The stats overlay's numbers or the volume changed since the last call (GPU's vblank:
+    /// a present for the overlay when the guest's screens are unchanged).
     bool TakeOverlayChanged() override {
         return overlay_changed.exchange(false, std::memory_order_relaxed);
     }
@@ -110,11 +110,21 @@ public:
     void SetInputToGuest(bool enabled) {
         input_to_guest.store(enabled, std::memory_order_relaxed);
     }
+    /// A title's or a savestate's load or save is running: the volume keys do nothing
+    /// (VolumeKeys). The render thread polls the pad from the renderer's start, partway through
+    /// a title's load.
+    void SetLoading(bool on) {
+        loading.store(on, std::memory_order_relaxed);
+    }
 
     void UpdateCurrentFramebufferLayout();
 
 private:
     void ReadPad();
+    /// The volume keys, this app's while sgxd owns the GPU (azaharnative keeps them from
+    /// SceShell): each press, and each 0.1 s held past 0.4 s, steps the system volume
+    /// (azaharSystemVolume). HDMI and USB audio have none: there they step nothing.
+    void VolumeKeys(u32 buttons);
     void UpdateTouch();
     void DrawGuestScreens();
     /// The pause menu, run on the polling thread until it closes; the run loop waits meanwhile.
@@ -134,9 +144,14 @@ private:
     std::atomic<u32> buttons_held{};
     std::atomic<s32> stick_x{}, stick_y{};
     std::atomic<bool> input_to_guest{true};
+    std::atomic<bool> loading{};
     std::atomic<bool> quit_requested{};
     std::atomic<bool> overlay_changed{};
     bool touch_down{};
+    /// The volume key held (the polling thread's), and when it steps again.
+    u32 volume_keys{};
+    u64 volume_repeat_us{};
+    u32 pad_reads{};
 
     GuestScreen screens[2]{};
     bool have_screens{};

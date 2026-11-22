@@ -362,6 +362,7 @@ int azaharVersion() {
 #include "reback.c"
 #include "cycles.c"
 #include "shellcdram.c"
+#include "shell.c"
 #include "plugins.c"
 
 // ---------------------------------------------------------------------------- module

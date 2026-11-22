@@ -39,6 +39,9 @@ target_link_libraries(azaharnative
   SceDebugForDriver_stub
   SceKernelSuspendForDriver_stub
   SceIntrmgrForDriver_stub
+  SceCtrlForDriver_stub
+  SceRegMgrForDriver_stub
+  SceSysconForDriver_stub
 )
 
 # Deliberately NOT linked: SceProcessmgrForKernel_stub and SceSysmemForKernel_stub. The
