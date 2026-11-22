@@ -76,6 +76,7 @@ const std::array<Definition, Count> definitions{{
     {"region", false, false, 0, 7, 0, Regions},
     {"force_new_3ds", true, false, 0, 1, 0, Toggle},
     {"theme", false, true, 0, 1, 0, Themes},
+    {"startup_notice", false, true, 0, 1, 1, Toggle},
 }};
 
 /// The screen layouts' choices as the emulator's layout options; the overlay is the single
@@ -215,6 +216,9 @@ void ApplyLocked(Option option) {
         break;
     case Option::Theme:
         // Nothing of the emulator's: the menus read it as they draw (Ui::Update).
+        break;
+    case Option::StartupNotice:
+        // Nothing of the emulator's: the start reads it (EmulatorMain).
         break;
     case Option::Count:
         UNREACHABLE();

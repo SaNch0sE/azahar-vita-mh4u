@@ -15,12 +15,16 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include <imgui_vita2d/imgui.h>
 #include <imgui_vita2d/imgui_internal.h>
+#include <psp2/ctrl.h>
 #include <psp2/io/devctl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 #include <psp2/rtc.h>
+#include <psp2/touch.h>
 
+#include "citra_vita/gxm_present.h"
+#include "citra_vita/imgui_impl_gxm.h"
 #include "citra_vita/imgui_impl_sgxd.h"
 #include "citra_vita/imgui_impl_vita.h"
 #include "citra_vita/livearea.h"
@@ -1039,13 +1043,15 @@ u64 ProgramIdOf(const std::string& path) {
     }
     return program_id;
 }
-} // Anonymous namespace
 
-Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{window_} {
+/// A new ImGui context for the menus, made current: their style in the theme the settings choose,
+/// and their fonts.
+void CreateMenuContext() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    // A new context starts in ImGui's own style, whichever palette was chosen last.
+    palette = Config::Effective(Config::Option::Theme) == 0 ? &DarkPalette : &LightPalette;
     ApplyStyle();
-    UseTheme();
 
     ImGuiIO& io = ImGui::GetIO();
     // Nothing to remember between sessions: every window here is placed by the code.
@@ -1072,6 +1078,71 @@ Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{
     io.FontDefault = io.Fonts->AddFontDefault(&font);
     io.Fonts->Flags |= ImFontAtlasFlags_NoMouseCursors | ImFontAtlasFlags_NoPowerOfTwoHeight;
     io.FontGlobalScale = 0.75f;
+}
+} // Anonymous namespace
+
+void ShowGxmNotice(const char* title, const std::string& text, const std::string& hint,
+                   const char* button) {
+    if (!GxmPresent::Initialize()) {
+        LOG_CRITICAL(Frontend, "Could not bring up GXM for: {}", text);
+        return;
+    }
+    CreateMenuContext();
+    ImGui_ImplVita_Init();
+    const bool drawable = ImGui_ImplGxm_Init();
+    ASSERT_MSG(drawable, "the notice's GXM programs or font atlas failed");
+    // The pad and the front panel sampled as EmuWindowVita samples them, which comes later: the
+    // panel reports nothing until its sampling starts.
+    sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+
+    // The text in the middle of the screen between the header and the footer, the hint under it
+    // in the dimmer colour.
+    constexpr float Width = 720.0f;
+    constexpr float HintGap = 28.0f;
+    // A press of cross counts from up to down: one still held from the launch does not pass it.
+    bool cross_was_down = true;
+    for (bool done = false; !done;) {
+        ImGui_ImplVita_NewFrame();
+        // Read before the frame ends, which clears ImGui's pad inputs.
+        const bool cross_down = ImGui::GetIO().NavInputs[ImGuiNavInput_Activate] > 0.0f;
+        BeginBackdrop("##notice", Icon::Cartridge, title, "");
+        const bool touched = FooterButton(Glyph::Cross, button);
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        ImFont* const font = ImGui::GetFont();
+        const float size = ImGui::GetFontSize();
+        const ImVec2 body = ImGui::CalcTextSize(text.c_str(), nullptr, false, Width);
+        const ImVec2 note = ImGui::CalcTextSize(hint.c_str(), nullptr, false, Width);
+        const float height = body.y + (hint.empty() ? 0.0f : HintGap + note.y);
+        const float x = (ScreenWidth - Width) * 0.5f;
+        const float y =
+            std::max(HeaderHeight + Margin,
+                     HeaderHeight + (ScreenHeight - FooterHeight - HeaderHeight - height) * 0.5f);
+        dl->AddText(font, size, ImVec2(x, y), Colour(palette->Text), text.c_str(), nullptr, Width);
+        if (!hint.empty()) {
+            dl->AddText(font, size, ImVec2(x, y + body.y + HintGap), Colour(palette->TextDim),
+                        hint.c_str(), nullptr, Width);
+        }
+        EndBackdrop();
+        ImGui::Render();
+
+        done = touched || (cross_down && !cross_was_down);
+        cross_was_down = cross_down;
+        // No clear: the backdrop covers every pixel.
+        GxmPresent::BeginFrame();
+        ImGui_ImplGxm_RenderDrawData(ImGui::GetDrawData());
+        GxmPresent::EndFrame();
+    }
+
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_STOP);
+    ImGui_ImplGxm_Shutdown();
+    ImGui::DestroyContext();
+    GxmPresent::Shutdown();
+}
+
+Ui::Ui(Core::System& system_, EmuWindowVita& window_) : system{system_}, window{window_} {
+    CreateMenuContext();
+    ImGuiIO& io = ImGui::GetIO();
     // The titles' icons get slots of the atlas, written as the game list shows them (IconFor):
     // the menus draw with one texture, and a slot is a rectangle of it like a glyph.
     for (int i = 0; i < IconSlots; ++i) {
@@ -1480,6 +1551,16 @@ void Ui::BuildRows() {
          "Region",
          "The console region reported to the game. Auto picks one the game accepts.",
          {"Auto", "Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"},
+         0,
+         nullptr,
+         nullptr});
+    add({Option::StartupNotice,
+         Category::System,
+         Kind::Toggle,
+         "Startup notice",
+         "Shows a notice as Azahar starts, while the quick menu, notifications and plugin menus "
+         "such as PSVshell's still work. Off: Azahar takes over the GPU at once.",
+         {},
          0,
          nullptr,
          nullptr});

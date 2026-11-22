@@ -108,7 +108,7 @@ void WaitDrawn();
 /// fence would read as not reached. The presenting thread's, with no other presenting.
 void SessionEnded();
 
-/// The next EndFrame writes its picture to ux0:data/azahar/frame_NN.ppm, as GxmPresent's does.
+/// The next EndFrame writes its picture to ux0:data/azahar/frame_NN.ppm.
 void DumpNextFrame();
 [[nodiscard]] bool DumpPending();
 

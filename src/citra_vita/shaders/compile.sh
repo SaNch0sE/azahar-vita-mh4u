@@ -3,7 +3,7 @@
 #
 # psp2cgc is the SDK's own Cg compiler: a 32-bit Windows tool, so it runs under wine in a
 # container. Its output is committed, which is why the console needs no runtime compiler
-# (libshacccg.suprx) to present - see the note at the top of gxm_present.cpp.
+# (libshacccg.suprx).
 #
 # Usage: shaders/compile.sh [directory]   (needs docker, and the Vita SDK in $PSVITA_SDK).
 # The directory defaults to this one.
@@ -30,10 +30,7 @@ docker run --rm -v "${PSVITA_SDK:?}:/sdk:ro" -v "$PWD:/shaders" \
         b=$(basename "$f" .cg)
         # Vertex programs are the *_v sources; everything else is a fragment program.
         case $b in *_v) p=sce_vp_psp2;; *) p=sce_fp_psp2;; esac
-        # An ubershader needs -O2: at -O3 the compiler dies with a "fatal internal
-        # compiler error" on it (the register allocator, not the source).
-        case $b in uber*) o=-O2;; *) o=;; esac
-        if wine /sdk/PSVITA/sdk/host_tools/bin/psp2cgc.exe -profile $p $o "$f" \
+        if wine /sdk/PSVITA/sdk/host_tools/bin/psp2cgc.exe -profile $p "$f" \
                 -o "/shaders/$b.gxp" 2>/tmp/err && [ -s "/shaders/$b.gxp" ]; then
             echo "  $b.gxp ($p, $(stat -c%s /shaders/$b.gxp) bytes)"
         else

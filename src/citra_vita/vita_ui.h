@@ -34,6 +34,16 @@ namespace VitaFrontend {
 class EmuWindowVita;
 
 /**
+ * A full-screen notice in the menus' look, drawn through GXM (imgui_impl_gxm) until cross or its
+ * footer's button is pressed: before sgxd takes the GPU (the start-up notice, an error that ends
+ * the start), or when it could not take it. GXM comes up for it and goes down after, and the
+ * notice has an ImGui context of its own for the while. `hint`, when there is one, is a dimmer
+ * line under the text.
+ */
+void ShowGxmNotice(const char* title, const std::string& text, const std::string& hint,
+                   const char* button);
+
+/**
  * The on-screen interface: a game list before anything is running and a pause menu over a
  * running title, drawn with Dear ImGui through sgxd (imgui_impl_sgxd). One menu owns the loop
  * while it is open; the pad is the primary input, with touch alongside.

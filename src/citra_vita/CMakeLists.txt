@@ -1,9 +1,9 @@
 # vita_create_self / vita_create_vpk live here, not in the toolchain file.
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
-# The presentation shaders, embedded as byte arrays. The .gxp are vendored - compiled offline
-# by the SDK's psp2cgc (shaders/compile.sh) from the .cg next to them - so the console needs no
-# runtime Cg compiler to present, and a machine without docker still builds the vpk.
+# The GXM notices' ImGui programs (imgui_impl_gxm), embedded as byte arrays. The .gxp are vendored
+# - compiled offline by the SDK's psp2cgc (shaders/compile.sh) from the .cg next to them - so the
+# console needs no runtime Cg compiler, and a machine without docker still builds the vpk.
 set(GXM_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/gxm_shaders.gen.h")
 file(GLOB GXM_SHADER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.gxp")
 add_custom_command(
@@ -34,6 +34,8 @@ set(CITRA_VITA_SOURCES
     emu_window_vita.h
     gxm_present.cpp
     gxm_present.h
+    imgui_impl_gxm.cpp
+    imgui_impl_gxm.h
     imgui_impl_sgxd.cpp
     imgui_impl_sgxd.h
     imgui_impl_vita.cpp
@@ -94,7 +96,6 @@ function(citra_vita_executable target titleid)
         taihen_stub
         SceDisplay_stub
         SceGxm_stub
-        SceCommonDialog_stub
         SceCtrl_stub
         SceTouch_stub
         SceAudio_stub

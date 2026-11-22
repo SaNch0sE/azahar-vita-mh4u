@@ -217,7 +217,6 @@ void PutClear(Batch& b) {
     b.draw_count = 1;
 }
 
-// The frame just rendered as a PPM, as GxmPresent's WriteDisplayPpm.
 void WriteDisplayPpm(const char* path, const u8* px) {
     FILE* f = std::fopen(path, "wb");
     if (f == nullptr) {

@@ -25,9 +25,9 @@
  * file) over the running title's own value over the one for all games.
  *
  * The values are the emulator's settings and the frontend's own switches (the layout's overlay,
- * widescreen, the top screen's scale, the menus' theme); this is the only place that writes them,
- * so that what a menu shows is what runs. Any thread: the pause menu edits on the render thread,
- * the run loop applies a title's values on the emulation thread.
+ * widescreen, the top screen's scale, the menus' theme, the start-up notice); this is the only
+ * place that writes them, so that what a menu shows is what runs. Any thread: the pause menu edits
+ * on the render thread, the run loop applies a title's values on the emulation thread.
  */
 namespace VitaFrontend::Config {
 
@@ -63,6 +63,9 @@ enum class Option : u32 {
     /// Their colours: 0 dark, 1 light (the HOME Menu's). The frontend's own; the menus read it
     /// as they draw.
     Theme,
+    /// The notice before sgxd takes the GPU at start (ShowGxmNotice): 1, or 0 to take it at once.
+    /// The frontend's own, read as the app starts.
+    StartupNotice,
     Count,
 };
 
@@ -85,8 +88,8 @@ constexpr int NoFrameSkipLimit = 5;
 
 /// Whether a title can have its own value. The options for the screens and the speed are: what
 /// suits one title (a top screen it needs whole, a scale its GPU work allows, vsync where its
-/// frame rate is uneven) does not suit the next. The sound, the region and the menus' theme are
-/// the player's or the console's, the same whatever runs.
+/// frame rate is uneven) does not suit the next. The sound, the region, the menus' theme and the
+/// start-up notice are the player's or the console's, the same whatever runs.
 [[nodiscard]] bool PerTitle(Option option);
 /// Whether a change takes effect under a running title. The region is read as a title loads.
 [[nodiscard]] bool Runtime(Option option);

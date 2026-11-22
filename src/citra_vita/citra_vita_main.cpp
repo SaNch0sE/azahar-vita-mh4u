@@ -26,7 +26,6 @@
 #include <psp2/appmgr.h>
 #include <psp2/audioout.h>
 #include <psp2/ctrl.h>
-#include <psp2/touch.h>
 #include <psp2/display.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -34,15 +33,14 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
-#include <psp2/message_dialog.h>
 #include <psp2/power.h>
 #include <psp2/shellutil.h>
+#include <psp2/touch.h>
 #include <psp2/vshbridge.h>
 #include <taihen.h>
 #include "citra_vita/banner_player.h"
 #include "citra_vita/config.h"
 #include "citra_vita/crash_report.h"
-#include "citra_vita/gxm_present.h"
 #include "citra_vita/sgxd_present.h"
 
 #include "citra_vita/emu_window_vita.h"
@@ -147,6 +145,9 @@ constexpr int MinAzaharNativeVersion = 69;
 namespace {
 /// The process's own arguments, kept for LaunchParameter.
 std::vector<std::string> g_arguments;
+/// Whether the process was launched by its SELF's path (LOADP, SceAppMgr's
+/// LaunchAppByPath), not from the LiveArea; LoadAzaharNative's restart carries it on.
+bool g_launched_by_path = false;
 
 /// Where the vpk puts the kernel module. The kernel opens the file itself, and app0: is this
 /// process's mount rather than a path the kernel resolves, so this is the installed copy.
@@ -265,9 +266,8 @@ std::string DescribeLoadError(Core::System::ResultStatus status) {
     }
 }
 
-/// Releases the GPU's view of guest memory and shuts the system down - in that order, because
-/// the unmap must run while guest RAM is still allocated. `threads_before`: the threads running
-/// before the title (RunningNamedThreads), all that may be left after it.
+/// Shuts the system down. `threads_before`: the threads running before the title
+/// (RunningNamedThreads), all that may be left after it.
 void ShutdownSystem(Core::System& system, std::size_t threads_before) {
     // A title's process alive after its shutdown keeps its kernel objects and its page table
     // (5 MiB) on the heap for good. Reported with the HLE async sections in flight.
@@ -277,7 +277,6 @@ void ShutdownSystem(Core::System& system, std::size_t threads_before) {
     // finishes and its threads join here, while everything it may touch is still there; the
     // shutdown joins the rest (the render thread, the DSP's, the services' workers).
     Kernel::JoinAsyncSections();
-    VitaFrontend::GxmPresent::UnmapAllGuestMemory();
     system.Shutdown();
     // The title's GPU session is over: nothing of it is left for the next one (the game list's
     // banner) to wait on.
@@ -397,9 +396,11 @@ StateArguments TakeStateArguments() {
         const std::string& argument = g_arguments[i];
         if (argument.starts_with("load=")) {
             a.load = std::atoi(argument.c_str() + 5);
-        } else if (argument == "commands" || argument.starts_with("seq=") ||
-                   argument.starts_with("crashed=") || argument.starts_with("changed=")) {
-            // CommandChannel's, and a crash's restart's (main).
+        } else if (argument == "commands" || argument == "crashhold" || argument == "notice" ||
+                   argument.starts_with("seq=") || argument.starts_with("crashed=") ||
+                   argument.starts_with("changed=")) {
+            // CommandChannel's, a crashed title's hold (RunTitle), EmulatorMain's start-up
+            // notice, and a crash's restart's (main).
         } else if (argument.starts_with("scale=")) {
             // The top screen's scale: 1, 1.25, 1.5, 1.75 or 2 (Config::TopScaleValue).
             Config::Pin(Option::TopScale,
@@ -2356,13 +2357,15 @@ bool module_installed(const std::string& name) {
 }
 
 int AppMgrOptionValues(std::string_view option);
+bool IsOwnSelfPath(std::string_view argument);
 
 /**
  * Finds the marker LoadAzaharNative's restart carries. The arguments after it, when there are
  * any, are the launch parameter the first process was started with and the ones after it
  * (load=N, save=N@T), which the restart would otherwise lose; SceAppMgr's options among them
- * are skipped as main does. The scan starts at argv[0] because nothing says whether the
- * restarted process gets its own path there.
+ * are skipped as main does, and a SELF's path among them says the first process was launched by
+ * path. The scan starts at argv[0] because nothing says whether the restarted process gets its
+ * own path there.
  */
 bool TakeRelaunchArguments(int argc, char* argv[]) {
     for (int i = 0; i < argc; ++i) {
@@ -2372,6 +2375,10 @@ bool TakeRelaunchArguments(int argc, char* argv[]) {
         for (int j = i + 1; j < argc && argv[j] != nullptr && argv[j][0] != '\0'; ++j) {
             if (argv[j][0] == '-' && argv[j][1] != '\0') {
                 j += AppMgrOptionValues(argv[j]);
+                continue;
+            }
+            if (IsOwnSelfPath(argv[j])) {
+                g_launched_by_path = true;
                 continue;
             }
             g_arguments.emplace_back(argv[j]);
@@ -2456,7 +2463,8 @@ std::string LoadAzaharNative(bool relaunched) {
         return "azaharnative.skprx was loaded twice without the restarted app seeing it.";
     }
 
-    // The restart carries the launch parameter and the arguments after it (load=N, save=N@T).
+    // The restart carries the launch parameter and the arguments after it (load=N, save=N@T), and
+    // for a launch by path a SELF's path before them.
     std::string marker{RelaunchArgument};
     std::vector<std::string> carried = g_arguments;
     if (carried.empty()) {
@@ -2465,6 +2473,10 @@ std::string LoadAzaharNative(bool relaunched) {
         }
     }
     std::vector<char*> args{marker.data()};
+    std::string self_path{"app0:eboot.bin"};
+    if (g_launched_by_path) {
+        args.push_back(self_path.data());
+    }
     for (std::string& argument : carried) {
         args.push_back(argument.data());
     }
@@ -2482,29 +2494,10 @@ std::string LoadAzaharNative(bool relaunched) {
         static_cast<u32>(exec));
 }
 
-/// The system's message dialog, over GXM: only before sgxd has the GPU, or when it could not
-/// take it.
-void show_error_dialog(const std::string& message) {
-    if (!VitaFrontend::GxmPresent::Initialize()) {
-        LOG_CRITICAL(Frontend, "Could not bring up GXM for: {}", message);
-        return;
-    }
-    SceMsgDialogUserMessageParam msg_param{};
-    msg_param.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_OK;
-    msg_param.msg = reinterpret_cast<const SceChar8*>(message.c_str());
-
-    SceMsgDialogParam param{};
-    sceMsgDialogParamInit(&param);
-    param.mode = SCE_MSG_DIALOG_MODE_USER_MSG;
-    param.userMsgParam = &msg_param;
-
-    sceMsgDialogInit(&param);
-
-    while (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED) {
-        VitaFrontend::GxmPresent::SwapCommonDialog();
-    }
-    sceMsgDialogTerm();
-    VitaFrontend::GxmPresent::Shutdown();
+/// What stops the start, on the notice through GXM: only before sgxd has the GPU, or when it could
+/// not take it.
+void ShowStartError(const std::string& message) {
+    VitaFrontend::ShowGxmNotice("Azahar can't start", message, "", "Close");
 }
 
 /// The emulator proper. Runs on a thread of its own; see main.
@@ -2516,23 +2509,20 @@ int EmulatorMain() {
 
     SetupPaths();
     SetupLogging();
+    // What the player chose, from the memory card: the values for all games until a title runs.
+    // Before the first screen, which takes its theme from them.
+    Config::Load();
 
     // What stops the start comes first, in the menus' language: before anything else is set up
     // and before the startup notice. Closing it exits the app.
-    {
-        SceCommonDialogConfigParam dialog_config_param{};
-        sceCommonDialogSetConfigParam(&dialog_config_param);
-
-        if (!g_native_error.empty()) {
-            show_error_dialog(g_native_error);
-            return -1;
-        }
-
-        if (!module_installed("CapUnlocker")) {
-            show_error_dialog("CapUnlocker.skprx not installed. Install it from "
-                              "https://github.com/GrapheneCt/CapUnlocker");
-            return -1;
-        }
+    if (!g_native_error.empty()) {
+        ShowStartError(g_native_error);
+        return -1;
+    }
+    if (!module_installed("CapUnlocker")) {
+        ShowStartError("Install CapUnlocker.skprx from https://github.com/GrapheneCt/CapUnlocker, "
+                       "then reboot your console.");
+        return -1;
     }
 
     SetupClocks();
@@ -2546,13 +2536,42 @@ int EmulatorMain() {
     SetupNetwork();
     VitaFrontend::Multiplayer::Init();
 
+    // The last moment the system can draw: anything that needs its notifications or quick menu
+    // (a plugin's menu there, such as PSVshell's clocks) has to happen now. The clocks are set
+    // already (SetupClocks), so a plugin's choice there is the one that stays, and the PS button
+    // is not locked yet. Not on a crash's restart, whose session showed it, nor on a launch by
+    // path (a scripted launch drives the console itself) unless it asks with `notice`.
+    const auto argument_given = [](auto test) {
+        return std::any_of(g_arguments.begin(), g_arguments.end(), test);
+    };
+    const bool crash_restart = argument_given(
+        [](const std::string& argument) { return argument.starts_with("crashed="); });
+    const bool asked =
+        argument_given([](const std::string& argument) { return argument == "notice"; });
+    // Nor in the replay player, which a scripted launch starts with no path and nobody presses X
+    // for.
+#ifdef AZAHAR_REPLAY_PLAYER
+    constexpr bool replay_player = true;
+#else
+    constexpr bool replay_player = false;
+#endif
+    if (Config::Global(Option::StartupNotice) != 0 && !crash_restart && !replay_player &&
+        (!g_launched_by_path || asked)) {
+        VitaFrontend::ShowGxmNotice(
+            "Before Azahar starts",
+            "Azahar is about to take over the GPU. Until you close it, notifications, the quick "
+            "menu and plugin menus such as PSVshell's won't show, and the PS button won't leave "
+            "Azahar.\n\nUse them now if you need them, then press X to continue.",
+            "You can turn this screen off in Settings > System > Startup notice.", "Continue");
+    }
+
     // The GPU is sgxd's from here to the end of the session (docs/sgxd/takeover.md). No GXM call
     // may follow: SceGpu's callers would wait at its gate.
     std::string sgxd_error;
     if (!VitaFrontend::SgxdPresent::Initialize(&sgxd_error)) {
         LOG_CRITICAL(Frontend, "{}", sgxd_error);
         sceClibPrintf("[azahar] %s\n", sgxd_error.c_str());
-        show_error_dialog(sgxd_error);
+        ShowStartError(sgxd_error);
         return -1;
     }
 
@@ -2587,8 +2606,6 @@ int EmulatorMain() {
     // Vertex shading happens on the GPU or not at all: with this off, the PICA code would send
     // every draw down its CPU vertex path, which the sgxd rasterizer does not have.
     Settings::values.use_hw_shader = true;
-    // What the player chose, from the memory card: the values for all games until a title runs.
-    Config::Load();
     Frontend::RegisterDefaultApplets(system);
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());
 
@@ -2819,7 +2836,11 @@ int main(int argc, char* argv[]) {
 #ifdef VITA_DIAGNOSTICS
         sceClibPrintf("[azahar] argv[%d] %s\n", i, argv[i] != nullptr ? argv[i] : "(null)");
 #endif
-        if (argv[i] == nullptr || argv[i][0] == '\0' || IsOwnSelfPath(argv[i])) {
+        if (argv[i] == nullptr || argv[i][0] == '\0') {
+            continue;
+        }
+        if (IsOwnSelfPath(argv[i])) {
+            g_launched_by_path = true;
             continue;
         }
         // SceAppMgr's options start with a dash; a dash alone is the launch parameter's "no
