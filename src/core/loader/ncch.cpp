@@ -125,11 +125,15 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
     if (!is_loaded)
         return ResultStatus::ErrorNotLoaded;
 
+    // The ExeFS's own .code goes straight into the process's memory at its start (the image's
+    // writer below), decompressed there: no copy of it on the heap, where twice the image could
+    // fail on a fragmented heap. An override file, a patch or a prototype still go that way.
+    const bool in_place = overlay_ncch->CodeLoadsInPlace();
     std::vector<u8> code;
     u64_le program_id;
-    if (ResultStatus::Success == ReadCode(code) &&
+    if ((in_place || ResultStatus::Success == ReadCode(code)) &&
         ResultStatus::Success == ReadProgramId(program_id)) {
-        if (IsGbaVirtualConsole(code)) {
+        if (!in_place && IsGbaVirtualConsole(code)) {
             LOG_ERROR(Loader, "Encountered unsupported GBA Virtual Console code section.");
             return ResultStatus::ErrorGbaTitle;
         }
@@ -153,7 +157,11 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
         // TODO(yuriks): Not sure if the bss size is added to the page-aligned .data size or just
         //               to the regular size. Playing it safe for now.
         u32 bss_page_size = (overlay_ncch->exheader_header.codeset_info.bss_size + 0xFFF) & ~0xFFF;
-        code.resize(code.size() + bss_page_size, 0);
+        if (!in_place) {
+            // Grown exactly: by the .bss alone, the vector would take twice the image.
+            code.reserve(code.size() + bss_page_size);
+            code.resize(code.size() + bss_page_size, 0);
+        }
 
         codeset->DataSegment().offset =
             codeset->RODataSegment().offset + codeset->RODataSegment().size;
@@ -164,12 +172,28 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
             bss_page_size;
 
         // Apply patches now that the entire codeset (including .bss) has been allocated
-        const ResultStatus patch_result = overlay_ncch->ApplyCodePatch(code);
-        if (patch_result != ResultStatus::Success && patch_result != ResultStatus::ErrorNotUsed)
-            return patch_result;
+        if (!in_place) {
+            const ResultStatus patch_result = overlay_ncch->ApplyCodePatch(code);
+            if (patch_result != ResultStatus::Success &&
+                patch_result != ResultStatus::ErrorNotUsed)
+                return patch_result;
+        }
 
         codeset->entrypoint = codeset->CodeSegment().addr;
-        codeset->memory = std::move(code);
+        ResultStatus code_result = ResultStatus::Success;
+        bool gba_virtual_console = false;
+        if (in_place) {
+            codeset->image_writer = [this, &code_result,
+                                     &gba_virtual_console](const CodeSet::ImagePieces& image) {
+                std::size_t size = 0;
+                std::array<u8, 16> tail{};
+                code_result = overlay_ncch->LoadCodeInto(image, size, tail);
+                gba_virtual_console = code_result == ResultStatus::Success &&
+                                      size >= tail.size() && IsGbaVirtualConsole(tail);
+            };
+        } else {
+            codeset->memory = std::move(code);
+        }
 
         process = system.Kernel().CreateProcess(std::move(codeset));
 
@@ -242,6 +266,13 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
         fs_user->RegisterProductInfo(process->process_id, product_info);
 
         process->Run(priority, stack_size);
+        if (code_result != ResultStatus::Success) {
+            return code_result;
+        }
+        if (gba_virtual_console) {
+            LOG_ERROR(Loader, "Encountered unsupported GBA Virtual Console code section.");
+            return ResultStatus::ErrorGbaTitle;
+        }
         return ResultStatus::Success;
     }
     return ResultStatus::Error;

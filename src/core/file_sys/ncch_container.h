@@ -4,8 +4,10 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 #include "common/bit_field.h"
@@ -274,6 +276,24 @@ public:
     Loader::ResultStatus LoadSectionExeFS(const char* name, std::vector<u8>& buffer);
 
     /**
+     * Whether the application's .code is read straight into the process's memory (LoadCodeInto):
+     * the ExeFS's own section, with no file overriding it, no patch and not a prototype's ExeFS.
+     */
+    bool CodeLoadsInPlace();
+
+    /**
+     * Reads the ExeFS's .code into `image`, the process's memory for its code (text through
+     * data, the .bss zeroed after them, in the pieces of FCRAM it lies in), and decompresses it
+     * there as the 3DS's loader does: the section's compression works backwards from its end, so
+     * it unpacks over its own input.
+     * @param size The decompressed image's size
+     * @param tail The decompressed image's last 16 bytes
+     * @return ResultStatus result of function
+     */
+    Loader::ResultStatus LoadCodeInto(std::span<const std::span<u8>> image, std::size_t& size,
+                                      std::array<u8, 16>& tail);
+
+    /**
      * Reads an application ExeFS section from external files instead of an NCCH file,
      * (e.g. code.bin, logo.bcma.lz, icon.icn, banner.bnr)
      * @param name Name of section to read from external files
@@ -360,6 +380,15 @@ public:
     ExHeader_Header exheader_header;
 
 private:
+    struct CodePatch {
+        std::string path;
+        Loader::ResultStatus (*patch_fn)(const std::vector<u8>& patch, std::vector<u8>& code);
+    };
+    /// The files a patch of .code is looked for in, in order (ApplyCodePatch).
+    std::array<CodePatch, 7> CodePatches() const;
+    /// The files that replace an ExeFS section, in order (LoadOverrideExeFSSection).
+    std::array<std::string, 3> OverridePaths(const std::string& override_name) const;
+
     bool has_header = false;
     bool has_exheader = false;
     bool has_exefs = false;

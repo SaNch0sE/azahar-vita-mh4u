@@ -87,6 +87,10 @@ template <class Archive>
 void CodeSet::serialize(Archive& ar, const unsigned int) {
     ar& boost::serialization::base_object<Object>(*this);
     ar & memory;
+    // A state from before the image was dropped at the process's start carries it.
+    if (Archive::is_loading::value) {
+        ReleaseImage();
+    }
     ar & segments;
     ar & entrypoint;
     ar & name;
@@ -235,14 +239,41 @@ void Process::Run(s32 main_thread_priority, u32 stack_size) {
                           MemoryState memory_state) {
         HeapAllocate(std::addressof(out_addr), segment.addr, segment.size, permissions,
                      memory_state, true);
-        kernel.memory.WriteBlock(*this, segment.addr, codeset->memory.data() + segment.offset,
-                                 segment.size);
+        if (!codeset->image_writer) {
+            kernel.memory.WriteBlock(*this, segment.addr, codeset->memory.data() + segment.offset,
+                                     segment.size);
+        }
     };
 
     // Map CodeSet segments
     MapSegment(codeset->CodeSegment(), VMAPermission::ReadExecute, MemoryState::Code);
     MapSegment(codeset->RODataSegment(), VMAPermission::Read, MemoryState::Code);
     MapSegment(codeset->DataSegment(), VMAPermission::ReadWrite, MemoryState::Private);
+    if (codeset->image_writer) {
+        // The segments follow each other in the address space as the 3DS's loader maps them; in
+        // FCRAM each has its own block (HeapAllocate), so the writer is given the pieces.
+        const CodeSet::Segment& text = codeset->CodeSegment();
+        const CodeSet::Segment& ro = codeset->RODataSegment();
+        const CodeSet::Segment& data = codeset->DataSegment();
+        ASSERT_MSG(ro.addr == text.addr + text.size && data.addr == ro.addr + ro.size,
+                   "the code segments are not one range: {:#x}+{:#x}, {:#x}+{:#x}, {:#x}+{:#x}",
+                   text.addr, text.size, ro.addr, ro.size, data.addr, data.size);
+        auto blocks =
+            vm_manager.GetBackingBlocksForRange(text.addr, data.addr + data.size - text.addr);
+        ASSERT_MSG(blocks.Succeeded(), "the code's memory is not mapped");
+        CodeSet::ImagePieces pieces;
+        for (auto& [backing, size] : blocks.Unwrap()) {
+            // Blocks that follow each other in FCRAM too are one piece.
+            if (!pieces.empty() && pieces.back().data() + pieces.back().size() == backing.GetPtr()) {
+                pieces.back() = std::span<u8>(pieces.back().data(), pieces.back().size() + size);
+            } else {
+                pieces.emplace_back(backing.GetPtr(), size);
+            }
+        }
+        codeset->image_writer(pieces);
+        codeset->image_writer = nullptr;
+    }
+    codeset->ReleaseImage();
 
     // Allocate and map stack
     HeapAllocate(std::addressof(out_addr), Memory::HEAP_VADDR_END - stack_size, stack_size,

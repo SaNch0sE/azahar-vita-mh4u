@@ -7,7 +7,9 @@
 #include <array>
 #include <bitset>
 #include <cstddef>
+#include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -116,7 +118,21 @@ public:
         return segments[2];
     }
 
+    /// The image as the loader read it, copied into the process's memory at its start
+    /// (Process::Run) and then dropped. Empty when the loader writes the image itself.
     std::vector<u8> memory;
+    /// The process's memory for its image at the start, text through data (the .bss zeroed
+    /// after), in image order: the pieces of FCRAM it lies in (each segment has its own).
+    using ImagePieces = std::vector<std::span<u8>>;
+    /// The loader's own writer of the image, in place of `memory`: given the process's memory for
+    /// it at the start, it reads the image straight there (an NCCH's .code, decompressed where it
+    /// runs). Not kept past the start.
+    std::function<void(const ImagePieces&)> image_writer;
+
+    /// Drops the loader's copy of the image: the process's memory holds it from its start.
+    void ReleaseImage() {
+        std::vector<u8>().swap(memory);
+    }
 
     std::array<Segment, 3> segments;
     VAddr entrypoint;

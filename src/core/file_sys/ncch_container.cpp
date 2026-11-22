@@ -2,12 +2,14 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <cryptopp/aes.h>
 #include <cryptopp/modes.h>
 #include <cryptopp/sha.h>
+#include "common/assert.h"
 #include "common/common_types.h"
 #include "common/file_derived.h"
 #include "common/logging/log.h"
@@ -45,29 +47,51 @@ static std::size_t LZSS_GetDecompressedSize(std::span<const u8> buffer) {
     return offset_size + buffer.size();
 }
 
+/// The process's memory for its code as one buffer over its pieces (each segment has its own
+/// block of FCRAM), for the decompression in place.
+struct ImagePiecesView {
+    std::span<const std::span<u8>> pieces;
+
+    std::size_t size() const {
+        std::size_t total = 0;
+        for (const std::span<u8>& piece : pieces) {
+            total += piece.size();
+        }
+        return total;
+    }
+
+    u8& operator[](std::size_t i) const {
+        for (const std::span<u8>& piece : pieces) {
+            if (i < piece.size()) {
+                return piece[i];
+            }
+            i -= piece.size();
+        }
+        UNREACHABLE_MSG("past the code's memory");
+    }
+};
+
 /**
- * Decompress ExeFS file (compressed with LZSS)
- * @param compressed Compressed buffer
- * @param compressed_size Size of compressed buffer
- * @param decompressed Decompressed buffer
- * @param decompressed_size Size of decompressed buffer
+ * Decompress ExeFS file (compressed with LZSS) where it lies: the compressed bytes at the
+ * buffer's start, the decompressed ones over them. The format works backwards from the end, and
+ * its writes never pass the reads still to come (the 3DS's loader unpacks in place too).
+ * @param buffer The compressed section at its start, as long as it decompresses to
+ * @param compressed_size Size of the compressed section
  * @return True on success, otherwise false
  */
-static bool LZSS_Decompress(std::span<const u8> compressed, std::span<u8> decompressed) {
-    const u8* footer = compressed.data() + compressed.size() - 8;
+template <typename Buffer>
+static bool LZSS_DecompressInPlace(Buffer& buffer, std::size_t buffer_size,
+                                   std::size_t compressed_size) {
+    const u32 buffer_top_and_bottom =
+        buffer[compressed_size - 8] | (buffer[compressed_size - 7] << 8) |
+        (buffer[compressed_size - 6] << 16) | (static_cast<u32>(buffer[compressed_size - 5]) << 24);
 
-    u32 buffer_top_and_bottom;
-    std::memcpy(&buffer_top_and_bottom, footer, sizeof(u32));
-
-    std::size_t out = decompressed.size();
-    std::size_t index = compressed.size() - ((buffer_top_and_bottom >> 24) & 0xFF);
-    std::size_t stop_index = compressed.size() - (buffer_top_and_bottom & 0xFFFFFF);
-
-    std::memset(decompressed.data(), 0, decompressed.size());
-    std::memcpy(decompressed.data(), compressed.data(), compressed.size());
+    std::size_t out = buffer_size;
+    std::size_t index = compressed_size - ((buffer_top_and_bottom >> 24) & 0xFF);
+    std::size_t stop_index = compressed_size - (buffer_top_and_bottom & 0xFFFFFF);
 
     while (index > stop_index) {
-        u8 control = compressed[--index];
+        u8 control = buffer[--index];
 
         for (unsigned i = 0; i < 8; i++) {
             if (index <= stop_index)
@@ -83,7 +107,7 @@ static bool LZSS_Decompress(std::span<const u8> compressed, std::span<u8> decomp
                     return false;
                 index -= 2;
 
-                u32 segment_offset = compressed[index] | (compressed[index + 1] << 8);
+                u32 segment_offset = buffer[index] | (buffer[index + 1] << 8);
                 u32 segment_size = ((segment_offset >> 12) & 15) + 3;
                 segment_offset &= 0x0FFF;
                 segment_offset += 2;
@@ -94,22 +118,34 @@ static bool LZSS_Decompress(std::span<const u8> compressed, std::span<u8> decomp
 
                 for (unsigned j = 0; j < segment_size; j++) {
                     // Check if compression is out of bounds
-                    if (out + segment_offset >= decompressed.size())
+                    if (out + segment_offset >= buffer_size)
                         return false;
 
-                    u8 data = decompressed[out + segment_offset];
-                    decompressed[--out] = data;
+                    u8 data = buffer[out + segment_offset];
+                    buffer[--out] = data;
                 }
             } else {
                 // Check if compression is out of bounds
                 if (out < 1)
                     return false;
-                decompressed[--out] = compressed[--index];
+                buffer[--out] = buffer[--index];
             }
             control <<= 1;
         }
     }
     return true;
+}
+
+/**
+ * Decompress ExeFS file (compressed with LZSS)
+ * @param compressed Compressed buffer
+ * @param decompressed Decompressed buffer
+ * @return True on success, otherwise false
+ */
+static bool LZSS_Decompress(std::span<const u8> compressed, std::span<u8> decompressed) {
+    std::memset(decompressed.data(), 0, decompressed.size());
+    std::memcpy(decompressed.data(), compressed.data(), compressed.size());
+    return LZSS_DecompressInPlace(decompressed, decompressed.size(), compressed.size());
 }
 
 std::unique_ptr<FileUtil::IOFileBase> NCCHContainer::AutoOpenNCCHNCSD(const std::string& filepath) {
@@ -491,12 +527,78 @@ Loader::ResultStatus NCCHContainer::LoadSectionExeFS(const char* name, std::vect
     return Loader::ResultStatus::ErrorNotUsed;
 }
 
-Loader::ResultStatus NCCHContainer::ApplyCodePatch(std::vector<u8>& code) const {
-    struct PatchLocation {
-        std::string path;
-        Loader::ResultStatus (*patch_fn)(const std::vector<u8>& patch, std::vector<u8>& code);
-    };
+bool NCCHContainer::CodeLoadsInPlace() {
+    if (Load() != Loader::ResultStatus::Success || is_proto || !has_exefs ||
+        !exefs_file->IsOpen()) {
+        return false;
+    }
+    for (const std::string& path : OverridePaths("code.bin")) {
+        if (FileUtil::Exists(path)) {
+            return false;
+        }
+    }
+    for (const CodePatch& patch : CodePatches()) {
+        if (FileUtil::Exists(patch.path)) {
+            return false;
+        }
+    }
+    return true;
+}
 
+Loader::ResultStatus NCCHContainer::LoadCodeInto(std::span<const std::span<u8>> image,
+                                                 std::size_t& size, std::array<u8, 16>& tail) {
+    Loader::ResultStatus result = Load();
+    if (result != Loader::ResultStatus::Success)
+        return result;
+
+    const ImagePiecesView view{image};
+    const std::size_t image_size = view.size();
+    for (unsigned section_number = 0; section_number < kMaxSections; section_number++) {
+        const auto& section = exefs_header.section[section_number];
+        if (std::strcmp(section.name, ".code") != 0) {
+            continue;
+        }
+        if (section.size > image_size || section.size < 8) {
+            LOG_ERROR(Service_FS, ".code of {} bytes for the code's {} bytes", section.size,
+                      image_size);
+            return Loader::ResultStatus::ErrorInvalidFormat;
+        }
+        // The section into the image's start, piece by piece.
+        exefs_file->Seek(section.offset + sizeof(ExeFs_Header), SEEK_SET);
+        std::size_t read = 0;
+        for (const std::span<u8>& piece : image) {
+            const std::size_t n = std::min<std::size_t>(piece.size(), section.size - read);
+            if (n == 0) {
+                break;
+            }
+            if (exefs_file->ReadBytes(piece.data(), n) != n)
+                return Loader::ResultStatus::Error;
+            read += n;
+        }
+        size = section.size;
+        if (is_compressed) {
+            size += view[section.size - 4] | (view[section.size - 3] << 8) |
+                    (view[section.size - 2] << 16) |
+                    (static_cast<u32>(view[section.size - 1]) << 24);
+            if (size > image_size) {
+                LOG_ERROR(Service_FS, ".code decompresses to {} bytes, over the code's {} bytes",
+                          size, image_size);
+                return Loader::ResultStatus::ErrorInvalidFormat;
+            }
+            if (!LZSS_DecompressInPlace(view, size, section.size)) {
+                return Loader::ResultStatus::ErrorInvalidFormat;
+            }
+        }
+        tail.fill(0);
+        for (std::size_t i = size >= tail.size() ? size - tail.size() : 0, k = 0; i < size; i++) {
+            tail[k++] = view[i];
+        }
+        return Loader::ResultStatus::Success;
+    }
+    return Loader::ResultStatus::ErrorNotUsed;
+}
+
+std::array<NCCHContainer::CodePatch, 7> NCCHContainer::CodePatches() const {
     const auto mods_path =
         fmt::format("{}mods/{:016X}/", FileUtil::GetUserPath(FileUtil::UserPath::LoadDir),
                     GetModId(ncch_header.program_id));
@@ -514,7 +616,7 @@ Loader::ResultStatus NCCHContainer::ApplyCodePatch(std::vector<u8>& code) const 
             fmt::format("{}luma/titles/{:016X}/code.ips",
                         FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir), ncch_header.program_id);
     }
-    const std::array<PatchLocation, 7> patch_paths{{
+    return {{
         {mods_path + "exefs/code.ips", Patch::ApplyIpsPatch},
         {mods_path + "exefs/code.bps", Patch::ApplyBpsPatch},
         {mods_path + "code.ips", Patch::ApplyIpsPatch},
@@ -523,8 +625,10 @@ Loader::ResultStatus NCCHContainer::ApplyCodePatch(std::vector<u8>& code) const 
         {filepath + ".exefsdir/code.ips", Patch::ApplyIpsPatch},
         {filepath + ".exefsdir/code.bps", Patch::ApplyBpsPatch},
     }};
+}
 
-    for (const PatchLocation& info : patch_paths) {
+Loader::ResultStatus NCCHContainer::ApplyCodePatch(std::vector<u8>& code) const {
+    for (const CodePatch& info : CodePatches()) {
         FileUtil::IOFile patch_file{info.path, "rb"};
         if (!patch_file)
             continue;
@@ -543,6 +647,17 @@ Loader::ResultStatus NCCHContainer::ApplyCodePatch(std::vector<u8>& code) const 
     return Loader::ResultStatus::ErrorNotUsed;
 }
 
+std::array<std::string, 3> NCCHContainer::OverridePaths(const std::string& override_name) const {
+    const auto mods_path =
+        fmt::format("{}mods/{:016X}/", FileUtil::GetUserPath(FileUtil::UserPath::LoadDir),
+                    GetModId(ncch_header.program_id));
+    return {{
+        mods_path + "exefs/" + override_name,
+        mods_path + override_name,
+        filepath + ".exefsdir/" + override_name,
+    }};
+}
+
 Loader::ResultStatus NCCHContainer::LoadOverrideExeFSSection(const char* name,
                                                              std::vector<u8>& buffer) {
     std::string override_name;
@@ -559,16 +674,7 @@ Loader::ResultStatus NCCHContainer::LoadOverrideExeFSSection(const char* name,
     else
         return Loader::ResultStatus::Error;
 
-    const auto mods_path =
-        fmt::format("{}mods/{:016X}/", FileUtil::GetUserPath(FileUtil::UserPath::LoadDir),
-                    GetModId(ncch_header.program_id));
-    const std::array<std::string, 3> override_paths{{
-        mods_path + "exefs/" + override_name,
-        mods_path + override_name,
-        filepath + ".exefsdir/" + override_name,
-    }};
-
-    for (const auto& path : override_paths) {
+    for (const auto& path : OverridePaths(override_name)) {
         FileUtil::IOFile section_file(path, "rb");
 
         if (section_file.IsOpen()) {
