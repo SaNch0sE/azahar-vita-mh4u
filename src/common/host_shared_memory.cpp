@@ -115,10 +115,9 @@ HostSharedMemory::HostSharedMemory(std::size_t size_, [[maybe_unused]] const cha
     // alignment from it, so the alignment is done by hand - allocate a page of slack, keep the
     // raw pointer for the free, and point Data() at the first page boundary inside it.
     const std::size_t rounded = (size + 0xFFFu) & ~static_cast<std::size_t>(0xFFFu);
-    // Only a block that asked for the physically contiguous pool goes there. It used to be
-    // taken by anything a megabyte or over, which meant guest FCRAM asked for 128 MB of a
-    // ~26 MB pool at every boot and the kernel printed its refusal three times before the
-    // fallback; the pool is for the RomFS cache, which is sized to it.
+    // Only a block that asked for the physically contiguous pool goes there, not anything a
+    // megabyte or over (guest FCRAM would ask for 128 MB of a ~26 MB pool at every boot); the
+    // pool is for the RomFS cache, which is sized to it.
     // A kernel block of the given type, its size rounded to the type's unit. False, with
     // nothing held, when the kernel refuses it.
     const auto take_block = [&](SceKernelMemBlockType type, std::size_t unit,

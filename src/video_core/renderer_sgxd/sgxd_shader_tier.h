@@ -15,7 +15,7 @@
 #include "common/common_types.h"
 #include "common/named_thread.h"
 #include "common/wake_flag.h"
-#include "video_core/renderer_gxm/usse/gxp_writer.h"
+#include "video_core/renderer_gxm/usse/usse_program.h"
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
 #include "video_core/pica/shader_setup.h"
 #include "video_core/shader/generator/pica_fs_config.h"
@@ -43,7 +43,7 @@ public:
     struct Result {
         u64 key;
         bool vertex;
-        std::optional<Usse::GxpProgram> program; ///< empty when level 2 failed
+        std::optional<Usse::Program> program; ///< empty when level 2 failed
         u32 input_regs; ///< a vertex program's, which the first tier's must equal
         std::string refusal;
         u32 took_us;

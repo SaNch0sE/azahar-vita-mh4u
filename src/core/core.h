@@ -392,7 +392,7 @@ public:
     }
 
     /// Accept a state saved by another build of the same serialization layout (the Vita
-    /// autoload restores states the pi5 harness saved; every commit changes the revision).
+    /// autoload restores states other builds saved; every commit changes the revision).
     void SetLoadStateAnyBuild(bool accept) {
         load_state_any_build = accept;
     }

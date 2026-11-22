@@ -17,7 +17,7 @@
 #include "video_core/renderer_gxm/guest_gpu_memory.h"
 #include "video_core/renderer_gxm/gxm_shader_tier.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
-#include "video_core/renderer_gxm/usse/gxp_writer.h"
+#include "video_core/renderer_gxm/usse/usse_program.h"
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
 #include "video_core/shader/generator/profile.h"
 
@@ -244,7 +244,7 @@ private:
 
     /// A vertex program placed in the code heap, for one PICA program and draw shape.
     struct VertexProgram {
-        Usse::GxpProgram gxp;
+        Usse::Program usse;
         u32 input_regs;
         u32 primary_doutu0;
         u32 secondary_doutu0;
@@ -280,7 +280,7 @@ private:
     };
     struct FragmentProgram {
         std::vector<UniformSource> uniforms;
-        Usse::GxpProgram gxp;
+        Usse::Program usse;
         u32 primary_doutu0;
         u32 secondary_doutu0;
         u32 fprim;
@@ -409,7 +409,8 @@ private:
                                           const std::array<u8, 16>& reg_components, u16 u8_regs,
                                           u16 s8_regs, u16 s16_regs,
                                           Usse::VsMode mode = Usse::VsMode::Draw);
-    VertexProgram PlaceVertexProgram(Usse::GxpProgram gxp, const char* what, u64 key);
+    VertexProgram PlaceVertexProgram(Usse::Program usse, const char* what, u64 key,
+                                     u64 emit_us = 0);
     /// The geometry program for `rows` input rows and at most `max_triangles` triangles an invocation;
     /// `input_rows`: the fixed-primitive mode's registers that read rows of their own.
     const VertexProgram& GeometryProgramFor(u32 rows, bool rows_uniform, bool rows_table,
@@ -425,9 +426,9 @@ private:
     const VertexProgram* last_passthrough = nullptr;
     std::array<u32, 9> last_passthrough_regs{};
     const FragmentProgram& FragmentProgramFor(const Epilogue& epilogue);
-    /// The program placed for sgxd: its code (with the blend's tail), secondary and PDS.
-    FragmentProgram PlaceFragmentProgram(Usse::GxpProgram gxp, const Epilogue& epilogue,
-                                         u64 hash);
+    /// Places a program: its code (with the blend's tail), secondary and PDS. `emit_us` for the log.
+    FragmentProgram PlaceFragmentProgram(Usse::Program usse, const Epilogue& epilogue, u64 hash,
+                                         u64 emit_us = 0);
     void InstallTier2();
     void InstallVertexTier2(ShaderTier2::Result& result);
     /// The host copy of texture unit `unit`'s texture for the open pass: untiled when it is

@@ -768,8 +768,8 @@ void ARM_VitaNative::InvalidateCacheRange(u32 start_address, std::size_t length)
 }
 
 void ARM_VitaNative::ClearExclusiveState() {
-    // Nothing to do here, but not for the reason this used to give. Whether an exception return
-    // clears the local monitor is IMPLEMENTATION DEFINED on ARMv7-A, so entry.S now executes
+    // Nothing to do here. Whether an exception return clears the local monitor is
+    // IMPLEMENTATION DEFINED on ARMv7-A, so entry.S executes
     // CLREX explicitly before every guest entry - which covers this and every other path back
     // into the guest, including the ones that never call through here.
 }

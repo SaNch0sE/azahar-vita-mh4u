@@ -116,12 +116,12 @@ if (ENABLE_GXM)
             renderer_gxm/guest_gpu_memory.h
             renderer_gxm/usse/fs_usse_gen.cpp
             renderer_gxm/usse/fs_usse_gen.h
-            renderer_gxm/usse/gxp_writer.cpp
-            renderer_gxm/usse/gxp_writer.h
             renderer_gxm/usse/usse_encoder.cpp
             renderer_gxm/usse/usse_encoder.h
             renderer_gxm/usse/usse_ir.cpp
             renderer_gxm/usse/usse_ir.h
+            renderer_gxm/usse/usse_program.cpp
+            renderer_gxm/usse/usse_program.h
             renderer_gxm/usse/vs_usse_gen.cpp
             renderer_gxm/usse/vs_usse_gen.h
             renderer_gxm/render_thread.cpp

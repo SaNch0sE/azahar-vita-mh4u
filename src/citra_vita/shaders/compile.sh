@@ -24,16 +24,15 @@ DOCKEREOF
 fi
 # wine refuses to run as a uid that owns no home, so the container runs as root and hands
 # the outputs back to the invoking user at the end.
-docker run --rm -v "$HOME/psvita_sdk:/sdk:ro" -v "$PWD:/shaders" \
+docker run --rm -v "${PSVITA_SDK:?}:/sdk:ro" -v "$PWD:/shaders" \
     -e OWNER="$(id -u):$(id -g)" $IMAGE bash -c '
     fail=0
     for f in /shaders/*.cg; do
         b=$(basename "$f" .cg)
         # Vertex programs are the *_v sources; everything else is a fragment program.
         case $b in *_v) p=sce_vp_psp2;; *) p=sce_fp_psp2;; esac
-        # The ubershader needs -O2: at -O3 the compiler dies with a "fatal internal
-        # compiler error" on it (measured 2026-09-03; the register allocator, not the
-        # source - it compiles once lighting or the TEV stages are taken out).
+        # An ubershader needs -O2: at -O3 the compiler dies with a "fatal internal
+        # compiler error" on it (the register allocator, not the source).
         case $b in uber*) o=-O2;; *) o=;; esac
         if wine /sdk/PSVITA/sdk/host_tools/bin/psp2cgc.exe -profile $p $o "$f" \
                 -o "/shaders/$b.gxp" 2>/tmp/err && [ -s "/shaders/$b.gxp" ]; then

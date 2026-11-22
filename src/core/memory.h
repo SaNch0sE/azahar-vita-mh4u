@@ -70,8 +70,8 @@ struct PageTable {
     // We need 'raw' for the executors and the references for serialization and for the
     // executors' mapping observers. The references are kept as runs of consecutive pages
     // backed by consecutive bytes of one block, not one per page: a MemoryRef is 24 bytes,
-    // and one per page of a 4 GB space was 24 MB per page table - on the Vita, a fifth of
-    // everything the emulator has beside the guest's FCRAM (2026-09-01). A mapping of any
+    // and one per page of a 4 GB space would be 24 MB per page table - on the Vita, a fifth of
+    // everything the emulator has beside the guest's FCRAM. A mapping of any
     // size is one run, so the whole table is a few dozen entries.
     struct Pointers {
 

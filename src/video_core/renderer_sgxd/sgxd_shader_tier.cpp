@@ -84,10 +84,10 @@ void ShaderTier2::Loop(std::stop_token stop) {
         result.key = job->key;
         result.vertex = !job->fs;
         if (job->fs) {
-            result.program = Usse::EmitFragmentGxp(*job->fs, &result.refusal, 2);
+            result.program = Usse::EmitFragmentProgram(*job->fs, &result.refusal, 2);
         } else {
             result.program =
-                Usse::EmitVertexGxp(job->vs, result.input_regs, &result.refusal, 2);
+                Usse::EmitVertexProgram(job->vs, result.input_regs, &result.refusal, 2);
         }
         result.took_us = static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(
                                               std::chrono::steady_clock::now() - start)

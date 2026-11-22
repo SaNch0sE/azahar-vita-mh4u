@@ -8,14 +8,16 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include "video_core/renderer_gxm/usse/gxp_writer.h"
+#include "video_core/renderer_sgxd/usse/usse_program.h"
 #include "video_core/shader/generator/pica_fs_config.h"
 
 namespace GxmRenderer::Usse {
 
 /**
- * The PICA fragment emitter: a GXP program for a fragment configuration, written directly
- * as USSE instructions. Mirrors cg_fs_shader_gen.cpp pass for pass. Its uniforms
+ * The PICA fragment emitter: a USSE fragment program (Program) for a fragment
+ * configuration. Follows upstream's fragment generator (glsl_fs_shader_gen.cpp, and its Cg form
+ * in tools/pica_cg) stage by stage, with the combiners in U8 where the PICA's precision allows
+ * and the lighting LUTs read as filtered F16 rows. Its uniforms
  * (UniformKind: FSUniformData's fields) and samplers (SamplerKind) say what they hold, which
  * the rasterizer fills and binds them by.
  *
@@ -26,7 +28,7 @@ namespace GxmRenderer::Usse {
 /// `refusal`, when given, receives why an empty result came back. `level` 2 runs the IR's
 /// optimising passes (the second tier).
 /// The program itself, for sgxd, which places the code and builds the PDS programs.
-[[nodiscard]] std::optional<GxpProgram> EmitFragmentGxp(const Pica::Shader::FSConfig& config,
+[[nodiscard]] std::optional<Program> EmitFragmentProgram(const Pica::Shader::FSConfig& config,
                                                         std::string* refusal = nullptr,
                                                         int level = 1);
 

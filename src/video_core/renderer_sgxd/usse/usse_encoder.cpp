@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <optional>
@@ -20,7 +21,9 @@ namespace {
 constexpr const char* PatV32Nmad = "00001pppsrrydcbawwwwneeeemmoiittkkllffffffzzzzzzzggghhhhhhjjjjjj";
 constexpr const char* PatV16Nmad = "00010pppsrrydcbawwwwneeeemmoiittkkllffffffzzzzzzzggghhhhhhjjjjjj";
 constexpr const char* PatVmad2 = "00000dpps-ry-cbawwwineeeemmookttffgghhhhhhzzjjllllllqqqqqquuuuuu";
-constexpr const char* PatVmad = "00011pppsg1oderaaittnwwwwcbfhzkkjjllmmmmmmqqqquuuuvvxyAAAABBBBBB";
+// VECMAD has no 3-bit predicate: USE1 bit 26 is its F16 flag and bits 25..24 the 2-bit short
+// predicate (SGXVEC_USE1_VECMAD_F16, SGXVEC_USE1_VECMAD_SVPRED_SHIFT).
+constexpr const char* PatVmad = "000110ppsg1oderaaittnwwwwcbfhzkkjjllmmmmmmqqqquuuuvvxyAAAABBBBBB";
 constexpr const char* PatVdp = "00011pppsc0oderaagttnwwwwbflllkkhhiijjjjjjzzzzmmmqqqyyyxxxuuuuuu";
 constexpr const char* PatVcomp = "00110pppsddyenr-aaaaobbccmmff-ttkk--ggggggg-------hhhhhhh---wwww";
 constexpr const char* PatVmov = "00111pppstrydecbmmaanoooiwwwwkllffgghhhhjjjjjjqqqqqquuuuuuvvvvvv";
@@ -185,6 +188,20 @@ uint64_t ExtVecPred(Pred p) {
         return 5;
     }
     return 0;
+}
+
+// VECMAD's short form: none, p0, !p0 (SGXVEC_USE_VEC_SVPRED_*; 3 is per-channel, unused).
+uint64_t MadPred(Pred p) {
+    switch (p) {
+    case Pred::None:
+        return 0;
+    case Pred::P0:
+        return 1;
+    case Pred::NotP0:
+        return 2;
+    default:
+        Fail("usse: mad takes only p0 or !p0 as its predicate");
+    }
 }
 
 uint64_t ExtPred(Pred p) {
@@ -432,8 +449,8 @@ void Encoder::EndSecondary() {
 
 void Encoder::WdfVertex(uint8_t drc) {
     // Bit 43 is the wait's nosched bit (psp2cgc's `f9200800...` form before an internal
-    // register write, 2026-09-06): without it the boundary after the instruction that
-    // follows the wait is unguarded, and the console corrupted every dynamic uniform read.
+    // register write): without it the boundary after the instruction that follows the wait is
+    // unguarded, and every dynamic uniform read is corrupted.
     Push(drc ? 0xf920000100000000ull : 0xf920000000000000ull, 43, 0, 0);
 }
 
@@ -706,7 +723,97 @@ void Encoder::PatchKills(uint32_t control_sa) {
     }
 }
 
+namespace {
+
+bool UnifiedStore(Bank bank) {
+    return bank != Bank::Internal && bank != Bank::Const;
+}
+
+// The unified-store words a source reads for the lanes in mask (bit k: word reg.n + k of its
+// bank, Z and W counted as words 2 and 3), or 0 for another bank.
+uint32_t SourceWords(const Src& src, uint8_t mask) {
+    uint32_t words = 0;
+    if (!UnifiedStore(src.reg.bank)) {
+        return 0;
+    }
+    for (unsigned j = 0; j < 4; j++) {
+        if ((mask & (1u << j)) && src.swz[j] <= Ch::W) {
+            words |= 1u << static_cast<unsigned>(src.swz[j]);
+        }
+    }
+    return words;
+}
+
+// Whether a write of dst's lanes changes a word src reads for its lanes in mask.
+bool Overwrites(const Dst& dst, const Src& src, uint8_t mask) {
+    if (dst.reg.bank != src.reg.bank || !UnifiedStore(src.reg.bank)) {
+        return false;
+    }
+    const uint32_t read = SourceWords(src, mask);
+    for (unsigned k = 0; k < 4; k++) {
+        if ((read & (1u << k)) && src.reg.n + k >= dst.reg.n && src.reg.n + k < dst.reg.n + 2u &&
+            (dst.mask & (1u << (src.reg.n + k - dst.reg.n)))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // Anonymous namespace
+
 void Encoder::Vec(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched) {
+    // An F32 vector operation on the unified store works on a register pair (docs/sgxd/usse.md): a
+    // unified-store destination takes mask bits 0 and 1 alone (bits 2 and 3 write nothing), and a
+    // unified-store second source does not read the words a z or w lane names (the first source
+    // does). Lanes z and w of a unified-store vector are the next pair's x and y, so such a write
+    // is made there, its sources' z and w lanes moved to x and y.
+    if (!UnifiedStore(Map(dst.reg).bank) || (dst.mask & 0xc) == 0) {
+        VecPair(op, dst, src1, src2, pred, nosched);
+        return;
+    }
+    const Dst low{dst.reg, static_cast<uint8_t>(dst.mask & 0x3)};
+    const Dst high{Reg{dst.reg.bank, static_cast<uint8_t>(dst.reg.n + 2)},
+                   static_cast<uint8_t>(dst.mask >> 2)};
+    Src high1 = src1, high2 = src2;
+    high1.swz = {src1.swz[2], src1.swz[3], src1.swz[2], src1.swz[3]};
+    high2.swz = {src2.swz[2], src2.swz[3], src2.swz[2], src2.swz[3]};
+    if (low.mask == 0) {
+        VecPair(op, high, high1, high2, pred, nosched);
+        return;
+    }
+    // Two instructions: the second must not read what the first wrote.
+    if (!Overwrites(low, high1, high.mask) && !Overwrites(low, high2, high.mask)) {
+        VecPair(op, low, src1, src2, pred, nosched);
+        VecPair(op, high, high1, high2, pred, nosched);
+    } else if (!Overwrites(high, src1, low.mask) && !Overwrites(high, src2, low.mask)) {
+        VecPair(op, high, high1, high2, pred, nosched);
+        VecPair(op, low, src1, src2, pred, nosched);
+    } else {
+        Fail("usse: a unified-store vector write whose two pairs read each other");
+    }
+}
+
+void Encoder::VecPair(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched) {
+    // A unified-store second source's z and w read nothing (usse_ir's SecondSourceInPair keeps
+    // them out; an internal destination's lanes z and w count too).
+    const bool pair_dst = UnifiedStore(Map(dst.reg).bank);
+    const uint8_t lanes = pair_dst ? dst.mask & 0x3 : dst.mask;
+    if (SourceWords(Src{Map(src2.reg), src2.swz, src2.mod}, lanes) & 0xc) {
+        Fail("usse: a unified-store second source's z or w");
+    }
+    if (pair_dst && std::find(std::begin(Vec4Std), std::end(Vec4Std), src2.swz) ==
+                        std::end(Vec4Std)) {
+        // Only lanes x and y count: a standard swizzle with the same two.
+        Swizzle pair;
+        if (!StdSwizzleForPair(src2.swz[0], src2.swz[1], pair)) {
+            Fail("usse: a vector operation's second source pair no standard swizzle has");
+        }
+        src2.swz = pair;
+    }
+    VecWord(op, dst, src1, src2, pred, nosched);
+}
+
+void Encoder::VecWord(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched) {
     dst.reg = Map(dst.reg);
     src1.reg = Map(src1.reg);
     src2.reg = Map(src2.reg);
@@ -730,7 +837,8 @@ void Encoder::Vec(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched
 }
 
 void Encoder::Vec16(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched) {
-    Vec(op, dst, src1, src2, pred, nosched);
+    // An F16 pair holds all four lanes: no move to the second pair.
+    VecWord(op, dst, src1, src2, pred, nosched);
     // Same fields, the opcode selects the f16 unit.
     uint64_t& word = words.back();
     word = (word & ~(0x1full << 59)) | (0b00010ull << 59);
@@ -753,7 +861,7 @@ void Encoder::Mad(Dst dst, Src src1, Src gpi0, Src gpi1, bool vec4, Pred pred, b
     const auto neg = [](Mod m) { return (m == Mod::Neg || m == Mod::NegAbs) ? 1u : 0u; };
     const auto abs = [](Mod m) { return (m == Mod::Abs || m == Mod::NegAbs) ? 1u : 0u; };
     Push(Pack(PatVmad, {
-        {'p', ExtVecPred(pred)}, {'s', skip_invalid ? 1u : 0u}, {'g', sw2ext}, {'o', vec4 ? 1u : 0u}, {'d', dext},
+        {'p', MadPred(pred)}, {'s', skip_invalid ? 1u : 0u}, {'g', sw2ext}, {'o', vec4 ? 1u : 0u}, {'d', dext},
         {'e', 0}, {'r', s1ext}, {'a', 3}, {'i', abs(gpi0.mod)}, {'t', 0},
         {'n', 0}, {'w', dst.mask}, {'c', neg(src1.mod)}, {'b', abs(src1.mod)},
         {'f', neg(gpi1.mod)}, {'h', abs(gpi1.mod)}, {'z', sw0ext}, {'k', db}, {'j', s1b},
@@ -928,6 +1036,14 @@ void Encoder::CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched) {
     src1.reg = Map(src1.reg);
     src2.reg = Map(src2.reg);
 
+    // The one swizzle field selects the lanes of the moved sources 1 and 2; the tested source 0
+    // keeps the identity.
+    if (src0.swz != XYZW) {
+        Fail("usse: a conditional move tests source 0 with the identity swizzle only");
+    }
+    if (src1.swz != src2.swz) {
+        Fail("usse: a conditional move's two moved sources share one swizzle");
+    }
     const auto [db, dext] = DestBank(dst.reg.bank);
     const auto [s0b, s0ext] = Src0Bank(src0.reg.bank);
     const auto [s1b, s1ext] = Src12Bank(src1.reg.bank);
@@ -935,7 +1051,7 @@ void Encoder::CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched) {
     Push(Pack(PatVmov, {
         {'p', 0}, {'s', skip_invalid ? 1u : 0u}, {'t', 0}, {'r', 0}, {'y', 0}, {'d', dext}, {'e', s0ext},
         {'c', s1ext}, {'b', s2ext}, {'m', 1}, {'a', 0}, {'n', 0}, {'o', 5},
-        {'i', 1}, {'w', Vec4StdSwizzle(src0.swz)}, {'k', s0b}, {'l', db}, {'f', s1b},
+        {'i', 1}, {'w', Vec4StdSwizzle(src1.swz)}, {'k', s0b}, {'l', db}, {'f', s1b},
         {'g', s2b}, {'h', dst.mask}, {'j', DoubledNum(dst.reg, 7)},
         {'q', DoubledNum(src0.reg, 7)}, {'u', DoubledNum(src1.reg, 7)},
         {'v', DoubledNum(src2.reg, 7)},
@@ -959,7 +1075,7 @@ void Encoder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2,
     case Cond::Ge: sign = 2; zero = 1; andc = 0; break;
     case Cond::Lt: sign = 1; zero = 2; andc = 1; break;
     case Cond::Le: sign = 1; zero = 1; andc = 0; break;
-    case Cond::Eq: sign = 0; zero = 1; andc = 1; break; // psp2cgc's cmp.eq.f32 (2026-09-05)
+    case Cond::Eq: sign = 0; zero = 1; andc = 1; break; // psp2cgc's cmp.eq.f32
     case Cond::Ne: sign = 0; zero = 2; andc = 1; break;
     }
     Push(Pack(PatVtst, {
@@ -985,6 +1101,15 @@ void Encoder::Sample(Reg dst, Reg coord, uint8_t dims, uint8_t sampler_sa, const
     const auto [cb, cext] = Src0Bank(coord.bank);
     if (dst.bank != Bank::Temp && dst.bank != Bank::PrimAttr) {
         Fail("usse: a texture read lands in a temporary or a primary attribute");
+    }
+    // The four F32 result words start at a 64-bit boundary (an F16 or F32 destination is aligned
+    // to 64 bits on the SGX543); the field itself is not doubled.
+    if (dst.n & 1) {
+        Fail("usse: a texture read's destination is pair-aligned");
+    }
+    // The state source is an 8-bit doubled field, so the control words start at an even SA.
+    if (sampler_sa & 1) {
+        Fail("usse: a texture's control words start at an even secondary attribute");
     }
     Push(Pack(PatSmp, {
         {'p', 0}, {'s', lod ? 1u : 0u}, {'n', 0}, {'y', 0}, {'m', 0},

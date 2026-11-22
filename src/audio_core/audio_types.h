@@ -32,11 +32,11 @@ using QuadFrame32 = std::array<std::array<s32, 4>, samples_per_frame>;
 /**
  * A variable length buffer of signed PCM16 stereo samples: a decoded guest buffer, consumed
  * from the front by the interpolator, which also pushes its two history samples in front of
- * it every tick. Was a std::deque, whose per-element chunk arithmetic was most of the
- * interpolator's and the decoders' time on the emulation thread (2026-09-07, pi5: the audio
- * HLE was 7% of it). A flat vector with a read head and a little slack in front: a pop is a
- * head move, the two history samples fit in the slack, the decoders and the interpolator
- * walk plain pointers. The archive form stays the deque's, so savestates carry over.
+ * it every tick. Not a std::deque, whose per-element chunk arithmetic would be most of the
+ * interpolator's and the decoders' time on the emulation thread. A flat vector with a read head and
+ * a little slack in front: a pop is a head move, the two history samples fit in the slack, the
+ * decoders and the interpolator walk plain pointers. The archive form stays the deque's, so
+ * savestates carry over.
  */
 class StereoBuffer16 {
 public:
@@ -125,7 +125,6 @@ enum class DspState {
 } // namespace AudioCore
 
 // Exactly the deque's bytes on the wire: no class version or object tracking around it, as
-// boost writes none for a std::deque. Without this a state saved before the change loaded as
-// garbage (a kernel memory assertion right after the DSP section, 2026-09-08).
+// boost writes none for a std::deque, so states saved with the deque load.
 BOOST_CLASS_IMPLEMENTATION(AudioCore::StereoBuffer16, boost::serialization::object_serializable)
 BOOST_CLASS_TRACKING(AudioCore::StereoBuffer16, boost::serialization::track_never)

@@ -82,9 +82,9 @@ void Timing::ScheduleEvent(s64 cycles_into_future, const TimingEventType* event_
     if (thread_safe_mode) {
         // The tick count of another thread's timer cannot be read here, so the delay travels with
         // the event and MoveEvents() turns it into an absolute time on the owning thread. That is
-        // what lets it be honoured as written: this used to be floored at MAX_SLICE_LENGTH * 2
-        // cycles, 8.55 ms of emulated time, so that an absolute time computed from a racily read
-        // tick count could not land in the past.
+        // what lets it be honoured as written, with no floor (MAX_SLICE_LENGTH * 2 cycles,
+        // 8.55 ms of emulated time) to keep an absolute time computed from a racily read tick
+        // count from landing in the past.
         timer->ts_queue.Push(
             Event{std::max<s64>(0, cycles_into_future), 0, user_data, event_type, true});
     } else {

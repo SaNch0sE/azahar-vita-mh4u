@@ -34,7 +34,8 @@
 #include "video_core/renderer_gxm/vprof.h"
 #include "video_core/texture/texture_decode.h"
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
-#include "video_core/renderer_gxm/usse/gxp_writer.h"
+#include "video_core/renderer_gxm/usse/usse_ir.h"
+#include "video_core/renderer_gxm/usse/usse_program.h"
 #include "video_core/renderer_gxm/usse/vs_usse_gen.h"
 #include "video_core/shader/generator/shader_gen.h"
 
@@ -116,9 +117,8 @@ const char* TopologyName(Pica::PipelineRegs::TriangleTopology topology) {
     return "unknown";
 }
 
-// What libgxm's shader patcher adds to a fragment program (sgxd_recipe.c's imgui_fs and
-// imgui_fs_blend, Sony's words): the emitter leaves the colour as F16 in pa0, packed to the
-// output with END, or packed in place and blended over the output buffer's o0.
+// The fragment program's epilogue (as libgxm's shader patcher appends it): the colour as F16 in
+// pa0, packed to the output with END, or packed in place and blended over o0.
 constexpr u64 PackToOutput = 0x40a40a3da01d8000ull; // pack.u8.f16.scl o0, pa0 (end)
 constexpr u64 PackInPlace = 0x40a00a3ea01d8000ull;  // pack.u8.f16.scl pa0, pa0
 // VPCK's destination mask (bits 37:34, bit 34 R): an unwritten byte keeps what o0 held.
@@ -567,7 +567,7 @@ struct UniformField {
     bool is_int;
 };
 
-UniformField FragmentUniformField(const Usse::GxpUniform& u) {
+UniformField FragmentUniformField(const Usse::Uniform& u) {
     using D = Pica::Shader::Generator::FSUniformData;
     using L = Pica::Shader::Generator::LightSrc;
     using K = Usse::UniformKind;
@@ -1371,7 +1371,7 @@ void RasterizerSgxd::NoteStreamOut(const char* stage, u32 mode, u32 invocations,
     SgxdBackend::stream_hook = PrintStreamOut;
     stream_note = {stage,       passes, backend.PassDraws() + 1, mode,
                    invocations, rows,   cap,                     count,
-                   program.primary_doutu0, program.gxp.temp_count};
+                   program.primary_doutu0, program.usse.temp_count};
 }
 
 #endif
@@ -2167,22 +2167,22 @@ void RasterizerGxm::NoteLutTable(u32 index, bool ring_move) {
 
 namespace {
 
-/// With gxm_flags dumpgxp, an emitted program as a GXP container on host0, for
-/// psp2shaderperf -disasm; `kind` is vs or fs, `key` the program cache's.
-void DumpGxp(const char* kind, u64 key, const Usse::GxpProgram& gxp) {
-    if (!GxmFlag("dumpgxp")) {
+/// With gxm_flags dumpusse, an emitted program on host0 as azahar-KIND-KEY.json;
+/// `kind` is vs or fs (vs2, fs2: the second tier's), `key` the program cache's.
+void DumpProgram(const char* kind, u64 key, const Usse::Program& program) {
+    if (!SgxdFlag("dumpusse")) {
         return;
     }
-    const std::vector<uint8_t> bytes = Usse::WriteGxp(gxp);
-    const std::string path = fmt::format("host0:azahar-{}-{:016x}.gxp", kind, key);
+    const std::string json = Usse::ProgramJson(program);
+    const std::string path = fmt::format("host0:azahar-{}-{:016x}.json", kind, key);
     if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
-        std::fwrite(bytes.data(), 1, bytes.size(), f);
+        std::fwrite(json.data(), 1, json.size(), f);
         std::fclose(f);
         LOG_INFO(Render, "{} program {:016x}: written to {}", kind, key, path);
     }
 }
 
-/// With gxm_flags dumpgxp, bytes to host0:azahar-NAME.
+/// With sgxd_flags dumpusse, bytes to host0:azahar-NAME.
 void DumpBytes(const std::string& name, const void* data, std::size_t size) {
     const std::string path = fmt::format("host0:azahar-{}", name);
     if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
@@ -2191,11 +2191,11 @@ void DumpBytes(const std::string& name, const void* data, std::size_t size) {
     }
 }
 
-/// With gxm_flags dumpgxp, the 3DS side of a fragment program: its PICA configuration's bytes
+/// With sgxd_flags dumpusse, the 3DS side of a fragment program: its PICA configuration's bytes
 /// (azahar-fs-KEY.fsconfig) and upstream's GLSL for it (azahar-fs-KEY.glsl), for glsl2cg and
 /// psp2cgc to compile the same program as Sony's compiler would.
 void DumpPicaFragment(u64 key, const Pica::Shader::FSConfig& config) {
-    if (!GxmFlag("dumpgxp")) {
+    if (!SgxdFlag("dumpusse")) {
         return;
     }
     DumpBytes(fmt::format("fs-{:016x}.fsconfig", key), &config, sizeof(config));
@@ -2204,12 +2204,12 @@ void DumpPicaFragment(u64 key, const Pica::Shader::FSConfig& config) {
     DumpBytes(fmt::format("fs-{:016x}.glsl", key), glsl.data(), glsl.size());
 }
 
-/// With gxm_flags dumpgxp, the 3DS side of a vertex program: its PicaVSConfig's bytes, then
+/// With sgxd_flags dumpusse, the 3DS side of a vertex program: its PicaVSConfig's bytes, then
 /// the PICA program code and swizzle data (4096 words each) as azahar-vs-KEY.pica, and
 /// upstream's GLSL for it (azahar-vs-KEY.glsl).
 void DumpPicaVertex(u64 key, const Pica::Shader::Generator::PicaVSConfig& config,
                     const Pica::ShaderSetup& setup) {
-    if (!GxmFlag("dumpgxp")) {
+    if (!SgxdFlag("dumpusse")) {
         return;
     }
     std::vector<u8> bytes(sizeof(config));
@@ -2289,41 +2289,61 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::VertexProgramFor(
     const Usse::VsRequest request = make_request();
     VertexProgram v{};
     std::string refusal;
-    auto gxp = Usse::EmitVertexGxp(request, v.input_regs, &refusal);
-    DEBUG_ASSERT_MSG(gxp.has_value(),
-                     "sgxd: vertex program {:016x}: the emitter has no program for it: {}",
-                     state.program_hash, refusal);
-    v.gxp = std::move(*gxp);
-    DumpGxp("vs", key, v.gxp);
+    const u64 emit_start = sceKernelGetProcessTimeWide();
+    auto emitted = Usse::EmitVertexProgram(request, v.input_regs, &refusal);
+    const u64 emit_us = sceKernelGetProcessTimeWide() - emit_start;
+    NoteEmit(0, emit_us);
+    // The PICA side before the assert: a program the emitter refuses is the one to look at.
+    DumpPicaVertex(key, config, pica.vs_setup, request);
+    ASSERT_MSG(emitted.has_value(),
+               "sgxd: vertex program {:016x} (entry {}): the emitter has no program for it: {}",
+               state.program_hash, request.main_offset, refusal);
+    v.usse = std::move(*emitted);
+    DumpProgram("vs", key, v.usse);
     DumpPicaVertex(key, config, pica.vs_setup);
     v.primary_doutu0 =
         sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.primary), v.gxp.temp_count);
     v.secondary_doutu0 = v.gxp.secondary.empty()
                              ? DummyVertexSecondary
-                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.secondary), 0);
+                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.secondary), 0);
     LOG_INFO(Render,
              "vertex program {:016x}: {} + {} words, {} PAs, {} temps, {} SAs, {} uniforms{}, "
              "emitted in {} us",
-             state.program_hash, v.gxp.primary.size(), v.gxp.secondary.size(), v.gxp.pa_count,
-             v.gxp.temp_count, v.gxp.secondary_reg_count, v.gxp.uniforms.size(),
-             v.gxp.per_instance ? ", per instance" : "");
+             state.program_hash, v.usse.primary.size(), v.usse.secondary.size(), v.usse.pa_count,
+             v.usse.temp_count, v.usse.secondary_reg_count, v.usse.uniforms.size(),
+             v.usse.per_instance ? ", per instance" : "", emit_us);
     return vertex_programs.emplace(key, std::move(v)).first->second;
 }
 
-RasterizerGxm::VertexProgram RasterizerGxm::PlaceVertexProgram(Usse::GxpProgram gxp,
+void RasterizerSgxd::FlushPrograms() {
+    LOG_INFO(Render, "sgxd: code heap {} KiB free: {} vertex-side and {} fragment programs dropped",
+             backend.CodeFree() >> 10, vertex_programs.Size(), fragment_programs.Size());
+    vertex_programs.ForEach([this](const VertexProgram& v) { FreeProgramCode(v.code); });
+    fragment_programs.ForEach([this](const FragmentProgram& f) { FreeProgramCode(f.code); });
+    vertex_programs.Clear();
+    fragment_programs.Clear();
+    fragment_states.Clear();
+    vertex_layouts.Clear();
+    last_fragment = nullptr;
+    last_layout = nullptr;
+    last_passthrough = nullptr;
+    program_flushes++;
+}
+
+RasterizerSgxd::VertexProgram RasterizerSgxd::PlaceVertexProgram(Usse::Program usse,
                                                                  const char* what, u64 key,
                                                                  u64 emit_us) {
     VertexProgram v{};
-    v.gxp = std::move(gxp);
-    DumpGxp("vs", key, v.gxp);
-    v.primary_doutu0 = sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.primary),
-                                           v.gxp.temp_count);
-    v.secondary_doutu0 = v.gxp.secondary.empty()
+    v.usse = std::move(usse);
+    DumpProgram("vs", key, v.usse);
+    v.primary_doutu0 = sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.primary),
+                                           v.usse.temp_count);
+    v.secondary_doutu0 = v.usse.secondary.empty()
                              ? DummyVertexSecondary
-                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.secondary), 0);
-    LOG_INFO(Render, "{} {:016x}: {} words, {} PAs, {} temps, {} SAs{}", what, key,
-             v.gxp.primary.size(), v.gxp.pa_count, v.gxp.temp_count, v.gxp.secondary_reg_count,
-             v.gxp.per_instance ? ", per instance" : "");
+                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.secondary), 0);
+    LOG_INFO(Render, "{} {:016x}: {} words, {} PAs, {} temps, {} SAs{}, emitted in {} us", what,
+             key, v.usse.primary.size(), v.usse.pa_count, v.usse.temp_count,
+             v.usse.secondary_reg_count, v.usse.per_instance ? ", per instance" : "", emit_us);
     return v;
 }
 
@@ -2384,11 +2404,15 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::GeometryProgramFor(
     request.gs_max_triangles = max_triangles;
     u32 input_regs = 0;
     std::string refusal;
-    auto gxp = Usse::EmitVertexGxp(request, input_regs, &refusal);
-    DEBUG_ASSERT_MSG(gxp.has_value(),
+    const u64 emit_start = sceKernelGetProcessTimeWide();
+    auto emitted = Usse::EmitVertexProgram(request, input_regs, &refusal);
+    const u64 emit_us = sceKernelGetProcessTimeWide() - emit_start;
+    NoteEmit(1, emit_us);
+    DEBUG_ASSERT_MSG(emitted.has_value(),
                      "sgxd: {}: geometry program {:016x}: the emitter has no program for it: {}",
                      describe(), program_hash, refusal);
-    return vertex_programs.emplace(key, PlaceVertexProgram(std::move(*gxp), "geometry program", key))
+    return vertex_programs
+        .emplace(key, PlaceVertexProgram(std::move(*emitted), "geometry program", key))
         .first->second;
 }
 
@@ -2448,10 +2472,10 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
     request.default_regs = static_cast<u16>(~((1u << request.num_outputs) - 1));
     u32 input_regs = 0;
     std::string refusal;
-    auto gxp = Usse::EmitVertexGxp(request, input_regs, &refusal);
-    ASSERT_MSG(gxp.has_value(), "GXM: the geometry passthrough program: {}", refusal);
+    auto emitted = Usse::EmitVertexProgram(request, input_regs, &refusal);
+    ASSERT_MSG(emitted.has_value(), "sgxd: the geometry passthrough program: {}", refusal);
     ASSERT(request.num_outputs == outputs);
-    VertexProgram v = PlaceVertexProgram(std::move(*gxp), "geometry passthrough", key);
+    VertexProgram v = PlaceVertexProgram(std::move(*emitted), "geometry passthrough", key);
     v.input_regs = input_regs;
     return vertex_programs.emplace(key, std::move(v)).first->second;
 }
@@ -2631,10 +2655,11 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         a0_list[j] = static_cast<u16>(vertices - 1); // the last again: the same stores
     }
     {
-        const auto& ag = a0.vp->gxp;
-        const auto out = std::find_if(ag.attributes.begin(), ag.attributes.end(), [](const auto& a) {
-            return a.kind == Usse::AttributeKind::OutAddress;
-        });
+        const auto& ag = a0.vp->usse;
+        const auto out =
+            std::find_if(ag.attributes.begin(), ag.attributes.end(), [](const auto& a) {
+                return a.kind == Usse::AttributeKind::OutAddress;
+            });
         DEBUG_ASSERT(out != ag.attributes.end() && a0.fetch_count < a0.fetch.size());
         a0.fetch[a0.fetch_count++] = {a0_table.gpu, 4, 1, out->resource};
         a0.fresh = true;
@@ -2756,11 +2781,11 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     gs_regs_loaded |= mapped;
     // Invocations [first, first + n) with program gp, padded to whole triangles with the last again.
     const auto run_invocations = [&](const VertexProgram& gp, u32 first, u32 n) {
-        const auto in = std::find_if(gp.gxp.attributes.begin(), gp.gxp.attributes.end(),
+        const auto in = std::find_if(gp.usse.attributes.begin(), gp.usse.attributes.end(),
                                      [](const auto& a) {
                                          return a.kind == Usse::AttributeKind::GsInRows;
                                      });
-        DEBUG_ASSERT(in != gp.gxp.attributes.end());
+        DEBUG_ASSERT(in != gp.usse.attributes.end());
         VertexStage a1{};
         a1.vp = &gp;
         a1.fetch[0] = {gs_table.gpu, words * 4, words, in->resource};
@@ -2779,9 +2804,9 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
         const SgxdBackend::Data vsa = VertexSa(gp.gxp, pica.gs_setup, vsec_sa, describe);
         if (rows_table) {
             // Past its rows an entry points at the shared uniform, as the SA image's bank pointer reads it.
-            DEBUG_ASSERT(gp.gxp.buffer_pointer);
+            DEBUG_ASSERT(gp.usse.buffer_pointer);
             u32 pointer = 0;
-            std::memcpy(&pointer, vsa.cpu + gp.gxp.uniform_floats * 4, 4);
+            std::memcpy(&pointer, vsa.cpu + gp.usse.uniform_floats * 4, 4);
             u32* const tables = reinterpret_cast<u32*>(row_tables.cpu);
             float* const counts = reinterpret_cast<float*>(count_rows.cpu);
             for (u32 i = first; i < first + n; i++) {
@@ -2957,12 +2982,12 @@ const RasterizerGxm::FragmentProgram& RasterizerGxm::FragmentProgramFor(const Ep
     // The first tier: registers placed, no optimising passes; microseconds, and the draw
     // waits for it. The second tier replaces it once it has drawn Tier2Draws times.
     std::string refusal;
-    auto gxp = Usse::EmitFragmentGxp(config, &refusal);
-    DEBUG_ASSERT_MSG(gxp.has_value(), "GXM: the emitter has no fragment program for this state: {}",
-                     refusal);
-    DumpGxp("fs", key, *gxp);
+    auto emitted = Usse::EmitFragmentProgram(config, &refusal);
+    DEBUG_ASSERT_MSG(emitted.has_value(),
+                     "GXM: the emitter has no fragment program for this state: {}", refusal);
+    DumpProgram("fs", key, *emitted);
     DumpPicaFragment(key, config);
-    FragmentProgram f = PlaceFragmentProgram(std::move(*gxp), epilogue, config.Hash());
+    FragmentProgram f = PlaceFragmentProgram(std::move(*emitted), epilogue, config.Hash());
     return fragment_programs.emplace(key, std::move(f)).first->second;
 }
 
@@ -3011,9 +3036,9 @@ void RasterizerSgxd::InstallTier2() {
         ASSERT_MSG(result.program.has_value(), "sgxd: tier 2 of fragment program {:016x}: {}",
                    result.key, result.refusal);
         ASSERT(it != fragment_programs.end());
-        DumpGxp("fs2", result.key, *result.program);
-        const u32 temps_before = it->second.gxp.temp_count;
-        const std::size_t words_before = it->second.gxp.primary.size();
+        DumpProgram("fs2", result.key, *result.program);
+        const u32 temps_before = it->second.usse.temp_count;
+        const std::size_t words_before = it->second.usse.primary.size();
         FragmentProgram f =
             PlaceFragmentProgram(std::move(*result.program), it->second.epilogue, result.key);
         f.draws = it->second.draws;
@@ -3021,7 +3046,7 @@ void RasterizerSgxd::InstallTier2() {
         LOG_INFO(Render,
                  "tier 2 fragment program {:016x}: {} words to {}, {} temps to {}, emitted in {} "
                  "us ({} cycles), program {:016x}",
-                 result.key, words_before, f.gxp.primary.size(), temps_before, f.gxp.temp_count,
+                 result.key, words_before, f.usse.primary.size(), temps_before, f.usse.temp_count,
                  result.took_us, result.took_cycles, ProgramHash(f.usse));
         it->second = std::move(f);
     }
@@ -3037,66 +3062,36 @@ void RasterizerSgxd::InstallVertexTier2(ShaderTier2::Result& result) {
     ASSERT_MSG(result.input_regs == it->second.input_regs,
                "sgxd: tier 2 of vertex program {:016x} reads input registers {:#x}, tier 1 {:#x}",
                result.key, result.input_regs, it->second.input_regs);
-    DumpGxp("vs2", result.key, *result.program);
-    const u32 temps_before = it->second.gxp.temp_count;
-    const std::size_t words_before = it->second.gxp.primary.size();
+    DumpProgram("vs2", result.key, *result.program);
+    const u32 temps_before = it->second.usse.temp_count;
+    const std::size_t words_before = it->second.usse.primary.size();
     VertexProgram v{};
-    v.gxp = std::move(*result.program);
+    v.usse = std::move(*result.program);
     v.input_regs = result.input_regs;
-    v.primary_doutu0 = sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.primary),
-                                           v.gxp.temp_count);
-    v.secondary_doutu0 = v.gxp.secondary.empty()
+    v.primary_doutu0 = sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.primary),
+                                           v.usse.temp_count);
+    v.secondary_doutu0 = v.usse.secondary.empty()
                              ? DummyVertexSecondary
-                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.gxp.secondary), 0);
+                             : sgxd_program_doutu0(0, backend.PlaceCode(0, v.usse.secondary), 0);
     v.draws = it->second.draws;
     v.tier2_queued = true;
     LOG_INFO(Render,
              "tier 2 vertex program {:016x}: {} words to {}, {} temps to {}, emitted in {} us ({} "
              "cycles), program {:016x}",
-             result.key, words_before, v.gxp.primary.size(), temps_before, v.gxp.temp_count,
+             result.key, words_before, v.usse.primary.size(), temps_before, v.usse.temp_count,
              result.took_us, result.took_cycles, ProgramHash(v.usse));
     it->second = std::move(v);
 }
 
-RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProgram gxp,
+RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Program usse,
                                                                      const Epilogue& epilogue,
                                                                      u64 hash, u64 emit_us) {
     FragmentProgram f{};
-    f.gxp = std::move(gxp);
+    f.usse = std::move(usse);
     f.epilogue = epilogue;
-#ifdef VITA_DIAGNOSTICS
-    // fsload: the primary program's words from host0:fsload.gxp instead of ours, with
-    // our inputs, uniforms and samplers; its temps if more. For timing another compiler's code on
-    // the same frames: what it reads from our registers is whatever they hold.
-    if (GxmFlag("fsload")) {
-        std::FILE* file = std::fopen("host0:fsload.gxp", "rb");
-        ASSERT_MSG(file, "GXM: fsload: no host0:fsload.gxp");
-        std::vector<u8> bytes;
-        u8 chunk[4096];
-        for (std::size_t n; (n = std::fread(chunk, 1, sizeof(chunk), file)) > 0;) {
-            bytes.insert(bytes.end(), chunk, chunk + n);
-        }
-        std::fclose(file);
-        // SceGxmProgram: temps at 0x34, the primary program's count at 0x3c and its offset,
-        // relative to that field, at 0x40.
-        u32 temps, count, offset;
-        ASSERT_MSG(bytes.size() >= 0x44 && std::memcmp(bytes.data(), "GXP", 4) == 0,
-                   "GXM: fsload: not a GXP");
-        std::memcpy(&temps, bytes.data() + 0x34, 4);
-        std::memcpy(&count, bytes.data() + 0x3c, 4);
-        std::memcpy(&offset, bytes.data() + 0x40, 4);
-        ASSERT_MSG(0x40 + offset + 8ull * count <= bytes.size(), "GXM: fsload: short GXP");
-        f.gxp.primary.resize(count);
-        std::memcpy(f.gxp.primary.data(), bytes.data() + 0x40 + offset, 8ull * count);
-        f.gxp.temp_count = std::max(f.gxp.temp_count, temps);
-        f.gxp.phase_starts = {0};
-        LOG_INFO(Render, "fsload: fragment program {:016x}: {} words, {} temps", hash, count,
-                 f.gxp.temp_count);
-    }
-#endif
-    const Usse::GxpProgram& g = f.gxp;
-    // A second phase (a kill or a depth write) gets its address into the first phase's PHAS
-    // where the code is placed (SgxdBackend::PlaceCodePhased), as libgxm's patcher relocates it.
+    const Usse::Program& g = f.usse;
+    // A second phase (a kill or a depth write) gets its address into the first phase's PHAS where the
+    // code is placed (PlaceCodePhased).
 
     // SMP reads its four state words as two pairs: with memory uniforms the resident count is odd and
     // the buffer pointer makes it even.
@@ -3105,7 +3100,7 @@ RasterizerGxm::FragmentProgram RasterizerGxm::PlaceFragmentProgram(Usse::GxpProg
                                        static_cast<u32>(g.literals.size()), 0) %
                          2 ==
                      0);
-    for (const Usse::GxpUniform& u : g.uniforms) {
+    for (const Usse::Uniform& u : g.uniforms) {
         // Resident, or in the memory buffer (FragmentSa) at the same float index.
         DEBUG_ASSERT(u.sa_offset + u.components * u.array_size <=
                      (g.buffer_pointer ? g.buffer_floats : g.uniform_floats));
@@ -3719,7 +3714,7 @@ RasterizerSgxd::VertexStage RasterizerSgxd::VertexStageFor(bool is_indexed, cons
         }
     }
     const VertexProgram& vp = *program;
-    const Usse::GxpProgram& vg = vp.gxp;
+    const Usse::Program& vg = vp.usse;
 
     // --- the index list ---
     // The VDM reads 16-bit indices where the guest put them; it has no 8-bit format, so 8-bit indices
@@ -3964,7 +3959,7 @@ void RasterizerSgxd::VertexPrograms(const VertexStage& stage, const SgxdBackend:
                                    u32 vsec_sa, SgxdRecipeDrawPrograms& p,
                                    const Describe& describe) {
     const VertexProgram& vp = *stage.vp;
-    const Usse::GxpProgram& vg = vp.gxp;
+    const Usse::Program& vg = vp.usse;
     const auto vspds = backend.VertexPds(stage.fetch.data(), stage.fetch_count,
                                          vp.primary_doutu0, vg.per_instance, stage.fresh);
     DEBUG_ASSERT_MSG(vspds.va != 0, "sgxd: {}: {} attributes the vertex PDS does not take",
@@ -3976,10 +3971,17 @@ void RasterizerSgxd::VertexPrograms(const VertexStage& stage, const SgxdBackend:
     p.vsec = vsec.va;
     p.vsec_units = vsec.units;
     p.vsec_sa = vsec_sa;
-    sgxd_program_vertex_dms(vg.pa_count, vg.temp_count, vsec_sa, vg.vertex_outputs1 >> 24,
-                            &p.vdm_w2, &p.vdm_w4, &p.vdm_w5);
-    p.outselects = vg.vertex_outputs1;
-    p.texsize = vg.vertex_outputs2;
+    // Its VDM words follow from the program and the SA size alone: worked out once.
+    if (vp.vdm_sa != vsec_sa) {
+        sgxd_program_vertex_dms(vg.pa_count, vg.temp_count, vsec_sa, vg.outselects >> 24,
+                                &vp.vdm_words[0], &vp.vdm_words[1], &vp.vdm_words[2]);
+        vp.vdm_sa = vsec_sa;
+    }
+    p.vdm_w2 = vp.vdm_words[0];
+    p.vdm_w4 = vp.vdm_words[1];
+    p.vdm_w5 = vp.vdm_words[2];
+    p.outselects = vg.outselects;
+    p.texsize = vg.texsize;
     p.indices = stage.indices;
 }
 
@@ -4656,6 +4658,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     if (tier2 && tier2->Ready()) {
         InstallTier2();
     }
+    // The programs start again with the code heap three quarters full: A Link Between Worlds'
+    // intro filled the 1 MiB with programs it had drawn once. Here, before the
+    // draw holds any; their code is the heap's again once the passes begun so far are done.
+    if (backend.CodeFree() < SgxdBackend::CodeBytes / 4) {
+        FlushPrograms();
+    }
     // A DMA into cached memory still queued: the draw reads guest memory as the guest would after its
     // interrupt.
     if (backend.RetirePending()) {
@@ -5083,7 +5091,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         return true; // the geometry program stored no triangle
     }
     const VertexProgram& vp = *stage.vp;
-    const Usse::GxpProgram& vg = vp.gxp;
+    const Usse::Program& vg = vp.usse;
 
     // --- the vertex program's SA block and uniform buffer ---
     // The image covers the containers, the prefetched uniforms after them and the SAs the
@@ -5152,7 +5160,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
 
     // --- the fragment program and its SA block ---
     const FragmentProgram& fp = FragmentProgramFor(epilogue);
-    const Usse::GxpProgram& fg = fp.gxp;
+    const Usse::Program& fg = fp.usse;
 #ifdef VITA_DIAGNOSTICS
     // A recorded frame's draw (vprof) and its fragment program's dumpusse key.
     if (vprof_draw_noted) {
@@ -5192,8 +5200,8 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         SyncLutLf();
         SyncLutProcTex();
     }
-    // The data container follows the resident uniforms: the memory buffer's pointer first
-    // when the program has one (as VertexSa's), the literals, the samplers' words.
+    // The data block follows the resident uniforms: the memory buffer's pointer, the literals, the
+    // samplers' words.
     const u32 head = fg.uniform_floats + Usse::DataHead(fg);
     const u32 fsa_words = head + static_cast<u32>(fg.literals.size()) +
                           static_cast<u32>(fg.samplers.size()) * 4;
@@ -5242,7 +5250,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         const Texture* unit_texture[3] = {};
         u32 unit_words[3][4];
         for (size_t i = 0; i < fg.samplers.size(); i++) {
-            const Usse::GxpSampler& sampler = fg.samplers[i];
+            const Usse::Sampler& sampler = fg.samplers[i];
             u32 words[4];
             switch (sampler.kind) {
             case Usse::SamplerKind::Texture:

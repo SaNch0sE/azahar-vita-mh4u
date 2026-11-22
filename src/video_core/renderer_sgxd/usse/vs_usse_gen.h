@@ -10,21 +10,14 @@
 #include <span>
 #include <string>
 #include <vector>
-#include "video_core/renderer_gxm/usse/gxp_writer.h"
+#include "video_core/renderer_sgxd/usse/usse_program.h"
 
 namespace GxmRenderer::Usse {
 
 /**
- * The PICA vertex emitter: a GXP vertex program for a PICA vertex program, written directly
- * as USSE instructions. Its attributes (AttributeKind) and uniforms (UniformKind) say what
- * they carry, which the rasterizer binds and fills them by; its fragment interface is by
- * semantic (POSITION, COLOR0, TEXCOORD0-6), so every generated fragment program links
- * against it.
- *
- * Returns the program, or empty (with `refusal` set) for a program it cannot express:
- * an instruction outside the set below, a bool uniform not baked in, a jump out of its
- * subroutine, deeper loop nesting than two, more live registers than the unified store
- * holds.
+ * The PICA vertex emitter: a USSE vertex program for a PICA vertex program. Its fragment
+ * interface is by semantic (POSITION, COLOR0, TEXCOORD0-6), so every generated fragment
+ * program links against it. A program it cannot express comes back empty, with `refusal` set.
  */
 
 /// Where a fragment-interface semantic comes from: an output attribute's component, or the
@@ -108,7 +101,7 @@ struct VsRequest {
 [[nodiscard]] bool GsIndexesUniforms(std::span<const uint32_t> code, uint32_t code_size);
 
 /// `level` 2 runs the IR's optimising passes (the second tier).
-[[nodiscard]] std::optional<GxpProgram> EmitVertexGxp(const VsRequest& request,
+[[nodiscard]] std::optional<Program> EmitVertexProgram(const VsRequest& request,
                                                       uint32_t& input_regs,
                                                       std::string* refusal = nullptr,
                                                       int level = 1);

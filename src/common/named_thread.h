@@ -28,7 +28,7 @@ struct ThreadCfg {
 /// A std::jthread-alike on a raw sceKernelCreateThread thread, so the kernel knows the
 /// thread by name. Before the callable runs, the thread attaches itself to newlib's
 /// pthread layer (the per-thread record pte's cancellable waits dereference - a bare SCE
-/// thread crashed in pte_osSemaphoreCancellablePend without it, 2026-08-30), and it exits
+/// thread crashes in pte_osSemaphoreCancellablePend without it), and it exits
 /// through newlib's vita_exit_thread/vita_exit_delete_thread so the lazily created
 /// reentrancy state is cleaned up. Supports plain callables and callables taking a
 /// std::stop_token, join-on-destruction, request_stop, and detach.

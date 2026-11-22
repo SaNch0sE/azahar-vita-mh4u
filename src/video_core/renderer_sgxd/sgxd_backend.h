@@ -75,6 +75,9 @@ public:
 
     /// USSE code: its offset from code base cb (0 vertex, 1 pixel).
     u32 PlaceCode(unsigned cb, std::span<const u64> words);
+    /// The code heap's bytes free now: its free ranges and its unused end, once the code given
+    /// back whose passes are done is free again.
+    u32 CodeFree();
     /// PlaceCode for a program of several phases: each phase's opening PHAS but the last's
     /// (an immediate PHAS at phase_starts[k]) gets the next phase's execution address, the
     /// DOUTU0 EXE field's instruction index from the code base, and the temps in fours.

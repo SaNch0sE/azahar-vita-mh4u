@@ -58,7 +58,7 @@ constexpr u32 Pages = 418;
 constexpr u32 MaxIndices = SGXD_RECIPE_MAX_INDICES;
 // The code heap follows each layout. It must stay within DOUTU's reach of CV and CF (EXE, 20
 // bits of 8 bytes: 8 MiB). The PDS arena and the pass data make the shared block.
-constexpr u32 CodeSize = 1u << 20;
+constexpr u32 CodeSize = SgxdBackend::CodeBytes;
 // The PDS arena: programs kept by address (a fragment program's pixel PDS) in a fixed part,
 // then two halves for the rest, which embed a draw's addresses (vertex buffers, SA data): a game
 // placed 14564 in 1 MiB by 114 s. A pass start past half of the current half flips to

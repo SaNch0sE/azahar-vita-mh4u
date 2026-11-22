@@ -40,8 +40,6 @@ namespace GxmRenderer {
  *             each); latelog_at=S from S seconds of the process's time on
  *   passdump=T the same for the first 32 passes from T s, any buffer,
  *             host0:azahar-passNN-ADDR-WxH-fFORMAT.bin
- *   fsload    every fragment program's code from host0:fsload.gxp (a GXP's primary
- *             program, with our inputs, uniforms and samplers): another compiler's code, timed
  *
  *   threadtimes  with perflog, each placed thread's run time in the second and the cores its
  *             role allows (Common::RoleThreads; core 3's threads, which psp2prof cannot see).
@@ -51,8 +49,10 @@ namespace GxmRenderer {
  * The shader emitter:
  *   notier2   vertex and fragment programs stay the first tier's: no worker re-emits them with
  *             the optimising passes after RasterizerSgxd::Tier2Draws draws
- *   dumpgxp   write each emitted program to host0 as azahar-vs-KEY.gxp / azahar-fs-KEY.gxp
- *             (vs2 / fs2 for the second tier's), a GXP container psp2shaderperf -disasm lists
+ *   dumpusse  write each emitted program to host0 as azahar-vs-KEY.json / azahar-fs-KEY.json
+ *             (vs2 / fs2 for the second tier's): its words and interface (Usse::ProgramJson),
+ *             which tools/usse2gxp.py puts in a GXP for psp2shaderperf; with the
+ *             PICA side of each (.fsconfig, .pica, .glsl) for compiling it with psp2cgc
  *
  * Debugging a pass on the console:
  *   dumptex   write the first eight untiled textures to host0, each level: the guest's bytes

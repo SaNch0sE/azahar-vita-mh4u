@@ -230,7 +230,7 @@ std::string Describe(Inst& i) {
 /// Where no internal register survives: labels and branches (the scheduler's instance
 /// switch cannot be held across them), and the waits and memory reads that deschedule
 /// the instance (psp2cgc hoists every uniform-buffer load ahead of its internal-register
-/// work; the console showed why, 2026-09-05).
+/// work).
 bool IsBarrier(const Inst& i) {
     switch (i.op) {
     case Op::Label:
@@ -440,6 +440,11 @@ void Builder::Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc)
 
 void Builder::Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words,
                     uint8_t count, uint8_t drc) {
+    // Liveness and allocation work on quads: a wider load's other quads would get homes
+    // of their own and never be written.
+    if (IsVirtual(dst) && (dst.n & 3) + count > 4) {
+        Fail("a load into virtual registers crosses a quad");
+    }
     Inst& i = Push(Op::Lda32);
     i.reg[0] = dst;
     i.reg[1] = base_sa;
@@ -857,6 +862,43 @@ void Lowering::InternalDeadWrites() {
 }
 
 namespace {
+
+/// The two-wide ops that split one four-wide op into its destination's pairs (two, or more where
+/// a half is moved out to several places), put in an order where none reads a pair an earlier
+/// one wrote (in place: `add r0, r0.zwxy, r1`, whose first half writes the r0.xy its second
+/// reads). The given order when it is one. False when no order is.
+bool OrderPairWrites(std::vector<Inst>& ops, int sources) {
+    const auto clobbers = [sources](const Inst& first, const Inst& later) {
+        for (int n = 0; n < sources; n++) {
+            const Reg r = later.src[n].reg;
+            if (r.bank == first.dst.reg.bank && r.bank != Bank::Internal &&
+                r.bank != Bank::Const && r.n < first.dst.reg.n + 2 && first.dst.reg.n < r.n + 2) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<std::size_t> order(ops.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    do {
+        bool fine = true;
+        for (std::size_t a = 0; a < order.size() && fine; a++) {
+            for (std::size_t b = a + 1; b < order.size() && fine; b++) {
+                fine = !clobbers(ops[order[a]], ops[order[b]]);
+            }
+        }
+        if (fine) {
+            std::vector<Inst> sorted;
+            sorted.reserve(ops.size());
+            for (const std::size_t k : order) {
+                sorted.push_back(ops[k]);
+            }
+            ops.swap(sorted);
+            return true;
+        }
+    } while (std::next_permutation(order.begin(), order.end()));
+    return false;
+}
 
 /// The lanes (2h, 2h + 1) of a four-wide source as a two-wide source: the pair holding
 /// them (both channels in one pair, or constants) with the channels moved down, or an
@@ -1879,6 +1921,10 @@ void Lowering::TwoWideChains() {
                 }
                 produced[li].push_back(d);
             }
+            // The last link writes the destination itself, from sources that may be it.
+            if (ok && last && !OrderPairWrites(produced[li], is_mad ? 3 : 2)) {
+                ok = false;
+            }
             if (ok && !last) {
                 carried = std::make_pair(inst.dst.reg.n, dst_quad);
             }
@@ -2154,7 +2200,8 @@ void Lowering::DirectTwoWide() {
             lanes_read |= static_cast<uint8_t>(h == 0 ? 0x3 : 0xc);
             j++;
         }
-        if (!ok || direct.empty() || InternalRead(j, k, 0xf)) {
+        if (!ok || direct.empty() || InternalRead(j, k, 0xf) ||
+            !OrderPairWrites(direct, is_mad ? 3 : 2)) {
             out.push_back(inst);
             i++;
             continue;

@@ -1128,9 +1128,9 @@ private:
 
     std::atomic<bool> stop_scan_flag = false;
     /// The ticket and title scans run here, one at a time in the order they were asked for.
-    /// They were std::async futures; on the Vita a finished async future's wait() joins a
-    /// thread that has already exited and never returns (the AM module's destructor hung a
-    /// savestate load there, 2026-09-07). A worker thread that is joined while alive is the
+    /// Not std::async futures: on the Vita a finished async future's wait() joins a thread that
+    /// has already exited and never returns (the AM module's destructor would hang a savestate
+    /// load there). A worker thread that is joined while alive is the
     /// pattern the FS service drains without trouble.
     std::unique_ptr<Common::ThreadWorker> scan_worker;
     std::mutex am_lists_mutex;

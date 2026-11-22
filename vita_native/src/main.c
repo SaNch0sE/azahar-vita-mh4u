@@ -248,19 +248,8 @@ typedef int (*fn_change_active_cpu_mask)(int mask);
 static fn_get_system_info p_GetSystemInfo;
 
 
-// Resolving GetSystemInfo, and the NID that finally made it work from kernel context.
-//
-// 2026-08-26 called the user-facing NID 0x80544E0C from a kernel thread and got 0xc0022005 every
-// time: that entry point copies its result out to a *user* pointer, and a kernel buffer is not
-// one. Two stages spent runs assuming a mask they could not read.
-//
-// PSVshell (Electry, src/perf.c) calls SceThreadmgrForDriver_0x7E280B69 with a plain kernel
-// struct and reads cpuInfo[].idleClock out of it — a driver-level entry point for the same call,
-// which is exactly what a kernel plugin needs. It is not in the SDK's NID database and has no
-// recorded prototype; the argument is the same SceKernelSystemInfo, with .size set first.
-//
-// Try that one first, and keep the user NID as a fallback so a firmware without it degrades to
-// the old behaviour rather than losing the stage.
+// The user NID 0x80544E0C copies out to a user pointer and fails from kernel context with
+// 0xc0022005; the driver NID 0x7E280B69 (undocumented) takes a kernel struct with .size set.
 #define SYSINFO_NID_DRIVER 0x7E280B69u
 #define SYSINFO_NID_USER 0x80544E0Cu
 

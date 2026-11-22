@@ -117,11 +117,6 @@ public:
     /// on every instruction of the ubershader); the emitter chooses per program, and it is
     /// left settable so a compiler program can be reproduced exactly.
     bool skip_invalid = true;
-    /// The nosched bit: 0 lets FinishNosched place it as the compiler does, 1 clears it
-    /// everywhere, 2 sets it everywhere (what the emitter did until 2026-09-05: correct,
-    /// and slow, since the USSE then never switches instances to hide a texture read).
-    /// Vita3K ignores the bit. The builders' `nosched` arguments are ignored as well.
-    int nosched_override = 0;
     /// Encoding a secondary program: the secondary attributes are addressed with the primary
     /// attribute bank codes there (the compiler's secondary programs, all forms), since a
     /// secondary program has no primary attributes of its own.
@@ -192,13 +187,10 @@ public:
     /// is left blank here and PatchKills fills it in.
     void KillUnlessP1();
     /// Write the fragment's depth from `src` (one 32-bit register); ends the phase like a
-    /// kill. `control_sa` names the data container's 0xE000 word, as the kill does.
+    /// kill. `control_sa` names the data block's 0xE000 word, as the kill does.
     void DepthF(Reg src, uint8_t control_sa);
-    /// Point every kill at `control_sa`, the SA holding its control word. psp2cgc always
-    /// makes that the data container's first literal, raw 0xE000 (148 SM3DL programs and
-    /// the ubershader). The emitter used to leave the operand at SA 2, a uniform: the
-    /// console drew through it until a dependent texture read faulted at address 0
-    /// (2026-09-05), and with the operand pointed at a numeric literal it drew nothing.
+    /// Point every kill at `control_sa`, the SA holding its control word (psp2cgc's data
+    /// block's first literal, raw 0xE000); any other word draws wrong or faults.
     void PatchKills(uint32_t control_sa);
 
     /// dst = op(src1, src2), f32, two components on the unified store or four on an
@@ -206,7 +198,12 @@ public:
     void Vec(VecOp op, Dst dst, Src src1, Src src2, Pred pred = Pred::None, bool nosched = false);
     /// The f16 form of the same.
     void Vec16(VecOp op, Dst dst, Src src1, Src src2, Pred pred = Pred::None, bool nosched = false);
-    /// dst = src1 * i<gpi0> + i<gpi1>, four-wide (or three-wide) f32; dst is any bank.
+    /// One F32 vector instruction on a unified-store destination's pair (or an internal one).
+    void VecPair(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched);
+    /// Vec's and Vec16's instruction word, as given.
+    void VecWord(VecOp op, Dst dst, Src src1, Src src2, Pred pred, bool nosched);
+    /// dst = src1 * i<gpi0> + i<gpi1>, four-wide (or three-wide) f32; dst is any bank. The
+    /// predicate is the short form: none, p0 or !p0 only.
     void Mad(Dst dst, Src src1, Src gpi0, Src gpi1, bool vec4, Pred pred = Pred::None,
              bool nosched = false);
     /// The two-wide mad with three unified-store sources (psp2cgc's `mad.f32 o0.xy,
@@ -229,15 +226,17 @@ public:
     void PackF16(Dst dst, Reg lo, Reg hi, bool nosched = false);
     /// Four-wide f32 move between internal registers with a swizzle.
     void MoveInternal(Dst dst, Src src, Pred pred = Pred::None, bool nosched = false);
-    /// dst = (src0 != 0) ? src1 : src2, per component, f32.
+    /// dst = (src0 != 0) ? src1 : src2, per component, f32. src0 is tested with the identity
+    /// swizzle; src1 and src2 share the instruction's one swizzle and must name the same one.
     void CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched = false);
     /// p<pred_n> = src1.<chan> <cond> src2.x (src2 broadcast when `src2_scalar`).
     /// `pred` guards the write: with p1 as the guard and the destination, the result is
     /// the previous p1 AND the test, the compiler's way of folding two kills into one.
     void Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, bool src2_scalar,
               Pred pred = Pred::None);
-    /// A 2D texture read: four f32 at dst (temp or pa) from sampler words at sa<sampler>,
-    /// coordinates at coord.xy; `lod` is an internal register holding the level in x, or
+    /// A 2D texture read: four f32 at dst (temp or pa, pair-aligned) from sampler words at
+    /// sa<sampler> (even), coordinates at coord.xy (pair-aligned); `lod` is an internal
+    /// register holding the level in x, or
     /// null for the hardware's own level. Counter `drc` is what Wdf waits on.
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
                   bool nosched = false);

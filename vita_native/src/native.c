@@ -4,28 +4,21 @@
 // Included from main.c, whose helpers it uses (emit, translate, the cp15 accessors,
 // resolve_export, the mask getter and setter, gic_locate). Every exported call is here.
 //
-// The STAGE_* names in the comments below are vaprobe's, the diagnostic plugin this code grew
-// out of. Each one was a measurement that established a fact this file depends on, and the
-// dates say when. The stages themselves are not part of this module:
-//
 //   azaharTakeCore   occupy core 2 with a resident kernel thread, then clear core 2 from the
-//                 scheduler's mask (STAGE_OWN / STAGE_HOLD, 2026-08-26 / 08-29)
+//                 scheduler's mask
 //   azaharMap        the app owns the guest memory as ordinary user memblocks; the plugin resolves
 //                 their physical pages, builds an N=0 translation table — the kernel's own two
 //                 tables merged, with the guest windows as coarse L2s over the app's page lists
-//                 and per-page W^X — plus a vector page, and installs both on core 2 (STAGE_OWN
-//                 N=0, STAGE_L2, 2026-08-29)
+//                 and per-page W^X — plus a vector page, and installs both on core 2
 //   azaharRun        enter the guest in user mode with a register file, leave it on the first
 //                 exception (svc, undefined, prefetch or data abort), return the register file
 //                 and the reason (entry.S). The svcs the module can answer from what it
 //                 has (AZAHAR_FAST_*: the guest clock, the cache svcs, the current IDs) are
 //                 answered in the vector, and the guest runs on
 //   azaharRelease    put Sony's registers back on core 2, end the resident thread, and hand the
-//                 core back to the scheduler. The order is what makes the hand-back safe:
-//                 restoring the mask while the thread still occupied the core left the core
-//                 unschedulable and froze the app at exit (measured 2026-08-29), so the thread
-//                 is stopped and waited for first - the order azahar_on_proc_gone has always used
-//                 for a dead client. A release that cannot end the thread leaves the core
+//                 core back to the scheduler. The thread is stopped and waited for before the
+//                 mask is restored: the other order leaves the core unschedulable and freezes
+//                 the app at exit. A release that cannot end the thread leaves the core
 //                 detached and refuses to be taken again.
 //
 // Everything the resident thread does after the detach avoids kernel calls: the scheduler is no
@@ -85,9 +78,9 @@
 
 // 1: the table holds only what core 2 needs — guest windows, the vector page, this module's
 //    megabytes, the resident thread's stack, the GIC alias — and nothing of the kernel's.
-// 0: the kernel's two tables merged, as the first runs used. With interrupts masked from install
-//    nothing of Sony's executes on core 2, so the merge has no purpose left; without the seal a
-//    guest that ran off its window executed 5.7 MB of kernel-mapped memory (2026-08-29).
+// 0: the kernel's two tables merged. With interrupts masked from install nothing of Sony's
+//    executes on core 2, so the merge has no purpose; without the seal a guest that runs off its
+//    window executes kernel-mapped memory.
 #ifndef AZAHAR_SEAL
 #define AZAHAR_SEAL 1
 #endif
@@ -536,9 +529,8 @@ static void core2_install(unsigned n) {
     AzaharCpu *const cpu = &azahar_cpu[n];
     AzaharCore *const core = &azahar_core[n];
     // Own the core from here on: nothing of Sony's is delivered to it while our table is in.
-    // The 2026-08-29 run that left interrupts open between install and the first run took a
-    // prefetch abort within 0.1 s — Sony's IRQ path running under a copy of its L1 that had
-    // already gone stale.
+    // Interrupts left open between install and the first run take a prefetch abort: Sony's IRQ
+    // path runs under a copy of its L1 that has gone stale.
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
     if (pmr) {
         core->sv_pmr = *pmr & 0xFFu;
@@ -561,8 +553,8 @@ static void core2_install(unsigned n) {
     wr_fpexc(core->sv_fpexc | (1u << 30));
     // The whole register bank and FPSCR belong to whichever Sony thread lazily owned the VFP
     // on this core, and the guest is about to clobber both. Hand back at uninstall exactly
-    // what was here: a guest FPSCR with exception bits left live panicked Sony's first VFP
-    // operation after release ("VFP/NEON exception occurred in kernel thread", 2026-08-30).
+    // what was here: a guest FPSCR with exception bits left live panics Sony's first VFP
+    // operation after release ("VFP/NEON exception occurred in kernel thread").
     core->sv_fpscr = rd_fpscr_here();
     vfp_bank_save(core->sv_vfp_bank);
     core->sv_sp_und = azahar_get_banked_sp(MODE_UND);
@@ -656,23 +648,17 @@ static void core2_uninstall(unsigned n) {
     azahar_cmd_status = 0;
 }
 
-// The kernel's cross-core calls — Threadmgr on SGI 2/7, Processmgr on SGI 6 (FINDINGS,
-// 2026-08-17) — broadcast to every core, and the sender spins until each core's handler has
-// run. With ICCPMR at AZAHAR_PMR_MASK a taken core never takes them, so the sender spins forever
-// holding whatever lock it holds, and the whole console freezes. Hardware showed this the
-// first time a system process spawned mid-title (2026-09-01): module loading does an all-core
-// icache rendezvous, and the burst of module starts ended in a full-device freeze. Steady-state
-// gameplay never triggers it — the 2026-08-29 count saw no foreign SGI at all — which is why
-// every earlier hold survived.
+// The kernel's cross-core calls — Threadmgr on SGI 2/7, Processmgr on SGI 6 — broadcast to every
+// core, and the sender spins until each core's handler has run. With ICCPMR at AZAHAR_PMR_MASK a
+// taken core never takes them, so the sender spins forever holding whatever lock it holds, and
+// the whole console freezes. A system process spawned mid-title does it: module loading does an
+// all-core icache rendezvous. Steady-state gameplay never triggers it (no foreign SGI at all).
 //
-// The answer is to service the SGI rather than emulate its protocol: put Sony's world back for
-// a moment (core2_uninstall restores the PMR last, so the pending SGI vectors straight into
-// Sony's own handler, which does the flush and acks the barrier), then take the core again.
-// The scheduler still dispatches nothing here — the active-mask bit stays clear, and STAGE_HOLD
-// ran 180 s that way with interrupts open — so the resident thread resumes the instant the
-// handler returns. The TLBIALL/ICIALLU each way is the price of the round trip; a window opens
-// only when an SGI actually pends. Latency to the answer is bounded by one guest slice
-// (16 ms cap, sub-millisecond in practice with the SVC exit rate).
+// The answer is to service the SGI: put Sony's world back for a moment (core2_uninstall
+// restores the PMR last, so the pending SGI vectors straight into Sony's handler), then take
+// the core again. The active-mask bit stays clear, so the scheduler dispatches nothing here and
+// the resident thread resumes when the handler returns. A window opens only when an SGI pends;
+// the latency is bounded by one guest slice.
 static void core2_sgi_window(unsigned n) {
     core2_uninstall(n);
     // The interrupt delivers within a few cycles of the PMR write above. Stay open while
@@ -708,12 +694,10 @@ static void core2_run(unsigned n) {
 
     if (azahar_tlb_dirty) {
         // Descriptors changed under us since the last run, so a translation may be stale and
-        // the TLB always goes. What else is stale depends on the edit, and this used to drop
-        // everything for all of them: the line was written when MAP was the only edit, and
-        // mapping a guest code range does need all three, since the app wrote those
-        // instructions through its own view and this core may have executed different code at
-        // the address before. PROTECT and SYNC_CODE came later and the blanket was never
-        // narrowed. A permission change moves no memory and rewrites no instruction, so the
+        // the TLB always goes. What else is stale depends on the edit: mapping a guest code
+        // range needs all three, since the app wrote those instructions through its own view
+        // and this core may have executed different code at the address before. A permission
+        // change moves no memory and rewrites no instruction, so the
         // instruction cache and the branch predictor are still correct for it.
         asm volatile("dsb                       \n"
                      "mcr p15, 0, %0, c8, c7, 0 \n" // TLBIALL
@@ -998,11 +982,11 @@ static const uint32_t *find_kernel_page(uint32_t pa) {
 //
 // The app's pages live in a domain the kernel holds at No-access while a syscall runs (that is
 // why kernel code copies user memory through ksceKernelCopyFromUser), so from here ATS1CUR
-// answers with a domain fault — PAR 00000017, measured 2026-08-29 — and a by-VA cache clean
+// answers with a domain fault — PAR 00000017 — and a by-VA cache clean
 // would fault the same way, inside the syscall. ksceKernelVAtoPA is tried first. Failing that,
 // every No-access domain is granted Client for one ATS and one page clean, with interrupts
 // suspended: DACR is process context, and a reschedule mid-window would put the old value back
-// under the clean. Grant-only, never revoke — the direction STAGE_DOMAINS proved safe.
+// under the clean. Grant-only, never revoke — the direction measured safe.
 static uint32_t dacr_grant_all(uint32_t d) {
     uint32_t g = d;
     for (unsigned k = 0; k < 16; k++) {
@@ -1276,8 +1260,8 @@ out:
 }
 
 // Where Sony's vector `slot` (0..7) goes. Its vectors are `ldr pc, [pc, #imm]` for most slots
-// and not for all — the 2026-08-29 run read a pointer word of 0 for Data Abort under the
-// assumption they all were — so the instruction is decoded: a PC-relative ldr, or a branch.
+// and not for all — Data Abort's reads a pointer word of 0 taken as one — so the instruction is
+// decoded: a PC-relative ldr, or a branch.
 static uint32_t azahar_sony_target(uint32_t vbar, unsigned slot) {
     const uint32_t addr = vbar + slot * 4u;
     const uint32_t w = *(const volatile uint32_t *)(uintptr_t)addr;
@@ -1398,12 +1382,12 @@ static int check_range(const AzaharRange *rg, int need_user) {
 // quarter, then the guest windows as coarse L2s.
 static int build_table(const AzaharMapRequest *req) {
     // TTBR0 is one global table; TTBR1 is per process, and the one core 2 needs is the resident
-    // kernel thread's, not this syscall's — the first run (2026-08-29) read the app's TTBR1 here,
-    // whose pages are not where the kernel keeps its own, and found nothing to merge.
+    // kernel thread's, not this syscall's — the app's TTBR1, whose pages are not where the
+    // kernel keeps its own, has nothing to merge.
     if (azahar_core2_vbar == 0 || azahar_core2_sp == 0) {
         // Nothing captured the core's context: in the resident design core2_entry does it,
         // in the folded one azaharMap does it for the caller. Without it this function would
-        // read Sony's vectors from address zero, which killed the syscall (2026-09-09).
+        // read Sony's vectors from address zero, which kills the syscall.
         emit("  no core context: vbar %08x sp %08x ttbr1 %08x\n", azahar_core2_vbar, azahar_core2_sp,
              azahar_core2_ttbr1);
         return AZAHAR_ERR_STATE;
@@ -1418,8 +1402,8 @@ static int build_table(const AzaharMapRequest *req) {
     // Only megabytes at or above 0x40000000 come from the upper table; the kernel's code, its
     // thread stacks and this module all live in the low gigabyte, which TTBR0 covers globally.
     // A page that cannot be located is therefore left out rather than fatal: the folded design
-    // reads the app process's TTBR1, whose pages are not where the kernel keeps its own
-    // (measured 2026-08-29). The preflight below refuses an address that needed one.
+    // reads the app process's TTBR1, whose pages are not where the kernel keeps its own. The
+    // preflight below refuses an address that needed one.
     const uint32_t *upper[4] = {NULL, NULL, NULL, NULL};
     for (unsigned pg = 1; pg < 4; pg++) {
         upper[pg] = find_kernel_page(ttbr1_pa + pg * 0x1000u);
@@ -1441,12 +1425,6 @@ static int build_table(const AzaharMapRequest *req) {
     // this module's code and data, its stack, the GIC. Each address names one megabyte, and
     // that megabyte's entry — the kernel's own, pointing at the kernel's own L2 — is kept.
     // The module's own megabytes come from its segment table — code and data/bss both,
-    // wherever this boot placed them. This replaced a by-symbol spot list: the list named
-    // single objects, the module's layout differs per boot, and on 2026-08-30 the stray-IRQ
-    // stack (.bss, past the last named object) landed in a megabyte the list missed — the
-    // first stray IRQ's push data-aborted, and the sealed abort stub spun forever with the
-    // heartbeat frozen and every command timing out. The spot list survives only as the
-    // fallback when the lookup fails.
     struct KeepRange { uint32_t addr, len; };
     struct KeepRange keep[40];
     unsigned nkeep = 0;
@@ -1485,9 +1463,8 @@ static int build_table(const AzaharMapRequest *req) {
             // A symbol belongs to whichever segment starts at or below it, nearest. The two
             // lists only say what this file *thinks* is text or data, and the compiler is
             // free to disagree (.rodata lives in the text segment, for one); bucketing by
-            // list stretched a segment's range across the gap to the other, into megabytes
-            // the kernel never mapped, and the install failed on them (2026-08-30, second
-            // commercial-title run).
+            // list would stretch a segment's range across the gap to the other, into
+            // megabytes the kernel never mapped, and the install would fail on them.
             const unsigned n_text = sizeof(text_syms) / sizeof(text_syms[0]);
             const unsigned n_data = sizeof(data_syms) / sizeof(data_syms[0]);
             int bucket[32];
@@ -1508,9 +1485,7 @@ static int build_table(const AzaharMapRequest *req) {
             }
             // A range longer than any plausible module segment means the bucketing went
             // wrong: when one segment's base lookup fails, its symbols fall into the other
-            // segment's bucket and stretch that range across the gap between the two -
-            // hundreds of unmapped megabytes' worth on 2026-08-30 (third commercial-title
-            // run: text near 0x01c-, data near 0x810-, one skip line per megabyte between).
+            // segment's bucket and stretch that range across the gap between the two.
             // Such a range is discarded and its symbols are kept one megabyte at a time,
             // like the spot-list fallback.
             for (unsigned seg = 0; seg < 2; seg++) {
@@ -1628,10 +1603,9 @@ static int build_table(const AzaharMapRequest *req) {
 #endif
 
     // The vector page: the highest free megabyte below 0x40000000 that no guest range wants.
-    // The top half of the low quarter is fully populated on this console (2026-08-29: no free
-    // entry in 0x200-0x3ff), so the scan runs down to 1; 0x090 is where STAGE_OWN put it.
-    // "Free" is type bits 00, not a zero word: the 2026-08-29 run found every entry in
-    // 0x200-0x3ff non-zero and none of them valid.
+    // The top half of the low quarter is fully populated on the console (no free entry in
+    // 0x200-0x3ff), so the scan runs down to 1. "Free" is type bits 00, not a zero word: every
+    // entry in 0x200-0x3ff is non-zero and none of them valid.
     unsigned upper_used = 0;
     for (uint32_t idx = 0x200; idx < 0x400; idx++) {
         upper_used += (KERNEL_L1(idx) & 3u) != 0;
@@ -1712,7 +1686,7 @@ static int build_table(const AzaharMapRequest *req) {
     static const char *const crit_name[] = {"entry code", "context", "core-2 stack", "gic",
                                             "core-2 C code"};
     // The GIC may legitimately be absent (azahar_gic says so and the guest runs unmasked); the
-    // rest may not, and a zero address used to pass this check by being skipped.
+    // rest may not, and a zero address is not skipped.
     static const uint8_t crit_required[] = {1, 1, 1, 0, 1};
     for (unsigned i = 0; i < sizeof(crit) / sizeof(crit[0]); i++) {
         if (crit[i] == 0) {

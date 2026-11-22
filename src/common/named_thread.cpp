@@ -49,8 +49,8 @@ int NamedThread::Trampoline(unsigned int args, void* argp) {
 
     // Attach to newlib's pthread layer: pte's cancellable waits (under every std::mutex
     // and condition variable) dereference the pspThreadData record unconditionally, and
-    // only pthread_create-made threads get one for free - a bare SCE thread crashed in
-    // pte_osSemaphoreCancellablePend without it (2026-08-30). pte_osInit builds the record
+    // only pthread_create-made threads get one for free - a bare SCE thread crashes in
+    // pte_osSemaphoreCancellablePend without it. pte_osInit builds the record
     // for the calling thread, exactly as pte_osThreadCreate does on its first-ever call.
     // (pthread_self's implicit registration struct still leaks per thread, as it does for
     // any foreign thread; every NamedThread but the detached tasks lives process-long.)
@@ -99,7 +99,7 @@ void NamedThread::join() {
         return;
     }
     // Under Vita3K a worker joined right after its stop request (the AM scan worker at a
-    // savestate load's shutdown, 2026-09-07) never returns from this wait although the
+    // savestate load's shutdown) never returns from this wait although the
     // thread's callable has returned and it has entered newlib's exit; the same join on a
     // thread that exited earlier returns at once. Not reproduced on the console.
     sceKernelWaitThreadEnd(uid, nullptr, nullptr);

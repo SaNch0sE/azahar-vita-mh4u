@@ -9,7 +9,7 @@
 #include <string>
 #include <fmt/format.h>
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
-#include "video_core/renderer_gxm/usse/gxp_writer.h"
+#include "video_core/renderer_gxm/usse/usse_program.h"
 #include "video_core/renderer_gxm/usse/usse_encoder.h"
 #include "video_core/renderer_gxm/usse/usse_ir.h"
 
@@ -138,10 +138,10 @@ const Reg I0 = Reg::I(0);
 const Reg I1 = Reg::I(1);
 const Reg I2 = Reg::I(2);
 
-// The literals, in the data container right after the uniforms. The first one is the
-// kill's operand, not a number: psp2cgc's kill (a visibility-test op whose two source
-// registers are the data container's first SA, on all 148 SM3DL programs and the
-// ubershader) reads the raw word 0xE000 there, and the second literal pads it to a pair.
+// The literals follow the uniforms. The first is the kill's operand, the raw word 0xE000 (the
+// second pads it to a pair): ISP feedback word 0 with ACMPMODE ALWAYS, AREF 0 and depth writes
+// on, so the kill's predicate alone decides. Other modes compare an 8-bit value against AREF,
+// and DWDISABLE does not stop the depth write.
 enum Lit : uint8_t {
     LitKillControl,
     LitKillControlPad,
@@ -206,7 +206,7 @@ class FragmentEmitter {
 public:
     FragmentEmitter(const FSConfig& config_, int level_) : config{config_}, level{level_} {}
 
-    std::optional<GxpProgram> Emit(std::string* refusal);
+    std::optional<Program> Emit(std::string* refusal);
     uint32_t SampledUnits() {
         PlanInputs();
         return (unit_used[0] ? 1u : 0u) | (unit_used[1] ? 2u : 0u) | (unit_used[2] ? 4u : 0u);
@@ -282,8 +282,8 @@ private:
     static Src Scalar(Bank bank, uint32_t reg) {
         return {Reg{bank, static_cast<uint8_t>(reg & ~1u)}, (reg & 1) ? YYYY : XXXX};
     }
-    /// The data container starts after the resident uniforms; its first SA is the uniform
-    /// buffer pointer when the program reads uniforms from memory (data_head).
+    /// The data block starts after the resident uniforms; its first SA is the uniform buffer
+    /// pointer when the program reads uniforms from memory (data_head).
     Src Lit(uint8_t index) const {
         return SaScalar(LiteralSaOffset(uniform_floats + data_head, index));
     }
@@ -296,7 +296,7 @@ private:
     /// budget); returns the offset.
     uint32_t AllocateMemoryUniform(UniformKind kind, uint8_t index, uint8_t components);
     /// A light's parameters: the SA quad set for a resident light, else loaded into
-    /// TmpLightMem here (three loads and a wait).
+    /// TmpLightMem here (six loads and a wait).
     Vec4Loc LightParams(uint32_t num);
     void WriteDepth();
     /// A uniform's place: `components` floats (or array_size float4s) at a pair-aligned
@@ -309,7 +309,7 @@ private:
 
     FSConfig config;
     Ir::Builder e; ///< the program, in virtual quads; usse_ir places them
-    GxpProgram gxp;
+    Program program;
     std::array<bool, 3> unit_used{};
     /// The units whose texel is the pixel's own colour (FSConfig own_pixel): the tile's colour
     /// in o0, no sampler (unit_used is false for them).
@@ -347,7 +347,7 @@ private:
     uint32_t sa_lut_offset = 0;
     uint32_t sa_global_ambient = 0;
     uint32_t sa_border = 0;               ///< tex_border_color float4[3]
-    uint32_t data_head = 0;               ///< 1 when the data container starts with the pointer
+    uint32_t data_head = 0;               ///< 1 when the data block starts with the pointer
     uint32_t memory_floats = 0;           ///< floats in the memory part of the uniform buffer
     struct MemoryUniform {
         UniformKind kind;
@@ -585,16 +585,16 @@ void FragmentEmitter::PlanInputs() {
 
     // pa0-3 is the vertex colour; the four-wide inputs follow, then the pairs, then the
     // one float3 (which need not be followed by anything pair-aligned).
-    gxp.inputs.push_back({FragmentInput::Color0, 4});
+    program.inputs.push_back({FragmentInput::Color0, 4});
     uint8_t pa = 4;
     if (uses_scissor || uses_fog || uses_depth) {
-        gxp.inputs.push_back({FragmentInput::Position, 4});
+        program.inputs.push_back({FragmentInput::Position, 4});
         position_pa = pa;
         pa += 4;
     }
     if (uses_lighting) {
-        gxp.inputs.push_back({FragmentInput::TexCoord4, 4});
-        gxp.inputs.push_back({FragmentInput::TexCoord5, 4});
+        program.inputs.push_back({FragmentInput::TexCoord4, 4});
+        program.inputs.push_back({FragmentInput::TexCoord5, 4});
         normquat_pa = pa;
         pa += 8;
     }
@@ -614,7 +614,7 @@ void FragmentEmitter::PlanInputs() {
                                            FragmentInput::TexCoord2};
     for (int c = 0; c < 3; c++) {
         if (coord_needed[c]) {
-            gxp.inputs.push_back({coord_inputs[c], 2});
+            program.inputs.push_back({coord_inputs[c], 2});
             texcoord_pa[c] = pa;
             pa += 2;
         }
@@ -630,14 +630,14 @@ void FragmentEmitter::PlanInputs() {
     if (uses_lighting) {
         // Declared four wide, as psp2cgc declares a float3 varying (descriptor components
         // 4, four registers): the console, unlike Vita3K, allocates by the declaration.
-        gxp.inputs.push_back({FragmentInput::TexCoord6, 4});
+        program.inputs.push_back({FragmentInput::TexCoord6, 4});
         view_pa = pa;
         pa += 4;
     }
     if (unit_used[0] && (tex.texture0_type == TextureType::Projection2D ||
                          tex.texture0_type == TextureType::TextureCube)) {
         // texcoord0's w, one register, last so nothing pair-aligned has to follow it.
-        gxp.inputs.push_back({FragmentInput::TexCoord3, 1});
+        program.inputs.push_back({FragmentInput::TexCoord3, 1});
         texcoord0_w_pa = pa;
         pa += 1;
     }
@@ -650,31 +650,31 @@ void FragmentEmitter::PlanInputs() {
         scissor_pa = pa;
         pa += 2;
     }
-    gxp.pa_count = pa;
+    program.pa_count = pa;
     for (u32 unit = 0; unit < 3; unit++) {
         if (unit_used[unit]) {
-            gxp.samplers.push_back({SamplerKind::Texture, static_cast<uint8_t>(unit), unit});
+            program.samplers.push_back({SamplerKind::Texture, static_cast<uint8_t>(unit), unit});
         }
     }
     if (lut_used) {
-        gxp.samplers.push_back({SamplerKind::LutLf, 0, 3});
+        program.samplers.push_back({SamplerKind::LutLf, 0, 3});
     }
     if (uses_proctex && !proctex_tabled) {
-        sampler_rg = static_cast<uint32_t>(gxp.samplers.size());
-        gxp.samplers.push_back({SamplerKind::LutRg, 0, 4});
-        sampler_rgba = static_cast<uint32_t>(gxp.samplers.size());
-        gxp.samplers.push_back({SamplerKind::LutRgba, 0, 5});
+        sampler_rg = static_cast<uint32_t>(program.samplers.size());
+        program.samplers.push_back({SamplerKind::LutRg, 0, 4});
+        sampler_rgba = static_cast<uint32_t>(program.samplers.size());
+        program.samplers.push_back({SamplerKind::LutRgba, 0, 5});
         if (config.proctex.noise_enable) {
-            sampler_noise = static_cast<uint32_t>(gxp.samplers.size());
-            gxp.samplers.push_back({SamplerKind::ProctexNoise, 0, 6});
+            sampler_noise = static_cast<uint32_t>(program.samplers.size());
+            program.samplers.push_back({SamplerKind::ProctexNoise, 0, 6});
         }
     }
     // A split unit's alpha texture (TEXUNIT 7 + unit), after everything else so the other
     // samplers keep their indices.
     for (u32 unit = 0; unit < 3; unit++) {
         if (unit_used[unit] && (config.texture.alpha_split >> unit & 1)) {
-            sampler_alpha[unit] = static_cast<uint32_t>(gxp.samplers.size());
-            gxp.samplers.push_back(
+            sampler_alpha[unit] = static_cast<uint32_t>(program.samplers.size());
+            program.samplers.push_back(
                 {SamplerKind::TextureAlpha, static_cast<uint8_t>(unit), 7 + unit});
         }
     }
@@ -682,14 +682,14 @@ void FragmentEmitter::PlanInputs() {
 
 uint32_t FragmentEmitter::AllocateUniform(UniformKind kind, uint8_t components,
                                           uint32_t array_size, uint8_t index) {
-    // Vectors and arrays start on a pair (array elements are four floats apart, as
-    // sceGxmSetUniformDataF lays a float4 array out); scalars pack, so consecutive scalars
-    // such as the scissor bounds form pairs the program reads as one operand.
+    // Vectors and arrays start on a pair, and an array's elements are four floats apart;
+    // scalars pack, so consecutive scalars such as the scissor bounds form pairs the program
+    // reads as one operand.
     if ((components > 1 || array_size > 1) && (uniform_floats & 1)) {
         uniform_floats++;
     }
     const uint32_t at = uniform_floats;
-    gxp.uniforms.push_back({kind, index, at, components, array_size});
+    program.uniforms.push_back({kind, index, at, components, array_size});
     uniform_floats += array_size > 1 ? array_size * 4 : components;
     return at;
 }
@@ -701,8 +701,8 @@ void FragmentEmitter::PlanUniforms() {
         config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Never) {
         sa_alpha_ref = AllocateUniform(UniformKind::AlphaTestRef, 1, 1);
     }
-    // The constant colours as a prefix up to the last stage that reads one: the rasterizer
-    // writes all six and sceGxmSetUniformDataF clips to the parameter's size.
+    // The constant colours as a prefix up to the last stage that reads one (the rasterizer
+    // copies the uniform's array_size of them).
     u32 const_stages = 0;
     for (u32 i = 0; i < tex.tev_stages.size(); i++) {
         const TevStageConfig stage = tex.tev_stages[i];
@@ -783,7 +783,7 @@ void FragmentEmitter::PlanUniforms() {
         // Lights are register-resident (24 SAs each) while the budget holds, counting the
         // literals, the sampler words and the pointer behind them; the rest live in the
         // memory part of the uniform buffer and are loaded when their turn comes.
-        const uint32_t tail = LiteralCount + static_cast<uint32_t>(gxp.samplers.size()) * 4 + 1;
+        const uint32_t tail = LiteralCount + static_cast<uint32_t>(program.samplers.size()) * 4 + 1;
         for (u32 i = 0; i < lighting.src_num; i++) {
             const u32 num = lighting.lights[i].num;
             const UniformKind members[8] = {
@@ -810,20 +810,21 @@ void FragmentEmitter::PlanUniforms() {
         }
     }
     if (!memory_uniforms.empty()) {
-        // The pointer takes the data container's first SA; an odd resident count keeps the
+        // The pointer takes the data block's first SA; an odd resident count keeps the
         // literals behind it on their pairs.
         uniform_floats |= 1;
         data_head = 1;
-        gxp.buffer_pointer = true;
-        gxp.ldst_base_value = static_cast<int32_t>(uniform_floats * 4) - 4;
-        gxp.buffer_floats = uniform_floats + memory_floats;
+        program.buffer_pointer = true;
+        program.ldst_base_value = static_cast<int32_t>(uniform_floats * 4) - 4;
+        program.buffer_floats = uniform_floats + memory_floats;
         for (const MemoryUniform& m : memory_uniforms) {
-            gxp.uniforms.push_back({m.kind, m.index, uniform_floats + m.offset, m.components, 1});
+            program.uniforms.push_back(
+                {m.kind, m.index, uniform_floats + m.offset, m.components, 1});
         }
     } else if (uniform_floats & 1) {
         uniform_floats++;
     }
-    gxp.uniform_floats = uniform_floats;
+    program.uniform_floats = uniform_floats;
 }
 
 uint32_t FragmentEmitter::AllocateMemoryUniform(UniformKind kind, uint8_t index,
@@ -843,16 +844,20 @@ Vec4Loc FragmentEmitter::LightParams(uint32_t num) {
     if (light_memory[num] < 0) {
         return {Bank::SecAttr, static_cast<uint8_t>(sa_light[num])};
     }
-    // 24 floats from the buffer: sixteen, then two fours. The immediate offset is in
-    // floats and seven bits wide; the fourth light past the budget still fits.
+    // 24 floats from the buffer, a load per quad. The allocator places each quad on its
+    // own: one sixteen-float load filled sixteen registers from the first quad's home (past
+    // the program's temps), while the three quads after it read registers nothing loaded
+    // (a game's speckled drivers). The immediate offset is in floats and seven
+    // bits wide; the fourth light past the budget still fits.
     const uint32_t off = static_cast<uint32_t>(light_memory[num]);
     if (off + 20 > 127) {
         throw std::runtime_error("light parameters past the load offset's reach");
     }
-    const Reg ptr = Reg::Sa(static_cast<uint8_t>(uniform_floats)); // data container offset 0
-    e.Lda32(Reg::V(TmpLightMem), ptr, nullptr, static_cast<uint8_t>(off), 16, 0);
-    e.Lda32(Reg::V(TmpLightMem + 16), ptr, nullptr, static_cast<uint8_t>(off + 16), 4, 0);
-    e.Lda32(Reg::V(TmpLightMem + 20), ptr, nullptr, static_cast<uint8_t>(off + 20), 4, 0);
+    const Reg ptr = Reg::Sa(static_cast<uint8_t>(uniform_floats)); // the data block's head
+    for (uint32_t q = 0; q < 24; q += 4) {
+        e.Lda32(Reg::V(static_cast<uint8_t>(TmpLightMem + q)), ptr, nullptr,
+                static_cast<uint8_t>(off + q), 4, 0);
+    }
     e.WdfVertex(0);
     return {Bank::Virtual, TmpLightMem};
 }
@@ -877,10 +882,9 @@ uint32_t FragmentEmitter::LutSamplerIndex() const {
 }
 
 void FragmentEmitter::NewPhaseAfterKill() {
-    // A kill ends its phase, and a program has one kill and two phases, never more: three
-    // phases locked the console's GPU up on the title screen's alpha-tested sprites, and a
-    // second kill inside phase two locked it up as well (both 2026-09-05). The scissor
-    // and alpha tests therefore share one kill (fold_scissor).
+    // A kill ends its phase; a program has one kill and two phases, never more: three phases, or a
+    // second kill inside phase two, lock the GPU up. So the scissor and alpha tests share one kill
+    // (fold_scissor).
     e.NopAfterKill();
     e.PhaseStart();
     e.Phas(true);
@@ -2446,7 +2450,7 @@ void FragmentEmitter::AlphaTest() {
     NewPhaseAfterKill();
 }
 
-std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
+std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
     if (const char* why = Unsupported()) {
         if (refusal) {
             *refusal = why;
@@ -2458,7 +2462,7 @@ std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
     uses_kill = config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always ||
                 uses_scissor;
 
-    gxp.literals = {0xE000u, // the kill's control word, as every compiler program has it
+    program.literals = {0xE000u, // the kill's control word, as every compiler program has it
                     0u,
                     std::bit_cast<uint32_t>(255.0f),
                     std::bit_cast<uint32_t>(1.0f / 255.0f),
@@ -2504,21 +2508,16 @@ std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
                     0u};
     static_assert(LiteralCount == 44);
     static_assert(Pica::Shader::LUT_RG_ROWS == Pica::Shader::LUT_RGBA_ROWS);
-    gxp.uses_discard = uses_kill;
-    gxp.writes_depth = uses_depth;
-    if (uniform_floats + LiteralCount + gxp.samplers.size() * 4 > 128) {
+    program.uses_discard = uses_kill;
+    if (uniform_floats + LiteralCount + program.samplers.size() * 4 > 128) {
         if (refusal) {
             *refusal = "secondary attribute budget";
         }
         return {};
     }
 
-    // Console findings, 2026-09-04, on the sparse per-pixel noise every program with a
-    // texture read drew: the phase marker must be followed by a NOP, and the nosched bits
-    // the builders chose were wrong (they marked the producer of an internal register,
-    // while the hardware wants the instruction before it: the bit guards the boundary
-    // after the next instruction). Setting the bit everywhere cured the noise and cost
-    // the GPU its instance switching; FinishNosched now places it as the compiler does.
+    // The phase marker must be followed by a NOP, and the nosched bit guards the boundary after the
+    // next instruction: FinishNosched places it as the compiler does.
     // skipinv as psp2cgc places it (Ir::Builder::skip_invalid_auto): without it the pipes run a
     // task's invalid instances too. The LUT and noise reads are point sampled from one level
     // (Sample2DPoint), so only the texture units' coordinates keep it clear.
@@ -2577,16 +2576,19 @@ std::optional<GxpProgram> FragmentEmitter::Emit(std::string* refusal) {
 
     // The quads go to the temporaries, then to primary attributes past the interpolants.
     e.AddClass({Bank::Temp, 0, 64});
-    e.AddClass({Bank::PrimAttr, static_cast<uint8_t>((gxp.pa_count + 3) & ~3u), 64});
+    e.AddClass({Bank::PrimAttr, static_cast<uint8_t>((program.pa_count + 3) & ~3u), 64});
     Encoder encoder;
     const Ir::LowerResult lowered = e.Lower(encoder, level);
     encoder.PatchKills(LiteralSaOffset(uniform_floats + data_head, LitKillControl));
     encoder.FinishNosched();
-    gxp.temp_count = lowered.temp_count;
-    gxp.pa_count = std::max<uint32_t>(gxp.pa_count, lowered.pa_count);
-    gxp.phase_starts = lowered.phase_starts;
-    gxp.primary = encoder.Words();
-    return gxp;
+    program.temp_count = lowered.temp_count;
+    program.peak_live = lowered.peak_live;
+    program.peak_at = lowered.peak_at;
+    program.peak_regs = lowered.peak_regs;
+    program.pa_count = std::max<uint32_t>(program.pa_count, lowered.pa_count);
+    program.phase_starts = lowered.phase_starts;
+    program.primary = encoder.Words();
+    return program;
 }
 
 } // Anonymous namespace
@@ -2596,7 +2598,7 @@ uint32_t SampledTextureUnits(const FSConfig& config) {
     return emitter.SampledUnits();
 }
 
-std::optional<GxpProgram> EmitFragmentGxp(const FSConfig& config, std::string* refusal,
+std::optional<Program> EmitFragmentProgram(const FSConfig& config, std::string* refusal,
                                           int level) {
     FragmentEmitter emitter{config, level};
     std::optional<FragmentEmitter> exact;

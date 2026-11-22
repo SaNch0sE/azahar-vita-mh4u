@@ -20,10 +20,10 @@ namespace Core {
 class System;
 
 /**
- * Keeps the taken core's translation table matching the emulated process's page table.
+ * Keeps the guest's translation table matching the emulated process's page table.
  *
- * The PS Vita build runs guest code on a CPU core taken away from the Vita's kernel, under a
- * translation table the kernel module authors (vita_native/src/native.c). The guest
+ * The PS Vita build runs guest code on the emulation threads' own cores, one slice at a time,
+ * under a translation table the kernel module authors (vita_native/src/native.c). The guest
  * therefore sees memory at its own addresses, but those addresses are not this process's: what
  * this process reaches through a MemoryRef pointer, the guest reaches through a descriptor the
  * module writes for the same physical pages. This observer turns each mapping change of the
@@ -109,7 +109,8 @@ private:
  * svcs on the current process, the current thread's and process's IDs (AZAHAR_FAST_*) - never
  * leave the guest: its vector answers them and the slice runs on.
  *
- * Both emulated cores share the one taken core and the one host thread, as on Linux.
+ * The 3DS's core 0 runs on the emulation thread, its other cores on the second emulation thread
+ * (Core::System::SecondHostMain), each in the guest's world on a Vita core of its own.
  */
 #ifdef VITA_DIAGNOSTICS
 /// The native core's slices since the last TakeVitaNativeCensus (sgxd_flags `perflog`).

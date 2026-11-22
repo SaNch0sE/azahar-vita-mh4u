@@ -101,10 +101,10 @@ azahar_enter:
     @ guest thread A can take its exit between an ldrex and its strex, and if the reservation
     @ survives into thread B then B's strex to the same word succeeds when the architecture
     @ says it must fail. That is a 3DS LightLock handed to two owners at once, and it is how
-    @ eight of thirteen guest threads ended up parked on address arbiters nobody would signal
-    @ (2026-09-01). One instruction per entry, and it also makes ClearExclusiveState's
-    @ no-op honest. A spurious strex failure is architecturally permitted and every lock loop
-    @ retries, so clearing on every entry costs nothing but the instruction.
+    @ guest threads end up parked on address arbiters nobody will signal. One instruction per entry,
+    @ and it also makes ClearExclusiveState's no-op honest. A spurious strex failure is
+    @ architecturally permitted and every lock loop retries, so clearing on every entry costs
+    @ nothing but the instruction.
     clrex
     cps     #0x13                   @ Supervisor (IRQs masked above: nothing may interrupt
                                     @ the banked-register dance)
@@ -472,10 +472,10 @@ azahar_cpu:        .space 4 * CPU_SIZE
                                     @ segment: a symbol at the exact end (one-past-the-end
                                     @ address) gets its relocations silently DROPPED by
                                     @ vita-elf-create - it cannot attribute the address to
-                                    @ a segment - so every reference to it stayed at the
-                                    @ link-time address after load (2026-08-30: the stray
-                                    @ pushes aborted on the unmapped link VA, the seal
-                                    @ ranges stretched toward it, and a C dereference of it
-                                    @ crashed the resident thread outright)
+                                    @ a segment - so every reference to it stays at the
+                                    @ link-time address after load (the stray pushes abort
+                                    @ on the unmapped link VA, the seal ranges stretch
+                                    @ toward it, and a C dereference of it crashes the
+                                    @ resident thread outright)
 
     .section .note.GNU-stack,"",%progbits

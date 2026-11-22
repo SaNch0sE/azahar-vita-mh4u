@@ -509,7 +509,7 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
 #if defined(__vita__)
     // Cheats are off on the Vita build: every cheat write goes through
     // InvalidateCacheRange, which on the native core is a kernel round trip that cleans the
-    // page and drops core 2's icache, once a frame per cheat line (2026-09-05).
+    // page and drops core 2's icache, once a frame per cheat line.
     LOG_INFO(Core, "cheats are disabled on this build");
 #else
     cheat_engine.LoadCheatFile(title_id);
@@ -863,8 +863,8 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     auto gsp = service_manager->GetService<Service::GSP::GSP_GPU>("gsp::Gpu");
     // Free the old one first. Assigning over it constructs the replacement while it is still
     // alive, so both renderers hold their GL resources at once - two vertex rings, two texture
-    // caches - and on a modest GPU the second allocation simply fails. That is what a state
-    // load, which re-enters Init, used to hit.
+    // caches - and on a modest GPU the second allocation simply fails, in a state load, which
+    // re-enters Init.
     gpu.reset();
     gpu = std::make_unique<VideoCore::GPU>(*this, emu_window, secondary_window);
     gpu->SetInterruptHandler([gsp](Service::GSP::InterruptId interrupt_id, u64 wait_delay_ns) {
@@ -991,7 +991,7 @@ void System::RegisterImageInterface(std::shared_ptr<Frontend::ImageInterface> im
 }
 
 // Milestones of a state load, printed at info level: a load that stops without an error
-// (Vita3K, 2026-09-07) needs to say where. Cheap: one line per section.
+// needs to say where. Cheap: one line per section.
 static void SavestateTrace(const char* what) {
     LOG_INFO(Core, "savestate: {}", what);
 }
@@ -1232,8 +1232,8 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     // Flush on save, don't flush on load - but only where the cache knows what the guest has
     // written since. With page marking off (the render thread runs; the native CPU traps no
     // stores) a dirty region can be a render target the guest has long since reused for its
-    // own data, and writing those pixels back over it crashed Smash the instant after "Save
-    // completed" (a null pointer read out of a written-back surface, 2026-09-07). The state
+    // own data, and writing those pixels back over it crashes a game the instant after "Save
+    // completed" (a null pointer read out of a written-back surface). The state
     // then holds what guest memory holds; GPU-only content is redrawn or reloaded after a
     // load, as it is after any invalidation.
     const bool should_flush = !Archive::is_loading::value && memory->RasterizerCacheMarkingEnabled();

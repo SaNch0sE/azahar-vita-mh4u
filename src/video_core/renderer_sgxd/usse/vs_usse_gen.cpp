@@ -15,7 +15,6 @@
 #include <string>
 #include <string_view>
 #include <nihstro/shader_bytecode.h>
-#include "video_core/renderer_gxm/usse/gxp_writer.h"
 #include "video_core/renderer_sgxd/usse/usse_encoder.h"
 #include "video_core/renderer_sgxd/usse/usse_ir.h"
 #include "video_core/renderer_sgxd/usse/usse_program.h"
@@ -23,11 +22,11 @@
 
 /**
  * How a PICA vertex program becomes a USSE one (the forms are psp2cgc's for the same
- * operations, probes p_a-p_i of 2026-09-05, see vs_encoder_test):
+ * operations, see vs_encoder_test):
  *
  * Registers. A PICA float4 lives in a quad of four consecutive registers of the unified
- * store: inputs a loader feeds in primary attributes (four per attribute, as the compiler
- * lays them out), inputs with no loader and the register-resident uniforms in secondary
+ * store: inputs a loader feeds in primary attributes (a quad per attribute), inputs with no
+ * loader and the register-resident uniforms in secondary
  * attributes, everything else (temporaries, output attributes, the load quad, the
  * address registers as 16-bit integers, the loop state) in virtual quads that the IR
  * (usse_ir.h) places by liveness: temporaries first, then primary attributes past the
@@ -37,17 +36,17 @@
  * time.
  *
  * Uniforms. The 128 float4 uniforms cannot be register-resident (512 of 128 SAs), so
- * they sit in memory behind the resident part of the default uniform buffer: the ones a
- * program reads with a constant index ride in the SA image the secondary PDS program DMAs
- * (per draw), the others are loaded at their use with lda32 through the buffer pointer
- * libgxm plants in the data container: base + address register, wrapped to 128 entries
- * and scaled to bytes with the compiler's integer sequence.
+ * they sit in memory behind the resident uniforms: the ones a program reads with a
+ * constant index ride in the SA image the secondary PDS program DMAs (per draw), the others
+ * are loaded at their use with lda32 through the buffer pointer at the data block's head:
+ * base + address register, wrapped to 128 entries and scaled to bytes with the compiler's
+ * integer sequence.
  *
  * Control flow. The condition codes are the predicates p0 and p1 (CMP writes them, the
  * conditional forms branch on them), p2 is the scratch predicate, always used positive
  * since the vector ops have no !p2. Subroutines are inlined at each call, IF/ELSE and LOOP
  * are branches, END branches to the epilogue. A branch on per-vertex data puts the
- * program in per-instance mode (flag 0x2), as the compiler does.
+ * program in per-instance mode (Program::per_instance), as the compiler does.
  */
 namespace GxmRenderer::Usse {
 
@@ -100,13 +99,13 @@ constexpr uint32_t SaLimit = 128;
 constexpr uint8_t OutScratchEnd = 24;
 
 // The resident secondary attributes: the depth mapping, then the input defaults and the
-// integer uniforms (container 14, in the order the parameters name them).
+// integer uniforms.
 constexpr uint32_t SaFlipViewport = 0;
 constexpr uint32_t SaDepthScale = 1;
 constexpr uint32_t SaDepthOffset = 2;
 constexpr uint32_t SaResidentHead = 4;
 
-// The data container (19): the buffer pointer, then the literals. The ones a compare reads
+// The data block: the buffer pointer, then the literals. The ones a compare reads
 // as a scalar sit at even offsets (a test reads the .x of a pair); the odd slots between
 // them are unused.
 enum DataSlot : uint32_t {
@@ -129,8 +128,8 @@ enum DataSlot : uint32_t {
 };
 constexpr uint32_t DataLiteralCount = DataSize - 1;
 
-// Output registers of the fragment interface, as the compiled programs with the same
-// interface lay them out: POSITION o0-o3, COLOR0 o4-o7, TEXCOORD0-2 two each from o8,
+// Output registers of the fragment interface, in the order the output selects lay them out
+// (OutSelects, TexSize): POSITION o0-o3, COLOR0 o4-o7, TEXCOORD0-2 two each from o8,
 // TEXCOORD3 o14, TEXCOORD4 o16-19, TEXCOORD5 o20-23, TEXCOORD6 o24-26.
 constexpr uint8_t OutPosition = 0;
 constexpr uint8_t OutColor = 4;
@@ -141,8 +140,8 @@ constexpr uint8_t OutTexcoord0W = 14;
 constexpr uint8_t OutNormquat = 16;
 constexpr uint8_t OutNormquatFlat = 20;
 constexpr uint8_t OutView = 24;
-constexpr uint32_t VertexOutputs1 = 0x1b001800; ///< 27 registers, position, colour
-constexpr uint32_t VertexOutputs2 = 0xff249;    ///< the texcoord widths
+constexpr uint32_t OutSelects = 0x1b001800; ///< 27 registers, position, colour
+constexpr uint32_t TexSize = 0xff249;        ///< the texcoord widths
 
 // VSOutputAttributes::Semantic, as regs_rasterizer.h numbers them.
 enum Semantic : uint8_t {
@@ -259,7 +258,7 @@ public:
     VertexEmitter(const VsRequest& request_, int level_, bool dynamic_emit_)
         : req{request_}, level{level_}, dynamic_emit{dynamic_emit_} {}
 
-    std::optional<GxpProgram> Emit(uint32_t& input_regs);
+    std::optional<Program> Emit(uint32_t& input_regs);
     int level = 1;
 
 private:
@@ -354,7 +353,7 @@ private:
     /// Main's walk over the whole program from its entry (ScanProgram): what main emits.
     std::vector<bool> main_walk;
     Ir::Builder e;   ///< the primary program
-    GxpProgram gxp;
+    Program program;
 
     // Where things landed.
     std::array<int, 16> input_pa{};   ///< input register -> PA base, or -1
@@ -363,8 +362,8 @@ private:
     std::array<std::optional<Quad>, 16> temp_quad{};
     std::array<std::optional<Quad>, 16> attr_quad{};
     std::array<int, 128> uniform_sa{}; ///< uniform -> SA base when prefetched, or -1
-    uint32_t resident = 0;             ///< container 14 size (floats)
-    uint32_t data_base = 0;            ///< container 19's first SA
+    uint32_t resident = 0;             ///< the resident uniforms' size (floats)
+    uint32_t data_base = 0;            ///< the data block's first SA
     uint32_t sa_top = 0;               ///< SAs in use
     int int_sa = -1;                   ///< uniforms_i's SA base
     uint8_t pa_inputs = 0;             ///< PA registers the attributes take
@@ -603,8 +602,7 @@ void VertexEmitter::Layout() {
         if (words + 2 > PaLimit) {
             Refuse("more geometry input rows than primary attributes");
         }
-        gxp.attributes.push_back({AttributeKind::GsInRows, 0, 0});
-        gxp.attrib_pa_regs = (1ull << words) - 1;
+        program.attributes.push_back({AttributeKind::GsInRows, 0, 0, static_cast<uint8_t>(words)});
         pa_inputs = static_cast<uint8_t>((words + 1) & ~1u);
     }
     // Attributes: four PAs each, in register order; the components a loader does not
@@ -615,12 +613,12 @@ void VertexEmitter::Layout() {
         }
         input_pa[i] = pa_inputs;
         if ((req.u8_regs & (1u << i)) == 0) {
-            gxp.attributes.push_back({AttributeKind::Input, static_cast<uint8_t>(i), pa_inputs});
             uint32_t comps = req.reg_components[i];
             if (comps == 0 || comps > 4) {
                 comps = 4;
             }
-            gxp.attrib_pa_regs |= ((1ull << comps) - 1) << pa_inputs;
+            program.attributes.push_back({AttributeKind::Input, static_cast<uint8_t>(i), pa_inputs,
+                                      static_cast<uint8_t>(comps)});
         }
         pa_inputs = static_cast<uint8_t>(pa_inputs + 4);
     }
@@ -633,52 +631,39 @@ void VertexEmitter::Layout() {
             continue;
         }
         input_raw_pa[i] = pa_inputs;
-        gxp.attributes.push_back({AttributeKind::Input, static_cast<uint8_t>(i), pa_inputs});
         const uint32_t words = RawWords(req, i);
-        gxp.attrib_pa_regs |= ((1ull << words) - 1) << pa_inputs;
+        program.attributes.push_back({AttributeKind::Input, static_cast<uint8_t>(i), pa_inputs,
+                                  static_cast<uint8_t>(words)});
         pa_inputs = static_cast<uint8_t>(pa_inputs + (words > 2 ? 4 : 2));
     }
     if (req.mode == VsMode::StoreOutputs) {
         out_address_pa = pa_inputs;
-        gxp.attributes.push_back({AttributeKind::OutAddress, 0, pa_inputs});
-        gxp.attrib_pa_regs |= 1ull << pa_inputs;
+        program.attributes.push_back({AttributeKind::OutAddress, 0, pa_inputs, 1});
         pa_inputs = static_cast<uint8_t>(pa_inputs + 2);
     }
 
     // Resident uniforms: the depth mapping, the input defaults, the integer uniforms.
-    gxp.uniforms.push_back({UniformKind::FlipViewport, 0, SaFlipViewport, 1, 1});
-    gxp.uniforms.push_back({UniformKind::DepthScale, 0, SaDepthScale, 1, 1});
-    gxp.uniforms.push_back({UniformKind::DepthOffset, 0, SaDepthOffset, 1, 1});
+    program.uniforms.push_back({UniformKind::FlipViewport, 0, SaFlipViewport, 1, 1});
+    program.uniforms.push_back({UniformKind::DepthScale, 0, SaDepthScale, 1, 1});
+    program.uniforms.push_back({UniformKind::DepthOffset, 0, SaDepthOffset, 1, 1});
     resident = SaResidentHead;
     for (uint32_t i = 0; i < 16 && req.mode != VsMode::Geometry; i++) {
         if ((scan.inputs & (1u << i)) != 0 && (req.default_regs & (1u << i)) != 0) {
             default_sa[i] = static_cast<int>(resident);
-            gxp.uniforms.push_back(
+            program.uniforms.push_back(
                 {UniformKind::DefaultInput, static_cast<uint8_t>(i), resident, 4, 1});
             resident += 4;
         }
     }
     if (scan.ints != 0) {
         int_sa = static_cast<int>(resident);
-        gxp.uniforms.push_back({UniformKind::IntUniforms, 0, resident, 4, 4});
+        program.uniforms.push_back({UniformKind::IntUniforms, 0, resident, 4, 4});
         resident += 16;
     }
-    gxp.uniform_floats = resident;
+    program.uniform_floats = resident;
 
-    // The data container, then the prefetched uniforms.
     data_base = resident;
     sa_top = data_base + DataSize + ExtraLiterals();
-    // The variable-primitive mode's tables point past an invocation's rows into the bank.
-    if (scan.any_uniform || req.gs_rows_table) {
-        // 128 entries plus a mirror of the first four: an indexed read whose index wraps
-        // at 128 (Smash reads with a0 = -2) may be issued at an immediate offset from a
-        // neighbouring row's address, and the offset runs into the mirror.
-        gxp.uniforms.push_back(
-            {UniformKind::FloatBank, 0, resident, 4, 128 + Ir::UniformMirrorRows});
-        gxp.buffer_pointer = true;
-        gxp.ldst_base_value = static_cast<int32_t>(resident * 4) - 4;
-        gxp.buffer_floats = resident + 512 + Ir::UniformMirrorRows * 4;
-    }
     // Most used first, as many as fit.
     std::vector<uint8_t> order;
     for (uint32_t n = 0; n < 128; n++) {
@@ -720,7 +705,7 @@ void VertexEmitter::Layout() {
     }
     // The header's secondary register count decides what the hardware allocates: undeclared SA
     // quads read as black screens.
-    gxp.secondary_reg_count = sa_top;
+    program.secondary_reg_count = sa_top;
 
     // Output attributes, then the temporaries.
     for (uint32_t k = 0; k < req.num_outputs && k < 16; k++) {
@@ -889,7 +874,7 @@ Operand VertexEmitter::Source(const SourceRegister& reg, uint32_t addr, const Sw
         // pointer, into a per-instance register that is the load's base with offset 0.
         // That is psp2cgc's form in every per-instance program (`mad.i32 o0.x, r0.lo16,
         // 0x10.lo16, sa16.x; lda32.fetch4 r0, [o0, 0x0]`); the `[sa16, r3]` form it uses
-        // in programs without branches broke skinned vertices on the console (2026-09-06).
+        // in programs without branches breaks skinned vertices.
         const Reg areg = addr == 1 ? Reg::V(TmpA0X) : addr == 2 ? Reg::V(TmpA0Y) : Reg::V(TmpAlS16);
         const Reg address = Reg::V(TmpAddr);
         e.MadI16(address, areg, DataReg(DataOnes16),
@@ -1199,8 +1184,24 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
                 }
             }
         }
+        // In place (the destination is the source's quad), a half's write is a pair the other
+        // half may read: the half reading the pair the other writes goes first, and two halves
+        // reading each other's pairs go through I2 instead.
+        int source_pair[2] = {-1, -1};
+        for (int h = 0; h < 2 && direct; h++) {
+            const uint8_t m = static_cast<uint8_t>((mask >> (2 * h)) & 3);
+            if (m != 0) {
+                source_pair[h] = static_cast<int>((m & 1) ? a.swz[2 * h] : a.swz[2 * h + 1]) / 2;
+            }
+        }
+        const bool in_place = dst->bank == a.quad.bank && dst->base == a.quad.base;
+        if (in_place && source_pair[0] == 1 && source_pair[1] == 0) {
+            direct = false; // a swap of the halves
+        }
+        const bool high_first = in_place && source_pair[1] == 0;
         if (direct) {
-            for (int h = 0; h < 2; h++) {
+            for (int k = 0; k < 2; k++) {
+                const int h = high_first ? 1 - k : k;
                 const uint8_t m = static_cast<uint8_t>((mask >> (2 * h)) & 3);
                 if (m == 0) {
                     continue;
@@ -1274,7 +1275,11 @@ void VertexEmitter::EmitArithmetic(const Instruction& instr, const SwizzlePatter
                            : op == OpCode::Id::RSQ ? CompOp::Rsq
                            : op == OpCode::Id::EX2 ? CompOp::Exp
                                                    : CompOp::Log;
-        for (int h = 0; h < 2; h++) {
+        // In place, the source's pair is written last: the other half reads it first.
+        const bool in_place = dst->bank == a.quad.bank && dst->base == a.quad.base;
+        const int last = in_place ? static_cast<int>(ch) / 2 : 1;
+        for (int k = 0; k < 2; k++) {
+            const int h = last == 0 ? 1 - k : k;
             const uint8_t m = static_cast<uint8_t>((mask >> (2 * h)) & 3);
             if (m != 0) {
                 e.Comp(cop, {dst->Pair(h), m}, {pair, XYZW, a.mod}, comp, pred);
@@ -1860,8 +1865,7 @@ void VertexEmitter::OutputPair(uint8_t out, Semantic s0, Semantic s1) {
         e.MoveInternal({Reg::O(out), 0x3}, {attr_quad[m0.attribute]->Pair(m0.component / 2), XYZW});
         return;
     }
-    // Two lanes no attribute feeds (the emitter's 1.0 fill) go in one pair move: the Smash
-    // corpus wrote 477 single output lanes, 385 of them in adjacent pairs (2026-09-07).
+    // Two lanes no attribute feeds (the emitter's 1.0 fill) go in one pair move.
     if (!SemanticSrc(s0) && !SemanticSrc(s1)) {
         e.MoveInternal({Reg::O(out), 0x3}, ConstOne);
         return;
@@ -1917,7 +1921,7 @@ void VertexEmitter::Epilogue() {
 
 // ---------------------------------------------------------------------------------------
 
-std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
+std::optional<Program> VertexEmitter::Emit(uint32_t& input_regs) {
     if (req.code.size() < req.code_size || req.main_offset >= req.code_size) {
         Refuse("program extent");
     }
@@ -1953,7 +1957,7 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
     // DMAs: no secondary USSE program. Loads of its own are not complete when a draw's first
     // vertices read them (docs/sgxd/pds.md).
     for (const uint8_t n : prefetch) {
-        gxp.prefetched_uniforms.emplace_back(static_cast<uint32_t>(uniform_sa[n]), n);
+        program.prefetched_uniforms.emplace_back(static_cast<uint32_t>(uniform_sa[n]), n);
     }
     const std::size_t epilogue_at = e.Count();
     Bind(end_label);
@@ -1977,28 +1981,29 @@ std::optional<GxpProgram> VertexEmitter::Emit(uint32_t& input_regs) {
     const Ir::LowerResult lowered = e.Lower(primary, level);
     primary.FinishNosched();
 
-    gxp.vertex = true;
-    gxp.per_instance = per_instance;
-    gxp.vertex_outputs1 = VertexOutputs1;
-    gxp.vertex_outputs2 = VertexOutputs2;
-    gxp.pa_count = std::max<uint32_t>({static_cast<uint32_t>(pa_inputs), lowered.pa_count, 4u});
-    gxp.temp_count = lowered.temp_count;
-    gxp.literals = {
+    program.vertex = true;
+    program.per_instance = per_instance;
+    program.outselects = OutSelects;
+    program.texsize = TexSize;
+    program.pa_count = std::max<uint32_t>({static_cast<uint32_t>(pa_inputs), lowered.pa_count, 4u});
+    program.temp_count = lowered.temp_count;
+    program.literals = {
         0u, std::bit_cast<uint32_t>(-128.0f), 0x00010000u, std::bit_cast<uint32_t>(127.0f),
         0u, std::bit_cast<uint32_t>(1e-6f),   0u,          std::bit_cast<uint32_t>(-1.00001f),
         0u, std::bit_cast<uint32_t>(-1.0f),   0u,          0x00010001u,
         0u};
     static_assert(DataLiteralCount == 13);
-    if (!gxp.buffer_pointer) {
+    if (!program.buffer_pointer) {
         // No uniform read: the pointer slot stays, as a literal, so the layout is one.
-        gxp.literals.insert(gxp.literals.begin(), 0u);
+        program.literals.insert(program.literals.begin(), 0u);
     }
     if (req.mode == VsMode::Geometry) {
-        gxp.literals.push_back(std::bit_cast<uint32_t>(static_cast<float>(req.gs_max_triangles)));
-        gxp.literals.push_back(0u);
+        program.literals.push_back(
+            std::bit_cast<uint32_t>(static_cast<float>(req.gs_max_triangles)));
+        program.literals.push_back(0u);
     }
-    gxp.primary = primary.Words();
-    return gxp;
+    program.primary = primary.Words();
+    return program;
 }
 
 struct GsBoundWalk {
@@ -2134,7 +2139,7 @@ bool GsIndexesUniforms(std::span<const uint32_t> code, uint32_t code_size) {
     return false;
 }
 
-std::optional<GxpProgram> EmitVertexGxp(const VsRequest& request, uint32_t& input_regs,
+std::optional<Program> EmitVertexProgram(const VsRequest& request, uint32_t& input_regs,
                                         std::string* refusal, int level) {
     // A geometry program with an EMIT that different SETEMITs reach (a join between) keeps
     // its emit state in registers too (VertexEmitter::dynamic_emit).
