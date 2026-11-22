@@ -275,6 +275,7 @@ static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at ma
 enum { CMD_NONE, CMD_INSTALL, CMD_RUN, CMD_UNINSTALL };
 static volatile uint32_t azahar_cmd, azahar_cmd_done, azahar_cmd_status;
 static volatile uint32_t azahar_heartbeat, azahar_on_core, azahar_stop, azahar_park;
+static volatile uint32_t azahar_guest_on; // 0x100 | the core while it runs the guest (prof.c)
 
 static volatile uint32_t azahar_core2_vbar, azahar_core2_cpsr, azahar_core2_ttbr1, azahar_core2_sp;
 
@@ -621,7 +622,13 @@ static void core2_run(void) {
         asm volatile("dsb \n isb" ::: "memory");
     }
     azahar_progress = 3;
+    // prof.c: this core runs the guest until azahar_enter returns (0x100 | the core). The core
+    // comes from MPIDR: nothing of Sony's kernel is mapped here once the core is sealed.
+    uint32_t mpidr;
+    asm volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
+    azahar_guest_on = 0x100u | (mpidr & 3u);
     const uint32_t reason = (uint32_t)azahar_enter(&azahar_ctx, azahar_host);
+    azahar_guest_on = 0;
     azahar_progress = 42;
     if (pmr) {
         azahar_run_timer_left = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);

@@ -15,7 +15,7 @@ add_custom_command(
     DEPENDS ${GXM_SHADER_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/shaders/EmbedShaders.cmake"
     COMMENT "Embedding GXM shader programs")
 
-add_executable(citra_vita
+set(CITRA_VITA_SOURCES
     ../vita_compat/src/vita_libc_shims.c
     citra_vita_main.cpp
     emu_window_vita.cpp
@@ -34,8 +34,6 @@ add_executable(citra_vita
     vita_ui.h
     "${GXM_SHADER_HEADER}"
 )
-target_include_directories(citra_vita PRIVATE "${CMAKE_CURRENT_BINARY_DIR}"
-                                              "${CMAKE_SOURCE_DIR}/src/sgxd")
 
 # The shims must survive LTO. clang only emits the call to __aeabi_h2f during code generation,
 # which happens after LTO has decided what to keep - so with the shim in bitcode, LLVM sees a
@@ -45,39 +43,48 @@ target_include_directories(citra_vita PRIVATE "${CMAKE_CURRENT_BINARY_DIR}"
 set_source_files_properties(../vita_compat/src/vita_libc_shims.c PROPERTIES
     COMPILE_OPTIONS "-fno-lto")
 
-create_target_directory_groups(citra_vita)
+# The emulator's executable, and the replay player's below: the same frontend, told its title ID.
+# The kernel opens the module by its installed path rather than through app0:, so the app is
+# told its title ID to build that path (LoadAzaharNative in citra_vita_main.cpp).
+function(citra_vita_executable target titleid)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}"
+                                                 "${CMAKE_SOURCE_DIR}/src/sgxd")
+    create_target_directory_groups(${target})
 
-target_link_libraries(citra_vita PRIVATE citra_common citra_core input_common video_core)
+    target_link_libraries(${target} PRIVATE citra_common citra_core input_common video_core)
 
-# imgui's core objects come from the VITASDK's imgui_vita2d archive (its 1.79 imgui build);
-# the vita2d backend object inside it is never referenced, so vita2d itself is not linked.
-target_link_libraries(citra_vita PRIVATE
-    imgui_vita2d
-    taihen_stub
-    SceDisplay_stub
-    SceGxm_stub
-    SceCommonDialog_stub
-    SceCtrl_stub
-    SceTouch_stub
-    SceAudio_stub
-    ScePower_stub
-    SceShellSvc_stub
-    SceAppMgr_stub
-    SceAppUtil_stub
-    SceKernelDmacMgr_stub
-    SceKernelModulemgr_stub
-    SceVshBridge_stub
-    m
-)
+    # imgui's core objects come from the VITASDK's imgui_vita2d archive (its 1.79 imgui build);
+    # the vita2d backend object inside it is never referenced, so vita2d itself is not linked.
+    target_link_libraries(${target} PRIVATE
+        imgui_vita2d
+        taihen_stub
+        SceDisplay_stub
+        SceGxm_stub
+        SceCommonDialog_stub
+        SceCtrl_stub
+        SceTouch_stub
+        SceAudio_stub
+        ScePower_stub
+        SceShellSvc_stub
+        SceAppMgr_stub
+        SceAppUtil_stub
+        SceKernelDmacMgr_stub
+        SceKernelModulemgr_stub
+        SceVshBridge_stub
+        m
+    )
 
-target_include_directories(citra_vita PRIVATE ${VITASDK}/arm-vita-eabi/include)
+    target_include_directories(${target} PRIVATE ${VITASDK}/arm-vita-eabi/include)
 
+    # vita_create_self looks for the executable next to the target rather than in the project's
+    # shared output directory, so this target keeps its own.
+    set_target_properties(${target} PROPERTIES
+        LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ldscript.ld
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    target_compile_definitions(${target} PRIVATE AZAHAR_VITA_TITLEID="${titleid}")
+endfunction()
 
-# vita_create_self looks for the executable next to the target rather than in the project's
-# shared output directory, so this target keeps its own.
-set_target_properties(citra_vita PROPERTIES
-    LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ldscript.ld
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+add_executable(citra_vita ${CITRA_VITA_SOURCES})
 
 # ATTRIBUTE2=12 is the extended-memory mode: the app's LPDDR budget grows by 109 MB, which
 # is what lets the newlib heap below hold the guest's 128 MB FCRAM and still leave the
@@ -90,10 +97,9 @@ set(VITA_APP_NAME "Azahar")
 set(VITA_VERSION "00.10")
 
 # The vpk carries the kernel module and the app loads it at startup (LoadAzaharNative in
-# citra_vita_main.cpp). The kernel opens the file by its installed path rather than through
-# app0:, so the app is told its title ID to build that path.
+# citra_vita_main.cpp).
 get_target_property(AZAHAR_NATIVE_MODULE azaharnative_stub AZAHAR_NATIVE_MODULE)
-target_compile_definitions(citra_vita PRIVATE AZAHAR_VITA_TITLEID="${VITA_TITLEID}")
+citra_vita_executable(citra_vita ${VITA_TITLEID})
 
 # The SceShell authid grants the extra permissions the native backend needs (taking a core, the
 # kernel-module bridge), and -na disables ASLR so the guest range lands where the module expects.
@@ -130,4 +136,35 @@ vita_create_vpk(citra_vita.vpk ${VITA_TITLEID} citra_vita.self
 # generators that do not follow a file dependency across directories.
 if (TARGET vita_native_module)
     add_dependencies(citra_vita.vpk-vpk vita_native_module)
+endif()
+
+# The replay player (diagnostics builds, on request: "ninja citra_vita_player.vpk-vpk"): a
+# vprof capture's frame on sgxd with no title, as Razor replays a capture without the game
+# (citra_vita_main.cpp's RunReplay). The capture and its requests are added to the vpk after
+# the build, as app0:replay.vprof and app0:replay.txt (tools/frame_replay/FORMAT.md).
+if (ENABLE_VITA_DIAGNOSTICS)
+    set(PLAYER_TITLEID "AZRPLAY01")
+    add_executable(citra_vita_player EXCLUDE_FROM_ALL ${CITRA_VITA_SOURCES})
+    citra_vita_executable(citra_vita_player ${PLAYER_TITLEID})
+    target_compile_definitions(citra_vita_player PRIVATE AZAHAR_REPLAY_PLAYER)
+    vita_create_self(citra_vita_player.self citra_vita_player UNSAFE NOASLR)
+    vita_create_vpk(citra_vita_player.vpk ${PLAYER_TITLEID} citra_vita_player.self
+        VERSION ${VITA_VERSION}
+        NAME "Azahar Replay"
+        FILE ${AZAHAR_NATIVE_MODULE} azaharnative.skprx
+            ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png sce_sys/icon0.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+    )
+    if (TARGET vita_native_module)
+        add_dependencies(citra_vita_player.vpk-vpk vita_native_module)
+    endif()
+    # vita.cmake makes its targets part of "all"; the player is built on request only.
+    foreach(player_target citra_vita_player-velf citra_vita_player.self-self
+                          citra_vita_player.vpk-vpk)
+        if (TARGET ${player_target})
+            set_target_properties(${player_target} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+        endif()
+    endforeach()
 endif()

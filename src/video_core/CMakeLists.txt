@@ -134,6 +134,16 @@ if (ENABLE_GXM)
             ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_program.c
             ${CMAKE_SOURCE_DIR}/src/sgxd/sgxd_recipe.c
     )
+    # vprof, the profiler and its replay: diagnostics builds only.
+    if (ENABLE_VITA_DIAGNOSTICS)
+        target_sources(video_core PRIVATE
+                renderer_gxm/gxm_rasterizer_vprof.cpp
+                renderer_gxm/vprof.cpp
+                renderer_gxm/vprof.h
+                renderer_gxm/vprof_replay.cpp
+                renderer_gxm/vprof_replay.h
+        )
+    endif()
     # sgxd_recipe.h takes the op list's types from the module's sgxd.h, plain C on any host.
     target_include_directories(video_core PRIVATE ${CMAKE_SOURCE_DIR}/src/sgxd
                                                   ${CMAKE_SOURCE_DIR}/vita_native/src)

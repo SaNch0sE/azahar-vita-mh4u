@@ -215,6 +215,7 @@ struct PicaCore::Dispatch {
         const PAddr addr = p.regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
         const u32 size = p.regs.internal.pipeline.command_buffer.GetSize(index);
         const u8* head = p.memory.GetPhysicalPointer(addr);
+        GxmRenderer::Vprof::Memory(GxmRenderer::Vprof::Mem::CmdList, addr, size);
         p.cmd_list.Reset(addr, head, size);
     }
 
@@ -651,6 +652,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
     }
 
     const u8* head = memory.GetPhysicalPointer(list);
+    GxmRenderer::Vprof::Memory(GxmRenderer::Vprof::Mem::CmdList, list, size);
     cmd_list.Reset(list, head, size);
 
     bool stop_requested = false;

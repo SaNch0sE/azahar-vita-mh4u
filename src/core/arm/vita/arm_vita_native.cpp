@@ -18,6 +18,7 @@
 #include "core/hle/kernel/vm_manager.h"
 #include "core/hle/kernel/thread.h"
 #include "core/memory.h"
+#include "video_core/renderer_sgxd/vprof.h"
 
 namespace Core {
 

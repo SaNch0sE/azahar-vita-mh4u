@@ -52,6 +52,44 @@ std::vector<u8> CompressDataZSTDDefault(std::span<const u8> source) {
     return CompressDataZSTD(source, ZSTD_CLEVEL_DEFAULT);
 }
 
+ZstdStreamWriter::ZstdStreamWriter(std::size_t total,
+                                   std::function<void(std::span<const u8>)> sink_)
+    : context{ZSTD_createCCtx()}, sink{std::move(sink_)}, out(ZSTD_CStreamOutSize()) {
+    ASSERT_MSG(context != nullptr, "ZSTD_createCCtx failed");
+    auto* const cctx = static_cast<ZSTD_CCtx*>(context);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, ZSTD_CLEVEL_DEFAULT);
+    // The content size goes in the frame's header, as ZSTD_compress puts it.
+    ZSTD_CCtx_setPledgedSrcSize(cctx, total);
+}
+
+ZstdStreamWriter::~ZstdStreamWriter() {
+    ZSTD_freeCCtx(static_cast<ZSTD_CCtx*>(context));
+}
+
+void ZstdStreamWriter::Write(std::span<const u8> data) {
+    Run(data, false);
+}
+
+void ZstdStreamWriter::Finish() {
+    Run({}, true);
+}
+
+void ZstdStreamWriter::Run(std::span<const u8> data, bool end) {
+    ZSTD_inBuffer in{data.data(), data.size(), 0};
+    for (;;) {
+        ZSTD_outBuffer o{out.data(), out.size(), 0};
+        const std::size_t left = ZSTD_compressStream2(static_cast<ZSTD_CCtx*>(context), &o, &in,
+                                                      end ? ZSTD_e_end : ZSTD_e_continue);
+        ASSERT_MSG(!ZSTD_isError(left), "ZSTD_compressStream2: {}", ZSTD_getErrorName(left));
+        if (o.pos != 0) {
+            sink(std::span<const u8>{out.data(), o.pos});
+        }
+        if (end ? left == 0 : in.pos == in.size) {
+            return;
+        }
+    }
+}
+
 std::size_t GetDecompressedSize(std::span<const u8> compressed) {
     return ZSTD_getFrameContentSize(compressed.data(), compressed.size());
 }

@@ -15,6 +15,7 @@
 #include "common/logging/log.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/sgxd_backend.h"
+#include "video_core/renderer_gxm/vprof.h"
 #include "video_core/renderer_gxm/usse/usse_encoder.h"
 #include "video_core/shader/generator/profile.h"
 
@@ -877,6 +878,7 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
         return;
     }
     Recipe& r = *current;
+    Vprof::Pass(passes, pass_target.lo, r.width, r.height, draw_count, false);
     const int taken = sgxd_recipe_set_draws(&r.recipe, r.memory, draws.data(), draw_count);
     ASSERT_MSG(taken == 0, "sgxd: the pass's {} draws were not taken", draw_count);
     sgxd_recipe_restage(&r.recipe, r.memory);
@@ -928,6 +930,25 @@ void SgxdBackend::EndPass(u32* ta_us, u32* d3_us) {
         const u32 touches[4] = {pass_target.lo, pass_target.hi, pass_source.lo, pass_source.hi};
         if (sgxd_session_render_overlap(&r.recipe, touches, failed, sizeof(failed)) != 0) {
             Fault(r, failed);
+        }
+        if (ta_us) {
+            *ta_us = render.ta_us;
+        }
+        if (d3_us) {
+            *d3_us = render.d3_us;
+        }
+        return;
+    }
+#endif
+#ifdef VITA_DIAGNOSTICS
+    static const bool sync_passes = SgxdFlag("syncpasses");
+    if (sync_passes || replay_sync || Vprof::FrameSync()) {
+        RenderSync(r, &render.ta_us, &render.d3_us);
+        r.fence = data_fence[data_slot] = pass_fences[passes % PassFences] = FenceAll();
+        if (replay_sync) {
+            replay_times.push_back({passes, render.ta_us, render.d3_us});
+        } else if (Vprof::FrameSync()) {
+            Vprof::PassTimes(passes, render.ta_us, render.d3_us);
         }
         if (ta_us) {
             *ta_us = render.ta_us;

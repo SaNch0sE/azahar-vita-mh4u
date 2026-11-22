@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <functional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +57,30 @@ namespace Common::Compression {
  * @return the decompressed data.
  */
 [[nodiscard]] std::vector<u8> DecompressDataZSTD(std::span<const u8> compressed);
+
+/**
+ * Zstandard compression of `total` bytes given in pieces, at the default level, the compressed
+ * bytes handed to `sink` as they are made: one frame, readable as CompressDataZSTDDefault's,
+ * without the source or the result held whole in memory.
+ */
+class ZstdStreamWriter {
+public:
+    ZstdStreamWriter(std::size_t total, std::function<void(std::span<const u8>)> sink);
+    ~ZstdStreamWriter();
+    ZstdStreamWriter(const ZstdStreamWriter&) = delete;
+    ZstdStreamWriter& operator=(const ZstdStreamWriter&) = delete;
+
+    void Write(std::span<const u8> data);
+    /// Ends the frame; the pieces written must add up to `total`.
+    void Finish();
+
+private:
+    void Run(std::span<const u8> data, bool end);
+
+    void* context;
+    std::function<void(std::span<const u8>)> sink;
+    std::vector<u8> out;
+};
 
 } // namespace Common::Compression
 

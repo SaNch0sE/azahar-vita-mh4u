@@ -32,6 +32,9 @@
 
 #include "azahar_native.h"
 #include "sgxd_ptla.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/process.h"
+#include "video_core/renderer_sgxd/vprof.h"
 #include "common/named_thread.h"
 
 #include <cstdio>
@@ -212,6 +215,11 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     ui.ClearStatusMessage();
 
 #ifdef VITA_DIAGNOSTICS
+    SgxdRenderer::Vprof::Info("rom", path.c_str());
+    if (const auto& process = system.Kernel().GetCurrentProcess(); process && process->codeset) {
+        SgxdRenderer::Vprof::Info("guest_name", process->codeset->GetName().c_str());
+    }
+
     // ux0:data/azahar/autoload.txt names a savestate slot to restore before the title runs.
     // The signal executes at a quiescent point inside RunLoop, so it gets a few slices.
     // States are the same boost archive on every 32-bit build, so a state the pi5 harness
@@ -401,6 +409,56 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     ShutdownSystem(system);
     return keep_running;
 }
+
+#ifdef VITA_DIAGNOSTICS
+std::string ReadWholeFile(const char* path) {
+    std::string text;
+    if (std::FILE* f = std::fopen(path, "rb")) {
+        char buf[4096];
+        while (const std::size_t n = std::fread(buf, 1, sizeof(buf), f)) {
+            text.append(buf, n);
+        }
+        std::fclose(f);
+    }
+    return text;
+}
+
+bool IsCapture(std::string_view path) {
+    return path.size() > 6 && path.substr(path.size() - 6) == ".vprof";
+}
+
+/**
+ * The replay player: a vprof capture's frame on the GPU with no title at all
+ * (tools/frame_replay). Only memory,
+ * timing and the GPU exist (Core::System::InitReplay); the frame's commands and memory come
+ * from the capture. The first requests are the vpk's app0:replay.txt when host0 has none,
+ * later ones host0:vprof-replay.txt's, and the results go to host0 (vprof_replay.cpp), so the
+ * player needs host0.
+ */
+void RunReplay(Core::System& system, VitaFrontend::EmuWindowVita& window,
+               const std::string& capture) {
+    window.UpdateCurrentFramebufferLayout();
+    std::string first;
+    SceIoStat st{};
+    if (sceIoGetstat("host0:vprof-replay.txt", &st) < 0) {
+        first = ReadWholeFile("app0:replay.txt");
+        if (first.empty()) {
+            first = "results\nprofile 30\nquit\n";
+        }
+    }
+    std::string shown = first.empty() ? std::string{"host0:vprof-replay.txt's"} : first;
+    std::replace(shown.begin(), shown.end(), '\n', ';');
+    LOG_INFO(Frontend, "replay player: {}, first requests {}", capture, shown);
+    SgxdRenderer::Vprof::Info("replay", capture.c_str());
+    if (system.InitReplay(window) != Core::System::ResultStatus::Success) {
+        LOG_CRITICAL(Frontend, "replay player: the GPU could not be brought up");
+        return;
+    }
+    system.GPU().VprofReplay(capture, first);
+    system.ShutdownReplay();
+    LOG_INFO(Frontend, "replay player: done");
+}
+#endif
 
 /**
  * The title to start without going through the list, if the launcher named one.
@@ -663,6 +721,20 @@ int EmulatorMain() {
     VitaFrontend::CrashReport::EnableRecovery(restart,
                                               CommandChannel() ? command_file.LastSeq() : nullptr);
     bool running = true;
+#ifdef VITA_DIAGNOSTICS
+    // The replay player's vpk carries its capture; the emulator's replays one it is launched
+    // with.
+    std::string replay = LaunchParameter();
+#ifdef AZAHAR_REPLAY_PLAYER
+    if (!IsCapture(replay)) {
+        replay = "app0:replay.vprof";
+    }
+#endif
+    if (IsCapture(replay)) {
+        RunReplay(system, window, replay);
+        running = false;
+    } else
+#endif
     if (const std::string launch = LaunchParameter(); !launch.empty()) {
         LOG_INFO(Frontend, "launch parameter names {}", launch);
         running = RunTitle(system, window, ui, launch);

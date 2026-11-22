@@ -93,8 +93,8 @@ namespace GxmRenderer {
  *   poolcheck the textures pool's GPU mapping, checked at the first untile that differs
  *   tilecheck a write-back against the CPU's own encoding of the surface
  *
- * The profiler: vprof, vprof_at, vprof_len, vprof_us, vprof_cpus, vprof_trigger, vprof_replay,
- *   vprof_replay_at
+ * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks
+ *   (docs/debugging.md, "Wrong pictures")
  *
  * Timelines:
  *   tracelog  SgxdTrace's events from 8 s to 9 s after the first one (tracelog_at=S and

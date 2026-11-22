@@ -101,6 +101,63 @@ public:
     bool AccelerateImmediateVertex(const Pica::AttributeBuffer& input) override;
     void FlushImmediate() override;
     void NotifyP3D() override;
+#ifdef VITA_DIAGNOSTICS
+    /// vprof's replay: the frame's draws counted from here, those after `limit` left out (-1: none).
+    void ReplayBegin(int limit) {
+        replay_limit = limit;
+        replay_draw_index = 0;
+    }
+    void ReplayStop() {
+        replay_limit = -2;
+    }
+    [[nodiscard]] u32 ReplayDraws() const {
+        return replay_draw_index;
+    }
+    void ReplayEndPass();
+    /// The surface at `addr` as its A8B8G8R8 rows, once the GPU is idle; false when there is
+    /// none.
+    bool ReplayReadSurface(PAddr addr, std::vector<u8>& out, u32& width, u32& height);
+    SgxdBackend& Backend() {
+        return backend;
+    }
+#endif
+#ifdef VITA_DIAGNOSTICS
+    /// vprof: what a pass can start from, as the recorded frame began: the pending clears, the colour surfaces a pass drew with their
+    /// pixels, and the depth stores with their samples. Pointers into the capture.
+    struct VprofState {
+        struct Clear {
+            PAddr start, end;
+            u32 value, bytes, order;
+        };
+        struct Colour {
+            PAddr addr;
+            u32 width, height, format, bpp, passes, generation;
+            bool synced, guest_newer;
+            const u8* pixels; // width x height A8B8G8R8
+        };
+        struct Depth {
+            PAddr addr;
+            u32 width, height, format;
+            bool valid;
+            const u8* samples; // the store's bytes (NewDepthStore's layout)
+            u32 bytes;
+        };
+        u32 clear_order{};
+        std::vector<Clear> clears;
+        u32 generations{};
+        std::vector<Colour> surfaces;
+        std::vector<Depth> depths;
+    };
+    /// vprof: the recorded frame starts: the open pass ended, the GPU idle, VprofState recorded.
+    void VprofFrameStart();
+    /// vprof's replay: `state` in place of this renderer's surfaces, depth stores and clears
+    /// before each run of the frame, and with `retile` every texture untiled again.
+    void ReplayRestore(const VprofState& state, bool retile);
+    /// vprof's replay wrote guest memory: the textures there are untiled again.
+    void ReplayMemoryWritten(PAddr start, PAddr end) {
+        TexturesWritten(start, end);
+    }
+#endif
     void GpuIdle() override;
     u64 GpuWaitUs() const override;
 #endif
@@ -501,6 +558,25 @@ private:
     u32 draws{};
     u32 gs_draws{};
     u32 passes{};
+#ifdef VITA_DIAGNOSTICS
+    bool vprof_frame_start = false; // VprofFrameStart's own EndPass is not a frame's result
+    int replay_limit = -2; // -2: no replay; -1: a replay of every draw
+    u32 replay_draw_index = 0;
+    u32 vprof_draws = 0;
+    bool vprof_draw_noted = false;
+    void VprofDraw(bool is_indexed, bool immediate, u32 count);
+    /// vprof: a pass's surface, and a display transfer's output, as results of the frame.
+    void VprofPassResult(const Surface& s);
+    void VprofTransferResult(PAddr output, u32 width, u32 height, u32 format, const u8* out,
+                             u32 bytes);
+    bool ReplaySkipsDraw();
+    /// perflog: a slow display transfer (source null: from guest memory), a pass's first draws.
+    void PerflogTransfer(PAddr input, u32 in_width, u32 in_height, PAddr output, u32 width,
+                         u32 height, u32 scale_x, u32 scale_y, const Surface* source,
+                         u32 first_row, u32 ta_us, u32 d3_us);
+    void PerflogDraw(const Describe& describe, u32 isp, bool blend,
+                     const SgxdRecipeDrawPrograms& p);
+#endif
 #ifdef VITA_DIAGNOSTICS
     struct StreamOutNote {
         const char* stage = nullptr; // "A0" (vertex outputs), "A1" (geometry)

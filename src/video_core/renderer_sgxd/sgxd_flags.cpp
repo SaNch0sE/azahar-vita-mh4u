@@ -9,7 +9,8 @@
 #include <string>
 #include <vector>
 #include "common/logging/log.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#include "video_core/renderer_sgxd/vprof.h"
 
 namespace GxmRenderer {
 
@@ -112,6 +113,7 @@ std::atomic<bool> trace_written{false};
 } // Anonymous namespace
 
 void SgxdTrace(const char* tag, unsigned arg) {
+    Vprof::Event(tag, arg);
     static const bool on = SgxdFlag("tracelog");
     if (!on || trace_written.load(std::memory_order_relaxed)) {
         return;

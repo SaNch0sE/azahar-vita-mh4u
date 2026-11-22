@@ -333,7 +333,12 @@ static uint32_t active_cpu_mask(void) {
 // 7: azaharAdopt, azaharReback and azaharRebackRestore: guest FCRAM under tables of ours, and
 //    pages of it moved onto other physical pages (reback.c).
 // 8: azaharRebackReturn, moved pages back on their own.
+// 9: the ATS/PAR fix for 64 KiB pages.
+// 10: azaharProfStart, azaharProfRead, azaharProfStop: the CPU sampler (prof.c).
+// 11: the samples carry the running thread (thid for cid), azaharProfThreadName.
+// 12: azaharProfKernelModule, the kernel's module segments.
 // 13: sgxdSubmitAsync queues lists (SGXD_CHAIN_RING) and returns the first op's index.
+// 19: AzaharProfSample's syscall (svc, user PC, LR and SP) from the thread's SVC frame.
 int azaharVersion() {
     return 5;
 }

@@ -229,6 +229,11 @@ endif()
 option(ENABLE_VITA_DIAGNOSTICS "Compile in the Vita's logging and bring-up switches" ${DEFAULT_VITA_DIAGNOSTICS})
 if (ENABLE_VITA_DIAGNOSTICS)
     add_compile_definitions(VITA_DIAGNOSTICS)
+    # Line tables, for profiles and crash reports: addresses to file:line in the
+    # unstripped ELF. No code changes; the SELF leaves the debug sections out.
+    if (VITA)
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-gline-tables-only>)
+    endif()
 endif()
 
 # Handle incompatible options for libretro builds

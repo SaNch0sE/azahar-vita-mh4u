@@ -124,6 +124,7 @@ typedef struct AzaharRebackRequest {
 #define AZAHAR_ERR_TIMEOUT AZAHAR_ERROR(1007)  // the core-2 thread did not complete a command in time
 #define AZAHAR_ERR_FULL AZAHAR_ERROR(1008)     // a queue has no room yet (sgxdSubmitAsync)
 
+
 #ifdef __cplusplus
 extern "C" {
 #endif

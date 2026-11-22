@@ -7,6 +7,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 #include <boost/serialization/access.hpp>
 
@@ -131,6 +132,16 @@ public:
     ScanRoom TakeScanRoom();
 #endif
 
+    /// vprof's replay: the GSP commands it executes carry physical addresses already, which
+    /// VirtualToPhysicalAddress passes through.
+    bool replay_physical{};
+#ifdef VITA_DIAGNOSTICS
+    /// vprof's replay (vprof_replay.h) in the replay player, with no guest at all
+    /// (Core::System::InitReplay). `first` is the first batch of requests; more come from
+    /// host0:vprof-replay.txt until one quits.
+    void VprofReplay(const std::string& capture, const std::string& first);
+#endif
+
 private:
     void SubmitCmdList(u32 index);
 
@@ -155,6 +166,8 @@ private:
     /// GSP's DMA of size bytes from src to dst (the current process's addresses) as physical
     /// runs. Memory outside guest FCRAM and VRAM stops the emulator.
     std::vector<DmaRun> DmaRuns(VAddr src, VAddr dst, u32 size);
+    /// A DMA's runs, queued to the PTLA; the DMA interrupt after delay.
+    void RunDma(const std::vector<DmaRun>& runs, u64 delay);
 
     /// Runs op, a GSP command's or a register trigger's work (vprof numbers it, perflog times
     /// it), then lets the rasterizer start what it held back (RasterizerInterface::GpuIdle).

@@ -161,6 +161,16 @@ public:
     [[nodiscard]] ResultStatus Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                     Frontend::EmuWindow* secondary_window = {});
 
+#ifdef VITA_DIAGNOSTICS
+    /**
+     * vprof's replay player: memory, timing and the GPU alone, with no kernel, services, CPU or
+     * application. A capture's frame replays onto them (VideoCore::GPU::VprofReplay); nothing
+     * else may run, and the GPU's interrupts go nowhere. ShutdownReplay ends it.
+     */
+    [[nodiscard]] ResultStatus InitReplay(Frontend::EmuWindow& emu_window);
+    void ShutdownReplay();
+#endif
+
     /**
      * Indicates if the emulated system is powered on (all subsystems initialized and able to run an
      * application).
@@ -324,6 +334,11 @@ public:
 
     [[nodiscard]] Loader::AppLoader& GetAppLoader() const {
         return *app_loader;
+    }
+
+    /// Whether a title was loaded (the Vita's replay player renders without one).
+    [[nodiscard]] bool HasAppLoader() const {
+        return app_loader != nullptr;
     }
 
     /// Frontend Applets

@@ -123,6 +123,14 @@ public:
     /// while the pass before's 3D does: its list ends at its own 3D kick, and the next list, or
     /// RenderFinish's, waits for that 3D. RenderFence counts that list; RenderTaFence the
     /// pass's own.
+#ifdef VITA_DIAGNOSTICS
+    /// vprof's replay: every pass synchronous, its (pass, TA us, 3D us) in replay_times.
+    bool replay_sync{};
+    std::vector<std::array<u32, 3>> replay_times;
+    /// sgxd_flags syncside: the side renders (untiles, gathers) run whole too, (count, TA us,
+    /// 3D us) summed here; a replay lists them after the frame's passes as one more.
+    std::array<u32, 3> side_times{};
+#endif
     [[nodiscard]] u32 RenderFence() const;
     [[nodiscard]] u32 RenderTaFence() const;
     [[nodiscard]] bool RenderReached(u32 fence) const;

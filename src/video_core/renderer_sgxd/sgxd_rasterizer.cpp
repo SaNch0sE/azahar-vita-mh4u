@@ -31,6 +31,7 @@
 #include "video_core/shader/shader.h"
 #include "video_core/renderer_gxm/gxm_flags.h"
 #include "video_core/renderer_gxm/gxm_rasterizer.h"
+#include "video_core/renderer_gxm/vprof.h"
 #include "video_core/texture/texture_decode.h"
 #include "video_core/renderer_gxm/usse/fs_usse_gen.h"
 #include "video_core/renderer_gxm/usse/gxp_writer.h"
@@ -625,6 +626,15 @@ UniformField FragmentUniformField(const std::string& n) {
 RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memory_,
                              GuestGpuMemory& guest_memory_)
     : VideoCore::RasterizerAccelerated{memory_, pica_}, guest_memory{guest_memory_} {
+    Vprof::Start(memory_);
+#ifdef VITA_DIAGNOSTICS
+    Usse::sched_probe.lut_reads = SgxdFlagValue("fslut");
+    Usse::sched_probe.lut_kind = SgxdFlagValue("fslutkind");
+    Usse::sched_probe.nosched = static_cast<int>(SgxdFlagValue("fsnosched"));
+#endif
+#ifdef VITA_DIAGNOSTICS
+    Usse::Encoder::probe_skip_point_reads = SgxdFlag("smpskip");
+#endif
     Usse::Ir::SetTier2Skip(GxmFlagValue("tier2skip"));
 #ifdef VITA_DIAGNOSTICS
     // sgxd_flags eotmixpbe=N: EUR_CR_PIXELBE for every 3D kick built (the eotmix probes).
@@ -919,6 +929,9 @@ bool RasterizerGxm::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig&
             LOG_INFO(Render, "transfer {} rows {:2}: |{}|", transfers, ty, row);
         }
     }
+    VprofTransferResult(output, width, height, static_cast<u32>(config.output_format.Value()),
+                        out, bytes);
+#endif
     return true;
 }
 
@@ -2154,6 +2167,25 @@ void RasterizerSgxd::EndPass(const char* why) {
     s.passes++;
     s.generation = ++generations;
     s.guest_newer = false;
+#ifdef VITA_DIAGNOSTICS
+    VprofPassResult(s);
+    LogTextureStats();
+    static const u64 pass_log_at = u64{SgxdFlagValue("passlog")} * 1000000;
+    if (pass_log_at != 0) {
+        const u64 now = sceKernelGetProcessTimeWide();
+        if (now >= pass_log_at && now < pass_log_at + 1000000) {
+            const char* depth_how = !pass_depth_used ? "unused"
+                                    : !pass_depth_load ? "cleared"
+                                    : pass_depth_guest ? "loaded from guest memory"
+                                                       : "loaded";
+            LOG_INFO(Render,
+                     "perf: pass on {:#x} {}x{} at {}x: {} draws, opened by {}, depth {}, TA {} us, "
+                     "3D {} us; ended by {}",
+                     s.addr, s.width, s.height, ended_scale, pass_draws, pass_opened, depth_how,
+                     ta_us, d3_us, why);
+        }
+    }
+#endif
     // Surfaces this one covers whole are dead: its pass started from what they held.
     const PAddr lo = s.addr, hi = s.End();
     for (auto it = surfaces.begin(); it != surfaces.end();) {
@@ -4548,6 +4580,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const auto& pipeline = regs.pipeline;
     const u32 count = immediate ? immediate_count : pipeline.num_vertices;
     draw_serial++;
+#ifdef VITA_DIAGNOSTICS
+    VprofDraw(is_indexed, immediate != nullptr, count);
+    if (ReplaySkipsDraw()) {
+        return true;
+    }
+#endif
     const auto describe = [&] {
         return fmt::format("{} draw, topology {}, {} vertices",
                            immediate ? "immediate" : (is_indexed ? "indexed" : "non-indexed"),
@@ -5109,6 +5147,13 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     const FragmentProgram& fp = FragmentProgramFor(epilogue);
     const Usse::GxpProgram& fg = fp.gxp;
 #ifdef VITA_DIAGNOSTICS
+    // A recorded frame's draw (vprof) and its fragment program's dumpusse key.
+    if (vprof_draw_noted) {
+        LOG_INFO(Render, "vprof draw {}: fs {:016x}, {} words, {} vertices, {}{}, target {:#x}",
+                 vprof_draws - 1, last_fragment_key, fg.primary.size(), stage.count,
+                 translucent ? "translucent" : "opaque", fg.uses_discard ? " punch-through" : "",
+                 fb.GetColorBufferPhysicalAddress());
+    }
     // sgxd_flags drawkeys: the first thousand draws' fragment program keys (drawkeys_at=S from S s), to
     // tie a replay's per-draw costs to the dumped programs.
     static const bool draw_keys = SgxdFlag("drawkeys") || SgxdFlagValue("drawkeys_at") != 0;
@@ -5276,22 +5321,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         pass_drawn_hi = first ? hi : std::max(pass_drawn_hi, hi);
     }
 #ifdef VITA_DIAGNOSTICS
-    if (backend.PassDraws() <= 3 && GxmFlag("perflog")) {
-        std::string units;
-        const auto textures = regs.texturing.GetTextures();
-        for (u32 k = 0; k < textures.size(); k++) {
-            if (textures[k].enabled) {
-                units += fmt::format(" t{} {:#x} {}x{} f{}", k,
-                                     textures[k].config.GetPhysicalAddress(),
-                                     textures[k].config.width.Value(),
-                                     textures[k].config.height.Value(),
-                                     static_cast<u32>(textures[k].format));
-            }
-        }
-        backend.NotePass(fmt::format(" [draw {}: {}, ISP {:#x}, blend {}, viewport {} {} {} {};{}]",
-                                     backend.PassDraws(), describe(), isp, blend, p.viewport[0],
-                                     p.viewport[1], p.viewport[2], p.viewport[3], units));
-    }
+    PerflogDraw(describe, isp, blend, p);
 #endif
     if (draws++ < 4) {
         LOG_INFO(Render,

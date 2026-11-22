@@ -17,6 +17,11 @@
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_lcd.h"
 #include "video_core/renderer_base.h"
+#include "video_core/renderer_gxm/vprof.h"
+#ifdef VITA_DIAGNOSTICS
+#include "video_core/renderer_gxm/gxm_rasterizer.h"
+#include "video_core/renderer_sgxd/vprof_replay.h"
+#endif
 #include "video_core/right_eye_disabler.h"
 #include "video_core/video_core.h"
 #ifdef ENABLE_GXM
@@ -117,49 +122,8 @@ void GPU::RunGpuOp([[maybe_unused]] OpKind kind, const std::function<void()>& op
     op();
 #else
     // The time by kind is `perflog`'s, in the diagnostics build only.
-    impl->render_thread->Push([this, kind, op = std::move(op)] {
-        const auto start = std::chrono::steady_clock::now();
-        const u64 waited = impl->rasterizer->GpuWaitUs();
-        GPU_TRACE("op", static_cast<unsigned>(kind));
-        op();
-        GPU_TRACE("done", static_cast<unsigned>(impl->rasterizer->GpuWaitUs() - waited));
-        const auto k = static_cast<std::size_t>(kind);
-        impl->kind_wait_us[k].fetch_add(impl->rasterizer->GpuWaitUs() - waited,
-                                        std::memory_order_relaxed);
-        impl->kind_us[k].fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                       std::chrono::steady_clock::now() - start)
-                                       .count()),
-                                   std::memory_order_relaxed);
-        impl->kind_ops[k].fetch_add(1, std::memory_order_relaxed);
-        impl->ops_in_flight.fetch_sub(1, std::memory_order_release);
-    });
-#endif
-}
-
-void GPU::PostToEmulation(std::function<void()> fn, RasterizerInterface::GpuFence fence) {
-    {
-        std::scoped_lock lock{impl->posted_mutex};
-        impl->posted.push_back({fence, std::move(fn)});
-        if (fence.Any()) {
-            impl->fenced.store(true, std::memory_order_release);
-        }
-    }
-    // No delay of its own: the work is done now, and the interrupt's modelled delay travels
-    // inside fn to GSP.
-    impl->timing.ScheduleEvent(0, impl->posted_event, 0, 0, true);
-}
-
-void GPU::PostedEventCallback(uintptr_t, s64) {
-    DrainPosted();
-}
-
-void GPU::PollPosted() {
-    if (impl->fenced.load(std::memory_order_acquire)) {
-        DrainPosted();
-    }
-}
-
-bool GPU::WaitPostedIdle() {
+    // vprof: the op's number in the recorded frame, 0 outside it.
+    const u32 seq = SgxdRenderer::Vprof::OpQueued(static_cast<u32>(kind));
     const auto start = std::chrono::steady_clock::now();
     const u64 waited = impl->rasterizer->GpuWaitUs();
     GPU_TRACE("op", static_cast<unsigned>(kind));
@@ -191,8 +155,8 @@ void GPU::RunOnRenderThread(const std::function<void()>& fn) {
 }
 
 PAddr GPU::VirtualToPhysicalAddress(VAddr addr) {
-    if (addr == 0) {
-        return 0;
+    if (addr == 0 || replay_physical) {
+        return addr;
     }
 
     if (addr >= Memory::VRAM_VADDR && addr <= Memory::VRAM_VADDR_END) {
@@ -233,6 +197,43 @@ void GPU::ClearAll(bool flush) {
 void GPU::Execute(const Service::GSP::Command& command) {
     using Service::GSP::CommandId;
     auto& regs = impl->pica.regs;
+#ifdef VITA_DIAGNOSTICS
+    // vprof: the command as the PICA's registers take it, its addresses physical (a DMA's
+    // physical runs are recorded where they are made).
+    if (SgxdRenderer::Vprof::Recording() && command.id != CommandId::RequestDma &&
+        !replay_physical) {
+        Service::GSP::Command p = command;
+        const auto phys = [this](u32& a) {
+            if (a != 0) {
+                a = VirtualToPhysicalAddress(a);
+            }
+        };
+        switch (command.id) {
+        case CommandId::SubmitCmdList:
+            phys(p.submit_gpu_cmdlist.address);
+            break;
+        case CommandId::MemoryFill:
+            phys(p.memory_fill.start1);
+            phys(p.memory_fill.end1);
+            phys(p.memory_fill.start2);
+            phys(p.memory_fill.end2);
+            break;
+        case CommandId::DisplayTransfer:
+            phys(p.display_transfer.in_buffer_address);
+            phys(p.display_transfer.out_buffer_address);
+            break;
+        case CommandId::TextureCopy:
+            phys(p.texture_copy.in_buffer_address);
+            phys(p.texture_copy.out_buffer_address);
+            break;
+        default:
+            break;
+        }
+        std::array<u32, 8> words;
+        std::memcpy(words.data(), &p, sizeof(words));
+        SgxdRenderer::Vprof::Gsp(words.data());
+    }
+#endif
 
     switch (command.id) {
     case CommandId::RequestDma: {
@@ -244,16 +245,17 @@ void GPU::Execute(const Service::GSP::Command& command) {
         // The PTLA copies it, run by run.
         auto runs = DmaRuns(command.dma_request.source_address, command.dma_request.dest_address,
                             command.dma_request.size);
-        RunGpuOp(OpKind::Dma, [this, runs = std::move(runs)] {
-            for (const DmaRun& run : runs) {
-                if (!impl->rasterizer->AccelerateDma(run.src, run.dst, run.size)) {
-                    UNREACHABLE_MSG("GPU: DMA {:#x} to {:#x}, {} bytes: not done on the GPU",
-                                    run.src, run.dst, run.size);
-                }
-            }
-            PostToEmulation([this] { impl->signal_interrupt(Service::GSP::InterruptId::DMA, 0); },
-                            impl->rasterizer->GpuFencePtla());
-        });
+
+        auto is_vram = [&](u32 addr) {
+            return addr >= Memory::VRAM_VADDR && addr <= Memory::VRAM_VADDR_END;
+        };
+
+        u64 delay = DelayGenerator::CalculateDelayNanoseconds(
+            DelayGenerator::GetCopyMode(is_vram(command.dma_request.source_address),
+                                        is_vram(command.dma_request.dest_address)),
+            false, command.dma_request.size);
+
+        RunDma(runs, delay);
         break;
     }
     case CommandId::SubmitCmdList: {
@@ -363,6 +365,14 @@ void GPU::SetBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info
     framebuffer.stride = info.stride;
     framebuffer.format = info.format;
     framebuffer.active_fb = info.shown_fb;
+    // vprof: the swap as the register writes it is.
+    if (SgxdRenderer::Vprof::Recording()) {
+        const u32 first = GPU_REG_INDEX(framebuffer_config[0]) +
+                          screen_id * static_cast<u32>(sizeof(Pica::FramebufferConfig) / 4);
+        for (u32 i = 0; i < sizeof(Pica::FramebufferConfig) / 4; i++) {
+            SgxdRenderer::Vprof::RegWrite(first + i, impl->pica.regs.reg_array[first + i], false);
+        }
+    }
 
     // Notify debugger about the buffer swap.
 
@@ -408,6 +418,7 @@ void GPU::WriteReg(VAddr addr, u32 data) {
         ASSERT(addr % sizeof(u32) == 0);
         ASSERT(index < Pica::RegsLcd::NumIds());
         impl->pica.regs_lcd[index] = data;
+        SgxdRenderer::Vprof::RegWrite(index, data, true);
         break;
     }
     case VADDR_GPU:
@@ -417,6 +428,7 @@ void GPU::WriteReg(VAddr addr, u32 data) {
 
         ASSERT(addr % sizeof(u32) == 0);
         ASSERT(index < Pica::PicaCore::Regs::NUM_REGS);
+        SgxdRenderer::Vprof::RegWrite(index, data, false);
         if (index >= GPU_REG_INDEX(internal)) {
             // An op like the GSP's commands, numbered with them in a vprof recording.
             RunGpuOp(OpKind::RegWrite, [this, index, data] {
@@ -580,6 +592,80 @@ void GPU::MemoryTransfer() {
     Signal(Service::GSP::InterruptId::PPF, delay);
 }
 
+void GPU::RunDma(const std::vector<DmaRun>& runs, u64 delay) {
+#ifdef VITA_DIAGNOSTICS
+    if (SgxdRenderer::Vprof::Recording()) {
+        std::vector<u32> words;
+        for (const DmaRun& run : runs) {
+            words.insert(words.end(), {run.src, run.dst, run.size});
+        }
+        SgxdRenderer::Vprof::Dma(words.data(), static_cast<u32>(runs.size()));
+    }
+#endif
+    RunGpuOp(OpKind::Dma, [this, &runs] {
+        for (const DmaRun& run : runs) {
+            SgxdRenderer::Vprof::Memory(SgxdRenderer::Vprof::Mem::DmaSource, run.src, run.size);
+            if (!impl->rasterizer->AccelerateDma(run.src, run.dst, run.size)) {
+                UNREACHABLE_MSG("GPU: DMA {:#x} to {:#x}, {} bytes: not done on the GPU",
+                                run.src, run.dst, run.size);
+            }
+        }
+    });
+    Signal(Service::GSP::InterruptId::DMA, delay);
+}
+
+#ifdef VITA_DIAGNOSTICS
+void GPU::VprofReplay(const std::string& capture, const std::string& first) {
+    // The guest sees none of the replay's interrupts.
+    impl->interrupts_muted = true;
+    auto& rasterizer = *static_cast<GxmRenderer::RasterizerGxm*>(impl->rasterizer);
+    SgxdRenderer::Vprof::ReplayHost host{
+        impl->pica,
+        impl->memory,
+        rasterizer,
+        [this](const u32* words) {
+            Service::GSP::Command command;
+            std::memcpy(&command, words, sizeof(u32) * 8);
+            replay_physical = true;
+            Execute(command);
+            replay_physical = false;
+        },
+        [this](u32 index, u32 value, bool lcd) {
+            WriteReg((lcd ? VADDR_LCD : VADDR_GPU) + index * 4, value);
+        },
+        [this](const std::vector<u32>& triples) {
+            std::vector<DmaRun> runs;
+            for (std::size_t i = 0; i + 2 < triples.size(); i += 3) {
+                runs.push_back({triples[i], triples[i + 1], triples[i + 2]});
+            }
+            RunDma(runs, 0);
+        },
+        [this](std::function<void()> fn) { RunGpuOp(OpKind::RegWrite, fn); },
+        [](std::function<void()> fn) { fn(); },
+        // The screens as VBlankCallback shows them.
+        [this] {
+            const auto& regs = impl->pica.regs;
+            for (u32 i = 0; i < 2; i++) {
+                const Pica::FramebufferConfig& f = regs.framebuffer_config[i];
+                KeepUncached(f.second_fb_active ? f.address_left2 : f.address_left1,
+                             f.stride * (i == 0 ? 400u : 320u), false);
+            }
+            const std::array<Pica::FramebufferConfig, 2> fb{regs.framebuffer_config[0],
+                                                            regs.framebuffer_config[1]};
+            const std::array<Pica::ColorFill, 2> fill{impl->pica.regs_lcd.color_fill_top,
+                                                      impl->pica.regs_lcd.color_fill_bottom};
+            // PresentFrame waits for the flip. RendererBase::EndFrame is left out: its frame
+            // limiter and PerfStats belong to a running guest, and the player has neither.
+            impl->renderer->PresentFrame(fb, fill);
+            impl->rasterizer->GpuIdle();
+        },
+        [this] { right_eye_disabler->ReportEndFrame(); },
+    };
+    SgxdRenderer::Vprof::Serve(host, capture, first);
+    impl->interrupts_muted = false;
+}
+#endif
+
 std::vector<GPU::DmaRun> GPU::DmaRuns(VAddr src, VAddr dst, u32 size) {
     // GSP copies through the process's mapping, the PTLA through the GPU's, where guest FCRAM
     // and VRAM sit at their PICA physical addresses.
@@ -640,6 +726,19 @@ void GPU::RunMemoryTransfer(const Pica::DisplayTransferConfig& config,
 
 void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     GPU_TRACE("vblank");
+    // vprof: a recorded frame starts with the PICA's state.
+    if (GxmRenderer::Vprof::VBlank()) {
+        RunGpuOp(OpKind::RegWrite, [this] {
+            // The capture records the geometry unit's setup as its own (FlushGsMirror).
+            impl->pica.FlushGsMirror();
+            SgxdRenderer::Vprof::State(impl->pica);
+#ifdef VITA_DIAGNOSTICS
+            // What the frame's passes can start from: the rasterizer's clears, surfaces and
+            // depth stores (RSTA).
+            static_cast<GxmRenderer::RasterizerGxm*>(impl->rasterizer)->VprofFrameStart();
+#endif
+        });
+    }
     // Signal to GSP that GPU interrupt has occurred
     Signal(Service::GSP::InterruptId::PDC0, 0);
     Signal(Service::GSP::InterruptId::PDC1, 0);
