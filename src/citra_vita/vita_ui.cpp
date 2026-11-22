@@ -1310,6 +1310,20 @@ void Ui::ScanGames() {
     LOG_INFO(Frontend, "Found {} titles", games.size());
 }
 
+std::string Ui::SettingTitle(Config::Option option) const {
+    const auto row = std::find_if(rows.begin(), rows.end(),
+                                  [option](const Row& row) { return row.option == option; });
+    ASSERT_MSG(row != rows.end(), "settings: option {} has no row", static_cast<int>(option));
+    return Tr(row->title);
+}
+
+std::string Ui::SettingDefault(Config::Option option) const {
+    const auto row = std::find_if(rows.begin(), rows.end(),
+                                  [option](const Row& row) { return row.option == option; });
+    ASSERT_MSG(row != rows.end(), "settings: option {} has no row", static_cast<int>(option));
+    return ValueText(*row, Config::Default(option));
+}
+
 void Ui::BuildRows() {
     using Config::Option;
     using Kind = Row::Kind;
@@ -3357,9 +3371,12 @@ void Ui::DrawKeyboard() {
 }
 
 void Ui::DrawStatusMessage() {
-    // A panel as tall as its text, the text centred in it (a line across, wrapped lines left).
-    constexpr float Width = 560.0f;
+    // A panel as tall as its text, the text centred in it (a line across, wrapped lines left);
+    // as wide as its longest line where that is wider (a crash notice's file paths), up to the
+    // screen's width.
     constexpr float Padding = 28.0f;
+    const float Width = std::clamp(ImGui::CalcTextSize(status_message.c_str()).x + 2.0f * Padding,
+                                   560.0f, 920.0f);
     // With a progress: a bar under the text, its share filled in the accent colour.
     constexpr float BarHeight = 12.0f;
     constexpr float BarGap = 18.0f;

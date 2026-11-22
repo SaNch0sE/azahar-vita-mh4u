@@ -11,8 +11,12 @@
 // allocation refused and the return addresses found on the thread's stack go to the debug channel
 // and to ux0:data/azahar/crash.txt, which the next start prints (PrintLast). malloc, calloc,
 // realloc and free keep the heap's large blocks with where they were allocated (PrintHeapSites).
+// A crash the process finds itself then ends in Recover rather than the system's error dialog:
+// its own core dump, and the app started again on its game list. A hardware fault (a data abort,
+// an undefined instruction in the code) stays the system's.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +26,7 @@
 #include <string>
 #include <string_view>
 
+#include <psp2/appmgr.h>
 #include <psp2/display.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
@@ -53,7 +58,6 @@ extern const char etext[];
 extern const char __build_id_start[];
 extern const char __build_id_end[];
 
-int __real_raise(int sig);
 void __real___assert_func(const char* file, int line, const char* func, const char* expr);
 void* __real__malloc_r(struct _reent* r, size_t size);
 void __real__free_r(struct _reent* r, void* p);
@@ -68,13 +72,321 @@ extern unsigned int _newlib_heap_size_user;
 namespace {
 
 constexpr const char* ReportPath = Common::Log::CrashReportPath;
-constexpr char LastReportPath[] = "ux0:data/azahar/crash-last.txt";
 
 char assert_text[256];
 /// The size of the last allocation malloc refused (operator new's, before its std::bad_alloc).
 size_t failed_malloc_size;
 /// A report written: abort's raise after the terminate handler's adds none.
 bool reported;
+
+/// Recover's restart (EnableRecovery): its arguments, packed in restart_text, with room after
+/// them for seq=N and crashed=PATH; none before EnableRecovery.
+char restart_text[2048];
+const char* restart_argv[40];
+int restart_argc;
+const unsigned long* restart_seq;
+/// The stall watch held: a core dump's length, a recovery's.
+std::atomic<bool> stall_held;
+char system_text[12288];
+std::size_t system_length;
+
+void SystemLine(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    const int n = std::vsnprintf(system_text + system_length,
+                                 sizeof(system_text) - system_length, format, args);
+    va_end(args);
+    if (n > 0) {
+        system_length = std::min(system_length + static_cast<std::size_t>(n),
+                                 sizeof(system_text) - 1);
+    }
+}
+
+/// The SHA-256 of a file, in hex; nothing a report needs is read for it later: these are the
+/// plugins as they are when the app starts, hashed then. Its error when it cannot be read.
+int HashFile(const char* path, char (&hex)[CryptoPP::SHA256::DIGESTSIZE * 2 + 1]) {
+    const SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return fd;
+    }
+    static u8 buffer[64 * 1024];
+    CryptoPP::SHA256 sha;
+    int got;
+    while ((got = sceIoRead(fd, buffer, sizeof(buffer))) > 0) {
+        sha.Update(buffer, static_cast<std::size_t>(got));
+    }
+    sceIoClose(fd);
+    if (got < 0) {
+        return got;
+    }
+    u8 digest[CryptoPP::SHA256::DIGESTSIZE];
+    sha.Final(digest);
+    for (std::size_t i = 0; i < sizeof(digest); i++) {
+        std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    }
+    return 0;
+}
+
+void PluginLine(const char* label, const char* path) {
+    char hex[CryptoPP::SHA256::DIGESTSIZE * 2 + 1];
+    if (const int r = HashFile(path, hex); r < 0) {
+        SystemLine("[azahar] system:   %s %s (not read: %08x)\n", label, path,
+                   static_cast<unsigned>(r));
+    } else {
+        SystemLine("[azahar] system:   %s %s sha256 %s\n", label, path, hex);
+    }
+}
+
+/// The user plugins taiHEN's config.txt names for this app (*ALL and its title's sections) and the
+/// shell (*main), as written there: sceKernelGetModuleList has only those in this process. taiHEN
+/// reads ux0's file if there is one, else ur0's. Plugins for other titles are counted: they do not
+/// run beside this app, and the *KERNEL section's are listed as loaded.
+void ListUserPlugins() {
+    const char* path = "ux0:tai/config.txt";
+    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        path = "ur0:tai/config.txt";
+        fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    }
+    if (fd < 0) {
+        SystemLine("[azahar] system: no taiHEN config.txt read (%08x)\n",
+                   static_cast<unsigned>(fd));
+        return;
+    }
+    static char config[32 * 1024];
+    const int got = sceIoRead(fd, config, sizeof(config) - 1);
+    sceIoClose(fd);
+    if (got < 0) {
+        SystemLine("[azahar] system: %s not read (%08x)\n", path, static_cast<unsigned>(got));
+        return;
+    }
+    config[got] = '\0';
+    SystemLine("[azahar] system: user plugins in %s for this app and the shell:\n", path);
+    char section[32] = "";
+    bool runs_here = false;
+    unsigned other_titles = 0;
+    for (char* line = config; line != nullptr && *line != '\0';) {
+        char* const next = std::strchr(line, '\n');
+        if (next != nullptr) {
+            *next = '\0';
+        }
+        std::size_t length = std::strlen(line);
+        while (length != 0 && (line[length - 1] == '\r' || line[length - 1] == ' ')) {
+            line[--length] = '\0';
+        }
+        while (*line == ' ' || *line == '\t') {
+            line++;
+        }
+        if (*line == '*') {
+            std::snprintf(section, sizeof(section), "%s", line + 1);
+            runs_here = std::strcmp(section, "ALL") == 0 || std::strcmp(section, "main") == 0 ||
+                        std::strcmp(section, AZAHAR_VITA_TITLEID) == 0;
+        } else if (*line != '\0' && *line != '#') {
+            if (runs_here) {
+                char label[40];
+                std::snprintf(label, sizeof(label), "*%s", section);
+                PluginLine(label, line);
+            } else if (std::strcmp(section, "KERNEL") != 0) {
+                other_titles++;
+            }
+        }
+        line = next != nullptr ? next + 1 : nullptr;
+    }
+    if (other_titles != 0) {
+        SystemLine("[azahar] system:   and %u for other titles\n", other_titles);
+    }
+}
+
+bool FirmwarePath(const char* path) {
+    return std::strncmp(path, "os0:", 4) == 0 || std::strncmp(path, "vs0:", 4) == 0;
+}
+
+char cheats_text[1024];
+
+/// The header's facts, noted as they become known: how core 3 was unlocked and the module's
+/// version (NoteSystem), the firmware by its GPU driver (NoteGpuDriver).
+int cores_unlocked;
+int native_version;
+const char* firmware = "not known yet";
+char game_path[256];
+char game_details[384];
+char game_plugin[384];
+u64 game_program_id;
+u64 game_started_us;
+u32 titles_started;
+u32 title_jumps;
+std::atomic<u32> resumes;
+std::atomic<u64> last_resume_us;
+s32 loaded_slot = -1;
+u64 loaded_slot_us;
+
+/// The console's last text (every sceClibPrintf of the app's: its own lines and the kernel log it
+/// drains), oldest overwritten, for the report: the app's TTY reaches nobody on a retail Vita.
+/// Appended from any thread without a lock (a line written at the same moment as another can
+/// interleave with it); the head is a running byte count.
+constexpr std::size_t ConsoleRingSize = 16 * 1024;
+static_assert((ConsoleRingSize & (ConsoleRingSize - 1)) == 0, "a power of two");
+char console_ring[ConsoleRingSize];
+std::atomic<std::size_t> console_head;
+/// PrintLast's reprint of the last run's report stays out of it.
+std::atomic<bool> console_quiet;
+
+/// Whether a console line is left out of the ring: sgxd's line for each GPU mapping, hundreds as a
+/// title starts, would push out everything else.
+bool ConsoleNoise(std::string_view line) {
+    return line.find("] map gpu ") != std::string_view::npos;
+}
+
+void ConsoleRecord(std::string_view text) {
+    while (!text.empty()) {
+        const std::size_t end = text.find('\n');
+        const std::string_view line =
+            text.substr(0, end == std::string_view::npos ? text.size() : end + 1);
+        text.remove_prefix(line.size());
+        if (ConsoleNoise(line)) {
+            continue;
+        }
+        const std::size_t at = console_head.fetch_add(line.size(), std::memory_order_relaxed);
+        for (std::size_t i = 0; i < line.size(); i++) {
+            console_ring[(at + i) & (ConsoleRingSize - 1)] = line[i];
+        }
+    }
+}
+
+/// The link's build ID as hex, which names the one ELF that resolves this build's addresses: a
+/// commit does not, a `-dirty` build's least of all. Its note: the sizes of its name and ID, its
+/// type, the name to four bytes, the ID.
+const char* BuildId() {
+    static char text[41];
+    const auto* const note = reinterpret_cast<const u32*>(__build_id_start);
+    const auto* const end = reinterpret_cast<const u8*>(__build_id_end);
+    if (__build_id_end - __build_id_start < 16) {
+        return "none";
+    }
+    const u32 id_size = note[1];
+    const u8* const id = reinterpret_cast<const u8*>(note + 3) + ((note[0] + 3) & ~3u);
+    if (id + id_size > end || id_size * 2 >= sizeof(text)) {
+        return "none";
+    }
+    for (u32 i = 0; i < id_size; i++) {
+        std::snprintf(text + i * 2, 3, "%02x", id[i]);
+    }
+    return text;
+}
+
+/// The report's first lines (Common::Log's preamble): the build and the console, what the console
+/// ran, the game and the settings it ran with, then the console's last text. Allocates nothing.
+void WritePreamble() {
+    // The kernel log since the app's last drain (sgxd's and the module's lines) into the ring,
+    // read here rather than through SgxdDrainKernelLog, whose sceClibPrintf reaches the debug
+    // channel: the stall watch's report keeps off it (a debug link that stopped holds a print
+    // for good), and the watch's first line brings this preamble.
+    if (native_version > 0) {
+        static char klog[0x1000];
+        for (int round = 0; round < 32; round++) {
+            const int n = azaharKlogRead(klog, sizeof(klog) - 1);
+            if (n <= 0) {
+                break;
+            }
+            klog[n] = '\0';
+            ConsoleRecord(klog);
+        }
+    }
+    static char text[ConsoleRingSize + 8192];
+    std::size_t at = 0;
+    const auto add = [&](const char* format, auto... args) {
+        if (at + 1 < sizeof(text)) {
+            const int n = std::snprintf(text + at, sizeof(text) - at, format, args...);
+            at = n > 0 ? std::min(at + static_cast<std::size_t>(n), sizeof(text) - 1) : at;
+        }
+    };
+    const u64 now_us = sceKernelGetProcessTimeWide();
+    add("[azahar] report: Azahar %s (%.10s), build %s, azaharnative %d, %s, firmware %s, core 3 "
+        "%s; at %u.%01u s\n",
+        Common::g_scm_desc, Common::g_scm_rev, BuildId(), native_version,
+        sceKernelIsPSVitaTV() ? "PS TV" : "PS Vita", firmware,
+        cores_unlocked == AZAHAR_CORES_CAPUNLOCKER ? "CapUnlocker's"
+        : cores_unlocked == AZAHAR_CORES_OWN       ? "azaharnative's"
+                                                   : "not unlocked",
+        static_cast<unsigned>(now_us / 1000000), static_cast<unsigned>(now_us / 100000 % 10));
+    Common::Log::AppendCrashReport(std::string_view{text, at});
+    if (system_length != 0) {
+        Common::Log::AppendCrashReport(std::string_view{system_text, system_length});
+    }
+    at = 0;
+    if (game_path[0] != '\0') {
+        const u64 ran_us = now_us - game_started_us;
+        add("[azahar] game: %s, program %016llx, running %u.%01u s\n", game_path,
+            static_cast<unsigned long long>(game_program_id),
+            static_cast<unsigned>(ran_us / 1000000), static_cast<unsigned>(ran_us / 100000 % 10));
+        add("[azahar] game: %s\n", game_details);
+        if (game_plugin[0] != '\0') {
+            add("[azahar] game: plugin %s\n", game_plugin);
+        }
+    }
+    add("[azahar] session: titles started: %u, by a jump: %u; ", titles_started, title_jumps);
+    const auto ago = [&](u64 at_us, unsigned& seconds, unsigned& tenths) {
+        seconds = static_cast<unsigned>((now_us - at_us) / 1000000);
+        tenths = static_cast<unsigned>((now_us - at_us) / 100000 % 10);
+    };
+    unsigned seconds, tenths;
+    const u32 resumed = resumes.load(std::memory_order_relaxed);
+    if (resumed != 0) {
+        ago(last_resume_us.load(std::memory_order_relaxed), seconds, tenths);
+        add("resumes from standby: %u, the last %u.%01u s ago; ", resumed, seconds, tenths);
+    } else {
+        add("%s", "resumes from standby: 0; ");
+    }
+    if (loaded_slot >= 0) {
+        ago(loaded_slot_us, seconds, tenths);
+        add("slot %d loaded %u.%01u s ago\n", static_cast<int>(loaded_slot), seconds, tenths);
+    } else {
+        add("%s", "no savestate loaded\n");
+    }
+    at += VitaFrontend::Config::WriteApplied(text + at, sizeof(text) - at);
+    Common::Log::AppendCrashReport(std::string_view{text, at});
+    Common::Log::AppendCrashReport(cheats_text);
+    at = 0;
+    const std::size_t head = console_head.load(std::memory_order_relaxed);
+    const std::size_t from = head > ConsoleRingSize ? head - ConsoleRingSize : 0;
+    add("[azahar] console: its last %u bytes before this report:\n",
+        static_cast<unsigned>(head - from));
+    // The newest whole lines that fit with their prefixes, found back from the head: lines
+    // shorter than the prefix take more room than the ring holds, and the last ones before the
+    // crash are the ones to keep. A ring that has wrapped starts inside a line: never that one.
+    constexpr std::size_t Prefix = sizeof("[azahar] console: ") - 1;
+    const std::size_t room = sizeof(text) - at - 32;
+    std::size_t first = head;
+    std::size_t used = 0;
+    std::size_t line_end = head;
+    std::size_t i = head;
+    for (; i > from; i--) {
+        if (console_ring[(i - 1) & (ConsoleRingSize - 1)] == '\n' && i != head) {
+            if (used + (line_end - i) + Prefix > room) {
+                break;
+            }
+            used += line_end - i + Prefix;
+            first = i;
+            line_end = i;
+        }
+    }
+    if (i == 0 && used + line_end + Prefix <= room) {
+        first = 0; // the ring has not wrapped: its first line is whole
+    }
+    bool line_start = true;
+    for (std::size_t k = first; k < head && at + 32 < sizeof(text); k++) {
+        const char c = console_ring[k & (ConsoleRingSize - 1)];
+        if (line_start) {
+            add("%s", "[azahar] console: ");
+        }
+        text[at++] = c;
+        line_start = c == '\n';
+    }
+    if (at != 0 && text[at - 1] != '\n') {
+        text[at++] = '\n';
+    }
+    Common::Log::AppendCrashReport(std::string_view{text, at});
+}
 
 /// A word on the stack that a call left: inside the text segment, and the instruction before it
 /// a BL or BLX. Other words that point into the code (function pointers, a vtable's) mostly fail
@@ -1088,18 +1400,17 @@ void StartStallWatch() {
     // For the process's life: never joined.
     new Common::NamedThread(Common::ThreadCfg{"stall watch", 16 * 1024}, [] {
         SceUInt64 last_beat = sceKernelGetProcessTimeWide();
-        bool reported = false;
         for (;;) {
             SceUInt timeout = 10 * 1000 * 1000;
             unsigned int bits = 0;
             if (sceKernelWaitEventFlag(stall_flag, 1, SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
-                                       &bits, &timeout) >= 0) {
+                                       &bits, &timeout) >= 0 ||
+                stall_held.load(std::memory_order_relaxed)) {
                 last_beat = sceKernelGetProcessTimeWide();
-                reported = false;
                 continue;
             }
             const SceUInt64 quiet_s = (sceKernelGetProcessTimeWide() - last_beat) / 1000000;
-            if (!reported && quiet_s >= StallSeconds) {
+            if (quiet_s >= StallSeconds) {
                 char reason[64];
                 std::snprintf(reason, sizeof(reason), "the frontend's loop stopped for %u s",
                               static_cast<unsigned>(quiet_s));
@@ -1112,14 +1423,96 @@ void StartStallWatch() {
                 PrintBusErrorDump(true);
                 PrintTableScan(true);
                 MoveRenderThread();
+                // Then the core dump, every thread's registers and stack in it (parse_core.py),
+                // where the listing above has no thread's PC or depth, and the game list again.
+                // The listing is the report: the watch's own stack says nothing.
                 Common::Log::AppendCrashReport(
-                    "[azahar] stall: the frontend's loop stopped; faulting for the core dump\n");
-                BlankDisplay();
-                __builtin_trap();
+                    "[azahar] stall: the frontend's loop stopped; recovering\n");
                 reported = true;
+                Recover(reason);
             }
         }
     });
+}
+
+void EnableRecovery(const std::vector<std::string>& arguments, const unsigned long* command_seq) {
+    std::size_t at = 0;
+    int n = 0;
+    for (const std::string& argument : arguments) {
+        // Three places kept for seq=N, crashed=PATH and changed=KEYS, and the list's end.
+        if (at + argument.size() + 1 > sizeof(restart_text) ||
+            n + 4 >= static_cast<int>(std::size(restart_argv))) {
+            break;
+        }
+        std::memcpy(restart_text + at, argument.c_str(), argument.size() + 1);
+        restart_argv[n++] = restart_text + at;
+        at += argument.size() + 1;
+    }
+    restart_seq = command_seq;
+    restart_argc = n;
+    Common::Log::SetCrashHook([] { Recover("a failed assert"); });
+}
+
+int Coredump(char* path, unsigned path_size) {
+    stall_held = true;
+    const int dumped = azaharCoredump(path, path_size);
+    stall_held = false;
+    return dumped;
+}
+
+void Recover(const char* reason) {
+    static std::atomic<bool> recovering{false};
+    if (recovering.exchange(true)) {
+        // Another thread's crash is being taken: this one stops here, its message in the log.
+        sceKernelExitDeleteThread(0);
+    }
+    stall_held = true;
+    Common::Log::RenewCrashReport();
+    if (!reported) {
+        WriteStackReport(reason);
+    }
+    WriteProcessState();
+    BlankDisplay();
+    if (restart_argc == 0) {
+        __builtin_trap();
+    }
+    // The dump before anything else changes the process. Minutes over host0, seconds
+    // to a memory card; the display stays black meanwhile.
+    static char path[256];
+    const int dumped = azaharCoredump(path, sizeof(path));
+    static char line[320];
+    std::snprintf(line, sizeof(line), "[azahar] crash: core dump %08x, %s; restarting\n",
+                  static_cast<unsigned>(dumped), dumped >= 0 ? path : "none");
+    Write(line);
+    // The restart: the game list, its notice naming the dump, and the running title's settings
+    // that are not at their defaults (to try those first).
+    static char seq[32];
+    static char crashed[sizeof(path) + 16];
+    static char changed[200];
+    int n = restart_argc;
+    if (restart_seq != nullptr) {
+        std::snprintf(seq, sizeof(seq), "seq=%lu", *restart_seq);
+        restart_argv[n++] = seq;
+    }
+    std::snprintf(crashed, sizeof(crashed), "crashed=%s", dumped >= 0 ? path : "");
+    restart_argv[n++] = crashed;
+    constexpr std::size_t changed_at = sizeof("changed=") - 1;
+    std::memcpy(changed, "changed=", changed_at);
+    if (VitaFrontend::Config::WriteChangedFromDefaults(changed + changed_at,
+                                                       sizeof(changed) - changed_at) > 0) {
+        restart_argv[n++] = changed;
+    }
+    restart_argv[n] = nullptr;
+    const int exec =
+        sceAppMgrLoadExec("app0:eboot.bin", const_cast<char* const*>(restart_argv), nullptr);
+    sceClibPrintf("[azahar] crash: restart %08x\n", static_cast<unsigned>(exec));
+    if (exec >= 0) {
+        // As LoadAzaharNative's restart: the system ends this process soon after the call.
+        for (int waited = 0; waited < 50; ++waited) {
+            sceKernelDelayThread(100 * 1000);
+        }
+    }
+    __builtin_trap();
 }
 
 void StallWatchBeat() {
@@ -1423,7 +1816,8 @@ int __wrap_raise(int sig) {
                       assert_text[0] != '\0' ? "; " : "", assert_text);
         VitaFrontend::CrashReport::WriteStackReport(reason);
     }
-    return __real_raise(sig);
+    // newlib raises only for abort.
+    VitaFrontend::CrashReport::Recover("an abort");
 }
 
 } // extern "C"

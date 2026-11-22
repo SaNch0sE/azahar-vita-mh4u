@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -90,6 +91,7 @@ constexpr int NoFrameSkipLimit = 5;
 /// The option's range: 0 and 1 for a toggle, 0 and the last index for a choice.
 [[nodiscard]] int Minimum(Option option);
 [[nodiscard]] int Maximum(Option option);
+[[nodiscard]] int Default(Option option);
 
 /// The file's values, applied. Once, at start, before anything reads a setting.
 void Load();
@@ -147,5 +149,22 @@ void RemoveRomFolder(std::size_t index);
 /// or a pin set it, as "[azahar] settings:" lines in `out` (cut where they do not fit): for a
 /// crash report. Takes no lock and allocates nothing. Returns the length written.
 std::size_t WriteApplied(char* out, std::size_t size);
+
+/// The running title's applied values that are not their options' defaults, among the options a
+/// game runs differently with (widescreen, the top screen's resolution, anti-aliasing, vsync, the
+/// speed limit, the frame skip limit and Wait for GPU results), as their file keys separated by
+/// commas in `out`: a crash's notice asks the player to try the defaults first. Nothing with no
+/// title running. Takes no lock and allocates nothing (CrashReport::Recover hands it to the
+/// restart). Returns the length written.
+std::size_t WriteChangedFromDefaults(char* out, std::size_t size);
+
+/// An option WriteChangedFromDefaults named; `own` where the value was the game's own.
+struct ChangedOption {
+    Option option;
+    bool own;
+};
+/// The options WriteChangedFromDefaults's keys name, in their order; a key no option has is left
+/// out.
+std::vector<ChangedOption> OptionsOfKeys(std::string_view keys);
 
 } // namespace VitaFrontend::Config

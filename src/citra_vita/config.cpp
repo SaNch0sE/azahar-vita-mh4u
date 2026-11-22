@@ -302,6 +302,10 @@ int Maximum(Option option) {
     return Of(option).maximum;
 }
 
+int Default(Option option) {
+    return Of(option).default_value;
+}
+
 void Load() {
     std::scoped_lock lock{mutex};
     for (std::size_t i = 0; i < Count; i++) {
@@ -570,6 +574,60 @@ std::size_t WriteApplied(char* out, std::size_t size) {
     }
     add("\n");
     return at;
+}
+
+/// The options a game runs differently with (WriteChangedFromDefaults): those of the screen and
+/// speed rows that change what the emulation draws or when, not where the screens are shown.
+constexpr std::array crash_options{Option::Widescreen, Option::TopScale,       Option::Msaa,
+                                   Option::Vsync,      Option::SpeedLimit,     Option::FrameSkipLimit,
+                                   Option::WaitForGpu, Option::SkipRightEye};
+
+std::size_t WriteChangedFromDefaults(char* out, std::size_t size) {
+    if (size == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (applied_title[0] == '\0') {
+        return 0;
+    }
+    std::size_t at = 0;
+    for (const Option option : crash_options) {
+        const Definition& d = Of(option);
+        if (applied_values[static_cast<std::size_t>(option)].load(std::memory_order_relaxed) ==
+            d.default_value) {
+            continue;
+        }
+        const bool own = applied_sources[static_cast<std::size_t>(option)].load(
+                             std::memory_order_relaxed) == Source::Title;
+        const int n = std::snprintf(out + at, size - at, "%s%s%s", at == 0 ? "" : ",", d.key,
+                                    own ? "*" : "");
+        if (n < 0 || at + static_cast<std::size_t>(n) >= size) {
+            // A key cut short names no option: the list ends before it.
+            out[at] = '\0';
+            break;
+        }
+        at += static_cast<std::size_t>(n);
+    }
+    return at;
+}
+
+std::vector<ChangedOption> OptionsOfKeys(std::string_view keys) {
+    std::vector<ChangedOption> options;
+    while (!keys.empty()) {
+        const std::size_t comma = keys.find(',');
+        std::string_view key = keys.substr(0, comma);
+        const bool own = key.ends_with('*');
+        if (own) {
+            key.remove_suffix(1);
+        }
+        for (std::size_t i = 0; i < Count; i++) {
+            if (key == definitions[i].key) {
+                options.push_back({static_cast<Option>(i), own});
+            }
+        }
+        keys = comma == std::string_view::npos ? std::string_view{} : keys.substr(comma + 1);
+    }
+    return options;
 }
 
 } // namespace VitaFrontend::Config

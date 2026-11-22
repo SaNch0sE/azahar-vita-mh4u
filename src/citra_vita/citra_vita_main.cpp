@@ -16,6 +16,7 @@
 #include <string_view>
 #include <typeinfo>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <malloc.h>
 #include <pthread.h>
@@ -154,6 +155,9 @@ constexpr char AzaharNativePath[] = "ux0:app/" AZAHAR_VITA_TITLEID "/azaharnativ
 constexpr char RelaunchArgument[] = "--azaharnative-loaded";
 /// What LoadAzaharNative returned: empty, or the error EmulatorMain shows once it can.
 std::string g_native_error;
+/// A crash's notice for the game list to show, the player closing it: a restart's after
+/// CrashReport::Recover (crashed=PATH), or a title's that crashed (RunTitle).
+std::string g_crash_notice;
 
 constexpr char UserDirectory[] = "ux0:/data/azahar/";
 
@@ -393,8 +397,9 @@ StateArguments TakeStateArguments() {
         const std::string& argument = g_arguments[i];
         if (argument.starts_with("load=")) {
             a.load = std::atoi(argument.c_str() + 5);
-        } else if (argument == "commands") {
-            // CommandChannel's.
+        } else if (argument == "commands" || argument.starts_with("seq=") ||
+                   argument.starts_with("crashed=") || argument.starts_with("changed=")) {
+            // CommandChannel's, and a crash's restart's (main).
         } else if (argument.starts_with("scale=")) {
             // The top screen's scale: 1, 1.25, 1.5, 1.75 or 2 (Config::TopScaleValue).
             Config::Pin(Option::TopScale,
@@ -531,6 +536,15 @@ public:
             return {};
         }
         return due;
+    }
+
+    /// The last line run, for a crash's restart (seq=N), which goes on after it rather than run
+    /// the file's lines again (the crash's among them).
+    [[nodiscard]] const unsigned long* LastSeq() const {
+        return &last_seq;
+    }
+    void StartAfter(unsigned long seq) {
+        last_seq = seq;
     }
 
 private:
@@ -850,9 +864,52 @@ bool RunSettingCommand(const std::string& command) {
 #endif
     if (command == "stalltest") {
         // The stall watch's whole path on purpose: the loop that reads this channel stops for a
-        // minute, past the watch's limit (its listing, its fault, the core dump).
+        // minute, past the watch's limit (its listing, the core dump, the game list again).
         sceClibPrintf("[azahar] stalltest: the frontend's loop stops for 60 s (command)\n");
         sceKernelDelayThread(60 * 1000 * 1000);
+        return true;
+    }
+    if (command == "crashtest assert" || command == "crashtest abort") {
+        // A crash on purpose, as a failed assert or an abort ends: the report, the core dump,
+        // the game list again (CrashReport::Recover).
+        sceClibPrintf("[azahar] %s (command)\n", command.c_str());
+        if (command == "crashtest abort") {
+            std::abort();
+        }
+        UNREACHABLE_MSG("crashtest (command)");
+    }
+    if (command == "crashtest render") {
+        // A failed assert on the render thread with a title's frames on the GPU: where a GPU
+        // stop ends (sgxd's Fault).
+        auto& system = Core::System::GetInstance();
+        if (!system.IsPoweredOn()) {
+            sceClibPrintf("[azahar] crashtest render: no title runs (command)\n");
+            return true;
+        }
+        sceClibPrintf("[azahar] %s (command)\n", command.c_str());
+        system.GPU().GetRenderThread().Run([] { UNREACHABLE_MSG("crashtest render (command)"); });
+        return true;
+    }
+    if (command == "hangtest") {
+        // A GPU hang on purpose with a title's frames on the GPU: the next pass's 3D never ends
+        // (SgxdBackend::DrawHang), then the stop, the fault's report and the recovery from it.
+        if (!Core::System::GetInstance().IsPoweredOn()) {
+            sceClibPrintf("[azahar] hangtest: no title runs (command)\n");
+            return true;
+        }
+        sceClibPrintf("[azahar] hangtest (command)\n");
+        SgxdRenderer::SgxdBackend::hang_test = true;
+        return true;
+    }
+    if (command == "coredumptest") {
+        // A core dump of the running process (azaharCoredump), timed: what a caught crash
+        // writes before the app goes back to its game list. The loop goes on after it.
+        char path[256] = {};
+        const SceUInt64 start = sceKernelGetProcessTimeWide();
+        const int result = VitaFrontend::CrashReport::Coredump(path, sizeof(path));
+        sceClibPrintf("[azahar] coredumptest: %08x after %llu ms, \"%s\" (command)\n",
+                      static_cast<unsigned>(result),
+                      (sceKernelGetProcessTimeWide() - start) / 1000, path);
         return true;
     }
 #ifdef VITA_DIAGNOSTICS
@@ -1192,6 +1249,40 @@ int PowerThread(SceSize, void*) {
     return 0;
 }
 
+/// A crash's notice (g_crash_notice): what happened, and the files a report wants.
+std::string CrashNotice(std::string_view what, std::string_view report, std::string_view dump) {
+    std::string text{what};
+    text.append(dump.empty() ? "\n\nTo report it, send this file:\n"
+                             : "\n\nTo report it, send these files:\n")
+        .append(report);
+    if (!dump.empty()) {
+        text.append("\n").append(dump);
+    }
+    return text.append("\n\nPress X or O to continue.");
+}
+
+/// A crash's first line, and with the title's settings not all at their defaults
+/// (Config::WriteChangedFromDefaults's `keys`), the advice to try it with them first, naming them,
+/// their defaults and their screen as the settings do.
+std::string CrashWhat(const VitaFrontend::Ui& ui, const char* what, std::string_view keys) {
+    std::string text{what};
+    std::string names;
+    for (const auto& [option, own] : Config::OptionsOfKeys(keys)) {
+        const std::string name = ui.SettingTitle(option);
+        const std::string value = ui.SettingDefault(option);
+        names.append(names.empty() ? "" : "; ")
+            .append(own ? TrFormat("{} to {}, in Game settings", name, value)
+                        : TrFormat("{} to {}, in Settings", name, value));
+    }
+    if (!names.empty()) {
+        text.append("\n\n").append(
+            TrFormat("This game does not use the default settings. Before you report the crash, "
+                     "set these back to their defaults and try again: {}",
+                     names));
+    }
+    return text;
+}
+
 /// What copy runs, for a crash report: the name, the product code and version (an update's or the
 /// cartridge's), the file's type and size, and its 3GX plugin. At a title's start and after a jump
 /// to another title, which the core makes alone.
@@ -1216,6 +1307,103 @@ void NoteRunningTitle(Core::System& system) {
         }
     }
     VitaFrontend::CrashReport::NotePlugin(plugin);
+}
+
+/// The commands that only read the title's state: `dump PADDR SIZE` and `vdump VADDR SIZE` (its
+/// memory to host0), `memfind`, `tables VADDR`, `pageinfo VADDR` (`tables` and the GPU's holds of
+/// the page), `versions` (the versioned pages) and `threads`. The title's loop takes them, and so
+/// does a crashed title's hold (launch argument crashhold), while the state is still there.
+bool RunInspectCommand(Core::System& system, const std::string& command) {
+    if (unsigned paddr = 0, size = 0;
+        std::sscanf(command.c_str(), "dump %x %x", &paddr, &size) == 2) {
+#ifdef VITA_DIAGNOSTICS
+        // Guest memory as the host sees it (moved pages included), to
+        // host0:azahar-dump-PADDR.bin.
+        const u8* const at = system.Memory().GetPhysicalPointer(paddr);
+        const auto name = fmt::format("host0:azahar-dump-{:08x}.bin", paddr);
+        FILE* const out = at != nullptr ? std::fopen(name.c_str(), "wb") : nullptr;
+        const std::size_t written = out ? std::fwrite(at, 1, size, out) : 0;
+        if (out) {
+            std::fclose(out);
+        }
+        sceClibPrintf("[azahar] dump %08x+%x: %u bytes to %s\n", paddr, size,
+                      static_cast<unsigned>(written), name.c_str());
+#else
+        sceClibPrintf("[azahar] dump: a diagnostics build's command\n");
+#endif
+        return true;
+    }
+    if (u32 vaddr = 0, size = 0; std::sscanf(command.c_str(), "vdump %x %x", &vaddr, &size) == 2) {
+#ifdef VITA_DIAGNOSTICS
+        // The title's memory at a virtual address, to host0:azahar-vdump-VADDR.bin.
+        const auto process = system.Kernel().GetCurrentProcess();
+        std::vector<u8> bytes(process ? size : 0);
+        if (process) {
+            system.Memory().ReadBlock(*process, vaddr, bytes.data(), bytes.size());
+        }
+        const auto name = fmt::format("host0:azahar-vdump-{:08x}.bin", vaddr);
+        FILE* const out = process ? std::fopen(name.c_str(), "wb") : nullptr;
+        const std::size_t written = out ? std::fwrite(bytes.data(), 1, bytes.size(), out) : 0;
+        if (out) {
+            std::fclose(out);
+        }
+        sceClibPrintf("[azahar] vdump %08x+%x: %u bytes to %s\n", vaddr, size,
+                      static_cast<unsigned>(written), name.c_str());
+#else
+        sceClibPrintf("[azahar] vdump: a diagnostics build's command\n");
+#endif
+        return true;
+    }
+    if (command.starts_with("memfind ")) {
+#ifdef VITA_DIAGNOSTICS
+        Memfind(system, command.substr(8));
+#else
+        sceClibPrintf("[azahar] memfind: a diagnostics build's command\n");
+#endif
+        return true;
+    }
+    if (command.starts_with("tables ")) {
+        // What a guest fault's report says of an address (Core::ModuleTablesAt), from the
+        // emulation thread's core (host 0's).
+        const u32 va = static_cast<u32>(std::strtoul(command.c_str() + 7, nullptr, 16));
+        for (const std::string& line : Core::ModuleTablesAt(va)) {
+            sceClibPrintf("[azahar] %s (command)\n", line.c_str());
+        }
+        return true;
+    }
+    if (u32 va = 0; std::sscanf(command.c_str(), "pageinfo %x", &va) == 1) {
+#ifdef VITA_DIAGNOSTICS
+        // A guest address's page as the module's tables (the shared one and each core's view) and
+        // the GPU's holds (its access, tickets and versions) have it.
+        for (const std::string& line : Core::ModuleTablesAt(va)) {
+            LOG_INFO(Frontend, "pageinfo {:08x}: {} (command)", va, line);
+        }
+        const u8* const host = system.Memory().GetPointer(va);
+        LOG_INFO(Frontend, "pageinfo {:08x}: app view {}; {} (command)", va, fmt::ptr(host),
+                 host != nullptr ? system.GPU().GetRenderThread().HoldState(host)
+                                 : std::string{"not mapped"});
+#else
+        LOG_INFO(Frontend, "pageinfo: a diagnostics build's command");
+#endif
+        return true;
+    }
+    if (command == "versions") {
+#ifdef VITA_DIAGNOSTICS
+        LOG_INFO(Frontend, "versions: {} (command)", system.GPU().GetRenderThread().VersionList());
+#else
+        LOG_INFO(Frontend, "versions: a diagnostics build's command");
+#endif
+        return true;
+    }
+    if (command == "threads") {
+#ifdef VITA_DIAGNOSTICS
+        LogGuestThreads(system);
+#else
+        sceClibPrintf("[azahar] threads: a diagnostics build's command\n");
+#endif
+        return true;
+    }
+    return false;
 }
 
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
@@ -1370,6 +1558,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     // A save or load sent (the argument's or the menu's) whose result is still to print.
     bool state_watch = false;
     bool state_watch_is_load = false;
+    // An exception in the title's code, or its read of memory it has not mapped.
+    bool title_crashed = false;
 
     ui.EnterGame();
     window.SetUi(&ui);
@@ -1438,50 +1628,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     sceClibPrintf("[azahar] savestate: %s slot %d (command) %s\n",
                                   save ? "saving" : "loading", slot,
                                   state_watch ? "queued" : "refused");
-                } else if (unsigned paddr = 0, size = 0;
-                           std::sscanf(command.c_str(), "dump %x %x", &paddr, &size) == 2) {
-#ifdef VITA_DIAGNOSTICS
-                    // Guest memory as the host sees it (moved pages included), to
-                    // host0:azahar-dump-PADDR.bin.
-                    const u8* const at = system.Memory().GetPhysicalPointer(paddr);
-                    const auto name = fmt::format("host0:azahar-dump-{:08x}.bin", paddr);
-                    FILE* const out = at != nullptr ? std::fopen(name.c_str(), "wb") : nullptr;
-                    const std::size_t written = out ? std::fwrite(at, 1, size, out) : 0;
-                    if (out) {
-                        std::fclose(out);
-                    }
-                    sceClibPrintf("[azahar] dump %08x+%x: %u bytes to %s\n", paddr, size,
-                                  static_cast<unsigned>(written), name.c_str());
-#else
-                    sceClibPrintf("[azahar] dump: a diagnostics build's command\n");
-#endif
-                } else if (u32 vaddr = 0, size = 0;
-                           std::sscanf(command.c_str(), "vdump %x %x", &vaddr, &size) == 2) {
-#ifdef VITA_DIAGNOSTICS
-                    // The title's memory at a virtual address, to host0:azahar-vdump-VADDR.bin.
-                    const auto process = system.Kernel().GetCurrentProcess();
-                    std::vector<u8> bytes(process ? size : 0);
-                    if (process) {
-                        system.Memory().ReadBlock(*process, vaddr, bytes.data(), bytes.size());
-                    }
-                    const auto name = fmt::format("host0:azahar-vdump-{:08x}.bin", vaddr);
-                    FILE* const out = process ? std::fopen(name.c_str(), "wb") : nullptr;
-                    const std::size_t written =
-                        out ? std::fwrite(bytes.data(), 1, bytes.size(), out) : 0;
-                    if (out) {
-                        std::fclose(out);
-                    }
-                    sceClibPrintf("[azahar] vdump %08x+%x: %u bytes to %s\n", vaddr, size,
-                                  static_cast<unsigned>(written), name.c_str());
-#else
-                    sceClibPrintf("[azahar] vdump: a diagnostics build's command\n");
-#endif
-                } else if (command.starts_with("memfind ")) {
-#ifdef VITA_DIAGNOSTICS
-                    Memfind(system, command.substr(8));
-#else
-                    sceClibPrintf("[azahar] memfind: a diagnostics build's command\n");
-#endif
+                } else if (RunInspectCommand(system, command)) {
                 } else if (command == "menu quit") {
                     // As a player quits: the pause menu open a second, then its "Quit game".
                     sceClibPrintf("[azahar] menu quit (command)\n");
@@ -1490,21 +1637,14 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     // The next round of this loop shuts the title down, as after the menu's.
                     sceClibPrintf("[azahar] %s (command)\n", command.c_str());
                     window.RequestQuit(command == "exit");
-                } else if (command.starts_with("tables ")) {
-                    // What a guest fault's report says of an address (Core::ModuleTablesAt),
-                    // from the emulation thread's core (host 0's).
-                    const u32 va = static_cast<u32>(std::strtoul(command.c_str() + 7, nullptr, 16));
-                    for (const std::string& line : Core::ModuleTablesAt(va)) {
-                        sceClibPrintf("[azahar] %s (command)\n", line.c_str());
-                    }
+                } else if (command == "crashtest guest") {
+                    // The title stopped as a crash in its code stops it: the frontend's side
+                    // (the core dump with the title's state, the game list's notice).
+                    sceClibPrintf("[azahar] crashtest guest (command)\n");
+                    title_crashed = true;
+                    break;
                 } else if (RunSettingCommand(command) ||
                            VitaFrontend::Multiplayer::RunCommand(system, command)) {
-                } else if (command == "threads") {
-#ifdef VITA_DIAGNOSTICS
-                    LogGuestThreads(system);
-#else
-                    sceClibPrintf("[azahar] threads: a diagnostics build's command\n");
-#endif
                 } else {
                     sceClibPrintf("[azahar] command \"%s\" not known\n", command.c_str());
                 }
@@ -1543,6 +1683,8 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             LOG_ERROR(Frontend, "Savestate operation failed");
         } else if (status != Core::System::ResultStatus::Success) {
             LOG_CRITICAL(Frontend, "Emulation stopped: {}", static_cast<int>(status));
+            title_crashed = status == Core::System::ResultStatus::ErrorCoreExceptionRaised ||
+                            status == Core::System::ResultStatus::ErrorMemoryExceptionRaised;
             break;
         }
 
@@ -2056,6 +2198,64 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         // RunLoop (EmuWindowVita::SwapBuffers).
     }
 
+    if (title_crashed) {
+        // A core dump while the title's state is still there, then the game list's notice. The
+        // report's preamble as things are now, unless this crash's own lines wrote it.
+        Common::Log::RenewCrashReport();
+        LOG_CRITICAL(Frontend, "The title crashed: {}", system.GetStatusDetails());
+#ifdef VITA_DIAGNOSTICS
+        // Launch argument crashhold: the crashed title's state stays for the command channel's
+        // reading commands (what the title wrote where its code went wrong) until `go`, ten
+        // minutes at most.
+        if (CommandChannel() &&
+            std::find(g_arguments.begin() + 1, g_arguments.end(), "crashhold") != g_arguments.end()) {
+            sceClibPrintf("[azahar] crashhold: reading commands until go\n");
+            const SceUInt64 hold_start_us = sceKernelGetProcessTimeWide();
+            while (sceKernelGetProcessTimeWide() - hold_start_us < 600 * 1000000ull) {
+                const std::string command = command_file.Poll();
+                if (command == "go") {
+                    break;
+                }
+                if (!command.empty() && !RunInspectCommand(system, command)) {
+                    sceClibPrintf("[azahar] crashhold: \"%s\" is not a reading command\n",
+                                  command.c_str());
+                }
+                sceKernelDelayThread(100000);
+            }
+            sceClibPrintf("[azahar] crashhold: over\n");
+        }
+#endif
+        VitaFrontend::CrashReport::WriteProcessState();
+        // While the title is up its presents are the render thread's: the guest frames it still
+        // had queued built the same ImGui frame as this thread. Nothing comes after.
+        const bool powered = system.IsPoweredOn();
+        if (powered) {
+            system.GPU().GetRenderThread().RunSync([] {});
+        }
+        const auto present = [&] {
+            const auto build = [&] {
+                ui.Update();
+                window.Present(&ui, false);
+            };
+            if (powered) {
+                system.GPU().GetRenderThread().RunSync(build);
+            } else {
+                build();
+            }
+        };
+        ui.SetStatusMessage("The game crashed. Saving a crash report...");
+        present();
+        char dump[256] = {};
+        const int dumped = VitaFrontend::CrashReport::Coredump(dump, sizeof(dump));
+        sceClibPrintf("[azahar] the title crashed; core dump %08x, %s\n",
+                      static_cast<unsigned>(dumped), dumped >= 0 ? dump : "none");
+        g_crash_notice = CrashNotice("The game crashed.", Common::Log::CrashReportPath,
+                                     dumped >= 0 ? dump : "");
+        ui.ClearStatusMessage();
+        // The title's settings still applied (SetRunningTitle below).
+        char changed[192];
+        Config::WriteChangedFromDefaults(changed, sizeof(changed));
+    }
     window.SetPauseMenu(nullptr);
     window.SetInputToGuest(true);
     window.SetLoading(false);
@@ -2412,6 +2612,36 @@ int EmulatorMain() {
         }
         return more;
     };
+    // A crash's restart (CrashReport::Recover): its notice, with the title's settings changed
+    // from their defaults, and the command channel going on after the last line the crashed
+    // process ran.
+    std::string_view changed;
+    for (const std::string& argument : g_arguments) {
+        if (argument.starts_with("changed=")) {
+            changed = std::string_view{argument}.substr(8);
+        }
+    }
+    for (const std::string& argument : g_arguments) {
+        if (argument.starts_with("crashed=")) {
+            g_crash_notice = CrashNotice("Azahar crashed and started again.",
+                                         VitaFrontend::CrashReport::LastReportPath,
+                                         std::string_view{argument}.substr(8));
+        } else if (argument.starts_with("seq=")) {
+            command_file.StartAfter(std::strtoul(argument.c_str() + 4, nullptr, 10));
+        }
+    }
+    // From here a crash the process finds itself starts it again on the game list
+    // (CrashReport::Recover); before, the system takes it, as a restart would crash again. The
+    // restart leaves a title's launch parameter and savestate arguments behind.
+    std::vector<std::string> restart{RelaunchArgument, "-"};
+    for (std::size_t i = 1; i < g_arguments.size(); i++) {
+        const std::string& argument = g_arguments[i];
+        if (!argument.starts_with("load=") && !argument.starts_with("save=") &&
+            !argument.starts_with("seq=") && !argument.starts_with("crashed=") &&
+            !argument.starts_with("changed=")) {
+            restart.push_back(argument);
+        }
+    }
     VitaFrontend::CrashReport::EnableRecovery(restart,
                                               CommandChannel() ? command_file.LastSeq() : nullptr);
     bool running = true;
@@ -2453,12 +2683,34 @@ int EmulatorMain() {
         }
         ui.ClearStatusMessage();
     };
+    // A notice the player closes (a crash's): the status message until X or O is pressed and let
+    // go, so that the list does not take the press.
+    const auto show_notice = [&](std::string message) {
+        ui.SetStatusMessage(std::move(message));
+        int phase = 0; // 0: the buttons let go, 1: one pressed, 2: let go again
+        while (phase < 3) {
+            present_list();
+            sceDisplayWaitVblankStart();
+            SceCtrlData pad{};
+            const bool held = sceCtrlPeekBufferPositive(0, &pad, 1) > 0 &&
+                              (pad.buttons & (SCE_CTRL_CROSS | SCE_CTRL_CIRCLE)) != 0;
+            if (held == (phase == 1)) {
+                phase++;
+            }
+        }
+        ui.ClearStatusMessage();
+    };
     const auto install_selected = [&] {
         std::string outcome = ui.InstallSelected(present_list);
         sceClibPrintf("[azahar] install: %s\n", outcome.c_str());
         show_outcome(std::move(outcome));
     };
     while (running && !window.IsQuitRequested()) {
+        if (!g_crash_notice.empty()) {
+            sceClibPrintf("[azahar] crash notice shown\n");
+            show_notice(std::exchange(g_crash_notice, {}));
+            sceClibPrintf("[azahar] crash notice closed\n");
+        }
         window.PollEvents();
         // The banner before the interface: the list leaves the panel open for the banner as the
         // banner stands when it draws (a new selection hides the old one here); drawn after it,

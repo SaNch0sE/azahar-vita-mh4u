@@ -61,5 +61,9 @@ void EndCrashReport(bool remove);
 /// Called by Stop, which every failed assertion calls before its fault: the frontend's last act
 /// (the Vita's blacks out its display).
 void SetStopHook(void (*hook)());
+/// Called by Crashed, every failed assertion's and unreachable path's end (Crash()): the
+/// frontend's recovery, which does not return. Without one, or when it returns, the process
+/// faults (an undefined instruction) and the system takes it.
+void SetCrashHook(void (*hook)());
 #endif
 } // namespace Common::Log

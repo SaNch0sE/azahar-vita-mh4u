@@ -102,6 +102,11 @@ public:
     /// keeping the selected one selected.
     void ScanGames();
 
+    /// The title of the option's row in the settings, in the menus' language: a crash's notice
+    /// names the settings it asks the player to set back (Config::WriteChangedFromDefaults).
+    [[nodiscard]] std::string SettingTitle(Config::Option option) const;
+    [[nodiscard]] std::string SettingDefault(Config::Option option) const;
+
     /// The savestate slot the user chose, valid after Action::SaveState / Action::LoadState.
     [[nodiscard]] u32 SelectedSlot() const {
         return selected_slot;

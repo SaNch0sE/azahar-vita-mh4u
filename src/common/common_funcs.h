@@ -44,6 +44,14 @@ extern "C" {
 __declspec(dllimport) void __stdcall DebugBreak(void);
 }
 #define Crash() DebugBreak()
+#elif defined(__vita__)
+// The Vita's frontend takes a crash it finds itself (a failed assert, an unreachable path) back
+// to its game list after a core dump of its own (citra_vita's CrashReport::Recover), rather than
+// leave the process to the system's error dialog.
+namespace Common::Log {
+[[noreturn]] void Crashed();
+}
+#define Crash() ::Common::Log::Crashed()
 #else
 #define Crash() __builtin_trap()
 #endif

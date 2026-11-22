@@ -354,6 +354,7 @@ int azaharVersion() {
 #include "klog.c"
 #include "reback.c"
 #include "cycles.c"
+#include "coredump.c"
 #include "memreport.c"
 #include "shellcdram.c"
 #include "shell.c"

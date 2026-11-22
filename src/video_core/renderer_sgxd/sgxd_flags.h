@@ -93,6 +93,7 @@ namespace SgxdRenderer {
  *             program replaced by the white write alone: the vertex side and rasterisation;
  *             fswhite=4 as many NOPs as the program's words, then the white write (its time
  *             without its loads and reads)
+ *   xferlog   every display transfer, texture copy and fill as it comes (sgxd_rasterizer.cpp)
  *   clipcheck=N  from N s of the process's time on, the draws in the first 50 ms of each second
  *             (clipcheckall: every draw) run through the vertex program on the CPU and clipped
  *             at the TA's near and far planes: their triangles the TA clips at its guard band

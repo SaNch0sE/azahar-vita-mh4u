@@ -592,6 +592,7 @@ void Initialize(std::string_view log_file) {
 #ifdef __vita__
 namespace {
 void (*stop_hook)() = nullptr;
+void (*crash_hook)() = nullptr;
 void (*report_preamble)() = nullptr;
 std::atomic_flag report_begun = ATOMIC_FLAG_INIT;
 /// When the preamble was last written (process time, us), 0 for none.
@@ -607,6 +608,17 @@ void SetCrashReportPreamble(void (*hook)()) {
 
 void SetStopHook(void (*hook)()) {
     stop_hook = hook;
+}
+
+void SetCrashHook(void (*hook)()) {
+    crash_hook = hook;
+}
+
+void Crashed() {
+    if (crash_hook != nullptr) {
+        crash_hook();
+    }
+    __builtin_trap();
 }
 #endif
 

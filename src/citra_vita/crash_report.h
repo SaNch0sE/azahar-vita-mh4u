@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
 #include "common/common_types.h"
 
 namespace Cheats {
@@ -11,6 +14,9 @@ class CheatEngine;
 }
 
 namespace VitaFrontend::CrashReport {
+
+/// Where PrintLast sets the last run's report aside.
+constexpr char LastReportPath[] = "ux0:data/azahar/crash-last.txt";
 
 /// The last run's report, if it left one: printed on the debug channel and set aside
 /// (ux0:data/azahar/crash.txt to crash-last.txt).
@@ -68,6 +74,25 @@ void WriteProcessState();
 /// dump is written, minutes over host0, and would hold its last picture on the OLED.
 void BlankDisplay();
 
+/// From now on a crash the process finds itself ends in Recover: Common::Log's crash hook (every
+/// failed assert and unreachable path), an abort (std::terminate, newlib's assert), the stall
+/// watch. `arguments` are the restart's, packed now so that a crash allocates nothing;
+/// `command_seq`, when there is a command channel, its last line run, carried as seq=N. Before
+/// this the system takes a crash: one at the start would restart into itself.
+void EnableRecovery(const std::vector<std::string>& arguments, const unsigned long* command_seq);
+
+/// A crash's end: the report (WriteStackReport, unless one is written; WriteProcessState), a core
+/// dump of the process (azaharCoredump; the stall watch held), then the app started again on its
+/// game list with crashed=PATH, the dump's path, which the restart shows the player (CrashNotice).
+/// The process's end gives the GPU back (azaharnative's process-gone handler resets it). Another
+/// thread's crash meanwhile ends that thread. Without EnableRecovery, or when the restart fails,
+/// the process faults and the system takes it. Does not return.
+[[noreturn]] void Recover(const char* reason);
+
+/// A core dump of the process (azaharCoredump) with the stall watch held, for a crash the app
+/// lives on after (a title's): azaharCoredump's result, the path in `path`.
+int Coredump(char* path, unsigned path_size);
+
 /// The heap's live blocks of 512 KiB or more, each with the return addresses on its allocating
 /// thread's stack: on the debug channel, and with `to_report` in the crash report too.
 void PrintHeapSites(bool to_report);
@@ -81,12 +106,10 @@ void StartLeakTracking();
 void PrintLeaks(bool every_chunk);
 #endif
 
-/// The stall watch (with the command channel): a thread that, once the frontend's loop has not
-/// beaten for StallSeconds (a frozen frontend: its loops read the command channel once a second
-/// and the pause's wait beats too; a title's load or a savestate's save stops them for less),
-/// prints every emulator thread's state, what it waits on and the return addresses on its stack
-/// (PrintThreadStates), then faults (an undefined instruction) so that the system keeps the
-/// process for a core dump. StallWatchBeat: the loop alive. From the main thread.
+/// The stall watch (with the command channel): once the frontend's loop has not beaten for
+/// StallSeconds, prints every emulator thread's state (PrintThreadStates), then recovers. A
+/// title's load or a savestate's save stops the beats for less. From the main thread. A core
+/// dump holds it.
 constexpr unsigned StallSeconds = 40;
 void StartStallWatch();
 void StallWatchBeat();

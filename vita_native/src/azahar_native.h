@@ -373,6 +373,11 @@ int azaharSystemVolume(int step);
 /// (sgxdTake), read from Syscon every 20 ms (shell.c): out of SceShell's pad data then, they are
 /// in no app's either. Version 63.
 int azaharVolumeKeys(void);
+/// A core dump of the calling process, as the system writes a crashed process's (coredump.c):
+/// the process suspended for its first part, running again for the rest; the call returns once
+/// the file is written (minutes over host0). `path` (path_size bytes, may be NULL)
+/// gets the dump's path. Returns the dump's result (0 written), or a negative error. Version 77.
+int azaharCoredump(char *path, uint32_t path_size);
 /// The kernel modules loaded from outside the firmware (plugins.c, version 86): taiHEN, HENkaku
 /// and the plugins a taiHEN config.txt loads, as "name path" lines in `out` (`size` bytes, ended
 /// in a NUL, cut where they do not fit). Returns the count listed, or AZAHAR_ERR_*.
