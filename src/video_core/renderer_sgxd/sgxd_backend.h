@@ -507,6 +507,7 @@ private:
         u32 va{};
         u32 size{};
         int block{-1};
+        int shell_slot{-1}; // its block's slot in the shell's CDRAM, or -1: its own block
         u32 width{}, height{};
         u32 bg_offset{}; // the background colour word and its SA secondary, after the layout
         Kind kind{};
@@ -525,6 +526,19 @@ private:
     /// the kernel's free figure is not one block's worth.
     static constexpr u32 RecipeBlockSize = 512u << 10;
     static constexpr u32 RecipeCdramMargin = 1u << 20;
+    /// SceShell's 16 MiB of CDRAM, the app's while sgxd holds the GPU (azaharShellCdram): the
+    /// recipes' blocks in slots of RecipeBlockSize, before the game's 112 MiB.
+    static constexpr u32 ShellCdramSize = 16u << 20;
+    static constexpr u32 ShellSlots = ShellCdramSize / RecipeBlockSize;
+    u8* shell_cdram{};
+    u64 shell_slots_used{}; ///< a bit a slot
+    /// The slots' GPU addresses, a megabyte apart from here, mapped once at the start: a recipe
+    /// made in a slot maps nothing, so the GPU never idles for one.
+    u32 shell_slots_va{};
+    [[nodiscard]] u32 ShellSlotVa(u32 slot) const {
+        return shell_slots_va + slot * (1u << 20);
+    }
+    void FreeRecipeBlock(const Recipe& r);
 
     /// The recipe for a width x height target of kind, made at its first use. A PICA recipe's
     /// pixel event program DOUTAs IR0 to its end of tile (sgxd_recipe_pica_pixev).

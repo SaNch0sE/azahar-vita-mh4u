@@ -202,6 +202,11 @@ int azaharHold(const AzaharHoldRun *runs, uint32_t count);
 /// See AzaharFlipRun: `count` runs, 1 to AZAHAR_FLIP_MAX_RUNS. Returns the guest descriptors it
 /// retargeted. Version 26.
 int azaharFlip(const AzaharFlipRun *runs, uint32_t count);
+/// SceShell's 16 MiB of CDRAM (ScePhyMemPartShellCdram, 0x27000000) for the caller, which must
+/// hold the GPU (sgxdTake): the shell's contents go to main memory, and sgxd's release copies
+/// them back before SceGpu has the GPU again. `*user_va` gets the range's address in the app.
+/// Version 29.
+int azaharShellCdram(uint32_t *user_va);
 /// This module's version, and the first version that can be stopped and unloaded: from it on,
 /// module_stop lets go of everything the module registered or allocated, and refuses while a
 /// process holds any of it, so an update can replace a loaded module without a reboot.

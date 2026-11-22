@@ -113,6 +113,15 @@ SgxdBackend* drain_owner;
 } // Anonymous namespace
 
 SgxdBackend::SgxdBackend() {
+    // SceShell's CDRAM for the recipes: sgxd holds the GPU, and its release copies the shell's
+    // contents back.
+    u32 shell_va = 0;
+    const int shell_took = azaharShellCdram(&shell_va);
+    ASSERT_MSG(shell_took == 0 && shell_va != 0, "sgxd: the shell's CDRAM was not ours ({:#010x})",
+               static_cast<u32>(shell_took));
+    shell_cdram = reinterpret_cast<u8*>(shell_va);
+    LOG_INFO(Render, "sgxd: the shell's {} MiB of CDRAM at {:#010x}: {} recipe slots",
+             ShellCdramSize >> 20, shell_va, ShellSlots);
     surfaces = MapBlock("azahar-sgxd-surfaces", SurfacesVa, SurfacesSize, surfaces_block);
     surfaces_size = SurfacesSize;
     textures = MapBlock("azahar-sgxd-textures", TexturesVa, TexturesSize, textures_block);
@@ -132,7 +141,17 @@ SgxdBackend::SgxdBackend() {
         ASSERT_MSG(mapped == 0, "sgxd: the PDS arena's window {} not mapped at GPU {:#010x}: {:#010x}",
                    w, PdsWindowVa + w * PdsHalfSize, static_cast<u32>(mapped));
     }
-    next_va = BlockVa + shared_size;
+    // Each slot of the shell's CDRAM at a GPU address of its own, mapped once: a recipe made in a
+    // slot maps nothing. The recipes past the slots take blocks of the game's CDRAM.
+    shell_slots_va = BlockVa + shared_size;
+    for (u32 slot = 0; slot < ShellSlots; slot++) {
+        const int mapped =
+            sgxdMap(ShellSlotVa(slot), shell_cdram + slot * RecipeBlockSize, RecipeBlockSize, 0);
+        ASSERT_MSG(mapped == 0,
+                   "sgxd: the shell's CDRAM slot {} not mapped at GPU {:#010x}: {:#010x}", slot,
+                   ShellSlotVa(slot), static_cast<u32>(mapped));
+    }
+    next_va = ShellSlotVa(ShellSlots);
     sgxd_recipe_code_heap = BlockVa + code_begin;
     draws.resize(MaxDraws);
     programs.resize(MaxDraws);
@@ -431,12 +450,24 @@ SgxdBackend::~SgxdBackend() {
     char failed[16];
     sgxd_ptla_events(nullptr, 0, failed, sizeof(failed));
     for (const auto& r : recipes) {
-        FreeBlock(r->memory, r->va, r->size, r->block);
+        FreeRecipeBlock(*r);
+    }
+    for (u32 slot = 0; slot < ShellSlots; slot++) {
+        sgxdUnmap(ShellSlotVa(slot), RecipeBlockSize);
     }
     sgxdUnmap(PdsWindowVa, PdsWindows * PdsHalfSize);
     FreeBlock(shared, BlockVa, shared_size, shared_block);
     FreeBlock(surfaces, SurfacesVa, surfaces_size, surfaces_block);
     FreeBlock(textures, TexturesVa, TexturesSize, textures_block);
+}
+
+void SgxdBackend::FreeRecipeBlock(const Recipe& r) {
+    if (r.shell_slot < 0) {
+        FreeBlock(r.memory, r.va, r.size, r.block);
+        return;
+    }
+    // Its slot stays mapped at its address for the next recipe there (its render is done).
+    shell_slots_used &= ~(u64{1} << r.shell_slot);
 }
 
 SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
@@ -477,6 +508,16 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
             return *oldest;
         }
     }
+    int slot = -1;
+    for (u32 k = 0; k < ShellSlots && slot < 0; k++) {
+        if ((shell_slots_used >> k & 1) == 0) {
+            slot = static_cast<int>(k);
+        }
+    }
+    if (slot >= 0) {
+        va = ShellSlotVa(static_cast<u32>(slot));
+        va_end = va + RecipeBlockSize;
+    }
     auto made = std::make_unique<Recipe>();
     Recipe& r = *made;
     r.width = width;
@@ -498,7 +539,7 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind) {
                      height, r.size >> 10, RecipeBlockSize >> 10);
     DEBUG_ASSERT_MSG(r.va + r.size <= RecipesEnd, "sgxd: no GPU space for a {}x{} recipe",
                      width, height);
-    r.memory = MapBlock("azahar-sgxd-recipe", r.va, r.size, r.block);
+    r.memory = MapRecipeBlock(r);
     next_va = AlignUp(r.va + r.size, 1u << 20);
 
     sgxd_recipe_write(&r.recipe, r.memory);

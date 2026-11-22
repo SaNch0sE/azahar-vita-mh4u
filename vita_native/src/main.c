@@ -19,6 +19,7 @@
 #include <psp2kern/kernel/sysmem/address_space.h>
 #include <psp2kern/kernel/sysmem/memtype.h>
 #include <psp2kern/kernel/sysmem/uid_class.h>
+#include <psp2kern/kernel/sysroot.h>
 #include <psp2kern/kernel/sysmem/uid_puid.h>
 #include <psp2kern/kernel/threadmgr.h>
 
@@ -346,6 +347,7 @@ static uint32_t active_cpu_mask(void) {
 // 26: azaharFlip, page versions: the app's and the guest's views on another page, the GPU's kept.
 // 27: azaharAttach and azaharDetach gone, and the cross-core maintenance with them: one
 //     emulation thread, one attached core.
+// 29: azaharShellCdram, the shell's 16 MiB of CDRAM the app's while sgxd holds the GPU.
 int azaharVersion() {
     return 5;
 }
@@ -358,6 +360,7 @@ int azaharVersion() {
 #include "sgxd.c"
 #include "reback.c"
 #include "cycles.c"
+#include "shellcdram.c"
 
 // ---------------------------------------------------------------------------- module
 

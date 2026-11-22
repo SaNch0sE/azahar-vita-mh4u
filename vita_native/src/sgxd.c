@@ -124,6 +124,7 @@ typedef void (*sgxd_void_fn)(void);
 enum { SGXD_NONE, SGXD_OWNED, SGXD_LOST };
 static int sgxd_state;
 static SceUID sgxd_owner = -1;
+static void shellcdram_give_back(void); // shellcdram.c
 static SceUID sgxd_mutex = -1;
 static SceUID sgxd_sysevent_uid = -1;
 
@@ -667,6 +668,8 @@ static int sgxd_sysevent(int resume, int eventid, void *args, void *opt) {
         ksceKernelLockMutex(sgxd_mutex, 1, NULL);
         if (sgxd_state == SGXD_OWNED) {
             sgxd_hw_down();
+            // SceGpu has the GPU at resume, before the app takes it again.
+            shellcdram_give_back();
             sgxd_state = SGXD_LOST;
             SGXD_LOG("suspend while owned: our side down, lost until the next take\n");
         }
@@ -810,6 +813,8 @@ static int sgxd_release_locked(void) {
     }
     if (sgxd_state == SGXD_OWNED) {
         sgxd_hw_down();
+        // The shell's CDRAM back before SceGpu, and the shell's GPU work with it, runs again.
+        shellcdram_give_back();
         sgxd_hand_back();
     }
     // LOST: the system's resume already gave SceGpu its GPU back.

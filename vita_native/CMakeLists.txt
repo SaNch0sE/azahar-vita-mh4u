@@ -34,6 +34,7 @@ target_link_libraries(azaharnative
   SceProcEventForDriver_stub
   SceSysclibForDriver_stub
   SceSysmemForDriver_stub
+  SceSysrootForDriver_stub
   SceThreadmgrForDriver_stub
   SceDebugForDriver_stub
   SceKernelSuspendForDriver_stub

@@ -118,12 +118,10 @@ static uint32_t reback_attr_for(uint32_t pa) {
     return 0;
 }
 
-// The process's level-1 entry for `uva`, through a mapping of its table's page of our own. The
-// mapping must be Normal, write-back and shareable on both levels, as the kernel's own view of
-// its tables is: the table walker and the kernel's writes are coherent with that, and a
-// different view of the same page would not be. One page of entries covers 1 GiB; the adopted
-// range must fit in it.
-static volatile uint32_t *reback_map_l1(uint32_t uva, uint32_t mbs) {
+// The process's level-1 entry for `uva`, through a mapping of its table's page of our own:
+// Normal, write-back, shareable, as the kernel's own view (coherent with the walker). One page
+// of entries covers 1 GiB. The mapping's block goes to *uid (freed by the caller).
+static volatile uint32_t *reback_map_l1(uint32_t uva, uint32_t mbs, SceUID *uid_out) {
     const uint32_t n = rd_ttbcr() & 7u;
     uint32_t pa;
     if (n != 0 && uva >= (1u << (32 - n))) {
@@ -160,7 +158,7 @@ static volatile uint32_t *reback_map_l1(uint32_t uva, uint32_t mbs) {
         ksceKernelFreeMemBlock(uid);
         return NULL;
     }
-    reback_l1_uid = uid;
+    *uid_out = uid;
     return (volatile uint32_t *)((uintptr_t)va + (pa & 0xFFFu));
 }
 
@@ -315,7 +313,7 @@ int azaharAdopt(uint32_t user_va, uint32_t size) {
                            0x1000, &reback_l2_uid, &reback_l2, &reback_l2_pa)) != 0) {
         goto fail;
     }
-    if (!(reback_l1 = reback_map_l1(user_va, mbs))) {
+    if (!(reback_l1 = reback_map_l1(user_va, mbs, &reback_l1_uid))) {
         ret = AZAHAR_ERR_TABLE;
         goto fail;
     }
