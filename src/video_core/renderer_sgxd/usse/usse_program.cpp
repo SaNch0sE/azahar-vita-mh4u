@@ -50,6 +50,12 @@ std::string UniformName(const Uniform& uniform) {
         return "uniforms_f";
     case UniformKind::AlphaTestRef:
         return "alphatest_ref";
+    case UniformKind::ShadowBiasConstant:
+        return "shadow_bias_constant";
+    case UniformKind::ShadowBiasLinear:
+        return "shadow_bias_linear";
+    case UniformKind::ShadowTextureBias:
+        return "shadow_texture_bias";
     case UniformKind::Dot3Const:
         return "dot3_const[" + std::to_string(uniform.index) + "]";
     case UniformKind::ConstColor:
@@ -191,8 +197,9 @@ std::string ProgramJson(const Program& p) {
     });
     list("uniforms", p.uniforms.size(), [&](std::size_t i) {
         const Uniform& u = p.uniforms[i];
-        fmt::format_to(it, R"({{"name":"{}","sa":{},"components":{},"array_size":{},"u8":{}}})",
-                       UniformName(u), u.sa_offset, u.components, u.array_size, u.u8);
+        fmt::format_to(it,
+                       R"({{"name":"{}","sa":{},"components":{},"array_size":{},"u8":{},"f16":{}}})",
+                       UniformName(u), u.sa_offset, u.components, u.array_size, u.u8, u.f16);
     });
     list("samplers", p.samplers.size(), [&](std::size_t i) {
         fmt::format_to(it, R"({{"name":"{}","unit":{}}})", SamplerName(p.samplers[i]),

@@ -652,7 +652,8 @@ UniformField FragmentUniformField(const Usse::Uniform& u) {
     case K::AlphaTestRef:
         return {offsetof(D, alphatest_ref), true};
     case K::ConstColor:
-        return {offsetof(D, const_color), false};
+        // The array from stage 0, or one stage's colour (a moved channel's broadcast).
+        return {offsetof(D, const_color) + u.index * sizeof(D::const_color[0]), false};
     case K::BufferColor:
         return {offsetof(D, tev_combiner_buffer_color), false};
     case K::ScissorX1:
@@ -713,6 +714,12 @@ UniformField FragmentUniformField(const Usse::Uniform& u) {
         return {light + offsetof(L, dist_atten_bias), false};
     case K::LightDistAttenScale:
         return {light + offsetof(L, dist_atten_scale), false};
+    case K::ShadowBiasConstant:
+        return {offsetof(D, shadow_bias_constant), false};
+    case K::ShadowBiasLinear:
+        return {offsetof(D, shadow_bias_linear), false};
+    case K::ShadowTextureBias:
+        return {offsetof(D, shadow_texture_bias), true};
     case K::Dot3Const:
         return {offsetof(D, const_color) + u.index * sizeof(D::const_color[0]), false};
     default:
@@ -734,7 +741,6 @@ RasterizerSgxd::RasterizerSgxd(Pica::PicaCore& pica_, Memory::MemorySystem& memo
 #ifdef VITA_DIAGNOSTICS
     Usse::Encoder::probe_skip_point_reads = SgxdFlag("smpskip");
 #endif
-    Usse::SetShadowSmpProbe(GxmFlag("shadowsmp"));
 #ifdef VITA_DIAGNOSTICS
     // zflip: clip z = 2z + w, the TA's near plane the PICA's z = -w and its far plane z = 0.
     Usse::z_flip = SgxdFlag("zflip");
@@ -2388,9 +2394,11 @@ const RasterizerSgxd::Texture& RasterizerSgxd::NullTexture(u32 unit) {
     // Unit 0's type picks the sampler, a 2D or a cube; units 1 and 2 are 2D.
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
     const TextureConfig::TextureType type = regs.texturing.texture0.type;
+    // A shadow type reads it as a 2D unit (FragmentConfig).
     const bool cube = unit == 0 && type == TextureConfig::TextureCube;
     DEBUG_ASSERT_MSG(unit != 0 || cube || type == TextureConfig::Texture2D ||
-                         type == TextureConfig::Projection2D,
+                         type == TextureConfig::Projection2D || type == TextureConfig::Shadow2D ||
+                         type == TextureConfig::ShadowCube,
                      "sgxd: texture unit 0 is off, of type {}: no null texture for it is built",
                      static_cast<u32>(type));
 #ifdef VITA_DIAGNOSTICS
@@ -2428,14 +2436,19 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[
     }
 #endif
     const TextureConfig& c = real ? t.config : off;
-    const u32 mag = c.mag_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
-    const u32 min = c.min_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
-    const u32 mipf = c.mip_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
+    // A shadow texture's texel is one the program compares itself: point sampled from its first level
+    // through the unit's wrap, NORM off.
+    const bool shadow = unit == 0 && real && c.type == TextureConfig::Shadow2D;
+    DEBUG_ASSERT_MSG(!shadow || tex.format == Pica::TexturingRegs::TextureFormat::RGBA8,
+                     "sgxd: a shadow texture in format {}", static_cast<u32>(tex.format));
+    const u32 mag = !shadow && c.mag_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
+    const u32 min = !shadow && c.min_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
+    const u32 mipf = !shadow && c.mip_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
     const u32 addressing = AddressMode(c.wrap_s) << 6 | AddressMode(c.wrap_t) << 3;
     // The chain's levels: MIPMAPCLAMP the last level (15 for one), LODMIN the PICA's min_level,
     // DADJUST its bias in eighths, zero at 31.
-    const u32 clamp = tex.levels > 1 ? tex.levels - 1 : 15;
-    const u32 lod_min = std::min<u32>(c.lod.min_level, tex.levels - 1);
+    const u32 clamp = tex.levels > 1 && !shadow ? tex.levels - 1 : 15;
+    const u32 lod_min = shadow ? 0u : std::min<u32>(c.lod.min_level, tex.levels - 1);
     // A bias under DADJUST's -3.875 takes -3.875: the LOD differs only where it is above 3.875 before
     // the bias.
     const s32 dadjust = 31 + ((static_cast<s32>(c.lod.bias) + 16) >> 5);
@@ -2481,7 +2494,7 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[
     words[2] = tex.memory.gpu | lod_min >> 2;
     // Swizzle 4 on U8U8U8U8: alpha one (bit 2).
     const u32 swizzle = tex.byte_swizzle != 0 ? tex.byte_swizzle : tex.alpha_one ? 4u : 0u;
-    words[3] = 1u << 31 | swizzle << 28 | (lod_min & 3u) << 26;
+    words[3] = (shadow ? 0u : 1u << 31) | swizzle << 28 | (lod_min & 3u) << 26;
     return tex;
 }
 
@@ -3767,6 +3780,27 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfig() const {
     }
     config.texture.alpha_split.Assign(alpha_split);
     config.texture.own_pixel.Assign(draw_own_pixel);
+    // A shadow unit 0 that is off reads zeros, as the software renderer leaves its colour: the null
+    // texture, read as a plain 2D unit's.
+    using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
+    const auto unit0 = regs.texturing.GetTextures()[0];
+    if ((config.texture.texture0_type == TextureType::Shadow2D ||
+         config.texture.texture0_type == TextureType::ShadowCube) &&
+        (!unit0.enabled || unit0.config.GetPhysicalAddress() == 0)) {
+        config.texture.texture0_type.Assign(TextureType::Texture2D);
+    }
+    // A Shadow2D unit 0's size: its border test's bounds.
+    if (config.texture.texture0_type == Pica::TexturingRegs::TextureConfig::Shadow2D) {
+        const auto& t0 = regs.texturing.texture0;
+        const u32 w = t0.width, h = t0.height;
+        DEBUG_ASSERT_MSG(std::has_single_bit(w) && std::has_single_bit(h) && w >= 8 && h >= 8 &&
+                             w <= 1024 && h <= 1024,
+                         "sgxd: a {}x{} shadow texture: sides of 8 to 1024, powers of two, are "
+                         "built",
+                         w, h);
+        config.texture.shadow_width_log2.Assign(static_cast<u32>(std::countr_zero(w)) - 3);
+        config.texture.shadow_height_log2.Assign(static_cast<u32>(std::countr_zero(h)) - 3);
+    }
     return config;
 }
 
@@ -3946,14 +3980,16 @@ RasterizerSgxd::FragmentProgram RasterizerSgxd::PlaceFragmentProgram(Usse::Progr
                  Usse::SamplerSaOffset(g.uniform_floats + Usse::DataHead(g), 0) % 2 == 0);
     for (const Usse::Uniform& u : g.uniforms) {
         // Resident, or in the memory buffer (FragmentSa) at the same float index.
-        DEBUG_ASSERT(u.sa_offset + (u.u8 ? 1u : u.components) * u.array_size <=
+        DEBUG_ASSERT(u.sa_offset + (u.u8 ? 1u : u.f16 ? 2u : u.components) * u.array_size <=
                      (g.buffer_pointer ? g.buffer_floats : g.uniform_floats));
         const UniformField field = FragmentUniformField(u);
         DEBUG_ASSERT(!u.u8 || (!field.is_int && u.sa_offset + u.array_size <= g.uniform_floats));
+        DEBUG_ASSERT(!u.f16 || (!field.is_int && u.components == 4 &&
+                                u.sa_offset + 2 * u.array_size <= g.uniform_floats));
         f.uniforms.push_back(
             {u.sa_offset, static_cast<u16>(field.offset), static_cast<u8>(u.components),
              static_cast<u8>(u.array_size), 16, field.is_int,
-             u.kind == Usse::UniformKind::LightDirection, u.u8,
+             u.kind == Usse::UniformKind::LightDirection, u.u8, u.f16, u.lane,
              static_cast<u8>(u.kind == Usse::UniformKind::LightingLutRow         ? 1
                              : u.kind == Usse::UniformKind::LightingLutCoordHalf ? 2
                              : u.kind == Usse::UniformKind::LightingLutCoordWrap ? 3
@@ -5649,8 +5685,20 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // --- the target and the output merger ---
     const auto& fb = regs.framebuffer.framebuffer;
     const auto& om = regs.framebuffer.output_merger;
-    DEBUG_ASSERT_MSG(om.fragment_operation_mode == FramebufferRegs::FragmentOperationMode::Default,
-                     "GXM: {}: gas and shadow rendering are not built", describe());
+    // Shadow rendering: the fragment program updates the shadow map's word in place from o0, so every
+    // fragment runs, in order, with no blend and no depth or stencil test.
+    const bool shadow =
+        om.fragment_operation_mode == FramebufferRegs::FragmentOperationMode::Shadow;
+    // Gas rendering's density pass draws as Default; its fog
+    // stage's half writes (0, 0, 0, 0).
+    DEBUG_ASSERT_MSG(
+        om.fragment_operation_mode == FramebufferRegs::FragmentOperationMode::Default ||
+            om.fragment_operation_mode == FramebufferRegs::FragmentOperationMode::Gas || shadow,
+        "sgxd: {}: fragment operation mode {}", describe(),
+        static_cast<u32>(om.fragment_operation_mode.Value()));
+    DEBUG_ASSERT_MSG(!shadow || fb.color_format == FramebufferRegs::ColorFormat::RGBA8,
+                     "sgxd: {}: a shadow map in colour format {}", describe(),
+                     static_cast<u32>(fb.color_format.Value()));
     // A texture unit that reads the pixel's own colour reads the tile (OwnPixelUnits).
     draw_own_pixel = OwnPixelUnits(is_indexed, immediate, count);
     // The colour write mask: without a blend, the pack's byte mask; with one, the masked channels blend
@@ -5661,9 +5709,19 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                   ? 0
                   : static_cast<u8>(om.red_enable | om.green_enable << 1 | om.blue_enable << 2 |
                                     om.alpha_enable << 3);
-    const bool blend = om.alphablend_enable != 0;
+    // ONE, ZERO, ADD in colour and alpha is no blend: the pass type stays opaque, so the ISP shades only
+    // what no later opaque draw hides.
+    const auto& ab = om.alpha_blending;
+    const bool identity_blend = ab.blend_equation_rgb == BE::Add &&
+                                ab.blend_equation_a == BE::Add && ab.factor_source_rgb == BF::One &&
+                                ab.factor_dest_rgb == BF::Zero && ab.factor_source_a == BF::One &&
+                                ab.factor_dest_a == BF::Zero;
+    const bool blend = !shadow && om.alphablend_enable != 0 && !identity_blend;
     Epilogue epilogue{};
-    if (blend) {
+    if (shadow) {
+        mask = 0xf;
+        epilogue.mask = mask;
+    } else if (blend) {
         const auto& b = om.alpha_blending;
         BE eq_rgb = b.blend_equation_rgb, eq_a = b.blend_equation_a;
         BF src_rgb = b.factor_source_rgb, dst_rgb = b.factor_dest_rgb;
@@ -5764,12 +5822,26 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         }
         epilogue.mask = mask;
     }
-    // A fragment that keeps some of what is under it reads o0: the pass type is translucent,
-    // so the ISP neither removes what it covers nor runs it out of order.
-    const bool translucent = blend || mask != 0xf;
-    // As upstream: the test runs only when enabled, the write whenever enabled and allowed.
-    const u32 dcmp = om.depth_test_enable ? DepthCompare(om.depth_test_func) : 7;
-    const bool dwrite = fb.allow_depth_stencil_write != 0 && om.depth_write_enable;
+    // A fragment that keeps some of what is under it reads o0, as one reading its own pixel
+    // does: the pass type is translucent, so the ISP neither removes what it covers nor runs
+    // it out of order.
+    bool translucent = shadow || blend || mask != 0xf || draw_own_pixel != 0;
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags keepalpha_opaque (a probe, pictures may be wrong): a draw with no blend that
+    // keeps the destination's alpha (colour mask RGB) as opaque, so the ISP hides its covered
+    // fragments; exact only when no opaque draw that writes alpha lies hidden under it.
+    static const bool keepalpha_opaque = SgxdFlag("keepalpha_opaque");
+    if (keepalpha_opaque && !shadow && !blend && mask == 0x7 && draw_own_pixel == 0) {
+        translucent = false;
+    }
+#endif
+    // The test runs only when enabled, the write whenever enabled and allowed, and neither
+    // (nor the stencil) with no depth buffer (address 0).
+    const bool has_depth = fb.GetDepthBufferPhysicalAddress() != 0;
+    const u32 dcmp =
+        !shadow && has_depth && om.depth_test_enable ? DepthCompare(om.depth_test_func) : 7;
+    const bool dwrite =
+        !shadow && has_depth && fb.allow_depth_stencil_write != 0 && om.depth_write_enable;
     // FragmentConfigFor's alpha test as a blend takes a draw writing neither.
     draw_depth_stencil =
         has_depth && ((fb.allow_depth_stencil_write != 0 && om.depth_write_enable) ||
@@ -5777,8 +5849,8 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // The stencil: a D24S8 buffer's top byte, on chip as the depth is. The ISP's compare codes are the
     // depth's, and its ops are in the PICA's order.
     const auto& st = om.stencil_test;
-    const bool stencil =
-        st.enable && fb.depth_format == FramebufferRegs::DepthFormat::D24S8;
+    const bool stencil = !shadow && has_depth && st.enable &&
+                         fb.depth_format == FramebufferRegs::DepthFormat::D24S8;
     const bool uses_depth = dcmp != 7 || dwrite || stencil;
 
     const PAddr colour = fb.GetColorBufferPhysicalAddress();
@@ -6268,12 +6340,25 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
                     u32 word = 0;
                     for (u32 c = 0; c < u.components; c++) {
                         float value;
-                        std::memcpy(&value, src + c * 4, 4);
+                        std::memcpy(&value, src + (u.lane >= 0 ? u.lane : c) * 4, 4);
                         word |=
                             static_cast<u32>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f))
                             << (8 * c);
                     }
                     std::memcpy(fsa_cpu + (u.sa + e) * 4, &word, 4);
+                }
+                continue;
+            }
+            if (u.f16) {
+                // A pair an element, four F16 (Usse::Uniform::f16).
+                for (u32 e = 0; e < u.count; e++, src += u.stride) {
+                    u16 half[4];
+                    for (u32 c = 0; c < 4; c++) {
+                        float value;
+                        std::memcpy(&value, src + c * 4, 4);
+                        half[c] = ToF16(value);
+                    }
+                    std::memcpy(fsa_cpu + (u.sa + e * 2) * 4, half, sizeof(half));
                 }
                 continue;
             }

@@ -35,8 +35,6 @@ namespace GxmRenderer {
  *   latelog   the late skip's late frames: each kept draw reading a colour buffer whose draws
  *             the same frame dropped, the transfers (dropped or not) and the fills (400 lines
  *             each); latelog_at=S from S seconds of the process's time on
- *   passdump=T the same for the first 32 passes from T s, any buffer,
- *             host0:azahar-passNN-ADDR-WxH-fFORMAT.bin
  *
  *   threadtimes  with perflog, each placed thread's run time in the second and the cores its
  *             role allows (Common::RoleThreads; core 3's threads, which psp2prof cannot see).
@@ -90,9 +88,6 @@ namespace GxmRenderer {
  *   keepalpha_opaque  a probe: a draw with no blend that keeps the destination's alpha
  *             (colour mask RGB) is opaque, not translucent (pictures may be wrong: a hidden
  *             opaque draw's alpha is lost)
- *   shadowsmp  an orthographic Shadow2D unit read by the program's SMP at the iterated
- *             coordinate, not issued by the PDS; fsextratemps=N: every fragment program declares
- *             N more temporaries than it uses
  *   eagercopy  an upscaled pass's 1x copy into the guest's buffer sent at the pass's end, not
  *             held back until something may read the buffer (RasterizerGxm::DeferDownscale)
  *   eotmix=V+1... eotmixset=S...  the SCALE_AA probe: at the 300th frame, an 832x512 render

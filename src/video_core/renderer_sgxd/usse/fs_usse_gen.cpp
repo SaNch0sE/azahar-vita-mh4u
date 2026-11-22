@@ -16,12 +16,6 @@
 
 namespace GxmRenderer::Usse {
 
-bool shadow_smp_probe = false;
-
-void SetShadowSmpProbe(bool on) {
-    shadow_smp_probe = on;
-}
-
 namespace {
 
 using Pica::FramebufferRegs;
@@ -185,6 +179,15 @@ constexpr uint8_t TmpU8Specular = 201;
 constexpr uint8_t TmpU8Const = 203; ///< a SOP3 source 0's copy of a secondary attribute
 constexpr uint8_t TmpU8Arg = 204; ///< the three arguments, one register each
 constexpr uint8_t TmpU8Scratch = 207;
+// Shadows, F32 a lane each: the shadow write's tile word as bytes (the intensity, the depth's
+// low, middle and high byte) and its values (d, s, ref_d); a Shadow2D read's -z and its taps'
+// texels (TmpShadowVal holds the taps' results there).
+constexpr uint8_t TmpShadowOld = 208;
+constexpr uint8_t TmpShadowVal = 212;
+constexpr uint8_t TmpShadowZ = 220;    ///< -z in x, the four taps' weights (fract) in z and w
+constexpr uint8_t TmpShadowTap1 = 216; ///< a Shadow2D read's other three taps' texels
+constexpr uint8_t TmpShadowTap2 = 224;
+constexpr uint8_t TmpShadowTexel = 232;
 // The U8 combiners' inputs with one channel in every byte (U8Broadcast), one register each.
 constexpr uint8_t TmpU8Broadcast = 236;
 constexpr uint32_t U8BroadcastMax = 8;
@@ -277,13 +280,30 @@ enum Lit : uint8_t {
     LitNoisePad,
     LitU8White, ///< the U8 combiners' raw words: 0xffffffff, and 127 in each byte
     LitU8Half,
+    Lit65536, ///< shadows: a depth's high byte's weight and its inverse
+    LitInv65536,
+    LitDepthMax,    ///< 0xffffff, the 24-bit depth's scale
+    LitQuarter,     ///< a byte's quarter, which the U8 pack keeps whether it rounds or truncates
+    LitShadowWidth, ///< a Shadow2D unit 0's size (FSConfig shadow_width_log2): its border test
+    LitShadowHeight,
     LitHalf,        ///< 0.5: a signed filtered LUT read's x per input
     LitLutWrapLast, ///< 127.5 / 256: its last positive x, entry 127's centre
     LitMinNormal,   ///< 2^-126, the smallest normal float: the bump renormalisation's floor
     LitMinNormalPad,
+    LitShadowInvWidth, ///< 1 / LitShadowWidth and 1 / LitShadowHeight: a texel's step, a pair
+    LitShadowInvHeight,
+    LitShadowNegInvWidth, ///< -1 / LitShadowWidth and -1 / LitShadowHeight, a pair
+    LitShadowNegInvHeight,
+    LitNegHalf, ///< -0.5: a Shadow2D read's texel-space offset
+    LitNegHalfPad,
     LiteralCount, // even, so the sampler words stay pair-aligned
 };
 static_assert(LiteralCount % 2 == 0);
+
+/// A Shadow2D unit 0's side from FSConfig's log2 less 3.
+constexpr u32 ShadowSize(u32 log2_less_3) {
+    return 8u << log2_less_3;
+}
 
 /// Whether a light's vector comes normalised in its uniform (UniformKind::LightDirection): a
 /// directional light's, unless its distance attenuation reads the position's length.
@@ -494,12 +514,23 @@ private:
     /// already; with `wait` waited for too, else a LUT fetch's WDF that follows covers them
     /// (no internal register may hold a value across either). Nothing for a resident light.
     void LightQuads(uint32_t mask, bool wait);
+    /// Unit 0's Shadow2D read into its texel (every lane): four taps around the coordinate
+    /// compared with its depth and filtered.
+    void ShadowTexture(Reg coord, uint32_t sampler_index);
+    /// Shadow rendering: the tile's word in o0 updated by the fragment's depth and the
+    /// combiner output's green, into pa0 as U8. `u8` the U8
+    /// combiners' result, or null for the F32 one in TmpOutput.
+    void ShadowWrite(const Reg* u8);
     /// A uniform's place: `components` floats (or array_size float4s) at a pair-aligned
     /// offset.
     uint32_t AllocateUniform(UniformKind kind, uint8_t components, uint32_t array_size,
                              uint8_t index = 0);
     /// A U8 uniform's place (Uniform::u8): a word an element, anywhere.
     uint32_t AllocateUniformU8(UniformKind kind, uint8_t components, uint32_t array_size);
+    /// An F16 float4 uniform's place (Uniform::f16): a pair an element, pair-aligned.
+    uint32_t AllocateUniformF16(UniformKind kind, uint32_t array_size);
+    /// A U8 word of element `index`'s component `lane` in every byte (Uniform::lane).
+    uint32_t AllocateUniformU8Lane(UniformKind kind, uint8_t index, uint8_t lane);
     /// A SOP3's source 0, which is a temporary or a primary attribute: a secondary attribute
     /// copied into TmpU8Const first.
     Reg U8Src0(Reg r);
@@ -512,13 +543,16 @@ private:
     bool u8_tev = false;             ///< the U8 combiners (U8TevSupported)
     int colour_u8_pa = -1;           ///< sgxd_flags u8colour: the colour's bytes' register
     /// The U8 combiners read a unit's texel as four F16, packed to U8 from there: not a unit
-    /// that clamps to its border colour, whose split alpha is a dependent read, or that the
-    /// lighting reads as its shadow or bump map (that code moves or reads F32 lanes).
+    /// whose split alpha is a dependent read or that clamps to its border colour (U8Inputs
+    /// would merge that alpha into the border's), or that the lighting reads as its shadow or
+    /// bump map (that code moves or reads F32 lanes).
     bool TexelF16(u32 unit) const {
         const auto& tex = config.texture;
         const auto& border = tex.texture_border_color[unit];
         const auto& lighting = config.lighting;
-        return u8_tev && !border.enable_s && !border.enable_t &&
+        const bool split = tex.alpha_split >> unit & 1;
+        return u8_tev && !((border.enable_s || border.enable_t) && split) &&
+               !(unit == 0 && tex.texture0_type == TextureType::Shadow2D) &&
                (!(tex.alpha_split >> unit & 1) || unit_issued[unit]) &&
                !(uses_shadow && lighting.shadow_selector == unit) &&
                !(uses_lighting && lighting.bump_mode != LightingRegs::LightingBumpMode::None &&
@@ -580,6 +614,9 @@ private:
     uint32_t uniform_floats = 0;
     uint32_t sa_alpha_ref = 0;
     uint32_t sa_const_color = 0;
+    /// The U8 combiners' constant with a moved channel, per stage and lane: its broadcast's SA
+    /// (AllocateUniformU8Lane), ~0u where none reads it.
+    std::array<std::array<uint32_t, 3>, 6> sa_const_lane{};
     std::array<uint32_t, 6> sa_dot3_const{}; ///< a stage's Dot3Const
     uint32_t sa_buffer_color = 0;
     uint32_t sa_scissor = 0;
@@ -589,7 +626,8 @@ private:
     /// per lighting LUT: its (offset or bound, row) pair's SA, or UINT32_MAX (PlanUniforms)
     std::array<uint32_t, 24> sa_lut_coord{};
     uint32_t sa_global_ambient = 0;
-    uint32_t sa_border = 0;               ///< tex_border_color float4[3]
+    uint32_t sa_border = 0;               ///< tex_border_color float4[3]: F32 texels
+    uint32_t sa_border16 = 0;             ///< tex_border_color half4[3]: F16 texels
     uint32_t data_head = 0;               ///< 1 when the data block starts with the pointer
     uint32_t memory_floats = 0;           ///< floats in the memory part of the uniform buffer
     struct MemoryUniform {
@@ -609,6 +647,18 @@ private:
     bool light_mem_pending = false;
     bool uses_depth = false;              ///< W-buffering: the fragment writes its depth
     bool uses_shadow = false;             ///< lighting reads the shadow texture
+    bool shadow_write = false;            ///< shadow rendering: ShadowWrite updates o0's word
+    bool shadow_wbuffer = false;          ///< its depth is z / w (W-buffering)
+    bool shadow_texture = false;          ///< unit 0 is a Shadow2D read (ShadowTexture)
+    /// The lighting's shadow is unit 0's Shadow2D texel, one value in every lane: kept as
+    /// TmpShadow.x alone, a scalar the lights multiply by.
+    bool shadow_scalar = false;
+    /// shadow_scalar with nothing else reading unit 0 (no stage, no bump map): ShadowTexture
+    /// writes the scalar itself, and unit 0 has no texel.
+    bool shadow_direct = false;
+    uint32_t sa_shadow_constant = 0;      ///< shadow_bias_constant, shadow_bias_linear
+    uint32_t sa_shadow_linear = 0;
+    uint32_t sa_shadow_tex_bias = 0;      ///< shadow_texture_bias
     bool uses_border = false;             ///< a unit clamps to its border colour
     bool uses_proctex = false;
     bool proctex_rgb_read = false;   ///< a stage reads Texture3's red, green or blue
@@ -637,11 +687,11 @@ const char* FragmentEmitter::Unsupported() const {
     const auto& fb = config.framebuffer;
     const auto& tex = config.texture;
     const auto& lighting = config.lighting;
-    if (tex.fog_mode == TexturingRegs::FogMode::Gas) {
-        return "gas";
+    if (fb.shadow_rendering && tex.fog_mode == TexturingRegs::FogMode::Gas) {
+        return "shadow rendering with gas";
     }
-    if (fb.shadow_rendering) {
-        return "shadow rendering";
+    if (fb.shadow_rendering && tex.fog_mode == TexturingRegs::FogMode::Fog) {
+        return "shadow rendering with fog";
     }
     if ((tex.alpha_split & 1) && tex.texture0_type == TextureType::TextureCube) {
         return "a split alpha texture on a cube";
@@ -655,12 +705,9 @@ const char* FragmentEmitter::Unsupported() const {
     if (rgb.RequiresMinMaxEmulation() || alpha.RequiresMinMaxEmulation()) {
         return "min/max blend";
     }
-    // Shadow textures: the rasterizer binds a white texture for them (P5), so a program
-    // sampling them would not be the fix.
     const auto t0 = tex.texture0_type.Value();
-    if (t0 != TextureType::Disabled && t0 != TextureType::Texture2D &&
-        t0 != TextureType::Projection2D && t0 != TextureType::TextureCube) {
-        return "texture unit 0 type";
+    if (t0 == TextureType::Shadow2D && (tex.alpha_split & 1)) {
+        return "a split alpha shadow texture";
     }
     if (t0 == TextureType::TextureCube &&
         (tex.texture_border_color[0].enable_s || tex.texture_border_color[0].enable_t)) {
@@ -782,8 +829,12 @@ void FragmentEmitter::PlanInputs() {
     uses_scissor = config.framebuffer.scissor_test_mode.Value() !=
                    Pica::RasterizerRegs::ScissorMode::Disabled;
     uses_fog = tex.fog_mode == TexturingRegs::FogMode::Fog;
-    uses_depth = config.framebuffer.depthmap_enable ==
-                 Pica::RasterizerRegs::DepthBuffering::WBuffering;
+    // Shadow rendering writes no depth: its own depth is in the word it writes (ShadowWrite).
+    shadow_write = config.framebuffer.shadow_rendering != 0;
+    shadow_wbuffer = shadow_write && config.framebuffer.depthmap_enable ==
+                                         Pica::RasterizerRegs::DepthBuffering::WBuffering;
+    uses_depth = !shadow_write && config.framebuffer.depthmap_enable ==
+                                      Pica::RasterizerRegs::DepthBuffering::WBuffering;
     if (uses_lighting && lighting.enable_shadow) {
         const u32 unit = lighting.shadow_selector;
         if (unit < 3 && (unit != 0 || tex.texture0_type != TextureType::Disabled)) {
@@ -807,6 +858,7 @@ void FragmentEmitter::PlanInputs() {
         unit_own[unit] = true;
         unit_used[unit] = false;
     }
+    shadow_texture = unit_used[0] && tex.texture0_type == TextureType::Shadow2D;
     shadow_scalar = uses_shadow && shadow_texture && lighting.shadow_selector == 0;
     shadow_direct = shadow_scalar && !StageReads(Source::Texture0) &&
                     !(lighting.bump_mode != LightingRegs::LightingBumpMode::None &&
@@ -852,7 +904,7 @@ void FragmentEmitter::PlanInputs() {
     // float3 (which need not be followed by anything pair-aligned).
     program.inputs.push_back({FragmentInput::Color0, 4});
     uint8_t pa = 4;
-    if (uses_scissor || (uses_fog && !fog_issued) || uses_depth) {
+    if (uses_scissor || (uses_fog && !fog_issued) || uses_depth || shadow_write) {
         program.inputs.push_back({FragmentInput::Position, 4});
         position_pa = pa;
         pa += 4;
@@ -863,12 +915,10 @@ void FragmentEmitter::PlanInputs() {
         normquat_pa = pa;
         pa += 2;
     }
-    // A plain 2D read at an untouched coordinate is the PDS's to issue before the program
-    // starts (a non-dependent read): no SMP, no wait, no thread waiting on the texture unit
-    // (Sony's USSE Performance tutorial, "Dependent vs. Non-dependent Texture Reads"). The
-    // vertex program writes TEXCOORD0..2 as (s, 1 - t), the rows the host copies keep, so the
-    // coordinate needs no arithmetic here, and the program iterates it only for the border test
-    // or a split unit's alpha read.
+    // A plain 2D read at an untouched coordinate is the PDS's to issue before the program starts
+    // (a non-dependent read: no SMP, no wait). The vertex program writes TEXCOORD0..2 as
+    // (s, 1 - t), so the coordinate needs no arithmetic, and is iterated only for the border test
+    // or a split unit's alpha read. A shadow texture's taps are the program's own (ShadowTexture).
     const u32 unit_coord[3] = {0, 1, tex.texture2_use_coord1 ? 1u : 2u};
     for (u32 unit = 0; unit < 3; unit++) {
         unit_issued[unit] =
@@ -935,7 +985,8 @@ void FragmentEmitter::PlanInputs() {
         pa += 2;
     }
     if (unit_used[0] && (tex.texture0_type == TextureType::Projection2D ||
-                         tex.texture0_type == TextureType::TextureCube)) {
+                         tex.texture0_type == TextureType::TextureCube ||
+                         tex.texture0_type == TextureType::Shadow2D)) {
         // texcoord0's w, TEXCOORD3's second lane (its first is the fog table's coordinate).
         program.inputs.push_back({FragmentInput::TexCoord3, 2});
         texcoord0_w_pa = static_cast<uint8_t>(pa + 1);
@@ -1025,12 +1076,36 @@ uint32_t FragmentEmitter::AllocateUniformU8(UniformKind kind, uint8_t components
     return at;
 }
 
+uint32_t FragmentEmitter::AllocateUniformU8Lane(UniformKind kind, uint8_t index, uint8_t lane) {
+    const uint32_t at = uniform_floats;
+    program.uniforms.push_back({kind, index, at, 4, 1, true, false, static_cast<int8_t>(lane)});
+    uniform_floats++;
+    return at;
+}
+
+uint32_t FragmentEmitter::AllocateUniformF16(UniformKind kind, uint32_t array_size) {
+    if (uniform_floats & 1) {
+        uniform_floats++;
+    }
+    const uint32_t at = uniform_floats;
+    program.uniforms.push_back({kind, 0, at, 4, array_size, false, true});
+    uniform_floats += array_size * 2;
+    return at;
+}
+
 void FragmentEmitter::PlanUniforms() {
     const auto& tex = config.texture;
     const auto& lighting = config.lighting;
     if (config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always &&
         config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Never) {
         sa_alpha_ref = AllocateUniform(UniformKind::AlphaTestRef, 1, 1);
+    }
+    if (shadow_write) {
+        sa_shadow_constant = AllocateUniform(UniformKind::ShadowBiasConstant, 1, 1);
+        sa_shadow_linear = AllocateUniform(UniformKind::ShadowBiasLinear, 1, 1);
+    }
+    if (shadow_texture) {
+        sa_shadow_tex_bias = AllocateUniform(UniformKind::ShadowTextureBias, 1, 1);
     }
     // The constant colours as a prefix up to the last stage that reads one (the rasterizer
     // copies the uniform's array_size of them).
@@ -1056,6 +1131,25 @@ void FragmentEmitter::PlanUniforms() {
     if (const_stages != 0) {
         sa_const_color = u8_tev ? AllocateUniformU8(UniformKind::ConstColor, 4, const_stages)
                                 : AllocateUniform(UniformKind::ConstColor, 4, const_stages);
+    }
+    // A constant's moved channel (const.rrr, an alpha from const.g) as a word of its own with that
+    // byte in every byte, made by the host: no unpack and pack a use.
+    for (auto& lanes : sa_const_lane) {
+        lanes.fill(~0u);
+    }
+    if (u8_tev && const_stages != 0) {
+        ForEachU8Arg([&](u32 k, Source csrc, ColorModifier cmod, Source asrc,
+                         AlphaModifier amod) {
+            const auto add = [&](Source src, int lane) {
+                if (src == Source::Constant && lane >= 0 && sa_const_lane[k][lane] == ~0u) {
+                    sa_const_lane[k][lane] = AllocateUniformU8Lane(
+                        UniformKind::ConstColor, static_cast<uint8_t>(k),
+                        static_cast<uint8_t>(lane));
+                }
+            };
+            add(csrc, MovedLane(cmod));
+            add(asrc, MovedLane(amod));
+        });
     }
     if (u8_tev) {
         for (u32 i = 0; i < tex.tev_stages.size(); i++) {
@@ -1086,7 +1180,20 @@ void FragmentEmitter::PlanUniforms() {
                               : AllocateUniform(UniformKind::FogColor, 3, 1);
     }
     if (uses_border) {
-        sa_border = AllocateUniform(UniformKind::TexBorderColor, 4, 3);
+        // In the form of the texels it replaces (SampleTextures).
+        bool f32 = false, f16 = false;
+        for (u32 unit = 0; unit < 3; unit++) {
+            const auto& border = tex.texture_border_color[unit];
+            if (unit_used[unit] && (border.enable_s || border.enable_t)) {
+                (TexelF16(unit) ? f16 : f32) = true;
+            }
+        }
+        if (f32) {
+            sa_border = AllocateUniform(UniformKind::TexBorderColor, 4, 3);
+        }
+        if (f16) {
+            sa_border16 = AllocateUniformF16(UniformKind::TexBorderColor, 3);
+        }
     }
     if (uses_proctex && !proctex_tabled) {
         sa_proctex = AllocateUniform(UniformKind::ProctexLutOffset, 1, 1);
@@ -1286,6 +1393,286 @@ void FragmentEmitter::LightQuads(uint32_t mask, bool wait) {
         e.WdfVertex(0);
         light_mem_pending = false;
     }
+}
+
+void FragmentEmitter::ShadowTexture(Reg coord, uint32_t sampler_index) {
+    // Four taps, each compared on its own and blended bilinearly (PCF). A texel gives its density
+    // (red) where its depth (alpha, blue, green: high to low byte) is at or past
+    // z = trunc(min(|w|, 1) * 0xffffff) - bias, else 0. Each tap is a point read; a border side is
+    // tested here.
+    const auto& tex = config.texture;
+    const Reg w_pair = Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u));
+    const Swizzle w_swz = (texcoord0_w_pa & 1) ? YYYY : XXXX;
+    constexpr Swizzle XYXY{Ch::X, Ch::Y, Ch::X, Ch::Y};
+    // The coordinate as the host copy reads it, (s, 1 - t); divided by w unless orthographic,
+    // as a Projection2D unit's: back to t, divided, flipped again.
+    Reg uv = coord;
+    if (!tex.shadow_texture_orthographic) {
+        const Reg proj = Reg::V(TmpProj);
+        e.Vec(VecOp::Add, {proj, 0x1}, {coord, XYZW}, ConstZero, Pred::None, true);
+        e.Vec(VecOp::Add, {proj, 0x2}, {coord, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
+        e.Comp(CompOp::Rcp, {I0, 0x1}, {w_pair}, static_cast<uint8_t>(texcoord0_w_pa & 1),
+               Pred::None, true);
+        e.Vec(VecOp::Mul, {proj, 0x3}, {proj, XYZW}, {I0, XXXX}, Pred::None, true);
+        const Reg flipped = Reg::V(TmpTexFlip);
+        e.Vec(VecOp::Add, {flipped, 0x3}, {proj, XYZW}, ConstZero, Pred::None, true);
+        e.Vec(VecOp::Add, {flipped, 0x2}, {proj, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
+        uv = flipped;
+    }
+    const Reg weights = Reg::V(TmpShadowZ);
+    // c = uv * size - 0.5 in texels; f = fract(c), the weights, in TmpShadowZ's z and w;
+    // the first tap at the centre of floor(c), (floor(c) + 0.5) / size = uv - f / size, the
+    // others a texel right, down and both. The size is a power of two: every product here is
+    // exact, and uv - f / size is the centre itself, which a float holds.
+    const Src size{Reg::Sa(static_cast<uint8_t>(LitSa(LitShadowWidth) & ~1u)), XYZW};
+    const Src inv_size{Reg::Sa(static_cast<uint8_t>(LitSa(LitShadowInvWidth) & ~1u)), XYXY};
+    const Src neg_inv_size{Reg::Sa(static_cast<uint8_t>(LitSa(LitShadowNegInvWidth))), XYZW};
+    const Reg texels = Reg::V(TmpShadowTexel); // c, until the reads land there
+    const Reg fract = Reg::V(TmpShadowZ + 2);
+    e.Mad2({texels, 0x3}, {uv, XYZW}, size, Lit(LitNegHalf));
+    e.Vec(VecOp::Frc, {fract, 0x3}, {texels, XYZW}, {texels, XYZW}, Pred::None, true);
+    // The taps two at a time, each pair waited for and compared before the next (four in flight
+    // raise the register peak). (0, 0)'s coordinate in TmpProj, kept for the others; (1, 0) and
+    // then (0, 1) in TmpTexFlip, (1, 1) in TmpProj's other pair, each made after the read before
+    // it in that register has been waited for.
+    const Reg tap0 = Reg::V(TmpProj), tap_k = Reg::V(TmpTexFlip), tap_m = Reg::V(TmpProj + 2);
+    const Reg tap_coord[4] = {tap0, tap_k, tap_k, tap_m};
+    e.Mad2({tap0, 0x3}, {fract, XYZW}, neg_inv_size, {uv, XYZW});
+    e.Vec(VecOp::Add, {taps_b, 0xf}, {I0, XYXY}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {taps_b, 0x1}, {taps_b, XYZW}, {inv_size.reg, XXXX}, Pred::None, true);
+    e.Vec(VecOp::Add, {taps_b, 0x8}, {taps_b, XYZW}, {inv_size.reg, YYYY}, Pred::None, true);
+    // Each tap's texel as four F16 lanes in two words (FCONV F16): with NORM off (TextureWords)
+    // its bytes come back as whole numbers, which F16 holds exactly. A pair for each of the two.
+    const Reg texel_of[4] = {Reg::V(TmpShadowTexel), Reg::V(TmpShadowTexel + 2),
+                             Reg::V(TmpShadowTexel), Reg::V(TmpShadowTexel + 2)};
+    // Each tap's result in TmpShadowVal: x the (0, 0) tap, y (0, 1), z (1, 0), w (1, 1), so
+    // that one pass along x blends both rows. A result is the tap's density where its depth
+    // ref = G + 256 B + 65536 A is at or past z, else 0, in bytes: to 0..1 once, after the
+    // blend. The test takes -z (weights.x) less -ref (the dot product with the negated byte
+    // weights; whole numbers below 2^24, exact): a test's second source is not negated.
+    const Reg results = Reg::V(TmpShadowVal);
+    const uint8_t result_lane[4] = {0x1, 0x4, 0x2, 0x8};
+    const auto& border = tex.texture_border_color[0];
+    const bool bordered = border.enable_s || border.enable_t;
+    // z itself (a test's second source is not negated); the weights (R, G, B, A) = (0, 1, 256,
+    // 65536); every result 0.
+    const Reg z = Reg::V(TmpShadowTap3);
+    e.Vec(VecOp::Add, {z, 0x1}, {weights, XXXX, Mod::Neg}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I2, 0x1}, ConstZero, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I2, 0x2}, ConstOne, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I2, 0x4}, Lit(Lit256), ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I2, 0x8}, Lit(Lit65536), ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {results, 0xf}, ConstZero, ConstZero, Pred::None, true);
+    // A border tap's result depends on z alone: the border colour's, once, in border_result.x.
+    const Reg border_result = Reg::V(TmpShadowTap2);
+    if (bordered) {
+        LoadVec4(I1, {Bank::SecAttr, static_cast<uint8_t>(sa_border)});
+        // Its bytes: floor(c * 255 + 0.5), from -floor.
+        e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, Lit(LitTwoFiftyFive), Pred::None, true);
+        e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW}, ConstHalf, Pred::None, true);
+        e.Vec(VecOp::Frc, {I1, 0xf}, ConstZero, {I1, XYZW}, Pred::None, true);
+        e.Vec(VecOp::Add, {I1, 0xf}, {I1, XYZW, Mod::Neg}, ConstZero, Pred::None, true);
+        e.Dot({I0, 0x1}, {I1, XYZW}, {I2, XYZW}, true, Pred::None, true);
+        e.Vec(VecOp::Add, {border_result, 0x1}, ConstZero, ConstZero, Pred::None, true);
+        e.Test(Cond::Ge, 2, {I0}, 0, {z, XXXX}, true);
+        e.Vec(VecOp::Add, {border_result, 0x1}, {I1, XXXX}, ConstZero, Pred::P2, true);
+    }
+    for (int r = 0; r < 2; r++) {
+        if (r == 0) {
+            e.Vec(VecOp::Add, {tap_k, 0x3}, {inv_size.reg, X0}, {tap0, XYZW}, Pred::None, true);
+        } else {
+            e.Vec(VecOp::Add, {tap_k, 0x3}, {inv_size.reg, Y0}, {tap0, XYZW}, Pred::None, true);
+            e.Vec(VecOp::Add, {tap_m, 0x3}, inv_size, {tap0, XYZW}, Pred::None, true);
+        }
+        e.Sample2DPoint(texel_of[2 * r], tap_coord[2 * r], SamplerSa(sampler_index), 0, 2, 2);
+        e.Sample2DPoint(texel_of[2 * r + 1], tap_coord[2 * r + 1], SamplerSa(sampler_index), 0, 2,
+                        2);
+        if (r == 0) {
+            // While the first reads are in flight: -z = bias - trunc(min(|w|, 1) * 0xffffff), every
+            // result 0, and a border tap's result (it depends on z alone) from the border colour's
+            // (-depth, density), made by the rasterizer once a draw (ShadowBorderDepth).
+            e.Vec(VecOp::Min, {I0, 0x1}, {w_pair, w_swz, Mod::Abs}, ConstOne, Pred::None, true);
+            e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, Lit(LitDepthMax), Pred::None, true);
+            e.Vec(VecOp::Frc, {I0, 0x1}, ConstZero, {I0, XXXX}, Pred::None, true); // -floor
+            e.Vec(VecOp::Add, {weights, 0x1}, {I0, XXXX}, SaScalar(sa_shadow_tex_bias),
+                  Pred::None, true);
+            e.Vec(VecOp::Add, {results, 0xf}, ConstZero, ConstZero, Pred::None, true);
+            if (bordered) {
+                const Reg border_depth = Reg::Sa(static_cast<uint8_t>(sa_shadow_border));
+                e.Vec(VecOp::Add, {border_result, 0x1}, ConstZero, ConstZero, Pred::None, true);
+                e.Test(Cond::Ge, 2, {weights}, 0, {border_depth, XXXX}, true);
+                e.Vec(VecOp::Add, {border_result, 0x1}, {border_depth, YYYY}, ConstZero,
+                      Pred::P2, true);
+            }
+        }
+        e.Wdf(0);
+        for (int k = 2 * r; k < 2 * r + 2; k++) {
+        // A border side (ClampToBorder) reads the border colour past the texture: a tap whose
+        // point is outside [0, 1] on that axis. A tap's centre is never 0 or 1 ((i + 0.5) /
+        // size), so it is inside where (c - 1) c < 0: c - 1 for both axes, the test unit's
+        // product with c an axis, folded by AND into p1, and the border's result taken where
+        // not.
+        if (bordered) {
+            e.Vec(VecOp::Add, {I0, 0x3}, {ConstOne.reg, XXXX, Mod::Neg}, {tap_coord[k], XYZW},
+                  Pred::None, true);
+            bool tested = false;
+            for (uint8_t chan = 0; chan < 2; chan++) {
+                if (chan == 0 ? border.enable_s : border.enable_t) {
+                    e.Test(Cond::Lt, 1, {I0}, chan, {tap_coord[k], XYZW}, false,
+                           tested ? Pred::P1 : Pred::None, TestAlu::Mul);
+                    tested = true;
+                }
+            }
+        }
+        e.UnpackF16x4({I1, 0xf}, texel_of[k]);
+        e.Dot({I0, 0x1}, {I1, XYZW}, {I2, XYZW}, true, Pred::None, true);
+        e.Test(Cond::Ge, 2, {weights}, 0, {I0, XXXX}, true);
+        e.Vec(VecOp::Add, {results, result_lane[k]}, {I1, XXXX}, ConstZero, Pred::P2, true);
+        if (bordered) {
+            e.Vec(VecOp::Add, {results, result_lane[k]}, {border_result, XXXX}, ConstZero,
+                  Pred::NotP1, true);
+        }
+    }
+    // A border side (ClampToBorder) reads the border colour past the texture: a tap whose point
+    // is outside [0, 1] on that axis takes the border's result. The taps lie on two columns and
+    // two rows, so the four of them are tested at once: m = clamp(min(c, 1 - c) * 65536, 0, 1)
+    // is 1 for a centre inside and 0 outside (a centre is at least half a texel, 1 / 2048, from
+    // 0 and 1), over (x0, x1, y0, y1); a tap is inside where its column and its row are, and its
+    // result is the border's where it is not, exact on whole numbers.
+    if (bordered) {
+        // In the internal registers: a four-wide second source of the unified store reads one
+        // pair.
+        constexpr Swizzle XXYY{Ch::X, Ch::X, Ch::Y, Ch::Y};
+        constexpr Swizzle Step{Ch::Zero, Ch::X, Ch::Zero, Ch::Y};
+        e.Vec(VecOp::Add, {I1, 0xf}, {inv_size.reg, Step}, {tap0, XXYY}, Pred::None, true);
+        e.Vec(VecOp::Add, {I0, 0xf}, {I1, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
+        e.Vec(VecOp::Min, {I0, 0xf}, {I1, XYZW}, {I0, XYZW}, Pred::None, true);
+        e.Vec(VecOp::Mul, {I0, 0xf}, {I0, XYZW}, Lit(Lit65536), Pred::None, true);
+        e.Vec(VecOp::Max, {I0, 0xf}, {I0, XYZW}, ConstZero, Pred::None, true);
+        e.Vec(VecOp::Min, {I0, 0xf}, {I0, XYZW}, ConstOne, Pred::None, true);
+        // The results' lanes: (0, 0), (0, 1), (1, 0), (1, 1), the column first.
+        Src inside{I0, XXYY};
+        if (border.enable_s && border.enable_t) {
+            e.Vec(VecOp::Mul, {I2, 0xf}, {I0, XXYY}, {I0, ZWZW}, Pred::None, true);
+            inside = {I2, XYZW};
+        } else if (border.enable_t) {
+            inside = {I0, ZWZW};
+        }
+        // border - (border - result) * inside.
+        e.Vec(VecOp::Add, {I1, 0xf}, {results, XYZW, Mod::Neg}, {border_result, XXXX}, Pred::None,
+              true);
+        e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, inside, Pred::None, true);
+        e.Vec(VecOp::Add, {results, 0xf}, {I1, XYZW, Mod::Neg}, {border_result, XXXX}, Pred::None,
+              true);
+    }
+    // Along x: (row 0, row 1) = (x, y) + ((z, w) - (x, y)) * f.x; then along y; each lerp's
+    // product and sum one two-wide multiply-add over the stored pairs (TmpShadowTap1's, the
+    // taps' texels read by then). Then to 0..1, into where it is read.
+    const Reg vals = Reg::V(TmpShadowVal), vals_hi = Reg::V(TmpShadowVal + 2);
+    const Reg rows = Reg::V(TmpShadowTap1), lerp = Reg::V(TmpShadowTap1 + 2);
+    e.Vec(VecOp::Add, {rows, 0x3}, {vals, XYZW, Mod::Neg}, {vals_hi, XYZW}, Pred::None, true);
+    e.Mad2({rows, 0x3}, {rows, XYZW}, {fract, XXXX}, {vals, XYZW});
+    e.Vec(VecOp::Add, {lerp, 0x1}, {rows, XXXX, Mod::Neg}, {rows, YYYY}, Pred::None, true);
+    e.Mad2({lerp, 0x1}, {lerp, XXXX}, {fract, YYYY}, {rows, XXXX});
+    const Src value{lerp, XXXX};
+    if (shadow_direct) {
+        // The lighting's scalar alone (shadow_scalar), or 1 - it: no stage reads the texel.
+        const Reg shadow = Reg::V(TmpShadow);
+        if (config.lighting.shadow_invert) {
+            e.Vec(VecOp::Mul, {I2, 0x1}, value, Lit(LitInv255), Pred::None, true);
+            e.Vec(VecOp::Add, {shadow, 0x1}, {I2, XXXX, Mod::Neg}, ConstOne, Pred::None, true);
+        } else {
+            e.Vec(VecOp::Mul, {shadow, 0x1}, value, Lit(LitInv255), Pred::None, true);
+        }
+        return;
+    }
+    // The texel, the value in every lane: the same product into both pairs.
+    e.Vec(VecOp::Mul, {Reg::V(TmpTex0), 0x3}, value, Lit(LitInv255), Pred::None, true);
+    e.Vec(VecOp::Mul, {Reg::V(TmpTex0 + 2), 0x3}, value, Lit(LitInv255), Pred::None, true);
+    texel_loc[0] = {Bank::Virtual, TmpTex0, false};
+}
+
+void FragmentEmitter::ShadowWrite(const Reg* u8) {
+    // UpdateShadow on the tile's word, (depth << 8) | intensity as the PBE keeps the
+    // PICA's RGBA8 (R the low byte: the intensity, then the depth's low, middle and high byte):
+    // a fragment nearer than the depth there moves it when its intensity (the combiner output's
+    // green) is zero, else lowers the intensity to s / (constant + linear * d / ref_d). In F32
+    // on whole numbers, which the 24-bit depths are exactly.
+    for (uint8_t b = 0; b < 4; b++) {
+        e.UnpackInt(Reg::V(static_cast<uint8_t>(TmpShadowOld + b)), Reg::O(0), b, 0);
+    }
+    const Reg old_lo = Reg::V(TmpShadowOld);     // (ref_s, lo)
+    const Reg old_hi = Reg::V(TmpShadowOld + 2); // (mid, hi)
+    const Reg val = Reg::V(TmpShadowVal);        // (d, s)
+    const Reg ref = Reg::V(TmpShadowVal + 2);    // (ref_d, -)
+    if (u8) {
+        e.UnpackInt(Reg::V(TmpShadowVal + 1), *u8, 1, 0);
+    } else {
+        e.Vec(VecOp::Mul, {I0, 0x1}, {Reg::V(TmpOutput), YYYY}, Lit(LitTwoFiftyFive), Pred::None,
+              true);
+        e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX}, ConstHalf, Pred::None, true);
+        e.Vec(VecOp::Frc, {I0, 0x1}, ConstZero, {I0, XXXX}, Pred::None, true);
+        e.Vec(VecOp::Add, {val, 0x2}, {I0, XXXX, Mod::Neg}, ConstZero, Pred::None, true);
+    }
+    // d = floor(clamp(depth, 0, 1) * 0xffffff): WPOS z, z / w with W-buffering.
+    const Reg zw = Reg::Pa(static_cast<uint8_t>(position_pa + 2));
+    if (shadow_wbuffer) {
+        e.Comp(CompOp::Rcp, {I0, 0x1}, {zw}, 1, Pred::None, true);
+        e.Vec(VecOp::Mul, {I0, 0x1}, {zw, XXXX}, {I0, XXXX}, Pred::None, true);
+    } else {
+        e.Vec(VecOp::Add, {I0, 0x1}, {zw, XXXX}, ConstZero, Pred::None, true);
+    }
+    Clamp01(I0, 0x1);
+    e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, Lit(LitDepthMax), Pred::None, true);
+    e.Vec(VecOp::Frc, {I0, 0x1}, ConstZero, {I0, XXXX}, Pred::None, true);
+    e.Vec(VecOp::Add, {val, 0x1}, {I0, XXXX, Mod::Neg}, ConstZero, Pred::None, true);
+    // ref_d = 65536 hi + 256 mid + lo.
+    e.Vec(VecOp::Mul, {I0, 0x1}, {old_hi, YYYY}, Lit(Lit65536), Pred::None, true);
+    e.Vec(VecOp::Mul, {I1, 0x1}, {old_hi, XXXX}, Lit(Lit256), Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX}, {I1, XXXX}, Pred::None, true);
+    e.Vec(VecOp::Add, {ref, 0x1}, {I0, XXXX}, {old_lo, YYYY}, Pred::None, true);
+    // s' = min(clamp(floor(s / (constant + linear * d / ref_d)), 0, 255), ref_s).
+    e.Comp(CompOp::Rcp, {I0, 0x1}, {ref}, 0, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, {val, XXXX}, Pred::None, true);
+    e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, SaScalar(sa_shadow_linear), Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x1}, {I0, XXXX}, SaScalar(sa_shadow_constant), Pred::None, true);
+    e.Comp(CompOp::Rcp, {I1, 0x1}, {I0}, 0, Pred::None, true);
+    e.Vec(VecOp::Mul, {I1, 0x1}, {I1, XXXX}, {val, YYYY}, Pred::None, true);
+    e.Vec(VecOp::Frc, {I1, 0x1}, ConstZero, {I1, XXXX}, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x1}, {I1, XXXX, Mod::Neg}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Max, {I1, 0x1}, {I1, XXXX}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Min, {I1, 0x1}, {I1, XXXX}, Lit(LitTwoFiftyFive), Pred::None, true);
+    e.Vec(VecOp::Min, {I1, 0x1}, {I1, XXXX}, {old_lo, XXXX}, Pred::None, true);
+    // P1: nearer (d < ref_d); P2: no intensity (s == 0).
+    e.Test(Cond::Lt, 1, {val}, 0, {ref, XXXX}, false);
+    e.Test(Cond::Eq, 2, {val}, 1, ConstZero, true);
+    // The intensity: ref_s, or s' for a nearer fragment with one.
+    e.Vec(VecOp::Add, {I1, 0x1}, {old_lo, XXXX}, ConstZero, Pred::P2, true);
+    e.Vec(VecOp::Add, {I2, 0x1}, {old_lo, XXXX}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I2, 0x1}, {I1, XXXX}, ConstZero, Pred::P1, true);
+    // The depth: ref_d, or d for a nearer fragment without one.
+    e.Vec(VecOp::Add, {I1, 0x2}, {ref, XXXX}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x2}, {val, XXXX}, ConstZero, Pred::P2, true);
+    e.Vec(VecOp::Add, {I2, 0x2}, {ref, XXXX}, ConstZero, Pred::None, true);
+    e.Vec(VecOp::Add, {I2, 0x2}, {I1, YYYY}, ConstZero, Pred::P1, true);
+    // Its bytes: hi = floor(D / 65536), m = D - 65536 hi, mid = floor(m / 256), lo = m - 256 mid.
+    e.Vec(VecOp::Mul, {I0, 0x1}, {I2, YYYY}, Lit(LitInv65536), Pred::None, true);
+    e.Vec(VecOp::Frc, {I0, 0x1}, ConstZero, {I0, XXXX}, Pred::None, true); // -hi
+    e.Vec(VecOp::Mul, {I0, 0x2}, {I0, XXXX}, Lit(Lit65536), Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x2}, {I0, YYYY}, {I2, YYYY}, Pred::None, true); // m
+    e.Vec(VecOp::Mul, {I0, 0x4}, {I0, YYYY}, Lit(LitInv256), Pred::None, true);
+    e.Vec(VecOp::Frc, {I0, 0x4}, ConstZero, {I0, ZZZZ}, Pred::None, true); // -mid
+    e.Vec(VecOp::Mul, {I0, 0x8}, {I0, ZZZZ}, Lit(Lit256), Pred::None, true);
+    e.Vec(VecOp::Add, {I0, 0x8}, {I0, WWWW}, {I0, YYYY}, Pred::None, true); // lo
+    // (s', lo, mid, hi), each (b + 1/4) / 255: the U8 pack keeps b whether it rounds or truncates.
+    const Src quarter = Lit(LitQuarter);
+    e.Vec(VecOp::Add, {I1, 0x1}, {I2, XXXX}, quarter, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x2}, {I0, WWWW}, quarter, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x4}, {I0, ZZZZ, Mod::Neg}, quarter, Pred::None, true);
+    e.Vec(VecOp::Add, {I1, 0x8}, {I0, XXXX, Mod::Neg}, quarter, Pred::None, true);
+    e.Vec(VecOp::Mul, {I1, 0xf}, {I1, XYZW}, Lit(LitInv255), Pred::None, true);
+    e.PackU8(Reg::Pa(0), I1, I1);
+    program.output_u8 = true;
 }
 
 uint32_t FragmentEmitter::LutSamplerIndex() const {
@@ -1777,6 +2164,13 @@ void FragmentEmitter::ProcTexColour(bool mipmapped) {
 }
 
 void FragmentEmitter::Fog() {
+    // Gas, the fog stage's half of gas rendering: (0, 0, 0, 0), the blend going on from it (a
+    // transparent pixel, not a discard).
+    if (config.texture.fog_mode == TexturingRegs::FogMode::Gas) {
+        e.Vec(VecOp::Add, {Reg::V(TmpOutput), 0x3}, ConstZero, ConstZero);
+        e.Vec(VecOp::Add, {Reg::V(TmpOutput + 2), 0x3}, ConstZero, ConstZero);
+        return;
+    }
     if (!uses_fog) {
         return;
     }
@@ -1827,6 +2221,12 @@ void FragmentEmitter::SampleTextures() {
         }
         const int coord = (unit == 2 && tex.texture2_use_coord1) ? 1 : static_cast<int>(unit);
         coords[unit] = Reg::Pa(texcoord_pa[coord]); // not iterated for an issued unit alone
+        if (unit == 0 && shadow_texture) {
+            // Its four reads wait for themselves; the other units' reads follow.
+            ShadowTexture(coords[0], sampler_index);
+            sampler_index++;
+            continue;
+        }
         if (unit == 0 && tex.texture0_type == TextureType::TextureCube) {
             // The direction (u, v, w) of texcoord0 and texcoord0_w. The SGX's cube takes a face's
             // (s, t) as the PICA does, and the faces keep t = 1 at row 0: reading at (u, -v, w)
@@ -1892,25 +2292,41 @@ void FragmentEmitter::SampleTextures() {
             e.MoveInternal({texel.Pair(1), 0x2}, {alpha.Pair(1), XYZW}, Pred::None, true);
         }
     }
-    // A coordinate past [0, 1] on an axis that clamps to the border colour replaces the
-    // texel with it (the generator's sampleTexUnit).
+    // A coordinate past [0, 1] on an axis that clamps to the border colour replaces the texel with
+    // it. (u - 1) * u is above 0 there and only there (u - 1 is exact from 0.5 up and negative
+    // below 1), so u - 1 for both axes and the test unit's product with u an axis, folded by AND
+    // into p1, say "inside"; the colour moves in where not. An F16 texel takes the F16 colour's
+    // pair by two bitwise moves (F16 bits are no F32 values for a float move), an F32 one the F32
+    // colour's two pairs.
     for (u32 unit = 0; unit < 3; unit++) {
         const auto& border = tex.texture_border_color[unit];
-        if (!unit_used[unit] || !(border.enable_s || border.enable_t)) {
+        // A shadow read is lit (1) past its texture's edge instead (ShadowTexture).
+        if (!unit_used[unit] || !(border.enable_s || border.enable_t) ||
+            (unit == 0 && shadow_texture)) {
             continue;
         }
-        const Vec4Loc colour{Bank::SecAttr, static_cast<uint8_t>(sa_border + unit * 4)};
-        const Vec4Loc texel = texel_loc[unit];
-        const auto replace_when = [&](Cond cond, uint8_t chan, const Src& bound) {
-            e.Test(cond, 2, {coords[unit]}, chan, bound, true);
-            e.MoveInternal({texel.Pair(0), 0x3}, {colour.Pair(0), XYZW}, Pred::P2, true);
-            e.MoveInternal({texel.Pair(1), 0x3}, {colour.Pair(1), XYZW}, Pred::P2, true);
-        };
+        e.Vec(VecOp::Add, {I0, 0x3}, {ConstOne.reg, XXXX, Mod::Neg}, {coords[unit], XYZW},
+              Pred::None, true);
+        bool tested = false;
         for (uint8_t chan = 0; chan < 2; chan++) {
             if (chan == 0 ? border.enable_s : border.enable_t) {
-                replace_when(Cond::Lt, chan, ConstZero);
-                replace_when(Cond::Gt, chan, ConstOne);
+                e.Test(Cond::Le, 1, {I0}, chan, {coords[unit], XYZW}, false,
+                       tested ? Pred::P1 : Pred::None, TestAlu::Mul);
+                tested = true;
             }
+        }
+        const Vec4Loc texel = texel_loc[unit];
+        if (texel.f16) {
+            for (uint8_t word = 0; word < 2; word++) {
+                const Reg dst{texel.bank, static_cast<uint8_t>(texel.base + word)};
+                e.Bitwise(BwOp::Or, dst,
+                          IOp::R(Reg::Sa(static_cast<uint8_t>(sa_border16 + unit * 2 + word))),
+                          IOp::Imm(0), Pred::NotP1);
+            }
+        } else {
+            const Vec4Loc colour{Bank::SecAttr, static_cast<uint8_t>(sa_border + unit * 4)};
+            e.MoveInternal({texel.Pair(0), 0x3}, {colour.Pair(0), XYZW}, Pred::NotP1, true);
+            e.MoveInternal({texel.Pair(1), 0x3}, {colour.Pair(1), XYZW}, Pred::NotP1, true);
         }
     }
     if (uses_shadow) {
@@ -3487,17 +3903,24 @@ Reg FragmentEmitter::U8Arg(uint8_t k, u32 stage_index, Source csrc, ColorModifie
                (src >= Source::Texture0 && src <= Source::Texture2 &&
                 unit_own[static_cast<u32>(src) - static_cast<u32>(Source::Texture0)]);
     };
+    // A constant's from its broadcast word (PlanUniforms), any other's made here.
+    const auto lane_broadcast = [&](Source src, int lane, uint8_t tmp) {
+        if (src == Source::Constant) {
+            const uint32_t sa = sa_const_lane[stage_index][lane];
+            DEBUG_ASSERT(sa != ~0u);
+            return Reg::Sa(static_cast<uint8_t>(sa));
+        }
+        return U8LaneBroadcast(U8Source(src, stage_index, false), lane, Reg::V(tmp));
+    };
     if (need_colour) {
         c = clane < 0  ? U8Source(cs, stage_index, ReadsAlphaLane(cmod))
-            : lazy(cs) ? U8LaneBroadcast(U8Source(cs, stage_index, false), clane,
-                                         Reg::V(static_cast<uint8_t>(TmpU8LaneColour + k)))
+            : lazy(cs) ? lane_broadcast(cs, clane, static_cast<uint8_t>(TmpU8LaneColour + k))
                        : U8Broadcast(cs, clane);
         cm = clane >= 0 ? static_cast<u32>(cmod) & 1 : static_cast<u32>(cmod);
     }
     if (need_alpha) {
         a = alane < 0  ? U8Source(as, stage_index, true)
-            : lazy(as) ? U8LaneBroadcast(U8Source(as, stage_index, false), alane,
-                                         Reg::V(static_cast<uint8_t>(TmpU8LaneAlpha + k)))
+            : lazy(as) ? lane_broadcast(as, alane, static_cast<uint8_t>(TmpU8LaneAlpha + k))
                        : U8Broadcast(as, alane);
         am = alane >= 0 ? static_cast<u32>(amod) & 1 : static_cast<u32>(amod);
     }
@@ -3877,6 +4300,10 @@ void FragmentEmitter::U8TevStage(u32 index) {
 void FragmentEmitter::U8Output() {
     Reg final = U8EvenFinal();
     AlphaTest(&final);
+    if (shadow_write) {
+        ShadowWrite(&final);
+        return;
+    }
     if (uses_fog) {
         // colour * f + fog colour * (1 - f) on the colour, the alpha kept: the factor with
         // alpha one, so the fog colour's alpha term is zero, and one SOP3. The factor is in 8
@@ -3975,7 +4402,10 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
         }
         return {};
     }
-    u8_tev = u8_combiners && U8TevSupported();
+    // The texture combiners in U8 registers with SOP2 and SOP3 (each product, and each sum of
+    // two, to nearest, as the F32 path's byte rounding gives) where every stage has a U8 form,
+    // else the F32 path. Gas zeroes the F32 combiner output (Fog).
+    u8_tev = U8TevSupported() && config.texture.fog_mode != TexturingRegs::FogMode::Gas;
     PlanInputs();
     // ShadowCube is not built, nor a type the PICA does not define. Only a program that reads unit
     // 0 has a use for its type: a game can leave all-ones (type 7) in its texture registers under a
@@ -4043,8 +4473,23 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
         std::bit_cast<uint32_t>(1.0f / 144.0f),
         0u,
         0xffffffffu,
-        0x7f7f7f7fu};
-    static_assert(LiteralCount == 46);
+        0x7f7f7f7fu,
+        std::bit_cast<uint32_t>(65536.0f),
+        std::bit_cast<uint32_t>(1.0f / 65536.0f),
+        std::bit_cast<uint32_t>(16777215.0f),
+        std::bit_cast<uint32_t>(0.25f),
+        std::bit_cast<uint32_t>(static_cast<float>(ShadowSize(config.texture.shadow_width_log2))),
+        std::bit_cast<uint32_t>(static_cast<float>(ShadowSize(config.texture.shadow_height_log2))),
+        std::bit_cast<uint32_t>(0.5f),
+        std::bit_cast<uint32_t>(127.5f / 256.0f),
+        std::bit_cast<uint32_t>(std::numeric_limits<float>::min()),
+        0u,
+        std::bit_cast<uint32_t>(1.0f /
+                                static_cast<float>(ShadowSize(config.texture.shadow_width_log2))),
+        std::bit_cast<uint32_t>(1.0f /
+                                static_cast<float>(ShadowSize(config.texture.shadow_height_log2)))});
+    static_assert(LiteralCount == 58);
+    static_assert(LitShadowWidth % 2 == 0 && LitShadowInvWidth % 2 == 0);
     static_assert(std::tuple_size_v<decltype(literal_table)> == LiteralCount);
     static_assert(Pica::Shader::LUT_RG_ROWS == Pica::Shader::LUT_RGBA_ROWS);
     program.uses_discard = uses_kill;
@@ -4113,13 +4558,12 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
             TevStage(i);
         }
         AlphaTest();
-        if (uses_depth && !uses_kill) {
-            // No kill to share the phase end with: the depth write ends phase one by itself.
-            WriteDepth();
-            NewPhaseAfterKill();
+        if (shadow_write) {
+            ShadowWrite(nullptr);
+        } else {
+            Fog();
+            e.PackF16({Reg::Pa(0), 0xf}, Reg::V(TmpOutput), Reg::V(TmpOutput + 2));
         }
-        Fog();
-        e.PackF16({Reg::Pa(0), 0xf}, Reg::V(TmpOutput), Reg::V(TmpOutput + 2));
     }
 
     // The quads go to the inputs' pairs past their last reference (free: a task's size counts

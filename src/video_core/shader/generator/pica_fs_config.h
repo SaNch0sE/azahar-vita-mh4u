@@ -171,6 +171,10 @@ struct TextureConfig {
         // by the rasterizer after construction (an ETC1A4 texture split into compressed colour
         // and A8 alpha, SgxdBackend::QueueUntile).
         BitField<17, 3, u32> alpha_split;
+        // sgxd only: a Shadow2D unit 0's size as log2 less 3 (8 to 1024 texels a side), set by
+        // the rasterizer: the program's filter taps are whole texels.
+        BitField<20, 3, u32> shadow_width_log2;
+        BitField<23, 3, u32> shadow_height_log2;
         // sgxd only: the units whose texel is the pixel's own colour in the buffer the draw
         // writes, texel for pixel (RasterizerSgxd::OwnPixelUnits), set by the rasterizer: the
         // program reads the tile's colour (o0) for them and samples nothing.

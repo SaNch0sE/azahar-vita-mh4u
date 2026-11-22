@@ -219,7 +219,7 @@ public:
     void MoveInternal(Dst dst, Src src, Pred pred = Pred::None, bool nosched = false);
     void CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched = false);
     void Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, bool src2_scalar,
-              Pred pred = Pred::None);
+              Pred pred = Pred::None, TestAlu alu = TestAlu::Sub);
     /// `fconv` 3 four F32 words, 2 four F16 in two words (Encoder::Sample2D); in Inst::ctl.
     void Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, uint8_t drc,
                   bool nosched = false, uint8_t fconv = 3);
@@ -227,8 +227,9 @@ public:
     /// depend on the level, so its coordinates need no neighbouring instance (skip_invalid_auto).
     /// `lanes`: the registers from `dst` the read writes, in dst.mask (Sample2D's four, or two
     /// for a one-channel format: its F32 word in the first, and the destination's 64-bit
-    /// alignment keeps the pair).
-    void Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, uint8_t lanes = 4);
+    /// alignment keeps the pair). `fconv` as Sample2D's: 2 four F16 lanes in two words.
+    void Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, uint8_t lanes = 4,
+                       uint8_t fconv = 3);
     /// Op::Sample2D with three coordinates (u[2] = 3): Encoder::SampleCube.
     void SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc);
     void Lda32(Reg dst, Reg base_sa, const Reg* offset_reg, uint8_t offset_words, uint8_t count,

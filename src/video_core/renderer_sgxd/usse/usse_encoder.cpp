@@ -1248,7 +1248,7 @@ void Encoder::CondMove(Dst dst, Src src0, Src src1, Src src2, bool nosched) {
 }
 
 void Encoder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2,
-                   bool src2_scalar, Pred pred) {
+                   bool src2_scalar, Pred pred, TestAlu alu) {
     src1.reg = Map(src1.reg);
     src2.reg = Map(src2.reg);
 
@@ -1271,7 +1271,8 @@ void Encoder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2,
         {'r', (src1.mod == Mod::Neg) ? 1u : 0u}, {'c', s1ext}, {'e', s2ext}, {'a', 1},
         {'v', src2_scalar ? 1u : 0u}, {'t', 0}, {'i', sign}, {'z', zero}, {'m', andc},
         {'h', chan}, {'n', pred_n}, {'b', 1}, {'k', s1b}, {'f', s2b}, {'g', 0}, {'w', 0},
-        {'l', 0}, {'u', 14}, {'j', DoubledNum(src1.reg, 8)}, {'q', DoubledNum(src2.reg, 8)},
+        {'l', 0}, {'u', alu == TestAlu::Mul ? 13u : 14u}, {'j', DoubledNum(src1.reg, 8)},
+        {'q', DoubledNum(src2.reg, 8)},
     }), 54, ReadsOne(src1.reg, chan) | ReadsOne(src2.reg, src2_scalar ? 0 : chan), 0);
 }
 

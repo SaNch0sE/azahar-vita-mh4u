@@ -45,7 +45,4 @@ inline LightingSwitches lighting_switches;
 /// the bump map and the shadow texture, as the emitter plans them.
 [[nodiscard]] uint32_t SampledTextureUnits(const Pica::Shader::FSConfig& config);
 
-/// gxm_flags shadowsmp (diagnostics): an orthographic Shadow2D unit read by the program's SMP at
-/// the iterated coordinate, not issued by the PDS.
-void SetShadowSmpProbe(bool on);
 } // namespace GxmRenderer::Usse

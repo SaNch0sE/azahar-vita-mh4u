@@ -91,6 +91,9 @@ enum class CompOp : uint8_t { Rcp = 0, Rsq = 1, Log = 2, Exp = 3 };
 
 /// Compare conditions a VTST writes to a predicate.
 enum class Cond : uint8_t { Gt, Ge, Lt, Le, Eq, Ne };
+/// What the vector test's unit makes of its sources before the sign and zero tests (VTST's
+/// alu_op with alu_sel 0: Vita3K's vf32_opcode, 14 VSUB, 13 VMUL).
+enum class TestAlu : uint8_t { Sub, Mul };
 
 /// The bitwise operations (VBW).
 enum class BwOp : uint8_t { And, Or, Xor };
@@ -264,8 +267,9 @@ public:
     /// p<pred_n> = src1.<chan> <cond> src2.x (src2 broadcast when `src2_scalar`).
     /// `pred` guards the write: with p1 as the guard and the destination, the result is
     /// the previous p1 AND the test, the compiler's way of folding two kills into one.
+    /// TestAlu::Mul tests the product src1 * src2 against 0 instead of the difference.
     void Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, bool src2_scalar,
-              Pred pred = Pred::None);
+              Pred pred = Pred::None, TestAlu alu = TestAlu::Sub);
     /// A 2D texture read: four f32 at dst (temp or pa, pair-aligned) from sampler words at
     /// sa<sampler> (even), coordinates at coord.xy (pair-aligned); `lod` is an internal
     /// register holding the level in x, or

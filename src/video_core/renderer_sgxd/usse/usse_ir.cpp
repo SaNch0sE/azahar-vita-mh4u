@@ -423,8 +423,10 @@ void Builder::MoveF32x4(Dst dst, Reg lo, Reg hi, bool) {
 }
 
 void Builder::UnpackF16x4(Dst dst, Reg src) {
-    if (dst.reg.bank != Bank::Internal || IsVirtual(src)) {
-        Fail("an F16 unpack goes from a fixed register pair into an internal register");
+    // From a fixed pair (an issued F16 iterator) or a virtual one (an F16 texture read): the
+    // liveness reads the one pair (MoveF32x4's b[0]).
+    if (dst.reg.bank != Bank::Internal) {
+        Fail("an F16 unpack goes into an internal register");
     }
     MoveF32x4(dst, src, src);
     insts.back().b[0] = true;
@@ -453,7 +455,7 @@ void Builder::CondMove(Dst dst, Src src0, Src src1, Src src2, bool) {
 }
 
 void Builder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, bool src2_scalar,
-                   Pred pred) {
+                   Pred pred, TestAlu alu) {
     Inst& i = Push(Op::Test);
     i.u[0] = static_cast<uint8_t>(cond);
     i.u[1] = pred_n;
@@ -462,6 +464,7 @@ void Builder::Test(Cond cond, uint8_t pred_n, Src src1, uint8_t chan, Src src2, 
     i.src[1] = src2;
     i.b[0] = src2_scalar;
     i.pred = pred;
+    i.ctl = static_cast<uint32_t>(alu);
 }
 
 void Builder::SampleCube(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc) {
@@ -484,8 +487,9 @@ void Builder::Sample2D(Reg dst, Reg coord, uint8_t sampler_sa, const Reg* lod, u
     }
 }
 
-void Builder::Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, uint8_t lanes) {
-    Sample2D(dst, coord, sampler_sa, nullptr, drc);
+void Builder::Sample2DPoint(Reg dst, Reg coord, uint8_t sampler_sa, uint8_t drc, uint8_t lanes,
+                            uint8_t fconv) {
+    Sample2D(dst, coord, sampler_sa, nullptr, drc, false, fconv);
     insts.back().b[1] = true;
     insts.back().dst.mask = static_cast<uint8_t>((1u << lanes) - 1);
 }
@@ -2687,7 +2691,8 @@ bool FoldTest(Inst& d, uint8_t k, const Src& loaded, std::vector<int>& lanes_rea
         d.src[1] = s2;
         d.u[2] = static_cast<uint8_t>(c1);
         d.b[0] = sc;
-        if (order == 1) {
+        // A product's sign is the same either way round.
+        if (order == 1 && static_cast<TestAlu>(d.ctl) == TestAlu::Sub) {
             d.u[0] = static_cast<uint8_t>(Flipped(static_cast<Cond>(d.u[0])));
         }
         return true;
@@ -4154,7 +4159,7 @@ void Lowering::Encode(Encoder& e, LowerResult& result) {
             break;
         case Op::Test:
             e.Test(static_cast<Cond>(i.u[0]), i.u[1], S(i.src[0]), i.u[2], S(i.src[1]), i.b[0],
-                   i.pred);
+                   i.pred, static_cast<TestAlu>(i.ctl));
             break;
         case Op::Sample2D: {
             const Reg lod = Map(i.src[0].reg);

@@ -337,6 +337,8 @@ private:
         bool is_int;
         bool normalize; ///< the vec3 normalised as it is copied (UniformKind::LightDirection)
         bool u8;        ///< packed to a word of bytes an element (Usse::Uniform::u8)
+        bool f16;       ///< packed to a pair of four F16 an element (Usse::Uniform::f16)
+        s8 lane;        ///< u8: every byte this component (Usse::Uniform::lane), or -1
         /// A LUT offset as its row's centre: 1 alone, 2 and 3 after a pair's x; 0 none.
         ::u8 lut_row;
         /// The distance attenuation's scale (1) or bias (2), in the LUT read's units (the bias plus half a

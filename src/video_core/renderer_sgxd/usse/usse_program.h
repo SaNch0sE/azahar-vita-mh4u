@@ -150,6 +150,11 @@ enum class UniformKind : uint8_t {
     /// A directional light's position normalised (its light vector), once a draw as the
     /// rasterizer fills the SAs instead of in every pixel.
     LightDirection,
+    // Shadows: the shadow write's intensity bias (shadow_bias_constant, shadow_bias_linear),
+    // and the depth bias a Shadow2D read subtracts (shadow_texture_bias, an integer).
+    ShadowBiasConstant,
+    ShadowBiasLinear,
+    ShadowTextureBias,
     /// Stage `index`'s constant colour as a U8 Dot3 reads it (FragmentEmitter::U8Dot3Const):
     /// 4 (b - 0.5) in x, y and z and -2 sum(b - 0.5) in w, b its bytes over 255.
     Dot3Const,
@@ -164,6 +169,12 @@ struct Uniform {
     /// One word an element, the components as unsigned bytes (round(x * 255), x the lowest,
     /// a missing component zero): what the U8 combiners' SOPs read in place.
     bool u8 = false;
+    /// A pair an element, the four components as F16 (x in the first word's low half): what
+    /// an F16 texel's lanes take in place (a border colour).
+    bool f16 = false;
+    /// u8: every byte component `lane` (a moved channel's broadcast, const.rrr); -1 for each
+    /// byte its own.
+    int8_t lane = -1;
 };
 
 enum class SamplerKind : uint8_t {
