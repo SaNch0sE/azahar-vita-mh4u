@@ -2458,6 +2458,17 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
         return {};
     }
     PlanInputs();
+    // ShadowCube is not built, nor a type the PICA does not define. Only a program that reads unit
+    // 0 has a use for its type: a game can leave all-ones (type 7) in its texture registers under a
+    // combiner of constants.
+    if (const auto t0 = config.texture.texture0_type.Value();
+        unit_used[0] && t0 != TextureType::Texture2D && t0 != TextureType::Projection2D &&
+        t0 != TextureType::TextureCube && t0 != TextureType::Shadow2D) {
+        if (refusal) {
+            *refusal = "texture unit 0 type";
+        }
+        return {};
+    }
     PlanUniforms();
     uses_kill = config.framebuffer.alpha_test_func != FramebufferRegs::CompareFunc::Always ||
                 uses_scissor;

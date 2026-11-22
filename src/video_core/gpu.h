@@ -191,7 +191,7 @@ private:
 
     /// Has the renderer keep [addr, addr + size) where the CPU reaches it uncached, if it would
     /// (RendererBase::WouldMakeUncached), before the GPU writes or shows it.
-    void KeepUncached(PAddr addr, u32 size, bool overwritten);
+    void KeepUncached(PAddr addr, u32 size);
 
     /// A DMA's piece that is contiguous in physical memory on both sides.
     struct DmaRun {

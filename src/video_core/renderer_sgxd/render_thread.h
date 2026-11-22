@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include "common/common_types.h"
 #include "common/named_thread.h"
@@ -179,9 +180,8 @@ public:
     /// waiting (at once on the render side itself).
     void Run(std::function<void()> fn);
     void RunSync(const std::function<void()>& fn);
-    /// A present of the guest's screens, as the VBlank found them. One with a newer one queued
-    /// behind it is dropped, and one within 12 ms of the last: at 100% the guest's VBlanks
-    /// jitter around the display's frame.
+    /// A present of the guest's screens as the VBlank found them. One with two newer ones queued is
+    /// dropped (one newer is the normal lag), and one within 12 ms of the last.
     void Present(const std::array<Pica::FramebufferConfig, 2>& fb,
                  const std::array<Pica::ColorFill, 2>& fill);
 
@@ -236,7 +236,15 @@ public:
         u32 gpu_wakes;
         u32 timeouts;
         u32 presents;
-        u32 presents_dropped;
+        u32 presents_behind;
+        u32 presents_soon;
+        u32 late_frames;
+        u32 late_draws;
+        u32 late_kept;
+        u32 merged_draws; ///< the parse's merged runs' vertices (MergeDraw), and the runs
+        u32 merged_runs;
+        u32 late_partial;
+        std::array<u32, 4> present_gaps;
         u32 holds;
         u64 hold_us;
         std::array<u32, EmuWaits> emu_waits;
@@ -402,8 +410,91 @@ private:
     /// The window's input at least this often while the thread runs, so the PS button answers.
     static constexpr std::chrono::milliseconds WindowPollInterval{16};
     Common::ProcessClock::time_point last_window_poll{};
-    /// The newest present record's position: one with a newer one queued behind it is dropped.
-    std::atomic<u32> newest_present{};
+    std::atomic<u32> presents_queued{};
+    /// The late skip (emulation side): the vblank never waits for the GPU, so when the GPU is
+    /// TicketFramesBack frames behind, the next frame's busier screen's draws are not recorded and the
+    /// game keeps its CPU speed. The screen a late frame keeps (or -1), and an open batch's decision.
+    bool late_skip{};
+    int late_keep{-1};
+    bool late_batch_open{};
+    bool late_batch_skip{};
+    bool late_triangles_open{};
+    bool late_triangles_skip{};
+    /// The colour buffers drawn lately (the newest 16), each with its segments: a segment is
+    /// the draws into it up to a transfer from it. a game draws both screens into one colour
+    /// buffer (skiplog: the top screen's draws, its transfer, the bottom screen's draws, its
+    /// transfer). Per buffer: this frame's segment, whether a draw of it was dropped, and each
+    /// segment's screen as the transfer that ended it last found it (-1: none, or no LCD).
+    struct SegmentTarget {
+        PAddr addr;
+        u32 bytes;
+        u32 segment;
+        bool dropped;
+        std::array<s8, 4> screens;
+        u8 readers;
+        /// segment_draws at its last draw: of the buffers holding a transfer's source, the newest drawn.
+        u32 drawn;
+#ifdef VITA_DIAGNOSTICS
+        u32 dropped_frame; // screenlog_frame of its last dropped draw (latelog)
+        u32 kept_frame;    // screenlog_frame of its last kept draw (latelog)
+#endif
+    };
+    std::vector<SegmentTarget> segment_targets;
+    /// This frame's and the last frame's outputs of dropped transfers and copies, until a kept write
+    /// covers them: a picture never made. Not an LCD buffer's. A transfer or copy that reads one and no
+    /// drawn colour buffer is dropped too; one into a drawn colour buffer counts as a dropped draw.
+    struct DroppedOutput {
+        PAddr lo, hi;
+        bool earlier = false; ///< dropped in the last frame
+    };
+    std::vector<DroppedOutput> dropped_outputs;
+    /// This frame's LCD buffers with a dropped write: its later writes into one are dropped too, so it
+    /// keeps its last whole picture and stamp.
+    std::vector<PAddr> dropped_lcd;
+    [[nodiscard]] bool ReadsDroppedOutput(PAddr lo, PAddr hi) const;
+    void ForgetDroppedOutputs(PAddr lo, PAddr hi);
+    u32 segment_draws{};
+    SegmentTarget& SegmentTargetFor(PAddr addr, u32 bytes);
+    struct LateTargetCache {
+        PAddr addr = 0;
+        u32 bytes = 0;
+        u32 generation = ~0u;
+        int lcd_screen = -1;
+        PAddr lcd = 0;
+        u32 target = 0;
+    };
+    LateTargetCache late_cache;
+    u32 late_generation{};
+#ifdef VITA_DIAGNOSTICS
+    struct ScreenlogTarget {
+        PAddr addr;
+        u32 bytes;
+        int screen;
+        u32 draws, dropped;
+    };
+    u32 screenlog_frame{};
+    bool screenlog_on{};
+    std::vector<ScreenlogTarget> screenlog_targets;
+    std::string screenlog_transfers;
+#endif
+    std::array<Pica::FramebufferConfig, 2> lcd_fb{};
+    /// Each screen's LCD buffers (the newest four a present named) with their pictures' stamps; a write
+    /// the late skip dropped leaves the stamp. A present shows a screen's selected buffer unless its
+    /// picture is older than the one last shown, and then the oldest no older than that.
+    std::array<std::vector<LcdBuffer>, 2> lcd_buffers;
+    u32 lcd_writes{};
+    std::array<u32, 2> shown_stamp{};
+    void NoteLcdWrite(int screen, PAddr buffer, bool dropped);
+    /// Each screen's GPU cost, in vertices: this frame's, and a running sum (8 x the frame's mean).
+    /// A draw adds its vertices and LateDrawCost.
+    std::array<u32, 2> frame_cost{};
+    std::array<u32, 2> screen_cost{};
+    /// A draw's own TA cost in vertices (measured: ~2.2 us a draw, 72 ns a vertex).
+    static constexpr u32 LateDrawCost = 32;
+    [[nodiscard]] int LcdScreenOf(PAddr addr, u32 bytes, PAddr* buffer = nullptr) const;
+    /// A draw (a batch's first vertex, the first CPU-path triangle): its screen (its colour
+    /// buffer's segment's) counted, and whether the late skip drops it.
+    [[nodiscard]] bool LateDraw();
 
     /// The emulation side waits for waited_ticket: the loop kicks the pending 3D up to it.
     std::atomic<bool> ticket_wait{false};
@@ -419,7 +510,15 @@ private:
     std::atomic<u32> timeouts{};
     u32 gpu_wakes_mark{};
     std::atomic<u32> presents{};
-    std::atomic<u32> presents_dropped{};
+    std::atomic<u32> presents_behind{};
+    std::atomic<u32> presents_soon{};
+    std::atomic<u32> late_frames{};
+    std::atomic<u32> late_draws{};
+    std::atomic<u32> late_kept{};
+    std::atomic<u32> merged_draws{};
+    std::atomic<u32> merged_runs{};
+    std::atomic<u32> late_partial{};
+    std::array<std::atomic<u32>, 4> present_gaps{};
     std::atomic<u32> holds{};
     std::atomic<u64> hold_us{};
     struct EmuWaitCounters {

@@ -281,17 +281,14 @@ private:
     std::vector<u32> changed;
     std::vector<std::array<u32, 3>> calls_runs;
 
-    /// A page's versions: its slots (0 the home, the rest pages of the pool, NoSlot until
-    /// used), the ticket up to which queued work reads each slot the GPU has left, which slot
-    /// the guest (and the app) is on and which the GPU's MMU names as of the work queued,
-    /// whether it is armed (closed to writes) this frame, and the frame of its last GPU use.
-    /// Four slots: the GPU runs up to three frames behind the guest
-    /// (RenderThread::TicketFramesBack), each frame's work reading the slot of its own frame, so
-    /// a page the guest rewrites each frame needs a fourth to write. With two the guest wrote
-    /// in place ~260 pages a second in a game's fight, its bottom-screen panel torn white for a
-    /// frame every few seconds; with three ~155.
+    /// A page's versions: its slots (0 the home, the rest pages of the pool, NoSlot until used),
+    /// the ticket up to which queued work reads each slot the GPU has left, which slot the guest
+    /// (and the app) is on and which the GPU's MMU names as of the work queued, whether it is armed
+    /// (closed to writes) this frame, and the frame of its last GPU use. Five slots: the GPU runs
+    /// up to four frames behind the guest (RenderThread::LeadFramesBack), each frame's work reading
+    /// the slot of its own frame, so a page the guest rewrites each frame needs a fifth to write.
     static constexpr u16 NoSlot = 0xffff;
-    static constexpr u8 Slots = 4;
+    static constexpr u8 Slots = 5;
     static constexpr std::array<u16, Slots - 1> NoPoolSlots() {
         std::array<u16, Slots - 1> pool{};
         pool.fill(NoSlot);

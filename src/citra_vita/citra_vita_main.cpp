@@ -486,13 +486,19 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                              "{} timed out), GPU waits {:.1f} ms; records: state {}, draw {}, "
                              "fill {}, "
                              "transfer {}, dma {}, present {}, other {}; present {} ({} "
-                             "dropped); holds {} waiting {:.1f} ms",
+                             "dropped behind, {} too soon; gaps to 20 ms {}, 37 {}, 54 {}, "
+                             "longer {}); holds {} waiting {:.1f} ms",
                              t.busy_us / 1e3, t.idle_us / 1e3, t.gpu_wakes, t.timeouts,
-                             render_counters.gpu_wait_us / 1e3,
-                             t.records[K::State], t.records[K::Draw], t.records[K::Fill],
-                             t.records[K::Transfer], t.records[K::Dma], t.records[K::Present],
-                             t.records[K::Other], t.presents, t.presents_dropped, t.holds,
+                             render_counters.gpu_wait_us / 1e3, t.records[K::State],
+                             t.records[K::Draw], t.records[K::Fill], t.records[K::Transfer],
+                             t.records[K::Dma], t.records[K::Present], t.records[K::Other],
+                             t.presents, t.presents_behind, t.presents_soon, t.present_gaps[0],
+                             t.present_gaps[1], t.present_gaps[2], t.present_gaps[3], t.holds,
                              t.hold_us / 1e3);
+                    LOG_INFO(Frontend,
+                             "perf: late skip: {} frames, {} draws dropped, {} kept for the "
+                             "other screen; screens presented from another buffer {}",
+                             t.late_frames, t.late_draws, t.late_kept, t.late_partial);
                     // This thread, the emulation thread: its run time by the kernel's count
                     // over the interval, and its waits for the render thread by kind (sleeps,
                     // the 1 ms timeouts among them). The holds are above, the DSP's waits below.

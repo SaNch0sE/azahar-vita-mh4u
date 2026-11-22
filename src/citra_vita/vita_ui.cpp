@@ -18,6 +18,7 @@
 #include "common/logging/log.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "video_core/renderer_sgxd/render_thread.h"
 
 namespace VitaFrontend {
 

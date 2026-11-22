@@ -688,12 +688,9 @@ void GPU::MemoryTransfer() {
         config.is_texture_copy ||
         right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
                                                        config.input_height, config.output_height);
-    // The output's pages move without their contents: only the bytes the transfer writes
-    // (OutputBytes, the scaling's). The registers' unscaled size moved a game Y's heap past
-    // a halved screen capture's output, uncopied, and the guest read the pool's old pixels as
-    // a pointer.
+    // (The output's pages move to CDRAM once the transfer is known to run:
+    // RenderThread::AccelerateDisplayTransfer.)
     if (!config.is_texture_copy && allow_display_transfer) {
-        KeepUncached(config.GetPhysicalOutputAddress(), config.OutputBytes(), true);
         ScreensWritten(config.GetPhysicalOutputAddress(), config.OutputBytes());
     } else if (config.is_texture_copy) {
         // Its lines of output_width with output_gap after each, as the copy writes them.
@@ -835,7 +832,7 @@ std::vector<GPU::DmaRun> GPU::DmaRuns(VAddr src, VAddr dst, u32 size) {
     return runs;
 }
 
-void GPU::KeepUncached(PAddr addr, u32 size, bool overwritten) {
+void GPU::KeepUncached(PAddr addr, u32 size) {
     // Rare: a page moves once and stays until the GPU leaves it unused (ReturnUncached). The
     // move runs here, the guest stopped, with the render thread held after the work queued
     // before it; the GPU's mapping follows in its own order (GuestGpuMemory), without an idle.
@@ -900,7 +897,15 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     constexpr bool vb_cached = false;
 #endif
     for (const auto& [addr, size] : impl->rasterizer->TakeCachedReads()) {
-        KeepUncached(addr, size, false);
+#ifdef VITA_DIAGNOSTICS
+        if (!vb_cached && impl->renderer->WouldMakeUncached(addr, size)) {
+            SgxdRenderer::GuestGpuMemory::WatchNote("vertex or index buffers read since the vblank",
+                                                    addr, size);
+        }
+#endif
+        if (!vb_cached) {
+            KeepUncached(addr, size);
+        }
     }
     // The LCD's picture comes from the GPU's present: kept uncached, it needs no clean
     // before each one. The LCD scans 400 columns on the top screen, 320 on the bottom.
@@ -908,7 +913,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     for (u32 i = 0; i < 2; i++) {
         const Pica::FramebufferConfig& f = regs.framebuffer_config[i];
         KeepUncached(f.second_fb_active ? f.address_left2 : f.address_left1,
-                     f.stride * (i == 0 ? 400u : 320u), false);
+                     f.stride * (i == 0 ? 400u : 320u));
     }
 
     // Present renderered frame, as the LCD's registers are now.
@@ -932,26 +937,10 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     }
     impl->render->StartFramePageHolds();
     impl->render->ApplyPageHolds();
-    // The guest hears of the GPU's work when it is submitted, so nothing else keeps the GPU
-    // near the guest: each vblank waits for the work queued before the last one (the present
-    // above included), so the GPU runs at most a frame behind. gxm_flags `novblankwait`: no
-    // wait, the GPU as far behind as the render ring and the page holds let it fall.
-    static const bool no_wait = GxmRenderer::GxmFlag("novblankwait");
-    const u64 ticket = impl->rasterizer->InterruptFence();
-    if (!no_wait && impl->vblank_ticket != 0 &&
-        !impl->rasterizer->InterruptPoll(impl->vblank_ticket)) {
-#ifdef VITA_DIAGNOSTICS
-        const auto start = Common::ProcessClock::now();
-#endif
-        impl->rasterizer->InterruptWait(impl->vblank_ticket);
-#ifdef VITA_DIAGNOSTICS
-        impl->render->CountVblankWait(
-            static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                 Common::ProcessClock::now() - start)
-                                 .count()));
-#endif
-    }
-    impl->vblank_ticket = ticket;
+    // The guest hears of the GPU's work when it is submitted. The vblank does not wait for
+    // the GPU; the render thread drops the frames it is two behind on (the late skip,
+    // RenderThread's Op::FrameEnd), which keeps it near the guest.
+    impl->vblank_ticket = impl->rasterizer->InterruptFence();
 #else
     // A present has no guest-visible effect: well past the display's rate it is dropped. 12 ms,
     // not a frame's 16.7: at 100% the guest's VBlanks jitter around the frame, and a frame's cap
