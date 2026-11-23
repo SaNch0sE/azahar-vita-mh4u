@@ -2443,6 +2443,16 @@ std::vector<TitlePatchInfo> TitlePatchesOf(u64 title_id) {
     return patches;
 }
 
+u32 TitleTuningOf(u64 title_id) {
+    u32 tuning = 0;
+    for (const TitlePatch& patch : title_patches) {
+        if (patch.title_id == title_id) {
+            tuning |= patch.tuning;
+        }
+    }
+    return tuning;
+}
+
 std::vector<bool> ApplyTitlePatches(Core::System& system, const Kernel::Process& process) {
     std::vector<bool> in;
     title_tuning.store(0, std::memory_order_relaxed);

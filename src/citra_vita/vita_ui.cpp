@@ -1767,13 +1767,14 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    // Among a title's patches (DrawSettings), where the title's own offer it.
     add({Option::HudScale,
-         Category::Display,
+         Category::Patches,
          Kind::Choice,
          Translatable("HUD resolution"),
          Translatable("Draws the top screen's HUD, text and menus at a higher resolution over the "
-                      "3D picture, which stays at the 3DS's: sharper text for little GPU work. Only "
-                      "in games whose patches offer it, and with Internal resolution at Native."),
+                      "3D picture, which stays at the 3DS's: sharper text for little GPU work. It "
+                      "needs Internal resolution at Native."),
          {Translatable("Native"), "1.25x", "1.5x"},
          0,
          nullptr,
@@ -2413,6 +2414,8 @@ void Ui::DrawRow(const Row& row, std::size_t index) {
     const bool focused = ImGui::GetFocusID() == card.id;
     if (focused) {
         focused_row = static_cast<int>(index);
+        focused_patch = -1;
+        focused_engine = -1;
     }
     const ImRect value_bb(card.bb.Max.x - Pad - value_width, card.bb.Min.y, card.bb.Max.x - Pad,
                           card.bb.Max.y);
@@ -2537,6 +2540,7 @@ void Ui::DrawPatchRow(std::size_t index) {
     if (ImGui::GetFocusID() == card.id) {
         focused_patch = static_cast<int>(index);
         focused_engine = -1;
+        focused_row = -1;
     }
     if (card.visible) {
         ImDrawList* const dl = ImGui::GetWindowDrawList();
@@ -2611,6 +2615,7 @@ void Ui::DrawEngineRow(std::size_t index) {
     if (focused) {
         focused_engine = static_cast<int>(index);
         focused_patch = -1;
+        focused_row = -1;
     }
     if (card.pressed ||
         (focused && (ImGui::IsNavInputTest(ImGuiNavInput_DpadLeft, ImGuiInputReadMode_Pressed) ||
@@ -2656,6 +2661,7 @@ void Ui::DrawEngineValueRow(std::size_t index) {
     if (focused) {
         focused_engine = static_cast<int>(Loader::EngineSettingCount + index);
         focused_patch = -1;
+        focused_row = -1;
     }
     const ImRect value_bb(card.bb.Max.x - Pad - value_width, card.bb.Min.y, card.bb.Max.x - Pad,
                           card.bb.Max.y);
@@ -2717,6 +2723,7 @@ void Ui::DrawEngineFilterRow(std::size_t index) {
         focused_engine =
             static_cast<int>(Loader::EngineSettingCount + Loader::EngineValueCount + index);
         focused_patch = -1;
+        focused_row = -1;
     }
     if (card.pressed ||
         (focused && (ImGui::IsNavInputTest(ImGuiNavInput_DpadLeft, ImGuiInputReadMode_Pressed) ||
@@ -3538,6 +3545,13 @@ Ui::Action Ui::DrawSettings() {
         for (std::size_t i = 0; i < settings_patches.size(); i++) {
             DrawPatchRow(i);
         }
+        // The options a title's patches offer (the HUD resolution), as its own values.
+        for (std::size_t i = 0; i < rows.size(); i++) {
+            if (rows[i].category == Category::Patches &&
+                (Loader::TitleTuningOf(settings_program_id) & Loader::TuningHudScale) != 0) {
+                DrawRow(rows[i], i);
+            }
+        }
         for (std::size_t i = 0; settings_engine.found && i < Loader::EngineSettings().size(); i++) {
             if (settings_engine.bits[i] >= 0) {
                 DrawEngineRow(i);
@@ -3598,7 +3612,9 @@ Ui::Action Ui::DrawSettings() {
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav);
     if (category == Category::Patches) {
-        if (focused_engine >= 0) {
+        if (focused_row >= 0) {
+            DrawRowInfo();
+        } else if (focused_engine >= 0) {
             DrawEngineInfo();
         } else {
             DrawPatchInfo();

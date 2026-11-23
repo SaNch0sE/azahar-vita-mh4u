@@ -72,6 +72,8 @@ enum TitleTuningBit : u32 {
     TuningHudScale = 1u << 2,
 };
 inline std::atomic<u32> title_tuning{0};
+/// The tuning bits a title's built-in patches ask for (a menu's: the title need not be running).
+[[nodiscard]] u32 TitleTuningOf(u64 title_id);
 [[nodiscard]] inline bool TitleTuned(u32 bit) {
     return (title_tuning.load(std::memory_order_relaxed) & bit) != 0;
 }
