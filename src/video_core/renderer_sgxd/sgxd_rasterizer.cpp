@@ -26,6 +26,7 @@
 #include "common/math_util.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/loader/title_patches.h"
 #include "core/memory.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_external.h"
@@ -4931,7 +4932,13 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     // Triangles an invocation may store: what a quarter of the pass data holds, to 1024.
     const u32 room = std::clamp<u32>((256u << 10) / (invocations * tri_bytes), 1u, 1024u);
     const u32 bound = GsFacts().bound;
-    const bool padded = bound != 0 && bound <= room;
+    // A bound that is more than an invocation's share (many invocations: 836 sprites of two
+    // triangles) still is the room while every slot fits GsBoundRoomBytes and pass B's 16-bit
+    // list: the draw stays in the stream-out queue and no triangle is dropped.
+    const bool bound_fits = bound != 0 && Loader::TitleTuned(Loader::TuningGeometryBatches) &&
+                            u64{invocations} * bound * tri_bytes <= GsBoundRoomBytes &&
+                            u64{invocations} * bound * 3 <= 0x10000;
+    const bool padded = bound != 0 && (bound <= room || bound_fits);
     const u32 cap = padded ? bound : room;
     const bool wait = !padded;
 #ifdef VITA_DIAGNOSTICS
@@ -8191,8 +8198,14 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         const u32 room = std::max(256u << 10, vertices * tri_bytes);
         const GsCodeFacts facts = GsFacts();
         const u32 gs_bound = facts.bound;
+        // With a bound the triangles are every slot's (GeometryStage's bound_fits), past the
+        // quarter megabyte too.
+        const u32 bound_bytes = vertices * gs_bound * (tri_bytes + 6);
         const u32 triangles =
-            gs_bound != 0 ? std::min(room, vertices * gs_bound * (tri_bytes + 6)) : room;
+            gs_bound == 0 ? room
+            : Loader::TitleTuned(Loader::TuningGeometryBatches) && u64{vertices} * gs_bound * tri_bytes <= GsBoundRoomBytes
+                ? bound_bytes
+                                                                        : std::min(room, bound_bytes);
         const bool tables =
             variable || (pipeline.gs_config.mode == Pica::PipelineRegs::GSMode::FixedPrimitive &&
                          facts.indexes_uniforms);

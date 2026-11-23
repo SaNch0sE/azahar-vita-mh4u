@@ -868,6 +868,9 @@ private:
     };
     KeyIndex<GsCodeFacts> gs_code_facts;
     GsCodeFacts GsFacts();
+    /// The most a geometry draw's triangle slots take when each invocation's room is its program's
+    /// bound (GeometryStage): half a pass's data.
+    static constexpr u32 GsBoundRoomBytes = 1u << 20;
     /// Whether the geometry program set now gets its table of uniforms in this mode
     /// (Usse::VsRequest::gs_uniform_table).
     bool GsUniformTable(bool rows_uniform, bool rows_table) {
