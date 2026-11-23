@@ -4,6 +4,8 @@
 
 #include "core/arm/vita/arm_vita_native.h"
 
+#include <psp2/kernel/clib.h>
+#include <psp2/kernel/processmgr.h>
 #include <algorithm>
 #include <bit>
 #include <cstddef>
@@ -570,6 +572,10 @@ struct EngineGuard {
     /// for the default finds nothing.
     VAddr found_global = 0;
     u32 found_offset = 0;
+#ifdef VITA_DIAGNOSTICS
+    u32 diag_ticks = 0, diag_wrong_ticks = 0, diag_stores = 0, diag_wrong_stores = 0;
+    u32 diag_wrong_pc = 0, diag_refused = 0, diag_refused_pc = 0, diag_traps = 0;
+#endif
 };
 /// A second of frames.
 constexpr u32 MissedSearches = 60;
@@ -2825,6 +2831,30 @@ void ARM_VitaNative::GuardTick() {
                      want);
         }
     }
+#ifdef VITA_DIAGNOSTICS
+    // The guard's second: checks, those that found a kept word wrong, the pages armed after
+    // them, and GuardStore's stores (those that changed a kept word, the last such pc).
+    {
+        g.diag_ticks++;
+        bool any = false;
+        for (const EngineGuard::Page& page : g.pages) {
+            any |= page.changed;
+        }
+        g.diag_wrong_ticks += any ? 1 : 0;
+        if (g.diag_ticks >= 60) {
+            sceClibPrintf("[azahar] guard: %u checks, %u with a word wrong; stores trapped %u "
+                          "(%u changed a word, last pc %08X; %u not made past the hold, last pc "
+                          "%08X); traps run %u; writers found %u, words kept %u, pages %u\n",
+                          g.diag_ticks, g.diag_wrong_ticks, g.diag_stores, g.diag_wrong_stores,
+                          g.diag_wrong_pc, g.diag_refused, g.diag_refused_pc, g.diag_traps,
+                          static_cast<unsigned>(g.traps.size()),
+                          static_cast<unsigned>(g.held.size()),
+                          static_cast<unsigned>(g.pages.size()));
+            g.diag_ticks = g.diag_wrong_ticks = g.diag_stores = g.diag_wrong_stores = 0;
+            g.diag_refused = g.diag_traps = 0;
+        }
+    }
+#endif
     // A page is held while something changes its words; a frame with no such store lets it go.
     for (EngineGuard::Page& page : g.pages) {
         const bool hold = std::exchange(page.changed, false);
@@ -2870,7 +2900,14 @@ bool ARM_VitaNative::GuardStore(u32 va, bool write, u32 pc) {
     refused_va = 0;
     // An access the core cannot make past the hold: the page let go, the store runs again; the
     // next check holds it again only where a kept word is wrong.
+#ifdef VITA_DIAGNOSTICS
+    g.diag_stores++;
+#endif
     if (!AccessPastHolds(pc, write)) {
+#ifdef VITA_DIAGNOSTICS
+        g.diag_refused++;
+        g.diag_refused_pc = pc;
+#endif
         GuardHold(page->host, AZAHAR_HOLD_NONE);
         page->armed = false;
         LOG_DEBUG(Core_ARM11, "engine guard: the store at {:#010x} not made past the hold", pc);
@@ -2889,6 +2926,10 @@ bool ARM_VitaNative::GuardStore(u32 va, bool write, u32 pc) {
         }
     }
     if (wrong) {
+#ifdef VITA_DIAGNOSTICS
+        g.diag_wrong_stores++;
+        g.diag_wrong_pc = pc;
+#endif
         page->changed = true;
         if ((run.ctx.cpsr & 0x20u) != 0) {
             if (!g.traps.contains(pc)) {
@@ -2956,6 +2997,9 @@ bool ARM_VitaNative::GuardTrap() {
     if (it == g.traps.end() || it->second == 0 || (run.ctx.cpsr & 0x20u) != 0) {
         return false;
     }
+#ifdef VITA_DIAGNOSTICS
+    g.diag_traps++;
+#endif
     const u32 insn = it->second;
     if (ConditionPasses(insn >> 28, run.ctx.cpsr)) {
         const u32 rn = (insn >> 16) & 15;
