@@ -2175,6 +2175,8 @@ void Ui::OpenSettings(std::string title, std::string name, State back, u64 progr
     // The title's cheats, its file's as the cheat engine reads it: the running title's are the
     // engine's already.
     settings_program_id = settings_title.empty() ? 0 : program_id;
+    // A title not started yet shows the settings it will start from.
+    Config::SeedTitleValues(settings_title, settings_program_id);
     settings_cheats.clear();
     if (settings_program_id != 0) {
         Cheats::CheatEngine& engine = system.CheatEngine();

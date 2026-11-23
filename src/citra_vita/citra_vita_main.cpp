@@ -1767,6 +1767,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     }
     ApplyConsoleName(system);
     ApplySystemLanguage(system);
+    if (u64 program_id = 0; system.GetAppLoader().ReadProgramId(program_id) ==
+                            Loader::ResultStatus::Success) {
+        Config::SeedTitleValues(Config::TitleKeyOf(path), program_id);
+    }
     Config::SetRunningTitle(Config::TitleKeyOf(path));
     NoteRunningTitle(system);
     system.SetResetCallback([&system] {

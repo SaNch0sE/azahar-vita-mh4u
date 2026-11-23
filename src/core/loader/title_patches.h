@@ -77,6 +77,16 @@ enum TitleTuningBit : u32 {
 inline std::atomic<u32> title_tuning{0};
 /// The tuning bits a title's built-in patches ask for (a menu's: the title need not be running).
 [[nodiscard]] u32 TitleTuningOf(u64 title_id);
+
+/// A frontend setting a tuned title starts from: its key and value as the settings file writes
+/// them (the Vita's config.cpp), set when the title gets settings of its own, and the player's to
+/// change after.
+struct TitleSettingDefault {
+    const char* key;
+    const char* value;
+};
+/// The settings `title_id` starts from (none for most titles).
+[[nodiscard]] std::span<const TitleSettingDefault> TitleSettingDefaultsOf(u64 title_id);
 [[nodiscard]] inline bool TitleTuned(u32 bit) {
     return (title_tuning.load(std::memory_order_relaxed) & bit) != 0;
 }

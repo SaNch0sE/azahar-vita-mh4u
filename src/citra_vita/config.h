@@ -271,6 +271,9 @@ void SetGlobal(Option option, int value);
 /// Gives the title its own value, or with nullopt takes it away (the value for all games again).
 void SetTitleValue(const std::string& title, Option option, std::optional<int> value);
 [[nodiscard]] bool HasTitleValues(const std::string& title);
+/// A title with settings to start from (Loader::TitleSettingDefaultsOf) and none of its own yet:
+/// its own from now on, all games' values with those set.
+void SeedTitleValues(const std::string& title, u64 program_id);
 void ClearTitleValues(const std::string& title);
 
 /// What runs: the pin, else the running title's own value, else the one for all games.

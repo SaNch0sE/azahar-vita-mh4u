@@ -25,6 +25,7 @@
 #include "common/assert.h"
 #include "common/file_util.h"
 #include "common/logging/log.h"
+#include "core/loader/title_patches.h"
 #include "common/mutex.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -821,6 +822,30 @@ void SetTitleValue(const std::string& title, Option option, std::optional<int> v
     }
     pins[i].reset();
     ApplyLocked(option);
+}
+
+void SeedTitleValues(const std::string& title, u64 program_id) {
+    const auto defaults = Loader::TitleSettingDefaultsOf(program_id);
+    std::scoped_lock lock{mutex};
+    if (title.empty() || defaults.empty() || title_values.contains(title)) {
+        return;
+    }
+    Values& values = title_values[title];
+    FillFromGlobal(values);
+    for (const Loader::TitleSettingDefault& d : defaults) {
+        const auto definition =
+            std::find_if(definitions.begin(), definitions.end(),
+                         [&](const Definition& def) { return d.key == std::string_view{def.key}; });
+        ASSERT_MSG(definition != definitions.end() && definition->per_title,
+                   "settings: {} is no title's own setting", d.key);
+        const auto option = static_cast<Option>(definition - definitions.begin());
+        const std::optional<int> value = ParseValue(option, d.value);
+        ASSERT_MSG(value.has_value(), "settings: {} is not a value of {}", d.value, d.key);
+        values[static_cast<std::size_t>(option)] = *value;
+    }
+    dirty = true;
+    LOG_INFO(Frontend, "Settings: {} starts from its {} settings of its own", title,
+             defaults.size());
 }
 
 bool HasTitleValues(const std::string& title) {

@@ -2444,6 +2444,28 @@ std::vector<TitlePatchInfo> TitlePatchesOf(u64 title_id) {
     return patches;
 }
 
+namespace {
+// Monster Hunter 4 Ultimate (USA), as it is played on the Vita: the top screen alone, stretched
+// to the display (the game's menus on it with a single-screen mod), no touches on the bottom
+// screen it does not show; its 3D picture at 1.25x with the HUD at 1.5x holds 30 frames a second,
+// evenly paced.
+constexpr std::array mh4u_setting_defaults{
+    TitleSettingDefault{"screen_layout", "single"},
+    TitleSettingDefault{"widescreen", "stretch"},
+    TitleSettingDefault{"hidden_screen_touch", "off"},
+    TitleSettingDefault{"top_scale", "1.25x"},
+    TitleSettingDefault{"hud_scale", "1.5x"},
+    TitleSettingDefault{"even_frame_pacing", "on"},
+};
+} // Anonymous namespace
+
+std::span<const TitleSettingDefault> TitleSettingDefaultsOf(u64 title_id) {
+    if (title_id == MonsterHunter4UltimateUsa) {
+        return mh4u_setting_defaults;
+    }
+    return {};
+}
+
 u32 TitleTuningOf(u64 title_id) {
     u32 tuning = 0;
     for (const TitlePatch& patch : title_patches) {
