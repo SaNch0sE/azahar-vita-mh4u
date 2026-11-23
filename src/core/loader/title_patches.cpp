@@ -258,10 +258,21 @@ constexpr auto xenoblade_frame_buffer_watcher =
 
 constexpr u64 XenobladeUsa = 0x000400000F700100;
 constexpr u64 MonsterHunter4UltimateUsa = 0x0004000000126300;
+constexpr u64 MonsterHunterXxJpn = 0x0004000000197100;
 
 constexpr std::array title_patches{
     // Monster Hunter 4 Ultimate (USA): no code words, the renderer's work alone.
     TitlePatch{MonsterHunter4UltimateUsa, Translatable("SaNch0sE optimizations"),
+               Translatable("Speed-ups made for this game on the Vita, with the same picture. Its "
+                            "sprite, grass and particle batches get the room they need, and stay "
+                            "short where their sprites lie far apart in the game's data. A screen "
+                            "the layout does not show is not drawn."),
+               std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale |
+                   TuningEvenPacing},
+    // Monster Hunter XX (Japan): MH4U's renderer tuning. Its frame is drawn as MH4U's (the 3D
+    // picture with depth, then the HUD without), so the HUD scale applies; at 1.25x it is held
+    // by the GPU's pixels, and the rest neither speeds it up nor slows it down.
+    TitlePatch{MonsterHunterXxJpn, Translatable("SaNch0sE optimizations"),
                Translatable("Speed-ups made for this game on the Vita, with the same picture. Its "
                             "sprite, grass and particle batches get the room they need, and stay "
                             "short where their sprites lie far apart in the game's data. A screen "
