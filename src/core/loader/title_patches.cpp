@@ -57,6 +57,9 @@ struct TitlePatch {
     /// Brings the game's data along when the patch goes into running code (a state's load
     /// saved without it), or nullptr.
     void (*applied)(Memory::MemorySystem& memory, const Kernel::Process& process) = nullptr;
+    /// TitleTuningBit bits the renderer takes while the title runs; a patch of these alone has
+    /// no words.
+    u32 tuning = 0;
 };
 
 // Xenoblade Chronicles 3D (USA). It draws every object of its 3D scene twice, once an eye, into
@@ -254,8 +257,16 @@ constexpr auto xenoblade_frame_buffer_watcher =
                   0x00478960, xenoblade_frame_buffer_watcher_routine);
 
 constexpr u64 XenobladeUsa = 0x000400000F700100;
+constexpr u64 MonsterHunter4UltimateUsa = 0x0004000000126300;
 
 constexpr std::array title_patches{
+    // Monster Hunter 4 Ultimate (USA): no code words, the renderer's work alone.
+    TitlePatch{MonsterHunter4UltimateUsa, Translatable("SaNch0sE optimizations"),
+               Translatable("Speed-ups made for this game on the Vita, with the same picture. Its "
+                            "sprite, grass and particle batches get the room they need, and stay "
+                            "short where their sprites lie far apart in the game's data. A screen "
+                            "the layout does not show is not drawn."),
+               std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale},
     TitlePatch{XenobladeUsa, Translatable("Left eye only"),
                Translatable("The game draws its 3D scene twice, once per eye, even with 3D off. "
                             "Only one picture is shown, so only the left eye's is drawn."),
@@ -2434,6 +2445,7 @@ std::vector<TitlePatchInfo> TitlePatchesOf(u64 title_id) {
 
 std::vector<bool> ApplyTitlePatches(Core::System& system, const Kernel::Process& process) {
     std::vector<bool> in;
+    title_tuning.store(0, std::memory_order_relaxed);
     if (process.codeset == nullptr) {
         return in;
     }
@@ -2443,6 +2455,7 @@ std::vector<bool> ApplyTitlePatches(Core::System& system, const Kernel::Process&
         if (patch.title_id != title_id) {
             continue;
         }
+        title_tuning.fetch_or(patch.tuning, std::memory_order_relaxed);
         // Each word as the title has it, or as the patch has it (a state saved with the patch).
         bool original = true;
         bool patched = true;

@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <span>
 #include <string>
 #include <string_view>
@@ -53,6 +54,27 @@ std::vector<bool> ApplyTitlePatches(Core::System& system, const Kernel::Process&
  */
 [[nodiscard]] std::string TitlePatchesWarning(u64 title_id, std::string_view product_code,
                                               u16 remaster_version, const std::vector<bool>& in);
+
+/// What a title's built-in patches ask of the renderer, as bits: work done another way for that
+/// title alone, with the same picture, where it is measured to be faster. Every other title is
+/// drawn as before. Set by ApplyTitlePatches for the title loaded.
+enum TitleTuningBit : u32 {
+    /// Geometry shader draws: an invocation's room is its program's bound past the usual share
+    /// (RasterizerSgxd::GeometryStage), and merged runs stop where their vertices lie far apart
+    /// (RenderThread::DrawMerged).
+    TuningGeometryBatches = 1u << 0,
+    /// A screen the frontend's layout does not show (RenderThread::hidden_screen) is not drawn:
+    /// its draws are left out as an unseen right eye's are.
+    TuningHiddenScreen = 1u << 1,
+    /// The HUD scale option applies: the passes that draw the top screen's 2D layer over its
+    /// finished 3D picture are drawn at that scale, the 3D picture at the 3DS's resolution
+    /// (RasterizerSgxd::SetHudScale). A sharper picture, not the same one.
+    TuningHudScale = 1u << 2,
+};
+inline std::atomic<u32> title_tuning{0};
+[[nodiscard]] inline bool TitleTuned(u32 bit) {
+    return (title_tuning.load(std::memory_order_relaxed) & bit) != 0;
+}
 
 /// What Azahar sets an engine setting to where the player has not: the game's own, off or on.
 enum class EngineDefault : u8 { Game, Off, On };

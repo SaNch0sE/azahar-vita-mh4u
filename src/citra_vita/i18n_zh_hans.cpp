@@ -280,6 +280,11 @@ constexpr std::array table{std::to_array<Translation>({
      "of showing each as a block. It costs no speed. For Internal resolution at Native: a higher "
      "one is always smoothed.",
      "将 3DS 画面拉伸到屏幕时混合相邻像素，而不是把每个像素显示为方块。不影响速度。用于原生内部分辨率：更高的分辨率始终平滑。"},
+    {"SaNch0sE optimizations", "SaNch0sE 优化"},
+    {"Speed-ups made for this game on the Vita, with the same picture. Its sprite, grass and "
+     "particle batches get the room they need, and stay short where their sprites lie far apart "
+     "in the game's data. A screen the layout does not show is not drawn.",
+     "为本游戏在 Vita 上所做的提速，画面不变。精灵、草和粒子的批次获得所需的空间，并在精灵于游戏数据中相距较远时保持较短。布局中未显示的屏幕不会被绘制。"},
     {"Touch a hidden bottom screen", "触摸隐藏的下屏"},
     {"With a layout that shows the top screen alone, touching the display still presses the "
      "bottom screen where it would be. Turn it off so that a brush of the display presses "
