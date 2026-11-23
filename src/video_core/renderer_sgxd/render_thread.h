@@ -752,6 +752,13 @@ private:
     [[nodiscard]] std::chrono::microseconds PresentSpacing() const;
     std::array<Pica::FramebufferConfig, 2> pending_fb{};
     std::array<Pica::ColorFill, 2> pending_fill{};
+    /// Even pacing: a second present waits behind the pending one, which is shown first in its
+    /// turn, so a present that comes a refresh early costs no picture (the guest draws into three
+    /// LCD buffers in turn: the one waiting is not drawn over meanwhile). A third takes the place
+    /// of the oldest.
+    bool present_second{};
+    std::array<Pica::FramebufferConfig, 2> second_fb{};
+    std::array<Pica::ColorFill, 2> second_fill{};
     void ShowDuePresent();
     void ShowPresent(const std::array<Pica::FramebufferConfig, 2>& fb,
                      const std::array<Pica::ColorFill, 2>& fill,

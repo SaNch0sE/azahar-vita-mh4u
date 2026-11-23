@@ -4035,8 +4035,15 @@ void RenderThread::ShowDuePresent() {
     if (now - last_present < PresentSpacing() || renderer.PresentBusy()) {
         return;
     }
-    present_pending = false;
-    ShowPresent(pending_fb, pending_fill, now);
+    const auto fb = pending_fb;
+    const auto fill = pending_fill;
+    present_pending = present_second;
+    if (present_second) {
+        pending_fb = second_fb;
+        pending_fill = second_fill;
+        present_second = false;
+    }
+    ShowPresent(fb, fill, now);
 }
 
 void RenderThread::RunRecord(const Head& head, const u8* p) {
@@ -4261,15 +4268,43 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         last_submit = now;
         if (now - last_present < PresentSpacing() || renderer.PresentBusy()) {
             // Too soon after the last, or the last still on the GPU: shown later unless a newer one comes.
+            // Evenly paced, it waits behind the pending one, and the oldest of three gives way.
+            const bool queue = even_pacing.load(std::memory_order_relaxed) && present_pending;
 #ifdef VITA_DIAGNOSTICS
-            if (present_pending) {
+            if (present_pending && (!queue || present_second)) {
                 presents_soon.fetch_add(1, std::memory_order_relaxed);
             }
 #endif
-            present_pending = true;
-            pending_fb = r.fb;
-            pending_fill = r.fill;
+            if (queue) {
+                if (present_second) {
+                    pending_fb = second_fb;
+                    pending_fill = second_fill;
+                }
+                second_fb = r.fb;
+                second_fill = r.fill;
+                present_second = true;
+            } else {
+                present_pending = true;
+                pending_fb = r.fb;
+                pending_fill = r.fill;
+            }
             SgxdTrace("present_pending");
+            break;
+        }
+        if (even_pacing.load(std::memory_order_relaxed) && present_pending) {
+            // Evenly paced, the one that waited is shown in its turn and this one waits.
+            const auto fb = pending_fb;
+            const auto fill = pending_fill;
+            if (present_second) {
+                pending_fb = second_fb;
+                pending_fill = second_fill;
+                second_fb = r.fb;
+                second_fill = r.fill;
+            } else {
+                pending_fb = r.fb;
+                pending_fill = r.fill;
+            }
+            ShowPresent(fb, fill, now);
             break;
         }
 #ifdef VITA_DIAGNOSTICS
@@ -4278,6 +4313,7 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         }
 #endif
         present_pending = false;
+        present_second = false;
         ShowPresent(r.fb, r.fill, now);
         break;
     }
