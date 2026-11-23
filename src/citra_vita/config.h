@@ -46,9 +46,6 @@ enum class Option : u32 {
     /// The top screen's 2D layer's scale where a title's patches offer it
     /// (RasterizerSgxd::SetHudScale): 0 the 3DS's, 1 1.25x, 2 1.5x.
     HudScale,
-    /// The screens at the 3DS's resolution filtered as they are stretched onto the display
-    /// (SgxdPresent::smooth_screens): 1, or 0 for the pixel under each display pixel's centre.
-    SmoothScreens,
     /// The stats overlay over a running title (StatsHud): 1, or 0 for none (the volume still
     /// shows after a volume key). All games' alone; the overlay reads it as it draws.
     StatsOverlay,

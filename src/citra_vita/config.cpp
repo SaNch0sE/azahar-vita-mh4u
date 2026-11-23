@@ -90,7 +90,6 @@ const std::array<Definition, Count> definitions{{
     {"top_scale", true, true, 0, 4, 0, Scales},
     {"msaa", true, true, 0, 1, 0, Toggle},
     {"hud_scale", true, true, 0, 2, 0, HudScales},
-    {"smooth_screens", true, true, 0, 1, 0, Toggle},
     {"stats_overlay", false, true, 0, 1, 1, Toggle},
     {"vsync", true, true, 0, 1, 1, Toggle},
     // Full speed: applied only with vsync off (vsync holds the display's rate itself).
@@ -269,9 +268,6 @@ void ApplyLocked(Option option) {
         break;
     case Option::HudScale:
         SgxdRenderer::RasterizerSgxd::SetHudScale(4 + static_cast<u32>(value));
-        break;
-    case Option::SmoothScreens:
-        SgxdPresent::smooth_screens.store(value != 0, std::memory_order_relaxed);
         break;
     case Option::StatsOverlay:
         StatsHud::SetShown(value != 0);
