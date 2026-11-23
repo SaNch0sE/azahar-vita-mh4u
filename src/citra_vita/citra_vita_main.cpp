@@ -598,7 +598,10 @@ public:
     }
 
 private:
-    static constexpr const char* Path = "host0:azahar-commands.txt";
+    // On the memory card, where a host without a debug link (one that reaches the console's
+    // files over the network) can write it; such a host cannot pass arguments either
+    // (launch.txt), and has no other way to end a run that owns the GPU.
+    static constexpr const char* Path = "ux0:data/azahar/commands.txt";
     SceUInt64 quiet_until_us = 0;
     SceUInt64 last_read_us = 0;
     unsigned long last_seq = 0;
