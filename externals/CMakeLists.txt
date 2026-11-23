@@ -43,7 +43,6 @@ else()
         boost_iostreams
         STATIC
         ${CMAKE_SOURCE_DIR}/externals/boost/libs/iostreams/src/file_descriptor.cpp
-        ${CMAKE_SOURCE_DIR}/externals/boost/libs/iostreams/src/mapped_file.cpp
     )
     target_link_libraries(boost_iostreams PUBLIC boost)
     # Add additional boost libs here; remember to ALIAS them in the root CMakeLists!
