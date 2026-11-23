@@ -52,6 +52,12 @@ public:
     static constexpr u32 RearLeftButton = 0x00000400;
     static constexpr u32 RearRightButton = 0x00000800;
 
+    /// A scripted run (the command channel): no pad is pressed, so the system would turn the
+    /// display off after its idle time, which the emulator takes as a suspend (it pauses the
+    /// title). Set, the pad read keeps the display's timers from running out as well as the
+    /// standby's.
+    static inline bool keep_display_on = false;
+
     explicit EmuWindowVita(Core::System& system);
     ~EmuWindowVita() override;
 

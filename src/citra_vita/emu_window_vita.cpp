@@ -533,7 +533,8 @@ void EmuWindowVita::ReadPad() {
     // automatic one while the emulator runs, as a video player keeps it off. The timer counts
     // minutes.
     if (++pad_reads % 64 == 0) {
-        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+        sceKernelPowerTick(keep_display_on ? SCE_KERNEL_POWER_TICK_DEFAULT
+                                           : SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
     }
 }
 

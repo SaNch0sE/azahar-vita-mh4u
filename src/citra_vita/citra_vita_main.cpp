@@ -3412,6 +3412,7 @@ int main(int argc, char* argv[]) {
                           static_cast<unsigned>(g_arguments.size()));
         }
     }
+    VitaFrontend::EmuWindowVita::keep_display_on = CommandChannel();
 #endif
     SetupTerminateHandler();
     Common::Log::SetStopHook(VitaFrontend::CrashReport::BlankDisplay);
