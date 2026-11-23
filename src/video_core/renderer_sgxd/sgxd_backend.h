@@ -452,6 +452,11 @@ public:
     /// magnified to the scale (nearest).
     void BeginPassLoadedScaled(const PicaTarget& target, float depth, const UntileSource& guest,
                                bool magnified, const std::function<void()>& before = {});
+    /// A target drawn scaled whose first draw reads another picture of the same buffer (`source`,
+    /// rows of source_stride texels, source_rows of them, at a smaller scale) over all of it,
+    /// through the bilinear filter: the buffer's colour as that picture holds it, magnified.
+    void BeginPassFromPicture(const PicaTarget& target, float depth, u32 source, u32 source_stride,
+                              u32 source_rows, const PictureFormat& source_format);
     /// In a pass BeginPassLoadedScaled opened from its picture: rows (the guest's whole strips
     /// of the buffer from its row first_row on) drawn over the load from guest memory, each
     /// texel magnified to the scale (nearest): the picture's rows older than guest memory. The

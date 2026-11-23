@@ -1929,6 +1929,24 @@ void SgxdBackend::BeginPassLoadedScaled(const PicaTarget& target, float depth,
     Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
 }
 
+void SgxdBackend::BeginPassFromPicture(const PicaTarget& target, float depth, u32 source,
+                                       u32 source_stride, u32 source_rows,
+                                       const PictureFormat& source_format) {
+    DEBUG_ASSERT(target.picture != 0 && source != 0 && source != target.picture);
+    OpenPass(target.gpu, target.height, target.width, target.pack, 0, depth, &target);
+    const Recipe& r = *current;
+    pass_source = {source, source + source_stride * source_rows * source_format.bpp};
+    // Every pixel of the target from the source picture's, filtered: target pixel x reads
+    // source column x * source_stride / width.
+    const float scale_x = static_cast<float>(source_stride) / static_cast<float>(r.width);
+    const float scale_y = static_cast<float>(source_rows) / static_cast<float>(r.height);
+    const SgxdRecipeDrawPrograms p = BlitPrograms(Data{nullptr, source}, r.width, r.height,
+                                                  source_stride, scale_x, scale_y, 0, false,
+                                                  nullptr, source_format);
+    const u32 isp = 7u << 22 | 1u << 20 | 1u << 9;
+    Draw(SgxdRecipeDraw{0, 6, isp, SGXD_R_FPRIM, 0, 0, nullptr}, p);
+}
+
 void SgxdBackend::LoadGuestRowsScaled(const PicaTarget& target, const UntileSource& rows,
                                       u32 first_row, bool first) {
     DEBUG_ASSERT(in_pass && target.picture != 0);
@@ -2837,8 +2855,10 @@ SgxdRecipeDrawPrograms SgxdBackend::BlitPrograms(const Data& source, u32 width, 
                                                  const PassRect* rect,
                                                  const PictureFormat& format) {
     const u32 source_rows = static_cast<u32>(std::lround(height * scale_y));
-    DEBUG_ASSERT(scale_x >= 1 && scale_x <= 2 && scale_y >= 1 && scale_y <= 2 &&
-                 static_cast<float>(source_rows) == height * scale_y);
+    // 1 to 2: the source is the larger (a downscale). Under 1 (BeginPassFromPicture): the source
+    // is the smaller and its texels are spread over the target through the bilinear filter.
+    DEBUG_ASSERT(scale_x >= 0.5f && scale_x <= 2 && scale_y >= 0.5f && scale_y <= 2 &&
+                 std::abs(static_cast<float>(source_rows) - height * scale_y) < 0.01f);
     const u32 stride = source_stride != 0 ? source_stride : width;
     PlaceFixedPrograms();
     // Two triangles over the target: x, y, z, w, a white colour (unused), u, v. Pixel row y

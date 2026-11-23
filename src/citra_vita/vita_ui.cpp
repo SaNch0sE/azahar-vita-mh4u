@@ -1767,6 +1767,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::HudScale,
+         Category::Display,
+         Kind::Choice,
+         Translatable("HUD resolution"),
+         Translatable("Draws the top screen's HUD, text and menus at a higher resolution over the "
+                      "3D picture, which stays at the 3DS's: sharper text for little GPU work. Only "
+                      "in games whose patches offer it, and with Internal resolution at Native."),
+         {Translatable("Native"), "1.25x", "1.5x"},
+         0,
+         nullptr,
+         nullptr});
     add({Option::SmoothScreens,
          Category::Display,
          Kind::Toggle,

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <array>
 #include <limits>
 #include <list>
@@ -107,6 +108,13 @@ public:
     [[nodiscard]] static u32 Widescreen();
     /// 2x MSAA on the top screen (every other buffer at 1x while it is on). Any thread.
     static void SetTopMsaa(bool on);
+    /// The HUD scale option, in quarters (4: off; 5 or 6): for a title with TuningHudScale, the
+    /// top screen's 2D layer is drawn at this scale over its 3D picture, which stays at the 3DS's
+    /// resolution (PictureShapeFor). Not with an internal resolution above 1x, widescreen margins
+    /// or MSAA, which scale the whole screen. Any thread.
+    static void SetHudScale(u32 quarters);
+    /// What applies now: SetHudScale's for a title with the tuning, else 4.
+    [[nodiscard]] static u32 HudScale();
     [[nodiscard]] static bool TopMsaa();
     /// Whether the top screen's pictures are other than 1x ones: upscaled, widescreen or 2x.
     [[nodiscard]] static bool TopPictures();
@@ -1043,6 +1051,15 @@ private:
     void NoteTopDepth(PAddr depth);
     /// A list: a pass's picture stays in place while the pass beside makes or drops another.
     std::list<Upscaled> upscaled;
+    /// The HUD scale's frame: a pass with depth has drawn a top screen buffer's 3D picture
+    /// (hud_world_done), a pass at the HUD's scale has opened since (hud_layer_open); both until
+    /// the next display transfer. hud_holdoff: transfers to go before the layer is scaled again.
+    bool hud_world_done = false;
+    bool hud_layer_open = false;
+    u32 hud_holdoff = 0;
+    static constexpr u32 HudHoldoffFrames = 60;
+    u32 hud_opens = 0;           ///< perflog: layer passes opened from the 1x picture
+    u32 hud_depth_fallbacks = 0; ///< perflog: depth draws that took the layer back to 1x
     Upscaled* pass_upscaled = nullptr;           ///< the open pass's buffer, drawn scaled
     SgxdBackend::PicaTarget pass_scaled_target{}; ///< its target, for DownscalePicture after it
     /// Its target's part before a load of outdated rows made it all of the buffer.

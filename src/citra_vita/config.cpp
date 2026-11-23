@@ -60,6 +60,7 @@ const std::vector<const char*> Layouts{"default", "single", "large",  "side",
 /// The file's word for a custom screen layout: this, then its name.
 constexpr char CustomLayoutWord[] = "custom:";
 const std::vector<const char*> Scales{"1x", "1.25x", "1.5x", "1.75x", "2x"};
+const std::vector<const char*> HudScales{"1x", "1.25x", "1.5x"};
 const std::vector<const char*> Skips{"0", "1", "2", "3", "4", "none"};
 const std::vector<const char*> Regions{"auto",      "japan", "usa",   "europe",
                                        "australia", "china", "korea", "taiwan"};
@@ -88,6 +89,7 @@ const std::array<Definition, Count> definitions{{
     {"widescreen", true, true, 0, 2, 0, WidescreenWords},
     {"top_scale", true, true, 0, 4, 0, Scales},
     {"msaa", true, true, 0, 1, 0, Toggle},
+    {"hud_scale", true, true, 0, 2, 0, HudScales},
     {"smooth_screens", true, true, 0, 1, 0, Toggle},
     {"stats_overlay", false, true, 0, 1, 1, Toggle},
     {"vsync", true, true, 0, 1, 1, Toggle},
@@ -263,6 +265,9 @@ void ApplyLocked(Option option) {
         break;
     case Option::Msaa:
         SgxdRenderer::RasterizerSgxd::SetTopMsaa(value != 0);
+        break;
+    case Option::HudScale:
+        SgxdRenderer::RasterizerSgxd::SetHudScale(4 + static_cast<u32>(value));
         break;
     case Option::SmoothScreens:
         SgxdPresent::smooth_screens.store(value != 0, std::memory_order_relaxed);

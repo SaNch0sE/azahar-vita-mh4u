@@ -276,6 +276,11 @@ constexpr std::array table{std::to_array<Translation>({
     {"Model files reported", "上报模型文件"},
     {"Motion controls", "体感操作"},
     {"Smooth picture", "平滑画面"},
+    {"HUD resolution", "HUD 分辨率"},
+    {"Draws the top screen's HUD, text and menus at a higher resolution over the 3D picture, which "
+     "stays at the 3DS's: sharper text for little GPU work. Only in games whose patches offer it, "
+     "and with Internal resolution at Native.",
+     "以更高的分辨率在 3D 画面之上绘制上屏的 HUD、文字和菜单，3D 画面保持 3DS 的分辨率：文字更清晰，GPU 开销很小。仅适用于补丁提供此功能的游戏，且内部分辨率须为原生。"},
     {"Blends neighbouring pixels where the 3DS's picture is stretched onto the display, instead "
      "of showing each as a block. It costs no speed. For Internal resolution at Native: a higher "
      "one is always smoothed.",
