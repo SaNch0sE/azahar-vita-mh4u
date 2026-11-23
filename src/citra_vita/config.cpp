@@ -18,6 +18,7 @@
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/i18n.h"
 #include "citra_vita/input_factory_vita.h"
+#include "citra_vita/sgxd_present.h"
 #include "citra_vita/stats_hud.h"
 #include "citra_vita/uvc_stream.h"
 #include "common/assert.h"
@@ -87,6 +88,7 @@ const std::array<Definition, Count> definitions{{
     {"widescreen", true, true, 0, 2, 0, WidescreenWords},
     {"top_scale", true, true, 0, 4, 0, Scales},
     {"msaa", true, true, 0, 1, 0, Toggle},
+    {"smooth_screens", true, true, 0, 1, 0, Toggle},
     {"stats_overlay", false, true, 0, 1, 1, Toggle},
     {"vsync", true, true, 0, 1, 1, Toggle},
     // Full speed: applied only with vsync off (vsync holds the display's rate itself).
@@ -260,6 +262,9 @@ void ApplyLocked(Option option) {
         break;
     case Option::Msaa:
         SgxdRenderer::RasterizerSgxd::SetTopMsaa(value != 0);
+        break;
+    case Option::SmoothScreens:
+        SgxdPresent::smooth_screens.store(value != 0, std::memory_order_relaxed);
         break;
     case Option::StatsOverlay:
         StatsHud::SetShown(value != 0);

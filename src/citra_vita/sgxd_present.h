@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include "citra_vita/screen_layout.h"
 #include "common/common_types.h"
@@ -15,6 +16,10 @@ struct SgxdRecipeDraw;
 // (vsync) or at once. A present waits for no vblank, so a loop that presents paces itself. No
 // GXM call may run while it is initialised: SceGpu's callers wait at its gate until Shutdown.
 namespace VitaFrontend::SgxdPresent {
+
+/// The Smooth picture option: a screen drawn from the guest's own buffer (the 3DS's resolution)
+/// is read through the bilinear filter as it is stretched onto the display. Off, point sampled.
+inline std::atomic<bool> smooth_screens{false};
 
 inline constexpr u32 DisplayWidth = 960;
 inline constexpr u32 DisplayHeight = 544;

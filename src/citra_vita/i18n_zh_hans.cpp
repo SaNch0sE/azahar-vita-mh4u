@@ -275,6 +275,11 @@ constexpr std::array table{std::to_array<Translation>({
     {"Menu theme", "菜单主题"},
     {"Model files reported", "上报模型文件"},
     {"Motion controls", "体感操作"},
+    {"Smooth picture", "平滑画面"},
+    {"Blends neighbouring pixels where the 3DS's picture is stretched onto the display, instead "
+     "of showing each as a block. It costs no speed. For Internal resolution at Native: a higher "
+     "one is always smoothed.",
+     "将 3DS 画面拉伸到屏幕时混合相邻像素，而不是把每个像素显示为方块。不影响速度。用于原生内部分辨率：更高的分辨率始终平滑。"},
     {"Move: d-pad, left stick or drag. Size: L, R or pinch.", "移动：方向键、左摇杆或拖动。大小：L、R 或双指缩放。"},
     {"Move: d-pad, left stick or drag. Size: L, R or pinch. Stretch: right stick.",
      "移动：方向键、左摇杆或拖动。缩放：L、R 或双指捏合。拉伸：右摇杆。"},

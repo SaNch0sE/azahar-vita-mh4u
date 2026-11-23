@@ -1767,6 +1767,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::SmoothScreens,
+         Category::Display,
+         Kind::Toggle,
+         Translatable("Smooth picture"),
+         Translatable("Blends neighbouring pixels where the 3DS's picture is stretched onto the "
+                      "display, instead of showing each as a block. It costs no speed. For "
+                      "Internal resolution at Native: a higher one is always smoothed."),
+         {},
+         0,
+         nullptr,
+         nullptr});
     add({Option::StatsOverlay,
          Category::Display,
          Kind::Toggle,

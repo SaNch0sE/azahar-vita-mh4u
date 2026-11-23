@@ -43,6 +43,9 @@ enum class Option : u32 {
     TopScale,
     /// 2x MSAA on the top screen (RasterizerSgxd::SetTopMsaa): 0 off, 1 on.
     Msaa,
+    /// The screens at the 3DS's resolution filtered as they are stretched onto the display
+    /// (SgxdPresent::smooth_screens): 1, or 0 for the pixel under each display pixel's centre.
+    SmoothScreens,
     /// The stats overlay over a running title (StatsHud): 1, or 0 for none (the volume still
     /// shows after a volume key). All games' alone; the overlay reads it as it draws.
     StatsOverlay,

@@ -1045,7 +1045,11 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
         return false;
     }
     const u32 texels = stride / bytes;
-    const float u_end = 240.0f / static_cast<float>(texels);
+    // Filtered (smooth_screens), u stops half a texel short of the 240th where the texture goes
+    // on past it, so the last row blends with nothing beyond the picture.
+    const bool smooth = smooth_screens.load(std::memory_order_relaxed);
+    const float u_end =
+        (smooth && texels > 240 ? 239.5f : 240.0f) / static_cast<float>(texels);
     const u32 slot = g.screens_in_frame++;
     g.touches[slot * 2] = va;
     g.touches[slot * 2 + 1] = va + stride * columns;
@@ -1068,7 +1072,7 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
     // alpha as one (RGBA as RGB1: the LCD shows no alpha).
     const bool blend = opacity < 1.0f;
     u32 tex[4];
-    sgxd_recipe_texture_words_format(va, texels, columns, blend ? 1 : 0, code,
+    sgxd_recipe_texture_words_format(va, texels, columns, blend || smooth ? 1 : 0, code,
                                      blend && swizzle == 2 ? 6 : swizzle, tex);
     const State::PixelEntry& e = PixelEntryFor(tex, blend);
     SgxdRecipeDrawPrograms& p = g.screen_programs[slot];
