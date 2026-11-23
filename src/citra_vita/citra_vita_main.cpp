@@ -3385,6 +3385,31 @@ int main(int argc, char* argv[]) {
         }
         g_arguments.emplace_back(argv[i]);
     }
+#ifdef VITA_DEBUG_TOOLS
+    // A scripted launch from a host that cannot pass arguments: ux0:data/azahar/launch.txt holds
+    // them one a line (the title's path first, or `-`), and is removed as it is read, so only the
+    // launch after it was written takes them. A restart carries them on as any arguments.
+    if (g_arguments.empty() && !relaunched) {
+        static constexpr const char* LaunchFile = "ux0:data/azahar/launch.txt";
+        if (FILE* f = std::fopen(LaunchFile, "rb")) {
+            char line[1024];
+            while (std::fgets(line, sizeof(line), f) != nullptr) {
+                std::string argument{line};
+                while (!argument.empty() && (argument.back() == '\n' || argument.back() == '\r' ||
+                                             argument.back() == ' ')) {
+                    argument.pop_back();
+                }
+                if (!argument.empty()) {
+                    g_arguments.push_back(std::move(argument));
+                }
+            }
+            std::fclose(f);
+            sceIoRemove(LaunchFile);
+            sceClibPrintf("[azahar] launch.txt: %u arguments\n",
+                          static_cast<unsigned>(g_arguments.size()));
+        }
+    }
+#endif
     SetupTerminateHandler();
     Common::Log::SetStopHook(VitaFrontend::CrashReport::BlankDisplay);
     VitaFrontend::CrashReport::PrintLast();
