@@ -2892,14 +2892,19 @@ bool ARM_VitaNative::GuardStore(u32 va, bool write, u32 pc) {
 
 namespace {
 
-/// A store the guard traps: str rT, [rN, #+-imm] or vstr sD, [rN, #+-imm * 4], no write-back,
-/// rT not the PC.
+/// str rT, [rN, +-rM]: a register offset unshifted, no write-back, rT and rM not the PC.
+bool GuardRegisterStore(u32 insn) {
+    return (insn & 0x0F700FF0u) == 0x07000000u && ((insn >> 12) & 15) != 15 && (insn & 15) != 15;
+}
+
+/// A store the guard traps: str rT, [rN, #+-imm], str rT, [rN, +-rM] or vstr sD, [rN, #+-imm * 4],
+/// no write-back, rT not the PC.
 bool GuardTrappable(u32 insn) {
     if ((insn >> 28) == 0xF) {
         return false;
     }
     return ((insn & 0x0F700000u) == 0x05000000u && ((insn >> 12) & 15) != 15) ||
-           (insn & 0x0F300F00u) == 0x0D000A00u;
+           GuardRegisterStore(insn) || (insn & 0x0F300F00u) == 0x0D000A00u;
 }
 
 } // namespace
@@ -2948,7 +2953,8 @@ bool ARM_VitaNative::GuardTrap() {
             addr = up ? base + off : base - off;
             value = run.ctx.fpregs[((insn >> 12) & 15) << 1 | ((insn >> 22) & 1)];
         } else {
-            const u32 off = insn & 0xFFF;
+            // The offset register read as the instruction reads it (the PC is no offset here).
+            const u32 off = GuardRegisterStore(insn) ? run.ctx.r[insn & 15] : insn & 0xFFF;
             addr = up ? base + off : base - off;
             value = run.ctx.r[(insn >> 12) & 15];
         }
