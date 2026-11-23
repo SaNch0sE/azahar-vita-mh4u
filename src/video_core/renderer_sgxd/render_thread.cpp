@@ -4058,14 +4058,22 @@ std::chrono::microseconds RenderThread::PresentSpacing() const {
     if (!even_pacing.load(std::memory_order_relaxed) || Settings::values.use_vsync.GetValue()) {
         return PresentInterval;
     }
-    // The title's presents come every n refreshes: n refreshes apart, less what lets a flip at
-    // the nth refresh through. One a refresh: PresentInterval, as without the option.
+    // A title on a beat of two refreshes: two refreshes apart, less what lets a flip at the second
+    // through. Any other pace: PresentInterval, as without the option.
     constexpr s64 RefreshUs = 16667;
-    const s64 n = std::clamp<s64>((submit_period.count() + RefreshUs / 2) / RefreshUs, 1, 4);
-    if (n <= 1) {
+    if (PaceRefreshes() != 2) {
         return PresentInterval;
     }
-    return std::chrono::microseconds(n * RefreshUs - 1500);
+    return std::chrono::microseconds(2 * RefreshUs - 1500);
+}
+
+u32 RenderThread::PaceRefreshes() const {
+    // Paced only where the presents come a steady two refreshes apart (30 a second). A title that
+    // presents at another pace, or now and then (a notice, a loading screen), is shown as it
+    // comes: spaced by its own slow pace, the display queue would fill and hold the emulation,
+    // which then presents slower still.
+    const s64 us = submit_period.count();
+    return even_pacing.load(std::memory_order_relaxed) && us >= 28000 && us <= 40000 ? 2 : 1;
 }
 
 void RenderThread::ShowDuePresent() {
@@ -4316,11 +4324,7 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
             submit_period = {};
         }
         last_submit = now;
-        flip_refreshes.store(
-            even_pacing.load(std::memory_order_relaxed)
-                ? static_cast<u32>(std::clamp<s64>((submit_period.count() + 8333) / 16667, 1, 4))
-                : 1u,
-            std::memory_order_relaxed);
+        flip_refreshes.store(PaceRefreshes(), std::memory_order_relaxed);
         if (now - last_present < PresentSpacing() || renderer.PresentBusy()) {
             // Too soon after the last, or the last still on the GPU: shown later unless a newer one comes.
             // Evenly paced, it waits behind the pending one, and the oldest of three gives way.

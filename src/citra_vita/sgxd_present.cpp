@@ -947,8 +947,9 @@ void DisplayLoop() {
         u8* const buffer = g.buffers + static_cast<std::size_t>(index) * DisplayBufferSize;
         // Even pacing: a title that presents every nth refresh has its pictures set n refreshes
         // apart, counted from the refresh the last one was taken at. One that comes early waits
-        // here in the queue (nothing is dropped: with the queue full the render thread waits);
-        // with two waiting the next goes a refresh sooner, so the queue does not stay full.
+        // here in the queue (nothing is dropped). With two waiting the next goes at the next
+        // refresh: the queue never stays full, so the pacing never holds the render thread, and
+        // through it the emulation, behind.
         static u16 last_taken = 0;
         static bool taken_once = false;
         if (const u32 n = SgxdRenderer::RenderThread::flip_refreshes.load(std::memory_order_relaxed);
@@ -958,7 +959,7 @@ void DisplayLoop() {
                 std::scoped_lock lk{DisplayGate()};
                 waiting = g.queued;
             }
-            const u16 due = static_cast<u16>(last_taken + (waiting >= 2 ? n - 1 : n));
+            const u16 due = static_cast<u16>(last_taken + (waiting >= 2 ? 1 : n));
             // A NEXTFRAME set is taken at the count after the call's.
             for (u32 guard = 0; guard < 8; guard++) {
                 const u16 next = static_cast<u16>(sceDisplayGetVcount() + 1);
