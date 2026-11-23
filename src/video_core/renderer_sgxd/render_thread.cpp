@@ -39,6 +39,7 @@
 
 namespace SgxdRenderer {
 
+
 enum class RenderThread::Op : u16 {
     /// The rest of the ring is unused: the next record is at its start.
     Wrap,
@@ -4012,12 +4013,26 @@ void RenderThread::ShowPresent(const std::array<Pica::FramebufferConfig, 2>& fb,
 #endif
 }
 
+std::chrono::microseconds RenderThread::PresentSpacing() const {
+    if (!even_pacing.load(std::memory_order_relaxed)) {
+        return PresentInterval;
+    }
+    // The title's presents come every n refreshes: n refreshes apart, less what lets a flip at
+    // the nth refresh through. One a refresh: PresentInterval, as without the option.
+    constexpr s64 RefreshUs = 16667;
+    const s64 n = std::clamp<s64>((submit_period.count() + RefreshUs / 2) / RefreshUs, 1, 4);
+    if (n <= 1) {
+        return PresentInterval;
+    }
+    return std::chrono::microseconds(n * RefreshUs - 1500);
+}
+
 void RenderThread::ShowDuePresent() {
     if (!present_pending) {
         return;
     }
     const auto now = Clock::now();
-    if (now - last_present < PresentInterval || renderer.PresentBusy()) {
+    if (now - last_present < PresentSpacing() || renderer.PresentBusy()) {
         return;
     }
     present_pending = false;
@@ -4235,7 +4250,16 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
             break;
         }
         const auto now = Clock::now();
-        if (now - last_present < PresentInterval || renderer.PresentBusy()) {
+        // The emulation's pace, for PresentSpacing: the time between its presents, smoothed over
+        // eight; a pause (a load, the menu) starts it again.
+        if (const auto since = std::chrono::duration_cast<std::chrono::microseconds>(now - last_submit);
+            since.count() > 5000 && since.count() < 200000) {
+            submit_period = submit_period.count() == 0 ? since : (submit_period * 7 + since) / 8;
+        } else if (since.count() >= 200000) {
+            submit_period = {};
+        }
+        last_submit = now;
+        if (now - last_present < PresentSpacing() || renderer.PresentBusy()) {
             // Too soon after the last, or the last still on the GPU: shown later unless a newer one comes.
 #ifdef VITA_DIAGNOSTICS
             if (present_pending) {
@@ -4458,7 +4482,7 @@ void RenderThread::Loop() {
                 if (present_pending) {
                     // Its interval, or the last present's GPU work, polled every 2 ms.
                     sleep = std::clamp(std::chrono::duration_cast<std::chrono::microseconds>(
-                                           last_present + PresentInterval - now),
+                                           last_present + PresentSpacing() - now),
                                        std::chrono::microseconds(2000), sleep);
                 }
                 // The window's present drawn and held for its paced flip (FlipDone).

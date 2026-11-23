@@ -70,6 +70,9 @@ public:
     /// The screen the frontend's layout does not show (0 the top, 1 the bottom), or -1 when it
     /// shows both. With the title's TuningHiddenScreen its draws are left out. Any thread.
     static inline std::atomic<s8> hidden_screen{-1};
+    /// The Even frame pacing option: presents are spaced by the title's own rate (PresentSpacing)
+    /// in place of PresentInterval alone. Any thread.
+    static inline std::atomic<bool> even_pacing{false};
     static void SetReadbackHolds(bool on);
     [[nodiscard]] static u32 MaxScreenSkips();
     static constexpr u32 NoScreenSkipLimit = 0xFFFFFFFF;
@@ -741,6 +744,12 @@ private:
     /// A present within PresentInterval of the last, or while the last one is still on the GPU, shown
     /// once both allow unless a newer one takes its place (presents come in bursts).
     bool present_pending{};
+    /// Even pacing (even_pacing): the time between the presents the emulation sends, smoothed, and
+    /// the last one's time. A title that sends one every second refresh has its presents spaced
+    /// two refreshes apart: one that comes a refresh early waits for its turn (PresentSpacing).
+    Common::ProcessClock::time_point last_submit{};
+    std::chrono::microseconds submit_period{};
+    [[nodiscard]] std::chrono::microseconds PresentSpacing() const;
     std::array<Pica::FramebufferConfig, 2> pending_fb{};
     std::array<Pica::ColorFill, 2> pending_fill{};
     void ShowDuePresent();

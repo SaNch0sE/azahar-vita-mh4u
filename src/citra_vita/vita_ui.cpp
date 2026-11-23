@@ -1857,6 +1857,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::EvenPacing,
+         Category::Speed,
+         Kind::Toggle,
+         Translatable("Even frame pacing"),
+         Translatable("Shows a game's pictures at an even beat: one that is ready early waits for "
+                      "its turn. For a game that runs at 30 frames a second and still looks "
+                      "choppy. It can show a picture up to one refresh (17 ms) later."),
+         {},
+         0,
+         nullptr,
+         nullptr});
     add({Option::SimulateGpuTimings,
          Category::Speed,
          Kind::Toggle,
