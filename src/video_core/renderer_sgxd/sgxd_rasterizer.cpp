@@ -8230,6 +8230,17 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     if (backend.InPass() && pass_part != part && !KeepPassForViewport(target)) {
         EndPass("a draw with another viewport");
     }
+    // The HUD scale over a 3D picture above 1x: a draw with depth in a pass at the HUD's scale (a 3D
+    // preview a menu draws in the pass of its 2D layer) would find no depth at that scale, and guest
+    // memory's is stale (the 3D picture's depth is in its store at HudBase). The pass ends, and the
+    // layer goes back to HudBase a while (hud_holdoff), as for a depth pass after the layer. At 1x
+    // the 3D picture's depth is guest memory's, which the pass loads magnified.
+    if (backend.InPass() && uses_depth && pass_upscaled && HudLayered() && HudBase() != 4 &&
+        pass_quarters == HudScale() && pass_margin == 0) {
+        hud_holdoff = HudHoldoffFrames;
+        hud_depth_fallbacks++;
+        EndPass("a draw with depth in the HUD layer");
+    }
     // A viewport off the store's grid keeps its fragments by the ISP's mask (MaskOutside): no kill, no
     // punch-through. A draw with another viewport after the mask starts the next pass (a mask set again
     // is not verified). A pass masked to its part keeps its draws with that viewport.
