@@ -168,6 +168,8 @@ void EmuWindowVita::UpdateCurrentFramebufferLayout() {
     draw_order = layout.front == Screen::Top ? std::array<u32, 2>{1, 0} : std::array<u32, 2>{0, 1};
     // Every touch on the display goes back through the bottom screen's transformation.
     touch_from_display = layout[Screen::Bottom].transform.Inverse();
+    // The Hidden screen touch option, off: a bottom screen that is not shown takes no touch.
+    touch_screen_shown = layout[Screen::Bottom].shown;
     NotifyFramebufferLayoutChanged(record);
 }
 
@@ -671,8 +673,11 @@ void EmuWindowVita::UpdateTouch() {
     const ScreenLayouts::Point on_screen_point = touch_from_display.Apply(*touch_at);
     if (!touch_down) {
         touch_down = true;
-        touch_on_screen = on_screen_point.x >= 0.0f && on_screen_point.x < 1.0f &&
-                          on_screen_point.y >= 0.0f && on_screen_point.y < 1.0f;
+        touch_on_screen = (touch_screen_shown ||
+                           hidden_screen_touch.load(std::memory_order_relaxed)) &&
+                          on_screen_point.x >= 0.0f &&
+                          on_screen_point.x < 1.0f && on_screen_point.y >= 0.0f &&
+                          on_screen_point.y < 1.0f;
     }
     if (touch_on_screen) {
         press(on_screen_point.x, on_screen_point.y);

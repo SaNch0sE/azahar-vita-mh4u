@@ -58,6 +58,10 @@ public:
     /// standby's.
     static inline bool keep_display_on = false;
 
+    /// The Hidden screen touch option: whether a touch reaches a bottom screen the layout does
+    /// not show. Off, a brush of the panel presses nothing while the top screen is alone.
+    static inline std::atomic<bool> hidden_screen_touch{true};
+
     explicit EmuWindowVita(Core::System& system);
     ~EmuWindowVita() override;
 
@@ -308,6 +312,7 @@ private:
     std::array<PlacedScreen, 2> placed{};
     std::array<u32, 2> draw_order{0, 1};
     ScreenLayouts::Affine touch_from_display{};
+    bool touch_screen_shown = true; ///< the layout shows the bottom screen (its touches count)
     /// PaceFrame: the display's vblank count the next guest frame waits for, and whether the
     /// cadence runs (a frame paced the last time). 16 bits, as sceDisplayGetVcount counts.
     u16 pace_target{};

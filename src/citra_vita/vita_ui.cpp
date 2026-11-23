@@ -1986,6 +1986,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::HiddenScreenTouch,
+         Category::Controls,
+         Kind::Toggle,
+         Translatable("Touch a hidden bottom screen"),
+         Translatable("With a layout that shows the top screen alone, touching the display still "
+                      "presses the bottom screen where it would be. Turn it off so that a brush "
+                      "of the display presses nothing."),
+         {},
+         0,
+         nullptr,
+         nullptr});
 
     // System: the console and the menus.
     add({Option::Theme,

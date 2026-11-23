@@ -95,6 +95,10 @@ enum class Option : u32 {
     /// The 3DS's accelerometer and gyroscope from the Vita's (VitaMotion): 1, or 0 for none
     /// (both read zero).
     Motion,
+    /// Touches on a bottom screen the layout does not show (the top screen alone on the display):
+    /// 1 they reach the game where the screen would lie, 0 they touch nothing
+    /// (EmuWindowVita::hidden_screen_touch).
+    HiddenScreenTouch,
     RightStick,
     /// What swaps the screens while a title runs (Shortcut): a button pressed with PS held, a rear
     /// panel half, or nothing.

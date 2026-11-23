@@ -118,6 +118,7 @@ const std::array<Definition, Count> definitions{{
     {"map_select", true, true, 0, 14, 11, Inputs},
     {"control_layout", true, true, 0, 0, 0, ControlLayoutWords},
     {"motion", true, true, 0, 1, 1, Toggle},
+    {"hidden_screen_touch", true, true, 0, 1, 1, Toggle},
     {"right_stick", true, true, 0, static_cast<int>(RightStickMode::Count) - 1, 0, RightStickWords},
     // PS + cross.
     {"swap_shortcut", true, true, 0, static_cast<int>(Shortcut::Count) - 1, 1, ShortcutWords},
@@ -349,6 +350,9 @@ void ApplyLocked(Option option) {
         break;
     case Option::Motion:
         SetMotion(value != 0);
+        break;
+    case Option::HiddenScreenTouch:
+        EmuWindowVita::hidden_screen_touch.store(value != 0, std::memory_order_relaxed);
         break;
     case Option::RightStick:
         SetRightStick(static_cast<RightStickMode>(value));

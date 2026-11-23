@@ -280,6 +280,11 @@ constexpr std::array table{std::to_array<Translation>({
      "of showing each as a block. It costs no speed. For Internal resolution at Native: a higher "
      "one is always smoothed.",
      "将 3DS 画面拉伸到屏幕时混合相邻像素，而不是把每个像素显示为方块。不影响速度。用于原生内部分辨率：更高的分辨率始终平滑。"},
+    {"Touch a hidden bottom screen", "触摸隐藏的下屏"},
+    {"With a layout that shows the top screen alone, touching the display still presses the "
+     "bottom screen where it would be. Turn it off so that a brush of the display presses "
+     "nothing.",
+     "在只显示上屏的布局中，触摸屏幕仍会按到下屏原本所在的位置。关闭后，误触屏幕不会按到任何东西。"},
     {"Move: d-pad, left stick or drag. Size: L, R or pinch.", "移动：方向键、左摇杆或拖动。大小：L、R 或双指缩放。"},
     {"Move: d-pad, left stick or drag. Size: L, R or pinch. Stretch: right stick.",
      "移动：方向键、左摇杆或拖动。缩放：L、R 或双指捏合。拉伸：右摇杆。"},
