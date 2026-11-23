@@ -255,6 +255,26 @@ public:
 
     void Write(const Entry& entry) override {
         const std::string text = FormatLogMessage(entry).append(1, '\n');
+#ifdef VITA_DIAGNOSTICS
+        // perflog's lines go to ux0:data/azahar/perflog.txt, a block at a time: the debug
+        // channel drops most of a second's hundred lines, and printing them takes the threads'
+        // time. Under Impl's writing lock, as every Write is.
+        if (text.find("perf: ") != std::string::npos ||
+            text.find("EndOnePass") != std::string::npos) {
+            static std::string pending;
+            static bool started = false;
+            pending += text;
+            if (pending.size() >= 24 * 1024) {
+                if (FILE* f = std::fopen("ux0:data/azahar/perflog.txt", started ? "ab" : "wb")) {
+                    std::fwrite(pending.data(), 1, pending.size(), f);
+                    std::fclose(f);
+                }
+                started = true;
+                pending.clear();
+            }
+            return;
+        }
+#endif
         sceClibPrintf("%s", text.c_str());
         if (entry.log_level == Level::Critical) {
             AppendCrashReport(text);
