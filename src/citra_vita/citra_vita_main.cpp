@@ -2055,9 +2055,14 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 #ifdef VITA_DEBUG_TOOLS
                 if (stats_log) {
                     const u32 g10 = game_fps10.load(std::memory_order_relaxed);
-                    LOG_INFO(Frontend, "stats: speed {}% game {}.{} fps shown {} fps",
+                    // With the presents' gaps at three stages, each to 20 ms / 37 / 54 / longer.
+                    const auto p = SgxdRenderer::RenderThread::TakePaceGaps();
+                    LOG_INFO(Frontend,
+                             "stats: speed {}% game {}.{} fps shown {} fps; gaps handed {} {} {} "
+                             "{} reached {} {} {} {} shown {} {} {} {}",
                              speed_percent.load(std::memory_order_relaxed), g10 / 10, g10 % 10,
-                             shown - last_shown);
+                             shown - last_shown, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+                             p[8], p[9], p[10], p[11]);
                 }
 #endif
                 last_shown = shown;

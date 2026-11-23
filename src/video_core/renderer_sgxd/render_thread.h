@@ -73,6 +73,11 @@ public:
     /// The Even frame pacing option: presents are spaced by the title's own rate (PresentSpacing)
     /// in place of PresentInterval alone. Any thread.
     static inline std::atomic<bool> even_pacing{false};
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
+    /// The presents' gaps since the last call at three stages (handed over by the emulation,
+    /// reached by the render thread, shown), four spans each: to 20 ms, to 37, to 54, longer.
+    [[nodiscard]] static std::array<u32, 12> TakePaceGaps();
+#endif
     static void SetReadbackHolds(bool on);
     [[nodiscard]] static u32 MaxScreenSkips();
     static constexpr u32 NoScreenSkipLimit = 0xFFFFFFFF;

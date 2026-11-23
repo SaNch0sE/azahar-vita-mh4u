@@ -39,6 +39,28 @@
 
 namespace SgxdRenderer {
 
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
+namespace {
+/// The presents' gaps where the emulation hands them over [0], where the render thread reaches
+/// them [1] and where they are shown [2], in four spans: to 20 ms, to 37, to 54, longer. Counted
+/// in the development tools' builds too (statslog), where nothing else of perflog's runs.
+std::array<std::array<std::atomic<u32>, 4>, 3> diag_stage_gaps{};
+u32 StageSpan(s64 ms) {
+    return ms <= 20 ? 0 : ms <= 37 ? 1 : ms <= 54 ? 2 : 3;
+}
+} // namespace
+
+std::array<u32, 12> RenderThread::TakePaceGaps() {
+    std::array<u32, 12> out{};
+    for (u32 s = 0; s < 3; s++) {
+        for (u32 k = 0; k < 4; k++) {
+            out[s * 4 + k] = diag_stage_gaps[s][k].exchange(0, std::memory_order_relaxed);
+        }
+    }
+    return out;
+}
+#endif
+
 
 enum class RenderThread::Op : u16 {
     /// The rest of the ring is unused: the next record is at its start.
@@ -3415,6 +3437,16 @@ void RenderThread::Present(const std::array<Pica::FramebufferConfig, 2>& guest_f
         HoldRead(f.second_fb_active ? f.address_left2 : f.address_left1,
                  f.stride * (i == 0 ? 400u : 320u), PageHolds::Present);
     }
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
+    // The time between the presents the emulation hands over (TakePaceGaps).
+    {
+        static Clock::time_point last{};
+        const auto now = Clock::now();
+        const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - last);
+        last = now;
+        diag_stage_gaps[0][StageSpan(gap.count())].fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
     const PresentRecord record{fb, fill};
     std::memcpy(Begin(Op::Present, sizeof(record)), &record, sizeof(record));
     // Counted before it is published, so that the thread never sees the record uncounted.
@@ -3998,6 +4030,12 @@ void RenderThread::ShowPresent(const std::array<Pica::FramebufferConfig, 2>& fb,
                                      : 3]
         .fetch_add(1, std::memory_order_relaxed);
 #endif
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
+    diag_stage_gaps[2][StageSpan(
+                           std::chrono::duration_cast<std::chrono::milliseconds>(now - last_present)
+                               .count())]
+        .fetch_add(1, std::memory_order_relaxed);
+#endif
     last_present = now;
 #ifdef VITA_DIAGNOSTICS
     const PAddr top = fb[0].second_fb_active ? fb[0].address_left2 : fb[0].address_left1;
@@ -4257,6 +4295,15 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
             break;
         }
         const auto now = Clock::now();
+#if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
+        // The time between the presents as the render thread reaches them (TakePaceGaps).
+        {
+            static Clock::time_point last{};
+            const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(now - last);
+            last = now;
+            diag_stage_gaps[1][StageSpan(gap.count())].fetch_add(1, std::memory_order_relaxed);
+        }
+#endif
         // The emulation's pace, for PresentSpacing: the time between its presents, smoothed over
         // eight; a pause (a load, the menu) starts it again.
         if (const auto since = std::chrono::duration_cast<std::chrono::microseconds>(now - last_submit);
