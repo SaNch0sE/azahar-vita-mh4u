@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <array>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -23,6 +25,7 @@
 #include "common/logging/log.h"
 #include "common/named_thread.h"
 #include "common/settings.h"
+#include "video_core/renderer_sgxd/render_thread.h"
 #include "common/thread.h"
 #include "sgxd.h"
 #include "sgxd_mkq.h"
@@ -931,10 +934,35 @@ void DisplayLoop() {
             index = g.queue[0];
         }
         u8* const buffer = g.buffers + static_cast<std::size_t>(index) * DisplayBufferSize;
+        // Even pacing: a title that presents every nth refresh has its pictures set n refreshes
+        // apart, counted from the refresh the last one was taken at. One that comes early waits
+        // here in the queue (nothing is dropped: with the queue full the render thread waits);
+        // with two waiting the next goes a refresh sooner, so the queue does not stay full.
+        static u16 last_taken = 0;
+        static bool taken_once = false;
+        if (const u32 n = SgxdRenderer::RenderThread::flip_refreshes.load(std::memory_order_relaxed);
+            n > 1 && taken_once) {
+            u32 waiting;
+            {
+                std::scoped_lock lk{DisplayGate()};
+                waiting = g.queued;
+            }
+            const u16 due = static_cast<u16>(last_taken + (waiting >= 2 ? n - 1 : n));
+            // A NEXTFRAME set is taken at the count after the call's.
+            for (u32 guard = 0; guard < 8; guard++) {
+                const u16 next = static_cast<u16>(sceDisplayGetVcount() + 1);
+                if (AtOrAfter(next, due)) {
+                    break;
+                }
+                sceDisplayWaitVblankStart();
+            }
+        }
         SgxdRenderer::SgxdTrace("flip_vcount", static_cast<u16>(sceDisplayGetVcount()));
         const int shown = ShowFrame(buffer, SCE_DISPLAY_SETBUF_NEXTFRAME);
         ASSERT_MSG(shown >= 0, "sgxd: sceDisplaySetFrameBuf {:#010x}", static_cast<u32>(shown));
         sceDisplayWaitSetFrameBuf();
+        last_taken = static_cast<u16>(sceDisplayGetVcount());
+        taken_once = true;
         std::scoped_lock lk{DisplayGate()};
         for (State::Part& part : g.parts) {
             part = part == State::Part::Shown ? State::Part::Free : part;

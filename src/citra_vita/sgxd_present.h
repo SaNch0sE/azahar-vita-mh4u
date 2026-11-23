@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <string>
 #include "citra_vita/screen_layout.h"

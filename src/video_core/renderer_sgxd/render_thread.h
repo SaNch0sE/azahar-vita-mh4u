@@ -73,6 +73,10 @@ public:
     /// The Even frame pacing option: presents are spaced by the title's own rate (PresentSpacing)
     /// in place of PresentInterval alone. Any thread.
     static inline std::atomic<bool> even_pacing{false};
+    /// Even pacing with vsync on: the refreshes between the title's presents (1 to 4; 1 without
+    /// the option), for the display thread, which sets its queue's pictures that many refreshes
+    /// apart (SgxdPresent's DisplayLoop). Written by the render thread.
+    static inline std::atomic<u32> flip_refreshes{1};
 #if defined(VITA_DIAGNOSTICS) || defined(VITA_DEBUG_TOOLS)
     /// The presents' gaps since the last call at three stages (handed over by the emulation,
     /// reached by the render thread, shown), four spans each: to 20 ms, to 37, to 54, longer.

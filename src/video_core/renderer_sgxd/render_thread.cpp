@@ -20,6 +20,7 @@
 #include "common/named_thread.h"
 #include "core/loader/title_patches.h"
 #include "core/memory.h"
+#include "common/settings.h"
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/renderer_sgxd.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
@@ -4052,7 +4053,9 @@ void RenderThread::ShowPresent(const std::array<Pica::FramebufferConfig, 2>& fb,
 }
 
 std::chrono::microseconds RenderThread::PresentSpacing() const {
-    if (!even_pacing.load(std::memory_order_relaxed)) {
+    // With vsync on the display thread spaces the pictures by counting refreshes (flip_refreshes):
+    // the presents go into its queue as they come, and none gives way to another.
+    if (!even_pacing.load(std::memory_order_relaxed) || Settings::values.use_vsync.GetValue()) {
         return PresentInterval;
     }
     // The title's presents come every n refreshes: n refreshes apart, less what lets a flip at
@@ -4313,6 +4316,11 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
             submit_period = {};
         }
         last_submit = now;
+        flip_refreshes.store(
+            even_pacing.load(std::memory_order_relaxed)
+                ? static_cast<u32>(std::clamp<s64>((submit_period.count() + 8333) / 16667, 1, 4))
+                : 1u,
+            std::memory_order_relaxed);
         if (now - last_present < PresentSpacing() || renderer.PresentBusy()) {
             // Too soon after the last, or the last still on the GPU: shown later unless a newer one comes.
             // Evenly paced, it waits behind the pending one, and the oldest of three gives way.
