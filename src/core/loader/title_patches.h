@@ -70,6 +70,9 @@ enum TitleTuningBit : u32 {
     /// finished 3D picture are drawn at that scale, the 3D picture at the 3DS's resolution
     /// (RasterizerSgxd::SetHudScale). A sharper picture, not the same one.
     TuningHudScale = 1u << 2,
+    /// The Even frame pacing option applies (RenderThread::even_pacing): experimental, offered
+    /// where it has been tried.
+    TuningEvenPacing = 1u << 3,
 };
 inline std::atomic<u32> title_tuning{0};
 /// The tuning bits a title's built-in patches ask for (a menu's: the title need not be running).

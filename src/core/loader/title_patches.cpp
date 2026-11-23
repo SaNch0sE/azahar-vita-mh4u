@@ -266,7 +266,8 @@ constexpr std::array title_patches{
                             "sprite, grass and particle batches get the room they need, and stay "
                             "short where their sprites lie far apart in the game's data. A screen "
                             "the layout does not show is not drawn."),
-               std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale},
+               std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale |
+                   TuningEvenPacing},
     TitlePatch{XenobladeUsa, Translatable("Left eye only"),
                Translatable("The game draws its 3D scene twice, once per eye, even with 3D off. "
                             "Only one picture is shown, so only the left eye's is drawn."),

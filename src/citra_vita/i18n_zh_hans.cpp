@@ -276,11 +276,11 @@ constexpr std::array table{std::to_array<Translation>({
     {"Model files reported", "上报模型文件"},
     {"Motion controls", "体感操作"},
     {"Smooth picture", "平滑画面"},
-    {"Even frame pacing", "均匀帧节奏"},
-    {"Shows a game's pictures at an even beat: one that is ready early waits for its turn. For a "
-     "game that runs at 30 frames a second and still looks choppy. It can show a picture up to one "
-     "refresh (17 ms) later.",
-     "以均匀的节奏显示游戏画面：提前完成的画面会等待自己的时机。适用于以每秒 30 帧运行但仍显得卡顿的游戏。画面最多可能晚一次刷新（17 毫秒）显示。"},
+    {"Even frame pacing (experimental)", "均匀帧节奏（实验性）"},
+    {"Experimental. Shows the game's pictures at an even beat of two refreshes: one that is ready "
+     "early waits for its turn. For a game that runs at 30 frames a second and still looks choppy. "
+     "It works with Vsync on, and can show a picture up to two refreshes (33 ms) later.",
+     "实验性功能。以每两次刷新一帧的均匀节奏显示游戏画面：提前完成的画面会等待自己的时机。适用于以每秒 30 帧运行但仍显得卡顿的游戏。需要开启垂直同步，画面最多可能晚两次刷新（33 毫秒）显示。"},
     {"HUD resolution", "HUD 分辨率"},
     {"Draws the top screen's HUD, text and menus at a higher resolution over the 3D picture, which "
      "stays at the 3DS's: sharper text for little GPU work. It needs Internal resolution at Native.",

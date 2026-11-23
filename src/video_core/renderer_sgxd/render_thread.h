@@ -70,9 +70,11 @@ public:
     /// The screen the frontend's layout does not show (0 the top, 1 the bottom), or -1 when it
     /// shows both. With the title's TuningHiddenScreen its draws are left out. Any thread.
     static inline std::atomic<s8> hidden_screen{-1};
-    /// The Even frame pacing option: presents are spaced by the title's own rate (PresentSpacing)
-    /// in place of PresentInterval alone. Any thread.
+    /// The Even frame pacing option (experimental, among a title's patches): presents are spaced
+    /// by the title's own rate in place of PresentInterval alone (EvenlyPaced). Any thread.
     static inline std::atomic<bool> even_pacing{false};
+    /// Whether presents are evenly paced now: the option, in a title with TuningEvenPacing.
+    [[nodiscard]] static bool EvenlyPaced();
     /// Even pacing with vsync on: 2 for a title whose presents come a steady two refreshes apart,
     /// else 1 (PaceRefreshes), for the display thread, which sets its queue's pictures that many
     /// refreshes apart (SgxdPresent's DisplayLoop). Written by the render thread.

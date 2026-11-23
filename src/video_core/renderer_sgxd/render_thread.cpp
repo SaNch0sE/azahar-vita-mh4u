@@ -4052,10 +4052,16 @@ void RenderThread::ShowPresent(const std::array<Pica::FramebufferConfig, 2>& fb,
 #endif
 }
 
+bool RenderThread::EvenlyPaced() {
+    // The option, in a title whose patches offer it (experimental: where it has been tried).
+    return even_pacing.load(std::memory_order_relaxed) &&
+           Loader::TitleTuned(Loader::TuningEvenPacing);
+}
+
 std::chrono::microseconds RenderThread::PresentSpacing() const {
     // With vsync on the display thread spaces the pictures by counting refreshes (flip_refreshes):
     // the presents go into its queue as they come, and none gives way to another.
-    if (!even_pacing.load(std::memory_order_relaxed) || Settings::values.use_vsync.GetValue()) {
+    if (!EvenlyPaced() || Settings::values.use_vsync.GetValue()) {
         return PresentInterval;
     }
     // A title on a beat of two refreshes: two refreshes apart, less what lets a flip at the second
@@ -4073,7 +4079,7 @@ u32 RenderThread::PaceRefreshes() const {
     // comes: spaced by its own slow pace, the display queue would fill and hold the emulation,
     // which then presents slower still.
     const s64 us = submit_period.count();
-    return even_pacing.load(std::memory_order_relaxed) && us >= 28000 && us <= 40000 ? 2 : 1;
+    return EvenlyPaced() && us >= 28000 && us <= 40000 ? 2 : 1;
 }
 
 void RenderThread::ShowDuePresent() {
@@ -4328,7 +4334,7 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
         if (now - last_present < PresentSpacing() || renderer.PresentBusy()) {
             // Too soon after the last, or the last still on the GPU: shown later unless a newer one comes.
             // Evenly paced, it waits behind the pending one, and the oldest of three gives way.
-            const bool queue = even_pacing.load(std::memory_order_relaxed) && present_pending;
+            const bool queue = EvenlyPaced() && present_pending;
 #ifdef VITA_DIAGNOSTICS
             if (present_pending && (!queue || present_second)) {
                 presents_soon.fetch_add(1, std::memory_order_relaxed);
@@ -4350,7 +4356,7 @@ void RenderThread::RunRecord(const Head& head, const u8* p) {
             SgxdTrace("present_pending");
             break;
         }
-        if (even_pacing.load(std::memory_order_relaxed) && present_pending) {
+        if (EvenlyPaced() && present_pending) {
             // Evenly paced, the one that waited is shown in its turn and this one waits.
             const auto fb = pending_fb;
             const auto fill = pending_fill;

@@ -1857,13 +1857,15 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    // Among a title's patches too, where the title's own offer it.
     add({Option::EvenPacing,
-         Category::Speed,
+         Category::Patches,
          Kind::Toggle,
-         Translatable("Even frame pacing"),
-         Translatable("Shows a game's pictures at an even beat: one that is ready early waits for "
-                      "its turn. For a game that runs at 30 frames a second and still looks "
-                      "choppy. It can show a picture up to one refresh (17 ms) later."),
+         Translatable("Even frame pacing (experimental)"),
+         Translatable("Experimental. Shows the game's pictures at an even beat of two refreshes: "
+                      "one that is ready early waits for its turn. For a game that runs at 30 "
+                      "frames a second and still looks choppy. It works with Vsync on, and can "
+                      "show a picture up to two refreshes (33 ms) later."),
          {},
          0,
          nullptr,
@@ -3556,10 +3558,14 @@ Ui::Action Ui::DrawSettings() {
         for (std::size_t i = 0; i < settings_patches.size(); i++) {
             DrawPatchRow(i);
         }
-        // The options a title's patches offer (the HUD resolution), as its own values.
+        // The options a title's patches offer, as its own values: each where the title has its bit.
         for (std::size_t i = 0; i < rows.size(); i++) {
-            if (rows[i].category == Category::Patches &&
-                (Loader::TitleTuningOf(settings_program_id) & Loader::TuningHudScale) != 0) {
+            if (rows[i].category != Category::Patches) {
+                continue;
+            }
+            const u32 bit = rows[i].option == Config::Option::EvenPacing ? Loader::TuningEvenPacing
+                                                                         : Loader::TuningHudScale;
+            if ((Loader::TitleTuningOf(settings_program_id) & bit) != 0) {
                 DrawRow(rows[i], i);
             }
         }
