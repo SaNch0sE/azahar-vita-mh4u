@@ -18,6 +18,7 @@
 #include "common/logging/log.h"
 #include "common/math_util.h"
 #include "common/named_thread.h"
+#include "core/loader/title_patches.h"
 #include "core/memory.h"
 #include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/renderer_sgxd.h"
@@ -803,6 +804,9 @@ void GsInvoked(Pica::PicaCore& p) {
 } // namespace
 
 void RenderThread::DrawMerged(const u16* vertices, u32 count, u16 cleaned) {
+    // A merged run's span of vertices against the vertices it takes, and the span any run may have.
+    constexpr u32 MergedSpanPerVertex = 4;
+    constexpr u32 MergedSpanFloor = 48;
     // The run as one draw indexed by its vertices' numbers, 16-bit; while b15 is false, the run's first
     // draw alone first.
     auto& regs = render_pica.regs.internal.reg_array;
@@ -810,7 +814,24 @@ void RenderThread::DrawMerged(const u16* vertices, u32 count, u16 cleaned) {
     constexpr u32 IndexReg = PICA_REG_INDEX(pipeline.index_array);
     const u32 num = regs[NumReg], index = regs[IndexReg];
     for (u32 at = 0; at < count;) {
-        const u32 n = at == 0 && !render_pica.gs_setup.uniforms.b[15] ? 1 : count - at;
+        u32 n = at == 0 && !render_pica.gs_setup.uniforms.b[15] ? 1 : count - at;
+        // The geometry draw's first stage runs the vertex program on every vertex from the run's
+        // lowest to its highest (RasterizerSgxd::GeometryStage), so a run of vertices far apart
+        // (ten sprites over 8850 vertices) costs their whole span. The run goes on only while its
+        // span stays near what it takes; the rest is the next draw, in the same order.
+        if (Loader::TitleTuned(Loader::TuningGeometryBatches)) {
+            u32 lo = vertices[at], hi = vertices[at];
+            for (u32 k = 1; k < n; k++) {
+                const u32 v = vertices[at + k];
+                const u32 new_lo = std::min(lo, v), new_hi = std::max(hi, v);
+                if (new_hi - new_lo + 1 > std::max(MergedSpanPerVertex * (k + 1), MergedSpanFloor)) {
+                    n = k;
+                    break;
+                }
+                lo = new_lo;
+                hi = new_hi;
+            }
+        }
         regs[NumReg] = n;
         regs[IndexReg] = index | 1u << 31;
         render_pica.dirty_regs.Set(NumReg);
