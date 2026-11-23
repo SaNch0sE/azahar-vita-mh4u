@@ -8559,8 +8559,10 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             backend.BeginPassOver(t, bg_depth);
             covered_passes++;
         } else if (hud_from && !took) {
+            // The 3D picture's rows: the buffer's width at that picture's scale.
             backend.BeginPassFromPicture(t, bg_depth, hud_from->picture.gpu, hud_from->stride,
-                                         hud_from->width, hud_from->picture_format);
+                                         hud_from->width * hud_from->quarters / 4,
+                                         hud_from->picture_format);
             backend.TouchAllTiles();
             hud_opens++;
         } else if (took) {
