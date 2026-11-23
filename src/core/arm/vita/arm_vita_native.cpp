@@ -565,6 +565,11 @@ struct EngineGuard {
     /// The made config object's searches that found no words (a frame apart; MissedSearches end
     /// them).
     u32 missed = 0;
+    /// Where the words were last found in the config object of `found_global`: after a reset (a
+    /// savestate's save or load) the object's words are no longer its default's, and the search
+    /// for the default finds nothing.
+    VAddr found_global = 0;
+    u32 found_offset = 0;
 };
 /// A second of frames.
 constexpr u32 MissedSearches = 60;
@@ -2723,7 +2728,17 @@ void ARM_VitaNative::GuardTick() {
                     g.word = object + off;
                 }
             }
+            // Not its default's: where they were found before in this global's object, when the
+            // two still agree in the bits nothing keeps (the engine's request and its setting).
+            if (g.word == 0 && g.found_global == t.global && g.found_offset != 0 &&
+                ((memory.Read32(object + g.found_offset) ^
+                  memory.Read32(object + g.found_offset + 4)) &
+                 same & 0x0000FFFFu) == 0) {
+                g.word = object + g.found_offset;
+            }
             if (g.word != 0) {
+                g.found_global = t.global;
+                g.found_offset = g.word - object;
                 LOG_INFO(Core_ARM11,
                          "engine guard: the render config words at {:#010x}: {:#010x} {:#010x}",
                          g.word, memory.Read32(g.word), memory.Read32(g.word + 4));
