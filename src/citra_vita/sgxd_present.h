@@ -22,6 +22,10 @@ namespace VitaFrontend::SgxdPresent {
 /// is read through the bilinear filter as it is stretched onto the display. Off, point sampled.
 inline std::atomic<bool> smooth_screens{false};
 
+/// With vsync on: how many refreshes apart the display took its pictures since the last call, as
+/// counts of one, two, three, and four or more (statslog).
+[[nodiscard]] std::array<u32, 4> TakeFlipGaps();
+
 inline constexpr u32 DisplayWidth = 960;
 inline constexpr u32 DisplayHeight = 544;
 

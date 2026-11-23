@@ -39,6 +39,9 @@
 namespace VitaFrontend::SgxdPresent {
 
 namespace {
+/// With vsync on: how many refreshes apart the display took its pictures (TakeFlipGaps): one,
+/// two, three, four or more.
+std::array<std::atomic<u32>, 4> flip_gaps{};
 
 // GPU addresses (docs/sgxd/memory.md; sgxd_test's): the recipe's block at 16 MiB,
 // the display buffers at 1 GiB, the texture at 60 MiB.
@@ -920,6 +923,14 @@ void SetQueueMode(bool on) {
 
 // The display thread (vsync): each queued picture set for the next vblank, then waited for until
 // the display has taken it; the picture shown before is free from then on.
+std::array<u32, 4> TakeFlipGaps() {
+    std::array<u32, 4> out{};
+    for (u32 k = 0; k < 4; k++) {
+        out[k] = flip_gaps[k].exchange(0, std::memory_order_relaxed);
+    }
+    return out;
+}
+
 void DisplayLoop() {
     for (;;) {
         u32 index;
@@ -961,8 +972,17 @@ void DisplayLoop() {
         const int shown = ShowFrame(buffer, SCE_DISPLAY_SETBUF_NEXTFRAME);
         ASSERT_MSG(shown >= 0, "sgxd: sceDisplaySetFrameBuf {:#010x}", static_cast<u32>(shown));
         sceDisplayWaitSetFrameBuf();
-        last_taken = static_cast<u16>(sceDisplayGetVcount());
-        taken_once = true;
+        {
+            // The refreshes since the last picture was taken (TakeFlipGaps): what the display shows.
+            const u16 taken = static_cast<u16>(sceDisplayGetVcount());
+            if (taken_once) {
+                const u16 apart = static_cast<u16>(taken - last_taken);
+                flip_gaps[apart <= 1 ? 0 : apart == 2 ? 1 : apart == 3 ? 2 : 3].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            last_taken = taken;
+            taken_once = true;
+        }
         std::scoped_lock lk{DisplayGate()};
         for (State::Part& part : g.parts) {
             part = part == State::Part::Shown ? State::Part::Free : part;

@@ -2056,13 +2056,15 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 if (stats_log) {
                     const u32 g10 = game_fps10.load(std::memory_order_relaxed);
                     // With the presents' gaps at three stages, each to 20 ms / 37 / 54 / longer.
+                    // And how many refreshes apart the display took them (vsync on): 1 2 3 4+.
                     const auto p = SgxdRenderer::RenderThread::TakePaceGaps();
+                    const auto f = VitaFrontend::SgxdPresent::TakeFlipGaps();
                     LOG_INFO(Frontend,
                              "stats: speed {}% game {}.{} fps shown {} fps; gaps handed {} {} {} "
-                             "{} reached {} {} {} {} shown {} {} {} {}",
+                             "{} reached {} {} {} {} shown {} {} {} {} flips {} {} {} {}",
                              speed_percent.load(std::memory_order_relaxed), g10 / 10, g10 % 10,
                              shown - last_shown, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-                             p[8], p[9], p[10], p[11]);
+                             p[8], p[9], p[10], p[11], f[0], f[1], f[2], f[3]);
                 }
 #endif
                 last_shown = shown;
