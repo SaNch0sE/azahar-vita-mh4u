@@ -3674,8 +3674,12 @@ bool RenderThread::LateDraw(ListDraw& d, u32 vertices) {
     // A buffer of no screen goes with the screens that sample it: dropped late unless the kept screen
     // reads it.
     const bool reader_kept = screen < 0 && late_keep >= 0 && ((t.readers >> late_keep) & 1) != 0;
-    const bool dropped =
-        right_eye || (late_skip && !reader_kept && (screen < 0 || screen != late_keep));
+    // A screen the layout does not show (the title's TuningHiddenScreen): never drawn.
+    const bool hidden = screen >= 0 && !right_eye &&
+                        screen == hidden_screen.load(std::memory_order_relaxed) &&
+                        Loader::TitleTuned(Loader::TuningHiddenScreen);
+    const bool dropped = right_eye || hidden ||
+                         (late_skip && !reader_kept && (screen < 0 || screen != late_keep));
     // A kept draw that samples a copy of another buffer: that buffer feeds it, whatever screen its own
     // segment goes to (each eye's picture may be composited in the other eye's buffer).
     if (!right_eye && !segment_copies.empty()) {

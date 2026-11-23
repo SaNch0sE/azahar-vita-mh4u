@@ -35,6 +35,7 @@
 #include "core/3ds.h"
 #include "core/core.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "video_core/renderer_sgxd/render_thread.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
 #include "video_core/renderer_sgxd/sgxd_flags.h"
 #include "video_core/renderer_sgxd/sgxd_rasterizer.h"
@@ -170,6 +171,9 @@ void EmuWindowVita::UpdateCurrentFramebufferLayout() {
     touch_from_display = layout[Screen::Bottom].transform.Inverse();
     // The Hidden screen touch option, off: a bottom screen that is not shown takes no touch.
     touch_screen_shown = layout[Screen::Bottom].shown;
+    SgxdRenderer::RenderThread::hidden_screen.store(
+        !layout[Screen::Bottom].shown ? s8{1} : !layout[Screen::Top].shown ? s8{0} : s8{-1},
+        std::memory_order_relaxed);
     NotifyFramebufferLayoutChanged(record);
 }
 

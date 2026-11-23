@@ -67,6 +67,9 @@ public:
     /// The late skip's cap: how many frames in a row it may drop one screen's draws while the GPU lags
     /// (0 none, NoScreenSkipLimit any number). Read at each frame's end; any thread.
     static void SetMaxScreenSkips(u32 frames);
+    /// The screen the frontend's layout does not show (0 the top, 1 the bottom), or -1 when it
+    /// shows both. With the title's TuningHiddenScreen its draws are left out. Any thread.
+    static inline std::atomic<s8> hidden_screen{-1};
     static void SetReadbackHolds(bool on);
     [[nodiscard]] static u32 MaxScreenSkips();
     static constexpr u32 NoScreenSkipLimit = 0xFFFFFFFF;
