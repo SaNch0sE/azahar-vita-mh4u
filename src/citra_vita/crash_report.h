@@ -128,7 +128,7 @@ void PrintLeaks(bool every_chunk);
 /// StallSeconds, prints every emulator thread's state (PrintThreadStates), then recovers. A
 /// title's load or a savestate's save stops the beats for less. From the main thread. A core
 /// dump holds it.
-constexpr unsigned StallSeconds = 40;
+constexpr unsigned StallSeconds = 150;
 void StartStallWatch();
 void StallWatchBeat();
 /// The listing: on the debug channel, or with `to_report` in the crash report on the memory card
