@@ -1225,7 +1225,41 @@ FramebufferRegs::ColorFormat ColorFormatOf(Pica::PixelFormat format) {
 }
 } // namespace
 
+#ifdef VITA_DIAGNOSTICS
+namespace {
+struct DiagPostGrade {
+    bool on = SgxdFlag("perflog");
+    bool active = false;
+    u32 buffer = 0;
+    u32 self_reads = 0, grade_depth = 0, grade_vertices = 0, grade_blend = 0;
+    u32 after = 0, after_depth = 0, transfers = 0;
+    u64 last_us = 0;
+} diag_post_grade;
+} // namespace
+#endif
+
 bool RasterizerSgxd::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
+#ifdef VITA_DIAGNOSTICS
+    if (diag_post_grade.on) {
+        auto& d = diag_post_grade;
+        d.active = false;
+        d.transfers++;
+        const u64 now_us = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        if (now_us - d.last_us >= 1000000) {
+            d.last_us = now_us;
+            LOG_INFO(Render,
+                     "perf: after the self-read: {} self-read draws ({} with depth, the last {} "
+                     "vertices, blend {}) on {:#x}; then {} draws there before a transfer, {} "
+                     "with depth; {} transfers",
+                     d.self_reads, d.grade_depth, d.grade_vertices, d.grade_blend, d.buffer,
+                     d.after, d.after_depth, d.transfers);
+            d.self_reads = d.grade_depth = d.after = d.after_depth = d.transfers = 0;
+        }
+    }
+#endif
     FlushImmediate();
 #ifdef VITA_DIAGNOSTICS
     // sgxd_flags `texdump=N`: every texture the draws take over a frame of both screens from N s.
@@ -4900,11 +4934,96 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     const bool padded = bound != 0 && bound <= room;
     const u32 cap = padded ? bound : room;
     const bool wait = !padded;
+#ifdef VITA_DIAGNOSTICS
+    // perflog: the second's geometry draws by shape, the busiest first: what the stream-out
+    // renders are made of.
+    {
+        struct Shape {
+            u32 key, draws, invocations, vertices;
+        };
+        static std::array<Shape, 24> shapes{};
+        static u32 used = 0;
+        static u64 last_us = 0;
+        static const bool on = SgxdFlag("perflog");
+        if (on) {
+            const u32 key = static_cast<u32>(pipeline.gs_config.mode.Value()) |
+                            std::min(per_invocation, 15u) << 2 | std::min(bound, 15u) << 6 |
+                            (padded ? 1u : 0u) << 10 | std::min(gs_outputs, 15u) << 11 |
+                            std::min(vs_outputs, 15u) << 15 | (is_indexed ? 1u : 0u) << 19 |
+                            std::min(rows, 127u) << 20;
+            u32 at = 0;
+            while (at < used && shapes[at].key != key) {
+                at++;
+            }
+            if (at == used && used < shapes.size()) {
+                shapes[used++] = {key, 0, 0, 0};
+            }
+            if (at < used) {
+                shapes[at].draws++;
+                shapes[at].invocations += invocations;
+                shapes[at].vertices += count;
+            }
+            const u64 now_us = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            if (now_us - last_us >= 1000000) {
+                last_us = now_us;
+                std::sort(shapes.begin(), shapes.begin() + used,
+                          [](const Shape& x, const Shape& y) { return x.vertices > y.vertices; });
+                std::string text;
+                for (u32 i = 0; i < used && i < 10; i++) {
+                    const u32 k = shapes[i].key;
+                    fmt::format_to(std::back_inserter(text),
+                                   " [mode {} per {} rows {} vs_out {} gs_out {} bound {} {}{}: {} "
+                                   "draws, {} invocations, {} vertices]",
+                                   k & 3, k >> 2 & 15, k >> 20, k >> 15 & 15, k >> 11 & 15,
+                                   k >> 6 & 15, (k >> 10 & 1) != 0 ? "queued" : "WAITED",
+                                   (k >> 19 & 1) != 0 ? " indexed" : "", shapes[i].draws,
+                                   shapes[i].invocations, shapes[i].vertices);
+                }
+                LOG_INFO(Render, "perf: geometry draws by shape ({} shapes):{}", used, text);
+                used = 0;
+            }
+        }
+    }
+#endif
 
     // --- pass A0: the vertex program, each vertex's outputs stored densely ---
     VertexStage a0 = VertexStageFor(is_indexed, nullptr, count, Usse::VsMode::StoreOutputs,
                                     describe);
     const u32 vertices = a0.vertex_max - a0.vertex_min + 1;
+#ifdef VITA_DIAGNOSTICS
+    // perflog: what stage A0 runs the vertex program on (its dense range) against what the draws
+    // take, a second's sums, and the widest ranges.
+    {
+        static u32 n_draws = 0, n_taken = 0, n_range = 0, n_wide = 0, widest = 0, widest_taken = 0;
+        static u64 last_us = 0;
+        static const bool on = SgxdFlag("perflog");
+        if (on) {
+            n_draws++;
+            n_taken += count;
+            n_range += vertices;
+            n_wide += vertices > count * 4 ? 1 : 0;
+            if (vertices > widest) {
+                widest = vertices;
+                widest_taken = count;
+            }
+            const u64 now_us = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            if (now_us - last_us >= 1000000) {
+                last_us = now_us;
+                LOG_INFO(Render,
+                         "perf: geometry stage A0: {} draws take {} vertices, their ranges hold {} "
+                         "({} draws' range over four times what they take; the widest {} for {})",
+                         n_draws, n_taken, n_range, n_wide, widest, widest_taken);
+                n_draws = n_taken = n_range = n_wide = widest = widest_taken = 0;
+            }
+        }
+    }
+#endif
     const u32 vsize = vs_outputs * 16;
     if (rows_table) {
         // The vertices alone must reach A0's range's ends, or it runs the program on vertices the draw
@@ -7943,9 +8062,31 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
             }
         }
     }
+#ifdef VITA_DIAGNOSTICS
+    const bool diag_self_read = backend.InPass() && TexturesReadPassColour();
+#endif
     if (backend.InPass() && TexturesReadPassColour()) {
         EndPass("a draw reading its own colour buffer");
     }
+#ifdef VITA_DIAGNOSTICS
+    // perflog: what follows a frame's self-read (a colour grade) on its buffer until the next
+    // display transfer - the 2D layer, if the title draws one there: how many of those draws
+    // test or write depth, and the self-read draw's own shape.
+    if (diag_post_grade.on) {
+        auto& d = diag_post_grade;
+        if (diag_self_read) {
+            d.self_reads++;
+            d.buffer = buffer.addr;
+            d.active = true;
+            d.grade_depth += uses_depth ? 1 : 0;
+            d.grade_vertices = regs.pipeline.num_vertices;
+            d.grade_blend = regs.framebuffer.output_merger.alphablend_enable ? 1 : 0;
+        } else if (d.active && buffer.addr == d.buffer) {
+            d.after++;
+            d.after_depth += uses_depth ? 1 : 0;
+        }
+    }
+#endif
     // A texture over rows whose picture is newer than guest memory reads the picture's copy; asked only
     // for sampled units whose reads meet such rows (the program's inputs cost more than the other
     // checks, and a top screen picture may own its rows all the time).
