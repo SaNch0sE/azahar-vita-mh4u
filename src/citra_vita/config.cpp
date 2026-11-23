@@ -10,6 +10,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 #include <fmt/format.h>
@@ -34,7 +35,13 @@ namespace VitaFrontend::Config {
 
 namespace {
 
-constexpr char SettingsPath[] = "ux0:data/azahar/settings.txt";
+/// Azahar's settings. A build with another title ID (AZAHAR_VITA_TITLEID), installed beside it,
+/// keeps its own file and shares every other one in ux0:data/azahar (games, their updates and
+/// saves, savestates, mods, cheats); it starts from Azahar's the first time.
+constexpr char SharedSettingsPath[] = "ux0:data/azahar/settings.txt";
+constexpr bool OwnSettings = std::string_view{AZAHAR_VITA_TITLEID} != "AZAHARPSV";
+constexpr const char* SettingsPath =
+    OwnSettings ? "ux0:data/azahar/settings-" AZAHAR_VITA_TITLEID ".txt" : SharedSettingsPath;
 /// The file's section of the values for all games; every other section is a title's.
 constexpr char GlobalSection[] = "all games";
 
@@ -530,7 +537,12 @@ void Load() {
     // The menus in the console's language until the player picks one.
     global_values[static_cast<std::size_t>(Option::Language)] =
         static_cast<int>(I18n::ConsoleLanguage());
-    if (FILE* f = std::fopen(SettingsPath, "r")) {
+    FILE* f = std::fopen(SettingsPath, "r");
+    // Beside Azahar with no file of its own yet: Azahar's settings to start from, written to its
+    // own at the next save.
+    const bool from_shared = f == nullptr && OwnSettings &&
+                             (f = std::fopen(SharedSettingsPath, "r")) != nullptr;
+    if (f != nullptr) {
         // A line is a section's name in brackets, `key = value` or a comment. A title's section is
         // named for its key, which a file's name makes anything but a newline: the name
         // runs from the first bracket to the last.
@@ -586,7 +598,8 @@ void Load() {
             }
         }
         std::fclose(f);
-        LOG_INFO(Frontend, "Settings read from {}: {} titles with their own", SettingsPath,
+        LOG_INFO(Frontend, "Settings read from {}: {} titles with their own",
+                 from_shared ? SharedSettingsPath : SettingsPath,
                  title_values.size());
     }
     // A title's section with nothing left in it is not kept.
@@ -600,7 +613,7 @@ void Load() {
     for (auto& [title, values] : title_values) {
         filled |= FillFromGlobal(values);
     }
-    dirty = filled;
+    dirty = filled || from_shared;
     NoteConsoleNameLocked();
     ApplyAllLocked();
 }

@@ -188,8 +188,12 @@ add_executable(citra_vita ${CITRA_VITA_SOURCES})
 # and one large FS read's std::bad_alloc froze the guest (see hle_ipc.h's async sections).
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
-set(VITA_TITLEID "AZAHARPSV")
-set(VITA_APP_NAME "Azahar")
+# The app's title ID and name. Another pair makes a build that installs beside Azahar: it keeps
+# its own settings file (config.cpp) and shares every other file in ux0:data/azahar.
+set(AZAHAR_VITA_TITLEID "AZAHARPSV" CACHE STRING "The vpk's title ID, 9 characters")
+set(AZAHAR_VITA_APP_NAME "Azahar" CACHE STRING "The app's name on the home screen")
+set(VITA_TITLEID "${AZAHAR_VITA_TITLEID}")
+set(VITA_APP_NAME "${AZAHAR_VITA_APP_NAME}")
 set(VITA_VERSION "26.01")
 
 # The vpk carries the kernel module and the app loads it at startup (LoadAzaharNative in
