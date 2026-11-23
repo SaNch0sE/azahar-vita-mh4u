@@ -283,8 +283,9 @@ constexpr std::array table{std::to_array<Translation>({
      "实验性功能。以每两次刷新一帧的均匀节奏显示游戏画面：提前完成的画面会等待自己的时机。适用于以每秒 30 帧运行但仍显得卡顿的游戏。需要开启垂直同步，画面最多可能晚两次刷新（33 毫秒）显示。"},
     {"HUD resolution", "HUD 分辨率"},
     {"Draws the top screen's HUD, text and menus at a higher resolution over the 3D picture, which "
-     "stays at the 3DS's: sharper text for little GPU work. It needs Internal resolution at Native.",
-     "以更高的分辨率在 3D 画面之上绘制上屏的 HUD、文字和菜单，3D 画面保持 3DS 的分辨率：文字更清晰，GPU 开销很小。需要内部分辨率为原生。"},
+     "stays at the internal resolution: sharper text for little GPU work. It applies above the "
+     "internal resolution, for example 1.5x with Internal resolution at 1.25x.",
+     "以更高的分辨率在 3D 画面之上绘制上屏的 HUD、文字和菜单，3D 画面保持内部分辨率：文字更清晰，GPU 开销很小。仅在高于内部分辨率时生效，例如内部分辨率为 1.25x 时选择 1.5x。"},
     {"Blends neighbouring pixels where the 3DS's picture is stretched onto the display, instead "
      "of showing each as a block. It costs no speed. For Internal resolution at Native: a higher "
      "one is always smoothed.",

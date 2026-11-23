@@ -109,12 +109,17 @@ public:
     /// 2x MSAA on the top screen (every other buffer at 1x while it is on). Any thread.
     static void SetTopMsaa(bool on);
     /// The HUD scale option, in quarters (4: off; 5 or 6): for a title with TuningHudScale, the
-    /// top screen's 2D layer is drawn at this scale over its 3D picture, which stays at the 3DS's
-    /// resolution (PictureShapeFor). Not with an internal resolution above 1x, widescreen margins
-    /// or MSAA, which scale the whole screen. Any thread.
+    /// top screen's 2D layer is drawn at this scale over its 3D picture, which stays at the
+    /// internal resolution (PictureShapeFor). Only above the internal resolution, and not with
+    /// widescreen margins or MSAA. Any thread.
     static void SetHudScale(u32 quarters);
     /// What applies now: SetHudScale's for a title with the tuning, else 4.
     [[nodiscard]] static u32 HudScale();
+    /// Whether the top screen's 2D layer is drawn at the HUD scale now: one above the internal
+    /// resolution, without MSAA. Its 3D picture is at HudBase.
+    [[nodiscard]] static bool HudLayered();
+    /// The scale of the top screen's 3D picture under the HUD scale: the internal resolution.
+    [[nodiscard]] static u32 HudBase();
     [[nodiscard]] static bool TopMsaa();
     /// Whether the top screen's pictures are other than 1x ones: upscaled, widescreen or 2x.
     [[nodiscard]] static bool TopPictures();

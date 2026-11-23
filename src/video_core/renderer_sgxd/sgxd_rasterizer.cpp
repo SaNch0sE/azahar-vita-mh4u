@@ -928,6 +928,14 @@ u32 RasterizerSgxd::HudScale() {
                                                       : 4;
 }
 
+u32 RasterizerSgxd::HudBase() {
+    return top_scale.load(std::memory_order_relaxed);
+}
+
+bool RasterizerSgxd::HudLayered() {
+    return !TopMsaa() && HudScale() > HudBase();
+}
+
 RasterizerSgxd::PictureShape RasterizerSgxd::PictureShapeFor(const ColourBuffer& target,
                                                              PAddr depth) const {
     // A buffer a top-screen transfer reads from (at its start or from inside it, a 256x512 buffer's
@@ -946,13 +954,15 @@ RasterizerSgxd::PictureShape RasterizerSgxd::PictureShapeFor(const ColourBuffer&
     // colour kept there until something reads the bytes (WriteColourBack). At 1x a pass stores into
     // the guest's buffer itself: a picture gains nothing and its copies cost.
     const bool scaled = q != 4 || margin != 0 || samples != 1;
-    // The HUD scale (the title's TuningHudScale), with everything else at the 3DS's resolution: a
-    // top screen buffer has two pictures, one at 1x for the passes that draw its 3D picture and one
-    // at the HUD's scale for the passes after them that use no depth (the 2D layer, until the
-    // buffer's display transfer). The second opens from the first, magnified (hud_from).
-    if (const u32 hud = HudScale(); hud != 4 && !scaled && top && ScalesWhole(target, hud, 0)) {
+    // The HUD scale (the title's TuningHudScale), above the internal resolution: a top screen
+    // buffer has two pictures, one at the internal resolution (HudBase) for the passes that draw
+    // its 3D picture and one at the HUD's scale for the passes after them that use no depth (the
+    // 2D layer, until the buffer's display transfer). The second opens from the first, magnified
+    // (hud_from).
+    if (const u32 hud = HudScale(); HudLayered() && margin == 0 && top &&
+                                    ScalesWhole(target, hud, 0)) {
         const bool layer = hud_world_done && depth == 0 && hud_holdoff == 0;
-        return {true, true, layer ? hud : 4, 0, 1};
+        return {true, true, layer ? hud : q, 0, 1};
     }
     const bool drawn = scaled && ScalesWhole(target, q, margin);
     return {drawn, scaled, q, margin, samples};
@@ -981,9 +991,9 @@ RasterizerSgxd::Upscaled* RasterizerSgxd::UpscaledFor(const ColourBuffer& target
         if (u.addr == target.addr && u.width == target.width && u.height == target.height &&
             u.format == target.format) {
             // The HUD scale's two pictures of a buffer, each found by its scale.
-            const u32 hud = HudScale();
-            if (hud != 4 && u.quarters != q && margin == 0 && u.margin == 0 &&
-                (u.quarters == 4 || u.quarters == hud) && (q == 4 || q == hud)) {
+            const u32 hud = HudScale(), base = HudBase();
+            if (HudLayered() && u.quarters != q && margin == 0 && u.margin == 0 &&
+                (u.quarters == base || u.quarters == hud) && (q == base || q == hud)) {
                 continue;
             }
             if (u.quarters != q || u.margin != margin) {
@@ -4201,8 +4211,8 @@ void RasterizerSgxd::EndOnePass(const char* why) {
     }
     // A pass into a picture stored there alone: its rows are the picture's (Upscaled::owned), taken
     // from any other picture, and reach the guest's buffer once something else reads or writes them.
-    if (pass_upscaled && HudScale() != 4 && pass_margin == 0 && pass_depth_used &&
-        pass_quarters == 4) {
+    if (pass_upscaled && HudLayered() && pass_margin == 0 && pass_depth_used &&
+        pass_quarters == HudBase()) {
         // The HUD scale: the buffer's 3D picture is drawn; the passes without depth that follow,
         // until a display transfer, are its 2D layer (PictureShapeFor).
         hud_world_done = true;
@@ -8431,12 +8441,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         pass_margin = pass_upscaled ? pass_upscaled->margin : 0;
         pass_samples = pass_upscaled ? pass_upscaled->samples : 1;
         pass_widened = pass_margin != 0 && part.x1 != 0 && part.x1 - part.x0 >= TopScreenRows;
-        if (pass_upscaled && HudScale() != 4 && pass_margin == 0) {
-            if (pass_quarters != 4) {
+        if (pass_upscaled && HudLayered() && pass_margin == 0) {
+            if (pass_quarters == HudScale()) {
                 hud_layer_open = true;
             } else if (hud_layer_open && uses_depth) {
                 // Depth after the 2D layer began (a 3D preview inside a menu): the layer goes back
-                // to 1x through guest memory, and stays there a while rather than pay that a frame.
+                // to the internal resolution through guest memory, and stays there a while rather than pay that a frame.
                 hud_holdoff = HudHoldoffFrames;
                 hud_depth_fallbacks++;
             }
@@ -8449,25 +8459,26 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
         // from guest memory and stores all of the buffer; one opened by a clear stores all of it too.
         const bool reloads =
             pass_upscaled && !covered && !took && !pass_upscaled->outdated.empty();
-        // The HUD scale: a 2D pass's picture opens from the buffer's 1x picture where that one holds
+        // The HUD scale: a 2D pass's picture opens from the buffer's 3D picture where that one holds
         // the buffer's newest colour in every row (none outdated: the 3D picture just drawn, which
         // owns the rows it drew), instead of through guest memory.
         const Upscaled* hud_from = nullptr;
-        if (reloads && pass_quarters != 4 && pass_quarters == HudScale() && pass_margin == 0) {
+        if (reloads && HudLayered() && pass_quarters == HudScale() && pass_margin == 0) {
             for (const Upscaled& w : upscaled) {
                 if (&w != pass_upscaled && w.addr == target.addr && w.width == target.width &&
-                    w.height == target.height && w.format == target.format && w.quarters == 4 &&
+                    w.height == target.height && w.format == target.format &&
+                    w.quarters == HudBase() &&
                     w.margin == 0 && w.outdated.empty() && !w.owned.empty()) {
                     hud_from = &w;
                 }
             }
         }
-        // The HUD scale's 1x picture: a pass whose first draw covers its part stores the whole
+        // The HUD scale's 3D picture: a pass whose first draw covers its part stores the whole
         // buffer while rows of the picture are outdated (the rows no pass draws, black), so that
         // the picture is the buffer: a texture over it reads the picture, and the 2D layer's
         // picture opens from it (hud_from).
-        const bool hud_whole = pass_upscaled && covered && !took && pass_quarters == 4 &&
-                               pass_margin == 0 && pass_samples == 1 && HudScale() != 4 &&
+        const bool hud_whole = pass_upscaled && covered && !took && pass_quarters == HudBase() &&
+                               pass_margin == 0 && pass_samples == 1 && HudLayered() &&
                                !pass_upscaled->outdated.empty();
         const SgxdBackend::PicaTarget drawn_part = t;
         if (pass_upscaled && (reloads || took || hud_whole)) {
@@ -8524,7 +8535,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
 #ifdef VITA_DIAGNOSTICS
         pass_opened = covered                                     ? "covered"
                       : took                                      ? "clear"
-                      : hud_from                                  ? "its 1x picture"
+                      : hud_from                                  ? "its 3D picture"
                       : pass_upscaled && !pass_upscaled->outdated.empty() ? "partly reloaded"
                                                                   : "load";
 #endif

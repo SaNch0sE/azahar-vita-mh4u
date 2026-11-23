@@ -1773,8 +1773,9 @@ void Ui::BuildRows() {
          Kind::Choice,
          Translatable("HUD resolution"),
          Translatable("Draws the top screen's HUD, text and menus at a higher resolution over the "
-                      "3D picture, which stays at the 3DS's: sharper text for little GPU work. It "
-                      "needs Internal resolution at Native."),
+                      "3D picture, which stays at the internal resolution: sharper text for little "
+                      "GPU work. It applies above the internal resolution, for example 1.5x with "
+                      "Internal resolution at 1.25x."),
          {Translatable("Native"), "1.25x", "1.5x"},
          0,
          nullptr,
