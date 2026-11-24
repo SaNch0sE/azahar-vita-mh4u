@@ -268,8 +268,7 @@ constexpr std::array title_patches{
                             "short where their sprites lie far apart in the game's data. A screen "
                             "the layout does not show is not drawn."),
                std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale |
-                   TuningEvenPacing | TuningKeepMovedPages |
-                   TuningSimpleLighting},
+                   TuningEvenPacing | TuningKeepMovedPages},
     // Monster Hunter XX (Japan): MH4U's renderer tuning. Its frame is drawn as MH4U's (the 3D
     // picture with depth, then the HUD without), so the HUD scale applies; at 1.25x it is held
     // by the GPU's pixels, and the rest neither speeds it up nor slows it down.
@@ -279,8 +278,7 @@ constexpr std::array title_patches{
                             "short where their sprites lie far apart in the game's data. A screen "
                             "the layout does not show is not drawn."),
                std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale |
-                   TuningEvenPacing | TuningKeepMovedPages |
-                   TuningSimpleLighting},
+                   TuningEvenPacing | TuningKeepMovedPages},
     TitlePatch{XenobladeUsa, Translatable("Left eye only"),
                Translatable("The game draws its 3D scene twice, once per eye, even with 3D off. "
                             "Only one picture is shown, so only the left eye's is drawn."),

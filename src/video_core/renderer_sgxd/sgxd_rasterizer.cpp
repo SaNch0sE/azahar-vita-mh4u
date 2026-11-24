@@ -919,14 +919,6 @@ SgxdBackend::PictureFormat PictureFormatFor(FramebufferRegs::ColorFormat format)
 }
 } // Anonymous namespace
 
-namespace {
-std::atomic<bool> simple_lighting{false};
-} // Anonymous namespace
-
-void RasterizerSgxd::SetSimpleLighting(bool on) {
-    simple_lighting.store(on, std::memory_order_relaxed);
-}
-
 void RasterizerSgxd::SetHudScale(u32 quarters) {
     hud_scale.store(std::clamp(quarters, 4u, 8u), std::memory_order_relaxed);
 }
@@ -5501,19 +5493,11 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInterna
             light.specular1_zero.Assign(zero(src.specular_1) ? 1 : 0);
             light.ambient_zero.Assign(zero(src.ambient) ? 1 : 0);
         }
-        // The Simplified lighting option (a tuned title's): every term below left out. Each costs
-        // the fragment program instructions at every lit pixel; together about 9% of Monster Hunter
-        // 4 Ultimate's 3D picture at 1.5x, its look barely changed but for sheen and highlights.
-        u32 lite = simple_lighting.load(std::memory_order_relaxed) &&
-                           Loader::TitleTuned(Loader::TuningSimpleLighting)
-                       ? 127u
-                       : 0u;
 #ifdef VITA_DIAGNOSTICS
         // sgxd_flags `lightlite=MASK`: lighting terms left out, to measure what each costs (the
         // picture changes): 1 Fresnel, 2 the reflection colour tables, 4 D1, 8 every light's
         // specular_1 term, 16 the spotlight, 32 the distance attenuation, 64 the geometric factors.
-        lite |= SgxdFlagValue("lightlite");
-#endif
+        static const u32 lite = SgxdFlagValue("lightlite");
         if (lite & 1) {
             lighting.lut_fr = {};
         }
@@ -5544,6 +5528,7 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInterna
                 light.geometric_factor_1.Assign(0);
             }
         }
+#endif
     }
     // The SGX's samplers have no border colour: a border mode clamps (AddressMode) and the fragment
     // program puts the border colour past the texture.

@@ -276,11 +276,6 @@ constexpr std::array table{std::to_array<Translation>({
     {"Model files reported", "上报模型文件"},
     {"Motion controls", "体感操作"},
     {"Even frame pacing (experimental)", "均匀帧节奏（实验性）"},
-    {"Simplified lighting", "简化光照"},
-    {"Leaves the costlier parts of the game's lighting out: Fresnel, coloured reflections, the "
-     "second highlight, spotlights and light falloff. Shiny materials lose some of their sheen; the "
-     "GPU does less at every lit pixel, about 9% of the 3D picture in Monster Hunter 4 Ultimate.",
-     "省略游戏光照中开销较大的部分：菲涅耳、彩色反射、第二高光、聚光灯和光照衰减。光亮材质会失去部分光泽；GPU 在每个受光像素上的工作量减少，在《怪物猎人4 终极版》中约占 3D 画面的 9%。"},
     {"Experimental. Shows the game's pictures at an even beat of two refreshes: one that is ready "
      "early waits for its turn. For a game that runs at 30 frames a second and still looks choppy. "
      "It works with Vsync on, and can show a picture up to two refreshes (33 ms) later.",

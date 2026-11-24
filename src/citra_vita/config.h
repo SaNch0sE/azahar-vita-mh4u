@@ -65,9 +65,6 @@ enum class Option : u32 {
     /// Presents spaced by the title's own rate (RenderThread::even_pacing): 1, or 0 for each
     /// shown as it comes.
     EvenPacing,
-    /// Lighting terms left out of a tuned title's programs (RasterizerSgxd::SetSimpleLighting): 1,
-    /// or 0 for the whole lighting.
-    SimpleLighting,
     /// Upstream's simulate_3ds_gpu_timings: 1 delays GSP's interrupts by the delay generators'
     /// estimates of their work, 0 (upstream's default) raises them at once.
     SimulateGpuTimings,

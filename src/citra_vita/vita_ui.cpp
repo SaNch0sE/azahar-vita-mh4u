@@ -1860,18 +1860,6 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
-    add({Option::SimpleLighting,
-         Category::Patches,
-         Kind::Toggle,
-         Translatable("Simplified lighting"),
-         Translatable("Leaves the costlier parts of the game's lighting out: Fresnel, coloured "
-                      "reflections, the second highlight, spotlights and light falloff. Shiny "
-                      "materials lose some of their sheen; the GPU does less at every lit pixel, "
-                      "about 9% of the 3D picture in Monster Hunter 4 Ultimate."),
-         {},
-         0,
-         nullptr,
-         nullptr});
     add({Option::SimulateGpuTimings,
          Category::Speed,
          Kind::Toggle,
@@ -3568,9 +3556,7 @@ Ui::Action Ui::DrawSettings() {
                 continue;
             }
             const u32 bit = rows[i].option == Config::Option::EvenPacing ? Loader::TuningEvenPacing
-                            : rows[i].option == Config::Option::SimpleLighting
-                                ? Loader::TuningSimpleLighting
-                                : Loader::TuningHudScale;
+                                                                         : Loader::TuningHudScale;
             if ((Loader::TitleTuningOf(settings_program_id) & bit) != 0) {
                 DrawRow(rows[i], i);
             }
