@@ -5493,6 +5493,42 @@ Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInterna
             light.specular1_zero.Assign(zero(src.specular_1) ? 1 : 0);
             light.ambient_zero.Assign(zero(src.ambient) ? 1 : 0);
         }
+#ifdef VITA_DIAGNOSTICS
+        // sgxd_flags `lightlite=MASK`: lighting terms left out, to measure what each costs (the
+        // picture changes): 1 Fresnel, 2 the reflection colour tables, 4 D1, 8 every light's
+        // specular_1 term, 16 the spotlight, 32 the distance attenuation, 64 the geometric factors.
+        static const u32 lite = SgxdFlagValue("lightlite");
+        if (lite & 1) {
+            lighting.lut_fr = {};
+        }
+        if (lite & 2) {
+            lighting.lut_rr = {};
+            lighting.lut_rg = {};
+            lighting.lut_rb = {};
+        }
+        if (lite & 4) {
+            lighting.lut_d1 = {};
+        }
+        if (lite & 16) {
+            lighting.lut_sp = {};
+        }
+        for (u32 i = 0; i < lighting.src_num; ++i) {
+            auto& light = lighting.lights[i];
+            if (lite & 8) {
+                light.specular1_zero.Assign(1);
+            }
+            if (lite & 16) {
+                light.spot_atten_enable.Assign(0);
+            }
+            if (lite & 32) {
+                light.dist_atten_enable.Assign(0);
+            }
+            if (lite & 64) {
+                light.geometric_factor_0.Assign(0);
+                light.geometric_factor_1.Assign(0);
+            }
+        }
+#endif
     }
     // The SGX's samplers have no border colour: a border mode clamps (AddressMode) and the fragment
     // program puts the border colour past the texture.
