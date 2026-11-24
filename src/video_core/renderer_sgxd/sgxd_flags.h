@@ -87,6 +87,8 @@ namespace SgxdRenderer {
  *             program replaced by the white write alone: the vertex side and rasterisation;
  *             fswhite=4 as many NOPs as the program's words, then the white write (its time
  *             without its loads and reads)
+ *   fsnosched fragment programs without nosched bits (wrong pictures): what keeping instances
+ *             scheduled across internal-register chains costs
  *   xferlog   every display transfer, texture copy and fill as it comes (sgxd_rasterizer.cpp)
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks

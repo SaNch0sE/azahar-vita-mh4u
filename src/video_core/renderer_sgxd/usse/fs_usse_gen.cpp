@@ -5465,6 +5465,15 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
         LitSa(LitKillControl);
     }
     encoder.FinishNosched();
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags `fsnosched`: no nosched bits at all, so the pipe may switch tasks at every
+    // instruction boundary (internal registers are lost there: wrong pictures). Its time against
+    // the normal one prices the chains that keep an instance scheduled.
+    static const bool nosched_off = ::SgxdRenderer::SgxdFlag("fsnosched");
+    if (nosched_off) {
+        encoder.ClearNosched();
+    }
+#endif
     program.literals.assign(lit_pairs * 2, 0u);
     for (uint32_t pair = 0; pair < LiteralCount / 2; pair++) {
         if (lit_pair_slot[pair] >= 0) {

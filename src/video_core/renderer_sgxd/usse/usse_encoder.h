@@ -170,6 +170,9 @@ public:
     /// instruction).
     /// Call once, after the last instruction. The builders' `nosched` arguments are ignored.
     void FinishNosched();
+    /// Diagnostics: clears every nosched bit FinishNosched placed (wrong pictures; measures what
+    /// keeping instances scheduled costs).
+    void ClearNosched();
 
     const std::vector<uint64_t>& Words() const { return words; }
     std::size_t Count() const { return words.size(); }

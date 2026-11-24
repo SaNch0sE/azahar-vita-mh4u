@@ -479,6 +479,14 @@ void Encoder::FinishNosched() {
     }
 }
 
+void Encoder::ClearNosched() {
+    for (std::size_t i = 0; i < words.size(); i++) {
+        if (meta[i].bit != 0) {
+            words[i] &= ~(1ull << meta[i].bit);
+        }
+    }
+}
+
 void Encoder::EndVertex() {
     Push(SGXD_USSE_EMITVTX_END, 0, 0, 0);
 }
