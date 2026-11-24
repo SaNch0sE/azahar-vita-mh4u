@@ -1030,7 +1030,7 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
     // Moved pages the GPU has not used for a while go back to cached FCRAM first, so that the
     // moves below can reuse their pool pages. Rare, as a move is: on the render thread, after
     // the work queued, this thread waiting.
-    if (impl->renderer->UncachedFrameEnded()) {
+    if (impl->renderer->UncachedFrameEnded(impl->render->CaughtUp())) {
         impl->render->RunSync([this] { impl->renderer->ReturnUncached(); });
     }
     // Vertex and index buffers the draws cleaned since the last vblank, those no page holds cover

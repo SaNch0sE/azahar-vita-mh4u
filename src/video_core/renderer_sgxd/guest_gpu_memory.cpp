@@ -252,7 +252,7 @@ bool GuestGpuMemory::PoolLow() const {
     return pool_used.load(std::memory_order_relaxed) > pages - pages / 8;
 }
 
-bool GuestGpuMemory::EndFrame() {
+bool GuestGpuMemory::EndFrame(bool render_idle) {
     const u32 now = frame.fetch_add(1, std::memory_order_relaxed) + 1;
     if (pool_used.load(std::memory_order_relaxed) == 0) {
         return false;
@@ -260,11 +260,20 @@ bool GuestGpuMemory::EndFrame() {
     if (PoolLow()) {
         return true;
     }
-    // A title tuned to keep them: moved pages go back only for room (a return stops the game until
-    // the GPU's queued work is done, a frame or more, and a page sent back is often moved again).
-    if (now % 64 != 0 || Loader::TitleTuned(Loader::TuningKeepMovedPages)) {
+    // Stale pages, every 64 frames. They must go back: a moved page is uncached for the guest's
+    // CPU too, and a game that reuses memory its loading moved runs its code there at a fraction
+    // of the speed (Monster Hunter 4 Ultimate's movie decoder: its intro from 30 frames a second
+    // to 15). But the return waits for the render thread to reach it, behind the work queued: a
+    // frame or more in a busy scene (Monster Hunter 4 Ultimate's fights stuttered, 11 to 160 ms).
+    // A title tuned to keep its moved pages looks at the first vblank past the 64 frames that
+    // finds the render thread with nothing queued, where the return costs its copy alone.
+    if (now - next_stale_look >= 0x80000000u) {
         return false;
     }
+    if (Loader::TitleTuned(Loader::TuningKeepMovedPages) && !render_idle) {
+        return false;
+    }
+    next_stale_look = now + 64;
     // By index up to the published size: a move may grow the pool meanwhile (pool_pages).
     const u32 pages = pool_pages.load(std::memory_order_acquire);
     for (u32 i = 0; i < pages; i++) {

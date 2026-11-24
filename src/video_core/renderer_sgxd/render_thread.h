@@ -267,6 +267,12 @@ public:
     /// waiting (at once on the render side itself).
     void Run(std::function<void()> fn);
     /// `where`: the caller, for the diagnostics build's log of long waits.
+    /// From the producer's thread: the render side has taken every record published and none is
+    /// being written, so a RunSync now waits for its own call alone.
+    bool CaughtUp() const {
+        const u32 p = published.load(std::memory_order_acquire);
+        return write == p && read.load(std::memory_order_acquire) == p;
+    }
     void RunSync(const std::function<void()>& fn,
                  std::source_location where = std::source_location::current());
     /// A present of the guest's screens as the VBlank found them. One with two newer ones queued is

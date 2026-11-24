@@ -78,8 +78,8 @@ public:
     /// From the emulation thread at vblank, with the guest stopped: a frame has ended. Whether
     /// memory MakeUncached moved should go back (unused long enough, or the pool short of free
     /// pages), which ReturnUncached then does on the render thread (RunSync).
-    bool UncachedFrameEnded() {
-        return guest_memory.EndFrame();
+    bool UncachedFrameEnded(bool render_idle) {
+        return guest_memory.EndFrame(render_idle);
     }
     void ReturnUncached() {
         guest_memory.ReturnUnused();

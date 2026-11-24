@@ -101,9 +101,11 @@ public:
     /**
      * A frame has ended: from the emulation thread at vblank, with the guest stopped. Whether
      * pages should go back (ReturnUnused): the pool short of free pages, or (looked at every
-     * 64th frame) a moved page StaleFrames frames without a use.
+     * 64th frame) a moved page StaleFrames frames without a use. `render_idle`: the render thread
+     * has taken all the work queued, so that the return waits for nothing else; a title tuned to
+     * keep its moved pages returns stale ones only then.
      */
-    [[nodiscard]] bool EndFrame();
+    [[nodiscard]] bool EndFrame(bool render_idle);
 
     /// Puts back on FCRAM the moved pages StaleFrames frames without a use, and with the pool
     /// short of free pages the ones unused longest. At vblank, the guest stopped and the render
@@ -165,6 +167,7 @@ private:
     /// emulation threads.
     std::unique_ptr<std::atomic<u32>[]> last_use;
     std::atomic<u32> frame{};
+    u32 next_stale_look{64}; ///< EndFrame's next look for stale pages (the emulation thread's)
 #ifdef VITA_DIAGNOSTICS
     MoveStats stats{};
     /// The last return's FCRAM pages (EvictPool, ReturnStale), its frame and its kind.
