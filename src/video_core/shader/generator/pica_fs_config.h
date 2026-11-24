@@ -72,6 +72,9 @@ struct FramebufferConfig {
         /// else keeps a fragment (no depth or stencil write): the alpha test's failures get alpha
         /// 0 instead of a kill (RasterizerSgxd::FragmentConfig).
         BitField<12, 1, u32> alpha_test_blends;
+        /// sgxd: a Shadow2D unit 0 read once through a linear filter and compared once (the
+        /// Fast shadows option), not four point taps compared and blended.
+        BitField<13, 1, u32> shadow_fast;
     };
     BlendConfig requested_rgb_blend{};
     BlendConfig requested_alpha_blend{};

@@ -1674,13 +1674,13 @@ void FragmentEmitter::ShadowTexture(Reg coord, uint32_t sampler_index) {
         uv = flipped;
     }
     const Reg weights = Reg::V(TmpShadowZ);
-#ifdef VITA_DIAGNOSTICS
-    // sgxd_flags `shadowfast`: one LINEAR read of the packed texel (the unit's filters forced to
-    // linear, sgxd_rasterizer.cpp): the depth is a weighted sum of the bytes, so the filtered bytes
-    // decode to the filtered depth, compared once. Hard, texel-stepped edges where the four taps
-    // blend (with NORM on, the filter's fractions kept, the edges look the same).
-    static const bool shadow_fast = ::SgxdRenderer::SgxdFlag("shadowfast");
-    if (shadow_fast) {
+    // Fast shadows (FramebufferConfig shadow_fast): one LINEAR read of the packed texel (the
+    // unit's filters forced to linear, RasterizerSgxd::TextureWords): the depth is a weighted sum
+    // of the bytes, so the filtered bytes decode to the filtered depth, compared once. Hard,
+    // texel-stepped edges where the four taps blend (with NORM on, the filter's fractions kept,
+    // the edges look the same). Monster Hunter 4 Ultimate in a busy field at 1.5x: -15% of the
+    // 3D picture's GPU time.
+    if (config.framebuffer.shadow_fast) {
         const Reg texel = Reg::V(TmpShadowTexel);
         const Reg result = Reg::V(TmpShadowVal);
         const auto& fborder = tex.texture_border_color[0];
@@ -1742,7 +1742,6 @@ void FragmentEmitter::ShadowTexture(Reg coord, uint32_t sampler_index) {
         texel_loc[0] = {Bank::Virtual, TmpTex0, false};
         return;
     }
-#endif
     // c = uv * size - 0.5 in texels; f = fract(c), the weights, in TmpShadowZ's z and w;
     // the first tap at the centre of floor(c), (floor(c) + 0.5) / size = uv - f / size, the
     // others a texel right, down and both. The size is a power of two: every product here is

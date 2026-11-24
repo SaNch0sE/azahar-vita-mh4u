@@ -276,6 +276,12 @@ constexpr std::array table{std::to_array<Translation>({
     {"Model files reported", "上报模型文件"},
     {"Motion controls", "体感操作"},
     {"Even frame pacing (experimental)", "均匀帧节奏（实验性）"},
+    {"Fast shadows", "快速阴影"},
+    {"Fast shadows option", "快速阴影选项"},
+    {"Offers the Fast shadows option for this game. It changes nothing by itself.",
+     "为此游戏提供快速阴影选项。它本身不改变任何内容。"},
+    {"Reads the game's shadow map once per pixel instead of four times. Shadows stay in place but get hard, stepped edges; the GPU does less at every lit pixel in shadowed scenes, about 15% of the 3D picture in a Monster Hunter 4 Ultimate field.",
+     "每个像素只读取一次游戏的阴影贴图，而不是四次。阴影位置不变，但边缘变硬、呈阶梯状；在有阴影的场景中，GPU 在每个受光像素上的工作量减少，在《怪物猎人4 终极版》的野外约占 3D 画面的 15%。"},
     {"Experimental. Shows the game's pictures at an even beat of two refreshes: one that is ready "
      "early waits for its turn. For a game that runs at 30 frames a second and still looks choppy. "
      "It works with Vsync on, and can show a picture up to two refreshes (33 ms) later.",

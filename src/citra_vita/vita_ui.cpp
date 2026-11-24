@@ -1860,6 +1860,18 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::FastShadows,
+         Category::Patches,
+         Kind::Toggle,
+         Translatable("Fast shadows"),
+         Translatable("Reads the game's shadow map once per pixel instead of four times. Shadows stay "
+                      "in place but get hard, stepped edges; the GPU does less at every lit pixel in "
+                      "shadowed scenes, about 15% of the 3D picture in a Monster Hunter 4 Ultimate "
+                      "field."),
+         {},
+         0,
+         nullptr,
+         nullptr});
     add({Option::SimulateGpuTimings,
          Category::Speed,
          Kind::Toggle,
@@ -3556,7 +3568,9 @@ Ui::Action Ui::DrawSettings() {
                 continue;
             }
             const u32 bit = rows[i].option == Config::Option::EvenPacing ? Loader::TuningEvenPacing
-                                                                         : Loader::TuningHudScale;
+                            : rows[i].option == Config::Option::FastShadows
+                                ? Loader::TuningFastShadows
+                                : Loader::TuningHudScale;
             if ((Loader::TitleTuningOf(settings_program_id) & bit) != 0) {
                 DrawRow(rows[i], i);
             }

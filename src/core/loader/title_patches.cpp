@@ -258,6 +258,7 @@ constexpr auto xenoblade_frame_buffer_watcher =
 
 constexpr u64 XenobladeUsa = 0x000400000F700100;
 constexpr u64 MonsterHunter4UltimateUsa = 0x0004000000126300;
+constexpr u64 MonsterHunterXxJpn = 0x0004000000197100;
 
 constexpr std::array title_patches{
     // Monster Hunter 4 Ultimate (USA): no code words, the renderer's work alone.
@@ -267,7 +268,12 @@ constexpr std::array title_patches{
                             "short where their sprites lie far apart in the game's data. A screen "
                             "the layout does not show is not drawn."),
                std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale |
-                   TuningEvenPacing | TuningKeepMovedPages},
+                   TuningEvenPacing | TuningKeepMovedPages | TuningFastShadows},
+    // Monster Hunter XX (Japan): the Fast shadows option alone; the rest runs as in beta-1.
+    TitlePatch{MonsterHunterXxJpn, Translatable("Fast shadows option"),
+               Translatable("Offers the Fast shadows option for this game. It changes nothing by "
+                            "itself."),
+               std::span<const PatchWord>{}, nullptr, TuningFastShadows},
     TitlePatch{XenobladeUsa, Translatable("Left eye only"),
                Translatable("The game draws its 3D scene twice, once per eye, even with 3D off. "
                             "Only one picture is shown, so only the left eye's is drawn."),

@@ -65,6 +65,9 @@ enum class Option : u32 {
     /// Presents spaced by the title's own rate (RenderThread::even_pacing): 1, or 0 for each
     /// shown as it comes.
     EvenPacing,
+    /// Shadows read once and compared once (RasterizerSgxd::SetFastShadows): 1, or 0 for the
+    /// four compared taps.
+    FastShadows,
     /// Upstream's simulate_3ds_gpu_timings: 1 delays GSP's interrupts by the delay generators'
     /// estimates of their work, 0 (upstream's default) raises them at once.
     SimulateGpuTimings,

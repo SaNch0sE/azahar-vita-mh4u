@@ -919,6 +919,26 @@ SgxdBackend::PictureFormat PictureFormatFor(FramebufferRegs::ColorFormat format)
 }
 } // Anonymous namespace
 
+namespace {
+std::atomic<bool> fast_shadows{false};
+} // Anonymous namespace
+
+void RasterizerSgxd::SetFastShadows(bool on) {
+    fast_shadows.store(on, std::memory_order_relaxed);
+}
+
+bool RasterizerSgxd::FastShadows() {
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags shadowfast: the same for any title.
+    static const bool flag = SgxdFlag("shadowfast");
+    if (flag) {
+        return true;
+    }
+#endif
+    return fast_shadows.load(std::memory_order_relaxed) &&
+           Loader::TitleTuned(Loader::TuningFastShadows);
+}
+
 void RasterizerSgxd::SetHudScale(u32 quarters) {
     hud_scale.store(std::clamp(quarters, 4u, 8u), std::memory_order_relaxed);
 }
@@ -3108,13 +3128,8 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[
     const bool shadow = unit == 0 && real && c.type == TextureConfig::Shadow2D;
     DEBUG_ASSERT_MSG(!shadow || tex.format == Pica::TexturingRegs::TextureFormat::RGBA8,
                      "sgxd: a shadow texture in format {}", static_cast<u32>(tex.format));
-#ifdef VITA_DIAGNOSTICS
-    // sgxd_flags shadowfast: the shadow texel read once, LINEAR (fs_usse_gen.cpp ShadowTexture).
-    static const bool shadow_fast = SgxdFlag("shadowfast");
-    const bool shadow_linear = shadow && shadow_fast;
-#else
-    constexpr bool shadow_linear = false;
-#endif
+    // Fast shadows: the shadow texel read once, LINEAR (fs_usse_gen.cpp ShadowTexture).
+    const bool shadow_linear = shadow && FastShadows();
     const u32 mag =
         shadow_linear || (!shadow && c.mag_filter == Pica::TexturingRegs::TextureConfig::Linear) ? 1 : 0;
     const u32 min =
@@ -5478,6 +5493,11 @@ void RasterizerSgxd::PrefetchFragment(const Pica::RegsInternal& parse_regs) {
 Pica::Shader::FSConfig RasterizerSgxd::FragmentConfigFor(const Pica::RegsInternal& regs,
                                                          u32 own_pixel, bool kills_viewport) {
     Pica::Shader::FSConfig config{regs};
+    // Fast shadows: one linear read of a Shadow2D unit 0 (TextureWords forces its filters).
+    if (config.texture.texture0_type == Pica::TexturingRegs::TextureConfig::Shadow2D &&
+        FastShadows()) {
+        config.framebuffer.shadow_fast.Assign(1);
+    }
     // A light's specular_0 term is specular_0 * D0: with that colour zero on every light the term is
     // left out (its D0 lookups, loads and adds). The colours are state the key holds, so a nonzero one
     // brings the term back.
