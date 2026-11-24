@@ -9158,7 +9158,18 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     if (fg.uses_discard) {
         pass_type = translucent ? 2u : 4u;
     }
-    const u32 isp = pass_type << 25 | dcmp << 22 | (dwrite ? 0u : 1u << 20) | 1u << 9 |
+    u32 isp_dcmp = dcmp;
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags `fsnever=N`: the draws of the fragment programs whose keys' low 32 bits are N
+    // set up as ever, but their depth test never passes: no pixel shaded or blended, what their
+    // fragments cost (overdraw included, which fswhite keeps); the pass is otherwise unchanged.
+    static const std::vector<u32> fs_never = SgxdFlagValues("fsnever");
+    if (!fs_never.empty() && std::find(fs_never.begin(), fs_never.end(),
+                                       static_cast<u32>(last_fragment_key)) != fs_never.end()) {
+        isp_dcmp = 0;
+    }
+#endif
+    const u32 isp = pass_type << 25 | isp_dcmp << 22 | (dwrite ? 0u : 1u << 20) | 1u << 9 |
                     (stencil ? SGXD_RECIPE_ISP_CPRES | st.reference_value : 0u);
     const u32 ispc =
         !stencil ? 0u
