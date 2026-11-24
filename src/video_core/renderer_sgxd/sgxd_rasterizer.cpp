@@ -8819,7 +8819,7 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     static u32 draw_keys_logged = 0;
     if (draw_keys && draw_keys_logged < 1000 && sceKernelGetProcessTimeWide() >= draw_keys_from) {
         LOG_INFO(Render,
-                 "drawkey {}: {} vertices, fs {:016x}: {} words, {} temps, {} PAs, {} issues, "
+                 "perf: drawkey {}: {} vertices, fs {:016x}: {} words, {} temps, {} PAs, {} issues, "
                  "{} samplers, {} literals; {}{} (blend {} {}/{} {}/{} {}/{}, mask {:#x}, own "
                  "pixel {:#x}), depth compare {} write {}; target {:#x} {}x{}",
                  draw_keys_logged++, stage.count, last_fragment_key, fg.primary.size(),
