@@ -11,6 +11,7 @@
 #include "common/assert.h"
 #include "common/host_shared_memory.h"
 #include "common/logging/log.h"
+#include "core/loader/title_patches.h"
 #include "core/memory.h"
 #include "video_core/renderer_sgxd/guest_gpu_memory.h"
 #include "video_core/renderer_sgxd/sgxd_backend.h"
@@ -259,7 +260,9 @@ bool GuestGpuMemory::EndFrame() {
     if (PoolLow()) {
         return true;
     }
-    if (now % 64 != 0) {
+    // A title tuned to keep them: moved pages go back only for room (a return stops the game until
+    // the GPU's queued work is done, a frame or more, and a page sent back is often moved again).
+    if (now % 64 != 0 || Loader::TitleTuned(Loader::TuningKeepMovedPages)) {
         return false;
     }
     // By index up to the published size: a move may grow the pool meanwhile (pool_pages).
