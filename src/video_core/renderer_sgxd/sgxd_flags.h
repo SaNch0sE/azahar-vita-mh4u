@@ -91,6 +91,8 @@ namespace SgxdRenderer {
  *             scheduled across internal-register chains costs
  *   shadowlite Shadow2D reads replaced by a constant 1 (fully lit): what the four-tap shadow
  *             read costs in lit programs
+ *   shadowfast Shadow2D read once with a LINEAR filter and compared once (hard edges), not
+ *             four point taps compared and blended
  *   xferlog   every display transfer, texture copy and fill as it comes (sgxd_rasterizer.cpp)
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks

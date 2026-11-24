@@ -1674,6 +1674,75 @@ void FragmentEmitter::ShadowTexture(Reg coord, uint32_t sampler_index) {
         uv = flipped;
     }
     const Reg weights = Reg::V(TmpShadowZ);
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags `shadowfast`: one LINEAR read of the packed texel (the unit's filters forced to
+    // linear, sgxd_rasterizer.cpp): the depth is a weighted sum of the bytes, so the filtered bytes
+    // decode to the filtered depth, compared once. Hard, texel-stepped edges where the four taps
+    // blend (with NORM on, the filter's fractions kept, the edges look the same).
+    static const bool shadow_fast = ::SgxdRenderer::SgxdFlag("shadowfast");
+    if (shadow_fast) {
+        const Reg texel = Reg::V(TmpShadowTexel);
+        const Reg result = Reg::V(TmpShadowVal);
+        const auto& fborder = tex.texture_border_color[0];
+        const bool fbordered = fborder.enable_s || fborder.enable_t;
+        const Reg fborder_result = Reg::V(TmpShadowTap2);
+        e.Sample2D(texel, uv, SamplerSa(sampler_index), nullptr, 0, true, 2);
+        e.Vec(VecOp::Min, {I0, 0x1}, {w_pair, w_swz, Mod::Abs}, ConstOne, Pred::None, true);
+        e.Vec(VecOp::Mul, {I0, 0x1}, {I0, XXXX}, Lit(LitDepthMax), Pred::None, true);
+        e.Vec(VecOp::Frc, {I0, 0x1}, ConstZero, {I0, XXXX}, Pred::None, true); // -floor
+        e.Vec(VecOp::Add, {weights, 0x1}, {I0, XXXX}, SaScalar(sa_shadow_tex_bias), Pred::None,
+              true);
+        e.Vec(VecOp::Add, {result, 0x1}, ConstZero, ConstZero, Pred::None, true);
+        if (fbordered) {
+            const Reg border_depth = Reg::Sa(static_cast<uint8_t>(sa_shadow_border));
+            e.Vec(VecOp::Add, {fborder_result, 0x1}, ConstZero, ConstZero, Pred::None, true);
+            e.Test(Cond::Ge, 2, {weights}, 0, {border_depth, XXXX}, true);
+            e.Vec(VecOp::Add, {fborder_result, 0x1}, {border_depth, YYYY}, ConstZero, Pred::P2,
+                  true);
+        }
+        e.Wdf(0);
+        const Src byte_weights{Reg::Sa(static_cast<uint8_t>(LitQuadSa(LitByteWeightR))), XYZW};
+        e.UnpackF16x4({I1, 0xf}, texel);
+        e.Dot({I0, 0x1}, byte_weights, {I1, XYZW}, true, Pred::None, true);
+        e.Test(Cond::Ge, 2, {weights}, 0, {I0, XXXX}, true);
+        e.Vec(VecOp::Add, {result, 0x1}, {I1, XXXX}, ConstZero, Pred::P2, true);
+        if (fbordered) {
+            // Inside [0, 1] on a bordered axis: m = clamp(min(uv, 1 - uv) * 65536, 0, 1).
+            e.Vec(VecOp::Add, {I0, 0x3}, {uv, XYZW, Mod::Neg}, ConstOne, Pred::None, true);
+            e.Vec(VecOp::Min, {I0, 0x3}, {I0, XYZW}, {uv, XYZW}, Pred::None, true);
+            e.Vec(VecOp::Mul, {I0, 0x3}, {I0, XYZW}, Lit(Lit65536), Pred::None, true);
+            e.Vec(VecOp::Max, {I0, 0x3}, {I0, XYZW}, ConstZero, Pred::None, true);
+            e.Vec(VecOp::Min, {I0, 0x3}, {I0, XYZW}, ConstOne, Pred::None, true);
+            Src inside{I0, XXXX};
+            if (fborder.enable_s && fborder.enable_t) {
+                e.Vec(VecOp::Mul, {I2, 0x1}, {I0, XXXX}, {I0, YYYY}, Pred::None, true);
+                inside = {I2, XXXX};
+            } else if (fborder.enable_t) {
+                inside = {I0, YYYY};
+            }
+            e.Vec(VecOp::Add, {I1, 0x1}, {result, XXXX, Mod::Neg}, {fborder_result, XXXX},
+                  Pred::None, true);
+            e.Vec(VecOp::Mul, {I1, 0x1}, {I1, XXXX}, inside, Pred::None, true);
+            e.Vec(VecOp::Add, {result, 0x1}, {I1, XXXX, Mod::Neg}, {fborder_result, XXXX},
+                  Pred::None, true);
+        }
+        const Src fvalue{result, XXXX};
+        if (shadow_direct) {
+            const Reg shadow = Reg::V(TmpShadow);
+            if (config.lighting.shadow_invert) {
+                e.Vec(VecOp::Mul, {I2, 0x1}, fvalue, Lit(LitInv255), Pred::None, true);
+                e.Vec(VecOp::Add, {shadow, 0x1}, {I2, XXXX, Mod::Neg}, ConstOne, Pred::None, true);
+            } else {
+                e.Vec(VecOp::Mul, {shadow, 0x1}, fvalue, Lit(LitInv255), Pred::None, true);
+            }
+            return;
+        }
+        e.Vec(VecOp::Mul, {Reg::V(TmpTex0), 0x3}, fvalue, Lit(LitInv255), Pred::None, true);
+        e.Vec(VecOp::Mul, {Reg::V(TmpTex0 + 2), 0x3}, fvalue, Lit(LitInv255), Pred::None, true);
+        texel_loc[0] = {Bank::Virtual, TmpTex0, false};
+        return;
+    }
+#endif
     // c = uv * size - 0.5 in texels; f = fract(c), the weights, in TmpShadowZ's z and w;
     // the first tap at the centre of floor(c), (floor(c) + 0.5) / size = uv - f / size, the
     // others a texel right, down and both. The size is a power of two: every product here is

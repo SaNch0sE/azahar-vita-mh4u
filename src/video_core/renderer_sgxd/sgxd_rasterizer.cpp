@@ -3108,8 +3108,17 @@ const RasterizerSgxd::Texture& RasterizerSgxd::TextureWords(u32 unit, u32 words[
     const bool shadow = unit == 0 && real && c.type == TextureConfig::Shadow2D;
     DEBUG_ASSERT_MSG(!shadow || tex.format == Pica::TexturingRegs::TextureFormat::RGBA8,
                      "sgxd: a shadow texture in format {}", static_cast<u32>(tex.format));
-    const u32 mag = !shadow && c.mag_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
-    const u32 min = !shadow && c.min_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags shadowfast: the shadow texel read once, LINEAR (fs_usse_gen.cpp ShadowTexture).
+    static const bool shadow_fast = SgxdFlag("shadowfast");
+    const bool shadow_linear = shadow && shadow_fast;
+#else
+    constexpr bool shadow_linear = false;
+#endif
+    const u32 mag =
+        shadow_linear || (!shadow && c.mag_filter == Pica::TexturingRegs::TextureConfig::Linear) ? 1 : 0;
+    const u32 min =
+        shadow_linear || (!shadow && c.min_filter == Pica::TexturingRegs::TextureConfig::Linear) ? 1 : 0;
     const u32 mipf = !shadow && c.mip_filter == Pica::TexturingRegs::TextureConfig::Linear ? 1 : 0;
     const u32 addressing = AddressMode(c.wrap_s) << 6 | AddressMode(c.wrap_t) << 3;
     // The chain's levels: MIPMAPCLAMP the last level (15 for one), LODMIN the PICA's min_level,
