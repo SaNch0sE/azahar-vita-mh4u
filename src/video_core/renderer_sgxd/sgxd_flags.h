@@ -89,6 +89,8 @@ namespace SgxdRenderer {
  *             without its loads and reads)
  *   fsnosched fragment programs without nosched bits (wrong pictures): what keeping instances
  *             scheduled across internal-register chains costs
+ *   shadowlite Shadow2D reads replaced by a constant 1 (fully lit): what the four-tap shadow
+ *             read costs in lit programs
  *   xferlog   every display transfer, texture copy and fill as it comes (sgxd_rasterizer.cpp)
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks

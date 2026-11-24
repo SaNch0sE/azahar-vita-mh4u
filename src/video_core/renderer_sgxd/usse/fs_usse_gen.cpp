@@ -1638,6 +1638,22 @@ void FragmentEmitter::ShadowTexture(Reg coord, uint32_t sampler_index) {
     // (red) where its depth (alpha, blue, green: high to low byte) is at or past
     // z = trunc(min(|w|, 1) * 0xffffff) - bias, else 0. Each tap is a point read; a border side is
     // tested here.
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags `shadowlite`: no taps, the texel a constant 1 (fully lit; wrong pictures):
+    // prices the shadow read against the rest of a lit program.
+    static const bool shadow_lite = ::SgxdRenderer::SgxdFlag("shadowlite");
+    if (shadow_lite) {
+        e.Vec(VecOp::Mul, {I0, 0x1}, {coord, XXXX}, ConstZero, Pred::None, true);
+        if (shadow_direct) {
+            e.Vec(VecOp::Add, {Reg::V(TmpShadow), 0x1}, {I0, XXXX}, ConstOne, Pred::None, true);
+            return;
+        }
+        e.Vec(VecOp::Add, {Reg::V(TmpTex0), 0x3}, {I0, XXXX}, ConstOne, Pred::None, true);
+        e.Vec(VecOp::Add, {Reg::V(TmpTex0 + 2), 0x3}, {I0, XXXX}, ConstOne, Pred::None, true);
+        texel_loc[0] = {Bank::Virtual, TmpTex0, false};
+        return;
+    }
+#endif
     const auto& tex = config.texture;
     const Reg w_pair = Reg::Pa(static_cast<uint8_t>(texcoord0_w_pa & ~1u));
     const Swizzle w_swz = (texcoord0_w_pa & 1) ? YYYY : XXXX;
