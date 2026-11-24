@@ -2,6 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#ifdef VITA_DIAGNOSTICS
+#include "video_core/renderer_sgxd/sgxd_flags.h"
+#endif
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -5470,6 +5473,12 @@ std::optional<Program> FragmentEmitter::Emit(std::string* refusal) {
         }
     }
     program.temp_count = lowered.temp_count;
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags `fstempsadd=N`: N more temporaries declared than the program uses (its code
+    // unchanged): fewer pixel tasks in flight, to measure how much the occupancy matters.
+    static const uint32_t temps_add = ::SgxdRenderer::SgxdFlagValue("fstempsadd");
+    program.temp_count += temps_add;
+#endif
     program.peak_live = lowered.peak_live;
     program.peak_at = lowered.peak_at;
     program.peak_regs = lowered.peak_regs;
