@@ -3293,7 +3293,8 @@ void RenderThread::Run(std::function<void()> fn) {
     Put(Op::Call, c);
 }
 
-void RenderThread::RunSync(const std::function<void()>& fn) {
+void RenderThread::RunSync(const std::function<void()>& fn,
+                           [[maybe_unused]] std::source_location where) {
     if (thread.IsCurrentThread()) {
         fn();
         return;
@@ -3320,6 +3321,12 @@ void RenderThread::RunSync(const std::function<void()>& fn) {
     done_waiters.fetch_sub(1);
 #ifdef VITA_DIAGNOSTICS
     CountEmuWait(EmuSync, start);
+    // A wait long enough to cost the game a frame: from where.
+    if (const auto waited = Clock::now() - start; waited >= std::chrono::milliseconds(10)) {
+        LOG_INFO(Render, "perf: emulation sync {:.1f} ms, from {}:{} ({})",
+                 std::chrono::duration<double, std::milli>(waited).count(), where.file_name(),
+                 where.line(), where.function_name());
+    }
 #endif
 }
 

@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <source_location>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -265,7 +266,9 @@ public:
     /// Runs fn on the render side after the work queued before it: Run without waiting, RunSync
     /// waiting (at once on the render side itself).
     void Run(std::function<void()> fn);
-    void RunSync(const std::function<void()>& fn);
+    /// `where`: the caller, for the diagnostics build's log of long waits.
+    void RunSync(const std::function<void()>& fn,
+                 std::source_location where = std::source_location::current());
     /// A present of the guest's screens as the VBlank found them. One with two newer ones queued is
     /// dropped (one newer is the normal lag), and one within 12 ms of the last.
     void Present(const std::array<Pica::FramebufferConfig, 2>& fb,
