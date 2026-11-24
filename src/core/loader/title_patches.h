@@ -76,6 +76,9 @@ enum TitleTuningBit : u32 {
     /// Pages moved to uncached memory stay there until the pool runs low, rather than going back
     /// once unused for StaleFrames: each return stops the game until the GPU's queued work is done.
     TuningKeepMovedPages = 1u << 4,
+    /// The Simplified lighting option applies (RasterizerSgxd::SetSimpleLighting): offered where
+    /// it has been measured.
+    TuningSimpleLighting = 1u << 5,
 };
 inline std::atomic<u32> title_tuning{0};
 /// The tuning bits a title's built-in patches ask for (a menu's: the title need not be running).

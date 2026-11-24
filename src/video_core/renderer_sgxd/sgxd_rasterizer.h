@@ -113,6 +113,11 @@ public:
     /// internal resolution (PictureShapeFor). Only above the internal resolution, and not with
     /// widescreen margins or MSAA. Any thread.
     static void SetHudScale(u32 quarters);
+    /// The Simplified lighting option: for a title with TuningSimpleLighting, the lighting's
+    /// Fresnel, reflection colour, D1, second specular, spotlight, distance and geometric terms
+    /// are left out of its fragment programs (FragmentConfigFor). Any thread; programs made after
+    /// it changes take it.
+    static void SetSimpleLighting(bool on);
     /// What applies now: SetHudScale's for a title with the tuning, else 4.
     [[nodiscard]] static u32 HudScale();
     /// Whether the top screen's 2D layer is drawn at the HUD scale now: one above the internal
