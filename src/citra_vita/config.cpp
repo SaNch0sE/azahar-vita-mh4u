@@ -106,7 +106,7 @@ const std::array<Definition, Count> definitions{{
     {"wait_for_gpu", true, true, 0, 1, 1, Toggle},
     {"skip_right_eye", true, true, 0, 1, 1, Toggle},
     {"even_frame_pacing", true, true, 0, 1, 0, Toggle},
-    {"fast_shadows", true, true, 0, 1, 0, Toggle},
+    {"fast_shadows", true, true, 0, 1, 1, Toggle},
     {"simulate_3ds_gpu_timings", true, true, 0, 1, 0, Toggle},
     {"cpu_clock_percentage", true, false, 5, 400, 100, {}},
     {"multicore", true, false, 0, 1, 1, Toggle},
