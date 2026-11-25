@@ -8881,8 +8881,12 @@ bool RasterizerSgxd::Draw(bool is_indexed, const float* immediate, u32 immediate
     // tie a replay's per-draw costs to the dumped programs.
     static const bool draw_keys = SgxdFlag("drawkeys") || SgxdFlagValue("drawkeys_at") != 0;
     static const u64 draw_keys_from = u64{SgxdFlagValue("drawkeys_at")} * 1000000;
+    // drawkeys_n=N: N draws rather than the first thousand.
+    static const u32 draw_keys_max =
+        SgxdFlagValue("drawkeys_n") != 0 ? SgxdFlagValue("drawkeys_n") : 1000u;
     static u32 draw_keys_logged = 0;
-    if (draw_keys && draw_keys_logged < 1000 && sceKernelGetProcessTimeWide() >= draw_keys_from) {
+    if (draw_keys && draw_keys_logged < draw_keys_max &&
+        sceKernelGetProcessTimeWide() >= draw_keys_from) {
         LOG_INFO(Render,
                  "perf: drawkey {}: {} vertices, fs {:016x}: {} words, {} temps, {} PAs, {} issues, "
                  "{} samplers, {} literals; {}{} (blend {} {}/{} {}/{} {}/{}, mask {:#x}, own "

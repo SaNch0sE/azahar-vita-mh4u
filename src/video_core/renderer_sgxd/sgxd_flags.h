@@ -59,6 +59,7 @@ namespace SgxdRenderer {
  *   drawkeys  log the first thousand draws' fragment programs by dumpusse's key (words, temps,
  *             PAs, issues): a replay's per-draw costs tied to the dumped programs;
  *             drawkeys_at=S the first thousand from S seconds of the process's time on
+ *             (drawkeys_n=N: N draws instead of a thousand)
  *
  *   noload    a pass that would load its colour buffer's picture (BeginPassLoaded) starts from
  *             a clear instead; nozload: a pass's depth is not loaded (still stored): what the
