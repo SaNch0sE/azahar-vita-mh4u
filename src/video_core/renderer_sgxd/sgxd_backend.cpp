@@ -169,8 +169,9 @@ constexpr u32 BlockVa = 0x04000000;
 // With the shared parameter buffer, every block within 256 MiB of the DPM requestor base
 // (sgxd_present.cpp's RecipeVa, 16 MiB): the recipes' GPU addresses end at 272 MiB. Its last
 // StreamInstances megabytes are the stream pool's windows, one a block (StreamSlotVa); the shell's
-// slots and the recipes in blocks of their own (next_va) take the addresses below them. Nothing
-// else is mapped from the shell slots up to guest VRAM (0x18000000).
+// slots, the recipe reserve's (ReserveSlotVa) and the recipes in blocks of their own (next_va), in
+// that order, take the addresses below them. Nothing else is mapped from the shell slots up to
+// guest VRAM (0x18000000).
 constexpr u32 RecipesTop = 0x11000000;
 constexpr u32 StreamPoolVa = RecipesTop - SgxdBackend::StreamInstances * (1u << 20);
 constexpr u32 RecipesEnd = StreamPoolVa;
@@ -324,8 +325,12 @@ SgxdBackend::SgxdBackend() {
                    "sgxd: the shell's CDRAM slot {} not mapped at GPU {:#010x}: {:#010x}", slot,
                    ShellSlotVa(slot), static_cast<u32>(mapped));
     }
-    next_va = ShellSlotVa(ShellSlots);
-    ASSERT_MSG(next_va < RecipesEnd, "sgxd: the shell's slots reach the stream pool's windows");
+    // The recipe reserve's windows follow the shell's slots, whether or not it is made; the
+    // recipes in blocks of their own start after them.
+    next_va = ReserveSlotVa(ReserveSlots);
+    ASSERT_MSG(next_va < RecipesEnd,
+               "sgxd: the shell's slots and the recipe reserve reach the stream pool's windows");
+    MakeRecipeReserve();
     sgxd_recipe_code_heap = BlockVa + code_begin;
     draws.resize(MaxDraws);
     programs.resize(MaxDraws);
@@ -636,6 +641,12 @@ SgxdBackend::~SgxdBackend() {
     for (u32 slot = 0; slot < ShellSlots; slot++) {
         sgxdUnmap(ShellSlotVa(slot), RecipeBlockSize);
     }
+    if (reserve != nullptr) {
+        for (u32 slot = 0; slot < ReserveSlots; slot++) {
+            sgxdUnmap(ReserveSlotVa(slot), RecipeBlockSize);
+        }
+        sceKernelFreeMemBlock(reserve_block);
+    }
     if (stream_pool != nullptr) {
         for (u32 slot = 0; slot < StreamInstances; slot++) {
             sgxdUnmap(StreamSlotVa(slot), StreamBlockSize);
@@ -659,12 +670,64 @@ void SgxdBackend::FreeRecipeBlock(const Recipe& r) {
         stream_slots_used &= ~(u64{1} << r.stream_slot);
         return;
     }
+    if (r.reserve_slot >= 0) {
+        // As a shell slot: the reserve's block stays mapped at its window for the next recipe.
+        reserve_slots_used &= ~(u64{1} << r.reserve_slot);
+        return;
+    }
     if (r.shell_slot < 0) {
         FreeBlock(r.memory, r.va, r.size, r.block);
         return;
     }
     // Its slot stays mapped at its address for the next recipe there (its render is done).
     shell_slots_used &= ~(u64{1} << r.shell_slot);
+}
+
+void SgxdBackend::MakeRecipeReserve() {
+    // Made at the backend's start, with the GPU idle and before the game's first frame: the CDRAM
+    // free is known here, and its map costs no render a drain. Made at the shell's slots running
+    // out instead, it would idle the GPU there, mid-game, once (79-125 ms as a recipe block's map
+    // did). A game that never fills the shell's slots spends its 4 MiB of CDRAM for nothing, which
+    // the guest memory pool's growth and the textures pool's overflow then take from main memory.
+    // The reserve is CDRAM no other recipe can take back, so only with room for it beside the
+    // margin RecipeFor keeps: else the recipes past the shell's slots take blocks as before.
+    SceKernelFreeMemorySizeInfo free{};
+    free.size = sizeof(free);
+    sceKernelGetFreeMemorySize(&free);
+    if (static_cast<u32>(free.size_cdram) < ReserveSize + RecipeCdramMargin) {
+        LOG_WARNING(Render, "sgxd: no recipe reserve, {} KiB of CDRAM free",
+                    static_cast<u32>(free.size_cdram) >> 10);
+        return;
+    }
+    reserve_block = sceKernelAllocMemBlock("azahar-sgxd-recipe-reserve",
+                                           SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, ReserveSize,
+                                           nullptr);
+    void* base = nullptr;
+    if (reserve_block < 0 || sceKernelGetMemBlockBase(reserve_block, &base) < 0) {
+        LOG_WARNING(Render, "sgxd: no recipe reserve: no {} KiB block of CDRAM ({:#010x})",
+                    ReserveSize >> 10, static_cast<u32>(reserve_block));
+        if (reserve_block >= 0) {
+            sceKernelFreeMemBlock(reserve_block);
+        }
+        reserve_block = -1;
+        return;
+    }
+    // As MapBlock: the GPU's MMU takes the windows with no PTLA op in flight, and the SLC, which
+    // its table walks go through, is emptied after. The windows are new addresses no work used.
+    [[maybe_unused]] const int idle = GpuIdleAt("idle: the recipe reserve's map");
+    DEBUG_ASSERT_MSG(idle == 0, "sgxd: a PTLA op never completed before mapping the recipe reserve");
+    for (u32 slot = 0; slot < ReserveSlots; slot++) {
+        u8* const block = static_cast<u8*>(base) + slot * RecipeBlockSize;
+        const int mapped = sgxdMap(ReserveSlotVa(slot), block, RecipeBlockSize, 0);
+        ASSERT_MSG(mapped == 0,
+                   "sgxd: the recipe reserve's slot {} not mapped at GPU {:#010x}: {:#010x}", slot,
+                   ReserveSlotVa(slot), static_cast<u32>(mapped));
+    }
+    [[maybe_unused]] const int slc = sgxd_slc_invalidate();
+    DEBUG_ASSERT_MSG(slc == 0, "sgxd: the SLC not emptied after mapping the recipe reserve");
+    reserve = static_cast<u8*>(base);
+    LOG_INFO(Render, "sgxd: the recipe reserve, {} KiB of CDRAM: {} slots of {} KiB at GPU {:#010x}",
+             ReserveSize >> 10, ReserveSlots, RecipeBlockSize >> 10, ReserveSlotVa(0));
 }
 
 bool SgxdBackend::MakeStreamPool() {
@@ -749,9 +812,10 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         }
     }
     // CDRAM bounds the instances in all: with less free than a block and a margin, and an instance
-    // of the size in flight, that one's render is waited for.
+    // of the size in flight, that one's render is waited for. A free shell or reserve slot takes a
+    // recipe with no CDRAM.
     const auto cdram_short = [this] {
-        if (shell_slots_used != (u64{1} << ShellSlots) - 1) {
+        if (!SlotsFull()) {
             return false;
         }
         SceKernelFreeMemorySizeInfo free{};
@@ -766,7 +830,8 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
     // A size's first instance, or one beside its pending render's, with little CDRAM free: the
     // recipes are a cache, and the one used longest ago gives its block back once its render is
     // done. Never the open pass's or the pending render's, nor a stream pool's block, which gives
-    // no CDRAM back.
+    // no CDRAM back. A shell or reserve slot's recipe gives none back either, but its slot, which
+    // the new recipe then takes.
     u32 va = next_va;
     u32 va_end = RecipesEnd;
     if (stream_slot < 0 && !recipes.empty() && cdram_short()) {
@@ -794,7 +859,7 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         RenderWait(s.fence, "a recipe's block (CDRAM)");
         LOG_INFO(Render, "sgxd: the {}x{} recipe {} at GPU {:#010x} gives its block back", s.width,
                  s.height, s.instance, s.va);
-        if (s.shell_slot < 0) {
+        if (s.shell_slot < 0 && s.reserve_slot < 0) {
             va = s.va;
             va_end = AlignUp(s.va + s.size, 1u << 20);
         }
@@ -809,11 +874,23 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
             slot = static_cast<int>(k);
         }
     }
+    // Past the shell's slots, the reserve's, which map nothing either.
+    int reserve_slot = -1;
+    for (u32 k = 0; k < ReserveSlots && reserve != nullptr && slot < 0 && reserve_slot < 0 &&
+                    stream_slot < 0;
+         k++) {
+        if ((reserve_slots_used >> k & 1) == 0) {
+            reserve_slot = static_cast<int>(k);
+        }
+    }
     if (stream_slot >= 0) {
         va = StreamSlotVa(static_cast<u32>(stream_slot));
         va_end = va + StreamBlockSize;
     } else if (slot >= 0) {
         va = ShellSlotVa(static_cast<u32>(slot));
+        va_end = va + RecipeBlockSize;
+    } else if (reserve_slot >= 0) {
+        va = ReserveSlotVa(static_cast<u32>(reserve_slot));
         va_end = va + RecipeBlockSize;
     }
     auto made = std::make_unique<Recipe>();
@@ -853,6 +930,10 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         shell_slots_used |= u64{1} << slot;
         r.shell_slot = slot;
         r.memory = shell_cdram + static_cast<u32>(slot) * RecipeBlockSize;
+    } else if (reserve_slot >= 0) {
+        reserve_slots_used |= u64{1} << reserve_slot;
+        r.reserve_slot = reserve_slot;
+        r.memory = reserve + static_cast<u32>(reserve_slot) * RecipeBlockSize;
     } else {
         r.memory = MapBlock("azahar-sgxd-recipe", r.va, r.size, r.block);
         if (r.va == next_va) {
@@ -884,9 +965,10 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
              "KiB; shared block at {:#010x}",
              width, height, kinds[static_cast<u32>(kind)], samples == 2 ? " 2x" : "", r.instance,
              r.size >> 10, r.va,
-             r.stream_slot >= 0  ? "the stream pool"
-             : r.shell_slot >= 0 ? "the shell's CDRAM"
-                                 : "the game's",
+             r.stream_slot >= 0    ? "the stream pool"
+             : r.shell_slot >= 0   ? "the shell's CDRAM"
+             : r.reserve_slot >= 0 ? "the recipe reserve"
+                                   : "the game's",
              r.recipe.offset[SGXD_R_END] >> 10, BlockVa);
     recipes.push_back(std::move(made));
     return r;
@@ -2621,6 +2703,7 @@ void SgxdBackend::TargetTimes(u32 width, u32 height, u32 ta_us, u32 d3_us) {
             const char* name = base == surfaces   ? "surfaces"
                                : base == textures ? "textures"
                                : base == shared   ? "shared"
+                               : base == reserve  ? "recipe reserve"
                                : std::any_of(overflow.begin(), overflow.end(),
                                              [base](const auto& c) { return c.cpu == base; })
                                    ? "overflow"

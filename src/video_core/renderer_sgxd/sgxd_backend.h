@@ -735,6 +735,7 @@ private:
         int block{-1};
         int shell_slot{-1}; // its block's slot in the shell's CDRAM, or -1: its own block
         int stream_slot{-1}; // its block's slot in the stream pool, or -1 (shell_slot or own)
+        int reserve_slot{-1}; // its block's slot in the recipe reserve, or -1 (shell_slot or own)
         u32 width{}, height{};
         u32 bg_offset{}; // the background colour word and its SA secondary, after the layout
         Kind kind{};
@@ -764,6 +765,29 @@ private:
     u32 shell_slots_va{};
     [[nodiscard]] u32 ShellSlotVa(u32 slot) const {
         return shell_slots_va + slot * (1u << 20);
+    }
+    /// The recipe reserve: ReserveSlots slots of RecipeBlockSize in one block of the game's CDRAM
+    /// (4 MiB, a multiple of 256 KiB as the kernel takes CDRAM), each mapped at its own window right
+    /// after the shell's slots (ShellSlotVa(ShellSlots + k)), all at once at the backend's start.
+    /// A recipe past the shell's slots takes one before a block of its own: that block's map idles
+    /// the GPU (MapBlock), 79-125 ms mid-game each in Monster Hunter XX at 1.25x, where the shell's
+    /// slots ran out ~18 s in. Made only with room for it beside RecipeCdramMargin; else none.
+    static constexpr u32 ReserveSlots = 8;
+    static constexpr u32 ReserveSize = ReserveSlots * RecipeBlockSize;
+    static_assert(ReserveSize % (256u << 10) == 0 && ReserveSlots <= 64);
+    u8* reserve{};
+    int reserve_block{-1};
+    u64 reserve_slots_used{}; ///< a bit a slot
+    [[nodiscard]] u32 ReserveSlotVa(u32 slot) const {
+        return ShellSlotVa(ShellSlots + slot);
+    }
+    /// Maps the recipe reserve if CDRAM has room for it and a margin (the constructor's).
+    void MakeRecipeReserve();
+    /// Every slot that takes a recipe with no CDRAM of its own is used: the shell's, and the
+    /// reserve's if there is one.
+    [[nodiscard]] bool SlotsFull() const {
+        return shell_slots_used == (u64{1} << ShellSlots) - 1 &&
+               (reserve == nullptr || reserve_slots_used == (u64{1} << ReserveSlots) - 1);
     }
     /// A stream recipe's block in the stream pool: its layout at StreamMaxDraws draws on a 32x32
     /// target is 42 KiB, and the background page after it makes 48 KiB.
