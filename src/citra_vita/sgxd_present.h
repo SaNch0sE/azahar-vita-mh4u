@@ -129,4 +129,8 @@ void SessionEnded();
 void DumpNextFrame();
 [[nodiscard]] bool DumpPending();
 
+/// Smooth picture at Native: the 3DS-sized screens (DrawGuestScreen) filtered bilinearly to the
+/// display instead of point sampled. Any thread; the next frame takes it.
+void SetSmoothNative(bool on);
+
 } // namespace VitaFrontend::SgxdPresent

@@ -277,6 +277,11 @@ constexpr std::array table{std::to_array<Translation>({
     {"Motion controls", "体感操作"},
     {"Even frame pacing (experimental)", "均匀帧节奏（实验性）"},
     {"Fast shadows", "快速阴影"},
+    {"Smooth picture at Native", "原生分辨率平滑画面"},
+    {"At Internal resolution Native, scales the screens to the display smoothly instead of pixel "
+     "for pixel: softer, without the uneven blocky pixels. Free on the GPU. Higher resolutions are "
+     "always smooth.",
+     "在内部分辨率为原生时，以平滑方式将画面缩放到屏幕，而不是逐像素缩放：更柔和，没有不均匀的块状像素。不占用 GPU。更高分辨率始终是平滑的。"},
     {"Speed options", "速度选项"},
     {"Offers the Fast shadows, Per-vertex effect lighting and Parallel geometry options for this "
      "game. It changes nothing by itself.",

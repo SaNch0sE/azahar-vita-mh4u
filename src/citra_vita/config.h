@@ -43,6 +43,9 @@ enum class Option : u32 {
     TopScale,
     /// 2x MSAA on the top screen (RasterizerSgxd::SetTopMsaa): 0 off, 1 on.
     Msaa,
+    /// The 3DS-sized screens (Internal resolution Native) scaled to the display with a bilinear
+    /// filter instead of point sampled (SgxdPresent::SetSmoothNative): 1 smooth, 0 sharp.
+    SmoothNative,
     /// The top screen's 2D layer's scale where a title's patches offer it
     /// (RasterizerSgxd::SetHudScale): 0 the 3DS's, 1 1.25x, 2 1.5x.
     HudScale,

@@ -1767,6 +1767,17 @@ void Ui::BuildRows() {
          0,
          nullptr,
          nullptr});
+    add({Option::SmoothNative,
+         Category::Display,
+         Kind::Toggle,
+         Translatable("Smooth picture at Native"),
+         Translatable("At Internal resolution Native, scales the screens to the display smoothly "
+                      "instead of pixel for pixel: softer, without the uneven blocky pixels. Free "
+                      "on the GPU. Higher resolutions are always smooth."),
+         {},
+         0,
+         nullptr,
+         nullptr});
     // Among a title's patches (DrawSettings), where the title's own offer it.
     add({Option::HudScale,
          Category::Patches,

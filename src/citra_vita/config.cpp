@@ -97,6 +97,7 @@ const std::array<Definition, Count> definitions{{
     {"widescreen", true, true, 0, 2, 0, WidescreenWords},
     {"top_scale", true, true, 0, 4, 0, Scales},
     {"msaa", true, true, 0, 1, 0, Toggle},
+    {"smooth_native", true, true, 0, 1, 0, Toggle},
     {"hud_scale", true, true, 0, 2, 0, HudScales},
     {"stats_overlay", false, true, 0, 1, 1, Toggle},
     {"vsync", true, true, 0, 1, 1, Toggle},
@@ -276,6 +277,9 @@ void ApplyLocked(Option option) {
         break;
     case Option::Msaa:
         SgxdRenderer::RasterizerSgxd::SetTopMsaa(value != 0);
+        break;
+    case Option::SmoothNative:
+        VitaFrontend::SgxdPresent::SetSmoothNative(value != 0);
         break;
     case Option::HudScale:
         SgxdRenderer::RasterizerSgxd::SetHudScale(4 + static_cast<u32>(value));

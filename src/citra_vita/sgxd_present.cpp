@@ -813,6 +813,14 @@ void ShowLast() {
     set.from_hi = next ? static_cast<u16>(after + 1) : before;
 }
 
+namespace {
+std::atomic<bool> smooth_native{false};
+} // Anonymous namespace
+
+void SetSmoothNative(bool on) {
+    smooth_native.store(on, std::memory_order_relaxed);
+}
+
 bool SetTexture(const void* texels, u32 width, u32 height, bool bilinear) {
     if (!g.initialized || g.texture >= 0 || width == 0 || height == 0 || width > 4096 ||
         height > 4096 || (width & 7)) {
@@ -1112,12 +1120,13 @@ bool DrawGuestScreen(u32 va, const u8* cpu, u32 stride, u32 columns, u32 pica_fo
     const float uv[4][2] = {{u_end, 0.0f}, {u_end, 1.0f}, {0.0f, 0.0f}, {0.0f, 1.0f}};
     PutScreenVertices(slot, quad, opacity, uv);
 
-    // Point sampled: each display pixel shows the framebuffer pixel under its centre. A
-    // translucent screen (the overlay, drawn smaller than the 3DS's) is filtered, and reads its
-    // alpha as one (RGBA as RGB1: the LCD shows no alpha).
+    // Point sampled: each display pixel shows the framebuffer pixel under its centre; with Smooth
+    // picture at Native, filtered. A translucent screen (the overlay, drawn smaller than the 3DS's)
+    // is filtered, and reads its alpha as one (RGBA as RGB1: the LCD shows no alpha).
     const bool blend = opacity < 1.0f;
+    const bool filtered = blend || smooth_native.load(std::memory_order_relaxed);
     u32 tex[4];
-    sgxd_recipe_texture_words_format(va, texels, columns, blend ? 1 : 0, code,
+    sgxd_recipe_texture_words_format(va, texels, columns, filtered ? 1 : 0, code,
                                      blend && swizzle == 2 ? 6 : swizzle, tex);
     const State::PixelEntry& e = PixelEntryFor(tex, blend);
     SgxdRecipeDrawPrograms& p = g.screen_programs[slot];
