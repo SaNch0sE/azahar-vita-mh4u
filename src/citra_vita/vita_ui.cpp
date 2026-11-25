@@ -1872,7 +1872,7 @@ void Ui::BuildRows() {
          nullptr,
          nullptr});
     add({Option::FastShadows,
-         Category::Display,
+         Category::Patches,
          Kind::Toggle,
          Translatable("Fast shadows"),
          Translatable("Reads the game's shadow map once per pixel instead of four times. Shadows stay "
@@ -1895,7 +1895,7 @@ void Ui::BuildRows() {
          nullptr,
          nullptr});
     add({Option::ParallelGeometry,
-         Category::Display,
+         Category::Patches,
          Kind::Toggle,
          Translatable("Parallel geometry"),
          Translatable("Builds effect particles side by side instead of one after another. Much "
@@ -3595,9 +3595,15 @@ Ui::Action Ui::DrawSettings() {
         for (std::size_t i = 0; i < settings_patches.size(); i++) {
             DrawPatchRow(i);
         }
-        // The options a title's patches offer, as its own values: each where the title has its bit.
+        // The options a title's patches offer, as its own values: each where the title has its bit;
+        // Fast shadows and Parallel geometry for every game (Config's game-only options).
         for (std::size_t i = 0; i < rows.size(); i++) {
             if (rows[i].category != Category::Patches) {
+                continue;
+            }
+            if (rows[i].option == Config::Option::FastShadows ||
+                rows[i].option == Config::Option::ParallelGeometry) {
+                DrawRow(rows[i], i);
                 continue;
             }
             const u32 bit = rows[i].option == Config::Option::EvenPacing ? Loader::TuningEvenPacing
