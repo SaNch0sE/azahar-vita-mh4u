@@ -97,6 +97,8 @@ namespace SgxdRenderer {
  *   pveffect  per-vertex effect lighting for any title (RasterizerSgxd::PvEffectLighting): a
  *             blended draw whose lighting Usse::PvEffectEligible lets through is lit at its
  *             vertices, its fragment program reading only the Fresnel table
+ *   pvnofresnel  per-vertex effect lighting with the alphas 1 (no Fresnel read; wrong pictures):
+ *             what that read costs
  *   xferlog   every display transfer, texture copy and fill as it comes (sgxd_rasterizer.cpp)
  *
  * sgxd's frame capture: vprof, vprof_at, vprof_len, vprof_trigger, vprof_vblanks

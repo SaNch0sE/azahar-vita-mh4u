@@ -4019,7 +4019,14 @@ void FragmentEmitter::PvLighting() {
     const Vec4Loc specular_sum{Bank::Virtual, TmpSpecular};
     const LitReads reads = LitSumReads();
     u8_lighting_packed = reads.packed;
-    const bool fresnel = PvFresnelRead();
+#ifdef VITA_DIAGNOSTICS
+    // sgxd_flags `pvnofresnel`: the alphas 1 instead of the Fresnel read (wrong pictures): what the
+    // read costs a per-vertex lit effect.
+    static const bool no_fresnel = ::SgxdRenderer::SgxdFlag("pvnofresnel");
+#else
+    constexpr bool no_fresnel = false;
+#endif
+    const bool fresnel = PvFresnelRead() && !no_fresnel;
     const bool fresnel_primary =
         fresnel && uses_primary_color && lighting.enable_primary_alpha && reads.primary_alpha;
     const bool fresnel_secondary =
