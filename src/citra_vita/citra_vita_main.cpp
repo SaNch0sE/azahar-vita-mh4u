@@ -2111,7 +2111,17 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     // perflog has them by site.
                     const std::string sites;
 #else
-                    const std::string sites = SgxdRenderer::SgxdBackend::ToolsWaitSites();
+                    std::string sites = SgxdRenderer::SgxdBackend::ToolsWaitSites();
+                    static std::array<u32, 3> last_geo{};
+                    std::array<u32, 3> geo{};
+                    for (int k = 0; k < 3; k++) {
+                        geo[k] = SgxdRenderer::RasterizerSgxd::ToolsGeometryDraws(k);
+                    }
+                    sites += fmt::format("; geometry draws queued {}, alone without a bound {}, "
+                                         "alone past the room {}",
+                                         geo[0] - last_geo[0], geo[1] - last_geo[1],
+                                         geo[2] - last_geo[2]);
+                    last_geo = geo;
 #endif
                     LOG_INFO(Frontend, "cpu: GPU waits {} ms; renders {}{}",
                              sgxd_wait_us_take() / 1000, renders - last_renders, sites);

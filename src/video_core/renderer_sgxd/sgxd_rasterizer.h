@@ -113,6 +113,11 @@ public:
     /// internal resolution (PictureShapeFor). Only above the internal resolution, and not with
     /// widescreen margins or MSAA. Any thread.
     static void SetHudScale(u32 quarters);
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    /// Tools builds' cpu line, since the start: geometry draws 0 queued with the pass, 1 sent
+    /// alone for want of a triangle bound, 2 sent alone with a bound past the room.
+    [[nodiscard]] static u32 ToolsGeometryDraws(int which);
+#endif
     /// The Fast shadows option: for a title with TuningFastShadows, a Shadow2D texture is read once
     /// through a linear filter and compared once (hard edges) rather than as four compared taps.
     /// Any thread; draws after it changes take it.

@@ -4993,6 +4993,16 @@ const RasterizerSgxd::VertexProgram& RasterizerSgxd::PassthroughProgramLookup(u3
     return vertex_programs.Emplace(key, std::move(v));
 }
 
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+namespace {
+std::array<std::atomic<u32>, 3> tools_geometry{};
+} // Anonymous namespace
+
+u32 RasterizerSgxd::ToolsGeometryDraws(int which) {
+    return tools_geometry[which].load(std::memory_order_relaxed);
+}
+#endif
+
 RasterizerSgxd::GsCodeFacts RasterizerSgxd::GsFacts() {
     Pica::ShaderSetup& setup = pica.gs_setup;
     setup.DoProgramCodeFixup();
@@ -5116,6 +5126,27 @@ RasterizerSgxd::VertexStage RasterizerSgxd::GeometryStage(bool is_indexed,
     const bool padded = bound != 0 && (bound <= room || bound_fits);
     const u32 cap = padded ? bound : room;
     const bool wait = !padded;
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    // Tools builds' cpu line: the geometry draws queued with the pass (padded), and the ones
+    // sent alone with their counts read back: no bound, or one past the room.
+    tools_geometry[padded ? 0 : bound == 0 ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+    if (!padded) {
+        static std::array<u64, 32> told{};
+        static u32 told_count = 0;
+        const u64 gs_key = Common::HashCombine(pica.gs_setup.GetProgramCodeHash(),
+                                               regs.gs.main_offset.Value());
+        if (told_count < told.size() &&
+            std::find(told.begin(), told.begin() + told_count, gs_key) ==
+                told.begin() + told_count) {
+            told[told_count++] = gs_key;
+            LOG_INFO(Render,
+                     "geometry: program {:016x} sent alone: bound {}, room {}, {} invocations of "
+                     "{} bytes a triangle, mode {}",
+                     gs_key, bound, room, invocations, tri_bytes,
+                     static_cast<u32>(pipeline.gs_config.mode.Value()));
+        }
+    }
+#endif
 #ifdef VITA_DIAGNOSTICS
     // perflog: the second's geometry draws by shape, the busiest first: what the stream-out
     // renders are made of.
