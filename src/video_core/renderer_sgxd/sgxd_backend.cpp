@@ -135,7 +135,34 @@ struct ToolsWaitSite {
     std::atomic<u32> count{};
 };
 std::array<ToolsWaitSite, 16> tools_wait_sites{};
+
+void ToolsNoteWait(const char* site, u64 us) {
+    for (ToolsWaitSite& t : tools_wait_sites) {
+        const char* const held = t.site.load(std::memory_order_relaxed);
+        if (held == site || held == nullptr) {
+            if (held == nullptr) {
+                t.site.store(site, std::memory_order_relaxed);
+            }
+            t.us.fetch_add(us, std::memory_order_relaxed);
+            t.count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
 #endif
+
+/// sgxd_gpu_idle, its wall time noted under `site` in tools builds (the cpu line's GPU waits by
+/// site): which caller drained the GPU.
+int GpuIdleAt([[maybe_unused]] const char* site) {
+#if defined(VITA_DEBUG_TOOLS) && !defined(VITA_DIAGNOSTICS)
+    const u64 start = sceKernelGetProcessTimeWide();
+    const int r = sgxd_gpu_idle();
+    ToolsNoteWait(site, sceKernelGetProcessTimeWide() - start);
+    return r;
+#else
+    return sgxd_gpu_idle();
+#endif
+}
 
 // GPU address map: docs/sgxd/memory.md.
 constexpr u32 BlockVa = 0x04000000;
@@ -203,7 +230,7 @@ u8* MapBlock(const char* name, u32 va, u32 size, int& uid) {
     const int got = uid >= 0 ? sceKernelGetMemBlockBase(uid, &base) : uid;
     ASSERT_MSG(got >= 0, "sgxd: no {} KiB of CDRAM for {} ({:#010x})", size >> 10, name,
                static_cast<u32>(got));
-    [[maybe_unused]] const int idle = sgxd_gpu_idle();
+    [[maybe_unused]] const int idle = GpuIdleAt("idle: a block's map");
     DEBUG_ASSERT_MSG(idle == 0, "sgxd: a PTLA op never completed before mapping {}", name);
     const int mapped = sgxdMap(va, base, size, 0);
     DEBUG_ASSERT_MSG(mapped == 0, "sgxd: {} not mapped at GPU {:#010x}: {:#010x}", name, va,
@@ -220,7 +247,7 @@ void FreeBlock(u8* cpu, u32 va, u32 size, int uid) {
     if (cpu == nullptr) {
         return;
     }
-    sgxd_gpu_idle();
+    GpuIdleAt("idle: a block's unmap");
     sgxdUnmap(va, size);
     sceKernelFreeMemBlock(uid);
 }
@@ -669,7 +696,7 @@ bool SgxdBackend::MakeStreamPool() {
     }
     // As MapBlock: the GPU's MMU takes the windows with no PTLA op in flight, and the SLC, which
     // its table walks go through, is emptied after. The windows are new addresses no work used.
-    [[maybe_unused]] const int idle = sgxd_gpu_idle();
+    [[maybe_unused]] const int idle = GpuIdleAt("idle: the stream pool's map");
     DEBUG_ASSERT_MSG(idle == 0, "sgxd: a PTLA op never completed before mapping the stream pool");
     for (u32 slot = 0; slot < StreamInstances; slot++) {
         u8* const block = static_cast<u8*>(base) + slot * StreamBlockSize;
@@ -753,7 +780,7 @@ SgxdBackend::Recipe& SgxdBackend::RecipeFor(u32 width, u32 height, Kind kind, u3
         }
         if (victim == recipes.end() && instances != 0) {
             // Only this size's pending render holds one: its 3D finishes now.
-            sgxd_gpu_idle();
+            GpuIdleAt("idle: a recipe's eviction");
             for (const auto& r : recipes) {
                 if (r->width == width && r->height == height && r->kind == kind &&
                     r->samples == samples && sgxd_chain_reached(r->fence)) {
@@ -1830,7 +1857,7 @@ SgxdBackend::Data SgxdBackend::AllocOverflow(u32 bytes, u32* ready) {
     c.size = size;
     c.used = bytes;
     // As MapBlock: the GPU's MMU takes the chunk with no PTLA op in flight.
-    sgxd_gpu_idle();
+    GpuIdleAt("idle: a pass data overflow chunk");
     const int mapped = sgxdMap(c.gpu, base, size, 0);
     ASSERT_MSG(mapped == 0, "sgxd: the textures pool's overflow not mapped at GPU {:#010x}: {:#010x}",
                c.gpu, static_cast<u32>(mapped));
