@@ -269,12 +269,12 @@ constexpr std::array title_patches{
                             "the layout does not show is not drawn."),
                std::span<const PatchWord>{}, nullptr, TuningGeometryBatches | TuningHiddenScreen | TuningHudScale |
                    TuningEvenPacing | TuningKeepMovedPages | TuningFastShadows |
-                   TuningPvEffectLighting | TuningParallelGeometry},
+                   TuningPvEffectLighting},
     // Monster Hunter XX (Japan): the Fast shadows, Per-vertex effect lighting and Parallel geometry
     // options and the geometry shader draws' room; the rest runs as in beta-1.
     TitlePatch{MonsterHunterXxJpn, Translatable("Speed options"),
-               Translatable("Offers the Fast shadows, Per-vertex effect lighting and Parallel "
-                            "geometry options for this game. It changes nothing by itself."),
+               Translatable("Offers Per-vertex effect lighting for this game and starts it with "
+                            "Fast shadows and Parallel geometry on."),
                std::span<const PatchWord>{}, nullptr,
                TuningFastShadows | TuningGeometryBatches | TuningPvEffectLighting |
                    TuningKeepMovedPages | TuningParallelGeometry},

@@ -76,14 +76,14 @@ enum TitleTuningBit : u32 {
     /// Pages moved to uncached memory stay there until the pool runs low, rather than going back
     /// once unused for StaleFrames: each return stops the game until the GPU's queued work is done.
     TuningKeepMovedPages = 1u << 4,
-    /// The Fast shadows option applies (RasterizerSgxd::SetFastShadows): offered where it has been
-    /// measured.
+    /// Fast shadows on by default for this game (Config's game-only options; any game can turn it
+    /// on): where it has been measured.
     TuningFastShadows = 1u << 5,
     /// The Per-vertex effect lighting option applies (RasterizerSgxd::SetPvEffectLighting): offered
     /// where it has been tried.
     TuningPvEffectLighting = 1u << 6,
-    /// The Parallel geometry option applies (RasterizerSgxd::SetParallelGeometry): offered where
-    /// it has been tried.
+    /// Parallel geometry on by default for this game (Config's game-only options; any game can turn
+    /// it on): where it has been tried.
     TuningParallelGeometry = 1u << 7,
 };
 inline std::atomic<u32> title_tuning{0};

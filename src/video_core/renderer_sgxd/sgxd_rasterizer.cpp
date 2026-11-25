@@ -935,8 +935,8 @@ bool RasterizerSgxd::FastShadows() {
         return true;
     }
 #endif
-    return fast_shadows.load(std::memory_order_relaxed) &&
-           Loader::TitleTuned(Loader::TuningFastShadows);
+    // Any game's own setting (Config's game-only options): on by default where its patches say.
+    return fast_shadows.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -1001,8 +1001,8 @@ bool RasterizerSgxd::ParallelGeometry() {
         return true;
     }
 #endif
-    return parallel_geometry.load(std::memory_order_relaxed) &&
-           Loader::TitleTuned(Loader::TuningParallelGeometry);
+    // Any game's own setting (Config's game-only options): on by default where its patches say.
+    return parallel_geometry.load(std::memory_order_relaxed);
 }
 
 u32 RasterizerSgxd::PvEffectRequest(bool blend) {

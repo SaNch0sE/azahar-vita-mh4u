@@ -10,7 +10,9 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -107,7 +109,7 @@ const std::array<Definition, Count> definitions{{
     {"wait_for_gpu", true, true, 0, 1, 1, Toggle},
     {"skip_right_eye", true, true, 0, 1, 1, Toggle},
     {"even_frame_pacing", true, true, 0, 1, 0, Toggle},
-    {"fast_shadows", true, true, 0, 1, 1, Toggle},
+    {"fast_shadows", true, true, 0, 1, 0, Toggle},
     {"pv_effect_lighting", true, true, 0, 1, 0, Toggle},
     {"parallel_geometry", true, true, 0, 1, 0, Toggle},
     {"simulate_3ds_gpu_timings", true, true, 0, 1, 0, Toggle},
@@ -204,11 +206,35 @@ int Clamp(Option option, int value) {
     return std::clamp(value, Of(option).minimum, MaximumOf(option));
 }
 
+/// The titles' program IDs by settings title (SeedTitleValues): a game-only option's default.
+std::unordered_map<std::string, u64> title_programs;
+
+/// Fast shadows and Parallel geometry: a game's own setting alone, never all games'. Off by
+/// default, on for a game whose built-in patches mark it so (TuningFastShadows,
+/// TuningParallelGeometry: where it has been tried). A settings file's all-games value (Fast
+/// shadows was on there when only Monster Hunter had it) is ignored, so no game takes either
+/// untested.
+bool GameOnly(std::size_t i) {
+    return i == static_cast<std::size_t>(Option::FastShadows) ||
+           i == static_cast<std::size_t>(Option::ParallelGeometry);
+}
+
+int GameOnlyDefault(const std::string& title, std::size_t i) {
+    const auto it = title_programs.find(title);
+    if (it == title_programs.end()) {
+        return 0;
+    }
+    const u32 bit = i == static_cast<std::size_t>(Option::FastShadows)
+                        ? Loader::TuningFastShadows
+                        : Loader::TuningParallelGeometry;
+    return (Loader::TitleTuningOf(it->second) & bit) != 0 ? 1 : 0;
+}
+
 /// A title's options it does not set yet, set to all games' values. Whether any was.
 bool FillFromGlobal(Values& values) {
     bool filled = false;
     for (std::size_t i = 0; i < Count; i++) {
-        if (definitions[i].per_title && !values[i]) {
+        if (definitions[i].per_title && !values[i] && !GameOnly(i)) {
             values[i] = global_values[i];
             filled = true;
         }
@@ -226,6 +252,9 @@ int EffectiveForLocked(const std::string& title, Option option) {
         if (const auto it = title_values.find(title); it != title_values.end() && it->second[i]) {
             return *it->second[i];
         }
+    }
+    if (GameOnly(i)) {
+        return GameOnlyDefault(title, i);
     }
     return global_values[i];
 }
@@ -843,6 +872,9 @@ void SetTitleValue(const std::string& title, Option option, std::optional<int> v
 void SeedTitleValues(const std::string& title, u64 program_id) {
     const auto defaults = Loader::TitleSettingDefaultsOf(program_id);
     std::scoped_lock lock{mutex};
+    if (!title.empty()) {
+        title_programs[title] = program_id;
+    }
     if (title.empty() || defaults.empty() || title_values.contains(title)) {
         return;
     }

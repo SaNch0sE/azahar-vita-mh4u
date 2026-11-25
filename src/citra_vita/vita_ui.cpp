@@ -1872,7 +1872,7 @@ void Ui::BuildRows() {
          nullptr,
          nullptr});
     add({Option::FastShadows,
-         Category::Patches,
+         Category::Display,
          Kind::Toggle,
          Translatable("Fast shadows"),
          Translatable("Reads the game's shadow map once per pixel instead of four times. Shadows stay "
@@ -1895,7 +1895,7 @@ void Ui::BuildRows() {
          nullptr,
          nullptr});
     add({Option::ParallelGeometry,
-         Category::Patches,
+         Category::Display,
          Kind::Toggle,
          Translatable("Parallel geometry"),
          Translatable("Builds effect particles side by side instead of one after another. Much "
@@ -3601,12 +3601,8 @@ Ui::Action Ui::DrawSettings() {
                 continue;
             }
             const u32 bit = rows[i].option == Config::Option::EvenPacing ? Loader::TuningEvenPacing
-                            : rows[i].option == Config::Option::FastShadows
-                                ? Loader::TuningFastShadows
                             : rows[i].option == Config::Option::PvEffectLighting
                                 ? Loader::TuningPvEffectLighting
-                            : rows[i].option == Config::Option::ParallelGeometry
-                                ? Loader::TuningParallelGeometry
                                 : Loader::TuningHudScale;
             if ((Loader::TitleTuningOf(settings_program_id) & bit) != 0) {
                 DrawRow(rows[i], i);
