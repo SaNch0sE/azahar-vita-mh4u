@@ -283,9 +283,9 @@ constexpr std::array table{std::to_array<Translation>({
      "always smooth.",
      "在内部分辨率为原生时，以平滑方式将画面缩放到屏幕，而不是逐像素缩放：更柔和，没有不均匀的块状像素。不占用 GPU。更高分辨率始终是平滑的。"},
     {"Speed options", "速度选项"},
-    {"Offers Per-vertex effect lighting for this game and starts it with Fast shadows and "
-     "Parallel geometry on.",
-     "为此游戏提供逐顶点特效光照选项，并默认开启快速阴影和并行几何。"},
+    {"Offers Per-vertex effect lighting and HUD resolution for this game and starts it with Fast "
+     "shadows and Parallel geometry on.",
+     "为此游戏提供逐顶点特效光照和 HUD 分辨率选项，并默认开启快速阴影和并行几何。"},
     {"Reads the game's shadow map once per pixel instead of four times. Shadows stay in place but get hard, stepped edges; the GPU does less at every lit pixel in shadowed scenes, about 15% of the 3D picture in a Monster Hunter 4 Ultimate field.",
      "每个像素只读取一次游戏的阴影贴图，而不是四次。阴影位置不变，但边缘变硬、呈阶梯状；在有阴影的场景中，GPU 在每个受光像素上的工作量减少，在《怪物猎人4 终极版》的野外约占 3D 画面的 15%。"},
     {"Per-vertex effect lighting", "逐顶点特效光照"},
